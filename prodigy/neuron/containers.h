@@ -54,6 +54,17 @@ static void prodigyAppendAttachTrace(String& line)
    (void)::close(fd);
 }
 
+static inline void prodigyBuildContainerStartupFlags(const ContainerPlan& plan, Vector<uint64_t>& flags)
+{
+   flags.clear();
+   flags.push_back(plan.shardGroup);
+
+   if (plan.isStateful && plan.nShardGroups > 0)
+   {
+      flags.push_back(plan.nShardGroups);
+   }
+}
+
 // Upstream Linux source of truth for netkit program orientation:
 // - netkit_new_link() marks the root RTM_NEWLINK device as primary and the
 //   peer-info device as peer.
@@ -528,6 +539,8 @@ public:
    bool killedOnPurpose = false;
    bool pendingKillAckToBrain = false;
    bool pendingDestroy = false;
+   bool waitidPending = false;
+   bool destroyCloseCompleted = false;
    bool failedArtifactsPreserved = false;
    bool deleteStorageOnCleanUp = true;
    bool storageUsesLoopFilesystem = false;
@@ -784,6 +797,89 @@ public:
          installedPeerHostedIngressRouteKeys6);
    }
 
+   uint32_t desiredInterContainerMTU(String *failureReport = nullptr) const
+   {
+      if (thisNeuron == nullptr)
+      {
+         return 0;
+      }
+
+      const uint32_t configuredMTU = thisNeuron->configuredInterContainerMTU;
+      const uint32_t hostMTU = thisNeuron->eth.mtu;
+      if (configuredMTU == 0)
+      {
+         return hostMTU;
+      }
+
+      if (hostMTU != 0 && hostMTU < configuredMTU)
+      {
+         basics_log("container netkit mtu mismatch uuid=%llu configured=%u hostMTU=%u hostIfidx=%u\n",
+            (unsigned long long)plan.uuid,
+            unsigned(configuredMTU),
+            unsigned(hostMTU),
+            unsigned(thisNeuron->eth.ifidx));
+         if (failureReport && failureReport->size() == 0)
+         {
+            failureReport->snprintf<"configured inter-container mtu {itoa} exceeds host mtu {itoa} for container {itoa}"_ctv>(
+               uint64_t(configuredMTU),
+               uint64_t(hostMTU),
+               plan.uuid);
+         }
+         return 0;
+      }
+
+      return configuredMTU;
+   }
+
+   bool buildContainerNetworkPolicy(struct container_network_policy& networkPolicy, String *failureReport = nullptr) const
+   {
+      networkPolicy = {};
+      networkPolicy.requiresPublic4 = needsAnyExternalAddressFamily(plan, ExternalAddressFamily::ipv4) ? 1 : 0;
+      networkPolicy.requiresPublic6 = needsAnyExternalAddressFamily(plan, ExternalAddressFamily::ipv6) ? 1 : 0;
+      networkPolicy.interContainerMTU = desiredInterContainerMTU(failureReport);
+      return !(thisNeuron && thisNeuron->configuredInterContainerMTU != 0 && networkPolicy.interContainerMTU == 0);
+   }
+
+   bool applyHostMTUToNetkitPair(String *failureReport = nullptr)
+   {
+      uint32_t desiredMTU = desiredInterContainerMTU(failureReport);
+      if (desiredMTU == 0)
+      {
+         return !(thisNeuron && thisNeuron->configuredInterContainerMTU != 0);
+      }
+
+      // Keep the runtime-created container netkit pair on the same packet
+      // budget as the fake-cluster underlay so container GSO skbs cannot grow
+      // beyond the inter-container MTU and then get fail-closed by the egress
+      // router. This path intentionally clamps GSO to one segment; the helper
+      // itself leaves that policy to the caller.
+      bool hostBudgetSet = netdevs.host.setPacketBudget(desiredMTU, 1);
+      bool peerBudgetSet = netdevs.peer.setPacketBudget(desiredMTU, 1);
+      basics_log("container netkit packet budget uuid=%llu desired=%u hostIfidx=%u peerIfidx=%u hostSet=%d peerSet=%d hostMTU=%u peerMTU=%u\n",
+         (unsigned long long)plan.uuid,
+         unsigned(desiredMTU),
+         unsigned(netdevs.host.ifidx),
+         unsigned(netdevs.peer.ifidx),
+         int(hostBudgetSet),
+         int(peerBudgetSet),
+         unsigned(netdevs.host.mtu),
+         unsigned(netdevs.peer.mtu));
+
+      if (hostBudgetSet && peerBudgetSet)
+      {
+         return true;
+      }
+
+      if (failureReport && failureReport->size() == 0)
+      {
+         failureReport->snprintf<"failed to apply packet budget {itoa} to container netkit pair for container {itoa}"_ctv>(
+            uint64_t(desiredMTU),
+            plan.uuid);
+      }
+
+      return false;
+   }
+
    // rescheduleIfCrashes == false for canaries, true otherwise under the justification these would be extensively tested binaries
    // triggering rare edge cases that are unlikely to be triggered again, AND we have an entire fleet running
    // this binary, so if this is bad those are bad too, and we can't take our app offline. this is the best choice
@@ -875,11 +971,21 @@ public:
          return false;
       }
       netdevs.getInfo();
+      if (applyHostMTUToNetkitPair(failureReport) == false)
+      {
+         if (peernetnsfd >= 0) ::close(peernetnsfd);
+         if (hostnetnsfd >= 0) ::close(hostnetnsfd);
+         return false;
+      }
 
       // Container netkit routers are neuron runtime infrastructure, not per-image artifacts.
       struct container_network_policy networkPolicy = {};
-      networkPolicy.requiresPublic4 = needsAnyExternalAddressFamily(plan, ExternalAddressFamily::ipv4) ? 1 : 0;
-      networkPolicy.requiresPublic6 = needsAnyExternalAddressFamily(plan, ExternalAddressFamily::ipv6) ? 1 : 0;
+      if (buildContainerNetworkPolicy(networkPolicy, failureReport) == false)
+      {
+         if (peernetnsfd >= 0) ::close(peernetnsfd);
+         if (hostnetnsfd >= 0) ::close(hostnetnsfd);
+         return false;
+      }
 
       path.assign("/root/prodigy/container.egress.router.ebpf.o"_ctv);
       peer_program = netdevs.host.loadPreattachedProgram(prodigyContainerEgressNetkitAttachType(), path);
@@ -913,6 +1019,14 @@ public:
 
    bool setupNetwork(String *failureReport = nullptr)
    {
+      if (plan.config.applicationID == 11)
+      {
+         basics_log("setupNetwork stage=begin uuid=%llu appID=%u pid=%d\n",
+            (unsigned long long)plan.uuid,
+            unsigned(plan.config.applicationID),
+            int(pid));
+      }
+
       int hostnetnsfd = Filesystem::openFileAt(-1, "/proc/self/ns/net"_ctv, O_RDONLY);
       if (hostnetnsfd < 0)
       {
@@ -936,6 +1050,12 @@ public:
 
       netdevs.createPair(pid);
       netdevs.peer.moveSocketToNamespace(peernetnsfd, hostnetnsfd);
+      if (plan.config.applicationID == 11)
+      {
+         basics_log("setupNetwork stage=pair-created uuid=%llu appID=%u\n",
+            (unsigned long long)plan.uuid,
+            unsigned(plan.config.applicationID));
+      }
       if (bringContainerLoopbackUp(peernetnsfd, hostnetnsfd, plan.uuid, failureReport) == false)
       {
          if (peernetnsfd >= 0) ::close(peernetnsfd);
@@ -946,6 +1066,13 @@ public:
 
       auto& host = netdevs.host;
       auto& peer = netdevs.peer;
+
+      if (applyHostMTUToNetkitPair(failureReport) == false)
+      {
+         if (peernetnsfd >= 0) ::close(peernetnsfd);
+         if (hostnetnsfd >= 0) ::close(hostnetnsfd);
+         return false;
+      }
 
       host.bringUp();
       peer.bringUp();
@@ -967,6 +1094,15 @@ public:
          if (peernetnsfd >= 0) ::close(peernetnsfd);
          if (hostnetnsfd >= 0) ::close(hostnetnsfd);
          return false;
+      }
+
+      if (plan.config.applicationID == 11)
+      {
+         basics_log("setupNetwork stage=host-ready uuid=%llu appID=%u hostIngress=%d hostEgress=%d\n",
+            (unsigned long long)plan.uuid,
+            unsigned(plan.config.applicationID),
+            int(thisNeuron->tcx_ingress_program != nullptr),
+            int(thisNeuron->tcx_egress_program != nullptr));
       }
 
       if (thisNeuron->tcx_ingress_program == nullptr || thisNeuron->tcx_egress_program == nullptr)
@@ -996,9 +1132,20 @@ public:
          return false;
       }
 
+      if (plan.config.applicationID == 11)
+      {
+         basics_log("setupNetwork stage=egress-attached uuid=%llu appID=%u\n",
+            (unsigned long long)plan.uuid,
+            unsigned(plan.config.applicationID));
+      }
+
       struct container_network_policy networkPolicy = {};
-      networkPolicy.requiresPublic4 = needsAnyExternalAddressFamily(plan, ExternalAddressFamily::ipv4) ? 1 : 0;
-      networkPolicy.requiresPublic6 = needsAnyExternalAddressFamily(plan, ExternalAddressFamily::ipv6) ? 1 : 0;
+      if (buildContainerNetworkPolicy(networkPolicy, failureReport) == false)
+      {
+         if (peernetnsfd >= 0) ::close(peernetnsfd);
+         if (hostnetnsfd >= 0) ::close(hostnetnsfd);
+         return false;
+      }
       peer_program->setArrayElement("local_container_subnet_map"_ctv, 0, thisNeuron->lcsubnet6);
       peer_program->setArrayElement("mac_map"_ctv, 0, thisNeuron->eth.mac);
       peer_program->setArrayElement("gateway_mac_map"_ctv, 0, thisNeuron->eth.gateway_mac);
@@ -1015,6 +1162,13 @@ public:
          if (hostnetnsfd >= 0) ::close(hostnetnsfd);
          return false;
       }
+
+      if (plan.config.applicationID == 11)
+      {
+         basics_log("setupNetwork stage=ingress-attached uuid=%llu appID=%u\n",
+            (unsigned long long)plan.uuid,
+            unsigned(plan.config.applicationID));
+      }
       primary_program->setArrayElement("container_network_policy_map"_ctv, 0, networkPolicy);
 
       if (syncContainerDeviceMaps(this, nullptr, failureReport) == false)
@@ -1024,8 +1178,22 @@ public:
          return false;
       }
 
+      if (plan.config.applicationID == 11)
+      {
+         basics_log("setupNetwork stage=device-maps-synced uuid=%llu appID=%u\n",
+            (unsigned long long)plan.uuid,
+            unsigned(plan.config.applicationID));
+      }
+
       syncPeerOverlayRoutingProgram();
       thisNeuron->syncContainerSwitchboardRuntime(this);
+
+      if (plan.config.applicationID == 11)
+      {
+         basics_log("setupNetwork stage=done uuid=%llu appID=%u\n",
+            (unsigned long long)plan.uuid,
+            unsigned(plan.config.applicationID));
+      }
 
       if (peernetnsfd >= 0) ::close(peernetnsfd);
       if (hostnetnsfd >= 0) ::close(hostnetnsfd);
@@ -1848,6 +2016,16 @@ public:
    static bool debugApplyContainerPostMountExecutionSecurityPolicy(Container *container, String *failureReport = nullptr)
    {
       return applyContainerPostMountExecutionSecurityPolicy(container, failureReport);
+   }
+
+   static scmp_filter_ctx debugBuildContainerSyscallFilter(Container *container, String *failureReport = nullptr)
+   {
+      return buildContainerSyscallFilter(container, failureReport);
+   }
+
+   static bool debugLoadContainerSyscallFilter(Container *container, scmp_filter_ctx seccomp, String *failureReport = nullptr)
+   {
+      return loadContainerSyscallFilter(container, seccomp, failureReport);
    }
 
    static bool debugMoveContainerExecDescriptorAboveMinimum(int& fd, String *failureReport = nullptr)
@@ -5904,6 +6082,15 @@ public:
 
    static void createContainer(ContainerPlan& plan, const String& compressedContainerPath, Container*& container)
    {
+      if (plan.config.applicationID == 11)
+      {
+         basics_log("createContainer stage=begin deploymentID=%llu appID=%u compressed=%.*s\n",
+            (unsigned long long)plan.config.deploymentID(),
+            unsigned(plan.config.applicationID),
+            compressedContainerPath.size(),
+            compressedContainerPath.data());
+      }
+
 	      container = new Container();
 	      container->plan = plan;
 	      container->name.assignItoa(plan.uuid);
@@ -6166,6 +6353,14 @@ public:
          return;
       }
 
+      if (plan.config.applicationID == 11)
+      {
+         basics_log("createContainer stage=received-artifact deploymentID=%llu appID=%u artifactRoot=%s\n",
+            (unsigned long long)plan.config.deploymentID(),
+            unsigned(plan.config.applicationID),
+            receivedSubvolumePath.c_str());
+      }
+
       String artifactShapeFailure = {};
       if (validateContainerArtifactShape(receivedSubvolumePath, &artifactShapeFailure) == false)
       {
@@ -6233,6 +6428,17 @@ public:
          cleanupContainerAfterFailedCreate(container);
          container = nullptr;
          return;
+      }
+
+      if (plan.config.applicationID == 11)
+      {
+         basics_log("createContainer stage=launch-metadata deploymentID=%llu appID=%u execute=%s cwd=%s env=%u args=%u\n",
+            (unsigned long long)plan.config.deploymentID(),
+            unsigned(plan.config.applicationID),
+            container->executePath.c_str(),
+            container->executeCwd.c_str(),
+            unsigned(container->executeEnv.size()),
+            unsigned(container->executeArgs.size()));
       }
 
       int rootfd = -1;
@@ -6326,6 +6532,14 @@ public:
          cleanupContainerAfterFailedCreate(container);
          container = nullptr;
          return;
+      }
+
+      if (plan.config.applicationID == 11)
+      {
+         basics_log("createContainer stage=artifact-moved deploymentID=%llu appID=%u finalArtifactRoot=%s\n",
+            (unsigned long long)plan.config.deploymentID(),
+            unsigned(plan.config.applicationID),
+            finalArtifactRootPath.c_str());
       }
 
       if (artifactMoveUsedSnapshotFallback)
@@ -6872,7 +7086,7 @@ public:
 
 public:
 
-   static bool restrictContainerSyscalls(Container *container)
+   static scmp_filter_ctx buildContainerSyscallFilter(Container *container, String *failureReport = nullptr)
    {
       scmp_filter_ctx seccomp = seccomp_init(SCMP_ACT_ALLOW);
       if (seccomp == nullptr)
@@ -6881,7 +7095,13 @@ public:
             (unsigned long long)container->plan.uuid,
             errno,
             strerror(errno));
-         return false;
+         if (failureReport)
+         {
+            failureReport->snprintf<"restrictContainerSyscalls seccomp_init failed for container {itoa}: {}"_ctv>(
+               container->plan.uuid,
+               String(strerror(errno)));
+         }
+         return nullptr;
       }
 
       auto denySyscallByName = [&] (const char *name) -> bool
@@ -6899,6 +7119,13 @@ public:
                (unsigned long long)container->plan.uuid,
                name,
                addRuleResult);
+            if (failureReport)
+            {
+               failureReport->snprintf<"restrictContainerSyscalls seccomp_rule_add failed for container {itoa} syscall {} rc {itoa}"_ctv>(
+                  container->plan.uuid,
+                  String{name},
+                  uint64_t(uint32_t(addRuleResult)));
+            }
             return false;
          }
 
@@ -6958,7 +7185,7 @@ public:
          if (denySyscallByName(name) == false)
          {
             seccomp_release(seccomp);
-            return false;
+            return nullptr;
          }
       }
 
@@ -6968,8 +7195,23 @@ public:
          if (denySyscallByName("sched_setaffinity") == false)
          {
             seccomp_release(seccomp);
-            return false;
+            return nullptr;
          }
+      }
+
+      return seccomp;
+   }
+
+   static bool loadContainerSyscallFilter(Container *container, scmp_filter_ctx seccomp, String *failureReport = nullptr)
+   {
+      if (seccomp == nullptr)
+      {
+         if (failureReport)
+         {
+            failureReport->snprintf<"restrictContainerSyscalls missing seccomp filter for container {itoa}"_ctv>(
+               container->plan.uuid);
+         }
+         return false;
       }
 
       int loadResult = seccomp_load(seccomp);
@@ -6979,28 +7221,47 @@ public:
          basics_log("restrictContainerSyscalls seccomp_load failed uuid=%llu rc=%d\n",
             (unsigned long long)container->plan.uuid,
             loadResult);
+         if (failureReport)
+         {
+            failureReport->snprintf<"restrictContainerSyscalls seccomp_load failed for container {itoa} rc {itoa}"_ctv>(
+               container->plan.uuid,
+               uint64_t(uint32_t(loadResult)));
+         }
          return false;
       }
 
       return true;
    }
 
+   static bool restrictContainerSyscalls(Container *container, String *failureReport = nullptr)
+   {
+      scmp_filter_ctx seccomp = buildContainerSyscallFilter(container, failureReport);
+      if (seccomp == nullptr)
+      {
+         return false;
+      }
+
+      return loadContainerSyscallFilter(container, seccomp, failureReport);
+   }
+
 private:
 
-   static bool applyContainerPostMountExecutionSecurityPolicy(Container *container, String *failureReport = nullptr)
+   static bool applyContainerPostMountExecutionSecurityPolicy(Container *container, String *failureReport = nullptr, scmp_filter_ctx prebuiltSeccomp = nullptr)
    {
       if (restrictToCapabilities(container, failureReport) == false)
       {
          return false;
       }
 
-      if (restrictContainerSyscalls(container) == false)
+      if (prebuiltSeccomp != nullptr)
       {
-         if (failureReport)
+         if (loadContainerSyscallFilter(container, prebuiltSeccomp, failureReport) == false)
          {
-            failureReport->snprintf<"restrictContainerSyscalls failed for container {itoa}"_ctv>(
-               container->plan.uuid);
+            return false;
          }
+      }
+      else if (restrictContainerSyscalls(container, failureReport) == false)
+      {
          return false;
       }
 
@@ -7070,6 +7331,29 @@ public:
          return false;
       }
 
+      String seccompBuildFailure = {};
+      scmp_filter_ctx containerSeccomp = buildContainerSyscallFilter(container, &seccompBuildFailure);
+      if (containerSeccomp == nullptr)
+      {
+         if (failureReport)
+         {
+            if (seccompBuildFailure.size() > 0)
+            {
+               failureReport->assign(seccompBuildFailure);
+            }
+            else
+            {
+               failureReport->snprintf<"failed to build seccomp filter for container {itoa}"_ctv>(container->plan.uuid);
+            }
+         }
+
+         close(startupSync[0]);
+         close(startupSync[1]);
+         close(socs[0]);
+         close(socs[1]);
+         return false;
+      }
+
       struct StartupSyncPayload
       {
          uint8_t startSignal = 0;
@@ -7109,6 +7393,7 @@ public:
 
       if (container->pid < 0)
       {
+         seccomp_release(containerSeccomp);
          if (failureReport)
          {
             failureReport->snprintf<"clone3 failed for container {itoa}: {}"_ctv>(container->plan.uuid, String(strerror(errno)));
@@ -7181,7 +7466,7 @@ public:
          }
 
          String policyFailure = {};
-         if (applyContainerPostMountExecutionSecurityPolicy(container, &policyFailure) == false)
+         if (applyContainerPostMountExecutionSecurityPolicy(container, &policyFailure, containerSeccomp) == false)
          {
             basics_log("startContainer failed to apply post-mount security policy uuid=%llu reason=%s\n",
                (unsigned long long)container->plan.uuid,
@@ -7249,8 +7534,7 @@ public:
             }
          }
 
-         parameters.flags.clear();
-         parameters.flags.push_back(container->plan.shardGroup);
+         prodigyBuildContainerStartupFlags(container->plan, parameters.flags);
 
          parameters.hasCredentialBundle = container->plan.hasCredentialBundle;
          if (parameters.hasCredentialBundle)
@@ -7407,6 +7691,7 @@ public:
       }
       else // host, clone doesn't return until child calls exec
       {
+         seccomp_release(containerSeccomp);
          close(startupSync[0]);
          close(socs[1]);
          if (useUserNamespace && mapIDs(container, failureReport) == false)
@@ -7508,6 +7793,8 @@ public:
             int(container->pendingSend),
             int(container->pendingRecv),
             (unsigned long long)container->queuedSendOutstandingBytes());
+         container->waitidPending = true;
+         container->destroyCloseCompleted = false;
          Ring::queueWaitid(container, P_PID, container->pid);
          seedDynamicData(container);
 
@@ -7747,6 +8034,21 @@ public:
 	      delete container;
 	   }
 
+      static void finalizeContainerDestroyIfReady(Container *container)
+      {
+         if (container == nullptr || container->pendingDestroy == false)
+         {
+            return;
+         }
+
+         if (container->destroyCloseCompleted == false || container->waitidPending)
+         {
+            return;
+         }
+
+         finalizeContainerDestroy(container);
+      }
+
 	   static void destroyContainer(Container *container)
 	   {
 	      if (container == nullptr || container->pendingDestroy)
@@ -7897,6 +8199,8 @@ public:
 	         waitingForCloseEvent = true;
 	      }
 
+      container->destroyCloseCompleted = (waitingForCloseEvent == false);
+
       if (applicationUsesIsolatedCPUs(container->plan.config))
       {
 	      for (uint16_t index = 0; index < container->plan.config.nLogicalCores; index++)
@@ -7958,7 +8262,7 @@ public:
          int(waitingForCloseEvent));
       std::fflush(stderr);
 
-	      if (waitingForCloseEvent)
+	      if (waitingForCloseEvent || container->waitidPending)
 	      {
 	         return;
 	      }
@@ -7967,7 +8271,7 @@ public:
          (unsigned long long)container->plan.uuid);
       std::fflush(stderr);
 
-	      finalizeContainerDestroy(container);
+	      finalizeContainerDestroyIfReady(container);
 	   }
 
 // approve in master before distributing

@@ -110,24 +110,74 @@ static inline __be16 switchboardHostToBE16(__u16 host)
 #endif
 }
 
+static inline __u32 switchboardPacketBudgetEthernetHeaderBytes(void)
+{
+   return (__u32)sizeof(struct ethhdr);
+}
+
+static inline __u32 switchboardPacketBudgetIPv4HeaderBytes(void)
+{
+   return 20u;
+}
+
+static inline __u32 switchboardPacketBudgetIPv6HeaderBytes(void)
+{
+   return 40u;
+}
+
+// These helpers describe the L3 bytes Prodigy adds on top of the original
+// packet for the maintained paths. Same-machine delivery and public egress
+// rewrite tuples in place, while cross-machine delivery adds one outer IP
+// header on the datacenter underlay.
+static inline __u32 switchboardPacketBudgetExternalIngressLocalDeliveryAddedBytes(void)
+{
+   return 0u;
+}
+
+static inline __u32 switchboardPacketBudgetExternalIngressRemoteDeliveryAddedBytes(void)
+{
+   return switchboardPacketBudgetIPv6HeaderBytes();
+}
+
+static inline __u32 switchboardPacketBudgetPrivateOverlayIPv4AddedBytes(void)
+{
+   return switchboardPacketBudgetIPv4HeaderBytes();
+}
+
+static inline __u32 switchboardPacketBudgetPrivateOverlayIPv6AddedBytes(void)
+{
+   return switchboardPacketBudgetIPv6HeaderBytes();
+}
+
+static inline __u32 switchboardPacketBudgetContainerInternetEgressAddedBytes(void)
+{
+   return 0u;
+}
+
+static inline __u32 switchboardPacketBudgetMinTransportHeaderBytes(void)
+{
+   return 20u;
+}
+
 static inline __u32 switchboardNetkitIngressL3Offset(bool has_host_ethernet)
 {
-   return has_host_ethernet ? (__u32)sizeof(struct ethhdr) : 0u;
+   return has_host_ethernet ? switchboardPacketBudgetEthernetHeaderBytes() : 0u;
 }
 
 static inline __u32 switchboardHostIngressOverlayMinimumLinearBytes(__be16 wire_protocol)
 {
-   const __u32 ipv4_header_bytes = 20u;
-   const __u32 ipv6_header_bytes = 40u;
-
    if (wire_protocol == switchboardHostToBE16(ETH_P_IPV6))
    {
-      return (__u32)(sizeof(struct ethhdr) + ipv6_header_bytes + ipv6_header_bytes);
+      return switchboardPacketBudgetEthernetHeaderBytes()
+         + switchboardPacketBudgetPrivateOverlayIPv6AddedBytes()
+         + switchboardPacketBudgetIPv6HeaderBytes();
    }
 
    if (wire_protocol == switchboardHostToBE16(ETH_P_IP))
    {
-      return (__u32)(sizeof(struct ethhdr) + ipv4_header_bytes + ipv6_header_bytes);
+      return switchboardPacketBudgetEthernetHeaderBytes()
+         + switchboardPacketBudgetPrivateOverlayIPv4AddedBytes()
+         + switchboardPacketBudgetIPv6HeaderBytes();
    }
 
    return 0u;

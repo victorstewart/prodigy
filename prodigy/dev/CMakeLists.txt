@@ -369,6 +369,7 @@ file(GLOB DISCOMBOBULATOR_SOURCE_FILES CONFIGURE_DEPENDS
 
 add_executable(prodigy ${PRODIGY_ROOT}/prodigy/prodigy.cpp)
 add_executable(mothership ${PRODIGY_ROOT}/prodigy/mothership/mothership.cpp)
+add_executable(prodigy_ready_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/ready_container.cpp)
 set(PRODIGY_LEGACY_NATIVE_CONTAINER_PROBE_TARGETS)
 if (PRODIGY_ENABLE_LEGACY_NATIVE_CONTAINER_PROBES)
    add_executable(prodigy_pingpong_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
@@ -403,6 +404,7 @@ add_executable(prodigy_runtime_environment_bgp_unit ${CMAKE_CURRENT_SOURCE_DIR}/
 add_executable(prodigy_transport_tls_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_transport_tls_unit.cpp)
 add_executable(prodigy_cluster_topology_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cluster_topology_unit.cpp)
 add_executable(prodigy_neuron_hub_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_neuron_hub_unit.cpp)
+add_executable(prodigy_ring_recvmsg_multishot_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_ring_recvmsg_multishot_unit.cpp)
 add_executable(prodigy_switchboard_routable_prefix_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_switchboard_routable_prefix_unit.cpp)
 add_executable(prodigy_switchboard_balancer_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_switchboard_balancer_unit.cpp)
 add_executable(prodigy_container_storage_layout_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_container_storage_layout_unit.cpp)
@@ -440,6 +442,7 @@ add_executable(prodigy_mothership_provider_machine_destroy_unit ${CMAKE_CURRENT_
 set(PRODIGY_ALL_BUILD_TARGETS
    prodigy
    mothership
+   prodigy_ready_container
    ${PRODIGY_LEGACY_NATIVE_CONTAINER_PROBE_TARGETS}
    prodigy_gpu_device_mount_smoke
    prodigy_shared_cpu_affinity_seccomp_unit
@@ -457,6 +460,7 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_transport_tls_unit
    prodigy_cluster_topology_unit
    prodigy_neuron_hub_unit
+   prodigy_ring_recvmsg_multishot_unit
    prodigy_switchboard_routable_prefix_unit
    prodigy_switchboard_balancer_unit
    prodigy_container_storage_layout_unit
@@ -570,6 +574,7 @@ endforeach()
 target_compile_definitions(prodigy PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy PUBLIC NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE=1)
 target_compile_definitions(mothership PUBLIC PRODIGY_DEBUG=1)
+target_compile_definitions(prodigy_ready_container PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_bundle_artifact_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
 target_compile_definitions(prodigy_mothership_cluster_report_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}" PRODIGY_ROOT_DIR="${PRODIGY_ROOT}")
 target_compile_definitions(prodigy_mothership_restart_persistence_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
@@ -586,10 +591,12 @@ target_compile_definitions(prodigy_wire_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_sdk_cpp_unit PUBLIC PRODIGY_DEBUG=1 PRODIGY_SDK_FIXTURE_DIR="${PRODIGY_ROOT}/prodigy/sdk/fixtures")
 target_compile_definitions(prodigy_mesh_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_deployments_unit PUBLIC PRODIGY_DEBUG=1)
+target_compile_definitions(prodigy_ring_recvmsg_multishot_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_brain_config_ssh_replication_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_brain_replication_credentials_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_pairing_parser_adversarial_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_container_overlay_sync_unit PUBLIC PRODIGY_DEBUG=1 PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
+target_compile_definitions(prodigy_switchboard_whitehole_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
 if (PRODIGY_ENABLE_FUZZ_TESTS)
    target_compile_definitions(prodigy_pairing_parser_fuzz PUBLIC PRODIGY_DEBUG=1)
    target_compile_definitions(prodigy_mothership_topic_fuzz PUBLIC PRODIGY_DEBUG=1)
@@ -600,6 +607,7 @@ endif()
 
 target_compile_options(prodigy PUBLIC -O2) # -g -flto
 target_compile_options(mothership PUBLIC -O2) # -g -flto
+target_compile_options(prodigy_ready_container PUBLIC -O2)
 if (PRODIGY_ENABLE_LEGACY_NATIVE_CONTAINER_PROBES)
    target_compile_options(prodigy_pingpong_container PUBLIC -O2)
    target_compile_options(prodigy_pingpong_container_alt PUBLIC -O2)
@@ -624,6 +632,7 @@ target_compile_options(prodigy_runtime_environment_bgp_unit PUBLIC -O2)
 target_compile_options(prodigy_transport_tls_unit PUBLIC -O2)
 target_compile_options(prodigy_cluster_topology_unit PUBLIC -O2)
 target_compile_options(prodigy_neuron_hub_unit PUBLIC -O2)
+target_compile_options(prodigy_ring_recvmsg_multishot_unit PUBLIC -O2)
 target_compile_options(prodigy_switchboard_routable_prefix_unit PUBLIC -O2)
 target_compile_options(prodigy_switchboard_balancer_unit PUBLIC -O2)
 target_compile_options(prodigy_container_storage_layout_unit PUBLIC -O2)
@@ -723,6 +732,10 @@ add_custom_target(container_egress_router ALL DEPENDS container.egress.router.eb
 
 add_dependencies(prodigy_container_overlay_sync_unit
    container_egress_router)
+
+add_dependencies(prodigy_switchboard_whitehole_unit
+   host_ingress_router
+   host_egress_router)
 
 # Build the boundary fake-ipv4 NAT object used by netns ingress/egress testing.
 add_custom_command(OUTPUT fake_ipv4_boundary_nat.ebpf.o
@@ -834,9 +847,45 @@ if (PROJECT_ENABLE_TESTS)
    )
 
    add_test(
+      NAME prodigy_dev_bpffs_mount_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_bpffs_mount_unit.sh ${CMAKE_BINARY_DIR}/prodigy
+   )
+
+   add_test(
+      NAME prodigy_dev_overlay_link_mtu_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_overlay_link_mtu_unit.sh ${CMAKE_BINARY_DIR}/prodigy
+   )
+
+   add_test(
+      NAME prodigy_dev_host_tcp_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_host_tcp_unit.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_ready_container
+   )
+
+   add_test(
+      NAME prodigy_dev_runtime_bundle_refresh_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_runtime_bundle_refresh_unit.sh
+   )
+
+   add_test(
+      NAME prodigy_dev_container_netkit_mtu_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_container_netkit_mtu_unit.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_ready_container
+   )
+
+   add_test(
+      NAME prodigy_dev_accepted_fixed_file_sender_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_accepted_fixed_file_sender_unit.sh ${CMAKE_BINARY_DIR}/prodigy_transport_tls_unit
+   )
+
+   add_test(
       NAME prodigy_dev_single_ns_mothership_boot
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_single_ns_mothership_boot.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership
    )
+
+   set_tests_properties(prodigy_dev_bpffs_mount_unit PROPERTIES SKIP_RETURN_CODE 77)
+   set_tests_properties(prodigy_dev_overlay_link_mtu_unit PROPERTIES SKIP_RETURN_CODE 77)
+   set_tests_properties(prodigy_dev_host_tcp_unit PROPERTIES SKIP_RETURN_CODE 77)
+   set_tests_properties(prodigy_dev_container_netkit_mtu_unit PROPERTIES SKIP_RETURN_CODE 77)
+   set_tests_properties(prodigy_dev_accepted_fixed_file_sender_unit PROPERTIES SKIP_RETURN_CODE 77)
 
    add_test(
       NAME prodigy_dev_test_cluster_membership_smoke
@@ -1076,6 +1125,11 @@ if (PROJECT_ENABLE_TESTS)
    add_test(
       NAME prodigy_neuron_hub_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_neuron_hub_unit
+   )
+
+   add_test(
+      NAME prodigy_ring_recvmsg_multishot_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_ring_recvmsg_multishot_unit
    )
 
    add_test(

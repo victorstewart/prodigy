@@ -226,6 +226,8 @@ public:
    uint32_t containerID;
    uint16_t port;
    uint8_t proto;
+   ServiceUserCapacity userCapacity;
+   uint32_t weight = 1;
    SwitchboardPortal *portal;
 
    uint64_t hash(void) const
@@ -1858,6 +1860,8 @@ public:
       wormhole->containerID = containerID;
       wormhole->port = requestedWormhole.containerPort;
       wormhole->proto = requestedWormhole.layer4;
+      wormhole->userCapacity = requestedWormhole.userCapacity;
+      wormhole->weight = serviceUserCapacityPlanningWeight(requestedWormhole.userCapacity);
       wormhole->portal = portal;
 
       wormholesByContainer.emplace(containerID, wormhole);

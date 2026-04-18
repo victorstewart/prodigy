@@ -207,6 +207,15 @@ static inline void prodigyConfigureMachineNeuronEndpoint(Machine& machine, const
       machine.neuron.setDatacenterCongestion();
    }
 
+   if (localNeuron != nullptr)
+   {
+      uint32_t maxSegmentSize = localNeuron->controlPlaneTCPMaxSegmentSize(peerAddress.is6 ? AF_INET6 : AF_INET);
+      if (maxSegmentSize > 0 && machine.neuron.isFixedFile == false && machine.neuron.fd >= 0)
+      {
+         (void)prodigySetTCPMaxSegmentSize(machine.neuron.fd, maxSegmentSize);
+      }
+   }
+
    ClusterMachinePeerAddress remoteCandidate = {};
    if (machine.peerAddresses.empty() == false)
    {

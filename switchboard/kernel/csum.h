@@ -93,7 +93,8 @@ static inline bool replace_l4_checksum_ipv6_address_skb(struct __sk_buff *skb,
 // Wormhole ingress/egress only handles native external packets on the portal
 // path, but QUIC/TLS first-flight packets can legitimately exceed a single
 // 1500-byte MTU. Keep the verifier-visible checksum walk bounded, but large
-// enough for the observed 2047-byte QUIC transport segment on the live path.
+// enough for the observed 2050-byte public QUIC reply segment on the live
+// path.
 #define SWITCHBOARD_WORMHOLE_CHECKSUM_HELPER_CHUNK_BYTES 512u
 
 __attribute__((__always_inline__))

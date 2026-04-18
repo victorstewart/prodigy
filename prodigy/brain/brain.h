@@ -762,6 +762,7 @@ public:
 	bytell_hash_set<MachineSSH *> sshs;
 
 				Mothership *mothership = nullptr;
+            bytell_hash_set<Mothership *> activeMotherships;
 				bytell_hash_set<Mothership *> closingMotherships;
 				TCPSocket mothershipSocket;
 			bool mothershipAcceptArmed = false;
@@ -3365,6 +3366,26 @@ public:
 		return conflictingExistingMasterUUID ? uint128_t(0) : existingMasterUUID;
 	}
 
+	bool peerHasFreshExistingMasterClaim(BrainView *peer) const
+	{
+		if (peerEligibleForClusterQuorum(peer) == false)
+		{
+			return false;
+		}
+
+		if (peer->registrationFresh == false)
+		{
+			return false;
+		}
+
+		if (peer->uuid == 0 || peer->boottimens == 0 || peer->existingMasterUUID == 0)
+		{
+			return false;
+		}
+
+		return true;
+	}
+
 	uint128_t deriveRegisteredMasterUUID(void) const
 	{
 		uint128_t masterUUID = 0;
@@ -3679,15 +3700,31 @@ public:
 							&& updateSelfState == UpdateSelfState::waitingForFollowerReboots
 							&& updateSelfPeerKey != 0
 							&& updateSelfFollowerBootNsByPeerKey.contains(updateSelfPeerKey));
-						if (expectedUpdateFollowerReconnect)
+						bool replaceActivePeerWithAcceptedStream = shouldReplaceActivePeerWithAcceptedStream(brain, expectedUpdateFollowerReconnect);
+						if (replaceActivePeerWithAcceptedStream)
 						{
 							std::fprintf(stderr,
-								"prodigy updateProdigy follower-accept-replace private4=%u peerKey=%llu oldFslot=%d newFslot=%d\n",
+								"prodigy debug brain accept-replace private4=%u reason=%s oldAccepted=%d oldConnected=%d oldQuarantined=%d weConnectToIt=%d oldFd=%d oldFslot=%d newFslot=%d\n",
 								brain->private4,
-								(unsigned long long)updateSelfPeerKey,
+								(expectedUpdateFollowerReconnect ? "expected-update-reconnect" : "canonical-accepted-replaces-outbound"),
+								int(brain->currentStreamAccepted),
+								int(brain->connected),
+								int(brain->quarantined),
+								int(brain->weConnectToIt),
+								brain->fd,
 								brain->fslot,
 								fslot);
 							std::fflush(stderr);
+							if (expectedUpdateFollowerReconnect)
+							{
+								std::fprintf(stderr,
+									"prodigy updateProdigy follower-accept-replace private4=%u peerKey=%llu oldFslot=%d newFslot=%d\n",
+									brain->private4,
+									(unsigned long long)updateSelfPeerKey,
+									brain->fslot,
+									fslot);
+								std::fflush(stderr);
+							}
 							abandonSocketGeneration(brain);
 						}
 						else
@@ -3703,19 +3740,21 @@ public:
 						}
 					}
 
-					if (auto it = brainWaiters.find(brain); it != brainWaiters.end())
-					{
-						// possible it's already completed and is in the CQE queue, so this is the only way to cancel it without segfaulting
-						TimeoutPacket *packet = it->second;
-						packet->flags = uint64_t(BrainTimeoutFlags::canceled);
-
-						brainWaiters.erase(it);
-					}
+					// possible it's already completed and is in the CQE queue, so this is the only
+					// safe cancellation path before the stale completion drains.
+					cancelBrainMissingWaiter(brain, "accept-known");
 
 						if (rawStreamIsActive(brain))
 						{
 							abandonSocketGeneration(brain);
 						}
+
+						// A prior queueClose() can already have a tracked close CQE in flight for
+						// this BrainView identity. Advance to a fresh transport generation before
+						// adopting the replacement accepted slot so that stale close completions
+						// from the old generation cannot dispatch against the new stream.
+						const uint8_t priorGeneration = brain->ioGeneration;
+						brain->bumpIoGeneration();
 
 						// Accepted reconnects must not inherit buffered plaintext/ciphertext
 						// or stale peer-verification state from the prior stream generation.
@@ -3724,23 +3763,25 @@ public:
 						brain->fslot = fslot;
 						brain->isFixedFile = true;
 						brain->isNonBlocking = true;
+						brain->currentStreamAccepted = true;
+						brain->noteTransportActivated();
+						Ring::publishSocketGeneration(brain);
 						std::fprintf(stderr,
-							"prodigy debug brain accept-known private4=%u fd=%d fslot=%d updateState=%u oldConnected=%d oldQuarantined=%d\n",
+							"prodigy debug brain accept-known private4=%u fd=%d fslot=%d updateState=%u oldConnected=%d oldQuarantined=%d generation=%u priorGeneration=%u transportEpoch=%u\n",
 							brain->private4,
 							brain->fd,
 							brain->fslot,
 							unsigned(updateSelfState),
 							int(brain->connected),
-							int(brain->quarantined));
+							int(brain->quarantined),
+							unsigned(brain->ioGeneration),
+							unsigned(priorGeneration),
+							unsigned(brain->transportEpoch));
 						std::fflush(stderr);
-						Ring::queueSetSockOptRaw(brain, SOL_TCP, TCP_CONGESTION, "dctcp", socklen_t(strlen("dctcp")), "brain accepted peer congestion");
-							Ring::queueSetSockOptInt(brain, SOL_SOCKET, SO_KEEPALIVE, 1, "brain accepted peer keepalive");
-							Ring::queueSetSockOptInt(brain, SOL_TCP, TCP_KEEPIDLE, int(std::max<uint32_t>(brainPeerKeepaliveSeconds, 1u)), "brain accepted peer keepidle");
-							Ring::queueSetSockOptInt(brain, SOL_TCP, TCP_KEEPINTVL, int(std::max<uint32_t>(brainPeerKeepaliveSeconds / 3, 1u)), "brain accepted peer keepintvl");
-							Ring::queueSetSockOptInt(brain, SOL_TCP, TCP_KEEPCNT, 3, "brain accepted peer keepcnt");
+                  queueAcceptedBrainPeerSocketOptions(brain);
 							if (ProdigyTransportTLSRuntime::configured() && brain->beginTransportTLS(true) == false)
 							{
-							queueCloseIfActive(brain);
+							queueBrainCloseIfActive(brain, "accept-known-tls-begin-fail");
 							brain_saddrlen = sizeof(brain_saddr);
 							Ring::queueAccept(&brainSocket, reinterpret_cast<struct sockaddr*>(&brain_saddr), &brain_saddrlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
 							return;
@@ -3807,23 +3848,14 @@ public:
 								std::fflush(stderr);
 								Ring::queueCloseRaw(fslot);
 							}
-							else if (mothership)
-							{
-								// Keep a single active mothership control stream per brain.
-								// Close duplicate accepts and keep the existing stream stable.
-								std::fprintf(stderr, "prodigy mothership accept-close transport=tcp reason=duplicate acceptedFslot=%d existingFD=%d existingFslot=%d\n",
-									fslot,
-									mothership->fd,
-									mothership->fslot);
-								std::fflush(stderr);
-								Ring::queueCloseRaw(fslot);
-							}
 							else
 							{
 								mothership = new Mothership();
 								mothership->fslot = fslot;
 								mothership->isFixedFile = true;
 								mothership->isNonBlocking = true;
+								Ring::publishSocketGeneration(mothership);
+                        activeMotherships.insert(mothership);
 								const int fixedFD = loggableSocketFD(mothership);
 								std::fprintf(stderr, "prodigy mothership accept-adopt transport=tcp source=cqe acceptedFslot=%d fixedFD=%d isFixed=%d\n",
 									fslot,
@@ -3865,22 +3897,14 @@ public:
 								std::fflush(stderr);
 								Ring::queueCloseRaw(fslot);
 							}
-							else if (mothership)
-							{
-								std::fprintf(stderr, "prodigy mothership accept-close transport=unix reason=duplicate acceptedFslot=%d existingFD=%d existingFslot=%d path=%s\n",
-									fslot,
-									mothership->fd,
-									mothership->fslot,
-									mothershipUnixSocketPath.c_str());
-								std::fflush(stderr);
-								Ring::queueCloseRaw(fslot);
-							}
 							else
 							{
 								mothership = new Mothership();
 								mothership->fslot = fslot;
 								mothership->isFixedFile = true;
 								mothership->isNonBlocking = true;
+								Ring::publishSocketGeneration(mothership);
+                        activeMotherships.insert(mothership);
 								const int fixedFD = loggableSocketFD(mothership);
 								std::fprintf(stderr, "prodigy mothership accept-adopt transport=unix source=cqe acceptedFslot=%d fixedFD=%d isFixed=%d path=%s\n",
 									fslot,
@@ -3901,27 +3925,64 @@ public:
 					}
 			}
 
-	void connectHandler(void *socket, int result) override
-	{
-			if (brains.contains(static_cast<BrainView *>(socket)))
-			{
-				BrainView *brain = static_cast<BrainView *>(socket);
-
-				if (result == 0) // connected to brain
+		void connectHandler(void *socket, int result) override
+		{
+				if (brains.contains(static_cast<BrainView *>(socket)))
 				{
-					if (Ring::socketIsClosing(brain) || brain->isFixedFile == false || brain->fslot < 0)
+					BrainView *brain = static_cast<BrainView *>(socket);
+					brain->cancelPendingConnect();
+
+					// Non-connector peers only own accepted transports in steady state.
+					// Once a peer is healthy again and no longer quarantined, any later
+					// connect CQE on the opposite-direction connector is stale fallback
+					// work and must not reinitialize the BrainView transport generation.
+					if (brain->weConnectToIt == false
+						&& brain->currentStreamAccepted == false
+						&& brain->quarantined == false)
 					{
+						basics_log("brain connect ignored non-connector completion private4=%u result=%d fd=%d fslot=%d\n",
+							brain->private4,
+							result,
+							brain->fd,
+							brain->fslot);
 						return;
 					}
 
+					// Accepted peer ownership can replace an older outbound generation on the
+					// same BrainView identity. Ignore any later connect CQEs from that stale
+					// outbound generation so we do not re-run client TLS/registration against
+					// the accepted stream.
+					if (brain->currentStreamAccepted)
+					{
+						basics_log("brain connect ignored accepted-owned completion private4=%u result=%d fd=%d fslot=%d weConnectToIt=%d\n",
+							brain->private4,
+							result,
+							brain->fd,
+							brain->fslot,
+							int(brain->weConnectToIt));
+						return;
+					}
+
+					if (result == 0) // connected to brain
+					{
+						if (Ring::socketIsClosing(brain) || brain->isFixedFile == false || brain->fslot < 0)
+						{
+						return;
+					}
+
+					cancelBrainMissingWaiter(brain, "connect-ok");
+
+					brain->currentStreamAccepted = false;
 					brain->connected = true;
+					brain->noteTransportActivated();
 					std::fprintf(stderr,
-						"prodigy debug brain connect-ok private4=%u fd=%d fslot=%d updateState=%u weConnectToIt=%d\n",
+						"prodigy debug brain connect-ok private4=%u fd=%d fslot=%d updateState=%u weConnectToIt=%d transportEpoch=%u\n",
 						brain->private4,
 						brain->fd,
 						brain->fslot,
 						unsigned(updateSelfState),
-						int(brain->weConnectToIt));
+						int(brain->weConnectToIt),
+						unsigned(brain->transportEpoch));
 					std::fflush(stderr);
 					if (updateSelfState == UpdateSelfState::waitingForFollowerReboots)
 					{
@@ -3942,7 +4003,7 @@ public:
 							std::fprintf(stderr, "prodigy updateProdigy peer-connect-tls-fail private4=%u\n", brain->private4);
 							std::fflush(stderr);
 						}
-						queueCloseIfActive(brain);
+						queueBrainCloseIfActive(brain, "connect-ok-tls-begin-fail");
 						return;
 					}
 				// reset failure streak on success
@@ -3995,7 +4056,7 @@ public:
 							basics_log("brain connect failed stream=%p private4=%u result=%d fslot=%d weConnectToIt=%d quarantined=%d attempt=%u/%u\n",
 								static_cast<void *>(brain), brain->private4, result, brain->fslot, int(brain->weConnectToIt), int(brain->quarantined), attemptNumber, attemptBudget);
 						}
-					queueCloseIfActive(brain);
+					queueBrainCloseIfActive(brain, "connect-fail", result);
 
 				if (brain->connectAttemptFailed())
 				{
@@ -4011,6 +4072,7 @@ public:
 		else if (neurons.contains(static_cast<NeuronView *>(socket)))
 		{
 			NeuronView *neuron = static_cast<NeuronView *>(socket);
+			neuron->cancelPendingConnect();
 
 				if (result == 0) // connected to neuron
 				{
@@ -4029,6 +4091,16 @@ public:
 						neuron->fd,
 						neuron->fslot,
 						int(ProdigyTransportTLSRuntime::configured()));
+					std::fprintf(stderr,
+						"brain neuron connect-ok-live stream=%p uuid=%llu private4=%u fd=%d fslot=%d reconnecting=%d tlsConfigured=%d\n",
+						static_cast<void *>(neuron),
+						(unsigned long long)(neuron->machine ? neuron->machine->uuid : 0),
+						unsigned(neuron->machine ? neuron->machine->private4 : 0u),
+						neuron->fd,
+						neuron->fslot,
+						int(reconnecting),
+						int(ProdigyTransportTLSRuntime::configured()));
+					std::fflush(stderr);
 					neuron->connectAttemptSucceded();
 					neuron->rBuffer.clear();
 					if (ProdigyTransportTLSRuntime::configured() && neuron->beginTransportTLS(false) == false)
@@ -4049,11 +4121,50 @@ public:
 				{
 					// Reconnect starts a new stream generation; do not replay buffered payloads
 					// from the prior connection because partial delivery state is unknowable.
+					std::fprintf(stderr, "brain neuron reconnect drop-buffered uuid=%llu private4=%u bytes=%llu fd=%d fslot=%d hadSuccessfulConnection=%d\n",
+						(unsigned long long)(neuron->machine ? neuron->machine->uuid : 0),
+						unsigned(neuron->machine ? neuron->machine->private4 : 0u),
+						(unsigned long long)pendingBytes,
+						neuron->fd,
+						neuron->fslot,
+						int(neuron->hadSuccessfulConnection));
+					std::fflush(stderr);
 					neuron->wBuffer.clear();
 				}
 
 				Message::construct(neuron->wBuffer, NeuronTopic::registration, ignited);
+				std::fprintf(stderr,
+					"brain neuron connect-queue-before stream=%p uuid=%llu private4=%u fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d wbytes=%u queued=%llu needsKick=%d\n",
+					static_cast<void *>(neuron),
+					(unsigned long long)(neuron->machine ? neuron->machine->uuid : 0),
+					unsigned(neuron->machine ? neuron->machine->private4 : 0u),
+					neuron->fd,
+					neuron->fslot,
+					int(neuron->pendingSend),
+					int(neuron->pendingRecv),
+					int(neuron->isTLSNegotiated()),
+					int(neuron->tlsPeerVerified),
+					unsigned(neuron->wBuffer.size()),
+					(unsigned long long)neuron->queuedSendOutstandingBytes(),
+					int(neuron->needsTransportTLSSendKick()));
+				std::fflush(stderr);
 				Ring::queueSend(neuron);
+				std::fprintf(stderr,
+					"brain neuron connect-send-submit stream=%p uuid=%llu private4=%u fd=%d fslot=%d pendingSend=%d pendingRecv=%d pendingSendBytes=%u tlsNegotiated=%d peerVerified=%d wbytes=%u queued=%llu needsKick=%d\n",
+					static_cast<void *>(neuron),
+					(unsigned long long)(neuron->machine ? neuron->machine->uuid : 0),
+					unsigned(neuron->machine ? neuron->machine->private4 : 0u),
+					neuron->fd,
+					neuron->fslot,
+					int(neuron->pendingSend),
+					int(neuron->pendingRecv),
+					unsigned(neuron->pendingSendBytes),
+					int(neuron->isTLSNegotiated()),
+					int(neuron->tlsPeerVerified),
+					unsigned(neuron->wBuffer.size()),
+					(unsigned long long)neuron->queuedSendOutstandingBytes(),
+					int(neuron->needsTransportTLSSendKick()));
+				std::fflush(stderr);
 				basics_log("brain neuron connect arm stream=%p uuid=%llu private4=%u fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d needsSendKick=%d wbytes=%u queued=%llu\n",
 					static_cast<void *>(neuron),
 					(unsigned long long)(neuron->machine ? neuron->machine->uuid : 0),
@@ -4069,6 +4180,20 @@ public:
 
 				// the neuron will now send us its state
 				Ring::queueRecv(neuron);
+				std::fprintf(stderr,
+					"brain neuron connect-recv-submit stream=%p uuid=%llu private4=%u fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d wbytes=%u queued=%llu\n",
+					static_cast<void *>(neuron),
+					(unsigned long long)(neuron->machine ? neuron->machine->uuid : 0),
+					unsigned(neuron->machine ? neuron->machine->private4 : 0u),
+					neuron->fd,
+					neuron->fslot,
+					int(neuron->pendingSend),
+					int(neuron->pendingRecv),
+					int(neuron->isTLSNegotiated()),
+					int(neuron->tlsPeerVerified),
+					unsigned(neuron->wBuffer.size()),
+					(unsigned long long)neuron->queuedSendOutstandingBytes());
+				std::fflush(stderr);
 				basics_log("brain neuron recv arm stream=%p uuid=%llu private4=%u fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d needsSendKick=%d wbytes=%u queued=%llu\n",
 					static_cast<void *>(neuron),
 					(unsigned long long)(neuron->machine ? neuron->machine->uuid : 0),
@@ -4114,6 +4239,7 @@ public:
 			else if (sshs.contains(static_cast<MachineSSH *>(socket)))
 			{
 				MachineSSH *ssh = static_cast<MachineSSH *>(socket);
+				ssh->cancelPendingConnect();
 
 				if (result == 0) // connected to brain
 				{
@@ -4155,15 +4281,53 @@ public:
 		}
 	}
 
+	bool shouldReplaceActivePeerWithAcceptedStream(BrainView *brain, bool expectedUpdateFollowerReconnect) const
+	{
+		if (brain == nullptr)
+		{
+			return false;
+		}
+
+		if (expectedUpdateFollowerReconnect)
+		{
+			return true;
+		}
+
+		// Master-side fallback redials can temporarily connect outward to a peer that
+		// canonically owns the connector. When that peer restores its accepted stream,
+		// prefer the canonical accepted transport and drop the fallback outbound one.
+		return (brain->weConnectToIt == false && brain->currentStreamAccepted == false);
+	}
+
 	void brainFound(BrainView *brain)
 	{
 		// a brain we had quarantined reappeared... either the network restored OR we restarted the neuron program or the machine itself
 		brain->boottimens = 0; // this will block any new master derivation until after it has registered
+		brain->registrationFresh = false;
 		brain->quarantined = false;
 		brain->weConnectToIt = shouldWeConnectToBrain(brain);
 		if (brain->weConnectToIt)
 		{
 			configureBrainPeerConnectAddress(brain);
+		}
+	}
+
+	void cancelBrainMissingWaiter(BrainView *brain, const char *reason = nullptr)
+	{
+		if (brain == nullptr)
+		{
+			return;
+		}
+
+		if (auto it = brainWaiters.find(brain); it != brainWaiters.end())
+		{
+			TimeoutPacket *packet = it->second;
+			packet->flags = uint64_t(BrainTimeoutFlags::canceled);
+			brainWaiters.erase(it);
+			basics_log("brainMissing waiter canceled private4=%u packet=%p reason=%s\n",
+				brain->private4,
+				static_cast<void *>(packet),
+				(reason ? reason : "unspecified"));
 		}
 	}
 
@@ -4236,6 +4400,7 @@ public:
 		if (firstMissingTransition)
 		{
 			brain->quarantined = true;
+			brain->registrationFresh = false;
 			brain->existingMasterUUID = 0;
 			basics_log("brainMissing private4=%u weAreMaster=%d peerWasMaster=%d weConnectToIt=%d\n",
 				brain->private4, int(weAreMaster), int(brain->isMasterBrain), int(brain->weConnectToIt));
@@ -4342,6 +4507,10 @@ public:
 
 			brainSocket.recreateSocket();
 			brainSocket.setIPVersion(AF_INET6);
+         if (uint32_t maxSegmentSize = controlPlaneTCPMaxSegmentSize(AF_INET6); maxSegmentSize > 0)
+         {
+            (void)prodigySetTCPMaxSegmentSize(brainSocket.fd, maxSegmentSize);
+         }
 			setsockopt(brainSocket.fd, IPPROTO_IPV6, IPV6_V6ONLY, (const int[]){0}, sizeof(int));
 			brainSocket.setKeepaliveTimeoutSeconds(brainPeerKeepaliveSeconds);
 			brainSocket.setSaddr("::"_ctv, uint16_t(ReservedPorts::brain));
@@ -4359,14 +4528,58 @@ public:
 				BrainView *brain = static_cast<BrainView *>(socket);
 				uint128_t updateSelfPeerKey = updateSelfPeerTrackingKey(brain);
 				std::fprintf(stderr,
-					"prodigy debug brain close private4=%u fd=%d fslot=%d updateState=%u weConnectToIt=%d peerKey=%llu\n",
+					"prodigy debug brain close stream=%p private4=%u fd=%d fslot=%d isFixed=%d updateState=%u weConnectToIt=%d accepted=%d connected=%d pendingSend=%d pendingRecv=%d tls=%d negotiated=%d peerVerified=%d registrationFresh=%d quarantined=%d queuedBytes=%llu wbytes=%u rbytes=%llu peerKey=%llu\n",
+					static_cast<void *>(brain),
 					brain->private4,
 					brain->fd,
 					brain->fslot,
+					int(brain->isFixedFile),
 					unsigned(updateSelfState),
 					int(brain->weConnectToIt),
+					int(brain->currentStreamAccepted),
+					int(brain->connected),
+					int(brain->pendingSend),
+					int(brain->pendingRecv),
+					int(brain->transportTLSEnabled()),
+					int(brain->isTLSNegotiated()),
+					int(brain->tlsPeerVerified),
+					int(brain->registrationFresh),
+					int(brain->quarantined),
+					(unsigned long long)brain->queuedSendOutstandingBytes(),
+					uint32_t(brain->wBuffer.outstandingBytes()),
+					(unsigned long long)brain->rBuffer.outstandingBytes(),
 					(unsigned long long)updateSelfPeerKey);
 				std::fflush(stderr);
+				const bool staleCloseAfterTransportAdvance = (
+					brain->queuedCloseTransportEpoch != 0
+					&& brain->queuedCloseTransportEpoch != brain->transportEpoch);
+				if (staleCloseAfterTransportAdvance)
+				{
+					basics_log("brain close ignored stale transport private4=%u queuedCloseEpoch=%u transportEpoch=%u weConnectToIt=%d accepted=%d fd=%d fslot=%d\n",
+						brain->private4,
+						unsigned(brain->queuedCloseTransportEpoch),
+						unsigned(brain->transportEpoch),
+						int(brain->weConnectToIt),
+						int(brain->currentStreamAccepted),
+						brain->fd,
+						brain->fslot);
+					brain->queuedCloseTransportEpoch = 0;
+					co_return;
+				}
+				const bool inertDuplicateConnectorClose = (
+					brain->weConnectToIt
+					&& rawStreamIsActive(brain) == false
+					&& brain->connected == false
+					&& brain->currentStreamAccepted == false
+					&& brain->nConnectionAttempts == 0
+					&& brain->pendingSend == false
+					&& brain->pendingRecv == false
+					&& brain->registrationFresh == false
+					&& brain->tlsPeerVerified == false
+					&& brain->isTLSNegotiated() == false
+					&& brain->queuedSendOutstandingBytes() == 0
+					&& brain->wBuffer.outstandingBytes() == 0
+					&& brain->rBuffer.outstandingBytes() == 0);
 				if (updateSelfPeerKey != 0)
 				{
 					updateSelfBundleIssuedPeerKeys.erase(updateSelfPeerKey);
@@ -4376,6 +4589,8 @@ public:
 					updateSelfRelinquishIssuedPeerKeys.erase(updateSelfPeerKey);
 				}
 				brain->connected = false;
+				brain->cancelPendingConnect();
+				brain->registrationFresh = false;
             bool expectedUpdateFollowerReboot = (
                updateSelfState == UpdateSelfState::waitingForFollowerReboots &&
                updateSelfFollowerBootNsByPeerKey.contains(updateSelfPeerTrackingKey(brain)));
@@ -4384,6 +4599,16 @@ public:
 
 			if (brain->weConnectToIt)
 			{
+				cancelBrainMissingWaiter(brain, "close-connector-reconnect");
+				if (inertDuplicateConnectorClose)
+				{
+					basics_log("brain close ignored inert duplicate connector private4=%u weConnectToIt=%d reconnectAfterClose=%d\n",
+						brain->private4,
+						int(brain->weConnectToIt),
+						int(brain->reconnectAfterClose));
+					co_return;
+				}
+
 				// this connection might've broken spuriously, or due to a network failure (maybe discovered when we sent a masterMissing message)
 				// but regardless try to reconnect, if not we'll then assume and handle the failure
 				if (brain->shouldReconnect())
@@ -4438,6 +4663,13 @@ public:
 				// During coordinated follower reboots we still need this waiter armed;
 				// skipping it can strand the master with no recovery path for the
 				// rebooted accepted peer.
+				if (brainWaiters.contains(brain))
+				{
+					basics_log("brainMissing waiter preserve-existing private4=%u reason=close-inbound packet=%p\n",
+						brain->private4,
+						static_cast<void *>(brainWaiters[brain]));
+					co_return;
+				}
 
 				TimeoutPacket *timeout = new TimeoutPacket();
 				timeout->flags = uint64_t(BrainTimeoutFlags::brainMissing);
@@ -4445,28 +4677,60 @@ public:
 				timeout->dispatcher = this;
 				timeout->setTimeoutMs(brain->nDefaultAttemptsBudget * brain->connectTimeoutMs + prodigyBrainPeerInboundMissingSlackMs);
 
-				brainWaiters.insert_or_assign(brain, timeout);
+				brainWaiters.insert({brain, timeout});
+				basics_log("brainMissing waiter armed private4=%u packet=%p reason=close-inbound timeoutMs=%lld\n",
+					brain->private4,
+					static_cast<void *>(timeout),
+					(long long)(brain->nDefaultAttemptsBudget * brain->connectTimeoutMs + prodigyBrainPeerInboundMissingSlackMs));
 				Ring::queueTimeout(timeout);
 			}
 		}
-		else if (neurons.contains(static_cast<NeuronView *>(socket)))
-		{
+			else if (neurons.contains(static_cast<NeuronView *>(socket)))
+			{
 			NeuronView *neuron = static_cast<NeuronView *>(socket);
 			neuron->connected = false;
 
 			neuron->cancelSuspended();
-			basics_log("brain neuron close stream=%p uuid=%llu private4=%u reconnect=%d fd=%d isFixed=%d fslot=%d\n",
-				static_cast<void *>(neuron),
-				(unsigned long long)(neuron->machine ? neuron->machine->uuid : 0),
-				unsigned(neuron->machine ? neuron->machine->private4 : 0u),
-				int(neuron->reconnectAfterClose),
-				neuron->fd,
-				int(neuron->isFixedFile),
-				neuron->fslot);
+		basics_log("brain neuron close stream=%p uuid=%llu private4=%u reconnect=%d connected=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d fd=%d isFixed=%d fslot=%d queuedBytes=%llu wbytes=%u rbytes=%llu\n",
+			static_cast<void *>(neuron),
+			(unsigned long long)(neuron->machine ? neuron->machine->uuid : 0),
+			unsigned(neuron->machine ? neuron->machine->private4 : 0u),
+			int(neuron->reconnectAfterClose),
+			int(neuron->connected),
+			int(neuron->pendingSend),
+			int(neuron->pendingRecv),
+			int(neuron->isTLSNegotiated()),
+			int(neuron->tlsPeerVerified),
+			neuron->fd,
+			int(neuron->isFixedFile),
+			neuron->fslot,
+			(unsigned long long)neuron->queuedSendOutstandingBytes(),
+			uint32_t(neuron->wBuffer.outstandingBytes()),
+			(unsigned long long)neuron->rBuffer.outstandingBytes());
+		std::fprintf(stderr,
+			"brain neuron close-live stream=%p uuid=%llu private4=%u reconnect=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d fd=%d fslot=%d queued=%llu rbytes=%llu\n",
+			static_cast<void *>(neuron),
+			(unsigned long long)(neuron->machine ? neuron->machine->uuid : 0),
+			unsigned(neuron->machine ? neuron->machine->private4 : 0u),
+			int(neuron->reconnectAfterClose),
+			int(neuron->pendingSend),
+			int(neuron->pendingRecv),
+			int(neuron->isTLSNegotiated()),
+			int(neuron->tlsPeerVerified),
+			neuron->fd,
+			neuron->fslot,
+			(unsigned long long)neuron->queuedSendOutstandingBytes(),
+			(unsigned long long)neuron->rBuffer.outstandingBytes());
+			std::fflush(stderr);
+			neuron->cancelPendingConnect();
 
 				if (weAreMaster && neuron->shouldReconnect())
 				{
-					neuron->rBuffer.clear();
+					// A reconnect is a fresh transport generation. If stale send/TLS state
+					// survives the prior socket, queueSend() can stay wedged behind a dead
+					// pendingSend flag and the first post-reconnect registration/control
+					// frames never get re-armed.
+					neuron->ProdigyTransportTLSStream::reset();
 					neuron->recreateSocket();
 					if (installNeuronControlSocket(neuron))
 					{
@@ -4500,13 +4764,18 @@ public:
 							armMothershipUnixListener();
 						}
 					}
-					else if (socket == (void *)mothership)
+					else if (activeMotherships.contains(static_cast<Mothership *>(socket)))
 					{
+                     Mothership *activeMothership = static_cast<Mothership *>(socket);
 							basics_log("mothership stream closed weAreMaster=%d\n", int(weAreMaster));
-                     clearSpinApplicationMothershipsForStream(mothership);
-							RingDispatcher::eraseMultiplexee(mothership); // it'll reconnect to us
-							delete mothership;
-						mothership = nullptr;
+                     clearSpinApplicationMothershipsForStream(activeMothership);
+                     activeMotherships.erase(activeMothership);
+                     if (mothership == activeMothership)
+                     {
+                        mothership = (activeMotherships.empty() ? nullptr : *activeMotherships.begin());
+                     }
+							RingDispatcher::eraseMultiplexee(activeMothership); // it'll reconnect to us
+							delete activeMothership;
 						if (weAreMaster)
 						{
 							queueMothershipListenersIfNeeded();
@@ -4530,6 +4799,7 @@ public:
 		else if (sshs.contains(static_cast<MachineSSH *>(socket)))
 		{
 			MachineSSH *ssh = static_cast<MachineSSH *>(socket);
+			ssh->cancelPendingConnect();
 
 			ssh->cancelSuspended();
 
@@ -5178,6 +5448,44 @@ public:
 			return true;
 		}
 
+      uint32_t controlPlaneTCPMaxSegmentSize(int family) const
+      {
+         if (brainConfig.runtimeEnvironment.test.enabled == false)
+         {
+            return 0;
+         }
+
+         return prodigyTCPMaxSegmentSizeForMTU(brainConfig.runtimeEnvironment.test.interContainerMTU, family);
+      }
+
+      void queueAcceptedBrainPeerSocketOptions(BrainView *brain)
+      {
+         if (brain == nullptr)
+         {
+            return;
+         }
+
+         Ring::queueSetSockOptRaw(brain, SOL_TCP, TCP_CONGESTION, "dctcp", socklen_t(strlen("dctcp")), "brain accepted peer congestion");
+         Ring::queueSetSockOptInt(brain, SOL_SOCKET, SO_KEEPALIVE, 1, "brain accepted peer keepalive");
+         Ring::queueSetSockOptInt(brain, SOL_TCP, TCP_KEEPIDLE, int(std::max<uint32_t>(brainPeerKeepaliveSeconds, 1u)), "brain accepted peer keepidle");
+         Ring::queueSetSockOptInt(brain, SOL_TCP, TCP_KEEPINTVL, int(std::max<uint32_t>(brainPeerKeepaliveSeconds / 3, 1u)), "brain accepted peer keepintvl");
+         Ring::queueSetSockOptInt(brain, SOL_TCP, TCP_KEEPCNT, 3, "brain accepted peer keepcnt");
+         // Followers can receive multi-megabyte replicated blobs immediately
+         // after accept. Keep the short accepted-peer probe cadence, but lift
+         // the in-flight data timeout to the large-payload budget before the
+         // first big frame starts arriving.
+         Ring::queueSetSockOptInt(
+            brain,
+            SOL_TCP,
+            TCP_USER_TIMEOUT,
+            int(brainPeerLargePayloadKeepaliveSeconds * 1000u),
+            "brain accepted peer large-payload user-timeout");
+         if (uint32_t maxSegmentSize = controlPlaneTCPMaxSegmentSize(brain->peerAddress.is6 ? AF_INET6 : AF_INET); maxSegmentSize > 0)
+         {
+            Ring::queueSetSockOptInt(brain, SOL_TCP, TCP_MAXSEG, int(maxSegmentSize), "brain accepted peer tcp maxseg");
+         }
+      }
+
 		void configureBrainPeerConnectAddress(BrainView *brain, bool advanceCandidate = false) const
 		{
 			if (brain == nullptr)
@@ -5258,6 +5566,10 @@ public:
 
 			brain->setIPVersion(peerAddress.is6 ? AF_INET6 : AF_INET);
 			brain->setDatacenterCongestion();
+         if (uint32_t maxSegmentSize = controlPlaneTCPMaxSegmentSize(peerAddress.is6 ? AF_INET6 : AF_INET); maxSegmentSize > 0)
+         {
+            (void)prodigySetTCPMaxSegmentSize(brain->fd, maxSegmentSize);
+         }
 	         brain->saddrLen = 0;
 	         String sourceAddressText = {};
 	         if (selectedPeerCandidate.address.size() == 0 && peerAddressText.size() > 0)
@@ -6061,6 +6373,10 @@ public:
 				timeout->setTimeoutMs(connectAttemptTimeMs);
 
 				brainWaiters.insert_or_assign(brain, timeout);
+				basics_log("brainMissing waiter armed private4=%u packet=%p reason=init-peer-wait timeoutMs=%lld\n",
+					brain->private4,
+					static_cast<void *>(timeout),
+					(long long)connectAttemptTimeMs);
 				Ring::queueTimeout(timeout);
 			}
 		}
@@ -6448,6 +6764,16 @@ public:
 					machine->cloudID.c_str());
 				std::fflush(stderr);
 
+				// finishMachineConfig() can arm live neuron-control connects. Register the
+				// Machine/NeuronView in the runtime sets first so any immediate connect CQE
+				// is recognized as a neuron socket instead of falling through unmatched.
+				machines.insert(machine);
+				neurons.insert(&machine->neuron);
+				if (machine->uuid != 0)
+				{
+					machinesByUUID.insert_or_assign(machine->uuid, machine);
+				}
+
 				if (knownMachine == false)
 				{
 					std::fprintf(stderr, "prodigy topology restore-machine finish-begin machine=%p uuid=%llu private4=%u\n",
@@ -6483,8 +6809,6 @@ public:
 					std::fflush(stderr);
 				}
 
-				machines.insert(machine);
-				neurons.insert(&machine->neuron);
 				if (machine->uuid != 0)
 				{
 					machinesByUUID.insert_or_assign(machine->uuid, machine);
@@ -6528,6 +6852,18 @@ public:
 
          if (weAreMaster == false)
          {
+            BrainView *masterPeer = currentMasterPeer();
+            if (masterPeer != nullptr)
+            {
+               Message::construct(masterPeer->wBuffer, BrainTopic::replicateContainerHealthy, containerUUID);
+               Ring::queueSend(masterPeer);
+               std::fprintf(stderr,
+                  "brain noteLocalContainerHealthy relay uuid=%llu peerPrivate4=%u peerFslot=%d\n",
+                  (unsigned long long)containerUUID,
+                  unsigned(masterPeer->private4),
+                  masterPeer->fslot);
+               std::fflush(stderr);
+            }
             return;
          }
 
@@ -6742,6 +7078,10 @@ public:
 		for (Machine *machine : machines)
 		{
 			bool knownMachine = knownMachines.contains(machine);
+			// finishMachineConfig() may issue live neuron-control connects for new
+			// machines. Track the NeuronView before that happens so connect CQEs
+			// route through the neuron branch instead of the unmatched fallback.
+			neurons.insert(&machine->neuron);
 			if (knownMachine == false)
 			{
 				finishMachineConfig(machine);
@@ -6755,7 +7095,6 @@ public:
 				// survive master handoff; do not reset it on inventory refresh.
 			}
 
-			neurons.insert(&machine->neuron);
 			if (machine->uuid != 0)
 			{
 				machinesByUUID.insert_or_assign(machine->uuid, machine);
@@ -6851,6 +7190,10 @@ public:
 		// listener itself must accept whichever IPv4/IPv6 address peers can route
 		// to on this machine.
 		brainSocket.setIPVersion(AF_INET6);
+      if (uint32_t maxSegmentSize = controlPlaneTCPMaxSegmentSize(AF_INET6); maxSegmentSize > 0)
+      {
+         (void)prodigySetTCPMaxSegmentSize(brainSocket.fd, maxSegmentSize);
+      }
 		setsockopt(brainSocket.fd, IPPROTO_IPV6, IPV6_V6ONLY, (const int[]){0}, sizeof(int));
 		brainSocket.setKeepaliveTimeoutSeconds(brainPeerKeepaliveSeconds);
 		brainSocket.setSaddr("::"_ctv, uint16_t(ReservedPorts::brain));
@@ -6960,6 +7303,44 @@ public:
 			resolveProdigyControlSocketPathFromProcess(mothershipSocketPath);
 		}
 
+			bool mothershipUnixSocketPathHasLiveListener(const String& socketPath) const
+			{
+				if (socketPath.size() == 0)
+				{
+					return false;
+				}
+
+				String ownedSocketPath = socketPath;
+
+				struct stat st = {};
+				if (::stat(ownedSocketPath.c_str(), &st) != 0 || S_ISSOCK(st.st_mode) == false)
+				{
+					return false;
+				}
+
+				int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+				if (fd < 0)
+				{
+					// Fail safe: if we cannot probe, do not tear down a path that may belong
+					// to an active master listener.
+					return true;
+				}
+
+				struct sockaddr_un address = {};
+				address.sun_family = AF_UNIX;
+				std::snprintf(address.sun_path, sizeof(address.sun_path), "%s", ownedSocketPath.c_str());
+				socklen_t addressLen = socklen_t(sizeof(address.sun_family) + std::strlen(address.sun_path));
+
+				bool listenerLive = (::connect(fd, reinterpret_cast<struct sockaddr *>(&address), addressLen) == 0);
+				if (listenerLive == false)
+				{
+					listenerLive = (errno != ECONNREFUSED);
+				}
+
+				::close(fd);
+				return listenerLive;
+			}
+
 			bool armMothershipUnixListener(void)
 			{
 				mothershipUnixAcceptArmed = false;
@@ -6976,7 +7357,6 @@ public:
 				return false;
 			}
 
-			unlink(mothershipUnixSocketPath.c_str());
 				mothershipUnixSocket.setSocketPath(mothershipUnixSocketPath.c_str());
 				mothershipUnixSocket.saddr_storage = mothershipUnixSocket.daddr_storage;
 				mothershipUnixSocket.saddrLen = mothershipUnixSocket.daddrLen;
@@ -6985,7 +7365,6 @@ public:
             bool listenerBound = false;
             for (uint32_t attempt = 1; attempt <= bindRetryLimit; attempt++)
             {
-               unlink(mothershipUnixSocketPath.c_str());
                if (::bind(mothershipUnixSocket.fd, mothershipUnixSocket.saddr<struct sockaddr>(), mothershipUnixSocket.saddrLen) == 0)
                {
                   listenerBound = true;
@@ -6995,6 +7374,16 @@ public:
                int err = errno;
                if (err == EADDRINUSE)
                {
+                  if (mothershipUnixSocketPathHasLiveListener(mothershipUnixSocketPath))
+                  {
+                     basics_log("armMothershipUnixListener live listener already owns path=%s; deferring election\n",
+                        mothershipUnixSocketPath.c_str());
+                     ::close(mothershipUnixSocket.fd);
+                     mothershipUnixSocket.fd = -1;
+                     return false;
+                  }
+
+                  unlink(mothershipUnixSocketPath.c_str());
                   if (attempt == bindRetryLimit)
                   {
                      basics_log("armMothershipUnixListener bind busy after retries path=%s; deferring election\n",
@@ -7178,10 +7567,20 @@ public:
 			}
 
 	      // Relinquishing master also relinquishes any active mothership control stream.
-	      if (mothership)
-	      {
-	         queueCloseIfActive(mothership);
-	      }
+         if (activeMotherships.empty() == false)
+         {
+            Vector<Mothership *> activeStreams = {};
+            activeStreams.reserve(activeMotherships.size());
+            for (Mothership *stream : activeMotherships)
+            {
+               activeStreams.push_back(stream);
+            }
+
+            for (Mothership *stream : activeStreams)
+            {
+               queueCloseIfActive(stream);
+            }
+         }
 
 	      if (mothershipSocket.isFixedFile)
 	      {
@@ -7302,6 +7701,19 @@ public:
 				nv->nConnectionAttempts = 0;
 				nv->nAttemptsBudget = 0;
 				nv->reconnectAfterClose = true;
+				std::fprintf(stderr,
+					"prodigy debug neuron-control-rearm-entry source=self-elect uuid=%llu private4=%u armed=%d connected=%d closing=%d pendingConnect=%d pendingSend=%d pendingRecv=%d fd=%d fslot=%d\n",
+					(unsigned long long)machine->uuid,
+					unsigned(machine->private4),
+					int(neuronControlSocketArmed(machine)),
+					int(nv->connected),
+					int(Ring::socketIsClosing(nv)),
+					int(nv->connectAttemptPending()),
+					int(nv->pendingSend),
+					int(nv->pendingRecv),
+					nv->fd,
+					nv->fslot);
+				std::fflush(stderr);
 
 				bool reconnectArmedByClose = Ring::socketIsClosing(nv);
 				if (reconnectArmedByClose == false)
@@ -7312,8 +7724,20 @@ public:
 						// transport is actually live or still progressing. Preserving a
 						// disconnected fixed slot strands the master queueing control
 						// traffic into a dead neuron stream.
-						if (neuronControlStreamActive(machine) || nv->pendingSend || nv->pendingRecv)
+						if (neuronControlStreamActive(machine) || nv->pendingSend || nv->pendingRecv || nv->connectAttemptPending())
 						{
+							std::fprintf(stderr,
+								"prodigy debug neuron-control-rearm-preserve source=self-elect uuid=%llu private4=%u connected=%d closing=%d pendingConnect=%d pendingSend=%d pendingRecv=%d fd=%d fslot=%d\n",
+								(unsigned long long)machine->uuid,
+								unsigned(machine->private4),
+								int(nv->connected),
+								int(Ring::socketIsClosing(nv)),
+								int(nv->connectAttemptPending()),
+								int(nv->pendingSend),
+								int(nv->pendingRecv),
+								nv->fd,
+								nv->fslot);
+							std::fflush(stderr);
 							continue;
 						}
 
@@ -7331,6 +7755,17 @@ public:
 							nv->connectTimeoutMs,
 							nv->nDefaultAttemptsBudget));
 						nv->attemptConnect();
+						std::fprintf(stderr,
+							"prodigy debug neuron-control-connect-submit source=self-elect uuid=%llu private4=%u fd=%d fslot=%d pendingConnect=%d pendingSend=%d pendingRecv=%d daddrLen=%u\n",
+							(unsigned long long)machine->uuid,
+							unsigned(machine->private4),
+							nv->fd,
+							nv->fslot,
+							int(nv->connectAttemptPending()),
+							int(nv->pendingSend),
+							int(nv->pendingRecv),
+							unsigned(nv->daddrLen));
+						std::fflush(stderr);
 					}
 				}
 			}
@@ -7389,10 +7824,20 @@ public:
 				// Followers never hold commander or neuron control sockets.
 				queueCloseIfActive(&mothershipSocket);
 				queueCloseIfActive(&mothershipUnixSocket);
-				if (mothership)
-				{
-					queueCloseIfActive(mothership);
-				}
+            if (activeMotherships.empty() == false)
+            {
+               Vector<Mothership *> activeStreams = {};
+               activeStreams.reserve(activeMotherships.size());
+               for (Mothership *stream : activeMotherships)
+               {
+                  activeStreams.push_back(stream);
+               }
+
+               for (Mothership *stream : activeStreams)
+               {
+                  queueCloseIfActive(stream);
+               }
+            }
 
 				for (NeuronView *nv : neurons)
 				{
@@ -8236,11 +8681,11 @@ public:
 			return weAreMaster;
 		}
 
-	protected:
+		protected:
 
-		void armMachineNeuronControl(Machine *machine) override
-		{
-			if (machine == nullptr)
+			void armMachineNeuronControl(Machine *machine) override
+			{
+				if (machine == nullptr)
 			{
 				return;
 			}
@@ -8261,16 +8706,77 @@ public:
 				return;
 			}
 
-			basics_log("brain armMachineNeuronControl uuid=%llu private4=%u privateAddress=%s isThisMachine=%d fd=%d isFixed=%d fslot=%d\n",
-				(unsigned long long)machine->uuid,
-				unsigned(machine->private4),
-				machine->privateAddress.c_str(),
-				int(machine->isThisMachine),
-				machine->neuron.fd,
-				int(machine->neuron.isFixedFile),
-				machine->neuron.fslot);
-			BrainBase::armMachineNeuronControl(machine);
-		}
+				basics_log("brain armMachineNeuronControl uuid=%llu private4=%u privateAddress=%s isThisMachine=%d fd=%d isFixed=%d fslot=%d\n",
+					(unsigned long long)machine->uuid,
+					unsigned(machine->private4),
+					machine->privateAddress.c_str(),
+					int(machine->isThisMachine),
+					machine->neuron.fd,
+					int(machine->neuron.isFixedFile),
+					machine->neuron.fslot);
+
+				NeuronView *neuron = &machine->neuron;
+				std::fprintf(stderr,
+					"prodigy debug neuron-control-rearm-entry source=brain-arm uuid=%llu private4=%u armed=%d connected=%d closing=%d pendingConnect=%d pendingSend=%d pendingRecv=%d fd=%d fslot=%d\n",
+					(unsigned long long)machine->uuid,
+					unsigned(machine->private4),
+					int(neuronControlSocketArmed(machine)),
+					int(neuron->connected),
+					int(Ring::socketIsClosing(neuron)),
+					int(neuron->connectAttemptPending()),
+					int(neuron->pendingSend),
+					int(neuron->pendingRecv),
+					neuron->fd,
+					neuron->fslot);
+				std::fflush(stderr);
+				if (neuronControlSocketArmed(machine))
+				{
+					if (Ring::socketIsClosing(neuron)
+						|| neuronControlStreamActive(machine)
+						|| neuron->pendingSend
+						|| neuron->pendingRecv
+						|| neuron->connectAttemptPending())
+					{
+						std::fprintf(stderr,
+							"prodigy debug neuron-control-rearm-preserve source=brain-arm uuid=%llu private4=%u connected=%d closing=%d pendingConnect=%d pendingSend=%d pendingRecv=%d fd=%d fslot=%d\n",
+							(unsigned long long)machine->uuid,
+							unsigned(machine->private4),
+							int(neuron->connected),
+							int(Ring::socketIsClosing(neuron)),
+							int(neuron->connectAttemptPending()),
+							int(neuron->pendingSend),
+							int(neuron->pendingRecv),
+							neuron->fd,
+							neuron->fslot);
+						std::fflush(stderr);
+						basics_log("brain armMachineNeuronControl preserve-active uuid=%llu private4=%u connected=%d closing=%d pendingSend=%d pendingRecv=%d fd=%d isFixed=%d fslot=%d\n",
+							(unsigned long long)machine->uuid,
+							unsigned(machine->private4),
+							int(neuron->connected),
+							int(Ring::socketIsClosing(neuron)),
+							int(neuron->pendingSend),
+							int(neuron->pendingRecv),
+							neuron->fd,
+							int(neuron->isFixedFile),
+							neuron->fslot);
+						return;
+					}
+
+					abandonSocketGeneration(neuron);
+				}
+
+				std::fprintf(stderr,
+					"prodigy debug neuron-control-rearm-recreate source=brain-arm uuid=%llu private4=%u pendingConnect=%d pendingSend=%d pendingRecv=%d fd=%d fslot=%d\n",
+					(unsigned long long)machine->uuid,
+					unsigned(machine->private4),
+					int(neuron->connectAttemptPending()),
+					int(neuron->pendingSend),
+					int(neuron->pendingRecv),
+					neuron->fd,
+					neuron->fslot);
+				std::fflush(stderr);
+				BrainBase::armMachineNeuronControl(machine);
+			}
 
 	public:
 
@@ -8423,8 +8929,28 @@ public:
 			case BrainTimeoutFlags::brainMissing:
 			{
 				BrainView *brain = (BrainView *)packet->originator;
+				if (auto it = brainWaiters.find(brain); it != brainWaiters.end())
+				{
+					if (it->second != packet)
+					{
+						basics_log("brainMissing timeout ignored stale packet private4=%u active=%p stale=%p\n",
+							brain ? brain->private4 : 0u,
+							static_cast<void *>(it->second),
+							static_cast<void *>(packet));
+						delete packet;
+						break;
+					}
 
-				brainWaiters.erase(brain);
+					brainWaiters.erase(it);
+				}
+				else
+				{
+					basics_log("brainMissing timeout ignored untracked packet private4=%u packet=%p\n",
+						brain ? brain->private4 : 0u,
+						static_cast<void *>(packet));
+					delete packet;
+					break;
+				}
 				delete packet;
 
 				brainMissing(brain);
@@ -8664,6 +9190,44 @@ public:
 					Ring::queueClose(stream);
 				}
 
+				void queueBrainCloseIfActive(BrainView *brain, const char *reason, int result = 0)
+				{
+					if (brain == nullptr)
+					{
+						return;
+					}
+
+					const bool active = rawStreamIsActive(brain);
+					basics_log("brain queueClose reason=%s private4=%u result=%d active=%d weConnectToIt=%d accepted=%d connected=%d pendingSend=%d pendingRecv=%d tls=%d negotiated=%d peerVerified=%d registrationFresh=%d quarantined=%d fd=%d fslot=%d queuedBytes=%llu wbytes=%u rbytes=%llu\n",
+						(reason ? reason : "unspecified"),
+						brain->private4,
+						result,
+						int(active),
+						int(brain->weConnectToIt),
+						int(brain->currentStreamAccepted),
+						int(brain->connected),
+						int(brain->pendingSend),
+						int(brain->pendingRecv),
+						int(brain->transportTLSEnabled()),
+						int(brain->isTLSNegotiated()),
+						int(brain->tlsPeerVerified),
+						int(brain->registrationFresh),
+						int(brain->quarantined),
+						brain->fd,
+						brain->fslot,
+						(unsigned long long)brain->queuedSendOutstandingBytes(),
+						uint32_t(brain->wBuffer.outstandingBytes()),
+						(unsigned long long)brain->rBuffer.outstandingBytes());
+
+					if (active == false)
+					{
+						return;
+					}
+
+					brain->noteCloseQueuedForCurrentTransport();
+					Ring::queueClose(brain);
+				}
+
 				template <typename T>
 				void abandonSocketGeneration(T *stream)
 				{
@@ -8790,14 +9354,22 @@ public:
 						return true;
 					}
 
+					Machine *machine = neuron->machine;
 					uint128_t peerUUID = 0;
 					if (ProdigyTransportTLSRuntime::extractPeerUUID(neuron->ssl, peerUUID) == false)
 					{
 						basics_log("neuron transport tls missing peer uuid fd=%d fslot=%d\n", neuron->fd, neuron->fslot);
+						std::fprintf(stderr,
+							"brain neuron tls-verify missing-peer-uuid fd=%d fslot=%d private4=%u machineUUID=%llu tlsNegotiated=%d\n",
+							neuron->fd,
+							neuron->fslot,
+							unsigned(machine ? machine->private4 : 0u),
+							(unsigned long long)(machine ? machine->uuid : 0),
+							int(neuron->isTLSNegotiated()));
+						std::fflush(stderr);
 						return false;
 					}
 
-					Machine *machine = neuron->machine;
 					if (machine && machine->uuid != 0 && machine->uuid != peerUUID)
 					{
 						basics_log("neuron transport tls uuid mismatch expected=%llu actual=%llu fd=%d fslot=%d\n",
@@ -8805,6 +9377,14 @@ public:
 							(unsigned long long)peerUUID,
 							neuron->fd,
 							neuron->fslot);
+						std::fprintf(stderr,
+							"brain neuron tls-verify uuid-mismatch expected=%llu actual=%llu private4=%u fd=%d fslot=%d\n",
+							(unsigned long long)machine->uuid,
+							(unsigned long long)peerUUID,
+							unsigned(machine->private4),
+							neuron->fd,
+							neuron->fslot);
+						std::fflush(stderr);
 						return false;
 					}
 
@@ -8829,12 +9409,22 @@ public:
 #else
 					basics_log("brain neuron transport tls peer verified fd=%d fslot=%d\n", neuron->fd, neuron->fslot);
 #endif
+					std::fprintf(stderr,
+						"brain neuron tls-verify ok peerUUID=%llu machineUUID=%llu private4=%u fd=%d fslot=%d state=%u inventoryComplete=%d\n",
+						(unsigned long long)peerUUID,
+						(unsigned long long)(machine ? machine->uuid : 0),
+						unsigned(machine ? machine->private4 : 0u),
+						neuron->fd,
+						neuron->fslot,
+						unsigned(machine ? uint32_t(machine->state) : 0u),
+						int(machine ? machine->hardware.inventoryComplete : 0));
+					std::fflush(stderr);
 					return true;
 				}
 
 				void retireClosingMothershipStreamIfNeeded(Mothership *stream, const char *reason = nullptr)
 				{
-					if (stream == nullptr || stream != mothership)
+					if (stream == nullptr || activeMotherships.contains(stream) == false)
 					{
 						return;
 					}
@@ -8845,7 +9435,11 @@ public:
 					}
 
 					closingMotherships.insert(stream);
-					mothership = nullptr;
+               activeMotherships.erase(stream);
+					if (mothership == stream)
+               {
+						mothership = (activeMotherships.empty() ? nullptr : *activeMotherships.begin());
+               }
 					std::fprintf(stderr, "prodigy mothership retire-closing reason=%s stream=%p closingStreams=%zu master=%d\n",
 						(reason ? reason : "unknown"),
 						static_cast<void *>(stream),
@@ -8893,9 +9487,10 @@ public:
 					clearSpinApplicationMothershipsForStream(stream);
 					closingMotherships.erase(stream);
 
+               activeMotherships.erase(stream);
 					if (stream == mothership)
 					{
-						mothership = nullptr;
+						mothership = (activeMotherships.empty() ? nullptr : *activeMotherships.begin());
 					}
 
 					if (stream->isFixedFile && stream->fslot >= 0)
@@ -9336,11 +9931,28 @@ public:
 					queueMothershipUnixAcceptIfNeeded();
 				}
 
+      Mothership *activeMothershipFromSocket(void *socket)
+      {
+         if (socket == nullptr)
+         {
+            return nullptr;
+         }
+
+         Mothership *stream = static_cast<Mothership *>(socket);
+         if (activeMotherships.contains(stream))
+         {
+            return stream;
+         }
+
+         return nullptr;
+      }
+
 		void recvHandler(void *socket, int result) override
 		{
-		if (brains.contains(static_cast<BrainView *>(socket)))
-		{
-			BrainView *brain = static_cast<BrainView *>(socket);
+         Mothership *activeMothership = activeMothershipFromSocket(socket);
+			if (brains.contains(static_cast<BrainView *>(socket)))
+			{
+				BrainView *brain = static_cast<BrainView *>(socket);
 			if (brain->pendingRecv == false)
 			{
 				// Ignore stale/duplicate recv completions from prior socket generations.
@@ -9374,7 +9986,7 @@ public:
 								brain->fd,
 								brain->fslot);
 							brain->rBuffer.clear();
-							queueCloseIfActive(brain);
+							queueBrainCloseIfActive(brain, "recv-overflow", result);
 							return;
 						}
 
@@ -9383,7 +9995,7 @@ public:
 							if (brain->decryptTransportTLS(uint32_t(result)) == false || verifyBrainTransportTLSPeer(brain) == false)
 							{
 								brain->rBuffer.clear();
-								queueCloseIfActive(brain);
+								queueBrainCloseIfActive(brain, "recv-decrypt-or-peer-verify-fail", result);
 								return;
 							}
 						}
@@ -9413,32 +10025,100 @@ public:
 							brain->fd,
 							brain->fslot);
 						brain->rBuffer.clear();
-						queueCloseIfActive(brain);
+						queueBrainCloseIfActive(brain, "recv-parse-fail", result);
 						return;
 					}
 
-						if (streamIsActive(brain)
+						const bool rawActiveAfterDispatch = rawStreamIsActive(brain);
+						const bool streamActiveAfterDispatch = streamIsActive(brain);
+						const bool closingAfterDispatch = Ring::socketIsClosing(brain);
+						if (streamActiveAfterDispatch
 							&& brain->transportTLSEnabled()
 							&& brain->needsTransportTLSSendKick())
 						{
 							Ring::queueSend(brain);
 						}
-						else if (brain->wBuffer.size() > 0 && streamIsActive(brain))
+						else if (brain->wBuffer.size() > 0 && streamActiveAfterDispatch)
 						{
 							Ring::queueSend(brain);
 						}
 
-						if (streamIsActive(brain))
+						if (streamActiveAfterDispatch)
 						{
 							Ring::queueRecv(brain);
+							if (brain->pendingRecv == false)
+							{
+								basics_log("brain recv rearm failed private4=%u result=%d rawActive=%d streamActive=%d closing=%d connected=%d weConnectToIt=%d accepted=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d tls=%d negotiated=%d peerVerified=%d queuedBytes=%llu wbytes=%u rbytes=%llu\n",
+									brain->private4,
+									result,
+									int(rawActiveAfterDispatch),
+									int(streamActiveAfterDispatch),
+									int(closingAfterDispatch),
+									int(brain->connected),
+									int(brain->weConnectToIt),
+									int(brain->currentStreamAccepted),
+									brain->fd,
+									brain->fslot,
+									int(brain->pendingSend),
+									int(brain->pendingRecv),
+									int(brain->transportTLSEnabled()),
+									int(brain->isTLSNegotiated()),
+									int(brain->tlsPeerVerified),
+									(unsigned long long)brain->queuedSendOutstandingBytes(),
+									uint32_t(brain->wBuffer.outstandingBytes()),
+									(unsigned long long)brain->rBuffer.outstandingBytes());
+							}
 						}
-					}
-				else
-				{
-					queueCloseIfActive(brain);
-				// try to reconnect... then when that fails...
+						else
+						{
+							basics_log("brain recv rearm skipped private4=%u result=%d rawActive=%d streamActive=%d closing=%d connected=%d weConnectToIt=%d accepted=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d tls=%d negotiated=%d peerVerified=%d queuedBytes=%llu wbytes=%u rbytes=%llu\n",
+								brain->private4,
+								result,
+								int(rawActiveAfterDispatch),
+								int(streamActiveAfterDispatch),
+								int(closingAfterDispatch),
+								int(brain->connected),
+								int(brain->weConnectToIt),
+								int(brain->currentStreamAccepted),
+								brain->fd,
+								brain->fslot,
+								int(brain->pendingSend),
+								int(brain->pendingRecv),
+								int(brain->transportTLSEnabled()),
+								int(brain->isTLSNegotiated()),
+								int(brain->tlsPeerVerified),
+								(unsigned long long)brain->queuedSendOutstandingBytes(),
+								uint32_t(brain->wBuffer.outstandingBytes()),
+								(unsigned long long)brain->rBuffer.outstandingBytes());
+				}
 			}
+		else
+		{
+			basics_log("brain recv failed stream=%p private4=%u result=%d isFixed=%d fslot=%d fd=%d weConnectToIt=%d accepted=%d connected=%d pendingSend=%d pendingRecv=%d tls=%d negotiated=%d peerVerified=%d registrationFresh=%d quarantined=%d queuedBytes=%llu wbytes=%u rbytes=%llu updateState=%u\n",
+				static_cast<void *>(brain),
+				brain->private4,
+				result,
+				int(brain->isFixedFile),
+				brain->fslot,
+				brain->fd,
+				int(brain->weConnectToIt),
+				int(brain->currentStreamAccepted),
+				int(brain->connected),
+				int(brain->pendingSend),
+				int(brain->pendingRecv),
+				int(brain->transportTLSEnabled()),
+				int(brain->isTLSNegotiated()),
+				int(brain->tlsPeerVerified),
+				int(brain->registrationFresh),
+				int(brain->quarantined),
+				(unsigned long long)brain->queuedSendOutstandingBytes(),
+				uint32_t(brain->wBuffer.outstandingBytes()),
+				(unsigned long long)brain->rBuffer.outstandingBytes(),
+				unsigned(updateSelfState));
+			queueBrainCloseIfActive(brain, "recv-fail", result);
+			// try to reconnect... then when that fails...
 		}
+	}
 		else if (neurons.contains(static_cast<NeuronView *>(socket)))
 		{
 			NeuronView *neuron = static_cast<NeuronView *>(socket);
@@ -9479,13 +10159,25 @@ public:
 							return;
 						}
 
-						if (neuron->transportTLSEnabled())
+					if (neuron->transportTLSEnabled())
+					{
+						if (neuron->decryptTransportTLS(uint32_t(result)) == false || verifyNeuronTransportTLSPeer(neuron) == false)
 						{
-							if (neuron->decryptTransportTLS(uint32_t(result)) == false || verifyNeuronTransportTLSPeer(neuron) == false)
-							{
-								neuron->rBuffer.clear();
-								queueCloseIfActive(neuron);
-								return;
+							std::fprintf(stderr,
+								"brain neuron recv-close tls-or-verify uuid=%llu private4=%u result=%d tlsNegotiated=%d peerVerified=%d fd=%d fslot=%d rbytes=%llu queued=%llu\n",
+								(unsigned long long)(neuron->machine ? neuron->machine->uuid : 0),
+								unsigned(neuron->machine ? neuron->machine->private4 : 0u),
+								result,
+								int(neuron->isTLSNegotiated()),
+								int(neuron->tlsPeerVerified),
+								neuron->fd,
+								neuron->fslot,
+								(unsigned long long)neuron->rBuffer.outstandingBytes(),
+								(unsigned long long)neuron->queuedSendOutstandingBytes());
+							std::fflush(stderr);
+							neuron->rBuffer.clear();
+							queueCloseIfActive(neuron);
+							return;
 							}
 						}
 						else
@@ -9625,41 +10317,59 @@ public:
 						if (streamIsActive(neuron))
 						{
 							Ring::queueRecv(neuron);
-						}
-					}
-				else
-				{
-					queueCloseIfActive(neuron);
-				// try to reconnect... then when that fails...
+				}
 			}
+		else
+		{
+			basics_log("neuron recv failed stream=%p uuid=%llu private4=%u result=%d isFixed=%d fslot=%d fd=%d connected=%d reconnect=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d queuedBytes=%llu wbytes=%u rbytes=%llu machineState=%d\n",
+				static_cast<void *>(neuron),
+				(unsigned long long)(neuron->machine ? neuron->machine->uuid : 0),
+				unsigned(neuron->machine ? neuron->machine->private4 : 0u),
+				result,
+				int(neuron->isFixedFile),
+				neuron->fslot,
+				neuron->fd,
+				int(neuron->connected),
+				int(neuron->reconnectAfterClose),
+				int(neuron->pendingSend),
+				int(neuron->pendingRecv),
+				int(neuron->isTLSNegotiated()),
+				int(neuron->tlsPeerVerified),
+				(unsigned long long)neuron->queuedSendOutstandingBytes(),
+				uint32_t(neuron->wBuffer.outstandingBytes()),
+				(unsigned long long)neuron->rBuffer.outstandingBytes(),
+				(neuron->machine ? int(neuron->machine->state) : -1));
+			queueCloseIfActive(neuron);
+			// try to reconnect... then when that fails...
 		}
-			else if (socket == (void *)mothership)
+	}
+			else if (activeMothership != nullptr)
 			{
-				if (mothership->pendingRecv == false)
+				if (activeMothership->pendingRecv == false)
 				{
 					// Ignore stale/duplicate recv completions from prior socket generations.
 					return;
 				}
-				mothership->pendingRecv = false;
+				activeMothership->pendingRecv = false;
 					std::fprintf(stderr, "prodigy mothership recv-complete result=%d stream=%p fd=%d fslot=%d isFixed=%d rbytes=%zu wbytes=%zu master=%d\n",
 						result,
-						static_cast<void *>(mothership),
-						mothership->fd,
-						mothership->fslot,
-					int(mothership->isFixedFile),
-					size_t(mothership->rBuffer.size()),
-					size_t(mothership->wBuffer.size()),
+						static_cast<void *>(activeMothership),
+						activeMothership->fd,
+						activeMothership->fslot,
+					int(activeMothership->isFixedFile),
+					size_t(activeMothership->rBuffer.size()),
+					size_t(activeMothership->wBuffer.size()),
 					int(weAreMaster));
 					std::fflush(stderr);
 
 					if (result > 0)
 					{
-						if (processMothershipReceivedBytes(mothership, result, "io_uring-recv") == false)
+						if (processMothershipReceivedBytes(activeMothership, result, "io_uring-recv") == false)
 						{
 							return;
 						}
 
-						queueMothershipReceiveIfNeeded(mothership, "post-dispatch");
+						queueMothershipReceiveIfNeeded(activeMothership, "post-dispatch");
 					}
 				else
 				{
@@ -9671,28 +10381,28 @@ public:
 						std::fprintf(stderr, "prodigy mothership recv-close result=%d closeCompletion=%d stream=%p fd=%d fslot=%d master=%d\n",
 							result,
 							int(closeCompletion),
-							static_cast<void *>(mothership),
-							mothership->fd,
-							mothership->fslot,
+							static_cast<void *>(activeMothership),
+							activeMothership->fd,
+							activeMothership->fslot,
 						int(weAreMaster));
 					std::fflush(stderr);
 						if (weAreMaster && closeCompletion == false)
 						{
 							queueMothershipListenersIfNeeded();
 						}
-							if (mothership->pendingSend == false
-								&& mothership->pendingRecv == false
-								&& mothership->wBuffer.outstandingBytes() == 0)
+							if (activeMothership->pendingSend == false
+								&& activeMothership->pendingRecv == false
+								&& activeMothership->wBuffer.outstandingBytes() == 0)
 							{
 								// Local one-shot commander clients hit EOF immediately after
 								// consuming the response. Retire the drained stream into the
 								// normal close-completion lifecycle so stale CQEs cannot outlive
 								// the object and collide with allocator reuse.
-								destroyIdleMothershipStreamNow(mothership, "recv-eof-drained");
+								destroyIdleMothershipStreamNow(activeMothership, "recv-eof-drained");
 							}
 						else
 						{
-							queueCloseIfActive(mothership);
+							queueCloseIfActive(activeMothership);
 						}
 					}
 				}
@@ -9768,7 +10478,8 @@ public:
 
 				void sendHandler(void *socket, int result) override
 				{
-					if (result <= 0 && socket == (void *)mothership && weAreMaster)
+               Mothership *activeMothership = activeMothershipFromSocket(socket);
+					if (result <= 0 && activeMothership != nullptr && weAreMaster)
 					{
 						queueMothershipListenersIfNeeded();
 					}
@@ -9838,9 +10549,8 @@ public:
 						int(streamIsActive(neuron)),
 						int(neuron->pendingSend));
 			}
-			else if (socket == (void *)mothership)
+			else if (activeMothership != nullptr)
 			{
-				Mothership *activeMothership = mothership;
 				size_t bytesBefore = size_t(activeMothership->wBuffer.size());
 				uint32_t submittedBytes = activeMothership->pendingSendBytes;
 				bool pendingSendBefore = activeMothership->pendingSend;
@@ -9978,9 +10688,6 @@ public:
 											switch (container->state)
 											{
 												case ContainerState::planned:
-												case ContainerState::scheduled:
-												case ContainerState::crashedRestarting:
-												case ContainerState::healthy:
 												{
 													if (donor->rack != machine->rack)
 													{
@@ -10051,6 +10758,78 @@ public:
 
 															deployment->scheduleConstructionDestruction(cwork, dwork);
 														}
+													}
+
+													break;
+												}
+												case ContainerState::scheduled:
+												case ContainerState::crashedRestarting:
+												case ContainerState::healthy:
+												{
+													bool skipLiveMove = false;
+													if (plan.isStateful)
+													{
+														skipLiveMove = (container->state != ContainerState::healthy);
+													}
+													else
+													{
+														skipLiveMove =
+															(deployment->statelessCompactionDonorIsQuiescent() == false)
+															|| (ApplicationDeployment::statelessCompactionContainerIsEligible(container) == false);
+													}
+
+													if (skipLiveMove)
+													{
+														basics_log(
+															"machine healthy donor-skip deploymentID=%llu appID=%u uuid=%llu state=%u donorPrivate4=%u targetPrivate4=%u deploymentState=%u waiting=%llu toSchedule=%llu\n",
+															(unsigned long long)deployment->plan.config.deploymentID(),
+															unsigned(deployment->plan.config.applicationID),
+															(unsigned long long)container->uuid,
+															unsigned(container->state),
+															unsigned(donor->private4),
+															unsigned(machine->private4),
+															unsigned(deployment->state),
+															(unsigned long long)deployment->waitingOnContainers.size(),
+															(unsigned long long)deployment->toSchedule.size());
+														break;
+													}
+
+													if (donor->rack != machine->rack)
+													{
+														if (plan.isStateful)
+														{
+															if (deployment->racksByShardGroup[container->shardGroup].contains(machine->rack)) break;
+
+															deployment->racksByShardGroup[container->shardGroup].erase(donor->rack);
+															deployment->racksByShardGroup[container->shardGroup].insert(machine->rack);
+														}
+
+														deployment->countPerRack[donor->rack] -= 1;
+														deployment->countPerRack[machine->rack] += 1;
+													}
+
+													nFit -= 1;
+
+                                       prodigyDebitMachineScalarResources(machine, plan.config, 1);
+
+													deployment->countPerMachine[donor] -= 1;
+													deployment->countPerMachine[machine] += 1;
+													container->state = ContainerState::aboutToDestroy;
+													deployment->handleContainerStateChange(container, true);
+
+													if (plan.isStateful)
+													{
+														DeploymentWork *dwork = deployment->planStatefulDestruction(container);
+														DeploymentWork *cwork = deployment->planStatefulConstruction(machine, container->shardGroup, DataStrategy::seeding);
+
+														deployment->scheduleConstructionDestruction(cwork, dwork);
+													}
+													else
+													{
+														DeploymentWork *dwork = deployment->planStatelessDestruction(container);
+														DeploymentWork *cwork = deployment->planStatelessConstruction(machine, container->lifetime);
+
+														deployment->scheduleConstructionDestruction(cwork, dwork);
 													}
 
 													break;
@@ -10461,22 +11240,35 @@ bool hasConnectedBrainMajority(void)
 	{
 		if (bv == nullptr) return;
 		if (bv->weConnectToIt == false && forceConnectorOwnership == false) return;
+		cancelBrainMissingWaiter(bv, forceConnectorOwnership ? "arm-outbound-force" : "arm-outbound");
 		const uint32_t preservedAttemptsBudget = bv->nAttemptsBudget;
 		const int64_t preservedAttemptDeadlineMs = bv->attemptDeadlineMs;
 		const bool preserveReconnectPolicy = (preservedAttemptsBudget > 0 || preservedAttemptDeadlineMs > 0);
+		const bool hadActivePeerSocket = peerSocketActive(bv);
+		const bool hadRawActiveStream = rawStreamIsActive(bv);
 		bv->connected = false;
 		bv->nConnectionAttempts = 0;
 		bv->reconnectAfterClose = true;
 
 		bool reconnectArmedByClose = Ring::socketIsClosing(bv);
-		if (reconnectArmedByClose == false && peerSocketActive(bv))
+		if (reconnectArmedByClose == false && hadActivePeerSocket)
 		{
-			queueCloseIfActive(bv);
+			queueBrainCloseIfActive(bv, forceConnectorOwnership ? "arm-outbound-force" : "arm-outbound");
 			reconnectArmedByClose = Ring::socketIsClosing(bv);
 		}
 
-		if (reconnectArmedByClose == false && rawStreamIsActive(bv))
+		if (reconnectArmedByClose == false && hadRawActiveStream)
 		{
+			std::fprintf(stderr,
+				"prodigy debug brain reconnect-abandon private4=%u reason=%s accepted=%d connected=%d quarantined=%d fd=%d fslot=%d\n",
+				bv->private4,
+				(forceConnectorOwnership ? "arm-outbound-force" : "arm-outbound"),
+				int(bv->currentStreamAccepted),
+				int(bv->connected),
+				int(bv->quarantined),
+				bv->fd,
+				bv->fslot);
+			std::fflush(stderr);
 			abandonSocketGeneration(bv);
 		}
 
@@ -10568,7 +11360,7 @@ bool hasConnectedBrainMajority(void)
 		{
 			const uint64_t bundleSendHeadroom = 256_KB;
 			// Large updateProdigy payloads can exceed the normal peer keepalive/user-timeout window.
-			bv->setKeepaliveTimeoutSeconds(120);
+			queueBrainPeerLargePayloadKeepalive(bv);
 			bv->wBuffer.reserve(bv->wBuffer.size() + updateSelfBundleBlob.size() + bundleSendHeadroom);
 			Message::construct(bv->wBuffer, BrainTopic::updateBundle, updateSelfBundleBlob);
 			std::fprintf(stderr, "prodigy updateProdigy bundle-send private4=%u bytes=%u\n", bv->private4, uint32_t(updateSelfBundleBlob.size()));
@@ -11119,6 +11911,16 @@ void brainHandler(BrainView *bv, Message *message)
             }
 				break;
 			}
+         case BrainTopic::replicateContainerHealthy:
+         {
+            uint128_t containerUUID = 0;
+            Message::extractArg<ArgumentNature::fixed>(args, containerUUID);
+            if (weAreMaster)
+            {
+               noteLocalContainerHealthy(containerUUID);
+            }
+            break;
+         }
          case BrainTopic::replicateMetricsSnapshot:
          {
             String serialized;
@@ -11145,6 +11947,51 @@ void brainHandler(BrainView *bv, Message *message)
 					if (auto it = deployments.find(deploymentID); it != deployments.end())
 					{
 						ApplicationDeployment *deployment = it->second;
+                  uint128_t peerKey = updateSelfPeerTrackingKey(bv);
+                  const bool requiresBlobEcho = (deployment->plan.config.containerBlobBytes > 0);
+
+                  if (requiresBlobEcho && peerKey != 0 && deployment->brainBlobQueuedPeerKeys.contains(peerKey) == false)
+                  {
+                     String serializedPlan = {};
+                     BitseryEngine::serialize(serializedPlan, deployment->plan);
+                     if (queueBrainDeploymentReplicationFromStoreToPeer(
+                        bv,
+                        serializedPlan,
+                        deploymentID,
+                        deployment->plan.config.containerBlobBytes))
+                     {
+                        deployment->brainBlobQueuedPeerKeys.insert(peerKey);
+                        std::fprintf(
+                           stderr,
+                           "prodigy replicateDeployment stage-blob private4=%u deploymentID=%llu peerKey=%llu blobBytes=%llu\n",
+                           bv->private4,
+                           (unsigned long long)deploymentID,
+                           (unsigned long long)peerKey,
+                           (unsigned long long)deployment->plan.config.containerBlobBytes);
+                        std::fflush(stderr);
+                     }
+                     else
+                     {
+                        basics_log(
+                           "replicateDeployment stage-blob failed private4=%u deploymentID=%llu peerKey=%llu blobBytes=%llu\n",
+                           bv->private4,
+                           (unsigned long long)deploymentID,
+                           (unsigned long long)peerKey,
+                           (unsigned long long)deployment->plan.config.containerBlobBytes);
+                     }
+
+                     break;
+                  }
+
+                  if (requiresBlobEcho && peerKey != 0)
+                  {
+                     if (deployment->brainBlobEchoPeerKeys.contains(peerKey))
+                     {
+                        break;
+                     }
+
+                     deployment->brainBlobEchoPeerKeys.insert(peerKey);
+                  }
 
 						deployment->brainEchos += 1;
 
@@ -11333,6 +12180,7 @@ void brainHandler(BrainView *bv, Message *message)
 				Message::extractArg<ArgumentNature::fixed>(args, bv->boottimens);
 				Message::extractArg<ArgumentNature::fixed>(args, bv->version);
 				Message::extractArg<ArgumentNature::fixed>(args, bv->existingMasterUUID);
+				bv->registrationFresh = true;
 				std::fprintf(stderr,
 					"prodigy debug brain registration private4=%u uuid=%llu boottimens=%ld existingMasterUUID=%llu updateState=%u\n",
 					bv->private4,
@@ -11361,8 +12209,7 @@ void brainHandler(BrainView *bv, Message *message)
 					bool conflictingMasterClaims = false;
 					for (BrainView *peer : brains)
 					{
-						if (peerEligibleForClusterQuorum(peer) == false) continue;
-						if (peer->existingMasterUUID == 0) continue;
+						if (peerHasFreshExistingMasterClaim(peer) == false) continue;
 						if (peer->existingMasterUUID == selfBrainUUID()) continue;
 						conflictingMasterClaims = true;
 						break;
@@ -11376,16 +12223,15 @@ void brainHandler(BrainView *bv, Message *message)
 
 				// If we are currently master but a majority of peers consistently report a different
 				// existing master, relinquish and follow that majority to avoid split-brain on heal.
-					if (weAreMaster && bv->existingMasterUUID > 0 && bv->existingMasterUUID != selfBrainUUID())
+					if (weAreMaster && peerHasFreshExistingMasterClaim(bv) && bv->existingMasterUUID != selfBrainUUID())
 					{
 						uint32_t majority = uint32_t(nBrains / 2) + 1;
 						bytell_hash_map<uint128_t, uint32_t> votesByMasterUUID;
 
 						for (BrainView *peer : brains)
 						{
-							if (peerEligibleForClusterQuorum(peer) == false) continue;
 							if (peerSocketActive(peer) == false) continue;
-							if (peer->existingMasterUUID == 0) continue;
+							if (peerHasFreshExistingMasterClaim(peer) == false) continue;
 							if (peer->existingMasterUUID == selfBrainUUID()) continue;
 
 							votesByMasterUUID[peer->existingMasterUUID] += 1;
@@ -11405,8 +12251,9 @@ void brainHandler(BrainView *bv, Message *message)
 						BrainView *candidateMasterBrain = findBrainViewByUUID(candidateMasterUUID);
 
 							bool candidateMasterActive = (candidateMasterBrain != nullptr &&
-								candidateMasterBrain->quarantined == false &&
-								peerSocketActive(candidateMasterBrain));
+								peerSocketActive(candidateMasterBrain) &&
+								peerHasFreshExistingMasterClaim(candidateMasterBrain) &&
+								candidateMasterBrain->existingMasterUUID == candidateMasterUUID);
 							bool connectedMajority = hasConnectedBrainMajority();
 							bool overrideByMajority = (candidateMasterUUID > 0 &&
 								candidateVotes >= majority &&
@@ -13718,6 +14565,56 @@ addmachines_finalize:
             if (incomingConfig.runtimeEnvironment.configured())
             {
                ownRuntimeEnvironmentConfig(incomingConfig.runtimeEnvironment, brainConfig.runtimeEnvironment);
+               if (uint32_t maxSegmentSize = controlPlaneTCPMaxSegmentSize(AF_INET6); maxSegmentSize > 0)
+               {
+                  if (brainSocket.isFixedFile && brainSocket.fslot >= 0)
+                  {
+                     Ring::queueSetSockOptInt(&brainSocket, SOL_TCP, TCP_MAXSEG, int(maxSegmentSize), "brain listener tcp maxseg refresh");
+                  }
+                  else
+                  {
+                     (void)prodigySetTCPMaxSegmentSize(brainSocket.fd, maxSegmentSize);
+                  }
+               }
+
+               for (BrainView *peer : brains)
+               {
+                  if (peer == nullptr)
+                  {
+                     continue;
+                  }
+
+                  uint32_t maxSegmentSize = controlPlaneTCPMaxSegmentSize(peer->peerAddress.is6 ? AF_INET6 : AF_INET);
+                  if (peer->isFixedFile && peer->fslot >= 0 && maxSegmentSize > 0)
+                  {
+                     Ring::queueSetSockOptInt(peer, SOL_TCP, TCP_MAXSEG, int(maxSegmentSize), "brain peer tcp maxseg refresh");
+                  }
+                  else if (peer->fd >= 0 && maxSegmentSize > 0)
+                  {
+                     (void)prodigySetTCPMaxSegmentSize(peer->fd, maxSegmentSize);
+                  }
+               }
+
+               for (Machine *machine : machines)
+               {
+                  if (machine == nullptr)
+                  {
+                     continue;
+                  }
+
+                  prodigyConfigureMachineNeuronEndpoint(*machine, thisNeuron);
+                  IPAddress peerAddress = {};
+                  if (prodigyResolveMachinePeerAddress(*machine, peerAddress) == false)
+                  {
+                     continue;
+                  }
+
+                  uint32_t maxSegmentSize = controlPlaneTCPMaxSegmentSize(peerAddress.is6 ? AF_INET6 : AF_INET);
+                  if (machine->neuron.isFixedFile && machine->neuron.fslot >= 0 && maxSegmentSize > 0)
+                  {
+                     Ring::queueSetSockOptInt(&machine->neuron, SOL_TCP, TCP_MAXSEG, int(maxSegmentSize), "neuron control tcp maxseg refresh");
+                  }
+               }
             }
 
             String serializedBrainConfig;
@@ -15936,11 +16833,12 @@ addmachines_finalize:
 
 					// Replicate lightweight deployment metadata first so a follower can
 					// take over scheduling even if the leader dies during large blob transfer.
-					// Then fan out the blob payload for peers that rely on local image stores.
+					// Only queue the large blob to a given peer after that peer echoes the
+					// metadata frame, so a slow metadata apply path cannot immediately wedge
+					// the same control socket behind a multi-megabyte follow-up frame.
 					if (nBrains > 1)
 					{
 						queueBrainDeploymentReplication(trustedSerializedPlan, ""_ctv);
-						queueBrainDeploymentReplication(trustedSerializedPlan, containerBlob);
 					}
 
 				Message::construct(mothership->wBuffer, MothershipTopic::spinApplication, uint8_t(SpinApplicationResponseCode::okay));
@@ -16048,7 +16946,7 @@ addmachines_finalize:
 
 									for (ContainerView *container : containers)
 									{
-										ContainerPlan planToReplay = container->generatePlan(deployment->plan);
+										ContainerPlan planToReplay = container->generatePlan(deployment->plan, deployment->nShardGroups);
 										applyCredentialsToContainerPlan(deployment->plan, *container, planToReplay);
 
                               NeuronContainerBootstrap bootstrap;
@@ -16068,8 +16966,6 @@ addmachines_finalize:
 						{
 							assignMachineFragment(machine);
 						}
-
-                  sendNeuronSwitchboardStateSync(machine);
 
 					}
 					// else main brain hasn't reached ignition yet. we need to wait for that otherwise we won't have gathered all
@@ -16232,6 +17128,22 @@ addmachines_finalize:
 						Machine *previousMachine = container->machine;
 						ContainerState previousState = container->state;
 						ContainerState uploadedState = plan.state;
+						uint128_t previousPairingAddress = container->pairingAddress();
+						bool replayActivePeerPairings = false;
+
+						if (previousState == ContainerState::healthy && uploadedState == ContainerState::healthy)
+						{
+							for (const auto& [service, advertisement] : container->advertisements)
+							{
+								auto updatedAdvertisement = plan.advertisements.find(service);
+								if (updatedAdvertisement != plan.advertisements.end() &&
+								    updatedAdvertisement->second.port != advertisement.port)
+								{
+									replayActivePeerPairings = true;
+									break;
+								}
+							}
+						}
 
 						if (previousMachine)
 						{
@@ -16271,11 +17183,17 @@ addmachines_finalize:
                      container->whiteholes = plan.whiteholes;
                      container->assignedGPUMemoryMBs = plan.assignedGPUMemoryMBs;
                      container->assignedGPUDevices = plan.assignedGPUDevices;
-							container->fragment = plan.fragment;
+						container->fragment = plan.fragment;
 						container->setMeshAddress(container_network_subnet6, brainConfig.datacenterFragment, neuron->machine->fragment, container->fragment);
 						container->shardGroup = plan.shardGroup;
 						container->subscriptions = plan.subscriptions;
 	   				container->advertisements = plan.advertisements;
+						if (previousState == ContainerState::healthy &&
+						    uploadedState == ContainerState::healthy &&
+						    previousPairingAddress != container->pairingAddress())
+						{
+							replayActivePeerPairings = true;
+						}
 
 	   				auto deploymentIt = deployments.find(container->deploymentID);
 						if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
@@ -16331,6 +17249,11 @@ addmachines_finalize:
 						{
 							container->state = previousState;
 							deployment->containerIsHealthy(container);
+						}
+						else if (replayActivePeerPairings)
+						{
+							container->replayActivePairingsToSelf();
+							container->replayActivePairingsToPeers();
 						}
 					}
 

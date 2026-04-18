@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <linux/pkt_cls.h>
+#include <netinet/udp.h>
 
 class TestSuite
 {
@@ -76,6 +78,23 @@ static bool lookupProgramMapElement(BPFProgram& program, StringType auto&& mapNa
    return found;
 }
 
+template <typename Key, typename Value>
+static bool updateProgramMapElement(BPFProgram& program, StringType auto&& mapName, const Key& key, const Value& value)
+{
+   bool updated = false;
+   program.openMap(mapName, [&] (int mapFD) -> void {
+
+      if (mapFD < 0)
+      {
+         return;
+      }
+
+      updated = (bpf_map_update_elem(mapFD, &key, &value, BPF_ANY) == 0);
+   });
+
+   return updated;
+}
+
 static switchboard_wormhole_egress_key makeWormholeEgressKey(uint8_t datacenterPrefix,
    uint32_t containerKey,
    uint16_t containerPort,
@@ -125,6 +144,57 @@ static Vector<uint8_t> makeIPv6UDPFrame(const char *srcIPv6,
    udph->source = htons(sourcePort);
    udph->dest = htons(destPort);
    udph->len = htons(sizeof(struct udphdr));
+   return frame;
+}
+
+static void parseIPv6Bytes(const char *text, uint8_t out[16])
+{
+   if (inet_pton(AF_INET6, text, out) != 1)
+   {
+      std::fprintf(stderr, "unable to parse ipv6 test address: %s\n", text);
+      std::abort();
+   }
+}
+
+static Vector<uint8_t> makeIPv6UDPFrameWithPayload(const char *srcIPv6,
+   const char *dstIPv6,
+   uint16_t sourcePort,
+   uint16_t destPort,
+   const Vector<uint8_t>& payload,
+   bool includeEthernet)
+{
+   const size_t ethBytes = includeEthernet ? sizeof(struct ethhdr) : 0u;
+   Vector<uint8_t> frame = {};
+   frame.resize(ethBytes + sizeof(struct ipv6hdr) + sizeof(struct udphdr) + payload.size());
+   std::memset(frame.data(), 0, frame.size());
+
+   if (includeEthernet)
+   {
+      struct ethhdr *eth = reinterpret_cast<struct ethhdr *>(frame.data());
+      eth->h_proto = bpf_htons(ETH_P_IPV6);
+   }
+
+   struct ipv6hdr *ip6h = reinterpret_cast<struct ipv6hdr *>(frame.data() + ethBytes);
+   ip6h->version = 6;
+   ip6h->nexthdr = IPPROTO_UDP;
+   ip6h->hop_limit = 64;
+   ip6h->payload_len = htons(static_cast<uint16_t>(sizeof(struct udphdr) + payload.size()));
+   parseIPv6Bytes(srcIPv6, ip6h->saddr.s6_addr);
+   parseIPv6Bytes(dstIPv6, ip6h->daddr.s6_addr);
+
+   struct udphdr *udph = reinterpret_cast<struct udphdr *>(frame.data() + ethBytes + sizeof(struct ipv6hdr));
+   udph->source = htons(sourcePort);
+   udph->dest = htons(destPort);
+   udph->len = htons(static_cast<uint16_t>(sizeof(struct udphdr) + payload.size()));
+   std::memcpy(frame.data() + ethBytes + sizeof(struct ipv6hdr) + sizeof(struct udphdr), payload.data(), payload.size());
+
+   udph->check = compute_ipv6_transport_checksum_portable(
+      ip6h->saddr.s6_addr,
+      ip6h->daddr.s6_addr,
+      IPPROTO_UDP,
+      udph,
+      static_cast<__u32>(sizeof(struct udphdr) + payload.size()),
+      __builtin_offsetof(struct udphdr, check));
    return frame;
 }
 
@@ -495,6 +565,61 @@ static void testContainerPeerEgressRouterLoadsAfterWormholeSourceRewrite(TestSui
    peerProgram.close();
 }
 
+static void testContainerPeerEgressRouterDropsPacketsOverConfiguredMTU(TestSuite& suite)
+{
+   String objectPath = {};
+   objectPath.assign(PRODIGY_TEST_BINARY_DIR);
+   objectPath.append("/container.egress.router.ebpf.o"_ctv);
+
+   BPFProgram peerProgram = {};
+   suite.expect(peerProgram.load(objectPath, "container_egress_router"_ctv),
+      "container_peer_egress_router_drop_over_mtu_loads_program");
+
+   if (peerProgram.prog_fd >= 0)
+   {
+      container_network_policy networkPolicy = {};
+      networkPolicy.interContainerMTU = 1280u;
+      peerProgram.setArrayElement("container_network_policy_map"_ctv, 0, networkPolicy);
+
+      Vector<uint8_t> payload = {};
+      payload.resize(1300u);
+      for (uint32_t index = 0; index < payload.size(); index += 1)
+      {
+         payload[index] = static_cast<uint8_t>((index * 17u + 5u) & 0xffu);
+      }
+
+      Vector<uint8_t> frame = makeIPv6UDPFrameWithPayload(
+         "fdf8:d94c:7c33:e26e:ca4b:f501:f454:a6ee",
+         "fdf8:d94c:7c33:e26e:ca4b:f501:e160:7c7b",
+         8443,
+         47156,
+         payload,
+         true);
+      Vector<uint8_t> output = {};
+      output.resize(frame.size());
+
+      LIBBPF_OPTS(bpf_test_run_opts, opts,
+         .data_in = frame.data(),
+         .data_out = output.data(),
+         .data_size_in = static_cast<__u32>(frame.size()),
+         .data_size_out = static_cast<__u32>(output.size()),
+         .repeat = 1,
+      );
+
+      int runResult = bpf_prog_test_run_opts(peerProgram.prog_fd, &opts);
+      suite.expect(runResult == 0, "container_peer_egress_router_drop_over_mtu_test_run_succeeds");
+      suite.expect(opts.retval == NETKIT_DROP,
+         "container_peer_egress_router_drop_over_mtu_returns_drop");
+
+      __u64 oversizeDrops = 0;
+      peerProgram.getArrayElement("container_router_stats_map"_ctv, 1, oversizeDrops);
+      suite.expect(oversizeDrops == 1,
+         "container_peer_egress_router_drop_over_mtu_bumps_stat");
+   }
+
+   peerProgram.close();
+}
+
 static void testWormholeEgressBindingReconcilePreservesDesiredKeysDuringStaleRemoval(TestSuite& suite)
 {
    SwitchboardWormholeEgressBindingEntry desired = {};
@@ -584,6 +709,192 @@ static void testWormholeRewriteLayoutResolvesEthernetAndL3Frames(TestSuite& suit
    suite.expect(wormholeEgressKeysEqual(l3Key, expected), "wormhole_rewrite_layout_l3_lookup_key_matches_binding");
 }
 
+static void testContainerPeerEgressRouterRewritesCrossMachineWormholeReplyForOverlay(TestSuite& suite)
+{
+   String objectPath = {};
+   objectPath.assign(PRODIGY_TEST_BINARY_DIR);
+   objectPath.append("/container.egress.router.ebpf.o"_ctv);
+
+   BPFProgram peerProgram = {};
+   suite.expect(peerProgram.load(objectPath, "container_egress_router"_ctv),
+      "container_peer_egress_router_cross_machine_wormhole_reply_loads_program");
+
+   if (peerProgram.prog_fd >= 0)
+   {
+      local_container_subnet6 localSubnet = {};
+      localSubnet.dpfx = 0x01;
+      localSubnet.mpfx[0] = 0xf4;
+      localSubnet.mpfx[1] = 0x54;
+      localSubnet.mpfx[2] = 0xa6;
+      peerProgram.setArrayElement("local_container_subnet_map"_ctv, 0, localSubnet);
+
+      __u32 nicIfidx = 77;
+      peerProgram.setArrayElement("container_device_map"_ctv, 0, nicIfidx);
+
+      mac localMAC = {};
+      localMAC.mac[0] = 0x02;
+      localMAC.mac[1] = 0x42;
+      localMAC.mac[2] = 0xac;
+      localMAC.mac[3] = 0x11;
+      localMAC.mac[4] = 0x00;
+      localMAC.mac[5] = 0x03;
+      peerProgram.setArrayElement("mac_map"_ctv, 0, localMAC);
+
+      mac gatewayMAC = {};
+      gatewayMAC.mac[0] = 0x02;
+      gatewayMAC.mac[1] = 0x42;
+      gatewayMAC.mac[2] = 0xac;
+      gatewayMAC.mac[3] = 0x11;
+      gatewayMAC.mac[4] = 0x00;
+      gatewayMAC.mac[5] = 0x01;
+      peerProgram.setArrayElement("gateway_mac_map"_ctv, 0, gatewayMAC);
+
+      switchboard_overlay_config overlayConfig = {};
+      overlayConfig.container_network_enabled = 1;
+      peerProgram.setArrayElement("overlay_config_map"_ctv, 0, overlayConfig);
+
+      switchboard_overlay_machine_route route = {};
+      route.family = SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6;
+      route.use_gateway_mac = 1;
+      parseIPv6Bytes("fd00:10::c", route.source6);
+      parseIPv6Bytes("fd00:10::a", route.next_hop6);
+      switchboard_overlay_machine_route_key routeKey = switchboardMakeOverlayMachineRouteKey(0xe1607cu);
+      suite.expect(updateProgramMapElement(peerProgram, "overlay_machine_routes_full"_ctv, routeKey, route),
+         "container_peer_egress_router_cross_machine_wormhole_reply_sets_overlay_route");
+
+      switchboard_wormhole_egress_key bindingKey = makeWormholeEgressKey(0x01, 0xeef454a6u, 8443, IPPROTO_UDP);
+      switchboard_wormhole_egress_binding binding = {};
+      parseIPv6Bytes("2001:db8:100::c", reinterpret_cast<uint8_t *>(binding.addr6));
+      binding.port = htons(443);
+      binding.proto = IPPROTO_UDP;
+      binding.is_ipv6 = 1;
+      suite.expect(updateProgramMapElement(peerProgram, "wormhole_egress_bindings"_ctv, bindingKey, binding),
+         "container_peer_egress_router_cross_machine_wormhole_reply_sets_binding");
+
+      Vector<uint8_t> payload = {};
+      payload.resize(2044u - sizeof(struct udphdr));
+      for (uint32_t index = 0; index < payload.size(); index += 1)
+      {
+         payload[index] = static_cast<uint8_t>((index * 41u + 23u) & 0xffu);
+      }
+
+      Vector<uint8_t> frame = makeIPv6UDPFrameWithPayload(
+         "fdf8:d94c:7c33:e26e:ca4b:f501:f454:a6ee",
+         "fdf8:d94c:7c33:e26e:ca4b:f501:e160:7c7b",
+         8443,
+         47156,
+         payload,
+         true);
+      Vector<uint8_t> output = {};
+      output.resize(frame.size() + sizeof(struct ipv6hdr) + 64u);
+
+      LIBBPF_OPTS(bpf_test_run_opts, opts,
+         .data_in = frame.data(),
+         .data_out = output.data(),
+         .data_size_in = static_cast<__u32>(frame.size()),
+         .data_size_out = static_cast<__u32>(output.size()),
+         .repeat = 1,
+      );
+
+      int runResult = bpf_prog_test_run_opts(peerProgram.prog_fd, &opts);
+      suite.expect(runResult == 0, "container_peer_egress_router_cross_machine_wormhole_reply_test_run_succeeds");
+      suite.expect(opts.retval == TC_ACT_REDIRECT,
+         "container_peer_egress_router_cross_machine_wormhole_reply_redirects_to_nic");
+      suite.expect(opts.data_size_out == frame.size() + sizeof(struct ipv6hdr),
+         "container_peer_egress_router_cross_machine_wormhole_reply_adds_outer_ipv6_header");
+
+      if (runResult == 0
+         && opts.data_size_out >= (sizeof(struct ethhdr) + (2u * sizeof(struct ipv6hdr)) + sizeof(struct udphdr)))
+      {
+         const uint8_t expectedGatewayMAC[6] = {0x02, 0x42, 0xac, 0x11, 0x00, 0x01};
+         const uint8_t expectedLocalMAC[6] = {0x02, 0x42, 0xac, 0x11, 0x00, 0x03};
+         uint8_t expectedOuterSrc[16] = {};
+         uint8_t expectedOuterDst[16] = {};
+         uint8_t expectedInnerSrc[16] = {};
+         uint8_t expectedInnerDst[16] = {};
+         parseIPv6Bytes("fd00:10::c", expectedOuterSrc);
+         parseIPv6Bytes("fd00:10::a", expectedOuterDst);
+         parseIPv6Bytes("2001:db8:100::c", expectedInnerSrc);
+         parseIPv6Bytes("fdf8:d94c:7c33:e26e:ca4b:f501:e160:7c7b", expectedInnerDst);
+
+         const struct ethhdr *eth = reinterpret_cast<const struct ethhdr *>(output.data());
+         suite.expect(eth->h_proto == bpf_htons(ETH_P_IPV6),
+            "container_peer_egress_router_cross_machine_wormhole_reply_preserves_ipv6_ethertype");
+         suite.expect(std::memcmp(eth->h_source, expectedLocalMAC, sizeof(expectedLocalMAC)) == 0,
+            "container_peer_egress_router_cross_machine_wormhole_reply_sets_source_mac");
+         suite.expect(std::memcmp(eth->h_dest, expectedGatewayMAC, sizeof(expectedGatewayMAC)) == 0,
+            "container_peer_egress_router_cross_machine_wormhole_reply_sets_gateway_mac");
+
+         const struct ipv6hdr *outer6 = reinterpret_cast<const struct ipv6hdr *>(output.data() + sizeof(struct ethhdr));
+         suite.expect(outer6->nexthdr == IPPROTO_IPV6,
+            "container_peer_egress_router_cross_machine_wormhole_reply_wraps_inner_ipv6");
+         suite.expect(std::memcmp(outer6->saddr.s6_addr, expectedOuterSrc, sizeof(expectedOuterSrc)) == 0,
+            "container_peer_egress_router_cross_machine_wormhole_reply_sets_outer_source");
+         suite.expect(std::memcmp(outer6->daddr.s6_addr, expectedOuterDst, sizeof(expectedOuterDst)) == 0,
+            "container_peer_egress_router_cross_machine_wormhole_reply_sets_outer_destination");
+
+         const struct ipv6hdr *inner6 = reinterpret_cast<const struct ipv6hdr *>(output.data() + sizeof(struct ethhdr) + sizeof(struct ipv6hdr));
+         bool innerProtocolMatches = (inner6->nexthdr == IPPROTO_UDP);
+         bool innerSourceNonZero = false;
+         for (size_t index = 0; index < sizeof(expectedInnerSrc); index += 1)
+         {
+            if (inner6->saddr.s6_addr[index] != 0)
+            {
+               innerSourceNonZero = true;
+               break;
+            }
+         }
+         bool innerDestinationMatches = (std::memcmp(inner6->daddr.s6_addr, expectedInnerDst, sizeof(expectedInnerDst)) == 0);
+         const struct udphdr *udph = reinterpret_cast<const struct udphdr *>(inner6 + 1);
+         __u16 expectedChecksum = compute_ipv6_transport_checksum_portable(
+            inner6->saddr.s6_addr,
+            inner6->daddr.s6_addr,
+            IPPROTO_UDP,
+            udph,
+            ntohs(udph->len),
+            __builtin_offsetof(struct udphdr, check));
+         bool checksumMatches = (udph->check == expectedChecksum);
+
+         if (!innerProtocolMatches || !innerSourceNonZero || !innerDestinationMatches || !checksumMatches)
+         {
+            char innerSourceText[INET6_ADDRSTRLEN] = {};
+            char innerDestText[INET6_ADDRSTRLEN] = {};
+            char expectedDestText[INET6_ADDRSTRLEN] = {};
+            (void)inet_ntop(AF_INET6, inner6->saddr.s6_addr, innerSourceText, sizeof(innerSourceText));
+            (void)inet_ntop(AF_INET6, inner6->daddr.s6_addr, innerDestText, sizeof(innerDestText));
+            (void)inet_ntop(AF_INET6, expectedInnerDst, expectedDestText, sizeof(expectedDestText));
+            std::fprintf(stderr,
+               "container_peer_egress_router_cross_machine_wormhole_reply debug inner nexthdr=%u src=%s dst=%s expected_dst=%s udp_check=%u expected_check=%u\n",
+               unsigned(inner6->nexthdr),
+               innerSourceText,
+               innerDestText,
+               expectedDestText,
+               unsigned(ntohs(udph->check)),
+               unsigned(ntohs(expectedChecksum)));
+         }
+
+         suite.expect(innerProtocolMatches,
+            "container_peer_egress_router_cross_machine_wormhole_reply_keeps_udp_inner_protocol");
+         suite.expect(innerSourceNonZero,
+            "container_peer_egress_router_cross_machine_wormhole_reply_preserves_nonzero_inner_source_address");
+         suite.expect(innerDestinationMatches,
+            "container_peer_egress_router_cross_machine_wormhole_reply_preserves_inner_destination_address");
+         suite.expect(ntohs(udph->source) != 0,
+            "container_peer_egress_router_cross_machine_wormhole_reply_preserves_nonzero_inner_source_port");
+         suite.expect(ntohs(udph->dest) == 47156,
+            "container_peer_egress_router_cross_machine_wormhole_reply_preserves_inner_destination_port");
+         suite.expect(ntohs(udph->len) == (sizeof(struct udphdr) + payload.size()),
+            "container_peer_egress_router_cross_machine_wormhole_reply_preserves_udp_length");
+         suite.expect(std::memcmp(reinterpret_cast<const uint8_t *>(udph + 1), payload.data(), payload.size()) == 0,
+            "container_peer_egress_router_cross_machine_wormhole_reply_preserves_payload");
+         suite.expect(checksumMatches,
+            "container_peer_egress_router_cross_machine_wormhole_reply_recomputes_udp_checksum");
+      }
+
+      peerProgram.close();
+   }
+}
+
 int main(void)
 {
    TestSuite suite = {};
@@ -591,8 +902,10 @@ int main(void)
    testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntries(suite);
    testContainerPeerRuntimeSyncPopulatesAndClearsWormholeEgressBindings(suite);
    testContainerPeerEgressRouterLoadsAfterWormholeSourceRewrite(suite);
+   testContainerPeerEgressRouterDropsPacketsOverConfiguredMTU(suite);
    testWormholeEgressBindingReconcilePreservesDesiredKeysDuringStaleRemoval(suite);
    testWormholeRewriteLayoutResolvesEthernetAndL3Frames(suite);
+   testContainerPeerEgressRouterRewritesCrossMachineWormholeReplyForOverlay(suite);
 
    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

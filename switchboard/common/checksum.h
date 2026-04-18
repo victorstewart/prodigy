@@ -9,7 +9,10 @@
 
 #include <bpf/bpf_endian.h>
 
-#define SWITCHBOARD_MAX_WORMHOLE_CHECKSUM_BYTES 2048u
+// Live public QUIC reply rewrites now reach a 2050-byte UDP transport segment.
+// Keep the ceiling exact so the helper loop bounds stay tight while the
+// maintained battery's current packet still fits.
+#define SWITCHBOARD_MAX_WORMHOLE_CHECKSUM_BYTES 2050u
 #define SWITCHBOARD_WORMHOLE_SKB_CHECKSUM_CHUNK_BYTES 128u
 
 __attribute__((__always_inline__))
@@ -90,30 +93,43 @@ __attribute__((__always_inline__))
 static inline __u64 switchboardPacketRewriteManualChecksumStoreFlags(void)
 {
    // When a path recomputes the full transport checksum from the mutated
-   // packet bytes, keep skb flow hashing coherent but avoid layering helper
+   // packet bytes, keep the final checksum-word store from layering helper
    // incremental checksum updates on top of the full recompute.
    return BPF_F_INVALIDATE_HASH;
 }
 
 __attribute__((__always_inline__))
+static inline __u64 switchboardPacketRewriteManualChecksumDataStoreFlags(void)
+{
+   // Large UDP_SEGMENT / GRO packets can survive the full checksum rewrite only
+   // if the intermediate tuple-byte stores still keep skb checksum/GSO
+   // metadata coherent. Only the final checksum-word write should skip helper
+   // incremental checksum updates.
+   return switchboardPacketRewriteStoreFlags();
+}
+
+__attribute__((__always_inline__))
 static inline __u64 switchboardAdjustRoomPreserveOffloadFlags(void)
 {
-   // Cross-machine QUIC can ride UDP_SEGMENT / UDP_GRO super-packets. Overlay
-   // L3 grow/shrink must preserve skb checksum and gso metadata or the packet
-   // can stall between machines even though same-machine delivery still works.
+   // Non-encap grow/shrink paths still need to preserve both checksum and GSO
+   // metadata so the kernel can keep tracking an existing super-packet.
    return BPF_F_ADJ_ROOM_FIXED_GSO | BPF_F_ADJ_ROOM_NO_CSUM_RESET;
 }
 
 __attribute__((__always_inline__))
 static inline __u64 switchboardOverlayEncapAdjustRoomFlagsIPv6(void)
 {
-   return BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 | switchboardAdjustRoomPreserveOffloadFlags();
+   // Once we wrap an inner packet in outer L3, preserving the inner UDP GSO
+   // metadata lets the kernel segment the encapsulated packet into multiple
+   // bogus partial inner datagrams. Keep checksum state, but force the outer
+   // overlay packet to travel as one packet.
+   return BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 | BPF_F_ADJ_ROOM_NO_CSUM_RESET;
 }
 
 __attribute__((__always_inline__))
 static inline __u64 switchboardOverlayEncapAdjustRoomFlagsIPv4(void)
 {
-   return BPF_F_ADJ_ROOM_ENCAP_L3_IPV4 | switchboardAdjustRoomPreserveOffloadFlags();
+   return BPF_F_ADJ_ROOM_ENCAP_L3_IPV4 | BPF_F_ADJ_ROOM_NO_CSUM_RESET;
 }
 
 __attribute__((__always_inline__))

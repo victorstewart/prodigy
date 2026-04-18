@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <cstring>
+#include <memory>
 
 #include <networking/includes.h>
 #include <types/types.containers.h>
@@ -178,6 +180,17 @@ public:
    ProdigyPersistentMasterAuthorityPackage masterAuthority;
    Vector<ProdigyMetricSample> metricSamples;
 };
+
+static inline void prodigyReplaceCachedBrainSnapshot(
+   ProdigyPersistentBrainSnapshot& target,
+   ProdigyPersistentBrainSnapshot&& replacement)
+{
+   // Cached runtime snapshots should take ownership of the freshly built
+   // snapshot without routing large deployment/state maps back through
+   // assignment on an already-populated cache object.
+   std::destroy_at(std::addressof(target));
+   std::construct_at(std::addressof(target), std::move(replacement));
+}
 
 template <typename S>
 static void serialize(S&& serializer, ProdigyPersistentBrainSnapshot& snapshot)
@@ -1824,16 +1837,16 @@ static inline void prodigyApplyPersistentBootStateSecrets(
 }
 
 static inline void prodigyExtractPersistentBrainSnapshotSecrets(
-   const ProdigyPersistentBrainSnapshot& snapshot,
+   ProdigyPersistentBrainSnapshot snapshot,
    ProdigyPersistentBrainSnapshot& publicSnapshot,
    ProdigyPersistentBrainSnapshotSecrets& secrets)
 {
-   publicSnapshot = snapshot;
+   publicSnapshot = std::move(snapshot);
    secrets.clear();
 
-   secrets.bootstrapSshPrivateKeyOpenSSH = snapshot.brainConfig.bootstrapSshKeyPackage.privateKeyOpenSSH;
-   secrets.bootstrapSshHostPrivateKeyOpenSSH = snapshot.brainConfig.bootstrapSshHostKeyPackage.privateKeyOpenSSH;
-   secrets.reporterPassword = snapshot.brainConfig.reporter.password;
+   secrets.bootstrapSshPrivateKeyOpenSSH = publicSnapshot.brainConfig.bootstrapSshKeyPackage.privateKeyOpenSSH;
+   secrets.bootstrapSshHostPrivateKeyOpenSSH = publicSnapshot.brainConfig.bootstrapSshHostKeyPackage.privateKeyOpenSSH;
+   secrets.reporterPassword = publicSnapshot.brainConfig.reporter.password;
    prodigyClearPersistentSSHPrivateKey(publicSnapshot.brainConfig.bootstrapSshKeyPackage);
    prodigyClearPersistentSSHPrivateKey(publicSnapshot.brainConfig.bootstrapSshHostKeyPackage);
    prodigyClearPersistentSecretString(publicSnapshot.brainConfig.reporter.password);
@@ -2025,6 +2038,42 @@ static bool prodigyPersistentSerializedEqual(const T& lhs, const T& rhs)
    Vault::secureClearString(lhsSerialized);
    Vault::secureClearString(rhsSerialized);
    return equal;
+}
+
+static bool prodigyPersistentRawBytesEqual(const String& lhs, const String& rhs)
+{
+   return lhs.size() == rhs.size()
+      && (lhs.size() == 0 || std::memcmp(lhs.data(), rhs.data(), lhs.size()) == 0);
+}
+
+static bool prodigyPersistentStoredRecordSecretVersion(const String& serialized, uint64_t& secretVersion)
+{
+   if (serialized.size() < sizeof(secretVersion))
+   {
+      secretVersion = 0;
+      return false;
+   }
+
+   const uint8_t *bytes = reinterpret_cast<const uint8_t *>(serialized.data());
+   secretVersion = 0;
+   for (size_t i = 0; i < sizeof(secretVersion); ++i)
+   {
+      secretVersion |= uint64_t(bytes[i]) << (8 * i);
+   }
+
+   return true;
+}
+
+static bool prodigyPersistentStoredRecordPayloadEquals(const String& serialized, const String& payload)
+{
+   if (serialized.size() != sizeof(uint64_t) + payload.size())
+   {
+      return false;
+   }
+
+   const uint8_t *serializedBytes = reinterpret_cast<const uint8_t *>(serialized.data());
+   return payload.size() == 0
+      || std::memcmp(serializedBytes + sizeof(uint64_t), payload.data(), payload.size()) == 0;
 }
 
 template <typename StoredRecord, typename LegacyRecord>
@@ -2354,6 +2403,7 @@ public:
       }
 
       prodigyStripManagedCloudBootstrapCredentials(snapshot.brainConfig.runtimeEnvironment);
+      prodigyStripMachineHardwareCapturesFromClusterTopology(snapshot.topology);
       return true;
    }
 
@@ -2361,34 +2411,92 @@ public:
    {
       ProdigyPersistentBrainSnapshot canonicalSnapshot = snapshot;
       prodigyStripManagedCloudBootstrapCredentials(canonicalSnapshot.brainConfig.runtimeEnvironment);
+      prodigyStripMachineHardwareCapturesFromClusterTopology(canonicalSnapshot.topology);
 
-      ProdigyPersistentBrainSnapshot existingSnapshot = {};
-      String loadFailure = {};
-      if (loadBrainSnapshot(existingSnapshot, &loadFailure))
+      ProdigyPersistentBrainSnapshot publicSnapshot = {};
+      ProdigyPersistentBrainSnapshotSecrets secrets = {};
+      prodigyExtractPersistentBrainSnapshotSecrets(std::move(canonicalSnapshot), publicSnapshot, secrets);
+
+      String serializedPublicSnapshot = {};
+      BitseryEngine::serialize(serializedPublicSnapshot, publicSnapshot);
+
+      String serializedSecrets = {};
+      if (secrets.empty() == false)
       {
-         if (prodigyPersistentSerializedEqual(existingSnapshot, canonicalSnapshot))
+         BitseryEngine::serialize(serializedSecrets, secrets);
+      }
+
+      uint64_t previousVersion = 0;
+      String existingStoredRecord = {};
+      String loadFailure = {};
+      if (db.read(brainColumnFamily, brainSnapshotKey, existingStoredRecord, &loadFailure))
+      {
+         uint64_t existingVersion = 0;
+         if (prodigyPersistentStoredRecordSecretVersion(existingStoredRecord, existingVersion))
          {
-            if (failure) failure->clear();
-            return true;
+            if (existingVersion == 0)
+            {
+               previousVersion = 0;
+               if (serializedSecrets.size() == 0
+                  && prodigyPersistentStoredRecordPayloadEquals(existingStoredRecord, serializedPublicSnapshot))
+               {
+                  Vault::secureClearString(serializedPublicSnapshot);
+                  secrets.clear();
+                  if (failure) failure->clear();
+                  return true;
+               }
+            }
+            else
+            {
+               String existingSerializedSecrets = {};
+               String secretFailure = {};
+               String existingSecretKey = {};
+               prodigyBuildPersistentSecretRecordKey(brainSnapshotKey, existingVersion, existingSecretKey);
+               if (secretsDb.read(brainColumnFamily, existingSecretKey, existingSerializedSecrets, &secretFailure))
+               {
+                  previousVersion = existingVersion;
+                  bool samePublicSnapshot = prodigyPersistentStoredRecordPayloadEquals(
+                     existingStoredRecord,
+                     serializedPublicSnapshot);
+                  bool sameSecrets = prodigyPersistentRawBytesEqual(existingSerializedSecrets, serializedSecrets);
+                  Vault::secureClearString(existingSerializedSecrets);
+                  if (samePublicSnapshot && sameSecrets)
+                  {
+                     Vault::secureClearString(serializedPublicSnapshot);
+                     Vault::secureClearString(serializedSecrets);
+                     secrets.clear();
+                     if (failure) failure->clear();
+                     return true;
+                  }
+               }
+               else if (secretFailure.size() > 0 && secretFailure != "record not found"_ctv)
+               {
+                  Vault::secureClearString(serializedPublicSnapshot);
+                  Vault::secureClearString(serializedSecrets);
+                  secrets.clear();
+                  if (failure) failure->assign(secretFailure);
+                  return false;
+               }
+            }
          }
       }
       else if (loadFailure.size() > 0 && loadFailure != "record not found"_ctv)
       {
+         Vault::secureClearString(serializedPublicSnapshot);
+         Vault::secureClearString(serializedSecrets);
+         secrets.clear();
          if (failure) failure->assign(loadFailure);
          return false;
       }
 
-      ProdigyPersistentBrainSnapshot publicSnapshot = {};
-      ProdigyPersistentBrainSnapshotSecrets secrets = {};
-      prodigyExtractPersistentBrainSnapshotSecrets(canonicalSnapshot, publicSnapshot, secrets);
-
-      uint64_t previousVersion = previousBrainSnapshotSecretVersion();
       uint64_t newVersion = 0;
       if (secrets.empty() == false)
       {
          newVersion = prodigyGeneratePersistentSecretVersion();
          if (saveSecretRecord(brainColumnFamily, brainSnapshotKey, newVersion, secrets, failure) == false)
          {
+            Vault::secureClearString(serializedPublicSnapshot);
+            Vault::secureClearString(serializedSecrets);
             secrets.clear();
             return false;
          }
@@ -2407,6 +2515,8 @@ public:
       }
 
       Vault::secureClearString(serialized);
+      Vault::secureClearString(serializedPublicSnapshot);
+      Vault::secureClearString(serializedSecrets);
       secrets.clear();
       return ok;
    }

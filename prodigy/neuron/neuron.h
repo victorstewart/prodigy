@@ -138,6 +138,7 @@ protected:
       void ensureDeferredHardwareInventoryProgress(void) override
       {
          (void)completeDeferredHardwareInventoryIfReady();
+         (void)queueMachineHardwareProfileToBrainIfReady("ensure-progress");
       }
 
 	static bool verboseNeuronSocketLogsEnabled(void)
@@ -475,11 +476,11 @@ protected:
 				Ring::queueAccept(&brainListener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
 			}
 
-		bool verifyBrainTransportTLSPeer(void)
-		{
-			if (brain == nullptr || brain->transportTLSEnabled() == false || brain->tlsPeerVerified)
+			bool verifyBrainTransportTLSPeer(void)
 			{
-				return true;
+				if (brain == nullptr || brain->transportTLSEnabled() == false || brain->tlsPeerVerified)
+				{
+					return true;
 			}
 
 			if (brain->isTLSNegotiated() == false)
@@ -491,15 +492,106 @@ protected:
 			if (ProdigyTransportTLSRuntime::extractPeerUUID(brain->ssl, peerUUID) == false)
 			{
 				basics_log("neuron transport tls missing brain peer uuid fd=%d fslot=%d\n", brain->fd, brain->fslot);
+				std::fprintf(stderr,
+					"neuron brain tls-verify missing-peer-uuid fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d\n",
+					brain->fd,
+					brain->fslot,
+					int(brain->pendingSend),
+					int(brain->pendingRecv),
+					int(brain->isTLSNegotiated()));
+				std::fflush(stderr);
 				return false;
 			}
 
 			brain->tlsPeerUUID = peerUUID;
 			brain->tlsPeerVerified = true;
-			basics_log("neuron brain transport tls peer verified fd=%d fslot=%d\n", brain->fd, brain->fslot);
+				basics_log("neuron brain transport tls peer verified fd=%d fslot=%d\n", brain->fd, brain->fslot);
+			std::fprintf(stderr,
+				"neuron brain tls-verify ok peerUUID=%llu fd=%d fslot=%d pendingSend=%d pendingRecv=%d queued=%llu\n",
+				(unsigned long long)peerUUID,
+				brain->fd,
+				brain->fslot,
+				int(brain->pendingSend),
+				int(brain->pendingRecv),
+				(unsigned long long)brain->queuedSendOutstandingBytes());
+			std::fflush(stderr);
          (void)queueMachineHardwareProfileToBrainIfReady("transport-tls-peer-verified");
-			return true;
-		}
+				return true;
+			}
+
+         void destroyRetiredBrainControlStream(NeuronBrainControlStream *stream)
+         {
+            if (stream == nullptr)
+            {
+               return;
+            }
+
+            closingBrainControls.erase(stream);
+            RingDispatcher::eraseMultiplexee(stream);
+            delete stream;
+         }
+
+         void destroyRetiredBrainControlStreamIfDrained(NeuronBrainControlStream *stream)
+         {
+            if (stream == nullptr || closingBrainControls.contains(stream) == false)
+            {
+               return;
+            }
+
+            if (Ring::socketIsClosing(stream)
+               || rawStreamIsActive(stream)
+               || stream->pendingSend
+               || stream->pendingRecv)
+            {
+               return;
+            }
+
+            destroyRetiredBrainControlStream(stream);
+         }
+
+         void retireBrainControlStream(NeuronBrainControlStream *stream, const char *reason = nullptr)
+         {
+            if (stream == nullptr)
+            {
+               return;
+            }
+
+            if (stream == brain)
+            {
+               brain = nullptr;
+            }
+
+            // Keep replaced brain-control stream objects alive until their own close CQE
+            // lands. Deleting them early lets stale close completions race with allocator
+            // reuse and tear down the replacement control stream instead.
+            bool awaitingCloseCompletion =
+               Ring::socketIsClosing(stream)
+               || rawStreamIsActive(stream)
+               || stream->pendingSend
+               || stream->pendingRecv;
+            if (awaitingCloseCompletion == false)
+            {
+               destroyRetiredBrainControlStream(stream);
+               return;
+            }
+
+            if (rawStreamIsActive(stream) && Ring::socketIsClosing(stream) == false)
+            {
+               queueCloseIfActive(stream);
+            }
+
+            closingBrainControls.insert(stream);
+            basics_log("neuron retire brain control stream=%p reason=%s closing=%d active=%d pendingSend=%d pendingRecv=%d fd=%d fslot=%d retained=%zu\n",
+               static_cast<void *>(stream),
+               (reason ? reason : "unknown"),
+               int(Ring::socketIsClosing(stream)),
+               int(streamIsActive(stream)),
+               int(stream->pendingSend),
+               int(stream->pendingRecv),
+               stream->fd,
+               stream->fslot,
+               size_t(closingBrainControls.size()));
+         }
 
       static uint64_t monotonicNowNs(void)
       {
@@ -635,8 +727,19 @@ protected:
          ProdigyMachineHardwareCollectorOptions hardwareCollectorOptions = {};
          hardwareCollectorOptions.collectOptionalBenchmarks = false;
          prodigyCollectMachineHardwareProfile(result.hardware, hardwareCollectorOptions);
-         BitseryEngine::serialize(result.serializedHardwareProfile, result.hardware);
+         serializeMachineHardwareProfileForBrainTransport(result.hardware, result.serializedHardwareProfile);
          return result;
+      }
+
+      static void serializeMachineHardwareProfileForBrainTransport(const MachineHardwareProfile& hardware, String& serialized)
+      {
+         MachineHardwareProfile transportHardware = hardware;
+         // The brain only needs the structured hardware inventory for readiness
+         // and scheduling. Large per-tool captures stay local so the initial
+         // neuron-control frame does not balloon into multi-megabyte transport.
+         prodigyStripMachineHardwareCapturesForClusterReport(transportHardware);
+         serialized.clear();
+         BitseryEngine::serialize(serialized, transportHardware);
       }
 
       static bool deferredHardwareInventoryResultReadyForAdoption(const DeferredHardwareInventoryResult& result)
@@ -681,6 +784,9 @@ protected:
             deferredHardwareInventoryInFlight = true;
          }
 
+         std::fprintf(stderr, "neuron deferred hardware begin wakeFD=%d\n", deferredHardwareInventoryWake.fd);
+         std::fflush(stderr);
+
          std::thread([this]() mutable {
             DeferredHardwareInventoryResult result = {};
             try
@@ -696,6 +802,16 @@ protected:
                basics_log("Neuron deferred hardware inventory threw exception=unknown\n");
             }
 
+            std::fprintf(stderr, "neuron deferred hardware collected inventoryComplete=%d serializedBytes=%llu logicalCores=%u memoryMB=%u disks=%llu nics=%llu failure=%s\n",
+               int(result.hardware.inventoryComplete),
+               (unsigned long long)result.serializedHardwareProfile.size(),
+               result.hardware.cpu.logicalCores,
+               result.hardware.memory.totalMB,
+               (unsigned long long)result.hardware.disks.size(),
+               (unsigned long long)result.hardware.network.nics.size(),
+               result.hardware.inventoryFailure.c_str());
+            std::fflush(stderr);
+
             {
                std::lock_guard<std::mutex> lock(deferredHardwareInventoryMutex);
                deferredHardwareInventoryReady = std::move(result);
@@ -704,7 +820,18 @@ protected:
             if (deferredHardwareInventoryWake.fd >= 0)
             {
                uint64_t signal = 1;
-               (void)::write(deferredHardwareInventoryWake.fd, &signal, sizeof(signal));
+               ssize_t wrote = ::write(deferredHardwareInventoryWake.fd, &signal, sizeof(signal));
+               std::fprintf(stderr, "neuron deferred hardware wake-signaled fd=%d wrote=%lld errno=%d(%s)\n",
+                  deferredHardwareInventoryWake.fd,
+                  (long long)wrote,
+                  (wrote < 0 ? errno : 0),
+                  (wrote < 0 ? strerror(errno) : "ok"));
+               std::fflush(stderr);
+            }
+            else
+            {
+               std::fprintf(stderr, "neuron deferred hardware wake-skipped fd=%d\n", deferredHardwareInventoryWake.fd);
+               std::fflush(stderr);
             }
          }).detach();
       }
@@ -746,6 +873,15 @@ protected:
 
       bool queueMachineHardwareProfileToBrainIfReady(const char *reason)
       {
+         // The deferred inventory worker can finish before its wake poll is
+         // drained. If the first queue attempt arrives on a live brain stream,
+         // adopt the ready snapshot here so the initial hardware profile does
+         // not depend on that wake ordering.
+         if (serializedHardwareProfile.size() == 0)
+         {
+            (void)completeDeferredHardwareInventoryIfReady();
+         }
+
          bool brainPresent = (brain != nullptr);
          bool brainActive = (brainPresent && streamIsActive(brain));
          bool brainAppReady = (brainPresent
@@ -762,6 +898,28 @@ protected:
             {
                Ring::submitPending();
             }
+         }
+         else if (brainPresent && brainAppReady && alreadyQueued == false && serializedHardwareProfile.size() == 0)
+         {
+            bool deferredReadyPresent = false;
+            bool deferredInFlight = false;
+            {
+               std::lock_guard<std::mutex> lock(deferredHardwareInventoryMutex);
+               deferredReadyPresent = (deferredHardwareInventoryReady != std::nullopt);
+               deferredInFlight = deferredHardwareInventoryInFlight;
+            }
+
+            std::fprintf(stderr, "neuron machineHardwareProfile unavailable reason=%s deferredReady=%d deferredInFlight=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d\n",
+               (reason != nullptr ? reason : ""),
+               int(deferredReadyPresent),
+               int(deferredInFlight),
+               (brainPresent ? brain->fd : -1),
+               (brainPresent ? brain->fslot : -1),
+               int(brainPresent ? brain->pendingSend : 0),
+               int(brainPresent ? brain->pendingRecv : 0),
+               int(brainPresent ? brain->isTLSNegotiated() : 0),
+               int(brainPresent ? brain->tlsPeerVerified : 0));
+            std::fflush(stderr);
          }
 
 #if PRODIGY_DEBUG
@@ -785,6 +943,21 @@ protected:
 
       void adoptDeferredHardwareInventoryResult(DeferredHardwareInventoryResult result)
       {
+         bool brainPresentBeforeAdopt = (brain != nullptr);
+         bool brainActiveBeforeAdopt = (brainPresentBeforeAdopt && streamIsActive(brain));
+         std::fprintf(stderr,
+            "neuron deferred hardware adopt-begin inventoryComplete=%d serializedBytes=%llu brainPresent=%d brainActive=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d\n",
+            int(result.hardware.inventoryComplete),
+            (unsigned long long)result.serializedHardwareProfile.size(),
+            int(brainPresentBeforeAdopt),
+            int(brainActiveBeforeAdopt),
+            (brainPresentBeforeAdopt ? brain->fd : -1),
+            (brainPresentBeforeAdopt ? brain->fslot : -1),
+            int(brainPresentBeforeAdopt ? brain->pendingSend : 0),
+            int(brainPresentBeforeAdopt ? brain->pendingRecv : 0),
+            int(brainPresentBeforeAdopt ? brain->isTLSNegotiated() : 0),
+            int(brainPresentBeforeAdopt ? brain->tlsPeerVerified : 0));
+         std::fflush(stderr);
          basics_log("Neuron adopting deferred hardware inventory inventoryComplete=%d serializedBytes=%llu logicalCores=%u memoryMB=%u disks=%llu nics=%llu\n",
             int(result.hardware.inventoryComplete),
             (unsigned long long)result.serializedHardwareProfile.size(),
@@ -803,6 +976,19 @@ protected:
          bool brainPresent = (brain != nullptr);
          bool brainActive = (brainPresent && streamIsActive(brain));
          bool queuedHardwareProfile = queueMachineHardwareProfileToBrainIfReady("deferred-hardware-adopt");
+         std::fprintf(stderr,
+            "neuron deferred hardware adopt-end brainPresent=%d brainActive=%d queued=%d serializedBytes=%llu fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d\n",
+            int(brainPresent),
+            int(brainActive),
+            int(queuedHardwareProfile),
+            (unsigned long long)serializedHardwareProfile.size(),
+            (brainPresent ? brain->fd : -1),
+            (brainPresent ? brain->fslot : -1),
+            int(brainPresent ? brain->pendingSend : 0),
+            int(brainPresent ? brain->pendingRecv : 0),
+            int(brainPresent ? brain->isTLSNegotiated() : 0),
+            int(brainPresent ? brain->tlsPeerVerified : 0));
+         std::fflush(stderr);
 
 #if PRODIGY_DEBUG
          basics_log("Neuron deferred hardware inventory send brainPresent=%d brainActive=%d queued=%d serializedBytes=%llu fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d\n",
@@ -822,12 +1008,32 @@ protected:
       bool completeDeferredHardwareInventoryIfReady(void)
       {
          std::optional<DeferredHardwareInventoryResult> ready = std::nullopt;
+         bool deferredReadyPresent = false;
+         bool deferredInFlight = false;
 
          {
             std::lock_guard<std::mutex> lock(deferredHardwareInventoryMutex);
+            deferredReadyPresent = (deferredHardwareInventoryReady != std::nullopt);
+            deferredInFlight = deferredHardwareInventoryInFlight;
             if (deferredHardwareInventoryReady == std::nullopt)
             {
-               return (deferredHardwareInventoryInFlight == false);
+               bool completed = (deferredHardwareInventoryInFlight == false);
+               std::fprintf(stderr,
+                  "neuron deferred hardware complete-skip readyPresent=%d inFlight=%d completed=%d serializedBytes=%llu brainPresent=%d brainActive=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d\n",
+                  int(deferredReadyPresent),
+                  int(deferredInFlight),
+                  int(completed),
+                  (unsigned long long)serializedHardwareProfile.size(),
+                  int(brain != nullptr),
+                  int(brain != nullptr && streamIsActive(brain)),
+                  (brain ? brain->fd : -1),
+                  (brain ? brain->fslot : -1),
+                  int(brain ? brain->pendingSend : 0),
+                  int(brain ? brain->pendingRecv : 0),
+                  int(brain ? brain->isTLSNegotiated() : 0),
+                  int(brain ? brain->tlsPeerVerified : 0));
+               std::fflush(stderr);
+               return completed;
             }
 
             ready = std::move(deferredHardwareInventoryReady);
@@ -837,12 +1043,47 @@ protected:
 
          if (ready == std::nullopt)
          {
+            std::fprintf(stderr,
+               "neuron deferred hardware complete-nullopt readyPresent=%d inFlight=%d serializedBytes=%llu brainPresent=%d brainActive=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d\n",
+               int(deferredReadyPresent),
+               int(deferredInFlight),
+               (unsigned long long)serializedHardwareProfile.size(),
+               int(brain != nullptr),
+               int(brain != nullptr && streamIsActive(brain)),
+               (brain ? brain->fd : -1),
+               (brain ? brain->fslot : -1),
+               int(brain ? brain->pendingSend : 0),
+               int(brain ? brain->pendingRecv : 0),
+               int(brain ? brain->isTLSNegotiated() : 0),
+               int(brain ? brain->tlsPeerVerified : 0));
+            std::fflush(stderr);
             return true;
          }
 
          DeferredHardwareInventoryResult result = std::move(*ready);
+         std::fprintf(stderr,
+            "neuron deferred hardware complete-ready readyPresent=%d inFlight=%d inventoryComplete=%d serializedBytes=%llu brainPresent=%d brainActive=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d\n",
+            int(deferredReadyPresent),
+            int(deferredInFlight),
+            int(result.hardware.inventoryComplete),
+            (unsigned long long)result.serializedHardwareProfile.size(),
+            int(brain != nullptr),
+            int(brain != nullptr && streamIsActive(brain)),
+            (brain ? brain->fd : -1),
+            (brain ? brain->fslot : -1),
+            int(brain ? brain->pendingSend : 0),
+            int(brain ? brain->pendingRecv : 0),
+            int(brain ? brain->isTLSNegotiated() : 0),
+            int(brain ? brain->tlsPeerVerified : 0));
+         std::fflush(stderr);
          if (deferredHardwareInventoryResultReadyForAdoption(result) == false)
          {
+            std::fprintf(stderr,
+               "neuron deferred hardware complete-retry inventoryComplete=%d serializedBytes=%llu failure=%s\n",
+               int(result.hardware.inventoryComplete),
+               (unsigned long long)result.serializedHardwareProfile.size(),
+               result.hardware.inventoryFailure.c_str());
+            std::fflush(stderr);
             basics_log("Neuron deferred hardware inventory retry inventoryComplete=%d serializedBytes=%llu logicalCores=%u memoryMB=%u disks=%llu nics=%llu failure=%s\n",
                int(result.hardware.inventoryComplete),
                (unsigned long long)result.serializedHardwareProfile.size(),
@@ -1652,6 +1893,23 @@ protected:
                hostEgressPath.c_str(), eth.ifidx);
          }
 
+         bool whiteholeReplyFlowPinned = false;
+         if (tcx_egress_program)
+         {
+            whiteholeReplyFlowPinned = switchboardPinWhiteholeReplyFlowMap(tcx_egress_program, eth.ifidx);
+            if (whiteholeReplyFlowPinned == false)
+            {
+               basics_log("setupNetworking failed to pin host whitehole reply flow map ifidx=%d\n",
+                  eth.ifidx);
+            }
+         }
+
+         if (whiteholeReplyFlowPinned == false)
+         {
+            basics_log("setupNetworking skipping host ingress attach because whitehole reply flow pinning failed ifidx=%d\n",
+               eth.ifidx);
+         }
+         else
 			if ((tcx_ingress_program = eth.loadPreattachedProgram(BPF_TCX_INGRESS, hostIngressPath)))
 			{
 				basics_log("setupNetworking loaded preattached host ingress path=%s ifidx=%d\n",
@@ -1666,25 +1924,11 @@ protected:
 			{
 					eth.addIP(containerSubnet6);
 
-            String pinnedWhiteholeReplyPath = {};
-            switchboardWhiteholeReplyFlowPinPath(pinnedWhiteholeReplyPath, eth.ifidx);
-
 				// load and setup tcx ingress program
 				tcx_ingress_program = eth.attachBPF(BPF_TCX_INGRESS, hostIngressPath, "host_ingress_router"_ctv,
                [&] (struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
 
-                  int pinnedReplyMapFD = bpf_obj_get(pinnedWhiteholeReplyPath.c_str());
-                  if (pinnedReplyMapFD < 0)
-                  {
-                     return;
-                  }
-
-                  if (struct bpf_map *replyMap = bpf_object__find_map_by_name(obj, "whitehole_reply_flows"))
-                  {
-                     bpf_map__reuse_fd(replyMap, pinnedReplyMapFD);
-                  }
-
-                  inner_map_fds.push_back(pinnedReplyMapFD);
+                  (void)switchboardReusePinnedWhiteholeReplyFlowMap(obj, eth.ifidx, inner_map_fds);
                });
 				if (tcx_ingress_program)
 				{
@@ -1715,18 +1959,7 @@ protected:
       {
          tcx_egress_program->setArrayElement("mac_map"_ctv, 0, eth.mac);
          tcx_egress_program->setArrayElement("gateway_mac_map"_ctv, 0, eth.gateway_mac);
-         tcx_egress_program->openMap("whitehole_reply_flows"_ctv, [&] (int map_fd) -> void {
-
-            if (map_fd < 0)
-            {
-               return;
-            }
-
-            String pinPath = {};
-            switchboardWhiteholeReplyFlowPinPath(pinPath, eth.ifidx);
-            unlink(pinPath.c_str());
-            (void)bpf_obj_pin(map_fd, pinPath.c_str());
-         });
+         (void)switchboardPinWhiteholeReplyFlowMap(tcx_egress_program, eth.ifidx);
       }
 
          iaas->setLocalContainerPrefixes(localPrefixes);
@@ -1800,11 +2033,12 @@ protected:
 
 		String kernel;
 
-		int64_t bootTimeMs;
+			int64_t bootTimeMs;
 
-			bool isBrain;
-			TCPSocket brainListener;
-				NeuronBrainControlStream *brain = nullptr;
+				bool isBrain;
+				TCPSocket brainListener;
+					NeuronBrainControlStream *brain = nullptr;
+               bytell_hash_set<NeuronBrainControlStream *> closingBrainControls;
 
 		virtual void boot(void)
 		{
@@ -1839,6 +2073,10 @@ protected:
 			}
 
 				brainListener.setIPVersion(AF_INET6);
+            if (uint32_t maxSegmentSize = controlPlaneTCPMaxSegmentSize(AF_INET6); maxSegmentSize > 0)
+            {
+               (void)prodigySetTCPMaxSegmentSize(brainListener.fd, maxSegmentSize);
+            }
 				setsockopt(brainListener.fd, IPPROTO_IPV6, IPV6_V6ONLY, (const int[]){0}, sizeof(int));
 				brainListener.setKeepaliveTimeoutSeconds(brainControlKeepaliveSeconds);
 				brainListener.setSaddr("::"_ctv, uint16_t(ReservedPorts::neuron));
@@ -1931,9 +2169,10 @@ protected:
 		// 	short    si_addr_lsb; /* Least significant bit of address */
 		// } siginfo_t;
 
-   	uint128_t containerUUID;
-   	bool killedOnPurpose;
+	uint128_t containerUUID;
+	bool killedOnPurpose;
       bool destroyAfterWait = false;
+      bool pendingDestroyBeforeWait = false;
 
 	   CoroutineStack *resumeAfterShutdown = nullptr;
 
@@ -1943,6 +2182,8 @@ protected:
 			String containerName = container->name;
 			{
 	   		containerUUID = container->plan.uuid;
+            pendingDestroyBeforeWait = container->pendingDestroy;
+            container->waitidPending = false;
 	   		container->disableKillSwitch();
 	   		container->closeSocket();
    		killedOnPurpose = container->killedOnPurpose;
@@ -2129,6 +2370,11 @@ protected:
       {
          ContainerManager::destroyContainer(container);
       }
+
+      if (pendingDestroyBeforeWait)
+      {
+         ContainerManager::finalizeContainerDestroyIfReady(container);
+      }
    }
 
 	void containerHandler(Container *container, Message *message)
@@ -2187,12 +2433,12 @@ protected:
 					int(brain ? brain->pendingRecv : 0));
 				std::fflush(stderr);
 
-            if (thisBrain != nullptr && thisBrain->canControlNeurons())
+            bool controllingBrainActive = (brain != nullptr && streamIsActive(brain));
+            if (thisBrain != nullptr
+               && (thisBrain->canControlNeurons() || controllingBrainActive == false))
             {
                thisBrain->noteLocalContainerHealthy(container->plan.uuid);
             }
-
-            bool controllingBrainActive = (brain != nullptr && streamIsActive(brain));
 #if PRODIGY_DEBUG
 				basics_log("neuron containerHealthy brain-state uuid=%llu brainPresent=%d brainConnected=%d brainActive=%d pendingSend=%d pendingRecv=%d fd=%d fslot=%d\n",
 					(unsigned long long)container->plan.uuid,
@@ -2486,6 +2732,8 @@ protected:
 						path.snprintf<"/containers/{}/neuron.soc"_ctv>(container->name);
 						container->setSocketPath(path.c_str());
 						pushContainer(container);
+						container->waitidPending = true;
+						container->destroyCloseCompleted = false;
 						Ring::queueWaitid(container, P_PID, container->pid);
 						Ring::queueConnect(container);
 					}
@@ -2544,6 +2792,27 @@ protected:
             ProdigyRuntimeEnvironmentConfig config = {};
             if (BitseryEngine::deserializeSafe(serialized, config))
             {
+               prodigyApplyInternalRuntimeEnvironmentDefaults(config);
+               configuredInterContainerMTU = config.test.enabled ? config.test.interContainerMTU : 0;
+               if (uint32_t maxSegmentSize = controlPlaneTCPMaxSegmentSize(AF_INET6); maxSegmentSize > 0)
+               {
+                  if (brainListener.isFixedFile && brainListener.fslot >= 0)
+                  {
+                     Ring::queueSetSockOptInt(&brainListener, SOL_TCP, TCP_MAXSEG, int(maxSegmentSize), "neuron brain listener tcp maxseg");
+                  }
+                  else
+                  {
+                     (void)prodigySetTCPMaxSegmentSize(brainListener.fd, maxSegmentSize);
+                  }
+                  if (brain && brain->isFixedFile && brain->fslot >= 0)
+                  {
+                     Ring::queueSetSockOptInt(brain, SOL_TCP, TCP_MAXSEG, int(maxSegmentSize), "neuron brain control tcp maxseg");
+                  }
+                  else if (brain && brain->fd >= 0)
+                  {
+                     (void)prodigySetTCPMaxSegmentSize(brain->fd, maxSegmentSize);
+                  }
+               }
                iaas->configureRuntimeEnvironment(config);
 
                if (bgp)
@@ -3253,6 +3522,21 @@ protected:
 		}
 		else
 		{
+			if constexpr (std::is_same_v<T, NeuronBrainControlStream>)
+			{
+				std::fprintf(stderr,
+					"neuron brain recv-terminal result=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d fd=%d fslot=%d queued=%llu rbytes=%llu\n",
+					result,
+					int(stream->pendingSend),
+					int(stream->pendingRecv),
+					int(stream->isTLSNegotiated()),
+					int(stream->tlsPeerVerified),
+					stream->fd,
+					stream->fslot,
+					(unsigned long long)stream->queuedSendOutstandingBytes(),
+					(unsigned long long)stream->rBuffer.outstandingBytes());
+				std::fflush(stderr);
+			}
          if constexpr (std::is_same_v<T, Container>)
          {
             ContainerManager::appendContainerTrace(stream,
@@ -3278,21 +3562,32 @@ protected:
 		}
 	}
 
-		void recvHandler(void *socket, int result) override
-		{
-			verboseNeuronSocketLog("neuron recvHandler socket=%p brain=%p result=%d\n", socket, brain, result);
-		if (socket == (void *)brain)
-		{
-			recvHandler(brain, result, [&] (Message *message) -> void {
-
-				neuronHandler(message);
-			});
-		}
-			else
+			void recvHandler(void *socket, int result) override
 			{
-				Container *container = static_cast<Container *>(socket);
-				if (isTrackedContainerSocket(socket) == false)
+				verboseNeuronSocketLog("neuron recvHandler socket=%p brain=%p result=%d\n", socket, brain, result);
+			if (socket == (void *)brain)
+			{
+				recvHandler(brain, result, [&] (Message *message) -> void {
+
+					neuronHandler(message);
+				});
+			}
+            else if (closingBrainControls.contains(static_cast<NeuronBrainControlStream *>(socket)))
+            {
+               NeuronBrainControlStream *closingBrain = static_cast<NeuronBrainControlStream *>(socket);
+               closingBrain->pendingRecv = false;
+               if (rawStreamIsActive(closingBrain) && Ring::socketIsClosing(closingBrain) == false)
+               {
+                  queueCloseIfActive(closingBrain);
+               }
+               destroyRetiredBrainControlStreamIfDrained(closingBrain);
+               return;
+            }
+				else
 				{
+					Container *container = static_cast<Container *>(socket);
+					if (isTrackedContainerSocket(socket) == false)
+					{
 					return;
 				}
 				if (container->pendingDestroy)
@@ -3417,6 +3712,21 @@ protected:
 			}
 			else
 			{
+				if constexpr (std::is_same_v<T, NeuronBrainControlStream>)
+				{
+					std::fprintf(stderr,
+						"neuron brain send-terminal result=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d fd=%d fslot=%d queued=%llu wbytes=%u\n",
+						result,
+						int(stream->pendingSend),
+						int(stream->pendingRecv),
+						int(stream->isTLSNegotiated()),
+						int(stream->tlsPeerVerified),
+						stream->fd,
+						stream->fslot,
+						(unsigned long long)stream->queuedSendOutstandingBytes(),
+						unsigned(stream->wBuffer.size()));
+					std::fflush(stderr);
+				}
 				stream->noteSendCompleted();
 				// Do not replay partial frame tails after reconnect.
 				stream->clearQueuedSendBytes();
@@ -3424,17 +3734,34 @@ protected:
 			}
 		}
 
-		void sendHandler(void *socket, int result) override
-		{
-			if (socket == (void *)brain)
+			void sendHandler(void *socket, int result) override
 			{
-				sendHandler(brain, result);
-			}
-			else
-			{
-				Container *container = static_cast<Container *>(socket);
-				if (isTrackedContainerSocket(socket) == false)
+				if (socket == (void *)brain)
 				{
+					sendHandler(brain, result);
+				}
+            else if (closingBrainControls.contains(static_cast<NeuronBrainControlStream *>(socket)))
+            {
+               NeuronBrainControlStream *closingBrain = static_cast<NeuronBrainControlStream *>(socket);
+               if (closingBrain->pendingSend)
+               {
+                  closingBrain->noteSendCompleted();
+               }
+               closingBrain->pendingSend = false;
+               closingBrain->pendingSendBytes = 0;
+               closingBrain->clearQueuedSendBytes();
+               if (rawStreamIsActive(closingBrain) && Ring::socketIsClosing(closingBrain) == false)
+               {
+                  queueCloseIfActive(closingBrain);
+               }
+               destroyRetiredBrainControlStreamIfDrained(closingBrain);
+               return;
+            }
+				else
+				{
+					Container *container = static_cast<Container *>(socket);
+					if (isTrackedContainerSocket(socket) == false)
+					{
 					return;
 				}
 				if (container->pendingDestroy)
@@ -3456,27 +3783,26 @@ protected:
 		void acceptHandler(void *socket, int fslot) override
 		{
 			verboseNeuronSocketLog("neuron acceptHandler listener=%p fslot=%d\n", socket, fslot);
-			if (fslot >= 0)
-	  		{
-	  			if (brain != nullptr)
-	  			{
-	  				// Only one controlling brain stream is valid at a time. If the
-	  				// current slot is already closing or stale, retire it and allow the
-	  				// replacement accept to take over immediately.
-	  				if (rawStreamIsActive(brain))
-	  				{
-	  					Ring::queueCloseRaw(fslot);
-	  					return;
-	  				}
+				if (fslot >= 0)
+				{
+					if (brain != nullptr)
+					{
+						// Only one controlling brain stream is valid at a time. If the
+						// current slot is already closing or stale, retire it and allow the
+						// replacement accept to take over immediately.
+						if (streamIsActive(brain))
+						{
+							Ring::queueCloseRaw(fslot);
+							return;
+						}
 
-	  				delete brain;
-	  				brain = nullptr;
-	  			}
+                  retireBrainControlStream(brain, "accept-replace");
+					}
 
-	  			brain = new NeuronBrainControlStream();
-	  			brain->connected = true;
-	  			brain->rBuffer.reserve(8_KB);
-	  			brain->wBuffer.reserve(16_KB);
+					brain = new NeuronBrainControlStream();
+					brain->connected = true;
+					brain->rBuffer.reserve(8_KB);
+					brain->wBuffer.reserve(16_KB);
 				basics_log("neuron accepted brain control fslot=%d tlsConfigured=%d\n",
 					fslot,
 					int(ProdigyTransportTLSRuntime::configured()));
@@ -3486,15 +3812,26 @@ protected:
 	  			brain->fslot = fslot;
 	  			brain->isFixedFile = true;
 				brain->isNonBlocking = true;
+				Ring::publishSocketGeneration(brain);
 				Ring::queueSetSockOptRaw(brain, SOL_TCP, TCP_CONGESTION, "dctcp", socklen_t(strlen("dctcp")), "neuron accepted brain control congestion");
 				Ring::queueSetSockOptInt(brain, SOL_SOCKET, SO_KEEPALIVE, 1, "neuron accepted brain control keepalive");
 				Ring::queueSetSockOptInt(brain, SOL_TCP, TCP_KEEPIDLE, int(std::max<uint32_t>(brainControlKeepaliveSeconds, 1u)), "neuron accepted brain control keepidle");
 				Ring::queueSetSockOptInt(brain, SOL_TCP, TCP_KEEPINTVL, int(std::max<uint32_t>(brainControlKeepaliveSeconds / 3, 1u)), "neuron accepted brain control keepintvl");
 				Ring::queueSetSockOptInt(brain, SOL_TCP, TCP_KEEPCNT, 3, "neuron accepted brain control keepcnt");
+            if (uint32_t maxSegmentSize = controlPlaneTCPMaxSegmentSize(AF_INET6); maxSegmentSize > 0)
+            {
+               Ring::queueSetSockOptInt(brain, SOL_TCP, TCP_MAXSEG, int(maxSegmentSize), "neuron accepted brain control tcp maxseg");
+            }
 				basics_log("neuron accepted brain control stream=%p fd=%d fslot=%d\n",
 					static_cast<void *>(brain),
 					brain->fd,
 					brain->fslot);
+				std::fprintf(stderr, "neuron brain control accepted-live stream=%p fd=%d fslot=%d retained=%zu\n",
+					static_cast<void *>(brain),
+					brain->fd,
+					brain->fslot,
+					size_t(closingBrainControls.size()));
+				std::fflush(stderr);
 
 				if (ProdigyTransportTLSRuntime::configured() && beginAcceptedBrainTransportTLS(brain) == false)
 				{
@@ -3524,7 +3861,21 @@ protected:
 	      	Message::construct(brain->wBuffer, NeuronTopic::requestContainerBlob, deploymentID);
 	      }
 
-         (void)queueMachineHardwareProfileToBrainIfReady("brain-control-accept");
+         bool queuedHardwareProfile = queueMachineHardwareProfileToBrainIfReady("brain-control-accept");
+         std::fprintf(stderr,
+            "neuron brain control queue-hardware reason=accept stream=%p fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d queuedHardware=%d wbytes=%u queued=%llu serializedHardware=%llu\n",
+            static_cast<void *>(brain),
+            brain->fd,
+            brain->fslot,
+            int(brain->pendingSend),
+            int(brain->pendingRecv),
+            int(brain->isTLSNegotiated()),
+            int(brain->tlsPeerVerified),
+            int(queuedHardwareProfile),
+            unsigned(brain->wBuffer.size()),
+            (unsigned long long)brain->queuedSendOutstandingBytes(),
+            (unsigned long long)serializedHardwareProfile.size());
+         std::fflush(stderr);
          (void)appendHealthyContainerFrames(brain->wBuffer);
 
 	      if (streamIsActive(brain))
@@ -3557,10 +3908,16 @@ protected:
          if (socket == (void *)&deferredHardwareInventoryWake)
          {
             deferredHardwareInventoryWakePollQueued = false;
+            std::fprintf(stderr, "neuron deferred hardware wake result=%d fd=%d\n", result, deferredHardwareInventoryWake.fd);
+            std::fflush(stderr);
             if (result != -ECANCELED)
             {
                drainDeferredHardwareInventoryWake();
-               (void)completeDeferredHardwareInventoryIfReady();
+               bool completed = completeDeferredHardwareInventoryIfReady();
+               std::fprintf(stderr, "neuron deferred hardware wake-drain-complete result=%d completed=%d\n",
+                  result,
+                  int(completed));
+               std::fflush(stderr);
                armDeferredHardwareInventoryWakePoll();
             }
             return;
@@ -3574,29 +3931,48 @@ protected:
 			// maybe the brain failed?
 			// also possible we got cut off network wise?
 			// it will reconnect to us
+			NeuronBrainControlStream *closingBrain = brain;
 			basics_log("neuron brain control closed stream=%p fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d\n",
-				static_cast<void *>(brain),
-				brain->fd,
-				brain->fslot,
-				int(brain->pendingSend),
-				int(brain->pendingRecv),
-				int(brain->isTLSNegotiated()),
-				int(brain->tlsPeerVerified));
+				static_cast<void *>(closingBrain),
+				closingBrain->fd,
+				closingBrain->fslot,
+				int(closingBrain->pendingSend),
+				int(closingBrain->pendingRecv),
+				int(closingBrain->isTLSNegotiated()),
+				int(closingBrain->tlsPeerVerified));
+			std::fprintf(stderr, "neuron brain control close-live stream=%p fd=%d fslot=%d retained=%zu\n",
+				static_cast<void *>(closingBrain),
+				closingBrain->fd,
+				closingBrain->fslot,
+				size_t(closingBrainControls.size()));
+			std::fflush(stderr);
 
-				delete brain;
-				brain = nullptr;
+				retireBrainControlStream(closingBrain, "close-live-drain");
 				queueBrainAccept();
 					}
-					else // container
-					{
-						if (isTrackedContainerSocket(socket) == false)
+            else if (closingBrainControls.contains(static_cast<NeuronBrainControlStream *>(socket)))
+            {
+               NeuronBrainControlStream *closingBrain = static_cast<NeuronBrainControlStream *>(socket);
+               basics_log("neuron retired brain control closed stream=%p pendingSend=%d pendingRecv=%d fd=%d fslot=%d retained=%zu\n",
+                  static_cast<void *>(closingBrain),
+                  int(closingBrain->pendingSend),
+                  int(closingBrain->pendingRecv),
+                  closingBrain->fd,
+                  closingBrain->fslot,
+                  size_t(closingBrainControls.size()));
+               destroyRetiredBrainControlStream(closingBrain);
+            }
+						else // container
 						{
+							if (isTrackedContainerSocket(socket) == false)
+							{
 							return;
 						}
 						Container *container = static_cast<Container *>(socket);
 						if (container->pendingDestroy)
 						{
-							ContainerManager::finalizeContainerDestroy(container);
+                     container->destroyCloseCompleted = true;
+							ContainerManager::finalizeContainerDestroyIfReady(container);
 							return;
 						}
 

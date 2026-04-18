@@ -3869,6 +3869,35 @@ static inline void prodigyPrepareClusterStatusReportForTransport(ClusterStatusRe
    }
 }
 
+class ServiceUserCapacity {
+public:
+
+   uint32_t minimum = 0; // normal planned user capacity; services may exceed this under overload
+   uint32_t maximum = 0; // hard cap when nonzero
+};
+
+template <typename S>
+static void serialize(S&& serializer, ServiceUserCapacity& capacity)
+{
+   serializer.value4b(capacity.minimum);
+   serializer.value4b(capacity.maximum);
+}
+
+static inline uint32_t serviceUserCapacityPlanningWeight(const ServiceUserCapacity& capacity)
+{
+   if (capacity.minimum > 0)
+   {
+      return capacity.minimum;
+   }
+
+   if (capacity.maximum > 0)
+   {
+      return capacity.maximum;
+   }
+
+   return 1;
+}
+
 struct Wormhole {
 
    IPAddress externalAddress; // will include whether ipv6 or not
@@ -3876,6 +3905,7 @@ struct Wormhole {
    uint16_t containerPort;
    uint8_t layer4; // tcp or udp 
    bool isQuic; // if udp, is this quic
+   ServiceUserCapacity userCapacity;
    bool hasQuicCidKeyState = false;
    ExternalAddressSource source = ExternalAddressSource::distributableSubnet;
    uint128_t routableAddressUUID = 0;
@@ -3907,6 +3937,7 @@ static void serialize(S&& serializer, Wormhole& wormhole)
    serializer.value2b(wormhole.containerPort);
    serializer.value1b(wormhole.layer4);
    serializer.value1b(wormhole.isQuic);
+   serializer.object(wormhole.userCapacity);
    serializer.value1b(wormhole.hasQuicCidKeyState);
    serializer.value1b(wormhole.source);
    serializer.value16b(wormhole.routableAddressUUID);
@@ -5179,6 +5210,7 @@ class Advertisement : public ServiceBlueprint {
 public:
 
    uint16_t port; // if 0, chosen dynamically
+   ServiceUserCapacity userCapacity;
 
    Advertisement(uint64_t _service, ContainerState _startAt, ContainerState _stopAt, uint16_t _port) : ServiceBlueprint(_service, _startAt, _stopAt), port(_port) {}
    Advertisement() = default;
@@ -5189,6 +5221,7 @@ static void serialize(S&& serializer, Advertisement& advertisement)
 {
    serialize(serializer, static_cast<ServiceBlueprint&>(advertisement));
    serializer.value2b(advertisement.port);
+   serializer.object(advertisement.userCapacity);
 }
 
 class AssignedGPUDevice {
@@ -5233,6 +5266,7 @@ public:
    ContainerState state;            // neuron will update this itself
    int64_t createdAtMs;
    uint32_t shardGroup;
+   uint32_t nShardGroups = 0;
 
    bool requiresDatacenterUniqueTag;
    bool isStateful = false;
@@ -5442,6 +5476,7 @@ static void serialize(S&& serializer, ContainerPlan& plan)
    serializer.value1b(plan.state);
    serializer.value8b(plan.createdAtMs);
    serializer.value4b(plan.shardGroup);
+   serializer.value4b(plan.nShardGroups);
 
    serializer.value1b(plan.requiresDatacenterUniqueTag);
    serializer.value1b(plan.isStateful);

@@ -165,86 +165,6 @@ static inline bool overlay_inner_targets_local(__u8 inner_proto, void *inner_l3,
 }
 
 __attribute__((__always_inline__))
-static inline bool maybe_redirect_overlay_packet_to_local_container(struct ethhdr *eth, void *data_end, int *action)
-{
-   if (action == NULL)
-   {
-      return false;
-   }
-
-   void *inner_l3 = NULL;
-   __u8 inner_proto = 0;
-
-   if (eth->h_proto == BE_ETH_P_IPV6)
-   {
-      struct ipv6hdr *outer6 = (struct ipv6hdr *)(eth + 1);
-      if ((void *)(outer6 + 1) > data_end)
-      {
-         *action = TC_ACT_SHOT;
-         return true;
-      }
-
-      if (outer6->nexthdr != IPPROTO_IPIP && outer6->nexthdr != IPPROTO_IPV6)
-      {
-         return false;
-      }
-
-      inner_proto = outer6->nexthdr;
-      inner_l3 = (void *)(outer6 + 1);
-   }
-   else if (eth->h_proto == BE_ETH_P_IP)
-   {
-      struct iphdr *outer4 = (struct iphdr *)(eth + 1);
-      if ((void *)(outer4 + 1) > data_end)
-      {
-         *action = TC_ACT_SHOT;
-         return true;
-      }
-
-      if (outer4->protocol != IPPROTO_IPIP && outer4->protocol != IPPROTO_IPV6)
-      {
-         return false;
-      }
-
-      inner_proto = outer4->protocol;
-      inner_l3 = (void *)(outer4 + 1);
-   }
-   else
-   {
-      return false;
-   }
-
-   if (inner_proto != IPPROTO_IPV6)
-   {
-      return false;
-   }
-
-   struct ipv6hdr *inner6 = (struct ipv6hdr *)inner_l3;
-   if ((void *)(inner6 + 1) > data_end)
-   {
-      *action = TC_ACT_SHOT;
-      return true;
-   }
-
-   __u32 zeroidx = 0;
-   struct local_container_subnet6 *localcontainersubnet6 = bpf_map_lookup_elem(&local_container_subnet_map, &zeroidx);
-   __u8 container_fragment = 0;
-   if (switchboardResolveLocalContainerIPv6Fragment(inner6->daddr.s6_addr, localcontainersubnet6, &container_fragment) == false)
-   {
-      return false;
-   }
-
-   // Route cross-machine overlay traffic by the inner local container address
-   // and let the container primary program own decapsulation.
-   null_mac_addresses(eth);
-   setCheckpoint("overlay_local_redirect");
-   *action = redirectContainerFragment(container_fragment, true)
-      ? setInstruction(TC_ACT_REDIRECT)
-      : TC_ACT_SHOT;
-   return true;
-}
-
-__attribute__((__always_inline__))
 static inline bool maybe_decap_overlay_packet(struct __sk_buff *skb)
 {
    void *data_end = (void *)(long)skb->data_end;
@@ -273,10 +193,14 @@ static inline bool maybe_decap_overlay_packet(struct __sk_buff *skb)
          return false;
       }
 
+      __u64 decap_flags = switchboardAdjustRoomPreserveOffloadFlags()
+         | (ipv6h->nexthdr == IPPROTO_IPV6
+            ? BPF_F_ADJ_ROOM_DECAP_L3_IPV6
+            : BPF_F_ADJ_ROOM_DECAP_L3_IPV4);
       return bpf_skb_adjust_room(skb,
          -(__s32)sizeof(struct ipv6hdr),
-         BPF_ADJ_ROOM_NET,
-         BPF_F_ADJ_ROOM_DECAP_L3_IPV6 | switchboardAdjustRoomPreserveOffloadFlags()) == 0;
+         BPF_ADJ_ROOM_MAC,
+         decap_flags) == 0;
    }
 
    if (eth->h_proto == BE_ETH_P_IP)
@@ -298,10 +222,84 @@ static inline bool maybe_decap_overlay_packet(struct __sk_buff *skb)
          return false;
       }
 
+      __u64 decap_flags = switchboardAdjustRoomPreserveOffloadFlags()
+         | (iph->protocol == IPPROTO_IPV6
+            ? BPF_F_ADJ_ROOM_DECAP_L3_IPV6
+            : BPF_F_ADJ_ROOM_DECAP_L3_IPV4);
       return bpf_skb_adjust_room(skb,
          -(__s32)sizeof(struct iphdr),
-         BPF_ADJ_ROOM_NET,
-         BPF_F_ADJ_ROOM_DECAP_L3_IPV4 | switchboardAdjustRoomPreserveOffloadFlags()) == 0;
+         BPF_ADJ_ROOM_MAC,
+         decap_flags) == 0;
+   }
+
+  return false;
+}
+
+// Native host traffic should bypass the heavier overlay/container parsing path.
+// The maintained host-control failure is on plain machine-to-machine TCP/UDP,
+// so only keep packets on the slow path when they can still target a container,
+// a whitehole reply binding, or an overlay decap path.
+__attribute__((__always_inline__))
+static inline bool should_fast_pass_native_host_packet(struct ethhdr *eth, void *data_end)
+{
+   if (eth == NULL)
+   {
+      return false;
+   }
+
+   if (eth->h_proto == BE_ETH_P_IP)
+   {
+      struct iphdr *iph = (struct iphdr *)(eth + 1);
+      struct switchboard_whitehole_binding replyBinding = {};
+      if ((void *)(iph + 1) > data_end)
+      {
+         return false;
+      }
+
+      if (iph->protocol == IPPROTO_IPIP || iph->protocol == IPPROTO_IPV6)
+      {
+         return false;
+      }
+
+      if (overlayRoutablePrefixesContainIPv4(iph->daddr))
+      {
+         return false;
+      }
+
+      if (lookup_whitehole_reply_binding_ipv4(eth, data_end, &replyBinding))
+      {
+         return false;
+      }
+
+      return true;
+   }
+
+   if (eth->h_proto == BE_ETH_P_IPV6)
+   {
+      struct ipv6hdr *ipv6h = (struct ipv6hdr *)(eth + 1);
+      struct switchboard_whitehole_binding replyBinding = {};
+      if ((void *)(ipv6h + 1) > data_end)
+      {
+         return false;
+      }
+
+      if (ipv6h->nexthdr == IPPROTO_IPIP || ipv6h->nexthdr == IPPROTO_IPV6)
+      {
+         return false;
+      }
+
+      if (localSubnetContainsDaddr(ipv6h->daddr.s6_addr)
+         || overlayRoutablePrefixesContainIPv6(ipv6h->daddr.s6_addr32))
+      {
+         return false;
+      }
+
+      if (lookup_whitehole_reply_binding_ipv6(eth, data_end, &replyBinding))
+      {
+         return false;
+      }
+
+      return true;
    }
 
    return false;
@@ -327,6 +325,15 @@ int host_ingress_router(struct __sk_buff *skb)
     return TC_ACT_SHOT;
   }
 
+  if (should_fast_pass_native_host_packet(eth, data_end))
+  {
+    setCheckpoint("native-pass");
+#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
+    bump_dev_host_route_stat(14);
+#endif
+    return setInstruction(TC_ACT_OK);
+  }
+
   __u32 minimum_linear_bytes = switchboardHostIngressOverlayMinimumLinearBytes(eth->h_proto);
   if (minimum_linear_bytes != 0u && bpf_skb_pull_data(skb, minimum_linear_bytes) != 0)
   {
@@ -338,12 +345,6 @@ int host_ingress_router(struct __sk_buff *skb)
   if ((void *)(eth + 1) > data_end)
   {
     return TC_ACT_SHOT;
-  }
-
-  int overlay_local_action = TC_ACT_OK;
-  if (maybe_redirect_overlay_packet_to_local_container(eth, data_end, &overlay_local_action))
-  {
-    return overlay_local_action;
   }
 
   bool decapped = maybe_decap_overlay_packet(skb);
@@ -493,6 +494,5 @@ int host_ingress_router(struct __sk_buff *skb)
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
   bump_dev_host_route_stat(10);
 #endif
-
   return setInstruction(TC_ACT_OK);
 }

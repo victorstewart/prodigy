@@ -42,6 +42,10 @@ public:
 	bool quarantined = false;
 	bool weConnectToIt = false;
 	bool connected = false;
+	bool currentStreamAccepted = false;
+	bool registrationFresh = false;
+	uint32_t transportEpoch = 0;
+	uint32_t queuedCloseTransportEpoch = 0;
 	uint8_t datacenterFragment = 0;
 
 	uint32_t private4 = 0; // even if it connects to us, allows us to keep it in the brain bin until (if ever) it reconnects to us. then we check the privates
@@ -79,7 +83,26 @@ public:
       ProdigyTransportTLSStream::reset();
       Reconnector::reset();
 		connected = false;
+		currentStreamAccepted = false;
+		registrationFresh = false;
    }
+
+	void noteTransportActivated(void)
+	{
+		if (transportEpoch == UINT32_MAX)
+		{
+			transportEpoch = 1;
+		}
+		else
+		{
+			transportEpoch += 1;
+		}
+	}
+
+	void noteCloseQueuedForCurrentTransport(void)
+	{
+		queuedCloseTransportEpoch = transportEpoch;
+	}
 
 	// we need some kind of log to know what updates to replay for slave brains?
 	void sendRegistration(int64_t boottimens, uint64_t version, uint128_t existingMasterUUID)
@@ -429,8 +452,10 @@ public:
 				}
 
 				neuron->reconnectAfterClose = false;
+				neuron->cancelPendingConnect();
 				neuron->nConnectionAttempts = 0;
 				neuron->nAttemptsBudget = 0;
+				neuron->attemptDeadlineMs = 0;
 			}
 
 			virtual void armMachineNeuronControl(Machine *machine)
@@ -452,6 +477,17 @@ public:
 						machine->neuron.connectTimeoutMs,
 						machine->neuron.nDefaultAttemptsBudget));
 					machine->neuron.attemptConnect();
+					std::fprintf(stderr,
+						"prodigy debug neuron-control-connect-submit source=base-arm uuid=%llu private4=%u fd=%d fslot=%d pendingConnect=%d pendingSend=%d pendingRecv=%d daddrLen=%u\n",
+						(unsigned long long)machine->uuid,
+						unsigned(machine->private4),
+						machine->neuron.fd,
+						machine->neuron.fslot,
+						int(machine->neuron.connectAttemptPending()),
+						int(machine->neuron.pendingSend),
+						int(machine->neuron.pendingRecv),
+						unsigned(machine->neuron.daddrLen));
+					std::fflush(stderr);
 				}
 			}
 
@@ -643,7 +679,43 @@ public:
 	virtual void requestMachines(MachineTicket *ticket, ApplicationDeployment *deployment, ApplicationLifetime lifetime, uint32_t nMore) = 0;
 
    static constexpr uint64_t brainPeerReplicationBufferedBytesLimit = 512_MB;
+   static constexpr uint32_t brainPeerLargePayloadKeepaliveSeconds = 120u;
    static constexpr uint64_t brainPeerReplicationFrameHeadroomBytes = 256_KB;
+
+   static int brainPeerLargePayloadKeepaliveIdleSeconds(void)
+   {
+      constexpr int keepaliveProbeCount = 2;
+      constexpr int keepaliveProbeIntervalSeconds = 1;
+      int tcpKeepIdleVal = int(brainPeerLargePayloadKeepaliveSeconds)
+         - (keepaliveProbeCount + 1) * keepaliveProbeIntervalSeconds;
+      if (tcpKeepIdleVal < 1)
+      {
+         tcpKeepIdleVal = 1;
+      }
+
+      return tcpKeepIdleVal;
+   }
+
+   void queueBrainPeerLargePayloadKeepalive(BrainView *brain)
+   {
+      if (brain == nullptr)
+      {
+         return;
+      }
+
+      // Active brain peers are fixed-file sockets, so live keepalive retuning
+      // must go through queued socket commands rather than direct setsockopt.
+      Ring::queueSetSockOptInt(brain, SOL_SOCKET, SO_KEEPALIVE, 1, "brain peer large-payload keepalive");
+      Ring::queueSetSockOptInt(brain, SOL_TCP, TCP_KEEPIDLE, brainPeerLargePayloadKeepaliveIdleSeconds(), "brain peer large-payload keepidle");
+      Ring::queueSetSockOptInt(brain, SOL_TCP, TCP_KEEPCNT, 2, "brain peer large-payload keepcnt");
+      Ring::queueSetSockOptInt(brain, SOL_TCP, TCP_KEEPINTVL, 1, "brain peer large-payload keepintvl");
+      Ring::queueSetSockOptInt(
+         brain,
+         SOL_TCP,
+         TCP_USER_TIMEOUT,
+         int(brainPeerLargePayloadKeepaliveSeconds * 1000u),
+         "brain peer large-payload user-timeout");
+   }
 
    uint64_t brainPeerBufferedBytes(const BrainView *brain) const
    {
@@ -716,6 +788,7 @@ public:
 
       if (Ring::socketIsClosing(brain) == false)
       {
+         brain->noteCloseQueuedForCurrentTransport();
          Ring::queueClose(brain);
       }
 
@@ -736,6 +809,13 @@ public:
          return false;
       }
 
+      if (containerBlob.size() > 0)
+      {
+         // Large replicated deployment blobs can exceed the normal peer
+         // keepalive/user-timeout window while a follower persists the image.
+         queueBrainPeerLargePayloadKeepalive(brain);
+      }
+
       Message::construct(
          brain->wBuffer,
          BrainTopic::replicateDeployment,
@@ -754,6 +834,13 @@ public:
       if (allowBrainPeerReplicationAppend(brain, appendBytes, "replicateDeployment-store"_ctv) == false)
       {
          return false;
+      }
+
+      if (containerBlobBytes > 0)
+      {
+         // Store-backed replication can stream multi-megabyte blobs after a
+         // master change; keep the peer socket alive across that transfer.
+         queueBrainPeerLargePayloadKeepalive(brain);
       }
 
       uint32_t headerOffset = Message::appendHeader(brain->wBuffer, BrainTopic::replicateDeployment);

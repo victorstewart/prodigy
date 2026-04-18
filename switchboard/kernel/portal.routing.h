@@ -270,7 +270,7 @@ static inline bool switchboardRewriteWormholeIPv6TargetSKB(struct __sk_buff *skb
       return false;
    }
 
-   const __u64 rewriteFlags = switchboardPacketRewriteManualChecksumStoreFlags();
+   const __u64 rewriteFlags = switchboardPacketRewriteManualChecksumDataStoreFlags();
    __be16 oldTargetPort = pckt->flow.port16[1];
 
    if (pckt->flow.proto != IPPROTO_UDP && pckt->flow.proto != IPPROTO_TCP)

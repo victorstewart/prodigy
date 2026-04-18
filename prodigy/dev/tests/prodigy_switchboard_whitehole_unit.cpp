@@ -2,6 +2,7 @@
 #include <services/debug.h>
 
 #include <ebpf/common/structs.h>
+#include <ebpf/program.h>
 
 #include <switchboard/common/checksum.h>
 #include <switchboard/common/local_container_subnet.h>
@@ -13,8 +14,14 @@
 #include <array>
 #include <vector>
 #include <arpa/inet.h>
+#include <netinet/icmp6.h>
+#include <linux/pkt_cls.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
+
+#ifndef PRODIGY_TEST_BINARY_DIR
+#define PRODIGY_TEST_BINARY_DIR ""
+#endif
 
 class TestSuite
 {
@@ -35,6 +42,161 @@ public:
       }
    }
 };
+
+static uint32_t programMapID(BPFProgram& program, StringType auto&& mapName)
+{
+   uint32_t id = 0;
+
+   program.openMap(mapName, [&] (int mapFD) -> void {
+
+      if (mapFD < 0)
+      {
+         return;
+      }
+
+      struct bpf_map_info info = {};
+      __u32 infoLen = sizeof(info);
+      if (bpf_map_get_info_by_fd(mapFD, &info, &infoLen) == 0)
+      {
+         id = info.id;
+      }
+   });
+
+   return id;
+}
+
+static void makeContainerIPv6(uint8_t address[16],
+   uint8_t datacenterPrefix,
+   uint8_t machinePrefix0,
+   uint8_t machinePrefix1,
+   uint8_t machinePrefix2,
+   uint8_t containerFragment)
+{
+   std::memcpy(address, container_network_subnet6.value, sizeof(container_network_subnet6.value));
+   address[11] = datacenterPrefix;
+   address[12] = machinePrefix0;
+   address[13] = machinePrefix1;
+   address[14] = machinePrefix2;
+   address[15] = containerFragment;
+}
+
+static std::vector<uint8_t> makeIPv6InIPv6EthernetFrame(const uint8_t outerSrc[16],
+   const uint8_t outerDst[16],
+   const uint8_t innerSrc[16],
+   const uint8_t innerDst[16])
+{
+   std::vector<uint8_t> frame(sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + sizeof(struct ipv6hdr));
+   std::memset(frame.data(), 0, frame.size());
+
+   struct ethhdr *eth = reinterpret_cast<struct ethhdr *>(frame.data());
+   eth->h_proto = htons(ETH_P_IPV6);
+
+   struct ipv6hdr *outer6 = reinterpret_cast<struct ipv6hdr *>(frame.data() + sizeof(struct ethhdr));
+   outer6->version = 6;
+   outer6->nexthdr = IPPROTO_IPV6;
+   outer6->hop_limit = 64;
+   outer6->payload_len = htons(sizeof(struct ipv6hdr));
+   std::memcpy(outer6->saddr.s6_addr, outerSrc, sizeof(outer6->saddr.s6_addr));
+   std::memcpy(outer6->daddr.s6_addr, outerDst, sizeof(outer6->daddr.s6_addr));
+
+   struct ipv6hdr *inner6 = outer6 + 1;
+   inner6->version = 6;
+   inner6->nexthdr = IPPROTO_NONE;
+   inner6->hop_limit = 64;
+   inner6->payload_len = 0;
+   std::memcpy(inner6->saddr.s6_addr, innerSrc, sizeof(inner6->saddr.s6_addr));
+   std::memcpy(inner6->daddr.s6_addr, innerDst, sizeof(inner6->daddr.s6_addr));
+   return frame;
+}
+
+static std::vector<uint8_t> makeICMPv6InIPv6EthernetFrame(const uint8_t outerSrc[16],
+   const uint8_t outerDst[16],
+   const uint8_t innerSrc[16],
+   const uint8_t innerDst[16])
+{
+   std::vector<uint8_t> frame(sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + sizeof(struct ipv6hdr) + sizeof(struct icmp6_hdr));
+   std::memset(frame.data(), 0, frame.size());
+
+   struct ethhdr *eth = reinterpret_cast<struct ethhdr *>(frame.data());
+   eth->h_proto = htons(ETH_P_IPV6);
+
+   struct ipv6hdr *outer6 = reinterpret_cast<struct ipv6hdr *>(frame.data() + sizeof(struct ethhdr));
+   outer6->version = 6;
+   outer6->nexthdr = IPPROTO_IPV6;
+   outer6->hop_limit = 64;
+   outer6->payload_len = htons(sizeof(struct ipv6hdr) + sizeof(struct icmp6_hdr));
+   std::memcpy(outer6->saddr.s6_addr, outerSrc, sizeof(outer6->saddr.s6_addr));
+   std::memcpy(outer6->daddr.s6_addr, outerDst, sizeof(outer6->daddr.s6_addr));
+
+   struct ipv6hdr *inner6 = outer6 + 1;
+   inner6->version = 6;
+   inner6->nexthdr = IPPROTO_ICMPV6;
+   inner6->hop_limit = 64;
+   inner6->payload_len = htons(sizeof(struct icmp6_hdr));
+   std::memcpy(inner6->saddr.s6_addr, innerSrc, sizeof(inner6->saddr.s6_addr));
+   std::memcpy(inner6->daddr.s6_addr, innerDst, sizeof(inner6->daddr.s6_addr));
+
+   struct icmp6_hdr *icmp6 = reinterpret_cast<struct icmp6_hdr *>(inner6 + 1);
+   icmp6->icmp6_type = ICMP6_ECHO_REQUEST;
+   icmp6->icmp6_code = 0;
+   icmp6->icmp6_id = htons(0x1203);
+   icmp6->icmp6_seq = htons(0x0042);
+   return frame;
+}
+
+static uint16_t checksumIPv6Transport(const uint8_t src[16],
+   const uint8_t dst[16],
+   uint8_t nextHeader,
+   const void *transport,
+   size_t transportSize);
+
+static std::vector<uint8_t> makeUDPv6InIPv6EthernetFrame(const uint8_t outerSrc[16],
+   const uint8_t outerDst[16],
+   const uint8_t innerSrc[16],
+   const uint8_t innerDst[16],
+   uint16_t sourcePort,
+   uint16_t destPort,
+   const std::vector<uint8_t>& payload)
+{
+   std::vector<uint8_t> frame(sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + sizeof(struct ipv6hdr) + sizeof(struct udphdr) + payload.size());
+   std::memset(frame.data(), 0, frame.size());
+
+   struct ethhdr *eth = reinterpret_cast<struct ethhdr *>(frame.data());
+   eth->h_proto = htons(ETH_P_IPV6);
+
+   struct ipv6hdr *outer6 = reinterpret_cast<struct ipv6hdr *>(frame.data() + sizeof(struct ethhdr));
+   outer6->version = 6;
+   outer6->nexthdr = IPPROTO_IPV6;
+   outer6->hop_limit = 64;
+   outer6->payload_len = htons(sizeof(struct ipv6hdr) + sizeof(struct udphdr) + payload.size());
+   std::memcpy(outer6->saddr.s6_addr, outerSrc, sizeof(outer6->saddr.s6_addr));
+   std::memcpy(outer6->daddr.s6_addr, outerDst, sizeof(outer6->daddr.s6_addr));
+
+   struct ipv6hdr *inner6 = outer6 + 1;
+   inner6->version = 6;
+   inner6->nexthdr = IPPROTO_UDP;
+   inner6->hop_limit = 64;
+   inner6->payload_len = htons(sizeof(struct udphdr) + payload.size());
+   std::memcpy(inner6->saddr.s6_addr, innerSrc, sizeof(inner6->saddr.s6_addr));
+   std::memcpy(inner6->daddr.s6_addr, innerDst, sizeof(inner6->daddr.s6_addr));
+
+   struct udphdr *udp = reinterpret_cast<struct udphdr *>(inner6 + 1);
+   udp->source = htons(sourcePort);
+   udp->dest = htons(destPort);
+   udp->len = htons(sizeof(struct udphdr) + payload.size());
+
+   if (payload.empty() == false)
+   {
+      std::memcpy(reinterpret_cast<uint8_t *>(udp + 1), payload.data(), payload.size());
+   }
+
+   udp->check = checksumIPv6Transport(inner6->saddr.s6_addr,
+      inner6->daddr.s6_addr,
+      IPPROTO_UDP,
+      udp,
+      sizeof(struct udphdr) + payload.size());
+   return frame;
+}
 
 static uint16_t foldChecksum(uint32_t sum)
 {
@@ -277,19 +439,233 @@ int main(void)
    String pinPath = {};
    switchboardWhiteholeReplyFlowPinPath(pinPath, 17);
    suite.expect(pinPath == "/sys/fs/bpf/prodigy_whitehole_reply_flows_17"_ctv, "switchboard_whitehole_pin_path_uses_interface_index");
+
+   {
+      String egressObjectPath = {};
+      egressObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+      egressObjectPath.append("/host.egress.router.ebpf.o"_ctv);
+
+      String ingressObjectPath = {};
+      ingressObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+      ingressObjectPath.append("/host.ingress.router.ebpf.o"_ctv);
+
+      uint32_t testIfindex = uint32_t(::getpid());
+      String sharedPinPath = {};
+      switchboardWhiteholeReplyFlowPinPath(sharedPinPath, testIfindex);
+      (void)unlink(sharedPinPath.c_str());
+
+      BPFProgram egressProgram = {};
+      suite.expect(egressProgram.load(egressObjectPath, "host_egress_router"_ctv), "switchboard_whitehole_reply_flow_reuse_loads_host_egress_program");
+
+      bool pinnedReplyMap = switchboardPinWhiteholeReplyFlowMap(&egressProgram, testIfindex);
+      suite.expect(pinnedReplyMap, "switchboard_whitehole_reply_flow_reuse_pins_egress_reply_map_before_ingress_load");
+
+      bool reusedPinnedReplyMap = false;
+      BPFProgram ingressProgram = {};
+      bool ingressLoaded = ingressProgram.load(ingressObjectPath,
+         "host_ingress_router"_ctv,
+         [&] (struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
+
+            reusedPinnedReplyMap = switchboardReusePinnedWhiteholeReplyFlowMap(obj, testIfindex, inner_map_fds);
+         });
+      suite.expect(ingressLoaded, "switchboard_whitehole_reply_flow_reuse_loads_host_ingress_program");
+      suite.expect(reusedPinnedReplyMap, "switchboard_whitehole_reply_flow_reuse_reuses_pinned_map_for_ingress_program");
+
+      uint32_t egressReplyMapID = programMapID(egressProgram, "whitehole_reply_flows"_ctv);
+      uint32_t ingressReplyMapID = programMapID(ingressProgram, "whitehole_reply_flows"_ctv);
+      suite.expect(egressReplyMapID != 0, "switchboard_whitehole_reply_flow_reuse_resolves_egress_map_id");
+      suite.expect(ingressReplyMapID == egressReplyMapID, "switchboard_whitehole_reply_flow_reuse_shares_reply_flow_map_between_egress_and_ingress");
+
+      (void)unlink(sharedPinPath.c_str());
+   }
+
+   {
+      String ingressObjectPath = {};
+      ingressObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+      ingressObjectPath.append("/host.ingress.router.ebpf.o"_ctv);
+
+      BPFProgram ingressProgram = {};
+      suite.expect(ingressProgram.load(ingressObjectPath, "host_ingress_router"_ctv),
+         "switchboard_host_ingress_overlay_local_delivery_loads_host_ingress_program");
+
+      if (ingressProgram.prog_fd >= 0)
+      {
+         local_container_subnet6 localSubnet = {};
+         localSubnet.dpfx = 0x01;
+         localSubnet.mpfx[0] = 0x6e;
+         localSubnet.mpfx[1] = 0xa2;
+         localSubnet.mpfx[2] = 0x7b;
+         ingressProgram.setArrayElement("local_container_subnet_map"_ctv, 0, localSubnet);
+
+         uint32_t redirectIfidx = 77;
+         ingressProgram.setArrayElement("container_device_map"_ctv, 0x7e, redirectIfidx);
+
+         uint8_t outerSrc[16] = {0xfd, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0b};
+         uint8_t outerDst[16] = {0xfd, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0c};
+         uint8_t innerSrc[16] = {};
+         uint8_t innerDst[16] = {};
+         makeContainerIPv6(innerSrc, 0x01, 0x16, 0x25, 0x5b, 0x09);
+         makeContainerIPv6(innerDst, 0x01, localSubnet.mpfx[0], localSubnet.mpfx[1], localSubnet.mpfx[2], 0x7e);
+
+         std::vector<uint8_t> frame = makeIPv6InIPv6EthernetFrame(outerSrc, outerDst, innerSrc, innerDst);
+         std::vector<uint8_t> output(frame.size());
+         LIBBPF_OPTS(bpf_test_run_opts, opts,
+            .data_in = frame.data(),
+            .data_out = output.data(),
+            .data_size_in = static_cast<__u32>(frame.size()),
+            .data_size_out = static_cast<__u32>(output.size()),
+            .repeat = 1,
+         );
+
+         int runResult = bpf_prog_test_run_opts(ingressProgram.prog_fd, &opts);
+         suite.expect(runResult == 0, "switchboard_host_ingress_overlay_local_delivery_test_run_succeeds");
+         suite.expect(opts.retval == TC_ACT_REDIRECT,
+            "switchboard_host_ingress_overlay_local_delivery_redirects_to_container");
+         suite.expect(opts.data_size_out == (frame.size() - sizeof(struct ipv6hdr)),
+            "switchboard_host_ingress_overlay_local_delivery_decaps_outer_ipv6_before_redirect");
+
+         if (runResult == 0 && opts.data_size_out >= (sizeof(struct ethhdr) + sizeof(struct ipv6hdr)))
+         {
+            const struct ethhdr *outEth = reinterpret_cast<const struct ethhdr *>(output.data());
+            suite.expect(outEth->h_proto == htons(ETH_P_IPV6),
+               "switchboard_host_ingress_overlay_local_delivery_preserves_inner_ethertype");
+
+            const struct ipv6hdr *outIPv6 = reinterpret_cast<const struct ipv6hdr *>(output.data() + sizeof(struct ethhdr));
+            suite.expect(std::memcmp(outIPv6->daddr.s6_addr, innerDst, sizeof(outIPv6->daddr.s6_addr)) == 0,
+               "switchboard_host_ingress_overlay_local_delivery_preserves_inner_ipv6_destination");
+            suite.expect(outIPv6->nexthdr == IPPROTO_NONE,
+               "switchboard_host_ingress_overlay_local_delivery_preserves_inner_next_header");
+         }
+
+         ingressProgram.close();
+      }
+   }
+
+   {
+      String ingressObjectPath = {};
+      ingressObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+      ingressObjectPath.append("/host.ingress.router.ebpf.o"_ctv);
+
+      BPFProgram ingressProgram = {};
+      suite.expect(ingressProgram.load(ingressObjectPath, "host_ingress_router"_ctv),
+         "switchboard_host_ingress_overlay_local_delivery_live_packet_loads_host_ingress_program");
+
+      if (ingressProgram.prog_fd >= 0)
+      {
+         local_container_subnet6 localSubnet = {};
+         localSubnet.dpfx = 0x01;
+         localSubnet.mpfx[0] = 0x52;
+         localSubnet.mpfx[1] = 0xdf;
+         localSubnet.mpfx[2] = 0x39;
+         ingressProgram.setArrayElement("local_container_subnet_map"_ctv, 0, localSubnet);
+
+         uint32_t redirectIfidx = 7;
+         ingressProgram.setArrayElement("container_device_map"_ctv, 0x4e, redirectIfidx);
+
+         uint8_t outerSrc[16] = {0xfd, 0x00, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a};
+         uint8_t outerDst[16] = {0xfd, 0x00, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0b};
+         uint8_t innerSrc[16] = {0xfd, 0xf8, 0xd9, 0x4c, 0x7c, 0x33, 0xe2, 0x6e, 0xca, 0x4b, 0xf5, 0x01, 0xac, 0xbe, 0xa0, 0xd2};
+         uint8_t innerDst[16] = {0xfd, 0xf8, 0xd9, 0x4c, 0x7c, 0x33, 0xe2, 0x6e, 0xca, 0x4b, 0xf5, 0x01, 0x52, 0xdf, 0x39, 0x4e};
+
+         std::vector<uint8_t> frame = makeICMPv6InIPv6EthernetFrame(outerSrc, outerDst, innerSrc, innerDst);
+         std::vector<uint8_t> output(frame.size());
+         LIBBPF_OPTS(bpf_test_run_opts, opts,
+            .data_in = frame.data(),
+            .data_out = output.data(),
+            .data_size_in = static_cast<__u32>(frame.size()),
+            .data_size_out = static_cast<__u32>(output.size()),
+            .repeat = 1,
+         );
+
+         int runResult = bpf_prog_test_run_opts(ingressProgram.prog_fd, &opts);
+         suite.expect(runResult == 0, "switchboard_host_ingress_overlay_local_delivery_live_packet_test_run_succeeds");
+         suite.expect(opts.retval == TC_ACT_REDIRECT,
+            "switchboard_host_ingress_overlay_local_delivery_live_packet_redirects_to_container");
+         suite.expect(opts.data_size_out == (frame.size() - sizeof(struct ipv6hdr)),
+            "switchboard_host_ingress_overlay_local_delivery_live_packet_decaps_outer_ipv6_before_redirect");
+
+         if (runResult == 0 && opts.data_size_out >= (sizeof(struct ethhdr) + sizeof(struct ipv6hdr)))
+         {
+            const struct ethhdr *outEth = reinterpret_cast<const struct ethhdr *>(output.data());
+            suite.expect(outEth->h_proto == htons(ETH_P_IPV6),
+               "switchboard_host_ingress_overlay_local_delivery_live_packet_preserves_inner_ethertype");
+
+            const struct ipv6hdr *outIPv6 = reinterpret_cast<const struct ipv6hdr *>(output.data() + sizeof(struct ethhdr));
+            suite.expect(std::memcmp(outIPv6->daddr.s6_addr, innerDst, sizeof(outIPv6->daddr.s6_addr)) == 0,
+               "switchboard_host_ingress_overlay_local_delivery_live_packet_preserves_inner_ipv6_destination");
+            suite.expect(outIPv6->nexthdr == IPPROTO_ICMPV6,
+               "switchboard_host_ingress_overlay_local_delivery_live_packet_preserves_inner_next_header");
+         }
+
+         ingressProgram.close();
+      }
+   }
+
+   {
+      String ingressObjectPath = {};
+      ingressObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+      ingressObjectPath.append("/container.ingress.router.ebpf.o"_ctv);
+
+      BPFProgram ingressProgram = {};
+      suite.expect(ingressProgram.load(ingressObjectPath, "container_ingress_router"_ctv),
+         "switchboard_container_ingress_overlay_delivery_loads_program");
+
+      if (ingressProgram.prog_fd >= 0)
+      {
+         uint8_t outerSrc[16] = {0xfd, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0b};
+         uint8_t outerDst[16] = {0xfd, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0c};
+         uint8_t innerSrc[16] = {};
+         uint8_t innerDst[16] = {};
+         makeContainerIPv6(innerSrc, 0x01, 0x16, 0x25, 0x5b, 0x09);
+         makeContainerIPv6(innerDst, 0x01, 0x6e, 0xa2, 0x7b, 0x7e);
+
+         std::vector<uint8_t> frame = makeIPv6InIPv6EthernetFrame(outerSrc, outerDst, innerSrc, innerDst);
+         std::vector<uint8_t> output(frame.size());
+         LIBBPF_OPTS(bpf_test_run_opts, opts,
+            .data_in = frame.data(),
+            .data_out = output.data(),
+            .data_size_in = static_cast<__u32>(frame.size()),
+            .data_size_out = static_cast<__u32>(output.size()),
+            .repeat = 1,
+        );
+
+         int runResult = bpf_prog_test_run_opts(ingressProgram.prog_fd, &opts);
+         suite.expect(runResult == 0, "switchboard_container_ingress_overlay_delivery_test_run_succeeds");
+         suite.expect(opts.retval == 0, "switchboard_container_ingress_overlay_delivery_passes_inner_packet");
+         suite.expect(opts.data_size_out == (frame.size() - sizeof(struct ipv6hdr)),
+            "switchboard_container_ingress_overlay_delivery_decaps_outer_ipv6");
+
+         if (runResult == 0 && opts.data_size_out >= (sizeof(struct ethhdr) + sizeof(struct ipv6hdr)))
+         {
+            const struct ethhdr *outEth = reinterpret_cast<const struct ethhdr *>(output.data());
+            const struct ipv6hdr *outIPv6 = reinterpret_cast<const struct ipv6hdr *>(output.data() + sizeof(struct ethhdr));
+            suite.expect(outEth->h_proto == htons(ETH_P_IPV6),
+               "switchboard_container_ingress_overlay_delivery_preserves_inner_ethertype");
+            suite.expect(std::memcmp(outIPv6->daddr.s6_addr, innerDst, sizeof(outIPv6->daddr.s6_addr)) == 0,
+               "switchboard_container_ingress_overlay_delivery_preserves_inner_ipv6_destination");
+            suite.expect(outIPv6->nexthdr == IPPROTO_NONE,
+               "switchboard_container_ingress_overlay_delivery_preserves_inner_next_header");
+         }
+
+         ingressProgram.close();
+      }
+   }
+
    suite.expect((switchboardPacketRewriteStoreFlags() & BPF_F_RECOMPUTE_CSUM) != 0, "switchboard_packet_rewrite_store_flags_recompute_checksum");
    suite.expect((switchboardPacketRewriteStoreFlags() & BPF_F_INVALIDATE_HASH) != 0, "switchboard_packet_rewrite_store_flags_invalidate_hash");
-   suite.expect((switchboardPacketRewriteManualChecksumStoreFlags() & BPF_F_RECOMPUTE_CSUM) == 0, "switchboard_packet_rewrite_manual_checksum_store_flags_skip_incremental_checksum");
-   suite.expect((switchboardPacketRewriteManualChecksumStoreFlags() & BPF_F_INVALIDATE_HASH) != 0, "switchboard_packet_rewrite_manual_checksum_store_flags_invalidate_hash");
+   suite.expect((switchboardPacketRewriteManualChecksumDataStoreFlags() & BPF_F_RECOMPUTE_CSUM) != 0, "switchboard_packet_rewrite_manual_checksum_data_store_flags_recompute_checksum");
+   suite.expect((switchboardPacketRewriteManualChecksumDataStoreFlags() & BPF_F_INVALIDATE_HASH) != 0, "switchboard_packet_rewrite_manual_checksum_data_store_flags_invalidate_hash");
+   suite.expect((switchboardPacketRewriteManualChecksumStoreFlags() & BPF_F_RECOMPUTE_CSUM) == 0, "switchboard_packet_rewrite_manual_checksum_checksum_store_flags_skip_incremental_checksum");
+   suite.expect((switchboardPacketRewriteManualChecksumStoreFlags() & BPF_F_INVALIDATE_HASH) != 0, "switchboard_packet_rewrite_manual_checksum_checksum_store_flags_invalidate_hash");
    suite.expect((switchboardAdjustRoomPreserveOffloadFlags() & BPF_F_ADJ_ROOM_NO_CSUM_RESET) != 0, "switchboard_adjust_room_preserves_checksum_offload");
    suite.expect((switchboardAdjustRoomPreserveOffloadFlags() & BPF_F_ADJ_ROOM_FIXED_GSO) != 0, "switchboard_adjust_room_preserves_gso");
    suite.expect((switchboardOverlayEncapAdjustRoomFlagsIPv6() & BPF_F_ADJ_ROOM_ENCAP_L3_IPV6) != 0, "switchboard_overlay_encap_ipv6_sets_l3_flag");
    suite.expect((switchboardOverlayEncapAdjustRoomFlagsIPv6() & BPF_F_ADJ_ROOM_NO_CSUM_RESET) != 0, "switchboard_overlay_encap_ipv6_preserves_checksum_offload");
-   suite.expect((switchboardOverlayEncapAdjustRoomFlagsIPv6() & BPF_F_ADJ_ROOM_FIXED_GSO) != 0, "switchboard_overlay_encap_ipv6_preserves_gso");
+   suite.expect((switchboardOverlayEncapAdjustRoomFlagsIPv6() & BPF_F_ADJ_ROOM_FIXED_GSO) == 0, "switchboard_overlay_encap_ipv6_clears_gso");
    suite.expect((switchboardOverlayEncapAdjustRoomFlagsIPv4() & BPF_F_ADJ_ROOM_ENCAP_L3_IPV4) != 0, "switchboard_overlay_encap_ipv4_sets_l3_flag");
    suite.expect((switchboardOverlayEncapAdjustRoomFlagsIPv4() & BPF_F_ADJ_ROOM_NO_CSUM_RESET) != 0, "switchboard_overlay_encap_ipv4_preserves_checksum_offload");
-   suite.expect((switchboardOverlayEncapAdjustRoomFlagsIPv4() & BPF_F_ADJ_ROOM_FIXED_GSO) != 0, "switchboard_overlay_encap_ipv4_preserves_gso");
-   suite.expect(switchboardManualChecksumMaxBytes() == 2048u, "switchboard_manual_checksum_max_bytes_matches_live_quic_budget");
+   suite.expect((switchboardOverlayEncapAdjustRoomFlagsIPv4() & BPF_F_ADJ_ROOM_FIXED_GSO) == 0, "switchboard_overlay_encap_ipv4_clears_gso");
+   suite.expect(switchboardManualChecksumMaxBytes() == 2050u, "switchboard_manual_checksum_max_bytes_matches_live_quic_reply_budget");
    suite.expect(switchboardManualChecksumSKBChunkBytes() == 128u, "switchboard_manual_checksum_skb_chunk_bytes_is_verifier_safe");
    suite.expect((switchboardManualChecksumSKBChunkBytes() & 3u) == 0u, "switchboard_manual_checksum_skb_chunk_bytes_is_word_aligned");
    suite.expect(switchboardManualChecksumSKBChunkBytes() <= 128u, "switchboard_manual_checksum_skb_chunk_bytes_leaves_stack_headroom");
@@ -337,7 +713,7 @@ int main(void)
    {
       uint8_t src[16] = {0xfd, 0xf8, 0xd9, 0x4c, 0x7c, 0x33, 0xe2, 0x6e, 0xca, 0x4b, 0xf5, 0x01, 0xf2, 0x66, 0xe5, 0xd9};
       uint8_t dst[16] = {0xfd, 0xf8, 0xd9, 0x4c, 0x7c, 0x33, 0xe2, 0x6e, 0xca, 0x4b, 0xf5, 0x01, 0x6e, 0x1f, 0xdd, 0x55};
-      std::vector<uint8_t> payload(2047u - sizeof(struct udphdr));
+      std::vector<uint8_t> payload(2050u - sizeof(struct udphdr));
 
       for (size_t index = 0; index < payload.size(); index += 1)
       {
@@ -369,9 +745,50 @@ int main(void)
          __builtin_offsetof(struct udphdr, check),
          switchboardManualChecksumSKBChunkBytes()));
 
-      suite.expect(segment.size() == 2047u, "switchboard_wormhole_skb_chunked_checksum_current_live_segment_size_matches_capture");
+      suite.expect(segment.size() == 2050u, "switchboard_wormhole_skb_chunked_checksum_current_live_segment_size_matches_capture");
       suite.expect(checksumBytesChunked(segment.data(), segment.size(), switchboardManualChecksumSKBChunkBytes()) == checksumBytes(segment.data(), segment.size()), "switchboard_wormhole_skb_chunked_checksum_matches_full_checksum_for_current_live_size");
       suite.expect(emulatedSKBChunkedChecksum == expectedChecksum, "switchboard_wormhole_skb_chunked_transport_checksum_matches_current_live_capture");
+   }
+
+   {
+      uint8_t src[16] = {0xfd, 0xf8, 0xd9, 0x4c, 0x7c, 0x33, 0xe2, 0x6e, 0xca, 0x4b, 0xf5, 0x01, 0x69, 0x06, 0x98, 0xb8};
+      uint8_t dst[16] = {0xfd, 0xf8, 0xd9, 0x4c, 0x7c, 0x33, 0xe2, 0x6e, 0xca, 0x4b, 0xf5, 0x01, 0x69, 0x06, 0x98, 0x73};
+      std::vector<uint8_t> payload(2049u - sizeof(struct udphdr));
+
+      for (size_t index = 0; index < payload.size(); index += 1)
+      {
+         payload[index] = static_cast<uint8_t>((index * 41u + 23u) & 0xffu);
+      }
+
+      struct udphdr udp = {};
+      udp.source = htons(8443);
+      udp.dest = htons(33543);
+      udp.len = htons(static_cast<uint16_t>(sizeof(struct udphdr) + payload.size()));
+
+      std::vector<uint8_t> segment(sizeof(struct udphdr) + payload.size());
+      std::memcpy(segment.data(), &udp, sizeof(udp));
+      std::memcpy(segment.data() + sizeof(udp), payload.data(), payload.size());
+
+      uint16_t expectedChecksum = compute_ipv6_transport_checksum_portable(
+         src,
+         dst,
+         IPPROTO_UDP,
+         segment.data(),
+         segment.size(),
+         __builtin_offsetof(struct udphdr, check));
+      uint16_t emulatedSKBChunkedChecksum = htons(checksumIPv6TransportChunked(
+         src,
+         dst,
+         IPPROTO_UDP,
+         segment.data(),
+         segment.size(),
+         __builtin_offsetof(struct udphdr, check),
+         switchboardManualChecksumSKBChunkBytes()));
+
+      suite.expect(segment.size() == 2049u, "switchboard_wormhole_skb_chunked_checksum_same_machine_public_reply_segment_size_matches_capture");
+      suite.expect(segment.size() <= switchboardManualChecksumMaxBytes(), "switchboard_wormhole_skb_chunked_checksum_same_machine_public_reply_fits_checksum_budget");
+      suite.expect(checksumBytesChunked(segment.data(), segment.size(), switchboardManualChecksumSKBChunkBytes()) == checksumBytes(segment.data(), segment.size()), "switchboard_wormhole_skb_chunked_checksum_matches_full_checksum_for_same_machine_public_reply_size");
+      suite.expect(emulatedSKBChunkedChecksum == expectedChecksum, "switchboard_wormhole_skb_chunked_transport_checksum_matches_same_machine_public_reply_capture");
    }
 
    {
@@ -815,7 +1232,7 @@ int main(void)
       uint8_t rewrittenSrc[16] = {0x20, 0x01, 0x0d, 0xb8, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0b};
       uint8_t dst[16] = {0xfd, 0xf8, 0xd9, 0x4c, 0x7c, 0x33, 0xe2, 0x6e, 0xca, 0x4b, 0xf5, 0x01, 0xa8, 0xe8, 0x59, 0x6f};
       uint8_t src[16] = {0xfd, 0xf8, 0xd9, 0x4c, 0x7c, 0x33, 0xe2, 0x6e, 0xca, 0x4b, 0xf5, 0x01, 0x71, 0x1f, 0x40, 0x89};
-      std::array<uint8_t, 2039> payload = {};
+      std::array<uint8_t, 2042> payload = {};
 
       for (size_t index = 0; index < payload.size(); ++index)
       {
@@ -854,9 +1271,58 @@ int main(void)
          rewrittenSegment.size(),
          __builtin_offsetof(struct udphdr, check));
 
-      suite.expect(rewrittenSegment.size() == 2047u, "switchboard_wormhole_udp_quic_source_rewrite_current_live_segment_size_matches_capture");
+      suite.expect(rewrittenSegment.size() == 2050u, "switchboard_wormhole_udp_quic_source_rewrite_current_live_segment_size_matches_capture");
       suite.expect(incremental.check != expectedChecksum, "switchboard_wormhole_udp_quic_source_incremental_rewrite_fails_at_current_live_size");
       suite.expect(recomputed == expectedChecksum, "switchboard_wormhole_udp_quic_source_full_recompute_matches_expected_checksum_at_current_live_size");
+   }
+
+   {
+      uint8_t rewrittenSrc[16] = {0x20, 0x01, 0x0d, 0xb8, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0c};
+      uint8_t dst[16] = {0xfd, 0xf8, 0xd9, 0x4c, 0x7c, 0x33, 0xe2, 0x6e, 0xca, 0x4b, 0xf5, 0x01, 0x69, 0x06, 0x98, 0x73};
+      uint8_t src[16] = {0xfd, 0xf8, 0xd9, 0x4c, 0x7c, 0x33, 0xe2, 0x6e, 0xca, 0x4b, 0xf5, 0x01, 0x69, 0x06, 0x98, 0xb8};
+      std::array<uint8_t, 2041> payload = {};
+
+      for (size_t index = 0; index < payload.size(); ++index)
+      {
+         payload[index] = static_cast<uint8_t>((index * 19u + 5u) & 0xffu);
+      }
+
+      struct udphdr udp = {};
+      udp.source = htons(8443);
+      udp.dest = htons(33543);
+      udp.len = htons(sizeof(udp) + payload.size());
+      udp.check = htons(0xf5b6);
+
+      std::array<uint8_t, sizeof(udp) + payload.size()> rewrittenSegment = {};
+      memcpy(rewrittenSegment.data(), &udp, sizeof(udp));
+      memcpy(rewrittenSegment.data() + sizeof(udp), payload.data(), payload.size());
+      reinterpret_cast<struct udphdr *>(rewrittenSegment.data())->source = htons(443);
+
+      std::array<uint8_t, rewrittenSegment.size()> expectedSegment = rewrittenSegment;
+      reinterpret_cast<struct udphdr *>(expectedSegment.data())->check = 0;
+      uint16_t expectedChecksum = htons(checksumIPv6Transport(
+         rewrittenSrc,
+         dst,
+         IPPROTO_UDP,
+         expectedSegment.data(),
+         expectedSegment.size()));
+
+      struct udphdr incremental = udp;
+      incremental.check = replace_l4_checksum_portable(incremental.check, src, rewrittenSrc, sizeof(rewrittenSrc));
+      incremental.check = replace_l4_checksum_word16(incremental.check, htons(8443), htons(443));
+
+      uint16_t recomputed = compute_ipv6_transport_checksum_portable(
+         rewrittenSrc,
+         dst,
+         IPPROTO_UDP,
+         rewrittenSegment.data(),
+         rewrittenSegment.size(),
+         __builtin_offsetof(struct udphdr, check));
+
+      suite.expect(rewrittenSegment.size() == 2049u, "switchboard_wormhole_udp_quic_source_rewrite_same_machine_public_reply_segment_size_matches_capture");
+      suite.expect(rewrittenSegment.size() <= switchboardManualChecksumMaxBytes(), "switchboard_wormhole_udp_quic_source_rewrite_same_machine_public_reply_fits_checksum_budget");
+      suite.expect(incremental.check != expectedChecksum, "switchboard_wormhole_udp_quic_source_incremental_rewrite_fails_at_same_machine_public_reply_size");
+      suite.expect(recomputed == expectedChecksum, "switchboard_wormhole_udp_quic_source_full_recompute_matches_same_machine_public_reply_capture");
    }
 
    {

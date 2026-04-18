@@ -12,7 +12,7 @@ shift || true
 
 if [[ -z "${PRODIGY_BIN}" || ! -x "${PRODIGY_BIN}" ]]
 then
-   echo "usage: $0 /path/to/prodigy [--runner-mode=oneshot|persistent] [--workspace-root=/abs/path] [--manifest-path=/abs/path.json] [--machines=COUNT] [--brains=COUNT] [--duration=SECONDS] [--brain-bootstrap-family=ipv4|private6|public6|multihome6] [--tunnel-ebpf=/path/to/object] [--host-ingress-ebpf=/path/to/object] [--host-egress-ebpf=/path/to/object] [--enable-fake-ipv4-boundary=0|1] [--fake-ipv4-boundary-ebpf=/path/to/object] [--switchboard-gateway-index=INDEX] [--mothership-bin=/path/to/mothership] [--mothership-autoscale-interval-seconds=SECONDS] [--mothership-update-prodigy-input=/path/to/new/prodigy-or-bundle] [--mothership-update-start=SECONDS] [--master-index=0|1|2|3 (deprecated; ignored)] [--fault-mode=link|crash|flap] [--fault-targets=master|deployed|1|2|3|csv] [--fault-start=SECONDS] [--fault-start-on-ready=0|1] [--fault-duration=SECONDS] [--fault-cycles=COUNT] [--fault-down=SECONDS] [--fault-up=SECONDS] [--post-fault-window=SECONDS] [--expect-master-available=0|1] [--expect-master-change=0|1] [--expect-master-change-during-fault=0|1] [--expect-peer-recovery=0|1] [--deploy-plan-json=/path/to/plan.json] [--deploy-container-zstd=/path/to/blob.zst] [--deploy-expect-accept=0|1] [--deploy-expect-text=STRING] [--deploy-second-plan-json=/path/to/plan.json] [--deploy-second-container-zstd=/path/to/blob.zst] [--deploy-second-start=SECONDS] [--deploy-second-expect-accept=0|1] [--deploy-second-expect-text=STRING] [--deploy-third-plan-json=/path/to/plan.json] [--deploy-third-container-zstd=/path/to/blob.zst] [--deploy-third-start=SECONDS] [--deploy-third-expect-accept=0|1] [--deploy-third-expect-text=STRING] [--deploy-ping-port=PORT] [--deploy-ping-payload=STRING] [--deploy-ping-expect=STRING] [--deploy-ping-all=0|1] [--deploy-ping-after-fault=0|1] [--deploy-skip-probe=0|1] [--deploy-report-application=...] [--deploy-report-version-id=ID] [--deploy-report-version-min=0|1] [--deploy-report-attempts=COUNT] [--deploy-report-min-healthy=COUNT] [--deploy-report-max-healthy-min=COUNT] [--deploy-report-final-healthy-max=COUNT] [--deploy-report-min-target=COUNT] [--deploy-report-max-target-min=COUNT] [--deploy-report-final-target-max=COUNT] [--deploy-report-min-shard-groups=COUNT] [--deploy-report-max-shard-groups-min=COUNT] [--deploy-report-final-shard-groups-max=COUNT] [--deploy-report-runtime-cores-min=COUNT] [--deploy-report-runtime-memory-min-mb=COUNT] [--deploy-report-runtime-storage-min-mb=COUNT] [--deploy-report-runtime-cores-max-min=COUNT] [--deploy-report-runtime-memory-max-min-mb=COUNT] [--deploy-report-runtime-storage-max-min-mb=COUNT] [--deploy-report-traffic-burst=COUNT] [--deploy-mesh-mode=any|exclusiveSome|all|radar] [--deploy-mesh-require-all=0|1] [--require-brain-log-substring=TEXT]"
+   echo "usage: $0 /path/to/prodigy [--runner-mode=oneshot|persistent] [--workspace-root=/abs/path] [--manifest-path=/abs/path.json] [--machines=COUNT] [--brains=COUNT] [--duration=SECONDS] [--brain-bootstrap-family=ipv4|private6|public6|multihome6] [--inter-container-mtu=BYTES] [--tunnel-ebpf=/path/to/object] [--host-ingress-ebpf=/path/to/object] [--host-egress-ebpf=/path/to/object] [--enable-fake-ipv4-boundary=0|1] [--fake-ipv4-boundary-ebpf=/path/to/object] [--switchboard-gateway-index=INDEX] [--mothership-bin=/path/to/mothership] [--mothership-autoscale-interval-seconds=SECONDS] [--mothership-update-prodigy-input=/path/to/new/prodigy-or-bundle] [--mothership-update-start=SECONDS] [--master-index=0|1|2|3 (deprecated; ignored)] [--fault-mode=link|crash|flap] [--fault-targets=master|deployed|1|2|3|csv] [--fault-start=SECONDS] [--fault-start-on-ready=0|1] [--fault-duration=SECONDS] [--fault-cycles=COUNT] [--fault-down=SECONDS] [--fault-up=SECONDS] [--post-fault-window=SECONDS] [--expect-master-available=0|1] [--expect-master-change=0|1] [--expect-master-change-during-fault=0|1] [--expect-peer-recovery=0|1] [--deploy-plan-json=/path/to/plan.json] [--deploy-container-zstd=/path/to/blob.zst] [--deploy-expect-accept=0|1] [--deploy-expect-text=STRING] [--deploy-second-plan-json=/path/to/plan.json] [--deploy-second-container-zstd=/path/to/blob.zst] [--deploy-second-start=SECONDS] [--deploy-second-expect-accept=0|1] [--deploy-second-expect-text=STRING] [--deploy-third-plan-json=/path/to/plan.json] [--deploy-third-container-zstd=/path/to/blob.zst] [--deploy-third-start=SECONDS] [--deploy-third-expect-accept=0|1] [--deploy-third-expect-text=STRING] [--deploy-ping-port=PORT] [--deploy-ping-payload=STRING] [--deploy-ping-expect=STRING] [--deploy-ping-all=0|1] [--deploy-ping-after-fault=0|1] [--deploy-skip-probe=0|1] [--deploy-report-application=...] [--deploy-report-version-id=ID] [--deploy-report-version-min=0|1] [--deploy-report-attempts=COUNT] [--deploy-report-min-healthy=COUNT] [--deploy-report-max-healthy-min=COUNT] [--deploy-report-final-healthy-max=COUNT] [--deploy-report-min-target=COUNT] [--deploy-report-max-target-min=COUNT] [--deploy-report-final-target-max=COUNT] [--deploy-report-min-shard-groups=COUNT] [--deploy-report-max-shard-groups-min=COUNT] [--deploy-report-final-shard-groups-max=COUNT] [--deploy-report-runtime-cores-min=COUNT] [--deploy-report-runtime-memory-min-mb=COUNT] [--deploy-report-runtime-storage-min-mb=COUNT] [--deploy-report-runtime-cores-max-min=COUNT] [--deploy-report-runtime-memory-max-min-mb=COUNT] [--deploy-report-runtime-storage-max-min-mb=COUNT] [--deploy-report-traffic-burst=COUNT] [--deploy-mesh-mode=any|exclusiveSome|all|radar] [--deploy-mesh-require-all=0|1] [--require-brain-log-substring=TEXT]"
    echo "note: for a persistent fake cluster managed by Mothership, prefer 'mothership createCluster' with deploymentMode=test; invoke this harness directly only for low-level debugging or harness-focused test flows"
    exit 2
 fi
@@ -117,6 +117,44 @@ declare -a require_brain_log_substrings=()
 suite_runtime_s=10
 prodigy_runtime_root=""
 prodigy_runtime_bundle_path=""
+# Same-machine private traffic stays at the inner inter-container MTU, but the
+# fake-cluster underlay must carry one outer IPv6 header for cross-machine
+# private/public overlay transit. Keep the runtime policy at the requested
+# inter-container MTU and size the harness underlay links to the larger L3
+# envelope they actually carry.
+cluster_link_mtu=9000
+cluster_underlay_mtu=9000
+cluster_overlay_l3_overhead=40
+
+set_link_packet_budget()
+{
+   if [[ $# -lt 2 ]]
+   then
+      echo "FAIL: set_link_packet_budget requires a namespace selector and device name"
+      exit 1
+   fi
+
+   local ns_selector="$1"
+   local dev="$2"
+   shift 2
+
+   local -a prefix=()
+   if [[ "${ns_selector}" == "--host" ]]
+   then
+      prefix=()
+   else
+      prefix=(ip netns exec "${ns_selector}")
+   fi
+
+   "${prefix[@]}" ip link set dev "${dev}" \
+      mtu "${cluster_underlay_mtu}" \
+      gso_max_size "${cluster_underlay_mtu}" \
+      gso_max_segs 1 \
+      gro_max_size "${cluster_underlay_mtu}" \
+      gso_ipv4_max_size "${cluster_underlay_mtu}" \
+      gro_ipv4_max_size "${cluster_underlay_mtu}" \
+      "$@"
+}
 
 while [[ $# -gt 0 ]]
 do
@@ -141,6 +179,9 @@ do
          ;;
       --brain-bootstrap-family=*)
          brain_bootstrap_family="${1#*=}"
+         ;;
+      --inter-container-mtu=*)
+         cluster_link_mtu="${1#*=}"
          ;;
       --tunnel-ebpf=*)
          tunnel_ebpf="${1#*=}"
@@ -410,6 +451,29 @@ if [[ "${enable_fake_ipv4_boundary}" != "0" && "${enable_fake_ipv4_boundary}" !=
 then
    echo "FAIL: --enable-fake-ipv4-boundary must be 0 or 1"
    exit 1
+fi
+
+if ! [[ "${cluster_link_mtu}" =~ ^[0-9]+$ ]]
+then
+   echo "FAIL: --inter-container-mtu must be an integer"
+   exit 1
+fi
+
+if [[ "${cluster_link_mtu}" -lt 1280 || "${cluster_link_mtu}" -gt 65535 ]]
+then
+   echo "FAIL: --inter-container-mtu must be between 1280 and 65535"
+   exit 1
+fi
+
+cluster_underlay_mtu="${cluster_link_mtu}"
+if [[ "${machines}" -gt 1 ]]
+then
+   cluster_underlay_mtu="$((cluster_link_mtu + cluster_overlay_l3_overhead))"
+   if [[ "${cluster_underlay_mtu}" -gt 65535 ]]
+   then
+      echo "FAIL: --inter-container-mtu=${cluster_link_mtu} leaves no room for the fake-cluster IPv6 overlay underlay budget"
+      exit 1
+   fi
 fi
 
 if [[ "${require_fake_ipv4_boundary}" != "0" && "${require_fake_ipv4_boundary}" != "1" ]]
@@ -1341,7 +1405,79 @@ resolve_prodigy_bundle_artifact_path_for_input()
    printf '%s/%s\n' "${bundle_home}" "${bundle_name}"
 }
 
+prodigy_runtime_bundle_needs_refresh()
+{
+   local input_path="$1"
+   local bundle_path="$2"
+   local magic=""
+   local prodigy_dir=""
+   local bundle_inputs=()
+   local input_dep=""
+
+   magic="$(od -An -tx1 -N4 "${input_path}" 2>/dev/null | tr -d ' \n' || true)"
+   if [[ "${magic}" == "28b52ffd" ]]
+   then
+      return 1
+   fi
+
+   if [[ ! -r "${bundle_path}" ]]
+   then
+      return 0
+   fi
+
+   prodigy_dir="$(dirname "${input_path}")"
+   bundle_inputs=(
+      "${input_path}"
+      "${prodigy_dir}/balancer.ebpf.o"
+      "${prodigy_dir}/host.ingress.router.ebpf.o"
+      "${prodigy_dir}/host.egress.router.ebpf.o"
+      "${prodigy_dir}/container.ingress.router.ebpf.o"
+      "${prodigy_dir}/container.egress.router.ebpf.o"
+      "${prodigy_dir}/tunnel_to_nic.ebpf.o"
+      "${prodigy_dir}/fake_ipv4_boundary_nat.ebpf.o"
+   )
+
+   for input_dep in "${bundle_inputs[@]}"
+   do
+      if [[ -e "${input_dep}" && "${input_dep}" -nt "${bundle_path}" ]]
+      then
+         return 0
+      fi
+   done
+
+   return 1
+}
+
+ensure_prodigy_runtime_bundle_artifact_for_input()
+{
+   local input_path="$1"
+   local bundle_path="$2"
+   local prodigy_dir=""
+
+   if prodigy_runtime_bundle_needs_refresh "${input_path}" "${bundle_path}"
+   then
+      prodigy_dir="$(dirname "${input_path}")"
+      if [[ -f "${prodigy_dir}/build.ninja" || -f "${prodigy_dir}/CMakeCache.txt" ]]
+      then
+         cmake --build "${prodigy_dir}" -j"$(nproc)" --target prodigy_bundle prodigy_bundle_sha256 >/dev/null
+      fi
+   fi
+
+   if prodigy_runtime_bundle_needs_refresh "${input_path}" "${bundle_path}"
+   then
+      echo "FAIL: runtime bundle artifact is stale for ${input_path}: ${bundle_path}" >&2
+      exit 1
+   fi
+}
+
 prodigy_runtime_bundle_path="$(resolve_prodigy_bundle_artifact_path_for_input "${PRODIGY_BIN}" || true)"
+if [[ -n "${prodigy_runtime_bundle_path}" ]]
+then
+   # Direct harness runs must stage the same fresh bundle payload that the
+   # maintained Nametag battery already refreshes, otherwise createCluster
+   # debugging silently boots stale Prodigy/Basics code.
+   ensure_prodigy_runtime_bundle_artifact_for_input "${PRODIGY_BIN}" "${prodigy_runtime_bundle_path}"
+fi
 if [[ -z "${prodigy_runtime_bundle_path}" || ! -r "${prodigy_runtime_bundle_path}" ]]
 then
    echo "FAIL: runtime bundle artifact is not readable for ${PRODIGY_BIN}: ${prodigy_runtime_bundle_path}" >&2
@@ -1432,13 +1568,14 @@ write_persistent_manifest()
    fi
 
    {
-      printf '{"workspaceRoot":"%s","manifestPath":"%s","controlSocketPath":"%s","parentNamespace":"%s","machineCount":%s,"brainCount":%s,"leaderIndex":%s,"leaderNamespace":"%s","nodes":[' \
+      printf '{"workspaceRoot":"%s","manifestPath":"%s","controlSocketPath":"%s","parentNamespace":"%s","machineCount":%s,"brainCount":%s,"interContainerMTU":%s,"leaderIndex":%s,"leaderNamespace":"%s","nodes":[' \
          "${tmpdir}" \
          "${manifest_path}" \
          "${public_mothership_socket_path}" \
          "${parent_ns}" \
          "${machines}" \
          "${brains}" \
+         "${cluster_link_mtu}" \
          "${leader_idx}" \
          "${leader_ns}"
 
@@ -2059,6 +2196,7 @@ done
 
 ip netns exec "${parent_ns}" ip link add prodigy-br0 type bridge
 ip netns exec "${parent_ns}" ip link set dev prodigy-br0 type bridge mcast_snooping 0
+set_link_packet_budget "${parent_ns}" prodigy-br0
 ip netns exec "${parent_ns}" ip addr add 10.0.0.1/24 dev prodigy-br0
 ip netns exec "${parent_ns}" ip -6 addr add fd00:10::1/64 nodad dev prodigy-br0
 if [[ "${enable_fake_ipv4_boundary}" == "1" ]]
@@ -2080,11 +2218,14 @@ do
    parent_ifs+=("${parent_if}")
 
    ip netns exec "${parent_ns}" ip link add "${parent_if}" type veth peer name "${child_if}"
+   set_link_packet_budget "${parent_ns}" "${parent_if}"
+   set_link_packet_budget "${parent_ns}" "${child_if}"
    ip netns exec "${parent_ns}" ip link set "${parent_if}" master prodigy-br0
    ip netns exec "${parent_ns}" ip link set "${parent_if}" up
    ip netns exec "${parent_ns}" ip link set "${child_if}" netns "${ns}"
 
    ip netns exec "${ns}" ip link set "${child_if}" name bond0
+   set_link_packet_budget "${ns}" bond0
    ip netns exec "${ns}" ip link set bond0 up
    ip netns exec "${ns}" ip addr add "${brain_ip}/24" dev bond0
    ip netns exec "${ns}" ip -6 addr add "${brain_ip6}/64" nodad dev bond0
@@ -2189,6 +2330,8 @@ setup_fake_ipv4_boundary()
 
    ip link del "${host_edge_if}" >/dev/null 2>&1 || true
    ip link add "${host_edge_if}" type veth peer name "${parent_edge_if}"
+   set_link_packet_budget --host "${host_edge_if}"
+   set_link_packet_budget --host "${parent_edge_if}"
    ip link set "${parent_edge_if}" netns "${parent_ns}"
 
    ip addr add "${host_edge_ip}/30" dev "${host_edge_if}"
@@ -2196,6 +2339,7 @@ setup_fake_ipv4_boundary()
    ip -6 addr add "${host_edge_ip6}/126" dev "${host_edge_if}"
    ip link set "${host_edge_if}" up
 
+   set_link_packet_budget "${parent_ns}" "${parent_edge_if}"
    ip netns exec "${parent_ns}" ip link set "${parent_edge_if}" up
    ip netns exec "${parent_ns}" ip addr add "${parent_edge_ip}/30" dev "${parent_edge_if}"
    ip netns exec "${parent_ns}" ip -6 addr add "${parent_edge_ip6}/126" dev "${parent_edge_if}"
@@ -4819,7 +4963,11 @@ snapshot_deploy_spin_counts()
 resolve_update_prodigy_bundle_path()
 {
    local input_path="$1"
-   resolve_prodigy_bundle_artifact_path_for_input "${input_path}"
+   local bundle_path=""
+
+   bundle_path="$(resolve_prodigy_bundle_artifact_path_for_input "${input_path}")"
+   ensure_prodigy_runtime_bundle_artifact_for_input "${input_path}" "${bundle_path}"
+   printf '%s\n' "${bundle_path}"
 }
 
 verify_update_prodigy_sequence()
@@ -5115,7 +5263,15 @@ run_brain()
          mkdir -p /containers/store
          mount --bind /mnt/prodigy-shared-store-host /containers/store
 
-         exec ip netns exec "${ns_name}" "$@"
+         exec ip netns exec "${ns_name}" bash -lc "
+            set -euo pipefail
+            mkdir -p /sys/fs/bpf
+            if [[ \"\$(stat -f -c %T /sys/fs/bpf 2>/dev/null || true)\" != \"bpf_fs\" ]]
+            then
+               mount -t bpf bpf /sys/fs/bpf
+            fi
+            exec \"\$@\"
+         " _ "$@"
       ' _ "${brain_fs_root}" "${ns}" "${brain_fs_shared_store}" "${control_socket_root}" "${brain_cmd[@]}" \
       >"${stdout_log}" 2>&1 &
 
@@ -5320,7 +5476,7 @@ then
    fi
 
    write_persistent_manifest "${leader_idx}"
-   echo "TEST_CLUSTER_READY controlSocket=${mothership_socket_path} manifest=${manifest_path} leaderIndex=${leader_idx} machines=${machines} brains=${brains}"
+   echo "TEST_CLUSTER_READY controlSocket=${mothership_socket_path} manifest=${manifest_path} leaderIndex=${leader_idx} machines=${machines} brains=${brains} interContainerMTU=${cluster_link_mtu} underlayMTU=${cluster_underlay_mtu}"
 
    while true
    do

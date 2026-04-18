@@ -113,11 +113,16 @@ int container_ingress_router(struct __sk_buff *skb)
       setCheckpoint("decapping");
       bumpPacketCounter(1);
 
+      __u64 decap_flags = switchboardAdjustRoomPreserveOffloadFlags()
+         | (ipv6h->nexthdr == IPPROTO_IPV6
+            ? BPF_F_ADJ_ROOM_DECAP_L3_IPV6
+            : BPF_F_ADJ_ROOM_DECAP_L3_IPV4);
+
       // strip the encapsulation header
       if (bpf_skb_adjust_room(skb,
             -(__s32)sizeof(struct ipv6hdr),
-            BPF_ADJ_ROOM_NET,
-            BPF_F_ADJ_ROOM_DECAP_L3_IPV6 | switchboardAdjustRoomPreserveOffloadFlags()))
+            BPF_ADJ_ROOM_MAC,
+            decap_flags))
       {
         return NETKIT_DROP;
       }

@@ -2138,6 +2138,9 @@ int main(void)
       plan.fragment = 9;
       plan.useHostNetworkNamespace = true;
       plan.restartOnFailure = true;
+      plan.isStateful = true;
+      plan.shardGroup = 3;
+      plan.nShardGroups = 5;
       plan.assignedGPUMemoryMBs.push_back(16 * 1024u);
       plan.assignedGPUMemoryMBs.push_back(24 * 1024u);
       AssignedGPUDevice firstGPU = {};
@@ -2171,6 +2174,8 @@ int main(void)
       suite.expect(decoded, "container_plan_roundtrip_deserializes");
       suite.expect(roundtrip.useHostNetworkNamespace == true, "container_plan_roundtrip_preserves_host_network_namespace");
       suite.expect(roundtrip.fragment == 9, "container_plan_roundtrip_preserves_fragment");
+      suite.expect(roundtrip.shardGroup == 3, "container_plan_roundtrip_preserves_shard_group");
+      suite.expect(roundtrip.nShardGroups == 5, "container_plan_roundtrip_preserves_shard_group_count");
       suite.expect(roundtrip.assignedGPUMemoryMBs.size() == 2, "container_plan_roundtrip_preserves_assigned_gpu_count");
       suite.expect(roundtrip.assignedGPUMemoryMBs[0] == 16 * 1024u && roundtrip.assignedGPUMemoryMBs[1] == 24 * 1024u, "container_plan_roundtrip_preserves_assigned_gpu_memory");
       suite.expect(roundtrip.assignedGPUDevices.size() == 2, "container_plan_roundtrip_preserves_assigned_gpu_devices_count");
@@ -2397,12 +2402,36 @@ int main(void)
       container.subscriptions.emplace(roles.sibling, Subscription(roles.sibling, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all));
       container.subscriptions.emplace(roles.seeding, Subscription(roles.seeding, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all));
 
-      ContainerPlan plan = container.generatePlan(deploymentPlan);
+      ContainerPlan plan = container.generatePlan(deploymentPlan, 11);
       suite.expect(plan.statefulMeshRoles.client == 0, "containerview_generatePlan_prunes_unassigned_stateful_client_role");
       suite.expect(plan.statefulMeshRoles.sibling == roles.sibling, "containerview_generatePlan_preserves_assigned_stateful_sibling_role");
       suite.expect(plan.statefulMeshRoles.cousin == 0, "containerview_generatePlan_prunes_unassigned_stateful_cousin_role");
       suite.expect(plan.statefulMeshRoles.seeding == roles.seeding, "containerview_generatePlan_preserves_assigned_stateful_seeding_role");
       suite.expect(plan.statefulMeshRoles.sharding == 0, "containerview_generatePlan_prunes_unassigned_stateful_sharding_role");
+      suite.expect(plan.nShardGroups == 11, "containerview_generatePlan_preserves_stateful_shard_group_count");
+   }
+
+   {
+      ContainerPlan plan{};
+      plan.isStateful = true;
+      plan.shardGroup = 7;
+      plan.nShardGroups = 13;
+
+      Vector<uint64_t> flags = {};
+      prodigyBuildContainerStartupFlags(plan, flags);
+
+      suite.expect(flags.size() == 2, "container_startup_flags_stateful_include_two_entries");
+      suite.expect(flags[0] == 7, "container_startup_flags_stateful_preserve_shard_group");
+      suite.expect(flags[1] == 13, "container_startup_flags_stateful_preserve_shard_group_count");
+   }
+
+   {
+      ContainerPlan plan{};
+      Vector<uint64_t> flags = {};
+      prodigyBuildContainerStartupFlags(plan, flags);
+
+      suite.expect(flags.size() == 1, "container_startup_flags_stateless_keep_legacy_shape");
+      suite.expect(flags[0] == 0, "container_startup_flags_stateless_default_zero_group");
    }
 
    {
@@ -4985,6 +5014,60 @@ int main(void)
 
       deployment.containerDestroyed(container);
       suite.expect(brain.containers.contains(uuid) == false, "containerDestroyed_erases_brain_container_index");
+
+      brain.deployments.erase(deployment.plan.config.deploymentID());
+      thisBrain = savedBrain;
+   }
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      ApplicationDeployment deployment;
+      seedCommonPlan(deployment, false);
+
+      Rack rack{};
+      rack.uuid = 1902'1;
+
+      Machine machine;
+      machine.slug = "dev-baremetal"_ctv;
+      machine.rack = &rack;
+      machine.state = MachineState::healthy;
+      machine.lifetime = MachineLifetime::owned;
+      machine.nLogicalCores_available = 10;
+      machine.sharedCPUMillis_available = 0;
+      machine.memoryMB_available = 4'000;
+      machine.storageMB_available = 2'000;
+
+      brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+
+      ContainerView *container = new ContainerView();
+      container->uuid = uint128_t(0xD3511);
+      container->deploymentID = deployment.plan.config.deploymentID();
+      container->machine = &machine;
+      container->lifetime = ApplicationLifetime::base;
+      container->state = ContainerState::aboutToDestroy;
+      container->isStateful = false;
+
+      deployment.containers.insert(container);
+      brain.containers.insert_or_assign(container->uuid, container);
+      machine.upsertContainerIndexEntry(container->deploymentID, container);
+
+      deployment.nHealthyBase = 0;
+
+      const uint128_t uuid = container->uuid;
+
+      deployment.planStatelessDestruction(container, "destructContainer_zero_guard");
+      deployment.destructContainer(container);
+
+      suite.expect(deployment.nHealthyBase == 0, "destructContainer_clamps_zero_healthy_base");
+      suite.expect(container->state == ContainerState::destroying, "destructContainer_zero_guard_moves_state_to_destroying");
+      suite.expect(deployment.containers.contains(container) == false, "destructContainer_zero_guard_erases_from_deployment_container_set");
+      suite.expect(machine.containersByDeploymentID.size() == 0, "destructContainer_zero_guard_erases_machine_index_entry");
+
+      deployment.containerDestroyed(container);
+      suite.expect(brain.containers.contains(uuid) == false, "destructContainer_zero_guard_erases_brain_container_index");
 
       brain.deployments.erase(deployment.plan.config.deploymentID());
       thisBrain = savedBrain;

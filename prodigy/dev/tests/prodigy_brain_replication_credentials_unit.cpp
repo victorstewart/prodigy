@@ -4,6 +4,7 @@
 #include <prodigy/dev/tests/prodigy_test_ssh_keys.h>
 
 #include <cstdlib>
+#include <cerrno>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -133,6 +134,26 @@ public:
       masterAuthorityApplyCalls += 1;
    }
 
+   void queueBrainPeerLargePayloadKeepaliveForTest(BrainView *brain)
+   {
+      queueBrainPeerLargePayloadKeepalive(brain);
+   }
+
+   void setBrainPeerKeepaliveSecondsForTest(uint32_t seconds)
+   {
+      brainPeerKeepaliveSeconds = seconds;
+   }
+
+   void queueAcceptedBrainPeerSocketOptionsForTest(BrainView *brain)
+   {
+      queueAcceptedBrainPeerSocketOptions(brain);
+   }
+
+   void queueBrainDeploymentReplicationForTest(const String& serializedPlan, const String& containerBlob)
+   {
+      queueBrainDeploymentReplication(serializedPlan, containerBlob);
+   }
+
    Machine *findMachineByUUIDForTest(uint128_t uuid)
    {
       if (auto it = machinesByUUID.find(uuid); it != machinesByUUID.end())
@@ -141,6 +162,35 @@ public:
       }
 
       return nullptr;
+   }
+};
+
+class PairingTrackingContainerView : public ContainerView
+{
+public:
+   uint32_t subscriptionActivateCalls = 0;
+   uint32_t subscriptionDeactivateCalls = 0;
+   uint128_t lastSubscriptionAddress = 0;
+   uint64_t lastSubscriptionService = 0;
+   uint16_t lastSubscriptionPort = 0;
+   uint16_t lastSubscriptionApplicationID = 0;
+
+   void subscriptionPairing(uint128_t secret, uint128_t address, uint64_t service, uint16_t port, uint16_t applicationID, bool activate) override
+   {
+      (void)secret;
+      lastSubscriptionAddress = address;
+      lastSubscriptionService = service;
+      lastSubscriptionPort = port;
+      lastSubscriptionApplicationID = applicationID;
+
+      if (activate)
+      {
+         subscriptionActivateCalls += 1;
+      }
+      else
+      {
+         subscriptionDeactivateCalls += 1;
+      }
    }
 };
 
@@ -518,9 +568,11 @@ public:
    bool failAcceptedBrainTransportTLSForTest = false;
    uint32_t refreshContainerSwitchboardWormholesCallsForTest = 0;
    uint32_t syncContainerSwitchboardRuntimeCallsForTest = 0;
+   uint32_t popContainerCallsForTest = 0;
    uint128_t lastRefreshedContainerUUIDForTest = 0;
    Vector<Wormhole> lastRefreshedWormholesForTest = {};
    uint128_t lastSyncedContainerUUIDForTest = 0;
+   uint128_t lastPoppedContainerUUIDForTest = 0;
 
    TestNeuron()
    {
@@ -534,7 +586,18 @@ public:
 
    void popContainer(Container *container) override
    {
-      (void)container;
+      if (container == nullptr)
+      {
+         return;
+      }
+
+      popContainerCallsForTest += 1;
+      lastPoppedContainerUUIDForTest = container->plan.uuid;
+      containers.erase(container->plan.uuid);
+      if (container->pid > 0)
+      {
+         containerByPid.erase(container->pid);
+      }
    }
 
    bool ensureHostNetworkingReady(String *failureReport = nullptr) override
@@ -904,6 +967,11 @@ public:
       closeHandler(socket);
    }
 
+   void waitContainerForTest(Container *container)
+   {
+      waitidHandler(container);
+   }
+
    void recvSocketForTest(void *socket, int result)
    {
       recvHandler(socket, result);
@@ -1146,6 +1214,11 @@ public:
    bool appendMachineHardwareProfileFrameIfReadyForTest(String& outbound)
    {
       return appendMachineHardwareProfileFrameIfReady(outbound);
+   }
+
+   static void serializeMachineHardwareProfileForBrainTransportForTest(const MachineHardwareProfile& hardware, String& serialized)
+   {
+      serializeMachineHardwareProfileForBrainTransport(hardware, serialized);
    }
 
    void ensureDeferredHardwareInventoryProgressForTest(void)
@@ -2198,6 +2271,127 @@ static void testSpinApplicationProgressStaysOnOriginalDeployStream(TestSuite& su
    suite.expect(reportFrames == 0, "spin_application_progress_does_not_pollute_current_report_stream");
 }
 
+static void testSpinApplicationStagesFollowerBlobReplicationBehindMetadataEcho(TestSuite& suite)
+{
+   TestBrain brain = {};
+   NoopBrainIaaS iaas = {};
+   brain.iaas = &iaas;
+   brain.weAreMaster = true;
+   brain.noMasterYet = false;
+   brain.nBrains = 3;
+
+   BrainView followerA = {};
+   followerA.connected = true;
+   followerA.isFixedFile = true;
+   followerA.fslot = 11;
+   followerA.private4 = 0x0a00000b;
+   BrainView followerB = {};
+   followerB.connected = true;
+   followerB.isFixedFile = true;
+   followerB.fslot = 12;
+   followerB.private4 = 0x0a00000c;
+   brain.brains.insert(&followerA);
+   brain.brains.insert(&followerB);
+
+   ApplicationDeployment *deployment = new ApplicationDeployment();
+   seedDeployRequestPlan(deployment->plan, 62013);
+   deployment->state = DeploymentState::waitingToDeploy;
+   String containerBlob = "spin-stage-container-blob"_ctv;
+   ContainerStore::destroy(deployment->plan.config.deploymentID());
+   deployment->plan.config.containerBlobBytes = containerBlob.size();
+   String containerBlobPath = ContainerStore::pathForContainerImage(deployment->plan.config.deploymentID());
+   suite.expect(Filesystem::createDirectoryAt(-1, "/containers"_ctv, 0755) >= 0 || errno == EEXIST, "spin_application_stage_blob_create_containers_root");
+   suite.expect(Filesystem::createDirectoryAt(-1, "/containers/store"_ctv, 0755) >= 0 || errno == EEXIST, "spin_application_stage_blob_create_store_root");
+   suite.expect(
+      Filesystem::openWriteAtClose(-1, containerBlobPath, containerBlob) == int(containerBlob.size()),
+      "spin_application_stage_blob_store_fixture");
+
+   brain.deployments.insert_or_assign(deployment->plan.config.deploymentID(), deployment);
+   brain.deploymentPlans.insert_or_assign(deployment->plan.config.deploymentID(), deployment->plan);
+
+   String serializedPlan = {};
+   BitseryEngine::serialize(serializedPlan, deployment->plan);
+   brain.queueBrainDeploymentReplicationForTest(serializedPlan, ""_ctv);
+
+   if (auto it = brain.deployments.find(deployment->plan.config.deploymentID()); it != brain.deployments.end())
+   {
+      deployment = it->second;
+   }
+
+   suite.expect(deployment != nullptr, "spin_application_stage_blob_tracks_live_deployment");
+   if (deployment == nullptr)
+   {
+      return;
+   }
+
+   auto countReplicateDeploymentFrames =
+      [&] (BrainView& follower, uint32_t& emptyBlobFrames, uint32_t& nonEmptyBlobFrames) -> void {
+         emptyBlobFrames = 0;
+         nonEmptyBlobFrames = 0;
+         forEachMessageInBuffer(follower.wBuffer, [&] (Message *frame) {
+            if (BrainTopic(frame->topic) != BrainTopic::replicateDeployment)
+            {
+               return;
+            }
+
+            uint8_t *args = frame->args;
+            String ignoredSerializedPlan = {};
+            Message::extractToStringView(args, ignoredSerializedPlan);
+            String observedBlob = {};
+            Message::extractToStringView(args, observedBlob);
+            if (observedBlob.size() == 0)
+            {
+               emptyBlobFrames += 1;
+            }
+            else
+            {
+               nonEmptyBlobFrames += 1;
+            }
+         });
+      };
+
+   uint32_t followerAEmpty = 0;
+   uint32_t followerABlob = 0;
+   uint32_t followerBEmpty = 0;
+   uint32_t followerBBlob = 0;
+   countReplicateDeploymentFrames(followerA, followerAEmpty, followerABlob);
+   countReplicateDeploymentFrames(followerB, followerBEmpty, followerBBlob);
+   suite.expect(followerAEmpty == 1 && followerABlob == 0, "spin_application_stage_blob_initially_queues_metadata_only_to_first_peer");
+   suite.expect(followerBEmpty == 1 && followerBBlob == 0, "spin_application_stage_blob_initially_queues_metadata_only_to_second_peer");
+
+   String echoBufferA = {};
+   Message *echoA = buildBrainMessage(echoBufferA, BrainTopic::replicateDeployment, deployment->plan.config.deploymentID());
+   brain.brainHandler(&followerA, echoA);
+   countReplicateDeploymentFrames(followerA, followerAEmpty, followerABlob);
+   countReplicateDeploymentFrames(followerB, followerBEmpty, followerBBlob);
+   suite.expect(followerAEmpty == 1 && followerABlob == 1, "spin_application_stage_blob_first_echo_queues_blob_only_to_echoing_peer");
+   suite.expect(followerBEmpty == 1 && followerBBlob == 0, "spin_application_stage_blob_first_echo_does_not_queue_blob_to_other_peer");
+   suite.expect(deployment->brainEchos == 0, "spin_application_stage_blob_metadata_echo_does_not_count_as_blob_echo");
+
+   String echoBufferASecond = {};
+   Message *echoASecond = buildBrainMessage(echoBufferASecond, BrainTopic::replicateDeployment, deployment->plan.config.deploymentID());
+   brain.brainHandler(&followerA, echoASecond);
+   suite.expect(deployment->brainEchos == 1, "spin_application_stage_blob_second_echo_counts_first_peer_blob_ack");
+
+   String echoBufferB = {};
+   Message *echoB = buildBrainMessage(echoBufferB, BrainTopic::replicateDeployment, deployment->plan.config.deploymentID());
+   brain.brainHandler(&followerB, echoB);
+   countReplicateDeploymentFrames(followerB, followerBEmpty, followerBBlob);
+   suite.expect(followerBEmpty == 1 && followerBBlob == 1, "spin_application_stage_blob_first_echo_queues_blob_to_second_peer");
+
+   String echoBufferBSecond = {};
+   Message *echoBSecond = buildBrainMessage(echoBufferBSecond, BrainTopic::replicateDeployment, deployment->plan.config.deploymentID());
+   brain.brainHandler(&followerB, echoBSecond);
+   suite.expect(deployment->brainEchos == 2, "spin_application_stage_blob_second_peer_blob_ack_counts_full_replication");
+   suite.expect(deployment->brainBlobQueuedPeerKeys.size() == 2, "spin_application_stage_blob_tracks_blob_queue_per_peer");
+   suite.expect(deployment->brainBlobEchoPeerKeys.size() == 2, "spin_application_stage_blob_tracks_blob_echo_per_peer");
+
+   brain.deployments.erase(deployment->plan.config.deploymentID());
+   brain.deploymentPlans.erase(deployment->plan.config.deploymentID());
+   ContainerStore::destroy(deployment->plan.config.deploymentID());
+   delete deployment;
+}
+
 static void testStatefulRequestMachinesClaimsDeployingMachinesWithSpecializedTicket(TestSuite& suite)
 {
    StreamingTestBrain brain = {};
@@ -3166,6 +3360,157 @@ static void testDeploymentReplicationBackpressureClosesPeer(TestSuite& suite)
    // Reset the ring so later tests cannot inherit its stale identity entry.
    Ring::shutdownForExec();
    Ring::createRing(8, 8, 32, 32, -1, -1, 0);
+}
+
+static void testLargePayloadPeerKeepaliveUsesFixedFileSocketCommand(TestSuite& suite)
+{
+   ScopedFreshRing scopedRing = {};
+
+   TestBrain brain;
+   BrainView follower = {};
+   follower.private4 = 0x0a000012;
+   follower.connected = true;
+
+   TCPSocket listener = {};
+   listener.setIPVersion(AF_INET);
+   listener.setSaddr("127.0.0.1"_ctv, 0);
+   listener.bindThenListen();
+
+   struct sockaddr_in listenerAddress = {};
+   socklen_t listenerAddressLen = sizeof(listenerAddress);
+   suite.expect(
+      getsockname(listener.fd, reinterpret_cast<struct sockaddr *>(&listenerAddress), &listenerAddressLen) == 0,
+      "large_payload_keepalive_gets_listener_address");
+
+   TCPSocket client = {};
+   client.setIPVersion(AF_INET);
+   client.setDaddr("127.0.0.1"_ctv, ntohs(listenerAddress.sin_port));
+   suite.expect(client.connect() == 0, "large_payload_keepalive_connects_client");
+
+   int acceptedFD = listener.accept();
+   suite.expect(acceptedFD >= 0, "large_payload_keepalive_accepts_client");
+
+   int acceptedFslot = -1;
+   if (acceptedFD >= 0)
+   {
+      acceptedFslot = Ring::adoptProcessFDIntoFixedFileSlot(acceptedFD, false);
+   }
+   suite.expect(acceptedFslot >= 0, "large_payload_keepalive_adopts_fixed_slot");
+
+   if (acceptedFslot >= 0)
+   {
+      follower.isFixedFile = true;
+      follower.fslot = acceptedFslot;
+      brain.queueBrainPeerLargePayloadKeepaliveForTest(&follower);
+      Ring::submitPending();
+      usleep(20 * 1000);
+
+      int keepaliveEnabled = 0;
+      socklen_t keepaliveEnabledLen = sizeof(keepaliveEnabled);
+      suite.expect(
+         getsockopt(acceptedFD, SOL_SOCKET, SO_KEEPALIVE, &keepaliveEnabled, &keepaliveEnabledLen) == 0,
+         "large_payload_keepalive_reads_so_keepalive");
+      suite.expect(keepaliveEnabled == 1, "large_payload_keepalive_enables_keepalive");
+
+      int userTimeoutMs = 0;
+      socklen_t userTimeoutLen = sizeof(userTimeoutMs);
+      suite.expect(
+         getsockopt(acceptedFD, SOL_TCP, TCP_USER_TIMEOUT, &userTimeoutMs, &userTimeoutLen) == 0,
+         "large_payload_keepalive_reads_tcp_user_timeout");
+      suite.expect(
+         userTimeoutMs == int(BrainBase::brainPeerLargePayloadKeepaliveSeconds * 1000u),
+         "large_payload_keepalive_sets_tcp_user_timeout");
+   }
+
+   if (acceptedFD >= 0)
+   {
+      close(acceptedFD);
+   }
+   if (client.fd >= 0)
+   {
+      client.close();
+   }
+   if (listener.fd >= 0)
+   {
+      listener.close();
+   }
+}
+
+static void testAcceptedBrainPeerSetsLargePayloadUserTimeout(TestSuite& suite)
+{
+   ScopedFreshRing scopedRing = {};
+
+   TestBrain brain = {};
+   brain.setBrainPeerKeepaliveSecondsForTest(prodigyBrainDevPeerKeepaliveSeconds);
+
+   TCPSocket listener = {};
+   listener.setIPVersion(AF_INET);
+   listener.setSaddr("127.0.0.1"_ctv, 0);
+   listener.bindThenListen();
+
+   struct sockaddr_in listenerAddress = {};
+   socklen_t listenerAddressLen = sizeof(listenerAddress);
+   suite.expect(
+      getsockname(listener.fd, reinterpret_cast<struct sockaddr *>(&listenerAddress), &listenerAddressLen) == 0,
+      "accepted_brain_peer_keepalive_reads_listener_port");
+
+   TCPSocket client = {};
+   client.setIPVersion(AF_INET);
+   client.setDaddr("127.0.0.1"_ctv, ntohs(listenerAddress.sin_port));
+   suite.expect(client.connect() == 0, "accepted_brain_peer_keepalive_connects_client");
+
+   int acceptedFD = listener.accept();
+   suite.expect(acceptedFD >= 0, "accepted_brain_peer_keepalive_accepts_client");
+
+   int acceptedFslot = -1;
+   if (acceptedFD >= 0)
+   {
+      acceptedFslot = Ring::adoptProcessFDIntoFixedFileSlot(acceptedFD, false);
+   }
+   suite.expect(acceptedFslot >= 0, "accepted_brain_peer_keepalive_adopts_fixed_slot");
+
+   if (acceptedFslot >= 0)
+   {
+      BrainView follower = {};
+      follower.peerAddress = IPAddress("127.0.0.1", false);
+      follower.private4 = follower.peerAddress.v4;
+      follower.isFixedFile = true;
+      follower.fslot = acceptedFslot;
+      brain.queueAcceptedBrainPeerSocketOptionsForTest(&follower);
+      Ring::submitPending();
+      usleep(20 * 1000);
+
+      int keepaliveIdleSeconds = 0;
+      socklen_t keepaliveIdleLen = sizeof(keepaliveIdleSeconds);
+      suite.expect(
+         getsockopt(acceptedFD, SOL_TCP, TCP_KEEPIDLE, &keepaliveIdleSeconds, &keepaliveIdleLen) == 0,
+         "accepted_brain_peer_keepalive_reads_keepidle");
+      suite.expect(
+         keepaliveIdleSeconds == int(prodigyBrainDevPeerKeepaliveSeconds),
+         "accepted_brain_peer_keepalive_preserves_short_probe_budget");
+
+      int userTimeoutMs = 0;
+      socklen_t userTimeoutLen = sizeof(userTimeoutMs);
+      suite.expect(
+         getsockopt(acceptedFD, SOL_TCP, TCP_USER_TIMEOUT, &userTimeoutMs, &userTimeoutLen) == 0,
+         "accepted_brain_peer_keepalive_reads_tcp_user_timeout");
+      suite.expect(
+         userTimeoutMs == int(BrainBase::brainPeerLargePayloadKeepaliveSeconds * 1000u),
+         "accepted_brain_peer_keepalive_sets_large_payload_user_timeout");
+   }
+
+   if (acceptedFD >= 0)
+   {
+      close(acceptedFD);
+   }
+   if (client.fd >= 0)
+   {
+      client.close();
+   }
+   if (listener.fd >= 0)
+   {
+      listener.close();
+   }
 }
 
 static void testMothershipConfigureAppliesClusterUUID(TestSuite& suite)
@@ -5670,6 +6015,59 @@ static void testNeuronDeferredHardwareInventoryWakeAdoptsReadyProfile(TestSuite&
    suite.expect(hardwareFrames == 0, "neuron_deferred_hardware_inventory_wake_adopts_profile_without_prequeueing_initial_frame");
 }
 
+static void testNeuronEnsureDeferredHardwareInventoryProgressQueuesReadyProfileToActiveBrain(TestSuite& suite)
+{
+   TestNeuron neuron = {};
+   neuron.seedRegistrationState(13579, "6.8.0-test"_ctv, false);
+   neuron.seedBrainStreamForTest(true);
+
+   MachineHardwareProfile hardware = {};
+   hardware.inventoryComplete = true;
+   hardware.cpu.logicalCores = 4;
+   hardware.memory.totalMB = 8192;
+
+   String serializedHardware = {};
+   BitseryEngine::serialize(serializedHardware, hardware);
+   neuron.seedDeferredHardwareInventoryReadyForTest(hardware, serializedHardware);
+
+   suite.expect(
+      neuron.brainInitialMachineHardwareProfileQueuedForTest() == false,
+      "neuron_deferred_inventory_progress_active_brain_starts_unqueued");
+   suite.expect(
+      neuron.latestHardwareProfileIfReadyForTest() == nullptr,
+      "neuron_deferred_inventory_progress_active_brain_starts_unadopted");
+
+   neuron.ensureDeferredHardwareInventoryProgressForTest();
+
+   suite.expect(
+      neuron.deferredHardwareInventoryInFlightForTest() == false,
+      "neuron_deferred_inventory_progress_active_brain_clears_inflight");
+   suite.expect(
+      neuron.latestHardwareProfileIfReadyForTest() != nullptr,
+      "neuron_deferred_inventory_progress_active_brain_adopts_hardware");
+   suite.expect(
+      neuron.brainInitialMachineHardwareProfileQueuedForTest(),
+      "neuron_deferred_inventory_progress_active_brain_sets_queue_flag");
+
+   uint32_t hardwareFrames = 0;
+   String payload = {};
+   forEachMessageInBuffer(neuron.brainOutboundForTest(), [&] (Message *message) {
+      if (NeuronTopic(message->topic) == NeuronTopic::machineHardwareProfile)
+      {
+         hardwareFrames += 1;
+         uint8_t *args = message->args;
+         Message::extractToStringView(args, payload);
+      }
+   });
+
+   suite.expect(
+      hardwareFrames == 1,
+      "neuron_deferred_inventory_progress_active_brain_emits_single_hardware_frame");
+   suite.expect(
+      payload.equals(serializedHardware),
+      "neuron_deferred_inventory_progress_active_brain_preserves_serialized_payload");
+}
+
 static void testNeuronQueuesCachedHardwareProfileWhenBrainStreamBecomesActive(TestSuite& suite)
 {
    TestNeuron neuron = {};
@@ -6079,6 +6477,87 @@ static void testNeuronAcceptHandlerBrainControlPaths(TestSuite& suite)
       ProdigyTransportTLSRuntime::clear();
 
       ScopedSocketPair sockets = {};
+      if (sockets.create(suite, "neuron_accept_handler_replaces_disconnected_raw_active_brain_creates_socketpair"))
+      {
+         int acceptedFslot = sockets.adoptLeftIntoFixedFileSlot();
+         suite.expect(acceptedFslot >= 0, "neuron_accept_handler_replaces_disconnected_raw_active_brain_adopts_fixed_slot");
+
+         TestNeuron neuron = {};
+         neuron.seedRegistrationState(13579, "6.9.1-test"_ctv, true);
+         neuron.seedBrainStreamForTest(false);
+         suite.expect(TestNeuron::rawBrainStreamIsActiveForTest(neuron.brainStreamForTest()), "neuron_accept_handler_replaces_disconnected_raw_active_brain_seed_is_raw_active");
+         suite.expect(TestNeuron::brainStreamIsActiveForTest(neuron.brainStreamForTest()) == false, "neuron_accept_handler_replaces_disconnected_raw_active_brain_seed_is_not_connected");
+         neuron.queueContainerDownloadRequestForTest(uint64_t(0xA116));
+
+         MachineHardwareProfile hardware = {};
+         hardware.inventoryComplete = true;
+         hardware.cpu.logicalCores = 16;
+         hardware.memory.totalMB = 32768;
+         String serializedHardware = {};
+         BitseryEngine::serialize(serializedHardware, hardware);
+         neuron.adoptHardwareInventoryForTest(hardware, serializedHardware);
+
+         Container healthy = {};
+         healthy.plan.uuid = uint128_t(0xA1004);
+         healthy.plan.state = ContainerState::healthy;
+         neuron.registerContainerForTest(&healthy);
+
+         neuron.acceptBrainForTest(acceptedFslot);
+
+         suite.expect(neuron.brainStreamForTest() != nullptr, "neuron_accept_handler_replaces_disconnected_raw_active_brain_creates_stream");
+         suite.expect(neuron.brainStreamForTest()->connected, "neuron_accept_handler_replaces_disconnected_raw_active_brain_marks_stream_connected");
+         suite.expect(neuron.brainStreamForTest()->isFixedFile, "neuron_accept_handler_replaces_disconnected_raw_active_brain_marks_stream_fixed_file");
+         suite.expect(neuron.brainStreamForTest()->fslot == acceptedFslot, "neuron_accept_handler_replaces_disconnected_raw_active_brain_preserves_fixed_slot");
+         suite.expect(neuron.brainStreamForTest()->pendingRecv, "neuron_accept_handler_replaces_disconnected_raw_active_brain_arms_recv");
+         suite.expect(neuron.brainStreamForTest()->pendingSend, "neuron_accept_handler_replaces_disconnected_raw_active_brain_arms_send");
+         suite.expect(neuron.brainInitialMachineHardwareProfileQueuedForTest(), "neuron_accept_handler_replaces_disconnected_raw_active_brain_queues_hardware_profile");
+
+         uint32_t registrationFrames = 0;
+         uint32_t hardwareFrames = 0;
+         uint32_t blobRequestFrames = 0;
+         uint32_t healthyFrames = 0;
+         bool sawHealthy = false;
+         forEachMessageInBuffer(neuron.brainOutboundForTest(), [&] (Message *frame) {
+            switch (NeuronTopic(frame->topic))
+            {
+               case NeuronTopic::registration:
+                  registrationFrames += 1;
+                  break;
+               case NeuronTopic::machineHardwareProfile:
+                  hardwareFrames += 1;
+                  break;
+               case NeuronTopic::requestContainerBlob:
+                  blobRequestFrames += 1;
+                  break;
+               case NeuronTopic::containerHealthy:
+               {
+                  uint8_t *args = frame->args;
+                  uint128_t containerUUID = 0;
+                  Message::extractArg<ArgumentNature::fixed>(args, containerUUID);
+                  healthyFrames += 1;
+                  sawHealthy = sawHealthy || (containerUUID == healthy.plan.uuid);
+                  break;
+               }
+               default:
+                  break;
+            }
+         });
+
+         suite.expect(registrationFrames == 1, "neuron_accept_handler_replaces_disconnected_raw_active_brain_queues_registration_frame");
+         suite.expect(hardwareFrames == 1, "neuron_accept_handler_replaces_disconnected_raw_active_brain_queues_hardware_frame");
+         suite.expect(blobRequestFrames == 1, "neuron_accept_handler_replaces_disconnected_raw_active_brain_replays_blob_request");
+         suite.expect(healthyFrames == 1, "neuron_accept_handler_replaces_disconnected_raw_active_brain_replays_healthy_container");
+         suite.expect(sawHealthy, "neuron_accept_handler_replaces_disconnected_raw_active_brain_preserves_healthy_uuid");
+
+         neuron.unregisterContainerForTest(healthy.plan.uuid);
+      }
+   }
+
+   {
+      ScopedFreshRing scopedRing = {};
+      ProdigyTransportTLSRuntime::clear();
+
+      ScopedSocketPair sockets = {};
       if (sockets.create(suite, "neuron_accept_handler_replays_healthy_containers_creates_socketpair"))
       {
          int acceptedFslot = sockets.adoptLeftIntoFixedFileSlot();
@@ -6215,6 +6694,50 @@ static void testNeuronCloseHandlerPaths(TestSuite& suite)
          suite.expect(TestNeuron::containerStreamIsClosingForTest(&container) == false, "neuron_close_handler_container_pair_reconnect_keeps_socket_open");
 
          neuron.unregisterContainerForTest(container.plan.uuid);
+      }
+   }
+
+   {
+      ScopedFreshRing scopedRing = {};
+
+      TestNeuron neuron = {};
+      neuron.seedBrainStreamForTest(true);
+
+      Container *container = new Container();
+      container->plan.uuid = uint128_t(0xC063);
+      container->name.assign("unit-close-waitid-order"_ctv);
+      container->pid = getpid();
+      container->pendingDestroy = true;
+      container->waitidPending = true;
+      container->infop.si_pid = container->pid;
+      container->infop.si_code = CLD_EXITED;
+      container->infop.si_status = 7;
+      neuron.registerContainerForTest(container);
+
+      neuron.closeSocketForTest(container);
+
+      suite.expect(neuron.popContainerCallsForTest == 0, "neuron_close_handler_pending_destroy_waits_for_waitid_before_finalize");
+      suite.expect(container->destroyCloseCompleted, "neuron_close_handler_pending_destroy_records_close_completion");
+      suite.expect(container->waitidPending, "neuron_close_handler_pending_destroy_keeps_waitid_pending");
+
+      neuron.waitContainerForTest(container);
+
+      uint32_t containerFailedFrames = 0;
+      forEachMessageInBuffer(neuron.brainOutboundForTest(), [&] (Message *message) {
+         if (message->topic == uint16_t(NeuronTopic::containerFailed))
+         {
+            containerFailedFrames += 1;
+         }
+      });
+
+      suite.expect(containerFailedFrames == 1, "neuron_waitid_pending_destroy_close_first_emits_container_failed");
+      suite.expect(neuron.popContainerCallsForTest == 1, "neuron_waitid_pending_destroy_close_first_finalizes_after_waitid");
+      suite.expect(neuron.lastPoppedContainerUUIDForTest == uint128_t(0xC063), "neuron_waitid_pending_destroy_close_first_pops_expected_container");
+
+      if (neuron.lastPoppedContainerUUIDForTest != uint128_t(0xC063))
+      {
+         neuron.unregisterContainerForTest(container->plan.uuid);
+         delete container;
       }
    }
 }
@@ -6907,6 +7430,152 @@ static void testNeuronTransportTLSPeerVerificationGatesHardwareProfileQueueing(T
    suite.expect(
       fixture.neuron.brainStreamForTest()->nBytesToSend() > bytesQueuedBeforeVerify,
       "neuron_transport_tls_hardware_profile_queues_send_bytes_during_verification");
+}
+
+static void testNeuronMachineHardwareProfileTransportStripsCaptures(TestSuite& suite)
+{
+   MachineHardwareProfile hardware = {};
+   hardware.inventoryComplete = true;
+   hardware.cpu.logicalCores = 8;
+   hardware.memory.totalMB = 16384;
+
+   MachineToolCapture capture = {};
+   capture.tool.assign("tool"_ctv);
+   capture.phase.assign("phase"_ctv);
+   capture.command.assign("cmd"_ctv);
+   for (uint32_t i = 0; i < 4096; ++i)
+   {
+      capture.output.append('x');
+   }
+   capture.attempted = true;
+   capture.succeeded = true;
+
+   hardware.captures.push_back(capture);
+   hardware.cpu.captures.push_back(capture);
+   hardware.memory.captures.push_back(capture);
+
+   MachineDiskHardwareProfile disk = {};
+   disk.sizeMB = 102400;
+   disk.captures.push_back(capture);
+   disk.benchmark.captures.push_back(capture);
+   hardware.disks.push_back(disk);
+
+   MachineNicHardwareProfile nic = {};
+   nic.name.assign("bond0"_ctv);
+   nic.captures.push_back(capture);
+   hardware.network.captures.push_back(capture);
+   hardware.network.internet.captures.push_back(capture);
+   hardware.network.nics.push_back(nic);
+
+   MachineGpuHardwareProfile gpu = {};
+   gpu.vendor.assign("nvidia"_ctv);
+   gpu.model.assign("stub"_ctv);
+   gpu.captures.push_back(capture);
+   hardware.gpus.push_back(gpu);
+
+   String rawSerialized = {};
+   BitseryEngine::serialize(rawSerialized, hardware);
+
+   String transportSerialized = {};
+   TestNeuron::serializeMachineHardwareProfileForBrainTransportForTest(hardware, transportSerialized);
+   suite.expect(
+      transportSerialized.size() < rawSerialized.size(),
+      "neuron_machine_hardware_transport_strips_captures_reduces_payload_size");
+
+   MachineHardwareProfile roundtrip = {};
+   suite.expect(
+      BitseryEngine::deserializeSafe(transportSerialized, roundtrip),
+      "neuron_machine_hardware_transport_strips_captures_roundtrips");
+   suite.expect(roundtrip.inventoryComplete, "neuron_machine_hardware_transport_strips_captures_preserves_inventory_complete");
+   suite.expect(roundtrip.cpu.logicalCores == hardware.cpu.logicalCores, "neuron_machine_hardware_transport_strips_captures_preserves_cpu_cores");
+   suite.expect(roundtrip.memory.totalMB == hardware.memory.totalMB, "neuron_machine_hardware_transport_strips_captures_preserves_memory_total");
+   suite.expect(roundtrip.captures.empty(), "neuron_machine_hardware_transport_strips_captures_clears_global_captures");
+   suite.expect(roundtrip.cpu.captures.empty(), "neuron_machine_hardware_transport_strips_captures_clears_cpu_captures");
+   suite.expect(roundtrip.memory.captures.empty(), "neuron_machine_hardware_transport_strips_captures_clears_memory_captures");
+   suite.expect(roundtrip.disks.size() == 1, "neuron_machine_hardware_transport_strips_captures_preserves_disk_inventory");
+   suite.expect(roundtrip.disks[0].captures.empty(), "neuron_machine_hardware_transport_strips_captures_clears_disk_captures");
+   suite.expect(roundtrip.disks[0].benchmark.captures.empty(), "neuron_machine_hardware_transport_strips_captures_clears_disk_benchmark_captures");
+   suite.expect(roundtrip.network.captures.empty(), "neuron_machine_hardware_transport_strips_captures_clears_network_captures");
+   suite.expect(roundtrip.network.internet.captures.empty(), "neuron_machine_hardware_transport_strips_captures_clears_internet_captures");
+   suite.expect(roundtrip.network.nics.size() == 1, "neuron_machine_hardware_transport_strips_captures_preserves_nic_inventory");
+   suite.expect(roundtrip.network.nics[0].captures.empty(), "neuron_machine_hardware_transport_strips_captures_clears_nic_captures");
+   suite.expect(roundtrip.gpus.size() == 1, "neuron_machine_hardware_transport_strips_captures_preserves_gpu_inventory");
+   suite.expect(roundtrip.gpus[0].captures.empty(), "neuron_machine_hardware_transport_strips_captures_clears_gpu_captures");
+}
+
+static void testNeuronTransportTLSPeerVerificationAdoptsDeferredHardwareInventory(TestSuite& suite)
+{
+   constexpr uint128_t brainUUID = uint128_t(0xB10B);
+   constexpr uint128_t neuronUUID = uint128_t(0xE2029);
+
+   BrainTransportTLSFixture fixture(
+      suite,
+      "neuron_transport_tls_deferred_hardware",
+      brainUUID,
+      neuronUUID,
+      "fd00::12",
+      "fd00::22");
+   if (fixture.ready == false)
+   {
+      return;
+   }
+
+   MachineHardwareProfile hardware = {};
+   hardware.inventoryComplete = true;
+   hardware.cpu.logicalCores = 16;
+   hardware.memory.totalMB = 32768;
+
+   String serializedHardware = {};
+   BitseryEngine::serialize(serializedHardware, hardware);
+   fixture.neuron.seedDeferredHardwareInventoryReadyForTest(hardware, serializedHardware);
+
+   suite.expect(
+      fixture.neuron.latestHardwareProfileIfReadyForTest() == nullptr,
+      "neuron_transport_tls_deferred_hardware_starts_unadopted");
+   suite.expect(
+      fixture.neuron.brainInitialMachineHardwareProfileQueuedForTest() == false,
+      "neuron_transport_tls_deferred_hardware_flag_starts_clear");
+
+   if (fixture.completeHandshake(suite, "complete_handshake") == false)
+   {
+      return;
+   }
+
+   fixture.neuron.brainOutboundForTest().clear();
+   uint32_t bytesQueuedBeforeVerify = fixture.neuron.brainStreamForTest()->nBytesToSend();
+   suite.expect(
+      TestNeuron::verifyBrainTransportTLSPeerForTest(fixture.neuron),
+      "neuron_transport_tls_deferred_hardware_verify_peer");
+   suite.expect(
+      fixture.neuron.brainInitialMachineHardwareProfileQueuedForTest(),
+      "neuron_transport_tls_deferred_hardware_sets_queue_flag");
+   suite.expect(
+      fixture.neuron.deferredHardwareInventoryInFlightForTest() == false,
+      "neuron_transport_tls_deferred_hardware_clears_inflight_after_adoption");
+   suite.expect(
+      fixture.neuron.latestHardwareProfileIfReadyForTest() != nullptr,
+      "neuron_transport_tls_deferred_hardware_adopts_ready_inventory_during_verification");
+   suite.expect(
+      fixture.neuron.brainStreamForTest()->nBytesToSend() > bytesQueuedBeforeVerify,
+      "neuron_transport_tls_deferred_hardware_queues_send_bytes_during_verification");
+
+   uint32_t hardwareFrames = 0;
+   String payload = {};
+   forEachMessageInBuffer(fixture.neuron.brainOutboundForTest(), [&] (Message *message) {
+      if (NeuronTopic(message->topic) == NeuronTopic::machineHardwareProfile)
+      {
+         hardwareFrames += 1;
+         uint8_t *args = message->args;
+         Message::extractToStringView(args, payload);
+      }
+   });
+
+   suite.expect(
+      hardwareFrames == 1,
+      "neuron_transport_tls_deferred_hardware_emits_single_machine_hardware_profile");
+   suite.expect(
+      payload.equals(serializedHardware),
+      "neuron_transport_tls_deferred_hardware_preserves_serialized_payload");
 }
 
 static void testNeuronTransportTLSPeerVerificationRejectsPeerWithoutTransportUUID(TestSuite& suite)
@@ -8858,6 +9527,61 @@ static void testNeuronContainerHandlerMarksMasterLocalContainerHealthyWithoutBra
    thisBrain = previousBrain;
 }
 
+static void testNeuronContainerHandlerRelaysHealthyToMasterPeerWithoutBrainStream(TestSuite& suite)
+{
+   TestBrain brain = {};
+   NoopBrainIaaS iaas = {};
+   brain.iaas = &iaas;
+   brain.weAreMaster = false;
+
+   BrainBase *previousBrain = thisBrain;
+   thisBrain = &brain;
+
+   BrainView masterPeer = {};
+   masterPeer.isMasterBrain = true;
+   masterPeer.connected = true;
+   masterPeer.isFixedFile = true;
+   masterPeer.fslot = 41;
+   masterPeer.private4 = 0x0A00000A;
+   brain.brains.insert(&masterPeer);
+
+   TestNeuron neuron = {};
+
+   Container container = {};
+   container.plan.uuid = uint128_t(0x5105);
+   container.plan.config.applicationID = 62012;
+   container.plan.config.versionID = 7;
+   container.plan.state = ContainerState::scheduled;
+
+   String buffer = {};
+   Message *message = buildContainerMessage(buffer, ContainerTopic::healthy);
+   neuron.containerHandler(&container, message);
+
+   uint32_t relayedHealthyFrames = 0;
+   bool sawRelayedUUID = false;
+   forEachMessageInBuffer(masterPeer.wBuffer, [&] (Message *frame) {
+      suite.expect(BrainTopic(frame->topic) == BrainTopic::replicateContainerHealthy, "neuron_container_healthy_without_brain_stream_relays_brain_topic");
+      if (BrainTopic(frame->topic) != BrainTopic::replicateContainerHealthy)
+      {
+         return;
+      }
+
+      uint8_t *args = frame->args;
+      uint128_t observedUUID = 0;
+      Message::extractArg<ArgumentNature::fixed>(args, observedUUID);
+      relayedHealthyFrames += 1;
+      sawRelayedUUID = sawRelayedUUID || (observedUUID == container.plan.uuid);
+   });
+
+   suite.expect(container.plan.state == ContainerState::healthy, "neuron_container_healthy_without_brain_stream_marks_follower_runtime_container_healthy");
+   suite.expect(relayedHealthyFrames == 1, "neuron_container_healthy_without_brain_stream_relays_single_master_peer_frame");
+   suite.expect(sawRelayedUUID, "neuron_container_healthy_without_brain_stream_preserves_relayed_uuid");
+   suite.expect(neuron.brainOutboundForTest().size() == 0, "neuron_container_healthy_without_brain_stream_skips_missing_control_stream_frame");
+
+   brain.brains.erase(&masterPeer);
+   thisBrain = previousBrain;
+}
+
 static void testNeuronContainerHandlerMarksMasterLocalContainerHealthyWithActiveBrainStream(TestSuite& suite)
 {
    TestBrain brain = {};
@@ -9153,6 +9877,71 @@ static void testBrainNeuronHandlerMarksContainerHealthyOnceAndClearsWaiters(Test
    thisBrain = previousBrain;
 }
 
+static void testBrainReplicatedContainerHealthyMarksContainerHealthyOnMaster(TestSuite& suite)
+{
+   TestBrain brain = {};
+   NoopBrainIaaS iaas = {};
+   brain.iaas = &iaas;
+   brain.weAreMaster = true;
+
+   BrainBase *previousBrain = thisBrain;
+   thisBrain = &brain;
+
+   Rack rack = {};
+   rack.uuid = 62021;
+
+   Machine machine = {};
+   machine.uuid = uint128_t(0x5203);
+   machine.state = MachineState::healthy;
+   machine.rack = &rack;
+   machine.neuron.machine = &machine;
+   brain.machines.insert(&machine);
+   brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+   brain.neurons.insert(&machine.neuron);
+
+   ApplicationDeployment deployment = {};
+   deployment.plan = makeDeploymentPlan(62021, 1);
+   deployment.state = DeploymentState::deploying;
+   brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+   brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
+
+   ContainerView *container = new ContainerView();
+   container->uuid = uint128_t(0x5204);
+   container->deploymentID = deployment.plan.config.deploymentID();
+   container->machine = &machine;
+   container->lifetime = ApplicationLifetime::base;
+   container->state = ContainerState::scheduled;
+
+   deployment.containers.insert(container);
+   deployment.waitingOnContainers.insert_or_assign(container, ContainerState::healthy);
+   brain.containers.insert_or_assign(container->uuid, container);
+   machine.upsertContainerIndexEntry(container->deploymentID, container);
+
+   BrainView follower = {};
+   follower.private4 = 0x0A00000B;
+
+   String buffer = {};
+   Message *message = buildBrainMessage(buffer, BrainTopic::replicateContainerHealthy, container->uuid);
+   brain.brainHandler(&follower, message);
+   brain.brainHandler(&follower, message);
+
+   suite.expect(container->state == ContainerState::healthy, "brain_replicated_container_healthy_marks_container_healthy");
+   suite.expect(deployment.nHealthyBase == 1, "brain_replicated_container_healthy_increments_count_once");
+   suite.expect(deployment.waitingOnContainers.size() == 0, "brain_replicated_container_healthy_clears_waiters");
+
+   deployment.containers.erase(container);
+   machine.removeContainerIndexEntry(container->deploymentID, container);
+   brain.containers.erase(container->uuid);
+   delete container;
+
+   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
+   brain.deployments.erase(deployment.plan.config.deploymentID());
+   brain.neurons.erase(&machine.neuron);
+   brain.machinesByUUID.erase(machine.uuid);
+   brain.machines.erase(&machine);
+   thisBrain = previousBrain;
+}
+
 static void testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(TestSuite& suite)
 {
    TestBrain brain = {};
@@ -9329,6 +10118,122 @@ static void testBrainNeuronStateUploadHealthyContainerClearsWaiters(TestSuite& s
    machine.removeContainerIndexEntry(container->deploymentID, container);
    brain.containers.erase(container->uuid);
    delete container;
+
+   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
+   brain.deployments.erase(deployment.plan.config.deploymentID());
+   brain.neurons.erase(&machine.neuron);
+   brain.machinesByUUID.erase(machine.uuid);
+   brain.machines.erase(&machine);
+   thisBrain = previousBrain;
+}
+
+static void testBrainNeuronStateUploadHealthyAdvertiserRefreshesPeerPairingsOnPortChange(TestSuite& suite)
+{
+   TestBrain brain = {};
+   NoopBrainIaaS iaas = {};
+   brain.iaas = &iaas;
+   brain.weAreMaster = true;
+
+   BrainBase *previousBrain = thisBrain;
+   thisBrain = &brain;
+
+   Rack rack = {};
+   rack.uuid = 62045;
+
+   Machine machine = {};
+   machine.uuid = uint128_t(0x5407);
+   machine.state = MachineState::healthy;
+   machine.fragment = 0x1237;
+   machine.rack = &rack;
+   machine.neuron.machine = &machine;
+   brain.machines.insert(&machine);
+   brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+   brain.neurons.insert(&machine.neuron);
+
+   ApplicationDeployment deployment = {};
+   deployment.plan = makeDeploymentPlan(62045, 1);
+   deployment.state = DeploymentState::running;
+   brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+   brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
+
+   constexpr uint64_t service = 0x620450000001ULL;
+   constexpr uint16_t initialPort = 19111;
+   constexpr uint16_t refreshedPort = 19404;
+
+   ContainerView *advertiser = new ContainerView();
+   advertiser->uuid = uint128_t(0x5408);
+   advertiser->deploymentID = deployment.plan.config.deploymentID();
+   advertiser->applicationID = deployment.plan.config.applicationID;
+   advertiser->machine = &machine;
+   advertiser->lifetime = ApplicationLifetime::base;
+   advertiser->state = ContainerState::healthy;
+   advertiser->fragment = 13;
+   advertiser->createdAtMs = 123460;
+   advertiser->remainingSubscriberCapacity = 64;
+   advertiser->advertisements.insert_or_assign(
+      service,
+      Advertisement(service, ContainerState::scheduled, ContainerState::destroying, initialPort));
+   advertiser->setMeshAddress(container_network_subnet6, brain.brainConfig.datacenterFragment, machine.fragment, advertiser->fragment);
+
+   PairingTrackingContainerView subscriber = {};
+   subscriber.applicationID = uint16_t(deployment.plan.config.applicationID + 1);
+   subscriber.state = ContainerState::healthy;
+   subscriber.fragment = 14;
+   subscriber.remainingSubscriberCapacity = 64;
+   subscriber.meshAddress = uint128_t(0x62045);
+   subscriber.subscriptions.insert_or_assign(
+      service,
+      Subscription(service, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all));
+
+   deployment.containers.insert(advertiser);
+   brain.containers.insert_or_assign(advertiser->uuid, advertiser);
+   machine.upsertContainerIndexEntry(advertiser->deploymentID, advertiser);
+
+   brain.mesh->advertise(service, advertiser, initialPort, false);
+   brain.mesh->subscribe(service, &subscriber, SubscriptionNature::all, false);
+
+   suite.expect(subscriber.subscribedTo.hasEntryFor(service, advertiser), "brain_neuron_state_upload_refresh_fixture_pairs_subscriber");
+
+   ContainerView updatedSeed = *advertiser;
+   updatedSeed.advertisements.insert_or_assign(
+      service,
+      Advertisement(service, ContainerState::scheduled, ContainerState::destroying, refreshedPort));
+   ContainerPlan updatedPlan = updatedSeed.generatePlan(deployment.plan);
+   updatedPlan.state = ContainerState::healthy;
+
+   String uploadBuffer = {};
+   uint32_t headerOffset = Message::appendHeader(uploadBuffer, NeuronTopic::stateUpload);
+   local_container_subnet6 fragment = {};
+   fragment.dpfx = 1;
+   fragment.mpfx[0] = 0x00;
+   fragment.mpfx[1] = 0x12;
+   fragment.mpfx[2] = 0x37;
+   Message::appendAlignedBuffer<Alignment::one>(uploadBuffer, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
+   String serializedHealthyPlan = {};
+   BitseryEngine::serialize(serializedHealthyPlan, updatedPlan);
+   Message::appendValue(uploadBuffer, serializedHealthyPlan);
+   Message::finish(uploadBuffer, headerOffset);
+
+   Message *message = reinterpret_cast<Message *>(uploadBuffer.data());
+   brain.neuronHandler(&machine.neuron, message);
+
+   suite.expect(
+      subscriber.subscriptionActivateCalls == 1,
+      "brain_neuron_state_upload_refresh_replays_subscription_pairing");
+   suite.expect(
+      subscriber.lastSubscriptionPort == refreshedPort,
+      "brain_neuron_state_upload_refresh_uses_updated_port");
+   suite.expect(
+      subscriber.lastSubscriptionService == service,
+      "brain_neuron_state_upload_refresh_preserves_service");
+   suite.expect(
+      subscriber.subscriptionDeactivateCalls == 0,
+      "brain_neuron_state_upload_refresh_does_not_spuriously_deactivate");
+
+   deployment.containers.erase(advertiser);
+   machine.removeContainerIndexEntry(advertiser->deploymentID, advertiser);
+   brain.containers.erase(advertiser->uuid);
+   delete advertiser;
 
    brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
    brain.deployments.erase(deployment.plan.config.deploymentID());
@@ -9547,6 +10452,177 @@ static void testMachineHealthyClaimWakePreservesTicketOutstandingCount(TestSuite
    brain.racks.erase(rack.uuid);
 }
 
+static void testMachineHealthySkipsScheduledStatelessDonorMoveUntilQuiescent(TestSuite& suite)
+{
+   TestBrain brain = {};
+   NoopBrainIaaS iaas = {};
+   brain.iaas = &iaas;
+   brain.weAreMaster = true;
+
+   Rack rack = {};
+   rack.uuid = 62043;
+
+   Machine donor = {};
+   donor.uuid = uint128_t(0x62043001);
+   donor.private4 = IPAddress("10.0.0.81", false).v4;
+   donor.state = MachineState::healthy;
+   donor.rack = &rack;
+   donor.rackUUID = rack.uuid;
+   donor.lifetime = MachineLifetime::ondemand;
+   donor.nLogicalCores_available = 32;
+   donor.memoryMB_available = 32768;
+   donor.storageMB_available = 32768;
+
+   Machine receiver = {};
+   receiver.uuid = uint128_t(0x62043002);
+   receiver.private4 = IPAddress("10.0.0.82", false).v4;
+   receiver.state = MachineState::deploying;
+   receiver.rack = &rack;
+   receiver.rackUUID = rack.uuid;
+   receiver.lifetime = MachineLifetime::owned;
+   receiver.nLogicalCores_available = 32;
+   receiver.memoryMB_available = 32768;
+   receiver.storageMB_available = 32768;
+
+   rack.machines.insert(&donor);
+   rack.machines.insert(&receiver);
+   brain.racks.insert_or_assign(rack.uuid, &rack);
+   brain.machines.insert(&donor);
+   brain.machines.insert(&receiver);
+
+   ApplicationDeployment deployment = {};
+   deployment.plan = makeDeploymentPlan(62043, 1);
+   deployment.plan.stateless.nBase = 1;
+   deployment.plan.stateless.maxPerRackRatio = 1.0f;
+   deployment.plan.stateless.maxPerMachineRatio = 1.0f;
+   deployment.state = DeploymentState::deploying;
+   deployment.nTargetBase = 1;
+   deployment.nDeployedBase = 1;
+   deployment.countPerMachine.insert_or_assign(&donor, 1);
+   deployment.countPerRack.insert_or_assign(&rack, 1);
+   brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+
+   ContainerView *container = new ContainerView();
+   container->uuid = uint128_t(0x62043003);
+   container->deploymentID = deployment.plan.config.deploymentID();
+   container->applicationID = deployment.plan.config.applicationID;
+   container->machine = &donor;
+   container->lifetime = ApplicationLifetime::base;
+   container->state = ContainerState::scheduled;
+   deployment.containers.insert(container);
+   deployment.waitingOnContainers.insert_or_assign(container, ContainerState::healthy);
+   donor.upsertContainerIndexEntry(container->deploymentID, container);
+
+   brain.handleMachineStateChange(&receiver, MachineState::healthy);
+
+   suite.expect(receiver.state == MachineState::healthy, "machine_healthy_scheduled_stateless_skip_marks_receiver_healthy");
+   suite.expect(container->state == ContainerState::scheduled, "machine_healthy_scheduled_stateless_skip_preserves_container_state");
+   suite.expect(container->machine == &donor, "machine_healthy_scheduled_stateless_skip_preserves_container_machine");
+   suite.expect(deployment.toSchedule.size() == 0, "machine_healthy_scheduled_stateless_skip_does_not_queue_replacement");
+   suite.expect(deployment.waitingOnContainers.size() == 1, "machine_healthy_scheduled_stateless_skip_preserves_waiter");
+   suite.expect(deployment.countPerMachine.getIf(&donor) == 1, "machine_healthy_scheduled_stateless_skip_preserves_donor_count");
+   suite.expect(deployment.countPerMachine.getIf(&receiver) == 0, "machine_healthy_scheduled_stateless_skip_preserves_receiver_count");
+   suite.expect(receiver.containersByDeploymentID.contains(container->deploymentID) == false, "machine_healthy_scheduled_stateless_skip_keeps_receiver_index_empty");
+
+   donor.removeContainerIndexEntry(container->deploymentID, container);
+   deployment.waitingOnContainers.erase(container);
+   deployment.containers.erase(container);
+   delete container;
+
+   brain.deployments.erase(deployment.plan.config.deploymentID());
+   brain.machines.erase(&receiver);
+   brain.machines.erase(&donor);
+   brain.racks.erase(rack.uuid);
+}
+
+static void testDrainMachineSkipsScheduledLiveRedeployUntilHealthy(TestSuite& suite)
+{
+   TestBrain brain = {};
+   NoopBrainIaaS iaas = {};
+   brain.iaas = &iaas;
+   brain.weAreMaster = true;
+
+   BrainBase *previousBrain = thisBrain;
+   thisBrain = &brain;
+
+   Rack rack = {};
+   rack.uuid = 62044;
+
+   Machine donor = {};
+   donor.uuid = uint128_t(0x62044001);
+   donor.private4 = IPAddress("10.0.0.91", false).v4;
+   donor.state = MachineState::deploying;
+   donor.rack = &rack;
+   donor.rackUUID = rack.uuid;
+   donor.lifetime = MachineLifetime::ondemand;
+   donor.nLogicalCores_available = 32;
+   donor.memoryMB_available = 32768;
+   donor.storageMB_available = 32768;
+
+   Machine receiver = {};
+   receiver.uuid = uint128_t(0x62044002);
+   receiver.private4 = IPAddress("10.0.0.92", false).v4;
+   receiver.state = MachineState::healthy;
+   receiver.rack = &rack;
+   receiver.rackUUID = rack.uuid;
+   receiver.lifetime = MachineLifetime::owned;
+   receiver.nLogicalCores_available = 32;
+   receiver.memoryMB_available = 32768;
+   receiver.storageMB_available = 32768;
+
+   rack.machines.insert(&donor);
+   rack.machines.insert(&receiver);
+   brain.racks.insert_or_assign(rack.uuid, &rack);
+   brain.machines.insert(&donor);
+   brain.machines.insert(&receiver);
+
+   ApplicationDeployment deployment = {};
+   deployment.plan = makeDeploymentPlan(62044, 1);
+   deployment.plan.stateless.nBase = 1;
+   deployment.plan.stateless.maxPerRackRatio = 1.0f;
+   deployment.plan.stateless.maxPerMachineRatio = 1.0f;
+   deployment.state = DeploymentState::running;
+   deployment.nTargetBase = 1;
+   deployment.nDeployedBase = 1;
+   deployment.countPerMachine.insert_or_assign(&donor, 1);
+   deployment.countPerRack.insert_or_assign(&rack, 1);
+   brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+
+   ContainerView *container = new ContainerView();
+   container->uuid = uint128_t(0x62044003);
+   container->deploymentID = deployment.plan.config.deploymentID();
+   container->applicationID = deployment.plan.config.applicationID;
+   container->machine = &donor;
+   container->lifetime = ApplicationLifetime::base;
+   container->state = ContainerState::scheduled;
+   deployment.containers.insert(container);
+   deployment.waitingOnContainers.insert_or_assign(container, ContainerState::healthy);
+   donor.upsertContainerIndexEntry(container->deploymentID, container);
+
+   deployment.drainMachine(&donor, false);
+
+   suite.expect(container->state == ContainerState::scheduled, "drain_machine_scheduled_live_redeploy_skip_preserves_container_state");
+   suite.expect(container->machine == &donor, "drain_machine_scheduled_live_redeploy_skip_preserves_container_machine");
+   suite.expect(deployment.toSchedule.size() == 0, "drain_machine_scheduled_live_redeploy_skip_does_not_queue_replacement");
+   suite.expect(deployment.waitingOnContainers.size() == 1, "drain_machine_scheduled_live_redeploy_skip_preserves_waiter");
+   suite.expect(deployment.nDeployedBase == 1, "drain_machine_scheduled_live_redeploy_skip_preserves_deployed_count");
+   suite.expect(deployment.countPerMachine.getIf(&donor) == 1, "drain_machine_scheduled_live_redeploy_skip_preserves_donor_count");
+   suite.expect(deployment.countPerMachine.getIf(&receiver) == 0, "drain_machine_scheduled_live_redeploy_skip_preserves_receiver_count");
+   suite.expect(donor.containersByDeploymentID.contains(container->deploymentID), "drain_machine_scheduled_live_redeploy_skip_restores_machine_bin");
+   suite.expect(donor.containersByDeploymentID[container->deploymentID].contains(container), "drain_machine_scheduled_live_redeploy_skip_restores_container_pointer");
+
+   donor.removeContainerIndexEntry(container->deploymentID, container);
+   deployment.waitingOnContainers.erase(container);
+   deployment.containers.erase(container);
+   delete container;
+
+   brain.deployments.erase(deployment.plan.config.deploymentID());
+   brain.machines.erase(&receiver);
+   brain.machines.erase(&donor);
+   brain.racks.erase(rack.uuid);
+   thisBrain = previousBrain;
+}
+
 static void testBrainNeuronHandlerRecordsContainerStatisticsAndReplicates(TestSuite& suite)
 {
    TestBrain brain = {};
@@ -9703,6 +10779,207 @@ static void testBrainNeuronHandlerHandlesRestartingContainerFailure(TestSuite& s
    brain.deployments.erase(deployment.plan.config.deploymentID());
    brain.machinesByUUID.erase(machine.uuid);
    brain.machines.erase(&machine);
+   thisBrain = previousBrain;
+}
+
+static void testBrainNeuronHandlerRestartingContainerFailureRebalancesAnySubscribersWithoutDeadReplay(TestSuite& suite)
+{
+   TestBrain brain = {};
+   NoopBrainIaaS iaas = {};
+   brain.iaas = &iaas;
+   brain.weAreMaster = true;
+
+   BrainBase *previousBrain = thisBrain;
+   thisBrain = &brain;
+
+   Rack rackA = {};
+   rackA.uuid = 62024;
+   Rack rackB = {};
+   rackB.uuid = 62025;
+
+   Machine machineA = {};
+   machineA.uuid = uint128_t(0x5210);
+   machineA.state = MachineState::healthy;
+   machineA.fragment = 0x45;
+   machineA.rack = &rackA;
+   machineA.neuron.machine = &machineA;
+   brain.machines.insert(&machineA);
+   brain.machinesByUUID.insert_or_assign(machineA.uuid, &machineA);
+
+   Machine machineB = {};
+   machineB.uuid = uint128_t(0x5211);
+   machineB.state = MachineState::healthy;
+   machineB.fragment = 0x46;
+   machineB.rack = &rackB;
+   machineB.neuron.machine = &machineB;
+   brain.machines.insert(&machineB);
+   brain.machinesByUUID.insert_or_assign(machineB.uuid, &machineB);
+
+   ApplicationDeployment deployment = {};
+   deployment.plan = makeDeploymentPlan(62024, 1);
+   deployment.state = DeploymentState::running;
+   brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+   brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
+
+   constexpr uint64_t service = 0x620240000001ULL;
+   constexpr uint16_t failedPort = 19111;
+   constexpr uint16_t replacementPort = 19404;
+
+   ContainerView *failedAdvertiser = new ContainerView();
+   failedAdvertiser->uuid = uint128_t(0x5212);
+   failedAdvertiser->deploymentID = deployment.plan.config.deploymentID();
+   failedAdvertiser->applicationID = deployment.plan.config.applicationID;
+   failedAdvertiser->machine = &machineA;
+   failedAdvertiser->lifetime = ApplicationLifetime::base;
+   failedAdvertiser->state = ContainerState::healthy;
+   failedAdvertiser->fragment = 13;
+   failedAdvertiser->remainingSubscriberCapacity = 64;
+   failedAdvertiser->advertisements.insert_or_assign(
+      service,
+      Advertisement(service, ContainerState::healthy, ContainerState::destroying, failedPort));
+   failedAdvertiser->setMeshAddress(
+      container_network_subnet6,
+      brain.brainConfig.datacenterFragment,
+      machineA.fragment,
+      failedAdvertiser->fragment);
+
+   ContainerView *replacementAdvertiser = new ContainerView();
+   replacementAdvertiser->uuid = uint128_t(0x5213);
+   replacementAdvertiser->deploymentID = deployment.plan.config.deploymentID();
+   replacementAdvertiser->applicationID = deployment.plan.config.applicationID;
+   replacementAdvertiser->machine = &machineB;
+   replacementAdvertiser->lifetime = ApplicationLifetime::base;
+   replacementAdvertiser->state = ContainerState::healthy;
+   replacementAdvertiser->fragment = 14;
+   replacementAdvertiser->remainingSubscriberCapacity = 64;
+   replacementAdvertiser->advertisements.insert_or_assign(
+      service,
+      Advertisement(service, ContainerState::healthy, ContainerState::destroying, replacementPort));
+   replacementAdvertiser->setMeshAddress(
+      container_network_subnet6,
+      brain.brainConfig.datacenterFragment,
+      machineB.fragment,
+      replacementAdvertiser->fragment);
+
+   auto makeSubscriber = [&] (uint16_t applicationID, uint8_t fragment, uint128_t meshAddress) {
+      PairingTrackingContainerView subscriber = {};
+      subscriber.applicationID = applicationID;
+      subscriber.state = ContainerState::healthy;
+      subscriber.fragment = fragment;
+      subscriber.remainingSubscriberCapacity = 64;
+      subscriber.meshAddress = meshAddress;
+      subscriber.subscriptions.insert_or_assign(
+         service,
+         Subscription(service, ContainerState::healthy, ContainerState::destroying, SubscriptionNature::any));
+      return subscriber;
+   };
+
+   PairingTrackingContainerView subscriberA = makeSubscriber(
+      uint16_t(deployment.plan.config.applicationID + 1),
+      15,
+      uint128_t(0x62024015));
+   PairingTrackingContainerView subscriberB = makeSubscriber(
+      uint16_t(deployment.plan.config.applicationID + 2),
+      16,
+      uint128_t(0x62024016));
+
+   deployment.containers.insert(failedAdvertiser);
+   deployment.containers.insert(replacementAdvertiser);
+   deployment.countPerMachine[&machineA] = 1;
+   deployment.countPerMachine[&machineB] = 1;
+   deployment.countPerRack[&rackA] = 1;
+   deployment.countPerRack[&rackB] = 1;
+   deployment.nHealthyBase = 2;
+   brain.containers.insert_or_assign(failedAdvertiser->uuid, failedAdvertiser);
+   brain.containers.insert_or_assign(replacementAdvertiser->uuid, replacementAdvertiser);
+   machineA.upsertContainerIndexEntry(failedAdvertiser->deploymentID, failedAdvertiser);
+   machineB.upsertContainerIndexEntry(replacementAdvertiser->deploymentID, replacementAdvertiser);
+
+   brain.mesh->advertise(service, failedAdvertiser, failedPort, false);
+   brain.mesh->subscribe(service, &subscriberA, SubscriptionNature::any, false);
+   brain.mesh->subscribe(service, &subscriberB, SubscriptionNature::any, false);
+   brain.mesh->advertise(service, replacementAdvertiser, replacementPort, false);
+
+   PairingTrackingContainerView *migratingSubscriber = nullptr;
+   PairingTrackingContainerView *stableSubscriber = nullptr;
+   if (subscriberA.subscribedTo.hasEntryFor(service, failedAdvertiser))
+   {
+      migratingSubscriber = &subscriberA;
+      stableSubscriber = &subscriberB;
+   }
+   else if (subscriberB.subscribedTo.hasEntryFor(service, failedAdvertiser))
+   {
+      migratingSubscriber = &subscriberB;
+      stableSubscriber = &subscriberA;
+   }
+
+   suite.expect(
+      migratingSubscriber != nullptr,
+      "brain_neuron_container_failed_restart_rebalance_fixture_retains_one_failed_pairing");
+   suite.expect(
+      stableSubscriber != nullptr && stableSubscriber->subscribedTo.hasEntryFor(service, replacementAdvertiser),
+      "brain_neuron_container_failed_restart_rebalance_fixture_pairs_other_subscriber_to_replacement");
+
+   for (PairingTrackingContainerView *subscriber : {&subscriberA, &subscriberB})
+   {
+      subscriber->subscriptionActivateCalls = 0;
+      subscriber->subscriptionDeactivateCalls = 0;
+      subscriber->lastSubscriptionAddress = 0;
+      subscriber->lastSubscriptionService = 0;
+      subscriber->lastSubscriptionPort = 0;
+      subscriber->lastSubscriptionApplicationID = 0;
+   }
+
+   deployment.containerFailed(
+      failedAdvertiser,
+      int64_t(1700000000011),
+      11,
+      "container crash"_ctv,
+      true);
+
+   suite.expect(
+      failedAdvertiser->state == ContainerState::crashedRestarting,
+      "brain_neuron_container_failed_restart_rebalance_marks_crashed_restarting");
+   suite.expect(
+      migratingSubscriber->subscriptionDeactivateCalls == 1,
+      "brain_neuron_container_failed_restart_rebalance_deactivates_failed_pairing");
+   suite.expect(
+      migratingSubscriber->subscriptionActivateCalls == 1,
+      "brain_neuron_container_failed_restart_rebalance_activates_only_replacement");
+   suite.expect(
+      migratingSubscriber->lastSubscriptionAddress == replacementAdvertiser->pairingAddress(),
+      "brain_neuron_container_failed_restart_rebalance_uses_replacement_address");
+   suite.expect(
+      migratingSubscriber->lastSubscriptionPort == replacementPort,
+      "brain_neuron_container_failed_restart_rebalance_uses_replacement_port");
+   suite.expect(
+      migratingSubscriber->subscribedTo.hasEntryFor(service, failedAdvertiser) == false,
+      "brain_neuron_container_failed_restart_rebalance_removes_failed_advertiser");
+   suite.expect(
+      migratingSubscriber->subscribedTo.hasEntryFor(service, replacementAdvertiser),
+      "brain_neuron_container_failed_restart_rebalance_pairs_spare_advertiser");
+   suite.expect(
+      stableSubscriber->subscriptionDeactivateCalls == 0,
+      "brain_neuron_container_failed_restart_rebalance_keeps_replacement_peer_active");
+   suite.expect(
+      stableSubscriber->subscriptionActivateCalls == 0,
+      "brain_neuron_container_failed_restart_rebalance_avoids_duplicate_replacement_activation");
+
+   deployment.containers.erase(failedAdvertiser);
+   deployment.containers.erase(replacementAdvertiser);
+   machineA.removeContainerIndexEntry(failedAdvertiser->deploymentID, failedAdvertiser);
+   machineB.removeContainerIndexEntry(replacementAdvertiser->deploymentID, replacementAdvertiser);
+   brain.containers.erase(failedAdvertiser->uuid);
+   brain.containers.erase(replacementAdvertiser->uuid);
+   delete failedAdvertiser;
+   delete replacementAdvertiser;
+
+   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
+   brain.deployments.erase(deployment.plan.config.deploymentID());
+   brain.machinesByUUID.erase(machineA.uuid);
+   brain.machinesByUUID.erase(machineB.uuid);
+   brain.machines.erase(&machineA);
+   brain.machines.erase(&machineB);
    thisBrain = previousBrain;
 }
 
@@ -10438,6 +11715,9 @@ int main(void)
    testSpinApplicationProgressAppendsAfterOkayFrame(suite);
    testSpinApplicationProgressAcceptsDirectFdMothership(suite);
    testSpinApplicationProgressStaysOnOriginalDeployStream(suite);
+   testSpinApplicationStagesFollowerBlobReplicationBehindMetadataEcho(suite);
+   testLargePayloadPeerKeepaliveUsesFixedFileSocketCommand(suite);
+   testAcceptedBrainPeerSetsLargePayloadUserTimeout(suite);
    testStatefulRequestMachinesClaimsDeployingMachinesWithSpecializedTicket(suite);
    testSpinApplicationFailedFrameCarriesReason(suite);
    testMachineSchemaMutationsQueueRuntimeStateReplication(suite);
@@ -10474,6 +11754,8 @@ int main(void)
    testNeuronInitialFramesDeferAdoptedHardwareProfileUntilBrainStreamReady(suite);
    testNeuronDeferredHardwareInventoryAdoptionRequiresReadySerializedProfile(suite);
    testNeuronDeferredHardwareInventoryWakeAdoptsReadyProfile(suite);
+   testNeuronEnsureDeferredHardwareInventoryProgressQueuesReadyProfileToActiveBrain(suite);
+   testBrainNeuronHandlerRestartingContainerFailureRebalancesAnySubscribersWithoutDeadReplay(suite);
    testNeuronQueuesCachedHardwareProfileWhenBrainStreamBecomesActive(suite);
    testNeuronOverlayRoutingSyncWithoutPrograms(suite);
    testNeuronWhiteholeBindingBookkeepingWithoutPrograms(suite);
@@ -10490,6 +11772,8 @@ int main(void)
    testNeuronStreamStateHelpers(suite);
    testNeuronBrainControlAndDeferredInventoryHelpers(suite);
    testNeuronTransportTLSPeerVerificationGatesHardwareProfileQueueing(suite);
+   testNeuronMachineHardwareProfileTransportStripsCaptures(suite);
+   testNeuronTransportTLSPeerVerificationAdoptsDeferredHardwareInventory(suite);
    testNeuronTransportTLSPeerVerificationRejectsPeerWithoutTransportUUID(suite);
    testNeuronTransportTLSPeerVerificationWaitsForNegotiation(suite);
    testNeuronTransportTLSBrainRecvAndSendHandlers(suite);
@@ -10505,16 +11789,21 @@ int main(void)
    testNeuronRecvAndSendSocketWrappers(suite);
    testNeuronContainerHandlerForwardsHealthyToBrain(suite);
    testNeuronContainerHandlerMarksMasterLocalContainerHealthyWithoutBrainStream(suite);
+   testNeuronContainerHandlerRelaysHealthyToMasterPeerWithoutBrainStream(suite);
    testNeuronContainerHandlerMarksMasterLocalContainerHealthyWithActiveBrainStream(suite);
    testNeuronContainerHandlerForwardsStatisticsToBrain(suite);
    testNeuronHandlerStoresRequestedContainerBlob(suite);
    testNeuronHandlerKillContainerStopsContainerAndEchoesBrain(suite);
    testBrainNeuronHandlerMarksContainerHealthyOnceAndClearsWaiters(suite);
+   testBrainReplicatedContainerHealthyMarksContainerHealthyOnMaster(suite);
    testBrainNeuronHandlerHealthyReplacementPointerClearsEquivalentWaiter(suite);
    testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(suite);
    testBrainNeuronStateUploadHealthyContainerClearsWaiters(suite);
+   testBrainNeuronStateUploadHealthyAdvertiserRefreshesPeerPairingsOnPortChange(suite);
    testBrainNeuronStateUploadHealthyReplacementPointerClearsEquivalentWaiter(suite);
    testMachineHealthyClaimWakePreservesTicketOutstandingCount(suite);
+   testMachineHealthySkipsScheduledStatelessDonorMoveUntilQuiescent(suite);
+   testDrainMachineSkipsScheduledLiveRedeployUntilHealthy(suite);
    testBrainNeuronHandlerRecordsContainerStatisticsAndReplicates(suite);
    testBrainNeuronHandlerHandlesRestartingContainerFailure(suite);
    testBrainNeuronHandlerHandlesNonRestartingContainerFailureAndDrainsMachine(suite);

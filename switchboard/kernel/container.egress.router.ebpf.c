@@ -20,6 +20,16 @@ struct
   __type(value, __u64);
 } container_router_stats_map SEC(".maps");
 
+// container_router_stats_map indexes:
+// 0 entered
+// 1 dropped_over_mtu
+// 2 dropped_public_ipv4
+// 3 saw_ipv6
+// 4 redirected_to_nic
+// 5 redirected_to_container
+// 6 dropped_multicast
+// 7 redirected_portal_to_container
+
 static __always_inline void bumpPacketCounter(__u32 index)
 {
   __u64 *slot = bpf_map_lookup_elem(&container_router_stats_map, &index);
@@ -46,6 +56,18 @@ int container_egress_router(struct __sk_buff *skb)
   }
 
   bumpPacketCounter(0);
+
+  __u32 interContainerMTU = containerInterContainerMTU();
+  __u32 l3Offset = (__u32)((const __u8 *)l3_data - (const __u8 *)data);
+  __u32 l3Length = ((__u32)skb->len > l3Offset) ? ((__u32)skb->len - l3Offset) : 0u;
+  if (interContainerMTU != 0 && l3Length > interContainerMTU)
+  {
+    bumpPacketCounter(1);
+#if PRODIGY_DEBUG
+    setCheckpoint("dropOversizeInterContainerMTU");
+#endif
+    return NETKIT_DROP;
+  }
 
   if (protocol == BE_ETH_P_IP && containerRequiresPublic4() == false)
   {

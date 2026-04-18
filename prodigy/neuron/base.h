@@ -1,6 +1,7 @@
 #include <prodigy/containerstore.h>
 #include <prodigy/iaas/iaas.h>
 #include <prodigy/machine.hardware.types.h>
+#include <prodigy/runtime.environment.h>
 #include <ebpf/program.h>
 #include <ebpf/common/structs.h>
 
@@ -40,6 +41,7 @@ public:
    bytell_hash_set<uint128_t> statefulCrashed; // waiting on word from the brain what to do with the data
 
    EthDevice eth;
+   uint32_t configuredInterContainerMTU = 0;
    BPFProgram *tcx_ingress_program = nullptr;
    BPFProgram *tcx_egress_program = nullptr;
    struct local_container_subnet6 lcsubnet6;
@@ -51,6 +53,16 @@ public:
    uint8_t datacenterUniqueTag(void)
    {
       return lcsubnet6.dpfx;
+   }
+
+   uint32_t desiredInterContainerMTU(void) const
+   {
+      return configuredInterContainerMTU > 0 ? configuredInterContainerMTU : eth.mtu;
+   }
+
+   uint32_t controlPlaneTCPMaxSegmentSize(int family) const
+   {
+      return prodigyTCPMaxSegmentSizeForMTU(desiredInterContainerMTU(), family);
    }
 
    bool haveFragments(void)

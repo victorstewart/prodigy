@@ -64,7 +64,7 @@ static inline bool switchboardRewriteWormholeSourceIPv6SKB(struct __sk_buff *skb
          return false;
       }
 
-      const __u64 rewriteFlags = switchboardPacketRewriteManualChecksumStoreFlags();
+      const __u64 rewriteFlags = switchboardPacketRewriteManualChecksumDataStoreFlags();
       __be16 oldSourcePort = udph->source;
 
       if (oldSourcePort != binding->port
@@ -113,7 +113,7 @@ static inline bool switchboardRewriteWormholeSourceIPv6SKB(struct __sk_buff *skb
          return false;
       }
 
-      const __u64 rewriteFlags = switchboardPacketRewriteManualChecksumStoreFlags();
+      const __u64 rewriteFlags = switchboardPacketRewriteManualChecksumDataStoreFlags();
       __be16 oldSourcePort = tcph->source;
 
       if (oldSourcePort != binding->port
@@ -260,18 +260,78 @@ static inline bool switchboardEncapSKBV6(struct __sk_buff *skb,
       return false;
    }
 
+   // NETKIT_L3 skb overlay growth preserves the transport payload but can
+   // leave the first inner L3 header bytes zeroed. Snapshot the inner header
+   // and restore it after outer-header insertion so host ingress can still
+   // route by the destination container subnet.
+   void *data_end = (void *)(long)skb->data_end;
+   struct ethhdr *eth = (struct ethhdr *)(long)skb->data;
+   struct ipv6hdr inner6 = {};
+   struct iphdr inner4 = {};
+
+   if ((void *)(eth + 1) > data_end)
+   {
+      return false;
+   }
+
+   if (inner_proto == IPPROTO_IPV6)
+   {
+      struct ipv6hdr *originalInner6 = (struct ipv6hdr *)(eth + 1);
+      if ((void *)(originalInner6 + 1) > data_end)
+      {
+         return false;
+      }
+
+      bpf_memcpy(&inner6, originalInner6, sizeof(inner6));
+   }
+   else if (inner_proto == IPPROTO_IPIP)
+   {
+      struct iphdr *originalInner4 = (struct iphdr *)(eth + 1);
+      if ((void *)(originalInner4 + 1) > data_end)
+      {
+         return false;
+      }
+
+      bpf_memcpy(&inner4, originalInner4, sizeof(inner4));
+   }
+   else
+   {
+      return false;
+   }
+
    if (bpf_skb_adjust_room(skb, (__s32)sizeof(struct ipv6hdr), BPF_ADJ_ROOM_NET, switchboardOverlayEncapAdjustRoomFlagsIPv6()))
    {
       return false;
    }
 
-   void *data_end = (void *)(long)skb->data_end;
-   struct ethhdr *eth = (struct ethhdr *)(long)skb->data;
+   data_end = (void *)(long)skb->data_end;
+   eth = (struct ethhdr *)(long)skb->data;
    struct ipv6hdr *ip6h = (struct ipv6hdr *)(eth + 1);
 
    if ((void *)(eth + 1) > data_end || (void *)(ip6h + 1) > data_end)
    {
       return false;
+   }
+
+   if (inner_proto == IPPROTO_IPV6)
+   {
+      struct ipv6hdr *restoredInner6 = (struct ipv6hdr *)(ip6h + 1);
+      if ((void *)(restoredInner6 + 1) > data_end)
+      {
+         return false;
+      }
+
+      bpf_memcpy(restoredInner6, &inner6, sizeof(inner6));
+   }
+   else
+   {
+      struct iphdr *restoredInner4 = (struct iphdr *)(ip6h + 1);
+      if ((void *)(restoredInner4 + 1) > data_end)
+      {
+         return false;
+      }
+
+      bpf_memcpy(restoredInner4, &inner4, sizeof(inner4));
    }
 
    eth->h_proto = BE_ETH_P_IPV6;
@@ -303,18 +363,74 @@ static inline bool switchboardEncapSKBV4(struct __sk_buff *skb,
       return false;
    }
 
+   void *data_end = (void *)(long)skb->data_end;
+   struct ethhdr *eth = (struct ethhdr *)(long)skb->data;
+   struct ipv6hdr inner6 = {};
+   struct iphdr inner4 = {};
+
+   if ((void *)(eth + 1) > data_end)
+   {
+      return false;
+   }
+
+   if (inner_proto == IPPROTO_IPV6)
+   {
+      struct ipv6hdr *originalInner6 = (struct ipv6hdr *)(eth + 1);
+      if ((void *)(originalInner6 + 1) > data_end)
+      {
+         return false;
+      }
+
+      bpf_memcpy(&inner6, originalInner6, sizeof(inner6));
+   }
+   else if (inner_proto == IPPROTO_IPIP)
+   {
+      struct iphdr *originalInner4 = (struct iphdr *)(eth + 1);
+      if ((void *)(originalInner4 + 1) > data_end)
+      {
+         return false;
+      }
+
+      bpf_memcpy(&inner4, originalInner4, sizeof(inner4));
+   }
+   else
+   {
+      return false;
+   }
+
    if (bpf_skb_adjust_room(skb, (__s32)sizeof(struct iphdr), BPF_ADJ_ROOM_NET, switchboardOverlayEncapAdjustRoomFlagsIPv4()))
    {
       return false;
    }
 
-   void *data_end = (void *)(long)skb->data_end;
-   struct ethhdr *eth = (struct ethhdr *)(long)skb->data;
+   data_end = (void *)(long)skb->data_end;
+   eth = (struct ethhdr *)(long)skb->data;
    struct iphdr *iph = (struct iphdr *)(eth + 1);
 
    if ((void *)(eth + 1) > data_end || (void *)(iph + 1) > data_end)
    {
       return false;
+   }
+
+   if (inner_proto == IPPROTO_IPV6)
+   {
+      struct ipv6hdr *restoredInner6 = (struct ipv6hdr *)(iph + 1);
+      if ((void *)(restoredInner6 + 1) > data_end)
+      {
+         return false;
+      }
+
+      bpf_memcpy(restoredInner6, &inner6, sizeof(inner6));
+   }
+   else
+   {
+      struct iphdr *restoredInner4 = (struct iphdr *)(iph + 1);
+      if ((void *)(restoredInner4 + 1) > data_end)
+      {
+         return false;
+      }
+
+      bpf_memcpy(restoredInner4, &inner4, sizeof(inner4));
    }
 
    eth->h_proto = BE_ETH_P_IP;

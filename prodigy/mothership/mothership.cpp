@@ -1868,12 +1868,13 @@ static void printManagedCluster(const MothershipProdigyCluster& cluster)
    if (cluster.deploymentMode == MothershipClusterDeploymentMode::test && cluster.test.specified)
    {
       String workspaceRoot = cluster.test.workspaceRoot;
-      basics_log("    test hostMode=%s workspaceRoot=%s machineCount=%u brainBootstrapFamily=%s enableFakeIpv4Boundary=%d\n",
+      basics_log("    test hostMode=%s workspaceRoot=%s machineCount=%u brainBootstrapFamily=%s enableFakeIpv4Boundary=%d interContainerMTU=%u\n",
          mothershipClusterTestHostModeName(cluster.test.host.mode),
          workspaceRoot.c_str(),
          unsigned(cluster.test.machineCount),
          mothershipClusterTestBootstrapFamilyName(cluster.test.brainBootstrapFamily),
-         int(cluster.test.enableFakeIpv4Boundary));
+         int(cluster.test.enableFakeIpv4Boundary),
+         unsigned(cluster.test.interContainerMTU));
 
       if (cluster.test.host.mode == MothershipClusterTestHostMode::ssh)
       {
@@ -3048,6 +3049,13 @@ static void mothershipAppendPersistentTestClusterHarnessCommand(const String& ha
    {
       command.append("0"_ctv);
    }
+   String interContainerMTUText = {};
+   interContainerMTUText.snprintf<"{itoa}"_ctv>(uint64_t(
+      cluster.test.interContainerMTU > 0
+         ? cluster.test.interContainerMTU
+         : prodigyRuntimeTestInterContainerMTUDefault));
+   command.append(" --inter-container-mtu="_ctv);
+   command.append(interContainerMTUText);
 }
 
 static void mothershipAppendPersistentTestClusterWorkspaceCleanup(const String& workspaceRoot, String& command)
@@ -3099,7 +3107,7 @@ static void mothershipBuildPersistentTestClusterStartCommand(const String& harne
    mothershipAppendPersistentTestClusterWorkspaceCleanup(cluster.test.workspaceRoot, command);
    command.append("mkdir -p "_ctv);
    prodigyAppendShellSingleQuoted(command, cluster.test.workspaceRoot);
-   command.append("; setsid nohup bash -lc "_ctv);
+   command.append("; setsid nohup env PRODIGY_DEV_KEEP_TMP=1 bash -lc "_ctv);
    prodigyAppendShellSingleQuoted(command, runnerCommand);
    command.append(" >"_ctv);
    prodigyAppendShellSingleQuoted(command, logPath);
@@ -3144,6 +3152,31 @@ static bool mothershipWaitForLocalTestClusterReady(const MothershipProdigyCluste
       {
          if (failure) failure->clear();
          return true;
+      }
+
+      if (::access(pidPath.c_str(), R_OK) == 0)
+      {
+         String pidText = {};
+         Filesystem::openReadAtClose(-1, pidPath, pidText);
+         if (pidText.size() > 0)
+         {
+            pidText.addNullTerminator();
+            long long runnerPID = std::atoll(pidText.c_str());
+            if (runnerPID > 0 && ::kill(pid_t(runnerPID), 0) != 0 && errno == ESRCH)
+            {
+               if (failure)
+               {
+                  failure->snprintf<"local test cluster runner exited before ready workspaceRoot={} runnerPID={} runnerLogPath={} runnerLogPathExists={} manifestPathExists={} controlSocketPathExists={}"_ctv>(
+                     cluster.test.workspaceRoot,
+                     uint64_t(runnerPID),
+                     logPath,
+                     uint32_t(::access(logPath.c_str(), R_OK) == 0),
+                     uint32_t(::access(manifestPath.c_str(), R_OK) == 0),
+                     uint32_t(::access(controlSocketPath.c_str(), F_OK) == 0));
+               }
+               return false;
+            }
+         }
       }
 
       if (Time::now<TimeResolution::ms>() >= deadlineMs)
@@ -3416,6 +3449,7 @@ public:
 		Vector<MothershipProdigyClusterMachine> remoteMachines;
       Vault::SSHKeyPackage clusterBootstrapSshKeyPackage;
       String clusterBootstrapSshPrivateKeyPath;
+		String matchedFrameBuffer;
 		int transportFD = -1;
 		LIBSSH2_SESSION *sshSession = nullptr;
 		LIBSSH2_CHANNEL *sshChannel = nullptr;
@@ -3452,6 +3486,7 @@ public:
          clusterBootstrapSshKeyPackage.clear();
          clusterBootstrapSshPrivateKeyPath.clear();
          sshTunnelKnownHostsPath.clear();
+			matchedFrameBuffer.clear();
 		}
 
 		void disconnectSSH(void)
@@ -4192,6 +4227,7 @@ public:
 		disconnect();
 		rBuffer.clear();
 		wBuffer.clear();
+		matchedFrameBuffer.clear();
 
 		switch (transportMode)
 		{
@@ -4309,10 +4345,23 @@ public:
 	bool send(void)
 	{
 		uint16_t topic = 0;
+		uint32_t messageSize = 0;
+		uint8_t messagePadding = 0;
+		uint8_t messageHeaderSize = 0;
+		uint8_t sample[16] = {0};
+		size_t sampleCount = 0;
 		if (wBuffer.size() >= sizeof(Message))
 		{
 			const Message *message = reinterpret_cast<const Message *>(wBuffer.data());
 			topic = message->topic;
+			messageSize = message->size;
+			messagePadding = message->padding;
+			messageHeaderSize = message->headerSize;
+			sampleCount = (wBuffer.size() < sizeof(sample) ? size_t(wBuffer.size()) : sizeof(sample));
+			if (sampleCount > 0)
+			{
+				memcpy(sample, wBuffer.data(), sampleCount);
+			}
 		}
 		basics_log("mothership control send mode=%s target=%s topic=%s(%u) bytes=%zu\n",
 			transportModeName(),
@@ -4320,6 +4369,36 @@ public:
 			prodigyMothershipTopicName(MothershipTopic(topic)),
 			unsigned(topic),
 			size_t(wBuffer.size()));
+		if (topic == uint16_t(MothershipTopic::measureApplication) || topic == uint16_t(MothershipTopic::spinApplication))
+		{
+			basics_log(
+				"mothership control send-head mode=%s target=%s topic=%s(%u) bytes=%zu messageSize=%u padding=%u header=%u sampleBytes=%zu sample=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+				transportModeName(),
+				targetLabel.c_str(),
+				prodigyMothershipTopicName(MothershipTopic(topic)),
+				unsigned(topic),
+				size_t(wBuffer.size()),
+				unsigned(messageSize),
+				unsigned(messagePadding),
+				unsigned(messageHeaderSize),
+				sampleCount,
+				unsigned(sample[0]),
+				unsigned(sample[1]),
+				unsigned(sample[2]),
+				unsigned(sample[3]),
+				unsigned(sample[4]),
+				unsigned(sample[5]),
+				unsigned(sample[6]),
+				unsigned(sample[7]),
+				unsigned(sample[8]),
+				unsigned(sample[9]),
+				unsigned(sample[10]),
+				unsigned(sample[11]),
+				unsigned(sample[12]),
+				unsigned(sample[13]),
+				unsigned(sample[14]),
+				unsigned(sample[15]));
+		}
 		bool result = sendTransport(reinterpret_cast<const uint8_t *>(wBuffer.data()), wBuffer.size());
 		wBuffer.clear();
 
@@ -4359,12 +4438,9 @@ public:
 	Message* recvExpectedTopic(MothershipTopic expectedTopic, uint32_t maxReceives = 64)
 	{
 		constexpr uint64_t wireHeaderBytes = sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint8_t) + sizeof(uint8_t);
-		rBuffer.clear();
 
 		for (uint32_t receiveAttempt = 0; receiveAttempt < maxReceives; ++receiveAttempt)
 		{
-			if (recvAppend() == false) return nullptr;
-
 			uint64_t cursorOffset = 0;
 			bool awaitingMoreBytes = false;
 
@@ -4416,6 +4492,15 @@ public:
 
 				if (MothershipTopic(messageTopic) == expectedTopic)
 				{
+					matchedFrameBuffer.clear();
+					matchedFrameBuffer.append(cursor, messageSize);
+					uint64_t consumedBytes = cursorOffset + messageSize;
+					uint64_t remaining = rBuffer.size() - consumedBytes;
+					if (remaining > 0)
+					{
+						memmove(rBuffer.data(), rBuffer.data() + consumedBytes, remaining);
+					}
+					rBuffer.resize(remaining);
 					basics_log("mothership control recv-topic mode=%s target=%s topic=%s(%u) expected=%s(%u) size=%u attempt=%u\n",
 					transportModeName(),
 					targetLabel.c_str(),
@@ -4425,7 +4510,7 @@ public:
 					unsigned(expectedTopic),
 					unsigned(messageSize),
 					receiveAttempt + 1);
-					return reinterpret_cast<Message *>(cursor);
+					return reinterpret_cast<Message *>(matchedFrameBuffer.data());
 				}
 
 				basics_log("mothership control recv-topic mode=%s target=%s topic=%s(%u) expected=%s(%u) size=%u attempt=%u ignored=1\n",
@@ -4506,8 +4591,10 @@ public:
 						unsigned(sample[13]),
 						unsigned(sample[14]),
 						unsigned(sample[15]));
-					continue;
 				}
+
+			if (recvAppend() == false) return nullptr;
+			continue;
 
 			if (cursorOffset != rBuffer.size())
 			{
@@ -7626,6 +7713,15 @@ private:
 		}
 
 		bool returnAfterInitialSpinOkay = (std::strcmp(argv[0], "dev") == 0);
+		if (returnAfterInitialSpinOkay == false
+			&& std::strcmp(argv[0], "local") == 0
+			&& std::getenv("PRODIGY_MOTHERSHIP_TEST_HARNESS") != nullptr)
+		{
+			// Local unix control requests coming from the isolated test harness run
+			// readiness validation via explicit follow-up probes, so they should not
+			// block on the terminal spinApplication frame.
+			returnAfterInitialSpinOkay = true;
+		}
 		if (returnAfterInitialSpinOkay == false && std::strcmp(argv[0], "local") != 0)
 		{
 			MothershipClusterRegistry clusterRegistry = openClusterRegistry();
@@ -9357,6 +9453,17 @@ private:
                 wormhole.isQuic = b;
               }
 						}
+                  else if (key.equal("userCapacity"_ctv))
+                  {
+                     String failure = {};
+                     String context = {};
+                     context.assign("wormhole.userCapacity"_ctv);
+                     if (mothershipParseServiceUserCapacity(item.value, wormhole.userCapacity, context, &failure) == false)
+                     {
+                        basics_log("%s\n", failure.c_str());
+                        exit(EXIT_FAILURE);
+                     }
+                  }
                   else if (key.equal("quicCidKeyRotationHours"_ctv))
                   {
                      String failure = {};
@@ -9912,6 +10019,17 @@ private:
 								basics_log("advertisement.port value invalid\n");
                 exit(EXIT_FAILURE);
               }
+            }
+            else if (key.equal("userCapacity"_ctv))
+            {
+               String failure;
+               String context;
+               context.assign("advertisement.userCapacity"_ctv);
+               if (mothershipParseServiceUserCapacity(item.value, advertisement.userCapacity, context, &failure) == false)
+               {
+                  basics_log("%s\n", failure.c_str());
+                  exit(EXIT_FAILURE);
+               }
             }
           }
 
@@ -12662,6 +12780,20 @@ private:
                   }
 
                   request.test.enableFakeIpv4Boundary = value;
+               }
+               else if (testKey.equal("interContainerMTU"_ctv))
+               {
+                  uint64_t value = 0;
+                  if ((testField.value.type() != simdjson::dom::element_type::INT64
+                        && testField.value.type() != simdjson::dom::element_type::UINT64)
+                     || testField.value.get(value) != simdjson::SUCCESS
+                     || value > UINT32_MAX)
+                  {
+                     basics_log("createCluster.test.interContainerMTU invalid\n");
+                     exit(EXIT_FAILURE);
+                  }
+
+                  request.test.interContainerMTU = uint32_t(value);
                }
                else if (testKey.equal("host"_ctv))
                {

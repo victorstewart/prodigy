@@ -4201,6 +4201,19 @@ public:
 	// Reconcile pending work and close target deficits after master/brain recovery.
 	void recoverAfterReboot(void)
 	{
+		std::fprintf(stderr,
+			"deployment recoverAfterReboot begin deploymentID=%llu appID=%u state=%u waiting=%llu toSchedule=%llu nDeployed=%u nTarget=%u nHealthy=%u suspended=%u\n",
+			(unsigned long long)plan.config.deploymentID(),
+			unsigned(plan.config.applicationID),
+			unsigned(state),
+			(unsigned long long)waitingOnContainers.size(),
+			(unsigned long long)toSchedule.size(),
+			unsigned(nDeployed()),
+			unsigned(nTarget()),
+			unsigned(nHealthy()),
+			unsigned(nSuspended));
+		std::fflush(stderr);
+
 		if (state == DeploymentState::failed || state == DeploymentState::decommissioning)
 		{
 			return;
@@ -4213,6 +4226,13 @@ public:
 
 		if (toSchedule.size() > 0)
 		{
+			std::fprintf(stderr,
+				"deployment recoverAfterReboot reschedule-pending deploymentID=%llu appID=%u toSchedule=%llu waiting=%llu\n",
+				(unsigned long long)plan.config.deploymentID(),
+				unsigned(plan.config.applicationID),
+				(unsigned long long)toSchedule.size(),
+				(unsigned long long)waitingOnContainers.size());
+			std::fflush(stderr);
 			schedule(nullptr);
 			return;
 		}
@@ -4274,6 +4294,15 @@ public:
 		// registrations arrive after initial evaluateAfterNewMaster() planning.
 		if (nDeployed() < nTarget())
 		{
+			std::fprintf(stderr,
+				"deployment recoverAfterReboot underprovisioned deploymentID=%llu appID=%u nDeployed=%u nTarget=%u waiting=%llu hasHealthyMachines=%d\n",
+				(unsigned long long)plan.config.deploymentID(),
+				unsigned(plan.config.applicationID),
+				unsigned(nDeployed()),
+				unsigned(nTarget()),
+				(unsigned long long)waitingOnContainers.size(),
+				int(thisBrain->hasHealthyMachines()));
+			std::fflush(stderr);
 			// On master handoff, followers may still be reconnecting neuron control sockets.
 			// Do not request additional machines until at least one machine is healthy.
 			if (thisBrain->hasHealthyMachines() == false)
@@ -4289,12 +4318,21 @@ public:
 			{
 				state = DeploymentState::deploying;
 				stateChangedAtMs = Time::now<TimeResolution::ms>();
+				std::fprintf(stderr,
+					"deployment recoverAfterReboot reschedule-underprovisioned deploymentID=%llu appID=%u toSchedule=%llu waiting=%llu\n",
+					(unsigned long long)plan.config.deploymentID(),
+					unsigned(plan.config.applicationID),
+					(unsigned long long)toSchedule.size(),
+					(unsigned long long)waitingOnContainers.size());
+				std::fflush(stderr);
 				schedule(nullptr);
 			}
 		}
 	}
 
-	uint32_t brainEchos = 0; // we wait until both brains echo that they have the deployment plan and (unless vertical rescale) the container blob
+	uint32_t brainEchos = 0; // we wait until both brains echo that they have the deployment blob when one is required
+	bytell_hash_set<uint128_t> brainBlobQueuedPeerKeys = {};
+	bytell_hash_set<uint128_t> brainBlobEchoPeerKeys = {};
 
 		void cancelDeploymentWork(DeploymentWork *meta)
 		{
@@ -5136,6 +5174,19 @@ public:
 				case ContainerState::crashedRestarting:
 				case ContainerState::healthy:
 				{
+					if (failed == false && container->state == ContainerState::scheduled)
+					{
+						basics_log("drainMachine skip-scheduled-live-redeploy deploymentID=%llu appID=%u uuid=%llu machinePrivate4=%u waitingOnContainers=%llu toSchedule=%llu\n",
+							(unsigned long long)plan.config.deploymentID(),
+							unsigned(plan.config.applicationID),
+							(unsigned long long)container->uuid,
+							unsigned(machine->private4),
+							(unsigned long long)waitingOnContainers.size(),
+							(unsigned long long)toSchedule.size());
+						bin.push_back(container);
+						break;
+					}
+
 					if (isDecommissioning()) // this means the new head is actively or waiting to transitioning to itself
 					{
 						if (failed)
@@ -5540,17 +5591,26 @@ public:
 			{
 				case ApplicationLifetime::canary:
 				{
-					nHealthyCanary -= 1;
+					if (nHealthyCanary > 0)
+					{
+						nHealthyCanary -= 1;
+					}
 					break;
 				}
 				case ApplicationLifetime::base:
 				{
-					nHealthyBase -= 1;
+					if (nHealthyBase > 0)
+					{
+						nHealthyBase -= 1;
+					}
 					break;
 				}
 				case ApplicationLifetime::surge:
 				{
-					nHealthySurge -= 1;
+					if (nHealthySurge > 0)
+					{
+						nHealthySurge -= 1;
+					}
 					break;
 				}
 			}
@@ -5733,10 +5793,10 @@ public:
 		else
 		{
 			container->state = ContainerState::crashedRestarting;
-			// Keep pairings hot across crash-loop restarts so the next process
-			// seeds with current endpoints even if a healthy ack is delayed.
+			// Keep the restarting container's own pairing view warm so the next
+			// process can seed current dependencies, but do not replay this dead
+			// endpoint back out to peers while the old listener is gone.
 			container->replayActivePairingsToSelf();
-			container->replayActivePairingsToPeers();
 
 			if (plan.isStateful && !plan.stateful.allMasters)
 			{
@@ -5798,11 +5858,13 @@ public:
 
 			auto setupContainerServices = [&] (ContainerView *container) -> void {
 
-				auto setupAdvertisement = [&] (uint64_t service, ContainerState startAt, ContainerState stopAt, uint16_t port = 0) -> void {
+				auto setupAdvertisement = [&] (uint64_t service, ContainerState startAt, ContainerState stopAt, uint16_t port = 0, ServiceUserCapacity userCapacity = {}) -> void {
 
 					if (port == 0) port = container->getRandomAdvertisementPort(); // assign dynamically
 
-					container->advertisements.emplace(service, Advertisement(service, startAt, stopAt, port));
+					Advertisement advertisement(service, startAt, stopAt, port);
+					advertisement.userCapacity = userCapacity;
+					container->advertisements.emplace(service, advertisement);
 
 					if (startAt == ContainerState::scheduled)
 					{
@@ -5827,7 +5889,7 @@ public:
 
 				for (const Advertisement& advertisement : plan.advertisements)
 				{
-					setupAdvertisement(advertisement.service, advertisement.startAt, advertisement.stopAt, advertisement.port);
+					setupAdvertisement(advertisement.service, advertisement.startAt, advertisement.stopAt, advertisement.port, advertisement.userCapacity);
 				}
 
 				if constexpr (std::is_same_v<T, StatefulWork>)
@@ -5941,7 +6003,7 @@ public:
 
 					setupContainerServices(container);
 
-							ContainerPlan containerPlan = container->generatePlan(plan);
+							ContainerPlan containerPlan = container->generatePlan(plan, nShardGroups);
 							thisBrain->applyCredentialsToContainerPlan(plan, *container, containerPlan);
                      NeuronContainerMetricPolicy metricPolicy = deriveNeuronMetricPolicyForDeployment(plan);
 
