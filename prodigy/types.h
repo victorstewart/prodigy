@@ -2822,7 +2822,9 @@ public:
 
    bool allowUpdateInPlace; // for some versions we might not allow this so that we can change data formats etc
 
-   // an ephemeral, in-memory-only database like graph database needs seeding always because if it crashes or restarts it much seed the entire database again from its siblings
+   // Only changelog/update-style construction consults this flag. Genesis launch still starts empty without
+   // requesting seeding. Ephemeral, in-memory-only databases like graph services need restart/update construction
+   // to seed from siblings because changelog replay alone cannot rebuild them.
    bool seedingAlways;
 
    // if we autoscaled the resources when (neverShard == true) then we'd have to include logic about what to do when the instances don't fit on any machine type
@@ -4915,6 +4917,26 @@ static void serialize(S&& serializer, ProdigyMetricSample& sample)
    serializer.value16b(sample.containerUUID);
    serializer.value8b(sample.metricKey);
    serializer.value4b(sample.value);
+}
+
+template <typename S>
+static void prodigySerializeMetricSamplesWide(S&& serializer, Vector<ProdigyMetricSample>& samples)
+{
+   serializer.container(samples, UINT32_MAX, [] (auto& nested, ProdigyMetricSample& sample) {
+      nested.object(sample);
+   });
+}
+
+class ProdigyMetricSamplesSnapshot
+{
+public:
+   Vector<ProdigyMetricSample> samples;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyMetricSamplesSnapshot& snapshot)
+{
+   prodigySerializeMetricSamplesWide(serializer, snapshot.samples);
 }
 
 class Scaler {

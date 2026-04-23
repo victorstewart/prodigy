@@ -3617,7 +3617,7 @@ public:
 
 	void logMothershipReceiveBufferHead(const char *stage, Mothership *stream)
 	{
-		if (stream == nullptr)
+		if (stream == nullptr || prodigyRuntimeTraceEnabled() == false)
 		{
 			return;
 		}
@@ -3636,9 +3636,9 @@ public:
 			memcpy(sample, stream->rBuffer.pHead(), sampleCount);
 		}
 
-			std::fprintf(stderr,
-				"prodigy mothership %s outstanding=%llu peekSize=%u sampleBytes=%llu sample=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x stream=%p fixedFD=%d fslot=%d master=%d\n",
-				stage,
+		prodigyRuntimeTrace(
+			"prodigy mothership %s outstanding=%llu peekSize=%u sampleBytes=%llu sample=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x stream=%p fixedFD=%d fslot=%d master=%d\n",
+			stage,
 			(unsigned long long)outstanding,
 			unsigned(peekSize),
 			(unsigned long long)sampleCount,
@@ -3658,11 +3658,10 @@ public:
 				unsigned(sample[13]),
 				unsigned(sample[14]),
 				unsigned(sample[15]),
-				static_cast<void *>(stream),
-				loggableSocketFD(stream),
-				stream->fslot,
-				int(weAreMaster));
-		std::fflush(stderr);
+			static_cast<void *>(stream),
+			loggableSocketFD(stream),
+			stream->fslot,
+			int(weAreMaster));
 	}
 
 	void acceptHandler(void *socket, int fslot) override
@@ -3703,7 +3702,7 @@ public:
 						bool replaceActivePeerWithAcceptedStream = shouldReplaceActivePeerWithAcceptedStream(brain, expectedUpdateFollowerReconnect);
 						if (replaceActivePeerWithAcceptedStream)
 						{
-							std::fprintf(stderr,
+							prodigyRuntimeTrace(
 								"prodigy debug brain accept-replace private4=%u reason=%s oldAccepted=%d oldConnected=%d oldQuarantined=%d weConnectToIt=%d oldFd=%d oldFslot=%d newFslot=%d\n",
 								brain->private4,
 								(expectedUpdateFollowerReconnect ? "expected-update-reconnect" : "canonical-accepted-replaces-outbound"),
@@ -3714,7 +3713,6 @@ public:
 								brain->fd,
 								brain->fslot,
 								fslot);
-							std::fflush(stderr);
 							if (expectedUpdateFollowerReconnect)
 							{
 								std::fprintf(stderr,
@@ -3766,7 +3764,7 @@ public:
 						brain->currentStreamAccepted = true;
 						brain->noteTransportActivated();
 						Ring::publishSocketGeneration(brain);
-						std::fprintf(stderr,
+						prodigyRuntimeTrace(
 							"prodigy debug brain accept-known private4=%u fd=%d fslot=%d updateState=%u oldConnected=%d oldQuarantined=%d generation=%u priorGeneration=%u transportEpoch=%u\n",
 							brain->private4,
 							brain->fd,
@@ -3777,7 +3775,6 @@ public:
 							unsigned(brain->ioGeneration),
 							unsigned(priorGeneration),
 							unsigned(brain->transportEpoch));
-						std::fflush(stderr);
                   queueAcceptedBrainPeerSocketOptions(brain);
 							if (ProdigyTransportTLSRuntime::configured() && brain->beginTransportTLS(true) == false)
 							{
@@ -3806,7 +3803,7 @@ public:
 
 						// they will send us a registration too
 						Ring::queueRecv(brain);
-						std::fprintf(stderr,
+						prodigyRuntimeTrace(
 							"prodigy debug brain recv-armed private4=%u fd=%d fslot=%d pendingRecv=%d pendingSend=%d tls=%d negotiated=%d queuedBytes=%llu\n",
 							brain->private4,
 							brain->fd,
@@ -3816,7 +3813,6 @@ public:
 							int(brain->transportTLSEnabled()),
 							int(brain->isTLSNegotiated()),
 							(unsigned long long)brain->queuedSendOutstandingBytes());
-						std::fflush(stderr);
 					}
 					else
 					{
@@ -3975,7 +3971,7 @@ public:
 					brain->currentStreamAccepted = false;
 					brain->connected = true;
 					brain->noteTransportActivated();
-					std::fprintf(stderr,
+					prodigyRuntimeTrace(
 						"prodigy debug brain connect-ok private4=%u fd=%d fslot=%d updateState=%u weConnectToIt=%d transportEpoch=%u\n",
 						brain->private4,
 						brain->fd,
@@ -3983,7 +3979,6 @@ public:
 						unsigned(updateSelfState),
 						int(brain->weConnectToIt),
 						unsigned(brain->transportEpoch));
-					std::fflush(stderr);
 					if (updateSelfState == UpdateSelfState::waitingForFollowerReboots)
 					{
 						std::fprintf(stderr, "prodigy updateProdigy peer-connect-ok private4=%u\n", brain->private4);
@@ -4023,7 +4018,7 @@ public:
 
 				// We always need to receive the peer's registration/replication stream after connect.
 				Ring::queueRecv(brain);
-				std::fprintf(stderr,
+				prodigyRuntimeTrace(
 					"prodigy debug brain recv-armed private4=%u fd=%d fslot=%d pendingRecv=%d pendingSend=%d tls=%d negotiated=%d queuedBytes=%llu\n",
 					brain->private4,
 					brain->fd,
@@ -4033,7 +4028,6 @@ public:
 					int(brain->transportTLSEnabled()),
 					int(brain->isTLSNegotiated()),
 					(unsigned long long)brain->queuedSendOutstandingBytes());
-				std::fflush(stderr);
 				}
 				else
 				{
@@ -4132,7 +4126,10 @@ public:
 					neuron->wBuffer.clear();
 				}
 
-				Message::construct(neuron->wBuffer, NeuronTopic::registration, ignited);
+				// A live reconnect is not an authoritative inventory boundary: a restarted
+				// neuron may not have recovered its local container map yet, and an empty
+				// state upload would make the master delete still-running containers.
+				Message::construct(neuron->wBuffer, NeuronTopic::registration, ignited && reconnecting == false);
 				std::fprintf(stderr,
 					"brain neuron connect-queue-before stream=%p uuid=%llu private4=%u fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d wbytes=%u queued=%llu needsKick=%d\n",
 					static_cast<void *>(neuron),
@@ -4527,7 +4524,7 @@ public:
 			{
 				BrainView *brain = static_cast<BrainView *>(socket);
 				uint128_t updateSelfPeerKey = updateSelfPeerTrackingKey(brain);
-				std::fprintf(stderr,
+				prodigyRuntimeTrace(
 					"prodigy debug brain close stream=%p private4=%u fd=%d fslot=%d isFixed=%d updateState=%u weConnectToIt=%d accepted=%d connected=%d pendingSend=%d pendingRecv=%d tls=%d negotiated=%d peerVerified=%d registrationFresh=%d quarantined=%d queuedBytes=%llu wbytes=%u rbytes=%llu peerKey=%llu\n",
 					static_cast<void *>(brain),
 					brain->private4,
@@ -4549,21 +4546,21 @@ public:
 					uint32_t(brain->wBuffer.outstandingBytes()),
 					(unsigned long long)brain->rBuffer.outstandingBytes(),
 					(unsigned long long)updateSelfPeerKey);
-				std::fflush(stderr);
 				const bool staleCloseAfterTransportAdvance = (
-					brain->queuedCloseTransportEpoch != 0
+					brain->queuedCloseTransportEpochKnown
 					&& brain->queuedCloseTransportEpoch != brain->transportEpoch);
 				if (staleCloseAfterTransportAdvance)
 				{
-					basics_log("brain close ignored stale transport private4=%u queuedCloseEpoch=%u transportEpoch=%u weConnectToIt=%d accepted=%d fd=%d fslot=%d\n",
+					basics_log("brain close ignored stale transport private4=%u queuedCloseEpoch=%u transportEpoch=%u closePending=%d weConnectToIt=%d accepted=%d fd=%d fslot=%d\n",
 						brain->private4,
 						unsigned(brain->queuedCloseTransportEpoch),
 						unsigned(brain->transportEpoch),
+						int(brain->closeCompletionPending),
 						int(brain->weConnectToIt),
 						int(brain->currentStreamAccepted),
 						brain->fd,
 						brain->fslot);
-					brain->queuedCloseTransportEpoch = 0;
+					brain->closeCompletionPending = false;
 					co_return;
 				}
 				const bool inertDuplicateConnectorClose = (
@@ -4571,7 +4568,7 @@ public:
 					&& rawStreamIsActive(brain) == false
 					&& brain->connected == false
 					&& brain->currentStreamAccepted == false
-					&& brain->nConnectionAttempts == 0
+					&& brain->closeCompletionPending == false
 					&& brain->pendingSend == false
 					&& brain->pendingRecv == false
 					&& brain->registrationFresh == false
@@ -4580,6 +4577,19 @@ public:
 					&& brain->queuedSendOutstandingBytes() == 0
 					&& brain->wBuffer.outstandingBytes() == 0
 					&& brain->rBuffer.outstandingBytes() == 0);
+				if (inertDuplicateConnectorClose)
+				{
+					basics_log("brain close ignored inert duplicate connector private4=%u weConnectToIt=%d reconnectAfterClose=%d attempts=%u closeEpochKnown=%d queuedCloseEpoch=%u transportEpoch=%u\n",
+						brain->private4,
+						int(brain->weConnectToIt),
+						int(brain->reconnectAfterClose),
+						unsigned(brain->nConnectionAttempts),
+						int(brain->queuedCloseTransportEpochKnown),
+						unsigned(brain->queuedCloseTransportEpoch),
+						unsigned(brain->transportEpoch));
+					co_return;
+				}
+				brain->closeCompletionPending = false;
 				if (updateSelfPeerKey != 0)
 				{
 					updateSelfBundleIssuedPeerKeys.erase(updateSelfPeerKey);
@@ -4600,14 +4610,6 @@ public:
 			if (brain->weConnectToIt)
 			{
 				cancelBrainMissingWaiter(brain, "close-connector-reconnect");
-				if (inertDuplicateConnectorClose)
-				{
-					basics_log("brain close ignored inert duplicate connector private4=%u weConnectToIt=%d reconnectAfterClose=%d\n",
-						brain->private4,
-						int(brain->weConnectToIt),
-						int(brain->reconnectAfterClose));
-					co_return;
-				}
 
 				// this connection might've broken spuriously, or due to a network failure (maybe discovered when we sent a masterMissing message)
 				// but regardless try to reconnect, if not we'll then assume and handle the failure
@@ -6918,6 +6920,43 @@ public:
          {
             basics_log("brain local containerHealthy missing uuid=%llu\n",
                (unsigned long long)containerUUID);
+         }
+      }
+
+      void noteLocalContainerRuntimeReady(uint128_t containerUUID) override
+      {
+         if (weAreMaster == false)
+         {
+            BrainView *masterPeer = currentMasterPeer();
+            if (masterPeer != nullptr)
+            {
+               Message::construct(masterPeer->wBuffer, BrainTopic::replicateContainerRuntimeReady, containerUUID);
+               Ring::queueSend(masterPeer);
+            }
+            return;
+         }
+
+         auto it = containers.find(containerUUID);
+         if (it == containers.end())
+         {
+            basics_log("brain local containerRuntimeReady missing uuid=%llu\n",
+               (unsigned long long)containerUUID);
+            return;
+         }
+
+         ContainerView *container = it->second;
+         bool wasReady = container->runtimeReady;
+
+         if (auto deploymentIt = deployments.find(container->deploymentID); deploymentIt != deployments.end())
+         {
+            basics_log("brain local containerRuntimeReady uuid=%llu deploymentID=%llu duplicate=%d\n",
+               (unsigned long long)containerUUID,
+               (unsigned long long)container->deploymentID,
+               int(wasReady));
+            if (wasReady == false)
+            {
+               deploymentIt->second->containerRuntimeReady(container);
+            }
          }
       }
 
@@ -9656,18 +9695,17 @@ public:
 
 					if (Ring::socketIsClosing(stream) || streamIsActive(stream) == false)
 					{
-						std::fprintf(stderr, "prodigy mothership recv-rearm-skip reason=%s active=%d closing=%d stream=%p fd=%d fslot=%d\n",
+						prodigyRuntimeTrace("prodigy mothership recv-rearm-skip reason=%s active=%d closing=%d stream=%p fd=%d fslot=%d\n",
 							(reason ? reason : "unknown"),
 							int(streamIsActive(stream)),
 							int(Ring::socketIsClosing(stream)),
 							static_cast<void *>(stream),
 							stream->fd,
 							stream->fslot);
-						std::fflush(stderr);
 						return;
 					}
 
-					std::fprintf(stderr, "prodigy mothership recv-arm reason=%s stream=%p fd=%d fslot=%d isFixed=%d pendingRecv=%d pendingSend=%d\n",
+					prodigyRuntimeTrace("prodigy mothership recv-arm reason=%s stream=%p fd=%d fslot=%d isFixed=%d pendingRecv=%d pendingSend=%d\n",
 						(reason ? reason : "unknown"),
 						static_cast<void *>(stream),
 						loggableSocketFD(stream),
@@ -9675,9 +9713,8 @@ public:
 						int(stream->isFixedFile),
 						int(stream->pendingRecv),
 						int(stream->pendingSend));
-					std::fflush(stderr);
 					Ring::queueRecv(stream);
-					std::fprintf(stderr, "prodigy mothership recv-submit reason=%s pendingRecv=%d stream=%p fixedFD=%d fslot=%d rbytes=%zu remaining=%llu\n",
+					prodigyRuntimeTrace("prodigy mothership recv-submit reason=%s pendingRecv=%d stream=%p fixedFD=%d fslot=%d rbytes=%zu remaining=%llu\n",
 						(reason ? reason : "unknown"),
 						int(stream->pendingRecv),
 						static_cast<void *>(stream),
@@ -9685,7 +9722,6 @@ public:
 						stream->fslot,
 						size_t(stream->rBuffer.size()),
 						(unsigned long long)stream->rBuffer.remainingCapacity());
-					std::fflush(stderr);
 				}
 
 				bool flushActiveMothershipSendBuffer(Mothership *stream, const char *reason)
@@ -9697,19 +9733,18 @@ public:
 
 					if (stream->wBuffer.size() == 0)
 					{
-						std::fprintf(stderr, "prodigy mothership send-skip reason=%s wbytes=0 active=%d stream=%p fd=%d fslot=%d\n",
+						prodigyRuntimeTrace("prodigy mothership send-skip reason=%s wbytes=0 active=%d stream=%p fd=%d fslot=%d\n",
 							(reason ? reason : "unknown"),
 							int(streamIsActive(stream)),
 							static_cast<void *>(stream),
 							stream->fd,
 							stream->fslot);
-						std::fflush(stderr);
 						return true;
 					}
 
 					if (streamIsActive(stream) == false || Ring::socketIsClosing(stream))
 					{
-						std::fprintf(stderr, "prodigy mothership send-skip reason=%s wbytes=%zu active=%d closing=%d stream=%p fd=%d fslot=%d\n",
+						prodigyRuntimeTrace("prodigy mothership send-skip reason=%s wbytes=%zu active=%d closing=%d stream=%p fd=%d fslot=%d\n",
 							(reason ? reason : "unknown"),
 							size_t(stream->wBuffer.size()),
 							int(streamIsActive(stream)),
@@ -9717,20 +9752,18 @@ public:
 							static_cast<void *>(stream),
 							stream->fd,
 							stream->fslot);
-						std::fflush(stderr);
 						return false;
 					}
 
-					std::fprintf(stderr, "prodigy mothership send-queue reason=%s wbytes=%zu stream=%p fd=%d fslot=%d pendingSend=%d\n",
+					prodigyRuntimeTrace("prodigy mothership send-queue reason=%s wbytes=%zu stream=%p fd=%d fslot=%d pendingSend=%d\n",
 						(reason ? reason : "unknown"),
 						size_t(stream->wBuffer.size()),
 						static_cast<void *>(stream),
 						stream->fd,
 						stream->fslot,
 						int(stream->pendingSend));
-					std::fflush(stderr);
 					Ring::queueSend(stream);
-					std::fprintf(stderr, "prodigy mothership send-submit reason=%s pendingSend=%d pendingSendBytes=%u wbytes=%zu active=%d stream=%p fixedFD=%d fslot=%d\n",
+					prodigyRuntimeTrace("prodigy mothership send-submit reason=%s pendingSend=%d pendingSendBytes=%u wbytes=%zu active=%d stream=%p fixedFD=%d fslot=%d\n",
 						(reason ? reason : "unknown"),
 						int(stream->pendingSend),
 						unsigned(stream->pendingSendBytes),
@@ -9739,7 +9772,6 @@ public:
 						static_cast<void *>(stream),
 						loggableSocketFD(stream),
 						stream->fslot);
-					std::fflush(stderr);
 					return true;
 				}
 
@@ -9774,7 +9806,7 @@ public:
 					bool parseFailed = false;
 					stream->extractMessages<Message>([&] (Message *message) -> void {
 						size_t wBefore = size_t(stream->wBuffer.size());
-						std::fprintf(stderr, "prodigy mothership dispatch-begin source=%s topic=%s(%u) size=%u wBefore=%zu stream=%p fd=%d fslot=%d\n",
+						prodigyRuntimeTrace("prodigy mothership dispatch-begin source=%s topic=%s(%u) size=%u wBefore=%zu stream=%p fd=%d fslot=%d\n",
 							(source ? source : "unknown"),
 							prodigyMothershipTopicName(MothershipTopic(message->topic)),
 							unsigned(message->topic),
@@ -9783,11 +9815,10 @@ public:
 							static_cast<void *>(stream),
 							stream->fd,
 							stream->fslot);
-						std::fflush(stderr);
 
 						mothershipHandler(stream, message);
 						size_t wAfter = size_t(stream->wBuffer.size());
-						std::fprintf(stderr, "prodigy mothership dispatch-end source=%s topic=%s(%u) size=%u wAfter=%zu delta=%lld active=%d pendingSend=%d pendingRecv=%d\n",
+						prodigyRuntimeTrace("prodigy mothership dispatch-end source=%s topic=%s(%u) size=%u wAfter=%zu delta=%lld active=%d pendingSend=%d pendingRecv=%d\n",
 							(source ? source : "unknown"),
 							prodigyMothershipTopicName(MothershipTopic(message->topic)),
 							unsigned(message->topic),
@@ -9797,7 +9828,6 @@ public:
 							int(streamIsActive(stream)),
 							int(stream->pendingSend),
 							int(stream->pendingRecv));
-						std::fflush(stderr);
 					}, true, UINT32_MAX, 16, ProdigyWire::maxControlFrameBytes, parseFailed);
 
 					if (parseFailed)
@@ -9831,14 +9861,13 @@ public:
 						return flushActiveMothershipSendBuffer(stream, source);
 					}
 
-					std::fprintf(stderr, "prodigy mothership send-skip reason=%s wbytes=%zu active=%d stream=%p fd=%d fslot=%d\n",
+					prodigyRuntimeTrace("prodigy mothership send-skip reason=%s wbytes=%zu active=%d stream=%p fd=%d fslot=%d\n",
 						(source ? source : "unknown"),
 						size_t(stream->wBuffer.size()),
 						int(streamIsActive(stream)),
 						static_cast<void *>(stream),
 						stream->fd,
 						stream->fslot);
-					std::fflush(stderr);
 					return streamIsActive(stream);
 				}
 
@@ -9962,7 +9991,7 @@ public:
 
 					if (result > 0)
 					{
-						std::fprintf(stderr,
+						prodigyRuntimeTrace(
 							"prodigy debug brain recv-result private4=%u result=%d fd=%d fslot=%d tls=%d negotiated=%d peerVerified=%d pendingSend=%d pendingRecv=%d queuedBytes=%llu rbytes=%llu\n",
 							brain->private4,
 							result,
@@ -9975,7 +10004,6 @@ public:
 							int(brain->pendingRecv),
 							(unsigned long long)brain->queuedSendOutstandingBytes(),
 							(unsigned long long)brain->rBuffer.outstandingBytes());
-						std::fflush(stderr);
 						const uint64_t remaining = brain->rBuffer.remainingCapacity();
 						if (uint64_t(result) > remaining)
 						{
@@ -10351,7 +10379,7 @@ public:
 					return;
 				}
 				activeMothership->pendingRecv = false;
-					std::fprintf(stderr, "prodigy mothership recv-complete result=%d stream=%p fd=%d fslot=%d isFixed=%d rbytes=%zu wbytes=%zu master=%d\n",
+					prodigyRuntimeTrace("prodigy mothership recv-complete result=%d stream=%p fd=%d fslot=%d isFixed=%d rbytes=%zu wbytes=%zu master=%d\n",
 						result,
 						static_cast<void *>(activeMothership),
 						activeMothership->fd,
@@ -10360,7 +10388,6 @@ public:
 					size_t(activeMothership->rBuffer.size()),
 					size_t(activeMothership->wBuffer.size()),
 					int(weAreMaster));
-					std::fflush(stderr);
 
 					if (result > 0)
 					{
@@ -10378,14 +10405,13 @@ public:
 					{
 						basics_log("mothership stream recv closed result=%d weAreMaster=%d\n", result, int(weAreMaster));
 					}
-						std::fprintf(stderr, "prodigy mothership recv-close result=%d closeCompletion=%d stream=%p fd=%d fslot=%d master=%d\n",
+						prodigyRuntimeTrace("prodigy mothership recv-close result=%d closeCompletion=%d stream=%p fd=%d fslot=%d master=%d\n",
 							result,
 							int(closeCompletion),
 							static_cast<void *>(activeMothership),
 							activeMothership->fd,
 							activeMothership->fslot,
 						int(weAreMaster));
-					std::fflush(stderr);
 						if (weAreMaster && closeCompletion == false)
 						{
 							queueMothershipListenersIfNeeded();
@@ -10487,7 +10513,7 @@ public:
 			if (brains.contains(static_cast<BrainView *>(socket)))
 			{
 				BrainView *brain = static_cast<BrainView *>(socket);
-				std::fprintf(stderr,
+				prodigyRuntimeTrace(
 					"prodigy debug brain send-result private4=%u result=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d tls=%d negotiated=%d peerVerified=%d queuedBytes=%llu wbytes=%u\n",
 					brain->private4,
 					result,
@@ -10500,7 +10526,6 @@ public:
 					int(brain->tlsPeerVerified),
 					(unsigned long long)brain->queuedSendOutstandingBytes(),
 					uint32_t(brain->wBuffer.outstandingBytes()));
-				std::fflush(stderr);
 				if (result <= 0)
 				{
 			basics_log("brain send failed stream=%p private4=%u result=%d isFixed=%d fslot=%d fd=%d updateProdigyState=%u\n",
@@ -10555,7 +10580,7 @@ public:
 				uint32_t submittedBytes = activeMothership->pendingSendBytes;
 				bool pendingSendBefore = activeMothership->pendingSend;
 				sendHandler(activeMothership, result);
-					std::fprintf(stderr, "prodigy mothership send-complete result=%d submittedBytes=%u bytesBefore=%zu bytesAfter=%zu stream=%p fixedFD=%d fslot=%d active=%d pendingSendBefore=%d pendingSendAfter=%d pendingSendBytesAfter=%u\n",
+					prodigyRuntimeTrace("prodigy mothership send-complete result=%d submittedBytes=%u bytesBefore=%zu bytesAfter=%zu stream=%p fixedFD=%d fslot=%d active=%d pendingSendBefore=%d pendingSendAfter=%d pendingSendBytesAfter=%u\n",
 						result,
 						unsigned(submittedBytes),
 						bytesBefore,
@@ -10567,7 +10592,6 @@ public:
 					int(pendingSendBefore),
 					int(activeMothership->pendingSend),
 					unsigned(activeMothership->pendingSendBytes));
-				std::fflush(stderr);
 				closeMothershipAfterSendDrainIfNeeded(activeMothership, "send-complete-drained");
 				if (Ring::socketIsClosing(activeMothership)
 					&& activeMothership->pendingSend == false
@@ -11259,7 +11283,7 @@ bool hasConnectedBrainMajority(void)
 
 		if (reconnectArmedByClose == false && hadRawActiveStream)
 		{
-			std::fprintf(stderr,
+			prodigyRuntimeTrace(
 				"prodigy debug brain reconnect-abandon private4=%u reason=%s accepted=%d connected=%d quarantined=%d fd=%d fslot=%d\n",
 				bv->private4,
 				(forceConnectorOwnership ? "arm-outbound-force" : "arm-outbound"),
@@ -11268,7 +11292,6 @@ bool hasConnectedBrainMajority(void)
 				int(bv->quarantined),
 				bv->fd,
 				bv->fslot);
-			std::fflush(stderr);
 			abandonSocketGeneration(bv);
 		}
 
@@ -11921,15 +11944,25 @@ void brainHandler(BrainView *bv, Message *message)
             }
             break;
          }
+         case BrainTopic::replicateContainerRuntimeReady:
+         {
+            uint128_t containerUUID = 0;
+            Message::extractArg<ArgumentNature::fixed>(args, containerUUID);
+            if (weAreMaster)
+            {
+               noteLocalContainerRuntimeReady(containerUUID);
+            }
+            break;
+         }
          case BrainTopic::replicateMetricsSnapshot:
          {
             String serialized;
             Message::extractToStringView(args, serialized);
 
-            Vector<ProdigyMetricSample> samples;
-            if (BitseryEngine::deserializeSafe(serialized, samples))
+            ProdigyMetricSamplesSnapshot snapshot;
+            if (BitseryEngine::deserializeSafe(serialized, snapshot))
             {
-               metrics.importSamples(samples);
+               metrics.importSamples(snapshot.samples);
                persistLocalRuntimeState();
             }
             break;
@@ -12154,9 +12187,9 @@ void brainHandler(BrainView *bv, Message *message)
                      Message::construct(bv->wBuffer, BrainTopic::replicateMasterAuthorityState, serializedRuntimeState);
                   }
                   {
-                     Vector<ProdigyMetricSample> metricSamples;
-                     metrics.exportSamples(metricSamples);
-                     if (metricSamples.empty() == false)
+                     ProdigyMetricSamplesSnapshot metricSamples;
+                     metrics.exportSamples(metricSamples.samples);
+                     if (metricSamples.samples.empty() == false)
                      {
                         String serializedMetricSamples;
                         BitseryEngine::serialize(serializedMetricSamples, metricSamples);
@@ -12181,14 +12214,13 @@ void brainHandler(BrainView *bv, Message *message)
 				Message::extractArg<ArgumentNature::fixed>(args, bv->version);
 				Message::extractArg<ArgumentNature::fixed>(args, bv->existingMasterUUID);
 				bv->registrationFresh = true;
-				std::fprintf(stderr,
+				prodigyRuntimeTrace(
 					"prodigy debug brain registration private4=%u uuid=%llu boottimens=%ld existingMasterUUID=%llu updateState=%u\n",
 					bv->private4,
 					(unsigned long long)bv->uuid,
 					(long)bv->boottimens,
 					(unsigned long long)bv->existingMasterUUID,
 					unsigned(updateSelfState));
-				std::fflush(stderr);
 				if (updateSelfState == UpdateSelfState::waitingForFollowerReboots ||
 					updateSelfState == UpdateSelfState::waitingForRelinquishEchos)
 				{
@@ -17129,7 +17161,6 @@ addmachines_finalize:
 						ContainerState previousState = container->state;
 						ContainerState uploadedState = plan.state;
 						uint128_t previousPairingAddress = container->pairingAddress();
-						bool replayActivePeerPairings = false;
 
 						if (previousState == ContainerState::healthy && uploadedState == ContainerState::healthy)
 						{
@@ -17139,9 +17170,28 @@ addmachines_finalize:
 								if (updatedAdvertisement != plan.advertisements.end() &&
 								    updatedAdvertisement->second.port != advertisement.port)
 								{
-									replayActivePeerPairings = true;
+									malformedStateUpload = true;
 									break;
 								}
+							}
+
+							if (malformedStateUpload)
+							{
+								break;
+							}
+
+							ContainerView uploadedAddressView = {};
+							uploadedAddressView.addresses = plan.addresses;
+							uploadedAddressView.fragment = plan.fragment;
+							if (neuron->machine)
+							{
+								uploadedAddressView.setMeshAddress(container_network_subnet6, brainConfig.datacenterFragment, neuron->machine->fragment, plan.fragment);
+							}
+
+							if (previousPairingAddress != uploadedAddressView.pairingAddress())
+							{
+								malformedStateUpload = true;
+								break;
 							}
 						}
 
@@ -17188,13 +17238,6 @@ addmachines_finalize:
 						container->shardGroup = plan.shardGroup;
 						container->subscriptions = plan.subscriptions;
 	   				container->advertisements = plan.advertisements;
-						if (previousState == ContainerState::healthy &&
-						    uploadedState == ContainerState::healthy &&
-						    previousPairingAddress != container->pairingAddress())
-						{
-							replayActivePeerPairings = true;
-						}
-
 	   				auto deploymentIt = deployments.find(container->deploymentID);
 						if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
 						{
@@ -17249,11 +17292,6 @@ addmachines_finalize:
 						{
 							container->state = previousState;
 							deployment->containerIsHealthy(container);
-						}
-						else if (replayActivePeerPairings)
-						{
-							container->replayActivePairingsToSelf();
-							container->replayActivePairingsToPeers();
 						}
 					}
 
@@ -17370,6 +17408,13 @@ addmachines_finalize:
 
 					break;
 				}
+            case NeuronTopic::containerRuntimeReady:
+            {
+               uint128_t containerUUID = 0;
+               Message::extractArg<ArgumentNature::fixed>(args, containerUUID);
+               noteLocalContainerRuntimeReady(containerUUID);
+               break;
+            }
 			case NeuronTopic::containerStatistics:
 			{
 				// deploymentID(8) containerUUID(16) sampleTimeMs(8) [metricKey(8) metricValue(8)]...

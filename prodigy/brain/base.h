@@ -22,6 +22,42 @@
 #include <prodigy/transport.tls.h>
 #include <networking/email.client.h>
 #include <networking/reconnector.h>
+#include <cstdlib>
+#include <utility>
+
+static inline bool prodigyRuntimeTraceEnabled(void)
+{
+   static const bool enabled = []() -> bool
+   {
+      if (const char *value = getenv("PRODIGY_RUNTIME_TRACE"); value && value[0] == '1' && value[1] == '\0')
+      {
+         return true;
+      }
+
+      return false;
+   }();
+
+   return enabled;
+}
+
+template <typename... Args>
+static inline void prodigyRuntimeTrace(const char *format, Args&&... args)
+{
+   if (prodigyRuntimeTraceEnabled() == false)
+   {
+      return;
+   }
+
+   if constexpr (sizeof...(args) == 0)
+   {
+      std::fputs(format, stderr);
+   }
+   else
+   {
+      std::fprintf(stderr, format, std::forward<Args>(args)...);
+   }
+   std::fflush(stderr);
+}
 
 class ContainerView;
 class ApplicationDeployment;
@@ -46,6 +82,8 @@ public:
 	bool registrationFresh = false;
 	uint32_t transportEpoch = 0;
 	uint32_t queuedCloseTransportEpoch = 0;
+	bool queuedCloseTransportEpochKnown = false;
+	bool closeCompletionPending = false;
 	uint8_t datacenterFragment = 0;
 
 	uint32_t private4 = 0; // even if it connects to us, allows us to keep it in the brain bin until (if ever) it reconnects to us. then we check the privates
@@ -102,6 +140,8 @@ public:
 	void noteCloseQueuedForCurrentTransport(void)
 	{
 		queuedCloseTransportEpoch = transportEpoch;
+		queuedCloseTransportEpochKnown = true;
+		closeCompletionPending = true;
 	}
 
 	// we need some kind of log to know what updates to replay for slave brains?
@@ -109,7 +149,7 @@ public:
 	{
 		if (canQueueSend() == false)
 		{
-			std::fprintf(stderr,
+			prodigyRuntimeTrace(
 				"prodigy debug brain registration-skip private4=%u connected=%d isFixed=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d closing=%d tls=%d negotiated=%d wbytes=%u\n",
 				private4,
 				int(connected),
@@ -122,7 +162,6 @@ public:
 				int(transportTLSEnabled()),
 				int(isTLSNegotiated()),
 				uint32_t(wBuffer.outstandingBytes()));
-			std::fflush(stderr);
 			return;
 		}
 
@@ -139,7 +178,7 @@ public:
 		Message::finish(wBuffer, headerOffset);
 
 		Ring::queueSend(this);
-		std::fprintf(stderr,
+		prodigyRuntimeTrace(
 			"prodigy debug brain registration-queued private4=%u connected=%d isFixed=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d tls=%d negotiated=%d sendBytes=%u queuedBytes=%llu wbytes=%u\n",
 			private4,
 			int(connected),
@@ -153,7 +192,6 @@ public:
 			unsigned(pendingSendBytes),
 			(unsigned long long)queuedSendOutstandingBytes(),
 			uint32_t(wBuffer.outstandingBytes()));
-		std::fflush(stderr);
 	}
 
 	void sendMasterMissing(void)
@@ -379,6 +417,10 @@ public:
          (void)hardware;
       }
       virtual void noteLocalContainerHealthy(uint128_t containerUUID)
+      {
+         (void)containerUUID;
+      }
+      virtual void noteLocalContainerRuntimeReady(uint128_t containerUUID)
       {
          (void)containerUUID;
       }

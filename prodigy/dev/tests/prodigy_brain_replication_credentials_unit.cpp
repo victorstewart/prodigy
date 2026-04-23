@@ -3149,14 +3149,14 @@ static void testBrainHandlerReplicationPaths(TestSuite& suite)
    suite.expect(brain.masterAuthorityApplyCalls == 1, "replicate_master_authority_ignores_duplicate_state");
    suite.expect(brain.persistCalls == 8, "replicate_master_authority_duplicate_does_not_persist");
 
-   Vector<ProdigyMetricSample> metricSamples;
+   ProdigyMetricSamplesSnapshot metricSamples;
    ProdigyMetricSample metric = {};
    metric.ms = 1700000000000;
    metric.deploymentID = plan.config.deploymentID();
    metric.containerUUID = 0x9911;
    metric.metricKey = ProdigyMetrics::runtimeContainerCpuUtilPctKey();
    metric.value = 87.0f;
-   metricSamples.push_back(metric);
+   metricSamples.samples.push_back(metric);
    {
       String serialized;
       BitseryEngine::serialize(serialized, metricSamples);
@@ -3311,8 +3311,8 @@ static void testReconcileStateReplicatesCredentialAndTlsState(TestSuite& suite)
          String serializedSamples;
          Message::extractToStringView(args, serializedSamples);
 
-         Vector<ProdigyMetricSample> decoded;
-         if (BitseryEngine::deserializeSafe(serializedSamples, decoded) && decoded.size() == 1)
+         ProdigyMetricSamplesSnapshot decoded;
+         if (BitseryEngine::deserializeSafe(serializedSamples, decoded) && decoded.samples.size() == 1)
          {
             foundMetricsSnapshot = true;
          }
@@ -9582,6 +9582,71 @@ static void testNeuronContainerHandlerRelaysHealthyToMasterPeerWithoutBrainStrea
    thisBrain = previousBrain;
 }
 
+static void testNeuronContainerHandlerForwardsRuntimeReadyToBrainWithActiveBrainStream(TestSuite& suite)
+{
+   TestBrain brain = {};
+   NoopBrainIaaS iaas = {};
+   brain.iaas = &iaas;
+   brain.weAreMaster = false;
+
+   BrainBase *previousBrain = thisBrain;
+   thisBrain = &brain;
+
+   BrainView masterPeer = {};
+   masterPeer.isMasterBrain = true;
+   masterPeer.connected = true;
+   masterPeer.isFixedFile = true;
+   masterPeer.fslot = 42;
+   masterPeer.private4 = 0x0A00000B;
+   brain.brains.insert(&masterPeer);
+
+   TestNeuron neuron = {};
+   neuron.seedBrainStreamForTest(false);
+
+   Container container = {};
+   container.plan.uuid = uint128_t(0x5107);
+   container.plan.config.applicationID = 62012;
+   container.plan.config.versionID = 7;
+   container.plan.state = ContainerState::scheduled;
+
+   String buffer = {};
+   Message *message = buildContainerMessage(buffer, ContainerTopic::runtimeReady);
+   neuron.containerHandler(&container, message);
+
+   uint32_t relayedRuntimeReadyFrames = 0;
+   forEachMessageInBuffer(masterPeer.wBuffer, [&] (Message *frame) {
+      suite.expect(BrainTopic(frame->topic) == BrainTopic::replicateContainerRuntimeReady, "neuron_container_runtime_ready_with_brain_stream_relays_brain_topic");
+      if (BrainTopic(frame->topic) != BrainTopic::replicateContainerRuntimeReady)
+      {
+         return;
+      }
+
+      relayedRuntimeReadyFrames += 1;
+   });
+
+   uint32_t forwardedRuntimeReadyFrames = 0;
+   bool sawForwardedUUID = false;
+   forEachMessageInBuffer(neuron.brainOutboundForTest(), [&] (Message *frame) {
+      if (NeuronTopic(frame->topic) != NeuronTopic::containerRuntimeReady)
+      {
+         return;
+      }
+
+      uint8_t *args = frame->args;
+      uint128_t observedUUID = 0;
+      Message::extractArg<ArgumentNature::fixed>(args, observedUUID);
+      forwardedRuntimeReadyFrames += 1;
+      sawForwardedUUID = sawForwardedUUID || (observedUUID == container.plan.uuid);
+   });
+
+   suite.expect(relayedRuntimeReadyFrames == 0, "neuron_container_runtime_ready_with_brain_stream_skips_master_peer_relay");
+   suite.expect(forwardedRuntimeReadyFrames == 1, "neuron_container_runtime_ready_with_brain_stream_keeps_forwarded_control_frame");
+   suite.expect(sawForwardedUUID, "neuron_container_runtime_ready_with_brain_stream_preserves_forwarded_uuid");
+
+   brain.brains.erase(&masterPeer);
+   thisBrain = previousBrain;
+}
+
 static void testNeuronContainerHandlerMarksMasterLocalContainerHealthyWithActiveBrainStream(TestSuite& suite)
 {
    TestBrain brain = {};
@@ -9654,8 +9719,85 @@ static void testNeuronContainerHandlerMarksMasterLocalContainerHealthyWithActive
    suite.expect(view->state == ContainerState::healthy, "neuron_container_healthy_with_brain_stream_marks_master_local_view_healthy");
    suite.expect(deployment.nHealthyBase == 1, "neuron_container_healthy_with_brain_stream_counts_master_local_container_once");
    suite.expect(deployment.waitingOnContainers.size() == 0, "neuron_container_healthy_with_brain_stream_clears_waiters");
-   suite.expect(forwardedHealthyFrames == 1, "neuron_container_healthy_with_brain_stream_keeps_forwarded_brain_frame");
-   suite.expect(sawForwardedUUID, "neuron_container_healthy_with_brain_stream_preserves_forwarded_uuid");
+   suite.expect(forwardedHealthyFrames == 0, "neuron_container_healthy_with_brain_stream_skips_forwarded_brain_frame");
+   suite.expect(sawForwardedUUID == false, "neuron_container_healthy_with_brain_stream_has_no_forwarded_uuid");
+
+   deployment.containers.erase(view);
+   machine.removeContainerIndexEntry(view->deploymentID, view);
+   brain.containers.erase(view->uuid);
+   delete view;
+
+   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
+   brain.deployments.erase(deployment.plan.config.deploymentID());
+   brain.neurons.erase(&machine.neuron);
+   brain.machinesByUUID.erase(machine.uuid);
+   brain.machines.erase(&machine);
+   thisBrain = previousBrain;
+}
+
+static void testNeuronContainerHandlerMarksMasterLocalContainerRuntimeReadyWithActiveBrainStream(TestSuite& suite)
+{
+   TestBrain brain = {};
+   NoopBrainIaaS iaas = {};
+   brain.iaas = &iaas;
+   brain.weAreMaster = true;
+
+   TestNeuron neuron = {};
+   neuron.seedBrainStreamForTest(false);
+
+   BrainBase *previousBrain = thisBrain;
+   thisBrain = &brain;
+
+   Rack rack = {};
+   rack.uuid = 62014;
+
+   Machine machine = {};
+   machine.uuid = uint128_t(0x5107);
+   machine.state = MachineState::healthy;
+   machine.rack = &rack;
+   machine.isThisMachine = true;
+   machine.neuron.machine = &machine;
+   brain.machines.insert(&machine);
+   brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+   brain.neurons.insert(&machine.neuron);
+
+   ApplicationDeployment deployment = {};
+   deployment.plan = makeDeploymentPlan(62014, 1);
+   deployment.state = DeploymentState::deploying;
+   brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+   brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
+
+   Container container = {};
+   container.plan.uuid = uint128_t(0x5108);
+   container.plan.config = deployment.plan.config;
+   container.plan.state = ContainerState::scheduled;
+
+   ContainerView *view = new ContainerView();
+   view->uuid = container.plan.uuid;
+   view->deploymentID = deployment.plan.config.deploymentID();
+   view->applicationID = deployment.plan.config.applicationID;
+   view->machine = &machine;
+   view->lifetime = ApplicationLifetime::base;
+   view->state = ContainerState::scheduled;
+   view->runtimeReady = false;
+   deployment.containers.insert(view);
+   brain.containers.insert_or_assign(view->uuid, view);
+   machine.upsertContainerIndexEntry(view->deploymentID, view);
+
+   String buffer = {};
+   Message *message = buildContainerMessage(buffer, ContainerTopic::runtimeReady);
+   neuron.containerHandler(&container, message);
+
+   uint32_t forwardedRuntimeReadyFrames = 0;
+   forEachMessageInBuffer(neuron.brainOutboundForTest(), [&] (Message *frame) {
+      if (NeuronTopic(frame->topic) == NeuronTopic::containerRuntimeReady)
+      {
+         forwardedRuntimeReadyFrames += 1;
+      }
+   });
+
+   suite.expect(view->runtimeReady, "neuron_container_runtime_ready_with_brain_stream_marks_master_local_view_ready");
+   suite.expect(forwardedRuntimeReadyFrames == 0, "neuron_container_runtime_ready_with_brain_stream_skips_forwarded_control_frame_for_master");
 
    deployment.containers.erase(view);
    machine.removeContainerIndexEntry(view->deploymentID, view);
@@ -10127,7 +10269,7 @@ static void testBrainNeuronStateUploadHealthyContainerClearsWaiters(TestSuite& s
    thisBrain = previousBrain;
 }
 
-static void testBrainNeuronStateUploadHealthyAdvertiserRefreshesPeerPairingsOnPortChange(TestSuite& suite)
+static void testBrainNeuronStateUploadRejectsHealthyAdvertiserPortChange(TestSuite& suite)
 {
    TestBrain brain = {};
    NoopBrainIaaS iaas = {};
@@ -10158,7 +10300,7 @@ static void testBrainNeuronStateUploadHealthyAdvertiserRefreshesPeerPairingsOnPo
 
    constexpr uint64_t service = 0x620450000001ULL;
    constexpr uint16_t initialPort = 19111;
-   constexpr uint16_t refreshedPort = 19404;
+   constexpr uint16_t invalidPort = 19404;
 
    ContainerView *advertiser = new ContainerView();
    advertiser->uuid = uint128_t(0x5408);
@@ -10197,7 +10339,7 @@ static void testBrainNeuronStateUploadHealthyAdvertiserRefreshesPeerPairingsOnPo
    ContainerView updatedSeed = *advertiser;
    updatedSeed.advertisements.insert_or_assign(
       service,
-      Advertisement(service, ContainerState::scheduled, ContainerState::destroying, refreshedPort));
+      Advertisement(service, ContainerState::scheduled, ContainerState::destroying, invalidPort));
    ContainerPlan updatedPlan = updatedSeed.generatePlan(deployment.plan);
    updatedPlan.state = ContainerState::healthy;
 
@@ -10218,17 +10360,17 @@ static void testBrainNeuronStateUploadHealthyAdvertiserRefreshesPeerPairingsOnPo
    brain.neuronHandler(&machine.neuron, message);
 
    suite.expect(
-      subscriber.subscriptionActivateCalls == 1,
-      "brain_neuron_state_upload_refresh_replays_subscription_pairing");
+      subscriber.subscriptionActivateCalls == 0,
+      "brain_neuron_state_upload_rejects_port_change_without_pairing_activate");
    suite.expect(
-      subscriber.lastSubscriptionPort == refreshedPort,
-      "brain_neuron_state_upload_refresh_uses_updated_port");
+      subscriber.lastSubscriptionPort != invalidPort,
+      "brain_neuron_state_upload_rejects_port_change_without_new_port");
    suite.expect(
-      subscriber.lastSubscriptionService == service,
-      "brain_neuron_state_upload_refresh_preserves_service");
+      advertiser->advertisements.at(service).port == initialPort,
+      "brain_neuron_state_upload_rejects_port_change_preserves_current_port");
    suite.expect(
       subscriber.subscriptionDeactivateCalls == 0,
-      "brain_neuron_state_upload_refresh_does_not_spuriously_deactivate");
+      "brain_neuron_state_upload_rejects_port_change_without_deactivate");
 
    deployment.containers.erase(advertiser);
    machine.removeContainerIndexEntry(advertiser->deploymentID, advertiser);
@@ -11790,7 +11932,9 @@ int main(void)
    testNeuronContainerHandlerForwardsHealthyToBrain(suite);
    testNeuronContainerHandlerMarksMasterLocalContainerHealthyWithoutBrainStream(suite);
    testNeuronContainerHandlerRelaysHealthyToMasterPeerWithoutBrainStream(suite);
+   testNeuronContainerHandlerForwardsRuntimeReadyToBrainWithActiveBrainStream(suite);
    testNeuronContainerHandlerMarksMasterLocalContainerHealthyWithActiveBrainStream(suite);
+   testNeuronContainerHandlerMarksMasterLocalContainerRuntimeReadyWithActiveBrainStream(suite);
    testNeuronContainerHandlerForwardsStatisticsToBrain(suite);
    testNeuronHandlerStoresRequestedContainerBlob(suite);
    testNeuronHandlerKillContainerStopsContainerAndEchoesBrain(suite);
@@ -11799,7 +11943,7 @@ int main(void)
    testBrainNeuronHandlerHealthyReplacementPointerClearsEquivalentWaiter(suite);
    testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(suite);
    testBrainNeuronStateUploadHealthyContainerClearsWaiters(suite);
-   testBrainNeuronStateUploadHealthyAdvertiserRefreshesPeerPairingsOnPortChange(suite);
+   testBrainNeuronStateUploadRejectsHealthyAdvertiserPortChange(suite);
    testBrainNeuronStateUploadHealthyReplacementPointerClearsEquivalentWaiter(suite);
    testMachineHealthyClaimWakePreservesTicketOutstandingCount(suite);
    testMachineHealthySkipsScheduledStatelessDonorMoveUntilQuiescent(suite);

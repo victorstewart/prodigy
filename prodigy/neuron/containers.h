@@ -444,8 +444,13 @@ static bool devFakeIPv4ModeEnabled(void)
 }
 #endif
 
-static bool writeProcSysctlValue(const char *path, const char *value)
+static bool writeProcSysctlValue(const char *path, const char *value, int *failureErrno = nullptr)
 {
+   if (failureErrno)
+   {
+      *failureErrno = 0;
+   }
+
    if (path == nullptr || value == nullptr)
    {
       return false;
@@ -454,13 +459,93 @@ static bool writeProcSysctlValue(const char *path, const char *value)
    int fd = open(path, O_WRONLY | O_CLOEXEC);
    if (fd < 0)
    {
+      if (failureErrno)
+      {
+         *failureErrno = errno;
+      }
       return false;
    }
 
    size_t length = strlen(value);
-   bool ok = (write(fd, value, length) == ssize_t(length));
+   ssize_t written = write(fd, value, length);
+   if (written != ssize_t(length) && failureErrno)
+   {
+      *failureErrno = errno != 0 ? errno : EIO;
+   }
+
    close(fd);
-   return ok;
+   return written == ssize_t(length);
+}
+
+static bool enableProdigyTCPFastOpen(int *failureErrno = nullptr)
+{
+   // 519 = 0x1 client + 0x2 server + 0x4 client-without-cookie
+   // + 0x200 server-without-cookie. Aegis service admission depends on
+   // secret/TID bytes arriving as TFO early data, including first contact.
+   return writeProcSysctlValue("/proc/sys/net/ipv4/tcp_fastopen", "519", failureErrno);
+}
+
+static bool enableProdigyTCPFastOpenInNetworkNamespace(int targetNetNSFD, int restoreNetNSFD, String *failureReport = nullptr)
+{
+   // /proc/sys/net resolves through the caller's current network namespace.
+   // Switch only this setup thread, write the per-netns TFO policy, then restore.
+   if (targetNetNSFD < 0)
+   {
+      if (failureReport)
+      {
+         failureReport->assign("tcp_fastopen target netns fd is invalid"_ctv);
+      }
+      return false;
+   }
+
+   if (restoreNetNSFD < 0)
+   {
+      if (failureReport)
+      {
+         failureReport->assign("tcp_fastopen restore netns fd is invalid"_ctv);
+      }
+      return false;
+   }
+
+   if (setns(targetNetNSFD, CLONE_NEWNET) != 0)
+   {
+      if (failureReport)
+      {
+         failureReport->snprintf<"failed to enter tcp_fastopen target netns: {}"_ctv>(String(strerror(errno)));
+      }
+      return false;
+   }
+
+   int failureErrno = 0;
+   bool enabled = enableProdigyTCPFastOpen(&failureErrno);
+
+   if (setns(restoreNetNSFD, CLONE_NEWNET) != 0)
+   {
+      int restoreErrno = errno;
+      basics_log("tcp_fastopen netns restore failed targetFD=%d restoreFD=%d errno=%d(%s)\n",
+         targetNetNSFD,
+         restoreNetNSFD,
+         restoreErrno,
+         strerror(restoreErrno));
+
+      if (failureReport)
+      {
+         failureReport->snprintf<"failed to restore tcp_fastopen caller netns: {}"_ctv>(String(strerror(restoreErrno)));
+      }
+
+      std::abort();
+   }
+
+   if (enabled == false)
+   {
+      if (failureReport)
+      {
+         failureReport->snprintf<"failed to enable tcp_fastopen in target netns: {}"_ctv>(String(strerror(failureErrno)));
+      }
+      return false;
+   }
+
+   return true;
 }
 
 static std::filesystem::path prodigyFilesystemPathFromString(const String& path)
@@ -957,10 +1042,28 @@ public:
    bool restoreNetwork(String *failureReport = nullptr)
    {
       int hostnetnsfd = Filesystem::openFileAt(-1, "/proc/self/ns/net"_ctv, O_RDONLY);
+      if (hostnetnsfd < 0)
+      {
+         if (failureReport) failureReport->snprintf<"failed to open host netns while restoring container {itoa}: {}"_ctv>(plan.uuid, String(strerror(errno)));
+         return false;
+      }
 
       String path;
       path.snprintf<"/proc/{itoa}/ns/net"_ctv>(pid);
       int peernetnsfd = Filesystem::openFileAt(-1, path, O_RDONLY);
+      if (peernetnsfd < 0)
+      {
+         if (failureReport) failureReport->snprintf<"failed to open peer netns while restoring container {itoa}: {}"_ctv>(plan.uuid, String(strerror(errno)));
+         if (hostnetnsfd >= 0) ::close(hostnetnsfd);
+         return false;
+      }
+
+      if (enableProdigyTCPFastOpenInNetworkNamespace(peernetnsfd, hostnetnsfd, failureReport) == false)
+      {
+         if (peernetnsfd >= 0) ::close(peernetnsfd);
+         if (hostnetnsfd >= 0) ::close(hostnetnsfd);
+         return false;
+      }
 
       netdevs.setNames(String{plan.fragment});
       netdevs.peer.moveSocketToNamespace(peernetnsfd, hostnetnsfd);
@@ -1044,6 +1147,16 @@ public:
          if (failureReport) failureReport->snprintf<"failed to open peer netns for container {itoa}: {}"_ctv>(plan.uuid, String(strerror(errno)));
          basics_log("setupNetwork failed uuid=%llu reason=open-peer-netns path=%s errno=%d(%s)\n",
             (unsigned long long)plan.uuid, path.c_str(), errno, strerror(errno));
+         if (hostnetnsfd >= 0) ::close(hostnetnsfd);
+         return false;
+      }
+
+      if (enableProdigyTCPFastOpenInNetworkNamespace(peernetnsfd, hostnetnsfd, failureReport) == false)
+      {
+         basics_log("setupNetwork failed uuid=%llu reason=enable-tcp-fastopen-netns detail=%s\n",
+            (unsigned long long)plan.uuid,
+            failureReport != nullptr ? failureReport->c_str() : "");
+         if (peernetnsfd >= 0) ::close(peernetnsfd);
          if (hostnetnsfd >= 0) ::close(hostnetnsfd);
          return false;
       }
@@ -6580,51 +6693,26 @@ public:
 
    static void seedDynamicData(Container *container)
    {
-      // seed dynamic data to neuron socket
-      // otherwise we need to write 2 pathways in every application to handle dynamic data through main() and neuron socket. this makes more sense
-
       uint32_t advertisementPairingCount = 0;
       uint32_t subscriptionPairingCount = 0;
 
       for (const auto& [secret, pairings] : container->plan.advertisementPairings)
       {
+         (void)secret;
          for (const AdvertisementPairing& pairing : pairings)
          {
+            (void)pairing;
             advertisementPairingCount += 1;
-            String payload;
-            uint16_t applicationID = uint16_t(pairing.service >> 48);
-            if (ProdigyWire::serializeAdvertisementPairingPayload(
-               payload,
-               pairing.secret,
-               pairing.address,
-               pairing.service,
-               applicationID,
-               true))
-            {
-               ProdigyWire::constructPackedFrame(container->wBuffer, ContainerTopic::advertisementPairing, payload);
-            }
          }
       }
 
       for (const auto& [secret, pairings] : container->plan.subscriptionPairings)
       {
+         (void)secret;
          for (const SubscriptionPairing& pairing : pairings)
          {
+            (void)pairing;
             subscriptionPairingCount += 1;
-            // Service encoding carries application prefix in upper 16 bits.
-            uint16_t applicationID = uint16_t(pairing.service >> 48);
-            String payload;
-            if (ProdigyWire::serializeSubscriptionPairingPayload(
-               payload,
-               pairing.secret,
-               pairing.address,
-               pairing.service,
-               pairing.port,
-               applicationID,
-               true))
-            {
-               ProdigyWire::constructPackedFrame(container->wBuffer, ContainerTopic::subscriptionPairing, payload);
-            }
          }
       }
 
@@ -7411,27 +7499,73 @@ public:
          close(startupSync[1]);
          close(socs[0]);
 
+         auto failStartup = [&] (const char *stage, int errorNumber, const String *detail) -> void
+         {
+            String stageText = {};
+            if (stage != nullptr)
+            {
+               stageText.assign(stage);
+            }
+
+            String report = {};
+            report.snprintf<"pre-exec-stage={}\nerrno={itoa}({})\n"_ctv>(
+               stageText,
+               errorNumber,
+               String(strerror(errorNumber)));
+            if (detail != nullptr && detail->size() > 0)
+            {
+               String detailText = {};
+               detailText.append(reinterpret_cast<const char *>(detail->data()), size_t(detail->size()));
+               report.snprintf_add<"detail={}\n"_ctv>(detailText);
+            }
+
+            if (container->rootfsPath.size() > 0)
+            {
+               String bootstagePath = {};
+               bootstagePath.assign(container->rootfsPath);
+               bootstagePath.append("/bootstage.txt"_ctv);
+               Filesystem::openWriteAtClose(-1, bootstagePath, report);
+            }
+
+            basics_log("startContainer pre-exec failure uuid=%llu stage=%s errno=%d(%s) detail=%s\n",
+               (unsigned long long)container->plan.uuid,
+               stageText.c_str(),
+               errorNumber,
+               strerror(errorNumber),
+               detail != nullptr && detail->size() > 0 ? "present" : "");
+
+            _exit(containerStartupFailureExitCode);
+         };
+
          String privilegedFDCloseFailure = {};
          if (closeContainerChildPrivilegedFDs(container, &privilegedFDCloseFailure) == false)
          {
             basics_log("startContainer failed to close inherited privileged fds uuid=%llu reason=%s\n",
                (unsigned long long)container->plan.uuid,
                privilegedFDCloseFailure.c_str());
-            _exit(containerStartupFailureExitCode);
+            failStartup("close-privileged-fds", errno, &privilegedFDCloseFailure);
          }
 
          StartupSyncPayload startupPayload;
          ssize_t startupRead = read(startupSync[0], &startupPayload, sizeof(startupPayload));
+         int startupReadErrno = errno;
          close(startupSync[0]);
          bool childUsesUserNamespace = useUserNamespace;
 
          if (startupRead != ssize_t(sizeof(startupPayload)) || startupPayload.startSignal != 1 || (childUsesUserNamespace && startupPayload.idMapPID <= 0))
          {
-            _exit(containerStartupFailureExitCode);
+            failStartup("startup-sync", startupReadErrno, nullptr);
          }
 
-         setuid(0);
-         setgid(0);
+         if (setgid(0) != 0)
+         {
+            failStartup("setgid", errno, nullptr);
+         }
+
+         if (setuid(0) != 0)
+         {
+            failStartup("setuid", errno, nullptr);
+         }
 
          String noNewPrivsFailure = {};
          if (setContainerNoNewPrivileges(container, &noNewPrivsFailure) == false)
@@ -7439,12 +7573,12 @@ public:
             basics_log("startContainer failed to set no_new_privs uuid=%llu reason=%s\n",
                (unsigned long long)container->plan.uuid,
                noNewPrivsFailure.c_str());
-            _exit(containerStartupFailureExitCode);
+            failStartup("no-new-privs", errno, &noNewPrivsFailure);
          }
 
          if (mountRootFSInCurrentNamespace(container, isRestart, startupPayload.idMapPID) == false)
          {
-            _exit(containerStartupFailureExitCode);
+            failStartup("mount-rootfs", errno, nullptr);
          }
 
          if (sethostname("x", 1) != 0)
@@ -7453,7 +7587,7 @@ public:
                (unsigned long long)container->plan.uuid,
                errno,
                strerror(errno));
-            _exit(containerStartupFailureExitCode);
+            failStartup("sethostname", errno, nullptr);
          }
 
          if (setdomainname("x", 1) != 0)
@@ -7462,7 +7596,7 @@ public:
                (unsigned long long)container->plan.uuid,
                errno,
                strerror(errno));
-            _exit(containerStartupFailureExitCode);
+            failStartup("setdomainname", errno, nullptr);
          }
 
          String policyFailure = {};
@@ -7471,7 +7605,7 @@ public:
             basics_log("startContainer failed to apply post-mount security policy uuid=%llu reason=%s\n",
                (unsigned long long)container->plan.uuid,
                policyFailure.c_str());
-            _exit(containerStartupFailureExitCode);
+            failStartup("post-mount-security-policy", errno, &policyFailure);
          }
 
          if (chdir(container->executeCwd.c_str()) != 0)
@@ -7481,7 +7615,7 @@ public:
                container->executeCwd.c_str(),
                errno,
                strerror(errno));
-            _exit(containerStartupFailureExitCode);
+            failStartup("chdir", errno, nullptr);
          }
 
          int execNeuronFD = socs[1];
@@ -7491,7 +7625,7 @@ public:
             basics_log("startContainer failed to move inherited neuron fd uuid=%llu reason=%s\n",
                (unsigned long long)container->plan.uuid,
                execDescriptorFailure.c_str());
-            _exit(containerStartupFailureExitCode);
+            failStartup("move-neuron-fd", errno, &execDescriptorFailure);
          }
 
          ContainerParameters parameters;
@@ -7578,7 +7712,7 @@ public:
          }
          else if (ProdigyWire::serializeContainerParameters(serializedParameters, parameters) == false)
          {
-            _exit(containerStartupFailureExitCode);
+            failStartup("serialize-container-parameters", errno, nullptr);
          }
 
          int pfd = Memfd::create("container.params"_ctv);
@@ -7595,12 +7729,15 @@ public:
                basics_log("startContainer failed to move inherited params fd uuid=%llu reason=%s\n",
                   (unsigned long long)container->plan.uuid,
                   execDescriptorFailure.c_str());
-               _exit(containerStartupFailureExitCode);
+               failStartup("move-params-fd", errno, &execDescriptorFailure);
             }
 
             String paramsFDText = {};
             paramsFDText.assignItoa(uint64_t(execParamsFD));
-            setenv("PRODIGY_PARAMS_FD", paramsFDText.c_str(), 1);
+            if (setenv("PRODIGY_PARAMS_FD", paramsFDText.c_str(), 1) != 0)
+            {
+               failStartup("setenv-params-fd", errno, nullptr);
+            }
          }
 
          // The parent process is launched under stdbuf in tests, which injects
@@ -7626,7 +7763,7 @@ public:
 
             if (foundEquals == false || equalsIndex == 0)
             {
-               _exit(containerStartupFailureExitCode);
+               failStartup("invalid-env-assignment", 0, &assignment);
             }
 
             String key = {};
@@ -7642,7 +7779,7 @@ public:
                   key.c_str(),
                   errno,
                   strerror(errno));
-               _exit(containerStartupFailureExitCode);
+               failStartup("setenv", errno, &key);
             }
          }
 
@@ -7651,7 +7788,7 @@ public:
             basics_log("startContainer failed to sanitize inherited exec fds uuid=%llu reason=%s\n",
                (unsigned long long)container->plan.uuid,
                execDescriptorFailure.c_str());
-            _exit(containerStartupFailureExitCode);
+            failStartup("sanitize-exec-fds", errno, &execDescriptorFailure);
          }
 
          extern char **environ;
@@ -7672,11 +7809,12 @@ public:
          int usrLdAccess = access("/usr/lib64/ld-linux-x86-64.so.2", R_OK);
          int usrLdAccessErrno = errno;
          execve(argv0, args.data(), environ);
+         int execErrno = errno;
          basics_log("startContainer execve failed uuid=%llu path=%s errno=%d(%s)\n",
             (unsigned long long)container->plan.uuid,
             argv0,
-            errno,
-            strerror(errno));
+            execErrno,
+            strerror(execErrno));
          basics_log("startContainer pre-exec access uuid=%llu bin=%d(%d) ld=%d(%d) usrld=%d(%d)\n",
             (unsigned long long)container->plan.uuid,
             binaryAccess,
@@ -7687,7 +7825,7 @@ public:
             usrLdAccessErrno);
 
          // when PID 1, process only receive receives signals it has set a mask for.... so this doesn't really matter for us?
-         _exit(containerStartupFailureExitCode);
+         failStartup("execve", execErrno, nullptr);
       }
       else // host, clone doesn't return until child calls exec
       {
@@ -7739,6 +7877,31 @@ public:
          }
          else
          {
+            int tcpFastOpenErrno = 0;
+            if (enableProdigyTCPFastOpen(&tcpFastOpenErrno) == false)
+            {
+               if (failureReport)
+               {
+                  failureReport->snprintf<"failed to enable tcp_fastopen in host netns for container {itoa}: {}"_ctv>(
+                     container->plan.uuid,
+                     String(strerror(tcpFastOpenErrno)));
+               }
+
+               close(startupSync[1]);
+               close(socs[0]);
+
+               kill(container->pid, SIGKILL);
+               waitpid(container->pid, nullptr, 0);
+
+               if (container->pidfd > 0)
+               {
+                  close(container->pidfd);
+                  container->pidfd = -1;
+               }
+
+               return false;
+            }
+
             for (const IPPrefix& prefix : container->plan.addresses)
             {
                thisNeuron->eth.addIP(prefix);

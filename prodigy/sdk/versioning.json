@@ -1,0 +1,16 @@
+{
+   "sdkVersion": "1.0.0",
+   "wireSeries": "WIRE_V1",
+   "wireProtocolVersion": 1,
+   "fixtureManifestVersion": 3,
+   "fixtureCorpusVersion": 2,
+   "containerParametersMagic": "PRDPAR01",
+   "credentialBundleMagic": "PRDBUN01",
+   "credentialDeltaMagic": "PRDDEL01",
+   "policy": {
+      "breakingWireChangesRequireNewWireSeries": true,
+      "nonBreakingWireByteChangesRequireWireProtocolVersionBump": true,
+      "fixtureByteChangesRequireFixtureCorpusVersionBump": true,
+      "manifestShapeChangesRequireFixtureManifestVersionBump": true
+   }
+}

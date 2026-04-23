@@ -1,0 +1,21 @@
+{
+  "name": "test-local-3brain",
+  "deploymentMode": "test",
+  "nBrains": 3,
+  "machineSchemas": [
+    {
+      "schema": "test-brain",
+      "kind": "vm",
+      "vmImageURI": "test://netns-local"
+    }
+  ],
+  "test": {
+    "workspaceRoot": "/tmp/nametag-test-local-3brain",
+    "machineCount": 3,
+    "brainBootstrapFamily": "ipv4",
+    "enableFakeIpv4Boundary": false,
+    "host": {
+      "mode": "local"
+    }
+  }
+}

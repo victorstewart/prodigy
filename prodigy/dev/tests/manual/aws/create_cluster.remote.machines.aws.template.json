@@ -1,0 +1,66 @@
+{
+  "name": "aws-adopted-reuse",
+  "deploymentMode": "remote",
+  "provider": "aws",
+  "providerScope": "acct-test/us-east-1",
+  "providerCredentialName": "aws-test",
+  "controls": [
+    {
+      "kind": "unixSocket",
+      "path": "/run/prodigy/control.sock"
+    }
+  ],
+  "nBrains": 1,
+  "machineSchemas": [
+    {
+      "schema": "t3.micro",
+      "kind": "vm",
+      "lifetime": "ondemand",
+      "vmImageURI": "REPLACE_AWS_AMI_ID",
+      "providerMachineType": "t3.micro"
+    }
+  ],
+  "machines": [
+    {
+      "source": "adopted",
+      "backing": "cloud",
+      "kind": "vm",
+      "lifetime": "ondemand",
+      "isBrain": true,
+      "cloud": {
+        "schema": "t3.micro",
+        "providerMachineType": "t3.micro",
+        "cloudID": "REPLACE_EC2_INSTANCE_ID"
+      },
+      "ssh": {
+        "address": "REPLACE_PUBLIC_IP_OR_DNS",
+        "port": 22,
+        "user": "root",
+        "privateKeyPath": "REPLACE_SSH_PRIVATE_KEY_PATH"
+      },
+      "addresses": {
+        "private": [
+          {
+            "address": "REPLACE_PRIVATE_IP",
+            "cidr": 24,
+            "gateway": "REPLACE_PRIVATE_GATEWAY_IP"
+          }
+        ],
+        "public": [
+          {
+            "address": "REPLACE_PUBLIC_IP_OR_DNS",
+            "cidr": 24,
+            "gateway": "REPLACE_PUBLIC_GATEWAY_IP"
+          }
+        ]
+      },
+      "ownership": {
+        "mode": "wholeMachine"
+      }
+    }
+  ],
+  "bootstrapSshUser": "root",
+  "bootstrapSshPrivateKeyPath": "REPLACE_SSH_PRIVATE_KEY_PATH",
+  "remoteProdigyPath": "/root/prodigy",
+  "desiredEnvironment": "aws"
+}

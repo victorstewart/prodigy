@@ -2295,7 +2295,20 @@ protected:
 	            {
 	               if (infop.si_status == containerStartupFailureExitCode)
 	               {
-	                  crashReport.assign("startup failed before exec"_ctv);
+	                  String stagePath;
+	                  stagePath.snprintf<"/containers/{}/bootstage.txt"_ctv>(containerName);
+
+	                  String bootStage;
+	                  Filesystem::openReadAtClose(-1, stagePath, bootStage);
+	                  if (bootStage.size() > 0)
+	                  {
+	                     crashReport.assign("startup failed before exec: "_ctv);
+	                     crashReport.append(bootStage);
+	                  }
+	                  else
+	                  {
+	                     crashReport.assign("startup failed before exec"_ctv);
+	                  }
 	               }
 	               else
 	               {
@@ -2411,6 +2424,30 @@ protected:
 				
 				break;
 			}
+			case ContainerTopic::runtimeReady:
+			{
+            bool controllingBrainActive = (brain != nullptr && streamIsActive(brain));
+            bool handledLocally = (thisBrain != nullptr
+               && (thisBrain->canControlNeurons() || controllingBrainActive == false));
+            if (thisBrain != nullptr)
+            {
+               if (handledLocally)
+               {
+                  thisBrain->noteLocalContainerRuntimeReady(container->plan.uuid);
+               }
+            }
+
+				if (brain && handledLocally == false)
+				{
+					Message::construct(brain->wBuffer, NeuronTopic::containerRuntimeReady, container->plan.uuid);
+					if (controllingBrainActive)
+					{
+						Ring::queueSend(brain);
+					}
+				}
+
+				break;
+			}
 			case ContainerTopic::healthy:
 			{
 				container->plan.state = ContainerState::healthy;
@@ -2434,8 +2471,9 @@ protected:
 				std::fflush(stderr);
 
             bool controllingBrainActive = (brain != nullptr && streamIsActive(brain));
-            if (thisBrain != nullptr
-               && (thisBrain->canControlNeurons() || controllingBrainActive == false))
+            bool handledLocally = (thisBrain != nullptr
+               && (thisBrain->canControlNeurons() || controllingBrainActive == false));
+            if (handledLocally)
             {
                thisBrain->noteLocalContainerHealthy(container->plan.uuid);
             }
@@ -2453,7 +2491,7 @@ protected:
 
 				// Explicitly notify brain that this container passed startup.
 				// Deployment scheduling waits on this signal.
-				if (brain)
+				if (brain && handledLocally == false)
 				{
 					Message::construct(brain->wBuffer, NeuronTopic::containerHealthy, container->plan.uuid);
 					if (controllingBrainActive)

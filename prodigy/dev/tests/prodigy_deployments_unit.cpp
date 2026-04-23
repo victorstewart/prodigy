@@ -86,6 +86,29 @@ public:
    }
 };
 
+class PairingCountingContainerView : public ContainerView
+{
+public:
+   uint32_t advertisementActivations = 0;
+   uint32_t subscriptionActivations = 0;
+
+   void advertisementPairing(uint128_t, uint128_t, uint64_t, uint16_t, bool activate) override
+   {
+      if (activate)
+      {
+         advertisementActivations += 1;
+      }
+   }
+
+   void subscriptionPairing(uint128_t, uint128_t, uint64_t, uint16_t, uint16_t, bool activate) override
+   {
+      if (activate)
+      {
+         subscriptionActivations += 1;
+      }
+   }
+};
+
 class ScopedFreshRing final
 {
 public:
@@ -372,9 +395,151 @@ static bool armNeuronControlStream(Machine& machine, ScopedSocketPair& sockets)
    return machine.neuron.connected;
 }
 
+template <typename Handler>
+static void forEachMessageInBuffer(String& buffer, Handler&& handler)
+{
+   uint8_t *cursor = buffer.data();
+   uint8_t *end = buffer.data() + buffer.size();
+
+   while (cursor < end)
+   {
+      Message *message = reinterpret_cast<Message *>(cursor);
+      if (message->size == 0)
+      {
+         break;
+      }
+
+      handler(message);
+      cursor += message->size;
+   }
+}
+
 int main(void)
 {
    TestSuite suite;
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      ApplicationDeployment deployment;
+      seedCommonPlan(deployment, true);
+      deployment.state = DeploymentState::running;
+
+      PairingCountingContainerView advertiser;
+      PairingCountingContainerView subscriber;
+      const uint64_t service = (uint64_t(777) << 48) | uint64_t(1);
+      const uint16_t port = 9191;
+
+      advertiser.uuid = uint128_t(0x777001);
+      advertiser.deploymentID = deployment.plan.config.deploymentID();
+      advertiser.applicationID = deployment.plan.config.applicationID;
+      advertiser.lifetime = ApplicationLifetime::base;
+      advertiser.state = ContainerState::scheduled;
+      advertiser.advertisements.emplace(service, Advertisement(service, ContainerState::scheduled, ContainerState::destroying, port));
+      advertiser.advertisingOnPorts.insert(port);
+
+      subscriber.uuid = uint128_t(0x777002);
+      subscriber.deploymentID = deployment.plan.config.deploymentID();
+      subscriber.applicationID = deployment.plan.config.applicationID;
+      subscriber.lifetime = ApplicationLifetime::base;
+      subscriber.state = ContainerState::scheduled;
+      subscriber.subscriptions.emplace(service, Subscription(service, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all));
+
+      brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+      deployment.containers.insert(&advertiser);
+      deployment.containers.insert(&subscriber);
+
+      brain.mesh->advertise(service, &advertiser, port, false);
+      brain.mesh->subscribe(service, &subscriber, SubscriptionNature::all, false);
+
+      suite.expect(brain.mesh->pairingSecretFor(&advertiser, &subscriber, service) != 0, "container_healthy_replay_fixture_has_scheduled_pairing");
+      suite.expect(advertiser.advertisementActivations == 1, "container_healthy_replay_fixture_schedules_advertiser_pairing_once");
+      suite.expect(subscriber.subscriptionActivations == 0, "container_healthy_replay_fixture_does_not_notify_subscriber");
+      advertiser.advertisementActivations = 0;
+      subscriber.subscriptionActivations = 0;
+
+      deployment.containerIsHealthy(&subscriber);
+      suite.expect(advertiser.advertisementActivations == 0, "container_healthy_does_not_replay_scheduled_pairing_to_peer");
+      suite.expect(subscriber.subscriptionActivations == 0, "container_healthy_does_not_replay_scheduled_pairing_to_self");
+
+      deployment.containerIsHealthy(&subscriber);
+      suite.expect(advertiser.advertisementActivations == 0, "container_duplicate_healthy_does_not_replay_pairing_to_peer");
+      suite.expect(subscriber.subscriptionActivations == 0, "container_duplicate_healthy_does_not_replay_pairing_to_self");
+
+      deployment.recoverAfterReboot();
+      suite.expect(advertiser.advertisementActivations == 0, "deployment_recover_after_reboot_does_not_replay_pairing_to_peer");
+      suite.expect(subscriber.subscriptionActivations == 0, "deployment_recover_after_reboot_does_not_replay_pairing_to_self");
+
+      brain.deployments.erase(deployment.plan.config.deploymentID());
+      thisBrain = savedBrain;
+   }
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      ApplicationDeployment deployment;
+      seedCommonPlan(deployment, true);
+      deployment.state = DeploymentState::running;
+
+      PairingCountingContainerView advertiser;
+      PairingCountingContainerView subscriber;
+      const uint64_t service = (uint64_t(888) << 48) | uint64_t(2);
+      const uint16_t port = 9292;
+
+      advertiser.uuid = uint128_t(0x888001);
+      advertiser.deploymentID = deployment.plan.config.deploymentID();
+      advertiser.applicationID = deployment.plan.config.applicationID;
+      advertiser.lifetime = ApplicationLifetime::base;
+      advertiser.state = ContainerState::scheduled;
+      advertiser.advertisements.emplace(service, Advertisement(service, ContainerState::scheduled, ContainerState::destroying, port));
+      advertiser.advertisingOnPorts.insert(port);
+
+      subscriber.uuid = uint128_t(0x888002);
+      subscriber.deploymentID = deployment.plan.config.deploymentID();
+      subscriber.applicationID = deployment.plan.config.applicationID;
+      subscriber.lifetime = ApplicationLifetime::base;
+      subscriber.state = ContainerState::scheduled;
+      subscriber.subscriptions.emplace(service, Subscription(service, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all));
+
+      deployment.containers.insert(&advertiser);
+      deployment.containers.insert(&subscriber);
+
+      brain.mesh->advertise(service, &advertiser, port, false);
+      brain.mesh->subscribe(service, &subscriber, SubscriptionNature::all, false);
+
+      suite.expect(brain.mesh->pairingSecretFor(&advertiser, &subscriber, service) != 0, "container_runtime_ready_fixture_has_scheduled_pairing");
+      advertiser.advertisementActivations = 0;
+      subscriber.subscriptionActivations = 0;
+
+      deployment.containerRuntimeReady(&subscriber);
+      suite.expect(subscriber.runtimeReady, "container_runtime_ready_marks_first_peer_ready");
+      suite.expect(advertiser.advertisementActivations == 0, "container_runtime_ready_waits_for_advertiser");
+      suite.expect(subscriber.subscriptionActivations == 0, "container_runtime_ready_waits_for_peer_listener");
+
+      deployment.containerRuntimeReady(&subscriber);
+      suite.expect(advertiser.advertisementActivations == 0, "container_runtime_ready_ignores_duplicate_subscriber");
+      suite.expect(subscriber.subscriptionActivations == 0, "container_runtime_ready_duplicate_subscriber_has_no_subscription");
+
+      deployment.containerRuntimeReady(&advertiser);
+      suite.expect(advertiser.runtimeReady, "container_runtime_ready_marks_second_peer_ready");
+      suite.expect(advertiser.advertisementActivations == 1, "container_runtime_ready_replays_advertiser_pairing_after_both_ready");
+      suite.expect(subscriber.subscriptionActivations == 1, "container_runtime_ready_replays_subscriber_pairing_after_both_ready");
+
+      deployment.containerRuntimeReady(&advertiser);
+      suite.expect(advertiser.advertisementActivations == 1, "container_runtime_ready_ignores_duplicate_advertiser");
+      suite.expect(subscriber.subscriptionActivations == 1, "container_runtime_ready_duplicate_advertiser_has_no_subscription");
+
+      advertiser.runtimeReady = false;
+      deployment.containerRuntimeReady(&advertiser);
+      suite.expect(advertiser.advertisementActivations == 2, "container_runtime_ready_replays_after_restart_reset");
+      suite.expect(subscriber.subscriptionActivations == 2, "container_runtime_ready_replays_subscription_after_restart_reset");
+
+      thisBrain = savedBrain;
+   }
 
    {
       suite.expect(
@@ -2033,6 +2198,27 @@ int main(void)
       suite.expect(
          String::numberFromHexString<uint128_t>("0x25a812f1daecf688fc738a2aa4684e95gg"_ctv) == uint128_t(0),
          "numberFromHexString_uint128_rejects_invalid_hex");
+   }
+
+   {
+      suite.expect(
+         statefulConstructionNeedsSeedingSubscription(DataStrategy::genesis, false) == false,
+         "stateful_seeding_subscription_genesis_without_seeding_always");
+      suite.expect(
+         statefulConstructionNeedsSeedingSubscription(DataStrategy::genesis, true) == false,
+         "stateful_seeding_subscription_genesis_ignores_seeding_always");
+      suite.expect(
+         statefulConstructionNeedsSeedingSubscription(DataStrategy::changelog, false) == false,
+         "stateful_seeding_subscription_changelog_skips_without_seeding_always");
+      suite.expect(
+         statefulConstructionNeedsSeedingSubscription(DataStrategy::changelog, true),
+         "stateful_seeding_subscription_changelog_uses_seeding_always");
+      suite.expect(
+         statefulConstructionNeedsSeedingSubscription(DataStrategy::seeding, false),
+         "stateful_seeding_subscription_seeding_strategy_requires_seeders");
+      suite.expect(
+         statefulConstructionNeedsSeedingSubscription(DataStrategy::sharding, true) == false,
+         "stateful_seeding_subscription_sharding_uses_dedicated_sharding_mesh");
    }
 
    {
@@ -5270,6 +5456,8 @@ int main(void)
          deployment.deploy();
 
          uint32_t queuedMachineCount = 0;
+         uint32_t queuedPairingTopics = 0;
+         uint32_t queuedSpinTopics = 0;
          Machine *queuedMachine = nullptr;
          for (Machine *machine : {&machineA, &machineB, &machineC})
          {
@@ -5278,6 +5466,18 @@ int main(void)
                queuedMachineCount += 1;
                queuedMachine = machine;
             }
+
+            forEachMessageInBuffer(machine->neuron.wBuffer, [&] (Message *message) {
+               NeuronTopic topic = NeuronTopic(message->topic);
+               if (topic == NeuronTopic::advertisementPairing || topic == NeuronTopic::subscriptionPairing)
+               {
+                  queuedPairingTopics += 1;
+               }
+               else if (topic == NeuronTopic::spinContainer)
+               {
+                  queuedSpinTopics += 1;
+               }
+            });
          }
 
          suite.expect(deployment.state == DeploymentState::deploying, "deploy_stateful_initial_schedule_keeps_deployment_deploying_until_health_ack");
@@ -5288,6 +5488,8 @@ int main(void)
          suite.expect(deployment.toSchedule.size() == 0, "deploy_stateful_initial_schedule_drains_construct_queue");
          suite.expect(deployment.schedulingStack.execution != nullptr, "deploy_stateful_initial_schedule_suspends_scheduler_while_waiting_on_health");
          suite.expect(queuedMachineCount == 3, "deploy_stateful_initial_schedule_queues_all_initial_neuron_spins");
+         suite.expect(queuedSpinTopics == 3, "deploy_stateful_initial_schedule_queues_three_spin_messages");
+         suite.expect(queuedPairingTopics == 0, "deploy_stateful_initial_schedule_keeps_startup_pairings_out_of_live_queue");
          suite.expect(queuedMachine != nullptr && queuedMachine->neuron.pendingSendBytes > 0, "deploy_stateful_initial_schedule_marks_neuron_spins_pending_send");
          suite.expect(brain.finCount == 0, "deploy_stateful_initial_schedule_does_not_finish_before_first_health_ack");
          suite.expect(brain.failureCount == 0, "deploy_stateful_initial_schedule_does_not_fail_healthy_fixture");

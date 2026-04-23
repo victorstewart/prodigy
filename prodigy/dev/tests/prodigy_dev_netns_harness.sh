@@ -125,6 +125,27 @@ prodigy_runtime_bundle_path=""
 cluster_link_mtu=9000
 cluster_underlay_mtu=9000
 cluster_overlay_l3_overhead=40
+prodigy_tcp_fastopen_required_bits=$((0x1 | 0x2 | 0x4 | 0x200))
+
+enable_prodigy_tcp_fastopen_netns()
+{
+   if [[ $# -ne 1 ]]
+   then
+      echo "FAIL: enable_prodigy_tcp_fastopen_netns requires a namespace"
+      exit 1
+   fi
+
+   local ns="$1"
+   ip netns exec "${ns}" sysctl -q -w "net.ipv4.tcp_fastopen=${prodigy_tcp_fastopen_required_bits}" >/dev/null
+
+   local observed
+   observed="$(ip netns exec "${ns}" sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo 0)"
+   if (( (observed & prodigy_tcp_fastopen_required_bits) != prodigy_tcp_fastopen_required_bits ))
+   then
+      echo "FAIL: netns ${ns} tcp_fastopen=${observed}, required bits=${prodigy_tcp_fastopen_required_bits}"
+      exit 1
+   fi
+}
 
 set_link_packet_budget()
 {
@@ -2145,6 +2166,7 @@ ln -s "${mothership_socket_path}" "${public_mothership_socket_path}"
 
 ip netns add "${parent_ns}"
 ip netns exec "${parent_ns}" ip link set lo up
+enable_prodigy_tcp_fastopen_netns "${parent_ns}"
 
 parent_ino="$(ip netns exec "${parent_ns}" stat -Lc '%i' /proc/self/ns/net)"
 if [[ "${parent_ino}" == "${host_netns_ino}" ]]
@@ -2167,6 +2189,7 @@ do
    wait "${seed_pid}" 2>/dev/null || true
 
    ip netns exec "${ns}" ip link set lo up
+   enable_prodigy_tcp_fastopen_netns "${ns}"
 done
 
 child_inodes=()

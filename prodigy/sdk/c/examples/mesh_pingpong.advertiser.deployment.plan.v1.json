@@ -1,0 +1,43 @@
+{
+   "config": {
+      "type": "ApplicationType::stateless",
+      "allowedMachineTypes": [
+         "dev-baremetal"
+      ],
+      "preferredMachineTypes": {
+         "MachineLifetime::reserved": "dev-baremetal"
+      },
+      "applicationID": "${application:CMeshPingPongAdvertiser}",
+      "versionID": 1,
+      "filesystemMB": 64,
+      "storageMB": 64,
+      "memoryMB": 128,
+      "nLogicalCores": 1,
+      "nThreads": 1,
+      "msTilHealthy": 10000,
+      "sTilHealthcheck": 15,
+      "sTilKillable": 30
+   },
+   "minimumSubscriberCapacity": 1024,
+   "isStateful": false,
+   "stateless": {
+      "nBase": 1,
+      "maxPerRackRatio": 1.0,
+      "maxPerMachineRatio": 1.0,
+      "moveableDuringCompaction": true
+   },
+   "requiresPublic6": false,
+   "requiresPublic4": false,
+   "useHostNetworkNamespace": false,
+   "subscriptions": [],
+   "advertisements": [
+      {
+         "service": "${service:CMeshPingPongAdvertiser/clients}",
+         "startAt": "ContainerState::scheduled",
+         "stopAt": "ContainerState::destroying",
+         "port": 19121
+      }
+   ],
+   "moveConstructively": true,
+   "requiresDatacenterUniqueTag": false
+}

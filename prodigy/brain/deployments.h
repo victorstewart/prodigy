@@ -1220,6 +1220,28 @@ enum class DataStrategy : uint8_t {
 	sharding
 };
 
+inline bool statefulConstructionNeedsSeedingSubscription(DataStrategy dataStrategy, bool seedingAlways)
+{
+	switch (dataStrategy)
+	{
+		case DataStrategy::changelog:
+		{
+			return seedingAlways;
+		}
+		case DataStrategy::seeding:
+		{
+			return true;
+		}
+		case DataStrategy::none:
+		case DataStrategy::genesis:
+		case DataStrategy::sharding:
+		default:
+		{
+			return false;
+		}
+	}
+}
+
 class StatefulWork : public WorkBase {
 	public:
 
@@ -4281,15 +4303,6 @@ public:
 		nHealthyBase = actualHealthyBase;
 		nHealthySurge = actualHealthySurge;
 
-		for (ContainerView *container : containers)
-		{
-			if (container->state == ContainerState::scheduled || container->state == ContainerState::healthy)
-			{
-				container->replayActivePairingsToSelf();
-				container->replayActivePairingsToPeers();
-			}
-		}
-
 		// Recover underprovisioned deployments after master takeover when machine
 		// registrations arrive after initial evaluateAfterNewMaster() planning.
 		if (nDeployed() < nTarget())
@@ -5436,6 +5449,7 @@ public:
 		{
 			return;
 		}
+		container->runtimeReady = true;
 
 		std::fprintf(stderr,
 			"deployment containerIsHealthy enter deploymentID=%llu appID=%u uuid=%llu stateBefore=%u waitingBefore=%llu nHealthy=%u/%u/%u\n",
@@ -5467,17 +5481,12 @@ public:
 				unsigned(nHealthySurge));
 #endif
 			clearEquivalentHealthyWaiters(container);
-			// Duplicate healthy notifications can occur across reconnect races.
-			// Keep existing pairings warm without replaying state transitions/counters.
-			container->replayActivePairingsToSelf();
 			return;
 		}
 
 		container->state = ContainerState::healthy;
 		handleContainerStateChange(container, true);
 		clearEquivalentHealthyWaiters(container);
-		container->replayActivePairingsToSelf();
-		container->replayActivePairingsToPeers();
 
 		switch (container->lifetime)
 		{
@@ -5576,6 +5585,25 @@ public:
 				}
 			}
 		}
+	}
+
+	void containerRuntimeReady(ContainerView *container)
+	{
+		if (container == nullptr ||
+		    container->state == ContainerState::destroyed ||
+		    container->state == ContainerState::destroying ||
+		    container->state == ContainerState::aboutToDestroy)
+		{
+			return;
+		}
+
+		if (container->runtimeReady)
+		{
+			return;
+		}
+
+		container->runtimeReady = true;
+		container->replayRuntimeReadyPairings();
 	}
 
 	void destructContainer(ContainerView *container)
@@ -5710,6 +5738,8 @@ public:
 
 	void containerFailed(ContainerView *container, int64_t approxTimeMs, int signal, const String& report, bool restarted)
 	{
+		container->runtimeReady = false;
+
 		if (container->state == ContainerState::healthy)
 		{
 			switch (container->lifetime)
@@ -5793,10 +5823,6 @@ public:
 		else
 		{
 			container->state = ContainerState::crashedRestarting;
-			// Keep the restarting container's own pairing view warm so the next
-			// process can seed current dependencies, but do not replay this dead
-			// endpoint back out to peers while the old listener is gone.
-			container->replayActivePairingsToSelf();
 
 			if (plan.isStateful && !plan.stateful.allMasters)
 			{
@@ -5856,7 +5882,7 @@ public:
 
 			Machine *machine = work.machine;
 
-			auto setupContainerServices = [&] (ContainerView *container) -> void {
+				auto setupContainerServices = [&] (ContainerView *container) -> void {
 
 				auto setupAdvertisement = [&] (uint64_t service, ContainerState startAt, ContainerState stopAt, uint16_t port = 0, ServiceUserCapacity userCapacity = {}) -> void {
 
@@ -5914,7 +5940,7 @@ public:
 
 					setupSubscription(roles.sibling, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all);
 
-					if (plan.stateful.seedingAlways)
+					if (statefulConstructionNeedsSeedingSubscription(work.data, plan.stateful.seedingAlways))
 					{
 						setupSubscription(roles.seeding, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all);
 					}
@@ -5925,14 +5951,9 @@ public:
 						{
 							break;
 						}
-						case DataStrategy::changelog: // still give them seeding just in case there is a problem they can start from scratch
-						case DataStrategy::seeding: 
+						case DataStrategy::changelog:
+						case DataStrategy::seeding:
 						{
-							if (plan.stateful.seedingAlways == false)
-							{
-								setupSubscription(roles.seeding, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all);
-							}
-		
 							break;
 						}
 						case DataStrategy::sharding:
@@ -5954,11 +5975,80 @@ public:
 						}
 						case DataStrategy::none: break;
 					}
-				}
-			};
+					}
+				};
 
-			switch (work.lifecycle)
-			{
+				auto prepareScheduledContainer = [&] (ContainerView *container, Machine *targetMachine) -> void {
+					if (container->state == ContainerState::scheduled)
+					{
+						return;
+					}
+
+					container->state = ContainerState::scheduled;
+					container->runtimeReady = false;
+					container->remainingSubscriberCapacity = plan.minimumSubscriberCapacity;
+
+					container->fragment = targetMachine->getContainerFragment();
+					container->setMeshAddress(container_network_subnet6, thisBrain->brainConfig.datacenterFragment, targetMachine->fragment, container->fragment);
+					container->addresses.clear();
+					container->addresses.emplace_back(container->meshAddress, uint8_t(128));
+					container->wormholes = plan.wormholes;
+					container->whiteholes = plan.whiteholes;
+
+					for (Whitehole& whitehole : container->whiteholes)
+					{
+						whitehole.hasAddress = false;
+						whitehole.address = {};
+						whitehole.sourcePort = 0;
+						whitehole.bindingNonce = 0;
+
+						if (resolveWhiteholeSourceAddressForScheduling(targetMachine, whitehole, nullptr, container) == false
+							|| whitehole.hasAddress == false
+							|| allocateWhiteholeSourcePort(targetMachine, container, whitehole) == false)
+						{
+							whitehole.hasAddress = false;
+							whitehole.address = {};
+							whitehole.sourcePort = 0;
+							whitehole.bindingNonce = 0;
+						}
+					}
+
+					setupContainerServices(container);
+				};
+
+				if constexpr (std::is_same_v<T, StatefulWork>)
+				{
+					if (work.lifecycle == LifecycleOp::construct && plan.stateful.allMasters)
+					{
+						Vector<ContainerView *> startupBatchContainers;
+						for (DeploymentWork *queuedWork : toSchedule)
+						{
+							if (StatefulWork *peerWork = std::get_if<StatefulWork>(queuedWork);
+								peerWork && peerWork->lifecycle == LifecycleOp::construct && peerWork->container != nullptr && peerWork->machine != nullptr)
+							{
+								peerWork->container->suppressStartupPairingNotifications = true;
+								startupBatchContainers.push_back(peerWork->container);
+							}
+						}
+
+						for (DeploymentWork *queuedWork : toSchedule)
+						{
+							if (StatefulWork *peerWork = std::get_if<StatefulWork>(queuedWork);
+								peerWork && peerWork->lifecycle == LifecycleOp::construct && peerWork->container != nullptr && peerWork->machine != nullptr)
+							{
+								prepareScheduledContainer(peerWork->container, peerWork->machine);
+							}
+						}
+
+						for (ContainerView *container : startupBatchContainers)
+						{
+							container->suppressStartupPairingNotifications = false;
+						}
+					}
+				}
+
+				switch (work.lifecycle)
+				{
 				case LifecycleOp::updateInPlace:
 				case LifecycleOp::construct:
 				{
@@ -5971,39 +6061,10 @@ public:
 						handleContainerStateChange(replacingContainer, false);
 					}
 
-					ContainerView *container = work.container;
-					
-					container->state = ContainerState::scheduled;
-					container->remainingSubscriberCapacity = plan.minimumSubscriberCapacity;
+						ContainerView *container = work.container;
+						prepareScheduledContainer(container, machine);
 
-					container->fragment = machine->getContainerFragment();
-					container->setMeshAddress(container_network_subnet6, thisBrain->brainConfig.datacenterFragment, machine->fragment, container->fragment);
-					container->addresses.clear();
-					container->addresses.emplace_back(container->meshAddress, uint8_t(128));
-               container->wormholes = plan.wormholes;
-               container->whiteholes = plan.whiteholes;
-
-               for (Whitehole& whitehole : container->whiteholes)
-               {
-                  whitehole.hasAddress = false;
-                  whitehole.address = {};
-                  whitehole.sourcePort = 0;
-                  whitehole.bindingNonce = 0;
-
-                  if (resolveWhiteholeSourceAddressForScheduling(machine, whitehole, nullptr, container) == false
-                     || whitehole.hasAddress == false
-                     || allocateWhiteholeSourcePort(machine, container, whitehole) == false)
-                  {
-                     whitehole.hasAddress = false;
-                     whitehole.address = {};
-                     whitehole.sourcePort = 0;
-                     whitehole.bindingNonce = 0;
-                  }
-               }
-
-					setupContainerServices(container);
-
-							ContainerPlan containerPlan = container->generatePlan(plan, nShardGroups);
+								ContainerPlan containerPlan = container->generatePlan(plan, nShardGroups);
 							thisBrain->applyCredentialsToContainerPlan(plan, *container, containerPlan);
                      NeuronContainerMetricPolicy metricPolicy = deriveNeuronMetricPolicyForDeployment(plan);
 

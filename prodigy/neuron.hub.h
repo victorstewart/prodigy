@@ -389,6 +389,11 @@ public:
 		signalReady();
 	}
 
+	void signalRuntimeReadyToNeuron(void)
+	{
+		(void)queueEmptyFrame(ContainerTopic::runtimeReady);
+	}
+
 	void pushStatisticsToNeuron(void)
 	{
 		String payload;
@@ -480,8 +485,9 @@ public:
 				}
 				case ContainerTopic::pong:
 				case ContainerTopic::healthy:
+				case ContainerTopic::runtimeReady:
 				{
-					// pong/healthy are produced by containers toward neuron, not expected inbound here.
+					// pong/healthy/runtimeReady are produced by containers toward neuron, not expected inbound here.
 					break;
 				}
 				case ContainerTopic::stop:

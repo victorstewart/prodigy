@@ -199,7 +199,7 @@ static void serialize(S&& serializer, ProdigyPersistentBrainSnapshot& snapshot)
    serializer.object(snapshot.topology);
    serializer.object(snapshot.brainConfig);
    serializer.object(snapshot.masterAuthority);
-   serializer.object(snapshot.metricSamples);
+   prodigySerializeMetricSamplesWide(serializer, snapshot.metricSamples);
 }
 
 static inline const char *defaultProdigyPersistentStateDBPath(void)
