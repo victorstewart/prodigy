@@ -532,6 +532,11 @@ private:
 			return;
 		}
 
+		bool advertiserReady = advertiser->readyForPairingNotifications();
+		bool subscriberReady = subscriber->readyForPairingNotifications();
+		bool shouldNotifyAdvertiser = notifyAdvertiser && advertiserReady;
+		bool shouldNotifySubscriber = notifySubscriber && advertiserReady && subscriberReady;
+
 		if (auto existing = pairingSecrets.find(ServicePairing{advertiser, subscriber, service}); existing != pairingSecrets.end())
 		{
 			uint128_t secret = existing->second.secret;
@@ -548,8 +553,8 @@ private:
 			bool hadSubscriberEdge = subscriber->subscribedTo.hasEntryFor(service, advertiser);
 			if (hadAdvertiserEdge == false) advertiser->advertisingTo.insert(service, subscriber);
 			if (hadSubscriberEdge == false) subscriber->subscribedTo.insert(service, advertiser);
-			if (notifyAdvertiser && hadAdvertiserEdge == false) advertiser->advertisementPairing(secret, subscriber->pairingAddress(), service, subscriber->applicationID, true);
-			if (notifySubscriber && hadSubscriberEdge == false) subscriber->subscriptionPairing(secret, advertiser->pairingAddress(), service, advertiserPort, advertiser->applicationID, true);
+			if (shouldNotifyAdvertiser && hadAdvertiserEdge == false) advertiser->advertisementPairing(secret, subscriber->pairingAddress(), service, subscriber->applicationID, true);
+			if (shouldNotifySubscriber && hadSubscriberEdge == false) subscriber->subscriptionPairing(secret, advertiser->pairingAddress(), service, advertiserPort, advertiser->applicationID, true);
 			return;
 		}
 
@@ -562,12 +567,12 @@ private:
 
 		advertiser->advertisingTo.insert(service, subscriber);
 			// secret(16) address(16) service(8) activate(1)
-		if (notifyAdvertiser) advertiser->advertisementPairing(secret, subscriber->pairingAddress(), service, subscriber->applicationID, true);
+		if (shouldNotifyAdvertiser) advertiser->advertisementPairing(secret, subscriber->pairingAddress(), service, subscriber->applicationID, true);
 
 
 		subscriber->subscribedTo.insert(service, advertiser);
 			// secret(16) address(16) service(8) port(2) activate(1)
-		if (notifySubscriber) subscriber->subscriptionPairing(secret, advertiser->pairingAddress(), service, advertiserPort, advertiser->applicationID, true);
+		if (shouldNotifySubscriber) subscriber->subscriptionPairing(secret, advertiser->pairingAddress(), service, advertiserPort, advertiser->applicationID, true);
 
 		// Track 'any' counts incrementally to avoid counting scans during rebalances
 		uint64_t subscriptionService = subscriptionServiceForPairing(subscriber, service);

@@ -17248,12 +17248,18 @@ addmachines_finalize:
 
 						for (const auto& [service, subscription] : container->subscriptions)
 						{
-							mesh->logSubscription(container, subscription.service, subscription.nature);
+							if (serviceBlueprintActiveAtContainerState(subscription, uploadedState))
+							{
+								mesh->logSubscription(container, subscription.service, subscription.nature);
+							}
 						}
 
 						for (const auto& [service, advertisement] : container->advertisements)
 						{
-							mesh->logAdvertisement(container, advertisement.service);
+							if (serviceBlueprintActiveAtContainerState(advertisement, uploadedState))
+							{
+								mesh->logAdvertisement(container, advertisement.service);
+							}
 							container->advertisingOnPorts.insert(advertisement.port);
 						}
 

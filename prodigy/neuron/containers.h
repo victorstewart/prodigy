@@ -40,6 +40,11 @@ static constexpr int containerExecInheritedFDMinimum = 64;
 static constexpr int64_t failedContainerArtifactRetentionMs = 24LL * 60LL * 60LL * 1000LL;
 static constexpr int64_t failedContainerArtifactCleanupIntervalMs = 3LL * 60LL * 60LL * 1000LL;
 
+static inline uint16_t prodigyContainerReservedCoreCount(uint32_t lcoreCount)
+{
+   return (lcoreCount > nReservedCores) ? uint16_t(nReservedCores) : uint16_t(0);
+}
+
 static void prodigyAppendAttachTrace(String& line)
 {
    int fd = ::open("/switchboard.attach.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -5652,16 +5657,17 @@ public:
          }
       }
 
-      thisNeuron->lcoreCount = endIdx + 1; // CPUs are 0-indexed
-      // Initialize all cores as available (0)
-      for (uint16_t i = 0; i < 256; ++i) thisNeuron->lcores[i] = 0;
-      // Reserve the first nReservedCores for the OS by marking them non-zero (unavailable)
-      for (uint16_t i = 0; i < nReservedCores && i < thisNeuron->lcoreCount; ++i) thisNeuron->lcores[i] = 0xFFFF;
+	      thisNeuron->lcoreCount = endIdx + 1; // CPUs are 0-indexed
+	      uint16_t reservedCores = prodigyContainerReservedCoreCount(thisNeuron->lcoreCount);
+	      // Initialize all cores as available (0)
+	      for (uint16_t i = 0; i < 256; ++i) thisNeuron->lcores[i] = 0;
+	      // Reserve the first nReservedCores for the OS by marking them non-zero (unavailable)
+	      for (uint16_t i = 0; i < reservedCores && i < thisNeuron->lcoreCount; ++i) thisNeuron->lcores[i] = 0xFFFF;
 
-      // Remove OS-reserved cores from the containers slice: set e.g. "2-<end>"
-      String cpusRange;
-      uint16_t firstContainerCore = (nReservedCores < thisNeuron->lcoreCount) ? nReservedCores : thisNeuron->lcoreCount - 1;
-      cpusRange.snprintf<"{itoa}-{itoa}"_ctv>(firstContainerCore, endIdx);
+	      // Remove OS-reserved cores from the containers slice: set e.g. "2-<end>"
+	      String cpusRange;
+	      uint16_t firstContainerCore = (reservedCores < thisNeuron->lcoreCount) ? reservedCores : thisNeuron->lcoreCount - 1;
+	      cpusRange.snprintf<"{itoa}-{itoa}"_ctv>(firstContainerCore, endIdx);
       Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/containers.slice/cpuset.cpus"_ctv, cpusRange);
       Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/containers.slice/cpuset.cpus.partition"_ctv, "isolated"_ctv);
       basics_log("seed_root_cgroupv2_subtree_controllers complete range=%s lcoreCount=%u\n", cpusRange.c_str(), unsigned(thisNeuron->lcoreCount));
@@ -5744,11 +5750,12 @@ public:
       Filesystem::openWriteAtClose(middirfd, "cgroup.max.descendants"_ctv, "1"_ctv);
       Filesystem::openWriteAtClose(middirfd, "cgroup.max.depth"_ctv, "1"_ctv);
 
-      if (applicationUsesSharedCPUs(container->plan.config))
-      {
-         uint16_t firstContainerCore = (nReservedCores < thisNeuron->lcoreCount) ? nReservedCores : (thisNeuron->lcoreCount - 1);
-         path.snprintf<"{itoa}-{itoa}"_ctv>(firstContainerCore, uint16_t(thisNeuron->lcoreCount - 1));
-      }
+	      if (applicationUsesSharedCPUs(container->plan.config))
+	      {
+	         uint16_t reservedCores = prodigyContainerReservedCoreCount(thisNeuron->lcoreCount);
+	         uint16_t firstContainerCore = (reservedCores < thisNeuron->lcoreCount) ? reservedCores : (thisNeuron->lcoreCount - 1);
+	         path.snprintf<"{itoa}-{itoa}"_ctv>(firstContainerCore, uint16_t(thisNeuron->lcoreCount - 1));
+	      }
       else
       {
          path.snprintf<"{itoa}-{itoa}"_ctv>(container->lcores[0], container->lcores[container->plan.config.nLogicalCores - 1]);
@@ -5843,7 +5850,8 @@ public:
       span = 0;
 
       // pack them tightly oriented about lower core indexes
-      for (uint16_t index = nReservedCores; index < thisNeuron->lcoreCount; index++)
+	      uint16_t reservedCores = prodigyContainerReservedCoreCount(thisNeuron->lcoreCount);
+	      for (uint16_t index = reservedCores; index < thisNeuron->lcoreCount; index++)
       {
          if (thisNeuron->lcores[index] == 0) // available
          {
@@ -5859,7 +5867,7 @@ public:
          uint16_t holeIndex = 0; // it's never 0 because the bottom logical core is always reserved for the operating system 
 
          // compact leftwise
-         for (uint16_t index = nReservedCores; index < thisNeuron->lcoreCount;)
+	         for (uint16_t index = reservedCores; index < thisNeuron->lcoreCount;)
          {  
             if (thisNeuron->lcores[index] == 0) // hole
             {
@@ -5999,9 +6007,10 @@ public:
             return false;
          }
 
-         String cpuset;
-         uint16_t firstContainerCore = (nReservedCores < thisNeuron->lcoreCount) ? nReservedCores : (thisNeuron->lcoreCount - 1);
-         cpuset.snprintf<"{itoa}-{itoa}"_ctv>(firstContainerCore, uint16_t(thisNeuron->lcoreCount - 1));
+	         String cpuset;
+	         uint16_t reservedCores = prodigyContainerReservedCoreCount(thisNeuron->lcoreCount);
+	         uint16_t firstContainerCore = (reservedCores < thisNeuron->lcoreCount) ? reservedCores : (thisNeuron->lcoreCount - 1);
+	         cpuset.snprintf<"{itoa}-{itoa}"_ctv>(firstContainerCore, uint16_t(thisNeuron->lcoreCount - 1));
          Filesystem::openWriteAtClose(sliceFD, "cpuset.cpus"_ctv, cpuset);
          close(sliceFD);
          return true;

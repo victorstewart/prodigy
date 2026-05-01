@@ -5204,6 +5204,21 @@ public:
    ServiceBlueprint() = default;
 };
 
+static inline bool serviceBlueprintActiveAtContainerState(const ServiceBlueprint& blueprint, ContainerState state)
+{
+   switch (state)
+   {
+      case ContainerState::scheduled:
+      case ContainerState::crashedRestarting:
+         return blueprint.startAt == ContainerState::scheduled;
+      case ContainerState::healthy:
+         return blueprint.startAt == ContainerState::scheduled ||
+                blueprint.startAt == ContainerState::healthy;
+      default:
+         return false;
+   }
+}
+
 template <typename S>
 static void serialize(S&& serializer, ServiceBlueprint& blueprint)
 {

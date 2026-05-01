@@ -374,6 +374,13 @@ int main(void)
    }
 
    {
+      String command = {};
+      prodigyBuildDiskInventoryLsblkCommand(command);
+      suite.expect(prodigyStringContains(command, "lsblk -J -e7 -b"), "disk_inventory_lsblk_excludes_loop_devices");
+      suite.expect(prodigyStringContains(command, "NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,WWN,ROTA,TRAN,LOG-SEC,PHY-SEC,MOUNTPOINTS"), "disk_inventory_lsblk_keeps_required_columns");
+   }
+
+   {
       MachineHardwareProfile hardware = {};
       hardware.cpu.model = "Intel(R) Xeon(R)"_ctv;
       hardware.cpu.logicalCores = 8;

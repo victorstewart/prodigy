@@ -5927,6 +5927,17 @@ static void testNeuronInitialFramesDoNotRequireHardwareProfile(TestSuite& suite)
    suite.expect(hardwareFrames == 0, "neuron_initial_frames_skip_missing_hardware_profile");
 }
 
+static void testNeuronRegistrationBootTimeUsesEpochMs(TestSuite& suite)
+{
+   int64_t beforeMs = Time::now<TimeResolution::ms>();
+   int64_t bootTimeMs = TestNeuron::registrationBootTimeMs();
+   int64_t afterMs = Time::now<TimeResolution::ms>();
+
+   suite.expect(bootTimeMs >= beforeMs, "neuron_registration_boot_time_not_before_epoch_sample");
+   suite.expect(bootTimeMs <= afterMs, "neuron_registration_boot_time_not_after_epoch_sample");
+   suite.expect(bootTimeMs > 1'000'000'000'000LL, "neuron_registration_boot_time_is_epoch_ms_not_uptime_ms");
+}
+
 static void testNeuronInitialFramesDeferAdoptedHardwareProfileUntilBrainStreamReady(TestSuite& suite)
 {
    TestNeuron neuron = {};
@@ -10269,6 +10280,116 @@ static void testBrainNeuronStateUploadHealthyContainerClearsWaiters(TestSuite& s
    thisBrain = previousBrain;
 }
 
+static void testBrainNeuronStateUploadRestoresOnlyActiveMeshServices(TestSuite& suite)
+{
+   TestBrain brain = {};
+   NoopBrainIaaS iaas = {};
+   brain.iaas = &iaas;
+   brain.weAreMaster = true;
+
+   BrainBase *previousBrain = thisBrain;
+   thisBrain = &brain;
+
+   Rack rack = {};
+   rack.uuid = 62043;
+
+   Machine machine = {};
+   machine.uuid = uint128_t(0x5404);
+   machine.state = MachineState::healthy;
+   machine.fragment = 0x1236;
+   machine.rack = &rack;
+   machine.neuron.machine = &machine;
+   brain.machines.insert(&machine);
+   brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+   brain.neurons.insert(&machine.neuron);
+
+   ApplicationDeployment deployment = {};
+   deployment.plan = makeDeploymentPlan(62043, 1);
+   deployment.state = DeploymentState::deploying;
+   brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+   brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
+
+   constexpr uint64_t scheduledService = 0x620430000001ULL;
+   constexpr uint64_t healthyService = 0x620430000002ULL;
+
+   ContainerView seed = {};
+   seed.uuid = uint128_t(0x5405);
+   seed.deploymentID = deployment.plan.config.deploymentID();
+   seed.applicationID = deployment.plan.config.applicationID;
+   seed.machine = &machine;
+   seed.lifetime = ApplicationLifetime::base;
+   seed.state = ContainerState::scheduled;
+   seed.fragment = 12;
+   seed.createdAtMs = 123459;
+   seed.shardGroup = 0;
+   seed.advertisements.insert_or_assign(
+      scheduledService,
+      Advertisement(scheduledService, ContainerState::scheduled, ContainerState::destroying, 19101));
+   seed.advertisements.insert_or_assign(
+      healthyService,
+      Advertisement(healthyService, ContainerState::healthy, ContainerState::destroying, 19102));
+
+   auto uploadPlan = [&] (ContainerPlan& plan) -> void {
+      String uploadBuffer = {};
+      uint32_t headerOffset = Message::appendHeader(uploadBuffer, NeuronTopic::stateUpload);
+      local_container_subnet6 fragment = {};
+      fragment.dpfx = 1;
+      fragment.mpfx[0] = 0x00;
+      fragment.mpfx[1] = 0x12;
+      fragment.mpfx[2] = 0x36;
+      Message::appendAlignedBuffer<Alignment::one>(uploadBuffer, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
+      String serializedPlan = {};
+      BitseryEngine::serialize(serializedPlan, plan);
+      Message::appendValue(uploadBuffer, serializedPlan);
+      Message::finish(uploadBuffer, headerOffset);
+
+      Message *message = reinterpret_cast<Message *>(uploadBuffer.data());
+      brain.neuronHandler(&machine.neuron, message);
+   };
+
+   ContainerPlan scheduledPlan = seed.generatePlan(deployment.plan);
+   scheduledPlan.state = ContainerState::scheduled;
+   uploadPlan(scheduledPlan);
+
+   auto liveIt = brain.containers.find(scheduledPlan.uuid);
+   ContainerView *live = (liveIt != brain.containers.end()) ? liveIt->second : nullptr;
+   suite.expect(live != nullptr, "brain_neuron_state_upload_active_services_tracks_container");
+   suite.expect(
+      live != nullptr && brain.mesh->isAdvertising(scheduledService, live),
+      "brain_neuron_state_upload_restores_scheduled_advertisement");
+   suite.expect(
+      live != nullptr && brain.mesh->isAdvertising(healthyService, live) == false,
+      "brain_neuron_state_upload_does_not_restore_healthy_advertisement_while_scheduled");
+
+   ContainerPlan healthyPlan = seed.generatePlan(deployment.plan);
+   healthyPlan.state = ContainerState::healthy;
+   uploadPlan(healthyPlan);
+
+   liveIt = brain.containers.find(healthyPlan.uuid);
+   live = (liveIt != brain.containers.end()) ? liveIt->second : nullptr;
+   suite.expect(
+      live != nullptr && brain.mesh->isAdvertising(scheduledService, live),
+      "brain_neuron_state_upload_keeps_scheduled_advertisement_when_healthy");
+   suite.expect(
+      live != nullptr && brain.mesh->isAdvertising(healthyService, live),
+      "brain_neuron_state_upload_restores_healthy_advertisement_when_healthy");
+
+   if (live != nullptr)
+   {
+      deployment.containers.erase(live);
+      machine.removeContainerIndexEntry(live->deploymentID, live);
+      brain.containers.erase(live->uuid);
+      delete live;
+   }
+
+   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
+   brain.deployments.erase(deployment.plan.config.deploymentID());
+   brain.neurons.erase(&machine.neuron);
+   brain.machinesByUUID.erase(machine.uuid);
+   brain.machines.erase(&machine);
+   thisBrain = previousBrain;
+}
+
 static void testBrainNeuronStateUploadRejectsHealthyAdvertiserPortChange(TestSuite& suite)
 {
    TestBrain brain = {};
@@ -11893,6 +12014,7 @@ int main(void)
    testPersistentReservedServiceCaptureAndRestore(suite);
    testMothershipReserveServiceTopic(suite);
    testNeuronInitialFramesDoNotRequireHardwareProfile(suite);
+   testNeuronRegistrationBootTimeUsesEpochMs(suite);
    testNeuronInitialFramesDeferAdoptedHardwareProfileUntilBrainStreamReady(suite);
    testNeuronDeferredHardwareInventoryAdoptionRequiresReadySerializedProfile(suite);
    testNeuronDeferredHardwareInventoryWakeAdoptsReadyProfile(suite);
@@ -11943,6 +12065,7 @@ int main(void)
    testBrainNeuronHandlerHealthyReplacementPointerClearsEquivalentWaiter(suite);
    testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(suite);
    testBrainNeuronStateUploadHealthyContainerClearsWaiters(suite);
+   testBrainNeuronStateUploadRestoresOnlyActiveMeshServices(suite);
    testBrainNeuronStateUploadRejectsHealthyAdvertiserPortChange(suite);
    testBrainNeuronStateUploadHealthyReplacementPointerClearsEquivalentWaiter(suite);
    testMachineHealthyClaimWakePreservesTicketOutstandingCount(suite);

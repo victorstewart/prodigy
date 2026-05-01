@@ -2040,10 +2040,15 @@ protected:
 					NeuronBrainControlStream *brain = nullptr;
                bytell_hash_set<NeuronBrainControlStream *> closingBrainControls;
 
+      static int64_t registrationBootTimeMs(void)
+      {
+         return Time::now<TimeResolution::ms>();
+      }
+
 		virtual void boot(void)
 		{
 		loadKernelVersion();
-		bootTimeMs = Time::msSinceBoot();
+		bootTimeMs = registrationBootTimeMs();
 
 		private4.is6 = false;
 		

@@ -153,6 +153,14 @@ public:
 		return count;
 	}
 
+	bool readyForPairingNotifications(void) const override
+	{
+		return runtimeReady
+			&& state != ContainerState::destroyed
+			&& state != ContainerState::destroying
+			&& state != ContainerState::aboutToDestroy;
+	}
+
 	void reconcileMeshAgainstState(bool notifySelf) // called during ContainerState changes
 	{
 		for (const auto& [service, subscription] : subscriptions)
@@ -209,7 +217,6 @@ public:
 					continue;
 				}
 
-				advertiser->advertisementPairing(secret, pairingAddress(), service, applicationID, true);
 				subscriptionPairing(secret, advertiser->pairingAddress(), service, advertisementIt->second.port, advertiser->applicationID, true);
 			}
 		}
@@ -225,7 +232,7 @@ public:
 			for (MeshNode *subscriberNode : subscribers)
 			{
 				ContainerView *subscriber = static_cast<ContainerView *>(subscriberNode);
-				if (subscriber == nullptr || subscriber->runtimeReady == false)
+				if (subscriber == nullptr)
 				{
 					continue;
 				}
@@ -237,7 +244,10 @@ public:
 				}
 
 				advertisementPairing(secret, subscriber->pairingAddress(), service, subscriber->applicationID, true);
-				subscriber->subscriptionPairing(secret, pairingAddress(), service, advertisementIt->second.port, applicationID, true);
+				if (subscriber->runtimeReady)
+				{
+					subscriber->subscriptionPairing(secret, pairingAddress(), service, advertisementIt->second.port, applicationID, true);
+				}
 			}
 		}
 	}
@@ -256,6 +266,11 @@ public:
 			{
 				for (MeshNode *advertiser : advertisers)
 				{
+					if (advertiser == nullptr || advertiser->readyForPairingNotifications() == false)
+					{
+						continue;
+					}
+
 					auto advertisementIt = advertiser->advertisements.find(service);
 					if (advertisementIt == advertiser->advertisements.end())
 					{
@@ -270,6 +285,11 @@ public:
 		{
 			for (MeshNode *subscriber : subscribers)
 			{
+				if (subscriber == nullptr)
+				{
+					continue;
+				}
+
 				plan.advertisementPairings.emplace(service, thisBrain->mesh->pairingSecretFor(this, subscriber, service), subscriber->pairingAddress(), service);
 			}
 		}
