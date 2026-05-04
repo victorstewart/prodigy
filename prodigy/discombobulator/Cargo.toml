@@ -1,0 +1,30 @@
+[package]
+name = "discombobulator"
+version = "0.1.0"
+edition = "2021"
+description = "Prodigy-native container builder"
+license = "Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "discombobulator"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.100"
+base64 = "0.22.1"
+clap = { version = "4.5.48", features = ["derive"] }
+flate2 = "1.1.2"
+hex = "0.4.3"
+metalor = "0.3.0"
+reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+tar = "0.4.44"
+tempfile = "3.23.0"
+walkdir = "2.5.0"
+zstd = "0.13.3"

@@ -12,7 +12,7 @@ shift || true
 
 if [[ -z "${PRODIGY_BIN}" || ! -x "${PRODIGY_BIN}" ]]
 then
-   echo "usage: $0 /path/to/prodigy [--runner-mode=oneshot|persistent] [--workspace-root=/abs/path] [--manifest-path=/abs/path.json] [--machines=COUNT] [--brains=COUNT] [--duration=SECONDS] [--brain-bootstrap-family=ipv4|private6|public6|multihome6] [--inter-container-mtu=BYTES] [--tunnel-ebpf=/path/to/object] [--host-ingress-ebpf=/path/to/object] [--host-egress-ebpf=/path/to/object] [--enable-fake-ipv4-boundary=0|1] [--fake-ipv4-boundary-ebpf=/path/to/object] [--switchboard-gateway-index=INDEX] [--mothership-bin=/path/to/mothership] [--mothership-autoscale-interval-seconds=SECONDS] [--mothership-update-prodigy-input=/path/to/new/prodigy-or-bundle] [--mothership-update-start=SECONDS] [--master-index=0|1|2|3 (deprecated; ignored)] [--fault-mode=link|crash|flap] [--fault-targets=master|deployed|1|2|3|csv] [--fault-start=SECONDS] [--fault-start-on-ready=0|1] [--fault-duration=SECONDS] [--fault-cycles=COUNT] [--fault-down=SECONDS] [--fault-up=SECONDS] [--post-fault-window=SECONDS] [--expect-master-available=0|1] [--expect-master-change=0|1] [--expect-master-change-during-fault=0|1] [--expect-peer-recovery=0|1] [--deploy-plan-json=/path/to/plan.json] [--deploy-container-zstd=/path/to/blob.zst] [--deploy-expect-accept=0|1] [--deploy-expect-text=STRING] [--deploy-second-plan-json=/path/to/plan.json] [--deploy-second-container-zstd=/path/to/blob.zst] [--deploy-second-start=SECONDS] [--deploy-second-expect-accept=0|1] [--deploy-second-expect-text=STRING] [--deploy-third-plan-json=/path/to/plan.json] [--deploy-third-container-zstd=/path/to/blob.zst] [--deploy-third-start=SECONDS] [--deploy-third-expect-accept=0|1] [--deploy-third-expect-text=STRING] [--deploy-ping-port=PORT] [--deploy-ping-payload=STRING] [--deploy-ping-expect=STRING] [--deploy-ping-all=0|1] [--deploy-ping-after-fault=0|1] [--deploy-skip-probe=0|1] [--deploy-report-application=...] [--deploy-report-version-id=ID] [--deploy-report-version-min=0|1] [--deploy-report-attempts=COUNT] [--deploy-report-min-healthy=COUNT] [--deploy-report-max-healthy-min=COUNT] [--deploy-report-final-healthy-max=COUNT] [--deploy-report-min-target=COUNT] [--deploy-report-max-target-min=COUNT] [--deploy-report-final-target-max=COUNT] [--deploy-report-min-shard-groups=COUNT] [--deploy-report-max-shard-groups-min=COUNT] [--deploy-report-final-shard-groups-max=COUNT] [--deploy-report-runtime-cores-min=COUNT] [--deploy-report-runtime-memory-min-mb=COUNT] [--deploy-report-runtime-storage-min-mb=COUNT] [--deploy-report-runtime-cores-max-min=COUNT] [--deploy-report-runtime-memory-max-min-mb=COUNT] [--deploy-report-runtime-storage-max-min-mb=COUNT] [--deploy-report-traffic-burst=COUNT] [--deploy-mesh-mode=any|exclusiveSome|all|radar] [--deploy-mesh-require-all=0|1] [--require-brain-log-substring=TEXT]"
+   echo "usage: $0 /path/to/prodigy [--runner-mode=oneshot|persistent] [--workspace-root=/abs/path] [--manifest-path=/abs/path.json] [--machines=COUNT] [--brains=COUNT] [--test-machine-logical-cores=COUNT] [--test-machine-memory-mb=MB] [--test-machine-storage-mb=MB] [--duration=SECONDS] [--brain-bootstrap-family=ipv4|private6|public6|multihome6] [--inter-container-mtu=BYTES] [--tunnel-ebpf=/path/to/object] [--host-ingress-ebpf=/path/to/object] [--host-egress-ebpf=/path/to/object] [--enable-fake-ipv4-boundary=0|1] [--fake-ipv4-boundary-ebpf=/path/to/object] [--switchboard-gateway-index=INDEX] [--mothership-bin=/path/to/mothership] [--mothership-autoscale-interval-seconds=SECONDS] [--mothership-update-prodigy-input=/path/to/new/prodigy-or-bundle] [--mothership-update-start=SECONDS] [--master-index=0|1|2|3 (deprecated; ignored)] [--fault-mode=link|crash|flap] [--fault-targets=master|deployed|1|2|3|csv] [--fault-start=SECONDS] [--fault-start-on-ready=0|1] [--fault-duration=SECONDS] [--fault-cycles=COUNT] [--fault-down=SECONDS] [--fault-up=SECONDS] [--post-fault-window=SECONDS] [--fault-master-change-budget-ms=MS] [--update-master-change-budget-ms=MS] [--update-order-budget-ms=MS] [--expect-master-available=0|1] [--expect-master-change=0|1] [--expect-master-change-during-fault=0|1] [--expect-peer-recovery=0|1] [--deploy-plan-json=/path/to/plan.json] [--deploy-container-zstd=/path/to/blob.zst] [--deploy-expect-accept=0|1] [--deploy-expect-text=STRING] [--deploy-second-plan-json=/path/to/plan.json] [--deploy-second-container-zstd=/path/to/blob.zst] [--deploy-second-start=SECONDS] [--deploy-second-expect-accept=0|1] [--deploy-second-expect-text=STRING] [--deploy-third-plan-json=/path/to/plan.json] [--deploy-third-container-zstd=/path/to/blob.zst] [--deploy-third-start=SECONDS] [--deploy-third-expect-accept=0|1] [--deploy-third-expect-text=STRING] [--deploy-ping-port=PORT] [--deploy-ping-payload=STRING] [--deploy-ping-expect=STRING] [--deploy-ping-all=0|1] [--deploy-ping-after-fault=0|1] [--deploy-skip-probe=0|1] [--deploy-report-application=...] [--deploy-report-version-id=ID] [--deploy-report-version-min=0|1] [--deploy-report-attempts=COUNT] [--deploy-report-min-healthy=COUNT] [--deploy-report-max-healthy-min=COUNT] [--deploy-report-final-healthy-min=COUNT] [--deploy-report-final-healthy-max=COUNT] [--deploy-report-min-target=COUNT] [--deploy-report-max-target-min=COUNT] [--deploy-report-final-target-max=COUNT] [--deploy-report-min-deployed=COUNT] [--deploy-report-max-deployed-min=COUNT] [--deploy-report-final-deployed-max=COUNT] [--deploy-report-min-shard-groups=COUNT] [--deploy-report-max-shard-groups-min=COUNT] [--deploy-report-final-shard-groups-max=COUNT] [--deploy-report-max-crashes-max=COUNT] [--deploy-report-runtime-cores-min=COUNT] [--deploy-report-runtime-memory-min-mb=COUNT] [--deploy-report-runtime-storage-min-mb=COUNT] [--deploy-report-runtime-cores-max-min=COUNT] [--deploy-report-runtime-memory-max-min-mb=COUNT] [--deploy-report-runtime-storage-max-min-mb=COUNT] [--deploy-report-require-scaler=NAME] [--deploy-report-require-scaler-value-min=VALUE] [--deploy-report-traffic-burst=COUNT] [--deploy-mesh-mode=any|exclusiveSome|all|radar] [--deploy-mesh-require-all=0|1] [--require-brain-log-substring=TEXT]"
    echo "note: for a persistent fake cluster managed by Mothership, prefer 'mothership createCluster' with deploymentMode=test; invoke this harness directly only for low-level debugging or harness-focused test flows"
    exit 2
 fi
@@ -24,11 +24,27 @@ then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PRODIGY_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+REPO_WORK_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+PRODIGY_ROOT="${REPO_WORK_ROOT}"
+source "${SCRIPT_DIR}/prodigy_dev_discombobulator_artifact_helpers.sh"
+HARNESS_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+
+if [[ "${PRODIGY_DEV_NETNS_HARNESS_MOUNT_NS_READY:-0}" != "1" ]]
+then
+   exec unshare -m -- bash -lc '
+      set -euo pipefail
+      mount --make-rprivate /
+      export PRODIGY_DEV_NETNS_HARNESS_MOUNT_NS_READY=1
+      exec "$@"
+   ' _ bash "${HARNESS_SELF}" "${PRODIGY_BIN}" "$@"
+fi
 
 runner_mode="oneshot"
 brains=3
 machines=3
+test_machine_logical_cores="${PRODIGY_DEV_TEST_MACHINE_LOGICAL_CORES:-8}"
+test_machine_memory_mb="${PRODIGY_DEV_TEST_MACHINE_MEMORY_MB:-16384}"
+test_machine_storage_mb="${PRODIGY_DEV_TEST_MACHINE_STORAGE_MB:-262144}"
 duration_s=10
 brain_bootstrap_family="${PRODIGY_DEV_BRAIN_BOOTSTRAP_FAMILY:-ipv4}"
 workspace_root=""
@@ -46,6 +62,12 @@ mothership_bin=""
 mothership_autoscale_interval_seconds=180
 mothership_update_prodigy_input=""
 mothership_update_start_s=2
+os_update_restart_on_command="${PRODIGY_DEV_OS_UPDATE_RESTART_ON_COMMAND:-0}"
+os_update_command_timeout_s="${PRODIGY_DEV_OS_UPDATE_COMMAND_TIMEOUT_S:-90}"
+os_update_rollout_timeout_s="${PRODIGY_DEV_OS_UPDATE_ROLLOUT_TIMEOUT_S:-}"
+dev_os_release_id="${PRODIGY_DEV_TEST_OS_RELEASE_ID:-}"
+dev_os_release_version_id="${PRODIGY_DEV_TEST_OS_RELEASE_VERSION_ID:-}"
+dev_os_update_cadence_ms="${PRODIGY_DEV_OS_UPDATE_CADENCE_MS:-}"
 master_index=0
 fault_mode="link"
 fault_targets=""
@@ -56,10 +78,15 @@ fault_cycles=0
 fault_down_s=1
 fault_up_s=1
 post_fault_window_s=8
+persistent_ready_attempts="${PRODIGY_DEV_PERSISTENT_READY_ATTEMPTS:-600}"
+fault_master_change_budget_ms="${PRODIGY_DEV_FAULT_MASTER_CHANGE_BUDGET_MS:-9000}"
+update_master_change_budget_ms="${PRODIGY_DEV_UPDATE_MASTER_CHANGE_BUDGET_MS:-15000}"
+update_order_budget_ms="${PRODIGY_DEV_UPDATE_ORDER_BUDGET_MS:-15000}"
 expect_master_available=-1
 expect_master_change=-1
 expect_master_change_during_fault=-1
 expect_peer_recovery=-1
+expect_full_brain_registration=0
 deploy_plan_json=""
 deploy_container_zstd=""
 deploy_expect_accept=1
@@ -91,20 +118,28 @@ deploy_report_version_min=0
 deploy_report_attempts=180
 deploy_report_min_healthy=0
 deploy_report_max_healthy_min=0
+deploy_report_final_healthy_min=0
 deploy_report_final_healthy_max=-1
 deploy_report_min_target=0
 deploy_report_max_target_min=0
 deploy_report_final_target_max=-1
+deploy_report_min_deployed=0
+deploy_report_max_deployed_min=0
+deploy_report_final_deployed_max=-1
 deploy_report_min_shard_groups=0
 deploy_report_max_shard_groups_min=0
 deploy_report_final_shard_groups_max=-1
+deploy_report_max_crashes_max=-1
 deploy_report_runtime_cores_min=0
 deploy_report_runtime_memory_min_mb=0
 deploy_report_runtime_storage_min_mb=0
 deploy_report_runtime_cores_max_min=0
 deploy_report_runtime_memory_max_min_mb=0
 deploy_report_runtime_storage_max_min_mb=0
+deploy_report_require_scaler=""
+deploy_report_require_scaler_value_min=0
 deploy_report_traffic_burst=1
+deploy_report_traffic_discovery_attempts="${PRODIGY_DEV_DEPLOY_REPORT_TRAFFIC_DISCOVERY_ATTEMPTS:-30}"
 deploy_report_success_hold_ms="${PRODIGY_DEV_DEPLOY_REPORT_SUCCESS_HOLD_MS:-2500}"
 deploy_report_floor_min_runtime_ms="${PRODIGY_DEV_DEPLOY_REPORT_FLOOR_MIN_RUNTIME_MS:-12000}"
 deploy_report_poll_interval_ms="${PRODIGY_DEV_DEPLOY_REPORT_POLL_INTERVAL_MS:-300}"
@@ -174,6 +209,15 @@ do
       --brains=*)
          brains="${1#*=}"
          ;;
+      --test-machine-logical-cores=*)
+         test_machine_logical_cores="${1#*=}"
+         ;;
+      --test-machine-memory-mb=*)
+         test_machine_memory_mb="${1#*=}"
+         ;;
+      --test-machine-storage-mb=*)
+         test_machine_storage_mb="${1#*=}"
+         ;;
       --duration=*)
          duration_s="${1#*=}"
          ;;
@@ -213,6 +257,15 @@ do
       --mothership-update-start=*)
          mothership_update_start_s="${1#*=}"
          ;;
+      --os-update-restart-on-command=*)
+         os_update_restart_on_command="${1#*=}"
+         ;;
+      --os-update-command-timeout=*)
+         os_update_command_timeout_s="${1#*=}"
+         ;;
+      --os-update-rollout-timeout=*)
+         os_update_rollout_timeout_s="${1#*=}"
+         ;;
       --master-index=*)
          master_index="${1#*=}"
          ;;
@@ -243,6 +296,15 @@ do
       --post-fault-window=*)
          post_fault_window_s="${1#*=}"
          ;;
+      --fault-master-change-budget-ms=*)
+         fault_master_change_budget_ms="${1#*=}"
+         ;;
+      --update-master-change-budget-ms=*)
+         update_master_change_budget_ms="${1#*=}"
+         ;;
+      --update-order-budget-ms=*)
+         update_order_budget_ms="${1#*=}"
+         ;;
       --expect-master-available=*)
          expect_master_available="${1#*=}"
          ;;
@@ -254,6 +316,9 @@ do
          ;;
       --expect-peer-recovery=*)
          expect_peer_recovery="${1#*=}"
+         ;;
+      --expect-full-brain-registration=*)
+         expect_full_brain_registration="${1#*=}"
          ;;
       --deploy-plan-json=*)
          deploy_plan_json="${1#*=}"
@@ -336,6 +401,9 @@ do
       --deploy-report-max-healthy-min=*)
          deploy_report_max_healthy_min="${1#*=}"
          ;;
+      --deploy-report-final-healthy-min=*)
+         deploy_report_final_healthy_min="${1#*=}"
+         ;;
       --deploy-report-final-healthy-max=*)
          deploy_report_final_healthy_max="${1#*=}"
          ;;
@@ -348,6 +416,15 @@ do
       --deploy-report-final-target-max=*)
          deploy_report_final_target_max="${1#*=}"
          ;;
+      --deploy-report-min-deployed=*)
+         deploy_report_min_deployed="${1#*=}"
+         ;;
+      --deploy-report-max-deployed-min=*)
+         deploy_report_max_deployed_min="${1#*=}"
+         ;;
+      --deploy-report-final-deployed-max=*)
+         deploy_report_final_deployed_max="${1#*=}"
+         ;;
       --deploy-report-min-shard-groups=*)
          deploy_report_min_shard_groups="${1#*=}"
          ;;
@@ -356,6 +433,9 @@ do
          ;;
       --deploy-report-final-shard-groups-max=*)
          deploy_report_final_shard_groups_max="${1#*=}"
+         ;;
+      --deploy-report-max-crashes-max=*)
+         deploy_report_max_crashes_max="${1#*=}"
          ;;
       --deploy-report-runtime-cores-min=*)
          deploy_report_runtime_cores_min="${1#*=}"
@@ -374,6 +454,12 @@ do
          ;;
       --deploy-report-runtime-storage-max-min-mb=*)
          deploy_report_runtime_storage_max_min_mb="${1#*=}"
+         ;;
+      --deploy-report-require-scaler=*)
+         deploy_report_require_scaler="${1#*=}"
+         ;;
+      --deploy-report-require-scaler-value-min=*)
+         deploy_report_require_scaler_value_min="${1#*=}"
          ;;
       --deploy-report-traffic-burst=*)
          deploy_report_traffic_burst="${1#*=}"
@@ -420,6 +506,24 @@ fi
 if ! [[ "${brains}" =~ ^[0-9]+$ ]]
 then
    echo "FAIL: --brains must be an integer"
+   exit 1
+fi
+
+if ! [[ "${test_machine_logical_cores}" =~ ^[0-9]+$ ]] || [[ "${test_machine_logical_cores}" -le 0 ]]
+then
+   echo "FAIL: --test-machine-logical-cores must be a positive integer"
+   exit 1
+fi
+
+if ! [[ "${test_machine_memory_mb}" =~ ^[0-9]+$ ]] || [[ "${test_machine_memory_mb}" -le 0 ]]
+then
+   echo "FAIL: --test-machine-memory-mb must be a positive integer"
+   exit 1
+fi
+
+if ! [[ "${test_machine_storage_mb}" =~ ^[0-9]+$ ]] || [[ "${test_machine_storage_mb}" -le 0 ]]
+then
+   echo "FAIL: --test-machine-storage-mb must be a positive integer"
    exit 1
 fi
 
@@ -554,6 +658,24 @@ then
    exit 1
 fi
 
+if ! [[ "${fault_master_change_budget_ms}" =~ ^[0-9]+$ ]]
+then
+   echo "FAIL: --fault-master-change-budget-ms must be an integer number of milliseconds"
+   exit 1
+fi
+
+if ! [[ "${update_master_change_budget_ms}" =~ ^[0-9]+$ ]]
+then
+   echo "FAIL: --update-master-change-budget-ms must be an integer number of milliseconds"
+   exit 1
+fi
+
+if ! [[ "${update_order_budget_ms}" =~ ^[0-9]+$ ]]
+then
+   echo "FAIL: --update-order-budget-ms must be an integer number of milliseconds"
+   exit 1
+fi
+
 if [[ -n "${mothership_bin}" && ! -x "${mothership_bin}" ]]
 then
    echo "FAIL: --mothership-bin is not executable: ${mothership_bin}"
@@ -581,6 +703,47 @@ fi
 if [[ "${mothership_autoscale_interval_seconds}" -le 0 || "${mothership_autoscale_interval_seconds}" -gt 86400 ]]
 then
    echo "FAIL: --mothership-autoscale-interval-seconds must be in 1..86400"
+   exit 1
+fi
+
+if [[ "${os_update_restart_on_command}" != "0" && "${os_update_restart_on_command}" != "1" ]]
+then
+   echo "FAIL: --os-update-restart-on-command must be 0 or 1"
+   exit 1
+fi
+
+if ! [[ "${os_update_command_timeout_s}" =~ ^[0-9]+$ ]] || [[ "${os_update_command_timeout_s}" -le 0 ]]
+then
+   echo "FAIL: --os-update-command-timeout must be a positive integer number of seconds"
+   exit 1
+fi
+
+if [[ -z "${os_update_rollout_timeout_s}" ]]
+then
+   os_update_rollout_timeout_s=$((os_update_command_timeout_s * brains))
+fi
+
+if ! [[ "${os_update_rollout_timeout_s}" =~ ^[0-9]+$ ]] || [[ "${os_update_rollout_timeout_s}" -le 0 ]]
+then
+   echo "FAIL: --os-update-rollout-timeout must be a positive integer number of seconds"
+   exit 1
+fi
+
+if [[ "${os_update_restart_on_command}" == "1" && -z "${mothership_bin}" ]]
+then
+   echo "FAIL: --os-update-restart-on-command requires --mothership-bin"
+   exit 1
+fi
+
+if [[ "${os_update_restart_on_command}" == "1" && -z "${PRODIGY_DEV_CONFIGURE_TARGET_OS_VERSION_ID:-}" ]]
+then
+   echo "FAIL: --os-update-restart-on-command requires PRODIGY_DEV_CONFIGURE_TARGET_OS_VERSION_ID"
+   exit 1
+fi
+
+if [[ -n "${dev_os_update_cadence_ms}" ]] && ! [[ "${dev_os_update_cadence_ms}" =~ ^[0-9]+$ ]]
+then
+   echo "FAIL: PRODIGY_DEV_OS_UPDATE_CADENCE_MS must be an integer number of milliseconds"
    exit 1
 fi
 
@@ -715,6 +878,12 @@ fi
 if [[ "${expect_peer_recovery}" != "-1" && "${expect_peer_recovery}" != "0" && "${expect_peer_recovery}" != "1" ]]
 then
    echo "FAIL: --expect-peer-recovery must be 0 or 1"
+   exit 1
+fi
+
+if [[ "${expect_full_brain_registration}" != "0" && "${expect_full_brain_registration}" != "1" ]]
+then
+   echo "FAIL: --expect-full-brain-registration must be 0 or 1"
    exit 1
 fi
 
@@ -906,6 +1075,12 @@ fi
       exit 1
    fi
 
+   if ! [[ "${deploy_report_final_healthy_min}" =~ ^[0-9]+$ ]]
+   then
+      echo "FAIL: --deploy-report-final-healthy-min must be an integer >= 0"
+      exit 1
+   fi
+
    if [[ "${deploy_report_final_healthy_max}" != "-1" ]] && ! [[ "${deploy_report_final_healthy_max}" =~ ^[0-9]+$ ]]
    then
       echo "FAIL: --deploy-report-final-healthy-max must be -1 or an integer >= 0"
@@ -921,6 +1096,12 @@ fi
    if [[ "${deploy_report_final_healthy_max}" != "-1" && -z "${deploy_report_application}" ]]
    then
       echo "FAIL: --deploy-report-final-healthy-max requires --deploy-report-application"
+      exit 1
+   fi
+
+   if [[ "${deploy_report_final_healthy_min}" -gt 0 && -z "${deploy_report_application}" ]]
+   then
+      echo "FAIL: --deploy-report-final-healthy-min > 0 requires --deploy-report-application"
       exit 1
    fi
 
@@ -948,6 +1129,24 @@ fi
       exit 1
    fi
 
+   if ! [[ "${deploy_report_min_deployed}" =~ ^[0-9]+$ ]]
+   then
+      echo "FAIL: --deploy-report-min-deployed must be an integer >= 0"
+      exit 1
+   fi
+
+   if ! [[ "${deploy_report_max_deployed_min}" =~ ^[0-9]+$ ]]
+   then
+      echo "FAIL: --deploy-report-max-deployed-min must be an integer >= 0"
+      exit 1
+   fi
+
+   if [[ "${deploy_report_final_deployed_max}" != "-1" ]] && ! [[ "${deploy_report_final_deployed_max}" =~ ^[0-9]+$ ]]
+   then
+      echo "FAIL: --deploy-report-final-deployed-max must be -1 or an integer >= 0"
+      exit 1
+   fi
+
    if ! [[ "${deploy_report_min_shard_groups}" =~ ^[0-9]+$ ]]
    then
       echo "FAIL: --deploy-report-min-shard-groups must be an integer >= 0"
@@ -963,6 +1162,12 @@ fi
    if [[ "${deploy_report_final_shard_groups_max}" != "-1" ]] && ! [[ "${deploy_report_final_shard_groups_max}" =~ ^[0-9]+$ ]]
    then
       echo "FAIL: --deploy-report-final-shard-groups-max must be -1 or an integer >= 0"
+      exit 1
+   fi
+
+   if [[ "${deploy_report_max_crashes_max}" != "-1" ]] && ! [[ "${deploy_report_max_crashes_max}" =~ ^[0-9]+$ ]]
+   then
+      echo "FAIL: --deploy-report-max-crashes-max must be -1 or an integer >= 0"
       exit 1
    fi
 
@@ -1008,6 +1213,12 @@ fi
       exit 1
    fi
 
+   if ! [[ "${deploy_report_traffic_discovery_attempts}" =~ ^[0-9]+$ ]] || [[ "${deploy_report_traffic_discovery_attempts}" -le 0 ]]
+   then
+      echo "FAIL: PRODIGY_DEV_DEPLOY_REPORT_TRAFFIC_DISCOVERY_ATTEMPTS must be a positive integer"
+      exit 1
+   fi
+
    if ! [[ "${deploy_report_success_hold_ms}" =~ ^[0-9]+$ ]]
    then
       echo "FAIL: --deploy-report-success-hold-ms must be an integer >= 0"
@@ -1050,6 +1261,24 @@ fi
       exit 1
    fi
 
+   if [[ "${deploy_report_min_deployed}" -gt 0 && -z "${deploy_report_application}" ]]
+   then
+      echo "FAIL: --deploy-report-min-deployed > 0 requires --deploy-report-application"
+      exit 1
+   fi
+
+   if [[ "${deploy_report_max_deployed_min}" -gt 0 && -z "${deploy_report_application}" ]]
+   then
+      echo "FAIL: --deploy-report-max-deployed-min > 0 requires --deploy-report-application"
+      exit 1
+   fi
+
+   if [[ "${deploy_report_final_deployed_max}" != "-1" && -z "${deploy_report_application}" ]]
+   then
+      echo "FAIL: --deploy-report-final-deployed-max requires --deploy-report-application"
+      exit 1
+   fi
+
    if [[ "${deploy_report_min_shard_groups}" -gt 0 && -z "${deploy_report_application}" ]]
    then
       echo "FAIL: --deploy-report-min-shard-groups > 0 requires --deploy-report-application"
@@ -1068,6 +1297,12 @@ fi
       exit 1
    fi
 
+   if [[ "${deploy_report_max_crashes_max}" != "-1" && -z "${deploy_report_application}" ]]
+   then
+      echo "FAIL: --deploy-report-max-crashes-max requires --deploy-report-application"
+      exit 1
+   fi
+
    if [[ "${deploy_report_version_id}" -gt 0 && -z "${deploy_report_application}" ]]
    then
       echo "FAIL: --deploy-report-version-id requires --deploy-report-application"
@@ -1079,6 +1314,21 @@ fi
       if [[ -z "${deploy_report_application}" ]]
       then
          echo "FAIL: runtime deploy-report constraints require --deploy-report-application"
+         exit 1
+      fi
+   fi
+
+   if [[ -n "${deploy_report_require_scaler}" ]]
+   then
+      if [[ -z "${deploy_report_application}" ]]
+      then
+         echo "FAIL: --deploy-report-require-scaler requires --deploy-report-application"
+         exit 1
+      fi
+
+      if ! [[ "${deploy_report_require_scaler_value_min}" =~ ^[0-9]+([.][0-9]+)?$ ]]
+      then
+         echo "FAIL: --deploy-report-require-scaler-value-min must be a non-negative number"
          exit 1
       fi
    fi
@@ -1114,7 +1364,7 @@ then
 fi
 deploy_report_poll_sleep_s="$(printf '%d.%03d' $((deploy_report_poll_interval_ms / 1000)) $((deploy_report_poll_interval_ms % 1000)))"
 
-deps=(ip stat timeout mktemp sed unshare ss rg setsid stdbuf mount tc sysctl)
+deps=(ip stat timeout mktemp sed unshare ss rg setsid stdbuf mount tc sysctl btrfs mkfs.btrfs umount awk ping nsenter)
 
 for cmd in "${deps[@]}"
 do
@@ -1343,6 +1593,17 @@ keep_tmp="${PRODIGY_DEV_KEEP_TMP:-0}"
 keep_fs="${PRODIGY_DEV_KEEP_FS:-0}"
 mothership_socket_path=""
 public_mothership_socket_path=""
+state_db_path="${tmpdir}/prodigy.state"
+
+brain_state_db_path()
+{
+   local idx="$1"
+   printf '%s/brain%s.prodigy.state\n' "${tmpdir}" "${idx}"
+}
+
+containers_dir_created=0
+containers_mount_created=0
+containers_loop_image=""
 if [[ -z "${manifest_path}" ]]
 then
    manifest_path="${tmpdir}/test-cluster-manifest.json"
@@ -1544,7 +1805,9 @@ render_bootstrap_json()
       "--role=${role}"
       "--control-socket-path=${mothership_socket_path}"
       "--local-index=${local_index}"
-      "--brains=${brains}")
+      "--brains=${brains}"
+      "--schema=${test_machine_schema}"
+      "--peer-family=${brain_bootstrap_family}")
    local idx=0
 
    for idx in "${!assigned_brain_ips[@]}"
@@ -1568,11 +1831,12 @@ write_persistent_manifest()
    fi
 
    {
-      printf '{"workspaceRoot":"%s","manifestPath":"%s","controlSocketPath":"%s","parentNamespace":"%s","machineCount":%s,"brainCount":%s,"interContainerMTU":%s,"leaderIndex":%s,"leaderNamespace":"%s","nodes":[' \
+      printf '{"workspaceRoot":"%s","manifestPath":"%s","controlSocketPath":"%s","parentNamespace":"%s","parentPid":%s,"machineCount":%s,"brainCount":%s,"interContainerMTU":%s,"leaderIndex":%s,"leaderNamespace":"%s","nodes":[' \
          "${tmpdir}" \
          "${manifest_path}" \
          "${public_mothership_socket_path}" \
          "${parent_ns}" \
+         "${parent_pin_pid:-0}" \
          "${machines}" \
          "${brains}" \
          "${cluster_link_mtu}" \
@@ -1611,7 +1875,11 @@ write_persistent_manifest()
 }
 
 parent_ns="prodigy-dev-parent-${$}-${RANDOM}"
+parent_pin_pid=""
+test_machine_schema="dev-baremetal"
+test_machine_kind="bareMetal"
 child_names=()
+child_pin_pids=()
 parent_ifs=()
 pids=()
 status_codes=()
@@ -1630,7 +1898,9 @@ brain_fs_roots=()
 brain_fs_shared_store=""
 brain_fs_shared_store_backing=""
 brain_fs_control_root=""
+brain_fs_control_root_owned=0
 brain_log_root=""
+dev_cgroup_root=""
 runtime_tunnel_ebpf=""
 runtime_host_ingress_ebpf=""
 runtime_host_egress_ebpf=""
@@ -1640,6 +1910,7 @@ fake_public6_subnet_cidr="2602:fac0:0:12ab:34cd::/88"
 switchboard_gateway_ip=""
 switchboard_gateway_ip6=""
 switchboard_balancer_ebpf="${PRODIGY_DEV_SWITCHBOARD_BALANCER_EBPF:-}"
+preattach_switchboard_balancer="${PRODIGY_DEV_PREATTACH_SWITCHBOARD_BALANCER:-0}"
 switchboard_balancer_machine_fragment_override=""
 parent_edge_if=""
 host_edge_if=""
@@ -1763,7 +2034,14 @@ prepare_brain_fs_roots()
    # private to a mount namespace or cleaned independently of keep-fs mode.
    brain_log_root="${tmpdir}/logs"
    mkdir -p "${brain_log_root}"
-   brain_fs_control_root="${brain_fs_parent}/control"
+   # The mothership CLI runs in the target netns but not in the per-brain mount
+   # namespace, so the control socket path must stay host-visible. Keep this
+   # path short; sockaddr_un::sun_path is only 108 bytes on Linux, and long
+   # retained-test workspace paths otherwise make the elected master fail to
+   # bind its Unix control socket.
+   mkdir -p "${REPO_WORK_ROOT}/.run"
+   brain_fs_control_root="$(mktemp -d "${REPO_WORK_ROOT}/.run/pc.XXXXXX")"
+   brain_fs_control_root_owned=1
    mkdir -p "${brain_fs_control_root}"
    brain_fs_shared_store_backing="${brain_fs_parent}/shared-store"
    mkdir -p "${brain_fs_shared_store_backing}"
@@ -1772,13 +2050,21 @@ prepare_brain_fs_roots()
    local idx=0
    for idx in $(seq 1 "${node_count}")
    do
-      local root="${brain_fs_parent}/brain${idx}"
-      local install_root="${root}/root/prodigy"
-      mkdir -p "${root}/root"
-      stage_prodigy_install_root_from_bundle "${prodigy_runtime_bundle_path}" "${install_root}"
+	      local root="${brain_fs_parent}/brain${idx}"
+	      local install_root="${root}/root/prodigy"
+	      mkdir -p "${root}/root"
+	      stage_prodigy_install_root_from_bundle "${prodigy_runtime_bundle_path}" "${install_root}"
 
-      if [[ -n "${tunnel_ebpf}" ]]
-      then
+	      if [[ -n "${dev_os_release_id}" || -n "${dev_os_release_version_id}" ]]
+	      then
+	         {
+	            printf 'ID=%s\n' "${dev_os_release_id:-testlinux}"
+	            printf 'VERSION_ID=%s\n' "${dev_os_release_version_id:-0}"
+	         } > "${root}/prodigy-dev-os-release"
+	      fi
+
+	      if [[ -n "${tunnel_ebpf}" ]]
+	      then
          local installed_tunnel_name=""
          installed_tunnel_name="$(basename -- "${tunnel_ebpf}")"
          install -m 0644 "${tunnel_ebpf}" "${install_root}/${installed_tunnel_name}"
@@ -1877,6 +2163,28 @@ cleanup_brain_fs_roots()
    fi
 }
 
+ensure_containers_btrfs_root()
+{
+   if [[ ! -d /containers ]]
+   then
+      mkdir -p /containers
+      containers_dir_created=1
+   fi
+
+   local containers_fs_type=""
+   containers_fs_type="$(stat -f -c '%T' /containers 2>/dev/null || echo unknown)"
+   if [[ "${containers_fs_type}" == "btrfs" ]]
+   then
+      return 0
+   fi
+
+   containers_loop_image="${tmpdir}/containers.loop.img"
+   truncate -s 2G "${containers_loop_image}"
+   mkfs.btrfs -f "${containers_loop_image}" >/dev/null
+   mount -o loop "${containers_loop_image}" /containers
+   containers_mount_created=1
+}
+
 dump_brain_container_artifacts()
 {
    local brain_label="$1"
@@ -1961,6 +2269,266 @@ terminate_netns_processes()
    kill -KILL ${ns_pids} >/dev/null 2>&1 || true
 }
 
+netns_name_exec_works()
+{
+   local ns="$1"
+   ip netns exec "${ns}" true >/dev/null 2>&1
+}
+
+remove_netns_name()
+{
+   local ns="$1"
+   ip netns del "${ns}" >/dev/null 2>&1 || true
+   rm -f "/run/netns/${ns}" >/dev/null 2>&1 || true
+}
+
+netns_inode_for_pid()
+{
+   local pid="$1"
+   stat -Lc '%i' "/proc/${pid}/ns/net" 2>/dev/null || true
+}
+
+netns_inode_for_name()
+{
+   local ns="$1"
+   ip netns exec "${ns}" stat -Lc '%i' /proc/self/ns/net 2>/dev/null || true
+}
+
+attach_netns_name_from_pid()
+{
+   local ns="$1"
+   local pid="$2"
+   local pid_ino=""
+   local name_ino=""
+
+   if [[ -z "${pid}" ]] || ! kill -0 "${pid}" >/dev/null 2>&1
+   then
+      return 1
+   fi
+
+   pid_ino="$(netns_inode_for_pid "${pid}")"
+   if [[ -z "${pid_ino}" ]]
+   then
+      return 1
+   fi
+
+   if netns_name_exec_works "${ns}"
+   then
+      name_ino="$(netns_inode_for_name "${ns}")"
+      if [[ "${name_ino}" == "${pid_ino}" ]]
+      then
+         return 0
+      fi
+   fi
+
+   remove_netns_name "${ns}"
+   ip netns attach "${ns}" "${pid}" >/dev/null 2>&1 || return 1
+
+   name_ino="$(netns_inode_for_name "${ns}")"
+   [[ "${name_ino}" == "${pid_ino}" ]]
+}
+
+wait_for_pid_netns_distinct_from()
+{
+   local pid="$1"
+   shift
+   local attempt=0
+   local ino=""
+   local forbidden=""
+   local matches_forbidden=0
+
+   while [[ "${attempt}" -lt 100 ]]
+   do
+      if [[ -n "${pid}" ]] && kill -0 "${pid}" >/dev/null 2>&1
+      then
+         ino="$(netns_inode_for_pid "${pid}")"
+         if [[ -n "${ino}" ]]
+         then
+            matches_forbidden=0
+            for forbidden in "$@"
+            do
+               if [[ -n "${forbidden}" && "${ino}" == "${forbidden}" ]]
+               then
+                  matches_forbidden=1
+                  break
+               fi
+            done
+
+            if [[ "${matches_forbidden}" -eq 0 ]]
+            then
+               echo "${ino}"
+               return 0
+            fi
+         fi
+      fi
+
+      sleep 0.05
+      attempt=$((attempt + 1))
+   done
+
+   return 1
+}
+
+ensure_parent_netns_name()
+{
+   if netns_name_exec_works "${parent_ns}"
+   then
+      return 0
+   fi
+
+   if [[ -n "${parent_pin_pid}" ]] && kill -0 "${parent_pin_pid}" >/dev/null 2>&1
+   then
+      attach_netns_name_from_pid "${parent_ns}" "${parent_pin_pid}" && return 0
+   fi
+
+   return 1
+}
+
+ensure_child_netns_name()
+{
+   local idx="$1"
+   local ns="${child_names[$((idx - 1))]}"
+
+   if netns_name_exec_works "${ns}"
+   then
+      return 0
+   fi
+
+   local pin_pid="${child_pin_pids[$((idx - 1))]:-}"
+   if [[ -n "${pin_pid}" ]] && kill -0 "${pin_pid}" >/dev/null 2>&1
+   then
+      attach_netns_name_from_pid "${ns}" "${pin_pid}" && return 0
+   fi
+
+   return 1
+}
+
+child_index_for_netns_name()
+{
+   local ns="$1"
+   local idx=0
+
+   for idx in "${!child_names[@]}"
+   do
+      if [[ "${child_names[$idx]}" == "${ns}" ]]
+      then
+         echo $((idx + 1))
+         return 0
+      fi
+   done
+
+   return 1
+}
+
+brain_runtime_pid_for_index()
+{
+   local idx="$1"
+   local wrapper_pid="${active_pids[$((idx - 1))]:-}"
+   local pid=""
+   local cmdline=""
+   local comm=""
+   local pid_ino=""
+   local expected_ino="${child_inodes[$((idx - 1))]:-}"
+
+   if [[ -z "${wrapper_pid}" ]] || ! kill -0 "${wrapper_pid}" >/dev/null 2>&1
+   then
+      return 1
+   fi
+
+   while IFS= read -r pid
+   do
+      [[ -n "${pid}" && -r "/proc/${pid}/cmdline" ]] || continue
+      comm="$(cat "/proc/${pid}/comm" 2>/dev/null || true)"
+      [[ "${comm}" == "prodigy" ]] || continue
+      cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
+      if [[ "${cmdline}" == *"/prodigy "* && "${cmdline}" == *"--isolated"* ]]
+      then
+         pid_ino="$(netns_inode_for_pid "${pid}")"
+         if [[ -z "${pid_ino}" || "${pid_ino}" == "${host_netns_ino}" ]]
+         then
+            continue
+         fi
+
+         if [[ -n "${expected_ino}" && "${pid_ino}" != "${expected_ino}" ]]
+         then
+            continue
+         fi
+
+         echo "${pid}"
+         return 0
+      fi
+   done < <(ps -o pid= -g "${wrapper_pid}" 2>/dev/null | awk '{print $1}')
+
+   return 1
+}
+
+child_netns_exec()
+{
+   local ns="$1"
+   shift
+   local idx=""
+   local pid=""
+
+   if idx="$(child_index_for_netns_name "${ns}")" && pid="$(brain_runtime_pid_for_index "${idx}")"
+   then
+      nsenter -t "${pid}" -n -- "$@"
+      return
+   fi
+
+   ip netns exec "${ns}" "$@"
+}
+
+run_timeout_in_child_netns()
+{
+   local ns="$1"
+   local timeout_s="$2"
+   local kill_after_s="$3"
+   local output_log="$4"
+   shift 4
+   local idx=""
+   local pid=""
+
+   if idx="$(child_index_for_netns_name "${ns}")" && pid="$(brain_runtime_pid_for_index "${idx}")"
+   then
+      timeout --preserve-status -k "${kill_after_s}" "${timeout_s}" nsenter -t "${pid}" -n -- "$@" >"${output_log}" 2>&1
+      return
+   fi
+
+   timeout --preserve-status -k "${kill_after_s}" "${timeout_s}" ip netns exec "${ns}" "$@" >"${output_log}" 2>&1
+}
+
+prepare_dev_cgroup_root()
+{
+   local cpus=""
+
+   if [[ ! -d /sys/fs/cgroup || ! -w /sys/fs/cgroup/cgroup.subtree_control ]]
+   then
+      return 0
+   fi
+
+   dev_cgroup_root="/sys/fs/cgroup/prodigy-dev-netns-${$}"
+   rm -rf "${dev_cgroup_root}" >/dev/null 2>&1 || true
+   mkdir -p "${dev_cgroup_root}"
+
+   printf '+cpuset +memory +pids\n' > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+
+   cpus="$(cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || true)"
+   if [[ -n "${cpus}" ]]
+   then
+      printf '%s\n' "${cpus}" > "${dev_cgroup_root}/cpuset.cpus" 2>/dev/null || true
+   fi
+
+   printf '+cpuset +memory +pids\n' > "${dev_cgroup_root}/cgroup.subtree_control" 2>/dev/null || true
+}
+
+cleanup_dev_cgroup_root()
+{
+   if [[ -n "${dev_cgroup_root}" && -d "${dev_cgroup_root}" ]]
+   then
+      find "${dev_cgroup_root}" -depth -type d -exec rmdir {} + >/dev/null 2>&1 || true
+   fi
+}
+
 cleanup()
 {
    if [[ "${cleanup_ran}" -eq 1 ]]
@@ -1977,7 +2545,27 @@ cleanup()
    do
       terminate_netns_processes "${ns}"
    done
+   for pin_pid in "${child_pin_pids[@]}"
+   do
+      if [[ -n "${pin_pid}" ]]
+      then
+         kill -TERM "${pin_pid}" >/dev/null 2>&1 || true
+      fi
+   done
    terminate_netns_processes "${parent_ns}"
+   if [[ -n "${parent_pin_pid}" ]]
+   then
+      kill -TERM "${parent_pin_pid}" >/dev/null 2>&1 || true
+      sleep 0.1
+      kill -KILL "${parent_pin_pid}" >/dev/null 2>&1 || true
+   fi
+   for pin_pid in "${child_pin_pids[@]}"
+   do
+      if [[ -n "${pin_pid}" ]]
+      then
+         kill -KILL "${pin_pid}" >/dev/null 2>&1 || true
+      fi
+   done
 
    if [[ "${enable_fake_ipv4_boundary}" == "1" ]]
    then
@@ -2100,6 +2688,18 @@ cleanup()
       echo "DEBUG: preserved brain fs root ${brain_fs_parent}"
    fi
 
+   cleanup_dev_cgroup_root
+
+   if [[ "${containers_mount_created}" -eq 1 ]]
+   then
+      umount /containers >/dev/null 2>&1 || true
+   fi
+
+   if [[ "${containers_dir_created}" -eq 1 ]]
+   then
+      rmdir /containers >/dev/null 2>&1 || true
+   fi
+
    if [[ -n "${deploy_container_runtime_path}" && -n "${deploy_container_zstd}" && "${deploy_container_runtime_path}" != "${deploy_container_zstd}" ]]
    then
       rm -f "${deploy_container_runtime_path}" >/dev/null 2>&1 || true
@@ -2118,8 +2718,16 @@ cleanup()
    if [[ "${keep_tmp}" != "1" ]]
    then
       rm -rf "${tmpdir}"
+      if [[ "${brain_fs_control_root_owned}" == "1" && -n "${brain_fs_control_root}" ]]
+      then
+         rm -rf "${brain_fs_control_root}"
+      fi
    else
       echo "DEBUG: preserved tmpdir ${tmpdir}"
+      if [[ "${brain_fs_control_root_owned}" == "1" && -n "${brain_fs_control_root}" ]]
+      then
+         echo "DEBUG: preserved control root ${brain_fs_control_root}"
+      fi
    fi
 }
 
@@ -2135,7 +2743,9 @@ trap handle_cleanup_signal INT TERM HUP
 # Prevent a prior aborted run from contaminating this run or burning CPU.
 kill_leaked_test_containers
 
+ensure_containers_btrfs_root
 prepare_brain_fs_roots
+prepare_dev_cgroup_root
 
 mothership_socket_path="${brain_fs_control_root}/prodigy-mothership.sock"
 public_mothership_socket_path="${tmpdir}/prodigy-mothership.sock"
@@ -2153,18 +2763,32 @@ then
    exit 1
 fi
 
+parent_pin_seconds=$((suite_runtime_s + post_fault_window_s + 300))
+ip netns exec "${parent_ns}" sleep "${parent_pin_seconds}" &
+parent_pin_pid=$!
+child_pin_seconds="${parent_pin_seconds}"
+
 for idx in $(seq 1 "${node_count}")
 do
    ns="prodigy-dev-brain${idx}-${$}-${RANDOM}"
    child_names+=("${ns}")
 
    # Create each child netns from inside the parent netns, then attach a name.
-   ip netns exec "${parent_ns}" unshare -n -- bash -lc 'sleep 60' &
+   ip netns exec "${parent_ns}" unshare -n -- sleep "${child_pin_seconds}" &
    seed_pid=$!
-   sleep 0.1
-   ip netns attach "${ns}" "${seed_pid}"
-   kill "${seed_pid}" >/dev/null 2>&1 || true
-   wait "${seed_pid}" 2>/dev/null || true
+   if ! wait_for_pid_netns_distinct_from "${seed_pid}" "${host_netns_ino}" "${parent_ino}" >/dev/null
+   then
+      echo "FAIL: child netns ${ns} pin process did not enter a unique network namespace"
+      exit 1
+   fi
+
+   if ! attach_netns_name_from_pid "${ns}" "${seed_pid}"
+   then
+      echo "FAIL: could not attach child netns name ${ns} to pin process ${seed_pid}"
+      exit 1
+   fi
+
+   child_pin_pids+=("${seed_pid}")
 
    ip netns exec "${ns}" ip link set lo up
 done
@@ -3035,6 +3659,11 @@ configure_dev_switchboard_balancers_on_nodes()
       return 0
    fi
 
+   if [[ "${preattach_switchboard_balancer}" != "1" ]]
+   then
+      return 0
+   fi
+
    local target_ns=""
    for target_ns in "${child_names[@]}"
    do
@@ -3369,23 +3998,41 @@ master_listener_in_ns()
       return 0
    fi
 
-   ip netns exec "${ns}" ss -ltn 2>/dev/null | rg -q '240\.1\.0\.1:314'
+   child_netns_exec "${ns}" ss -ltn 2>/dev/null | rg -q '240\.1\.0\.1:314'
+}
+
+unix_listener_inodes()
+{
+   local ns="$1"
+   local path="$2"
+   local line=""
+   local rest=""
+
+   child_netns_exec "${ns}" ss -H -lxn 2>/dev/null | while IFS= read -r line
+   do
+      [[ "${line}" == *LISTEN* && "${line}" == *"${path}"* ]] || continue
+      rest="${line#*"${path}"}"
+      set -- ${rest}
+      [[ "$#" -ge 1 && "$1" =~ ^[0-9]+$ ]] || continue
+      echo "$1"
+   done | sort -u
 }
 
 master_unix_listener_in_ns()
 {
    local ns="$1"
    [[ -n "${mothership_socket_path}" ]] || return 1
-   ip netns exec "${ns}" ss -lxn 2>/dev/null | rg -F -q -- "${mothership_socket_path}"
+
+   unix_listener_inodes "${ns}" "${mothership_socket_path}" | rg -q '^[0-9]+$'
 }
 
 dump_master_listener_state()
 {
    local ns="$1"
    echo "--- ${ns} tcp listeners ---"
-   ip netns exec "${ns}" ss -ltn 2>/dev/null || true
+   child_netns_exec "${ns}" ss -ltn 2>/dev/null || true
    echo "--- ${ns} unix listeners ---"
-   ip netns exec "${ns}" ss -lxn 2>/dev/null || true
+   child_netns_exec "${ns}" ss -lxn 2>/dev/null || true
 }
 
 master_listener_indices_once()
@@ -3450,7 +4097,7 @@ wait_for_master_ns()
 count_established_peer_links_in_ns()
 {
    local ns="$1"
-   ip netns exec "${ns}" ss -tan 2>/dev/null | awk '$1=="ESTAB" && ($4 ~ /:313$/ || $5 ~ /:313$/) {c++} END {print c+0}'
+   child_netns_exec "${ns}" ss -tan 2>/dev/null | awk '$1=="ESTAB" && ($4 ~ /:313$/ || $5 ~ /:313$/) {c++} END {print c+0}'
 }
 
 peer_transport_family_pattern()
@@ -3485,7 +4132,7 @@ peer_links_match_bootstrap_family_in_ns()
       return 0
    fi
 
-   ip netns exec "${ns}" ss -tan 2>/dev/null \
+   child_netns_exec "${ns}" ss -tan 2>/dev/null \
       | awk '$1=="ESTAB" && ($4 ~ /:313$/ || $5 ~ /:313$/)' \
       | rg -F -q -- "${pattern}"
 }
@@ -3521,15 +4168,75 @@ wait_for_peer_mesh_bootstrap_family()
 count_established_neuron_links_in_ns()
 {
    local ns="$1"
-   ip netns exec "${ns}" ss -tan 2>/dev/null | awk '$1=="ESTAB" && ($4 ~ /:312$/ || $5 ~ /:312$/) {c++} END {print c+0}'
+   child_netns_exec "${ns}" ss -tan 2>/dev/null | awk '$1=="ESTAB" && ($4 ~ /:312$/ || $5 ~ /:312$/) {c++} END {print c+0}'
+}
+
+peer_reachability_address()
+{
+   local idx="$1"
+
+   case "${brain_bootstrap_family}" in
+      private6|multihome6)
+         echo "${assigned_brain_ips6[$((idx - 1))]}"
+         ;;
+      public6)
+         echo "${assigned_brain_public_ips6[$((idx - 1))]}"
+         ;;
+      *)
+         echo "${assigned_brain_ips[$((idx - 1))]}"
+         ;;
+   esac
+}
+
+peer_reachability_ping()
+{
+   local ns="$1"
+   local address="$2"
+
+   case "${address}" in
+      *:*)
+         child_netns_exec "${ns}" ping -6 -n -q -c 1 -W 1 "${address}" >/dev/null 2>&1
+         ;;
+      *)
+         child_netns_exec "${ns}" ping -4 -n -q -c 1 -W 1 "${address}" >/dev/null 2>&1
+         ;;
+   esac
+}
+
+brain_peer_listener_in_ns()
+{
+   local ns="$1"
+   child_netns_exec "${ns}" ss -ltn 2>/dev/null | awk '$4 ~ /:313$/ { found = 1 } END { exit(found ? 0 : 1) }'
+}
+
+count_reachable_peer_links_in_ns()
+{
+   local ns="$1"
+   local idx=0
+   local peer_ns=""
+   local address=""
+   local reachable=0
+
+   for idx in $(seq 1 "${brains}")
+   do
+      peer_ns="${child_names[$((idx - 1))]}"
+      [[ "${peer_ns}" != "${ns}" ]] || continue
+      address="$(peer_reachability_address "${idx}")"
+      if peer_reachability_ping "${ns}" "${address}" && brain_peer_listener_in_ns "${peer_ns}"
+      then
+         reachable=$((reachable + 1))
+      fi
+   done
+
+   echo "${reachable}"
 }
 
 brain_link_is_up_in_ns()
 {
    local ns="$1"
-   local state
-   state="$(ip netns exec "${ns}" cat /sys/class/net/bond0/operstate 2>/dev/null || echo down)"
-   [[ "${state}" == "up" || "${state}" == "unknown" ]]
+   local link
+   link="$(child_netns_exec "${ns}" ip -o link show dev bond0 2>/dev/null || true)"
+   [[ "${link}" == *"<"*UP*">"* ]]
 }
 
 quorum_peer_requirement()
@@ -3894,7 +4601,7 @@ all_peers_connected_once()
       candidates=$((candidates + 1))
 
       local ns="${child_names[$((idx - 1))]}"
-      established="$(ip netns exec "${ns}" ss -tan 2>/dev/null | awk '$1=="ESTAB" && ($4 ~ /:313$/ || $5 ~ /:313$/) {c++} END {print c+0}')"
+      established="$(child_netns_exec "${ns}" ss -tan 2>/dev/null | awk '$1=="ESTAB" && ($4 ~ /:313$/ || $5 ~ /:313$/) {c++} END {print c+0}')"
       if [[ "${established}" -gt 0 ]]
       then
          connected=$((connected + 1))
@@ -4029,10 +4736,8 @@ run_cluster_report_from_any_ns()
    local candidate_ns=""
    for candidate_ns in "${candidates[@]}"
    do
-      if timeout --preserve-status -k 2s "${timeout_s}"s \
-         ip netns exec "${candidate_ns}" \
-         env PRODIGY_STATE_DB=/containers/var/lib/prodigy/state PRODIGY_MOTHERSHIP_SOCKET="${mothership_socket_path}" "${mothership_bin}" clusterReport local \
-         >"${output_log}" 2>&1
+      if run_timeout_in_child_netns "${candidate_ns}" "${timeout_s}s" 2s "${output_log}" \
+         env PRODIGY_STATE_DB="${state_db_path}" PRODIGY_MOTHERSHIP_SOCKET="${mothership_socket_path}" "${mothership_bin}" clusterReport local
       then
          configure_ns="${candidate_ns}"
          for idx in "${!child_names[@]}"
@@ -4047,6 +4752,115 @@ run_cluster_report_from_any_ns()
 
          return 0
       fi
+   done
+
+   return 1
+}
+
+run_application_report_from_any_ns()
+{
+   local output_log="$1"
+   local application_name="$2"
+   local timeout_s="${3:-3}"
+
+   if [[ -z "${mothership_bin}" || -z "${application_name}" ]]
+   then
+      return 1
+   fi
+
+   local candidates=()
+   if [[ -n "${configure_ns:-}" ]]
+   then
+      candidates+=("${configure_ns}")
+   fi
+
+   local ns=""
+   for ns in "${child_names[@]}"
+   do
+      if [[ -n "${configure_ns:-}" && "${ns}" == "${configure_ns}" ]]
+      then
+         continue
+      fi
+      candidates+=("${ns}")
+   done
+
+   local candidate_ns=""
+   for candidate_ns in "${candidates[@]}"
+   do
+      if run_timeout_in_child_netns "${candidate_ns}" "${timeout_s}s" 2s "${output_log}" \
+         env PRODIGY_STATE_DB="${state_db_path}" PRODIGY_MOTHERSHIP_SOCKET="${mothership_socket_path}" "${mothership_bin}" applicationReport local "${application_name}"
+      then
+         configure_ns="${candidate_ns}"
+         for idx in "${!child_names[@]}"
+         do
+            if [[ "${child_names[$idx]}" == "${candidate_ns}" ]]
+            then
+               configure_index=$((idx + 1))
+               configure_ip="${assigned_brain_ips[$idx]}"
+               break
+            fi
+         done
+
+         return 0
+      fi
+   done
+
+   return 1
+}
+
+cluster_report_initial_machines_healthy()
+{
+   local report_log="$1"
+
+   if [[ ! -f "${report_log}" ]]
+   then
+      return 1
+   fi
+
+   local reported_machines=""
+   reported_machines="$(awk '
+      /^[[:space:]]*nMachines:[[:space:]]*/ {
+         print $2 + 0;
+         exit;
+      }
+   ' "${report_log}")"
+
+   if [[ -z "${reported_machines}" ]] || ! [[ "${reported_machines}" =~ ^[0-9]+$ ]] || [[ "${reported_machines}" -lt "${machines}" ]]
+   then
+      return 1
+   fi
+
+   local healthy_count=""
+   healthy_count="$(rg -c '^[[:space:]]*Machine:[[:space:]]*state=healthy ' "${report_log}" 2>/dev/null || true)"
+   if [[ -z "${healthy_count}" ]] || ! [[ "${healthy_count}" =~ ^[0-9]+$ ]] || [[ "${healthy_count}" -lt "${machines}" ]]
+   then
+      return 1
+   fi
+
+   local ready_count=""
+   ready_count="$(rg -c '^[[:space:]]*lifecycle controlPlaneReachable=1 runtimeReady=1 ' "${report_log}" 2>/dev/null || true)"
+   if [[ -z "${ready_count}" ]] || ! [[ "${ready_count}" =~ ^[0-9]+$ ]] || [[ "${ready_count}" -lt "${machines}" ]]
+   then
+      return 1
+   fi
+
+   return 0
+}
+
+wait_for_initial_cluster_deployability()
+{
+   local output_log="$1"
+   local attempts="${2:-120}"
+   local timeout_s="${3:-3}"
+
+   for attempt in $(seq 1 "${attempts}")
+   do
+      if run_cluster_report_from_any_ns "${output_log}" "${timeout_s}" && cluster_report_initial_machines_healthy "${output_log}"
+      then
+         return 0
+      fi
+
+      sleep 0.25
    done
 
    return 1
@@ -4124,10 +4938,8 @@ reserve_application_id_for_plan()
       for reserve_ns in "${reserve_namespaces[@]}"
       do
          reserve_rc=0
-         timeout --preserve-status -k 2s 6s \
-            ip netns exec "${reserve_ns}" \
-            env PRODIGY_STATE_DB=/containers/var/lib/prodigy/state PRODIGY_MOTHERSHIP_SOCKET="${mothership_socket_path}" "${mothership_bin}" reserveApplicationID local "${reserve_json}" \
-            >"${reserve_log}" 2>&1 || reserve_rc=$?
+         run_timeout_in_child_netns "${reserve_ns}" 6s 2s "${reserve_log}" \
+            env PRODIGY_STATE_DB="${state_db_path}" PRODIGY_MOTHERSHIP_SOCKET="${mothership_socket_path}" "${mothership_bin}" reserveApplicationID local "${reserve_json}" || reserve_rc=$?
 
          if rg -q "reserveApplicationID success=1" "${reserve_log}"
          then
@@ -4321,10 +5133,8 @@ reserve_service_ids_for_plan()
          for reserve_ns in "${reserve_namespaces[@]}"
          do
             reserve_rc=0
-            timeout --preserve-status -k 2s 6s \
-               ip netns exec "${reserve_ns}" \
-               "${mothership_bin}" reserveServiceID dev "${reserve_json}" \
-               >"${reserve_log}" 2>&1 || reserve_rc=$?
+            run_timeout_in_child_netns "${reserve_ns}" 6s 2s "${reserve_log}" \
+               "${mothership_bin}" reserveServiceID dev "${reserve_json}" || reserve_rc=$?
 
             if rg -q "reserveServiceID success=1" "${reserve_log}"
             then
@@ -4712,6 +5522,7 @@ probe_deploy_mesh_stats()
 
 deploy_probe_success_ip=""
 deploy_probe_success_ips=""
+deploy_report_traffic_ips=()
 
 probe_deploy_ping_targets()
 {
@@ -4786,6 +5597,33 @@ probe_deploy_ping_targets()
    return 1
 }
 
+discover_deploy_report_traffic_ips()
+{
+   deploy_report_traffic_ips=("${assigned_brain_ips[@]}")
+
+   if [[ "${deploy_skip_probe}" != "0" ]]
+   then
+      return 0
+   fi
+
+   for attempt in $(seq 1 "${deploy_report_traffic_discovery_attempts}")
+   do
+      for ip in "${assigned_brain_ips[@]}"
+      do
+         if emit_pingpong_traffic_in_parent_ns "${ip}" "${deploy_ping_port}" "${deploy_ping_payload}" 0.25
+         then
+            deploy_report_traffic_ips=("${ip}")
+            return 0
+         fi
+      done
+
+      sleep 0.2
+   done
+
+   deploy_report_traffic_ips=()
+   return 1
+}
+
 brain_latest_stdout_log()
 {
    local idx="$1"
@@ -4840,6 +5678,327 @@ brain_logs_contain_substring()
    return 1
 }
 
+os_update_handled_logs=()
+
+os_update_log_already_handled()
+{
+   local target="$1"
+   local handled=""
+
+   for handled in "${os_update_handled_logs[@]}"
+   do
+      if [[ "${handled}" == "${target}" ]]
+      then
+         return 0
+      fi
+   done
+
+   return 1
+}
+
+mark_os_update_log_handled()
+{
+   local target="$1"
+
+   if [[ -z "${target}" ]]
+   then
+      return 0
+   fi
+
+   if ! os_update_log_already_handled "${target}"
+   then
+      os_update_handled_logs+=("${target}")
+   fi
+}
+
+find_os_update_command_brain_index()
+{
+   local idx=0
+   local log_path=""
+
+   for idx in $(seq 1 "${brains}")
+   do
+      if ! log_path="$(brain_latest_stdout_log "${idx}" 2>/dev/null)"
+      then
+         continue
+      fi
+
+      if os_update_log_already_handled "${log_path}"
+      then
+         continue
+      fi
+
+      if rg -q --fixed-strings "neuron updateOS started" "${log_path}" 2>/dev/null
+      then
+         echo "${idx}"
+         return 0
+      fi
+   done
+
+   return 1
+}
+
+brain_os_update_target_observed()
+{
+   local idx="$1"
+   local target_id="${PRODIGY_DEV_CONFIGURE_TARGET_OS_ID:-}"
+   local target_version="${PRODIGY_DEV_CONFIGURE_TARGET_OS_VERSION_ID:-}"
+   local log_path=""
+   local registration_value=""
+
+   if [[ -z "${target_version}" ]]
+   then
+      return 1
+   fi
+
+   if ! registration_value="$(ipv4_log_value "${assigned_brain_ips[$((idx - 1))]}")"
+   then
+      return 1
+   fi
+
+   for log_path in "${brain_log_root}"/brain*.stdout.log
+   do
+      if [[ ! -f "${log_path}" ]]
+      then
+         continue
+      fi
+
+      if [[ -n "${target_id}" ]]
+      then
+         if rg -q -- "registration private4=${registration_value} .*osID=${target_id} osVersionID=${target_version}" "${log_path}" 2>/dev/null
+         then
+            return 0
+         fi
+      elif rg -q -- "registration private4=${registration_value} .*osVersionID=${target_version}" "${log_path}" 2>/dev/null
+      then
+         return 0
+      fi
+   done
+
+   return 1
+}
+
+all_os_update_targets_observed()
+{
+   local idx=0
+
+   for idx in $(seq 1 "${brains}")
+   do
+      if ! brain_os_update_target_observed "${idx}"
+      then
+         return 1
+      fi
+   done
+
+   return 0
+}
+
+cluster_has_no_active_os_update()
+{
+   local report_log="${tmpdir}/mothership.clusterreport.os-update.log"
+
+   run_cluster_report_from_any_ns "${report_log}" 3 \
+      && ! rg -q --fixed-strings "updatingOS=1" "${report_log}" 2>/dev/null
+}
+
+wait_for_os_update_restart_completion()
+{
+   local idx="$1"
+   local target_version="${PRODIGY_DEV_CONFIGURE_TARGET_OS_VERSION_ID:-}"
+   local deadline=$(( $(date +%s) + os_update_command_timeout_s ))
+   local log_path=""
+   local report_log="${tmpdir}/mothership.clusterreport.os-update.log"
+
+   while [[ "$(date +%s)" -lt "${deadline}" ]]
+   do
+      if brain_os_update_target_observed "${idx}"
+      then
+         echo "OS_UPDATE_RESTART_COMPLETE index=${idx} targetOSVersionID=${target_version}"
+         return 0
+      fi
+
+      sleep 0.2
+   done
+
+   echo "FAIL: OS update restart did not complete for brain index ${idx}"
+   if [[ -n "${log_path}" && -f "${log_path}" ]]
+   then
+      sed -n '1,220p' "${log_path}"
+   fi
+   if [[ -f "${report_log}" ]]
+   then
+      sed -n '1,220p' "${report_log}"
+   fi
+   return 1
+}
+
+read_os_release_value()
+{
+   local path="$1"
+   local key="$2"
+
+   if [[ ! -f "${path}" ]]
+   then
+      return 1
+   fi
+
+   while IFS='=' read -r field value
+   do
+      if [[ "${field}" == "${key}" ]]
+      then
+         value="${value%\"}"
+         value="${value#\"}"
+         printf '%s\n' "${value}"
+         return 0
+      fi
+   done < "${path}"
+
+   return 1
+}
+
+wait_for_os_update_command_applied()
+{
+   local idx="$1"
+   local target_id="${PRODIGY_DEV_CONFIGURE_TARGET_OS_ID:-}"
+   local target_version="${PRODIGY_DEV_CONFIGURE_TARGET_OS_VERSION_ID:-}"
+   local root="${brain_fs_roots[$((idx - 1))]:-}"
+   local marker="${root}/prodigy-dev-os-release"
+   local deadline=$(( $(date +%s) + os_update_command_timeout_s ))
+
+   while [[ "$(date +%s)" -lt "${deadline}" ]]
+   do
+      local marker_id=""
+      local marker_version=""
+      marker_id="$(read_os_release_value "${marker}" "ID" 2>/dev/null || true)"
+      marker_version="$(read_os_release_value "${marker}" "VERSION_ID" 2>/dev/null || true)"
+
+      if [[ "${marker_version}" == "${target_version}" ]] \
+         && { [[ -z "${target_id}" ]] || [[ "${marker_id}" == "${target_id}" ]]; }
+      then
+         echo "OS_UPDATE_COMMAND_APPLIED index=${idx} targetOSID=${marker_id} targetOSVersionID=${marker_version}"
+         return 0
+      fi
+
+      sleep 0.1
+   done
+
+   echo "FAIL: OS update command did not apply target os-release for brain index ${idx}"
+   if [[ -f "${marker}" ]]
+   then
+      sed -n '1,40p' "${marker}"
+   else
+      echo "missing marker ${marker}"
+   fi
+   return 1
+}
+
+run_os_update_reboot_probe()
+{
+   local deadline=$(( $(date +%s) + os_update_rollout_timeout_s ))
+   local updated_idx=""
+   local updated_log=""
+
+   while [[ "$(date +%s)" -lt "${deadline}" ]]
+   do
+      if all_os_update_targets_observed && cluster_has_no_active_os_update
+      then
+         echo "OS_UPDATE_ROLLOUT_COMPLETE brains=${brains} targetOSVersionID=${PRODIGY_DEV_CONFIGURE_TARGET_OS_VERSION_ID:-}"
+         return 0
+      fi
+
+      if updated_idx="$(find_os_update_command_brain_index 2>/dev/null)"
+      then
+         echo "OS_UPDATE_COMMAND_OBSERVED index=${updated_idx}"
+         updated_log="$(brain_latest_stdout_log "${updated_idx}" 2>/dev/null || true)"
+         mark_os_update_log_handled "${updated_log}"
+         wait_for_os_update_command_applied "${updated_idx}" || return 1
+         kill_fault_target_brains "${updated_idx}"
+         restart_fault_target_brains "${updated_idx}"
+         echo "OS_UPDATE_RESTARTED index=${updated_idx}"
+         wait_for_os_update_restart_completion "${updated_idx}" || return 1
+         continue
+      fi
+
+      sleep 0.2
+   done
+
+   echo "FAIL: OS update rollout did not complete within ${os_update_rollout_timeout_s}s"
+   for updated_idx in $(seq 1 "${brains}")
+   do
+      local log_path=""
+      if log_path="$(brain_latest_stdout_log "${updated_idx}" 2>/dev/null)" && [[ -f "${log_path}" ]]
+      then
+         echo "--- brain${updated_idx} stdout tail ---"
+         tail -n 120 "${log_path}"
+      fi
+   done
+   return 1
+}
+
+ipv4_log_value()
+{
+   local address="$1"
+   local a=0
+   local b=0
+   local c=0
+   local d=0
+
+   IFS=. read -r a b c d <<< "${address}"
+   if ! [[ "${a}" =~ ^[0-9]+$ && "${b}" =~ ^[0-9]+$ && "${c}" =~ ^[0-9]+$ && "${d}" =~ ^[0-9]+$ ]]
+   then
+      return 1
+   fi
+
+   printf '%u\n' "$(((d << 24) | (c << 16) | (b << 8) | a))"
+}
+
+brain_master_log_has_full_registration()
+{
+   local leader_idx="$1"
+   local log_path=""
+   local idx=0
+   local registration_value=""
+
+   if ! log_path="$(brain_latest_stdout_log "${leader_idx}" 2>/dev/null)" || [[ -z "${log_path}" || ! -f "${log_path}" ]]
+   then
+      return 1
+   fi
+
+   for idx in $(seq 1 "${brains}")
+   do
+      [[ "${idx}" != "${leader_idx}" ]] || continue
+      if ! registration_value="$(ipv4_log_value "${assigned_brain_ips[$((idx - 1))]}")"
+      then
+         return 1
+      fi
+
+      if ! rg -q --fixed-strings "registration private4=${registration_value} uuid=" "${log_path}" 2>/dev/null
+      then
+         return 1
+      fi
+   done
+
+   return 0
+}
+
+wait_for_full_brain_registration()
+{
+   local leader_idx="$1"
+   local attempts="$2"
+
+   for _ in $(seq 1 "${attempts}")
+   do
+      if brain_master_log_has_full_registration "${leader_idx}"
+      then
+         return 0
+      fi
+
+      sleep 0.2
+   done
+
+   return 1
+}
+
 container_traces_contain_substring()
 {
    local needle="$1"
@@ -4870,6 +6029,11 @@ container_traces_contain_substring()
    return 1
 }
 
+now_ms()
+{
+   printf '%s\n' "$(( $(date +%s%N) / 1000000 ))"
+}
+
 first_fixed_line_number()
 {
    local file="$1"
@@ -4883,6 +6047,25 @@ first_fixed_line_number()
 
    echo "${match%%:*}"
    return 0
+}
+
+first_fixed_line_text()
+{
+   local file="$1"
+   local pattern="$2"
+   rg -m1 --fixed-strings "${pattern}" "${file}" 2>/dev/null
+}
+
+line_now_ms()
+{
+   local line="$1"
+   if [[ "${line}" =~ nowMs=([0-9]+) ]]
+   then
+      echo "${BASH_REMATCH[1]}"
+      return 0
+   fi
+
+   return 1
 }
 
 wait_for_fixed_line_number()
@@ -4975,14 +6158,17 @@ verify_update_prodigy_sequence()
    local coordinator_log="$1"
    local expected_peer_echos="$2"
    local wait_attempts="${3:-200}"
+   local order_budget_ms="${4:-0}"
 
    local begin_pattern="prodigy updateProdigy begin expectedPeerEchos=${expected_peer_echos}"
    local bundle_done_pattern="prodigy updateProdigy bundle-echo ${expected_peer_echos}/${expected_peer_echos}"
+   local transition_begin_pattern="prodigy updateProdigy follower-transition-begin peers=${expected_peer_echos}"
    local relinquish_begin_pattern="prodigy updateProdigy relinquish-begin peers=${expected_peer_echos}"
    local relinquish_done_pattern="prodigy updateProdigy relinquish-echo ${expected_peer_echos}/${expected_peer_echos}"
 
    local begin_line=0
    local bundle_done_line=0
+   local transition_begin_line=0
    local relinquish_begin_line=0
    local relinquish_done_line=0
 
@@ -4998,6 +6184,12 @@ verify_update_prodigy_sequence()
       return 1
    fi
 
+   if ! transition_begin_line="$(wait_for_fixed_line_number "${coordinator_log}" "${transition_begin_pattern}" "${wait_attempts}")"
+   then
+      echo "FAIL: updateProdigy order proof missing follower transition marker (${transition_begin_pattern})"
+      return 1
+   fi
+
    if ! relinquish_begin_line="$(wait_for_fixed_line_number "${coordinator_log}" "${relinquish_begin_pattern}" "${wait_attempts}")"
    then
       echo "FAIL: updateProdigy order proof missing relinquish-begin marker (${relinquish_begin_pattern})"
@@ -5010,9 +6202,9 @@ verify_update_prodigy_sequence()
       return 1
    fi
 
-   if [[ "${begin_line}" -ge "${bundle_done_line}" || "${bundle_done_line}" -ge "${relinquish_begin_line}" || "${relinquish_begin_line}" -ge "${relinquish_done_line}" ]]
+   if [[ "${begin_line}" -ge "${bundle_done_line}" || "${bundle_done_line}" -ge "${transition_begin_line}" || "${transition_begin_line}" -ge "${relinquish_begin_line}" || "${relinquish_begin_line}" -ge "${relinquish_done_line}" ]]
    then
-      echo "FAIL: updateProdigy order violated (begin=${begin_line} bundle_done=${bundle_done_line} relinquish_begin=${relinquish_begin_line} relinquish_done=${relinquish_done_line})"
+      echo "FAIL: updateProdigy order violated (begin=${begin_line} bundle_done=${bundle_done_line} transition_begin=${transition_begin_line} relinquish_begin=${relinquish_begin_line} relinquish_done=${relinquish_done_line})"
       return 1
    fi
 
@@ -5042,7 +6234,49 @@ verify_update_prodigy_sequence()
       return 1
    fi
 
-   echo "UPDATE_ORDER begin=${begin_line} bundle_done=${bundle_done_line} relinquish_begin=${relinquish_begin_line} relinquish_done=${relinquish_done_line} bundle_echos=${bundle_echo_count} relinquish_echos=${relinquish_echo_count}"
+   echo "UPDATE_ORDER begin=${begin_line} bundle_done=${bundle_done_line} transition_begin=${transition_begin_line} relinquish_begin=${relinquish_begin_line} relinquish_done=${relinquish_done_line} bundle_echos=${bundle_echo_count} relinquish_echos=${relinquish_echo_count}"
+
+   local begin_text=""
+   local bundle_done_text=""
+   local transition_begin_text=""
+   local relinquish_begin_text=""
+   local relinquish_done_text=""
+   local begin_ms=0
+   local bundle_done_ms=0
+   local transition_begin_ms=0
+   local relinquish_begin_ms=0
+   local relinquish_done_ms=0
+
+   begin_text="$(first_fixed_line_text "${coordinator_log}" "${begin_pattern}" || true)"
+   bundle_done_text="$(first_fixed_line_text "${coordinator_log}" "${bundle_done_pattern}" || true)"
+   transition_begin_text="$(first_fixed_line_text "${coordinator_log}" "${transition_begin_pattern}" || true)"
+   relinquish_begin_text="$(first_fixed_line_text "${coordinator_log}" "${relinquish_begin_pattern}" || true)"
+   relinquish_done_text="$(first_fixed_line_text "${coordinator_log}" "${relinquish_done_pattern}" || true)"
+
+   if begin_ms="$(line_now_ms "${begin_text}")" \
+      && bundle_done_ms="$(line_now_ms "${bundle_done_text}")" \
+      && transition_begin_ms="$(line_now_ms "${transition_begin_text}")" \
+      && relinquish_begin_ms="$(line_now_ms "${relinquish_begin_text}")" \
+      && relinquish_done_ms="$(line_now_ms "${relinquish_done_text}")"
+   then
+      local bundle_ms=$((bundle_done_ms - begin_ms))
+      local transition_ms=$((transition_begin_ms - bundle_done_ms))
+      local follower_reboot_ms=$((relinquish_begin_ms - transition_begin_ms))
+      local relinquish_ms=$((relinquish_done_ms - relinquish_begin_ms))
+      local total_ms=$((relinquish_done_ms - begin_ms))
+
+      echo "UPDATE_ORDER_TIMING bundleMs=${bundle_ms} transitionArmMs=${transition_ms} followerRebootMs=${follower_reboot_ms} relinquishMs=${relinquish_ms} totalMs=${total_ms} budgetMs=${order_budget_ms}"
+
+      if [[ "${order_budget_ms}" -gt 0 && "${total_ms}" -gt "${order_budget_ms}" ]]
+      then
+         echo "FAIL: updateProdigy order exceeded latency budget (totalMs=${total_ms}, budgetMs=${order_budget_ms})"
+         return 1
+      fi
+   else
+      echo "FAIL: updateProdigy timing markers missing nowMs fields"
+      return 1
+   fi
+
    return 0
 }
 
@@ -5153,10 +6387,30 @@ set_fault_links_state()
 
       if [[ "${state}" == "down" ]]
       then
+         if ! ensure_child_netns_name "${idx}"
+         then
+            echo "FAIL: child netns for fault target ${idx} is not available"
+            return 1
+         fi
          ip netns exec "${child_ns}" ip link set bond0 down
+         if ! ensure_parent_netns_name
+         then
+            echo "FAIL: parent netns is not available for fault target ${idx}"
+            return 1
+         fi
          ip netns exec "${parent_ns}" ip link set "${parent_if}" down
       else
+         if ! ensure_parent_netns_name
+         then
+            echo "FAIL: parent netns is not available for fault target ${idx}"
+            return 1
+         fi
          ip netns exec "${parent_ns}" ip link set "${parent_if}" up
+         if ! ensure_child_netns_name "${idx}"
+         then
+            echo "FAIL: child netns for fault target ${idx} is not available"
+            return 1
+         fi
          ip netns exec "${child_ns}" ip link set bond0 up
       fi
    done
@@ -5171,6 +6425,8 @@ run_brain()
    start_count=$((start_count + 1))
    brain_start_count[$((idx - 1))]="${start_count}"
    local stdout_log="${brain_log_root}/brain${idx}.start${start_count}.stdout.log"
+   local brain_state_db=""
+   brain_state_db="$(brain_state_db_path "${idx}")"
 
    local -a run_env=(env "PRODIGY_DEV_MODE=1" "PRODIGY_HOST_NETNS_INO=${host_netns_ino}" "PRODIGY_BOOTSTRAP_BRAIN_COUNT=${brains}" "PRODIGY_DEV_SHARED_TRANSPORT_TLS_DIR=/containers/store/prodigy-transport-tls")
    if [[ -n "${runtime_host_ingress_ebpf}" ]]
@@ -5192,11 +6448,30 @@ run_brain()
    fi
    if [[ "${allow_bpf_attach}" == "1" && -n "${runtime_switchboard_balancer_ebpf}" ]]
    then
-      run_env+=("SWITCHBOARD_USE_PREATTACHED_XDP=1")
+      if [[ "${preattach_switchboard_balancer}" == "1" ]]
+      then
+         run_env+=("SWITCHBOARD_USE_PREATTACHED_XDP=1")
+      fi
       run_env+=("SWITCHBOARD_BALANCER_OBJ=${runtime_switchboard_balancer_ebpf}")
    fi
+   if [[ -n "${PRODIGY_AUTOSCALE_TRACE:-}" ]]
+   then
+      run_env+=("PRODIGY_AUTOSCALE_TRACE=${PRODIGY_AUTOSCALE_TRACE}")
+   fi
+	   if [[ -n "${PRODIGY_STATEFUL_TOPOLOGY_ROLLBACK_WINDOW_SECONDS:-}" ]]
+	   then
+	      run_env+=("PRODIGY_STATEFUL_TOPOLOGY_ROLLBACK_WINDOW_SECONDS=${PRODIGY_STATEFUL_TOPOLOGY_ROLLBACK_WINDOW_SECONDS}")
+	   fi
+	   if [[ -n "${dev_os_release_id}" || -n "${dev_os_release_version_id}" ]]
+	   then
+	      run_env+=("PRODIGY_DEV_OS_RELEASE_PATH=/containers/prodigy-dev-os-release")
+	   fi
+	   if [[ -n "${dev_os_update_cadence_ms}" ]]
+	   then
+	      run_env+=("PRODIGY_DEV_OS_UPDATE_CADENCE_MS=${dev_os_update_cadence_ms}")
+	   fi
 
-   local brain_fs_root="${brain_fs_roots[$((idx - 1))]:-}"
+	   local brain_fs_root="${brain_fs_roots[$((idx - 1))]:-}"
    if [[ -z "${brain_fs_root}" || ! -d "${brain_fs_root}" ]]
    then
       echo "FAIL: missing filesystem root for brain index ${idx}: ${brain_fs_root}" >&2
@@ -5226,9 +6501,8 @@ run_brain()
    local boot_json
    boot_json="$(render_bootstrap_json "${idx}" "${role}")"
 
-   local state_db_path="/containers/var/lib/prodigy/state"
    local runtime_prodigy_bin="/root/prodigy/prodigy"
-   local -a brain_cmd=("${run_env[@]}" "PRODIGY_STATE_DB=${state_db_path}" stdbuf -oL -eL "${runtime_prodigy_bin}" --isolated --netdev=bond0 "--boot-json=${boot_json}")
+   local -a brain_cmd=("${run_env[@]}" "PRODIGY_STATE_DB=${brain_state_db}" stdbuf -oL -eL "${runtime_prodigy_bin}" --isolated --netdev=bond0 "--boot-json=${boot_json}")
    if [[ -n "${runtime_tunnel_ebpf}" ]]
    then
       brain_cmd+=("--tunnel-ebpf=${runtime_tunnel_ebpf}")
@@ -5240,39 +6514,73 @@ run_brain()
       launch_prefix+=(timeout --preserve-status -k 3s -s INT "${runtime_s}s")
    fi
 
+   local netns_pin_pid="${child_pin_pids[$((idx - 1))]:-}"
+   local brain_cgroup_path=""
+
+   if [[ -n "${dev_cgroup_root}" && -d "${dev_cgroup_root}" ]]
+   then
+      brain_cgroup_path="${dev_cgroup_root}/brain${idx}.start${start_count}"
+      mkdir -p "${brain_cgroup_path}"
+      if [[ -r "${dev_cgroup_root}/cpuset.cpus.effective" ]]
+      then
+         cat "${dev_cgroup_root}/cpuset.cpus.effective" > "${brain_cgroup_path}/cpuset.cpus" 2>/dev/null || true
+      fi
+   fi
+
    "${launch_prefix[@]}" \
-      unshare -m -- bash -lc '
+      bash -lc '
          set -euo pipefail
-         fs_root="$1"
-         ns_name="$2"
-         fs_store="$3"
-         control_socket_root="$4"
-         shift 4
+         brain_cgroup_path="$1"
+         shift
+         unshare_args=(-m)
+
+         if [[ -n "${brain_cgroup_path}" && -w "${brain_cgroup_path}/cgroup.procs" ]]
+         then
+            printf "%s\n" "$$" > "${brain_cgroup_path}/cgroup.procs" || true
+            unshare_args=(-C -m)
+         fi
+
+         exec unshare "${unshare_args[@]}" -- bash -lc "
+            set -euo pipefail
+            fs_root=\"\$1\"
+            ns_name=\"\$2\"
+            fs_store=\"\$3\"
+            control_socket_root=\"\$4\"
+            netns_pin_pid=\"\$5\"
+            shift 5
 
          mkdir -p /containers
          mkdir -p /mnt/prodigy-shared-store-host
          mkdir -p /mnt/prodigy-control-root
          mkdir -p /root
          mount --make-rprivate /
-         mount --bind "${fs_store}" /mnt/prodigy-shared-store-host
-         mount --bind "${control_socket_root}" /mnt/prodigy-control-root
-         mount --bind "${fs_root}/root" /root
-         mount --bind "${fs_root}" /containers
-         mkdir -p "${control_socket_root}"
-         mount --bind /mnt/prodigy-control-root "${control_socket_root}"
+         mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null || true
+         mount --bind \"\${fs_store}\" /mnt/prodigy-shared-store-host
+         mount --bind \"\${control_socket_root}\" /mnt/prodigy-control-root
+         mount --bind \"\${fs_root}/root\" /root
+         mount --bind \"\${fs_root}\" /containers
+         mkdir -p \"\${control_socket_root}\"
+         mount --bind /mnt/prodigy-control-root \"\${control_socket_root}\"
          mkdir -p /containers/store
          mount --bind /mnt/prodigy-shared-store-host /containers/store
 
-         exec ip netns exec "${ns_name}" bash -lc "
+         run_in_netns=(ip netns exec \"\${ns_name}\")
+         if [[ -n \"\${netns_pin_pid}\" ]] && kill -0 \"\${netns_pin_pid}\" >/dev/null 2>&1
+         then
+            run_in_netns=(nsenter -t \"\${netns_pin_pid}\" -n --)
+         fi
+
+         exec \"\${run_in_netns[@]}\" bash -lc \"
             set -euo pipefail
             mkdir -p /sys/fs/bpf
-            if [[ \"\$(stat -f -c %T /sys/fs/bpf 2>/dev/null || true)\" != \"bpf_fs\" ]]
+            if [[ \\\"\$(stat -f -c %T /sys/fs/bpf 2>/dev/null || true)\\\" != \\\"bpf_fs\\\" ]]
             then
                mount -t bpf bpf /sys/fs/bpf
             fi
-            exec \"\$@\"
-         " _ "$@"
-      ' _ "${brain_fs_root}" "${ns}" "${brain_fs_shared_store}" "${control_socket_root}" "${brain_cmd[@]}" \
+            exec \\\"\\\$@\\\"
+         \" _ \"\$@\"
+      " _ "$@"
+      ' _ "${brain_cgroup_path}" "${brain_fs_root}" "${ns}" "${brain_fs_shared_store}" "${control_socket_root}" "${netns_pin_pid}" "${brain_cmd[@]}" \
       >"${stdout_log}" 2>&1 &
 
    local pid="$!"
@@ -5324,6 +6632,7 @@ terminate_all_brains()
       then
          kill -KILL -- "-${pid}" >/dev/null 2>&1 || kill -KILL "${pid}" >/dev/null 2>&1 || true
          expected_nonzero_pid["${pid}"]=1
+         wait "${pid}" >/dev/null 2>&1 || true
       fi
    done
 }
@@ -5344,6 +6653,7 @@ kill_fault_target_brains()
       then
          kill -KILL -- "-${pid}" >/dev/null 2>&1 || kill -KILL "${pid}" >/dev/null 2>&1 || true
          expected_nonzero_pid["${pid}"]=1
+         wait "${pid}" >/dev/null 2>&1 || true
       fi
    done
 }
@@ -5367,6 +6677,8 @@ fault_phase_quorum_indices="none"
 fault_phase_changed=0
 fault_phase_split_brain=0
 fault_phase_split_quorum_indices="none"
+fault_applied_ms=0
+fault_first_change_ms=0
 
 record_fault_phase_sample()
 {
@@ -5391,7 +6703,31 @@ record_fault_phase_sample()
       elif [[ "${quorum_count}" -eq 1 ]] && csv_has_other_than "${quorum_indices}" "${baseline_master_index}"
       then
          fault_phase_changed=1
+         if [[ "${fault_first_change_ms}" -eq 0 ]]
+         then
+            fault_first_change_ms="$(now_ms)"
+         fi
       fi
+   fi
+}
+
+run_fault_phase_samples_for_ms()
+{
+   local baseline_master_index="$1"
+   local duration_ms="$2"
+   local deadline_ms=$(( $(now_ms) + duration_ms ))
+   local sampled=0
+
+   while [[ "$(now_ms)" -lt "${deadline_ms}" ]]
+   do
+      record_fault_phase_sample "${baseline_master_index}"
+      sampled=1
+      sleep 0.2
+   done
+
+   if [[ "${sampled}" -eq 0 ]]
+   then
+      record_fault_phase_sample "${baseline_master_index}"
    fi
 }
 
@@ -5430,20 +6766,20 @@ then
 
    if [[ "${brains}" -gt 1 ]]
    then
-      if ! wait_for_peer_mesh 180
+      if ! wait_for_peer_mesh "${persistent_ready_attempts}"
       then
          echo "FAIL: persistent test cluster peer connectivity did not become ready on :313"
          for idx in $(seq 1 "${brains}")
          do
             ns="${child_names[$((idx - 1))]}"
             echo "--- ${ns} sockets ---"
-            ip netns exec "${ns}" ss -tan 2>/dev/null || true
+            child_netns_exec "${ns}" ss -tan 2>/dev/null || true
          done
          exit 1
       fi
 
       leader_quorum_indices=""
-      if leader_quorum_indices="$(wait_for_single_master_listener_indices_stable 180 5)"
+      if leader_quorum_indices="$(wait_for_single_master_listener_indices_stable "${persistent_ready_attempts}" 5)"
       then
          leader_idx="$(first_index_from_csv "${leader_quorum_indices}" || true)"
          if [[ "${leader_idx}" -gt 0 ]]
@@ -5454,7 +6790,7 @@ then
    else
       leader_idx=1
       leader_ns="${child_names[0]}"
-      for attempt in $(seq 1 180)
+      for attempt in $(seq 1 "${persistent_ready_attempts}")
       do
          if [[ -S "${mothership_socket_path}" ]]
          then
@@ -5493,7 +6829,7 @@ then
       for ns in "${child_names[@]}"
       do
          echo "--- ${ns} sockets ---"
-         ip netns exec "${ns}" ss -tan 2>/dev/null || true
+         child_netns_exec "${ns}" ss -tan 2>/dev/null || true
       done
       failed=1
    fi
@@ -5504,7 +6840,7 @@ then
       for ns in "${child_names[@]}"
       do
          echo "--- ${ns} established peer links ---"
-         ip netns exec "${ns}" ss -tan 2>/dev/null | awk '$1=="ESTAB" && ($4 ~ /:313$/ || $5 ~ /:313$/)' || true
+         child_netns_exec "${ns}" ss -tan 2>/dev/null | awk '$1=="ESTAB" && ($4 ~ /:313$/ || $5 ~ /:313$/)' || true
       done
       failed=1
    fi
@@ -5534,13 +6870,28 @@ then
    else
       echo "MASTER_LISTENER ns=${leader_ns} index=${leader_idx} quorum=${leader_quorum_indices}"
    fi
+
+   if [[ "${failed}" -eq 0 && "${expect_full_brain_registration}" == "1" ]]
+   then
+      if wait_for_full_brain_registration "${leader_idx}" 120
+      then
+         echo "BRAIN_REGISTRATION_ASSERT success nRegistered=${brains} required=${brains} leaderIndex=${leader_idx}"
+      else
+         echo "FAIL: elected master did not log full brain registration coverage"
+         if log_path="$(brain_latest_stdout_log "${leader_idx}" 2>/dev/null || true)" && [[ -n "${log_path}" && -f "${log_path}" ]]
+         then
+            echo "--- ${log_path} registration lines ---"
+            rg -n "registration private4=" "${log_path}" || true
+         fi
+         failed=1
+      fi
+   fi
 fi
 
 if [[ -n "${mothership_bin}" ]]
 then
    fragment=$((RANDOM % 255 + 1))
    configured=0
-   legacy_local_configure_invalid=0
    cluster_reported=0
    configure_ns=""
    configure_index=0
@@ -5632,18 +6983,33 @@ then
          continue
       fi
 
-      if timeout --preserve-status -k 2s 3s \
-         ip netns exec "${configure_ns}" \
-         env PRODIGY_STATE_DB=/containers/var/lib/prodigy/state PRODIGY_MOTHERSHIP_SOCKET="${mothership_socket_path}" "${mothership_bin}" configure local "${fragment}" dev-baremetal 8 16384 262144 "${mothership_autoscale_interval_seconds}" \
-         >"${tmpdir}/mothership.configure.log" 2>&1
+	      if run_timeout_in_child_netns "${configure_ns}" 3s 2s "${tmpdir}/mothership.configure.log" \
+	         env \
+	         PRODIGY_STATE_DB="${state_db_path}" \
+	         PRODIGY_MOTHERSHIP_SOCKET="${mothership_socket_path}" \
+	         PRODIGY_DEV_CONFIGURE_TARGET_OS_ID="${PRODIGY_DEV_CONFIGURE_TARGET_OS_ID:-}" \
+	         PRODIGY_DEV_CONFIGURE_TARGET_OS_VERSION_ID="${PRODIGY_DEV_CONFIGURE_TARGET_OS_VERSION_ID:-}" \
+	         PRODIGY_DEV_CONFIGURE_OS_UPDATE_COMMAND="${PRODIGY_DEV_CONFIGURE_OS_UPDATE_COMMAND:-}" \
+	         PRODIGY_DEV_CONFIGURE_OS_UPDATE_POLICIES_JSON="${PRODIGY_DEV_CONFIGURE_OS_UPDATE_POLICIES_JSON:-}" \
+	         PRODIGY_DEV_CONFIGURE_OS_UPDATES_ENABLED="${PRODIGY_DEV_CONFIGURE_OS_UPDATES_ENABLED:-}" \
+	         PRODIGY_DEV_CONFIGURE_INCLUDE_VMS_IN_OS_UPDATES="${PRODIGY_DEV_CONFIGURE_INCLUDE_VMS_IN_OS_UPDATES:-}" \
+	         PRODIGY_DEV_CONFIGURE_MAX_OS_DRAINS="${PRODIGY_DEV_CONFIGURE_MAX_OS_DRAINS:-}" \
+	         PRODIGY_DEV_CONFIGURE_MACHINE_UPDATE_CADENCE_MINS="${PRODIGY_DEV_CONFIGURE_MACHINE_UPDATE_CADENCE_MINS:-}" \
+	         "${mothership_bin}" configureTestCluster \
+         "${tmpdir}" \
+         "${machines}" \
+         "${brains}" \
+         "${brain_bootstrap_family}" \
+         "${enable_fake_ipv4_boundary}" \
+	         "${cluster_link_mtu}" \
+	         "${fragment}" \
+	         "${mothership_autoscale_interval_seconds}" \
+	         "${test_machine_schema}" \
+	         "${test_machine_kind}" \
+	         "${test_machine_logical_cores}" \
+         "${test_machine_memory_mb}" \
+         "${test_machine_storage_mb}"
       then
-         configured=1
-         break
-      fi
-
-      if grep -q "operation invalid" "${tmpdir}/mothership.configure.log" 2>/dev/null
-      then
-         legacy_local_configure_invalid=1
          configured=1
          break
       fi
@@ -5658,22 +7024,16 @@ then
       failed=1
    elif [[ "${listener_ready}" -eq 1 && "${configured}" -eq 1 ]]
    then
-      if [[ "${legacy_local_configure_invalid}" -eq 1 ]]
-      then
-         echo "NOTE: skipping legacy mothership configure local path because the current mothership binary reports operation invalid"
-         cluster_reported=1
-      else
-         for attempt in $(seq 1 80)
-         do
-            if run_cluster_report_from_any_ns "${tmpdir}/mothership.clusterreport.log" 3
-            then
-               cluster_reported=1
-               break
-            fi
+      for attempt in $(seq 1 80)
+      do
+         if run_cluster_report_from_any_ns "${tmpdir}/mothership.clusterreport.log" 3
+         then
+            cluster_reported=1
+            break
+         fi
 
-            sleep 0.2
-         done
-      fi
+         sleep 0.2
+      done
 
       if [[ "${cluster_reported}" -ne 1 ]]
       then
@@ -5688,18 +7048,36 @@ then
          fi
          echo "MOTHERSHIP_BOOTSTRAP success index=${configure_index} ip=${configure_ip} fragment=${fragment} quorum=${configure_quorum_display}"
 
-         if [[ "${failed}" -eq 0 && -n "${deploy_plan_json}" ]]
-         then
+	         if [[ "${failed}" -eq 0 && ( -n "${deploy_plan_json}" || "${os_update_restart_on_command}" == "1" ) ]]
+	         then
+	            if ! wait_for_initial_cluster_deployability "${tmpdir}/mothership.clusterreport.ready.log" 180 3
+	            then
+               echo "FAIL: cluster never reached an initial deployable healthy state"
+               sed -n '1,220p' "${tmpdir}/mothership.clusterreport.ready.log"
+	               failed=1
+	            fi
+	         fi
+
+	         if [[ "${failed}" -eq 0 && "${os_update_restart_on_command}" == "1" ]]
+	         then
+	            if ! run_os_update_reboot_probe
+	            then
+	               failed=1
+	            fi
+	         fi
+
+	         if [[ "${failed}" -eq 0 && -n "${deploy_plan_json}" ]]
+	         then
             deploy_container_runtime_path="${deploy_container_zstd}"
             deploy_runtime_plan_json="${deploy_plan_json}"
 
-            if ! ip netns exec "${configure_ns}" test -f "${deploy_container_runtime_path}" >/dev/null 2>&1
+            if ! child_netns_exec "${configure_ns}" test -f "${deploy_container_runtime_path}" >/dev/null 2>&1
             then
-               deploy_container_runtime_path="/root/prodigy.deploy.${RANDOM}.${$}.container.zst"
+               deploy_container_runtime_path="/containers/store/prodigy.deploy.${RANDOM}.${$}.container.zst"
                cp -f "${deploy_container_zstd}" "${deploy_container_runtime_path}"
             fi
 
-            if ! ip netns exec "${configure_ns}" test -f "${deploy_container_runtime_path}" >/dev/null 2>&1
+            if ! child_netns_exec "${configure_ns}" test -f "${deploy_container_runtime_path}" >/dev/null 2>&1
             then
                echo "FAIL: deploy container blob is not visible inside configure namespace"
                echo "original=${deploy_container_zstd}"
@@ -5735,10 +7113,8 @@ then
                for attempt in $(seq 1 "${deploy_attempts}")
                do
                   deploy_attempt_rc=0
-                  timeout --preserve-status -k 3s "${deploy_attempt_timeout_s}"s \
-                     ip netns exec "${configure_ns}" \
-                     env PRODIGY_STATE_DB=/containers/var/lib/prodigy/state PRODIGY_MOTHERSHIP_SOCKET="${mothership_socket_path}" "${mothership_bin}" deploy local "${deploy_json_payload}" "${deploy_container_runtime_path}" \
-                     >"${tmpdir}/mothership.deploy.log" 2>&1 || deploy_attempt_rc=$?
+                  run_timeout_in_child_netns "${configure_ns}" "${deploy_attempt_timeout_s}s" 3s "${tmpdir}/mothership.deploy.log" \
+                     env PRODIGY_STATE_DB="${state_db_path}" PRODIGY_MOTHERSHIP_SOCKET="${mothership_socket_path}" "${mothership_bin}" deploy local "${deploy_json_payload}" "${deploy_container_runtime_path}" || deploy_attempt_rc=$?
 
                   # A dev deploy may continue streaming status after acceptance and exceed
                   # the per-attempt timeout. Treat explicit acceptance as success and let
@@ -5770,6 +7146,11 @@ then
                if [[ "${deploy_ok}" -ne 1 ]]
                then
                   echo "FAIL: mothership deploy did not succeed"
+                  sed -n '1,220p' "${tmpdir}/mothership.deploy.log"
+                  failed=1
+               elif [[ -n "${deploy_expect_text}" ]] && ! rg -q --fixed-strings "${deploy_expect_text}" "${tmpdir}/mothership.deploy.log"
+               then
+                  echo "FAIL: deploy accepted but did not include expected text: ${deploy_expect_text}"
                   sed -n '1,220p' "${tmpdir}/mothership.deploy.log"
                   failed=1
                else
@@ -5807,13 +7188,13 @@ then
                deploy_second_container_runtime_path="${deploy_second_container_zstd}"
                deploy_second_runtime_plan_json="${deploy_second_plan_json}"
 
-               if ! ip netns exec "${configure_ns}" test -f "${deploy_second_container_runtime_path}" >/dev/null 2>&1
+               if ! child_netns_exec "${configure_ns}" test -f "${deploy_second_container_runtime_path}" >/dev/null 2>&1
                then
-                  deploy_second_container_runtime_path="/root/prodigy.deploy.second.${RANDOM}.${$}.container.zst"
+                  deploy_second_container_runtime_path="/containers/store/prodigy.deploy.second.${RANDOM}.${$}.container.zst"
                   cp -f "${deploy_second_container_zstd}" "${deploy_second_container_runtime_path}"
                fi
 
-               if ! ip netns exec "${configure_ns}" test -f "${deploy_second_container_runtime_path}" >/dev/null 2>&1
+               if ! child_netns_exec "${configure_ns}" test -f "${deploy_second_container_runtime_path}" >/dev/null 2>&1
                then
                   echo "FAIL: second deploy container blob is not visible inside configure namespace"
                   echo "original=${deploy_second_container_zstd}"
@@ -5849,10 +7230,8 @@ then
                   for attempt in $(seq 1 "${deploy_attempts}")
                   do
                      deploy_second_attempt_rc=0
-                     timeout --preserve-status -k 3s "${deploy_attempt_timeout_s}"s \
-                        ip netns exec "${configure_ns}" \
-                        env PRODIGY_STATE_DB=/containers/var/lib/prodigy/state PRODIGY_MOTHERSHIP_SOCKET="${mothership_socket_path}" "${mothership_bin}" deploy local "${deploy_second_json_payload}" "${deploy_second_container_runtime_path}" \
-                        >"${tmpdir}/mothership.deploy.second.log" 2>&1 || deploy_second_attempt_rc=$?
+                     run_timeout_in_child_netns "${configure_ns}" "${deploy_attempt_timeout_s}s" 3s "${tmpdir}/mothership.deploy.second.log" \
+                        env PRODIGY_STATE_DB="${state_db_path}" PRODIGY_MOTHERSHIP_SOCKET="${mothership_socket_path}" "${mothership_bin}" deploy local "${deploy_second_json_payload}" "${deploy_second_container_runtime_path}" || deploy_second_attempt_rc=$?
 
                      if rg -q "SpinApplicationResponseCode::okay" "${tmpdir}/mothership.deploy.second.log"
                      then
@@ -5880,6 +7259,11 @@ then
                   if [[ "${deploy_second_ok}" -ne 1 ]]
                   then
                      echo "FAIL: mothership second deploy did not succeed"
+                     sed -n '1,220p' "${tmpdir}/mothership.deploy.second.log"
+                     failed=1
+                  elif [[ -n "${deploy_second_expect_text}" ]] && ! rg -q --fixed-strings "${deploy_second_expect_text}" "${tmpdir}/mothership.deploy.second.log"
+                  then
+                     echo "FAIL: second deploy accepted but did not include expected text: ${deploy_second_expect_text}"
                      sed -n '1,220p' "${tmpdir}/mothership.deploy.second.log"
                      failed=1
                   else
@@ -5925,13 +7309,13 @@ then
                deploy_third_container_runtime_path="${deploy_third_container_zstd}"
                deploy_third_runtime_plan_json="${deploy_third_plan_json}"
 
-               if ! ip netns exec "${configure_ns}" test -f "${deploy_third_container_runtime_path}" >/dev/null 2>&1
+               if ! child_netns_exec "${configure_ns}" test -f "${deploy_third_container_runtime_path}" >/dev/null 2>&1
                then
-                  deploy_third_container_runtime_path="/root/prodigy.deploy.third.${RANDOM}.${$}.container.zst"
+                  deploy_third_container_runtime_path="/containers/store/prodigy.deploy.third.${RANDOM}.${$}.container.zst"
                   cp -f "${deploy_third_container_zstd}" "${deploy_third_container_runtime_path}"
                fi
 
-               if ! ip netns exec "${configure_ns}" test -f "${deploy_third_container_runtime_path}" >/dev/null 2>&1
+               if ! child_netns_exec "${configure_ns}" test -f "${deploy_third_container_runtime_path}" >/dev/null 2>&1
                then
                   echo "FAIL: third deploy container blob is not visible inside configure namespace"
                   echo "original=${deploy_third_container_zstd}"
@@ -5967,10 +7351,8 @@ then
                   for attempt in $(seq 1 "${deploy_attempts}")
                   do
                      deploy_third_attempt_rc=0
-                     timeout --preserve-status -k 3s "${deploy_attempt_timeout_s}"s \
-                        ip netns exec "${configure_ns}" \
-                        env PRODIGY_STATE_DB=/containers/var/lib/prodigy/state PRODIGY_MOTHERSHIP_SOCKET="${mothership_socket_path}" "${mothership_bin}" deploy local "${deploy_third_json_payload}" "${deploy_third_container_runtime_path}" \
-                        >"${tmpdir}/mothership.deploy.third.log" 2>&1 || deploy_third_attempt_rc=$?
+                     run_timeout_in_child_netns "${configure_ns}" "${deploy_attempt_timeout_s}s" 3s "${tmpdir}/mothership.deploy.third.log" \
+                        env PRODIGY_STATE_DB="${state_db_path}" PRODIGY_MOTHERSHIP_SOCKET="${mothership_socket_path}" "${mothership_bin}" deploy local "${deploy_third_json_payload}" "${deploy_third_container_runtime_path}" || deploy_third_attempt_rc=$?
 
                      if rg -q "SpinApplicationResponseCode::okay" "${tmpdir}/mothership.deploy.third.log"
                      then
@@ -5999,6 +7381,11 @@ then
                      echo "FAIL: mothership third deploy did not succeed"
                      sed -n '1,220p' "${tmpdir}/mothership.deploy.third.log"
                      failed=1
+                  elif [[ -n "${deploy_third_expect_text}" ]] && ! rg -q --fixed-strings "${deploy_third_expect_text}" "${tmpdir}/mothership.deploy.third.log"
+                  then
+                     echo "FAIL: third deploy accepted but did not include expected text: ${deploy_third_expect_text}"
+                     sed -n '1,220p' "${tmpdir}/mothership.deploy.third.log"
+                     failed=1
                   else
                      echo "MOTHERSHIP_DEPLOY_THIRD success plan=${deploy_third_plan_json} blob=${deploy_third_container_runtime_path}"
                   fi
@@ -6021,13 +7408,15 @@ then
 
             if [[ "${failed}" -eq 0 && "${deploy_ok}" -eq 1 && "${deploy_skip_probe}" == "0" ]]
             then
+               discover_deploy_report_traffic_ips
+
                # Prime basic request traffic so containers emit initial runtime metrics
                # before report-based autoscale assertions run.
                for _ in $(seq 1 60)
                do
                   for burst in $(seq 1 "${deploy_report_traffic_burst}")
                   do
-                     for ip in "${assigned_brain_ips[@]}"
+                     for ip in "${deploy_report_traffic_ips[@]}"
                      do
                         emit_pingpong_traffic_in_parent_ns "${ip}" "${deploy_ping_port}" "${deploy_ping_payload}" 0.35 >/dev/null 2>&1 || true
                      done
@@ -6043,14 +7432,20 @@ then
                report_last_healthy=-1
                report_max_target=0
                report_last_target=-1
+               report_max_deployed=0
+               report_last_deployed=-1
                report_max_shard_groups=0
                report_last_shard_groups=-1
+               report_max_crashes=0
+               report_last_crashes=-1
                report_min_runtime_cores=-1
                report_min_runtime_memory_mb=-1
                report_min_runtime_storage_mb=-1
                report_max_runtime_cores=0
                report_max_runtime_memory_mb=0
                report_max_runtime_storage_mb=0
+               report_required_scaler_seen=0
+               report_required_scaler_max_value=0
                report_runtime_constraints_requested=0
                report_floor_constraints_requested=0
                report_timed_out=0
@@ -6082,14 +7477,15 @@ then
                   then
                      for burst in $(seq 1 "${deploy_report_traffic_burst}")
                      do
-                        for ip in "${assigned_brain_ips[@]}"
+                        for ip in "${deploy_report_traffic_ips[@]}"
                         do
                            emit_pingpong_traffic_in_parent_ns "${ip}" "${deploy_ping_port}" "${deploy_ping_payload}" 0.35 >/dev/null 2>&1 || true
                         done
                      done
                   fi
 
-                  if run_cluster_report_from_any_ns "${tmpdir}/mothership.clusterreport.log" 3
+                  if run_cluster_report_from_any_ns "${tmpdir}/mothership.clusterreport.log" 3 \
+                     && run_application_report_from_any_ns "${tmpdir}/mothership.applicationreport.log" "${deploy_report_application}" 3
                   then
                      report_sample_max="$(
                         awk -v app="${deploy_report_application}" -v version="${deploy_report_version_id}" -v version_min="${deploy_report_version_min}" '
@@ -6105,10 +7501,9 @@ then
                               next;
                            }
                            in_app && (version == 0 || (version_min == 1 ? current_version >= version : current_version == version)) && match($0, /nHealthy:[[:space:]]*([0-9]+)/, m) {
-                              healthy = m[1] + 0;
-                              if (healthy > max) max = healthy;
+                              sum += m[1] + 0;
                            }
-                           END { print max + 0; }
+                           END { print sum + 0; }
                         ' "${tmpdir}/mothership.applicationreport.log"
                      )"
 
@@ -6126,11 +7521,11 @@ then
                               next;
                            }
                            in_app && (version == 0 || (version_min == 1 ? current_version >= version : current_version == version)) && match($0, /nHealthy:[[:space:]]*([0-9]+)/, m) {
-                              last = m[1] + 0;
+                              sum += m[1] + 0;
                               seen = 1;
                            }
                            END {
-                              if (seen) print last + 0;
+                              if (seen) print sum + 0;
                               else print -1;
                            }
                         ' "${tmpdir}/mothership.applicationreport.log"
@@ -6160,10 +7555,9 @@ then
                               next;
                            }
                            in_app && (version == 0 || (version_min == 1 ? current_version >= version : current_version == version)) && match($0, /nTarget:[[:space:]]*([0-9]+)/, m) {
-                              target = m[1] + 0;
-                              if (target > max) max = target;
+                              sum += m[1] + 0;
                            }
-                           END { print max + 0; }
+                           END { print sum + 0; }
                         ' "${tmpdir}/mothership.applicationreport.log"
                      )"
 
@@ -6181,11 +7575,11 @@ then
                               next;
                            }
                            in_app && (version == 0 || (version_min == 1 ? current_version >= version : current_version == version)) && match($0, /nTarget:[[:space:]]*([0-9]+)/, m) {
-                              last = m[1] + 0;
+                              sum += m[1] + 0;
                               seen = 1;
                            }
                            END {
-                              if (seen) print last + 0;
+                              if (seen) print sum + 0;
                               else print -1;
                            }
                         ' "${tmpdir}/mothership.applicationreport.log"
@@ -6199,6 +7593,60 @@ then
                      if [[ "${report_target_sample_last}" -ge 0 ]]
                      then
                         report_last_target="${report_target_sample_last}"
+                     fi
+
+                     report_deployed_sample_max="$(
+                        awk -v app="${deploy_report_application}" -v version="${deploy_report_version_id}" -v version_min="${deploy_report_version_min}" '
+                           /^[[:space:]]*Application:[[:space:]]*/ {
+                              name = $0;
+                              sub(/^[[:space:]]*Application:[[:space:]]*/, "", name);
+                              in_app = (name == app);
+                              current_version = 0;
+                              next;
+                           }
+                           in_app && match($0, /versionID:[[:space:]]*([0-9]+)/, m) {
+                              current_version = m[1] + 0;
+                              next;
+                           }
+                           in_app && (version == 0 || (version_min == 1 ? current_version >= version : current_version == version)) && match($0, /nDeployed:[[:space:]]*([0-9]+)/, m) {
+                              sum += m[1] + 0;
+                           }
+                           END { print sum + 0; }
+                        ' "${tmpdir}/mothership.applicationreport.log"
+                     )"
+
+                     report_deployed_sample_last="$(
+                        awk -v app="${deploy_report_application}" -v version="${deploy_report_version_id}" -v version_min="${deploy_report_version_min}" '
+                           /^[[:space:]]*Application:[[:space:]]*/ {
+                              name = $0;
+                              sub(/^[[:space:]]*Application:[[:space:]]*/, "", name);
+                              in_app = (name == app);
+                              current_version = 0;
+                              next;
+                           }
+                           in_app && match($0, /versionID:[[:space:]]*([0-9]+)/, m) {
+                              current_version = m[1] + 0;
+                              next;
+                           }
+                           in_app && (version == 0 || (version_min == 1 ? current_version >= version : current_version == version)) && match($0, /nDeployed:[[:space:]]*([0-9]+)/, m) {
+                              sum += m[1] + 0;
+                              seen = 1;
+                           }
+                           END {
+                              if (seen) print sum + 0;
+                              else print -1;
+                           }
+                        ' "${tmpdir}/mothership.applicationreport.log"
+                     )"
+
+                     if [[ "${report_deployed_sample_max}" -gt "${report_max_deployed}" ]]
+                     then
+                        report_max_deployed="${report_deployed_sample_max}"
+                     fi
+
+                     if [[ "${report_deployed_sample_last}" -ge 0 ]]
+                     then
+                        report_last_deployed="${report_deployed_sample_last}"
                      fi
 
                      report_shard_groups_sample_max="$(
@@ -6215,10 +7663,9 @@ then
                               next;
                            }
                            in_app && (version == 0 || (version_min == 1 ? current_version >= version : current_version == version)) && match($0, /nShardGroups:[[:space:]]*([0-9]+)/, m) {
-                              groups = m[1] + 0;
-                              if (groups > max) max = groups;
+                              sum += m[1] + 0;
                            }
-                           END { print max + 0; }
+                           END { print sum + 0; }
                         ' "${tmpdir}/mothership.applicationreport.log"
                      )"
 
@@ -6236,11 +7683,11 @@ then
                               next;
                            }
                            in_app && (version == 0 || (version_min == 1 ? current_version >= version : current_version == version)) && match($0, /nShardGroups:[[:space:]]*([0-9]+)/, m) {
-                              last = m[1] + 0;
+                              sum += m[1] + 0;
                               seen = 1;
                            }
                            END {
-                              if (seen) print last + 0;
+                              if (seen) print sum + 0;
                               else print -1;
                            }
                         ' "${tmpdir}/mothership.applicationreport.log"
@@ -6254,6 +7701,60 @@ then
                      if [[ "${report_shard_groups_sample_last}" -ge 0 ]]
                      then
                         report_last_shard_groups="${report_shard_groups_sample_last}"
+                     fi
+
+                     report_crashes_sample_max="$(
+                        awk -v app="${deploy_report_application}" -v version="${deploy_report_version_id}" -v version_min="${deploy_report_version_min}" '
+                           /^[[:space:]]*Application:[[:space:]]*/ {
+                              name = $0;
+                              sub(/^[[:space:]]*Application:[[:space:]]*/, "", name);
+                              in_app = (name == app);
+                              current_version = 0;
+                              next;
+                           }
+                           in_app && match($0, /versionID:[[:space:]]*([0-9]+)/, m) {
+                              current_version = m[1] + 0;
+                              next;
+                           }
+                           in_app && (version == 0 || (version_min == 1 ? current_version >= version : current_version == version)) && match($0, /nCrashes:[[:space:]]*([0-9]+)/, m) {
+                              sum += m[1] + 0;
+                           }
+                           END { print sum + 0; }
+                        ' "${tmpdir}/mothership.applicationreport.log"
+                     )"
+
+                     report_crashes_sample_last="$(
+                        awk -v app="${deploy_report_application}" -v version="${deploy_report_version_id}" -v version_min="${deploy_report_version_min}" '
+                           /^[[:space:]]*Application:[[:space:]]*/ {
+                              name = $0;
+                              sub(/^[[:space:]]*Application:[[:space:]]*/, "", name);
+                              in_app = (name == app);
+                              current_version = 0;
+                              next;
+                           }
+                           in_app && match($0, /versionID:[[:space:]]*([0-9]+)/, m) {
+                              current_version = m[1] + 0;
+                              next;
+                           }
+                           in_app && (version == 0 || (version_min == 1 ? current_version >= version : current_version == version)) && match($0, /nCrashes:[[:space:]]*([0-9]+)/, m) {
+                              sum += m[1] + 0;
+                              seen = 1;
+                           }
+                           END {
+                              if (seen) print sum + 0;
+                              else print -1;
+                           }
+                        ' "${tmpdir}/mothership.applicationreport.log"
+                     )"
+
+                     if [[ "${report_crashes_sample_max}" -gt "${report_max_crashes}" ]]
+                     then
+                        report_max_crashes="${report_crashes_sample_max}"
+                     fi
+
+                     if [[ "${report_crashes_sample_last}" -ge 0 ]]
+                     then
+                        report_last_crashes="${report_crashes_sample_last}"
                      fi
 
                      report_runtime_sample="$(
@@ -6349,14 +7850,62 @@ then
                         report_max_runtime_storage_mb="${report_runtime_sample_max_storage_mb}"
                      fi
 
+                     if [[ -n "${deploy_report_require_scaler}" ]]
+                     then
+                        report_scaler_sample_value="$(
+                           awk -v required="${deploy_report_require_scaler}" '
+                              /^[[:space:]]*Scaler:[[:space:]]*$/ {
+                                 in_scaler = 1;
+                                 current_name = "";
+                                 next;
+                              }
+                              in_scaler && /^[[:space:]]*name:[[:space:]]*/ {
+                                 current_name = $0;
+                                 sub(/^[[:space:]]*name:[[:space:]]*/, "", current_name);
+                                 next;
+                              }
+                              in_scaler && /^[[:space:]]*nvalue:[[:space:]]*/ {
+                                 value = $0;
+                                 sub(/^[[:space:]]*nvalue:[[:space:]]*/, "", value);
+                                 if (current_name == required)
+                                 {
+                                    if (seen == 0 || value + 0 > max)
+                                    {
+                                       max = value + 0;
+                                    }
+                                    seen = 1;
+                                 }
+                                 in_scaler = 0;
+                                 next;
+                              }
+                              END {
+                                 if (seen) print max;
+                                 else print "";
+                              }
+                           ' "${tmpdir}/mothership.applicationreport.log"
+                        )"
+
+                        if [[ -n "${report_scaler_sample_value}" ]]
+                        then
+                           report_required_scaler_seen=1
+                           if awk -v sample="${report_scaler_sample_value}" -v current="${report_required_scaler_max_value}" 'BEGIN { exit !((sample + 0) > (current + 0)) }'
+                           then
+                              report_required_scaler_max_value="${report_scaler_sample_value}"
+                           fi
+                        fi
+                     fi
+
                      healthy_constraints_met=0
                      target_constraints_met=0
+                     deployed_constraints_met=1
                      shard_constraints_met=1
+                     crash_constraints_met=1
                      runtime_constraints_met=1
+                     scaler_constraints_met=1
 
                      if [[ "${report_max_healthy}" -ge "${deploy_report_min_healthy}" && "${report_max_healthy}" -ge "${deploy_report_max_healthy_min}" ]]
                      then
-                        if [[ "${deploy_report_final_healthy_max}" == "-1" || ( "${report_last_healthy}" -ge 0 && "${report_last_healthy}" -le "${deploy_report_final_healthy_max}" ) ]]
+                        if [[ "${report_last_healthy}" -ge "${deploy_report_final_healthy_min}" && ( "${deploy_report_final_healthy_max}" == "-1" || "${report_last_healthy}" -le "${deploy_report_final_healthy_max}" ) ]]
                         then
                            healthy_constraints_met=1
                         fi
@@ -6370,6 +7919,16 @@ then
                         fi
                      fi
 
+                     if [[ "${report_max_deployed}" -lt "${deploy_report_min_deployed}" || "${report_max_deployed}" -lt "${deploy_report_max_deployed_min}" ]]
+                     then
+                        deployed_constraints_met=0
+                     fi
+
+                     if [[ "${deploy_report_final_deployed_max}" != "-1" && ( "${report_last_deployed}" -lt 0 || "${report_last_deployed}" -gt "${deploy_report_final_deployed_max}" ) ]]
+                     then
+                        deployed_constraints_met=0
+                     fi
+
                      if [[ "${report_max_shard_groups}" -lt "${deploy_report_min_shard_groups}" || "${report_max_shard_groups}" -lt "${deploy_report_max_shard_groups_min}" ]]
                      then
                         shard_constraints_met=0
@@ -6378,6 +7937,11 @@ then
                      if [[ "${deploy_report_final_shard_groups_max}" != "-1" && ( "${report_last_shard_groups}" -lt 0 || "${report_last_shard_groups}" -gt "${deploy_report_final_shard_groups_max}" ) ]]
                      then
                         shard_constraints_met=0
+                     fi
+
+                     if [[ "${deploy_report_max_crashes_max}" != "-1" && ( "${report_last_crashes}" -lt 0 || "${report_max_crashes}" -gt "${deploy_report_max_crashes_max}" ) ]]
+                     then
+                        crash_constraints_met=0
                      fi
 
                      if [[ "${deploy_report_runtime_cores_min}" -gt 0 && ( "${report_min_runtime_cores}" -lt 0 || "${report_min_runtime_cores}" -lt "${deploy_report_runtime_cores_min}" ) ]]
@@ -6410,7 +7974,16 @@ then
                         runtime_constraints_met=0
                      fi
 
-                     if [[ "${healthy_constraints_met}" -eq 1 && "${target_constraints_met}" -eq 1 && "${shard_constraints_met}" -eq 1 && "${runtime_constraints_met}" -eq 1 ]]
+                     if [[ -n "${deploy_report_require_scaler}" ]]
+                     then
+                        scaler_constraints_met=0
+                        if [[ "${report_required_scaler_seen}" -eq 1 ]] && awk -v value="${report_required_scaler_max_value}" -v minimum="${deploy_report_require_scaler_value_min}" 'BEGIN { exit !((value + 0) >= (minimum + 0)) }'
+                        then
+                           scaler_constraints_met=1
+                        fi
+                     fi
+
+                     if [[ "${healthy_constraints_met}" -eq 1 && "${target_constraints_met}" -eq 1 && "${deployed_constraints_met}" -eq 1 && "${shard_constraints_met}" -eq 1 && "${crash_constraints_met}" -eq 1 && "${runtime_constraints_met}" -eq 1 && "${scaler_constraints_met}" -eq 1 ]]
                      then
                         report_now_ms=$(( $(date +%s%N) / 1000000 ))
                         if [[ "${report_stable_since_ms}" -eq 0 ]]
@@ -6443,12 +8016,15 @@ then
 
                healthy_constraints_met=0
                target_constraints_met=0
+               deployed_constraints_met=1
                shard_constraints_met=1
+               crash_constraints_met=1
                runtime_constraints_met=1
+               scaler_constraints_met=1
 
                if [[ "${report_max_healthy}" -ge "${deploy_report_min_healthy}" && "${report_max_healthy}" -ge "${deploy_report_max_healthy_min}" ]]
                then
-                  if [[ "${deploy_report_final_healthy_max}" == "-1" || ( "${report_last_healthy}" -ge 0 && "${report_last_healthy}" -le "${deploy_report_final_healthy_max}" ) ]]
+                  if [[ "${report_last_healthy}" -ge "${deploy_report_final_healthy_min}" && ( "${deploy_report_final_healthy_max}" == "-1" || "${report_last_healthy}" -le "${deploy_report_final_healthy_max}" ) ]]
                   then
                      healthy_constraints_met=1
                   fi
@@ -6462,6 +8038,16 @@ then
                   fi
                fi
 
+               if [[ "${report_max_deployed}" -lt "${deploy_report_min_deployed}" || "${report_max_deployed}" -lt "${deploy_report_max_deployed_min}" ]]
+               then
+                  deployed_constraints_met=0
+               fi
+
+               if [[ "${deploy_report_final_deployed_max}" != "-1" && ( "${report_last_deployed}" -lt 0 || "${report_last_deployed}" -gt "${deploy_report_final_deployed_max}" ) ]]
+               then
+                  deployed_constraints_met=0
+               fi
+
                if [[ "${report_max_shard_groups}" -lt "${deploy_report_min_shard_groups}" || "${report_max_shard_groups}" -lt "${deploy_report_max_shard_groups_min}" ]]
                then
                   shard_constraints_met=0
@@ -6470,6 +8056,11 @@ then
                if [[ "${deploy_report_final_shard_groups_max}" != "-1" && ( "${report_last_shard_groups}" -lt 0 || "${report_last_shard_groups}" -gt "${deploy_report_final_shard_groups_max}" ) ]]
                then
                   shard_constraints_met=0
+               fi
+
+               if [[ "${deploy_report_max_crashes_max}" != "-1" && ( "${report_last_crashes}" -lt 0 || "${report_max_crashes}" -gt "${deploy_report_max_crashes_max}" ) ]]
+               then
+                  crash_constraints_met=0
                fi
 
                if [[ "${deploy_report_runtime_cores_min}" -gt 0 && ( "${report_min_runtime_cores}" -lt 0 || "${report_min_runtime_cores}" -lt "${deploy_report_runtime_cores_min}" ) ]]
@@ -6502,7 +8093,16 @@ then
                   runtime_constraints_met=0
                fi
 
-               if [[ "${healthy_constraints_met}" -eq 1 && "${target_constraints_met}" -eq 1 && "${shard_constraints_met}" -eq 1 && "${runtime_constraints_met}" -eq 1 ]]
+               if [[ -n "${deploy_report_require_scaler}" ]]
+               then
+                  scaler_constraints_met=0
+                  if [[ "${report_required_scaler_seen}" -eq 1 ]] && awk -v value="${report_required_scaler_max_value}" -v minimum="${deploy_report_require_scaler_value_min}" 'BEGIN { exit !((value + 0) >= (minimum + 0)) }'
+                  then
+                     scaler_constraints_met=1
+                  fi
+               fi
+
+               if [[ "${healthy_constraints_met}" -eq 1 && "${target_constraints_met}" -eq 1 && "${deployed_constraints_met}" -eq 1 && "${shard_constraints_met}" -eq 1 && "${crash_constraints_met}" -eq 1 && "${runtime_constraints_met}" -eq 1 && "${scaler_constraints_met}" -eq 1 ]]
                then
                   report_ok=1
                fi
@@ -6513,7 +8113,7 @@ then
                   then
                      echo "FAIL: deploy report checks exceeded timeout ${deploy_report_max_seconds}s"
                   fi
-                  echo "FAIL: deployment report check failed for application=${deploy_report_application} versionID=${deploy_report_version_id} versionMin=${deploy_report_version_min} minHealthy=${deploy_report_min_healthy} maxHealthyMin=${deploy_report_max_healthy_min} finalHealthyMax=${deploy_report_final_healthy_max} minTarget=${deploy_report_min_target} maxTargetMin=${deploy_report_max_target_min} finalTargetMax=${deploy_report_final_target_max} minShardGroups=${deploy_report_min_shard_groups} maxShardGroupsMin=${deploy_report_max_shard_groups_min} finalShardGroupsMax=${deploy_report_final_shard_groups_max} runtimeMinCores=${deploy_report_runtime_cores_min} runtimeMinMemoryMB=${deploy_report_runtime_memory_min_mb} runtimeMinStorageMB=${deploy_report_runtime_storage_min_mb} runtimeMaxCoresMin=${deploy_report_runtime_cores_max_min} runtimeMaxMemoryMBMin=${deploy_report_runtime_memory_max_min_mb} runtimeMaxStorageMBMin=${deploy_report_runtime_storage_max_min_mb} observedMaxHealthy=${report_max_healthy} observedFinalHealthy=${report_last_healthy} observedMaxTarget=${report_max_target} observedFinalTarget=${report_last_target} observedMaxShardGroups=${report_max_shard_groups} observedFinalShardGroups=${report_last_shard_groups} observedRuntimeMinCores=${report_min_runtime_cores} observedRuntimeMinMemoryMB=${report_min_runtime_memory_mb} observedRuntimeMinStorageMB=${report_min_runtime_storage_mb} observedRuntimeMaxCores=${report_max_runtime_cores} observedRuntimeMaxMemoryMB=${report_max_runtime_memory_mb} observedRuntimeMaxStorageMB=${report_max_runtime_storage_mb}"
+                  echo "FAIL: deployment report check failed for application=${deploy_report_application} versionID=${deploy_report_version_id} versionMin=${deploy_report_version_min} minHealthy=${deploy_report_min_healthy} maxHealthyMin=${deploy_report_max_healthy_min} finalHealthyMin=${deploy_report_final_healthy_min} finalHealthyMax=${deploy_report_final_healthy_max} minTarget=${deploy_report_min_target} maxTargetMin=${deploy_report_max_target_min} finalTargetMax=${deploy_report_final_target_max} minDeployed=${deploy_report_min_deployed} maxDeployedMin=${deploy_report_max_deployed_min} finalDeployedMax=${deploy_report_final_deployed_max} minShardGroups=${deploy_report_min_shard_groups} maxShardGroupsMin=${deploy_report_max_shard_groups_min} finalShardGroupsMax=${deploy_report_final_shard_groups_max} maxCrashesMax=${deploy_report_max_crashes_max} runtimeMinCores=${deploy_report_runtime_cores_min} runtimeMinMemoryMB=${deploy_report_runtime_memory_min_mb} runtimeMinStorageMB=${deploy_report_runtime_storage_min_mb} runtimeMaxCoresMin=${deploy_report_runtime_cores_max_min} runtimeMaxMemoryMBMin=${deploy_report_runtime_memory_max_min_mb} runtimeMaxStorageMBMin=${deploy_report_runtime_storage_max_min_mb} requireScaler=${deploy_report_require_scaler} requireScalerValueMin=${deploy_report_require_scaler_value_min} observedMaxHealthy=${report_max_healthy} observedFinalHealthy=${report_last_healthy} observedMaxTarget=${report_max_target} observedFinalTarget=${report_last_target} observedMaxDeployed=${report_max_deployed} observedFinalDeployed=${report_last_deployed} observedMaxShardGroups=${report_max_shard_groups} observedFinalShardGroups=${report_last_shard_groups} observedMaxCrashes=${report_max_crashes} observedFinalCrashes=${report_last_crashes} observedRuntimeMinCores=${report_min_runtime_cores} observedRuntimeMinMemoryMB=${report_min_runtime_memory_mb} observedRuntimeMinStorageMB=${report_min_runtime_storage_mb} observedRuntimeMaxCores=${report_max_runtime_cores} observedRuntimeMaxMemoryMB=${report_max_runtime_memory_mb} observedRuntimeMaxStorageMB=${report_max_runtime_storage_mb} observedRequiredScalerSeen=${report_required_scaler_seen} observedRequiredScalerMaxValue=${report_required_scaler_max_value}"
                   sed -n '1,220p' "${tmpdir}/mothership.applicationreport.log"
                   for idx in "${!brain_fs_roots[@]}"
                   do
@@ -6527,7 +8127,7 @@ then
                   done
                   failed=1
                else
-                  echo "DEPLOY_REPORT success application=${deploy_report_application} versionID=${deploy_report_version_id} versionMin=${deploy_report_version_min} minHealthy=${deploy_report_min_healthy} maxHealthyMin=${deploy_report_max_healthy_min} finalHealthyMax=${deploy_report_final_healthy_max} minTarget=${deploy_report_min_target} maxTargetMin=${deploy_report_max_target_min} finalTargetMax=${deploy_report_final_target_max} minShardGroups=${deploy_report_min_shard_groups} maxShardGroupsMin=${deploy_report_max_shard_groups_min} finalShardGroupsMax=${deploy_report_final_shard_groups_max} runtimeMinCores=${deploy_report_runtime_cores_min} runtimeMinMemoryMB=${deploy_report_runtime_memory_min_mb} runtimeMinStorageMB=${deploy_report_runtime_storage_min_mb} runtimeMaxCoresMin=${deploy_report_runtime_cores_max_min} runtimeMaxMemoryMBMin=${deploy_report_runtime_memory_max_min_mb} runtimeMaxStorageMBMin=${deploy_report_runtime_storage_max_min_mb} maxHealthy=${report_max_healthy} finalHealthy=${report_last_healthy} maxTarget=${report_max_target} finalTarget=${report_last_target} maxShardGroups=${report_max_shard_groups} finalShardGroups=${report_last_shard_groups} minRuntimeCores=${report_min_runtime_cores} minRuntimeMemoryMB=${report_min_runtime_memory_mb} minRuntimeStorageMB=${report_min_runtime_storage_mb} maxRuntimeCores=${report_max_runtime_cores} maxRuntimeMemoryMB=${report_max_runtime_memory_mb} maxRuntimeStorageMB=${report_max_runtime_storage_mb}"
+                  echo "DEPLOY_REPORT success application=${deploy_report_application} versionID=${deploy_report_version_id} versionMin=${deploy_report_version_min} minHealthy=${deploy_report_min_healthy} maxHealthyMin=${deploy_report_max_healthy_min} finalHealthyMin=${deploy_report_final_healthy_min} finalHealthyMax=${deploy_report_final_healthy_max} minTarget=${deploy_report_min_target} maxTargetMin=${deploy_report_max_target_min} finalTargetMax=${deploy_report_final_target_max} minDeployed=${deploy_report_min_deployed} maxDeployedMin=${deploy_report_max_deployed_min} finalDeployedMax=${deploy_report_final_deployed_max} minShardGroups=${deploy_report_min_shard_groups} maxShardGroupsMin=${deploy_report_max_shard_groups_min} finalShardGroupsMax=${deploy_report_final_shard_groups_max} maxCrashesMax=${deploy_report_max_crashes_max} runtimeMinCores=${deploy_report_runtime_cores_min} runtimeMinMemoryMB=${deploy_report_runtime_memory_min_mb} runtimeMinStorageMB=${deploy_report_runtime_storage_min_mb} runtimeMaxCoresMin=${deploy_report_runtime_cores_max_min} runtimeMaxMemoryMBMin=${deploy_report_runtime_memory_max_min_mb} runtimeMaxStorageMBMin=${deploy_report_runtime_storage_max_min_mb} requireScaler=${deploy_report_require_scaler} requireScalerValueMin=${deploy_report_require_scaler_value_min} maxHealthy=${report_max_healthy} finalHealthy=${report_last_healthy} maxTarget=${report_max_target} finalTarget=${report_last_target} maxDeployed=${report_max_deployed} finalDeployed=${report_last_deployed} maxShardGroups=${report_max_shard_groups} finalShardGroups=${report_last_shard_groups} maxCrashes=${report_max_crashes} finalCrashes=${report_last_crashes} minRuntimeCores=${report_min_runtime_cores} minRuntimeMemoryMB=${report_min_runtime_memory_mb} minRuntimeStorageMB=${report_min_runtime_storage_mb} maxRuntimeCores=${report_max_runtime_cores} maxRuntimeMemoryMB=${report_max_runtime_memory_mb} maxRuntimeStorageMB=${report_max_runtime_storage_mb} requiredScalerSeen=${report_required_scaler_seen} requiredScalerMaxValue=${report_required_scaler_max_value}"
                fi
             fi
 
@@ -6561,7 +8161,7 @@ then
                   for ns in "${child_names[@]}"
                   do
                      echo "--- ${ns} listeners ---"
-                     ip netns exec "${ns}" ss -ltn 2>/dev/null || true
+                     child_netns_exec "${ns}" ss -ltn 2>/dev/null || true
                   done
 
                   for idx in "${!brain_fs_roots[@]}"
@@ -6636,7 +8236,7 @@ then
       do
          established="$(count_established_peer_links_in_ns "${ns}")"
          echo "--- ${ns} sockets (peer_estab_313=${established}) ---"
-         ip netns exec "${ns}" ss -tan 2>/dev/null || true
+         child_netns_exec "${ns}" ss -tan 2>/dev/null || true
       done
       failed=1
    fi
@@ -6698,6 +8298,7 @@ then
 
       update_ns="${update_baseline_master_ns}"
       update_listener_ready=0
+      update_trigger_ms=0
       for attempt in $(seq 1 80)
       do
          for ns in "${child_names[@]}"
@@ -6726,13 +8327,16 @@ then
             dump_master_listener_state "${ns}"
          done
          failed=1
-      elif timeout --preserve-status -k 3s 8s \
-         ip netns exec "${update_ns}" \
-         env PRODIGY_STATE_DB=/containers/var/lib/prodigy/state PRODIGY_MOTHERSHIP_SOCKET="${mothership_socket_path}" "${mothership_bin}" updateProdigy local "${mothership_update_prodigy_input}" \
-         >"${tmpdir}/mothership.updateProdigy.log" 2>&1
-      then
-         echo "UPDATE_TRIGGERED ns=${update_ns} baseline_index=${update_baseline_master_index}"
       else
+         update_trigger_ms="$(now_ms)"
+      fi
+
+      if [[ "${failed}" -eq 0 ]] && run_timeout_in_child_netns "${update_ns}" 8s 3s "${tmpdir}/mothership.updateProdigy.log" \
+         env PRODIGY_STATE_DB="${state_db_path}" PRODIGY_MOTHERSHIP_SOCKET="${mothership_socket_path}" "${mothership_bin}" updateProdigy local "${mothership_update_prodigy_input}"
+      then
+         echo "UPDATE_TRIGGERED ns=${update_ns} baseline_index=${update_baseline_master_index} atMs=${update_trigger_ms}"
+      elif [[ "${failed}" -eq 0 ]]
+      then
          echo "FAIL: mothership updateProdigy dispatch failed"
          sed -n '1,160p' "${tmpdir}/mothership.updateProdigy.log"
          failed=1
@@ -6814,7 +8418,7 @@ then
             then
                echo "FAIL: updateProdigy order proof missing coordinator brain log for index ${update_dispatch_index}"
                failed=1
-            elif ! verify_update_prodigy_sequence "${update_coordinator_log}" "${update_expected_peer_echos}"
+            elif ! verify_update_prodigy_sequence "${update_coordinator_log}" "${update_expected_peer_echos}" 200 "${update_order_budget_ms}"
             then
                echo "--- coordinator update log (${update_coordinator_log}) ---"
                sed -n '1,200p' "${update_coordinator_log}"
@@ -6833,6 +8437,7 @@ then
          update_phase_changed=0
          update_phase_split_brain=0
          update_phase_split_quorum_indices="none"
+         update_first_change_ms=0
          for attempt in $(seq 1 "${update_phase_attempts}")
          do
             listener_indices=""
@@ -6853,6 +8458,10 @@ then
                elif [[ "${quorum_count}" -eq 1 ]] && csv_has_other_than "${quorum_indices}" "${update_baseline_master_index}"
                then
                   update_phase_changed=1
+                  if [[ "${update_first_change_ms}" -eq 0 ]]
+                  then
+                     update_first_change_ms="$(now_ms)"
+                  fi
                fi
             fi
 
@@ -6860,6 +8469,18 @@ then
          done
 
          echo "UPDATE_PHASE listeners=${update_phase_listener_indices} quorum=${update_phase_quorum_indices} changed=${update_phase_changed}"
+         if [[ "${update_first_change_ms}" -gt 0 && "${update_trigger_ms}" -gt 0 ]]
+         then
+            update_master_change_latency_ms=$((update_first_change_ms - update_trigger_ms))
+            echo "UPDATE_TIMING masterChangeLatencyMs=${update_master_change_latency_ms} budgetMs=${update_master_change_budget_ms}"
+            if [[ "${update_master_change_budget_ms}" -gt 0 && "${update_master_change_latency_ms}" -gt "${update_master_change_budget_ms}" ]]
+            then
+               echo "FAIL: updateProdigy master handoff exceeded latency budget (latencyMs=${update_master_change_latency_ms}, budgetMs=${update_master_change_budget_ms})"
+               failed=1
+            fi
+         else
+            echo "UPDATE_TIMING masterChangeLatencyMs=unobserved budgetMs=${update_master_change_budget_ms}"
+         fi
 
          if [[ "${expect_master_change_during_fault}" == "1" ]]
          then
@@ -6957,7 +8578,7 @@ then
                do
                   established="$(count_established_peer_links_in_ns "${ns}")"
                   echo "--- ${ns} listeners (peer_estab_313=${established}) ---"
-                  ip netns exec "${ns}" ss -ltn 2>/dev/null || true
+                  child_netns_exec "${ns}" ss -ltn 2>/dev/null || true
                done
                failed=1
             fi
@@ -6997,7 +8618,7 @@ then
                for ns in "${child_names[@]}"
                do
                   echo "--- ${ns} sockets ---"
-                  ip netns exec "${ns}" ss -tan 2>/dev/null || true
+                  child_netns_exec "${ns}" ss -tan 2>/dev/null || true
                done
                failed=1
             fi
@@ -7104,93 +8725,97 @@ then
          fault_phase_changed=0
          fault_phase_split_brain=0
          fault_phase_split_quorum_indices="none"
+         fault_applied_ms=0
+         fault_first_change_ms=0
 
          if [[ "${fault_mode}" == "link" ]]
          then
             set_fault_links_state "${resolved_fault_targets}" down
-            echo "FAULT_APPLIED mode=link targets=${resolved_fault_targets} state=down"
+            fault_applied_ms="$(now_ms)"
+            echo "FAULT_APPLIED mode=link targets=${resolved_fault_targets} state=down atMs=${fault_applied_ms}"
 
-            fault_phase_attempts=$((post_fault_window_s * 5))
+            fault_phase_duration_s="${post_fault_window_s}"
             if [[ "${fault_duration_s}" -gt 0 ]]
             then
-               fault_phase_attempts=$((fault_duration_s * 5))
+               fault_phase_duration_s="${fault_duration_s}"
             fi
-            if [[ "${fault_phase_attempts}" -lt 1 ]]
+            if [[ "${fault_phase_duration_s}" -lt 1 ]]
             then
-               fault_phase_attempts=1
+               fault_phase_duration_s=1
             fi
 
-            for attempt in $(seq 1 "${fault_phase_attempts}")
-            do
-               record_fault_phase_sample "${baseline_master_index}"
-               sleep 0.2
-            done
+            run_fault_phase_samples_for_ms "${baseline_master_index}" "$((fault_phase_duration_s * 1000))"
 
             if [[ "${fault_duration_s}" -gt 0 ]]
             then
                set_fault_links_state "${resolved_fault_targets}" up
-               echo "FAULT_APPLIED mode=link targets=${resolved_fault_targets} state=up"
+               echo "FAULT_APPLIED mode=link targets=${resolved_fault_targets} state=up atMs=$(now_ms)"
             fi
          elif [[ "${fault_mode}" == "crash" ]]
          then
             kill_fault_target_brains "${resolved_fault_targets}"
-            echo "FAULT_APPLIED mode=crash targets=${resolved_fault_targets} state=crashed"
+            fault_applied_ms="$(now_ms)"
+            echo "FAULT_APPLIED mode=crash targets=${resolved_fault_targets} state=crashed atMs=${fault_applied_ms}"
 
-            fault_phase_attempts=$((post_fault_window_s * 5))
+            fault_phase_duration_s="${post_fault_window_s}"
             if [[ "${fault_duration_s}" -gt 0 ]]
             then
-               fault_phase_attempts=$((fault_duration_s * 5))
+               fault_phase_duration_s="${fault_duration_s}"
             fi
-            if [[ "${fault_phase_attempts}" -lt 1 ]]
+            if [[ "${fault_phase_duration_s}" -lt 1 ]]
             then
-               fault_phase_attempts=1
+               fault_phase_duration_s=1
             fi
 
-            for attempt in $(seq 1 "${fault_phase_attempts}")
-            do
-               record_fault_phase_sample "${baseline_master_index}"
-               sleep 0.2
-            done
+            run_fault_phase_samples_for_ms "${baseline_master_index}" "$((fault_phase_duration_s * 1000))"
 
             if [[ "${fault_duration_s}" -gt 0 ]]
             then
                restart_fault_target_brains "${resolved_fault_targets}"
-               echo "FAULT_APPLIED mode=crash targets=${resolved_fault_targets} state=restarted"
+               echo "FAULT_APPLIED mode=crash targets=${resolved_fault_targets} state=restarted atMs=$(now_ms)"
             fi
          else
             for cycle in $(seq 1 "${fault_cycles}")
             do
                set_fault_links_state "${resolved_fault_targets}" down
-               echo "FAULT_APPLIED mode=flap cycle=${cycle}/${fault_cycles} targets=${resolved_fault_targets} state=down"
-
-               down_attempts=$((fault_down_s * 5))
-               if [[ "${down_attempts}" -lt 1 ]]
+               if [[ "${fault_applied_ms}" -eq 0 ]]
                then
-                  down_attempts=1
+                  fault_applied_ms="$(now_ms)"
                fi
-               for attempt in $(seq 1 "${down_attempts}")
-               do
-                  record_fault_phase_sample "${baseline_master_index}"
-                  sleep 0.2
-               done
+               echo "FAULT_APPLIED mode=flap cycle=${cycle}/${fault_cycles} targets=${resolved_fault_targets} state=down atMs=$(now_ms)"
+
+               fault_down_duration_s="${fault_down_s}"
+               if [[ "${fault_down_duration_s}" -lt 1 ]]
+               then
+                  fault_down_duration_s=1
+               fi
+               run_fault_phase_samples_for_ms "${baseline_master_index}" "$((fault_down_duration_s * 1000))"
 
                set_fault_links_state "${resolved_fault_targets}" up
-               echo "FAULT_APPLIED mode=flap cycle=${cycle}/${fault_cycles} targets=${resolved_fault_targets} state=up"
+               echo "FAULT_APPLIED mode=flap cycle=${cycle}/${fault_cycles} targets=${resolved_fault_targets} state=up atMs=$(now_ms)"
 
-               up_attempts=$((fault_up_s * 5))
-               if [[ "${up_attempts}" -lt 1 ]]
+               fault_up_duration_s="${fault_up_s}"
+               if [[ "${fault_up_duration_s}" -lt 1 ]]
                then
-                  up_attempts=1
+                  fault_up_duration_s=1
                fi
-               for attempt in $(seq 1 "${up_attempts}")
-               do
-                  record_fault_phase_sample "${baseline_master_index}"
-                  sleep 0.2
-               done
+               run_fault_phase_samples_for_ms "${baseline_master_index}" "$((fault_up_duration_s * 1000))"
             done
          fi
 
          echo "FAULT_PHASE listeners=${fault_phase_listener_indices} quorum=${fault_phase_quorum_indices} changed=${fault_phase_changed}"
+         if [[ "${fault_first_change_ms}" -gt 0 && "${fault_applied_ms}" -gt 0 ]]
+         then
+            fault_master_change_latency_ms=$((fault_first_change_ms - fault_applied_ms))
+            echo "FAULT_TIMING masterChangeLatencyMs=${fault_master_change_latency_ms} budgetMs=${fault_master_change_budget_ms}"
+            if [[ "${fault_master_change_budget_ms}" -gt 0 && "${fault_master_change_latency_ms}" -gt "${fault_master_change_budget_ms}" ]]
+            then
+               echo "FAIL: fault master change exceeded latency budget (latencyMs=${fault_master_change_latency_ms}, budgetMs=${fault_master_change_budget_ms})"
+               failed=1
+            fi
+         else
+            echo "FAULT_TIMING masterChangeLatencyMs=unobserved budgetMs=${fault_master_change_budget_ms}"
+         fi
 
          if [[ "${expect_master_change_during_fault}" == "1" ]]
          then
@@ -7281,6 +8906,13 @@ then
             if [[ "${final_quorum_count}" -eq 0 ]]
             then
                echo "FAIL: expected a quorum master after fault, but none was found"
+               for ns in "${child_names[@]}"
+               do
+                  established="$(count_established_peer_links_in_ns "${ns}" || echo 0)"
+                  neurons_established="$(count_established_neuron_links_in_ns "${ns}" || echo 0)"
+                  echo "--- ${ns} listeners (peer_estab_313=${established} neuron_estab_312=${neurons_established}) ---"
+                  dump_master_listener_state "${ns}"
+               done
                failed=1
             elif [[ "${final_quorum_count}" -gt 1 ]]
             then
@@ -7290,7 +8922,7 @@ then
                   established="$(count_established_peer_links_in_ns "${ns}")"
                   neurons_established="$(count_established_neuron_links_in_ns "${ns}")"
                   echo "--- ${ns} listeners (peer_estab_313=${established} neuron_estab_312=${neurons_established}) ---"
-                  ip netns exec "${ns}" ss -ltn 2>/dev/null || true
+                  dump_master_listener_state "${ns}"
                done
                failed=1
             fi
@@ -7303,7 +8935,7 @@ then
                do
                   established="$(count_established_peer_links_in_ns "${ns}")"
                   echo "--- ${ns} listeners (peer_estab_313=${established}) ---"
-                  ip netns exec "${ns}" ss -ltn 2>/dev/null || true
+                  child_netns_exec "${ns}" ss -ltn 2>/dev/null || true
                done
                failed=1
             fi
@@ -7349,7 +8981,7 @@ then
                for ns in "${child_names[@]}"
                do
                   echo "--- ${ns} sockets ---"
-                  ip netns exec "${ns}" ss -tan 2>/dev/null || true
+                  child_netns_exec "${ns}" ss -tan 2>/dev/null || true
                done
                failed=1
             fi
@@ -7399,7 +9031,7 @@ then
                for ns in "${child_names[@]}"
                do
                   echo "--- ${ns} listeners ---"
-                  ip netns exec "${ns}" ss -ltn 2>/dev/null || true
+                  child_netns_exec "${ns}" ss -ltn 2>/dev/null || true
                done
                failed=1
             fi
@@ -7479,7 +9111,7 @@ terminate_all_brains
 set +e
 for i in "${!pids[@]}"
 do
-   wait "${pids[$i]}"
+   wait "${pids[$i]}" 2>/dev/null
    status_codes[$i]=$?
 done
 set -e

@@ -1,0 +1,212 @@
+{
+   "manifestVersion": 3,
+   "wireSeries": "WIRE_V1",
+   "wireProtocolVersion": 1,
+   "fixtureCorpusVersion": 2,
+   "containerParametersMagic": "PRDPAR01",
+   "credentialBundleMagic": "PRDBUN01",
+   "credentialDeltaMagic": "PRDDEL01",
+   "policy": {
+      "breakingWireChangesRequireNewWireSeries": true,
+      "nonBreakingWireByteChangesRequireWireProtocolVersionBump": true,
+      "fixtureByteChangesRequireFixtureCorpusVersionBump": true,
+      "manifestShapeChangesRequireFixtureManifestVersionBump": true
+   },
+   "fixtures": [
+      {
+         "description": "Advertisement pairing frame",
+         "file": "frame.advertisement_pairing.activate.bin",
+         "kind": "frame",
+         "name": "frame.advertisement_pairing.activate",
+         "sha256": "35bbff47810bc6cf4f3dfc71acb20e4c2a82d0f55816f2e4fe9037bcd99b3d1f",
+         "size": 64,
+         "topic": "advertisementPairing"
+      },
+      {
+         "description": "Empty credentials refresh ack frame",
+         "file": "frame.credentials_refresh_ack.empty.bin",
+         "kind": "frame",
+         "name": "frame.credentials_refresh_ack.empty",
+         "sha256": "7dd22c220e5c2921825e66ed3939b4efe513c15356f07d0c891964697b75b99d",
+         "size": 16,
+         "topic": "credentialsRefresh"
+      },
+      {
+         "description": "Credential refresh frame with full delta payload",
+         "file": "frame.credentials_refresh.full.bin",
+         "kind": "frame",
+         "name": "frame.credentials_refresh.full",
+         "sha256": "7cd53ed67b233d540ebfdd09fbf13540a7f6bd32dbe781f3c6d4d89493df9eb3",
+         "size": 544,
+         "topic": "credentialsRefresh"
+      },
+      {
+         "description": "Datacenter unique tag frame",
+         "file": "frame.datacenter_unique_tag.23.bin",
+         "kind": "frame",
+         "name": "frame.datacenter_unique_tag.23",
+         "sha256": "8a1fe53cce99842cb5f193148b807a425bfeaf8a6466c7f561302c428c61c122",
+         "size": 16,
+         "topic": "datacenterUniqueTag"
+      },
+      {
+         "description": "Empty healthy frame",
+         "file": "frame.healthy.empty.bin",
+         "kind": "frame",
+         "name": "frame.healthy.empty",
+         "sha256": "95bd4340d3671fa5632c0639cf9d79e9cb76924fa6bd13dfd72f35e1aae819aa",
+         "size": 16,
+         "topic": "healthy"
+      },
+      {
+         "description": "Opaque message frame",
+         "file": "frame.message.demo.bin",
+         "kind": "frame",
+         "name": "frame.message.demo",
+         "sha256": "acd7797f08e3e2c8dcd1d8193f1c25132c91e82f2fdc20c422ce667440f9c5bf",
+         "size": 32,
+         "topic": "message"
+      },
+      {
+         "description": "Empty ping frame",
+         "file": "frame.ping.empty.bin",
+         "kind": "frame",
+         "name": "frame.ping.empty",
+         "sha256": "1ec58bca0f1276dd14b36c713523f65b263d7e56800971f4d0be8719041253d6",
+         "size": 16,
+         "topic": "ping"
+      },
+      {
+         "description": "Accepted resource delta ack frame",
+         "file": "frame.resource_delta_ack.accepted.bin",
+         "kind": "frame",
+         "name": "frame.resource_delta_ack.accepted",
+         "sha256": "e610e88baa88d90d645ccd3149f30b06a1334b0592cc0c9b4c24fc6c856e90f5",
+         "size": 16,
+         "topic": "resourceDeltaAck"
+      },
+      {
+         "description": "Resource delta frame",
+         "file": "frame.resource_delta.scale_up.bin",
+         "kind": "frame",
+         "name": "frame.resource_delta.scale_up",
+         "sha256": "6e2a20c664f56a7cccddf06b89a42965c72d0b2a22abdad8045f2f4f8c023af0",
+         "size": 32,
+         "topic": "resourceDelta"
+      },
+      {
+         "description": "Statistics frame",
+         "file": "frame.statistics.demo.bin",
+         "kind": "frame",
+         "name": "frame.statistics.demo",
+         "sha256": "35fc686dff6b820624d8add2da66c9c23224a2eb8333f1d5673ad4b93c33a665",
+         "size": 48,
+         "topic": "statistics"
+      },
+      {
+         "description": "Empty stop frame",
+         "file": "frame.stop.empty.bin",
+         "kind": "frame",
+         "name": "frame.stop.empty",
+         "sha256": "7b24462d4e0324252a56d3c7d37cf2c2e0a29d7d924fa3ca1c79f95a6eade86e",
+         "size": 16,
+         "topic": "stop"
+      },
+      {
+         "description": "Subscription pairing frame",
+         "file": "frame.subscription_pairing.activate.bin",
+         "kind": "frame",
+         "name": "frame.subscription_pairing.activate",
+         "sha256": "1982602bc2e999e919c4c50af99564440f5d859681561365b7565537efd5ace0",
+         "size": 64,
+         "topic": "subscriptionPairing"
+      },
+      {
+         "description": "Packed advertisement pairing payload",
+         "file": "payload.advertisement_pairing.activate.bin",
+         "kind": "payload",
+         "name": "payload.advertisement_pairing.activate",
+         "sha256": "fcc7bf657e25e9ab73e3e6b4c8e8c41ea362a7e2e2f1119cf6fb9bcc44ae9e18",
+         "size": 43,
+         "topic": "advertisementPairing"
+      },
+      {
+         "description": "Credential refresh payload using CredentialDelta bytes",
+         "file": "payload.credentials_refresh.full.bin",
+         "kind": "payload",
+         "name": "payload.credentials_refresh.full",
+         "sha256": "f8a19b7dc0c04c73c5fe0ceb10645c0248905903efa775ec086e64a903678ec3",
+         "size": 528,
+         "topic": "credentialsRefresh"
+      },
+      {
+         "description": "Single-byte datacenter tag payload",
+         "file": "payload.datacenter_unique_tag.23.bin",
+         "kind": "payload",
+         "name": "payload.datacenter_unique_tag.23",
+         "sha256": "8f11b05da785e43e713d03774c6bd3405d99cd3024af334ffd68db663aa37034",
+         "size": 1,
+         "topic": "datacenterUniqueTag"
+      },
+      {
+         "description": "Single-byte accepted ack payload",
+         "file": "payload.resource_delta_ack.accepted.bin",
+         "kind": "payload",
+         "name": "payload.resource_delta_ack.accepted",
+         "sha256": "4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+         "size": 1,
+         "topic": "resourceDeltaAck"
+      },
+      {
+         "description": "Packed resource delta payload",
+         "file": "payload.resource_delta.scale_up.bin",
+         "kind": "payload",
+         "name": "payload.resource_delta.scale_up",
+         "sha256": "b84e6a59adddc0278c200d65bcf8ea4aeb1d41ab56e8c8a47a288d9b01884d52",
+         "size": 15,
+         "topic": "resourceDelta"
+      },
+      {
+         "description": "Packed metric pairs payload",
+         "file": "payload.statistics.demo.bin",
+         "kind": "payload",
+         "name": "payload.statistics.demo",
+         "sha256": "73e200e2b048c86d4e8c86b86bf62bbda84c7384e34e250b01aa30ab29d234a4",
+         "size": 32,
+         "topic": "statistics"
+      },
+      {
+         "description": "Packed subscription pairing payload",
+         "file": "payload.subscription_pairing.activate.bin",
+         "kind": "payload",
+         "name": "payload.subscription_pairing.activate",
+         "sha256": "f2b4415965e707a0580aad459cac49bf8e1ade99ab717e24a5ab76d5171216cf",
+         "size": 45,
+         "topic": "subscriptionPairing"
+      },
+      {
+         "description": "ContainerParameters fixture with embedded credential bundle",
+         "file": "startup.container_parameters.full.bin",
+         "kind": "startup",
+         "name": "startup.container_parameters.full",
+         "sha256": "fbd0f527e474a17cbf9be56b2960e96ec2f21b5fce885094ce86780f92333e9f",
+         "size": 660
+      },
+      {
+         "description": "Standalone CredentialBundle fixture",
+         "file": "startup.credential_bundle.full.bin",
+         "kind": "startup",
+         "name": "startup.credential_bundle.full",
+         "sha256": "cc5542d690d7e06c7c34cd652b40b8c6f27c71b41280d90ba4d62f7d18be8c0f",
+         "size": 469
+      },
+      {
+         "description": "Standalone CredentialDelta fixture",
+         "file": "startup.credential_delta.full.bin",
+         "kind": "startup",
+         "name": "startup.credential_delta.full",
+         "sha256": "f8a19b7dc0c04c73c5fe0ceb10645c0248905903efa775ec086e64a903678ec3",
+         "size": 528
+      }
+   ]
+}

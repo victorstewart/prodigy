@@ -57,9 +57,16 @@ enum class BrainTimeoutFlags : uint64_t {
 	canceled = 0,
 	updateOSWakeup,
 	ignition,
-	hardRebootedMachine,
-	brainMissing,
-	softEscalationCheck,
+		brainPeerHeartbeat,
+				brainPeerReconnect,
+				brainPeerLiveness,
+				brainPeerHandshake,
+				neuronControlReconnect,
+				neuronControlHandshake,
+				osUpdateCommandDeadline,
+				hardRebootedMachine,
+			brainMissing,
+			softEscalationCheck,
 	transitionStuck,
 	performHardReboot,
 	postIgnitionRecovery,
@@ -705,6 +712,8 @@ public:
 	// any brain
 	uint8_t nBrains = 0;
 	uint32_t brainPeerKeepaliveSeconds = prodigyBrainPeerKeepaliveSeconds;
+	uint32_t brainPeerHeartbeatIntervalMs = prodigyBrainPeerHeartbeatIntervalMs;
+	uint32_t brainPeerHeartbeatTimeoutMs = prodigyBrainPeerHeartbeatTimeoutMs;
 	int64_t boottimens;
 
 	TCPSocket brainSocket;
@@ -750,11 +759,20 @@ public:
 	// master brain
 	bool ignited = false;
 
-		TimeoutPacket osUpdateTimer;
-		TimeoutPacket ignitionSwitch;
-		TimeoutPacket spotDecomissionChecker;
-		bytell_hash_map<BrainView *, TimeoutPacket *> brainWaiters;
-	Vector<Machine *> operatingSystemUpdateOrder;
+			TimeoutPacket osUpdateTimer;
+	      bool osUpdateTimerInstalled = false;
+	      bool osUpdateTimerArmed = false;
+	      int64_t lastOperatingSystemUpdateStartMs = 0;
+			TimeoutPacket ignitionSwitch;
+		TimeoutPacket brainPeerHeartbeatTicker;
+			TimeoutPacket spotDecomissionChecker;
+			bytell_hash_map<BrainView *, TimeoutPacket *> brainWaiters;
+			bytell_hash_map<BrainView *, TimeoutPacket *> brainReconnectWaiters;
+			bytell_hash_map<BrainView *, TimeoutPacket *> brainLivenessWaiters;
+			bytell_hash_map<BrainView *, TimeoutPacket *> brainHandshakeWaiters;
+				bytell_hash_map<NeuronView *, TimeoutPacket *> neuronReconnectWaiters;
+				bytell_hash_map<NeuronView *, TimeoutPacket *> neuronHandshakeWaiters;
+		Vector<Machine *> operatingSystemUpdateOrder;
 
 	bytell_hash_set<NeuronView *> neurons;
 
@@ -766,10 +784,13 @@ public:
 				bytell_hash_set<Mothership *> closingMotherships;
 				TCPSocket mothershipSocket;
 			bool mothershipAcceptArmed = false;
-			UnixSocket mothershipUnixSocket;
-			bool mothershipUnixAcceptArmed = false;
-			String mothershipUnixSocketPath;
-         bytell_hash_map<uint64_t, Mothership *> spinApplicationMotherships;
+				UnixSocket mothershipUnixSocket;
+				bool mothershipUnixAcceptArmed = false;
+				String mothershipUnixSocketPath;
+				bool mothershipUnixSocketPathInodeRecorded = false;
+				dev_t mothershipUnixSocketPathDevice = 0;
+				ino_t mothershipUnixSocketPathInode = 0;
+	         bytell_hash_map<uint64_t, Mothership *> spinApplicationMotherships;
 		bytell_hash_map<uint128_t, Machine *> machinesByUUID;
 
 		bytell_hash_map<String, uint32_t> nReservedRequestedBySlug;
@@ -780,12 +801,13 @@ public:
 		bytell_hash_map<String, ApplicationServiceIdentity> reservedApplicationServicesByNameKey;
 		bytell_hash_map<uint64_t, ApplicationServiceIdentity> reservedApplicationServicesByID;
 		bytell_hash_map<uint32_t, String> reservedApplicationServiceNamesBySlotKey;
-		bytell_hash_map<uint16_t, uint8_t> nextReservableServiceSlotByApplication;
-		uint16_t nextReservableApplicationID = 1;
-		uint64_t nextMintedClientTlsGeneration = 1;
-		ProdigyMasterAuthorityRuntimeState masterAuthorityRuntimeState;
+			bytell_hash_map<uint16_t, uint8_t> nextReservableServiceSlotByApplication;
+			uint16_t nextReservableApplicationID = 1;
+			uint64_t nextMintedClientTlsGeneration = 1;
+			ProdigyMasterAuthorityRuntimeState masterAuthorityRuntimeState;
+	      bytell_hash_map<uint64_t, Vector<BrainReplicatedContainerRuntimeState>> pendingReplicatedContainerRuntimeStates;
 
-	// 2,592,000 seconds in 30 days. so even if each reboot took 20 seconds (in reality it'll be closer to 10 seconds, but should be more like 5 seconds)
+		// 2,592,000 seconds in 30 days. so even if each reboot took 20 seconds (in reality it'll be closer to 10 seconds, but should be more like 5 seconds)
 	// we'd still have capacity to be rebooting to update the OS on over 125,000 machines a month, never doing more than 1 machine at at time.
 	// google updates their machines at least once a month
 	   // removed legacy OS update order; updates now driven by explicit targets
@@ -1087,6 +1109,8 @@ public:
 							failure.c_str());
 					}
 				}
+
+	         armMachineUpdateTimerIfNeeded();
 			}
 
 			void initializeApplicationIDReservationState(void)
@@ -1376,9 +1400,22 @@ public:
                masterAuthorityRuntimeState.nextPendingAddMachinesOperationID = 1;
             }
 
+            masterAuthorityRuntimeState.statefulWorkerTopologyUpgradeOperations = statefulWorkerTopologyUpgradeRuntimeState;
+            masterAuthorityRuntimeState.deferredStatefulScaleIntents = deferredStatefulScaleIntentRuntimeState;
+				masterAuthorityRuntimeState.hasCompletedInitialMasterElection = hasCompletedInitialMasterElection;
 				masterAuthorityRuntimeState.nextMintedClientTlsGeneration = nextMintedClientTlsGeneration;
 				masterAuthorityRuntimeState.updateSelf = capturePersistentUpdateSelfState();
 			}
+
+         void noteStatefulWorkerTopologyUpgradeRuntimeStateChanged(void) override
+         {
+            noteMasterAuthorityRuntimeStateChanged();
+         }
+
+         void noteDeferredStatefulScaleIntentRuntimeStateChanged(void) override
+         {
+            noteMasterAuthorityRuntimeStateChanged();
+         }
 
          void upsertManagedMachineSchemaConfig(const ProdigyManagedMachineSchema& managedSchema)
          {
@@ -2006,6 +2043,7 @@ public:
 					captureAuthoritativeDeploymentPlans(package.deploymentPlans);
 					package.failedDeployments = failedDeployments;
 					package.runtimeState = masterAuthorityRuntimeState;
+					package.runtimeState.hasCompletedInitialMasterElection = hasCompletedInitialMasterElection;
 					package.runtimeState.nextMintedClientTlsGeneration = (nextMintedClientTlsGeneration == 0) ? 1 : nextMintedClientTlsGeneration;
 				package.runtimeState.updateSelf = capturePersistentUpdateSelfState();
 			}
@@ -2022,6 +2060,9 @@ public:
 					deploymentPlans = package.deploymentPlans;
 					failedDeployments = package.failedDeployments;
 					masterAuthorityRuntimeState = package.runtimeState;
+               hasCompletedInitialMasterElection = masterAuthorityRuntimeState.hasCompletedInitialMasterElection;
+               statefulWorkerTopologyUpgradeRuntimeState = masterAuthorityRuntimeState.statefulWorkerTopologyUpgradeOperations;
+               deferredStatefulScaleIntentRuntimeState = masterAuthorityRuntimeState.deferredStatefulScaleIntents;
 	            if (masterAuthorityRuntimeState.nextPendingAddMachinesOperationID == 0)
             {
                masterAuthorityRuntimeState.nextPendingAddMachinesOperationID = 1;
@@ -2060,6 +2101,12 @@ public:
 
             Vector<ProdigyManagedMachineSchema> previousSchemas = masterAuthorityRuntimeState.machineSchemas;
 				masterAuthorityRuntimeState = sanitizedIncoming;
+            if (masterAuthorityRuntimeState.hasCompletedInitialMasterElection)
+            {
+               hasCompletedInitialMasterElection = true;
+            }
+            statefulWorkerTopologyUpgradeRuntimeState = masterAuthorityRuntimeState.statefulWorkerTopologyUpgradeOperations;
+            deferredStatefulScaleIntentRuntimeState = masterAuthorityRuntimeState.deferredStatefulScaleIntents;
 				nextMintedClientTlsGeneration = (sanitizedIncoming.nextMintedClientTlsGeneration == 0) ? 1 : sanitizedIncoming.nextMintedClientTlsGeneration;
             syncManagedMachineSchemaConfigs(previousSchemas, masterAuthorityRuntimeState.machineSchemas);
 
@@ -2170,12 +2217,12 @@ public:
             return changed;
          }
 
-         void applyReplicatedDeploymentPlanLiveState(const DeploymentPlan& plan)
-         {
-            auto deploymentIt = deployments.find(plan.config.deploymentID());
-            if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
-            {
-               return;
+	         void applyReplicatedDeploymentPlanLiveState(const DeploymentPlan& plan)
+	         {
+	            auto deploymentIt = deployments.find(plan.config.deploymentID());
+	            if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
+	            {
+	               return;
             }
 
             ApplicationDeployment *deployment = deploymentIt->second;
@@ -2188,12 +2235,275 @@ public:
                }
 
                container->wormholes = plan.wormholes;
-               container->whiteholes = plan.whiteholes;
-            }
-         }
+	               container->whiteholes = plan.whiteholes;
+	            }
+	         }
 
-         bool publishDeploymentWormholeState(ApplicationDeployment *deployment)
-         {
+	      Machine *findMachineForReplicatedContainerRuntimeState(const BrainReplicatedContainerRuntimeState& state)
+	      {
+	         if (state.machineUUID != 0)
+	         {
+	            if (auto it = machinesByUUID.find(state.machineUUID); it != machinesByUUID.end())
+	            {
+	               return it->second;
+	            }
+	         }
+
+	         if (state.machinePrivate4 != 0)
+	         {
+	            for (Machine *machine : machines)
+	            {
+	               if (machine != nullptr && machine->private4 == state.machinePrivate4)
+	               {
+	                  return machine;
+	               }
+	            }
+	         }
+
+	         return nullptr;
+	      }
+
+	      void detachContainerRuntimeState(ContainerView *container)
+	      {
+	         if (container == nullptr)
+	         {
+	            return;
+	         }
+
+	         Machine *previousMachine = container->machine;
+	         uint64_t previousDeploymentID = container->deploymentID;
+	         uint32_t previousShardGroup = container->shardGroup;
+
+	         if (previousMachine != nullptr)
+	         {
+	            previousMachine->removeContainerIndexEntry(previousDeploymentID, container);
+	         }
+
+	         if (previousDeploymentID > 0)
+	         {
+	            if (auto prevDeployment = deployments.find(previousDeploymentID); prevDeployment != deployments.end() && prevDeployment->second != nullptr)
+	            {
+	               prevDeployment->second->containers.erase(container);
+	               if (prevDeployment->second->plan.isStateful)
+	               {
+	                  while (prevDeployment->second->containersByShardGroup.eraseEntry(previousShardGroup, container)) {}
+	               }
+	            }
+	         }
+	      }
+
+	      void applyContainerRuntimePlanToView(ContainerView *container, Machine *machine, ApplicationDeployment *deployment, ContainerPlan& plan)
+	      {
+	         container->subscriptions.clear();
+	         container->advertisements.clear();
+	         container->advertisingOnPorts.clear();
+
+	         container->uuid = plan.uuid;
+	         container->deploymentID = plan.config.deploymentID();
+	         container->applicationID = plan.config.applicationID;
+	         container->lifetime = plan.lifetime;
+	         container->state = plan.state;
+	         container->runtimeReady = plan.runtimeReady;
+	         if (container->runtimeReady == false)
+	         {
+	            container->clearStatefulTopologyCutoverBarrier();
+	         }
+	         container->machine = machine;
+	         container->createdAtMs = plan.createdAtMs;
+	         container->runtime_nLogicalCores = static_cast<uint16_t>(applicationSharedCPUCoreHint(plan.config));
+	         container->runtime_memoryMB = plan.config.totalMemoryMB();
+	         container->runtime_storageMB = plan.config.totalStorageMB();
+	         container->addresses = plan.addresses;
+	         container->wormholes = plan.wormholes;
+	         container->whiteholes = plan.whiteholes;
+	         container->assignedGPUMemoryMBs = plan.assignedGPUMemoryMBs;
+	         container->assignedGPUDevices = plan.assignedGPUDevices;
+	         container->fragment = plan.fragment;
+	         container->setMeshAddress(container_network_subnet6, brainConfig.datacenterFragment, machine->fragment, container->fragment);
+	         container->isStateful = plan.isStateful;
+	         container->shardGroup = plan.shardGroup;
+	         container->explicitStatefulMeshRoles = plan.statefulMeshRoles;
+	         container->explicitStatefulTopology = plan.statefulTopology;
+	         container->subscriptions = plan.subscriptions;
+	         container->advertisements = plan.advertisements;
+	         container->remainingSubscriberCapacity = deployment->plan.minimumSubscriberCapacity;
+
+	         if (mesh != nullptr)
+	         {
+	            for (const auto& [service, subscription] : container->subscriptions)
+	            {
+	               mesh->logSubscription(container, subscription.service, subscription.nature);
+	            }
+
+	            for (const auto& [service, advertisement] : container->advertisements)
+	            {
+	               mesh->logAdvertisement(container, advertisement.service);
+	               container->advertisingOnPorts.insert(advertisement.port);
+	            }
+
+	            for (const auto& [secret, pairings] : plan.advertisementPairings)
+	            {
+	               for (const AdvertisementPairing& pairing : pairings)
+	               {
+	                  mesh->logAdvertisementPairing(pairing.secret, container, pairing);
+	                  container->remainingSubscriberCapacity -= 1;
+	               }
+	            }
+
+	            for (const auto& [secret, pairings] : plan.subscriptionPairings)
+	            {
+	               for (const SubscriptionPairing& pairing : pairings)
+	               {
+	                  mesh->logSubscriptionPairing(pairing.secret, container, pairing);
+	               }
+	            }
+	         }
+	      }
+
+	      bool applyReplicatedContainerRuntimeStateNow(const BrainReplicatedContainerRuntimeState& state)
+	      {
+	         uint64_t deploymentID = state.plan.config.deploymentID();
+	         auto deploymentIt = deployments.find(deploymentID);
+	         if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
+	         {
+	            return false;
+	         }
+
+	         Machine *machine = findMachineForReplicatedContainerRuntimeState(state);
+	         if (machine == nullptr)
+	         {
+	            return false;
+	         }
+
+	         ApplicationDeployment *deployment = deploymentIt->second;
+	         ContainerView *container = nullptr;
+	         bool created = false;
+	         if (auto existing = containers.find(state.plan.uuid); existing != containers.end())
+	         {
+	            container = existing->second;
+	         }
+	         else
+	         {
+	            container = new ContainerView();
+	            created = true;
+	         }
+
+	         detachContainerRuntimeState(container);
+
+	         bool uploadedRuntimeReady = state.plan.runtimeReady;
+	         ContainerPlan plan = state.plan;
+	         plan.runtimeReady = false;
+	         applyContainerRuntimePlanToView(container, machine, deployment, plan);
+	         container->runtime_nLogicalCores = state.runtimeLogicalCores;
+	         container->runtime_memoryMB = state.runtimeMemoryMB;
+	         container->runtime_storageMB = state.runtimeStorageMB;
+
+	         containers.insert_or_assign(container->uuid, container);
+	         machine->upsertContainerIndexEntry(container->deploymentID, container);
+	         deployment->containers.insert(container);
+	         if (deployment->plan.isStateful)
+	         {
+	            deployment->containersByShardGroup.insert(container->shardGroup, container);
+	         }
+
+	         if (uploadedRuntimeReady)
+	         {
+	            deployment->containerIsRuntimeReady(container);
+	         }
+
+	         if (weAreMaster)
+	         {
+	            deployment->recoverAfterReboot();
+	         }
+
+	         basics_log("brain replicated container runtime applied uuid=%llu deploymentID=%llu machinePrivate4=%u state=%u runtimeReady=%d created=%d master=%d\n",
+	            (unsigned long long)container->uuid,
+	            (unsigned long long)container->deploymentID,
+	            unsigned(machine->private4),
+	            unsigned(container->state),
+	            int(container->runtimeReady),
+	            int(created),
+	            int(weAreMaster));
+	         return true;
+	      }
+
+	      void applyPendingReplicatedContainerRuntimeStates(uint64_t deploymentID)
+	      {
+	         auto pendingIt = pendingReplicatedContainerRuntimeStates.find(deploymentID);
+	         if (pendingIt == pendingReplicatedContainerRuntimeStates.end())
+	         {
+	            return;
+	         }
+
+	         Vector<BrainReplicatedContainerRuntimeState> pending = std::move(pendingIt->second);
+	         pendingReplicatedContainerRuntimeStates.erase(pendingIt);
+
+	         for (const BrainReplicatedContainerRuntimeState& state : pending)
+	         {
+	            if (applyReplicatedContainerRuntimeStateNow(state) == false)
+	            {
+	               pendingReplicatedContainerRuntimeStates[state.plan.config.deploymentID()].push_back(state);
+	            }
+	         }
+	      }
+
+	      void applyReplicatedContainerRuntimeState(const BrainReplicatedContainerRuntimeState& state)
+	      {
+	         if (applyReplicatedContainerRuntimeStateNow(state))
+	         {
+	            persistLocalRuntimeState();
+	            return;
+	         }
+
+	         pendingReplicatedContainerRuntimeStates[state.plan.config.deploymentID()].push_back(state);
+	      }
+
+	      bool captureReplicatedContainerRuntimeState(ContainerView *container, BrainReplicatedContainerRuntimeState& state)
+	      {
+	         if (container == nullptr || container->machine == nullptr)
+	         {
+	            return false;
+	         }
+
+	         auto deploymentIt = deployments.find(container->deploymentID);
+	         if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
+	         {
+	            return false;
+	         }
+
+	         ApplicationDeployment *deployment = deploymentIt->second;
+	         ApplicationConfig replayConfig = deployment->resourceConfigForContainer(container);
+	         state = {};
+	         state.machineUUID = container->machine->uuid;
+	         state.machinePrivate4 = container->machine->private4;
+	         state.plan = container->generatePlan(deployment->plan, deployment->nShardGroups, &replayConfig);
+	         applyCredentialsToContainerPlan(deployment->plan, *container, state.plan);
+	         state.runtimeLogicalCores = container->runtime_nLogicalCores;
+	         state.runtimeMemoryMB = container->runtime_memoryMB;
+	         state.runtimeStorageMB = container->runtime_storageMB;
+	         return true;
+	      }
+
+	      void replicateContainerRuntimeStateToFollowers(ContainerView *container)
+	      {
+	         if (weAreMaster == false)
+	         {
+	            return;
+	         }
+
+	         BrainReplicatedContainerRuntimeState state = {};
+	         if (captureReplicatedContainerRuntimeState(container, state) == false)
+	         {
+	            return;
+	         }
+
+	         String serialized = {};
+	         BitseryEngine::serialize(serialized, state);
+	         queueBrainReplication(BrainTopic::replicateContainerRuntimeState, serialized);
+	      }
+
+	         bool publishDeploymentWormholeState(ApplicationDeployment *deployment)
+	         {
             if (deployment == nullptr)
             {
                return false;
@@ -2969,11 +3279,7 @@ public:
       }
 
       applyMachineHardwareProfile(machine, hardware);
-      if (machine->state != MachineState::healthy
-         && machineReadyForHealthyState(machine))
-      {
-         handleMachineStateChange(machine, MachineState::healthy);
-      }
+      promoteMachineToHealthyIfReady(machine);
    }
 
    void replayLocalMachineHardwareProfileIfReady(void)
@@ -3196,7 +3502,7 @@ public:
 		{
 			for (BrainView *bv : brains)
 			{
-				if (bv->isMasterBrain)
+				if (peerRepresentsCurrentMaster(bv))
 				{
 					existingMasterUUID = bv->uuid;
 					break;
@@ -3205,6 +3511,68 @@ public:
 		}
 
 		return existingMasterUUID;
+	}
+
+	bool peerClaimsCurrentMasterIdentity(const BrainView *peer) const
+	{
+		if (peer == nullptr || weAreMaster)
+		{
+			return false;
+		}
+
+		return (
+			peer->uuid != 0
+			&& peer->existingMasterUUID != 0
+			&& peer->existingMasterUUID == peer->uuid);
+	}
+
+	bool peerRepresentsCurrentMaster(const BrainView *peer) const
+	{
+		if (peer == nullptr)
+		{
+			return false;
+		}
+
+		if (peer->isMasterBrain)
+		{
+			return true;
+		}
+
+		if (weAreMaster || noMasterYet)
+		{
+			return false;
+		}
+
+		return peerClaimsCurrentMasterIdentity(peer);
+	}
+
+	bool peerRepresentsCurrentMasterForLiveness(const BrainView *peer) const
+	{
+		if (peer == nullptr)
+		{
+			return false;
+		}
+
+		if (peer->isMasterBrain)
+		{
+			return true;
+		}
+
+		// Followers can transiently lose the local isMasterBrain bit during reconnect
+		// churn even while a peer is still explicitly claiming it is the current master.
+		// Keep treating that peer as the authoritative master identity for liveness,
+		// registration, and reconnect decisions until a new election resolves it.
+		return peerClaimsCurrentMasterIdentity(peer);
+	}
+
+	bool peerReconnectOwned(const BrainView *peer) const
+	{
+		if (peer == nullptr)
+		{
+			return false;
+		}
+
+		return (peer->weConnectToIt || peer->forceConnectorOwnershipUntilMasterAck);
 	}
 
    void queueLocalPeerAddressCandidates(BrainView *brain)
@@ -3310,6 +3678,11 @@ public:
             continue;
          }
 
+         clusterMachine.peerAddresses.clear();
+         for (const ClusterMachinePeerAddress& candidate : normalizedCandidates)
+         {
+            prodigyAppendUniqueClusterMachinePeerAddress(clusterMachine.peerAddresses, candidate);
+         }
          prodigyAssignClusterMachineAddressesFromPeerCandidates(clusterMachine.addresses, normalizedCandidates);
 
          updatedTopology = true;
@@ -3743,6 +4116,7 @@ public:
 					// possible it's already completed and is in the CQE queue, so this is the only
 					// safe cancellation path before the stale completion drains.
 					cancelBrainMissingWaiter(brain, "accept-known");
+					cancelBrainReconnectWaiter(brain, "accept-known");
 
 						if (rawStreamIsActive(brain))
 						{
@@ -3760,12 +4134,14 @@ public:
 						// or stale peer-verification state from the prior stream generation.
 						// Keep the broader BrainView identity/runtime intact and scrub only
 						// the transport buffers that can block fresh registration parsing.
+						brain->ProdigyTransportTLSStream::reset();
 						brain->fslot = fslot;
-						brain->isFixedFile = true;
-						brain->isNonBlocking = true;
-						brain->currentStreamAccepted = true;
-						brain->noteTransportActivated();
-						Ring::publishSocketGeneration(brain);
+							brain->isFixedFile = true;
+							brain->isNonBlocking = true;
+							brain->currentStreamAccepted = true;
+							brain->registrationFresh = false;
+							brain->noteTransportActivated();
+							Ring::publishSocketGeneration(brain);
 						std::fprintf(stderr,
 							"prodigy debug brain accept-known private4=%u fd=%d fslot=%d updateState=%u oldConnected=%d oldQuarantined=%d generation=%u priorGeneration=%u transportEpoch=%u\n",
 							brain->private4,
@@ -3817,7 +4193,13 @@ public:
 							int(brain->isTLSNegotiated()),
 							(unsigned long long)brain->queuedSendOutstandingBytes());
 						std::fflush(stderr);
-					}
+
+	                  // This is the first post-accept opportunity to arm the server-side
+	                  // TLS receive. Submit now so a rebooted brain does not wait for an
+	                  // unrelated later CQE before it can consume the peer's ClientHello.
+	                  Ring::submitPending();
+	                  refreshBrainPeerHandshakeWatchdog(brain, "accept-known");
+						}
 					else
 					{
 						basics_log("brain accept unknown peer address=%s fslot=%d\n", remoteAddressText.c_str(), fslot);
@@ -3971,10 +4353,12 @@ public:
 					}
 
 					cancelBrainMissingWaiter(brain, "connect-ok");
+					cancelBrainReconnectWaiter(brain, "connect-ok");
 
 					brain->currentStreamAccepted = false;
 					brain->connected = true;
 					brain->noteTransportActivated();
+					brain->registrationFresh = false;
 					std::fprintf(stderr,
 						"prodigy debug brain connect-ok private4=%u fd=%d fslot=%d updateState=%u weConnectToIt=%d transportEpoch=%u\n",
 						brain->private4,
@@ -3995,7 +4379,10 @@ public:
 						}
 					}
 					brain->connectAttemptSucceded();
-					brain->rBuffer.clear();
+					// A successful reconnect is a fresh transport generation. Keep the
+					// BrainView identity/reconnect policy but discard prior TLS/BIO and
+					// buffered stream state before starting the new handshake.
+					brain->ProdigyTransportTLSStream::reset();
 					if (ProdigyTransportTLSRuntime::configured() && brain->beginTransportTLS(false) == false)
 					{
 						if (updateSelfState == UpdateSelfState::waitingForFollowerReboots)
@@ -4021,9 +4408,10 @@ public:
 				queueUpdateSelfTransitionToPeer(brain);
 				queueUpdateSelfRelinquishToPeer(brain);
 
-				// We always need to receive the peer's registration/replication stream after connect.
-				Ring::queueRecv(brain);
-				std::fprintf(stderr,
+					// We always need to receive the peer's registration/replication stream after connect.
+					Ring::queueRecv(brain);
+					refreshBrainPeerHandshakeWatchdog(brain, "connect-ok");
+					std::fprintf(stderr,
 					"prodigy debug brain recv-armed private4=%u fd=%d fslot=%d pendingRecv=%d pendingSend=%d tls=%d negotiated=%d queuedBytes=%llu\n",
 					brain->private4,
 					brain->fd,
@@ -4069,17 +4457,18 @@ public:
 				}
 			}
 		}
-		else if (neurons.contains(static_cast<NeuronView *>(socket)))
-		{
-			NeuronView *neuron = static_cast<NeuronView *>(socket);
-			neuron->cancelPendingConnect();
+			else if (neurons.contains(static_cast<NeuronView *>(socket)))
+			{
+				NeuronView *neuron = static_cast<NeuronView *>(socket);
+				neuron->cancelPendingConnect();
 
-				if (result == 0) // connected to neuron
-				{
-					if (Ring::socketIsClosing(neuron) || neuron->isFixedFile == false || neuron->fslot < 0)
+					if (result == 0) // connected to neuron
 					{
-						return;
-					}
+						cancelNeuronReconnectWaiter(neuron, "connect-ok");
+						if (Ring::socketIsClosing(neuron) || neuron->isFixedFile == false || neuron->fslot < 0)
+						{
+							return;
+						}
 
 					bool reconnecting = neuron->hadSuccessfulConnection;
 					neuron->connected = true;
@@ -4132,7 +4521,9 @@ public:
 					neuron->wBuffer.clear();
 				}
 
-				Message::construct(neuron->wBuffer, NeuronTopic::registration, ignited);
+            const bool requiresNeuronState = ignited
+               && (reconnecting == false || machineNeedsNeuronStateRefresh(neuron->machine));
+				Message::construct(neuron->wBuffer, NeuronTopic::registration, requiresNeuronState);
 				std::fprintf(stderr,
 					"brain neuron connect-queue-before stream=%p uuid=%llu private4=%u fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d wbytes=%u queued=%llu needsKick=%d\n",
 					static_cast<void *>(neuron),
@@ -4178,11 +4569,12 @@ public:
 					unsigned(neuron->wBuffer.size()),
 					(unsigned long long)neuron->queuedSendOutstandingBytes());
 
-				// the neuron will now send us its state
-				Ring::queueRecv(neuron);
-				std::fprintf(stderr,
-					"brain neuron connect-recv-submit stream=%p uuid=%llu private4=%u fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d wbytes=%u queued=%llu\n",
-					static_cast<void *>(neuron),
+					// the neuron will now send us its state
+					Ring::queueRecv(neuron);
+					refreshNeuronControlHandshakeWatchdog(neuron, "connect");
+					std::fprintf(stderr,
+						"brain neuron connect-recv-submit stream=%p uuid=%llu private4=%u fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d wbytes=%u queued=%llu\n",
+						static_cast<void *>(neuron),
 					(unsigned long long)(neuron->machine ? neuron->machine->uuid : 0),
 					unsigned(neuron->machine ? neuron->machine->private4 : 0u),
 					neuron->fd,
@@ -4293,6 +4685,17 @@ public:
 			return true;
 		}
 
+		if (brain->currentStreamAccepted && brain->connected && brain->quarantined == false)
+		{
+			return false;
+		}
+
+		if (brain->transportTLSEnabled()
+			&& (brain->isTLSNegotiated() == false || brain->tlsPeerVerified == false))
+		{
+			return true;
+		}
+
 		// Master-side fallback redials can temporarily connect outward to a peer that
 		// canonically owns the connector. When that peer restores its accepted stream,
 		// prefer the canonical accepted transport and drop the fallback outbound one.
@@ -4302,6 +4705,7 @@ public:
 	void brainFound(BrainView *brain)
 	{
 		// a brain we had quarantined reappeared... either the network restored OR we restarted the neuron program or the machine itself
+		cancelBrainLivenessWaiter(brain, "brain-found");
 		brain->boottimens = 0; // this will block any new master derivation until after it has registered
 		brain->registrationFresh = false;
 		brain->quarantined = false;
@@ -4324,6 +4728,12 @@ public:
 			TimeoutPacket *packet = it->second;
 			packet->flags = uint64_t(BrainTimeoutFlags::canceled);
 			brainWaiters.erase(it);
+			std::fprintf(stderr,
+				"prodigy debug brain waiter-cancel private4=%u packet=%p reason=%s\n",
+				brain->private4,
+				static_cast<void *>(packet),
+				(reason ? reason : "unspecified"));
+			std::fflush(stderr);
 			basics_log("brainMissing waiter canceled private4=%u packet=%p reason=%s\n",
 				brain->private4,
 				static_cast<void *>(packet),
@@ -4331,9 +4741,494 @@ public:
 		}
 	}
 
-   float calculateAliveBrainRatio(void)
-   {
-      uint32_t nBrainsAlive = 1;
+	void armBrainMissingWaiterIfAbsent(BrainView *brain, int64_t timeoutMs, const char *reason)
+	{
+		if (brain == nullptr)
+		{
+			return;
+		}
+
+		if (brainWaiters.contains(brain))
+		{
+			std::fprintf(stderr,
+				"prodigy debug brain waiter-preserve private4=%u packet=%p reason=%s\n",
+				brain->private4,
+				static_cast<void *>(brainWaiters[brain]),
+				(reason ? reason : "unspecified"));
+			std::fflush(stderr);
+			basics_log("brainMissing waiter preserve-existing private4=%u reason=%s packet=%p\n",
+				brain->private4,
+				(reason ? reason : "unspecified"),
+				static_cast<void *>(brainWaiters[brain]));
+			return;
+		}
+
+		TimeoutPacket *timeout = new TimeoutPacket();
+		timeout->flags = uint64_t(BrainTimeoutFlags::brainMissing);
+		timeout->originator = brain;
+		timeout->dispatcher = this;
+		timeout->setTimeoutMs(std::max<int64_t>(timeoutMs, 1));
+
+		brainWaiters.insert({brain, timeout});
+		std::fprintf(stderr,
+			"prodigy debug brain waiter-arm private4=%u packet=%p reason=%s timeoutMs=%lld\n",
+			brain->private4,
+			static_cast<void *>(timeout),
+			(reason ? reason : "unspecified"),
+			(long long)std::max<int64_t>(timeoutMs, 1));
+		std::fflush(stderr);
+		basics_log("brainMissing waiter armed private4=%u packet=%p reason=%s timeoutMs=%lld\n",
+			brain->private4,
+			static_cast<void *>(timeout),
+			(reason ? reason : "unspecified"),
+			(long long)std::max<int64_t>(timeoutMs, 1));
+		Ring::queueTimeout(timeout);
+	}
+
+	void cancelBrainReconnectWaiter(BrainView *brain, const char *reason)
+	{
+		if (brain == nullptr)
+		{
+			return;
+		}
+
+		if (auto it = brainReconnectWaiters.find(brain); it != brainReconnectWaiters.end())
+		{
+			TimeoutPacket *packet = it->second;
+			packet->flags = uint64_t(BrainTimeoutFlags::canceled);
+			brainReconnectWaiters.erase(it);
+			basics_log("brain reconnect waiter canceled private4=%u packet=%p reason=%s\n",
+				brain->private4,
+				static_cast<void *>(packet),
+				(reason ? reason : "unspecified"));
+		}
+	}
+
+		void cancelBrainLivenessWaiter(BrainView *brain, const char *reason)
+		{
+		if (brain == nullptr)
+		{
+			return;
+		}
+
+		if (auto it = brainLivenessWaiters.find(brain); it != brainLivenessWaiters.end())
+		{
+			TimeoutPacket *packet = it->second;
+			packet->flags = uint64_t(BrainTimeoutFlags::canceled);
+			brainLivenessWaiters.erase(it);
+			basics_log("brain liveness waiter canceled private4=%u packet=%p reason=%s\n",
+				brain->private4,
+				static_cast<void *>(packet),
+				(reason ? reason : "unspecified"));
+			}
+		}
+
+		void cancelBrainPeerHandshakeWatchdog(BrainView *brain, const char *reason)
+		{
+			if (brain == nullptr)
+			{
+				return;
+			}
+
+			if (auto it = brainHandshakeWaiters.find(brain); it != brainHandshakeWaiters.end())
+			{
+				TimeoutPacket *packet = it->second;
+				packet->flags = uint64_t(BrainTimeoutFlags::canceled);
+				brainHandshakeWaiters.erase(it);
+				basics_log("brain peer handshake watchdog canceled private4=%u packet=%p reason=%s\n",
+					brain->private4,
+					static_cast<void *>(packet),
+					(reason ? reason : "unspecified"));
+			}
+		}
+
+		void cancelAllBrainLivenessWaiters(const char *reason)
+		{
+		for (auto& [brain, packet] : brainLivenessWaiters)
+		{
+			if (packet != nullptr)
+			{
+				packet->flags = uint64_t(BrainTimeoutFlags::canceled);
+			}
+
+			basics_log("brain liveness waiter canceled private4=%u packet=%p reason=%s\n",
+				brain ? brain->private4 : 0u,
+				static_cast<void *>(packet),
+				(reason ? reason : "unspecified"));
+		}
+
+			brainLivenessWaiters.clear();
+		}
+
+		bool brainPeerHandshakeComplete(BrainView *brain)
+		{
+			if (brain == nullptr || rawStreamIsActive(brain) == false)
+			{
+				return true;
+			}
+
+			if (brain->connected == false)
+			{
+				return false;
+			}
+
+			if (brain->transportTLSEnabled()
+				&& (brain->isTLSNegotiated() == false || brain->tlsPeerVerified == false))
+			{
+				return false;
+			}
+
+			return brain->registrationFresh;
+		}
+
+		void refreshBrainPeerHandshakeWatchdog(BrainView *brain, const char *reason)
+		{
+			if (brain == nullptr || brains.contains(brain) == false)
+			{
+				cancelBrainPeerHandshakeWatchdog(brain, reason);
+				return;
+			}
+
+			if (brainPeerHandshakeComplete(brain))
+			{
+				cancelBrainPeerHandshakeWatchdog(brain, reason);
+				return;
+			}
+
+			cancelBrainPeerHandshakeWatchdog(brain, "refresh");
+
+			TimeoutPacket *timeout = new TimeoutPacket();
+			timeout->flags = uint64_t(BrainTimeoutFlags::brainPeerHandshake);
+			timeout->originator = brain;
+			timeout->identifier = brain->transportEpoch;
+			timeout->dispatcher = this;
+			timeout->setTimeoutMs(prodigyBrainPeerHandshakeTimeoutMs);
+			brainHandshakeWaiters.insert({brain, timeout});
+			basics_log("brain peer handshake watchdog armed private4=%u packet=%p reason=%s timeoutMs=%u transportEpoch=%u\n",
+				brain->private4,
+				static_cast<void *>(timeout),
+				(reason ? reason : "unspecified"),
+				unsigned(prodigyBrainPeerHandshakeTimeoutMs),
+				unsigned(brain->transportEpoch));
+			Ring::queueTimeout(timeout);
+		}
+
+		int64_t brainPeerReconnectDelayMs(const BrainView *brain) const
+		{
+		if (brain == nullptr || brain->connectTimeoutMs <= 0)
+		{
+			return 1;
+		}
+
+		return std::max<int64_t>(brain->connectTimeoutMs, 1);
+	}
+
+	void attemptBrainPeerReconnectNow(BrainView *brain, bool persistentReconnect, const char *reason)
+	{
+		if (brain == nullptr || brains.contains(brain) == false)
+		{
+			return;
+		}
+
+		if (rawStreamIsActive(brain) || Ring::socketIsClosing(brain) || brain->connectAttemptPending())
+		{
+			basics_log("brain reconnect skipped active private4=%u reason=%s active=%d closing=%d pendingConnect=%d\n",
+				brain->private4,
+				(reason ? reason : "unspecified"),
+				int(rawStreamIsActive(brain)),
+				int(Ring::socketIsClosing(brain)),
+				int(brain->connectAttemptPending()));
+			return;
+		}
+
+		brain->reset();
+		brain->recreateSocket();
+		configureBrainPeerConnectAddress(brain);
+
+		if (persistentReconnect)
+		{
+			brain->nConnectionAttempts = 0;
+			brain->reconnectAfterClose = true;
+
+			int64_t reconnectWindowMs = int64_t(brain->connectTimeoutMs) * int64_t(brain->nDefaultAttemptsBudget);
+			if (reconnectWindowMs < prodigyBrainPeerPersistentReconnectMinMs)
+			{
+				reconnectWindowMs = prodigyBrainPeerPersistentReconnectMinMs;
+			}
+
+			if (brain->connectTimeoutMs > 0)
+			{
+				brain->attemptForMs(reconnectWindowMs);
+			}
+			else
+			{
+				brain->nAttemptsBudget = brain->nDefaultAttemptsBudget;
+			}
+		}
+
+		if (installBrainPeerSocket(brain))
+		{
+			brain->attemptConnect();
+		}
+	}
+
+		void armBrainReconnectWaiterIfAbsent(BrainView *brain, int64_t delayMs, bool persistentReconnect, const char *reason, bool allowCloseInFlight = false)
+		{
+			if (brain == nullptr)
+			{
+				return;
+		}
+
+		if (rawStreamIsActive(brain)
+			|| (allowCloseInFlight == false && Ring::socketIsClosing(brain))
+			|| brain->connectAttemptPending())
+		{
+			return;
+		}
+
+		if (brainReconnectWaiters.contains(brain))
+		{
+			basics_log("brain reconnect waiter preserve-existing private4=%u reason=%s packet=%p\n",
+				brain->private4,
+				(reason ? reason : "unspecified"),
+				static_cast<void *>(brainReconnectWaiters[brain]));
+			return;
+		}
+
+		TimeoutPacket *timeout = new TimeoutPacket();
+		timeout->flags = uint64_t(BrainTimeoutFlags::brainPeerReconnect);
+		timeout->originator = brain;
+		timeout->dispatcher = this;
+		timeout->identifier = persistentReconnect ? uint128_t(1) : uint128_t(0);
+		timeout->setTimeoutMs(std::max<int64_t>(delayMs, 1));
+
+		brainReconnectWaiters.insert({brain, timeout});
+			basics_log("brain reconnect waiter armed private4=%u packet=%p reason=%s timeoutMs=%lld persistent=%d\n",
+				brain->private4,
+				static_cast<void *>(timeout),
+				(reason ? reason : "unspecified"),
+				(long long)std::max<int64_t>(delayMs, 1),
+				int(persistentReconnect));
+			Ring::queueTimeout(timeout);
+		}
+
+		void cancelNeuronReconnectWaiter(NeuronView *neuron, const char *reason)
+		{
+			if (neuron == nullptr)
+			{
+				return;
+			}
+
+			if (auto it = neuronReconnectWaiters.find(neuron); it != neuronReconnectWaiters.end())
+			{
+				TimeoutPacket *packet = it->second;
+				packet->flags = uint64_t(BrainTimeoutFlags::canceled);
+				neuronReconnectWaiters.erase(it);
+				basics_log("neuron reconnect waiter canceled private4=%u packet=%p reason=%s\n",
+					(neuron->machine ? neuron->machine->private4 : 0u),
+					static_cast<void *>(packet),
+					(reason ? reason : "unspecified"));
+				}
+			}
+
+			bool neuronControlHandshakeComplete(NeuronView *neuron)
+			{
+				if (neuron == nullptr || rawStreamIsActive(neuron) == false)
+				{
+					return true;
+				}
+
+				if (neuron->transportTLSEnabled()
+					&& (neuron->isTLSNegotiated() == false || neuron->tlsPeerVerified == false))
+				{
+					return false;
+				}
+
+				return ignited == false
+					|| brainConfig.datacenterFragment == 0
+					|| machineNeedsNeuronStateRefresh(neuron->machine) == false;
+			}
+
+			void cancelNeuronControlHandshakeWatchdog(NeuronView *neuron, const char *reason)
+			{
+				if (neuron == nullptr)
+				{
+					return;
+				}
+
+				if (auto it = neuronHandshakeWaiters.find(neuron); it != neuronHandshakeWaiters.end())
+				{
+					TimeoutPacket *packet = it->second;
+					packet->flags = uint64_t(BrainTimeoutFlags::canceled);
+					neuronHandshakeWaiters.erase(it);
+					basics_log("neuron handshake watchdog canceled private4=%u packet=%p reason=%s\n",
+						(neuron->machine ? neuron->machine->private4 : 0u),
+						static_cast<void *>(packet),
+						(reason ? reason : "unspecified"));
+				}
+			}
+
+			void refreshNeuronControlHandshakeWatchdog(NeuronView *neuron, const char *reason)
+			{
+				if (neuron == nullptr || weAreMaster == false || neurons.contains(neuron) == false)
+				{
+					cancelNeuronControlHandshakeWatchdog(neuron, reason);
+					return;
+				}
+
+				if (neuronControlHandshakeComplete(neuron))
+				{
+					cancelNeuronControlHandshakeWatchdog(neuron, reason);
+					return;
+				}
+
+				cancelNeuronControlHandshakeWatchdog(neuron, "refresh");
+
+				TimeoutPacket *timeout = new TimeoutPacket();
+				timeout->flags = uint64_t(BrainTimeoutFlags::neuronControlHandshake);
+				timeout->originator = neuron;
+				timeout->identifier = neuron->machine ? neuron->machine->uuid : 0;
+				timeout->dispatcher = this;
+				timeout->setTimeoutMs(prodigyBrainNeuronControlHandshakeTimeoutMs);
+				neuronHandshakeWaiters.insert({neuron, timeout});
+				basics_log("neuron handshake watchdog armed private4=%u packet=%p reason=%s timeoutMs=%u\n",
+					(neuron->machine ? neuron->machine->private4 : 0u),
+					static_cast<void *>(timeout),
+					(reason ? reason : "unspecified"),
+					unsigned(prodigyBrainNeuronControlHandshakeTimeoutMs));
+				Ring::queueTimeout(timeout);
+			}
+
+		int64_t neuronControlReconnectDelayMs(const NeuronView *neuron) const
+		{
+			if (neuron == nullptr || neuron->connectTimeoutMs <= 0)
+			{
+				return 1;
+			}
+
+			return std::max<int64_t>(neuron->connectTimeoutMs, 1);
+		}
+
+		void attemptNeuronControlReconnectNow(NeuronView *neuron, const char *reason)
+		{
+			if (neuron == nullptr || neurons.contains(neuron) == false)
+			{
+				return;
+			}
+
+			if (weAreMaster == false || neuron->shouldReconnect() == false)
+			{
+				disarmNeuronControlReconnect(neuron);
+				return;
+			}
+
+			if (rawStreamIsActive(neuron) || neuron->connectAttemptPending())
+			{
+				basics_log("neuron reconnect skipped active private4=%u reason=%s active=%d closing=%d pendingConnect=%d\n",
+					(neuron->machine ? neuron->machine->private4 : 0u),
+					(reason ? reason : "unspecified"),
+					int(rawStreamIsActive(neuron)),
+					int(Ring::socketIsClosing(neuron)),
+					int(neuron->connectAttemptPending()));
+				return;
+			}
+
+			if (Ring::socketIsClosing(neuron))
+			{
+				basics_log("neuron reconnect deferred close-in-flight private4=%u reason=%s timeoutMs=%lld\n",
+					(neuron->machine ? neuron->machine->private4 : 0u),
+					(reason ? reason : "unspecified"),
+					(long long)neuronControlReconnectDelayMs(neuron));
+				armNeuronReconnectWaiterIfAbsent(neuron, neuronControlReconnectDelayMs(neuron), "neuron-reconnect-close-in-flight", true, true);
+				return;
+			}
+
+			neuron->ProdigyTransportTLSStream::reset();
+			neuron->recreateSocket();
+			if (installNeuronControlSocket(neuron))
+			{
+				neuron->attemptConnect();
+			}
+		}
+
+		void armNeuronReconnectWaiterIfAbsent(NeuronView *neuron, int64_t delayMs, const char *reason, bool allowCloseInFlight = false, bool allowActiveTransport = false)
+		{
+			if (neuron == nullptr || weAreMaster == false || neuron->shouldReconnect() == false)
+			{
+				return;
+			}
+
+			if ((allowActiveTransport == false && rawStreamIsActive(neuron))
+				|| (allowCloseInFlight == false && Ring::socketIsClosing(neuron))
+				|| neuron->connectAttemptPending())
+			{
+				return;
+			}
+
+			if (neuronReconnectWaiters.contains(neuron))
+			{
+				basics_log("neuron reconnect waiter preserve-existing private4=%u reason=%s packet=%p\n",
+					(neuron->machine ? neuron->machine->private4 : 0u),
+					(reason ? reason : "unspecified"),
+					static_cast<void *>(neuronReconnectWaiters[neuron]));
+				return;
+			}
+
+			TimeoutPacket *timeout = new TimeoutPacket();
+			timeout->flags = uint64_t(BrainTimeoutFlags::neuronControlReconnect);
+			timeout->originator = neuron;
+			timeout->dispatcher = this;
+			timeout->setTimeoutMs(std::max<int64_t>(delayMs, 1));
+
+			neuronReconnectWaiters.insert({neuron, timeout});
+			basics_log("neuron reconnect waiter armed private4=%u packet=%p reason=%s timeoutMs=%lld\n",
+				(neuron->machine ? neuron->machine->private4 : 0u),
+				static_cast<void *>(timeout),
+				(reason ? reason : "unspecified"),
+				(long long)std::max<int64_t>(delayMs, 1));
+			Ring::queueTimeout(timeout);
+		}
+
+		void refreshMasterPeerLivenessWaiter(BrainView *brain, const char *reason)
+		{
+			if (brain == nullptr || nBrains <= 1 || brainPeerHeartbeatTimeoutMs == 0 || Ring::getRingFD() <= 0)
+			{
+			return;
+		}
+
+		if (peerRepresentsCurrentMasterForLiveness(brain) == false)
+		{
+			cancelBrainLivenessWaiter(brain, reason);
+			return;
+		}
+
+		if (rawStreamIsActive(brain) == false
+			|| brain->connected == false
+			|| (brain->transportTLSEnabled() && (brain->isTLSNegotiated() == false || brain->tlsPeerVerified == false)))
+		{
+			return;
+		}
+
+		cancelBrainLivenessWaiter(brain, reason);
+
+		TimeoutPacket *timeout = new TimeoutPacket();
+		timeout->flags = uint64_t(BrainTimeoutFlags::brainPeerLiveness);
+		timeout->originator = brain;
+		timeout->dispatcher = this;
+		timeout->setTimeoutMs(std::max<int64_t>(brainPeerHeartbeatTimeoutMs, 1));
+
+		brainLivenessWaiters.insert({brain, timeout});
+		basics_log("brain liveness waiter armed private4=%u packet=%p reason=%s timeoutMs=%lld\n",
+			brain->private4,
+			static_cast<void *>(timeout),
+			(reason ? reason : "unspecified"),
+			(long long)std::max<int64_t>(brainPeerHeartbeatTimeoutMs, 1));
+		Ring::queueTimeout(timeout);
+	}
+
+	   float calculateAliveBrainRatio(void)
+	   {
+	      uint32_t nBrainsAlive = 1;
 
 		for (BrainView *bv : brains)
 		{
@@ -4341,14 +5236,229 @@ public:
 		}
 
       // nBrains is computed as peers + self during getBrains().
-      return (nBrains > 0)
-                 ? float(nBrainsAlive) / float(nBrains)
-                 : 0.0f;
-   }
+	      return (nBrains > 0)
+	                 ? float(nBrainsAlive) / float(nBrains)
+	                 : 0.0f;
+	   }
+
+		bool maybeDeriveOnMasterMissingAgreement(const char *reason)
+		{
+			// Local vote must agree as well; then require currently reachable active peers.
+			bool everyoneAgrees = isMasterMissing;
+			uint32_t nBrainsAlive = 1;
+
+			for (BrainView *peer : brains)
+			{
+				if (peerEligibleForClusterQuorum(peer) == false) continue;
+				if (peerSocketActive(peer) == false) continue;
+				nBrainsAlive += 1;
+				if (peer->isMasterMissing == false) everyoneAgrees = false;
+			}
+
+			if (nBrainsAlive <= 1)
+			{
+				everyoneAgrees = false;
+			}
+
+			basics_log("masterMissing agreement reason=%s everyone=%d alive=%u local=%d\n",
+				(reason ? reason : "unspecified"),
+				int(everyoneAgrees),
+				nBrainsAlive,
+				int(isMasterMissing));
+
+			if (everyoneAgrees)
+			{
+				deriveMasterBrainIf();
+				return true;
+			}
+
+			return false;
+		}
+
+		void driveMasterPeerIdentityConvergence(BrainView *peer, int64_t nowMs)
+		{
+			if (weAreMaster == false || peer == nullptr)
+			{
+				return;
+			}
+
+			bool peerAcknowledgedCurrentMaster = (
+				peerHasFreshExistingMasterClaim(peer)
+				&& peer->existingMasterUUID == selfBrainUUID());
+			if (peerAcknowledgedCurrentMaster)
+			{
+				return;
+			}
+
+			if (peerSocketActive(peer))
+			{
+				if (peer->lastMasterRegistrationAdvertiseMs == 0
+					|| nowMs - peer->lastMasterRegistrationAdvertiseMs >= int64_t(brainPeerHeartbeatIntervalMs))
+				{
+					peer->sendRegistration(boottimens, version, getExistingMasterUUID());
+					peer->lastMasterRegistrationAdvertiseMs = nowMs;
+				}
+				return;
+			}
+
+			peer->weConnectToIt = shouldWeConnectToBrain(peer);
+			const bool reconnectAlreadyInFlight = (
+				rawStreamIsActive(peer)
+				|| Ring::socketIsClosing(peer)
+				|| peer->connectAttemptPending());
+			if (reconnectAlreadyInFlight == false)
+			{
+				if (peer->weConnectToIt)
+				{
+					armOutboundPeerReconnect(peer);
+				}
+				else
+				{
+					armOutboundPeerReconnect(peer, true);
+				}
+			}
+			else if (peer->weConnectToIt == false)
+			{
+				peer->forceConnectorOwnershipUntilMasterAck = true;
+			}
+		}
+
+		void runBrainPeerHeartbeatTick(void)
+		{
+			if (brainPeerHeartbeatIntervalMs == 0 || brainPeerHeartbeatTimeoutMs == 0)
+			{
+				return;
+			}
+
+			int64_t nowMs = Time::now<TimeResolution::ms>();
+			for (BrainView *peer : brains)
+			{
+				auto noteMasterPeerHeartbeatEligibility = [&] (uint8_t state, const char *reason) -> void
+				{
+					if (peer == nullptr || peerRepresentsCurrentMasterForLiveness(peer) == false || peer->peerHeartbeatEligibilityState == state)
+					{
+						return;
+					}
+
+					peer->peerHeartbeatEligibilityState = state;
+					basics_log("brainPeerHeartbeat eligibility private4=%u state=%u reason=%s rawActive=%d connected=%d tls=%d negotiated=%d peerVerified=%d registrationFresh=%d fd=%d fslot=%d transportEpoch=%u lastAckAgoMs=%lld lastRecvAgoMs=%lld\n",
+						peer->private4,
+						unsigned(state),
+						(reason ? reason : "unspecified"),
+						int(rawStreamIsActive(peer)),
+						int(peer->connected),
+						int(peer->transportTLSEnabled()),
+						int(peer->isTLSNegotiated()),
+						int(peer->tlsPeerVerified),
+						int(peer->registrationFresh),
+						peer->fd,
+						peer->fslot,
+						unsigned(peer->transportEpoch),
+						(long long)(peer->lastHeartbeatAckMs > 0 ? (nowMs - peer->lastHeartbeatAckMs) : -1),
+						(long long)(peer->lastReceiveMs > 0 ? (nowMs - peer->lastReceiveMs) : -1));
+					std::fprintf(stderr,
+						"prodigy debug brainPeerHeartbeat eligibility private4=%u state=%u reason=%s rawActive=%d connected=%d tls=%d negotiated=%d peerVerified=%d registrationFresh=%d fd=%d fslot=%d transportEpoch=%u lastAckAgoMs=%lld lastRecvAgoMs=%lld\n",
+						peer->private4,
+						unsigned(state),
+						(reason ? reason : "unspecified"),
+						int(rawStreamIsActive(peer)),
+						int(peer->connected),
+						int(peer->transportTLSEnabled()),
+						int(peer->isTLSNegotiated()),
+						int(peer->tlsPeerVerified),
+						int(peer->registrationFresh),
+						peer->fd,
+						peer->fslot,
+						unsigned(peer->transportEpoch),
+						(long long)(peer->lastHeartbeatAckMs > 0 ? (nowMs - peer->lastHeartbeatAckMs) : -1),
+						(long long)(peer->lastReceiveMs > 0 ? (nowMs - peer->lastReceiveMs) : -1));
+					std::fflush(stderr);
+				};
+
+				if (peer == nullptr || rawStreamIsActive(peer) == false)
+				{
+					noteMasterPeerHeartbeatEligibility(1, "raw-inactive");
+					driveMasterPeerIdentityConvergence(peer, nowMs);
+					continue;
+				}
+
+				if (peer->connected == false)
+				{
+					noteMasterPeerHeartbeatEligibility(2, "disconnected");
+					driveMasterPeerIdentityConvergence(peer, nowMs);
+					continue;
+				}
+
+				if (peer->transportTLSEnabled() && (peer->isTLSNegotiated() == false || peer->tlsPeerVerified == false))
+				{
+					noteMasterPeerHeartbeatEligibility(3, "tls-unready");
+					driveMasterPeerIdentityConvergence(peer, nowMs);
+					continue;
+				}
+
+				noteMasterPeerHeartbeatEligibility(4, "eligible");
+
+				int64_t lastPeerLivenessMs = peer->lastHeartbeatAckMs;
+				if (peer->lastReceiveMs > lastPeerLivenessMs)
+				{
+					lastPeerLivenessMs = peer->lastReceiveMs;
+				}
+
+				const bool heartbeatOutstanding = (peer->lastHeartbeatSentNonce != peer->lastHeartbeatAckNonce);
+				if (heartbeatOutstanding
+					&& peer->lastHeartbeatSendMs > 0
+					&& nowMs - peer->lastHeartbeatSendMs >= int64_t(brainPeerHeartbeatTimeoutMs))
+				{
+					peer->confirmedMissingTransportEpoch = peer->transportEpoch;
+					basics_log("brainPeerHeartbeat stale private4=%u lastLivenessAgoMs=%lld lastAckAgoMs=%lld timeoutMs=%u transportEpoch=%u lastAckNonce=%llu lastSentNonce=%llu lastReceiveAgoMs=%lld lastSendAgoMs=%lld\n",
+						peer->private4,
+						(long long)(nowMs - lastPeerLivenessMs),
+						(long long)(peer->lastHeartbeatAckMs > 0 ? (nowMs - peer->lastHeartbeatAckMs) : -1),
+						brainPeerHeartbeatTimeoutMs,
+						unsigned(peer->transportEpoch),
+						(unsigned long long)peer->lastHeartbeatAckNonce,
+						(unsigned long long)peer->lastHeartbeatSentNonce,
+						(long long)(peer->lastReceiveMs > 0 ? (nowMs - peer->lastReceiveMs) : -1),
+						(long long)(peer->lastHeartbeatSendMs > 0 ? (nowMs - peer->lastHeartbeatSendMs) : -1));
+					std::fprintf(stderr,
+						"prodigy debug brainPeerHeartbeat stale private4=%u lastLivenessAgoMs=%lld lastAckAgoMs=%lld timeoutMs=%u transportEpoch=%u lastAckNonce=%llu lastSentNonce=%llu lastReceiveAgoMs=%lld lastSendAgoMs=%lld\n",
+						peer->private4,
+						(long long)(nowMs - lastPeerLivenessMs),
+						(long long)(peer->lastHeartbeatAckMs > 0 ? (nowMs - peer->lastHeartbeatAckMs) : -1),
+						brainPeerHeartbeatTimeoutMs,
+						unsigned(peer->transportEpoch),
+						(unsigned long long)peer->lastHeartbeatAckNonce,
+						(unsigned long long)peer->lastHeartbeatSentNonce,
+						(long long)(peer->lastReceiveMs > 0 ? (nowMs - peer->lastReceiveMs) : -1),
+						(long long)(peer->lastHeartbeatSendMs > 0 ? (nowMs - peer->lastHeartbeatSendMs) : -1));
+					std::fflush(stderr);
+					queueBrainCloseIfActive(peer, "peer-heartbeat-timeout");
+					brainMissing(peer);
+					continue;
+				}
+
+				driveMasterPeerIdentityConvergence(peer, nowMs);
+
+				const bool heartbeatDue = (
+					peer->lastHeartbeatSendMs == 0
+					|| nowMs - peer->lastHeartbeatSendMs >= int64_t(brainPeerHeartbeatIntervalMs)
+					|| (lastPeerLivenessMs > 0 && nowMs - lastPeerLivenessMs >= int64_t(brainPeerHeartbeatIntervalMs)));
+				if (heartbeatOutstanding == false && heartbeatDue)
+				{
+					peer->sendPeerHeartbeat(nowMs);
+				}
+			}
+		}
 
 	void brainMissing(BrainView *brain)
 	{
+		const bool peerWasCurrentMaster = peerRepresentsCurrentMasterForLiveness(brain);
 		brain->connected = false;
+		cancelBrainReconnectWaiter(brain, "brain-missing");
+		cancelBrainLivenessWaiter(brain, "brain-missing");
+		const bool reconnectAlreadyInFlight = (
+			Ring::socketIsClosing(brain)
+			|| brain->connectAttemptPending());
 		bool expectedUpdateFollowerReboot = (
 			updateSelfState == UpdateSelfState::waitingForFollowerReboots &&
 			updateSelfFollowerBootNsByPeerKey.contains(updateSelfPeerTrackingKey(brain)));
@@ -4403,14 +5513,28 @@ public:
 			brain->registrationFresh = false;
 			brain->existingMasterUUID = 0;
 			basics_log("brainMissing private4=%u weAreMaster=%d peerWasMaster=%d weConnectToIt=%d\n",
-				brain->private4, int(weAreMaster), int(brain->isMasterBrain), int(brain->weConnectToIt));
+				brain->private4, int(weAreMaster), int(peerWasCurrentMaster), int(brain->weConnectToIt));
 
 			// Master-side fallback: if a peer link drops, proactively dial it even when
-			// canonical connector ownership is the opposite direction. This prevents
-			// post-fault mesh stranding with zero established :313 links.
+			// canonical connector ownership is the opposite direction. Do not stack a
+			// second forced reconnect on top of a close/connect already in flight.
 			if (weAreMaster)
 			{
-				armOutboundPeerReconnect(brain, true);
+				if (reconnectAlreadyInFlight == false)
+				{
+					if (brain->weConnectToIt)
+					{
+						armOutboundPeerReconnect(brain);
+					}
+					else
+					{
+						armOutboundPeerReconnect(brain, true);
+					}
+				}
+				else if (brain->weConnectToIt == false)
+				{
+					brain->forceConnectorOwnershipUntilMasterAck = true;
+				}
 			}
 
 			if (weAreMaster)
@@ -4432,7 +5556,7 @@ public:
 			}
 				else
 				{
-					if (brain->isMasterBrain)
+					if (peerWasCurrentMaster)
 					{
 						// the master brain is missing
 						isMasterMissing = true;
@@ -4452,10 +5576,10 @@ public:
 							}
 						}
 
-							// Do not derive immediately here.
-							// We must wait for masterMissing gossip responses so an isolated minority
-							// cannot self-elect from stale socket state and create split-brain.
-							// Election is triggered from BrainTopic::masterMissing agreement handling.
+							// Re-evaluate after publishing our local vote. A reachable peer may
+							// already have reported the master missing before our own liveness
+							// timeout completed; derivation still requires connected-majority checks.
+							maybeDeriveOnMasterMissingAgreement("brain-missing-local-vote");
 					}
 
 					if (isMasterMissing) // if master fails first, then the other brain fails, we'd run through here twice, otherwise once
@@ -4524,11 +5648,13 @@ public:
 		}
 
 			if (brains.contains(static_cast<BrainView *>(socket)))
-			{
-				BrainView *brain = static_cast<BrainView *>(socket);
-				uint128_t updateSelfPeerKey = updateSelfPeerTrackingKey(brain);
+				{
+					BrainView *brain = static_cast<BrainView *>(socket);
+					cancelBrainLivenessWaiter(brain, "close");
+					cancelBrainPeerHandshakeWatchdog(brain, "close");
+					uint128_t updateSelfPeerKey = updateSelfPeerTrackingKey(brain);
 				std::fprintf(stderr,
-					"prodigy debug brain close stream=%p private4=%u fd=%d fslot=%d isFixed=%d updateState=%u weConnectToIt=%d accepted=%d connected=%d pendingSend=%d pendingRecv=%d tls=%d negotiated=%d peerVerified=%d registrationFresh=%d quarantined=%d queuedBytes=%llu wbytes=%u rbytes=%llu peerKey=%llu\n",
+					"prodigy debug brain close stream=%p private4=%u fd=%d fslot=%d isFixed=%d updateState=%u weConnectToIt=%d forceConnectorOwnership=%d accepted=%d connected=%d pendingSend=%d pendingRecv=%d tls=%d negotiated=%d peerVerified=%d registrationFresh=%d quarantined=%d isMasterBrain=%d existingMasterUUID=%llu noMasterYet=%d weAreMaster=%d transportEpoch=%u queuedCloseEpoch=%u processedCloseEpoch=%u confirmedMissingEpoch=%u queuedBytes=%llu wbytes=%u rbytes=%llu peerKey=%llu\n",
 					static_cast<void *>(brain),
 					brain->private4,
 					brain->fd,
@@ -4536,6 +5662,7 @@ public:
 					int(brain->isFixedFile),
 					unsigned(updateSelfState),
 					int(brain->weConnectToIt),
+					int(brain->forceConnectorOwnershipUntilMasterAck),
 					int(brain->currentStreamAccepted),
 					int(brain->connected),
 					int(brain->pendingSend),
@@ -4545,15 +5672,39 @@ public:
 					int(brain->tlsPeerVerified),
 					int(brain->registrationFresh),
 					int(brain->quarantined),
+					int(brain->isMasterBrain),
+					(unsigned long long)brain->existingMasterUUID,
+					int(noMasterYet),
+					int(weAreMaster),
+					unsigned(brain->transportEpoch),
+					unsigned(brain->queuedCloseTransportEpoch),
+					unsigned(brain->processedCloseTransportEpoch),
+					unsigned(brain->confirmedMissingTransportEpoch),
 					(unsigned long long)brain->queuedSendOutstandingBytes(),
 					uint32_t(brain->wBuffer.outstandingBytes()),
 					(unsigned long long)brain->rBuffer.outstandingBytes(),
 					(unsigned long long)updateSelfPeerKey);
 				std::fflush(stderr);
+				const bool closeConfirmedMissing = (
+					brain->confirmedMissingTransportEpoch != 0
+					&& brain->confirmedMissingTransportEpoch == brain->transportEpoch);
+				const bool closeTargetHasInstalledTransport = (
+					brain->isFixedFile
+					? (brain->fslot >= 0)
+					: (brain->fd >= 0));
+				const bool closeArrivedOnActiveReplacement = (
+					closeTargetHasInstalledTransport
+					&& brain->connected
+					&& brain->confirmedMissingTransportEpoch != brain->transportEpoch
+					&& brain->queuedCloseTransportEpoch != brain->transportEpoch
+					&& (
+						brain->queuedCloseTransportEpoch != 0
+						|| (brain->processedCloseTransportEpoch != 0
+							&& brain->processedCloseTransportEpoch != brain->transportEpoch)));
 				const bool staleCloseAfterTransportAdvance = (
 					brain->queuedCloseTransportEpoch != 0
 					&& brain->queuedCloseTransportEpoch != brain->transportEpoch);
-				if (staleCloseAfterTransportAdvance)
+				if (closeArrivedOnActiveReplacement)
 				{
 					basics_log("brain close ignored stale transport private4=%u queuedCloseEpoch=%u transportEpoch=%u weConnectToIt=%d accepted=%d fd=%d fslot=%d\n",
 						brain->private4,
@@ -4566,12 +5717,30 @@ public:
 					brain->queuedCloseTransportEpoch = 0;
 					co_return;
 				}
+				if (staleCloseAfterTransportAdvance)
+				{
+					basics_log("brain close processing inactive advanced transport private4=%u queuedCloseEpoch=%u transportEpoch=%u weConnectToIt=%d accepted=%d fd=%d fslot=%d\n",
+						brain->private4,
+						unsigned(brain->queuedCloseTransportEpoch),
+						unsigned(brain->transportEpoch),
+						int(brain->weConnectToIt),
+						int(brain->currentStreamAccepted),
+						brain->fd,
+						brain->fslot);
+					brain->queuedCloseTransportEpoch = 0;
+				}
+				brain->processedCloseTransportEpoch = brain->transportEpoch;
+				brain->confirmedMissingTransportEpoch = 0;
+				const bool reconnectOwned = peerReconnectOwned(brain);
 				const bool inertDuplicateConnectorClose = (
-					brain->weConnectToIt
+					reconnectOwned
+					&& brain->reconnectAfterClose
+					&& brain->uuid != 0
+					&& brain->queuedCloseTransportEpoch == 0
 					&& rawStreamIsActive(brain) == false
 					&& brain->connected == false
 					&& brain->currentStreamAccepted == false
-					&& brain->nConnectionAttempts == 0
+					&& brain->connectAttemptPending() == false
 					&& brain->pendingSend == false
 					&& brain->pendingRecv == false
 					&& brain->registrationFresh == false
@@ -4591,15 +5760,69 @@ public:
 				brain->connected = false;
 				brain->cancelPendingConnect();
 				brain->registrationFresh = false;
+				// The next accepted/outbound peer stream must not inherit TLS/BIO or
+				// buffered send/receive state from the closed socket generation.
+				brain->ProdigyTransportTLSStream::reset();
+            bool expectedOSUpdateFollowerReboot = (
+               brain->machine != nullptr
+               && brain->machine->state == MachineState::updatingOS
+               && brain->machine->osUpdateCommandIssued);
             bool expectedUpdateFollowerReboot = (
-               updateSelfState == UpdateSelfState::waitingForFollowerReboots &&
-               updateSelfFollowerBootNsByPeerKey.contains(updateSelfPeerTrackingKey(brain)));
+               (updateSelfState == UpdateSelfState::waitingForFollowerReboots
+                  && updateSelfFollowerBootNsByPeerKey.contains(updateSelfPeerTrackingKey(brain)))
+               || expectedOSUpdateFollowerReboot);
 
 				brain->cancelSuspended();
+            if (closeConfirmedMissing
+               && expectedOSUpdateFollowerReboot
+               && brain->machine != nullptr
+               && brain->machine->state == MachineState::updatingOS)
+            {
+               handleMachineStateChange(brain->machine, MachineState::missing);
+            }
 
-			if (brain->weConnectToIt)
+			if (reconnectOwned)
 			{
-				cancelBrainMissingWaiter(brain, "close-connector-reconnect");
+				if (closeConfirmedMissing)
+				{
+					basics_log("brain close liveness-confirmed connector deferring missing vote private4=%u transportEpoch=%u\n",
+						brain->private4,
+						unsigned(brain->transportEpoch));
+				}
+
+				const bool armConnectorMasterWaiter = (
+					expectedUpdateFollowerReboot == false
+					&& peerRepresentsCurrentMasterForLiveness(brain)
+					&& nBrains > 1);
+				std::fprintf(stderr,
+					"prodigy debug brain close-master-eval private4=%u closeConfirmedMissing=%d expectedUpdateFollowerReboot=%d arm=%d inert=%d reconnectOwned=%d nBrains=%u isMasterBrain=%d existingMasterUUID=%llu uuid=%llu noMasterYet=%d weAreMaster=%d\n",
+					brain->private4,
+					int(closeConfirmedMissing),
+					int(expectedUpdateFollowerReboot),
+					int(armConnectorMasterWaiter),
+					int(inertDuplicateConnectorClose),
+					int(reconnectOwned),
+					nBrains,
+					int(brain->isMasterBrain),
+					(unsigned long long)brain->existingMasterUUID,
+					(unsigned long long)brain->uuid,
+					int(noMasterYet),
+					int(weAreMaster));
+				std::fflush(stderr);
+				if (armConnectorMasterWaiter == false)
+				{
+					if (inertDuplicateConnectorClose == false || brainWaiters.contains(brain) == false)
+					{
+						cancelBrainMissingWaiter(brain, "close-connector-reconnect");
+					}
+				}
+				else
+				{
+					armBrainMissingWaiterIfAbsent(
+						brain,
+						brain->nDefaultAttemptsBudget * brain->connectTimeoutMs + prodigyBrainPeerInboundMissingSlackMs,
+						"close-connector-master");
+				}
 				if (inertDuplicateConnectorClose)
 				{
 					basics_log("brain close ignored inert duplicate connector private4=%u weConnectToIt=%d reconnectAfterClose=%d\n",
@@ -4613,85 +5836,82 @@ public:
 				// but regardless try to reconnect, if not we'll then assume and handle the failure
 				if (brain->shouldReconnect())
 				{
-					// A connector-owned peer must discard the full prior transport
-					// generation before redialing. Reusing stale TLS/BIO/send state
-					// here can trap the mesh in connect/close churn against the same peer.
-					brain->reset();
-					brain->recreateSocket();
-					configureBrainPeerConnectAddress(brain);
-					if (installBrainPeerSocket(brain))
-					{
-						brain->attemptConnect();
-					}
+					armBrainReconnectWaiterIfAbsent(
+						brain,
+						brainPeerReconnectDelayMs(brain),
+						false,
+						"close-connector-reconnect",
+						true);
 				}
 				else
 				{
 					// Keep connector-owned peer links persistently re-armed while the cluster
 					// runs. A transient partition can outlive the default reconnect budget
 					// and otherwise strand the mesh with no active brain links.
-					brain->reset();
-					brain->recreateSocket();
-					configureBrainPeerConnectAddress(brain);
-					brain->nConnectionAttempts = 0;
-					brain->reconnectAfterClose = true;
-
-					int64_t reconnectWindowMs = int64_t(brain->connectTimeoutMs) * int64_t(brain->nDefaultAttemptsBudget);
-					if (reconnectWindowMs < prodigyBrainPeerPersistentReconnectMinMs)
-					{
-						reconnectWindowMs = prodigyBrainPeerPersistentReconnectMinMs;
-					}
-
-					if (brain->connectTimeoutMs > 0)
-					{
-						brain->attemptForMs(reconnectWindowMs);
-					}
-					else
-					{
-						brain->nAttemptsBudget = brain->nDefaultAttemptsBudget;
-					}
-
-					if (installBrainPeerSocket(brain))
-					{
-						brain->attemptConnect();
-					}
+					armBrainReconnectWaiterIfAbsent(
+						brain,
+						brainPeerReconnectDelayMs(brain),
+						true,
+						"close-connector-persistent-reconnect",
+						true);
 				}
 			}
 			else
 			{
-				// Wait one full inbound reconnect window plus a small slack so the
+				if (closeConfirmedMissing)
+				{
+					basics_log("brain close liveness-confirmed inbound deferring missing vote private4=%u transportEpoch=%u\n",
+						brain->private4,
+						unsigned(brain->transportEpoch));
+				}
+
+					const bool shouldProbeCurrentMaster = (
+						expectedUpdateFollowerReboot == false
+						&& peerRepresentsCurrentMasterForLiveness(brain)
+						&& nBrains > 1
+						&& rawStreamIsActive(brain) == false
+						&& brain->connectAttemptPending() == false);
+					if (shouldProbeCurrentMaster)
+					{
+						armOutboundPeerReconnect(brain, true);
+					}
+
+					// Wait one full inbound reconnect window plus a small slack so the
 				// owner brain has a fair chance to redial before we quarantine it.
 				// During coordinated follower reboots we still need this waiter armed;
 				// skipping it can strand the master with no recovery path for the
 				// rebooted accepted peer.
 				if (brainWaiters.contains(brain))
 				{
-					basics_log("brainMissing waiter preserve-existing private4=%u reason=close-inbound packet=%p\n",
-						brain->private4,
-						static_cast<void *>(brainWaiters[brain]));
+					armBrainMissingWaiterIfAbsent(brain, 0, "close-inbound");
 					co_return;
 				}
-
-				TimeoutPacket *timeout = new TimeoutPacket();
-				timeout->flags = uint64_t(BrainTimeoutFlags::brainMissing);
-				timeout->originator = brain;
-				timeout->dispatcher = this;
-				timeout->setTimeoutMs(brain->nDefaultAttemptsBudget * brain->connectTimeoutMs + prodigyBrainPeerInboundMissingSlackMs);
-
-				brainWaiters.insert({brain, timeout});
-				basics_log("brainMissing waiter armed private4=%u packet=%p reason=close-inbound timeoutMs=%lld\n",
-					brain->private4,
-					static_cast<void *>(timeout),
-					(long long)(brain->nDefaultAttemptsBudget * brain->connectTimeoutMs + prodigyBrainPeerInboundMissingSlackMs));
-				Ring::queueTimeout(timeout);
+				armBrainMissingWaiterIfAbsent(
+					brain,
+					brain->nDefaultAttemptsBudget * brain->connectTimeoutMs + prodigyBrainPeerInboundMissingSlackMs,
+					"close-inbound");
 			}
 		}
-			else if (neurons.contains(static_cast<NeuronView *>(socket)))
-			{
-			NeuronView *neuron = static_cast<NeuronView *>(socket);
-			neuron->connected = false;
+				else if (neurons.contains(static_cast<NeuronView *>(socket)))
+				{
+					NeuronView *neuron = static_cast<NeuronView *>(socket);
+					const bool duplicateInactiveNeuronClose = (
+						weAreMaster
+					&& neuronReconnectWaiters.contains(neuron)
+					&& rawStreamIsActive(neuron) == false
+					&& neuron->connectAttemptPending() == false
+					&& neuron->pendingSend == false
+					&& neuron->pendingRecv == false);
+				if (duplicateInactiveNeuronClose)
+				{
+					co_return;
+					}
 
-			neuron->cancelSuspended();
-		basics_log("brain neuron close stream=%p uuid=%llu private4=%u reconnect=%d connected=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d fd=%d isFixed=%d fslot=%d queuedBytes=%llu wbytes=%u rbytes=%llu\n",
+					cancelNeuronControlHandshakeWatchdog(neuron, "close");
+					neuron->connected = false;
+
+					neuron->cancelSuspended();
+			basics_log("brain neuron close stream=%p uuid=%llu private4=%u reconnect=%d connected=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d fd=%d isFixed=%d fslot=%d queuedBytes=%llu wbytes=%u rbytes=%llu\n",
 			static_cast<void *>(neuron),
 			(unsigned long long)(neuron->machine ? neuron->machine->uuid : 0),
 			unsigned(neuron->machine ? neuron->machine->private4 : 0u),
@@ -4721,27 +5941,31 @@ public:
 			neuron->fslot,
 			(unsigned long long)neuron->queuedSendOutstandingBytes(),
 			(unsigned long long)neuron->rBuffer.outstandingBytes());
-			std::fflush(stderr);
-			neuron->cancelPendingConnect();
+				std::fflush(stderr);
+				neuron->cancelPendingConnect();
 
-				if (weAreMaster && neuron->shouldReconnect())
-				{
-					// A reconnect is a fresh transport generation. If stale send/TLS state
-					// survives the prior socket, queueSend() can stay wedged behind a dead
-					// pendingSend flag and the first post-reconnect registration/control
-					// frames never get re-armed.
-					neuron->ProdigyTransportTLSStream::reset();
-					neuron->recreateSocket();
-					if (installNeuronControlSocket(neuron))
+					if (weAreMaster && neuron->shouldReconnect())
 					{
-						neuron->attemptConnect();
+						// A reconnect is a fresh transport generation. If stale send/TLS state
+						// survives the prior socket, queueSend() can stay wedged behind a dead
+						// pendingSend flag and the first post-reconnect registration/control
+						// frames never get re-armed.
+						if (rawStreamIsActive(neuron))
+						{
+							abandonSocketGeneration(neuron);
+						}
+						else
+						{
+							neuron->ProdigyTransportTLSStream::reset();
+						}
+						armNeuronReconnectWaiterIfAbsent(neuron, neuronControlReconnectDelayMs(neuron), "close-neuron-reconnect", true, true);
+					}
+					else
+					{
+						cancelNeuronReconnectWaiter(neuron, "close-neuron-disarm");
+						disarmNeuronControlReconnect(neuron);
 					}
 				}
-				else
-				{
-					disarmNeuronControlReconnect(neuron);
-				}
-			}
 						else if (socket == (void *)&mothershipSocket)
 						{
 							basics_log("mothership listener socket closed weAreMaster=%d\n", int(weAreMaster));
@@ -4759,11 +5983,15 @@ public:
 							mothershipUnixAcceptArmed = false;
 							RingDispatcher::eraseMultiplexee(&mothershipUnixSocket);
 
-						if (weAreMaster)
-						{
-							armMothershipUnixListener();
+							if (weAreMaster)
+							{
+								armMothershipUnixListener();
+							}
+							else
+							{
+								unlinkMothershipUnixSocketPath("unix-listener-close-follower");
+							}
 						}
-					}
 					else if (activeMotherships.contains(static_cast<Mothership *>(socket)))
 					{
                      Mothership *activeMothership = static_cast<Mothership *>(socket);
@@ -4838,8 +6066,119 @@ public:
 		}
 	}
 
+      void queueNeuronStateUploadForMachine(Machine *machine)
+      {
+         if (machine == nullptr || brainConfig.datacenterFragment == 0 || machine->fragment == 0)
+         {
+            return;
+         }
+
+         machine->reportedDatacenterFragment = 0;
+         machine->reportedFragment = 0;
+         machine->runtimeReady = false;
+
+         uint32_t headerOffset = Message::appendHeader(machine->neuron.wBuffer, NeuronTopic::stateUpload);
+
+         struct local_container_subnet6 fragment = {};
+         fragment.dpfx = brainConfig.datacenterFragment;
+         fragment.mpfx[0] = static_cast<uint8_t>((machine->fragment >> 16) & 0xFF);
+         fragment.mpfx[1] = static_cast<uint8_t>((machine->fragment >> 8) & 0xFF);
+         fragment.mpfx[2] = static_cast<uint8_t>(machine->fragment & 0xFF);
+
+         Message::appendAlignedBuffer<Alignment::one>(machine->neuron.wBuffer, reinterpret_cast<uint8_t *>(&fragment), sizeof(struct local_container_subnet6));
+
+         for (const auto& [deploymentID, containers] : machine->containersByDeploymentID)
+         {
+            auto deploymentIt = deployments.find(deploymentID);
+            if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
+            {
+               continue;
+            }
+
+            ApplicationDeployment *deployment = deploymentIt->second;
+            for (ContainerView *container : containers)
+            {
+               ApplicationConfig replayConfig = deployment->resourceConfigForContainer(container);
+               ContainerPlan planToReplay = container->generatePlan(deployment->plan, deployment->nShardGroups, &replayConfig);
+               if (planToReplay.isStateful)
+               {
+                  prodigyPopulateDefaultStatefulTopology(planToReplay.statefulTopology, planToReplay.shardGroup, planToReplay.config);
+               }
+               applyCredentialsToContainerPlan(deployment->plan, *container, planToReplay);
+
+               NeuronContainerBootstrap bootstrap = {};
+               bootstrap.plan = std::move(planToReplay);
+               bootstrap.metricPolicy = deriveNeuronMetricPolicyForDeployment(deployment->plan);
+               String serializedBootstrap = {};
+               BitseryEngine::serialize(serializedBootstrap, bootstrap);
+               Message::appendValue(machine->neuron.wBuffer, serializedBootstrap);
+            }
+         }
+
+         Message::finish(machine->neuron.wBuffer, headerOffset);
+
+         if (streamIsActive(&machine->neuron))
+         {
+            Ring::queueSend(&machine->neuron);
+         }
+      }
+
+      bool machineNeedsNeuronStateRefresh(const Machine *machine) const
+      {
+         if (machine == nullptr)
+         {
+            return false;
+         }
+
+         if (machine->state == MachineState::hardRebooting
+            || machine->state == MachineState::neuronRebooting
+            || machine->runtimeReady == false)
+         {
+            return true;
+         }
+
+         return brainConfig.datacenterFragment != 0
+            && machine->fragment > 0
+            && (machine->reportedDatacenterFragment != brainConfig.datacenterFragment
+               || machine->reportedFragment != machine->fragment);
+      }
+
+      void refreshMachineFragmentAssignmentsIfPossible(void)
+      {
+         if (brainConfig.datacenterFragment == 0)
+         {
+            return;
+         }
+
+         for (Machine *machine : machines)
+         {
+            if (machine == nullptr || neuronControlStreamActive(machine) == false)
+            {
+               continue;
+            }
+
+            if (machine->fragment == 0)
+            {
+               assignMachineFragment(machine);
+               continue;
+            }
+
+            if (machine->runtimeReady == false
+               || machine->reportedDatacenterFragment != brainConfig.datacenterFragment
+               || machine->reportedFragment != machine->fragment)
+            {
+               queueNeuronStateUploadForMachine(machine);
+            }
+         }
+      }
+
 		void assignMachineFragment(Machine *machine)
 		{
+         if (machine == nullptr || brainConfig.datacenterFragment == 0)
+         {
+            return;
+         }
+
 			bool fakeIPv4Mode = false;
 			#if NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE
 			if (const char *mode = getenv("PRODIGY_DEV_FAKE_IPV4_MODE"); mode && mode[0] == '1' && mode[1] == '\0')
@@ -4848,6 +6187,8 @@ public:
 			}
 			#endif
 
+         if (machine->fragment == 0)
+         {
 				do
 				{
 					if (fakeIPv4Mode)
@@ -4891,8 +6232,12 @@ public:
 				}
 
 			} while (usedMachineFragments.contains(machine->fragment));
+         }
 
 		usedMachineFragments.insert(machine->fragment);
+      machine->reportedDatacenterFragment = 0;
+      machine->reportedFragment = 0;
+      machine->runtimeReady = false;
 
 		struct local_container_subnet6 lcsubnet6;
 		lcsubnet6.dpfx = brainConfig.datacenterFragment;
@@ -4916,6 +6261,9 @@ public:
 		{
 			usedMachineFragments.erase(machine->fragment);
 			machine->fragment = 0;
+         machine->reportedDatacenterFragment = 0;
+         machine->reportedFragment = 0;
+         machine->runtimeReady = false;
 	      sendNeuronSwitchboardOverlayRoutes();
 		}
 
@@ -4931,17 +6279,81 @@ public:
 				return false;
 			}
 
-			// A connected neuron socket alone is not sufficient to host work. The
-			// machine must have completed hardware inventory and received a container
-			// subnet fragment before we advertise it as healthy to deployment
-			// scheduling.
-			if (machine->hardware.inventoryComplete == false || machine->fragment == 0)
+			// A connected neuron socket alone is not sufficient to host work. Real
+			// machines need hardware inventory; isolated test clusters may use the
+			// configured synthetic capacity because local runners often expose only
+			// loop-backed storage to lsblk.
+         bool hasInventoryOrTestCapacity = machine->hardware.inventoryComplete;
+         if (hasInventoryOrTestCapacity == false && brainConfig.runtimeEnvironment.test.enabled)
+         {
+            hasInventoryOrTestCapacity = prodigyMachineReadyResourcesAvailable(*machine);
+         }
+
+			if (hasInventoryOrTestCapacity == false
+            || (brainConfig.datacenterFragment != 0 && machine->fragment == 0))
 			{
 				return false;
 			}
 
 			return prodigyMachineReadyResourcesAvailable(*machine);
 		}
+
+      bool machineCanEnterHealthyState(Machine *machine) const
+      {
+         if (machineReadyForHealthyState(machine) == false)
+         {
+            return false;
+         }
+
+         if (machine->state == MachineState::updatingOS
+            || (machine->state == MachineState::hardRebooting && machine->osUpdateCommandIssued))
+         {
+            const OperatingSystemUpdatePolicy *policy = osUpdatePolicyForMachine(machine);
+            return policy != nullptr
+               && machine->osVersionID.equals(policy->targetVersionID)
+               && machine->runtimeReady;
+         }
+
+         return machine->state != MachineState::hardRebooting || machine->runtimeReady;
+      }
+
+      void promoteMachineToHealthyIfReady(Machine *machine)
+      {
+         if (machine != nullptr
+            && machine->state != MachineState::healthy
+            && machineCanEnterHealthyState(machine))
+         {
+            handleMachineStateChange(machine, MachineState::healthy);
+         }
+      }
+
+      void resumeMachineClaimsIfSchedulingReady(Machine *machine)
+      {
+         if (machine == nullptr
+            || machine->state != MachineState::healthy
+            || machine->runtimeReady == false
+            || machine->claims.size() == 0)
+         {
+            return;
+         }
+
+         for (auto it = machine->claims.begin(); it != machine->claims.end(); )
+         {
+            Machine::Claim& claim = *it;
+
+            MachineTicket *ticket = claim.ticket;
+            ticket->nNow = claim.nFit;
+            ticket->shardGroups = claim.shardGroups;
+            ticket->placementTopologyEpochs = claim.placementTopologyEpochs;
+            ticket->reservedGPUMemoryMBs = claim.reservedGPUMemoryMBs;
+            ticket->reservedGPUDevices = claim.reservedGPUDevices;
+            ticket->machineNow = machine;
+
+            ticket->coro->co_consume();
+
+            it = machine->claims.erase(it);
+         }
+      }
 
       static void ownMachineConfig(const MachineConfig& source, MachineConfig& owned)
       {
@@ -5028,13 +6440,136 @@ public:
          }
          owned.reporter.to.assign(source.reporter.to);
          owned.reporter.from.assign(source.reporter.from);
-         owned.reporter.smtp.assign(source.reporter.smtp);
-         owned.reporter.password.assign(source.reporter.password);
-         owned.vmImageURI.assign(source.vmImageURI);
-         ownRuntimeEnvironmentConfig(source.runtimeEnvironment, owned.runtimeEnvironment);
-      }
+	         owned.reporter.smtp.assign(source.reporter.smtp);
+	         owned.reporter.password.assign(source.reporter.password);
+	         owned.vmImageURI.assign(source.vmImageURI);
+	         owned.osUpdatesEnabled = source.osUpdatesEnabled;
+	         owned.osUpdatePolicies = source.osUpdatePolicies;
+	         owned.maxOSDrains = source.maxOSDrains;
+	         owned.machineUpdateCadenceMins = source.machineUpdateCadenceMins;
+	         ownRuntimeEnvironmentConfig(source.runtimeEnvironment, owned.runtimeEnvironment);
+	      }
 
-			void loadBrainConfigIf(void)
+         bool applyConfiguredMachineCapacity(Machine *machine, const MachineConfig& machineConfig, bool overrideExistingTotals)
+         {
+            if (machine == nullptr)
+            {
+               return false;
+            }
+
+            uint32_t beforeTotalLogicalCores = machine->totalLogicalCores;
+            uint32_t beforeTotalMemoryMB = machine->totalMemoryMB;
+            uint32_t beforeTotalStorageMB = machine->totalStorageMB;
+            uint32_t beforeOwnedLogicalCores = machine->ownedLogicalCores;
+            uint32_t beforeOwnedMemoryMB = machine->ownedMemoryMB;
+            uint32_t beforeOwnedStorageMB = machine->ownedStorageMB;
+            int32_t beforeAvailableLogicalCores = machine->nLogicalCores_available;
+            int32_t beforeAvailableSharedCPUMillis = machine->sharedCPUMillis_available;
+            int32_t beforeAvailableMemoryMB = machine->memoryMB_available;
+            int32_t beforeAvailableStorageMB = machine->storageMB_available;
+
+            if (overrideExistingTotals)
+            {
+               if (machineConfig.nLogicalCores > 0) machine->totalLogicalCores = machineConfig.nLogicalCores;
+               if (machineConfig.nMemoryMB > 0) machine->totalMemoryMB = machineConfig.nMemoryMB;
+               if (machineConfig.nStorageMB > 0) machine->totalStorageMB = machineConfig.nStorageMB;
+            }
+            else
+            {
+               if (machine->totalLogicalCores == 0) machine->totalLogicalCores = machineConfig.nLogicalCores;
+               if (machine->totalMemoryMB == 0) machine->totalMemoryMB = machineConfig.nMemoryMB;
+               if (machine->totalStorageMB == 0) machine->totalStorageMB = machineConfig.nStorageMB;
+            }
+
+            ClusterMachineOwnership ownership = {};
+            ownership.mode = ClusterMachineOwnershipMode(machine->ownershipMode);
+            ownership.nLogicalCoresCap = machine->ownershipLogicalCoresCap;
+            ownership.nMemoryMBCap = machine->ownershipMemoryMBCap;
+            ownership.nStorageMBCap = machine->ownershipStorageMBCap;
+            ownership.nLogicalCoresBasisPoints = machine->ownershipLogicalCoresBasisPoints;
+            ownership.nMemoryBasisPoints = machine->ownershipMemoryBasisPoints;
+            ownership.nStorageBasisPoints = machine->ownershipStorageBasisPoints;
+
+            uint32_t resolvedOwnedLogicalCores = overrideExistingTotals ? 0 : machine->ownedLogicalCores;
+            uint32_t resolvedOwnedMemoryMB = overrideExistingTotals ? 0 : machine->ownedMemoryMB;
+            uint32_t resolvedOwnedStorageMB = overrideExistingTotals ? 0 : machine->ownedStorageMB;
+            if (resolvedOwnedLogicalCores == 0 || resolvedOwnedMemoryMB == 0 || resolvedOwnedStorageMB == 0)
+            {
+               (void)clusterMachineResolveOwnedResources(
+                  ownership,
+                  machine->totalLogicalCores,
+                  machine->totalMemoryMB,
+                  machine->totalStorageMB,
+                  resolvedOwnedLogicalCores,
+                  resolvedOwnedMemoryMB,
+                  resolvedOwnedStorageMB
+               );
+            }
+
+            machine->ownedLogicalCores = resolvedOwnedLogicalCores;
+            machine->ownedMemoryMB = resolvedOwnedMemoryMB;
+            machine->ownedStorageMB = resolvedOwnedStorageMB;
+            machine->isolatedLogicalCoresCommitted = 0;
+            machine->sharedCPUMillisCommitted = 0;
+            machine->memoryMB_available = int32_t(resolvedOwnedMemoryMB);
+            machine->storageMB_available = int32_t(resolvedOwnedStorageMB);
+            machine->resetAvailableGPUMemoryMBsFromHardware();
+            prodigyRecomputeMachineCPUAvailability(machine, prodigySharedCPUOvercommitPermille(brainConfig.sharedCPUOvercommitPermille));
+
+            for (Machine::Claim& claim : machine->claims)
+            {
+               if (claim.nFit == 0)
+               {
+                  continue;
+               }
+
+               uint32_t reservedIsolatedLogicalCores = claim.reservedIsolatedLogicalCoresTotal ? claim.reservedIsolatedLogicalCoresTotal : (claim.reservedIsolatedLogicalCoresPerInstance * claim.nFit);
+               uint32_t reservedSharedCPUMillis = claim.reservedSharedCPUMillisTotal ? claim.reservedSharedCPUMillisTotal : (claim.reservedSharedCPUMillisPerInstance * claim.nFit);
+               uint32_t reservedMemoryMB = claim.reservedMemoryMBTotal ? claim.reservedMemoryMBTotal : (claim.reservedMemoryMBPerInstance * claim.nFit);
+               uint32_t reservedStorageMB = claim.reservedStorageMBTotal ? claim.reservedStorageMBTotal : (claim.reservedStorageMBPerInstance * claim.nFit);
+               machine->isolatedLogicalCoresCommitted += reservedIsolatedLogicalCores;
+               machine->sharedCPUMillisCommitted += reservedSharedCPUMillis;
+               machine->memoryMB_available -= int32_t(reservedMemoryMB);
+               machine->storageMB_available -= int32_t(reservedStorageMB);
+               prodigyConsumeAssignedGPUsFromMachineAvailability(machine, claim.reservedGPUMemoryMBs, claim.reservedGPUDevices);
+            }
+
+            for (const auto& [deploymentID, indexedContainers] : machine->containersByDeploymentID)
+            {
+               auto deploymentIt = deployments.find(deploymentID);
+               if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
+               {
+                  continue;
+               }
+
+               const ApplicationConfig& indexedConfig = deploymentIt->second->plan.config;
+               for (ContainerView *container : indexedContainers)
+               {
+                  if (container == nullptr || container->state == ContainerState::destroyed)
+                  {
+                     continue;
+                  }
+
+                  prodigyDebitMachineScalarResources(machine, indexedConfig, 1);
+                  prodigyConsumeAssignedGPUsFromMachineAvailability(machine, container->assignedGPUMemoryMBs, container->assignedGPUDevices);
+               }
+            }
+
+            prodigyRecomputeMachineCPUAvailability(machine, prodigySharedCPUOvercommitPermille(brainConfig.sharedCPUOvercommitPermille));
+
+            return beforeTotalLogicalCores != machine->totalLogicalCores
+               || beforeTotalMemoryMB != machine->totalMemoryMB
+               || beforeTotalStorageMB != machine->totalStorageMB
+               || beforeOwnedLogicalCores != machine->ownedLogicalCores
+               || beforeOwnedMemoryMB != machine->ownedMemoryMB
+               || beforeOwnedStorageMB != machine->ownedStorageMB
+               || beforeAvailableLogicalCores != machine->nLogicalCores_available
+               || beforeAvailableSharedCPUMillis != machine->sharedCPUMillis_available
+               || beforeAvailableMemoryMB != machine->memoryMB_available
+               || beforeAvailableStorageMB != machine->storageMB_available;
+         }
+
+				void loadBrainConfigIf(void)
 		{
 	      iaas->configureRuntimeEnvironment(brainConfig.runtimeEnvironment);
 	      for (Machine *machine : machines)
@@ -5063,98 +6598,15 @@ public:
 					continue;
 				}
 
-				const MachineConfig& machineConfig = it->second;
-				ClusterMachineOwnership ownership = {};
-				ownership.mode = ClusterMachineOwnershipMode(machine->ownershipMode);
-				ownership.nLogicalCoresCap = machine->ownershipLogicalCoresCap;
-				ownership.nMemoryMBCap = machine->ownershipMemoryMBCap;
-				ownership.nStorageMBCap = machine->ownershipStorageMBCap;
-				ownership.nLogicalCoresBasisPoints = machine->ownershipLogicalCoresBasisPoints;
-				ownership.nMemoryBasisPoints = machine->ownershipMemoryBasisPoints;
-				ownership.nStorageBasisPoints = machine->ownershipStorageBasisPoints;
-
-				if (machine->totalLogicalCores == 0) machine->totalLogicalCores = machineConfig.nLogicalCores;
-				if (machine->totalMemoryMB == 0) machine->totalMemoryMB = machineConfig.nMemoryMB;
-				if (machine->totalStorageMB == 0) machine->totalStorageMB = machineConfig.nStorageMB;
-
-				uint32_t resolvedOwnedLogicalCores = machine->ownedLogicalCores;
-				uint32_t resolvedOwnedMemoryMB = machine->ownedMemoryMB;
-				uint32_t resolvedOwnedStorageMB = machine->ownedStorageMB;
-				if (resolvedOwnedLogicalCores == 0 || resolvedOwnedMemoryMB == 0 || resolvedOwnedStorageMB == 0)
-				{
-					(void)clusterMachineResolveOwnedResources(
-						ownership,
-						machine->totalLogicalCores,
-						machine->totalMemoryMB,
-						machine->totalStorageMB,
-						resolvedOwnedLogicalCores,
-						resolvedOwnedMemoryMB,
-						resolvedOwnedStorageMB
-					);
-				}
-
-				machine->ownedLogicalCores = resolvedOwnedLogicalCores;
-				machine->ownedMemoryMB = resolvedOwnedMemoryMB;
-				machine->ownedStorageMB = resolvedOwnedStorageMB;
-            machine->isolatedLogicalCoresCommitted = 0;
-            machine->sharedCPUMillisCommitted = 0;
-				machine->memoryMB_available = int32_t(resolvedOwnedMemoryMB);
-				machine->storageMB_available = int32_t(resolvedOwnedStorageMB);
-            machine->resetAvailableGPUMemoryMBsFromHardware();
-            prodigyRecomputeMachineCPUAvailability(machine, prodigySharedCPUOvercommitPermille(brainConfig.sharedCPUOvercommitPermille));
-
-            for (Machine::Claim& claim : machine->claims)
-            {
-               if (claim.nFit == 0)
-               {
-                  continue;
-               }
-
-               machine->isolatedLogicalCoresCommitted += (claim.reservedIsolatedLogicalCoresPerInstance * claim.nFit);
-               machine->sharedCPUMillisCommitted += (claim.reservedSharedCPUMillisPerInstance * claim.nFit);
-               machine->memoryMB_available -= int32_t(uint64_t(claim.reservedMemoryMBPerInstance) * uint64_t(claim.nFit));
-               machine->storageMB_available -= int32_t(uint64_t(claim.reservedStorageMBPerInstance) * uint64_t(claim.nFit));
-               prodigyConsumeAssignedGPUsFromMachineAvailability(machine, claim.reservedGPUMemoryMBs, claim.reservedGPUDevices);
-            }
-
-            for (const auto& [deploymentID, indexedContainers] : machine->containersByDeploymentID)
-            {
-               auto deploymentIt = deployments.find(deploymentID);
-               if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
-               {
-                  continue;
-               }
-
-               const ApplicationConfig& indexedConfig = deploymentIt->second->plan.config;
-               for (ContainerView *container : indexedContainers)
-               {
-                  if (container == nullptr)
-                  {
-                     continue;
-                  }
-
-                  if (container->state == ContainerState::destroyed)
-                  {
-                     continue;
-                  }
-
-                  prodigyDebitMachineScalarResources(machine, indexedConfig, 1);
-                  prodigyConsumeAssignedGPUsFromMachineAvailability(machine, container->assignedGPUMemoryMBs, container->assignedGPUDevices);
-               }
-            }
-
-            prodigyRecomputeMachineCPUAvailability(machine, prodigySharedCPUOvercommitPermille(brainConfig.sharedCPUOvercommitPermille));
+					const MachineConfig& machineConfig = it->second;
+	            (void)applyConfiguredMachineCapacity(machine, machineConfig, brainConfig.runtimeEnvironment.test.enabled);
 
 				if (haveDatacenterFragment)
 				{
 					assignMachineFragment(machine);
 				}
 
-				if (machine->state != MachineState::healthy
-					&& machineReadyForHealthyState(machine))
-				{
-					handleMachineStateChange(machine, MachineState::healthy);
-				}
+				promoteMachineToHealthyIfReady(machine);
 
 				if (machine->isThisMachine)
 				{
@@ -5196,8 +6648,21 @@ public:
          }
 
          bool changed = (machine->hardware != hardware);
-         prodigyApplyHardwareProfileToMachine(*machine, hardware);
-         if (changed == false)
+         if (changed)
+         {
+            prodigyApplyHardwareProfileToMachine(*machine, hardware);
+         }
+         bool configuredCapacityChanged = false;
+         if (brainConfig.runtimeEnvironment.test.enabled)
+         {
+            auto configIt = brainConfig.configBySlug.find(machine->slug);
+            if (configIt != brainConfig.configBySlug.end())
+            {
+               configuredCapacityChanged = applyConfiguredMachineCapacity(machine, configIt->second, true);
+            }
+         }
+
+         if (changed == false && configuredCapacityChanged == false)
          {
             return;
          }
@@ -5218,6 +6683,14 @@ public:
                   }
 
                   prodigyApplyHardwareProfileToClusterMachine(clusterMachine, hardware);
+                  if (brainConfig.runtimeEnvironment.test.enabled)
+                  {
+                     auto configIt = brainConfig.configBySlug.find(machine->slug);
+                     if (configIt != brainConfig.configBySlug.end())
+                     {
+                        (void)clusterMachineApplyOwnedResourcesFromConfig(clusterMachine, configIt->second);
+                     }
+                  }
                   updatedTopology = true;
                   break;
                }
@@ -5434,12 +6907,18 @@ public:
 
 			if (Ring::bindSourceAddressBeforeFixedFileInstall(brain) == false)
 			{
+				::close(brain->fd);
+				brain->fd = -1;
+				brain->isFixedFile = false;
 				return false;
 			}
 
 			int slot = Ring::adoptProcessFDIntoFixedFileSlot(brain->fd);
 			if (slot < 0)
 			{
+				::close(brain->fd);
+				brain->fd = -1;
+				brain->isFixedFile = false;
 				return false;
 			}
 
@@ -5900,10 +7379,25 @@ public:
 			return false;
 		}
 
-		void linkBrainViewToMachine(Machine *machine)
-		{
-			if (machine == nullptr || machine->isBrain == false)
+	      void applyBrainViewRuntimeMetadataToMachine(Machine *machine, BrainView *brain)
+	      {
+	         if (machine == nullptr || brain == nullptr)
+	         {
+	            return;
+	         }
+
+	         machine->brain = brain;
+	         brain->machine = machine;
+	         if (brain->kernel.size() > 0) machine->kernel = brain->kernel;
+	         if (brain->osID.size() > 0) machine->osID = brain->osID;
+	         if (brain->osVersionID.size() > 0) machine->osVersionID = brain->osVersionID;
+	         if (brain->boottimens > 0) machine->lastUpdatedOSMs = brain->boottimens / 1000000;
+	      }
+
+			void linkBrainViewToMachine(Machine *machine)
 			{
+				if (machine == nullptr || machine->isBrain == false)
+				{
 				return;
 			}
 
@@ -5914,13 +7408,12 @@ public:
 					continue;
 				}
 
-				if ((brain->uuid != 0 && machine->uuid != 0 && brain->uuid == machine->uuid)
-					|| machineMatchesPeerAddress(machine, brain->peerAddress, &brain->peerAddressText))
-				{
-					machine->brain = brain;
-					brain->machine = machine;
-					return;
-				}
+					if ((brain->uuid != 0 && machine->uuid != 0 && brain->uuid == machine->uuid)
+						|| machineMatchesPeerAddress(machine, brain->peerAddress, &brain->peerAddressText))
+					{
+						applyBrainViewRuntimeMetadataToMachine(machine, brain);
+						return;
+					}
 
             for (const ClusterMachinePeerAddress& candidate : brain->peerAddresses)
             {
@@ -5930,24 +7423,22 @@ public:
                   continue;
                }
 
-               if (machineMatchesPeerAddress(machine, candidateAddress, &candidate.address))
-               {
-                  machine->brain = brain;
-                  brain->machine = machine;
-                  return;
-               }
+	               if (machineMatchesPeerAddress(machine, candidateAddress, &candidate.address))
+	               {
+	                  applyBrainViewRuntimeMetadataToMachine(machine, brain);
+	                  return;
+	               }
             }
 
-				if (machine->private4 != 0
-					&& brain->private4 != 0
-					&& machine->private4 == brain->private4
-					&& brain->peerAddress.isNull()
-					&& brain->peerAddressText.size() == 0)
-				{
-					machine->brain = brain;
-					brain->machine = machine;
-					return;
-				}
+					if (machine->private4 != 0
+						&& brain->private4 != 0
+						&& machine->private4 == brain->private4
+						&& brain->peerAddress.isNull()
+						&& brain->peerAddressText.size() == 0)
+					{
+						applyBrainViewRuntimeMetadataToMachine(machine, brain);
+						return;
+					}
 			}
 		}
 
@@ -5969,9 +7460,8 @@ public:
 					return;
 				}
 
-				machine->brain = brain;
-				brain->machine = machine;
-			}
+					applyBrainViewRuntimeMetadataToMachine(machine, brain);
+				}
 
 			if (machine->uuid == brain->uuid)
 			{
@@ -6141,7 +7631,7 @@ public:
 				machine->isBrain = clusterMachine.isBrain;
 				machine->isThisMachine = thisIsMachine;
 				machine->neuron.machine = machine;
-				prodigyConfigureMachineNeuronEndpoint(*machine, thisNeuron);
+				prodigyConfigureMachineNeuronEndpoint(*machine, thisNeuron, &localBrainPeerAddresses);
 			}
 
 		bool restoreBrainsFromClusterTopology(const ClusterTopology& topology)
@@ -6353,6 +7843,12 @@ public:
 						brain->fslot,
 						unsigned(brain->daddrLen));
 					std::fflush(stderr);
+					armBrainReconnectWaiterIfAbsent(
+						brain,
+						brainPeerReconnectDelayMs(brain),
+						true,
+						"init-peer-connect-install-fail",
+						true);
 				}
 			}
 			else
@@ -6518,6 +8014,11 @@ public:
 			uint32_t resolvedPrivate4 = 0;
 			if (resolveClusterMachinePrivate4(normalized, resolvedPrivate4) == false)
 			{
+            normalized.peerAddresses.clear();
+            for (const ClusterMachinePeerAddress& candidate : probedResources.peerAddresses)
+            {
+               prodigyAppendUniqueClusterMachinePeerAddress(normalized.peerAddresses, candidate);
+            }
             prodigyAssignClusterMachineAddressesFromPeerCandidates(normalized.addresses, probedResources.peerAddresses);
             ClusterTopology candidateTopology = {};
             for (const Machine *machine : machines)
@@ -6531,6 +8032,10 @@ public:
                existing.isBrain = machine->isBrain;
                existing.uuid = machine->uuid;
                existing.ssh.address = machine->sshAddress;
+               for (const ClusterMachinePeerAddress& candidate : machine->peerAddresses)
+               {
+                  prodigyAppendUniqueClusterMachinePeerAddress(existing.peerAddresses, candidate);
+               }
                prodigyAssignClusterMachineAddressesFromPeerCandidates(existing.addresses, machine->peerAddresses);
                String privateGateway = {};
                if (machine->gatewayPrivate4 != 0)
@@ -6813,20 +8318,20 @@ public:
 				{
 					machinesByUUID.insert_or_assign(machine->uuid, machine);
 				}
-				if (machine->isThisMachine && thisNeuron != nullptr)
-				{
-					thisNeuron->ensureDeferredHardwareInventoryProgress();
-					// The local neuron can finish deferred inventory before topology
-					// restore links it to the runtime Machine. Replay any completed
+					if (machine->isThisMachine && thisNeuron != nullptr)
+					{
+						machine->kernel = thisNeuron->kernel;
+						machine->osID = thisNeuron->osID;
+						machine->osVersionID = thisNeuron->osVersionID;
+						machine->lastUpdatedOSMs = thisNeuron->bootTimeMs;
+						thisNeuron->ensureDeferredHardwareInventoryProgress();
+						// The local neuron can finish deferred inventory before topology
+						// restore links it to the runtime Machine. Replay any completed
 					// inventory now so created seeds do not lose self hardware state.
 					if (const MachineHardwareProfile *hardware = thisNeuron->latestHardwareProfileIfReady(); hardware != nullptr)
 					{
 						applyMachineHardwareProfile(machine, *hardware);
-						if (machine->state != MachineState::healthy
-							&& machineReadyForHealthyState(machine))
-						{
-							handleMachineStateChange(machine, MachineState::healthy);
-						}
+						promoteMachineToHealthyIfReady(machine);
 					}
 				}
 				std::fprintf(stderr, "prodigy topology restore-machine complete machine=%p uuid=%llu private4=%u\n",
@@ -6897,9 +8402,10 @@ public:
                   (unsigned long long)deployment->waitingOnContainers.size(),
                   unsigned(container->state));
                std::fflush(stderr);
-               deployment->containerIsHealthy(container);
-               std::fprintf(stderr,
-                  "brain noteLocalContainerHealthy done uuid=%llu deploymentID=%llu appID=%u waitingAfter=%llu stateAfter=%u\n",
+	               deployment->containerIsHealthy(container);
+	               replicateContainerRuntimeStateToFollowers(container);
+	               std::fprintf(stderr,
+	                  "brain noteLocalContainerHealthy done uuid=%llu deploymentID=%llu appID=%u waitingAfter=%llu stateAfter=%u\n",
                   (unsigned long long)containerUUID,
                   (unsigned long long)container->deploymentID,
                   unsigned(ApplicationConfig::extractApplicationID(container->deploymentID)),
@@ -6920,6 +8426,35 @@ public:
                (unsigned long long)containerUUID);
          }
       }
+
+      void noteLocalContainerRuntimeReady(uint128_t containerUUID) override
+      {
+         if (weAreMaster == false)
+         {
+            BrainView *masterPeer = currentMasterPeer();
+            if (masterPeer != nullptr)
+            {
+               Message::construct(masterPeer->wBuffer, BrainTopic::replicateContainerRuntimeReady, containerUUID);
+               Ring::queueSend(masterPeer);
+            }
+            return;
+         }
+
+         if (auto it = containers.find(containerUUID); it != containers.end())
+         {
+            ContainerView *container = it->second;
+            if (container == nullptr)
+            {
+               return;
+            }
+
+	            if (auto deploymentIt = deployments.find(container->deploymentID); deploymentIt != deployments.end() && deploymentIt->second != nullptr)
+	            {
+	               deploymentIt->second->containerIsRuntimeReady(container);
+	               replicateContainerRuntimeStateToFollowers(container);
+	            }
+	         }
+	      }
 
 	void getMachines(CoroutineStack *coro)
 	{
@@ -6946,12 +8481,20 @@ public:
 		}
 
 		Vector<Machine *> duplicateSnapshots;
-      auto reconcileCanonicalMachineFromSnapshot = [&] (Machine *canonical, Machine *candidate) -> void {
+	      auto isGenericBootstrapMachineSnapshot = [] (const Machine *machine) -> bool {
 
-         if (canonical == nullptr || candidate == nullptr)
-         {
-            return;
-         }
+	         return machine != nullptr
+	            && machine->slug.equals("bootstrap"_ctv)
+	            && machine->type.size() == 0
+	            && machine->cloudID.size() == 0;
+	      };
+
+	      auto reconcileCanonicalMachineFromSnapshot = [&] (Machine *canonical, Machine *candidate) -> void {
+
+	         if (canonical == nullptr || candidate == nullptr)
+	         {
+	            return;
+	         }
 
          auto assignRack = [&] (Machine *machine, uint32_t rackUUID) -> void {
 
@@ -6994,25 +8537,61 @@ public:
             rack->machines.insert(machine);
          };
 
-         canonical->isBrain = candidate->isBrain;
-         canonical->isThisMachine = candidate->isThisMachine;
-         canonical->private4 = candidate->private4;
-         canonical->gatewayPrivate4 = candidate->gatewayPrivate4;
-         canonical->slug = candidate->slug;
-         canonical->lifetime = candidate->lifetime;
-         canonical->type = candidate->type;
-         canonical->cloudID = candidate->cloudID;
-         canonical->sshAddress = candidate->sshAddress;
-         canonical->sshPort = candidate->sshPort;
-         canonical->sshUser = candidate->sshUser;
-         canonical->sshPrivateKeyPath = candidate->sshPrivateKeyPath;
-         canonical->sshHostPublicKeyOpenSSH = candidate->sshHostPublicKeyOpenSSH;
-         canonical->publicAddress = candidate->publicAddress;
-         canonical->privateAddress = candidate->privateAddress;
-         canonical->peerAddresses = candidate->peerAddresses;
-         canonical->creationTimeMs = candidate->creationTimeMs;
+	         canonical->isBrain = candidate->isBrain;
+	         canonical->isThisMachine = candidate->isThisMachine;
+	         if (candidate->private4 != 0)
+	         {
+	            canonical->private4 = candidate->private4;
+	         }
+	         if (candidate->gatewayPrivate4 != 0)
+	         {
+	            canonical->gatewayPrivate4 = candidate->gatewayPrivate4;
+	         }
+	         if (isGenericBootstrapMachineSnapshot(candidate) == false || canonical->slug.size() == 0)
+	         {
+	            canonical->slug = candidate->slug;
+	            canonical->lifetime = candidate->lifetime;
+	            canonical->type = candidate->type;
+	            canonical->cloudID = candidate->cloudID;
+	         }
+	         if (candidate->sshAddress.size() > 0)
+	         {
+	            canonical->sshAddress = candidate->sshAddress;
+	         }
+	         if (candidate->sshPort != 0)
+	         {
+	            canonical->sshPort = candidate->sshPort;
+	         }
+	         if (candidate->sshUser.size() > 0)
+	         {
+	            canonical->sshUser = candidate->sshUser;
+	         }
+         if (candidate->sshPrivateKeyPath.size() > 0)
+         {
+            canonical->sshPrivateKeyPath = candidate->sshPrivateKeyPath;
+         }
+         if (candidate->sshHostPublicKeyOpenSSH.size() > 0)
+         {
+            canonical->sshHostPublicKeyOpenSSH = candidate->sshHostPublicKeyOpenSSH;
+         }
+         if (candidate->publicAddress.size() > 0)
+         {
+            canonical->publicAddress = candidate->publicAddress;
+         }
+         if (candidate->privateAddress.size() > 0)
+         {
+            canonical->privateAddress = candidate->privateAddress;
+         }
+         if (candidate->peerAddresses.empty() == false)
+         {
+            canonical->peerAddresses = candidate->peerAddresses;
+         }
+         if (candidate->creationTimeMs != 0)
+         {
+            canonical->creationTimeMs = candidate->creationTimeMs;
+         }
          canonical->neuron.machine = canonical;
-         prodigyConfigureMachineNeuronEndpoint(*canonical, thisNeuron);
+         prodigyConfigureMachineNeuronEndpoint(*canonical, thisNeuron, &localBrainPeerAddresses);
 
          if (candidate->rackUUID != 0)
          {
@@ -7104,18 +8683,28 @@ public:
 		loadBrainConfigIf();
 
 		// Wait one full initial control-plane reconnect window before declaring
-		// startup ignited. Freshly created machines can continue bootstrapping
-		// after this; ignition just avoids racing the first reconnect budget.
-		bool isDevMode = BrainBase::controlPlaneDevModeEnabled();
-		ignitionSwitch.flags = uint64_t(BrainTimeoutFlags::ignition);
-		ignitionSwitch.setTimeoutMs(BrainBase::controlPlaneIgnitionTimeoutMs(isDevMode));
-		ignitionSwitch.dispatcher = this;
-		RingDispatcher::installMultiplexee(&ignitionSwitch, this);
-		Ring::queueTimeout(&ignitionSwitch);
+			// startup ignited. Freshly created machines can continue bootstrapping
+			// after this; ignition just avoids racing the first reconnect budget.
+			bool isDevMode = BrainBase::controlPlaneDevModeEnabled();
+			brainPeerKeepaliveSeconds = (isDevMode ? prodigyBrainDevPeerKeepaliveSeconds : prodigyBrainPeerKeepaliveSeconds);
+			brainPeerHeartbeatIntervalMs = (isDevMode ? prodigyBrainDevPeerHeartbeatIntervalMs : prodigyBrainPeerHeartbeatIntervalMs);
+			brainPeerHeartbeatTimeoutMs = (isDevMode ? prodigyBrainDevPeerHeartbeatTimeoutMs : prodigyBrainPeerHeartbeatTimeoutMs);
+			ignitionSwitch.flags = uint64_t(BrainTimeoutFlags::ignition);
+			ignitionSwitch.setTimeoutMs(BrainBase::controlPlaneIgnitionTimeoutMs(isDevMode));
+			ignitionSwitch.dispatcher = this;
+			RingDispatcher::installMultiplexee(&ignitionSwitch, this);
+			Ring::queueTimeout(&ignitionSwitch);
 
-		// we could turn this on and off whether we have spot machines or not.... but just simpler to let it run always
-		spotDecomissionChecker.flags = uint64_t(BrainTimeoutFlags::spotDecomissionChecker);
-		spotDecomissionChecker.setTimeoutMs(prodigyBrainSpotDecommissionCheckIntervalMs); // every 90 seconds, gives us 30 seconds to get a new machine up if need be
+			brainPeerHeartbeatTicker.flags = uint64_t(BrainTimeoutFlags::brainPeerHeartbeat);
+			brainPeerHeartbeatTicker.setTimeoutMs(brainPeerHeartbeatIntervalMs);
+			brainPeerHeartbeatTicker.dispatcher = this;
+			RingDispatcher::installMultiplexee(&brainPeerHeartbeatTicker, this);
+			// Keep peer liveness ticking even when the mesh goes otherwise quiet.
+			Ring::queueTimeout(&brainPeerHeartbeatTicker);
+
+			// we could turn this on and off whether we have spot machines or not.... but just simpler to let it run always
+			spotDecomissionChecker.flags = uint64_t(BrainTimeoutFlags::spotDecomissionChecker);
+			spotDecomissionChecker.setTimeoutMs(prodigyBrainSpotDecommissionCheckIntervalMs); // every 90 seconds, gives us 30 seconds to get a new machine up if need be
 		spotDecomissionChecker.dispatcher = this;
 		RingDispatcher::installMultiplexee(&spotDecomissionChecker, this);
 		Ring::queueTimeout(&spotDecomissionChecker);
@@ -7129,7 +8718,7 @@ public:
 		{
 			for (Machine *machine : machines)
 			{
-				if (machine->state == MachineState::healthy)
+				if (prodigyMachineReadyForScheduling(machine))
 				{
 					return true;
 				}
@@ -7144,11 +8733,13 @@ public:
 
 		iaas->boot();
 
-		bool isDevMode = BrainBase::controlPlaneDevModeEnabled();
+			bool isDevMode = BrainBase::controlPlaneDevModeEnabled();
 
-		// Keep brain-to-brain failure detection bounded in dev so master failover is testable.
-		// Production uses a slightly larger bound to avoid churn from brief transients.
-		brainPeerKeepaliveSeconds = (isDevMode ? prodigyBrainDevPeerKeepaliveSeconds : prodigyBrainPeerKeepaliveSeconds);
+			// Keep brain-to-brain liveness bounded in dev so master failover is testable.
+			// Production uses a slightly larger bound to avoid churn from brief transients.
+			brainPeerKeepaliveSeconds = (isDevMode ? prodigyBrainDevPeerKeepaliveSeconds : prodigyBrainPeerKeepaliveSeconds);
+			brainPeerHeartbeatIntervalMs = (isDevMode ? prodigyBrainDevPeerHeartbeatIntervalMs : prodigyBrainPeerHeartbeatIntervalMs);
+			brainPeerHeartbeatTimeoutMs = (isDevMode ? prodigyBrainDevPeerHeartbeatTimeoutMs : prodigyBrainPeerHeartbeatTimeoutMs);
 
 		// Fast-restore brain state from memfd if available
 		{
@@ -7268,10 +8859,7 @@ public:
 			{
 				initializeBrainPeerIfNeeded(brain);
 			}
-
-      std::fprintf(stderr, "prodigy brain getBrains selfIsBrain=%d nBrains=%u peerRegistrations=%u\n", int(selfIsBrain), nBrains, uint32_t(brains.size()));
-
-		// Multi-brain bootstrap self-elects from brain registrations; only the elected master
+			// Multi-brain bootstrap self-elects from brain registrations; only the elected master
 		// should arm mothership listening.
 		if (nBrains == 1)
 		{
@@ -7287,11 +8875,13 @@ public:
 			noMasterYet = true;
 			isMasterMissing = false;
 			pendingDesignatedMasterPeerKey = 0;
+			cancelAllBrainLivenessWaiters("reset-master");
 
 		for (BrainView *bv : brains)
 		{
 			bv->isMasterBrain = false;
 			bv->isMasterMissing = false;
+			bv->forceConnectorOwnershipUntilMasterAck = false;
 		}
 	}
 
@@ -7341,10 +8931,53 @@ public:
 				return listenerLive;
 			}
 
-			bool armMothershipUnixListener(void)
-			{
-				mothershipUnixAcceptArmed = false;
-				mothershipUnixSocket.recreateSocket();
+				void clearMothershipUnixSocketPathOwnership(void)
+				{
+					mothershipUnixSocketPathInodeRecorded = false;
+					mothershipUnixSocketPathDevice = 0;
+					mothershipUnixSocketPathInode = 0;
+				}
+
+				bool recordMothershipUnixSocketPathOwnership(void)
+				{
+					if (mothershipUnixSocketPath.size() == 0)
+					{
+						return false;
+					}
+
+					struct stat pathStat = {};
+					if (::stat(mothershipUnixSocketPath.c_str(), &pathStat) != 0 || S_ISSOCK(pathStat.st_mode) == false)
+					{
+						return false;
+					}
+
+					mothershipUnixSocketPathInodeRecorded = true;
+					mothershipUnixSocketPathDevice = pathStat.st_dev;
+					mothershipUnixSocketPathInode = pathStat.st_ino;
+					return true;
+				}
+
+				bool mothershipUnixSocketPathOwnedByLocalListener(void)
+				{
+					if (mothershipUnixSocketPath.size() == 0 || mothershipUnixSocketPathInodeRecorded == false)
+					{
+						return false;
+					}
+
+					struct stat pathStat = {};
+					if (::stat(mothershipUnixSocketPath.c_str(), &pathStat) != 0 || S_ISSOCK(pathStat.st_mode) == false)
+					{
+						return false;
+					}
+
+					return pathStat.st_dev == mothershipUnixSocketPathDevice && pathStat.st_ino == mothershipUnixSocketPathInode;
+				}
+
+					bool armMothershipUnixListener(bool replaceLiveListener = false)
+					{
+					mothershipUnixAcceptArmed = false;
+					clearMothershipUnixSocketPathOwnership();
+					mothershipUnixSocket.recreateSocket();
 				mothershipUnixSocket.isFixedFile = false;
 				mothershipUnixSocket.pendingSend = false;
 			mothershipUnixSocket.pendingSendBytes = 0;
@@ -7354,6 +8987,17 @@ public:
 			if (mothershipUnixSocketPath.size() == 0)
 			{
 				basics_log("armMothershipUnixListener missing socket path\n");
+				return false;
+			}
+			struct sockaddr_un pathLimitProbe = {};
+			if (mothershipUnixSocketPath.size() >= sizeof(pathLimitProbe.sun_path))
+			{
+				std::fprintf(stderr,
+					"prodigy mothership listen-failed transport=unix reason=path-too-long pathBytes=%zu maxBytes=%zu path=%s\n",
+					size_t(mothershipUnixSocketPath.size()),
+					sizeof(pathLimitProbe.sun_path) - 1,
+					mothershipUnixSocketPath.c_str());
+				std::fflush(stderr);
 				return false;
 			}
 
@@ -7376,14 +9020,20 @@ public:
                {
                   if (mothershipUnixSocketPathHasLiveListener(mothershipUnixSocketPath))
                   {
-                     basics_log("armMothershipUnixListener live listener already owns path=%s; deferring election\n",
-                        mothershipUnixSocketPath.c_str());
-                     ::close(mothershipUnixSocket.fd);
-                     mothershipUnixSocket.fd = -1;
-                     return false;
+							if (replaceLiveListener == false)
+							{
+								basics_log("armMothershipUnixListener live listener already owns path=%s; deferring election\n",
+									mothershipUnixSocketPath.c_str());
+								::close(mothershipUnixSocket.fd);
+								mothershipUnixSocket.fd = -1;
+								return false;
+							}
+
+							basics_log("armMothershipUnixListener replacing live listener path=%s\n",
+								mothershipUnixSocketPath.c_str());
                   }
 
-                  unlink(mothershipUnixSocketPath.c_str());
+                  unlinkMothershipUnixSocketPath("arm-mothership-unix-listener-rebind", false);
                   if (attempt == bindRetryLimit)
                   {
                      basics_log("armMothershipUnixListener bind busy after retries path=%s; deferring election\n",
@@ -7406,19 +9056,30 @@ public:
                return false;
             }
 
-            if (listenerBound == false)
-            {
-               return false;
-            }
+	            if (listenerBound == false)
+	            {
+	               return false;
+	            }
 
-            if (::listen(mothershipUnixSocket.fd, SOMAXCONN) != 0)
-            {
-               basics_log("armMothershipUnixListener listen failed path=%s errno=%d(%s)\n",
-                  mothershipUnixSocketPath.c_str(),
-                  errno,
-                  strerror(errno));
-               ::close(mothershipUnixSocket.fd);
-               mothershipUnixSocket.fd = -1;
+					if (recordMothershipUnixSocketPathOwnership() == false)
+					{
+						basics_log("armMothershipUnixListener ownership record failed path=%s\n",
+							mothershipUnixSocketPath.c_str());
+						::unlink(mothershipUnixSocketPath.c_str());
+						::close(mothershipUnixSocket.fd);
+						mothershipUnixSocket.fd = -1;
+						return false;
+					}
+
+	            if (::listen(mothershipUnixSocket.fd, SOMAXCONN) != 0)
+	            {
+	               basics_log("armMothershipUnixListener listen failed path=%s errno=%d(%s)\n",
+	                  mothershipUnixSocketPath.c_str(),
+	                  errno,
+	                  strerror(errno));
+						clearMothershipUnixSocketPathOwnership();
+	               ::close(mothershipUnixSocket.fd);
+	               mothershipUnixSocket.fd = -1;
                return false;
             }
 
@@ -7442,11 +9103,45 @@ public:
 				std::fflush(stderr);
 			}
 
-			return true;
-		}
+				return true;
+			}
 
-			bool armMothershipListener(void)
+			void unlinkMothershipUnixSocketPath(const char *reason, bool requireLocalOwnership = true)
 			{
+				if (mothershipUnixSocketPath.size() == 0)
+				{
+					return;
+				}
+
+					bool locallyOwned = mothershipUnixSocketPathOwnedByLocalListener();
+					if (requireLocalOwnership && locallyOwned == false)
+					{
+						basics_log("mothership unix socket path unlink skipped reason=%s path=%s ownership=not-local\n",
+							reason ? reason : "unspecified",
+						mothershipUnixSocketPath.c_str());
+					return;
+				}
+
+				int rc = ::unlink(mothershipUnixSocketPath.c_str());
+					if (rc == 0 || errno == ENOENT)
+					{
+						clearMothershipUnixSocketPathOwnership();
+						basics_log("mothership unix socket path unlinked reason=%s path=%s\n",
+							reason ? reason : "unspecified",
+						mothershipUnixSocketPath.c_str());
+				}
+				else
+				{
+					basics_log("mothership unix socket path unlink failed reason=%s path=%s errno=%d(%s)\n",
+						reason ? reason : "unspecified",
+						mothershipUnixSocketPath.c_str(),
+						errno,
+						strerror(errno));
+				}
+			}
+
+				bool armMothershipListener(void)
+				{
 				// Recreate a clean listener socket for bootstrap and master transitions.
 				mothershipAcceptArmed = false;
 				mothershipSocket.recreateSocket();
@@ -7561,10 +9256,7 @@ public:
 				mothershipUnixAcceptArmed = false;
 
 	      teardownCloudflareTunnel();
-			if (mothershipUnixSocketPath.size() > 0)
-			{
-				unlink(mothershipUnixSocketPath.c_str());
-			}
+				unlinkMothershipUnixSocketPath("forfeit-master");
 
 	      // Relinquishing master also relinquishes any active mothership control stream.
          if (activeMotherships.empty() == false)
@@ -7586,30 +9278,35 @@ public:
 	      {
 	         if (mothershipSocket.fslot >= 0 && Ring::socketIsClosing(&mothershipSocket) == false)
 	         {
-	            Ring::queueClose(&mothershipSocket);
+	            RingDispatcher::eraseMultiplexee(&mothershipSocket);
+	            abandonSocketGeneration(&mothershipSocket);
 	         }
 	      }
 	      else if (mothershipSocket.fd >= 0 && Ring::socketIsClosing(&mothershipSocket) == false)
 	      {
-	         Ring::queueClose(&mothershipSocket);
+	         RingDispatcher::eraseMultiplexee(&mothershipSocket);
+	         abandonSocketGeneration(&mothershipSocket);
 	      }
 
 			if (mothershipUnixSocket.isFixedFile)
 			{
 				if (mothershipUnixSocket.fslot >= 0 && Ring::socketIsClosing(&mothershipUnixSocket) == false)
 				{
-					Ring::queueClose(&mothershipUnixSocket);
+					RingDispatcher::eraseMultiplexee(&mothershipUnixSocket);
+					abandonSocketGeneration(&mothershipUnixSocket);
 				}
 			}
 			else if (mothershipUnixSocket.fd >= 0 && Ring::socketIsClosing(&mothershipUnixSocket) == false)
 			{
-				Ring::queueClose(&mothershipUnixSocket);
+				RingDispatcher::eraseMultiplexee(&mothershipUnixSocket);
+				abandonSocketGeneration(&mothershipUnixSocket);
 			}
 	      // Only the active master may hold neuron control sockets.
 	      for (NeuronView *nv : neurons)
 	      {
-				disarmNeuronControlReconnect(nv);
-				nv->connected = false;
+					cancelNeuronControlHandshakeWatchdog(nv, "forfeit-master");
+					disarmNeuronControlReconnect(nv);
+					nv->connected = false;
 	         if (nv->isFixedFile)
 	         {
 	            if (nv->fslot >= 0 && Ring::socketIsClosing(nv) == false)
@@ -7622,24 +9319,30 @@ public:
 	            Ring::queueClose(nv);
 	         }
 	      }
+
+	      for (BrainView *bv : brains)
+	      {
+	         bv->forceConnectorOwnershipUntilMasterAck = false;
+	      }
 	   }
 
-		void selfElectAsMaster(const char *reason = "unspecified")
+		bool selfElectAsMaster(const char *reason = "unspecified", bool replaceLiveMothershipListener = false)
 		{
 			basics_log("selfElectAsMaster begin weAreMaster=%d reason=%s\n", int(weAreMaster), reason);
 			if (weAreMaster)
 			{
-				co_return;
+				return true;
 			}
 
 			// Promotion must flip master ownership before listener arm so any immediate
 			// close CQE races on mothership control-listener re-arm through closeHandler.
 			weAreMaster = true;
+			cancelAllBrainLivenessWaiters("self-elect");
 
-			if (armMothershipUnixListener() == false)
+			if (armMothershipUnixListener(replaceLiveMothershipListener) == false)
 			{
 				weAreMaster = false;
-				co_return;
+				return false;
 			}
 
 			(void)armMothershipListener();
@@ -7652,22 +9355,36 @@ public:
             refreshAllDeploymentWormholeQuicCidState(false);
 				basics_log("selfElectAsMaster complete\n");
 
-		// During handover/updateProdigy a connector-owned peer link may already be
-		// in failed state. Re-arm outbound connectors immediately on promotion so
-		// peer-mesh quorum can recover inside the post-handover window.
+		// During handover/updateProdigy or bootstrap, followers may not yet have
+		// acknowledged the new master identity. Keep any live peer stream intact long
+		// enough to push the new registration across it. Only force an outbound
+		// reconnect when there is no usable peer stream to carry that registration.
 		for (BrainView *bv : brains)
 		{
-			if (bv == nullptr || bv->weConnectToIt == false)
+			if (bv == nullptr || bv->quarantined)
 			{
 				continue;
 			}
 
-			if (peerSocketActive(bv))
+			bool peerAcknowledgedMaster = (
+				peerHasFreshExistingMasterClaim(bv)
+				&& bv->existingMasterUUID == selfBrainUUID());
+			if (peerAcknowledgedMaster == false)
 			{
+				if (peerSocketActive(bv))
+				{
+					bv->sendRegistration(boottimens, version, getExistingMasterUUID());
+					continue;
+				}
+
+				armOutboundPeerReconnect(bv, true);
 				continue;
 			}
 
-			armOutboundPeerReconnect(bv);
+			if (bv->weConnectToIt && peerSocketActive(bv) == false)
+			{
+				armOutboundPeerReconnect(bv);
+			}
 		}
 
 		// Broadcast our selected-master identity immediately so peers converge on this master.
@@ -7774,6 +9491,8 @@ public:
 			{
 			ApplicationDeployment *deployment = new ApplicationDeployment(); // as neurons register and upload their state, these deployments will be populated
 			deployment->plan = plan;
+         deployment->restorePersistedStatefulWorkerTopologyUpgradeOperation();
+         deployment->restorePersistedDeferredStatefulScaleIntent();
 
 			deployments.insert_or_assign(plan.config.deploymentID(), deployment);
 
@@ -7790,22 +9509,30 @@ public:
 				}
 			}
 			else
-			{
-				deploymentsByApp.insert_or_assign(plan.config.applicationID, deployment);
+				{
+					deploymentsByApp.insert_or_assign(plan.config.applicationID, deployment);
+				}
+	         applyPendingReplicatedContainerRuntimeStates(plan.config.deploymentID());
 			}
-		}
 
-			// Deployment recovery still waits for healthy machine state transitions, but
+				// Deployment recovery still waits for healthy machine state transitions, but
 			// interrupted addMachines journaling can resume immediately on promotion.
 			deploymentPlans.clear();
          resumePendingAddMachinesOperations();
+         if (ignited)
+         {
+            refreshMachineFragmentAssignmentsIfPossible();
+         }
          String managedSchemaReconcileFailure = {};
          if (reconcileManagedMachineSchemasOnSelfElection(&managedSchemaReconcileFailure) == false)
-         {
-            basics_log("selfElectAsMaster managed machine schema reconcile failed reason=%s\n",
-               managedSchemaReconcileFailure.c_str());
-         }
-		}
+	         {
+	            basics_log("selfElectAsMaster managed machine schema reconcile failed reason=%s\n",
+	               managedSchemaReconcileFailure.c_str());
+	         }
+	         recoverDeploymentsAfterNeuronState();
+
+			return true;
+			}
 
 		void electBrainToMaster(BrainView *brain)
 		{
@@ -7820,10 +9547,11 @@ public:
 			}
 			else
 			{
-				// Peer-master convergence must hard-stop any stale local ownership too.
-				// Followers never hold commander or neuron control sockets.
-				queueCloseIfActive(&mothershipSocket);
-				queueCloseIfActive(&mothershipUnixSocket);
+					// Peer-master convergence must hard-stop any stale local ownership too.
+					// Followers never hold commander or neuron control sockets.
+					unlinkMothershipUnixSocketPath("elect-peer-master");
+					queueCloseIfActive(&mothershipSocket);
+					queueCloseIfActive(&mothershipUnixSocket);
             if (activeMotherships.empty() == false)
             {
                Vector<Mothership *> activeStreams = {};
@@ -7855,7 +9583,9 @@ public:
 			masterUUIDText.snprintf<"{itoa}"_ctv>(brain->uuid);
 			basics_log("electBrainToMaster uuid=%s\n", masterUUIDText.c_str());
 
+			refreshMasterAuthorityRuntimeStateFromLiveFields();
          persistLocalRuntimeState();
+			refreshMasterPeerLivenessWaiter(brain, "elect-master");
 		}
 
 	void deriveMasterBrain(bool allowExistingMasterClaims = true)
@@ -7901,7 +9631,7 @@ public:
 						if (preferSelfByAddressOrder)
 						{
 							basics_log("deriveMasterBrain elect-self reason=active-peer-address-order\n");
-							selfElectAsMaster("deriveMasterBrain:active-peer-address-order");
+							selfElectAsMaster("deriveMasterBrain:active-peer-address-order", true);
 						}
 						else
 						{
@@ -7970,7 +9700,7 @@ public:
 							if (preferSelfByAddressOrder)
 							{
 								basics_log("deriveMasterBrain elect-self reason=active-peer-address-order\n");
-								selfElectAsMaster("deriveMasterBrain:active-peer-address-order");
+								selfElectAsMaster("deriveMasterBrain:active-peer-address-order", allowExistingMasterClaims == false);
 							}
 							else
 							{
@@ -8050,6 +9780,7 @@ public:
 				// always have 1 other brain alive, making 2 alive brains, to even be in this message handler)
 			}
 		}
+
 	}
 
 	virtual void checkMetroReachabilityForMasterFailover(bool& connectedMajority, bool& reachableSwitchMajority)
@@ -8432,6 +10163,10 @@ public:
 			(machine ? machine->cloudID.c_str() : ""),
 			(unsigned long long)(machine ? machine->containersByDeploymentID.size() : 0u));
 
+		cancelMachineSoftWatchdog(machine);
+		cancelMachineHardRebootWatchdog(machine);
+		cancelOSUpdateCommandWatchdog(machine);
+
 		evacuateFailedMachineContainers(machine);
 
 		// if we need another machine, the deployments will request it
@@ -8450,9 +10185,10 @@ public:
 		machines.erase(machine);
 		machinesByUUID.erase(machine->uuid);
 	      neurons.erase(&machine->neuron);
+	      cancelNeuronReconnectWaiter(&machine->neuron, "decommission-machine");
 
-		for (MachineSSH *ssh : sshs)
-		{
+			for (MachineSSH *ssh : sshs)
+			{
 			if (ssh && ssh->machine == machine)
 			{
 				ssh->machine = nullptr;
@@ -8623,23 +10359,458 @@ public:
 		}
 	}
 
-   // Called opportunistically after container lifecycle events (destroy/failed)
-   // to check whether the machine is now empty. If we were draining for an OS
-   // update, this is where we actually trigger the OS update (neuron reboot).
-   // NOTE: The drain scheduler's in-flight counters should be decremented when
-   // the machine returns healthy after the reboot. See onDrainCompleteForOSUpdate.
-   void isMachineDrained(Machine *machine)
-	{
-		if (machine->containersByDeploymentID.size() == 0)
+	      uint32_t normalizedMaxOSDrains(void) const
+	      {
+	         return brainConfig.maxOSDrains > 0 ? brainConfig.maxOSDrains : 1;
+	      }
+
+	      uint32_t normalizedMachineUpdateCadenceMins(void) const
+	      {
+	         return brainConfig.machineUpdateCadenceMins > 0 ? brainConfig.machineUpdateCadenceMins : 15;
+	      }
+
+	      int64_t normalizedMachineUpdateCadenceMs(void) const
+	      {
+	         const char *devMode = std::getenv("PRODIGY_DEV_MODE");
+	         const char *devCadenceMs = std::getenv("PRODIGY_DEV_OS_UPDATE_CADENCE_MS");
+	         if (devMode != nullptr
+	            && devMode[0] != '\0'
+	            && devMode[0] != '0'
+	            && devCadenceMs != nullptr
+	            && devCadenceMs[0] != '\0')
+	         {
+	            errno = 0;
+	            char *end = nullptr;
+	            unsigned long long value = std::strtoull(devCadenceMs, &end, 10);
+	            if (errno == 0 && end != devCadenceMs && *end == '\0' && value > 0 && value <= uint64_t(INT64_MAX))
+	            {
+	               return int64_t(value);
+	            }
+	         }
+
+	         return int64_t(normalizedMachineUpdateCadenceMins()) * 60 * 1000;
+	      }
+
+	      int64_t normalizedOSUpdateCommandRebootDeadlineMs(void) const
+	      {
+	         const char *devMode = std::getenv("PRODIGY_DEV_MODE");
+	         const char *devDeadlineMs = std::getenv("PRODIGY_DEV_OS_UPDATE_COMMAND_REBOOT_DEADLINE_MS");
+	         if (devMode != nullptr
+	            && devMode[0] != '\0'
+	            && devMode[0] != '0'
+	            && devDeadlineMs != nullptr
+	            && devDeadlineMs[0] != '\0')
+	         {
+	            errno = 0;
+	            char *end = nullptr;
+	            unsigned long long value = std::strtoull(devDeadlineMs, &end, 10);
+	            if (errno == 0 && end != devDeadlineMs && *end == '\0' && value > 0 && value <= uint64_t(INT64_MAX))
+	            {
+	               return int64_t(value);
+	            }
+	         }
+
+	         return prodigyBrainOSUpdateCommandRebootDeadlineMs;
+	      }
+
+	      bool machineIsVMForMaintenance(const Machine *machine) const
+	      {
+	         if (machine == nullptr)
+	         {
+	            return false;
+	         }
+
+	         auto configIt = brainConfig.configBySlug.find(machine->slug);
+	         if (configIt != brainConfig.configBySlug.end())
+	         {
+	            return configIt->second.kind == MachineConfig::MachineKind::vm;
+	         }
+
+	         return machine->cloudID.size() > 0 || machine->currentImageURI.size() > 0;
+	      }
+
+	      const OperatingSystemUpdatePolicy *osUpdatePolicyForMachine(const Machine *machine) const
+	      {
+	         if (machine == nullptr || machine->osID.size() == 0)
+	         {
+	            return nullptr;
+	         }
+
+	         for (const OperatingSystemUpdatePolicy& policy : brainConfig.osUpdatePolicies)
+	         {
+	            if (policy.osID.size() > 0
+	               && policy.targetVersionID.size() > 0
+	               && policy.command.size() > 0
+	               && machine->osID.equals(policy.osID))
+	            {
+	               return &policy;
+	            }
+	         }
+
+	         return nullptr;
+	      }
+
+	      OperatingSystemUpdatePolicy *mutableOSUpdatePolicyForMachine(const Machine *machine)
+	      {
+	         if (machine == nullptr || machine->osID.size() == 0)
+	         {
+	            return nullptr;
+	         }
+
+	         for (OperatingSystemUpdatePolicy& policy : brainConfig.osUpdatePolicies)
+	         {
+	            if (policy.osID.size() > 0
+	               && policy.targetVersionID.size() > 0
+	               && policy.command.size() > 0
+	               && machine->osID.equals(policy.osID))
+	            {
+	               return &policy;
+	            }
+	         }
+
+	         return nullptr;
+	      }
+
+	      bool machineEligibleForOSUpdate(Machine *machine) const
+	      {
+	         const OperatingSystemUpdatePolicy *policy = osUpdatePolicyForMachine(machine);
+	         if (machine == nullptr
+	            || policy == nullptr
+	            || machine->uuid == 0
+	            || machine->state != MachineState::healthy
+	            || machine->osVersionID.size() == 0
+	            || machine->osVersionID.equals(policy->targetVersionID)
+	            || neuronControlStreamActive(machine) == false)
+	         {
+	            return false;
+	         }
+
+	         if (machineIsVMForMaintenance(machine) && policy->includeVMs == false)
+	         {
+	            return false;
+	         }
+
+	         return true;
+	      }
+
+	      bool osUpdatePolicyCoverageComplete(void) const
+	      {
+	         if (brainConfig.osUpdatesEnabled == false || brainConfig.osUpdatePolicies.empty())
+	         {
+	            return false;
+	         }
+
+	         for (Machine *machine : machines)
+	         {
+	            if (machine == nullptr)
+	            {
+	               continue;
+	            }
+
+	            if (machine->uuid == 0 || machine->osID.size() == 0 || osUpdatePolicyForMachine(machine) == nullptr)
+	            {
+	               return false;
+	            }
+	         }
+
+	         return true;
+	      }
+
+	      bool hasPendingVMReimage(void) const
+	      {
+	         if (masterAuthorityRuntimeState.pendingAddMachinesOperations.empty() == false)
+	         {
+	            return true;
+	         }
+
+	         ClusterTopology topology = {};
+	         if (loadAuthoritativeClusterTopology(topology) == false)
+	         {
+	            return false;
+	         }
+
+	         for (const ClusterMachine& machine : topology.machines)
+	         {
+	            if (machine.source != ClusterMachineSource::created
+	               || machine.backing != ClusterMachineBacking::cloud
+	               || machine.kind != MachineConfig::MachineKind::vm
+	               || machine.cloud.schema.size() == 0)
+	            {
+	               continue;
+	            }
+
+	            const ProdigyManagedMachineSchema *managedSchema =
+	               prodigyFindManagedMachineSchema(masterAuthorityRuntimeState.machineSchemas, machine.cloud.schema);
+	            if (managedSchema == nullptr
+	               || managedSchema->kind != MachineConfig::MachineKind::vm
+	               || managedSchema->vmImageURI.size() == 0)
+	            {
+	               continue;
+	            }
+
+	            if (machine.vmImageURI.equals(managedSchema->vmImageURI) == false)
+	            {
+	               return true;
+	            }
+	         }
+
+	         return false;
+	      }
+
+	      uint32_t countActiveOSDrains(void) const
+	      {
+	         uint32_t count = 0;
+	         for (Machine *machine : machines)
+	         {
+	            if (machine == nullptr)
+	            {
+	               continue;
+	            }
+
+	            if (machine->state == MachineState::updatingOS
+	               || (machine->state == MachineState::hardRebooting
+	                  && machine->osUpdateCommandIssued
+	                  && osUpdatePolicyForMachine(machine) != nullptr))
+	            {
+	               count += 1;
+	            }
+	         }
+
+	         return count;
+	      }
+
+	      void refreshOperatingSystemUpdateQueue(void)
+	      {
+	         operatingSystemUpdateOrder.clear();
+	         for (Machine *machine : machines)
+	         {
+	            if (machineEligibleForOSUpdate(machine))
+	            {
+	               operatingSystemUpdateOrder.push_back(machine);
+	            }
+	         }
+
+	         std::sort(operatingSystemUpdateOrder.begin(), operatingSystemUpdateOrder.end(), [] (const Machine *lhs, const Machine *rhs) -> bool {
+	            if (lhs->isThisMachine != rhs->isThisMachine)
+	            {
+	               return rhs->isThisMachine;
+	            }
+
+	            if (lhs->lastUpdatedOSMs != rhs->lastUpdatedOSMs)
+	            {
+	               return lhs->lastUpdatedOSMs < rhs->lastUpdatedOSMs;
+	            }
+
+	            return lhs->uuid < rhs->uuid;
+	         });
+	      }
+
+	      Machine *nextOperatingSystemUpdateCandidate(void)
+	      {
+	         while (operatingSystemUpdateOrder.empty() == false)
+	         {
+	            Machine *machine = operatingSystemUpdateOrder.front();
+	            operatingSystemUpdateOrder.erase(operatingSystemUpdateOrder.begin());
+	            if (machineEligibleForOSUpdate(machine))
+	            {
+	               return machine;
+	            }
+	         }
+
+	         return nullptr;
+	      }
+
+	      bool machineAtOSUpdateTargetVersion(Machine *machine) const
+	      {
+	         const OperatingSystemUpdatePolicy *policy = osUpdatePolicyForMachine(machine);
+	         return (
+	            machine != nullptr
+	            && policy != nullptr
+	            && machine->osVersionID.size() > 0
+	            && machine->osVersionID.equals(policy->targetVersionID));
+	      }
+
+	      BrainView *selectOSUpdateMasterHandoffPeer(Machine *machine)
+	      {
+	         if (machine == nullptr || machine->isThisMachine == false || weAreMaster == false || nBrains <= 1)
+	         {
+	            return nullptr;
+	         }
+
+	         BrainView *selected = nullptr;
+	         uint128_t selectedPeerKey = 0;
+	         for (BrainView *peer : brains)
+	         {
+	            if (peer == nullptr
+	               || peer->quarantined
+	               || peer->registrationFresh == false
+	               || peer->uuid == 0
+	               || peer->boottimens == 0
+	               || peerSocketActive(peer) == false
+	               || peer->machine == nullptr
+	               || peer->machine == machine
+	               || peer->machine->state != MachineState::healthy
+	               || peer->machine->runtimeReady == false
+	               || machineAtOSUpdateTargetVersion(peer->machine) == false)
+	            {
+	               continue;
+	            }
+
+	            uint128_t peerKey = updateSelfPeerTrackingKey(peer);
+	            if (peerKey == 0)
+	            {
+	               continue;
+	            }
+
+	            if (selected == nullptr || peerKey < selectedPeerKey)
+	            {
+	               selected = peer;
+	               selectedPeerKey = peerKey;
+	            }
+	         }
+
+	         return selected;
+	      }
+
+	      bool handoffMasterBeforeLocalOSUpdate(Machine *machine)
+	      {
+	         BrainView *target = selectOSUpdateMasterHandoffPeer(machine);
+	         if (target == nullptr)
+	         {
+	            basics_log("os update local master defer uuid=%llu private4=%u reason=no-updated-brain-handoff-target\n",
+	               (unsigned long long)(machine ? machine->uuid : 0),
+	               unsigned(machine ? machine->private4 : 0));
+	            return false;
+	         }
+
+	         uint128_t targetPeerKey = updateSelfPeerTrackingKey(target);
+	         uint32_t relayedPeers = 0;
+	         for (BrainView *peer : brains)
+	         {
+	            if (peer == nullptr || peer->quarantined || peerSocketActive(peer) == false)
+	            {
+	               continue;
+	            }
+
+	            Message::construct(peer->wBuffer, BrainTopic::relinquishMasterStatus, uint8_t(1), targetPeerKey);
+	            Ring::queueSend(peer);
+	            relayedPeers += 1;
+	         }
+
+	         if (relayedPeers == 0)
+	         {
+	            return false;
+	         }
+
+	         basics_log("os update local master handoff uuid=%llu private4=%u targetUUID=%llu targetPrivate4=%u relayedPeers=%u\n",
+	            (unsigned long long)(machine ? machine->uuid : 0),
+	            unsigned(machine ? machine->private4 : 0),
+	            (unsigned long long)target->uuid,
+	            unsigned(target->private4),
+	            relayedPeers);
+	         electBrainToMaster(target);
+	         noteMasterAuthorityRuntimeStateChanged(false, true);
+	         return true;
+	      }
+
+	      void queueMachineOSUpdate(Machine *machine)
+	      {
+	         OperatingSystemUpdatePolicy *policy = mutableOSUpdatePolicyForMachine(machine);
+	         if (machine == nullptr
+	            || policy == nullptr
+	            || machine->osUpdateCommandIssued
+	            || neuronControlStreamActive(machine) == false)
+	         {
+	            return;
+	         }
+
+	         Message::construct(
+	            machine->neuron.wBuffer,
+	            NeuronTopic::updateOS,
+	            policy->osID,
+	            policy->targetVersionID,
+	            policy->command);
+	         machine->state = MachineState::updatingOS;
+	         machine->osUpdateCommandIssued = true;
+	         persistLocalRuntimeState();
+	         armOSUpdateCommandWatchdog(machine);
+	         std::fprintf(stderr,
+	            "os update command queued uuid=%llu private4=%u osID=%s targetVersionID=%s\n",
+	            (unsigned long long)machine->uuid,
+	            unsigned(machine->private4),
+	            policy->osID.c_str(),
+	            policy->targetVersionID.c_str());
+	         std::fflush(stderr);
+	         basics_log("os update command queued uuid=%llu private4=%u osID=%s targetVersionID=%s\n",
+	            (unsigned long long)machine->uuid,
+	            unsigned(machine->private4),
+	            policy->osID.c_str(),
+	            policy->targetVersionID.c_str());
+	         Ring::queueSend(&machine->neuron);
+	      }
+
+	      bool beginMachineOSUpdate(Machine *machine)
+	      {
+	         if (machineEligibleForOSUpdate(machine) == false)
+	         {
+	            return false;
+	         }
+
+	         if (machine->isThisMachine && weAreMaster && nBrains > 1)
+	         {
+	            return handoffMasterBeforeLocalOSUpdate(machine);
+	         }
+
+	         machine->state = MachineState::updatingOS;
+	         machine->osUpdateCommandIssued = false;
+	         lastOperatingSystemUpdateStartMs = Time::now<TimeResolution::ms>();
+	         drainMachine(machine);
+	         isMachineDrained(machine);
+	         return true;
+		      }
+
+	      bool runMachineUpdateCadenceTick(void)
+	      {
+		         if (weAreMaster == false
+		            || ignited == false
+		            || osUpdatePolicyCoverageComplete() == false
+		            || hasPendingVMReimage()
+	            || countActiveOSDrains() >= normalizedMaxOSDrains())
+	         {
+	            return false;
+	         }
+
+	         refreshOperatingSystemUpdateQueue();
+	         for (;;)
+	         {
+	            Machine *machine = nextOperatingSystemUpdateCandidate();
+	            if (machine == nullptr)
+	            {
+	               return false;
+	            }
+
+	            if (beginMachineOSUpdate(machine))
+	            {
+	               return true;
+	            }
+	         }
+		      }
+
+	      // Called opportunistically after container lifecycle events (destroy/failed)
+	      // to check whether the machine is now empty. If we were draining for an OS
+	      // update, this queues the explicit Neuron update command.
+	   void isMachineDrained(Machine *machine)
 		{
+			if (machine->containersByDeploymentID.size() == 0)
+			{
 			switch (machine->state)
 			{
-				case MachineState::updatingOS:
-				{
-					machine->triggerOSUpdate();
+					case MachineState::updatingOS:
+					{
+						queueMachineOSUpdate(machine);
 
-					break;
-				}
+						break;
+					}
 				case MachineState::decommissioning:
 				{
 					iaas->destroyMachine(machine);
@@ -8647,24 +10818,13 @@ public:
 				}
 				default: break;
 			}
+			}
 		}
-	}
 
-	void scheduleNextOperatingSystemUpdate(void)
-	{
-		// we need to schedule the first update...
-		Machine *machine = operatingSystemUpdateOrder.back();
-
-		// every 30 days
-		int64_t untilUpdateMs = machine->lastUpdatedOSMs + thirtyDaysInMilliseconds - Time::now<TimeResolution::ms>();
-
-		// is this at least.. some minimum number of seconds in the future?
-		// untilUpdateMs could also be in the past
-		if (untilUpdateMs < thirtySecondsInMilliseconds) untilUpdateMs = thirtySecondsInMilliseconds;
-
-		osUpdateTimer.setTimeoutMs(untilUpdateMs);
-		Ring::queueTimeout(&osUpdateTimer);
-	}
+			void scheduleNextOperatingSystemUpdate(void)
+			{
+		         armMachineUpdateTimerIfNeeded();
+			}
 
 	bool isActiveMaster(void) const
 	{
@@ -8780,15 +10940,104 @@ public:
 
 	public:
 
-	void onDrainCompleteForOSUpdate(Machine *machine)
-	{
-		(void)machine;
-	}
+		void onDrainCompleteForOSUpdate(Machine *machine)
+		{
+	         if (machine != nullptr)
+	         {
+	            machine->osUpdateCommandIssued = false;
+	            cancelOSUpdateCommandWatchdog(machine);
+	         }
+		}
 
-	void armMachineUpdateTimerIfNeeded(void)
-	{
-		// Compatibility no-op for partially merged OS-drain scheduler.
-	}
+				void armMachineUpdateTimerIfNeeded(void)
+		      {
+		         if (brainConfig.osUpdatesEnabled || brainConfig.osUpdatePolicies.empty() == false)
+		         {
+		            std::fprintf(stderr,
+		               "os update scheduler arm-enter master=%d ignited=%d enabled=%d policies=%u coverage=%d activeDrains=%u armed=%d pendingVMReimage=%d\n",
+		               int(weAreMaster),
+		               int(ignited),
+		               int(brainConfig.osUpdatesEnabled),
+		               unsigned(brainConfig.osUpdatePolicies.size()),
+		               int(osUpdatePolicyCoverageComplete()),
+		               unsigned(countActiveOSDrains()),
+		               int(osUpdateTimerArmed),
+		               int(hasPendingVMReimage()));
+		            std::fflush(stderr);
+		            basics_log("os update scheduler arm-enter master=%d ignited=%d enabled=%d policies=%u coverage=%d activeDrains=%u armed=%d pendingVMReimage=%d\n",
+		               int(weAreMaster),
+		               int(ignited),
+		               int(brainConfig.osUpdatesEnabled),
+		               unsigned(brainConfig.osUpdatePolicies.size()),
+		               int(osUpdatePolicyCoverageComplete()),
+		               unsigned(countActiveOSDrains()),
+		               int(osUpdateTimerArmed),
+		               int(hasPendingVMReimage()));
+		         }
+
+				         if (weAreMaster == false
+				            || ignited == false
+				            || osUpdatePolicyCoverageComplete() == false
+		            || hasPendingVMReimage()
+		            || countActiveOSDrains() >= normalizedMaxOSDrains())
+		         {
+		            return;
+		         }
+
+	         refreshOperatingSystemUpdateQueue();
+	         basics_log("os update scheduler arm-check enabled=%d policies=%u activeDrains=%u candidates=%u armed=%d lastStartMs=%lld cadenceMs=%lld\n",
+	            int(brainConfig.osUpdatesEnabled),
+	            unsigned(brainConfig.osUpdatePolicies.size()),
+	            unsigned(countActiveOSDrains()),
+	            unsigned(operatingSystemUpdateOrder.size()),
+	            int(osUpdateTimerArmed),
+	            (long long)lastOperatingSystemUpdateStartMs,
+	            (long long)normalizedMachineUpdateCadenceMs());
+	         if (operatingSystemUpdateOrder.empty())
+	         {
+		            return;
+		         }
+
+			         int64_t nowMs = Time::now<TimeResolution::ms>();
+			         int64_t cadenceMs = normalizedMachineUpdateCadenceMs();
+			         int64_t elapsedMs = lastOperatingSystemUpdateStartMs > 0 ? nowMs - lastOperatingSystemUpdateStartMs : cadenceMs;
+			         if (lastOperatingSystemUpdateStartMs == 0 || elapsedMs >= cadenceMs)
+			         {
+			            bool started = runMachineUpdateCadenceTick();
+			            if (started)
+			            {
+			               basics_log("os update scheduler started candidate immediately cadenceMs=%lld\n", (long long)cadenceMs);
+			               return;
+		            }
+		         }
+
+		         if (osUpdateTimerArmed)
+		         {
+		            return;
+		         }
+
+		         osUpdateTimer.flags = uint64_t(BrainTimeoutFlags::updateOSWakeup);
+		         osUpdateTimer.dispatcher = this;
+	         if (osUpdateTimerInstalled == false)
+	         {
+	            RingDispatcher::installMultiplexee(&osUpdateTimer, this);
+	            osUpdateTimerInstalled = true;
+	         }
+
+		         int64_t delayMs = cadenceMs;
+		         if (lastOperatingSystemUpdateStartMs > 0)
+		         {
+		            delayMs = cadenceMs - elapsedMs;
+		            if (delayMs < 1)
+		            {
+		               delayMs = 1;
+		            }
+		         }
+
+		         osUpdateTimer.setTimeoutMs(delayMs);
+		         Ring::queueTimeout(&osUpdateTimer);
+		         osUpdateTimerArmed = true;
+			}
 
 	void cancelMachineSoftWatchdog(Machine *machine)
 	{
@@ -8836,6 +11085,79 @@ public:
 		}
 	}
 
+	void cancelOSUpdateCommandWatchdog(Machine *machine)
+	{
+		if (machine == nullptr)
+		{
+			return;
+		}
+
+		if (machines.contains(machine) == false)
+		{
+			return;
+		}
+
+		if (machine->osUpdateCommandWatchdog)
+		{
+			TimeoutPacket *watchdog = machine->osUpdateCommandWatchdog;
+			machine->osUpdateCommandWatchdog = nullptr;
+
+			RingDispatcher::eraseMultiplexee(watchdog);
+			watchdog->flags = uint64_t(BrainTimeoutFlags::canceled);
+			Ring::queueCancelTimeout(watchdog);
+		}
+	}
+
+	void armOSUpdateCommandWatchdog(Machine *machine)
+	{
+		if (machine == nullptr || machines.contains(machine) == false)
+		{
+			return;
+		}
+
+		cancelOSUpdateCommandWatchdog(machine);
+
+		TimeoutPacket *timeout = new TimeoutPacket();
+		timeout->flags = uint64_t(BrainTimeoutFlags::osUpdateCommandDeadline);
+		timeout->identifier = machine->uuid;
+		timeout->originator = machine;
+		timeout->dispatcher = this;
+		timeout->setTimeoutMs(normalizedOSUpdateCommandRebootDeadlineMs());
+		RingDispatcher::installMultiplexee(timeout, this);
+		Ring::queueTimeout(timeout);
+		machine->osUpdateCommandWatchdog = timeout;
+	}
+
+	void failOSUpdateCommandDeadline(Machine *machine)
+	{
+		if (machine == nullptr || machines.contains(machine) == false)
+		{
+			return;
+		}
+
+		std::fprintf(stderr,
+			"os update command deadline uuid=%llu private4=%u state=%u targetKnown=%d\n",
+			(unsigned long long)machine->uuid,
+			unsigned(machine->private4),
+			unsigned(machine->state),
+			int(osUpdatePolicyForMachine(machine) != nullptr));
+		std::fflush(stderr);
+		basics_log("os update command deadline uuid=%llu private4=%u state=%u targetKnown=%d\n",
+			(unsigned long long)machine->uuid,
+			unsigned(machine->private4),
+			unsigned(machine->state),
+			int(osUpdatePolicyForMachine(machine) != nullptr));
+
+		machine->osUpdateCommandIssued = false;
+		iaas->reportHardwareFailure(machine->uuid, "OS update command did not reboot before deadline"_ctv);
+		if (machine->state != MachineState::hardwareFailure && machine->state != MachineState::decommissioning)
+		{
+			handleMachineStateChange(machine, MachineState::hardwareFailure);
+			decommissionMachine(machine);
+		}
+		armMachineUpdateTimerIfNeeded();
+	}
+
 	void dispatchTimeout(TimeoutPacket *packet) override
 	{
 			switch (BrainTimeoutFlags(packet->flags))
@@ -8846,48 +11168,31 @@ public:
 				delete packet;
 				break;
 			}
-			case BrainTimeoutFlags::ignition:
-			{
+				case BrainTimeoutFlags::ignition:
+				{
 				ignited = true;
 
 				// at this point we've either connected to every neuron and gotten an upload of its state,
 				// or we can assume the neuron is missing... and appropriate action would already be in progress
 
-				Machine *thisMachine = nullptr;
-
-				for (Machine *machine : machines)
-				{
+					for (Machine *machine : machines)
+					{
 					// consider the machine registered if we've received neuron registration metadata
 					if ((machine->lastUpdatedOSMs > 0 || machine->kernel.size() > 0)
                   && prodigyMachineHardwareInventoryReady(machine->hardware))
 					{
-						if (machine->state != MachineState::healthy
-                     && machineReadyForHealthyState(machine))
+						if (machine->fragment == 0)
 						{
-							handleMachineStateChange(machine, MachineState::healthy);
+							assignMachineFragment(machine);
 						}
 
-						if (machine->state == MachineState::healthy)
-						{
-							// check if machine is unconfigured
-							if (machine->fragment == 0) // unlikely though
-							{
-								assignMachineFragment(machine);
-							}
+						promoteMachineToHealthyIfReady(machine);
 
-							if (machine->isThisMachine == false)
-							{
-								operatingSystemUpdateOrder.push_back(machine);
-							}
-							else
-							{
-								// we'll insert the master brain at the very end, when it updates it'll effectively transfer control to another brain
-								thisMachine = machine;
-							}
 						}
+						// else we'll be triaging it already
 					}
-					// else we'll be triaging it already
-				}
+
+				refreshMachineFragmentAssignmentsIfPossible();
 
 				// loop over each application and recover runtime from inventory, then reconcile
 				for (const auto& [applicationID, deployment] : deploymentsByApp)
@@ -8895,26 +11200,9 @@ public:
 					deployment->recoverAfterReboot();
 				}
 
-		// configure operating system updater
+					armMachineUpdateTimerIfNeeded();
 
-				// this should be descending order so we can feed from the tail
-				cppsort::verge_adapter<cppsort::ska_sorter> sorter;
-				sorter(operatingSystemUpdateOrder, [] (Machine *machine) -> int64_t { return -machine->lastUpdatedOSMs; });
-
-				if (thisMachine)
-				{
-					operatingSystemUpdateOrder.push_back(thisMachine); // insert self at tail so we consume it last
-				}
-
-					if (operatingSystemUpdateOrder.size() > 0)
-					{
-						osUpdateTimer.flags = uint64_t(BrainTimeoutFlags::updateOSWakeup);
-						osUpdateTimer.dispatcher = this;
-						RingDispatcher::installMultiplexee(&osUpdateTimer, this);
-						scheduleNextOperatingSystemUpdate();
-					}
-
-					if (weAreMaster)
+						if (weAreMaster)
 					{
 						TimeoutPacket *recovery = new TimeoutPacket();
 						recovery->flags = uint64_t(BrainTimeoutFlags::postIgnitionRecovery);
@@ -8924,10 +11212,252 @@ public:
 						Ring::queueTimeout(recovery);
 					}
 
+						break;
+					}
+				case BrainTimeoutFlags::brainPeerHeartbeat:
+				{
+					runBrainPeerHeartbeatTick();
+					brainPeerHeartbeatTicker.setTimeoutMs(brainPeerHeartbeatIntervalMs);
+					Ring::queueTimeout(&brainPeerHeartbeatTicker);
 					break;
 				}
-			case BrainTimeoutFlags::brainMissing:
-			{
+				case BrainTimeoutFlags::brainPeerReconnect:
+				{
+					BrainView *brain = (BrainView *)packet->originator;
+					bool persistentReconnect = (packet->identifier != 0);
+					if (auto it = brainReconnectWaiters.find(brain); it != brainReconnectWaiters.end())
+					{
+						if (it->second != packet)
+						{
+							basics_log("brain reconnect timeout ignored stale packet private4=%u active=%p stale=%p\n",
+								brain ? brain->private4 : 0u,
+								static_cast<void *>(it->second),
+								static_cast<void *>(packet));
+							delete packet;
+							break;
+						}
+
+						brainReconnectWaiters.erase(it);
+					}
+					else
+					{
+						basics_log("brain reconnect timeout ignored untracked packet private4=%u packet=%p\n",
+							brain ? brain->private4 : 0u,
+							static_cast<void *>(packet));
+						delete packet;
+						break;
+					}
+
+						delete packet;
+						attemptBrainPeerReconnectNow(brain, persistentReconnect, "reconnect-timeout");
+						break;
+					}
+						case BrainTimeoutFlags::brainPeerHandshake:
+						{
+							BrainView *brain = (BrainView *)packet->originator;
+							uint128_t transportEpoch = packet->identifier;
+							if (auto it = brainHandshakeWaiters.find(brain); it != brainHandshakeWaiters.end())
+							{
+								if (it->second != packet)
+								{
+									basics_log("brain peer handshake timeout ignored stale packet private4=%u active=%p stale=%p\n",
+										brain ? brain->private4 : 0u,
+										static_cast<void *>(it->second),
+										static_cast<void *>(packet));
+									delete packet;
+									break;
+								}
+
+								brainHandshakeWaiters.erase(it);
+							}
+							else
+							{
+								basics_log("brain peer handshake timeout ignored untracked packet private4=%u packet=%p\n",
+									brain ? brain->private4 : 0u,
+									static_cast<void *>(packet));
+								delete packet;
+								break;
+							}
+
+							delete packet;
+
+							if (brain == nullptr
+								|| brains.contains(brain) == false
+								|| brainPeerHandshakeComplete(brain)
+								|| transportEpoch != uint128_t(brain->transportEpoch))
+							{
+								break;
+							}
+
+							basics_log("brain peer handshake timeout closing private4=%u active=%d closing=%d connected=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d registrationFresh=%d transportEpoch=%u\n",
+								brain->private4,
+								int(rawStreamIsActive(brain)),
+								int(Ring::socketIsClosing(brain)),
+								int(brain->connected),
+								int(brain->pendingSend),
+								int(brain->pendingRecv),
+								int(brain->isTLSNegotiated()),
+								int(brain->tlsPeerVerified),
+								int(brain->registrationFresh),
+								unsigned(brain->transportEpoch));
+
+							if (rawStreamIsActive(brain))
+							{
+								queueBrainCloseIfActive(brain, "brain-peer-handshake-timeout");
+							}
+							else if (peerReconnectOwned(brain) && Ring::socketIsClosing(brain) == false)
+							{
+								attemptBrainPeerReconnectNow(brain, true, "brain-peer-handshake-timeout");
+							}
+
+							break;
+						}
+						case BrainTimeoutFlags::neuronControlReconnect:
+						{
+						NeuronView *neuron = (NeuronView *)packet->originator;
+						if (auto it = neuronReconnectWaiters.find(neuron); it != neuronReconnectWaiters.end())
+						{
+							if (it->second != packet)
+							{
+								basics_log("neuron reconnect timeout ignored stale packet private4=%u active=%p stale=%p\n",
+									(neuron && neuron->machine ? neuron->machine->private4 : 0u),
+									static_cast<void *>(it->second),
+									static_cast<void *>(packet));
+								delete packet;
+								break;
+							}
+
+							neuronReconnectWaiters.erase(it);
+						}
+						else
+						{
+							basics_log("neuron reconnect timeout ignored untracked packet private4=%u packet=%p\n",
+								(neuron && neuron->machine ? neuron->machine->private4 : 0u),
+								static_cast<void *>(packet));
+							delete packet;
+							break;
+						}
+
+						delete packet;
+						attemptNeuronControlReconnectNow(neuron, "neuron-reconnect-timeout");
+						break;
+					}
+					case BrainTimeoutFlags::neuronControlHandshake:
+					{
+						NeuronView *neuron = (NeuronView *)packet->originator;
+						if (auto it = neuronHandshakeWaiters.find(neuron); it != neuronHandshakeWaiters.end())
+						{
+							if (it->second != packet)
+							{
+								basics_log("neuron handshake timeout ignored stale packet private4=%u active=%p stale=%p\n",
+									(neuron && neuron->machine ? neuron->machine->private4 : 0u),
+									static_cast<void *>(it->second),
+									static_cast<void *>(packet));
+								delete packet;
+								break;
+							}
+
+							neuronHandshakeWaiters.erase(it);
+						}
+						else
+						{
+							basics_log("neuron handshake timeout ignored untracked packet private4=%u packet=%p\n",
+								(neuron && neuron->machine ? neuron->machine->private4 : 0u),
+								static_cast<void *>(packet));
+							delete packet;
+							break;
+						}
+
+						delete packet;
+
+						if (neuron == nullptr
+							|| neurons.contains(neuron) == false
+							|| weAreMaster == false
+							|| neuronControlHandshakeComplete(neuron))
+						{
+							break;
+						}
+
+						if (neuron->machine)
+						{
+							neuron->machine->lastNeuronFailMs = Time::now<TimeResolution::ms>();
+							neuron->machine->neuronConnectFailStreak += 1;
+						}
+
+						basics_log("neuron handshake timeout closing private4=%u active=%d closing=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d runtimeReady=%d state=%u\n",
+							(neuron->machine ? neuron->machine->private4 : 0u),
+							int(rawStreamIsActive(neuron)),
+							int(Ring::socketIsClosing(neuron)),
+							int(neuron->pendingSend),
+							int(neuron->pendingRecv),
+							int(neuron->isTLSNegotiated()),
+							int(neuron->tlsPeerVerified),
+							int(neuron->machine ? neuron->machine->runtimeReady : false),
+							unsigned(neuron->machine ? uint32_t(neuron->machine->state) : 0u));
+
+						if (rawStreamIsActive(neuron))
+						{
+							queueCloseIfActive(neuron);
+						}
+						else
+						{
+							attemptNeuronControlReconnectNow(neuron, "neuron-handshake-timeout");
+						}
+
+						break;
+					}
+					case BrainTimeoutFlags::brainPeerLiveness:
+					{
+						BrainView *brain = (BrainView *)packet->originator;
+						if (auto it = brainLivenessWaiters.find(brain); it != brainLivenessWaiters.end())
+					{
+						if (it->second != packet)
+						{
+							basics_log("brain liveness timeout ignored stale packet private4=%u active=%p stale=%p\n",
+								brain ? brain->private4 : 0u,
+								static_cast<void *>(it->second),
+								static_cast<void *>(packet));
+							delete packet;
+							break;
+						}
+
+						brainLivenessWaiters.erase(it);
+					}
+					else
+					{
+						basics_log("brain liveness timeout ignored untracked packet private4=%u packet=%p\n",
+							brain ? brain->private4 : 0u,
+							static_cast<void *>(packet));
+						delete packet;
+						break;
+					}
+
+					delete packet;
+
+					if (brain == nullptr || brains.contains(brain) == false || peerRepresentsCurrentMasterForLiveness(brain) == false)
+					{
+						break;
+					}
+
+					brain->confirmedMissingTransportEpoch = brain->transportEpoch;
+					basics_log("brain liveness timeout current-master private4=%u transportEpoch=%u active=%d closing=%d\n",
+						brain->private4,
+						unsigned(brain->transportEpoch),
+						int(rawStreamIsActive(brain)),
+						int(Ring::socketIsClosing(brain)));
+					if (rawStreamIsActive(brain))
+					{
+						queueBrainCloseIfActive(brain, "peer-liveness-timeout");
+					}
+					else if (Ring::socketIsClosing(brain) == false)
+					{
+						brainMissing(brain);
+					}
+
+					break;
+				}
+				case BrainTimeoutFlags::brainMissing:
+				{
 				BrainView *brain = (BrainView *)packet->originator;
 				if (auto it = brainWaiters.find(brain); it != brainWaiters.end())
 				{
@@ -8951,24 +11481,58 @@ public:
 					delete packet;
 					break;
 				}
+				std::fprintf(stderr,
+					"prodigy debug brain waiter-fire private4=%u packet=%p\n",
+					brain ? brain->private4 : 0u,
+					static_cast<void *>(packet));
+				std::fflush(stderr);
 				delete packet;
 
 				brainMissing(brain);
 
 				break;
 			}
-			case BrainTimeoutFlags::updateOSWakeup:
+				case BrainTimeoutFlags::updateOSWakeup:
+				{
+	         osUpdateTimerArmed = false;
+	         (void)runMachineUpdateCadenceTick();
+			         armMachineUpdateTimerIfNeeded();
+					break;
+				}
+			case BrainTimeoutFlags::osUpdateCommandDeadline:
 			{
-				// run the update on the head machine
+				Machine *machine = nullptr;
+				if (packet->identifier > 0)
+				{
+					if (auto it = machinesByUUID.find(packet->identifier); it != machinesByUUID.end())
+					{
+						machine = it->second;
+					}
+				}
+				else if (packet->originator != nullptr)
+				{
+					Machine *candidate = (Machine *)packet->originator;
+					if (machines.contains(candidate))
+					{
+						machine = candidate;
+					}
+				}
 
-				Machine *machine = operatingSystemUpdateOrder.back();
-				operatingSystemUpdateOrder.pop_back();
-				operatingSystemUpdateOrder.insert(operatingSystemUpdateOrder.begin(), machine);
+				if (machine == nullptr || machine->osUpdateCommandWatchdog != packet)
+				{
+					RingDispatcher::eraseMultiplexee(packet);
+					delete packet;
+					break;
+				}
 
-				machine->state = MachineState::updatingOS;
-				drainMachine(machine);
+				machine->osUpdateCommandWatchdog = nullptr;
+				RingDispatcher::eraseMultiplexee(packet);
+				delete packet;
 
-				// once drained it will see the state and call back
+				if (machine->osUpdateCommandIssued)
+				{
+					failOSUpdateCommandDeadline(machine);
+				}
 				break;
 			}
 			case BrainTimeoutFlags::hardRebootedMachine:
@@ -9140,6 +11704,11 @@ public:
 		}
 	}
 
+	void timeoutMultishotHandler(TimeoutPacket *packet, int result) override
+	{
+		timeoutHandler(packet, result);
+	}
+
 			template <typename T>
 			bool rawStreamIsActive(T *stream)
 			{
@@ -9182,7 +11751,7 @@ public:
 				template <typename T>
 				void queueCloseIfActive(T *stream)
 				{
-					if (rawStreamIsActive(stream) == false)
+					if (rawStreamIsActive(stream) == false || Ring::socketIsClosing(stream))
 					{
 						return;
 					}
@@ -9519,7 +12088,7 @@ public:
 
 				void queueCloseIfActive(Mothership *stream, const char *reason = nullptr)
 				{
-					if (streamIsActive(stream) == false)
+					if (streamIsActive(stream) == false || Ring::socketIsClosing(stream))
 					{
 						return;
 					}
@@ -9545,7 +12114,7 @@ public:
 					}
 
 					stream->closeAfterSendDrain = false;
-					if (streamIsActive(stream))
+					if (streamIsActive(stream) && Ring::socketIsClosing(stream) == false)
 					{
 						Ring::queueClose(stream);
 					}
@@ -10004,15 +12573,17 @@ public:
 							brain->rBuffer.advance(result);
 						}
 
+						brain->notePeerMessageReceived();
+
 						bool parseFailed = false;
 						brain->extractMessages<Message>([&] (Message *message) -> void {
 
 						brainHandler(brain, message);
 					}, true, UINT32_MAX, 16, ProdigyWire::maxControlFrameBytes, parseFailed);
 					if (parseFailed)
-					{
-						uint64_t outstanding = brain->rBuffer.outstandingBytes();
-						uint32_t peekSize = 0;
+						{
+							uint64_t outstanding = brain->rBuffer.outstandingBytes();
+							uint32_t peekSize = 0;
 						if (outstanding >= sizeof(uint32_t))
 						{
 							memcpy(&peekSize, brain->rBuffer.pHead(), sizeof(uint32_t));
@@ -10025,12 +12596,16 @@ public:
 							brain->fd,
 							brain->fslot);
 						brain->rBuffer.clear();
-						queueBrainCloseIfActive(brain, "recv-parse-fail", result);
-						return;
-					}
+							queueBrainCloseIfActive(brain, "recv-parse-fail", result);
+							return;
+						}
 
-						const bool rawActiveAfterDispatch = rawStreamIsActive(brain);
-						const bool streamActiveAfterDispatch = streamIsActive(brain);
+							if (brainPeerHandshakeComplete(brain))
+							{
+								cancelBrainPeerHandshakeWatchdog(brain, "recv");
+							}
+							const bool rawActiveAfterDispatch = rawStreamIsActive(brain);
+							const bool streamActiveAfterDispatch = streamIsActive(brain);
 						const bool closingAfterDispatch = Ring::socketIsClosing(brain);
 						if (streamActiveAfterDispatch
 							&& brain->transportTLSEnabled()
@@ -10539,10 +13114,10 @@ public:
 						unsigned(bytesBefore));
 						queueCloseIfActive(neuron);
 						return;
-					}
-					sendHandler(neuron, result);
-					basics_log("neuron send complete private4=%u result=%d bytesBefore=%u bytesAfter=%u active=%d pendingSend=%d\n",
-						(neuron->machine ? neuron->machine->private4 : 0u),
+						}
+						sendHandler(neuron, result);
+						basics_log("neuron send complete private4=%u result=%d bytesBefore=%u bytesAfter=%u active=%d pendingSend=%d\n",
+							(neuron->machine ? neuron->machine->private4 : 0u),
 						result,
 						unsigned(bytesBefore),
 						unsigned(neuron->wBuffer.size()),
@@ -10608,7 +13183,7 @@ public:
 
 			switch (newState)
 			{
-				case MachineState::healthy:
+					case MachineState::healthy:
 				{
 					// clear transient flags and counters when returning to healthy
 					machine->inBinaryUpdate = false;
@@ -10616,26 +13191,9 @@ public:
 					machine->brainConnectFailStreak = 0;
 					cancelMachineSoftWatchdog(machine);
 					cancelMachineHardRebootWatchdog(machine);
+					cancelOSUpdateCommandWatchdog(machine);
 
-					if (machine->claims.size() > 0) // the resources for these containers have already been charged and per machine bookkeeping done as well
-					{
-						for (auto it = machine->claims.begin(); it != machine->claims.end(); )
-						{
-						Machine::Claim& claim = *it;
-
-						MachineTicket *ticket = claim.ticket;
-						ticket->nNow = claim.nFit;
-						ticket->shardGroups = claim.shardGroups;
-                  ticket->reservedGPUMemoryMBs = claim.reservedGPUMemoryMBs;
-                  ticket->reservedGPUDevices = claim.reservedGPUDevices;
-
-						ticket->machineNow = machine;
-
-						ticket->coro->co_consume();
-
-						it = machine->claims.erase(it);
-					}
-				}
+               resumeMachineClaimsIfSchedulingReady(machine);
 
 					switch (oldState)
 					{
@@ -10890,6 +13448,15 @@ public:
                   armMachineUpdateTimerIfNeeded();
                   break;
                }
+               case MachineState::hardRebooting:
+               {
+                  if (machine->osUpdateCommandIssued)
+                  {
+                     onDrainCompleteForOSUpdate(machine);
+                     armMachineUpdateTimerIfNeeded();
+                  }
+                  break;
+               }
 						default: break;
 					}
 
@@ -10900,7 +13467,7 @@ public:
 							(void)applicationID;
 							if (head && !head->plan.isStateful)
 							{
-								head->evaluateAfterNewMaster();
+								head->recoverAfterReboot();
 							}
 						}
 					}
@@ -10912,6 +13479,7 @@ public:
 				// by the time we get here, we could've already progressed past this stage and be on SSH or hard rebooting or even reported it failed..
 				// so check that state first, then return if
 
+				bool handledExpectedOSUpdateReboot = false;
 				switch (oldState)
 				{
 					case MachineState::deploying:
@@ -10938,12 +13506,45 @@ public:
 					}
 					case MachineState::updatingOS:
 					{
-						// we already accounted for the reboot time + neuron start time in our "attempt reconnects until" factor
+						basics_log("machine os update reboot wait uuid=%llu private4=%u watchdogMs=%u reconnectWindowMs=%u\n",
+							(unsigned long long)machine->uuid,
+							unsigned(machine->private4),
+							unsigned(prodigyBrainOSUpdateRebootWatchdogMs),
+							unsigned(prodigyBrainOSUpdateReconnectWindowMs));
+						cancelOSUpdateCommandWatchdog(machine);
+						machine->state = MachineState::hardRebooting;
+						machine->lastHardRebootMs = Time::now<TimeResolution::ms>();
+						cancelMachineSoftWatchdog(machine);
+						cancelMachineHardRebootWatchdog(machine);
 
+						if (isActiveMaster())
+						{
+							armMachineNeuronReconnect(machine, prodigyBrainOSUpdateReconnectWindowMs);
+						}
 
+						if (machine->brain)
+						{
+							armOutboundPeerReconnect(machine->brain);
+						}
+
+						TimeoutPacket *timeout = new TimeoutPacket();
+						timeout->flags = uint64_t(BrainTimeoutFlags::hardRebootedMachine);
+						timeout->identifier = machine->uuid;
+						timeout->originator = machine;
+						timeout->dispatcher = this;
+						timeout->setTimeoutMs(prodigyBrainOSUpdateRebootWatchdogMs);
+						RingDispatcher::installMultiplexee(timeout, this);
+						Ring::queueTimeout(timeout);
+						machine->hardRebootWatchdog = timeout;
+						handledExpectedOSUpdateReboot = true;
 						break;
 					}
 					default: break;
+				}
+
+				if (handledExpectedOSUpdateReboot)
+				{
+					break;
 				}
 
 				// If we transitioned here during a binary update, give it space (state will be neuronRebooting)
@@ -11131,7 +13732,7 @@ public:
 		}
 	}
 
-	void transitionToNewBundle(void)
+		virtual void transitionToNewBundle(void)
 	{
 		// should we serialize and save all the container data?
 		String failure = {};
@@ -11147,6 +13748,12 @@ public:
 		String libraryDirectoryText = {};
 		libraryDirectoryText.assign(installPaths.libraryDirectory);
 		(void)setenv("LD_LIBRARY_PATH", libraryDirectoryText.c_str(), 1);
+		String prepareFailure = {};
+		if (prepareForBundleExec(prepareFailure) == false)
+		{
+			basics_log("transitionToNewBundle prepare failed: %s\n", prepareFailure.c_str());
+			_exit(EXIT_FAILURE);
+		}
 		Ring::shutdownForExec();
 
 		long maxFD = sysconf(_SC_OPEN_MAX);
@@ -11240,6 +13847,10 @@ bool hasConnectedBrainMajority(void)
 	{
 		if (bv == nullptr) return;
 		if (bv->weConnectToIt == false && forceConnectorOwnership == false) return;
+		if (forceConnectorOwnership)
+		{
+			bv->forceConnectorOwnershipUntilMasterAck = true;
+		}
 		cancelBrainMissingWaiter(bv, forceConnectorOwnership ? "arm-outbound-force" : "arm-outbound");
 		const uint32_t preservedAttemptsBudget = bv->nAttemptsBudget;
 		const int64_t preservedAttemptDeadlineMs = bv->attemptDeadlineMs;
@@ -11252,6 +13863,21 @@ bool hasConnectedBrainMajority(void)
 
 		bool reconnectArmedByClose = Ring::socketIsClosing(bv);
 		if (reconnectArmedByClose == false && hadActivePeerSocket)
+		{
+			queueBrainCloseIfActive(bv, forceConnectorOwnership ? "arm-outbound-force" : "arm-outbound");
+			reconnectArmedByClose = Ring::socketIsClosing(bv);
+		}
+
+		const bool shouldGracefullyCloseLiveRawTransport = (
+			reconnectArmedByClose == false
+			&& hadRawActiveStream
+			&& (bv->currentStreamAccepted
+				|| bv->tlsPeerVerified
+				|| bv->isTLSNegotiated()
+				|| bv->registrationFresh
+				|| bv->pendingSend
+				|| bv->pendingRecv));
+		if (shouldGracefullyCloseLiveRawTransport)
 		{
 			queueBrainCloseIfActive(bv, forceConnectorOwnership ? "arm-outbound-force" : "arm-outbound");
 			reconnectArmedByClose = Ring::socketIsClosing(bv);
@@ -11285,6 +13911,7 @@ bool hasConnectedBrainMajority(void)
 
 		if (reconnectArmedByClose == false)
 		{
+			bv->currentStreamAccepted = false;
 			bv->recreateSocket();
 			configureBrainPeerConnectAddress(bv);
 			if (installBrainPeerSocket(bv))
@@ -11460,10 +14087,11 @@ bool hasConnectedBrainMajority(void)
 			updateSelfExpectedEchos = expectedPeerEchos;
 
 			std::fprintf(stderr,
-				"prodigy updateProdigy begin expectedPeerEchos=%u stagedOnly=%d bundleBytes=%zu\n",
+				"prodigy updateProdigy begin expectedPeerEchos=%u stagedOnly=%d bundleBytes=%zu nowMs=%lld\n",
 				expectedPeerEchos,
 				int(updateSelfUseStagedBundleOnly),
-				size_t(updateSelfBundleBlob.size()));
+				size_t(updateSelfBundleBlob.size()),
+				(long long)Time::now<TimeResolution::ms>());
 			std::fflush(stderr);
          noteMasterAuthorityRuntimeStateChanged();
 
@@ -11513,9 +14141,10 @@ bool hasConnectedBrainMajority(void)
 			String nextMasterPeerKeyText = {};
 			nextMasterPeerKeyText.snprintf<"{itoa}"_ctv>(updateSelfPlannedMasterPeerKey);
 			std::fprintf(stderr,
-				"prodigy updateProdigy relinquish-begin peers=%u nextMasterPeerKey=%s\n",
+				"prodigy updateProdigy relinquish-begin peers=%u nextMasterPeerKey=%s nowMs=%lld\n",
 				updateSelfExpectedEchos,
-				nextMasterPeerKeyText.c_str());
+				nextMasterPeerKeyText.c_str(),
+				(long long)Time::now<TimeResolution::ms>());
 			std::fflush(stderr);
          noteMasterAuthorityRuntimeStateChanged();
 
@@ -11538,7 +14167,10 @@ bool hasConnectedBrainMajority(void)
          noteMasterAuthorityRuntimeStateChanged();
 
 			// Followers should transition first so master handoff/restart happens last.
-			std::fprintf(stderr, "prodigy updateProdigy follower-transition-begin peers=%u\n", updateSelfExpectedEchos);
+			std::fprintf(stderr,
+				"prodigy updateProdigy follower-transition-begin peers=%u nowMs=%lld\n",
+				updateSelfExpectedEchos,
+				(long long)Time::now<TimeResolution::ms>());
 			std::fflush(stderr);
 		for (BrainView *bv : brains)
 		{
@@ -11573,14 +14205,15 @@ bool hasConnectedBrainMajority(void)
 		String rebootedUUIDText = {};
 		rebootedUUIDText.snprintf<"{itoa}"_ctv>(bv->uuid);
 		std::fprintf(stderr,
-			"prodigy updateProdigy follower-reboot source=%s uuid=%s private4=%u %u/%u oldBootNs=%ld newBootNs=%ld\n",
+			"prodigy updateProdigy follower-reboot source=%s uuid=%s private4=%u %u/%u oldBootNs=%ld newBootNs=%ld nowMs=%lld\n",
 			(source ? source : "unknown"),
 			rebootedUUIDText.c_str(),
 			bv->private4,
 			uint32_t(updateSelfFollowerRebootedPeerKeys.size()),
 			updateSelfExpectedEchos,
 			(long)previousBootNs,
-			(long)bv->boottimens);
+			(long)bv->boottimens,
+			(long long)Time::now<TimeResolution::ms>());
 		std::fflush(stderr);
 		noteMasterAuthorityRuntimeStateChanged();
 
@@ -11626,7 +14259,11 @@ bool hasConnectedBrainMajority(void)
             noteMasterAuthorityRuntimeStateChanged();
 			}
 
-		std::fprintf(stderr, "prodigy updateProdigy bundle-echo %u/%u\n", updateSelfBundleEchos, updateSelfExpectedEchos);
+		std::fprintf(stderr,
+			"prodigy updateProdigy bundle-echo %u/%u nowMs=%lld\n",
+			updateSelfBundleEchos,
+			updateSelfExpectedEchos,
+			(long long)Time::now<TimeResolution::ms>());
 		std::fflush(stderr);
 		maybeTransitionFollowersForUpdateSelf();
 	}
@@ -11644,14 +14281,22 @@ bool hasConnectedBrainMajority(void)
             noteMasterAuthorityRuntimeStateChanged();
 			}
 
-		std::fprintf(stderr, "prodigy updateProdigy relinquish-echo %u/%u\n", updateSelfRelinquishEchos, updateSelfExpectedEchos);
-		std::fflush(stderr);
-		if (updateSelfRelinquishEchos < updateSelfExpectedEchos) return;
+			std::fprintf(stderr,
+				"prodigy updateProdigy relinquish-echo %u/%u nowMs=%lld\n",
+				updateSelfRelinquishEchos,
+				updateSelfExpectedEchos,
+				(long long)Time::now<TimeResolution::ms>());
+			std::fflush(stderr);
+			if (updateSelfRelinquishEchos < updateSelfExpectedEchos) return;
 
-		// Once every peer has acknowledged relinquish, we can safely restart ourselves.
-			boottimens = Time::now<TimeResolution::ns>();
-			forfeitMasterStatus();
-			resetUpdateSelfState();
+			// Once every peer has acknowledged relinquish, we can safely restart ourselves.
+				if (updateSelfPlannedMasterPeerKey > 0)
+				{
+					pendingDesignatedMasterPeerKey = updateSelfPlannedMasterPeerKey;
+				}
+				boottimens = Time::now<TimeResolution::ns>();
+				forfeitMasterStatus();
+				resetUpdateSelfState();
          noteMasterAuthorityRuntimeStateChanged();
 			transitionToNewBundle();
 		}
@@ -11665,7 +14310,7 @@ bool hasConnectedBrainMajority(void)
 				continue;
 			}
 
-			if (peer->isMasterBrain == false)
+			if (peerRepresentsCurrentMasterForLiveness(peer) == false)
 			{
 				continue;
 			}
@@ -11729,12 +14374,16 @@ bool hasConnectedBrainMajority(void)
 		Ring::queueSend(masterPeer);
 	}
 
-void brainHandler(BrainView *bv, Message *message)
-{
-   uint8_t *args = message->args;
+	void brainHandler(BrainView *bv, Message *message)
+	{
+	   uint8_t *args = message->args;
+		if (bv != nullptr)
+		{
+			bv->notePeerMessageReceived();
+		}
 
-  switch (BrainTopic(message->topic))
-  {
+	  switch (BrainTopic(message->topic))
+	  {
 #if 0
       case BrainTopic::reconcileMetrics:
       {
@@ -11905,6 +14554,17 @@ void brainHandler(BrainView *bv, Message *message)
 				Message::extractArg<ArgumentNature::fixed>(args, metricValue);
 
 				recordContainerMetric(deploymentID, containerUUID, metricKey, sampleTimeMs, static_cast<double>(metricValue));
+            if (auto containerIt = containers.find(containerUUID); containerIt != containers.end())
+            {
+               if (containerIt->second->deploymentID == deploymentID
+                  && containerIt->second->applyStatefulTopologyCutoverMetric(metricKey, metricValue))
+               {
+                  if (auto deploymentIt = deployments.find(deploymentID); deploymentIt != deployments.end() && deploymentIt->second)
+                  {
+                     deploymentIt->second->containerStatefulTopologyCutoverBarrierUpdated(containerIt->second);
+                  }
+               }
+            }
             if (weAreMaster && bv != nullptr)
             {
                replicateMetricSampleToFollowers(bv, deploymentID, containerUUID, sampleTimeMs, metricKey, metricValue);
@@ -11915,13 +14575,35 @@ void brainHandler(BrainView *bv, Message *message)
          {
             uint128_t containerUUID = 0;
             Message::extractArg<ArgumentNature::fixed>(args, containerUUID);
-            if (weAreMaster)
-            {
-               noteLocalContainerHealthy(containerUUID);
-            }
-            break;
-         }
-         case BrainTopic::replicateMetricsSnapshot:
+	            if (weAreMaster)
+	            {
+	               noteLocalContainerHealthy(containerUUID);
+	            }
+	            break;
+	         }
+	         case BrainTopic::replicateContainerRuntimeReady:
+	         {
+	            uint128_t containerUUID = 0;
+	            Message::extractArg<ArgumentNature::fixed>(args, containerUUID);
+	            if (weAreMaster)
+	            {
+	               noteLocalContainerRuntimeReady(containerUUID);
+	            }
+	            break;
+	         }
+	         case BrainTopic::replicateContainerRuntimeState:
+	         {
+	            String serialized;
+	            Message::extractToStringView(args, serialized);
+
+	            BrainReplicatedContainerRuntimeState state = {};
+	            if (BitseryEngine::deserializeSafe(serialized, state))
+	            {
+	               applyReplicatedContainerRuntimeState(state);
+	            }
+	            break;
+	         }
+	         case BrainTopic::replicateMetricsSnapshot:
          {
             String serialized;
             Message::extractToStringView(args, serialized);
@@ -12012,9 +14694,10 @@ void brainHandler(BrainView *bv, Message *message)
 					BitseryEngine::deserialize(serializedPlan, plan);
 
 					deploymentPlans.insert_or_assign(plan.config.deploymentID(), plan);
-               applyReplicatedDeploymentPlanLiveState(plan);
+	               applyReplicatedDeploymentPlanLiveState(plan);
+	               applyPendingReplicatedContainerRuntimeStates(plan.config.deploymentID());
 
-					String containerBlob;
+						String containerBlob;
 					Message::extractToStringView(args, containerBlob);
 
 					if (containerBlob.size() > 0)
@@ -12175,19 +14858,31 @@ void brainHandler(BrainView *bv, Message *message)
 			{
 				uint8_t *args = message->args;
 
-				// uuid(16) boottimens(8) version(8) existingMasterUUID(16)
-				Message::extractArg<ArgumentNature::fixed>(args, bv->uuid);
-				Message::extractArg<ArgumentNature::fixed>(args, bv->boottimens);
-				Message::extractArg<ArgumentNature::fixed>(args, bv->version);
-				Message::extractArg<ArgumentNature::fixed>(args, bv->existingMasterUUID);
-				bv->registrationFresh = true;
-				std::fprintf(stderr,
-					"prodigy debug brain registration private4=%u uuid=%llu boottimens=%ld existingMasterUUID=%llu updateState=%u\n",
-					bv->private4,
-					(unsigned long long)bv->uuid,
-					(long)bv->boottimens,
-					(unsigned long long)bv->existingMasterUUID,
-					unsigned(updateSelfState));
+					// uuid(16) boottimens(8) version(8) existingMasterUUID(16) kernel{4} osID{4} osVersionID{4}
+					Message::extractArg<ArgumentNature::fixed>(args, bv->uuid);
+					Message::extractArg<ArgumentNature::fixed>(args, bv->boottimens);
+					Message::extractArg<ArgumentNature::fixed>(args, bv->version);
+					Message::extractArg<ArgumentNature::fixed>(args, bv->existingMasterUUID);
+					Message::extractToString(args, bv->kernel);
+					Message::extractToString(args, bv->osID);
+					Message::extractToString(args, bv->osVersionID);
+					bv->registrationFresh = true;
+	            if (bv->machine != nullptr)
+	            {
+	               bv->machine->kernel = bv->kernel;
+	               bv->machine->osID = bv->osID;
+	               bv->machine->osVersionID = bv->osVersionID;
+	               bv->machine->lastUpdatedOSMs = bv->boottimens / 1000000;
+	            }
+					std::fprintf(stderr,
+						"prodigy debug brain registration private4=%u uuid=%llu boottimens=%ld existingMasterUUID=%llu osID=%s osVersionID=%s updateState=%u\n",
+						bv->private4,
+						(unsigned long long)bv->uuid,
+						(long)bv->boottimens,
+						(unsigned long long)bv->existingMasterUUID,
+	                  bv->osID.c_str(),
+	                  bv->osVersionID.c_str(),
+						unsigned(updateSelfState));
 				std::fflush(stderr);
 				if (updateSelfState == UpdateSelfState::waitingForFollowerReboots ||
 					updateSelfState == UpdateSelfState::waitingForRelinquishEchos)
@@ -12200,9 +14895,20 @@ void brainHandler(BrainView *bv, Message *message)
 						(long)bv->boottimens,
 						unsigned(updateSelfState));
 					std::fflush(stderr);
-				}
-				synchronizeBrainUUIDToMachine(bv);
+					}
+					synchronizeBrainUUIDToMachine(bv);
+					refreshBrainPeerHandshakeWatchdog(bv, "registration");
+	            if (isActiveMaster() && bv->machine != nullptr)
+            {
+               promoteMachineToHealthyIfReady(bv->machine);
+               armMachineUpdateTimerIfNeeded();
+            }
 				onUpdateSelfPeerRegistration(bv);
+
+				if (weAreMaster && bv->existingMasterUUID == selfBrainUUID())
+				{
+					bv->forceConnectorOwnershipUntilMasterAck = false;
+				}
 
 				if (weAreMaster && bv->existingMasterUUID == selfBrainUUID())
 				{
@@ -12293,22 +14999,30 @@ void brainHandler(BrainView *bv, Message *message)
 						}
 						else
 						{
-							// Reconciliation requires quorum-majority reports from currently active peers.
-							// Never relinquish master from stale/degraded claims.
-						}
+						// Reconciliation requires quorum-majority reports from currently active peers.
+						// Never relinquish master from stale/degraded claims.
 					}
+				}
 
-					if (noMasterYet && weAreMaster == false && pendingDesignatedMasterPeerKey > 0)
-					{
-						uint128_t registrationPeerKey = updateSelfPeerTrackingKey(bv);
-						uint128_t selfPeerKey = updateSelfLocalPeerTrackingKey();
+				if (weAreMaster && bv->existingMasterUUID != selfBrainUUID())
+				{
+					// Followers can still have a live stream to us while lacking an explicit
+					// current-master claim. Push our master identity immediately so liveness
+					// and failover logic do not wait for a later reconnect cycle.
+					bv->sendRegistration(boottimens, version, getExistingMasterUUID());
+				}
+
+				if (noMasterYet && weAreMaster == false && pendingDesignatedMasterPeerKey > 0)
+				{
+					uint128_t registrationPeerKey = updateSelfPeerTrackingKey(bv);
+					uint128_t selfPeerKey = updateSelfLocalPeerTrackingKey();
 						if (selfPeerKey > 0 && pendingDesignatedMasterPeerKey == selfPeerKey)
 						{
 							String pendingPeerKeyText = {};
 							pendingPeerKeyText.snprintf<"{itoa}"_ctv>(pendingDesignatedMasterPeerKey);
 							basics_log("registration elect-self reason=pending-designated-master peerKey=%s\n",
 								pendingPeerKeyText.c_str());
-							selfElectAsMaster("registration:pending-designated-master");
+							(void)selfElectAsMaster("registration:pending-designated-master", true);
 						}
 						else if (registrationPeerKey == pendingDesignatedMasterPeerKey && bv->quarantined == false)
 						{
@@ -12361,7 +15075,7 @@ void brainHandler(BrainView *bv, Message *message)
 						{
 							for (BrainView *bv : brains)
 							{
-								if (bv->isMasterBrain)
+								if (peerRepresentsCurrentMaster(bv))
 								{
 									// send the deployments we have
 									// the master will respond with any to cull and any we don't have yet
@@ -12395,6 +15109,7 @@ void brainHandler(BrainView *bv, Message *message)
 						}
 					}
 
+				refreshMasterPeerLivenessWaiter(bv, "registration");
 				break;
 			}
          case BrainTopic::peerAddressCandidates:
@@ -12412,30 +15127,12 @@ void brainHandler(BrainView *bv, Message *message)
          }
 			case BrainTopic::masterMissing:
 			{
-					auto maybeDeriveOnMasterMissingAgreement = [&] () -> void
-					{
-						// Local vote must agree as well; then require currently reachable active peers.
-						bool everyoneAgrees = isMasterMissing;
-						uint32_t nBrainsAlive = 1;
-
-						for (BrainView *peer : brains) // some might've been deleted from here because they connect to us
-						{
-							if (peerEligibleForClusterQuorum(peer) == false) continue;
-							if (peerSocketActive(peer) == false) continue;
-							nBrainsAlive += 1;
-							if (peer->isMasterMissing == false) everyoneAgrees = false;
-						}
-
-					if (everyoneAgrees) deriveMasterBrainIf();
-					basics_log("masterMissing agreement everyone=%d alive=%u local=%d\n", int(everyoneAgrees), nBrainsAlive, int(isMasterMissing));
-				};
-
 				if (message->isEcho()) // they're eliciting our state but also saying their state is true
 				{
 					bv->isMasterMissing = true;
 					basics_log("masterMissing echo from=%u localIsMasterMissing=%d\n", bv->private4, int(isMasterMissing));
 					bv->respondMasterMissing(isMasterMissing);
-					maybeDeriveOnMasterMissingAgreement();
+					maybeDeriveOnMasterMissingAgreement("echo");
 				}
 				else
 				{
@@ -12444,13 +15141,38 @@ void brainHandler(BrainView *bv, Message *message)
 					uint8_t *args = message->args;
 					Message::extractArg<ArgumentNature::fixed>(args, bv->isMasterMissing);
 					basics_log("masterMissing response from=%u value=%d\n", bv->private4, int(bv->isMasterMissing));
-					maybeDeriveOnMasterMissingAgreement();
-				}
+					maybeDeriveOnMasterMissingAgreement("response");
+					}
 
 				break;
 			}
-			case BrainTopic::updateBundle:
+			case BrainTopic::peerHeartbeat:
 			{
+				uint8_t *args = message->args;
+				bool isResponse = false;
+				uint64_t heartbeatNonce = 0;
+				if (Message::extractArg<ArgumentNature::fixed>(args, isResponse) == false)
+				{
+					break;
+				}
+				if (Message::extractArg<ArgumentNature::fixed>(args, heartbeatNonce) == false)
+				{
+					break;
+				}
+
+				if (isResponse)
+				{
+					bv->notePeerHeartbeatAck(heartbeatNonce);
+					refreshMasterPeerLivenessWaiter(bv, "peer-heartbeat-ack");
+				}
+				else
+				{
+					bv->respondPeerHeartbeat(heartbeatNonce);
+				}
+				break;
+			}
+				case BrainTopic::updateBundle:
+				{
 				if (message->isEcho())
 				{
 					onUpdateSelfBundleEcho(bv);
@@ -12533,8 +15255,7 @@ void brainHandler(BrainView *bv, Message *message)
 						{
 							designatedMasterKnown = true;
 							basics_log("relinquishMasterStatus elect-self reason=designated-master\n");
-							selfElectAsMaster("relinquishMasterStatus:designated-master");
-							electedDesignatedMaster = true;
+							electedDesignatedMaster = selfElectAsMaster("relinquishMasterStatus:designated-master", true);
 						}
 						else if (designatedMasterPeerKey > 0)
 						{
@@ -12602,6 +15323,7 @@ void brainHandler(BrainView *bv, Message *message)
 					}
 
 					brainConfig = incomingConfig;
+               refreshMachineFragmentAssignmentsIfPossible();
 
 						loadBrainConfigIf();
 						if (noMasterYet)
@@ -12800,6 +15522,8 @@ void brainHandler(BrainView *bv, Message *message)
 
 		deploymentsByApp.insert_or_assign(deployment->plan.config.applicationID, deployment);
 		deployments.insert_or_assign(deployment->plan.config.deploymentID(), deployment);
+      deployment->restorePersistedStatefulWorkerTopologyUpgradeOperation();
+      deployment->restorePersistedDeferredStatefulScaleIntent();
 
 		if (previous == nullptr)
 		{
@@ -12807,19 +15531,31 @@ void brainHandler(BrainView *bv, Message *message)
 		}
 		else
 		{
-			switch (previous->state)
-			{
-				case DeploymentState::none:  // they rapid fire sent another before we could begin work on this
-				case DeploymentState::waitingToDeploy:
-
+				switch (previous->state)
 				{
-					// previous->previous can never be nullptr when DeploymentState::none
-					deployment->previous = previous->previous;
-					previous->previous->next = deployment;
+					case DeploymentState::none:  // they rapid fire sent another before we could begin work on this
+					case DeploymentState::waitingToDeploy:
 
-					delete previous;
+					{
+						if (previous->previous == nullptr)
+						{
+							previous->next = deployment;
+							deployment->previous = previous;
+							deployment->state = DeploymentState::waitingToDeploy;
+							break;
+						}
 
-					break;
+						deployment->previous = previous->previous;
+						previous->previous->next = deployment;
+
+						if (auto it = deployments.find(previous->plan.config.deploymentID()); it != deployments.end() && it->second == previous)
+						{
+							deployments.erase(it);
+						}
+
+						delete previous;
+
+						break;
 				}
 				case DeploymentState::canaries:
 				case DeploymentState::deploying:
@@ -12984,13 +15720,17 @@ void brainHandler(BrainView *bv, Message *message)
 
 	static bool managedMachineSchemaMatchesClusterMachine(const ClusterMachine& machine, const ProdigyManagedMachineSchema& managedSchema)
 	{
-		return machine.source == ClusterMachineSource::created
-			&& machine.backing == ClusterMachineBacking::cloud
-			&& machine.cloudPresent()
-			&& machine.lifetime == managedSchema.lifetime
-			&& machine.cloud.schema.equals(managedSchema.schema)
-			&& machine.cloud.providerMachineType.equals(managedSchema.providerMachineType);
-	}
+			return machine.source == ClusterMachineSource::created
+				&& machine.backing == ClusterMachineBacking::cloud
+	         && machine.kind == managedSchema.kind
+				&& machine.cloudPresent()
+				&& machine.lifetime == managedSchema.lifetime
+				&& machine.cloud.schema.equals(managedSchema.schema)
+				&& machine.cloud.providerMachineType.equals(managedSchema.providerMachineType)
+	         && (managedSchema.kind != MachineConfig::MachineKind::vm
+	            || managedSchema.vmImageURI.size() == 0
+	            || machine.vmImageURI.equals(managedSchema.vmImageURI));
+		}
 
 	static bool managedCreatedClusterMachineRemovalPriority(const ClusterMachine *lhs, const ClusterMachine *rhs)
 	{
@@ -14376,8 +17116,8 @@ addmachines_finalize:
          }
 		}
 
-			if (response.success && managedWork.empty() && readOnlyTopologyRequest == false && weAreMaster)
-			{
+				if (response.success && managedWork.empty() && readOnlyTopologyRequest == false && weAreMaster)
+				{
 				String managedFailure = {};
             ClusterTopology managedTopology = {};
 				if (reconcileManagedMachineSchemas(&managedFailure, nullptr, &managedTopology) == false)
@@ -14390,11 +17130,15 @@ addmachines_finalize:
 				else
 				{
 					response.hasTopology = true;
-               response.topology = std::move(managedTopology);
+	               response.topology = std::move(managedTopology);
+		         }
+				}
+	         if (response.success && readOnlyTopologyRequest == false)
+	         {
+	            armMachineUpdateTimerIfNeeded();
 	         }
-			}
 
-#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
+	#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
       response.hasTimingAttribution = true;
       prodigyFinalizeTimingAttribution(Time::now<TimeResolution::ns>() - addMachinesStartNs, addMachinesProviderWaitNs, response.timingAttribution);
 #endif
@@ -14557,12 +17301,19 @@ addmachines_finalize:
                brainConfig.reporter = incomingConfig.reporter;
             }
 
-            if (incomingConfig.vmImageURI.size() > 0)
-            {
-               brainConfig.vmImageURI = incomingConfig.vmImageURI;
-            }
+	            if (incomingConfig.vmImageURI.size() > 0)
+	            {
+	               brainConfig.vmImageURI = incomingConfig.vmImageURI;
+	            }
 
-            if (incomingConfig.runtimeEnvironment.configured())
+	            brainConfig.osUpdatesEnabled = incomingConfig.osUpdatesEnabled;
+	            brainConfig.osUpdatePolicies = incomingConfig.osUpdatePolicies;
+	            brainConfig.maxOSDrains = incomingConfig.maxOSDrains > 0 ? incomingConfig.maxOSDrains : 1;
+	            brainConfig.machineUpdateCadenceMins = incomingConfig.machineUpdateCadenceMins > 0
+	               ? incomingConfig.machineUpdateCadenceMins
+	               : 15;
+
+	            if (incomingConfig.runtimeEnvironment.configured())
             {
                ownRuntimeEnvironmentConfig(incomingConfig.runtimeEnvironment, brainConfig.runtimeEnvironment);
                if (uint32_t maxSegmentSize = controlPlaneTCPMaxSegmentSize(AF_INET6); maxSegmentSize > 0)
@@ -14602,7 +17353,7 @@ addmachines_finalize:
                      continue;
                   }
 
-                  prodigyConfigureMachineNeuronEndpoint(*machine, thisNeuron);
+                  prodigyConfigureMachineNeuronEndpoint(*machine, thisNeuron, &localBrainPeerAddresses);
                   IPAddress peerAddress = {};
                   if (prodigyResolveMachinePeerAddress(*machine, peerAddress) == false)
                   {
@@ -14620,7 +17371,9 @@ addmachines_finalize:
             String serializedBrainConfig;
             BitseryEngine::serialize(serializedBrainConfig, brainConfig);
 
-						loadBrainConfigIf();
+							loadBrainConfigIf();
+	                  refreshMachineFragmentAssignmentsIfPossible();
+	                  armMachineUpdateTimerIfNeeded();
 
 							queueBrainReplication(BrainTopic::replicateBrainConfig, serializedBrainConfig);
                      persistLocalRuntimeState();
@@ -14630,15 +17383,19 @@ addmachines_finalize:
 								deriveMasterBrain();
 						}
 
-						std::fprintf(stderr, "prodigy mothership configure-response clusterUUID=%llu datacenter=%u autoscale=%u nMachineConfigs=%u nSubnets=%u bytes=%zu noMasterYet=%d master=%d\n",
-							(unsigned long long)brainConfig.clusterUUID,
-							unsigned(brainConfig.datacenterFragment),
-							unsigned(brainConfig.autoscaleIntervalSeconds),
-							uint32_t(brainConfig.configBySlug.size()),
-							uint32_t(brainConfig.distributableExternalSubnets.size()),
-							size_t(serializedBrainConfig.size()),
-							int(noMasterYet),
-							int(weAreMaster));
+							std::fprintf(stderr, "prodigy mothership configure-response clusterUUID=%llu datacenter=%u autoscale=%u nMachineConfigs=%u nSubnets=%u bytes=%zu noMasterYet=%d master=%d osUpdatesEnabled=%d osUpdatePolicies=%u maxOSDrains=%u cadenceMins=%u\n",
+								(unsigned long long)brainConfig.clusterUUID,
+								unsigned(brainConfig.datacenterFragment),
+								unsigned(brainConfig.autoscaleIntervalSeconds),
+								uint32_t(brainConfig.configBySlug.size()),
+								uint32_t(brainConfig.distributableExternalSubnets.size()),
+								size_t(serializedBrainConfig.size()),
+								int(noMasterYet),
+								int(weAreMaster),
+								int(brainConfig.osUpdatesEnabled),
+								unsigned(brainConfig.osUpdatePolicies.size()),
+								unsigned(brainConfig.maxOSDrains),
+								unsigned(brainConfig.machineUpdateCadenceMins));
 					std::fflush(stderr);
                   basics_log("configure sharedCPUOvercommitPermille=%u previous=%u\n",
                      unsigned(brainConfig.sharedCPUOvercommitPermille),
@@ -14707,8 +17464,12 @@ addmachines_finalize:
                         response.topology = std::move(reconciledTopology);
 	                  }
 
-							response.success = (response.failure.size() == 0);
-#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
+								response.success = (response.failure.size() == 0);
+	                     if (response.success)
+	                     {
+	                        armMachineUpdateTimerIfNeeded();
+	                     }
+	#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
                   response.hasTimingAttribution = true;
                   response.timingAttribution = reconcileTiming;
 #endif
@@ -15557,6 +18318,7 @@ addmachines_finalize:
                mreport.state.assign(machineStateName(machine->state));
                mreport.isBrain = machine->isBrain;
                mreport.controlPlaneReachable = neuronControlStreamActive(machine);
+               mreport.runtimeReady = machine->runtimeReady && mreport.controlPlaneReachable;
                mreport.currentMaster = machine->isBrain
                   && ((machine->isThisMachine && isActiveMaster())
                      || (machine->brain != nullptr && machine->brain == masterPeer));
@@ -15624,10 +18386,10 @@ addmachines_finalize:
                   }
 
                   mreport.reservedContainers += claim.nFit;
-                  mreport.reservedIsolatedLogicalCores += (claim.reservedIsolatedLogicalCoresPerInstance * claim.nFit);
-                  mreport.reservedSharedCPUMillis += (claim.reservedSharedCPUMillisPerInstance * claim.nFit);
-                  mreport.reservedMemoryMB += (claim.reservedMemoryMBPerInstance * claim.nFit);
-                  mreport.reservedStorageMB += (claim.reservedStorageMBPerInstance * claim.nFit);
+                  mreport.reservedIsolatedLogicalCores += claim.reservedIsolatedLogicalCoresTotal ? claim.reservedIsolatedLogicalCoresTotal : (claim.reservedIsolatedLogicalCoresPerInstance * claim.nFit);
+                  mreport.reservedSharedCPUMillis += claim.reservedSharedCPUMillisTotal ? claim.reservedSharedCPUMillisTotal : (claim.reservedSharedCPUMillisPerInstance * claim.nFit);
+                  mreport.reservedMemoryMB += claim.reservedMemoryMBTotal ? claim.reservedMemoryMBTotal : (claim.reservedMemoryMBPerInstance * claim.nFit);
+                  mreport.reservedStorageMB += claim.reservedStorageMBTotal ? claim.reservedStorageMBTotal : (claim.reservedStorageMBPerInstance * claim.nFit);
                }
 
                for (const auto& [deploymentID, indexedContainers] : machine->containersByDeploymentID)
@@ -16605,6 +19367,12 @@ addmachines_finalize:
 						return;
 					}
 
+					if (deployment->plan.isStateful && deployment->plan.canaryCount > 0)
+					{
+						rejectInvalidPlan("invalid plan: stateful canaries are not supported; use stateful blue-green topology rollout"_ctv);
+						return;
+					}
+
 					if (deployment->plan.hasTlsIssuancePolicy)
 					{
 						const DeploymentTlsIssuancePolicy& tlsPolicy = deployment->plan.tlsIssuancePolicy;
@@ -16895,8 +19663,8 @@ addmachines_finalize:
 			// neuron sends... serialized containers + its fragments
 			// NeuronTopic::stateUpload containers{4} fragment(4)
 
-			// neuron always sends back
-			// NeuronTopic::registration bootTimeMs(8) kernel{4} haveData(1)
+					// neuron always sends back
+					// NeuronTopic::registration bootTimeMs(8) kernel{4} osID{4} osVersionID{4} haveData(1)
 
 			// if haveData == false
 			// brain sends back
@@ -16905,62 +19673,38 @@ addmachines_finalize:
 			// maybe we should send it our registration... saying that we just became master and don't have data?
 			case NeuronTopic::registration:
 			{
-				// bootTimeMs(8) kernel{4} haveData(1)
+						// bootTimeMs(8) kernel{4} osID{4} osVersionID{4} haveData(1)
 				uint8_t *args = message->args;
 
 				Machine *machine = neuron->machine;
+            const bool needsStateRefresh = machineNeedsNeuronStateRefresh(machine);
 
-				Message::extractArg<ArgumentNature::fixed>(args, machine->lastUpdatedOSMs);
-				Message::extractToString(args, machine->kernel);
+							Message::extractArg<ArgumentNature::fixed>(args, machine->lastUpdatedOSMs);
+							Message::extractToString(args, machine->kernel);
+			            Message::extractToString(args, machine->osID);
+			            Message::extractToString(args, machine->osVersionID);
+			            basics_log("brain neuron registration os uuid=%llu private4=%u osID=%s osVersionID=%s bootTimeMs=%lld\n",
+			               (unsigned long long)machine->uuid,
+			               unsigned(machine->private4),
+			               machine->osID.c_str(),
+			               machine->osVersionID.c_str(),
+			               (long long)machine->lastUpdatedOSMs);
 
-				bool haveData;
-				Message::extractArg<ArgumentNature::fixed>(args, haveData);
+					bool haveData;
+					Message::extractArg<ArgumentNature::fixed>(args, haveData);
 
-				if (haveData == false) // either 1) first time the neuron is connecting or 2) neuron crashed or 3) neuron was updated or 4) OS updated
+				if (haveData == false || needsStateRefresh) // either 1) first time the neuron is connecting or 2) neuron crashed or 3) neuron was updated or 4) OS updated
 				{
 					if (ignited)
 					{
+                  if (brainConfig.datacenterFragment == 0)
+                  {
+                     break;
+                  }
+
 						if (machine->fragment > 0)
 						{
-							// was previously configured.... must've crashed or neuron was updated or OS was updated (but maybe we don't keep containers on machines when OS updating)
-
-							uint32_t headerOffset = Message::appendHeader(neuron->wBuffer, NeuronTopic::stateUpload);
-
-							struct local_container_subnet6 fragment;
-							fragment.dpfx = brainConfig.datacenterFragment;
-							fragment.mpfx[0] = static_cast<uint8_t>((neuron->machine->fragment >> 16) & 0xFF);
-							fragment.mpfx[1] = static_cast<uint8_t>((neuron->machine->fragment >> 8) & 0xFF);
-							fragment.mpfx[2] = static_cast<uint8_t>(neuron->machine->fragment & 0xFF);
-
-							Message::appendAlignedBuffer<Alignment::one>(neuron->wBuffer, (uint8_t *)&fragment, sizeof(struct local_container_subnet6));
-
-							for (const auto& [deploymentID, containers] : machine->containersByDeploymentID) // might not be any
-							{
-								auto deploymentIt = deployments.find(deploymentID);
-								if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
-								{
-									continue;
-								}
-
-								ApplicationDeployment *deployment = deploymentIt->second;
-
-									for (ContainerView *container : containers)
-									{
-										ContainerPlan planToReplay = container->generatePlan(deployment->plan, deployment->nShardGroups);
-										applyCredentialsToContainerPlan(deployment->plan, *container, planToReplay);
-
-                              NeuronContainerBootstrap bootstrap;
-                              bootstrap.plan = std::move(planToReplay);
-                              bootstrap.metricPolicy = deriveNeuronMetricPolicyForDeployment(deployment->plan);
-                              String serializedBootstrap;
-                              BitseryEngine::serialize(serializedBootstrap, bootstrap);
-                              Message::appendValue(neuron->wBuffer, serializedBootstrap);
-									}
-							}
-
-							Message::finish(neuron->wBuffer, headerOffset);
-
-							Ring::queueSend(neuron);
+                     queueNeuronStateUploadForMachine(machine);
 						}
 						else // neuron yet to ever be configured, assign fragment now
 						{
@@ -16990,17 +19734,18 @@ addmachines_finalize:
                   neuron->fd,
                   neuron->fslot);
 #endif
-						if (machine->state != MachineState::healthy
-	                  && readyAfterRegistration)
-						{
-							handleMachineStateChange(machine, MachineState::healthy);
-						}
+							if (readyAfterRegistration)
+							{
+								promoteMachineToHealthyIfReady(machine);
+							}
 
-					sendNeuronSwitchboardStateSync(machine);
-					recoverDeploymentsAfterNeuronState();
+							refreshNeuronControlHandshakeWatchdog(neuron, "registration");
+							sendNeuronSwitchboardStateSync(machine);
+							recoverDeploymentsAfterNeuronState();
+		               armMachineUpdateTimerIfNeeded();
 
-					break;
-				}
+						break;
+					}
          case NeuronTopic::machineHardwareProfile:
          {
             String serialized = {};
@@ -17070,14 +19815,11 @@ addmachines_finalize:
                neuron->fslot);
 #endif
 
-	            if (machine->state != MachineState::healthy
-	               && machineReadyForHealthyState(machine))
-	            {
-	               handleMachineStateChange(machine, MachineState::healthy);
-	            }
+		            promoteMachineToHealthyIfReady(machine);
+	            refreshNeuronControlHandshakeWatchdog(neuron, "machine-hardware");
 
-            break;
-         }
+	            break;
+	         }
 			case NeuronTopic::stateUpload:
 			{
          // fragment(4) [containerPlan{4} + runtimeCores(2) + runtimeMemMB(4) + runtimeStorMB(4)]...
@@ -17085,9 +19827,24 @@ addmachines_finalize:
 				struct local_container_subnet6 fragment;
 				Message::extractBytes<Alignment::one>(args, (uint8_t *)&fragment, sizeof(struct local_container_subnet6));
 
-				neuron->machine->fragment = (static_cast<uint32_t>(fragment.mpfx[0]) << 16) |
+				uint32_t reportedFragment = (static_cast<uint32_t>(fragment.mpfx[0]) << 16) |
 				   (static_cast<uint32_t>(fragment.mpfx[1]) << 8) |
 				   static_cast<uint32_t>(fragment.mpfx[2]);
+            neuron->machine->reportedDatacenterFragment = fragment.dpfx;
+            neuron->machine->reportedFragment = reportedFragment;
+            if (neuron->machine->fragment == 0 && fragment.dpfx != 0 && reportedFragment > 0)
+            {
+               neuron->machine->fragment = reportedFragment;
+            }
+            else if (reportedFragment > 0
+               && neuron->machine->fragment > 0
+               && reportedFragment != neuron->machine->fragment)
+            {
+               basics_log("brain stateUpload fragment mismatch private4=%u assigned=%u reported=%u\n",
+                  unsigned(neuron->machine ? neuron->machine->private4 : 0u),
+                  unsigned(neuron->machine->fragment),
+                  unsigned(reportedFragment));
+            }
 
 					uint8_t *terminal = message->terminal();
 					bool malformedStateUpload = false;
@@ -17127,6 +19884,7 @@ addmachines_finalize:
 						uint32_t previousShardGroup = container->shardGroup;
 						Machine *previousMachine = container->machine;
 						ContainerState previousState = container->state;
+                  bool previousRuntimeReady = container->runtimeReady;
 						ContainerState uploadedState = plan.state;
 						uint128_t previousPairingAddress = container->pairingAddress();
 						bool replayActivePeerPairings = false;
@@ -17171,6 +19929,11 @@ addmachines_finalize:
 						container->applicationID = plan.config.applicationID;
 						container->lifetime = plan.lifetime;
 						container->state = uploadedState;
+                  container->runtimeReady = plan.runtimeReady;
+                  if (container->runtimeReady == false)
+                  {
+                     container->clearStatefulTopologyCutoverBarrier();
+                  }
 						container->machine = neuron->machine;
 	            container->createdAtMs = plan.createdAtMs;
 	            // Neuron state upload currently transmits the serialized container plan.
@@ -17183,10 +19946,13 @@ addmachines_finalize:
                      container->whiteholes = plan.whiteholes;
                      container->assignedGPUMemoryMBs = plan.assignedGPUMemoryMBs;
                      container->assignedGPUDevices = plan.assignedGPUDevices;
-						container->fragment = plan.fragment;
-						container->setMeshAddress(container_network_subnet6, brainConfig.datacenterFragment, neuron->machine->fragment, container->fragment);
-						container->shardGroup = plan.shardGroup;
-						container->subscriptions = plan.subscriptions;
+							container->fragment = plan.fragment;
+							container->setMeshAddress(container_network_subnet6, brainConfig.datacenterFragment, neuron->machine->fragment, container->fragment);
+                     container->isStateful = plan.isStateful;
+							container->shardGroup = plan.shardGroup;
+                     container->explicitStatefulMeshRoles = plan.statefulMeshRoles;
+                     container->explicitStatefulTopology = plan.statefulTopology;
+							container->subscriptions = plan.subscriptions;
 	   				container->advertisements = plan.advertisements;
 						if (previousState == ContainerState::healthy &&
 						    uploadedState == ContainerState::healthy &&
@@ -17250,7 +20016,15 @@ addmachines_finalize:
 							container->state = previousState;
 							deployment->containerIsHealthy(container);
 						}
-						else if (replayActivePeerPairings)
+
+                  bool appliedRuntimeReady = false;
+                  if (container->runtimeReady && previousRuntimeReady == false)
+                  {
+                     deployment->containerIsRuntimeReady(container);
+                     appliedRuntimeReady = true;
+                  }
+
+						if (replayActivePeerPairings && appliedRuntimeReady == false)
 						{
 							container->replayActivePairingsToSelf();
 							container->replayActivePairingsToPeers();
@@ -17330,6 +20104,14 @@ addmachines_finalize:
 						int(malformedStateUpload));
 #endif
 
+	               neuron->machine->runtimeReady =
+	                  neuron->machine->fragment > 0
+	                  && neuron->machine->reportedDatacenterFragment != 0
+	                  && (brainConfig.datacenterFragment == 0 || neuron->machine->reportedDatacenterFragment == brainConfig.datacenterFragment)
+	                  && neuron->machine->reportedFragment == neuron->machine->fragment;
+	               promoteMachineToHealthyIfReady(neuron->machine);
+	               refreshNeuronControlHandshakeWatchdog(neuron, "state-upload");
+	               resumeMachineClaimsIfSchedulingReady(neuron->machine);
 					sendNeuronSwitchboardStateSync(neuron->machine);
 					recoverDeploymentsAfterNeuronState();
 
@@ -17370,6 +20152,13 @@ addmachines_finalize:
 
 					break;
 				}
+         case NeuronTopic::containerRuntimeReady:
+         {
+            uint128_t containerUUID = 0;
+            Message::extractArg<ArgumentNature::fixed>(args, containerUUID);
+            noteLocalContainerRuntimeReady(containerUUID);
+            break;
+         }
 			case NeuronTopic::containerStatistics:
 			{
 				// deploymentID(8) containerUUID(16) sampleTimeMs(8) [metricKey(8) metricValue(8)]...
@@ -17404,6 +20193,14 @@ addmachines_finalize:
 
 					recordContainerMetric(deploymentID, containerUUID, metricKey, sampleTimeMs, static_cast<double>(metricValue));
 					forwardMetricSampleToMaster(deploymentID, containerUUID, sampleTimeMs, metricKey, metricValue);
+
+               if (containerIt->second->applyStatefulTopologyCutoverMetric(metricKey, metricValue))
+               {
+                  if (auto deploymentIt = deployments.find(deploymentID); deploymentIt != deployments.end() && deploymentIt->second)
+                  {
+                     deploymentIt->second->containerStatefulTopologyCutoverBarrierUpdated(containerIt->second);
+                  }
+               }
 				}
 
 				break;
@@ -17442,25 +20239,28 @@ addmachines_finalize:
                      (unsigned long long)((deployments.contains(container->deploymentID) && deployments[container->deploymentID]) ? deployments[container->deploymentID]->containers.size() : 0ull));
                   std::fflush(stderr);
 
-						auto deploymentIt = deployments.find(container->deploymentID);
-						if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
-						{
-							break;
-						}
+							uint64_t waiterDeploymentID = container->destructionWaiterDeploymentID;
+							auto deploymentIt = deployments.find(waiterDeploymentID ? waiterDeploymentID : container->deploymentID);
+							if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
+							{
+								break;
+							}
 
-						ApplicationDeployment *deployment = deploymentIt->second;
-                  std::fprintf(stderr, "brain killContainerAck destroy-call uuid=%llu deploymentID=%llu waitingBefore=%llu containersBefore=%llu\n",
+							ApplicationDeployment *deployment = deploymentIt->second;
+							container->destructionWaiterDeploymentID = 0;
+	                  std::fprintf(stderr, "brain killContainerAck destroy-call uuid=%llu deploymentID=%llu waitingBefore=%llu containersBefore=%llu\n",
                      (unsigned long long)containerUUID,
                      (unsigned long long)container->deploymentID,
                      (unsigned long long)deployment->waitingOnContainers.size(),
                      (unsigned long long)deployment->containers.size());
                   std::fflush(stderr);
-						deployment->containerDestroyed(container);
-                  std::fprintf(stderr, "brain killContainerAck destroy-done uuid=%llu deploymentID=%llu waitingAfter=%llu containersAfter=%llu\n",
-                     (unsigned long long)containerUUID,
-                     (unsigned long long)container->deploymentID,
-                     (unsigned long long)deployment->waitingOnContainers.size(),
-                     (unsigned long long)deployment->containers.size());
+	                  uint64_t destroyedDeploymentID = container->deploymentID;
+							deployment->containerDestroyed(container);
+	                  std::fprintf(stderr, "brain killContainerAck destroy-done uuid=%llu deploymentID=%llu waitingAfter=%llu containersAfter=%llu\n",
+	                     (unsigned long long)containerUUID,
+	                     (unsigned long long)destroyedDeploymentID,
+	                     (unsigned long long)deployment->waitingOnContainers.size(),
+	                     (unsigned long long)deployment->containers.size());
                   std::fflush(stderr);
 
 						isMachineDrained(machine);
@@ -17484,16 +20284,29 @@ addmachines_finalize:
 
 						Machine *machine = container->machine;
 
-						// is it possible we'd ever destroy an application and orphan the containers? no right?
-						uint16_t applicationID = ApplicationConfig::extractApplicationID(container->deploymentID);
-						auto deploymentIt = deploymentsByApp.find(applicationID);
-						if (deploymentIt == deploymentsByApp.end() || deploymentIt->second == nullptr)
-						{
-							break;
-						}
-						ApplicationDeployment *deployment = deploymentIt->second;
+							ApplicationDeployment *deployment = nullptr;
+							if (auto deploymentIt = deployments.find(container->deploymentID); deploymentIt != deployments.end())
+							{
+								deployment = deploymentIt->second;
+							}
 
-					int64_t approxTimeMs;
+							// is it possible we'd ever destroy an application and orphan the containers? no right?
+							uint16_t applicationID = ApplicationConfig::extractApplicationID(container->deploymentID);
+							if (deployment == nullptr)
+							{
+								auto deploymentIt = deploymentsByApp.find(applicationID);
+								if (deploymentIt != deploymentsByApp.end())
+								{
+									deployment = deploymentIt->second;
+								}
+							}
+
+							if (deployment == nullptr)
+							{
+								break;
+							}
+
+						int64_t approxTimeMs;
 					Message::extractArg<ArgumentNature::fixed>(args, approxTimeMs);
 
 					int signal;

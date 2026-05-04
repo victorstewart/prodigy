@@ -35,11 +35,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS ON)
 
 option(PROJECT_ENABLE_TESTS "Build Prodigy dev tests" ON)
-option(
-   PRODIGY_ENABLE_LEGACY_NATIVE_CONTAINER_PROBES
-   "Build legacy native probe containers that still depend on the old NeuronHub runtime path"
-   OFF
-)
 set(
    PRODIGY_DEV_BASICS_SOURCE_MODE
    "LOCAL"
@@ -370,28 +365,28 @@ file(GLOB DISCOMBOBULATOR_SOURCE_FILES CONFIGURE_DEPENDS
 add_executable(prodigy ${PRODIGY_ROOT}/prodigy/prodigy.cpp)
 add_executable(mothership ${PRODIGY_ROOT}/prodigy/mothership/mothership.cpp)
 add_executable(prodigy_ready_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/ready_container.cpp)
-set(PRODIGY_LEGACY_NATIVE_CONTAINER_PROBE_TARGETS)
-if (PRODIGY_ENABLE_LEGACY_NATIVE_CONTAINER_PROBES)
-   add_executable(prodigy_pingpong_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
-   add_executable(prodigy_pingpong_container_alt ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
-   add_executable(prodigy_pingpong_container_noport ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
-   add_executable(prodigy_pingpong_container_google_egress ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
-   add_executable(prodigy_whitehole_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/whitehole_probe_container.cpp)
-   add_executable(prodigy_quic_wormhole_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/quic_wormhole_probe_container.cpp)
-   set(
-      PRODIGY_LEGACY_NATIVE_CONTAINER_PROBE_TARGETS
-      prodigy_pingpong_container
-      prodigy_pingpong_container_alt
-      prodigy_pingpong_container_noport
-      prodigy_pingpong_container_google_egress
-      prodigy_whitehole_probe_container
-      prodigy_quic_wormhole_probe_container
-   )
-endif()
+add_executable(prodigy_pingpong_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
+add_executable(prodigy_pingpong_container_alt ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
+add_executable(prodigy_pingpong_container_noport ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
+add_executable(prodigy_pingpong_container_crash ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
+add_executable(prodigy_pingpong_container_google_egress ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
+add_executable(prodigy_whitehole_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/whitehole_probe_container.cpp)
+add_executable(prodigy_quic_wormhole_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/quic_wormhole_probe_container.cpp)
+set(
+   PRODIGY_RUNTIME_CONTAINER_PROBE_TARGETS
+   prodigy_pingpong_container
+   prodigy_pingpong_container_alt
+   prodigy_pingpong_container_noport
+   prodigy_pingpong_container_crash
+   prodigy_pingpong_container_google_egress
+   prodigy_whitehole_probe_container
+   prodigy_quic_wormhole_probe_container
+)
 add_executable(prodigy_gpu_device_mount_smoke ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_gpu_device_mount_smoke.cpp)
 add_executable(prodigy_shared_cpu_affinity_seccomp_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_shared_cpu_affinity_seccomp_unit.cpp)
 add_executable(prodigy_metrics_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_metrics_unit.cpp)
 add_executable(prodigy_wire_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_wire_unit.cpp)
+add_executable(prodigy_sdk_c_selftest ${PRODIGY_ROOT}/prodigy/sdk/c/prodigy_neuron_hub_selftest.c)
 add_executable(prodigy_sdk_cpp_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_sdk_cpp_unit.cpp)
 add_executable(prodigy_mesh_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mesh_unit.cpp)
 add_executable(prodigy_deployments_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_deployments_unit.cpp)
@@ -443,7 +438,7 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy
    mothership
    prodigy_ready_container
-   ${PRODIGY_LEGACY_NATIVE_CONTAINER_PROBE_TARGETS}
+   ${PRODIGY_RUNTIME_CONTAINER_PROBE_TARGETS}
    prodigy_gpu_device_mount_smoke
    prodigy_shared_cpu_affinity_seccomp_unit
    prodigy_metrics_unit
@@ -563,6 +558,7 @@ endforeach()
 if (NOT TARGET Prodigy::SdkCppOpinionated)
    message(FATAL_ERROR "Prodigy dev requires Prodigy::SdkCppOpinionated for the SDK-owned neuron hub fixture coverage.")
 endif()
+target_link_libraries(prodigy_sdk_c_selftest PRIVATE Prodigy::SdkC)
 target_link_libraries(prodigy_sdk_cpp_unit PRIVATE Prodigy::SdkCppOpinionated)
 
 set(PRODIGY_PTHREAD_TARGETS ${PRODIGY_ALL_BUILD_TARGETS})
@@ -578,16 +574,16 @@ target_compile_definitions(prodigy_ready_container PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_bundle_artifact_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
 target_compile_definitions(prodigy_mothership_cluster_report_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}" PRODIGY_ROOT_DIR="${PRODIGY_ROOT}")
 target_compile_definitions(prodigy_mothership_restart_persistence_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
-if (PRODIGY_ENABLE_LEGACY_NATIVE_CONTAINER_PROBES)
-   target_compile_definitions(prodigy_pingpong_container PUBLIC PRODIGY_DEBUG=1)
-   target_compile_definitions(prodigy_pingpong_container_alt PUBLIC PRODIGY_DEBUG=1 PRODIGY_PINGPONG_DEFAULT_PORT=19091)
-   target_compile_definitions(prodigy_pingpong_container_noport PUBLIC PRODIGY_DEBUG=1 PRODIGY_PINGPONG_DISABLE_SERVER=1)
-   target_compile_definitions(prodigy_pingpong_container_google_egress PUBLIC PRODIGY_DEBUG=1 PRODIGY_PINGPONG_REQUIRE_GOOGLE_EGRESS=1)
-endif()
+target_compile_definitions(prodigy_pingpong_container PUBLIC PRODIGY_DEBUG=1)
+target_compile_definitions(prodigy_pingpong_container_alt PUBLIC PRODIGY_DEBUG=1 PRODIGY_PINGPONG_DEFAULT_PORT=19091)
+target_compile_definitions(prodigy_pingpong_container_noport PUBLIC PRODIGY_DEBUG=1 PRODIGY_PINGPONG_DISABLE_SERVER=1)
+target_compile_definitions(prodigy_pingpong_container_crash PUBLIC PRODIGY_DEBUG=1 PRODIGY_PINGPONG_CRASH_ON_START=1)
+target_compile_definitions(prodigy_pingpong_container_google_egress PUBLIC PRODIGY_DEBUG=1 PRODIGY_PINGPONG_REQUIRE_GOOGLE_EGRESS=1)
 target_compile_definitions(prodigy_gpu_device_mount_smoke PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_shared_cpu_affinity_seccomp_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_metrics_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_wire_unit PUBLIC PRODIGY_DEBUG=1)
+target_compile_definitions(prodigy_sdk_c_selftest PUBLIC PRODIGY_SDK_FIXTURES_DIR="${PRODIGY_ROOT}/prodigy/sdk/fixtures")
 target_compile_definitions(prodigy_sdk_cpp_unit PUBLIC PRODIGY_DEBUG=1 PRODIGY_SDK_FIXTURE_DIR="${PRODIGY_ROOT}/prodigy/sdk/fixtures")
 target_compile_definitions(prodigy_mesh_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_deployments_unit PUBLIC PRODIGY_DEBUG=1)
@@ -608,18 +604,18 @@ endif()
 target_compile_options(prodigy PUBLIC -O2) # -g -flto
 target_compile_options(mothership PUBLIC -O2) # -g -flto
 target_compile_options(prodigy_ready_container PUBLIC -O2)
-if (PRODIGY_ENABLE_LEGACY_NATIVE_CONTAINER_PROBES)
-   target_compile_options(prodigy_pingpong_container PUBLIC -O2)
-   target_compile_options(prodigy_pingpong_container_alt PUBLIC -O2)
-   target_compile_options(prodigy_pingpong_container_noport PUBLIC -O2)
-   target_compile_options(prodigy_pingpong_container_google_egress PUBLIC -O2)
-   target_compile_options(prodigy_whitehole_probe_container PUBLIC -O2)
-   target_compile_options(prodigy_quic_wormhole_probe_container PUBLIC -O2)
-endif()
+target_compile_options(prodigy_pingpong_container PUBLIC -O2)
+target_compile_options(prodigy_pingpong_container_alt PUBLIC -O2)
+target_compile_options(prodigy_pingpong_container_noport PUBLIC -O2)
+target_compile_options(prodigy_pingpong_container_crash PUBLIC -O2)
+target_compile_options(prodigy_pingpong_container_google_egress PUBLIC -O2)
+target_compile_options(prodigy_whitehole_probe_container PUBLIC -O2)
+target_compile_options(prodigy_quic_wormhole_probe_container PUBLIC -O2)
 target_compile_options(prodigy_gpu_device_mount_smoke PUBLIC -O2)
 target_compile_options(prodigy_shared_cpu_affinity_seccomp_unit PUBLIC -O2)
 target_compile_options(prodigy_metrics_unit PUBLIC -O2)
 target_compile_options(prodigy_wire_unit PUBLIC -O2)
+target_compile_options(prodigy_sdk_c_selftest PUBLIC -O2)
 target_compile_options(prodigy_sdk_cpp_unit PUBLIC -O2)
 target_compile_options(prodigy_mesh_unit PUBLIC -O2)
 target_compile_options(prodigy_deployments_unit PUBLIC -O2)
@@ -709,6 +705,13 @@ add_custom_command(OUTPUT host.ingress.router.ebpf.o
 
 add_custom_target(host_ingress_router ALL DEPENDS host.ingress.router.ebpf.o)
 
+add_custom_command(OUTPUT host.ingress.router.dev.ebpf.o
+                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" -g -O2 -target bpf -I${PRODIGY_ROOT} ${PRODIGY_EBPF_INCLUDE_ARGS} -DPRODIGY_DEBUG=1 -DNAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE=1 -MMD -MF host.ingress.router.dev.ebpf.o.d -c ${PRODIGY_ROOT}/switchboard/kernel/host.ingress.router.ebpf.c -o host.ingress.router.dev.ebpf.o
+                   DEPENDS ${PRODIGY_ROOT}/switchboard/kernel/host.ingress.router.ebpf.c
+                   DEPFILE host.ingress.router.dev.ebpf.o.d)
+
+add_custom_target(host_ingress_router_dev DEPENDS host.ingress.router.dev.ebpf.o)
+
 add_custom_command(OUTPUT host.egress.router.ebpf.o
                    COMMAND "${PRODIGY_CLANG_EXECUTABLE}" -g -O2 -target bpf -I${PRODIGY_ROOT} ${PRODIGY_EBPF_INCLUDE_ARGS} -DPRODIGY_DEBUG=1 -MMD -MF host.egress.router.ebpf.o.d -c ${PRODIGY_ROOT}/switchboard/kernel/host.egress.router.ebpf.c -o host.egress.router.ebpf.o
                    DEPENDS ${PRODIGY_ROOT}/switchboard/kernel/host.egress.router.ebpf.c
@@ -735,6 +738,7 @@ add_dependencies(prodigy_container_overlay_sync_unit
 
 add_dependencies(prodigy_switchboard_whitehole_unit
    host_ingress_router
+   host_ingress_router_dev
    host_egress_router)
 
 # Build the boundary fake-ipv4 NAT object used by netns ingress/egress testing.
@@ -906,18 +910,17 @@ if (PROJECT_ENABLE_TESTS)
       NAME prodigy_dev_master_failure_matrix_full
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_master_failure_matrix.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership --mode=full
    )
+   set_tests_properties(prodigy_dev_master_failure_matrix_full PROPERTIES TIMEOUT 3600)
 
    add_test(
       NAME prodigy_dev_master_upgrade_sim
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_master_upgrade_sim.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership
    )
 
-   if (PRODIGY_ENABLE_LEGACY_NATIVE_CONTAINER_PROBES)
-      add_test(
-         NAME prodigy_dev_pingpong_deploy_smoke
-         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_pingpong_deploy_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container
-      )
-   endif()
+   add_test(
+      NAME prodigy_dev_pingpong_deploy_smoke
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_pingpong_deploy_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container
+   )
 
    add_test(
       NAME prodigy_dev_sdk_mesh_e2e_matrix_smoke
@@ -929,64 +932,75 @@ if (PROJECT_ENABLE_TESTS)
 
 
 
-   if (PRODIGY_ENABLE_LEGACY_NATIVE_CONTAINER_PROBES)
-      add_test(
-         NAME prodigy_dev_whitehole_fake_ipv4_smoke
-         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_whitehole_fake_ipv4_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_whitehole_probe_container
-      )
+   add_test(
+      NAME prodigy_dev_whitehole_fake_ipv4_smoke
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_whitehole_fake_ipv4_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_whitehole_probe_container
+   )
+   set_tests_properties(prodigy_dev_whitehole_fake_ipv4_smoke PROPERTIES SKIP_RETURN_CODE 77)
 
-      add_test(
-         NAME prodigy_dev_whitehole_host_ipv4_smoke
-         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_whitehole_host_ipv4_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_whitehole_probe_container
-      )
+   add_test(
+      NAME prodigy_dev_whitehole_host_ipv4_smoke
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_whitehole_host_ipv4_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_whitehole_probe_container
+   )
+   set_tests_properties(prodigy_dev_whitehole_host_ipv4_smoke PROPERTIES SKIP_RETURN_CODE 77)
 
-      add_test(
-         NAME prodigy_dev_autoscale_metrics_smoke
-         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_autoscale_metrics_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container
-      )
+   add_test(
+      NAME prodigy_dev_autoscale_metrics_smoke
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_autoscale_metrics_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container
+   )
 
-      add_test(
-         NAME prodigy_dev_storage_multidrive_resize_smoke
-         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_storage_multidrive_resize_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container
-      )
+   add_test(
+      NAME prodigy_dev_storage_multidrive_resize_smoke
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_storage_multidrive_resize_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container
+   )
 
-      add_test(
-         NAME prodigy_dev_autoscale_ingress_composite_smoke
-         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_autoscale_ingress_composite_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container
-      )
-   endif()
+   add_test(
+      NAME prodigy_dev_autoscale_ingress_composite_smoke
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_autoscale_ingress_composite_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container
+   )
 
    add_test(
       NAME prodigy_dev_autoscale_schema_contract
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_autoscale_schema_contract.sh ${CMAKE_BINARY_DIR}/mothership
    )
 
-   if (PRODIGY_ENABLE_LEGACY_NATIVE_CONTAINER_PROBES)
-      add_test(
-         NAME prodigy_dev_autoscale_runtime_matrix
-         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_autoscale_runtime_matrix.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container
-      )
+   add_test(
+      NAME prodigy_dev_autoscale_runtime_matrix
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_autoscale_runtime_matrix.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container
+   )
 
-      add_test(
-         NAME prodigy_dev_container_migration_matrix
-         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_container_migration_matrix.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container
-      )
+   add_test(
+      NAME prodigy_dev_container_migration_matrix
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_container_migration_matrix.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container
+   )
 
-      add_test(
-         NAME prodigy_dev_quic_wormhole_smoke
-         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_quic_wormhole_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_quic_wormhole_probe_container
-      )
+add_test(
+   NAME prodigy_dev_stateful_topology_upgrade_matrix
+   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_stateful_topology_upgrade_matrix.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container_noport
+)
+set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1600)
 
-      add_test(
-         NAME prodigy_dev_deployments_matrix_smoke
-         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_deployments_matrix.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container ${CMAKE_BINARY_DIR}/prodigy_pingpong_container_alt ${CMAKE_BINARY_DIR}/prodigy_pingpong_container_noport --mode=smoke
-      )
+   add_test(
+      NAME prodigy_dev_os_update_reimage_matrix
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_os_update_reimage_matrix.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership
+   )
+   set_tests_properties(prodigy_dev_os_update_reimage_matrix PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
 
-      add_test(
-         NAME prodigy_dev_deployments_matrix_ci
-         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_deployments_matrix.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container ${CMAKE_BINARY_DIR}/prodigy_pingpong_container_alt ${CMAKE_BINARY_DIR}/prodigy_pingpong_container_noport --mode=ci
-      )
-   endif()
+   add_test(
+      NAME prodigy_dev_quic_wormhole_smoke
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_quic_wormhole_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_quic_wormhole_probe_container
+   )
+   set_tests_properties(prodigy_dev_quic_wormhole_smoke PROPERTIES SKIP_RETURN_CODE 77)
+
+   add_test(
+      NAME prodigy_dev_deployments_matrix_smoke
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_deployments_matrix.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container ${CMAKE_BINARY_DIR}/prodigy_pingpong_container_alt ${CMAKE_BINARY_DIR}/prodigy_pingpong_container_noport ${CMAKE_BINARY_DIR}/prodigy_pingpong_container_crash --mode=smoke
+   )
+
+   add_test(
+      NAME prodigy_dev_deployments_matrix_ci
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_deployments_matrix.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container ${CMAKE_BINARY_DIR}/prodigy_pingpong_container_alt ${CMAKE_BINARY_DIR}/prodigy_pingpong_container_noport ${CMAKE_BINARY_DIR}/prodigy_pingpong_container_crash --mode=ci
+   )
 
    add_test(
       NAME prodigy_shared_cpu_affinity_seccomp_unit
@@ -1006,6 +1020,11 @@ if (PROJECT_ENABLE_TESTS)
    add_test(
       NAME prodigy_dev_sdk_cpp_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_sdk_cpp_unit
+   )
+
+   add_test(
+      NAME prodigy_dev_sdk_c_selftest
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_sdk_c_selftest
    )
 
    add_test(
@@ -1087,6 +1106,51 @@ if (PROJECT_ENABLE_TESTS)
       )
    endif()
 
+   set(_prodigy_runtime_harness_test_candidates
+      prodigy_dev_hostns_fail_closed
+      prodigy_dev_single_ns_safety
+      prodigy_dev_bpffs_mount_unit
+      prodigy_dev_overlay_link_mtu_unit
+      prodigy_dev_host_tcp_unit
+      prodigy_dev_runtime_bundle_refresh_unit
+      prodigy_dev_container_netkit_mtu_unit
+      prodigy_dev_accepted_fixed_file_sender_unit
+      prodigy_dev_single_ns_mothership_boot
+      prodigy_dev_test_cluster_membership_smoke
+      prodigy_dev_three_ns_boot
+      prodigy_dev_master_failure_matrix_smoke
+      prodigy_dev_master_failure_matrix_full
+      prodigy_dev_master_upgrade_sim
+      prodigy_dev_pingpong_deploy_smoke
+      prodigy_dev_sdk_mesh_e2e_matrix_smoke
+      prodigy_dev_whitehole_fake_ipv4_smoke
+      prodigy_dev_whitehole_host_ipv4_smoke
+      prodigy_dev_autoscale_metrics_smoke
+      prodigy_dev_storage_multidrive_resize_smoke
+      prodigy_dev_autoscale_ingress_composite_smoke
+      prodigy_dev_autoscale_runtime_matrix
+      prodigy_dev_container_migration_matrix
+      prodigy_dev_stateful_topology_upgrade_matrix
+      prodigy_dev_os_update_reimage_matrix
+      prodigy_dev_quic_wormhole_smoke
+      prodigy_dev_deployments_matrix_smoke
+      prodigy_dev_deployments_matrix_ci
+      prodigy_host_egress_bpf_load_smoke
+   )
+   set(_prodigy_runtime_harness_tests)
+   foreach(_prodigy_test_name IN LISTS _prodigy_runtime_harness_test_candidates)
+      if (TEST ${_prodigy_test_name})
+         list(APPEND _prodigy_runtime_harness_tests ${_prodigy_test_name})
+      endif()
+   endforeach()
+   if (_prodigy_runtime_harness_tests)
+      set_tests_properties(
+         ${_prodigy_runtime_harness_tests}
+         PROPERTIES
+         RESOURCE_LOCK prodigy_runtime_harness
+      )
+   endif()
+
    add_test(
       NAME prodigy_dev_mesh_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_mesh_unit
@@ -1154,6 +1218,7 @@ if (PROJECT_ENABLE_TESTS)
       NAME prodigy_container_overlay_sync_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_container_overlay_sync_unit
    )
+   set_tests_properties(prodigy_container_overlay_sync_unit PROPERTIES SKIP_RETURN_CODE 77)
    add_test(
       NAME prodigy_brain_overlay_hosted_ingress_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_brain_overlay_hosted_ingress_unit
@@ -1162,6 +1227,7 @@ if (PROJECT_ENABLE_TESTS)
       NAME prodigy_switchboard_whitehole_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_switchboard_whitehole_unit
    )
+   set_tests_properties(prodigy_switchboard_whitehole_unit PROPERTIES SKIP_RETURN_CODE 77)
    add_test(
       NAME prodigy_host_egress_bpf_load_smoke
       COMMAND
@@ -1169,6 +1235,7 @@ if (PROJECT_ENABLE_TESTS)
          ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_host_egress_bpf_load_smoke.sh
          ${CMAKE_BINARY_DIR}/host.egress.router.ebpf.o
    )
+   set_tests_properties(prodigy_host_egress_bpf_load_smoke PROPERTIES SKIP_RETURN_CODE 77)
 
    add_test(
       NAME prodigy_quic_cid_unit

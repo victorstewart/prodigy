@@ -11,7 +11,10 @@
 #include <utility>
 #include <poll.h>
 #include <sys/eventfd.h>
+#include <sys/syscall.h>
 #include <sys/utsname.h>
+#include <sys/wait.h>
+#include <spawn.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -61,6 +64,17 @@ public:
 
 class Neuron : public NeuronBase, public RingInterface {
 protected:
+
+      class OSUpdateProcess : public SocketBase
+      {
+      public:
+
+         pid_t pid = -1;
+         bool active = false;
+         bool pollQueued = false;
+         String targetOSID;
+         String targetOSVersionID;
+      };
 
       struct LocalWhiteholeBindingEntry {
 
@@ -204,7 +218,7 @@ protected:
 		template <typename T>
 		static void queueCloseIfActive(T *stream)
 		{
-			if (rawStreamIsActive(stream) == false)
+			if (rawStreamIsActive(stream) == false || Ring::socketIsClosing(stream))
 			{
 				return;
 			}
@@ -426,10 +440,20 @@ protected:
          }
 
          syncWhiteholeBindingsProgram();
+
+         if (Container *container = findTrackedContainerByLocalID(containerID))
+         {
+            container->syncPeerWhiteholeBindingsFrom(whiteholes);
+         }
       }
 
       void closeLocalWhiteholesToContainer(uint32_t containerID)
       {
+         if (Container *container = findTrackedContainerByLocalID(containerID))
+         {
+            container->clearPeerWhiteholeBindings();
+         }
+
          whiteholeBindingsByContainer.erase(containerID);
          syncWhiteholeBindingsProgram();
       }
@@ -725,6 +749,7 @@ protected:
       {
          DeferredHardwareInventoryResult result = {};
          ProdigyMachineHardwareCollectorOptions hardwareCollectorOptions = {};
+         hardwareCollectorOptions.allowLocalCommands = false;
          hardwareCollectorOptions.collectOptionalBenchmarks = false;
          prodigyCollectMachineHardwareProfile(result.hardware, hardwareCollectorOptions);
          serializeMachineHardwareProfileForBrainTransport(result.hardware, result.serializedHardwareProfile);
@@ -847,10 +872,10 @@ protected:
          return true;
       }
 
-      void appendInitialBrainControlFrames(String& outbound)
-      {
-         Message::construct(outbound, NeuronTopic::registration, bootTimeMs, kernel, haveFragments());
-      }
+	      void appendInitialBrainControlFrames(String& outbound)
+	      {
+	         Message::construct(outbound, NeuronTopic::registration, bootTimeMs, kernel, osID, osVersionID, haveFragments());
+	      }
 
       uint32_t appendHealthyContainerFrames(String& outbound)
       {
@@ -1758,22 +1783,113 @@ protected:
 			return false;
 		}
 
-	void loadKernelVersion(void)
-	{
-		struct utsname buffer;
-		uname(&buffer);
+		void loadKernelVersion(void)
+		{
+			struct utsname buffer;
+			uname(&buffer);
 
-		kernel.assign(buffer.release); // 6.10.1-1453.native
-		// kernel.resize(kernel.findChar('-'));
-	}
+			kernel.assign(buffer.release); // 6.10.1-1453.native
+			// kernel.resize(kernel.findChar('-'));
+		}
 
-   Switchboard *ensureSwitchboard(void)
+	      static bool parseOSReleaseValue(const String& osRelease, const char *key, String& parsed)
+	      {
+	         parsed.clear();
+	         if (key == nullptr)
+	         {
+	            return false;
+	         }
+
+	         uint64_t keySize = strlen(key);
+	         for (uint64_t start = 0; start < osRelease.size(); )
+	         {
+	            uint64_t end = start;
+	            while (end < osRelease.size() && osRelease[end] != '\n')
+	            {
+	               end += 1;
+	            }
+
+	            if (end - start > keySize
+	               && memcmp(osRelease.data() + start, key, keySize) == 0
+	               && osRelease[start + keySize] == '=')
+	            {
+	               uint64_t valueStart = start + keySize + 1;
+	               uint64_t valueEnd = end;
+	               if (valueStart < valueEnd && osRelease[valueStart] == '"')
+	               {
+	                  valueStart += 1;
+	                  if (valueEnd > valueStart && osRelease[valueEnd - 1] == '"')
+	                  {
+	                     valueEnd -= 1;
+	                  }
+	               }
+
+	               if (valueStart == valueEnd)
+	               {
+	                  return false;
+	               }
+
+	               parsed.assign(osRelease.substr(valueStart, valueEnd - valueStart, Copy::yes));
+	               return parsed.size() > 0;
+	            }
+
+	            start = (end < osRelease.size()) ? end + 1 : end;
+	         }
+
+	         return false;
+	      }
+
+	      static bool parseOSReleaseMetadata(const String& osRelease, String& parsedOSID, String& parsedOSVersionID)
+	      {
+	         bool haveID = parseOSReleaseValue(osRelease, "ID", parsedOSID);
+	         bool haveVersionID = parseOSReleaseValue(osRelease, "VERSION_ID", parsedOSVersionID);
+	         return haveID || haveVersionID;
+	      }
+
+		      void loadOSReleaseMetadata(void)
+		      {
+		         osID.clear();
+		         osVersionID.clear();
+		         String osRelease = {};
+
+	         const char *devMode = std::getenv("PRODIGY_DEV_MODE");
+	         const char *devOSReleasePath = std::getenv("PRODIGY_DEV_OS_RELEASE_PATH");
+	         if (devMode != nullptr
+	            && devMode[0] != '\0'
+	            && devMode[0] != '0'
+	            && devOSReleasePath != nullptr
+	            && devOSReleasePath[0] != '\0')
+	         {
+	            String path = {};
+	            path.assign(devOSReleasePath);
+	            Filesystem::openReadAtClose(-1, path, osRelease);
+	            if (parseOSReleaseMetadata(osRelease, osID, osVersionID))
+	            {
+	               return;
+	            }
+
+	            osRelease.clear();
+	         }
+
+		         Filesystem::openReadAtClose(-1, "/usr/lib/os-release"_ctv, osRelease);
+		         if (parseOSReleaseMetadata(osRelease, osID, osVersionID))
+		         {
+	            return;
+	         }
+
+	         osRelease.clear();
+	         Filesystem::openReadAtClose(-1, "/etc/os-release"_ctv, osRelease);
+	         (void)parseOSReleaseMetadata(osRelease, osID, osVersionID);
+	      }
+
+	   Switchboard *ensureSwitchboard(void)
    {
       if (!switchboard)
       {
          switchboard = std::make_unique<Switchboard>(eth);
       }
 
+      switchboard->setHostIngressRouter(tcx_ingress_program);
       switchboard->setHostEgressRouter(tcx_egress_program);
 
       return switchboard.get();
@@ -1823,6 +1939,21 @@ protected:
       // runtime immediately, not just the broader switchboard state, so the
       // first reply packets after a live refresh cannot miss the egress binding.
       syncContainerSwitchboardRuntime(container);
+   }
+
+   void openWhiteholesForLocalContainer(uint8_t fragment, const Vector<Whitehole>& whiteholes) override
+   {
+      if (whiteholes.empty())
+      {
+         return;
+      }
+
+      openLocalWhiteholes(generateLocalContainerID(fragment), whiteholes);
+   }
+
+   void closeWhiteholesForLocalContainer(uint8_t fragment) override
+   {
+      closeLocalWhiteholesToContainer(generateLocalContainerID(fragment));
    }
 
    void syncContainerSwitchboardRuntime(Container *container) override
@@ -1967,6 +2098,7 @@ protected:
 
 	      if (switchboard)
 	      {
+         switchboard->setHostIngressRouter(tcx_ingress_program);
          switchboard->setHostEgressRouter(tcx_egress_program);
          switchboard->setLocalContainerSubnet(lcsubnet6);
       }
@@ -1984,7 +2116,16 @@ protected:
          if (haveFragments() == false)
          {
             if (failureReport) failureReport->assign("neuron has no assigned fragment yet"_ctv);
-            basics_log("ensureHostNetworkingReady failed reason=no-fragment ifidx=%d\n", eth.ifidx);
+            basics_log("ensureHostNetworkingReady failed reason=no-fragment ifidx=%d dpfx=%u mpfx=%u.%u.%u brainPresent=%d brainActive=%d fd=%d fslot=%d\n",
+               eth.ifidx,
+               unsigned(lcsubnet6.dpfx),
+               unsigned(lcsubnet6.mpfx[0]),
+               unsigned(lcsubnet6.mpfx[1]),
+               unsigned(lcsubnet6.mpfx[2]),
+               int(brain != nullptr),
+               int(brain && streamIsActive(brain)),
+               (brain ? brain->fd : -1),
+               (brain ? brain->fslot : -1));
             return false;
          }
 
@@ -2029,21 +2170,259 @@ protected:
          return true;
       }
 
-		public:
+			public:
 
-		String kernel;
+						bool isBrain;
+					TCPSocket brainListener;
+						NeuronBrainControlStream *brain = nullptr;
+	               bytell_hash_set<NeuronBrainControlStream *> closingBrainControls;
+               OSUpdateProcess osUpdateProcess;
 
-			int64_t bootTimeMs;
+      static void resetSignalForOSUpdateChild(int signal)
+      {
+         struct sigaction action = {};
+         action.sa_handler = SIG_DFL;
+         sigemptyset(&action.sa_mask);
+         (void)sigaction(signal, &action, nullptr);
+      }
 
-				bool isBrain;
-				TCPSocket brainListener;
-					NeuronBrainControlStream *brain = nullptr;
-               bytell_hash_set<NeuronBrainControlStream *> closingBrainControls;
+      static void closeOSUpdateChildFDs(void)
+      {
+#ifdef SYS_close_range
+         if (syscall(SYS_close_range, 3u, ~0u, 0u) == 0)
+         {
+            return;
+         }
+#endif
+         for (int fd = 3; fd < 4096; ++fd)
+         {
+            (void)syscall(SYS_close, fd);
+         }
+      }
 
-		virtual void boot(void)
-		{
-		loadKernelVersion();
-		bootTimeMs = Time::msSinceBoot();
+      static int openOSUpdateChildFile(const char *path, int flags, mode_t mode = 0)
+      {
+         return int(syscall(SYS_openat, AT_FDCWD, path, flags, mode));
+      }
+
+      static void execOSUpdateChild(
+         const char *shellPath,
+         char * const *argv,
+         char * const *envp)
+      {
+         sigset_t emptyMask = {};
+         sigemptyset(&emptyMask);
+         (void)sigprocmask(SIG_SETMASK, &emptyMask, nullptr);
+         resetSignalForOSUpdateChild(SIGCHLD);
+         resetSignalForOSUpdateChild(SIGTERM);
+         resetSignalForOSUpdateChild(SIGINT);
+         resetSignalForOSUpdateChild(SIGHUP);
+
+         int nullFD = openOSUpdateChildFile("/dev/null", O_RDONLY | O_CLOEXEC);
+         if (nullFD >= 0)
+         {
+            (void)syscall(SYS_dup2, nullFD, STDIN_FILENO);
+            if (nullFD > STDERR_FILENO)
+            {
+               (void)syscall(SYS_close, nullFD);
+            }
+         }
+
+         int logFD = openOSUpdateChildFile("/var/log/prodigy/os-update.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+         if (logFD >= 0)
+         {
+            (void)syscall(SYS_dup2, logFD, STDOUT_FILENO);
+            (void)syscall(SYS_dup2, logFD, STDERR_FILENO);
+            if (logFD > STDERR_FILENO)
+            {
+               (void)syscall(SYS_close, logFD);
+            }
+         }
+
+         closeOSUpdateChildFDs();
+         (void)syscall(SYS_execve, shellPath, argv, envp);
+         (void)syscall(SYS_exit, 127);
+         __builtin_unreachable();
+      }
+
+      static pid_t forkOSUpdateLauncher(
+         const char *shellPath,
+         char * const *argv,
+         char * const *envp)
+      {
+         pid_t launcher = fork();
+         if (launcher != 0)
+         {
+            return launcher;
+         }
+
+         pid_t command = fork();
+         if (command < 0)
+         {
+            (void)syscall(SYS_exit, 126);
+         }
+
+         if (command > 0)
+         {
+            (void)syscall(SYS_exit, 0);
+         }
+
+         (void)setsid();
+         execOSUpdateChild(shellPath, argv, envp);
+         __builtin_unreachable();
+      }
+
+      void clearOSUpdateProcess(void)
+      {
+         if (osUpdateProcess.fd >= 0)
+         {
+            (void)::close(osUpdateProcess.fd);
+         }
+
+         osUpdateProcess.fd = -1;
+         osUpdateProcess.pid = -1;
+         osUpdateProcess.active = false;
+         osUpdateProcess.pollQueued = false;
+         osUpdateProcess.targetOSID.clear();
+         osUpdateProcess.targetOSVersionID.clear();
+      }
+
+	      virtual bool startOperatingSystemUpdate(const String& targetOSID, const String& targetOSVersionID, const String& updateCommand, String *failure = nullptr)
+	      {
+	         if (failure)
+	         {
+	            failure->clear();
+	         }
+
+	         if (targetOSID.size() == 0)
+	         {
+	            if (failure) failure->assign("target OS ID is empty"_ctv);
+	            return false;
+	         }
+
+	         if (targetOSVersionID.size() == 0)
+	         {
+	            if (failure) failure->assign("target OS VERSION_ID is empty"_ctv);
+	            return false;
+	         }
+
+		         if (updateCommand.size() == 0)
+		         {
+		            if (failure) failure->assign("OS update command is empty"_ctv);
+		            return false;
+		         }
+
+		         String targetOSIDText = {};
+		         String targetOSVersionIDText = {};
+		         String updateCommandText = {};
+		         targetOSIDText.assign(targetOSID);
+		         targetOSVersionIDText.assign(targetOSVersionID);
+		         updateCommandText.assign(updateCommand);
+
+            if (osUpdateProcess.active)
+            {
+               if (failure)
+               {
+                  failure->snprintf<"OS update command already running pid={itoa}"_ctv>(int(osUpdateProcess.pid));
+               }
+               return false;
+            }
+
+		         std::error_code createLogDirError = {};
+	         std::filesystem::create_directories("/var/log/prodigy", createLogDirError);
+
+		         String command = {};
+		         command.assign(updateCommandText);
+            const char *shellPath = "/bin/sh";
+            if (access(shellPath, X_OK) != 0)
+            {
+               shellPath = "/usr/bin/sh";
+            }
+            if (access(shellPath, X_OK) != 0)
+            {
+               if (failure) failure->assign("missing executable /bin/sh or /usr/bin/sh for OS update command"_ctv);
+               return false;
+            }
+
+	         char *argv[] = {
+	            const_cast<char *>("sh"),
+	            const_cast<char *>("-c"),
+	            const_cast<char *>(command.c_str()),
+	            nullptr
+	         };
+	         extern char **environ;
+	         std::vector<std::string> envStorage = {};
+	         for (char **entry = environ; entry != nullptr && *entry != nullptr; ++entry)
+	         {
+	            if (strncmp(*entry, "PRODIGY_TARGET_OS_ID=", 21) == 0
+	               || strncmp(*entry, "PRODIGY_TARGET_OS_VERSION_ID=", 29) == 0
+	               || strncmp(*entry, "PRODIGY_CURRENT_OS_ID=", 22) == 0
+	               || strncmp(*entry, "PRODIGY_CURRENT_OS_VERSION_ID=", 30) == 0)
+	            {
+	               continue;
+	            }
+
+	            envStorage.emplace_back(*entry);
+	         }
+		         envStorage.emplace_back(std::string("PRODIGY_TARGET_OS_ID=") + targetOSIDText.c_str());
+		         envStorage.emplace_back(std::string("PRODIGY_TARGET_OS_VERSION_ID=") + targetOSVersionIDText.c_str());
+	         envStorage.emplace_back(std::string("PRODIGY_CURRENT_OS_ID=") + osID.c_str());
+	         envStorage.emplace_back(std::string("PRODIGY_CURRENT_OS_VERSION_ID=") + osVersionID.c_str());
+	         std::vector<char *> envp = {};
+	         envp.reserve(envStorage.size() + 1);
+	         for (std::string& value : envStorage)
+	         {
+	            envp.push_back(value.data());
+	         }
+	         envp.push_back(nullptr);
+
+            pid_t pid = forkOSUpdateLauncher(shellPath, argv, envp.data());
+
+            if (pid < 0)
+            {
+               if (failure)
+               {
+                  failure->snprintf<"failed to start OS update command errno={itoa}({})"_ctv>(uint32_t(errno), String(strerror(errno)));
+               }
+               return false;
+            }
+
+            osUpdateProcess.pid = pid;
+            osUpdateProcess.active = true;
+            osUpdateProcess.pollQueued = false;
+            osUpdateProcess.fd = int(syscall(SYS_pidfd_open, pid, 0));
+            if (osUpdateProcess.fd >= 0)
+            {
+               osUpdateProcess.setNonBlocking();
+            }
+            osUpdateProcess.targetOSID.assign(targetOSIDText);
+            osUpdateProcess.targetOSVersionID.assign(targetOSVersionIDText);
+            if (osUpdateProcess.fd >= 0)
+            {
+               Ring::queuePollProcessFD(&osUpdateProcess, osUpdateProcess.fd, false, POLLIN);
+               osUpdateProcess.pollQueued = true;
+            }
+
+			         std::fprintf(stderr,
+			            "neuron updateOS started targetOSID=%s targetOSVersionID=%s launcherPid=%lld pidfd=%d\n",
+			            targetOSIDText.c_str(),
+			            targetOSVersionIDText.c_str(),
+			            (long long)pid,
+                     osUpdateProcess.fd);
+			         std::fflush(stderr);
+			         basics_log("neuron updateOS started targetOSID=%s targetOSVersionID=%s launcherPid=%lld pidfd=%d\n",
+			            targetOSIDText.c_str(),
+			            targetOSVersionIDText.c_str(),
+		            (long long)pid,
+                  osUpdateProcess.fd);
+	         return true;
+	      }
+
+			virtual void boot(void)
+			{
+			loadKernelVersion();
+	         loadOSReleaseMetadata();
+			bootTimeMs = Time::msSinceBoot();
 
 		private4.is6 = false;
 		
@@ -2146,8 +2525,8 @@ protected:
       }
    }
 
-   void waitidHandler(void *waiter) override
-   {
+	      void waitidHandler(void *waiter) override
+	   {
 		// typedef struct {
 		// 	int      si_signo;    /* Signal number */
 		// 	int      si_errno;    /* An errno value */
@@ -2169,34 +2548,48 @@ protected:
 		// 	short    si_addr_lsb; /* Least significant bit of address */
 		// } siginfo_t;
 
-	uint128_t containerUUID;
-	bool killedOnPurpose;
-      bool destroyAfterWait = false;
-      bool pendingDestroyBeforeWait = false;
+	      uint128_t containerUUID;
+	      bool killedOnPurpose;
+	      bool destroyAfterWait = false;
+	      bool pendingDestroyBeforeWait = false;
 
-	   CoroutineStack *resumeAfterShutdown = nullptr;
+	      CoroutineStack *resumeAfterShutdown = nullptr;
 
-		   	Container *container = reinterpret_cast<Container *>(waiter);
-			siginfo_t infop = container->infop;
-			bool nonRestartableStartupFailure = (infop.si_code == CLD_EXITED && infop.si_status == containerStartupFailureExitCode);
-			String containerName = container->name;
-			{
-	   		containerUUID = container->plan.uuid;
-            pendingDestroyBeforeWait = container->pendingDestroy;
-            container->waitidPending = false;
-	   		container->disableKillSwitch();
-	   		container->closeSocket();
-   		killedOnPurpose = container->killedOnPurpose;
+	      Container *container = reinterpret_cast<Container *>(waiter);
+	      siginfo_t infop = container->infop;
+	      bool nonRestartableStartupFailure = (infop.si_code == CLD_EXITED && infop.si_status == containerStartupFailureExitCode);
+	      String containerName = container->name;
+	      {
+	         containerUUID = container->plan.uuid;
+	         pendingDestroyBeforeWait = container->pendingDestroy;
+	         container->waitidPending = false;
+	         container->disableKillSwitch();
+	         container->closeSocket();
+	         killedOnPurpose = container->killedOnPurpose;
 
-   		resumeAfterShutdown = container->resumeAfterShutdown;
-         destroyAfterWait = (killedOnPurpose || container->plan.restartOnFailure == false || nonRestartableStartupFailure);
-   	}
+	         resumeAfterShutdown = container->resumeAfterShutdown;
+	         destroyAfterWait = (killedOnPurpose || container->plan.restartOnFailure == false || nonRestartableStartupFailure);
+	      }
 
-	   	bool restart = (destroyAfterWait == false);
+	      bool restart = (destroyAfterWait == false);
 
-		basics_log("neuron waitid uuid=%llu pid=%d code=%d status=%d killedOnPurpose=%d restart=%d startupFailure=%d\n",
-			(unsigned long long)containerUUID,
-			int(infop.si_pid),
+	      std::fprintf(stderr,
+	         "neuron waitid debug uuid=%llu pid=%d code=%d status=%d killedOnPurpose=%d pendingDestroyBefore=%d destroyAfter=%d restart=%d deploymentID=%llu lifetime=%u\n",
+	         (unsigned long long)containerUUID,
+	         int(infop.si_pid),
+	         int(infop.si_code),
+	         int(infop.si_status),
+	         int(killedOnPurpose),
+	         int(pendingDestroyBeforeWait),
+	         int(destroyAfterWait),
+	         int(restart),
+	         (unsigned long long)container->plan.config.deploymentID(),
+	         unsigned(container->plan.lifetime));
+	      std::fflush(stderr);
+
+			basics_log("neuron waitid uuid=%llu pid=%d code=%d status=%d killedOnPurpose=%d restart=%d startupFailure=%d\n",
+				(unsigned long long)containerUUID,
+				int(infop.si_pid),
 			int(infop.si_code),
 			int(infop.si_status),
 			int(killedOnPurpose),
@@ -2464,6 +2857,28 @@ protected:
 
 				break;
 			}
+         case ContainerTopic::runtimeReady:
+         {
+            container->plan.runtimeReady = true;
+
+            bool controllingBrainActive = (brain != nullptr && streamIsActive(brain));
+            if (thisBrain != nullptr
+               && (thisBrain->canControlNeurons() || controllingBrainActive == false))
+            {
+               thisBrain->noteLocalContainerRuntimeReady(container->plan.uuid);
+            }
+
+            if (brain)
+            {
+               Message::construct(brain->wBuffer, NeuronTopic::containerRuntimeReady, container->plan.uuid);
+               if (controllingBrainActive)
+               {
+                  Ring::queueSend(brain);
+               }
+            }
+
+            break;
+         }
 			case ContainerTopic::statistics:
 			{
 				// [metricKey(8) metricValue(8)]...
@@ -2591,6 +3006,42 @@ protected:
 			return;
 		}
 
+      auto queueNeuronStateUpload = [&] () -> void {
+         if (brain == nullptr)
+         {
+            return;
+         }
+
+         basics_log("neuron queue stateUpload dpfx=%u mpfx=%u.%u.%u containers=%llu brainPresent=%d brainActive=%d fd=%d fslot=%d\n",
+            unsigned(lcsubnet6.dpfx),
+            unsigned(lcsubnet6.mpfx[0]),
+            unsigned(lcsubnet6.mpfx[1]),
+            unsigned(lcsubnet6.mpfx[2]),
+            (unsigned long long)containers.size(),
+            int(brain != nullptr),
+            int(streamIsActive(brain)),
+            (brain ? brain->fd : -1),
+            (brain ? brain->fslot : -1));
+
+         uint32_t headerOffset = Message::appendHeader(brain->wBuffer, NeuronTopic::stateUpload);
+         Message::appendAlignedBuffer<Alignment::one>(brain->wBuffer, (uint8_t *)&lcsubnet6, sizeof(struct local_container_subnet6));
+
+         for (const auto& [uuid, container] : containers)
+         {
+            (void)uuid;
+            String serializedPlan = {};
+            BitseryEngine::serialize(serializedPlan, container->plan);
+            Message::appendValue(brain->wBuffer, serializedPlan);
+         }
+
+         Message::finish(brain->wBuffer, headerOffset);
+
+         if (streamIsActive(brain))
+         {
+            Ring::queueSend(brain);
+         }
+      };
+
 		switch (NeuronTopic(message->topic))
 		{
             case NeuronTopic::registration:
@@ -2602,24 +3053,7 @@ protected:
 
 				if (requiresState)
 				{
-					uint32_t headerOffset = Message::appendHeader(brain->wBuffer, NeuronTopic::stateUpload);
-
-					Message::appendAlignedBuffer<Alignment::one>(brain->wBuffer, (uint8_t *)&lcsubnet6, sizeof(struct local_container_subnet6));
-
-						for (const auto& [uuid, container] : containers)
-						{
-                     (void)uuid;
-                     String serializedPlan;
-                     BitseryEngine::serialize(serializedPlan, container->plan);
-                     Message::appendValue(brain->wBuffer, serializedPlan);
-						}
-
-					Message::finish(brain->wBuffer, headerOffset);
-
-					if (streamIsActive(brain))
-					{
-						Ring::queueSend(brain);
-					}
+               queueNeuronStateUpload();
 				}
 
 				break;
@@ -2627,8 +3061,32 @@ protected:
 			case NeuronTopic::stateUpload:
 			{
 				// fragment(4, 1) containerPlan{4}...
-				Message::extractBytes<Alignment::one>(args, (uint8_t *)&lcsubnet6, sizeof(struct local_container_subnet6));
-				setupNetworking();
+            struct local_container_subnet6 uploadedFragment = {};
+				Message::extractBytes<Alignment::one>(args, (uint8_t *)&uploadedFragment, sizeof(struct local_container_subnet6));
+            const bool hadFragments = haveFragments();
+            const bool fragmentChanged = (memcmp(&lcsubnet6, &uploadedFragment, sizeof(uploadedFragment)) != 0);
+            lcsubnet6 = uploadedFragment;
+            basics_log("neuron apply stateUpload dpfx=%u mpfx=%u.%u.%u brainPresent=%d brainActive=%d fd=%d fslot=%d\n",
+               unsigned(lcsubnet6.dpfx),
+               unsigned(lcsubnet6.mpfx[0]),
+               unsigned(lcsubnet6.mpfx[1]),
+               unsigned(lcsubnet6.mpfx[2]),
+               int(brain != nullptr),
+               int(brain && streamIsActive(brain)),
+               (brain ? brain->fd : -1),
+               (brain ? brain->fslot : -1));
+            if (hadFragments == false || fragmentChanged)
+            {
+				   setupNetworking();
+            }
+            else
+            {
+               basics_log("neuron stateUpload networking already configured dpfx=%u mpfx=%u.%u.%u\n",
+                  unsigned(lcsubnet6.dpfx),
+                  unsigned(lcsubnet6.mpfx[0]),
+                  unsigned(lcsubnet6.mpfx[1]),
+                  unsigned(lcsubnet6.mpfx[2]));
+            }
 
 					bool malformedStateUpload = false;
 					while (args < terminal) // it's possible that some of these containers died right?
@@ -2653,6 +3111,21 @@ protected:
                   {
                      malformedStateUpload = true;
                      break;
+                  }
+
+                  if (auto existing = containers.find(restoredPlan.uuid); existing != containers.end() && existing->second != nullptr)
+                  {
+                     Container *liveContainer = existing->second;
+                     if (liveContainer->pendingDestroy == false)
+                     {
+                        liveContainer->neuronScalingDimensionsMask = metricPolicy.scalingDimensionsMask;
+                        liveContainer->neuronMetricsCadenceMs = metricPolicy.metricsCadenceMs;
+                        basics_log("neuron stateUpload skipped existing live container uuid=%llu pid=%d state=%u\n",
+                           (unsigned long long)liveContainer->plan.uuid,
+                           int(liveContainer->pid),
+                           unsigned(liveContainer->plan.state));
+                        continue;
+                     }
                   }
 
 						Container *container = new Container();
@@ -2770,17 +3243,70 @@ protected:
 						queueCloseIfActive(brain);
 					}
 				}
+            else
+            {
+               queueNeuronStateUpload();
+            }
 
-				break;
-			}
-			case NeuronTopic::assignFragment:
-			{
+					break;
+				}
+	         case NeuronTopic::updateOS:
+	         {
+	            String targetOSID = {};
+	            String targetOSVersionID = {};
+	            String updateCommand = {};
+	            Message::extractToStringView(args, targetOSID);
+	            Message::extractToStringView(args, targetOSVersionID);
+	            Message::extractToStringView(args, updateCommand);
+
+	            String targetOSIDText = {};
+	            String targetOSVersionIDText = {};
+	            String updateCommandText = {};
+	            targetOSIDText.assign(targetOSID);
+	            targetOSVersionIDText.assign(targetOSVersionID);
+	            updateCommandText.assign(updateCommand);
+
+	            String failure = {};
+	            if (startOperatingSystemUpdate(targetOSIDText, targetOSVersionIDText, updateCommandText, &failure) == false)
+	            {
+	               std::fprintf(stderr,
+	                  "neuron updateOS failed targetOSID=%s targetOSVersionID=%s reason=%s\n",
+	                  targetOSIDText.c_str(),
+	                  targetOSVersionIDText.c_str(),
+	                  failure.c_str());
+	               std::fflush(stderr);
+	               basics_log("neuron updateOS failed targetOSID=%s targetOSVersionID=%s reason=%s\n",
+	                  targetOSIDText.c_str(),
+	                  targetOSVersionIDText.c_str(),
+	                  failure.c_str());
+	               if (brain != nullptr)
+	               {
+	                  Message::construct(brain->wBuffer, NeuronTopic::hardwareFailure, failure);
+	                  if (streamIsActive(brain))
+	                  {
+	                     Ring::queueSend(brain);
+	                  }
+	               }
+	            }
+
+	            break;
+	         }
+				case NeuronTopic::assignFragment:
+				{
 				// fragment(4, 1)
 
 				Message::extractBytes<Alignment::one>(args, (uint8_t *)&lcsubnet6, sizeof(struct local_container_subnet6));
+            basics_log("neuron assignFragment dpfx=%u mpfx=%u.%u.%u brainPresent=%d brainActive=%d fd=%d fslot=%d\n",
+               unsigned(lcsubnet6.dpfx),
+               unsigned(lcsubnet6.mpfx[0]),
+               unsigned(lcsubnet6.mpfx[1]),
+               unsigned(lcsubnet6.mpfx[2]),
+               int(brain != nullptr),
+               int(brain && streamIsActive(brain)),
+               (brain ? brain->fd : -1),
+               (brain ? brain->fslot : -1));
 				setupNetworking();
-
-				setupNetworking();
+            queueNeuronStateUpload();
 
 				break;
 			}
@@ -2974,11 +3500,17 @@ protected:
 				uint128_t containerUUID;
 				Message::extractArg<ArgumentNature::fixed>(args, containerUUID);
 
-				if (auto it = containers.find(containerUUID); it != containers.end())
-				{
-					Container *container = it->second;
-					Message::extractArg<ArgumentNature::fixed>(args, container->plan.lifetime);
-				}
+					if (auto it = containers.find(containerUUID); it != containers.end())
+					{
+						Container *container = it->second;
+						std::fprintf(stderr,
+							"neuron changeContainerLifetime uuid=%llu deploymentID=%llu old=%u\n",
+							(unsigned long long)containerUUID,
+							(unsigned long long)container->plan.config.deploymentID(),
+							unsigned(container->plan.lifetime));
+						std::fflush(stderr);
+						Message::extractArg<ArgumentNature::fixed>(args, container->plan.lifetime);
+					}
 
 				break;
 			}
@@ -2989,12 +3521,21 @@ protected:
 				uint128_t containerUUID;
 				Message::extractArg<ArgumentNature::fixed>(args, containerUUID);
 
-				if (auto it = containers.find(containerUUID); it != containers.end())
-				{
-					Container *container = it->second;
-					container->pendingKillAckToBrain = true;
-					container->stop();
-				}
+					if (auto it = containers.find(containerUUID); it != containers.end())
+					{
+						Container *container = it->second;
+						std::fprintf(stderr,
+							"neuron killContainer command uuid=%llu deploymentID=%llu lifetime=%u pendingDestroy=%d killedOnPurpose=%d pid=%d\n",
+							(unsigned long long)containerUUID,
+							(unsigned long long)container->plan.config.deploymentID(),
+							unsigned(container->plan.lifetime),
+							int(container->pendingDestroy),
+							int(container->killedOnPurpose),
+							int(container->pid));
+						std::fflush(stderr);
+						container->pendingKillAckToBrain = true;
+						container->stop();
+					}
 				else if (brain)
 				{
 					Message::construct(brain->wBuffer, NeuronTopic::killContainer, containerUUID);
@@ -3785,18 +4326,17 @@ protected:
 			verboseNeuronSocketLog("neuron acceptHandler listener=%p fslot=%d\n", socket, fslot);
 				if (fslot >= 0)
 				{
+               // Keep one brain-control accept armed even while a current control
+               // stream is live. Reboots and master handoffs can leave the old
+               // stream half-open; the next accepted stream must be able to
+               // preempt it without waiting for kernel EOF on the stale socket.
+               queueBrainAccept();
 					if (brain != nullptr)
 					{
-						// Only one controlling brain stream is valid at a time. If the
-						// current slot is already closing or stale, retire it and allow the
-						// replacement accept to take over immediately.
-						if (streamIsActive(brain))
-						{
-							Ring::queueCloseRaw(fslot);
-							return;
-						}
-
-                  retireBrainControlStream(brain, "accept-replace");
+						// Only one controlling brain stream is valid at a time. A promoted
+						// master must be able to displace a stale live stream left behind by
+						// the old master during handoff/failover, so the accepted stream wins.
+                  retireBrainControlStream(brain, streamIsActive(brain) ? "accept-preempt-active" : "accept-replace");
 					}
 
 					brain = new NeuronBrainControlStream();
@@ -3905,6 +4445,36 @@ protected:
 
       void pollHandler(void *socket, int result) override
       {
+         if (socket == (void *)&osUpdateProcess)
+         {
+            osUpdateProcess.pollQueued = false;
+
+            siginfo_t infop = {};
+            if (osUpdateProcess.pid > 0)
+            {
+               (void)waitid(P_PID, osUpdateProcess.pid, &infop, WEXITED | WNOHANG);
+            }
+
+            basics_log("neuron updateOS launcher-poll targetOSID=%s targetOSVersionID=%s launcherPid=%lld result=%d code=%d status=%d\n",
+               osUpdateProcess.targetOSID.c_str(),
+               osUpdateProcess.targetOSVersionID.c_str(),
+               (long long)osUpdateProcess.pid,
+               result,
+               int(infop.si_code),
+               int(infop.si_status));
+            std::fprintf(stderr,
+               "neuron updateOS launcher-poll targetOSID=%s targetOSVersionID=%s launcherPid=%lld result=%d code=%d status=%d\n",
+               osUpdateProcess.targetOSID.c_str(),
+               osUpdateProcess.targetOSVersionID.c_str(),
+               (long long)osUpdateProcess.pid,
+               result,
+               int(infop.si_code),
+               int(infop.si_status));
+            std::fflush(stderr);
+            clearOSUpdateProcess();
+            return;
+         }
+
          if (socket == (void *)&deferredHardwareInventoryWake)
          {
             deferredHardwareInventoryWakePollQueued = false;

@@ -1,0 +1,31 @@
+{
+  "name": "aws-managed-test",
+  "deploymentMode": "remote",
+  "provider": "aws",
+  "providerScope": "acct-test/us-east-1",
+  "providerCredentialName": "aws-test",
+  "aws": {
+    "instanceProfileName": "REPLACE_AWS_INSTANCE_PROFILE_NAME"
+  },
+  "controls": [
+    {
+      "kind": "unixSocket",
+      "path": "/run/prodigy/control.sock"
+    }
+  ],
+  "nBrains": 1,
+  "machineSchemas": [
+    {
+      "schema": "t3.micro",
+      "kind": "vm",
+      "lifetime": "ondemand",
+      "vmImageURI": "REPLACE_AWS_AMI_ID",
+      "providerMachineType": "t3.micro",
+      "budget": 1
+    }
+  ],
+  "bootstrapSshUser": "root",
+  "bootstrapSshPrivateKeyPath": "REPLACE_SSH_PRIVATE_KEY_PATH",
+  "remoteProdigyPath": "/root/prodigy",
+  "desiredEnvironment": "aws"
+}

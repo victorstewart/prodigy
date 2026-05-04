@@ -1,0 +1,28 @@
+{
+  "name": "test-remote-3brain",
+  "deploymentMode": "test",
+  "nBrains": 3,
+  "machineSchemas": [
+    {
+      "schema": "test-brain",
+      "kind": "vm",
+      "vmImageURI": "test://netns-remote"
+    }
+  ],
+  "remoteProdigyPath": "/root/prodigy",
+  "test": {
+    "workspaceRoot": "/root/nametag-test-remote-3brain",
+    "machineCount": 3,
+    "brainBootstrapFamily": "ipv4",
+    "enableFakeIpv4Boundary": false,
+    "host": {
+      "mode": "ssh",
+      "ssh": {
+        "address": "203.0.113.44",
+        "port": 22,
+        "user": "root",
+        "privateKeyPath": "/root/.ssh/id_ed25519"
+      }
+    }
+  }
+}

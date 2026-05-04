@@ -1,8 +1,10 @@
 #pragma once
 #include <arpa/inet.h>
 #include <services/debug.h>
+#include <prodigy/brain/timing.knobs.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <malloc.h>
 #include <limits>
@@ -135,6 +137,25 @@ static bool scalingDimensionForMetricName(const String& metricName, ScalingDimen
    }
 
    return false;
+}
+
+static inline bool prodigyMachineReadyForScheduling(const Machine *machine)
+{
+   if (machine == nullptr || machine->state != MachineState::healthy)
+   {
+      return false;
+   }
+
+   // Some deployment-unit fixtures exercise pure placement math without a live
+   // neuron/control-stream model. Keep those synthetic machines schedulable,
+   // but require an explicit runtime-ready barrier once a machine is actually
+   // under neuron control.
+   if (machine->neuron.machine == nullptr && machine->neuron.connected == false)
+   {
+      return true;
+   }
+
+   return BrainBase::neuronControlStreamActive(machine) && machine->runtimeReady;
 }
 
 class MachineResourcesDelta {
@@ -828,11 +849,20 @@ static bool prodigyMachineMeetsApplicationResourceCriteria(const Machine *machin
       return false;
    }
 
-   if (config.architecture != MachineCpuArchitecture::unknown
-      && machine->hardware.cpu.architecture != config.architecture)
-   {
-      return false;
-   }
+	   MachineCpuArchitecture machineArchitecture = machine->hardware.cpu.architecture;
+	   if (machineArchitecture == MachineCpuArchitecture::unknown
+	      && thisBrain != nullptr
+	      && thisBrain->brainConfig.runtimeEnvironment.test.enabled
+	      && prodigyMachineReadyResourcesAvailable(*machine))
+	   {
+	      machineArchitecture = thisBrain->brainConfig.architecture;
+	   }
+
+	   if (config.architecture != MachineCpuArchitecture::unknown
+	      && machineArchitecture != config.architecture)
+	   {
+	      return false;
+	   }
 
    if (config.requiredIsaFeatures.empty() == false
       && prodigyIsaFeaturesMeetRequirements(machine->hardware.cpu.isaFeatures, config.requiredIsaFeatures) == false)
@@ -1154,7 +1184,8 @@ enum class DeploymentTimeoutFlags : uint64_t {
 
 	canariesMinimumLifetime,
 	autoscale,
-	shardGroupReady
+	shardGroupReady,
+   statefulTopologyRollbackWindow
 };
 
 enum class LifecycleOp {
@@ -1269,6 +1300,7 @@ class MachineTicket {
 	CoroutineStack *coro;
 	uint32_t nMore = 0; 			  		// nMore instances
 	Vector<uint32_t> shardGroups; // at the beginning this is used the feed shard group into claims... then when consuming this is filled with shard group to schedule on that machine now
+   Vector<uint32_t> placementTopologyEpochs;
    Vector<uint32_t> reservedGPUMemoryMBs;
    Vector<AssignedGPUDevice> reservedGPUDevices;
 
@@ -1458,6 +1490,7 @@ class ApplicationDeployment : public TimeoutDispatcher {
 	TimeoutPacket canaryTimer;
 	TimeoutPacket shardTimer;
 	TimeoutPacket autoscaleTimer;
+   TimeoutPacket statefulWorkerTopologyRollbackTimer;
 
 	uint64_t configuredAutoscalePeriodSeconds(void) const
 	{
@@ -1493,8 +1526,8 @@ class ApplicationDeployment : public TimeoutDispatcher {
 	}
 
 	// before calling this we check that if we move all stateless off machineA, that we could even fit any instanes of the desired
-	CoroutineGenerator<Machine *> compactAtoBs(uint32_t nToFit, Machine *machineA, const bytell_hash_set<uint64_t>& excludeDeploymentIDs, Vector<Machine *>& machinesB, bytell_hash_map<Machine *, MachineResourcesDelta>& deltasByMachine)
-	{
+		CoroutineGenerator<Machine *> compactAtoBs(uint32_t nToFit, Machine *machineA, const bytell_hash_set<uint64_t>& excludeDeploymentIDs, Vector<Machine *>& machinesB, bytell_hash_map<Machine *, MachineResourcesDelta>& deltasByMachine, bool planCompactionWork)
+		{
 		struct PlannedMove {
 
 			Machine *machineB;
@@ -1508,15 +1541,19 @@ class ApplicationDeployment : public TimeoutDispatcher {
 			PlannedMove(Machine *_machineB, uint64_t _deploymentID, uint32_t _count, uint32_t _nBase, uint32_t _nSurge) : machineB(_machineB), deploymentID(_deploymentID), count(_count), nBase(_nBase), nSurge(_nSurge) {}
 		};
 
-		// we can't schedule and account for moves until we're sure we can move enough to free up the requisite amount of space
-		Vector<PlannedMove> plannedMoves;
+			// we can't schedule and account for moves until we're sure we can move enough to free up the requisite amount of space
+			Vector<PlannedMove> plannedMoves;
+	      bytell_hash_map<Machine *, MachineResourcesDelta> planningDeltasByMachine = deltasByMachine;
 
-			uint32_t accumulated_nLogicalCores = 0;
-         uint32_t accumulated_sharedCPUMillis = 0;
-			uint32_t accumulated_memoryMB = 0;
-			uint32_t accumulated_storageMB = 0;
-         Vector<uint32_t> accumulatedGPUMemoryMBs = {};
-         bool plannedMovesIncludeSharedCPU = false;
+	         MachineResourcesDelta& donorInitialDeltas = deltasByMachine[machineA];
+	         uint64_t accumulated_nLogicalCores = 0;
+	         uint64_t accumulated_sharedCPUMillis = 0;
+	         prodigyComputeEffectiveMachineCPUAvailability(machineA, &donorInitialDeltas, accumulated_nLogicalCores, accumulated_sharedCPUMillis);
+				uint64_t accumulated_memoryMB = prodigyEffectiveMachineScalarAvailability(machineA->memoryMB_available, &donorInitialDeltas, &MachineResourcesDelta::nMemoryMB);
+				uint64_t accumulated_storageMB = prodigyEffectiveMachineScalarAvailability(machineA->storageMB_available, &donorInitialDeltas, &MachineResourcesDelta::nStorageMB);
+	         Vector<uint32_t> accumulatedGPUMemoryMBs = machineA->availableGPUMemoryMBs;
+	         prodigyAppendGPUMemoryMBs(accumulatedGPUMemoryMBs, donorInitialDeltas.gpuMemoryMBs);
+	         bool plannedMovesIncludeSharedCPU = false;
 
 		// accumulate how many resources we could accumulate if we moved everything
 		for (const auto& [deploymentID, containers] : machineA->containersByDeploymentID)
@@ -1566,8 +1603,8 @@ class ApplicationDeployment : public TimeoutDispatcher {
 
 				uint32_t thisBudget = clampBudgetByRackAndMachine(thisDeployment, machineB, budget);
 
-				if (uint32_t moveN = nFitOnMachine(thisDeployment, machineB, thisBudget, deltasByMachine[machineB]); moveN > 0) // we could move this many
-				{
+					if (uint32_t moveN = nFitOnMachine(thisDeployment, machineB, thisBudget, planningDeltasByMachine[machineB]); moveN > 0) // we could move this many
+					{
 					uint32_t nSurgeToMove = 0;
 					uint32_t nBaseToMove = 0;
 
@@ -1604,9 +1641,10 @@ class ApplicationDeployment : public TimeoutDispatcher {
 
 					if (moveN > 0)
 					{
-						budget -= moveN;
+							budget -= moveN;
 
-						PlannedMove& plan = plannedMoves.emplace_back(machineB, deploymentID, moveN, nBaseToMove, nSurgeToMove);
+							PlannedMove& plan = plannedMoves.emplace_back(machineB, deploymentID, moveN, nBaseToMove, nSurgeToMove);
+	                  prodigyApplyPlannedMachineScalarDelta(planningDeltasByMachine[machineB], thisPlan.config, int64_t(moveN));
 
 						uint32_t nMoreBase = nBaseToMove;
 						uint32_t nMoreSurge = nSurgeToMove;
@@ -1716,9 +1754,9 @@ class ApplicationDeployment : public TimeoutDispatcher {
                && applicationUsesSharedCPUs(plan.config) == false
                && plannedMovesIncludeSharedCPU == false)
             {
-				   uint32_t nLogicalCoresSlack = accumulated_nLogicalCores - (nFit * plan.config.nLogicalCores);
-				   uint32_t nMemoryMBSlack = accumulated_memoryMB - (nFit * plan.config.totalMemoryMB());
-				   uint32_t nStorageMBSlack = accumulated_storageMB - (nFit * plan.config.totalStorageMB());
+					   uint64_t nLogicalCoresSlack = accumulated_nLogicalCores - (uint64_t(nFit) * uint64_t(plan.config.nLogicalCores));
+					   uint64_t nMemoryMBSlack = accumulated_memoryMB - (uint64_t(nFit) * uint64_t(plan.config.totalMemoryMB()));
+					   uint64_t nStorageMBSlack = accumulated_storageMB - (uint64_t(nFit) * uint64_t(plan.config.totalStorageMB()));
 
 				   // now filter the accumulations by the resources we actually need... preferring to move as few instances as possible
 				   for (auto it = plannedMoves.begin(); it != plannedMoves.end(); ) 
@@ -1727,21 +1765,23 @@ class ApplicationDeployment : public TimeoutDispatcher {
 
 					   ApplicationDeployment *thisDeployment = thisBrain->deployments.at(plannedMove.deploymentID);
 
-					   uint32_t nByCores = nLogicalCoresSlack / thisDeployment->plan.config.nLogicalCores;
+						   uint64_t nByCores = nLogicalCoresSlack / thisDeployment->plan.config.nLogicalCores;
 
 					   if (nByCores > 0)
 					   {
-						   uint32_t nByMemory = nMemoryMBSlack / thisDeployment->plan.config.totalMemoryMB();
+							   uint64_t nByMemory = nMemoryMBSlack / thisDeployment->plan.config.totalMemoryMB();
 
 						   if (nByMemory > 0)
 						   {
-							   uint32_t nByStorage = nStorageMBSlack / thisDeployment->plan.config.totalStorageMB();
+								   uint64_t nByStorage = nStorageMBSlack / thisDeployment->plan.config.totalStorageMB();
 
 							   if (nByStorage > 0)
 							   {
-								   uint32_t nToCull = nByCores;
-								   if (nByMemory < nToCull) nToCull = nByMemory;
-								   if (nByStorage < nToCull) nToCull = nByStorage;
+									   uint64_t nToCull64 = nByCores;
+									   if (nByMemory < nToCull64) nToCull64 = nByMemory;
+									   if (nByStorage < nToCull64) nToCull64 = nByStorage;
+									   if (plannedMove.count < nToCull64) nToCull64 = plannedMove.count;
+									   uint32_t nToCull = static_cast<uint32_t>(nToCull64);
 
 								   if (nToCull == plannedMove.count) 
 								   {
@@ -1779,14 +1819,46 @@ class ApplicationDeployment : public TimeoutDispatcher {
 				   }
             }
 
-				// now we're moving the minimum number of containers to still achieve nFit 
+					// now we're moving the minimum number of containers to still achieve nFit
 
-				// generate a stateless work object that sees us WAIT for all of the followings compactions, then schedules n of our application on that machine
+					// generate a stateless work object that sees us WAIT for all of the followings compactions, then schedules n of our application on that machine
 
-				bytell_hash_set<ApplicationDeployment *> compactedDeployments;
+					bytell_hash_set<ApplicationDeployment *> compactedDeployments;
 
-				CompactionTicket *ticket = new CompactionTicket();
-				ticket->orchestrator = this;
+	            auto applyDonorDelta = [&] (const PlannedMove& plannedMove) -> void {
+
+	               ApplicationDeployment *thisDeployment = thisBrain->deployments.at(plannedMove.deploymentID);
+	               DeploymentPlan& thisPlan = thisDeployment->plan;
+	               MachineResourcesDelta& donorDeltas = deltasByMachine[machineA];
+
+	               prodigyApplyPlannedMachineScalarDelta(donorDeltas, thisPlan.config, -int64_t(plannedMove.count));
+	               for (ContainerView *container : plannedMove.bases)
+	               {
+	                  prodigyAppendGPUMemoryMBs(donorDeltas.gpuMemoryMBs, container->assignedGPUMemoryMBs);
+	                  prodigyAppendAssignedGPUDevices(donorDeltas.gpuDevices, container->assignedGPUDevices);
+	               }
+	               for (ContainerView *container : plannedMove.surges)
+	               {
+	                  prodigyAppendGPUMemoryMBs(donorDeltas.gpuMemoryMBs, container->assignedGPUMemoryMBs);
+	                  prodigyAppendAssignedGPUDevices(donorDeltas.gpuDevices, container->assignedGPUDevices);
+	               }
+	            };
+
+	            if (planCompactionWork == false)
+	            {
+	               for (const PlannedMove& plannedMove : plannedMoves)
+	               {
+	                  ApplicationDeployment *thisDeployment = thisBrain->deployments.at(plannedMove.deploymentID);
+	                  applyDonorDelta(plannedMove);
+	                  prodigyApplyPlannedMachineScalarDelta(deltasByMachine[plannedMove.machineB], thisDeployment->plan.config, int64_t(plannedMove.count));
+	               }
+
+	               co_yield machineA;
+	               co_return;
+	            }
+
+					CompactionTicket *ticket = new CompactionTicket();
+					ticket->orchestrator = this;
 
 				for (PlannedMove& plannedMove : plannedMoves) // now schedule the moves
 				{
@@ -1797,18 +1869,7 @@ class ApplicationDeployment : public TimeoutDispatcher {
 
 					uint32_t moveN = plannedMove.count;
 
-					MachineResourcesDelta& deltas = deltasByMachine[machineA];
-               prodigyApplyPlannedMachineScalarDelta(deltas, thisPlan.config, -int64_t(moveN));
-               for (ContainerView *container : plannedMove.bases)
-               {
-                  prodigyAppendGPUMemoryMBs(deltas.gpuMemoryMBs, container->assignedGPUMemoryMBs);
-                  prodigyAppendAssignedGPUDevices(deltas.gpuDevices, container->assignedGPUDevices);
-               }
-               for (ContainerView *container : plannedMove.surges)
-               {
-                  prodigyAppendGPUMemoryMBs(deltas.gpuMemoryMBs, container->assignedGPUMemoryMBs);
-                  prodigyAppendAssignedGPUDevices(deltas.gpuDevices, container->assignedGPUDevices);
-               }
+	               applyDonorDelta(plannedMove);
 
 					// moving moveN of deploymentID from machine A to machine B
                prodigyDebitMachineScalarResources(machineB, thisPlan.config, moveN);
@@ -1916,7 +1977,7 @@ class ApplicationDeployment : public TimeoutDispatcher {
 		}
 	}
 
-	CoroutineGenerator<Machine *> compact(bytell_hash_map<Machine *, MachineResourcesDelta>& deltasByMachine)
+		CoroutineGenerator<Machine *> compact(bytell_hash_map<Machine *, MachineResourcesDelta>& deltasByMachine, bool planCompactionWork)
 	{
 		Vector<Machine *> recepientMachines;
 		Vector<Machine *> donorMachines;
@@ -1926,7 +1987,7 @@ class ApplicationDeployment : public TimeoutDispatcher {
 
 		for (Machine *machine : thisBrain->machines)
 		{
-			if (machine->state != MachineState::healthy) continue;
+			if (prodigyMachineReadyForScheduling(machine) == false) continue;
 
 			if (machine->lifetime == MachineLifetime::spot)
 			{
@@ -2016,9 +2077,9 @@ class ApplicationDeployment : public TimeoutDispatcher {
 
 			// enforce rack + machine concentration limits
 			// theoreticaly have some rack and machine budget room to schedule onto this machine not taking into account moveable resources
-			if (uint32_t budget = clampBudgetByRackAndMachine(this, donor, nToFit); budget > 0) 
+			if (uint32_t budget = clampBudgetByRackAndMachine(this, donor, nToFit); budget > 0)
 			{
-				for (Machine *machine : compactAtoBs(budget, donor, excludeDeploymentIDs, recepientMachines, deltasByMachine)) 
+					for (Machine *machine : compactAtoBs(budget, donor, excludeDeploymentIDs, recepientMachines, deltasByMachine, planCompactionWork))
 				{
 				   co_yield machine;
 				}
@@ -2044,7 +2105,7 @@ class ApplicationDeployment : public TimeoutDispatcher {
 	};
 
 	template <typename TicketSpecializer = DefaultTicketSpecializer, typename ExtraBin = std::vector<Machine *>>
-	CoroutineGenerator<std::pair<Machine *, MachineTicket *>> gatherMachinesForScheduling(CoroutineStack *coro, bool& scheduleSurgeOnReserved, bytell_hash_map<Machine *, MachineResourcesDelta>& deltasByMachine, bool allowCompaction, bool allowNewMachines, TicketSpecializer ticketSpecializer = {}, ExtraBin extraBin = ExtraBin{})
+		CoroutineGenerator<std::pair<Machine *, MachineTicket *>> gatherMachinesForScheduling(CoroutineStack *coro, bool& scheduleSurgeOnReserved, bytell_hash_map<Machine *, MachineResourcesDelta>& deltasByMachine, bool allowCompaction, bool allowNewMachines, TicketSpecializer ticketSpecializer = {}, ExtraBin extraBin = ExtraBin{}, bool planCompactionWork = true)
 	{
 		struct CleanupGuard {
 	      MachineTicket* ticket = nullptr;
@@ -2144,7 +2205,7 @@ class ApplicationDeployment : public TimeoutDispatcher {
 
 		if (allowCompaction)
 		{
-			for (Machine *machine : compact(deltasByMachine))
+				for (Machine *machine : compact(deltasByMachine, planCompactionWork))
 			{
 				co_yield std::make_pair(machine, ticket);
 			}
@@ -2348,7 +2409,7 @@ class ApplicationDeployment : public TimeoutDispatcher {
 			Machine *machine = yielded.first;
 			MachineTicket *ticket = yielded.second;
 			if (machine == nullptr) continue;
-			if (machine->state != MachineState::healthy) continue;
+			if (prodigyMachineReadyForScheduling(machine) == false) continue;
 
 			uint32_t nFit;
 
@@ -2631,13 +2692,14 @@ class ApplicationDeployment : public TimeoutDispatcher {
 
 				switch (container->state)
 				{
-					case ContainerState::planned:
-					{
-						StatefulWork *work = std::get_if<StatefulWork>(container->plannedWork);
+				case ContainerState::planned:
+				{
+					StatefulWork *work = std::get_if<StatefulWork>(container->plannedWork);
                   Machine *previousMachine = container->machine;
+                  ApplicationConfig schedulingConfig = resourceConfigForContainer(container);
                   Vector<uint32_t> assignedGPUMemoryMBs = {};
                   Vector<AssignedGPUDevice> assignedGPUDevices = {};
-                  bool assignedGPUs = prodigyTakeAssignedGPUsForScheduling(machine, ticket, nullptr, plan.config, assignedGPUMemoryMBs, assignedGPUDevices);
+                  bool assignedGPUs = prodigyTakeAssignedGPUsForScheduling(machine, ticket, nullptr, schedulingConfig, assignedGPUMemoryMBs, assignedGPUDevices);
                   assert(assignedGPUs && "planned stateful placement must reserve GPUs");
                   if (container->machine != nullptr && container->machine != machine)
                   {
@@ -2712,6 +2774,8 @@ class ApplicationDeployment : public TimeoutDispatcher {
 				case ContainerState::scheduled:
 				case ContainerState::healthy:
 				{
+                  uint32_t topologyEpoch = container->explicitStatefulTopology.topologyEpoch;
+                  ApplicationConfig schedulingConfig = resourceConfigForContainer(container);
 						if (containersAreDead)
 							{
 								basics_log("spinStateful replacement fromPrivate4=%u toPrivate4=%u shardGroup=%u state=%u plannedWork=%p\n",
@@ -2722,9 +2786,9 @@ class ApplicationDeployment : public TimeoutDispatcher {
 									(void *)container->plannedWork);
                            Vector<uint32_t> assignedGPUMemoryMBs = {};
                            Vector<AssignedGPUDevice> assignedGPUDevices = {};
-                           bool assignedGPUs = prodigyTakeAssignedGPUsForScheduling(machine, ticket, nullptr, plan.config, assignedGPUMemoryMBs, assignedGPUDevices);
+                           bool assignedGPUs = prodigyTakeAssignedGPUsForScheduling(machine, ticket, nullptr, schedulingConfig, assignedGPUMemoryMBs, assignedGPUDevices);
                            assert(assignedGPUs && "replacement stateful placement must reserve GPUs");
-								toSchedule.push_back(planStatefulConstruction(machine, container->shardGroup, DataStrategy::seeding, std::move(assignedGPUMemoryMBs), std::move(assignedGPUDevices)));
+								toSchedule.push_back(planStatefulConstruction(machine, container->shardGroup, topologyEpoch, DataStrategy::seeding, std::move(assignedGPUMemoryMBs), std::move(assignedGPUDevices)));
 								container->plannedWork = nullptr;
 								destructContainer(container);
 								containerDestroyed(container);
@@ -2734,9 +2798,9 @@ class ApplicationDeployment : public TimeoutDispatcher {
 							DeploymentWork *dwork = planStatefulDestruction(container);
                         Vector<uint32_t> assignedGPUMemoryMBs = {};
                         Vector<AssignedGPUDevice> assignedGPUDevices = {};
-                        bool assignedGPUs = prodigyTakeAssignedGPUsForScheduling(machine, ticket, nullptr, plan.config, assignedGPUMemoryMBs, assignedGPUDevices);
+                        bool assignedGPUs = prodigyTakeAssignedGPUsForScheduling(machine, ticket, nullptr, schedulingConfig, assignedGPUMemoryMBs, assignedGPUDevices);
                         assert(assignedGPUs && "constructive stateful placement must reserve GPUs");
-							DeploymentWork *cwork = planStatefulConstruction(machine, container->shardGroup, DataStrategy::seeding, std::move(assignedGPUMemoryMBs), std::move(assignedGPUDevices));
+							DeploymentWork *cwork = planStatefulConstruction(machine, container->shardGroup, topologyEpoch, DataStrategy::seeding, std::move(assignedGPUMemoryMBs), std::move(assignedGPUDevices));
 
 							scheduleConstructionDestruction(cwork, dwork);
 						}
@@ -2754,18 +2818,20 @@ class ApplicationDeployment : public TimeoutDispatcher {
 		bool allowCompaction = true;
 		bool allowNewMachines = true;
 
-		auto machines = gatherMachinesForScheduling(coro, scheduleSurgeOnReserved, deltasByMachine, allowCompaction, allowNewMachines, [=] (MachineTicket *ticket) -> void {
+		auto machines = gatherMachinesForScheduling(coro, scheduleSurgeOnReserved, deltasByMachine, allowCompaction, allowNewMachines, [=, this] (MachineTicket *ticket) -> void {
 
 			if (containersToRedeploy.size() > 0)
 			{
 				for (ContainerView *container : containersToRedeploy)
 				{
 					ticket->shardGroups.push_back(container->shardGroup);
+               ticket->placementTopologyEpochs.push_back(container->explicitStatefulTopology.topologyEpoch);
 				}
 			}
 			else
 			{
 				ticket->shardGroups = spinContainerForGroups;
+            buildPlacementTopologyEpochs(ticket->placementTopologyEpochs, spinContainerForGroups);
 			}
 		});
 		while (true)
@@ -2807,12 +2873,12 @@ class ApplicationDeployment : public TimeoutDispatcher {
 			Machine *machine = yielded.first;
 			MachineTicket *ticket = yielded.second;
 			if (machine == nullptr) continue;
-			if (machine->state != MachineState::healthy) continue;
+			if (prodigyMachineReadyForScheduling(machine) == false) continue;
 			if (machine->lifetime == MachineLifetime::spot) continue;
 
 			if (ticket == nullptr)
 			{
-				auto chargeMachine = [&] (Machine *machine, uint32_t shardGroup) -> void {
+				auto chargeMachine = [&] (Machine *machine, const ApplicationConfig& config, uint32_t shardGroup) -> void {
 
 					nDeployedBase += 1;
 
@@ -2820,24 +2886,25 @@ class ApplicationDeployment : public TimeoutDispatcher {
 						countPerRack[machine->rack] 	 	 += 1;
 						racksByShardGroup[shardGroup].insert(machine->rack);
 
-                  prodigyDebitMachineScalarResources(machine, plan.config, 1);
+                  prodigyDebitMachineScalarResources(machine, config, 1);
 					};
 
 				if (spinContainerForGroups.size() > 0)
 				{
 					for (auto it = spinContainerForGroups.begin(); it != spinContainerForGroups.end(); )
 					{
-						if (uint32_t shardGroup = *it; racksByShardGroup[shardGroup].contains(machine->rack) == false)
+						if (uint32_t shardGroup = *it; canPlaceReplicaForShardGroupOnRack(shardGroup, machine->rack))
 						{
-	                     if (nFitOnMachine(this, machine, 1) > 0)
+                        ApplicationConfig schedulingConfig = statefulConstructionConfigForShardGroup(shardGroup);
+	                     if (nFitOnMachine(this, machine, 1, MachineResourcesDelta{}, &schedulingConfig) > 0)
 	                     {
-	                        chargeMachine(machine, shardGroup);
+	                        chargeMachine(machine, schedulingConfig, shardGroup);
 
                            Vector<uint32_t> assignedGPUMemoryMBs = {};
                            Vector<AssignedGPUDevice> assignedGPUDevices = {};
-                           bool assignedGPUs = prodigyTakeAssignedGPUsForScheduling(machine, nullptr, nullptr, plan.config, assignedGPUMemoryMBs, assignedGPUDevices);
+                           bool assignedGPUs = prodigyTakeAssignedGPUsForScheduling(machine, nullptr, nullptr, schedulingConfig, assignedGPUMemoryMBs, assignedGPUDevices);
                            assert(assignedGPUs && "stateful scheduling must reserve GPUs");
-									toSchedule.push_back(planStatefulConstruction(machine, shardGroup, DataStrategy::sharding, std::move(assignedGPUMemoryMBs), std::move(assignedGPUDevices)));
+									toSchedule.push_back(planStatefulConstruction(machine, shardGroup, statefulWorkerTopologyUpgradeLocksShardGroup(shardGroup) ? statefulWorkerTopologyUpgradeTargetEpoch : 0, topologyUpgradeConstructionDataStrategy(shardGroup), std::move(assignedGPUMemoryMBs), std::move(assignedGPUDevices)));
 
 								it = spinContainerForGroups.erase(it);
 							}
@@ -2862,11 +2929,12 @@ class ApplicationDeployment : public TimeoutDispatcher {
 								continue;
 							}
 
-							if (racksByShardGroup[container->shardGroup].contains(machine->rack) == false)
+							if (canPlaceReplicaForShardGroupOnRack(container->shardGroup, machine->rack))
 							{
-	                     if (nFitOnMachine(this, machine, 1) > 0)
+                        ApplicationConfig schedulingConfig = resourceConfigForContainer(container);
+	                     if (nFitOnMachine(this, machine, 1, MachineResourcesDelta{}, &schedulingConfig) > 0)
 	                     {
-	                        chargeMachine(machine, container->shardGroup);
+	                        chargeMachine(machine, schedulingConfig, container->shardGroup);
 	                        rescheduleContainerOntoMachine(machine, container, nullptr);
 	                        it = containersToRedeploy.erase(it);
 	                     }
@@ -2883,17 +2951,20 @@ class ApplicationDeployment : public TimeoutDispatcher {
 			}
 			else // ticket != nullptr so this machine is a new machine which we claimed on
 			{
-				for (uint32_t shardGroup : ticket->shardGroups)
+				for (uint32_t index = 0; index < ticket->shardGroups.size(); ++index)
 				{
+               uint32_t shardGroup = ticket->shardGroups[index];
+               uint32_t topologyEpoch = placementTopologyEpochForIndex(ticket, index);
 					nDeployedBase += 1;
 
 						if (spinContainerForGroups.size() > 0)
 						{
+                     ApplicationConfig schedulingConfig = statefulPlacementConfig(topologyEpoch);
                      Vector<uint32_t> assignedGPUMemoryMBs = {};
                      Vector<AssignedGPUDevice> assignedGPUDevices = {};
-                     bool assignedGPUs = prodigyTakeAssignedGPUsForScheduling(machine, ticket, nullptr, plan.config, assignedGPUMemoryMBs, assignedGPUDevices);
+                     bool assignedGPUs = prodigyTakeAssignedGPUsForScheduling(machine, ticket, nullptr, schedulingConfig, assignedGPUMemoryMBs, assignedGPUDevices);
                      assert(assignedGPUs && "claimed stateful shard placement must consume reserved GPUs");
-							toSchedule.push_back(planStatefulConstruction(machine, shardGroup, DataStrategy::sharding, std::move(assignedGPUMemoryMBs), std::move(assignedGPUDevices)));
+							toSchedule.push_back(planStatefulConstruction(machine, shardGroup, topologyEpoch, topologyUpgradeConstructionDataStrategy(shardGroup), std::move(assignedGPUMemoryMBs), std::move(assignedGPUDevices)));
 						}
 						else // containersToRedeploy
 						{
@@ -2906,7 +2977,8 @@ class ApplicationDeployment : public TimeoutDispatcher {
 								continue;
 							}
 
-								if (container->shardGroup == shardGroup)
+								if (container->shardGroup == shardGroup
+                           && (topologyEpoch == 0 || container->explicitStatefulTopology.topologyEpoch == topologyEpoch))
 								{
 									rescheduleContainerOntoMachine(machine, container, ticket);
 									it = containersToRedeploy.erase(it);
@@ -2931,9 +3003,9 @@ class ApplicationDeployment : public TimeoutDispatcher {
 		spinStateful(coro, spinContainerForGroups, containersToRedeploy, containersAreDead);
 	}
 
-	void rollback(void) // if canaries fail... we rollback
-	{
-		bool preserveContainerImage = false;
+		void rollback(void) // if canaries fail... we rollback
+		{
+			bool preserveContainerImage = false;
 		if (previous && previous->plan.config.deploymentID() == plan.config.deploymentID())
 		{
 			// Vertical respins keep the same deployment identity; preserve shared container image state.
@@ -2951,25 +3023,39 @@ class ApplicationDeployment : public TimeoutDispatcher {
 			}
 		}
 
-		if (next) // roll forward
-		{
-			previous->next = next;
-			next->previous = previous;
+			if (next) // roll forward
+			{
+				if (previous) previous->next = next;
+				next->previous = previous;
 
-			next->deploy();
-		}
-		else 
-		{
-			// the fact that previous is now the head deployment via deploymentsByApp, it regains control
-			// that is the real rollback
-			thisBrain->deploymentsByApp.insert_or_assign(plan.config.applicationID, previous);
+				next->deploy();
+			}
+			else if (previous)
+			{
+				// the fact that previous is now the head deployment via deploymentsByApp, it regains control
+				// that is the real rollback
+				thisBrain->deploymentsByApp.insert_or_assign(plan.config.applicationID, previous);
 
-			previous->next = nullptr;
-			previous->setDeploymentRunning();
+				previous->next = nullptr;
+				if (previous->state != DeploymentState::running)
+				{
+					previous->setDeploymentRunning();
+				}
+			}
+			else
+			{
+				thisBrain->deploymentsByApp.erase(plan.config.applicationID);
+			}
+
+			delete this;
 		}
-		
-		delete this;
-	}
+
+		void beginDecommissioningForRollForward(void)
+		{
+			state = DeploymentState::decommissioning;
+			stateChangedAtMs = Time::now<TimeResolution::ms>();
+			Ring::queueCancelTimeout(&autoscaleTimer);
+		}
 
 	void setDeploymentRunning(void)
 	{
@@ -2997,6 +3083,8 @@ class ApplicationDeployment : public TimeoutDispatcher {
 			delete previous;
 			previous = nullptr;
 		}
+
+      dispatchDeferredStatefulScaleIntent();
 	}
 
 	void consumeSchedulingExecution(void)
@@ -3038,6 +3126,7 @@ class ApplicationDeployment : public TimeoutDispatcher {
 									{
 										consumeSchedulingExecution();
 									}
+                           dispatchDeferredStatefulScaleIntent();
 								}
 								break;
 							}
@@ -3059,6 +3148,7 @@ class ApplicationDeployment : public TimeoutDispatcher {
 								{
 									consumeSchedulingExecution();
 								}
+                           dispatchDeferredStatefulScaleIntent();
 							}
 						}
 
@@ -3076,7 +3166,11 @@ class ApplicationDeployment : public TimeoutDispatcher {
 			if (previous) nShardGroups = previous->nShardGroups;
 			else 			  nShardGroups = 1;
 
-			nTargetBase = nShardGroups * 3; // always 3 masters per shard group
+         nTargetBase = 0;
+         for (uint32_t shardGroup = 0; shardGroup < nShardGroups; ++shardGroup)
+         {
+            nTargetBase += desiredReplicaCountForShardGroup(shardGroup);
+         }
 		}
 		else
 		{
@@ -3107,18 +3201,436 @@ class ApplicationDeployment : public TimeoutDispatcher {
 		}
 	}
 
-	void deployCanaries(CoroutineStack *coro, uint32_t nCanaries)
+public:
+   using StatefulWorkerTopologyUpgradePhase = ::StatefulWorkerTopologyUpgradePhase;
+   static constexpr uint64_t statefulWorkerTopologyRollbackWindowMs = uint64_t(prodigyBrainStatefulTopologyRollbackWindowSeconds) * 1000ull;
+
+#if PRODIGY_DEBUG
+	void debugRollbackForTest(void)
 	{
+		rollback();
+	}
+#endif
+
+   bool statefulWorkerTopologyUpgradePendingForAnyShardGroup(void) const
+   {
+      return (statefulWorkerTopologyUpgradePending && statefulWorkerTopologyLockedShardGroups.empty() == false);
+   }
+
+   bool statefulWorkerTopologyUpgradeLocksShardGroup(uint32_t shardGroup) const
+   {
+      return (statefulWorkerTopologyUpgradePendingForAnyShardGroup() && statefulWorkerTopologyLockedShardGroups.contains(shardGroup));
+   }
+
+   int64_t statefulWorkerTopologyUpgradeRollbackDeadlineMs(void) const
+   {
+      if (statefulWorkerTopologyUpgradePendingForAnyShardGroup() == false
+         || statefulWorkerTopologyUpgradePhase != StatefulWorkerTopologyUpgradePhase::blueDraining
+         || statefulWorkerTopologyUpgradePhaseChangedAtMs <= 0)
+      {
+         return 0;
+      }
+
+      const uint64_t phaseChangedAtMs = uint64_t(statefulWorkerTopologyUpgradePhaseChangedAtMs);
+      const uint64_t maxInt64 = uint64_t(std::numeric_limits<int64_t>::max());
+      const uint64_t rollbackWindowMs = statefulWorkerTopologyUpgradeRollbackWindowMsConfigured();
+      if (phaseChangedAtMs > (maxInt64 - rollbackWindowMs))
+      {
+         return std::numeric_limits<int64_t>::max();
+      }
+
+      return int64_t(phaseChangedAtMs + rollbackWindowMs);
+   }
+
+   bool statefulWorkerTopologyUpgradeRollbackEligibleAt(int64_t nowMs) const
+   {
+      const int64_t deadlineMs = statefulWorkerTopologyUpgradeRollbackDeadlineMs();
+      return (deadlineMs != 0 && nowMs < deadlineMs);
+   }
+
+   bool statefulWorkerTopologyUpgradeRollbackEligible(void) const
+   {
+      return statefulWorkerTopologyUpgradeRollbackEligibleAt(Time::now<TimeResolution::ms>());
+   }
+
+   uint64_t statefulWorkerTopologyUpgradeRollbackWindowMsConfigured(void) const
+   {
+      const char *value = std::getenv("PRODIGY_STATEFUL_TOPOLOGY_ROLLBACK_WINDOW_SECONDS");
+      if (value == nullptr || value[0] == '\0')
+      {
+         return statefulWorkerTopologyRollbackWindowMs;
+      }
+
+      char *end = nullptr;
+      unsigned long long seconds = std::strtoull(value, &end, 10);
+      if (end == value || *end != '\0')
+      {
+         return statefulWorkerTopologyRollbackWindowMs;
+      }
+
+      constexpr uint64_t maxSeconds = uint64_t(std::numeric_limits<int64_t>::max()) / 1000ull;
+      if (uint64_t(seconds) > maxSeconds)
+      {
+         return uint64_t(std::numeric_limits<int64_t>::max());
+      }
+
+      return uint64_t(seconds) * 1000ull;
+   }
+
+   void recomputeStatefulBaseTargetFromShardGroups(void)
+   {
+      nTargetBase = 0;
+      for (uint32_t shardGroup = 0; shardGroup < nShardGroups; ++shardGroup)
+      {
+         nTargetBase += desiredReplicaCountForShardGroup(shardGroup);
+      }
+   }
+
+   bool statefulDeferredScaleIntentPending(void) const
+   {
+      if (plan.isStateful == false)
+      {
+         return false;
+      }
+
+      if (deferredStatefulTargetShardGroups > nShardGroups)
+      {
+         return true;
+      }
+
+      return (deferredStatefulTargetLogicalCores > 0
+         && (deferredStatefulTargetLogicalCores != plan.config.nLogicalCores
+            || deferredStatefulTargetMemoryMB != plan.config.memoryMB
+            || deferredStatefulTargetStorageMB != plan.config.storageMB));
+   }
+
+   void seedStatefulDeferredScaleIntentFromCurrentState(void)
+   {
+      if (deferredStatefulTargetShardGroups < nShardGroups)
+      {
+         deferredStatefulTargetShardGroups = nShardGroups;
+      }
+
+      if (deferredStatefulTargetLogicalCores == 0)
+      {
+         deferredStatefulTargetLogicalCores = plan.config.nLogicalCores;
+      }
+
+      if (deferredStatefulTargetMemoryMB == 0)
+      {
+         deferredStatefulTargetMemoryMB = plan.config.memoryMB;
+      }
+
+      if (deferredStatefulTargetStorageMB == 0)
+      {
+         deferredStatefulTargetStorageMB = plan.config.storageMB;
+      }
+   }
+
+   void requestDeferredStatefulShardGrowth(uint32_t additionalShardGroups = 1)
+   {
+      if (plan.isStateful == false || additionalShardGroups == 0)
+      {
+         return;
+      }
+
+      seedStatefulDeferredScaleIntentFromCurrentState();
+
+      uint64_t nextTargetShardGroups = uint64_t(deferredStatefulTargetShardGroups) + uint64_t(additionalShardGroups);
+      if (nextTargetShardGroups > UINT32_MAX)
+      {
+         nextTargetShardGroups = UINT32_MAX;
+      }
+
+      deferredStatefulTargetShardGroups = uint32_t(nextTargetShardGroups);
+      statefulDeferredScaleIntentUpdatedAtMs = Time::now<TimeResolution::ms>();
+      persistDeferredStatefulScaleIntent();
+   }
+
+   void requestDeferredStatefulTopologyTarget(uint16_t targetLogicalCores,
+                                              uint32_t targetMemoryMB,
+                                              uint32_t targetStorageMB)
+   {
+      if (plan.isStateful == false || targetLogicalCores == 0)
+      {
+         return;
+      }
+
+      seedStatefulDeferredScaleIntentFromCurrentState();
+      deferredStatefulTargetLogicalCores = targetLogicalCores;
+      deferredStatefulTargetMemoryMB = targetMemoryMB;
+      deferredStatefulTargetStorageMB = targetStorageMB;
+      statefulDeferredScaleIntentUpdatedAtMs = Time::now<TimeResolution::ms>();
+      persistDeferredStatefulScaleIntent();
+   }
+
+   void applyStatefulWorkerTopologyUpgradeTargetResources(ApplicationConfig& config) const
+   {
+      if (statefulWorkerTopologyUpgradeTargetLogicalCores == 0)
+      {
+         return;
+      }
+
+      config.nLogicalCores = statefulWorkerTopologyUpgradeTargetLogicalCores;
+      config.memoryMB = statefulWorkerTopologyUpgradeTargetMemoryMB;
+      config.storageMB = statefulWorkerTopologyUpgradeTargetStorageMB;
+   }
+
+   ApplicationConfig statefulWorkerTopologyUpgradeTargetConfig(void) const
+   {
+      ApplicationConfig config = plan.config;
+      applyStatefulWorkerTopologyUpgradeTargetResources(config);
+      return config;
+   }
+
+   ApplicationConfig statefulPlacementConfig(uint32_t topologyEpoch) const
+   {
+      ApplicationConfig config = plan.config;
+      if (statefulWorkerTopologyUpgradePendingForAnyShardGroup()
+         && topologyEpoch != 0
+         && topologyEpoch == statefulWorkerTopologyUpgradeTargetEpoch)
+      {
+         applyStatefulWorkerTopologyUpgradeTargetResources(config);
+      }
+
+      return config;
+   }
+
+   ApplicationConfig statefulConstructionConfigForShardGroup(uint32_t shardGroup) const
+   {
+      ApplicationConfig config = plan.config;
+      if (statefulWorkerTopologyUpgradeLocksShardGroup(shardGroup))
+      {
+         applyStatefulWorkerTopologyUpgradeTargetResources(config);
+      }
+
+      return config;
+   }
+
+   ApplicationConfig resourceConfigForContainer(const ContainerView *container) const
+   {
+      if (container == nullptr)
+      {
+         return plan.config;
+      }
+
+      if (container->isStateful)
+      {
+         return statefulPlacementConfig(container->explicitStatefulTopology.topologyEpoch);
+      }
+
+      return plan.config;
+   }
+
+   void buildPlacementTopologyEpochs(Vector<uint32_t>& placementTopologyEpochs, const Vector<uint32_t>& shardGroups) const
+   {
+      placementTopologyEpochs.clear();
+      placementTopologyEpochs.reserve(shardGroups.size());
+
+      for (uint32_t shardGroup : shardGroups)
+      {
+         placementTopologyEpochs.push_back(statefulWorkerTopologyUpgradeLocksShardGroup(shardGroup) ? statefulWorkerTopologyUpgradeTargetEpoch : 0);
+      }
+   }
+
+   uint32_t placementTopologyEpochForIndex(const MachineTicket *ticket, uint32_t index) const
+   {
+      if (ticket == nullptr || index >= ticket->placementTopologyEpochs.size())
+      {
+         return 0;
+      }
+
+      return ticket->placementTopologyEpochs[index];
+   }
+
+   uint32_t desiredReplicaCountForShardGroup(uint32_t shardGroup) const
+   {
+      bool keepBlueAndGreen = (statefulWorkerTopologyUpgradeLocksShardGroup(shardGroup)
+         && statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::greenBootstrap);
+      return uint32_t(3 + (keepBlueAndGreen ? 3 : 0));
+   }
+
+   uint32_t maxReplicasPerRackForShardGroup(uint32_t shardGroup) const
+   {
+      return uint32_t(statefulWorkerTopologyUpgradeLocksShardGroup(shardGroup) ? 2 : 1);
+   }
+
+   uint32_t replicaCountForShardGroupOnRack(uint32_t shardGroup, Rack *rack)
+   {
+      if (rack == nullptr)
+      {
+         return 0;
+      }
+
+      uint32_t count = 0;
+      for (ContainerView *container : containersByShardGroup[shardGroup])
+      {
+         if (container == nullptr || container->machine == nullptr)
+         {
+            continue;
+         }
+
+         if (container->state == ContainerState::destroyed)
+         {
+            continue;
+         }
+
+         if (container->machine->rack == rack)
+         {
+            ++count;
+         }
+      }
+
+      if (count == 0 && racksByShardGroup[shardGroup].contains(rack))
+      {
+         count = 1;
+      }
+
+      return count;
+   }
+
+   bool canPlaceReplicaForShardGroupOnRack(uint32_t shardGroup, Rack *rack)
+   {
+      return (replicaCountForShardGroupOnRack(shardGroup, rack) < maxReplicasPerRackForShardGroup(shardGroup));
+   }
+
+   DataStrategy topologyUpgradeConstructionDataStrategy(uint32_t shardGroup) const
+   {
+      return statefulWorkerTopologyUpgradeLocksShardGroup(shardGroup) ? DataStrategy::seeding : DataStrategy::sharding;
+   }
+
+   DataStrategy architectedStatefulConstructionDataStrategy(uint32_t shardGroup) const
+   {
+      if (statefulWorkerTopologyUpgradeLocksShardGroup(shardGroup))
+      {
+         return DataStrategy::seeding;
+      }
+
+      return (previous ? DataStrategy::seeding : DataStrategy::genesis);
+   }
+
+   uint32_t currentServingStatefulTopologyEpochForLockedShardGroups(uint32_t fallbackWorkerCount) const
+   {
+      uint32_t sourceEpoch = 0;
+      for (ContainerView *container : containers)
+      {
+         if (container == nullptr
+            || container->isStateful == false
+            || container->state == ContainerState::destroyed
+            || statefulWorkerTopologyLockedShardGroups.contains(container->shardGroup) == false)
+         {
+            continue;
+         }
+
+         StatefulTopology topology = container->effectiveStatefulTopology(plan);
+         if (topology.topologyEpoch == 0
+            || topology.workerCount != fallbackWorkerCount
+            || prodigyStatefulTopologyServesClients(topology) == false)
+         {
+            continue;
+         }
+
+         if (sourceEpoch == 0)
+         {
+            sourceEpoch = topology.topologyEpoch;
+         }
+         else if (sourceEpoch != topology.topologyEpoch)
+         {
+            return fallbackWorkerCount;
+         }
+      }
+
+      return (sourceEpoch == 0) ? fallbackWorkerCount : sourceEpoch;
+   }
+
+   void armStatefulWorkerTopologyUpgrade(uint32_t sourceWorkerCount,
+      uint32_t targetWorkerCount,
+      uint16_t targetLogicalCores,
+      uint32_t targetMemoryMB,
+      uint32_t targetStorageMB)
+   {
+      statefulWorkerTopologyUpgradePending = true;
+      statefulWorkerTopologyUpgradePhase = StatefulWorkerTopologyUpgradePhase::greenBootstrap;
+      statefulWorkerTopologyUpgradePhaseChangedAtMs = Time::now<TimeResolution::ms>();
+      statefulWorkerTopologyUpgradeOperationID = generateTopologyUpgradeOperationID();
+      statefulWorkerTopologyUpgradeSourceWorkerCount = sourceWorkerCount;
+      statefulWorkerTopologyUpgradeTargetWorkerCount = targetWorkerCount;
+      statefulWorkerTopologyUpgradeTargetLogicalCores = targetLogicalCores;
+      statefulWorkerTopologyUpgradeTargetMemoryMB = targetMemoryMB;
+      statefulWorkerTopologyUpgradeTargetStorageMB = targetStorageMB;
+      statefulWorkerTopologyLockedShardGroups.clear();
+      cancelStatefulWorkerTopologyUpgradeRollbackTimer();
+
+      for (uint32_t shardGroup = 0; shardGroup < nShardGroups; ++shardGroup)
+      {
+         statefulWorkerTopologyLockedShardGroups.insert(shardGroup);
+      }
+
+      statefulWorkerTopologyUpgradeSourceEpoch = currentServingStatefulTopologyEpochForLockedShardGroups(sourceWorkerCount);
+      statefulWorkerTopologyUpgradeTargetEpoch = generateDistinctTopologyUpgradeEpoch(statefulWorkerTopologyUpgradeSourceEpoch);
+
+#if PRODIGY_DEBUG
+      std::fprintf(stderr, "stateful topology upgrade arm deploymentID=%llu cores=%u->%u workers=%u->%u sourceEpoch=%u targetEpoch=%u lockedGroups=%u\n",
+         (unsigned long long)plan.config.deploymentID(),
+         unsigned(plan.config.nLogicalCores),
+         unsigned(targetLogicalCores),
+         unsigned(sourceWorkerCount),
+         unsigned(targetWorkerCount),
+         unsigned(statefulWorkerTopologyUpgradeSourceEpoch),
+         unsigned(statefulWorkerTopologyUpgradeTargetEpoch),
+         unsigned(statefulWorkerTopologyLockedShardGroups.size()));
+      std::fflush(stderr);
+#endif
+
+      for (ContainerView *container : containers)
+      {
+         if (container == nullptr || statefulWorkerTopologyLockedShardGroups.contains(container->shardGroup) == false)
+         {
+            continue;
+         }
+
+         configureStatefulWorkerTopologyUpgradeSource(container);
+         reconcileLiveStatefulTopologyServices(container);
+      }
+
+      persistStatefulWorkerTopologyUpgradeOperation();
+
+      Vector<uint32_t> shardGroups = {};
+      shardGroups.reserve(statefulWorkerTopologyLockedShardGroups.size() * 3);
+      for (uint32_t shardGroup : statefulWorkerTopologyLockedShardGroups)
+      {
+         shardGroups.push_back(shardGroup);
+         shardGroups.push_back(shardGroup);
+         shardGroups.push_back(shardGroup);
+      }
+
+      if (thisBrain != nullptr && shardGroups.empty() == false)
+      {
+         spinStateful(nullptr, shardGroups);
+         if (toSchedule.size() > 0)
+         {
+            schedule(nullptr);
+         }
+      }
+   }
+
+private:
+		void deployCanaries(CoroutineStack *coro, uint32_t nCanaries)
+		{
 		state = DeploymentState::canaries;
 		stateChangedAtMs = Time::now<TimeResolution::ms>();
 
+		uint32_t deferredTargetBase = nTargetBase;
+		uint32_t deferredTargetSurge = nTargetSurge;
+		nTargetBase = 0;
+		nTargetSurge = 0;
 		nTargetCanary = nCanaries;
 
 		// start canaries and once they run succesfully for some period of time and none fail, we can continue
 
 		if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&] (void) -> void { spinStateless(coro); }))
 		{
-			
+
 			nSuspended += 1;
 			co_await coro->suspendAtIndex(suspendIndex);
 			nSuspended -= 1;
@@ -3131,50 +3643,81 @@ class ApplicationDeployment : public TimeoutDispatcher {
 			nSuspended -= 1;
 		});
 
-		setCanaryTimeout();
+		if (state == DeploymentState::failed)
+		{
+			rollbackFailedCanaries();
+			co_return;
+		}
 
-		canaryStack = coro;
+			canaryStack = coro;
+			setCanaryTimeout();
 
-		nSuspended += 1;
-		co_await coro->suspend();
+			nSuspended += 1;
+			co_await coro->suspend();
 		nSuspended -= 1;
-
-		canaryStack = nullptr;
-		nTargetCanary = 0;
-		nHealthyCanary = 0;
 
 		if (state == DeploymentState::failed) // one or more canaries failed
 		{
-			// cancel canaries lifetime timeout
-			Ring::queueCancelTimeout(&canaryTimer);
-
-			auto copiedCanaries = containers;
-			// kill the other canaries
-			for (ContainerView *container : copiedCanaries)
-			{
-				queueSend(container->machine, NeuronTopic::killContainer, container->uuid); // by the time these return... the deployment will have been destroyed....
-
-				destructContainer(container);
-				containerDestroyed(container);
-			}
-
-			rollback();
+			rollbackFailedCanaries();
+			co_return;
 		}
 		else
 		{
 			thisBrain->pushSpinApplicationProgressToMothership(this, "canaries succeeded"_ctv);
 
-			nDeployedBase = nDeployedCanary;
+			uint32_t promotedHealthy = nHealthyCanary;
+			nTargetBase = deferredTargetBase;
+			nTargetSurge = deferredTargetSurge;
+			nDeployedBase += nDeployedCanary;
 			nDeployedCanary = 0;
+			nHealthyBase += promotedHealthy;
+				nTargetCanary = 0;
+				nHealthyCanary = 0;
 
-			// upgrade canaries
-			for (ContainerView *container : containers)
-			{
-				nHealthyBase += 1;
-				container->lifetime = ApplicationLifetime::base;
-				container->proxySend(NeuronTopic::changeContainerLifetime, container->uuid, ApplicationLifetime::base);
+				if (previous && previous->state == DeploymentState::running)
+				{
+					previous->beginDecommissioningForRollForward();
+				}
+
+				// upgrade canaries
+				for (ContainerView *container : containers)
+				{
+				if (container->lifetime == ApplicationLifetime::canary)
+				{
+					container->lifetime = ApplicationLifetime::base;
+					container->proxySend(NeuronTopic::changeContainerLifetime, container->uuid, ApplicationLifetime::base);
+				}
 			}
+
+			canaryStack = nullptr;
 		}
+	}
+
+	void rollbackFailedCanaries(void)
+	{
+		canaryStack = nullptr;
+		nTargetCanary = 0;
+		nHealthyCanary = 0;
+
+		// cancel canaries lifetime timeout
+		Ring::queueCancelTimeout(&canaryTimer);
+
+		auto copiedCanaries = containers;
+		// kill the other canaries
+		for (ContainerView *container : copiedCanaries)
+		{
+			if (container == nullptr || containers.contains(container) == false)
+			{
+				continue;
+			}
+
+			queueSend(container->machine, NeuronTopic::killContainer, container->uuid); // by the time these return... the deployment will have been destroyed....
+
+			destructContainer(container);
+			containerDestroyed(container);
+		}
+
+		rollback();
 	}
 
 	ContainerView* constructOnMachine(Machine *machine, ApplicationLifetime lifetime, Vector<uint32_t> assignedGPUMemoryMBs = {}, Vector<AssignedGPUDevice> assignedGPUDevices = {})
@@ -3197,6 +3740,1066 @@ class ApplicationDeployment : public TimeoutDispatcher {
 
 		return container;
 	}
+
+   static uint64_t generateTopologyUpgradeOperationID(void)
+   {
+      uint64_t operationID = 0;
+      while (operationID == 0)
+      {
+         operationID = Random::generateNumberWithNBits<64, uint64_t>();
+      }
+
+      return operationID;
+   }
+
+   static uint32_t generateDistinctTopologyUpgradeEpoch(uint32_t avoid)
+   {
+      uint32_t epoch = 0;
+      while (epoch == 0 || epoch == avoid)
+      {
+         epoch = Random::generateNumberWithNBits<32, uint32_t>();
+      }
+
+      return epoch;
+   }
+
+   StatefulMeshRoles statefulMeshRolesForShardGroup(uint32_t shardGroup) const
+   {
+      return StatefulMeshRoles::forShardGroup(plan.stateful, plan.config.applicationID, shardGroup);
+   }
+
+   StatefulTopology statefulWorkerTopologyUpgradeSourceTopology(uint32_t shardGroup) const
+   {
+      StatefulTopology topology = {};
+      topology.operationID = statefulWorkerTopologyUpgradeOperationID;
+      topology.shardGroup = shardGroup;
+      topology.topologyEpoch = statefulWorkerTopologyUpgradeSourceEpoch;
+      topology.workerCount = statefulWorkerTopologyUpgradeSourceWorkerCount;
+      topology.servingMode = (statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::blueDraining)
+         ? StatefulTopologyServingMode::drainOnly
+         : StatefulTopologyServingMode::serve;
+      topology.sourceEpoch = statefulWorkerTopologyUpgradeSourceEpoch;
+      topology.targetEpoch = statefulWorkerTopologyUpgradeTargetEpoch;
+      topology.bridgeMode = (statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::blueDraining)
+         ? StatefulTopologyBridgeMode::targetToSource
+         : StatefulTopologyBridgeMode::sourceToTarget;
+      return topology;
+   }
+
+   StatefulTopology statefulWorkerTopologyUpgradeTargetTopology(uint32_t shardGroup) const
+   {
+      StatefulTopology topology = {};
+      topology.operationID = statefulWorkerTopologyUpgradeOperationID;
+      topology.shardGroup = shardGroup;
+      topology.topologyEpoch = statefulWorkerTopologyUpgradeTargetEpoch;
+      topology.workerCount = statefulWorkerTopologyUpgradeTargetWorkerCount;
+      topology.servingMode = (statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::blueDraining)
+         ? StatefulTopologyServingMode::serve
+         : StatefulTopologyServingMode::catchupOnly;
+      topology.sourceEpoch = statefulWorkerTopologyUpgradeSourceEpoch;
+      topology.targetEpoch = statefulWorkerTopologyUpgradeTargetEpoch;
+      topology.bridgeMode = (statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::blueDraining)
+         ? StatefulTopologyBridgeMode::targetToSource
+         : StatefulTopologyBridgeMode::sourceToTarget;
+      return topology;
+   }
+
+   void configureStatefulWorkerTopologyUpgradeSource(ContainerView *container)
+   {
+      if (container == nullptr)
+      {
+         return;
+      }
+
+      container->explicitStatefulMeshRoles = statefulMeshRolesForShardGroup(container->shardGroup);
+      container->explicitStatefulTopology = statefulWorkerTopologyUpgradeSourceTopology(container->shardGroup);
+   }
+
+   void configureStatefulWorkerTopologyUpgradeTarget(ContainerView *container)
+   {
+      if (container == nullptr)
+      {
+         return;
+      }
+
+      container->explicitStatefulMeshRoles = statefulMeshRolesForShardGroup(container->shardGroup);
+      container->explicitStatefulTopology = statefulWorkerTopologyUpgradeTargetTopology(container->shardGroup);
+   }
+
+public:
+   bool captureStatefulWorkerTopologyUpgradeOperation(ProdigyStatefulWorkerTopologyUpgradeOperation& operation) const
+   {
+      operation = {};
+      if (statefulWorkerTopologyUpgradePendingForAnyShardGroup() == false)
+      {
+         return false;
+      }
+
+      operation.deploymentID = plan.config.deploymentID();
+      operation.applicationID = plan.config.applicationID;
+      operation.operationID = statefulWorkerTopologyUpgradeOperationID;
+      operation.phase = statefulWorkerTopologyUpgradePhase;
+      operation.sourceWorkerCount = statefulWorkerTopologyUpgradeSourceWorkerCount;
+      operation.targetWorkerCount = statefulWorkerTopologyUpgradeTargetWorkerCount;
+      operation.sourceEpoch = statefulWorkerTopologyUpgradeSourceEpoch;
+      operation.targetEpoch = statefulWorkerTopologyUpgradeTargetEpoch;
+      operation.targetLogicalCores = statefulWorkerTopologyUpgradeTargetLogicalCores;
+      operation.targetMemoryMB = statefulWorkerTopologyUpgradeTargetMemoryMB;
+      operation.targetStorageMB = statefulWorkerTopologyUpgradeTargetStorageMB;
+      operation.updatedAtMs = statefulWorkerTopologyUpgradePhaseChangedAtMs;
+
+      operation.lockedShardGroups.reserve(statefulWorkerTopologyLockedShardGroups.size());
+      for (uint32_t shardGroup : statefulWorkerTopologyLockedShardGroups)
+      {
+         operation.lockedShardGroups.push_back(shardGroup);
+      }
+      std::sort(operation.lockedShardGroups.begin(), operation.lockedShardGroups.end());
+
+      return true;
+   }
+
+   bool restoreStatefulWorkerTopologyUpgradeOperation(const ProdigyStatefulWorkerTopologyUpgradeOperation& operation)
+   {
+      if (operation.deploymentID != plan.config.deploymentID()
+         || operation.applicationID != plan.config.applicationID
+         || operation.operationID == 0
+         || operation.phase == StatefulWorkerTopologyUpgradePhase::none
+         || operation.lockedShardGroups.empty())
+      {
+         return false;
+      }
+
+      statefulWorkerTopologyUpgradePending = true;
+      statefulWorkerTopologyUpgradePhase = operation.phase;
+      statefulWorkerTopologyUpgradeOperationID = operation.operationID;
+      statefulWorkerTopologyUpgradeSourceWorkerCount = operation.sourceWorkerCount;
+      statefulWorkerTopologyUpgradeTargetWorkerCount = operation.targetWorkerCount;
+      statefulWorkerTopologyUpgradeSourceEpoch = operation.sourceEpoch;
+      statefulWorkerTopologyUpgradeTargetEpoch = operation.targetEpoch;
+      statefulWorkerTopologyUpgradeTargetLogicalCores = operation.targetLogicalCores;
+      statefulWorkerTopologyUpgradeTargetMemoryMB = operation.targetMemoryMB;
+      statefulWorkerTopologyUpgradeTargetStorageMB = operation.targetStorageMB;
+      statefulWorkerTopologyUpgradePhaseChangedAtMs = operation.updatedAtMs;
+      statefulWorkerTopologyLockedShardGroups.clear();
+      for (uint32_t shardGroup : operation.lockedShardGroups)
+      {
+         statefulWorkerTopologyLockedShardGroups.insert(shardGroup);
+      }
+
+      reconcileStatefulWorkerTopologyUpgradeContainers();
+      armStatefulWorkerTopologyUpgradeRollbackTimer();
+      return true;
+   }
+
+   bool restorePersistedStatefulWorkerTopologyUpgradeOperation(void)
+   {
+      if (thisBrain == nullptr)
+      {
+         return false;
+      }
+
+      for (const ProdigyStatefulWorkerTopologyUpgradeOperation& operation : thisBrain->statefulWorkerTopologyUpgradeRuntimeState)
+      {
+         if (restoreStatefulWorkerTopologyUpgradeOperation(operation))
+         {
+            return true;
+         }
+      }
+
+      return false;
+   }
+
+   void persistStatefulWorkerTopologyUpgradeOperation(void)
+   {
+      if (thisBrain == nullptr)
+      {
+         return;
+      }
+
+      ProdigyStatefulWorkerTopologyUpgradeOperation snapshot = {};
+      bool haveSnapshot = captureStatefulWorkerTopologyUpgradeOperation(snapshot);
+      auto& operations = thisBrain->statefulWorkerTopologyUpgradeRuntimeState;
+
+      for (auto it = operations.begin(); it != operations.end(); ++it)
+      {
+         if (it->deploymentID != plan.config.deploymentID())
+         {
+            continue;
+         }
+
+         if (haveSnapshot)
+         {
+            *it = std::move(snapshot);
+         }
+         else
+         {
+            operations.erase(it);
+         }
+
+         thisBrain->noteStatefulWorkerTopologyUpgradeRuntimeStateChanged();
+         return;
+      }
+
+      if (haveSnapshot)
+      {
+         operations.push_back(std::move(snapshot));
+         thisBrain->noteStatefulWorkerTopologyUpgradeRuntimeStateChanged();
+      }
+   }
+
+   bool captureDeferredStatefulScaleIntent(ProdigyDeferredStatefulScaleIntent& intent) const
+   {
+      intent = {};
+      if (statefulDeferredScaleIntentPending() == false)
+      {
+         return false;
+      }
+
+      intent.deploymentID = plan.config.deploymentID();
+      intent.applicationID = plan.config.applicationID;
+      intent.targetShardGroups = (deferredStatefulTargetShardGroups > nShardGroups)
+         ? deferredStatefulTargetShardGroups
+         : nShardGroups;
+      intent.targetLogicalCores = (deferredStatefulTargetLogicalCores > 0)
+         ? deferredStatefulTargetLogicalCores
+         : plan.config.nLogicalCores;
+      intent.targetMemoryMB = (deferredStatefulTargetMemoryMB > 0)
+         ? deferredStatefulTargetMemoryMB
+         : plan.config.memoryMB;
+      intent.targetStorageMB = (deferredStatefulTargetStorageMB > 0)
+         ? deferredStatefulTargetStorageMB
+         : plan.config.storageMB;
+      intent.updatedAtMs = statefulDeferredScaleIntentUpdatedAtMs;
+      return true;
+   }
+
+   bool restoreDeferredStatefulScaleIntent(const ProdigyDeferredStatefulScaleIntent& intent)
+   {
+      if (intent.deploymentID != plan.config.deploymentID()
+         || intent.applicationID != plan.config.applicationID)
+      {
+         return false;
+      }
+
+      deferredStatefulTargetShardGroups = (intent.targetShardGroups > nShardGroups)
+         ? intent.targetShardGroups
+         : nShardGroups;
+      deferredStatefulTargetLogicalCores = (intent.targetLogicalCores > 0)
+         ? intent.targetLogicalCores
+         : plan.config.nLogicalCores;
+      deferredStatefulTargetMemoryMB = (intent.targetMemoryMB > 0)
+         ? intent.targetMemoryMB
+         : plan.config.memoryMB;
+      deferredStatefulTargetStorageMB = (intent.targetStorageMB > 0)
+         ? intent.targetStorageMB
+         : plan.config.storageMB;
+      statefulDeferredScaleIntentUpdatedAtMs = intent.updatedAtMs;
+      return statefulDeferredScaleIntentPending();
+   }
+
+   bool restorePersistedDeferredStatefulScaleIntent(void)
+   {
+      if (thisBrain == nullptr)
+      {
+         return false;
+      }
+
+      for (const ProdigyDeferredStatefulScaleIntent& intent : thisBrain->deferredStatefulScaleIntentRuntimeState)
+      {
+         if (restoreDeferredStatefulScaleIntent(intent))
+         {
+            return true;
+         }
+      }
+
+      return false;
+   }
+
+   void persistDeferredStatefulScaleIntent(void)
+   {
+      if (thisBrain == nullptr)
+      {
+         return;
+      }
+
+      ProdigyDeferredStatefulScaleIntent snapshot = {};
+      bool haveSnapshot = captureDeferredStatefulScaleIntent(snapshot);
+      auto& intents = thisBrain->deferredStatefulScaleIntentRuntimeState;
+
+      for (auto it = intents.begin(); it != intents.end(); ++it)
+      {
+         if (it->deploymentID != plan.config.deploymentID())
+         {
+            continue;
+         }
+
+         if (haveSnapshot)
+         {
+            *it = std::move(snapshot);
+         }
+         else
+         {
+            intents.erase(it);
+         }
+
+         thisBrain->noteDeferredStatefulScaleIntentRuntimeStateChanged();
+         return;
+      }
+
+      if (haveSnapshot)
+      {
+         intents.push_back(std::move(snapshot));
+         thisBrain->noteDeferredStatefulScaleIntentRuntimeStateChanged();
+      }
+   }
+
+   void clearDeferredStatefulScaleIntent(void)
+   {
+      deferredStatefulTargetShardGroups = 0;
+      deferredStatefulTargetLogicalCores = 0;
+      deferredStatefulTargetMemoryMB = 0;
+      deferredStatefulTargetStorageMB = 0;
+      statefulDeferredScaleIntentUpdatedAtMs = 0;
+      persistDeferredStatefulScaleIntent();
+   }
+
+   bool dispatchDeferredStatefulScaleIntent(void)
+   {
+      if (plan.isStateful == false
+         || deployingNewShardGroup
+         || statefulWorkerTopologyUpgradePendingForAnyShardGroup()
+         || waitingOnContainers.empty() == false
+         || toSchedule.empty() == false)
+      {
+         return false;
+      }
+
+      if (statefulDeferredScaleIntentPending() == false)
+      {
+         clearDeferredStatefulScaleIntent();
+         return false;
+      }
+
+      if (deferredStatefulTargetLogicalCores > 0
+         && (deferredStatefulTargetLogicalCores != plan.config.nLogicalCores
+            || deferredStatefulTargetMemoryMB != plan.config.memoryMB
+            || deferredStatefulTargetStorageMB != plan.config.storageMB))
+      {
+         uint32_t oldWorkerCount = prodigyStatefulWorkerCountForLogicalCores(plan.config.nLogicalCores);
+         uint32_t targetWorkerCount = prodigyStatefulWorkerCountForLogicalCores(deferredStatefulTargetLogicalCores);
+         armStatefulWorkerTopologyUpgrade(
+            oldWorkerCount,
+            targetWorkerCount,
+            deferredStatefulTargetLogicalCores,
+            deferredStatefulTargetMemoryMB,
+            deferredStatefulTargetStorageMB);
+         persistDeferredStatefulScaleIntent();
+         return true;
+      }
+
+      if (deferredStatefulTargetShardGroups > nShardGroups)
+      {
+         deployingNewShardGroup = true;
+
+         Vector<uint32_t> shardGroups;
+         shardGroups.insert(shardGroups.end(), 3, nShardGroups);
+
+         nShardGroups += 1;
+         recomputeStatefulBaseTargetFromShardGroups();
+         persistDeferredStatefulScaleIntent();
+         spinStateful(nullptr, shardGroups);
+         if (toSchedule.size() > 0)
+         {
+            schedule(nullptr);
+         }
+         return true;
+      }
+
+      clearDeferredStatefulScaleIntent();
+      return false;
+   }
+
+   void clearStatefulWorkerTopologyUpgradeOperation(void)
+   {
+      cancelStatefulWorkerTopologyUpgradeRollbackTimer();
+
+      bytell_hash_set<uint32_t> lockedShardGroups = statefulWorkerTopologyLockedShardGroups;
+      for (ContainerView *container : containers)
+      {
+         if (container == nullptr || lockedShardGroups.contains(container->shardGroup) == false)
+         {
+            continue;
+         }
+
+         container->clearStatefulTopologyCutoverBarrier();
+      }
+
+      statefulWorkerTopologyUpgradePending = false;
+      statefulWorkerTopologyUpgradePhase = StatefulWorkerTopologyUpgradePhase::none;
+      statefulWorkerTopologyUpgradeOperationID = 0;
+      statefulWorkerTopologyUpgradeSourceWorkerCount = 0;
+      statefulWorkerTopologyUpgradeTargetWorkerCount = 0;
+      statefulWorkerTopologyUpgradeSourceEpoch = 0;
+      statefulWorkerTopologyUpgradeTargetEpoch = 0;
+      statefulWorkerTopologyUpgradeTargetLogicalCores = 0;
+      statefulWorkerTopologyUpgradeTargetMemoryMB = 0;
+      statefulWorkerTopologyUpgradeTargetStorageMB = 0;
+      statefulWorkerTopologyUpgradePhaseChangedAtMs = 0;
+      statefulWorkerTopologyLockedShardGroups.clear();
+      persistStatefulWorkerTopologyUpgradeOperation();
+   }
+
+private:
+   void cancelStatefulWorkerTopologyUpgradeRollbackTimer(void)
+   {
+      if (statefulWorkerTopologyRollbackTimer.isLive())
+      {
+         Ring::queueCancelTimeout(&statefulWorkerTopologyRollbackTimer);
+      }
+   }
+
+   void armStatefulWorkerTopologyUpgradeRollbackTimer(void)
+   {
+      cancelStatefulWorkerTopologyUpgradeRollbackTimer();
+
+      if (statefulWorkerTopologyUpgradePendingForAnyShardGroup() == false
+         || statefulWorkerTopologyUpgradePhase != StatefulWorkerTopologyUpgradePhase::blueDraining)
+      {
+         return;
+      }
+
+      const int64_t nowMs = Time::now<TimeResolution::ms>();
+      const int64_t deadlineMs = statefulWorkerTopologyUpgradeRollbackDeadlineMs();
+      if (deadlineMs == 0 || nowMs >= deadlineMs)
+      {
+         scheduleStatefulWorkerTopologyUpgradeBlueRetirement();
+         return;
+      }
+
+      if (Ring::getRingFD() <= 0)
+      {
+         return;
+      }
+
+      statefulWorkerTopologyRollbackTimer.setTimeoutMs(uint64_t(deadlineMs - nowMs));
+      statefulWorkerTopologyRollbackTimer.dispatcher = this;
+      statefulWorkerTopologyRollbackTimer.flags = uint64_t(DeploymentTimeoutFlags::statefulTopologyRollbackWindow);
+      Ring::queueTimeout(&statefulWorkerTopologyRollbackTimer);
+   }
+
+   void statefulWorkerTopologyUpgradeRollbackWindowExpired(void)
+   {
+      scheduleStatefulWorkerTopologyUpgradeBlueRetirement();
+   }
+
+   static void clearStatefulWorkerTopologyCutoverBarrier(ContainerView *container)
+   {
+      if (container != nullptr)
+      {
+         container->clearStatefulTopologyCutoverBarrier();
+      }
+   }
+
+   bool containerHasStatefulWorkerTopologyCutoverBarrier(const ContainerView *container) const
+   {
+      return (container != nullptr
+         && container->hasStatefulTopologyCutoverBarrier(
+            statefulWorkerTopologyUpgradeSourceEpoch,
+            statefulWorkerTopologyUpgradeTargetEpoch));
+   }
+
+   bool containerUsesStatefulWorkerTopologyUpgradeTarget(const ContainerView *container) const
+   {
+      if (container == nullptr || container->isStateful == false)
+      {
+         return false;
+      }
+
+      const StatefulTopology& topology = container->explicitStatefulTopology;
+      return (topology.operationID == statefulWorkerTopologyUpgradeOperationID
+         && topology.topologyEpoch == statefulWorkerTopologyUpgradeTargetEpoch);
+   }
+
+   bool containerUsesStatefulWorkerTopologyUpgradeSource(const ContainerView *container) const
+   {
+      if (container == nullptr || container->isStateful == false)
+      {
+         return false;
+      }
+
+      const StatefulTopology& topology = container->explicitStatefulTopology;
+      return (topology.operationID == statefulWorkerTopologyUpgradeOperationID
+         && topology.topologyEpoch == statefulWorkerTopologyUpgradeSourceEpoch);
+   }
+
+   StatefulTopology statefulWorkerTopologyUpgradeSteadyTargetTopology(uint32_t shardGroup) const
+   {
+      StatefulTopology topology = {};
+      topology.shardGroup = shardGroup;
+      topology.topologyEpoch = statefulWorkerTopologyUpgradeTargetEpoch;
+      topology.workerCount = statefulWorkerTopologyUpgradeTargetWorkerCount;
+      topology.servingMode = StatefulTopologyServingMode::serve;
+      topology.sourceEpoch = statefulWorkerTopologyUpgradeTargetEpoch;
+      topology.targetEpoch = statefulWorkerTopologyUpgradeTargetEpoch;
+      topology.bridgeMode = StatefulTopologyBridgeMode::none;
+      return topology;
+   }
+
+   void updateVerticalAdjustmentForStatefulWorkerTopologyTarget(const ApplicationConfig& targetConfig)
+   {
+      if (verticalResourceBaseInitialized == false)
+      {
+         return;
+      }
+
+      auto adjustmentFromTarget = [] (uint32_t base, uint32_t target) -> int32_t {
+         int64_t delta = int64_t(target) - int64_t(base);
+         if (delta > int64_t(std::numeric_limits<int32_t>::max()))
+         {
+            delta = int64_t(std::numeric_limits<int32_t>::max());
+         }
+         else if (delta < int64_t(std::numeric_limits<int32_t>::min()))
+         {
+            delta = int64_t(std::numeric_limits<int32_t>::min());
+         }
+
+         return int32_t(delta);
+      };
+
+      verticalAdjustment_nLogicalCores = adjustmentFromTarget(verticalResourceBase_nLogicalCores, targetConfig.nLogicalCores);
+      verticalAdjustment_memoryMB = adjustmentFromTarget(verticalResourceBase_memoryMB, targetConfig.memoryMB);
+      verticalAdjustment_storageMB = adjustmentFromTarget(verticalResourceBase_storageMB, targetConfig.storageMB);
+   }
+
+   void recountStatefulDeploymentCountersFromLiveContainers(void)
+   {
+      if (plan.isStateful == false)
+      {
+         return;
+      }
+
+      nDeployedBase = 0;
+      nDeployedCanary = 0;
+      nDeployedSurge = 0;
+      nHealthyBase = 0;
+      nHealthyCanary = 0;
+      nHealthySurge = 0;
+
+      for (ContainerView *container : containers)
+      {
+         if (container == nullptr || container->state == ContainerState::destroyed)
+         {
+            continue;
+         }
+
+         switch (container->lifetime)
+         {
+            case ApplicationLifetime::base:
+            {
+               nDeployedBase += 1;
+               if (container->state == ContainerState::healthy)
+               {
+                  nHealthyBase += 1;
+               }
+               break;
+            }
+            case ApplicationLifetime::canary:
+            {
+               nDeployedCanary += 1;
+               if (container->state == ContainerState::healthy)
+               {
+                  nHealthyCanary += 1;
+               }
+               break;
+            }
+            case ApplicationLifetime::surge:
+            {
+               nDeployedSurge += 1;
+               if (container->state == ContainerState::healthy)
+               {
+                  nHealthySurge += 1;
+               }
+               break;
+            }
+         }
+      }
+   }
+
+   bool statefulWorkerTopologyUpgradeBlueRetired(void) const
+   {
+      if (statefulWorkerTopologyUpgradePendingForAnyShardGroup() == false
+         || statefulWorkerTopologyUpgradePhase != StatefulWorkerTopologyUpgradePhase::blueDraining)
+      {
+         return false;
+      }
+
+      uint32_t observedTargets = 0;
+      for (ContainerView *container : containers)
+      {
+         if (container == nullptr || statefulWorkerTopologyLockedShardGroups.contains(container->shardGroup) == false)
+         {
+            continue;
+         }
+
+         if (containerUsesStatefulWorkerTopologyUpgradeSource(container))
+         {
+            return false;
+         }
+
+         if (containerUsesStatefulWorkerTopologyUpgradeTarget(container))
+         {
+            ++observedTargets;
+         }
+      }
+
+      return (observedTargets == uint32_t(statefulWorkerTopologyLockedShardGroups.size() * 3));
+   }
+
+   void completeStatefulWorkerTopologyUpgradeIfReady(void)
+   {
+      if (waitingOnContainers.empty() == false || toSchedule.empty() == false)
+      {
+         return;
+      }
+
+      if (statefulWorkerTopologyUpgradeBlueRetired() == false)
+      {
+         return;
+      }
+
+      ApplicationConfig targetConfig = statefulWorkerTopologyUpgradeTargetConfig();
+      uint32_t targetWorkerCount = statefulWorkerTopologyUpgradeTargetWorkerCount;
+      uint32_t targetEpoch = statefulWorkerTopologyUpgradeTargetEpoch;
+      bytell_hash_set<uint32_t> lockedShardGroups = statefulWorkerTopologyLockedShardGroups;
+
+      plan.config = targetConfig;
+      updateVerticalAdjustmentForStatefulWorkerTopologyTarget(targetConfig);
+
+      for (ContainerView *container : containers)
+      {
+         if (container == nullptr || lockedShardGroups.contains(container->shardGroup) == false)
+         {
+            continue;
+         }
+
+         container->explicitStatefulMeshRoles = statefulMeshRolesForShardGroup(container->shardGroup);
+         container->explicitStatefulTopology = statefulWorkerTopologyUpgradeSteadyTargetTopology(container->shardGroup);
+         container->explicitStatefulTopology.workerCount = targetWorkerCount;
+         container->explicitStatefulTopology.topologyEpoch = targetEpoch;
+         container->explicitStatefulTopology.sourceEpoch = targetEpoch;
+         container->explicitStatefulTopology.targetEpoch = targetEpoch;
+      }
+
+      clearStatefulWorkerTopologyUpgradeOperation();
+
+      recomputeStatefulBaseTargetFromShardGroups();
+      recountStatefulDeploymentCountersFromLiveContainers();
+
+      for (ContainerView *container : containers)
+      {
+         if (container == nullptr || lockedShardGroups.contains(container->shardGroup) == false)
+         {
+            continue;
+         }
+
+         reconcileLiveStatefulTopologyServices(container);
+      }
+
+      dispatchDeferredStatefulScaleIntent();
+   }
+
+   void rollbackStatefulWorkerTopologyUpgradeCutover(void)
+   {
+      if (statefulWorkerTopologyUpgradePendingForAnyShardGroup() == false
+         || statefulWorkerTopologyUpgradePhase != StatefulWorkerTopologyUpgradePhase::blueDraining)
+      {
+         return;
+      }
+
+      if (statefulWorkerTopologyUpgradeRollbackEligible() == false)
+      {
+         scheduleStatefulWorkerTopologyUpgradeBlueRetirement();
+         return;
+      }
+
+      bool haveSource = false;
+      for (ContainerView *container : containers)
+      {
+         if (container == nullptr
+            || statefulWorkerTopologyLockedShardGroups.contains(container->shardGroup) == false
+            || containerUsesStatefulWorkerTopologyUpgradeSource(container) == false)
+         {
+            continue;
+         }
+
+         if (container->state != ContainerState::destroyed
+            && container->state != ContainerState::destroying
+            && container->state != ContainerState::aboutToDestroy)
+         {
+            haveSource = true;
+            break;
+         }
+      }
+
+      if (haveSource == false)
+      {
+         return;
+      }
+
+      statefulWorkerTopologyUpgradePhase = StatefulWorkerTopologyUpgradePhase::greenBootstrap;
+      statefulWorkerTopologyUpgradePhaseChangedAtMs = Time::now<TimeResolution::ms>();
+      for (uint32_t shardGroup : statefulWorkerTopologyLockedShardGroups)
+      {
+         masterForShardGroup.erase(shardGroup);
+      }
+
+      for (ContainerView *container : containers)
+      {
+         if (container == nullptr
+            || container->isStateful == false
+            || statefulWorkerTopologyLockedShardGroups.contains(container->shardGroup) == false)
+         {
+            continue;
+         }
+
+         clearStatefulWorkerTopologyCutoverBarrier(container);
+
+         if (containerUsesStatefulWorkerTopologyUpgradeTarget(container))
+         {
+            configureStatefulWorkerTopologyUpgradeTarget(container);
+         }
+         else
+         {
+            configureStatefulWorkerTopologyUpgradeSource(container);
+         }
+
+         reconcileLiveStatefulTopologyServices(container);
+      }
+
+      persistStatefulWorkerTopologyUpgradeOperation();
+   }
+
+   void scheduleStatefulWorkerTopologyUpgradeBlueRetirement(void)
+   {
+      if (statefulWorkerTopologyUpgradePendingForAnyShardGroup() == false
+         || statefulWorkerTopologyUpgradePhase != StatefulWorkerTopologyUpgradePhase::blueDraining)
+      {
+         return;
+      }
+
+      bool queued = false;
+      for (ContainerView *container : containers)
+      {
+         if (container == nullptr
+            || container->machine == nullptr
+            || statefulWorkerTopologyLockedShardGroups.contains(container->shardGroup) == false
+            || containerUsesStatefulWorkerTopologyUpgradeSource(container) == false
+            || container->plannedWork != nullptr)
+         {
+            continue;
+         }
+
+         switch (container->state)
+         {
+            case ContainerState::planned:
+            case ContainerState::scheduled:
+            case ContainerState::healthy:
+            case ContainerState::crashedRestarting:
+            {
+               scheduleStatefulDestruction(container);
+               queued = true;
+               break;
+            }
+            default: break;
+         }
+      }
+
+      if (queued)
+      {
+         schedule(nullptr);
+      }
+   }
+
+   bool statefulWorkerTopologyUpgradeGreenReadyForCutover(void) const
+   {
+      if (statefulWorkerTopologyUpgradePendingForAnyShardGroup() == false
+         || statefulWorkerTopologyUpgradePhase != StatefulWorkerTopologyUpgradePhase::greenBootstrap)
+      {
+         return false;
+      }
+
+      const uint32_t expectedTargets = uint32_t(statefulWorkerTopologyLockedShardGroups.size() * 3);
+      uint32_t observedTargets = 0;
+      uint32_t readyTargets = 0;
+
+      for (ContainerView *container : containers)
+      {
+         if (container == nullptr
+            || statefulWorkerTopologyLockedShardGroups.contains(container->shardGroup) == false
+            || containerUsesStatefulWorkerTopologyUpgradeTarget(container) == false)
+         {
+            continue;
+         }
+
+         ++observedTargets;
+         if (container->state == ContainerState::healthy
+            && container->runtimeReady
+            && containerHasStatefulWorkerTopologyCutoverBarrier(container))
+         {
+            ++readyTargets;
+         }
+      }
+
+      return (expectedTargets > 0 && observedTargets == expectedTargets && readyTargets == expectedTargets);
+   }
+
+   void commitStatefulWorkerTopologyUpgradeCutover(void)
+   {
+      if (statefulWorkerTopologyUpgradeGreenReadyForCutover() == false)
+      {
+         return;
+      }
+
+      statefulWorkerTopologyUpgradePhase = StatefulWorkerTopologyUpgradePhase::blueDraining;
+      statefulWorkerTopologyUpgradePhaseChangedAtMs = Time::now<TimeResolution::ms>();
+#if PRODIGY_DEBUG
+      std::fprintf(stderr, "stateful topology cutover deploymentID=%llu sourceEpoch=%u targetEpoch=%u workers=%u->%u lockedGroups=%u\n",
+         (unsigned long long)plan.config.deploymentID(),
+         unsigned(statefulWorkerTopologyUpgradeSourceEpoch),
+         unsigned(statefulWorkerTopologyUpgradeTargetEpoch),
+         unsigned(statefulWorkerTopologyUpgradeSourceWorkerCount),
+         unsigned(statefulWorkerTopologyUpgradeTargetWorkerCount),
+         unsigned(statefulWorkerTopologyLockedShardGroups.size()));
+      std::fflush(stderr);
+#endif
+      autoscaleTrace("autoscale topologyCutover deploymentID=%llu sourceEpoch=%u targetEpoch=%u workers=%u->%u lockedGroups=%u\n",
+         (unsigned long long)plan.config.deploymentID(),
+         unsigned(statefulWorkerTopologyUpgradeSourceEpoch),
+         unsigned(statefulWorkerTopologyUpgradeTargetEpoch),
+         unsigned(statefulWorkerTopologyUpgradeSourceWorkerCount),
+         unsigned(statefulWorkerTopologyUpgradeTargetWorkerCount),
+         unsigned(statefulWorkerTopologyLockedShardGroups.size()));
+      for (uint32_t shardGroup : statefulWorkerTopologyLockedShardGroups)
+      {
+         masterForShardGroup.erase(shardGroup);
+      }
+
+      for (ContainerView *container : containers)
+      {
+         if (container == nullptr
+            || container->isStateful == false
+            || statefulWorkerTopologyLockedShardGroups.contains(container->shardGroup) == false)
+         {
+            continue;
+         }
+
+         clearStatefulWorkerTopologyCutoverBarrier(container);
+
+         if (containerUsesStatefulWorkerTopologyUpgradeTarget(container))
+         {
+            configureStatefulWorkerTopologyUpgradeTarget(container);
+         }
+         else
+         {
+            configureStatefulWorkerTopologyUpgradeSource(container);
+         }
+
+         reconcileLiveStatefulTopologyServices(container);
+      }
+
+      persistStatefulWorkerTopologyUpgradeOperation();
+      armStatefulWorkerTopologyUpgradeRollbackTimer();
+   }
+
+   void reconcileLiveStatefulTopologyServices(ContainerView *container)
+   {
+      if (container == nullptr || container->isStateful == false || thisBrain == nullptr || thisBrain->mesh == nullptr)
+      {
+         return;
+      }
+
+      StatefulMeshRoles roles = container->effectiveStatefulMeshRoles(plan);
+      StatefulTopology topology = container->effectiveStatefulTopology(plan);
+
+      auto ensureAdvertisement = [&] (uint64_t service, ContainerState startAt, ContainerState stopAt) -> void {
+
+         if (service == 0)
+         {
+            return;
+         }
+
+         auto it = container->advertisements.find(service);
+         if (it == container->advertisements.end())
+         {
+            uint16_t port = container->getRandomAdvertisementPort();
+            it = container->advertisements.emplace(service, Advertisement(service, startAt, stopAt, port)).first;
+            container->advertisingOnPorts.insert(it->second.port);
+         }
+
+         if (startAt == ContainerState::scheduled)
+         {
+            if (container->state == ContainerState::scheduled || container->state == ContainerState::healthy)
+            {
+               thisBrain->mesh->advertise(service, container, it->second.port, false);
+            }
+         }
+         else if (startAt == ContainerState::healthy && container->state == ContainerState::healthy)
+         {
+            thisBrain->mesh->advertise(service, container, it->second.port, false);
+         }
+      };
+
+      auto eraseAdvertisement = [&] (uint64_t service) -> void {
+
+         if (service == 0)
+         {
+            return;
+         }
+
+         auto it = container->advertisements.find(service);
+         if (it == container->advertisements.end())
+         {
+            return;
+         }
+
+         container->advertisingOnPorts.erase(it->second.port);
+         thisBrain->mesh->stopAdvertisement(service, container, false);
+         container->advertisements.erase(it);
+      };
+
+      auto ensureSubscription = [&] (uint64_t service, ContainerState startAt, ContainerState stopAt, SubscriptionNature nature) -> void {
+
+         if (service == 0)
+         {
+            return;
+         }
+
+         auto it = container->subscriptions.find(service);
+         if (it == container->subscriptions.end())
+         {
+            it = container->subscriptions.emplace(service, Subscription(service, startAt, stopAt, nature)).first;
+         }
+
+         if (startAt == ContainerState::scheduled)
+         {
+            if (container->state == ContainerState::scheduled || container->state == ContainerState::healthy)
+            {
+               thisBrain->mesh->subscribe(service, container, it->second.nature, false);
+            }
+         }
+      };
+
+      auto eraseSubscription = [&] (uint64_t service) -> void {
+
+         if (service == 0)
+         {
+            return;
+         }
+
+         auto it = container->subscriptions.find(service);
+         if (it == container->subscriptions.end())
+         {
+            return;
+         }
+
+         thisBrain->mesh->stopSubscription(service, container, it->second.nature, false);
+         container->subscriptions.erase(it);
+      };
+
+      if (roles.topologyBridge != 0 && prodigyStatefulTopologyShouldAdvertiseBridge(topology))
+      {
+         ensureAdvertisement(roles.topologyBridge, ContainerState::scheduled, ContainerState::destroying);
+      }
+      else
+      {
+         eraseAdvertisement(roles.topologyBridge);
+      }
+
+      if (roles.topologyBridge != 0 && prodigyStatefulTopologyShouldSubscribeBridge(topology))
+      {
+         ensureSubscription(roles.topologyBridge, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all);
+      }
+      else
+      {
+         eraseSubscription(roles.topologyBridge);
+      }
+
+      if (prodigyStatefulTopologyServesClients(topology) == false)
+      {
+         eraseAdvertisement(roles.client);
+         if (plan.stateful.allMasters == false)
+         {
+            auto masterIt = masterForShardGroup.find(container->shardGroup);
+            if (masterIt != masterForShardGroup.end() && masterIt->second == container)
+            {
+               masterForShardGroup.erase(masterIt);
+            }
+         }
+      }
+      else if (roles.client != 0)
+      {
+         bool shouldAdvertiseClient = plan.stateful.allMasters;
+         if (plan.stateful.allMasters == false)
+         {
+            auto masterIt = masterForShardGroup.find(container->shardGroup);
+            if (masterIt == masterForShardGroup.end() || masterIt->second == nullptr || masterIt->second->state == ContainerState::destroyed)
+            {
+               masterForShardGroup.insert_or_assign(container->shardGroup, container);
+               shouldAdvertiseClient = true;
+            }
+            else
+            {
+               shouldAdvertiseClient = (masterIt->second == container);
+            }
+         }
+
+         if (shouldAdvertiseClient)
+         {
+            ensureAdvertisement(roles.client, ContainerState::healthy, ContainerState::destroying);
+         }
+         else
+         {
+            eraseAdvertisement(roles.client);
+         }
+      }
+   }
+
+   void reconcileStatefulWorkerTopologyUpgradeContainers(void)
+   {
+      if (statefulWorkerTopologyUpgradePendingForAnyShardGroup() == false)
+      {
+         return;
+      }
+
+      if (statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::blueDraining)
+      {
+         for (uint32_t shardGroup : statefulWorkerTopologyLockedShardGroups)
+         {
+            masterForShardGroup.erase(shardGroup);
+         }
+      }
+
+      for (ContainerView *container : containers)
+      {
+         if (container == nullptr || container->isStateful == false || statefulWorkerTopologyLockedShardGroups.contains(container->shardGroup) == false)
+         {
+            continue;
+         }
+
+         const StatefulTopology& explicitTopology = container->explicitStatefulTopology;
+         if (explicitTopology.operationID == statefulWorkerTopologyUpgradeOperationID
+            && explicitTopology.topologyEpoch == statefulWorkerTopologyUpgradeTargetEpoch)
+         {
+            configureStatefulWorkerTopologyUpgradeTarget(container);
+         }
+         else
+         {
+            configureStatefulWorkerTopologyUpgradeSource(container);
+         }
+
+         reconcileLiveStatefulTopologyServices(container);
+      }
+   }
 
 	bool isDecommissioning(void) const // it's possible the new deployment has to wait for this to complete work... and it won't be marked as decomissioning until after that?
 	{
@@ -3234,6 +4837,7 @@ class ApplicationDeployment : public TimeoutDispatcher {
 		bool active = (closing == false && machine->neuron.isFixedFile && machine->neuron.fslot >= 0);
 		uint32_t bytesAfter = machine->neuron.wBuffer.size();
 
+#if PRODIGY_DEBUG
 		if (topic == NeuronTopic::spinContainer || topic == NeuronTopic::killContainer || active == false || closing)
 		{
 			std::fprintf(stderr, "deployment queueSend topic=%u deploymentID=%llu machinePrivate4=%u active=%d closing=%d pendingSend=%d bytesBefore=%u bytesAfter=%u connected=%d fd=%d fslot=%d\n",
@@ -3250,6 +4854,7 @@ class ApplicationDeployment : public TimeoutDispatcher {
 				machine->neuron.fslot);
 			std::fflush(stderr);
 		}
+#endif
 
 		Ring::queueSend(&machine->neuron);
 	}
@@ -3765,7 +5370,14 @@ class ApplicationDeployment : public TimeoutDispatcher {
 
 					if (baseUp)
 					{
-						nTargetBase += baseStep;
+						if (plan.isStateful && statefulWorkerTopologyUpgradePendingForAnyShardGroup())
+						{
+                     requestDeferredStatefulShardGrowth(1);
+						}
+						else
+						{
+							nTargetBase += baseStep;
+						}
 
 						// reserve up implies surge down, if the application uses surge, since a surge instance would've been spun up earlier
 						if (nTargetSurge > 0) nTargetSurge -= 1;
@@ -3805,16 +5417,28 @@ class ApplicationDeployment : public TimeoutDispatcher {
 						{
 							if (nTargetBase > beforeBase)
 							{
-								// flip this flag here that we're deploying a new shard group so that we wait for all those containers to be healthy
-								deployingNewShardGroup = true;
+								if (statefulWorkerTopologyUpgradePendingForAnyShardGroup())
+                        {
+                           autoscaleTrace("autoscale shardGrowthBlockedByTopologyUpgrade deploymentID=%llu shardGroups=%u lockedGroups=%u targetWorkers=%u\n",
+                              (unsigned long long)plan.config.deploymentID(),
+                              unsigned(nShardGroups),
+                              unsigned(statefulWorkerTopologyLockedShardGroups.size()),
+                              unsigned(statefulWorkerTopologyUpgradeTargetWorkerCount));
+                        }
+                        else
+                        {
+								   // flip this flag here that we're deploying a new shard group so that we wait for all those containers to be healthy
+								   deployingNewShardGroup = true;
 
-								Vector<uint32_t> shardGroups;
-								// Each shard group has three replicas; enqueue all three immediately.
-								shardGroups.insert(shardGroups.end(), 3, nShardGroups);
+								   Vector<uint32_t> shardGroups;
+								   // Each shard group has three replicas; enqueue all three immediately.
+								   shardGroups.insert(shardGroups.end(), 3, nShardGroups);
 
-								nShardGroups += 1;
+								   nShardGroups += 1;
+                           recomputeStatefulBaseTargetFromShardGroups();
 
-								spinStateful(nullptr, shardGroups);
+								   spinStateful(nullptr, shardGroups);
+                        }
 							}
 						}
 						else
@@ -4042,6 +5666,45 @@ class ApplicationDeployment : public TimeoutDispatcher {
 				int32_t deltaCores = int32_t(nextCores) - int32_t(oldCores);
 				int32_t deltaMemoryMB = int32_t(nextTotalMemoryMB) - int32_t(oldTotalMemoryMB);
 				int32_t deltaStorageMB = int32_t(nextTotalStorageMB) - int32_t(oldTotalStorageMB);
+            uint32_t oldWorkerCount = prodigyStatefulWorkerCountForLogicalCores(oldCores);
+            uint32_t nextWorkerCount = prodigyStatefulWorkerCountForLogicalCores(nextCores);
+
+            if (prodigyStatefulCoreChangeRequiresTopologyUpgrade(plan.isStateful, oldCores, nextCores))
+            {
+               if (deployingNewShardGroup)
+               {
+                  requestDeferredStatefulTopologyTarget(uint16_t(nextCores), nextMemoryMB, nextStorageMB);
+                  autoscaleTrace("autoscale topologyUpgradeBlockedByShardGrowth deploymentID=%llu cores=%u->%u workers=%u->%u shardGroups=%u\n",
+                     (unsigned long long)plan.config.deploymentID(),
+                     unsigned(oldCores),
+                     unsigned(nextCores),
+                     unsigned(oldWorkerCount),
+                     unsigned(nextWorkerCount),
+                     unsigned(nShardGroups));
+               }
+               else
+               {
+                  if (statefulWorkerTopologyUpgradePendingForAnyShardGroup() == false)
+                  {
+                     armStatefulWorkerTopologyUpgrade(oldWorkerCount, nextWorkerCount, uint16_t(nextCores), nextMemoryMB, nextStorageMB);
+                  }
+                  else
+                  {
+                     requestDeferredStatefulTopologyTarget(uint16_t(nextCores), nextMemoryMB, nextStorageMB);
+                  }
+
+                  autoscaleTrace("autoscale topologyUpgradeRequired deploymentID=%llu cores=%u->%u workers=%u->%u lockedGroups=%u pending=%u\n",
+                     (unsigned long long)plan.config.deploymentID(),
+                     unsigned(oldCores),
+                     unsigned(nextCores),
+                     unsigned(oldWorkerCount),
+                     unsigned(nextWorkerCount),
+                     unsigned(statefulWorkerTopologyLockedShardGroups.size()),
+                     unsigned(statefulWorkerTopologyUpgradePending));
+               }
+            }
+            else
+            {
 
 				bytell_hash_map<Machine *, uint32_t> containersPerMachine;
 				for (ContainerView *container : containers)
@@ -4129,6 +5792,7 @@ class ApplicationDeployment : public TimeoutDispatcher {
 						unsigned(oldStorageMB),
 						unsigned(nextStorageMB));
 				}
+            }
 			}
 			else if (isDecommissioning()) rollForward(); // there's a new deployment version waiting to be deployed
 		}
@@ -4197,10 +5861,66 @@ public:
 
 	uint32_t nSuspended = 0;
 
+	bool recoveredStatelessContainerHostIsLive(ContainerView *container) const
+	{
+		if (container == nullptr || container->machine == nullptr)
+		{
+			return false;
+		}
+
+		return prodigyMachineReadyForScheduling(container->machine);
+	}
+
+	void discardRecoveredStatelessContainersOnUnavailableHosts(const char *reason)
+	{
+		if (plan.isStateful)
+		{
+			return;
+		}
+
+		Vector<ContainerView *> staleContainers;
+		for (ContainerView *container : containers)
+		{
+			if (container == nullptr
+				|| container->machine == nullptr
+				|| container->state == ContainerState::none
+				|| container->state == ContainerState::destroyed)
+			{
+				continue;
+			}
+
+			if (recoveredStatelessContainerHostIsLive(container))
+			{
+				continue;
+			}
+
+			staleContainers.push_back(container);
+		}
+
+		for (ContainerView *container : staleContainers)
+		{
+			if (container == nullptr || containers.contains(container) == false)
+			{
+				continue;
+			}
+
+			basics_log("deployment discard unavailable stateless container deploymentID=%llu appID=%u uuid=%llu machinePrivate4=%u state=%u reason=%s\n",
+				(unsigned long long)plan.config.deploymentID(),
+				unsigned(plan.config.applicationID),
+				(unsigned long long)container->uuid,
+				unsigned(container->machine ? container->machine->private4 : 0u),
+				unsigned(container->state),
+				(reason ? reason : "unspecified"));
+			destructContainer(container);
+			containerDestroyed(container);
+		}
+	}
+
 	// Compatibility hook for reboot recovery flows invoked by Brain timeout paths.
 	// Reconcile pending work and close target deficits after master/brain recovery.
 	void recoverAfterReboot(void)
 	{
+#if PRODIGY_DEBUG
 		std::fprintf(stderr,
 			"deployment recoverAfterReboot begin deploymentID=%llu appID=%u state=%u waiting=%llu toSchedule=%llu nDeployed=%u nTarget=%u nHealthy=%u suspended=%u\n",
 			(unsigned long long)plan.config.deploymentID(),
@@ -4213,19 +5933,41 @@ public:
 			unsigned(nHealthy()),
 			unsigned(nSuspended));
 		std::fflush(stderr);
+#endif
 
 		if (state == DeploymentState::failed || state == DeploymentState::decommissioning)
 		{
 			return;
 		}
 
+		bool activeLocalTransition = (
+			state == DeploymentState::deploying
+			|| state == DeploymentState::canaries
+			|| waitingOnCompactions
+			|| waitingOnContainers.size() > 0
+			|| schedulingStack.execution != nullptr
+			|| canaryStack != nullptr);
 		if (nSuspended > 0)
 		{
-			return;
+			if (activeLocalTransition)
+			{
+				return;
+			}
+
+#if PRODIGY_DEBUG
+			std::fprintf(stderr,
+				"deployment recoverAfterReboot clear-stale-suspension deploymentID=%llu appID=%u suspended=%u\n",
+				(unsigned long long)plan.config.deploymentID(),
+				unsigned(plan.config.applicationID),
+				unsigned(nSuspended));
+			std::fflush(stderr);
+#endif
+			nSuspended = 0;
 		}
 
 		if (toSchedule.size() > 0)
 		{
+#if PRODIGY_DEBUG
 			std::fprintf(stderr,
 				"deployment recoverAfterReboot reschedule-pending deploymentID=%llu appID=%u toSchedule=%llu waiting=%llu\n",
 				(unsigned long long)plan.config.deploymentID(),
@@ -4233,6 +5975,7 @@ public:
 				(unsigned long long)toSchedule.size(),
 				(unsigned long long)waitingOnContainers.size());
 			std::fflush(stderr);
+#endif
 			schedule(nullptr);
 			return;
 		}
@@ -4246,10 +5989,17 @@ public:
 		uint32_t actualHealthyBase = 0;
 		uint32_t actualHealthySurge = 0;
 
+		discardRecoveredStatelessContainersOnUnavailableHosts("recoverAfterReboot");
+
 		for (ContainerView *container : containers)
 		{
 			bool countsAsDeployed = (container->state != ContainerState::none && container->state != ContainerState::destroyed);
 			bool countsAsHealthy = (container->state == ContainerState::healthy);
+			if (plan.isStateful == false && recoveredStatelessContainerHostIsLive(container) == false)
+			{
+				countsAsDeployed = false;
+				countsAsHealthy = false;
+			}
 
 			switch (container->lifetime)
 			{
@@ -4277,12 +6027,24 @@ public:
 		nDeployedCanary = actualDeployedCanary;
 		nDeployedBase = actualDeployedBase;
 		nDeployedSurge = actualDeployedSurge;
-		nHealthyCanary = actualHealthyCanary;
-		nHealthyBase = actualHealthyBase;
-		nHealthySurge = actualHealthySurge;
+			nHealthyCanary = actualHealthyCanary;
+			nHealthyBase = actualHealthyBase;
+			nHealthySurge = actualHealthySurge;
 
-		for (ContainerView *container : containers)
+			if (nTarget() == 0)
+			{
+				calculateTargets();
+			}
+
+	      reconcileStatefulWorkerTopologyUpgradeContainers();
+
+			for (ContainerView *container : containers)
 		{
+			if (plan.isStateful == false && recoveredStatelessContainerHostIsLive(container) == false)
+			{
+				continue;
+			}
+
 			if (container->state == ContainerState::scheduled || container->state == ContainerState::healthy)
 			{
 				container->replayActivePairingsToSelf();
@@ -4294,6 +6056,7 @@ public:
 		// registrations arrive after initial evaluateAfterNewMaster() planning.
 		if (nDeployed() < nTarget())
 		{
+#if PRODIGY_DEBUG
 			std::fprintf(stderr,
 				"deployment recoverAfterReboot underprovisioned deploymentID=%llu appID=%u nDeployed=%u nTarget=%u waiting=%llu hasHealthyMachines=%d\n",
 				(unsigned long long)plan.config.deploymentID(),
@@ -4303,6 +6066,7 @@ public:
 				(unsigned long long)waitingOnContainers.size(),
 				int(thisBrain->hasHealthyMachines()));
 			std::fflush(stderr);
+#endif
 			// On master handoff, followers may still be reconnecting neuron control sockets.
 			// Do not request additional machines until at least one machine is healthy.
 			if (thisBrain->hasHealthyMachines() == false)
@@ -4310,14 +6074,13 @@ public:
 				return;
 			}
 
-			CoroutineStack *coro = new CoroutineStack();
-			architect(coro, false);
-			delete coro;
+				architect(nullptr, false, false, false);
 
 			if (toSchedule.size() > 0)
 			{
 				state = DeploymentState::deploying;
 				stateChangedAtMs = Time::now<TimeResolution::ms>();
+#if PRODIGY_DEBUG
 				std::fprintf(stderr,
 					"deployment recoverAfterReboot reschedule-underprovisioned deploymentID=%llu appID=%u toSchedule=%llu waiting=%llu\n",
 					(unsigned long long)plan.config.deploymentID(),
@@ -4325,6 +6088,7 @@ public:
 					(unsigned long long)toSchedule.size(),
 					(unsigned long long)waitingOnContainers.size());
 				std::fflush(stderr);
+#endif
 				schedule(nullptr);
 			}
 		}
@@ -4377,6 +6141,12 @@ public:
 
 	DeploymentWork* planStatefulConstruction(Machine *machine, ContainerView *container, DataStrategy dataStrategy)
 	{
+      if (statefulWorkerTopologyUpgradeLocksShardGroup(container->shardGroup)
+         && container->explicitStatefulTopology.configured() == false)
+      {
+         configureStatefulWorkerTopologyUpgradeTarget(container);
+      }
+
 		DeploymentWork *work = workPool.get();
 		work->emplace<StatefulWork>(LifecycleOp::construct, machine, container, dataStrategy);
 
@@ -4384,6 +6154,31 @@ public:
 
 		return work;
 	}
+
+   void configureStatefulPlacement(ContainerView *container, uint32_t topologyEpoch)
+   {
+      if (container == nullptr || statefulWorkerTopologyUpgradeLocksShardGroup(container->shardGroup) == false)
+      {
+         return;
+      }
+
+      if (topologyEpoch != 0)
+      {
+         if (topologyEpoch == statefulWorkerTopologyUpgradeTargetEpoch)
+         {
+            configureStatefulWorkerTopologyUpgradeTarget(container);
+            return;
+         }
+
+         if (topologyEpoch == statefulWorkerTopologyUpgradeSourceEpoch)
+         {
+            configureStatefulWorkerTopologyUpgradeSource(container);
+            return;
+         }
+      }
+
+      configureStatefulWorkerTopologyUpgradeTarget(container);
+   }
 
 	DeploymentWork* planStatefulConstruction(Machine *machine, uint32_t shardGroup, DataStrategy dataStrategy, Vector<uint32_t> assignedGPUMemoryMBs = {}, Vector<AssignedGPUDevice> assignedGPUDevices = {})
 	{
@@ -4394,6 +6189,17 @@ public:
 
 		return planStatefulConstruction(machine, container, dataStrategy);
 	}
+
+   DeploymentWork* planStatefulConstruction(Machine *machine, uint32_t shardGroup, uint32_t topologyEpoch, DataStrategy dataStrategy, Vector<uint32_t> assignedGPUMemoryMBs = {}, Vector<AssignedGPUDevice> assignedGPUDevices = {})
+   {
+      ContainerView *container = constructOnMachine(machine, ApplicationLifetime::base, std::move(assignedGPUMemoryMBs), std::move(assignedGPUDevices));
+      container->shardGroup = shardGroup;
+      configureStatefulPlacement(container, topologyEpoch);
+
+      containersByShardGroup.insert(container->shardGroup, container);
+
+      return planStatefulConstruction(machine, container, dataStrategy);
+   }
 
 	DeploymentWork* planStatefulUpdateInPlace(ContainerView *oldContainer, Vector<uint32_t> assignedGPUMemoryMBs = {}, Vector<AssignedGPUDevice> assignedGPUDevices = {})
 	{
@@ -4469,6 +6275,38 @@ public:
 		toSchedule.push_back(planStatefulDestruction(container));
 	}
 
+	void scheduleRemainingPreviousStatelessDestruction(const char *reason)
+	{
+		if (plan.isStateful || previous == nullptr || previous->containers.size() == 0)
+		{
+			return;
+		}
+
+		Vector<ContainerView *> oldContainers;
+		for (ContainerView *container : previous->containers)
+		{
+			oldContainers.push_back(container);
+		}
+
+		for (ContainerView *container : oldContainers)
+		{
+			if (container == nullptr || previous->containers.contains(container) == false)
+			{
+				continue;
+			}
+
+			if (container->plannedWork != nullptr
+				|| container->state == ContainerState::aboutToDestroy
+				|| container->state == ContainerState::destroying
+				|| container->state == ContainerState::destroyed)
+			{
+				continue;
+			}
+
+			toSchedule.push_back(planStatelessDestruction(container, reason));
+		}
+	}
+
 	void scheduleConstructionDestruction(DeploymentWork *cwork, DeploymentWork *dwork)
 	{
 		if (dwork)
@@ -4522,28 +6360,69 @@ public:
 
 	uint32_t nFitOnMachineClaim(MachineTicket *ticket, Machine *machine, uint32_t nMore) // called by requestMoreMachines
 	{
-		if (nFitOnMachine(this, machine, 1) == 0) 									 return 0;
+      if (plan.isStateful && ticket != nullptr && ticket->placementTopologyEpochs.empty())
+      {
+         buildPlacementTopologyEpochs(ticket->placementTopologyEpochs, ticket->shardGroups);
+      }
+
+      if (plan.isStateful && ticket != nullptr && ticket->placementTopologyEpochs.empty() == false)
+      {
+         ApplicationConfig initialConfig = statefulPlacementConfig(ticket->placementTopologyEpochs[0]);
+		   if (nFitOnMachine(this, machine, 1, MachineResourcesDelta{}, &initialConfig) == 0) return 0;
+      }
+      else
+      {
+		   if (nFitOnMachine(this, machine, 1) == 0) 									 return 0;
+      }
 
 		Machine::Claim claim;
 
 		if (plan.isStateful)
 		{
+         MachineResourcesDelta claimDeltas = {};
+         uint32_t index = 0;
 			for (auto it = ticket->shardGroups.begin(); it != ticket->shardGroups.end(); )
 			{
-				if (uint32_t shardGroup = *it; racksByShardGroup[shardGroup].contains(machine->rack) == false) 
+				if (uint32_t shardGroup = *it; canPlaceReplicaForShardGroupOnRack(shardGroup, machine->rack))
 				{
-					if (nFitOnMachine(this, machine, claim.shardGroups.size() + 1) >= (claim.shardGroups.size() + 1))
+               uint32_t topologyEpoch = (index < ticket->placementTopologyEpochs.size()) ? ticket->placementTopologyEpochs[index] : 0;
+               ApplicationConfig schedulingConfig = statefulPlacementConfig(topologyEpoch);
+					if (nFitOnMachine(this, machine, 1, claimDeltas, &schedulingConfig) > 0)
 					{
 						it = ticket->shardGroups.erase(it);
+                  if (index < ticket->placementTopologyEpochs.size())
+                  {
+                     ticket->placementTopologyEpochs.erase(ticket->placementTopologyEpochs.begin() + index);
+                  }
 
 						claim.shardGroups.push_back(shardGroup);
+                  claim.placementTopologyEpochs.push_back(topologyEpoch);
 						racksByShardGroup[shardGroup].insert(machine->rack);
+                  prodigyApplyPlannedMachineScalarDelta(claimDeltas, schedulingConfig, 1);
+                  if (applicationUsesSharedCPUs(schedulingConfig))
+                  {
+                     claim.reservedSharedCPUMillisTotal += applicationRequestedCPUMillis(schedulingConfig);
+                  }
+                  else
+                  {
+                     claim.reservedIsolatedLogicalCoresTotal += applicationRequiredIsolatedCores(schedulingConfig);
+                  }
+                  claim.reservedMemoryMBTotal += schedulingConfig.totalMemoryMB();
+                  claim.reservedStorageMBTotal += schedulingConfig.totalStorageMB();
+
+                  Vector<uint32_t> reservedGPUMemoryMBs = {};
+                  Vector<AssignedGPUDevice> reservedGPUDevices = {};
+                  bool reservedGPUs = prodigyReserveMachineGPUsForInstance(machine, schedulingConfig, reservedGPUMemoryMBs, &reservedGPUDevices);
+                  assert(reservedGPUs && "stateful machine claim must reserve GPUs for each selected placement");
+                  prodigyAppendGPUMemoryMBs(claim.reservedGPUMemoryMBs, reservedGPUMemoryMBs);
+                  prodigyAppendAssignedGPUDevices(claim.reservedGPUDevices, reservedGPUDevices);
 					}
 					else break;
 				}
 				else
 				{
 					it++;
+               index += 1;
 					continue;
 				}
 			}
@@ -4569,17 +6448,28 @@ public:
 
 		if (nFit > 0)
 		{
-         claim.reservedIsolatedLogicalCoresPerInstance = applicationRequiredIsolatedCores(plan.config);
-         claim.reservedSharedCPUMillisPerInstance = applicationUsesSharedCPUs(plan.config) ? applicationRequestedCPUMillis(plan.config) : 0;
-         claim.reservedMemoryMBPerInstance = plan.config.totalMemoryMB();
-         claim.reservedStorageMBPerInstance = plan.config.totalStorageMB();
-         if (prodigyReserveMachineGPUsForInstances(machine, plan.config, nFit, claim.reservedGPUMemoryMBs, &claim.reservedGPUDevices) == false)
+         if (plan.isStateful)
          {
-            claim.nFit = 0;
-            return 0;
+            for (uint32_t topologyEpoch : claim.placementTopologyEpochs)
+            {
+               ApplicationConfig schedulingConfig = statefulPlacementConfig(topologyEpoch);
+               prodigyDebitMachineScalarResources(machine, schedulingConfig, 1);
+            }
          }
+         else
+         {
+            claim.reservedIsolatedLogicalCoresPerInstance = applicationRequiredIsolatedCores(plan.config);
+            claim.reservedSharedCPUMillisPerInstance = applicationUsesSharedCPUs(plan.config) ? applicationRequestedCPUMillis(plan.config) : 0;
+            claim.reservedMemoryMBPerInstance = plan.config.totalMemoryMB();
+            claim.reservedStorageMBPerInstance = plan.config.totalStorageMB();
+            if (prodigyReserveMachineGPUsForInstances(machine, plan.config, nFit, claim.reservedGPUMemoryMBs, &claim.reservedGPUDevices) == false)
+            {
+               claim.nFit = 0;
+               return 0;
+            }
 
-         prodigyDebitMachineScalarResources(machine, plan.config, nFit);
+            prodigyDebitMachineScalarResources(machine, plan.config, nFit);
+         }
 
 			countPerMachine[machine] += nFit;
 			countPerRack[machine->rack] += nFit;
@@ -4630,20 +6520,22 @@ public:
       uint64_t nMemoryMB,
       uint64_t nStorageMB,
       const Vector<uint32_t>& availableGPUMemoryMBs,
-      uint32_t budget)
+      uint32_t budget,
+      const ApplicationConfig *configOverride = nullptr)
 	{
+      const ApplicationConfig& config = (configOverride ? *configOverride : deployment->plan.config);
       uint64_t capacityPerCores = 0;
-      if (applicationUsesSharedCPUs(deployment->plan.config))
+      if (applicationUsesSharedCPUs(config))
       {
-         uint64_t requestedSharedCPU = applicationRequestedCPUMillis(deployment->plan.config);
+         uint64_t requestedSharedCPU = applicationRequestedCPUMillis(config);
          capacityPerCores = (requestedSharedCPU ? (sharedCPUMillis / requestedSharedCPU) : 0);
       }
       else
       {
-		   capacityPerCores = (deployment->plan.config.nLogicalCores ? (nCores / deployment->plan.config.nLogicalCores) : 0);
+		   capacityPerCores = (config.nLogicalCores ? (nCores / config.nLogicalCores) : 0);
       }
-		uint64_t capacityPerMemory = (deployment->plan.config.totalMemoryMB() ? (nMemoryMB / deployment->plan.config.totalMemoryMB()) : 0);
-		uint64_t capacityPerStorage = (deployment->plan.config.totalStorageMB() ? (nStorageMB / deployment->plan.config.totalStorageMB()) : 0);
+		uint64_t capacityPerMemory = (config.totalMemoryMB() ? (nMemoryMB / config.totalMemoryMB()) : 0);
+		uint64_t capacityPerStorage = (config.totalStorageMB() ? (nStorageMB / config.totalStorageMB()) : 0);
 
 		uint64_t canScheduleN = budget;
 
@@ -4651,7 +6543,7 @@ public:
 		if (capacityPerMemory < canScheduleN) canScheduleN = capacityPerMemory;
 		if (capacityPerStorage < canScheduleN) canScheduleN = capacityPerStorage;
 
-      uint32_t requiredGPUs = applicationRequiredWholeGPUs(deployment->plan.config);
+      uint32_t requiredGPUs = applicationRequiredWholeGPUs(config);
       if (requiredGPUs > 0 && canScheduleN > 0)
       {
          Vector<uint32_t> scratchGPUMemoryMBs = availableGPUMemoryMBs;
@@ -4664,7 +6556,7 @@ public:
                nullptr,
                nullptr,
                requiredGPUs,
-               applicationRequiredGPUMemoryMB(deployment->plan.config),
+               applicationRequiredGPUMemoryMB(config),
                assignedGPUMemoryMBs))
          {
             capacityPerGPUs += 1;
@@ -4825,14 +6717,16 @@ public:
       return false;
    }
 
-	static uint32_t nFitOnMachine(ApplicationDeployment *deployment, Machine *machine, uint32_t budget, const MachineResourcesDelta& deltas = MachineResourcesDelta{})
+	static uint32_t nFitOnMachine(ApplicationDeployment *deployment, Machine *machine, uint32_t budget, const MachineResourcesDelta& deltas = MachineResourcesDelta{}, const ApplicationConfig *configOverride = nullptr)
 	{
       if (deployment == nullptr || machine == nullptr)
       {
          return 0;
       }
 
-      if (prodigyMachineMeetsApplicationResourceCriteria(machine, deployment->plan.config) == false)
+      const ApplicationConfig& config = (configOverride ? *configOverride : deployment->plan.config);
+
+      if (prodigyMachineMeetsApplicationResourceCriteria(machine, config) == false)
       {
          return 0;
       }
@@ -5002,7 +6896,7 @@ public:
 		uint64_t uMemory  = static_cast<uint64_t>(nMemory  > 0 ? nMemory  : 0);
 		uint64_t uStorage = static_cast<uint64_t>(nStorage > 0 ? nStorage : 0);
 
-      uint32_t fit = nFitOntoResources(deployment, uCores, uSharedCPU, uMemory, uStorage, availableGPUMemoryMBs, budget);
+      uint32_t fit = nFitOntoResources(deployment, uCores, uSharedCPU, uMemory, uStorage, availableGPUMemoryMBs, budget, &config);
       if (fit == 0 && deployment != nullptr && deployment->plan.whiteholes.empty() == false)
       {
          String machineUUIDText = {};
@@ -5019,11 +6913,11 @@ public:
             (unsigned long long)uMemory,
             (unsigned long long)uStorage,
             (unsigned long long)availableGPUMemoryMBs.size(),
-            unsigned(deployment->plan.config.nLogicalCores),
-            unsigned(applicationRequestedCPUMillis(deployment->plan.config)),
-            unsigned(deployment->plan.config.totalMemoryMB()),
-            unsigned(deployment->plan.config.totalStorageMB()),
-            unsigned(applicationRequiredWholeGPUs(deployment->plan.config)),
+            unsigned(config.nLogicalCores),
+            unsigned(applicationRequestedCPUMillis(config)),
+            unsigned(config.totalMemoryMB()),
+            unsigned(config.totalStorageMB()),
+            unsigned(applicationRequiredWholeGPUs(config)),
             unsigned(budget),
             unsigned(containerSlotBudget)
          );
@@ -5061,6 +6955,23 @@ public:
 	int32_t verticalAdjustment_nLogicalCores = 0;
 	int32_t verticalAdjustment_memoryMB = 0;
 	int32_t verticalAdjustment_storageMB = 0;
+   bool statefulWorkerTopologyUpgradePending = false;
+   StatefulWorkerTopologyUpgradePhase statefulWorkerTopologyUpgradePhase = StatefulWorkerTopologyUpgradePhase::none;
+   uint64_t statefulWorkerTopologyUpgradeOperationID = 0;
+   uint32_t statefulWorkerTopologyUpgradeSourceWorkerCount = 0;
+   uint32_t statefulWorkerTopologyUpgradeTargetWorkerCount = 0;
+   uint32_t statefulWorkerTopologyUpgradeSourceEpoch = 0;
+   uint32_t statefulWorkerTopologyUpgradeTargetEpoch = 0;
+   uint16_t statefulWorkerTopologyUpgradeTargetLogicalCores = 0;
+   uint32_t statefulWorkerTopologyUpgradeTargetMemoryMB = 0;
+   uint32_t statefulWorkerTopologyUpgradeTargetStorageMB = 0;
+   int64_t statefulWorkerTopologyUpgradePhaseChangedAtMs = 0;
+   bytell_hash_set<uint32_t> statefulWorkerTopologyLockedShardGroups;
+   uint32_t deferredStatefulTargetShardGroups = 0;
+   uint16_t deferredStatefulTargetLogicalCores = 0;
+   uint32_t deferredStatefulTargetMemoryMB = 0;
+   uint32_t deferredStatefulTargetStorageMB = 0;
+   int64_t statefulDeferredScaleIntentUpdatedAtMs = 0;
 
 	uint32_t nCrashes = 0;
 
@@ -5099,13 +7010,15 @@ public:
 		{
 			for (uint32_t shardGroup = 0; shardGroup < (nShardGroups - 1); ++shardGroup)
 			{
-				StatefulMeshRoles roles = StatefulMeshRoles::forShardGroup(plan.stateful, shardGroup);
+				StatefulMeshRoles roles = statefulMeshRolesForShardGroup(shardGroup);
 
 				// cull sharding service pairings (this is the signal to delete the sharded data!!!!!!)
 				thisBrain->mesh->stopSubscription(roles.sharding, container, SubscriptionNature::all, true);
 				thisBrain->mesh->stopSubscription(roles.cousin, container, SubscriptionNature::all, true);
 			}
 		}
+
+      dispatchDeferredStatefulScaleIntent();
 	}
 
 	void dispatchTimeout(TimeoutPacket *packet)
@@ -5127,6 +7040,11 @@ public:
 				loadStress();
 				break;
 			}
+         case DeploymentTimeoutFlags::statefulTopologyRollbackWindow:
+         {
+            statefulWorkerTopologyUpgradeRollbackWindowExpired();
+            break;
+         }
 		}
 	}
 
@@ -5135,6 +7053,7 @@ public:
 	void drainMachine(Machine *machine, bool failed)
 	{
 		Vector<ContainerView *> containersToRedeploy;
+		Vector<ContainerView *> skippedScheduledContainers;
 		bytell_hash_set<ContainerView *> seenContainers;
 
 		auto& bin = machine->containersByDeploymentID[plan.config.deploymentID()];
@@ -5183,7 +7102,7 @@ public:
 							unsigned(machine->private4),
 							(unsigned long long)waitingOnContainers.size(),
 							(unsigned long long)toSchedule.size());
-						bin.push_back(container);
+						skippedScheduledContainers.push_back(container);
 						break;
 					}
 
@@ -5197,17 +7116,17 @@ public:
 								{
 									case ApplicationLifetime::canary:
 									{
-										nHealthyCanary -= 1;
+										if (nHealthyCanary > 0) nHealthyCanary -= 1;
 										break;
 									}
 									case ApplicationLifetime::base:
 									{
-										nHealthyBase -= 1;
+										if (nHealthyBase > 0) nHealthyBase -= 1;
 										break;
 									}
 									case ApplicationLifetime::surge:
 									{
-										nHealthySurge -= 1;
+										if (nHealthySurge > 0) nHealthySurge -= 1;
 										break;
 									}
 								}
@@ -5363,6 +7282,11 @@ public:
 			}
 		}
 
+		for (ContainerView *container : skippedScheduledContainers)
+		{
+			machine->upsertContainerIndexEntry(plan.config.deploymentID(), container);
+		}
+
 		if (containersToRedeploy.size() > 0)
 		{
 			CoroutineStack *coro = new CoroutineStack();
@@ -5424,9 +7348,13 @@ public:
 			++it;
 		}
 
-		if (removed && waitingOnContainers.size() == 0 && schedulingStack.execution)
+		if (removed && waitingOnContainers.size() == 0)
 		{
-			consumeSchedulingExecution();
+         if (schedulingStack.execution)
+         {
+            consumeSchedulingExecution();
+         }
+         dispatchDeferredStatefulScaleIntent();
 		}
 	}
 
@@ -5578,12 +7506,45 @@ public:
 		}
 	}
 
-	void destructContainer(ContainerView *container)
-	{
-		if (container->plannedWork)
+   void containerIsRuntimeReady(ContainerView *container)
+   {
+      if (container == nullptr)
+      {
+         return;
+      }
+
+      if (container->state == ContainerState::destroyed
+         || container->state == ContainerState::destroying
+         || container->state == ContainerState::aboutToDestroy)
+      {
+         return;
+      }
+
+      if (container->runtimeReady == false)
+      {
+         container->runtimeReady = true;
+         container->replayRuntimeReadyPairings();
+      }
+
+      commitStatefulWorkerTopologyUpgradeCutover();
+   }
+
+   void containerStatefulTopologyCutoverBarrierUpdated(ContainerView *container)
+   {
+      if (container == nullptr)
+      {
+         return;
+      }
+
+      commitStatefulWorkerTopologyUpgradeCutover();
+   }
+
+		void destructContainer(ContainerView *container, bool cancelWork = true)
 		{
-			cancelDeploymentWork(container->plannedWork);
-		}
+			if (cancelWork && container->plannedWork)
+			{
+				cancelDeploymentWork(container->plannedWork);
+			}
 
 		if (container->state == ContainerState::aboutToDestroy)
 		{
@@ -5620,10 +7581,11 @@ public:
 		handleContainerStateChange(container, false);
 
 		Machine *machine = container->machine;
+      ApplicationConfig containerConfig = resourceConfigForContainer(container);
 
 		if (container->fragment > 0) machine->relinquishContainerFragment(container->fragment);
 
-      prodigyCreditMachineScalarResources(machine, plan.config, 1);
+      prodigyCreditMachineScalarResources(machine, containerConfig, 1);
       prodigyReleaseContainerGPUs(container);
 
 		containers.erase(container);
@@ -5644,7 +7606,7 @@ public:
          thisBrain->sendNeuronCloseSwitchboardWhiteholesToContainer(container);
       }
 
-			machine->removeContainerIndexEntry(container->deploymentID, container);
+      machine->removeContainerIndexEntry(container->deploymentID, container);
 		}
 
    void containerDestroyed(ContainerView *container)
@@ -5655,22 +7617,42 @@ public:
 
       container->state = ContainerState::destroyed;
       handleContainerStateChange(container, false);
+      completeStatefulWorkerTopologyUpgradeIfReady();
 
 		delete container;
 	}
 
-	void failCanaries(void)
-	{
-		state = DeploymentState::failed;
-		stateChangedAtMs = Time::now<TimeResolution::ms>();
-		Ring::queueCancelTimeout(&canaryTimer);
+		void failCanaries(void)
+		{
+         markCanariesFailed();
 
-		if (canaryStack) canaryStack->co_consume();
-	}
+			if (canaryStack) canaryStack->co_consume();
+		}
 
-	void changeShardGroupMaster(uint32_t shardGroup)
-	{
-		StatefulMeshRoles roles = StatefulMeshRoles::forShardGroup(plan.stateful, shardGroup);
+      void markCanariesFailed(void)
+      {
+         state = DeploymentState::failed;
+         stateChangedAtMs = Time::now<TimeResolution::ms>();
+         Ring::queueCancelTimeout(&canaryTimer);
+      }
+
+      void resumeFailedCanaryRollbackAfterContainerCleanup(void)
+      {
+         if (canaryStack)
+         {
+            canaryStack->co_consume();
+            return;
+         }
+
+         if (waitingOnContainers.empty() && schedulingStack.execution)
+         {
+            consumeSchedulingExecution();
+         }
+      }
+
+		void changeShardGroupMaster(uint32_t shardGroup)
+		{
+		StatefulMeshRoles roles = statefulMeshRolesForShardGroup(shardGroup);
 
 		ContainerView *master = masterForShardGroup[shardGroup];
 
@@ -5692,6 +7674,11 @@ public:
 				default: continue;
 			}
 
+         if (prodigyStatefulTopologyServesClients(other->effectiveStatefulTopology(plan)) == false)
+         {
+            continue;
+         }
+
 			master = other;
 			masterForShardGroup[shardGroup] = master;
 
@@ -5708,25 +7695,47 @@ public:
 		}
 	}
 
-	void containerFailed(ContainerView *container, int64_t approxTimeMs, int signal, const String& report, bool restarted)
-	{
+		void containerFailed(ContainerView *container, int64_t approxTimeMs, int signal, const String& report, bool restarted)
+		{
+	      std::fprintf(stderr,
+	         "deployment containerFailed debug deploymentID=%llu appID=%u uuid=%llu containerDeploymentID=%llu state=%u lifetime=%u signal=%d restarted=%d containersBefore=%llu waitingBefore=%llu reportBytes=%u\n",
+	         (unsigned long long)plan.config.deploymentID(),
+	         unsigned(plan.config.applicationID),
+	         (unsigned long long)(container ? container->uuid : 0),
+	         (unsigned long long)(container ? container->deploymentID : 0),
+	         unsigned(container ? container->state : ContainerState::none),
+	         unsigned(container ? container->lifetime : ApplicationLifetime::base),
+	         signal,
+	         int(restarted),
+	         (unsigned long long)containers.size(),
+	         (unsigned long long)waitingOnContainers.size(),
+	         unsigned(report.size()));
+	      std::fflush(stderr);
+
+	      if (containerUsesStatefulWorkerTopologyUpgradeTarget(container))
+	      {
+	         rollbackStatefulWorkerTopologyUpgradeCutover();
+      }
+
+		bool failedCanary = false;
+
 		if (container->state == ContainerState::healthy)
 		{
 			switch (container->lifetime)
 			{
 				case ApplicationLifetime::canary:
 				{
-					nHealthyCanary -= 1;
+					if (nHealthyCanary > 0) nHealthyCanary -= 1;
 					break;
 				}
 				case ApplicationLifetime::base:
 				{
-					nHealthyBase -= 1;
+					if (nHealthyBase > 0) nHealthyBase -= 1;
 					break;
 				}
 				case ApplicationLifetime::surge:
 				{
-					nHealthySurge -= 1;
+					if (nHealthySurge > 0) nHealthySurge -= 1;
 					break;
 				}
 			}
@@ -5768,12 +7777,15 @@ public:
 			failureReport.restarted = restarted;
 			failureReport.wasCanary = (lifetime == ApplicationLifetime::canary);
 
-			if (lifetime == ApplicationLifetime::canary)
-			{
-				failCanaries();
-			}
+			failedCanary = (lifetime == ApplicationLifetime::canary);
 		}
 		// else a container from the previous deployment failed
+
+      if (failedCanary)
+      {
+         markCanariesFailed();
+         waitingOnContainers.clear();
+      }
 
 		if (restarted == false) 
 		{
@@ -5789,6 +7801,12 @@ public:
 			// non restartable container could've had services exposed
 			destructContainer(container);
 			containerDestroyed(container);
+
+         if (failedCanary)
+         {
+            resumeFailedCanaryRollbackAfterContainerCleanup();
+            return;
+         }
 		}
 		else
 		{
@@ -5822,28 +7840,37 @@ public:
 				}
 			}
 		}
+
+		if (failedCanary)
+		{
+         resumeFailedCanaryRollbackAfterContainerCleanup();
+		}
 	}
 
 		void schedule(CoroutineStack *waiter = nullptr)
 		{
 			if (plan.isStateful)
 			{
+#if PRODIGY_DEBUG
 				std::fprintf(stderr, "schedule enter deploymentID=%llu waiter=%p toSchedule=%llu waitingOnContainers=%llu execution=%p\n",
 					(unsigned long long)plan.config.deploymentID(),
 					(void *)waiter,
 					(unsigned long long)toSchedule.size(),
 					(unsigned long long)waitingOnContainers.size(),
 					(void *)schedulingStack.execution);
+#endif
 			}
 
 			if (schedulingStack.execution != nullptr)
 			{
+#if PRODIGY_DEBUG
 				std::fprintf(stderr, "schedule deferred deploymentID=%llu waiter=%p toSchedule=%llu waitingOnContainers=%llu execution=%p\n",
 					(unsigned long long)plan.config.deploymentID(),
 					(void *)waiter,
 					(unsigned long long)toSchedule.size(),
 					(unsigned long long)waitingOnContainers.size(),
 					(void *)schedulingStack.execution);
+#endif
 				if (waiter) schedulingStack.waiters.push_back(waiter);
 				co_return; // we're already suspended processing the scheduling queue
 			}
@@ -5894,12 +7921,17 @@ public:
 
 				if constexpr (std::is_same_v<T, StatefulWork>)
 				{
-					StatefulMeshRoles roles = StatefulMeshRoles::forShardGroup(plan.stateful, container->shardGroup);
+					StatefulMeshRoles roles = container->effectiveStatefulMeshRoles(plan);
+               StatefulTopology topology = container->effectiveStatefulTopology(plan);
 
 					setupAdvertisement(roles.sibling, ContainerState::scheduled, ContainerState::destroying);
 					setupAdvertisement(roles.seeding, ContainerState::healthy, ContainerState::destroying);
+               if (roles.topologyBridge != 0 && prodigyStatefulTopologyShouldAdvertiseBridge(topology))
+               {
+                  setupAdvertisement(roles.topologyBridge, ContainerState::scheduled, ContainerState::destroying);
+               }
 
-					if (plan.stateful.allMasters || !masterForShardGroup.contains(container->shardGroup))
+					if (prodigyStatefulTopologyServesClients(topology) && (plan.stateful.allMasters || !masterForShardGroup.contains(container->shardGroup)))
 					{
 						if (!plan.stateful.allMasters) masterForShardGroup.insert_or_assign(container->shardGroup, container);
 
@@ -5913,6 +7945,10 @@ public:
 					}
 
 					setupSubscription(roles.sibling, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all);
+               if (roles.topologyBridge != 0 && prodigyStatefulTopologyShouldSubscribeBridge(topology))
+               {
+                  setupSubscription(roles.topologyBridge, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all);
+               }
 
 					if (plan.stateful.seedingAlways)
 					{
@@ -5940,7 +7976,7 @@ public:
 							// feed on 1 instance from every other shard group
 							for (uint32_t shardGroup = 0; shardGroup < (nShardGroups - 1); ++shardGroup) // container->shardGroup will be (nShardGroups - 1) thus excluded
 							{
-								StatefulMeshRoles shardRoles = StatefulMeshRoles::forShardGroup(plan.stateful, shardGroup);
+								StatefulMeshRoles shardRoles = statefulMeshRolesForShardGroup(shardGroup);
 
 								// we'll cancel this subscription manually once all shards in the group are healthy and clients have connected
 
@@ -6003,7 +8039,15 @@ public:
 
 					setupContainerServices(container);
 
-							ContainerPlan containerPlan = container->generatePlan(plan, nShardGroups);
+	                     ApplicationConfig containerConfig = resourceConfigForContainer(container);
+	                     container->runtime_nLogicalCores = uint16_t(applicationSharedCPUCoreHint(containerConfig));
+	                     container->runtime_memoryMB = containerConfig.totalMemoryMB();
+	                     container->runtime_storageMB = containerConfig.totalStorageMB();
+								ContainerPlan containerPlan = container->generatePlan(plan, nShardGroups, &containerConfig);
+                     if (containerPlan.isStateful)
+                     {
+                        prodigyPopulateDefaultStatefulTopology(containerPlan.statefulTopology, containerPlan.shardGroup, containerPlan.config);
+                     }
 							thisBrain->applyCredentialsToContainerPlan(plan, *container, containerPlan);
                      NeuronContainerMetricPolicy metricPolicy = deriveNeuronMetricPolicyForDeployment(plan);
 
@@ -6020,6 +8064,7 @@ public:
 								replaceContainerUUID = replacingContainer->uuid;
 							}
 
+#if PRODIGY_DEBUG
 							std::fprintf(stderr, "schedule spinContainer deploymentID=%llu appID=%u machinePrivate4=%u containerUUID=%llu replaceUUID=%llu state=%d waitingBefore=%llu\n",
 								(unsigned long long)plan.config.deploymentID(),
 								unsigned(plan.config.applicationID),
@@ -6028,6 +8073,7 @@ public:
 								(unsigned long long)replaceContainerUUID,
 								int(state),
 								(unsigned long long)waitingOnContainers.size());
+#endif
 
 								queueSend(machine, NeuronTopic::spinContainer, replaceContainerUUID, buffer);
                      if (container->whiteholes.empty() == false)
@@ -6044,17 +8090,39 @@ public:
 
 						break;
 					}
-				case LifecycleOp::destruct:
-				{
-					// we get 1 container to destroy
-					ContainerView *container = work.oldContainer;
-					assert(container != nullptr && "LifecycleOp::destruct requires oldContainer");
-					destructContainer(container);
+					case LifecycleOp::destruct:
+					{
+						// we get 1 container to destroy
+						ContainerView *container = work.oldContainer;
+						assert(container != nullptr && "LifecycleOp::destruct requires oldContainer");
 
-						queueSend(machine, NeuronTopic::killContainer, container->uuid);
+						if (container->plannedWork)
+						{
+							cancelDeploymentWork(container->plannedWork);
+						}
 
-						waitingOnContainers.insert_or_assign(container, ContainerState::destroyed);
-						container->plannedWork = nullptr;
+						ApplicationDeployment *destructionOwner = this;
+						if (container->deploymentID != plan.config.deploymentID())
+						{
+							if (previous
+								&& previous->plan.config.deploymentID() == container->deploymentID
+								&& previous->containers.contains(container))
+							{
+								destructionOwner = previous;
+							}
+							else if (auto deploymentIt = thisBrain->deployments.find(container->deploymentID); deploymentIt != thisBrain->deployments.end() && deploymentIt->second)
+							{
+								destructionOwner = deploymentIt->second;
+							}
+						}
+
+						container->destructionWaiterDeploymentID = plan.config.deploymentID();
+						destructionOwner->destructContainer(container, false);
+
+							queueSend(machine, NeuronTopic::killContainer, container->uuid);
+
+							waitingOnContainers.insert_or_assign(container, ContainerState::destroyed);
+							container->plannedWork = nullptr;
 
 						break;
 					}
@@ -6165,9 +8233,11 @@ public:
 
 			if (waitingOnContainers.size() > 0)
 			{
+#if PRODIGY_DEBUG
 				std::fprintf(stderr, "schedule waiting deploymentID=%llu waitingOnContainers=%llu\n",
 					(unsigned long long)plan.config.deploymentID(),
 					(unsigned long long)waitingOnContainers.size());
+#endif
 				nSuspended += 1;
 				co_await coro->suspend();
 				nSuspended -= 1;
@@ -6202,7 +8272,7 @@ public:
 
 	// map over machines, including potential compactions
 	// this calculates a deployment of an application over a cluster, including transitioning from the last version(s) to this most recent
-	void architect(CoroutineStack *coro, bool onlyMeasure)
+	void architect(CoroutineStack *coro, bool onlyMeasure, bool allowCompactionForScheduling = true, bool allowNewMachinesForScheduling = true)
 	{
 		if (plan.isStateful)
 		{
@@ -6266,9 +8336,10 @@ public:
 
 					// if this were called by evaluateAfterNewMaster, we might have some containers that exist
 					uint32_t existing = containersByShardGroup[n].size();
-					if (existing < 3)
+               uint32_t desired = desiredReplicaCountForShardGroup(n);
+					if (existing < desired)
 					{
-						shardsForCreation.insert(shardsForCreation.end(), 3 - existing, n); // tail will be shard groups 0, so we can harvest from tail
+						shardsForCreation.insert(shardsForCreation.end(), desired - existing, n); // tail will be shard groups 0, so we can harvest from tail
 					}
 				}
 			}
@@ -6385,25 +8456,28 @@ public:
 		if (nDeployed() < nTarget()) // it's possible we scheduled all the stateful updates in place
 		{
 			bool scheduleSurgeOnReserved = false;
-			bool allowCompaction = (onlyMeasure == false);
-			bool allowNewMachines = (onlyMeasure == false);
+					bool allowCompaction = allowCompactionForScheduling;
+				bool allowNewMachines = (onlyMeasure == false && allowNewMachinesForScheduling);
 
 			if (plan.isStateful)
 			{
-				for (const auto& [machine, ticket] : gatherMachinesForScheduling(coro, scheduleSurgeOnReserved, deltasByMachine, allowCompaction, allowNewMachines, [=] (MachineTicket *ticket) -> void { ticket->shardGroups = shardsForCreation; }, deletedOnMachines))
+					for (const auto& [machine, ticket] : gatherMachinesForScheduling(coro, scheduleSurgeOnReserved, deltasByMachine, allowCompaction, allowNewMachines, [=, this] (MachineTicket *ticket) -> void {
+	               ticket->shardGroups = shardsForCreation;
+	               buildPlacementTopologyEpochs(ticket->placementTopologyEpochs, shardsForCreation);
+	            }, deletedOnMachines, onlyMeasure == false))
 				{
 					if (machine == nullptr) continue;
-					if (machine->state != MachineState::healthy) continue;
-					if (BrainBase::neuronControlStreamActive(machine) == false) continue;
+					if (prodigyMachineReadyForScheduling(machine) == false) continue;
 					if (machine->lifetime == MachineLifetime::spot) continue;
 
 					if (ticket == nullptr)
 					{
 						for (auto it = shardsForCreation.begin(); it != shardsForCreation.end(); )
 						{
-							if (uint32_t shardGroup = *it; racksByShardGroup[shardGroup].contains(machine->rack) == false)
+							if (uint32_t shardGroup = *it; canPlaceReplicaForShardGroupOnRack(shardGroup, machine->rack))
 							{
-								if (nFitOnMachine(this, machine, 1, deltasByMachine[machine]) > 0) 
+                        ApplicationConfig schedulingConfig = statefulConstructionConfigForShardGroup(shardGroup);
+								if (nFitOnMachine(this, machine, 1, deltasByMachine[machine], &schedulingConfig) > 0)
 								{
 									it = shardsForCreation.erase(it);
 
@@ -6414,14 +8488,14 @@ public:
 									racksByShardGroup[shardGroup].insert(machine->rack);
 
 									if (onlyMeasure) logInitialMachineResources(machine);
-                           prodigyDebitMachineScalarResources(machine, plan.config, 1);
+                           prodigyDebitMachineScalarResources(machine, schedulingConfig, 1);
 
 									DeploymentWork *dwork = selectPlanStatefulDeletion(shardGroup);
                            Vector<uint32_t> assignedGPUMemoryMBs = {};
                            Vector<AssignedGPUDevice> assignedGPUDevices = {};
-                           bool assignedGPUs = prodigyTakeAssignedGPUsForScheduling(machine, nullptr, &deltasByMachine[machine], plan.config, assignedGPUMemoryMBs, assignedGPUDevices);
+                           bool assignedGPUs = prodigyTakeAssignedGPUsForScheduling(machine, nullptr, &deltasByMachine[machine], schedulingConfig, assignedGPUMemoryMBs, assignedGPUDevices);
                            assert(assignedGPUs && "stateful construction must reserve GPUs");
-									DeploymentWork *cwork = planStatefulConstruction(machine, shardGroup, (previous ? DataStrategy::seeding : DataStrategy::genesis), std::move(assignedGPUMemoryMBs), std::move(assignedGPUDevices));
+									DeploymentWork *cwork = planStatefulConstruction(machine, shardGroup, statefulWorkerTopologyUpgradeLocksShardGroup(shardGroup) ? statefulWorkerTopologyUpgradeTargetEpoch : 0, architectedStatefulConstructionDataStrategy(shardGroup), std::move(assignedGPUMemoryMBs), std::move(assignedGPUDevices));
 								
 									scheduleConstructionDestruction(cwork, dwork);
 								}
@@ -6438,16 +8512,19 @@ public:
 					}
 						else // ticket != nullptr so this machine is a new machine which we claimed on
 						{
-							for (uint32_t shardGroup : ticket->shardGroups)
+							for (uint32_t index = 0; index < ticket->shardGroups.size(); ++index)
 							{
+                        uint32_t shardGroup = ticket->shardGroups[index];
+                        uint32_t topologyEpoch = placementTopologyEpochForIndex(ticket, index);
+                        ApplicationConfig schedulingConfig = statefulPlacementConfig(topologyEpoch);
 								nDeployedBase += 1;
 
 								DeploymentWork *dwork = selectPlanStatefulDeletion(shardGroup);
                         Vector<uint32_t> assignedGPUMemoryMBs = {};
                         Vector<AssignedGPUDevice> assignedGPUDevices = {};
-                        bool assignedGPUs = prodigyTakeAssignedGPUsForScheduling(machine, ticket, nullptr, plan.config, assignedGPUMemoryMBs, assignedGPUDevices);
+                        bool assignedGPUs = prodigyTakeAssignedGPUsForScheduling(machine, ticket, nullptr, schedulingConfig, assignedGPUMemoryMBs, assignedGPUDevices);
                         assert(assignedGPUs && "claimed stateful construction must consume reserved GPUs");
-								DeploymentWork *cwork = planStatefulConstruction(machine, shardGroup, (previous ? DataStrategy::seeding : DataStrategy::genesis), std::move(assignedGPUMemoryMBs), std::move(assignedGPUDevices));
+								DeploymentWork *cwork = planStatefulConstruction(machine, shardGroup, topologyEpoch, architectedStatefulConstructionDataStrategy(shardGroup), std::move(assignedGPUMemoryMBs), std::move(assignedGPUDevices));
 									
 								scheduleConstructionDestruction(cwork, dwork);
 							}
@@ -6471,11 +8548,10 @@ public:
 
 				bool scheduleSurgeOnReserved;
 
-				for (const auto& [machine, ticket] : gatherMachinesForScheduling(coro, scheduleSurgeOnReserved, deltasByMachine, allowCompaction, allowNewMachines, [=] (MachineTicket *ticket) -> void {}, deletedOnMachines))
+					for (const auto& [machine, ticket] : gatherMachinesForScheduling(coro, scheduleSurgeOnReserved, deltasByMachine, allowCompaction, allowNewMachines, [=] (MachineTicket *ticket) -> void {}, deletedOnMachines, onlyMeasure == false))
 				{
 					if (machine == nullptr) continue;
-					if (machine->state != MachineState::healthy) continue;
-               if (BrainBase::neuronControlStreamActive(machine) == false) continue;
+					if (prodigyMachineReadyForScheduling(machine) == false) continue;
 
 					bool isBase;
 					uint32_t nFit;
@@ -6608,7 +8684,11 @@ public:
 		if (plan.isStateful)
 		{
 			nShardGroups = containersByShardGroup.size();
-			nTargetBase = nShardGroups * 3;
+         nTargetBase = 0;
+         for (uint32_t shardGroup = 0; shardGroup < nShardGroups; ++shardGroup)
+         {
+            nTargetBase += desiredReplicaCountForShardGroup(shardGroup);
+         }
 			nTargetSurge = 0;
 			nTargetCanary = 0;
 			nDeployedBase = 0;
@@ -6656,6 +8736,7 @@ public:
 		}
 		else
 		{
+			discardRecoveredStatelessContainersOnUnavailableHosts("evaluateAfterNewMaster");
 			nTargetBase = plan.stateless.nBase;
          nTargetSurge = 0;
          nTargetCanary = 0;
@@ -6712,20 +8793,11 @@ public:
 		// if master failed while transitoning deployment versions, architect will clean up any containers from previous deployment
 		if (nDeployedBase < nTargetBase)
 		{
-			CoroutineStack *coro = new CoroutineStack();
-			architect(coro, false);
-
-			delete coro;
+				architect(nullptr, false, false, false);
 		}
 
 		// if move constructively it's possible we could have had all our base instances but have left 1 old instance?
-		if (previous && previous->containers.size() > 0)
-		{
-			for (ContainerView *container : previous->containers)
-			{
-				scheduleStatelessDestruction(container);
-			}
-		}
+		scheduleRemainingPreviousStatelessDestruction("evaluateAfterNewMaster");
 
 		if (toSchedule.size() > 0)
 		{
@@ -6740,6 +8812,7 @@ public:
 	// might be dangerous to expose this as an option...
 	void destroy(void)
 	{
+      clearStatefulWorkerTopologyUpgradeOperation();
 		state = DeploymentState::decommissioning;
 		stateChangedAtMs = Time::now<TimeResolution::ms>();
 
@@ -6780,15 +8853,15 @@ public:
 		delete this;
 	}
 
-	void rollForward(void)
-	{
-		state = DeploymentState::decommissioning;
-		stateChangedAtMs = Time::now<TimeResolution::ms>();
+		void rollForward(void)
+		{
+			if (next && next->plan.canaryCount == 0)
+			{
+				beginDecommissioningForRollForward();
+			}
 
-		Ring::queueCancelTimeout(&autoscaleTimer);
-
-		next->deploy();
-	}
+			next->deploy();
+		}
 
 	    void deploy(void)
     {
@@ -6819,12 +8892,12 @@ public:
       {
          thisBrain->pushSpinApplicationProgressToMothership(this, "deploying canaries"_ctv);
 
-         co_await coro->suspendUsRunThis([&] (void) -> void {
+	         co_await coro->suspendUsRunThis([&] (void) -> void {
 
-            nSuspended += 1;
-            deployCanaries(coro, plan.canaryCount);
-            nSuspended += 1;
-         });
+	            nSuspended += 1;
+	            deployCanaries(coro, plan.canaryCount);
+	            nSuspended -= 1;
+	         });
 
          if (state == DeploymentState::failed)
          {
@@ -6840,14 +8913,18 @@ public:
 
 		delete coro;
 
+		scheduleRemainingPreviousStatelessDestruction("deploy");
+
 		if (plan.isStateful)
 		{
+#if PRODIGY_DEBUG
 			std::fprintf(stderr, "deploy post-architect deploymentID=%llu nDeployed=%u nTarget=%u toSchedule=%llu waitingOnContainers=%llu\n",
 				(unsigned long long)plan.config.deploymentID(),
 				unsigned(nDeployed()),
 				unsigned(nTarget()),
 				(unsigned long long)toSchedule.size(),
 				(unsigned long long)waitingOnContainers.size());
+#endif
 			prodigyLogDeployHeapSnapshot(
 				"deploy-post-architect",
 				plan.config.deploymentID(),
@@ -6869,12 +8946,14 @@ public:
 
 		if (plan.isStateful)
 		{
+#if PRODIGY_DEBUG
 			std::fprintf(stderr, "deploy post-schedule deploymentID=%llu state=%u toSchedule=%llu waitingOnContainers=%llu execution=%p\n",
 				(unsigned long long)plan.config.deploymentID(),
 				unsigned(state),
 				(unsigned long long)toSchedule.size(),
 				(unsigned long long)waitingOnContainers.size(),
 				(void *)schedulingStack.execution);
+#endif
 			prodigyLogDeployHeapSnapshot(
 				"deploy-post-schedule",
 				plan.config.deploymentID(),

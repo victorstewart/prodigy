@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prodigy-sdk"
+version = "1.0.0"
+description = "Transport-neutral Prodigy neuron/container protocol SDK for Python"
+license = "Apache-2.0"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+   "gxhash>=0.5.2,<0.6",
+   "pyaegis>=0.3.0,<0.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/victorstewart/prodigy"
+Repository = "https://github.com/victorstewart/prodigy"
+Documentation = "https://github.com/victorstewart/prodigy/tree/main/prodigy/sdk/python"
+
+[tool.setuptools]
+py-modules = ["neuron_hub", "prodigy_sdk"]

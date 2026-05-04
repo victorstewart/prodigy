@@ -1,0 +1,34 @@
+{
+   "config": {
+      "type": "ApplicationType::stateless",
+      "applicationID": "${application:CppMeshPingPongAdvertiser}",
+      "versionID": 1,
+      "filesystemMB": 64,
+      "storageMB": 64,
+      "memoryMB": 128,
+      "nLogicalCores": 1,
+      "msTilHealthy": 10000,
+      "sTilHealthcheck": 15,
+      "sTilKillable": 30
+   },
+   "minimumSubscriberCapacity": 1024,
+   "isStateful": false,
+   "stateless": {
+      "nBase": 1,
+      "maxPerRackRatio": 1.0,
+      "maxPerMachineRatio": 1.0,
+      "moveableDuringCompaction": true
+   },
+   "useHostNetworkNamespace": false,
+   "subscriptions": [],
+   "advertisements": [
+      {
+         "service": "${service:CppMeshPingPongAdvertiser/clients}",
+         "startAt": "ContainerState::scheduled",
+         "stopAt": "ContainerState::destroying",
+         "port": 43111
+      }
+   ],
+   "moveConstructively": true,
+   "requiresDatacenterUniqueTag": false
+}

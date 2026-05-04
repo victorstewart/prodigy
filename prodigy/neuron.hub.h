@@ -327,10 +327,10 @@ public:
 	           }
 	        }
 
-	        for (const auto& [serviceKey, pairings] : parameters.advertisementPairings)
-	        {
-	           for (const AdvertisementPairing& pairing : pairings)
-	           {
+		        for (const auto& [serviceKey, pairings] : parameters.advertisementPairings)
+		        {
+		           for (const AdvertisementPairing& pairing : pairings)
+		           {
 	              uint64_t hash = AegisStream::generateSecretServiceHash(pairing.secret, pairing.service);
 	              basics_log("NeuronHub::fillFromMainArgs advpair serviceKey=%llu pairService=%llu hash=%llu\n",
 	                 (unsigned long long)serviceKey,
@@ -357,12 +357,52 @@ public:
 	                    (void)write(dumpFD, line, lineSize);
 	                 }
 	              }
-	           }
-	        }
+		           }
+		        }
 
-	        if (dumpFD >= 0)
-	        {
-	           (void)close(dumpFD);
+           if (dumpFD >= 0)
+           {
+              for (uint32_t index = 0; index < parameters.whiteholes.size(); ++index)
+              {
+                 const Whitehole& whitehole = parameters.whiteholes[index];
+                 char addressText[INET6_ADDRSTRLEN] = {};
+                 if (whitehole.address.is6)
+                 {
+                    inet_ntop(AF_INET6, whitehole.address.v6, addressText, sizeof(addressText));
+                 }
+                 else
+                 {
+                    inet_ntop(AF_INET, &whitehole.address.v4, addressText, sizeof(addressText));
+                 }
+
+                 char line[256] = {};
+                 int lineWritten = snprintf(
+                    line,
+                    sizeof(line),
+                    "whitehole index=%u transport=%u family=%u source=%u hasAddress=%u address=%s port=%u nonce=%llu\n",
+                    unsigned(index),
+                    unsigned(whitehole.transport),
+                    unsigned(whitehole.family),
+                    unsigned(whitehole.source),
+                    unsigned(whitehole.hasAddress),
+                    addressText[0] ? addressText : "invalid",
+                    unsigned(whitehole.sourcePort),
+                    (unsigned long long)whitehole.bindingNonce);
+                 if (lineWritten > 0)
+                 {
+                    size_t lineSize = size_t(lineWritten);
+                    if (lineSize >= sizeof(line))
+                    {
+                       lineSize = sizeof(line) - 1;
+                    }
+                    (void)write(dumpFD, line, lineSize);
+                 }
+              }
+           }
+
+		        if (dumpFD >= 0)
+		        {
+		           (void)close(dumpFD);
 	        }
 
 	        takeNeuronUnixPairHalf(parameters.neuronFD); // already open
@@ -387,6 +427,16 @@ public:
 	void signalReadyToNeuron(void)
 	{
 		signalReady();
+	}
+
+	void signalRuntimeReady(void)
+	{
+		(void)queueEmptyFrame(ContainerTopic::runtimeReady);
+	}
+
+	void signalRuntimeReadyToNeuron(void)
+	{
+		signalRuntimeReady();
 	}
 
 	void pushStatisticsToNeuron(void)
@@ -480,8 +530,9 @@ public:
 				}
 				case ContainerTopic::pong:
 				case ContainerTopic::healthy:
+				case ContainerTopic::runtimeReady:
 				{
-					// pong/healthy are produced by containers toward neuron, not expected inbound here.
+					// pong/healthy/runtimeReady are produced by containers toward neuron, not expected inbound here.
 					break;
 				}
 				case ContainerTopic::stop:

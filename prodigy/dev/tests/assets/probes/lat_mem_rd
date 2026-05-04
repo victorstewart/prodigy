@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "lat_mem_rd stub"

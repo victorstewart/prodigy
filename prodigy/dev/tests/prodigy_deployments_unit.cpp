@@ -360,6 +360,7 @@ static void markNeuronControlActive(Machine& machine, int fslot)
    machine.neuron.isFixedFile = true;
    machine.neuron.fslot = fslot;
    machine.neuron.connected = true;
+   machine.runtimeReady = true;
 }
 
 static bool armNeuronControlStream(Machine& machine, ScopedSocketPair& sockets)
@@ -369,6 +370,7 @@ static bool armNeuronControlStream(Machine& machine, ScopedSocketPair& sockets)
    machine.neuron.isFixedFile = true;
    machine.neuron.fslot = sockets.adoptLeftIntoFixedFileSlot();
    machine.neuron.connected = (machine.neuron.fslot >= 0);
+   machine.runtimeReady = machine.neuron.connected;
    return machine.neuron.connected;
 }
 
@@ -376,20 +378,42 @@ int main(void)
 {
    TestSuite suite;
 
-   {
-      suite.expect(
-         prodigyContainerIngressNetkitAttachType() == BPF_NETKIT_PRIMARY,
-         "container_netkit_ingress_attach_type_is_primary");
+	   {
+	      suite.expect(
+	         prodigyContainerIngressNetkitAttachType() == BPF_NETKIT_PRIMARY,
+	         "container_netkit_ingress_attach_type_is_primary");
       suite.expect(
          prodigyContainerEgressNetkitAttachType() == BPF_NETKIT_PEER,
          "container_netkit_egress_attach_type_is_peer");
-      suite.expect(
-         prodigyContainerIngressNetkitAttachType() != prodigyContainerEgressNetkitAttachType(),
-         "container_netkit_attach_types_are_distinct");
-   }
+	      suite.expect(
+	         prodigyContainerIngressNetkitAttachType() != prodigyContainerEgressNetkitAttachType(),
+	         "container_netkit_attach_types_are_distinct");
+	   }
 
-   {
-      Vector<MachineDiskHardwareProfile> disks;
+	   {
+	      TestBrain brain;
+	      BrainBase *savedBrain = thisBrain;
+	      thisBrain = &brain;
+
+	      Machine machine = {};
+	      machine.ownedLogicalCores = 6;
+	      machine.ownedMemoryMB = 12'288;
+	      machine.ownedStorageMB = 258'048;
+
+	      ApplicationConfig config = {};
+	      config.architecture = nametagCurrentBuildMachineArchitecture();
+
+	      suite.expect(prodigyMachineMeetsApplicationResourceCriteria(&machine, config) == false, "resource_criteria_rejects_unknown_architecture_in_production");
+
+	      brain.brainConfig.runtimeEnvironment.test.enabled = true;
+	      brain.brainConfig.architecture = config.architecture;
+	      suite.expect(prodigyMachineMeetsApplicationResourceCriteria(&machine, config), "resource_criteria_uses_test_cluster_configured_architecture");
+
+	      thisBrain = savedBrain;
+	   }
+
+	   {
+	      Vector<MachineDiskHardwareProfile> disks;
 
       auto addDisk = [&] (const char *mountPath) -> void {
          MachineDiskHardwareProfile disk = {};
@@ -2138,9 +2162,20 @@ int main(void)
       plan.fragment = 9;
       plan.useHostNetworkNamespace = true;
       plan.restartOnFailure = true;
+      plan.runtimeReady = true;
       plan.isStateful = true;
       plan.shardGroup = 3;
       plan.nShardGroups = 5;
+      plan.statefulMeshRoles.sibling = 0x0100'0000'0000'0001ULL;
+      plan.statefulMeshRoles.topologyBridge = 0x0100'0000'0000'0002ULL;
+      plan.statefulTopology.operationID = 77;
+      plan.statefulTopology.shardGroup = 3;
+      plan.statefulTopology.topologyEpoch = 400;
+      plan.statefulTopology.workerCount = 4;
+      plan.statefulTopology.servingMode = StatefulTopologyServingMode::catchupOnly;
+      plan.statefulTopology.sourceEpoch = 200;
+      plan.statefulTopology.targetEpoch = 400;
+      plan.statefulTopology.bridgeMode = StatefulTopologyBridgeMode::sourceToTarget;
       plan.assignedGPUMemoryMBs.push_back(16 * 1024u);
       plan.assignedGPUMemoryMBs.push_back(24 * 1024u);
       AssignedGPUDevice firstGPU = {};
@@ -2173,9 +2208,19 @@ int main(void)
 
       suite.expect(decoded, "container_plan_roundtrip_deserializes");
       suite.expect(roundtrip.useHostNetworkNamespace == true, "container_plan_roundtrip_preserves_host_network_namespace");
+      suite.expect(roundtrip.runtimeReady == true, "container_plan_roundtrip_preserves_runtime_ready");
       suite.expect(roundtrip.fragment == 9, "container_plan_roundtrip_preserves_fragment");
       suite.expect(roundtrip.shardGroup == 3, "container_plan_roundtrip_preserves_shard_group");
       suite.expect(roundtrip.nShardGroups == 5, "container_plan_roundtrip_preserves_shard_group_count");
+      suite.expect(roundtrip.statefulMeshRoles.sibling == plan.statefulMeshRoles.sibling, "container_plan_roundtrip_preserves_stateful_sibling_role");
+      suite.expect(roundtrip.statefulMeshRoles.topologyBridge == plan.statefulMeshRoles.topologyBridge, "container_plan_roundtrip_preserves_stateful_topology_bridge_role");
+      suite.expect(roundtrip.statefulTopology.operationID == 77, "container_plan_roundtrip_preserves_topology_operation_id");
+      suite.expect(roundtrip.statefulTopology.topologyEpoch == 400, "container_plan_roundtrip_preserves_topology_epoch");
+      suite.expect(roundtrip.statefulTopology.workerCount == 4, "container_plan_roundtrip_preserves_topology_worker_count");
+      suite.expect(roundtrip.statefulTopology.servingMode == StatefulTopologyServingMode::catchupOnly, "container_plan_roundtrip_preserves_topology_serving_mode");
+      suite.expect(roundtrip.statefulTopology.sourceEpoch == 200, "container_plan_roundtrip_preserves_topology_source_epoch");
+      suite.expect(roundtrip.statefulTopology.targetEpoch == 400, "container_plan_roundtrip_preserves_topology_target_epoch");
+      suite.expect(roundtrip.statefulTopology.bridgeMode == StatefulTopologyBridgeMode::sourceToTarget, "container_plan_roundtrip_preserves_topology_bridge_mode");
       suite.expect(roundtrip.assignedGPUMemoryMBs.size() == 2, "container_plan_roundtrip_preserves_assigned_gpu_count");
       suite.expect(roundtrip.assignedGPUMemoryMBs[0] == 16 * 1024u && roundtrip.assignedGPUMemoryMBs[1] == 24 * 1024u, "container_plan_roundtrip_preserves_assigned_gpu_memory");
       suite.expect(roundtrip.assignedGPUDevices.size() == 2, "container_plan_roundtrip_preserves_assigned_gpu_devices_count");
@@ -2397,7 +2442,7 @@ int main(void)
       container.shardGroup = 7;
       container.isStateful = true;
 
-      StatefulMeshRoles roles = StatefulMeshRoles::forShardGroup(deploymentPlan.stateful, container.shardGroup);
+      StatefulMeshRoles roles = StatefulMeshRoles::forShardGroup(deploymentPlan.stateful, deploymentPlan.config.applicationID, container.shardGroup);
       container.advertisements.emplace(roles.sibling, Advertisement(roles.sibling, ContainerState::scheduled, ContainerState::destroying, 19113));
       container.subscriptions.emplace(roles.sibling, Subscription(roles.sibling, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all));
       container.subscriptions.emplace(roles.seeding, Subscription(roles.seeding, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all));
@@ -2408,6 +2453,7 @@ int main(void)
       suite.expect(plan.statefulMeshRoles.cousin == 0, "containerview_generatePlan_prunes_unassigned_stateful_cousin_role");
       suite.expect(plan.statefulMeshRoles.seeding == roles.seeding, "containerview_generatePlan_preserves_assigned_stateful_seeding_role");
       suite.expect(plan.statefulMeshRoles.sharding == 0, "containerview_generatePlan_prunes_unassigned_stateful_sharding_role");
+      suite.expect(plan.statefulMeshRoles.topologyBridge == 0, "containerview_generatePlan_prunes_unassigned_stateful_topology_bridge_role");
       suite.expect(plan.nShardGroups == 11, "containerview_generatePlan_preserves_stateful_shard_group_count");
    }
 
@@ -2430,8 +2476,1657 @@ int main(void)
       Vector<uint64_t> flags = {};
       prodigyBuildContainerStartupFlags(plan, flags);
 
-      suite.expect(flags.size() == 1, "container_startup_flags_stateless_keep_legacy_shape");
+      suite.expect(flags.size() == 1, "container_startup_flags_stateless_keep_one_entry_shape");
       suite.expect(flags[0] == 0, "container_startup_flags_stateless_default_zero_group");
+   }
+
+   {
+      StatefulMeshRoles roles{};
+      roles.topologyBridge = 0x0100'0000'0000'1234ULL;
+
+      suite.expect(
+         roles.classify(roles.topologyBridge) == StatefulMeshRole::topologyBridge,
+         "stateful_mesh_roles_classify_topology_bridge");
+   }
+
+   {
+      StatefulDeploymentPlan plan{};
+      plan.clientPrefix = MeshServices::generateStatefulService(501, 1);
+      plan.siblingPrefix = MeshServices::generateStatefulService(501, 2);
+      plan.cousinPrefix = MeshServices::generateStatefulService(501, 3);
+      plan.seedingPrefix = MeshServices::generateStatefulService(501, 4);
+      plan.shardingPrefix = MeshServices::generateStatefulService(501, 5);
+
+      StatefulMeshRoles roles = StatefulMeshRoles::forShardGroup(plan, 501, 7);
+      suite.expect(roles.topologyBridge == MeshServices::constrainPrefixToGroup(prodigyDefaultStatefulTopologyBridgePrefix(501), 7), "stateful_mesh_roles_for_shard_group_derives_topology_bridge");
+   }
+
+   {
+      ApplicationConfig config{};
+      config.nLogicalCores = 6;
+
+      StatefulTopology topology{};
+      prodigyPopulateDefaultStatefulTopology(topology, 7, config);
+
+      suite.expect(topology.shardGroup == 7, "stateful_topology_defaults_preserve_shard_group");
+      suite.expect(topology.workerCount == 4, "stateful_topology_defaults_derive_worker_count");
+      suite.expect(topology.topologyEpoch == 4, "stateful_topology_defaults_epoch_matches_worker_count");
+      suite.expect(topology.sourceEpoch == 4, "stateful_topology_defaults_source_epoch_matches_topology_epoch");
+      suite.expect(topology.targetEpoch == 4, "stateful_topology_defaults_target_epoch_matches_topology_epoch");
+      suite.expect(topology.servingMode == StatefulTopologyServingMode::serve, "stateful_topology_defaults_to_serve");
+   }
+
+   {
+      suite.expect(prodigyStatefulCoreChangeRequiresTopologyUpgrade(true, 1, 2), "stateful_core_change_upgrade_required_for_one_to_two");
+      suite.expect(prodigyStatefulCoreChangeRequiresTopologyUpgrade(true, 3, 2), "stateful_core_change_upgrade_required_for_three_to_two");
+      suite.expect(prodigyStatefulCoreChangeRequiresTopologyUpgrade(true, 4, 4) == false, "stateful_core_change_upgrade_not_required_without_core_change");
+      suite.expect(prodigyStatefulCoreChangeRequiresTopologyUpgrade(false, 4, 6) == false, "stateful_core_change_upgrade_not_required_for_stateless");
+   }
+
+   {
+      ContainerView container{};
+      container.applyStatefulTopologyCutoverMetric(ProdigyMetrics::runtimeStatefulTopologyCutoverSourceEpochKey(), 200);
+      container.applyStatefulTopologyCutoverMetric(ProdigyMetrics::runtimeStatefulTopologyCutoverTargetEpochKey(), 400);
+      container.applyStatefulTopologyCutoverMetric(ProdigyMetrics::runtimeStatefulTopologyCutoverReadyKey(), 1);
+
+      suite.expect(container.hasStatefulTopologyCutoverBarrier(200, 400), "containerview_cutover_metric_sets_ready_barrier");
+
+      container.applyStatefulTopologyCutoverMetric(ProdigyMetrics::runtimeStatefulTopologyCutoverReadyKey(), 0);
+      suite.expect(container.hasStatefulTopologyCutoverBarrier(200, 400) == false, "containerview_cutover_metric_zero_clears_barrier");
+      suite.expect(container.statefulTopologyCutoverSourceEpoch == 0 && container.statefulTopologyCutoverTargetEpoch == 0, "containerview_cutover_metric_zero_clears_epochs");
+   }
+
+   {
+      StatefulTopology source{};
+      source.topologyEpoch = 200;
+      source.sourceEpoch = 200;
+      source.targetEpoch = 400;
+      source.bridgeMode = StatefulTopologyBridgeMode::sourceToTarget;
+
+      StatefulTopology target = source;
+      target.topologyEpoch = 400;
+
+      suite.expect(prodigyStatefulTopologyShouldAdvertiseBridge(source), "stateful_topology_source_to_target_source_advertises_bridge");
+      suite.expect(prodigyStatefulTopologyShouldSubscribeBridge(source) == false, "stateful_topology_source_to_target_source_does_not_subscribe_bridge");
+      suite.expect(prodigyStatefulTopologyShouldAdvertiseBridge(target) == false, "stateful_topology_source_to_target_target_does_not_advertise_bridge");
+      suite.expect(prodigyStatefulTopologyShouldSubscribeBridge(target), "stateful_topology_source_to_target_target_subscribes_bridge");
+   }
+
+   {
+      ContainerParameters parameters{};
+      parameters.nLogicalCores = 6;
+      parameters.lowCPU = 2;
+      parameters.highCPU = 7;
+      parameters.statefulMeshRoles.sibling = 0x0100'0000'0000'0101ULL;
+      parameters.statefulMeshRoles.topologyBridge = 0x0100'0000'0000'0102ULL;
+      parameters.statefulTopology.operationID = 88;
+      parameters.statefulTopology.shardGroup = 5;
+      parameters.statefulTopology.topologyEpoch = 400;
+      parameters.statefulTopology.workerCount = 4;
+      parameters.statefulTopology.servingMode = StatefulTopologyServingMode::drainOnly;
+      parameters.statefulTopology.sourceEpoch = 200;
+      parameters.statefulTopology.targetEpoch = 400;
+      parameters.statefulTopology.bridgeMode = StatefulTopologyBridgeMode::targetToSource;
+
+      String serialized;
+      BitseryEngine::serialize(serialized, parameters);
+
+      ContainerParameters roundtrip{};
+      bool decoded = BitseryEngine::deserializeSafe(serialized, roundtrip);
+
+      suite.expect(decoded, "container_parameters_roundtrip_deserializes");
+      suite.expect(roundtrip.statefulMeshRoles.sibling == parameters.statefulMeshRoles.sibling, "container_parameters_roundtrip_preserves_stateful_sibling_role");
+      suite.expect(roundtrip.statefulMeshRoles.topologyBridge == parameters.statefulMeshRoles.topologyBridge, "container_parameters_roundtrip_preserves_topology_bridge_role");
+      suite.expect(roundtrip.statefulTopology.operationID == 88, "container_parameters_roundtrip_preserves_topology_operation_id");
+      suite.expect(roundtrip.statefulTopology.shardGroup == 5, "container_parameters_roundtrip_preserves_topology_shard_group");
+      suite.expect(roundtrip.statefulTopology.topologyEpoch == 400, "container_parameters_roundtrip_preserves_topology_epoch");
+      suite.expect(roundtrip.statefulTopology.workerCount == 4, "container_parameters_roundtrip_preserves_topology_worker_count");
+      suite.expect(roundtrip.statefulTopology.servingMode == StatefulTopologyServingMode::drainOnly, "container_parameters_roundtrip_preserves_topology_serving_mode");
+      suite.expect(roundtrip.statefulTopology.sourceEpoch == 200, "container_parameters_roundtrip_preserves_topology_source_epoch");
+      suite.expect(roundtrip.statefulTopology.targetEpoch == 400, "container_parameters_roundtrip_preserves_topology_target_epoch");
+      suite.expect(roundtrip.statefulTopology.bridgeMode == StatefulTopologyBridgeMode::targetToSource, "container_parameters_roundtrip_preserves_topology_bridge_mode");
+   }
+
+   {
+      ProdigyMasterAuthorityRuntimeState runtimeState = {};
+      runtimeState.generation = 17;
+      runtimeState.nextPendingAddMachinesOperationID = 9;
+
+      ProdigyStatefulWorkerTopologyUpgradeOperation operation = {};
+      operation.deploymentID = 9911;
+      operation.applicationID = 88;
+      operation.operationID = 7711;
+      operation.phase = StatefulWorkerTopologyUpgradePhase::greenBootstrap;
+      operation.sourceWorkerCount = 2;
+      operation.targetWorkerCount = 4;
+      operation.sourceEpoch = 200;
+      operation.targetEpoch = 400;
+      operation.targetLogicalCores = 4;
+      operation.targetMemoryMB = 512;
+      operation.targetStorageMB = 64;
+      operation.lockedShardGroups.push_back(0);
+      operation.lockedShardGroups.push_back(2);
+      operation.updatedAtMs = 123456789;
+      runtimeState.statefulWorkerTopologyUpgradeOperations.push_back(operation);
+
+      String serialized = {};
+      BitseryEngine::serialize(serialized, runtimeState);
+
+      ProdigyMasterAuthorityRuntimeState roundtrip = {};
+      bool decoded = BitseryEngine::deserializeSafe(serialized, roundtrip);
+
+      suite.expect(decoded, "runtime_state_roundtrip_deserializes_stateful_worker_topology_upgrade");
+      suite.expect(roundtrip.statefulWorkerTopologyUpgradeOperations.size() == 1, "runtime_state_roundtrip_preserves_stateful_worker_topology_upgrade_count");
+      suite.expect(roundtrip.statefulWorkerTopologyUpgradeOperations.size() == 1 && roundtrip.statefulWorkerTopologyUpgradeOperations[0].deploymentID == 9911, "runtime_state_roundtrip_preserves_stateful_worker_topology_upgrade_deployment_id");
+      suite.expect(roundtrip.statefulWorkerTopologyUpgradeOperations.size() == 1 && roundtrip.statefulWorkerTopologyUpgradeOperations[0].operationID == 7711, "runtime_state_roundtrip_preserves_stateful_worker_topology_upgrade_operation_id");
+      suite.expect(roundtrip.statefulWorkerTopologyUpgradeOperations.size() == 1 && roundtrip.statefulWorkerTopologyUpgradeOperations[0].phase == StatefulWorkerTopologyUpgradePhase::greenBootstrap, "runtime_state_roundtrip_preserves_stateful_worker_topology_upgrade_phase");
+      suite.expect(roundtrip.statefulWorkerTopologyUpgradeOperations.size() == 1 && roundtrip.statefulWorkerTopologyUpgradeOperations[0].targetLogicalCores == 4, "runtime_state_roundtrip_preserves_stateful_worker_topology_upgrade_target_cores");
+      suite.expect(roundtrip.statefulWorkerTopologyUpgradeOperations.size() == 1 && roundtrip.statefulWorkerTopologyUpgradeOperations[0].lockedShardGroups.size() == 2, "runtime_state_roundtrip_preserves_stateful_worker_topology_upgrade_locked_groups");
+   }
+
+   {
+      ApplicationDeployment deployment{};
+      seedCommonPlan(deployment, true);
+      deployment.nShardGroups = 3;
+
+      deployment.armStatefulWorkerTopologyUpgrade(2, 4, 4, 512, 64);
+
+      suite.expect(deployment.statefulWorkerTopologyUpgradePendingForAnyShardGroup(), "stateful_worker_topology_upgrade_marks_pending");
+      suite.expect(deployment.statefulWorkerTopologyUpgradePhase == ApplicationDeployment::StatefulWorkerTopologyUpgradePhase::greenBootstrap, "stateful_worker_topology_upgrade_enters_green_bootstrap_phase");
+      suite.expect(deployment.statefulWorkerTopologyUpgradeOperationID != 0, "stateful_worker_topology_upgrade_assigns_operation_id");
+      suite.expect(deployment.statefulWorkerTopologyUpgradeSourceWorkerCount == 2, "stateful_worker_topology_upgrade_preserves_source_worker_count");
+      suite.expect(deployment.statefulWorkerTopologyUpgradeTargetWorkerCount == 4, "stateful_worker_topology_upgrade_preserves_target_worker_count");
+      suite.expect(deployment.statefulWorkerTopologyUpgradeSourceEpoch == 2, "stateful_worker_topology_upgrade_preserves_source_epoch");
+      suite.expect(deployment.statefulWorkerTopologyUpgradeTargetEpoch != 0 && deployment.statefulWorkerTopologyUpgradeTargetEpoch != deployment.statefulWorkerTopologyUpgradeSourceEpoch, "stateful_worker_topology_upgrade_assigns_distinct_target_epoch");
+      suite.expect(deployment.statefulWorkerTopologyUpgradeLocksShardGroup(0), "stateful_worker_topology_upgrade_locks_group_0");
+      suite.expect(deployment.statefulWorkerTopologyUpgradeLocksShardGroup(1), "stateful_worker_topology_upgrade_locks_group_1");
+      suite.expect(deployment.statefulWorkerTopologyUpgradeLocksShardGroup(2), "stateful_worker_topology_upgrade_locks_group_2");
+      suite.expect(deployment.statefulWorkerTopologyUpgradeLocksShardGroup(3) == false, "stateful_worker_topology_upgrade_does_not_lock_out_of_range_group");
+      suite.expect(deployment.desiredReplicaCountForShardGroup(0) == 6, "stateful_worker_topology_upgrade_doubles_desired_replicas_per_group");
+      suite.expect(deployment.maxReplicasPerRackForShardGroup(0) == 2, "stateful_worker_topology_upgrade_allows_second_replica_per_rack");
+   }
+
+   {
+      ApplicationDeployment deployment{};
+      seedCommonPlan(deployment, true);
+      deployment.plan.config.nLogicalCores = 3;
+      deployment.nShardGroups = 1;
+
+      deployment.armStatefulWorkerTopologyUpgrade(1, 1, 2, 512, 64);
+
+      ContainerView target = {};
+      target.isStateful = true;
+      target.shardGroup = 0;
+      target.explicitStatefulTopology.topologyEpoch = deployment.statefulWorkerTopologyUpgradeTargetEpoch;
+
+      ApplicationConfig targetConfig = deployment.statefulWorkerTopologyUpgradeTargetConfig();
+
+      suite.expect(deployment.statefulWorkerTopologyUpgradeSourceWorkerCount == 1, "stateful_worker_topology_upgrade_same_worker_count_preserves_source_worker_count");
+      suite.expect(deployment.statefulWorkerTopologyUpgradeTargetWorkerCount == 1, "stateful_worker_topology_upgrade_same_worker_count_preserves_target_worker_count");
+      suite.expect(deployment.statefulWorkerTopologyUpgradeTargetEpoch != deployment.statefulWorkerTopologyUpgradeSourceEpoch, "stateful_worker_topology_upgrade_same_worker_count_assigns_distinct_epoch");
+      suite.expect(targetConfig.nLogicalCores == 2, "stateful_worker_topology_upgrade_same_worker_count_uses_target_core_count");
+      suite.expect(deployment.resourceConfigForContainer(&target).nLogicalCores == 2, "stateful_worker_topology_upgrade_same_worker_count_applies_target_cores_to_green");
+   }
+
+   {
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = nullptr;
+
+      ApplicationDeployment deployment{};
+      seedCommonPlan(deployment, true);
+      deployment.plan.config.nLogicalCores = 3;
+      deployment.nShardGroups = 1;
+
+      const uint32_t currentServingEpoch = 987654321;
+      ContainerView servingA = {};
+      ContainerView servingB = {};
+      ContainerView servingC = {};
+      ContainerView *serving[] = {&servingA, &servingB, &servingC};
+      for (ContainerView *container : serving)
+      {
+         container->isStateful = true;
+         container->shardGroup = 0;
+         container->state = ContainerState::healthy;
+         container->explicitStatefulTopology.shardGroup = 0;
+         container->explicitStatefulTopology.topologyEpoch = currentServingEpoch;
+         container->explicitStatefulTopology.workerCount = 1;
+         container->explicitStatefulTopology.servingMode = StatefulTopologyServingMode::serve;
+         container->explicitStatefulTopology.sourceEpoch = currentServingEpoch;
+         container->explicitStatefulTopology.targetEpoch = currentServingEpoch;
+         deployment.containers.insert(container);
+         deployment.containersByShardGroup.insert(0, container);
+      }
+
+      deployment.armStatefulWorkerTopologyUpgrade(1, 3, 5, 512, 64);
+
+      suite.expect(deployment.statefulWorkerTopologyUpgradeSourceEpoch == currentServingEpoch, "stateful_worker_topology_upgrade_reuses_current_serving_epoch_for_repeated_raise");
+      suite.expect(deployment.statefulWorkerTopologyUpgradeTargetEpoch != currentServingEpoch, "stateful_worker_topology_upgrade_repeated_raise_assigns_distinct_target_epoch");
+      suite.expect(servingA.explicitStatefulTopology.sourceEpoch == currentServingEpoch, "stateful_worker_topology_upgrade_repeated_raise_preserves_source_epoch_on_blue");
+      suite.expect(servingA.explicitStatefulTopology.targetEpoch == deployment.statefulWorkerTopologyUpgradeTargetEpoch, "stateful_worker_topology_upgrade_repeated_raise_sets_next_target_epoch_on_blue");
+
+      thisBrain = savedBrain;
+   }
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      ApplicationDeployment deployment{};
+      seedCommonPlan(deployment, true);
+      deployment.nShardGroups = 2;
+
+      deployment.armStatefulWorkerTopologyUpgrade(2, 4, 4, 512, 64);
+
+      suite.expect(brain.statefulWorkerTopologyUpgradeRuntimeState.size() == 1, "stateful_worker_topology_upgrade_persists_runtime_state_record");
+      suite.expect(
+         brain.statefulWorkerTopologyUpgradeRuntimeState.size() == 1
+            && brain.statefulWorkerTopologyUpgradeRuntimeState[0].deploymentID == deployment.plan.config.deploymentID(),
+         "stateful_worker_topology_upgrade_persists_runtime_state_deployment_id");
+      suite.expect(
+         brain.statefulWorkerTopologyUpgradeRuntimeState.size() == 1
+            && brain.statefulWorkerTopologyUpgradeRuntimeState[0].phase == StatefulWorkerTopologyUpgradePhase::greenBootstrap,
+         "stateful_worker_topology_upgrade_persists_runtime_state_phase");
+      suite.expect(
+         brain.statefulWorkerTopologyUpgradeRuntimeState.size() == 1
+            && brain.statefulWorkerTopologyUpgradeRuntimeState[0].lockedShardGroups.size() == 2,
+         "stateful_worker_topology_upgrade_persists_runtime_state_locked_groups");
+      suite.expect(
+         brain.statefulWorkerTopologyUpgradeRuntimeState.size() == 1
+            && brain.statefulWorkerTopologyUpgradeRuntimeState[0].targetLogicalCores == 4,
+         "stateful_worker_topology_upgrade_persists_runtime_state_target_cores");
+
+      thisBrain = savedBrain;
+   }
+
+   {
+      ScopedFreshRing ring;
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+      brain.brainConfig.runtimeEnvironment.test.enabled = true;
+      brain.brainConfig.architecture = nametagCurrentBuildMachineArchitecture();
+
+      ApplicationDeployment deployment{};
+      seedCommonPlan(deployment, true);
+      deployment.nShardGroups = 1;
+      deployment.recomputeStatefulBaseTargetFromShardGroups();
+
+      HorizontalScaler scaler = {};
+      scaler.name.assign(ProdigyMetrics::runtimeContainerCpuUtilPctName);
+      scaler.percentile = 95.0;
+      scaler.lookbackSeconds = 60;
+      scaler.threshold = 0.50;
+      scaler.direction = Scaler::Direction::upscale;
+      scaler.lifetime = ApplicationLifetime::base;
+      deployment.plan.horizontalScalers.push_back(scaler);
+
+      ProdigyStatefulWorkerTopologyUpgradeOperation operation = {};
+      operation.deploymentID = deployment.plan.config.deploymentID();
+      operation.applicationID = deployment.plan.config.applicationID;
+      operation.operationID = 0x19072012ull;
+      operation.phase = StatefulWorkerTopologyUpgradePhase::greenBootstrap;
+      operation.sourceWorkerCount = 1;
+      operation.targetWorkerCount = 2;
+      operation.sourceEpoch = 1;
+      operation.targetEpoch = 400;
+      operation.targetLogicalCores = 4;
+      operation.targetMemoryMB = 768;
+      operation.targetStorageMB = 96;
+      operation.lockedShardGroups.push_back(0);
+      suite.expect(deployment.restoreStatefulWorkerTopologyUpgradeOperation(operation), "stateful_autoscale_shard_growth_during_topology_upgrade_restores_active_topology_upgrade_fixture");
+
+      const int64_t nowMs = Time::now<TimeResolution::ms>();
+      brain.metrics.record(
+         deployment.plan.config.deploymentID(),
+         uint128_t(0x19072010),
+         ProdigyMetrics::runtimeContainerCpuUtilPctKey(),
+         nowMs,
+         0.95);
+
+      TimeoutPacket autoscalePacket = {};
+      autoscalePacket.flags = uint64_t(DeploymentTimeoutFlags::autoscale);
+      deployment.dispatchTimeout(&autoscalePacket);
+
+      suite.expect(deployment.deferredStatefulTargetShardGroups == 2, "stateful_autoscale_shard_growth_during_topology_upgrade_defers_target_group_count");
+      suite.expect(deployment.nShardGroups == 1, "stateful_autoscale_shard_growth_during_topology_upgrade_keeps_live_group_count");
+      suite.expect(deployment.nTargetBase == 3, "stateful_autoscale_shard_growth_during_topology_upgrade_keeps_live_target_base");
+      suite.expect(
+         brain.deferredStatefulScaleIntentRuntimeState.size() == 1
+            && brain.deferredStatefulScaleIntentRuntimeState[0].targetShardGroups == 2,
+         "stateful_autoscale_shard_growth_during_topology_upgrade_persists_deferred_growth_intent");
+
+      deployment.clearStatefulWorkerTopologyUpgradeOperation();
+      ProdigyDeferredStatefulScaleIntent deferredIntent = {};
+      bool capturedIntent = deployment.captureDeferredStatefulScaleIntent(deferredIntent);
+      suite.expect(capturedIntent, "stateful_autoscale_shard_growth_during_topology_upgrade_keeps_deferred_growth_after_unlock");
+      suite.expect(deferredIntent.targetShardGroups == 2, "stateful_autoscale_shard_growth_during_topology_upgrade_preserves_target_group_count_after_unlock");
+      suite.expect(brain.statefulWorkerTopologyUpgradeRuntimeState.empty(), "stateful_autoscale_shard_growth_during_topology_upgrade_clears_topology_runtime_state_after_unlock");
+
+      thisBrain = savedBrain;
+   }
+
+   {
+      ScopedFreshRing ring;
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      ApplicationDeployment deployment{};
+      seedCommonPlan(deployment, true);
+      deployment.nShardGroups = 1;
+      deployment.recomputeStatefulBaseTargetFromShardGroups();
+      deployment.deployingNewShardGroup = true;
+
+      VerticalScaler scaler = {};
+      scaler.name.assign(ProdigyMetrics::runtimeContainerCpuUtilPctName);
+      scaler.percentile = 95.0;
+      scaler.lookbackSeconds = 60;
+      scaler.threshold = 0.50;
+      scaler.direction = Scaler::Direction::upscale;
+      scaler.resource = ScalingDimension::cpu;
+      scaler.increment = 2;
+      deployment.plan.verticalScalers.push_back(scaler);
+
+      const int64_t nowMs = Time::now<TimeResolution::ms>();
+      brain.metrics.record(
+         deployment.plan.config.deploymentID(),
+         uint128_t(0x19072011),
+         ProdigyMetrics::runtimeContainerCpuUtilPctKey(),
+         nowMs,
+         0.99);
+
+      TimeoutPacket autoscalePacket = {};
+      autoscalePacket.flags = uint64_t(DeploymentTimeoutFlags::autoscale);
+      deployment.dispatchTimeout(&autoscalePacket);
+
+      suite.expect(deployment.statefulWorkerTopologyUpgradePendingForAnyShardGroup() == false, "stateful_autoscale_topology_upgrade_during_shard_growth_does_not_start_live_upgrade");
+      suite.expect(deployment.deferredStatefulTargetLogicalCores == 4, "stateful_autoscale_topology_upgrade_during_shard_growth_defers_target_cores");
+      suite.expect(
+         brain.deferredStatefulScaleIntentRuntimeState.size() == 1
+            && brain.deferredStatefulScaleIntentRuntimeState[0].targetLogicalCores == 4,
+         "stateful_autoscale_topology_upgrade_during_shard_growth_persists_deferred_topology_intent");
+
+      thisBrain = nullptr;
+      deployment.deployingNewShardGroup = false;
+      bool dispatched = deployment.dispatchDeferredStatefulScaleIntent();
+
+      suite.expect(dispatched, "stateful_autoscale_topology_upgrade_during_shard_growth_dispatches_after_unlock");
+      suite.expect(deployment.statefulWorkerTopologyUpgradePendingForAnyShardGroup(), "stateful_autoscale_topology_upgrade_during_shard_growth_arms_topology_upgrade_after_unlock");
+      suite.expect(deployment.statefulWorkerTopologyUpgradeTargetLogicalCores == 4, "stateful_autoscale_topology_upgrade_during_shard_growth_applies_deferred_target_cores");
+
+      thisBrain = savedBrain;
+   }
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      ApplicationDeployment deployment{};
+      seedCommonPlan(deployment, true);
+      deployment.nShardGroups = 1;
+      deployment.recomputeStatefulBaseTargetFromShardGroups();
+
+      ProdigyDeferredStatefulScaleIntent intent = {};
+      intent.deploymentID = deployment.plan.config.deploymentID();
+      intent.applicationID = deployment.plan.config.applicationID;
+      intent.targetShardGroups = 3;
+      intent.targetLogicalCores = 4;
+      intent.targetMemoryMB = 768;
+      intent.targetStorageMB = 96;
+      intent.updatedAtMs = 123456789;
+      brain.deferredStatefulScaleIntentRuntimeState.push_back(intent);
+
+      bool restored = deployment.restorePersistedDeferredStatefulScaleIntent();
+      thisBrain = nullptr;
+      bool dispatchedTopology = deployment.dispatchDeferredStatefulScaleIntent();
+
+      suite.expect(restored, "stateful_deferred_scale_intent_restore_recovers_persisted_intent");
+      suite.expect(dispatchedTopology, "stateful_deferred_scale_intent_restore_dispatches_topology_first");
+      suite.expect(deployment.statefulWorkerTopologyUpgradePendingForAnyShardGroup(), "stateful_deferred_scale_intent_restore_arms_topology_upgrade_first");
+      suite.expect(deployment.nShardGroups == 1, "stateful_deferred_scale_intent_restore_defers_shard_growth_until_after_topology_upgrade");
+
+      deployment.clearStatefulWorkerTopologyUpgradeOperation();
+      deployment.plan.config.nLogicalCores = 4;
+      deployment.plan.config.memoryMB = 768;
+      deployment.plan.config.storageMB = 96;
+      ProdigyDeferredStatefulScaleIntent restoredIntent = {};
+      bool capturedIntent = deployment.captureDeferredStatefulScaleIntent(restoredIntent);
+      suite.expect(capturedIntent, "stateful_deferred_scale_intent_restore_keeps_pending_growth_after_topology_completion");
+      suite.expect(restoredIntent.targetShardGroups == 3, "stateful_deferred_scale_intent_restore_preserves_target_group_count_after_topology_completion");
+      suite.expect(restoredIntent.targetLogicalCores == 4, "stateful_deferred_scale_intent_restore_preserves_target_cores_after_topology_completion");
+      suite.expect(brain.deferredStatefulScaleIntentRuntimeState.size() == 1, "stateful_deferred_scale_intent_restore_keeps_persisted_intent_after_topology_completion");
+
+      thisBrain = savedBrain;
+   }
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      ApplicationDeployment deployment{};
+      seedCommonPlan(deployment, true);
+      deployment.nShardGroups = 2;
+
+      deployment.armStatefulWorkerTopologyUpgrade(2, 4, 4, 512, 64);
+      deployment.clearStatefulWorkerTopologyUpgradeOperation();
+
+      suite.expect(deployment.statefulWorkerTopologyUpgradePendingForAnyShardGroup() == false, "stateful_worker_topology_upgrade_clear_resets_pending_state");
+      suite.expect(brain.statefulWorkerTopologyUpgradeRuntimeState.empty(), "stateful_worker_topology_upgrade_clear_removes_runtime_state_record");
+
+      thisBrain = savedBrain;
+   }
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      Rack rack{};
+      rack.uuid = 1907'1001;
+      brain.racks.insert_or_assign(rack.uuid, &rack);
+
+      Machine machine{};
+      machine.uuid = uint128_t(0x19071001);
+      machine.slug = "topology-green"_ctv;
+      machine.rack = &rack;
+      machine.state = MachineState::healthy;
+      machine.lifetime = MachineLifetime::owned;
+      rack.machines.insert(&machine);
+      brain.machines.insert(&machine);
+
+      ApplicationDeployment deployment{};
+      seedCommonPlan(deployment, true);
+      deployment.nShardGroups = 1;
+      deployment.armStatefulWorkerTopologyUpgrade(2, 4, 4, 512, 64);
+
+      DeploymentWork *work = deployment.planStatefulConstruction(&machine, uint32_t(0), DataStrategy::seeding);
+      StatefulWork *stateful = std::get_if<StatefulWork>(work);
+      ContainerView *container = stateful ? stateful->container : nullptr;
+      StatefulMeshRoles roles = container ? container->effectiveStatefulMeshRoles(deployment.plan) : StatefulMeshRoles{};
+      StatefulTopology topology = container ? container->effectiveStatefulTopology(deployment.plan) : StatefulTopology{};
+      ApplicationConfig containerConfig = container ? deployment.resourceConfigForContainer(container) : ApplicationConfig{};
+
+      suite.expect(container != nullptr, "stateful_worker_topology_upgrade_green_construction_creates_container");
+      suite.expect(containerConfig.nLogicalCores == 4, "stateful_worker_topology_upgrade_green_construction_uses_target_boot_cores");
+      suite.expect(topology.operationID == deployment.statefulWorkerTopologyUpgradeOperationID, "stateful_worker_topology_upgrade_green_construction_sets_operation_id");
+      suite.expect(topology.workerCount == 4, "stateful_worker_topology_upgrade_green_construction_sets_target_worker_count");
+      suite.expect(topology.servingMode == StatefulTopologyServingMode::catchupOnly, "stateful_worker_topology_upgrade_green_construction_sets_catchup_only");
+      suite.expect(topology.bridgeMode == StatefulTopologyBridgeMode::sourceToTarget, "stateful_worker_topology_upgrade_green_construction_sets_source_to_target_bridge");
+      suite.expect(topology.topologyEpoch == deployment.statefulWorkerTopologyUpgradeTargetEpoch, "stateful_worker_topology_upgrade_green_construction_sets_target_epoch");
+      suite.expect(roles.topologyBridge != 0, "stateful_worker_topology_upgrade_green_construction_derives_bridge_role");
+
+      if (container)
+      {
+         deployment.cancelDeploymentWork(container->plannedWork);
+         deployment.containers.erase(container);
+         while (deployment.containersByShardGroup.eraseEntry(container->shardGroup, container)) {}
+         machine.removeContainerIndexEntry(container->deploymentID, container);
+         brain.containers.erase(container->uuid);
+         delete container;
+      }
+
+	      rack.machines.erase(&machine);
+	      brain.machines.erase(&machine);
+	      brain.racks.erase(rack.uuid);
+	      thisBrain = savedBrain;
+	   }
+
+	   {
+	      TestBrain brain;
+	      BrainBase *savedBrain = thisBrain;
+	      thisBrain = &brain;
+
+	      Rack rackA{};
+	      rackA.uuid = 1901'3101;
+	      Rack rackB{};
+	      rackB.uuid = 1901'3102;
+	      Rack rackC{};
+	      rackC.uuid = 1901'3103;
+	      brain.racks.insert_or_assign(rackA.uuid, &rackA);
+	      brain.racks.insert_or_assign(rackB.uuid, &rackB);
+	      brain.racks.insert_or_assign(rackC.uuid, &rackC);
+
+	      auto seedMachine = [&] (Machine& machine, Rack& rack, uint128_t uuid, const String& slug) -> void {
+	         machine.uuid = uuid;
+	         machine.slug = slug;
+	         machine.rack = &rack;
+	         machine.state = MachineState::healthy;
+	         machine.lifetime = MachineLifetime::owned;
+	         machine.ownedLogicalCores = 8;
+	         machine.ownedMemoryMB = 8'192;
+	         machine.ownedStorageMB = 4'096;
+	         machine.totalLogicalCores = 8;
+	         machine.totalMemoryMB = 8'192;
+	         machine.totalStorageMB = 4'096;
+	         machine.isolatedLogicalCoresCommitted = 4;
+	         machine.nLogicalCores_available = 4;
+	         machine.memoryMB_available = 7'680;
+	         machine.storageMB_available = 4'032;
+	         rack.machines.insert(&machine);
+	         brain.machines.insert(&machine);
+	      };
+
+	      Machine machineA{};
+	      Machine machineB{};
+	      Machine machineC{};
+	      seedMachine(machineA, rackA, uint128_t(0x19013101), "measure-compaction-a"_ctv);
+	      seedMachine(machineB, rackB, uint128_t(0x19013102), "measure-compaction-b"_ctv);
+	      seedMachine(machineC, rackC, uint128_t(0x19013103), "measure-compaction-c"_ctv);
+
+	      auto seedDonorDeployment = [&] (ApplicationDeployment& donor, uint32_t applicationID, uint32_t nBase) -> void {
+	         seedCommonPlan(donor, false);
+	         donor.plan.config.applicationID = applicationID;
+	         donor.plan.config.versionID = 1;
+	         donor.plan.config.nLogicalCores = 4;
+	         donor.plan.stateless.nBase = nBase;
+	         donor.plan.stateless.maxPerRackRatio = 1.0f;
+	         donor.plan.stateless.maxPerMachineRatio = 1.0f;
+	         donor.plan.stateless.moveableDuringCompaction = true;
+	         donor.state = DeploymentState::running;
+	         donor.nTargetBase = nBase;
+	         donor.nDeployedBase = nBase;
+	         donor.nHealthyBase = nBase;
+	         brain.deployments.insert_or_assign(donor.plan.config.deploymentID(), &donor);
+	      };
+
+	      ApplicationDeployment donorAB;
+	      ApplicationDeployment donorC;
+	      seedDonorDeployment(donorAB, 13111, 2);
+	      seedDonorDeployment(donorC, 13112, 1);
+
+	      auto seedContainer = [&] (ApplicationDeployment& donor, ContainerView& container, Machine& machine, Rack& rack, uint128_t uuid) -> void {
+	         container.uuid = uuid;
+	         container.deploymentID = donor.plan.config.deploymentID();
+	         container.applicationID = donor.plan.config.applicationID;
+	         container.machine = &machine;
+	         container.lifetime = ApplicationLifetime::base;
+	         container.state = ContainerState::healthy;
+	         donor.containers.insert(&container);
+	         donor.countPerMachine[&machine] += 1;
+	         donor.countPerRack[&rack] += 1;
+	         brain.containers.insert_or_assign(container.uuid, &container);
+	         machine.upsertContainerIndexEntry(container.deploymentID, &container);
+	      };
+
+	      ContainerView donorAContainer{};
+	      ContainerView donorBContainer{};
+	      ContainerView donorCContainer{};
+	      seedContainer(donorAB, donorAContainer, machineA, rackA, uint128_t(0x19013121));
+	      seedContainer(donorAB, donorBContainer, machineB, rackB, uint128_t(0x19013122));
+	      seedContainer(donorC, donorCContainer, machineC, rackC, uint128_t(0x19013123));
+
+	      ApplicationDeployment deployment;
+	      seedCommonPlan(deployment, false);
+	      deployment.plan.config.applicationID = 13199;
+	      deployment.plan.config.nLogicalCores = 8;
+	      deployment.plan.stateless.nBase = 1;
+	      deployment.plan.stateless.maxPerRackRatio = 1.0f;
+	      deployment.plan.stateless.maxPerMachineRatio = 1.0f;
+
+	      uint32_t measured = deployment.measure();
+	      suite.expect(measured == 1, "measure_stateless_counts_compaction_fit");
+	      suite.expect(deployment.containers.empty(), "measure_stateless_compaction_cleans_measured_containers");
+	      suite.expect(deployment.toSchedule.empty(), "measure_stateless_compaction_cleans_measured_work");
+	      suite.expect(donorAB.toSchedule.empty() && donorC.toSchedule.empty(), "measure_stateless_compaction_does_not_schedule_donor_work");
+	      suite.expect(donorAB.waitingOnCompactions == false && donorC.waitingOnCompactions == false, "measure_stateless_compaction_does_not_block_donors");
+	      suite.expect(donorAContainer.state == ContainerState::healthy && donorAContainer.plannedWork == nullptr, "measure_stateless_compaction_preserves_donor_a_container");
+	      suite.expect(donorBContainer.state == ContainerState::healthy && donorBContainer.plannedWork == nullptr, "measure_stateless_compaction_preserves_donor_b_container");
+	      suite.expect(donorCContainer.state == ContainerState::healthy && donorCContainer.plannedWork == nullptr, "measure_stateless_compaction_preserves_donor_c_container");
+	      suite.expect(machineA.nLogicalCores_available == 4 && machineB.nLogicalCores_available == 4 && machineC.nLogicalCores_available == 4, "measure_stateless_compaction_preserves_machine_capacity");
+	      suite.expect(brain.containers.size() == 3, "measure_stateless_compaction_preserves_brain_container_index");
+
+	      machineA.removeContainerIndexEntry(donorAContainer.deploymentID, &donorAContainer);
+	      machineB.removeContainerIndexEntry(donorBContainer.deploymentID, &donorBContainer);
+	      machineC.removeContainerIndexEntry(donorCContainer.deploymentID, &donorCContainer);
+	      brain.containers.erase(donorAContainer.uuid);
+	      brain.containers.erase(donorBContainer.uuid);
+	      brain.containers.erase(donorCContainer.uuid);
+	      brain.deployments.erase(donorAB.plan.config.deploymentID());
+	      brain.deployments.erase(donorC.plan.config.deploymentID());
+	      rackA.machines.erase(&machineA);
+	      rackB.machines.erase(&machineB);
+	      rackC.machines.erase(&machineC);
+	      brain.machines.erase(&machineA);
+	      brain.machines.erase(&machineB);
+	      brain.machines.erase(&machineC);
+	      brain.racks.erase(rackA.uuid);
+	      brain.racks.erase(rackB.uuid);
+	      brain.racks.erase(rackC.uuid);
+	      thisBrain = savedBrain;
+	   }
+
+	   {
+	      ScopedFreshRing ring;
+	      TestBrain brain;
+	      BrainBase *savedBrain = thisBrain;
+	      thisBrain = &brain;
+	      brain.brainConfig.sharedCPUOvercommitPermille = 1000;
+
+	      Rack rackA{};
+	      rackA.uuid = 1901'3201;
+	      Rack rackB{};
+	      rackB.uuid = 1901'3202;
+	      Rack rackC{};
+	      rackC.uuid = 1901'3203;
+	      brain.racks.insert_or_assign(rackA.uuid, &rackA);
+	      brain.racks.insert_or_assign(rackB.uuid, &rackB);
+	      brain.racks.insert_or_assign(rackC.uuid, &rackC);
+
+	      auto seedMachine = [&] (Machine& machine, Rack& rack, uint128_t uuid, const String& slug) -> void {
+	         machine.uuid = uuid;
+	         machine.slug = slug;
+	         machine.rack = &rack;
+	         machine.state = MachineState::healthy;
+	         machine.lifetime = MachineLifetime::owned;
+	         machine.ownedLogicalCores = 6;
+	         machine.ownedMemoryMB = 8'192;
+	         machine.ownedStorageMB = 4'096;
+	         machine.totalLogicalCores = 8;
+	         machine.totalMemoryMB = 8'192;
+	         machine.totalStorageMB = 4'096;
+	         machine.sharedCPUMillisCommitted = 3'000;
+	         prodigyRecomputeMachineCPUAvailability(&machine, 1000);
+	         machine.memoryMB_available = 7'680;
+	         machine.storageMB_available = 4'032;
+	         rack.machines.insert(&machine);
+	         brain.machines.insert(&machine);
+	      };
+
+	      Machine machineA{};
+	      Machine machineB{};
+	      Machine machineC{};
+	      seedMachine(machineA, rackA, uint128_t(0x19013201), "measure-shared-compaction-a"_ctv);
+	      seedMachine(machineB, rackB, uint128_t(0x19013202), "measure-shared-compaction-b"_ctv);
+	      seedMachine(machineC, rackC, uint128_t(0x19013203), "measure-shared-compaction-c"_ctv);
+
+	      auto seedDonorDeployment = [&] (ApplicationDeployment& donor, uint32_t applicationID, uint32_t nBase) -> void {
+	         seedCommonPlan(donor, false);
+	         donor.plan.config.applicationID = applicationID;
+	         donor.plan.config.versionID = 1;
+	         donor.plan.config.cpuMode = ApplicationCPUMode::shared;
+	         donor.plan.config.nLogicalCores = 3;
+	         donor.plan.config.sharedCPUMillis = 3'000;
+	         donor.plan.stateless.nBase = nBase;
+	         donor.plan.stateless.maxPerRackRatio = 1.0f;
+	         donor.plan.stateless.maxPerMachineRatio = 1.0f;
+	         donor.plan.stateless.moveableDuringCompaction = true;
+	         donor.state = DeploymentState::running;
+	         donor.nTargetBase = nBase;
+	         donor.nDeployedBase = nBase;
+	         donor.nHealthyBase = nBase;
+	         brain.deployments.insert_or_assign(donor.plan.config.deploymentID(), &donor);
+	      };
+
+	      ApplicationDeployment donorAB;
+	      ApplicationDeployment donorC;
+	      seedDonorDeployment(donorAB, 13211, 2);
+	      seedDonorDeployment(donorC, 13212, 1);
+
+	      auto seedContainer = [&] (ApplicationDeployment& donor, ContainerView& container, Machine& machine, Rack& rack, uint128_t uuid) -> void {
+	         container.uuid = uuid;
+	         container.deploymentID = donor.plan.config.deploymentID();
+	         container.applicationID = donor.plan.config.applicationID;
+	         container.machine = &machine;
+	         container.lifetime = ApplicationLifetime::base;
+	         container.state = ContainerState::healthy;
+	         donor.containers.insert(&container);
+	         donor.countPerMachine[&machine] += 1;
+	         donor.countPerRack[&rack] += 1;
+	         brain.containers.insert_or_assign(container.uuid, &container);
+	         machine.upsertContainerIndexEntry(container.deploymentID, &container);
+	      };
+
+	      ContainerView donorAContainer{};
+	      ContainerView donorBContainer{};
+	      ContainerView donorCContainer{};
+	      seedContainer(donorAB, donorAContainer, machineA, rackA, uint128_t(0x19013221));
+	      seedContainer(donorAB, donorBContainer, machineB, rackB, uint128_t(0x19013222));
+	      seedContainer(donorC, donorCContainer, machineC, rackC, uint128_t(0x19013223));
+
+	      ApplicationDeployment deployment;
+	      seedCommonPlan(deployment, false);
+	      deployment.plan.config.applicationID = 13299;
+	      deployment.plan.config.cpuMode = ApplicationCPUMode::shared;
+	      deployment.plan.config.nLogicalCores = 6;
+	      deployment.plan.config.sharedCPUMillis = 6'000;
+	      deployment.plan.stateless.nBase = 1;
+	      deployment.plan.stateless.maxPerRackRatio = 1.0f;
+	      deployment.plan.stateless.maxPerMachineRatio = 1.0f;
+
+	      uint32_t measured = deployment.measure();
+	      suite.expect(measured == 1, "measure_stateless_shared_cpu_counts_compaction_fit");
+	      suite.expect(deployment.containers.empty(), "measure_stateless_shared_cpu_compaction_cleans_measured_containers");
+	      suite.expect(deployment.toSchedule.empty(), "measure_stateless_shared_cpu_compaction_cleans_measured_work");
+	      suite.expect(donorAB.toSchedule.empty() && donorC.toSchedule.empty(), "measure_stateless_shared_cpu_compaction_does_not_schedule_donor_work");
+	      suite.expect(machineA.sharedCPUMillis_available == 3'000 && machineB.sharedCPUMillis_available == 3'000 && machineC.sharedCPUMillis_available == 3'000, "measure_stateless_shared_cpu_compaction_preserves_machine_capacity");
+
+	      machineA.removeContainerIndexEntry(donorAContainer.deploymentID, &donorAContainer);
+	      machineB.removeContainerIndexEntry(donorBContainer.deploymentID, &donorBContainer);
+	      machineC.removeContainerIndexEntry(donorCContainer.deploymentID, &donorCContainer);
+	      brain.containers.erase(donorAContainer.uuid);
+	      brain.containers.erase(donorBContainer.uuid);
+	      brain.containers.erase(donorCContainer.uuid);
+	      brain.deployments.erase(donorAB.plan.config.deploymentID());
+	      brain.deployments.erase(donorC.plan.config.deploymentID());
+	      rackA.machines.erase(&machineA);
+	      rackB.machines.erase(&machineB);
+	      rackC.machines.erase(&machineC);
+	      brain.machines.erase(&machineA);
+	      brain.machines.erase(&machineB);
+	      brain.machines.erase(&machineC);
+	      brain.racks.erase(rackA.uuid);
+	      brain.racks.erase(rackB.uuid);
+	      brain.racks.erase(rackC.uuid);
+	      thisBrain = savedBrain;
+	   }
+
+	   {
+	      ScopedFreshRing ring;
+	      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      Rack rack{};
+      rack.uuid = 1907'2001;
+      brain.racks.insert_or_assign(rack.uuid, &rack);
+
+      ScopedSocketPair socket = {};
+      bool socketReady = socket.create(suite, "stateful_worker_topology_upgrade_green_schedule_creates_socketpair");
+
+      Machine machine{};
+      machine.uuid = uint128_t(0x19072001);
+      machine.slug = "topology-green-scheduled"_ctv;
+      machine.rack = &rack;
+      machine.state = MachineState::healthy;
+      machine.lifetime = MachineLifetime::owned;
+      machine.hardware.cpu.architecture = nametagCurrentBuildMachineArchitecture();
+      machine.nLogicalCores_available = 8;
+      machine.memoryMB_available = 8'192;
+      machine.storageMB_available = 4'096;
+      bool machineReady = socketReady && armNeuronControlStream(machine, socket);
+      rack.machines.insert(&machine);
+      brain.machines.insert(&machine);
+
+      suite.expect(machineReady, "stateful_worker_topology_upgrade_green_schedule_arms_machine_neuron_control_stream");
+
+      ApplicationDeployment deployment{};
+      seedCommonPlan(deployment, true);
+      deployment.nShardGroups = 1;
+      deployment.plan.stateful.clientPrefix = MeshServices::generateStatefulService(999, 1);
+      deployment.plan.stateful.siblingPrefix = MeshServices::generateStatefulService(999, 2);
+      deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(999, 3);
+      deployment.plan.stateful.seedingPrefix = MeshServices::generateStatefulService(999, 4);
+      deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(999, 5);
+      deployment.armStatefulWorkerTopologyUpgrade(2, 4, 4, 512, 64);
+
+      ContainerView *container = nullptr;
+      for (ContainerView *candidate : deployment.containers)
+      {
+         if (candidate != nullptr
+            && candidate->shardGroup == 0
+            && candidate->explicitStatefulTopology.topologyEpoch == deployment.statefulWorkerTopologyUpgradeTargetEpoch)
+         {
+            container = candidate;
+            break;
+         }
+      }
+
+      StatefulMeshRoles roles = container ? container->effectiveStatefulMeshRoles(deployment.plan) : StatefulMeshRoles{};
+      ApplicationConfig containerConfig = container ? deployment.resourceConfigForContainer(container) : ApplicationConfig{};
+      ContainerPlan containerPlan = container ? container->generatePlan(deployment.plan, deployment.nShardGroups, &containerConfig) : ContainerPlan{};
+
+      suite.expect(container != nullptr, "stateful_worker_topology_upgrade_green_schedule_creates_container");
+      suite.expect(container && container->state == ContainerState::scheduled, "stateful_worker_topology_upgrade_green_schedule_schedules_container_immediately");
+      suite.expect(container && container->advertisements.find(roles.client) == container->advertisements.end(), "stateful_worker_topology_upgrade_green_schedule_suppresses_client_advertisement");
+      suite.expect(container && container->advertisements.find(roles.sibling) != container->advertisements.end(), "stateful_worker_topology_upgrade_green_schedule_preserves_sibling_advertisement");
+      suite.expect(container && container->subscriptions.find(roles.sibling) != container->subscriptions.end(), "stateful_worker_topology_upgrade_green_schedule_preserves_sibling_subscription");
+      suite.expect(container && container->advertisements.find(roles.topologyBridge) == container->advertisements.end(), "stateful_worker_topology_upgrade_green_schedule_does_not_advertise_bridge_on_target");
+      suite.expect(container && container->subscriptions.find(roles.topologyBridge) != container->subscriptions.end(), "stateful_worker_topology_upgrade_green_schedule_subscribes_bridge_on_target");
+      suite.expect(containerPlan.statefulMeshRoles.client == 0, "stateful_worker_topology_upgrade_green_schedule_plan_prunes_client_role");
+      suite.expect(containerPlan.config.nLogicalCores == 4, "stateful_worker_topology_upgrade_green_schedule_plan_uses_target_boot_cores");
+      suite.expect(containerPlan.statefulMeshRoles.topologyBridge == roles.topologyBridge, "stateful_worker_topology_upgrade_green_schedule_plan_preserves_bridge_role");
+      suite.expect(containerPlan.statefulTopology.servingMode == StatefulTopologyServingMode::catchupOnly, "stateful_worker_topology_upgrade_green_schedule_plan_preserves_catchup_only");
+
+      if (container)
+      {
+         deployment.waitingOnContainers.erase(container);
+         deployment.containers.erase(container);
+         while (deployment.containersByShardGroup.eraseEntry(container->shardGroup, container)) {}
+         machine.removeContainerIndexEntry(container->deploymentID, container);
+         brain.containers.erase(container->uuid);
+         delete container;
+      }
+
+      rack.machines.erase(&machine);
+      brain.machines.erase(&machine);
+      brain.racks.erase(rack.uuid);
+      thisBrain = savedBrain;
+   }
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      ApplicationDeployment deployment{};
+      seedCommonPlan(deployment, true);
+      deployment.nShardGroups = 1;
+      deployment.plan.stateful.clientPrefix = MeshServices::generateStatefulService(999, 1);
+      deployment.plan.stateful.siblingPrefix = MeshServices::generateStatefulService(999, 2);
+      deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(999, 3);
+      deployment.plan.stateful.seedingPrefix = MeshServices::generateStatefulService(999, 4);
+      deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(999, 5);
+
+      ProdigyStatefulWorkerTopologyUpgradeOperation operation = {};
+      operation.deploymentID = deployment.plan.config.deploymentID();
+      operation.applicationID = deployment.plan.config.applicationID;
+      operation.operationID = 0x19073001ull;
+      operation.phase = StatefulWorkerTopologyUpgradePhase::greenBootstrap;
+      operation.sourceWorkerCount = 2;
+      operation.targetWorkerCount = 4;
+      operation.sourceEpoch = 2;
+      operation.targetEpoch = 400;
+      operation.lockedShardGroups.push_back(0);
+      brain.statefulWorkerTopologyUpgradeRuntimeState.push_back(operation);
+
+      bool restored = deployment.restorePersistedStatefulWorkerTopologyUpgradeOperation();
+      suite.expect(restored, "stateful_worker_topology_upgrade_restore_recovers_persisted_operation");
+
+      ContainerView source = {};
+      source.uuid = uint128_t(0x19073002);
+      source.deploymentID = deployment.plan.config.deploymentID();
+      source.applicationID = deployment.plan.config.applicationID;
+      source.isStateful = true;
+      source.shardGroup = 0;
+      source.lifetime = ApplicationLifetime::base;
+      source.state = ContainerState::healthy;
+      deployment.containers.insert(&source);
+      deployment.containersByShardGroup.insert(0, &source);
+
+      deployment.recoverAfterReboot();
+
+      StatefulMeshRoles sourceRoles = source.effectiveStatefulMeshRoles(deployment.plan);
+      suite.expect(source.explicitStatefulTopology.operationID == operation.operationID, "stateful_worker_topology_upgrade_restore_applies_source_operation_id");
+      suite.expect(source.explicitStatefulTopology.servingMode == StatefulTopologyServingMode::serve, "stateful_worker_topology_upgrade_restore_applies_source_serving_mode");
+      suite.expect(source.explicitStatefulTopology.topologyEpoch == operation.sourceEpoch, "stateful_worker_topology_upgrade_restore_applies_source_epoch");
+      suite.expect(source.advertisements.find(sourceRoles.topologyBridge) != source.advertisements.end(), "stateful_worker_topology_upgrade_restore_adds_source_bridge_advertisement");
+      suite.expect(source.subscriptions.find(sourceRoles.topologyBridge) == source.subscriptions.end(), "stateful_worker_topology_upgrade_restore_omits_source_bridge_subscription");
+
+      deployment.containers.erase(&source);
+      while (deployment.containersByShardGroup.eraseEntry(0, &source)) {}
+      thisBrain = savedBrain;
+   }
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      ApplicationDeployment deployment{};
+      seedCommonPlan(deployment, true);
+      deployment.nShardGroups = 1;
+      deployment.plan.stateful.clientPrefix = MeshServices::generateStatefulService(999, 1);
+      deployment.plan.stateful.siblingPrefix = MeshServices::generateStatefulService(999, 2);
+      deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(999, 3);
+      deployment.plan.stateful.seedingPrefix = MeshServices::generateStatefulService(999, 4);
+      deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(999, 5);
+
+      ProdigyStatefulWorkerTopologyUpgradeOperation operation = {};
+      operation.deploymentID = deployment.plan.config.deploymentID();
+      operation.applicationID = deployment.plan.config.applicationID;
+      operation.operationID = 0x19074001ull;
+      operation.phase = StatefulWorkerTopologyUpgradePhase::greenBootstrap;
+      operation.sourceWorkerCount = 2;
+      operation.targetWorkerCount = 4;
+      operation.sourceEpoch = 2;
+      operation.targetEpoch = 400;
+      operation.lockedShardGroups.push_back(0);
+      brain.statefulWorkerTopologyUpgradeRuntimeState.push_back(operation);
+
+      ContainerView target = {};
+      target.uuid = uint128_t(0x19074002);
+      target.deploymentID = deployment.plan.config.deploymentID();
+      target.applicationID = deployment.plan.config.applicationID;
+      target.isStateful = true;
+      target.shardGroup = 0;
+      target.lifetime = ApplicationLifetime::base;
+      target.state = ContainerState::healthy;
+      target.explicitStatefulMeshRoles = StatefulMeshRoles::forShardGroup(deployment.plan.stateful, deployment.plan.config.applicationID, 0);
+      target.explicitStatefulTopology.operationID = operation.operationID;
+      target.explicitStatefulTopology.shardGroup = 0;
+      target.explicitStatefulTopology.topologyEpoch = operation.targetEpoch;
+      target.explicitStatefulTopology.workerCount = operation.targetWorkerCount;
+      target.explicitStatefulTopology.servingMode = StatefulTopologyServingMode::catchupOnly;
+      target.explicitStatefulTopology.sourceEpoch = operation.sourceEpoch;
+      target.explicitStatefulTopology.targetEpoch = operation.targetEpoch;
+      target.explicitStatefulTopology.bridgeMode = StatefulTopologyBridgeMode::sourceToTarget;
+
+      StatefulMeshRoles targetRoles = target.effectiveStatefulMeshRoles(deployment.plan);
+      target.advertisements.emplace(targetRoles.client, Advertisement(targetRoles.client, ContainerState::healthy, ContainerState::destroying, 4200));
+      target.advertisingOnPorts.insert(4200);
+      deployment.containers.insert(&target);
+      deployment.containersByShardGroup.insert(0, &target);
+
+      bool restored = deployment.restorePersistedStatefulWorkerTopologyUpgradeOperation();
+
+      suite.expect(restored, "stateful_worker_topology_upgrade_restore_recovers_target_operation");
+      suite.expect(target.advertisements.find(targetRoles.client) == target.advertisements.end(), "stateful_worker_topology_upgrade_restore_removes_target_client_advertisement");
+      suite.expect(target.advertisements.find(targetRoles.topologyBridge) == target.advertisements.end(), "stateful_worker_topology_upgrade_restore_omits_target_bridge_advertisement");
+      suite.expect(target.subscriptions.find(targetRoles.topologyBridge) != target.subscriptions.end(), "stateful_worker_topology_upgrade_restore_adds_target_bridge_subscription");
+
+      deployment.containers.erase(&target);
+      while (deployment.containersByShardGroup.eraseEntry(0, &target)) {}
+      thisBrain = savedBrain;
+   }
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      ApplicationDeployment deployment{};
+      seedCommonPlan(deployment, true);
+      deployment.nShardGroups = 1;
+      deployment.plan.stateful.clientPrefix = MeshServices::generateStatefulService(999, 1);
+      deployment.plan.stateful.siblingPrefix = MeshServices::generateStatefulService(999, 2);
+      deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(999, 3);
+      deployment.plan.stateful.seedingPrefix = MeshServices::generateStatefulService(999, 4);
+      deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(999, 5);
+      deployment.armStatefulWorkerTopologyUpgrade(2, 4, 4, 512, 64);
+
+      StatefulMeshRoles roles = StatefulMeshRoles::forShardGroup(deployment.plan.stateful, deployment.plan.config.applicationID, 0);
+      ContainerView sourceA = {};
+      ContainerView sourceB = {};
+      ContainerView sourceC = {};
+      ContainerView targetA = {};
+      ContainerView targetB = {};
+      ContainerView targetC = {};
+      ContainerView *sources[] = {&sourceA, &sourceB, &sourceC};
+      ContainerView *targets[] = {&targetA, &targetB, &targetC};
+      auto noteCutoverBarrier = [&] (ContainerView *target) -> void {
+         target->applyStatefulTopologyCutoverMetric(ProdigyMetrics::runtimeStatefulTopologyCutoverSourceEpochKey(), deployment.statefulWorkerTopologyUpgradeSourceEpoch);
+         target->applyStatefulTopologyCutoverMetric(ProdigyMetrics::runtimeStatefulTopologyCutoverTargetEpochKey(), deployment.statefulWorkerTopologyUpgradeTargetEpoch);
+         target->applyStatefulTopologyCutoverMetric(ProdigyMetrics::runtimeStatefulTopologyCutoverReadyKey(), 1);
+         deployment.containerStatefulTopologyCutoverBarrierUpdated(target);
+      };
+
+      uint16_t portSeed = 4100;
+      for (ContainerView *source : sources)
+      {
+         source->uuid = ++portSeed;
+         source->deploymentID = deployment.plan.config.deploymentID();
+         source->applicationID = deployment.plan.config.applicationID;
+         source->isStateful = true;
+         source->shardGroup = 0;
+         source->state = ContainerState::healthy;
+         source->runtimeReady = true;
+         source->explicitStatefulMeshRoles = roles;
+         source->explicitStatefulTopology.operationID = deployment.statefulWorkerTopologyUpgradeOperationID;
+         source->explicitStatefulTopology.shardGroup = 0;
+         source->explicitStatefulTopology.topologyEpoch = deployment.statefulWorkerTopologyUpgradeSourceEpoch;
+         source->explicitStatefulTopology.workerCount = deployment.statefulWorkerTopologyUpgradeSourceWorkerCount;
+         source->explicitStatefulTopology.servingMode = StatefulTopologyServingMode::serve;
+         source->explicitStatefulTopology.sourceEpoch = deployment.statefulWorkerTopologyUpgradeSourceEpoch;
+         source->explicitStatefulTopology.targetEpoch = deployment.statefulWorkerTopologyUpgradeTargetEpoch;
+         source->explicitStatefulTopology.bridgeMode = StatefulTopologyBridgeMode::sourceToTarget;
+      }
+
+      sourceA.advertisements.emplace(roles.client, Advertisement(roles.client, ContainerState::healthy, ContainerState::destroying, 4301));
+      sourceA.advertisingOnPorts.insert(4301);
+      deployment.masterForShardGroup.insert_or_assign(0, &sourceA);
+
+      for (ContainerView *target : targets)
+      {
+         target->uuid = ++portSeed;
+         target->deploymentID = deployment.plan.config.deploymentID();
+         target->applicationID = deployment.plan.config.applicationID;
+         target->isStateful = true;
+         target->shardGroup = 0;
+         target->state = ContainerState::healthy;
+         target->explicitStatefulMeshRoles = roles;
+         target->explicitStatefulTopology.operationID = deployment.statefulWorkerTopologyUpgradeOperationID;
+         target->explicitStatefulTopology.shardGroup = 0;
+         target->explicitStatefulTopology.topologyEpoch = deployment.statefulWorkerTopologyUpgradeTargetEpoch;
+         target->explicitStatefulTopology.workerCount = deployment.statefulWorkerTopologyUpgradeTargetWorkerCount;
+         target->explicitStatefulTopology.servingMode = StatefulTopologyServingMode::catchupOnly;
+         target->explicitStatefulTopology.sourceEpoch = deployment.statefulWorkerTopologyUpgradeSourceEpoch;
+         target->explicitStatefulTopology.targetEpoch = deployment.statefulWorkerTopologyUpgradeTargetEpoch;
+         target->explicitStatefulTopology.bridgeMode = StatefulTopologyBridgeMode::sourceToTarget;
+      }
+
+      for (ContainerView *container : sources)
+      {
+         deployment.containers.insert(container);
+         deployment.containersByShardGroup.insert(0, container);
+      }
+
+      for (ContainerView *container : targets)
+      {
+         deployment.containers.insert(container);
+         deployment.containersByShardGroup.insert(0, container);
+      }
+
+      noteCutoverBarrier(&targetA);
+      noteCutoverBarrier(&targetB);
+      deployment.containerIsRuntimeReady(&targetA);
+      deployment.containerIsRuntimeReady(&targetB);
+      suite.expect(deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::greenBootstrap, "stateful_worker_topology_upgrade_cutover_waits_for_all_targets");
+      deployment.containerIsRuntimeReady(&targetC);
+      suite.expect(deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::greenBootstrap, "stateful_worker_topology_upgrade_cutover_waits_for_barrier_proof");
+      noteCutoverBarrier(&targetC);
+
+      uint32_t targetClientAdvertisements = 0;
+      for (ContainerView *target : targets)
+      {
+         if (target->advertisements.find(roles.client) != target->advertisements.end())
+         {
+            ++targetClientAdvertisements;
+         }
+      }
+
+      suite.expect(deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::blueDraining, "stateful_worker_topology_upgrade_cutover_enters_blue_draining");
+      suite.expect(sourceA.explicitStatefulTopology.servingMode == StatefulTopologyServingMode::drainOnly, "stateful_worker_topology_upgrade_cutover_drains_blue");
+      suite.expect(targetA.explicitStatefulTopology.servingMode == StatefulTopologyServingMode::serve, "stateful_worker_topology_upgrade_cutover_promotes_green");
+      suite.expect(sourceA.subscriptions.find(roles.topologyBridge) != sourceA.subscriptions.end(), "stateful_worker_topology_upgrade_cutover_reverses_bridge_subscription_on_blue");
+      suite.expect(targetA.advertisements.find(roles.topologyBridge) != targetA.advertisements.end(), "stateful_worker_topology_upgrade_cutover_reverses_bridge_advertisement_on_green");
+      suite.expect(sourceA.advertisements.find(roles.client) == sourceA.advertisements.end(), "stateful_worker_topology_upgrade_cutover_removes_blue_client_advertisement");
+      suite.expect(targetClientAdvertisements == 1, "stateful_worker_topology_upgrade_cutover_selects_one_green_client_master");
+      suite.expect(targetA.statefulTopologyCutoverReady == false, "stateful_worker_topology_upgrade_cutover_clears_target_barrier_after_cutover");
+      suite.expect(deployment.statefulWorkerTopologyUpgradeRollbackDeadlineMs() > 0, "stateful_worker_topology_upgrade_cutover_arms_rollback_deadline");
+      suite.expect(
+         brain.statefulWorkerTopologyUpgradeRuntimeState.size() == 1
+            && brain.statefulWorkerTopologyUpgradeRuntimeState[0].phase == StatefulWorkerTopologyUpgradePhase::blueDraining,
+         "stateful_worker_topology_upgrade_cutover_persists_blue_draining_phase");
+      suite.expect(
+         brain.statefulWorkerTopologyUpgradeRuntimeState.size() == 1
+            && brain.statefulWorkerTopologyUpgradeRuntimeState[0].updatedAtMs > 0,
+         "stateful_worker_topology_upgrade_cutover_persists_blue_draining_phase_time");
+      suite.expect(
+         brain.statefulWorkerTopologyUpgradeRuntimeState.size() == 1
+            && deployment.statefulWorkerTopologyUpgradeRollbackDeadlineMs() > brain.statefulWorkerTopologyUpgradeRuntimeState[0].updatedAtMs
+            && uint64_t(deployment.statefulWorkerTopologyUpgradeRollbackDeadlineMs() - brain.statefulWorkerTopologyUpgradeRuntimeState[0].updatedAtMs) == ApplicationDeployment::statefulWorkerTopologyRollbackWindowMs,
+         "stateful_worker_topology_upgrade_cutover_deadline_matches_window");
+
+      for (ContainerView *container : sources)
+      {
+         deployment.containers.erase(container);
+         while (deployment.containersByShardGroup.eraseEntry(0, container)) {}
+      }
+
+      for (ContainerView *container : targets)
+      {
+         deployment.containers.erase(container);
+         while (deployment.containersByShardGroup.eraseEntry(0, container)) {}
+      }
+
+      deployment.masterForShardGroup.erase(0);
+      thisBrain = savedBrain;
+   }
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      bool waitedBeforeFinalEvent = true;
+      bool committedOnFinalEvent = true;
+      uint32_t permutations = 0;
+      uint8_t order[] = {0, 1, 2, 3, 4, 5};
+
+      do
+      {
+         ++permutations;
+
+         ApplicationDeployment deployment{};
+         seedCommonPlan(deployment, true);
+         deployment.nShardGroups = 1;
+         deployment.plan.stateful.clientPrefix = MeshServices::generateStatefulService(999, 1);
+         deployment.plan.stateful.siblingPrefix = MeshServices::generateStatefulService(999, 2);
+         deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(999, 3);
+         deployment.plan.stateful.seedingPrefix = MeshServices::generateStatefulService(999, 4);
+         deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(999, 5);
+         deployment.armStatefulWorkerTopologyUpgrade(2, 4, 4, 512, 64);
+
+         StatefulMeshRoles roles = StatefulMeshRoles::forShardGroup(deployment.plan.stateful, deployment.plan.config.applicationID, 0);
+         ContainerView sourceA = {};
+         ContainerView sourceB = {};
+         ContainerView sourceC = {};
+         ContainerView targetA = {};
+         ContainerView targetB = {};
+         ContainerView targetC = {};
+         ContainerView *sources[] = {&sourceA, &sourceB, &sourceC};
+         ContainerView *targets[] = {&targetA, &targetB, &targetC};
+
+         auto noteCutoverBarrier = [&] (ContainerView *target) -> void {
+            target->applyStatefulTopologyCutoverMetric(ProdigyMetrics::runtimeStatefulTopologyCutoverSourceEpochKey(), deployment.statefulWorkerTopologyUpgradeSourceEpoch);
+            target->applyStatefulTopologyCutoverMetric(ProdigyMetrics::runtimeStatefulTopologyCutoverTargetEpochKey(), deployment.statefulWorkerTopologyUpgradeTargetEpoch);
+            target->applyStatefulTopologyCutoverMetric(ProdigyMetrics::runtimeStatefulTopologyCutoverReadyKey(), 1);
+            deployment.containerStatefulTopologyCutoverBarrierUpdated(target);
+         };
+
+         uint16_t portSeed = 5100;
+         for (ContainerView *source : sources)
+         {
+            source->uuid = ++portSeed;
+            source->deploymentID = deployment.plan.config.deploymentID();
+            source->applicationID = deployment.plan.config.applicationID;
+            source->isStateful = true;
+            source->shardGroup = 0;
+            source->state = ContainerState::healthy;
+            source->runtimeReady = true;
+            source->explicitStatefulMeshRoles = roles;
+            source->explicitStatefulTopology.operationID = deployment.statefulWorkerTopologyUpgradeOperationID;
+            source->explicitStatefulTopology.shardGroup = 0;
+            source->explicitStatefulTopology.topologyEpoch = deployment.statefulWorkerTopologyUpgradeSourceEpoch;
+            source->explicitStatefulTopology.workerCount = deployment.statefulWorkerTopologyUpgradeSourceWorkerCount;
+            source->explicitStatefulTopology.servingMode = StatefulTopologyServingMode::serve;
+            source->explicitStatefulTopology.sourceEpoch = deployment.statefulWorkerTopologyUpgradeSourceEpoch;
+            source->explicitStatefulTopology.targetEpoch = deployment.statefulWorkerTopologyUpgradeTargetEpoch;
+            source->explicitStatefulTopology.bridgeMode = StatefulTopologyBridgeMode::sourceToTarget;
+            deployment.containers.insert(source);
+            deployment.containersByShardGroup.insert(0, source);
+         }
+
+         sourceA.advertisements.emplace(roles.client, Advertisement(roles.client, ContainerState::healthy, ContainerState::destroying, 5301));
+         sourceA.advertisingOnPorts.insert(5301);
+         deployment.masterForShardGroup.insert_or_assign(0, &sourceA);
+
+         for (ContainerView *target : targets)
+         {
+            target->uuid = ++portSeed;
+            target->deploymentID = deployment.plan.config.deploymentID();
+            target->applicationID = deployment.plan.config.applicationID;
+            target->isStateful = true;
+            target->shardGroup = 0;
+            target->state = ContainerState::healthy;
+            target->explicitStatefulMeshRoles = roles;
+            target->explicitStatefulTopology.operationID = deployment.statefulWorkerTopologyUpgradeOperationID;
+            target->explicitStatefulTopology.shardGroup = 0;
+            target->explicitStatefulTopology.topologyEpoch = deployment.statefulWorkerTopologyUpgradeTargetEpoch;
+            target->explicitStatefulTopology.workerCount = deployment.statefulWorkerTopologyUpgradeTargetWorkerCount;
+            target->explicitStatefulTopology.servingMode = StatefulTopologyServingMode::catchupOnly;
+            target->explicitStatefulTopology.sourceEpoch = deployment.statefulWorkerTopologyUpgradeSourceEpoch;
+            target->explicitStatefulTopology.targetEpoch = deployment.statefulWorkerTopologyUpgradeTargetEpoch;
+            target->explicitStatefulTopology.bridgeMode = StatefulTopologyBridgeMode::sourceToTarget;
+            deployment.containers.insert(target);
+            deployment.containersByShardGroup.insert(0, target);
+         }
+
+         for (uint32_t step = 0; step < 6; ++step)
+         {
+            const uint8_t event = order[step];
+            if (event < 3)
+            {
+               deployment.containerIsRuntimeReady(targets[event]);
+            }
+            else
+            {
+               noteCutoverBarrier(targets[event - 3]);
+            }
+
+            if (step < 5)
+            {
+               waitedBeforeFinalEvent = waitedBeforeFinalEvent
+                  && deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::greenBootstrap;
+            }
+            else
+            {
+               committedOnFinalEvent = committedOnFinalEvent
+                  && deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::blueDraining;
+            }
+         }
+      }
+      while (std::next_permutation(order, order + 6));
+
+      suite.expect(permutations == 720, "stateful_worker_topology_upgrade_cutover_permutation_count");
+      suite.expect(waitedBeforeFinalEvent, "stateful_worker_topology_upgrade_cutover_waits_in_all_event_orders");
+      suite.expect(committedOnFinalEvent, "stateful_worker_topology_upgrade_cutover_commits_in_all_event_orders");
+
+      thisBrain = savedBrain;
+   }
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      ApplicationDeployment deployment{};
+      seedCommonPlan(deployment, true);
+      deployment.nShardGroups = 1;
+      deployment.plan.stateful.clientPrefix = MeshServices::generateStatefulService(999, 1);
+      deployment.plan.stateful.siblingPrefix = MeshServices::generateStatefulService(999, 2);
+      deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(999, 3);
+      deployment.plan.stateful.seedingPrefix = MeshServices::generateStatefulService(999, 4);
+      deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(999, 5);
+      deployment.armStatefulWorkerTopologyUpgrade(2, 4, 4, 512, 64);
+
+      StatefulMeshRoles roles = StatefulMeshRoles::forShardGroup(deployment.plan.stateful, deployment.plan.config.applicationID, 0);
+      ContainerView sourceA = {};
+      ContainerView sourceB = {};
+      ContainerView sourceC = {};
+      ContainerView targetA = {};
+      ContainerView targetB = {};
+      ContainerView targetC = {};
+      ContainerView *sources[] = {&sourceA, &sourceB, &sourceC};
+      ContainerView *targets[] = {&targetA, &targetB, &targetC};
+      auto noteCutoverBarrier = [&] (ContainerView *target) -> void {
+         target->applyStatefulTopologyCutoverMetric(ProdigyMetrics::runtimeStatefulTopologyCutoverSourceEpochKey(), deployment.statefulWorkerTopologyUpgradeSourceEpoch);
+         target->applyStatefulTopologyCutoverMetric(ProdigyMetrics::runtimeStatefulTopologyCutoverTargetEpochKey(), deployment.statefulWorkerTopologyUpgradeTargetEpoch);
+         target->applyStatefulTopologyCutoverMetric(ProdigyMetrics::runtimeStatefulTopologyCutoverReadyKey(), 1);
+         deployment.containerStatefulTopologyCutoverBarrierUpdated(target);
+      };
+      auto configureSource = [&] (ContainerView *source) -> void {
+         source->explicitStatefulTopology.operationID = deployment.statefulWorkerTopologyUpgradeOperationID;
+         source->explicitStatefulTopology.shardGroup = 0;
+         source->explicitStatefulTopology.topologyEpoch = deployment.statefulWorkerTopologyUpgradeSourceEpoch;
+         source->explicitStatefulTopology.workerCount = deployment.statefulWorkerTopologyUpgradeSourceWorkerCount;
+         source->explicitStatefulTopology.servingMode = StatefulTopologyServingMode::serve;
+         source->explicitStatefulTopology.sourceEpoch = deployment.statefulWorkerTopologyUpgradeSourceEpoch;
+         source->explicitStatefulTopology.targetEpoch = deployment.statefulWorkerTopologyUpgradeTargetEpoch;
+         source->explicitStatefulTopology.bridgeMode = StatefulTopologyBridgeMode::sourceToTarget;
+      };
+      auto configureTarget = [&] (ContainerView *target) -> void {
+         target->explicitStatefulTopology.operationID = deployment.statefulWorkerTopologyUpgradeOperationID;
+         target->explicitStatefulTopology.shardGroup = 0;
+         target->explicitStatefulTopology.topologyEpoch = deployment.statefulWorkerTopologyUpgradeTargetEpoch;
+         target->explicitStatefulTopology.workerCount = deployment.statefulWorkerTopologyUpgradeTargetWorkerCount;
+         target->explicitStatefulTopology.servingMode = StatefulTopologyServingMode::catchupOnly;
+         target->explicitStatefulTopology.sourceEpoch = deployment.statefulWorkerTopologyUpgradeSourceEpoch;
+         target->explicitStatefulTopology.targetEpoch = deployment.statefulWorkerTopologyUpgradeTargetEpoch;
+         target->explicitStatefulTopology.bridgeMode = StatefulTopologyBridgeMode::sourceToTarget;
+      };
+
+      uint16_t portSeed = 6100;
+      for (ContainerView *source : sources)
+      {
+         source->uuid = ++portSeed;
+         source->deploymentID = deployment.plan.config.deploymentID();
+         source->applicationID = deployment.plan.config.applicationID;
+         source->isStateful = true;
+         source->shardGroup = 0;
+         source->state = ContainerState::healthy;
+         source->runtimeReady = true;
+         source->explicitStatefulMeshRoles = roles;
+         configureSource(source);
+         deployment.containers.insert(source);
+         deployment.containersByShardGroup.insert(0, source);
+      }
+
+      sourceA.advertisements.emplace(roles.client, Advertisement(roles.client, ContainerState::healthy, ContainerState::destroying, 6301));
+      sourceA.advertisingOnPorts.insert(6301);
+      deployment.masterForShardGroup.insert_or_assign(0, &sourceA);
+
+      for (ContainerView *target : targets)
+      {
+         target->uuid = ++portSeed;
+         target->deploymentID = deployment.plan.config.deploymentID();
+         target->applicationID = deployment.plan.config.applicationID;
+         target->isStateful = true;
+         target->shardGroup = 0;
+         target->state = ContainerState::healthy;
+         target->explicitStatefulMeshRoles = roles;
+         configureTarget(target);
+         deployment.containers.insert(target);
+         deployment.containersByShardGroup.insert(0, target);
+      }
+
+      noteCutoverBarrier(&targetA);
+      noteCutoverBarrier(&targetB);
+      noteCutoverBarrier(&targetC);
+      deployment.containerIsRuntimeReady(&targetA);
+      deployment.containerIsRuntimeReady(&targetB);
+      deployment.containerIsRuntimeReady(&targetC);
+
+      deployment.nHealthyBase = 6;
+      String report = "target failed after cutover"_ctv;
+      deployment.containerFailed(&targetA, 1234, 9, report, true);
+
+      uint32_t sourceClientAdvertisements = 0;
+      for (ContainerView *source : sources)
+      {
+         if (source->advertisements.find(roles.client) != source->advertisements.end())
+         {
+            ++sourceClientAdvertisements;
+         }
+      }
+
+      suite.expect(deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::greenBootstrap, "stateful_worker_topology_upgrade_target_failure_rolls_back_to_green_bootstrap");
+      suite.expect(sourceA.explicitStatefulTopology.servingMode == StatefulTopologyServingMode::serve, "stateful_worker_topology_upgrade_target_failure_restores_blue_service");
+      suite.expect(targetA.explicitStatefulTopology.servingMode == StatefulTopologyServingMode::catchupOnly, "stateful_worker_topology_upgrade_target_failure_demotes_green");
+      suite.expect(sourceClientAdvertisements == 1, "stateful_worker_topology_upgrade_target_failure_restores_one_blue_client_advertisement");
+      suite.expect(targetA.advertisements.find(roles.client) == targetA.advertisements.end(), "stateful_worker_topology_upgrade_target_failure_removes_green_client_advertisement");
+      suite.expect(targetB.statefulTopologyCutoverReady == false, "stateful_worker_topology_upgrade_target_failure_clears_surviving_target_barrier");
+      suite.expect(
+         brain.statefulWorkerTopologyUpgradeRuntimeState.size() == 1
+            && brain.statefulWorkerTopologyUpgradeRuntimeState[0].phase == StatefulWorkerTopologyUpgradePhase::greenBootstrap,
+         "stateful_worker_topology_upgrade_target_failure_persists_rollback_phase");
+
+      targetA.state = ContainerState::healthy;
+      configureTarget(&targetA);
+      targetA.runtimeReady = true;
+      deployment.containerIsRuntimeReady(&targetA);
+      deployment.containerIsRuntimeReady(&targetB);
+      deployment.containerIsRuntimeReady(&targetC);
+
+      suite.expect(
+         deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::greenBootstrap,
+         "stateful_worker_topology_upgrade_target_failure_requires_fresh_barrier_before_recutover");
+
+      noteCutoverBarrier(&targetA);
+      noteCutoverBarrier(&targetB);
+      noteCutoverBarrier(&targetC);
+
+      suite.expect(
+         deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::blueDraining,
+         "stateful_worker_topology_upgrade_target_failure_recutover_after_fresh_barrier");
+
+      for (ContainerView *container : sources)
+      {
+         deployment.containers.erase(container);
+         while (deployment.containersByShardGroup.eraseEntry(0, container)) {}
+      }
+
+      for (ContainerView *container : targets)
+      {
+         deployment.containers.erase(container);
+         while (deployment.containersByShardGroup.eraseEntry(0, container)) {}
+      }
+
+      deployment.masterForShardGroup.erase(0);
+      thisBrain = savedBrain;
+   }
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      Rack rack{};
+      Machine machines[3] = {};
+      for (uint32_t i = 0; i < 3; ++i)
+      {
+         machines[i].rack = &rack;
+      }
+
+      ApplicationDeployment deployment{};
+      seedCommonPlan(deployment, true);
+      deployment.nShardGroups = 1;
+      deployment.plan.stateful.clientPrefix = MeshServices::generateStatefulService(999, 1);
+      deployment.plan.stateful.siblingPrefix = MeshServices::generateStatefulService(999, 2);
+      deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(999, 3);
+      deployment.plan.stateful.seedingPrefix = MeshServices::generateStatefulService(999, 4);
+      deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(999, 5);
+      deployment.armStatefulWorkerTopologyUpgrade(2, 4, 4, 512, 64);
+
+      StatefulMeshRoles roles = StatefulMeshRoles::forShardGroup(deployment.plan.stateful, deployment.plan.config.applicationID, 0);
+      uint32_t targetEpoch = deployment.statefulWorkerTopologyUpgradeTargetEpoch;
+      ContainerView *sourceA = new ContainerView();
+      ContainerView *sourceB = new ContainerView();
+      ContainerView *sourceC = new ContainerView();
+      ContainerView targetA = {};
+      ContainerView targetB = {};
+      ContainerView targetC = {};
+      ContainerView *sources[] = {sourceA, sourceB, sourceC};
+      ContainerView *targets[] = {&targetA, &targetB, &targetC};
+      auto noteCutoverBarrier = [&] (ContainerView *target) -> void {
+         target->applyStatefulTopologyCutoverMetric(ProdigyMetrics::runtimeStatefulTopologyCutoverSourceEpochKey(), deployment.statefulWorkerTopologyUpgradeSourceEpoch);
+         target->applyStatefulTopologyCutoverMetric(ProdigyMetrics::runtimeStatefulTopologyCutoverTargetEpochKey(), deployment.statefulWorkerTopologyUpgradeTargetEpoch);
+         target->applyStatefulTopologyCutoverMetric(ProdigyMetrics::runtimeStatefulTopologyCutoverReadyKey(), 1);
+         deployment.containerStatefulTopologyCutoverBarrierUpdated(target);
+      };
+      auto configureSource = [&] (ContainerView *source) -> void {
+         source->explicitStatefulTopology.operationID = deployment.statefulWorkerTopologyUpgradeOperationID;
+         source->explicitStatefulTopology.shardGroup = 0;
+         source->explicitStatefulTopology.topologyEpoch = deployment.statefulWorkerTopologyUpgradeSourceEpoch;
+         source->explicitStatefulTopology.workerCount = deployment.statefulWorkerTopologyUpgradeSourceWorkerCount;
+         source->explicitStatefulTopology.servingMode = StatefulTopologyServingMode::serve;
+         source->explicitStatefulTopology.sourceEpoch = deployment.statefulWorkerTopologyUpgradeSourceEpoch;
+         source->explicitStatefulTopology.targetEpoch = deployment.statefulWorkerTopologyUpgradeTargetEpoch;
+         source->explicitStatefulTopology.bridgeMode = StatefulTopologyBridgeMode::sourceToTarget;
+      };
+      auto configureTarget = [&] (ContainerView *target) -> void {
+         target->explicitStatefulTopology.operationID = deployment.statefulWorkerTopologyUpgradeOperationID;
+         target->explicitStatefulTopology.shardGroup = 0;
+         target->explicitStatefulTopology.topologyEpoch = deployment.statefulWorkerTopologyUpgradeTargetEpoch;
+         target->explicitStatefulTopology.workerCount = deployment.statefulWorkerTopologyUpgradeTargetWorkerCount;
+         target->explicitStatefulTopology.servingMode = StatefulTopologyServingMode::catchupOnly;
+         target->explicitStatefulTopology.sourceEpoch = deployment.statefulWorkerTopologyUpgradeSourceEpoch;
+         target->explicitStatefulTopology.targetEpoch = deployment.statefulWorkerTopologyUpgradeTargetEpoch;
+         target->explicitStatefulTopology.bridgeMode = StatefulTopologyBridgeMode::sourceToTarget;
+      };
+
+      uint16_t portSeed = 7100;
+      for (uint32_t i = 0; i < 3; ++i)
+      {
+         ContainerView *source = sources[i];
+         source->uuid = ++portSeed;
+         source->deploymentID = deployment.plan.config.deploymentID();
+         source->applicationID = deployment.plan.config.applicationID;
+         source->isStateful = true;
+         source->shardGroup = 0;
+         source->state = ContainerState::healthy;
+         source->runtimeReady = true;
+         source->machine = &machines[i];
+         source->explicitStatefulMeshRoles = roles;
+         configureSource(source);
+         deployment.containers.insert(source);
+         deployment.containersByShardGroup.insert(0, source);
+      }
+
+      sourceA->advertisements.emplace(roles.client, Advertisement(roles.client, ContainerState::healthy, ContainerState::destroying, 7301));
+      sourceA->advertisingOnPorts.insert(7301);
+      deployment.masterForShardGroup.insert_or_assign(0, sourceA);
+
+      for (ContainerView *target : targets)
+      {
+         target->uuid = ++portSeed;
+         target->deploymentID = deployment.plan.config.deploymentID();
+         target->applicationID = deployment.plan.config.applicationID;
+         target->isStateful = true;
+         target->shardGroup = 0;
+         target->state = ContainerState::healthy;
+         target->runtimeReady = true;
+         target->explicitStatefulMeshRoles = roles;
+         configureTarget(target);
+         deployment.containers.insert(target);
+         deployment.containersByShardGroup.insert(0, target);
+      }
+
+      noteCutoverBarrier(&targetA);
+      noteCutoverBarrier(&targetB);
+      noteCutoverBarrier(&targetC);
+      deployment.containerIsRuntimeReady(&targetA);
+      deployment.containerIsRuntimeReady(&targetB);
+      deployment.containerIsRuntimeReady(&targetC);
+      deployment.destructContainer(sourceA);
+      deployment.destructContainer(sourceB);
+      deployment.destructContainer(sourceC);
+      for (ContainerView *source : sources)
+      {
+         deployment.waitingOnContainers.insert_or_assign(source, ContainerState::destroyed);
+      }
+
+      suite.expect(deployment.statefulWorkerTopologyUpgradePendingForAnyShardGroup(), "stateful_worker_topology_upgrade_blue_retirement_waits_for_destroy_confirmations");
+      deployment.containerDestroyed(sourceA);
+      deployment.containerDestroyed(sourceB);
+      suite.expect(deployment.statefulWorkerTopologyUpgradePendingForAnyShardGroup(), "stateful_worker_topology_upgrade_blue_retirement_waits_for_all_destroy_confirmations");
+      deployment.containerDestroyed(sourceC);
+
+      uint32_t targetClientAdvertisements = 0;
+      for (ContainerView *target : targets)
+      {
+         if (target->advertisements.find(roles.client) != target->advertisements.end())
+         {
+            ++targetClientAdvertisements;
+         }
+      }
+
+      suite.expect(deployment.statefulWorkerTopologyUpgradePendingForAnyShardGroup() == false, "stateful_worker_topology_upgrade_blue_retirement_completes_operation");
+      suite.expect(deployment.plan.config.nLogicalCores == 4, "stateful_worker_topology_upgrade_blue_retirement_commits_target_cores");
+      suite.expect(brain.statefulWorkerTopologyUpgradeRuntimeState.empty(), "stateful_worker_topology_upgrade_blue_retirement_clears_persisted_operation");
+      suite.expect(targetA.explicitStatefulTopology.operationID == 0, "stateful_worker_topology_upgrade_blue_retirement_clears_target_operation_id");
+      suite.expect(targetA.explicitStatefulTopology.workerCount == 4, "stateful_worker_topology_upgrade_blue_retirement_preserves_target_worker_count");
+      suite.expect(targetA.explicitStatefulTopology.topologyEpoch == targetEpoch, "stateful_worker_topology_upgrade_blue_retirement_preserves_target_epoch");
+      suite.expect(targetA.explicitStatefulTopology.bridgeMode == StatefulTopologyBridgeMode::none, "stateful_worker_topology_upgrade_blue_retirement_removes_bridge_mode");
+      suite.expect(targetA.advertisements.find(roles.topologyBridge) == targetA.advertisements.end(), "stateful_worker_topology_upgrade_blue_retirement_removes_bridge_advertisement");
+      suite.expect(targetA.subscriptions.find(roles.topologyBridge) == targetA.subscriptions.end(), "stateful_worker_topology_upgrade_blue_retirement_removes_bridge_subscription");
+      suite.expect(targetClientAdvertisements == 1, "stateful_worker_topology_upgrade_blue_retirement_keeps_one_green_client_master");
+
+      for (ContainerView *container : targets)
+      {
+         deployment.containers.erase(container);
+         while (deployment.containersByShardGroup.eraseEntry(0, container)) {}
+      }
+
+      deployment.masterForShardGroup.erase(0);
+      thisBrain = savedBrain;
+   }
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      ApplicationDeployment deployment{};
+      seedCommonPlan(deployment, true);
+      deployment.nShardGroups = 1;
+      deployment.plan.stateful.clientPrefix = MeshServices::generateStatefulService(999, 1);
+      deployment.plan.stateful.siblingPrefix = MeshServices::generateStatefulService(999, 2);
+      deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(999, 3);
+      deployment.plan.stateful.seedingPrefix = MeshServices::generateStatefulService(999, 4);
+      deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(999, 5);
+
+      ProdigyStatefulWorkerTopologyUpgradeOperation operation = {};
+      operation.deploymentID = deployment.plan.config.deploymentID();
+      operation.applicationID = deployment.plan.config.applicationID;
+      operation.operationID = 0x19075001ull;
+      operation.phase = StatefulWorkerTopologyUpgradePhase::blueDraining;
+      operation.sourceWorkerCount = 2;
+      operation.targetWorkerCount = 4;
+      operation.sourceEpoch = 2;
+      operation.targetEpoch = 400;
+      operation.updatedAtMs = Time::now<TimeResolution::ms>();
+      operation.lockedShardGroups.push_back(0);
+      brain.statefulWorkerTopologyUpgradeRuntimeState.push_back(operation);
+
+      ContainerView source = {};
+      source.uuid = uint128_t(0x19075002);
+      source.deploymentID = deployment.plan.config.deploymentID();
+      source.applicationID = deployment.plan.config.applicationID;
+      source.isStateful = true;
+      source.shardGroup = 0;
+      source.state = ContainerState::healthy;
+
+      ContainerView target = {};
+      target.uuid = uint128_t(0x19075003);
+      target.deploymentID = deployment.plan.config.deploymentID();
+      target.applicationID = deployment.plan.config.applicationID;
+      target.isStateful = true;
+      target.shardGroup = 0;
+      target.state = ContainerState::healthy;
+      target.explicitStatefulTopology.operationID = operation.operationID;
+      target.explicitStatefulTopology.shardGroup = 0;
+      target.explicitStatefulTopology.topologyEpoch = operation.targetEpoch;
+      target.explicitStatefulTopology.workerCount = operation.targetWorkerCount;
+
+      deployment.containers.insert(&source);
+      deployment.containers.insert(&target);
+      deployment.containersByShardGroup.insert(0, &source);
+      deployment.containersByShardGroup.insert(0, &target);
+
+      bool restored = deployment.restorePersistedStatefulWorkerTopologyUpgradeOperation();
+      StatefulMeshRoles roles = StatefulMeshRoles::forShardGroup(deployment.plan.stateful, deployment.plan.config.applicationID, 0);
+
+      suite.expect(restored, "stateful_worker_topology_upgrade_restore_blue_draining_recovers_operation");
+      suite.expect(source.explicitStatefulTopology.servingMode == StatefulTopologyServingMode::drainOnly, "stateful_worker_topology_upgrade_restore_blue_draining_applies_source_drain_only");
+      suite.expect(source.subscriptions.find(roles.topologyBridge) != source.subscriptions.end(), "stateful_worker_topology_upgrade_restore_blue_draining_adds_source_reverse_bridge_subscription");
+      suite.expect(source.plannedWork == nullptr, "stateful_worker_topology_upgrade_restore_blue_draining_keeps_blue_retirement_waiting_for_deadline");
+      suite.expect(target.explicitStatefulTopology.servingMode == StatefulTopologyServingMode::serve, "stateful_worker_topology_upgrade_restore_blue_draining_applies_target_serve");
+      suite.expect(target.advertisements.find(roles.topologyBridge) != target.advertisements.end(), "stateful_worker_topology_upgrade_restore_blue_draining_adds_target_reverse_bridge_advertisement");
+      suite.expect(target.advertisements.find(roles.client) != target.advertisements.end(), "stateful_worker_topology_upgrade_restore_blue_draining_restores_target_client_advertisement");
+
+      deployment.containers.erase(&source);
+      deployment.containers.erase(&target);
+      while (deployment.containersByShardGroup.eraseEntry(0, &source)) {}
+      while (deployment.containersByShardGroup.eraseEntry(0, &target)) {}
+      deployment.masterForShardGroup.erase(0);
+      thisBrain = savedBrain;
+   }
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      ApplicationDeployment deployment{};
+      seedCommonPlan(deployment, true);
+      deployment.nShardGroups = 1;
+      deployment.plan.stateful.clientPrefix = MeshServices::generateStatefulService(999, 1);
+      deployment.plan.stateful.siblingPrefix = MeshServices::generateStatefulService(999, 2);
+      deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(999, 3);
+      deployment.plan.stateful.seedingPrefix = MeshServices::generateStatefulService(999, 4);
+      deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(999, 5);
+
+      ProdigyStatefulWorkerTopologyUpgradeOperation operation = {};
+      operation.deploymentID = deployment.plan.config.deploymentID();
+      operation.applicationID = deployment.plan.config.applicationID;
+      operation.operationID = 0x19075011ull;
+      operation.phase = StatefulWorkerTopologyUpgradePhase::blueDraining;
+      operation.sourceWorkerCount = 2;
+      operation.targetWorkerCount = 4;
+      operation.sourceEpoch = 2;
+      operation.targetEpoch = 400;
+      operation.updatedAtMs = Time::now<TimeResolution::ms>() - int64_t(ApplicationDeployment::statefulWorkerTopologyRollbackWindowMs + 1);
+      operation.lockedShardGroups.push_back(0);
+      brain.statefulWorkerTopologyUpgradeRuntimeState.push_back(operation);
+
+      ContainerView source = {};
+      source.uuid = uint128_t(0x19075012);
+      source.deploymentID = deployment.plan.config.deploymentID();
+      source.applicationID = deployment.plan.config.applicationID;
+      source.isStateful = true;
+      source.shardGroup = 0;
+      source.state = ContainerState::healthy;
+      Machine sourceMachine = {};
+      source.machine = &sourceMachine;
+
+      ContainerView target = {};
+      target.uuid = uint128_t(0x19075013);
+      target.deploymentID = deployment.plan.config.deploymentID();
+      target.applicationID = deployment.plan.config.applicationID;
+      target.isStateful = true;
+      target.shardGroup = 0;
+      target.state = ContainerState::healthy;
+      target.explicitStatefulTopology.operationID = operation.operationID;
+      target.explicitStatefulTopology.shardGroup = 0;
+      target.explicitStatefulTopology.topologyEpoch = operation.targetEpoch;
+      target.explicitStatefulTopology.workerCount = operation.targetWorkerCount;
+
+      deployment.containers.insert(&source);
+      deployment.containers.insert(&target);
+      deployment.containersByShardGroup.insert(0, &source);
+      deployment.containersByShardGroup.insert(0, &target);
+
+      bool restored = deployment.restorePersistedStatefulWorkerTopologyUpgradeOperation();
+      String report = "target failed after rollback deadline"_ctv;
+      deployment.containerFailed(&target, 1234, 9, report, true);
+
+      suite.expect(restored, "stateful_worker_topology_upgrade_restore_blue_draining_expired_window_recovers_operation");
+      suite.expect(deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::blueDraining, "stateful_worker_topology_upgrade_expired_window_does_not_roll_back");
+      suite.expect(source.explicitStatefulTopology.servingMode == StatefulTopologyServingMode::drainOnly, "stateful_worker_topology_upgrade_expired_window_keeps_blue_drain_only");
+      suite.expect(source.state == ContainerState::destroying, "stateful_worker_topology_upgrade_expired_window_schedules_blue_retirement");
+      suite.expect(source.plannedWork == nullptr, "stateful_worker_topology_upgrade_expired_window_consumes_blue_retirement_work");
+      suite.expect(target.explicitStatefulTopology.servingMode == StatefulTopologyServingMode::serve, "stateful_worker_topology_upgrade_expired_window_keeps_green_serving");
+
+      deployment.containers.erase(&source);
+      deployment.containers.erase(&target);
+      while (deployment.containersByShardGroup.eraseEntry(0, &source)) {}
+      while (deployment.containersByShardGroup.eraseEntry(0, &target)) {}
+      deployment.masterForShardGroup.erase(0);
+      thisBrain = savedBrain;
    }
 
    {
@@ -3952,11 +5647,16 @@ int main(void)
       deployment.nDeployedBase = 99;
       deployment.nHealthyBase = 99;
 
+      Machine machine = {};
+      machine.state = MachineState::healthy;
+
       ContainerView healthy;
+      healthy.machine = &machine;
       healthy.lifetime = ApplicationLifetime::base;
       healthy.state = ContainerState::healthy;
 
       ContainerView scheduled;
+      scheduled.machine = &machine;
       scheduled.lifetime = ApplicationLifetime::base;
       scheduled.state = ContainerState::scheduled;
 
@@ -3970,17 +5670,230 @@ int main(void)
    }
 
    {
+      ScopedFreshRing ring;
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+      brain.brainConfig.runtimeEnvironment.test.enabled = true;
+      brain.brainConfig.architecture = nametagCurrentBuildMachineArchitecture();
+
+      Rack rack = {};
+      rack.uuid = 0x19602020;
+      brain.racks.insert_or_assign(rack.uuid, &rack);
+
+      Machine staleMachine = {};
+      staleMachine.uuid = uint128_t(0x19602021);
+      staleMachine.slug = "recover-stale-stateless-source"_ctv;
+      staleMachine.private4 = 0x0a000021;
+      staleMachine.rack = &rack;
+      staleMachine.state = MachineState::healthy;
+      staleMachine.lifetime = MachineLifetime::owned;
+      staleMachine.hardware.cpu.architecture = nametagCurrentBuildMachineArchitecture();
+      staleMachine.nLogicalCores_available = 8;
+      staleMachine.memoryMB_available = 8'192;
+      staleMachine.storageMB_available = 4'096;
+      staleMachine.neuron.machine = &staleMachine;
+
+      Machine readyMachine = {};
+      readyMachine.uuid = uint128_t(0x19602022);
+      readyMachine.slug = "recover-stale-stateless-target"_ctv;
+      readyMachine.private4 = 0x0a000022;
+      readyMachine.rack = &rack;
+      readyMachine.state = MachineState::healthy;
+      readyMachine.lifetime = MachineLifetime::owned;
+      readyMachine.hardware.cpu.architecture = nametagCurrentBuildMachineArchitecture();
+      readyMachine.nLogicalCores_available = 8;
+      readyMachine.memoryMB_available = 8'192;
+      readyMachine.storageMB_available = 4'096;
+
+      ScopedSocketPair socket = {};
+      bool machineReady = socket.create(suite, "recoverAfterReboot_stale_stateless_fixture_socketpair")
+         && armNeuronControlStream(readyMachine, socket);
+
+      rack.machines.insert(&staleMachine);
+      rack.machines.insert(&readyMachine);
+      brain.machines.insert(&staleMachine);
+      brain.machines.insert(&readyMachine);
+
+      suite.expect(machineReady, "recoverAfterReboot_stale_stateless_fixture_machine_ready");
+
       ApplicationDeployment deployment;
-      deployment.state = DeploymentState::failed;
-      deployment.nDeployedBase = 7;
-      deployment.nHealthyBase = 5;
-      deployment.recoverAfterReboot();
-      suite.expect(deployment.nDeployedBase == 7 && deployment.nHealthyBase == 5, "recoverAfterReboot_skips_failed_state");
+      seedCommonPlan(deployment, false);
+      deployment.plan.config.type = ApplicationType::stateless;
+      deployment.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+      deployment.plan.stateless.nBase = 1;
+      deployment.plan.canaryCount = 0;
+      deployment.plan.canariesMustLiveForMinutes = 0;
+      deployment.plan.moveConstructively = true;
+      deployment.plan.useHostNetworkNamespace = false;
+      deployment.plan.requiresDatacenterUniqueTag = false;
+      deployment.state = DeploymentState::none;
+      deployment.nTargetBase = 1;
+      deployment.nDeployedBase = 1;
+      deployment.nHealthyBase = 1;
+      brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+
+      ContainerView *oldContainer = new ContainerView();
+      uint128_t oldUUID = uint128_t(0x19602023);
+      oldContainer->uuid = oldUUID;
+      oldContainer->deploymentID = deployment.plan.config.deploymentID();
+      oldContainer->applicationID = deployment.plan.config.applicationID;
+      oldContainer->machine = &staleMachine;
+      oldContainer->lifetime = ApplicationLifetime::base;
+      oldContainer->state = ContainerState::healthy;
+      deployment.containers.insert(oldContainer);
+      brain.containers.insert_or_assign(oldUUID, oldContainer);
+      staleMachine.upsertContainerIndexEntry(oldContainer->deploymentID, oldContainer);
+
+      if (machineReady)
+      {
+         deployment.recoverAfterReboot();
+
+         ContainerView *replacement = nullptr;
+         for (ContainerView *container : deployment.containers)
+         {
+            replacement = container;
+         }
+
+         suite.expect(deployment.containers.size() == 1, "recoverAfterReboot_stale_stateless_replaces_one_container");
+         suite.expect(replacement && replacement->machine == &readyMachine, "recoverAfterReboot_stale_stateless_schedules_on_live_machine");
+         suite.expect(deployment.nDeployedBase == 1, "recoverAfterReboot_stale_stateless_restores_deployed_count");
+         suite.expect(deployment.nHealthyBase == 0, "recoverAfterReboot_stale_stateless_does_not_count_stale_healthy");
+         suite.expect(deployment.state == DeploymentState::deploying, "recoverAfterReboot_stale_stateless_enters_deploying");
+         suite.expect(deployment.waitingOnContainers.size() == 1, "recoverAfterReboot_stale_stateless_waits_for_replacement_health");
+         suite.expect(brain.containers.contains(oldUUID) == false, "recoverAfterReboot_stale_stateless_erases_old_brain_container");
+         suite.expect(readyMachine.neuron.pendingSend && readyMachine.neuron.wBuffer.size() > 0, "recoverAfterReboot_stale_stateless_queues_replacement_spin");
+      }
+
+      Vector<ContainerView *> cleanupContainers;
+      for (ContainerView *container : deployment.containers)
+      {
+         cleanupContainers.push_back(container);
+      }
+
+      for (ContainerView *container : cleanupContainers)
+      {
+         if (container && deployment.containers.contains(container))
+         {
+            deployment.destructContainer(container);
+            deployment.containerDestroyed(container);
+         }
+      }
+
+      brain.deployments.erase(deployment.plan.config.deploymentID());
+      rack.machines.erase(&staleMachine);
+      rack.machines.erase(&readyMachine);
+      brain.machines.erase(&staleMachine);
+      brain.machines.erase(&readyMachine);
+      brain.racks.erase(rack.uuid);
+      thisBrain = savedBrain;
    }
 
    {
       ApplicationDeployment deployment;
+      deployment.state = DeploymentState::failed;
+      deployment.nDeployedBase = 7;
+      deployment.nHealthyBase = 5;
+	      deployment.recoverAfterReboot();
+	      suite.expect(deployment.nDeployedBase == 7 && deployment.nHealthyBase == 5, "recoverAfterReboot_skips_failed_state");
+	   }
+
+	   {
+	      TestBrain brain;
+	      BrainBase *savedBrain = thisBrain;
+	      thisBrain = &brain;
+
+	      ApplicationDeployment deployment;
+	      seedCommonPlan(deployment, false);
+	      deployment.plan.stateless.nBase = 1;
+	      deployment.state = DeploymentState::none;
+
+	      deployment.recoverAfterReboot();
+
+		      suite.expect(deployment.nTargetBase == 1, "recoverAfterReboot_materializes_stateless_target_for_pending_plan");
+		      suite.expect(deployment.nTarget() == 1, "recoverAfterReboot_materializes_stateless_total_target_for_pending_plan");
+		      suite.expect(deployment.nDeployed() == 0, "recoverAfterReboot_pending_plan_without_healthy_machines_does_not_schedule");
+		      suite.expect(deployment.state == DeploymentState::none, "recoverAfterReboot_pending_plan_without_healthy_machines_keeps_state");
+	      suite.expect(deployment.nSuspended == 0, "recoverAfterReboot_pending_plan_without_healthy_machines_does_not_leak_suspension");
+
+	      thisBrain = savedBrain;
+	   }
+
+   {
+      ScopedFreshRing ring;
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+      brain.brainConfig.runtimeEnvironment.test.enabled = true;
+      brain.brainConfig.architecture = nametagCurrentBuildMachineArchitecture();
+
+      Rack rack = {};
+      rack.uuid = 0x19602001;
+      brain.racks.insert_or_assign(rack.uuid, &rack);
+
+      ScopedSocketPair socket = {};
+      bool socketReady = socket.create(suite, "recoverAfterReboot_stale_suspension_fixture_socketpair");
+
+      Machine machine = {};
+      machine.uuid = uint128_t(0x19602002);
+      machine.slug = "recover-stale-suspension-target"_ctv;
+      machine.private4 = 0x0a000018;
+      machine.rack = &rack;
+      machine.state = MachineState::healthy;
+      machine.lifetime = MachineLifetime::owned;
+      machine.hardware.cpu.architecture = nametagCurrentBuildMachineArchitecture();
+      machine.nLogicalCores_available = 8;
+      machine.memoryMB_available = 8'192;
+      machine.storageMB_available = 4'096;
+      bool machineReady = socketReady && armNeuronControlStream(machine, socket);
+      rack.machines.insert(&machine);
+      brain.machines.insert(&machine);
+
+      suite.expect(machineReady, "recoverAfterReboot_stale_suspension_fixture_machine_ready");
+
+      ApplicationDeployment deployment;
       seedCommonPlan(deployment, false);
+      deployment.plan.config.type = ApplicationType::stateless;
+      deployment.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+      deployment.plan.stateless.nBase = 1;
+      deployment.plan.canaryCount = 0;
+      deployment.plan.canariesMustLiveForMinutes = 0;
+      deployment.plan.moveConstructively = true;
+      deployment.plan.useHostNetworkNamespace = false;
+      deployment.plan.requiresDatacenterUniqueTag = false;
+      deployment.state = DeploymentState::none;
+      deployment.nTargetBase = 1;
+      deployment.nSuspended = 3;
+      brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+
+      if (machineReady)
+      {
+         deployment.recoverAfterReboot();
+
+         suite.expect(deployment.state == DeploymentState::deploying, "recoverAfterReboot_stale_suspension_schedules_underprovisioned");
+         suite.expect(deployment.nDeployedBase == 1, "recoverAfterReboot_stale_suspension_deploys_missing_base");
+         suite.expect(deployment.waitingOnContainers.size() == 1, "recoverAfterReboot_stale_suspension_waits_for_construct_health");
+         suite.expect(deployment.schedulingStack.execution != nullptr, "recoverAfterReboot_stale_suspension_starts_scheduler");
+         suite.expect(deployment.nSuspended == 1, "recoverAfterReboot_stale_suspension_replaces_stale_counter_with_live_wait");
+         suite.expect(machine.neuron.pendingSend && machine.neuron.wBuffer.size() > 0, "recoverAfterReboot_stale_suspension_queues_neuron_spin");
+
+         if (deployment.containers.empty() == false)
+         {
+            ContainerView *container = *deployment.containers.begin();
+            deployment.containerIsHealthy(container);
+         }
+      }
+
+      brain.deployments.erase(deployment.plan.config.deploymentID());
+      rack.machines.erase(&machine);
+      brain.machines.erase(&machine);
+      brain.racks.erase(rack.uuid);
+      thisBrain = savedBrain;
+   }
+
+	   {
+	      ApplicationDeployment deployment;
+	      seedCommonPlan(deployment, false);
       deployment.plan.config.versionID = 42;
       deployment.state = DeploymentState::running;
       deployment.nTargetBase = 1;
@@ -4251,6 +6164,88 @@ int main(void)
       brain.machines.erase(&machineA);
       brain.machines.erase(&machineB);
       brain.machines.erase(&machineC);
+      brain.racks.erase(rackA.uuid);
+      brain.racks.erase(rackB.uuid);
+      brain.racks.erase(rackC.uuid);
+      thisBrain = savedBrain;
+   }
+
+   {
+      ScopedFreshRing ring;
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      Rack rackA{};
+      rackA.uuid = 1902'2911;
+      Rack rackB{};
+      rackB.uuid = 1902'2912;
+      Rack rackC{};
+      rackC.uuid = 1902'2913;
+      brain.racks.insert_or_assign(rackA.uuid, &rackA);
+      brain.racks.insert_or_assign(rackB.uuid, &rackB);
+      brain.racks.insert_or_assign(rackC.uuid, &rackC);
+
+      ScopedSocketPair socketBrain = {};
+      ScopedSocketPair socketWorkerA = {};
+      ScopedSocketPair socketWorkerB = {};
+      bool socketsReady =
+         socketBrain.create(suite, "measure_stateful_runtime_not_ready_creates_socketpair_brain")
+         && socketWorkerA.create(suite, "measure_stateful_runtime_not_ready_creates_socketpair_worker_a")
+         && socketWorkerB.create(suite, "measure_stateful_runtime_not_ready_creates_socketpair_worker_b");
+
+      Machine brainMachine = {};
+      brainMachine.slug = "controller-brain-runtime-ready"_ctv;
+      brainMachine.rack = &rackA;
+      brainMachine.state = MachineState::healthy;
+      brainMachine.lifetime = MachineLifetime::owned;
+      brainMachine.isBrain = true;
+      brainMachine.nLogicalCores_available = 8;
+      brainMachine.memoryMB_available = 8'192;
+      brainMachine.storageMB_available = 4'096;
+      bool brainMachineArmed = socketsReady && armNeuronControlStream(brainMachine, socketBrain);
+      rackA.machines.insert(&brainMachine);
+      brain.machines.insert(&brainMachine);
+
+      Machine workerA = {};
+      workerA.slug = "worker-runtime-ready-a"_ctv;
+      workerA.rack = &rackB;
+      workerA.state = MachineState::healthy;
+      workerA.lifetime = MachineLifetime::owned;
+      workerA.nLogicalCores_available = 8;
+      workerA.memoryMB_available = 8'192;
+      workerA.storageMB_available = 4'096;
+      bool workerAReady = socketsReady && armNeuronControlStream(workerA, socketWorkerA);
+      rackB.machines.insert(&workerA);
+      brain.machines.insert(&workerA);
+
+      Machine workerB = {};
+      workerB.slug = "worker-runtime-pending-b"_ctv;
+      workerB.rack = &rackC;
+      workerB.state = MachineState::healthy;
+      workerB.lifetime = MachineLifetime::owned;
+      workerB.nLogicalCores_available = 8;
+      workerB.memoryMB_available = 8'192;
+      workerB.storageMB_available = 4'096;
+      bool workerBReady = socketsReady && armNeuronControlStream(workerB, socketWorkerB);
+      workerB.runtimeReady = false;
+      rackC.machines.insert(&workerB);
+      brain.machines.insert(&workerB);
+
+      suite.expect(brainMachineArmed && workerAReady && workerBReady, "measure_stateful_runtime_not_ready_seeds_neuron_control_streams");
+
+      ApplicationDeployment deployment;
+      seedCommonPlan(deployment, true);
+
+      uint32_t measured = deployment.measure();
+      suite.expect(measured == 2, "measure_stateful_excludes_healthy_machine_without_runtime_ready");
+
+      rackA.machines.erase(&brainMachine);
+      rackB.machines.erase(&workerA);
+      rackC.machines.erase(&workerB);
+      brain.machines.erase(&brainMachine);
+      brain.machines.erase(&workerA);
+      brain.machines.erase(&workerB);
       brain.racks.erase(rackA.uuid);
       brain.racks.erase(rackB.uuid);
       brain.racks.erase(rackC.uuid);
@@ -5228,6 +7223,7 @@ int main(void)
          machine.neuron.isFixedFile = true;
          machine.neuron.fslot = sockets.adoptLeftIntoFixedFileSlot();
          machine.neuron.connected = (machine.neuron.fslot >= 0);
+         machine.runtimeReady = machine.neuron.connected;
          rack.machines.insert(&machine);
          brain.machines.insert(&machine);
          return machine.neuron.connected;
@@ -5363,6 +7359,7 @@ int main(void)
          machine.neuron.isFixedFile = true;
          machine.neuron.fslot = sockets.adoptLeftIntoFixedFileSlot();
          machine.neuron.connected = (machine.neuron.fslot >= 0);
+         machine.runtimeReady = machine.neuron.connected;
          rack.machines.insert(&machine);
          brain.machines.insert(&machine);
          return machine.neuron.connected;
@@ -5433,8 +7430,166 @@ int main(void)
       brain.racks.erase(rackA.uuid);
       brain.racks.erase(rackB.uuid);
       brain.racks.erase(rackC.uuid);
-      thisBrain = savedBrain;
-   }
+	      thisBrain = savedBrain;
+	   }
 
-   return (suite.failed == 0) ? 0 : 1;
-}
+	   {
+	      ScopedFreshRing ring;
+	      TestBrain brain;
+	      BrainBase *savedBrain = thisBrain;
+	      thisBrain = &brain;
+
+	      Rack rack = {};
+	      rack.uuid = 1961'0101;
+
+	      ScopedSocketPair socket = {};
+	      bool socketReady = socket.create(suite, "previous_stateless_destruction_routes_waiter_creates_socketpair");
+
+	      Machine machine = {};
+	      machine.uuid = uint128_t(0x19610101);
+	      machine.private4 = 0x0a000031;
+	      machine.slug = "previous-destroy-owner"_ctv;
+	      machine.rack = &rack;
+	      machine.state = MachineState::healthy;
+	      machine.lifetime = MachineLifetime::owned;
+	      machine.hardware.inventoryComplete = true;
+	      machine.hardware.cpu.architecture = nametagCurrentBuildMachineArchitecture();
+	      machine.nLogicalCores_available = 8;
+	      machine.memoryMB_available = 8'192;
+	      machine.storageMB_available = 4'096;
+	      bool machineReady = socketReady && armNeuronControlStream(machine, socket);
+	      rack.machines.insert(&machine);
+	      brain.racks.insert_or_assign(rack.uuid, &rack);
+	      brain.machines.insert(&machine);
+
+	      suite.expect(machineReady, "previous_stateless_destruction_routes_waiter_seeds_neuron_control_stream");
+
+	      ApplicationDeployment *previous = new ApplicationDeployment();
+	      ApplicationDeployment *current = new ApplicationDeployment();
+	      seedCommonPlan(*previous, false);
+	      seedCommonPlan(*current, false);
+	      previous->plan.config.versionID = 1;
+	      current->plan.config.versionID = 2;
+	      previous->plan.stateless.nBase = 1;
+	      current->plan.stateless.nBase = 1;
+	      previous->state = DeploymentState::decommissioning;
+	      current->state = DeploymentState::deploying;
+	      previous->nTargetBase = 1;
+	      previous->nDeployedBase = 1;
+	      previous->nHealthyBase = 1;
+	      current->nTargetBase = 1;
+	      current->nDeployedBase = 1;
+	      current->nHealthyBase = 1;
+	      previous->next = current;
+	      current->previous = previous;
+
+	      ContainerView *oldContainer = new ContainerView();
+	      oldContainer->uuid = uint128_t(0x19610102);
+	      oldContainer->deploymentID = previous->plan.config.deploymentID();
+	      oldContainer->applicationID = previous->plan.config.applicationID;
+	      oldContainer->machine = &machine;
+	      oldContainer->lifetime = ApplicationLifetime::base;
+	      oldContainer->state = ContainerState::healthy;
+	      previous->containers.insert(oldContainer);
+	      machine.upsertContainerIndexEntry(oldContainer->deploymentID, oldContainer);
+	      brain.containers.insert_or_assign(oldContainer->uuid, oldContainer);
+	      brain.deployments.insert_or_assign(previous->plan.config.deploymentID(), previous);
+	      brain.deployments.insert_or_assign(current->plan.config.deploymentID(), current);
+	      brain.deploymentsByApp.insert_or_assign(current->plan.config.applicationID, current);
+
+	      current->toSchedule.push_back(current->planStatelessDestruction(oldContainer, "unit-previous-destroy"));
+	      current->schedule(nullptr);
+
+	      suite.expect(oldContainer->state == ContainerState::destroying, "previous_stateless_destruction_marks_old_container_destroying");
+	      suite.expect(oldContainer->destructionWaiterDeploymentID == current->plan.config.deploymentID(), "previous_stateless_destruction_records_current_waiter");
+	      suite.expect(previous->containers.contains(oldContainer) == false, "previous_stateless_destruction_removes_from_previous_container_set");
+	      suite.expect(previous->nHealthyBase == 0, "previous_stateless_destruction_decrements_previous_health");
+	      suite.expect(current->nHealthyBase == 1, "previous_stateless_destruction_preserves_current_health");
+	      suite.expect(current->waitingOnContainers.contains(oldContainer), "previous_stateless_destruction_waits_on_current_deployment");
+
+	      ApplicationDeployment *ackDeployment = nullptr;
+	      uint64_t waiterDeploymentID = oldContainer->destructionWaiterDeploymentID;
+	      if (auto deploymentIt = brain.deployments.find(waiterDeploymentID ? waiterDeploymentID : oldContainer->deploymentID); deploymentIt != brain.deployments.end())
+	      {
+	         ackDeployment = deploymentIt->second;
+	      }
+	      suite.expect(ackDeployment == current, "previous_stateless_destruction_ack_routes_to_current_deployment");
+
+	      current->containerDestroyed(oldContainer);
+
+	      suite.expect(current->state == DeploymentState::running, "previous_stateless_destruction_completion_runs_current_deployment");
+	      suite.expect(current->previous == nullptr, "previous_stateless_destruction_completion_culls_previous_deployment");
+	      suite.expect(current->waitingOnContainers.empty(), "previous_stateless_destruction_completion_clears_waiter");
+	      suite.expect(current->nHealthyBase == 1, "previous_stateless_destruction_completion_keeps_current_health");
+
+	      brain.deployments.erase(current->plan.config.deploymentID());
+	      brain.deploymentsByApp.erase(current->plan.config.applicationID);
+	      brain.machines.erase(&machine);
+	      brain.racks.erase(rack.uuid);
+	      rack.machines.erase(&machine);
+	      delete current;
+	      thisBrain = savedBrain;
+	   }
+
+	   {
+	      ScopedFreshRing ring;
+	      TestBrain brain;
+	      BrainBase *savedBrain = thisBrain;
+	      thisBrain = &brain;
+
+	      ApplicationDeployment *previous = new ApplicationDeployment();
+	      ApplicationDeployment *current = new ApplicationDeployment();
+	      seedCommonPlan(*previous, false);
+	      seedCommonPlan(*current, false);
+	      previous->plan.config.versionID = 1;
+	      current->plan.config.versionID = 2;
+	      previous->state = DeploymentState::running;
+	      current->state = DeploymentState::failed;
+	      previous->next = current;
+	      current->previous = previous;
+	      brain.deployments.insert_or_assign(previous->plan.config.deploymentID(), previous);
+	      brain.deployments.insert_or_assign(current->plan.config.deploymentID(), current);
+	      brain.deploymentsByApp.insert_or_assign(current->plan.config.applicationID, current);
+
+	      uint64_t failedDeploymentID = current->plan.config.deploymentID();
+	      current->debugRollbackForTest();
+
+	      suite.expect(brain.deploymentsByApp.contains(previous->plan.config.applicationID), "canary_rollback_restores_previous_head_entry");
+	      suite.expect(brain.deploymentsByApp[previous->plan.config.applicationID] == previous, "canary_rollback_restores_previous_head_pointer");
+	      suite.expect(previous->state == DeploymentState::running, "canary_rollback_keeps_previous_running");
+	      suite.expect(previous->next == nullptr, "canary_rollback_unlinks_failed_deployment");
+	      suite.expect(brain.deployments.contains(failedDeploymentID) == false, "canary_rollback_erases_failed_deployment_index");
+	      suite.expect(brain.failureCount == 1, "canary_rollback_reports_failed_deploy");
+	      suite.expect(brain.finCount == 1, "canary_rollback_finishes_mothership_stream");
+
+	      brain.deployments.erase(previous->plan.config.deploymentID());
+	      brain.deploymentsByApp.erase(previous->plan.config.applicationID);
+	      delete previous;
+	      thisBrain = savedBrain;
+	   }
+
+	   {
+	      ScopedFreshRing ring;
+	      TestBrain brain;
+	      BrainBase *savedBrain = thisBrain;
+	      thisBrain = &brain;
+
+	      ApplicationDeployment *current = new ApplicationDeployment();
+	      seedCommonPlan(*current, false);
+	      current->state = DeploymentState::failed;
+	      brain.deployments.insert_or_assign(current->plan.config.deploymentID(), current);
+	      brain.deploymentsByApp.insert_or_assign(current->plan.config.applicationID, current);
+
+	      uint16_t applicationID = current->plan.config.applicationID;
+	      uint64_t deploymentID = current->plan.config.deploymentID();
+	      current->debugRollbackForTest();
+
+	      suite.expect(brain.deploymentsByApp.contains(applicationID) == false, "canary_rollback_without_previous_erases_application_head");
+	      suite.expect(brain.deployments.contains(deploymentID) == false, "canary_rollback_without_previous_erases_failed_deployment_index");
+	      suite.expect(brain.failureCount == 1, "canary_rollback_without_previous_reports_failed_deploy");
+
+	      thisBrain = savedBrain;
+	   }
+
+	   return (suite.failed == 0) ? 0 : 1;
+	}

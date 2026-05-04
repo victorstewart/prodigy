@@ -14,6 +14,38 @@
 #include <services/base64.h>
 #include <services/random.h>
 
+static inline bool prodigyPersistentTraceEnabled(void)
+{
+   const char *value = std::getenv("PRODIGY_PERSIST_TRACE");
+   return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+template <typename Value>
+static inline size_t prodigyPersistentMaxStringKeyBytes(const bytell_hash_map<String, Value>& values)
+{
+   size_t maxBytes = 0;
+   for (const auto& [key, value] : values)
+   {
+      (void)value;
+      maxBytes = std::max(maxBytes, size_t(key.size()));
+   }
+
+   return maxBytes;
+}
+
+template <typename Key>
+static inline size_t prodigyPersistentMaxStringValueBytes(const bytell_hash_map<Key, String>& values)
+{
+   size_t maxBytes = 0;
+   for (const auto& [key, value] : values)
+   {
+      (void)key;
+      maxBytes = std::max(maxBytes, size_t(value.size()));
+   }
+
+   return maxBytes;
+}
+
 class ProdigyPersistentBootState
 {
 public:
@@ -170,6 +202,30 @@ static inline bool prodigyResolveInitialTopologyFromBootState(const ProdigyPersi
    return true;
 }
 
+static inline uint32_t prodigyResolveStartupClusterNodeCount(
+   const ProdigyPersistentBootState& state,
+   const ProdigyBootstrapConfig& effectiveBootstrapConfig)
+{
+   if (state.initialTopology.machines.empty() == false)
+   {
+      return uint32_t(state.initialTopology.machines.size());
+   }
+
+   if (effectiveBootstrapConfig.bootstrapPeers.empty() == false)
+   {
+      return uint32_t(effectiveBootstrapConfig.bootstrapPeers.size()) + 1;
+   }
+
+   return 1;
+}
+
+static inline bool prodigyStartupRequiresTransportTLS(
+   const ProdigyPersistentBootState& state,
+   const ProdigyBootstrapConfig& effectiveBootstrapConfig)
+{
+   return prodigyResolveStartupClusterNodeCount(state, effectiveBootstrapConfig) > 1;
+}
+
 class ProdigyPersistentBrainSnapshot
 {
 public:
@@ -195,11 +251,65 @@ static inline void prodigyReplaceCachedBrainSnapshot(
 template <typename S>
 static void serialize(S&& serializer, ProdigyPersistentBrainSnapshot& snapshot)
 {
+   if (prodigyPersistentTraceEnabled())
+   {
+      std::fprintf(stderr, "prodigy persist snapshot brainPeers begin\n");
+      std::fflush(stderr);
+   }
    serializer.container(snapshot.brainPeers, UINT32_MAX);
+   if (prodigyPersistentTraceEnabled())
+   {
+      std::fprintf(stderr, "prodigy persist snapshot brainPeers end\n");
+      std::fflush(stderr);
+   }
+
+   if (prodigyPersistentTraceEnabled())
+   {
+      std::fprintf(stderr, "prodigy persist snapshot topology begin\n");
+      std::fflush(stderr);
+   }
    serializer.object(snapshot.topology);
+   if (prodigyPersistentTraceEnabled())
+   {
+      std::fprintf(stderr, "prodigy persist snapshot topology end\n");
+      std::fflush(stderr);
+   }
+
+   if (prodigyPersistentTraceEnabled())
+   {
+      std::fprintf(stderr, "prodigy persist snapshot brainConfig begin\n");
+      std::fflush(stderr);
+   }
    serializer.object(snapshot.brainConfig);
+   if (prodigyPersistentTraceEnabled())
+   {
+      std::fprintf(stderr, "prodigy persist snapshot brainConfig end\n");
+      std::fflush(stderr);
+   }
+
+   if (prodigyPersistentTraceEnabled())
+   {
+      std::fprintf(stderr, "prodigy persist snapshot masterAuthority begin\n");
+      std::fflush(stderr);
+   }
    serializer.object(snapshot.masterAuthority);
-   serializer.object(snapshot.metricSamples);
+   if (prodigyPersistentTraceEnabled())
+   {
+      std::fprintf(stderr, "prodigy persist snapshot masterAuthority end\n");
+      std::fflush(stderr);
+   }
+
+   if (prodigyPersistentTraceEnabled())
+   {
+      std::fprintf(stderr, "prodigy persist snapshot metricSamples begin\n");
+      std::fflush(stderr);
+   }
+   serializer.container(snapshot.metricSamples, UINT32_MAX);
+   if (prodigyPersistentTraceEnabled())
+   {
+      std::fprintf(stderr, "prodigy persist snapshot metricSamples end\n");
+      std::fflush(stderr);
+   }
 }
 
 static inline const char *defaultProdigyPersistentStateDBPath(void)
@@ -294,7 +404,7 @@ static inline bool prodigyApplyTransportTLSAuthorityToLocalState(
    String localCertPem = {};
    String localKeyPem = {};
    Vector<String> addresses;
-   if (Vault::generateTransportNodeCertificateEd25519(
+   if (prodigyGenerateTransportNodeCertificateEd25519(
          authority.clusterRootCertPem,
          authority.clusterRootKeyPem,
          localState.uuid,
@@ -2284,6 +2394,12 @@ public:
       return secretsDb.path();
    }
 
+   void close(void)
+   {
+      db.close();
+      secretsDb.close();
+   }
+
    bool loadBootState(ProdigyPersistentBootState& state, String *failure = nullptr)
    {
       ProdigyPersistentStoredBootState stored = {};
@@ -2417,13 +2533,48 @@ public:
       ProdigyPersistentBrainSnapshotSecrets secrets = {};
       prodigyExtractPersistentBrainSnapshotSecrets(std::move(canonicalSnapshot), publicSnapshot, secrets);
 
+      if (prodigyPersistentTraceEnabled())
+      {
+         std::fprintf(stderr,
+            "prodigy persist snapshot-serialize topologyMachines=%zu brainPeers=%zu reservedIdsByName=%zu reservedIdsKeyMax=%zu reservedNamesById=%zu reservedNamesValueMax=%zu deploymentPlans=%zu failedDeployments=%zu failedDeploymentBytesMax=%zu machineSchemas=%zu workerTopologyOps=%zu deferredScaleIntents=%zu metricSamples=%zu secrets=%d\n",
+            size_t(publicSnapshot.topology.machines.size()),
+            size_t(publicSnapshot.brainPeers.size()),
+            size_t(publicSnapshot.masterAuthority.reservedApplicationIDsByName.size()),
+            prodigyPersistentMaxStringKeyBytes(publicSnapshot.masterAuthority.reservedApplicationIDsByName),
+            size_t(publicSnapshot.masterAuthority.reservedApplicationNamesByID.size()),
+            prodigyPersistentMaxStringValueBytes(publicSnapshot.masterAuthority.reservedApplicationNamesByID),
+            size_t(publicSnapshot.masterAuthority.deploymentPlans.size()),
+            size_t(publicSnapshot.masterAuthority.failedDeployments.size()),
+            prodigyPersistentMaxStringValueBytes(publicSnapshot.masterAuthority.failedDeployments),
+            size_t(publicSnapshot.masterAuthority.runtimeState.machineSchemas.size()),
+            size_t(publicSnapshot.masterAuthority.runtimeState.statefulWorkerTopologyUpgradeOperations.size()),
+            size_t(publicSnapshot.masterAuthority.runtimeState.deferredStatefulScaleIntents.size()),
+            size_t(publicSnapshot.metricSamples.size()),
+            int(secrets.empty() == false));
+         std::fflush(stderr);
+      }
+
       String serializedPublicSnapshot = {};
       BitseryEngine::serialize(serializedPublicSnapshot, publicSnapshot);
+      if (prodigyPersistentTraceEnabled())
+      {
+         std::fprintf(stderr,
+            "prodigy persist snapshot-public-serialized bytes=%zu\n",
+            size_t(serializedPublicSnapshot.size()));
+         std::fflush(stderr);
+      }
 
       String serializedSecrets = {};
       if (secrets.empty() == false)
       {
          BitseryEngine::serialize(serializedSecrets, secrets);
+         if (prodigyPersistentTraceEnabled())
+         {
+            std::fprintf(stderr,
+               "prodigy persist snapshot-secrets-serialized bytes=%zu\n",
+               size_t(serializedSecrets.size()));
+            std::fflush(stderr);
+         }
       }
 
       uint64_t previousVersion = 0;
@@ -2500,6 +2651,13 @@ public:
             secrets.clear();
             return false;
          }
+         if (prodigyPersistentTraceEnabled())
+         {
+            std::fprintf(stderr,
+               "prodigy persist snapshot-secrets-saved version=%llu\n",
+               (unsigned long long)newVersion);
+            std::fflush(stderr);
+         }
       }
 
       ProdigyPersistentStoredBrainSnapshot stored = {};
@@ -2508,7 +2666,25 @@ public:
 
       String serialized = {};
       BitseryEngine::serialize(serialized, stored);
+      if (prodigyPersistentTraceEnabled())
+      {
+         std::fprintf(stderr,
+            "prodigy persist snapshot-record-serialized bytes=%zu version=%llu\n",
+            size_t(serialized.size()),
+            (unsigned long long)newVersion);
+         std::fflush(stderr);
+      }
       bool ok = db.write(brainColumnFamily, brainSnapshotKey, serialized, failure);
+      if (prodigyPersistentTraceEnabled())
+      {
+         std::fprintf(stderr,
+            "prodigy persist snapshot-db-write ok=%d previousVersion=%llu newVersion=%llu failure=%s\n",
+            int(ok),
+            (unsigned long long)previousVersion,
+            (unsigned long long)newVersion,
+            failure ? failure->c_str() : "");
+         std::fflush(stderr);
+      }
       if (ok && previousVersion != newVersion)
       {
          removeSecretRecordBestEffort(brainColumnFamily, brainSnapshotKey, previousVersion);

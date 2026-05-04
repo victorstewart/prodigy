@@ -1,0 +1,43 @@
+@PACKAGE_INIT@
+
+set(ProdigySDK_EXPORTED_TARGETS "@_PRODIGY_SDK_CPP_EXPORTED_TARGETS@")
+set(ProdigySDK_HAS_CPP_OPINIONATED @_PRODIGY_SDK_HAS_CPP_OPINIONATED@)
+
+set(_ProdigySDK_need_depos OFF)
+if (NOT TARGET aegis::aegis OR NOT TARGET gxhash::gxhash)
+   set(_ProdigySDK_need_depos ON)
+endif()
+if (ProdigySDK_HAS_CPP_OPINIONATED AND NOT TARGET basics::basics)
+   set(_ProdigySDK_need_depos ON)
+endif()
+
+if (_ProdigySDK_need_depos)
+   set(_ProdigySDK_depos_helper "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_DATADIR@/prodigy-sdk/cmake/ProdigySDKDepos.cmake")
+
+   if (NOT COMMAND depos_depend)
+      if (NOT DEFINED DEPOS_BOOTSTRAP_VERSION OR "${DEPOS_BOOTSTRAP_VERSION}" STREQUAL "")
+         set(DEPOS_BOOTSTRAP_VERSION "@DEPOS_BOOTSTRAP_VERSION@")
+      endif()
+      if (NOT DEFINED DEPOS_BOOTSTRAP_DIR OR "${DEPOS_BOOTSTRAP_DIR}" STREQUAL "")
+         set(DEPOS_BOOTSTRAP_DIR "${CMAKE_BINARY_DIR}/.prodigy-sdk-depos/bootstrap")
+      endif()
+      if (NOT DEFINED DEPOS_PROJECT_NAMESPACE OR "${DEPOS_PROJECT_NAMESPACE}" STREQUAL "")
+         set(DEPOS_PROJECT_NAMESPACE "prodigy-sdk-consumer")
+      endif()
+      include("${_ProdigySDK_depos_helper}")
+   endif()
+
+   set(_ProdigySDK_depofiles)
+   foreach(_ProdigySDK_relative_depofile IN ITEMS @_PRODIGY_SDK_CPP_INSTALLED_DEPOFILE_RELATIVE_PATHS@)
+      list(APPEND _ProdigySDK_depofiles "${PACKAGE_PREFIX_DIR}/${_ProdigySDK_relative_depofile}")
+   endforeach()
+   depos_depend(FILES ${_ProdigySDK_depofiles})
+   _depos_ensure_registry_ready()
+   unset(_ProdigySDK_depofiles)
+   unset(_ProdigySDK_relative_depofile)
+
+   unset(_ProdigySDK_depos_helper)
+endif()
+unset(_ProdigySDK_need_depos)
+
+include("${CMAKE_CURRENT_LIST_DIR}/ProdigySDKTargets.cmake")

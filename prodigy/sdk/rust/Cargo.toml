@@ -1,0 +1,30 @@
+[package]
+name = "prodigy-sdk"
+version = "1.0.0"
+edition = "2021"
+description = "Transport-neutral Prodigy neuron/container protocol SDK for Rust"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/victorstewart/prodigy"
+homepage = "https://github.com/victorstewart/prodigy"
+documentation = "https://docs.rs/prodigy-sdk"
+
+[features]
+default = []
+tokio = ["dep:tokio"]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+aegis = "0.9.8"
+getrandom = "0.4.2"
+gxhash = "3.5.0"
+tokio = { version = "1.44.2", features = ["io-util", "macros", "net", "rt", "sync", "time"], optional = true }
+
+[[example]]
+name = "mesh_pingpong"
+required-features = ["tokio"]
+
+[[example]]
+name = "opinionated_aegis_roundtrip"

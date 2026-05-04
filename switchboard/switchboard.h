@@ -37,6 +37,10 @@
 #include <switchboard/owned.routable.prefix.h>
 #include <switchboard/whitehole.route.h>
 
+#ifndef NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE
+#define NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE 0
+#endif
+
 struct quic_cid_aes_decrypt_state {
 
    uint32_t rk[44];
@@ -278,6 +282,9 @@ private:
 
    EthDevice& eth;
    BPFProgram *bpf_router = nullptr;
+#if NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE
+   BPFProgram *host_ingress_router = nullptr;
+#endif
    BPFProgram *host_egress_router = nullptr;
    struct local_container_subnet6 subnet = {};
 
@@ -1588,6 +1595,80 @@ private:
       switchboardSyncWormholeEgressBindingsForProgram(program, desiredBindings, eth.ifidx, "peer-runtime-sync");
    }
 
+#if NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE
+   void syncHostIngressPortalRouting(void)
+   {
+      if (host_ingress_router == nullptr)
+      {
+         return;
+      }
+
+      host_ingress_router->openMap("external_portals"_ctv, [&] (int map_fd) -> void {
+
+         clearHashMapFD<portal_definition>(map_fd);
+      });
+
+      host_ingress_router->openMap("wormhole_target_ports"_ctv, [&] (int map_fd) -> void {
+
+         clearHashMapFD<switchboard_wormhole_target_key>(map_fd);
+      });
+
+      host_ingress_router->openMap("quic_cid_aes_decrypt_map"_ctv, [&] (int map_fd) -> void {
+
+         if (map_fd < 0)
+         {
+            return;
+         }
+
+         quic_cid_aes_decrypt_state emptyState = {};
+         for (uint32_t mapIndex = 0; mapIndex < (MAX_PORTALS * 2); ++mapIndex)
+         {
+            (void)bpf_map_update_elem(map_fd, &mapIndex, &emptyState, BPF_ANY);
+         }
+      });
+
+      for (SwitchboardPortal *portal : portals)
+      {
+         syncPortalDefinitionForProgram(host_ingress_router, portal);
+         installPortalQuicCidDecryptStateForProgram(host_ingress_router, portal);
+      }
+
+      host_ingress_router->openMap("wormhole_target_ports"_ctv, [&] (int map_fd) -> void {
+
+         if (map_fd < 0)
+         {
+            return;
+         }
+
+         for (const auto& [containerID, wormholes] : wormholesByContainer)
+         {
+            (void)containerID;
+
+            for (switchboard_runtime::Wormhole *wormhole : wormholes)
+            {
+               if (wormhole == nullptr || wormhole->portal == nullptr)
+               {
+                  continue;
+               }
+
+               switchboard_wormhole_target_key targetKey = {};
+               if (buildWormholeTargetKey(wormhole->portal, wormhole->containerID, targetKey) == false)
+               {
+                  continue;
+               }
+
+               const __u16 containerPort = htons(wormhole->port);
+               (void)bpf_map_update_elem(map_fd, &targetKey, &containerPort, BPF_ANY);
+            }
+         }
+      });
+   }
+#else
+   void syncHostIngressPortalRouting(void)
+   {
+   }
+#endif
+
    void syncAllPeerProgramRuntimeRouting(void)
    {
       forEachActivePeerProgram([&] (BPFProgram *program) -> void {
@@ -1630,6 +1711,7 @@ private:
       }
 
       syncAllPeerProgramRuntimeRouting();
+      syncHostIngressPortalRouting();
       delete wormhole;
    }
 
@@ -1685,6 +1767,16 @@ public:
       switchboardSyncWormholeEgressBindingsForProgram(host_egress_router, desiredBindings, eth.ifidx, "host-egress-sync");
    }
 
+   void setHostIngressRouter(BPFProgram *program)
+   {
+#if NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE
+      host_ingress_router = program;
+      syncHostIngressPortalRouting();
+#else
+      (void)program;
+#endif
+   }
+
    void syncPeerProgramRuntimeState(BPFProgram *program)
    {
       syncPeerProgramRuntimeRouting(program);
@@ -1706,6 +1798,7 @@ public:
          generateRingForPortal(portal);
       }
 
+      syncHostIngressPortalRouting();
       syncAllPeerProgramRuntimeRouting();
    }
 
@@ -1869,6 +1962,7 @@ public:
       installWormholeTargetBinding(portal, wormhole, requestedWormhole);
 
       generateRingForPortal(portal);
+      syncHostIngressPortalRouting();
       syncAllPeerProgramRuntimeRouting();
       return true;
    }

@@ -7,6 +7,8 @@ then
    exit 1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 obj_path="$1"
 if [[ ! -f "${obj_path}" ]]
 then
@@ -14,14 +16,30 @@ then
    exit 1
 fi
 
-if ! command -v bpftool >/dev/null 2>&1
+if [[ "${PRODIGY_DEV_ALLOW_BPF_ATTACH:-0}" != "1" ]]
 then
-   echo "missing bpftool" >&2
-   exit 1
+   echo "SKIP: host egress BPF load smoke requires PRODIGY_DEV_ALLOW_BPF_ATTACH=1" >&2
+   exit 77
 fi
 
+if [[ "${EUID}" -ne 0 ]]
+then
+   echo "SKIP: host egress BPF load smoke requires root" >&2
+   exit 77
+fi
+
+for cmd in bpftool ip mktemp
+do
+   if ! command -v "${cmd}" >/dev/null 2>&1
+   then
+      echo "SKIP: missing required command: ${cmd}" >&2
+      exit 77
+   fi
+done
+
 ns_name="prodigy-host-egress-smoke-$$"
-pin_dir="$(mktemp -d /root/prodigy/.run/host-egress-bpf-load.XXXXXX)"
+mkdir -p "${REPO_ROOT}/.run"
+pin_dir="$(mktemp -d "${REPO_ROOT}/.run/host-egress-bpf-load.XXXXXX")"
 
 cleanup()
 {

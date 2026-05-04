@@ -5,8 +5,11 @@
 #include <ebpf/program.h>
 
 #include <switchboard/common/checksum.h>
+#include <switchboard/common/constants.h>
 #include <switchboard/common/local_container_subnet.h>
+#include <switchboard/common/structs.h>
 #include <switchboard/whitehole.route.h>
+#include <prodigy/quic.cid.generator.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +17,7 @@
 #include <array>
 #include <vector>
 #include <arpa/inet.h>
+#include <linux/ip.h>
 #include <netinet/icmp6.h>
 #include <linux/pkt_cls.h>
 #include <netinet/tcp.h>
@@ -195,6 +199,42 @@ static std::vector<uint8_t> makeUDPv6InIPv6EthernetFrame(const uint8_t outerSrc[
       IPPROTO_UDP,
       udp,
       sizeof(struct udphdr) + payload.size());
+   return frame;
+}
+
+static std::vector<uint8_t> makeUDPv4QuicEthernetFrame(const struct in_addr& source,
+   const struct in_addr& destination,
+   uint16_t sourcePort,
+   uint16_t destinationPort,
+   const ProdigyQuicCID& cid)
+{
+   std::vector<uint8_t> frame(sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + sizeof(struct quic_long_header) + 1);
+   std::memset(frame.data(), 0, frame.size());
+
+   struct ethhdr *eth = reinterpret_cast<struct ethhdr *>(frame.data());
+   eth->h_proto = htons(ETH_P_IP);
+
+   struct iphdr *ip4 = reinterpret_cast<struct iphdr *>(frame.data() + sizeof(struct ethhdr));
+   ip4->version = 4;
+   ip4->ihl = 5;
+   ip4->ttl = 64;
+   ip4->protocol = IPPROTO_UDP;
+   ip4->tot_len = htons(uint16_t(frame.size() - sizeof(struct ethhdr)));
+   ip4->saddr = source.s_addr;
+   ip4->daddr = destination.s_addr;
+
+   struct udphdr *udp = reinterpret_cast<struct udphdr *>(ip4 + 1);
+   udp->source = htons(sourcePort);
+   udp->dest = htons(destinationPort);
+   udp->len = htons(uint16_t(sizeof(struct udphdr) + sizeof(struct quic_long_header) + 1));
+
+   struct quic_long_header *quic = reinterpret_cast<struct quic_long_header *>(udp + 1);
+   quic->flags = QUIC_V1_LONG_HEADER | QUIC_V1_CLIENT_INITIAL;
+   quic->version = 1;
+   quic->conn_id_lens = cid.id_len;
+   std::memcpy(quic->dst_cid, cid.id, cid.id_len);
+   *(reinterpret_cast<uint8_t *>(quic + 1)) = 0;
+
    return frame;
 }
 
@@ -406,6 +446,12 @@ static uint16_t replaceChecksumIPv6AddressIncremental(uint16_t checksum, const u
 
 int main(void)
 {
+   if (const char *allow = std::getenv("PRODIGY_DEV_ALLOW_BPF_ATTACH"); allow == nullptr || std::strcmp(allow, "1") != 0)
+   {
+      std::fprintf(stderr, "SKIP: switchboard whitehole unit loads BPF programs; set PRODIGY_DEV_ALLOW_BPF_ATTACH=1 only inside an authorized isolated VM\n");
+      return 77;
+   }
+
    TestSuite suite = {};
 
    Whitehole whitehole = {};
@@ -476,7 +522,144 @@ int main(void)
       suite.expect(egressReplyMapID != 0, "switchboard_whitehole_reply_flow_reuse_resolves_egress_map_id");
       suite.expect(ingressReplyMapID == egressReplyMapID, "switchboard_whitehole_reply_flow_reuse_shares_reply_flow_map_between_egress_and_ingress");
 
+      if (ingressLoaded)
+      {
+         suite.expect(programMapID(ingressProgram, "external_portals"_ctv) == 0,
+            "switchboard_host_ingress_production_omits_ipv4_portal_map");
+         suite.expect(programMapID(ingressProgram, "wormhole_target_ports"_ctv) == 0,
+            "switchboard_host_ingress_production_omits_wormhole_target_port_map");
+         suite.expect(programMapID(ingressProgram, "quic_cid_aes_decrypt_map"_ctv) == 0,
+            "switchboard_host_ingress_production_omits_quic_decrypt_map");
+      }
+
       (void)unlink(sharedPinPath.c_str());
+   }
+
+   {
+      String ingressObjectPath = {};
+      ingressObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+      ingressObjectPath.append("/host.ingress.router.dev.ebpf.o"_ctv);
+
+      BPFProgram ingressProgram = {};
+      suite.expect(ingressProgram.load(ingressObjectPath, "host_ingress_router"_ctv),
+         "switchboard_host_ingress_ipv4_quic_portal_loads_host_ingress_program");
+
+      if (ingressProgram.prog_fd >= 0)
+      {
+         local_container_subnet6 localSubnet = {};
+         localSubnet.dpfx = 0x01;
+         localSubnet.mpfx[0] = 0x52;
+         localSubnet.mpfx[1] = 0xdf;
+         localSubnet.mpfx[2] = 0x39;
+         ingressProgram.setArrayElement("local_container_subnet_map"_ctv, 0, localSubnet);
+
+         uint32_t redirectIfidx = 91;
+         ingressProgram.setArrayElement("container_device_map"_ctv, 0x4e, redirectIfidx);
+
+         struct in_addr externalAddress = {};
+         struct in_addr clientAddress = {};
+         suite.expect(inet_pton(AF_INET, "198.18.0.1", &externalAddress) == 1,
+            "switchboard_host_ingress_ipv4_quic_portal_external_address_parses");
+         suite.expect(inet_pton(AF_INET, "203.0.113.99", &clientAddress) == 1,
+            "switchboard_host_ingress_ipv4_quic_portal_client_address_parses");
+
+         uint8_t key[16] = {
+            0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+            0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01
+         };
+         ProdigyQuicCidEncryptor encryptor = {};
+         suite.expect(encryptor.setKey(key),
+            "switchboard_host_ingress_ipv4_quic_portal_encryptor_accepts_key");
+
+         uint8_t cidContainer[5] = {localSubnet.dpfx, localSubnet.mpfx[0], localSubnet.mpfx[1], localSubnet.mpfx[2], 0x4e};
+         struct sockaddr_in cidDestination = {};
+         cidDestination.sin_family = AF_INET;
+         cidDestination.sin_addr = externalAddress;
+         cidDestination.sin_port = htons(18443);
+
+         uint32_t nonceCursor = 1;
+         ProdigyQuicCID cid = prodigyGenerateQuicCID(encryptor,
+            cidContainer,
+            &nonceCursor,
+            reinterpret_cast<const struct sockaddr *>(&cidDestination),
+            0);
+         suite.expect(cid.id_len == 16,
+            "switchboard_host_ingress_ipv4_quic_portal_generates_cid");
+
+         portal_definition portal = {};
+         portal.addr4 = externalAddress.s_addr;
+         portal.port = htons(18443);
+         portal.proto = IPPROTO_UDP;
+
+         portal_meta meta = {};
+         meta.flags = F_QUIC_PORTAL;
+         meta.slot = 7;
+
+         bool portalUpdated = false;
+         ingressProgram.openMap("external_portals"_ctv, [&] (int mapFD) -> void {
+            portalUpdated = mapFD >= 0 && bpf_map_update_elem(mapFD, &portal, &meta, BPF_ANY) == 0;
+         });
+         suite.expect(portalUpdated,
+            "switchboard_host_ingress_ipv4_quic_portal_installs_portal");
+
+         switchboard_wormhole_target_key targetKey = {};
+         targetKey.slot = meta.slot;
+         std::memcpy(targetKey.container, cidContainer, sizeof(targetKey.container));
+         uint16_t targetPort = htons(19443);
+
+         bool targetUpdated = false;
+         ingressProgram.openMap("wormhole_target_ports"_ctv, [&] (int mapFD) -> void {
+            targetUpdated = mapFD >= 0 && bpf_map_update_elem(mapFD, &targetKey, &targetPort, BPF_ANY) == 0;
+         });
+         suite.expect(targetUpdated,
+            "switchboard_host_ingress_ipv4_quic_portal_installs_target_port");
+
+         struct
+         {
+            uint32_t rk[44];
+         } aesState = {};
+         suite.expect(prodigyBuildQuicCidDecryptRoundKeys(key, aesState.rk),
+            "switchboard_host_ingress_ipv4_quic_portal_builds_decrypt_state");
+
+         uint32_t decryptIndex = quicCidPortalDecryptMapIndex(meta.slot, 0);
+         bool decryptUpdated = false;
+         ingressProgram.openMap("quic_cid_aes_decrypt_map"_ctv, [&] (int mapFD) -> void {
+            decryptUpdated = mapFD >= 0 && bpf_map_update_elem(mapFD, &decryptIndex, &aesState, BPF_ANY) == 0;
+         });
+         suite.expect(decryptUpdated,
+            "switchboard_host_ingress_ipv4_quic_portal_installs_decrypt_state");
+
+         std::vector<uint8_t> frame = makeUDPv4QuicEthernetFrame(clientAddress, externalAddress, 49152, 18443, cid);
+         std::vector<uint8_t> output(frame.size());
+         LIBBPF_OPTS(bpf_test_run_opts, opts,
+            .data_in = frame.data(),
+            .data_out = output.data(),
+            .data_size_in = static_cast<__u32>(frame.size()),
+            .data_size_out = static_cast<__u32>(output.size()),
+            .repeat = 1,
+         );
+
+         int runResult = bpf_prog_test_run_opts(ingressProgram.prog_fd, &opts);
+         suite.expect(runResult == 0,
+            "switchboard_host_ingress_ipv4_quic_portal_test_run_succeeds");
+         suite.expect(opts.retval == TC_ACT_REDIRECT,
+            "switchboard_host_ingress_ipv4_quic_portal_redirects_to_container");
+
+         if (runResult == 0 && opts.data_size_out >= sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr))
+         {
+            const struct ethhdr *outEth = reinterpret_cast<const struct ethhdr *>(output.data());
+            const struct iphdr *outIP = reinterpret_cast<const struct iphdr *>(output.data() + sizeof(struct ethhdr));
+            const struct udphdr *outUDP = reinterpret_cast<const struct udphdr *>(outIP + 1);
+            suite.expect(outEth->h_proto == htons(ETH_P_IP),
+               "switchboard_host_ingress_ipv4_quic_portal_preserves_ipv4_ethertype");
+            suite.expect(outIP->daddr == externalAddress.s_addr,
+               "switchboard_host_ingress_ipv4_quic_portal_preserves_external_destination");
+            suite.expect(outUDP->dest == targetPort,
+               "switchboard_host_ingress_ipv4_quic_portal_rewrites_container_port");
+         }
+
+         ingressProgram.close();
+      }
    }
 
    {

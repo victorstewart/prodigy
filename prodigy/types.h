@@ -5,7 +5,7 @@
 
 #include <prodigy/machine.hardware.types.h>
 #include <prodigy/runtime.environment.h>
-#include <enums/datacenter.h>
+#include <prodigy/enums/datacenter.h>
 #include <networking/private4.h>
 #include <services/prodigy.h>
 #include <services/vault.h>
@@ -903,6 +903,7 @@ public:
    ClusterMachineCloud cloud;
    ClusterMachineSSH ssh;
    ClusterMachineAddresses addresses;
+   Vector<ClusterMachinePeerAddress> peerAddresses;
 
    uint128_t uuid = 0;
    uint32_t rackUUID = 0;
@@ -911,10 +912,11 @@ public:
 
    uint32_t totalLogicalCores = 0;
    uint32_t totalMemoryMB = 0;
-   uint32_t totalStorageMB = 0;
-   MachineHardwareProfile hardware;
+	   uint32_t totalStorageMB = 0;
+	   MachineHardwareProfile hardware;
+	   String vmImageURI;
 
-   ClusterMachineOwnership ownership;
+	   ClusterMachineOwnership ownership;
    uint32_t ownedLogicalCores = 0;
    uint32_t ownedMemoryMB = 0;
    uint32_t ownedStorageMB = 0;
@@ -924,11 +926,11 @@ public:
       String ownedText = {};
       ownedText.assign(text);
 
-      struct in_addr address4 = {};
-      if (inet_pton(AF_INET, ownedText.c_str(), &address4) == 1)
+      struct in_addr parsedIPv4 = {};
+      if (inet_pton(AF_INET, ownedText.c_str(), &parsedIPv4) == 1)
       {
          address = {};
-         address.v4 = address4.s_addr;
+         address.v4 = parsedIPv4.s_addr;
          address.is6 = false;
          return true;
       }
@@ -994,12 +996,12 @@ public:
             continue;
          }
 
-         uint32_t parsedPrivate4 = 0;
+         struct in_addr parsedIPv4 = {};
          String privateAddressText = {};
          privateAddressText.assign(candidate.address);
-         if (inet_pton(AF_INET, privateAddressText.c_str(), &parsedPrivate4) == 1)
+         if (inet_pton(AF_INET, privateAddressText.c_str(), &parsedIPv4) == 1)
          {
-            resolvedPrivate4 = parsedPrivate4;
+            resolvedPrivate4 = parsedIPv4.s_addr;
             return true;
          }
       }
@@ -1016,16 +1018,16 @@ public:
             continue;
          }
 
-         uint32_t parsedPrivate4 = 0;
-         uint32_t parsedGateway = 0;
+         struct in_addr parsedIPv4 = {};
+         struct in_addr parsedGatewayIPv4 = {};
          String privateAddressText = {};
          String gatewayText = {};
          privateAddressText.assign(candidate.address);
          gatewayText.assign(candidate.gateway);
-         if (inet_pton(AF_INET, privateAddressText.c_str(), &parsedPrivate4) == 1
-            && inet_pton(AF_INET, gatewayText.c_str(), &parsedGateway) == 1)
+         if (inet_pton(AF_INET, privateAddressText.c_str(), &parsedIPv4) == 1
+            && inet_pton(AF_INET, gatewayText.c_str(), &parsedGatewayIPv4) == 1)
          {
-            resolvedGatewayPrivate4 = parsedGateway;
+            resolvedGatewayPrivate4 = parsedGatewayIPv4.s_addr;
             return true;
          }
       }
@@ -1072,6 +1074,14 @@ public:
          IPAddress parsed = {};
          return parseIPAddressLiteral(literal, parsed) && parsed.equals(address);
       };
+
+      for (const ClusterMachinePeerAddress& candidate : peerAddresses)
+      {
+         if (matchesLiteral(candidate.address))
+         {
+            return true;
+         }
+      }
 
       for (const ClusterMachineAddress& candidate : addresses.privateAddresses)
       {
@@ -1127,6 +1137,14 @@ public:
 
          return true;
       };
+
+      for (const ClusterMachinePeerAddress& candidate : peerAddresses)
+      {
+         if (tryTextAddress(candidate.address))
+         {
+            return true;
+         }
+      }
 
       for (const ClusterMachineAddress& candidate : addresses.privateAddresses)
       {
@@ -1211,6 +1229,19 @@ public:
          return false;
       }
 
+      if (peerAddresses.size() != other.peerAddresses.size())
+      {
+         return false;
+      }
+
+      for (uint32_t index = 0; index < peerAddresses.size(); ++index)
+      {
+         if (peerAddresses[index] != other.peerAddresses[index])
+         {
+            return false;
+         }
+      }
+
       return source == other.source
          && backing == other.backing
          && kind == other.kind
@@ -1224,10 +1255,11 @@ public:
          && creationTimeMs == other.creationTimeMs
          && hasInternetAccess == other.hasInternetAccess
          && totalLogicalCores == other.totalLogicalCores
-         && totalMemoryMB == other.totalMemoryMB
-         && totalStorageMB == other.totalStorageMB
-         && hardware == other.hardware
-         && ownership == other.ownership
+	         && totalMemoryMB == other.totalMemoryMB
+	         && totalStorageMB == other.totalStorageMB
+	         && hardware == other.hardware
+	         && vmImageURI.equals(other.vmImageURI)
+	         && ownership == other.ownership
          && ownedLogicalCores == other.ownedLogicalCores
          && ownedMemoryMB == other.ownedMemoryMB
          && ownedStorageMB == other.ownedStorageMB;
@@ -1311,15 +1343,19 @@ static void serialize(S&& serializer, ClusterMachine& machine)
    }
    serializer.object(machine.ssh);
    serializer.object(machine.addresses);
+   serializer.container(machine.peerAddresses, UINT32_MAX, [] (S& serializer, ClusterMachinePeerAddress& value) {
+      serializer.object(value);
+   });
    serializer.value16b(machine.uuid);
    serializer.value4b(machine.rackUUID);
    serializer.value8b(machine.creationTimeMs);
    serializer.value1b(machine.hasInternetAccess);
    serializer.value4b(machine.totalLogicalCores);
-   serializer.value4b(machine.totalMemoryMB);
-   serializer.value4b(machine.totalStorageMB);
-   serializer.object(machine.hardware);
-   serializer.object(machine.ownership);
+	   serializer.value4b(machine.totalMemoryMB);
+	   serializer.value4b(machine.totalStorageMB);
+	   serializer.object(machine.hardware);
+	   serializer.text1b(machine.vmImageURI, UINT32_MAX);
+	   serializer.object(machine.ownership);
    serializer.value4b(machine.ownedLogicalCores);
    serializer.value4b(machine.ownedMemoryMB);
    serializer.value4b(machine.ownedStorageMB);
@@ -1680,6 +1716,15 @@ static inline void prodigyCollectClusterMachinePeerAddresses(const ClusterMachin
 {
    candidates.clear();
 
+   if (machine.peerAddresses.empty() == false)
+   {
+      for (const ClusterMachinePeerAddress& candidate : machine.peerAddresses)
+      {
+         prodigyAppendUniqueClusterMachinePeerAddress(candidates, candidate);
+      }
+      return;
+   }
+
    for (const ClusterMachineAddress& address : machine.addresses.privateAddresses)
    {
       prodigyAppendUniqueClusterMachinePeerAddress(candidates, ClusterMachinePeerAddress{address.address, address.cidr, address.gateway});
@@ -1701,11 +1746,14 @@ static inline void prodigyNormalizeClusterTopologyPeerAddresses(ClusterTopology&
    bytell_hash_map<String, uint32_t> privateSubnetCounts;
    bytell_hash_map<String, uint32_t> subnetCounts;
    Vector<Vector<ClusterMachinePeerAddress>> normalizedCandidates;
+   Vector<uint8_t> machineHasExplicitPeerAddresses;
    normalizedCandidates.resize(topology.machines.size());
+   machineHasExplicitPeerAddresses.resize(topology.machines.size());
 
    for (uint32_t machineIndex = 0; machineIndex < topology.machines.size(); ++machineIndex)
    {
       const ClusterMachine& machine = topology.machines[machineIndex];
+      machineHasExplicitPeerAddresses[machineIndex] = machine.peerAddresses.empty() ? uint8_t(0) : uint8_t(1);
       prodigyCollectClusterMachinePeerAddresses(machine, normalizedCandidates[machineIndex]);
 
       Vector<String> seenPrivateSubnets;
@@ -1810,7 +1858,29 @@ static inline void prodigyNormalizeClusterTopologyPeerAddresses(ClusterTopology&
          return false;
       });
 
-      prodigyAssignClusterMachineAddressesFromPeerCandidates(topology.machines[machineIndex].addresses, candidates);
+      if (machineHasExplicitPeerAddresses[machineIndex])
+      {
+         topology.machines[machineIndex].peerAddresses.clear();
+         for (const ClusterMachinePeerAddress& candidate : candidates)
+         {
+            prodigyAppendUniqueClusterMachinePeerAddress(topology.machines[machineIndex].peerAddresses, candidate);
+         }
+
+         ClusterMachineAddresses normalizedAddresses = {};
+         for (const ClusterMachineAddress& address : topology.machines[machineIndex].addresses.privateAddresses)
+         {
+            prodigyAppendUniqueClusterMachineAddress(normalizedAddresses.privateAddresses, address);
+         }
+         for (const ClusterMachineAddress& address : topology.machines[machineIndex].addresses.publicAddresses)
+         {
+            prodigyAppendUniqueClusterMachineAddress(normalizedAddresses.publicAddresses, address);
+         }
+         topology.machines[machineIndex].addresses = std::move(normalizedAddresses);
+      }
+      else
+      {
+         prodigyAssignClusterMachineAddressesFromPeerCandidates(topology.machines[machineIndex].addresses, candidates);
+      }
    }
 }
 
@@ -2504,6 +2574,24 @@ static void serialize(S&& serializer, AddMachines& payload)
    serializer.text1b(payload.failure, UINT32_MAX);
 }
 
+class OperatingSystemUpdatePolicy {
+public:
+
+   String osID;
+   String targetVersionID;
+   String command;
+   bool includeVMs = false;
+};
+
+template <typename S>
+static void serialize(S&& serializer, OperatingSystemUpdatePolicy& policy)
+{
+   serializer.text1b(policy.osID, UINT32_MAX);
+   serializer.text1b(policy.targetVersionID, UINT32_MAX);
+   serializer.text1b(policy.command, UINT32_MAX);
+   serializer.value1b(policy.includeVMs);
+}
+
 class BrainConfig {
 public:
 
@@ -2534,6 +2622,10 @@ public:
    EmailReporter reporter;
    // Generic VM image URI for cloud providers (e.g., GCP: projects/<p>/global/images/<image>)
    String vmImageURI;
+   bool osUpdatesEnabled = false;
+   Vector<OperatingSystemUpdatePolicy> osUpdatePolicies;
+   uint32_t maxOSDrains = 1;
+   uint32_t machineUpdateCadenceMins = 15;
    ProdigyRuntimeEnvironmentConfig runtimeEnvironment;
 };
 
@@ -2566,6 +2658,10 @@ static void serialize(S&& serializer, BrainConfig& config)
    serializer.object(config.routableAddresses);
    serializer.object(config.reporter);
    serializer.text1b(config.vmImageURI, UINT32_MAX);
+   serializer.value1b(config.osUpdatesEnabled);
+   serializer.container(config.osUpdatePolicies, UINT32_MAX);
+   serializer.value4b(config.maxOSDrains);
+   serializer.value4b(config.machineUpdateCadenceMins);
    serializer.object(config.runtimeEnvironment);
 }
 
@@ -2775,6 +2871,23 @@ static inline uint32_t applicationRequiredIsolatedCores(const ApplicationConfig&
    return applicationUsesIsolatedCPUs(config) ? config.nLogicalCores : 0u;
 }
 
+static inline uint32_t prodigyStatefulWorkerCountForLogicalCores(uint32_t nLogicalCores)
+{
+   if (nLogicalCores <= 2)
+   {
+      return 1;
+   }
+
+   return (nLogicalCores - 2);
+}
+
+static inline bool prodigyStatefulCoreChangeRequiresTopologyUpgrade(bool isStateful,
+                                                                    uint32_t currentLogicalCores,
+                                                                    uint32_t targetLogicalCores)
+{
+   return (isStateful && currentLogicalCores != targetLogicalCores);
+}
+
 template <typename S>
 static void serialize(S&& serializer, ApplicationConfig& config)
 {
@@ -2849,6 +2962,21 @@ static void serialize(S&& serializer, StatefulDeploymentPlan& plan)
    serializer.value1b(plan.allMasters);
 }
 
+static inline uint64_t prodigyRuntimeStatefulServicePrefix(uint16_t applicationID, uint8_t serviceID)
+{
+   return (uint64_t(applicationID) << 48) | (uint64_t(serviceID) << 40) | (uint64_t(nShardsPerStatefulApplication) - 1);
+}
+
+static inline uint64_t prodigyDefaultStatefulTopologyBridgePrefix(uint16_t applicationID)
+{
+   if (applicationID == 0)
+   {
+      return 0;
+   }
+
+   return prodigyRuntimeStatefulServicePrefix(applicationID, 6);
+}
+
 enum class StatefulMeshRole : uint8_t
 {
    none,
@@ -2856,7 +2984,8 @@ enum class StatefulMeshRole : uint8_t
    sibling,
    cousin,
    seeding,
-   sharding
+   sharding,
+   topologyBridge
 };
 
 class StatefulMeshRoles {
@@ -2867,6 +2996,7 @@ public:
    uint64_t cousin = 0;
    uint64_t seeding = 0;
    uint64_t sharding = 0;
+   uint64_t topologyBridge = 0;
 
    StatefulMeshRole classify(uint64_t service) const
    {
@@ -2895,20 +3025,64 @@ public:
          return StatefulMeshRole::sharding;
       }
 
+      if (topologyBridge != 0 && (topologyBridge == service || MeshRegistry::prefixContains(topologyBridge, service)))
+      {
+         return StatefulMeshRole::topologyBridge;
+      }
+
       return StatefulMeshRole::none;
+   }
+
+   static StatefulMeshRoles forShardGroup(const StatefulDeploymentPlan& plan, uint16_t applicationID, uint32_t shardGroup)
+   {
+      StatefulMeshRoles roles;
+      if (plan.clientPrefix != 0)
+      {
+         roles.client = MeshServices::constrainPrefixToGroup(plan.clientPrefix, shardGroup);
+      }
+
+      if (plan.siblingPrefix != 0)
+      {
+         roles.sibling = MeshServices::constrainPrefixToGroup(plan.siblingPrefix, shardGroup);
+      }
+
+      if (plan.cousinPrefix != 0)
+      {
+         roles.cousin = MeshServices::constrainPrefixToGroup(plan.cousinPrefix, shardGroup);
+      }
+
+      if (plan.seedingPrefix != 0)
+      {
+         roles.seeding = MeshServices::constrainPrefixToGroup(plan.seedingPrefix, shardGroup);
+      }
+
+      if (plan.shardingPrefix != 0)
+      {
+         roles.sharding = MeshServices::constrainPrefixToGroup(plan.shardingPrefix, shardGroup);
+      }
+
+      if (uint64_t topologyBridgePrefix = prodigyDefaultStatefulTopologyBridgePrefix(applicationID); topologyBridgePrefix != 0)
+      {
+         roles.topologyBridge = MeshServices::constrainPrefixToGroup(topologyBridgePrefix, shardGroup);
+      }
+      return roles;
    }
 
    static StatefulMeshRoles forShardGroup(const StatefulDeploymentPlan& plan, uint32_t shardGroup)
    {
-      StatefulMeshRoles roles;
-      roles.client = MeshServices::constrainPrefixToGroup(plan.clientPrefix, shardGroup);
-      roles.sibling = MeshServices::constrainPrefixToGroup(plan.siblingPrefix, shardGroup);
-      roles.cousin = MeshServices::constrainPrefixToGroup(plan.cousinPrefix, shardGroup);
-      roles.seeding = MeshServices::constrainPrefixToGroup(plan.seedingPrefix, shardGroup);
-      roles.sharding = MeshServices::constrainPrefixToGroup(plan.shardingPrefix, shardGroup);
-      return roles;
+      return forShardGroup(plan, 0, shardGroup);
    }
 };
+
+static inline bool prodigyStatefulMeshRolesConfigured(const StatefulMeshRoles& roles)
+{
+   return (roles.client != 0
+      || roles.sibling != 0
+      || roles.cousin != 0
+      || roles.seeding != 0
+      || roles.sharding != 0
+      || roles.topologyBridge != 0);
+}
 
 template <typename S>
 static void serialize(S&& serializer, StatefulMeshRoles& roles)
@@ -2918,6 +3092,265 @@ static void serialize(S&& serializer, StatefulMeshRoles& roles)
    serializer.value8b(roles.cousin);
    serializer.value8b(roles.seeding);
    serializer.value8b(roles.sharding);
+   serializer.value8b(roles.topologyBridge);
+}
+
+enum class StatefulTopologyServingMode : uint8_t
+{
+   none,
+   serve,
+   catchupOnly,
+   drainOnly
+};
+
+enum class StatefulTopologyBridgeMode : uint8_t
+{
+   none,
+   sourceToTarget,
+   targetToSource,
+   bidirectional
+};
+
+enum class StatefulWorkerTopologyUpgradePhase : uint8_t
+{
+   none,
+   greenBootstrap,
+   blueDraining
+};
+
+class StatefulTopology {
+public:
+
+   uint64_t operationID = 0;
+   uint32_t shardGroup = 0;
+   uint32_t topologyEpoch = 0;
+   uint32_t workerCount = 0;
+   StatefulTopologyServingMode servingMode = StatefulTopologyServingMode::none;
+   uint32_t sourceEpoch = 0;
+   uint32_t targetEpoch = 0;
+   StatefulTopologyBridgeMode bridgeMode = StatefulTopologyBridgeMode::none;
+
+   bool configured(void) const
+   {
+      return (operationID != 0
+         || topologyEpoch != 0
+         || workerCount != 0
+         || servingMode != StatefulTopologyServingMode::none
+         || sourceEpoch != 0
+         || targetEpoch != 0
+         || bridgeMode != StatefulTopologyBridgeMode::none);
+   }
+};
+
+template <typename S>
+static void serialize(S&& serializer, StatefulTopology& topology)
+{
+   serializer.value8b(topology.operationID);
+   serializer.value4b(topology.shardGroup);
+   serializer.value4b(topology.topologyEpoch);
+   serializer.value4b(topology.workerCount);
+   serializer.value1b(topology.servingMode);
+   serializer.value4b(topology.sourceEpoch);
+   serializer.value4b(topology.targetEpoch);
+   serializer.value1b(topology.bridgeMode);
+}
+
+static inline void prodigyPopulateDefaultStatefulTopology(StatefulTopology& topology, uint32_t shardGroup, const ApplicationConfig& config)
+{
+   topology.shardGroup = shardGroup;
+
+   if (topology.workerCount == 0)
+   {
+      topology.workerCount = prodigyStatefulWorkerCountForLogicalCores(config.nLogicalCores);
+   }
+
+   if (topology.topologyEpoch == 0)
+   {
+      topology.topologyEpoch = topology.workerCount;
+   }
+
+   if (topology.sourceEpoch == 0)
+   {
+      topology.sourceEpoch = topology.topologyEpoch;
+   }
+
+   if (topology.targetEpoch == 0)
+   {
+      topology.targetEpoch = topology.topologyEpoch;
+   }
+
+   if (topology.servingMode == StatefulTopologyServingMode::none)
+   {
+      topology.servingMode = StatefulTopologyServingMode::serve;
+   }
+}
+
+static inline bool prodigyStatefulTopologyServesClients(const StatefulTopology& topology)
+{
+   return (topology.servingMode == StatefulTopologyServingMode::serve);
+}
+
+static inline bool prodigyStatefulTopologyShouldAdvertiseBridge(const StatefulTopology& topology)
+{
+   switch (topology.bridgeMode)
+   {
+      case StatefulTopologyBridgeMode::sourceToTarget:
+      {
+         return (topology.topologyEpoch != 0 && topology.topologyEpoch == topology.sourceEpoch);
+      }
+      case StatefulTopologyBridgeMode::targetToSource:
+      {
+         return (topology.topologyEpoch != 0 && topology.topologyEpoch == topology.targetEpoch);
+      }
+      case StatefulTopologyBridgeMode::bidirectional:
+      {
+         return (topology.topologyEpoch != 0
+            && (topology.topologyEpoch == topology.sourceEpoch || topology.topologyEpoch == topology.targetEpoch));
+      }
+      case StatefulTopologyBridgeMode::none:
+      default:
+      {
+         return false;
+      }
+   }
+}
+
+static inline bool prodigyStatefulTopologyShouldSubscribeBridge(const StatefulTopology& topology)
+{
+   switch (topology.bridgeMode)
+   {
+      case StatefulTopologyBridgeMode::sourceToTarget:
+      {
+         return (topology.topologyEpoch != 0 && topology.topologyEpoch == topology.targetEpoch);
+      }
+      case StatefulTopologyBridgeMode::targetToSource:
+      {
+         return (topology.topologyEpoch != 0 && topology.topologyEpoch == topology.sourceEpoch);
+      }
+      case StatefulTopologyBridgeMode::bidirectional:
+      {
+         return (topology.topologyEpoch != 0
+            && (topology.topologyEpoch == topology.sourceEpoch || topology.topologyEpoch == topology.targetEpoch));
+      }
+      case StatefulTopologyBridgeMode::none:
+      default:
+      {
+         return false;
+      }
+   }
+}
+
+class ProdigyStatefulWorkerTopologyUpgradeOperation
+{
+public:
+
+   uint64_t deploymentID = 0;
+   uint16_t applicationID = 0;
+   uint64_t operationID = 0;
+   StatefulWorkerTopologyUpgradePhase phase = StatefulWorkerTopologyUpgradePhase::none;
+   uint32_t sourceWorkerCount = 0;
+   uint32_t targetWorkerCount = 0;
+   uint32_t sourceEpoch = 0;
+   uint32_t targetEpoch = 0;
+   uint16_t targetLogicalCores = 0;
+   uint32_t targetMemoryMB = 0;
+   uint32_t targetStorageMB = 0;
+   Vector<uint32_t> lockedShardGroups;
+   int64_t updatedAtMs = 0;
+
+   bool operator==(const ProdigyStatefulWorkerTopologyUpgradeOperation& other) const
+   {
+      if (deploymentID != other.deploymentID
+         || applicationID != other.applicationID
+         || operationID != other.operationID
+         || phase != other.phase
+         || sourceWorkerCount != other.sourceWorkerCount
+         || targetWorkerCount != other.targetWorkerCount
+         || sourceEpoch != other.sourceEpoch
+         || targetEpoch != other.targetEpoch
+         || targetLogicalCores != other.targetLogicalCores
+         || targetMemoryMB != other.targetMemoryMB
+         || targetStorageMB != other.targetStorageMB
+         || updatedAtMs != other.updatedAtMs
+         || lockedShardGroups.size() != other.lockedShardGroups.size())
+      {
+         return false;
+      }
+
+      for (uint32_t index = 0; index < lockedShardGroups.size(); ++index)
+      {
+         if (lockedShardGroups[index] != other.lockedShardGroups[index])
+         {
+            return false;
+         }
+      }
+
+      return true;
+   }
+
+   bool operator!=(const ProdigyStatefulWorkerTopologyUpgradeOperation& other) const
+   {
+      return (*this == other) == false;
+   }
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyStatefulWorkerTopologyUpgradeOperation& operation)
+{
+   serializer.value8b(operation.deploymentID);
+   serializer.value2b(operation.applicationID);
+   serializer.value8b(operation.operationID);
+   serializer.value1b(operation.phase);
+   serializer.value4b(operation.sourceWorkerCount);
+   serializer.value4b(operation.targetWorkerCount);
+   serializer.value4b(operation.sourceEpoch);
+   serializer.value4b(operation.targetEpoch);
+   serializer.value2b(operation.targetLogicalCores);
+   serializer.value4b(operation.targetMemoryMB);
+   serializer.value4b(operation.targetStorageMB);
+   serializer.object(operation.lockedShardGroups);
+   serializer.value8b(operation.updatedAtMs);
+}
+
+class ProdigyDeferredStatefulScaleIntent
+{
+public:
+
+   uint64_t deploymentID = 0;
+   uint16_t applicationID = 0;
+   uint32_t targetShardGroups = 0;
+   uint16_t targetLogicalCores = 0;
+   uint32_t targetMemoryMB = 0;
+   uint32_t targetStorageMB = 0;
+   int64_t updatedAtMs = 0;
+
+   bool operator==(const ProdigyDeferredStatefulScaleIntent& other) const
+   {
+      return (deploymentID == other.deploymentID
+         && applicationID == other.applicationID
+         && targetShardGroups == other.targetShardGroups
+         && targetLogicalCores == other.targetLogicalCores
+         && targetMemoryMB == other.targetMemoryMB
+         && targetStorageMB == other.targetStorageMB
+         && updatedAtMs == other.updatedAtMs);
+   }
+
+   bool operator!=(const ProdigyDeferredStatefulScaleIntent& other) const
+   {
+      return (*this == other) == false;
+   }
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyDeferredStatefulScaleIntent& intent)
+{
+   serializer.value8b(intent.deploymentID);
+   serializer.value2b(intent.applicationID);
+   serializer.value4b(intent.targetShardGroups);
+   serializer.value2b(intent.targetLogicalCores);
+   serializer.value4b(intent.targetMemoryMB);
+   serializer.value4b(intent.targetStorageMB);
+   serializer.value8b(intent.updatedAtMs);
 }
 
 class StatelessDeploymentPlan {
@@ -3551,6 +3984,7 @@ public:
    String state;
    bool isBrain = false;
    bool controlPlaneReachable = false;
+   bool runtimeReady = false;
    bool currentMaster = false;
    bool decommissioning = false;
    bool rebooting = false;
@@ -3648,8 +4082,9 @@ public:
          unsigned(ssh.port)
       );
       string.appendTabs(nTabs + 1);
-      string.snprintf_add<"lifecycle controlPlaneReachable={itoa} currentMaster={itoa} decommissioning={itoa} rebooting={itoa} updatingOS={itoa} hardwareFailure={itoa} bootTimeMs={itoa} uptimeMs={itoa}\n"_ctv>(
+      string.snprintf_add<"lifecycle controlPlaneReachable={itoa} runtimeReady={itoa} currentMaster={itoa} decommissioning={itoa} rebooting={itoa} updatingOS={itoa} hardwareFailure={itoa} bootTimeMs={itoa} uptimeMs={itoa}\n"_ctv>(
          controlPlaneReachable ? 1u : 0u,
+         runtimeReady ? 1u : 0u,
          currentMaster ? 1u : 0u,
          decommissioning ? 1u : 0u,
          rebooting ? 1u : 0u,
@@ -3715,6 +4150,7 @@ static void serialize(S&& serializer, MachineStatusReport& report)
    serializer.text1b(report.state, UINT32_MAX);
    serializer.value1b(report.isBrain);
    serializer.value1b(report.controlPlaneReachable);
+   serializer.value1b(report.runtimeReady);
    serializer.value1b(report.currentMaster);
    serializer.value1b(report.decommissioning);
    serializer.value1b(report.rebooting);
@@ -4826,20 +5262,26 @@ class ProdigyMasterAuthorityRuntimeState {
 public:
 
    uint64_t generation = 0;
+   bool hasCompletedInitialMasterElection = false;
    ProdigyTransportTLSAuthority transportTLSAuthority;
    uint64_t nextMintedClientTlsGeneration = 1;
    uint64_t nextPendingAddMachinesOperationID = 1;
    Vector<ProdigyPendingAddMachinesOperation> pendingAddMachinesOperations;
+   Vector<ProdigyStatefulWorkerTopologyUpgradeOperation> statefulWorkerTopologyUpgradeOperations;
+   Vector<ProdigyDeferredStatefulScaleIntent> deferredStatefulScaleIntents;
    Vector<ProdigyManagedMachineSchema> machineSchemas;
    ProdigyPersistentUpdateSelfState updateSelf;
 
    bool operator==(const ProdigyMasterAuthorityRuntimeState& other) const
    {
       if (generation != other.generation
+         || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection
          || transportTLSAuthority != other.transportTLSAuthority
          || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration
          || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID
          || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size()
+         || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size()
+         || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size()
          || machineSchemas.size() != other.machineSchemas.size()
          || updateSelf != other.updateSelf)
       {
@@ -4849,6 +5291,22 @@ public:
       for (uint32_t index = 0; index < pendingAddMachinesOperations.size(); ++index)
       {
          if (pendingAddMachinesOperations[index] != other.pendingAddMachinesOperations[index])
+         {
+            return false;
+         }
+      }
+
+      for (uint32_t index = 0; index < statefulWorkerTopologyUpgradeOperations.size(); ++index)
+      {
+         if (statefulWorkerTopologyUpgradeOperations[index] != other.statefulWorkerTopologyUpgradeOperations[index])
+         {
+            return false;
+         }
+      }
+
+      for (uint32_t index = 0; index < deferredStatefulScaleIntents.size(); ++index)
+      {
+         if (deferredStatefulScaleIntents[index] != other.deferredStatefulScaleIntents[index])
          {
             return false;
          }
@@ -4875,10 +5333,13 @@ template <typename S>
 static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
 {
    serializer.value8b(state.generation);
+   serializer.value1b(state.hasCompletedInitialMasterElection);
    serializer.object(state.transportTLSAuthority);
    serializer.value8b(state.nextMintedClientTlsGeneration);
    serializer.value8b(state.nextPendingAddMachinesOperationID);
    serializer.object(state.pendingAddMachinesOperations);
+   serializer.object(state.statefulWorkerTopologyUpgradeOperations);
+   serializer.object(state.deferredStatefulScaleIntents);
    serializer.object(state.machineSchemas);
    serializer.object(state.updateSelf);
 }
@@ -4953,6 +5414,9 @@ public:
    static constexpr const char *runtimeContainerStorageUtilPctName = "runtime.container.storage_util_pct";
    static constexpr const char *runtimeIngressQueueWaitCompositeName = "runtime.ingress.queue_wait_us.composite";
    static constexpr const char *runtimeIngressHandlerCompositeName = "runtime.ingress.handler_us.composite";
+   static constexpr const char *runtimeStatefulTopologyCutoverReadyName = "runtime.stateful.topology.cutover.ready";
+   static constexpr const char *runtimeStatefulTopologyCutoverSourceEpochName = "runtime.stateful.topology.cutover.source_epoch";
+   static constexpr const char *runtimeStatefulTopologyCutoverTargetEpochName = "runtime.stateful.topology.cutover.target_epoch";
 
    static uint64_t stableMetricHash(const uint8_t *bytes, uint64_t length)
    {
@@ -5075,6 +5539,24 @@ public:
    static uint64_t runtimeIngressHandlerCompositeKey(void)
    {
       static const uint64_t key = keyForBuiltin(Builtin::runtimeIngressHandlerComposite);
+      return key;
+   }
+
+   static uint64_t runtimeStatefulTopologyCutoverReadyKey(void)
+   {
+      static const uint64_t key = metricKeyForName(runtimeStatefulTopologyCutoverReadyName);
+      return key;
+   }
+
+   static uint64_t runtimeStatefulTopologyCutoverSourceEpochKey(void)
+   {
+      static const uint64_t key = metricKeyForName(runtimeStatefulTopologyCutoverSourceEpochName);
+      return key;
+   }
+
+   static uint64_t runtimeStatefulTopologyCutoverTargetEpochKey(void)
+   {
+      static const uint64_t key = metricKeyForName(runtimeStatefulTopologyCutoverTargetEpochName);
       return key;
    }
 };
@@ -5264,6 +5746,7 @@ public:
 // not used by neuron, but stored for safe keeping for when brain retires or ever crashes
    ApplicationLifetime lifetime;    // brain will update this because canary -> reserved and surge -> reserved are possible
    ContainerState state;            // neuron will update this itself
+   bool runtimeReady = false;       // neuron will update this itself
    int64_t createdAtMs;
    uint32_t shardGroup;
    uint32_t nShardGroups = 0;
@@ -5271,6 +5754,7 @@ public:
    bool requiresDatacenterUniqueTag;
    bool isStateful = false;
    StatefulMeshRoles statefulMeshRoles;
+   StatefulTopology statefulTopology;
 
    bool hasCredentialBundle = false;
    CredentialBundle credentialBundle;
@@ -5474,6 +5958,7 @@ static void serialize(S&& serializer, ContainerPlan& plan)
       
    serializer.value1b(plan.lifetime);
    serializer.value1b(plan.state);
+   serializer.value1b(plan.runtimeReady);
    serializer.value8b(plan.createdAtMs);
    serializer.value4b(plan.shardGroup);
    serializer.value4b(plan.nShardGroups);
@@ -5481,6 +5966,7 @@ static void serialize(S&& serializer, ContainerPlan& plan)
    serializer.value1b(plan.requiresDatacenterUniqueTag);
    serializer.value1b(plan.isStateful);
    serializer.object(plan.statefulMeshRoles);
+   serializer.object(plan.statefulTopology);
    serializer.value1b(plan.hasCredentialBundle);
    serializer.object(plan.credentialBundle);
 }
@@ -5511,6 +5997,28 @@ static void serialize(S&& serializer, NeuronContainerBootstrap& bootstrap)
 {
    serializer.object(bootstrap.plan);
    serializer.object(bootstrap.metricPolicy);
+}
+
+class BrainReplicatedContainerRuntimeState {
+public:
+
+   uint128_t machineUUID = 0;
+   uint32_t machinePrivate4 = 0;
+   ContainerPlan plan;
+   uint16_t runtimeLogicalCores = 0;
+   uint32_t runtimeMemoryMB = 0;
+   uint32_t runtimeStorageMB = 0;
+};
+
+template <typename S>
+static void serialize(S&& serializer, BrainReplicatedContainerRuntimeState& state)
+{
+   serializer.value16b(state.machineUUID);
+   serializer.value4b(state.machinePrivate4);
+   serializer.object(state.plan);
+   serializer.value2b(state.runtimeLogicalCores);
+   serializer.value4b(state.runtimeMemoryMB);
+   serializer.value4b(state.runtimeStorageMB);
 }
 
 class DeploymentPlan {
@@ -5600,21 +6108,185 @@ public:
    ProdigyMasterAuthorityRuntimeState runtimeState;
 };
 
+template <typename Key, typename Value>
+class ProdigyPersistentMapEntry {
+public:
+
+   Key key = {};
+   Value value = {};
+};
+
+static inline bool prodigyPersistentStringComesBefore(const String& lhs, const String& rhs)
+{
+   size_t common = std::min(lhs.size(), rhs.size());
+   int cmp = std::memcmp(lhs.data(), rhs.data(), common);
+   if (cmp != 0)
+   {
+      return cmp < 0;
+   }
+
+   return lhs.size() < rhs.size();
+}
+
+template <typename S, typename Key, typename Value, typename SerializeKey, typename SerializeValue, typename Compare>
+static void prodigySerializePersistentMapAsEntries(
+   S&& serializer,
+   bytell_hash_map<Key, Value>& map,
+   SerializeKey&& serializeKey,
+   SerializeValue&& serializeValue,
+   Compare&& compare)
+{
+   Vector<ProdigyPersistentMapEntry<Key, Value>> entries = {};
+   entries.reserve(map.size());
+   for (const auto& [key, value] : map)
+   {
+      ProdigyPersistentMapEntry<Key, Value> entry = {};
+      entry.key = key;
+      entry.value = value;
+      entries.push_back(std::move(entry));
+   }
+
+   std::sort(entries.begin(), entries.end(), compare);
+   serializer.container(entries, UINT32_MAX, [&] (S& serializer, ProdigyPersistentMapEntry<Key, Value>& entry) {
+      serializeKey(serializer, entry.key);
+      serializeValue(serializer, entry.value);
+   });
+
+   map.clear();
+   for (ProdigyPersistentMapEntry<Key, Value>& entry : entries)
+   {
+      map.insert_or_assign(std::move(entry.key), std::move(entry.value));
+   }
+}
+
 template <typename S>
 static void serialize(S&& serializer, ProdigyPersistentMasterAuthorityPackage& package)
 {
+   const char *persistTraceValue = std::getenv("PRODIGY_PERSIST_TRACE");
+   bool persistTrace = persistTraceValue != nullptr && persistTraceValue[0] != '\0' && persistTraceValue[0] != '0';
+
+   if (persistTrace)
+   {
+      std::fprintf(stderr, "prodigy persist package tlsVaultFactoriesByApp begin\n");
+      std::fflush(stderr);
+   }
    serializer.object(package.tlsVaultFactoriesByApp);
+   if (persistTrace)
+   {
+      std::fprintf(stderr, "prodigy persist package tlsVaultFactoriesByApp end\n");
+      std::fflush(stderr);
+   }
+
+   if (persistTrace)
+   {
+      std::fprintf(stderr, "prodigy persist package apiCredentialSetsByApp begin\n");
+      std::fflush(stderr);
+   }
    serializer.object(package.apiCredentialSetsByApp);
-   serializer.object(package.reservedApplicationIDsByName);
-   serializer.object(package.reservedApplicationNamesByID);
+   if (persistTrace)
+   {
+      std::fprintf(stderr, "prodigy persist package apiCredentialSetsByApp end\n");
+      std::fflush(stderr);
+   }
+
+   if (persistTrace)
+   {
+      std::fprintf(stderr, "prodigy persist package reservedApplicationIDsByName begin\n");
+      std::fflush(stderr);
+   }
+   prodigySerializePersistentMapAsEntries(
+      serializer,
+      package.reservedApplicationIDsByName,
+      [] (S& serializer, String& key) {
+         serializer.text1b(key, UINT32_MAX);
+      },
+      [] (S& serializer, uint16_t& value) {
+         serializer.value2b(value);
+      },
+      [] (const ProdigyPersistentMapEntry<String, uint16_t>& lhs, const ProdigyPersistentMapEntry<String, uint16_t>& rhs) -> bool {
+         return prodigyPersistentStringComesBefore(lhs.key, rhs.key);
+      });
+   if (persistTrace)
+   {
+      std::fprintf(stderr, "prodigy persist package reservedApplicationIDsByName end\n");
+      std::fflush(stderr);
+   }
+
+   if (persistTrace)
+   {
+      std::fprintf(stderr, "prodigy persist package reservedApplicationNamesByID begin\n");
+      std::fflush(stderr);
+   }
+   prodigySerializePersistentMapAsEntries(
+      serializer,
+      package.reservedApplicationNamesByID,
+      [] (S& serializer, uint16_t& key) {
+         serializer.value2b(key);
+      },
+      [] (S& serializer, String& value) {
+         serializer.text1b(value, UINT32_MAX);
+      },
+      [] (const ProdigyPersistentMapEntry<uint16_t, String>& lhs, const ProdigyPersistentMapEntry<uint16_t, String>& rhs) -> bool {
+         return lhs.key < rhs.key;
+      });
+   if (persistTrace)
+   {
+      std::fprintf(stderr, "prodigy persist package reservedApplicationNamesByID end\n");
+      std::fflush(stderr);
+   }
+
+   if (persistTrace)
+   {
+      std::fprintf(stderr, "prodigy persist package reservedApplicationServices begin\n");
+      std::fflush(stderr);
+   }
    serializer.object(package.reservedApplicationServices);
+   if (persistTrace)
+   {
+      std::fprintf(stderr, "prodigy persist package reservedApplicationServices end\n");
+      std::fflush(stderr);
+   }
+
    serializer.value2b(package.nextReservableApplicationID);
+
+   if (persistTrace)
+   {
+      std::fprintf(stderr, "prodigy persist package deploymentPlans begin\n");
+      std::fflush(stderr);
+   }
    serializer.object(package.deploymentPlans);
+   if (persistTrace)
+   {
+      std::fprintf(stderr, "prodigy persist package deploymentPlans end\n");
+      std::fflush(stderr);
+   }
+
+   if (persistTrace)
+   {
+      std::fprintf(stderr, "prodigy persist package failedDeployments begin\n");
+      std::fflush(stderr);
+   }
    serializer.object(package.failedDeployments);
+   if (persistTrace)
+   {
+      std::fprintf(stderr, "prodigy persist package failedDeployments end\n");
+      std::fflush(stderr);
+   }
+
+   if (persistTrace)
+   {
+      std::fprintf(stderr, "prodigy persist package runtimeState begin\n");
+      std::fflush(stderr);
+   }
    serializer.object(package.runtimeState);
+   if (persistTrace)
+   {
+      std::fprintf(stderr, "prodigy persist package runtimeState end\n");
+      std::fflush(stderr);
+   }
 }
 
-class ContainerParameters { // startup payload encoded by ProdigyWire; readers still accept legacy Bitsery during rollout
+class ContainerParameters { // startup payload for container launch; stateful mesh and topology metadata use the full serializer path
 public:
 
    uint128_t uuid;
@@ -5644,6 +6316,7 @@ public:
    bool hasCredentialBundle = false;
    CredentialBundle credentialBundle;
    StatefulMeshRoles statefulMeshRoles;
+   StatefulTopology statefulTopology;
 
    Vector<uint64_t> flags;
 };
@@ -5690,6 +6363,7 @@ static void serialize(S&& serializer, ContainerParameters& params)
    serializer.value1b(params.hasCredentialBundle);
    serializer.object(params.credentialBundle);
    serializer.object(params.statefulMeshRoles);
+   serializer.object(params.statefulTopology);
 
    serializer.container8b(params.flags, UINT32_MAX);
 }
