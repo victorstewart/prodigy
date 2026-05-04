@@ -6,7 +6,13 @@ MOTHERSHIP_BIN="${2:-}"
 PINGPONG_BIN="${3:-}"
 PINGPONG_ALT_BIN="${4:-}"
 PINGPONG_NOPORT_BIN="${5:-}"
+PINGPONG_FAIL_BIN="${6:-}"
 MODE="smoke"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+source "${SCRIPT_DIR}/prodigy_dev_discombobulator_artifact_helpers.sh"
+prodigy_dev_reexec_in_private_mount_namespace_once PRODIGY_DEV_DEPLOYMENTS_MATRIX_MOUNT_NS_READY bash "${SCRIPT_SELF}" "$@"
 
 if [[ -n "${PINGPONG_ALT_BIN}" && "${PINGPONG_ALT_BIN}" != --* ]]
 then
@@ -24,6 +30,14 @@ else
    PINGPONG_NOPORT_BIN="${PINGPONG_ALT_BIN}"
 fi
 
+if [[ $# -gt 0 && "${1:-}" != --* ]]
+then
+   PINGPONG_FAIL_BIN="$1"
+   shift
+else
+   PINGPONG_FAIL_BIN=""
+fi
+
 while [[ $# -gt 0 ]]
 do
    case "$1" in
@@ -38,7 +52,6 @@ do
    shift
 done
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARNESS="${SCRIPT_DIR}/prodigy_dev_netns_harness.sh"
 
 if [[ "${MODE}" != "smoke" && "${MODE}" != "ci" ]]
@@ -49,7 +62,7 @@ fi
 
 if [[ -z "${PRODIGY_BIN}" || -z "${MOTHERSHIP_BIN}" || -z "${PINGPONG_BIN}" ]]
 then
-   echo "usage: $0 /path/to/prodigy /path/to/mothership /path/to/prodigy_pingpong_container [/path/to/prodigy_pingpong_container_alt] [/path/to/prodigy_pingpong_container_noport] [--mode=smoke|ci]"
+   echo "usage: $0 /path/to/prodigy /path/to/mothership /path/to/prodigy_pingpong_container [/path/to/prodigy_pingpong_container_alt] [/path/to/prodigy_pingpong_container_noport] [/path/to/prodigy_pingpong_container_crash] [--mode=smoke|ci]"
    exit 2
 fi
 
@@ -89,13 +102,19 @@ then
    exit 1
 fi
 
+if [[ -n "${PINGPONG_FAIL_BIN}" && ! -x "${PINGPONG_FAIL_BIN}" ]]
+then
+   echo "FAIL: pingpong failing container binary is not executable: ${PINGPONG_FAIL_BIN}"
+   exit 1
+fi
+
 if [[ ! -x "${HARNESS}" ]]
 then
    echo "FAIL: harness is not executable: ${HARNESS}"
    exit 1
 fi
 
-deps=(awk btrfs mkfs.btrfs mount umount stat zstd ldd install timeout ip rg)
+deps=(awk btrfs cargo mkfs.btrfs mount umount stat zstd timeout ip rg)
 for cmd in "${deps[@]}"
 do
    if ! command -v "${cmd}" >/dev/null 2>&1
@@ -110,34 +129,23 @@ MOTHERSHIP_BIN="$(readlink -f "${MOTHERSHIP_BIN}" 2>/dev/null || printf '%s' "${
 PINGPONG_BIN="$(readlink -f "${PINGPONG_BIN}" 2>/dev/null || printf '%s' "${PINGPONG_BIN}")"
 PINGPONG_ALT_BIN="$(readlink -f "${PINGPONG_ALT_BIN}" 2>/dev/null || printf '%s' "${PINGPONG_ALT_BIN}")"
 PINGPONG_NOPORT_BIN="$(readlink -f "${PINGPONG_NOPORT_BIN}" 2>/dev/null || printf '%s' "${PINGPONG_NOPORT_BIN}")"
+if [[ -n "${PINGPONG_FAIL_BIN}" ]]
+then
+   PINGPONG_FAIL_BIN="$(readlink -f "${PINGPONG_FAIL_BIN}" 2>/dev/null || printf '%s' "${PINGPONG_FAIL_BIN}")"
+fi
+target_arch="$(prodigy_dev_detect_target_arch)"
 
 tmpdir="$(mktemp -d)"
 export TMPDIR="${tmpdir}"
 containers_dir_created=0
 containers_mount_created=0
 containers_loop_image=""
-host_pingpong_path="/root/pingpong_container"
-host_pingpong_backup=""
-active_subvol=""
 failed_cases=0
 total_cases=0
 
 cleanup()
 {
    set +e
-
-   if [[ -n "${active_subvol}" && -e "${active_subvol}" ]]
-   then
-      btrfs property set -f "${active_subvol}" ro false >/dev/null 2>&1 || true
-      btrfs subvolume delete "${active_subvol}" >/dev/null 2>&1 || true
-   fi
-
-   if [[ -n "${host_pingpong_backup}" && -f "${host_pingpong_backup}" ]]
-   then
-      install -m 0755 "${host_pingpong_backup}" "${host_pingpong_path}" >/dev/null 2>&1 || true
-   else
-      rm -f "${host_pingpong_path}" >/dev/null 2>&1 || true
-   fi
 
    if [[ "${containers_mount_created}" -eq 1 ]]
    then
@@ -173,9 +181,9 @@ then
       exit 1
    fi
 
-   if [[ -n "$(ls -A /containers 2>/dev/null)" ]]
+   if ! prodigy_dev_containers_root_is_safely_overmountable /containers
    then
-      echo "FAIL: /containers exists on non-btrfs fs and is not empty"
+      echo "FAIL: /containers exists on non-btrfs fs and is not safely overmountable"
       exit 1
    fi
 
@@ -188,13 +196,6 @@ fi
 
 mkdir -p /containers/store /containers/storage
 
-if [[ -e "${host_pingpong_path}" ]]
-then
-   host_pingpong_backup="${tmpdir}/pingpong_container.host.backup"
-   cp -f "${host_pingpong_path}" "${host_pingpong_backup}"
-fi
-install -m 0755 "${PINGPONG_BIN}" "${host_pingpong_path}"
-
 next_version_id()
 {
    local version_id=$(( ($(date +%s%N) & 281474976710655) ))
@@ -205,64 +206,33 @@ next_version_id()
    echo "${version_id}"
 }
 
-subvol_id_for()
-{
-   local app_id="$1"
-   local version_id="$2"
-   local deployment_id=$(( (app_id << 48) | version_id ))
-   echo "${deployment_id}"
-}
-
-copy_binary_and_libs_into_subvol()
-{
-   local binary_path="$1"
-   local subvol_root="$2"
-   local install_path="${3:-/root/pingpong_container}"
-
-   mkdir -p "${subvol_root}$(dirname "${install_path}")" "${subvol_root}/etc"
-   install -m 0755 "${binary_path}" "${subvol_root}${install_path}"
-
-   while IFS= read -r libpath
-   do
-      if [[ -z "${libpath}" ]]
-      then
-         continue
-      fi
-
-      if [[ -e "${libpath}" ]]
-      then
-         cp -aL --parents "${libpath}" "${subvol_root}"
-      fi
-   done < <(
-      ldd "${binary_path}" | awk '
-         /=>/ {
-            if ($3 ~ /^\//) print $3;
-         }
-         /^[[:space:]]*\// {
-            print $1;
-         }
-      ' | sort -u
-   )
-}
-
 build_blob_with_binary()
 {
    local out_blob="$1"
    local app_id="$2"
    local version_id="$3"
    local binary_path="$4"
+   local project_dir="${tmpdir}/artifact-${app_id}-${version_id}"
+   local discombobulator_file="${project_dir}/PingPong.DiscombobuFile"
 
-   local deployment_id
-   deployment_id="$(subvol_id_for "${app_id}" "${version_id}")"
-   active_subvol="/containers/${deployment_id}"
+   rm -rf "${project_dir}" >/dev/null 2>&1 || true
+   mkdir -p "${project_dir}"
+   cat > "${discombobulator_file}" <<EOF
+FROM scratch for ${target_arch}
+COPY {bin} ./$(basename "${binary_path}") /root/pingpong_container
+SURVIVE /root/pingpong_container
+EOF
+   prodigy_dev_write_common_prodigy_assets "${discombobulator_file}"
+   cat >> "${discombobulator_file}" <<'EOF'
+EXECUTE ["/root/pingpong_container"]
+EOF
 
-   btrfs subvolume create "${active_subvol}" >/dev/null
-   copy_binary_and_libs_into_subvol "${binary_path}" "${active_subvol}" "/root/pingpong_container"
-   btrfs property set -f "${active_subvol}" ro true >/dev/null
-   btrfs send "${active_subvol}" | zstd -19 -T0 -q -o "${out_blob}"
-   btrfs property set -f "${active_subvol}" ro false >/dev/null
-   btrfs subvolume delete "${active_subvol}" >/dev/null
-   active_subvol=""
+   prodigy_dev_run_discombobulator_build \
+      "${project_dir}" \
+      "${discombobulator_file}" \
+      "${out_blob}" \
+      "bin=$(dirname "${binary_path}")" \
+      "ebpf=$(dirname "${PRODIGY_BIN}")"
 }
 
 build_blob_missing_binary()
@@ -270,18 +240,44 @@ build_blob_missing_binary()
    local out_blob="$1"
    local app_id="$2"
    local version_id="$3"
+   local project_dir="${tmpdir}/artifact-missing-${app_id}-${version_id}"
+   local discombobulator_file="${project_dir}/MissingBinary.DiscombobuFile"
+   local bad_binary="${project_dir}/bad_container"
 
-   local deployment_id
-   deployment_id="$(subvol_id_for "${app_id}" "${version_id}")"
-   active_subvol="/containers/${deployment_id}"
+   rm -rf "${project_dir}" >/dev/null 2>&1 || true
+   mkdir -p "${project_dir}"
+   printf 'this is intentionally not an executable container\n' > "${bad_binary}"
+   chmod 0644 "${bad_binary}"
+   cat > "${discombobulator_file}" <<EOF
+FROM scratch for ${target_arch}
+COPY {bad} ./bad_container /root/pingpong_container
+SURVIVE /root/pingpong_container
+EOF
+   prodigy_dev_write_common_prodigy_assets "${discombobulator_file}"
+   cat >> "${discombobulator_file}" <<'EOF'
+EXECUTE ["/root/pingpong_container"]
+EOF
 
-   btrfs subvolume create "${active_subvol}" >/dev/null
-   mkdir -p "${active_subvol}/root" "${active_subvol}/etc"
-   btrfs property set -f "${active_subvol}" ro true >/dev/null
-   btrfs send "${active_subvol}" | zstd -19 -T0 -q -o "${out_blob}"
-   btrfs property set -f "${active_subvol}" ro false >/dev/null
-   btrfs subvolume delete "${active_subvol}" >/dev/null
-   active_subvol=""
+   prodigy_dev_run_discombobulator_build \
+      "${project_dir}" \
+      "${discombobulator_file}" \
+      "${out_blob}" \
+      "bad=${project_dir}" \
+      "ebpf=$(dirname "${PRODIGY_BIN}")"
+}
+
+build_blob_failing_binary()
+{
+   local out_blob="$1"
+   local app_id="$2"
+   local version_id="$3"
+
+   if [[ -n "${PINGPONG_FAIL_BIN}" ]]
+   then
+      build_blob_with_binary "${out_blob}" "${app_id}" "${version_id}" "${PINGPONG_FAIL_BIN}"
+   else
+      build_blob_missing_binary "${out_blob}" "${app_id}" "${version_id}"
+   fi
 }
 
 write_stateless_plan()
@@ -299,6 +295,7 @@ write_stateless_plan()
    local canary_minutes="${11}"
    local use_host_ns="${12}"
    local moveable="${13}"
+   local isolate_cpus="${14:-false}"
 
    cat > "${out_plan}" <<EOF
 {
@@ -306,14 +303,17 @@ write_stateless_plan()
     "type": "ApplicationType::stateless",
     "applicationID": ${app_id},
     "versionID": ${version_id},
-    "filesystemMB": 64,
-    "storageMB": ${storage_mb},
-    "memoryMB": ${memory_mb},
-    "nLogicalCores": ${cores},
-    "msTilHealthy": 2000,
+    "architecture": "${target_arch}",
+	    "filesystemMB": 64,
+	    "storageMB": ${storage_mb},
+	    "memoryMB": ${memory_mb},
+	    "isolateCPUs": ${isolate_cpus},
+	    "nLogicalCores": ${cores},
+	    "msTilHealthy": 2000,
     "sTilHealthcheck": 3,
     "sTilKillable": 30
   },
+  "useHostNetworkNamespace": ${use_host_ns},
   "minimumSubscriberCapacity": 1024,
   "isStateful": false,
   "canaryCount": ${canary_count},
@@ -355,14 +355,17 @@ write_stateful_plan()
     "type": "ApplicationType::stateful",
     "applicationID": ${app_id},
     "versionID": ${version_id},
-    "filesystemMB": 64,
-    "storageMB": ${storage_mb},
-    "memoryMB": ${memory_mb},
-    "nLogicalCores": ${cores},
-    "msTilHealthy": 2000,
+    "architecture": "${target_arch}",
+	    "filesystemMB": 64,
+	    "storageMB": ${storage_mb},
+	    "memoryMB": ${memory_mb},
+	    "isolateCPUs": false,
+	    "nLogicalCores": ${cores},
+	    "msTilHealthy": 2000,
     "sTilHealthcheck": 3,
     "sTilKillable": 30
   },
+  "useHostNetworkNamespace": ${use_host_ns},
   "minimumSubscriberCapacity": 1024,
   "isStateful": true,
   "canaryCount": ${canary_count},
@@ -424,6 +427,7 @@ run_harness_case "stateless_baseline_smoke" 65 \
    --deploy-ping-expect=pong \
    --deploy-report-application="Nametag" \
    --deploy-report-min-healthy=1 \
+   --deploy-report-final-healthy-min=1 \
    --deploy-report-min-target=2 \
    --deploy-report-max-target-min=2
 
@@ -441,6 +445,7 @@ run_harness_case "stateful_baseline_smoke" 80 \
    --deploy-ping-expect=pong \
    --deploy-report-application="Hot" \
    --deploy-report-min-healthy=3 \
+   --deploy-report-final-healthy-min=3 \
    --deploy-report-min-target=3 \
    --deploy-report-max-target-min=3
 
@@ -464,10 +469,12 @@ run_harness_case "stateless_upgrade_rollout_good" 120 \
    --deploy-skip-probe=1 \
    --deploy-report-application="Nametag" \
    --deploy-report-min-healthy=1 \
+   --deploy-report-final-healthy-min=1 \
    --deploy-report-min-target=1 \
    --deploy-report-max-target-min=2 \
    --deploy-report-final-healthy-max=1 \
-   --deploy-report-final-target-max=1
+   --deploy-report-final-target-max=1 \
+   --deploy-report-attempts=420
 
 # Case 4: stateful good upgrade rollout.
 case4_v1="$(next_version_id)"
@@ -489,6 +496,7 @@ run_harness_case "stateful_upgrade_rollout_good" 140 \
    --deploy-skip-probe=1 \
    --deploy-report-application="Hot" \
    --deploy-report-min-healthy=3 \
+   --deploy-report-final-healthy-min=3 \
    --deploy-report-min-target=3 \
    --deploy-report-max-target-min=3
 
@@ -502,20 +510,23 @@ case5_blob_v2_bad="${tmpdir}/case5.stateless_upgrade_bad.v2.bad.container.zst"
 write_stateless_plan "${case5_plan_v1}" 6 "${case5_v1}" 1 1 256 64 "1.0" "1.0" 0 1 true true
 write_stateless_plan "${case5_plan_v2}" 6 "${case5_v2}" 1 1 256 64 "1.0" "1.0" 1 1 true true
 build_blob_with_binary "${case5_blob_v1}" 6 "${case5_v1}" "${PINGPONG_BIN}"
-build_blob_missing_binary "${case5_blob_v2_bad}" 6 "${case5_v2}"
+build_blob_failing_binary "${case5_blob_v2_bad}" 6 "${case5_v2}"
 run_harness_case "stateless_upgrade_rollback_bad" 150 \
    --deploy-plan-json="${case5_plan_v1}" \
    --deploy-container-zstd="${case5_blob_v1}" \
    --deploy-second-plan-json="${case5_plan_v2}" \
    --deploy-second-container-zstd="${case5_blob_v2_bad}" \
    --deploy-second-start=25 \
+   --deploy-second-expect-text="SpinApplicationResponseCode::failed" \
    --deploy-skip-probe=1 \
    --deploy-report-application="Nametag" \
    --deploy-report-min-healthy=1 \
+   --deploy-report-final-healthy-min=1 \
    --deploy-report-min-target=1 \
-   --deploy-report-max-target-min=2 \
    --deploy-report-final-healthy-max=1 \
-   --deploy-report-final-target-max=1
+   --deploy-report-final-target-max=1 \
+   --deploy-report-attempts=600 \
+   --require-brain-log-substring="spin-application-failed"
 
 # Case 6: stateful bad upgrade rollback.
 case6_v1="$(next_version_id)"
@@ -527,7 +538,7 @@ case6_blob_v2_bad="${tmpdir}/case6.stateful_upgrade_bad.v2.bad.container.zst"
 write_stateful_plan "${case6_plan_v1}" 3 "${case6_v1}" 1 256 64 0 1 true true
 write_stateful_plan "${case6_plan_v2}" 3 "${case6_v2}" 1 256 64 1 1 true true
 build_blob_with_binary "${case6_blob_v1}" 3 "${case6_v1}" "${PINGPONG_BIN}"
-build_blob_missing_binary "${case6_blob_v2_bad}" 3 "${case6_v2}"
+build_blob_failing_binary "${case6_blob_v2_bad}" 3 "${case6_v2}"
 run_harness_case "stateful_upgrade_rollback_bad" 170 \
    --deploy-plan-json="${case6_plan_v1}" \
    --deploy-container-zstd="${case6_blob_v1}" \
@@ -535,7 +546,15 @@ run_harness_case "stateful_upgrade_rollback_bad" 170 \
    --deploy-second-container-zstd="${case6_blob_v2_bad}" \
    --deploy-second-start=25 \
    --deploy-second-expect-accept=0 \
-   --deploy-skip-probe=1
+   --deploy-second-expect-text="SpinApplicationResponseCode::invalidPlan" \
+   --deploy-skip-probe=1 \
+   --deploy-report-application="Hot" \
+   --deploy-report-min-healthy=3 \
+   --deploy-report-final-healthy-min=3 \
+   --deploy-report-min-target=3 \
+   --deploy-report-max-target-min=3 \
+   --deploy-report-final-healthy-max=3 \
+   --deploy-report-final-target-max=3
 
 # Case 7: stateless scarcity forces machine-request path.
 case7_version="$(next_version_id)"
@@ -554,7 +573,7 @@ run_harness_case "stateless_scarcity_requests_machines" 70 \
 case8_version="$(next_version_id)"
 case8_plan="${tmpdir}/case8.stateful_scarcity.plan.json"
 case8_blob="${tmpdir}/case8.stateful_scarcity.container.zst"
-write_stateful_plan "${case8_plan}" 3 "${case8_version}" 16 256 64 0 1 false true
+write_stateful_plan "${case8_plan}" 3 "${case8_version}" 128 256 64 0 1 false true
 build_blob_with_binary "${case8_blob}" 3 "${case8_version}" "${PINGPONG_BIN}"
 run_harness_case "stateful_scarcity_requests_machines" 90 \
    --deploy-plan-json="${case8_plan}" \
@@ -568,23 +587,32 @@ then
    # Case 9: compaction path for a stateless target.
    case9_a_version="$(next_version_id)"
    case9_b_version="$(next_version_id)"
+   case9_c_version="$(next_version_id)"
    case9_plan_a="${tmpdir}/case9.compaction_stateless.a.plan.json"
    case9_plan_b="${tmpdir}/case9.compaction_stateless.b.plan.json"
+   case9_plan_c="${tmpdir}/case9.compaction_stateless.c.plan.json"
    case9_blob_a="${tmpdir}/case9.compaction_stateless.a.container.zst"
    case9_blob_b="${tmpdir}/case9.compaction_stateless.b.container.zst"
-   write_stateless_plan "${case9_plan_a}" 6 "${case9_a_version}" 3 2 256 64 "1.0" "0.66" 0 1 true true
-   write_stateless_plan "${case9_plan_b}" 5 "${case9_b_version}" 1 2 256 64 "1.0" "1.0" 0 1 true true
+   case9_blob_c="${tmpdir}/case9.compaction_stateless.c.container.zst"
+   write_stateless_plan "${case9_plan_a}" 6 "${case9_a_version}" 2 3 256 64 "1.0" "0.5" 0 1 true true false
+   write_stateless_plan "${case9_plan_b}" 3 "${case9_b_version}" 1 3 256 64 "1.0" "1.0" 0 1 true true false
+   write_stateless_plan "${case9_plan_c}" 5 "${case9_c_version}" 1 6 256 64 "1.0" "1.0" 0 1 true true false
    build_blob_with_binary "${case9_blob_a}" 6 "${case9_a_version}" "${PINGPONG_NOPORT_BIN}"
-   build_blob_with_binary "${case9_blob_b}" 5 "${case9_b_version}" "${PINGPONG_NOPORT_BIN}"
+   build_blob_with_binary "${case9_blob_b}" 3 "${case9_b_version}" "${PINGPONG_NOPORT_BIN}"
+   build_blob_with_binary "${case9_blob_c}" 5 "${case9_c_version}" "${PINGPONG_NOPORT_BIN}"
    run_harness_case "stateless_compaction_path" 110 \
       --deploy-plan-json="${case9_plan_a}" \
       --deploy-container-zstd="${case9_blob_a}" \
       --deploy-second-plan-json="${case9_plan_b}" \
       --deploy-second-container-zstd="${case9_blob_b}" \
       --deploy-second-start=3 \
+      --deploy-third-plan-json="${case9_plan_c}" \
+      --deploy-third-container-zstd="${case9_blob_c}" \
+      --deploy-third-start=15 \
       --deploy-skip-probe=1 \
       --deploy-report-application="Radar" \
       --deploy-report-min-healthy=1 \
+      --deploy-report-final-healthy-min=1 \
       --deploy-report-min-target=1 \
       --deploy-report-max-target-min=1
 
@@ -608,6 +636,7 @@ then
       --deploy-skip-probe=1 \
       --deploy-report-application="Hot" \
       --deploy-report-min-healthy=1 \
+      --deploy-report-final-healthy-min=1 \
       --deploy-report-min-target=3 \
       --deploy-report-max-target-min=3
 
@@ -631,28 +660,37 @@ then
       --deploy-skip-probe=1 \
       --deploy-report-application="Hot" \
       --deploy-report-min-healthy=3 \
+      --deploy-report-final-healthy-min=3 \
       --deploy-report-min-target=3 \
       --deploy-report-max-target-min=3
 
    # Case 12: stateless compaction disabled by moveableDuringCompaction=false.
    case12_a_version="$(next_version_id)"
    case12_b_version="$(next_version_id)"
+   case12_c_version="$(next_version_id)"
    case12_plan_a="${tmpdir}/case12.compaction_blocked_stateless.a.plan.json"
    case12_plan_b="${tmpdir}/case12.compaction_blocked_stateless.b.plan.json"
+   case12_plan_c="${tmpdir}/case12.compaction_blocked_stateless.c.plan.json"
    case12_blob_a="${tmpdir}/case12.compaction_blocked_stateless.a.container.zst"
    case12_blob_b="${tmpdir}/case12.compaction_blocked_stateless.b.container.zst"
-   write_stateless_plan "${case12_plan_a}" 6 "${case12_a_version}" 6 4 256 64 "1.0" "0.66" 0 1 true false
-   write_stateless_plan "${case12_plan_b}" 5 "${case12_b_version}" 1 2 256 64 "1.0" "1.0" 0 1 true true
+   case12_blob_c="${tmpdir}/case12.compaction_blocked_stateless.c.container.zst"
+   write_stateless_plan "${case12_plan_a}" 6 "${case12_a_version}" 2 3 256 64 "1.0" "0.5" 0 1 true false false
+   write_stateless_plan "${case12_plan_b}" 3 "${case12_b_version}" 1 3 256 64 "1.0" "1.0" 0 1 true false false
+   write_stateless_plan "${case12_plan_c}" 5 "${case12_c_version}" 1 6 256 64 "1.0" "1.0" 0 1 true true false
    build_blob_with_binary "${case12_blob_a}" 6 "${case12_a_version}" "${PINGPONG_NOPORT_BIN}"
-   build_blob_with_binary "${case12_blob_b}" 5 "${case12_b_version}" "${PINGPONG_ALT_BIN}"
+   build_blob_with_binary "${case12_blob_b}" 3 "${case12_b_version}" "${PINGPONG_NOPORT_BIN}"
+   build_blob_with_binary "${case12_blob_c}" 5 "${case12_c_version}" "${PINGPONG_ALT_BIN}"
    run_harness_case "stateless_compaction_blocked_nonmoveable" 120 \
       --deploy-plan-json="${case12_plan_a}" \
       --deploy-container-zstd="${case12_blob_a}" \
       --deploy-second-plan-json="${case12_plan_b}" \
       --deploy-second-container-zstd="${case12_blob_b}" \
       --deploy-second-start=3 \
-      --deploy-second-expect-accept=0 \
-      --deploy-second-expect-text="can only fit" \
+      --deploy-third-plan-json="${case12_plan_c}" \
+      --deploy-third-container-zstd="${case12_blob_c}" \
+      --deploy-third-start=3 \
+      --deploy-third-expect-accept=0 \
+      --deploy-third-expect-text="can only fit" \
       --deploy-skip-probe=1
 
    # Case 13: stateless machine lifecycle (deployed host crash -> drain + reschedule).
@@ -676,6 +714,7 @@ run_harness_case "stateless_machine_lifecycle_host_crash" 100 \
       --deploy-ping-after-fault=1 \
    --deploy-report-application="Nametag" \
    --deploy-report-min-healthy=1 \
+   --deploy-report-final-healthy-min=1 \
    --deploy-report-min-target=2 \
    --deploy-report-max-target-min=2
 
@@ -700,6 +739,7 @@ run_harness_case "stateless_machine_lifecycle_host_crash" 100 \
       --deploy-ping-after-fault=1 \
    --deploy-report-application="Hot" \
    --deploy-report-min-healthy=1 \
+   --deploy-report-final-healthy-min=1 \
    --deploy-report-min-target=3 \
    --deploy-report-max-target-min=3
 
@@ -727,6 +767,7 @@ run_harness_case "stateless_machine_lifecycle_host_crash" 100 \
       --deploy-ping-expect=pong \
       --deploy-report-application="Nametag" \
       --deploy-report-min-healthy=1 \
+      --deploy-report-final-healthy-min=1 \
       --deploy-report-min-target=1 \
       --deploy-report-max-target-min=1 \
       --deploy-report-final-target-max=1
@@ -752,6 +793,7 @@ run_harness_case "stateless_machine_lifecycle_host_crash" 100 \
       --deploy-ping-after-fault=1 \
       --deploy-report-application="Nametag" \
       --deploy-report-min-healthy=1 \
+      --deploy-report-final-healthy-min=1 \
       --deploy-report-min-target=2 \
       --deploy-report-max-target-min=2
 fi

@@ -46,6 +46,43 @@ int main(void)
    TestSuite suite;
 
    {
+      String output = {};
+      int exitStatus = -1;
+      String failure = {};
+      suite.expect(
+         prodigyRunBlockingLocalCommandCaptureStdout("printf prodigy-spawn-ok"_ctv, output, &exitStatus, &failure),
+         "machine_hardware_command_spawn_success"
+      );
+      suite.expect(output == "prodigy-spawn-ok"_ctv, "machine_hardware_command_spawn_stdout");
+      suite.expect(exitStatus == 0, "machine_hardware_command_spawn_exit_zero");
+      suite.expect(failure.size() == 0, "machine_hardware_command_spawn_success_no_failure");
+
+      output.clear();
+      exitStatus = -1;
+      failure.clear();
+      suite.expect(
+         prodigyRunBlockingLocalCommandCaptureStdout("printf prodigy-spawn-fail; exit 7"_ctv, output, &exitStatus, &failure) == false,
+         "machine_hardware_command_spawn_reports_failure"
+      );
+      suite.expect(output == "prodigy-spawn-fail"_ctv, "machine_hardware_command_spawn_failure_stdout");
+      suite.expect(exitStatus == 7, "machine_hardware_command_spawn_failure_status");
+      suite.expect(failure.size() > 0, "machine_hardware_command_spawn_failure_message");
+   }
+
+   {
+      MachineHardwareProfile hardware = {};
+      ProdigyMachineHardwareCollectorOptions options = {};
+      options.allowLocalCommands = false;
+      options.collectOptionalBenchmarks = false;
+      prodigyCollectMachineHardwareProfile(hardware, options);
+      suite.expect(hardware.cpu.logicalCores > 0, "machine_hardware_commandless_inventory_cpu");
+      suite.expect(hardware.memory.totalMB > 0, "machine_hardware_commandless_inventory_memory");
+      suite.expect(hardware.disks.empty() == false, "machine_hardware_commandless_inventory_disk");
+      suite.expect(hardware.network.nics.empty() == false, "machine_hardware_commandless_inventory_nics");
+      suite.expect(hardware.inventoryComplete, "machine_hardware_commandless_inventory_complete");
+   }
+
+   {
       const char *savedHome = std::getenv("HOME");
       const char *savedConfigHome = std::getenv("XDG_CONFIG_HOME");
       String savedHomeText = {};
@@ -242,6 +279,34 @@ int main(void)
    }
 
    {
+      const char *savedDevMode = std::getenv("PRODIGY_DEV_MODE");
+      const char *savedStorageMounts = std::getenv("PRODIGY_DEV_CONTAINER_STORAGE_MOUNTS");
+      String savedDevModeText = {};
+      String savedStorageMountsText = {};
+      if (savedDevMode != nullptr) savedDevModeText.assign(savedDevMode);
+      if (savedStorageMounts != nullptr) savedStorageMountsText.assign(savedStorageMounts);
+
+      ::unsetenv("PRODIGY_DEV_MODE");
+      ::setenv("PRODIGY_DEV_CONTAINER_STORAGE_MOUNTS", "/tmp:/var/tmp", 1);
+      Vector<MachineDiskHardwareProfile> disks = {};
+      prodigyAppendDevContainerStorageMountPaths(disks);
+      suite.expect(disks.empty(), "dev_storage_mounts_ignored_without_dev_mode");
+
+      ::setenv("PRODIGY_DEV_MODE", "1", 1);
+      ::setenv("PRODIGY_DEV_CONTAINER_STORAGE_MOUNTS", "/tmp:/tmp:relative:/var/tmp", 1);
+      prodigyAppendDevContainerStorageMountPaths(disks);
+      suite.expect(disks.size() == 2, "dev_storage_mounts_append_absolute_deduped");
+      suite.expect(disks.size() >= 1 && disks[0].mountPath == "/tmp"_ctv, "dev_storage_mounts_first_path");
+      suite.expect(disks.size() >= 2 && disks[1].mountPath == "/var/tmp"_ctv, "dev_storage_mounts_second_path");
+      suite.expect(disks.size() >= 1 && disks[0].benchmark.failure == "dev injected storage mount"_ctv, "dev_storage_mounts_mark_benchmark");
+
+      if (savedDevMode != nullptr) ::setenv("PRODIGY_DEV_MODE", savedDevModeText.c_str(), 1);
+      else ::unsetenv("PRODIGY_DEV_MODE");
+      if (savedStorageMounts != nullptr) ::setenv("PRODIGY_DEV_CONTAINER_STORAGE_MOUNTS", savedStorageMountsText.c_str(), 1);
+      else ::unsetenv("PRODIGY_DEV_CONTAINER_STORAGE_MOUNTS");
+   }
+
+   {
       MachineDiskBenchmarkProfile benchmark = {};
       suite.expect(
          prodigyParseFioBenchmarkJSON(
@@ -371,13 +436,6 @@ int main(void)
       prodigyTagInternetReachableNicSubnets(network);
       suite.expect(network.nics[0].subnets[0].internetReachable, "tag_internet_reachable_nic_subnet_marks_matching_source");
       suite.expect(network.nics[0].subnets[1].internetReachable == false, "tag_internet_reachable_nic_subnet_leaves_other_family_clear");
-   }
-
-   {
-      String command = {};
-      prodigyBuildDiskInventoryLsblkCommand(command);
-      suite.expect(prodigyStringContains(command, "lsblk -J -e7 -b"), "disk_inventory_lsblk_excludes_loop_devices");
-      suite.expect(prodigyStringContains(command, "NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,WWN,ROTA,TRAN,LOG-SEC,PHY-SEC,MOUNTPOINTS"), "disk_inventory_lsblk_keeps_required_columns");
    }
 
    {

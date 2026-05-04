@@ -46,6 +46,140 @@ public:
    }
 };
 
+static constexpr int64_t ProdigyTransportTLSNotBeforeBackdateSeconds = 300;
+
+static inline bool prodigyBackdateTransportCertificate(
+   X509 *cert,
+   EVP_PKEY *signingKey,
+   String *failure = nullptr)
+{
+   if (failure) failure->clear();
+   if (cert == nullptr || signingKey == nullptr)
+   {
+      if (failure) failure->assign("transport tls certificate and signing key required"_ctv);
+      return false;
+   }
+
+   if (X509_gmtime_adj(X509_getm_notBefore(cert), -ProdigyTransportTLSNotBeforeBackdateSeconds) == nullptr)
+   {
+      if (failure) failure->assign("failed to backdate transport tls certificate notBefore"_ctv);
+      return false;
+   }
+
+   if (X509_sign(cert, signingKey, nullptr) == 0)
+   {
+      if (failure) failure->assign("failed to resign backdated transport tls certificate"_ctv);
+      return false;
+   }
+
+   return true;
+}
+
+static inline bool prodigyGenerateTransportRootCertificateEd25519(
+   String& certPem,
+   String& keyPem,
+   String *failure = nullptr)
+{
+   certPem.clear();
+   keyPem.clear();
+   if (failure) failure->clear();
+
+   String generatedCertPem = {};
+   String generatedKeyPem = {};
+   if (Vault::generateTransportRootCertificateEd25519(generatedCertPem, generatedKeyPem, failure) == false)
+   {
+      return false;
+   }
+
+   X509 *cert = VaultPem::x509FromPem(generatedCertPem);
+   EVP_PKEY *key = VaultPem::privateKeyFromPem(generatedKeyPem);
+   bool ok = (cert != nullptr && key != nullptr);
+   if (ok == false)
+   {
+      if (failure) failure->assign("failed to parse generated transport root material"_ctv);
+   }
+   if (ok)
+   {
+      ok = prodigyBackdateTransportCertificate(cert, key, failure);
+   }
+   if (ok)
+   {
+      ok = VaultPem::x509ToPem(cert, certPem);
+      if (ok == false && failure) failure->assign("failed to serialize backdated transport root certificate"_ctv);
+   }
+
+   if (cert) X509_free(cert);
+   if (key) EVP_PKEY_free(key);
+
+   if (ok == false)
+   {
+      certPem.clear();
+      keyPem.clear();
+      return false;
+   }
+
+   keyPem = generatedKeyPem;
+   return true;
+}
+
+static inline bool prodigyGenerateTransportNodeCertificateEd25519(
+   const String& rootCertPem,
+   const String& rootKeyPem,
+   uint128_t uuid,
+   const Vector<String>& ipAddresses,
+   String& certPem,
+   String& keyPem,
+   String *failure = nullptr)
+{
+   certPem.clear();
+   keyPem.clear();
+   if (failure) failure->clear();
+
+   String generatedCertPem = {};
+   String generatedKeyPem = {};
+   if (Vault::generateTransportNodeCertificateEd25519(
+         rootCertPem,
+         rootKeyPem,
+         uuid,
+         ipAddresses,
+         generatedCertPem,
+         generatedKeyPem,
+         failure) == false)
+   {
+      return false;
+   }
+
+   X509 *cert = VaultPem::x509FromPem(generatedCertPem);
+   EVP_PKEY *rootKey = VaultPem::privateKeyFromPem(rootKeyPem);
+   bool ok = (cert != nullptr && rootKey != nullptr);
+   if (ok == false)
+   {
+      if (failure) failure->assign("failed to parse generated transport node material"_ctv);
+   }
+   if (ok)
+   {
+      ok = prodigyBackdateTransportCertificate(cert, rootKey, failure);
+   }
+   if (ok)
+   {
+      ok = VaultPem::x509ToPem(cert, certPem);
+      if (ok == false && failure) failure->assign("failed to serialize backdated transport node certificate"_ctv);
+   }
+
+   if (cert) X509_free(cert);
+   if (rootKey) EVP_PKEY_free(rootKey);
+
+   if (ok == false)
+   {
+      certPem.clear();
+      keyPem.clear();
+      return false;
+   }
+
+   keyPem = generatedKeyPem;
+   return true;
+}
+
 template <typename S>
 static void serialize(S&& serializer, ProdigyTransportTLSMaterial& material)
 {

@@ -21,39 +21,39 @@ class BrainView;
 
 enum class MachineState : uint8_t {
 
-	deploying,
-	unknown,
-	healthy,
-	missing,
-	unresponsive,
-	neuronRebooting,
-	hardRebooting,
-	updatingOS,
-	hardwareFailure,
-	unreachable,
-	decommissioning
+   deploying,
+   unknown,
+   healthy,
+   missing,
+   unresponsive,
+   neuronRebooting,
+   hardRebooting,
+   updatingOS,
+   hardwareFailure,
+   unreachable,
+   decommissioning
 };
 
 class NeuronView : public RingInterface, public ProdigyTransportTLSStream, public CoroutineStack, public Reconnector {
 public:
 
-	Machine *machine = nullptr;
-	bool connected = false;
-	bool hadSuccessfulConnection = false;
+   Machine *machine = nullptr;
+   bool connected = false;
+   bool hadSuccessfulConnection = false;
 
-	void reset(void) override
-	{
-		ProdigyTransportTLSStream::reset();
-		Reconnector::reset();
-		connected = false;
-		hadSuccessfulConnection = false;
-	}
+   void reset(void) override
+   {
+      ProdigyTransportTLSStream::reset();
+      Reconnector::reset();
+      connected = false;
+      hadSuccessfulConnection = false;
+   }
 };
 
 enum class SSHAction : uint8_t {
 
-	restartProdigy,
-	updateNeuron
+   restartProdigy,
+   updateNeuron
 };
 
 static inline void prodigyResolveMachineRestartSSHCredentials(const Machine *machine, String& user, String& privateKeyPath);
@@ -61,39 +61,39 @@ static inline void prodigyResolveMachineRestartSSHCredentials(const Machine *mac
 class MachineSSH : public SSHClient, public Reconnector {
 public:
 
-	Machine *machine = nullptr;
+   Machine *machine = nullptr;
    const Vault::SSHKeyPackage *bootstrapSshKeyPackage = nullptr;
    const String *bootstrapSshPrivateKeyPath = nullptr;
 
-	SSHAction action;
-	stdext::inplace_function<void(), 128> callback;
+   SSHAction action;
+   stdext::inplace_function<void(), 128> callback;
 
-	void reset(void) override
-	{
-		SSHClient::reset();
-		Reconnector::reset();
-	}
+   void reset(void) override
+   {
+      SSHClient::reset();
+      Reconnector::reset();
+   }
 
-	void restartProdigy(void);
+   void restartProdigy(void);
 
-	void registerAction(SSHAction thisAction, stdext::inplace_function<void(), 128>&& thisCallback)
-	{
-		action = thisAction;
-		callback = std::move(thisCallback);
-	}
+   void registerAction(SSHAction thisAction, stdext::inplace_function<void(), 128>&& thisCallback)
+   {
+      action = thisAction;
+      callback = std::move(thisCallback);
+   }
 
-	void execute(void)
-	{
-		switch (action)
-		{
-			case SSHAction::restartProdigy:
-			{
-				restartProdigy();
-				break;
-			}
-			default: break;
-		}
-	}
+   void execute(void)
+   {
+      switch (action)
+      {
+         case SSHAction::restartProdigy:
+         {
+            restartProdigy();
+            break;
+         }
+         default: break;
+      }
+   }
 };
 
 class MachineTicket;
@@ -102,93 +102,101 @@ class ContainerView;
 class MachineBase {
 public:
 
-	uint32_t private4 = 0;
-	uint32_t gatewayPrivate4 = 0;
+   uint32_t private4 = 0;
+   uint32_t gatewayPrivate4 = 0;
 };
 
 class Machine : public MachineBase {
 public:
 
-	struct Claim {
+   struct Claim {
 
-		MachineTicket *ticket;
-		uint32_t nFit;						// if stateless
-		Vector<uint32_t> shardGroups; // if stateful
+      MachineTicket *ticket;
+      uint32_t nFit;						// if stateless
+      Vector<uint32_t> shardGroups; // if stateful
+      Vector<uint32_t> placementTopologyEpochs;
       uint32_t reservedIsolatedLogicalCoresPerInstance = 0;
       uint32_t reservedSharedCPUMillisPerInstance = 0;
       uint32_t reservedMemoryMBPerInstance = 0;
       uint32_t reservedStorageMBPerInstance = 0;
+      uint32_t reservedIsolatedLogicalCoresTotal = 0;
+      uint32_t reservedSharedCPUMillisTotal = 0;
+      uint32_t reservedMemoryMBTotal = 0;
+      uint32_t reservedStorageMBTotal = 0;
       Vector<uint32_t> reservedGPUMemoryMBs;
       Vector<AssignedGPUDevice> reservedGPUDevices;
-	};
+   };
 
-	String slug;
-	MachineLifetime lifetime;
-	MachineState state;
-	String type;
+   String slug;
+   MachineLifetime lifetime;
+   MachineState state;
+   String type;
     String cloudID; // cloud provider resource identifier used by IaaS APIs
-	uint8_t topologySource = 0; // ClusterMachineSource
-	String region;
-	String zone;
-	String sshAddress;
-	uint16_t sshPort = 22;
-	String sshUser;
-	String sshPrivateKeyPath;
+   uint8_t topologySource = 0; // ClusterMachineSource
+   String region;
+   String zone;
+   String sshAddress;
+   uint16_t sshPort = 22;
+   String sshUser;
+   String sshPrivateKeyPath;
    String sshHostPublicKeyOpenSSH;
-	String publicAddress;
-	String privateAddress;
+   String publicAddress;
+   String privateAddress;
    Vector<ClusterMachinePeerAddress> peerAddresses;
-	uint8_t ownershipMode = 0; // ClusterMachineOwnershipMode
-	uint32_t ownershipLogicalCoresCap = 0;
-	uint32_t ownershipMemoryMBCap = 0;
-	uint32_t ownershipStorageMBCap = 0;
-	uint16_t ownershipLogicalCoresBasisPoints = 0;
-	uint16_t ownershipMemoryBasisPoints = 0;
-	uint16_t ownershipStorageBasisPoints = 0;
-	uint32_t totalLogicalCores = 0;
-	uint32_t totalMemoryMB = 0;
-	uint32_t totalStorageMB = 0;
-	MachineHardwareProfile hardware;
+   uint8_t ownershipMode = 0; // ClusterMachineOwnershipMode
+   uint32_t ownershipLogicalCoresCap = 0;
+   uint32_t ownershipMemoryMBCap = 0;
+   uint32_t ownershipStorageMBCap = 0;
+   uint16_t ownershipLogicalCoresBasisPoints = 0;
+   uint16_t ownershipMemoryBasisPoints = 0;
+   uint16_t ownershipStorageBasisPoints = 0;
+   uint32_t totalLogicalCores = 0;
+   uint32_t totalMemoryMB = 0;
+   uint32_t totalStorageMB = 0;
+   MachineHardwareProfile hardware;
    bool hasInternetAccess = false;
-	uint32_t ownedLogicalCores = 0;
-	uint32_t ownedMemoryMB = 0;
-	uint32_t ownedStorageMB = 0;
+   uint32_t ownedLogicalCores = 0;
+   uint32_t ownedMemoryMB = 0;
+   uint32_t ownedStorageMB = 0;
    Vector<uint32_t> availableGPUMemoryMBs;
    Vector<uint32_t> availableGPUHardwareIndexes;
 
-	uint128_t uuid = 0; // this will match neuron uuid if isThisMachine
-	uint32_t rackUUID = 0;
-	Rack *rack = nullptr; // we could always change this to a uuid if we wanted to, we at least have to serialize it that way
+   uint128_t uuid = 0; // this will match neuron uuid if isThisMachine
+   uint32_t rackUUID = 0;
+   Rack *rack = nullptr; // we could always change this to a uuid if we wanted to, we at least have to serialize it that way
 
-	int64_t creationTimeMs = 0;
-    // Reported Clear Linux VERSION_ID (from neuron registration)
-    uint32_t clearVersion = 0;
+   int64_t creationTimeMs = 0;
+    // Reported os-release metadata from neuron registration.
+    String osID;
+    String osVersionID;
     // Current VM image reference if known (IaaS-specific discovery)
     String currentImageURI;
-	// Connectivity/maintenance tracking used by Brain health and update flows.
-	uint32_t brainConnectFailStreak = 0;
-	uint32_t neuronConnectFailStreak = 0;
-	int64_t lastNeuronFailMs = 0;
-	uint32_t sshRestartAttempts = 0;
-	int64_t lastSshAttemptMs = 0;
-	int64_t lastUpdatedOSMs = 0;
-	uint32_t hardRebootAttempts = 0;
-	int64_t lastHardRebootMs = 0;
-	TimeoutPacket *softWatchdog = nullptr;
-	TimeoutPacket *hardRebootWatchdog = nullptr;
-	bool inBinaryUpdate = false;
-	String kernel;
+   // Connectivity/maintenance tracking used by Brain health and update flows.
+   uint32_t brainConnectFailStreak = 0;
+   uint32_t neuronConnectFailStreak = 0;
+   int64_t lastNeuronFailMs = 0;
+   uint32_t sshRestartAttempts = 0;
+   int64_t lastSshAttemptMs = 0;
+      int64_t lastUpdatedOSMs = 0;
+      bool osUpdateCommandIssued = false;
+      uint32_t hardRebootAttempts = 0;
+   int64_t lastHardRebootMs = 0;
+   TimeoutPacket *softWatchdog = nullptr;
+   TimeoutPacket *hardRebootWatchdog = nullptr;
+   TimeoutPacket *osUpdateCommandWatchdog = nullptr;
+   bool inBinaryUpdate = false;
+   String kernel;
 
-	bool isBrain = false; // iaas will flip this, and then we need to match the brain
-	BrainView *brain = nullptr;
-	NeuronView neuron;
+   bool isBrain = false; // iaas will flip this, and then we need to match the brain
+   BrainView *brain = nullptr;
+   NeuronView neuron;
 
-	bool isThisMachine = false;
+   bool isThisMachine = false;
 
-	String hardwareFailureReport;
+   String hardwareFailureReport;
 
-	// so if this machine dies, we can unwind
-	bytell_hash_subvector<uint64_t, ContainerView *> containersByDeploymentID;
+   // so if this machine dies, we can unwind
+   bytell_hash_subvector<uint64_t, ContainerView *> containersByDeploymentID;
 
    // Machine-local networking addresses containers by an 8-bit fragment.
    static constexpr uint32_t maxSchedulableContainers = 256u;
@@ -277,84 +285,88 @@ public:
       return uint32_t(availableGPUMemoryMBs.size());
    }
 
-	void removeContainerIndexEntry(uint64_t deploymentID, ContainerView *container)
-	{
-		if (container == nullptr)
-		{
-			return;
-		}
+   void removeContainerIndexEntry(uint64_t deploymentID, ContainerView *container)
+   {
+      if (container == nullptr)
+      {
+         return;
+      }
 
-		while (containersByDeploymentID.eraseEntry(deploymentID, container)) {}
+      while (containersByDeploymentID.eraseEntry(deploymentID, container)) {}
 
-		if (auto it = containersByDeploymentID.find(deploymentID); it != containersByDeploymentID.end() && it->second.size() == 0)
-		{
-			containersByDeploymentID.erase(deploymentID);
-		}
-	}
+      if (auto it = containersByDeploymentID.find(deploymentID); it != containersByDeploymentID.end() && it->second.size() == 0)
+      {
+         containersByDeploymentID.erase(deploymentID);
+      }
+   }
 
-	void upsertContainerIndexEntry(uint64_t deploymentID, ContainerView *container)
-	{
-		if (container == nullptr)
-		{
-			return;
-		}
+   void upsertContainerIndexEntry(uint64_t deploymentID, ContainerView *container)
+   {
+      if (container == nullptr)
+      {
+         return;
+      }
 
-		removeContainerIndexEntry(deploymentID, container);
-		containersByDeploymentID.insert(deploymentID, container);
-	}
+      removeContainerIndexEntry(deploymentID, container);
+      containersByDeploymentID.insert(deploymentID, container);
+   }
 
-	// available for scheduling
-	// allow these to go negative so that during compaction we can charge a machine for resources before the existing container is destroyed
+   // available for scheduling
+   // allow these to go negative so that during compaction we can charge a machine for resources before the existing container is destroyed
    uint32_t isolatedLogicalCoresCommitted = 0;
    uint32_t sharedCPUMillisCommitted = 0;
    int32_t nLogicalCores_available = 0;
    int32_t sharedCPUMillis_available = 0;
    int32_t memoryMB_available = 0;
-   int32_t storageMB_available = 0; 
+   int32_t storageMB_available = 0;
 
    Vector<Claim> claims; // while waiting for machine to be deployed and become healthy
 
-	uint32_t fragment = 0;
-	bytell_hash_set<uint32_t> usedContainerFragments;
+   uint32_t fragment = 0;
+   uint8_t reportedDatacenterFragment = 0;
+   uint32_t reportedFragment = 0;
+   bool runtimeReady = false;
+   bytell_hash_set<uint32_t> usedContainerFragments;
 
-	uint8_t getContainerFragment(void)
-	{
-		uint8_t fragment = 0;
+   uint8_t getContainerFragment(void)
+   {
+      uint8_t fragment = 0;
 
-		do
-		{
-			fragment = Random::generateNumberWithNBits<8, uint8_t>();
+      do
+      {
+         fragment = Random::generateNumberWithNBits<8, uint8_t>();
 
-		} while (usedContainerFragments.contains(fragment));
+      } while (usedContainerFragments.contains(fragment));
 
-		usedContainerFragments.insert(fragment);
+      usedContainerFragments.insert(fragment);
 
-		return fragment;
-	}
+      return fragment;
+   }
 
-	void relinquishContainerFragment(uint8_t fragment)
-	{
-		usedContainerFragments.erase(fragment);
-	}
+   void relinquishContainerFragment(uint8_t fragment)
+   {
+      usedContainerFragments.erase(fragment);
+   }
 
    template <typename... Args>
-	void queueSend(NeuronTopic topic, Args&&... args)
-	{
-		Message::construct(neuron.wBuffer, topic, std::forward<Args>(args)...);
-		Ring::queueSend(&neuron);
-	}
+   void queueSend(NeuronTopic topic, Args&&... args)
+   {
+      Message::construct(neuron.wBuffer, topic, std::forward<Args>(args)...);
+      Ring::queueSend(&neuron);
+   }
 
-  // explicit OS update hook retained for compatibility with brain orchestration paths.
-	void triggerOSUpdate(void)
-	{
-		state = MachineState::updatingOS;
-	}
+     // explicit OS update hook retained for compatibility with brain orchestration paths.
+      void triggerOSUpdate(void)
+      {
+         state = MachineState::updatingOS;
+         osUpdateCommandIssued = false;
+      }
 
-	Machine()
-	{
-		neuron.rBuffer.reserve(8_KB);
-		neuron.wBuffer.reserve(16_KB);
-	}
+   Machine()
+   {
+      neuron.rBuffer.reserve(8_KB);
+      neuron.wBuffer.reserve(16_KB);
+   }
 };
 
 static inline void prodigyResolveMachineRestartSSHCredentials(const Machine *machine, String& user, String& privateKeyPath)

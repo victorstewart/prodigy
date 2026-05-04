@@ -7,6 +7,9 @@ PINGPONG_BIN="${3:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARNESS="${SCRIPT_DIR}/prodigy_dev_netns_harness.sh"
+source "${SCRIPT_DIR}/prodigy_dev_discombobulator_artifact_helpers.sh"
+SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+prodigy_dev_reexec_in_private_mount_namespace_once PRODIGY_DEV_CONTAINER_MIGRATION_MATRIX_MOUNT_NS_READY bash "${SCRIPT_SELF}" "$@"
 
 if [[ -z "${PRODIGY_BIN}" || -z "${MOTHERSHIP_BIN}" || -z "${PINGPONG_BIN}" ]]
 then
@@ -44,7 +47,7 @@ then
    exit 1
 fi
 
-deps=(awk btrfs mkfs.btrfs mount umount stat zstd ldd install timeout ip rg)
+deps=(awk btrfs cargo mkfs.btrfs mount umount stat zstd timeout ip rg)
 for cmd in "${deps[@]}"
 do
    if ! command -v "${cmd}" >/dev/null 2>&1
@@ -57,15 +60,13 @@ done
 PRODIGY_BIN="$(readlink -f "${PRODIGY_BIN}" 2>/dev/null || printf '%s' "${PRODIGY_BIN}")"
 MOTHERSHIP_BIN="$(readlink -f "${MOTHERSHIP_BIN}" 2>/dev/null || printf '%s' "${MOTHERSHIP_BIN}")"
 PINGPONG_BIN="$(readlink -f "${PINGPONG_BIN}" 2>/dev/null || printf '%s' "${PINGPONG_BIN}")"
+target_arch="$(prodigy_dev_detect_target_arch)"
 
 tmpdir="$(mktemp -d)"
 export TMPDIR="${tmpdir}"
 containers_dir_created=0
 containers_mount_created=0
 containers_loop_image=""
-host_pingpong_path="/root/pingpong_container"
-host_pingpong_backup=""
-active_subvol=""
 case_plan_json=""
 case_container_blob=""
 failed_cases=0
@@ -74,19 +75,6 @@ total_cases=0
 cleanup()
 {
    set +e
-
-   if [[ -n "${active_subvol}" && -e "${active_subvol}" ]]
-   then
-      btrfs property set -f "${active_subvol}" ro false >/dev/null 2>&1 || true
-      btrfs subvolume delete "${active_subvol}" >/dev/null 2>&1 || true
-   fi
-
-   if [[ -n "${host_pingpong_backup}" && -f "${host_pingpong_backup}" ]]
-   then
-      install -m 0755 "${host_pingpong_backup}" "${host_pingpong_path}" >/dev/null 2>&1 || true
-   else
-      rm -f "${host_pingpong_path}" >/dev/null 2>&1 || true
-   fi
 
    if [[ "${containers_mount_created}" -eq 1 ]]
    then
@@ -122,9 +110,9 @@ then
       exit 1
    fi
 
-   if [[ -n "$(ls -A /containers 2>/dev/null)" ]]
+   if ! prodigy_dev_containers_root_is_safely_overmountable /containers
    then
-      echo "FAIL: /containers exists on non-btrfs fs and is not empty"
+      echo "FAIL: /containers exists on non-btrfs fs and is not safely overmountable"
       exit 1
    fi
 
@@ -137,37 +125,8 @@ fi
 
 mkdir -p /containers/store /containers/storage
 
-if [[ -e "${host_pingpong_path}" ]]
-then
-   host_pingpong_backup="${tmpdir}/pingpong_container.host.backup"
-   cp -f "${host_pingpong_path}" "${host_pingpong_backup}"
-fi
-install -m 0755 "${PINGPONG_BIN}" "${host_pingpong_path}"
-
 application_id=6 # MeshRegistry::Nametag::applicationID
 ping_port=19090
-
-stream_subvolume_blob()
-{
-   local subvol_path="$1"
-   local out_blob="$2"
-   local max_attempts="${3:-3}"
-
-   local attempt=0
-   for attempt in $(seq 1 "${max_attempts}")
-   do
-      rm -f "${out_blob}" >/dev/null 2>&1 || true
-      if btrfs send "${subvol_path}" | zstd -19 -T0 -q -o "${out_blob}"
-      then
-         return 0
-      fi
-
-      sleep 0.2
-   done
-
-   echo "FAIL: unable to stream subvolume to blob after retries: ${subvol_path}"
-   return 1
-}
 
 build_case_artifacts_once()
 {
@@ -179,46 +138,8 @@ build_case_artifacts_once()
    then
       version_id=1
    fi
-   local deployment_id=$(( (application_id << 48) | version_id ))
-
-   active_subvol="/containers/${deployment_id}"
-   if [[ -e "${active_subvol}" ]]
-   then
-      btrfs property set -f "${active_subvol}" ro false >/dev/null 2>&1 || true
-      btrfs subvolume delete "${active_subvol}" >/dev/null 2>&1 || true
-      rm -rf "${active_subvol}" >/dev/null 2>&1 || true
-   fi
-
-   if ! btrfs subvolume create "${active_subvol}" >/dev/null
-   then
-      echo "FAIL: unable to create subvolume: ${active_subvol}"
-      return 1
-   fi
-
-   mkdir -p "${active_subvol}/root" "${active_subvol}/etc"
-   install -m 0755 "${PINGPONG_BIN}" "${active_subvol}/root/pingpong_container"
-
-   while IFS= read -r libpath
-   do
-      if [[ -z "${libpath}" ]]
-      then
-         continue
-      fi
-
-      if [[ -e "${libpath}" ]]
-      then
-         cp -aL --parents "${libpath}" "${active_subvol}"
-      fi
-   done < <(
-      ldd "${PINGPONG_BIN}" | awk '
-         /=>/ {
-            if ($3 ~ /^\//) print $3;
-         }
-         /^[[:space:]]*\// {
-            print $1;
-         }
-      ' | sort -u
-   )
+   local project_dir="${tmpdir}/${case_name}.artifact"
+   local discombobulator_file="${project_dir}/PingPong.DiscombobuFile"
 
    case_plan_json="${tmpdir}/${case_name}.plan.json"
    if [[ "${case_kind}" == "stateful" ]]
@@ -229,6 +150,7 @@ build_case_artifacts_once()
     "type": "ApplicationType::stateful",
     "applicationID": ${application_id},
     "versionID": ${version_id},
+    "architecture": "${target_arch}",
     "filesystemMB": 64,
     "storageMB": 64,
     "memoryMB": 256,
@@ -237,6 +159,7 @@ build_case_artifacts_once()
     "sTilHealthcheck": 3,
     "sTilKillable": 30
   },
+  "useHostNetworkNamespace": true,
   "minimumSubscriberCapacity": 1024,
   "isStateful": true,
   "stateful": {
@@ -261,6 +184,7 @@ EOF
     "type": "ApplicationType::stateless",
     "applicationID": ${application_id},
     "versionID": ${version_id},
+    "architecture": "${target_arch}",
     "filesystemMB": 64,
     "storageMB": 64,
     "memoryMB": 256,
@@ -269,6 +193,7 @@ EOF
     "sTilHealthcheck": 3,
     "sTilKillable": 30
   },
+  "useHostNetworkNamespace": true,
   "minimumSubscriberCapacity": 1024,
 	  "isStateful": false,
 	  "stateless": {
@@ -284,40 +209,24 @@ EOF
    fi
 
    case_container_blob="${tmpdir}/${case_name}.container.zst"
-   if ! btrfs property set -f "${active_subvol}" ro true >/dev/null
-   then
-      echo "FAIL: unable to mark subvolume readonly: ${active_subvol}"
-      btrfs property set -f "${active_subvol}" ro false >/dev/null 2>&1 || true
-      btrfs subvolume delete "${active_subvol}" >/dev/null 2>&1 || true
-      active_subvol=""
-      return 1
-   fi
+   rm -rf "${project_dir}" >/dev/null 2>&1 || true
+   mkdir -p "${project_dir}"
+   cat > "${discombobulator_file}" <<EOF
+FROM scratch for ${target_arch}
+COPY {bin} ./$(basename "${PINGPONG_BIN}") /root/pingpong_container
+SURVIVE /root/pingpong_container
+EOF
+   prodigy_dev_write_common_prodigy_assets "${discombobulator_file}"
+   cat >> "${discombobulator_file}" <<'EOF'
+EXECUTE ["/root/pingpong_container"]
+EOF
 
-   if ! stream_subvolume_blob "${active_subvol}" "${case_container_blob}" 3
-   then
-      btrfs property set -f "${active_subvol}" ro false >/dev/null 2>&1 || true
-      btrfs subvolume delete "${active_subvol}" >/dev/null 2>&1 || true
-      active_subvol=""
-      return 1
-   fi
-
-   if ! btrfs property set -f "${active_subvol}" ro false >/dev/null
-   then
-      echo "FAIL: unable to clear readonly property: ${active_subvol}"
-      btrfs subvolume delete "${active_subvol}" >/dev/null 2>&1 || true
-      active_subvol=""
-      return 1
-   fi
-
-   if ! btrfs subvolume delete "${active_subvol}" >/dev/null
-   then
-      echo "FAIL: unable to delete subvolume after streaming: ${active_subvol}"
-      active_subvol=""
-      return 1
-   fi
-
-   active_subvol=""
-   return 0
+   prodigy_dev_run_discombobulator_build \
+      "${project_dir}" \
+      "${discombobulator_file}" \
+      "${case_container_blob}" \
+      "bin=$(dirname "${PINGPONG_BIN}")" \
+      "ebpf=$(dirname "${PRODIGY_BIN}")"
 }
 
 build_case_artifacts()
@@ -367,7 +276,7 @@ count_spin_lines_for_brain()
    local idx="$2"
    local total=0
 
-   for log_path in "${preserved_tmpdir}/brain${idx}.start"*.stdout.log
+   for log_path in "${preserved_tmpdir}/logs/brain${idx}.start"*.stdout.log
    do
       if [[ ! -f "${log_path}" ]]
       then

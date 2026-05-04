@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <utility>
 #include <sys/stat.h>
 #include <sys/file.h>
 
@@ -25,6 +26,23 @@ static ProdigyPersistentBrainSnapshot persistedBrainSnapshot;
 static ProdigyPersistentLocalBrainState persistentLocalBrainState;
 static bool havePersistedBrainSnapshot = false;
 static ProdigyBootstrapConfig effectiveBootstrapConfig;
+
+static bool prodigyRuntimeTraceEnabled(void)
+{
+   const char *value = std::getenv("PRODIGY_RUNTIME_TRACE");
+   return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+template<typename... Args>
+static void prodigyRuntimeTrace(const char *format, Args&&... args)
+{
+   if (prodigyRuntimeTraceEnabled() == false)
+   {
+      return;
+   }
+
+   basics_log(format, std::forward<Args>(args)...);
+}
 
 static bool prodigyReadTextFile(const String& path, String& content, String& failure)
 {
@@ -190,6 +208,11 @@ static ClusterTopology prodigyCaptureClusterTopology(const Brain& brain, const C
       clusterMachine.ssh.user = machine->sshUser;
       clusterMachine.ssh.privateKeyPath = machine->sshPrivateKeyPath;
       clusterMachine.ssh.hostPublicKeyOpenSSH = machine->sshHostPublicKeyOpenSSH;
+      clusterMachine.peerAddresses.clear();
+      for (const ClusterMachinePeerAddress& candidate : machine->peerAddresses)
+      {
+         prodigyAppendUniqueClusterMachinePeerAddress(clusterMachine.peerAddresses, candidate);
+      }
       prodigyAssignClusterMachineAddressesFromPeerCandidates(clusterMachine.addresses, machine->peerAddresses);
       prodigyAppendUniqueClusterMachineAddress(clusterMachine.addresses.publicAddresses, machine->publicAddress);
       String privateGateway = {};
@@ -393,7 +416,7 @@ static bool loadProdigyStartupState(const String& bootJSON, String& failure)
       return false;
    }
 
-   if (havePersistedBrainSnapshot && explicitBootJSON == false)
+   if (havePersistedBrainSnapshot)
    {
       prodigyReplaceCachedBrainSnapshot(persistedBrainSnapshot, std::move(storedBrainSnapshot));
       prodigyStripMachineHardwareCapturesFromClusterTopology(persistedBrainSnapshot.topology);
@@ -586,7 +609,7 @@ static bool loadOrUpdateLocalBrainState(const String& transportTLSJSONPath, Stri
 
       if (rootCertPem.size() == 0 || rootKeyPem.size() == 0)
       {
-         if (Vault::generateTransportRootCertificateEd25519(rootCertPem, rootKeyPem, &failure) == false)
+         if (prodigyGenerateTransportRootCertificateEd25519(rootCertPem, rootKeyPem, &failure) == false)
          {
             (void)flock(lockFD, LOCK_UN);
             close(lockFD);
@@ -608,7 +631,7 @@ static bool loadOrUpdateLocalBrainState(const String& transportTLSJSONPath, Stri
 
       String localCertPem = {};
       String localKeyPem = {};
-      if (Vault::generateTransportNodeCertificateEd25519(
+      if (prodigyGenerateTransportNodeCertificateEd25519(
             rootCertPem,
             rootKeyPem,
             state.uuid,
@@ -633,8 +656,13 @@ static bool loadOrUpdateLocalBrainState(const String& transportTLSJSONPath, Stri
       return true;
    };
 
+   const uint32_t startupClusterNodeCount =
+      prodigyResolveStartupClusterNodeCount(persistentBootState, effectiveBootstrapConfig);
+   const bool startupRequiresTransportTLS =
+      prodigyStartupRequiresTransportTLS(persistentBootState, effectiveBootstrapConfig);
+
    if (state.transportTLSConfigured() == false
-      && effectiveBootstrapConfig.bootstrapPeers.size() > 1)
+      && startupRequiresTransportTLS)
    {
       if (configureSharedDevTransportTLS())
       {
@@ -648,11 +676,11 @@ static bool loadOrUpdateLocalBrainState(const String& transportTLSJSONPath, Stri
 
    if (state.transportTLSConfigured() == false
       && persistentBootState.bootstrapConfig.nodeRole == ProdigyBootstrapNodeRole::brain
-      && effectiveBootstrapConfig.bootstrapPeers.size() <= 1)
+      && startupClusterNodeCount <= 1)
    {
       String rootCertPem = {};
       String rootKeyPem = {};
-      if (Vault::generateTransportRootCertificateEd25519(rootCertPem, rootKeyPem, &failure) == false)
+      if (prodigyGenerateTransportRootCertificateEd25519(rootCertPem, rootKeyPem, &failure) == false)
       {
          return false;
       }
@@ -660,7 +688,7 @@ static bool loadOrUpdateLocalBrainState(const String& transportTLSJSONPath, Stri
       Vector<String> addresses;
       String localCertPem = {};
       String localKeyPem = {};
-      if (Vault::generateTransportNodeCertificateEd25519(rootCertPem, rootKeyPem, state.uuid, addresses, localCertPem, localKeyPem, &failure) == false)
+      if (prodigyGenerateTransportNodeCertificateEd25519(rootCertPem, rootKeyPem, state.uuid, addresses, localCertPem, localKeyPem, &failure) == false)
       {
          return false;
       }
@@ -687,7 +715,7 @@ static bool loadOrUpdateLocalBrainState(const String& transportTLSJSONPath, Stri
          return false;
       }
    }
-   else if (effectiveBootstrapConfig.bootstrapPeers.size() > 1)
+   else if (startupRequiresTransportTLS)
    {
       failure.assign("transport tls state required for multi-node cluster startup"_ctv);
       return false;
@@ -994,6 +1022,18 @@ public:
       prodigyRuntimeTrace("prodigy persist local-runtime-end\n");
    }
 
+   bool prepareForBundleExec(String& failure) override
+   {
+      if (persistentStateStore.saveLocalBrainState(persistentLocalBrainState, &failure) == false)
+      {
+         return false;
+      }
+
+      persistentStateStore.close();
+      failure.clear();
+      return true;
+   }
+
    ProdigyBrain()
    {
       if (havePersistedBrainSnapshot)
@@ -1053,6 +1093,34 @@ public:
    {
       iaas = new RuntimeAwareNeuronIaaS(&persistentStateStore, effectiveBootstrapConfig, persistentBootState);
    }
+
+   bool startOperatingSystemUpdate(const String& targetOSID, const String& targetOSVersionID, const String& updateCommand, String *failure = nullptr) override
+   {
+      String targetOSIDText = {};
+      String targetOSVersionIDText = {};
+      String updateCommandText = {};
+      targetOSIDText.assign(targetOSID);
+      targetOSVersionIDText.assign(targetOSVersionID);
+      updateCommandText.assign(updateCommand);
+
+      if (targetOSIDText.size() == 0 || targetOSVersionIDText.size() == 0 || updateCommandText.size() == 0)
+      {
+         return Neuron::startOperatingSystemUpdate(targetOSIDText, targetOSVersionIDText, updateCommandText, failure);
+      }
+
+      String localFailure = {};
+      if (persistentStateStore.saveLocalBrainState(persistentLocalBrainState, &localFailure) == false)
+      {
+         if (failure) *failure = localFailure;
+         return false;
+      }
+
+      persistentStateStore.close();
+      basics_log("os update persistent state sealed targetOSID=%s targetOSVersionID=%s\n",
+         targetOSIDText.c_str(),
+         targetOSVersionIDText.c_str());
+      return Neuron::startOperatingSystemUpdate(targetOSIDText, targetOSVersionIDText, updateCommandText, failure);
+   }
 };
 
 int main(int argc, char *argv[])
@@ -1105,6 +1173,12 @@ int main(int argc, char *argv[])
       return EXIT_FAILURE;
    }
 
+   if (prodigyEnforceDevHostNetnsIsolation(failure) == false)
+   {
+      std::fprintf(stderr, "%s\n", failure.c_str());
+      return EXIT_FAILURE;
+   }
+
    if (loadProdigyStartupState(bootJSON, failure) == false)
    {
       std::fprintf(stderr, "failed to load prodigy startup state: %s\n", failure.c_str());
@@ -1152,12 +1226,6 @@ int main(int argc, char *argv[])
       (void)std::fputc('\n', stdout);
       (void)std::fflush(stdout);
       return EXIT_SUCCESS;
-   }
-
-   if (prodigyEnforceDevHostNetnsIsolation(failure) == false)
-   {
-      std::fprintf(stderr, "%s\n", failure.c_str());
-      return EXIT_FAILURE;
    }
 
    setenv("PRODIGY_MOTHERSHIP_SOCKET", effectiveBootstrapConfig.controlSocketPath.c_str(), 1);

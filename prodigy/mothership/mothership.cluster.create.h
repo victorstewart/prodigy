@@ -245,8 +245,12 @@ static inline bool mothershipBuildClusterBrainConfig(const MothershipProdigyClus
    config.bootstrapSshHostKeyPackage = cluster.bootstrapSshHostKeyPackage;
    config.bootstrapSshPrivateKeyPath = cluster.bootstrapSshPrivateKeyPath;
    config.remoteProdigyPath = cluster.remoteProdigyPath;
+   config.osUpdatesEnabled = cluster.osUpdatesEnabled;
+   config.osUpdatePolicies = cluster.osUpdatePolicies;
+   config.maxOSDrains = cluster.maxOSDrains > 0 ? cluster.maxOSDrains : 1;
+   config.machineUpdateCadenceMins = cluster.machineUpdateCadenceMins > 0 ? cluster.machineUpdateCadenceMins : 15;
 
-   if (mothershipResolveClusterControlSocketPath(cluster, config.controlSocketPath, failure) == false)
+	   if (mothershipResolveClusterControlSocketPath(cluster, config.controlSocketPath, failure) == false)
    {
       return false;
    }
@@ -696,7 +700,7 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
       }
 
       ClusterTopology topology = {};
-      constexpr uint32_t topologyFetchAttempts = 200;
+      constexpr uint32_t topologyFetchAttempts = 600;
       constexpr useconds_t topologyFetchRetrySleepUs = 100 * 1000;
       uint32_t fetchedMachines = 0;
       uint32_t fetchedBrains = 0;

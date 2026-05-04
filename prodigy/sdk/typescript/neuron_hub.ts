@@ -305,7 +305,9 @@ export const ContainerTopic =
    DatacenterUniqueTag: 9,
    Statistics: 10,
    ResourceDeltaAck: 11,
-   CredentialsRefresh: 12
+   CredentialsRefresh: 12,
+   WormholesRefresh: 13,
+   RuntimeReady: 14
 } as const
 
 export type ContainerTopic = (typeof ContainerTopic)[keyof typeof ContainerTopic]
@@ -333,6 +335,8 @@ function parseTopic(value: number): ContainerTopic
       case ContainerTopic.Statistics:
       case ContainerTopic.ResourceDeltaAck:
       case ContainerTopic.CredentialsRefresh:
+      case ContainerTopic.WormholesRefresh:
+      case ContainerTopic.RuntimeReady:
       {
          return value
       }
@@ -847,6 +851,11 @@ export function buildReadyFrame(): Buffer
    return buildMessageFrame(ContainerTopic.Healthy)
 }
 
+export function buildRuntimeReadyFrame(): Buffer
+{
+   return buildMessageFrame(ContainerTopic.RuntimeReady)
+}
+
 export function buildStatisticsFrame(metrics: Iterable<MetricPair>): Buffer
 {
    return buildMessageFrame(ContainerTopic.Statistics, encodeMetricPairs(metrics))
@@ -1149,6 +1158,10 @@ export class NeuronHubDispatch
    {
    }
 
+   wormholesRefresh(_hub: NeuronHub, _payload: Buffer): void
+   {
+   }
+
    messageFromProdigy(_hub: NeuronHub, _payload: Buffer): void
    {
    }
@@ -1252,6 +1265,11 @@ export class NeuronHub
       this.sendEncoded(buildReadyFrame())
    }
 
+   signalRuntimeReady(): void
+   {
+      this.sendEncoded(buildRuntimeReadyFrame())
+   }
+
    publishStatistic(metric: MetricPair): void
    {
       this.publishStatistics([metric])
@@ -1293,6 +1311,7 @@ export class NeuronHub
          }
          case ContainerTopic.Pong:
          case ContainerTopic.Healthy:
+         case ContainerTopic.RuntimeReady:
          case ContainerTopic.Statistics:
          case ContainerTopic.ResourceDeltaAck:
          {
@@ -1339,6 +1358,11 @@ export class NeuronHub
             {
                this.dispatch.credentialsRefresh(this, decodeCredentialDelta(frame.payload))
             }
+            break
+         }
+         case ContainerTopic.WormholesRefresh:
+         {
+            this.dispatch.wormholesRefresh(this, Buffer.from(frame.payload))
             break
          }
          default:
@@ -1536,6 +1560,11 @@ class NodeNeuronDispatch extends NeuronHubDispatch
          hub.acknowledgeCredentialsRefresh()
       }
       this.inner.credentialsRefresh(hub, delta)
+   }
+
+   override wormholesRefresh(hub: NeuronHub, payload: Buffer): void
+   {
+      this.inner.wormholesRefresh(hub, payload)
    }
 
    override messageFromProdigy(hub: NeuronHub, payload: Buffer): void

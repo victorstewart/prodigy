@@ -7,6 +7,9 @@ PINGPONG_BIN="${3:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARNESS="${SCRIPT_DIR}/prodigy_dev_netns_harness.sh"
+source "${SCRIPT_DIR}/prodigy_dev_discombobulator_artifact_helpers.sh"
+SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+prodigy_dev_reexec_in_private_mount_namespace_once PRODIGY_DEV_AUTOSCALE_METRICS_SMOKE_MOUNT_NS_READY bash "${SCRIPT_SELF}" "$@"
 
 if [[ -z "${PRODIGY_BIN}" || -z "${MOTHERSHIP_BIN}" || -z "${PINGPONG_BIN}" ]]
 then
@@ -44,7 +47,7 @@ then
    exit 1
 fi
 
-deps=(awk btrfs mkfs.btrfs mount umount stat zstd ldd install timeout ip)
+deps=(awk btrfs cargo mkfs.btrfs mount umount stat zstd timeout ip)
 for cmd in "${deps[@]}"
 do
    if ! command -v "${cmd}" >/dev/null 2>&1
@@ -57,31 +60,17 @@ done
 PRODIGY_BIN="$(readlink -f "${PRODIGY_BIN}" 2>/dev/null || printf '%s' "${PRODIGY_BIN}")"
 MOTHERSHIP_BIN="$(readlink -f "${MOTHERSHIP_BIN}" 2>/dev/null || printf '%s' "${MOTHERSHIP_BIN}")"
 PINGPONG_BIN="$(readlink -f "${PINGPONG_BIN}" 2>/dev/null || printf '%s' "${PINGPONG_BIN}")"
+target_arch="$(prodigy_dev_detect_target_arch)"
 
 tmpdir="$(mktemp -d)"
 containers_dir_created=0
 containers_mount_created=0
 containers_loop_image=""
-host_pingpong_path="/root/pingpong_container"
-host_pingpong_backup=""
-deployment_subvol=""
+case_failed=0
 
 cleanup()
 {
    set +e
-
-   if [[ -n "${deployment_subvol}" && -e "${deployment_subvol}" ]]
-   then
-      btrfs property set -f "${deployment_subvol}" ro false >/dev/null 2>&1 || true
-      btrfs subvolume delete "${deployment_subvol}" >/dev/null 2>&1 || true
-   fi
-
-   if [[ -n "${host_pingpong_backup}" && -f "${host_pingpong_backup}" ]]
-   then
-      install -m 0755 "${host_pingpong_backup}" "${host_pingpong_path}" >/dev/null 2>&1 || true
-   else
-      rm -f "${host_pingpong_path}" >/dev/null 2>&1 || true
-   fi
 
    if [[ "${containers_mount_created}" -eq 1 ]]
    then
@@ -93,31 +82,14 @@ cleanup()
       rmdir /containers >/dev/null 2>&1 || true
    fi
 
-   rm -rf "${tmpdir}"
+   if [[ "${case_failed}" -ne 0 ]]
+   then
+      echo "DEBUG: preserved tmpdir ${tmpdir}"
+   else
+      rm -rf "${tmpdir}"
+   fi
 }
 trap cleanup EXIT
-
-stream_subvolume_blob()
-{
-   local subvol_path="$1"
-   local out_blob="$2"
-   local max_attempts="${3:-3}"
-
-   local attempt=0
-   for attempt in $(seq 1 "${max_attempts}")
-   do
-      rm -f "${out_blob}" >/dev/null 2>&1 || true
-      if btrfs send "${subvol_path}" | zstd -19 -T0 -q -o "${out_blob}"
-      then
-         return 0
-      fi
-
-      sleep 0.2
-   done
-
-   echo "FAIL: unable to stream subvolume to blob after retries: ${subvol_path}"
-   return 1
-}
 
 if [[ ! -d /containers ]]
 then
@@ -134,9 +106,9 @@ then
       exit 1
    fi
 
-   if [[ -n "$(ls -A /containers 2>/dev/null)" ]]
+   if ! prodigy_dev_containers_root_is_safely_overmountable /containers
    then
-      echo "FAIL: /containers exists on non-btrfs fs and is not empty"
+      echo "FAIL: /containers exists on non-btrfs fs and is not safely overmountable"
       exit 1
    fi
 
@@ -172,6 +144,13 @@ harness_brains="${PRODIGY_DEV_AUTOSCALE_METRICS_HARNESS_BRAINS:-3}"
 harness_duration_s="${PRODIGY_DEV_AUTOSCALE_METRICS_HARNESS_DURATION_S:-55}"
 enable_report_checks="${PRODIGY_DEV_AUTOSCALE_METRICS_ENABLE_REPORT_CHECKS:-1}"
 require_brain_log_substring="${PRODIGY_DEV_AUTOSCALE_METRICS_REQUIRE_BRAIN_LOG_SUBSTRING:-}"
+require_scaler_name="${PRODIGY_DEV_AUTOSCALE_METRICS_REQUIRE_SCALER_NAME:-}"
+require_scaler_value_min="${PRODIGY_DEV_AUTOSCALE_METRICS_REQUIRE_SCALER_VALUE_MIN:-0}"
+autoscale_trace="${PRODIGY_AUTOSCALE_TRACE:-}"
+if [[ -n "${require_brain_log_substring}" ]]
+then
+   autoscale_trace=1
+fi
 
 if [[ -z "${emit_metric_name}" ]]
 then
@@ -233,39 +212,30 @@ then
    exit 1
 fi
 
-if [[ -e "${host_pingpong_path}" ]]
+artifact_project_dir="${tmpdir}/autoscale-metrics-artifact"
+discombobulator_file="${artifact_project_dir}/PingPongAutoscaleMetrics.DiscombobuFile"
+container_blob="${tmpdir}/autoscale_metrics.container.zst"
+mkdir -p "${artifact_project_dir}"
+cat > "${discombobulator_file}" <<EOF
+FROM scratch for ${target_arch}
+COPY {bin} ./$(basename "${PINGPONG_BIN}") /root/pingpong_container
+SURVIVE /root/pingpong_container
+EOF
+prodigy_dev_write_common_prodigy_assets "${discombobulator_file}"
+cat >> "${discombobulator_file}" <<'EOF'
+EXECUTE ["/root/pingpong_container"]
+EOF
+
+if ! prodigy_dev_run_discombobulator_build \
+   "${artifact_project_dir}" \
+   "${discombobulator_file}" \
+   "${container_blob}" \
+   "bin=$(dirname "${PINGPONG_BIN}")" \
+   "ebpf=$(dirname "${PRODIGY_BIN}")"
 then
-   host_pingpong_backup="${tmpdir}/pingpong_container.host.backup"
-   cp -f "${host_pingpong_path}" "${host_pingpong_backup}"
+   echo "FAIL: unable to build autoscale metrics artifact"
+   exit 1
 fi
-install -m 0755 "${PINGPONG_BIN}" "${host_pingpong_path}"
-
-deployment_subvol="/containers/${deployment_id}"
-btrfs subvolume create "${deployment_subvol}" >/dev/null
-mkdir -p "${deployment_subvol}/root" "${deployment_subvol}/etc"
-install -m 0755 "${PINGPONG_BIN}" "${deployment_subvol}/root/pingpong_container"
-
-while IFS= read -r libpath
-do
-   if [[ -z "${libpath}" ]]
-   then
-      continue
-   fi
-
-   if [[ -e "${libpath}" ]]
-   then
-      cp -aL --parents "${libpath}" "${deployment_subvol}"
-   fi
-done < <(
-   ldd "${PINGPONG_BIN}" | awk '
-      /=>/ {
-         if ($3 ~ /^\//) print $3;
-      }
-      /^[[:space:]]*\// {
-         print $1;
-      }
-   ' | sort -u
-)
 
 plan_json="${tmpdir}/autoscale_metrics.plan.json"
 cat > "${plan_json}" <<EOF
@@ -274,6 +244,7 @@ cat > "${plan_json}" <<EOF
     "type": "ApplicationType::stateless",
     "applicationID": ${application_id},
     "versionID": ${version_id},
+    "architecture": "${target_arch}",
     "filesystemMB": 64,
     "storageMB": 64,
     "memoryMB": 256,
@@ -282,6 +253,7 @@ cat > "${plan_json}" <<EOF
     "sTilHealthcheck": 3,
     "sTilKillable": 30
   },
+  "useHostNetworkNamespace": true,
   "minimumSubscriberCapacity": 1024,
   "isStateful": false,
   "stateless": {
@@ -304,13 +276,6 @@ cat > "${plan_json}" <<EOF
   "requiresDatacenterUniqueTag": false
 }
 EOF
-
-container_blob="${tmpdir}/autoscale_metrics.container.zst"
-btrfs property set -f "${deployment_subvol}" ro true >/dev/null
-stream_subvolume_blob "${deployment_subvol}" "${container_blob}" 3
-btrfs property set -f "${deployment_subvol}" ro false >/dev/null
-btrfs subvolume delete "${deployment_subvol}" >/dev/null
-deployment_subvol=""
 
 for attempt in $(seq 1 "${case_attempts}")
 do
@@ -335,6 +300,14 @@ do
          "--deploy-report-attempts=${report_attempts}"
          "--deploy-report-max-target-min=2"
       )
+
+      if [[ -n "${require_scaler_name}" ]]
+      then
+         harness_args+=(
+            "--deploy-report-require-scaler=${require_scaler_name}"
+            "--deploy-report-require-scaler-value-min=${require_scaler_value_min}"
+         )
+      fi
    fi
 
    if [[ -n "${require_brain_log_substring}" ]]
@@ -342,7 +315,8 @@ do
       harness_args+=("--require-brain-log-substring=${require_brain_log_substring}")
    fi
 
-   if PINGPONG_METRIC_NAME="${emit_metric_name}" \
+   if PRODIGY_AUTOSCALE_TRACE="${autoscale_trace}" \
+      PINGPONG_METRIC_NAME="${emit_metric_name}" \
       PRODIGY_DEV_DEPLOY_PING_ATTEMPTS="${deploy_ping_attempts}" \
       PRODIGY_DEV_DEPLOY_SKIP_FINAL_PING=1 \
       timeout --preserve-status -k 3s "${harness_attempt_timeout_s}"s \
@@ -363,4 +337,5 @@ do
 done
 
 echo "AUTOSCALE_METRICS_CASE_FAIL"
+case_failed=1
 exit 1

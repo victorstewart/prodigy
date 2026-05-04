@@ -588,6 +588,8 @@ pub enum ContainerTopic
    Statistics = 10,
    ResourceDeltaAck = 11,
    CredentialsRefresh = 12,
+   WormholesRefresh = 13,
+   RuntimeReady = 14,
 }
 
 impl ContainerTopic
@@ -609,6 +611,8 @@ impl ContainerTopic
          10 => Ok(Self::Statistics),
          11 => Ok(Self::ResourceDeltaAck),
          12 => Ok(Self::CredentialsRefresh),
+         13 => Ok(Self::WormholesRefresh),
+         14 => Ok(Self::RuntimeReady),
          _ => Err(invalid_data(format!("unknown container topic {value}"))),
       }
    }
@@ -667,6 +671,10 @@ pub trait Dispatch: Sized
       &mut self,
       _hub: &mut NeuronHub<Self>,
       _delta: CredentialDelta)
+   {
+   }
+
+   fn wormholes_refresh(&mut self, _hub: &mut NeuronHub<Self>, _payload: &[u8])
    {
    }
 
@@ -805,6 +813,11 @@ impl<D: Dispatch> NeuronHub<D>
       self.send_empty(ContainerTopic::Healthy)
    }
 
+   pub fn signal_runtime_ready(&mut self) -> io::Result<()>
+   {
+      self.send_empty(ContainerTopic::RuntimeReady)
+   }
+
    pub fn with_control_policy(mut self, control_policy: ControlPolicy) -> Self
    {
       self.control_policy = control_policy;
@@ -851,6 +864,11 @@ impl<D: Dispatch> NeuronHub<D>
    pub fn queue_ready(&mut self)
    {
       self.queue_empty(ContainerTopic::Healthy);
+   }
+
+   pub fn queue_runtime_ready(&mut self)
+   {
+      self.queue_empty(ContainerTopic::RuntimeReady);
    }
 
    pub fn queue_statistics(&mut self, metrics: &[MetricPair])
@@ -901,7 +919,7 @@ impl<D: Dispatch> NeuronHub<D>
          {
             self.queue_empty(ContainerTopic::Ping);
          }
-         ContainerTopic::Pong | ContainerTopic::Healthy | ContainerTopic::Statistics | ContainerTopic::ResourceDeltaAck =>
+         ContainerTopic::Pong | ContainerTopic::Healthy | ContainerTopic::RuntimeReady | ContainerTopic::Statistics | ContainerTopic::ResourceDeltaAck =>
          {
          }
          ContainerTopic::Stop =>
@@ -949,6 +967,10 @@ impl<D: Dispatch> NeuronHub<D>
                   self.queue_credentials_refresh_ack();
                }
             }
+         }
+         ContainerTopic::WormholesRefresh =>
+         {
+            self.with_dispatch(|dispatch, hub| dispatch.wormholes_refresh(hub, &frame.payload));
          }
       }
 
@@ -1073,6 +1095,11 @@ pub fn build_message_frame(topic: ContainerTopic, payload: &[u8]) -> io::Result<
 pub fn build_ready_frame() -> io::Result<Vec<u8>>
 {
    build_message_frame(ContainerTopic::Healthy, &[])
+}
+
+pub fn build_runtime_ready_frame() -> io::Result<Vec<u8>>
+{
+   build_message_frame(ContainerTopic::RuntimeReady, &[])
 }
 
 pub fn build_statistics_frame(metrics: &[MetricPair]) -> io::Result<Vec<u8>>
@@ -1444,7 +1471,9 @@ impl Writer
 mod tests
 {
    use super::*;
+   use std::cell::RefCell;
    use std::io::Cursor;
+   use std::rc::Rc;
 
    const FIXTURE_CREDENTIAL_BUNDLE: &[u8] =
       include_bytes!("../fixtures/startup.credential_bundle.full.bin");
@@ -1481,6 +1510,24 @@ mod tests
       fn resource_delta(&mut self, hub: &mut NeuronHub<Self>, _delta: ResourceDelta)
       {
          hub.queue_resource_delta_ack(true);
+      }
+   }
+
+   #[derive(Clone)]
+   struct RecordingDispatch
+   {
+      wormholes_refreshes: Rc<RefCell<Vec<Vec<u8>>>>,
+   }
+
+   impl Dispatch for RecordingDispatch
+   {
+      fn begin_shutdown(&mut self, _hub: &mut NeuronHub<Self>)
+      {
+      }
+
+      fn wormholes_refresh(&mut self, _hub: &mut NeuronHub<Self>, payload: &[u8])
+      {
+         self.wormholes_refreshes.borrow_mut().push(payload.to_vec());
       }
    }
 
@@ -1777,6 +1824,12 @@ mod tests
       assert_eq!(
          build_credentials_refresh_ack_frame().unwrap(),
          FIXTURE_CREDENTIALS_REFRESH_ACK_FRAME);
+
+      let runtime_ready = read_frame(&mut Cursor::new(build_runtime_ready_frame().unwrap()))
+         .unwrap()
+         .unwrap();
+      assert_eq!(runtime_ready.topic, ContainerTopic::RuntimeReady);
+      assert!(runtime_ready.payload.is_empty());
    }
 
    #[test]
@@ -1809,6 +1862,33 @@ mod tests
 
       let outbound = hub.handle_decoded_frame(&frame).unwrap();
       assert_eq!(outbound, vec![build_message_frame(ContainerTopic::Ping, &[]).unwrap()]);
+   }
+
+   #[test]
+   fn runtime_ready_is_noop_and_wormholes_refresh_dispatches()
+   {
+      let parameters = ContainerParameters::decode(FIXTURE_CONTAINER_PARAMETERS).unwrap();
+      let wormholes_refreshes = Rc::new(RefCell::new(Vec::new()));
+      let dispatch = RecordingDispatch {
+         wormholes_refreshes: wormholes_refreshes.clone(),
+      };
+      let mut hub = NeuronHub::new_borrowed_transport(parameters, dispatch).unwrap();
+
+      assert!(hub.handle_decoded_frame(&MessageFrame {
+         topic: ContainerTopic::RuntimeReady,
+         payload: Vec::new(),
+      }).unwrap().is_empty());
+
+      assert!(hub.handle_decoded_frame(&MessageFrame {
+         topic: ContainerTopic::WormholesRefresh,
+         payload: b"worm".to_vec(),
+      }).unwrap().is_empty());
+      assert_eq!(*wormholes_refreshes.borrow(), vec![b"worm".to_vec()]);
+
+      hub.queue_runtime_ready();
+      assert_eq!(
+         hub.drain_outbound_bytes().unwrap(),
+         vec![build_runtime_ready_frame().unwrap()]);
    }
 
    #[test]

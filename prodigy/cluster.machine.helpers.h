@@ -190,7 +190,10 @@ static inline bool prodigyResolveMachineSSHSocketAddress(const Machine& machine,
    return prodigyResolveMachineSSHSocketAddress(machine, resolvedAddress, resolvedPort, resolvedAddressText);
 }
 
-static inline void prodigyConfigureMachineNeuronEndpoint(Machine& machine, const NeuronBase *localNeuron)
+static inline void prodigyConfigureMachineNeuronEndpoint(
+   Machine& machine,
+   const NeuronBase *localNeuron,
+   const Vector<ClusterMachinePeerAddress> *localCandidatesOverride)
 {
    IPAddress peerAddress = {};
    if (prodigyResolveMachinePeerAddress(machine, peerAddress) == false)
@@ -228,13 +231,19 @@ static inline void prodigyConfigureMachineNeuronEndpoint(Machine& machine, const
 
    if (localNeuron != nullptr && remoteCandidate.address.size() > 0)
    {
-      Vector<ClusterMachinePeerAddress> localCandidates = {};
-      String preferredInterface = {};
-      preferredInterface.assign(localNeuron->eth.name);
-      prodigyCollectLocalPeerAddressCandidates(preferredInterface, localNeuron->private4, localCandidates);
+      const Vector<ClusterMachinePeerAddress> *localCandidates = localCandidatesOverride;
+      Vector<ClusterMachinePeerAddress> discoveredLocalCandidates = {};
+      if (localCandidates == nullptr)
+      {
+         String preferredInterface = {};
+         preferredInterface.assign(localNeuron->eth.name);
+         prodigyCollectLocalPeerAddressCandidates(preferredInterface, localNeuron->private4, discoveredLocalCandidates);
+         localCandidates = &discoveredLocalCandidates;
+      }
 
       IPAddress sourceAddress = {};
-      if (prodigyResolvePreferredLocalSourceAddress(localCandidates, remoteCandidate, sourceAddress))
+      if (localCandidates != nullptr
+         && prodigyResolvePreferredLocalSourceAddress(*localCandidates, remoteCandidate, sourceAddress))
       {
          machine.neuron.setSaddr(sourceAddress);
       }
@@ -245,6 +254,11 @@ static inline void prodigyConfigureMachineNeuronEndpoint(Machine& machine, const
       machine.neuron.setSaddr(localNeuron->private4);
    }
    machine.neuron.setDaddr(peerAddress, uint16_t(ReservedPorts::neuron));
+}
+
+static inline void prodigyConfigureMachineNeuronEndpoint(Machine& machine, const NeuronBase *localNeuron)
+{
+   prodigyConfigureMachineNeuronEndpoint(machine, localNeuron, nullptr);
 }
 
 static inline bool prodigyMachineProvisioningReady(const Machine& machine)
@@ -438,6 +452,10 @@ static inline void prodigyPopulateCreatedClusterMachineFromSnapshot(ClusterMachi
    clusterMachine.ssh.user = snapshot->sshUser.size() > 0 ? snapshot->sshUser : defaultSSHUser;
    clusterMachine.ssh.privateKeyPath = snapshot->sshPrivateKeyPath.size() > 0 ? snapshot->sshPrivateKeyPath : defaultSSHPrivateKeyPath;
    clusterMachine.ssh.hostPublicKeyOpenSSH = snapshot->sshHostPublicKeyOpenSSH.size() > 0 ? snapshot->sshHostPublicKeyOpenSSH : defaultSSHHostPublicKeyOpenSSH;
+   for (const ClusterMachinePeerAddress& candidate : snapshot->peerAddresses)
+   {
+      prodigyAppendUniqueClusterMachinePeerAddress(clusterMachine.peerAddresses, candidate);
+   }
    prodigyAssignClusterMachineAddressesFromPeerCandidates(clusterMachine.addresses, snapshot->peerAddresses);
    prodigyAppendUniqueClusterMachineAddress(clusterMachine.addresses.publicAddresses, snapshot->publicAddress);
    String privateGateway = {};
@@ -452,9 +470,10 @@ static inline void prodigyPopulateCreatedClusterMachineFromSnapshot(ClusterMachi
    clusterMachine.uuid = snapshot->uuid;
    clusterMachine.rackUUID = snapshot->rackUUID;
    clusterMachine.creationTimeMs = snapshot->creationTimeMs > 0 ? snapshot->creationTimeMs : Time::now<TimeResolution::ms>();
-   clusterMachine.hasInternetAccess = snapshot->hasInternetAccess;
-   clusterMachine.hardware = snapshot->hardware;
-   clusterMachine.ownership.mode = ClusterMachineOwnershipMode::wholeMachine;
+	   clusterMachine.hasInternetAccess = snapshot->hasInternetAccess;
+	   clusterMachine.hardware = snapshot->hardware;
+	   clusterMachine.vmImageURI = machineConfig.vmImageURI.size() > 0 ? machineConfig.vmImageURI : snapshot->currentImageURI;
+	   clusterMachine.ownership.mode = ClusterMachineOwnershipMode::wholeMachine;
    uint32_t resolvedLogicalCores = machineConfig.nLogicalCores > 0 ? machineConfig.nLogicalCores : snapshot->totalLogicalCores;
    uint32_t resolvedMemoryMB = machineConfig.nMemoryMB > 0 ? machineConfig.nMemoryMB : snapshot->totalMemoryMB;
    uint32_t resolvedStorageMB = machineConfig.nStorageMB > 0 ? machineConfig.nStorageMB : snapshot->totalStorageMB;
@@ -511,9 +530,10 @@ static inline void prodigyPopulateCreatedClusterMachineFromAcceptance(ClusterMac
    clusterMachine.ssh.port = 22;
    clusterMachine.ssh.user = defaultSSHUser;
    clusterMachine.ssh.privateKeyPath = defaultSSHPrivateKeyPath;
-   clusterMachine.ssh.hostPublicKeyOpenSSH = defaultSSHHostPublicKeyOpenSSH;
-   clusterMachine.creationTimeMs = Time::now<TimeResolution::ms>();
-   clusterMachine.ownership.mode = ClusterMachineOwnershipMode::wholeMachine;
+	   clusterMachine.ssh.hostPublicKeyOpenSSH = defaultSSHHostPublicKeyOpenSSH;
+	   clusterMachine.creationTimeMs = Time::now<TimeResolution::ms>();
+	   clusterMachine.vmImageURI = machineConfig.vmImageURI;
+	   clusterMachine.ownership.mode = ClusterMachineOwnershipMode::wholeMachine;
    clusterMachineApplyOwnedResourcesFromTotals(
       clusterMachine,
       machineConfig.nLogicalCores,
@@ -531,6 +551,11 @@ static inline void prodigyRefreshCreatedClusterMachineFromSnapshot(ClusterMachin
    refreshed.ssh.hostPublicKeyOpenSSH = snapshot->sshHostPublicKeyOpenSSH.size() > 0 ? snapshot->sshHostPublicKeyOpenSSH : (refreshed.ssh.hostPublicKeyOpenSSH.size() > 0 ? refreshed.ssh.hostPublicKeyOpenSSH : defaultSSHHostPublicKeyOpenSSH);
    refreshed.cloud.providerMachineType = refreshed.cloud.providerMachineType.size() > 0 ? refreshed.cloud.providerMachineType : snapshot->type;
    refreshed.cloud.cloudID = snapshot->cloudID.size() > 0 ? snapshot->cloudID : refreshed.cloud.cloudID;
+   refreshed.peerAddresses.clear();
+   for (const ClusterMachinePeerAddress& candidate : snapshot->peerAddresses)
+   {
+      prodigyAppendUniqueClusterMachinePeerAddress(refreshed.peerAddresses, candidate);
+   }
    refreshed.addresses = {};
    prodigyAssignClusterMachineAddressesFromPeerCandidates(refreshed.addresses, snapshot->peerAddresses);
    prodigyAppendUniqueClusterMachineAddress(refreshed.addresses.publicAddresses, snapshot->publicAddress);
@@ -547,11 +572,15 @@ static inline void prodigyRefreshCreatedClusterMachineFromSnapshot(ClusterMachin
    refreshed.rackUUID = snapshot->rackUUID != 0 ? snapshot->rackUUID : refreshed.rackUUID;
    refreshed.creationTimeMs = snapshot->creationTimeMs > 0 ? snapshot->creationTimeMs : (refreshed.creationTimeMs > 0 ? refreshed.creationTimeMs : Time::now<TimeResolution::ms>());
    refreshed.hasInternetAccess = refreshed.hasInternetAccess || snapshot->hasInternetAccess;
-   if (snapshot->hardware.inventoryComplete)
-   {
-      refreshed.hardware = snapshot->hardware;
-   }
-   refreshed.totalLogicalCores = snapshot->totalLogicalCores > 0 ? snapshot->totalLogicalCores : refreshed.totalLogicalCores;
+	   if (snapshot->hardware.inventoryComplete)
+	   {
+	      refreshed.hardware = snapshot->hardware;
+	   }
+	   if (refreshed.vmImageURI.size() == 0)
+	   {
+	      refreshed.vmImageURI = snapshot->currentImageURI;
+	   }
+	   refreshed.totalLogicalCores = snapshot->totalLogicalCores > 0 ? snapshot->totalLogicalCores : refreshed.totalLogicalCores;
    refreshed.totalMemoryMB = snapshot->totalMemoryMB > 0 ? snapshot->totalMemoryMB : refreshed.totalMemoryMB;
    refreshed.totalStorageMB = snapshot->totalStorageMB > 0 ? snapshot->totalStorageMB : refreshed.totalStorageMB;
    if (refreshed.ownedLogicalCores == 0)
@@ -677,8 +706,9 @@ static inline Machine prodigyBuildMachineSnapshotFromClusterMachine(const Cluste
    machine.totalLogicalCores = clusterMachine.totalLogicalCores;
    machine.totalMemoryMB = clusterMachine.totalMemoryMB;
    machine.totalStorageMB = clusterMachine.totalStorageMB;
-   machine.hardware = clusterMachine.hardware;
-   machine.ownedLogicalCores = clusterMachine.ownedLogicalCores;
+	   machine.hardware = clusterMachine.hardware;
+	   machine.currentImageURI = clusterMachine.vmImageURI;
+	   machine.ownedLogicalCores = clusterMachine.ownedLogicalCores;
    machine.ownedMemoryMB = clusterMachine.ownedMemoryMB;
    machine.ownedStorageMB = clusterMachine.ownedStorageMB;
 
@@ -803,12 +833,16 @@ static inline void prodigyBackfillClusterMachineFromAuthoritativeRecord(ClusterM
    {
       machine.ownedStorageMB = authoritative.ownedStorageMB;
    }
-   if (machine.hardware.inventoryComplete == false && authoritative.hardware.inventoryComplete)
-   {
-      machine.hardware = authoritative.hardware;
-   }
+	   if (machine.hardware.inventoryComplete == false && authoritative.hardware.inventoryComplete)
+	   {
+	      machine.hardware = authoritative.hardware;
+	   }
+	   if (machine.vmImageURI.size() == 0 && authoritative.vmImageURI.size() > 0)
+	   {
+	      machine.vmImageURI = authoritative.vmImageURI;
+	   }
 
-   bool machineOwnershipDefault =
+	   bool machineOwnershipDefault =
       machine.ownership.mode == ClusterMachineOwnershipMode::wholeMachine
       && machine.ownership.nLogicalCoresCap == 0
       && machine.ownership.nMemoryMBCap == 0

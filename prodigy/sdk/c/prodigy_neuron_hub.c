@@ -1525,7 +1525,7 @@ static void prodigy_write_u16_le(uint8_t *buffer, uint16_t value)
 
 static int prodigy_valid_topic(uint16_t topic)
 {
-   return topic <= (uint16_t)PRODIGY_CONTAINER_TOPIC_CREDENTIALS_REFRESH;
+   return topic <= (uint16_t)PRODIGY_CONTAINER_TOPIC_RUNTIME_READY;
 }
 
 prodigy_result prodigy_build_message_frame(
@@ -1625,6 +1625,11 @@ static prodigy_result prodigy_encode_metric_pairs(
 prodigy_result prodigy_build_ready_frame(prodigy_bytes *frame)
 {
    return prodigy_build_message_frame(PRODIGY_CONTAINER_TOPIC_HEALTHY, NULL, 0, frame);
+}
+
+prodigy_result prodigy_build_runtime_ready_frame(prodigy_bytes *frame)
+{
+   return prodigy_build_message_frame(PRODIGY_CONTAINER_TOPIC_RUNTIME_READY, NULL, 0, frame);
 }
 
 prodigy_result prodigy_build_statistics_frame(
@@ -1892,6 +1897,7 @@ prodigy_result prodigy_neuron_hub_handle_message_frame(
       }
       case PRODIGY_CONTAINER_TOPIC_PONG:
       case PRODIGY_CONTAINER_TOPIC_HEALTHY:
+      case PRODIGY_CONTAINER_TOPIC_RUNTIME_READY:
       {
          return (payload_size == 0) ? PRODIGY_RESULT_OK : PRODIGY_RESULT_PROTOCOL;
       }
@@ -2021,6 +2027,14 @@ prodigy_result prodigy_neuron_hub_handle_message_frame(
             hub->callbacks.credentials_refresh(hub->context, hub, &delta);
          }
          prodigy_credential_delta_free(&delta);
+         return PRODIGY_RESULT_OK;
+      }
+      case PRODIGY_CONTAINER_TOPIC_WORMHOLES_REFRESH:
+      {
+         if (hub->callbacks.wormholes_refresh != NULL)
+         {
+            hub->callbacks.wormholes_refresh(hub->context, hub, payload, payload_size);
+         }
          return PRODIGY_RESULT_OK;
       }
       default:
@@ -2236,6 +2250,28 @@ prodigy_result prodigy_neuron_hub_signal_ready(prodigy_neuron_hub *hub)
 
    memset(&frame, 0, sizeof(frame));
    result = prodigy_build_ready_frame(&frame);
+   if (result != PRODIGY_RESULT_OK)
+   {
+      return result;
+   }
+
+   result = prodigy_write_all_fd(hub->fd, frame.data, frame.size);
+   prodigy_bytes_free(&frame);
+   return result;
+}
+
+prodigy_result prodigy_neuron_hub_signal_runtime_ready(prodigy_neuron_hub *hub)
+{
+   prodigy_bytes frame;
+   prodigy_result result = PRODIGY_RESULT_OK;
+
+   if (hub == NULL)
+   {
+      return PRODIGY_RESULT_ARGUMENT;
+   }
+
+   memset(&frame, 0, sizeof(frame));
+   result = prodigy_build_runtime_ready_frame(&frame);
    if (result != PRODIGY_RESULT_OK)
    {
       return result;

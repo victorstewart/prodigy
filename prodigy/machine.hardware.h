@@ -14,7 +14,9 @@
 #include <pwd.h>
 #include <random>
 #include <simdjson.h>
+#include <spawn.h>
 #include <string>
+#include <sys/statvfs.h>
 #include <sys/wait.h>
 #include <thread>
 #include <sys/utsname.h>
@@ -22,6 +24,7 @@
 #include <vector>
 
 #include <prodigy/bundle.artifact.h>
+#include <prodigy/child.process.signal.h>
 #include <prodigy/machine.hardware.types.h>
 #include <services/filesystem.h>
 #include <services/time.h>
@@ -30,6 +33,7 @@ class ProdigyMachineHardwareCollectorOptions
 {
 public:
 
+   bool allowLocalCommands = true;
    uint32_t cpuBenchmarkWarmupSeconds = 1;
    uint32_t cpuBenchmarkSeconds = 3;
    uint32_t memoryBenchmarkWarmupSeconds = 1;
@@ -196,23 +200,7 @@ static inline void prodigyEraseFileBestEffort(const String& path)
 
 static inline void prodigyEnsureMachineHardwareCommandSigchldWaitable(void)
 {
-   // Guardian can leave SIGCHLD ignored; popen/pclose need it waitable.
-   struct sigaction currentSigChld = {};
-   if (::sigaction(SIGCHLD, nullptr, &currentSigChld) != 0)
-   {
-      return;
-   }
-
-   if (currentSigChld.sa_handler != SIG_IGN)
-   {
-      return;
-   }
-
-   struct sigaction defaultSigChld = {};
-   ::sigemptyset(&defaultSigChld.sa_mask);
-   defaultSigChld.sa_handler = SIG_DFL;
-   defaultSigChld.sa_flags = 0;
-   (void)::sigaction(SIGCHLD, &defaultSigChld, nullptr);
+   (void)prodigyEnsureSigchldDefaultWaitable();
 }
 
 static inline bool prodigyDecodeMachineHardwareCommandStatus(int rawStatus, int savedErrno, int *exitStatus = nullptr, String *failure = nullptr)
@@ -262,21 +250,120 @@ static inline bool prodigyRunBlockingLocalCommandCaptureStdout(const String& com
 
    String ownedCommand = {};
    ownedCommand.assign(command);
-   FILE *pipe = ::popen(ownedCommand.c_str(), "r");
-   if (pipe == nullptr)
+   const char *shellPath = "/bin/sh";
+   if (access(shellPath, X_OK) != 0)
+   {
+      shellPath = "/usr/bin/sh";
+   }
+
+   if (access(shellPath, X_OK) != 0)
+   {
+      if (failure) failure->assign("failed to launch local command: missing shell"_ctv);
+      return false;
+   }
+
+   int pipeFDs[2] = {-1, -1};
+   if (pipe2(pipeFDs, O_CLOEXEC) != 0)
    {
       if (failure) failure->assign("failed to launch local command"_ctv);
       return false;
    }
 
-   char buffer[4096];
-   while (std::fgets(buffer, sizeof(buffer), pipe) != nullptr)
+   posix_spawn_file_actions_t actions = {};
+   posix_spawnattr_t attrs = {};
+   int spawnSetupRC = posix_spawn_file_actions_init(&actions);
+   bool actionsInitialized = (spawnSetupRC == 0);
+   if (spawnSetupRC == 0) spawnSetupRC = posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], STDOUT_FILENO);
+   if (spawnSetupRC == 0) spawnSetupRC = posix_spawn_file_actions_addclose(&actions, pipeFDs[0]);
+#ifdef __GLIBC__
+   if (spawnSetupRC == 0) spawnSetupRC = posix_spawn_file_actions_addclosefrom_np(&actions, 3);
+#endif
+   if (spawnSetupRC == 0) spawnSetupRC = posix_spawnattr_init(&attrs);
+   bool attrsInitialized = (spawnSetupRC == 0);
+   sigset_t emptyMask = {};
+   sigemptyset(&emptyMask);
+   sigset_t defaultSignals = {};
+   sigemptyset(&defaultSignals);
+   sigaddset(&defaultSignals, SIGCHLD);
+   sigaddset(&defaultSignals, SIGTERM);
+   sigaddset(&defaultSignals, SIGINT);
+   sigaddset(&defaultSignals, SIGHUP);
+   if (spawnSetupRC == 0) spawnSetupRC = posix_spawnattr_setsigmask(&attrs, &emptyMask);
+   if (spawnSetupRC == 0) spawnSetupRC = posix_spawnattr_setsigdefault(&attrs, &defaultSignals);
+   if (spawnSetupRC == 0) spawnSetupRC = posix_spawnattr_setflags(&attrs, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+
+   pid_t pid = -1;
+   char *argv[] = {
+      const_cast<char *>("sh"),
+      const_cast<char *>("-c"),
+      const_cast<char *>(ownedCommand.c_str()),
+      nullptr
+   };
+   extern char **environ;
+   int spawnRC = (spawnSetupRC == 0) ? posix_spawn(&pid, shellPath, &actions, &attrs, argv, environ) : spawnSetupRC;
+   if (actionsInitialized)
    {
-      output.append(buffer);
+      posix_spawn_file_actions_destroy(&actions);
+   }
+   if (attrsInitialized)
+   {
+      posix_spawnattr_destroy(&attrs);
    }
 
-   int rc = ::pclose(pipe);
+   if (spawnRC != 0)
+   {
+      (void)::close(pipeFDs[0]);
+      (void)::close(pipeFDs[1]);
+      if (failure) failure->snprintf<"failed to launch local command: {}"_ctv>(String(strerror(spawnRC)));
+      return false;
+   }
+
+   (void)::close(pipeFDs[1]);
+
+   char buffer[4096];
+   for (;;)
+   {
+      ssize_t got = ::read(pipeFDs[0], buffer, sizeof(buffer));
+      if (got > 0)
+      {
+         output.append(buffer, uint64_t(got));
+         continue;
+      }
+
+      if (got == 0)
+      {
+         break;
+      }
+
+      if (errno == EINTR)
+      {
+         continue;
+      }
+
+      break;
+   }
+   (void)::close(pipeFDs[0]);
+
+   int rc = -1;
    int savedErrno = errno;
+   for (;;)
+   {
+      if (waitpid(pid, &rc, 0) == pid)
+      {
+         savedErrno = 0;
+         break;
+      }
+
+      if (errno == EINTR)
+      {
+         continue;
+      }
+
+      savedErrno = errno;
+      rc = -1;
+      break;
+   }
+
    return prodigyDecodeMachineHardwareCommandStatus(rc, savedErrno, exitStatus, failure);
 }
 
@@ -1084,6 +1171,21 @@ static inline void prodigyCollectCpuHardwareProfile(MachineCpuHardwareProfile& c
 {
    cpu = {};
 
+   if (options.allowLocalCommands == false)
+   {
+      prodigyCollectCpuIdentity(cpu);
+      cpu.logicalCores = std::max<uint32_t>(1, std::thread::hardware_concurrency());
+      cpu.physicalCores = cpu.logicalCores;
+      cpu.sockets = 1;
+      cpu.numaNodes = 1;
+      cpu.threadsPerCore = 1;
+      if (cpu.model.size() == 0)
+      {
+         prodigyReadCPUModelName(cpu.model);
+      }
+      return;
+   }
+
    ProdigyCpuInventorySnapshot snapshot = {};
 
    String command = {};
@@ -1450,6 +1552,11 @@ static inline void prodigyCollectMemoryHardwareProfile(MachineMemoryHardwareProf
 {
    memory = {};
    memory.totalMB = uint32_t(sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGESIZE) / (1024ULL * 1024ULL));
+   if (options.allowLocalCommands == false)
+   {
+      return;
+   }
+
    prodigyCollectMemoryDmiProfile(memory);
 
    if (options.collectOptionalBenchmarks == false)
@@ -1830,19 +1937,41 @@ static inline void prodigyPopulateDiskPcieLink(const String& diskName, MachineDi
    }
 }
 
-static inline void prodigyBuildDiskInventoryLsblkCommand(String& command)
-{
-   command.clear();
-   prodigyAppendCommandPrefix(command, 4);
-   prodigyAppendMachineHardwareShellSingleQuoted(command, "lsblk -J -e7 -b --output NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,WWN,ROTA,TRAN,LOG-SEC,PHY-SEC,MOUNTPOINTS"_ctv);
-}
-
-static inline bool prodigyCollectDiskInventory(Vector<MachineDiskHardwareProfile>& disks, Vector<MachineToolCapture>& captures)
+static inline bool prodigyCollectRootFilesystemDiskInventory(Vector<MachineDiskHardwareProfile>& disks)
 {
    disks.clear();
 
+   struct statvfs stats = {};
+   if (statvfs("/", &stats) != 0 || stats.f_blocks == 0 || stats.f_frsize == 0)
+   {
+      return false;
+   }
+
+   MachineDiskHardwareProfile disk = {};
+   disk.name.assign("rootfs"_ctv);
+   disk.path.assign("/"_ctv);
+   disk.model.assign("root filesystem"_ctv);
+   disk.sizeMB = (uint64_t(stats.f_blocks) * uint64_t(stats.f_frsize)) / (1024ULL * 1024ULL);
+   disk.mountPath.assign("/"_ctv);
+   bool usable = disk.sizeMB > 0;
+   disks.push_back(std::move(disk));
+   return usable;
+}
+
+static inline bool prodigyCollectDiskInventory(
+   Vector<MachineDiskHardwareProfile>& disks,
+   Vector<MachineToolCapture>& captures,
+   const ProdigyMachineHardwareCollectorOptions& options = {})
+{
+   disks.clear();
+   if (options.allowLocalCommands == false)
+   {
+      return prodigyCollectRootFilesystemDiskInventory(disks);
+   }
+
    String command = {};
-   prodigyBuildDiskInventoryLsblkCommand(command);
+   prodigyAppendCommandPrefix(command, 4);
+   prodigyAppendMachineHardwareShellSingleQuoted(command, "lsblk -J -b --output NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,WWN,ROTA,TRAN,LOG-SEC,PHY-SEC,MOUNTPOINTS"_ctv);
 
    String output = {};
    if (prodigyRunRecordedLocalCommand("lsblk"_ctv, "inventory"_ctv, command, captures, output) == false)
@@ -1905,6 +2034,76 @@ static inline bool prodigyCollectDiskInventory(Vector<MachineDiskHardwareProfile
    }
 
    return disks.size() > 0;
+}
+
+static inline bool prodigyMachineHardwareDevModeEnabled()
+{
+   const char *devMode = getenv("PRODIGY_DEV_MODE");
+   return devMode != nullptr && devMode[0] == '1' && devMode[1] == '\0';
+}
+
+static inline bool prodigyDiskMountPathAlreadyTracked(const Vector<MachineDiskHardwareProfile>& disks, const String& mountPath)
+{
+   for (const MachineDiskHardwareProfile& disk : disks)
+   {
+      if (disk.mountPath.equals(mountPath))
+      {
+         return true;
+      }
+   }
+
+   return false;
+}
+
+static inline void prodigyAppendDevContainerStorageMountPaths(Vector<MachineDiskHardwareProfile>& disks)
+{
+   if (prodigyMachineHardwareDevModeEnabled() == false)
+   {
+      return;
+   }
+
+   const char *mounts = getenv("PRODIGY_DEV_CONTAINER_STORAGE_MOUNTS");
+   if (mounts == nullptr || mounts[0] == '\0')
+   {
+      return;
+   }
+
+   uint32_t devIndex = 0;
+   const char *start = mounts;
+   while (*start != '\0')
+   {
+      const char *end = start;
+      while (*end != '\0' && *end != ':')
+      {
+         ++end;
+      }
+
+      if (end > start && *start == '/')
+      {
+         String mountPath = {};
+         mountPath.assign(start, size_t(end - start));
+         if (prodigyDiskMountPathAlreadyTracked(disks, mountPath) == false)
+         {
+            MachineDiskHardwareProfile disk = {};
+            disk.name.snprintf<"prodigy-dev-storage-{itoa}"_ctv>(devIndex++);
+            disk.path.assign(disk.name);
+            disk.model.assign("prodigy-dev-container-storage"_ctv);
+            disk.mountPath.assign(mountPath);
+
+            std::string nativePath(reinterpret_cast<const char *>(mountPath.data()), mountPath.size());
+            struct statvfs statbuf = {};
+            if (statvfs(nativePath.c_str(), &statbuf) == 0)
+            {
+               disk.sizeMB = (uint64_t(statbuf.f_blocks) * uint64_t(statbuf.f_frsize)) / (1024ULL * 1024ULL);
+            }
+
+            disk.benchmark.failure.assign("dev injected storage mount"_ctv);
+            disks.push_back(std::move(disk));
+         }
+      }
+
+      start = (*end == ':') ? end + 1 : end;
+   }
 }
 
 static inline bool prodigyParseFioBenchmarkJSON(const String& json, MachineDiskBenchmarkProfile& benchmark, bool sequentialPhase)
@@ -2284,6 +2483,29 @@ static inline MachineNicHardwareProfile *prodigyFindNicByName(Vector<MachineNicH
    return nullptr;
 }
 
+static inline MachineNicHardwareProfile& prodigyFindOrAppendNicByName(Vector<MachineNicHardwareProfile>& nics, const String& ifname)
+{
+   if (MachineNicHardwareProfile *existing = prodigyFindNicByName(nics, ifname))
+   {
+      return *existing;
+   }
+
+   MachineNicHardwareProfile& nic = nics.emplace_back();
+   nic.name.assign(ifname);
+
+   String path = {};
+   path.snprintf<"/sys/class/net/{}/address"_ctv>(ifname);
+   (void)prodigyReadTextFile(path, nic.mac);
+   path.snprintf<"/sys/class/net/{}/operstate"_ctv>(ifname);
+   String operstate = {};
+   if (prodigyReadTextFile(path, operstate))
+   {
+      nic.up = (operstate.equal("up"_ctv) || operstate.equal("UP"_ctv));
+   }
+
+   return nic;
+}
+
 static inline const ProdigyNicGatewayMapping *prodigyFindNicGateway(const Vector<ProdigyNicGatewayMapping>& gateways, const String& ifname, bool is6)
 {
    for (const ProdigyNicGatewayMapping& gateway : gateways)
@@ -2295,6 +2517,93 @@ static inline const ProdigyNicGatewayMapping *prodigyFindNicGateway(const Vector
    }
 
    return nullptr;
+}
+
+static inline uint8_t prodigyPrefixLengthFromNetmask(const struct sockaddr *netmask, bool is6)
+{
+   if (netmask == nullptr)
+   {
+      return is6 ? 128 : 32;
+   }
+
+   if (is6 == false && netmask->sa_family == AF_INET)
+   {
+      uint32_t mask = ntohl(reinterpret_cast<const struct sockaddr_in *>(netmask)->sin_addr.s_addr);
+      return uint8_t(__builtin_popcount(mask));
+   }
+
+   if (is6 && netmask->sa_family == AF_INET6)
+   {
+      const uint8_t *bytes = reinterpret_cast<const struct sockaddr_in6 *>(netmask)->sin6_addr.s6_addr;
+      uint8_t bits = 0;
+      for (uint32_t i = 0; i < 16; ++i)
+      {
+         bits = uint8_t(bits + __builtin_popcount(unsigned(bytes[i])));
+      }
+      return bits;
+   }
+
+   return is6 ? 128 : 32;
+}
+
+static inline bool prodigyCollectNicInventoryFromProcess(Vector<MachineNicHardwareProfile>& nics)
+{
+   nics.clear();
+
+   struct ifaddrs *addresses = nullptr;
+   if (getifaddrs(&addresses) != 0)
+   {
+      return false;
+   }
+
+   for (struct ifaddrs *ifa = addresses; ifa != nullptr; ifa = ifa->ifa_next)
+   {
+      if (ifa->ifa_name == nullptr || ifa->ifa_name[0] == '\0' || std::strcmp(ifa->ifa_name, "lo") == 0)
+      {
+         continue;
+      }
+
+      String ifname = {};
+      ifname.assign(ifa->ifa_name);
+      MachineNicHardwareProfile& nic = prodigyFindOrAppendNicByName(nics, ifname);
+      nic.up = nic.up || ((ifa->ifa_flags & IFF_UP) != 0);
+
+      if (ifa->ifa_addr == nullptr)
+      {
+         continue;
+      }
+
+      MachineNicSubnetHardwareProfile subnet = {};
+      if (ifa->ifa_addr->sa_family == AF_INET)
+      {
+         subnet.address = {};
+         subnet.address.is6 = false;
+         subnet.address.v4 = reinterpret_cast<const struct sockaddr_in *>(ifa->ifa_addr)->sin_addr.s_addr;
+         prodigyComputePrefixNetwork(subnet.address, prodigyPrefixLengthFromNetmask(ifa->ifa_netmask, false), subnet.subnet);
+      }
+      else if (ifa->ifa_addr->sa_family == AF_INET6)
+      {
+         const struct in6_addr& raw = reinterpret_cast<const struct sockaddr_in6 *>(ifa->ifa_addr)->sin6_addr;
+         if (IN6_IS_ADDR_UNSPECIFIED(&raw) || IN6_IS_ADDR_LOOPBACK(&raw) || IN6_IS_ADDR_MULTICAST(&raw))
+         {
+            continue;
+         }
+
+         subnet.address = {};
+         subnet.address.is6 = true;
+         std::memcpy(subnet.address.v6, raw.s6_addr, 16);
+         prodigyComputePrefixNetwork(subnet.address, prodigyPrefixLengthFromNetmask(ifa->ifa_netmask, true), subnet.subnet);
+      }
+      else
+      {
+         continue;
+      }
+
+      nic.subnets.push_back(std::move(subnet));
+   }
+
+   freeifaddrs(addresses);
+   return nics.empty() == false;
 }
 
 static inline bool prodigyPopulateNicSubnetsFromJSON(Vector<MachineNicHardwareProfile>& nics, const String& addressOutput, const String& routeOutput)
@@ -2525,9 +2834,15 @@ static inline bool prodigyCollectNicSubnets(Vector<MachineNicHardwareProfile>& n
    return prodigyPopulateNicSubnetsFromJSON(nics, addressOutput, routeOutput);
 }
 
-static inline void prodigyCollectNicInventory(MachineNetworkHardwareProfile& network)
+static inline void prodigyCollectNicInventory(MachineNetworkHardwareProfile& network, const ProdigyMachineHardwareCollectorOptions& options = {})
 {
    network.nics.clear();
+   if (options.allowLocalCommands == false)
+   {
+      (void)prodigyCollectNicInventoryFromProcess(network.nics);
+      return;
+   }
+
    Vector<ProdigyPciDescription> pciDescriptions;
    prodigyCollectPciDescriptions(pciDescriptions, &network.captures);
 
@@ -2941,9 +3256,13 @@ static inline void prodigyDeferOptionalMachineHardwareBenchmarks(MachineHardware
    hardware.benchmarkFailure.assign("optional hardware benchmarks deferred from boot path"_ctv);
 }
 
-static inline void prodigyCollectGpuInventory(Vector<MachineGpuHardwareProfile>& gpus)
+static inline void prodigyCollectGpuInventory(Vector<MachineGpuHardwareProfile>& gpus, const ProdigyMachineHardwareCollectorOptions& options = {})
 {
    gpus.clear();
+   if (options.allowLocalCommands == false)
+   {
+      return;
+   }
 
    auto parseNvidiaInventory = [&] (const String& output) -> void {
       uint64_t start = 0;
@@ -3056,9 +3375,10 @@ static inline void prodigyCollectMachineHardwareProfile(MachineHardwareProfile& 
 
    prodigyCollectCpuHardwareProfile(hardware.cpu, options);
    prodigyCollectMemoryHardwareProfile(hardware.memory, hardware.cpu, options);
-   bool haveDisks = prodigyCollectDiskInventory(hardware.disks, hardware.captures);
-   prodigyCollectNicInventory(hardware.network);
-   prodigyCollectGpuInventory(hardware.gpus);
+   bool haveDisks = prodigyCollectDiskInventory(hardware.disks, hardware.captures, options);
+   prodigyAppendDevContainerStorageMountPaths(hardware.disks);
+   prodigyCollectNicInventory(hardware.network, options);
+   prodigyCollectGpuInventory(hardware.gpus, options);
 
    bool haveNetworkAddressing = false;
    for (const MachineNicHardwareProfile& nic : hardware.network.nics)

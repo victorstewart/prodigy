@@ -897,6 +897,12 @@ static void testContainerPeerEgressRouterRewritesCrossMachineWormholeReplyForOve
 
 int main(void)
 {
+   if (const char *allow = std::getenv("PRODIGY_DEV_ALLOW_BPF_ATTACH"); allow == nullptr || std::strcmp(allow, "1") != 0)
+   {
+      std::fprintf(stderr, "SKIP: container overlay sync unit loads BPF programs; set PRODIGY_DEV_ALLOW_BPF_ATTACH=1 only inside an authorized isolated VM\n");
+      return 77;
+   }
+
    TestSuite suite = {};
 
    testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntries(suite);

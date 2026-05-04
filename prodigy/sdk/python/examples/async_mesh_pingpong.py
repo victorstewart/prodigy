@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import socket
 from enum import Enum, auto
 
@@ -53,8 +54,8 @@ class MeshDispatch(DefaultDispatch):
       self.pairing_events = 0
       self.resource_delta_events = 0
       self.credentials_refresh_events = 0
-      self._active_advertisements: set[tuple[int, int, bytes]] = set()
-      self._active_subscriptions: set[tuple[int, int, int, bytes]] = set()
+      self._active_advertisements: dict[tuple[int, int, bytes], AdvertisementPairing] = {}
+      self._active_subscriptions: dict[tuple[int, int, int, bytes], SubscriptionPairing] = {}
 
    def seed(self, parameters: ContainerParameters) -> None:
       for pairing in parameters.advertisement_pairings:
@@ -91,21 +92,33 @@ class MeshDispatch(DefaultDispatch):
       hub.acknowledge_credentials_refresh()
       self.publish_stats(hub)
 
+   def advertisement_for_peer(self, peer_address: str | None) -> AdvertisementPairing | None:
+      if peer_address is not None:
+         try:
+            address = ipaddress.IPv6Address(peer_address.split("%", 1)[0]).packed
+         except ValueError:
+            address = b""
+         if address:
+            for pairing in self._active_advertisements.values():
+               if pairing.address.bytes == address:
+                  return pairing
+      return next(iter(self._active_advertisements.values()), None)
+
    def _track_advertisement(self, pairing: AdvertisementPairing) -> None:
       self.pairing_events += 1
       if pairing.activate:
-         self._active_advertisements.add(advertisement_key(pairing))
+         self._active_advertisements[advertisement_key(pairing)] = pairing
          self.advertisements.put_nowait(pairing)
       else:
-         self._active_advertisements.discard(advertisement_key(pairing))
+         self._active_advertisements.pop(advertisement_key(pairing), None)
 
    def _track_subscription(self, pairing: SubscriptionPairing) -> None:
       self.pairing_events += 1
       if pairing.activate:
-         self._active_subscriptions.add(subscription_key(pairing))
+         self._active_subscriptions[subscription_key(pairing)] = pairing
          self.subscriptions.put_nowait(pairing)
       else:
-         self._active_subscriptions.discard(subscription_key(pairing))
+         self._active_subscriptions.pop(subscription_key(pairing), None)
 
 
 async def next_active_pairing(queue: "asyncio.Queue[AdvertisementPairing | SubscriptionPairing]") -> AdvertisementPairing | SubscriptionPairing:
@@ -117,14 +130,19 @@ async def next_active_pairing(queue: "asyncio.Queue[AdvertisementPairing | Subsc
 
 async def start_advertiser_server(
    port: int,
-   pairing: AdvertisementPairing,
+   dispatch: MeshDispatch,
 ) -> tuple[asyncio.AbstractServer, asyncio.Future[Role]]:
    loop = asyncio.get_running_loop()
    completed: asyncio.Future[Role] = loop.create_future()
-   session = AegisSession.from_advertisement(pairing)
 
    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
       try:
+         peer = writer.get_extra_info("peername")
+         peer_address = peer[0] if isinstance(peer, tuple) and peer else None
+         pairing = dispatch.advertisement_for_peer(peer_address)
+         if pairing is None:
+            return
+         session = AegisSession.from_advertisement(pairing)
          for index in range(PING_COUNT):
             frame = await asyncio.wait_for(read_aegis_frame(reader), timeout=PING_TIMEOUT_SECONDS)
             plaintext, _ = session.decrypt(frame)
@@ -157,34 +175,32 @@ async def run_subscriber(pairing: SubscriptionPairing) -> Role:
    loop = asyncio.get_running_loop()
    deadline = loop.time() + CONNECT_TIMEOUT_SECONDS
    session = AegisSession.from_subscription(pairing)
+   last_error: BaseException | None = None
 
-   while True:
+   while loop.time() < deadline:
+      writer: asyncio.StreamWriter | None = None
       try:
          reader, writer = await asyncio.wait_for(
             asyncio.open_connection(str(pairing.ipv6_addr()), pairing.port, family=socket.AF_INET6),
             timeout=1.0,
          )
-         break
-      except (ConnectionRefusedError, OSError) as error:
-         if loop.time() >= deadline:
-            raise RuntimeError(
-               f"timed out connecting to [{pairing.ipv6_addr()}]:{pairing.port}"
-            ) from error
+         for index in range(PING_COUNT):
+            writer.write(session.encrypt(f"ping {index}\n".encode()))
+            await writer.drain()
+            frame = await asyncio.wait_for(read_aegis_frame(reader), timeout=PING_TIMEOUT_SECONDS)
+            plaintext, _ = session.decrypt(frame)
+            if plaintext != f"pong {index}\n".encode():
+               raise RuntimeError(f"unexpected pong payload {plaintext!r}")
+         return Role.SUBSCRIBER
+      except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionRefusedError, OSError, RuntimeError) as error:
+         last_error = error
          await asyncio.sleep(0.25)
+      finally:
+         if writer is not None:
+            writer.close()
+            await writer.wait_closed()
 
-   try:
-      for index in range(PING_COUNT):
-         writer.write(session.encrypt(f"ping {index}\n".encode()))
-         await writer.drain()
-         frame = await asyncio.wait_for(read_aegis_frame(reader), timeout=PING_TIMEOUT_SECONDS)
-         plaintext, _ = session.decrypt(frame)
-         if plaintext != f"pong {index}\n".encode():
-            raise RuntimeError(f"unexpected pong payload {plaintext!r}")
-   finally:
-      writer.close()
-      await writer.wait_closed()
-
-   return Role.SUBSCRIBER
+   raise RuntimeError(f"timed out connecting to [{pairing.ipv6_addr()}]:{pairing.port}") from last_error
 
 
 async def main() -> None:
@@ -205,7 +221,7 @@ async def main() -> None:
    if role is Role.ADVERTISER:
       server, completed = await start_advertiser_server(
          parameters.advertises[0].port,
-         parameters.advertisement_pairings[0],
+         dispatch,
       )
       await neuron.ready()
       ready_sent = True

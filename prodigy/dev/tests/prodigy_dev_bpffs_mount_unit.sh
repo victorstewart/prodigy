@@ -17,6 +17,12 @@ then
    exit 77
 fi
 
+if [[ "${PRODIGY_DEV_ALLOW_BPF_ATTACH:-0}" != "1" ]]
+then
+   echo "SKIP: bpffs mount unit requires PRODIGY_DEV_ALLOW_BPF_ATTACH=1"
+   exit 77
+fi
+
 deps=(mktemp ps stat timeout)
 for cmd in "${deps[@]}"
 do
@@ -47,7 +53,6 @@ cleanup()
 }
 trap cleanup EXIT
 
-export PRODIGY_DEV_ALLOW_BPF_ATTACH=1
 "${SCRIPT_DIR}/prodigy_dev_netns_harness.sh" \
    "${PRODIGY_BIN}" \
    --runner-mode=persistent \

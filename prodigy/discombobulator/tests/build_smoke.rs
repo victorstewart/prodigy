@@ -3624,7 +3624,13 @@ fn main() {
     .unwrap();
     let rust_build = Command::new("cargo")
         .current_dir(&rust_context)
-        .args(["build", "--release", "--offline"])
+        .args([
+            "build",
+            "--release",
+            "--offline",
+            "--target-dir",
+            rust_context.join("target").to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     assert!(
@@ -3689,14 +3695,18 @@ EXECUTE [\"/app/bin/rust-app\"]
     fs::create_dir_all(python_context.join("bin")).unwrap();
     fs::create_dir_all(python_context.join("config")).unwrap();
     fs::create_dir_all(python_context.join("data")).unwrap();
-    fs::create_dir_all(python_context.join("vendor")).unwrap();
+    fs::create_dir_all(python_context.join("vendor/packaging")).unwrap();
     fs::create_dir_all(python_context.join("generated")).unwrap();
-    let packaging_root = host_python_module_root("packaging");
-    copy_tree_into_context(
-        &packaging_root,
-        &python_context,
-        Path::new("/vendor/packaging"),
-    );
+    fs::write(python_context.join("vendor/packaging/__init__.py"), "").unwrap();
+    fs::write(
+        python_context.join("vendor/packaging/version.py"),
+        r#"
+class Version:
+    def __init__(self, value):
+        self.major = int(str(value).split(".")[0])
+        "#,
+    )
+    .unwrap();
     fs::write(
         python_context.join("main.py"),
         r#"
@@ -3805,16 +3815,40 @@ EXECUTE [\"{}\", \"/app/main.py\"]
     );
 
     let typescript_context = project.join("typescriptctx");
+    let node_runtime = fs::canonicalize(&node_binary).unwrap_or_else(|_| node_binary.clone());
     fs::create_dir_all(typescript_context.join("src")).unwrap();
     fs::create_dir_all(typescript_context.join("bin")).unwrap();
     fs::create_dir_all(typescript_context.join("config")).unwrap();
     fs::create_dir_all(typescript_context.join("data")).unwrap();
     fs::create_dir_all(typescript_context.join("generated")).unwrap();
     let packed_sdk = typescript_context.join("prodigy-neuron-hub.tgz");
-    create_local_npm_package_tarball(
-        Path::new("/root/prodigy/prodigy/sdk/typescript"),
-        &packed_sdk,
+    let sdk_source_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("sdk/typescript");
+    let sdk_package_root = project.join("typescript-sdk-package");
+    copy_tree_into_context(&sdk_source_root, project, Path::new("/typescript-sdk-package"));
+    let sdk_install = Command::new("npm")
+        .current_dir(&sdk_package_root)
+        .args(["install", "--no-package-lock", "--ignore-scripts"])
+        .output()
+        .unwrap();
+    assert!(
+        sdk_install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sdk_install.stderr)
     );
+    let sdk_build = Command::new("npm")
+        .current_dir(&sdk_package_root)
+        .args(["run", "build"])
+        .output()
+        .unwrap();
+    assert!(
+        sdk_build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sdk_build.stderr)
+    );
+    create_local_npm_package_tarball(&sdk_package_root, &packed_sdk);
     fs::write(
         typescript_context.join("package.json"),
         format!(
@@ -3932,8 +3966,8 @@ SURVIVE /app/node_modules/*
 EXECUTE [\"{}\", \"/app/dist/main.js\"]
 ",
             shell_target.display(),
-            node_binary.display(),
-            node_binary.display()
+            node_runtime.display(),
+            node_runtime.display()
         ),
     )
     .unwrap();
@@ -4177,22 +4211,6 @@ fn host_python_stdlib() -> PathBuf {
         .args([
             "-c",
             "import sysconfig; print(sysconfig.get_paths()['stdlib'])",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
-}
-
-fn host_python_module_root(module: &str) -> PathBuf {
-    let output = Command::new("python3")
-        .args([
-            "-c",
-            &format!("import {module}, os; print(os.path.dirname({module}.__file__))"),
         ])
         .output()
         .unwrap();

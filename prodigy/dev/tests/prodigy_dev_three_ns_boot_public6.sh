@@ -10,5 +10,5 @@ exec "${SCRIPT_DIR}/prodigy_dev_netns_harness.sh" \
    --duration=14 \
    --brain-bootstrap-family=public6 \
    --enable-fake-ipv4-boundary=0 \
-   --require-brain-log-substring='nRegistered=3 required=3' \
-   --require-brain-log-substring='brain transport tls peer verified'
+   --expect-full-brain-registration=1 \
+   --require-brain-log-substring='tls-verify ok'

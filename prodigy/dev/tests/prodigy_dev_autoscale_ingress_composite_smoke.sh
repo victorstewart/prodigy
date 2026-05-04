@@ -26,6 +26,7 @@ run_case()
    local emit_metric_name="$2"
    local scaler_metric_name="$3"
    local scaler_threshold="$4"
+   local report_scaler_name="$5"
    local rc=0
 
    echo "=== AUTOSCALE_INGRESS_COMPOSITE_CASE ${case_name} ==="
@@ -35,8 +36,10 @@ run_case()
       PINGPONG_METRIC_NAME="${emit_metric_name}" \
       PRODIGY_DEV_AUTOSCALE_METRICS_SCALER_METRIC_NAME="${scaler_metric_name}" \
       PRODIGY_DEV_AUTOSCALE_METRICS_SCALER_THRESHOLD="${scaler_threshold}" \
-      PRODIGY_DEV_AUTOSCALE_METRICS_ENABLE_REPORT_CHECKS="${PRODIGY_DEV_AUTOSCALE_INGRESS_ENABLE_REPORT_CHECKS:-0}" \
-      PRODIGY_DEV_AUTOSCALE_METRICS_REQUIRE_BRAIN_LOG_SUBSTRING="${PRODIGY_DEV_AUTOSCALE_INGRESS_REQUIRE_BRAIN_LOG_SUBSTRING:-autoscale ingressComposite deploymentID=}" \
+      PRODIGY_DEV_AUTOSCALE_METRICS_ENABLE_REPORT_CHECKS="${PRODIGY_DEV_AUTOSCALE_INGRESS_ENABLE_REPORT_CHECKS:-1}" \
+      PRODIGY_DEV_AUTOSCALE_METRICS_REQUIRE_BRAIN_LOG_SUBSTRING="${PRODIGY_DEV_AUTOSCALE_INGRESS_REQUIRE_BRAIN_LOG_SUBSTRING:-}" \
+      PRODIGY_DEV_AUTOSCALE_METRICS_REQUIRE_SCALER_NAME="${report_scaler_name}" \
+      PRODIGY_DEV_AUTOSCALE_METRICS_REQUIRE_SCALER_VALUE_MIN="${scaler_threshold}" \
       PRODIGY_DEV_AUTOSCALE_METRICS_REPORT_TRAFFIC_BURST="${PRODIGY_DEV_AUTOSCALE_INGRESS_REPORT_TRAFFIC_BURST:-8}" \
       PRODIGY_DEV_AUTOSCALE_METRICS_CASE_ATTEMPTS="${PRODIGY_DEV_AUTOSCALE_INGRESS_CASE_ATTEMPTS:-3}" \
       PRODIGY_DEV_AUTOSCALE_METRICS_HARNESS_BRAINS="${PRODIGY_DEV_AUTOSCALE_INGRESS_HARNESS_BRAINS:-3}" \
@@ -66,12 +69,14 @@ run_case \
    "queue_wait_composite_alias" \
    "runtime.ingress.queue_wait_us.fine.bucket.10" \
    "ScalingDimension::runtimeIngressQueueWaitComposite" \
-   "${PRODIGY_DEV_AUTOSCALE_INGRESS_QUEUE_WAIT_THRESHOLD:-100.0}"
+   "${PRODIGY_DEV_AUTOSCALE_INGRESS_QUEUE_WAIT_THRESHOLD:-100.0}" \
+   "runtime.ingress.queue_wait_us.composite"
 
 run_case \
    "handler_composite_alias" \
    "runtime.ingress.handler_us.fine.bucket.9" \
    "ScalingDimension::runtimeIngressHandlerComposite" \
-   "${PRODIGY_DEV_AUTOSCALE_INGRESS_HANDLER_THRESHOLD:-100.0}"
+   "${PRODIGY_DEV_AUTOSCALE_INGRESS_HANDLER_THRESHOLD:-100.0}" \
+   "runtime.ingress.handler_us.composite"
 
 echo "AUTOSCALE_INGRESS_COMPOSITE_PASS"

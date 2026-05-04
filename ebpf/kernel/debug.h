@@ -20,7 +20,7 @@ struct {
    __uint(max_entries, 256);
 } packet_map SEC(".maps");
 
-__attribute__((__always_inline__)) 
+__attribute__((__always_inline__))
 static inline struct packet_frame * getFrame(struct packet *pkt)
 {
    switch (pkt->nFrames)
@@ -52,7 +52,7 @@ static inline struct packet_frame * getFrame(struct packet *pkt)
    }
 }
 
-__attribute__((__always_inline__)) 
+__attribute__((__always_inline__))
 static inline void logTcpFrame(struct tcphdr *tcp, struct packet *pkt, void *data_end)
 {
    struct packet_frame *frame = getFrame(pkt);
@@ -82,7 +82,7 @@ static inline void logTcpFrame(struct tcphdr *tcp, struct packet *pkt, void *dat
    }
 }
 
-__attribute__((__always_inline__)) 
+__attribute__((__always_inline__))
 static inline void logUdpFrame(struct udphdr *udp, struct packet *pkt, void *data_end)
 {
    struct packet_frame *frame = getFrame(pkt);
@@ -93,7 +93,7 @@ static inline void logUdpFrame(struct udphdr *udp, struct packet *pkt, void *dat
    frame->udp.payload_len = udp->len;
 }
 
-__attribute__((__always_inline__)) 
+__attribute__((__always_inline__))
 static inline void logIcmp6Frame(struct icmp6hdr *icmp6, struct packet *pkt, void *data_end)
 {
    struct packet_frame *frame = getFrame(pkt);
@@ -103,7 +103,7 @@ static inline void logIcmp6Frame(struct icmp6hdr *icmp6, struct packet *pkt, voi
    frame->icmp6.code = icmp6->icmp6_code;
 }
 
-__attribute__((__always_inline__)) 
+__attribute__((__always_inline__))
 static inline void logIpFrame(struct iphdr *ip, struct packet *pkt, void *data_end)
 {
    struct packet_frame *frame = getFrame(pkt);
@@ -141,7 +141,7 @@ static inline void logIpFrame(struct iphdr *ip, struct packet *pkt, void *data_e
    }
 }
 
-__attribute__((__always_inline__)) 
+__attribute__((__always_inline__))
 static inline void logIpFrameHeader(struct iphdr *ip, struct packet *pkt)
 {
    struct packet_frame *frame = getFrame(pkt);
@@ -152,7 +152,7 @@ static inline void logIpFrameHeader(struct iphdr *ip, struct packet *pkt)
    bpf_memcpy(frame->ip.dest, &ip->daddr, 4);
 }
 
-__attribute__((__always_inline__)) 
+__attribute__((__always_inline__))
 static inline void logIp6Frame(struct ipv6hdr *ip6, struct packet *pkt, void *data_end)
 {
    struct packet_frame *frame = getFrame(pkt);
@@ -219,7 +219,7 @@ static inline void logIp6Frame(struct ipv6hdr *ip6, struct packet *pkt, void *da
 
          break;
       }
-      case 0: 
+      case 0:
       {
          struct ipv6_opt_hdr *opt = (struct ipv6_opt_hdr *)(ip6 + 1);
 
@@ -243,7 +243,7 @@ static inline void logIp6Frame(struct ipv6hdr *ip6, struct packet *pkt, void *da
    }
 }
 
-__attribute__((__always_inline__)) 
+__attribute__((__always_inline__))
 static inline void logIp6FrameHeader(struct ipv6hdr *ip6, struct packet *pkt)
 {
    struct packet_frame *frame = getFrame(pkt);
@@ -254,7 +254,7 @@ static inline void logIp6FrameHeader(struct ipv6hdr *ip6, struct packet *pkt)
    bpf_memcpy(frame->ip6.dest, &ip6->daddr, 16);
 }
 
-__attribute__((__always_inline__)) 
+__attribute__((__always_inline__))
 static inline void logEthFrame(struct ethhdr *eth, struct packet *pkt, void *data_end)
 {
    struct packet_frame *frame = getFrame(pkt);
@@ -265,7 +265,7 @@ static inline void logEthFrame(struct ethhdr *eth, struct packet *pkt, void *dat
    bpf_memcpy(frame->eth.src, eth->h_source, 6);
    bpf_memcpy(frame->eth.dest, eth->h_dest, 6);
 
-   if (eth->h_proto == BE_ETH_P_IPV6) 
+   if (eth->h_proto == BE_ETH_P_IPV6)
    {
       struct ipv6hdr *ip6 = (struct ipv6hdr *)(eth + 1);
 
@@ -285,7 +285,7 @@ static inline void logEthFrame(struct ethhdr *eth, struct packet *pkt, void *dat
    }
 }
 
-__attribute__((__always_inline__)) 
+__attribute__((__always_inline__))
 static inline void logEthFrameShallow(struct ethhdr *eth, struct packet *pkt, void *data_end)
 {
    struct packet_frame *frame = getFrame(pkt);
@@ -316,7 +316,7 @@ static inline void logEthFrameShallow(struct ethhdr *eth, struct packet *pkt, vo
    }
 }
 
-__attribute__((__always_inline__)) 
+__attribute__((__always_inline__))
 static inline void logPacket(struct ethhdr *eth, void *data_end)
 {
    __u32 zeroidx = 0;
@@ -354,7 +354,7 @@ static inline void logPacket(struct ethhdr *eth, void *data_end)
    }
 }
 
-__attribute__((__always_inline__)) 
+__attribute__((__always_inline__))
 static inline void logPacketShallow(struct ethhdr *eth, void *data_end)
 {
    __u32 zeroidx = 0;
@@ -392,7 +392,7 @@ static inline void logPacketShallow(struct ethhdr *eth, void *data_end)
    }
 }
 
-__attribute__((__always_inline__)) 
+__attribute__((__always_inline__))
 static inline void logXDP(struct xdp_md *ctx)
 {
    struct ethhdr *eth = NULL;
@@ -407,7 +407,7 @@ static inline void logXDP(struct xdp_md *ctx)
    logPacketShallow(eth, data_end);
 }
 
-__attribute__((__always_inline__)) 
+__attribute__((__always_inline__))
 static inline void logSKB(struct __sk_buff *skb)
 {
    struct ethhdr *eth = NULL;
@@ -422,7 +422,7 @@ static inline void logSKB(struct __sk_buff *skb)
    logPacketShallow(eth, data_end);
 }
 
-__attribute__((__always_inline__)) 
+__attribute__((__always_inline__))
 static inline struct packet* getPacket(void)
 {
    __u32 zeroidx = 0;
@@ -441,25 +441,25 @@ static inline struct packet* getPacket(void)
    return NULL;
 }
 
-__attribute__((__always_inline__)) 
+__attribute__((__always_inline__))
 static inline void logPacketRedirectIfIdx(__u32 ifidx)
 {
    struct packet *pkt = getPacket();
 
-   if (pkt) 
+   if (pkt)
    {
       pkt->redirectIfIdx = ifidx;
    }
 }
 
-__attribute__((__always_inline__)) 
+__attribute__((__always_inline__))
 static inline void setBufferOnPacket(__u8 *data, __u32 data_len)
 {
    if (data_len <= 32)
    {
       struct packet *pkt = getPacket();
 
-      if (pkt) 
+      if (pkt)
       {
          pkt->buffer.len = data_len;
          bpf_memcpy(pkt->buffer.string, data, pkt->buffer.len);
@@ -467,12 +467,12 @@ static inline void setBufferOnPacket(__u8 *data, __u32 data_len)
    }
 }
 
-__attribute__((__always_inline__)) 
+__attribute__((__always_inline__))
 static inline void setCheckpoint(const char *reading)
 {
    struct packet *pkt = getPacket();
 
-   if (pkt) 
+   if (pkt)
    {
       pkt->checkpoint.len = 32;
       // pkt->checkpoint.len = sizeof(*value); // this refuses to work so... and somehow this doesn't crash so whatever?
@@ -480,12 +480,12 @@ static inline void setCheckpoint(const char *reading)
    }
 }
 
-__attribute__((__always_inline__)) 
+__attribute__((__always_inline__))
 static inline int setInstruction(int instruction)
 {
    struct packet *pkt = getPacket();
 
-   if (pkt) 
+   if (pkt)
    {
       pkt->instruction = instruction;
    }

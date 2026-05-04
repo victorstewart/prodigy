@@ -19,15 +19,17 @@ Notes
 - For production, ensure Cloudflared is installed at the configured path and credentials/tokens are provisioned out-of-band.
 - The brain’s OS update drain concurrency can be configured via the BrainConfig (serialized from mothership): `maxOSDrains`.
   - Default: `maxOSDrains=1` (upper bound; updates start serially by cadence).
- - Machine update cadence: `machineUpdateCadenceMins` (default 15). The master waits at least this long after becoming active, then starts exactly one machine update per cadence tick.
+- Machine update cadence: `machineUpdateCadenceMins` (default 15). The master waits at least this long after becoming active, then starts exactly one machine update per cadence tick.
 - VM reimages vs OS updates:
   - VM reimages (triggered by updating a `MachineConfig.vmImageURI`) always run before OS updates.
-  - OS updates only run when the mothership sets a target Clear Linux VERSION_ID; the brain enqueues only machines reporting a lower `VERSION_ID`.
-  - VM inclusion for OS-target campaigns is explicit: the mothership must pass `includeVMs=true` to include VMs; otherwise only bare metal is updated.
-   - Disable Clear Linux automatic updates on all machines so restarts do not cause unintended upgrades:
-     - `swupd autoupdate --disable`
-     - Mask any auto-update systemd units/timers if present.
- - Majority-present gating: Mutating actions execute only when more than half of the expected brains are present (registered and non-quarantined) and a majority of metro switches are reachable. Non-active masters remain read-only; state changes resume automatically after healing.
+  - In-place OS updates require the global `osUpdatesEnabled=true` switch and per-distro `osUpdatePolicies[]`. Each policy supplies `osID`, `targetVersionID`, `command`, and `includeVMs`.
+  - The scheduler is all-or-off: every controlled machine must report an `/etc/os-release` `ID` covered by a configured policy, or no in-place OS updates run. Unknown or unconfigured distros disable the whole in-place OS update path until policy coverage is complete.
+  - A covered machine is update-eligible when its `VERSION_ID` differs from its policy target.
+  - The neuron runs the matching policy `command` with `PRODIGY_TARGET_OS_ID`, `PRODIGY_TARGET_OS_VERSION_ID`, `PRODIGY_CURRENT_OS_ID`, and `PRODIGY_CURRENT_OS_VERSION_ID` in the environment. Prodigy does not infer distro package-manager commands.
+  - VM inclusion is explicit per policy with `includeVMs=true`; otherwise only bare metal is updated.
+  - Disable distro automatic updates on all machines so restarts do not cause unintended upgrades outside Prodigy orchestration.
+    Mask any auto-update systemd units/timers if present.
+- Majority-present gating: Mutating actions execute only when more than half of the expected brains are present (registered and non-quarantined) and a majority of metro switches are reachable. Non-active masters remain read-only; state changes resume automatically after healing.
  - Membership consistency: All brains must compute the same expected brain count (N) from IaaS listing (same labels/zone selectors). Divergent N values can break majority decisions.
 - Mothership queries: Use `MothershipTopic::isActiveMaster` to query whether a brain is currently the active master (returns a single byte: 1 or 0). Mutating requests (e.g., `spinApplication`, config updates) will reject when not active.
 

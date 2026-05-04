@@ -7,6 +7,9 @@ QUIC_PROBE_BIN="${3:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARNESS="${SCRIPT_DIR}/prodigy_dev_netns_harness.sh"
+source "${SCRIPT_DIR}/prodigy_dev_discombobulator_artifact_helpers.sh"
+SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+prodigy_dev_reexec_in_private_mount_namespace_once PRODIGY_DEV_QUIC_WORMHOLE_SMOKE_MOUNT_NS_READY bash "${SCRIPT_SELF}" "$@"
 
 if [[ -z "${PRODIGY_BIN}" || -z "${MOTHERSHIP_BIN}" || -z "${QUIC_PROBE_BIN}" ]]
 then
@@ -20,7 +23,7 @@ then
    exit 77
 fi
 
-deps=(awk btrfs mkfs.btrfs mount umount stat zstd ldd install timeout ip python3 rg)
+deps=(awk btrfs cargo mkfs.btrfs mount umount stat zstd timeout ip nsenter python3 rg)
 for cmd in "${deps[@]}"
 do
    if ! command -v "${cmd}" >/dev/null 2>&1
@@ -30,9 +33,16 @@ do
    fi
 done
 
+if [[ "${PRODIGY_DEV_ALLOW_BPF_ATTACH:-0}" != "1" ]]
+then
+   echo "SKIP: QUIC wormhole smoke requires fake IPv4 boundary BPF attach; set PRODIGY_DEV_ALLOW_BPF_ATTACH=1 only inside an authorized isolated VM"
+   exit 77
+fi
+
 PRODIGY_BIN="$(readlink -f "${PRODIGY_BIN}" 2>/dev/null || printf '%s' "${PRODIGY_BIN}")"
 MOTHERSHIP_BIN="$(readlink -f "${MOTHERSHIP_BIN}" 2>/dev/null || printf '%s' "${MOTHERSHIP_BIN}")"
 QUIC_PROBE_BIN="$(readlink -f "${QUIC_PROBE_BIN}" 2>/dev/null || printf '%s' "${QUIC_PROBE_BIN}")"
+target_arch="$(prodigy_dev_detect_target_arch)"
 
 tmpdir="$(mktemp -d)"
 workspace_root="${tmpdir}/workspace"
@@ -52,7 +62,6 @@ remove_log="${tmpdir}/remove_cluster.log"
 containers_dir_created=0
 containers_mount_created=0
 containers_loop_image=""
-deployment_subvol=""
 cluster_created=0
 archive_workspace=0
 
@@ -72,12 +81,6 @@ cleanup()
          PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
          "${MOTHERSHIP_BIN}" removeCluster "${cluster_name}" \
          >"${remove_log}" 2>&1 || true
-   fi
-
-   if [[ -n "${deployment_subvol}" && -e "${deployment_subvol}" ]]
-   then
-      btrfs property set -f "${deployment_subvol}" ro false >/dev/null 2>&1 || true
-      btrfs subvolume delete "${deployment_subvol}" >/dev/null 2>&1 || true
    fi
 
    if [[ "${containers_mount_created}" -eq 1 ]]
@@ -117,9 +120,9 @@ then
       fi
    fi
 
-   if [[ -n "$(ls -A /containers 2>/dev/null)" ]]
+   if ! prodigy_dev_containers_root_is_safely_overmountable /containers
    then
-      echo "FAIL: /containers exists on non-btrfs fs and is not empty"
+      echo "FAIL: /containers exists on non-btrfs fs and is not safely overmountable"
       exit 1
    fi
 
@@ -191,15 +194,21 @@ then
    exit 1
 fi
 
-read -r parent_ns <<EOF
+read -r parent_pid <<EOF
 $(python3 - "${manifest_path}" <<'PY'
 import json, sys
 with open(sys.argv[1], "r", encoding="utf-8") as fh:
     manifest = json.load(fh)
-print(manifest["parentNamespace"])
+print(manifest["parentPid"])
 PY
 )
 EOF
+
+if [[ -z "${parent_pid}" || "${parent_pid}" == "0" ]]
+then
+   echo "FAIL: unable to parse persistent harness parent pid"
+   exit 1
+fi
 
 register_request='{"name":"quic-test-ipv4","kind":"testFakeAddress","family":"ipv4"}'
 if ! env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
@@ -231,32 +240,31 @@ then
    exit 1
 fi
 
-deployment_subvol="/containers/${deployment_id}"
-btrfs subvolume create "${deployment_subvol}" >/dev/null
-mkdir -p "${deployment_subvol}/root"
-install -m 0755 "${QUIC_PROBE_BIN}" "${deployment_subvol}/root/quic_wormhole_probe_container"
+artifact_project_dir="${tmpdir}/quic-artifact"
+discombobulator_file="${artifact_project_dir}/QuicWormholeProbe.DiscombobuFile"
+container_blob="${tmpdir}/quic.container.zst"
+mkdir -p "${artifact_project_dir}"
+cat > "${discombobulator_file}" <<EOF
+FROM scratch for ${target_arch}
+COPY {bin} ./$(basename "${QUIC_PROBE_BIN}") /root/quic_wormhole_probe_container
+SURVIVE /root/quic_wormhole_probe_container
+EOF
+prodigy_dev_write_common_prodigy_assets "${discombobulator_file}"
+cat >> "${discombobulator_file}" <<'EOF'
+EXECUTE ["/root/quic_wormhole_probe_container"]
+EOF
 
-while IFS= read -r libpath
-do
-   if [[ -z "${libpath}" ]]
-   then
-      continue
-   fi
-
-   if [[ -e "${libpath}" ]]
-   then
-      cp -aL --parents "${libpath}" "${deployment_subvol}"
-   fi
-done < <(
-   ldd "${QUIC_PROBE_BIN}" | awk '
-      /=>/ {
-         if ($3 ~ /^\//) print $3;
-      }
-      /^[[:space:]]*\// {
-         print $1;
-      }
-   ' | sort -u
-)
+if ! prodigy_dev_run_discombobulator_build \
+   "${artifact_project_dir}" \
+   "${discombobulator_file}" \
+   "${container_blob}" \
+   "bin=$(dirname "${QUIC_PROBE_BIN}")" \
+   "ebpf=$(dirname "${PRODIGY_BIN}")"
+then
+   archive_workspace=1
+   echo "FAIL: unable to build QUIC wormhole artifact"
+   exit 1
+fi
 
 plan_json="${tmpdir}/quic.plan.json"
 cat > "${plan_json}" <<EOF
@@ -265,6 +273,7 @@ cat > "${plan_json}" <<EOF
     "type": "ApplicationType::stateless",
     "applicationID": ${application_id},
     "versionID": ${version_id},
+    "architecture": "${target_arch}",
     "filesystemMB": 64,
     "storageMB": 64,
     "memoryMB": 256,
@@ -296,13 +305,6 @@ cat > "${plan_json}" <<EOF
   "requiresDatacenterUniqueTag": false
 }
 EOF
-
-container_blob="${tmpdir}/quic.container.zst"
-btrfs property set -f "${deployment_subvol}" ro true >/dev/null
-btrfs send "${deployment_subvol}" | zstd -19 -T0 -q -o "${container_blob}"
-btrfs property set -f "${deployment_subvol}" ro false >/dev/null
-btrfs subvolume delete "${deployment_subvol}" >/dev/null
-deployment_subvol=""
 
 if ! env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
    "${MOTHERSHIP_BIN}" deploy "${cluster_name}" "$(cat "${plan_json}")" "${container_blob}" \
@@ -344,6 +346,7 @@ then
 fi
 
 probe_log=""
+probe_trace_log="${tmpdir}/quic_probe_trace.log"
 for _ in $(seq 1 120)
 do
    for stdout_log in $(python3 - "${manifest_path}" <<'PY'
@@ -359,6 +362,23 @@ PY
       then
          probe_log="${stdout_log}"
          break
+      fi
+
+      container_pid="$(
+         rg -o 'spinContainer start ok deploymentID=[0-9]+ appID=6 .* pid=[0-9]+' "${stdout_log}" 2>/dev/null \
+            | tail -n 1 \
+            | sed -E 's/.* pid=([0-9]+).*/\1/'
+      )"
+      if [[ -n "${container_pid}" ]] && kill -0 "${container_pid}" >/dev/null 2>&1
+      then
+         container_trace_path="/proc/${container_pid}/root/quic_wormhole_probe_trace.log"
+         if [[ -r "${container_trace_path}" ]] && rg -q 'probe\.cid ' "${container_trace_path}"
+         then
+            probe_log="${container_trace_path}"
+            break
+         fi
+
+         cat "${container_trace_path}" >"${probe_trace_log}" 2>/dev/null || true
       fi
    done
 
@@ -395,7 +415,7 @@ then
    exit 1
 fi
 
-ip netns exec "${parent_ns}" \
+if ! nsenter -t "${parent_pid}" -n \
    env QUIC_WORMHOLE_TARGET="${routable_address}" \
    QUIC_WORMHOLE_PORT="18443" \
    QUIC_WORMHOLE_CID="${cid_hex}" \
@@ -421,6 +441,12 @@ sock.sendto(packet, target)
 reply, addr = sock.recvfrom(256)
 print(f"reply={reply.decode(errors='replace')} from={addr[0]}:{addr[1]}")
 PY
+then
+   archive_workspace=1
+   echo "FAIL: QUIC wormhole sender command failed"
+   sed -n '1,120p' "${sender_log}" || true
+   exit 1
+fi
 
 if ! rg -q 'reply=wormhole-ok' "${sender_log}"
 then

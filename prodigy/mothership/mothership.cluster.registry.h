@@ -915,6 +915,42 @@ private:
       return true;
    }
 
+   static bool validateOSUpdatePoliciesForStorage(const Vector<OperatingSystemUpdatePolicy>& policies, String *failure)
+   {
+      for (uint32_t index = 0; index < policies.size(); ++index)
+      {
+         const OperatingSystemUpdatePolicy& policy = policies[index];
+         if (policy.osID.size() == 0)
+         {
+            if (failure) failure->assign("osUpdatePolicies require osID");
+            return false;
+         }
+
+         if (policy.targetVersionID.size() == 0)
+         {
+            if (failure) failure->assign("osUpdatePolicies require targetVersionID");
+            return false;
+         }
+
+         if (policy.command.size() == 0)
+         {
+            if (failure) failure->assign("osUpdatePolicies require command");
+            return false;
+         }
+
+         for (uint32_t other = index + 1; other < policies.size(); ++other)
+         {
+            if (policies[other].osID.equals(policy.osID))
+            {
+               if (failure) failure->assign("osUpdatePolicies contain duplicate osID");
+               return false;
+            }
+         }
+      }
+
+      return true;
+   }
+
    static bool normalizeClusterForStorage(MothershipProdigyCluster& cluster, String *failure)
    {
       if (cluster.name.size() == 0)
@@ -1123,6 +1159,17 @@ private:
       if (cluster.autoscaleIntervalSeconds == 0 || cluster.autoscaleIntervalSeconds > 86'400)
       {
          if (failure) failure->assign("cluster autoscaleIntervalSeconds must be in 1..86400");
+         return false;
+      }
+
+      if (validateOSUpdatePoliciesForStorage(cluster.osUpdatePolicies, failure) == false)
+      {
+         return false;
+      }
+
+      if (cluster.osUpdatesEnabled && cluster.osUpdatePolicies.empty())
+      {
+         if (failure) failure->assign("osUpdatesEnabled requires osUpdatePolicies");
          return false;
       }
 

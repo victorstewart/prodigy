@@ -46,10 +46,9 @@ Each case asserts one or more of:
 ## Current Full-Matrix Status (latest run)
 
 - Total cases: 19
-- Passed: 17
-- Failed:
-  - `master_transient_crash_requires_failover_master1`
-  - `follower3_transient_partition_heals_master1`
+- Passed: 19
+- Failed: none
+- Latest isolated-netns run: `prodigy_dev_master_failure_matrix.close_epoch_fix.20260424T032520Z.log`
 
 ## Current Upgrade-Sim Status (latest run)
 

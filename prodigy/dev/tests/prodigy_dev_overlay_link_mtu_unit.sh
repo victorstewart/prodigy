@@ -19,6 +19,12 @@ then
    exit 77
 fi
 
+if [[ "${PRODIGY_DEV_ALLOW_BPF_ATTACH:-0}" != "1" ]]
+then
+   echo "SKIP: overlay link MTU unit requires PRODIGY_DEV_ALLOW_BPF_ATTACH=1"
+   exit 77
+fi
+
 deps=(mktemp ps stat timeout ip nsenter grep cut awk)
 for cmd in "${deps[@]}"
 do
@@ -32,7 +38,9 @@ done
 tmpdir="$(mktemp -d "${REPO_ROOT}/.run/prodigy-dev-overlay-link-mtu-unit.XXXXXX")"
 workspace_root="${tmpdir}/workspace"
 manifest_path="${workspace_root}/test-cluster-manifest.json"
+harness_log="${tmpdir}/harness.log"
 harness_pid=""
+keep_tmpdir="${PRODIGY_DEV_KEEP_TMP:-0}"
 
 cleanup()
 {
@@ -45,9 +53,34 @@ cleanup()
       kill -KILL "${harness_pid}" >/dev/null 2>&1 || true
    fi
 
-   rm -rf "${tmpdir}"
+   if [[ "${keep_tmpdir}" -eq 0 ]]
+   then
+      rm -rf "${tmpdir}"
+   else
+      echo "RETAINED: ${tmpdir}" >&2
+   fi
 }
 trap cleanup EXIT
+
+fail()
+{
+   keep_tmpdir=1
+   echo "FAIL: $*" >&2
+   if [[ -f "${harness_log}" ]]
+   then
+      echo "harness log: ${harness_log}" >&2
+      sed -n '1,220p' "${harness_log}" >&2 || true
+   fi
+   if compgen -G "${workspace_root}/logs/brain*.stdout.log" >/dev/null
+   then
+      for brain_log in "${workspace_root}"/logs/brain*.stdout.log
+      do
+         echo "brain log tail: ${brain_log}" >&2
+         tail -n 80 "${brain_log}" >&2 || true
+      done
+   fi
+   exit 1
+}
 
 extract_json_string()
 {
@@ -82,8 +115,7 @@ assert_link_mtu()
 
    if [[ "${observed_mtu}" != "${EXPECTED_UNDERLAY_MTU}" ]]
    then
-      echo "FAIL: ${label} mtu=${observed_mtu} expected=${EXPECTED_UNDERLAY_MTU}"
-      exit 1
+      fail "${label} mtu=${observed_mtu} expected=${EXPECTED_UNDERLAY_MTU}"
    fi
 }
 
@@ -95,12 +127,10 @@ assert_link_budget()
 
    if [[ "${observed_value}" != "${EXPECTED_UNDERLAY_MTU}" ]]
    then
-      echo "FAIL: ${label} ${field}=${observed_value} expected=${EXPECTED_UNDERLAY_MTU}"
-      exit 1
+      fail "${label} ${field}=${observed_value} expected=${EXPECTED_UNDERLAY_MTU}"
    fi
 }
 
-export PRODIGY_DEV_ALLOW_BPF_ATTACH=1
 "${SCRIPT_DIR}/prodigy_dev_netns_harness.sh" \
    "${PRODIGY_BIN}" \
    --runner-mode=persistent \
@@ -109,57 +139,66 @@ export PRODIGY_DEV_ALLOW_BPF_ATTACH=1
    --machines=3 \
    --brains=3 \
    --inter-container-mtu="${EXPECTED_INTER_CONTAINER_MTU}" \
-   >/dev/null 2>&1 &
+   >"${harness_log}" 2>&1 &
 harness_pid="$!"
 
-timeout 60s bash -lc '
+if ! timeout 180s bash -lc '
    while [[ ! -s "'"${manifest_path}"'" ]]
    do
+      if ! kill -0 "'"${harness_pid}"'" >/dev/null 2>&1
+      then
+         exit 2
+      fi
       sleep 0.1
    done
 ' >/dev/null
+then
+   fail "persistent harness did not produce a manifest"
+fi
 
 parent_ns="$(extract_json_string "parentNamespace" "${manifest_path}")"
 if [[ -z "${parent_ns}" ]]
 then
-   echo "FAIL: unable to resolve parent namespace from manifest"
-   exit 1
+   fail "unable to resolve parent namespace from manifest"
+fi
+
+parent_pid="$(extract_json_number "parentPid" "${manifest_path}")"
+if [[ -z "${parent_pid}" || "${parent_pid}" == "0" ]]
+then
+   fail "unable to resolve parent pid from manifest"
 fi
 
 manifest_inter_container_mtu="$(extract_json_number "interContainerMTU" "${manifest_path}")"
 if [[ "${manifest_inter_container_mtu}" != "${EXPECTED_INTER_CONTAINER_MTU}" ]]
 then
-   echo "FAIL: manifest interContainerMTU=${manifest_inter_container_mtu} expected=${EXPECTED_INTER_CONTAINER_MTU}"
-   exit 1
+   fail "manifest interContainerMTU=${manifest_inter_container_mtu} expected=${EXPECTED_INTER_CONTAINER_MTU}"
 fi
 
 mapfile -t brain_pids < <(grep -o '"pid":[0-9]*' "${manifest_path}" | cut -d: -f2)
 if [[ "${#brain_pids[@]}" -ne 3 ]]
 then
-   echo "FAIL: expected 3 brain pids in manifest, saw ${#brain_pids[@]}"
-   exit 1
+   fail "expected 3 brain pids in manifest, saw ${#brain_pids[@]}"
 fi
 
-parent_bridge_mtu="$(extract_link_mtu ip netns exec "${parent_ns}" ip -o link show dev prodigy-br0)"
+parent_bridge_mtu="$(extract_link_mtu nsenter -t "${parent_pid}" -n ip -o link show dev prodigy-br0)"
 assert_link_mtu "${parent_bridge_mtu}" "parent_ns/prodigy-br0"
 
 for idx in 1 2 3
 do
-   parent_if_mtu="$(extract_link_mtu ip netns exec "${parent_ns}" ip -o link show dev "bp${idx}")"
+   parent_if_mtu="$(extract_link_mtu nsenter -t "${parent_pid}" -n ip -o link show dev "bp${idx}")"
    assert_link_mtu "${parent_if_mtu}" "parent_ns/bp${idx}"
-   parent_if_gso="$(extract_link_detail_field gso_max_size ip netns exec "${parent_ns}" ip -details link show dev "bp${idx}")"
+   parent_if_gso="$(extract_link_detail_field gso_max_size nsenter -t "${parent_pid}" -n ip -details link show dev "bp${idx}")"
    assert_link_budget "${parent_if_gso}" "gso_max_size" "parent_ns/bp${idx}"
-   parent_if_gso_segs="$(extract_link_detail_field gso_max_segs ip netns exec "${parent_ns}" ip -details link show dev "bp${idx}")"
+   parent_if_gso_segs="$(extract_link_detail_field gso_max_segs nsenter -t "${parent_pid}" -n ip -details link show dev "bp${idx}")"
    if [[ "${parent_if_gso_segs}" != "1" ]]
    then
-      echo "FAIL: parent_ns/bp${idx} gso_max_segs=${parent_if_gso_segs} expected=1"
-      exit 1
+      fail "parent_ns/bp${idx} gso_max_segs=${parent_if_gso_segs} expected=1"
    fi
-   parent_if_gso_ipv4="$(extract_link_detail_field gso_ipv4_max_size ip netns exec "${parent_ns}" ip -details link show dev "bp${idx}")"
+   parent_if_gso_ipv4="$(extract_link_detail_field gso_ipv4_max_size nsenter -t "${parent_pid}" -n ip -details link show dev "bp${idx}")"
    assert_link_budget "${parent_if_gso_ipv4}" "gso_ipv4_max_size" "parent_ns/bp${idx}"
-   parent_if_gro="$(extract_link_detail_field gro_max_size ip netns exec "${parent_ns}" ip -details link show dev "bp${idx}")"
+   parent_if_gro="$(extract_link_detail_field gro_max_size nsenter -t "${parent_pid}" -n ip -details link show dev "bp${idx}")"
    assert_link_budget "${parent_if_gro}" "gro_max_size" "parent_ns/bp${idx}"
-   parent_if_gro_ipv4="$(extract_link_detail_field gro_ipv4_max_size ip netns exec "${parent_ns}" ip -details link show dev "bp${idx}")"
+   parent_if_gro_ipv4="$(extract_link_detail_field gro_ipv4_max_size nsenter -t "${parent_pid}" -n ip -details link show dev "bp${idx}")"
    assert_link_budget "${parent_if_gro_ipv4}" "gro_ipv4_max_size" "parent_ns/bp${idx}"
 done
 
@@ -179,8 +218,7 @@ do
    bond_gso_segs="$(extract_link_detail_field gso_max_segs nsenter -t "${brain_pid}" -n ip -details link show dev bond0)"
    if [[ "${bond_gso_segs}" != "1" ]]
    then
-      echo "FAIL: brain$((idx + 1))/bond0 gso_max_segs=${bond_gso_segs} expected=1"
-      exit 1
+      fail "brain$((idx + 1))/bond0 gso_max_segs=${bond_gso_segs} expected=1"
    fi
    bond_gso_ipv4="$(extract_link_detail_field gso_ipv4_max_size nsenter -t "${brain_pid}" -n ip -details link show dev bond0)"
    assert_link_budget "${bond_gso_ipv4}" "gso_ipv4_max_size" "brain$((idx + 1))/bond0"

@@ -27,10 +27,12 @@ typedef struct callback_state
    int resource_delta_count;
    int credential_refresh_count;
    int message_count;
+   int wormholes_refresh_count;
    prodigy_resource_delta last_resource_delta;
    uint64_t last_bundle_generation;
    size_t last_reason_size;
    size_t last_message_size;
+   size_t last_wormholes_refresh_size;
 } callback_state;
 
 static void fail_message(const char *message)
@@ -261,6 +263,19 @@ static void message_from_prodigy(
    state->last_message_size = payload_size;
 }
 
+static void wormholes_refresh(
+   void *context,
+   prodigy_neuron_hub *hub,
+   const uint8_t *payload,
+   size_t payload_size)
+{
+   callback_state *state = (callback_state *)context;
+   (void)hub;
+   (void)payload;
+   state->wormholes_refresh_count += 1;
+   state->last_wormholes_refresh_size = payload_size;
+}
+
 static void write_all(int fd, const uint8_t *bytes, size_t size)
 {
    size_t offset = 0;
@@ -379,6 +394,7 @@ int main(void)
    prodigy_credential_delta delta;
    prodigy_bytes ping_bytes;
    prodigy_bytes ready_bytes;
+   prodigy_bytes runtime_ready_bytes;
    prodigy_bytes statistics_bytes;
    prodigy_bytes resource_delta_ack_bytes;
    prodigy_bytes credentials_refresh_ack_bytes;
@@ -403,6 +419,7 @@ int main(void)
    memset(&delta, 0, sizeof(delta));
    memset(&ping_bytes, 0, sizeof(ping_bytes));
    memset(&ready_bytes, 0, sizeof(ready_bytes));
+   memset(&runtime_ready_bytes, 0, sizeof(runtime_ready_bytes));
    memset(&statistics_bytes, 0, sizeof(statistics_bytes));
    memset(&resource_delta_ack_bytes, 0, sizeof(resource_delta_ack_bytes));
    memset(&credentials_refresh_ack_bytes, 0, sizeof(credentials_refresh_ack_bytes));
@@ -604,6 +621,7 @@ int main(void)
    callbacks.resource_delta = resource_delta;
    callbacks.credentials_refresh = credentials_refresh;
    callbacks.message_from_prodigy = message_from_prodigy;
+   callbacks.wormholes_refresh = wormholes_refresh;
 
    options.abi_version = PRODIGY_NEURON_HUB_ABI_VERSION;
    options.argc = 1;
@@ -668,6 +686,24 @@ int main(void)
    expect_true(built_frame.payload.size == 0u, "ready frame should have empty payload");
    prodigy_message_frame_free(&built_frame);
    prodigy_bytes_free(&ready_bytes);
+
+   expect_true(
+      prodigy_build_runtime_ready_frame(&runtime_ready_bytes) == PRODIGY_RESULT_OK,
+      "build runtime ready frame failed");
+   expect_true(
+      prodigy_parse_message_frame(runtime_ready_bytes.data, runtime_ready_bytes.size, &built_frame) == PRODIGY_RESULT_OK,
+      "parse runtime ready frame failed");
+   expect_true(
+      built_frame.topic == PRODIGY_CONTAINER_TOPIC_RUNTIME_READY,
+      "unexpected runtime ready frame topic");
+   expect_true(built_frame.payload.size == 0u, "runtime ready frame should have empty payload");
+   expect_true(
+      prodigy_neuron_hub_handle_message_frame(hub, &built_frame, &automatic_response) == PRODIGY_RESULT_OK,
+      "handle runtime ready frame failed");
+   expect_true(automatic_response.topic == PRODIGY_CONTAINER_TOPIC_NONE, "runtime ready should not auto-respond");
+   prodigy_message_frame_free(&built_frame);
+   prodigy_message_frame_free(&automatic_response);
+   prodigy_bytes_free(&runtime_ready_bytes);
 
    {
       static const prodigy_metric_pair demo_metrics[2] = {
@@ -781,6 +817,13 @@ int main(void)
    expect_true(state.last_message_size == sizeof(message_payload), "unexpected message size");
 
    frame.size = 0;
+   append_frame(&frame, PRODIGY_CONTAINER_TOPIC_WORMHOLES_REFRESH, message_payload, sizeof(message_payload));
+   write_all(sockets[1], frame.bytes, frame.size);
+   expect_true(prodigy_neuron_hub_run_once(hub) == PRODIGY_RESULT_OK, "wormholes refresh run_once failed");
+   expect_true(state.wormholes_refresh_count == 1, "wormholes refresh callback missing");
+   expect_true(state.last_wormholes_refresh_size == sizeof(message_payload), "unexpected wormholes refresh size");
+
+   frame.size = 0;
    append_frame(&frame, PRODIGY_CONTAINER_TOPIC_CREDENTIALS_REFRESH, credential_delta.bytes, credential_delta.size);
    write_all(sockets[1], frame.bytes, frame.size);
    expect_true(prodigy_neuron_hub_run_once(hub) == PRODIGY_RESULT_OK, "credential refresh run_once failed");
@@ -790,6 +833,9 @@ int main(void)
 
    expect_true(prodigy_neuron_hub_signal_ready(hub) == PRODIGY_RESULT_OK, "signal_ready failed");
    read_and_expect_topic(sockets[1], PRODIGY_CONTAINER_TOPIC_HEALTHY, 0, 0);
+
+   expect_true(prodigy_neuron_hub_signal_runtime_ready(hub) == PRODIGY_RESULT_OK, "signal_runtime_ready failed");
+   read_and_expect_topic(sockets[1], PRODIGY_CONTAINER_TOPIC_RUNTIME_READY, 0, 0);
 
    expect_true(prodigy_neuron_hub_publish_statistic(hub, 1, 2) == PRODIGY_RESULT_OK, "publish_statistic failed");
    read_and_expect_topic(sockets[1], PRODIGY_CONTAINER_TOPIC_STATISTICS, 1, 1);

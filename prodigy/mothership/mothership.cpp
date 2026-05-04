@@ -1668,6 +1668,123 @@ static bool parseMothershipClusterMachinesJSON(simdjson::dom::element value, Vec
    return true;
 }
 
+static bool parseOperatingSystemUpdatePolicyJSON(simdjson::dom::element value, OperatingSystemUpdatePolicy& policy, const char *context)
+{
+   if (value.type() != simdjson::dom::element_type::OBJECT)
+   {
+      basics_log("%s requires object\n", context);
+      return false;
+   }
+
+   OperatingSystemUpdatePolicy parsed = {};
+   for (auto field : value.get_object())
+   {
+      String key = {};
+      key.setInvariant(field.key.data(), field.key.size());
+
+      if (key.equal("osID"_ctv))
+      {
+         if (field.value.type() != simdjson::dom::element_type::STRING)
+         {
+            basics_log("%s.osID requires string\n", context);
+            return false;
+         }
+
+         parsed.osID.assign(field.value.get_c_str());
+      }
+      else if (key.equal("targetVersionID"_ctv))
+      {
+         if (field.value.type() != simdjson::dom::element_type::STRING)
+         {
+            basics_log("%s.targetVersionID requires string\n", context);
+            return false;
+         }
+
+         parsed.targetVersionID.assign(field.value.get_c_str());
+      }
+      else if (key.equal("command"_ctv))
+      {
+         if (field.value.type() != simdjson::dom::element_type::STRING)
+         {
+            basics_log("%s.command requires string\n", context);
+            return false;
+         }
+
+         parsed.command.assign(field.value.get_c_str());
+      }
+      else if (key.equal("includeVMs"_ctv))
+      {
+         if (field.value.type() != simdjson::dom::element_type::BOOL || field.value.get(parsed.includeVMs) != simdjson::SUCCESS)
+         {
+            basics_log("%s.includeVMs requires bool\n", context);
+            return false;
+         }
+      }
+      else
+      {
+         basics_log("%s invalid field\n", context);
+         return false;
+      }
+   }
+
+   policy = std::move(parsed);
+   return true;
+}
+
+static bool parseOperatingSystemUpdatePolicyArrayJSON(simdjson::dom::element value, Vector<OperatingSystemUpdatePolicy>& policies, const char *context)
+{
+   String contextText = {};
+   contextText.assign(context);
+
+   if (value.type() != simdjson::dom::element_type::ARRAY)
+   {
+      basics_log("%s requires array\n", context);
+      return false;
+   }
+
+   Vector<OperatingSystemUpdatePolicy> parsed = {};
+   uint32_t index = 0;
+   for (auto item : value.get_array())
+   {
+      String itemContext = {};
+      itemContext.snprintf<"{}[{itoa}]"_ctv>(contextText, uint64_t(index));
+
+      OperatingSystemUpdatePolicy policy = {};
+      if (parseOperatingSystemUpdatePolicyJSON(item, policy, itemContext.c_str()) == false)
+      {
+         return false;
+      }
+
+      parsed.push_back(std::move(policy));
+      index += 1;
+   }
+
+   policies = std::move(parsed);
+   return true;
+}
+
+static bool parseOperatingSystemUpdatePolicyArrayJSONString(const char *text, Vector<OperatingSystemUpdatePolicy>& policies, const char *context)
+{
+   if (text == nullptr || text[0] == '\0')
+   {
+      return false;
+   }
+
+   String json = {};
+   json.append(text);
+   json.need(simdjson::SIMDJSON_PADDING);
+
+   simdjson::dom::parser parser;
+   simdjson::dom::element doc;
+   if (parser.parse(json.data(), json.size()).get(doc))
+   {
+      basics_log("%s invalid json\n", context);
+      return false;
+   }
+
+   return parseOperatingSystemUpdatePolicyArrayJSON(doc, policies, context);
+}
+
 static void printClusterMachineOwnership(const ClusterMachineOwnership& ownership)
 {
    basics_log("ownershipMode=%s caps=%u/%u/%u basisPoints=%u/%u/%u",
@@ -3595,6 +3712,15 @@ public:
 
 		struct sockaddr_un address = {};
 		address.sun_family = AF_UNIX;
+		if (socketPath.size() >= sizeof(address.sun_path))
+		{
+			lastConnectFailure.snprintf<"failed to connect local unix socket {}: path too long ({} >= {})"_ctv>(
+				path,
+				uint64_t(socketPath.size()),
+				uint64_t(sizeof(address.sun_path)));
+			::close(fd);
+			return false;
+		}
 		std::snprintf(address.sun_path, sizeof(address.sun_path), "%s", socketPath.c_str());
 		socklen_t addressLen = socklen_t(sizeof(address.sun_family) + std::strlen(address.sun_path));
 
@@ -7114,7 +7240,7 @@ private:
          exit(EXIT_FAILURE);
       }
 
-      String json = {};
+      String json;
       json.append(argv[1]);
       json.need(simdjson::SIMDJSON_PADDING);
 
@@ -12924,17 +13050,86 @@ private:
 
             request.remoteProdigyPath.assign(field.value.get_c_str());
          }
-         else if (key.equal("sharedCpuOvercommit"_ctv))
+         else if (key.equal("autoscaleIntervalSeconds"_ctv))
          {
-            String failure = {};
-            if (mothershipParseSharedCPUOvercommitValue(field.value, request.sharedCPUOvercommitPermille, &failure, "createCluster.sharedCpuOvercommit"_ctv) == false)
+            uint64_t value = 0;
+            if ((field.value.type() != simdjson::dom::element_type::INT64
+                  && field.value.type() != simdjson::dom::element_type::UINT64)
+               || field.value.get(value) != simdjson::SUCCESS
+               || value == 0
+               || value > 86'400)
             {
-               basics_log("%s\n", failure.c_str());
+               basics_log("createCluster.autoscaleIntervalSeconds invalid\n");
                exit(EXIT_FAILURE);
             }
+
+            request.autoscaleIntervalSeconds = uint32_t(value);
          }
-         else if (key.equal("bgp"_ctv))
-         {
+	         else if (key.equal("sharedCpuOvercommit"_ctv))
+	         {
+	            String failure = {};
+	            if (mothershipParseSharedCPUOvercommitValue(field.value, request.sharedCPUOvercommitPermille, &failure, "createCluster.sharedCpuOvercommit"_ctv) == false)
+	            {
+	               basics_log("%s\n", failure.c_str());
+	               exit(EXIT_FAILURE);
+	            }
+	         }
+	         else if (key.equal("osUpdatePolicies"_ctv))
+	         {
+	            if (parseOperatingSystemUpdatePolicyArrayJSON(field.value, request.osUpdatePolicies, "createCluster.osUpdatePolicies") == false)
+	            {
+	               exit(EXIT_FAILURE);
+	            }
+	         }
+	         else if (key.equal("osUpdatesEnabled"_ctv))
+	         {
+	            if (field.value.type() != simdjson::dom::element_type::BOOL
+	               || field.value.get(request.osUpdatesEnabled) != simdjson::SUCCESS)
+	            {
+	               basics_log("createCluster.osUpdatesEnabled requires bool\n");
+	               exit(EXIT_FAILURE);
+	            }
+	         }
+	         else if (key.equal("targetOSID"_ctv)
+	            || key.equal("targetOSVersionID"_ctv)
+	            || key.equal("osUpdateCommand"_ctv)
+	            || key.equal("includeVMsInOSUpdates"_ctv))
+	         {
+	            basics_log("createCluster OS update fields were replaced by osUpdatePolicies[]\n");
+	            exit(EXIT_FAILURE);
+	         }
+	         else if (key.equal("maxOSDrains"_ctv))
+	         {
+	            uint64_t value = 0;
+	            if ((field.value.type() != simdjson::dom::element_type::INT64
+	                  && field.value.type() != simdjson::dom::element_type::UINT64)
+	               || field.value.get(value) != simdjson::SUCCESS
+	               || value == 0
+	               || value > UINT32_MAX)
+	            {
+	               basics_log("createCluster.maxOSDrains invalid\n");
+	               exit(EXIT_FAILURE);
+	            }
+
+	            request.maxOSDrains = uint32_t(value);
+	         }
+	         else if (key.equal("machineUpdateCadenceMins"_ctv))
+	         {
+	            uint64_t value = 0;
+	            if ((field.value.type() != simdjson::dom::element_type::INT64
+	                  && field.value.type() != simdjson::dom::element_type::UINT64)
+	               || field.value.get(value) != simdjson::SUCCESS
+	               || value == 0
+	               || value > UINT32_MAX)
+	            {
+	               basics_log("createCluster.machineUpdateCadenceMins invalid\n");
+	               exit(EXIT_FAILURE);
+	            }
+
+	            request.machineUpdateCadenceMins = uint32_t(value);
+	         }
+	         else if (key.equal("bgp"_ctv))
+	         {
             if (parseProdigyEnvironmentBGPJSONElement(field.value, request.bgp) == false)
             {
                basics_log("createCluster.bgp invalid\n");
@@ -13029,6 +13224,196 @@ private:
 #endif
       basics_log("createCluster success=1 created=1\n");
       printManagedCluster(stored);
+   }
+
+   void runConfigureTestCluster(int argc, char *argv[])
+   {
+      if (argc != 13)
+      {
+         basics_log("wrong number of arguments. ex: configureTestCluster [workspaceRoot] [machineCount] [nBrains] [brainBootstrapFamily] [enableFakeIpv4Boundary:0|1] [interContainerMTU] [datacenterFragment] [autoscaleIntervalSeconds] [schema] [kind] [nLogicalCores] [nMemoryMB] [nStorageMB]\n");
+         exit(EXIT_FAILURE);
+      }
+
+	      auto parseUnsigned = [] (const char *text, uint64_t maxValue, const char *fieldName) -> uint64_t {
+         if (text == nullptr || text[0] == '\0')
+         {
+            basics_log("configureTestCluster.%s required\n", fieldName);
+            exit(EXIT_FAILURE);
+         }
+
+         errno = 0;
+         char *end = nullptr;
+         unsigned long long value = std::strtoull(text, &end, 10);
+         if (errno != 0 || end == text || *end != '\0' || value > maxValue)
+         {
+            basics_log("configureTestCluster.%s invalid\n", fieldName);
+            exit(EXIT_FAILURE);
+         }
+
+	         return uint64_t(value);
+	      };
+
+	      auto readDevEnvString = [] (const char *name, String& value) {
+	         const char *text = std::getenv(name);
+	         if (text != nullptr && text[0] != '\0')
+	         {
+	            value.assign(text);
+	         }
+	      };
+
+	      auto readDevEnvUnsigned = [] (const char *name, uint64_t maxValue, uint32_t& value) {
+	         const char *text = std::getenv(name);
+	         if (text == nullptr || text[0] == '\0')
+	         {
+	            return;
+	         }
+
+	         errno = 0;
+	         char *end = nullptr;
+	         unsigned long long parsed = std::strtoull(text, &end, 10);
+	         if (errno != 0 || end == text || *end != '\0' || parsed > maxValue)
+	         {
+	            basics_log("configureTestCluster.%s invalid\n", name);
+	            exit(EXIT_FAILURE);
+	         }
+
+	         value = uint32_t(parsed);
+	      };
+
+      String workspaceRoot;
+      workspaceRoot.assign(argv[0]);
+      uint32_t machineCount = uint32_t(parseUnsigned(argv[1], UINT32_MAX, "machineCount"));
+      uint32_t nBrains = uint32_t(parseUnsigned(argv[2], UINT32_MAX, "nBrains"));
+
+      String family;
+      family.assign(argv[3]);
+      MothershipClusterTestBootstrapFamily brainBootstrapFamily = MothershipClusterTestBootstrapFamily::ipv4;
+      if (parseMothershipClusterTestBootstrapFamily(family, brainBootstrapFamily) == false)
+      {
+         basics_log("configureTestCluster.brainBootstrapFamily invalid\n");
+         exit(EXIT_FAILURE);
+      }
+
+      uint64_t enableFakeIpv4BoundaryValue = parseUnsigned(argv[4], 1, "enableFakeIpv4Boundary");
+      uint32_t interContainerMTU = uint32_t(parseUnsigned(argv[5], UINT32_MAX, "interContainerMTU"));
+      uint8_t datacenterFragment = uint8_t(parseUnsigned(argv[6], UINT8_MAX, "datacenterFragment"));
+      uint32_t autoscaleIntervalSeconds = uint32_t(parseUnsigned(argv[7], 86'400, "autoscaleIntervalSeconds"));
+
+      String schema;
+      schema.assign(argv[8]);
+      if (schema.size() == 0)
+      {
+         basics_log("configureTestCluster.schema required\n");
+         exit(EXIT_FAILURE);
+      }
+
+      String kindText;
+      kindText.assign(argv[9]);
+      MachineConfig::MachineKind machineKind = MachineConfig::MachineKind::bareMetal;
+      if (parseMachineKind(kindText, machineKind) == false)
+      {
+         basics_log("configureTestCluster.kind invalid\n");
+         exit(EXIT_FAILURE);
+      }
+
+      MachineConfig machineConfig = {};
+      machineConfig.slug = schema;
+      machineConfig.kind = machineKind;
+      machineConfig.nLogicalCores = uint32_t(parseUnsigned(argv[10], UINT32_MAX, "nLogicalCores"));
+      machineConfig.nMemoryMB = uint32_t(parseUnsigned(argv[11], UINT32_MAX, "nMemoryMB"));
+      machineConfig.nStorageMB = uint32_t(parseUnsigned(argv[12], UINT32_MAX, "nStorageMB"));
+
+      MothershipProdigyCluster cluster = {};
+      cluster.name = "configure-test-cluster"_ctv;
+      cluster.deploymentMode = MothershipClusterDeploymentMode::test;
+      cluster.architecture = nametagCurrentBuildMachineArchitecture();
+      cluster.datacenterFragment = datacenterFragment;
+      cluster.autoscaleIntervalSeconds = autoscaleIntervalSeconds;
+      cluster.nBrains = nBrains;
+      cluster.test.specified = true;
+      cluster.test.host.mode = MothershipClusterTestHostMode::local;
+	      cluster.test.workspaceRoot = workspaceRoot;
+	      cluster.test.machineCount = machineCount;
+	      cluster.test.brainBootstrapFamily = brainBootstrapFamily;
+	      cluster.test.enableFakeIpv4Boundary = (enableFakeIpv4BoundaryValue != 0);
+	      cluster.test.interContainerMTU = interContainerMTU;
+	      OperatingSystemUpdatePolicy osUpdatePolicy = {};
+	      uint32_t osUpdatesEnabled = cluster.osUpdatesEnabled ? 1u : 0u;
+	      readDevEnvUnsigned("PRODIGY_DEV_CONFIGURE_OS_UPDATES_ENABLED", 1, osUpdatesEnabled);
+	      cluster.osUpdatesEnabled = (osUpdatesEnabled != 0);
+	      const char *policyJSON = std::getenv("PRODIGY_DEV_CONFIGURE_OS_UPDATE_POLICIES_JSON");
+	      if (policyJSON != nullptr && policyJSON[0] != '\0')
+	      {
+	         if (parseOperatingSystemUpdatePolicyArrayJSONString(
+	            policyJSON,
+	            cluster.osUpdatePolicies,
+	            "PRODIGY_DEV_CONFIGURE_OS_UPDATE_POLICIES_JSON") == false)
+	         {
+	            exit(EXIT_FAILURE);
+	         }
+	      }
+	      else
+	      {
+	         readDevEnvString("PRODIGY_DEV_CONFIGURE_TARGET_OS_ID", osUpdatePolicy.osID);
+	         readDevEnvString("PRODIGY_DEV_CONFIGURE_TARGET_OS_VERSION_ID", osUpdatePolicy.targetVersionID);
+	         readDevEnvString("PRODIGY_DEV_CONFIGURE_OS_UPDATE_COMMAND", osUpdatePolicy.command);
+	         uint32_t includeVMsInOSUpdates = osUpdatePolicy.includeVMs ? 1u : 0u;
+	         readDevEnvUnsigned("PRODIGY_DEV_CONFIGURE_INCLUDE_VMS_IN_OS_UPDATES", 1, includeVMsInOSUpdates);
+	         osUpdatePolicy.includeVMs = (includeVMsInOSUpdates != 0);
+	         if (osUpdatePolicy.osID.size() > 0
+	            || osUpdatePolicy.targetVersionID.size() > 0
+	            || osUpdatePolicy.command.size() > 0)
+	         {
+	            cluster.osUpdatePolicies.push_back(osUpdatePolicy);
+	         }
+	      }
+	      readDevEnvUnsigned("PRODIGY_DEV_CONFIGURE_MAX_OS_DRAINS", UINT32_MAX, cluster.maxOSDrains);
+	      readDevEnvUnsigned("PRODIGY_DEV_CONFIGURE_MACHINE_UPDATE_CADENCE_MINS", UINT32_MAX, cluster.machineUpdateCadenceMins);
+	      basics_log("configureTestCluster os enabled=%d policies=%u firstOSID=%s firstTargetVersionID=%s firstCommandBytes=%zu maxOSDrains=%u cadenceMins=%u\n",
+	         int(cluster.osUpdatesEnabled),
+	         unsigned(cluster.osUpdatePolicies.size()),
+	         osUpdatePolicy.osID.c_str(),
+	         osUpdatePolicy.targetVersionID.c_str(),
+	         size_t(osUpdatePolicy.command.size()),
+	         unsigned(cluster.maxOSDrains),
+	         unsigned(cluster.machineUpdateCadenceMins));
+
+	      String failure;
+      MothershipProdigyCluster normalizedCluster = {};
+      if (MothershipClusterRegistry::validateClusterForStorage(cluster, normalizedCluster, &failure) == false)
+      {
+         basics_log("configureTestCluster success=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
+         exit(EXIT_FAILURE);
+      }
+
+      BrainConfig config = {};
+	      if (mothershipBuildClusterBrainConfig(normalizedCluster, nullptr, config, &failure) == false)
+	      {
+	         basics_log("configureTestCluster success=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
+	         exit(EXIT_FAILURE);
+	      }
+	      basics_log("configureTestCluster brainconfig os enabled=%d policies=%u maxOSDrains=%u cadenceMins=%u\n",
+	         int(config.osUpdatesEnabled),
+	         unsigned(config.osUpdatePolicies.size()),
+	         unsigned(config.maxOSDrains),
+	         unsigned(config.machineUpdateCadenceMins));
+
+	      config.configBySlug.insert_or_assign(schema, machineConfig);
+
+      ClusterCreateHooks hooks(this);
+      if (hooks.configureSeedCluster(normalizedCluster, config, &failure) == false)
+      {
+         basics_log("configureTestCluster success=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
+         exit(EXIT_FAILURE);
+      }
+
+      String clusterUUIDHex;
+      clusterUUIDHex.assignItoh(normalizedCluster.clusterUUID);
+      basics_log("configureTestCluster success=1 name=%s clusterUUID=%s datacenterFragment=%u machineSchema=%s\n",
+         normalizedCluster.name.c_str(),
+         clusterUUIDHex.c_str(),
+         unsigned(normalizedCluster.datacenterFragment),
+         schema.c_str());
    }
 
    void runPrintClusters(int argc, char *argv[])
@@ -14802,6 +15187,10 @@ public:
       {
          runCreateCluster(argc, argv);
       }
+      else if (operation.equal("configureTestCluster"_ctv))
+      {
+         runConfigureTestCluster(argc, argv);
+      }
       else if (operation.equal("printClusters"_ctv))
       {
          runPrintClusters(argc, argv);
@@ -14891,7 +15280,7 @@ int main (int argc, char *argv[])
    if (argc < 2)
    {
       static constexpr char usage[] =
-         "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, registerRoutableAddress, unregisterRoutableAddress, pullRoutableAddresses, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity]";
+         "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, configureTestCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, registerRoutableAddress, unregisterRoutableAddress, pullRoutableAddresses, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity]";
       std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
       exit(EXIT_FAILURE);
    }
@@ -14927,6 +15316,8 @@ int main (int argc, char *argv[])
       message.append("createCluster [json]\n");
          message.append("\tcreates a managed Prodigy cluster record, assigns a clusterUUID, and uses providerCredentialName or an inline providerCredentialOverride secret block\n");
          message.append("\tfor persistent fake clusters, prefer deploymentMode=test instead of invoking prodigy_dev_netns_harness.sh directly\n");
+      message.append("configureTestCluster [workspaceRoot] [machineCount] [nBrains] [brainBootstrapFamily] [enableFakeIpv4Boundary:0|1] [interContainerMTU] [datacenterFragment] [autoscaleIntervalSeconds] [schema] [kind] [nLogicalCores] [nMemoryMB] [nStorageMB]\n");
+         message.append("\tvalidates a disposable test-cluster config, derives BrainConfig, and sends one configure request to the synthesized test control socket without persisting cluster state\n");
       message.append("printClusters\n");
          message.append("\tlists all managed Prodigy cluster records with their clusterUUIDs\n");
       message.append("setLocalClusterMembership [name|clusterUUID] [json]\n");

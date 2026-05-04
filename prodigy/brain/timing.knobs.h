@@ -7,7 +7,8 @@
 // without editing the runtime logic itself.
 
 // Dev mode runs inside slower local environments, so it keeps a larger retry
-// budget and a shorter keepalive interval.
+// budget and a shorter heartbeat interval while preserving a production-like
+// stale-peer window.
 #ifndef PRODIGY_BRAIN_DEV_CONTROL_PLANE_CONNECT_TIMEOUT_MS
 #define PRODIGY_BRAIN_DEV_CONTROL_PLANE_CONNECT_TIMEOUT_MS 100u
 #endif
@@ -17,7 +18,15 @@
 #endif
 
 #ifndef PRODIGY_BRAIN_DEV_PEER_KEEPALIVE_SECONDS
-#define PRODIGY_BRAIN_DEV_PEER_KEEPALIVE_SECONDS 6u
+#define PRODIGY_BRAIN_DEV_PEER_KEEPALIVE_SECONDS 35u
+#endif
+
+#ifndef PRODIGY_BRAIN_DEV_PEER_HEARTBEAT_INTERVAL_MS
+#define PRODIGY_BRAIN_DEV_PEER_HEARTBEAT_INTERVAL_MS 500u
+#endif
+
+#ifndef PRODIGY_BRAIN_DEV_PEER_HEARTBEAT_TIMEOUT_MS
+#define PRODIGY_BRAIN_DEV_PEER_HEARTBEAT_TIMEOUT_MS 5000u
 #endif
 
 // Production control-plane traffic is same-datacenter east-west traffic. Keep
@@ -36,7 +45,15 @@
 #endif
 
 #ifndef PRODIGY_BRAIN_PEER_KEEPALIVE_SECONDS
-#define PRODIGY_BRAIN_PEER_KEEPALIVE_SECONDS 15u
+#define PRODIGY_BRAIN_PEER_KEEPALIVE_SECONDS 35u
+#endif
+
+#ifndef PRODIGY_BRAIN_PEER_HEARTBEAT_INTERVAL_MS
+#define PRODIGY_BRAIN_PEER_HEARTBEAT_INTERVAL_MS 1000u
+#endif
+
+#ifndef PRODIGY_BRAIN_PEER_HEARTBEAT_TIMEOUT_MS
+#define PRODIGY_BRAIN_PEER_HEARTBEAT_TIMEOUT_MS 5000u
 #endif
 
 // Remote bootstrap waits on a local Unix control socket after restarting the
@@ -104,12 +121,35 @@
 #define PRODIGY_BRAIN_PEER_INBOUND_MISSING_SLACK_MS 5u
 #endif
 
+#ifndef PRODIGY_BRAIN_NEURON_CONTROL_HANDSHAKE_TIMEOUT_MS
+#define PRODIGY_BRAIN_NEURON_CONTROL_HANDSHAKE_TIMEOUT_MS 1000u
+#endif
+
+#ifndef PRODIGY_BRAIN_PEER_HANDSHAKE_TIMEOUT_MS
+#define PRODIGY_BRAIN_PEER_HANDSHAKE_TIMEOUT_MS 1000u
+#endif
+
 #ifndef PRODIGY_BRAIN_HARD_REBOOT_WATCHDOG_MS
 #define PRODIGY_BRAIN_HARD_REBOOT_WATCHDOG_MS 30000u
 #endif
 
 #ifndef PRODIGY_BRAIN_HARD_REBOOT_RECONNECT_WINDOW_MS
 #define PRODIGY_BRAIN_HARD_REBOOT_RECONNECT_WINDOW_MS 29000u
+#endif
+
+// OS update commands are user-supplied and may legitimately spend minutes in
+// package-manager shutdown/reboot paths. Successful recovery is still
+// event-driven; this only bounds a dead update/reboot.
+#ifndef PRODIGY_BRAIN_OS_UPDATE_COMMAND_REBOOT_DEADLINE_MS
+#define PRODIGY_BRAIN_OS_UPDATE_COMMAND_REBOOT_DEADLINE_MS 300000u
+#endif
+
+#ifndef PRODIGY_BRAIN_OS_UPDATE_REBOOT_WATCHDOG_MS
+#define PRODIGY_BRAIN_OS_UPDATE_REBOOT_WATCHDOG_MS 600000u
+#endif
+
+#ifndef PRODIGY_BRAIN_OS_UPDATE_RECONNECT_WINDOW_MS
+#define PRODIGY_BRAIN_OS_UPDATE_RECONNECT_WINDOW_MS 599000u
 #endif
 
 #ifndef PRODIGY_BRAIN_SPOT_DECOMMISSION_CHECK_INTERVAL_MS
@@ -137,14 +177,22 @@
 #define PRODIGY_BRAIN_AUTOSCALE_INTERVAL_MS 60000u
 #endif
 
+#ifndef PRODIGY_BRAIN_STATEFUL_TOPOLOGY_ROLLBACK_WINDOW_SECONDS
+#define PRODIGY_BRAIN_STATEFUL_TOPOLOGY_ROLLBACK_WINDOW_SECONDS 300u
+#endif
+
 inline constexpr uint32_t prodigyBrainDevControlPlaneConnectTimeoutMs = PRODIGY_BRAIN_DEV_CONTROL_PLANE_CONNECT_TIMEOUT_MS;
 inline constexpr uint32_t prodigyBrainDevControlPlaneConnectAttempts = PRODIGY_BRAIN_DEV_CONTROL_PLANE_CONNECT_ATTEMPTS;
 inline constexpr uint32_t prodigyBrainDevPeerKeepaliveSeconds = PRODIGY_BRAIN_DEV_PEER_KEEPALIVE_SECONDS;
+inline constexpr uint32_t prodigyBrainDevPeerHeartbeatIntervalMs = PRODIGY_BRAIN_DEV_PEER_HEARTBEAT_INTERVAL_MS;
+inline constexpr uint32_t prodigyBrainDevPeerHeartbeatTimeoutMs = PRODIGY_BRAIN_DEV_PEER_HEARTBEAT_TIMEOUT_MS;
 
 inline constexpr uint32_t prodigyBrainControlPlaneConnectTimeoutMs = PRODIGY_BRAIN_CONTROL_PLANE_CONNECT_TIMEOUT_MS;
 inline constexpr uint32_t prodigyBrainControlPlaneConnectAttempts = PRODIGY_BRAIN_CONTROL_PLANE_CONNECT_ATTEMPTS;
 inline constexpr uint32_t prodigyBrainControlPlaneSoftEscalationFloorMs = PRODIGY_BRAIN_CONTROL_PLANE_SOFT_ESCALATION_FLOOR_MS;
 inline constexpr uint32_t prodigyBrainPeerKeepaliveSeconds = PRODIGY_BRAIN_PEER_KEEPALIVE_SECONDS;
+inline constexpr uint32_t prodigyBrainPeerHeartbeatIntervalMs = PRODIGY_BRAIN_PEER_HEARTBEAT_INTERVAL_MS;
+inline constexpr uint32_t prodigyBrainPeerHeartbeatTimeoutMs = PRODIGY_BRAIN_PEER_HEARTBEAT_TIMEOUT_MS;
 inline constexpr uint32_t prodigyRemoteBootstrapSSHRetrySleepMs = PRODIGY_REMOTE_BOOTSTRAP_SSH_RETRY_SLEEP_MS;
 inline constexpr uint32_t prodigyRemoteBootstrapControlSocketWaitSeconds = PRODIGY_REMOTE_BOOTSTRAP_CONTROL_SOCKET_WAIT_SECONDS;
 inline constexpr uint32_t prodigyRemoteBootstrapControlSocketProbeTimeoutMs = PRODIGY_REMOTE_BOOTSTRAP_CONTROL_SOCKET_PROBE_TIMEOUT_MS;
@@ -159,8 +207,13 @@ inline constexpr uint32_t prodigyBrainConnectFailureLogIntervalMs = PRODIGY_BRAI
 inline constexpr uint32_t prodigyBrainPeerRecoveryReconnectMinMs = PRODIGY_BRAIN_PEER_RECOVERY_RECONNECT_MIN_MS;
 inline constexpr uint32_t prodigyBrainPeerPersistentReconnectMinMs = PRODIGY_BRAIN_PEER_PERSISTENT_RECONNECT_MIN_MS;
 inline constexpr uint32_t prodigyBrainPeerInboundMissingSlackMs = PRODIGY_BRAIN_PEER_INBOUND_MISSING_SLACK_MS;
+inline constexpr uint32_t prodigyBrainNeuronControlHandshakeTimeoutMs = PRODIGY_BRAIN_NEURON_CONTROL_HANDSHAKE_TIMEOUT_MS;
+inline constexpr uint32_t prodigyBrainPeerHandshakeTimeoutMs = PRODIGY_BRAIN_PEER_HANDSHAKE_TIMEOUT_MS;
 inline constexpr uint32_t prodigyBrainHardRebootWatchdogMs = PRODIGY_BRAIN_HARD_REBOOT_WATCHDOG_MS;
 inline constexpr uint32_t prodigyBrainHardRebootReconnectWindowMs = PRODIGY_BRAIN_HARD_REBOOT_RECONNECT_WINDOW_MS;
+inline constexpr uint32_t prodigyBrainOSUpdateCommandRebootDeadlineMs = PRODIGY_BRAIN_OS_UPDATE_COMMAND_REBOOT_DEADLINE_MS;
+inline constexpr uint32_t prodigyBrainOSUpdateRebootWatchdogMs = PRODIGY_BRAIN_OS_UPDATE_REBOOT_WATCHDOG_MS;
+inline constexpr uint32_t prodigyBrainOSUpdateReconnectWindowMs = PRODIGY_BRAIN_OS_UPDATE_RECONNECT_WINDOW_MS;
 inline constexpr uint32_t prodigyBrainSpotDecommissionCheckIntervalMs = PRODIGY_BRAIN_SPOT_DECOMMISSION_CHECK_INTERVAL_MS;
 inline constexpr uint32_t prodigyBrainFailedDeploymentCleanerIntervalMs = PRODIGY_BRAIN_FAILED_DEPLOYMENT_CLEANER_INTERVAL_MS;
 
@@ -168,6 +221,7 @@ inline constexpr uint64_t prodigyBrainMetricRetentionMs = PRODIGY_BRAIN_METRIC_R
 inline constexpr uint32_t prodigyBrainMetricTrimMinIntervalMs = PRODIGY_BRAIN_METRIC_TRIM_MIN_INTERVAL_MS;
 inline constexpr uint32_t prodigyBrainMetricPersistMinIntervalMs = PRODIGY_BRAIN_METRIC_PERSIST_MIN_INTERVAL_MS;
 inline constexpr uint32_t prodigyBrainAutoscaleIntervalMs = PRODIGY_BRAIN_AUTOSCALE_INTERVAL_MS;
+inline constexpr uint32_t prodigyBrainStatefulTopologyRollbackWindowSeconds = PRODIGY_BRAIN_STATEFUL_TOPOLOGY_ROLLBACK_WINDOW_SECONDS;
 
 static_assert(prodigyBrainControlPlaneConnectAttempts > 0, "production control-plane connect attempts must be non-zero");
 static_assert(prodigyBrainDevControlPlaneConnectAttempts > 0, "dev control-plane connect attempts must be non-zero");
@@ -179,9 +233,21 @@ static_assert(prodigyRemoteBootstrapSocketDiagnosticsTimeoutSeconds > 0, "remote
 static_assert(prodigyMachineProvisioningPollSleepMs > 0, "machine provisioning poll sleep must be non-zero");
 static_assert(prodigyMachineProvisioningTimeoutMs >= prodigyMachineProvisioningPollSleepMs, "machine provisioning timeout must cover at least one poll interval");
 static_assert(prodigyNeuronDeferredHardwarePollMs > 0, "deferred neuron hardware poll must be non-zero");
+static_assert(prodigyBrainStatefulTopologyRollbackWindowSeconds > 0, "stateful topology rollback window must be non-zero");
+static_assert(prodigyBrainDevPeerHeartbeatTimeoutMs > prodigyBrainDevPeerHeartbeatIntervalMs, "dev peer heartbeat timeout must exceed interval");
+static_assert(prodigyBrainPeerHeartbeatTimeoutMs > prodigyBrainPeerHeartbeatIntervalMs, "peer heartbeat timeout must exceed interval");
+static_assert(prodigyBrainDevPeerHeartbeatTimeoutMs <= 5000u, "dev peer heartbeat stale detection must stay within the production failover budget");
+static_assert(prodigyBrainPeerHeartbeatTimeoutMs <= 5000u, "production peer heartbeat stale detection must stay within the production failover budget");
+static_assert(prodigyBrainNeuronControlHandshakeTimeoutMs > 0, "neuron control handshake timeout must be non-zero");
+static_assert(prodigyBrainNeuronControlHandshakeTimeoutMs <= 5000u, "neuron control handshake timeout must bound wedged runtime recovery quickly");
+static_assert(prodigyBrainPeerHandshakeTimeoutMs > 0, "brain peer handshake timeout must be non-zero");
+static_assert(prodigyBrainPeerHandshakeTimeoutMs <= 5000u, "brain peer handshake timeout must bound wedged peer recovery quickly");
 static_assert(
    prodigyBrainControlPlaneSoftEscalationFloorMs >= (prodigyBrainControlPlaneConnectTimeoutMs * prodigyBrainControlPlaneConnectAttempts),
    "soft escalation floor must cover the full production control-plane reconnect window");
 static_assert(
    prodigyBrainHardRebootReconnectWindowMs < prodigyBrainHardRebootWatchdogMs,
    "hard reboot reconnect window must expire before the hard reboot watchdog");
+static_assert(
+   prodigyBrainOSUpdateReconnectWindowMs < prodigyBrainOSUpdateRebootWatchdogMs,
+   "OS update reconnect window must expire before the OS update reboot watchdog");

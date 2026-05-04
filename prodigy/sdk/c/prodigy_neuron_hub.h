@@ -17,7 +17,7 @@ extern "C" {
 #define PRODIGY_NEURON_HUB_SDK_VERSION_STRING "1.0.0"
 #define PRODIGY_NEURON_HUB_WIRE_SERIES "WIRE_V1"
 #define PRODIGY_NEURON_HUB_WIRE_PROTOCOL_VERSION 1u
-#define PRODIGY_NEURON_HUB_ABI_VERSION 2u
+#define PRODIGY_NEURON_HUB_ABI_VERSION 3u
 #define PRODIGY_AEGIS_ALIGNMENT 16u
 #define PRODIGY_AEGIS_HEADER_BYTES 24u
 #define PRODIGY_AEGIS_MAX_FRAME_BYTES (2u * 1024u * 1024u)
@@ -51,7 +51,9 @@ typedef enum prodigy_container_topic
    PRODIGY_CONTAINER_TOPIC_DATACENTER_UNIQUE_TAG = 9,
    PRODIGY_CONTAINER_TOPIC_STATISTICS = 10,
    PRODIGY_CONTAINER_TOPIC_RESOURCE_DELTA_ACK = 11,
-   PRODIGY_CONTAINER_TOPIC_CREDENTIALS_REFRESH = 12
+   PRODIGY_CONTAINER_TOPIC_CREDENTIALS_REFRESH = 12,
+   PRODIGY_CONTAINER_TOPIC_WORMHOLES_REFRESH = 13,
+   PRODIGY_CONTAINER_TOPIC_RUNTIME_READY = 14
 } prodigy_container_topic;
 
 typedef struct prodigy_neuron_hub prodigy_neuron_hub;
@@ -256,6 +258,11 @@ typedef struct prodigy_neuron_hub_callbacks
       void *context,
       prodigy_neuron_hub *hub,
       const prodigy_credential_delta *delta);
+   void (*wormholes_refresh)(
+      void *context,
+      prodigy_neuron_hub *hub,
+      const uint8_t *payload,
+      size_t payload_size);
    void (*message_from_prodigy)(
       void *context,
       prodigy_neuron_hub *hub,
@@ -346,6 +353,7 @@ prodigy_result prodigy_build_message_frame(
    prodigy_bytes *frame);
 
 prodigy_result prodigy_build_ready_frame(prodigy_bytes *frame);
+prodigy_result prodigy_build_runtime_ready_frame(prodigy_bytes *frame);
 
 prodigy_result prodigy_build_statistics_frame(
    const prodigy_metric_pair *metrics,
@@ -400,6 +408,7 @@ prodigy_result prodigy_neuron_hub_run_once(prodigy_neuron_hub *hub);
 prodigy_result prodigy_neuron_hub_run_forever(prodigy_neuron_hub *hub);
 
 prodigy_result prodigy_neuron_hub_signal_ready(prodigy_neuron_hub *hub);
+prodigy_result prodigy_neuron_hub_signal_runtime_ready(prodigy_neuron_hub *hub);
 
 prodigy_result prodigy_neuron_hub_publish_statistic(
    prodigy_neuron_hub *hub,

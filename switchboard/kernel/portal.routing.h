@@ -298,3 +298,84 @@ static inline bool switchboardRewriteWormholeIPv6TargetSKB(struct __sk_buff *skb
    pckt->flow.port16[1] = targetPort;
    return true;
 }
+
+__attribute__((__always_inline__))
+static inline bool switchboardRewriteWormholeIPv4TargetSKB(struct __sk_buff *skb,
+   struct packet_description *pckt,
+   __u16 targetPort)
+{
+   void *data = (void *)(long)skb->data;
+   void *data_end = (void *)(long)skb->data_end;
+
+   if (pckt == NULL || (pckt->flow.proto != IPPROTO_UDP && pckt->flow.proto != IPPROTO_TCP))
+   {
+      return false;
+   }
+
+   struct ethhdr *eth = (struct ethhdr *)data;
+   if ((void *)(eth + 1) > data_end || eth->h_proto != BE_ETH_P_IP)
+   {
+      return false;
+   }
+
+   struct iphdr *iph = (struct iphdr *)(eth + 1);
+   if ((void *)(iph + 1) > data_end || iph->ihl != 5)
+   {
+      return false;
+   }
+
+   __be16 oldTargetPort = pckt->flow.port16[1];
+   if (oldTargetPort == targetPort)
+   {
+      return true;
+   }
+
+   const __u32 l4Offset = sizeof(struct ethhdr) + sizeof(struct iphdr);
+   const __u64 rewriteFlags = switchboardPacketRewriteStoreFlags();
+
+   if (pckt->flow.proto == IPPROTO_UDP)
+   {
+      struct udphdr *udph = (struct udphdr *)((__u8 *)data + l4Offset);
+      if ((void *)(udph + 1) > data_end)
+      {
+         return false;
+      }
+
+      bool udpChecksumPresent = (udph->check != 0);
+      if (bpf_skb_store_bytes(skb, l4Offset + __builtin_offsetof(struct udphdr, dest), &targetPort, sizeof(targetPort), rewriteFlags) != 0)
+      {
+         return false;
+      }
+
+      if (udpChecksumPresent
+         && replace_l4_checksum_word16_skb(skb,
+            l4Offset + __builtin_offsetof(struct udphdr, check),
+            oldTargetPort,
+            targetPort,
+            0) != 0)
+      {
+         return false;
+      }
+   }
+   else
+   {
+      struct tcphdr *tcph = (struct tcphdr *)((__u8 *)data + l4Offset);
+      if ((void *)(tcph + 1) > data_end)
+      {
+         return false;
+      }
+
+      if (bpf_skb_store_bytes(skb, l4Offset + __builtin_offsetof(struct tcphdr, dest), &targetPort, sizeof(targetPort), rewriteFlags) != 0
+         || replace_l4_checksum_word16_skb(skb,
+            l4Offset + __builtin_offsetof(struct tcphdr, check),
+            oldTargetPort,
+            targetPort,
+            0) != 0)
+      {
+         return false;
+      }
+   }
+
+   pckt->flow.port16[1] = targetPort;
+   return true;
+}

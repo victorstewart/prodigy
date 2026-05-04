@@ -22,42 +22,6 @@
 #include <prodigy/transport.tls.h>
 #include <networking/email.client.h>
 #include <networking/reconnector.h>
-#include <cstdlib>
-#include <utility>
-
-static inline bool prodigyRuntimeTraceEnabled(void)
-{
-   static const bool enabled = []() -> bool
-   {
-      if (const char *value = getenv("PRODIGY_RUNTIME_TRACE"); value && value[0] == '1' && value[1] == '\0')
-      {
-         return true;
-      }
-
-      return false;
-   }();
-
-   return enabled;
-}
-
-template <typename... Args>
-static inline void prodigyRuntimeTrace(const char *format, Args&&... args)
-{
-   if (prodigyRuntimeTraceEnabled() == false)
-   {
-      return;
-   }
-
-   if constexpr (sizeof...(args) == 0)
-   {
-      std::fputs(format, stderr);
-   }
-   else
-   {
-      std::fprintf(stderr, format, std::forward<Args>(args)...);
-   }
-   std::fflush(stderr);
-}
 
 class ContainerView;
 class ApplicationDeployment;
@@ -77,14 +41,26 @@ public:
 	bool isMasterBrain = false;
 	bool quarantined = false;
 	bool weConnectToIt = false;
-	bool connected = false;
-	bool currentStreamAccepted = false;
-	bool registrationFresh = false;
-	uint32_t transportEpoch = 0;
-	uint32_t queuedCloseTransportEpoch = 0;
-	bool queuedCloseTransportEpochKnown = false;
-	bool closeCompletionPending = false;
-	uint8_t datacenterFragment = 0;
+	bool forceConnectorOwnershipUntilMasterAck = false;
+		bool connected = false;
+		bool currentStreamAccepted = false;
+		bool registrationFresh = false;
+		int64_t lastReceiveMs = 0;
+		int64_t lastMasterRegistrationAdvertiseMs = 0;
+		int64_t lastHeartbeatSendMs = 0;
+		int64_t lastHeartbeatAckMs = 0;
+		uint8_t peerHeartbeatEligibilityState = 0;
+		uint64_t nextHeartbeatNonce = 1;
+		uint64_t lastHeartbeatSentNonce = 0;
+		uint64_t lastHeartbeatAckNonce = 0;
+		uint32_t transportEpoch = 0;
+		uint32_t confirmedMissingTransportEpoch = 0;
+		uint32_t queuedCloseTransportEpoch = 0;
+		uint32_t processedCloseTransportEpoch = 0;
+		uint8_t datacenterFragment = 0;
+	   String kernel;
+	   String osID;
+	   String osVersionID;
 
 	uint32_t private4 = 0; // even if it connects to us, allows us to keep it in the brain bin until (if ever) it reconnects to us. then we check the privates
 	uint32_t gatewayPrivate4 = 0;
@@ -118,18 +94,40 @@ public:
 
 	void reset() override 
    {
-      ProdigyTransportTLSStream::reset();
-      Reconnector::reset();
-		connected = false;
-		currentStreamAccepted = false;
-		registrationFresh = false;
-   }
+	      ProdigyTransportTLSStream::reset();
+	      Reconnector::reset();
+				connected = false;
+				currentStreamAccepted = false;
+				registrationFresh = false;
+	         kernel.clear();
+	         osID.clear();
+	         osVersionID.clear();
+				lastReceiveMs = 0;
+			lastMasterRegistrationAdvertiseMs = 0;
+			lastHeartbeatSendMs = 0;
+			lastHeartbeatAckMs = 0;
+			peerHeartbeatEligibilityState = 0;
+			nextHeartbeatNonce = 1;
+			lastHeartbeatSentNonce = 0;
+			lastHeartbeatAckNonce = 0;
+			confirmedMissingTransportEpoch = 0;
+	   }
 
-	void noteTransportActivated(void)
-	{
-		if (transportEpoch == UINT32_MAX)
+		void noteTransportActivated(void)
 		{
-			transportEpoch = 1;
+			int64_t nowMs = Time::now<TimeResolution::ms>();
+			lastReceiveMs = nowMs;
+			lastMasterRegistrationAdvertiseMs = 0;
+			lastHeartbeatSendMs = 0;
+			lastHeartbeatAckMs = nowMs;
+			peerHeartbeatEligibilityState = 0;
+			nextHeartbeatNonce = 1;
+			lastHeartbeatSentNonce = 0;
+			lastHeartbeatAckNonce = 0;
+			confirmedMissingTransportEpoch = 0;
+			if (transportEpoch == UINT32_MAX)
+			{
+				transportEpoch = 1;
 		}
 		else
 		{
@@ -139,17 +137,31 @@ public:
 
 	void noteCloseQueuedForCurrentTransport(void)
 	{
-		queuedCloseTransportEpoch = transportEpoch;
-		queuedCloseTransportEpochKnown = true;
-		closeCompletionPending = true;
-	}
+			queuedCloseTransportEpoch = transportEpoch;
+		}
+
+		void notePeerMessageReceived(int64_t nowMs = Time::now<TimeResolution::ms>())
+		{
+			lastReceiveMs = nowMs;
+		}
+
+		void notePeerHeartbeatAck(uint64_t nonce, int64_t nowMs = Time::now<TimeResolution::ms>())
+		{
+			if (nonce == 0 || nonce > lastHeartbeatSentNonce || nonce <= lastHeartbeatAckNonce)
+			{
+				return;
+			}
+
+			lastHeartbeatAckNonce = nonce;
+			lastHeartbeatAckMs = nowMs;
+		}
 
 	// we need some kind of log to know what updates to replay for slave brains?
 	void sendRegistration(int64_t boottimens, uint64_t version, uint128_t existingMasterUUID)
 	{
 		if (canQueueSend() == false)
 		{
-			prodigyRuntimeTrace(
+			std::fprintf(stderr,
 				"prodigy debug brain registration-skip private4=%u connected=%d isFixed=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d closing=%d tls=%d negotiated=%d wbytes=%u\n",
 				private4,
 				int(connected),
@@ -162,6 +174,7 @@ public:
 				int(transportTLSEnabled()),
 				int(isTLSNegotiated()),
 				uint32_t(wBuffer.outstandingBytes()));
+			std::fflush(stderr);
 			return;
 		}
 
@@ -169,16 +182,19 @@ public:
 		// figure out who main brain is... if us then we gather machines and do other stuff, 
 		// we would only be booting into main brain if we were the first machine in the datacenter... so by definition no other machines or state to gather/sync
 
-		// uuid(16) boottimens(8) version(8) existingMasterUUID(16)
-		uint32_t headerOffset = Message::appendHeader(wBuffer, static_cast<uint16_t>(BrainTopic::registration));
-		Message::append(wBuffer, thisNeuron->uuid);
-		Message::append(wBuffer, boottimens);
-		Message::append(wBuffer, version);
-		Message::append(wBuffer, existingMasterUUID);
-		Message::finish(wBuffer, headerOffset);
+			// uuid(16) boottimens(8) version(8) existingMasterUUID(16) kernel{4} osID{4} osVersionID{4}
+			uint32_t headerOffset = Message::appendHeader(wBuffer, static_cast<uint16_t>(BrainTopic::registration));
+			Message::append(wBuffer, thisNeuron->uuid);
+			Message::append(wBuffer, boottimens);
+			Message::append(wBuffer, version);
+			Message::append(wBuffer, existingMasterUUID);
+	      Message::appendValue(wBuffer, thisNeuron->kernel);
+	      Message::appendValue(wBuffer, thisNeuron->osID);
+	      Message::appendValue(wBuffer, thisNeuron->osVersionID);
+			Message::finish(wBuffer, headerOffset);
 
 		Ring::queueSend(this);
-		prodigyRuntimeTrace(
+		std::fprintf(stderr,
 			"prodigy debug brain registration-queued private4=%u connected=%d isFixed=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d tls=%d negotiated=%d sendBytes=%u queuedBytes=%llu wbytes=%u\n",
 			private4,
 			int(connected),
@@ -192,6 +208,7 @@ public:
 			unsigned(pendingSendBytes),
 			(unsigned long long)queuedSendOutstandingBytes(),
 			uint32_t(wBuffer.outstandingBytes()));
+		std::fflush(stderr);
 	}
 
 	void sendMasterMissing(void)
@@ -205,17 +222,48 @@ public:
 		Ring::queueSend(this);
 	}
 
-	void respondMasterMissing(bool status)
-	{
-		if (canQueueSend() == false)
+		void respondMasterMissing(bool status)
 		{
-			return;
+			if (canQueueSend() == false)
+			{
+				return;
 		}
 
-		Message::construct(wBuffer, static_cast<uint16_t>(BrainTopic::masterMissing), status);
-		Ring::queueSend(this);
-	}
-};
+			Message::construct(wBuffer, static_cast<uint16_t>(BrainTopic::masterMissing), status);
+			Ring::queueSend(this);
+		}
+
+		void sendPeerHeartbeat(int64_t nowMs = Time::now<TimeResolution::ms>())
+		{
+			if (canQueueSend() == false)
+			{
+				return;
+			}
+
+			uint64_t nonce = nextHeartbeatNonce;
+			nextHeartbeatNonce += 1;
+			if (nextHeartbeatNonce == 0)
+			{
+				nextHeartbeatNonce = 1;
+			}
+
+			Message::construct(wBuffer, static_cast<uint16_t>(BrainTopic::peerHeartbeat), false, nonce);
+			Ring::queueSend(this);
+			lastHeartbeatSendMs = nowMs;
+			lastHeartbeatSentNonce = nonce;
+		}
+
+		void respondPeerHeartbeat(uint64_t nonce)
+		{
+			if (canQueueSend() == false)
+			{
+				return;
+			}
+
+			Message::construct(wBuffer, static_cast<uint16_t>(BrainTopic::peerHeartbeat), true, nonce);
+			Ring::queueSend(this);
+		}
+	};
 
 class BrainBase : public RingMultiplexer {
 public:
@@ -260,6 +308,12 @@ public:
 		}
 
 		argv.push_back(nullptr);
+		return true;
+	}
+
+	virtual bool prepareForBundleExec(String& failure)
+	{
+		failure.clear();
 		return true;
 	}
 
@@ -356,6 +410,16 @@ public:
 
 	// these are were non master brains store deployment plans
 	bytell_hash_map<uint64_t, DeploymentPlan> deploymentPlans;
+   Vector<ProdigyStatefulWorkerTopologyUpgradeOperation> statefulWorkerTopologyUpgradeRuntimeState;
+   Vector<ProdigyDeferredStatefulScaleIntent> deferredStatefulScaleIntentRuntimeState;
+
+   virtual void noteStatefulWorkerTopologyUpgradeRuntimeStateChanged(void)
+   {
+   }
+
+   virtual void noteDeferredStatefulScaleIntentRuntimeStateChanged(void)
+   {
+   }
 
 	// these will be culled once every 10 minutes
 		TimeoutPacket failedDeploymentCleaner;
@@ -601,13 +665,17 @@ public:
 			for (BrainView *brain : brains)
 			{
 				// Brain identity is source-address based (peer private4), not socket destination.
-				if (brain->private4 == machine->private4)
-				{
-					machine->brain = brain;
-					brain->machine = machine;
+					if (brain->private4 == machine->private4)
+					{
+						machine->brain = brain;
+						brain->machine = machine;
+						if (brain->kernel.size() > 0) machine->kernel = brain->kernel;
+						if (brain->osID.size() > 0) machine->osID = brain->osID;
+						if (brain->osVersionID.size() > 0) machine->osVersionID = brain->osVersionID;
+						if (brain->boottimens > 0) machine->lastUpdatedOSMs = brain->boottimens / 1000000;
 
-					break;
-				}
+						break;
+					}
 			}
 		}
 
@@ -974,7 +1042,17 @@ inline bool BrainBase::neuronControlStreamActive(const Machine *machine)
       return false;
    }
 
-   return machine->neuron.connected;
+   if (machine->neuron.connected == false)
+   {
+      return false;
+   }
+
+   if (machine->neuron.transportTLSEnabled())
+   {
+      return machine->neuron.isTLSNegotiated() && machine->neuron.tlsPeerVerified;
+   }
+
+   return true;
 }
 
 inline BrainBase *thisBrain = nullptr;

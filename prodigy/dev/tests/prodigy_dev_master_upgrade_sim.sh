@@ -70,7 +70,7 @@ fi
 total_cases=0
 failed_cases=0
 failed_names=()
-case_max_attempts="${PRODIGY_DEV_CASE_MAX_ATTEMPTS:-2}"
+case_max_attempts="${PRODIGY_DEV_CASE_MAX_ATTEMPTS:-1}"
 
 if ! [[ "${case_max_attempts}" =~ ^[0-9]+$ ]] || [[ "${case_max_attempts}" -le 0 ]]
 then

@@ -1,4 +1,5 @@
 #include <prodigy/brain/metrics.h>
+#include <prodigy/persistent.state.h>
 #include <services/debug.h>
 
 #include <algorithm>
@@ -269,9 +270,9 @@ int main(void)
    }
 
    {
-      ProdigyMetricSamplesSnapshot snapshot = {};
+      ProdigyPersistentBrainSnapshot snapshot = {};
       constexpr uint32_t sampleCount = 70'000;
-      snapshot.samples.reserve(sampleCount);
+      snapshot.metricSamples.reserve(sampleCount);
 
       for (uint32_t index = 0; index < sampleCount; ++index)
       {
@@ -281,20 +282,20 @@ int main(void)
          sample.containerUUID = containerA + index;
          sample.metricKey = metricKey;
          sample.value = float(index % 4096);
-         snapshot.samples.push_back(sample);
+         snapshot.metricSamples.push_back(sample);
       }
 
       String serialized = {};
       BitseryEngine::serialize(serialized, snapshot);
 
-      ProdigyMetricSamplesSnapshot decoded = {};
+      ProdigyPersistentBrainSnapshot decoded = {};
       const bool deserialized = BitseryEngine::deserializeSafe(serialized, decoded);
       suite.expect(deserialized, "metric_snapshot_above_uint16_deserializes");
-      suite.expect(decoded.samples.size() == sampleCount, "metric_snapshot_above_uint16_count");
+      suite.expect(decoded.metricSamples.size() == sampleCount, "metric_snapshot_above_uint16_count");
       suite.expect(
-         decoded.samples.size() == sampleCount
-            && decoded.samples.front() == snapshot.samples.front()
-            && decoded.samples.back() == snapshot.samples.back(),
+         decoded.metricSamples.size() == sampleCount
+            && decoded.metricSamples.front() == snapshot.metricSamples.front()
+            && decoded.metricSamples.back() == snapshot.metricSamples.back(),
          "metric_snapshot_above_uint16_edges");
    }
 

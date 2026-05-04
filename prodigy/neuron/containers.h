@@ -30,20 +30,17 @@
 #include <services/memfd.h>
 #include <prodigy/build.identity.h>
 #include <prodigy/wire.h>
+#include <prodigy/child.process.signal.h>
 
 #include <prodigy/neuron/container.storage.layout.h>
 #include <switchboard/overlay.route.h>
+#include <switchboard/whitehole.route.h>
 
 #define nReservedCores 2
 static constexpr int containerStartupFailureExitCode = 125;
 static constexpr int containerExecInheritedFDMinimum = 64;
 static constexpr int64_t failedContainerArtifactRetentionMs = 24LL * 60LL * 60LL * 1000LL;
 static constexpr int64_t failedContainerArtifactCleanupIntervalMs = 3LL * 60LL * 60LL * 1000LL;
-
-static inline uint16_t prodigyContainerReservedCoreCount(uint32_t lcoreCount)
-{
-   return (lcoreCount > nReservedCores) ? uint16_t(nReservedCores) : uint16_t(0);
-}
 
 static void prodigyAppendAttachTrace(String& line)
 {
@@ -449,13 +446,8 @@ static bool devFakeIPv4ModeEnabled(void)
 }
 #endif
 
-static bool writeProcSysctlValue(const char *path, const char *value, int *failureErrno = nullptr)
+static bool writeProcSysctlValue(const char *path, const char *value)
 {
-   if (failureErrno)
-   {
-      *failureErrno = 0;
-   }
-
    if (path == nullptr || value == nullptr)
    {
       return false;
@@ -464,93 +456,13 @@ static bool writeProcSysctlValue(const char *path, const char *value, int *failu
    int fd = open(path, O_WRONLY | O_CLOEXEC);
    if (fd < 0)
    {
-      if (failureErrno)
-      {
-         *failureErrno = errno;
-      }
       return false;
    }
 
    size_t length = strlen(value);
-   ssize_t written = write(fd, value, length);
-   if (written != ssize_t(length) && failureErrno)
-   {
-      *failureErrno = errno != 0 ? errno : EIO;
-   }
-
+   bool ok = (write(fd, value, length) == ssize_t(length));
    close(fd);
-   return written == ssize_t(length);
-}
-
-static bool enableProdigyTCPFastOpen(int *failureErrno = nullptr)
-{
-   // 519 = 0x1 client + 0x2 server + 0x4 client-without-cookie
-   // + 0x200 server-without-cookie. Aegis service admission depends on
-   // secret/TID bytes arriving as TFO early data, including first contact.
-   return writeProcSysctlValue("/proc/sys/net/ipv4/tcp_fastopen", "519", failureErrno);
-}
-
-static bool enableProdigyTCPFastOpenInNetworkNamespace(int targetNetNSFD, int restoreNetNSFD, String *failureReport = nullptr)
-{
-   // /proc/sys/net resolves through the caller's current network namespace.
-   // Switch only this setup thread, write the per-netns TFO policy, then restore.
-   if (targetNetNSFD < 0)
-   {
-      if (failureReport)
-      {
-         failureReport->assign("tcp_fastopen target netns fd is invalid"_ctv);
-      }
-      return false;
-   }
-
-   if (restoreNetNSFD < 0)
-   {
-      if (failureReport)
-      {
-         failureReport->assign("tcp_fastopen restore netns fd is invalid"_ctv);
-      }
-      return false;
-   }
-
-   if (setns(targetNetNSFD, CLONE_NEWNET) != 0)
-   {
-      if (failureReport)
-      {
-         failureReport->snprintf<"failed to enter tcp_fastopen target netns: {}"_ctv>(String(strerror(errno)));
-      }
-      return false;
-   }
-
-   int failureErrno = 0;
-   bool enabled = enableProdigyTCPFastOpen(&failureErrno);
-
-   if (setns(restoreNetNSFD, CLONE_NEWNET) != 0)
-   {
-      int restoreErrno = errno;
-      basics_log("tcp_fastopen netns restore failed targetFD=%d restoreFD=%d errno=%d(%s)\n",
-         targetNetNSFD,
-         restoreNetNSFD,
-         restoreErrno,
-         strerror(restoreErrno));
-
-      if (failureReport)
-      {
-         failureReport->snprintf<"failed to restore tcp_fastopen caller netns: {}"_ctv>(String(strerror(restoreErrno)));
-      }
-
-      std::abort();
-   }
-
-   if (enabled == false)
-   {
-      if (failureReport)
-      {
-         failureReport->snprintf<"failed to enable tcp_fastopen in target netns: {}"_ctv>(String(strerror(failureErrno)));
-      }
-      return false;
-   }
-
-   return true;
+   return ok;
 }
 
 static std::filesystem::path prodigyFilesystemPathFromString(const String& path)
@@ -657,6 +569,7 @@ public:
    Vector<switchboard_overlay_machine_route_key> installedPeerOverlayRouteKeysLow8 = {};
    Vector<switchboard_overlay_prefix4_key> installedPeerHostedIngressRouteKeys4 = {};
    Vector<switchboard_overlay_prefix6_key> installedPeerHostedIngressRouteKeys6 = {};
+   Vector<portal_definition> installedPeerWhiteholeBindingKeys = {};
 
 private:
 
@@ -887,6 +800,62 @@ public:
          installedPeerHostedIngressRouteKeys6);
    }
 
+   uint32_t localContainerID(void) const
+   {
+      if (thisNeuron == nullptr)
+      {
+         return 0;
+      }
+
+      uint32_t containerID = uint32_t(thisNeuron->lcsubnet6.mpfx[2]);
+      containerID |= uint32_t(thisNeuron->lcsubnet6.mpfx[1]) << 8;
+      containerID |= uint32_t(thisNeuron->lcsubnet6.mpfx[0]) << 16;
+      containerID |= uint32_t(plan.fragment) << 24;
+      return containerID;
+   }
+
+   void syncPeerWhiteholeBindingsFrom(const Vector<Whitehole>& whiteholes)
+   {
+      Vector<std::pair<portal_definition, switchboard_whitehole_binding>> desiredBindings = {};
+      if (thisNeuron != nullptr)
+      {
+         uint32_t containerID = localContainerID();
+         desiredBindings.reserve(whiteholes.size());
+
+         for (const Whitehole& whitehole : whiteholes)
+         {
+            portal_definition key = {};
+            switchboard_whitehole_binding value = {};
+            if (switchboardBuildWhiteholeBinding(whitehole, containerID, thisNeuron->lcsubnet6, key, value) == false)
+            {
+               continue;
+            }
+
+            desiredBindings.emplace_back(key, value);
+         }
+      }
+
+      prodigySyncOverlayValueMap(peer_program,
+         "whitehole_bindings"_ctv,
+         installedPeerWhiteholeBindingKeys,
+         desiredBindings,
+         [] (const portal_definition& lhs, const portal_definition& rhs) -> bool {
+
+            return switchboardPortalDefinitionEquals(lhs, rhs);
+         });
+   }
+
+   void syncPeerWhiteholeBindings(void)
+   {
+      syncPeerWhiteholeBindingsFrom(plan.whiteholes);
+   }
+
+   void clearPeerWhiteholeBindings(void)
+   {
+      static const Vector<Whitehole> noWhiteholes = {};
+      syncPeerWhiteholeBindingsFrom(noWhiteholes);
+   }
+
    uint32_t desiredInterContainerMTU(String *failureReport = nullptr) const
    {
       if (thisNeuron == nullptr)
@@ -1047,28 +1016,10 @@ public:
    bool restoreNetwork(String *failureReport = nullptr)
    {
       int hostnetnsfd = Filesystem::openFileAt(-1, "/proc/self/ns/net"_ctv, O_RDONLY);
-      if (hostnetnsfd < 0)
-      {
-         if (failureReport) failureReport->snprintf<"failed to open host netns while restoring container {itoa}: {}"_ctv>(plan.uuid, String(strerror(errno)));
-         return false;
-      }
 
       String path;
       path.snprintf<"/proc/{itoa}/ns/net"_ctv>(pid);
       int peernetnsfd = Filesystem::openFileAt(-1, path, O_RDONLY);
-      if (peernetnsfd < 0)
-      {
-         if (failureReport) failureReport->snprintf<"failed to open peer netns while restoring container {itoa}: {}"_ctv>(plan.uuid, String(strerror(errno)));
-         if (hostnetnsfd >= 0) ::close(hostnetnsfd);
-         return false;
-      }
-
-      if (enableProdigyTCPFastOpenInNetworkNamespace(peernetnsfd, hostnetnsfd, failureReport) == false)
-      {
-         if (peernetnsfd >= 0) ::close(peernetnsfd);
-         if (hostnetnsfd >= 0) ::close(hostnetnsfd);
-         return false;
-      }
 
       netdevs.setNames(String{plan.fragment});
       netdevs.peer.moveSocketToNamespace(peernetnsfd, hostnetnsfd);
@@ -1103,6 +1054,7 @@ public:
          peer_program->setArrayElement("mac_map"_ctv, 0, thisNeuron->eth.mac);
          peer_program->setArrayElement("gateway_mac_map"_ctv, 0, thisNeuron->eth.gateway_mac);
          peer_program->setArrayElement("container_network_policy_map"_ctv, 0, networkPolicy);
+         syncPeerWhiteholeBindings();
       }
 
       path.assign("/root/prodigy/container.ingress.router.ebpf.o"_ctv);
@@ -1127,6 +1079,18 @@ public:
 
    bool setupNetwork(String *failureReport = nullptr)
    {
+      std::fprintf(stderr, "setupNetwork begin uuid=%llu appID=%u useHostNetns=%d dpfx=%u mpfx=%u.%u.%u neuron=%p pid=%d\n",
+         (unsigned long long)plan.uuid,
+         unsigned(plan.config.applicationID),
+         int(plan.useHostNetworkNamespace),
+         unsigned(thisNeuron->lcsubnet6.dpfx),
+         unsigned(thisNeuron->lcsubnet6.mpfx[0]),
+         unsigned(thisNeuron->lcsubnet6.mpfx[1]),
+         unsigned(thisNeuron->lcsubnet6.mpfx[2]),
+         static_cast<void *>(thisNeuron),
+         int(pid));
+      std::fflush(stderr);
+
       if (plan.config.applicationID == 11)
       {
          basics_log("setupNetwork stage=begin uuid=%llu appID=%u pid=%d\n",
@@ -1152,16 +1116,6 @@ public:
          if (failureReport) failureReport->snprintf<"failed to open peer netns for container {itoa}: {}"_ctv>(plan.uuid, String(strerror(errno)));
          basics_log("setupNetwork failed uuid=%llu reason=open-peer-netns path=%s errno=%d(%s)\n",
             (unsigned long long)plan.uuid, path.c_str(), errno, strerror(errno));
-         if (hostnetnsfd >= 0) ::close(hostnetnsfd);
-         return false;
-      }
-
-      if (enableProdigyTCPFastOpenInNetworkNamespace(peernetnsfd, hostnetnsfd, failureReport) == false)
-      {
-         basics_log("setupNetwork failed uuid=%llu reason=enable-tcp-fastopen-netns detail=%s\n",
-            (unsigned long long)plan.uuid,
-            failureReport != nullptr ? failureReport->c_str() : "");
-         if (peernetnsfd >= 0) ::close(peernetnsfd);
          if (hostnetnsfd >= 0) ::close(hostnetnsfd);
          return false;
       }
@@ -1200,10 +1154,53 @@ public:
          peer.addIP(prefix);
       }
 
+      for (const Whitehole& whitehole : plan.whiteholes)
+      {
+         if (whitehole.hasAddress == false || whitehole.address.isNull())
+         {
+            continue;
+         }
+
+         IPPrefix whiteholeAddress = {};
+         whiteholeAddress.network = whitehole.address;
+         whiteholeAddress.cidr = whitehole.address.is6 ? 128 : 32;
+         peer.addIP(whiteholeAddress);
+      }
+
+#if NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE
+      if (devFakeIPv4ModeEnabled())
+      {
+         // Fake-boundary dev tests inject IPv4 portal packets from inside the
+         // ecosystem with the external /32 still as destination. Production
+         // boundary ingress normalizes external traffic before container entry.
+         for (const Wormhole& wormhole : plan.wormholes)
+         {
+            if (wormhole.externalAddress.isNull() || wormhole.externalAddress.is6)
+            {
+               continue;
+            }
+
+            IPPrefix wormholeAddress = {};
+            wormholeAddress.network = wormhole.externalAddress;
+            wormholeAddress.cidr = 32;
+            peer.addIP(wormholeAddress);
+         }
+      }
+#endif
+
       peer.addDefaultRoutes();
 
       // Mesh subscriptions target datacenter-scoped container IPv6s (prefix11 + dpfx + machine + fragment).
       // Add datacenter-wide /96 routes so cross-machine container traffic is routable from this netns.
+      basics_log("setupNetwork fragment-check uuid=%llu appID=%u dpfx=%u mpfx=%u.%u.%u neuron=%p pid=%d\n",
+         (unsigned long long)plan.uuid,
+         unsigned(plan.config.applicationID),
+         unsigned(thisNeuron->lcsubnet6.dpfx),
+         unsigned(thisNeuron->lcsubnet6.mpfx[0]),
+         unsigned(thisNeuron->lcsubnet6.mpfx[1]),
+         unsigned(thisNeuron->lcsubnet6.mpfx[2]),
+         static_cast<void *>(thisNeuron),
+         int(pid));
       installDatacenterMeshRoutes(peer, thisNeuron->lcsubnet6.dpfx);
 
    // add us to host map
@@ -1239,7 +1236,10 @@ public:
       }
 
       path.assign("/root/prodigy/container.egress.router.ebpf.o"_ctv);
-      peer_program = host.attachBPF(prodigyContainerEgressNetkitAttachType(), path, "container_egress_router"_ctv);
+      peer_program = host.attachBPF(prodigyContainerEgressNetkitAttachType(), path, "container_egress_router"_ctv,
+         [&] (struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
+            (void)switchboardReusePinnedWhiteholeReplyFlowMap(obj, thisNeuron->eth.ifidx, inner_map_fds);
+         });
       if (peer_program == nullptr)
       {
          if (failureReport) failureReport->snprintf<"failed to attach container egress bpf for container {itoa} path={}"_ctv>(plan.uuid, path);
@@ -1268,6 +1268,7 @@ public:
       peer_program->setArrayElement("mac_map"_ctv, 0, thisNeuron->eth.mac);
       peer_program->setArrayElement("gateway_mac_map"_ctv, 0, thisNeuron->eth.gateway_mac);
       peer_program->setArrayElement("container_network_policy_map"_ctv, 0, networkPolicy);
+      syncPeerWhiteholeBindings();
       
       path.assign("/root/prodigy/container.ingress.router.ebpf.o"_ctv);
       primary_program = host.attachBPF(prodigyContainerIngressNetkitAttachType(), path, "container_ingress_router"_ctv);
@@ -1364,33 +1365,12 @@ private:
 
    int slicefd;
    static inline bool rootCgroupSeeded = false;
-   static inline bool sigchldWaitabilityEnsured = false;
 
    static void ensureSigchldIsWaitable(void)
    {
-      if (sigchldWaitabilityEnsured)
-      {
-         return;
-      }
-
-      // Guardian defaults SIGCHLD to SIG_IGN globally; container lifecycle
-      // supervision relies on waitid/waitpid semantics, so keep SIGCHLD waitable.
-      struct sigaction currentSigChld {};
-      if (sigaction(SIGCHLD, nullptr, &currentSigChld) != 0)
-      {
-         return;
-      }
-
-      if (currentSigChld.sa_handler == SIG_IGN)
-      {
-         struct sigaction defaultSigChld {};
-         sigemptyset(&defaultSigChld.sa_mask);
-         defaultSigChld.sa_handler = SIG_DFL;
-         defaultSigChld.sa_flags = 0;
-         sigaction(SIGCHLD, &defaultSigChld, nullptr);
-      }
-
-      sigchldWaitabilityEnsured = true;
+      // Guardian may install a blocking SIGCHLD policy; container lifecycle
+      // supervision relies on explicit waitid/waitpid ownership instead.
+      (void)prodigyEnsureSigchldDefaultWaitable();
    }
 
    static void trimTrailingWhitespace(String& text)
@@ -3408,6 +3388,8 @@ private:
          {&rootfsRoot, "crashreport.txt", "crashreport.txt"},
          {&rootfsRoot, "readytrace.log", "readytrace.log"},
          {&rootfsRoot, "aegis.hash.log", "aegis.hash.log"},
+         {&rootfsRoot, "whitehole_probe_trace.log", "whitehole_probe_trace.log"},
+         {&rootfsRoot, "quic_wormhole_probe_trace.log", "quic_wormhole_probe_trace.log"},
          {&rootfsRoot, "params.dump", "params.dump"},
          {&artifactRoot, ".prodigy-private/launch.metadata", "launch.metadata"},
          {&rootfsRoot, "logs/stdout.log", "logs/stdout.log"},
@@ -5657,17 +5639,16 @@ public:
          }
       }
 
-	      thisNeuron->lcoreCount = endIdx + 1; // CPUs are 0-indexed
-	      uint16_t reservedCores = prodigyContainerReservedCoreCount(thisNeuron->lcoreCount);
-	      // Initialize all cores as available (0)
-	      for (uint16_t i = 0; i < 256; ++i) thisNeuron->lcores[i] = 0;
-	      // Reserve the first nReservedCores for the OS by marking them non-zero (unavailable)
-	      for (uint16_t i = 0; i < reservedCores && i < thisNeuron->lcoreCount; ++i) thisNeuron->lcores[i] = 0xFFFF;
+      thisNeuron->lcoreCount = endIdx + 1; // CPUs are 0-indexed
+      // Initialize all cores as available (0)
+      for (uint16_t i = 0; i < 256; ++i) thisNeuron->lcores[i] = 0;
+      // Reserve the first nReservedCores for the OS by marking them non-zero (unavailable)
+      for (uint16_t i = 0; i < nReservedCores && i < thisNeuron->lcoreCount; ++i) thisNeuron->lcores[i] = 0xFFFF;
 
-	      // Remove OS-reserved cores from the containers slice: set e.g. "2-<end>"
-	      String cpusRange;
-	      uint16_t firstContainerCore = (reservedCores < thisNeuron->lcoreCount) ? reservedCores : thisNeuron->lcoreCount - 1;
-	      cpusRange.snprintf<"{itoa}-{itoa}"_ctv>(firstContainerCore, endIdx);
+      // Remove OS-reserved cores from the containers slice: set e.g. "2-<end>"
+      String cpusRange;
+      uint16_t firstContainerCore = (nReservedCores < thisNeuron->lcoreCount) ? nReservedCores : thisNeuron->lcoreCount - 1;
+      cpusRange.snprintf<"{itoa}-{itoa}"_ctv>(firstContainerCore, endIdx);
       Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/containers.slice/cpuset.cpus"_ctv, cpusRange);
       Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/containers.slice/cpuset.cpus.partition"_ctv, "isolated"_ctv);
       basics_log("seed_root_cgroupv2_subtree_controllers complete range=%s lcoreCount=%u\n", cpusRange.c_str(), unsigned(thisNeuron->lcoreCount));
@@ -5750,12 +5731,11 @@ public:
       Filesystem::openWriteAtClose(middirfd, "cgroup.max.descendants"_ctv, "1"_ctv);
       Filesystem::openWriteAtClose(middirfd, "cgroup.max.depth"_ctv, "1"_ctv);
 
-	      if (applicationUsesSharedCPUs(container->plan.config))
-	      {
-	         uint16_t reservedCores = prodigyContainerReservedCoreCount(thisNeuron->lcoreCount);
-	         uint16_t firstContainerCore = (reservedCores < thisNeuron->lcoreCount) ? reservedCores : (thisNeuron->lcoreCount - 1);
-	         path.snprintf<"{itoa}-{itoa}"_ctv>(firstContainerCore, uint16_t(thisNeuron->lcoreCount - 1));
-	      }
+      if (applicationUsesSharedCPUs(container->plan.config))
+      {
+         uint16_t firstContainerCore = (nReservedCores < thisNeuron->lcoreCount) ? nReservedCores : (thisNeuron->lcoreCount - 1);
+         path.snprintf<"{itoa}-{itoa}"_ctv>(firstContainerCore, uint16_t(thisNeuron->lcoreCount - 1));
+      }
       else
       {
          path.snprintf<"{itoa}-{itoa}"_ctv>(container->lcores[0], container->lcores[container->plan.config.nLogicalCores - 1]);
@@ -5840,121 +5820,179 @@ public:
       Filesystem::openWriteAtClose(fd, "cgroup.freeze"_ctv, "0"_ctv);
    }
 
-   // master scheduler garauntees this machine has enough cores
-   static void allocateCores(Container *container)
+   static bool findAvailableCoreSpan(Container *container)
    {
-      uint16_t span;
-
-      restart:
-
-      span = 0;
-
       // pack them tightly oriented about lower core indexes
-	      uint16_t reservedCores = prodigyContainerReservedCoreCount(thisNeuron->lcoreCount);
-	      for (uint16_t index = reservedCores; index < thisNeuron->lcoreCount; index++)
+      uint16_t span = 0;
+      for (uint16_t index = nReservedCores; index < thisNeuron->lcoreCount; index++)
       {
          if (thisNeuron->lcores[index] == 0) // available
          {
             container->lcores[span] = index;
-            
-            if (++span == container->plan.config.nLogicalCores) break;
+
+            if (++span == container->plan.config.nLogicalCores)
+            {
+               return true;
+            }
          }
          else span = 0;
       }
 
-      if (span != container->plan.config.nLogicalCores) // we need to defrag
+      return false;
+   }
+
+   // The master scheduler should target machines with enough cores; the local
+   // neuron still fails closed if its cgroup CPU view or bookkeeping disagrees.
+   static bool allocateCores(Container *container)
+   {
+      if (container->plan.config.nLogicalCores == 0
+         || container->plan.config.nLogicalCores > 256
+         || thisNeuron->lcoreCount <= nReservedCores
+         || container->plan.config.nLogicalCores > thisNeuron->lcoreCount - nReservedCores)
       {
-         uint16_t holeIndex = 0; // it's never 0 because the bottom logical core is always reserved for the operating system 
+         std::fprintf(stderr,
+            "allocateCores rejected request=%u lcoreCount=%u reserved=%u reason=invalid-request-or-range\n",
+            unsigned(container->plan.config.nLogicalCores),
+            unsigned(thisNeuron->lcoreCount),
+            unsigned(nReservedCores));
+         std::fflush(stderr);
+         return false;
+      }
+
+      if (findAvailableCoreSpan(container) == false) // we need to defrag
+      {
+         uint16_t holeIndex = nReservedCores;
 
          // compact leftwise
-	         for (uint16_t index = reservedCores; index < thisNeuron->lcoreCount;)
+         for (uint16_t index = nReservedCores; index < thisNeuron->lcoreCount;)
          {  
             if (thisNeuron->lcores[index] == 0) // hole
             {
                // we found our first hole, this is our starting point to compact into
-               if (holeIndex == 0) holeIndex = index;
-
                index++;
             }
             else // has a process into it
             {
                // shift the process to the hole index, then reset the new hole index to the new process tail
 
-               uint16_t nShift = index - holeIndex;
-
-               for (auto& [uuid, container] : thisNeuron->containers)
+               Container *owner = nullptr;
+               for (auto& [uuid, existingContainer] : thisNeuron->containers)
                {
-                  if (container->lcores[0] == index)
+                  if (existingContainer->lcores[0] == index)
                   {
-                     String workingString;
-
-                  // update bookkeeping 
-                     for (uint16_t subIndex = 0; subIndex < container->plan.config.nLogicalCores; subIndex++)
-                     {
-                        container->lcores[subIndex] = index + subIndex;
-                        thisNeuron->lcores[index + subIndex] = container->plan.config.nLogicalCores;
-                     }
-
-                     String path;
-                     path.assign("/sys/fs/cgroup/containers.slice/"_ctv);
-                     path.append(container->name);
-                     path.append(".slice"_ctv);
-
-                     int slicefd = Filesystem::createOpenDirectoryAt(-1, path);
-
-                  // change the cores the cgroup owns
-                     workingString.snprintf<"{itoa}-{itoa}"_ctv>(container->lcores[0], container->lcores[container->plan.config.nLogicalCores - 1]);
-                     Filesystem::openWriteAtClose(slicefd, "cpuset.cpus"_ctv, workingString);
-
-                   // if any pinned threads, shift them by nShift
-                     int leaffd = Filesystem::openDirectoryAt(slicefd, "leaf"_ctv);
-                     Filesystem::openReadAtClose(leaffd, "cgroup.threads"_ctv, workingString);
-
-                     uint64_t head = 0;
-                     uint16_t threadIndex = 0;
-
-                     // read over by linebreaks, then translate into pid_t numbers
-                     for (uint64_t charIndex = 0; charIndex < workingString.size(); charIndex++)
-                     {
-                        if (workingString[charIndex] == '\n')
-                        {
-                           pid_t tid = workingString.toNumber<uint32_t>(head, charIndex - head);
-
-                           cpu_set_t currentSet;
-                           CPU_ZERO(&currentSet);
-                           sched_getaffinity(tid, sizeof(currentSet), &currentSet);
-
-                           if (bool isPinned = (CPU_COUNT(&currentSet) == 1); isPinned)
-                           {
-                              int currentCore = __builtin_ffsl(*(unsigned long *)(&currentSet)) - 1; // Find first set bit (the pinned core)
-                              int newCore = currentCore - nShift;
-
-                              cpu_set_t set;
-                              CPU_ZERO(&set);
-                              CPU_SET(newCore, &set);
-                              sched_setaffinity(tid, sizeof(set), &set);
-                           }                 
-                        }
-                     }
-
-                     holeIndex += container->plan.config.nLogicalCores;
-                     index = holeIndex;
-
+                     owner = existingContainer;
                      break;
                   }
                }
+
+               if (owner == nullptr
+                  || owner->plan.config.nLogicalCores == 0
+                  || owner->plan.config.nLogicalCores > 256)
+               {
+                  index++;
+                  continue;
+               }
+
+               uint16_t ownerCores = owner->plan.config.nLogicalCores;
+               if (index != holeIndex)
+               {
+                  uint16_t nShift = index - holeIndex;
+                  String workingString;
+
+                  // update bookkeeping 
+                  for (uint16_t subIndex = 0; subIndex < ownerCores; subIndex++)
+                  {
+                     uint16_t oldCore = uint16_t(index + subIndex);
+                     if (oldCore < thisNeuron->lcoreCount && oldCore < 256)
+                     {
+                        thisNeuron->lcores[oldCore] = 0;
+                     }
+                  }
+
+                  for (uint16_t subIndex = 0; subIndex < ownerCores; subIndex++)
+                  {
+                     uint16_t newCore = uint16_t(holeIndex + subIndex);
+                     owner->lcores[subIndex] = newCore;
+                     thisNeuron->lcores[newCore] = ownerCores;
+                  }
+
+                  String path;
+                  path.assign("/sys/fs/cgroup/containers.slice/"_ctv);
+                  path.append(owner->name);
+                  path.append(".slice"_ctv);
+
+                  int slicefd = Filesystem::createOpenDirectoryAt(-1, path);
+
+                  // change the cores the cgroup owns
+                  workingString.snprintf<"{itoa}-{itoa}"_ctv>(owner->lcores[0], owner->lcores[ownerCores - 1]);
+                  Filesystem::openWriteAtClose(slicefd, "cpuset.cpus"_ctv, workingString);
+
+                   // if any pinned threads, shift them by nShift
+                  int leaffd = Filesystem::openDirectoryAt(slicefd, "leaf"_ctv);
+                  Filesystem::openReadAtClose(leaffd, "cgroup.threads"_ctv, workingString);
+
+                  uint64_t head = 0;
+                  uint16_t threadIndex = 0;
+
+                  // read over by linebreaks, then translate into pid_t numbers
+                  for (uint64_t charIndex = 0; charIndex < workingString.size(); charIndex++)
+                  {
+                     if (workingString[charIndex] == '\n')
+                     {
+                        pid_t tid = workingString.toNumber<uint32_t>(head, charIndex - head);
+
+                        cpu_set_t currentSet;
+                        CPU_ZERO(&currentSet);
+                        sched_getaffinity(tid, sizeof(currentSet), &currentSet);
+
+                        if (bool isPinned = (CPU_COUNT(&currentSet) == 1); isPinned)
+                        {
+                           int currentCore = __builtin_ffsl(*(unsigned long *)(&currentSet)) - 1; // Find first set bit (the pinned core)
+                           int newCore = currentCore - nShift;
+
+                           cpu_set_t set;
+                           CPU_ZERO(&set);
+                           CPU_SET(newCore, &set);
+                           sched_setaffinity(tid, sizeof(set), &set);
+                        }
+                     }
+                  }
+
+                  if (slicefd >= 0) close(slicefd);
+                  if (leaffd >= 0) close(leaffd);
+               }
+
+               holeIndex = uint16_t(holeIndex + ownerCores);
+               index = uint16_t(index + ownerCores);
             }
          }
 
-         goto restart;
-      }
-      else
-      {
-         for (uint16_t index = 0; index < container->plan.config.nLogicalCores; index++)
+         if (findAvailableCoreSpan(container) == false)
          {
-            thisNeuron->lcores[container->lcores[index]] = container->plan.config.nLogicalCores;
+            std::fprintf(stderr,
+               "allocateCores rejected request=%u lcoreCount=%u reserved=%u reason=no-contiguous-span lcores[0..7]=%u,%u,%u,%u,%u,%u,%u,%u\n",
+               unsigned(container->plan.config.nLogicalCores),
+               unsigned(thisNeuron->lcoreCount),
+               unsigned(nReservedCores),
+               unsigned(thisNeuron->lcores[0]),
+               unsigned(thisNeuron->lcores[1]),
+               unsigned(thisNeuron->lcores[2]),
+               unsigned(thisNeuron->lcores[3]),
+               unsigned(thisNeuron->lcores[4]),
+               unsigned(thisNeuron->lcores[5]),
+               unsigned(thisNeuron->lcores[6]),
+               unsigned(thisNeuron->lcores[7]));
+            std::fflush(stderr);
+            return false;
          }
       }
+
+      for (uint16_t index = 0; index < container->plan.config.nLogicalCores; index++)
+      {
+         thisNeuron->lcores[container->lcores[index]] = container->plan.config.nLogicalCores;
+      }
+
+      return true;
    }
 
    static bool openContainerSliceFD(const Container *container, int& sliceFD, String *pathOut = nullptr)
@@ -6007,10 +6045,9 @@ public:
             return false;
          }
 
-	         String cpuset;
-	         uint16_t reservedCores = prodigyContainerReservedCoreCount(thisNeuron->lcoreCount);
-	         uint16_t firstContainerCore = (reservedCores < thisNeuron->lcoreCount) ? reservedCores : (thisNeuron->lcoreCount - 1);
-	         cpuset.snprintf<"{itoa}-{itoa}"_ctv>(firstContainerCore, uint16_t(thisNeuron->lcoreCount - 1));
+         String cpuset;
+         uint16_t firstContainerCore = (nReservedCores < thisNeuron->lcoreCount) ? nReservedCores : (thisNeuron->lcoreCount - 1);
+         cpuset.snprintf<"{itoa}-{itoa}"_ctv>(firstContainerCore, uint16_t(thisNeuron->lcoreCount - 1));
          Filesystem::openWriteAtClose(sliceFD, "cpuset.cpus"_ctv, cpuset);
          close(sliceFD);
          return true;
@@ -6221,7 +6258,17 @@ public:
 	      container->wBuffer.reserve(16_KB);
       if (applicationUsesIsolatedCPUs(container->plan.config))
       {
-	      allocateCores(container);
+	      if (allocateCores(container) == false)
+         {
+            basics_log("createContainer rejected deploymentID=%llu appID=%u reason=insufficient isolated cores requested=%u lcoreCount=%u\n",
+               (unsigned long long)plan.config.deploymentID(),
+               unsigned(plan.config.applicationID),
+               unsigned(plan.config.nLogicalCores),
+               unsigned(thisNeuron->lcoreCount));
+            delete container;
+            container = nullptr;
+            return;
+         }
       }
 
       if (container->plan.addresses.size() > 0)
@@ -6352,12 +6399,22 @@ public:
          defaultSigChld.sa_handler = SIG_DFL;
          defaultSigChld.sa_flags = 0;
          sigaction(SIGCHLD, &defaultSigChld, &oldSigChld);
+         auto restoreSigChld = [&] (void) -> void {
+            if (prodigySigchldIsDefaultWaitable(oldSigChld))
+            {
+               sigaction(SIGCHLD, &oldSigChld, nullptr);
+            }
+            else
+            {
+               prodigyEnsureSigchldDefaultWaitable();
+            }
+         };
 
          int pipefd[2];
          if (pipe(pipefd) != 0)
          {
             basics_log("createContainer pipe failed errno=%d(%s)\n", errno, strerror(errno));
-            sigaction(SIGCHLD, &oldSigChld, nullptr);
+            restoreSigChld();
             cleanupContainerAfterFailedCreate(container);
             container = nullptr;
             return;
@@ -6446,7 +6503,7 @@ public:
          bool zstd_ok = waitForSpawned(zstd_pid, zstd_status, "zstd");
          bool recv_ok = waitForSpawned(recv_pid, recv_status, "btrfs_receive");
 
-         sigaction(SIGCHLD, &oldSigChld, nullptr);
+         restoreSigChld();
 
          if (zstd_ok == false || recv_ok == false)
          {
@@ -6702,26 +6759,51 @@ public:
 
    static void seedDynamicData(Container *container)
    {
+      // seed dynamic data to neuron socket
+      // otherwise we need to write 2 pathways in every application to handle dynamic data through main() and neuron socket. this makes more sense
+
       uint32_t advertisementPairingCount = 0;
       uint32_t subscriptionPairingCount = 0;
 
       for (const auto& [secret, pairings] : container->plan.advertisementPairings)
       {
-         (void)secret;
          for (const AdvertisementPairing& pairing : pairings)
          {
-            (void)pairing;
             advertisementPairingCount += 1;
+            String payload;
+            uint16_t applicationID = uint16_t(pairing.service >> 48);
+            if (ProdigyWire::serializeAdvertisementPairingPayload(
+               payload,
+               pairing.secret,
+               pairing.address,
+               pairing.service,
+               applicationID,
+               true))
+            {
+               ProdigyWire::constructPackedFrame(container->wBuffer, ContainerTopic::advertisementPairing, payload);
+            }
          }
       }
 
       for (const auto& [secret, pairings] : container->plan.subscriptionPairings)
       {
-         (void)secret;
          for (const SubscriptionPairing& pairing : pairings)
          {
-            (void)pairing;
             subscriptionPairingCount += 1;
+            // Service encoding carries application prefix in upper 16 bits.
+            uint16_t applicationID = uint16_t(pairing.service >> 48);
+            String payload;
+            if (ProdigyWire::serializeSubscriptionPairingPayload(
+               payload,
+               pairing.secret,
+               pairing.address,
+               pairing.service,
+               pairing.port,
+               applicationID,
+               true))
+            {
+               ProdigyWire::constructPackedFrame(container->wBuffer, ContainerTopic::subscriptionPairing, payload);
+            }
          }
       }
 
@@ -7374,6 +7456,18 @@ public:
 
    static bool startContainer(Container *container, bool isRestart = false, String *failureReport = nullptr)
    {
+      std::fprintf(stderr, "startContainer begin uuid=%llu appID=%u useHostNetns=%d dpfx=%u mpfx=%u.%u.%u neuron=%p pid=%d\n",
+         (unsigned long long)container->plan.uuid,
+         unsigned(container->plan.config.applicationID),
+         int(container->plan.useHostNetworkNamespace),
+         unsigned(thisNeuron->lcsubnet6.dpfx),
+         unsigned(thisNeuron->lcsubnet6.mpfx[0]),
+         unsigned(thisNeuron->lcsubnet6.mpfx[1]),
+         unsigned(thisNeuron->lcsubnet6.mpfx[2]),
+         static_cast<void *>(thisNeuron),
+         int(container->pid));
+      std::fflush(stderr);
+
       ensureSigchldIsWaitable();
 
       if (container->artifactRootPath.size() == 0)
@@ -7508,73 +7602,27 @@ public:
          close(startupSync[1]);
          close(socs[0]);
 
-         auto failStartup = [&] (const char *stage, int errorNumber, const String *detail) -> void
-         {
-            String stageText = {};
-            if (stage != nullptr)
-            {
-               stageText.assign(stage);
-            }
-
-            String report = {};
-            report.snprintf<"pre-exec-stage={}\nerrno={itoa}({})\n"_ctv>(
-               stageText,
-               errorNumber,
-               String(strerror(errorNumber)));
-            if (detail != nullptr && detail->size() > 0)
-            {
-               String detailText = {};
-               detailText.append(reinterpret_cast<const char *>(detail->data()), size_t(detail->size()));
-               report.snprintf_add<"detail={}\n"_ctv>(detailText);
-            }
-
-            if (container->rootfsPath.size() > 0)
-            {
-               String bootstagePath = {};
-               bootstagePath.assign(container->rootfsPath);
-               bootstagePath.append("/bootstage.txt"_ctv);
-               Filesystem::openWriteAtClose(-1, bootstagePath, report);
-            }
-
-            basics_log("startContainer pre-exec failure uuid=%llu stage=%s errno=%d(%s) detail=%s\n",
-               (unsigned long long)container->plan.uuid,
-               stageText.c_str(),
-               errorNumber,
-               strerror(errorNumber),
-               detail != nullptr && detail->size() > 0 ? "present" : "");
-
-            _exit(containerStartupFailureExitCode);
-         };
-
          String privilegedFDCloseFailure = {};
          if (closeContainerChildPrivilegedFDs(container, &privilegedFDCloseFailure) == false)
          {
             basics_log("startContainer failed to close inherited privileged fds uuid=%llu reason=%s\n",
                (unsigned long long)container->plan.uuid,
                privilegedFDCloseFailure.c_str());
-            failStartup("close-privileged-fds", errno, &privilegedFDCloseFailure);
+            _exit(containerStartupFailureExitCode);
          }
 
          StartupSyncPayload startupPayload;
          ssize_t startupRead = read(startupSync[0], &startupPayload, sizeof(startupPayload));
-         int startupReadErrno = errno;
          close(startupSync[0]);
          bool childUsesUserNamespace = useUserNamespace;
 
          if (startupRead != ssize_t(sizeof(startupPayload)) || startupPayload.startSignal != 1 || (childUsesUserNamespace && startupPayload.idMapPID <= 0))
          {
-            failStartup("startup-sync", startupReadErrno, nullptr);
+            _exit(containerStartupFailureExitCode);
          }
 
-         if (setgid(0) != 0)
-         {
-            failStartup("setgid", errno, nullptr);
-         }
-
-         if (setuid(0) != 0)
-         {
-            failStartup("setuid", errno, nullptr);
-         }
+         setuid(0);
+         setgid(0);
 
          String noNewPrivsFailure = {};
          if (setContainerNoNewPrivileges(container, &noNewPrivsFailure) == false)
@@ -7582,12 +7630,12 @@ public:
             basics_log("startContainer failed to set no_new_privs uuid=%llu reason=%s\n",
                (unsigned long long)container->plan.uuid,
                noNewPrivsFailure.c_str());
-            failStartup("no-new-privs", errno, &noNewPrivsFailure);
+            _exit(containerStartupFailureExitCode);
          }
 
          if (mountRootFSInCurrentNamespace(container, isRestart, startupPayload.idMapPID) == false)
          {
-            failStartup("mount-rootfs", errno, nullptr);
+            _exit(containerStartupFailureExitCode);
          }
 
          if (sethostname("x", 1) != 0)
@@ -7596,7 +7644,7 @@ public:
                (unsigned long long)container->plan.uuid,
                errno,
                strerror(errno));
-            failStartup("sethostname", errno, nullptr);
+            _exit(containerStartupFailureExitCode);
          }
 
          if (setdomainname("x", 1) != 0)
@@ -7605,7 +7653,7 @@ public:
                (unsigned long long)container->plan.uuid,
                errno,
                strerror(errno));
-            failStartup("setdomainname", errno, nullptr);
+            _exit(containerStartupFailureExitCode);
          }
 
          String policyFailure = {};
@@ -7614,7 +7662,7 @@ public:
             basics_log("startContainer failed to apply post-mount security policy uuid=%llu reason=%s\n",
                (unsigned long long)container->plan.uuid,
                policyFailure.c_str());
-            failStartup("post-mount-security-policy", errno, &policyFailure);
+            _exit(containerStartupFailureExitCode);
          }
 
          if (chdir(container->executeCwd.c_str()) != 0)
@@ -7624,7 +7672,7 @@ public:
                container->executeCwd.c_str(),
                errno,
                strerror(errno));
-            failStartup("chdir", errno, nullptr);
+            _exit(containerStartupFailureExitCode);
          }
 
          int execNeuronFD = socs[1];
@@ -7634,7 +7682,7 @@ public:
             basics_log("startContainer failed to move inherited neuron fd uuid=%llu reason=%s\n",
                (unsigned long long)container->plan.uuid,
                execDescriptorFailure.c_str());
-            failStartup("move-neuron-fd", errno, &execDescriptorFailure);
+            _exit(containerStartupFailureExitCode);
          }
 
          ContainerParameters parameters;
@@ -7668,6 +7716,7 @@ public:
          parameters.wormholes = container->plan.wormholes;
          parameters.whiteholes = container->plan.whiteholes;
          parameters.statefulMeshRoles = container->plan.statefulMeshRoles;
+         parameters.statefulTopology = container->plan.statefulTopology;
          for (const IPPrefix& address : container->plan.addresses)
          {
             if (address.network.is6)
@@ -7705,23 +7754,26 @@ public:
             enableWhiteholeNonlocalBind(container->plan);
          }
 
-         bool needsLegacyStatefulRoles = (parameters.statefulMeshRoles.client != 0 ||
+         bool needsFullStatefulPayload = (
+            parameters.statefulMeshRoles.client != 0 ||
             parameters.statefulMeshRoles.sibling != 0 ||
             parameters.statefulMeshRoles.cousin != 0 ||
             parameters.statefulMeshRoles.seeding != 0 ||
-            parameters.statefulMeshRoles.sharding != 0);
+            parameters.statefulMeshRoles.sharding != 0 ||
+            parameters.statefulMeshRoles.topologyBridge != 0 ||
+            parameters.statefulTopology.configured());
 
-         // SDK startup payloads use ProdigyWire, but wormhole/whitehole startup
-         // data and runtime stateful role payloads still rely on the legacy
-         // Bitsery payload until the SDK wire format grows those fields.
+         // ProdigyWire covers the compact stateless startup path. Wormhole and
+         // whitehole startup data plus stateful mesh and topology metadata use
+         // the full container-parameter serializer.
          String serializedParameters;
-         if (parameters.wormholes.empty() == false || parameters.whiteholes.empty() == false || needsLegacyStatefulRoles)
+         if (parameters.wormholes.empty() == false || parameters.whiteholes.empty() == false || needsFullStatefulPayload)
          {
             BitseryEngine::serialize(serializedParameters, parameters);
          }
          else if (ProdigyWire::serializeContainerParameters(serializedParameters, parameters) == false)
          {
-            failStartup("serialize-container-parameters", errno, nullptr);
+            _exit(containerStartupFailureExitCode);
          }
 
          int pfd = Memfd::create("container.params"_ctv);
@@ -7738,15 +7790,12 @@ public:
                basics_log("startContainer failed to move inherited params fd uuid=%llu reason=%s\n",
                   (unsigned long long)container->plan.uuid,
                   execDescriptorFailure.c_str());
-               failStartup("move-params-fd", errno, &execDescriptorFailure);
+               _exit(containerStartupFailureExitCode);
             }
 
             String paramsFDText = {};
             paramsFDText.assignItoa(uint64_t(execParamsFD));
-            if (setenv("PRODIGY_PARAMS_FD", paramsFDText.c_str(), 1) != 0)
-            {
-               failStartup("setenv-params-fd", errno, nullptr);
-            }
+            setenv("PRODIGY_PARAMS_FD", paramsFDText.c_str(), 1);
          }
 
          // The parent process is launched under stdbuf in tests, which injects
@@ -7772,7 +7821,7 @@ public:
 
             if (foundEquals == false || equalsIndex == 0)
             {
-               failStartup("invalid-env-assignment", 0, &assignment);
+               _exit(containerStartupFailureExitCode);
             }
 
             String key = {};
@@ -7788,7 +7837,7 @@ public:
                   key.c_str(),
                   errno,
                   strerror(errno));
-               failStartup("setenv", errno, &key);
+               _exit(containerStartupFailureExitCode);
             }
          }
 
@@ -7797,7 +7846,7 @@ public:
             basics_log("startContainer failed to sanitize inherited exec fds uuid=%llu reason=%s\n",
                (unsigned long long)container->plan.uuid,
                execDescriptorFailure.c_str());
-            failStartup("sanitize-exec-fds", errno, &execDescriptorFailure);
+            _exit(containerStartupFailureExitCode);
          }
 
          extern char **environ;
@@ -7818,12 +7867,11 @@ public:
          int usrLdAccess = access("/usr/lib64/ld-linux-x86-64.so.2", R_OK);
          int usrLdAccessErrno = errno;
          execve(argv0, args.data(), environ);
-         int execErrno = errno;
          basics_log("startContainer execve failed uuid=%llu path=%s errno=%d(%s)\n",
             (unsigned long long)container->plan.uuid,
             argv0,
-            execErrno,
-            strerror(execErrno));
+            errno,
+            strerror(errno));
          basics_log("startContainer pre-exec access uuid=%llu bin=%d(%d) ld=%d(%d) usrld=%d(%d)\n",
             (unsigned long long)container->plan.uuid,
             binaryAccess,
@@ -7834,7 +7882,7 @@ public:
             usrLdAccessErrno);
 
          // when PID 1, process only receive receives signals it has set a mask for.... so this doesn't really matter for us?
-         failStartup("execve", execErrno, nullptr);
+         _exit(containerStartupFailureExitCode);
       }
       else // host, clone doesn't return until child calls exec
       {
@@ -7886,31 +7934,6 @@ public:
          }
          else
          {
-            int tcpFastOpenErrno = 0;
-            if (enableProdigyTCPFastOpen(&tcpFastOpenErrno) == false)
-            {
-               if (failureReport)
-               {
-                  failureReport->snprintf<"failed to enable tcp_fastopen in host netns for container {itoa}: {}"_ctv>(
-                     container->plan.uuid,
-                     String(strerror(tcpFastOpenErrno)));
-               }
-
-               close(startupSync[1]);
-               close(socs[0]);
-
-               kill(container->pid, SIGKILL);
-               waitpid(container->pid, nullptr, 0);
-
-               if (container->pidfd > 0)
-               {
-                  close(container->pidfd);
-                  container->pidfd = -1;
-               }
-
-               return false;
-            }
-
             for (const IPPrefix& prefix : container->plan.addresses)
             {
                thisNeuron->eth.addIP(prefix);
@@ -8075,6 +8098,10 @@ public:
          co_return;
       }
 
+      std::fprintf(stderr, "spinContainer verify begin deploymentID=%llu path=%s\n",
+         (unsigned long long)deploymentID,
+         compressedContainerPath.c_str());
+      std::fflush(stderr);
       String blobVerificationFailure = {};
       if (verifyCompressedContainerBlob(
          compressedContainerPath,
@@ -8089,10 +8116,16 @@ public:
          std::fflush(stderr);
          co_return;
       }
+      std::fprintf(stderr, "spinContainer verify ok deploymentID=%llu\n",
+         (unsigned long long)deploymentID);
+      std::fflush(stderr);
 
       ContainerRegistry::retain(deploymentID);
 
       Container *container = nullptr;
+      std::fprintf(stderr, "spinContainer create begin deploymentID=%llu\n",
+         (unsigned long long)deploymentID);
+      std::fflush(stderr);
       createContainer(plan, compressedContainerPath, container);
       if (container == nullptr)
       {
@@ -8105,10 +8138,19 @@ public:
       container->neuronScalingDimensionsMask = metricPolicy.scalingDimensionsMask;
       container->neuronMetricsCadenceMs = metricPolicy.metricsCadenceMs;
 
+      if (thisNeuron != nullptr && container->plan.whiteholes.empty() == false)
+      {
+         thisNeuron->openWhiteholesForLocalContainer(container->plan.fragment, container->plan.whiteholes);
+      }
+
       String failureReport;
       if (startContainer(container, false, &failureReport) == false)
       {
          if (failureReport.size() == 0) failureReport.assign("startContainer failed"_ctv);
+         if (thisNeuron != nullptr && container->plan.whiteholes.empty() == false)
+         {
+            thisNeuron->closeWhiteholesForLocalContainer(container->plan.fragment);
+         }
          cleanupContainerAfterFailedCreate(container);
          std::fprintf(stderr, "spinContainer start failed deploymentID=%llu appID=%u reason=%s\n",
             (unsigned long long)plan.config.deploymentID(),
@@ -8175,9 +8217,18 @@ public:
       container->cleanupNetwork();
 
       String failureReport;
+      if (thisNeuron != nullptr && container->plan.whiteholes.empty() == false)
+      {
+         thisNeuron->openWhiteholesForLocalContainer(container->plan.fragment, container->plan.whiteholes);
+      }
+
       if (startContainer(container, true, &failureReport) == false)
       {
          if (failureReport.size() == 0) failureReport.assign("restart startContainer failed"_ctv);
+         if (thisNeuron != nullptr && container->plan.whiteholes.empty() == false)
+         {
+            thisNeuron->closeWhiteholesForLocalContainer(container->plan.fragment);
+         }
          basics_log("restartContainer start failed uuid=%llu reason=%s\n",
             (unsigned long long)container->plan.uuid,
             failureReport.c_str());

@@ -26,4 +26,3 @@ struct LogStreamFrame {
 
 } // namespace Logs
 } // namespace Prodigy
-

@@ -19,14 +19,20 @@ public:
    Vector<AssignedGPUDevice> assignedGPUDevices;
 	uint8_t fragment;
 
-   uint32_t nCrashes;
+	   uint32_t nCrashes;
 
-   DeploymentWork *plannedWork = nullptr;
-   bool suppressStartupPairingNotifications = false;
+	   DeploymentWork *plannedWork = nullptr;
+	   uint64_t destructionWaiterDeploymentID = 0;
+	   bool suppressStartupPairingNotifications = false;
    bool runtimeReady = false;
+   bool statefulTopologyCutoverReady = false;
+   uint32_t statefulTopologyCutoverSourceEpoch = 0;
+   uint32_t statefulTopologyCutoverTargetEpoch = 0;
 
    bool isStateful = false;
    uint32_t shardGroup = 0; // only for stateful
+   StatefulMeshRoles explicitStatefulMeshRoles = {};
+   StatefulTopology explicitStatefulTopology = {};
 
    // Runtime resource assignments tracked on the brain
    uint16_t runtime_nLogicalCores = 0;
@@ -153,13 +159,49 @@ public:
 		return count;
 	}
 
-	bool readyForPairingNotifications(void) const override
-	{
-		return runtimeReady
-			&& state != ContainerState::destroyed
-			&& state != ContainerState::destroying
-			&& state != ContainerState::aboutToDestroy;
-	}
+   void clearStatefulTopologyCutoverBarrier(void)
+   {
+      statefulTopologyCutoverReady = false;
+      statefulTopologyCutoverSourceEpoch = 0;
+      statefulTopologyCutoverTargetEpoch = 0;
+   }
+
+   bool hasStatefulTopologyCutoverBarrier(uint32_t sourceEpoch, uint32_t targetEpoch) const
+   {
+      return (statefulTopologyCutoverReady
+         && statefulTopologyCutoverSourceEpoch == sourceEpoch
+         && statefulTopologyCutoverTargetEpoch == targetEpoch);
+   }
+
+   bool applyStatefulTopologyCutoverMetric(uint64_t metricKey, uint64_t metricValue)
+   {
+      if (metricKey == ProdigyMetrics::runtimeStatefulTopologyCutoverReadyKey())
+      {
+         bool ready = (metricValue != 0);
+         if (ready == false)
+         {
+            clearStatefulTopologyCutoverBarrier();
+            return true;
+         }
+
+         statefulTopologyCutoverReady = true;
+         return true;
+      }
+
+      if (metricKey == ProdigyMetrics::runtimeStatefulTopologyCutoverSourceEpochKey())
+      {
+         statefulTopologyCutoverSourceEpoch = uint32_t(metricValue);
+         return true;
+      }
+
+      if (metricKey == ProdigyMetrics::runtimeStatefulTopologyCutoverTargetEpochKey())
+      {
+         statefulTopologyCutoverTargetEpoch = uint32_t(metricValue);
+         return true;
+      }
+
+      return false;
+   }
 
 	void reconcileMeshAgainstState(bool notifySelf) // called during ContainerState changes
 	{
@@ -188,7 +230,7 @@ public:
 		}
 	}
 
-	void replayRuntimeReadyPairings(void)
+	void replayActivePairingsToSelf(void)
 	{
 		if (runtimeReady == false || thisBrain == nullptr || thisBrain->mesh == nullptr)
 		{
@@ -232,7 +274,7 @@ public:
 			for (MeshNode *subscriberNode : subscribers)
 			{
 				ContainerView *subscriber = static_cast<ContainerView *>(subscriberNode);
-				if (subscriber == nullptr)
+				if (subscriber == nullptr || subscriber->runtimeReady == false)
 				{
 					continue;
 				}
@@ -244,33 +286,108 @@ public:
 				}
 
 				advertisementPairing(secret, subscriber->pairingAddress(), service, subscriber->applicationID, true);
-				if (subscriber->runtimeReady)
-				{
-					subscriber->subscriptionPairing(secret, pairingAddress(), service, advertisementIt->second.port, applicationID, true);
-				}
 			}
 		}
 	}
 
-   ContainerPlan generatePlan(const DeploymentPlan& dplan, uint32_t deploymentShardGroups = 0)
+	void replayActivePairingsToPeers(void)
+	{
+		if (runtimeReady == false || thisBrain == nullptr || thisBrain->mesh == nullptr)
+		{
+			return;
+		}
+
+		for (const auto& [service, advertisers] : subscribedTo)
+		{
+			for (MeshNode *advertiserNode : advertisers)
+			{
+				ContainerView *advertiser = static_cast<ContainerView *>(advertiserNode);
+				if (advertiser == nullptr || advertiser->runtimeReady == false)
+				{
+					continue;
+				}
+
+				auto advertisementIt = advertiser->advertisements.find(service);
+				if (advertisementIt == advertiser->advertisements.end())
+				{
+					continue;
+				}
+
+				uint128_t secret = thisBrain->mesh->pairingSecretFor(advertiser, this, service);
+				if (secret == 0)
+				{
+					continue;
+				}
+
+				advertiser->advertisementPairing(secret, pairingAddress(), service, applicationID, true);
+			}
+		}
+
+		for (const auto& [service, subscribers] : advertisingTo)
+		{
+			auto advertisementIt = advertisements.find(service);
+			if (advertisementIt == advertisements.end())
+			{
+				continue;
+			}
+
+			for (MeshNode *subscriberNode : subscribers)
+			{
+				ContainerView *subscriber = static_cast<ContainerView *>(subscriberNode);
+				if (subscriber == nullptr || subscriber->runtimeReady == false)
+				{
+					continue;
+				}
+
+				uint128_t secret = thisBrain->mesh->pairingSecretFor(this, subscriber, service);
+				if (secret == 0)
+				{
+					continue;
+				}
+
+				subscriber->subscriptionPairing(secret, pairingAddress(), service, advertisementIt->second.port, applicationID, true);
+			}
+		}
+	}
+
+	void replayRuntimeReadyPairings(void)
+	{
+		replayActivePairingsToSelf();
+		replayActivePairingsToPeers();
+	}
+
+   StatefulMeshRoles effectiveStatefulMeshRoles(const DeploymentPlan& dplan) const
+   {
+      if (prodigyStatefulMeshRolesConfigured(explicitStatefulMeshRoles))
+      {
+         return explicitStatefulMeshRoles;
+      }
+
+      return StatefulMeshRoles::forShardGroup(dplan.stateful, dplan.config.applicationID, shardGroup);
+   }
+
+   StatefulTopology effectiveStatefulTopology(const DeploymentPlan& dplan, const ApplicationConfig *configOverride = nullptr) const
+   {
+      StatefulTopology topology = explicitStatefulTopology;
+      prodigyPopulateDefaultStatefulTopology(topology, shardGroup, (configOverride ? *configOverride : dplan.config));
+      return topology;
+   }
+
+   ContainerPlan generatePlan(const DeploymentPlan& dplan, uint32_t deploymentShardGroups = 0, const ApplicationConfig *configOverride = nullptr)
    {
       ContainerPlan plan;
 
 		plan.uuid = uuid;
-		plan.config = dplan.config;
+		plan.config = (configOverride ? *configOverride : dplan.config);
 		plan.subscriptions = subscriptions;
 		plan.advertisements = advertisements;
 		plan.requiresDatacenterUniqueTag = dplan.requiresDatacenterUniqueTag;
+      plan.runtimeReady = runtimeReady;
 
 			for (const auto& [service, advertisers] : subscribedTo)
 			{
 				for (MeshNode *advertiser : advertisers)
 				{
-					if (advertiser == nullptr || advertiser->readyForPairingNotifications() == false)
-					{
-						continue;
-					}
-
 					auto advertisementIt = advertiser->advertisements.find(service);
 					if (advertisementIt == advertiser->advertisements.end())
 					{
@@ -285,11 +402,6 @@ public:
 		{
 			for (MeshNode *subscriber : subscribers)
 			{
-				if (subscriber == nullptr)
-				{
-					continue;
-				}
-
 				plan.advertisementPairings.emplace(service, thisBrain->mesh->pairingSecretFor(this, subscriber, service), subscriber->pairingAddress(), service);
 			}
 		}
@@ -315,7 +427,7 @@ public:
       plan.isStateful = isStateful;
       if (plan.isStateful)
       {
-         plan.statefulMeshRoles = StatefulMeshRoles::forShardGroup(dplan.stateful, shardGroup);
+         plan.statefulMeshRoles = effectiveStatefulMeshRoles(dplan);
          auto pruneRole = [&] (uint64_t& service) -> void {
             if (service == 0)
             {
@@ -336,6 +448,8 @@ public:
          pruneRole(plan.statefulMeshRoles.cousin);
          pruneRole(plan.statefulMeshRoles.seeding);
          pruneRole(plan.statefulMeshRoles.sharding);
+         pruneRole(plan.statefulMeshRoles.topologyBridge);
+         plan.statefulTopology = effectiveStatefulTopology(dplan, &plan.config);
       }
 
       plan.lifetime = lifetime;

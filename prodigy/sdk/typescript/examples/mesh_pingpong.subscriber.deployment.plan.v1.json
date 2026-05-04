@@ -3,7 +3,7 @@
       "type": "ApplicationType::stateless",
       "applicationID": "${application:TypeScriptMeshPingPongSubscriber}",
       "versionID": 1,
-      "filesystemMB": 64,
+      "filesystemMB": 192,
       "storageMB": 64,
       "memoryMB": 128,
       "nLogicalCores": 1,

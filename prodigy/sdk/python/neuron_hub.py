@@ -280,6 +280,8 @@ class ContainerTopic(IntEnum):
    STATISTICS = 10
    RESOURCE_DELTA_ACK = 11
    CREDENTIALS_REFRESH = 12
+   WORMHOLES_REFRESH = 13
+   RUNTIME_READY = 14
 
 
 _CONTAINER_PARAMETERS_MAGIC = b"PRDPAR01"
@@ -582,6 +584,10 @@ def build_ready_frame() -> bytes:
    return build_message_frame(ContainerTopic.HEALTHY)
 
 
+def build_runtime_ready_frame() -> bytes:
+   return build_message_frame(ContainerTopic.RUNTIME_READY)
+
+
 def build_statistics_frame(metrics: Iterable[MetricPair]) -> bytes:
    return build_message_frame(ContainerTopic.STATISTICS, _encode_metric_pairs(metrics))
 
@@ -743,6 +749,9 @@ class NeuronHubDispatch(abc.ABC):
    def credentials_refresh(self, hub: "NeuronHub", delta: CredentialDelta) -> None:
       del hub, delta
 
+   def wormholes_refresh(self, hub: "NeuronHub", payload: bytes) -> None:
+      del hub, payload
+
    def message_from_prodigy(self, hub: "NeuronHub", payload: bytes) -> None:
       del hub, payload
 
@@ -837,6 +846,9 @@ class NeuronHub:
    def signal_ready(self) -> None:
       self._send(ContainerTopic.HEALTHY)
 
+   def signal_runtime_ready(self) -> None:
+      self._send(ContainerTopic.RUNTIME_READY)
+
    def publish_statistic(self, metric: MetricPair) -> None:
       self.publish_statistics([metric])
 
@@ -906,7 +918,9 @@ class NeuronHub:
       elif topic == ContainerTopic.CREDENTIALS_REFRESH:
          if payload:
             self.dispatch.credentials_refresh(self, decode_credential_delta(payload))
-      elif topic in (ContainerTopic.PONG, ContainerTopic.HEALTHY, ContainerTopic.STATISTICS, ContainerTopic.RESOURCE_DELTA_ACK):
+      elif topic == ContainerTopic.WORMHOLES_REFRESH:
+         self.dispatch.wormholes_refresh(self, bytes(payload))
+      elif topic in (ContainerTopic.PONG, ContainerTopic.HEALTHY, ContainerTopic.RUNTIME_READY, ContainerTopic.STATISTICS, ContainerTopic.RESOURCE_DELTA_ACK):
          pass
       else:
          raise ProtocolError(f"unsupported inbound topic {int(topic)}")
@@ -1010,6 +1024,9 @@ class _AsyncioDispatchAdapter(NeuronHubDispatch):
       if self.owner is not None and self.owner._auto_ack_credentials_refresh:
          hub.acknowledge_credentials_refresh()
       self._inner.credentials_refresh(hub, delta)
+
+   def wormholes_refresh(self, hub: NeuronHub, payload: bytes) -> None:
+      self._inner.wormholes_refresh(hub, payload)
 
    def message_from_prodigy(self, hub: NeuronHub, payload: bytes) -> None:
       self._inner.message_from_prodigy(hub, payload)

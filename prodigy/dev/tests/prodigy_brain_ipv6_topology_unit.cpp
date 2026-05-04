@@ -1410,6 +1410,9 @@ int main(void)
       suite.expect(workerBMachine != nullptr, "restore_machine_test_runtime_worker_b_present");
       if (selfMachine != nullptr && workerAMachine != nullptr && workerBMachine != nullptr)
       {
+         suite.expect(selfMachine->private4 == IPAddress("10.0.0.10", false).v4, "restore_machine_test_runtime_self_private4");
+         suite.expect(workerAMachine->private4 == IPAddress("10.0.0.11", false).v4, "restore_machine_test_runtime_worker_a_private4");
+         suite.expect(workerBMachine->private4 == IPAddress("10.0.0.12", false).v4, "restore_machine_test_runtime_worker_b_private4");
          suite.expect(selfMachine->rackUUID != 0, "restore_machine_test_runtime_self_rack_nonzero");
          suite.expect(workerAMachine->rackUUID != 0, "restore_machine_test_runtime_worker_a_rack_nonzero");
          suite.expect(workerBMachine->rackUUID != 0, "restore_machine_test_runtime_worker_b_rack_nonzero");

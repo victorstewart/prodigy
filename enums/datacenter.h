@@ -80,6 +80,7 @@ enum class BrainTopic : uint16_t
    registration,
    peerAddressCandidates,
    masterMissing,
+   peerHeartbeat,
    updateBundle,
    transitionToNewBundle,
    relinquishMasterStatus,
@@ -94,11 +95,12 @@ enum class BrainTopic : uint16_t
    replicateMetricsSnapshot,
    reconcileMetrics,
    replicateMetricsAppend,
-   reconcileTd,
-   replicateTdAppend,
-   replicateContainerHealthy,
-   replicateContainerRuntimeReady
-};
+	   reconcileTd,
+	   replicateTdAppend,
+	   replicateContainerHealthy,
+	   replicateContainerRuntimeReady,
+	   replicateContainerRuntimeState
+	};
 
 enum class NeuronTopic : uint16_t
 {

@@ -14,6 +14,7 @@
 #include <atomic>
 #include <arpa/inet.h>
 #include <cstdio>
+#include <csignal>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
@@ -43,6 +44,10 @@
 
 #ifndef PRODIGY_PINGPONG_REQUIRE_GOOGLE_EGRESS_DUALSTACK
 #define PRODIGY_PINGPONG_REQUIRE_GOOGLE_EGRESS_DUALSTACK 1
+#endif
+
+#ifndef PRODIGY_PINGPONG_CRASH_ON_START
+#define PRODIGY_PINGPONG_CRASH_ON_START 0
 #endif
 
 static uint64_t pingPongQueueWaitFineBucketMetricKey(void)
@@ -896,6 +901,12 @@ public:
    void start()
    {
       listener.setIPVersion(AF_INET);
+#ifdef SO_REUSEPORT
+      // Blue/green runtime tests can keep source and target probes in the same
+      // brain namespace while Prodigy service advertisements gate real traffic.
+      int reusePort = 1;
+      (void)setsockopt(listener.fd, SOL_SOCKET, SO_REUSEPORT, &reusePort, sizeof(reusePort));
+#endif
       listener.setSaddr("0.0.0.0"_ctv, port);
       listener.bindThenListen();
 
@@ -1018,7 +1029,7 @@ public:
    }
 };
 
-class PingPongContainer final : public NeuronHubDispatch
+class PingPongContainer final : public NeuronHubDispatch, public TimeoutDispatcher
 {
 private:
 
@@ -1026,7 +1037,11 @@ private:
    PingPongServer server;
    std::unique_ptr<NeuronHub> neuronHub;
    uint64_t requestMetricKey = 0;
+   TimeoutPacket periodicMetricTick = {};
+   uint32_t periodicMetricIntervalMs = 0;
+   bool periodicMetricTickQueued = false;
    bool readySignaled = false;
+   bool topologyCutoverBarrierPublished = false;
    uint16_t currentLogicalCores = 1;
    uint32_t currentMemoryMB = 0;
    uint32_t currentStorageMB = 0;
@@ -1090,25 +1105,46 @@ private:
          return false;
       }
 
-      bool success = true;
       const off_t targetSize = off_t(bytes);
-
-      if (storageMB >= currentStorageMB)
+      bool success = (ftruncate(fd, targetSize) == 0);
+      if (success && bytes > 0)
       {
-         int result = posix_fallocate(fd, 0, targetSize);
-         if (result != 0)
+         const char probeByte = 0;
+         if (pwrite(fd, &probeByte, 1, targetSize - 1) != 1)
          {
             success = false;
          }
       }
 
-      if (success && ftruncate(fd, targetSize) != 0)
-      {
-         success = false;
-      }
-
       close(fd);
       return success;
+   }
+
+   void publishMetricSample(void)
+   {
+      if (neuronHub == nullptr) return;
+
+      if (requestMetricKey != 0)
+      {
+         neuronHub->publishStatistic(requestMetricKey, uint64_t(1));
+      }
+
+      neuronHub->publishStatistic(pingPongQueueWaitFineBucketMetricKey(), uint64_t(1));
+      neuronHub->publishStatistic(pingPongHandlerFineBucketMetricKey(), uint64_t(1));
+   }
+
+   void armPeriodicMetricTick(void)
+   {
+      if (periodicMetricIntervalMs == 0 || periodicMetricTickQueued || running.load(std::memory_order_relaxed) == false)
+      {
+         return;
+      }
+
+      periodicMetricTick.clear();
+      periodicMetricTick.dispatcher = this;
+      periodicMetricTick.setTimeoutMs(periodicMetricIntervalMs);
+      periodicMetricTickQueued = true;
+      Ring::queueTimeout(&periodicMetricTick);
    }
 
    void signalReadyAndSeedMetricOnce(void)
@@ -1118,14 +1154,21 @@ private:
 
       readySignaled = true;
       neuronHub->signalReady();
+      neuronHub->signalRuntimeReady();
 
-      if (requestMetricKey != 0)
+      publishMetricSample();
+
+      const StatefulTopology& topology = neuronHub->parameters.statefulTopology;
+      if (topologyCutoverBarrierPublished == false
+         && topology.servingMode == StatefulTopologyServingMode::catchupOnly
+         && topology.sourceEpoch != 0
+         && topology.targetEpoch != 0)
       {
-         neuronHub->publishStatistic(requestMetricKey, uint64_t(1));
+         topologyCutoverBarrierPublished = true;
+         neuronHub->publishStatistic(ProdigyMetrics::runtimeStatefulTopologyCutoverSourceEpochKey(), topology.sourceEpoch);
+         neuronHub->publishStatistic(ProdigyMetrics::runtimeStatefulTopologyCutoverTargetEpochKey(), topology.targetEpoch);
+         neuronHub->publishStatistic(ProdigyMetrics::runtimeStatefulTopologyCutoverReadyKey(), uint64_t(1));
       }
-
-      neuronHub->publishStatistic(pingPongQueueWaitFineBucketMetricKey(), uint64_t(1));
-      neuronHub->publishStatistic(pingPongHandlerFineBucketMetricKey(), uint64_t(1));
    }
 
 public:
@@ -1144,12 +1187,30 @@ public:
       // Emit startup readiness/metric once; keep a fallback in prepare()
       // in case the dynamic-args completion callback is delayed or missed.
       signalReadyAndSeedMetricOnce();
+      armPeriodicMetricTick();
    }
 
    void beginShutdown(void) override
    {
       running.store(false);
       server.stop();
+   }
+
+   void dispatchTimeout(TimeoutPacket *packet) override
+   {
+      if (packet != &periodicMetricTick)
+      {
+         return;
+      }
+
+      periodicMetricTickQueued = false;
+      if (running.load(std::memory_order_relaxed) == false)
+      {
+         return;
+      }
+
+      publishMetricSample();
+      armPeriodicMetricTick();
    }
 
    void resourceDelta(uint16_t nLogicalCores, uint32_t memoryMB, uint32_t storageMB, bool isDownscale, uint32_t graceSeconds) override
@@ -1202,6 +1263,15 @@ public:
          }
       }
 
+      if (const char *intervalEnv = getenv("PINGPONG_PERIODIC_METRIC_INTERVAL_MS"); intervalEnv && *intervalEnv)
+      {
+         long value = strtol(intervalEnv, nullptr, 10);
+         if (value > 0 && value <= 60'000)
+         {
+            periodicMetricIntervalMs = uint32_t(value);
+         }
+      }
+
       uint32_t sqeCount = 64;
       uint32_t cqeCount = 128;
       uint32_t nFixedFiles = 512;
@@ -1217,8 +1287,6 @@ public:
       currentLogicalCores = neuronHub->parameters.nLogicalCores;
       currentMemoryMB = neuronHub->parameters.memoryMB;
       currentStorageMB = neuronHub->parameters.storageMB;
-      (void)applyMemoryTarget(currentMemoryMB);
-      (void)applyStorageTarget(currentStorageMB);
       {
          String metricName;
          metricName.assign("pingpong.requests"_ctv);
@@ -1249,10 +1317,15 @@ public:
       }
 #endif
 
+#if PRODIGY_PINGPONG_CRASH_ON_START == 1
+      std::raise(SIGSEGV);
+#endif
+
 #if PRODIGY_PINGPONG_DISABLE_SERVER == 0
       server.start();
 #endif
       signalReadyAndSeedMetricOnce();
+      armPeriodicMetricTick();
    }
 
    void start(void)

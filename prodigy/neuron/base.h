@@ -48,9 +48,13 @@ public:
 
    String metro;
    IPAddress private4;
-   IPAddress gateway4;
+	   IPAddress gateway4;
+	   String kernel;
+	   String osID;
+	   String osVersionID;
+	   int64_t bootTimeMs = 0;
 
-   uint8_t datacenterUniqueTag(void)
+	   uint8_t datacenterUniqueTag(void)
    {
       return lcsubnet6.dpfx;
    }
@@ -97,6 +101,17 @@ public:
    virtual void refreshContainerSwitchboardWormholes(Container *container)
    {
       (void)container;
+   }
+
+   virtual void openWhiteholesForLocalContainer(uint8_t fragment, const Vector<Whitehole>& whiteholes)
+   {
+      (void)fragment;
+      (void)whiteholes;
+   }
+
+   virtual void closeWhiteholesForLocalContainer(uint8_t fragment)
+   {
+      (void)fragment;
    }
 
    virtual void syncContainerSwitchboardRuntime(Container *container)

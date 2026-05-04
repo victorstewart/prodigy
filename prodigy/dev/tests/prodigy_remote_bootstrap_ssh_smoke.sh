@@ -148,6 +148,28 @@ Subsystem sftp internal-sftp
 LogLevel VERBOSE
 EOF
 
+sshd_effective_config="$("${SSHD_BIN}" -T 2>/dev/null || true)"
+if [[ "${sshd_effective_config}" == persourcepenalties* || "${sshd_effective_config}" == *$'\npersourcepenalties '* ]]
+then
+   cat >> "${sshd_config}" <<EOF
+PerSourcePenalties no
+EOF
+fi
+
+if [[ "${sshd_effective_config}" == persourcemaxstartups* || "${sshd_effective_config}" == *$'\npersourcemaxstartups '* ]]
+then
+   cat >> "${sshd_config}" <<EOF
+PerSourceMaxStartups none
+EOF
+fi
+
+if [[ "${sshd_effective_config}" == maxstartups* || "${sshd_effective_config}" == *$'\nmaxstartups '* ]]
+then
+   cat >> "${sshd_config}" <<EOF
+MaxStartups 100:30:200
+EOF
+fi
+
 ip netns add "${master_ns}"
 ip netns add "${target_ns}"
 ip netns exec "${master_ns}" ip link set lo up

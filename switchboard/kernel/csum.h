@@ -559,7 +559,7 @@ static inline bool compute_ipv6_transport_checksum_skb(
    }
 
    __u16 folded = fold_l4_checksum_sum16(csum);
-   *checksumOut = normalize_l4_checksum_word16(bpf_htons((__u16)(~folded & 0xffffu)));
+   *checksumOut = normalize_l4_checksum_word16((__u16)(~folded & 0xffffu));
    return true;
 }
 
@@ -633,7 +633,7 @@ static inline bool compute_ipv6_transport_checksum_in_packet(
    }
 
    __u16 folded = fold_l4_checksum_sum16(csum);
-   *checksumOut = normalize_l4_checksum_word16(bpf_htons((__u16)(~folded & 0xffffu)));
+   *checksumOut = normalize_l4_checksum_word16((__u16)(~folded & 0xffffu));
    return true;
 }
 

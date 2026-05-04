@@ -24,6 +24,12 @@ then
    exit 77
 fi
 
+if [[ "${PRODIGY_DEV_ALLOW_BPF_ATTACH:-0}" != "1" ]]
+then
+   echo "SKIP: host TCP unit requires PRODIGY_DEV_ALLOW_BPF_ATTACH=1"
+   exit 77
+fi
+
 for path in "${PRODIGY_BIN}" "${MOTHERSHIP_BIN}" "${READY_BIN}" "${HARNESS}" "${DISCOMBOBULATOR_MANIFEST}"
 do
    if [[ ! -e "${path}" ]]
@@ -236,7 +242,7 @@ run_mothership()
    env \
       PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
       PRODIGY_MOTHERSHIP_TEST_HARNESS="${HARNESS}" \
-      PRODIGY_DEV_ALLOW_BPF_ATTACH=1 \
+      PRODIGY_DEV_ALLOW_BPF_ATTACH="${PRODIGY_DEV_ALLOW_BPF_ATTACH}" \
       PRODIGY_DEV_SWITCHBOARD_BALANCER_EBPF="${switchboard_balancer_ebpf}" \
       "${MOTHERSHIP_BIN}" "$@"
 }

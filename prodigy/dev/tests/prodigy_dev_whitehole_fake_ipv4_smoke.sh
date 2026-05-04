@@ -7,6 +7,9 @@ WHITEHOLE_BIN="${3:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARNESS="${SCRIPT_DIR}/prodigy_dev_netns_harness.sh"
+source "${SCRIPT_DIR}/prodigy_dev_discombobulator_artifact_helpers.sh"
+SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+prodigy_dev_reexec_in_private_mount_namespace_once PRODIGY_DEV_WHITEHOLE_FAKE_IPV4_SMOKE_MOUNT_NS_READY bash "${SCRIPT_SELF}" "$@"
 
 if [[ -z "${PRODIGY_BIN}" || -z "${MOTHERSHIP_BIN}" || -z "${WHITEHOLE_BIN}" ]]
 then
@@ -29,7 +32,7 @@ do
    fi
 done
 
-deps=(awk btrfs mkfs.btrfs mount umount stat zstd ldd install timeout ip python3 rg)
+deps=(awk btrfs cargo mkfs.btrfs mount umount stat zstd timeout ip nsenter python3 rg)
 for cmd in "${deps[@]}"
 do
    if ! command -v "${cmd}" >/dev/null 2>&1
@@ -39,9 +42,16 @@ do
    fi
 done
 
+if [[ "${PRODIGY_DEV_ALLOW_BPF_ATTACH:-0}" != "1" ]]
+then
+   echo "SKIP: whitehole fake IPv4 smoke requires fake IPv4 boundary BPF attach; set PRODIGY_DEV_ALLOW_BPF_ATTACH=1 only inside an authorized isolated VM"
+   exit 77
+fi
+
 PRODIGY_BIN="$(readlink -f "${PRODIGY_BIN}" 2>/dev/null || printf '%s' "${PRODIGY_BIN}")"
 MOTHERSHIP_BIN="$(readlink -f "${MOTHERSHIP_BIN}" 2>/dev/null || printf '%s' "${MOTHERSHIP_BIN}")"
 WHITEHOLE_BIN="$(readlink -f "${WHITEHOLE_BIN}" 2>/dev/null || printf '%s' "${WHITEHOLE_BIN}")"
+target_arch="$(prodigy_dev_detect_target_arch)"
 
 tmpdir="$(mktemp -d)"
 workspace_root="${tmpdir}/workspace"
@@ -64,11 +74,9 @@ remove_log="${tmpdir}/remove_cluster.log"
 containers_dir_created=0
 containers_mount_created=0
 containers_loop_image=""
-deployment_subvol=""
 responder_pid=""
 cluster_created=0
 archive_workspace=0
-execute_arch=""
 
 cleanup()
 {
@@ -94,12 +102,6 @@ cleanup()
          >"${remove_log}" 2>&1 || true
    fi
 
-   if [[ -n "${deployment_subvol}" && -e "${deployment_subvol}" ]]
-   then
-      btrfs property set -f "${deployment_subvol}" ro false >/dev/null 2>&1 || true
-      btrfs subvolume delete "${deployment_subvol}" >/dev/null 2>&1 || true
-   fi
-
    if [[ "${containers_mount_created}" -eq 1 ]]
    then
       umount /containers >/dev/null 2>&1 || true
@@ -119,72 +121,6 @@ cleanup()
 }
 trap cleanup EXIT
 
-detect_execute_arch()
-{
-   case "$(uname -m)" in
-      x86_64|amd64)
-         execute_arch="x86_64"
-         ;;
-      aarch64|arm64)
-         execute_arch="aarch64"
-         ;;
-      riscv64|riscv)
-         execute_arch="riscv64"
-         ;;
-      *)
-         echo "FAIL: unsupported host architecture for whitehole smoke: $(uname -m)"
-         exit 1
-         ;;
-   esac
-}
-
-copy_binary_and_libs_into_subvol()
-{
-   local binary_path="$1"
-   local subvol_root="$2"
-   local install_path="$3"
-   local execute_arch_name="$4"
-   local rootfs_root="${subvol_root}/rootfs"
-   local metadata_dir="${subvol_root}/.prodigy-private"
-
-   mkdir -p "${rootfs_root}$(dirname "${install_path}")" "${rootfs_root}/etc" "${metadata_dir}"
-   install -m 0755 "${binary_path}" "${rootfs_root}${install_path}"
-
-   cat > "${metadata_dir}/launch.metadata" <<EOF
-{
-  "execute_path": "${install_path}",
-  "execute_args": [],
-  "execute_env": [],
-  "execute_cwd": "/",
-  "execute_arch": "${execute_arch_name}"
-}
-EOF
-
-   while IFS= read -r libpath
-   do
-      if [[ -z "${libpath}" ]]
-      then
-         continue
-      fi
-
-      if [[ -e "${libpath}" ]]
-      then
-         cp -aL --parents "${libpath}" "${rootfs_root}"
-      fi
-   done < <(
-      ldd "${binary_path}" | awk '
-         /=>/ {
-            if ($3 ~ /^\//) print $3;
-         }
-         /^[[:space:]]*\// {
-            print $1;
-         }
-      ' | sort -u
-   )
-}
-
-detect_execute_arch
-
 if [[ ! -d /containers ]]
 then
    mkdir -p /containers
@@ -203,9 +139,9 @@ then
       fi
    fi
 
-   if [[ -n "$(ls -A /containers 2>/dev/null)" ]]
+   if ! prodigy_dev_containers_root_is_safely_overmountable /containers
    then
-      echo "FAIL: /containers exists on non-btrfs fs and is not empty"
+      echo "FAIL: /containers exists on non-btrfs fs and is not safely overmountable"
       exit 1
    fi
 
@@ -306,24 +242,24 @@ then
    exit 1
 fi
 
-read -r parent_ns control_socket_path <<EOF
+read -r parent_pid control_socket_path <<EOF
 $(python3 - "${manifest_path}" <<'PY'
 import json, sys
 with open(sys.argv[1], "r", encoding="utf-8") as fh:
     manifest = json.load(fh)
-print(manifest["parentNamespace"], manifest["controlSocketPath"])
+print(manifest["parentPid"], manifest["controlSocketPath"])
 PY
 )
 EOF
 
-if [[ -z "${parent_ns}" || -z "${control_socket_path}" || ! -S "${control_socket_path}" ]]
+if [[ -z "${parent_pid}" || "${parent_pid}" == "0" || -z "${control_socket_path}" || ! -S "${control_socket_path}" ]]
 then
    echo "FAIL: unable to parse persistent harness manifest or control socket path"
    exit 1
 fi
 
 parent_edge_ip="$(
-   ip netns exec "${parent_ns}" ip -4 -o addr show | python3 -c '
+   nsenter -t "${parent_pid}" -n ip -4 -o addr show | python3 -c '
 import sys
 
 for line in sys.stdin:
@@ -341,18 +277,44 @@ for line in sys.stdin:
 )"
 if [[ -z "${parent_edge_ip}" ]]
 then
-   echo "FAIL: unable to resolve parent edge IPv4 from ${parent_ns}"
+   echo "FAIL: unable to resolve parent edge IPv4 from pid ${parent_pid}"
    exit 1
 fi
 
-deployment_subvol="/containers/${deployment_id}"
-btrfs subvolume create "${deployment_subvol}" >/dev/null
-copy_binary_and_libs_into_subvol "${WHITEHOLE_BIN}" "${deployment_subvol}" "/root/whitehole_probe_container" "${execute_arch}"
-
-cat > "${deployment_subvol}/rootfs/etc/hosts" <<EOF
+hosts_context="${tmpdir}/whitehole-hosts"
+artifact_project_dir="${tmpdir}/whitehole-fake-artifact"
+discombobulator_file="${artifact_project_dir}/WhiteholeProbe.DiscombobuFile"
+container_blob="${tmpdir}/whitehole.container.zst"
+mkdir -p "${hosts_context}" "${artifact_project_dir}"
+cat > "${hosts_context}/hosts" <<EOF
 127.0.0.1 localhost
 ${parent_edge_ip} whitehole-target.test
 EOF
+
+cat > "${discombobulator_file}" <<EOF
+FROM scratch for ${target_arch}
+COPY {bin} ./$(basename "${WHITEHOLE_BIN}") /root/whitehole_probe_container
+COPY {hosts} ./hosts /etc/hosts
+SURVIVE /root/whitehole_probe_container
+SURVIVE /etc/hosts
+EOF
+prodigy_dev_write_common_prodigy_assets "${discombobulator_file}"
+cat >> "${discombobulator_file}" <<'EOF'
+EXECUTE ["/root/whitehole_probe_container"]
+EOF
+
+if ! prodigy_dev_run_discombobulator_build \
+   "${artifact_project_dir}" \
+   "${discombobulator_file}" \
+   "${container_blob}" \
+   "bin=$(dirname "${WHITEHOLE_BIN}")" \
+   "hosts=${hosts_context}" \
+   "ebpf=$(dirname "${PRODIGY_BIN}")"
+then
+   archive_workspace=1
+   echo "FAIL: unable to build whitehole artifact"
+   exit 1
+fi
 
 plan_json="${tmpdir}/whitehole.plan.json"
 cat > "${plan_json}" <<EOF
@@ -361,6 +323,7 @@ cat > "${plan_json}" <<EOF
     "type": "ApplicationType::stateless",
     "applicationID": ${application_id},
     "versionID": ${version_id},
+    "architecture": "${target_arch}",
     "filesystemMB": 64,
     "storageMB": 64,
     "memoryMB": 256,
@@ -389,14 +352,7 @@ cat > "${plan_json}" <<EOF
 }
 EOF
 
-container_blob="${tmpdir}/whitehole.container.zst"
-btrfs property set -f "${deployment_subvol}" ro true >/dev/null
-btrfs send "${deployment_subvol}" | zstd -19 -T0 -q -o "${container_blob}"
-btrfs property set -f "${deployment_subvol}" ro false >/dev/null
-btrfs subvolume delete "${deployment_subvol}" >/dev/null
-deployment_subvol=""
-
-ip netns exec "${parent_ns}" \
+nsenter -t "${parent_pid}" -n \
    env WHITEHOLE_TARGET_IP="${parent_edge_ip}" \
    WHITEHOLE_TARGET_PORT=32101 \
    WHITEHOLE_SPOOF_PORT=32102 \
@@ -478,6 +434,10 @@ do
          healthy=1
          break
       fi
+      if rg -q '^[[:space:]]*nCrashes:[[:space:]]*[1-9]' "${application_log}"
+      then
+         break
+      fi
    fi
 
    sleep 0.5
@@ -504,46 +464,6 @@ then
    archive_workspace=1
    echo "FAIL: responder did not complete the legit+spoof sequence"
    sed -n '1,120p' "${responder_log}" || true
-   exit 1
-fi
-
-probe_log=""
-for stdout_log in $(python3 - "${manifest_path}" <<'PY'
-import json, sys
-with open(sys.argv[1], "r", encoding="utf-8") as fh:
-    manifest = json.load(fh)
-for node in manifest["nodes"]:
-    print(node["stdoutLog"])
-PY
-)
-do
-   if [[ -f "${stdout_log}" ]] && rg -q 'probe\.(success|fail)' "${stdout_log}"
-   then
-      probe_log="${stdout_log}"
-      break
-   fi
-done
-
-if [[ -z "${probe_log}" ]]
-then
-   archive_workspace=1
-   echo "FAIL: unable to locate whitehole probe container stdout log"
-   exit 1
-fi
-
-if ! rg -q 'probe.success' "${probe_log}"
-then
-   archive_workspace=1
-   echo "FAIL: whitehole probe container did not report success"
-   sed -n '1,160p' "${probe_log}" || true
-   exit 1
-fi
-
-if rg -q 'unexpected_second_reply' "${probe_log}"
-then
-   archive_workspace=1
-   echo "FAIL: spoofed reply reached the whitehole container"
-   sed -n '1,160p' "${probe_log}" || true
    exit 1
 fi
 

@@ -12,6 +12,7 @@
 #include <prodigy/wire.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -150,6 +151,7 @@ struct ControlServerState
 {
    std::atomic<bool> stopRequested = false;
    uint32_t acceptCount = 0;
+   bool sawConfigure = false;
    bool sawPullClusterReport = false;
    bool sawMeasureApplication = false;
    bool sawSpinApplication = false;
@@ -243,6 +245,7 @@ static MachineStatusReport makeMachineStatusReport(
    report.state = state;
    report.isBrain = isBrain;
    report.controlPlaneReachable = controlPlaneReachable;
+   report.runtimeReady = controlPlaneReachable;
    report.currentMaster = currentMaster;
    report.decommissioning = decommissioning;
    report.rebooting = rebooting;
@@ -1140,6 +1143,95 @@ static bool handleDeployStep(
    return sendAll(clientFD, response, failure);
 }
 
+static bool handleConfigureTestClusterStep(
+   int clientFD,
+   ControlServerState& state,
+   const String& expectedControlSocketPath,
+   uint8_t expectedDatacenterFragment,
+   uint32_t expectedAutoscaleIntervalSeconds,
+   uint32_t expectedBrainCount,
+   const String& expectedMachineSchema,
+   MachineConfig::MachineKind expectedMachineKind,
+   uint32_t expectedLogicalCores,
+   uint32_t expectedMemoryMB,
+   uint32_t expectedStorageMB,
+   String& failure)
+{
+   String frame = {};
+   if (recvOneMessageFrame(clientFD, frame, failure) == false)
+   {
+      return false;
+   }
+
+   Message *message = reinterpret_cast<Message *>(const_cast<uint8_t *>(frame.data()));
+   if (MothershipTopic(message->topic) != MothershipTopic::configure)
+   {
+      failure.assign("unexpected topic for configureTestCluster request"_ctv);
+      return false;
+   }
+
+   state.sawConfigure = true;
+
+   uint8_t *args = message->args;
+   String serialized = {};
+   Message::extractToStringView(args, serialized);
+
+   BrainConfig config = {};
+   if (BitseryEngine::deserializeSafe(serialized, config) == false)
+   {
+      failure.assign("failed to deserialize configureTestCluster BrainConfig"_ctv);
+      return false;
+   }
+
+   if (config.datacenterFragment != expectedDatacenterFragment)
+   {
+      failure.assign("configureTestCluster datacenterFragment mismatch"_ctv);
+      return false;
+   }
+
+   if (config.autoscaleIntervalSeconds != expectedAutoscaleIntervalSeconds)
+   {
+      failure.assign("configureTestCluster autoscaleIntervalSeconds mismatch"_ctv);
+      return false;
+   }
+
+   if (config.requiredBrainCount != expectedBrainCount)
+   {
+      failure.assign("configureTestCluster requiredBrainCount mismatch"_ctv);
+      return false;
+   }
+
+   if (config.controlSocketPath.equals(expectedControlSocketPath) == false)
+   {
+      failure.assign("configureTestCluster controlSocketPath mismatch"_ctv);
+      return false;
+   }
+
+   auto it = config.configBySlug.find(expectedMachineSchema);
+   if (it == config.configBySlug.end())
+   {
+      failure.assign("configureTestCluster missing machineConfig schema"_ctv);
+      return false;
+   }
+
+   const MachineConfig& machineConfig = it->second;
+   if (machineConfig.kind != expectedMachineKind
+      || machineConfig.nLogicalCores != expectedLogicalCores
+      || machineConfig.nMemoryMB != expectedMemoryMB
+      || machineConfig.nStorageMB != expectedStorageMB)
+   {
+      failure.assign("configureTestCluster machineConfig mismatch"_ctv);
+      return false;
+   }
+
+   String responseSerialized = {};
+   BrainConfig responseConfig = config;
+   BitseryEngine::serialize(responseSerialized, responseConfig);
+   String response = {};
+   Message::construct(response, MothershipTopic::configure, responseSerialized);
+   return sendAll(clientFD, response, failure);
+}
+
 int main(void)
 {
    TestSuite suite = {};
@@ -1266,6 +1358,117 @@ int main(void)
       return EXIT_FAILURE;
    }
 
+   ScopedUnixListener configureListener = {};
+   setupFailure.clear();
+   bool configureListenerReady = createUnixListener(configureListener, setupFailure);
+   suite.expect(configureListenerReady, "configure_test_cluster_unix_listener_created");
+   if (configureListenerReady == false)
+   {
+      if (setupFailure.size() > 0)
+      {
+         basics_log("configure test cluster listener setup failure: %s\n", setupFailure.c_str());
+      }
+
+      server.stopRequested.store(true);
+      serverThread.join();
+      return EXIT_FAILURE;
+   }
+
+   String configureWorkspaceRoot = {};
+   configureWorkspaceRoot.assign(dbRoot);
+   configureWorkspaceRoot.append("/w"_ctv);
+   std::filesystem::create_directories(std::filesystem::path(configureWorkspaceRoot.c_str()));
+
+   String configureSocketAlias = {};
+   configureSocketAlias.assign(configureWorkspaceRoot);
+   configureSocketAlias.append("/prodigy-mothership.sock"_ctv);
+   (void)::unlink(configureSocketAlias.c_str());
+   int configureSocketAliasStatus = ::symlink(configureListener.path.c_str(), configureSocketAlias.c_str());
+   suite.expect(configureSocketAliasStatus == 0, "configure_test_cluster_socket_alias_created");
+   if (configureSocketAliasStatus != 0)
+   {
+      basics_log("configure test cluster symlink failed: %s\n", std::strerror(errno));
+      server.stopRequested.store(true);
+      serverThread.join();
+      return EXIT_FAILURE;
+   }
+
+   ControlServerState configureServer = {};
+   std::thread configureServerThread([&] () {
+      auto closeClient = [] (int clientFD) -> void {
+         if (clientFD >= 0)
+         {
+            (void)::shutdown(clientFD, SHUT_RDWR);
+            ::close(clientFD);
+         }
+      };
+
+      String stepFailure = {};
+      int clientFD = -1;
+      if (acceptNextClient(configureListener.fd, configureServer, clientFD) == false)
+      {
+         return;
+      }
+
+      if (handleConfigureTestClusterStep(
+            clientFD,
+            configureServer,
+            configureSocketAlias,
+            17,
+            9,
+            3,
+            "dev-baremetal"_ctv,
+            MachineConfig::MachineKind::bareMetal,
+            8,
+            16'384,
+            262'144,
+            stepFailure) == false)
+      {
+         configureServer.failure = stepFailure;
+         configureServer.stopRequested.store(true);
+         closeClient(clientFD);
+         return;
+      }
+
+      closeClient(clientFD);
+   });
+
+   String configureOutput = {};
+   int configureExitCode = -1;
+   bool ranConfigureTestCluster = runMothershipCommand(
+      binaryPath,
+      dbRoot,
+      {"configureTestCluster",
+       std::string(configureWorkspaceRoot.c_str()),
+       "3",
+       "3",
+       "private6",
+       "0",
+       "9000",
+       "17",
+       "9",
+       "dev-baremetal",
+       "bareMetal",
+       "8",
+       "16384",
+       "262144"},
+      configureOutput,
+      configureExitCode);
+   suite.expect(ranConfigureTestCluster, "run_configure_test_cluster_command");
+   suite.expect(configureExitCode == EXIT_SUCCESS, "configure_test_cluster_exit_success");
+   suite.expect(stringContains(configureOutput, "configureTestCluster success=1"), "configure_test_cluster_reports_success");
+
+   configureServer.stopRequested.store(true);
+   configureServerThread.join();
+
+   suite.expect(configureServer.failure.size() == 0, "configure_test_cluster_server_no_failure");
+   suite.expect(configureServer.acceptCount == 1, "configure_test_cluster_server_accept_count");
+   suite.expect(configureServer.sawConfigure, "configure_test_cluster_server_saw_configure");
+   if (configureServer.failure.size() > 0)
+   {
+      basics_log("configure test cluster server failure: %s\n", configureServer.failure.c_str());
+   }
+
    String clusterReportOutput = {};
    int clusterReportExitCode = -1;
    bool ranClusterReport = runMothershipCommand(
@@ -1296,14 +1499,14 @@ int main(void)
    suite.expect(stringContains(clusterReportOutput, "Machine: state=healthy role=brain publicAddresses=2001:db8::10 privateAddresses=fd00::10"), "cluster_report_output_machine_status");
    suite.expect(stringContains(clusterReportOutput, "Machine: state=healthy role=brain publicAddresses=2001:db8::10 privateAddresses=fd00::10"), "cluster_report_output_brain_role");
    suite.expect(stringContains(clusterReportOutput, "identity uuid=abc123 source=local backing=owned lifetime=owned provider= region= zone= rackUUID=0 sshAddress=fd00::10 sshPort=22"), "cluster_report_output_brain_identity");
-   suite.expect(stringContains(clusterReportOutput, "lifecycle controlPlaneReachable=1 currentMaster=1 decommissioning=0 rebooting=0 updatingOS=0 hardwareFailure=0 bootTimeMs=1700000000000 uptimeMs=86400000"), "cluster_report_output_brain_lifecycle");
+   suite.expect(stringContains(clusterReportOutput, "lifecycle controlPlaneReachable=1 runtimeReady=1 currentMaster=1 decommissioning=0 rebooting=0 updatingOS=0 hardwareFailure=0 bootTimeMs=1700000000000 uptimeMs=86400000"), "cluster_report_output_brain_lifecycle");
    suite.expect(stringContains(clusterReportOutput, "placement containers=c-brain-1,c-brain-2 applications=radar,probe deploymentIDs=101,202 shardGroups=7,9"), "cluster_report_output_brain_placement");
    suite.expect(stringContains(clusterReportOutput, "capacity active containers=2 isolatedLogicalCores=4 sharedCPUMillis=0 memoryMB=4096 storageMB=16384 reserved containers=1 isolatedLogicalCores=2 sharedCPUMillis=500 memoryMB=2048 storageMB=4096"), "cluster_report_output_brain_capacity");
    suite.expect(stringContains(clusterReportOutput, "maintenance runningProdigyVersion=123 approvedBundleSHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa updateStage=waitingForBundleEchos stagedBundleSHA256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), "cluster_report_output_brain_maintenance");
    suite.expect(stringContains(clusterReportOutput, "Machine: state=hardwareFailure role=worker cloudSchema=report-worker-spot"), "cluster_report_output_worker_state");
    suite.expect(stringContains(clusterReportOutput, "Machine: state=hardwareFailure role=worker cloudSchema=report-worker-spot"), "cluster_report_output_worker_role");
    suite.expect(stringContains(clusterReportOutput, "identity uuid=def456 source=created backing=cloud lifetime=spot provider=aws region=us-east-1 zone=us-east-1c rackUUID=0 sshAddress=fd00::20 sshPort=2202"), "cluster_report_output_worker_identity");
-   suite.expect(stringContains(clusterReportOutput, "lifecycle controlPlaneReachable=0 currentMaster=0 decommissioning=0 rebooting=0 updatingOS=0 hardwareFailure=1 bootTimeMs=1699999500000 uptimeMs=43210"), "cluster_report_output_worker_lifecycle");
+   suite.expect(stringContains(clusterReportOutput, "lifecycle controlPlaneReachable=0 runtimeReady=0 currentMaster=0 decommissioning=0 rebooting=0 updatingOS=0 hardwareFailure=1 bootTimeMs=1699999500000 uptimeMs=43210"), "cluster_report_output_worker_lifecycle");
    suite.expect(stringContains(clusterReportOutput, "placement containers=c-worker-1 applications=radar deploymentIDs=101 shardGroups=7"), "cluster_report_output_worker_placement");
    suite.expect(stringContains(clusterReportOutput, "capacity active containers=1 isolatedLogicalCores=2 sharedCPUMillis=1000 memoryMB=2048 storageMB=8192 reserved containers=0 isolatedLogicalCores=0 sharedCPUMillis=0 memoryMB=0 storageMB=0"), "cluster_report_output_worker_capacity");
    suite.expect(stringContains(clusterReportOutput, "maintenance runningProdigyVersion= approvedBundleSHA256= updateStage=idle stagedBundleSHA256="), "cluster_report_output_worker_maintenance");
@@ -1704,6 +1907,18 @@ int main(void)
    suite.expect(legacyUpdateExitCode == EXIT_FAILURE, "legacy_update_cluster_exit_failure");
    suite.expect(stringContains(legacyUpdateOutput, "operation invalid"), "legacy_update_cluster_reports_invalid_operation");
 
+   String legacyConfigureOutput = {};
+   int legacyConfigureExitCode = -1;
+   bool ranLegacyConfigure = runMothershipCommand(
+      binaryPath,
+      dbRoot,
+      {"configure", "local", "1", "dev-baremetal", "8", "16384", "262144", "180"},
+      legacyConfigureOutput,
+      legacyConfigureExitCode);
+   suite.expect(ranLegacyConfigure, "run_legacy_configure_command");
+   suite.expect(legacyConfigureExitCode == EXIT_FAILURE, "legacy_configure_exit_failure");
+   suite.expect(stringContains(legacyConfigureOutput, "operation invalid"), "legacy_configure_reports_invalid_operation");
+
    String removedHostKeyFieldWorkspaceRoot = {};
    removedHostKeyFieldWorkspaceRoot.assign(dbRoot);
    removedHostKeyFieldWorkspaceRoot.append("/removed-host-key-field-workspace"_ctv);
@@ -1739,6 +1954,7 @@ int main(void)
    suite.expect(ranHelp, "run_help_command");
    suite.expect(helpExitCode == EXIT_SUCCESS, "help_exit_success");
    suite.expect(stringContains(helpOutput, "clusterReport [target: local|clusterName|clusterUUID]"), "help_includes_cluster_report");
+   suite.expect(stringContains(helpOutput, "configureTestCluster [workspaceRoot] [machineCount] [nBrains]"), "help_includes_configure_test_cluster");
    suite.expect(stringContains(helpOutput, "setLocalClusterMembership [name|clusterUUID] [json]"), "help_includes_set_local_cluster_membership");
    suite.expect(stringContains(helpOutput, "setTestClusterMachineCount [name|clusterUUID] [json]"), "help_includes_set_test_cluster_machine_count");
    suite.expect(stringMissing(helpOutput, "allApplicationsReport"), "help_omits_legacy_alias");

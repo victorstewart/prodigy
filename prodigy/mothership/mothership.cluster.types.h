@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <cstdlib>
 
-#include <enums/datacenter.h>
+#include <prodigy/enums/datacenter.h>
 #include <prodigy/runtime.environment.h>
 #include <services/prodigy.h>
 #include <prodigy/types.h>
@@ -310,6 +310,10 @@ public:
    String bootstrapSshPrivateKeyPath;
    String remoteProdigyPath;
    uint16_t sharedCPUOvercommitPermille = 1000;
+   bool osUpdatesEnabled = false;
+   Vector<OperatingSystemUpdatePolicy> osUpdatePolicies;
+   uint32_t maxOSDrains = 1;
+   uint32_t machineUpdateCadenceMins = 15;
    ProdigyEnvironmentBGPConfig bgp;
    MothershipProdigyClusterTestConfig test;
 
@@ -348,6 +352,10 @@ static void serialize(S&& serializer, MothershipProdigyCluster& cluster)
    serializer.text1b(cluster.bootstrapSshPrivateKeyPath, UINT32_MAX);
    serializer.text1b(cluster.remoteProdigyPath, UINT32_MAX);
    serializer.value2b(cluster.sharedCPUOvercommitPermille);
+   serializer.value1b(cluster.osUpdatesEnabled);
+   serializer.container(cluster.osUpdatePolicies, UINT32_MAX);
+   serializer.value4b(cluster.maxOSDrains);
+   serializer.value4b(cluster.machineUpdateCadenceMins);
    serializer.object(cluster.bgp);
    serializer.object(cluster.test);
    serializer.value1b(cluster.desiredEnvironment);

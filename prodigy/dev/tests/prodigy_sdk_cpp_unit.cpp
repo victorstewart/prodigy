@@ -150,12 +150,14 @@ public:
    int resourceDeltaCount = 0;
    int credentialsRefreshCount = 0;
    int messageCount = 0;
+   int wormholesRefreshCount = 0;
 
    ProdigySDK::AdvertisementPairing lastAdvertisementPairing;
    ProdigySDK::SubscriptionPairing lastSubscriptionPairing;
    ProdigySDK::ResourceDelta lastResourceDelta;
    ProdigySDK::CredentialDelta lastCredentialDelta;
    ProdigySDK::Bytes lastMessage;
+   ProdigySDK::Bytes lastWormholesRefresh;
 
    void beginShutdown(ProdigySDK::NeuronHub& hub) override
    {
@@ -202,6 +204,13 @@ public:
       (void)hub;
       messageCount += 1;
       lastMessage = payload;
+   }
+
+   void wormholesRefreshRaw(ProdigySDK::NeuronHub& hub, const ProdigySDK::Bytes& payload) override
+   {
+      (void)hub;
+      wormholesRefreshCount += 1;
+      lastWormholesRefresh = payload;
    }
 };
 
@@ -322,6 +331,16 @@ int main(void)
       equalBytes(builtFrame, readFixture("frame.healthy.empty.bin")),
       "build ready frame");
    suite.expect(
+      ProdigySDK::buildRuntimeReadyFrame(builtFrame) == ProdigySDK::Result::ok &&
+      parseFixtureFrame("frame.healthy.empty.bin").payload.empty(),
+      "build runtime ready frame");
+   ProdigySDK::MessageFrame runtimeReadyFrame;
+   suite.expect(
+      ProdigySDK::parseMessageFrame(builtFrame, runtimeReadyFrame) == ProdigySDK::Result::ok &&
+      runtimeReadyFrame.topic == ProdigySDK::ContainerTopic::runtimeReady &&
+      runtimeReadyFrame.payload.empty(),
+      "runtime ready frame topic");
+   suite.expect(
       ProdigySDK::buildStatisticsFrame(
          builtFrame,
          std::vector<ProdigySDK::MetricPair> {
@@ -396,6 +415,20 @@ int main(void)
       std::string(dispatch.lastMessage.begin(), dispatch.lastMessage.end()) == "hello-prodigy",
       "hub message dispatch");
 
+   ProdigySDK::Bytes wormholesPayload {'w', 'o', 'r', 'm'};
+   ProdigySDK::MessageFrame wormholesFrame {ProdigySDK::ContainerTopic::wormholesRefresh, wormholesPayload};
+   suite.expect(
+      hub.handleFrame(wormholesFrame, automaticResponses) == ProdigySDK::Result::ok &&
+      dispatch.wormholesRefreshCount == 1 &&
+      equalBytes(dispatch.lastWormholesRefresh, wormholesPayload),
+      "hub wormholes refresh dispatch");
+
+   automaticResponses.clear();
+   suite.expect(
+      hub.handleFrame(runtimeReadyFrame, automaticResponses) == ProdigySDK::Result::ok &&
+      automaticResponses.empty(),
+      "hub runtime ready inbound no-op");
+
    suite.expect(
       hub.handleFrame(parseFixtureFrame("frame.stop.empty.bin"), automaticResponses) == ProdigySDK::Result::ok &&
       dispatch.shutdownCount == 1,
@@ -430,6 +463,14 @@ int main(void)
       hub.signalReady(outboundReadyFrame) == ProdigySDK::Result::ok &&
       equalBytes(outboundReadyFrame, readFixture("frame.healthy.empty.bin")),
       "hub ready frame builder");
+
+   ProdigySDK::Bytes outboundRuntimeReadyFrame;
+   suite.expect(
+      hub.signalRuntimeReady(outboundRuntimeReadyFrame) == ProdigySDK::Result::ok &&
+      ProdigySDK::parseMessageFrame(outboundRuntimeReadyFrame, runtimeReadyFrame) == ProdigySDK::Result::ok &&
+      runtimeReadyFrame.topic == ProdigySDK::ContainerTopic::runtimeReady &&
+      runtimeReadyFrame.payload.empty(),
+      "hub runtime ready frame builder");
 
    ProdigySDK::Bytes outboundStatisticsFrame;
    suite.expect(

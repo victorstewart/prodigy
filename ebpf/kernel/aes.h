@@ -12,8 +12,8 @@ struct aes_decrypt_state {
    __u32 rk[44];
 };
 
-__attribute__((__always_inline__)) 
-static void aesDecrypt(struct aes_decrypt_state *aes_state, const __u8 ct[16], __u8 pt[16]) 
+__attribute__((__always_inline__))
+static void aesDecrypt(struct aes_decrypt_state *aes_state, const __u8 ct[16], __u8 pt[16])
 {
    __u32 s0, s1, s2, s3, t0, t1, t2, t3;
 
@@ -71,7 +71,7 @@ static void aesDecrypt(struct aes_decrypt_state *aes_state, const __u8 ct[16], _
    t1 = Td0[s1 >> 24] ^ Td1[(s0 >> 16) & 0xff] ^ Td2[(s3 >>  8) & 0xff] ^ Td3[s2 & 0xff] ^ aes_state->rk[37];
    t2 = Td0[s2 >> 24] ^ Td1[(s1 >> 16) & 0xff] ^ Td2[(s0 >>  8) & 0xff] ^ Td3[s3 & 0xff] ^ aes_state->rk[38];
    t3 = Td0[s3 >> 24] ^ Td1[(s2 >> 16) & 0xff] ^ Td2[(s1 >>  8) & 0xff] ^ Td3[s0 & 0xff] ^ aes_state->rk[39];
-   
+
    __u32 rk_shift = 10 << 2;
 
    /*

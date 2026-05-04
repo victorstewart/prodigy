@@ -449,7 +449,7 @@ static StatefulMeshRoles makeStatefulMeshRoles(void)
    plan.cousinPrefix = MeshServices::generateStatefulService(501, 3);
    plan.seedingPrefix = MeshServices::generateStatefulService(501, 4);
    plan.shardingPrefix = MeshServices::generateStatefulService(501, 5);
-   return StatefulMeshRoles::forShardGroup(plan, 7);
+   return StatefulMeshRoles::forShardGroup(plan, 501, 7);
 }
 
 static CredentialDelta makeCredentialDelta(void)

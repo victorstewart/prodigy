@@ -37,4 +37,3 @@ static inline int spawn_with_logs(const char *path,
 
 } // namespace Logs
 } // namespace Prodigy
-

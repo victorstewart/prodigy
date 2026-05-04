@@ -3,19 +3,29 @@
 #pragma once
 
 #include <networking/includes.h>
+#include <services/base64.h>
 #include <types/types.containers.h>
 
 #define nShardsPerStatefulApplication 1'024
 
-static uint16_t jump_consistent_hash(uint8_t *key, uint64_t keySize)
+static constexpr uint8_t meshServiceGroupBits = 10;
+static constexpr uint16_t nStatefulServiceGroupSlots = uint16_t(1u << meshServiceGroupBits);
+static_assert(nShardsPerStatefulApplication == nStatefulServiceGroupSlots);
+
+static uint16_t jump_consistent_hash(uint8_t *key, uint64_t keySize, uint32_t nBuckets)
 {
+   if (nBuckets == 0)
+   {
+      return 0;
+   }
+
    // Shard routing must stay stable across threads, brains, and processes.
    uint64_t keyHash = Hasher::hash<Hasher::SeedPolicy::global_shared>(key, keySize);
 
    int64_t b = -1;
    int64_t j = 0;
 
-   while (j < nShardsPerStatefulApplication)
+   while (j < int64_t(nBuckets))
    {
       b = j;
       keyHash = keyHash * 2862933555777941757ULL + 1;
@@ -25,11 +35,39 @@ static uint16_t jump_consistent_hash(uint8_t *key, uint64_t keySize)
    return uint16_t(b);
 }
 
+static uint16_t jump_consistent_hash(uint8_t *key, uint64_t keySize)
+{
+   return jump_consistent_hash(key, keySize, nStatefulServiceGroupSlots);
+}
+
+static uint16_t statefulServiceGroupOwnerForSlot(uint16_t slot, uint16_t nShardGroups)
+{
+   return jump_consistent_hash(reinterpret_cast<uint8_t *>(&slot), sizeof(slot), nShardGroups);
+}
+
+template <typename Consumer>
+static void forEachStatefulServiceSlotOwnedByGroup(uint16_t shardGroup, uint16_t nShardGroups, Consumer&& consumer)
+{
+   if (nShardGroups == 0 || shardGroup >= nShardGroups)
+   {
+      return;
+   }
+
+   for (uint32_t slot = 0; slot < nStatefulServiceGroupSlots; ++slot)
+   {
+      uint16_t shardSlot = uint16_t(slot);
+      if (statefulServiceGroupOwnerForSlot(shardSlot, nShardGroups) == shardGroup)
+      {
+         consumer(shardSlot);
+      }
+   }
+}
+
 class MeshServices
 {
 private:
 
-   static constexpr uint64_t groupBitmask = (1ull << 10) - 1;
+   static constexpr uint64_t groupBitmask = (1ull << meshServiceGroupBits) - 1;
 
 public:
 

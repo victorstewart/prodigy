@@ -121,6 +121,27 @@ static bool equalEnvironmentBGP(const ProdigyEnvironmentBGPConfig& lhs, const Pr
    return lhs == rhs;
 }
 
+static bool equalOSUpdatePolicies(const Vector<OperatingSystemUpdatePolicy>& lhs, const Vector<OperatingSystemUpdatePolicy>& rhs)
+{
+   if (lhs.size() != rhs.size())
+   {
+      return false;
+   }
+
+   for (uint32_t index = 0; index < lhs.size(); ++index)
+   {
+      if (lhs[index].osID.equals(rhs[index].osID) == false
+         || lhs[index].targetVersionID.equals(rhs[index].targetVersionID) == false
+         || lhs[index].command.equals(rhs[index].command) == false
+         || lhs[index].includeVMs != rhs[index].includeVMs)
+      {
+         return false;
+      }
+   }
+
+   return true;
+}
+
 static bool equalTestHost(const MothershipProdigyClusterTestHost& lhs, const MothershipProdigyClusterTestHost& rhs)
 {
    return lhs.mode == rhs.mode
@@ -289,10 +310,14 @@ static bool equalClusters(const MothershipProdigyCluster& lhs, const MothershipP
       && lhs.bootstrapSshUser.equals(rhs.bootstrapSshUser)
       && lhs.bootstrapSshKeyPackage == rhs.bootstrapSshKeyPackage
       && lhs.bootstrapSshHostKeyPackage == rhs.bootstrapSshHostKeyPackage
-      && lhs.bootstrapSshPrivateKeyPath.equals(rhs.bootstrapSshPrivateKeyPath)
-      && lhs.remoteProdigyPath.equals(rhs.remoteProdigyPath)
-      && lhs.sharedCPUOvercommitPermille == rhs.sharedCPUOvercommitPermille
-      && equalEnvironmentBGP(lhs.bgp, rhs.bgp)
+	      && lhs.bootstrapSshPrivateKeyPath.equals(rhs.bootstrapSshPrivateKeyPath)
+	      && lhs.remoteProdigyPath.equals(rhs.remoteProdigyPath)
+	      && lhs.sharedCPUOvercommitPermille == rhs.sharedCPUOvercommitPermille
+	      && lhs.osUpdatesEnabled == rhs.osUpdatesEnabled
+	      && equalOSUpdatePolicies(lhs.osUpdatePolicies, rhs.osUpdatePolicies)
+	      && lhs.maxOSDrains == rhs.maxOSDrains
+	      && lhs.machineUpdateCadenceMins == rhs.machineUpdateCadenceMins
+	      && equalEnvironmentBGP(lhs.bgp, rhs.bgp)
       && equalTestConfig(lhs.test, rhs.test)
       && lhs.desiredEnvironment == rhs.desiredEnvironment
       && lhs.environmentConfigured == rhs.environmentConfigured
@@ -830,6 +855,11 @@ int main(void)
    invalidSharedCPUOvercommit.name = "local-invalid-overcommit"_ctv;
    invalidSharedCPUOvercommit.sharedCPUOvercommitPermille = 999;
 
+   MothershipProdigyCluster invalidOSUpdatesEnabledWithoutPolicies = local;
+   invalidOSUpdatesEnabledWithoutPolicies.name = "local-os-updates-without-policies"_ctv;
+   invalidOSUpdatesEnabledWithoutPolicies.osUpdatesEnabled = true;
+   invalidOSUpdatesEnabledWithoutPolicies.osUpdatePolicies.clear();
+
    MothershipProdigyCluster invalidTestProvider = testLocal;
    invalidTestProvider.name = "test-provider-invalid"_ctv;
    invalidTestProvider.provider = MothershipClusterProvider::aws;
@@ -1157,6 +1187,10 @@ int main(void)
       bool createInvalidSharedCPUOvercommit = registry.createCluster(invalidSharedCPUOvercommit, nullptr, &failure);
       suite.expect(createInvalidSharedCPUOvercommit == false, "create_invalid_shared_cpu_overcommit_rejected");
       suite.expect(failure.equals("sharedCpuOvercommit must be in 1.0..2.0"_ctv), "create_invalid_shared_cpu_overcommit_reason");
+
+      bool createInvalidOSUpdatesEnabledWithoutPolicies = registry.createCluster(invalidOSUpdatesEnabledWithoutPolicies, nullptr, &failure);
+      suite.expect(createInvalidOSUpdatesEnabledWithoutPolicies == false, "create_invalid_os_updates_enabled_without_policies_rejected");
+      suite.expect(failure.equals("osUpdatesEnabled requires osUpdatePolicies"_ctv), "create_invalid_os_updates_enabled_without_policies_reason");
 
       bool createTestProvider = registry.createCluster(invalidTestProvider, nullptr, &failure);
       suite.expect(createTestProvider == false, "create_test_provider_rejected");

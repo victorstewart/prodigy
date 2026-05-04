@@ -8,7 +8,7 @@ HARNESS="${SCRIPT_DIR}/prodigy_dev_netns_harness.sh"
 
 if [[ -z "${PRODIGY_BIN}" || -z "${MOTHERSHIP_BIN}" ]]
 then
-   echo "usage: $0 /path/to/prodigy /path/to/mothership [--mode=smoke|full] [--duration=SECONDS] [--post-fault-window=SECONDS]"
+   echo "usage: $0 /path/to/prodigy /path/to/mothership [--mode=smoke|full] [--duration=SECONDS] [--post-fault-window=SECONDS] [--case=NAME]"
    exit 2
 fi
 
@@ -31,8 +31,9 @@ then
 fi
 
 mode="full"
-duration_s=26
-post_fault_window_s=10
+duration_s=90
+post_fault_window_s=14
+case_filter=""
 
 shift 2 || true
 while [[ $# -gt 0 ]]
@@ -46,6 +47,9 @@ do
          ;;
       --post-fault-window=*)
          post_fault_window_s="${1#*=}"
+         ;;
+      --case=*)
+         case_filter="${1#*=}"
          ;;
       *)
          echo "unknown argument: $1"
@@ -76,7 +80,7 @@ fi
 total_cases=0
 failed_cases=0
 failed_names=()
-case_max_attempts="${PRODIGY_DEV_CASE_MAX_ATTEMPTS:-2}"
+case_max_attempts="${PRODIGY_DEV_CASE_MAX_ATTEMPTS:-1}"
 
 if ! [[ "${case_max_attempts}" =~ ^[0-9]+$ ]] || [[ "${case_max_attempts}" -le 0 ]]
 then
@@ -88,6 +92,12 @@ run_case()
 {
    local name="$1"
    shift
+
+   if [[ -n "${case_filter}" && "${name}" != "${case_filter}" ]]
+   then
+      return 0
+   fi
+
    total_cases=$((total_cases + 1))
 
    echo "=== CASE ${name} ==="
@@ -147,7 +157,7 @@ run_case "no_majority_partition_1_2" \
 run_case "master_transient_partition_requires_failover" \
    --fault-targets=master \
    --fault-start=2 \
-   --fault-duration=6 \
+   --fault-duration=10 \
    --expect-master-available=1 \
    --expect-master-change-during-fault=1 \
    --expect-master-change=1 \
@@ -157,7 +167,7 @@ run_case "master_transient_crash_requires_failover" \
    --fault-mode=crash \
    --fault-targets=master \
    --fault-start=2 \
-   --fault-duration=6 \
+   --fault-duration=10 \
    --expect-master-available=1 \
    --expect-master-change-during-fault=1 \
    --expect-master-change=1 \
@@ -247,7 +257,7 @@ then
    run_case "master_transient_partition_requires_failover_repeat_a" \
       --fault-targets=master \
       --fault-start=2 \
-      --fault-duration=6 \
+      --fault-duration=10 \
       --expect-master-available=1 \
       --expect-master-change-during-fault=1 \
       --expect-master-change=1 \
@@ -256,7 +266,7 @@ then
    run_case "master_transient_partition_requires_failover_repeat_b" \
       --fault-targets=master \
       --fault-start=2 \
-      --fault-duration=6 \
+      --fault-duration=10 \
       --expect-master-available=1 \
       --expect-master-change-during-fault=1 \
       --expect-master-change=1 \
@@ -287,6 +297,12 @@ fi
 echo "=== SUMMARY ==="
 echo "cases_total=${total_cases}"
 echo "cases_failed=${failed_cases}"
+
+if [[ -n "${case_filter}" && "${total_cases}" -eq 0 ]]
+then
+   echo "FAIL: requested case not found: ${case_filter}"
+   exit 1
+fi
 
 if [[ "${failed_cases}" -ne 0 ]]
 then

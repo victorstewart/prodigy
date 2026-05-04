@@ -3,7 +3,7 @@
 #pragma once
 
 struct bpf_string {
-   
+
    char string[32];
    __u32 len;
 };

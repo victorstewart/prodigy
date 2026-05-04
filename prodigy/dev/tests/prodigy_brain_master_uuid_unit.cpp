@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <csignal>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -30,6 +31,42 @@ public:
       }
    }
 };
+
+static void testSigchldHandler(int, siginfo_t *, void *)
+{
+}
+
+class ScopedSigchldAction
+{
+public:
+
+   struct sigaction previous = {};
+   bool valid = false;
+
+   ScopedSigchldAction(void)
+   {
+      valid = sigaction(SIGCHLD, nullptr, &previous) == 0;
+   }
+
+   ~ScopedSigchldAction()
+   {
+      if (valid)
+      {
+         sigaction(SIGCHLD, &previous, nullptr);
+      }
+   }
+};
+
+static bool testSigchldIsDefaultWaitable(void)
+{
+   struct sigaction action = {};
+   if (sigaction(SIGCHLD, nullptr, &action) != 0)
+   {
+      return false;
+   }
+
+   return prodigySigchldIsDefaultWaitable(action);
+}
 
 class TestNeuron final : public NeuronBase
 {
@@ -127,15 +164,25 @@ public:
       return shouldReplaceActivePeerWithAcceptedStream(brain, expectedUpdateFollowerReconnect);
    }
 
-   void testSelfElectAsMaster(const char *reason = "unit-test")
-   {
-      selfElectAsMaster(reason);
-   }
+	   bool testSelfElectAsMaster(const char *reason = "unit-test", bool replaceLiveMothershipListener = false)
+	   {
+	      return selfElectAsMaster(reason, replaceLiveMothershipListener);
+	   }
 
-   void testElectBrainToMaster(BrainView *brain)
-   {
-      electBrainToMaster(brain);
-   }
+	   void testSpinApplication(ApplicationDeployment *deployment)
+	   {
+	      spinApplication(deployment);
+	   }
+
+      void testHandleMachineStateChange(Machine *machine, MachineState state)
+      {
+         handleMachineStateChange(machine, state);
+      }
+
+	   void testElectBrainToMaster(BrainView *brain)
+	   {
+	      electBrainToMaster(brain);
+	   }
 
    void testDeriveMasterBrain(bool allowExistingMasterClaims = true)
    {
@@ -192,6 +239,11 @@ public:
       closeHandler(socket);
    }
 
+   void testRecvHandler(void *socket, int result)
+   {
+      recvHandler(socket, result);
+   }
+
    void testDestroyIdleMothershipStreamNow(Mothership *stream, const char *reason = "unit-test")
    {
       destroyIdleMothershipStreamNow(stream, reason);
@@ -212,6 +264,11 @@ public:
       dispatchTimeout(packet);
    }
 
+   void testRunBrainPeerHeartbeatTick(void)
+   {
+      runBrainPeerHeartbeatTick();
+   }
+
    void testAcceptHandler(void *socket, int fslot)
    {
       acceptHandler(socket, fslot);
@@ -227,9 +284,19 @@ public:
       return findMachineByUUID(uuid);
    }
 
-   bool testArmMothershipUnixListener(void)
+   bool testArmMothershipUnixListener(bool replaceLiveListener = false)
    {
-      return armMothershipUnixListener();
+      return armMothershipUnixListener(replaceLiveListener);
+   }
+
+   bool testMothershipUnixSocketPathOwnedByLocalListener(void)
+   {
+      return mothershipUnixSocketPathOwnedByLocalListener();
+   }
+
+   void testUnlinkMothershipUnixSocketPath(const char *reason, bool requireLocalOwnership = true)
+   {
+      unlinkMothershipUnixSocketPath(reason, requireLocalOwnership);
    }
 
    bool testMothershipUnixListenerActive(void) const
@@ -279,6 +346,98 @@ public:
       }
 
       return nullptr;
+   }
+
+   bool testHasBrainReconnectWaiter(BrainView *brain) const
+   {
+      return brainReconnectWaiters.contains(brain);
+   }
+
+   TimeoutPacket *testGetBrainReconnectWaiter(BrainView *brain) const
+   {
+      if (auto it = brainReconnectWaiters.find(brain); it != brainReconnectWaiters.end())
+      {
+         return it->second;
+      }
+
+      return nullptr;
+   }
+
+   bool testHasBrainLivenessWaiter(BrainView *brain) const
+   {
+      return brainLivenessWaiters.contains(brain);
+   }
+
+   TimeoutPacket *testGetBrainLivenessWaiter(BrainView *brain) const
+   {
+      if (auto it = brainLivenessWaiters.find(brain); it != brainLivenessWaiters.end())
+      {
+         return it->second;
+      }
+
+      return nullptr;
+   }
+
+   bool testHasNeuronReconnectWaiter(NeuronView *neuron) const
+   {
+      return neuronReconnectWaiters.contains(neuron);
+   }
+
+   TimeoutPacket *testGetNeuronReconnectWaiter(NeuronView *neuron) const
+   {
+      if (auto it = neuronReconnectWaiters.find(neuron); it != neuronReconnectWaiters.end())
+      {
+         return it->second;
+      }
+
+      return nullptr;
+   }
+
+   void testEraseNeuronReconnectWaiter(NeuronView *neuron)
+   {
+      if (auto it = neuronReconnectWaiters.find(neuron); it != neuronReconnectWaiters.end())
+      {
+         delete it->second;
+         neuronReconnectWaiters.erase(it);
+      }
+   }
+
+   void testRefreshMasterPeerLivenessWaiter(BrainView *brain, const char *reason = "unit-test")
+   {
+      refreshMasterPeerLivenessWaiter(brain, reason);
+   }
+
+   void testCancelBrainLivenessWaiter(BrainView *brain, const char *reason = "unit-test")
+   {
+      cancelBrainLivenessWaiter(brain, reason);
+   }
+
+   TimeoutPacket *testInsertBrainLivenessWaiter(BrainView *brain)
+   {
+      TimeoutPacket *timeout = new TimeoutPacket();
+      timeout->flags = uint64_t(BrainTimeoutFlags::brainPeerLiveness);
+      timeout->originator = brain;
+      timeout->dispatcher = this;
+      brainLivenessWaiters.insert_or_assign(brain, timeout);
+      return timeout;
+   }
+
+   void testEraseBrainLivenessWaiter(BrainView *brain)
+   {
+      if (auto it = brainLivenessWaiters.find(brain); it != brainLivenessWaiters.end())
+      {
+         delete it->second;
+         brainLivenessWaiters.erase(it);
+      }
+   }
+
+   void testEraseBrainReconnectWaiter(BrainView *brain)
+   {
+      if (auto it = brainReconnectWaiters.find(brain); it != brainReconnectWaiters.end())
+      {
+         delete it->second;
+         brainReconnectWaiters.erase(it);
+      }
    }
 
    void testInsertBrainWaiter(BrainView *brain)
@@ -544,7 +703,14 @@ template <typename... Args>
 static Message *buildBrainMessage(String& buffer, BrainTopic topic, Args&&... args)
 {
    buffer.clear();
-   Message::construct(buffer, topic, std::forward<Args>(args)...);
+   if (topic == BrainTopic::registration)
+   {
+      Message::construct(buffer, topic, std::forward<Args>(args)..., "test-kernel"_ctv, "portablelinux"_ctv, "1"_ctv);
+   }
+   else
+   {
+      Message::construct(buffer, topic, std::forward<Args>(args)...);
+   }
    return reinterpret_cast<Message *>(buffer.data());
 }
 
@@ -556,10 +722,11 @@ static Message *buildNeuronMessage(String& buffer, NeuronTopic topic, Args&&... 
    return reinterpret_cast<Message *>(buffer.data());
 }
 
-static Message *buildBrainEcho(String& buffer, BrainTopic topic)
+template <typename... Args>
+static Message *buildBrainEcho(String& buffer, BrainTopic topic, Args&&... args)
 {
    buffer.clear();
-   Message::appendEcho(buffer, topic);
+   Message::appendEcho(buffer, topic, std::forward<Args>(args)...);
    return reinterpret_cast<Message *>(buffer.data());
 }
 
@@ -614,6 +781,37 @@ int main(void)
    neuron.uuid = uint128_t(0x100);
    neuron.private4 = IPAddress("10.0.0.10", false);
    thisNeuron = &neuron;
+
+   suite.expect(prodigyBrainPeerHeartbeatTimeoutMs <= 5000u, "timing_knobs_bound_production_master_stale_detection");
+   suite.expect(prodigyBrainDevPeerHeartbeatTimeoutMs <= 5000u, "timing_knobs_bound_dev_master_stale_detection");
+   suite.expect(prodigyBrainPeerHeartbeatTimeoutMs >= prodigyBrainPeerHeartbeatIntervalMs * 3u, "timing_knobs_production_allows_multiple_missed_heartbeats");
+   suite.expect(prodigyBrainDevPeerHeartbeatTimeoutMs >= prodigyBrainDevPeerHeartbeatIntervalMs * 3u, "timing_knobs_dev_allows_multiple_missed_heartbeats");
+
+   {
+      ScopedSigchldAction restore = {};
+
+      struct sigaction custom = {};
+      sigemptyset(&custom.sa_mask);
+      custom.sa_sigaction = testSigchldHandler;
+      custom.sa_flags = SA_SIGINFO;
+      sigaction(SIGCHLD, &custom, nullptr);
+
+      suite.expect(prodigyEnsureSigchldDefaultWaitable(), "sigchld_policy_repairs_custom_handler");
+      suite.expect(testSigchldIsDefaultWaitable(), "sigchld_policy_custom_handler_becomes_default_waitable");
+   }
+
+   {
+      ScopedSigchldAction restore = {};
+
+      struct sigaction noChildWait = {};
+      sigemptyset(&noChildWait.sa_mask);
+      noChildWait.sa_handler = SIG_DFL;
+      noChildWait.sa_flags = SA_NOCLDWAIT;
+      sigaction(SIGCHLD, &noChildWait, nullptr);
+
+      suite.expect(prodigyEnsureSigchldDefaultWaitable(), "sigchld_policy_repairs_no_child_wait");
+      suite.expect(testSigchldIsDefaultWaitable(), "sigchld_policy_no_child_wait_becomes_default_waitable");
+   }
 
    {
       TestBrain brain = {};
@@ -674,13 +872,18 @@ int main(void)
 
       brain.localBrainPeerAddress = IPAddress("10.0.0.10", false);
       brain.localBrainPeerAddressText = "10.0.0.10"_ctv;
+      brain.localBrainPeerAddresses.push_back(ClusterMachinePeerAddress{"10.0.0.10"_ctv, 24});
 
       BrainView connectPeer = {};
       connectPeer.private4 = IPAddress("10.0.0.20", false).v4;
+      connectPeer.peerAddresses.push_back(ClusterMachinePeerAddress{"10.0.0.20"_ctv, 24});
       brain.testInitializeBrainPeerIfNeeded(&connectPeer);
       suite.expect(connectPeer.weConnectToIt, "initialize_brain_peer_connect_path_marks_connector_ownership");
       suite.expect(connectPeer.daddrLen > 0, "initialize_brain_peer_connect_path_configures_destination");
-      suite.expect(brain.testHasBrainWaiter(&connectPeer) == false, "initialize_brain_peer_connect_path_does_not_arm_waiter_on_install_failure");
+      suite.expect(connectPeer.fd == -1, "initialize_brain_peer_connect_path_closes_failed_process_fd");
+      suite.expect(brain.testHasBrainReconnectWaiter(&connectPeer), "initialize_brain_peer_connect_path_arms_reconnect_on_install_failure");
+      suite.expect(brain.testHasBrainWaiter(&connectPeer) == false, "initialize_brain_peer_connect_path_does_not_arm_missing_waiter_on_install_failure");
+      brain.testEraseBrainReconnectWaiter(&connectPeer);
 
       BrainView waitPeer = {};
       waitPeer.private4 = IPAddress("10.0.0.5", false).v4;
@@ -724,7 +927,7 @@ int main(void)
          bindFailPeer.setSaddr(IPAddress("203.0.113.10", false));
          bindFailPeer.setDaddr(IPAddress("10.0.0.20", false), uint16_t(ReservedPorts::brain));
          suite.expect(brain.testInstallBrainPeerSocket(&bindFailPeer) == false, "install_brain_peer_socket_rejects_source_bind_failure");
-         ::close(bindFailSockets[0]);
+         suite.expect(bindFailPeer.fd == -1, "install_brain_peer_socket_closes_fd_on_source_bind_failure");
          ::close(bindFailSockets[1]);
       }
 
@@ -800,6 +1003,10 @@ int main(void)
       suite.expect(brain.testGetExistingMasterUUID() == masterPeer.uuid, "get_existing_master_uuid_uses_master_peer_when_not_self_master");
 
       masterPeer.isMasterBrain = false;
+      masterPeer.existingMasterUUID = masterPeer.uuid;
+      suite.expect(brain.testGetExistingMasterUUID() == masterPeer.uuid, "get_existing_master_uuid_uses_existing_master_claim_when_master_bit_missing");
+
+      masterPeer.existingMasterUUID = 0;
       suite.expect(brain.testGetExistingMasterUUID() == 0, "get_existing_master_uuid_returns_zero_without_marked_master_peer");
 
       brain.noMasterYet = true;
@@ -1027,6 +1234,7 @@ int main(void)
       brain.weAreMaster = true;
       brain.noMasterYet = false;
       brain.ignited = true;
+      brain.brainConfig.datacenterFragment = 0x55;
 
       Machine machine = {};
       machine.uuid = uint128_t(0x902155);
@@ -1116,14 +1324,62 @@ int main(void)
          "restore_cluster_topology_machine_neuron_registered_before_finish_config_arms_control_once");
       suite.expect(brain.observedNeuronRegisteredBeforeArm,
          "restore_cluster_topology_machine_neuron_registered_before_finish_config_inserts_neuron_first");
-      suite.expect(brain.testFindMachineByUUID(uint128_t(0x90216)) != nullptr,
-         "restore_cluster_topology_machine_neuron_registered_before_finish_config_indexes_machine_by_uuid");
-   }
+	      suite.expect(brain.testFindMachineByUUID(uint128_t(0x90216)) != nullptr,
+	         "restore_cluster_topology_machine_neuron_registered_before_finish_config_indexes_machine_by_uuid");
+	   }
 
-   {
-      ScopedRing scopedRing = {};
+	   {
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+	      brain.weAreMaster = true;
+	      brain.overrideArmMachineNeuronControl = true;
 
-      TestBrain brain = {};
+	      uint32_t private4 = IPAddress("10.0.0.217", false).v4;
+	      BrainView *peer = makePeer(uint128_t(0x90217), int64_t(1234567890000), private4, "10.0.0.217");
+	      peer->kernel = "linux-6.11.0-test"_ctv;
+	      peer->osID = "portablelinux"_ctv;
+	      peer->osVersionID = "1"_ctv;
+	      brain.brains.insert(peer);
+
+	      ClusterTopology topology = {};
+	      topology.version = 1;
+
+	      ClusterMachine machine = {};
+	      machine.source = ClusterMachineSource::adopted;
+	      machine.backing = ClusterMachineBacking::owned;
+	      machine.kind = MachineConfig::MachineKind::vm;
+	      machine.isBrain = true;
+	      machine.lifetime = MachineLifetime::owned;
+	      machine.uuid = peer->uuid;
+	      machine.creationTimeMs = Time::now<TimeResolution::ms>();
+	      machine.ssh.address = "10.0.0.217"_ctv;
+	      machine.ssh.user = "root"_ctv;
+	      prodigyAppendUniqueClusterMachineAddress(machine.addresses.privateAddresses, "10.0.0.217"_ctv, 24);
+	      topology.machines.push_back(machine);
+
+	      suite.expect(brain.testRestoreMachinesFromClusterTopology(topology),
+	         "restore_cluster_topology_brain_peer_registration_before_machine_restore_succeeds");
+	      suite.expect(peer->machine != nullptr,
+	         "restore_cluster_topology_brain_peer_registration_before_machine_restore_links_machine");
+	      suite.expect(peer->machine != nullptr && peer->machine->brain == peer,
+	         "restore_cluster_topology_brain_peer_registration_before_machine_restore_links_peer");
+	      suite.expect(peer->machine != nullptr && peer->machine->kernel == "linux-6.11.0-test"_ctv,
+	         "restore_cluster_topology_brain_peer_registration_before_machine_restore_replays_kernel");
+	      suite.expect(peer->machine != nullptr && peer->machine->osID == "portablelinux"_ctv,
+	         "restore_cluster_topology_brain_peer_registration_before_machine_restore_replays_os_id");
+	      suite.expect(peer->machine != nullptr && peer->machine->osVersionID == "1"_ctv,
+	         "restore_cluster_topology_brain_peer_registration_before_machine_restore_replays_os_version_id");
+	      suite.expect(peer->machine != nullptr && peer->machine->lastUpdatedOSMs == int64_t(1234567),
+	         "restore_cluster_topology_brain_peer_registration_before_machine_restore_replays_boot_time_ms");
+
+	      brain.brains.erase(peer);
+	      delete peer;
+	   }
+
+	   {
+	      ScopedRing scopedRing = {};
+
+	      TestBrain brain = {};
       brain.iaas = new NoopBrainIaaS();
       brain.weAreMaster = true;
       brain.overrideNeuronControlInstallFromBrain = true;
@@ -1163,6 +1419,8 @@ int main(void)
       Machine machine = {};
       machine.private4 = IPAddress("10.0.0.21", false).v4;
       machine.uuid = uint128_t(0x9021);
+      machine.state = MachineState::healthy;
+      machine.runtimeReady = true;
       machine.neuron.machine = &machine;
       machine.neuron.hadSuccessfulConnection = true;
       brain.neurons.insert(&machine.neuron);
@@ -1234,6 +1492,82 @@ int main(void)
 
       TestBrain brain = {};
       brain.iaas = new NoopBrainIaaS();
+      brain.nBrains = 3;
+      brain.noMasterYet = false;
+
+      BrainView *peer = makePeer(uint128_t(0x21f3), 193, IPAddress("10.0.0.21", false).v4, "10.0.0.21");
+      peer->connected = true;
+      peer->weConnectToIt = true;
+      peer->registrationFresh = true;
+      peer->isMasterBrain = true;
+      peer->reconnectAfterClose = true;
+      peer->connectTimeoutMs = 250;
+      peer->nDefaultAttemptsBudget = 4;
+      peer->transportEpoch = 2;
+      peer->queuedCloseTransportEpoch = 1;
+      peer->fd = -1;
+      peer->fslot = -1;
+      peer->isFixedFile = false;
+      brain.brains.insert(peer);
+
+      brain.testCloseHandler(peer);
+
+      suite.expect(peer->connected == false, "brain_close_handler_inactive_advanced_transport_marks_peer_disconnected");
+      suite.expect(peer->queuedCloseTransportEpoch == 0, "brain_close_handler_inactive_advanced_transport_clears_stale_epoch");
+      suite.expect(brain.testHasBrainWaiter(peer), "brain_close_handler_inactive_advanced_transport_arms_master_missing_waiter");
+      suite.expect(brain.testHasBrainReconnectWaiter(peer), "brain_close_handler_inactive_advanced_transport_arms_reconnect_waiter");
+
+      brain.testEraseBrainWaiter(peer);
+      brain.testEraseBrainReconnectWaiter(peer);
+      brain.brains.erase(peer);
+      delete peer;
+   }
+
+   {
+      ScopedRing scopedRing = {};
+
+      TestBrain brain = {};
+      brain.iaas = new NoopBrainIaaS();
+      brain.nBrains = 3;
+      brain.weAreMaster = false;
+      brain.noMasterYet = false;
+
+      BrainView *peer = makePeer(uint128_t(0x21f), 0, IPAddress("10.0.0.19", false).v4, "10.0.0.19");
+      peer->weConnectToIt = true;
+      peer->reconnectAfterClose = true;
+      peer->connectTimeoutMs = 250;
+      peer->nDefaultAttemptsBudget = 4;
+      peer->nConnectionAttempts = 0;
+      peer->nAttemptsBudget = 9;
+      peer->attemptDeadlineMs = 12345;
+      peer->fd = -1;
+      peer->isFixedFile = false;
+      peer->connected = false;
+      peer->registrationFresh = false;
+      peer->existingMasterUUID = peer->uuid;
+      brain.brains.insert(peer);
+
+      brain.testCloseHandler(peer);
+
+      TimeoutPacket *waiter = brain.testGetBrainWaiter(peer);
+      suite.expect(waiter != nullptr, "brain_close_handler_connector_inert_master_claim_arms_waiter");
+      suite.expect(peer->fd == -1, "brain_close_handler_connector_inert_master_claim_keeps_fd_unarmed");
+      suite.expect(peer->isFixedFile == false, "brain_close_handler_connector_inert_master_claim_keeps_fixed_slot_unarmed");
+      suite.expect(peer->reconnectAfterClose, "brain_close_handler_connector_inert_master_claim_preserves_reconnect_policy");
+      suite.expect(peer->nConnectionAttempts == 0, "brain_close_handler_connector_inert_master_claim_preserves_attempt_counter");
+      suite.expect(peer->nAttemptsBudget == 9, "brain_close_handler_connector_inert_master_claim_preserves_attempt_budget");
+      suite.expect(peer->attemptDeadlineMs == 12345, "brain_close_handler_connector_inert_master_claim_preserves_attempt_deadline");
+
+      brain.testEraseBrainWaiter(peer);
+      brain.brains.erase(peer);
+      delete peer;
+   }
+
+   {
+      ScopedRing scopedRing = {};
+
+      TestBrain brain = {};
+      brain.iaas = new NoopBrainIaaS();
 
       BrainView *peer = makePeer(uint128_t(0x21e1), 0, IPAddress("10.0.0.181", false).v4, "10.0.0.181");
       peer->weConnectToIt = true;
@@ -1252,11 +1586,24 @@ int main(void)
       TimeoutPacket *waiter = brain.testGetBrainWaiter(peer);
       suite.expect(waiter != nullptr, "brain_close_handler_dead_connector_retry_fixture_arms_waiter");
 
+      peer->noteTransportActivated();
       peer->noteCloseQueuedForCurrentTransport();
       brain.testCloseHandler(peer);
 
       suite.expect(brain.testHasBrainWaiter(peer) == false, "brain_close_handler_dead_connector_retry_erases_waiter");
       suite.expect(waiter != nullptr && waiter->flags == uint64_t(BrainTimeoutFlags::canceled), "brain_close_handler_dead_connector_retry_marks_waiter_canceled");
+      TimeoutPacket *reconnectWaiter = brain.testGetBrainReconnectWaiter(peer);
+      suite.expect(reconnectWaiter != nullptr, "brain_close_handler_dead_connector_retry_arms_reconnect_waiter");
+      suite.expect(peer->isFixedFile == false, "brain_close_handler_dead_connector_retry_defers_fixed_slot_reinstall");
+      suite.expect(peer->fslot < 0, "brain_close_handler_dead_connector_retry_defers_slot_arm");
+      suite.expect(peer->connectAttemptPending() == false, "brain_close_handler_dead_connector_retry_defers_connect_attempt");
+
+      if (reconnectWaiter != nullptr)
+      {
+         brain.testDispatchTimeout(reconnectWaiter);
+      }
+
+      suite.expect(brain.testHasBrainReconnectWaiter(peer) == false, "brain_close_handler_dead_connector_retry_clears_reconnect_waiter");
       suite.expect(peer->isFixedFile, "brain_close_handler_dead_connector_retry_reinstalls_fixed_slot");
       suite.expect(peer->fslot >= 0, "brain_close_handler_dead_connector_retry_keeps_slot_armed");
       suite.expect(peer->connectAttemptPending(), "brain_close_handler_dead_connector_retry_submits_connect_attempt");
@@ -1415,6 +1762,44 @@ int main(void)
       TestBrain brain = {};
       brain.iaas = new NoopBrainIaaS();
 
+      BrainView *peer = makePeer(uint128_t(0x22124), 216, IPAddress("127.0.0.1", false).v4, "127.0.0.1");
+      peer->connected = false;
+      peer->weConnectToIt = false;
+      peer->currentStreamAccepted = true;
+      peer->registrationFresh = true;
+      peer->tlsPeerVerified = true;
+      brain.brains.insert(peer);
+
+      int peerFD = -1;
+      bool installed = installBrainPeerSocket(brain, *peer, peerFD);
+      suite.expect(installed, "brain_arm_outbound_peer_reconnect_force_live_raw_accepted_installs_fixture");
+      if (installed)
+      {
+         brain.testArmOutboundPeerReconnect(peer, true);
+
+         suite.expect(Ring::socketIsClosing(peer), "brain_arm_outbound_peer_reconnect_force_live_raw_accepted_queues_tracked_close");
+         suite.expect(peer->connectAttemptPending() == false, "brain_arm_outbound_peer_reconnect_force_live_raw_accepted_defers_redial_until_close_completion");
+         suite.expect(peer->forceConnectorOwnershipUntilMasterAck, "brain_arm_outbound_peer_reconnect_force_live_raw_accepted_sets_force_connector_flag");
+
+         brain.testCloseHandler(peer);
+         if (TimeoutPacket *waiter = brain.testGetBrainWaiter(peer); waiter != nullptr)
+         {
+            waiter->flags = uint64_t(BrainTimeoutFlags::canceled);
+            brain.testDispatchTimeout(waiter);
+         }
+      }
+
+      cleanupBrainPeerSocket(*peer, peerFD);
+      brain.brains.erase(peer);
+      delete peer;
+   }
+
+   {
+      ScopedRing scopedRing = {};
+
+      TestBrain brain = {};
+      brain.iaas = new NoopBrainIaaS();
+
       BrainView *peer = makePeer(uint128_t(0x22123), 215, IPAddress("127.0.0.1", false).v4, "127.0.0.1");
       peer->connected = true;
       peer->weConnectToIt = false;
@@ -1433,6 +1818,7 @@ int main(void)
          suite.expect(peer->connectAttemptPending() == false, "brain_arm_outbound_peer_reconnect_force_live_accepted_defers_redial_until_close_completion");
 
          brain.testCloseHandler(peer);
+         suite.expect(peer->forceConnectorOwnershipUntilMasterAck, "brain_arm_outbound_peer_reconnect_force_live_accepted_sets_force_connector_flag");
          if (TimeoutPacket *waiter = brain.testGetBrainWaiter(peer); waiter != nullptr)
          {
             waiter->flags = uint64_t(BrainTimeoutFlags::canceled);
@@ -1521,6 +1907,7 @@ int main(void)
             suite.expect(peer->registrationFresh, "brain_close_handler_stale_accepted_close_after_reaccept_keeps_replacement_registration_fresh");
             suite.expect(peer->fslot == replacementFslot, "brain_close_handler_stale_accepted_close_after_reaccept_preserves_replacement_slot");
             suite.expect(peer->transportEpoch == replacementEpoch, "brain_close_handler_stale_accepted_close_after_reaccept_preserves_transport_epoch");
+            suite.expect(peer->confirmedMissingTransportEpoch == 0, "brain_close_handler_stale_accepted_close_after_reaccept_clears_confirmed_missing_epoch_on_reaccept");
             suite.expect(brain.testHasBrainWaiter(peer) == false, "brain_close_handler_stale_accepted_close_after_reaccept_does_not_rearm_waiter");
          }
       }
@@ -1546,6 +1933,164 @@ int main(void)
       cleanupBrainPeerSocket(*peer, peerFD);
       brain.brains.erase(peer);
       delete peer;
+   }
+
+   {
+      ScopedRing scopedRing = {};
+
+      TestBrain brain = {};
+      brain.iaas = new NoopBrainIaaS();
+      brain.nBrains = 3;
+      brain.weAreMaster = false;
+      brain.noMasterYet = false;
+      brain.localBrainPeerAddress = IPAddress("10.0.0.10", false);
+      brain.localBrainPeerAddressText = "10.0.0.10"_ctv;
+
+      BrainView *masterPeer = makePeer(uint128_t(0x22124), 216, IPAddress("10.0.0.11", false).v4, "10.0.0.11");
+      masterPeer->connected = true;
+      masterPeer->weConnectToIt = false;
+      masterPeer->currentStreamAccepted = true;
+      masterPeer->registrationFresh = true;
+      masterPeer->isFixedFile = true;
+      masterPeer->fslot = 49;
+      masterPeer->isMasterBrain = true;
+      masterPeer->noteTransportActivated();
+      masterPeer->confirmedMissingTransportEpoch = masterPeer->transportEpoch;
+      brain.brains.insert(masterPeer);
+
+      BrainView *followerPeer = makePeer(uint128_t(0x22125), 217, IPAddress("10.0.0.12", false).v4, "10.0.0.12");
+      followerPeer->connected = true;
+      followerPeer->isFixedFile = true;
+      followerPeer->fslot = 50;
+      brain.brains.insert(followerPeer);
+
+      brain.testCloseHandler(masterPeer);
+
+      bool sawMasterMissingFrame = false;
+      forEachMessageInBuffer(followerPeer->wBuffer, [&] (Message *frame) {
+         if (BrainTopic(frame->topic) == BrainTopic::masterMissing)
+         {
+            sawMasterMissingFrame = true;
+         }
+      });
+
+      TimeoutPacket *waiter = brain.testGetBrainWaiter(masterPeer);
+      suite.expect(masterPeer->quarantined == false, "brain_close_handler_liveness_confirmed_accepted_master_defers_quarantine");
+      suite.expect(brain.isMasterMissing == false, "brain_close_handler_liveness_confirmed_accepted_master_defers_master_missing");
+      suite.expect(masterPeer->confirmedMissingTransportEpoch == 0, "brain_close_handler_liveness_confirmed_accepted_master_clears_confirmed_missing_epoch");
+      suite.expect(waiter != nullptr, "brain_close_handler_liveness_confirmed_accepted_master_arms_waiter");
+      suite.expect(waiter != nullptr && waiter->timeoutMs() == int64_t(masterPeer->nDefaultAttemptsBudget * masterPeer->connectTimeoutMs + prodigyBrainPeerInboundMissingSlackMs), "brain_close_handler_liveness_confirmed_accepted_master_waiter_uses_failover_window");
+      suite.expect(sawMasterMissingFrame == false, "brain_close_handler_liveness_confirmed_accepted_master_defers_master_missing_gossip");
+
+      brain.testEraseBrainWaiter(masterPeer);
+      brain.brains.erase(masterPeer);
+      brain.brains.erase(followerPeer);
+      delete masterPeer;
+      delete followerPeer;
+   }
+
+   withUniqueMothershipSocket("brain_missing_master_prior_peer_vote_derives_socket_dir_created", [&] {
+      TestBrain brain = {};
+      brain.iaas = new NoopBrainIaaS();
+      brain.nBrains = 3;
+      brain.boottimens = 10;
+      brain.hasCompletedInitialMasterElection = true;
+      brain.weAreMaster = false;
+      brain.noMasterYet = false;
+      brain.localBrainPeerAddress = IPAddress("10.0.0.10", false);
+      brain.localBrainPeerAddressText = "10.0.0.10"_ctv;
+
+      BrainView *masterPeer = makePeer(uint128_t(0x222), 20, IPAddress("10.0.0.11", false).v4, "10.0.0.11");
+      masterPeer->connected = true;
+      masterPeer->isFixedFile = true;
+      masterPeer->fslot = 38;
+      masterPeer->isMasterBrain = true;
+      brain.brains.insert(masterPeer);
+
+      BrainView *followerPeer = makePeer(uint128_t(0x332), 21, IPAddress("10.0.0.12", false).v4, "10.0.0.12");
+      followerPeer->connected = true;
+      followerPeer->isFixedFile = true;
+      followerPeer->fslot = 39;
+      followerPeer->isMasterMissing = true;
+      brain.brains.insert(followerPeer);
+
+      const char *socketPath = ::getenv("PRODIGY_MOTHERSHIP_SOCKET");
+      suite.expect(socketPath != nullptr, "brain_missing_master_prior_peer_vote_has_mothership_socket");
+      int existingListenerFD = -1;
+      if (socketPath != nullptr)
+      {
+         suite.expect(createUnixListener(String(socketPath), existingListenerFD),
+            "brain_missing_master_prior_peer_vote_creates_existing_listener");
+      }
+
+      brain.testBrainMissing(masterPeer);
+
+      suite.expect(masterPeer->quarantined, "brain_missing_master_prior_peer_vote_quarantines_missing_master");
+      suite.expect(brain.weAreMaster, "brain_missing_master_prior_peer_vote_derives_self_master");
+      suite.expect(brain.noMasterYet == false, "brain_missing_master_prior_peer_vote_clears_no_master");
+
+      brain.brains.erase(masterPeer);
+      brain.brains.erase(followerPeer);
+      delete masterPeer;
+      delete followerPeer;
+      if (existingListenerFD >= 0)
+      {
+         ::close(existingListenerFD);
+      }
+   });
+
+   {
+      ScopedRing scopedRing = {};
+
+      TestBrain brain = {};
+      brain.iaas = new NoopBrainIaaS();
+      brain.nBrains = 3;
+      brain.weAreMaster = false;
+      brain.noMasterYet = false;
+      brain.localBrainPeerAddress = IPAddress("10.0.0.12", false);
+      brain.localBrainPeerAddressText = "10.0.0.12"_ctv;
+
+      BrainView *masterPeer = makePeer(uint128_t(0x22126), 218, IPAddress("10.0.0.11", false).v4, "10.0.0.11");
+      masterPeer->connected = true;
+      masterPeer->weConnectToIt = true;
+      masterPeer->registrationFresh = true;
+      masterPeer->isMasterBrain = true;
+      masterPeer->noteTransportActivated();
+      masterPeer->confirmedMissingTransportEpoch = masterPeer->transportEpoch;
+      brain.brains.insert(masterPeer);
+
+      BrainView *followerPeer = makePeer(uint128_t(0x22127), 219, IPAddress("10.0.0.13", false).v4, "10.0.0.13");
+      followerPeer->connected = true;
+      followerPeer->isFixedFile = true;
+      followerPeer->fslot = 52;
+      brain.brains.insert(followerPeer);
+
+      brain.testCloseHandler(masterPeer);
+
+      bool sawMasterMissingFrame = false;
+      forEachMessageInBuffer(followerPeer->wBuffer, [&] (Message *frame) {
+         if (BrainTopic(frame->topic) == BrainTopic::masterMissing)
+         {
+            sawMasterMissingFrame = true;
+         }
+      });
+
+      TimeoutPacket *waiter = brain.testGetBrainWaiter(masterPeer);
+      TimeoutPacket *reconnectWaiter = brain.testGetBrainReconnectWaiter(masterPeer);
+      suite.expect(masterPeer->quarantined == false, "brain_close_handler_liveness_confirmed_connector_master_defers_quarantine");
+      suite.expect(brain.isMasterMissing == false, "brain_close_handler_liveness_confirmed_connector_master_defers_master_missing");
+      suite.expect(masterPeer->confirmedMissingTransportEpoch == 0, "brain_close_handler_liveness_confirmed_connector_master_clears_confirmed_missing_epoch");
+      suite.expect(waiter != nullptr, "brain_close_handler_liveness_confirmed_connector_master_arms_waiter");
+      suite.expect(reconnectWaiter != nullptr, "brain_close_handler_liveness_confirmed_connector_master_arms_reconnect_waiter");
+      suite.expect(waiter != nullptr && waiter->timeoutMs() == int64_t(masterPeer->nDefaultAttemptsBudget * masterPeer->connectTimeoutMs + prodigyBrainPeerInboundMissingSlackMs), "brain_close_handler_liveness_confirmed_connector_master_waiter_uses_failover_window");
+      suite.expect(sawMasterMissingFrame == false, "brain_close_handler_liveness_confirmed_connector_master_defers_master_missing_gossip");
+
+      brain.testEraseBrainWaiter(masterPeer);
+      brain.testEraseBrainReconnectWaiter(masterPeer);
+      brain.brains.erase(masterPeer);
+      brain.brains.erase(followerPeer);
+      delete masterPeer;
+      delete followerPeer;
    }
 
    {
@@ -2367,13 +2912,30 @@ int main(void)
           makeSocketPair("elect_brain_to_master_follower_convergence_creates_mothership_stream_pair", mothershipStreamPair) &&
           makeSocketPair("elect_brain_to_master_follower_convergence_creates_neuron_pair", neuronPair))
       {
-         brain.mothershipSocket.fd = mothershipTcpPair[0];
-         brain.mothershipSocket.isFixedFile = false;
-         brain.mothershipUnixSocket.fd = mothershipUnixPair[0];
-         brain.mothershipUnixSocket.isFixedFile = false;
+	         brain.mothershipSocket.fd = mothershipTcpPair[0];
+	         brain.mothershipSocket.isFixedFile = false;
+	         brain.mothershipUnixSocket.fd = mothershipUnixPair[0];
+	         brain.mothershipUnixSocket.isFixedFile = false;
 
-         Mothership *staleMothership = new Mothership();
-         staleMothership->fd = mothershipStreamPair[0];
+	         char followerSocketDirectoryTemplate[] = "/tmp/prodigy-brain-follower-master-XXXXXX";
+	         char *followerSocketDirectory = ::mkdtemp(followerSocketDirectoryTemplate);
+	         String followerSocketPath = {};
+	         int staleFollowerListenerFD = -1;
+	         suite.expect(followerSocketDirectory != nullptr,
+	            "elect_brain_to_master_follower_convergence_creates_stale_unix_socket_dir");
+	         if (followerSocketDirectory != nullptr)
+	         {
+	            followerSocketPath.assign(followerSocketDirectory);
+	            followerSocketPath.append("/mothership.sock"_ctv);
+	            suite.expect(createUnixListener(followerSocketPath, staleFollowerListenerFD),
+	               "elect_brain_to_master_follower_convergence_creates_stale_unix_socket_path");
+	            suite.expect(::access(followerSocketPath.c_str(), F_OK) == 0,
+	               "elect_brain_to_master_follower_convergence_stale_unix_socket_path_exists_before");
+	            brain.mothershipUnixSocketPath.assign(followerSocketPath);
+	         }
+
+	         Mothership *staleMothership = new Mothership();
+	         staleMothership->fd = mothershipStreamPair[0];
          staleMothership->isFixedFile = false;
          staleMothership->closeAfterSendDrain = true;
          brain.testRegisterActiveMothership(staleMothership);
@@ -2396,11 +2958,16 @@ int main(void)
          suite.expect(brain.pendingDesignatedMasterPeerKey == 0, "elect_brain_to_master_follower_convergence_clears_pending_designated_master");
          suite.expect(brain.hasCompletedInitialMasterElection, "elect_brain_to_master_follower_convergence_marks_initial_election_complete");
          suite.expect(brain.persistCalls == 1, "elect_brain_to_master_follower_convergence_persists");
-         suite.expect(Ring::socketIsClosing(&brain.mothershipSocket), "elect_brain_to_master_follower_convergence_closes_mothership_tcp_listener");
-         suite.expect(Ring::socketIsClosing(&brain.mothershipUnixSocket), "elect_brain_to_master_follower_convergence_closes_mothership_unix_listener");
-         suite.expect(Ring::socketIsClosing(staleMothership), "elect_brain_to_master_follower_convergence_closes_active_mothership_stream");
-         suite.expect(staleMothership->closeAfterSendDrain == false, "elect_brain_to_master_follower_convergence_disables_mothership_drain_close");
-         suite.expect(brain.mothership == nullptr, "elect_brain_to_master_follower_convergence_clears_active_mothership_stream");
+	         suite.expect(Ring::socketIsClosing(&brain.mothershipSocket), "elect_brain_to_master_follower_convergence_closes_mothership_tcp_listener");
+	         suite.expect(Ring::socketIsClosing(&brain.mothershipUnixSocket), "elect_brain_to_master_follower_convergence_closes_mothership_unix_listener");
+		         if (followerSocketPath.size() > 0)
+		         {
+		            suite.expect(::access(followerSocketPath.c_str(), F_OK) == 0,
+		               "elect_brain_to_master_follower_convergence_preserves_unowned_unix_socket_path");
+		         }
+	         suite.expect(Ring::socketIsClosing(staleMothership), "elect_brain_to_master_follower_convergence_closes_active_mothership_stream");
+	         suite.expect(staleMothership->closeAfterSendDrain == false, "elect_brain_to_master_follower_convergence_disables_mothership_drain_close");
+	         suite.expect(brain.mothership == nullptr, "elect_brain_to_master_follower_convergence_clears_active_mothership_stream");
          suite.expect(brain.closingMotherships.contains(staleMothership), "elect_brain_to_master_follower_convergence_tracks_retired_mothership_stream");
          suite.expect(machine.neuron.reconnectAfterClose == false, "elect_brain_to_master_follower_convergence_disarms_neuron_reconnect");
          suite.expect(machine.neuron.nConnectionAttempts == 0, "elect_brain_to_master_follower_convergence_resets_neuron_attempts");
@@ -2409,10 +2976,22 @@ int main(void)
          suite.expect(Ring::socketIsClosing(&machine.neuron), "elect_brain_to_master_follower_convergence_closes_neuron_control_stream");
 
          brain.neurons.erase(&machine.neuron);
-         brain.closingMotherships.erase(staleMothership);
-         delete staleMothership;
-         delete peer;
-      }
+	         brain.closingMotherships.erase(staleMothership);
+	         delete staleMothership;
+	         delete peer;
+	         if (staleFollowerListenerFD >= 0)
+	         {
+	            ::close(staleFollowerListenerFD);
+	         }
+	         if (followerSocketPath.size() > 0)
+	         {
+	            ::unlink(followerSocketPath.c_str());
+	         }
+	         if (followerSocketDirectory != nullptr)
+	         {
+	            ::rmdir(followerSocketDirectory);
+	         }
+	      }
 
       for (int *fds : {mothershipTcpPair, mothershipUnixPair, mothershipStreamPair, neuronPair})
       {
@@ -2528,14 +3107,574 @@ int main(void)
       suite.expect(peer->isMasterBrain, "registration_update_self_waiting_follower_reboots_elects_designated_peer");
       suite.expect(brain.updateSelfState == TestBrain::UpdateSelfState::waitingForFollowerReboots, "registration_update_self_waiting_follower_reboots_keeps_state");
 
-      brain.brains.erase(peer);
-      delete peer;
-   }
+	      brain.brains.erase(peer);
+	      delete peer;
+	   }
 
-   {
-      TestBrain brain = {};
-      brain.iaas = new NoopBrainIaaS();
-      brain.nBrains = 2;
+	   {
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+
+	      BrainView *peer = makePeer(uint128_t(0x060), 21, IPAddress("10.0.0.13", false).v4);
+	      peer->connected = true;
+	      peer->isFixedFile = true;
+	      peer->fslot = 46;
+	      brain.brains.insert(peer);
+
+	      String buffer = {};
+	      Message *message = buildBrainMessage(buffer, BrainTopic::peerHeartbeat, false, uint64_t(7));
+	      brain.testBrainHandler(peer, message);
+
+	      Message *queued = (peer->wBuffer.size() > 0 ? reinterpret_cast<Message *>(peer->wBuffer.data()) : nullptr);
+	      uint8_t *queuedArgs = (queued ? queued->args : nullptr);
+	      bool echoedResponse = false;
+	      uint64_t echoedNonce = 0;
+	      bool parsedEchoedNonce = (
+	         queuedArgs
+	         && Message::extractArg<ArgumentNature::fixed>(queuedArgs, echoedResponse)
+	         && Message::extractArg<ArgumentNature::fixed>(queuedArgs, echoedNonce));
+	      suite.expect(peer->lastReceiveMs > 0, "peer_heartbeat_request_updates_last_receive");
+	      suite.expect(queued != nullptr && BrainTopic(queued->topic) == BrainTopic::peerHeartbeat, "peer_heartbeat_request_queues_response");
+	      suite.expect(parsedEchoedNonce && echoedResponse && echoedNonce == 7, "peer_heartbeat_request_preserves_nonce");
+
+	      brain.brains.erase(peer);
+	      delete peer;
+	   }
+
+	   {
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+
+	      BrainView *peer = makePeer(uint128_t(0x0601), 211, IPAddress("10.0.0.23", false).v4);
+	      peer->connected = true;
+	      peer->isFixedFile = true;
+	      peer->fslot = 461;
+	      peer->lastHeartbeatSentNonce = 11;
+	      brain.brains.insert(peer);
+
+	      String buffer = {};
+	      Message *message = buildBrainMessage(buffer, BrainTopic::peerHeartbeat, true, uint64_t(11));
+	      brain.testBrainHandler(peer, message);
+
+	      suite.expect(peer->lastHeartbeatAckNonce == 11, "peer_heartbeat_response_updates_ack_nonce");
+	      suite.expect(peer->lastHeartbeatAckMs > 0, "peer_heartbeat_response_updates_ack_time");
+
+	      brain.brains.erase(peer);
+	      delete peer;
+	   }
+
+	   {
+	      ScopedRing scopedRing = {};
+
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+	      brain.nBrains = 3;
+	      brain.weAreMaster = true;
+	      brain.noMasterYet = false;
+	      brain.brainPeerHeartbeatIntervalMs = 1000;
+	      brain.brainPeerHeartbeatTimeoutMs = 1;
+	      brain.localBrainPeerAddress = IPAddress("10.0.0.10", false);
+	      brain.localBrainPeerAddressText = "10.0.0.10"_ctv;
+
+	      BrainView *peerA = makePeer(uint128_t(0x0607), 217, IPAddress("10.0.0.11", false).v4, "10.0.0.11");
+	      peerA->connected = true;
+	      int peerAFD = -1;
+
+	      BrainView *peerB = makePeer(uint128_t(0x0608), 218, IPAddress("10.0.0.12", false).v4, "10.0.0.12");
+	      peerB->connected = true;
+	      int peerBFD = -1;
+
+	      bool installedA = installBrainPeerSocket(brain, *peerA, peerAFD);
+	      bool installedB = installBrainPeerSocket(brain, *peerB, peerBFD);
+	      suite.expect(installedA && installedB, "master_heartbeat_majority_loss_installs_peer_sockets");
+	      if (installedA && installedB)
+	      {
+	         brain.brains.insert(peerA);
+	         brain.brains.insert(peerB);
+	         peerA->noteTransportActivated();
+	         peerB->noteTransportActivated();
+	         peerA->lastHeartbeatAckMs = Time::now<TimeResolution::ms>() - 10;
+	         peerA->lastReceiveMs = peerA->lastHeartbeatAckMs;
+	         peerA->lastHeartbeatSendMs = peerA->lastHeartbeatAckMs;
+	         peerA->lastHeartbeatSentNonce = 2;
+	         peerA->lastHeartbeatAckNonce = 1;
+	         peerB->lastHeartbeatAckMs = Time::now<TimeResolution::ms>() - 10;
+	         peerB->lastReceiveMs = peerB->lastHeartbeatAckMs;
+	         peerB->lastHeartbeatSendMs = peerB->lastHeartbeatAckMs;
+	         peerB->lastHeartbeatSentNonce = 2;
+	         peerB->lastHeartbeatAckNonce = 1;
+
+	         brain.testRunBrainPeerHeartbeatTick();
+
+	         suite.expect(peerA->quarantined, "master_heartbeat_majority_loss_quarantines_first_stale_peer");
+	         suite.expect(peerB->quarantined, "master_heartbeat_majority_loss_quarantines_second_stale_peer");
+	         suite.expect(Ring::socketIsClosing(peerA), "master_heartbeat_majority_loss_closes_first_stale_peer");
+	         suite.expect(Ring::socketIsClosing(peerB), "master_heartbeat_majority_loss_closes_second_stale_peer");
+	         suite.expect(brain.weAreMaster == false, "master_heartbeat_majority_loss_forfeits_master");
+	         suite.expect(brain.noMasterYet, "master_heartbeat_majority_loss_returns_to_no_master");
+
+	         cleanupBrainPeerSocket(*peerA, peerAFD);
+	         cleanupBrainPeerSocket(*peerB, peerBFD);
+	      }
+	      else
+	      {
+	         if (installedA)
+	         {
+	            cleanupBrainPeerSocket(*peerA, peerAFD);
+	         }
+	         if (installedB)
+	         {
+	            cleanupBrainPeerSocket(*peerB, peerBFD);
+	         }
+	      }
+
+	      brain.brains.erase(peerA);
+	      brain.brains.erase(peerB);
+	      delete peerA;
+	      delete peerB;
+	   }
+
+	   {
+	      ScopedRing scopedRing = {};
+
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+	      brain.nBrains = 3;
+	      brain.noMasterYet = false;
+	      brain.brainPeerHeartbeatTimeoutMs = 1234;
+
+	      BrainView *peer = makePeer(uint128_t(0x0602), 212, IPAddress("10.0.0.24", false).v4);
+	      peer->connected = true;
+	      int peerFD = -1;
+	      bool installed = installBrainPeerSocket(brain, *peer, peerFD);
+	      suite.expect(installed, "master_liveness_registration_installs_socket");
+	      if (installed)
+	      {
+	         brain.brains.insert(peer);
+
+	         String buffer = {};
+	         Message *message = buildBrainMessage(
+	            buffer,
+	            BrainTopic::registration,
+	            peer->uuid,
+	            peer->boottimens,
+	            uint64_t(3),
+	            peer->uuid);
+	         brain.testBrainHandler(peer, message);
+
+	         TimeoutPacket *waiter = brain.testGetBrainLivenessWaiter(peer);
+	         suite.expect(waiter != nullptr, "master_liveness_registration_arms_waiter");
+	         suite.expect(waiter != nullptr && waiter->timeoutMs() == 1234, "master_liveness_registration_uses_heartbeat_timeout");
+
+	         cleanupBrainPeerSocket(*peer, peerFD);
+	         brain.testCancelBrainLivenessWaiter(peer, "unit-cleanup");
+	      }
+
+	      brain.brains.erase(peer);
+	      delete peer;
+	   }
+
+	   {
+	      ScopedRing scopedRing = {};
+
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+
+	      BrainView *peer = makePeer(uint128_t(0x0606), 216, IPAddress("10.0.0.28", false).v4);
+	      peer->connected = true;
+	      int peerFD = -1;
+	      bool installed = installBrainPeerSocket(brain, *peer, peerFD);
+	      suite.expect(installed, "brain_recv_partial_frame_liveness_installs_socket");
+	      if (installed)
+	      {
+	         brain.brains.insert(peer);
+	         peer->pendingRecv = true;
+	         peer->lastReceiveMs = Time::now<TimeResolution::ms>() - 1000;
+	         int64_t oldLastReceiveMs = peer->lastReceiveMs;
+
+	         String frame = {};
+	         Message::construct(frame, BrainTopic::peerHeartbeat, false, uint64_t(99));
+	         memcpy(peer->rBuffer.pTail(), frame.data(), sizeof(uint32_t));
+	         peer->connected = false;
+
+	         brain.testRecvHandler(peer, int(sizeof(uint32_t)));
+
+	         suite.expect(peer->lastReceiveMs > oldLastReceiveMs, "brain_recv_partial_frame_liveness_updates_last_receive_without_complete_message");
+	         suite.expect(peer->rBuffer.outstandingBytes() == sizeof(uint32_t), "brain_recv_partial_frame_liveness_preserves_partial_frame");
+	         suite.expect(peer->pendingRecv == false, "brain_recv_partial_frame_liveness_does_not_leave_pending_recv");
+	         suite.expect(Ring::socketIsClosing(peer) == false, "brain_recv_partial_frame_liveness_keeps_peer_open");
+
+	         cleanupBrainPeerSocket(*peer, peerFD);
+	      }
+
+	      brain.brains.erase(peer);
+	      delete peer;
+	   }
+
+	   {
+	      ScopedRing scopedRing = {};
+
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+	      brain.nBrains = 3;
+	      brain.noMasterYet = false;
+	      brain.brainPeerHeartbeatTimeoutMs = 2000;
+
+	      BrainView *peer = makePeer(uint128_t(0x0603), 213, IPAddress("10.0.0.25", false).v4);
+	      peer->existingMasterUUID = peer->uuid;
+	      peer->connected = true;
+	      peer->lastHeartbeatSentNonce = 71;
+	      int peerFD = -1;
+	      bool installed = installBrainPeerSocket(brain, *peer, peerFD);
+	      suite.expect(installed, "master_liveness_message_refresh_installs_socket");
+	      if (installed)
+	      {
+	         brain.brains.insert(peer);
+	         brain.testRefreshMasterPeerLivenessWaiter(peer, "first");
+	         TimeoutPacket *firstWaiter = brain.testGetBrainLivenessWaiter(peer);
+
+	         String requestBuffer = {};
+	         Message *request = buildBrainMessage(requestBuffer, BrainTopic::peerHeartbeat, false, uint64_t(70));
+	         brain.testBrainHandler(peer, request);
+	         suite.expect(brain.testGetBrainLivenessWaiter(peer) == firstWaiter, "master_liveness_message_refresh_ignores_heartbeat_request");
+
+	         String buffer = {};
+	         Message *message = buildBrainMessage(buffer, BrainTopic::peerHeartbeat, true, uint64_t(71));
+	         brain.testBrainHandler(peer, message);
+
+	         TimeoutPacket *refreshedWaiter = brain.testGetBrainLivenessWaiter(peer);
+	         suite.expect(firstWaiter != nullptr, "master_liveness_message_refresh_fixture_arms_waiter");
+	         suite.expect(refreshedWaiter != nullptr, "master_liveness_message_refresh_keeps_waiter");
+	         suite.expect(refreshedWaiter != firstWaiter, "master_liveness_message_refresh_replaces_waiter");
+	         suite.expect(firstWaiter != nullptr && firstWaiter->flags == uint64_t(BrainTimeoutFlags::canceled), "master_liveness_message_refresh_cancels_old_waiter");
+
+	         cleanupBrainPeerSocket(*peer, peerFD);
+	         brain.testCancelBrainLivenessWaiter(peer, "unit-cleanup");
+	      }
+
+	      brain.brains.erase(peer);
+	      delete peer;
+	   }
+
+	   {
+	      ScopedRing scopedRing = {};
+
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+	      brain.nBrains = 3;
+	      brain.noMasterYet = false;
+	      brain.brainPeerHeartbeatTimeoutMs = 2000;
+
+	      BrainView *peer = makePeer(uint128_t(0x0604), 214, IPAddress("10.0.0.26", false).v4);
+	      peer->existingMasterUUID = peer->uuid;
+	      peer->connected = true;
+	      int peerFD = -1;
+	      bool installed = installBrainPeerSocket(brain, *peer, peerFD);
+	      suite.expect(installed, "master_liveness_timeout_installs_socket");
+	      if (installed)
+	      {
+	         brain.brains.insert(peer);
+	         peer->noteTransportActivated();
+	         brain.testRefreshMasterPeerLivenessWaiter(peer, "timeout-fixture");
+	         TimeoutPacket *waiter = brain.testGetBrainLivenessWaiter(peer);
+	         suite.expect(waiter != nullptr, "master_liveness_timeout_fixture_arms_waiter");
+	         if (waiter != nullptr)
+	         {
+	            brain.testDispatchTimeout(waiter);
+	         }
+
+	         suite.expect(brain.testHasBrainLivenessWaiter(peer) == false, "master_liveness_timeout_clears_waiter");
+	         suite.expect(peer->confirmedMissingTransportEpoch == peer->transportEpoch, "master_liveness_timeout_marks_confirmed_missing_epoch");
+	         suite.expect(peer->queuedCloseTransportEpoch == peer->transportEpoch, "master_liveness_timeout_queues_close_for_current_master");
+	         suite.expect(Ring::socketIsClosing(peer), "master_liveness_timeout_marks_current_master_closing");
+
+	         cleanupBrainPeerSocket(*peer, peerFD);
+	      }
+
+	      brain.brains.erase(peer);
+	      delete peer;
+	   }
+
+	   {
+	      ScopedRing scopedRing = {};
+
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+	      brain.nBrains = 3;
+	      brain.noMasterYet = false;
+	      brain.brainPeerHeartbeatTimeoutMs = 2000;
+
+	      BrainView *peer = makePeer(uint128_t(0x0605), 215, IPAddress("10.0.0.27", false).v4);
+	      peer->connected = true;
+	      int peerFD = -1;
+	      bool installed = installBrainPeerSocket(brain, *peer, peerFD);
+	      suite.expect(installed, "master_liveness_non_master_timeout_installs_socket");
+	      if (installed)
+	      {
+	         brain.brains.insert(peer);
+	         peer->noteTransportActivated();
+
+	         TimeoutPacket *waiter = brain.testInsertBrainLivenessWaiter(peer);
+	         brain.testDispatchTimeout(waiter);
+
+	         suite.expect(brain.testHasBrainLivenessWaiter(peer) == false, "master_liveness_non_master_timeout_clears_waiter");
+	         suite.expect(peer->confirmedMissingTransportEpoch == 0, "master_liveness_non_master_timeout_keeps_confirmed_missing_clear");
+	         suite.expect(Ring::socketIsClosing(peer) == false, "master_liveness_non_master_timeout_keeps_peer_open");
+
+	         cleanupBrainPeerSocket(*peer, peerFD);
+	      }
+
+	      brain.brains.erase(peer);
+	      delete peer;
+	   }
+
+	   {
+	      ScopedRing scopedRing = {};
+
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+	      brain.brainPeerHeartbeatIntervalMs = 1;
+	      brain.brainPeerHeartbeatTimeoutMs = 1000;
+
+	      BrainView *peer = makePeer(uint128_t(0x061), 22, IPAddress("10.0.0.14", false).v4);
+	      peer->connected = true;
+	      int peerFD = -1;
+	      bool installed = installBrainPeerSocket(brain, *peer, peerFD);
+	      suite.expect(installed, "brain_peer_heartbeat_tick_installs_socket");
+	      if (installed)
+	      {
+	         peer->lastReceiveMs = Time::now<TimeResolution::ms>();
+	         brain.brains.insert(peer);
+
+	         brain.runBrainPeerHeartbeatTick();
+
+	         Message *queued = (peer->wBuffer.size() > 0 ? reinterpret_cast<Message *>(peer->wBuffer.data()) : nullptr);
+	         uint8_t *queuedArgs = (queued ? queued->args : nullptr);
+	         bool queuedResponse = true;
+	         uint64_t queuedNonce = 0;
+	         bool parsedQueuedNonce = (
+	            queuedArgs
+	            && Message::extractArg<ArgumentNature::fixed>(queuedArgs, queuedResponse)
+	            && Message::extractArg<ArgumentNature::fixed>(queuedArgs, queuedNonce));
+	         suite.expect(peer->lastHeartbeatSendMs > 0, "brain_peer_heartbeat_tick_records_send_time");
+	         suite.expect(peer->lastHeartbeatSentNonce == 1, "brain_peer_heartbeat_tick_records_sent_nonce");
+	         suite.expect(queued != nullptr && BrainTopic(queued->topic) == BrainTopic::peerHeartbeat, "brain_peer_heartbeat_tick_queues_ping");
+	         suite.expect(queued != nullptr && queued->isEcho() == false, "brain_peer_heartbeat_tick_queues_request_payload");
+	         suite.expect(parsedQueuedNonce && queuedResponse == false && queuedNonce == 1, "brain_peer_heartbeat_tick_queues_nonce");
+
+	         cleanupBrainPeerSocket(*peer, peerFD);
+	      }
+
+	      brain.brains.erase(peer);
+	      delete peer;
+	   }
+
+	   {
+	      ScopedRing scopedRing = {};
+
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+	      brain.weAreMaster = true;
+	      brain.noMasterYet = false;
+	      brain.boottimens = 10;
+	      brain.version = 77;
+	      brain.localBrainPeerAddress = IPAddress("10.0.0.20", false);
+	      brain.localBrainPeerAddressText = "10.0.0.20"_ctv;
+	      brain.brainPeerHeartbeatIntervalMs = 1;
+	      brain.brainPeerHeartbeatTimeoutMs = 1000;
+
+	      BrainView *peer = makePeer(uint128_t(0x0612), 222, IPAddress("10.0.0.18", false).v4, "10.0.0.18");
+	      peer->connected = false;
+	      peer->isFixedFile = false;
+	      peer->fd = -1;
+	      brain.brains.insert(peer);
+
+	      brain.runBrainPeerHeartbeatTick();
+
+	      suite.expect(peer->reconnectAfterClose, "brain_peer_heartbeat_tick_master_arms_force_reconnect_until_ack_when_peer_inactive_arms_reconnect");
+	      suite.expect(peer->connectAttemptPending(), "brain_peer_heartbeat_tick_master_arms_force_reconnect_until_ack_when_peer_inactive_submits_connect_attempt");
+
+	      if (peer->isFixedFile)
+	      {
+	         Ring::uninstallFromFixedFileSlot(peer);
+	      }
+	      else if (peer->fd >= 0)
+	      {
+	         ::close(peer->fd);
+	      }
+	      peer->fd = -1;
+	      peer->isFixedFile = false;
+
+	      brain.brains.erase(peer);
+	      delete peer;
+	   }
+
+	   {
+	      ScopedRing scopedRing = {};
+
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+	      brain.weAreMaster = true;
+	      brain.noMasterYet = false;
+	      brain.boottimens = 10;
+	      brain.version = 77;
+	      brain.brainPeerHeartbeatIntervalMs = 1;
+	      brain.brainPeerHeartbeatTimeoutMs = 1000;
+
+	      BrainView *peer = makePeer(uint128_t(0x0611), 221, IPAddress("10.0.0.18", false).v4);
+	      peer->connected = true;
+	      int peerFD = -1;
+	      bool installed = installBrainPeerSocket(brain, *peer, peerFD);
+	      suite.expect(installed, "brain_peer_heartbeat_tick_master_installs_socket");
+	      if (installed)
+	      {
+	         peer->lastReceiveMs = Time::now<TimeResolution::ms>();
+	         brain.brains.insert(peer);
+
+	         brain.runBrainPeerHeartbeatTick();
+
+	         bool sawRegistration = false;
+	         bool sawHeartbeat = false;
+	         uint128_t registrationUUID = 0;
+	         uint128_t advertisedMasterUUID = 0;
+	         forEachMessageInBuffer(peer->wBuffer, [&] (Message *message) {
+	            if (BrainTopic(message->topic) == BrainTopic::registration)
+	            {
+	               uint8_t *args = message->args;
+	               int64_t echoedBoottimens = 0;
+	               uint64_t echoedVersion = 0;
+	               (void)Message::extractArg<ArgumentNature::fixed>(args, registrationUUID);
+	               (void)Message::extractArg<ArgumentNature::fixed>(args, echoedBoottimens);
+	               (void)Message::extractArg<ArgumentNature::fixed>(args, echoedVersion);
+	               (void)Message::extractArg<ArgumentNature::fixed>(args, advertisedMasterUUID);
+	               sawRegistration = true;
+	            }
+	            else if (BrainTopic(message->topic) == BrainTopic::peerHeartbeat)
+	            {
+	               sawHeartbeat = true;
+	            }
+	         });
+
+	         suite.expect(sawRegistration, "brain_peer_heartbeat_tick_master_advertises_registration_until_ack");
+	         suite.expect(registrationUUID == neuron.uuid, "brain_peer_heartbeat_tick_master_advertises_self_uuid");
+	         suite.expect(advertisedMasterUUID == neuron.uuid, "brain_peer_heartbeat_tick_master_advertises_self_master_uuid");
+	         suite.expect(peer->lastMasterRegistrationAdvertiseMs > 0, "brain_peer_heartbeat_tick_master_records_registration_advertise_time");
+	         suite.expect(sawHeartbeat, "brain_peer_heartbeat_tick_master_still_queues_heartbeat");
+
+	         cleanupBrainPeerSocket(*peer, peerFD);
+	      }
+
+	      brain.brains.erase(peer);
+	      delete peer;
+	   }
+
+	   {
+	      ScopedRing scopedRing = {};
+
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+	      brain.brainPeerHeartbeatIntervalMs = 1000;
+	      brain.brainPeerHeartbeatTimeoutMs = 1;
+
+	      BrainView *peer = makePeer(uint128_t(0x062), 23, IPAddress("10.0.0.15", false).v4);
+	      peer->connected = true;
+	      int peerFD = -1;
+	      bool installed = installBrainPeerSocket(brain, *peer, peerFD);
+	      suite.expect(installed, "brain_peer_heartbeat_tick_stale_peer_installs_socket");
+	      if (installed)
+	      {
+	         peer->noteTransportActivated();
+	         peer->lastHeartbeatAckMs = Time::now<TimeResolution::ms>() - 10;
+	         peer->lastReceiveMs = Time::now<TimeResolution::ms>() - 10;
+	         peer->lastHeartbeatSendMs = peer->lastHeartbeatAckMs;
+	         peer->lastHeartbeatSentNonce = 2;
+	         peer->lastHeartbeatAckNonce = 1;
+	         brain.brains.insert(peer);
+
+	         brain.runBrainPeerHeartbeatTick();
+
+	         suite.expect(peer->confirmedMissingTransportEpoch == peer->transportEpoch, "brain_peer_heartbeat_tick_marks_stale_peer_confirmed_missing_epoch");
+	         suite.expect(peer->queuedCloseTransportEpoch == peer->transportEpoch, "brain_peer_heartbeat_tick_queues_close_for_stale_peer");
+	         suite.expect(Ring::socketIsClosing(peer), "brain_peer_heartbeat_tick_marks_stale_peer_closing");
+
+	         cleanupBrainPeerSocket(*peer, peerFD);
+	      }
+
+	      brain.brains.erase(peer);
+	      delete peer;
+	   }
+
+	   {
+	      ScopedRing scopedRing = {};
+
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+	      brain.brainPeerHeartbeatIntervalMs = 1000;
+	      brain.brainPeerHeartbeatTimeoutMs = 1;
+
+	      BrainView *peer = makePeer(uint128_t(0x0621), 231, IPAddress("10.0.0.16", false).v4);
+	      peer->connected = true;
+	      int peerFD = -1;
+	      bool installed = installBrainPeerSocket(brain, *peer, peerFD);
+	      suite.expect(installed, "brain_peer_heartbeat_tick_last_receive_stale_peer_installs_socket");
+	      if (installed)
+	      {
+	         peer->noteTransportActivated();
+	         peer->lastHeartbeatAckMs = 0;
+	         peer->lastReceiveMs = Time::now<TimeResolution::ms>() - 10;
+	         brain.brains.insert(peer);
+
+	         brain.runBrainPeerHeartbeatTick();
+
+	         suite.expect(peer->confirmedMissingTransportEpoch == 0, "brain_peer_heartbeat_tick_probes_stale_peer_without_outstanding_heartbeat");
+	         suite.expect(peer->queuedCloseTransportEpoch == 0, "brain_peer_heartbeat_tick_does_not_close_before_probe_ack_deadline");
+	         suite.expect(Ring::socketIsClosing(peer) == false, "brain_peer_heartbeat_tick_keeps_unprobed_stale_peer_open");
+	         suite.expect(peer->lastHeartbeatSentNonce == 1, "brain_peer_heartbeat_tick_sends_first_probe_to_unprobed_stale_peer");
+
+	         cleanupBrainPeerSocket(*peer, peerFD);
+	      }
+
+	      brain.brains.erase(peer);
+	      delete peer;
+	   }
+
+	   {
+	      ScopedRing scopedRing = {};
+
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+	      brain.brainPeerHeartbeatIntervalMs = 1000;
+	      brain.brainPeerHeartbeatTimeoutMs = 1;
+
+	      BrainView *peer = makePeer(uint128_t(0x0622), 232, IPAddress("10.0.0.17", false).v4);
+	      peer->connected = true;
+	      int peerFD = -1;
+	      bool installed = installBrainPeerSocket(brain, *peer, peerFD);
+	      suite.expect(installed, "brain_peer_heartbeat_tick_recent_receive_peer_installs_socket");
+	      if (installed)
+	      {
+	         peer->noteTransportActivated();
+	         peer->lastHeartbeatAckMs = Time::now<TimeResolution::ms>() - 10;
+	         peer->lastReceiveMs = Time::now<TimeResolution::ms>();
+	         brain.brains.insert(peer);
+
+	         brain.runBrainPeerHeartbeatTick();
+
+	         suite.expect(peer->confirmedMissingTransportEpoch == 0, "brain_peer_heartbeat_tick_recent_receive_without_ack_keeps_confirmed_missing_clear");
+	         suite.expect(peer->queuedCloseTransportEpoch == 0, "brain_peer_heartbeat_tick_recent_receive_without_ack_does_not_queue_close");
+	         suite.expect(Ring::socketIsClosing(peer) == false, "brain_peer_heartbeat_tick_recent_receive_without_ack_keeps_peer_open");
+
+	         cleanupBrainPeerSocket(*peer, peerFD);
+	      }
+
+	      brain.brains.erase(peer);
+	      delete peer;
+	   }
+
+	   {
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+	      brain.nBrains = 2;
       brain.boottimens = 10;
 
       BrainView *peer = makePeer(uint128_t(0), 0, IPAddress("10.0.0.12", false).v4);
@@ -2588,6 +3727,58 @@ int main(void)
       suite.expect(brain.weAreMaster, "registration_consistent_self_master_claim_keeps_self_master");
       suite.expect(brain.masterQuorumDegraded == false, "registration_consistent_self_master_claim_clears_quorum_degraded");
       suite.expect(brain.persistCalls == 1, "registration_consistent_self_master_claim_skips_extra_persist");
+
+      brain.brains.erase(peer);
+      delete peer;
+   });
+
+   withUniqueMothershipSocket("registration_self_master_claim_echo_socket_dir_created", [&] {
+      TestBrain brain = {};
+      brain.iaas = new NoopBrainIaaS();
+
+      brain.testSelfElectAsMaster("unit-test");
+
+      BrainView *peer = makePeer(uint128_t(0), 0, IPAddress("10.0.0.12", false).v4);
+      peer->connected = true;
+      peer->isFixedFile = true;
+      peer->fslot = 47;
+      brain.brains.insert(peer);
+
+      String buffer = {};
+      Message *message = buildBrainMessage(
+         buffer,
+         BrainTopic::registration,
+         uint128_t(0x200),
+         int64_t(20),
+         uint64_t(0),
+         uint128_t(0));
+      brain.testBrainHandler(peer, message);
+
+      bool sawRegistration = false;
+      uint128_t echoedMasterUUID = 0;
+      forEachMessageInBuffer(peer->wBuffer, [&](Message *queued) {
+         if (BrainTopic(queued->topic) != BrainTopic::registration)
+         {
+            return;
+         }
+
+         uint8_t *args = queued->args;
+         uint128_t echoedUUID = 0;
+         int64_t echoedBoottimens = 0;
+         uint64_t echoedVersion = 0;
+         uint128_t queuedExistingMasterUUID = 0;
+         if (Message::extractArg<ArgumentNature::fixed>(args, echoedUUID)
+            && Message::extractArg<ArgumentNature::fixed>(args, echoedBoottimens)
+            && Message::extractArg<ArgumentNature::fixed>(args, echoedVersion)
+            && Message::extractArg<ArgumentNature::fixed>(args, queuedExistingMasterUUID))
+         {
+            sawRegistration = true;
+            echoedMasterUUID = queuedExistingMasterUUID;
+         }
+      });
+
+      suite.expect(sawRegistration, "registration_self_master_claim_echoes_registration");
+      suite.expect(echoedMasterUUID == neuron.uuid, "registration_self_master_claim_echoes_self_master_uuid");
 
       brain.brains.erase(peer);
       delete peer;
@@ -2776,14 +3967,44 @@ int main(void)
 
       suite.expect(peer->isMasterBrain, "registration_existing_master_claim_elects_peer");
 
-      brain.brains.erase(peer);
-      delete peer;
-   }
+	      brain.brains.erase(peer);
+	      delete peer;
+	   }
 
-   {
-      TestBrain brain = {};
-      brain.iaas = new NoopBrainIaaS();
-      brain.updateSelfState = TestBrain::UpdateSelfState::waitingForRelinquishEchos;
+	   {
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+	      brain.pendingDesignatedMasterPeerKey = uint128_t(IPAddress("10.0.0.12", false).v4);
+
+	      BrainView *peer = makePeer(uint128_t(0), 0, IPAddress("10.0.0.12", false).v4);
+	      peer->connected = true;
+	      peer->isFixedFile = true;
+	      peer->fslot = 44;
+	      brain.brains.insert(peer);
+
+	      String buffer = {};
+	      Message *message = buildBrainMessage(
+	         buffer,
+	         BrainTopic::registration,
+	         uint128_t(0x200),
+	         int64_t(20),
+	         uint64_t(8),
+	         neuron.uuid);
+	      brain.testBrainHandler(peer, message);
+
+	      suite.expect(peer->isMasterBrain, "registration_pending_designated_master_ignores_stale_self_claim");
+	      suite.expect(brain.weAreMaster == false, "registration_pending_designated_master_stale_self_claim_does_not_self_elect");
+	      suite.expect(brain.noMasterYet == false, "registration_pending_designated_master_stale_self_claim_clears_no_master");
+	      suite.expect(brain.pendingDesignatedMasterPeerKey == 0, "registration_pending_designated_master_stale_self_claim_clears_pending");
+
+	      brain.brains.erase(peer);
+	      delete peer;
+	   }
+
+	   {
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+	      brain.updateSelfState = TestBrain::UpdateSelfState::waitingForRelinquishEchos;
       brain.pendingDesignatedMasterPeerKey = uint128_t(IPAddress("10.0.0.12", false).v4);
 
       BrainView *peer = makePeer(uint128_t(0), 0, IPAddress("10.0.0.12", false).v4);
@@ -2870,7 +4091,14 @@ int main(void)
          uint128_t(0));
       brain.testBrainHandler(peer, message);
 
-      suite.expect(peer->wBuffer.size() > 0 && BrainTopic(reinterpret_cast<Message *>(peer->wBuffer.data())->topic) == BrainTopic::updateBundle, "registration_master_late_join_queues_bundle_update");
+      bool sawUpdateBundle = false;
+      forEachMessageInBuffer(peer->wBuffer, [&] (Message *queued) {
+         if (BrainTopic(queued->topic) == BrainTopic::updateBundle)
+         {
+            sawUpdateBundle = true;
+         }
+      });
+      suite.expect(sawUpdateBundle, "registration_master_late_join_queues_bundle_update");
 
       brain.brains.erase(peer);
       delete peer;
@@ -3048,6 +4276,35 @@ int main(void)
       delete peer;
    });
 
+   withUniqueMothershipSocket("derive_master_brain_rebooted_failover_majority_socket_dir_created", [&] {
+      TestBrain brain = {};
+      brain.iaas = new NoopBrainIaaS();
+      brain.nBrains = 3;
+      brain.boottimens = 10;
+      brain.localBrainPeerAddress = IPAddress("10.0.0.10", false);
+      brain.localBrainPeerAddressText = "10.0.0.10"_ctv;
+
+      ProdigyPersistentMasterAuthorityPackage package = {};
+      package.runtimeState.hasCompletedInitialMasterElection = true;
+      brain.applyPersistentMasterAuthorityPackage(package);
+
+      BrainView *peer = makePeer(uint128_t(0x200), 20, IPAddress("10.0.0.12", false).v4, "10.0.0.12");
+      peer->connected = true;
+      peer->isFixedFile = true;
+      peer->fslot = 42;
+      brain.brains.insert(peer);
+
+      brain.testDeriveMasterBrain();
+
+      suite.expect(brain.hasCompletedInitialMasterElection, "derive_master_brain_rebooted_failover_restores_completed_initial_election");
+      suite.expect(brain.weAreMaster, "derive_master_brain_rebooted_failover_self_elects_with_majority");
+      suite.expect(brain.noMasterYet == false, "derive_master_brain_rebooted_failover_clears_no_master");
+      suite.expect(brain.persistCalls == 1, "derive_master_brain_rebooted_failover_persists_self_election");
+
+      brain.brains.erase(peer);
+      delete peer;
+   });
+
    withUniqueMothershipSocket("derive_master_brain_single_brain_socket_dir_created", [&] {
       TestBrain brain = {};
       brain.iaas = new NoopBrainIaaS();
@@ -3145,8 +4402,10 @@ int main(void)
 
       suite.expect(brain.weAreMaster, "self_elect_as_master_rearms_connector_peers_sets_master");
       suite.expect(activeConnectorPeer->fslot == 52, "self_elect_as_master_rearms_connector_peers_keeps_active_peer_socket");
+      suite.expect(Ring::socketIsClosing(activeConnectorPeer) == false, "self_elect_as_master_rearms_connector_peers_keeps_active_peer_open");
       suite.expect(activeConnectorPeer->reconnectAfterClose == false, "self_elect_as_master_rearms_connector_peers_skips_active_peer_rearm");
       suite.expect(activeConnectorPeer->nConnectionAttempts == 3, "self_elect_as_master_rearms_connector_peers_preserves_active_peer_attempts");
+      suite.expect(activeConnectorPeer->pendingSend || activeConnectorPeer->wBuffer.outstandingBytes() > 0, "self_elect_as_master_rearms_connector_peers_pushes_master_registration_over_active_peer");
       suite.expect(inactiveConnectorPeer->reconnectAfterClose, "self_elect_as_master_rearms_connector_peers_rearms_inactive_peer");
       suite.expect(inactiveConnectorPeer->nConnectionAttempts == 0, "self_elect_as_master_rearms_connector_peers_resets_inactive_peer_attempts");
       suite.expect(inactiveConnectorPeer->nAttemptsBudget == 9, "self_elect_as_master_rearms_connector_peers_preserves_inactive_peer_budget");
@@ -3162,6 +4421,33 @@ int main(void)
       }
       delete activeConnectorPeer;
       delete inactiveConnectorPeer;
+   });
+
+   withUniqueMothershipSocket("self_elect_as_master_preserves_active_accepted_peer_socket_dir_created", [&] {
+      TestBrain brain = {};
+      brain.iaas = new NoopBrainIaaS();
+      brain.boottimens = 10;
+
+      BrainView *acceptedPeer = makePeer(uint128_t(0x230), 22, IPAddress("10.0.0.13", false).v4);
+      acceptedPeer->weConnectToIt = false;
+      acceptedPeer->connected = true;
+      acceptedPeer->currentStreamAccepted = true;
+      acceptedPeer->isFixedFile = true;
+      acceptedPeer->fslot = 61;
+      acceptedPeer->reconnectAfterClose = false;
+      brain.brains.insert(acceptedPeer);
+
+      brain.testSelfElectAsMaster("unit-test");
+
+      suite.expect(brain.weAreMaster, "self_elect_as_master_preserves_active_accepted_peer_sets_master");
+      suite.expect(acceptedPeer->currentStreamAccepted, "self_elect_as_master_preserves_active_accepted_peer_keeps_accepted_flag");
+      suite.expect(Ring::socketIsClosing(acceptedPeer) == false, "self_elect_as_master_preserves_active_accepted_peer_keeps_socket_open");
+      suite.expect(acceptedPeer->reconnectAfterClose == false, "self_elect_as_master_preserves_active_accepted_peer_skips_forced_reconnect");
+      suite.expect(acceptedPeer->forceConnectorOwnershipUntilMasterAck == false, "self_elect_as_master_preserves_active_accepted_peer_skips_force_connector_flag");
+      suite.expect(acceptedPeer->pendingSend || acceptedPeer->wBuffer.outstandingBytes() > 0, "self_elect_as_master_preserves_active_accepted_peer_pushes_master_registration");
+
+      brain.brains.erase(acceptedPeer);
+      delete acceptedPeer;
    });
 
    withUniqueMothershipSocket("arm_mothership_unix_listener_preserves_live_existing_path", [&] {
@@ -3199,6 +4485,131 @@ int main(void)
          socklen_t addressLen = socklen_t(sizeof(address.sun_family) + std::strlen(address.sun_path));
          suite.expect(::connect(probeFD, reinterpret_cast<struct sockaddr *>(&address), addressLen) == 0,
             "arm_mothership_unix_listener_preserves_live_existing_path_connects_existing_listener");
+         ::close(probeFD);
+      }
+
+      ::close(existingListenerFD);
+      ::unlink(socketPath);
+   });
+
+   withUniqueMothershipSocket("unlink_mothership_unix_socket_path_requires_local_ownership", [&] {
+      TestBrain brain = {};
+      brain.iaas = new NoopBrainIaaS();
+
+      const char *socketPath = ::getenv("PRODIGY_MOTHERSHIP_SOCKET");
+      suite.expect(socketPath != nullptr, "unlink_mothership_unix_socket_path_requires_local_ownership_has_env");
+      if (socketPath == nullptr)
+      {
+         return;
+      }
+
+      int existingListenerFD = -1;
+      suite.expect(createUnixListener(String(socketPath), existingListenerFD),
+         "unlink_mothership_unix_socket_path_requires_local_ownership_creates_existing_listener");
+      if (existingListenerFD < 0)
+      {
+         return;
+      }
+
+      brain.mothershipUnixSocketPath.assign(socketPath);
+      suite.expect(brain.testMothershipUnixSocketPathOwnedByLocalListener() == false,
+         "unlink_mothership_unix_socket_path_requires_local_ownership_detects_unowned_path");
+
+      brain.testUnlinkMothershipUnixSocketPath("unit-test");
+      suite.expect(::access(socketPath, F_OK) == 0,
+         "unlink_mothership_unix_socket_path_requires_local_ownership_preserves_unowned_path");
+
+      int probeFD = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+      suite.expect(probeFD >= 0,
+         "unlink_mothership_unix_socket_path_requires_local_ownership_creates_probe_socket");
+      if (probeFD >= 0)
+      {
+         struct sockaddr_un address = {};
+         address.sun_family = AF_UNIX;
+         std::snprintf(address.sun_path, sizeof(address.sun_path), "%s", socketPath);
+         socklen_t addressLen = socklen_t(sizeof(address.sun_family) + std::strlen(address.sun_path));
+         suite.expect(::connect(probeFD, reinterpret_cast<struct sockaddr *>(&address), addressLen) == 0,
+            "unlink_mothership_unix_socket_path_requires_local_ownership_preserves_live_listener");
+         ::close(probeFD);
+      }
+
+      brain.testUnlinkMothershipUnixSocketPath("unit-test-force", false);
+      suite.expect(::access(socketPath, F_OK) != 0,
+         "unlink_mothership_unix_socket_path_requires_local_ownership_allows_forced_unlink");
+
+      ::close(existingListenerFD);
+      ::unlink(socketPath);
+   });
+
+   withUniqueMothershipSocket("unlink_mothership_unix_socket_path_unlinks_owned_listener", [&] {
+      TestBrain brain = {};
+      brain.iaas = new NoopBrainIaaS();
+
+      const char *socketPath = ::getenv("PRODIGY_MOTHERSHIP_SOCKET");
+      suite.expect(socketPath != nullptr, "unlink_mothership_unix_socket_path_unlinks_owned_listener_has_env");
+      if (socketPath == nullptr)
+      {
+         return;
+      }
+
+      suite.expect(brain.testArmMothershipUnixListener(),
+         "unlink_mothership_unix_socket_path_unlinks_owned_listener_arms_listener");
+      suite.expect(brain.testMothershipUnixSocketPathOwnedByLocalListener(),
+         "unlink_mothership_unix_socket_path_unlinks_owned_listener_detects_owned_path");
+
+      brain.testUnlinkMothershipUnixSocketPath("unit-test");
+      suite.expect(::access(socketPath, F_OK) != 0,
+         "unlink_mothership_unix_socket_path_unlinks_owned_listener_removes_path");
+
+      if (brain.mothershipUnixSocket.isFixedFile)
+      {
+         Ring::uninstallFromFixedFileSlot(&brain.mothershipUnixSocket);
+      }
+      if (brain.mothershipUnixSocket.fd >= 0)
+      {
+         ::close(brain.mothershipUnixSocket.fd);
+         brain.mothershipUnixSocket.fd = -1;
+      }
+      brain.mothershipUnixSocket.fslot = -1;
+      brain.mothershipUnixSocket.isFixedFile = false;
+   });
+
+   withUniqueMothershipSocket("self_elect_as_master_failover_replaces_live_listener_socket_dir_created", [&] {
+      TestBrain brain = {};
+      brain.iaas = new NoopBrainIaaS();
+
+      const char *socketPath = ::getenv("PRODIGY_MOTHERSHIP_SOCKET");
+      suite.expect(socketPath != nullptr, "self_elect_as_master_failover_replaces_live_listener_has_env");
+      if (socketPath == nullptr)
+      {
+         return;
+      }
+
+      int existingListenerFD = -1;
+      suite.expect(createUnixListener(String(socketPath), existingListenerFD),
+         "self_elect_as_master_failover_replaces_live_listener_creates_existing_listener");
+      if (existingListenerFD < 0)
+      {
+         return;
+      }
+
+      brain.testSelfElectAsMaster("unit-test-failover", true);
+
+      suite.expect(brain.weAreMaster, "self_elect_as_master_failover_replaces_live_listener_sets_master");
+      suite.expect(::access(socketPath, F_OK) == 0,
+         "self_elect_as_master_failover_replaces_live_listener_keeps_socket_path");
+
+      int probeFD = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+      suite.expect(probeFD >= 0,
+         "self_elect_as_master_failover_replaces_live_listener_creates_probe_socket");
+      if (probeFD >= 0)
+      {
+         struct sockaddr_un address = {};
+         address.sun_family = AF_UNIX;
+         std::snprintf(address.sun_path, sizeof(address.sun_path), "%s", socketPath);
+         socklen_t addressLen = socklen_t(sizeof(address.sun_family) + std::strlen(address.sun_path));
+         suite.expect(::connect(probeFD, reinterpret_cast<struct sockaddr *>(&address), addressLen) == 0,
+            "self_elect_as_master_failover_replaces_live_listener_connects_new_listener");
          ::close(probeFD);
       }
 
@@ -3473,13 +4884,113 @@ int main(void)
          delete deployment;
       }
 
-      brain.deployments.clear();
-      brain.deploymentsByApp.clear();
-   });
+	      brain.deployments.clear();
+	      brain.deploymentsByApp.clear();
+	   });
 
-   withUniqueMothershipSocket("self_elect_as_master_promotes_newer_pending_deployment_socket_dir_created", [&] {
-      TestBrain brain = {};
-      brain.iaas = new NoopBrainIaaS();
+	   withUniqueMothershipSocket("spin_application_queues_new_deployment_behind_unstarted_baseline_socket_dir_created", [&] {
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+
+	      DeploymentPlan baselinePlan = makeDeploymentPlan(61003, 1);
+	      DeploymentPlan nextPlan = makeDeploymentPlan(61003, 2);
+
+	      ApplicationDeployment *baseline = new ApplicationDeployment();
+	      baseline->plan = baselinePlan;
+	      baseline->state = DeploymentState::none;
+
+	      ApplicationDeployment *next = new ApplicationDeployment();
+	      next->plan = nextPlan;
+
+	      brain.deployments.insert_or_assign(baselinePlan.config.deploymentID(), baseline);
+	      brain.deploymentsByApp.insert_or_assign(baselinePlan.config.applicationID, baseline);
+
+	      brain.testSpinApplication(next);
+
+	      suite.expect(brain.deploymentsByApp[nextPlan.config.applicationID] == next, "spin_application_queues_new_deployment_head_points_to_next");
+	      suite.expect(brain.deployments.contains(baselinePlan.config.deploymentID()), "spin_application_queues_new_deployment_keeps_unstarted_baseline_indexed");
+	      suite.expect(brain.deployments.contains(nextPlan.config.deploymentID()), "spin_application_queues_new_deployment_indexes_next");
+	      suite.expect(baseline->next == next, "spin_application_queues_new_deployment_links_baseline_next");
+	      suite.expect(next->previous == baseline, "spin_application_queues_new_deployment_links_next_previous");
+	      suite.expect(next->state == DeploymentState::waitingToDeploy, "spin_application_queues_new_deployment_waits_for_baseline");
+	      suite.expect(baseline->state == DeploymentState::none, "spin_application_queues_new_deployment_does_not_start_or_delete_baseline");
+
+	      brain.deployments.clear();
+	      brain.deploymentsByApp.clear();
+	      delete next;
+	      delete baseline;
+	   });
+
+      {
+         ScopedRing scopedRing = {};
+
+         TestBrain brain = {};
+         brain.iaas = new NoopBrainIaaS();
+         brain.weAreMaster = true;
+         brain.ignited = true;
+
+         BrainBase *savedBrain = thisBrain;
+         thisBrain = &brain;
+
+         Rack rack = {};
+         rack.uuid = 61004;
+
+         Machine machine = {};
+         machine.uuid = uint128_t(0x61004);
+         machine.private4 = IPAddress("10.0.0.44", false).v4;
+         machine.rack = &rack;
+         machine.state = MachineState::neuronRebooting;
+         machine.lifetime = MachineLifetime::owned;
+         rack.machines.insert(&machine);
+         brain.racks.insert_or_assign(rack.uuid, &rack);
+         brain.machines.insert(&machine);
+
+         DeploymentPlan plan = makeDeploymentPlan(61004, 1);
+         ApplicationDeployment *deployment = new ApplicationDeployment();
+         deployment->plan = plan;
+         deployment->state = DeploymentState::canaries;
+         deployment->nSuspended = 1;
+         deployment->nTargetBase = 0;
+         deployment->nTargetCanary = 1;
+         deployment->nDeployedCanary = 1;
+         deployment->nHealthyCanary = 1;
+
+         ContainerView *canary = new ContainerView();
+         canary->uuid = uint128_t(0x6100401);
+         canary->deploymentID = plan.config.deploymentID();
+         canary->applicationID = plan.config.applicationID;
+         canary->machine = &machine;
+         canary->lifetime = ApplicationLifetime::canary;
+         canary->state = ContainerState::healthy;
+         deployment->containers.insert(canary);
+         brain.containers.insert_or_assign(canary->uuid, canary);
+         brain.deployments.insert_or_assign(plan.config.deploymentID(), deployment);
+         brain.deploymentsByApp.insert_or_assign(plan.config.applicationID, deployment);
+
+         brain.testHandleMachineStateChange(&machine, MachineState::healthy);
+
+         suite.expect(machine.state == MachineState::healthy, "machine_healthy_recovery_marks_machine_healthy");
+         suite.expect(deployment->state == DeploymentState::canaries, "machine_healthy_recovery_preserves_active_stateless_canaries_state");
+         suite.expect(deployment->toSchedule.empty(), "machine_healthy_recovery_does_not_schedule_active_canary_destruction");
+         suite.expect(deployment->containers.contains(canary), "machine_healthy_recovery_keeps_active_canary_container");
+         suite.expect(canary->state == ContainerState::healthy, "machine_healthy_recovery_keeps_active_canary_healthy");
+         suite.expect(deployment->nTargetCanary == 1 && deployment->nHealthyCanary == 1, "machine_healthy_recovery_preserves_active_canary_counts");
+
+         brain.deployments.erase(plan.config.deploymentID());
+         brain.deploymentsByApp.erase(plan.config.applicationID);
+         brain.containers.erase(canary->uuid);
+         deployment->containers.erase(canary);
+         brain.machines.erase(&machine);
+         brain.racks.erase(rack.uuid);
+         rack.machines.erase(&machine);
+         delete canary;
+         delete deployment;
+         thisBrain = savedBrain;
+      }
+
+	   withUniqueMothershipSocket("self_elect_as_master_promotes_newer_pending_deployment_socket_dir_created", [&] {
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
 
       DeploymentPlan olderPlan = makeDeploymentPlan(61001, 1);
       DeploymentPlan newerPlan = makeDeploymentPlan(61001, 2);
@@ -3602,6 +5113,63 @@ int main(void)
 
       brain.brains.erase(peer);
       delete peer;
+   });
+
+   withUniqueMothershipSocket("relinquish_status_designated_self_replaces_live_listener_socket_dir_created", [&] {
+      TestBrain brain = {};
+      brain.iaas = new NoopBrainIaaS();
+
+      const char *socketPath = ::getenv("PRODIGY_MOTHERSHIP_SOCKET");
+      suite.expect(socketPath != nullptr, "relinquish_status_designated_self_replaces_live_listener_has_env");
+      if (socketPath == nullptr)
+      {
+         return;
+      }
+
+      int existingListenerFD = -1;
+      suite.expect(createUnixListener(String(socketPath), existingListenerFD),
+         "relinquish_status_designated_self_replaces_live_listener_creates_existing_listener");
+      if (existingListenerFD < 0)
+      {
+         return;
+      }
+
+      BrainView *peer = makePeer(uint128_t(0x200), 20, IPAddress("10.0.0.12", false).v4);
+      peer->connected = true;
+      peer->isFixedFile = true;
+      peer->fslot = 43;
+      brain.brains.insert(peer);
+
+      String buffer = {};
+      Message *message = buildBrainMessage(
+         buffer,
+         BrainTopic::relinquishMasterStatus,
+         uint8_t(1),
+         uint128_t(neuron.private4.v4));
+      brain.testBrainHandler(peer, message);
+
+      suite.expect(brain.weAreMaster, "relinquish_status_designated_self_replaces_live_listener_elects_self");
+      suite.expect(brain.pendingDesignatedMasterPeerKey == 0,
+         "relinquish_status_designated_self_replaces_live_listener_clears_pending_key");
+      suite.expect(brain.persistCalls == 2, "relinquish_status_designated_self_replaces_live_listener_persists");
+
+      int probeFD = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+      suite.expect(probeFD >= 0, "relinquish_status_designated_self_replaces_live_listener_creates_probe_socket");
+      if (probeFD >= 0)
+      {
+         struct sockaddr_un address = {};
+         address.sun_family = AF_UNIX;
+         std::snprintf(address.sun_path, sizeof(address.sun_path), "%s", socketPath);
+         socklen_t addressLen = socklen_t(sizeof(address.sun_family) + std::strlen(address.sun_path));
+         suite.expect(::connect(probeFD, reinterpret_cast<struct sockaddr *>(&address), addressLen) == 0,
+            "relinquish_status_designated_self_replaces_live_listener_connects_new_listener");
+         ::close(probeFD);
+      }
+
+      brain.brains.erase(peer);
+      delete peer;
+      ::close(existingListenerFD);
+      ::unlink(socketPath);
    });
 
    {
@@ -3809,6 +5377,50 @@ int main(void)
       suite.expect(machine.neuron.attemptDeadlineMs == 0, "forfeit_master_status_resets_neuron_deadline");
    }
 
+   withUniqueMothershipSocket("forfeit_master_status_disarms_unix_listener_socket_dir_created", [&] {
+      TestBrain brain = {};
+      brain.iaas = new NoopBrainIaaS();
+      brain.weAreMaster = true;
+      brain.noMasterYet = false;
+
+      const char *socketPath = ::getenv("PRODIGY_MOTHERSHIP_SOCKET");
+      suite.expect(socketPath != nullptr, "forfeit_master_status_disarms_unix_listener_has_env");
+      if (socketPath == nullptr)
+      {
+         return;
+      }
+
+      suite.expect(brain.testArmMothershipUnixListener(),
+         "forfeit_master_status_disarms_unix_listener_arms_listener");
+      suite.expect(brain.testMothershipUnixListenerActive(),
+         "forfeit_master_status_disarms_unix_listener_starts_active");
+      suite.expect(::access(socketPath, F_OK) == 0,
+         "forfeit_master_status_disarms_unix_listener_creates_socket_path");
+
+      brain.forfeitMasterStatus();
+
+      suite.expect(brain.weAreMaster == false,
+         "forfeit_master_status_disarms_unix_listener_clears_master_flag");
+      suite.expect(brain.testMothershipUnixListenerActive() == false,
+         "forfeit_master_status_disarms_unix_listener_marks_listener_inactive");
+      suite.expect(::access(socketPath, F_OK) != 0,
+         "forfeit_master_status_disarms_unix_listener_unlinks_socket_path");
+
+      int probeFD = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+      suite.expect(probeFD >= 0,
+         "forfeit_master_status_disarms_unix_listener_creates_probe_socket");
+      if (probeFD >= 0)
+      {
+         struct sockaddr_un address = {};
+         address.sun_family = AF_UNIX;
+         std::snprintf(address.sun_path, sizeof(address.sun_path), "%s", socketPath);
+         socklen_t addressLen = socklen_t(sizeof(address.sun_family) + std::strlen(address.sun_path));
+         suite.expect(::connect(probeFD, reinterpret_cast<struct sockaddr *>(&address), addressLen) != 0,
+            "forfeit_master_status_disarms_unix_listener_rejects_new_clients");
+         ::close(probeFD);
+      }
+   });
+
    {
       TestBrain brain = {};
 
@@ -3895,12 +5507,12 @@ int main(void)
       TestBrain brain = {};
       brain.iaas = new NoopBrainIaaS();
 
-      BrainView peer = {};
-      peer.weConnectToIt = true;
-      peer.connected = false;
-      peer.isFixedFile = false;
-      peer.fslot = -1;
-      peer.fd = ::dup(STDERR_FILENO);
+	      BrainView peer = {};
+	      peer.weConnectToIt = true;
+	      peer.connected = false;
+	      peer.isFixedFile = false;
+	      peer.fslot = -1;
+	      peer.fd = ::dup(STDERR_FILENO);
       peer.connectTimeoutMs = 250;
       peer.nDefaultAttemptsBudget = 4;
       peer.nConnectionAttempts = 3;
@@ -3912,15 +5524,35 @@ int main(void)
 
       suite.expect(peer.connected == false, "arm_outbound_peer_reconnect_marks_peer_disconnected");
       suite.expect(peer.reconnectAfterClose, "arm_outbound_peer_reconnect_arms_reconnect");
-      suite.expect(peer.nConnectionAttempts == 0, "arm_outbound_peer_reconnect_resets_attempt_counter");
-      suite.expect(peer.attemptDeadlineMs == expectedDeadlineMs, "arm_outbound_peer_reconnect_preserves_attempt_deadline");
-      suite.expect(peer.nAttemptsBudget == expectedAttemptsBudget, "arm_outbound_peer_reconnect_preserves_attempt_budget");
-      suite.expect(peer.isFixedFile == false, "arm_outbound_peer_reconnect_does_not_install_invalid_socket_without_address");
-   }
+	      suite.expect(peer.nConnectionAttempts == 0, "arm_outbound_peer_reconnect_resets_attempt_counter");
+	      suite.expect(peer.attemptDeadlineMs == expectedDeadlineMs, "arm_outbound_peer_reconnect_preserves_attempt_deadline");
+	      suite.expect(peer.nAttemptsBudget == expectedAttemptsBudget, "arm_outbound_peer_reconnect_preserves_attempt_budget");
+	      suite.expect(peer.isFixedFile == false, "arm_outbound_peer_reconnect_does_not_install_invalid_socket_without_address");
+	   }
 
-   {
-      TestBrain brain = {};
-      brain.iaas = new NoopBrainIaaS();
+	   {
+	      ScopedRing scopedRing = {};
+
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+
+	      BrainView peer = {};
+	      peer.weConnectToIt = true;
+	      peer.currentStreamAccepted = true;
+	      peer.connected = false;
+	      peer.isFixedFile = false;
+	      peer.fslot = -1;
+	      peer.fd = -1;
+
+	      brain.testArmOutboundPeerReconnect(&peer);
+
+	      suite.expect(peer.currentStreamAccepted == false, "arm_outbound_peer_reconnect_claims_connector_generation");
+	      suite.expect(peer.isFixedFile == false, "arm_outbound_peer_reconnect_claims_connector_generation_without_address");
+	   }
+
+	   {
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
 
       BrainView peer = {};
       peer.private4 = IPAddress("10.0.0.24", false).v4;
@@ -3985,6 +5617,48 @@ int main(void)
       suite.expect(peer->nConnectionAttempts == 2, "brain_close_handler_connector_inert_duplicate_preserves_attempt_counter");
       suite.expect(peer->nAttemptsBudget == 9, "brain_close_handler_connector_inert_duplicate_preserves_attempt_budget");
       suite.expect(peer->attemptDeadlineMs == 12345, "brain_close_handler_connector_inert_duplicate_preserves_attempt_deadline");
+
+      brain.testEraseBrainWaiter(peer);
+      brain.brains.erase(peer);
+      delete peer;
+   }
+
+   {
+      ScopedRing scopedRing = {};
+
+      TestBrain brain = {};
+      brain.iaas = new NoopBrainIaaS();
+      brain.nBrains = 3;
+      brain.weAreMaster = false;
+      brain.noMasterYet = false;
+
+      BrainView *peer = makePeer(uint128_t(0x2202), 202, IPAddress("10.0.0.12", false).v4, "10.0.0.12");
+      peer->connected = true;
+      peer->weConnectToIt = true;
+      peer->reconnectAfterClose = false;
+      peer->connectTimeoutMs = 250;
+      peer->nDefaultAttemptsBudget = 4;
+      peer->existingMasterUUID = peer->uuid;
+      brain.brains.insert(peer);
+
+      int peerFD = -1;
+      bool installed = installBrainPeerSocket(brain, *peer, peerFD);
+      suite.expect(installed, "brain_close_handler_connector_master_claim_installs_socket");
+      if (installed)
+      {
+         peer->noteCloseQueuedForCurrentTransport();
+         Ring::queueClose(peer);
+         brain.testCloseHandler(peer);
+
+         TimeoutPacket *waiter = brain.testGetBrainWaiter(peer);
+         suite.expect(waiter != nullptr, "brain_close_handler_connector_master_claim_arms_missing_waiter");
+         suite.expect(peer->connected == false, "brain_close_handler_connector_master_claim_marks_peer_disconnected");
+         suite.expect(peer->registrationFresh == false, "brain_close_handler_connector_master_claim_clears_registration_freshness");
+         suite.expect(peer->reconnectAfterClose, "brain_close_handler_connector_master_claim_rearms_reconnect");
+         suite.expect(waiter != nullptr && waiter->timeoutMs() == int64_t(peer->nDefaultAttemptsBudget * peer->connectTimeoutMs + prodigyBrainPeerInboundMissingSlackMs), "brain_close_handler_connector_master_claim_waiter_uses_failover_window");
+
+         cleanupBrainPeerSocket(*peer, peerFD);
+      }
 
       brain.testEraseBrainWaiter(peer);
       brain.brains.erase(peer);
@@ -4090,11 +5764,58 @@ int main(void)
          suite.expect(peer->connected == false, "brain_close_handler_connector_marks_peer_disconnected");
          suite.expect(peer->registrationFresh == false, "brain_close_handler_connector_clears_registration_freshness");
          suite.expect(peer->reconnectAfterClose, "brain_close_handler_connector_rearms_reconnect");
-         suite.expect(peer->attemptDeadlineMs > 0, "brain_close_handler_connector_preserves_persistent_reconnect_deadline");
+         TimeoutPacket *reconnectWaiter = brain.testGetBrainReconnectWaiter(peer);
+         suite.expect(reconnectWaiter != nullptr, "brain_close_handler_connector_arms_reconnect_waiter");
+         suite.expect(peer->attemptDeadlineMs == 0, "brain_close_handler_connector_defers_persistent_reconnect_deadline_until_timer");
 
          cleanupBrainPeerSocket(*peer, peerFD);
+         brain.testEraseBrainReconnectWaiter(peer);
       }
 
+      brain.brains.erase(peer);
+      delete peer;
+   }
+
+   {
+      ScopedRing scopedRing = {};
+
+      TestBrain brain = {};
+      brain.iaas = new NoopBrainIaaS();
+      brain.nBrains = 3;
+
+      BrainView *peer = makePeer(uint128_t(0x2201), 201, IPAddress("10.0.0.11", false).v4, "10.0.0.11");
+      peer->connected = true;
+      peer->weConnectToIt = true;
+      peer->reconnectAfterClose = false;
+      peer->connectTimeoutMs = 250;
+      peer->nDefaultAttemptsBudget = 4;
+      peer->isMasterBrain = true;
+      brain.brains.insert(peer);
+
+      int peerFD = -1;
+      bool installed = installBrainPeerSocket(brain, *peer, peerFD);
+      suite.expect(installed, "brain_close_handler_connector_master_installs_socket");
+      if (installed)
+      {
+         peer->noteCloseQueuedForCurrentTransport();
+         Ring::queueClose(peer);
+         brain.testCloseHandler(peer);
+
+         TimeoutPacket *waiter = brain.testGetBrainWaiter(peer);
+         suite.expect(waiter != nullptr, "brain_close_handler_connector_master_arms_missing_waiter");
+         suite.expect(peer->connected == false, "brain_close_handler_connector_master_marks_peer_disconnected");
+         suite.expect(peer->registrationFresh == false, "brain_close_handler_connector_master_clears_registration_freshness");
+         suite.expect(peer->reconnectAfterClose, "brain_close_handler_connector_master_rearms_reconnect");
+         TimeoutPacket *reconnectWaiter = brain.testGetBrainReconnectWaiter(peer);
+         suite.expect(reconnectWaiter != nullptr, "brain_close_handler_connector_master_arms_reconnect_waiter");
+         suite.expect(peer->attemptDeadlineMs == 0, "brain_close_handler_connector_master_defers_persistent_reconnect_deadline_until_timer");
+         suite.expect(waiter != nullptr && waiter->timeoutMs() == int64_t(peer->nDefaultAttemptsBudget * peer->connectTimeoutMs + prodigyBrainPeerInboundMissingSlackMs), "brain_close_handler_connector_master_waiter_uses_failover_window");
+
+         cleanupBrainPeerSocket(*peer, peerFD);
+         brain.testEraseBrainReconnectWaiter(peer);
+      }
+
+      brain.testEraseBrainWaiter(peer);
       brain.brains.erase(peer);
       delete peer;
    }
@@ -4319,10 +6040,13 @@ int main(void)
          brain.testCloseHandler(peer);
 
          suite.expect(peer->connected == false, "brain_close_handler_connector_retry_addressful_marks_peer_disconnected");
-         suite.expect(peer->isFixedFile, "brain_close_handler_connector_retry_addressful_installs_peer_socket");
-         suite.expect(peer->fslot >= 0, "brain_close_handler_connector_retry_addressful_assigns_fixed_file_slot");
+         TimeoutPacket *reconnectWaiter = brain.testGetBrainReconnectWaiter(peer);
+         suite.expect(reconnectWaiter != nullptr, "brain_close_handler_connector_retry_addressful_arms_reconnect_waiter");
+         suite.expect(peer->isFixedFile == false, "brain_close_handler_connector_retry_addressful_defers_peer_socket_install");
+         suite.expect(peer->fslot < 0, "brain_close_handler_connector_retry_addressful_defers_fixed_file_slot");
 
          cleanupBrainPeerSocket(*peer, peerFD);
+         brain.testEraseBrainReconnectWaiter(peer);
       }
 
       brain.brains.erase(peer);
@@ -4353,9 +6077,12 @@ int main(void)
          brain.testCloseHandler(peer);
 
          suite.expect(peer->connected == false, "brain_close_handler_connector_zero_timeout_marks_peer_disconnected");
-         suite.expect(peer->nAttemptsBudget == peer->nDefaultAttemptsBudget, "brain_close_handler_connector_zero_timeout_uses_default_attempt_budget");
+         TimeoutPacket *reconnectWaiter = brain.testGetBrainReconnectWaiter(peer);
+         suite.expect(reconnectWaiter != nullptr, "brain_close_handler_connector_zero_timeout_arms_reconnect_waiter");
+         suite.expect(peer->nAttemptsBudget == 0, "brain_close_handler_connector_zero_timeout_defers_default_attempt_budget_until_timer");
 
          cleanupBrainPeerSocket(*peer, peerFD);
+         brain.testEraseBrainReconnectWaiter(peer);
       }
 
       brain.brains.erase(peer);
@@ -4386,11 +6113,14 @@ int main(void)
          brain.testCloseHandler(peer);
 
          suite.expect(peer->connected == false, "brain_close_handler_connector_persistent_addressful_marks_peer_disconnected");
-         suite.expect(peer->attemptDeadlineMs > 0, "brain_close_handler_connector_persistent_addressful_arms_reconnect_deadline");
-         suite.expect(peer->isFixedFile, "brain_close_handler_connector_persistent_addressful_installs_peer_socket");
-         suite.expect(peer->fslot >= 0, "brain_close_handler_connector_persistent_addressful_assigns_fixed_file_slot");
+         TimeoutPacket *reconnectWaiter = brain.testGetBrainReconnectWaiter(peer);
+         suite.expect(reconnectWaiter != nullptr, "brain_close_handler_connector_persistent_addressful_arms_reconnect_waiter");
+         suite.expect(peer->attemptDeadlineMs == 0, "brain_close_handler_connector_persistent_addressful_defers_reconnect_deadline_until_timer");
+         suite.expect(peer->isFixedFile == false, "brain_close_handler_connector_persistent_addressful_defers_peer_socket_install");
+         suite.expect(peer->fslot < 0, "brain_close_handler_connector_persistent_addressful_defers_fixed_file_slot");
 
          cleanupBrainPeerSocket(*peer, peerFD);
+         brain.testEraseBrainReconnectWaiter(peer);
       }
 
       brain.brains.erase(peer);
@@ -4419,13 +6149,17 @@ int main(void)
       if (installed)
       {
          suite.expect(Ring::socketIsClosing(&machine.neuron) == false, "brain_close_handler_master_neuron_cqe_cleared_closing_precondition");
-         brain.testCloseHandler(&machine.neuron);
+	         brain.testCloseHandler(&machine.neuron);
 
-         suite.expect(machine.neuron.connected == false, "brain_close_handler_master_neuron_cqe_cleared_closing_marks_disconnected");
-         suite.expect(machine.neuron.reconnectAfterClose, "brain_close_handler_master_neuron_cqe_cleared_closing_keeps_reconnect_armed");
+	         suite.expect(machine.neuron.connected == false, "brain_close_handler_master_neuron_cqe_cleared_closing_marks_disconnected");
+	         suite.expect(machine.neuron.reconnectAfterClose, "brain_close_handler_master_neuron_cqe_cleared_closing_keeps_reconnect_armed");
+	         TimeoutPacket *waiter = brain.testGetNeuronReconnectWaiter(&machine.neuron);
+	         suite.expect(waiter != nullptr, "brain_close_handler_master_neuron_cqe_cleared_closing_arms_reconnect_waiter");
+	         suite.expect(waiter != nullptr && waiter->timeoutMs() == machine.neuron.connectTimeoutMs, "brain_close_handler_master_neuron_cqe_cleared_closing_uses_connect_timeout_retry");
+	         brain.testEraseNeuronReconnectWaiter(&machine.neuron);
 
-         cleanupNeuronSocket(machine.neuron, peerFD);
-      }
+	         cleanupNeuronSocket(machine.neuron, peerFD);
+	      }
    }
 
    {
@@ -4450,13 +6184,19 @@ int main(void)
       if (installed)
       {
          Ring::queueClose(&machine.neuron);
-         brain.testCloseHandler(&machine.neuron);
+	         brain.testCloseHandler(&machine.neuron);
 
-         suite.expect(machine.neuron.connected == false, "brain_close_handler_master_neuron_marks_disconnected");
-         suite.expect(machine.neuron.reconnectAfterClose, "brain_close_handler_master_neuron_keeps_reconnect_armed");
+	         suite.expect(machine.neuron.connected == false, "brain_close_handler_master_neuron_marks_disconnected");
+	         suite.expect(machine.neuron.reconnectAfterClose, "brain_close_handler_master_neuron_keeps_reconnect_armed");
+	         TimeoutPacket *waiter = brain.testGetNeuronReconnectWaiter(&machine.neuron);
+	         suite.expect(waiter != nullptr, "brain_close_handler_master_neuron_arms_reconnect_waiter");
 
-         cleanupNeuronSocket(machine.neuron, peerFD);
-      }
+	         brain.testCloseHandler(&machine.neuron);
+	         suite.expect(brain.testGetNeuronReconnectWaiter(&machine.neuron) == waiter, "brain_close_handler_master_neuron_duplicate_close_preserves_reconnect_waiter");
+	         brain.testEraseNeuronReconnectWaiter(&machine.neuron);
+
+	         cleanupNeuronSocket(machine.neuron, peerFD);
+	      }
    }
 
    {
@@ -4484,11 +6224,23 @@ int main(void)
       if (installed)
       {
          Ring::queueClose(&machine.neuron);
-         brain.testCloseHandler(&machine.neuron);
+	         brain.testCloseHandler(&machine.neuron);
 
-         suite.expect(machine.neuron.connected == false, "brain_close_handler_master_neuron_addressful_marks_disconnected");
-         suite.expect(machine.neuron.isFixedFile, "brain_close_handler_master_neuron_addressful_installs_neuron_socket");
-         suite.expect(machine.neuron.fslot >= 0, "brain_close_handler_master_neuron_addressful_assigns_fixed_file_slot");
+	         suite.expect(machine.neuron.connected == false, "brain_close_handler_master_neuron_addressful_marks_disconnected");
+	         TimeoutPacket *waiter = brain.testGetNeuronReconnectWaiter(&machine.neuron);
+	         suite.expect(waiter != nullptr, "brain_close_handler_master_neuron_addressful_arms_reconnect_waiter");
+
+	         if (waiter != nullptr)
+	         {
+	            brain.testDispatchTimeout(waiter);
+	         }
+
+	         suite.expect(machine.neuron.isFixedFile == false, "brain_close_handler_master_neuron_addressful_waits_for_close_completion_before_socket_install");
+	         suite.expect(machine.neuron.fslot < 0, "brain_close_handler_master_neuron_addressful_keeps_fixed_file_slot_clear_while_close_in_flight");
+	         suite.expect(machine.neuron.pendingConnect == false, "brain_close_handler_master_neuron_addressful_defers_connect_while_close_in_flight");
+	         TimeoutPacket *deferredWaiter = brain.testGetNeuronReconnectWaiter(&machine.neuron);
+	         suite.expect(deferredWaiter != nullptr, "brain_close_handler_master_neuron_addressful_rearms_reconnect_waiter_while_close_in_flight");
+	         brain.testEraseNeuronReconnectWaiter(&machine.neuron);
 
          cleanupNeuronSocket(machine.neuron, peerFD);
       }
@@ -4533,17 +6285,25 @@ int main(void)
       suite.expect(installed, "brain_close_handler_master_neuron_reconnect_resets_transport_generation_installs_fixture");
       if (installed)
       {
-         brain.testCloseHandler(&machine.neuron);
+	         brain.testCloseHandler(&machine.neuron);
 
-         suite.expect(machine.neuron.pendingSend == false, "brain_close_handler_master_neuron_reconnect_resets_transport_generation_clears_pending_send");
-         suite.expect(machine.neuron.pendingRecv == false, "brain_close_handler_master_neuron_reconnect_resets_transport_generation_clears_pending_recv");
-         suite.expect(machine.neuron.pendingSendBytes == 0, "brain_close_handler_master_neuron_reconnect_resets_transport_generation_clears_pending_send_bytes");
-         suite.expect(machine.neuron.pendingConnect, "brain_close_handler_master_neuron_reconnect_resets_transport_generation_rearms_pending_connect");
-         suite.expect(machine.neuron.wBuffer.outstandingBytes() == 0, "brain_close_handler_master_neuron_reconnect_resets_transport_generation_clears_buffered_send_bytes");
-         suite.expect(machine.neuron.rBuffer.outstandingBytes() == 0, "brain_close_handler_master_neuron_reconnect_resets_transport_generation_clears_buffered_recv_bytes");
-         suite.expect(machine.neuron.tlsPeerVerified == false, "brain_close_handler_master_neuron_reconnect_resets_transport_generation_clears_tls_peer");
+	         suite.expect(machine.neuron.pendingSend == false, "brain_close_handler_master_neuron_reconnect_resets_transport_generation_clears_pending_send");
+	         suite.expect(machine.neuron.pendingRecv == false, "brain_close_handler_master_neuron_reconnect_resets_transport_generation_clears_pending_recv");
+	         suite.expect(machine.neuron.pendingSendBytes == 0, "brain_close_handler_master_neuron_reconnect_resets_transport_generation_clears_pending_send_bytes");
+	         suite.expect(machine.neuron.pendingConnect == false, "brain_close_handler_master_neuron_reconnect_resets_transport_generation_defers_connect_until_waiter");
+	         suite.expect(machine.neuron.wBuffer.outstandingBytes() == 0, "brain_close_handler_master_neuron_reconnect_resets_transport_generation_clears_buffered_send_bytes");
+	         suite.expect(machine.neuron.rBuffer.outstandingBytes() == 0, "brain_close_handler_master_neuron_reconnect_resets_transport_generation_clears_buffered_recv_bytes");
+	         suite.expect(machine.neuron.tlsPeerVerified == false, "brain_close_handler_master_neuron_reconnect_resets_transport_generation_clears_tls_peer");
+	         TimeoutPacket *waiter = brain.testGetNeuronReconnectWaiter(&machine.neuron);
+	         suite.expect(waiter != nullptr, "brain_close_handler_master_neuron_reconnect_resets_transport_generation_arms_reconnect_waiter");
 
-         brain.testConnectHandler(&machine.neuron, 0);
+	         if (waiter != nullptr)
+	         {
+	            brain.testDispatchTimeout(waiter);
+	         }
+	         suite.expect(machine.neuron.pendingConnect, "brain_close_handler_master_neuron_reconnect_resets_transport_generation_rearms_pending_connect_after_waiter");
+
+	         brain.testConnectHandler(&machine.neuron, 0);
 
          Vector<uint16_t> topics = {};
          suite.expect(countQueuedTopics(machine.neuron.wBuffer, topics), "brain_close_handler_master_neuron_reconnect_resets_transport_generation_parses_messages");
@@ -4584,12 +6344,13 @@ int main(void)
          brain.testCloseHandler(&machine.neuron);
 
          suite.expect(machine.neuron.connected == false, "brain_close_handler_follower_neuron_marks_disconnected");
-         suite.expect(machine.neuron.reconnectAfterClose == false, "brain_close_handler_follower_neuron_disarms_reconnect");
-         suite.expect(machine.neuron.nConnectionAttempts == 0, "brain_close_handler_follower_neuron_resets_attempts");
-         suite.expect(machine.neuron.nAttemptsBudget == 0, "brain_close_handler_follower_neuron_resets_budget");
+	         suite.expect(machine.neuron.reconnectAfterClose == false, "brain_close_handler_follower_neuron_disarms_reconnect");
+	         suite.expect(machine.neuron.nConnectionAttempts == 0, "brain_close_handler_follower_neuron_resets_attempts");
+	         suite.expect(machine.neuron.nAttemptsBudget == 0, "brain_close_handler_follower_neuron_resets_budget");
+	         suite.expect(brain.testHasNeuronReconnectWaiter(&machine.neuron) == false, "brain_close_handler_follower_neuron_does_not_arm_reconnect_waiter");
 
-         cleanupNeuronSocket(machine.neuron, peerFD);
-      }
+	         cleanupNeuronSocket(machine.neuron, peerFD);
+	      }
    }
 
    {
@@ -4634,16 +6395,48 @@ int main(void)
       suite.expect(brain.testMothershipUnixListenerActive(), "brain_close_handler_mothership_unix_listener_rearms_listener_when_master");
    });
 
-   {
-      TestBrain brain = {};
-      brain.iaas = new NoopBrainIaaS();
-      brain.mothershipUnixAcceptArmed = true;
-      brain.mothershipUnixSocketPath.assign("/tmp/prodigy-test-mothership.sock"_ctv);
+	   {
+	      TestBrain brain = {};
+	      brain.iaas = new NoopBrainIaaS();
+	      brain.mothershipUnixAcceptArmed = true;
 
-      brain.testCloseHandler(&brain.mothershipUnixSocket);
+	      char socketDirectoryTemplate[] = "/tmp/prodigy-brain-close-follower-XXXXXX";
+	      char *socketDirectory = ::mkdtemp(socketDirectoryTemplate);
+	      String socketPath = {};
+	      int listenerFD = -1;
+	      suite.expect(socketDirectory != nullptr, "brain_close_handler_mothership_unix_listener_follower_creates_socket_dir");
+	      if (socketDirectory != nullptr)
+	      {
+	         socketPath.assign(socketDirectory);
+	         socketPath.append("/mothership.sock"_ctv);
+	         suite.expect(createUnixListener(socketPath, listenerFD),
+	            "brain_close_handler_mothership_unix_listener_follower_creates_socket_path");
+	         suite.expect(::access(socketPath.c_str(), F_OK) == 0,
+	            "brain_close_handler_mothership_unix_listener_follower_socket_path_exists_before");
+	         brain.mothershipUnixSocketPath.assign(socketPath);
+	      }
 
-      suite.expect(brain.mothershipUnixAcceptArmed == false, "brain_close_handler_mothership_unix_listener_disarms_accept");
-   }
+	      brain.testCloseHandler(&brain.mothershipUnixSocket);
+
+	      suite.expect(brain.mothershipUnixAcceptArmed == false, "brain_close_handler_mothership_unix_listener_disarms_accept");
+		      if (socketPath.size() > 0)
+		      {
+		         suite.expect(::access(socketPath.c_str(), F_OK) == 0,
+		            "brain_close_handler_mothership_unix_listener_follower_preserves_unowned_socket_path");
+		      }
+	      if (listenerFD >= 0)
+	      {
+	         ::close(listenerFD);
+	      }
+	      if (socketPath.size() > 0)
+	      {
+	         ::unlink(socketPath.c_str());
+	      }
+	      if (socketDirectory != nullptr)
+	      {
+	         ::rmdir(socketDirectory);
+	      }
+	   }
 
    {
       TestBrain brain = {};
@@ -4997,6 +6790,49 @@ int main(void)
 
       TestBrain brain = {};
       brain.iaas = new NoopBrainIaaS();
+      brain.nBrains = 1;
+      brain.weAreMaster = true;
+      brain.localBrainPeerAddress = IPAddress("10.0.0.12", false);
+      brain.localBrainPeerAddressText = "10.0.0.12"_ctv;
+
+      BrainView *peer = makePeer(uint128_t(0x2203), 223, IPAddress("10.0.0.11", false).v4, "10.0.0.11");
+      peer->connected = true;
+      peer->currentStreamAccepted = true;
+      peer->registrationFresh = true;
+      peer->tlsPeerVerified = true;
+      brain.brains.insert(peer);
+
+      int peerFD = -1;
+      bool installed = installBrainPeerSocket(brain, *peer, peerFD);
+      suite.expect(installed, "brain_missing_master_inflight_close_preserves_force_connector_fixture_installs");
+      if (installed)
+      {
+         Ring::queueClose(peer);
+         brain.testBrainMissing(peer);
+
+         suite.expect(peer->quarantined, "brain_missing_master_inflight_close_does_not_stack_redial_quarantines_peer");
+         suite.expect(Ring::socketIsClosing(peer), "brain_missing_master_inflight_close_does_not_stack_redial_keeps_close_in_flight");
+         suite.expect(peer->connectAttemptPending() == false, "brain_missing_master_inflight_close_does_not_stack_redial_skips_duplicate_connect_attempt");
+         suite.expect(brain.weAreMaster, "brain_missing_master_inflight_close_does_not_stack_redial_retains_master_role");
+
+         brain.testCloseHandler(peer);
+         if (TimeoutPacket *waiter = brain.testGetBrainWaiter(peer); waiter != nullptr)
+         {
+            waiter->flags = uint64_t(BrainTimeoutFlags::canceled);
+            brain.testDispatchTimeout(waiter);
+         }
+      }
+
+      cleanupBrainPeerSocket(*peer, peerFD);
+      brain.brains.erase(peer);
+      delete peer;
+   }
+
+   {
+      ScopedRing scopedRing = {};
+
+      TestBrain brain = {};
+      brain.iaas = new NoopBrainIaaS();
       brain.nBrains = 3;
       brain.weAreMaster = false;
       brain.noMasterYet = false;
@@ -5030,6 +6866,50 @@ int main(void)
       suite.expect(brain.isMasterMissing, "brain_missing_master_peer_marks_master_missing");
       suite.expect(sawMasterMissingFrame, "brain_missing_master_peer_gossips_master_missing_to_other_peers");
       suite.expect(brain.weAreMaster == false, "brain_missing_master_peer_does_not_self_elect_immediately");
+
+      brain.brains.erase(masterPeer);
+      brain.brains.erase(followerPeer);
+      delete masterPeer;
+      delete followerPeer;
+   }
+
+   {
+      ScopedRing scopedRing = {};
+
+      TestBrain brain = {};
+      brain.iaas = new NoopBrainIaaS();
+      brain.nBrains = 3;
+      brain.weAreMaster = false;
+      brain.noMasterYet = false;
+      brain.localBrainPeerAddress = IPAddress("10.0.0.10", false);
+      brain.localBrainPeerAddressText = "10.0.0.10"_ctv;
+
+      BrainView *masterPeer = makePeer(uint128_t(0x221), 25, IPAddress("10.0.0.11", false).v4, "10.0.0.11");
+      masterPeer->connected = true;
+      masterPeer->isFixedFile = true;
+      masterPeer->fslot = 36;
+      masterPeer->existingMasterUUID = masterPeer->uuid;
+      brain.brains.insert(masterPeer);
+
+      BrainView *followerPeer = makePeer(uint128_t(0x331), 26, IPAddress("10.0.0.12", false).v4, "10.0.0.12");
+      followerPeer->connected = true;
+      followerPeer->isFixedFile = true;
+      followerPeer->fslot = 37;
+      brain.brains.insert(followerPeer);
+
+      brain.testBrainMissing(masterPeer);
+
+      bool sawMasterMissingFrame = false;
+      forEachMessageInBuffer(followerPeer->wBuffer, [&] (Message *frame) {
+         if (BrainTopic(frame->topic) == BrainTopic::masterMissing)
+         {
+            sawMasterMissingFrame = true;
+         }
+      });
+
+      suite.expect(masterPeer->quarantined, "brain_missing_master_claim_quarantines_missing_master");
+      suite.expect(brain.isMasterMissing, "brain_missing_master_claim_marks_master_missing");
+      suite.expect(sawMasterMissingFrame, "brain_missing_master_claim_gossips_master_missing_to_other_peers");
 
       brain.brains.erase(masterPeer);
       brain.brains.erase(followerPeer);

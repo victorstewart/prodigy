@@ -110,6 +110,9 @@ def test_frame_helpers(params: prodigy.ContainerParameters) -> None:
       prodigy.MetricPair(3, 4),
    ]
    assert prodigy.build_ready_frame() == fixture_bytes("frame.healthy.empty.bin")
+   runtime_ready = prodigy.parse_message_frame(prodigy.build_runtime_ready_frame())
+   assert runtime_ready.topic == prodigy.ContainerTopic.RUNTIME_READY
+   assert runtime_ready.payload == b""
    assert prodigy.build_statistics_frame([prodigy.MetricPair(1, 2), prodigy.MetricPair(3, 4)]) == fixture_bytes("frame.statistics.demo.bin")
    assert prodigy.build_resource_delta_ack_frame(True) == fixture_bytes("frame.resource_delta_ack.accepted.bin")
    assert prodigy.build_credentials_refresh_ack_frame() == fixture_bytes("frame.credentials_refresh_ack.empty.bin")
@@ -121,15 +124,26 @@ def test_frame_helpers(params: prodigy.ContainerParameters) -> None:
    assert len(decoded) == 1
 
    class Dispatch(prodigy.NeuronHubDispatch):
+      def __init__(self) -> None:
+         self.wormholes_payloads: list[bytes] = []
+
       def begin_shutdown(self, hub: prodigy.NeuronHub) -> None:
          del hub
 
+      def wormholes_refresh(self, hub: prodigy.NeuronHub, payload: bytes) -> None:
+         del hub
+         self.wormholes_payloads.append(bytes(payload))
+
+   dispatch = Dispatch()
    borrowed_fd = os.open(os.devnull, os.O_RDONLY)
-   hub = prodigy.NeuronHub.borrowed_transport(Dispatch(), params, fd=borrowed_fd)
+   hub = prodigy.NeuronHub.borrowed_transport(dispatch, params, fd=borrowed_fd)
    hub.close()
    os.fstat(borrowed_fd)
    outbound = hub.handle_frame(decoded[0])
    assert outbound == [prodigy.MessageFrame(prodigy.ContainerTopic.PING, b"")]
+   assert hub.handle_frame(runtime_ready) == []
+   assert hub.handle_frame(prodigy.MessageFrame(prodigy.ContainerTopic.WORMHOLES_REFRESH, b"worm")) == []
+   assert dispatch.wormholes_payloads == [b"worm"]
    os.close(borrowed_fd)
 
 

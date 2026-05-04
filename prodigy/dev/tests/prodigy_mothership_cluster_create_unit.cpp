@@ -79,6 +79,20 @@ static bool equalCallSequence(const Vector<ClusterCreateCall>& lhs, std::initial
    return true;
 }
 
+static OperatingSystemUpdatePolicy makeOSUpdatePolicy(
+   const String& osID,
+   const String& targetVersionID,
+   const String& command,
+   bool includeVMs = false)
+{
+   OperatingSystemUpdatePolicy policy = {};
+   policy.osID = osID;
+   policy.targetVersionID = targetVersionID;
+   policy.command = command;
+   policy.includeVMs = includeVMs;
+   return policy;
+}
+
 static MachineConfig makeMachineConfig(const String& slug, MachineConfig::MachineKind kind, uint32_t nLogicalCores, uint32_t nMemoryMB, uint32_t nStorageMB)
 {
    MachineConfig config = {};
@@ -838,7 +852,15 @@ int main(void)
       cluster.clusterUUID = 0x1002;
       cluster.deploymentMode = MothershipClusterDeploymentMode::local;
       cluster.includeLocalMachine = true;
-      cluster.controls.push_back(makeUnixControl("/run/prodigy/local-minimal.sock"_ctv));
+	      cluster.controls.push_back(makeUnixControl("/run/prodigy/local-minimal.sock"_ctv));
+	      cluster.osUpdatesEnabled = true;
+	      cluster.osUpdatePolicies.push_back(makeOSUpdatePolicy(
+	         "ubuntu"_ctv,
+	         "24.04"_ctv,
+	         "apt-get update && apt-get -y dist-upgrade && systemctl reboot"_ctv,
+	         true));
+	      cluster.maxOSDrains = 2;
+	      cluster.machineUpdateCadenceMins = 3;
 
       FakeClusterCreateHooks hooks;
       hooks.fetchedTopology.machines.push_back(makeTopologyMachine("local-minimal"_ctv, "10.0.0.11"_ctv, true, ClusterMachineSource::adopted));
@@ -850,10 +872,18 @@ int main(void)
       suite.expect(hooks.localBootstrapCalls == 1, "create_local_minimal_bootstraps_local_seed");
       suite.expect(hooks.configureCalls == 1, "create_local_minimal_always_configures_seed");
       suite.expect(hooks.lastConfig.clusterUUID == cluster.clusterUUID, "create_local_minimal_config_cluster_uuid");
-      suite.expect(hooks.lastConfig.datacenterFragment == cluster.datacenterFragment, "create_local_minimal_config_fragment");
-      suite.expect(hooks.lastConfig.autoscaleIntervalSeconds == cluster.autoscaleIntervalSeconds, "create_local_minimal_config_autoscale_interval");
-      suite.expect(hooks.lastConfig.sharedCPUOvercommitPermille == cluster.sharedCPUOvercommitPermille, "create_local_minimal_config_shared_cpu_overcommit");
-      suite.expect(cluster.environmentConfigured, "create_local_minimal_environment_configured");
+	      suite.expect(hooks.lastConfig.datacenterFragment == cluster.datacenterFragment, "create_local_minimal_config_fragment");
+	      suite.expect(hooks.lastConfig.autoscaleIntervalSeconds == cluster.autoscaleIntervalSeconds, "create_local_minimal_config_autoscale_interval");
+	      suite.expect(hooks.lastConfig.sharedCPUOvercommitPermille == cluster.sharedCPUOvercommitPermille, "create_local_minimal_config_shared_cpu_overcommit");
+	      suite.expect(hooks.lastConfig.osUpdatesEnabled == cluster.osUpdatesEnabled, "create_local_minimal_config_os_updates_enabled");
+	      suite.expect(hooks.lastConfig.osUpdatePolicies.size() == 1, "create_local_minimal_config_os_update_policy_count");
+	      suite.expect(hooks.lastConfig.osUpdatePolicies.size() == 1 && hooks.lastConfig.osUpdatePolicies[0].osID == "ubuntu"_ctv, "create_local_minimal_config_os_update_policy_os_id");
+	      suite.expect(hooks.lastConfig.osUpdatePolicies.size() == 1 && hooks.lastConfig.osUpdatePolicies[0].targetVersionID == "24.04"_ctv, "create_local_minimal_config_os_update_policy_target_version");
+	      suite.expect(hooks.lastConfig.osUpdatePolicies.size() == 1 && hooks.lastConfig.osUpdatePolicies[0].command == cluster.osUpdatePolicies[0].command, "create_local_minimal_config_os_update_policy_command");
+	      suite.expect(hooks.lastConfig.osUpdatePolicies.size() == 1 && hooks.lastConfig.osUpdatePolicies[0].includeVMs, "create_local_minimal_config_os_update_policy_include_vms");
+	      suite.expect(hooks.lastConfig.maxOSDrains == cluster.maxOSDrains, "create_local_minimal_config_max_os_drains");
+	      suite.expect(hooks.lastConfig.machineUpdateCadenceMins == cluster.machineUpdateCadenceMins, "create_local_minimal_config_machine_update_cadence");
+	      suite.expect(cluster.environmentConfigured, "create_local_minimal_environment_configured");
       suite.expect(equalCallSequence(hooks.callSequence, {
          ClusterCreateCall::localBootstrap,
          ClusterCreateCall::configure,

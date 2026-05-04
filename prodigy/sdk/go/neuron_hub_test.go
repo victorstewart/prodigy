@@ -116,6 +116,13 @@ func TestFixtureFrames(t *testing.T) {
 	if got := BuildReadyFrame(); string(got) != string(fixtureBytes(t, "frame.healthy.empty.bin")) {
 		t.Fatalf("BuildReadyFrame mismatch")
 	}
+	runtimeReady, err := ParseMessageFrame(BuildRuntimeReadyFrame())
+	if err != nil {
+		t.Fatalf("ParseMessageFrame(runtimeReady): %v", err)
+	}
+	if runtimeReady.Topic != ContainerTopicRuntimeReady || len(runtimeReady.Payload) != 0 {
+		t.Fatalf("unexpected runtime ready frame: %#v", runtimeReady)
+	}
 	if got := BuildStatisticsFrame([]MetricPair{{Key: 1, Value: 2}, {Key: 3, Value: 4}}); string(got) != string(fixtureBytes(t, "frame.statistics.demo.bin")) {
 		t.Fatalf("BuildStatisticsFrame mismatch")
 	}
@@ -125,6 +132,15 @@ func TestFixtureFrames(t *testing.T) {
 	if got := BuildCredentialsRefreshAckFrame(); string(got) != string(fixtureBytes(t, "frame.credentials_refresh_ack.empty.bin")) {
 		t.Fatalf("BuildCredentialsRefreshAckFrame mismatch")
 	}
+}
+
+type recordingDispatch struct {
+	DispatchBase
+	wormholesPayloads [][]byte
+}
+
+func (dispatch *recordingDispatch) WormholesRefresh(_ *NeuronHub, payload []byte) {
+	dispatch.wormholesPayloads = append(dispatch.wormholesPayloads, append([]byte(nil), payload...))
 }
 
 func TestFrameDecoderAndHandleFrame(t *testing.T) {
@@ -162,6 +178,26 @@ func TestFrameDecoderAndHandleFrame(t *testing.T) {
 	}
 	if len(outbound) != 1 || outbound[0].Topic != ContainerTopicPing || len(outbound[0].Payload) != 0 {
 		t.Fatalf("unexpected outbound frames: %#v", outbound)
+	}
+
+	dispatch := &recordingDispatch{}
+	hub, err = NewBorrowedNeuronHubFromParameters(dispatch, params)
+	if err != nil {
+		t.Fatalf("NewBorrowedNeuronHubFromParameters(recording): %v", err)
+	}
+	outbound, err = hub.HandleFrame(MessageFrame{Topic: ContainerTopicRuntimeReady})
+	if err != nil {
+		t.Fatalf("HandleFrame(runtimeReady): %v", err)
+	}
+	if len(outbound) != 0 {
+		t.Fatalf("runtime ready yielded outbound frames: %#v", outbound)
+	}
+	outbound, err = hub.HandleFrame(MessageFrame{Topic: ContainerTopicWormholesRefresh, Payload: []byte("worm")})
+	if err != nil {
+		t.Fatalf("HandleFrame(wormholes): %v", err)
+	}
+	if len(outbound) != 0 || len(dispatch.wormholesPayloads) != 1 || string(dispatch.wormholesPayloads[0]) != "worm" {
+		t.Fatalf("unexpected wormholes dispatch: outbound=%#v payloads=%#v", outbound, dispatch.wormholesPayloads)
 	}
 }
 

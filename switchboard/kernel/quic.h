@@ -17,8 +17,8 @@ struct {
    __uint(max_entries, MAX_PORTALS * 2);
 } quic_cid_aes_decrypt_map SEC(".maps");
 
-__attribute__((__always_inline__)) 
-static inline bool parse_quic(struct container_id *containerID, const struct portal_meta *portal_meta, void *data, void *data_end, bool is_ipv6, const struct flow_key *flow) 
+__attribute__((__always_inline__))
+static inline bool parse_quic(struct container_id *containerID, const struct portal_meta *portal_meta, void *data, void *data_end, bool is_ipv6, const struct flow_key *flow)
 {
    containerID->hasID = false;
    bool allow_hash_fallback = false;
@@ -38,7 +38,7 @@ static inline bool parse_quic(struct container_id *containerID, const struct por
    __u8 *pkt_type = quic_data;
    __u8 *encrypted_cid = NULL;
 
-   if ((*pkt_type & QUIC_V1_LONG_HEADER) == QUIC_V1_LONG_HEADER) 
+   if ((*pkt_type & QUIC_V1_LONG_HEADER) == QUIC_V1_LONG_HEADER)
    {
       // packet with long header
       if ((void *)(quic_data + sizeof(struct quic_long_header)) > data_end) return false;
@@ -60,13 +60,13 @@ static inline bool parse_quic(struct container_id *containerID, const struct por
       }
 
       encrypted_cid = lheader->dst_cid;
-   } 
-   else 
+   }
+   else
    {
       if ((void *)(quic_data + sizeof(struct quic_short_header)) > data_end) return false;
 
       struct quic_short_header *sheader = (struct quic_short_header *)quic_data;
-      
+
       encrypted_cid = sheader->cid;
    }
 
@@ -74,7 +74,7 @@ static inline bool parse_quic(struct container_id *containerID, const struct por
    // if we have to build infrastructure to rotate keys, then we might as well just set that time frame to stick with a 3 byte nonce
    //
    // say we have 50,000 clients, that's 335 connection IDs per user. but also depends not only on simultaneous connections per connection establishments over key lifetime.
-   // 
+   //
    // it really depends on how many unique users connection per interval, how many cids each consumes per interval, how many application servers we have, how many bits in the sequenitally increasing nonce...
 
    // let's take a situation in which this will really matter: with scale. say 1M+ users.
@@ -86,7 +86,7 @@ static inline bool parse_quic(struct container_id *containerID, const struct por
    // assume 500K daily active users, using 8 each? we'd have 838 cids per user, exhausting only 1% of our cid space.
    // and if we choose a random starting nonce value then loop on overflow... we're probably gold.
    //
-   // but every time their ip address changes their cid must change.... and especially if they're bluetooth waking up to push changes to us.. 
+   // but every time their ip address changes their cid must change.... and especially if they're bluetooth waking up to push changes to us..
    // we could be consuming 100s per day per USER, not active user. then factor in wifi cellular crossovers. so maybe 100 a day is more accurate.
    // but that's stll only 11.9% of our cid space consumed... and it will vary normally by user so... even if we cycle once per day this is probably fine.
 
@@ -117,7 +117,7 @@ static inline bool parse_quic(struct container_id *containerID, const struct por
          __u8 key_index = quicCidEncryptedKeyIndex(encrypted_cid);
          __u32 decrypt_index = quicCidPortalDecryptMapIndex(portal_meta->slot, key_index);
          struct aes_decrypt_state *aes_state = bpf_map_lookup_elem(&quic_cid_aes_decrypt_map, &decrypt_index);
-             
+
          if (aes_state)
          {
             __u8 cid[16];
@@ -125,7 +125,7 @@ static inline bool parse_quic(struct container_id *containerID, const struct por
 
             __u8 cidv = cid[0];
 
-            if (cidv == QUIC_CID_VERSION) 
+            if (cidv == QUIC_CID_VERSION)
             {
                __u32 nonce = 0;
                __u8 expected_tag[QUIC_CID_TAG_LEN];
@@ -152,7 +152,7 @@ static inline bool parse_quic(struct container_id *containerID, const struct por
 
                   containerID->hasID = true;
                }
-            } 
+            }
          }
       }
    }

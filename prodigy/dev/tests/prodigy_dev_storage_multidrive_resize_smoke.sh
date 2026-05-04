@@ -7,6 +7,9 @@ PINGPONG_BIN="${3:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARNESS="${SCRIPT_DIR}/prodigy_dev_netns_harness.sh"
+source "${SCRIPT_DIR}/prodigy_dev_discombobulator_artifact_helpers.sh"
+SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+prodigy_dev_reexec_in_private_mount_namespace_once PRODIGY_DEV_STORAGE_MULTIDRIVE_RESIZE_SMOKE_MOUNT_NS_READY bash "${SCRIPT_SELF}" "$@"
 
 if [[ -z "${PRODIGY_BIN}" || -z "${MOTHERSHIP_BIN}" || -z "${PINGPONG_BIN}" ]]
 then
@@ -20,7 +23,7 @@ then
    exit 77
 fi
 
-deps=(awk btrfs mkfs.btrfs mkfs.ext4 mount umount stat zstd ldd install timeout ip python3 rg losetup)
+deps=(awk btrfs cargo mkfs.btrfs mkfs.ext4 mount umount stat zstd timeout ip nsenter python3 rg losetup)
 for cmd in "${deps[@]}"
 do
    if ! command -v "${cmd}" >/dev/null 2>&1
@@ -33,6 +36,7 @@ done
 PRODIGY_BIN="$(readlink -f "${PRODIGY_BIN}" 2>/dev/null || printf '%s' "${PRODIGY_BIN}")"
 MOTHERSHIP_BIN="$(readlink -f "${MOTHERSHIP_BIN}" 2>/dev/null || printf '%s' "${MOTHERSHIP_BIN}")"
 PINGPONG_BIN="$(readlink -f "${PINGPONG_BIN}" 2>/dev/null || printf '%s' "${PINGPONG_BIN}")"
+target_arch="$(prodigy_dev_detect_target_arch)"
 
 tmpdir="$(mktemp -d)"
 workspace_root="${tmpdir}/workspace"
@@ -42,7 +46,6 @@ mothership_db_path="${tmpdir}/mothership-storage.tidesdb"
 keep_tmp="${PRODIGY_DEV_KEEP_TMP:-0}"
 allow_containers_overmount="${PRODIGY_DEV_ALLOW_CONTAINERS_OVERMOUNT:-0}"
 create_log="${tmpdir}/create_cluster.log"
-configure_log="${tmpdir}/configure.log"
 deploy_log="${tmpdir}/deploy.log"
 application_log="${tmpdir}/application_report.log"
 cluster_report_log="${tmpdir}/cluster_report.log"
@@ -61,7 +64,6 @@ storage_a_mounted=0
 storage_b_mounted=0
 storage_a_dir_created=0
 storage_b_dir_created=0
-deployment_subvol=""
 cluster_created=0
 archive_workspace=0
 
@@ -81,12 +83,6 @@ cleanup()
          PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
          "${MOTHERSHIP_BIN}" removeCluster "${cluster_name}" \
          >"${remove_log}" 2>&1 || true
-   fi
-
-   if [[ -n "${deployment_subvol}" && -e "${deployment_subvol}" ]]
-   then
-      btrfs property set -f "${deployment_subvol}" ro false >/dev/null 2>&1 || true
-      btrfs subvolume delete "${deployment_subvol}" >/dev/null 2>&1 || true
    fi
 
    if [[ "${storage_a_mounted}" -eq 1 ]]
@@ -146,9 +142,9 @@ then
       fi
    fi
 
-   if [[ -n "$(ls -A /containers 2>/dev/null)" ]]
+   if ! prodigy_dev_containers_root_is_safely_overmountable /containers
    then
-      echo "FAIL: /containers exists on non-btrfs fs and is not empty"
+      echo "FAIL: /containers exists on non-btrfs fs and is not safely overmountable"
       exit 1
    fi
 
@@ -181,6 +177,7 @@ mount -o loop "${storage_a_img}" "${storage_a_mount}"
 storage_a_mounted=1
 mount -o loop "${storage_b_img}" "${storage_b_mount}"
 storage_b_mounted=1
+export PRODIGY_DEV_CONTAINER_STORAGE_MOUNTS="${storage_a_mount}:${storage_b_mount}"
 
 application_id=6
 version_id=$(( ($(date +%s%N) & 281474976710655) ))
@@ -194,6 +191,7 @@ read -r -d '' CREATE_REQUEST <<EOF || true
 {
   "name": "${cluster_name}",
   "deploymentMode": "test",
+  "autoscaleIntervalSeconds": 3,
   "nBrains": 1,
   "machineSchemas": [
     {
@@ -241,24 +239,18 @@ then
    exit 1
 fi
 
-if ! env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
-   "${MOTHERSHIP_BIN}" configure "${cluster_name}" 122 bootstrap 4 8192 65536 3 \
-   >"${configure_log}" 2>&1
-then
-   echo "FAIL: configure autoscale interval failed"
-   sed -n '1,200p' "${configure_log}" || true
-   exit 1
-fi
-
-read -r parent_ns <<EOF
-$(python3 - "${manifest_path}" <<'PY'
+mapfile -t manifest_fields < <(python3 - "${manifest_path}" <<'PY'
 import json, sys
 with open(sys.argv[1], "r", encoding="utf-8") as fh:
     manifest = json.load(fh)
 print(manifest["parentNamespace"])
+print(manifest.get("parentPid", 0))
+print(next((node.get("pid", 0) for node in manifest.get("nodes", []) if node.get("role") == "brain"), 0))
 PY
 )
-EOF
+parent_ns="${manifest_fields[0]:-}"
+parent_pid="${manifest_fields[1]:-0}"
+brain_pid="${manifest_fields[2]:-0}"
 
 if [[ -z "${parent_ns}" ]]
 then
@@ -266,32 +258,37 @@ then
    exit 1
 fi
 
-deployment_subvol="/containers/${deployment_id}"
-btrfs subvolume create "${deployment_subvol}" >/dev/null
-mkdir -p "${deployment_subvol}/root" "${deployment_subvol}/etc"
-install -m 0755 "${PINGPONG_BIN}" "${deployment_subvol}/root/pingpong_container"
+if ! [[ "${brain_pid}" =~ ^[0-9]+$ ]] || [[ "${brain_pid}" -le 0 ]] || ! kill -0 "${brain_pid}" >/dev/null 2>&1
+then
+   echo "FAIL: unable to parse live brain pid"
+   exit 1
+fi
 
-while IFS= read -r libpath
-do
-   if [[ -z "${libpath}" ]]
-   then
-      continue
-   fi
+artifact_project_dir="${tmpdir}/storage-artifact"
+discombobulator_file="${artifact_project_dir}/PingPongStorage.DiscombobuFile"
+container_blob="${tmpdir}/storage.container.zst"
+mkdir -p "${artifact_project_dir}"
+cat > "${discombobulator_file}" <<EOF
+FROM scratch for ${target_arch}
+COPY {bin} ./$(basename "${PINGPONG_BIN}") /root/pingpong_container
+SURVIVE /root/pingpong_container
+EOF
+prodigy_dev_write_common_prodigy_assets "${discombobulator_file}"
+cat >> "${discombobulator_file}" <<'EOF'
+EXECUTE ["/root/pingpong_container"]
+EOF
 
-   if [[ -e "${libpath}" ]]
-   then
-      cp -aL --parents "${libpath}" "${deployment_subvol}"
-   fi
-done < <(
-   ldd "${PINGPONG_BIN}" | awk '
-      /=>/ {
-         if ($3 ~ /^\//) print $3;
-      }
-      /^[[:space:]]*\// {
-         print $1;
-      }
-   ' | sort -u
-)
+if ! prodigy_dev_run_discombobulator_build \
+   "${artifact_project_dir}" \
+   "${discombobulator_file}" \
+   "${container_blob}" \
+   "bin=$(dirname "${PINGPONG_BIN}")" \
+   "ebpf=$(dirname "${PRODIGY_BIN}")"
+then
+   archive_workspace=1
+   echo "FAIL: unable to build storage test artifact"
+   exit 1
+fi
 
 plan_json="${tmpdir}/storage.plan.json"
 cat > "${plan_json}" <<EOF
@@ -300,6 +297,7 @@ cat > "${plan_json}" <<EOF
     "type": "ApplicationType::stateless",
     "applicationID": ${application_id},
     "versionID": ${version_id},
+    "architecture": "${target_arch}",
     "filesystemMB": 64,
     "storageMB": 256,
     "memoryMB": 256,
@@ -308,6 +306,7 @@ cat > "${plan_json}" <<EOF
     "sTilHealthcheck": 3,
     "sTilKillable": 30
   },
+  "useHostNetworkNamespace": true,
   "minimumSubscriberCapacity": 1024,
   "isStateful": false,
   "stateless": {
@@ -333,13 +332,6 @@ cat > "${plan_json}" <<EOF
   "requiresDatacenterUniqueTag": false
 }
 EOF
-
-container_blob="${tmpdir}/storage.container.zst"
-btrfs property set -f "${deployment_subvol}" ro true >/dev/null
-btrfs send "${deployment_subvol}" | zstd -19 -T0 -q -o "${container_blob}"
-btrfs property set -f "${deployment_subvol}" ro false >/dev/null
-btrfs subvolume delete "${deployment_subvol}" >/dev/null
-deployment_subvol=""
 
 if ! env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
    "${MOTHERSHIP_BIN}" deploy "${cluster_name}" "$(cat "${plan_json}")" "${container_blob}" \
@@ -376,7 +368,19 @@ then
    exit 1
 fi
 
-ip netns exec "${parent_ns}" python3 - <<'PY' >"${traffic_log}" 2>&1
+parent_netns_exec=(ip netns exec "${parent_ns}")
+if ! "${parent_netns_exec[@]}" true >/dev/null 2>&1
+then
+   if [[ "${parent_pid}" =~ ^[0-9]+$ ]] && [[ "${parent_pid}" -gt 0 ]] && kill -0 "${parent_pid}" >/dev/null 2>&1
+   then
+      parent_netns_exec=(nsenter -t "${parent_pid}" -n)
+   else
+      echo "FAIL: parent namespace is not reachable by name or pid"
+      exit 1
+   fi
+fi
+
+"${parent_netns_exec[@]}" python3 - <<'PY' >"${traffic_log}" 2>&1
 import socket
 import time
 
@@ -447,7 +451,8 @@ then
    exit 1
 fi
 
-storage_root="$(find /containers/storage -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+brain_mount_exec=(nsenter -t "${brain_pid}" -m --)
+storage_root="$("${brain_mount_exec[@]}" sh -lc 'find /containers/storage -mindepth 1 -maxdepth 1 -type d | head -n 1' 2>/dev/null || true)"
 if [[ -z "${storage_root}" ]]
 then
    archive_workspace=1
@@ -455,7 +460,7 @@ then
    exit 1
 fi
 
-btrfs filesystem show "${storage_root}" >"${btrfs_show_log}" 2>&1 || {
+"${brain_mount_exec[@]}" btrfs filesystem show "${storage_root}" >"${btrfs_show_log}" 2>&1 || {
    archive_workspace=1
    echo "FAIL: btrfs filesystem show failed"
    sed -n '1,200p' "${btrfs_show_log}" || true

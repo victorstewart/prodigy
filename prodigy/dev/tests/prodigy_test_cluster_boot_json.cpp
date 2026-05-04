@@ -19,9 +19,9 @@ public:
 static void printUsage(const char *argv0)
 {
    std::fprintf(
-      stderr,
-      "usage: %s --role=brain|neuron --control-socket-path=/path --local-index=N --brains=N --machine=PRIVATE4,PRIVATE6,PUBLIC6[,RACK] [...]\n",
-      argv0);
+	      stderr,
+	      "usage: %s --role=brain|neuron --control-socket-path=/path --local-index=N --brains=N [--schema=SCHEMA] [--peer-family=ipv4|private6|public6|multihome6] --machine=PRIVATE4,PRIVATE6,PUBLIC6[,RACK] [...]\n",
+	      argv0);
 }
 
 static bool parseUInt32(const char *text, uint32_t& value)
@@ -120,13 +120,25 @@ static void appendMachineAddressIfPresent(Vector<ClusterMachineAddress>& address
    prodigyAppendUniqueClusterMachineAddress(addresses, address, cidr);
 }
 
+static void appendMachinePeerAddressIfPresent(Vector<ClusterMachinePeerAddress>& addresses, const String& address, uint8_t cidr)
+{
+   if (address.size() == 0)
+   {
+      return;
+   }
+
+   prodigyAppendUniqueClusterMachinePeerAddress(addresses, ClusterMachinePeerAddress{address, cidr});
+}
+
 int main(int argc, char *argv[])
 {
    String role = {};
    String controlSocketPath = {};
-   uint32_t localIndex = 0;
-   uint32_t nBrains = 0;
-   std::vector<TestClusterMachineSpec> machineSpecs;
+	   uint32_t localIndex = 0;
+	   uint32_t nBrains = 0;
+	   String machineSchema = {};
+	   String peerFamily = {};
+	   std::vector<TestClusterMachineSpec> machineSpecs;
 
    for (int index = 1; index < argc; ++index)
    {
@@ -148,15 +160,23 @@ int main(int argc, char *argv[])
             return EXIT_FAILURE;
          }
       }
-      else if (std::strncmp(arg, "--brains=", 9) == 0)
-      {
-         if (parseUInt32(arg + 9, nBrains) == false)
-         {
-            std::fprintf(stderr, "invalid --brains\n");
-            return EXIT_FAILURE;
-         }
-      }
-      else if (std::strncmp(arg, "--machine=", 10) == 0)
+	      else if (std::strncmp(arg, "--brains=", 9) == 0)
+	      {
+	         if (parseUInt32(arg + 9, nBrains) == false)
+	         {
+	            std::fprintf(stderr, "invalid --brains\n");
+	            return EXIT_FAILURE;
+	         }
+	      }
+	      else if (std::strncmp(arg, "--schema=", 9) == 0)
+	      {
+	         machineSchema.assign(arg + 9);
+	      }
+	      else if (std::strncmp(arg, "--peer-family=", 14) == 0)
+	      {
+	         peerFamily.assign(arg + 14);
+	      }
+	      else if (std::strncmp(arg, "--machine=", 10) == 0)
       {
          TestClusterMachineSpec spec = {};
          if (splitMachineArgument(arg + 10, spec) == false)
@@ -185,6 +205,16 @@ int main(int argc, char *argv[])
       return EXIT_FAILURE;
    }
 
+   if (peerFamily.size() > 0
+      && peerFamily.equal("ipv4"_ctv) == false
+      && peerFamily.equal("private6"_ctv) == false
+      && peerFamily.equal("public6"_ctv) == false
+      && peerFamily.equal("multihome6"_ctv) == false)
+   {
+      std::fprintf(stderr, "invalid --peer-family\n");
+      return EXIT_FAILURE;
+   }
+
    if (localIndex > machineSpecs.size())
    {
       std::fprintf(stderr, "local index out of range\n");
@@ -207,16 +237,45 @@ int main(int argc, char *argv[])
       ClusterMachine machine = {};
       machine.source = ClusterMachineSource::adopted;
       machine.backing = ClusterMachineBacking::owned;
-      machine.kind = MachineConfig::MachineKind::vm;
-      machine.lifetime = MachineLifetime::reserved;
-      machine.isBrain = ((index + 1) <= nBrains);
-      machine.rackUUID = (spec.rackUUID != 0) ? spec.rackUUID : (index + 1);
+	      machine.kind = MachineConfig::MachineKind::vm;
+	      machine.lifetime = MachineLifetime::reserved;
+	      machine.isBrain = ((index + 1) <= nBrains);
+	      if (machineSchema.size() > 0)
+	      {
+	         machine.hasCloud = true;
+	         machine.cloud.schema = machineSchema;
+	      }
+	      machine.rackUUID = (spec.rackUUID != 0) ? spec.rackUUID : (index + 1);
       machine.creationTimeMs = Time::now<TimeResolution::ms>();
       machine.ssh.port = 22;
 
       appendMachineAddressIfPresent(machine.addresses.privateAddresses, spec.private4, 24);
       appendMachineAddressIfPresent(machine.addresses.privateAddresses, spec.private6, 64);
       appendMachineAddressIfPresent(machine.addresses.publicAddresses, spec.public6, 64);
+
+      if (peerFamily.equal("ipv4"_ctv))
+      {
+         appendMachinePeerAddressIfPresent(machine.peerAddresses, spec.private4, 24);
+      }
+      else if (peerFamily.equal("private6"_ctv))
+      {
+         appendMachinePeerAddressIfPresent(machine.peerAddresses, spec.private6, 64);
+      }
+      else if (peerFamily.equal("public6"_ctv))
+      {
+         appendMachinePeerAddressIfPresent(machine.peerAddresses, spec.public6, 64);
+      }
+      else if (peerFamily.equal("multihome6"_ctv))
+      {
+         appendMachinePeerAddressIfPresent(machine.peerAddresses, spec.private6, 64);
+         appendMachinePeerAddressIfPresent(machine.peerAddresses, spec.public6, 64);
+      }
+
+      if (peerFamily.size() > 0 && machine.peerAddresses.empty())
+      {
+         std::fprintf(stderr, "machine is missing a candidate for --peer-family\n");
+         return EXIT_FAILURE;
+      }
 
       if (spec.private4.size() > 0)
       {

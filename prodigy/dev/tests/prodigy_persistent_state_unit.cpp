@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <algorithm>
 
@@ -64,6 +65,20 @@ public:
       persistCalls += 1;
    }
 };
+
+static void expectTransportCertificateBackdated(TestSuite& suite, const String& certPem, const char *name)
+{
+   X509 *cert = VaultPem::x509FromPem(certPem);
+   suite.expect(cert != nullptr, name);
+   if (cert == nullptr)
+   {
+      return;
+   }
+
+   time_t latestAllowedNotBefore = std::time(nullptr) - (ProdigyTransportTLSNotBeforeBackdateSeconds - 30);
+   suite.expect(X509_cmp_time(X509_get0_notBefore(cert), &latestAllowedNotBefore) <= 0, name);
+   X509_free(cert);
+}
 
 template <typename... Args>
 static Message *buildBrainMessage(String& buffer, BrainTopic topic, Args&&... args)
@@ -157,6 +172,26 @@ static bool equalMachineConfig(const MachineConfig& lhs, const MachineConfig& rh
 
 static bool equalBrainConfigs(const BrainConfig& lhs, const BrainConfig& rhs)
 {
+   auto equalOSUpdatePolicies = [] (const Vector<OperatingSystemUpdatePolicy>& left, const Vector<OperatingSystemUpdatePolicy>& right) -> bool {
+      if (left.size() != right.size())
+      {
+         return false;
+      }
+
+      for (uint32_t index = 0; index < left.size(); ++index)
+      {
+         if (left[index].osID.equals(right[index].osID) == false
+            || left[index].targetVersionID.equals(right[index].targetVersionID) == false
+            || left[index].command.equals(right[index].command) == false
+            || left[index].includeVMs != right[index].includeVMs)
+         {
+            return false;
+         }
+      }
+
+      return true;
+   };
+
    if (lhs.clusterUUID != rhs.clusterUUID
       || lhs.datacenterFragment != rhs.datacenterFragment
       || lhs.autoscaleIntervalSeconds != rhs.autoscaleIntervalSeconds
@@ -168,9 +203,13 @@ static bool equalBrainConfigs(const BrainConfig& lhs, const BrainConfig& rhs)
       || lhs.bootstrapSshHostKeyPackage != rhs.bootstrapSshHostKeyPackage
       || lhs.bootstrapSshPrivateKeyPath.equals(rhs.bootstrapSshPrivateKeyPath) == false
       || lhs.remoteProdigyPath.equals(rhs.remoteProdigyPath) == false
-      || lhs.controlSocketPath.equals(rhs.controlSocketPath) == false
-      || lhs.vmImageURI.equals(rhs.vmImageURI) == false
-      || equalRuntimeEnvironment(lhs.runtimeEnvironment, rhs.runtimeEnvironment) == false
+	      || lhs.controlSocketPath.equals(rhs.controlSocketPath) == false
+	      || lhs.vmImageURI.equals(rhs.vmImageURI) == false
+	      || lhs.osUpdatesEnabled != rhs.osUpdatesEnabled
+	      || equalOSUpdatePolicies(lhs.osUpdatePolicies, rhs.osUpdatePolicies) == false
+	      || lhs.maxOSDrains != rhs.maxOSDrains
+	      || lhs.machineUpdateCadenceMins != rhs.machineUpdateCadenceMins
+	      || equalRuntimeEnvironment(lhs.runtimeEnvironment, rhs.runtimeEnvironment) == false
       || lhs.configBySlug.size() != rhs.configBySlug.size())
    {
       return false;
@@ -509,6 +548,29 @@ int main(void)
    bootTopologyMachine.ownedStorageMB = 20480;
    storedBootState.initialTopology.machines.push_back(bootTopologyMachine);
 
+   ClusterMachine bootTopologyWorker = {};
+   bootTopologyWorker.source = ClusterMachineSource::created;
+   bootTopologyWorker.backing = ClusterMachineBacking::cloud;
+   bootTopologyWorker.kind = MachineConfig::MachineKind::vm;
+   bootTopologyWorker.lifetime = MachineLifetime::ondemand;
+   bootTopologyWorker.isBrain = false;
+   bootTopologyWorker.cloud.schema = "vm-small"_ctv;
+   bootTopologyWorker.cloud.providerMachineType = "c7i-flex.large"_ctv;
+   bootTopologyWorker.cloud.cloudID = "i-0123456789abcdef1"_ctv;
+   bootTopologyWorker.ssh.address = "10.0.0.11"_ctv;
+   bootTopologyWorker.ssh.port = 22;
+   bootTopologyWorker.ssh.user = "root"_ctv;
+   bootTopologyWorker.ssh.privateKeyPath = prodigyTestClientSSHPrivateKeyPath();
+   prodigyAppendUniqueClusterMachineAddress(bootTopologyWorker.addresses.privateAddresses, "10.0.0.11"_ctv, 24, "10.0.0.1"_ctv);
+   bootTopologyWorker.totalLogicalCores = 2;
+   bootTopologyWorker.totalMemoryMB = 4096;
+   bootTopologyWorker.totalStorageMB = 20480;
+   bootTopologyWorker.ownership.mode = ClusterMachineOwnershipMode::wholeMachine;
+   bootTopologyWorker.ownedLogicalCores = 2;
+   bootTopologyWorker.ownedMemoryMB = 4096;
+   bootTopologyWorker.ownedStorageMB = 20480;
+   storedBootState.initialTopology.machines.push_back(bootTopologyWorker);
+
    ProdigyPersistentBootState expectedManagedBootState = storedBootState;
    prodigyStripManagedCloudBootstrapCredentials(expectedManagedBootState.runtimeEnvironment);
 
@@ -561,6 +623,32 @@ int main(void)
    ClusterTopology resolvedInitialTopology = {};
    suite.expect(prodigyResolveInitialTopologyFromBootState(parsedBootState, resolvedInitialTopology), "resolve_initial_topology_from_boot_state");
    suite.expect(resolvedInitialTopology == storedBootState.initialTopology, "resolve_initial_topology_matches");
+   uint32_t resolvedWorkerPrivate4 = 0;
+   uint32_t resolvedWorkerGatewayPrivate4 = 0;
+   suite.expect(parsedBootState.initialTopology.machines.size() == 2, "parse_rendered_boot_state_initial_topology_machine_count");
+   if (parsedBootState.initialTopology.machines.size() == 2)
+   {
+      suite.expect(parsedBootState.initialTopology.machines[1].resolvePrivate4(resolvedWorkerPrivate4), "parse_rendered_boot_state_initial_topology_worker_private4_resolves");
+      suite.expect(resolvedWorkerPrivate4 == IPAddress("10.0.0.11", false).v4, "parse_rendered_boot_state_initial_topology_worker_private4_preserves_network_order");
+      suite.expect(parsedBootState.initialTopology.machines[1].resolvePrivate4Gateway(resolvedWorkerGatewayPrivate4), "parse_rendered_boot_state_initial_topology_worker_gateway_resolves");
+      suite.expect(resolvedWorkerGatewayPrivate4 == IPAddress("10.0.0.1", false).v4, "parse_rendered_boot_state_initial_topology_worker_gateway_preserves_network_order");
+   }
+   suite.expect(prodigyResolveStartupClusterNodeCount(parsedBootState, parsedBootState.bootstrapConfig) == 2, "startup_cluster_node_count_uses_initial_topology_machine_count");
+   suite.expect(prodigyStartupRequiresTransportTLS(parsedBootState, parsedBootState.bootstrapConfig), "startup_cluster_transport_tls_required_for_two_node_topology");
+
+   ProdigyPersistentBootState singleNodeBootState = parsedBootState;
+   singleNodeBootState.initialTopology.machines.resize(1);
+   singleNodeBootState.bootstrapConfig.bootstrapPeers.clear();
+   suite.expect(prodigyResolveStartupClusterNodeCount(singleNodeBootState, singleNodeBootState.bootstrapConfig) == 1, "startup_cluster_node_count_single_seed_defaults_to_one");
+   suite.expect(prodigyStartupRequiresTransportTLS(singleNodeBootState, singleNodeBootState.bootstrapConfig) == false, "startup_cluster_transport_tls_not_required_for_single_seed");
+
+   ProdigyPersistentBootState workerBootState = {};
+   workerBootState.bootstrapConfig.nodeRole = ProdigyBootstrapNodeRole::neuron;
+   workerBootState.bootstrapConfig.controlSocketPath = "/run/prodigy/control.sock"_ctv;
+   workerBootState.bootstrapConfig.bootstrapPeers.push_back(makeBootstrapPeer("10.0.0.10", 24));
+   workerBootState.initialTopology = storedBootState.initialTopology;
+   suite.expect(prodigyResolveStartupClusterNodeCount(workerBootState, workerBootState.bootstrapConfig) == 2, "startup_cluster_node_count_worker_uses_topology_over_single_peer");
+   suite.expect(prodigyStartupRequiresTransportTLS(workerBootState, workerBootState.bootstrapConfig), "startup_cluster_transport_tls_required_for_worker_with_single_brain_peer");
 
    BrainConfig backfilledBrainConfig = {};
    prodigyBackfillBrainConfigSSHFromBootState(parsedBootState, backfilledBrainConfig);
@@ -646,9 +734,18 @@ int main(void)
    storedSnapshot.brainConfig.bootstrapSshUser = "root"_ctv;
    storedSnapshot.brainConfig.bootstrapSshPrivateKeyPath = prodigyTestBootstrapSeedSSHPrivateKeyPath();
    storedSnapshot.brainConfig.remoteProdigyPath = "/opt/prodigy"_ctv;
-   storedSnapshot.brainConfig.controlSocketPath = "/run/prodigy/control.sock"_ctv;
-   storedSnapshot.brainConfig.vmImageURI = "image://abc"_ctv;
-   storedSnapshot.brainConfig.runtimeEnvironment = storedBootState.runtimeEnvironment;
+	   storedSnapshot.brainConfig.controlSocketPath = "/run/prodigy/control.sock"_ctv;
+	   storedSnapshot.brainConfig.vmImageURI = "image://abc"_ctv;
+	   storedSnapshot.brainConfig.osUpdatesEnabled = true;
+	   storedSnapshot.brainConfig.osUpdatePolicies.push_back(OperatingSystemUpdatePolicy {
+	      .osID = "ubuntu"_ctv,
+	      .targetVersionID = "24.04"_ctv,
+	      .command = "apt-get update && apt-get -y dist-upgrade && systemctl reboot"_ctv,
+	      .includeVMs = true
+	   });
+	   storedSnapshot.brainConfig.maxOSDrains = 2;
+	   storedSnapshot.brainConfig.machineUpdateCadenceMins = 3;
+	   storedSnapshot.brainConfig.runtimeEnvironment = storedBootState.runtimeEnvironment;
    storedSnapshot.brainConfig.reporter.to = "ops@prodigy.local"_ctv;
    storedSnapshot.brainConfig.reporter.from = "prodigy@prodigy.local"_ctv;
    storedSnapshot.brainConfig.reporter.smtp = "smtp://mail.prodigy.local:587"_ctv;
@@ -696,8 +793,9 @@ int main(void)
    topologyMachine.creationTimeMs = 123456789;
    topologyMachine.totalLogicalCores = 4;
    topologyMachine.totalMemoryMB = 8192;
-   topologyMachine.totalStorageMB = 102400;
-   topologyMachine.hardware.cpu.model = "Intel(R) Xeon(R) Platinum 8488C"_ctv;
+	   topologyMachine.totalStorageMB = 102400;
+	   topologyMachine.vmImageURI = config.vmImageURI;
+	   topologyMachine.hardware.cpu.model = "Intel(R) Xeon(R) Platinum 8488C"_ctv;
    topologyMachine.hardware.cpu.logicalCores = 4;
    topologyMachine.hardware.memory.totalMB = 8192;
    topologyMachine.hardware.inventoryComplete = true;
@@ -713,11 +811,11 @@ int main(void)
    ProdigyPersistentLocalBrainState storedLocalBrainState = {};
    storedLocalBrainState.uuid = (uint128_t(0x1122334455667788ULL) << 64) | uint128_t(0x99AABBCCDDEEFF00ULL);
    storedLocalBrainState.ownerClusterUUID = (uint128_t(0x0102030405060708ULL) << 64) | uint128_t(0x1112131415161718ULL);
-   suite.expect(Vault::generateTransportRootCertificateEd25519(
+   suite.expect(prodigyGenerateTransportRootCertificateEd25519(
       storedLocalBrainState.transportTLS.clusterRootCertPem,
       storedLocalBrainState.transportTLS.clusterRootKeyPem,
       &parseFailure), "generate_transport_root_certificate");
-   suite.expect(Vault::generateTransportNodeCertificateEd25519(
+   suite.expect(prodigyGenerateTransportNodeCertificateEd25519(
       storedLocalBrainState.transportTLS.clusterRootCertPem,
       storedLocalBrainState.transportTLS.clusterRootKeyPem,
       storedLocalBrainState.uuid,
@@ -725,6 +823,14 @@ int main(void)
       storedLocalBrainState.transportTLS.localCertPem,
       storedLocalBrainState.transportTLS.localKeyPem,
       &parseFailure), "generate_transport_local_certificate");
+   expectTransportCertificateBackdated(
+      suite,
+      storedLocalBrainState.transportTLS.clusterRootCertPem,
+      "transport_root_certificate_backdated");
+   expectTransportCertificateBackdated(
+      suite,
+      storedLocalBrainState.transportTLS.localCertPem,
+      "transport_local_certificate_backdated");
    storedLocalBrainState.transportTLS.generation = 7;
    suite.expect(storedLocalBrainState.transportTLSConfigured(), "stored_local_brain_state_transport_tls_configured");
    suite.expect(storedLocalBrainState.canMintTransportTLS(), "stored_local_brain_state_transport_tls_can_mint");
@@ -802,6 +908,7 @@ int main(void)
    storedSnapshot.masterAuthority.deploymentPlans.insert_or_assign(storedPlan.config.deploymentID(), storedPlan);
    storedSnapshot.masterAuthority.failedDeployments.insert_or_assign(storedPlan.config.deploymentID(), "healthcheck timeout"_ctv);
    storedSnapshot.masterAuthority.runtimeState.generation = 19;
+   storedSnapshot.masterAuthority.runtimeState.hasCompletedInitialMasterElection = true;
    storedSnapshot.masterAuthority.runtimeState.nextMintedClientTlsGeneration = 123;
    prodigyBuildTransportTLSAuthority(storedLocalBrainState, storedSnapshot.masterAuthority.runtimeState.transportTLSAuthority);
    storedSnapshot.masterAuthority.runtimeState.updateSelf.state = 2;
@@ -858,6 +965,30 @@ int main(void)
    pendingAddMachinesOperation.updatedAtMs = 123456812;
    pendingAddMachinesOperation.lastFailure.assign("waiting for promotion"_ctv);
    storedSnapshot.masterAuthority.runtimeState.pendingAddMachinesOperations.push_back(pendingAddMachinesOperation);
+   ProdigyStatefulWorkerTopologyUpgradeOperation topologyUpgradeOperation = {};
+   topologyUpgradeOperation.deploymentID = storedPlan.config.deploymentID();
+   topologyUpgradeOperation.applicationID = applicationID;
+   topologyUpgradeOperation.operationID = 17;
+   topologyUpgradeOperation.phase = StatefulWorkerTopologyUpgradePhase::greenBootstrap;
+   topologyUpgradeOperation.sourceWorkerCount = 1;
+   topologyUpgradeOperation.targetWorkerCount = 1;
+   topologyUpgradeOperation.sourceEpoch = 1;
+   topologyUpgradeOperation.targetEpoch = 2222;
+   topologyUpgradeOperation.targetLogicalCores = 2;
+   topologyUpgradeOperation.targetMemoryMB = 512;
+   topologyUpgradeOperation.targetStorageMB = 64;
+   topologyUpgradeOperation.lockedShardGroups.push_back(0);
+   topologyUpgradeOperation.updatedAtMs = 123456813;
+   storedSnapshot.masterAuthority.runtimeState.statefulWorkerTopologyUpgradeOperations.push_back(topologyUpgradeOperation);
+   ProdigyDeferredStatefulScaleIntent deferredScaleIntent = {};
+   deferredScaleIntent.deploymentID = storedPlan.config.deploymentID();
+   deferredScaleIntent.applicationID = applicationID;
+   deferredScaleIntent.targetShardGroups = 2;
+   deferredScaleIntent.targetLogicalCores = 4;
+   deferredScaleIntent.targetMemoryMB = 768;
+   deferredScaleIntent.targetStorageMB = 96;
+   deferredScaleIntent.updatedAtMs = 123456814;
+   storedSnapshot.masterAuthority.runtimeState.deferredStatefulScaleIntents.push_back(deferredScaleIntent);
 
    ProdigyMetricSample metricA = {};
    metricA.ms = 1700000001000;
@@ -1055,12 +1186,23 @@ int main(void)
       if (!loadSnapshot) basics_log("detail load_snapshot: %s\n", failure.c_str());
       suite.expect(loadSnapshot, "load_snapshot");
       suite.expect(equalBrainSnapshots(expectedManagedSnapshot, loadedSnapshot), "load_snapshot_roundtrip");
+      suite.expect(
+         loadedSnapshot.masterAuthority.runtimeState.statefulWorkerTopologyUpgradeOperations.size() == 1
+            && loadedSnapshot.masterAuthority.runtimeState.statefulWorkerTopologyUpgradeOperations[0].targetLogicalCores == 2
+            && loadedSnapshot.masterAuthority.runtimeState.statefulWorkerTopologyUpgradeOperations[0].targetWorkerCount == 1,
+         "load_snapshot_restores_stateful_worker_topology_upgrade_operation");
+      suite.expect(
+         loadedSnapshot.masterAuthority.runtimeState.deferredStatefulScaleIntents.size() == 1
+            && loadedSnapshot.masterAuthority.runtimeState.deferredStatefulScaleIntents[0].targetShardGroups == 2
+            && loadedSnapshot.masterAuthority.runtimeState.deferredStatefulScaleIntents[0].targetLogicalCores == 4,
+         "load_snapshot_restores_deferred_stateful_scale_intent");
       suite.expect(loadedSnapshot.brainConfig.runtimeEnvironment.providerCredentialMaterial.size() == 0, "load_snapshot_scrubs_provider_credential");
       suite.expect(loadedSnapshot.brainConfig.runtimeEnvironment.aws.bootstrapCredentialRefreshCommand.size() == 0, "load_snapshot_scrubs_refresh_command");
 
       {
          PersistentStateTestBrain restoredBrain = {};
          restoredBrain.applyPersistentMasterAuthorityPackage(loadedSnapshot.masterAuthority);
+         suite.expect(restoredBrain.hasCompletedInitialMasterElection, "load_snapshot_restores_initial_master_election_completion");
 
          ApplicationServiceIdentity restoredClientsService = {};
          suite.expect(

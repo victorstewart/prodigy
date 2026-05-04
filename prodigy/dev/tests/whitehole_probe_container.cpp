@@ -23,6 +23,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#ifndef IP_FREEBIND
+#define IP_FREEBIND 15
+#endif
+
 namespace
 {
    static constexpr const char *kTargetHost = "whitehole-target.test";
@@ -136,10 +140,34 @@ private:
          return false;
       }
 
-      UDPSocket socket;
-      socket.setIPVersion(AF_INET);
-      socket.setSaddr(whitehole.address, whitehole.sourcePort);
-      socket.bind();
+      int socketFD = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+      if (socketFD < 0)
+      {
+         failure = "socket_failed";
+         appendTrace("probe.socket.fail", strerror(errno));
+         return false;
+      }
+
+      int enabled = 1;
+      if (setsockopt(socketFD, SOL_IP, IP_FREEBIND, &enabled, sizeof(enabled)) != 0)
+      {
+         failure = "freebind_failed";
+         appendTrace("probe.freebind.fail", strerror(errno));
+         close(socketFD);
+         return false;
+      }
+
+      struct sockaddr_in bindAddress = {};
+      bindAddress.sin_family = AF_INET;
+      bindAddress.sin_port = htons(whitehole.sourcePort);
+      memcpy(&bindAddress.sin_addr.s_addr, &whitehole.address.v4, sizeof(bindAddress.sin_addr.s_addr));
+      if (bind(socketFD, reinterpret_cast<const struct sockaddr *>(&bindAddress), sizeof(bindAddress)) != 0)
+      {
+         failure = "bind_failed";
+         appendTrace("probe.bind.fail", strerror(errno));
+         close(socketFD);
+         return false;
+      }
 
       std::string whiteholeAddress = renderIPv4(*reinterpret_cast<const struct in_addr *>(&whitehole.address.v4));
       appendTrace("probe.bind", whiteholeAddress.c_str());
@@ -151,7 +179,7 @@ private:
       target.sin_addr = targetAddress;
 
       appendTrace("probe.send.begin", renderIPv4(targetAddress).c_str());
-      ssize_t sent = sendto(socket.fd,
+      ssize_t sent = sendto(socketFD,
          kOpenPayload,
          std::strlen(kOpenPayload),
          MSG_NOSIGNAL,
@@ -160,23 +188,23 @@ private:
       if (sent != static_cast<ssize_t>(std::strlen(kOpenPayload)))
       {
          failure = "sendto_failed";
-         appendTrace("probe.send.fail", failure.c_str());
-         socket.close();
+         appendTrace("probe.send.fail", strerror(errno));
+         close(socketFD);
          return false;
       }
 
-      if (waitReadable(socket.fd, kReplyTimeoutMs) == false)
+      if (waitReadable(socketFD, kReplyTimeoutMs) == false)
       {
          failure = "reply_timeout";
          appendTrace("probe.recv.timeout");
-         socket.close();
+         close(socketFD);
          return false;
       }
 
       char buffer[256] = {};
       struct sockaddr_in replySource = {};
       socklen_t replySourceLen = sizeof(replySource);
-      ssize_t received = recvfrom(socket.fd,
+      ssize_t received = recvfrom(socketFD,
          buffer,
          sizeof(buffer),
          0,
@@ -186,7 +214,7 @@ private:
       {
          failure = "recvfrom_failed";
          appendTrace("probe.recv.fail", failure.c_str());
-         socket.close();
+         close(socketFD);
          return false;
       }
 
@@ -194,7 +222,7 @@ private:
       {
          failure = "reply_source_mismatch";
          appendTrace("probe.recv.bad_source", failure.c_str());
-         socket.close();
+         close(socketFD);
          return false;
       }
 
@@ -202,17 +230,17 @@ private:
       {
          failure = "reply_payload_mismatch";
          appendTrace("probe.recv.bad_payload", failure.c_str());
-         socket.close();
+         close(socketFD);
          return false;
       }
 
       appendTrace("probe.recv.ok");
 
-      if (waitReadable(socket.fd, kSpoofGuardMs))
+      if (waitReadable(socketFD, kSpoofGuardMs))
       {
          struct sockaddr_in unexpected = {};
          socklen_t unexpectedLen = sizeof(unexpected);
-         received = recvfrom(socket.fd,
+         received = recvfrom(socketFD,
             buffer,
             sizeof(buffer),
             0,
@@ -228,12 +256,12 @@ private:
             static_cast<long long>(received));
          failure = detail;
          appendTrace("probe.recv.unexpected", detail);
-         socket.close();
+         close(socketFD);
          return false;
       }
 
       appendTrace("probe.spoof_guard.ok");
-      socket.close();
+      close(socketFD);
       return true;
    }
 

@@ -169,6 +169,8 @@ namespace ProdigySDK
       statistics = 10,
       resourceDeltaAck = 11,
       credentialsRefresh = 12,
+      wormholesRefresh = 13,
+      runtimeReady = 14,
    };
 
    struct MessageFrame
@@ -219,6 +221,12 @@ namespace ProdigySDK
       {
          (void)hub;
          (void)delta;
+      }
+
+      virtual void wormholesRefreshRaw(NeuronHub& hub, const Bytes& payload)
+      {
+         (void)hub;
+         (void)payload;
       }
 
       virtual void messageFromProdigy(NeuronHub& hub, const Bytes& payload)
@@ -667,7 +675,7 @@ namespace ProdigySDK
 
       static inline bool validTopic(std::uint16_t rawTopic)
       {
-         return rawTopic <= static_cast<std::uint16_t>(ContainerTopic::credentialsRefresh);
+         return rawTopic <= static_cast<std::uint16_t>(ContainerTopic::runtimeReady);
       }
    }
 
@@ -1067,6 +1075,11 @@ namespace ProdigySDK
       return buildMessageFrame(output, ContainerTopic::healthy, nullptr, 0);
    }
 
+   inline Result buildRuntimeReadyFrame(Bytes& output)
+   {
+      return buildMessageFrame(output, ContainerTopic::runtimeReady, nullptr, 0);
+   }
+
    template <typename MetricPairs>
    Result buildStatisticsFrame(Bytes& output, const MetricPairs& metrics)
    {
@@ -1291,6 +1304,11 @@ namespace ProdigySDK
          return buildReadyFrame(output);
       }
 
+      Result signalRuntimeReady(Bytes& output) const
+      {
+         return buildRuntimeReadyFrame(output);
+      }
+
       Result publishStatistic(Bytes& output, std::uint64_t metricKey, std::uint64_t metricValue) const
       {
          return buildStatisticsFrame(output, std::vector<MetricPair> {{metricKey, metricValue}});
@@ -1315,6 +1333,11 @@ namespace ProdigySDK
       void queueReady(void)
       {
          queuedResponses.push_back(MessageFrame {ContainerTopic::healthy, {}});
+      }
+
+      void queueRuntimeReady(void)
+      {
+         queuedResponses.push_back(MessageFrame {ContainerTopic::runtimeReady, {}});
       }
 
       template <typename MetricPairs>
@@ -1373,6 +1396,7 @@ namespace ProdigySDK
             }
             case ContainerTopic::pong:
             case ContainerTopic::healthy:
+            case ContainerTopic::runtimeReady:
             case ContainerTopic::statistics:
             case ContainerTopic::resourceDeltaAck:
             {
@@ -1482,6 +1506,15 @@ namespace ProdigySDK
                if (controlPolicy.credentialsRefreshAck)
                {
                   queueCredentialsRefreshAck();
+               }
+
+               return Result::ok;
+            }
+            case ContainerTopic::wormholesRefresh:
+            {
+               if (dispatch != nullptr)
+               {
+                  dispatch->wormholesRefreshRaw(*this, frame.payload);
                }
 
                return Result::ok;

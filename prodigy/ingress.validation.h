@@ -284,14 +284,19 @@ namespace ProdigyIngressValidation
 				return (cursor == terminal);
 			}
          case BrainTopic::replicateContainerHealthy:
-         case BrainTopic::replicateContainerRuntimeReady:
-         {
-            uint128_t containerUUID = 0;
-            if (extractFixed(cursor, terminal, containerUUID) == false) return false;
-            return (cursor == terminal);
-         }
-			case BrainTopic::replicateDeployment:
-			{
+	         case BrainTopic::replicateContainerRuntimeReady:
+	         {
+	            uint128_t containerUUID = 0;
+	            if (extractFixed(cursor, terminal, containerUUID) == false) return false;
+	            return (cursor == terminal);
+	         }
+	         case BrainTopic::replicateContainerRuntimeState:
+	         {
+	            if (consumeVariable(cursor, terminal) == false) return false;
+	            return (cursor == terminal);
+	         }
+				case BrainTopic::replicateDeployment:
+				{
 				if ((terminal - args) == ptrdiff_t(sizeof(uint64_t)))
 				{
 					uint64_t deploymentID = 0;
@@ -327,28 +332,39 @@ namespace ProdigyIngressValidation
 				uint128_t existingMasterUUID = 0;
 
 				if (extractFixed(cursor, terminal, uuid) == false) return false;
-				if (extractFixed(cursor, terminal, boottimens) == false) return false;
-				if (extractFixed(cursor, terminal, version) == false) return false;
-				if (extractFixed(cursor, terminal, existingMasterUUID) == false) return false;
-				return (cursor == terminal);
-			}
+					if (extractFixed(cursor, terminal, boottimens) == false) return false;
+					if (extractFixed(cursor, terminal, version) == false) return false;
+					if (extractFixed(cursor, terminal, existingMasterUUID) == false) return false;
+	            if (consumeVariable(cursor, terminal) == false) return false;
+	            if (consumeVariable(cursor, terminal) == false) return false;
+	            if (consumeVariable(cursor, terminal) == false) return false;
+					return (cursor == terminal);
+				}
          case BrainTopic::peerAddressCandidates:
          {
             if (consumeVariable(cursor, terminal) == false) return false;
             return (cursor == terminal);
          }
-			case BrainTopic::masterMissing:
-			{
-				if (cursor == terminal)
+				case BrainTopic::masterMissing:
 				{
-					return true;
+					if (cursor == terminal)
+					{
+						return true;
 				}
 
-				bool isMissing = false;
-				if (extractFixed(cursor, terminal, isMissing) == false) return false;
-				return (cursor == terminal);
-			}
-			case BrainTopic::updateBundle:
+					bool isMissing = false;
+					if (extractFixed(cursor, terminal, isMissing) == false) return false;
+					return (cursor == terminal);
+				}
+				case BrainTopic::peerHeartbeat:
+				{
+					bool isResponse = false;
+					uint64_t heartbeatNonce = 0;
+					if (extractFixed(cursor, terminal, isResponse) == false) return false;
+					if (extractFixed(cursor, terminal, heartbeatNonce) == false) return false;
+					return (cursor == terminal);
+				}
+				case BrainTopic::updateBundle:
 			{
 				if (cursor == terminal)
 				{
@@ -432,14 +448,16 @@ namespace ProdigyIngressValidation
 		{
 			case NeuronTopic::registration:
 			{
-				int64_t bootTimeMs = 0;
-				bool haveData = false;
+					int64_t bootTimeMs = 0;
+					bool haveData = false;
 
-				if (extractFixed(cursor, terminal, bootTimeMs) == false) return false;
-				if (consumeVariable(cursor, terminal) == false) return false;
-				if (extractFixed(cursor, terminal, haveData) == false) return false;
-				return (cursor == terminal);
-			}
+					if (extractFixed(cursor, terminal, bootTimeMs) == false) return false;
+					if (consumeVariable(cursor, terminal) == false) return false;
+					if (consumeVariable(cursor, terminal) == false) return false;
+					if (consumeVariable(cursor, terminal) == false) return false;
+					if (extractFixed(cursor, terminal, haveData) == false) return false;
+					return (cursor == terminal);
+				}
 			case NeuronTopic::machineHardwareProfile:
 			{
 				return consumeVariable(cursor, terminal) && cursor == terminal;
@@ -604,13 +622,20 @@ namespace ProdigyIngressValidation
 				if (extractFixed(cursor, terminal, lifetime) == false) return false;
 				return (cursor == terminal);
 			}
-			case NeuronTopic::killContainer:
-			{
-				uint128_t containerUUID = 0;
-				if (extractFixed(cursor, terminal, containerUUID) == false) return false;
-				return (cursor == terminal);
-			}
-			case NeuronTopic::advertisementPairing:
+				case NeuronTopic::killContainer:
+				{
+					uint128_t containerUUID = 0;
+					if (extractFixed(cursor, terminal, containerUUID) == false) return false;
+					return (cursor == terminal);
+				}
+	         case NeuronTopic::updateOS:
+	         {
+	            if (consumeVariable(cursor, terminal) == false) return false;
+	            if (consumeVariable(cursor, terminal) == false) return false;
+	            if (consumeVariable(cursor, terminal) == false) return false;
+	            return (cursor == terminal);
+	         }
+				case NeuronTopic::advertisementPairing:
 			{
 				uint128_t containerUUID = 0;
 				if (extractFixed(cursor, terminal, containerUUID) == false) return false;

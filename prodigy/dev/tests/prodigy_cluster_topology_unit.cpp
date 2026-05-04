@@ -2,6 +2,7 @@
 #include <services/debug.h>
 #include <services/prodigy.h>
 #include <prodigy/brain/base.h>
+#include <prodigy/brain.reachability.h>
 #include <prodigy/cluster.machine.helpers.h>
 #include <prodigy/routable.address.helpers.h>
 #include <prodigy/types.h>
@@ -613,6 +614,30 @@ int main(void)
       suite.expect(machine.neuron.fslot == 7, "machine_neuron_endpoint_preserves_fixed_file_slot");
    }
 
+   {
+      TestNeuronBase neuron = {};
+      neuron.private4 = IPAddress("10.0.0.10", false);
+
+      Machine machine = {};
+      machine.privateAddress = "fd00:20::22"_ctv;
+      machine.peerAddresses.push_back(ClusterMachinePeerAddress{"fd00:20::22"_ctv, 64});
+
+      Vector<ClusterMachinePeerAddress> cachedLocalCandidates = {};
+      cachedLocalCandidates.push_back(ClusterMachinePeerAddress{"fd00:20::10"_ctv, 64});
+      cachedLocalCandidates.push_back(ClusterMachinePeerAddress{"2001:db8:100::10"_ctv, 64});
+
+      prodigyConfigureMachineNeuronEndpoint(machine, &neuron, &cachedLocalCandidates);
+
+      IPAddress configuredSourceAddress = {};
+      String configuredSourceText = {};
+      suite.expect(
+         prodigySockaddrToIPAddress(machine.neuron.saddr<struct sockaddr>(), configuredSourceAddress, &configuredSourceText),
+         "machine_neuron_endpoint_cached_candidates_resolve_source");
+      suite.expect(configuredSourceAddress.is6, "machine_neuron_endpoint_cached_candidates_preserve_ipv6_family");
+      suite.expect(configuredSourceText == "fd00:20::10"_ctv, "machine_neuron_endpoint_cached_candidates_select_matching_source");
+      machine.neuron.close();
+   }
+
    Machine orderByAddressA = {};
    orderByAddressA.private4 = IPAddress("10.0.0.9", false).v4;
    orderByAddressA.peerAddresses.push_back(ClusterMachinePeerAddress{"fd00:3::b"_ctv, 64});
@@ -650,6 +675,31 @@ int main(void)
       suite.expect(orderedCandidates[0].address == "10.2.0.29"_ctv, "peer_candidate_ordering_shared_private_subnet_first");
       suite.expect(orderedCandidates[1].address == "10.1.0.29"_ctv, "peer_candidate_ordering_remaining_private_before_public");
       suite.expect(orderedCandidates[2].address == "198.51.100.29"_ctv, "peer_candidate_ordering_public_last");
+   }
+
+   ClusterTopology explicitPeerTopology = {};
+   ClusterMachine explicitPeerMachine = {};
+   explicitPeerMachine.isBrain = true;
+   appendPrivateAddress(explicitPeerMachine, "10.0.0.31", 24);
+   appendPrivateAddress(explicitPeerMachine, "fd00:10::31", 64);
+   appendPublicAddress(explicitPeerMachine, "2001:db8:100::31", 64);
+   prodigyAppendUniqueClusterMachinePeerAddress(
+      explicitPeerMachine.peerAddresses,
+      ClusterMachinePeerAddress{"2001:db8:100::31"_ctv, 64});
+   explicitPeerTopology.machines.push_back(explicitPeerMachine);
+   prodigyNormalizeClusterTopologyPeerAddresses(explicitPeerTopology);
+   {
+      Vector<ClusterMachinePeerAddress> explicitCandidates = {};
+      prodigyCollectClusterMachinePeerAddresses(explicitPeerTopology.machines[0], explicitCandidates);
+      suite.expect(explicitCandidates.size() == 1, "explicit_peer_candidate_normalize_keeps_candidate_count");
+      if (explicitCandidates.size() == 1)
+      {
+         suite.expect(explicitCandidates[0].address == "2001:db8:100::31"_ctv, "explicit_peer_candidate_normalize_keeps_public6");
+      }
+      suite.expect(explicitPeerTopology.machines[0].addresses.privateAddresses.size() == 2, "explicit_peer_candidate_normalize_preserves_private_identity_addresses");
+      uint32_t explicitPrivate4 = 0;
+      suite.expect(explicitPeerTopology.machines[0].resolvePrivate4(explicitPrivate4), "explicit_peer_candidate_normalize_private4_resolves");
+      suite.expect(explicitPrivate4 == IPAddress("10.0.0.31", false).v4, "explicit_peer_candidate_normalize_private4_preserved");
    }
 
    Vector<ClusterMachinePeerAddress> localSourceCandidates = {};
@@ -706,6 +756,29 @@ int main(void)
    suite.expect(wholeMachineResolved.ownedLogicalCores == 6, "cluster_machine_whole_machine_resolve_cores");
    suite.expect(wholeMachineResolved.ownedMemoryMB == 28672, "cluster_machine_whole_machine_resolve_memory");
    suite.expect(wholeMachineResolved.ownedStorageMB == 200704, "cluster_machine_whole_machine_resolve_storage");
+   uint32_t resolvedPrivate4 = 0;
+   suite.expect(created.resolvePrivate4(resolvedPrivate4), "cluster_machine_resolve_private4_asymmetric_ipv4");
+   suite.expect(resolvedPrivate4 == IPAddress("10.0.0.11", false).v4, "cluster_machine_resolve_private4_preserves_network_order");
+   uint32_t resolvedGatewayPrivate4 = 0;
+   suite.expect(created.resolvePrivate4Gateway(resolvedGatewayPrivate4), "cluster_machine_resolve_private4_gateway_asymmetric_ipv4");
+   suite.expect(resolvedGatewayPrivate4 == IPAddress("10.0.0.1", false).v4, "cluster_machine_resolve_private4_gateway_preserves_network_order");
+
+   ClusterTopology asymmetricNormalizedTopology = {};
+   asymmetricNormalizedTopology.machines.push_back(adopted);
+   asymmetricNormalizedTopology.machines.push_back(created);
+   prodigyNormalizeClusterTopologyPeerAddresses(asymmetricNormalizedTopology);
+   suite.expect(asymmetricNormalizedTopology.machines[1].addresses.privateAddresses.size() == 1, "cluster_machine_normalized_private4_candidate_count");
+   if (asymmetricNormalizedTopology.machines[1].addresses.privateAddresses.size() == 1)
+   {
+      suite.expect(asymmetricNormalizedTopology.machines[1].addresses.privateAddresses[0].address == "10.0.0.11"_ctv, "cluster_machine_normalized_private4_literal_preserved");
+      suite.expect(asymmetricNormalizedTopology.machines[1].addresses.privateAddresses[0].gateway == "10.0.0.1"_ctv, "cluster_machine_normalized_private4_gateway_preserved");
+   }
+   resolvedPrivate4 = 0;
+   suite.expect(asymmetricNormalizedTopology.machines[1].resolvePrivate4(resolvedPrivate4), "cluster_machine_normalized_resolve_private4_asymmetric_ipv4");
+   suite.expect(resolvedPrivate4 == IPAddress("10.0.0.11", false).v4, "cluster_machine_normalized_resolve_private4_preserves_network_order");
+   resolvedGatewayPrivate4 = 0;
+   suite.expect(asymmetricNormalizedTopology.machines[1].resolvePrivate4Gateway(resolvedGatewayPrivate4), "cluster_machine_normalized_resolve_private4_gateway_asymmetric_ipv4");
+   suite.expect(resolvedGatewayPrivate4 == IPAddress("10.0.0.1", false).v4, "cluster_machine_normalized_resolve_private4_gateway_preserves_network_order");
 
    ClusterMachine invalidPercentages = adopted;
    invalidPercentages.ownership.nMemoryBasisPoints = 0;

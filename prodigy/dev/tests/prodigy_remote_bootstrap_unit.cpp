@@ -989,6 +989,53 @@ int main(void)
    expectBootstrapPeerCandidate(suite, publicSSHBootState.bootstrapConfig.bootstrapPeers[0], 0, "10.0.0.29"_ctv, 0, "plan_boot_json_public_ssh_prefers_private_peer");
    expectBootstrapPeerCandidate(suite, publicSSHBootState.bootstrapConfig.bootstrapPeers[0], 1, "44.0.0.29"_ctv, 0, "plan_boot_json_public_ssh_falls_back_to_public_peer");
 
+   ClusterMachine explicitPeerFamilyPeer = makeBrainMachine("brain-explicit-peer-family-peer"_ctv, "10.0.0.29"_ctv);
+   prodigyAppendUniqueClusterMachineAddress(explicitPeerFamilyPeer.addresses.privateAddresses, "fd00:10::29"_ctv);
+   prodigyAppendUniqueClusterMachineAddress(explicitPeerFamilyPeer.addresses.publicAddresses, "2001:db8:100::29"_ctv);
+   prodigyAppendUniqueClusterMachinePeerAddress(
+      explicitPeerFamilyPeer.peerAddresses,
+      ClusterMachinePeerAddress{"2001:db8:100::29"_ctv, 64});
+   ClusterMachine explicitPeerFamilySeed = target;
+   prodigyAppendUniqueClusterMachineAddress(explicitPeerFamilySeed.addresses.privateAddresses, "fd00:10::31"_ctv);
+   prodigyAppendUniqueClusterMachineAddress(explicitPeerFamilySeed.addresses.publicAddresses, "2001:db8:100::31"_ctv);
+   prodigyAppendUniqueClusterMachinePeerAddress(
+      explicitPeerFamilySeed.peerAddresses,
+      ClusterMachinePeerAddress{"2001:db8:100::31"_ctv, 64});
+
+   ClusterTopology explicitPeerFamilyTopology = {};
+   explicitPeerFamilyTopology.version = 131;
+   explicitPeerFamilyTopology.machines.push_back(explicitPeerFamilySeed);
+   explicitPeerFamilyTopology.machines.push_back(explicitPeerFamilyPeer);
+
+   suite.expect(
+      prodigyBuildRemoteBootstrapPlan(explicitPeerFamilySeed, request, explicitPeerFamilyTopology, runtimeEnvironment, plan, &failure),
+      "build_remote_bootstrap_plan_explicit_peer_family"
+   );
+   suite.expect(failure.size() == 0, "build_remote_bootstrap_plan_explicit_peer_family_clears_failure");
+
+   ProdigyPersistentBootState explicitPeerFamilyBootState = {};
+   suite.expect(parseProdigyPersistentBootStateJSON(plan.bootJSON, explicitPeerFamilyBootState, &failure), "plan_boot_json_explicit_peer_family_parses");
+   bool explicitPeerFamilyCountOkay = explicitPeerFamilyBootState.bootstrapConfig.bootstrapPeers.size() == 1;
+   suite.expect(explicitPeerFamilyCountOkay, "plan_boot_json_explicit_peer_family_peer_count");
+   if (explicitPeerFamilyCountOkay)
+   {
+      bool explicitPeerFamilyCandidateCountOkay = explicitPeerFamilyBootState.bootstrapConfig.bootstrapPeers[0].addresses.size() == 1;
+      suite.expect(explicitPeerFamilyCandidateCountOkay, "plan_boot_json_explicit_peer_family_candidate_count");
+      if (explicitPeerFamilyCandidateCountOkay)
+      {
+         expectBootstrapPeerCandidate(suite, explicitPeerFamilyBootState.bootstrapConfig.bootstrapPeers[0], 0, "2001:db8:100::29"_ctv, 64, "plan_boot_json_explicit_peer_family_public6_literal");
+      }
+   }
+   const ClusterMachine *explicitPeerFamilyParsedPeer = findMachineByCloudID(explicitPeerFamilyBootState.initialTopology, explicitPeerFamilyPeer.cloud.cloudID);
+   suite.expect(explicitPeerFamilyParsedPeer != nullptr, "plan_boot_json_explicit_peer_family_topology_peer_found");
+   if (explicitPeerFamilyParsedPeer != nullptr)
+   {
+      uint32_t explicitPeerFamilyPrivate4 = 0;
+      suite.expect(explicitPeerFamilyParsedPeer->resolvePrivate4(explicitPeerFamilyPrivate4), "plan_boot_json_explicit_peer_family_private4_resolves");
+      suite.expect(explicitPeerFamilyPrivate4 == IPAddress("10.0.0.29", false).v4, "plan_boot_json_explicit_peer_family_private4_preserved");
+      suite.expect(explicitPeerFamilyParsedPeer->peerAddresses.size() == 1, "plan_boot_json_explicit_peer_family_topology_peer_candidate_count");
+   }
+
    ClusterMachine private6Peer = makeBrainMachine("brain-private6-peer"_ctv, "fd00:10::29"_ctv);
    ClusterMachine private6Seed = target;
    prodigyAppendUniqueClusterMachineAddress(private6Seed.addresses.privateAddresses, "fd00:10::31"_ctv);

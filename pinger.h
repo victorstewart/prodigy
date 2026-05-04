@@ -5,8 +5,8 @@
 class PingSubscriber {
 public:
 
-	virtual void machinePingable(MachineBase *machine) = 0;
-	virtual void machineUnpingable(MachineBase *machine) = 0;
+   virtual void machinePingable(MachineBase *machine) = 0;
+   virtual void machineUnpingable(MachineBase *machine) = 0;
 };
 
 class MachinePinger : public ICMPSocket, public RingInterface, public RecvmsgMultishoter {
@@ -27,90 +27,90 @@ private:
       // basic rate limiting / backoff scheduling
       int64_t nextMs = 0;     // earliest time to send next ping
 
-		bool indefinitely(void)
-		{
-			return (untilMs == 0 && finiteCount == false);
-		}
-	};
+      bool indefinitely(void)
+      {
+         return (untilMs == 0 && finiteCount == false);
+      }
+   };
 
-	#define IP_DF 0x4000
+   #define IP_DF 0x4000
 
-	static inline constexpr uint32_t ping_interval_ms = 250;
+   static inline constexpr uint32_t ping_interval_ms = 250;
 
-	using ICMPMessage = msg<0, sizeof(struct iphdr) + sizeof(struct icmphdr) >;
+   using ICMPMessage = msg<0, sizeof(struct iphdr) + sizeof(struct icmphdr) >;
 
-	Pool<ICMPMessage, true> pool{256};
-	bytell_hash_map<uint32_t, Pingee *> pingeesByPrivate4;
+   Pool<ICMPMessage, true> pool{256};
+   bytell_hash_map<uint32_t, Pingee *> pingeesByPrivate4;
 
-	PingSubscriber *subscriber;
-	uint32_t src;
+   PingSubscriber *subscriber;
+   uint32_t src;
 
-	TimeoutPacket timer;
+   TimeoutPacket timer;
 
-	uint16_t calculate_checksum(const uint8_t *data, size_t length) 
-	{
-   	uint32_t sum = 0;
+   uint16_t calculate_checksum(const uint8_t *data, size_t length)
+   {
+      uint32_t sum = 0;
 
-    	// Sum up all 16-bit words
-    	for (size_t i = 0; i < length; i += 2) 
-    	{
-      	uint16_t word = (data[i] << 8) + (i + 1 < length ? data[i + 1] : 0);
-        	sum += word;
-    	}
+       // Sum up all 16-bit words
+       for (size_t i = 0; i < length; i += 2)
+       {
+         uint16_t word = (data[i] << 8) + (i + 1 < length ? data[i + 1] : 0);
+           sum += word;
+       }
 
-    	// Add the carry bits back to the sum
-    	while (sum >> 16) 
-    	{
-      	sum = (sum & 0xFFFF) + (sum >> 16);
-    	}
+       // Add the carry bits back to the sum
+       while (sum >> 16)
+       {
+         sum = (sum & 0xFFFF) + (sum >> 16);
+       }
 
-   	// Return the one's complement of the sum
-    	return ~sum;
-	}
+      // Return the one's complement of the sum
+       return ~sum;
+   }
 
-	Pingee* createPingee(MachineBase *machine)
-	{
-		Pingee *pingee = new Pingee();
-		pingee->machine = machine;
-		pingee->finiteCount = false;
-		pingee->nRemaining = 0;
-		pingee->nextMs = 0;
-		pingeesByPrivate4.insert_or_assign(machine->private4, pingee);
+   Pingee* createPingee(MachineBase *machine)
+   {
+      Pingee *pingee = new Pingee();
+      pingee->machine = machine;
+      pingee->finiteCount = false;
+      pingee->nRemaining = 0;
+      pingee->nextMs = 0;
+      pingeesByPrivate4.insert_or_assign(machine->private4, pingee);
 
-		if (pingeesByPrivate4.size() == 1) Ring::queueTimeoutMultishot(&timer);
+      if (pingeesByPrivate4.size() == 1) Ring::queueTimeoutMultishot(&timer);
 
-		return pingee;
-	}
+      return pingee;
+   }
 
 public:
 
-	MachinePinger() = default;
+   MachinePinger() = default;
 
-	~MachinePinger()
-	{
-		RingDispatcher::eraseMultiplexee(this);
-		Ring::queueCancelTimeout(&timer);
+   ~MachinePinger()
+   {
+      RingDispatcher::eraseMultiplexee(this);
+      Ring::queueCancelTimeout(&timer);
 
-		if (isFixedFile && fslot >= 0 && Ring::getRingFD() > 0)
-		{
-			Ring::queueCloseRaw(fslot);
-			fslot = -1;
-		}
-		else if (isFixedFile == false && fd >= 0)
-		{
-			::close(fd);
-			fd = -1;
-		}
+      if (isFixedFile && fslot >= 0 && Ring::getRingFD() > 0)
+      {
+         Ring::queueCloseRaw(fslot);
+         fslot = -1;
+      }
+      else if (isFixedFile == false && fd >= 0)
+      {
+         ::close(fd);
+         fd = -1;
+      }
 
-		isFixedFile = false;
+      isFixedFile = false;
 
-		for (auto& [private4, pingee] : pingeesByPrivate4)
-		{
-			(void)private4;
-			delete pingee;
-		}
-		pingeesByPrivate4.clear();
-	}
+      for (auto& [private4, pingee] : pingeesByPrivate4)
+      {
+         (void)private4;
+         delete pingee;
+      }
+      pingeesByPrivate4.clear();
+   }
 
    void sendPing(Pingee *pingee)
    {
@@ -267,54 +267,54 @@ public:
       sendPing(pingee);
    }
 
-	void removeMachine(MachineBase *machine)
-	{
-		if (auto it = pingeesByPrivate4.find(machine->private4); it != pingeesByPrivate4.end())
-		{
-			Pingee *pingee = it->second;
-			delete pingee;
-			pingeesByPrivate4.erase(it);
+   void removeMachine(MachineBase *machine)
+   {
+      if (auto it = pingeesByPrivate4.find(machine->private4); it != pingeesByPrivate4.end())
+      {
+         Pingee *pingee = it->second;
+         delete pingee;
+         pingeesByPrivate4.erase(it);
 
-			if (pingeesByPrivate4.size() == 0) Ring::queueCancelTimeout(&timer);
-		}
-	}
+         if (pingeesByPrivate4.size() == 0) Ring::queueCancelTimeout(&timer);
+      }
+   }
 
-		void configure(PingSubscriber *_subscriber, uint32_t ourPrivate4)
-		{
-			subscriber = _subscriber;
-			src = ourPrivate4;
-			RingDispatcher::installMultiplexee(this, this);
-			Ring::installFDIntoFixedFileSlot(this);
+      void configure(PingSubscriber *_subscriber, uint32_t ourPrivate4)
+      {
+         subscriber = _subscriber;
+         src = ourPrivate4;
+         RingDispatcher::installMultiplexee(this, this);
+         Ring::installFDIntoFixedFileSlot(this);
 
-			bgid = Ring::createBufferRing(sizeof(struct io_uring_recvmsg_out) + sizeof(struct iphdr) + sizeof(struct icmphdr), 256);
-			Ring::queueRecvmsgMultishot(this);
+         bgid = Ring::createBufferRing(sizeof(struct io_uring_recvmsg_out) + sizeof(struct iphdr) + sizeof(struct icmphdr), 256);
+         Ring::queueRecvmsgMultishot(this);
 
-		timer.originator = this;
-		timer.setTimeoutMs(ping_interval_ms);
-	}
+      timer.originator = this;
+      timer.setTimeoutMs(ping_interval_ms);
+   }
 
-	void recvmsgMultishotHandler(void *socket, struct io_uring_recvmsg_out *package, int result, bool mustRefresh)
-	{
-		if (result > 0 && package)
-		{
-			uint8_t *payload = reinterpret_cast<uint8_t *>(io_uring_recvmsg_payload(package, &msgh));
-			receivePing(payload);
-		}
+   void recvmsgMultishotHandler(void *socket, struct io_uring_recvmsg_out *package, int result, bool mustRefresh)
+   {
+      if (result > 0 && package)
+      {
+         uint8_t *payload = reinterpret_cast<uint8_t *>(io_uring_recvmsg_payload(package, &msgh));
+         receivePing(payload);
+      }
 
-		if (package)
-		{
-			Ring::relinquishBufferToRing(this, reinterpret_cast<uint8_t *>(package));
-		}
-		if (mustRefresh) Ring::queueRecvmsgMultishot(this);
-	}
+      if (package)
+      {
+         Ring::relinquishBufferToRing(this, reinterpret_cast<uint8_t *>(package));
+      }
+      if (mustRefresh) Ring::queueRecvmsgMultishot(this);
+   }
 
-	void sendmsgHandler(void *socket, struct msghdr *msg, int result)
-	{
-		pingSent(msg, result);
-	}
+   void sendmsgHandler(void *socket, struct msghdr *msg, int result)
+   {
+      pingSent(msg, result);
+   }
 
-	void timeoutMultishotHandler(TimeoutPacket *packet, int result)
-	{
-		sendPings();
-	}
+   void timeoutMultishotHandler(TimeoutPacket *packet, int result)
+   {
+      sendPings();
+   }
 };

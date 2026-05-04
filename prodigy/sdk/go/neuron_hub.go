@@ -158,6 +158,8 @@ const (
 	ContainerTopicStatistics
 	ContainerTopicResourceDeltaAck
 	ContainerTopicCredentialsRefresh
+	ContainerTopicWormholesRefresh
+	ContainerTopicRuntimeReady
 )
 
 type Dispatch interface {
@@ -167,6 +169,7 @@ type Dispatch interface {
 	SubscriptionPairing(hub *NeuronHub, pairing SubscriptionPairing)
 	ResourceDelta(hub *NeuronHub, delta ResourceDelta)
 	CredentialsRefresh(hub *NeuronHub, delta CredentialDelta)
+	WormholesRefresh(hub *NeuronHub, payload []byte)
 	MessageFromProdigy(hub *NeuronHub, payload []byte)
 }
 
@@ -178,6 +181,7 @@ func (DispatchBase) AdvertisementPairing(*NeuronHub, AdvertisementPairing) {}
 func (DispatchBase) SubscriptionPairing(*NeuronHub, SubscriptionPairing)   {}
 func (DispatchBase) ResourceDelta(*NeuronHub, ResourceDelta)               {}
 func (DispatchBase) CredentialsRefresh(*NeuronHub, CredentialDelta)        {}
+func (DispatchBase) WormholesRefresh(*NeuronHub, []byte)                   {}
 func (DispatchBase) MessageFromProdigy(*NeuronHub, []byte)                 {}
 
 type NeuronHub struct {
@@ -368,6 +372,8 @@ func (hub *NeuronHub) HandleFrame(frame MessageFrame) ([]MessageFrame, error) {
 		return []MessageFrame{{Topic: ContainerTopicPing}}, nil
 	case ContainerTopicPong:
 		return outbound, nil
+	case ContainerTopicRuntimeReady:
+		return outbound, nil
 	case ContainerTopicStop:
 		hub.shutdownRequested = true
 		hub.Dispatch.BeginShutdown(hub)
@@ -434,6 +440,9 @@ func (hub *NeuronHub) HandleFrame(frame MessageFrame) ([]MessageFrame, error) {
 			})
 		}
 		return outbound, nil
+	case ContainerTopicWormholesRefresh:
+		hub.Dispatch.WormholesRefresh(hub, cloneBytes(frame.Payload))
+		return outbound, nil
 	default:
 		return nil, fmt.Errorf("prodigy: unsupported topic %d", frame.Topic)
 	}
@@ -441,6 +450,10 @@ func (hub *NeuronHub) HandleFrame(frame MessageFrame) ([]MessageFrame, error) {
 
 func (hub *NeuronHub) SignalReady() error {
 	return hub.sendEmpty(ContainerTopicHealthy)
+}
+
+func (hub *NeuronHub) SignalRuntimeReady() error {
+	return hub.sendEmpty(ContainerTopicRuntimeReady)
 }
 
 func (hub *NeuronHub) Healthy() error {
@@ -858,6 +871,10 @@ func BuildMessageFrame(topic ContainerTopic, payload []byte) []byte {
 
 func BuildReadyFrame() []byte {
 	return BuildMessageFrame(ContainerTopicHealthy, nil)
+}
+
+func BuildRuntimeReadyFrame() []byte {
+	return BuildMessageFrame(ContainerTopicRuntimeReady, nil)
 }
 
 func BuildStatisticsFrame(metrics []MetricPair) []byte {

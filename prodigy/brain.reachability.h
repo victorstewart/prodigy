@@ -8,6 +8,7 @@
 #include <cstring>
 #include <sys/wait.h>
 
+#include <prodigy/child.process.signal.h>
 #include <prodigy/remote.bootstrap.h>
 
 static inline void prodigyRenderBrainReachabilityLabel(const ClusterMachine& machine, String& label)
@@ -226,16 +227,7 @@ static inline bool prodigyRunBlockingLocalCommandCaptureStdout(const String& com
    output.clear();
    if (failure) failure->clear();
 
-   struct sigaction currentSigChld = {};
-   if (::sigaction(SIGCHLD, nullptr, &currentSigChld) == 0
-      && currentSigChld.sa_handler == SIG_IGN)
-   {
-      struct sigaction defaultSigChld = {};
-      ::sigemptyset(&defaultSigChld.sa_mask);
-      defaultSigChld.sa_handler = SIG_DFL;
-      defaultSigChld.sa_flags = 0;
-      (void)::sigaction(SIGCHLD, &defaultSigChld, nullptr);
-   }
+   (void)prodigyEnsureSigchldDefaultWaitable();
 
    String ownedCommand = {};
    ownedCommand.assign(command);

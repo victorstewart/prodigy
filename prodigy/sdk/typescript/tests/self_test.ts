@@ -129,6 +129,9 @@ async function main(): Promise<void>
       { key: 3n, value: 4n },
    ])
    assert.deepEqual(sdk.buildReadyFrame(), fixtureBytes("frame.healthy.empty.bin"))
+   const runtimeReady = sdk.parseMessageFrame(sdk.buildRuntimeReadyFrame())
+   assert.equal(runtimeReady.topic, sdk.ContainerTopic.RuntimeReady)
+   assert.equal(runtimeReady.payload.length, 0)
    assert.deepEqual(sdk.buildStatisticsFrame([{ key: 1n, value: 2n }, { key: 3n, value: 4n }]), fixtureBytes("frame.statistics.demo.bin"))
    assert.deepEqual(sdk.buildResourceDeltaAckFrame(true), fixtureBytes("frame.resource_delta_ack.accepted.bin"))
    assert.deepEqual(sdk.buildCredentialsRefreshAckFrame(), fixtureBytes("frame.credentials_refresh_ack.empty.bin"))
@@ -138,14 +141,31 @@ async function main(): Promise<void>
    assert.deepEqual(decoder.feed(ping.subarray(0, 5)), [])
    const decoded = decoder.feed(ping.subarray(5))
    assert.equal(decoded.length, 1)
+   class Dispatch extends sdk.NeuronHubDispatch
+   {
+      wormholesPayloads: Buffer[] = []
+
+      override wormholesRefresh(_hub: sdk.NeuronHub, payload: Buffer): void
+      {
+         this.wormholesPayloads.push(Buffer.from(payload))
+      }
+   }
+
+   const dispatch = new Dispatch()
    const borrowedFD = fs.openSync("/dev/null", "r")
-   const hub = sdk.NeuronHub.borrowedTransport(new sdk.NeuronHubDispatch(), parameters, borrowedFD)
+   const hub = sdk.NeuronHub.borrowedTransport(dispatch, parameters, borrowedFD)
    hub.close()
    fs.fstatSync(borrowedFD)
    assert.deepEqual(hub.handleFrame(decoded[0]!), [{
       topic: sdk.ContainerTopic.Ping,
       payload: Buffer.alloc(0),
    }])
+   assert.deepEqual(hub.handleFrame(runtimeReady), [])
+   assert.deepEqual(hub.handleFrame({
+      topic: sdk.ContainerTopic.WormholesRefresh,
+      payload: Buffer.from("worm", "ascii"),
+   }), [])
+   assert.deepEqual(dispatch.wormholesPayloads, [Buffer.from("worm", "ascii")])
    fs.closeSync(borrowedFD)
 
    const session = sdk.AegisSession.fromSubscription(demoSubscriptionPairing())

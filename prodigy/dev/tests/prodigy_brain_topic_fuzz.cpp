@@ -14,7 +14,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
       return 0;
    }
 
-   static constexpr std::array<BrainTopic, 22> topics = {
+   static constexpr std::array<BrainTopic, 24> topics = {
       BrainTopic::cullDeployment,
       BrainTopic::reconcileState,
       BrainTopic::registration,
@@ -37,6 +37,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
       BrainTopic::reconcileTd,
       BrainTopic::replicateTdAppend,
       BrainTopic::replicateContainerHealthy,
+      BrainTopic::replicateContainerRuntimeReady,
+      BrainTopic::replicateContainerRuntimeState,
    };
 
    std::vector<uint8_t> bytes(data, data + size);

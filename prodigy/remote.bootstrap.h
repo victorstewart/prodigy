@@ -1092,7 +1092,7 @@ static inline ProdigyRemoteBootstrapClusterTransportTLSState *prodigyResolveRemo
 
    if (it->second.rootCertPem.size() == 0 || it->second.rootKeyPem.size() == 0)
    {
-      if (Vault::generateTransportRootCertificateEd25519(it->second.rootCertPem, it->second.rootKeyPem, failure) == false)
+      if (prodigyGenerateTransportRootCertificateEd25519(it->second.rootCertPem, it->second.rootKeyPem, failure) == false)
       {
          return nullptr;
       }
@@ -1195,7 +1195,7 @@ static inline bool prodigyBuildRemoteBootstrapTransportTLSState(
       localState.transportTLS.clusterRootKeyPem = clusterTLS->rootKeyPem;
    }
 
-   if (Vault::generateTransportNodeCertificateEd25519(
+   if (prodigyGenerateTransportNodeCertificateEd25519(
          clusterTLS->rootCertPem,
          clusterTLS->rootKeyPem,
          localUUID,
@@ -2233,13 +2233,18 @@ public:
          activeStep.assign("connect"_ctv);
          configureExpectedHostKey(prepared.plan.ssh.address, prepared.plan.ssh.port, prepared.plan.ssh.hostPublicKeyOpenSSH);
          uint32_t suspendIndex = nextSuspendIndex();
-         if (prodigyBootstrapSSHKeyPackageConfigured(prepared.plan.bootstrapSshKeyPackage))
+         if (prepared.plan.ssh.privateKeyPath.size() > 0)
+         {
+            authenticate(prepared.plan.ssh.user, prepared.plan.ssh.privateKeyPath);
+         }
+         else if (prodigyBootstrapSSHKeyPackageConfigured(prepared.plan.bootstrapSshKeyPackage))
          {
             authenticate(prepared.plan.ssh.user, prepared.plan.bootstrapSshKeyPackage);
          }
          else
          {
-            authenticate(prepared.plan.ssh.user, prepared.plan.ssh.privateKeyPath);
+            failed = true;
+            lastFailure.assign("remote bootstrap ssh credential unavailable"_ctv);
          }
          if (suspendIndex < nextSuspendIndex())
          {

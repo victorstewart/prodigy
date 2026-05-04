@@ -7,6 +7,9 @@ PINGPONG_BIN="${3:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARNESS="${SCRIPT_DIR}/prodigy_dev_netns_harness.sh"
+source "${SCRIPT_DIR}/prodigy_dev_discombobulator_artifact_helpers.sh"
+SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+prodigy_dev_reexec_in_private_mount_namespace_once PRODIGY_DEV_PINGPONG_DEPLOY_SMOKE_MOUNT_NS_READY bash "${SCRIPT_SELF}" "$@"
 
 if [[ -z "${PRODIGY_BIN}" || -z "${MOTHERSHIP_BIN}" || -z "${PINGPONG_BIN}" ]]
 then
@@ -44,7 +47,7 @@ then
    exit 1
 fi
 
-deps=(awk btrfs cmake install ip ldd mkfs.btrfs mount python3 stat timeout umount zstd)
+deps=(awk btrfs cargo cmake install ip mkfs.btrfs mount python3 stat timeout umount zstd)
 for cmd in "${deps[@]}"
 do
    if ! command -v "${cmd}" >/dev/null 2>&1
@@ -121,12 +124,6 @@ cleanup()
          "${MOTHERSHIP_BIN}" removeCluster "${cluster_name}" >/dev/null 2>&1 || true
    fi
 
-   if [[ -n "${deployment_subvol}" && -e "${deployment_subvol}" ]]
-   then
-      btrfs property set -f "${deployment_subvol}" ro false >/dev/null 2>&1 || true
-      btrfs subvolume delete "${deployment_subvol}" >/dev/null 2>&1 || true
-   fi
-
    if [[ "${containers_mount_created}" -eq 1 ]]
    then
       umount /containers >/dev/null 2>&1 || true
@@ -146,51 +143,6 @@ cleanup()
 }
 trap cleanup EXIT
 
-copy_binary_and_libs_into_subvol()
-{
-   local binary_path="$1"
-   local subvol_root="$2"
-   local install_path="${3:-/root/pingpong_container}"
-   local execute_arch="$4"
-   local rootfs_root="${subvol_root}/rootfs"
-   local metadata_dir="${subvol_root}/.prodigy-private"
-
-   mkdir -p "${rootfs_root}$(dirname "${install_path}")" "${rootfs_root}/etc" "${metadata_dir}"
-   install -m 0755 "${binary_path}" "${rootfs_root}${install_path}"
-
-   cat > "${metadata_dir}/launch.metadata" <<EOF
-{
-  "execute_path": "${install_path}",
-  "execute_args": [],
-  "execute_env": [],
-  "execute_cwd": "/",
-  "execute_arch": "${execute_arch}"
-}
-EOF
-
-   while IFS= read -r libpath
-   do
-      if [[ -z "${libpath}" ]]
-      then
-         continue
-      fi
-
-      if [[ -e "${libpath}" ]]
-      then
-         cp -aL --parents "${libpath}" "${rootfs_root}"
-      fi
-   done < <(
-      ldd "${binary_path}" | awk '
-         /=>/ {
-            if ($3 ~ /^\//) print $3;
-         }
-         /^[[:space:]]*\// {
-            print $1;
-         }
-      ' | sort -u
-   )
-}
-
 detect_arches
 
 if [[ ! -d /containers ]]
@@ -208,27 +160,10 @@ then
       exit 1
    fi
 
-   if [[ -n "$(ls -A /containers 2>/dev/null)" ]]
+   if ! prodigy_dev_containers_root_is_safely_overmountable /containers
    then
-      existing_entries_ok=1
-      while IFS= read -r existing_path
-      do
-         existing_name="$(basename "${existing_path}")"
-         case "${existing_name}" in
-            .prodigy-dev-fs-*)
-               ;;
-            *)
-               existing_entries_ok=0
-               break
-               ;;
-         esac
-      done < <(find /containers -mindepth 1 -maxdepth 1 -print 2>/dev/null)
-
-      if [[ "${existing_entries_ok}" -ne 1 ]]
-      then
-         echo "FAIL: /containers exists on non-btrfs fs and is not safely overmountable"
-         exit 1
-      fi
+      echo "FAIL: /containers exists on non-btrfs fs and is not safely overmountable"
+      exit 1
    fi
 
    containers_loop_image="${tmpdir}/containers.loop.img"
@@ -296,14 +231,29 @@ cat > "${plan_json}" <<EOF
 EOF
 
 container_blob="${tmpdir}/pingpong.container.zst"
-deployment_subvol="/containers/${deployment_id}"
-btrfs subvolume create "${deployment_subvol}" >/dev/null
-copy_binary_and_libs_into_subvol "${PINGPONG_BIN}" "${deployment_subvol}" "/root/pingpong_container" "${bundle_arch}"
-btrfs property set -f "${deployment_subvol}" ro true >/dev/null
-btrfs send "${deployment_subvol}" | zstd -19 -T0 -q -o "${container_blob}"
-btrfs property set -f "${deployment_subvol}" ro false >/dev/null
-btrfs subvolume delete "${deployment_subvol}" >/dev/null
-deployment_subvol=""
+artifact_project_dir="${tmpdir}/pingpong-artifact"
+discombobulator_file="${artifact_project_dir}/PingPongDeploy.DiscombobuFile"
+mkdir -p "${artifact_project_dir}"
+cat > "${discombobulator_file}" <<EOF
+FROM scratch for ${target_arch}
+COPY {bin} ./$(basename "${PINGPONG_BIN}") /root/pingpong_container
+SURVIVE /root/pingpong_container
+EOF
+prodigy_dev_write_common_prodigy_assets "${discombobulator_file}"
+cat >> "${discombobulator_file}" <<'EOF'
+EXECUTE ["/root/pingpong_container"]
+EOF
+
+if ! prodigy_dev_run_discombobulator_build \
+   "${artifact_project_dir}" \
+   "${discombobulator_file}" \
+   "${container_blob}" \
+   "bin=$(dirname "${PINGPONG_BIN}")" \
+   "ebpf=$(dirname "${PRODIGY_BIN}")"
+then
+   echo "FAIL: unable to build pingpong deploy artifact"
+   exit 1
+fi
 
 read -r -d '' CREATE_REQUEST <<EOF || true
 {
@@ -357,8 +307,7 @@ then
    exit 1
 fi
 
-read -r parent_ns <<EOF
-$(python3 - "${manifest_path}" <<'PY'
+mapfile -t manifest_fields < <(python3 - "${manifest_path}" <<'PY'
 import json
 import sys
 
@@ -366,15 +315,30 @@ with open(sys.argv[1], "r", encoding="utf-8") as fh:
     manifest = json.load(fh)
 
 print(manifest["parentNamespace"])
+print(manifest.get("parentPid", 0))
 PY
 )
-EOF
+parent_ns="${manifest_fields[0]:-}"
+parent_pid="${manifest_fields[1]:-0}"
 
 if [[ -z "${parent_ns}" ]]
 then
    echo "FAIL: unable to resolve parent namespace from manifest"
    sed -n '1,220p' "${create_log}" || true
    exit 1
+fi
+
+parent_netns_exec=(ip netns exec "${parent_ns}")
+if ! "${parent_netns_exec[@]}" true >/dev/null 2>&1
+then
+   if [[ "${parent_pid}" =~ ^[0-9]+$ ]] && [[ "${parent_pid}" -gt 0 ]] && kill -0 "${parent_pid}" >/dev/null 2>&1
+   then
+      parent_netns_exec=(nsenter -t "${parent_pid}" -n)
+   else
+      echo "FAIL: parent namespace is not reachable by name or pid"
+      sed -n '1,220p' "${create_log}" || true
+      exit 1
+   fi
 fi
 
 mapfile -t node_ips < <(python3 - "${manifest_path}" <<'PY'
@@ -489,7 +453,7 @@ for _ in $(seq 1 120)
 do
    for ip in "${node_ips[@]}"
    do
-      if ip netns exec "${parent_ns}" \
+      if "${parent_netns_exec[@]}" \
          env PRODIGY_PING_IP="${ip}" PRODIGY_PING_PORT="${ping_port}" PRODIGY_PING_PAYLOAD="ping" PRODIGY_PING_EXPECT="pong" \
          timeout --preserve-status -k 1s 3s bash -lc '
             exec 3<>"/dev/tcp/${PRODIGY_PING_IP}/${PRODIGY_PING_PORT}" || exit 1
