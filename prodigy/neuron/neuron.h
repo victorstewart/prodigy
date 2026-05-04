@@ -2172,11 +2172,16 @@ protected:
 
 			public:
 
-						bool isBrain;
-					TCPSocket brainListener;
-						NeuronBrainControlStream *brain = nullptr;
-	               bytell_hash_set<NeuronBrainControlStream *> closingBrainControls;
-               OSUpdateProcess osUpdateProcess;
+							bool isBrain;
+						TCPSocket brainListener;
+							NeuronBrainControlStream *brain = nullptr;
+		               bytell_hash_set<NeuronBrainControlStream *> closingBrainControls;
+	               OSUpdateProcess osUpdateProcess;
+
+      static int64_t registrationBootTimeMs(void)
+      {
+         return Time::now<TimeResolution::ms>();
+      }
 
       static void resetSignalForOSUpdateChild(int signal)
       {
@@ -2419,12 +2424,12 @@ protected:
 	      }
 
 			virtual void boot(void)
-			{
-			loadKernelVersion();
-	         loadOSReleaseMetadata();
-			bootTimeMs = Time::msSinceBoot();
+				{
+				loadKernelVersion();
+		         loadOSReleaseMetadata();
+				bootTimeMs = registrationBootTimeMs();
 
-		private4.is6 = false;
+			private4.is6 = false;
 		
 		iaas->gatherSelfData(uuid, metro, isBrain, eth, private4); // this is sync blocking
 

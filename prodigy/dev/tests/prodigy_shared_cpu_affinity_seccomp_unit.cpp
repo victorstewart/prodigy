@@ -536,6 +536,10 @@ int main(void)
 {
    TestSuite suite;
 
+   suite.expect(prodigyContainerReservedCoreCount(1) == 0, "small_cpuset_reserves_zero_container_cores_one_cpu");
+   suite.expect(prodigyContainerReservedCoreCount(2) == 0, "small_cpuset_reserves_zero_container_cores_two_cpus");
+   suite.expect(prodigyContainerReservedCoreCount(3) == nReservedCores, "larger_cpuset_keeps_default_reserved_cores");
+
    suite.expect(runSeccompProbe(false, false, ProbeKind::ptraceTraceMe) == 0, "unfiltered_ptrace_traceme_succeeds");
    suite.expect(runSeccompProbe(true, false, ProbeKind::ptraceTraceMe) == 0, "default_filter_blocks_ptrace_traceme");
    suite.expect(runSeccompProbe(false, false, ProbeKind::unshareFiles) == 0, "unfiltered_unshare_files_succeeds");

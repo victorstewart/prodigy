@@ -159,6 +159,14 @@ public:
 		return count;
 	}
 
+	bool readyForPairingNotifications(void) const override
+	{
+		return runtimeReady
+			&& state != ContainerState::destroyed
+			&& state != ContainerState::destroying
+			&& state != ContainerState::aboutToDestroy;
+	}
+
    void clearStatefulTopologyCutoverBarrier(void)
    {
       statefulTopologyCutoverReady = false;
@@ -263,18 +271,18 @@ public:
 			}
 		}
 
-		for (const auto& [service, subscribers] : advertisingTo)
-		{
-			auto advertisementIt = advertisements.find(service);
-			if (advertisementIt == advertisements.end())
+			for (const auto& [service, subscribers] : advertisingTo)
 			{
-				continue;
+				auto advertisementIt = advertisements.find(service);
+				if (advertisementIt == advertisements.end())
+				{
+					continue;
 			}
 
 			for (MeshNode *subscriberNode : subscribers)
 			{
 				ContainerView *subscriber = static_cast<ContainerView *>(subscriberNode);
-				if (subscriber == nullptr || subscriber->runtimeReady == false)
+				if (subscriber == nullptr)
 				{
 					continue;
 				}
@@ -297,35 +305,9 @@ public:
 			return;
 		}
 
-		for (const auto& [service, advertisers] : subscribedTo)
-		{
-			for (MeshNode *advertiserNode : advertisers)
+			for (const auto& [service, subscribers] : advertisingTo)
 			{
-				ContainerView *advertiser = static_cast<ContainerView *>(advertiserNode);
-				if (advertiser == nullptr || advertiser->runtimeReady == false)
-				{
-					continue;
-				}
-
-				auto advertisementIt = advertiser->advertisements.find(service);
-				if (advertisementIt == advertiser->advertisements.end())
-				{
-					continue;
-				}
-
-				uint128_t secret = thisBrain->mesh->pairingSecretFor(advertiser, this, service);
-				if (secret == 0)
-				{
-					continue;
-				}
-
-				advertiser->advertisementPairing(secret, pairingAddress(), service, applicationID, true);
-			}
-		}
-
-		for (const auto& [service, subscribers] : advertisingTo)
-		{
-			auto advertisementIt = advertisements.find(service);
+				auto advertisementIt = advertisements.find(service);
 			if (advertisementIt == advertisements.end())
 			{
 				continue;
@@ -388,6 +370,11 @@ public:
 			{
 				for (MeshNode *advertiser : advertisers)
 				{
+					if (advertiser == nullptr || advertiser->readyForPairingNotifications() == false)
+					{
+						continue;
+					}
+
 					auto advertisementIt = advertiser->advertisements.find(service);
 					if (advertisementIt == advertiser->advertisements.end())
 					{
@@ -402,6 +389,11 @@ public:
 		{
 			for (MeshNode *subscriber : subscribers)
 			{
+				if (subscriber == nullptr)
+				{
+					continue;
+				}
+
 				plan.advertisementPairings.emplace(service, thisBrain->mesh->pairingSecretFor(this, subscriber, service), subscriber->pairingAddress(), service);
 			}
 		}

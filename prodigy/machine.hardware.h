@@ -1958,6 +1958,13 @@ static inline bool prodigyCollectRootFilesystemDiskInventory(Vector<MachineDiskH
    return usable;
 }
 
+static inline void prodigyBuildDiskInventoryLsblkCommand(String& command)
+{
+   command.clear();
+   prodigyAppendCommandPrefix(command, 4);
+   prodigyAppendMachineHardwareShellSingleQuoted(command, "lsblk -J -e7 -b --output NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,WWN,ROTA,TRAN,LOG-SEC,PHY-SEC,MOUNTPOINTS"_ctv);
+}
+
 static inline bool prodigyCollectDiskInventory(
    Vector<MachineDiskHardwareProfile>& disks,
    Vector<MachineToolCapture>& captures,
@@ -1970,8 +1977,7 @@ static inline bool prodigyCollectDiskInventory(
    }
 
    String command = {};
-   prodigyAppendCommandPrefix(command, 4);
-   prodigyAppendMachineHardwareShellSingleQuoted(command, "lsblk -J -b --output NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,WWN,ROTA,TRAN,LOG-SEC,PHY-SEC,MOUNTPOINTS"_ctv);
+   prodigyBuildDiskInventoryLsblkCommand(command);
 
    String output = {};
    if (prodigyRunRecordedLocalCommand("lsblk"_ctv, "inventory"_ctv, command, captures, output) == false)

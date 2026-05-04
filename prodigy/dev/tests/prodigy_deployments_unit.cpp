@@ -86,6 +86,29 @@ public:
    }
 };
 
+class PairingCountingContainerView : public ContainerView
+{
+public:
+   uint32_t advertisementActivations = 0;
+   uint32_t subscriptionActivations = 0;
+
+   void advertisementPairing(uint128_t, uint128_t, uint64_t, uint16_t, bool activate) override
+   {
+      if (activate)
+      {
+         advertisementActivations += 1;
+      }
+   }
+
+   void subscriptionPairing(uint128_t, uint128_t, uint64_t, uint16_t, uint16_t, bool activate) override
+   {
+      if (activate)
+      {
+         subscriptionActivations += 1;
+      }
+   }
+};
+
 class ScopedFreshRing final
 {
 public:
@@ -378,9 +401,313 @@ int main(void)
 {
    TestSuite suite;
 
-	   {
-	      suite.expect(
-	         prodigyContainerIngressNetkitAttachType() == BPF_NETKIT_PRIMARY,
+   {
+      Advertisement scheduledAdvertisement(0x1001, ContainerState::scheduled, ContainerState::destroying, 7001);
+      Advertisement healthyAdvertisement(0x1002, ContainerState::healthy, ContainerState::destroying, 7002);
+      Subscription scheduledSubscription(0x1003, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::any);
+      Subscription healthySubscription(0x1004, ContainerState::healthy, ContainerState::destroying, SubscriptionNature::any);
+
+      suite.expect(
+         serviceBlueprintActiveAtContainerState(scheduledAdvertisement, ContainerState::scheduled),
+         "service_blueprint_scheduled_advertisement_active_at_scheduled");
+      suite.expect(
+         serviceBlueprintActiveAtContainerState(healthyAdvertisement, ContainerState::scheduled) == false,
+         "service_blueprint_healthy_advertisement_inactive_at_scheduled");
+      suite.expect(
+         serviceBlueprintActiveAtContainerState(scheduledSubscription, ContainerState::healthy),
+         "service_blueprint_scheduled_subscription_still_active_at_healthy");
+      suite.expect(
+         serviceBlueprintActiveAtContainerState(healthySubscription, ContainerState::healthy),
+         "service_blueprint_healthy_subscription_active_at_healthy");
+      suite.expect(
+         serviceBlueprintActiveAtContainerState(scheduledAdvertisement, ContainerState::crashedRestarting),
+         "service_blueprint_scheduled_advertisement_active_at_crashed_restarting");
+      suite.expect(
+         serviceBlueprintActiveAtContainerState(healthyAdvertisement, ContainerState::crashedRestarting) == false,
+         "service_blueprint_healthy_advertisement_inactive_at_crashed_restarting");
+      suite.expect(
+         serviceBlueprintActiveAtContainerState(scheduledAdvertisement, ContainerState::destroying) == false,
+         "service_blueprint_scheduled_advertisement_inactive_at_destroying");
+   }
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      ApplicationDeployment deployment;
+      seedCommonPlan(deployment, true);
+      deployment.state = DeploymentState::running;
+
+      PairingCountingContainerView advertiser;
+      PairingCountingContainerView subscriber;
+      const uint64_t service = (uint64_t(777) << 48) | uint64_t(1);
+      const uint16_t port = 9191;
+
+      advertiser.uuid = uint128_t(0x777001);
+      advertiser.deploymentID = deployment.plan.config.deploymentID();
+      advertiser.applicationID = deployment.plan.config.applicationID;
+      advertiser.lifetime = ApplicationLifetime::base;
+      advertiser.state = ContainerState::scheduled;
+      advertiser.advertisements.emplace(service, Advertisement(service, ContainerState::scheduled, ContainerState::destroying, port));
+      advertiser.advertisingOnPorts.insert(port);
+
+      subscriber.uuid = uint128_t(0x777002);
+      subscriber.deploymentID = deployment.plan.config.deploymentID();
+      subscriber.applicationID = deployment.plan.config.applicationID;
+      subscriber.lifetime = ApplicationLifetime::base;
+      subscriber.state = ContainerState::scheduled;
+      subscriber.subscriptions.emplace(service, Subscription(service, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all));
+
+      brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+      deployment.containers.insert(&advertiser);
+      deployment.containers.insert(&subscriber);
+
+      brain.mesh->advertise(service, &advertiser, port, false);
+      brain.mesh->subscribe(service, &subscriber, SubscriptionNature::all, false);
+
+      suite.expect(brain.mesh->pairingSecretFor(&advertiser, &subscriber, service) != 0, "container_healthy_replay_fixture_has_scheduled_pairing");
+      suite.expect(advertiser.advertisementActivations == 0, "container_healthy_replay_fixture_defers_advertiser_pairing_until_runtime_ready");
+      suite.expect(subscriber.subscriptionActivations == 0, "container_healthy_replay_fixture_does_not_notify_subscriber");
+      advertiser.advertisementActivations = 0;
+      subscriber.subscriptionActivations = 0;
+
+      deployment.containerIsHealthy(&subscriber);
+      suite.expect(advertiser.advertisementActivations == 0, "container_healthy_does_not_replay_scheduled_pairing_to_peer");
+      suite.expect(subscriber.subscriptionActivations == 0, "container_healthy_does_not_replay_scheduled_pairing_to_self");
+
+      deployment.containerIsHealthy(&subscriber);
+      suite.expect(advertiser.advertisementActivations == 0, "container_duplicate_healthy_does_not_replay_pairing_to_peer");
+      suite.expect(subscriber.subscriptionActivations == 0, "container_duplicate_healthy_does_not_replay_pairing_to_self");
+
+      deployment.recoverAfterReboot();
+      suite.expect(advertiser.advertisementActivations == 0, "deployment_recover_after_reboot_does_not_replay_pairing_to_peer");
+      suite.expect(subscriber.subscriptionActivations == 0, "deployment_recover_after_reboot_does_not_replay_pairing_to_self");
+
+      brain.deployments.erase(deployment.plan.config.deploymentID());
+      thisBrain = savedBrain;
+   }
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      ApplicationDeployment deployment;
+      seedCommonPlan(deployment, true);
+      deployment.state = DeploymentState::running;
+
+      PairingCountingContainerView advertiser;
+      PairingCountingContainerView subscriber;
+      const uint64_t service = (uint64_t(887) << 48) | uint64_t(2);
+      const uint16_t port = 9287;
+
+      advertiser.uuid = uint128_t(0x887001);
+      advertiser.deploymentID = deployment.plan.config.deploymentID();
+      advertiser.applicationID = deployment.plan.config.applicationID;
+      advertiser.lifetime = ApplicationLifetime::base;
+      advertiser.state = ContainerState::scheduled;
+      advertiser.advertisements.emplace(service, Advertisement(service, ContainerState::scheduled, ContainerState::destroying, port));
+      advertiser.advertisingOnPorts.insert(port);
+
+      subscriber.uuid = uint128_t(0x887002);
+      subscriber.deploymentID = deployment.plan.config.deploymentID();
+      subscriber.applicationID = deployment.plan.config.applicationID;
+      subscriber.lifetime = ApplicationLifetime::base;
+      subscriber.state = ContainerState::scheduled;
+      subscriber.subscriptions.emplace(service, Subscription(service, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all));
+
+      deployment.containers.insert(&advertiser);
+      deployment.containers.insert(&subscriber);
+
+      brain.mesh->advertise(service, &advertiser, port, false);
+      brain.mesh->subscribe(service, &subscriber, SubscriptionNature::all, false);
+
+      suite.expect(brain.mesh->pairingSecretFor(&advertiser, &subscriber, service) != 0, "container_runtime_ready_advertiser_first_fixture_has_pairing");
+      advertiser.advertisementActivations = 0;
+      subscriber.subscriptionActivations = 0;
+
+      deployment.containerIsRuntimeReady(&advertiser);
+      suite.expect(advertiser.advertisementActivations == 1, "container_runtime_ready_advertiser_first_preinstalls_secret");
+      suite.expect(subscriber.subscriptionActivations == 0, "container_runtime_ready_advertiser_first_waits_for_subscriber");
+
+      deployment.containerIsRuntimeReady(&subscriber);
+      suite.expect(advertiser.advertisementActivations == 1, "container_runtime_ready_subscriber_second_does_not_reinstall_secret");
+      suite.expect(subscriber.subscriptionActivations == 1, "container_runtime_ready_subscriber_second_connects_after_secret_preinstall");
+
+      thisBrain = savedBrain;
+   }
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      ApplicationDeployment deployment;
+      seedCommonPlan(deployment, true);
+      deployment.state = DeploymentState::running;
+
+      PairingCountingContainerView advertiser;
+      PairingCountingContainerView subscriber;
+      const uint64_t service = (uint64_t(888) << 48) | uint64_t(2);
+      const uint16_t port = 9292;
+
+      advertiser.uuid = uint128_t(0x888001);
+      advertiser.deploymentID = deployment.plan.config.deploymentID();
+      advertiser.applicationID = deployment.plan.config.applicationID;
+      advertiser.lifetime = ApplicationLifetime::base;
+      advertiser.state = ContainerState::scheduled;
+      advertiser.advertisements.emplace(service, Advertisement(service, ContainerState::scheduled, ContainerState::destroying, port));
+      advertiser.advertisingOnPorts.insert(port);
+
+      subscriber.uuid = uint128_t(0x888002);
+      subscriber.deploymentID = deployment.plan.config.deploymentID();
+      subscriber.applicationID = deployment.plan.config.applicationID;
+      subscriber.lifetime = ApplicationLifetime::base;
+      subscriber.state = ContainerState::scheduled;
+      subscriber.subscriptions.emplace(service, Subscription(service, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all));
+
+      deployment.containers.insert(&advertiser);
+      deployment.containers.insert(&subscriber);
+
+      brain.mesh->advertise(service, &advertiser, port, false);
+      brain.mesh->subscribe(service, &subscriber, SubscriptionNature::all, false);
+
+      suite.expect(brain.mesh->pairingSecretFor(&advertiser, &subscriber, service) != 0, "container_runtime_ready_fixture_has_scheduled_pairing");
+      advertiser.advertisementActivations = 0;
+      subscriber.subscriptionActivations = 0;
+
+      deployment.containerIsRuntimeReady(&subscriber);
+      suite.expect(subscriber.runtimeReady, "container_runtime_ready_marks_first_peer_ready");
+      suite.expect(advertiser.advertisementActivations == 0, "container_runtime_ready_waits_for_advertiser");
+      suite.expect(subscriber.subscriptionActivations == 0, "container_runtime_ready_waits_for_peer_listener");
+
+      deployment.containerIsRuntimeReady(&subscriber);
+      suite.expect(advertiser.advertisementActivations == 0, "container_runtime_ready_ignores_duplicate_subscriber");
+      suite.expect(subscriber.subscriptionActivations == 0, "container_runtime_ready_duplicate_subscriber_has_no_subscription");
+
+      deployment.containerIsRuntimeReady(&advertiser);
+      suite.expect(advertiser.runtimeReady, "container_runtime_ready_marks_second_peer_ready");
+      suite.expect(advertiser.advertisementActivations == 1, "container_runtime_ready_replays_advertiser_pairing_after_both_ready");
+      suite.expect(subscriber.subscriptionActivations == 1, "container_runtime_ready_replays_subscriber_pairing_after_both_ready");
+
+      deployment.containerIsRuntimeReady(&advertiser);
+      suite.expect(advertiser.advertisementActivations == 1, "container_runtime_ready_ignores_duplicate_advertiser");
+      suite.expect(subscriber.subscriptionActivations == 1, "container_runtime_ready_duplicate_advertiser_has_no_subscription");
+
+      advertiser.runtimeReady = false;
+      deployment.containerIsRuntimeReady(&advertiser);
+      suite.expect(advertiser.advertisementActivations == 2, "container_runtime_ready_replays_after_restart_reset");
+      suite.expect(subscriber.subscriptionActivations == 2, "container_runtime_ready_replays_subscription_after_restart_reset");
+
+      thisBrain = savedBrain;
+   }
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      ApplicationDeployment deployment;
+      seedCommonPlan(deployment, true);
+      deployment.state = DeploymentState::running;
+
+      PairingCountingContainerView advertiser;
+      PairingCountingContainerView subscriber;
+      const uint64_t service = (uint64_t(889) << 48) | uint64_t(2);
+      const uint16_t port = 9393;
+
+      advertiser.uuid = uint128_t(0x889001);
+      advertiser.deploymentID = deployment.plan.config.deploymentID();
+      advertiser.applicationID = deployment.plan.config.applicationID;
+      advertiser.lifetime = ApplicationLifetime::base;
+      advertiser.state = ContainerState::scheduled;
+      advertiser.advertisements.emplace(service, Advertisement(service, ContainerState::scheduled, ContainerState::destroying, port));
+      advertiser.advertisingOnPorts.insert(port);
+
+      subscriber.uuid = uint128_t(0x889002);
+      subscriber.deploymentID = deployment.plan.config.deploymentID();
+      subscriber.applicationID = deployment.plan.config.applicationID;
+      subscriber.lifetime = ApplicationLifetime::base;
+      subscriber.state = ContainerState::scheduled;
+      subscriber.subscriptions.emplace(service, Subscription(service, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all));
+
+      brain.mesh->advertise(service, &advertiser, port, false);
+      brain.mesh->subscribe(service, &subscriber, SubscriptionNature::all, false);
+
+      suite.expect(brain.mesh->pairingSecretFor(&advertiser, &subscriber, service) != 0, "containerview_generatePlan_runtime_ready_fixture_has_pairing");
+
+      ContainerPlan subscriberUnreadyPlan = subscriber.generatePlan(deployment.plan);
+      ContainerPlan advertiserUnreadyPlan = advertiser.generatePlan(deployment.plan);
+      suite.expect(subscriberUnreadyPlan.subscriptionPairings.isEmpty(), "containerview_generatePlan_omits_subscription_to_unready_advertiser");
+      suite.expect(advertiserUnreadyPlan.advertisementPairings.isEmpty() == false, "containerview_generatePlan_preinstalls_advertisement_for_unready_subscriber");
+
+      advertiser.runtimeReady = true;
+      ContainerPlan subscriberAdvertiserReadyPlan = subscriber.generatePlan(deployment.plan);
+      ContainerPlan advertiserSubscriberUnreadyPlan = advertiser.generatePlan(deployment.plan);
+      suite.expect(subscriberAdvertiserReadyPlan.subscriptionPairings.isEmpty() == false, "containerview_generatePlan_includes_subscription_to_ready_advertiser");
+      suite.expect(advertiserSubscriberUnreadyPlan.advertisementPairings.isEmpty() == false, "containerview_generatePlan_keeps_advertisement_for_unready_subscriber");
+
+      subscriber.runtimeReady = true;
+      ContainerPlan advertiserBothReadyPlan = advertiser.generatePlan(deployment.plan);
+      suite.expect(advertiserBothReadyPlan.advertisementPairings.isEmpty() == false, "containerview_generatePlan_includes_advertisement_for_ready_subscriber");
+
+      thisBrain = savedBrain;
+   }
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      ApplicationDeployment deployment;
+      seedCommonPlan(deployment, true);
+      deployment.state = DeploymentState::running;
+
+      PairingCountingContainerView advertiser;
+      PairingCountingContainerView subscriber;
+      const uint64_t service = (uint64_t(890) << 48) | uint64_t(2);
+      const uint16_t port = 9494;
+
+      advertiser.uuid = uint128_t(0x890001);
+      advertiser.deploymentID = deployment.plan.config.deploymentID();
+      advertiser.applicationID = deployment.plan.config.applicationID;
+      advertiser.lifetime = ApplicationLifetime::base;
+      advertiser.state = ContainerState::scheduled;
+      advertiser.advertisements.emplace(service, Advertisement(service, ContainerState::scheduled, ContainerState::destroying, port));
+      advertiser.advertisingOnPorts.insert(port);
+
+      subscriber.uuid = uint128_t(0x890002);
+      subscriber.deploymentID = deployment.plan.config.deploymentID();
+      subscriber.applicationID = deployment.plan.config.applicationID;
+      subscriber.lifetime = ApplicationLifetime::base;
+      subscriber.state = ContainerState::scheduled;
+      subscriber.subscriptions.emplace(service, Subscription(service, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all));
+
+      deployment.containers.insert(&advertiser);
+      deployment.containers.insert(&subscriber);
+
+      brain.mesh->advertise(service, &advertiser, port, true);
+      brain.mesh->subscribe(service, &subscriber, SubscriptionNature::all, true);
+
+      suite.expect(brain.mesh->pairingSecretFor(&advertiser, &subscriber, service) != 0, "mesh_notify_true_unready_fixture_has_pairing");
+      suite.expect(advertiser.advertisementActivations == 0, "mesh_notify_true_unready_advertiser_not_notified");
+      suite.expect(subscriber.subscriptionActivations == 0, "mesh_notify_true_unready_subscriber_not_notified");
+
+      deployment.containerIsRuntimeReady(&subscriber);
+      suite.expect(advertiser.advertisementActivations == 0, "mesh_notify_true_subscriber_first_advertiser_not_notified");
+      suite.expect(subscriber.subscriptionActivations == 0, "mesh_notify_true_subscriber_first_subscription_not_notified");
+
+      deployment.containerIsRuntimeReady(&advertiser);
+      suite.expect(advertiser.advertisementActivations == 1, "mesh_notify_true_advertiser_second_advertisement_notified");
+      suite.expect(subscriber.subscriptionActivations == 1, "mesh_notify_true_advertiser_second_subscription_notified");
+
+      thisBrain = savedBrain;
+   }
+
+		   {
+		      suite.expect(
+		         prodigyContainerIngressNetkitAttachType() == BPF_NETKIT_PRIMARY,
 	         "container_netkit_ingress_attach_type_is_primary");
       suite.expect(
          prodigyContainerEgressNetkitAttachType() == BPF_NETKIT_PEER,
