@@ -532,10 +532,10 @@ private:
          return;
       }
 
-      bool advertiserReady = advertiser->readyForPairingNotifications();
-      bool subscriberReady = subscriber->readyForPairingNotifications();
-      bool shouldNotifyAdvertiser = notifyAdvertiser && advertiserReady;
-      bool shouldNotifySubscriber = notifySubscriber && advertiserReady && subscriberReady;
+	      bool advertiserReady = advertiser->readyForPairingNotifications();
+	      bool subscriberReady = subscriber->readyForSubscriptionPairingNotifications();
+	      bool shouldNotifyAdvertiser = notifyAdvertiser && advertiserReady;
+	      bool shouldNotifySubscriber = notifySubscriber && advertiserReady && subscriberReady;
 
       if (auto existing = pairingSecrets.find(ServicePairing{advertiser, subscriber, service}); existing != pairingSecrets.end())
       {

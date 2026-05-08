@@ -39,6 +39,11 @@ public:
 		return true;
 	}
 
+   virtual bool readyForSubscriptionPairingNotifications(void) const
+   {
+      return readyForPairingNotifications();
+   }
+
 	virtual void advertisementPairing(uint128_t secret, uint128_t address, uint64_t service, uint16_t applicationID, bool activate) = 0; // sent to advertiser
 	virtual void subscriptionPairing(uint128_t secret, uint128_t address, uint64_t service, uint16_t port, uint16_t applicationID, bool activate) = 0; // sent to subscriber
 };

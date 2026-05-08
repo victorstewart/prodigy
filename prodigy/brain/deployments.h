@@ -7813,32 +7813,14 @@ public:
          container->state = ContainerState::crashedRestarting;
          // Keep the restarting container's own pairing view warm so the next
          // process can seed current dependencies, but do not replay this dead
-         // endpoint back out to peers while the old listener is gone.
+         // endpoint back out to peers while the old listener is gone. The mesh
+         // graph itself stays intact for a process restart, otherwise `any`
+         // subscribers get reassigned to a different live advertiser and can
+         // keep a stale port after that advertiser restarts.
+         container->deactivateActivePeerSubscriptionsForRestart();
          container->replayActivePairingsToSelf();
-
-         if (plan.isStateful && !plan.stateful.allMasters)
-         {
-            if (masterForShardGroup[container->shardGroup] == container) changeShardGroupMaster(container->shardGroup);
-         }
-
-         for (const auto& [service, advertisement] : container->advertisements)
-         {
-            // this would stop the client advertisment for databases...
-            if (advertisement.startAt != ContainerState::scheduled)
-            {
-               // stop advertising this service
-               thisBrain->mesh->stopAdvertisement(advertisement.service, container, false);
-            }
-         }
-
-         for (const auto& [service, subscription] : container->subscriptions)
-         {
-            if (subscription.startAt != ContainerState::scheduled)
-            {
-               // stop subscribing to this service
-               thisBrain->mesh->stopSubscription(subscription.service, container, subscription.nature, false);
-            }
-         }
+         container->runtimeReady = false;
+         container->clearStatefulTopologyCutoverBarrier();
       }
 
       if (failedCanary)

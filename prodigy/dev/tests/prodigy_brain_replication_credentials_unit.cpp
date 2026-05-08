@@ -12725,6 +12725,7 @@ static void testBrainNeuronHandlerRecordsContainerStatisticsAndReplicates(TestSu
    container->machine = &machine;
    container->lifetime = ApplicationLifetime::base;
    container->state = ContainerState::healthy;
+   container->runtimeReady = true;
 
    deployment.containers.insert(container);
    brain.containers.insert_or_assign(container->uuid, container);
@@ -13054,6 +13055,7 @@ static void testBrainNeuronHandlerHandlesRestartingContainerFailure(TestSuite& s
    brain.neuronHandler(&machine.neuron, message);
 
    suite.expect(container->state == ContainerState::crashedRestarting, "brain_neuron_container_failed_restart_marks_crashed_restarting");
+   suite.expect(container->runtimeReady == false, "brain_neuron_container_failed_restart_clears_runtime_ready");
    suite.expect(deployment.nHealthyBase == 0, "brain_neuron_container_failed_restart_decrements_healthy_count");
    suite.expect(container->nCrashes == 1, "brain_neuron_container_failed_restart_increments_container_crash_count");
    suite.expect(deployment.failureReports.size() == 1, "brain_neuron_container_failed_restart_records_failure_report");
@@ -13072,7 +13074,7 @@ static void testBrainNeuronHandlerHandlesRestartingContainerFailure(TestSuite& s
    thisBrain = previousBrain;
 }
 
-static void testBrainNeuronHandlerRestartingContainerFailureRebalancesAnySubscribersWithoutDeadReplay(TestSuite& suite)
+static void testBrainNeuronHandlerRestartingContainerFailurePreservesAnySubscribersWithoutDeadReplay(TestSuite& suite)
 {
    TestBrain brain = {};
    NoopBrainIaaS iaas = {};
@@ -13208,10 +13210,10 @@ static void testBrainNeuronHandlerRestartingContainerFailureRebalancesAnySubscri
 
    suite.expect(
       migratingSubscriber != nullptr,
-      "brain_neuron_container_failed_restart_rebalance_fixture_retains_one_failed_pairing");
+      "brain_neuron_container_failed_restart_preserve_fixture_retains_one_failed_pairing");
    suite.expect(
       stableSubscriber != nullptr && stableSubscriber->subscribedTo.hasEntryFor(service, replacementAdvertiser),
-      "brain_neuron_container_failed_restart_rebalance_fixture_pairs_other_subscriber_to_replacement");
+      "brain_neuron_container_failed_restart_preserve_fixture_pairs_other_subscriber_to_replacement");
 
    for (PairingTrackingContainerView *subscriber : {&subscriberA, &subscriberB})
    {
@@ -13232,31 +13234,60 @@ static void testBrainNeuronHandlerRestartingContainerFailureRebalancesAnySubscri
 
    suite.expect(
       failedAdvertiser->state == ContainerState::crashedRestarting,
-      "brain_neuron_container_failed_restart_rebalance_marks_crashed_restarting");
+      "brain_neuron_container_failed_restart_preserve_marks_crashed_restarting");
    suite.expect(
-      migratingSubscriber->subscriptionDeactivateCalls == 1,
-      "brain_neuron_container_failed_restart_rebalance_deactivates_failed_pairing");
+      failedAdvertiser->runtimeReady == false,
+      "brain_neuron_container_failed_restart_preserve_clears_runtime_ready");
    suite.expect(
-      migratingSubscriber->subscriptionActivateCalls == 1,
-      "brain_neuron_container_failed_restart_rebalance_activates_only_replacement");
+      migratingSubscriber->subscriptionDeactivateCalls >= 1,
+      "brain_neuron_container_failed_restart_preserve_deactivates_failed_pairing");
    suite.expect(
-      migratingSubscriber->lastSubscriptionAddress == replacementAdvertiser->pairingAddress(),
-      "brain_neuron_container_failed_restart_rebalance_uses_replacement_address");
+      migratingSubscriber->subscriptionActivateCalls == 0,
+      "brain_neuron_container_failed_restart_preserve_does_not_activate_replacement");
    suite.expect(
-      migratingSubscriber->lastSubscriptionPort == replacementPort,
-      "brain_neuron_container_failed_restart_rebalance_uses_replacement_port");
+      migratingSubscriber->lastSubscriptionAddress == failedAdvertiser->pairingAddress(),
+      "brain_neuron_container_failed_restart_preserve_deactivates_failed_address");
    suite.expect(
-      migratingSubscriber->subscribedTo.hasEntryFor(service, failedAdvertiser) == false,
-      "brain_neuron_container_failed_restart_rebalance_removes_failed_advertiser");
+      migratingSubscriber->lastSubscriptionPort == failedPort,
+      "brain_neuron_container_failed_restart_preserve_deactivates_failed_port");
    suite.expect(
-      migratingSubscriber->subscribedTo.hasEntryFor(service, replacementAdvertiser),
-      "brain_neuron_container_failed_restart_rebalance_pairs_spare_advertiser");
+      migratingSubscriber->subscribedTo.hasEntryFor(service, failedAdvertiser),
+      "brain_neuron_container_failed_restart_preserve_keeps_failed_advertiser_edge");
+   suite.expect(
+      migratingSubscriber->subscribedTo.hasEntryFor(service, replacementAdvertiser) == false,
+      "brain_neuron_container_failed_restart_preserve_avoids_spare_advertiser");
+   suite.expect(
+      brain.mesh->isAdvertising(service, failedAdvertiser),
+      "brain_neuron_container_failed_restart_preserve_keeps_failed_advertisement");
    suite.expect(
       stableSubscriber->subscriptionDeactivateCalls == 0,
-      "brain_neuron_container_failed_restart_rebalance_keeps_replacement_peer_active");
+      "brain_neuron_container_failed_restart_preserve_keeps_replacement_peer_active");
    suite.expect(
       stableSubscriber->subscriptionActivateCalls == 0,
-      "brain_neuron_container_failed_restart_rebalance_avoids_duplicate_replacement_activation");
+      "brain_neuron_container_failed_restart_preserve_avoids_duplicate_replacement_activation");
+
+   migratingSubscriber->subscriptionActivateCalls = 0;
+   migratingSubscriber->subscriptionDeactivateCalls = 0;
+   migratingSubscriber->lastSubscriptionAddress = 0;
+   migratingSubscriber->lastSubscriptionService = 0;
+   migratingSubscriber->lastSubscriptionPort = 0;
+   migratingSubscriber->lastSubscriptionApplicationID = 0;
+
+   deployment.containerIsHealthy(failedAdvertiser);
+   deployment.containerIsRuntimeReady(failedAdvertiser);
+
+   suite.expect(
+      failedAdvertiser->state == ContainerState::healthy && failedAdvertiser->runtimeReady,
+      "brain_neuron_container_failed_restart_preserve_recovers_same_container");
+   suite.expect(
+      migratingSubscriber->subscriptionActivateCalls >= 1,
+      "brain_neuron_container_failed_restart_preserve_replays_same_edge");
+   suite.expect(
+      migratingSubscriber->lastSubscriptionAddress == failedAdvertiser->pairingAddress(),
+      "brain_neuron_container_failed_restart_preserve_replays_same_address");
+   suite.expect(
+      migratingSubscriber->lastSubscriptionPort == failedPort,
+      "brain_neuron_container_failed_restart_preserve_replays_same_port");
 
    deployment.containers.erase(failedAdvertiser);
    deployment.containers.erase(replacementAdvertiser);
@@ -13273,6 +13304,149 @@ static void testBrainNeuronHandlerRestartingContainerFailureRebalancesAnySubscri
    brain.machinesByUUID.erase(machineB.uuid);
    brain.machines.erase(&machineA);
    brain.machines.erase(&machineB);
+   thisBrain = previousBrain;
+}
+
+static void testBrainNeuronHandlerRestartingStatefulMasterKeepsClientServiceSticky(TestSuite& suite)
+{
+   TestBrain brain = {};
+   NoopBrainIaaS iaas = {};
+   brain.iaas = &iaas;
+   brain.weAreMaster = true;
+
+   BrainBase *previousBrain = thisBrain;
+   thisBrain = &brain;
+
+   Rack rack = {};
+   rack.uuid = 62026;
+
+   Machine machine = {};
+   machine.uuid = uint128_t(0x5220);
+   machine.state = MachineState::healthy;
+   machine.fragment = 0x47;
+   machine.rack = &rack;
+   machine.neuron.machine = &machine;
+   brain.machines.insert(&machine);
+   brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+
+   ApplicationDeployment deployment = {};
+   seedStatefulDeployRequestPlan(deployment.plan, 62026);
+   deployment.state = DeploymentState::running;
+   deployment.nShardGroups = 1;
+   brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+   brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
+
+   StatefulMeshRoles roles = StatefulMeshRoles::forShardGroup(
+      deployment.plan.stateful,
+      deployment.plan.config.applicationID,
+      0);
+   constexpr uint16_t clientPort = 4744;
+
+   ContainerView failedMaster = {};
+   failedMaster.uuid = uint128_t(0x5221);
+   failedMaster.deploymentID = deployment.plan.config.deploymentID();
+   failedMaster.applicationID = deployment.plan.config.applicationID;
+   failedMaster.machine = &machine;
+   failedMaster.lifetime = ApplicationLifetime::base;
+   failedMaster.state = ContainerState::healthy;
+   failedMaster.runtimeReady = true;
+   failedMaster.isStateful = true;
+   failedMaster.shardGroup = 0;
+   failedMaster.fragment = 20;
+   failedMaster.remainingSubscriberCapacity = 64;
+   failedMaster.advertisements.insert_or_assign(
+      roles.client,
+      Advertisement(roles.client, ContainerState::healthy, ContainerState::destroying, clientPort));
+   failedMaster.advertisingOnPorts.insert(clientPort);
+   failedMaster.setMeshAddress(
+      container_network_subnet6,
+      brain.brainConfig.datacenterFragment,
+      machine.fragment,
+      failedMaster.fragment);
+
+   ContainerView standby = {};
+   standby.uuid = uint128_t(0x5222);
+   standby.deploymentID = deployment.plan.config.deploymentID();
+   standby.applicationID = deployment.plan.config.applicationID;
+   standby.machine = &machine;
+   standby.lifetime = ApplicationLifetime::base;
+   standby.state = ContainerState::healthy;
+   standby.runtimeReady = true;
+   standby.isStateful = true;
+   standby.shardGroup = 0;
+   standby.fragment = 21;
+   standby.remainingSubscriberCapacity = 64;
+   standby.setMeshAddress(
+      container_network_subnet6,
+      brain.brainConfig.datacenterFragment,
+      machine.fragment,
+      standby.fragment);
+
+   PairingTrackingContainerView subscriber = {};
+   subscriber.applicationID = uint16_t(deployment.plan.config.applicationID + 1);
+   subscriber.state = ContainerState::healthy;
+   subscriber.runtimeReady = true;
+   subscriber.fragment = 22;
+   subscriber.remainingSubscriberCapacity = 64;
+   subscriber.meshAddress = uint128_t(0x62026022);
+   subscriber.subscriptions.insert_or_assign(
+      roles.client,
+      Subscription(roles.client, ContainerState::healthy, ContainerState::destroying, SubscriptionNature::any));
+
+   deployment.containers.insert(&failedMaster);
+   deployment.containers.insert(&standby);
+   deployment.containersByShardGroup.insert(0, &failedMaster);
+   deployment.containersByShardGroup.insert(0, &standby);
+   deployment.masterForShardGroup.insert_or_assign(0, &failedMaster);
+   deployment.countPerMachine[&machine] = 2;
+   deployment.countPerRack[&rack] = 2;
+   deployment.nHealthyBase = 2;
+   brain.containers.insert_or_assign(failedMaster.uuid, &failedMaster);
+   brain.containers.insert_or_assign(standby.uuid, &standby);
+   machine.upsertContainerIndexEntry(failedMaster.deploymentID, &failedMaster);
+   machine.upsertContainerIndexEntry(standby.deploymentID, &standby);
+
+   brain.mesh->advertise(roles.client, &failedMaster, clientPort, false);
+   brain.mesh->subscribe(roles.client, &subscriber, SubscriptionNature::any, false);
+   subscriber.subscriptionActivateCalls = 0;
+   subscriber.subscriptionDeactivateCalls = 0;
+
+   deployment.containerFailed(
+      &failedMaster,
+      int64_t(1700000000012),
+      9,
+      "stateful master restart"_ctv,
+      true);
+
+   suite.expect(
+      deployment.masterForShardGroup[0] == &failedMaster,
+      "brain_neuron_stateful_restart_keeps_client_master_sticky");
+   suite.expect(
+      standby.advertisements.find(roles.client) == standby.advertisements.end(),
+      "brain_neuron_stateful_restart_does_not_assign_unopened_client_port");
+   suite.expect(
+      subscriber.subscriptionActivateCalls == 0,
+      "brain_neuron_stateful_restart_does_not_activate_unopened_client_port");
+   suite.expect(
+      subscriber.subscriptionDeactivateCalls >= 1,
+      "brain_neuron_stateful_restart_deactivates_failed_client_port");
+   suite.expect(
+      subscriber.subscribedTo.hasEntryFor(roles.client, &standby) == false,
+      "brain_neuron_stateful_restart_leaves_client_unpaired_until_same_master_returns");
+
+   machine.removeContainerIndexEntry(failedMaster.deploymentID, &failedMaster);
+   machine.removeContainerIndexEntry(standby.deploymentID, &standby);
+   brain.containers.erase(failedMaster.uuid);
+   brain.containers.erase(standby.uuid);
+   deployment.masterForShardGroup.erase(0);
+   while (deployment.containersByShardGroup.eraseEntry(0, &failedMaster)) {}
+   while (deployment.containersByShardGroup.eraseEntry(0, &standby)) {}
+   deployment.containers.erase(&failedMaster);
+   deployment.containers.erase(&standby);
+   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
+   brain.deployments.erase(deployment.plan.config.deploymentID());
+   brain.machinesByUUID.erase(machine.uuid);
+   brain.machines.erase(&machine);
    thisBrain = previousBrain;
 }
 
@@ -14477,7 +14651,7 @@ int main(void)
    testNeuronDeferredHardwareInventoryAdoptionRequiresReadySerializedProfile(suite);
    testNeuronDeferredHardwareInventoryWakeAdoptsReadyProfile(suite);
    testNeuronEnsureDeferredHardwareInventoryProgressQueuesReadyProfileToActiveBrain(suite);
-   testBrainNeuronHandlerRestartingContainerFailureRebalancesAnySubscribersWithoutDeadReplay(suite);
+   testBrainNeuronHandlerRestartingContainerFailurePreservesAnySubscribersWithoutDeadReplay(suite);
    testNeuronQueuesCachedHardwareProfileWhenBrainStreamBecomesActive(suite);
    testNeuronOverlayRoutingSyncWithoutPrograms(suite);
    testNeuronWhiteholeBindingBookkeepingWithoutPrograms(suite);
@@ -14544,6 +14718,7 @@ int main(void)
    testBrainNeuronHandlerContainerStatisticsCanTriggerStatefulTopologyCutover(suite);
    testBrainReplicatedMetricAppendCanTriggerStatefulTopologyCutover(suite);
    testBrainNeuronHandlerHandlesRestartingContainerFailure(suite);
+   testBrainNeuronHandlerRestartingStatefulMasterKeepsClientServiceSticky(suite);
    testBrainNeuronHandlerHandlesNonRestartingContainerFailureAndDrainsMachine(suite);
    testBrainNeuronHandlerProcessesKillContainerAckAndDrainsMachine(suite);
    testBrainNeuronHandlerQueuesRequestedContainerBlob(suite);

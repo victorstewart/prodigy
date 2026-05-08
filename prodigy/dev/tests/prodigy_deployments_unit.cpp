@@ -91,6 +91,12 @@ class PairingCountingContainerView : public ContainerView
 public:
    uint32_t advertisementActivations = 0;
    uint32_t subscriptionActivations = 0;
+   uint32_t subscriptionDeactivations = 0;
+
+   bool readyForSubscriptionPairingNotifications(void) const override
+   {
+      return runtimeReady || state == ContainerState::healthy;
+   }
 
    void advertisementPairing(uint128_t, uint128_t, uint64_t, uint16_t, bool activate) override
    {
@@ -105,6 +111,10 @@ public:
       if (activate)
       {
          subscriptionActivations += 1;
+      }
+      else
+      {
+         subscriptionDeactivations += 1;
       }
    }
 };
@@ -599,6 +609,56 @@ int main(void)
       deployment.containerIsRuntimeReady(&advertiser);
       suite.expect(advertiser.advertisementActivations == 2, "container_runtime_ready_replays_after_restart_reset");
       suite.expect(subscriber.subscriptionActivations == 2, "container_runtime_ready_replays_subscription_after_restart_reset");
+
+      thisBrain = savedBrain;
+   }
+
+   {
+      TestBrain brain;
+      BrainBase *savedBrain = thisBrain;
+      thisBrain = &brain;
+
+      ApplicationDeployment deployment;
+      seedCommonPlan(deployment, true);
+      deployment.state = DeploymentState::running;
+
+      PairingCountingContainerView advertiser;
+      PairingCountingContainerView subscriber;
+      const uint64_t service = (uint64_t(891) << 48) | uint64_t(2);
+      const uint16_t port = 9595;
+
+      advertiser.uuid = uint128_t(0x891001);
+      advertiser.deploymentID = deployment.plan.config.deploymentID();
+      advertiser.applicationID = deployment.plan.config.applicationID;
+      advertiser.lifetime = ApplicationLifetime::base;
+      advertiser.state = ContainerState::healthy;
+      advertiser.runtimeReady = true;
+      advertiser.advertisements.emplace(service, Advertisement(service, ContainerState::scheduled, ContainerState::destroying, port));
+      advertiser.advertisingOnPorts.insert(port);
+
+      subscriber.uuid = uint128_t(0x891002);
+      subscriber.deploymentID = deployment.plan.config.deploymentID();
+      subscriber.applicationID = deployment.plan.config.applicationID;
+      subscriber.lifetime = ApplicationLifetime::base;
+      subscriber.state = ContainerState::healthy;
+      subscriber.runtimeReady = false;
+      subscriber.subscriptions.emplace(service, Subscription(service, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all));
+
+      brain.mesh->advertise(service, &advertiser, port, false);
+      brain.mesh->subscribe(service, &subscriber, SubscriptionNature::all, false);
+
+      suite.expect(brain.mesh->pairingSecretFor(&advertiser, &subscriber, service) != 0, "container_restart_peer_refresh_fixture_has_pairing");
+      suite.expect(advertiser.advertisingTo.hasEntryFor(service, &subscriber), "container_restart_peer_refresh_fixture_has_advertising_edge");
+      suite.expect(subscriber.subscribedTo.hasEntryFor(service, &advertiser), "container_restart_peer_refresh_fixture_has_subscription_edge");
+
+      advertiser.deactivateActivePeerSubscriptionsForRestart();
+      suite.expect(subscriber.subscriptionDeactivations == 1, "container_restart_peer_refresh_deactivates_peer_subscription");
+      suite.expect(advertiser.advertisingTo.hasEntryFor(service, &subscriber), "container_restart_peer_refresh_keeps_advertising_edge");
+      suite.expect(subscriber.subscribedTo.hasEntryFor(service, &advertiser), "container_restart_peer_refresh_keeps_subscription_edge");
+
+      advertiser.runtimeReady = false;
+      deployment.containerIsRuntimeReady(&advertiser);
+      suite.expect(subscriber.subscriptionActivations == 1, "container_restart_peer_refresh_reactivates_healthy_subscriber_without_runtime_ready");
 
       thisBrain = savedBrain;
    }
@@ -2661,6 +2721,47 @@ int main(void)
       NeuronContainerMetricPolicy policy = deriveNeuronMetricPolicyForDeployment(plan);
       suite.expect(policy.scalingDimensionsMask == 0, "deriveNeuronMetricPolicy_excludes_ingress_composite_from_neuron_sampling");
       suite.expect(policy.metricsCadenceMs == 0, "deriveNeuronMetricPolicy_keeps_zero_cadence_without_collectable_dimensions");
+   }
+
+   {
+      ContainerPlan plan{};
+      constexpr uint64_t dynamicSubscriptionService = 0x700000000001ULL;
+      constexpr uint64_t scheduledSubscriptionService = 0x700000000002ULL;
+      constexpr uint64_t healthySubscriptionService = 0x700000000003ULL;
+      constexpr uint64_t dynamicAdvertisementService = 0x700000000004ULL;
+      constexpr uint64_t scheduledAdvertisementService = 0x700000000005ULL;
+      constexpr uint64_t healthyAdvertisementService = 0x700000000006ULL;
+
+      plan.state = ContainerState::healthy;
+      plan.subscriptions.insert_or_assign(
+         scheduledSubscriptionService,
+         Subscription(scheduledSubscriptionService, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all));
+      plan.subscriptions.insert_or_assign(
+         healthySubscriptionService,
+         Subscription(healthySubscriptionService, ContainerState::healthy, ContainerState::destroying, SubscriptionNature::all));
+      plan.advertisements.insert_or_assign(
+         scheduledAdvertisementService,
+         Advertisement(scheduledAdvertisementService, ContainerState::scheduled, ContainerState::destroying, 12001));
+      plan.advertisements.insert_or_assign(
+         healthyAdvertisementService,
+         Advertisement(healthyAdvertisementService, ContainerState::healthy, ContainerState::destroying, 12002));
+
+      plan.subscriptionPairings.insert(dynamicSubscriptionService, SubscriptionPairing(uint128_t(1), uint128_t(2), dynamicSubscriptionService, 13001));
+      plan.subscriptionPairings.insert(scheduledSubscriptionService, SubscriptionPairing(uint128_t(3), uint128_t(4), scheduledSubscriptionService, 13002));
+      plan.subscriptionPairings.insert(healthySubscriptionService, SubscriptionPairing(uint128_t(5), uint128_t(6), healthySubscriptionService, 13003));
+      plan.advertisementPairings.insert(dynamicAdvertisementService, AdvertisementPairing(uint128_t(7), uint128_t(8), dynamicAdvertisementService));
+      plan.advertisementPairings.insert(scheduledAdvertisementService, AdvertisementPairing(uint128_t(9), uint128_t(10), scheduledAdvertisementService));
+      plan.advertisementPairings.insert(healthyAdvertisementService, AdvertisementPairing(uint128_t(11), uint128_t(12), healthyAdvertisementService));
+
+      plan.prepareForRestartSchedule();
+
+      suite.expect(plan.state == ContainerState::scheduled, "container_plan_restart_prepare_marks_scheduled");
+      suite.expect(plan.subscriptionPairings.find(dynamicSubscriptionService) != plan.subscriptionPairings.end(), "container_plan_restart_prepare_keeps_dynamic_subscription_pairing");
+      suite.expect(plan.subscriptionPairings.find(scheduledSubscriptionService) != plan.subscriptionPairings.end(), "container_plan_restart_prepare_keeps_scheduled_subscription_pairing");
+      suite.expect(plan.subscriptionPairings.find(healthySubscriptionService) != plan.subscriptionPairings.end(), "container_plan_restart_prepare_keeps_healthy_subscription_pairing");
+      suite.expect(plan.advertisementPairings.find(dynamicAdvertisementService) != plan.advertisementPairings.end(), "container_plan_restart_prepare_keeps_dynamic_advertisement_pairing");
+      suite.expect(plan.advertisementPairings.find(scheduledAdvertisementService) != plan.advertisementPairings.end(), "container_plan_restart_prepare_keeps_scheduled_advertisement_pairing");
+      suite.expect(plan.advertisementPairings.find(healthyAdvertisementService) != plan.advertisementPairings.end(), "container_plan_restart_prepare_keeps_healthy_advertisement_pairing");
    }
 
    {

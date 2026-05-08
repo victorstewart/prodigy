@@ -3392,6 +3392,8 @@ private:
          {&rootfsRoot, "bootstage.txt", "bootstage.txt"},
          {&rootfsRoot, "crashreport.txt", "crashreport.txt"},
          {&rootfsRoot, "readytrace.log", "readytrace.log"},
+         {&rootfsRoot, "neuron.trace.log", "neuron.trace.log"},
+         {&rootfsRoot, "neuron.hosttrace.log", "neuron.hosttrace.log"},
          {&rootfsRoot, "aegis.hash.log", "aegis.hash.log"},
          {&rootfsRoot, "whitehole_probe_trace.log", "whitehole_probe_trace.log"},
          {&rootfsRoot, "quic_wormhole_probe_trace.log", "quic_wormhole_probe_trace.log"},
@@ -6224,7 +6226,11 @@ public:
          }
       }
 
-      if (container->pidfd > 0) close(container->pidfd);
+      if (container->pidfd > 0)
+      {
+         close(container->pidfd);
+         container->pidfd = -1;
+      }
       if (container->cgroup > 0) close(container->cgroup);
 
       // Best-effort external teardown (btrfs/cgroup shell calls) used to be skipped here.
@@ -7476,6 +7482,19 @@ public:
          int(container->pid));
       std::fflush(stderr);
 
+      auto logStartStage = [&] (const char *stage) -> void
+      {
+         std::fprintf(stderr,
+            "startContainer stage=%s uuid=%llu appID=%u restart=%d pid=%d cgroup=%d\n",
+            stage,
+            (unsigned long long)container->plan.uuid,
+            unsigned(container->plan.config.applicationID),
+            int(isRestart),
+            int(container->pid),
+            container->cgroup);
+         std::fflush(stderr);
+      };
+
       ensureSigchldIsWaitable();
 
       if (container->artifactRootPath.size() == 0)
@@ -7489,6 +7508,7 @@ public:
          container->rootfsPath.assign(container->artifactRootPath);
          container->rootfsPath.append("/rootfs"_ctv);
       }
+      logStartStage("paths-ready");
 
       if (container->executePath.size() == 0 || container->executeArchitecture == MachineCpuArchitecture::unknown)
       {
@@ -7505,8 +7525,7 @@ public:
             return false;
          }
       }
-
-      if (isRestart && container->cgroup >= 0) Filesystem::openWriteAtClose(container->cgroup, "cgroup.freeze"_ctv, "1"_ctv);
+      logStartStage("metadata-ready");
 
       int socs[2];
       if (socketpair(AF_UNIX, SOCK_STREAM, 0, socs) != 0)
@@ -7517,6 +7536,7 @@ public:
          }
          return false;
       }
+      logStartStage("socketpair-ready");
 
       int startupSync[2];
       if (pipe2(startupSync, O_CLOEXEC) != 0)
@@ -7529,6 +7549,7 @@ public:
          close(socs[1]);
          return false;
       }
+      logStartStage("pipe-ready");
 
       String seccompBuildFailure = {};
       scmp_filter_ctx containerSeccomp = buildContainerSyscallFilter(container, &seccompBuildFailure);
@@ -7552,6 +7573,7 @@ public:
          close(socs[1]);
          return false;
       }
+      logStartStage("seccomp-ready");
 
       struct StartupSyncPayload
       {
@@ -7588,6 +7610,7 @@ public:
          args.cgroup = 0;
       }
 
+      logStartStage("clone-enter");
       container->pid = syscall(SYS_clone3, &args, sizeof(struct clone_args));
 
       if (container->pid < 0)
@@ -7604,6 +7627,7 @@ public:
          close(socs[1]);
          return false;
       }
+      logStartStage(container->pid == 0 ? "clone-child" : "clone-parent");
 
       if (container->pid == 0) // child
       {
@@ -7913,6 +7937,7 @@ public:
 
             return false;
          }
+         logStartStage("ids-mapped");
 
          container->setUnixPairHalf(socs[0]);
 
@@ -7951,6 +7976,7 @@ public:
             // container-to-container probes and other mesh-targeted traffic.
             installDatacenterMeshRoutes(thisNeuron->eth, thisNeuron->lcsubnet6.dpfx);
          }
+         logStartStage("network-ready");
 
          if (applicationUsesIsolatedCPUs(container->plan.config))
          {
@@ -7981,6 +8007,7 @@ public:
          }
 
          thisNeuron->pushContainer(container);
+         logStartStage("pushed");
          appendContainerTrace(container,
             "startContainer after-push pendingSend=%d pendingRecv=%d outstanding=%llu isFixed=%d fslot=%d registeredFD=%d fd=%d\n",
             int(container->pendingSend),
@@ -7999,7 +8026,9 @@ public:
          container->waitidPending = true;
          container->destroyCloseCompleted = false;
          Ring::queueWaitid(container, P_PID, container->pid);
+         logStartStage("waitid-queued");
          seedDynamicData(container);
+         logStartStage("dynamic-seeded");
 
          StartupSyncPayload startupPayload;
          startupPayload.startSignal = 1;
@@ -8014,6 +8043,7 @@ public:
             }
             return false;
          }
+         logStartStage("startup-written");
 
          String pendingMarkerFailure = {};
          if (clearContainerCreatePendingMarker(container->artifactRootPath, &pendingMarkerFailure) == false)
@@ -8028,6 +8058,7 @@ public:
          {
             Filesystem::openWriteAtClose(container->cgroup, "cgroup.freeze"_ctv, "0"_ctv);
          }
+         logStartStage("cgroup-thawed");
 
          Ring::queueRecv(container, container->plan.config.msTilHealthy);
          appendContainerTrace(container,
@@ -8039,6 +8070,7 @@ public:
             int(container->isFixedFile),
             container->fslot,
             (container->isFixedFile && container->fslot >= 0 ? Ring::getFDFromFixedFileSlot(container->fslot) : container->fd));
+         logStartStage("complete");
          return true;
       }
 
@@ -8186,41 +8218,17 @@ public:
 
    static void restartContainer(Container *container)
    {
-      container->plan.state = ContainerState::scheduled;
+      // Keep the active pairing snapshot in the restart payload. The old
+      // process is gone, but the replacement needs those pairings to rejoin the
+      // mesh and reach runtime readiness before it can signal healthy again.
+      container->plan.prepareForRestartSchedule();
 
-   // destroy any advertisements or subscriptions which should not exist at state schedule
-
-      for (auto it = container->plan.advertisementPairings.begin(); it != container->plan.advertisementPairings.end();)
+      if (container->pidfd > 0)
       {
-         uint64_t service = it->first;
-         const Advertisement& advertisement = container->plan.advertisements[service];
-
-         if (advertisement.startAt != ContainerState::scheduled) // delete all of these
-         {
-            it = container->plan.advertisementPairings.erase(it);
-         }
-         else
-         {
-            it++;
-         }
+         close(container->pidfd);
+         container->pidfd = -1;
       }
-
-      for (auto it = container->plan.subscriptionPairings.begin(); it != container->plan.subscriptionPairings.end();)
-      {
-         uint64_t service = it->first;
-         const Subscription& subscription = container->plan.subscriptions[service];
-
-         if (subscription.startAt != ContainerState::scheduled) // delete all of these
-         {
-            it = container->plan.subscriptionPairings.erase(it);
-         }
-         else
-         {
-            it++;
-         }
-      }
-
-      if (container->pidfd > 0) close(container->pidfd);
+      container->pid = -1;
 
       container->cleanupNetwork();
 

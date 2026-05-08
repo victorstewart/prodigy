@@ -5952,6 +5952,11 @@ public:
 
       return erased;
    }
+
+   void prepareForRestartSchedule(void)
+   {
+      state = ContainerState::scheduled;
+   }
 };
 
 template <typename S>

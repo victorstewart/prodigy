@@ -2569,7 +2569,6 @@ protected:
 	         pendingDestroyBeforeWait = container->pendingDestroy;
 	         container->waitidPending = false;
 	         container->disableKillSwitch();
-	         container->closeSocket();
 	         killedOnPurpose = container->killedOnPurpose;
 
 	         resumeAfterShutdown = container->resumeAfterShutdown;
@@ -2577,6 +2576,39 @@ protected:
 	      }
 
 	      bool restart = (destroyAfterWait == false);
+	      if (restart)
+	      {
+	         if (container->isFixedFile && container->fslot >= 0 && Ring::socketIsClosing(container) == false)
+	         {
+	            Ring::queueCancelAll(container);
+	            Ring::queueCloseRaw(container->fslot);
+	         }
+	         else if (container->isFixedFile == false && container->fd >= 0)
+	         {
+	            close(container->fd);
+	         }
+
+	         if (container->pendingSend)
+	         {
+	            container->noteSendCompleted();
+	         }
+	         container->pendingSend = false;
+	         container->pendingRecv = false;
+	         container->pendingSendBytes = 0;
+	         container->pendingSendUserData = 0;
+	         container->pendingRecvUserData = 0;
+	         container->pendingConnectUserData = 0;
+	         container->pendingTCPFastOpenUserData = 0;
+	         container->rBuffer.clear();
+	         container->wBuffer.clear();
+	         container->fslot = -1;
+	         container->isFixedFile = false;
+	         container->bumpIoGeneration();
+	      }
+	      else
+	      {
+	         container->closeSocket();
+	      }
 
 	      std::fprintf(stderr,
 	         "neuron waitid debug uuid=%llu pid=%d code=%d status=%d killedOnPurpose=%d pendingDestroyBefore=%d destroyAfter=%d restart=%d deploymentID=%llu lifetime=%u\n",

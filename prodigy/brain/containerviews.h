@@ -167,6 +167,12 @@ public:
 			&& state != ContainerState::aboutToDestroy;
 	}
 
+   bool readyForSubscriptionPairingNotifications(void) const override
+   {
+      return runtimeReady
+         || (state == ContainerState::healthy && canProxySendToNeuron());
+   }
+
    void clearStatefulTopologyCutoverBarrier(void)
    {
       statefulTopologyCutoverReady = false;
@@ -316,10 +322,10 @@ public:
 			for (MeshNode *subscriberNode : subscribers)
 			{
 				ContainerView *subscriber = static_cast<ContainerView *>(subscriberNode);
-				if (subscriber == nullptr || subscriber->runtimeReady == false)
-				{
-					continue;
-				}
+					if (subscriber == nullptr || subscriber->readyForSubscriptionPairingNotifications() == false)
+					{
+						continue;
+					}
 
 				uint128_t secret = thisBrain->mesh->pairingSecretFor(this, subscriber, service);
 				if (secret == 0)
@@ -328,6 +334,40 @@ public:
 				}
 
 				subscriber->subscriptionPairing(secret, pairingAddress(), service, advertisementIt->second.port, applicationID, true);
+			}
+		}
+	}
+
+	void deactivateActivePeerSubscriptionsForRestart(void)
+	{
+		if (runtimeReady == false || thisBrain == nullptr || thisBrain->mesh == nullptr)
+		{
+			return;
+		}
+
+		for (const auto& [service, subscribers] : advertisingTo)
+		{
+			auto advertisementIt = advertisements.find(service);
+			if (advertisementIt == advertisements.end())
+			{
+				continue;
+			}
+
+			for (MeshNode *subscriberNode : subscribers)
+			{
+				ContainerView *subscriber = static_cast<ContainerView *>(subscriberNode);
+					if (subscriber == nullptr || subscriber->readyForSubscriptionPairingNotifications() == false)
+					{
+						continue;
+					}
+
+				uint128_t secret = thisBrain->mesh->pairingSecretFor(this, subscriber, service);
+				if (secret == 0)
+				{
+					continue;
+				}
+
+				subscriber->subscriptionPairing(secret, pairingAddress(), service, advertisementIt->second.port, applicationID, false);
 			}
 		}
 	}
