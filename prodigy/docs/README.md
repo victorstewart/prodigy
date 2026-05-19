@@ -29,6 +29,15 @@ Persistent Fake Clusters
 - The raw [prodigy_dev_netns_harness.sh](/root/prodigy/prodigy/dev/tests/prodigy_dev_netns_harness.sh) entrypoint is now the low-level runner underneath that cluster type.
 - Invoke the raw harness directly only for low-level debugging, isolated harness development, or the existing fault/deployment matrix scripts that intentionally exercise harness-only behavior.
 
+Container Artifacts
+
+- Discombobulator is the only valid producer of Prodigy app-container artifacts.
+- Deployment inputs must be Discombobulator `--kind app` outputs.
+- Hand-authored launch metadata, Btrfs payloads, rootfs trees, or `.zst` blobs are valid only as negative fixtures that prove runtime rejection.
+- App blobs start with a versioned Discombobulator app-container contract header, followed by the zstd payload.
+- Mothership rejects deployment blobs whose contract header, digest, or size is unsupported or mismatched.
+- Neuron verifies and skips the header before zstd/Btrfs receive.
+
 Startup State
 
 - First boot is seeded by `--boot-json=<inline-json>` or `--boot-json-path=<path>`.

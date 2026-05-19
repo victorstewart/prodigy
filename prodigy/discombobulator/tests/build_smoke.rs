@@ -21,6 +21,39 @@ use std::time::{Duration, Instant};
 use tar::{Builder, EntryType, Header};
 use walkdir::WalkDir;
 
+fn discombobulator_blob_header() -> &'static [u8] {
+    b"PRODIGY-DISCOMBOBULATOR-APP-CONTAINER\ncontract=prodigy-container-artifact\ncontract_version=1\n\n"
+}
+
+fn assert_discombobulator_blob_header(output_blob: &Path) {
+    let bytes = fs::read(output_blob).unwrap();
+    assert!(
+        bytes.starts_with(discombobulator_blob_header()),
+        "{} is missing Discombobulator app-container blob header",
+        output_blob.display()
+    );
+}
+
+fn blob_payload_bytes(blob: &Path) -> Vec<u8> {
+    let bytes = fs::read(blob).unwrap();
+    if bytes.starts_with(discombobulator_blob_header()) {
+        return bytes[discombobulator_blob_header().len()..].to_vec();
+    }
+
+    bytes
+}
+
+fn zstd_payload_for_blob(blob: &Path, temp: &Path) -> PathBuf {
+    let bytes = fs::read(blob).unwrap();
+    if bytes.starts_with(discombobulator_blob_header()) == false {
+        return blob.to_path_buf();
+    }
+
+    let payload = temp.join("payload-after-discombobulator-header.zst");
+    fs::write(&payload, &bytes[discombobulator_blob_header().len()..]).unwrap();
+    payload
+}
+
 #[test]
 fn scratch_build_emits_btrfs_blob_with_private_launch_metadata() {
     let temp = tempfile::tempdir().unwrap();
@@ -96,6 +129,7 @@ fn scratch_build_emits_btrfs_blob_with_private_launch_metadata() {
         String::from_utf8_lossy(&build.stderr)
     );
     assert!(output_blob.exists());
+    assert_discombobulator_blob_header(&output_blob);
 
     let inspect = tempfile::tempdir().unwrap();
     let image = inspect.path().join("recv.img");
@@ -123,11 +157,12 @@ fn scratch_build_emits_btrfs_blob_with_private_launch_metadata() {
         .unwrap()
         .success());
 
+    let zstd_payload = zstd_payload_for_blob(&output_blob, inspect.path());
     let decoded = Command::new("bash")
         .arg("-lc")
         .arg(format!(
             "set -euo pipefail; zstd -d -q -c '{}' | btrfs receive '{}'",
-            output_blob.display(),
+            zstd_payload.display(),
             mount_point.display()
         ))
         .output()
@@ -141,6 +176,9 @@ fn scratch_build_emits_btrfs_blob_with_private_launch_metadata() {
     let artifact_root = mount_point.join("artifact");
     assert!(artifact_root
         .join(".prodigy-private/launch.metadata")
+        .exists());
+    assert!(!artifact_root
+        .join(".prodigy-private/.discombobulator.contract")
         .exists());
     assert!(artifact_root.join("rootfs/app/hello").exists());
 
@@ -241,6 +279,7 @@ fn app_survive_projection_excludes_undeclared_files_and_keeps_private_metadata_o
         "app",
         &[format!("src={}", source_dir.display())],
     );
+    assert_discombobulator_blob_header(&output_blob);
 
     let mounted = MountedBlob::receive(&output_blob);
     let artifact_root = mounted.artifact_root();
@@ -248,6 +287,9 @@ fn app_survive_projection_excludes_undeclared_files_and_keeps_private_metadata_o
         .join(".prodigy-private/launch.metadata")
         .exists());
     assert!(!artifact_root.join("rootfs/.prodigy-private").exists());
+    assert!(!artifact_root
+        .join(".prodigy-private/.discombobulator.contract")
+        .exists());
     assert!(artifact_root.join("rootfs/app/hello").exists());
     assert!(artifact_root.join("rootfs/app/config.json").exists());
     assert!(!artifact_root.join("rootfs/app/.secret-env").exists());
@@ -296,7 +338,10 @@ fn app_build_rejects_missing_survivor_set() {
         "app",
         &[format!("src={}", source_dir.display())],
     );
-    assert!(stderr.contains("app builds require at least one SURVIVE path"), "{stderr}");
+    assert!(
+        stderr.contains("app builds require at least one SURVIVE path"),
+        "{stderr}"
+    );
     assert!(!output_blob.exists());
 }
 
@@ -610,7 +655,7 @@ fn published_local_base_can_seed_a_follow_on_build() {
     assert!(app_row.updated_at > 0);
     assert!(app_row.last_used_at > 0);
     assert_eq!(
-        fs::read(&app_blob).unwrap(),
+        blob_payload_bytes(&app_blob),
         fs::read(&app_cached_path).unwrap()
     );
 }
@@ -688,7 +733,7 @@ fn repeated_identical_app_build_reuses_cached_local_artifact_blob() {
         "expected one cached app artifact after first build"
     );
     assert_eq!(
-        fs::read(&first_blob).unwrap(),
+        blob_payload_bytes(&first_blob),
         fs::read(&first_cached_path).unwrap()
     );
 
@@ -719,7 +764,7 @@ fn repeated_identical_app_build_reuses_cached_local_artifact_blob() {
         "expected repeated build to reuse cached app artifact"
     );
     assert_eq!(
-        fs::read(&second_blob).unwrap(),
+        blob_payload_bytes(&second_blob),
         fs::read(&second_cached_path).unwrap()
     );
 }
@@ -3827,7 +3872,11 @@ EXECUTE [\"{}\", \"/app/main.py\"]
         .unwrap()
         .join("sdk/typescript");
     let sdk_package_root = project.join("typescript-sdk-package");
-    copy_tree_into_context(&sdk_source_root, project, Path::new("/typescript-sdk-package"));
+    copy_tree_into_context(
+        &sdk_source_root,
+        project,
+        Path::new("/typescript-sdk-package"),
+    );
     let sdk_install = Command::new("npm")
         .current_dir(&sdk_package_root)
         .args(["install", "--no-package-lock", "--ignore-scripts"])
@@ -4038,6 +4087,9 @@ fn build_blob(project: &Path, file: &Path, output: &Path, kind: &str) {
         "{}",
         String::from_utf8_lossy(&build.stderr)
     );
+    if kind == "app" {
+        assert_discombobulator_blob_header(output);
+    }
 }
 
 fn remote_fetch(project: &Path, remote: &str, image: &str, arch: &str) -> std::process::Output {
@@ -4092,6 +4144,9 @@ fn build_blob_with_contexts(
         "{}",
         String::from_utf8_lossy(&build.stderr)
     );
+    if kind == "app" {
+        assert_discombobulator_blob_header(output);
+    }
 }
 
 fn assert_fault_injected(output: &std::process::Output, stage: &str) {
@@ -4468,11 +4523,12 @@ impl MountedBlob {
             .unwrap()
             .success());
 
+        let zstd_payload = zstd_payload_for_blob(blob, temp.path());
         let decoded = Command::new("bash")
             .arg("-lc")
             .arg(format!(
                 "set -euo pipefail; zstd -d -q -c '{}' | btrfs receive '{}'",
-                blob.display(),
+                zstd_payload.display(),
                 mount_point.display()
             ))
             .output()

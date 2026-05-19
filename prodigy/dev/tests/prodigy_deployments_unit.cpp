@@ -294,7 +294,12 @@ static bool writeLaunchMetadataFixture(const String& artifactRoot, const char *m
 
    String payload = {};
    payload.assign(metadataJSON);
-   return Filesystem::openWriteAtClose(-1, metadataPath, payload) >= 0;
+   if (Filesystem::openWriteAtClose(-1, metadataPath, payload) < 0)
+   {
+      return false;
+   }
+
+   return true;
 }
 
 static bool writeFileFixture(const std::filesystem::path& path, const char *payloadText)
@@ -1065,12 +1070,13 @@ int main(void)
       if (workspace.path.size() > 0)
       {
          std::filesystem::path blobPath = filesystemPathFromString(workspace.path) / "container.zst";
+         String payload = {};
+         payload.assign(prodigyDiscombobulatorBlobHeaderText());
+         payload.append("discombobulator-blob-payload"_ctv);
          suite.expect(
-            writeFileFixture(blobPath, "discombobulator-blob-payload"),
+            Filesystem::openWriteAtClose(-1, stringFromFilesystemPath(blobPath), payload) >= 0,
             "container_blob_digest_fixture_written");
 
-         String payload = {};
-         payload.assign("discombobulator-blob-payload"_ctv);
          uint64_t expectedBytes = payload.size();
          String expectedDigest = {};
          String digestFailure = {};
@@ -1109,6 +1115,26 @@ int main(void)
          suite.expect(
             stringContains(verificationFailure, "blob size mismatch"),
             "container_blob_digest_verifier_reports_mismatched_size");
+
+         std::filesystem::path missingHeaderPath = filesystemPathFromString(workspace.path) / "missing-header-container.zst";
+         String missingHeaderPayload = {};
+         missingHeaderPayload.assign("discombobulator-blob-payload"_ctv);
+         suite.expect(
+            Filesystem::openWriteAtClose(-1, stringFromFilesystemPath(missingHeaderPath), missingHeaderPayload) >= 0,
+            "container_blob_contract_missing_header_fixture_written");
+         String missingHeaderDigest = {};
+         suite.expect(
+            prodigyComputeSHA256Hex(missingHeaderPayload, missingHeaderDigest, &digestFailure),
+            "container_blob_contract_missing_header_sha256_computed");
+         verified = ContainerManager::debugVerifyCompressedContainerBlob(
+            stringFromFilesystemPath(missingHeaderPath),
+            missingHeaderDigest,
+            missingHeaderPayload.size(),
+            &verificationFailure);
+         suite.expect(verified == false, "container_blob_digest_verifier_rejects_missing_contract_header");
+         suite.expect(
+            stringContains(verificationFailure, "Discombobulator app-container contract header"),
+            "container_blob_digest_verifier_reports_missing_contract_header");
       }
    }
 

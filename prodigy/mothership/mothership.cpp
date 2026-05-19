@@ -24,6 +24,7 @@
 #include <services/prodigy.h>
 
 #include <prodigy/bootstrap.config.h>
+#include <prodigy/container.contract.h>
 #include <prodigy/iaas/runtime/runtime.h>
 #include <prodigy/persistent.state.h>
 #include <prodigy/remote.bootstrap.h>
@@ -84,6 +85,13 @@ static bool parseU32Arg(const char *text, uint32_t& value)
 
 	value = static_cast<uint32_t>(parsed);
 	return true;
+}
+
+static bool mothershipValidateDiscombobulatorContainerBlobContract(
+   const String& containerPath,
+   String *failureReport = nullptr)
+{
+   return prodigyValidateDiscombobulatorContainerBlobHeader(containerPath, failureReport);
 }
 
 static bool parseBoolArg(const char *text, bool& value)
@@ -10462,11 +10470,12 @@ private:
 			exit(EXIT_FAILURE);
 		}
 
-		if (prodigyIsZstdFile(containerPath) == false)
-		{
-			basics_log("file provided is not a zstd file\n");
-			exit(EXIT_FAILURE);
-		}
+      String contractFailure = {};
+      if (mothershipValidateDiscombobulatorContainerBlobContract(containerPath, &contractFailure) == false)
+      {
+         basics_log("container artifact rejected: %s\n", contractFailure.c_str());
+         exit(EXIT_FAILURE);
+      }
 
       if (std::strcmp(argv[0], "local") != 0)
       {

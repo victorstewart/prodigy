@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -332,7 +332,7 @@ fn execute_supported_subset(
             if let Some(parent) = output_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            materialize_output_blob(&artifact_path, output_path)?;
+            materialize_output_blob(&artifact_path, output_path, None)?;
             maybe_inject_test_fault("registry-update");
             registry.upsert_artifact(&ArtifactRecord {
                 kind: "base".to_string(),
@@ -403,7 +403,15 @@ fn execute_supported_subset(
             None
         },
     )?;
-    materialize_output_blob(&artifact_path, output_path)?;
+    materialize_output_blob(
+        &artifact_path,
+        output_path,
+        if output_kind == OutputKind::App {
+            Some(discombobulator_blob_header())
+        } else {
+            None
+        },
+    )?;
     maybe_inject_test_fault("registry-update");
     registry.upsert_artifact(&ArtifactRecord {
         kind: artifact_kind.to_string(),
@@ -2266,6 +2274,10 @@ fn write_launch_metadata(path: &Path, resolved: &ResolvedBuildSpec) -> Result<()
     Ok(())
 }
 
+fn discombobulator_blob_header() -> &'static [u8] {
+    b"PRODIGY-DISCOMBOBULATOR-APP-CONTAINER\ncontract=prodigy-container-artifact\ncontract_version=1\n\n"
+}
+
 fn publish_cached_artifact(
     storage: &StorageRoot,
     session: &BuildSession,
@@ -2379,8 +2391,12 @@ fn emit_btrfs_blob(temp_root: &Path, artifact_root: &Path, output_path: &Path) -
     Ok(())
 }
 
-fn materialize_output_blob(cached_artifact: &Path, output_path: &Path) -> Result<()> {
-    if cached_artifact == output_path {
+fn materialize_output_blob(
+    cached_artifact: &Path,
+    output_path: &Path,
+    prefix: Option<&[u8]>,
+) -> Result<()> {
+    if cached_artifact == output_path && prefix.is_none() {
         return Ok(());
     }
 
@@ -2395,7 +2411,15 @@ fn materialize_output_blob(cached_artifact: &Path, output_path: &Path) -> Result
             .file_name()
             .unwrap_or_else(|| OsStr::new("artifact.zst")),
     );
-    copy_blob_file(cached_artifact, &staged_output)?;
+    if let Some(prefix_bytes) = prefix {
+        let mut output = fs::File::create(&staged_output)?;
+        output.write_all(prefix_bytes)?;
+        let mut input = fs::File::open(cached_artifact)?;
+        std::io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+    } else {
+        copy_blob_file(cached_artifact, &staged_output)?;
+    }
     fs::rename(&staged_output, output_path)?;
     Ok(())
 }

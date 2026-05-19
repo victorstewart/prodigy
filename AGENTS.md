@@ -1,5 +1,22 @@
 # Prodigy Host Safety Rules
 
+## Container Artifact Rule
+
+Discombobulator is the only valid way to produce a Prodigy container artifact.
+Any app container passed to Mothership/Brain/Neuron runtime paths must come from
+a Discombobulator `--kind app` build. Do not hand-author launch metadata, Btrfs
+receive payloads, rootfs trees, `.zst` blobs, or test fixtures as substitutes
+for real runtime deployment artifacts.
+
+Runtime paths must fail closed when an app artifact cannot prove it was produced
+by Discombobulator for the supported app-container contract. Every `--kind app`
+blob must start with the versioned Discombobulator contract header before the
+zstd payload. Mothership must reject deployment blobs whose header, digest, or
+size is unsupported or mismatched; Prodigy/Neuron must verify and skip that
+header before zstd/Btrfs receive. Tests may construct malformed artifacts only
+to prove that rejection behavior; successful runtime/deployment tests must use
+Discombobulator-built artifacts.
+
 ## Critical Runtime Test Rule
 
 This repo contains code and test harnesses that can manipulate Linux network

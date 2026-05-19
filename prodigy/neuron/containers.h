@@ -29,6 +29,7 @@
 
 #include <services/memfd.h>
 #include <prodigy/build.identity.h>
+#include <prodigy/container.contract.h>
 #include <prodigy/wire.h>
 #include <prodigy/child.process.signal.h>
 
@@ -4493,19 +4494,23 @@ private:
          return false;
       }
 
-      if (privateEntries.size() != 1 || privateEntries[0].equal("launch.metadata"_ctv) == false)
+      bool sawLaunchMetadata = false;
+      for (const String& privateEntryName : privateEntries)
       {
-         if (failureReport)
+         if (privateEntryName.equal("launch.metadata"_ctv))
          {
-            if (privateEntries.size() == 0)
-            {
-               failureReport->assign("artifact private metadata directory is missing launch.metadata"_ctv);
-            }
-            else
-            {
-               failureReport->snprintf<"artifact private metadata directory must contain only launch.metadata, found {} entries"_ctv>(uint32_t(privateEntries.size()));
-            }
+            sawLaunchMetadata = true;
+            continue;
          }
+
+         if (failureReport) failureReport->snprintf<"artifact private metadata directory contains unexpected entry {}"_ctv>(privateEntryName);
+         close(privateFD);
+         return false;
+      }
+
+      if (sawLaunchMetadata == false)
+      {
+         if (failureReport) failureReport->assign("artifact private metadata directory is missing launch.metadata"_ctv);
          close(privateFD);
          return false;
       }
@@ -4538,8 +4543,16 @@ private:
       }
 
       close(metadataFD);
+
+      if (metadataIsRegular == false)
+      {
+         close(privateFD);
+         return false;
+      }
+
       close(privateFD);
-      return metadataIsRegular;
+
+      return true;
    }
 
    static bool validateContainerArtifactShape(const String& artifactRootPath, String *failureReport = nullptr)
@@ -4589,6 +4602,11 @@ private:
       String actualDigest = {};
       uint64_t actualBytes = 0;
       if (prodigyFileMatchesExpectedSHA256HexAndSize(compressedContainerPath, expectedDigest, expectedBytes, actualDigest, &actualBytes, failureReport) == false)
+      {
+         return false;
+      }
+
+      if (prodigyValidateDiscombobulatorContainerBlobHeader(compressedContainerPath, failureReport) == false)
       {
          return false;
       }
@@ -6425,7 +6443,8 @@ public:
       receiveScratchCleanup.scratchPath = receiveScratchPath;
 
       // Replace shell pipeline with explicit posix_spawn commands:
-      // 1) zstd -d -c <compressed> | 2) btrfs receive <scratch>
+      // 1) verify and skip Prodigy blob contract header
+      // 2) zstd -d -c <payload-fd> | 3) btrfs receive <scratch>
       {
          // Guardian sets SIGCHLD to SIG_IGN globally; restore default disposition for
          // explicit child supervision in this extraction pipeline.
@@ -6446,10 +6465,22 @@ public:
             }
          };
 
+         int compressedPayloadFD = -1;
+         String contractFailure = {};
+         if (prodigyOpenContainerBlobPayloadAfterContractHeader(compressedContainerPath, compressedPayloadFD, &contractFailure) == false)
+         {
+            basics_log("createContainer rejected container blob contract: %s\n", contractFailure.c_str());
+            restoreSigChld();
+            cleanupContainerAfterFailedCreate(container);
+            container = nullptr;
+            return;
+         }
+
          int pipefd[2];
          if (pipe(pipefd) != 0)
          {
             basics_log("createContainer pipe failed errno=%d(%s)\n", errno, strerror(errno));
+            close(compressedPayloadFD);
             restoreSigChld();
             cleanupContainerAfterFailedCreate(container);
             container = nullptr;
@@ -6473,13 +6504,14 @@ public:
             }
          }
 
-         // Spawn zstd -d -c <compressed>, stdout = pipe write
+         // Spawn zstd -d -c, stdin = contract-verified compressed payload, stdout = pipe write.
          {
             posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
+            posix_spawn_file_actions_adddup2(&fa, compressedPayloadFD, STDIN_FILENO);
             posix_spawn_file_actions_adddup2(&fa, pipefd[1], STDOUT_FILENO);
             posix_spawn_file_actions_addclose(&fa, pipefd[0]);
-            String input = compressedContainerPath; // path to compressed image
-            char *const argv[] = { (char*)"zstd", (char*)"-d", (char*)"-c", (char*)input.c_str(), nullptr };
+            posix_spawn_file_actions_addclose(&fa, compressedPayloadFD);
+            char *const argv[] = { (char*)"zstd", (char*)"-d", (char*)"-c", nullptr };
             int rc = posix_spawnp(&zstd_pid, "zstd", &fa, nullptr, argv, environ);
             posix_spawn_file_actions_destroy(&fa);
             if (rc != 0)
@@ -6489,6 +6521,7 @@ public:
          }
 
          // Close both pipe ends in parent
+         close(compressedPayloadFD);
          close(pipefd[0]);
          close(pipefd[1]);
 
