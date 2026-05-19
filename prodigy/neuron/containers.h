@@ -470,6 +470,28 @@ static bool writeProcSysctlValue(const char *path, const char *value)
    return ok;
 }
 
+static bool enableContainerTCPFastOpen(uint64_t containerUUID, String *failureReport = nullptr)
+{
+   constexpr const char *requiredBits = "519";
+   if (writeProcSysctlValue("/proc/sys/net/ipv4/tcp_fastopen", requiredBits))
+   {
+      return true;
+   }
+
+   if (failureReport)
+   {
+      failureReport->snprintf<"failed to enable tcp_fastopen={} for container {itoa}"_ctv>(
+         String(requiredBits),
+         containerUUID);
+   }
+
+   basics_log("container tcp_fastopen setup failed uuid=%llu errno=%d(%s)\n",
+      (unsigned long long)containerUUID,
+      errno,
+      strerror(errno));
+   return false;
+}
+
 static std::filesystem::path prodigyFilesystemPathFromString(const String& path)
 {
    String pathText = {};
@@ -7685,6 +7707,16 @@ public:
                (unsigned long long)container->plan.uuid,
                errno,
                strerror(errno));
+            _exit(containerStartupFailureExitCode);
+         }
+
+         String fastOpenFailure = {};
+         if (container->plan.useHostNetworkNamespace == false
+            && enableContainerTCPFastOpen(container->plan.uuid, &fastOpenFailure) == false)
+         {
+            basics_log("startContainer failed to enable tcp_fastopen uuid=%llu reason=%s\n",
+               (unsigned long long)container->plan.uuid,
+               fastOpenFailure.c_str());
             _exit(containerStartupFailureExitCode);
          }
 

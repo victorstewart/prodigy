@@ -93,7 +93,7 @@ inline void BrainBase::sendNeuronSwitchboardRoutableSubnets(void)
 inline void BrainBase::buildHostedSwitchboardIngressPrefixes(Machine *machine, Vector<IPPrefix>& prefixes) const
 {
    prefixes.clear();
-   if (machine == nullptr || machine->uuid == 0)
+   if (machine == nullptr)
    {
       return;
    }
@@ -111,9 +111,14 @@ inline void BrainBase::buildHostedSwitchboardIngressPrefixes(Machine *machine, V
       prefixes.push_back(candidate);
    };
 
+   // Contract: every Switchboard instance must converge the same hosted
+   // ingress portal, target, and overlay routing state. Packets can enter
+   // through any Switchboard and still reach the same correct destination, so
+   // registered hosted prefixes are global routing data, not owner-local data
+   // filtered to address.machineUUID.
    for (const RegisteredRoutableAddress& address : brainConfig.routableAddresses)
    {
-      if (address.machineUUID != machine->uuid || address.address.isNull())
+      if (address.address.isNull())
       {
          continue;
       }
@@ -271,7 +276,7 @@ inline bool BrainBase::buildSwitchboardOverlayRoutingConfig(Machine *machine, Sw
    };
 
    Vector<ClusterMachinePeerAddress> localCandidates = {};
-   prodigyCollectMachinePeerAddresses(*machine, localCandidates);
+   prodigyCollectMachineOverlayRouteAddresses(*machine, localCandidates);
 
    Vector<Machine *> sortedMachines = {};
    sortedMachines.reserve(machines.size());
@@ -299,7 +304,7 @@ inline bool BrainBase::buildSwitchboardOverlayRoutingConfig(Machine *machine, Sw
       }
 
       Vector<ClusterMachinePeerAddress> remoteCandidates = {};
-      prodigyCollectMachinePeerAddresses(*candidate, remoteCandidates);
+      prodigyCollectMachineOverlayRouteAddresses(*candidate, remoteCandidates);
 
       auto appendIPv6Route = [&] () -> bool
       {
@@ -356,13 +361,15 @@ inline bool BrainBase::buildSwitchboardOverlayRoutingConfig(Machine *machine, Sw
                && localDirectSubnet->address.equals(sourceAddress));
             if (directPeerRoute)
             {
-               if (remoteDirectNic == nullptr || remoteDirectNic->mac.size() == 0)
+               if (remoteDirectNic != nullptr && remoteDirectNic->mac.size() > 0)
                {
-                  continue;
+                  route.useGatewayMAC = false;
+                  route.nextHopMAC.assign(remoteDirectNic->mac);
                }
-
-               route.useGatewayMAC = false;
-               route.nextHopMAC.assign(remoteDirectNic->mac);
+               else
+               {
+                  route.useGatewayMAC = true;
+               }
             }
             else
             {

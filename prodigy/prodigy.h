@@ -1,5 +1,7 @@
 #pragma once
 
+#include <limits.h>
+
 #include <networking/includes.h>
 #include <services/prodigy.h>
 #include <prodigy/types.h>

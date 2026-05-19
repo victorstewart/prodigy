@@ -99,6 +99,10 @@ protected:
          SwitchboardOverlayRoutingConfig overlayRoutingConfig;
          Vector<switchboard_overlay_prefix4_key> installedIngressOverlayPrefixes4;
          Vector<switchboard_overlay_prefix6_key> installedIngressOverlayPrefixes6;
+         Vector<switchboard_overlay_machine_route_key> installedIngressOverlayRouteKeysFull;
+         Vector<switchboard_overlay_machine_route_key> installedIngressOverlayRouteKeysLow8;
+         Vector<switchboard_overlay_prefix4_key> installedIngressHostedIngressRouteKeys4;
+         Vector<switchboard_overlay_prefix6_key> installedIngressHostedIngressRouteKeys6;
          Vector<switchboard_overlay_prefix4_key> installedEgressOverlayPrefixes4;
          Vector<switchboard_overlay_prefix6_key> installedEgressOverlayPrefixes6;
          Vector<switchboard_overlay_machine_route_key> installedOverlayRouteKeysFull;
@@ -354,22 +358,14 @@ protected:
          Vector<switchboard_overlay_prefix6_key> desiredPrefixes6 = {};
          switchboardBuildOverlayPrefixKeys(overlayRoutingConfig.overlaySubnets, desiredPrefixes4, desiredPrefixes6);
 
-         syncOverlayPresenceMap(tcx_ingress_program,
-            "overlay_routable_prefixes4"_ctv,
+         prodigySyncOverlayEgressRoutingProgram(tcx_ingress_program,
+            overlayRoutingConfig,
             installedIngressOverlayPrefixes4,
-            desiredPrefixes4,
-            [] (const switchboard_overlay_prefix4_key& lhs, const switchboard_overlay_prefix4_key& rhs) -> bool {
-
-               return switchboardOverlayPrefix4Equals(lhs, rhs);
-            });
-         syncOverlayPresenceMap(tcx_ingress_program,
-            "overlay_routable_prefixes6"_ctv,
             installedIngressOverlayPrefixes6,
-            desiredPrefixes6,
-            [] (const switchboard_overlay_prefix6_key& lhs, const switchboard_overlay_prefix6_key& rhs) -> bool {
-
-               return switchboardOverlayPrefix6Equals(lhs, rhs);
-            });
+            installedIngressOverlayRouteKeysFull,
+            installedIngressOverlayRouteKeysLow8,
+            installedIngressHostedIngressRouteKeys4,
+            installedIngressHostedIngressRouteKeys6);
 
          syncOverlayPresenceMap(tcx_egress_program,
             "overlay_routable_prefixes4"_ctv,
@@ -1925,15 +1921,16 @@ protected:
 
    void refreshContainerSwitchboardWormholes(Container *container) override
    {
-      if (switchboard == nullptr || container == nullptr || container->plan.wormholes.empty())
+      if (container == nullptr || container->plan.wormholes.empty())
       {
          return;
       }
 
+      Switchboard *activeSwitchboard = ensureSwitchboard();
       uint32_t containerID = generateLocalContainerID(container->plan.fragment);
 
-      switchboard->setLocalContainerSubnet(lcsubnet6);
-      switchboard->openWormholes(containerID, container->plan.wormholes);
+      activeSwitchboard->setLocalContainerSubnet(lcsubnet6);
+      activeSwitchboard->openWormholes(containerID, container->plan.wormholes);
 
       // Wormhole refresh must also converge the target container's live peer
       // runtime immediately, not just the broader switchboard state, so the

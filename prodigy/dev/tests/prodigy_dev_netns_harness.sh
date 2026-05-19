@@ -1493,6 +1493,10 @@ build_dev_host_ingress_ebpf_object()
 {
    local source_path="${PRODIGY_ROOT}/switchboard/kernel/host.ingress.router.ebpf.c"
    local output_path="${tmpdir}/host.ingress.router.dynamic.ebpf.o"
+   local manifest_path="${output_path}.manifest"
+   local prebuilt_path="${PRODIGY_DEV_HOST_INGRESS_EBPF:-}"
+   local object_sha256=""
+   local source_sha256=""
 
    if [[ ! -f "${source_path}" ]]
    then
@@ -1500,11 +1504,34 @@ build_dev_host_ingress_ebpf_object()
       return 1
    fi
 
+   if [[ -n "${prebuilt_path}" ]]
+   then
+      if [[ ! -r "${prebuilt_path}" ]]
+      then
+         echo "FAIL: PRODIGY_DEV_HOST_INGRESS_EBPF is not readable: ${prebuilt_path}" >&2
+         return 1
+      fi
+
+      cp -f "${prebuilt_path}" "${output_path}"
+      object_sha256="$(sha256sum "${output_path}" | awk '{print $1}')"
+      {
+         printf 'mode=prebuilt\n'
+         printf 'prebuilt_path=%s\n' "${prebuilt_path}"
+         printf 'prebuilt_sha256=%s\n' "$(sha256sum "${prebuilt_path}" | awk '{print $1}')"
+         printf 'runtime_object=%s\n' "${output_path}"
+         printf 'runtime_object_sha256=%s\n' "${object_sha256}"
+      } > "${manifest_path}"
+      host_ingress_ebpf="${output_path}"
+      return 0
+   fi
+
    if ! command -v clang >/dev/null 2>&1
    then
       echo "FAIL: clang is required to build dev host ingress eBPF object" >&2
       return 1
    fi
+
+   source_sha256="$(sha256sum "${source_path}" | awk '{print $1}')"
 
    if ! clang \
       -g \
@@ -1520,6 +1547,22 @@ build_dev_host_ingress_ebpf_object()
       echo "FAIL: unable to compile dev host ingress eBPF object" >&2
       return 1
    fi
+
+   object_sha256="$(sha256sum "${output_path}" | awk '{print $1}')"
+   {
+      printf 'mode=compiled\n'
+      printf 'source_path=%s\n' "${source_path}"
+      printf 'source_sha256=%s\n' "${source_sha256}"
+      printf 'clang_path=%s\n' "$(command -v clang)"
+      printf 'clang_version=%s\n' "$(clang --version | head -1)"
+      printf 'compile_command=clang -g -O2 -target bpf -I%s -I%s -DPRODIGY_DEBUG=1 -DNAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE=1 -c %s -o %s\n' \
+         "${PRODIGY_ROOT}" \
+         "${PRODIGY_ROOT}/libraries/include" \
+         "${source_path}" \
+         "${output_path}"
+      printf 'runtime_object=%s\n' "${output_path}"
+      printf 'runtime_object_sha256=%s\n' "${object_sha256}"
+   } > "${manifest_path}"
 
    host_ingress_ebpf="${output_path}"
    return 0
@@ -3076,100 +3119,6 @@ then
       exit 1
    fi
 fi
-
-private4_to_ipv4()
-{
-   local private4="$1"
-   if ! [[ "${private4}" =~ ^[0-9]+$ ]]
-   then
-      return 1
-   fi
-
-   local a=$((private4 & 255))
-   local b=$(((private4 >> 8) & 255))
-   local c=$(((private4 >> 16) & 255))
-   local d=$(((private4 >> 24) & 255))
-   printf '%d.%d.%d.%d' "${a}" "${b}" "${c}" "${d}"
-}
-
-refresh_fake_ipv4_gateway_route_from_primary_deploy()
-{
-   if [[ "${enable_fake_ipv4_boundary}" != "1" ]]
-   then
-      return 0
-   fi
-
-   local machine_private4=""
-   local resolved_gateway=""
-   local resolved_gateway6=""
-   local matched_idx=-1
-
-   for _attempt in $(seq 1 100)
-   do
-      machine_private4="$(
-         rg -o --no-line-number 'schedule spinContainer deploymentID=[0-9]+ appID=[0-9]+ machinePrivate4=[0-9]+' \
-            "${brain_log_root}"/brain*.stdout.log 2>/dev/null \
-            | sed -E 's/.*machinePrivate4=([0-9]+).*/\1/' \
-            | head -n 1 || true
-      )"
-
-      if [[ -n "${machine_private4}" ]]
-      then
-         break
-      fi
-
-      sleep 0.2
-   done
-
-   if [[ -z "${machine_private4}" ]]
-   then
-      echo "WARN: unable to resolve primary deploy machinePrivate4 for fake ipv4 route refresh"
-      return 0
-   fi
-
-   if ! resolved_gateway="$(private4_to_ipv4 "${machine_private4}")"
-   then
-      echo "WARN: invalid machinePrivate4 for fake ipv4 route refresh: ${machine_private4}"
-      return 0
-   fi
-
-   if ! ip netns exec "${parent_ns}" ip route replace "${fake_ipv4_subnet_cidr}" via "${resolved_gateway}" dev prodigy-br0 >/dev/null 2>&1
-   then
-      echo "WARN: failed to refresh fake ipv4 route via ${resolved_gateway}"
-      return 0
-   fi
-
-   for i in $(seq 0 $((${#assigned_brain_ips[@]} - 1)))
-   do
-      if [[ "${assigned_brain_ips[$i]}" == "${resolved_gateway}" ]]
-      then
-         matched_idx="${i}"
-         break
-      fi
-   done
-
-   if [[ "${matched_idx}" -ge 0 && "${matched_idx}" -lt "${#assigned_brain_ips6[@]}" ]]
-   then
-      resolved_gateway6="${assigned_brain_ips6[$matched_idx]}"
-
-      if ! ip netns exec "${parent_ns}" ip -6 route replace "${fake_public6_subnet_cidr}" via "${resolved_gateway6}" dev prodigy-br0 >/dev/null 2>&1
-      then
-         echo "WARN: failed to refresh fake public6 route via ${resolved_gateway6}"
-      fi
-   fi
-
-   if [[ "${switchboard_gateway_ip}" != "${resolved_gateway}" ]]
-   then
-      echo "BOUNDARY_FAKE_IPV4 route_update old_gateway=${switchboard_gateway_ip} new_gateway=${resolved_gateway} machinePrivate4=${machine_private4}"
-   fi
-
-   switchboard_gateway_ip="${resolved_gateway}"
-   if [[ -n "${resolved_gateway6}" ]]
-   then
-      switchboard_gateway_ip6="${resolved_gateway6}"
-   fi
-   return 0
-}
 
 resolve_second_deploy_machine_fragment_from_logs()
 {
@@ -7197,7 +7146,6 @@ then
 
             if [[ "${failed}" -eq 0 && "${deploy_ok}" -eq 1 ]]
             then
-               refresh_fake_ipv4_gateway_route_from_primary_deploy
                configure_dev_switchboard_balancer_on_gateway || true
             fi
 

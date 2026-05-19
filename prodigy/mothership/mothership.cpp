@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <limits.h>
 #include <services/debug.h>
 #include <cctype>
 #include <cerrno>

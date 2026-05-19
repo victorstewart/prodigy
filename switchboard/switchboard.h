@@ -1630,6 +1630,7 @@ private:
       for (SwitchboardPortal *portal : portals)
       {
          syncPortalDefinitionForProgram(host_ingress_router, portal);
+         generateRingForPortalOnProgram(host_ingress_router, portal);
          installPortalQuicCidDecryptStateForProgram(host_ingress_router, portal);
       }
 

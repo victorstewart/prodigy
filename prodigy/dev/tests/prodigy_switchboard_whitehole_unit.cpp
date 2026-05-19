@@ -1,13 +1,16 @@
+#include <limits.h>
 #include <networking/includes.h>
 #include <services/debug.h>
 
 #include <ebpf/common/structs.h>
 #include <ebpf/program.h>
 
+#include <bpf/bpf.h>
 #include <switchboard/common/checksum.h>
 #include <switchboard/common/constants.h>
 #include <switchboard/common/local_container_subnet.h>
 #include <switchboard/common/structs.h>
+#include <switchboard/overlay.route.h>
 #include <switchboard/whitehole.route.h>
 #include <prodigy/quic.cid.generator.h>
 
@@ -67,6 +70,49 @@ static uint32_t programMapID(BPFProgram& program, StringType auto&& mapName)
    });
 
    return id;
+}
+
+static IPPrefix makePrefix(const char *cidr)
+{
+   const char *slash = std::strrchr(cidr, '/');
+   if (slash == nullptr)
+   {
+      std::fprintf(stderr, "unable to parse cidr: %s\n", cidr);
+      std::abort();
+   }
+
+   String addressText = {};
+   addressText.assign(cidr, uint64_t(slash - cidr));
+
+   bool is6 = std::strchr(addressText.c_str(), ':') != nullptr;
+   IPPrefix prefix(addressText.c_str(), is6, uint8_t(std::strtoul(slash + 1, nullptr, 10)));
+   return prefix;
+}
+
+template <typename Key, typename Value>
+static bool updateProgramMapElement(BPFProgram& program, StringType auto&& mapName, const Key& key, const Value& value)
+{
+   bool updated = false;
+   program.openMap(mapName, [&] (int mapFD) -> void {
+
+      if (mapFD < 0)
+      {
+         return;
+      }
+
+      updated = (bpf_map_update_elem(mapFD, &key, &value, BPF_ANY) == 0);
+   });
+
+   return updated;
+}
+
+static void parseIPv6Bytes(const char *text, uint8_t out[16])
+{
+   if (inet_pton(AF_INET6, text, out) != 1)
+   {
+      std::fprintf(stderr, "unable to parse IPv6 address: %s\n", text);
+      std::abort();
+   }
 }
 
 static void makeContainerIPv6(uint8_t address[16],
@@ -235,6 +281,33 @@ static std::vector<uint8_t> makeUDPv4QuicEthernetFrame(const struct in_addr& sou
    std::memcpy(quic->dst_cid, cid.id, cid.id_len);
    *(reinterpret_cast<uint8_t *>(quic + 1)) = 0;
 
+   return frame;
+}
+
+static std::vector<uint8_t> makeUDPv4QuicInIPv6EthernetFrame(const uint8_t outerSrc[16],
+   const uint8_t outerDst[16],
+   const struct in_addr& innerSource,
+   const struct in_addr& innerDestination,
+   uint16_t sourcePort,
+   uint16_t destinationPort,
+   const ProdigyQuicCID& cid)
+{
+   std::vector<uint8_t> inner = makeUDPv4QuicEthernetFrame(innerSource, innerDestination, sourcePort, destinationPort, cid);
+   size_t innerSize = inner.size() - sizeof(struct ethhdr);
+   std::vector<uint8_t> frame(sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + innerSize);
+   std::memset(frame.data(), 0, frame.size());
+
+   struct ethhdr *eth = reinterpret_cast<struct ethhdr *>(frame.data());
+   eth->h_proto = htons(ETH_P_IPV6);
+
+   struct ipv6hdr *outer6 = reinterpret_cast<struct ipv6hdr *>(frame.data() + sizeof(struct ethhdr));
+   outer6->version = 6;
+   outer6->nexthdr = IPPROTO_IPIP;
+   outer6->hop_limit = 64;
+   outer6->payload_len = htons(innerSize);
+   std::memcpy(outer6->saddr.s6_addr, outerSrc, sizeof(outer6->saddr.s6_addr));
+   std::memcpy(outer6->daddr.s6_addr, outerDst, sizeof(outer6->daddr.s6_addr));
+   std::memcpy(outer6 + 1, inner.data() + sizeof(struct ethhdr), innerSize);
    return frame;
 }
 
@@ -442,6 +515,408 @@ static uint16_t replaceChecksumIPv6AddressIncremental(uint16_t checksum, const u
    }
 
    return updated;
+}
+
+static std::vector<uint8_t> makeIPv4L4EthernetFrame(const struct in_addr& source,
+   const struct in_addr& destination,
+   uint8_t proto,
+   uint16_t sourcePort,
+   uint16_t destinationPort)
+{
+   const size_t l4Size = (proto == IPPROTO_TCP) ? sizeof(struct tcphdr) : sizeof(struct udphdr);
+   std::vector<uint8_t> frame(sizeof(struct ethhdr) + sizeof(struct iphdr) + l4Size);
+   std::memset(frame.data(), 0, frame.size());
+
+   struct ethhdr *eth = reinterpret_cast<struct ethhdr *>(frame.data());
+   eth->h_proto = htons(ETH_P_IP);
+
+   struct iphdr *ip4 = reinterpret_cast<struct iphdr *>(frame.data() + sizeof(struct ethhdr));
+   ip4->version = 4;
+   ip4->ihl = 5;
+   ip4->ttl = 64;
+   ip4->protocol = proto;
+   ip4->tot_len = htons(uint16_t(frame.size() - sizeof(struct ethhdr)));
+   ip4->saddr = source.s_addr;
+   ip4->daddr = destination.s_addr;
+
+   if (proto == IPPROTO_TCP)
+   {
+      struct tcphdr *tcp = reinterpret_cast<struct tcphdr *>(ip4 + 1);
+      tcp->source = htons(sourcePort);
+      tcp->dest = htons(destinationPort);
+      tcp->doff = 5;
+      tcp->syn = 1;
+   }
+   else
+   {
+      struct udphdr *udp = reinterpret_cast<struct udphdr *>(ip4 + 1);
+      udp->source = htons(sourcePort);
+      udp->dest = htons(destinationPort);
+      udp->len = htons(sizeof(struct udphdr));
+   }
+
+   return frame;
+}
+
+static std::vector<uint8_t> makeIPv6L4EthernetFrame(const uint8_t source[16],
+   const uint8_t destination[16],
+   uint8_t proto,
+   uint16_t sourcePort,
+   uint16_t destinationPort)
+{
+   const size_t l4Size = (proto == IPPROTO_TCP) ? sizeof(struct tcphdr) : sizeof(struct udphdr);
+   std::vector<uint8_t> frame(sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + l4Size);
+   std::memset(frame.data(), 0, frame.size());
+
+   struct ethhdr *eth = reinterpret_cast<struct ethhdr *>(frame.data());
+   eth->h_proto = htons(ETH_P_IPV6);
+
+   struct ipv6hdr *ip6 = reinterpret_cast<struct ipv6hdr *>(frame.data() + sizeof(struct ethhdr));
+   ip6->version = 6;
+   ip6->nexthdr = proto;
+   ip6->hop_limit = 64;
+   ip6->payload_len = htons(l4Size);
+   std::memcpy(ip6->saddr.s6_addr, source, sizeof(ip6->saddr.s6_addr));
+   std::memcpy(ip6->daddr.s6_addr, destination, sizeof(ip6->daddr.s6_addr));
+
+   if (proto == IPPROTO_TCP)
+   {
+      struct tcphdr *tcp = reinterpret_cast<struct tcphdr *>(ip6 + 1);
+      tcp->source = htons(sourcePort);
+      tcp->dest = htons(destinationPort);
+      tcp->doff = 5;
+      tcp->syn = 1;
+      tcp->check = checksumIPv6Transport(ip6->saddr.s6_addr, ip6->daddr.s6_addr, IPPROTO_TCP, tcp, sizeof(*tcp));
+   }
+   else
+   {
+      struct udphdr *udp = reinterpret_cast<struct udphdr *>(ip6 + 1);
+      udp->source = htons(sourcePort);
+      udp->dest = htons(destinationPort);
+      udp->len = htons(sizeof(struct udphdr));
+      udp->check = checksumIPv6Transport(ip6->saddr.s6_addr, ip6->daddr.s6_addr, IPPROTO_UDP, udp, sizeof(*udp));
+   }
+
+   return frame;
+}
+
+static bool installSingleContainerPortalRing(BPFProgram& program, uint32_t slot, const uint8_t container[5])
+{
+   int ringFD = bpf_map_create(BPF_MAP_TYPE_ARRAY, nullptr, sizeof(__u32), sizeof(container_id), RING_SIZE, nullptr);
+   if (ringFD < 0)
+   {
+      return false;
+   }
+
+   container_id entry = {};
+   entry.hasID = true;
+   std::memcpy(entry.value, container, sizeof(entry.value));
+
+   bool ringFilled = true;
+   for (uint32_t index = 0; index < RING_SIZE; ++index)
+   {
+      if (bpf_map_update_elem(ringFD, &index, &entry, BPF_ANY) != 0)
+      {
+         ringFilled = false;
+         break;
+      }
+   }
+
+   bool outerUpdated = false;
+   if (ringFilled)
+   {
+      program.openMap("container_id_hash_rings"_ctv, [&] (int mapFD) -> void {
+         outerUpdated = mapFD >= 0 && bpf_map_update_elem(mapFD, &slot, &ringFD, BPF_ANY) == 0;
+      });
+   }
+
+   close(ringFD);
+   return ringFilled && outerUpdated;
+}
+
+static void exerciseHostIngressGenericPortal(TestSuite& suite, bool ipv6, uint8_t proto)
+{
+   String ingressObjectPath = {};
+   ingressObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+   ingressObjectPath.append("/host.ingress.router.dev.ebpf.o"_ctv);
+
+   BPFProgram ingressProgram = {};
+   suite.expect(ingressProgram.load(ingressObjectPath, "host_ingress_router"_ctv),
+      ipv6
+         ? (proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv6_tcp_portal_loads_program" : "switchboard_host_ingress_ipv6_udp_portal_loads_program")
+         : (proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv4_tcp_portal_loads_program" : "switchboard_host_ingress_ipv4_udp_portal_loads_program"));
+
+   if (ingressProgram.prog_fd < 0)
+   {
+      return;
+   }
+
+   local_container_subnet6 localSubnet = {};
+   localSubnet.dpfx = 0x01;
+   localSubnet.mpfx[0] = 0x52;
+   localSubnet.mpfx[1] = 0xdf;
+   localSubnet.mpfx[2] = 0x39;
+   ingressProgram.setArrayElement("local_container_subnet_map"_ctv, 0, localSubnet);
+
+   constexpr uint8_t containerFragment = 0x4e;
+   uint32_t redirectIfidx = 93;
+   ingressProgram.setArrayElement("container_device_map"_ctv, containerFragment, redirectIfidx);
+
+   uint8_t containerID[5] = {localSubnet.dpfx, localSubnet.mpfx[0], localSubnet.mpfx[1], localSubnet.mpfx[2], containerFragment};
+   portal_meta meta = {};
+   meta.flags = 0;
+   meta.slot = ipv6 ? (proto == IPPROTO_TCP ? 13u : 12u) : (proto == IPPROTO_TCP ? 11u : 10u);
+
+   suite.expect(installSingleContainerPortalRing(ingressProgram, meta.slot, containerID),
+      ipv6
+         ? (proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv6_tcp_portal_installs_ring" : "switchboard_host_ingress_ipv6_udp_portal_installs_ring")
+         : (proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv4_tcp_portal_installs_ring" : "switchboard_host_ingress_ipv4_udp_portal_installs_ring"));
+
+   const uint16_t externalPortHost = proto == IPPROTO_TCP ? 443 : 4443;
+   const uint16_t containerPortHost = proto == IPPROTO_TCP ? 18443 : 18444;
+   portal_definition portal = {};
+   portal.port = htons(externalPortHost);
+   portal.proto = proto;
+
+   struct in_addr external4 = {};
+   struct in_addr client4 = {};
+   uint8_t external6[16] = {};
+   uint8_t client6[16] = {};
+   if (ipv6)
+   {
+      suite.expect(inet_pton(AF_INET6, "2001:db8:100::44", external6) == 1,
+         proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv6_tcp_portal_external_parses" : "switchboard_host_ingress_ipv6_udp_portal_external_parses");
+      suite.expect(inet_pton(AF_INET6, "2001:db8:200::99", client6) == 1,
+         proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv6_tcp_portal_client_parses" : "switchboard_host_ingress_ipv6_udp_portal_client_parses");
+      std::memcpy(portal.addr6, external6, sizeof(portal.addr6));
+   }
+   else
+   {
+      suite.expect(inet_pton(AF_INET, "198.18.0.1", &external4) == 1,
+         proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv4_tcp_portal_external_parses" : "switchboard_host_ingress_ipv4_udp_portal_external_parses");
+      suite.expect(inet_pton(AF_INET, "203.0.113.99", &client4) == 1,
+         proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv4_tcp_portal_client_parses" : "switchboard_host_ingress_ipv4_udp_portal_client_parses");
+      portal.addr4 = external4.s_addr;
+   }
+
+   bool portalUpdated = false;
+   ingressProgram.openMap("external_portals"_ctv, [&] (int mapFD) -> void {
+      portalUpdated = mapFD >= 0 && bpf_map_update_elem(mapFD, &portal, &meta, BPF_ANY) == 0;
+   });
+   suite.expect(portalUpdated,
+      ipv6
+         ? (proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv6_tcp_portal_installs_portal" : "switchboard_host_ingress_ipv6_udp_portal_installs_portal")
+         : (proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv4_tcp_portal_installs_portal" : "switchboard_host_ingress_ipv4_udp_portal_installs_portal"));
+
+   switchboard_wormhole_target_key targetKey = {};
+   targetKey.slot = meta.slot;
+   std::memcpy(targetKey.container, containerID, sizeof(targetKey.container));
+   uint16_t targetPort = htons(containerPortHost);
+   bool targetUpdated = false;
+   ingressProgram.openMap("wormhole_target_ports"_ctv, [&] (int mapFD) -> void {
+      targetUpdated = mapFD >= 0 && bpf_map_update_elem(mapFD, &targetKey, &targetPort, BPF_ANY) == 0;
+   });
+   suite.expect(targetUpdated,
+      ipv6
+         ? (proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv6_tcp_portal_installs_target_port" : "switchboard_host_ingress_ipv6_udp_portal_installs_target_port")
+         : (proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv4_tcp_portal_installs_target_port" : "switchboard_host_ingress_ipv4_udp_portal_installs_target_port"));
+
+   std::vector<uint8_t> frame = ipv6
+      ? makeIPv6L4EthernetFrame(client6, external6, proto, 49152, externalPortHost)
+      : makeIPv4L4EthernetFrame(client4, external4, proto, 49152, externalPortHost);
+   std::vector<uint8_t> output(frame.size());
+   LIBBPF_OPTS(bpf_test_run_opts, opts,
+      .data_in = frame.data(),
+      .data_out = output.data(),
+      .data_size_in = static_cast<__u32>(frame.size()),
+      .data_size_out = static_cast<__u32>(output.size()),
+      .repeat = 1,
+   );
+
+   int runResult = bpf_prog_test_run_opts(ingressProgram.prog_fd, &opts);
+   suite.expect(runResult == 0,
+      ipv6
+         ? (proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv6_tcp_portal_test_run_succeeds" : "switchboard_host_ingress_ipv6_udp_portal_test_run_succeeds")
+         : (proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv4_tcp_portal_test_run_succeeds" : "switchboard_host_ingress_ipv4_udp_portal_test_run_succeeds"));
+   suite.expect(opts.retval == TC_ACT_REDIRECT,
+      ipv6
+         ? (proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv6_tcp_portal_redirects_to_container" : "switchboard_host_ingress_ipv6_udp_portal_redirects_to_container")
+         : (proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv4_tcp_portal_redirects_to_container" : "switchboard_host_ingress_ipv4_udp_portal_redirects_to_container"));
+
+   if (runResult == 0)
+   {
+      const struct ethhdr *outEth = reinterpret_cast<const struct ethhdr *>(output.data());
+      if (ipv6 && opts.data_size_out >= sizeof(struct ethhdr) + sizeof(struct ipv6hdr))
+      {
+         const struct ipv6hdr *outIP = reinterpret_cast<const struct ipv6hdr *>(output.data() + sizeof(struct ethhdr));
+         makeContainerIPv6(external6, localSubnet.dpfx, localSubnet.mpfx[0], localSubnet.mpfx[1], localSubnet.mpfx[2], containerFragment);
+         suite.expect(outEth->h_proto == htons(ETH_P_IPV6),
+            proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv6_tcp_portal_preserves_ethertype" : "switchboard_host_ingress_ipv6_udp_portal_preserves_ethertype");
+         suite.expect(std::memcmp(outIP->daddr.s6_addr, external6, sizeof(outIP->daddr.s6_addr)) == 0,
+            proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv6_tcp_portal_rewrites_destination" : "switchboard_host_ingress_ipv6_udp_portal_rewrites_destination");
+         if (proto == IPPROTO_TCP)
+         {
+            const struct tcphdr *outTCP = reinterpret_cast<const struct tcphdr *>(outIP + 1);
+            suite.expect(outTCP->dest == targetPort, "switchboard_host_ingress_ipv6_tcp_portal_rewrites_container_port");
+         }
+         else
+         {
+            const struct udphdr *outUDP = reinterpret_cast<const struct udphdr *>(outIP + 1);
+            suite.expect(outUDP->dest == targetPort, "switchboard_host_ingress_ipv6_udp_portal_rewrites_container_port");
+         }
+      }
+      else if (!ipv6 && opts.data_size_out >= sizeof(struct ethhdr) + sizeof(struct iphdr))
+      {
+         const struct iphdr *outIP = reinterpret_cast<const struct iphdr *>(output.data() + sizeof(struct ethhdr));
+         suite.expect(outEth->h_proto == htons(ETH_P_IP),
+            proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv4_tcp_portal_preserves_ethertype" : "switchboard_host_ingress_ipv4_udp_portal_preserves_ethertype");
+         suite.expect(outIP->daddr == external4.s_addr,
+            proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv4_tcp_portal_preserves_external_destination" : "switchboard_host_ingress_ipv4_udp_portal_preserves_external_destination");
+         if (proto == IPPROTO_TCP)
+         {
+            const struct tcphdr *outTCP = reinterpret_cast<const struct tcphdr *>(outIP + 1);
+            suite.expect(outTCP->dest == targetPort, "switchboard_host_ingress_ipv4_tcp_portal_rewrites_container_port");
+         }
+         else
+         {
+            const struct udphdr *outUDP = reinterpret_cast<const struct udphdr *>(outIP + 1);
+            suite.expect(outUDP->dest == targetPort, "switchboard_host_ingress_ipv4_udp_portal_rewrites_container_port");
+         }
+      }
+   }
+
+   ingressProgram.close();
+}
+
+static void exerciseHostIngressHostedIngressRoute(TestSuite& suite, bool ipv6, uint8_t proto)
+{
+   const char *label = ipv6
+      ? (proto == IPPROTO_TCP ? "switchboard_host_ingress_hosted_ingress_ipv6_tcp" : "switchboard_host_ingress_hosted_ingress_ipv6_udp")
+      : (proto == IPPROTO_TCP ? "switchboard_host_ingress_hosted_ingress_ipv4_tcp" : "switchboard_host_ingress_hosted_ingress_ipv4_udp");
+   auto expectNamed = [&] (bool condition, const char *suffix) -> void {
+      char name[256] = {};
+      std::snprintf(name, sizeof(name), "%s_%s", label, suffix);
+      suite.expect(condition, name);
+   };
+
+   String ingressObjectPath = {};
+   ingressObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+   ingressObjectPath.append("/host.ingress.router.ebpf.o"_ctv);
+
+   BPFProgram ingressProgram = {};
+   expectNamed(ingressProgram.load(ingressObjectPath, "host_ingress_router"_ctv), "loads_program");
+   if (ingressProgram.prog_fd < 0)
+   {
+      return;
+   }
+
+   mac localMAC = {};
+   localMAC.mac[0] = 0x02;
+   localMAC.mac[1] = 0x42;
+   localMAC.mac[2] = 0xac;
+   localMAC.mac[3] = 0x11;
+   localMAC.mac[4] = 0x00;
+   localMAC.mac[5] = 0x0a;
+   ingressProgram.setArrayElement("mac_map"_ctv, 0, localMAC);
+
+   mac gatewayMAC = {};
+   gatewayMAC.mac[0] = 0x02;
+   gatewayMAC.mac[1] = 0x42;
+   gatewayMAC.mac[2] = 0xac;
+   gatewayMAC.mac[3] = 0x11;
+   gatewayMAC.mac[4] = 0x00;
+   gatewayMAC.mac[5] = 0x01;
+   ingressProgram.setArrayElement("gateway_mac_map"_ctv, 0, gatewayMAC);
+
+   const uint32_t machineFragment = 0x000002u;
+   if (ipv6)
+   {
+      switchboard_overlay_hosted_ingress_route6 hosted = {};
+      hosted.machine_fragment = machineFragment;
+      switchboard_overlay_prefix6_key hostedKey = switchboardMakeOverlayPrefix6Key(makePrefix("2001:db8::1/128"));
+      expectNamed(updateProgramMapElement(ingressProgram, "overlay_hosted_ingress_routes6"_ctv, hostedKey, hosted),
+         "sets_hosted_route");
+   }
+   else
+   {
+      switchboard_overlay_hosted_ingress_route4 hosted = {};
+      hosted.machine_fragment = machineFragment;
+      switchboard_overlay_prefix4_key hostedKey = switchboardMakeOverlayPrefix4Key(makePrefix("198.18.0.1/32"));
+      expectNamed(updateProgramMapElement(ingressProgram, "overlay_hosted_ingress_routes4"_ctv, hostedKey, hosted),
+         "sets_hosted_route");
+   }
+
+   switchboard_overlay_machine_route route = {};
+   route.family = SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6;
+   route.use_gateway_mac = 1;
+   parseIPv6Bytes("fd00:10::a", route.source6);
+   parseIPv6Bytes("fd00:10::b", route.next_hop6);
+   switchboard_overlay_machine_route_key routeKey = switchboardMakeOverlayMachineRouteKey(machineFragment);
+   expectNamed(updateProgramMapElement(ingressProgram, "overlay_machine_routes_full"_ctv, routeKey, route),
+      "sets_machine_route");
+
+   struct in_addr source4 = {};
+   struct in_addr destination4 = {};
+   uint8_t source6[16] = {};
+   uint8_t destination6[16] = {};
+   std::vector<uint8_t> frame;
+   if (ipv6)
+   {
+      parseIPv6Bytes("2001:db8::77", source6);
+      parseIPv6Bytes("2001:db8::1", destination6);
+      frame = makeIPv6L4EthernetFrame(source6, destination6, proto, 49152, 443);
+   }
+   else
+   {
+      expectNamed(inet_pton(AF_INET, "198.18.0.77", &source4) == 1, "parses_source");
+      expectNamed(inet_pton(AF_INET, "198.18.0.1", &destination4) == 1, "parses_destination");
+      frame = makeIPv4L4EthernetFrame(source4, destination4, proto, 49152, 443);
+   }
+
+   std::vector<uint8_t> output(frame.size() + sizeof(struct ipv6hdr) + 64u);
+   LIBBPF_OPTS(bpf_test_run_opts, opts,
+      .data_in = frame.data(),
+      .data_out = output.data(),
+      .data_size_in = static_cast<__u32>(frame.size()),
+      .data_size_out = static_cast<__u32>(output.size()),
+      .repeat = 1,
+   );
+
+   int runResult = bpf_prog_test_run_opts(ingressProgram.prog_fd, &opts);
+   expectNamed(runResult == 0, "test_run_succeeds");
+   expectNamed(opts.retval == TC_ACT_OK, "returns_ok_after_encap");
+   expectNamed(opts.data_size_out == frame.size() + sizeof(struct ipv6hdr), "adds_outer_ipv6_header");
+
+   if (runResult == 0 && opts.data_size_out >= frame.size() + sizeof(struct ipv6hdr))
+   {
+      const struct ethhdr *outEth = reinterpret_cast<const struct ethhdr *>(output.data());
+      const struct ipv6hdr *outer6 = reinterpret_cast<const struct ipv6hdr *>(output.data() + sizeof(struct ethhdr));
+      uint8_t expectedOuterSrc[16] = {};
+      uint8_t expectedOuterDst[16] = {};
+      parseIPv6Bytes("fd00:10::a", expectedOuterSrc);
+      parseIPv6Bytes("fd00:10::b", expectedOuterDst);
+
+      expectNamed(outEth->h_proto == htons(ETH_P_IPV6), "sets_outer_ipv6_ethertype");
+      expectNamed(outer6->nexthdr == (ipv6 ? IPPROTO_IPV6 : IPPROTO_IPIP), "sets_outer_next_header");
+      expectNamed(std::memcmp(outer6->saddr.s6_addr, expectedOuterSrc, sizeof(expectedOuterSrc)) == 0, "sets_outer_source");
+      expectNamed(std::memcmp(outer6->daddr.s6_addr, expectedOuterDst, sizeof(expectedOuterDst)) == 0, "sets_outer_destination");
+
+      if (ipv6)
+      {
+         const struct ipv6hdr *inner6 = outer6 + 1;
+         expectNamed(std::memcmp(inner6->daddr.s6_addr, destination6, sizeof(destination6)) == 0,
+            "preserves_inner_destination");
+         expectNamed(inner6->nexthdr == proto, "preserves_inner_protocol");
+      }
+      else
+      {
+         const struct iphdr *inner4 = reinterpret_cast<const struct iphdr *>(outer6 + 1);
+         expectNamed(inner4->daddr == destination4.s_addr, "preserves_inner_destination");
+         expectNamed(inner4->protocol == proto, "preserves_inner_protocol");
+      }
+   }
+
+   ingressProgram.close();
 }
 
 int main(void)
@@ -665,6 +1140,155 @@ int main(void)
    {
       String ingressObjectPath = {};
       ingressObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+      ingressObjectPath.append("/host.ingress.router.dev.ebpf.o"_ctv);
+
+      BPFProgram ingressProgram = {};
+      suite.expect(ingressProgram.load(ingressObjectPath, "host_ingress_router"_ctv),
+         "switchboard_host_ingress_decapped_ipv4_quic_portal_loads_host_ingress_program");
+
+      if (ingressProgram.prog_fd >= 0)
+      {
+         local_container_subnet6 localSubnet = {};
+         localSubnet.dpfx = 0x01;
+         localSubnet.mpfx[0] = 0x52;
+         localSubnet.mpfx[1] = 0xdf;
+         localSubnet.mpfx[2] = 0x39;
+         ingressProgram.setArrayElement("local_container_subnet_map"_ctv, 0, localSubnet);
+
+         uint32_t redirectIfidx = 92;
+         ingressProgram.setArrayElement("container_device_map"_ctv, 0x4e, redirectIfidx);
+
+         struct in_addr externalAddress = {};
+         struct in_addr clientAddress = {};
+         suite.expect(inet_pton(AF_INET, "198.18.0.1", &externalAddress) == 1,
+            "switchboard_host_ingress_decapped_ipv4_quic_portal_external_address_parses");
+         suite.expect(inet_pton(AF_INET, "203.0.113.99", &clientAddress) == 1,
+            "switchboard_host_ingress_decapped_ipv4_quic_portal_client_address_parses");
+
+         switchboard_overlay_prefix4_key routableKey = {};
+         routableKey.prefixlen = 32;
+         routableKey.addr = externalAddress.s_addr;
+
+         bool routableUpdated = false;
+         __u8 present = 1;
+         ingressProgram.openMap("overlay_routable_prefixes4"_ctv, [&] (int mapFD) -> void {
+            routableUpdated = mapFD >= 0 && bpf_map_update_elem(mapFD, &routableKey, &present, BPF_ANY) == 0;
+         });
+         suite.expect(routableUpdated,
+            "switchboard_host_ingress_decapped_ipv4_quic_portal_installs_overlay_prefix");
+
+         uint8_t key[16] = {
+            0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+            0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01
+         };
+         ProdigyQuicCidEncryptor encryptor = {};
+         suite.expect(encryptor.setKey(key),
+            "switchboard_host_ingress_decapped_ipv4_quic_portal_encryptor_accepts_key");
+
+         uint8_t cidContainer[5] = {localSubnet.dpfx, localSubnet.mpfx[0], localSubnet.mpfx[1], localSubnet.mpfx[2], 0x4e};
+         struct sockaddr_in cidDestination = {};
+         cidDestination.sin_family = AF_INET;
+         cidDestination.sin_addr = externalAddress;
+         cidDestination.sin_port = htons(443);
+
+         uint32_t nonceCursor = 2;
+         ProdigyQuicCID cid = prodigyGenerateQuicCID(encryptor,
+            cidContainer,
+            &nonceCursor,
+            reinterpret_cast<const struct sockaddr *>(&cidDestination),
+            0);
+         suite.expect(cid.id_len == 16,
+            "switchboard_host_ingress_decapped_ipv4_quic_portal_generates_cid");
+
+         portal_definition portal = {};
+         portal.addr4 = externalAddress.s_addr;
+         portal.port = htons(443);
+         portal.proto = IPPROTO_UDP;
+
+         portal_meta meta = {};
+         meta.flags = F_QUIC_PORTAL;
+         meta.slot = 9;
+
+         bool portalUpdated = false;
+         ingressProgram.openMap("external_portals"_ctv, [&] (int mapFD) -> void {
+            portalUpdated = mapFD >= 0 && bpf_map_update_elem(mapFD, &portal, &meta, BPF_ANY) == 0;
+         });
+         suite.expect(portalUpdated,
+            "switchboard_host_ingress_decapped_ipv4_quic_portal_installs_portal");
+
+         switchboard_wormhole_target_key targetKey = {};
+         targetKey.slot = meta.slot;
+         std::memcpy(targetKey.container, cidContainer, sizeof(targetKey.container));
+         uint16_t targetPort = htons(19443);
+
+         bool targetUpdated = false;
+         ingressProgram.openMap("wormhole_target_ports"_ctv, [&] (int mapFD) -> void {
+            targetUpdated = mapFD >= 0 && bpf_map_update_elem(mapFD, &targetKey, &targetPort, BPF_ANY) == 0;
+         });
+         suite.expect(targetUpdated,
+            "switchboard_host_ingress_decapped_ipv4_quic_portal_installs_target_port");
+
+         struct
+         {
+            uint32_t rk[44];
+         } aesState = {};
+         suite.expect(prodigyBuildQuicCidDecryptRoundKeys(key, aesState.rk),
+            "switchboard_host_ingress_decapped_ipv4_quic_portal_builds_decrypt_state");
+
+         uint32_t decryptIndex = quicCidPortalDecryptMapIndex(meta.slot, 0);
+         bool decryptUpdated = false;
+         ingressProgram.openMap("quic_cid_aes_decrypt_map"_ctv, [&] (int mapFD) -> void {
+            decryptUpdated = mapFD >= 0 && bpf_map_update_elem(mapFD, &decryptIndex, &aesState, BPF_ANY) == 0;
+         });
+         suite.expect(decryptUpdated,
+            "switchboard_host_ingress_decapped_ipv4_quic_portal_installs_decrypt_state");
+
+         uint8_t outerSrc[16] = {0xfd, 0x00, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a};
+         uint8_t outerDst[16] = {0xfd, 0x00, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0b};
+         std::vector<uint8_t> frame = makeUDPv4QuicInIPv6EthernetFrame(outerSrc,
+            outerDst,
+            clientAddress,
+            externalAddress,
+            49152,
+            443,
+            cid);
+         std::vector<uint8_t> output(frame.size());
+         LIBBPF_OPTS(bpf_test_run_opts, opts,
+            .data_in = frame.data(),
+            .data_out = output.data(),
+            .data_size_in = static_cast<__u32>(frame.size()),
+            .data_size_out = static_cast<__u32>(output.size()),
+            .repeat = 1,
+         );
+
+         int runResult = bpf_prog_test_run_opts(ingressProgram.prog_fd, &opts);
+         suite.expect(runResult == 0,
+            "switchboard_host_ingress_decapped_ipv4_quic_portal_test_run_succeeds");
+         suite.expect(opts.retval == TC_ACT_REDIRECT,
+            "switchboard_host_ingress_decapped_ipv4_quic_portal_redirects_to_container");
+         suite.expect(opts.data_size_out == (frame.size() - sizeof(struct ipv6hdr)),
+            "switchboard_host_ingress_decapped_ipv4_quic_portal_decaps_outer_ipv6_before_redirect");
+
+         if (runResult == 0 && opts.data_size_out >= sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr))
+         {
+            const struct ethhdr *outEth = reinterpret_cast<const struct ethhdr *>(output.data());
+            const struct iphdr *outIP = reinterpret_cast<const struct iphdr *>(output.data() + sizeof(struct ethhdr));
+            const struct udphdr *outUDP = reinterpret_cast<const struct udphdr *>(outIP + 1);
+            suite.expect(outEth->h_proto == htons(ETH_P_IP),
+               "switchboard_host_ingress_decapped_ipv4_quic_portal_preserves_ipv4_ethertype");
+            suite.expect(outIP->daddr == externalAddress.s_addr,
+               "switchboard_host_ingress_decapped_ipv4_quic_portal_preserves_external_destination");
+            suite.expect(outUDP->dest == targetPort,
+               "switchboard_host_ingress_decapped_ipv4_quic_portal_rewrites_container_port");
+         }
+
+         ingressProgram.close();
+      }
+   }
+
+   {
+      String ingressObjectPath = {};
+      ingressObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
       ingressObjectPath.append("/host.ingress.router.ebpf.o"_ctv);
 
       BPFProgram ingressProgram = {};
@@ -723,6 +1347,15 @@ int main(void)
          ingressProgram.close();
       }
    }
+
+   exerciseHostIngressGenericPortal(suite, false, IPPROTO_UDP);
+   exerciseHostIngressGenericPortal(suite, false, IPPROTO_TCP);
+   exerciseHostIngressGenericPortal(suite, true, IPPROTO_UDP);
+   exerciseHostIngressGenericPortal(suite, true, IPPROTO_TCP);
+   exerciseHostIngressHostedIngressRoute(suite, false, IPPROTO_UDP);
+   exerciseHostIngressHostedIngressRoute(suite, false, IPPROTO_TCP);
+   exerciseHostIngressHostedIngressRoute(suite, true, IPPROTO_UDP);
+   exerciseHostIngressHostedIngressRoute(suite, true, IPPROTO_TCP);
 
    {
       String ingressObjectPath = {};

@@ -5903,6 +5903,17 @@ static void testRegisteredRoutableAddressWormholesRefreshHostedIngressBeforeOpen
    brain.machines.insert(&host);
    brain.machinesByUUID.insert_or_assign(host.uuid, &host);
 
+   Machine remote = {};
+   remote.uuid = uint128_t(0x9900);
+   remote.fragment = 0x000990u;
+   remote.slug.assign("registered-route-remote"_ctv);
+   remote.neuron.isFixedFile = true;
+   remote.neuron.fslot = 13;
+   remote.neuron.connected = true;
+   remote.neuron.pendingSend = true;
+   brain.machines.insert(&remote);
+   brain.machinesByUUID.insert_or_assign(remote.uuid, &remote);
+
    RegisteredRoutableAddress registered = {};
    registered.uuid = uint128_t(0x7788);
    registered.name = "wormhole-hosted-prefix"_ctv;
@@ -5931,72 +5942,88 @@ static void testRegisteredRoutableAddressWormholesRefreshHostedIngressBeforeOpen
 
    brain.sendNeuronOpenSwitchboardWormholes(&container, wormholes);
 
-   uint32_t hostedIngressIndex = UINT32_MAX;
-   uint32_t openIndex = UINT32_MAX;
-   uint32_t messageIndex = 0;
-   bool hostedPrefixMatchesRoute = false;
-   bool openMatchesContainer = false;
+   auto assertSwitchboardOpenState = [&] (Machine& machine, bool owner) {
 
-   forEachMessageInBuffer(host.neuron.wBuffer, [&] (Message *queued) {
-      if (NeuronTopic(queued->topic) == NeuronTopic::configureSwitchboardHostedIngressPrefixes)
-      {
-         if (hostedIngressIndex == UINT32_MAX)
+      uint32_t hostedIngressIndex = UINT32_MAX;
+      uint32_t openIndex = UINT32_MAX;
+      uint32_t messageIndex = 0;
+      bool hostedPrefixMatchesRoute = false;
+      bool openMatchesContainer = false;
+
+      forEachMessageInBuffer(machine.neuron.wBuffer, [&] (Message *queued) {
+         if (NeuronTopic(queued->topic) == NeuronTopic::configureSwitchboardHostedIngressPrefixes)
          {
-            hostedIngressIndex = messageIndex;
-         }
-
-         String payload = {};
-         uint8_t *args = queued->args;
-         Message::extractToStringView(args, payload);
-
-         Vector<IPPrefix> prefixes = {};
-         if (BitseryEngine::deserializeSafe(payload, prefixes))
-         {
-            IPPrefix expectedPrefix = {};
-            if (makeHostedIngressPrefixForAddress(registered.address, expectedPrefix))
+            if (hostedIngressIndex == UINT32_MAX)
             {
-               for (const IPPrefix& prefix : prefixes)
+               hostedIngressIndex = messageIndex;
+            }
+
+            String payload = {};
+            uint8_t *args = queued->args;
+            Message::extractToStringView(args, payload);
+
+            Vector<IPPrefix> prefixes = {};
+            if (BitseryEngine::deserializeSafe(payload, prefixes))
+            {
+               IPPrefix expectedPrefix = {};
+               if (makeHostedIngressPrefixForAddress(registered.address, expectedPrefix))
                {
-                  if (prefix.equals(expectedPrefix))
+                  for (const IPPrefix& prefix : prefixes)
                   {
-                     hostedPrefixMatchesRoute = true;
-                     break;
+                     if (prefix.equals(expectedPrefix))
+                     {
+                        hostedPrefixMatchesRoute = true;
+                        break;
+                     }
                   }
                }
             }
          }
-      }
-      else if (NeuronTopic(queued->topic) == NeuronTopic::openSwitchboardWormholes)
-      {
-         if (openIndex == UINT32_MAX)
+         else if (NeuronTopic(queued->topic) == NeuronTopic::openSwitchboardWormholes)
          {
-            openIndex = messageIndex;
+            if (openIndex == UINT32_MAX)
+            {
+               openIndex = messageIndex;
+            }
+
+            uint8_t *args = queued->args;
+            uint32_t containerID = 0;
+            Message::extractArg<ArgumentNature::fixed>(args, containerID);
+
+            String serialized = {};
+            Message::extractToStringView(args, serialized);
+            Vector<Wormhole> decoded = {};
+            if (containerID == container.generateContainerID()
+               && BitseryEngine::deserializeSafe(serialized, decoded)
+               && decoded.size() == 1
+               && equalSerializedObjects(decoded[0], wormholes[0]))
+            {
+               openMatchesContainer = true;
+            }
          }
 
-         uint8_t *args = queued->args;
-         uint32_t containerID = 0;
-         Message::extractArg<ArgumentNature::fixed>(args, containerID);
+         messageIndex += 1;
+      });
 
-         String serialized = {};
-         Message::extractToStringView(args, serialized);
-         Vector<Wormhole> decoded = {};
-         if (containerID == container.generateContainerID()
-            && BitseryEngine::deserializeSafe(serialized, decoded)
-            && decoded.size() == 1
-            && equalSerializedObjects(decoded[0], wormholes[0]))
-         {
-            openMatchesContainer = true;
-         }
-      }
+      suite.expect(hostedIngressIndex != UINT32_MAX, owner
+         ? "registered_routable_wormhole_open_queues_hosted_ingress_prefixes_owner"
+         : "registered_routable_wormhole_open_queues_hosted_ingress_prefixes_remote");
+      suite.expect(hostedPrefixMatchesRoute, owner
+         ? "registered_routable_wormhole_open_uses_registered_hosted_prefix_owner"
+         : "registered_routable_wormhole_open_uses_registered_hosted_prefix_remote");
+      suite.expect(openIndex != UINT32_MAX, owner
+         ? "registered_routable_wormhole_open_queues_open_message_owner"
+         : "registered_routable_wormhole_open_queues_open_message_remote");
+      suite.expect(openMatchesContainer, owner
+         ? "registered_routable_wormhole_open_preserves_wormhole_payload_owner"
+         : "registered_routable_wormhole_open_preserves_wormhole_payload_remote");
+      suite.expect(hostedIngressIndex < openIndex, owner
+         ? "registered_routable_wormhole_open_refreshes_hosted_prefixes_before_open_owner"
+         : "registered_routable_wormhole_open_refreshes_hosted_prefixes_before_open_remote");
+   };
 
-      messageIndex += 1;
-   });
-
-   suite.expect(hostedIngressIndex != UINT32_MAX, "registered_routable_wormhole_open_queues_hosted_ingress_prefixes");
-   suite.expect(hostedPrefixMatchesRoute, "registered_routable_wormhole_open_uses_registered_hosted_prefix");
-   suite.expect(openIndex != UINT32_MAX, "registered_routable_wormhole_open_queues_open_message");
-   suite.expect(openMatchesContainer, "registered_routable_wormhole_open_preserves_wormhole_payload");
-   suite.expect(hostedIngressIndex < openIndex, "registered_routable_wormhole_open_refreshes_hosted_prefixes_before_open");
+   assertSwitchboardOpenState(host, true);
+   assertSwitchboardOpenState(remote, false);
 }
 
 static void testApplyReplicatedDeploymentPlanLiveStateUpdatesTrackedContainers(TestSuite& suite)
@@ -10611,8 +10638,6 @@ static void testNeuronPushContainerRefreshesTrackedWormholes(TestSuite& suite)
       BrainContainerFixture fixture(suite, "neuron_push_container_wormholes", uint128_t(0x7030), false, false);
       if (fixture.ready)
       {
-         fixture.brain.neuron.ensureSwitchboardForTest();
-
          Wormhole wormhole = {};
          wormhole.externalAddress = IPAddress("2001:db8:100::e", true);
          wormhole.externalPort = 443;

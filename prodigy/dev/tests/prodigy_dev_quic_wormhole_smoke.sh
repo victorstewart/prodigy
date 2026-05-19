@@ -136,6 +136,8 @@ fi
 mkdir -p /containers/store /containers/storage "${workspace_root}"
 
 application_id=6
+external_quic_port=443
+container_quic_port=18443
 version_id=$(( ($(date +%s%N) & 281474976710655) ))
 if [[ "${version_id}" -le 0 ]]
 then
@@ -294,8 +296,8 @@ cat > "${plan_json}" <<EOF
     {
       "source": "registeredRoutableAddress",
       "routableAddressUUID": "${routable_uuid}",
-      "externalPort": 18443,
-      "containerPort": 18443,
+      "externalPort": ${external_quic_port},
+      "containerPort": ${container_quic_port},
       "layer4": "UDP",
       "isQuic": true,
       "quicCidKeyRotationHours": 24
@@ -417,7 +419,7 @@ fi
 
 if ! nsenter -t "${parent_pid}" -n \
    env QUIC_WORMHOLE_TARGET="${routable_address}" \
-   QUIC_WORMHOLE_PORT="18443" \
+   QUIC_WORMHOLE_PORT="${external_quic_port}" \
    QUIC_WORMHOLE_CID="${cid_hex}" \
    python3 - <<'PY' >"${sender_log}" 2>&1
 import os
@@ -473,4 +475,4 @@ then
    exit 1
 fi
 
-echo "PASS: QUIC wormhole smoke address=${routable_address}:18443 cid=${cid_hex}"
+echo "PASS: QUIC wormhole smoke address=${routable_address}:${external_quic_port} container_port=${container_quic_port} cid=${cid_hex}"

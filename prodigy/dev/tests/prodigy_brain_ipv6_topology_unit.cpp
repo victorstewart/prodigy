@@ -2009,6 +2009,93 @@ int main(void)
       brain.iaas = &iaas;
 
       Machine local = {};
+      local.uuid = uint128_t(0x9491);
+      local.fragment = 0x91;
+      ClusterMachinePeerAddress localPrivate4 = {};
+      localPrivate4.address.assign("10.0.0.10"_ctv);
+      localPrivate4.cidr = 24;
+      local.peerAddresses.push_back(localPrivate4);
+      local.hardware.inventoryComplete = true;
+      local.hardware.cpu.logicalCores = 4;
+      local.hardware.memory.totalMB = 4096;
+      local.hardware.network.nics.push_back(makeNic("bond0", "5e:b7:78:2a:48:7b", "fd00:10::10/64"));
+
+      Machine remote = {};
+      remote.uuid = uint128_t(0x9492);
+      remote.fragment = 0x92;
+      ClusterMachinePeerAddress remotePrivate4 = {};
+      remotePrivate4.address.assign("10.0.0.20"_ctv);
+      remotePrivate4.cidr = 24;
+      remote.peerAddresses.push_back(remotePrivate4);
+      remote.hardware.inventoryComplete = true;
+      remote.hardware.cpu.logicalCores = 4;
+      remote.hardware.memory.totalMB = 4096;
+      remote.hardware.network.nics.push_back(makeNic("bond0", "fa:6d:18:7d:9f:5e", "fd00:10::20/64"));
+
+      brain.machines.insert(&local);
+      brain.machines.insert(&remote);
+
+      SwitchboardOverlayRoutingConfig config = {};
+      suite.expect(brain.testBuildSwitchboardOverlayRoutingConfig(&local, config), "build_overlay_routing_config_ipv4_control_accepts_machine");
+      suite.expect(config.machineRoutes.size() == 1, "build_overlay_routing_config_ipv4_control_uses_inventory_ipv6_route");
+      if (config.machineRoutes.size() == 1)
+      {
+         suite.expect(config.machineRoutes[0].nextHop.equals(IPAddress("fd00:10::20", true)), "build_overlay_routing_config_ipv4_control_next_hop");
+         suite.expect(config.machineRoutes[0].sourceAddress.equals(IPAddress("fd00:10::10", true)), "build_overlay_routing_config_ipv4_control_source");
+         suite.expect(config.machineRoutes[0].useGatewayMAC == false, "build_overlay_routing_config_ipv4_control_prefers_direct_mac");
+      }
+   }
+
+   {
+      TestBrain brain = {};
+      NoopBrainIaaS iaas = {};
+      brain.iaas = &iaas;
+
+      Machine local = {};
+      local.uuid = uint128_t(0x9471);
+      local.fragment = 0x71;
+      ClusterMachinePeerAddress localPrivate4 = {};
+      localPrivate4.address.assign("10.0.0.10"_ctv);
+      localPrivate4.cidr = 24;
+      local.peerAddresses.push_back(localPrivate4);
+      local.hardware.inventoryComplete = true;
+      local.hardware.cpu.logicalCores = 4;
+      local.hardware.memory.totalMB = 4096;
+      local.hardware.network.nics.push_back(makeNic("bond0", "", "fd00:10::10/64"));
+
+      Machine remote = {};
+      remote.uuid = uint128_t(0x9472);
+      remote.fragment = 0x72;
+      ClusterMachinePeerAddress remotePrivate4 = {};
+      remotePrivate4.address.assign("10.0.0.20"_ctv);
+      remotePrivate4.cidr = 24;
+      remote.peerAddresses.push_back(remotePrivate4);
+      remote.hardware.inventoryComplete = true;
+      remote.hardware.cpu.logicalCores = 4;
+      remote.hardware.memory.totalMB = 4096;
+      remote.hardware.network.nics.push_back(makeNic("bond0", "", "fd00:10::20/64"));
+
+      brain.machines.insert(&local);
+      brain.machines.insert(&remote);
+
+      SwitchboardOverlayRoutingConfig config = {};
+      suite.expect(brain.testBuildSwitchboardOverlayRoutingConfig(&local, config), "build_overlay_routing_config_blank_mac_accepts_machine");
+      suite.expect(config.machineRoutes.size() == 1, "build_overlay_routing_config_blank_mac_keeps_route");
+      if (config.machineRoutes.size() == 1)
+      {
+         suite.expect(config.machineRoutes[0].nextHop.equals(IPAddress("fd00:10::20", true)), "build_overlay_routing_config_blank_mac_next_hop");
+         suite.expect(config.machineRoutes[0].sourceAddress.equals(IPAddress("fd00:10::10", true)), "build_overlay_routing_config_blank_mac_source");
+         suite.expect(config.machineRoutes[0].useGatewayMAC, "build_overlay_routing_config_blank_mac_uses_gateway_mac");
+         suite.expect(config.machineRoutes[0].nextHopMAC.size() == 0, "build_overlay_routing_config_blank_mac_leaves_direct_mac_empty");
+      }
+   }
+
+   {
+      TestBrain brain = {};
+      NoopBrainIaaS iaas = {};
+      brain.iaas = &iaas;
+
+      Machine local = {};
       local.uuid = uint128_t(0x9451);
       local.fragment = 0x31;
       ClusterMachinePeerAddress localPrivate = {};

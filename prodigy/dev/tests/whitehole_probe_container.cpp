@@ -1,3 +1,4 @@
+#include <limits.h>
 #include <networking/includes.h>
 #include <services/debug.h>
 #include <services/bitsery.h>

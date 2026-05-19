@@ -69,6 +69,50 @@ static inline void prodigyCollectMachinePeerAddresses(const Machine& machine, Ve
    }
 }
 
+static inline void prodigyCollectMachineOverlayRouteAddresses(const Machine& machine, Vector<ClusterMachinePeerAddress>& candidates)
+{
+   prodigyCollectMachinePeerAddresses(machine, candidates);
+
+   auto appendAddress = [&] (const String& address, uint8_t cidr = 0, const String& gateway = {}) -> void
+   {
+      prodigyAppendUniqueClusterMachinePeerAddress(candidates, ClusterMachinePeerAddress{address, cidr, gateway});
+   };
+
+   auto appendIP = [&] (const IPAddress& address, uint8_t cidr, const IPAddress& gateway) -> void
+   {
+      if (address.isNull() || (address.is6 && address.v6[0] == 0xfe))
+      {
+         return;
+      }
+
+      String addressText = {};
+      if (ClusterMachine::renderIPAddressLiteral(address, addressText) == false)
+      {
+         return;
+      }
+
+      String gatewayText = {};
+      if (gateway.isNull() == false)
+      {
+         (void)ClusterMachine::renderIPAddressLiteral(gateway, gatewayText);
+      }
+
+      appendAddress(addressText, cidr, gatewayText);
+   };
+
+   for (const MachineNicHardwareProfile& nic : machine.hardware.network.nics)
+   {
+      for (const MachineNicSubnetHardwareProfile& subnet : nic.subnets)
+      {
+         appendIP(subnet.address, subnet.subnet.cidr, subnet.gateway);
+      }
+   }
+
+   appendAddress(machine.privateAddress);
+   appendAddress(machine.publicAddress);
+   appendAddress(machine.sshAddress);
+}
+
 static inline bool prodigyMachinePeerAddressMatches(const Machine& machine, const IPAddress& address, const String *addressText = nullptr)
 {
    if (address.isNull())

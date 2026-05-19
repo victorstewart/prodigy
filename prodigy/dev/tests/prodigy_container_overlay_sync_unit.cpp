@@ -1,3 +1,4 @@
+#include <limits.h>
 #include <networking/includes.h>
 #include <services/debug.h>
 
@@ -10,6 +11,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <linux/pkt_cls.h>
+#include <linux/ip.h>
+#include <netinet/tcp.h>
 #include <netinet/udp.h>
 
 class TestSuite
@@ -156,16 +159,76 @@ static void parseIPv6Bytes(const char *text, uint8_t out[16])
    }
 }
 
-static Vector<uint8_t> makeIPv6UDPFrameWithPayload(const char *srcIPv6,
+static in_addr parseIPv4Address(const char *text)
+{
+   in_addr address = {};
+   if (inet_pton(AF_INET, text, &address) != 1)
+   {
+      std::fprintf(stderr, "unable to parse ipv4 test address: %s\n", text);
+      std::abort();
+   }
+
+   return address;
+}
+
+static Vector<uint8_t> makeIPv4L4FrameWithPayload(const char *srcIPv4,
+   const char *dstIPv4,
+   uint8_t proto,
+   uint16_t sourcePort,
+   uint16_t destPort,
+   const Vector<uint8_t>& payload)
+{
+   const size_t l4Size = (proto == IPPROTO_TCP) ? sizeof(struct tcphdr) : sizeof(struct udphdr);
+   Vector<uint8_t> frame = {};
+   frame.resize(sizeof(struct ethhdr) + sizeof(struct iphdr) + l4Size + payload.size());
+   std::memset(frame.data(), 0, frame.size());
+
+   struct ethhdr *eth = reinterpret_cast<struct ethhdr *>(frame.data());
+   eth->h_proto = bpf_htons(ETH_P_IP);
+
+   struct iphdr *ip4 = reinterpret_cast<struct iphdr *>(eth + 1);
+   ip4->version = 4;
+   ip4->ihl = 5;
+   ip4->ttl = 64;
+   ip4->protocol = proto;
+   ip4->tot_len = htons(static_cast<uint16_t>(sizeof(struct iphdr) + l4Size + payload.size()));
+   ip4->saddr = parseIPv4Address(srcIPv4).s_addr;
+   ip4->daddr = parseIPv4Address(dstIPv4).s_addr;
+
+   uint8_t *l4 = reinterpret_cast<uint8_t *>(ip4 + 1);
+   if (proto == IPPROTO_TCP)
+   {
+      struct tcphdr *tcph = reinterpret_cast<struct tcphdr *>(l4);
+      tcph->source = htons(sourcePort);
+      tcph->dest = htons(destPort);
+      tcph->doff = 5;
+      tcph->syn = 1;
+      std::memcpy(tcph + 1, payload.data(), payload.size());
+   }
+   else
+   {
+      struct udphdr *udph = reinterpret_cast<struct udphdr *>(l4);
+      udph->source = htons(sourcePort);
+      udph->dest = htons(destPort);
+      udph->len = htons(static_cast<uint16_t>(sizeof(struct udphdr) + payload.size()));
+      std::memcpy(udph + 1, payload.data(), payload.size());
+   }
+
+   return frame;
+}
+
+static Vector<uint8_t> makeIPv6L4FrameWithPayload(const char *srcIPv6,
    const char *dstIPv6,
+   uint8_t proto,
    uint16_t sourcePort,
    uint16_t destPort,
    const Vector<uint8_t>& payload,
    bool includeEthernet)
 {
    const size_t ethBytes = includeEthernet ? sizeof(struct ethhdr) : 0u;
+   const size_t l4Size = (proto == IPPROTO_TCP) ? sizeof(struct tcphdr) : sizeof(struct udphdr);
    Vector<uint8_t> frame = {};
-   frame.resize(ethBytes + sizeof(struct ipv6hdr) + sizeof(struct udphdr) + payload.size());
+   frame.resize(ethBytes + sizeof(struct ipv6hdr) + l4Size + payload.size());
    std::memset(frame.data(), 0, frame.size());
 
    if (includeEthernet)
@@ -176,26 +239,57 @@ static Vector<uint8_t> makeIPv6UDPFrameWithPayload(const char *srcIPv6,
 
    struct ipv6hdr *ip6h = reinterpret_cast<struct ipv6hdr *>(frame.data() + ethBytes);
    ip6h->version = 6;
-   ip6h->nexthdr = IPPROTO_UDP;
+   ip6h->nexthdr = proto;
    ip6h->hop_limit = 64;
-   ip6h->payload_len = htons(static_cast<uint16_t>(sizeof(struct udphdr) + payload.size()));
+   ip6h->payload_len = htons(static_cast<uint16_t>(l4Size + payload.size()));
    parseIPv6Bytes(srcIPv6, ip6h->saddr.s6_addr);
    parseIPv6Bytes(dstIPv6, ip6h->daddr.s6_addr);
 
-   struct udphdr *udph = reinterpret_cast<struct udphdr *>(frame.data() + ethBytes + sizeof(struct ipv6hdr));
-   udph->source = htons(sourcePort);
-   udph->dest = htons(destPort);
-   udph->len = htons(static_cast<uint16_t>(sizeof(struct udphdr) + payload.size()));
-   std::memcpy(frame.data() + ethBytes + sizeof(struct ipv6hdr) + sizeof(struct udphdr), payload.data(), payload.size());
+   uint8_t *l4 = frame.data() + ethBytes + sizeof(struct ipv6hdr);
+   if (proto == IPPROTO_TCP)
+   {
+      struct tcphdr *tcph = reinterpret_cast<struct tcphdr *>(l4);
+      tcph->source = htons(sourcePort);
+      tcph->dest = htons(destPort);
+      tcph->doff = 5;
+      tcph->syn = 1;
+      std::memcpy(tcph + 1, payload.data(), payload.size());
+      tcph->check = compute_ipv6_transport_checksum_portable(
+         ip6h->saddr.s6_addr,
+         ip6h->daddr.s6_addr,
+         IPPROTO_TCP,
+         tcph,
+         static_cast<__u32>(sizeof(struct tcphdr) + payload.size()),
+         __builtin_offsetof(struct tcphdr, check));
+   }
+   else
+   {
+      struct udphdr *udph = reinterpret_cast<struct udphdr *>(l4);
+      udph->source = htons(sourcePort);
+      udph->dest = htons(destPort);
+      udph->len = htons(static_cast<uint16_t>(sizeof(struct udphdr) + payload.size()));
+      std::memcpy(udph + 1, payload.data(), payload.size());
 
-   udph->check = compute_ipv6_transport_checksum_portable(
-      ip6h->saddr.s6_addr,
-      ip6h->daddr.s6_addr,
-      IPPROTO_UDP,
-      udph,
-      static_cast<__u32>(sizeof(struct udphdr) + payload.size()),
-      __builtin_offsetof(struct udphdr, check));
+      udph->check = compute_ipv6_transport_checksum_portable(
+         ip6h->saddr.s6_addr,
+         ip6h->daddr.s6_addr,
+         IPPROTO_UDP,
+         udph,
+         static_cast<__u32>(sizeof(struct udphdr) + payload.size()),
+         __builtin_offsetof(struct udphdr, check));
+   }
+
    return frame;
+}
+
+static Vector<uint8_t> makeIPv6UDPFrameWithPayload(const char *srcIPv6,
+   const char *dstIPv6,
+   uint16_t sourcePort,
+   uint16_t destPort,
+   const Vector<uint8_t>& payload,
+   bool includeEthernet)
+{
+   return makeIPv6L4FrameWithPayload(srcIPv6, dstIPv6, IPPROTO_UDP, sourcePort, destPort, payload, includeEthernet);
 }
 
 static switchboard_wormhole_egress_key makeLookupKeyFromFrame(const Vector<uint8_t>& frame, __be16 protocol)
@@ -895,6 +989,192 @@ static void testContainerPeerEgressRouterRewritesCrossMachineWormholeReplyForOve
    }
 }
 
+static void testContainerPeerEgressRouterEncapsulatesHostedIngress(TestSuite& suite, bool ipv6, uint8_t proto)
+{
+   const char *label = ipv6
+      ? (proto == IPPROTO_TCP ? "container_peer_egress_router_hosted_ingress_ipv6_tcp" : "container_peer_egress_router_hosted_ingress_ipv6_udp")
+      : (proto == IPPROTO_TCP ? "container_peer_egress_router_hosted_ingress_ipv4_tcp" : "container_peer_egress_router_hosted_ingress_ipv4_udp");
+   auto expectNamed = [&] (bool condition, const char *suffix) -> void {
+      char name[256] = {};
+      std::snprintf(name, sizeof(name), "%s_%s", label, suffix);
+      suite.expect(condition, name);
+   };
+
+   String objectPath = {};
+   objectPath.assign(PRODIGY_TEST_BINARY_DIR);
+   objectPath.append("/container.egress.router.ebpf.o"_ctv);
+
+   BPFProgram peerProgram = {};
+   expectNamed(peerProgram.load(objectPath, "container_egress_router"_ctv), "loads_program");
+
+   if (peerProgram.prog_fd >= 0)
+   {
+      container_network_policy networkPolicy = {};
+      networkPolicy.requiresPublic4 = 1;
+      networkPolicy.interContainerMTU = 9000;
+      peerProgram.setArrayElement("container_network_policy_map"_ctv, 0, networkPolicy);
+
+      __u32 nicIfidx = 77;
+      peerProgram.setArrayElement("container_device_map"_ctv, 0, nicIfidx);
+
+      mac localMAC = {};
+      localMAC.mac[0] = 0x02;
+      localMAC.mac[1] = 0x42;
+      localMAC.mac[2] = 0xac;
+      localMAC.mac[3] = 0x11;
+      localMAC.mac[4] = 0x00;
+      localMAC.mac[5] = 0x0a;
+      peerProgram.setArrayElement("mac_map"_ctv, 0, localMAC);
+
+      mac gatewayMAC = {};
+      gatewayMAC.mac[0] = 0x02;
+      gatewayMAC.mac[1] = 0x42;
+      gatewayMAC.mac[2] = 0xac;
+      gatewayMAC.mac[3] = 0x11;
+      gatewayMAC.mac[4] = 0x00;
+      gatewayMAC.mac[5] = 0x01;
+      peerProgram.setArrayElement("gateway_mac_map"_ctv, 0, gatewayMAC);
+
+      const uint32_t machineFragment = 0x000002u;
+      if (ipv6)
+      {
+         switchboard_overlay_hosted_ingress_route6 hosted = {};
+         hosted.machine_fragment = machineFragment;
+         switchboard_overlay_prefix6_key hostedKey = switchboardMakeOverlayPrefix6Key(makePrefix("2001:db8::1/128"));
+         expectNamed(updateProgramMapElement(peerProgram, "overlay_hosted_ingress_routes6"_ctv, hostedKey, hosted),
+            "sets_hosted_route");
+      }
+      else
+      {
+         switchboard_overlay_hosted_ingress_route4 hosted = {};
+         hosted.machine_fragment = machineFragment;
+         switchboard_overlay_prefix4_key hostedKey = switchboardMakeOverlayPrefix4Key(makePrefix("198.18.0.1/32"));
+         expectNamed(updateProgramMapElement(peerProgram, "overlay_hosted_ingress_routes4"_ctv, hostedKey, hosted),
+            "sets_hosted_route");
+      }
+
+      switchboard_overlay_machine_route route = {};
+      route.family = SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6;
+      route.use_gateway_mac = 1;
+      parseIPv6Bytes("fd00:10::a", route.source6);
+      parseIPv6Bytes("fd00:10::b", route.next_hop6);
+      switchboard_overlay_machine_route_key routeKey = switchboardMakeOverlayMachineRouteKey(machineFragment);
+      expectNamed(updateProgramMapElement(peerProgram, "overlay_machine_routes_full"_ctv, routeKey, route),
+         "sets_machine_route");
+
+      Vector<uint8_t> payload = {};
+      payload.resize(32);
+      for (uint32_t index = 0; index < payload.size(); index += 1)
+      {
+         payload[index] = static_cast<uint8_t>((index * 17u + 9u) & 0xffu);
+      }
+
+      Vector<uint8_t> frame = ipv6
+         ? makeIPv6L4FrameWithPayload("2001:db8::77", "2001:db8::1", proto, 49152, 443, payload, true)
+         : makeIPv4L4FrameWithPayload("198.18.0.77", "198.18.0.1", proto, 49152, 443, payload);
+      Vector<uint8_t> output = {};
+      output.resize(frame.size() + sizeof(struct ipv6hdr) + 64u);
+
+      LIBBPF_OPTS(bpf_test_run_opts, opts,
+         .data_in = frame.data(),
+         .data_out = output.data(),
+         .data_size_in = static_cast<__u32>(frame.size()),
+         .data_size_out = static_cast<__u32>(output.size()),
+         .repeat = 1,
+      );
+
+      int runResult = bpf_prog_test_run_opts(peerProgram.prog_fd, &opts);
+      expectNamed(runResult == 0, "test_run_succeeds");
+      expectNamed(opts.retval == TC_ACT_REDIRECT, "redirects_to_nic");
+      expectNamed(opts.data_size_out == frame.size() + sizeof(struct ipv6hdr), "adds_outer_ipv6_header");
+
+      const size_t innerHeaderSize = ipv6 ? sizeof(struct ipv6hdr) : sizeof(struct iphdr);
+      const size_t transportHeaderSize = (proto == IPPROTO_TCP) ? sizeof(struct tcphdr) : sizeof(struct udphdr);
+      if (runResult == 0 && opts.data_size_out >= (sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + innerHeaderSize + transportHeaderSize))
+      {
+         const uint8_t expectedGatewayMAC[6] = {0x02, 0x42, 0xac, 0x11, 0x00, 0x01};
+         const uint8_t expectedLocalMAC[6] = {0x02, 0x42, 0xac, 0x11, 0x00, 0x0a};
+         uint8_t expectedOuterSrc[16] = {};
+         uint8_t expectedOuterDst[16] = {};
+         parseIPv6Bytes("fd00:10::a", expectedOuterSrc);
+         parseIPv6Bytes("fd00:10::b", expectedOuterDst);
+
+         const struct ethhdr *eth = reinterpret_cast<const struct ethhdr *>(output.data());
+         expectNamed(eth->h_proto == bpf_htons(ETH_P_IPV6), "sets_ipv6_ethertype");
+         expectNamed(std::memcmp(eth->h_source, expectedLocalMAC, sizeof(expectedLocalMAC)) == 0,
+            "sets_source_mac");
+         expectNamed(std::memcmp(eth->h_dest, expectedGatewayMAC, sizeof(expectedGatewayMAC)) == 0,
+            "sets_gateway_mac");
+
+         const struct ipv6hdr *outer6 = reinterpret_cast<const struct ipv6hdr *>(output.data() + sizeof(struct ethhdr));
+         expectNamed(outer6->nexthdr == (ipv6 ? IPPROTO_IPV6 : IPPROTO_IPIP), "sets_outer_next_header");
+         expectNamed(std::memcmp(outer6->saddr.s6_addr, expectedOuterSrc, sizeof(expectedOuterSrc)) == 0,
+            "sets_outer_source");
+         expectNamed(std::memcmp(outer6->daddr.s6_addr, expectedOuterDst, sizeof(expectedOuterDst)) == 0,
+            "sets_outer_destination");
+
+         const uint8_t *transportPayload = nullptr;
+         if (ipv6)
+         {
+            uint8_t expectedSource[16] = {};
+            uint8_t expectedDestination[16] = {};
+            parseIPv6Bytes("2001:db8::77", expectedSource);
+            parseIPv6Bytes("2001:db8::1", expectedDestination);
+
+            const struct ipv6hdr *inner6 = reinterpret_cast<const struct ipv6hdr *>(outer6 + 1);
+            expectNamed(inner6->nexthdr == proto, "preserves_inner_protocol");
+            expectNamed(std::memcmp(inner6->saddr.s6_addr, expectedSource, sizeof(expectedSource)) == 0,
+               "preserves_inner_source");
+            expectNamed(std::memcmp(inner6->daddr.s6_addr, expectedDestination, sizeof(expectedDestination)) == 0,
+               "preserves_inner_destination");
+
+            if (proto == IPPROTO_TCP)
+            {
+               const struct tcphdr *tcph = reinterpret_cast<const struct tcphdr *>(inner6 + 1);
+               expectNamed(ntohs(tcph->source) == 49152, "preserves_inner_source_port");
+               expectNamed(ntohs(tcph->dest) == 443, "preserves_inner_destination_port");
+               transportPayload = reinterpret_cast<const uint8_t *>(tcph + 1);
+            }
+            else
+            {
+               const struct udphdr *udph = reinterpret_cast<const struct udphdr *>(inner6 + 1);
+               expectNamed(ntohs(udph->source) == 49152, "preserves_inner_source_port");
+               expectNamed(ntohs(udph->dest) == 443, "preserves_inner_destination_port");
+               transportPayload = reinterpret_cast<const uint8_t *>(udph + 1);
+            }
+         }
+         else
+         {
+            const struct iphdr *inner4 = reinterpret_cast<const struct iphdr *>(outer6 + 1);
+            expectNamed(inner4->protocol == proto, "preserves_inner_protocol");
+            expectNamed(inner4->saddr == parseIPv4Address("198.18.0.77").s_addr, "preserves_inner_source");
+            expectNamed(inner4->daddr == parseIPv4Address("198.18.0.1").s_addr, "preserves_inner_destination");
+
+            if (proto == IPPROTO_TCP)
+            {
+               const struct tcphdr *tcph = reinterpret_cast<const struct tcphdr *>(inner4 + 1);
+               expectNamed(ntohs(tcph->source) == 49152, "preserves_inner_source_port");
+               expectNamed(ntohs(tcph->dest) == 443, "preserves_inner_destination_port");
+               transportPayload = reinterpret_cast<const uint8_t *>(tcph + 1);
+            }
+            else
+            {
+               const struct udphdr *udph = reinterpret_cast<const struct udphdr *>(inner4 + 1);
+               expectNamed(ntohs(udph->source) == 49152, "preserves_inner_source_port");
+               expectNamed(ntohs(udph->dest) == 443, "preserves_inner_destination_port");
+               transportPayload = reinterpret_cast<const uint8_t *>(udph + 1);
+            }
+         }
+
+         expectNamed(transportPayload != nullptr
+            && std::memcmp(transportPayload, payload.data(), payload.size()) == 0,
+            "preserves_payload");
+      }
+
+      peerProgram.close();
+   }
+}
+
 int main(void)
 {
    if (const char *allow = std::getenv("PRODIGY_DEV_ALLOW_BPF_ATTACH"); allow == nullptr || std::strcmp(allow, "1") != 0)
@@ -912,6 +1192,10 @@ int main(void)
    testWormholeEgressBindingReconcilePreservesDesiredKeysDuringStaleRemoval(suite);
    testWormholeRewriteLayoutResolvesEthernetAndL3Frames(suite);
    testContainerPeerEgressRouterRewritesCrossMachineWormholeReplyForOverlay(suite);
+   testContainerPeerEgressRouterEncapsulatesHostedIngress(suite, false, IPPROTO_UDP);
+   testContainerPeerEgressRouterEncapsulatesHostedIngress(suite, false, IPPROTO_TCP);
+   testContainerPeerEgressRouterEncapsulatesHostedIngress(suite, true, IPPROTO_UDP);
+   testContainerPeerEgressRouterEncapsulatesHostedIngress(suite, true, IPPROTO_TCP);
 
    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
