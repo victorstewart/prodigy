@@ -171,6 +171,18 @@ static in_addr parseIPv4Address(const char *text)
    return address;
 }
 
+static switchboard_wormhole_egress4_key makeWormholeEgress4Key(const char *sourceIPv4,
+   uint16_t containerPort,
+   uint8_t proto)
+{
+   switchboard_wormhole_egress4_key key;
+   std::memset(&key, 0, sizeof(key));
+   key.addr = parseIPv4Address(sourceIPv4).s_addr;
+   key.port = htons(containerPort);
+   key.proto = proto;
+   return key;
+}
+
 static Vector<uint8_t> makeIPv4L4FrameWithPayload(const char *srcIPv4,
    const char *dstIPv4,
    uint8_t proto,
@@ -1175,6 +1187,125 @@ static void testContainerPeerEgressRouterEncapsulatesHostedIngress(TestSuite& su
    }
 }
 
+static void testContainerPeerEgressRouterRewritesIPv4WormholeSource(TestSuite& suite, uint8_t proto)
+{
+   const char *label = proto == IPPROTO_TCP
+      ? "container_peer_egress_router_ipv4_wormhole_source_tcp"
+      : "container_peer_egress_router_ipv4_wormhole_source_udp";
+   auto expectNamed = [&] (bool condition, const char *suffix) -> void {
+      char name[256] = {};
+      std::snprintf(name, sizeof(name), "%s_%s", label, suffix);
+      suite.expect(condition, name);
+   };
+
+   String objectPath = {};
+   objectPath.assign(PRODIGY_TEST_BINARY_DIR);
+   objectPath.append("/container.egress.router.ebpf.o"_ctv);
+
+   BPFProgram peerProgram = {};
+   expectNamed(peerProgram.load(objectPath, "container_egress_router"_ctv), "loads_program");
+   if (peerProgram.prog_fd < 0)
+   {
+      return;
+   }
+
+   container_network_policy networkPolicy = {};
+   networkPolicy.requiresPublic4 = 1;
+   networkPolicy.interContainerMTU = 9000;
+   peerProgram.setArrayElement("container_network_policy_map"_ctv, 0, networkPolicy);
+
+   __u32 nicIfidx = 77;
+   peerProgram.setArrayElement("container_device_map"_ctv, 0, nicIfidx);
+
+   mac localMAC = {};
+   localMAC.mac[0] = 0x02;
+   localMAC.mac[1] = 0x42;
+   localMAC.mac[2] = 0xac;
+   localMAC.mac[3] = 0x11;
+   localMAC.mac[4] = 0x00;
+   localMAC.mac[5] = 0x0a;
+   peerProgram.setArrayElement("mac_map"_ctv, 0, localMAC);
+
+   mac gatewayMAC = {};
+   gatewayMAC.mac[0] = 0x02;
+   gatewayMAC.mac[1] = 0x42;
+   gatewayMAC.mac[2] = 0xac;
+   gatewayMAC.mac[3] = 0x11;
+   gatewayMAC.mac[4] = 0x00;
+   gatewayMAC.mac[5] = 0x01;
+   peerProgram.setArrayElement("gateway_mac_map"_ctv, 0, gatewayMAC);
+
+   switchboard_wormhole_egress4_key bindingKey = makeWormholeEgress4Key("198.18.0.1", 8443, proto);
+   switchboard_wormhole_egress_binding binding = {};
+   binding.addr4 = parseIPv4Address("198.18.0.1").s_addr;
+   binding.port = htons(443);
+   binding.proto = proto;
+   binding.is_ipv6 = 0;
+   expectNamed(updateProgramMapElement(peerProgram, "wormhole_egress_bindings4"_ctv, bindingKey, binding),
+      "sets_ipv4_binding");
+
+   Vector<uint8_t> payload = {};
+   payload.resize(32);
+   for (uint32_t index = 0; index < payload.size(); index += 1)
+   {
+      payload[index] = static_cast<uint8_t>((index * 19u + 3u) & 0xffu);
+   }
+
+   Vector<uint8_t> frame = makeIPv4L4FrameWithPayload(
+      "198.18.0.1",
+      "10.0.0.1",
+      proto,
+      8443,
+      49152,
+      payload);
+   Vector<uint8_t> output = {};
+   output.resize(frame.size() + 64u);
+
+   LIBBPF_OPTS(bpf_test_run_opts, opts,
+      .data_in = frame.data(),
+      .data_out = output.data(),
+      .data_size_in = static_cast<__u32>(frame.size()),
+      .data_size_out = static_cast<__u32>(output.size()),
+      .repeat = 1,
+   );
+
+   int runResult = bpf_prog_test_run_opts(peerProgram.prog_fd, &opts);
+   expectNamed(runResult == 0, "test_run_succeeds");
+   expectNamed(opts.retval == TC_ACT_REDIRECT, "redirects_to_nic");
+   expectNamed(opts.data_size_out == frame.size(), "keeps_packet_size");
+
+   if (runResult == 0 && opts.data_size_out >= sizeof(struct ethhdr) + sizeof(struct iphdr))
+   {
+      const struct ethhdr *eth = reinterpret_cast<const struct ethhdr *>(output.data());
+      const struct iphdr *ip4 = reinterpret_cast<const struct iphdr *>(eth + 1);
+      expectNamed(eth->h_proto == bpf_htons(ETH_P_IP), "keeps_ipv4_ethertype");
+      expectNamed(ip4->saddr == parseIPv4Address("198.18.0.1").s_addr, "keeps_external_source_address");
+      expectNamed(ip4->daddr == parseIPv4Address("10.0.0.1").s_addr, "keeps_client_destination_address");
+
+      const uint8_t *transportPayload = nullptr;
+      if (proto == IPPROTO_TCP)
+      {
+         const struct tcphdr *tcph = reinterpret_cast<const struct tcphdr *>(ip4 + 1);
+         expectNamed(ntohs(tcph->source) == 443, "rewrites_source_port");
+         expectNamed(ntohs(tcph->dest) == 49152, "keeps_destination_port");
+         transportPayload = reinterpret_cast<const uint8_t *>(tcph + 1);
+      }
+      else
+      {
+         const struct udphdr *udph = reinterpret_cast<const struct udphdr *>(ip4 + 1);
+         expectNamed(ntohs(udph->source) == 443, "rewrites_source_port");
+         expectNamed(ntohs(udph->dest) == 49152, "keeps_destination_port");
+         transportPayload = reinterpret_cast<const uint8_t *>(udph + 1);
+      }
+
+      expectNamed(transportPayload != nullptr
+         && std::memcmp(transportPayload, payload.data(), payload.size()) == 0,
+         "preserves_payload");
+   }
+
+   peerProgram.close();
+}
+
 int main(void)
 {
    if (const char *allow = std::getenv("PRODIGY_DEV_ALLOW_BPF_ATTACH"); allow == nullptr || std::strcmp(allow, "1") != 0)
@@ -1196,6 +1327,8 @@ int main(void)
    testContainerPeerEgressRouterEncapsulatesHostedIngress(suite, false, IPPROTO_TCP);
    testContainerPeerEgressRouterEncapsulatesHostedIngress(suite, true, IPPROTO_UDP);
    testContainerPeerEgressRouterEncapsulatesHostedIngress(suite, true, IPPROTO_TCP);
+   testContainerPeerEgressRouterRewritesIPv4WormholeSource(suite, IPPROTO_UDP);
+   testContainerPeerEgressRouterRewritesIPv4WormholeSource(suite, IPPROTO_TCP);
 
    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

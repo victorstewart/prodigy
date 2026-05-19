@@ -1971,6 +1971,7 @@ runtime_host_egress_ebpf=""
 runtime_switchboard_balancer_ebpf=""
 fake_ipv4_subnet_cidr="198.18.0.0/16"
 fake_public6_subnet_cidr="2602:fac0:0:12ab:34cd::/88"
+fake_public6_parent_bridge_ip="2602:fac0:0:12ab:ffff::1"
 switchboard_gateway_ip=""
 switchboard_gateway_ip6=""
 switchboard_balancer_ebpf="${PRODIGY_DEV_SWITCHBOARD_BALANCER_EBPF:-}"
@@ -2891,7 +2892,7 @@ ip netns exec "${parent_ns}" ip addr add 10.0.0.1/24 dev prodigy-br0
 ip netns exec "${parent_ns}" ip -6 addr add fd00:10::1/64 nodad dev prodigy-br0
 if [[ "${enable_fake_ipv4_boundary}" == "1" ]]
 then
-   ip netns exec "${parent_ns}" ip -6 addr add 2602:fac0:0:12ab:34cd::1/64 nodad dev prodigy-br0
+   ip netns exec "${parent_ns}" ip -6 addr add "${fake_public6_parent_bridge_ip}/64" nodad dev prodigy-br0
 else
    ip netns exec "${parent_ns}" ip -6 addr add 2001:db8:100::1/64 nodad dev prodigy-br0
 fi

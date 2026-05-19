@@ -44,6 +44,13 @@ struct switchboard_wormhole_egress_key {
    __u8 proto;
 };
 
+struct switchboard_wormhole_egress4_key {
+   __be32 addr;
+   __u16 port;
+   __u8 proto;
+   __u8 padding;
+};
+
 struct switchboard_wormhole_egress_binding {
    union {
       __be32 addr4;

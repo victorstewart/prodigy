@@ -105,6 +105,14 @@ public:
    switchboard_wormhole_egress_binding binding = {};
 };
 
+class SwitchboardWormholeEgress4BindingEntry
+{
+public:
+
+   switchboard_wormhole_egress4_key key = {};
+   switchboard_wormhole_egress_binding binding = {};
+};
+
 static inline bool switchboardBuildWormholeEgressBinding(const IPAddress& externalAddress,
    uint16_t externalPort,
    uint8_t proto,
@@ -130,12 +138,32 @@ static inline bool switchboardWormholeEgressKeysEqual(const switchboard_wormhole
    return std::memcmp(&lhs, &rhs, sizeof(lhs)) == 0;
 }
 
+static inline bool switchboardWormholeEgress4KeysEqual(const switchboard_wormhole_egress4_key& lhs,
+   const switchboard_wormhole_egress4_key& rhs)
+{
+   return std::memcmp(&lhs, &rhs, sizeof(lhs)) == 0;
+}
+
 static inline bool switchboardWormholeEgressDesiredContainsKey(const Vector<SwitchboardWormholeEgressBindingEntry>& desiredBindings,
    const switchboard_wormhole_egress_key& key)
 {
    for (const SwitchboardWormholeEgressBindingEntry& desired : desiredBindings)
    {
       if (switchboardWormholeEgressKeysEqual(desired.key, key))
+      {
+         return true;
+      }
+   }
+
+   return false;
+}
+
+static inline bool switchboardWormholeEgress4DesiredContainsKey(const Vector<SwitchboardWormholeEgress4BindingEntry>& desiredBindings,
+   const switchboard_wormhole_egress4_key& key)
+{
+   for (const SwitchboardWormholeEgress4BindingEntry& entry : desiredBindings)
+   {
+      if (switchboardWormholeEgress4KeysEqual(entry.key, key))
       {
          return true;
       }
@@ -158,6 +186,26 @@ static inline void switchboardReconcileWormholeEgressBindings(const Vector<switc
    for (const switchboard_wormhole_egress_key& existingKey : existingKeys)
    {
       if (switchboardWormholeEgressDesiredContainsKey(desiredBindings, existingKey) == false)
+      {
+         remove(existingKey);
+      }
+   }
+}
+
+template <typename UpsertFn, typename DeleteFn>
+static inline void switchboardReconcileWormholeEgress4Bindings(const Vector<switchboard_wormhole_egress4_key>& existingKeys,
+   const Vector<SwitchboardWormholeEgress4BindingEntry>& desiredBindings,
+   UpsertFn&& upsert,
+   DeleteFn&& remove)
+{
+   for (const SwitchboardWormholeEgress4BindingEntry& desired : desiredBindings)
+   {
+      upsert(desired);
+   }
+
+   for (const switchboard_wormhole_egress4_key& existingKey : existingKeys)
+   {
+      if (switchboardWormholeEgress4DesiredContainsKey(desiredBindings, existingKey) == false)
       {
          remove(existingKey);
       }
@@ -212,6 +260,60 @@ static inline void switchboardSyncWormholeEgressBindingsForProgram(BPFProgram *p
             {
                basics_log("Switchboard %s wormhole_egress_bindings delete failed ifidx=%u errno=%d port=%u proto=%u\n",
                   (scope ? scope : "egress"),
+                  ifidx,
+                  errno,
+                  unsigned(ntohs(staleKey.port)),
+                  unsigned(staleKey.proto));
+            }
+         });
+   });
+}
+
+static inline void switchboardSyncWormholeEgress4BindingsForProgram(BPFProgram *program,
+   const Vector<SwitchboardWormholeEgress4BindingEntry>& desiredBindings,
+   uint32_t ifidx,
+   const char *scope)
+{
+   if (program == nullptr)
+   {
+      return;
+   }
+
+   program->openMap("wormhole_egress_bindings4"_ctv, [&] (int map_fd) -> void {
+      if (map_fd < 0)
+      {
+         return;
+      }
+
+      Vector<switchboard_wormhole_egress4_key> existingKeys = {};
+      switchboard_wormhole_egress4_key currentKey = {};
+      switchboard_wormhole_egress4_key nextKey = {};
+      bool haveCurrentKey = false;
+
+      while (bpf_map_get_next_key(map_fd, haveCurrentKey ? &currentKey : nullptr, &nextKey) == 0)
+      {
+         existingKeys.push_back(nextKey);
+         currentKey = nextKey;
+         haveCurrentKey = true;
+      }
+
+      switchboardReconcileWormholeEgress4Bindings(existingKeys, desiredBindings,
+         [&] (const SwitchboardWormholeEgress4BindingEntry& desired) -> void {
+            if (bpf_map_update_elem(map_fd, &desired.key, &desired.binding, BPF_ANY) != 0)
+            {
+               basics_log("Switchboard %s wormhole_egress_bindings4 update failed ifidx=%u errno=%d port=%u proto=%u\n",
+                  (scope ? scope : "egress4"),
+                  ifidx,
+                  errno,
+                  unsigned(ntohs(desired.key.port)),
+                  unsigned(desired.key.proto));
+            }
+         },
+         [&] (const switchboard_wormhole_egress4_key& staleKey) -> void {
+            if (bpf_map_delete_elem(map_fd, &staleKey) != 0)
+            {
+               basics_log("Switchboard %s wormhole_egress_bindings4 delete failed ifidx=%u errno=%d port=%u proto=%u\n",
+                  (scope ? scope : "egress4"),
                   ifidx,
                   errno,
                   unsigned(ntohs(staleKey.port)),
@@ -737,9 +839,29 @@ private:
       return true;
    }
 
-   void collectWormholeEgressBindingEntries(Vector<SwitchboardWormholeEgressBindingEntry>& desiredBindings)
+   bool buildWormholeEgress4Key(const IPAddress& externalAddress,
+      uint16_t containerPort,
+      uint8_t proto,
+      switchboard_wormhole_egress4_key& key) const
+   {
+      if (externalAddress.is6 || externalAddress.v4 == 0 || containerPort == 0 || proto == 0)
+      {
+         key = {};
+         return false;
+      }
+
+      key = {};
+      key.addr = externalAddress.v4;
+      key.port = htons(containerPort);
+      key.proto = proto;
+      return true;
+   }
+
+   void collectWormholeEgressBindingEntries(Vector<SwitchboardWormholeEgressBindingEntry>& desiredBindings,
+      Vector<SwitchboardWormholeEgress4BindingEntry>& desiredBindings4)
    {
       desiredBindings.clear();
+      desiredBindings4.clear();
 
       for (const auto& [containerID, wormholes] : wormholesByContainer)
       {
@@ -763,6 +885,19 @@ private:
             }
 
             desiredBindings.push_back(desired);
+
+            SwitchboardWormholeEgress4BindingEntry desired4 = {};
+            if (buildWormholeEgress4Key(wormhole->portal->address,
+                  wormhole->port,
+                  wormhole->proto,
+                  desired4.key)
+               && switchboardBuildWormholeEgressBinding(wormhole->portal->address,
+                  wormhole->portal->port,
+                  wormhole->proto,
+                  desired4.binding))
+            {
+               desiredBindings4.push_back(desired4);
+            }
          }
       }
    }
@@ -1297,6 +1432,16 @@ private:
          bool preattachedMode = usePreattachedXDPProgram();
 
          auto attachBalancer = [&] (uint32_t flags) -> BPFProgram * {
+            auto attachedProgramID = [&] (void) -> __u32 {
+               __u32 prog_id = 0;
+               const uint32_t queryFlags = (flags & XDP_FLAGS_MODES);
+               if (bpf_xdp_query_id(eth.ifidx, queryFlags, &prog_id) != 0 || prog_id == 0)
+               {
+                  return 0;
+               }
+
+               return prog_id;
+            };
 
             BPFProgram *program = eth.attachXDP(balancerObjectPath, "balancer_ingress"_ctv, flags,
                [&] (struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
@@ -1323,12 +1468,14 @@ private:
 
             if (program == nullptr)
             {
-               return nullptr;
+               return attachedProgramID() ? eth.loadPreattachedProgram(BPF_XDP, balancerObjectPath) : nullptr;
             }
 
-            __u32 prog_id = 0;
-            int query_result = bpf_xdp_query_id(eth.ifidx, 0, &prog_id);
-            if (query_result != 0 || prog_id == 0)
+            // Some kernels report generic XDP only when queried with
+            // XDP_FLAGS_SKB_MODE. Validate against the attach mode; otherwise a
+            // successful generic attach can be mistaken for failure and leave
+            // the live balancer without Switchboard-managed routing maps.
+            if (attachedProgramID() == 0)
             {
                eth.detachXDP();
                return nullptr;
@@ -1591,11 +1738,16 @@ private:
       });
 
       Vector<SwitchboardWormholeEgressBindingEntry> desiredBindings = {};
-      collectWormholeEgressBindingEntries(desiredBindings);
+      Vector<SwitchboardWormholeEgress4BindingEntry> desiredBindings4 = {};
+      collectWormholeEgressBindingEntries(desiredBindings, desiredBindings4);
       switchboardSyncWormholeEgressBindingsForProgram(program, desiredBindings, eth.ifidx, "peer-runtime-sync");
+      switchboardSyncWormholeEgress4BindingsForProgram(program, desiredBindings4, eth.ifidx, "peer-runtime-sync");
    }
 
 #if NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE
+   // Every Switchboard entry point must carry the same portal, target, and
+   // overlay routing state. Packets may enter through any Switchboard instance;
+   // the selected final destination must not depend on that entry point.
    void syncHostIngressPortalRouting(void)
    {
       if (host_ingress_router == nullptr)
@@ -1764,8 +1916,10 @@ public:
       host_egress_router = program;
 
       Vector<SwitchboardWormholeEgressBindingEntry> desiredBindings = {};
-      collectWormholeEgressBindingEntries(desiredBindings);
+      Vector<SwitchboardWormholeEgress4BindingEntry> desiredBindings4 = {};
+      collectWormholeEgressBindingEntries(desiredBindings, desiredBindings4);
       switchboardSyncWormholeEgressBindingsForProgram(host_egress_router, desiredBindings, eth.ifidx, "host-egress-sync");
+      switchboardSyncWormholeEgress4BindingsForProgram(host_egress_router, desiredBindings4, eth.ifidx, "host-egress-sync");
    }
 
    void setHostIngressRouter(BPFProgram *program)

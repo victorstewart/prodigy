@@ -306,7 +306,13 @@ static inline int maybe_redirect_ipv4_portal_packet(struct __sk_buff *skb, struc
    struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&local_container_subnet_map, &zeroidx);
    if (switchboardContainerIDTargetsLocalMachine(&containerID, localSubnet) == false)
    {
-      return TC_ACT_OK;
+      int overlayAction = TC_ACT_OK;
+      if (switchboardMaybeRouteHostedIngressIPv4(skb, eth, data_end, &overlayAction))
+      {
+         return overlayAction;
+      }
+
+      return TC_ACT_SHOT;
    }
 
    __u16 targetPort = 0;
@@ -396,18 +402,24 @@ static inline int maybe_redirect_ipv6_portal_packet(struct __sk_buff *skb, struc
       return TC_ACT_SHOT;
    }
 
+   __u32 zeroidx = 0;
+   struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&local_container_subnet_map, &zeroidx);
+   if (switchboardContainerIDTargetsLocalMachine(&containerID, localSubnet) == false)
+   {
+      int overlayAction = TC_ACT_OK;
+      if (switchboardMaybeRouteHostedIngressIPv6(skb, eth, data_end, &overlayAction))
+      {
+         return overlayAction;
+      }
+
+      return TC_ACT_SHOT;
+   }
+
    __u16 targetPort = 0;
    if (switchboardLookupWormholeTargetPort(portalMeta->slot, &containerID, &targetPort) == false
       || switchboardRewriteWormholeIPv6TargetSKB(skb, &pckt, &containerID, targetPort) == false)
    {
       return TC_ACT_SHOT;
-   }
-
-   __u32 zeroidx = 0;
-   struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&local_container_subnet_map, &zeroidx);
-   if (switchboardContainerIDTargetsLocalMachine(&containerID, localSubnet) == false)
-   {
-      return TC_ACT_OK;
    }
 
    data_end = (void *)(long)skb->data_end;
@@ -527,6 +539,64 @@ static inline int maybe_route_hosted_ingress_packet(struct __sk_buff *skb, struc
    }
 
    return TC_ACT_OK;
+}
+
+__attribute__((__always_inline__))
+static inline int maybe_redirect_plain_local_ipv6_packet(struct ethhdr *eth, void *data_end, bool *handled)
+{
+   if (handled == NULL)
+   {
+      return TC_ACT_OK;
+   }
+
+   *handled = false;
+
+   if (eth == NULL || eth->h_proto != BE_ETH_P_IPV6)
+   {
+      return TC_ACT_OK;
+   }
+
+   struct ipv6hdr *ipv6h = (struct ipv6hdr *)(eth + 1);
+   if ((void *)(ipv6h + 1) > data_end)
+   {
+      return TC_ACT_OK;
+   }
+
+   if (ipv6h->nexthdr == IPPROTO_IPIP || ipv6h->nexthdr == IPPROTO_IPV6)
+   {
+      return TC_ACT_OK;
+   }
+
+   __be8 *daddr6 = ipv6h->daddr.s6_addr;
+   if (localSubnetContainsDaddr(daddr6) == false)
+   {
+      return TC_ACT_OK;
+   }
+
+   *handled = true;
+#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
+   bump_dev_host_route_stat(4);
+   bump_dev_host_route_stat(13);
+#endif
+   // netkit_xmit() classifies skb->pkt_type for the destination peer before
+   // the primary-attached BPF program runs. Normalize the host NIC Ethernet
+   // header here so the receiving peer is PACKET_HOST, not OTHERHOST.
+   null_mac_addresses(eth);
+   if (redirectToContainer(daddr6, true) == TC_ACT_REDIRECT)
+   {
+#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
+      bump_dev_host_route_stat(5);
+#endif
+      return setInstruction(TC_ACT_REDIRECT);
+   }
+
+#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
+   bump_dev_host_route_stat(6);
+#endif
+   // Container-subnet destinations must resolve to a host-side primary
+   // netkit device for the destination container. If the boundary map is stale
+   // or the container is gone, fail closed.
+   return TC_ACT_SHOT;
 }
 
 // Native host traffic should bypass the heavier overlay/container parsing path.
@@ -653,6 +723,13 @@ int host_ingress_router(struct __sk_buff *skb)
   if (handledHostedIngress)
   {
     return hostedIngressAction;
+  }
+
+  bool handledPlainLocalIPv6 = false;
+  int plainLocalIPv6Action = maybe_redirect_plain_local_ipv6_packet(eth, data_end, &handledPlainLocalIPv6);
+  if (handledPlainLocalIPv6)
+  {
+    return plainLocalIPv6Action;
   }
 
   if (should_fast_pass_native_host_packet(eth, data_end))

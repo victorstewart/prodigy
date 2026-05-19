@@ -1,6 +1,7 @@
 #pragma once
 
 #include <netinet/tcp.h>
+#include <netinet/in.h>
 
 #include <networking/includes.h>
 #include <services/bitsery.h>

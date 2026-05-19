@@ -143,10 +143,29 @@ prodigy_resolve_basics_depofile(
 )
 set(PRODIGY_DEPOFILES
    "${PRODIGY_BASICS_DEPOFILE}"
+   "${PRODIGY_DEPOFILES_DIR}/SG14.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/aegis.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/bitsery.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/cppsort.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/gxhash.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/itoa.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/libbpf.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/libcap.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/libcurl.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/libelf.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/libseccomp.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/libssh2.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/liburing.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/lz4.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/mimalloc.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/nghttp2.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/openssl.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/simdjson.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/snappy.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/static_type_info.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/tidesdb.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/zlib.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/zstd.DepoFile"
 )
 
 depos_depend(FILES ${PRODIGY_DEPOFILES})
@@ -372,6 +391,7 @@ add_executable(prodigy_pingpong_container_crash ${CMAKE_CURRENT_SOURCE_DIR}/test
 add_executable(prodigy_pingpong_container_google_egress ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
 add_executable(prodigy_whitehole_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/whitehole_probe_container.cpp)
 add_executable(prodigy_quic_wormhole_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/quic_wormhole_probe_container.cpp)
+add_executable(prodigy_wormhole_matrix_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/wormhole_matrix_probe_container.cpp)
 set(
    PRODIGY_RUNTIME_CONTAINER_PROBE_TARGETS
    prodigy_pingpong_container
@@ -381,6 +401,7 @@ set(
    prodigy_pingpong_container_google_egress
    prodigy_whitehole_probe_container
    prodigy_quic_wormhole_probe_container
+   prodigy_wormhole_matrix_probe_container
 )
 add_executable(prodigy_gpu_device_mount_smoke ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_gpu_device_mount_smoke.cpp)
 add_executable(prodigy_shared_cpu_affinity_seccomp_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_shared_cpu_affinity_seccomp_unit.cpp)
@@ -611,6 +632,7 @@ target_compile_options(prodigy_pingpong_container_crash PUBLIC -O2)
 target_compile_options(prodigy_pingpong_container_google_egress PUBLIC -O2)
 target_compile_options(prodigy_whitehole_probe_container PUBLIC -O2)
 target_compile_options(prodigy_quic_wormhole_probe_container PUBLIC -O2)
+target_compile_options(prodigy_wormhole_matrix_probe_container PUBLIC -O2)
 target_compile_options(prodigy_gpu_device_mount_smoke PUBLIC -O2)
 target_compile_options(prodigy_shared_cpu_affinity_seccomp_unit PUBLIC -O2)
 target_compile_options(prodigy_metrics_unit PUBLIC -O2)
@@ -993,6 +1015,12 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    set_tests_properties(prodigy_dev_quic_wormhole_smoke PROPERTIES SKIP_RETURN_CODE 77)
 
    add_test(
+      NAME prodigy_dev_wormhole_matrix_smoke
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_wormhole_matrix_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_wormhole_matrix_probe_container
+   )
+   set_tests_properties(prodigy_dev_wormhole_matrix_smoke PROPERTIES SKIP_RETURN_CODE 77)
+
+   add_test(
       NAME prodigy_dev_deployments_matrix_smoke
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_deployments_matrix.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container ${CMAKE_BINARY_DIR}/prodigy_pingpong_container_alt ${CMAKE_BINARY_DIR}/prodigy_pingpong_container_noport ${CMAKE_BINARY_DIR}/prodigy_pingpong_container_crash --mode=smoke
    )
@@ -1089,6 +1117,7 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       prodigy_dev_autoscale_runtime_matrix
       prodigy_dev_container_migration_matrix
       prodigy_dev_quic_wormhole_smoke
+      prodigy_dev_wormhole_matrix_smoke
       prodigy_dev_deployments_matrix_smoke
       prodigy_dev_deployments_matrix_ci
    )
@@ -1133,6 +1162,7 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       prodigy_dev_stateful_topology_upgrade_matrix
       prodigy_dev_os_update_reimage_matrix
       prodigy_dev_quic_wormhole_smoke
+      prodigy_dev_wormhole_matrix_smoke
       prodigy_dev_deployments_matrix_smoke
       prodigy_dev_deployments_matrix_ci
       prodigy_host_egress_bpf_load_smoke

@@ -1,3 +1,5 @@
+#include <limits.h>
+
 #include <prodigy/persistent.state.h>
 #include <prodigy/remote.bootstrap.h>
 

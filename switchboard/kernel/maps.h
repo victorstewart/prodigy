@@ -55,6 +55,13 @@ struct {
    __uint(max_entries, MAX_PORTALS * 256);
 } wormhole_egress_bindings SEC(".maps");
 
+struct {
+   __uint(type, BPF_MAP_TYPE_HASH);
+   __type(key, struct switchboard_wormhole_egress4_key);
+   __type(value, struct switchboard_wormhole_egress_binding);
+   __uint(max_entries, MAX_PORTALS * 256);
+} wormhole_egress_bindings4 SEC(".maps");
+
 // src address to container address suffix
 struct {
    __uint(type, BPF_MAP_TYPE_LRU_PERCPU_HASH);

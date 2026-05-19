@@ -145,6 +145,147 @@ static inline bool switchboardRewriteWormholeSourceIPv6SKB(struct __sk_buff *skb
 }
 
 __attribute__((__always_inline__))
+static inline bool switchboardRewriteWormholeSourceIPv4SKB(struct __sk_buff *skb)
+{
+   void *data = (void *)(long)skb->data;
+   void *data_end = (void *)(long)skb->data_end;
+
+   if (data == NULL || data_end == NULL || skb->protocol != bpf_htons(ETH_P_IP))
+   {
+      return false;
+   }
+
+   struct ethhdr *eth = (struct ethhdr *)data;
+   __u32 l3Offset = 0;
+   if ((void *)(eth + 1) <= data_end && eth->h_proto == bpf_htons(ETH_P_IP))
+   {
+      l3Offset = sizeof(struct ethhdr);
+   }
+
+   struct iphdr *iph = (struct iphdr *)((__u8 *)data + l3Offset);
+   if ((void *)(iph + 1) > data_end || iph->ihl != 5)
+   {
+      return false;
+   }
+
+   __u8 proto = iph->protocol;
+   if (proto != IPPROTO_UDP && proto != IPPROTO_TCP)
+   {
+      return false;
+   }
+
+   __u32 l4Offset = l3Offset + sizeof(struct iphdr);
+   __be16 sourcePort = 0;
+   __u32 checksumOffset = 0;
+   bool udpChecksumPresent = true;
+
+   if (proto == IPPROTO_UDP)
+   {
+      struct udphdr *udph = (struct udphdr *)((__u8 *)data + l4Offset);
+      if ((void *)(udph + 1) > data_end)
+      {
+         return false;
+      }
+
+      sourcePort = udph->source;
+      checksumOffset = l4Offset + __builtin_offsetof(struct udphdr, check);
+      udpChecksumPresent = (udph->check != 0);
+   }
+   else
+   {
+      struct tcphdr *tcph = (struct tcphdr *)((__u8 *)data + l4Offset);
+      if ((void *)(tcph + 1) > data_end)
+      {
+         return false;
+      }
+
+      sourcePort = tcph->source;
+      checksumOffset = l4Offset + __builtin_offsetof(struct tcphdr, check);
+   }
+
+   struct switchboard_wormhole_egress4_key key;
+   bpf_memset(&key, 0, sizeof(key));
+   key.addr = iph->saddr;
+   key.port = sourcePort;
+   key.proto = proto;
+
+   struct switchboard_wormhole_egress_binding *binding = bpf_map_lookup_elem(&wormhole_egress_bindings4, &key);
+   if (binding == NULL)
+   {
+      return false;
+   }
+
+   __u8 bindingIsIPv6 = binding->is_ipv6;
+   __u8 bindingProto = binding->proto;
+   __be32 bindingAddress = binding->addr4;
+   __be16 bindingPort = binding->port;
+
+   if (bindingIsIPv6 != 0 || bindingProto != proto)
+   {
+      return false;
+   }
+
+   const __u64 rewriteFlags = switchboardPacketRewriteStoreFlags();
+   __be32 oldSourceAddress = iph->saddr;
+   __be16 oldSourcePort = sourcePort;
+
+   if (oldSourceAddress != bindingAddress)
+   {
+      if (bpf_l3_csum_replace(skb,
+            l3Offset + __builtin_offsetof(struct iphdr, check),
+            oldSourceAddress,
+            bindingAddress,
+            sizeof(__be32)) != 0
+         || bpf_skb_store_bytes(skb,
+            l3Offset + __builtin_offsetof(struct iphdr, saddr),
+            &bindingAddress,
+            sizeof(bindingAddress),
+            rewriteFlags) != 0)
+      {
+         return false;
+      }
+
+      if (proto == IPPROTO_TCP || udpChecksumPresent)
+      {
+         if (replace_l4_checksum_word32_skb(skb,
+               checksumOffset,
+               oldSourceAddress,
+               bindingAddress,
+               BPF_F_PSEUDO_HDR) != 0)
+         {
+            return false;
+         }
+      }
+   }
+
+   if (oldSourcePort != bindingPort)
+   {
+      if (bpf_skb_store_bytes(skb,
+            l4Offset,
+            &bindingPort,
+            sizeof(bindingPort),
+            rewriteFlags) != 0)
+      {
+         return false;
+      }
+
+      if (proto == IPPROTO_TCP || udpChecksumPresent)
+      {
+         if (replace_l4_checksum_word16_skb(skb,
+               checksumOffset,
+               oldSourcePort,
+               bindingPort,
+               0) != 0)
+         {
+            return false;
+         }
+      }
+   }
+
+   return true;
+}
+
+__attribute__((__always_inline__))
 static inline int switchboardMaybeLearnWhiteholeIPv4(struct ethhdr *eth, void *data_end)
 {
    struct iphdr *iph = (struct iphdr *)(eth + 1);
@@ -351,6 +492,15 @@ static inline int switchboardRouteOutboundEthFrame(struct __sk_buff *skb, struct
 
    if (eth->h_proto == BE_ETH_P_IP)
    {
+      (void)switchboardRewriteWormholeSourceIPv4SKB(skb);
+
+      data_end = (void *)(long)skb->data_end;
+      eth = (struct ethhdr *)(long)skb->data;
+      if ((void *)(eth + 1) > data_end)
+      {
+         return TC_ACT_SHOT;
+      }
+
       int whitehole_action = switchboardMaybeLearnWhiteholeIPv4(eth, data_end);
       if (whitehole_action != TC_ACT_OK)
       {
