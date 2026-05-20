@@ -14,6 +14,7 @@
 #include <switchboard/kernel/services.h>
 #include <switchboard/kernel/structs.h>
 #include <switchboard/kernel/maps.h>
+#include <switchboard/kernel/overlay.maps.h>
 #include <switchboard/kernel/layer4.h>
 #include <switchboard/kernel/encap.h>
 #include <switchboard/kernel/quic.h>
@@ -129,6 +130,47 @@ static inline int ourSubnetsContainDaddr(struct ethhdr *eth, void *data_end)
    }
 
    return 0;
+}
+
+__attribute__((__always_inline__))
+static inline struct switchboard_overlay_machine_route *balancerLookupOverlayMachineRouteByFragment(__u32 machine_fragment)
+{
+   if (machine_fragment == 0)
+   {
+      return NULL;
+   }
+
+   struct switchboard_overlay_machine_route_key key = {
+      .fragment = machine_fragment,
+   };
+
+   struct switchboard_overlay_machine_route *route = bpf_map_lookup_elem(&overlay_machine_routes_full, &key);
+   if (route != NULL)
+   {
+      return route;
+   }
+
+   key.fragment = machine_fragment & 0xFFu;
+   if (key.fragment == 0)
+   {
+      return NULL;
+   }
+
+   return bpf_map_lookup_elem(&overlay_machine_routes_low8, &key);
+}
+
+__attribute__((__always_inline__))
+static inline struct switchboard_overlay_machine_route *balancerLookupOverlayMachineRouteForContainer(struct container_id *containerID)
+{
+   if (containerID == NULL || containerID->hasID == false)
+   {
+      return NULL;
+   }
+
+   __u32 machine_fragment = ((__u32)containerID->value[1] << 16)
+      | ((__u32)containerID->value[2] << 8)
+      | (__u32)containerID->value[3];
+   return balancerLookupOverlayMachineRouteByFragment(machine_fragment);
 }
 
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
@@ -414,6 +456,10 @@ static inline int process_packet(struct xdp_md *xdp, __u64 off, bool is_ipv6)
 
    if (pkt) bpf_memcpy(&pkt->containerID, &containerID, sizeof(struct container_id));
 
+#if !NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
+   struct local_container_subnet6 *localcontainersubnet6 = bpf_map_lookup_elem(&local_container_subnet_map, &zeroidx);
+#endif
+
    if (portal_meta != NULL && is_ipv6)
    {
       __u16 target_port = 0;
@@ -426,10 +472,6 @@ static inline int process_packet(struct xdp_md *xdp, __u64 off, bool is_ipv6)
    }
 
    setCheckpoint("process_packet: checkpoint 4");
-
-#if !NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-   struct local_container_subnet6 *localcontainersubnet6 = bpf_map_lookup_elem(&local_container_subnet_map, &zeroidx);
-#endif
 
    if (localcontainersubnet6)
    {
@@ -449,9 +491,18 @@ static inline int process_packet(struct xdp_md *xdp, __u64 off, bool is_ipv6)
          return XDP_PASS;
       }
 
-      // Cross-machine delivery leaves this NIC toward the overlay, so we wrap
-      // the native packet in an outer IPv6 header here.
-      if (!encap_v6(xdp, localDelivery, localcontainersubnet6, &containerID, packet_len, is_ipv6)) 
+      struct switchboard_overlay_machine_route *overlayRoute = balancerLookupOverlayMachineRouteForContainer(&containerID);
+      bool overlayEncapped = false;
+      if (overlayRoute != NULL)
+      {
+         overlayEncapped = encap_v6_route(xdp, overlayRoute, packet_len, is_ipv6);
+      }
+      else if (portal_meta == NULL)
+      {
+         overlayEncapped = encap_v6(xdp, localDelivery, localcontainersubnet6, &containerID, packet_len, is_ipv6);
+      }
+
+      if (!overlayEncapped)
       {
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
          if (direct_fake_delivery)

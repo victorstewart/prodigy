@@ -1,3 +1,5 @@
+#include <limits.h>
+
 #include <networking/includes.h>
 #include <services/debug.h>
 
@@ -30,6 +32,14 @@ int main(void)
    suite.expect(
       switchboardBalancerPassesIPv6ToKernel(IPPROTO_ICMPV6),
       "switchboard_balancer_ipv6_icmp_passes_to_kernel"
+   );
+   suite.expect(
+      switchboardBalancerPassesIPv6ToKernel(IPPROTO_IPIP),
+      "switchboard_balancer_ipv6_ipip_overlay_passes_to_kernel"
+   );
+   suite.expect(
+      switchboardBalancerPassesIPv6ToKernel(IPPROTO_IPV6),
+      "switchboard_balancer_ipv6_in_ipv6_overlay_passes_to_kernel"
    );
    suite.expect(
       switchboardBalancerPassesIPv6ToKernel(IPPROTO_UDP) == false,

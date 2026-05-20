@@ -20,6 +20,7 @@
 #include <array>
 #include <vector>
 #include <arpa/inet.h>
+#include <linux/bpf.h>
 #include <linux/ip.h>
 #include <netinet/icmp6.h>
 #include <linux/pkt_cls.h>
@@ -1116,6 +1117,124 @@ static void exerciseHostIngressRemotePortalRoute(TestSuite& suite, bool ipv6, ui
    ingressProgram.close();
 }
 
+static void exerciseBalancerRemotePortalRoutesWithOverlay(TestSuite& suite)
+{
+   const char *label = "switchboard_balancer_remote_ipv4_tcp_portal_overlay";
+   auto expectNamed = [&] (bool condition, const char *suffix) -> void {
+      char name[256] = {};
+      std::snprintf(name, sizeof(name), "%s_%s", label, suffix);
+      suite.expect(condition, name);
+   };
+
+   String balancerObjectPath = {};
+   balancerObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+   balancerObjectPath.append("/balancer.ebpf.o"_ctv);
+
+   BPFProgram balancerProgram = {};
+   expectNamed(balancerProgram.load(balancerObjectPath, "balancer_ingress"_ctv), "loads_program");
+   if (balancerProgram.prog_fd < 0)
+   {
+      return;
+   }
+
+   local_container_subnet6 localSubnet = {};
+   localSubnet.dpfx = 0x01;
+   localSubnet.mpfx[0] = 0x52;
+   localSubnet.mpfx[1] = 0xdf;
+   localSubnet.mpfx[2] = 0x39;
+   balancerProgram.setArrayElement("local_container_subnet_map"_ctv, 0, localSubnet);
+
+   mac localMAC = {};
+   localMAC.mac[0] = 0x02;
+   localMAC.mac[1] = 0x42;
+   localMAC.mac[2] = 0xac;
+   localMAC.mac[3] = 0x11;
+   localMAC.mac[4] = 0x00;
+   localMAC.mac[5] = 0x0a;
+   balancerProgram.setArrayElement("mac_map"_ctv, 0, localMAC);
+
+   mac gatewayMAC = {};
+   gatewayMAC.mac[0] = 0x02;
+   gatewayMAC.mac[1] = 0x42;
+   gatewayMAC.mac[2] = 0xac;
+   gatewayMAC.mac[3] = 0x11;
+   gatewayMAC.mac[4] = 0x00;
+   gatewayMAC.mac[5] = 0x01;
+   balancerProgram.setArrayElement("gateway_mac_map"_ctv, 0, gatewayMAC);
+
+   struct in_addr external4 = {};
+   struct in_addr client4 = {};
+   expectNamed(inet_pton(AF_INET, "198.18.0.1", &external4) == 1, "parses_external");
+   expectNamed(inet_pton(AF_INET, "203.0.113.99", &client4) == 1, "parses_client");
+
+   switchboard_owned_routable_prefix4_key ownedKey = {};
+   ownedKey.prefixlen = 32;
+   ownedKey.addr = external4.s_addr;
+   __u8 present = 1;
+   expectNamed(updateProgramMapElement(balancerProgram, "owned_routable_prefixes4"_ctv, ownedKey, present),
+      "sets_owned_external_prefix");
+
+   portal_definition portal = {};
+   portal.addr4 = external4.s_addr;
+   portal.port = htons(443);
+   portal.proto = IPPROTO_TCP;
+
+   portal_meta meta = {};
+   meta.slot = 31;
+   expectNamed(updateProgramMapElement(balancerProgram, "external_portals"_ctv, portal, meta),
+      "installs_external_portal");
+
+   uint8_t remoteContainerID[5] = {0x01, 0x16, 0x25, 0x5b, 0x4e};
+   expectNamed(installSingleContainerPortalRing(balancerProgram, meta.slot, remoteContainerID),
+      "installs_remote_target_ring");
+
+   switchboard_overlay_machine_route route = {};
+   route.family = SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6;
+   route.use_gateway_mac = 1;
+   parseIPv6Bytes("fd00:10::a", route.source6);
+   parseIPv6Bytes("fd00:10::b", route.next_hop6);
+   switchboard_overlay_machine_route_key routeKey = switchboardMakeOverlayMachineRouteKey(0x0016255bu);
+   expectNamed(updateProgramMapElement(balancerProgram, "overlay_machine_routes_full"_ctv, routeKey, route),
+      "sets_machine_route");
+
+   std::vector<uint8_t> frame = makeIPv4L4EthernetFrame(client4, external4, IPPROTO_TCP, 49152, 443);
+   std::vector<uint8_t> output(frame.size() + sizeof(struct ipv6hdr) + 64u);
+   LIBBPF_OPTS(bpf_test_run_opts, opts,
+      .data_in = frame.data(),
+      .data_out = output.data(),
+      .data_size_in = static_cast<__u32>(frame.size()),
+      .data_size_out = static_cast<__u32>(output.size()),
+      .repeat = 1,
+   );
+
+   int runResult = bpf_prog_test_run_opts(balancerProgram.prog_fd, &opts);
+   expectNamed(runResult == 0, "test_run_succeeds");
+   expectNamed(opts.retval == XDP_TX, "routes_remote_portal_to_overlay");
+   expectNamed(opts.data_size_out == frame.size() + sizeof(struct ipv6hdr), "adds_outer_ipv6_header");
+
+   if (runResult == 0 && opts.data_size_out >= frame.size() + sizeof(struct ipv6hdr))
+   {
+      const struct ethhdr *outEth = reinterpret_cast<const struct ethhdr *>(output.data());
+      const struct ipv6hdr *outer6 = reinterpret_cast<const struct ipv6hdr *>(output.data() + sizeof(struct ethhdr));
+      const struct iphdr *inner4 = reinterpret_cast<const struct iphdr *>(outer6 + 1);
+      uint8_t expectedOuterSrc[16] = {};
+      uint8_t expectedOuterDst[16] = {};
+      parseIPv6Bytes("fd00:10::a", expectedOuterSrc);
+      parseIPv6Bytes("fd00:10::b", expectedOuterDst);
+
+      expectNamed(outEth->h_proto == htons(ETH_P_IPV6), "sets_outer_ipv6_ethertype");
+      expectNamed(outer6->nexthdr == IPPROTO_IPIP, "sets_outer_next_header");
+      expectNamed(std::memcmp(outer6->saddr.s6_addr, expectedOuterSrc, sizeof(expectedOuterSrc)) == 0,
+         "sets_outer_source");
+      expectNamed(std::memcmp(outer6->daddr.s6_addr, expectedOuterDst, sizeof(expectedOuterDst)) == 0,
+         "sets_outer_destination");
+      expectNamed(inner4->daddr == external4.s_addr, "preserves_external_destination");
+      expectNamed(inner4->protocol == IPPROTO_TCP, "preserves_protocol");
+   }
+
+   balancerProgram.close();
+}
+
 int main(void)
 {
    if (const char *allow = std::getenv("PRODIGY_DEV_ALLOW_BPF_ATTACH"); allow == nullptr || std::strcmp(allow, "1") != 0)
@@ -1362,18 +1481,6 @@ int main(void)
          suite.expect(inet_pton(AF_INET, "203.0.113.99", &clientAddress) == 1,
             "switchboard_host_ingress_decapped_ipv4_quic_portal_client_address_parses");
 
-         switchboard_overlay_prefix4_key routableKey = {};
-         routableKey.prefixlen = 32;
-         routableKey.addr = externalAddress.s_addr;
-
-         bool routableUpdated = false;
-         __u8 present = 1;
-         ingressProgram.openMap("overlay_routable_prefixes4"_ctv, [&] (int mapFD) -> void {
-            routableUpdated = mapFD >= 0 && bpf_map_update_elem(mapFD, &routableKey, &present, BPF_ANY) == 0;
-         });
-         suite.expect(routableUpdated,
-            "switchboard_host_ingress_decapped_ipv4_quic_portal_installs_overlay_prefix");
-
          uint8_t key[16] = {
             0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
             0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01
@@ -1557,6 +1664,7 @@ int main(void)
    exerciseHostIngressRemotePortalRoute(suite, false, IPPROTO_TCP);
    exerciseHostIngressRemotePortalRoute(suite, true, IPPROTO_UDP);
    exerciseHostIngressRemotePortalRoute(suite, true, IPPROTO_TCP);
+   exerciseBalancerRemotePortalRoutesWithOverlay(suite);
    exerciseHostIngressPlainLocalIPv6(suite, IPPROTO_UDP);
    exerciseHostIngressPlainLocalIPv6(suite, IPPROTO_TCP);
 

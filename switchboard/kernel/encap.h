@@ -98,3 +98,55 @@ static inline bool encap_v6(struct xdp_md *xdp, bool localDelivery, struct local
 
      return true;
 }
+
+__attribute__((__always_inline__))
+static inline bool encap_v6_route(struct xdp_md *xdp,
+   const struct switchboard_overlay_machine_route *route,
+   __u16 packet_len,
+   bool is_ipv6)
+{
+   if (route == NULL || route->family != SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6)
+   {
+      return false;
+   }
+
+   if (bpf_xdp_adjust_head(xdp, 0 - (int)sizeof(struct ipv6hdr)))
+   {
+      return false;
+   }
+
+   void *data = (void *)(long)xdp->data;
+   void *data_end = (void *)(long)xdp->data_end;
+   struct ethhdr *new_eth = data;
+   struct ipv6hdr *ip6h = data + sizeof(struct ethhdr);
+
+   if ((void *)(new_eth + 1) > data_end || (void *)(ip6h + 1) > data_end)
+   {
+      return false;
+   }
+
+   if (route->use_gateway_mac != 0)
+   {
+      if (from_us_to_gateway(new_eth) == false)
+      {
+         return false;
+      }
+   }
+   else if (from_us_to_overlay_next_hop(new_eth, route->next_hop_mac) == false)
+   {
+      return false;
+   }
+
+   new_eth->h_proto = BE_ETH_P_IPV6;
+
+   ip6h->priority = 0;
+   ip6h->version = 6;
+   bpf_memset(ip6h->flow_lbl, 0, sizeof(ip6h->flow_lbl));
+   ip6h->payload_len = bpf_htons(packet_len);
+   ip6h->nexthdr = is_ipv6 ? IPPROTO_IPV6 : IPPROTO_IPIP;
+   ip6h->hop_limit = 64;
+   bpf_memcpy(ip6h->saddr.s6_addr, route->source6, sizeof(route->source6));
+   bpf_memcpy(ip6h->daddr.s6_addr, route->next_hop6, sizeof(route->next_hop6));
+
+   return true;
+}

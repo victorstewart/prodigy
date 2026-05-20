@@ -23,6 +23,14 @@
 #define DEV_BOUNDARY_TRANSLATED_IPV4 0xAC1F0002u /* 172.31.0.2 */
 #endif
 
+#ifndef DEV_BOUNDARY_IPV4_SUBNET
+#define DEV_BOUNDARY_IPV4_SUBNET 0xAC1F0000u /* 172.31.0.0 */
+#endif
+
+#ifndef DEV_BOUNDARY_IPV4_MASK
+#define DEV_BOUNDARY_IPV4_MASK 0xFFFF0000u /* /16 */
+#endif
+
 #ifndef DEV_NAT_PORT_MIN
 #define DEV_NAT_PORT_MIN 20000u
 #endif
@@ -113,6 +121,13 @@ static __always_inline bool is_fake_ipv4(__be32 address)
 {
    __be32 subnet = bpf_htonl(DEV_FAKE_IPV4_SUBNET);
    __be32 mask = bpf_htonl(DEV_FAKE_IPV4_MASK);
+   return (address & mask) == subnet;
+}
+
+static __always_inline bool is_boundary_transfer_ipv4(__be32 address)
+{
+   __be32 subnet = bpf_htonl(DEV_BOUNDARY_IPV4_SUBNET);
+   __be32 mask = bpf_htonl(DEV_BOUNDARY_IPV4_MASK);
    return (address & mask) == subnet;
 }
 
@@ -292,6 +307,11 @@ int fake_ipv4_boundary_nat_egress(struct __sk_buff *skb)
    }
 
    bump_nat4_stat(1);
+
+   if (is_boundary_transfer_ipv4(iph->daddr))
+   {
+      return TC_ACT_OK;
+   }
 
    struct flow4_key flow = {};
    flow.src_ip = iph->saddr;

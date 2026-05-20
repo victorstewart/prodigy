@@ -149,6 +149,90 @@ static inline bool lookup_whitehole_reply_binding_ipv6(struct ethhdr *eth, void 
    return true;
 }
 
+#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
+__attribute__((__always_inline__))
+static inline bool overlay_inner_ipv4_matches_external_portal(struct iphdr *inner4, void *data_end)
+{
+   if ((void *)(inner4 + 1) > data_end || inner4->ihl != 5)
+   {
+      return false;
+   }
+
+   __u16 destPort = 0;
+   if (inner4->protocol == IPPROTO_TCP)
+   {
+      struct tcphdr *tcp = (struct tcphdr *)(inner4 + 1);
+      if ((void *)(tcp + 1) > data_end)
+      {
+         return false;
+      }
+
+      destPort = tcp->dest;
+   }
+   else if (inner4->protocol == IPPROTO_UDP)
+   {
+      struct udphdr *udp = (struct udphdr *)(inner4 + 1);
+      if ((void *)(udp + 1) > data_end)
+      {
+         return false;
+      }
+
+      destPort = udp->dest;
+   }
+   else
+   {
+      return false;
+   }
+
+   struct portal_definition portal = {};
+   portal.addr4 = inner4->daddr;
+   portal.port = destPort;
+   portal.proto = inner4->protocol;
+   return bpf_map_lookup_elem(&external_portals, &portal) != NULL;
+}
+
+__attribute__((__always_inline__))
+static inline bool overlay_inner_ipv6_matches_external_portal(struct ipv6hdr *inner6, void *data_end)
+{
+   if ((void *)(inner6 + 1) > data_end)
+   {
+      return false;
+   }
+
+   __u16 destPort = 0;
+   if (inner6->nexthdr == IPPROTO_TCP)
+   {
+      struct tcphdr *tcp = (struct tcphdr *)(inner6 + 1);
+      if ((void *)(tcp + 1) > data_end)
+      {
+         return false;
+      }
+
+      destPort = tcp->dest;
+   }
+   else if (inner6->nexthdr == IPPROTO_UDP)
+   {
+      struct udphdr *udp = (struct udphdr *)(inner6 + 1);
+      if ((void *)(udp + 1) > data_end)
+      {
+         return false;
+      }
+
+      destPort = udp->dest;
+   }
+   else
+   {
+      return false;
+   }
+
+   struct portal_definition portal = {};
+   bpf_memcpy(portal.addr6, inner6->daddr.s6_addr32, sizeof(portal.addr6));
+   portal.port = destPort;
+   portal.proto = inner6->nexthdr;
+   return bpf_map_lookup_elem(&external_portals, &portal) != NULL;
+}
+#endif
+
 __attribute__((__always_inline__))
 static inline bool overlay_inner_targets_local(__u8 inner_proto, void *inner_l3, void *data_end)
 {
@@ -160,7 +244,16 @@ static inline bool overlay_inner_targets_local(__u8 inner_proto, void *inner_l3,
          return false;
       }
 
-      return overlayRoutablePrefixesContainIPv4(inner4->daddr);
+      if (overlayRoutablePrefixesContainIPv4(inner4->daddr))
+      {
+         return true;
+      }
+
+#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
+      return overlay_inner_ipv4_matches_external_portal(inner4, data_end);
+#else
+      return false;
+#endif
    }
 
    if (inner_proto == IPPROTO_IPV6)
@@ -171,8 +264,17 @@ static inline bool overlay_inner_targets_local(__u8 inner_proto, void *inner_l3,
          return false;
       }
 
-      return localSubnetContainsDaddr(inner6->daddr.s6_addr)
-         || overlayRoutablePrefixesContainIPv6(inner6->daddr.s6_addr32);
+      if (localSubnetContainsDaddr(inner6->daddr.s6_addr)
+         || overlayRoutablePrefixesContainIPv6(inner6->daddr.s6_addr32))
+      {
+         return true;
+      }
+
+#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
+      return overlay_inner_ipv6_matches_external_portal(inner6, data_end);
+#else
+      return false;
+#endif
    }
 
   return false;

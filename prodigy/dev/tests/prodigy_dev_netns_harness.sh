@@ -2830,6 +2830,10 @@ then
 fi
 
 parent_pin_seconds=$((suite_runtime_s + post_fault_window_s + 300))
+if [[ "${runner_mode}" == "persistent" ]]
+then
+   parent_pin_seconds=31536000
+fi
 ip netns exec "${parent_ns}" sleep "${parent_pin_seconds}" &
 parent_pin_pid=$!
 child_pin_seconds="${parent_pin_seconds}"

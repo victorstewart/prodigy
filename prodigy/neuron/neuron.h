@@ -109,6 +109,12 @@ protected:
          Vector<switchboard_overlay_machine_route_key> installedOverlayRouteKeysLow8;
          Vector<switchboard_overlay_prefix4_key> installedHostedIngressRouteKeys4;
          Vector<switchboard_overlay_prefix6_key> installedHostedIngressRouteKeys6;
+         Vector<switchboard_overlay_prefix4_key> installedBalancerOverlayPrefixes4;
+         Vector<switchboard_overlay_prefix6_key> installedBalancerOverlayPrefixes6;
+         Vector<switchboard_overlay_machine_route_key> installedBalancerOverlayRouteKeysFull;
+         Vector<switchboard_overlay_machine_route_key> installedBalancerOverlayRouteKeysLow8;
+         Vector<switchboard_overlay_prefix4_key> installedBalancerHostedIngressRouteKeys4;
+         Vector<switchboard_overlay_prefix6_key> installedBalancerHostedIngressRouteKeys6;
          Vector<portal_definition> installedEgressWhiteholeBindingKeys;
          bytell_hash_subvector<uint32_t, LocalWhiteholeBindingEntry> whiteholeBindingsByContainer;
 		bytell_hash_subvector<uint64_t, CoroutineStack *> pendingContainerDownloads;
@@ -352,6 +358,23 @@ protected:
          }
       }
 
+      void syncSwitchboardBalancerOverlayRoutingProgram(void)
+      {
+         if (switchboard == nullptr)
+         {
+            return;
+         }
+
+         prodigySyncOverlayEgressRoutingProgram(switchboard->boundaryRouterProgram(),
+            overlayRoutingConfig,
+            installedBalancerOverlayPrefixes4,
+            installedBalancerOverlayPrefixes6,
+            installedBalancerOverlayRouteKeysFull,
+            installedBalancerOverlayRouteKeysLow8,
+            installedBalancerHostedIngressRouteKeys4,
+            installedBalancerHostedIngressRouteKeys6);
+      }
+
       void syncOverlayRoutingPrograms(void)
       {
          Vector<switchboard_overlay_prefix4_key> desiredPrefixes4 = {};
@@ -393,6 +416,7 @@ protected:
             installedHostedIngressRouteKeys4,
             installedHostedIngressRouteKeys6);
 
+         syncSwitchboardBalancerOverlayRoutingProgram();
          syncContainerOverlayRoutingPrograms();
       }
 
@@ -1887,6 +1911,7 @@ protected:
 
       switchboard->setHostIngressRouter(tcx_ingress_program);
       switchboard->setHostEgressRouter(tcx_egress_program);
+      syncSwitchboardBalancerOverlayRoutingProgram();
 
       return switchboard.get();
    }
@@ -1931,6 +1956,7 @@ protected:
 
       activeSwitchboard->setLocalContainerSubnet(lcsubnet6);
       activeSwitchboard->openWormholes(containerID, container->plan.wormholes);
+      syncSwitchboardBalancerOverlayRoutingProgram();
 
       // Wormhole refresh must also converge the target container's live peer
       // runtime immediately, not just the broader switchboard state, so the
@@ -3665,6 +3691,7 @@ protected:
             ensureSwitchboard()->setLocalContainerSubnet(lcsubnet6);
             basics_log("neuron openSwitchboardWormholes containerID=%u count=%u\n", containerID, unsigned(wormholes.size()));
             ensureSwitchboard()->openWormholes(containerID, wormholes);
+            syncSwitchboardBalancerOverlayRoutingProgram();
 
             // The open topic must converge the live local peer runtime immediately
             // for the owning container, otherwise first in-cluster packets can race

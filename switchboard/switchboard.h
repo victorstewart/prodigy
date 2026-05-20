@@ -1937,6 +1937,11 @@ public:
       syncPeerProgramRuntimeRouting(program);
    }
 
+   BPFProgram *boundaryRouterProgram(void)
+   {
+      return bpf_router;
+   }
+
    void setLocalContainerSubnet(const struct local_container_subnet6& newSubnet)
    {
       subnet = newSubnet;
