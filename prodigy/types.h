@@ -4916,6 +4916,8 @@ public:
    uint32_t leafValidityDays = 0; // 0 => factory default
    uint8_t renewLeadPercent = 10; // 0 => factory default
    Vector<String> identityNames;
+   Vector<String> dnsSans;
+   Vector<IPAddress> ipSans;
 };
 
 template <typename S>
@@ -4928,6 +4930,10 @@ static void serialize(S&& serializer, DeploymentTlsIssuancePolicy& policy)
    serializer.container(policy.identityNames, UINT32_MAX, [](S& serializer, String& name) {
       serializer.text1b(name, UINT32_MAX);
    });
+   serializer.container(policy.dnsSans, UINT32_MAX, [](S& serializer, String& san) {
+      serializer.text1b(san, UINT32_MAX);
+   });
+   serializer.object(policy.ipSans);
 }
 
 class ApplicationApiCredentialSet {

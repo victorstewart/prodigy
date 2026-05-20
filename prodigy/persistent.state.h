@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <limits.h>
 #include <cstring>
 #include <memory>
 

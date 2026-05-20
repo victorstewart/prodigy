@@ -1,4 +1,5 @@
 #include <prodigy/prodigy.h>
+#include <limits.h>
 #include <services/debug.h>
 #include <prodigy/brain/brain.h>
 #include <prodigy/containerstore.h>
@@ -2498,6 +2499,16 @@ int main(void)
       plan.stateful.neverShard = false;
       plan.stateful.allMasters = true;
       plan.useHostNetworkNamespace = true;
+      plan.hasTlsIssuancePolicy = true;
+      plan.tlsIssuancePolicy.applicationID = 42;
+      plan.tlsIssuancePolicy.enablePerContainerLeafs = true;
+      plan.tlsIssuancePolicy.leafValidityDays = 15;
+      plan.tlsIssuancePolicy.renewLeadPercent = 10;
+      plan.tlsIssuancePolicy.identityNames.push_back("inbound_server_tls"_ctv);
+      plan.tlsIssuancePolicy.dnsSans.push_back("nametag.social"_ctv);
+      plan.tlsIssuancePolicy.dnsSans.push_back("dev.nametag.social"_ctv);
+      plan.tlsIssuancePolicy.ipSans.push_back(IPAddress("10.0.0.18", false));
+      plan.tlsIssuancePolicy.ipSans.push_back(IPAddress("fd7a:115c:a1e0::18", true));
       Whitehole whitehole = {};
       whitehole.transport = ExternalAddressTransport::quic;
       whitehole.family = ExternalAddressFamily::ipv6;
@@ -2526,6 +2537,13 @@ int main(void)
       suite.expect(roundtrip.config.containerBlobBytes == plan.config.containerBlobBytes, "deployment_plan_roundtrip_preserves_container_blob_bytes");
       suite.expect(roundtrip.stateful.allMasters == true, "deployment_plan_roundtrip_preserves_all_masters");
       suite.expect(roundtrip.useHostNetworkNamespace == true, "deployment_plan_roundtrip_preserves_host_network_namespace");
+      suite.expect(roundtrip.hasTlsIssuancePolicy, "deployment_plan_roundtrip_preserves_tls_policy_flag");
+      suite.expect(roundtrip.tlsIssuancePolicy.identityNames.size() == 1, "deployment_plan_roundtrip_preserves_tls_identity_count");
+      suite.expect(roundtrip.tlsIssuancePolicy.dnsSans.size() == 2, "deployment_plan_roundtrip_preserves_tls_dns_san_count");
+      suite.expect(roundtrip.tlsIssuancePolicy.dnsSans[0].equal("nametag.social"_ctv), "deployment_plan_roundtrip_preserves_tls_dns_san");
+      suite.expect(roundtrip.tlsIssuancePolicy.ipSans.size() == 2, "deployment_plan_roundtrip_preserves_tls_ip_san_count");
+      suite.expect(roundtrip.tlsIssuancePolicy.ipSans[0].equals(IPAddress("10.0.0.18", false)), "deployment_plan_roundtrip_preserves_tls_ipv4_san");
+      suite.expect(roundtrip.tlsIssuancePolicy.ipSans[1].equals(IPAddress("fd7a:115c:a1e0::18", true)), "deployment_plan_roundtrip_preserves_tls_ipv6_san");
       suite.expect(roundtrip.whiteholes.size() == 1, "deployment_plan_roundtrip_preserves_whiteholes");
       suite.expect(roundtrip.whiteholes[0].sourcePort == 5555, "deployment_plan_roundtrip_preserves_whitehole_source_port");
       suite.expect(roundtrip.whiteholes[0].bindingNonce == 77, "deployment_plan_roundtrip_preserves_whitehole_binding_nonce");
@@ -4816,6 +4834,47 @@ int main(void)
       }
 
       suite.expect(parsedField && plan.useHostNetworkNamespace == true, "mothership_parse_use_host_network_namespace_sets_plan");
+   }
+
+   {
+      DeploymentPlan plan{};
+      String json = "{\"tls\":{\"applicationID\":42,\"enablePerContainerLeafs\":true,\"leafValidityDays\":15,\"renewLeadPercent\":10,\"identityNames\":[\"inbound_server_tls\"],\"dnsSans\":[\"nametag.social\",\"dev.nametag.social\"],\"ipSans\":[\"10.0.0.18\",\"fd7a:115c:a1e0::18\"]}}"_ctv;
+      json.need(simdjson::SIMDJSON_PADDING);
+
+      simdjson::dom::parser parser;
+      simdjson::dom::element doc;
+      const bool parsedJSON = (parser.parse(json.data(), json.size()).get(doc) == simdjson::SUCCESS);
+      suite.expect(parsedJSON, "mothership_parse_tls_policy_json_valid");
+
+      bool parsedField = false;
+      if (parsedJSON)
+      {
+         for (auto field : doc.get_object())
+         {
+            String key;
+            key.setInvariant(field.key.data(), field.key.size());
+            if (key == "tls"_ctv)
+            {
+               String failure;
+               auto resolver = [] (const String& reference, uint16_t& applicationID) -> bool {
+                  (void)reference;
+                  applicationID = 0;
+                  return false;
+               };
+               parsedField = mothershipParseDeploymentPlanTlsPolicy(field.value, plan, resolver, &failure);
+               suite.expect(parsedField, "mothership_parse_tls_policy_accepts_dns_and_ip_sans");
+               suite.expect(failure.size() == 0, "mothership_parse_tls_policy_clears_failure");
+            }
+         }
+      }
+
+      suite.expect(parsedField && plan.hasTlsIssuancePolicy, "mothership_parse_tls_policy_sets_flag");
+      suite.expect(plan.tlsIssuancePolicy.applicationID == 42, "mothership_parse_tls_policy_sets_application_id");
+      suite.expect(plan.tlsIssuancePolicy.identityNames.size() == 1, "mothership_parse_tls_policy_sets_identity_names");
+      suite.expect(plan.tlsIssuancePolicy.dnsSans.size() == 2, "mothership_parse_tls_policy_sets_dns_sans");
+      suite.expect(plan.tlsIssuancePolicy.ipSans.size() == 2, "mothership_parse_tls_policy_sets_ip_sans");
+      suite.expect(plan.tlsIssuancePolicy.ipSans.size() == 2 && plan.tlsIssuancePolicy.ipSans[0].equals(IPAddress("10.0.0.18", false)), "mothership_parse_tls_policy_sets_ipv4_san");
+      suite.expect(plan.tlsIssuancePolicy.ipSans.size() == 2 && plan.tlsIssuancePolicy.ipSans[1].equals(IPAddress("fd7a:115c:a1e0::18", true)), "mothership_parse_tls_policy_sets_ipv6_san");
    }
 
    {

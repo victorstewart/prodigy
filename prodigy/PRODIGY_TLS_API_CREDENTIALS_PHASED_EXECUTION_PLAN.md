@@ -176,6 +176,8 @@
 | `leafValidityMs` | `int64_t` | Optional override per deployment |
 | `renewLeadPercent` | `uint8_t` | Optional override, default `10` |
 | `identityNames` | `Vector<String>` | Inbound/outbound identities covered by policy |
+| `dnsSans` | `Vector<String>` | DNS subjectAltName values for issued server leaves |
+| `ipSans` | `Vector<IPAddress>` | IP subjectAltName values for issued server leaves |
 
 ### 5.10 `ApplicationApiCredentialSet` fields
 | Field | Type | Description |

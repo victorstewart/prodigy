@@ -1,6 +1,9 @@
 #pragma once
 
+#include <arpa/inet.h>
+
 #include <cmath>
+#include <utility>
 #include <simdjson.h>
 
 #include <prodigy/types.h>
@@ -28,6 +31,292 @@ static inline bool mothershipParseDeploymentPlanUseHostNetworkNamespace(
    bool useHostNetworkNamespace = false;
    (void)value.get(useHostNetworkNamespace);
    plan.useHostNetworkNamespace = useHostNetworkNamespace;
+   return true;
+}
+
+static inline bool mothershipParseIPAddressLiteral(const char *text, IPAddress& address)
+{
+   if (text == nullptr || text[0] == '\0')
+   {
+      return false;
+   }
+
+   IPAddress parsed = {};
+   if (inet_pton(AF_INET, text, parsed.v6) == 1)
+   {
+      parsed.is6 = false;
+      address = parsed;
+      return true;
+   }
+
+   if (inet_pton(AF_INET6, text, parsed.v6) == 1)
+   {
+      parsed.is6 = true;
+      address = parsed;
+      return true;
+   }
+
+   return false;
+}
+
+static inline bool mothershipParseStringArray(
+   const simdjson::dom::element& value,
+   Vector<String>& values,
+   const String& contextPrefix,
+   String *failure = nullptr)
+{
+   if (failure)
+   {
+      failure->clear();
+   }
+
+   if (value.type() != simdjson::dom::element_type::ARRAY)
+   {
+      if (failure)
+      {
+         failure->snprintf<"{} requires an array"_ctv>(contextPrefix);
+      }
+
+      return false;
+   }
+
+   values.clear();
+   for (auto item : value.get_array())
+   {
+      if (item.type() != simdjson::dom::element_type::STRING)
+      {
+         if (failure)
+         {
+            failure->snprintf<"{} requires string members"_ctv>(contextPrefix);
+         }
+
+         values.clear();
+         return false;
+      }
+
+      String text = {};
+      text.assign(item.get_c_str());
+      if (text.size() == 0)
+      {
+         if (failure)
+         {
+            failure->snprintf<"{} contains empty string"_ctv>(contextPrefix);
+         }
+
+         values.clear();
+         return false;
+      }
+
+      values.push_back(text);
+   }
+
+   return true;
+}
+
+template <typename ResolveApplicationIDReference>
+static inline bool mothershipParseDeploymentPlanTlsPolicy(
+   const simdjson::dom::element& value,
+   DeploymentPlan& plan,
+   ResolveApplicationIDReference&& resolveApplicationIDReference,
+   String *failure = nullptr)
+{
+   if (failure)
+   {
+      failure->clear();
+   }
+
+   if (value.type() != simdjson::dom::element_type::OBJECT)
+   {
+      if (failure)
+      {
+         failure->assign("tls requires a document"_ctv);
+      }
+
+      return false;
+   }
+
+   DeploymentTlsIssuancePolicy policy = {};
+   for (auto subfield : value.get_object())
+   {
+      String key = {};
+      key.setInvariant(subfield.key.data(), subfield.key.size());
+
+      if (key.equal("applicationID"_ctv))
+      {
+         if (subfield.value.type() == simdjson::dom::element_type::INT64)
+         {
+            int64_t parsed = 0;
+            (void)subfield.value.get(parsed);
+            if (parsed <= 0 || parsed > UINT16_MAX)
+            {
+               if (failure)
+               {
+                  failure->assign("tls.applicationID invalid"_ctv);
+               }
+
+               return false;
+            }
+
+            policy.applicationID = static_cast<uint16_t>(parsed);
+         }
+         else if (subfield.value.type() == simdjson::dom::element_type::STRING)
+         {
+            String reference = {};
+            reference.setInvariant(subfield.value.get_c_str());
+            if (resolveApplicationIDReference(reference, policy.applicationID) == false)
+            {
+               if (failure)
+               {
+                  failure->assign("tls.applicationID symbolic reference invalid or unreserved; reserveApplicationID first"_ctv);
+               }
+
+               return false;
+            }
+         }
+         else
+         {
+            if (failure)
+            {
+               failure->assign("tls.applicationID requires an integer or symbolic reference string"_ctv);
+            }
+
+            return false;
+         }
+      }
+      else if (key.equal("enablePerContainerLeafs"_ctv))
+      {
+         if (subfield.value.type() != simdjson::dom::element_type::BOOL)
+         {
+            if (failure)
+            {
+               failure->assign("tls.enablePerContainerLeafs requires a bool"_ctv);
+            }
+
+            return false;
+         }
+
+         bool parsed = false;
+         (void)subfield.value.get(parsed);
+         policy.enablePerContainerLeafs = parsed;
+      }
+      else if (key.equal("leafValidityDays"_ctv))
+      {
+         int64_t parsed = 0;
+         if (subfield.value.type() != simdjson::dom::element_type::INT64
+            || subfield.value.get(parsed) != simdjson::SUCCESS
+            || parsed <= 0
+            || parsed > 825)
+         {
+            if (failure)
+            {
+               failure->assign("tls.leafValidityDays must be in 1..825"_ctv);
+            }
+
+            return false;
+         }
+
+         policy.leafValidityDays = static_cast<uint32_t>(parsed);
+      }
+      else if (key.equal("renewLeadPercent"_ctv))
+      {
+         int64_t parsed = 0;
+         if (subfield.value.type() != simdjson::dom::element_type::INT64
+            || subfield.value.get(parsed) != simdjson::SUCCESS
+            || parsed <= 0
+            || parsed >= 100)
+         {
+            if (failure)
+            {
+               failure->assign("tls.renewLeadPercent must be in 1..99"_ctv);
+            }
+
+            return false;
+         }
+
+         policy.renewLeadPercent = static_cast<uint8_t>(parsed);
+      }
+      else if (key.equal("identityNames"_ctv))
+      {
+         String context = {};
+         context.assign("tls.identityNames"_ctv);
+         if (mothershipParseStringArray(subfield.value, policy.identityNames, context, failure) == false)
+         {
+            return false;
+         }
+      }
+      else if (key.equal("dnsSans"_ctv))
+      {
+         String context = {};
+         context.assign("tls.dnsSans"_ctv);
+         if (mothershipParseStringArray(subfield.value, policy.dnsSans, context, failure) == false)
+         {
+            return false;
+         }
+      }
+      else if (key.equal("ipSans"_ctv))
+      {
+         if (subfield.value.type() != simdjson::dom::element_type::ARRAY)
+         {
+            if (failure)
+            {
+               failure->assign("tls.ipSans requires an array"_ctv);
+            }
+
+            return false;
+         }
+
+         policy.ipSans.clear();
+         for (auto item : subfield.value.get_array())
+         {
+            if (item.type() != simdjson::dom::element_type::STRING)
+            {
+               if (failure)
+               {
+                  failure->assign("tls.ipSans requires string members"_ctv);
+               }
+
+               policy.ipSans.clear();
+               return false;
+            }
+
+            IPAddress address = {};
+            if (mothershipParseIPAddressLiteral(item.get_c_str(), address) == false)
+            {
+               if (failure)
+               {
+                  failure->assign("tls.ipSans contains invalid IP literal"_ctv);
+               }
+
+               policy.ipSans.clear();
+               return false;
+            }
+
+            policy.ipSans.push_back(address);
+         }
+      }
+      else
+      {
+         if (failure)
+         {
+            failure->assign("tls invalid field"_ctv);
+         }
+
+         return false;
+      }
+   }
+
+   if (policy.applicationID == 0)
+   {
+      if (failure)
+      {
+         failure->assign("tls.applicationID required"_ctv);
+      }
+
+      return false;
+   }
+
+   plan.hasTlsIssuancePolicy = true;
+   plan.tlsIssuancePolicy = std::move(policy);
    return true;
 }
 

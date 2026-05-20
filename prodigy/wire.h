@@ -1,5 +1,6 @@
 #pragma once
 
+#include <limits.h>
 #include <limits>
 
 #include <networking/includes.h>

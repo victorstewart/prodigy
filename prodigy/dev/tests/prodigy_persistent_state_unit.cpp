@@ -884,6 +884,8 @@ int main(void)
    storedPlan.tlsIssuancePolicy.applicationID = applicationID;
    storedPlan.tlsIssuancePolicy.enablePerContainerLeafs = true;
    storedPlan.tlsIssuancePolicy.identityNames.push_back("ingress"_ctv);
+   storedPlan.tlsIssuancePolicy.dnsSans.push_back("nametag.social"_ctv);
+   storedPlan.tlsIssuancePolicy.ipSans.push_back(IPAddress("10.0.0.18", false));
    storedPlan.hasApiCredentialPolicy = true;
    storedPlan.apiCredentialPolicy.applicationID = applicationID;
    storedPlan.apiCredentialPolicy.requiredCredentialNames.push_back("telnyx_bearer"_ctv);

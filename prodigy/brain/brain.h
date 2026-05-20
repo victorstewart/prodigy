@@ -1,3 +1,4 @@
+#include <limits.h>
 #include <cpp-sort/adapters/verge_adapter.h>
 #include <services/debug.h>
 #include <cpp-sort/sorters/ska_sorter.h>
@@ -72,6 +73,103 @@ enum class BrainTimeoutFlags : uint64_t {
 	postIgnitionRecovery,
 	spotDecomissionChecker
 };
+
+static inline bool brainAddCertificateSubjectAltNames(X509 *cert, const Vector<String>& dnsSans, const Vector<IPAddress>& ipSans)
+{
+	if (cert == nullptr || (dnsSans.size() == 0 && ipSans.size() == 0))
+	{
+		return cert != nullptr;
+	}
+
+	GENERAL_NAMES *names = sk_GENERAL_NAME_new_null();
+	if (names == nullptr)
+	{
+		return false;
+	}
+
+	bool ok = true;
+	auto appendDns = [&] (const String& san) -> bool {
+		if (san.size() == 0)
+		{
+			return false;
+		}
+
+		GENERAL_NAME *name = GENERAL_NAME_new();
+		ASN1_IA5STRING *value = ASN1_IA5STRING_new();
+		String copy = {};
+		copy.assign(san);
+		if (name == nullptr || value == nullptr || ASN1_STRING_set(value, copy.c_str(), int(copy.size())) != 1)
+		{
+			if (name) GENERAL_NAME_free(name);
+			if (value) ASN1_IA5STRING_free(value);
+			return false;
+		}
+
+		GENERAL_NAME_set0_value(name, GEN_DNS, value);
+		if (sk_GENERAL_NAME_push(names, name) <= 0)
+		{
+			GENERAL_NAME_free(name);
+			return false;
+		}
+
+		return true;
+	};
+
+	auto appendIP = [&] (const IPAddress& san) -> bool {
+		if (san.isNull())
+		{
+			return false;
+		}
+
+		GENERAL_NAME *name = GENERAL_NAME_new();
+		ASN1_OCTET_STRING *value = ASN1_OCTET_STRING_new();
+		const int length = san.is6 ? 16 : 4;
+		if (name == nullptr || value == nullptr || ASN1_OCTET_STRING_set(value, san.v6, length) != 1)
+		{
+			if (name) GENERAL_NAME_free(name);
+			if (value) ASN1_OCTET_STRING_free(value);
+			return false;
+		}
+
+		GENERAL_NAME_set0_value(name, GEN_IPADD, value);
+		if (sk_GENERAL_NAME_push(names, name) <= 0)
+		{
+			GENERAL_NAME_free(name);
+			return false;
+		}
+
+		return true;
+	};
+
+	for (const String& san : dnsSans)
+	{
+		if (appendDns(san) == false)
+		{
+			ok = false;
+			break;
+		}
+	}
+
+	if (ok)
+	{
+		for (const IPAddress& san : ipSans)
+		{
+			if (appendIP(san) == false)
+			{
+				ok = false;
+				break;
+			}
+		}
+	}
+
+	if (ok)
+	{
+		ok = (X509_add1_ext_i2d(cert, NID_subject_alt_name, names, 1, X509V3_ADD_APPEND) == 1);
+	}
+
+	sk_GENERAL_NAME_pop_free(names, GENERAL_NAME_free);
+	return ok;
+}
 
 inline void BrainBase::sendNeuronSwitchboardRoutableSubnets(void)
 {
@@ -2877,7 +2975,7 @@ public:
 					request.subjectCommonName = identityName;
 					request.enableServerAuth = true;
 					generateCertificateAndKeys(request, interCert, interKey, leafCert, leafKey);
-					if (leafCert == nullptr || leafKey == nullptr)
+					if (leafCert == nullptr || leafKey == nullptr || brainAddCertificateSubjectAltNames(leafCert, tlsPolicy.dnsSans, tlsPolicy.ipSans) == false)
 					{
 						if (leafCert) X509_free(leafCert);
 						if (leafKey) EVP_PKEY_free(leafKey);
@@ -2893,6 +2991,8 @@ public:
 					identity.generation = factory.factoryGeneration;
 					identity.notBeforeMs = nowMs;
 					identity.notAfterMs = nowMs + int64_t(validityDays) * 24 * 60 * 60 * 1000;
+					identity.dnsSans = tlsPolicy.dnsSans;
+					identity.ipSans = tlsPolicy.ipSans;
 
 					bool ok = VaultPem::x509ToPem(leafCert, identity.certPem) && VaultPem::privateKeyToPem(leafKey, identity.keyPem);
 					if (ok)
@@ -19226,31 +19326,38 @@ addmachines_finalize:
 							VaultCertificateRequest clientRequest = {};
 							clientRequest.type = CertificateType::client;
 							clientRequest.scheme = scheme;
-							clientRequest.subjectCommonName = request.name;
+							clientRequest.subjectCommonName = request.subjectCommonName.size() > 0 ? request.subjectCommonName : request.name;
 							clientRequest.enableClientAuth = true;
 							generateCertificateAndKeys(clientRequest, interCert, interKey, clientCert, clientKey);
 
-							uint32_t validityDays = request.validityDays > 0 ? request.validityDays : factory.defaultLeafValidityDays;
-							if (validityDays == 0) validityDays = 15;
-							X509_gmtime_adj(X509_getm_notBefore(clientCert), 0);
-							X509_time_adj_ex(X509_getm_notAfter(clientCert), int(validityDays), 0, nullptr);
-							(void)X509_sign(clientCert, interKey, (scheme == CryptoScheme::ed25519) ? nullptr : EVP_sha256());
+							if (clientCert == nullptr || clientKey == nullptr || brainAddCertificateSubjectAltNames(clientCert, request.dnsSans, request.ipSans) == false)
+							{
+								response.failure.assign("failed to mint client tls identity"_ctv);
+							}
+							else
+							{
+								uint32_t validityDays = request.validityDays > 0 ? request.validityDays : factory.defaultLeafValidityDays;
+								if (validityDays == 0) validityDays = 15;
+								X509_gmtime_adj(X509_getm_notBefore(clientCert), 0);
+								X509_time_adj_ex(X509_getm_notAfter(clientCert), int(validityDays), 0, nullptr);
+								(void)X509_sign(clientCert, interKey, (scheme == CryptoScheme::ed25519) ? nullptr : EVP_sha256());
 
-							bool ok = VaultPem::x509ToPem(clientCert, response.certPem) && VaultPem::privateKeyToPem(clientKey, response.keyPem);
+								bool ok = VaultPem::x509ToPem(clientCert, response.certPem) && VaultPem::privateKeyToPem(clientKey, response.keyPem);
 								if (ok)
 								{
 									response.chainPem = factory.intermediateCertPem;
 									response.chainPem.append(factory.rootCertPem);
 									response.generation = nextMintedClientTlsGeneration++;
-								response.issuerFactoryGeneration = factory.factoryGeneration;
+									response.issuerFactoryGeneration = factory.factoryGeneration;
 									response.notBeforeMs = Time::now<TimeResolution::ms>();
 									response.notAfterMs = response.notBeforeMs + int64_t(validityDays) * 24 * 60 * 60 * 1000;
 									response.success = true;
                            noteMasterAuthorityRuntimeStateChanged();
 								}
-							else
-							{
-								response.failure.assign("failed to mint or encode client cert"_ctv);
+								else
+								{
+									response.failure.assign("failed to mint or encode client cert"_ctv);
+								}
 							}
 
 							if (clientCert) X509_free(clientCert);

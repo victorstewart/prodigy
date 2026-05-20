@@ -1,4 +1,5 @@
 #include <prodigy/prodigy.h>
+#include <limits.h>
 #include <services/debug.h>
 #include <prodigy/brain/brain.h>
 #include <prodigy/dev/tests/prodigy_test_ssh_keys.h>
@@ -6,6 +7,7 @@
 #include <cstdlib>
 #include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -2735,6 +2737,81 @@ static bool generateApplicationTlsFactory(ApplicationTlsVaultFactory& factory, S
    return ok;
 }
 
+static bool certificateHasDnsSan(const String& certPem, const String& expected)
+{
+   X509 *cert = VaultPem::x509FromPem(certPem);
+   if (cert == nullptr)
+   {
+      return false;
+   }
+
+   GENERAL_NAMES *names = static_cast<GENERAL_NAMES *>(X509_get_ext_d2i(cert, NID_subject_alt_name, nullptr, nullptr));
+   bool found = false;
+   if (names)
+   {
+      for (int index = 0; index < sk_GENERAL_NAME_num(names); ++index)
+      {
+         const GENERAL_NAME *name = sk_GENERAL_NAME_value(names, index);
+         if (name == nullptr || name->type != GEN_DNS)
+         {
+            continue;
+         }
+
+         const ASN1_IA5STRING *dns = name->d.dNSName;
+         const unsigned char *bytes = ASN1_STRING_get0_data(dns);
+         const int length = ASN1_STRING_length(dns);
+         if (length == int(expected.size()) && std::memcmp(bytes, expected.data(), expected.size()) == 0)
+         {
+            found = true;
+            break;
+         }
+      }
+
+      sk_GENERAL_NAME_pop_free(names, GENERAL_NAME_free);
+   }
+
+   X509_free(cert);
+   return found;
+}
+
+static bool certificateHasIpSan(const String& certPem, const IPAddress& expected)
+{
+   X509 *cert = VaultPem::x509FromPem(certPem);
+   if (cert == nullptr)
+   {
+      return false;
+   }
+
+   GENERAL_NAMES *names = static_cast<GENERAL_NAMES *>(X509_get_ext_d2i(cert, NID_subject_alt_name, nullptr, nullptr));
+   bool found = false;
+   if (names)
+   {
+      const int expectedLength = expected.is6 ? 16 : 4;
+      for (int index = 0; index < sk_GENERAL_NAME_num(names); ++index)
+      {
+         const GENERAL_NAME *name = sk_GENERAL_NAME_value(names, index);
+         if (name == nullptr || name->type != GEN_IPADD)
+         {
+            continue;
+         }
+
+         const ASN1_OCTET_STRING *ip = name->d.iPAddress;
+         const unsigned char *bytes = ASN1_STRING_get0_data(ip);
+         const int length = ASN1_STRING_length(ip);
+         if (length == expectedLength && std::memcmp(bytes, expected.v6, size_t(expectedLength)) == 0)
+         {
+            found = true;
+            break;
+         }
+      }
+
+      sk_GENERAL_NAME_pop_free(names, GENERAL_NAME_free);
+   }
+
+   X509_free(cert);
+   return found;
+}
+
 static bool generateTransportAuthority(ProdigyTransportTLSAuthority& authority, String& failure)
 {
    failure.clear();
@@ -3136,6 +3213,10 @@ static void testCredentialBundleBuildAndApply(TestSuite& suite)
    deploymentPlan.tlsIssuancePolicy.leafValidityDays = 15;
    deploymentPlan.tlsIssuancePolicy.renewLeadPercent = 10;
    deploymentPlan.tlsIssuancePolicy.identityNames.push_back("inbound_server_tls"_ctv);
+   deploymentPlan.tlsIssuancePolicy.dnsSans.push_back("nametag.social"_ctv);
+   deploymentPlan.tlsIssuancePolicy.dnsSans.push_back("dev.nametag.social"_ctv);
+   deploymentPlan.tlsIssuancePolicy.ipSans.push_back(IPAddress("10.0.0.18", false));
+   deploymentPlan.tlsIssuancePolicy.ipSans.push_back(IPAddress("fd7a:115c:a1e0::18", true));
    deploymentPlan.hasApiCredentialPolicy = true;
    deploymentPlan.apiCredentialPolicy.applicationID = 6;
    deploymentPlan.apiCredentialPolicy.requiredCredentialNames.push_back("telnyx_bearer"_ctv);
@@ -3184,6 +3265,11 @@ static void testCredentialBundleBuildAndApply(TestSuite& suite)
    suite.expect(bundle.tlsIdentities[0].certPem.size() > 0, "bundle_build_tls_identity_cert");
    suite.expect(bundle.tlsIdentities[0].keyPem.size() > 0, "bundle_build_tls_identity_key");
    suite.expect(bundle.tlsIdentities[0].chainPem.size() > 0, "bundle_build_tls_identity_chain");
+   suite.expect(bundle.tlsIdentities[0].dnsSans.size() == 2, "bundle_build_tls_identity_dns_sans");
+   suite.expect(bundle.tlsIdentities[0].ipSans.size() == 2, "bundle_build_tls_identity_ip_sans");
+   suite.expect(certificateHasDnsSan(bundle.tlsIdentities[0].certPem, "nametag.social"_ctv), "bundle_build_tls_cert_dns_san");
+   suite.expect(certificateHasIpSan(bundle.tlsIdentities[0].certPem, IPAddress("10.0.0.18", false)), "bundle_build_tls_cert_ipv4_san");
+   suite.expect(certificateHasIpSan(bundle.tlsIdentities[0].certPem, IPAddress("fd7a:115c:a1e0::18", true)), "bundle_build_tls_cert_ipv6_san");
 
    ContainerPlan containerPlan;
    brain.applyCredentialsToContainerPlan(deploymentPlan, container, containerPlan);

@@ -8253,130 +8253,15 @@ private:
 			}
 	      else if (key.equal("tls"_ctv))
 	      {
-	        if (field.value.type() != simdjson::dom::element_type::OBJECT)
-	        {
-	          basics_log("tls requires a document\n");
-	          exit(EXIT_FAILURE);
-	        }
-
-	        plan.hasTlsIssuancePolicy = true;
-
-	        for (auto subfield : field.value.get_object())
-	        {
-	          String sk;
-	          sk.setInvariant(subfield.key.data(), subfield.key.size());
-
-	          if (sk.equal("applicationID"_ctv))
-	          {
-	            if (subfield.value.type() == simdjson::dom::element_type::INT64)
-	            {
-	               int64_t v = 0;
-	               (void)subfield.value.get(v);
-	               if (v <= 0 || v > UINT16_MAX)
-	               {
-	                  basics_log("tls.applicationID invalid\n");
-	                  exit(EXIT_FAILURE);
-	               }
-	               plan.tlsIssuancePolicy.applicationID = static_cast<uint16_t>(v);
-	            }
-	            else if (subfield.value.type() == simdjson::dom::element_type::STRING)
-	            {
-	               String reference;
-	               reference.setInvariant(subfield.value.get_c_str());
-	               if (socket.resolveApplicationIDReference(reference, plan.tlsIssuancePolicy.applicationID, false) == false)
-	               {
-	                  basics_log("tls.applicationID symbolic reference invalid or unreserved; reserveApplicationID first\n");
-	                  exit(EXIT_FAILURE);
-	               }
-	            }
-	            else
-	            {
-	               basics_log("tls.applicationID requires an integer or symbolic reference string\n");
-	               exit(EXIT_FAILURE);
-	            }
-	          }
-	          else if (sk.equal("enablePerContainerLeafs"_ctv))
-	          {
-	            if (subfield.value.type() != simdjson::dom::element_type::BOOL)
-	            {
-	              basics_log("tls.enablePerContainerLeafs requires a bool\n");
-	              exit(EXIT_FAILURE);
-	            }
-	            bool b = false;
-	            (void)subfield.value.get(b);
-	            plan.tlsIssuancePolicy.enablePerContainerLeafs = b;
-	          }
-	          else if (sk.equal("leafValidityDays"_ctv))
-	          {
-	            if (subfield.value.type() != simdjson::dom::element_type::INT64)
-	            {
-	              basics_log("tls.leafValidityDays requires an integer\n");
-	              exit(EXIT_FAILURE);
-	            }
-
-	            int64_t v = 0;
-	            (void)subfield.value.get(v);
-	            if (v <= 0 || v > 825)
-	            {
-	              basics_log("tls.leafValidityDays must be in 1..825\n");
-	              exit(EXIT_FAILURE);
-	            }
-	            plan.tlsIssuancePolicy.leafValidityDays = static_cast<uint32_t>(v);
-	          }
-	          else if (sk.equal("renewLeadPercent"_ctv))
-	          {
-	            if (subfield.value.type() != simdjson::dom::element_type::INT64)
-	            {
-	              basics_log("tls.renewLeadPercent requires an integer\n");
-	              exit(EXIT_FAILURE);
-	            }
-
-	            int64_t v = 0;
-	            (void)subfield.value.get(v);
-	            if (v <= 0 || v >= 100)
-	            {
-	              basics_log("tls.renewLeadPercent must be in 1..99\n");
-	              exit(EXIT_FAILURE);
-	            }
-	            plan.tlsIssuancePolicy.renewLeadPercent = static_cast<uint8_t>(v);
-	          }
-	          else if (sk.equal("identityNames"_ctv))
-	          {
-	            if (subfield.value.type() != simdjson::dom::element_type::ARRAY)
-	            {
-	              basics_log("tls.identityNames requires an array\n");
-	              exit(EXIT_FAILURE);
-	            }
-
-	            for (auto item : subfield.value.get_array())
-	            {
-	              if (item.type() != simdjson::dom::element_type::STRING)
-	              {
-	                basics_log("tls.identityNames requires string members\n");
-	                exit(EXIT_FAILURE);
-	              }
-	              String name;
-	              name.assign(item.get_c_str());
-	              if (name.size() == 0)
-	              {
-	                basics_log("tls.identityNames contains empty name\n");
-	                exit(EXIT_FAILURE);
-	              }
-	              plan.tlsIssuancePolicy.identityNames.push_back(name);
-	            }
-	          }
-	          else
-	          {
-	            basics_log("tls invalid field\n");
-	            exit(EXIT_FAILURE);
-	          }
-	        }
-
-	        if (plan.tlsIssuancePolicy.applicationID == 0)
-	        {
-	          basics_log("tls.applicationID required\n");
-	          exit(EXIT_FAILURE);
-	        }
+            String failure = {};
+            auto resolveApplicationIDReference = [&] (const String& reference, uint16_t& applicationID) -> bool {
+               return socket.resolveApplicationIDReference(reference, applicationID, false);
+            };
+            if (mothershipParseDeploymentPlanTlsPolicy(field.value, plan, resolveApplicationIDReference, &failure) == false)
+            {
+               basics_log("%s\n", failure.c_str());
+               exit(EXIT_FAILURE);
+            }
 	      }
 	      else if (key.equal("apiCredentials"_ctv))
 	      {
@@ -15018,6 +14903,29 @@ private:
 					String san;
 					san.assign(item.get_c_str());
 					request.dnsSans.push_back(san);
+				}
+			}
+			else if (key.equal("ipSans"_ctv))
+			{
+				if (field.value.type() != simdjson::dom::element_type::ARRAY)
+				{
+					basics_log("mintClientTlsIdentity.ipSans requires array\n");
+					exit(EXIT_FAILURE);
+				}
+				for (auto item : field.value.get_array())
+				{
+					if (item.type() != simdjson::dom::element_type::STRING)
+					{
+						basics_log("mintClientTlsIdentity.ipSans requires string members\n");
+						exit(EXIT_FAILURE);
+					}
+					IPAddress san;
+					if (mothershipParseIPAddressLiteral(item.get_c_str(), san) == false)
+					{
+						basics_log("mintClientTlsIdentity.ipSans contains invalid IP literal\n");
+						exit(EXIT_FAILURE);
+					}
+					request.ipSans.push_back(san);
 				}
 			}
 			else if (key.equal("tags"_ctv))
