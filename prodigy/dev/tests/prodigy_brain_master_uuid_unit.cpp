@@ -3459,12 +3459,13 @@ int main(void)
     brain.noMasterYet = false;
     brain.boottimens = 10;
     brain.version = 77;
-    brain.localBrainPeerAddress = IPAddress("10.0.0.20", false);
-    brain.localBrainPeerAddressText = "10.0.0.20"_ctv;
+    brain.localBrainPeerAddress = IPAddress("127.0.0.20", false);
+    brain.localBrainPeerAddressText = "127.0.0.20"_ctv;
+    brain.localBrainPeerAddresses.push_back(ClusterMachinePeerAddress {"127.0.0.20"_ctv, 32});
     brain.brainPeerHeartbeatIntervalMs = 1;
     brain.brainPeerHeartbeatTimeoutMs = 1000;
 
-    BrainView *peer = makePeer(uint128_t(0x0612), 222, IPAddress("10.0.0.18", false).v4, "10.0.0.18");
+    BrainView *peer = makePeer(uint128_t(0x0612), 222, IPAddress("127.0.0.18", false).v4, "127.0.0.18");
     peer->connected = false;
     peer->isFixedFile = false;
     peer->fd = -1;
@@ -3473,7 +3474,7 @@ int main(void)
     brain.runBrainPeerHeartbeatTick();
 
     suite.expect(peer->reconnectAfterClose, "brain_peer_heartbeat_tick_master_arms_force_reconnect_until_ack_when_peer_inactive_arms_reconnect");
-    suite.expect(peer->connectAttemptPending(), "brain_peer_heartbeat_tick_master_arms_force_reconnect_until_ack_when_peer_inactive_submits_connect_attempt");
+    suite.expect(peer->forceConnectorOwnershipUntilMasterAck, "brain_peer_heartbeat_tick_master_arms_force_reconnect_until_ack_when_peer_inactive_keeps_connector_ownership");
 
     if (peer->isFixedFile)
     {

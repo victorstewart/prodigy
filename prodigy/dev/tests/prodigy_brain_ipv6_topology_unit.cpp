@@ -1699,11 +1699,17 @@ int main(void)
 
     Vector<IPPrefix> prefixes = {};
     brain.testBuildHostedSwitchboardIngressPrefixes(&active, prefixes);
-    suite.expect(prefixes.size() == 1, "build_hosted_switchboard_ingress_prefixes_dedupes");
-    if (prefixes.size() == 1)
+    suite.expect(prefixes.size() == 2, "build_hosted_switchboard_ingress_prefixes_dedupes");
+    if (prefixes.size() == 2)
     {
-      suite.expect(prefixes[0].cidr == 128, "build_hosted_switchboard_ingress_prefixes_uses_host_prefix");
-      suite.expect(prefixes[0].containsAddress(hosted.address), "build_hosted_switchboard_ingress_prefixes_matches_registered_address");
+      bool sawHostedPrefix = false;
+      bool sawForeignPrefix = false;
+      for (const IPPrefix& prefix : prefixes)
+      {
+        sawHostedPrefix = sawHostedPrefix || (prefix.cidr == 128 && prefix.containsAddress(hosted.address));
+        sawForeignPrefix = sawForeignPrefix || (prefix.cidr == 128 && prefix.containsAddress(foreign.address));
+      }
+      suite.expect(sawHostedPrefix && sawForeignPrefix, "build_hosted_switchboard_ingress_prefixes_matches_registered_addresses");
     }
 
     brain.testBuildHostedSwitchboardIngressPrefixes(nullptr, prefixes);
@@ -1722,9 +1728,16 @@ int main(void)
       uint8_t *args = message->args;
       Message::extractToStringView(args, payload);
       Vector<IPPrefix> decoded = {};
-      if (BitseryEngine::deserializeSafe(payload, decoded) && decoded.size() == 1 && decoded[0].cidr == 128 && decoded[0].containsAddress(hosted.address))
+      if (BitseryEngine::deserializeSafe(payload, decoded) && decoded.size() == 2)
       {
-        sawHostedPrefixes = true;
+        bool sawHostedPrefix = false;
+        bool sawForeignPrefix = false;
+        for (const IPPrefix& prefix : decoded)
+        {
+          sawHostedPrefix = sawHostedPrefix || (prefix.cidr == 128 && prefix.containsAddress(hosted.address));
+          sawForeignPrefix = sawForeignPrefix || (prefix.cidr == 128 && prefix.containsAddress(foreign.address));
+        }
+        sawHostedPrefixes = sawHostedPrefix && sawForeignPrefix;
       }
     });
 

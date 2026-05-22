@@ -12,21 +12,21 @@ set(
 )
 set(
   PRODIGY_BASICS_RELEASE_VERSION
-  "0.2.20"
+  "0.3.1"
   CACHE STRING
   "Pinned Basics release version consumed through the published detached DepoFile asset"
   FORCE
 )
 set(
   PRODIGY_BASICS_RELEASE_DEPOFILE_URL
-  "https://github.com/victorstewart/basics/releases/download/v0.2.20/basics.DepoFile"
+  "https://github.com/victorstewart/basics/releases/download/v0.3.1/basics.DepoFile"
   CACHE STRING
   "Published Basics detached DepoFile asset URL"
   FORCE
 )
 set(
   PRODIGY_BASICS_RELEASE_DEPOFILE_SHA256
-  "b2db6870f06fc6ee728ec7575439430d23754937b3f290848f8f77823882ca2d"
+  "2275e71fd0b429525eac75f20471400d32a3ace9ebed30653cade464d5f9689b"
   CACHE STRING
   "SHA256 for the published Basics detached DepoFile asset"
   FORCE
@@ -40,9 +40,23 @@ set(
 )
 set(
   PRODIGY_BASICS_TIDESDB_DEPENDENCY_VERSION
-  "8.6.2"
+  "9.2.5"
   CACHE STRING
   "Pinned TidesDB package version used when deriving the Basics-with-TidesDB release DepoFile variant"
+  FORCE
+)
+set(
+  PRODIGY_BASICS_BITSERY_DEPENDENCY_VERSION
+  "5.2.5.1"
+  CACHE STRING
+  "Pinned Bitsery package version expected by the current local Basics workspace"
+  FORCE
+)
+set(
+  PRODIGY_BASICS_MIMALLOC_DEPENDENCY_VERSION
+  "3.3.2"
+  CACHE STRING
+  "Pinned mimalloc package version expected in the published Basics release DepoFile"
   FORCE
 )
 
@@ -166,6 +180,58 @@ function(prodigy_resolve_release_depofile out_var)
   set(${out_var} "${_prodigy_depofile}" PARENT_SCOPE)
 endfunction()
 
+function(_prodigy_patch_basics_depofile_for_dependency_versions out_var source_depofile)
+  if (NOT EXISTS "${source_depofile}")
+    message(FATAL_ERROR "Cannot patch missing Basics DepoFile ${source_depofile}.")
+  endif()
+
+  file(READ "${source_depofile}" _prodigy_basics_depofile_contents)
+  set(_prodigy_patched FALSE)
+
+  set(_prodigy_bitsery_depends_line "DEPENDS bitsery VERSION ${PRODIGY_BASICS_BITSERY_DEPENDENCY_VERSION}")
+  string(REGEX MATCH "DEPENDS bitsery VERSION [^\n]+" _prodigy_existing_bitsery_depends_line "${_prodigy_basics_depofile_contents}")
+  if ("${_prodigy_existing_bitsery_depends_line}" STREQUAL "")
+    message(
+      FATAL_ERROR
+      "Published Basics release DepoFile at ${source_depofile} no longer exposes the expected bitsery dependency line."
+    )
+  endif()
+  if (NOT "${_prodigy_existing_bitsery_depends_line}" STREQUAL "${_prodigy_bitsery_depends_line}")
+    string(REPLACE
+      "${_prodigy_existing_bitsery_depends_line}"
+      "${_prodigy_bitsery_depends_line}"
+      _prodigy_basics_depofile_contents
+      "${_prodigy_basics_depofile_contents}"
+    )
+    set(_prodigy_patched TRUE)
+  endif()
+
+  set(_prodigy_tidesdb_depends_line "DEPENDS tidesdb VERSION ${PRODIGY_BASICS_TIDESDB_DEPENDENCY_VERSION}")
+  string(REGEX MATCH "DEPENDS tidesdb VERSION [^\n]+" _prodigy_existing_tidesdb_depends_line "${_prodigy_basics_depofile_contents}")
+  if (NOT "${_prodigy_existing_tidesdb_depends_line}" STREQUAL ""
+      AND NOT "${_prodigy_existing_tidesdb_depends_line}" STREQUAL "${_prodigy_tidesdb_depends_line}")
+    string(REPLACE
+      "${_prodigy_existing_tidesdb_depends_line}"
+      "${_prodigy_tidesdb_depends_line}"
+      _prodigy_basics_depofile_contents
+      "${_prodigy_basics_depofile_contents}"
+    )
+    set(_prodigy_patched TRUE)
+  endif()
+
+  if (_prodigy_patched)
+    file(SHA256 "${source_depofile}" _prodigy_source_depofile_sha256)
+    string(SUBSTRING "${_prodigy_source_depofile_sha256}" 0 16 _prodigy_source_depofile_hash)
+    set(_prodigy_basics_variant_depofile
+      "${PRODIGY_RELEASE_DEPOFILE_CACHE_DIR}/basics-${PRODIGY_BASICS_RELEASE_VERSION}-dependency-overrides-${_prodigy_source_depofile_hash}.DepoFile"
+    )
+    file(WRITE "${_prodigy_basics_variant_depofile}" "${_prodigy_basics_depofile_contents}")
+    set(${out_var} "${_prodigy_basics_variant_depofile}" PARENT_SCOPE)
+  else()
+    set(${out_var} "${source_depofile}" PARENT_SCOPE)
+  endif()
+endfunction()
+
 function(_prodigy_patch_basics_release_depofile_for_tidesdb out_var source_depofile)
   if (NOT EXISTS "${source_depofile}")
     message(FATAL_ERROR "Cannot derive a Basics TidesDB variant from missing DepoFile ${source_depofile}.")
@@ -220,10 +286,11 @@ function(_prodigy_patch_basics_release_depofile_for_tidesdb out_var source_depof
     "${_prodigy_basics_depofile_contents}"
   )
 
+  set(_prodigy_mimalloc_depends_line "DEPENDS mimalloc VERSION ${PRODIGY_BASICS_MIMALLOC_DEPENDENCY_VERSION}")
   string(FIND "${_prodigy_basics_depofile_contents}" "DEPENDS tidesdb VERSION " _prodigy_tidesdb_depends_index)
   if (_prodigy_tidesdb_depends_index EQUAL -1)
     set(_prodigy_tidesdb_depends_line "DEPENDS tidesdb VERSION ${PRODIGY_BASICS_TIDESDB_DEPENDENCY_VERSION}")
-    string(FIND "${_prodigy_basics_depofile_contents}" "DEPENDS mimalloc VERSION 3.0.1" _prodigy_mimalloc_depends_index)
+    string(FIND "${_prodigy_basics_depofile_contents}" "${_prodigy_mimalloc_depends_line}" _prodigy_mimalloc_depends_index)
     if (_prodigy_mimalloc_depends_index EQUAL -1)
       message(
         FATAL_ERROR
@@ -231,8 +298,8 @@ function(_prodigy_patch_basics_release_depofile_for_tidesdb out_var source_depof
       )
     endif()
     string(REPLACE
-      "DEPENDS mimalloc VERSION 3.0.1"
-      "${_prodigy_tidesdb_depends_line}\nDEPENDS mimalloc VERSION 3.0.1"
+      "${_prodigy_mimalloc_depends_line}"
+      "${_prodigy_tidesdb_depends_line}\n${_prodigy_mimalloc_depends_line}"
       _prodigy_basics_depofile_contents
       "${_prodigy_basics_depofile_contents}"
     )
@@ -280,7 +347,7 @@ function(_prodigy_patch_basics_release_depofile_for_tidesdb out_var source_depof
       "${_prodigy_basics_depofile_contents}"
     )
     string(REPLACE
-      "\nDEPENDS mimalloc VERSION 3.0.1"
+      "\nDEPENDS mimalloc VERSION ${PRODIGY_BASICS_MIMALLOC_DEPENDENCY_VERSION}"
       ""
       _prodigy_basics_depofile_contents
       "${_prodigy_basics_depofile_contents}"
@@ -319,6 +386,10 @@ function(prodigy_resolve_basics_release_depofile out_var)
     VERSION "${PRODIGY_BASICS_RELEASE_VERSION}"
     URL "${PRODIGY_BASICS_RELEASE_DEPOFILE_URL}"
     SHA256 "${PRODIGY_BASICS_RELEASE_DEPOFILE_SHA256}"
+  )
+  _prodigy_patch_basics_depofile_for_dependency_versions(
+    _prodigy_basics_depofile
+    "${_prodigy_basics_depofile}"
   )
   if (PRODIGY_BASICS_VARIANT_ENABLE_TIDESDB)
     _prodigy_patch_basics_release_depofile_for_tidesdb(
@@ -433,6 +504,11 @@ function(prodigy_resolve_basics_local_depofile out_var)
       "Configured local Basics at ${_prodigy_local_basics_repo_dir}, but it did not produce the expected self DepoFile at ${_prodigy_local_basics_depofile}."
     )
   endif()
+
+  _prodigy_patch_basics_depofile_for_dependency_versions(
+    _prodigy_local_basics_depofile
+    "${_prodigy_local_basics_depofile}"
+  )
 
   set(${out_var} "${_prodigy_local_basics_depofile}" PARENT_SCOPE)
 endfunction()

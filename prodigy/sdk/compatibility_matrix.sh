@@ -211,7 +211,7 @@ expect_equal(
    capture(
       "cpp header sdkVersion",
       sdk / "cpp" / "neuron_hub.h",
-      r'^   inline constexpr char SDKVersion\[\] = "([^"]+)";$',
+      r'^\s*(?:inline constexpr|constexpr inline) char SDKVersion\[\] = "([^"]+)";$',
    ),
    sdk_version,
 )
@@ -220,7 +220,7 @@ expect_equal(
    capture(
       "cpp header wireSeries",
       sdk / "cpp" / "neuron_hub.h",
-      r'^   inline constexpr char WireSeries\[\] = "([^"]+)";$',
+      r'^\s*(?:inline constexpr|constexpr inline) char WireSeries\[\] = "([^"]+)";$',
    ),
    wire_series,
 )
@@ -229,7 +229,7 @@ expect_equal(
    capture(
       "cpp header wireProtocolVersion",
       sdk / "cpp" / "neuron_hub.h",
-      r'^   inline constexpr std::uint32_t WireProtocolVersion = ([0-9]+);$',
+      r'^\s*(?:inline constexpr|constexpr inline) std::uint32_t WireProtocolVersion = ([0-9]+);$',
    ),
    wire_protocol_version,
 )
