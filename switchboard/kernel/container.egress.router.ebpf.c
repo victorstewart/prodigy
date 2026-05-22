@@ -169,10 +169,9 @@ int container_egress_router(struct __sk_buff *skb)
     if (portalTarget == SWITCHBOARD_PORTAL_TARGET_RESOLVED)
     {
       __u16 targetPort = 0;
-      if (switchboardLookupWormholeTargetPort(portalMeta->slot, &containerID, &targetPort) == false
-         || switchboardRewriteWormholeIPv6TargetSKB(skb, &pckt, &containerID, targetPort) == false)
+      if (switchboardLookupWormholeTargetPort(portalMeta->slot, &containerID, &targetPort) == false || switchboardRewriteWormholeIPv6TargetSKB(skb, &pckt, &containerID, targetPort) == false)
       {
-         return NETKIT_DROP;
+        return NETKIT_DROP;
       }
 
       __u32 zeroidx = 0;

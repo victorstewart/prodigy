@@ -90,7 +90,7 @@
 #endif
 
 #ifndef PRODIGY_MACHINE_PROVISIONING_TIMEOUT_MS
-#define PRODIGY_MACHINE_PROVISIONING_TIMEOUT_MS 600000u
+#define PRODIGY_MACHINE_PROVISIONING_TIMEOUT_MS 600'000u
 #endif
 
 // Neuron hardware inventory runs off the pre-listen critical path. Poll the
@@ -110,11 +110,11 @@
 #endif
 
 #ifndef PRODIGY_BRAIN_PEER_RECOVERY_RECONNECT_MIN_MS
-#define PRODIGY_BRAIN_PEER_RECOVERY_RECONNECT_MIN_MS 12000u
+#define PRODIGY_BRAIN_PEER_RECOVERY_RECONNECT_MIN_MS 12'000u
 #endif
 
 #ifndef PRODIGY_BRAIN_PEER_PERSISTENT_RECONNECT_MIN_MS
-#define PRODIGY_BRAIN_PEER_PERSISTENT_RECONNECT_MIN_MS 30000u
+#define PRODIGY_BRAIN_PEER_PERSISTENT_RECONNECT_MIN_MS 30'000u
 #endif
 
 #ifndef PRODIGY_BRAIN_PEER_INBOUND_MISSING_SLACK_MS
@@ -130,34 +130,34 @@
 #endif
 
 #ifndef PRODIGY_BRAIN_HARD_REBOOT_WATCHDOG_MS
-#define PRODIGY_BRAIN_HARD_REBOOT_WATCHDOG_MS 30000u
+#define PRODIGY_BRAIN_HARD_REBOOT_WATCHDOG_MS 30'000u
 #endif
 
 #ifndef PRODIGY_BRAIN_HARD_REBOOT_RECONNECT_WINDOW_MS
-#define PRODIGY_BRAIN_HARD_REBOOT_RECONNECT_WINDOW_MS 29000u
+#define PRODIGY_BRAIN_HARD_REBOOT_RECONNECT_WINDOW_MS 29'000u
 #endif
 
 // OS update commands are user-supplied and may legitimately spend minutes in
 // package-manager shutdown/reboot paths. Successful recovery is still
 // event-driven; this only bounds a dead update/reboot.
 #ifndef PRODIGY_BRAIN_OS_UPDATE_COMMAND_REBOOT_DEADLINE_MS
-#define PRODIGY_BRAIN_OS_UPDATE_COMMAND_REBOOT_DEADLINE_MS 300000u
+#define PRODIGY_BRAIN_OS_UPDATE_COMMAND_REBOOT_DEADLINE_MS 300'000u
 #endif
 
 #ifndef PRODIGY_BRAIN_OS_UPDATE_REBOOT_WATCHDOG_MS
-#define PRODIGY_BRAIN_OS_UPDATE_REBOOT_WATCHDOG_MS 600000u
+#define PRODIGY_BRAIN_OS_UPDATE_REBOOT_WATCHDOG_MS 600'000u
 #endif
 
 #ifndef PRODIGY_BRAIN_OS_UPDATE_RECONNECT_WINDOW_MS
-#define PRODIGY_BRAIN_OS_UPDATE_RECONNECT_WINDOW_MS 599000u
+#define PRODIGY_BRAIN_OS_UPDATE_RECONNECT_WINDOW_MS 599'000u
 #endif
 
 #ifndef PRODIGY_BRAIN_SPOT_DECOMMISSION_CHECK_INTERVAL_MS
-#define PRODIGY_BRAIN_SPOT_DECOMMISSION_CHECK_INTERVAL_MS 90000u
+#define PRODIGY_BRAIN_SPOT_DECOMMISSION_CHECK_INTERVAL_MS 90'000u
 #endif
 
 #ifndef PRODIGY_BRAIN_FAILED_DEPLOYMENT_CLEANER_INTERVAL_MS
-#define PRODIGY_BRAIN_FAILED_DEPLOYMENT_CLEANER_INTERVAL_MS 90000u
+#define PRODIGY_BRAIN_FAILED_DEPLOYMENT_CLEANER_INTERVAL_MS 90'000u
 #endif
 
 // Local maintenance intervals.
@@ -174,54 +174,54 @@
 #endif
 
 #ifndef PRODIGY_BRAIN_AUTOSCALE_INTERVAL_MS
-#define PRODIGY_BRAIN_AUTOSCALE_INTERVAL_MS 60000u
+#define PRODIGY_BRAIN_AUTOSCALE_INTERVAL_MS 60'000u
 #endif
 
 #ifndef PRODIGY_BRAIN_STATEFUL_TOPOLOGY_ROLLBACK_WINDOW_SECONDS
 #define PRODIGY_BRAIN_STATEFUL_TOPOLOGY_ROLLBACK_WINDOW_SECONDS 300u
 #endif
 
-inline constexpr uint32_t prodigyBrainDevControlPlaneConnectTimeoutMs = PRODIGY_BRAIN_DEV_CONTROL_PLANE_CONNECT_TIMEOUT_MS;
-inline constexpr uint32_t prodigyBrainDevControlPlaneConnectAttempts = PRODIGY_BRAIN_DEV_CONTROL_PLANE_CONNECT_ATTEMPTS;
-inline constexpr uint32_t prodigyBrainDevPeerKeepaliveSeconds = PRODIGY_BRAIN_DEV_PEER_KEEPALIVE_SECONDS;
-inline constexpr uint32_t prodigyBrainDevPeerHeartbeatIntervalMs = PRODIGY_BRAIN_DEV_PEER_HEARTBEAT_INTERVAL_MS;
-inline constexpr uint32_t prodigyBrainDevPeerHeartbeatTimeoutMs = PRODIGY_BRAIN_DEV_PEER_HEARTBEAT_TIMEOUT_MS;
+constexpr inline uint32_t prodigyBrainDevControlPlaneConnectTimeoutMs = PRODIGY_BRAIN_DEV_CONTROL_PLANE_CONNECT_TIMEOUT_MS;
+constexpr inline uint32_t prodigyBrainDevControlPlaneConnectAttempts = PRODIGY_BRAIN_DEV_CONTROL_PLANE_CONNECT_ATTEMPTS;
+constexpr inline uint32_t prodigyBrainDevPeerKeepaliveSeconds = PRODIGY_BRAIN_DEV_PEER_KEEPALIVE_SECONDS;
+constexpr inline uint32_t prodigyBrainDevPeerHeartbeatIntervalMs = PRODIGY_BRAIN_DEV_PEER_HEARTBEAT_INTERVAL_MS;
+constexpr inline uint32_t prodigyBrainDevPeerHeartbeatTimeoutMs = PRODIGY_BRAIN_DEV_PEER_HEARTBEAT_TIMEOUT_MS;
 
-inline constexpr uint32_t prodigyBrainControlPlaneConnectTimeoutMs = PRODIGY_BRAIN_CONTROL_PLANE_CONNECT_TIMEOUT_MS;
-inline constexpr uint32_t prodigyBrainControlPlaneConnectAttempts = PRODIGY_BRAIN_CONTROL_PLANE_CONNECT_ATTEMPTS;
-inline constexpr uint32_t prodigyBrainControlPlaneSoftEscalationFloorMs = PRODIGY_BRAIN_CONTROL_PLANE_SOFT_ESCALATION_FLOOR_MS;
-inline constexpr uint32_t prodigyBrainPeerKeepaliveSeconds = PRODIGY_BRAIN_PEER_KEEPALIVE_SECONDS;
-inline constexpr uint32_t prodigyBrainPeerHeartbeatIntervalMs = PRODIGY_BRAIN_PEER_HEARTBEAT_INTERVAL_MS;
-inline constexpr uint32_t prodigyBrainPeerHeartbeatTimeoutMs = PRODIGY_BRAIN_PEER_HEARTBEAT_TIMEOUT_MS;
-inline constexpr uint32_t prodigyRemoteBootstrapSSHRetrySleepMs = PRODIGY_REMOTE_BOOTSTRAP_SSH_RETRY_SLEEP_MS;
-inline constexpr uint32_t prodigyRemoteBootstrapControlSocketWaitSeconds = PRODIGY_REMOTE_BOOTSTRAP_CONTROL_SOCKET_WAIT_SECONDS;
-inline constexpr uint32_t prodigyRemoteBootstrapControlSocketProbeTimeoutMs = PRODIGY_REMOTE_BOOTSTRAP_CONTROL_SOCKET_PROBE_TIMEOUT_MS;
-inline constexpr uint32_t prodigyRemoteBootstrapControlSocketProbeSleepMs = PRODIGY_REMOTE_BOOTSTRAP_CONTROL_SOCKET_PROBE_SLEEP_MS;
-inline constexpr uint32_t prodigyRemoteBootstrapSocketDiagnosticsTimeoutSeconds = PRODIGY_REMOTE_BOOTSTRAP_SOCKET_DIAGNOSTICS_TIMEOUT_SECONDS;
-inline constexpr uint32_t prodigyMachineProvisioningPollSleepMs = PRODIGY_MACHINE_PROVISIONING_POLL_SLEEP_MS;
-inline constexpr uint32_t prodigyMachineProvisioningTimeoutMs = PRODIGY_MACHINE_PROVISIONING_TIMEOUT_MS;
-inline constexpr uint32_t prodigyNeuronDeferredHardwarePollMs = PRODIGY_NEURON_DEFERRED_HARDWARE_POLL_MS;
+constexpr inline uint32_t prodigyBrainControlPlaneConnectTimeoutMs = PRODIGY_BRAIN_CONTROL_PLANE_CONNECT_TIMEOUT_MS;
+constexpr inline uint32_t prodigyBrainControlPlaneConnectAttempts = PRODIGY_BRAIN_CONTROL_PLANE_CONNECT_ATTEMPTS;
+constexpr inline uint32_t prodigyBrainControlPlaneSoftEscalationFloorMs = PRODIGY_BRAIN_CONTROL_PLANE_SOFT_ESCALATION_FLOOR_MS;
+constexpr inline uint32_t prodigyBrainPeerKeepaliveSeconds = PRODIGY_BRAIN_PEER_KEEPALIVE_SECONDS;
+constexpr inline uint32_t prodigyBrainPeerHeartbeatIntervalMs = PRODIGY_BRAIN_PEER_HEARTBEAT_INTERVAL_MS;
+constexpr inline uint32_t prodigyBrainPeerHeartbeatTimeoutMs = PRODIGY_BRAIN_PEER_HEARTBEAT_TIMEOUT_MS;
+constexpr inline uint32_t prodigyRemoteBootstrapSSHRetrySleepMs = PRODIGY_REMOTE_BOOTSTRAP_SSH_RETRY_SLEEP_MS;
+constexpr inline uint32_t prodigyRemoteBootstrapControlSocketWaitSeconds = PRODIGY_REMOTE_BOOTSTRAP_CONTROL_SOCKET_WAIT_SECONDS;
+constexpr inline uint32_t prodigyRemoteBootstrapControlSocketProbeTimeoutMs = PRODIGY_REMOTE_BOOTSTRAP_CONTROL_SOCKET_PROBE_TIMEOUT_MS;
+constexpr inline uint32_t prodigyRemoteBootstrapControlSocketProbeSleepMs = PRODIGY_REMOTE_BOOTSTRAP_CONTROL_SOCKET_PROBE_SLEEP_MS;
+constexpr inline uint32_t prodigyRemoteBootstrapSocketDiagnosticsTimeoutSeconds = PRODIGY_REMOTE_BOOTSTRAP_SOCKET_DIAGNOSTICS_TIMEOUT_SECONDS;
+constexpr inline uint32_t prodigyMachineProvisioningPollSleepMs = PRODIGY_MACHINE_PROVISIONING_POLL_SLEEP_MS;
+constexpr inline uint32_t prodigyMachineProvisioningTimeoutMs = PRODIGY_MACHINE_PROVISIONING_TIMEOUT_MS;
+constexpr inline uint32_t prodigyNeuronDeferredHardwarePollMs = PRODIGY_NEURON_DEFERRED_HARDWARE_POLL_MS;
 
-inline constexpr uint32_t prodigyBrainPostIgnitionRecoveryTimeoutMs = PRODIGY_BRAIN_POST_IGNITION_RECOVERY_TIMEOUT_MS;
-inline constexpr uint32_t prodigyBrainConnectFailureLogIntervalMs = PRODIGY_BRAIN_CONNECT_FAILURE_LOG_INTERVAL_MS;
-inline constexpr uint32_t prodigyBrainPeerRecoveryReconnectMinMs = PRODIGY_BRAIN_PEER_RECOVERY_RECONNECT_MIN_MS;
-inline constexpr uint32_t prodigyBrainPeerPersistentReconnectMinMs = PRODIGY_BRAIN_PEER_PERSISTENT_RECONNECT_MIN_MS;
-inline constexpr uint32_t prodigyBrainPeerInboundMissingSlackMs = PRODIGY_BRAIN_PEER_INBOUND_MISSING_SLACK_MS;
-inline constexpr uint32_t prodigyBrainNeuronControlHandshakeTimeoutMs = PRODIGY_BRAIN_NEURON_CONTROL_HANDSHAKE_TIMEOUT_MS;
-inline constexpr uint32_t prodigyBrainPeerHandshakeTimeoutMs = PRODIGY_BRAIN_PEER_HANDSHAKE_TIMEOUT_MS;
-inline constexpr uint32_t prodigyBrainHardRebootWatchdogMs = PRODIGY_BRAIN_HARD_REBOOT_WATCHDOG_MS;
-inline constexpr uint32_t prodigyBrainHardRebootReconnectWindowMs = PRODIGY_BRAIN_HARD_REBOOT_RECONNECT_WINDOW_MS;
-inline constexpr uint32_t prodigyBrainOSUpdateCommandRebootDeadlineMs = PRODIGY_BRAIN_OS_UPDATE_COMMAND_REBOOT_DEADLINE_MS;
-inline constexpr uint32_t prodigyBrainOSUpdateRebootWatchdogMs = PRODIGY_BRAIN_OS_UPDATE_REBOOT_WATCHDOG_MS;
-inline constexpr uint32_t prodigyBrainOSUpdateReconnectWindowMs = PRODIGY_BRAIN_OS_UPDATE_RECONNECT_WINDOW_MS;
-inline constexpr uint32_t prodigyBrainSpotDecommissionCheckIntervalMs = PRODIGY_BRAIN_SPOT_DECOMMISSION_CHECK_INTERVAL_MS;
-inline constexpr uint32_t prodigyBrainFailedDeploymentCleanerIntervalMs = PRODIGY_BRAIN_FAILED_DEPLOYMENT_CLEANER_INTERVAL_MS;
+constexpr inline uint32_t prodigyBrainPostIgnitionRecoveryTimeoutMs = PRODIGY_BRAIN_POST_IGNITION_RECOVERY_TIMEOUT_MS;
+constexpr inline uint32_t prodigyBrainConnectFailureLogIntervalMs = PRODIGY_BRAIN_CONNECT_FAILURE_LOG_INTERVAL_MS;
+constexpr inline uint32_t prodigyBrainPeerRecoveryReconnectMinMs = PRODIGY_BRAIN_PEER_RECOVERY_RECONNECT_MIN_MS;
+constexpr inline uint32_t prodigyBrainPeerPersistentReconnectMinMs = PRODIGY_BRAIN_PEER_PERSISTENT_RECONNECT_MIN_MS;
+constexpr inline uint32_t prodigyBrainPeerInboundMissingSlackMs = PRODIGY_BRAIN_PEER_INBOUND_MISSING_SLACK_MS;
+constexpr inline uint32_t prodigyBrainNeuronControlHandshakeTimeoutMs = PRODIGY_BRAIN_NEURON_CONTROL_HANDSHAKE_TIMEOUT_MS;
+constexpr inline uint32_t prodigyBrainPeerHandshakeTimeoutMs = PRODIGY_BRAIN_PEER_HANDSHAKE_TIMEOUT_MS;
+constexpr inline uint32_t prodigyBrainHardRebootWatchdogMs = PRODIGY_BRAIN_HARD_REBOOT_WATCHDOG_MS;
+constexpr inline uint32_t prodigyBrainHardRebootReconnectWindowMs = PRODIGY_BRAIN_HARD_REBOOT_RECONNECT_WINDOW_MS;
+constexpr inline uint32_t prodigyBrainOSUpdateCommandRebootDeadlineMs = PRODIGY_BRAIN_OS_UPDATE_COMMAND_REBOOT_DEADLINE_MS;
+constexpr inline uint32_t prodigyBrainOSUpdateRebootWatchdogMs = PRODIGY_BRAIN_OS_UPDATE_REBOOT_WATCHDOG_MS;
+constexpr inline uint32_t prodigyBrainOSUpdateReconnectWindowMs = PRODIGY_BRAIN_OS_UPDATE_RECONNECT_WINDOW_MS;
+constexpr inline uint32_t prodigyBrainSpotDecommissionCheckIntervalMs = PRODIGY_BRAIN_SPOT_DECOMMISSION_CHECK_INTERVAL_MS;
+constexpr inline uint32_t prodigyBrainFailedDeploymentCleanerIntervalMs = PRODIGY_BRAIN_FAILED_DEPLOYMENT_CLEANER_INTERVAL_MS;
 
-inline constexpr uint64_t prodigyBrainMetricRetentionMs = PRODIGY_BRAIN_METRIC_RETENTION_MS;
-inline constexpr uint32_t prodigyBrainMetricTrimMinIntervalMs = PRODIGY_BRAIN_METRIC_TRIM_MIN_INTERVAL_MS;
-inline constexpr uint32_t prodigyBrainMetricPersistMinIntervalMs = PRODIGY_BRAIN_METRIC_PERSIST_MIN_INTERVAL_MS;
-inline constexpr uint32_t prodigyBrainAutoscaleIntervalMs = PRODIGY_BRAIN_AUTOSCALE_INTERVAL_MS;
-inline constexpr uint32_t prodigyBrainStatefulTopologyRollbackWindowSeconds = PRODIGY_BRAIN_STATEFUL_TOPOLOGY_ROLLBACK_WINDOW_SECONDS;
+constexpr inline uint64_t prodigyBrainMetricRetentionMs = PRODIGY_BRAIN_METRIC_RETENTION_MS;
+constexpr inline uint32_t prodigyBrainMetricTrimMinIntervalMs = PRODIGY_BRAIN_METRIC_TRIM_MIN_INTERVAL_MS;
+constexpr inline uint32_t prodigyBrainMetricPersistMinIntervalMs = PRODIGY_BRAIN_METRIC_PERSIST_MIN_INTERVAL_MS;
+constexpr inline uint32_t prodigyBrainAutoscaleIntervalMs = PRODIGY_BRAIN_AUTOSCALE_INTERVAL_MS;
+constexpr inline uint32_t prodigyBrainStatefulTopologyRollbackWindowSeconds = PRODIGY_BRAIN_STATEFUL_TOPOLOGY_ROLLBACK_WINDOW_SECONDS;
 
 static_assert(prodigyBrainControlPlaneConnectAttempts > 0, "production control-plane connect attempts must be non-zero");
 static_assert(prodigyBrainDevControlPlaneConnectAttempts > 0, "dev control-plane connect attempts must be non-zero");
@@ -243,11 +243,11 @@ static_assert(prodigyBrainNeuronControlHandshakeTimeoutMs <= 5000u, "neuron cont
 static_assert(prodigyBrainPeerHandshakeTimeoutMs > 0, "brain peer handshake timeout must be non-zero");
 static_assert(prodigyBrainPeerHandshakeTimeoutMs <= 5000u, "brain peer handshake timeout must bound wedged peer recovery quickly");
 static_assert(
-   prodigyBrainControlPlaneSoftEscalationFloorMs >= (prodigyBrainControlPlaneConnectTimeoutMs * prodigyBrainControlPlaneConnectAttempts),
-   "soft escalation floor must cover the full production control-plane reconnect window");
+    prodigyBrainControlPlaneSoftEscalationFloorMs >= (prodigyBrainControlPlaneConnectTimeoutMs * prodigyBrainControlPlaneConnectAttempts),
+    "soft escalation floor must cover the full production control-plane reconnect window");
 static_assert(
-   prodigyBrainHardRebootReconnectWindowMs < prodigyBrainHardRebootWatchdogMs,
-   "hard reboot reconnect window must expire before the hard reboot watchdog");
+    prodigyBrainHardRebootReconnectWindowMs < prodigyBrainHardRebootWatchdogMs,
+    "hard reboot reconnect window must expire before the hard reboot watchdog");
 static_assert(
-   prodigyBrainOSUpdateReconnectWindowMs < prodigyBrainOSUpdateRebootWatchdogMs,
-   "OS update reconnect window must expire before the OS update reboot watchdog");
+    prodigyBrainOSUpdateReconnectWindowMs < prodigyBrainOSUpdateRebootWatchdogMs,
+    "OS update reconnect window must expire before the OS update reboot watchdog");

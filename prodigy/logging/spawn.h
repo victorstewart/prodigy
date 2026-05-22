@@ -17,22 +17,23 @@ namespace Logs {
 static inline int spawn_with_logs(const char *path,
                                   char *const argv[],
                                   char *const envp[],
-                                  const ContainerLogPaths &p,
+                                  const ContainerLogPaths& p,
                                   pid_t *outPid)
 {
-    posix_spawn_file_actions_t fa;
-    posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
 
-    ensure_dirs(p);
-    int rc = setup_posix_spawn_stdio(&fa, p.stdoutPath, p.stderrPath);
-    if (rc != 0) {
-        posix_spawn_file_actions_destroy(&fa);
-        return -1;
-    }
-
-    int s = posix_spawn(outPid, path, &fa, nullptr, argv, envp);
+  ensure_dirs(p);
+  int rc = setup_posix_spawn_stdio(&fa, p.stdoutPath, p.stderrPath);
+  if (rc != 0)
+  {
     posix_spawn_file_actions_destroy(&fa);
-    return s;
+    return -1;
+  }
+
+  int s = posix_spawn(outPid, path, &fa, nullptr, argv, envp);
+  posix_spawn_file_actions_destroy(&fa);
+  return s;
 }
 
 } // namespace Logs

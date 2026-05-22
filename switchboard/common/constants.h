@@ -3,7 +3,9 @@
 #pragma once
 
 // consistent hashing ring size
+// clang-format off
 #define RING_SIZE 65537 // when we made this 65536 there was an infinite loop in while (ring[cur] > 0) after 32768
+// clang-format on
 #define MAX_PORTALS 1024
 #define MAX_CONTAINERS_PER_PORTAL (1 << 14) // aka 16,384 application servers, this should be plenty fine for a long time
 
@@ -16,7 +18,9 @@
 
 #define MAX_OWNED_ROUTABLE_PREFIXES 256
 #define MAX_WHITEHOLE_BINDINGS 8192
+// clang-format off
 #define WHITEHOLE_REPLY_LRU_SIZE 16384
+// clang-format on
 
 // packet_description flags:
 // tcp packet had syn flag set (tcp initial packet)

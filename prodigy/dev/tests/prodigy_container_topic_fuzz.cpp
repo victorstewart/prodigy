@@ -9,12 +9,12 @@
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
-   if (data == nullptr || size == 0)
-   {
-      return 0;
-   }
+  if (data == nullptr || size == 0)
+  {
+    return 0;
+  }
 
-   static constexpr std::array<ContainerTopic, 14> topics = {
+  constexpr static std::array<ContainerTopic, 14> topics = {
       ContainerTopic::none,
       ContainerTopic::ping,
       ContainerTopic::pong,
@@ -29,15 +29,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
       ContainerTopic::resourceDeltaAck,
       ContainerTopic::credentialsRefresh,
       ContainerTopic::wormholesRefresh,
-   };
+  };
 
-   std::vector<uint8_t> bytes(data, data + size);
-   ContainerTopic topic = topics[bytes.front() % topics.size()];
+  std::vector<uint8_t> bytes(data, data + size);
+  ContainerTopic topic = topics[bytes.front() % topics.size()];
 
-   uint8_t *args = bytes.data() + 1;
-   uint8_t *terminal = bytes.data() + bytes.size();
+  uint8_t *args = bytes.data() + 1;
+  uint8_t *terminal = bytes.data() + bytes.size();
 
-   (void)ProdigyIngressValidation::validateContainerPayloadForNeuron(uint16_t(topic), args, terminal);
-   (void)ProdigyIngressValidation::validateContainerPayloadForHub(uint16_t(topic), args, terminal);
-   return 0;
+  (void)ProdigyIngressValidation::validateContainerPayloadForNeuron(uint16_t(topic), args, terminal);
+  (void)ProdigyIngressValidation::validateContainerPayloadForHub(uint16_t(topic), args, terminal);
+  return 0;
 }
