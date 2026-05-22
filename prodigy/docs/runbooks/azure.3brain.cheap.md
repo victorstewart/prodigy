@@ -1,81 +1,67 @@
-Azure Cheap 3-Brain Runbook
+# Azure cheap 3-brain cluster runbook
 
-Scope
+This runbook creates a cheap 3-machine / 3-brain Prodigy cluster on Azure, polls it, and removes it.
 
-- Bring up a fresh remote `3`-machine `3`-brain Prodigy cluster on Azure.
-- Keep the VM size at the cheapest viable x86 option that actually fits the current subscription quota.
+Validated practical shape: `Standard_D2als_v6`
+Preferred cheaper shape when quota exists: `Standard_B2als_v2`
+Validated region: `northcentralus`
+Validated auth mode: local `az` CLI bootstrap auth, then cluster-scoped user-assigned managed identity for runtime auth
 
-Cheapest Viable Shape Right Now
+Keep early test runs short. Public IP addresses, disks, NICs, and resource groups can continue to bill depending on provider behavior.
 
-- Preferred when quota exists: `Standard_B2als_v2`
-- Current practical shape in this subscription: `Standard_D2als_v6`
+## Requirements
 
-Why `Standard_D2als_v6`
+- Built `mothership` and `prodigy` from this repository.
+- Local Azure CLI.
+- Authenticated subscription.
+- Bootstrap SSH private key.
+- TCP Fast Open enabled on target hosts.
 
-- As of `2026-03-24`, `northcentralus` shows:
-  - `standardBasv2Family = 0`
-  - `standardDalv6Family = 10`
-- That means `B2als_v2` cannot currently support a `3 x 2-vCPU` run here, while `D2als_v6` can.
+## Required Azure permissions
 
-Auth Contract
+For the low-friction path, use `Contributor` on the target subscription or resource group plus the managed-identity permissions needed for user-assigned identities.
 
-- Preferred local bootstrap auth:
-  - provider credential mode `azureCli`
-- CLI-free local bootstrap alternative:
-  - provider credential mode `staticMaterial`
-  - material can be either a raw ARM access token or JSON with `tenantId`, `clientId`, and `clientSecret`
-- Runtime auth on created VMs comes from the cluster-scoped user-assigned managed identity.
-- Azure CLI is local bootstrap tooling only. Do not ship `az` to the remote Prodigy machines.
-- Do not propagate local Azure secrets into runtime state.
+For a tighter split:
 
-Provider Scope
-
-- Azure provider scope must be:
-  - `subscriptions/<subscription-id>/resourceGroups/<resource-group>/locations/<location>`
-
-Known Good Region
-
-- `northcentralus`
-
-Known Good Ubuntu Image
-
-- Known working URN from the earlier live proof:
-  - `Canonical:ubuntu-24_04-lts:server:24.04.202404230`
-- If you want to re-resolve:
-
-```bash
-/root/.local/azure-cli-venv/bin/az vm image list \
-  --location northcentralus \
-  --publisher Canonical \
-  --offer ubuntu-24_04-lts \
-  --sku server \
-  --all \
-  --query '[-1].urn' -o tsv
+```text
+Contributor or equivalent Compute/Network/Disk permissions on the target resource group
+Managed Identity Contributor to create/delete user-assigned managed identities
+Managed Identity Operator to assign a user-assigned identity to VMs
+Virtual Machine Contributor to create/update VMs that carry that identity
 ```
 
-Create A Fresh Resource Group
+## Authenticate locally
 
 ```bash
-RUN_RG="prodigy-live-azure-3brain-$(date -u +%Y%m%d-%H%M%S)"
-/root/.local/azure-cli-venv/bin/az group create \
-  --name "${RUN_RG}" \
-  --location northcentralus
+export MOTHERSHIP="${MOTHERSHIP:-./mothership}"
+export RUN_ID="${RUN_ID:-$(date -u +%Y%m%d-%H%M%S)}"
+export AZURE_SUBSCRIPTION_ID="REPLACE_AZURE_SUBSCRIPTION_ID"
+export AZURE_LOCATION="${AZURE_LOCATION:-northcentralus}"
+export RUN_RG="prodigy-${RUN_ID}"
+export AZURE_PROVIDER_SCOPE="subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${RUN_RG}/locations/${AZURE_LOCATION}"
+export BOOTSTRAP_SSH_KEY="REPLACE_PATH_TO_BOOTSTRAP_PRIVATE_KEY"
+
+az login
+az account set --subscription "${AZURE_SUBSCRIPTION_ID}"
+az account show --query '{tenantId:tenantId, subscription:id, user:user.name}' -o json
+az group create --name "${RUN_RG}" --location "${AZURE_LOCATION}"
 ```
 
-Cluster JSON Shape
+## Create cluster
 
-```json
+```bash
+cat > azure.cluster.json <<JSON
 {
-  "name": "azure-3brain-run",
+  "name": "azure-3brain-${RUN_ID}",
   "deploymentMode": "remote",
   "provider": "azure",
-  "providerScope": "subscriptions/877d99ab-4469-40eb-9cd1-5e1871ef9169/resourceGroups/RUN_RG/locations/northcentralus",
-  "providerCredentialName": "azure-3brain-run-credential",
+  "providerScope": "${AZURE_PROVIDER_SCOPE}",
+  "providerCredentialName": "azure-3brain-${RUN_ID}-credential",
   "providerCredentialOverride": {
-    "name": "azure-3brain-run-credential",
+    "name": "azure-3brain-${RUN_ID}-credential",
     "provider": "azure",
     "mode": "azureCli",
-    "scope": "subscriptions/877d99ab-4469-40eb-9cd1-5e1871ef9169/resourceGroups/RUN_RG/locations/northcentralus",
+    "scope": "${AZURE_PROVIDER_SCOPE}",
     "allowPropagateToProdigy": false
   },
   "controls": [
@@ -97,49 +83,33 @@ Cluster JSON Shape
     }
   ],
   "bootstrapSshUser": "root",
-  "bootstrapSshPrivateKeyPath": "/root/.ssh/id_rsa",
+  "bootstrapSshPrivateKeyPath": "${BOOTSTRAP_SSH_KEY}",
   "remoteProdigyPath": "/root/prodigy",
   "desiredEnvironment": "azure"
 }
+JSON
+
+time "${MOTHERSHIP}" createCluster "$(cat azure.cluster.json)"
+"${MOTHERSHIP}" clusterReport "azure-3brain-${RUN_ID}"
 ```
 
-How To Run
-
-1. Create a fresh Azure resource group for the run.
-2. Use either `azureCli` bootstrap auth from the local host or a `staticMaterial` provider credential with a pre-resolved ARM token or service-principal JSON.
-3. Run `mothership createCluster` with the JSON above.
-4. Poll `clusterReport` until `topologyMachines: 3` and all brains are healthy.
-5. Run `removeCluster`.
-6. Delete the whole Azure resource group after the run, even if `removeCluster` succeeded, so any straggler NICs/disks/identities are forced out.
-
-Timing Artifacts To Capture
-
-- `createCluster.timed.out`
-- `health.timed.out`
-- `clusterReport.final.out`
-- `seed.journal`
-- follower journals if cluster health stalls
-
-Cleanup
+## Remove cluster
 
 ```bash
-/root/.local/azure-cli-venv/bin/az group delete \
-  --name "${RUN_RG}" \
-  --yes \
-  --no-wait
+time "${MOTHERSHIP}" removeCluster "azure-3brain-${RUN_ID}"
+az group delete --name "${RUN_RG}" --yes --no-wait
 ```
 
-Current Caveats
+## Cleanup verification
 
-- `Standard_B2als_v2` remains blocked by family quota in this subscription.
-- The current cheap Azure runbook therefore standardizes on `Standard_D2als_v6` until Basv2 quota exists.
-- Fresh Azure seed VMs can briefly race managed-identity readiness. The current repo retries IMDS token acquisition instead of failing immediately on a missing `access_token`.
+```bash
+az resource list \
+  --resource-group "${RUN_RG}" \
+  --output table
+```
 
-Latest Measured Result
+If the resource group was deleted asynchronously, poll until it no longer appears:
 
-- Latest healthy `3`-brain live run:
-  - [/root/nametag/.mothership-live-azure-3brain-matrix-20260324-070044/createCluster.timed.out](/root/nametag/.mothership-live-azure-3brain-matrix-20260324-070044/createCluster.timed.out)
-  - [/root/nametag/.mothership-live-azure-3brain-matrix-20260324-070044/health.timed.out](/root/nametag/.mothership-live-azure-3brain-matrix-20260324-070044/health.timed.out)
-  - [/root/nametag/.mothership-live-azure-3brain-matrix-20260324-070044/clusterReport.final.out](/root/nametag/.mothership-live-azure-3brain-matrix-20260324-070044/clusterReport.final.out)
-- `createCluster` wall time: `67.23s`
-- `clusterReport` healthy convergence: first poll attempt
+```bash
+az group exists --name "${RUN_RG}"
+```

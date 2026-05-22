@@ -1,64 +1,77 @@
-GCP Cheap 3-Brain Runbook
+# GCP cheap 3-brain cluster runbook
 
-Scope
+This runbook creates a cheap 3-machine / 3-brain Prodigy cluster on GCP, polls it, and removes it.
 
-- Bring up a fresh remote `3`-machine `3`-brain Prodigy cluster on GCP.
-- Use the cheapest currently requested x86 machine type for this repo’s live GCP work.
+Validated cheap shape: `e2-medium`
+Validated zone: `us-central1-a`
+Validated image family: Ubuntu 24.04 LTS
+Validated auth mode: local `gcloud` bootstrap auth, then attached service account for runtime auth
 
-Cheapest Requested Shape
+Keep early test runs short. Instances, disks, static IPs, templates, and VPC resources can continue to bill depending on provider behavior.
 
-- `e2-medium`
+## Requirements
 
-Auth Contract
+- Built `mothership` and `prodigy` from this repository.
+- Local `gcloud` CLI.
+- Authenticated GCP project.
+- Runtime service account.
+- Bootstrap SSH private key.
+- TCP Fast Open enabled on target hosts.
 
-- Use local `gcloud` bootstrap auth.
-- Provider credential mode:
-  - `gcloud`
-- Runtime auth on created VMs comes from the attached service account.
-- Do not propagate local bootstrap credentials into runtime state.
+## Required GCP permissions
 
-Known Good Project And Zone
+Bootstrap identity:
 
-- Project:
-  - `prodigy-test-260321-0240-1bcc`
-- Zone:
-  - `us-central1-a`
-
-Known Runtime Service Account
-
-- `prodigy-machine@prodigy-test-260321-0240-1bcc.iam.gserviceaccount.com`
-
-Recommended Image URI
-
-- `projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64`
-
-Bootstrap Precheck
-
-```bash
-gcloud auth list
-gcloud config set project prodigy-test-260321-0240-1bcc
-gcloud config set compute/zone us-central1-a
-gcloud iam service-accounts list --project=prodigy-test-260321-0240-1bcc
+```text
+roles/compute.instanceAdmin.v1 on the target project or constrained scope
+roles/iam.serviceAccountUser on the runtime service account
 ```
 
-Cluster JSON Shape
+Runtime service account:
 
-```json
+```text
+Compute permissions required for Prodigy scale-out, replacement, and cleanup in the target project
+```
+
+For the validated live-run model, the runtime service account is created ahead of time and attached to the Prodigy machines.
+
+## Authenticate locally
+
+```bash
+export MOTHERSHIP="${MOTHERSHIP:-./mothership}"
+export RUN_ID="${RUN_ID:-$(date -u +%Y%m%d-%H%M%S)}"
+export GCP_PROJECT="REPLACE_GCP_PROJECT"
+export GCP_ZONE="${GCP_ZONE:-us-central1-a}"
+export GCP_RUNTIME_SERVICE_ACCOUNT="REPLACE_RUNTIME_SERVICE_ACCOUNT@${GCP_PROJECT}.iam.gserviceaccount.com"
+export GCP_PROVIDER_SCOPE="projects/${GCP_PROJECT}/zones/${GCP_ZONE}"
+export BOOTSTRAP_SSH_KEY="REPLACE_PATH_TO_BOOTSTRAP_PRIVATE_KEY"
+
+gcloud auth login
+gcloud config set project "${GCP_PROJECT}"
+gcloud config set compute/zone "${GCP_ZONE}"
+gcloud auth list
+gcloud iam service-accounts list --project "${GCP_PROJECT}"
+```
+
+## Create cluster
+
+```bash
+cat > gcp.cluster.json <<JSON
 {
-  "name": "gcp-3brain-run",
+  "name": "gcp-3brain-${RUN_ID}",
   "deploymentMode": "remote",
   "provider": "gcp",
-  "providerScope": "projects/prodigy-test-260321-0240-1bcc/zones/us-central1-a",
-  "providerCredentialName": "gcp-3brain-run-credential",
+  "providerScope": "${GCP_PROVIDER_SCOPE}",
+  "providerCredentialName": "gcp-3brain-${RUN_ID}-credential",
   "providerCredentialOverride": {
-    "name": "gcp-3brain-run-credential",
+    "name": "gcp-3brain-${RUN_ID}-credential",
     "provider": "gcp",
     "mode": "gcloud",
-    "scope": "projects/prodigy-test-260321-0240-1bcc/zones/us-central1-a",
+    "scope": "${GCP_PROVIDER_SCOPE}",
     "allowPropagateToProdigy": false
   },
   "gcp": {
-    "serviceAccountEmail": "prodigy-machine@prodigy-test-260321-0240-1bcc.iam.gserviceaccount.com",
+    "serviceAccountEmail": "${GCP_RUNTIME_SERVICE_ACCOUNT}",
     "network": "global/networks/default",
     "subnetwork": ""
   },
@@ -81,50 +94,29 @@ Cluster JSON Shape
     }
   ],
   "bootstrapSshUser": "root",
-  "bootstrapSshPrivateKeyPath": "/root/.ssh/id_rsa",
+  "bootstrapSshPrivateKeyPath": "${BOOTSTRAP_SSH_KEY}",
   "remoteProdigyPath": "/root/prodigy",
   "desiredEnvironment": "gcp"
 }
+JSON
+
+time "${MOTHERSHIP}" createCluster "$(cat gcp.cluster.json)"
+"${MOTHERSHIP}" clusterReport "gcp-3brain-${RUN_ID}"
 ```
 
-How To Run
-
-1. Reauth `gcloud` if necessary.
-2. Run `mothership createCluster` with the inline `gcloud` credential override above.
-3. Poll `clusterReport` until all `3` brains are healthy.
-4. Run `removeCluster`.
-5. Delete any instance templates created by the run that `removeCluster` does not clean up automatically.
-
-Timing Artifacts To Capture
-
-- `createCluster.timed.out`
-- `health.timed.out`
-- `clusterReport.final.out`
-- `seed.journal`
-- child journals if scale-out stalls
-
-Cleanup Commands
+## Remove cluster
 
 ```bash
-gcloud compute instances list --project=prodigy-test-260321-0240-1bcc
-gcloud compute instance-templates list --project=prodigy-test-260321-0240-1bcc
+time "${MOTHERSHIP}" removeCluster "gcp-3brain-${RUN_ID}"
 ```
 
-Current Caveat
+## Cleanup verification
 
-- As of `2026-03-24`, GCP’s Ubuntu 24.04 x86 family string for this runbook is `ubuntu-2404-lts-amd64`; the older `ubuntu-2404-lts` family path is stale and fails before provider launch.
-- The remaining GCP work is now optimization and A/B comparison, not correctness. The `20260324-100700` rerun reached healthy on the first `clusterReport` attempt and completed `removeCluster` successfully.
+If a run is interrupted, inspect and remove leftover provider artifacts such as instance templates, disks, static IPs, or VPC objects created for the run.
 
-Latest Measured Checkpoint
-
-- Latest healthy run:
-  - [/root/nametag/.mothership-live-gcp-3brain-matrix-20260324-100700/createCluster.timed.out](/root/nametag/.mothership-live-gcp-3brain-matrix-20260324-100700/createCluster.timed.out)
-  - [/root/nametag/.mothership-live-gcp-3brain-matrix-20260324-100700/createCluster.out](/root/nametag/.mothership-live-gcp-3brain-matrix-20260324-100700/createCluster.out)
-  - [/root/nametag/.mothership-live-gcp-3brain-matrix-20260324-100700/health.timed.out](/root/nametag/.mothership-live-gcp-3brain-matrix-20260324-100700/health.timed.out)
-  - [/root/nametag/.mothership-live-gcp-3brain-matrix-20260324-100700/clusterReport.final.out](/root/nametag/.mothership-live-gcp-3brain-matrix-20260324-100700/clusterReport.final.out)
-  - [/root/nametag/.mothership-live-gcp-3brain-matrix-20260324-100700/removeCluster.timed.out](/root/nametag/.mothership-live-gcp-3brain-matrix-20260324-100700/removeCluster.timed.out)
-- First `upsertMachineSchemas` request envelope: about `59.322s`
-- First healthy `clusterReport` attempt: about `2.430s`
-- Cleanup result:
-  - `removeCluster success=1 removed=1 ... destroyedCreatedCloudMachines=3`
-  - direct post-run GCP recheck showed zero remaining instances and zero remaining Prodigy instance templates
+```bash
+gcloud compute instances list --project "${GCP_PROJECT}" --filter="name~gcp-3brain-${RUN_ID}"
+gcloud compute disks list --project "${GCP_PROJECT}" --filter="name~gcp-3brain-${RUN_ID}"
+gcloud compute instance-templates list --project "${GCP_PROJECT}" --filter="name~gcp-3brain-${RUN_ID}"
+gcloud compute addresses list --project "${GCP_PROJECT}" --filter="name~gcp-3brain-${RUN_ID}"
+```

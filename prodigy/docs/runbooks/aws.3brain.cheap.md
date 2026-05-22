@@ -1,98 +1,107 @@
-AWS Cheap 3-Brain Runbook
+# AWS cheap 3-brain cluster runbook
 
-Scope
+This runbook creates a cheap 3-machine / 3-brain Prodigy cluster on AWS, polls it, and removes it.
 
-- Bring up a fresh remote `3`-machine `3`-brain Prodigy cluster on AWS.
-- Keep cost pinned to the repo-approved low-cost x86 shapes only.
-- Keep the created AWS brains on EC2 instance-profile / IMDS auth only.
+Validated cheap shape: `t3.micro`
+Alternate shape: `t2.micro`
+Validated auth mode: local AWS CLI v2 / IAM Identity Center, then EC2 instance-profile / IMDS for created AWS brains
 
-Cheapest Allowed Shape
+Keep early test runs short. Public IPv4 addresses, disks, launch templates, and stopped instances can continue to bill depending on provider behavior.
 
-- Preferred: `t3.micro`
-- Allowed alternate: `t2.micro`
-- Do not use any larger AWS instance type unless explicitly approved.
+## Requirements
 
-Current Auth Contract
+- Built `mothership` and `prodigy` from this repository.
+- Local AWS CLI v2.
+- Authenticated AWS profile.
+- Bootstrap SSH private key.
+- Ubuntu 24.04 AMI ID for the target region.
+- TCP Fast Open enabled on target hosts.
 
-- The created AWS brains stay on EC2 instance-profile / IMDS auth.
-- A local workstation may run `mothership createCluster` directly with provider credential mode `awsCli`, backed by a short-lived local AWS CLI v2 / SSO session.
-- An EC2 controller host may run the same flow with provider credential mode `awsImds`.
-- Do not inject long-lived static AWS secrets into Prodigy runtime state.
+## Required AWS permissions
 
-Validated Cheap Path
+The controller identity needs enough EC2 and IAM access to create bootstrap capacity, launch templates, and pass the runtime role. The validated runbook uses a controller role/profile named:
 
-- Validated on `2026-03-26`:
-  - local Mothership on this workstation
-  - provider credential mode `awsCli`
-  - remote EC2 instance profile `prodigy-controller-profile`
-  - `t3.micro`
-  - Ubuntu 24.04 x86_64 AMI `ami-04eaa218f1349d88b`
-  - healthy `3`-brain run artifact:
-    - [/root/nametag/.mothership-live-aws-3brain-matrix-20260326-053725/createCluster.timed.out](/root/nametag/.mothership-live-aws-3brain-matrix-20260326-053725/createCluster.timed.out)
+```text
+prodigy-controller-role
+prodigy-controller-profile
+```
 
-Current Required IAM/Profile State
+Minimum practical action set for the validated runbook:
 
-- Known controller instance profile:
-  - `prodigy-controller-profile`
-- Known controller role:
-  - `prodigy-controller-role`
-- The controller/seed role must allow:
-  - `ec2:RunInstances`
-  - `ec2:TerminateInstances`
-  - `ec2:CreateLaunchTemplate`
-  - `ec2:CreateLaunchTemplateVersion`
-  - `ec2:DeleteLaunchTemplate`
-  - `ec2:Describe*`
-  - `iam:PassRole` for the instance profile role attached to created Prodigy VMs
-- A read-only EC2 role is not sufficient.
+```text
+ec2:RunInstances
+ec2:TerminateInstances
+ec2:CreateLaunchTemplate
+ec2:CreateLaunchTemplateVersion
+ec2:DeleteLaunchTemplate
+ec2:Describe*
+iam:PassRole
+```
 
-Known Working Machine Image
+A read-only EC2 role is not sufficient.
 
-- Current Ubuntu 24.04 x86_64 AMI in `us-east-1` as of `2026-03-24`:
-  - `ami-04eaa218f1349d88b`
-- Re-resolve before a new wave if you want the latest:
+## Authenticate locally
 
 ```bash
-python - <<'PY'
-import boto3, json
+export MOTHERSHIP="${MOTHERSHIP:-./mothership}"
+export RUN_ID="${RUN_ID:-$(date -u +%Y%m%d-%H%M%S)}"
+export AWS_PROFILE="${AWS_PROFILE:-prodigy}"
+export AWS_REGION="${AWS_REGION:-us-east-1}"
+export AWS_ACCOUNT_ID="REPLACE_AWS_ACCOUNT_ID"
+export AWS_AMI_ID="REPLACE_UBUNTU_24_04_AMI_ID"
+export BOOTSTRAP_SSH_KEY="REPLACE_PATH_TO_BOOTSTRAP_PRIVATE_KEY"
+
+aws configure sso --profile "${AWS_PROFILE}"
+aws sso login --profile "${AWS_PROFILE}"
+aws sts get-caller-identity --profile "${AWS_PROFILE}"
+```
+
+To re-resolve the Ubuntu 24.04 AMI used by the runbook:
+
+```bash
+python - <<'PY_AWS_AMI'
+import boto3
 session = boto3.Session(region_name='us-east-1')
 ec2 = session.client('ec2')
 images = ec2.describe_images(
-   Owners=['099720109477'],
-   Filters=[
-      {'Name': 'name', 'Values': ['ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*']},
-      {'Name': 'architecture', 'Values': ['x86_64']},
-      {'Name': 'state', 'Values': ['available']},
-   ],
+    Owners=['099720109477'],
+    Filters=[
+        {'Name': 'name', 'Values': ['ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*']},
+        {'Name': 'architecture', 'Values': ['x86_64']},
+        {'Name': 'state', 'Values': ['available']},
+    ],
 )['Images']
 images.sort(key=lambda x: x['CreationDate'])
 print(images[-1]['ImageId'])
-PY
+PY_AWS_AMI
 ```
 
-Cluster JSON Shape For Local Mothership
+## Create provider credential
 
-Create a short-lived local bootstrap credential first:
-
-```json
+```bash
+cat > aws.credential.json <<JSON
 {
-  "name": "aws-3brain-run-credential",
+  "name": "aws-3brain-${RUN_ID}-credential",
   "provider": "aws",
   "mode": "awsCli",
-  "scope": "062397142164/us-east-1",
+  "scope": "${AWS_ACCOUNT_ID}/${AWS_REGION}",
   "allowPropagateToProdigy": false
 }
+JSON
+
+"${MOTHERSHIP}" createProviderCredential "$(cat aws.credential.json)"
 ```
 
-Then create the cluster with that named credential:
+## Create cluster
 
-```json
+```bash
+cat > aws.cluster.json <<JSON
 {
-  "name": "aws-3brain-run",
+  "name": "aws-3brain-${RUN_ID}",
   "deploymentMode": "remote",
   "provider": "aws",
-  "providerScope": "062397142164/us-east-1",
-  "providerCredentialName": "aws-3brain-run-credential",
+  "providerScope": "${AWS_ACCOUNT_ID}/${AWS_REGION}",
+  "providerCredentialName": "aws-3brain-${RUN_ID}-credential",
   "aws": {
     "instanceProfileName": "prodigy-controller-profile"
   },
@@ -109,64 +118,43 @@ Then create the cluster with that named credential:
       "schema": "t3.micro",
       "kind": "vm",
       "lifetime": "ondemand",
-      "vmImageURI": "ami-04eaa218f1349d88b",
+      "vmImageURI": "${AWS_AMI_ID}",
       "providerMachineType": "t3.micro",
       "budget": 3
     }
   ],
   "bootstrapSshUser": "root",
-  "bootstrapSshPrivateKeyPath": "/root/.ssh/prodigy_aws_test_ed25519",
+  "bootstrapSshPrivateKeyPath": "${BOOTSTRAP_SSH_KEY}",
   "remoteProdigyPath": "/root/prodigy",
   "desiredEnvironment": "aws"
 }
+JSON
+
+time "${MOTHERSHIP}" createCluster "$(cat aws.cluster.json)"
+"${MOTHERSHIP}" clusterReport "aws-3brain-${RUN_ID}"
 ```
 
-How To Run From A Local Workstation
-
-1. Refresh local AWS CLI auth with `aws sso login`.
-2. Create the bootstrap provider credential with mode `awsCli`.
-3. Run `mothership createCluster` locally with the cluster JSON above.
-4. Poll `clusterReport` until `topologyMachines: 3` and all `3` brains report healthy.
-5. Run `removeCluster`.
-6. Run `removeProviderCredential`.
-7. Verify no tagged test instances or volumes remain.
-
-Alternate Controller-Host Path
-
-- If you deliberately run `mothership createCluster` on an EC2 controller host that already has `prodigy-controller-profile`, switch the bootstrap provider credential mode to `awsImds`.
-
-Timing Artifacts To Capture
-
-- `createCluster.timed.out`
-- `health.timed.out`
-- `clusterReport.final.out`
-- `seed.journal`
-- follower journals if the run stalls
-
-Cleanup Checks
+## Remove cluster
 
 ```bash
-python - <<'PY'
-import boto3, json
-session = boto3.Session(region_name='us-east-1')
-ec2 = session.client('ec2')
-resp = ec2.describe_instances(Filters=[{'Name': 'tag:app', 'Values': ['prodigy', 'prodigy-controller']}])
-instances = []
-for r in resp.get('Reservations', []):
-   for i in r.get('Instances', []):
-      if i['State']['Name'] != 'terminated':
-         instances.append({'InstanceId': i['InstanceId'], 'State': i['State']['Name']})
-print(json.dumps(instances, indent=2))
-PY
+time "${MOTHERSHIP}" removeCluster "aws-3brain-${RUN_ID}"
+"${MOTHERSHIP}" removeProviderCredential "aws-3brain-${RUN_ID}-credential"
 ```
 
-Cost Notes
+## Cleanup verification
 
-- Even on `t2.micro` or `t3.micro`, public IPv4 is billed separately on AWS.
-- Keep runs short, tear down immediately, and verify cleanup every time.
-- Do not leave controller hosts running after the measurement wave.
+Check for tagged residual instances and volumes after removal:
 
-Current Caveats
+```bash
+aws ec2 describe-instances \
+  --profile "${AWS_PROFILE}" \
+  --region "${AWS_REGION}" \
+  --filters "Name=tag:prodigyCluster,Values=aws-3brain-${RUN_ID}" \
+  --output json
 
-- The managed AWS path depends on the controller/seed instance profile having real EC2 create/terminate and `iam:PassRole` permissions.
-- If the controller role still simulates as implicit deny for those actions, fix IAM first and do not launch.
+aws ec2 describe-volumes \
+  --profile "${AWS_PROFILE}" \
+  --region "${AWS_REGION}" \
+  --filters "Name=tag:prodigyCluster,Values=aws-3brain-${RUN_ID}" \
+  --output json
+```

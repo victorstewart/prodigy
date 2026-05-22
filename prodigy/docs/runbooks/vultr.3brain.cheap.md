@@ -1,54 +1,73 @@
-Vultr Cheap 3-Brain Runbook
+# Vultr cheap 3-brain cluster runbook
 
-Scope
+This runbook creates a cheap 3-machine / 3-brain Prodigy cluster on Vultr, polls it, and removes it.
 
-- Bring up a fresh remote `3`-machine `3`-brain Prodigy cluster on Vultr.
-- Use the cheapest validated VM shape for this repo’s Vultr live work.
+Validated cheap shape: `vx1-g-2c-8g`
+Validated region: `ewr`
+Validated image: `os:2284`
+Validated auth mode: static Vultr API key in a local ignored environment file
 
-Cheapest Validated Shape
+Keep early test runs short. Instances, VPCs, block storage, snapshots, and IP addresses can continue to bill depending on provider behavior.
 
-- `vx1-g-2c-8g`
+## Requirements
 
-Auth Contract
+- Built `mothership` and `prodigy` from this repository.
+- Vultr API key.
+- `curl` and `jq` for local API checks.
+- Bootstrap SSH private key.
+- TCP Fast Open enabled on target hosts.
 
-- Vultr automation is API-key based.
-- In this repo, Vultr uses propagated static credential material.
-- Keep the key only in a local ignored shell file such as `.env.vultr`.
+## Required Vultr permissions
 
-Expected Local Credential File
+Vultr API keys are account-level credentials. Store them carefully, restrict allowed source IPs through Vultr API access controls where possible, and prefer a dedicated account/sub-account for automation.
 
-```bash
-export VULTR_API_KEY='REPLACE_ME'
+The Prodigy Vultr path needs API access to manage:
+
+```text
+instances
+VPCs / private networking
+SSH keys or bootstrap metadata used by the run
+block storage cleanup checks, when applicable
+account metadata required by the provider adapter
 ```
 
-Important Networking Contract
+## Authenticate locally
 
-- VM-to-VM private networking on Vultr requires VPC attachment.
-- If the deployment mixes VMs and bare metal, both sides must be attached to the same VPC for private east-west communication.
-- Size the VPC subnet with headroom for the largest cluster you might ever place there.
+```bash
+export MOTHERSHIP="${MOTHERSHIP:-./mothership}"
+export RUN_ID="${RUN_ID:-$(date -u +%Y%m%d-%H%M%S)}"
+export BOOTSTRAP_SSH_KEY="REPLACE_PATH_TO_BOOTSTRAP_PRIVATE_KEY"
 
-Known Good Image And Scope
+cat > .env.vultr <<'EOF_VULTR'
+export VULTR_API_KEY='REPLACE_ME'
+EOF_VULTR
 
-- Region:
-  - `ewr`
-- Image:
-  - `os:2284`
+chmod 0600 .env.vultr
+source .env.vultr
 
-Cluster JSON Shape
+curl -fsS \
+  -H "Authorization: Bearer ${VULTR_API_KEY}" \
+  https://api.vultr.com/v2/account | jq .
+```
 
-```json
+## Create cluster
+
+The Vultr runbook uses propagated static credential material because runtime machines need provider API access for the Vultr control path.
+
+```bash
+cat > vultr.cluster.json <<JSON
 {
-  "name": "vultr-3brain-run",
+  "name": "vultr-3brain-${RUN_ID}",
   "deploymentMode": "remote",
   "provider": "vultr",
   "architecture": "x86_64",
   "providerScope": "ewr",
-  "providerCredentialName": "vultr-3brain-run-credential",
+  "providerCredentialName": "vultr-3brain-${RUN_ID}-credential",
   "providerCredentialOverride": {
-    "name": "vultr-3brain-run-credential",
+    "name": "vultr-3brain-${RUN_ID}-credential",
     "provider": "vultr",
     "mode": "staticMaterial",
-    "material": "REPLACE_WITH_VULTR_API_KEY",
+    "material": "${VULTR_API_KEY}",
     "scope": "ewr",
     "allowPropagateToProdigy": true
   },
@@ -71,66 +90,34 @@ Cluster JSON Shape
     }
   ],
   "bootstrapSshUser": "root",
-  "bootstrapSshPrivateKeyPath": "/root/.ssh/id_rsa",
+  "bootstrapSshPrivateKeyPath": "${BOOTSTRAP_SSH_KEY}",
   "remoteProdigyPath": "/root/prodigy",
   "desiredEnvironment": "vultr"
 }
+JSON
+
+time "${MOTHERSHIP}" createCluster "$(cat vultr.cluster.json)"
+"${MOTHERSHIP}" clusterReport "vultr-3brain-${RUN_ID}"
 ```
 
-How To Run
-
-1. `source .env.vultr`
-2. Confirm the account is clean before launch:
-   - `instances=0`
-   - `blocks=0`
-   - `vpcs=0`
-3. Run `mothership createCluster` with the JSON above.
-4. Poll `clusterReport` until all `3` brains are healthy.
-5. Run `removeCluster`.
-6. Recheck `instances`, `blocks`, and `vpcs`.
-
-Timing Artifacts To Capture
-
-- `createCluster.timed.out`
-- `health.timed.out`
-- `clusterReport.final.out`
-- `seed.journal`
-- follower journals if scale-out stalls
-
-Cleanup Checks
+## Remove cluster
 
 ```bash
-python - <<'PY'
-import os, json, urllib.request
-key = os.environ['VULTR_API_KEY']
-for path in ['instances', 'blocks', 'vpcs']:
-   req = urllib.request.Request(
-      f'https://api.vultr.com/v2/{path}',
-      headers={'Authorization': f'Bearer {key}'},
-   )
-   with urllib.request.urlopen(req, timeout=20) as r:
-      print(path, r.read().decode())
-PY
+time "${MOTHERSHIP}" removeCluster "vultr-3brain-${RUN_ID}"
 ```
 
-Current Caveats
+## Cleanup verification
 
-- Vultr VPC creation has intermittently failed with a generic `vultr vpc create failed` error even when the equivalent direct API call succeeds.
-- If that recurs, inspect the run artifact and confirm whether precreating the expected managed VPC is still required as a temporary workaround.
-- Older healthy runs exposed a teardown bug where `removeCluster` hung and left a VM plus the managed VPC behind.
-- The latest rerun below completed `removeCluster` successfully and ended with a direct clean Vultr API recheck, but keep the final cleanup recheck in the loop because this provider has been flaky.
-
-Latest Measured Result
-
-- Latest healthy `3`-brain live run:
-  - [/root/nametag/.mothership-live-vultr-3brain-stream-20260326-170053/createCluster.timed.out](/root/nametag/.mothership-live-vultr-3brain-stream-20260326-170053/createCluster.timed.out)
-  - [/root/nametag/.mothership-live-vultr-3brain-stream-20260326-170053/health.timed.out](/root/nametag/.mothership-live-vultr-3brain-stream-20260326-170053/health.timed.out)
-  - [/root/nametag/.mothership-live-vultr-3brain-stream-20260326-170053/clusterReport.final.out](/root/nametag/.mothership-live-vultr-3brain-stream-20260326-170053/clusterReport.final.out)
-  - [/root/nametag/.mothership-live-vultr-3brain-stream-20260326-170053/removeCluster.timed.out](/root/nametag/.mothership-live-vultr-3brain-stream-20260326-170053/removeCluster.timed.out)
-  - [/root/nametag/.mothership-live-vultr-3brain-stream-20260326-170053/postCleanup.final.instances.json](/root/nametag/.mothership-live-vultr-3brain-stream-20260326-170053/postCleanup.final.instances.json)
-  - [/root/nametag/.mothership-live-vultr-3brain-stream-20260326-170053/postCleanup.final.blocks.json](/root/nametag/.mothership-live-vultr-3brain-stream-20260326-170053/postCleanup.final.blocks.json)
-  - [/root/nametag/.mothership-live-vultr-3brain-stream-20260326-170053/postCleanup.final.vpcs.json](/root/nametag/.mothership-live-vultr-3brain-stream-20260326-170053/postCleanup.final.vpcs.json)
-- `createCluster` wall time: about `108.733s`
-- `clusterReport` healthy convergence: first poll attempt, about `4.069s` after `createCluster` returned
-- `removeCluster`: about `73.161s`
-- This run still required precreating the expected managed VPC before `createCluster`.
+```bash
+python - <<'PY_VULTR_CLEANUP'
+import os, urllib.request
+key = os.environ['VULTR_API_KEY']
+for path in ['instances', 'blocks', 'vpcs']:
+    req = urllib.request.Request(
+        f'https://api.vultr.com/v2/{path}',
+        headers={'Authorization': f'Bearer {key}'},
+    )
+    with urllib.request.urlopen(req, timeout=20) as r:
+        print(path, r.read().decode())
+PY_VULTR_CLEANUP
+```
