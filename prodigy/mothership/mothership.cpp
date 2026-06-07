@@ -10672,7 +10672,9 @@ private:
       // Reserve for serialized plan
       socket.wBuffer.reserve(socket.wBuffer.size() + 1024);
       uint32_t headerOffset = Message::appendHeader(socket.wBuffer, MothershipTopic::measureApplication);
-      Message::serializeAndAppendObject(socket.wBuffer, plan);
+      String serializedPlan;
+      BitseryEngine::serialize(serializedPlan, plan);
+      Message::appendValue(socket.wBuffer, serializedPlan);
       Message::finish(socket.wBuffer, headerOffset);
       debugLog("measure_serialized");
 
@@ -10730,7 +10732,7 @@ private:
       socket.wBuffer.reserve(socket.wBuffer.size() + 1024);
       uint32_t spinHeaderOffset = Message::appendHeader(socket.wBuffer, MothershipTopic::spinApplication);
       Message::append(socket.wBuffer, plan.config.applicationID);
-      Message::serializeAndAppendObject(socket.wBuffer, plan);
+      Message::appendValue(socket.wBuffer, serializedPlan);
       debugLog("spin_plan_serialized");
       Message::appendFile(socket.wBuffer, containerPath);
       debugLog("spin_blob_appended");

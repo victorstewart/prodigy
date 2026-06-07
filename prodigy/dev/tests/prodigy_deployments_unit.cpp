@@ -2712,6 +2712,15 @@ int main(void)
     Message::finish(messageBuffer, headerOffset);
     suite.expect(messageBuffer.size() >= sizeof(Message), "deployment_plan_mesh_message_serializes");
 
+    Message *message = reinterpret_cast<Message *>(messageBuffer.data());
+    uint8_t *args = message->args;
+    String payload;
+    Message::extractToStringView(args, payload);
+    DeploymentPlan messageRoundtrip {};
+    const bool messageDecoded = BitseryEngine::deserializeSafe(payload, messageRoundtrip);
+    suite.expect(messageDecoded, "deployment_plan_mesh_message_deserializes");
+    suite.expect(messageRoundtrip.advertisements.size() == 1, "deployment_plan_mesh_message_preserves_advertisement");
+
     String stagedMessageBuffer;
     const uint32_t stagedHeaderOffset = Message::appendHeader(stagedMessageBuffer, MothershipTopic::measureApplication);
     String stagedSerializedPlan;
