@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/prodigy-logo.avif" alt="Prodigy logo" width="260">
+</p>
+
 # Prodigy
 
 **A vertically integrated orchestration runtime for containers, machines, agents, databases, and high-density services.**
