@@ -51,8 +51,8 @@ __attribute__((__always_inline__)) static inline bool parse_quic(struct containe
     struct quic_long_header *lheader = (struct quic_long_header *)quic_data;
     __u8 packet_type = (*pkt_type & QUIC_V1_PACKET_TYPE_MASK);
 
-    // Post draft version 22, this byte is the conn id length of dest conn id
-    if (lheader->conn_id_lens < QUIC_V1_MIN_CID_LEN)
+    // Prodigy CIDs use one exact fixed-size schema.
+    if (lheader->conn_id_lens != QUIC_CID_LEN)
     {
       return false;
     }

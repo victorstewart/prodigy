@@ -1,6 +1,7 @@
 #include <networking/includes.h>
 #include <services/debug.h>
 
+#include <ebpf/common/structs.h>
 #include <ebpf/kernel/aes.h>
 
 #include <prodigy/quic.cid.generator.h>
@@ -131,6 +132,9 @@ static bool decryptAndValidateIPv6CID(
 int main(void)
 {
   TestSuite suite = {};
+
+  suite.expect(QUIC_CID_LEN == 16,
+               "quic_cid_schema_length_is_16_bytes");
 
   const uint8_t key0[16] = {
       0x00,

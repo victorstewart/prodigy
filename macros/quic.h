@@ -11,8 +11,6 @@
 #define QUIC_V1_RETRY 0x30
 #define QUIC_V1_PACKET_TYPE_MASK 0x30
 
-// Require connection IDs to be at least this long before attempting Prodigy's CID parsing.
-#define QUIC_V1_MIN_CID_LEN 8
 #define QUIC_CID_VERSION 0x1
 #define QUIC_V1_CID_TAG_SEED0 0x6f9d5a1cu
 #define QUIC_V1_CID_TAG_SEED1 0x91b34e27u

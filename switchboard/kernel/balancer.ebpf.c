@@ -80,40 +80,6 @@ __attribute__((__always_inline__)) static inline bool ownedRoutablePrefixesConta
   return bpf_map_lookup_elem(&owned_routable_prefixes6, &key) != NULL;
 }
 
-__attribute__((__always_inline__)) static inline int ourSubnetsContainDaddr(struct ethhdr *eth, void *data_end)
-{
-  if ((void *)(eth + 1) > data_end)
-  {
-    return 0;
-  }
-
-  if (eth->h_proto == BE_ETH_P_IP)
-  {
-    struct iphdr *iph = (struct iphdr *)(eth + 1);
-
-    if ((void *)(iph + 1) > data_end)
-    {
-      return 0;
-    }
-
-    __u32 dest_ip = iph->daddr;
-    return ownedRoutablePrefixesContainIPv4(dest_ip) ? 1 : 0;
-  }
-  else if (eth->h_proto == BE_ETH_P_IPV6)
-  {
-    struct ipv6hdr *ip6h = (struct ipv6hdr *)(eth + 1);
-
-    if ((void *)(ip6h + 1) > data_end)
-    {
-      return 0;
-    }
-
-    return (containsContainerNetworkIPv6(ip6h->daddr.s6_addr32) || ownedRoutablePrefixesContainIPv6(ip6h->daddr.s6_addr32)) ? 1 : 0;
-  }
-
-  return 0;
-}
-
 __attribute__((__always_inline__)) static inline struct switchboard_overlay_machine_route *balancerLookupOverlayMachineRouteByFragment(__u32 machine_fragment)
 {
   if (machine_fragment == 0)
@@ -358,11 +324,13 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
   {
     portal_meta = bpf_map_lookup_elem(&external_portals, &portal); // check if this is an open portal
   }
+
+  bool destination_is_owned_routable = is_ipv6 ? ownedRoutablePrefixesContainIPv6(pckt.flow.dstv6) : ownedRoutablePrefixesContainIPv4(pckt.flow.dst);
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
   struct local_container_subnet6 *localcontainersubnet6 = bpf_map_lookup_elem(&local_container_subnet_map, &zeroidx);
   bool direct_fake_delivery = false;
 
-  if (!portal_meta && !is_ipv6 && localcontainersubnet6 && ownedRoutablePrefixesContainIPv4(pckt.flow.dst))
+  if (!portal_meta && !is_ipv6 && localcontainersubnet6 && destination_is_owned_routable)
   {
     direct_fake_delivery = set_container_id_from_routable_ipv4(&containerID, pckt.flow.dst, localcontainersubnet6);
     if (direct_fake_delivery)
@@ -370,7 +338,7 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
       bump_dev_fake_route_stat(0);
     }
   }
-  else if (!portal_meta && is_ipv6 && localcontainersubnet6 && ownedRoutablePrefixesContainIPv6(pckt.flow.dstv6))
+  else if (!portal_meta && is_ipv6 && localcontainersubnet6 && destination_is_owned_routable)
   {
     direct_fake_delivery = set_container_id_from_routable_ipv6(&containerID, pckt.flow.dstv6, localcontainersubnet6);
     if (direct_fake_delivery)
@@ -380,11 +348,8 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
   }
 #endif
 
-  // this isn't a /32 or /128 we balance, so pass to kernel
-  // possibly contained witin a prefix we own, destined for a container using a unicast as a public address
-  // or could be container to container traffic
-  // or inter neuron traffic over the private ipv4..
-  // or junk.. regardless pass it to the kernel
+  // Unknown public ingress fails closed. Unknown private/container/control traffic
+  // stays on the existing host path.
 
   setCheckpoint("process_packet: checkpoint 1"); // they're being passed right here... which means a problem with the external_portals
 
@@ -398,6 +363,11 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
     bump_dev_fake_route_stat(2);
 #endif
     setCheckpoint("process_packet: !portal_meta");
+    if (destination_is_owned_routable)
+    {
+      return XDP_DROP;
+    }
+
     return XDP_PASS;
   }
 
@@ -430,7 +400,7 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
       }
       else if (allow_hash_fallback == false) // only Initial and 0-RTT may fall back to tuple hashing
       {
-        return XDP_DROP; // either packet too short or connectionID too short
+        return XDP_DROP; // either packet too short or CID length/authentication is invalid
       }
     }
     else if (!(pckt.flags & F_SYN_SET)) // TCP, so check in lru_cache
@@ -554,24 +524,38 @@ int balancer_ingress(struct xdp_md *xdp)
   void *data = (void *)(long)xdp->data;
   void *data_end = (void *)(long)xdp->data_end;
 
-  bool destination_is_ours = (ourSubnetsContainDaddr((struct ethhdr *)data, data_end) == 1);
-
-  if (destination_is_ours)
+  struct ethhdr *eth = data;
+  if ((void *)(eth + 1) > data_end)
   {
-    if (data + sizeof(struct ethhdr) > data_end)
+    return XDP_DROP;
+  }
+
+  __u32 eth_proto = eth->h_proto;
+
+  if (eth_proto == BE_ETH_P_IP)
+  {
+    struct iphdr *iph = (struct iphdr *)(eth + 1);
+
+    if ((void *)(iph + 1) > data_end)
     {
       return XDP_DROP;
     }
 
-    struct ethhdr *eth = data;
-
-    __u32 eth_proto = eth->h_proto;
-
-    if (eth_proto == BE_ETH_P_IP)
+    if (ownedRoutablePrefixesContainIPv4(iph->daddr))
     {
       return process_packet(xdp, sizeof(struct ethhdr), false);
     }
-    else if (eth_proto == BE_ETH_P_IPV6)
+  }
+  else if (eth_proto == BE_ETH_P_IPV6)
+  {
+    struct ipv6hdr *ip6h = (struct ipv6hdr *)(eth + 1);
+
+    if ((void *)(ip6h + 1) > data_end)
+    {
+      return XDP_DROP;
+    }
+
+    if (containsContainerNetworkIPv6(ip6h->daddr.s6_addr32) || ownedRoutablePrefixesContainIPv6(ip6h->daddr.s6_addr32))
     {
       return process_packet(xdp, sizeof(struct ethhdr), true);
     }
