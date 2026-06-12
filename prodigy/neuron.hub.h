@@ -49,6 +49,8 @@ private:
   uint16_t pendingResourceDeltaCores = 0;
   uint32_t pendingResourceDeltaMemoryMB = 0;
   uint32_t pendingResourceDeltaStorageMB = 0;
+  bool pendingInitialCredentialApplyAck = false;
+  TlsResumptionApplyAck pendingInitialTlsResumptionApplyAck;
 
   bool queuePackedFrame(ContainerTopic topic, const String& payload)
   {
@@ -193,6 +195,7 @@ public:
   UnixStream neuron;
   ContainerParameters parameters;
   Statistics statistics;
+  ProdigyResumptionRegistry tlsResumptionRegistry;
 
   void queueSendToNeuron(void)
   {
@@ -401,6 +404,7 @@ public:
       (void)close(dumpFD);
     }
 
+    applyInitialCredentialBundleLocally();
     takeNeuronUnixPairHalf(parameters.neuronFD); // already open
   }
 
@@ -412,6 +416,7 @@ public:
     installListenerIfReady();
     writeNeuronStage("worker:neuron:afterRing-install-neuron");
     installNeuronIfReady();
+    flushPendingInitialCredentialApplyAck();
     writeNeuronStage("worker:neuron:afterRing-done");
   }
 
@@ -497,6 +502,51 @@ public:
     (void)queueEmptyFrame(ContainerTopic::credentialsRefresh);
   }
 
+  void acknowledgeCredentialsRefresh(const TlsResumptionApplyAck& result)
+  {
+    String payload;
+    if (ProdigyWire::serializeTlsResumptionApplyAck(payload, result))
+    {
+      (void)queuePackedFrame(ContainerTopic::credentialsRefresh, payload);
+    }
+  }
+
+  bool applyCredentialBundleLocally(const CredentialBundle& bundle, TlsResumptionApplyAck& result)
+  {
+    return applyCredentialBundleResumptionLocally(tlsResumptionRegistry, bundle, result);
+  }
+
+  bool applyCredentialDeltaLocally(const CredentialDelta& delta, TlsResumptionApplyAck& result)
+  {
+    parameters.hasCredentialBundle = true;
+    return applyCredentialDeltaResumptionLocally(tlsResumptionRegistry, parameters.credentialBundle, delta, result);
+  }
+
+  bool applyInitialCredentialBundleLocally(void)
+  {
+    pendingInitialCredentialApplyAck = false;
+    pendingInitialTlsResumptionApplyAck = {};
+    if (parameters.hasCredentialBundle == false)
+    {
+      return false;
+    }
+
+    pendingInitialCredentialApplyAck = applyCredentialBundleLocally(parameters.credentialBundle, pendingInitialTlsResumptionApplyAck);
+    return pendingInitialCredentialApplyAck;
+  }
+
+  void flushPendingInitialCredentialApplyAck(void)
+  {
+    if (pendingInitialCredentialApplyAck == false)
+    {
+      return;
+    }
+
+    acknowledgeCredentialsRefresh(pendingInitialTlsResumptionApplyAck);
+    pendingInitialCredentialApplyAck = false;
+    pendingInitialTlsResumptionApplyAck = {};
+  }
+
   template <typename MetricPairs>
   void publishStatistics(const MetricPairs& metricPairs)
   {
@@ -549,7 +599,7 @@ public:
           uint32_t graceSeconds = 0;
           pendingResourceDeltaValid = false;
 
-          if (ProdigyWire::deserializeResourceDeltaPayloadAuto(
+          if (ProdigyWire::deserializeResourceDeltaPayload(
                   args,
                   uint64_t(terminal - args),
                   nLogicalCores,
@@ -577,7 +627,7 @@ public:
           uint16_t applicationID = 0;
           bool activate = false;
 
-          if (ProdigyWire::deserializeAdvertisementPairingPayloadAuto(
+          if (ProdigyWire::deserializeAdvertisementPairingPayload(
                   args,
                   uint64_t(terminal - args),
                   secret,
@@ -608,7 +658,7 @@ public:
           uint16_t applicationID = 0;
           bool activate = false;
 
-          if (ProdigyWire::deserializeSubscriptionPairingPayloadAuto(
+          if (ProdigyWire::deserializeSubscriptionPairingPayload(
                   args,
                   uint64_t(terminal - args),
                   secret,
@@ -667,8 +717,14 @@ public:
           }
 
           CredentialDelta delta;
-          if (ProdigyWire::deserializeCredentialDeltaFramePayloadAuto(args, uint64_t(terminal - args), delta))
+          if (ProdigyWire::deserializeCredentialDeltaFramePayload(args, uint64_t(terminal - args), delta))
           {
+            TlsResumptionApplyAck result = {};
+            bool hasTypedResumptionAck = applyCredentialDeltaLocally(delta, result);
+            if (hasTypedResumptionAck)
+            {
+              acknowledgeCredentialsRefresh(result);
+            }
             target->credentialsRefresh(delta);
           }
 

@@ -95,12 +95,19 @@ async function main(): Promise<void>
    assert.equal(bundle.bundleGeneration, 101n)
    assert.equal(bundle.tlsIdentities[0]?.name, "demo-cert")
    assert.equal(bundle.apiCredentials[0]?.metadata.get("scope"), "demo")
+   assert.equal(bundle.tlsResumptionSnapshots.length, 1)
+   assert.equal(bundle.tlsResumptionSnapshots[0]?.generation, 103n)
+   assert.equal(bundle.tlsResumptionSnapshots[0]?.wormholeName, "public-api-quic")
+   assert.equal(bundle.tlsResumptionSnapshots[0]?.keyRing.length, 1)
 
    const delta = sdk.decodeCredentialDelta(fixtureBytes("startup.credential_delta.full.bin"))
    assert.equal(delta.bundleGeneration, 102n)
    assert.deepEqual(delta.removedTLSNames, ["legacy-cert"])
    assert.deepEqual(delta.removedAPINames, ["legacy-token"])
    assert.equal(delta.reason, "fixture-rotation")
+   assert.equal(delta.updatedResumptionSnapshots.length, 1)
+   assert.equal(delta.updatedResumptionSnapshots[0]?.generation, 104n)
+   assert.deepEqual(delta.removedResumptionWormholeNames, ["legacy-public-api-quic"])
 
    const parameters = sdk.decodeContainerParameters(fixtureBytes("startup.container_parameters.full.bin"))
    assert.equal(parameters.memoryMB, 1536)
@@ -109,6 +116,7 @@ async function main(): Promise<void>
    assert.equal(parameters.advertisementPairings[0]?.applicationId, 0x3344)
    assert.equal(parameters.datacenterUniqueTag, 23)
    assert.equal(parameters.credentialBundle?.bundleGeneration, 101n)
+   assert.equal(parameters.credentialBundle?.tlsResumptionSnapshots.length, 1)
 
    const currentParameters = sdk.decodeContainerParameters(encodeCurrentDemoContainerParameters())
    assert.equal(currentParameters.memoryMB, 1024)

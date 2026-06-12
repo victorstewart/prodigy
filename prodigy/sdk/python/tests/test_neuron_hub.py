@@ -76,12 +76,19 @@ def test_fixture_decoders() -> prodigy.ContainerParameters:
    assert bundle.bundle_generation == 101
    assert bundle.tls_identities[0].name == "demo-cert"
    assert bundle.api_credentials[0].metadata["scope"] == "demo"
+   assert len(bundle.tls_resumption_snapshots) == 1
+   assert bundle.tls_resumption_snapshots[0].generation == 103
+   assert bundle.tls_resumption_snapshots[0].wormhole_name == "public-api-quic"
+   assert len(bundle.tls_resumption_snapshots[0].key_ring) == 1
 
    delta = prodigy.decode_credential_delta(fixture_bytes("startup.credential_delta.full.bin"))
    assert delta.bundle_generation == 102
    assert delta.removed_tls_names == ["legacy-cert"]
    assert delta.removed_api_names == ["legacy-token"]
    assert delta.reason == "fixture-rotation"
+   assert len(delta.updated_resumption_snapshots) == 1
+   assert delta.updated_resumption_snapshots[0].generation == 104
+   assert delta.removed_resumption_wormhole_names == ["legacy-public-api-quic"]
 
    params = prodigy.decode_container_parameters(fixture_bytes("startup.container_parameters.full.bin"))
    assert params.memory_mb == 1536
@@ -91,6 +98,7 @@ def test_fixture_decoders() -> prodigy.ContainerParameters:
    assert params.datacenter_unique_tag == 23
    assert params.credential_bundle is not None
    assert params.credential_bundle.bundle_generation == 101
+   assert len(params.credential_bundle.tls_resumption_snapshots) == 1
 
    current_params = prodigy.decode_container_parameters(encode_demo_current_container_parameters())
    assert current_params.memory_mb == 1024

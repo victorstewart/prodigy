@@ -1872,6 +1872,34 @@ static inline void prodigyClearPersistentSecretString(String& value)
   Vault::secureClearString(value);
 }
 
+static inline void prodigyClearPersistentSecretBytes(uint8_t *bytes, size_t size)
+{
+  if (bytes == nullptr || size == 0)
+  {
+    return;
+  }
+
+  uint8_t volatile *cursor = bytes;
+  while (size > 0)
+  {
+    *cursor++ = 0;
+    size -= 1;
+  }
+}
+
+static inline bool prodigyPersistentSecretBytesAreZero(const uint8_t *bytes, size_t size)
+{
+  for (size_t index = 0; index < size; index += 1)
+  {
+    if (bytes[index] != 0)
+    {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 static inline void prodigyClearPersistentSSHPrivateKey(Vault::SSHKeyPackage& package)
 {
   prodigyClearPersistentSecretString(package.privateKeyOpenSSH);
@@ -2019,6 +2047,35 @@ static void serialize(S&& serializer, ProdigyPersistentApplicationApiCredentialS
   serializer.object(secrets.credentials);
 }
 
+class ProdigyPersistentTlsResumptionEpochSecret {
+public:
+
+  String registryKey;
+  uint64_t generation = 0;
+  uint8_t keyID[16] = {};
+  uint8_t masterSecret[32] = {};
+
+  void clear(void)
+  {
+    prodigyClearPersistentSecretBytes(masterSecret, sizeof(masterSecret));
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyPersistentTlsResumptionEpochSecret& secret)
+{
+  serializer.text1b(secret.registryKey, UINT32_MAX);
+  serializer.value8b(secret.generation);
+  for (uint8_t& byte : secret.keyID)
+  {
+    serializer.value1b(byte);
+  }
+  for (uint8_t& byte : secret.masterSecret)
+  {
+    serializer.value1b(byte);
+  }
+}
+
 class ProdigyPersistentPendingAddMachinesOperationSecrets {
 public:
 
@@ -2054,12 +2111,13 @@ public:
   String reporterPassword;
   bytell_hash_map<uint16_t, ProdigyPersistentApplicationTlsVaultFactorySecrets> tlsVaultFactorySecretsByApp;
   bytell_hash_map<uint16_t, ProdigyPersistentApplicationApiCredentialSetSecrets> apiCredentialSecretsByApp;
+  Vector<ProdigyPersistentTlsResumptionEpochSecret> tlsResumptionEpochSecrets;
   String transportTLSAuthorityClusterRootKeyPem;
   Vector<ProdigyPersistentPendingAddMachinesOperationSecrets> pendingAddMachinesOperationSecrets;
 
   bool empty(void) const
   {
-    return bootstrapSshPrivateKeyOpenSSH.size() == 0 && bootstrapSshHostPrivateKeyOpenSSH.size() == 0 && reporterPassword.size() == 0 && tlsVaultFactorySecretsByApp.empty() && apiCredentialSecretsByApp.empty() && transportTLSAuthorityClusterRootKeyPem.size() == 0 && pendingAddMachinesOperationSecrets.empty();
+    return bootstrapSshPrivateKeyOpenSSH.size() == 0 && bootstrapSshHostPrivateKeyOpenSSH.size() == 0 && reporterPassword.size() == 0 && tlsVaultFactorySecretsByApp.empty() && apiCredentialSecretsByApp.empty() && tlsResumptionEpochSecrets.empty() && transportTLSAuthorityClusterRootKeyPem.size() == 0 && pendingAddMachinesOperationSecrets.empty();
   }
 
   void clear(void)
@@ -2081,6 +2139,11 @@ public:
       credentialSecrets.clear();
     }
 
+    for (auto& epochSecret : tlsResumptionEpochSecrets)
+    {
+      epochSecret.clear();
+    }
+
     for (auto& operationSecrets : pendingAddMachinesOperationSecrets)
     {
       operationSecrets.clear();
@@ -2088,6 +2151,7 @@ public:
 
     tlsVaultFactorySecretsByApp.clear();
     apiCredentialSecretsByApp.clear();
+    tlsResumptionEpochSecrets.clear();
     pendingAddMachinesOperationSecrets.clear();
   }
 };
@@ -2100,6 +2164,7 @@ static void serialize(S&& serializer, ProdigyPersistentBrainSnapshotSecrets& sec
   serializer.text1b(secrets.reporterPassword, UINT32_MAX);
   serializer.object(secrets.tlsVaultFactorySecretsByApp);
   serializer.object(secrets.apiCredentialSecretsByApp);
+  serializer.object(secrets.tlsResumptionEpochSecrets);
   serializer.text1b(secrets.transportTLSAuthorityClusterRootKeyPem, UINT32_MAX);
   serializer.object(secrets.pendingAddMachinesOperationSecrets);
 }
@@ -2206,6 +2271,24 @@ static inline void prodigyExtractPersistentBrainSnapshotSecrets(
     }
   }
 
+  for (auto& [registryKey, snapshot] : publicSnapshot.masterAuthority.runtimeState.tlsResumptionSnapshotsByWormhole)
+  {
+    for (TlsResumptionKeyEpoch& epoch : snapshot.keyRing)
+    {
+      if (prodigyPersistentSecretBytesAreZero(epoch.masterSecret, sizeof(epoch.masterSecret)) == false)
+      {
+        ProdigyPersistentTlsResumptionEpochSecret epochSecret = {};
+        epochSecret.registryKey = registryKey;
+        epochSecret.generation = epoch.generation;
+        std::memcpy(epochSecret.keyID, epoch.keyID, sizeof(epochSecret.keyID));
+        std::memcpy(epochSecret.masterSecret, epoch.masterSecret, sizeof(epochSecret.masterSecret));
+        secrets.tlsResumptionEpochSecrets.push_back(epochSecret);
+      }
+
+      prodigyClearPersistentSecretBytes(epoch.masterSecret, sizeof(epoch.masterSecret));
+    }
+  }
+
   secrets.transportTLSAuthorityClusterRootKeyPem = publicSnapshot.masterAuthority.runtimeState.transportTLSAuthority.clusterRootKeyPem;
   prodigyClearPersistentSecretString(publicSnapshot.masterAuthority.runtimeState.transportTLSAuthority.clusterRootKeyPem);
 
@@ -2290,6 +2373,40 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
         }
         return false;
       }
+    }
+  }
+
+  for (const ProdigyPersistentTlsResumptionEpochSecret& epochSecret : secrets.tlsResumptionEpochSecrets)
+  {
+    auto snapshotIt = snapshot.masterAuthority.runtimeState.tlsResumptionSnapshotsByWormhole.find(epochSecret.registryKey);
+    if (snapshotIt == snapshot.masterAuthority.runtimeState.tlsResumptionSnapshotsByWormhole.end())
+    {
+      if (failure)
+      {
+        failure->snprintf<"persistent brain snapshot resumption secret missing snapshot {}"_ctv>(epochSecret.registryKey);
+      }
+      return false;
+    }
+
+    bool matched = false;
+    for (TlsResumptionKeyEpoch& epoch : snapshotIt->second.keyRing)
+    {
+      if (epoch.generation == epochSecret.generation && std::memcmp(epoch.keyID, epochSecret.keyID, sizeof(epoch.keyID)) == 0)
+      {
+        std::memcpy(epoch.masterSecret, epochSecret.masterSecret, sizeof(epoch.masterSecret));
+        matched = true;
+        break;
+      }
+    }
+
+    if (matched == false)
+    {
+      if (failure)
+      {
+        failure->snprintf<"persistent brain snapshot resumption secret missing epoch {}"_ctv>(
+            String(epochSecret.generation));
+      }
+      return false;
     }
   }
 

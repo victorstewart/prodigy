@@ -68,6 +68,8 @@ Privileged runtime tests can touch host networking, BPF, cgroups, loop devices, 
 | Stateful-system support | Databases can use Prodigy for seeding, peer updates, placement, health, repair, and replacement. |
 | Local-to-datacenter model | The same control model supports local development, private infrastructure, and cloud clusters. |
 
+Prodigy also offers per-wormhole TLS session-resumption key-ring distribution for resumed TCP+TLS/QUIC traffic. A deployment opts in on each declared wormhole rather than globally, and Prodigy distributes that wormhole's resumption keys to healthy containers serving it so valid resumed traffic does not need affinity to the original container that issued a ticket. 0-RTT is not supported until Prodigy has a deployment-wide replay-prevention boundary. Switchboard remains routing-only: it does not inspect TLS tickets and does not store TLS ticket secrets. These TLS resumption ticket keys are separate from QUIC CID routing keys, TLS certificate keys, and API credentials.
+
 ## Architecture
 
 Prodigy is organized around six cooperating pieces.

@@ -42,6 +42,12 @@ func TestFixtureCredentialBundleDecode(t *testing.T) {
 	if len(bundle.APICredentials) != 1 || bundle.APICredentials[0].Metadata["scope"] != "demo" {
 		t.Fatalf("unexpected api credentials: %#v", bundle.APICredentials)
 	}
+	if len(bundle.TLSResumptionSnapshots) != 1 ||
+		bundle.TLSResumptionSnapshots[0].Generation != 103 ||
+		bundle.TLSResumptionSnapshots[0].WormholeName != "public-api-quic" ||
+		len(bundle.TLSResumptionSnapshots[0].KeyRing) != 1 {
+		t.Fatalf("unexpected tls resumption snapshots: %#v", bundle.TLSResumptionSnapshots)
+	}
 }
 
 func TestFixtureCredentialDeltaDecode(t *testing.T) {
@@ -61,6 +67,15 @@ func TestFixtureCredentialDeltaDecode(t *testing.T) {
 	}
 	if delta.Reason != "fixture-rotation" {
 		t.Fatalf("reason = %q, want fixture-rotation", delta.Reason)
+	}
+	if len(delta.UpdatedResumptionSnapshots) != 1 ||
+		delta.UpdatedResumptionSnapshots[0].Generation != 104 ||
+		len(delta.RemovedResumptionWormholeNames) != 1 ||
+		delta.RemovedResumptionWormholeNames[0] != "legacy-public-api-quic" {
+		t.Fatalf(
+			"unexpected tls resumption delta: updated=%#v removed=%#v",
+			delta.UpdatedResumptionSnapshots,
+			delta.RemovedResumptionWormholeNames)
 	}
 }
 
@@ -87,6 +102,9 @@ func TestFixtureContainerParametersDecode(t *testing.T) {
 	}
 	if params.CredentialBundle == nil || params.CredentialBundle.BundleGeneration != 101 {
 		t.Fatalf("unexpected credential bundle: %#v", params.CredentialBundle)
+	}
+	if len(params.CredentialBundle.TLSResumptionSnapshots) != 1 {
+		t.Fatalf("unexpected embedded tls resumption snapshots: %#v", params.CredentialBundle.TLSResumptionSnapshots)
 	}
 }
 

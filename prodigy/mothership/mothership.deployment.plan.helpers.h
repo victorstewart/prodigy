@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 
 #include <cmath>
+#include <limits>
 #include <utility>
 #include <simdjson.h>
 
@@ -971,6 +972,64 @@ static inline bool mothershipParseWormholeQuicCidKeyRotationHours(
   }
 
   wormhole.quicCidKeyState.rotationHours = uint32_t(rotationHours);
+  return true;
+}
+
+static inline bool mothershipParseWormholeTlsResumptionConfig(
+    const simdjson::dom::element& value,
+    TlsResumptionWormholeConfig& config,
+    String *failure = nullptr)
+{
+  if (failure)
+  {
+    failure->clear();
+  }
+
+  if (value.type() != simdjson::dom::element_type::OBJECT)
+  {
+    if (failure)
+    {
+      failure->assign("wormhole.tlsResumption requires a document"_ctv);
+    }
+
+    return false;
+  }
+
+  config = TlsResumptionWormholeConfig();
+  for (auto field : value.get_object())
+  {
+    String key = {};
+    key.setInvariant(field.key.data(), field.key.size());
+
+    if (key.equal("sniNames"_ctv))
+    {
+      String context = {};
+      context.assign("wormhole.tlsResumption.sniNames"_ctv);
+      if (mothershipParseStringArray(field.value, config.sniNames, context, failure) == false)
+      {
+        return false;
+      }
+    }
+    else if (key.equal("alpns"_ctv))
+    {
+      String context = {};
+      context.assign("wormhole.tlsResumption.alpns"_ctv);
+      if (mothershipParseStringArray(field.value, config.alpns, context, failure) == false)
+      {
+        return false;
+      }
+    }
+    else
+    {
+      if (failure)
+      {
+        failure->assign("wormhole.tlsResumption invalid field"_ctv);
+      }
+
+      return false;
+    }
+  }
+
   return true;
 }
 

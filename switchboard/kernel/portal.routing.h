@@ -120,8 +120,9 @@ __attribute__((__always_inline__)) static inline int switchboardResolveExternalP
 
   if (portalMeta->flags & F_QUIC_PORTAL)
   {
-    bool allowHashFallback = parse_quic(containerID, portalMeta, data, data_end, isIPv6, &pckt->flow);
-    if (containerID->hasID == false && allowHashFallback == false)
+    struct quic_route_result route = parse_quic_route(portalMeta, data, data_end, isIPv6, &pckt->flow);
+    bpf_memcpy(containerID, &route.containerID, sizeof(struct container_id));
+    if (containerID->hasID == false && route.fallback_allowed == false)
     {
       return SWITCHBOARD_PORTAL_TARGET_DROP;
     }

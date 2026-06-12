@@ -88,6 +88,29 @@ public:
     machine->queueSend(topic, std::forward<Args>(args)...);
   }
 
+  void proxySendPairingPayload(NeuronTopic topic, const String& payload)
+  {
+    if (canProxySendToNeuron() == false)
+    {
+      return;
+    }
+
+    uint32_t payloadBytes = uint32_t(payload.size());
+    if (uint64_t(payloadBytes) != payload.size())
+    {
+      return;
+    }
+
+    uint32_t headerOffset = Message::appendHeader(machine->neuron.wBuffer, topic);
+    Message::append(machine->neuron.wBuffer, uuid);
+    if (payloadBytes > 0)
+    {
+      Message::append<Alignment::one>(machine->neuron.wBuffer, payload.data(), payloadBytes);
+    }
+    Message::finish(machine->neuron.wBuffer, headerOffset);
+    Ring::queueSend(&machine->neuron);
+  }
+
   void advertisementPairing(uint128_t secret, uint128_t address, uint64_t service, uint16_t applicationID, bool activate) override
   {
     if (suppressStartupPairingNotifications)
@@ -95,7 +118,11 @@ public:
       return;
     }
 
-    proxySend(NeuronTopic::advertisementPairing, uuid, secret, address, service, applicationID, activate);
+    String payload;
+    if (ProdigyWire::serializeAdvertisementPairingPayload(payload, secret, address, service, applicationID, activate))
+    {
+      proxySendPairingPayload(NeuronTopic::advertisementPairing, payload);
+    }
   }
 
   void subscriptionPairing(uint128_t secret, uint128_t address, uint64_t service, uint16_t port, uint16_t applicationID, bool activate) override
@@ -119,7 +146,11 @@ public:
       std::fflush(stderr);
     }
 
-    proxySend(NeuronTopic::subscriptionPairing, uuid, secret, address, service, port, applicationID, activate);
+    String payload;
+    if (ProdigyWire::serializeSubscriptionPairingPayload(payload, secret, address, service, port, applicationID, activate))
+    {
+      proxySendPairingPayload(NeuronTopic::subscriptionPairing, payload);
+    }
   }
 
   uint128_t pairingAddress(void) const override

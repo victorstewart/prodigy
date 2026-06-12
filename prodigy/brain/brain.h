@@ -804,6 +804,27 @@ public:
   }
 };
 
+class BrainTlsResumptionAckState {
+public:
+
+  uint64_t generation = 0;
+  bool success = false;
+  String failureReason;
+};
+
+class BrainTlsResumptionWormholeState {
+public:
+
+  TlsResumptionSnapshot snapshot;
+  bytell_hash_map<uint128_t, BrainTlsResumptionAckState> acksByContainer;
+};
+
+class BrainTlsResumptionDeploymentState {
+public:
+
+  bytell_hash_map<String, BrainTlsResumptionWormholeState> wormholes;
+};
+
 class Brain : public BrainBase, public TimeoutDispatcher {
 public:
 
@@ -894,6 +915,7 @@ public:
   bytell_hash_map<String, uint32_t> nReservedRequestedBySlug;
   bytell_hash_map<uint16_t, ApplicationTlsVaultFactory> tlsVaultFactoriesByApp;
   bytell_hash_map<uint16_t, ApplicationApiCredentialSet> apiCredentialSetsByApp;
+  bytell_hash_map<uint64_t, BrainTlsResumptionDeploymentState> tlsResumptionStateByDeployment;
   bytell_hash_map<String, uint16_t> reservedApplicationIDsByName;
   bytell_hash_map<uint16_t, String> reservedApplicationNamesByID;
   bytell_hash_map<String, ApplicationServiceIdentity> reservedApplicationServicesByNameKey;
@@ -902,6 +924,7 @@ public:
   bytell_hash_map<uint16_t, uint8_t> nextReservableServiceSlotByApplication;
   uint16_t nextReservableApplicationID = 1;
   uint64_t nextMintedClientTlsGeneration = 1;
+  uint64_t nextTlsResumptionGeneration = 1;
   ProdigyMasterAuthorityRuntimeState masterAuthorityRuntimeState;
   bytell_hash_map<uint64_t, Vector<BrainReplicatedContainerRuntimeState>> pendingReplicatedContainerRuntimeStates;
 
@@ -1484,11 +1507,54 @@ public:
     }
   }
 
+  ProdigyResumptionRegistry::SnapshotMap captureTlsResumptionSnapshotsByWormhole(void) const
+  {
+    ProdigyResumptionRegistry::SnapshotMap snapshots;
+    for (const auto& [deploymentID, deploymentState] : tlsResumptionStateByDeployment)
+    {
+      for (const auto& [wormholeName, state] : deploymentState.wormholes)
+      {
+        snapshots.insert_or_assign(tlsResumptionRegistryKey(deploymentID, wormholeName), state.snapshot);
+      }
+    }
+    return snapshots;
+  }
+
+  void restoreTlsResumptionSnapshotsByWormhole(const ProdigyResumptionRegistry::SnapshotMap& snapshots, bool preserveMatchingGenerationAcks)
+  {
+    bytell_hash_map<uint64_t, BrainTlsResumptionDeploymentState> restored;
+    for (const auto& [registryKey, snapshot] : snapshots)
+    {
+      uint64_t deploymentID = 0;
+      String wormholeName = {};
+      if (tlsResumptionParseRegistryKey(registryKey, deploymentID, wormholeName) == false)
+      {
+        continue;
+      }
+
+      BrainTlsResumptionWormholeState state = {};
+      state.snapshot = snapshot;
+
+      const BrainTlsResumptionWormholeState *existing = preserveMatchingGenerationAcks ? tlsResumptionStateForWormhole(deploymentID, wormholeName) : nullptr;
+      if (existing != nullptr && existing->snapshot.generation == snapshot.generation)
+      {
+        state.acksByContainer = existing->acksByContainer;
+      }
+
+      restored[deploymentID].wormholes.insert_or_assign(wormholeName, std::move(state));
+    }
+    tlsResumptionStateByDeployment = std::move(restored);
+  }
+
   void refreshMasterAuthorityRuntimeStateFromLiveFields(void)
   {
     if (nextMintedClientTlsGeneration == 0)
     {
       nextMintedClientTlsGeneration = 1;
+    }
+    if (nextTlsResumptionGeneration == 0)
+    {
+      nextTlsResumptionGeneration = 1;
     }
 
     if (masterAuthorityRuntimeState.nextPendingAddMachinesOperationID == 0)
@@ -1500,6 +1566,8 @@ public:
     masterAuthorityRuntimeState.deferredStatefulScaleIntents = deferredStatefulScaleIntentRuntimeState;
     masterAuthorityRuntimeState.hasCompletedInitialMasterElection = hasCompletedInitialMasterElection;
     masterAuthorityRuntimeState.nextMintedClientTlsGeneration = nextMintedClientTlsGeneration;
+    masterAuthorityRuntimeState.nextTlsResumptionGeneration = nextTlsResumptionGeneration;
+    masterAuthorityRuntimeState.tlsResumptionSnapshotsByWormhole = captureTlsResumptionSnapshotsByWormhole();
     masterAuthorityRuntimeState.updateSelf = capturePersistentUpdateSelfState();
   }
 
@@ -2135,6 +2203,8 @@ public:
     package.runtimeState = masterAuthorityRuntimeState;
     package.runtimeState.hasCompletedInitialMasterElection = hasCompletedInitialMasterElection;
     package.runtimeState.nextMintedClientTlsGeneration = (nextMintedClientTlsGeneration == 0) ? 1 : nextMintedClientTlsGeneration;
+    package.runtimeState.nextTlsResumptionGeneration = (nextTlsResumptionGeneration == 0) ? 1 : nextTlsResumptionGeneration;
+    package.runtimeState.tlsResumptionSnapshotsByWormhole = captureTlsResumptionSnapshotsByWormhole();
     package.runtimeState.updateSelf = capturePersistentUpdateSelfState();
   }
 
@@ -2160,6 +2230,10 @@ public:
     nextMintedClientTlsGeneration = (masterAuthorityRuntimeState.nextMintedClientTlsGeneration == 0)
                                         ? 1
                                         : masterAuthorityRuntimeState.nextMintedClientTlsGeneration;
+    nextTlsResumptionGeneration = (masterAuthorityRuntimeState.nextTlsResumptionGeneration == 0)
+                                      ? 1
+                                      : masterAuthorityRuntimeState.nextTlsResumptionGeneration;
+    restoreTlsResumptionSnapshotsByWormhole(masterAuthorityRuntimeState.tlsResumptionSnapshotsByWormhole, false);
     restorePersistentUpdateSelfState(masterAuthorityRuntimeState.updateSelf);
     syncManagedMachineSchemaConfigs(previousSchemas, masterAuthorityRuntimeState.machineSchemas);
   }
@@ -2171,6 +2245,10 @@ public:
     if (sanitizedIncoming.nextPendingAddMachinesOperationID == 0)
     {
       sanitizedIncoming.nextPendingAddMachinesOperationID = 1;
+    }
+    if (sanitizedIncoming.nextTlsResumptionGeneration == 0)
+    {
+      sanitizedIncoming.nextTlsResumptionGeneration = 1;
     }
 
     bool shouldApply = false;
@@ -2197,6 +2275,8 @@ public:
     statefulWorkerTopologyUpgradeRuntimeState = masterAuthorityRuntimeState.statefulWorkerTopologyUpgradeOperations;
     deferredStatefulScaleIntentRuntimeState = masterAuthorityRuntimeState.deferredStatefulScaleIntents;
     nextMintedClientTlsGeneration = (sanitizedIncoming.nextMintedClientTlsGeneration == 0) ? 1 : sanitizedIncoming.nextMintedClientTlsGeneration;
+    nextTlsResumptionGeneration = sanitizedIncoming.nextTlsResumptionGeneration;
+    restoreTlsResumptionSnapshotsByWormhole(sanitizedIncoming.tlsResumptionSnapshotsByWormhole, true);
     syncManagedMachineSchemaConfigs(previousSchemas, masterAuthorityRuntimeState.machineSchemas);
 
     if (persist)
@@ -2311,6 +2391,8 @@ public:
 
   void applyReplicatedDeploymentPlanLiveState(const DeploymentPlan& plan)
   {
+    (void)removeTlsResumptionStateNotEnabledByPlan(plan, true);
+
     auto deploymentIt = deployments.find(plan.config.deploymentID());
     if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
     {
@@ -3056,10 +3138,783 @@ public:
     return produced;
   }
 
+  static String tlsResumptionRegistryKey(uint64_t deploymentID, const String& wormholeName)
+  {
+    String key = {};
+    key.snprintf<"{itoa}:"_ctv>(deploymentID);
+    key.append(wormholeName);
+    return key;
+  }
+
+  static bool tlsResumptionParseRegistryKey(const String& key, uint64_t& deploymentID, String& wormholeName)
+  {
+    uint64_t parsedDeploymentID = 0;
+    uint32_t index = 0;
+    for (; index < key.size(); index += 1)
+    {
+      uint8_t byte = key.data()[index];
+      if (byte == ':')
+      {
+        break;
+      }
+      if (byte < '0' || byte > '9' || parsedDeploymentID > (UINT64_MAX - uint64_t(byte - '0')) / 10)
+      {
+        return false;
+      }
+      parsedDeploymentID = (parsedDeploymentID * 10) + uint64_t(byte - '0');
+    }
+
+    if (index == 0 || index >= key.size() || key.data()[index] != ':')
+    {
+      return false;
+    }
+
+    deploymentID = parsedDeploymentID;
+    wormholeName.assign(reinterpret_cast<const char *>(key.data() + index + 1), uint64_t(key.size() - index - 1));
+    return wormholeName.size() > 0;
+  }
+
+  static bool tlsResumptionSnapshotMatchesWormhole(const TlsResumptionSnapshot& snapshot, const Wormhole& wormhole)
+  {
+    return wormhole.hasTlsResumptionConfig &&
+           snapshot.wormholeName.equal(wormhole.name) &&
+           snapshot.keyRing.size() > 0;
+  }
+
+  void mintTlsResumptionEpoch(TlsResumptionKeyEpoch& epoch, uint64_t generation, int64_t nowMs)
+  {
+    epoch = TlsResumptionKeyEpoch();
+    epoch.generation = generation;
+    epoch.role = TlsResumptionKeyRole::acceptOnly;
+    Crypto::fillWithSecureRandomBytes(epoch.keyID, sizeof(epoch.keyID));
+    Crypto::fillWithSecureRandomBytes(epoch.masterSecret, sizeof(epoch.masterSecret));
+    const int64_t baseMs = nowMs > 0 ? nowMs : 0;
+    epoch.issueUntilMs = 0;
+    uint64_t acceptWindowMs = prodigyTlsResumptionTicketLifetimeMs;
+    if (UINT64_MAX - acceptWindowMs < prodigyTlsResumptionOverlapMs)
+    {
+      acceptWindowMs = UINT64_MAX;
+    }
+    else
+    {
+      acceptWindowMs += prodigyTlsResumptionOverlapMs;
+    }
+
+    if (acceptWindowMs > uint64_t(INT64_MAX - baseMs))
+    {
+      epoch.acceptUntilMs = INT64_MAX;
+    }
+    else
+    {
+      epoch.acceptUntilMs = baseMs + int64_t(acceptWindowMs);
+    }
+  }
+
+  const TlsResumptionSnapshot *ensureTlsResumptionSnapshotForWormhole(const DeploymentPlan& deploymentPlan, const Wormhole& wormhole, int64_t nowMs)
+  {
+    if (wormhole.hasTlsResumptionConfig == false || wormhole.name.size() == 0)
+    {
+      return nullptr;
+    }
+
+    if (wormholeSupportsTlsResumption(wormhole) == false)
+    {
+      return nullptr;
+    }
+
+    const uint64_t deploymentID = deploymentPlan.config.deploymentID();
+    auto& deploymentState = tlsResumptionStateByDeployment[deploymentID];
+    if (auto existing = deploymentState.wormholes.find(wormhole.name); existing != deploymentState.wormholes.end())
+    {
+      if (tlsResumptionSnapshotMatchesWormhole(existing->second.snapshot, wormhole))
+      {
+        return &existing->second.snapshot;
+      }
+    }
+
+    uint64_t generation = mintNextTlsResumptionGeneration();
+
+    TlsResumptionSnapshot snapshot = {};
+    snapshot.generation = generation;
+    snapshot.wormholeName = wormhole.name;
+
+    TlsResumptionKeyEpoch epoch = {};
+    mintTlsResumptionEpoch(epoch, generation, nowMs);
+    snapshot.keyRing.push_back(epoch);
+
+    BrainTlsResumptionWormholeState state = {};
+    state.snapshot = std::move(snapshot);
+    deploymentState.wormholes.insert_or_assign(wormhole.name, std::move(state));
+    auto it = deploymentState.wormholes.find(wormhole.name);
+    if (it == deploymentState.wormholes.end())
+    {
+      return nullptr;
+    }
+
+    noteMasterAuthorityRuntimeStateChanged();
+    return &it->second.snapshot;
+  }
+
+  uint64_t mintNextTlsResumptionGeneration(uint64_t floorGeneration = 0)
+  {
+    if (nextTlsResumptionGeneration <= floorGeneration)
+    {
+      nextTlsResumptionGeneration = (floorGeneration == UINT64_MAX) ? 1 : floorGeneration + 1;
+    }
+    if (nextTlsResumptionGeneration == 0)
+    {
+      nextTlsResumptionGeneration = 1;
+    }
+
+    uint64_t generation = nextTlsResumptionGeneration++;
+    if (nextTlsResumptionGeneration == 0)
+    {
+      nextTlsResumptionGeneration = 1;
+    }
+    return generation;
+  }
+
+  BrainTlsResumptionWormholeState *mutableTlsResumptionStateForWormhole(uint64_t deploymentID, const String& wormholeName)
+  {
+    auto deploymentIt = tlsResumptionStateByDeployment.find(deploymentID);
+    if (deploymentIt == tlsResumptionStateByDeployment.end())
+    {
+      return nullptr;
+    }
+
+    auto it = deploymentIt->second.wormholes.find(wormholeName);
+    return it == deploymentIt->second.wormholes.end() ? nullptr : &it->second;
+  }
+
+  const BrainTlsResumptionWormholeState *tlsResumptionStateForWormhole(uint64_t deploymentID, const String& wormholeName) const
+  {
+    auto deploymentIt = tlsResumptionStateByDeployment.find(deploymentID);
+    if (deploymentIt == tlsResumptionStateByDeployment.end())
+    {
+      return nullptr;
+    }
+
+    auto it = deploymentIt->second.wormholes.find(wormholeName);
+    return it == deploymentIt->second.wormholes.end() ? nullptr : &it->second;
+  }
+
+  TlsResumptionSnapshot *mutableTlsResumptionSnapshotForWormhole(uint64_t deploymentID, const String& wormholeName)
+  {
+    BrainTlsResumptionWormholeState *state = mutableTlsResumptionStateForWormhole(deploymentID, wormholeName);
+    return state == nullptr ? nullptr : &state->snapshot;
+  }
+
+  const TlsResumptionSnapshot *tlsResumptionSnapshotForWormhole(uint64_t deploymentID, const String& wormholeName) const
+  {
+    const BrainTlsResumptionWormholeState *state = tlsResumptionStateForWormhole(deploymentID, wormholeName);
+    return state == nullptr ? nullptr : &state->snapshot;
+  }
+
+  void clearTlsResumptionAcksForWormhole(uint64_t deploymentID, const String& wormholeName)
+  {
+    BrainTlsResumptionWormholeState *state = mutableTlsResumptionStateForWormhole(deploymentID, wormholeName);
+    if (state != nullptr)
+    {
+      state->acksByContainer.clear();
+    }
+  }
+
+  bool recordTlsResumptionApplyResult(uint128_t containerUUID, const TlsResumptionApplyResult& result)
+  {
+    auto containerIt = containers.find(containerUUID);
+    if (containerIt == containers.end() || containerIt->second == nullptr || result.wormholeName.size() == 0)
+    {
+      return false;
+    }
+
+    ContainerView *container = containerIt->second;
+    const uint64_t deploymentID = container->deploymentID;
+    BrainTlsResumptionWormholeState *state = mutableTlsResumptionStateForWormhole(deploymentID, result.wormholeName);
+    if (state == nullptr)
+    {
+      return false;
+    }
+
+    if (result.generation != state->snapshot.generation)
+    {
+      return false;
+    }
+
+    BrainTlsResumptionAckState ack = {};
+    ack.generation = result.generation;
+    ack.success = result.success;
+    ack.failureReason = result.failureReason;
+    state->acksByContainer.insert_or_assign(containerUUID, std::move(ack));
+    return true;
+  }
+
+  bool recordTlsResumptionApplyAck(uint128_t containerUUID, const TlsResumptionApplyAck& result)
+  {
+    bool recordedAny = false;
+    for (const TlsResumptionApplyResult& resumptionResult : result.results)
+    {
+      recordedAny = recordTlsResumptionApplyResult(containerUUID, resumptionResult) || recordedAny;
+    }
+
+    return recordedAny;
+  }
+
+  static bool containerCanServeResumedTlsTraffic(const ContainerView& container)
+  {
+    return container.state == ContainerState::healthy;
+  }
+
+  bool tlsResumptionAckCoverageSatisfied(const DeploymentPlan& deploymentPlan, const Wormhole& wormhole, String *failure = nullptr) const
+  {
+    if (failure)
+    {
+      failure->clear();
+    }
+
+    if (wormhole.hasTlsResumptionConfig == false || wormhole.name.size() == 0)
+    {
+      if (failure)
+      {
+        failure->assign("resumption-enabled wormhole required"_ctv);
+      }
+      return false;
+    }
+
+    const uint64_t deploymentID = deploymentPlan.config.deploymentID();
+    const BrainTlsResumptionWormholeState *state = tlsResumptionStateForWormhole(deploymentID, wormhole.name);
+    if (state == nullptr)
+    {
+      if (failure)
+      {
+        failure->assign("resumption snapshot missing"_ctv);
+      }
+      return false;
+    }
+    const TlsResumptionSnapshot& snapshot = state->snapshot;
+
+    auto deploymentIt = deployments.find(deploymentID);
+    if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
+    {
+      if (failure)
+      {
+        failure->assign("resumption deployment missing"_ctv);
+      }
+      return false;
+    }
+
+    bool sawServingContainer = false;
+    for (ContainerView *container : deploymentIt->second->containers)
+    {
+      if (container == nullptr || containerCanServeResumedTlsTraffic(*container) == false)
+      {
+        continue;
+      }
+
+      sawServingContainer = true;
+      auto ackIt = state->acksByContainer.find(container->uuid);
+      if (ackIt == state->acksByContainer.end())
+      {
+        if (failure)
+        {
+          failure->snprintf<"missing resumption ACK for traffic-serving container {}"_ctv>(String(container->uuid));
+        }
+        return false;
+      }
+
+      const BrainTlsResumptionAckState& ack = ackIt->second;
+      if (ack.generation != snapshot.generation || ack.success == false)
+      {
+        if (failure)
+        {
+          failure->snprintf<"resumption ACK not successful for container {}"_ctv>(String(container->uuid));
+        }
+        return false;
+      }
+    }
+
+    if (sawServingContainer == false)
+    {
+      if (failure)
+      {
+        failure->assign("no traffic-serving resumption containers"_ctv);
+      }
+      return false;
+    }
+
+    return true;
+  }
+
+  uint32_t pushCredentialDeltaToLiveContainers(const DeploymentPlan& deploymentPlan, const CredentialDelta& delta)
+  {
+    String serializedDelta = {};
+    if (ProdigyWire::serializeCredentialDelta(serializedDelta, delta) == false)
+    {
+      return 0;
+    }
+
+    uint32_t eligibleContainers = 0;
+    auto deploymentIt = deployments.find(deploymentPlan.config.deploymentID());
+    if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
+    {
+      return 0;
+    }
+
+    for (ContainerView *container : deploymentIt->second->containers)
+    {
+      if (container == nullptr)
+      {
+        continue;
+      }
+
+      switch (container->state)
+      {
+        case ContainerState::scheduled:
+        case ContainerState::healthy:
+        case ContainerState::crashedRestarting:
+          {
+            eligibleContainers += 1;
+            container->proxySend(NeuronTopic::refreshContainerCredentials, container->uuid, serializedDelta);
+            break;
+          }
+        default:
+          break;
+      }
+    }
+
+    return eligibleContainers;
+  }
+
+  uint32_t pushTlsResumptionUpdateToLiveContainers(const DeploymentPlan& deploymentPlan, const TlsResumptionSnapshot *snapshot, const String *removedWormholeName, uint64_t generation, const String& reason)
+  {
+    CredentialDelta delta = {};
+    delta.bundleGeneration = generation;
+    if (snapshot != nullptr)
+    {
+      delta.bundleGeneration = snapshot->generation;
+      delta.updatedResumptionSnapshots.push_back(*snapshot);
+    }
+    if (removedWormholeName != nullptr && removedWormholeName->size() > 0)
+    {
+      delta.removedResumptionWormholeNames.push_back(*removedWormholeName);
+    }
+    delta.reason = reason;
+    return pushCredentialDeltaToLiveContainers(deploymentPlan, delta);
+  }
+
+  static bool deploymentPlanEnablesTlsResumptionWormhole(const DeploymentPlan& deploymentPlan, const String& wormholeName)
+  {
+    if (wormholeName.size() == 0)
+    {
+      return false;
+    }
+
+    for (const Wormhole& wormhole : deploymentPlan.wormholes)
+    {
+      if (wormhole.name.equal(wormholeName) &&
+          wormhole.hasTlsResumptionConfig)
+      {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  bool removeTlsResumptionStateForWormhole(uint64_t deploymentID, const String& wormholeName, bool noteChanged = true)
+  {
+    if (wormholeName.size() == 0)
+    {
+      return false;
+    }
+
+    auto deploymentIt = tlsResumptionStateByDeployment.find(deploymentID);
+    if (deploymentIt == tlsResumptionStateByDeployment.end())
+    {
+      return false;
+    }
+
+    auto it = deploymentIt->second.wormholes.find(wormholeName);
+    if (it == deploymentIt->second.wormholes.end())
+    {
+      return false;
+    }
+
+    deploymentIt->second.wormholes.erase(it);
+    if (deploymentIt->second.wormholes.empty())
+    {
+      tlsResumptionStateByDeployment.erase(deploymentIt);
+    }
+    if (noteChanged)
+    {
+      noteMasterAuthorityRuntimeStateChanged();
+    }
+    return true;
+  }
+
+  uint32_t removeTlsResumptionStateForDeployment(uint64_t deploymentID, bool noteChanged = true)
+  {
+    auto deploymentIt = tlsResumptionStateByDeployment.find(deploymentID);
+    if (deploymentIt == tlsResumptionStateByDeployment.end())
+    {
+      return 0;
+    }
+
+    uint32_t removed = uint32_t(deploymentIt->second.wormholes.size());
+    tlsResumptionStateByDeployment.erase(deploymentIt);
+
+    if (removed > 0 && noteChanged)
+    {
+      noteMasterAuthorityRuntimeStateChanged();
+    }
+    return removed;
+  }
+
+  uint32_t removeTlsResumptionStateNotEnabledByPlan(const DeploymentPlan& deploymentPlan, bool pushDelta = true)
+  {
+    const uint64_t deploymentID = deploymentPlan.config.deploymentID();
+    Vector<String> wormholesToRemove = {};
+    Vector<uint64_t> generationsToRemove = {};
+
+    auto deploymentIt = tlsResumptionStateByDeployment.find(deploymentID);
+    if (deploymentIt == tlsResumptionStateByDeployment.end())
+    {
+      return 0;
+    }
+
+    for (const auto& [wormholeName, state] : deploymentIt->second.wormholes)
+    {
+      const TlsResumptionSnapshot& snapshot = state.snapshot;
+      if (deploymentPlanEnablesTlsResumptionWormhole(deploymentPlan, wormholeName))
+      {
+        continue;
+      }
+
+      wormholesToRemove.push_back(wormholeName);
+      generationsToRemove.push_back(snapshot.generation);
+    }
+
+    uint32_t removed = 0;
+    for (uint32_t index = 0; index < wormholesToRemove.size(); index += 1)
+    {
+      const String& wormholeName = wormholesToRemove[index];
+      if (pushDelta)
+      {
+        pushTlsResumptionUpdateToLiveContainers(deploymentPlan, nullptr, &wormholeName, generationsToRemove[index], "tls-resumption-policy-disabled-or-removed"_ctv);
+      }
+      if (removeTlsResumptionStateForWormhole(deploymentID, wormholeName, false))
+      {
+        removed += 1;
+      }
+    }
+
+    if (removed > 0)
+    {
+      noteMasterAuthorityRuntimeStateChanged();
+    }
+    return removed;
+  }
+
+  TlsResumptionSnapshot *beginTlsResumptionAcceptOnlyRollout(const DeploymentPlan& deploymentPlan, const Wormhole& wormhole, int64_t nowMs, bool pushDelta = true, String *failure = nullptr)
+  {
+    if (failure)
+    {
+      failure->clear();
+    }
+
+    const TlsResumptionSnapshot *ensured = ensureTlsResumptionSnapshotForWormhole(deploymentPlan, wormhole, nowMs);
+    if (ensured == nullptr)
+    {
+      if (failure)
+      {
+        failure->assign("failed to ensure resumption snapshot"_ctv);
+      }
+      return nullptr;
+    }
+
+    const uint64_t deploymentID = deploymentPlan.config.deploymentID();
+    TlsResumptionSnapshot *snapshot = mutableTlsResumptionSnapshotForWormhole(deploymentID, wormhole.name);
+    if (snapshot == nullptr)
+    {
+      if (failure)
+      {
+        failure->assign("resumption snapshot missing after ensure"_ctv);
+      }
+      return nullptr;
+    }
+
+    for (const TlsResumptionKeyEpoch& epoch : snapshot->keyRing)
+    {
+      if (epoch.generation == snapshot->generation && epoch.role == TlsResumptionKeyRole::acceptOnly)
+      {
+        if (pushDelta)
+        {
+          pushTlsResumptionUpdateToLiveContainers(deploymentPlan, snapshot, nullptr, snapshot->generation, "tls-resumption-accept-only-rollout"_ctv);
+        }
+        return snapshot;
+      }
+    }
+
+    uint64_t generation = mintNextTlsResumptionGeneration(snapshot->generation);
+
+    TlsResumptionKeyEpoch epoch = {};
+    mintTlsResumptionEpoch(epoch, generation, nowMs);
+    snapshot->generation = generation;
+    snapshot->keyRing.push_back(epoch);
+
+    clearTlsResumptionAcksForWormhole(deploymentID, wormhole.name);
+
+    noteMasterAuthorityRuntimeStateChanged();
+    if (pushDelta)
+    {
+      pushTlsResumptionUpdateToLiveContainers(deploymentPlan, snapshot, nullptr, snapshot->generation, "tls-resumption-accept-only-rollout"_ctv);
+    }
+    return snapshot;
+  }
+
+  bool promoteTlsResumptionIssueEpochIfAcked(const DeploymentPlan& deploymentPlan, const Wormhole& wormhole, int64_t nowMs, bool pushDelta = true, String *failure = nullptr)
+  {
+    if (tlsResumptionAckCoverageSatisfied(deploymentPlan, wormhole, failure) == false)
+    {
+      return false;
+    }
+
+    TlsResumptionSnapshot *snapshot = mutableTlsResumptionSnapshotForWormhole(deploymentPlan.config.deploymentID(), wormhole.name);
+    if (snapshot == nullptr)
+    {
+      if (failure)
+      {
+        failure->assign("resumption snapshot missing"_ctv);
+      }
+      return false;
+    }
+
+    bool changed = false;
+    int64_t issueUntilMs = nowMs;
+    if (prodigyTlsResumptionRotationPeriodMs > uint64_t(INT64_MAX - issueUntilMs))
+    {
+      issueUntilMs = INT64_MAX;
+    }
+    else
+    {
+      issueUntilMs += int64_t(prodigyTlsResumptionRotationPeriodMs);
+    }
+
+    for (TlsResumptionKeyEpoch& epoch : snapshot->keyRing)
+    {
+      if (epoch.generation == snapshot->generation)
+      {
+        if (epoch.role != TlsResumptionKeyRole::issueAndAccept || epoch.issueUntilMs != issueUntilMs)
+        {
+          epoch.role = TlsResumptionKeyRole::issueAndAccept;
+          epoch.issueUntilMs = issueUntilMs;
+          changed = true;
+        }
+      }
+      else if (epoch.role == TlsResumptionKeyRole::issueAndAccept)
+      {
+        epoch.role = TlsResumptionKeyRole::acceptOnly;
+        epoch.issueUntilMs = 0;
+        changed = true;
+      }
+    }
+
+    if (changed == false)
+    {
+      return false;
+    }
+
+    noteMasterAuthorityRuntimeStateChanged();
+    if (pushDelta)
+    {
+      pushTlsResumptionUpdateToLiveContainers(deploymentPlan, snapshot, nullptr, snapshot->generation, "tls-resumption-issue-promotion"_ctv);
+    }
+    return true;
+  }
+
+  static bool tlsResumptionIssueWindowExpired(const TlsResumptionSnapshot& snapshot, int64_t nowMs)
+  {
+    if (nowMs <= 0)
+    {
+      return false;
+    }
+
+    for (const TlsResumptionKeyEpoch& epoch : snapshot.keyRing)
+    {
+      if (epoch.generation == snapshot.generation &&
+          epoch.role == TlsResumptionKeyRole::issueAndAccept &&
+          epoch.issueUntilMs > 0 &&
+          epoch.issueUntilMs <= nowMs)
+      {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  uint32_t retireExpiredTlsResumptionEpochs(const DeploymentPlan& deploymentPlan, int64_t nowMs, bool pushDelta = true)
+  {
+    if (nowMs <= 0)
+    {
+      return 0;
+    }
+
+    uint32_t retired = 0;
+    const uint64_t deploymentID = deploymentPlan.config.deploymentID();
+    for (const Wormhole& wormhole : deploymentPlan.wormholes)
+    {
+      if (wormhole.hasTlsResumptionConfig == false || wormhole.name.size() == 0)
+      {
+        continue;
+      }
+
+      TlsResumptionSnapshot *snapshot = mutableTlsResumptionSnapshotForWormhole(deploymentID, wormhole.name);
+      if (snapshot == nullptr || snapshot->keyRing.empty())
+      {
+        continue;
+      }
+
+      const uint32_t before = uint32_t(snapshot->keyRing.size());
+      auto firstExpired = std::remove_if(snapshot->keyRing.begin(), snapshot->keyRing.end(), [&](const TlsResumptionKeyEpoch& epoch) {
+        return epoch.acceptUntilMs > 0 && epoch.acceptUntilMs <= nowMs;
+      });
+      if (firstExpired == snapshot->keyRing.end())
+      {
+        continue;
+      }
+
+      snapshot->keyRing.erase(firstExpired, snapshot->keyRing.end());
+      retired += before - uint32_t(snapshot->keyRing.size());
+      if (snapshot->keyRing.empty())
+      {
+        const uint64_t generation = mintNextTlsResumptionGeneration(snapshot->generation);
+
+        TlsResumptionKeyEpoch epoch = {};
+        mintTlsResumptionEpoch(epoch, generation, nowMs);
+        snapshot->generation = generation;
+        snapshot->keyRing.push_back(epoch);
+        clearTlsResumptionAcksForWormhole(deploymentID, wormhole.name);
+      }
+
+      noteMasterAuthorityRuntimeStateChanged();
+      if (pushDelta)
+      {
+        pushTlsResumptionUpdateToLiveContainers(deploymentPlan, snapshot, nullptr, snapshot->generation, "tls-resumption-expired-epoch-retire"_ctv);
+      }
+    }
+
+    return retired;
+  }
+
+  uint32_t advanceTlsResumptionLifecycleForDeployment(const DeploymentPlan& deploymentPlan, int64_t nowMs, bool allowRotation, bool pushDelta = true)
+  {
+    if (nowMs <= 0)
+    {
+      return 0;
+    }
+
+    uint32_t advanced = 0;
+    const uint64_t deploymentID = deploymentPlan.config.deploymentID();
+    if (allowRotation)
+    {
+      advanced += retireExpiredTlsResumptionEpochs(deploymentPlan, nowMs, pushDelta);
+    }
+
+    for (const Wormhole& wormhole : deploymentPlan.wormholes)
+    {
+      if (wormhole.hasTlsResumptionConfig == false || wormhole.name.size() == 0)
+      {
+        continue;
+      }
+
+      const bool hadSnapshot = tlsResumptionSnapshotForWormhole(deploymentID, wormhole.name) != nullptr;
+      const TlsResumptionSnapshot *snapshot = ensureTlsResumptionSnapshotForWormhole(deploymentPlan, wormhole, nowMs);
+      if (snapshot == nullptr)
+      {
+        continue;
+      }
+
+      if (hadSnapshot == false)
+      {
+        advanced += 1;
+        if (pushDelta)
+        {
+          pushTlsResumptionUpdateToLiveContainers(deploymentPlan, snapshot, nullptr, snapshot->generation, "tls-resumption-initial-snapshot"_ctv);
+        }
+      }
+
+      if (allowRotation && tlsResumptionIssueWindowExpired(*snapshot, nowMs))
+      {
+        const uint64_t previousGeneration = snapshot->generation;
+        String failure = {};
+        TlsResumptionSnapshot *next = beginTlsResumptionAcceptOnlyRollout(deploymentPlan, wormhole, nowMs, pushDelta, &failure);
+        if (next != nullptr && next->generation != previousGeneration)
+        {
+          advanced += 1;
+        }
+      }
+
+      String failure = {};
+      if (promoteTlsResumptionIssueEpochIfAcked(deploymentPlan, wormhole, nowMs, pushDelta, &failure))
+      {
+        advanced += 1;
+      }
+    }
+
+    return advanced;
+  }
+
+  uint32_t advanceAllDeploymentTlsResumptionLifecycles(bool allowRotation, bool pushDelta = true)
+  {
+    if (weAreMaster == false)
+    {
+      return 0;
+    }
+
+    uint32_t advanced = 0;
+    const int64_t nowMs = Time::now<TimeResolution::ms>();
+    for (const auto& [deploymentID, deployment] : deployments)
+    {
+      (void)deploymentID;
+      if (deployment == nullptr)
+      {
+        continue;
+      }
+      advanced += advanceTlsResumptionLifecycleForDeployment(deployment->plan, nowMs, allowRotation, pushDelta);
+    }
+    return advanced;
+  }
+
+  bool buildTlsResumptionSnapshotsForContainer(const DeploymentPlan& deploymentPlan, const ContainerView& container, CredentialBundle& bundle, uint64_t& bundleGeneration)
+  {
+    (void)container;
+    bool produced = false;
+    const int64_t nowMs = Time::now<TimeResolution::ms>();
+
+    for (const Wormhole& wormhole : deploymentPlan.wormholes)
+    {
+      const TlsResumptionSnapshot *snapshot = ensureTlsResumptionSnapshotForWormhole(deploymentPlan, wormhole, nowMs);
+      if (snapshot == nullptr)
+      {
+        continue;
+      }
+
+      bundle.tlsResumptionSnapshots.push_back(*snapshot);
+      if (snapshot->generation > bundleGeneration)
+      {
+        bundleGeneration = snapshot->generation;
+      }
+      produced = true;
+    }
+
+    return produced;
+  }
+
   bool buildCredentialBundleForContainer(const DeploymentPlan& deploymentPlan, const ContainerView& container, CredentialBundle& bundle)
   {
     bundle.tlsIdentities.clear();
     bundle.apiCredentials.clear();
+    bundle.tlsResumptionSnapshots.clear();
     bundle.bundleGeneration = 0;
 
     bool produced = false;
@@ -3092,13 +3947,17 @@ public:
       produced = true;
     }
 
+    if (buildTlsResumptionSnapshotsForContainer(deploymentPlan, container, bundle, bundleGeneration))
+    {
+      produced = true;
+    }
+
     bundle.bundleGeneration = produced ? bundleGeneration : 0;
     return produced;
   }
 
   void applyCredentialsToContainerPlan(const DeploymentPlan& deploymentPlan, const ContainerView& container, ContainerPlan& plan) override
   {
-    const bool trace = deploymentPlan.hasTlsIssuancePolicy || deploymentPlan.hasApiCredentialPolicy || deploymentPlan.config.applicationID == 6;
     CredentialBundle bundle;
     if (buildCredentialBundleForContainer(deploymentPlan, container, bundle))
     {
@@ -3109,20 +3968,6 @@ public:
     {
       plan.hasCredentialBundle = false;
       plan.credentialBundle = CredentialBundle();
-    }
-
-    if (trace)
-    {
-      basics_log(
-          "applyCredentialsToContainerPlan appID=%u containerUUID=%llu hasTlsPolicy=%u hasBundle=%u tlsIdentities=%u apiCredentials=%u bundleGeneration=%llu enablePerContainerLeafs=%u\n",
-          unsigned(deploymentPlan.config.applicationID),
-          (unsigned long long)container.uuid,
-          unsigned(deploymentPlan.hasTlsIssuancePolicy),
-          unsigned(plan.hasCredentialBundle),
-          unsigned(plan.credentialBundle.tlsIdentities.size()),
-          unsigned(plan.credentialBundle.apiCredentials.size()),
-          (unsigned long long)plan.credentialBundle.bundleGeneration,
-          unsigned(deploymentPlan.hasTlsIssuancePolicy ? deploymentPlan.tlsIssuancePolicy.enablePerContainerLeafs : false));
     }
   }
 
@@ -8468,6 +9313,7 @@ public:
                      unsigned(container->state));
         std::fflush(stderr);
         deployment->containerIsHealthy(container);
+        (void)advanceTlsResumptionLifecycleForDeployment(deployment->plan, Time::now<TimeResolution::ms>(), false);
         replicateContainerRuntimeStateToFollowers(container);
         std::fprintf(stderr,
                      "brain noteLocalContainerHealthy done uuid=%llu deploymentID=%llu appID=%u waitingAfter=%llu stateAfter=%u\n",
@@ -11703,6 +12549,7 @@ public:
         {
           checkForSpotTerminations();
           refreshAllDeploymentWormholeQuicCidState(true);
+          (void)advanceAllDeploymentTlsResumptionLifecycles(true);
           break;
         }
       default:
@@ -14898,6 +15745,10 @@ public:
           Message::extractArg<ArgumentNature::fixed>(args, deploymentID);
 
           deploymentPlans.erase(deploymentID);
+          if (removeTlsResumptionStateForDeployment(deploymentID, false) > 0)
+          {
+            refreshMasterAuthorityRuntimeStateFromLiveFields();
+          }
           ContainerStore::destroy(deploymentID);
           persistLocalRuntimeState();
 
@@ -20416,8 +21267,45 @@ public:
           // containerUUID(16)
           uint128_t containerUUID = 0;
           Message::extractArg<ArgumentNature::fixed>(args, containerUUID);
-          basics_log("brain refreshContainerCredentialsAck uuid=%llu\n",
-                     (unsigned long long)containerUUID);
+          TlsResumptionApplyAck result = {};
+          if (args < message->terminal())
+          {
+            String serializedAck = {};
+            Message::extractToStringView(args, serializedAck);
+            if (ProdigyWire::deserializeTlsResumptionApplyAck(serializedAck, result) == false)
+            {
+              basics_log("brain refreshContainerCredentialsAckInvalid uuid=%llu bytes=%llu\n",
+                         (unsigned long long)containerUUID,
+                         (unsigned long long)serializedAck.size());
+              queueCloseIfActive(neuron);
+              break;
+            }
+
+            const int64_t nowMs = Time::now<TimeResolution::ms>();
+            (void)recordTlsResumptionApplyAck(containerUUID, result);
+            for (const TlsResumptionApplyResult& resumptionResult : result.results)
+            {
+              basics_log("brain refreshContainerCredentialsAck uuid=%llu wormhole=%.*s generation=%llu success=%u\n",
+                         (unsigned long long)containerUUID,
+                         int(resumptionResult.wormholeName.size()),
+                         reinterpret_cast<const char *>(resumptionResult.wormholeName.data()),
+                         (unsigned long long)resumptionResult.generation,
+                         unsigned(resumptionResult.success));
+            }
+
+            if (auto containerIt = containers.find(containerUUID); containerIt != containers.end() && containerIt->second != nullptr)
+            {
+              if (auto deploymentIt = deployments.find(containerIt->second->deploymentID); deploymentIt != deployments.end() && deploymentIt->second != nullptr)
+              {
+                (void)advanceTlsResumptionLifecycleForDeployment(deploymentIt->second->plan, nowMs, false);
+              }
+            }
+          }
+          else
+          {
+            basics_log("brain refreshContainerCredentialsAck uuid=%llu\n",
+                       (unsigned long long)containerUUID);
+          }
           break;
         }
       case NeuronTopic::killContainer: // echo-ing back after killing a container

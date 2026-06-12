@@ -72,7 +72,7 @@
 2. `ApiCredential`
 3. `CredentialBundle`
 4. `CredentialDelta`
-5. `CredentialApplyResult`
+5. `TlsResumptionApplyAck`
 6. `ApplicationTlsVaultFactory`
 7. `TlsVaultFactoryUpsertRequest`
 8. `TlsVaultFactoryUpsertResponse`

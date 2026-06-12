@@ -9680,6 +9680,21 @@ private:
 
               addressWasSet = true;
             }
+            else if (key.equal("name"_ctv))
+            {
+              if (item.value.type() != simdjson::dom::element_type::STRING)
+              {
+                basics_log("wormhole.name requires a string\n");
+                exit(EXIT_FAILURE);
+              }
+
+              wormhole.name.assign(item.value.get_c_str());
+              if (wormhole.name.size() == 0)
+              {
+                basics_log("wormhole.name cannot be empty\n");
+                exit(EXIT_FAILURE);
+              }
+            }
             else if (key.equal("externalPort"_ctv))
             {
               if (item.value.type() != simdjson::dom::element_type::INT64)
@@ -9821,6 +9836,17 @@ private:
 
               routableAddressUUIDWasSet = true;
             }
+            else if (key.equal("tlsResumption"_ctv))
+            {
+              String failure = {};
+              if (mothershipParseWormholeTlsResumptionConfig(item.value, wormhole.tlsResumption, &failure) == false)
+              {
+                basics_log("%s\n", failure.c_str());
+                exit(EXIT_FAILURE);
+              }
+
+              wormhole.hasTlsResumptionConfig = true;
+            }
             else
             {
               basics_log("wormhole invalid field\n");
@@ -9877,6 +9903,19 @@ private:
           {
             basics_log("wormhole.quicCidKeyRotationHours requires wormhole.isQuic\n");
             exit(EXIT_FAILURE);
+          }
+          if (wormhole.hasTlsResumptionConfig)
+          {
+            if (wormhole.name.size() == 0)
+            {
+              basics_log("wormhole.name required when wormhole.tlsResumption.enabled\n");
+              exit(EXIT_FAILURE);
+            }
+            if (wormholeSupportsTlsResumption(wormhole) == false)
+            {
+              basics_log("wormhole.tlsResumption.enabled requires TCP or QUIC-over-UDP wormhole\n");
+              exit(EXIT_FAILURE);
+            }
           }
         }
       }
@@ -10430,8 +10469,9 @@ private:
         exit(EXIT_FAILURE);
       }
 
-      for (const Wormhole& wormhole : plan.wormholes)
+      for (uint32_t index = 0; index < plan.wormholes.size(); index += 1)
       {
+        const Wormhole& wormhole = plan.wormholes[index];
         if (wormhole.source != ExternalAddressSource::distributableSubnet && wormhole.source != ExternalAddressSource::registeredRoutableAddress)
         {
           basics_log("wormholes currently require source == distributableSubnet or registeredRoutableAddress\n");
@@ -10448,6 +10488,20 @@ private:
         {
           basics_log("wormholes with isQuic require layer4 == UDP\n");
           exit(EXIT_FAILURE);
+        }
+
+        if (wormhole.hasTlsResumptionConfig)
+        {
+          for (uint32_t otherIndex = index + 1; otherIndex < plan.wormholes.size(); otherIndex += 1)
+          {
+            const Wormhole& other = plan.wormholes[otherIndex];
+            if (other.hasTlsResumptionConfig &&
+                wormhole.name.equal(other.name))
+            {
+              basics_log("resumption-enabled wormholes require unique names\n");
+              exit(EXIT_FAILURE);
+            }
+          }
         }
       }
     }
@@ -15567,7 +15621,6 @@ int main(int argc, char *argv[])
     message.append("\tcreates/updates API credential set for an application\n");
     message.append("mintClientTlsIdentity [target: local|clusterName|clusterUUID] [json]\n");
     message.append("\tmints a client TLS identity from an existing application vault factory\n");
-
     if (message.size() > 0)
     {
       std::fwrite(message.c_str(), 1, message.size(), stdout);

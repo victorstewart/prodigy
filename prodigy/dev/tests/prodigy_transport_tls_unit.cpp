@@ -312,7 +312,8 @@ static bool configureTransportRuntimeForNode(
     const String& rootKeyPem,
     const String& localCertPem,
     const String& localKeyPem,
-    String *failure = nullptr)
+    String *failure = nullptr,
+    const ProdigyTransportTLSResumptionConfig *resumption = nullptr)
 {
   ProdigyTransportTLSBootstrap bootstrap = {};
   bootstrap.uuid = nodeUUID;
@@ -321,7 +322,60 @@ static bool configureTransportRuntimeForNode(
   bootstrap.transport.clusterRootKeyPem = rootKeyPem;
   bootstrap.transport.localCertPem = localCertPem;
   bootstrap.transport.localKeyPem = localKeyPem;
+  if (resumption)
+  {
+    return ProdigyTransportTLSRuntime::configure(bootstrap, *resumption, failure);
+  }
+
   return ProdigyTransportTLSRuntime::configure(bootstrap, failure);
+}
+
+static EVP_MAC_CTX *makeTransportTlsHmacContextForTest(void)
+{
+  EVP_MAC *mac = EVP_MAC_fetch(nullptr, "HMAC", nullptr);
+  if (mac == nullptr)
+  {
+    return nullptr;
+  }
+
+  EVP_MAC_CTX *ctx = EVP_MAC_CTX_new(mac);
+  EVP_MAC_free(mac);
+  return ctx;
+}
+
+static TlsResumptionKeyEpoch makeTransportTlsResumptionEpoch(uint8_t seed)
+{
+  TlsResumptionKeyEpoch epoch = {};
+  epoch.generation = 90;
+  epoch.role = TlsResumptionKeyRole::issueAndAccept;
+  for (uint32_t index = 0; index < sizeof(epoch.keyID); index += 1)
+  {
+    epoch.keyID[index] = uint8_t(seed + index);
+  }
+  for (uint32_t index = 0; index < sizeof(epoch.masterSecret); index += 1)
+  {
+    epoch.masterSecret[index] = uint8_t(0x80u + seed + index);
+  }
+  epoch.issueUntilMs = 200'000;
+  epoch.acceptUntilMs = 300'000;
+  return epoch;
+}
+
+static TlsResumptionSnapshot makeTransportTlsResumptionSnapshot(void)
+{
+  TlsResumptionSnapshot snapshot = {};
+  snapshot.generation = 90;
+  snapshot.wormholeName.assign("public-api-tcp"_ctv);
+  snapshot.keyRing.push_back(makeTransportTlsResumptionEpoch(5));
+  return snapshot;
+}
+
+static ProdigyOpenSSLTlsTicketBinding makeTransportTlsResumptionBinding(void)
+{
+  ProdigyOpenSSLTlsTicketBinding binding = {};
+  binding.wormholeName.assign("public-api-tcp"_ctv);
+  binding.nowMs = 120'000;
+  return binding;
 }
 
 static bool streamBufferEquals(StreamBuffer& buffer, const String& expected)
@@ -755,6 +809,74 @@ int main(int argc, char **argv)
   {
     X509_free(serverCert);
   }
+
+  TlsResumptionSnapshot resumptionSnapshot = makeTransportTlsResumptionSnapshot();
+  ProdigyResumptionRegistry resumptionRegistry = {};
+  suite.expect(resumptionRegistry.applySnapshot(resumptionSnapshot), "transport_tls_resumption_registry_applies_snapshot");
+  ProdigyOpenSSLTlsTicketBinding resumptionBinding = makeTransportTlsResumptionBinding();
+
+  suite.expect(configureTransportRuntimeForNode(serverUUID, rootCertPem, rootKeyPem, serverCertPem, serverKeyPem, &failure),
+               "configure_transport_runtime_resumption_without_registry");
+  suite.expect(failure.size() == 0, "configure_transport_runtime_resumption_without_registry_clears_failure");
+  ProdigyTransportTLSStream missingResumptionRuntime = {};
+  reserveTransportStream(missingResumptionRuntime);
+  suite.expect(
+      missingResumptionRuntime.beginTransportTLS(true, &resumptionBinding) == false,
+      "begin_transport_tls_resumption_binding_requires_configured_registry");
+  suite.expect(
+      missingResumptionRuntime.transportTLSResumptionBindingConfigured() == false,
+      "begin_transport_tls_resumption_binding_failure_clears_stream_binding");
+
+  ProdigyTransportTLSResumptionConfig resumptionConfig = {};
+  resumptionConfig.registry = &resumptionRegistry;
+  resumptionConfig.renewBeforeMs = 30'000;
+  suite.expect(configureTransportRuntimeForNode(serverUUID, rootCertPem, rootKeyPem, serverCertPem, serverKeyPem, &failure, &resumptionConfig),
+               "configure_transport_runtime_with_resumption_registry");
+  suite.expect(failure.size() == 0, "configure_transport_runtime_with_resumption_registry_clears_failure");
+  suite.expect(ProdigyTransportTLSRuntime::resumptionConfigured(), "transport_tls_runtime_reports_resumption_configured");
+  suite.expect(
+      ProdigyTransportTLSRuntime::resumptionTicketContext() != nullptr &&
+          ProdigyTransportTLSRuntime::resumptionTicketContext()->registry == &resumptionRegistry,
+      "transport_tls_runtime_owns_resumption_ticket_context");
+
+  ProdigyTransportTLSStream resumptionServer = {};
+  reserveTransportStream(resumptionServer);
+  suite.expect(resumptionServer.beginTransportTLS(true, &resumptionBinding), "begin_transport_tls_server_with_resumption_binding");
+  suite.expect(resumptionServer.transportTLSResumptionBindingConfigured(), "transport_tls_stream_stores_resumption_binding");
+  ProdigyOpenSSLTlsTicketBinding *boundResumption = prodigyOpenSSLTlsTicketBindingForSSL(resumptionServer.ssl);
+  suite.expect(
+      boundResumption != nullptr &&
+          boundResumption->wormholeName.equal(resumptionBinding.wormholeName),
+      "transport_tls_stream_binds_wormhole_resumption_metadata_to_ssl");
+
+  unsigned char issuedKeyName[16] = {};
+  unsigned char issuedIV[EVP_MAX_IV_LENGTH] = {};
+  EVP_CIPHER_CTX *issuedCipher = EVP_CIPHER_CTX_new();
+  EVP_MAC_CTX *issuedMac = makeTransportTlsHmacContextForTest();
+  suite.expect(issuedCipher != nullptr && issuedMac != nullptr, "transport_tls_resumption_allocates_ticket_crypto");
+  int issueResult = (resumptionServer.ssl && issuedCipher && issuedMac)
+                        ? prodigyOpenSSLTlsTicketKeyCallback(resumptionServer.ssl, issuedKeyName, issuedIV, issuedCipher, issuedMac, 1)
+                        : -1;
+  suite.expect(issueResult == 1, "transport_tls_resumption_callback_issues_from_stream_binding");
+  suite.expect(
+      std::memcmp(issuedKeyName, resumptionSnapshot.keyRing[0].keyID, sizeof(issuedKeyName)) == 0,
+      "transport_tls_resumption_callback_uses_wormhole_key");
+  suite.expect(
+      ProdigyTransportTLSRuntime::resumptionTicketContext() != nullptr &&
+          ProdigyTransportTLSRuntime::resumptionTicketContext()->issuedTickets == 1 &&
+          ProdigyTransportTLSRuntime::resumptionTicketContext()->fallbackTickets == 0,
+      "transport_tls_resumption_callback_counts_issue");
+  if (issuedMac)
+  {
+    EVP_MAC_CTX_free(issuedMac);
+  }
+  if (issuedCipher)
+  {
+    EVP_CIPHER_CTX_free(issuedCipher);
+  }
+
+  ProdigyTransportTLSRuntime::clear();
+  suite.expect(ProdigyTransportTLSRuntime::resumptionConfigured() == false, "transport_tls_runtime_clear_resets_resumption");
 
   suite.expect(configureTransportRuntimeForNode(clientUUID, rootCertPem, rootKeyPem, clientCertPem, clientKeyPem, &failure), "configure_transport_runtime_client");
   suite.expect(failure.size() == 0, "configure_transport_runtime_client_clears_failure");

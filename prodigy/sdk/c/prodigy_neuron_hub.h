@@ -17,7 +17,7 @@ extern "C" {
 #define PRODIGY_NEURON_HUB_SDK_VERSION_STRING "1.0.0"
 #define PRODIGY_NEURON_HUB_WIRE_SERIES "WIRE_V1"
 #define PRODIGY_NEURON_HUB_WIRE_PROTOCOL_VERSION 1u
-#define PRODIGY_NEURON_HUB_ABI_VERSION 3u
+#define PRODIGY_NEURON_HUB_ABI_VERSION 5u
 #define PRODIGY_AEGIS_ALIGNMENT 16u
 #define PRODIGY_AEGIS_HEADER_BYTES 24u
 #define PRODIGY_AEGIS_MAX_FRAME_BYTES (2u * 1024u * 1024u)
@@ -172,26 +172,31 @@ typedef struct prodigy_api_credential {
   size_t metadata_count;
 } prodigy_api_credential;
 
+typedef struct prodigy_tls_resumption_key_epoch {
+  uint64_t generation;
+  uint8_t role;
+  uint8_t key_id[16];
+  uint8_t master_secret[32];
+  int64_t issue_until_ms;
+  int64_t accept_until_ms;
+} prodigy_tls_resumption_key_epoch;
+
+typedef struct prodigy_tls_resumption_snapshot {
+  uint64_t generation;
+  prodigy_bytes wormhole_name;
+  prodigy_tls_resumption_key_epoch *key_ring;
+  size_t key_ring_count;
+} prodigy_tls_resumption_snapshot;
+
 typedef struct prodigy_credential_bundle {
   prodigy_tls_identity *tls_identities;
   size_t tls_identity_count;
   prodigy_api_credential *api_credentials;
   size_t api_credential_count;
+  prodigy_tls_resumption_snapshot *tls_resumption_snapshots;
+  size_t tls_resumption_snapshot_count;
   uint64_t bundle_generation;
 } prodigy_credential_bundle;
-
-typedef struct prodigy_credential_delta {
-  uint64_t bundle_generation;
-  prodigy_tls_identity *updated_tls;
-  size_t updated_tls_count;
-  prodigy_bytes *removed_tls_names;
-  size_t removed_tls_name_count;
-  prodigy_api_credential *updated_api;
-  size_t updated_api_count;
-  prodigy_bytes *removed_api_names;
-  size_t removed_api_name_count;
-  prodigy_bytes reason;
-} prodigy_credential_delta;
 
 typedef struct prodigy_container_parameters {
   prodigy_u128 uuid;
@@ -234,7 +239,8 @@ typedef struct prodigy_neuron_hub_callbacks {
   void (*credentials_refresh)(
       void *context,
       prodigy_neuron_hub *hub,
-      const prodigy_credential_delta *delta);
+      const uint8_t *payload,
+      size_t payload_size);
   void (*wormholes_refresh)(
       void *context,
       prodigy_neuron_hub *hub,
@@ -258,7 +264,6 @@ typedef struct prodigy_neuron_hub_options {
 void prodigy_bytes_free(prodigy_bytes *value);
 void prodigy_message_frame_free(prodigy_message_frame *frame);
 void prodigy_credential_bundle_free(prodigy_credential_bundle *bundle);
-void prodigy_credential_delta_free(prodigy_credential_delta *delta);
 void prodigy_container_parameters_free(prodigy_container_parameters *parameters);
 
 void prodigy_frame_decoder_init(prodigy_frame_decoder *decoder);
@@ -342,6 +347,11 @@ prodigy_result prodigy_build_resource_delta_ack_frame(
 
 prodigy_result prodigy_build_credentials_refresh_ack_frame(prodigy_bytes *frame);
 
+prodigy_result prodigy_build_credentials_refresh_ack_payload_frame(
+    const uint8_t *payload,
+    size_t payload_size,
+    prodigy_bytes *frame);
+
 prodigy_result prodigy_decode_container_parameters(
     const uint8_t *data,
     size_t size,
@@ -351,11 +361,6 @@ prodigy_result prodigy_decode_credential_bundle(
     const uint8_t *data,
     size_t size,
     prodigy_credential_bundle *bundle);
-
-prodigy_result prodigy_decode_credential_delta(
-    const uint8_t *data,
-    size_t size,
-    prodigy_credential_delta *delta);
 
 prodigy_neuron_hub *prodigy_neuron_hub_create(
     const prodigy_neuron_hub_callbacks *callbacks,
@@ -402,6 +407,11 @@ prodigy_result prodigy_neuron_hub_acknowledge_resource_delta(
 
 prodigy_result prodigy_neuron_hub_acknowledge_credentials_refresh(
     prodigy_neuron_hub *hub);
+
+prodigy_result prodigy_neuron_hub_acknowledge_credentials_refresh_payload(
+    prodigy_neuron_hub *hub,
+    const uint8_t *payload,
+    size_t payload_size);
 
 #ifdef __cplusplus
 }

@@ -380,6 +380,8 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
 
   setCheckpoint("process_packet: checkpoint 2");
 
+  struct quic_route_result quic_route = {};
+
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
   if (!direct_fake_delivery)
   {
@@ -392,13 +394,14 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
     {
       setCheckpoint("process_packet: isQuic");
 
-      bool allow_hash_fallback = parse_quic(&containerID, portal_meta, data, data_end, is_ipv6, &pckt.flow);
+      quic_route = parse_quic_route(portal_meta, data, data_end, is_ipv6, &pckt.flow);
+      bpf_memcpy(&containerID, &quic_route.containerID, sizeof(struct container_id));
 
       if (containerID.hasID)
       {
         // no action here
       }
-      else if (allow_hash_fallback == false) // only Initial and 0-RTT may fall back to tuple hashing
+      else if (quic_route.fallback_allowed == false) // only Initial may fall back to tuple hashing
       {
         return XDP_DROP; // either packet too short or CID length/authentication is invalid
       }
@@ -442,7 +445,26 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
   if (portal_meta != NULL && is_ipv6)
   {
     __u16 target_port = 0;
-    if (switchboardLookupWormholeTargetPort(portal_meta->slot, &containerID, &target_port) == false || switchboardRewriteWormholeIPv6Target(data, data_end, &pckt, &containerID, target_port) == false)
+    bool target_found = switchboardLookupWormholeTargetPort(portal_meta->slot, &containerID, &target_port);
+
+    if (target_found == false &&
+        (portal_meta->flags & F_QUIC_PORTAL) &&
+        quic_route.had_valid_prodigy_cid &&
+        quic_route.fallback_allowed)
+    {
+      containerID = (struct container_id) {};
+      switchboardSelectContainer(&containerID, &pckt, portal_meta, is_ipv6);
+      if (containerID.hasID)
+      {
+        target_found = switchboardLookupWormholeTargetPort(portal_meta->slot, &containerID, &target_port);
+        if (pkt)
+        {
+          bpf_memcpy(&pkt->containerID, &containerID, sizeof(struct container_id));
+        }
+      }
+    }
+
+    if (target_found == false || switchboardRewriteWormholeIPv6Target(data, data_end, &pckt, &containerID, target_port) == false)
     {
       setInstruction(XDP_DROP);
       return XDP_DROP;

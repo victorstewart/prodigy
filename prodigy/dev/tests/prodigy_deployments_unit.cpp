@@ -2550,6 +2550,7 @@ int main(void)
   {
     DeploymentPlan plan {};
     Wormhole wormhole = {};
+    wormhole.name.assign("public-api-quic"_ctv);
     wormhole.externalAddress = IPAddress("2001:db8::44", true);
     wormhole.externalPort = 443;
     wormhole.containerPort = 8443;
@@ -2563,6 +2564,9 @@ int main(void)
     wormhole.quicCidKeyState.rotatedAtMs = 123'456'789;
     wormhole.quicCidKeyState.keyMaterialByIndex[0] = uint128_t(0x1111222233334444ULL);
     wormhole.quicCidKeyState.keyMaterialByIndex[1] = uint128_t(0xAAAABBBBCCCCDDDDULL);
+    wormhole.hasTlsResumptionConfig = true;
+    wormhole.tlsResumption.alpns.push_back("h3"_ctv);
+    wormhole.tlsResumption.sniNames.push_back("api.example.com"_ctv);
     plan.wormholes.push_back(wormhole);
 
     String serialized;
@@ -2573,6 +2577,7 @@ int main(void)
 
     suite.expect(decoded, "deployment_plan_roundtrip_quic_wormhole_deserializes");
     suite.expect(roundtrip.wormholes.size() == 1, "deployment_plan_roundtrip_preserves_wormhole_count");
+    suite.expect(roundtrip.wormholes[0].name.equal("public-api-quic"_ctv), "deployment_plan_roundtrip_preserves_wormhole_name");
     suite.expect(roundtrip.wormholes[0].isQuic == true, "deployment_plan_roundtrip_preserves_wormhole_quic_flag");
     suite.expect(roundtrip.wormholes[0].hasQuicCidKeyState == true, "deployment_plan_roundtrip_preserves_wormhole_quic_key_state_flag");
     suite.expect(roundtrip.wormholes[0].quicCidKeyState.rotationHours == 12, "deployment_plan_roundtrip_preserves_wormhole_quic_rotation_hours");
@@ -2582,6 +2587,9 @@ int main(void)
     suite.expect(roundtrip.wormholes[0].quicCidKeyState.keyMaterialByIndex[1] == uint128_t(0xAAAABBBBCCCCDDDDULL), "deployment_plan_roundtrip_preserves_wormhole_quic_key_slot_1");
     suite.expect(wormholeUsesQuicCidEncryption(roundtrip.wormholes[0]), "deployment_plan_roundtrip_recognizes_quic_wormhole");
     suite.expect(wormholeQuicCidInactiveKeyIndex(roundtrip.wormholes[0].quicCidKeyState) == 0, "deployment_plan_roundtrip_computes_quic_inactive_key_index");
+    suite.expect(roundtrip.wormholes[0].hasTlsResumptionConfig, "deployment_plan_roundtrip_preserves_wormhole_tls_resumption_flag");
+    suite.expect(roundtrip.wormholes[0].tlsResumption.alpns.size() == 1 && roundtrip.wormholes[0].tlsResumption.alpns[0].equal("h3"_ctv), "deployment_plan_roundtrip_preserves_wormhole_tls_resumption_alpn");
+    suite.expect(roundtrip.wormholes[0].tlsResumption.sniNames.size() == 1 && roundtrip.wormholes[0].tlsResumption.sniNames[0].equal("api.example.com"_ctv), "deployment_plan_roundtrip_preserves_wormhole_tls_resumption_sni");
   }
 
   {
@@ -5159,6 +5167,47 @@ int main(void)
     }
 
     suite.expect(rejected, "mothership_parse_wormhole_quic_rotation_hours_rejects_zero");
+  }
+
+  {
+    TlsResumptionWormholeConfig config {};
+    String json = "{\"sniNames\":[\"api.example.com\"],\"alpns\":[\"h3\"]}"_ctv;
+    json.need(simdjson::SIMDJSON_PADDING);
+
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    String failure;
+    const bool parsedJSON = (parser.parse(json.data(), json.size()).get(doc) == simdjson::SUCCESS);
+    suite.expect(parsedJSON, "mothership_parse_wormhole_tls_resumption_json_valid");
+
+    bool parsedField = false;
+    if (parsedJSON)
+    {
+      parsedField = mothershipParseWormholeTlsResumptionConfig(doc, config, &failure);
+    }
+
+    suite.expect(parsedField, "mothership_parse_wormhole_tls_resumption_parses");
+    suite.expect(failure.size() == 0, "mothership_parse_wormhole_tls_resumption_no_failure");
+    suite.expect(config.sniNames.size() == 1 && config.sniNames[0].equal("api.example.com"_ctv), "mothership_parse_wormhole_tls_resumption_sni");
+    suite.expect(config.alpns.size() == 1 && config.alpns[0].equal("h3"_ctv), "mothership_parse_wormhole_tls_resumption_alpn");
+  }
+
+  {
+    TlsResumptionWormholeConfig config {};
+    String json = "{\"zeroRtt\":{\"enabled\":true}}"_ctv;
+    json.need(simdjson::SIMDJSON_PADDING);
+
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    bool rejected = false;
+    if (parser.parse(json.data(), json.size()).get(doc) == simdjson::SUCCESS)
+    {
+      String failure;
+      rejected = (mothershipParseWormholeTlsResumptionConfig(doc, config, &failure) == false);
+      suite.expect(failure == "wormhole.tlsResumption invalid field"_ctv, "mothership_parse_wormhole_tls_resumption_zero_rtt_failure_text");
+    }
+
+    suite.expect(rejected, "mothership_parse_wormhole_tls_resumption_rejects_zero_rtt");
   }
 
   {

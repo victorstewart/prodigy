@@ -70,6 +70,43 @@ static bool consumeVariable(uint8_t *& cursor, uint8_t *terminal)
 }
 
 template <typename LengthType = uint32_t>
+static bool extractVariableStringView(uint8_t *& cursor, uint8_t *terminal, String& value)
+{
+  LengthType rawLength = 0;
+  if (extractFixed(cursor, terminal, rawLength) == false)
+  {
+    return false;
+  }
+
+  if constexpr (std::is_signed_v<LengthType>)
+  {
+    if (rawLength < 0)
+    {
+      return false;
+    }
+  }
+
+  uint64_t payloadLength = uint64_t(rawLength);
+  constexpr uintptr_t alignmentMask = uintptr_t(Alignment::eight) - 1;
+  uintptr_t aligned = (reinterpret_cast<uintptr_t>(cursor) + alignmentMask) & ~alignmentMask;
+  uint8_t *alignedCursor = reinterpret_cast<uint8_t *>(aligned);
+
+  if (alignedCursor > terminal)
+  {
+    return false;
+  }
+
+  if (payloadLength > uint64_t(terminal - alignedCursor))
+  {
+    return false;
+  }
+
+  value.setInvariant(alignedCursor, payloadLength);
+  cursor = alignedCursor + payloadLength;
+  return true;
+}
+
+template <typename LengthType = uint32_t>
 static bool consumeVariableBounded(uint8_t *& cursor, uint8_t *terminal, uint64_t maxPayloadLength)
 {
   LengthType rawLength = 0;
@@ -167,7 +204,7 @@ static bool consumeContainerPairingPayload(uint8_t *& cursor, uint8_t *terminal,
   if (includesPort)
   {
     uint16_t port = 0;
-    ok = ProdigyWire::deserializeSubscriptionPairingPayloadAuto(
+    ok = ProdigyWire::deserializeSubscriptionPairingPayload(
         cursor,
         uint64_t(terminal - cursor),
         secret,
@@ -179,7 +216,7 @@ static bool consumeContainerPairingPayload(uint8_t *& cursor, uint8_t *terminal,
   }
   else
   {
-    ok = ProdigyWire::deserializeAdvertisementPairingPayloadAuto(
+    ok = ProdigyWire::deserializeAdvertisementPairingPayload(
         cursor,
         uint64_t(terminal - cursor),
         secret,
@@ -680,7 +717,19 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
         {
           return false;
         }
-        return (cursor == terminal);
+        if (cursor == terminal)
+        {
+          return true;
+        }
+
+        String serializedAck = {};
+        if (extractVariableStringView(cursor, terminal, serializedAck) == false || cursor != terminal)
+        {
+          return false;
+        }
+
+        TlsResumptionApplyAck result;
+        return ProdigyWire::deserializeTlsResumptionApplyAck(serializedAck, result);
       }
     case NeuronTopic::spotTerminationImminent:
     case NeuronTopic::ping:
@@ -1004,7 +1053,13 @@ static bool validateContainerPayloadForNeuron(uint16_t rawTopic, uint8_t *args, 
       }
     case ContainerTopic::credentialsRefresh:
       {
-        return (cursor == terminal);
+        if (cursor == terminal)
+        {
+          return true;
+        }
+
+        TlsResumptionApplyAck result;
+        return ProdigyWire::deserializeTlsResumptionApplyAckFramePayload(args, uint64_t(terminal - args), result);
       }
     default:
       {
@@ -1039,7 +1094,7 @@ static bool validateContainerPayloadForHub(uint16_t rawTopic, uint8_t *args, uin
         uint32_t storageMB = 0;
         bool isDownscale = false;
         uint32_t graceSeconds = 0;
-        return ProdigyWire::deserializeResourceDeltaPayloadAuto(
+        return ProdigyWire::deserializeResourceDeltaPayload(
             args,
             uint64_t(terminal - args),
             nLogicalCores,
@@ -1055,7 +1110,7 @@ static bool validateContainerPayloadForHub(uint16_t rawTopic, uint8_t *args, uin
         uint64_t service = 0;
         uint16_t applicationID = 0;
         bool activate = false;
-        return ProdigyWire::deserializeAdvertisementPairingPayloadAuto(
+        return ProdigyWire::deserializeAdvertisementPairingPayload(
             args,
             uint64_t(terminal - args),
             secret,
@@ -1072,7 +1127,7 @@ static bool validateContainerPayloadForHub(uint16_t rawTopic, uint8_t *args, uin
         uint16_t port = 0;
         uint16_t applicationID = 0;
         bool activate = false;
-        return ProdigyWire::deserializeSubscriptionPairingPayloadAuto(
+        return ProdigyWire::deserializeSubscriptionPairingPayload(
             args,
             uint64_t(terminal - args),
             secret,
@@ -1112,7 +1167,7 @@ static bool validateContainerPayloadForHub(uint16_t rawTopic, uint8_t *args, uin
         }
 
         CredentialDelta delta;
-        return ProdigyWire::deserializeCredentialDeltaFramePayloadAuto(args, uint64_t(terminal - args), delta);
+        return ProdigyWire::deserializeCredentialDeltaFramePayload(args, uint64_t(terminal - args), delta);
       }
     case ContainerTopic::message:
       {

@@ -160,6 +160,8 @@ set(PRODIGY_DEPOFILES
    "${PRODIGY_DEPOFILES_DIR}/mimalloc.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/nghttp2.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/openssl.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/picotls.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/picoquic.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/simdjson.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/snappy.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/static_type_info.DepoFile"
@@ -392,6 +394,7 @@ add_executable(prodigy_pingpong_container_google_egress ${CMAKE_CURRENT_SOURCE_D
 add_executable(prodigy_whitehole_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/whitehole_probe_container.cpp)
 add_executable(prodigy_quic_wormhole_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/quic_wormhole_probe_container.cpp)
 add_executable(prodigy_wormhole_matrix_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/wormhole_matrix_probe_container.cpp)
+add_executable(prodigy_resumption_readiness_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/resumption_readiness_probe_container.cpp)
 set(
    PRODIGY_RUNTIME_CONTAINER_PROBE_TARGETS
    prodigy_pingpong_container
@@ -402,6 +405,7 @@ set(
    prodigy_whitehole_probe_container
    prodigy_quic_wormhole_probe_container
    prodigy_wormhole_matrix_probe_container
+   prodigy_resumption_readiness_probe_container
 )
 add_executable(prodigy_gpu_device_mount_smoke ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_gpu_device_mount_smoke.cpp)
 add_executable(prodigy_shared_cpu_affinity_seccomp_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_shared_cpu_affinity_seccomp_unit.cpp)
@@ -581,6 +585,8 @@ if (NOT TARGET Prodigy::SdkCppOpinionated)
 endif()
 target_link_libraries(prodigy_sdk_c_selftest PRIVATE Prodigy::SdkC)
 target_link_libraries(prodigy_sdk_cpp_unit PRIVATE Prodigy::SdkCppOpinionated)
+target_link_libraries(prodigy_resumption_readiness_probe_container PRIVATE picoquic::picoquic)
+target_include_directories(prodigy_resumption_readiness_probe_container PRIVATE "${PRODIGY_ROOT}/.depos/.root/downloads/picoquic/release/master-6a14757/src/picoquic")
 
 set(PRODIGY_PTHREAD_TARGETS ${PRODIGY_ALL_BUILD_TARGETS})
 list(REMOVE_ITEM PRODIGY_PTHREAD_TARGETS prodigy mothership prodigy_sdk_cpp_unit)
@@ -633,6 +639,7 @@ target_compile_options(prodigy_pingpong_container_google_egress PUBLIC -O2)
 target_compile_options(prodigy_whitehole_probe_container PUBLIC -O2)
 target_compile_options(prodigy_quic_wormhole_probe_container PUBLIC -O2)
 target_compile_options(prodigy_wormhole_matrix_probe_container PUBLIC -O2)
+target_compile_options(prodigy_resumption_readiness_probe_container PUBLIC -O2)
 target_compile_options(prodigy_gpu_device_mount_smoke PUBLIC -O2)
 target_compile_options(prodigy_shared_cpu_affinity_seccomp_unit PUBLIC -O2)
 target_compile_options(prodigy_metrics_unit PUBLIC -O2)
@@ -1021,6 +1028,12 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    set_tests_properties(prodigy_dev_wormhole_matrix_smoke PROPERTIES SKIP_RETURN_CODE 77)
 
    add_test(
+      NAME prodigy_dev_resumption_readiness_smoke
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_resumption_readiness_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_resumption_readiness_probe_container
+   )
+   set_tests_properties(prodigy_dev_resumption_readiness_smoke PROPERTIES SKIP_RETURN_CODE 77)
+
+   add_test(
       NAME prodigy_dev_deployments_matrix_smoke
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_deployments_matrix.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container ${CMAKE_BINARY_DIR}/prodigy_pingpong_container_alt ${CMAKE_BINARY_DIR}/prodigy_pingpong_container_noport ${CMAKE_BINARY_DIR}/prodigy_pingpong_container_crash --mode=smoke
    )
@@ -1118,6 +1131,7 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       prodigy_dev_container_migration_matrix
       prodigy_dev_quic_wormhole_smoke
       prodigy_dev_wormhole_matrix_smoke
+      prodigy_dev_resumption_readiness_smoke
       prodigy_dev_deployments_matrix_smoke
       prodigy_dev_deployments_matrix_ci
    )
@@ -1163,6 +1177,7 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       prodigy_dev_os_update_reimage_matrix
       prodigy_dev_quic_wormhole_smoke
       prodigy_dev_wormhole_matrix_smoke
+      prodigy_dev_resumption_readiness_smoke
       prodigy_dev_deployments_matrix_smoke
       prodigy_dev_deployments_matrix_ci
       prodigy_host_egress_bpf_load_smoke

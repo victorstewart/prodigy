@@ -9,6 +9,7 @@
 #include <networking/private4.h>
 #include <services/prodigy.h>
 #include <services/vault.h>
+#include <prodigy/tls.resumption.h>
 
 #ifndef PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
 #define PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION PRODIGY_DEBUG
@@ -4238,6 +4239,7 @@ static inline uint32_t serviceUserCapacityPlanningWeight(const ServiceUserCapaci
 
 struct Wormhole {
 
+  String name;
   IPAddress externalAddress; // will include whether ipv6 or not
   uint16_t externalPort;
   uint16_t containerPort;
@@ -4247,6 +4249,8 @@ struct Wormhole {
   bool hasQuicCidKeyState = false;
   ExternalAddressSource source = ExternalAddressSource::distributableSubnet;
   uint128_t routableAddressUUID = 0;
+  bool hasTlsResumptionConfig = false;
+  TlsResumptionWormholeConfig tlsResumption;
   class QuicCidKeyState {
   public:
 
@@ -4270,6 +4274,7 @@ static void serialize(S&& serializer, Wormhole::QuicCidKeyState& state)
 template <typename S>
 static void serialize(S&& serializer, Wormhole& wormhole)
 {
+  serializer.text1b(wormhole.name, UINT32_MAX);
   serializer.object(wormhole.externalAddress);
   serializer.value2b(wormhole.externalPort);
   serializer.value2b(wormhole.containerPort);
@@ -4279,12 +4284,20 @@ static void serialize(S&& serializer, Wormhole& wormhole)
   serializer.value1b(wormhole.hasQuicCidKeyState);
   serializer.value1b(wormhole.source);
   serializer.value16b(wormhole.routableAddressUUID);
+  serializer.value1b(wormhole.hasTlsResumptionConfig);
+  serializer.object(wormhole.tlsResumption);
   serializer.object(wormhole.quicCidKeyState);
 }
 
 static inline bool wormholeUsesQuicCidEncryption(const Wormhole& wormhole)
 {
   return wormhole.isQuic && wormhole.layer4 == IPPROTO_UDP;
+}
+
+static inline bool wormholeSupportsTlsResumption(const Wormhole& wormhole)
+{
+  return wormhole.layer4 == IPPROTO_TCP ||
+         (wormhole.layer4 == IPPROTO_UDP && wormhole.isQuic);
 }
 
 static inline uint8_t wormholeQuicCidInactiveKeyIndex(const Wormhole::QuicCidKeyState& state)
@@ -4483,6 +4496,7 @@ public:
 
   Vector<TlsIdentity> tlsIdentities;
   Vector<ApiCredential> apiCredentials;
+  Vector<TlsResumptionSnapshot> tlsResumptionSnapshots;
   uint64_t bundleGeneration = 0;
 };
 
@@ -4491,6 +4505,7 @@ static void serialize(S&& serializer, CredentialBundle& bundle)
 {
   serializer.object(bundle.tlsIdentities);
   serializer.object(bundle.apiCredentials);
+  serializer.object(bundle.tlsResumptionSnapshots);
   serializer.value8b(bundle.bundleGeneration);
 }
 
@@ -4502,6 +4517,8 @@ public:
   Vector<String> removedTlsNames;
   Vector<ApiCredential> updatedApi;
   Vector<String> removedApiNames;
+  Vector<TlsResumptionSnapshot> updatedResumptionSnapshots;
+  Vector<String> removedResumptionWormholeNames;
   String reason;
 };
 
@@ -4517,33 +4534,23 @@ static void serialize(S&& serializer, CredentialDelta& delta)
   serializer.container(delta.removedApiNames, UINT32_MAX, [](S& serializer, String& name) {
     serializer.text1b(name, UINT32_MAX);
   });
+  serializer.object(delta.updatedResumptionSnapshots);
+  serializer.container(delta.removedResumptionWormholeNames, UINT32_MAX, [](S& serializer, String& name) {
+    serializer.text1b(name, UINT32_MAX);
+  });
   serializer.text1b(delta.reason, UINT32_MAX);
 }
 
-class CredentialApplyResult {
+class TlsResumptionApplyAck {
 public:
 
-  uint64_t bundleGeneration = 0;
-  bool success = false;
-  String failureReason;
-  Vector<String> appliedTlsNames;
-  Vector<String> appliedApiNames;
-  uint64_t hash = 0;
+  Vector<TlsResumptionApplyResult> results;
 };
 
 template <typename S>
-static void serialize(S&& serializer, CredentialApplyResult& result)
+static void serialize(S&& serializer, TlsResumptionApplyAck& ack)
 {
-  serializer.value8b(result.bundleGeneration);
-  serializer.value1b(result.success);
-  serializer.text1b(result.failureReason, UINT32_MAX);
-  serializer.container(result.appliedTlsNames, UINT32_MAX, [](S& serializer, String& name) {
-    serializer.text1b(name, UINT32_MAX);
-  });
-  serializer.container(result.appliedApiNames, UINT32_MAX, [](S& serializer, String& name) {
-    serializer.text1b(name, UINT32_MAX);
-  });
-  serializer.value8b(result.hash);
+  serializer.object(ack.results);
 }
 
 static void applyCredentialDelta(CredentialBundle& bundle, const CredentialDelta& delta)
@@ -4576,6 +4583,20 @@ static void applyCredentialDelta(CredentialBundle& bundle, const CredentialDelta
     }
   };
 
+  auto eraseResumptionByWormholeName = [&](const String& wormholeName) {
+    for (auto it = bundle.tlsResumptionSnapshots.begin(); it != bundle.tlsResumptionSnapshots.end();)
+    {
+      if (it->wormholeName.equal(wormholeName))
+      {
+        it = bundle.tlsResumptionSnapshots.erase(it);
+      }
+      else
+      {
+        ++it;
+      }
+    }
+  };
+
   for (const String& name : delta.removedTlsNames)
   {
     eraseTlsByName(name);
@@ -4584,6 +4605,11 @@ static void applyCredentialDelta(CredentialBundle& bundle, const CredentialDelta
   for (const String& name : delta.removedApiNames)
   {
     eraseApiByName(name);
+  }
+
+  for (const String& wormholeName : delta.removedResumptionWormholeNames)
+  {
+    eraseResumptionByWormholeName(wormholeName);
   }
 
   for (const TlsIdentity& identity : delta.updatedTls)
@@ -4598,7 +4624,58 @@ static void applyCredentialDelta(CredentialBundle& bundle, const CredentialDelta
     bundle.apiCredentials.push_back(credential);
   }
 
+  for (const TlsResumptionSnapshot& snapshot : delta.updatedResumptionSnapshots)
+  {
+    eraseResumptionByWormholeName(snapshot.wormholeName);
+    bundle.tlsResumptionSnapshots.push_back(snapshot);
+  }
+
   bundle.bundleGeneration = delta.bundleGeneration;
+}
+
+static inline bool applyCredentialBundleResumptionLocally(
+    ProdigyResumptionRegistry& registry,
+    const CredentialBundle& bundle,
+    TlsResumptionApplyAck& ack)
+{
+  ack = {};
+  bool sawResumption = false;
+
+  for (const TlsResumptionSnapshot& snapshot : bundle.tlsResumptionSnapshots)
+  {
+    TlsResumptionApplyResult applyResult = {};
+    (void)registry.applySnapshot(snapshot, &applyResult);
+    ack.results.push_back(applyResult);
+    sawResumption = true;
+  }
+
+  return sawResumption;
+}
+
+static inline bool applyCredentialDeltaResumptionLocally(
+    ProdigyResumptionRegistry& registry,
+    CredentialBundle& bundle,
+    const CredentialDelta& delta,
+    TlsResumptionApplyAck& ack)
+{
+  ack = {};
+  bool sawResumption = delta.updatedResumptionSnapshots.empty() == false ||
+                       delta.removedResumptionWormholeNames.empty() == false;
+
+  if (sawResumption)
+  {
+    if (registry.applyDelta(
+            delta.updatedResumptionSnapshots,
+            delta.removedResumptionWormholeNames,
+            delta.bundleGeneration,
+            &ack.results) == false)
+    {
+      return true;
+    }
+  }
+
+  applyCredentialDelta(bundle, delta);
+  return sawResumption;
 }
 
 class ApplicationIDReserveRequest {
@@ -5136,7 +5213,9 @@ public:
   bool hasCompletedInitialMasterElection = false;
   ProdigyTransportTLSAuthority transportTLSAuthority;
   uint64_t nextMintedClientTlsGeneration = 1;
+  uint64_t nextTlsResumptionGeneration = 1;
   uint64_t nextPendingAddMachinesOperationID = 1;
+  ProdigyResumptionRegistry::SnapshotMap tlsResumptionSnapshotsByWormhole;
   Vector<ProdigyPendingAddMachinesOperation> pendingAddMachinesOperations;
   Vector<ProdigyStatefulWorkerTopologyUpgradeOperation> statefulWorkerTopologyUpgradeOperations;
   Vector<ProdigyDeferredStatefulScaleIntent> deferredStatefulScaleIntents;
@@ -5145,9 +5224,18 @@ public:
 
   bool operator==(const ProdigyMasterAuthorityRuntimeState& other) const
   {
-    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || machineSchemas.size() != other.machineSchemas.size() || updateSelf != other.updateSelf)
+    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || machineSchemas.size() != other.machineSchemas.size() || updateSelf != other.updateSelf)
     {
       return false;
+    }
+
+    for (const auto& [key, snapshot] : tlsResumptionSnapshotsByWormhole)
+    {
+      auto it = other.tlsResumptionSnapshotsByWormhole.find(key);
+      if (it == other.tlsResumptionSnapshotsByWormhole.end() || prodigyTlsResumptionSnapshotsEqual(it->second, snapshot) == false)
+      {
+        return false;
+      }
     }
 
     for (uint32_t index = 0; index < pendingAddMachinesOperations.size(); ++index)
@@ -5198,7 +5286,9 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
   serializer.value1b(state.hasCompletedInitialMasterElection);
   serializer.object(state.transportTLSAuthority);
   serializer.value8b(state.nextMintedClientTlsGeneration);
+  serializer.value8b(state.nextTlsResumptionGeneration);
   serializer.value8b(state.nextPendingAddMachinesOperationID);
+  serializer.object(state.tlsResumptionSnapshotsByWormhole);
   serializer.object(state.pendingAddMachinesOperations);
   serializer.object(state.statefulWorkerTopologyUpgradeOperations);
   serializer.object(state.deferredStatefulScaleIntents);

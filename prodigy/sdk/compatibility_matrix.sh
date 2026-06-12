@@ -146,6 +146,7 @@ import sys
 import tomllib
 
 sdk = pathlib.Path(sys.argv[1])
+prodigy = sdk.parent
 versioning = json.loads((sdk / "versioning.json").read_text(encoding="utf-8"))
 sdk_version = versioning["sdkVersion"]
 wire_series = versioning["wireSeries"]
@@ -162,6 +163,17 @@ def capture(label: str, path: pathlib.Path, pattern: str) -> str:
       raise SystemExit(f"{label}: pattern not found in {path}")
    return match.group(1)
 
+def capture_wire_magic(label: str, symbol: str) -> str:
+   text = (prodigy / "wire.h").read_text(encoding="utf-8")
+   pattern = rf'constexpr static uint8_t {symbol}\[8\] = \{{([^}}]+)\}};'
+   match = re.search(pattern, text, re.MULTILINE)
+   if not match:
+      raise SystemExit(f"{label}: pattern not found in {prodigy / 'wire.h'}")
+   values = re.findall(r"'(.)'", match.group(1))
+   if len(values) != 8:
+      raise SystemExit(f"{label}: expected 8 magic bytes in {prodigy / 'wire.h'}")
+   return "".join(values)
+
 expect_equal(
    "Cargo.toml sdkVersion",
    tomllib.loads((sdk / "rust" / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"],
@@ -176,6 +188,22 @@ expect_equal(
    "package.json sdkVersion",
    json.loads((sdk / "typescript" / "package.json").read_text(encoding="utf-8"))["version"],
    sdk_version,
+)
+
+expect_equal(
+   "core wire containerParametersMagic",
+   capture_wire_magic("core wire containerParametersMagic", "containerParametersMagic"),
+   versioning["containerParametersMagic"],
+)
+expect_equal(
+   "core wire credentialBundleMagic",
+   capture_wire_magic("core wire credentialBundleMagic", "credentialBundleMagic"),
+   versioning["credentialBundleMagic"],
+)
+expect_equal(
+   "core wire credentialDeltaMagic",
+   capture_wire_magic("core wire credentialDeltaMagic", "credentialDeltaMagic"),
+   versioning["credentialDeltaMagic"],
 )
 
 expect_equal(

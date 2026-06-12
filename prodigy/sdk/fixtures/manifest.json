@@ -1,8 +1,8 @@
 {
-   "manifestVersion": 3,
+   "manifestVersion": 1,
    "wireSeries": "WIRE_V1",
    "wireProtocolVersion": 1,
-   "fixtureCorpusVersion": 2,
+   "fixtureCorpusVersion": 1,
    "containerParametersMagic": "PRDPAR01",
    "credentialBundleMagic": "PRDBUN01",
    "credentialDeltaMagic": "PRDDEL01",
@@ -36,8 +36,8 @@
          "file": "frame.credentials_refresh.full.bin",
          "kind": "frame",
          "name": "frame.credentials_refresh.full",
-         "sha256": "7cd53ed67b233d540ebfdd09fbf13540a7f6bd32dbe781f3c6d4d89493df9eb3",
-         "size": 544,
+         "sha256": "0e743f8690de6f6d391c58dd981e562c6c03924be09ae57e506ce20fa3901ff0",
+         "size": 688,
          "topic": "credentialsRefresh"
       },
       {
@@ -135,8 +135,8 @@
          "file": "payload.credentials_refresh.full.bin",
          "kind": "payload",
          "name": "payload.credentials_refresh.full",
-         "sha256": "f8a19b7dc0c04c73c5fe0ceb10645c0248905903efa775ec086e64a903678ec3",
-         "size": 528,
+         "sha256": "5c8c103e1cee51a1aecbfec2752fb8c7d20a505078785320dbf3a9cb1676b68a",
+         "size": 666,
          "topic": "credentialsRefresh"
       },
       {
@@ -189,24 +189,24 @@
          "file": "startup.container_parameters.full.bin",
          "kind": "startup",
          "name": "startup.container_parameters.full",
-         "sha256": "fbd0f527e474a17cbf9be56b2960e96ec2f21b5fce885094ce86780f92333e9f",
-         "size": 660
+         "sha256": "349bf82e628e97e1ff5ad4403fce624e7261c55c11fcf99f8066082350951411",
+         "size": 768
       },
       {
          "description": "Standalone CredentialBundle fixture",
          "file": "startup.credential_bundle.full.bin",
          "kind": "startup",
          "name": "startup.credential_bundle.full",
-         "sha256": "cc5542d690d7e06c7c34cd652b40b8c6f27c71b41280d90ba4d62f7d18be8c0f",
-         "size": 469
+         "sha256": "0905ce2dd314a2ae89aca57656dbeb097139535684afbd1e1a952e8a57dd6b26",
+         "size": 577
       },
       {
          "description": "Standalone CredentialDelta fixture",
          "file": "startup.credential_delta.full.bin",
          "kind": "startup",
          "name": "startup.credential_delta.full",
-         "sha256": "f8a19b7dc0c04c73c5fe0ceb10645c0248905903efa775ec086e64a903678ec3",
-         "size": 528
+         "sha256": "5c8c103e1cee51a1aecbfec2752fb8c7d20a505078785320dbf3a9cb1676b68a",
+         "size": 666
       }
    ]
 }

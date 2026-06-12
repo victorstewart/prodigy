@@ -58,6 +58,7 @@ set(
    _PRODIGY_SDK_CPP_INSTALL_DEPOFILES
    "${PRODIGY_SDK_DEPOFILES_DIR}/aegis.DepoFile"
    "${PRODIGY_SDK_DEPOFILES_DIR}/gxhash.DepoFile"
+   "${PRODIGY_SDK_DEPOFILES_DIR}/openssl.DepoFile"
 )
 
 if (PRODIGY_SDK_USE_DEPOS_BASICS
@@ -143,6 +144,10 @@ endif()
 
 if (TARGET basics::basics)
 
+   if (NOT TARGET openssl::crypto OR NOT TARGET openssl::ssl)
+      message(FATAL_ERROR "Prodigy opinionated C++ SDK TLS resumption helpers require openssl::crypto and openssl::ssl targets.")
+   endif()
+
    add_library(prodigy_sdk_cpp_opinionated INTERFACE)
    add_library(Prodigy::SdkCppOpinionated ALIAS prodigy_sdk_cpp_opinionated)
    target_compile_features(prodigy_sdk_cpp_opinionated INTERFACE cxx_std_20)
@@ -150,6 +155,8 @@ if (TARGET basics::basics)
       INTERFACE
          Prodigy::SdkCpp
          basics::basics
+         openssl::ssl
+         openssl::crypto
    )
    set_target_properties(prodigy_sdk_cpp_opinionated PROPERTIES
       EXPORT_NAME SdkCppOpinionated

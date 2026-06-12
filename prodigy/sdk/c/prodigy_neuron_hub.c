@@ -29,7 +29,7 @@ typedef struct prodigy_reader {
 
 static const uint8_t prodigy_container_parameters_magic[8] = {'P', 'R', 'D', 'P', 'A', 'R', '0', '1'};
 static const uint8_t prodigy_credential_bundle_magic[8] = {'P', 'R', 'D', 'B', 'U', 'N', '0', '1'};
-static const uint8_t prodigy_credential_delta_magic[8] = {'P', 'R', 'D', 'D', 'E', 'L', '0', '1'};
+static const uint32_t prodigy_max_wire_collection_elements = 16u * 1024u;
 
 extern uint64_t gxhash64(const void *buf, size_t len, int64_t seed);
 
@@ -533,6 +533,18 @@ static void prodigy_api_credential_free(prodigy_api_credential *credential)
   credential->metadata_count = 0;
 }
 
+static void prodigy_tls_resumption_snapshot_free(prodigy_tls_resumption_snapshot *snapshot)
+{
+  if (snapshot == NULL)
+  {
+    return;
+  }
+
+  prodigy_bytes_free(&snapshot->wormhole_name);
+  free(snapshot->key_ring);
+  memset(snapshot, 0, sizeof(*snapshot));
+}
+
 void prodigy_credential_bundle_free(prodigy_credential_bundle *bundle)
 {
   size_t index = 0;
@@ -558,52 +570,15 @@ void prodigy_credential_bundle_free(prodigy_credential_bundle *bundle)
   bundle->api_credentials = NULL;
   bundle->api_credential_count = 0;
 
+  for (index = 0; index < bundle->tls_resumption_snapshot_count; index += 1)
+  {
+    prodigy_tls_resumption_snapshot_free(&bundle->tls_resumption_snapshots[index]);
+  }
+  free(bundle->tls_resumption_snapshots);
+  bundle->tls_resumption_snapshots = NULL;
+  bundle->tls_resumption_snapshot_count = 0;
+
   bundle->bundle_generation = 0;
-}
-
-void prodigy_credential_delta_free(prodigy_credential_delta *delta)
-{
-  size_t index = 0;
-
-  if (delta == NULL)
-  {
-    return;
-  }
-
-  for (index = 0; index < delta->updated_tls_count; index += 1)
-  {
-    prodigy_tls_identity_free(&delta->updated_tls[index]);
-  }
-  free(delta->updated_tls);
-  delta->updated_tls = NULL;
-  delta->updated_tls_count = 0;
-
-  for (index = 0; index < delta->removed_tls_name_count; index += 1)
-  {
-    prodigy_bytes_free(&delta->removed_tls_names[index]);
-  }
-  free(delta->removed_tls_names);
-  delta->removed_tls_names = NULL;
-  delta->removed_tls_name_count = 0;
-
-  for (index = 0; index < delta->updated_api_count; index += 1)
-  {
-    prodigy_api_credential_free(&delta->updated_api[index]);
-  }
-  free(delta->updated_api);
-  delta->updated_api = NULL;
-  delta->updated_api_count = 0;
-
-  for (index = 0; index < delta->removed_api_name_count; index += 1)
-  {
-    prodigy_bytes_free(&delta->removed_api_names[index]);
-  }
-  free(delta->removed_api_names);
-  delta->removed_api_names = NULL;
-  delta->removed_api_name_count = 0;
-
-  prodigy_bytes_free(&delta->reason);
-  delta->bundle_generation = 0;
 }
 
 void prodigy_container_parameters_free(prodigy_container_parameters *parameters)
@@ -801,6 +776,49 @@ static prodigy_result prodigy_read_owned_bytes(prodigy_reader *reader, prodigy_b
   return PRODIGY_RESULT_OK;
 }
 
+static prodigy_result prodigy_skip_bytes(prodigy_reader *reader)
+{
+  uint32_t length = 0;
+  prodigy_result result = prodigy_read_u32(reader, &length);
+  if (result != PRODIGY_RESULT_OK)
+  {
+    return result;
+  }
+  if (prodigy_reader_remaining(reader) < length)
+  {
+    return PRODIGY_RESULT_PROTOCOL;
+  }
+
+  reader->cursor += length;
+  return PRODIGY_RESULT_OK;
+}
+
+static prodigy_result prodigy_skip_string_array(prodigy_reader *reader)
+{
+  uint32_t count = 0;
+  uint32_t index = 0;
+  prodigy_result result = prodigy_read_u32(reader, &count);
+  if (result != PRODIGY_RESULT_OK)
+  {
+    return result;
+  }
+  if (count > prodigy_max_wire_collection_elements)
+  {
+    return PRODIGY_RESULT_PROTOCOL;
+  }
+
+  for (index = 0; index < count; index += 1)
+  {
+    result = prodigy_skip_bytes(reader);
+    if (result != PRODIGY_RESULT_OK)
+    {
+      return result;
+    }
+  }
+
+  return PRODIGY_RESULT_OK;
+}
+
 static prodigy_result prodigy_read_magic(prodigy_reader *reader, const uint8_t magic[8])
 {
   if (prodigy_reader_remaining(reader) < 8)
@@ -849,6 +867,10 @@ static prodigy_result prodigy_read_string_array(prodigy_reader *reader, prodigy_
   {
     return result;
   }
+  if (raw_count > prodigy_max_wire_collection_elements)
+  {
+    return PRODIGY_RESULT_PROTOCOL;
+  }
 
   *values = NULL;
   *count = (size_t)raw_count;
@@ -889,6 +911,10 @@ static prodigy_result prodigy_read_ip_address_array(prodigy_reader *reader, prod
   if (result != PRODIGY_RESULT_OK)
   {
     return result;
+  }
+  if (raw_count > prodigy_max_wire_collection_elements)
+  {
+    return PRODIGY_RESULT_PROTOCOL;
   }
 
   *values = NULL;
@@ -1052,7 +1078,119 @@ static prodigy_result prodigy_read_api_credential(prodigy_reader *reader, prodig
   return PRODIGY_RESULT_OK;
 }
 
-static prodigy_result prodigy_decode_credential_bundle_fields(prodigy_reader *reader, prodigy_credential_bundle *bundle)
+static prodigy_result prodigy_read_tls_resumption_key_epoch(prodigy_reader *reader, prodigy_tls_resumption_key_epoch *epoch)
+{
+  prodigy_result result = prodigy_read_u64(reader, &epoch->generation);
+  if (result != PRODIGY_RESULT_OK)
+  {
+    return result;
+  }
+  result = prodigy_read_u8(reader, &epoch->role);
+  if (result != PRODIGY_RESULT_OK || epoch->role > 1u)
+  {
+    return result == PRODIGY_RESULT_OK ? PRODIGY_RESULT_PROTOCOL : result;
+  }
+  result = prodigy_read_exact_bytes(reader, epoch->key_id, sizeof(epoch->key_id));
+  if (result != PRODIGY_RESULT_OK)
+  {
+    return result;
+  }
+  result = prodigy_read_exact_bytes(reader, epoch->master_secret, sizeof(epoch->master_secret));
+  if (result != PRODIGY_RESULT_OK)
+  {
+    return result;
+  }
+  result = prodigy_read_i64(reader, &epoch->issue_until_ms);
+  if (result != PRODIGY_RESULT_OK)
+  {
+    return result;
+  }
+  return prodigy_read_i64(reader, &epoch->accept_until_ms);
+}
+
+static prodigy_result prodigy_read_tls_resumption_snapshot(prodigy_reader *reader, prodigy_tls_resumption_snapshot *snapshot)
+{
+  uint32_t key_count = 0;
+  uint32_t index = 0;
+  prodigy_result result = prodigy_read_u64(reader, &snapshot->generation);
+  if (result != PRODIGY_RESULT_OK)
+  {
+    return result;
+  }
+  result = prodigy_read_owned_bytes(reader, &snapshot->wormhole_name);
+  if (result != PRODIGY_RESULT_OK)
+  {
+    return result;
+  }
+  result = prodigy_read_u32(reader, &key_count);
+  if (result != PRODIGY_RESULT_OK)
+  {
+    return result;
+  }
+  if (key_count > prodigy_max_wire_collection_elements)
+  {
+    return PRODIGY_RESULT_PROTOCOL;
+  }
+  snapshot->key_ring_count = (size_t)key_count;
+  if (snapshot->key_ring_count > 0)
+  {
+    snapshot->key_ring = (prodigy_tls_resumption_key_epoch *)prodigy_calloc_array(snapshot->key_ring_count, sizeof(*snapshot->key_ring));
+    if (snapshot->key_ring == NULL)
+    {
+      return PRODIGY_RESULT_MEMORY;
+    }
+  }
+  for (index = 0; index < key_count; index += 1)
+  {
+    result = prodigy_read_tls_resumption_key_epoch(reader, &snapshot->key_ring[index]);
+    if (result != PRODIGY_RESULT_OK)
+    {
+      return result;
+    }
+  }
+  return PRODIGY_RESULT_OK;
+}
+
+static prodigy_result prodigy_read_tls_resumption_snapshot_array(
+    prodigy_reader *reader,
+    prodigy_tls_resumption_snapshot **snapshots,
+    size_t *count)
+{
+  uint32_t raw_count = 0;
+  uint32_t index = 0;
+  prodigy_result result = prodigy_read_u32(reader, &raw_count);
+  if (result != PRODIGY_RESULT_OK)
+  {
+    return result;
+  }
+  if (raw_count > prodigy_max_wire_collection_elements)
+  {
+    return PRODIGY_RESULT_PROTOCOL;
+  }
+  *snapshots = NULL;
+  *count = (size_t)raw_count;
+  if (*count > 0)
+  {
+    *snapshots = (prodigy_tls_resumption_snapshot *)prodigy_calloc_array(*count, sizeof(**snapshots));
+    if (*snapshots == NULL)
+    {
+      return PRODIGY_RESULT_MEMORY;
+    }
+  }
+  for (index = 0; index < raw_count; index += 1)
+  {
+    result = prodigy_read_tls_resumption_snapshot(reader, &(*snapshots)[index]);
+    if (result != PRODIGY_RESULT_OK)
+    {
+      return result;
+    }
+  }
+  return PRODIGY_RESULT_OK;
+}
+
+static prodigy_result prodigy_decode_credential_bundle_fields(
+    prodigy_reader *reader,
+    prodigy_credential_bundle *bundle)
 {
   uint32_t tls_count = 0;
   uint32_t api_count = 0;
@@ -1109,90 +1247,22 @@ static prodigy_result prodigy_decode_credential_bundle_fields(prodigy_reader *re
     }
   }
 
-  return prodigy_read_u64(reader, &bundle->bundle_generation);
+  result = prodigy_read_u64(reader, &bundle->bundle_generation);
+  if (result != PRODIGY_RESULT_OK)
+  {
+    return result;
+  }
+
+  return prodigy_read_tls_resumption_snapshot_array(
+      reader,
+      &bundle->tls_resumption_snapshots,
+      &bundle->tls_resumption_snapshot_count);
 }
 
-static prodigy_result prodigy_decode_credential_delta_fields(prodigy_reader *reader, prodigy_credential_delta *delta)
-{
-  uint32_t updated_tls_count = 0;
-  uint32_t updated_api_count = 0;
-  size_t index = 0;
-  prodigy_result result = PRODIGY_RESULT_OK;
-
-  memset(delta, 0, sizeof(*delta));
-
-  result = prodigy_read_u64(reader, &delta->bundle_generation);
-  if (result != PRODIGY_RESULT_OK)
-  {
-    return result;
-  }
-  result = prodigy_read_u32(reader, &updated_tls_count);
-  if (result != PRODIGY_RESULT_OK)
-  {
-    return result;
-  }
-
-  delta->updated_tls_count = (size_t)updated_tls_count;
-  if (delta->updated_tls_count > 0)
-  {
-    delta->updated_tls = (prodigy_tls_identity *)prodigy_calloc_array(delta->updated_tls_count, sizeof(*delta->updated_tls));
-    if (delta->updated_tls == NULL)
-    {
-      return PRODIGY_RESULT_MEMORY;
-    }
-
-    for (index = 0; index < delta->updated_tls_count; index += 1)
-    {
-      result = prodigy_read_tls_identity(reader, &delta->updated_tls[index]);
-      if (result != PRODIGY_RESULT_OK)
-      {
-        return result;
-      }
-    }
-  }
-
-  result = prodigy_read_string_array(reader, &delta->removed_tls_names, &delta->removed_tls_name_count);
-  if (result != PRODIGY_RESULT_OK)
-  {
-    return result;
-  }
-
-  result = prodigy_read_u32(reader, &updated_api_count);
-  if (result != PRODIGY_RESULT_OK)
-  {
-    return result;
-  }
-  delta->updated_api_count = (size_t)updated_api_count;
-  if (delta->updated_api_count > 0)
-  {
-    delta->updated_api = (prodigy_api_credential *)prodigy_calloc_array(delta->updated_api_count, sizeof(*delta->updated_api));
-    if (delta->updated_api == NULL)
-    {
-      return PRODIGY_RESULT_MEMORY;
-    }
-
-    for (index = 0; index < delta->updated_api_count; index += 1)
-    {
-      result = prodigy_read_api_credential(reader, &delta->updated_api[index]);
-      if (result != PRODIGY_RESULT_OK)
-      {
-        return result;
-      }
-    }
-  }
-
-  result = prodigy_read_string_array(reader, &delta->removed_api_names, &delta->removed_api_name_count);
-  if (result != PRODIGY_RESULT_OK)
-  {
-    return result;
-  }
-
-  return prodigy_read_owned_bytes(reader, &delta->reason);
-}
-
-prodigy_result prodigy_decode_credential_bundle(
+static prodigy_result prodigy_decode_credential_bundle_with_magic(
     const uint8_t *data,
     size_t size,
+    const uint8_t magic[8],
     prodigy_credential_bundle *bundle)
 {
   prodigy_reader reader;
@@ -1204,7 +1274,7 @@ prodigy_result prodigy_decode_credential_bundle(
   }
 
   prodigy_reader_init(&reader, data, size);
-  result = prodigy_read_magic(&reader, prodigy_credential_bundle_magic);
+  result = prodigy_read_magic(&reader, magic);
   if (result != PRODIGY_RESULT_OK)
   {
     return result;
@@ -1225,44 +1295,37 @@ prodigy_result prodigy_decode_credential_bundle(
   return PRODIGY_RESULT_OK;
 }
 
-prodigy_result prodigy_decode_credential_delta(
+prodigy_result prodigy_decode_credential_bundle(
     const uint8_t *data,
     size_t size,
-    prodigy_credential_delta *delta)
+    prodigy_credential_bundle *bundle)
 {
-  prodigy_reader reader;
+  prodigy_credential_bundle decoded;
   prodigy_result result = PRODIGY_RESULT_OK;
 
-  if (data == NULL || delta == NULL)
+  if (data == NULL || bundle == NULL)
   {
     return PRODIGY_RESULT_ARGUMENT;
   }
 
-  prodigy_reader_init(&reader, data, size);
-  result = prodigy_read_magic(&reader, prodigy_credential_delta_magic);
-  if (result != PRODIGY_RESULT_OK)
-  {
-    return result;
-  }
-  result = prodigy_decode_credential_delta_fields(&reader, delta);
-  if (result != PRODIGY_RESULT_OK)
-  {
-    prodigy_credential_delta_free(delta);
-    return result;
-  }
+  memset(&decoded, 0, sizeof(decoded));
+  result = prodigy_decode_credential_bundle_with_magic(
+      data,
+      size,
+      prodigy_credential_bundle_magic,
+      &decoded);
 
-  if (prodigy_reader_remaining(&reader) != 0)
+  if (result == PRODIGY_RESULT_OK)
   {
-    prodigy_credential_delta_free(delta);
-    return PRODIGY_RESULT_PROTOCOL;
+    *bundle = decoded;
   }
-
-  return PRODIGY_RESULT_OK;
+  return result;
 }
 
-prodigy_result prodigy_decode_container_parameters(
+static prodigy_result prodigy_decode_container_parameters_with_magic(
     const uint8_t *data,
     size_t size,
+    const uint8_t magic[8],
     prodigy_container_parameters *parameters)
 {
   prodigy_reader reader;
@@ -1278,7 +1341,7 @@ prodigy_result prodigy_decode_container_parameters(
   memset(parameters, 0, sizeof(*parameters));
   prodigy_reader_init(&reader, data, size);
 
-  result = prodigy_read_magic(&reader, prodigy_container_parameters_magic);
+  result = prodigy_read_magic(&reader, magic);
   if (result != PRODIGY_RESULT_OK)
   {
     return result;
@@ -1497,6 +1560,33 @@ prodigy_result prodigy_decode_container_parameters(
 
 fail:
   prodigy_container_parameters_free(parameters);
+  return result;
+}
+
+prodigy_result prodigy_decode_container_parameters(
+    const uint8_t *data,
+    size_t size,
+    prodigy_container_parameters *parameters)
+{
+  prodigy_container_parameters decoded;
+  prodigy_result result = PRODIGY_RESULT_OK;
+
+  if (data == NULL || parameters == NULL)
+  {
+    return PRODIGY_RESULT_ARGUMENT;
+  }
+
+  memset(&decoded, 0, sizeof(decoded));
+  result = prodigy_decode_container_parameters_with_magic(
+      data,
+      size,
+      prodigy_container_parameters_magic,
+      &decoded);
+
+  if (result == PRODIGY_RESULT_OK)
+  {
+    *parameters = decoded;
+  }
   return result;
 }
 
@@ -1829,6 +1919,23 @@ prodigy_result prodigy_build_resource_delta_ack_frame(
 prodigy_result prodigy_build_credentials_refresh_ack_frame(prodigy_bytes *frame)
 {
   return prodigy_build_message_frame(PRODIGY_CONTAINER_TOPIC_CREDENTIALS_REFRESH, NULL, 0, frame);
+}
+
+prodigy_result prodigy_build_credentials_refresh_ack_payload_frame(
+    const uint8_t *payload,
+    size_t payload_size,
+    prodigy_bytes *frame)
+{
+  if ((payload == NULL && payload_size != 0u) || frame == NULL)
+  {
+    return PRODIGY_RESULT_ARGUMENT;
+  }
+
+  return prodigy_build_message_frame(
+      PRODIGY_CONTAINER_TOPIC_CREDENTIALS_REFRESH,
+      payload,
+      payload_size,
+      frame);
 }
 
 prodigy_result prodigy_parse_message_frame(
@@ -2232,23 +2339,10 @@ prodigy_result prodigy_neuron_hub_handle_message_frame(
       }
     case PRODIGY_CONTAINER_TOPIC_CREDENTIALS_REFRESH:
       {
-        prodigy_credential_delta delta;
-        if (payload_size == 0)
-        {
-          return PRODIGY_RESULT_OK;
-        }
-
-        result = prodigy_decode_credential_delta(payload, payload_size, &delta);
-        if (result != PRODIGY_RESULT_OK)
-        {
-          return result;
-        }
-
         if (hub->callbacks.credentials_refresh != NULL)
         {
-          hub->callbacks.credentials_refresh(hub->context, hub, &delta);
+          hub->callbacks.credentials_refresh(hub->context, hub, payload, payload_size);
         }
-        prodigy_credential_delta_free(&delta);
         return PRODIGY_RESULT_OK;
       }
     case PRODIGY_CONTAINER_TOPIC_WORMHOLES_REFRESH:
@@ -2564,16 +2658,24 @@ prodigy_result prodigy_neuron_hub_acknowledge_resource_delta(
 prodigy_result prodigy_neuron_hub_acknowledge_credentials_refresh(
     prodigy_neuron_hub *hub)
 {
+  return prodigy_neuron_hub_acknowledge_credentials_refresh_payload(hub, NULL, 0);
+}
+
+prodigy_result prodigy_neuron_hub_acknowledge_credentials_refresh_payload(
+    prodigy_neuron_hub *hub,
+    const uint8_t *payload,
+    size_t payload_size)
+{
   prodigy_bytes frame;
   prodigy_result result = PRODIGY_RESULT_OK;
 
-  if (hub == NULL)
+  if (hub == NULL || (payload == NULL && payload_size != 0u))
   {
     return PRODIGY_RESULT_ARGUMENT;
   }
 
   memset(&frame, 0, sizeof(frame));
-  result = prodigy_build_credentials_refresh_ack_frame(&frame);
+  result = prodigy_build_credentials_refresh_ack_payload_frame(payload, payload_size, &frame);
   if (result != PRODIGY_RESULT_OK)
   {
     return result;

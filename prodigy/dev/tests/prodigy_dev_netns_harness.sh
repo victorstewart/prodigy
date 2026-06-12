@@ -1711,7 +1711,7 @@ resolve_prodigy_bundle_artifact_path_for_input()
    esac
 
    input_dir="$(dirname "${input_path}")"
-   if [[ -r "${input_dir}/${bundle_name}" ]]
+   if [[ -r "${input_dir}/${bundle_name}" || -f "${input_dir}/build.ninja" || -f "${input_dir}/CMakeCache.txt" ]]
    then
       printf '%s\n' "${input_dir}/${bundle_name}"
       return 0

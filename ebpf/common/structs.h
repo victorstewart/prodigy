@@ -3,7 +3,9 @@
 
 #pragma once
 
+#ifndef QUIC_CID_LEN
 #define QUIC_CID_LEN 16
+#endif
 
 struct mac {
   __u8 mac[6];

@@ -2,6 +2,7 @@
 /.depos.cmake
 /.github/
 /.run/
+/.experiments/
 /.tasks/
 /.worktrees/
 /default.profraw

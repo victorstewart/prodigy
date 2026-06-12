@@ -148,9 +148,27 @@ class ApiCredential:
 
 
 @dataclass(frozen=True)
+class TlsResumptionKeyEpoch:
+   generation: int
+   role: int
+   key_id: bytes
+   master_secret: bytes
+   issue_until_ms: int
+   accept_until_ms: int
+
+
+@dataclass(frozen=True)
+class TlsResumptionSnapshot:
+   generation: int
+   wormhole_name: str
+   key_ring: list[TlsResumptionKeyEpoch]
+
+
+@dataclass(frozen=True)
 class CredentialBundle:
    tls_identities: list[TlsIdentity] = field(default_factory=list)
    api_credentials: list[ApiCredential] = field(default_factory=list)
+   tls_resumption_snapshots: list[TlsResumptionSnapshot] = field(default_factory=list)
    bundle_generation: int = 0
 
 
@@ -161,6 +179,8 @@ class CredentialDelta:
    removed_tls_names: list[str] = field(default_factory=list)
    updated_api: list[ApiCredential] = field(default_factory=list)
    removed_api_names: list[str] = field(default_factory=list)
+   updated_resumption_snapshots: list[TlsResumptionSnapshot] = field(default_factory=list)
+   removed_resumption_wormhole_names: list[str] = field(default_factory=list)
    reason: str = ""
 
 
@@ -389,6 +409,39 @@ def _decode_string_array(reader: _Reader) -> list[str]:
    return [reader.string() for _ in range(reader.u32())]
 
 
+def _skip_string_array(reader: _Reader) -> None:
+   for _ in range(reader.u32()):
+      reader.string()
+
+
+def _decode_tls_resumption_key_epoch(reader: _Reader) -> TlsResumptionKeyEpoch:
+   generation = reader.u64()
+   role = reader.u8()
+   if role > 1:
+      raise ProtocolError("invalid tls resumption key role")
+   return TlsResumptionKeyEpoch(
+      generation=generation,
+      role=role,
+      key_id=reader.raw(16),
+      master_secret=reader.raw(32),
+      issue_until_ms=reader.i64(),
+      accept_until_ms=reader.i64(),
+   )
+
+
+def _decode_tls_resumption_snapshots(reader: _Reader) -> list[TlsResumptionSnapshot]:
+   snapshots: list[TlsResumptionSnapshot] = []
+   for _ in range(reader.u32()):
+      generation = reader.u64()
+      wormhole_name = reader.string()
+      snapshots.append(TlsResumptionSnapshot(
+         generation=generation,
+         wormhole_name=wormhole_name,
+         key_ring=[_decode_tls_resumption_key_epoch(reader) for _ in range(reader.u32())],
+      ))
+   return snapshots
+
+
 def _decode_ip_address_array(reader: _Reader) -> list[IPAddress]:
    return [_decode_ip_address(reader) for _ in range(reader.u32())]
 
@@ -435,10 +488,13 @@ def _decode_api_credential(reader: _Reader) -> ApiCredential:
 def _decode_credential_bundle_fields(reader: _Reader) -> CredentialBundle:
    tls_identities = [_decode_tls_identity(reader) for _ in range(reader.u32())]
    api_credentials = [_decode_api_credential(reader) for _ in range(reader.u32())]
+   bundle_generation = reader.u64()
+   tls_resumption_snapshots = _decode_tls_resumption_snapshots(reader)
    return CredentialBundle(
       tls_identities=tls_identities,
       api_credentials=api_credentials,
-      bundle_generation=reader.u64(),
+      tls_resumption_snapshots=tls_resumption_snapshots,
+      bundle_generation=bundle_generation,
    )
 
 
@@ -461,6 +517,8 @@ def decode_credential_delta(data: bytes) -> CredentialDelta:
       updated_api=[_decode_api_credential(reader) for _ in range(reader.u32())],
       removed_api_names=_decode_string_array(reader),
       reason=reader.string(),
+      updated_resumption_snapshots=_decode_tls_resumption_snapshots(reader),
+      removed_resumption_wormhole_names=_decode_string_array(reader),
    )
    if not reader.done():
       raise ProtocolError("credential delta has trailing bytes")

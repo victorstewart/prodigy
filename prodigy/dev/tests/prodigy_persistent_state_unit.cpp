@@ -860,6 +860,29 @@ int main(void)
   storedSnapshot.masterAuthority.runtimeState.generation = 19;
   storedSnapshot.masterAuthority.runtimeState.hasCompletedInitialMasterElection = true;
   storedSnapshot.masterAuthority.runtimeState.nextMintedClientTlsGeneration = 123;
+  storedSnapshot.masterAuthority.runtimeState.nextTlsResumptionGeneration = 78;
+  String resumptionRegistryKey = {};
+  resumptionRegistryKey.snprintf<"{itoa}:"_ctv>(storedPlan.config.deploymentID());
+  resumptionRegistryKey.append("public-api-quic"_ctv);
+  String resumptionMasterSecretNeedle = {};
+  resumptionMasterSecretNeedle.assign("resumption-secret-material-1"_ctv);
+  TlsResumptionSnapshot storedResumptionSnapshot = {};
+  storedResumptionSnapshot.generation = 77;
+  storedResumptionSnapshot.wormholeName.assign("public-api-quic"_ctv);
+  TlsResumptionKeyEpoch storedResumptionEpoch = {};
+  storedResumptionEpoch.generation = storedResumptionSnapshot.generation;
+  storedResumptionEpoch.role = TlsResumptionKeyRole::acceptOnly;
+  for (uint32_t index = 0; index < sizeof(storedResumptionEpoch.keyID); index += 1)
+  {
+    storedResumptionEpoch.keyID[index] = uint8_t(0xA0u + index);
+  }
+  std::memcpy(
+      storedResumptionEpoch.masterSecret,
+      resumptionMasterSecretNeedle.data(),
+      std::min<size_t>(sizeof(storedResumptionEpoch.masterSecret), size_t(resumptionMasterSecretNeedle.size())));
+  storedResumptionEpoch.acceptUntilMs = 1'700'086'410'000;
+  storedResumptionSnapshot.keyRing.push_back(storedResumptionEpoch);
+  storedSnapshot.masterAuthority.runtimeState.tlsResumptionSnapshotsByWormhole.insert_or_assign(resumptionRegistryKey, storedResumptionSnapshot);
   prodigyBuildTransportTLSAuthority(storedLocalBrainState, storedSnapshot.masterAuthority.runtimeState.transportTLSAuthority);
   storedSnapshot.masterAuthority.runtimeState.updateSelf.state = 2;
   storedSnapshot.masterAuthority.runtimeState.updateSelf.expectedEchos = 3;
@@ -1404,6 +1427,13 @@ int main(void)
     suite.expect(stringContains(rawPublicSnapshotRecord, storedFactory.intermediateKeyPem) == false, "raw_public_snapshot_record_scrubs_tls_intermediate_key");
     suite.expect(stringContains(rawPublicSnapshotRecord, storedLocalBrainState.transportTLS.clusterRootKeyPem) == false, "raw_public_snapshot_record_scrubs_transport_root_key");
     suite.expect(stringContains(rawPublicSnapshotRecord, pendingAddMachinesOperation.request.bootstrapSshKeyPackage.privateKeyOpenSSH) == false, "raw_public_snapshot_record_scrubs_pending_bootstrap_private_key");
+    suite.expect(stringContains(rawPublicSnapshotRecord, resumptionMasterSecretNeedle) == false, "raw_public_snapshot_record_scrubs_tls_resumption_master_secret");
+    auto publicResumptionSnapshotIt = storedSnapshotRecord.state.masterAuthority.runtimeState.tlsResumptionSnapshotsByWormhole.find(resumptionRegistryKey);
+    suite.expect(
+        publicResumptionSnapshotIt != storedSnapshotRecord.state.masterAuthority.runtimeState.tlsResumptionSnapshotsByWormhole.end() &&
+            publicResumptionSnapshotIt->second.keyRing.size() == 1 &&
+            prodigyPersistentSecretBytesAreZero(publicResumptionSnapshotIt->second.keyRing[0].masterSecret, sizeof(publicResumptionSnapshotIt->second.keyRing[0].masterSecret)),
+        "raw_public_snapshot_record_zeroes_tls_resumption_master_secret");
 
     String snapshotSecretKey = {};
     prodigyBuildPersistentSecretRecordKey("snapshot", storedSnapshotRecord.secretVersion, snapshotSecretKey);
@@ -1417,6 +1447,7 @@ int main(void)
     suite.expect(stringContains(rawSnapshotSecretRecord, storedFactory.intermediateKeyPem), "raw_snapshot_secret_record_keeps_tls_intermediate_key");
     suite.expect(stringContains(rawSnapshotSecretRecord, storedLocalBrainState.transportTLS.clusterRootKeyPem), "raw_snapshot_secret_record_keeps_transport_root_key");
     suite.expect(stringContains(rawSnapshotSecretRecord, pendingAddMachinesOperation.request.bootstrapSshKeyPackage.privateKeyOpenSSH), "raw_snapshot_secret_record_keeps_pending_bootstrap_private_key");
+    suite.expect(stringContains(rawSnapshotSecretRecord, resumptionMasterSecretNeedle), "raw_snapshot_secret_record_keeps_tls_resumption_master_secret");
 
     String rawPublicLocalBrainStateRecord = {};
     suite.expect(readRawTidesDBRecord(dbPath, "brain"_ctv, "local_brain_state"_ctv, rawPublicLocalBrainStateRecord, &failure), "read_raw_public_local_brain_state_record");

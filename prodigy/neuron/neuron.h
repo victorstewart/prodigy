@@ -1644,7 +1644,7 @@ protected:
           uint64_t service = 0;
           uint16_t applicationID = 0;
           bool activate = false;
-          if (ProdigyWire::deserializeAdvertisementPairingPayloadAuto(
+          if (ProdigyWire::deserializeAdvertisementPairingPayload(
                   payload.data(),
                   payload.size(),
                   secret,
@@ -1682,7 +1682,7 @@ protected:
           uint16_t port = 0;
           uint16_t applicationID = 0;
           bool activate = false;
-          if (ProdigyWire::deserializeSubscriptionPairingPayloadAuto(
+          if (ProdigyWire::deserializeSubscriptionPairingPayload(
                   payload.data(),
                   payload.size(),
                   secret,
@@ -1746,7 +1746,7 @@ protected:
     for (String& payload : payloads)
     {
       CredentialDelta delta;
-      if (ProdigyWire::deserializeCredentialDeltaAuto(payload, delta) == false)
+      if (ProdigyWire::deserializeCredentialDelta(payload, delta) == false)
       {
         continue;
       }
@@ -2977,7 +2977,24 @@ public:
         {
           if (brain)
           {
-            Message::construct(brain->wBuffer, NeuronTopic::refreshContainerCredentials, container->plan.uuid);
+            if (args < terminal)
+            {
+              String serializedAck;
+              serializedAck.setInvariant(args, uint64_t(terminal - args));
+              TlsResumptionApplyAck result;
+              if (ProdigyWire::deserializeTlsResumptionApplyAckFramePayload(args, uint64_t(terminal - args), result))
+              {
+                Message::construct(brain->wBuffer, NeuronTopic::refreshContainerCredentials, container->plan.uuid, serializedAck);
+              }
+              else
+              {
+                break;
+              }
+            }
+            else
+            {
+              Message::construct(brain->wBuffer, NeuronTopic::refreshContainerCredentials, container->plan.uuid);
+            }
             if (streamIsActive(brain))
             {
               Ring::queueSend(brain);
@@ -3781,7 +3798,7 @@ public:
           uint64_t service = 0;
           uint16_t applicationID = 0;
           bool activate = false;
-          if (ProdigyWire::deserializeAdvertisementPairingPayloadAuto(
+          if (ProdigyWire::deserializeAdvertisementPairingPayload(
                   args,
                   uint64_t(terminal - args),
                   secret,
@@ -3866,7 +3883,7 @@ public:
           uint16_t port = 0;
           uint16_t applicationID = 0;
           bool activate = false;
-          if (ProdigyWire::deserializeSubscriptionPairingPayloadAuto(
+          if (ProdigyWire::deserializeSubscriptionPairingPayload(
                   args,
                   uint64_t(terminal - args),
                   secret,
@@ -3941,7 +3958,7 @@ public:
           String serializedDelta;
           Message::extractToStringView(args, serializedDelta);
           CredentialDelta delta;
-          if (ProdigyWire::deserializeCredentialDeltaAuto(serializedDelta, delta) == false)
+          if (ProdigyWire::deserializeCredentialDelta(serializedDelta, delta) == false)
           {
             basics_log("neuron refreshContainerCredentials malformed delta containerUUID=%llu payloadBytes=%u\n",
                        (unsigned long long)containerUUID,

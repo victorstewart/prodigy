@@ -1,7 +1,10 @@
+#include <prodigy/ingress.validation.h>
 #include <prodigy/wire.h>
 #include <services/debug.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <thread>
 #include <unistd.h>
 
 class TestSuite {
@@ -104,11 +107,44 @@ static bool equalApiCredential(const ApiCredential& lhs, const ApiCredential& rh
   return true;
 }
 
+static bool equalTlsResumptionWormholeConfig(const TlsResumptionWormholeConfig& lhs, const TlsResumptionWormholeConfig& rhs)
+{
+  return equalStringVector(lhs.alpns, rhs.alpns) &&
+         equalStringVector(lhs.sniNames, rhs.sniNames);
+}
+
+static bool equalTlsResumptionSnapshots(const Vector<TlsResumptionSnapshot>& lhs, const Vector<TlsResumptionSnapshot>& rhs)
+{
+  if (lhs.size() != rhs.size())
+  {
+    return false;
+  }
+
+  for (uint32_t index = 0; index < lhs.size(); index += 1)
+  {
+    if (prodigyTlsResumptionSnapshotsEqual(lhs[index], rhs[index]) == false)
+    {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool equalTlsResumptionApplyResult(const TlsResumptionApplyResult& lhs, const TlsResumptionApplyResult& rhs)
+{
+  return lhs.wormholeName.equal(rhs.wormholeName) &&
+         lhs.generation == rhs.generation &&
+         lhs.success == rhs.success &&
+         lhs.failureReason.equal(rhs.failureReason);
+}
+
 static bool equalCredentialBundle(const CredentialBundle& lhs, const CredentialBundle& rhs)
 {
   if (lhs.bundleGeneration != rhs.bundleGeneration ||
       lhs.tlsIdentities.size() != rhs.tlsIdentities.size() ||
-      lhs.apiCredentials.size() != rhs.apiCredentials.size())
+      lhs.apiCredentials.size() != rhs.apiCredentials.size() ||
+      equalTlsResumptionSnapshots(lhs.tlsResumptionSnapshots, rhs.tlsResumptionSnapshots) == false)
   {
     return false;
   }
@@ -137,9 +173,11 @@ static bool equalCredentialDelta(const CredentialDelta& lhs, const CredentialDel
   if (lhs.bundleGeneration != rhs.bundleGeneration ||
       lhs.updatedTls.size() != rhs.updatedTls.size() ||
       lhs.updatedApi.size() != rhs.updatedApi.size() ||
+      equalTlsResumptionSnapshots(lhs.updatedResumptionSnapshots, rhs.updatedResumptionSnapshots) == false ||
       lhs.reason.equal(rhs.reason) == false ||
       equalStringVector(lhs.removedTlsNames, rhs.removedTlsNames) == false ||
-      equalStringVector(lhs.removedApiNames, rhs.removedApiNames) == false)
+      equalStringVector(lhs.removedApiNames, rhs.removedApiNames) == false ||
+      equalStringVector(lhs.removedResumptionWormholeNames, rhs.removedResumptionWormholeNames) == false)
   {
     return false;
   }
@@ -176,7 +214,8 @@ static bool equalWhitehole(const Whitehole& lhs, const Whitehole& rhs)
 
 static bool equalWormhole(const Wormhole& lhs, const Wormhole& rhs)
 {
-  return lhs.externalAddress.equals(rhs.externalAddress) &&
+  return lhs.name.equal(rhs.name) &&
+         lhs.externalAddress.equals(rhs.externalAddress) &&
          lhs.externalPort == rhs.externalPort &&
          lhs.containerPort == rhs.containerPort &&
          lhs.layer4 == rhs.layer4 &&
@@ -186,6 +225,8 @@ static bool equalWormhole(const Wormhole& lhs, const Wormhole& rhs)
          lhs.hasQuicCidKeyState == rhs.hasQuicCidKeyState &&
          lhs.source == rhs.source &&
          lhs.routableAddressUUID == rhs.routableAddressUUID &&
+         lhs.hasTlsResumptionConfig == rhs.hasTlsResumptionConfig &&
+         equalTlsResumptionWormholeConfig(lhs.tlsResumption, rhs.tlsResumption) &&
          lhs.quicCidKeyState.rotationHours == rhs.quicCidKeyState.rotationHours &&
          lhs.quicCidKeyState.activeKeyIndex == rhs.quicCidKeyState.activeKeyIndex &&
          lhs.quicCidKeyState.rotatedAtMs == rhs.quicCidKeyState.rotatedAtMs &&
@@ -370,6 +411,59 @@ static ApiCredential makeApiCredential(void)
   return credential;
 }
 
+static TlsResumptionKeyEpoch makeTlsResumptionKeyEpoch(uint8_t seed)
+{
+  TlsResumptionKeyEpoch epoch;
+  epoch.generation = 9000 + seed;
+  epoch.role = (seed % 2) == 0 ? TlsResumptionKeyRole::issueAndAccept : TlsResumptionKeyRole::acceptOnly;
+  for (uint32_t index = 0; index < sizeof(epoch.keyID); index += 1)
+  {
+    epoch.keyID[index] = uint8_t(seed + index);
+  }
+  for (uint32_t index = 0; index < sizeof(epoch.masterSecret); index += 1)
+  {
+    epoch.masterSecret[index] = uint8_t(0x80u + seed + index);
+  }
+  epoch.issueUntilMs = 222'000 + seed;
+  epoch.acceptUntilMs = 333'000 + seed;
+  return epoch;
+}
+
+static TlsResumptionWormholeConfig makeTlsResumptionWormholeConfig(void)
+{
+  TlsResumptionWormholeConfig config;
+  config.alpns.push_back("h3"_ctv);
+  config.sniNames.push_back("api.example.com"_ctv);
+  return config;
+}
+
+static TlsResumptionSnapshot makeTlsResumptionSnapshot(void)
+{
+  TlsResumptionSnapshot snapshot;
+  snapshot.generation = 12'345;
+  snapshot.wormholeName.assign("public-api-quic"_ctv);
+  snapshot.keyRing.push_back(makeTlsResumptionKeyEpoch(1));
+  snapshot.keyRing.push_back(makeTlsResumptionKeyEpoch(2));
+  return snapshot;
+}
+
+static TlsResumptionApplyResult makeTlsResumptionApplyResult(void)
+{
+  TlsResumptionApplyResult result;
+  result.wormholeName.assign("public-api-quic"_ctv);
+  result.generation = 12'346;
+  result.success = false;
+  result.failureReason.assign("stale generation"_ctv);
+  return result;
+}
+
+static TlsResumptionApplyAck makeTlsResumptionApplyAck(void)
+{
+  TlsResumptionApplyAck ack;
+  ack.results.push_back(makeTlsResumptionApplyResult());
+  return ack;
+}
+
 static ContainerParameters makeContainerParameters(void)
 {
   ContainerParameters parameters;
@@ -396,47 +490,32 @@ static ContainerParameters makeContainerParameters(void)
   parameters.credentialBundle.bundleGeneration = 1234;
   parameters.credentialBundle.tlsIdentities.push_back(makeTlsIdentity());
   parameters.credentialBundle.apiCredentials.push_back(makeApiCredential());
+  parameters.credentialBundle.tlsResumptionSnapshots.push_back(makeTlsResumptionSnapshot());
   return parameters;
 }
 
-static ContainerParameters makeLegacyContainerParametersWithIngress(void)
+static Wormhole makeContainerParametersWormhole(void)
 {
-  ContainerParameters parameters = makeContainerParameters();
-
-  Wormhole wormhole;
-  wormhole.externalAddress = IPAddress("2602:fac0:0:12ab:34cd::1", true);
+  Wormhole wormhole = {};
+  wormhole.name.assign("public-api-quic"_ctv);
+  wormhole.externalAddress = IPAddress("2001:db8::44", true);
   wormhole.externalPort = 443;
-  wormhole.containerPort = 443;
+  wormhole.containerPort = 8443;
   wormhole.layer4 = IPPROTO_UDP;
   wormhole.isQuic = true;
-  wormhole.userCapacity.minimum = 40'000;
-  wormhole.userCapacity.maximum = 50'000;
+  wormhole.userCapacity.minimum = 1;
+  wormhole.userCapacity.maximum = 32;
   wormhole.hasQuicCidKeyState = true;
   wormhole.source = ExternalAddressSource::registeredRoutableAddress;
-  wormhole.routableAddressUUID = uint128_t(0x1234567890ABCDEFULL);
-  wormhole.routableAddressUUID <<= 64;
-  wormhole.routableAddressUUID |= uint128_t(0x0FEDCBA098765432ULL);
-  wormhole.quicCidKeyState.rotationHours = 24;
+  wormhole.routableAddressUUID = uint128_t(0xAABBCCDD0011);
+  wormhole.hasTlsResumptionConfig = true;
+  wormhole.tlsResumption = makeTlsResumptionWormholeConfig();
+  wormhole.quicCidKeyState.rotationHours = 12;
   wormhole.quicCidKeyState.activeKeyIndex = 1;
   wormhole.quicCidKeyState.rotatedAtMs = 123'456'789;
-  wormhole.quicCidKeyState.keyMaterialByIndex[0] = uint128_t(0x0102030405060708ULL);
-  wormhole.quicCidKeyState.keyMaterialByIndex[0] <<= 64;
-  wormhole.quicCidKeyState.keyMaterialByIndex[0] |= uint128_t(0x1112131415161718ULL);
-  wormhole.quicCidKeyState.keyMaterialByIndex[1] = uint128_t(0x2122232425262728ULL);
-  wormhole.quicCidKeyState.keyMaterialByIndex[1] <<= 64;
-  wormhole.quicCidKeyState.keyMaterialByIndex[1] |= uint128_t(0x3132333435363738ULL);
-  parameters.wormholes.push_back(wormhole);
-
-  Whitehole whitehole;
-  whitehole.transport = ExternalAddressTransport::tcp;
-  whitehole.family = ExternalAddressFamily::ipv6;
-  whitehole.source = ExternalAddressSource::hostPublicAddress;
-  whitehole.hasAddress = true;
-  whitehole.address = IPAddress("2602:fac0:0:beef::7", true);
-  whitehole.sourcePort = 8443;
-  whitehole.bindingNonce = 77;
-  parameters.whiteholes.push_back(whitehole);
-  return parameters;
+  wormhole.quicCidKeyState.keyMaterialByIndex[0] = uint128_t(0x1111222233334444ULL);
+  wormhole.quicCidKeyState.keyMaterialByIndex[1] = uint128_t(0xAAAABBBBCCCCDDDDULL);
+  return wormhole;
 }
 
 static StatefulMeshRoles makeStatefulMeshRoles(void)
@@ -458,13 +537,136 @@ static CredentialDelta makeCredentialDelta(void)
   delta.removedTlsNames.push_back("old.internal"_ctv);
   delta.updatedApi.push_back(makeApiCredential());
   delta.removedApiNames.push_back("legacy_token"_ctv);
+  delta.updatedResumptionSnapshots.push_back(makeTlsResumptionSnapshot());
+  delta.removedResumptionWormholeNames.push_back("old-api-quic"_ctv);
   delta.reason.assign("rotation"_ctv);
   return delta;
+}
+
+template <typename T, typename Equal>
+static void expectWireRoundTrip(TestSuite& suite, const T& expected, const char *decodeName, const char *roundTripName, Equal equal)
+{
+  String encoded;
+  BitseryEngine::serialize(encoded, expected);
+
+  T decoded;
+  suite.expect(BitseryEngine::deserializeSafe(encoded, decoded), decodeName);
+  suite.expect(equal(expected, decoded), roundTripName);
 }
 
 int main(void)
 {
   TestSuite suite;
+
+  expectWireRoundTrip(suite, makeTlsResumptionKeyEpoch(9), "tls_resumption_key_epoch_decode_state", "tls_resumption_key_epoch_roundtrip_state", prodigyTlsResumptionKeyEpochsEqual);
+  expectWireRoundTrip(suite, makeTlsResumptionSnapshot(), "tls_resumption_snapshot_decode_state", "tls_resumption_snapshot_roundtrip_state", prodigyTlsResumptionSnapshotsEqual);
+  expectWireRoundTrip(suite, makeTlsResumptionApplyResult(), "tls_resumption_apply_result_decode_state", "tls_resumption_apply_result_roundtrip_state", equalTlsResumptionApplyResult);
+
+  {
+    ProdigyResumptionRegistry registry;
+    TlsResumptionSnapshot snapshot = makeTlsResumptionSnapshot();
+    TlsResumptionApplyResult applyResult = {};
+
+    suite.expect(registry.applySnapshot(snapshot, &applyResult), "tls_resumption_registry_applies_valid_snapshot");
+    suite.expect(
+        applyResult.success &&
+            applyResult.wormholeName.equal(snapshot.wormholeName) &&
+            applyResult.generation == snapshot.generation &&
+            applyResult.failureReason.empty(),
+        "tls_resumption_registry_apply_result_has_no_secret_material");
+    suite.expect(registry.snapshotsByWormhole.size() == 1, "tls_resumption_registry_stores_by_wormhole");
+
+    const TlsResumptionSnapshot *found = registry.find(snapshot.wormholeName);
+    suite.expect(found != nullptr && found->generation == snapshot.generation, "tls_resumption_registry_lookup_matches_bindings");
+
+    const TlsResumptionKeyEpoch *issueKey = registry.currentIssueKey(snapshot.wormholeName, 111'002);
+    suite.expect(issueKey != nullptr && issueKey->generation == snapshot.keyRing[1].generation, "tls_resumption_registry_selects_issue_key");
+
+    bool crossThreadFound = false;
+    std::thread lookupThread([&]() {
+      const TlsResumptionKeyEpoch *threadIssueKey = registry.currentIssueKey(snapshot.wormholeName, 111'002);
+      crossThreadFound = threadIssueKey != nullptr && threadIssueKey->generation == snapshot.keyRing[1].generation;
+    });
+    lookupThread.join();
+    suite.expect(crossThreadFound, "tls_resumption_registry_lookup_is_thread_stable");
+
+    const TlsResumptionKeyEpoch *acceptKey = registry.acceptKeyByID(
+        snapshot.wormholeName,
+        snapshot.keyRing[0].keyID,
+        111'001);
+    suite.expect(acceptKey != nullptr && acceptKey->generation == snapshot.keyRing[0].generation, "tls_resumption_registry_selects_accept_key_by_id");
+
+    TlsResumptionSnapshot stale = snapshot;
+    stale.generation -= 1;
+    TlsResumptionApplyResult staleResult = {};
+    suite.expect(registry.applySnapshot(stale, &staleResult) == false, "tls_resumption_registry_rejects_stale_generation");
+    suite.expect(
+        staleResult.success == false &&
+            staleResult.failureReason.equal("stale generation"_ctv),
+        "tls_resumption_registry_reports_stale_generation");
+
+    TlsResumptionSnapshot invalid = snapshot;
+    invalid.wormholeName.assign("invalid-secret"_ctv);
+    invalid.generation += 1;
+    for (uint8_t& byte : invalid.keyRing[0].masterSecret)
+    {
+      byte = 0;
+    }
+    TlsResumptionApplyResult invalidResult = {};
+    suite.expect(registry.applySnapshot(invalid, &invalidResult) == false, "tls_resumption_registry_rejects_empty_secret");
+    suite.expect(
+        invalidResult.success == false &&
+            invalidResult.failureReason.equal("epoch master secret required"_ctv),
+        "tls_resumption_registry_reports_empty_secret");
+
+    Vector<String> removedWormholeNames = {};
+    removedWormholeNames.push_back(snapshot.wormholeName);
+    const uint64_t removalGeneration = snapshot.generation + 2;
+    Vector<TlsResumptionApplyResult> removalResults;
+    suite.expect(registry.applyDelta({}, removedWormholeNames, removalGeneration, &removalResults), "tls_resumption_registry_applies_removal_delta");
+    suite.expect(
+        removalResults.size() == 1 &&
+            removalResults[0].success &&
+            removalResults[0].wormholeName.equal(snapshot.wormholeName) &&
+            removalResults[0].generation == removalGeneration,
+        "tls_resumption_registry_reports_removal_delta");
+    suite.expect(registry.find(snapshot.wormholeName) == nullptr, "tls_resumption_registry_removes_wormhole");
+  }
+
+  {
+    TlsResumptionApplyAck expected = makeTlsResumptionApplyAck();
+    String encoded;
+    suite.expect(ProdigyWire::serializeTlsResumptionApplyAck(encoded, expected), "tls_resumption_apply_ack_encode_wire");
+
+    TlsResumptionApplyAck decoded;
+    suite.expect(ProdigyWire::deserializeTlsResumptionApplyAck(encoded, decoded), "tls_resumption_apply_ack_decode_wire");
+    suite.expect(
+        decoded.results.size() == 1 &&
+            equalTlsResumptionApplyResult(expected.results[0], decoded.results[0]),
+        "tls_resumption_apply_ack_roundtrip_wire");
+
+    String frame;
+    suite.expect(
+        ProdigyWire::constructPackedFrame(frame, ContainerTopic::credentialsRefresh, encoded),
+        "tls_resumption_apply_ack_frame_encode_wire");
+    Message *message = reinterpret_cast<Message *>(frame.data());
+
+    suite.expect(
+        ProdigyIngressValidation::validateContainerPayloadForNeuron(message->topic, message->args, message->terminal()),
+        "tls_resumption_apply_ack_ack_valid_for_neuron");
+    suite.expect(
+        ProdigyIngressValidation::validateContainerPayloadForHub(message->topic, message->args, message->terminal()) == false,
+        "tls_resumption_apply_ack_ack_not_valid_as_hub_delta");
+
+    TlsResumptionApplyAck decodedFromFrame;
+    suite.expect(
+        ProdigyWire::deserializeTlsResumptionApplyAckFramePayload(message->args, uint64_t(message->terminal() - message->args), decodedFromFrame),
+        "tls_resumption_apply_ack_frame_decode_wire");
+    suite.expect(
+        decodedFromFrame.results.size() == 1 &&
+            equalTlsResumptionApplyResult(expected.results[0], decodedFromFrame.results[0]),
+        "tls_resumption_apply_ack_frame_roundtrip_wire");
+  }
 
   {
     ContainerParameters expected = makeContainerParameters();
@@ -478,22 +680,30 @@ int main(void)
 
   {
     ContainerParameters expected = makeContainerParameters();
+    expected.wormholes.push_back(makeContainerParametersWormhole());
+
     String encoded;
     BitseryEngine::serialize(encoded, expected);
+    int fd = Memfd::create("test.container.params"_ctv);
+    suite.expect(fd >= 0 && Memfd::writeAll(fd, encoded), "container_params_full_payload_memfd_write");
 
+    char fdText[32] = {};
+    snprintf(fdText, sizeof(fdText), "%d", fd);
+    setenv("PRODIGY_PARAMS_FD", fdText, 1);
+
+    char arg0[] = "prodigy_wire_unit";
+    char *argv[] = {arg0, nullptr};
     ContainerParameters decoded;
-    suite.expect(ProdigyWire::deserializeContainerParametersAuto(encoded, decoded), "container_params_decode_legacy");
-    suite.expect(equalContainerParameters(expected, decoded), "container_params_roundtrip_legacy");
-  }
+    suite.expect(
+        ProdigyWire::readContainerParametersFromProcessArgs(1, argv, decoded),
+        "container_params_process_args_decode_full_wormhole_payload");
+    suite.expect(equalContainerParameters(expected, decoded), "container_params_process_args_full_wormhole_roundtrip");
 
-  {
-    ContainerParameters expected = makeLegacyContainerParametersWithIngress();
-    String encoded;
-    BitseryEngine::serialize(encoded, expected);
-
-    ContainerParameters decoded;
-    suite.expect(ProdigyWire::deserializeContainerParametersAuto(encoded, decoded), "container_params_decode_legacy_ingress");
-    suite.expect(equalContainerParameters(expected, decoded), "container_params_roundtrip_legacy_ingress");
+    unsetenv("PRODIGY_PARAMS_FD");
+    if (fd >= 0)
+    {
+      close(fd);
+    }
   }
 
   {
@@ -506,17 +716,6 @@ int main(void)
   }
 
   {
-    ContainerParameters expected = makeContainerParameters();
-    expected.statefulMeshRoles = makeStatefulMeshRoles();
-    String encoded;
-    BitseryEngine::serialize(encoded, expected);
-
-    ContainerParameters decoded;
-    suite.expect(ProdigyWire::deserializeContainerParametersAuto(encoded, decoded), "container_params_decode_legacy_stateful_mesh_roles");
-    suite.expect(equalContainerParameters(expected, decoded), "container_params_roundtrip_legacy_stateful_mesh_roles");
-  }
-
-  {
     CredentialBundle expected = makeContainerParameters().credentialBundle;
     String encoded;
     suite.expect(ProdigyWire::serializeCredentialBundle(encoded, expected), "credential_bundle_encode_wire");
@@ -524,6 +723,12 @@ int main(void)
     CredentialBundle decoded;
     suite.expect(ProdigyWire::deserializeCredentialBundle(encoded, decoded), "credential_bundle_decode_wire");
     suite.expect(equalCredentialBundle(expected, decoded), "credential_bundle_roundtrip_wire");
+
+    CredentialBundle invalidRole = expected;
+    invalidRole.tlsResumptionSnapshots[0].keyRing[0].role = TlsResumptionKeyRole(99);
+    suite.expect(
+        ProdigyWire::serializeCredentialBundle(encoded, invalidRole) == false,
+        "credential_bundle_rejects_invalid_tls_resumption_key_role");
   }
 
   {
@@ -534,16 +739,6 @@ int main(void)
     CredentialDelta decoded;
     suite.expect(ProdigyWire::deserializeCredentialDelta(encoded, decoded), "credential_delta_decode_wire");
     suite.expect(equalCredentialDelta(expected, decoded), "credential_delta_roundtrip_wire");
-  }
-
-  {
-    CredentialDelta expected = makeCredentialDelta();
-    String encoded;
-    BitseryEngine::serialize(encoded, expected);
-
-    CredentialDelta decoded;
-    suite.expect(ProdigyWire::deserializeCredentialDeltaAuto(encoded, decoded), "credential_delta_decode_legacy");
-    suite.expect(equalCredentialDelta(expected, decoded), "credential_delta_roundtrip_legacy");
   }
 
   {
@@ -563,24 +758,6 @@ int main(void)
     suite.expect(
         logicalCores == 4 && memoryMB == 1024 && storageMB == 2048 && isDownscale && graceSeconds == 30,
         "resource_delta_roundtrip_wire");
-  }
-
-  {
-    String frame;
-    Message::construct(frame, uint16_t(ContainerTopic::resourceDelta), uint16_t(6), uint32_t(4096), uint32_t(8192), false, uint32_t(45));
-    Message *message = reinterpret_cast<Message *>(frame.data());
-
-    uint16_t logicalCores = 0;
-    uint32_t memoryMB = 0;
-    uint32_t storageMB = 0;
-    bool isDownscale = true;
-    uint32_t graceSeconds = 0;
-    suite.expect(
-        ProdigyWire::deserializeResourceDeltaPayloadAuto(message->args, uint64_t(message->terminal() - message->args), logicalCores, memoryMB, storageMB, isDownscale, graceSeconds),
-        "resource_delta_decode_legacy");
-    suite.expect(
-        logicalCores == 6 && memoryMB == 4096 && storageMB == 8192 && isDownscale == false && graceSeconds == 45,
-        "resource_delta_roundtrip_legacy");
   }
 
   {
@@ -610,35 +787,6 @@ int main(void)
             applicationID == uint16_t(0xABCD) &&
             activate,
         "advertisement_pairing_roundtrip_wire");
-  }
-
-  {
-    String frame;
-    Message::construct(
-        frame,
-        uint16_t(ContainerTopic::advertisementPairing),
-        uint128_t(0x303),
-        uint128_t(0x404),
-        uint64_t(0x1234000000000222ULL),
-        uint16_t(0x1234),
-        true);
-    Message *message = reinterpret_cast<Message *>(frame.data());
-
-    uint128_t secret = 0;
-    uint128_t address = 0;
-    uint64_t service = 0;
-    uint16_t applicationID = 0;
-    bool activate = false;
-    suite.expect(
-        ProdigyWire::deserializeAdvertisementPairingPayloadAuto(message->args, uint64_t(message->terminal() - message->args), secret, address, service, applicationID, activate),
-        "advertisement_pairing_decode_legacy");
-    suite.expect(
-        secret == uint128_t(0x303) &&
-            address == uint128_t(0x404) &&
-            service == 0x1234000000000222ULL &&
-            applicationID == uint16_t(0x1234) &&
-            activate,
-        "advertisement_pairing_roundtrip_legacy");
   }
 
   {
@@ -674,38 +822,6 @@ int main(void)
   }
 
   {
-    String frame;
-    Message::construct(
-        frame,
-        uint16_t(ContainerTopic::subscriptionPairing),
-        uint128_t(0x707),
-        uint128_t(0x808),
-        uint64_t(0x5678000000000444ULL),
-        uint16_t(3210),
-        uint16_t(0x5678),
-        true);
-    Message *message = reinterpret_cast<Message *>(frame.data());
-
-    uint128_t secret = 0;
-    uint128_t address = 0;
-    uint64_t service = 0;
-    uint16_t port = 0;
-    uint16_t applicationID = 0;
-    bool activate = false;
-    suite.expect(
-        ProdigyWire::deserializeSubscriptionPairingPayloadAuto(message->args, uint64_t(message->terminal() - message->args), secret, address, service, port, applicationID, activate),
-        "subscription_pairing_decode_legacy");
-    suite.expect(
-        secret == uint128_t(0x707) &&
-            address == uint128_t(0x808) &&
-            service == 0x5678000000000444ULL &&
-            port == uint16_t(3210) &&
-            applicationID == uint16_t(0x5678) &&
-            activate,
-        "subscription_pairing_roundtrip_legacy");
-  }
-
-  {
     CredentialDelta expected = makeCredentialDelta();
     String encoded;
     suite.expect(ProdigyWire::serializeCredentialDelta(encoded, expected), "credential_delta_frame_encode_wire_payload");
@@ -718,25 +834,9 @@ int main(void)
 
     CredentialDelta decoded;
     suite.expect(
-        ProdigyWire::deserializeCredentialDeltaFramePayloadAuto(message->args, uint64_t(message->terminal() - message->args), decoded),
+        ProdigyWire::deserializeCredentialDeltaFramePayload(message->args, uint64_t(message->terminal() - message->args), decoded),
         "credential_delta_frame_decode_wire");
     suite.expect(equalCredentialDelta(expected, decoded), "credential_delta_frame_roundtrip_wire");
-  }
-
-  {
-    CredentialDelta expected = makeCredentialDelta();
-    String encoded;
-    suite.expect(ProdigyWire::serializeCredentialDelta(encoded, expected), "credential_delta_frame_encode_legacy_payload");
-
-    String frame;
-    Message::construct(frame, uint16_t(ContainerTopic::credentialsRefresh), encoded);
-    Message *message = reinterpret_cast<Message *>(frame.data());
-
-    CredentialDelta decoded;
-    suite.expect(
-        ProdigyWire::deserializeCredentialDeltaFramePayloadAuto(message->args, uint64_t(message->terminal() - message->args), decoded),
-        "credential_delta_frame_decode_legacy");
-    suite.expect(equalCredentialDelta(expected, decoded), "credential_delta_frame_roundtrip_legacy");
   }
 
   return (suite.failed == 0) ? 0 : 1;

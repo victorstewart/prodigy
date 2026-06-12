@@ -36,10 +36,7 @@ prodigy_dev_ensure_discombobulator()
       return 1
    fi
 
-   if [[ ! -x "${PRODIGY_DEV_DISCOMBOBULATOR_BIN}" ]]
-   then
-      cargo build --quiet --manifest-path "${PRODIGY_DEV_DISCOMBOBULATOR_MANIFEST}" >&2
-   fi
+   cargo build --quiet --manifest-path "${PRODIGY_DEV_DISCOMBOBULATOR_MANIFEST}" >&2
 
    if [[ ! -x "${PRODIGY_DEV_DISCOMBOBULATOR_BIN}" ]]
    then

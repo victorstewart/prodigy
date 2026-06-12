@@ -24,8 +24,8 @@ Bootstrap loading precedence:
 
 Startup payload type:
 
-- preferred path: packed `PRDPAR01` `ContainerParameters`
-- compatibility path: legacy Bitsery bootstrap when wormholes or whiteholes are present
+- packed `PRDPAR01` `ContainerParameters`
+- current runtimes should reject older bootstrap encodings instead of silently falling back
 
 Before processing live control frames, runtimes should seed local state from startup pairings and initial parameters.
 
@@ -61,6 +61,7 @@ No callback is required for:
 - `resourceDeltaAck`
 - `datacenterUniqueTag`
 - empty inbound `credentialsRefresh` ack frames
+- typed inbound `credentialsRefresh` resumption ACK frames
 
 ## Default Frame-Handler Semantics
 
@@ -80,6 +81,9 @@ The shared frame handler should behave like this:
   - update cached `parameters.datacenter_unique_tag`
 - empty inbound `credentialsRefresh`
   - treat as ack or no-op, not as a callback
+- typed inbound `credentialsRefresh`
+  - treat as a resumption ACK, not as a credentials-refresh callback
+  - resumption entries must identify `wormholeName`, generation, success/failure, and must not carry secret material
 
 Ack behavior is policy-driven:
 
@@ -88,6 +92,7 @@ Ack behavior is policy-driven:
   - or the SDK may auto-queue one if configured
 - `credentialsRefresh`
   - application may explicitly send an empty `credentialsRefresh` ack
+  - application must send a typed `TlsResumptionApplyAck` ack when it applies TLS resumption snapshots or deltas, because resumption readiness is per wormhole and generation
   - or the SDK may auto-queue one if configured
 
 ## Required Outbound Operations

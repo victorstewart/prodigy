@@ -16,7 +16,7 @@
 #endif
 
 typedef struct test_buffer {
-  uint8_t bytes[2048];
+  uint8_t bytes[8192];
   size_t size;
 } test_buffer;
 
@@ -27,8 +27,8 @@ typedef struct callback_state {
   int message_count;
   int wormholes_refresh_count;
   prodigy_resource_delta last_resource_delta;
-  uint64_t last_bundle_generation;
-  size_t last_reason_size;
+  uint8_t last_credentials_refresh_magic[8];
+  size_t last_credentials_refresh_size;
   size_t last_message_size;
   size_t last_wormholes_refresh_size;
 } callback_state;
@@ -161,6 +161,16 @@ static void append_i32(test_buffer *buffer, int32_t value)
   append_u32(buffer, (uint32_t)value);
 }
 
+static void append_i64(test_buffer *buffer, int64_t value)
+{
+  append_u64(buffer, (uint64_t)value);
+}
+
+static void append_bool(test_buffer *buffer, int value)
+{
+  append_u8(buffer, value ? 1u : 0u);
+}
+
 static void append_bytes(test_buffer *buffer, const uint8_t *bytes, size_t size)
 {
   memcpy(buffer->bytes + buffer->size, bytes, size);
@@ -239,13 +249,17 @@ static void resource_delta(
 static void credentials_refresh(
     void *context,
     prodigy_neuron_hub *hub,
-    const prodigy_credential_delta *delta)
+    const uint8_t *payload,
+    size_t payload_size)
 {
   callback_state *state = (callback_state *)context;
   (void)hub;
   state->credential_refresh_count += 1;
-  state->last_bundle_generation = delta->bundle_generation;
-  state->last_reason_size = delta->reason.size;
+  state->last_credentials_refresh_size = payload_size;
+  if (payload_size >= sizeof(state->last_credentials_refresh_magic))
+  {
+    memcpy(state->last_credentials_refresh_magic, payload, sizeof(state->last_credentials_refresh_magic));
+  }
 }
 
 static void message_from_prodigy(
@@ -307,7 +321,7 @@ static void read_all(int fd, uint8_t *bytes, size_t size)
 static void read_and_expect_topic(int fd, uint16_t expected_topic, uint8_t expected_first_payload, int expect_payload)
 {
   uint8_t header[8];
-  uint8_t payload[32];
+  uint8_t payload[256];
   uint32_t frame_size = 0;
   size_t payload_and_padding = 0;
   size_t payload_size = 0;
@@ -394,7 +408,6 @@ int main(void)
   static const uint8_t aegis_aux[] = {'m', 'e', 's', 'h', '-', 'a', 'e', 'g', 'i', 's'};
   uint8_t *fixture_bundle = NULL;
   uint8_t *fixture_parameters = NULL;
-  uint8_t *fixture_delta = NULL;
   uint8_t *fixture_ping = NULL;
   uint8_t *fixture_ready = NULL;
   uint8_t *fixture_statistics = NULL;
@@ -405,7 +418,6 @@ int main(void)
   uint8_t *fixture_aegis_frame = NULL;
   size_t fixture_bundle_size = 0;
   size_t fixture_parameters_size = 0;
-  size_t fixture_delta_size = 0;
   size_t fixture_ping_size = 0;
   size_t fixture_ready_size = 0;
   size_t fixture_statistics_size = 0;
@@ -421,6 +433,7 @@ int main(void)
   int sockets[2] = {-1, -1};
   test_buffer bootstrap = {{0}, 0};
   test_buffer credential_delta = {{0}, 0};
+  test_buffer resumption_ack_payload = {{0}, 0};
   test_buffer frame = {{0}, 0};
   callback_state state;
   prodigy_neuron_hub_callbacks callbacks;
@@ -428,16 +441,17 @@ int main(void)
   prodigy_neuron_hub *hub = NULL;
   prodigy_credential_bundle bundle;
   prodigy_container_parameters decoded;
-  prodigy_credential_delta delta;
   prodigy_bytes ping_bytes;
   prodigy_bytes ready_bytes;
   prodigy_bytes runtime_ready_bytes;
   prodigy_bytes statistics_bytes;
   prodigy_bytes resource_delta_ack_bytes;
   prodigy_bytes credentials_refresh_ack_bytes;
+  prodigy_bytes resumption_ack_frame_bytes;
   prodigy_frame_decoder decoder;
   prodigy_message_frame decoded_ping;
   prodigy_message_frame built_frame;
+  prodigy_message_frame decoded_resumption_ack_frame;
   prodigy_message_frame automatic_response;
   prodigy_subscription_pairing aegis_pairing;
   prodigy_aegis_session aegis_session;
@@ -453,16 +467,17 @@ int main(void)
   memset(&options, 0, sizeof(options));
   memset(&bundle, 0, sizeof(bundle));
   memset(&decoded, 0, sizeof(decoded));
-  memset(&delta, 0, sizeof(delta));
   memset(&ping_bytes, 0, sizeof(ping_bytes));
   memset(&ready_bytes, 0, sizeof(ready_bytes));
   memset(&runtime_ready_bytes, 0, sizeof(runtime_ready_bytes));
   memset(&statistics_bytes, 0, sizeof(statistics_bytes));
   memset(&resource_delta_ack_bytes, 0, sizeof(resource_delta_ack_bytes));
   memset(&credentials_refresh_ack_bytes, 0, sizeof(credentials_refresh_ack_bytes));
+  memset(&resumption_ack_frame_bytes, 0, sizeof(resumption_ack_frame_bytes));
   memset(&decoder, 0, sizeof(decoder));
   memset(&decoded_ping, 0, sizeof(decoded_ping));
   memset(&built_frame, 0, sizeof(built_frame));
+  memset(&decoded_resumption_ack_frame, 0, sizeof(decoded_resumption_ack_frame));
   memset(&automatic_response, 0, sizeof(automatic_response));
   memset(&aegis_pairing, 0, sizeof(aegis_pairing));
   memset(&tfo_data, 0, sizeof(tfo_data));
@@ -472,7 +487,6 @@ int main(void)
 
   fixture_bundle = read_fixture_named("startup.credential_bundle.full.bin", &fixture_bundle_size);
   fixture_parameters = read_fixture_named("startup.container_parameters.full.bin", &fixture_parameters_size);
-  fixture_delta = read_fixture_named("startup.credential_delta.full.bin", &fixture_delta_size);
   fixture_ping = read_fixture_named("frame.ping.empty.bin", &fixture_ping_size);
   fixture_ready = read_fixture_named("frame.healthy.empty.bin", &fixture_ready_size);
   fixture_statistics = read_fixture_named("frame.statistics.demo.bin", &fixture_statistics_size);
@@ -491,6 +505,15 @@ int main(void)
   expect_true(bundle.bundle_generation == 101u, "unexpected fixture bundle generation");
   expect_true(bundle.tls_identity_count == 1u, "unexpected fixture tls identity count");
   expect_true(bundle.api_credential_count == 1u, "unexpected fixture api credential count");
+  expect_true(bundle.tls_resumption_snapshot_count == 1u, "unexpected fixture resumption snapshot count");
+  expect_true(bundle.tls_resumption_snapshots[0].generation == 103u, "unexpected fixture resumption generation");
+  expect_bytes_equal(
+      bundle.tls_resumption_snapshots[0].wormhole_name.data,
+      bundle.tls_resumption_snapshots[0].wormhole_name.size,
+      (const uint8_t *)"public-api-quic",
+      strlen("public-api-quic"),
+      "unexpected fixture resumption wormhole");
+  expect_true(bundle.tls_resumption_snapshots[0].key_ring_count == 1u, "unexpected fixture resumption key count");
   prodigy_credential_bundle_free(&bundle);
 
   append_magic(&credential_delta, "PRDDEL01");
@@ -502,17 +525,8 @@ int main(void)
   append_u32(&credential_delta, 1);
   append_string(&credential_delta, "old-token");
   append_string(&credential_delta, "rotation");
-
-  expect_true(
-      prodigy_decode_credential_delta(
-          credential_delta.bytes,
-          credential_delta.size,
-          &delta) == PRODIGY_RESULT_OK,
-      "credential delta decode failed");
-  expect_true(delta.bundle_generation == 7, "unexpected delta bundle generation");
-  expect_true(delta.removed_tls_name_count == 1, "unexpected tls removal count");
-  expect_true(delta.removed_api_name_count == 1, "unexpected api removal count");
-  prodigy_credential_delta_free(&delta);
+  append_u32(&credential_delta, 0);
+  append_u32(&credential_delta, 0);
 
   append_magic(&bootstrap, "PRDPAR01");
   append_sequence(&bootstrap, 0);
@@ -565,19 +579,38 @@ int main(void)
   expect_true(decoded.datacenter_unique_tag == 23u, "unexpected fixture datacenter tag");
   expect_true(decoded.has_credential_bundle == 1u, "missing fixture credential bundle");
   expect_true(decoded.credential_bundle.bundle_generation == 101u, "unexpected embedded fixture bundle generation");
+  expect_true(
+      decoded.credential_bundle.tls_resumption_snapshot_count == 1u,
+      "unexpected embedded fixture resumption snapshot count");
   prodigy_container_parameters_free(&decoded);
 
+  append_magic(&resumption_ack_payload, "PRDACK01");
+  append_u32(&resumption_ack_payload, 1);
+  append_string(&resumption_ack_payload, "public-api-quic");
+  append_u64(&resumption_ack_payload, 203u);
+  append_bool(&resumption_ack_payload, 1);
+  append_string(&resumption_ack_payload, "");
   expect_true(
-      prodigy_decode_credential_delta(
-          fixture_delta,
-          fixture_delta_size,
-          &delta) == PRODIGY_RESULT_OK,
-      "credential delta fixture decode failed");
-  expect_true(delta.bundle_generation == 102u, "unexpected fixture delta bundle generation");
-  expect_true(delta.removed_tls_name_count == 1u, "unexpected fixture tls removal count");
-  expect_true(delta.removed_api_name_count == 1u, "unexpected fixture api removal count");
-  expect_true(delta.reason.size == 16u, "unexpected fixture reason size");
-  prodigy_credential_delta_free(&delta);
+      prodigy_build_credentials_refresh_ack_payload_frame(
+          resumption_ack_payload.bytes,
+          resumption_ack_payload.size,
+          &resumption_ack_frame_bytes) == PRODIGY_RESULT_OK,
+      "resumption apply ack frame build failed");
+  expect_true(
+      prodigy_parse_message_frame(
+          resumption_ack_frame_bytes.data,
+          resumption_ack_frame_bytes.size,
+          &decoded_resumption_ack_frame) == PRODIGY_RESULT_OK,
+      "resumption apply ack frame parse failed");
+  expect_true(decoded_resumption_ack_frame.topic == PRODIGY_CONTAINER_TOPIC_CREDENTIALS_REFRESH, "unexpected resumption ack topic");
+  expect_bytes_equal(
+      decoded_resumption_ack_frame.payload.data,
+      decoded_resumption_ack_frame.payload.size,
+      resumption_ack_payload.bytes,
+      resumption_ack_payload.size,
+      "unexpected resumption ack payload");
+  prodigy_message_frame_free(&decoded_resumption_ack_frame);
+  prodigy_bytes_free(&resumption_ack_frame_bytes);
 
   memcpy(aegis_pairing.secret.bytes, aegis_secret, sizeof(aegis_secret));
   memcpy(aegis_pairing.address.bytes, aegis_address, sizeof(aegis_address));
@@ -865,8 +898,8 @@ int main(void)
   write_all(sockets[1], frame.bytes, frame.size);
   expect_true(prodigy_neuron_hub_run_once(hub) == PRODIGY_RESULT_OK, "credential refresh run_once failed");
   expect_true(state.credential_refresh_count == 1, "credential refresh callback missing");
-  expect_true(state.last_bundle_generation == 7, "unexpected callback bundle generation");
-  expect_true(state.last_reason_size == 8, "unexpected callback reason size");
+  expect_true(state.last_credentials_refresh_size == credential_delta.size, "unexpected credential refresh payload size");
+  expect_true(memcmp(state.last_credentials_refresh_magic, "PRDDEL01", 8u) == 0, "unexpected credential refresh payload magic");
 
   expect_true(prodigy_neuron_hub_signal_ready(hub) == PRODIGY_RESULT_OK, "signal_ready failed");
   read_and_expect_topic(sockets[1], PRODIGY_CONTAINER_TOPIC_HEALTHY, 0, 0);
@@ -883,6 +916,11 @@ int main(void)
   expect_true(prodigy_neuron_hub_acknowledge_credentials_refresh(hub) == PRODIGY_RESULT_OK, "credentials refresh ack failed");
   read_and_expect_topic(sockets[1], PRODIGY_CONTAINER_TOPIC_CREDENTIALS_REFRESH, 0, 0);
 
+  expect_true(
+      prodigy_neuron_hub_acknowledge_credentials_refresh_payload(hub, resumption_ack_payload.bytes, resumption_ack_payload.size) == PRODIGY_RESULT_OK,
+      "credentials refresh payload ack failed");
+  read_and_expect_topic(sockets[1], PRODIGY_CONTAINER_TOPIC_CREDENTIALS_REFRESH, (uint8_t)'P', 1);
+
   frame.size = 0;
   append_frame(&frame, PRODIGY_CONTAINER_TOPIC_STOP, NULL, 0);
   write_all(sockets[1], frame.bytes, frame.size);
@@ -897,7 +935,6 @@ int main(void)
   sockets[1] = -1;
   free(fixture_bundle);
   free(fixture_parameters);
-  free(fixture_delta);
   free(fixture_ping);
   free(fixture_ready);
   free(fixture_statistics);

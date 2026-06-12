@@ -151,10 +151,28 @@ export interface ApiCredential
    metadata: Map<string, string>
 }
 
+export interface TlsResumptionKeyEpoch
+{
+   generation: bigint
+   role: number
+   keyID: Buffer
+   masterSecret: Buffer
+   issueUntilMs: bigint
+   acceptUntilMs: bigint
+}
+
+export interface TlsResumptionSnapshot
+{
+   generation: bigint
+   wormholeName: string
+   keyRing: TlsResumptionKeyEpoch[]
+}
+
 export interface CredentialBundle
 {
    tlsIdentities: TlsIdentity[]
    apiCredentials: ApiCredential[]
+   tlsResumptionSnapshots: TlsResumptionSnapshot[]
    bundleGeneration: bigint
 }
 
@@ -165,6 +183,8 @@ export interface CredentialDelta
    removedTLSNames: string[]
    updatedAPI: ApiCredential[]
    removedAPINames: string[]
+   updatedResumptionSnapshots: TlsResumptionSnapshot[]
+   removedResumptionWormholeNames: string[]
    reason: string
 }
 
@@ -526,6 +546,50 @@ function decodeStringArray(reader: Reader): string[]
    return values
 }
 
+function skipStringArray(reader: Reader): void
+{
+   const count = reader.u32()
+   for (let index = 0; index < count; index += 1)
+   {
+      reader.string()
+   }
+}
+
+function decodeTlsResumptionKeyEpoch(reader: Reader): TlsResumptionKeyEpoch
+{
+   const generation = reader.u64()
+   const role = reader.u8()
+   if (role > 1)
+   {
+      throw new ProtocolError("invalid tls resumption key role")
+   }
+   return {
+      generation,
+      role,
+      keyID: reader.raw(16),
+      masterSecret: reader.raw(32),
+      issueUntilMs: reader.i64(),
+      acceptUntilMs: reader.i64()
+   }
+}
+
+function decodeTlsResumptionSnapshots(reader: Reader): TlsResumptionSnapshot[]
+{
+   const snapshots: TlsResumptionSnapshot[] = []
+   const count = reader.u32()
+   for (let index = 0; index < count; index += 1)
+   {
+      const generation = reader.u64()
+      const wormholeName = reader.string()
+      snapshots.push({
+         generation,
+         wormholeName,
+         keyRing: Array.from({ length: reader.u32() }, () => decodeTlsResumptionKeyEpoch(reader))
+      })
+   }
+   return snapshots
+}
+
 function decodeIPAddressArray(reader: Reader): IPAddress[]
 {
    const values: IPAddress[] = []
@@ -600,10 +664,13 @@ function decodeCredentialBundleFields(reader: Reader): CredentialBundle
       apiCredentials.push(decodeApiCredential(reader))
    }
 
+   const bundleGeneration = reader.u64()
+   const tlsResumptionSnapshots = decodeTlsResumptionSnapshots(reader)
    return {
       tlsIdentities,
       apiCredentials,
-      bundleGeneration: reader.u64()
+      tlsResumptionSnapshots,
+      bundleGeneration
    }
 }
 
@@ -630,6 +697,8 @@ export function decodeCredentialDelta(data: Uint8Array): CredentialDelta
       removedTLSNames: [],
       updatedAPI: [],
       removedAPINames: [],
+      updatedResumptionSnapshots: [],
+      removedResumptionWormholeNames: [],
       reason: ""
    }
    const updatedTLSCount = reader.u32()
@@ -649,6 +718,8 @@ export function decodeCredentialDelta(data: Uint8Array): CredentialDelta
 
    delta.removedAPINames = decodeStringArray(reader)
    delta.reason = reader.string()
+   delta.updatedResumptionSnapshots = decodeTlsResumptionSnapshots(reader)
+   delta.removedResumptionWormholeNames = decodeStringArray(reader)
 
    if (!reader.done())
    {

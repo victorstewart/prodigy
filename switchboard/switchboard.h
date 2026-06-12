@@ -60,6 +60,8 @@ public:
 
   bytell_hash_set<switchboard_runtime::Wormhole *> wormholes;
   bool hasQuicCidKeyState = false;
+  // QUIC CID keys are Switchboard routing metadata only. They are unrelated to
+  // TLS resumption ticket keys and must not be used for TLS ticket encryption.
   uint8_t quicCidActiveKeyIndex = 0;
   uint128_t quicCidKeyMaterialByIndex[2] = {};
   std::array<uint32_t, RING_SIZE> hashRing;
@@ -700,6 +702,8 @@ private:
       for (uint8_t keyIndex = 0; keyIndex < 2; ++keyIndex)
       {
         quic_cid_aes_decrypt_state aesState = {};
+        // This BPF map holds only QUIC CID routing decrypt state, never TLS
+        // session-resumption ticket material.
         buildQuicCidDecryptState(portal->quicCidKeyMaterialByIndex[keyIndex], aesState);
 
         uint32_t mapIndex = quicCidPortalDecryptMapIndex(portal->slot, keyIndex);

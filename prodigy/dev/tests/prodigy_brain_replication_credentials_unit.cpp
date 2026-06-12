@@ -3175,6 +3175,131 @@ static DeploymentPlan makeDeploymentPlan(uint16_t applicationID, uint64_t versio
   return plan;
 }
 
+static Wormhole makeTlsResumptionTestWormhole(void)
+{
+  Wormhole wormhole = {};
+  wormhole.name.assign("public-api-quic"_ctv);
+  wormhole.externalAddress = IPAddress("2001:db8::44", true);
+  wormhole.externalPort = 443;
+  wormhole.containerPort = 8443;
+  wormhole.layer4 = IPPROTO_UDP;
+  wormhole.isQuic = true;
+  wormhole.source = ExternalAddressSource::distributableSubnet;
+  wormhole.hasTlsResumptionConfig = true;
+  wormhole.tlsResumption.alpns.push_back("h3"_ctv);
+  wormhole.tlsResumption.sniNames.push_back("api.example.com"_ctv);
+  return wormhole;
+}
+
+static TlsResumptionApplyAck makeTlsResumptionAck(const String& wormholeName, uint64_t generation)
+{
+  TlsResumptionApplyAck ack = {};
+
+  TlsResumptionApplyResult result = {};
+  result.wormholeName = wormholeName;
+  result.generation = generation;
+  result.success = true;
+  ack.results.push_back(result);
+  return ack;
+}
+
+static TlsResumptionSnapshot makeTlsResumptionTestSnapshot(const String& wormholeName, uint64_t generation, TlsResumptionKeyRole role)
+{
+  TlsResumptionSnapshot snapshot = {};
+  snapshot.generation = generation;
+  snapshot.wormholeName = wormholeName;
+
+  TlsResumptionKeyEpoch epoch = {};
+  epoch.generation = generation;
+  epoch.role = role;
+  for (uint32_t index = 0; index < sizeof(epoch.keyID); index += 1)
+  {
+    epoch.keyID[index] = uint8_t(0x20 + index);
+  }
+  for (uint32_t index = 0; index < sizeof(epoch.masterSecret); index += 1)
+  {
+    epoch.masterSecret[index] = uint8_t(0x40 + index);
+  }
+  epoch.issueUntilMs = role == TlsResumptionKeyRole::issueAndAccept ? 1'700'010'000'000 : 0;
+  epoch.acceptUntilMs = 1'700'020'000'000;
+  snapshot.keyRing.push_back(epoch);
+  return snapshot;
+}
+
+static bool tlsResumptionSnapshotHasEpoch(const TlsResumptionSnapshot *snapshot, uint64_t generation)
+{
+  if (snapshot == nullptr)
+  {
+    return false;
+  }
+
+  for (const TlsResumptionKeyEpoch& epoch : snapshot->keyRing)
+  {
+    if (epoch.generation == generation)
+    {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static bool tlsResumptionSnapshotHasEpochRole(const TlsResumptionSnapshot *snapshot, uint64_t generation, TlsResumptionKeyRole role)
+{
+  if (snapshot == nullptr)
+  {
+    return false;
+  }
+
+  for (const TlsResumptionKeyEpoch& epoch : snapshot->keyRing)
+  {
+    if (epoch.generation == generation && epoch.role == role)
+    {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static bool setTlsResumptionEpochAcceptUntilMs(TlsResumptionSnapshot *snapshot, uint64_t generation, int64_t acceptUntilMs)
+{
+  if (snapshot == nullptr)
+  {
+    return false;
+  }
+
+  for (TlsResumptionKeyEpoch& epoch : snapshot->keyRing)
+  {
+    if (epoch.generation == generation)
+    {
+      epoch.acceptUntilMs = acceptUntilMs;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static bool setTlsResumptionEpochIssueUntilMs(TlsResumptionSnapshot *snapshot, uint64_t generation, int64_t issueUntilMs)
+{
+  if (snapshot == nullptr)
+  {
+    return false;
+  }
+
+  for (TlsResumptionKeyEpoch& epoch : snapshot->keyRing)
+  {
+    if (epoch.generation == generation)
+    {
+      epoch.issueUntilMs = issueUntilMs;
+      return true;
+    }
+  }
+
+  return false;
+}
+
 static void testReplicationAcceptanceRules(TestSuite& suite)
 {
   TestBrain brain;
@@ -3312,6 +3437,186 @@ static void testCredentialBundleBuildAndApply(TestSuite& suite)
   brain.applyCredentialsToContainerPlan(noPolicyPlan, container, noPolicyContainerPlan);
   suite.expect(noPolicyContainerPlan.hasCredentialBundle == false, "apply_credentials_clears_bundle_without_policy");
   suite.expect(noPolicyContainerPlan.credentialBundle.apiCredentials.size() == 0, "apply_credentials_empty_without_policy");
+
+  DeploymentPlan resumptionPlan = makeDeploymentPlan(6, 909);
+  resumptionPlan.wormholes.push_back(makeTlsResumptionTestWormhole());
+
+  ContainerView resumptionContainerA;
+  resumptionContainerA.uuid = uint128_t(0xA001);
+  CredentialBundle resumptionBundleA;
+  suite.expect(brain.buildCredentialBundleForContainer(resumptionPlan, resumptionContainerA, resumptionBundleA), "bundle_build_resumption_produced");
+  suite.expect(resumptionBundleA.tlsIdentities.size() == 0, "bundle_build_resumption_no_tls_identity");
+  suite.expect(resumptionBundleA.apiCredentials.size() == 0, "bundle_build_resumption_no_api_credential");
+  suite.expect(resumptionBundleA.tlsResumptionSnapshots.size() == 1, "bundle_build_resumption_snapshot_count");
+  suite.expect(resumptionBundleA.tlsResumptionSnapshots[0].wormholeName.equal("public-api-quic"_ctv), "bundle_build_resumption_snapshot_wormhole_name");
+  suite.expect(resumptionBundleA.tlsResumptionSnapshots[0].keyRing.size() == 1, "bundle_build_resumption_snapshot_key_ring_count");
+  suite.expect(resumptionBundleA.tlsResumptionSnapshots[0].keyRing[0].role == TlsResumptionKeyRole::acceptOnly, "bundle_build_resumption_initial_epoch_accept_only");
+  suite.expect(resumptionBundleA.bundleGeneration == resumptionBundleA.tlsResumptionSnapshots[0].generation, "bundle_build_resumption_generation_matches_snapshot");
+
+  ContainerView resumptionContainerB;
+  resumptionContainerB.uuid = uint128_t(0xA002);
+  CredentialBundle resumptionBundleB;
+  suite.expect(brain.buildCredentialBundleForContainer(resumptionPlan, resumptionContainerB, resumptionBundleB), "bundle_build_resumption_second_container_produced");
+  suite.expect(resumptionBundleB.tlsResumptionSnapshots.size() == 1, "bundle_build_resumption_second_container_snapshot_count");
+  suite.expect(resumptionBundleA.tlsResumptionSnapshots[0].generation == resumptionBundleB.tlsResumptionSnapshots[0].generation, "bundle_build_resumption_reuses_generation");
+  suite.expect(resumptionBundleA.tlsResumptionSnapshots[0].keyRing.size() == 1 && resumptionBundleB.tlsResumptionSnapshots[0].keyRing.size() == 1 && prodigyTlsResumptionKeyEpochsEqual(resumptionBundleA.tlsResumptionSnapshots[0].keyRing[0], resumptionBundleB.tlsResumptionSnapshots[0].keyRing[0]), "bundle_build_resumption_reuses_key_epoch");
+
+  ContainerPlan resumptionContainerPlan;
+  brain.applyCredentialsToContainerPlan(resumptionPlan, resumptionContainerA, resumptionContainerPlan);
+  suite.expect(resumptionContainerPlan.hasCredentialBundle, "apply_credentials_resumption_sets_bundle_flag");
+  suite.expect(resumptionContainerPlan.credentialBundle.tlsResumptionSnapshots.size() == 1, "apply_credentials_resumption_copies_snapshot");
+}
+
+static void testTlsResumptionRotationAckCoverage(TestSuite& suite)
+{
+  TestBrain brain;
+  DeploymentPlan plan = makeDeploymentPlan(6, 910);
+  Wormhole wormhole = makeTlsResumptionTestWormhole();
+  plan.wormholes.push_back(wormhole);
+
+  ApplicationDeployment deployment = {};
+  deployment.plan = plan;
+  brain.deployments.insert_or_assign(plan.config.deploymentID(), &deployment);
+
+  ContainerView containerA = {};
+  containerA.uuid = uint128_t(0xB001);
+  containerA.deploymentID = plan.config.deploymentID();
+  containerA.state = ContainerState::healthy;
+  ContainerView containerB = {};
+  containerB.uuid = uint128_t(0xB002);
+  containerB.deploymentID = plan.config.deploymentID();
+  containerB.state = ContainerState::healthy;
+  ContainerView containerScheduled = {};
+  containerScheduled.uuid = uint128_t(0xB003);
+  containerScheduled.deploymentID = plan.config.deploymentID();
+  containerScheduled.state = ContainerState::scheduled;
+  ContainerView containerRestarting = {};
+  containerRestarting.uuid = uint128_t(0xB004);
+  containerRestarting.deploymentID = plan.config.deploymentID();
+  containerRestarting.state = ContainerState::crashedRestarting;
+  deployment.containers.insert(&containerA);
+  deployment.containers.insert(&containerB);
+  deployment.containers.insert(&containerScheduled);
+  deployment.containers.insert(&containerRestarting);
+  brain.containers.insert_or_assign(containerA.uuid, &containerA);
+  brain.containers.insert_or_assign(containerB.uuid, &containerB);
+  brain.containers.insert_or_assign(containerScheduled.uuid, &containerScheduled);
+  brain.containers.insert_or_assign(containerRestarting.uuid, &containerRestarting);
+
+  String failure = {};
+  auto currentSnapshot = [&]() -> TlsResumptionSnapshot * {
+    return brain.mutableTlsResumptionSnapshotForWormhole(plan.config.deploymentID(), plan.wormholes[0].name);
+  };
+  auto coverageIs = [&](bool expected, const char *label) {
+    suite.expect(brain.tlsResumptionAckCoverageSatisfied(plan, plan.wormholes[0], &failure) == expected, label);
+  };
+  auto recordAck = [&](ContainerView& container, uint64_t generation, bool success = true) -> bool {
+    TlsResumptionApplyAck ack = makeTlsResumptionAck(plan.wormholes[0].name, generation);
+    ack.results[0].success = success;
+    if (success == false)
+    {
+      ack.results[0].failureReason.assign("registry rejected snapshot"_ctv);
+    }
+    return brain.recordTlsResumptionApplyAck(container.uuid, ack);
+  };
+  auto expectAck = [&](ContainerView& container, uint64_t generation, bool expected, const char *label, bool success = true) {
+    suite.expect(recordAck(container, generation, success) == expected, label);
+  };
+  auto expectRole = [&](uint64_t generation, TlsResumptionKeyRole role, const char *label) {
+    suite.expect(tlsResumptionSnapshotHasEpochRole(currentSnapshot(), generation, role), label);
+  };
+
+  TlsResumptionSnapshot *snapshot = brain.beginTlsResumptionAcceptOnlyRollout(plan, plan.wormholes[0], 1'700'000'100'000, false, &failure);
+  suite.expect(snapshot != nullptr, "resumption_rotation_initial_rollout_snapshot");
+  suite.expect(failure.size() == 0, "resumption_rotation_initial_rollout_no_failure");
+  suite.expect(snapshot != nullptr && snapshot->keyRing.size() == 1, "resumption_rotation_initial_key_count");
+  suite.expect(snapshot != nullptr && snapshot->keyRing[0].role == TlsResumptionKeyRole::acceptOnly, "resumption_rotation_initial_accept_only");
+  const uint64_t firstGeneration = snapshot != nullptr ? snapshot->generation : 0;
+
+  coverageIs(false, "resumption_rotation_blocks_without_acks");
+  suite.expect(brain.promoteTlsResumptionIssueEpochIfAcked(plan, plan.wormholes[0], 1'700'000'100'100, false, &failure) == false, "resumption_rotation_does_not_promote_without_acks");
+
+  expectAck(containerA, firstGeneration, true, "resumption_rotation_records_first_ack");
+  coverageIs(false, "resumption_rotation_blocks_partial_ack");
+  suite.expect(brain.advanceTlsResumptionLifecycleForDeployment(plan, 1'700'000'100'250, false, false) == 0, "resumption_rotation_auto_promotion_blocks_partial_ack");
+
+  expectAck(containerB, firstGeneration > 0 ? firstGeneration - 1 : 0, false, "resumption_rotation_ignores_stale_ack");
+  coverageIs(false, "resumption_rotation_stale_ack_not_coverage");
+  expectAck(containerB, firstGeneration, true, "resumption_rotation_records_failure_ack", false);
+  coverageIs(false, "resumption_rotation_failure_ack_blocks");
+  expectAck(containerB, firstGeneration, true, "resumption_rotation_records_second_success_ack");
+  coverageIs(true, "resumption_rotation_coverage_after_all_success");
+  containerScheduled.state = ContainerState::healthy;
+  coverageIs(false, "resumption_rotation_scheduled_container_joining_gate_requires_ack");
+  expectAck(containerScheduled, firstGeneration, true, "resumption_rotation_records_scheduled_join_ack");
+  coverageIs(true, "resumption_rotation_scheduled_join_ack_satisfies_gate");
+  containerScheduled.state = ContainerState::scheduled;
+  containerRestarting.state = ContainerState::healthy;
+  coverageIs(false, "resumption_rotation_restarted_container_joining_gate_requires_ack");
+  expectAck(containerRestarting, firstGeneration, true, "resumption_rotation_records_restarted_join_ack");
+  coverageIs(true, "resumption_rotation_restarted_join_ack_satisfies_gate");
+  containerRestarting.state = ContainerState::crashedRestarting;
+  brain.restoreTlsResumptionSnapshotsByWormhole(brain.captureTlsResumptionSnapshotsByWormhole(), true);
+  coverageIs(true, "resumption_rotation_restore_preserves_matching_acks");
+  suite.expect(brain.advanceTlsResumptionLifecycleForDeployment(plan, 1'700'000'100'600, false, false) == 1, "resumption_rotation_auto_promotes_after_coverage");
+
+  TlsResumptionSnapshot *promoted = currentSnapshot();
+  suite.expect(promoted != nullptr && promoted->keyRing.size() == 1 && promoted->keyRing[0].role == TlsResumptionKeyRole::issueAndAccept, "resumption_rotation_promoted_issue_epoch");
+  suite.expect(promoted != nullptr && promoted->keyRing[0].issueUntilMs > 1'700'000'100'600, "resumption_rotation_sets_issue_until");
+  suite.expect(
+      promoted != nullptr &&
+          brain.pushTlsResumptionUpdateToLiveContainers(plan, promoted, nullptr, promoted->generation, "unit-test"_ctv) == 4,
+      "resumption_rotation_delta_attempts_all_refreshable_containers");
+
+  ContainerView lateScheduled = {};
+  lateScheduled.uuid = uint128_t(0xB005);
+  lateScheduled.deploymentID = plan.config.deploymentID();
+  lateScheduled.state = ContainerState::scheduled;
+  ContainerPlan startupPlan = {};
+  brain.applyCredentialsToContainerPlan(plan, lateScheduled, startupPlan);
+  suite.expect(
+      startupPlan.hasCredentialBundle &&
+          startupPlan.credentialBundle.tlsResumptionSnapshots.size() == 1 &&
+          startupPlan.credentialBundle.tlsResumptionSnapshots[0].generation == firstGeneration &&
+          tlsResumptionSnapshotHasEpochRole(&startupPlan.credentialBundle.tlsResumptionSnapshots[0], firstGeneration, TlsResumptionKeyRole::issueAndAccept),
+      "resumption_rotation_late_scheduled_startup_gets_promoted_bundle");
+
+  TlsResumptionSnapshot *next = brain.beginTlsResumptionAcceptOnlyRollout(plan, plan.wormholes[0], 1'700'000'101'000, false, &failure);
+  suite.expect(next != nullptr, "resumption_rotation_next_rollout_snapshot");
+  const uint64_t secondGeneration = next != nullptr ? next->generation : 0;
+  suite.expect(secondGeneration > firstGeneration, "resumption_rotation_next_generation_increases");
+  suite.expect(next != nullptr && next->keyRing.size() == 2, "resumption_rotation_next_keeps_old_epoch");
+  coverageIs(false, "resumption_rotation_next_rollout_clears_old_acks");
+  expectAck(containerA, firstGeneration, false, "resumption_rotation_old_generation_ack_ignored_after_next");
+  expectAck(containerA, secondGeneration, true, "resumption_rotation_records_next_ack_a");
+  expectAck(containerB, secondGeneration, true, "resumption_rotation_records_next_ack_b");
+  suite.expect(brain.promoteTlsResumptionIssueEpochIfAcked(plan, plan.wormholes[0], 1'700'000'101'400, false, &failure), "resumption_rotation_promotes_next_after_coverage");
+
+  expectRole(firstGeneration, TlsResumptionKeyRole::acceptOnly, "resumption_rotation_old_issue_epoch_demoted");
+  expectRole(secondGeneration, TlsResumptionKeyRole::issueAndAccept, "resumption_rotation_new_epoch_issue_and_accept");
+
+  suite.expect(setTlsResumptionEpochAcceptUntilMs(currentSnapshot(), firstGeneration, 1'700'000'101'450), "resumption_rotation_marks_old_epoch_expired");
+  suite.expect(brain.retireExpiredTlsResumptionEpochs(plan, 1'700'000'101'451, false) == 1, "resumption_rotation_retires_expired_old_epoch");
+  TlsResumptionSnapshot *retired = currentSnapshot();
+  suite.expect(retired != nullptr && retired->keyRing.size() == 1, "resumption_rotation_retire_keeps_current_epoch");
+  suite.expect(tlsResumptionSnapshotHasEpoch(retired, firstGeneration) == false, "resumption_rotation_expired_old_epoch_removed");
+  suite.expect(tlsResumptionSnapshotHasEpoch(retired, secondGeneration), "resumption_rotation_retire_keeps_new_generation");
+
+  suite.expect(setTlsResumptionEpochIssueUntilMs(retired, secondGeneration, 1'700'000'101'500), "resumption_rotation_expires_issue_epoch");
+  suite.expect(brain.advanceTlsResumptionLifecycleForDeployment(plan, 1'700'000'101'501, true, false) == 1, "resumption_rotation_scheduler_starts_next_rollout");
+  TlsResumptionSnapshot *scheduled = currentSnapshot();
+  const uint64_t thirdGeneration = scheduled != nullptr ? scheduled->generation : 0;
+  suite.expect(thirdGeneration > secondGeneration, "resumption_rotation_scheduler_generation_increases");
+  suite.expect(scheduled != nullptr && scheduled->keyRing.size() == 2, "resumption_rotation_scheduler_keeps_old_for_accept");
+  suite.expect(tlsResumptionSnapshotHasEpoch(scheduled, secondGeneration), "resumption_rotation_scheduler_old_epoch_present");
+  suite.expect(tlsResumptionSnapshotHasEpochRole(scheduled, thirdGeneration, TlsResumptionKeyRole::acceptOnly), "resumption_rotation_scheduler_new_epoch_accept_only");
+  suite.expect(brain.advanceTlsResumptionLifecycleForDeployment(plan, 1'700'000'101'550, false, false) == 0, "resumption_rotation_scheduler_blocks_without_new_acks");
+
+  expectAck(containerA, thirdGeneration, true, "resumption_rotation_scheduler_records_ack_a");
+  expectAck(containerB, thirdGeneration, true, "resumption_rotation_scheduler_records_ack_b");
+  suite.expect(brain.advanceTlsResumptionLifecycleForDeployment(plan, 1'700'000'101'580, false, false) == 1, "resumption_rotation_scheduler_promotes_after_acks");
+  expectRole(secondGeneration, TlsResumptionKeyRole::acceptOnly, "resumption_rotation_scheduler_demotes_previous_issue");
+  expectRole(thirdGeneration, TlsResumptionKeyRole::issueAndAccept, "resumption_rotation_scheduler_promotes_new_issue");
 }
 
 static void testBrainHandlerReplicationPaths(TestSuite& suite)
@@ -3476,12 +3781,25 @@ static void testBrainHandlerReplicationPaths(TestSuite& suite)
   suite.expect(brain.persistCalls == 6, "replicate_deployment_persists_on_apply");
   suite.expect(peer.wBuffer.size() > 0, "replicate_deployment_queues_echo");
 
+  String cullResumptionWormholeName = {};
+  cullResumptionWormholeName.assign("public-api-quic"_ctv);
+  TlsResumptionSnapshot cullResumptionSnapshot = {};
+  cullResumptionSnapshot.generation = 12;
+  cullResumptionSnapshot.wormholeName = cullResumptionWormholeName;
+  brain.tlsResumptionStateByDeployment[plan.config.deploymentID()].wormholes[cullResumptionWormholeName].snapshot = cullResumptionSnapshot;
+  BrainTlsResumptionAckState cullAck = {};
+  uint128_t cullContainerUUID = uint128_t(0xC011);
+  cullAck.generation = cullResumptionSnapshot.generation;
+  cullAck.success = true;
+  brain.tlsResumptionStateByDeployment[plan.config.deploymentID()].wormholes[cullResumptionWormholeName].acksByContainer.insert_or_assign(cullContainerUUID, cullAck);
+
   peer.wBuffer.clear();
   {
     Message *message = buildBrainMessage(messageBuffer, BrainTopic::cullDeployment, plan.config.deploymentID());
     brain.brainHandler(&peer, message);
   }
   suite.expect(brain.deploymentPlans.find(plan.config.deploymentID()) == brain.deploymentPlans.end(), "cull_deployment_erases_plan");
+  suite.expect(brain.tlsResumptionStateForWormhole(plan.config.deploymentID(), cullResumptionWormholeName) == nullptr, "cull_deployment_erases_tls_resumption_state");
   suite.expect(brain.persistCalls == 7, "cull_deployment_persists_on_apply");
 
   ProdigyMasterAuthorityRuntimeState runtimeState = {};
@@ -6156,6 +6474,91 @@ static void testApplyReplicatedDeploymentPlanLiveStateUpdatesTrackedContainers(T
   suite.expect(second.whiteholes.size() == 1 && equalSerializedObjects(second.whiteholes[0], replicated.whiteholes[0]), "apply_replicated_deployment_plan_live_state_updates_second_container_whiteholes");
 }
 
+static void testApplyReplicatedDeploymentPlanCleansTlsResumptionState(TestSuite& suite)
+{
+  TestBrain brain = {};
+  brain.iaas = new NoopBrainIaaS();
+
+  ApplicationDeployment deployment = {};
+  deployment.plan = makeDeploymentPlan(52'003, 1008);
+
+  Wormhole keep = {};
+  keep.name.assign("keep-quic"_ctv);
+  keep.externalAddress = IPAddress("203.0.113.101", false);
+  keep.externalPort = 9443;
+  keep.containerPort = 9443;
+  keep.layer4 = IPPROTO_UDP;
+  keep.isQuic = true;
+  keep.source = ExternalAddressSource::hostPublicAddress;
+  keep.hasTlsResumptionConfig = true;
+  keep.tlsResumption.alpns.push_back("h3"_ctv);
+  keep.tlsResumption.sniNames.push_back("keep.example.test"_ctv);
+  Wormhole disabled = keep;
+  disabled.name.assign("disabled-quic"_ctv);
+  disabled.externalPort = 9444;
+  disabled.containerPort = 9444;
+  disabled.tlsResumption.sniNames.clear();
+  disabled.tlsResumption.sniNames.push_back("disabled.example.test"_ctv);
+
+  Wormhole removed = keep;
+  removed.name.assign("removed-quic"_ctv);
+  removed.externalPort = 9445;
+  removed.containerPort = 9445;
+  removed.tlsResumption.sniNames.clear();
+  removed.tlsResumption.sniNames.push_back("removed.example.test"_ctv);
+
+  deployment.plan.wormholes.push_back(keep);
+  deployment.plan.wormholes.push_back(disabled);
+  deployment.plan.wormholes.push_back(removed);
+
+  ContainerView container = {};
+  container.uuid = uint128_t(0x6201);
+  container.deploymentID = deployment.plan.config.deploymentID();
+  container.state = ContainerState::healthy;
+  deployment.containers.insert(&container);
+  brain.containers.insert_or_assign(container.uuid, &container);
+  brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+
+  const int64_t nowMs = 1'700'000'202'000;
+  suite.expect(brain.ensureTlsResumptionSnapshotForWormhole(deployment.plan, deployment.plan.wormholes[0], nowMs) != nullptr, "resumption_cleanup_seed_keep_snapshot");
+  suite.expect(brain.ensureTlsResumptionSnapshotForWormhole(deployment.plan, deployment.plan.wormholes[1], nowMs) != nullptr, "resumption_cleanup_seed_disabled_snapshot");
+  suite.expect(brain.ensureTlsResumptionSnapshotForWormhole(deployment.plan, deployment.plan.wormholes[2], nowMs) != nullptr, "resumption_cleanup_seed_removed_snapshot");
+
+  auto seedAck = [&](const String& wormholeName) {
+    BrainTlsResumptionWormholeState *state = brain.mutableTlsResumptionStateForWormhole(deployment.plan.config.deploymentID(), wormholeName);
+    suite.expect(state != nullptr, "resumption_cleanup_seed_ack_snapshot_exists");
+    BrainTlsResumptionAckState ack = {};
+    ack.generation = state != nullptr ? state->snapshot.generation : 0;
+    ack.success = true;
+    if (state != nullptr)
+    {
+      state->acksByContainer.insert_or_assign(container.uuid, ack);
+    }
+  };
+  seedAck(keep.name);
+  seedAck(disabled.name);
+  seedAck(removed.name);
+
+  DeploymentPlan replicated = deployment.plan;
+  replicated.wormholes.clear();
+  replicated.wormholes.push_back(keep);
+  Wormhole disabledConfig = disabled;
+  disabledConfig.hasTlsResumptionConfig = false;
+  replicated.wormholes.push_back(disabledConfig);
+
+  brain.applyReplicatedDeploymentPlanLiveState(replicated);
+
+  suite.expect(equalSerializedObjects(deployment.plan, replicated), "resumption_cleanup_apply_updates_plan");
+  suite.expect(brain.tlsResumptionSnapshotForWormhole(replicated.config.deploymentID(), keep.name) != nullptr, "resumption_cleanup_preserves_declared_snapshot");
+  suite.expect(brain.tlsResumptionSnapshotForWormhole(replicated.config.deploymentID(), disabled.name) == nullptr, "resumption_cleanup_removes_undeclared_snapshot");
+  suite.expect(brain.tlsResumptionSnapshotForWormhole(replicated.config.deploymentID(), removed.name) == nullptr, "resumption_cleanup_removes_missing_snapshot");
+  const BrainTlsResumptionWormholeState *keepState = brain.tlsResumptionStateForWormhole(replicated.config.deploymentID(), keep.name);
+  suite.expect(keepState != nullptr && keepState->acksByContainer.find(container.uuid) != keepState->acksByContainer.end(), "resumption_cleanup_preserves_declared_ack");
+  suite.expect(brain.tlsResumptionStateForWormhole(replicated.config.deploymentID(), disabled.name) == nullptr, "resumption_cleanup_removes_undeclared_ack");
+  suite.expect(brain.tlsResumptionStateForWormhole(replicated.config.deploymentID(), removed.name) == nullptr, "resumption_cleanup_removes_missing_ack");
+  suite.expect(container.wormholes.size() == 2 && container.wormholes[0].name.equal(keep.name) && container.wormholes[1].name.equal(disabled.name), "resumption_cleanup_updates_container_wormholes");
+}
+
 static void testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(TestSuite& suite)
 {
   ScopedRing scopedRing = {};
@@ -6411,6 +6814,26 @@ static void testPersistentMasterAuthorityPackageRestore(TestSuite& suite)
   appName.assign("RestoredApp"_ctv);
   source.reserveApplicationIDMapping(appName, tlsFactory.applicationID);
   DeploymentPlan plan = makeDeploymentPlan(tlsFactory.applicationID, 203);
+  String resumptionWormholeName = {};
+  resumptionWormholeName.assign("public-api-quic"_ctv);
+  TlsResumptionSnapshot resumptionSnapshot = {};
+  resumptionSnapshot.generation = 44;
+  resumptionSnapshot.wormholeName = resumptionWormholeName;
+  TlsResumptionKeyEpoch resumptionEpoch = {};
+  resumptionEpoch.generation = resumptionSnapshot.generation;
+  resumptionEpoch.role = TlsResumptionKeyRole::acceptOnly;
+  for (uint32_t index = 0; index < sizeof(resumptionEpoch.keyID); index += 1)
+  {
+    resumptionEpoch.keyID[index] = uint8_t(0x30u + index);
+  }
+  for (uint32_t index = 0; index < sizeof(resumptionEpoch.masterSecret); index += 1)
+  {
+    resumptionEpoch.masterSecret[index] = uint8_t(0x70u + index);
+  }
+  resumptionEpoch.acceptUntilMs = 99'999;
+  resumptionSnapshot.keyRing.push_back(resumptionEpoch);
+  source.tlsResumptionStateByDeployment[plan.config.deploymentID()].wormholes[resumptionWormholeName].snapshot = resumptionSnapshot;
+  source.nextTlsResumptionGeneration = 45;
   source.deploymentPlans.insert_or_assign(plan.config.deploymentID(), plan);
   source.failedDeployments.insert_or_assign(plan.config.deploymentID(), "bundle-missing"_ctv);
   source.nextMintedClientTlsGeneration = 77;
@@ -6454,6 +6877,7 @@ static void testPersistentMasterAuthorityPackageRestore(TestSuite& suite)
   auto restoredPlanIt = restored.deploymentPlans.find(plan.config.deploymentID());
   auto restoredFailureIt = restored.failedDeployments.find(plan.config.deploymentID());
   auto restoredFollowerBootIt = restored.updateSelfFollowerBootNsByPeerKey.find(0xAAA5);
+  const BrainTlsResumptionWormholeState *restoredResumption = restored.tlsResumptionStateForWormhole(plan.config.deploymentID(), resumptionWormholeName);
 
   suite.expect(restoredTlsIt != restored.tlsVaultFactoriesByApp.end() && equalSerializedObjects(restoredTlsIt->second, tlsFactory), "restore_package_restores_tls_factory");
   suite.expect(restoredApiIt != restored.apiCredentialSetsByApp.end() && equalSerializedObjects(restoredApiIt->second, apiSet), "restore_package_restores_api_credentials");
@@ -6465,6 +6889,8 @@ static void testPersistentMasterAuthorityPackageRestore(TestSuite& suite)
   suite.expect(restored.masterAuthorityRuntimeState == source.masterAuthorityRuntimeState, "restore_package_restores_master_runtime_state");
   suite.expect(restored.hasCompletedInitialMasterElection, "restore_package_restores_initial_master_election_completion");
   suite.expect(restored.nextMintedClientTlsGeneration == source.nextMintedClientTlsGeneration, "restore_package_restores_client_tls_generation");
+  suite.expect(restored.nextTlsResumptionGeneration == source.nextTlsResumptionGeneration, "restore_package_restores_tls_resumption_generation");
+  suite.expect(restoredResumption != nullptr && equalSerializedObjects(restoredResumption->snapshot, resumptionSnapshot), "restore_package_restores_tls_resumption_snapshot");
   suite.expect(restored.updateSelfState == source.updateSelfState, "restore_package_restores_update_self_state");
   suite.expect(restoredFollowerBootIt != restored.updateSelfFollowerBootNsByPeerKey.end() && restoredFollowerBootIt->second == 999, "restore_package_restores_update_self_follower_boot");
   suite.expect(restored.masterAuthorityRuntimeState.pendingAddMachinesOperations.size() == 1, "restore_package_restores_pending_addmachines_operation");
@@ -8383,6 +8809,7 @@ static void testNeuronPendingReplayHelpers(TestSuite& suite)
   api.generation = 1;
   api.material.assign("secret-token"_ctv);
   delta.updatedApi.push_back(api);
+  delta.updatedResumptionSnapshots.push_back(makeTlsResumptionTestSnapshot("pending-quic"_ctv, 77, TlsResumptionKeyRole::issueAndAccept));
 
   String credentialPayload = {};
   suite.expect(ProdigyWire::serializeCredentialDelta(credentialPayload, delta), "neuron_pending_replay_serializes_credential_delta");
@@ -8411,6 +8838,12 @@ static void testNeuronPendingReplayHelpers(TestSuite& suite)
   suite.expect(
       container.plan.credentialBundle.apiCredentials.size() == 1 && container.plan.credentialBundle.apiCredentials[0].name.equals("token"_ctv) && container.plan.credentialBundle.apiCredentials[0].material.equals("secret-token"_ctv),
       "neuron_pending_replay_applies_credential_refresh");
+  suite.expect(
+      container.plan.credentialBundle.tlsResumptionSnapshots.size() == 1 &&
+          container.plan.credentialBundle.tlsResumptionSnapshots[0].wormholeName.equals("pending-quic"_ctv) &&
+          container.plan.credentialBundle.tlsResumptionSnapshots[0].generation == 77 &&
+          tlsResumptionSnapshotHasEpochRole(&container.plan.credentialBundle.tlsResumptionSnapshots[0], 77, TlsResumptionKeyRole::issueAndAccept),
+      "neuron_pending_replay_applies_tls_resumption_refresh");
 
   uint32_t advertisementFrames = 0;
   uint32_t subscriptionFrames = 0;
@@ -9927,84 +10360,31 @@ static void testNeuronRecvDispatchesPairingAndCredentialMessages(TestSuite& suit
   }
 
   {
-    BrainContainerFixture fixture(suite, "neuron_recv_credential_active", uint128_t(0x7020));
+    BrainSocketFixture fixture(suite, "neuron_recv_credential_typed_ack");
     if (fixture.ready)
     {
-      CredentialDelta delta = {};
-      delta.bundleGeneration = 9;
-      delta.reason.assign("rotate"_ctv);
-      ApiCredential api = {};
-      api.name.assign("token"_ctv);
-      api.provider.assign("example"_ctv);
-      api.generation = 1;
-      api.material.assign("secret-token"_ctv);
-      delta.updatedApi.push_back(api);
+      TlsResumptionApplyAck ack = {};
+      TlsResumptionApplyResult resumption = {};
+      resumption.wormholeName.assign("public-api-quic"_ctv);
+      resumption.generation = 42;
+      resumption.success = true;
+      ack.results.push_back(resumption);
 
-      String credentialPayload = {};
+      String ackPayload = {};
       suite.expect(
-          ProdigyWire::serializeCredentialDelta(credentialPayload, delta),
-          "neuron_recv_credential_active_serializes_delta");
+          ProdigyWire::serializeTlsResumptionApplyAck(ackPayload, ack),
+          "neuron_recv_credential_typed_ack_serializes_result");
 
       String inbound = {};
-      buildNeuronMessage(inbound, NeuronTopic::refreshContainerCredentials, fixture.container.plan.uuid, credentialPayload);
+      buildNeuronMessage(inbound, NeuronTopic::refreshContainerCredentials, uint128_t(0x7020), ackPayload);
       suite.require(
-          seedBrainInboundForTest(suite, fixture.brain.neuron, "neuron_recv_credential_active", inbound),
-          "neuron_recv_credential_active_seeds_inbound");
-      recvAndDispatchBrainForTest(fixture.brain.neuron, int(inbound.size()));
+          seedBrainInboundForTest(suite, fixture.neuron, "neuron_recv_credential_typed_ack", inbound),
+          "neuron_recv_credential_typed_ack_seeds_inbound");
+      uint32_t dispatchCount = recvAndDispatchBrainForTest(fixture.neuron, int(inbound.size()));
 
-      suite.expect(fixture.container.plan.hasCredentialBundle, "neuron_recv_credential_active_marks_bundle_present");
-      suite.expect(
-          fixture.container.plan.credentialBundle.apiCredentials.size() == 1 && fixture.container.plan.credentialBundle.apiCredentials[0].name.equals("token"_ctv) && fixture.container.plan.credentialBundle.apiCredentials[0].material.equals("secret-token"_ctv),
-          "neuron_recv_credential_active_applies_delta");
-      suite.expect(fixture.container.pendingSend, "neuron_recv_credential_active_queues_container_send");
-
-      uint32_t frames = 0;
-      forEachMessageInBuffer(fixture.container.wBuffer, [&](Message *frame) {
-        if (ContainerTopic(frame->topic) == ContainerTopic::credentialsRefresh)
-        {
-          frames += 1;
-        }
-      });
-      suite.expect(frames == 1, "neuron_recv_credential_active_emits_container_frame");
-    }
-  }
-
-  {
-    BrainContainerFixture fixture(suite, "neuron_recv_credential_inactive", uint128_t(0x7024), false);
-    if (fixture.ready)
-    {
-      CredentialDelta delta = {};
-      delta.bundleGeneration = 12;
-      delta.reason.assign("inactive"_ctv);
-      ApiCredential api = {};
-      api.name.assign("token"_ctv);
-      api.provider.assign("example"_ctv);
-      api.generation = 4;
-      api.material.assign("inactive-secret"_ctv);
-      delta.updatedApi.push_back(api);
-
-      String credentialPayload = {};
-      suite.expect(
-          ProdigyWire::serializeCredentialDelta(credentialPayload, delta),
-          "neuron_recv_credential_inactive_serializes_delta");
-
-      String inbound = {};
-      buildNeuronMessage(inbound, NeuronTopic::refreshContainerCredentials, fixture.container.plan.uuid, credentialPayload);
-      suite.require(
-          seedBrainInboundForTest(suite, fixture.brain.neuron, "neuron_recv_credential_inactive", inbound),
-          "neuron_recv_credential_inactive_seeds_inbound");
-      recvAndDispatchBrainForTest(fixture.brain.neuron, int(inbound.size()));
-
-      suite.expect(fixture.container.plan.hasCredentialBundle, "neuron_recv_credential_inactive_marks_bundle_present");
-      suite.expect(
-          fixture.container.plan.credentialBundle.apiCredentials.size() == 1 && fixture.container.plan.credentialBundle.apiCredentials[0].material.equals("inactive-secret"_ctv),
-          "neuron_recv_credential_inactive_applies_delta");
-      suite.expect(
-          fixture.brain.neuron.pendingCredentialRefreshPayloadCountForTest(fixture.container.plan.uuid) == 1,
-          "neuron_recv_credential_inactive_queues_pending_payload");
-      suite.expect(
-          fixture.container.pendingSend == false && fixture.container.wBuffer.size() == 0,
-          "neuron_recv_credential_inactive_does_not_queue_container_send");
+      suite.expect(dispatchCount == 1, "neuron_recv_credential_typed_ack_dispatches_once");
+      suite.expect(fixture.neuron.brainOutboundForTest().size() == 0, "neuron_recv_credential_typed_ack_emits_no_outbound_frames");
+      suite.expect(TestNeuron::brainStreamIsClosingForTest(fixture.neuron.brainStreamForTest()) == false, "neuron_recv_credential_typed_ack_keeps_stream_open");
     }
   }
 
@@ -10013,7 +10393,10 @@ static void testNeuronRecvDispatchesPairingAndCredentialMessages(TestSuite& suit
     if (fixture.ready)
     {
       String inbound = {};
-      buildNeuronMessage(inbound, NeuronTopic::refreshContainerCredentials, uint128_t(0x7025), "broken"_ctv);
+      Message *message = buildNeuronMessage(inbound, NeuronTopic::refreshContainerCredentials, uint128_t(0x7025), "broken"_ctv);
+      suite.expect(
+          ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal()) == false,
+          "neuron_recv_credential_malformed_validator_rejects_payload");
       suite.require(
           seedBrainInboundForTest(suite, fixture.neuron, "neuron_recv_credential_malformed", inbound),
           "neuron_recv_credential_malformed_seeds_inbound");
@@ -10026,38 +10409,6 @@ static void testNeuronRecvDispatchesPairingAndCredentialMessages(TestSuite& suit
       suite.expect(
           fixture.neuron.brainOutboundForTest().size() == 0,
           "neuron_recv_credential_malformed_emits_no_outbound_frames");
-    }
-  }
-
-  {
-    BrainSocketFixture fixture(suite, "neuron_recv_credential_missing");
-    if (fixture.ready)
-    {
-      CredentialDelta delta = {};
-      delta.bundleGeneration = 10;
-      delta.reason.assign("missing-container"_ctv);
-      ApiCredential api = {};
-      api.name.assign("token"_ctv);
-      api.provider.assign("example"_ctv);
-      api.generation = 2;
-      api.material.assign("missing-secret"_ctv);
-      delta.updatedApi.push_back(api);
-
-      String credentialPayload = {};
-      suite.expect(
-          ProdigyWire::serializeCredentialDelta(credentialPayload, delta),
-          "neuron_recv_credential_missing_serializes_delta");
-
-      String inbound = {};
-      buildNeuronMessage(inbound, NeuronTopic::refreshContainerCredentials, uint128_t(0x7021), credentialPayload);
-      suite.require(
-          seedBrainInboundForTest(suite, fixture.neuron, "neuron_recv_credential_missing", inbound),
-          "neuron_recv_credential_missing_seeds_inbound");
-      recvAndDispatchBrainForTest(fixture.neuron, int(inbound.size()));
-
-      suite.expect(
-          fixture.neuron.pendingCredentialRefreshPayloadCountForTest(uint128_t(0x7021)) == 1,
-          "neuron_recv_credential_missing_queues_pending_payload");
     }
   }
 
@@ -10093,42 +10444,6 @@ static void testNeuronRecvDispatchesPairingAndCredentialMessages(TestSuite& suit
       suite.expect(
           fixture.container.pendingSend == false && fixture.container.wBuffer.size() == 0,
           "neuron_recv_subscription_pending_destroy_does_not_queue_container_send");
-    }
-  }
-
-  {
-    BrainContainerFixture fixture(suite, "neuron_recv_credential_pending_destroy", uint128_t(0x7023), true, true, true);
-    if (fixture.ready)
-    {
-      CredentialDelta delta = {};
-      delta.bundleGeneration = 11;
-      delta.reason.assign("pending-destroy"_ctv);
-      ApiCredential api = {};
-      api.name.assign("token"_ctv);
-      api.provider.assign("example"_ctv);
-      api.generation = 3;
-      api.material.assign("skipped-secret"_ctv);
-      delta.updatedApi.push_back(api);
-
-      String credentialPayload = {};
-      suite.expect(
-          ProdigyWire::serializeCredentialDelta(credentialPayload, delta),
-          "neuron_recv_credential_pending_destroy_serializes_delta");
-
-      String inbound = {};
-      buildNeuronMessage(inbound, NeuronTopic::refreshContainerCredentials, fixture.container.plan.uuid, credentialPayload);
-      suite.require(
-          seedBrainInboundForTest(suite, fixture.brain.neuron, "neuron_recv_credential_pending_destroy", inbound),
-          "neuron_recv_credential_pending_destroy_seeds_inbound");
-      recvAndDispatchBrainForTest(fixture.brain.neuron, int(inbound.size()));
-
-      suite.expect(fixture.container.plan.hasCredentialBundle == false, "neuron_recv_credential_pending_destroy_skips_delta");
-      suite.expect(
-          fixture.brain.neuron.pendingCredentialRefreshPayloadCountForTest(fixture.container.plan.uuid) == 0,
-          "neuron_recv_credential_pending_destroy_does_not_queue_pending_payload");
-      suite.expect(
-          fixture.container.pendingSend == false && fixture.container.wBuffer.size() == 0,
-          "neuron_recv_credential_pending_destroy_does_not_queue_container_send");
     }
   }
 
@@ -14673,6 +14988,7 @@ int main(void)
 
   testReplicationAcceptanceRules(suite);
   testCredentialBundleBuildAndApply(suite);
+  testTlsResumptionRotationAckCoverage(suite);
   testBrainHandlerReplicationPaths(suite);
   testReconcileStateReplicatesCredentialAndTlsState(suite);
   testDeploymentReplicationBackpressureClosesPeer(suite);
@@ -14716,6 +15032,7 @@ int main(void)
   testRegisteredRoutableAddressRefreshReplaysToNeuronsFollowersAndContainers(suite);
   testRegisteredRoutableAddressWormholesRefreshHostedIngressBeforeOpen(suite);
   testApplyReplicatedDeploymentPlanLiveStateUpdatesTrackedContainers(suite);
+  testApplyReplicatedDeploymentPlanCleansTlsResumptionState(suite);
   testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(suite);
   testUpdateSelfPeerRegistrationCreditsBootNsChange(suite);
   testUpdateSelfPeerRegistrationCreditsReconnectWithoutBootNsChange(suite);

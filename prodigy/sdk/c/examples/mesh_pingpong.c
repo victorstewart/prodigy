@@ -503,11 +503,13 @@ static void mesh_pingpong_resource_delta(
 static void mesh_pingpong_credentials_refresh(
     void *context,
     prodigy_neuron_hub *hub,
-    const prodigy_credential_delta *delta)
+    const uint8_t *payload,
+    size_t payload_size)
 {
   mesh_pingpong_state *state = (mesh_pingpong_state *)context;
   (void)hub;
-  (void)delta;
+  (void)payload;
+  (void)payload_size;
   if (state == NULL)
   {
     return;

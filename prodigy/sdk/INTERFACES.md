@@ -31,7 +31,7 @@ This file does not define:
 
 - Mothership CLI or deployment-plan JSON
 - internal Brain/Neuron/Mothership RPCs
-- legacy Bitsery bootstrap details for wormholes and whiteholes
+- removed bootstrap compatibility formats
 - `AegisHub`
 
 ## Authoritative Sources And Precedence
@@ -135,6 +135,7 @@ Field order:
 1. `tls_identities: array<TlsIdentity>`
 2. `api_credentials: array<ApiCredential>`
 3. `bundle_generation: u64`
+4. `tls_resumption_snapshots: array<TlsResumptionSnapshot>`
 
 ### `CredentialDelta`
 
@@ -148,6 +149,18 @@ Field order:
 4. `updated_api: array<ApiCredential>`
 5. `removed_api_names: array<string>`
 6. `reason: string`
+7. `updated_resumption_snapshots: array<TlsResumptionSnapshot>`
+8. `removed_resumption_wormhole_names: array<string>`
+
+`TlsResumptionSnapshot` is the minimal delivery contract for TLS session resumption key rings: `generation`, `wormhole_name`, and `key_ring`. SDKs deliver those wormhole-marked key epochs to the application; application code owns TLS/QUIC stack integration, storage, and ticket behavior.
+
+### `TlsResumptionApplyAck`
+
+Magic: `PRDACK01`
+
+Field order:
+
+1. `results: array<TlsResumptionApplyResult>`
 
 ### `ContainerParameters`
 
@@ -192,13 +205,13 @@ Startup state rules:
 
 Current scope note:
 
-- if a startup payload needs `wormholes` or `whiteholes`, the runtime still falls back to legacy Bitsery bootstrap instead of this packed startup blob
+- startup payloads with `wormholes` or `whiteholes` use the packed startup blob
 
 Compatibility note:
 
 - historical readers and fixtures may have included `public6`, `requires_public4`, and `requires_public6` between `private6` and `just_crashed`
 - the current `ProdigyWire::serializeContainerParameters(...)` writer does not emit those fields
-- new SDKs should implement the latest shape above; legacy fallback is optional compatibility behavior, not part of the primary contract
+- new SDKs should implement the latest shape above and reject removed bootstrap/control payload variants
 
 ## Control Socket Frame
 
@@ -312,11 +325,13 @@ Inbound semantics for the shared frame handler:
   - meaning: normally outbound from container to neuron
   - handler behavior: no-op if observed on the inbound parser path
 - `credentialsRefresh`
-  - payload: either empty or packed `CredentialDelta`
+  - inbound payload: either empty or raw `CredentialDelta` bytes
   - handler behavior:
     - empty payload means ack/no-op
-    - non-empty payload must decode to `CredentialDelta` and notify the credentials-refresh callback
-  - ack behavior: if the SDK offers auto-ack policy, it should queue an empty outbound `credentialsRefresh` frame after a successful callback
+    - non-empty payload may be delivered raw or decoded to `CredentialDelta`, depending on SDK boundary
+    - the C SDK intentionally delivers this payload raw
+  - ack behavior: if the SDK offers auto-ack policy, it may queue an empty outbound `credentialsRefresh` frame after a successful non-resumption callback
+  - resumption ack behavior: when the refresh applies TLS resumption snapshots or deltas, the outbound ACK must carry `TlsResumptionApplyAck` with only per-wormhole resumption results
 
 ## Control Payloads
 
@@ -375,7 +390,8 @@ Field order:
 ### `credentialsRefresh`
 
 - neuron -> container: raw `CredentialDelta` blob including `PRDDEL01`
-- container -> neuron: empty payload means ack
+- container -> neuron: empty payload means generic non-resumption ACK
+- container -> neuron for resumption: raw `TlsResumptionApplyAck` blob including `PRDACK01`
 
 ### `message`
 
@@ -387,7 +403,7 @@ Field order:
 This is the intended order for a clean-room SDK implementation.
 
 1. Implement the primitive readers and writers from [`WIRE.md`](./WIRE.md).
-2. Implement `ContainerParameters`, `CredentialBundle`, and `CredentialDelta` decoding.
+2. Implement `ContainerParameters` and `CredentialBundle` decoding. Implement `CredentialDelta` decoding only if the SDK exposes typed refresh callbacks.
 3. Implement startup loading with the exact precedence:
    - `PRODIGY_PARAMS_FD`
    - `argv[1]`
@@ -507,14 +523,15 @@ An SDK implementation is conformant when it can:
 
 - decode `ContainerParameters`
 - decode `CredentialBundle`
-- decode `CredentialDelta`
+- deliver raw `CredentialDelta` bytes or decode `CredentialDelta`
+- build raw `credentialsRefresh` ACK frames, and encode `TlsResumptionApplyAck` only if it exposes a typed ACK helper
 - load startup parameters from `PRODIGY_PARAMS_FD` first and `argv[1]` second
 - parse and build control frames incrementally
 - handle all current control topics with the semantics in this file
 - maintain cached `datacenter_unique_tag` state from bootstrap and live updates
-- publish `healthy`, `statistics`, `resourceDeltaAck`, and empty `credentialsRefresh` ack frames
+- publish `healthy`, `statistics`, `resourceDeltaAck`, empty `credentialsRefresh` ack frames, and typed `credentialsRefresh` resumption ACK frames for resumption updates
 - decode packed pairing, resource, and credential payloads
-- optionally implement legacy compatibility payloads only as an out-of-tree extension if a downstream runtime still requires them
+- reject removed compatibility payloads in the in-tree contract
 - if it implements Aegis support, match the pairing-hash, TFO, frame, and encrypt/decrypt rules above
 - pass the shared fixture corpus and the mesh example smoke path for that language
 

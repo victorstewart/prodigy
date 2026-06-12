@@ -1,5 +1,6 @@
 #pragma once
 
+#include <prodigy/tls.resumption.h>
 #include <services/vault.h>
 #include <services/bitsery.h>
 #include <services/crypto.h>
@@ -242,6 +243,20 @@ public:
   }
 };
 
+class ProdigyTransportTLSResumptionConfig {
+public:
+
+  ProdigyResumptionRegistry *registry = nullptr;
+  int64_t (*nowMsCallback)(void *arg) = nullptr;
+  void *nowMsCallbackArg = nullptr;
+  uint64_t renewBeforeMs = 0;
+
+  bool configured(void) const
+  {
+    return registry != nullptr;
+  }
+};
+
 template <typename S>
 static void serialize(S&& serializer, ProdigyTransportTLSBootstrap& bootstrap)
 {
@@ -254,6 +269,7 @@ private:
 
   static inline SSL_CTX *ctx = nullptr;
   static inline ProdigyTransportTLSBootstrap bootstrap = {};
+  static inline ProdigyOpenSSLTlsTicketContext ticketContext = {};
 
 public:
 
@@ -265,10 +281,19 @@ public:
       ctx = nullptr;
     }
 
+    ticketContext = {};
     bootstrap = {};
   }
 
   static bool configure(const ProdigyTransportTLSBootstrap& newBootstrap, String *failure = nullptr)
+  {
+    return configure(newBootstrap, ProdigyTransportTLSResumptionConfig {}, failure);
+  }
+
+  static bool configure(
+      const ProdigyTransportTLSBootstrap& newBootstrap,
+      const ProdigyTransportTLSResumptionConfig& newResumption,
+      String *failure = nullptr)
   {
     if (failure)
     {
@@ -326,9 +351,32 @@ public:
       return false;
     }
 
-    clear();
+    ProdigyOpenSSLTlsTicketContext oldTicketContext = ticketContext;
+    if (newResumption.configured())
+    {
+      ticketContext = {};
+      ticketContext.registry = newResumption.registry;
+      ticketContext.nowMsCallback = newResumption.nowMsCallback;
+      ticketContext.nowMsCallbackArg = newResumption.nowMsCallbackArg;
+      ticketContext.renewBeforeMs = newResumption.renewBeforeMs;
+      if (prodigyInstallOpenSSLTlsResumptionTicketKeyCallback(newCtx, &ticketContext, failure) == false)
+      {
+        ticketContext = oldTicketContext;
+        SSL_CTX_free(newCtx);
+        return false;
+      }
+    }
+
+    if (ctx)
+    {
+      SSL_CTX_free(ctx);
+    }
     ctx = newCtx;
     bootstrap = newBootstrap;
+    if (newResumption.configured() == false)
+    {
+      ticketContext = {};
+    }
     return true;
   }
 
@@ -345,6 +393,16 @@ public:
   static SSL_CTX *context(void)
   {
     return ctx;
+  }
+
+  static bool resumptionConfigured(void)
+  {
+    return ticketContext.registry != nullptr;
+  }
+
+  static ProdigyOpenSSLTlsTicketContext *resumptionTicketContext(void)
+  {
+    return resumptionConfigured() ? &ticketContext : nullptr;
   }
 
   static const ProdigyTransportTLSBootstrap& state(void)
@@ -382,6 +440,7 @@ private:
 
   bool tlsEnabled = false;
   StreamBuffer encryptedWBuffer;
+  ProdigyOpenSSLTlsTicketBinding tlsResumptionBinding = {};
 
   bool harvestEncryptedOutput(void)
   {
@@ -471,7 +530,17 @@ public:
   bool tlsPeerVerified = false;
   uint128_t tlsPeerUUID = 0;
 
-  bool beginTransportTLS(bool isServer)
+  const ProdigyOpenSSLTlsTicketBinding& transportTLSResumptionBinding(void) const
+  {
+    return tlsResumptionBinding;
+  }
+
+  bool transportTLSResumptionBindingConfigured(void) const
+  {
+    return tlsResumptionBinding.configured();
+  }
+
+  bool beginTransportTLS(bool isServer, const ProdigyOpenSSLTlsTicketBinding *resumptionBinding = nullptr)
   {
     if (ProdigyTransportTLSRuntime::configured() == false)
     {
@@ -493,6 +562,7 @@ public:
     tlsEnabled = true;
     tlsPeerVerified = false;
     tlsPeerUUID = 0;
+    tlsResumptionBinding = {};
     nEncryptedBytesToSend = 0;
     setupTLS(ProdigyTransportTLSRuntime::context(), isServer);
     if (ssl == nullptr)
@@ -506,6 +576,37 @@ public:
                    static_cast<void *>(ProdigyTransportTLSRuntime::context()));
       std::fflush(stderr);
       return false;
+    }
+
+    if (resumptionBinding != nullptr)
+    {
+      tlsResumptionBinding = *resumptionBinding;
+      String failure = {};
+      if (ProdigyTransportTLSRuntime::resumptionConfigured() == false)
+      {
+        failure.assign("transport tls resumption runtime unconfigured"_ctv);
+      }
+      else
+      {
+        (void)prodigyBindOpenSSLTlsResumptionTicketContext(ssl, &tlsResumptionBinding, &failure);
+      }
+
+      if (failure.size() > 0)
+      {
+        std::fprintf(stderr,
+                     "prodigy debug transport-tls-resumption-bind-fail stream=%p server=%d reason=%s fd=%d fslot=%d ctx=%p\n",
+                     static_cast<void *>(this),
+                     int(isServer),
+                     failure.c_str(),
+                     fd,
+                     fslot,
+                     static_cast<void *>(ProdigyTransportTLSRuntime::context()));
+        std::fflush(stderr);
+        tlsResumptionBinding = {};
+        resetTLS();
+        tlsEnabled = false;
+        return false;
+      }
     }
 
     std::fprintf(stderr,
@@ -719,6 +820,7 @@ public:
     tlsEnabled = false;
     tlsPeerVerified = false;
     tlsPeerUUID = 0;
+    tlsResumptionBinding = {};
     nEncryptedBytesToSend = 0;
     encryptedWBuffer.reset();
     if (encryptedWBufferCapacity > 0)

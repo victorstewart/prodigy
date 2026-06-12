@@ -1,6 +1,6 @@
 # Prodigy Wire
 
-Document version: `2`
+Document version: `3`
 
 Wire series: `WIRE_V1`
 
@@ -42,6 +42,8 @@ The wire format never uses host alignment, native `bool`, native `int`, or compi
 
 Magic: `PRDPAR01`
 
+Readers must reject any startup payload whose magic is not `PRDPAR01`.
+
 Field order:
 
 1. `uuid: u128`
@@ -75,27 +77,32 @@ Bootstrap pairing rules:
 
 Current writer boundary:
 
-- when startup data includes `wormholes` or `whiteholes`, the runtime still uses legacy Bitsery bootstrap instead of `PRDPAR01`
+- startup data, including `wormholes` and `whiteholes`, is serialized as `PRDPAR01`
 
 Compatibility note:
 
 - some historical SDKs and historical fixtures carried `public6`, `requires_public4`, and `requires_public6` between `private6` and `just_crashed`
 - current `ProdigyWire::serializeContainerParameters(...)` writers do not emit those fields
-- those fields are compatibility-only and are not part of the latest wire contract
+- those fields are not part of the latest wire contract
 
 ### `CredentialBundle`
 
 Magic: `PRDBUN01`
+
+Readers must reject any credential bundle whose magic is not `PRDBUN01`.
 
 Field order:
 
 1. `tls_identities: array<TlsIdentity>`
 2. `api_credentials: array<ApiCredential>`
 3. `bundle_generation: u64`
+4. `tls_resumption_snapshots: array<TlsResumptionSnapshot>`
 
 ### `CredentialDelta`
 
 Magic: `PRDDEL01`
+
+Readers must reject any credential delta whose magic is not `PRDDEL01`.
 
 Field order:
 
@@ -105,6 +112,39 @@ Field order:
 4. `updated_api: array<ApiCredential>`
 5. `removed_api_names: array<string>`
 6. `reason: string`
+7. `updated_resumption_snapshots: array<TlsResumptionSnapshot>`
+8. `removed_resumption_wormhole_names: array<string>`
+
+### `TlsResumptionSnapshot`
+
+Field order:
+
+1. `generation: u64`
+2. `wormhole_name: string`
+3. `key_ring: array<TlsResumptionKeyEpoch>`
+
+The delivered snapshot is keyed by `wormhole_name` and only carries the key epochs for that declared wormhole. Application IDs, deployment IDs, ports, SNI/ALPN declarations, and policy metadata are not part of the SDK delivery contract. Key material is secret and must not be logged.
+
+### `TlsResumptionApplyAck`
+
+Magic: `PRDACK01`
+
+Container-to-neuron credential-refresh ACKs may carry this payload when resumption snapshots or deltas were applied.
+
+Field order:
+
+1. `results: array<TlsResumptionApplyResult>`
+
+### `TlsResumptionApplyResult`
+
+Field order:
+
+1. `wormhole_name: string`
+2. `generation: u64`
+3. `success: bool`
+4. `failure_reason: string`
+
+This ACK result must never include ticket values, key IDs, master secrets, TLS private keys, API credential material, or other secret material.
 
 ## Control Socket Frame
 
@@ -253,9 +293,9 @@ Packed payload length: 1 byte
 
 #### `credentialsRefresh`
 
-Payload: empty
+Payload: either empty or raw `TlsResumptionApplyAck` encoded with `PRDACK01`
 
-Empty payload is the ack for an inbound credential refresh.
+Empty payload is accepted only as the generic ACK for a non-resumption credential refresh. A typed `TlsResumptionApplyAck` payload is required when the container is acknowledging TLS resumption snapshots or deltas, because resumption readiness depends on `wormhole_name`, generation, and success/failure.
 
 ## Validation Requirements
 
@@ -268,8 +308,8 @@ These checks should be enforced even in high-performance implementations.
 - `resourceDeltaAck` payload length must be exactly 1 byte
 - `statistics` payload length must be a multiple of 16 bytes
 - `credentialsRefresh` payload is either:
-  - empty, meaning ack
-  - or a full `PRDDEL01` blob
+  - from neuron to container: a full `PRDDEL01` blob
+  - from container to neuron: empty generic ACK or a `PRDACK01` resumption apply ACK
 
 ## Performance Notes
 
@@ -290,11 +330,11 @@ Recommended implementation tactics:
 
 ## Compatibility Notes
 
-Compatibility behavior may exist in older SDKs, but it is not part of the latest primary wire contract:
+Compatibility behavior may exist in older SDKs, but it is not part of the latest wire contract:
 
 - historical startup readers may have accepted `public6`, `requires_public4`, and `requires_public6`
 - older out-of-tree integrations may still use `public6` startup paths
-- new SDKs should target the current packed startup shape and treat legacy bootstrap support as optional
+- new SDKs should target the current packed startup shape and reject removed bootstrap/control payload variants
 
 ## Supporting Documents
 

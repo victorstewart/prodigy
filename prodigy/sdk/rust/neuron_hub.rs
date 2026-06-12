@@ -210,6 +210,7 @@ pub struct CredentialBundle
 {
    pub tls_identities: Vec<TlsIdentity>,
    pub api_credentials: Vec<ApiCredential>,
+   pub tls_resumption_snapshots: Vec<TlsResumptionSnapshot>,
    pub bundle_generation: u64,
 }
 
@@ -220,10 +221,16 @@ impl CredentialBundle
       let mut reader = Reader::new(bytes);
       reader.header(CREDENTIAL_BUNDLE_MAGIC)?;
 
+      let tls_identities = decode_vec(&mut reader, TlsIdentity::decode_fields)?;
+      let api_credentials = decode_vec(&mut reader, ApiCredential::decode_fields)?;
+      let bundle_generation = reader.u64()?;
+      let tls_resumption_snapshots =
+         decode_vec(&mut reader, TlsResumptionSnapshot::decode_fields)?;
       let bundle = Self {
-         tls_identities: decode_vec(&mut reader, TlsIdentity::decode_fields)?,
-         api_credentials: decode_vec(&mut reader, ApiCredential::decode_fields)?,
-         bundle_generation: reader.u64()?,
+         tls_identities,
+         api_credentials,
+         tls_resumption_snapshots,
+         bundle_generation,
       };
 
       reader.finish()?;
@@ -234,9 +241,22 @@ impl CredentialBundle
    {
       let mut writer = Writer::new();
       writer.header(CREDENTIAL_BUNDLE_MAGIC);
-      encode_vec(&mut writer, &self.tls_identities, TlsIdentity::encode_fields)?;
-      encode_vec(&mut writer, &self.api_credentials, ApiCredential::encode_fields)?;
+      encode_vec(
+         &mut writer,
+         &self.tls_identities,
+         TlsIdentity::encode_fields,
+      )?;
+      encode_vec(
+         &mut writer,
+         &self.api_credentials,
+         ApiCredential::encode_fields,
+      )?;
       writer.u64(self.bundle_generation);
+      encode_vec(
+         &mut writer,
+         &self.tls_resumption_snapshots,
+         TlsResumptionSnapshot::encode_fields,
+      )?;
       Ok(writer.finish())
    }
 }
@@ -249,6 +269,8 @@ pub struct CredentialDelta
    pub removed_tls_names: Vec<String>,
    pub updated_api: Vec<ApiCredential>,
    pub removed_api_names: Vec<String>,
+   pub updated_resumption_snapshots: Vec<TlsResumptionSnapshot>,
+   pub removed_resumption_wormhole_names: Vec<String>,
    pub reason: String,
 }
 
@@ -266,6 +288,11 @@ impl CredentialDelta
          updated_api: decode_vec(&mut reader, ApiCredential::decode_fields)?,
          removed_api_names: decode_string_vec(&mut reader)?,
          reason: reader.string()?,
+         updated_resumption_snapshots: decode_vec(
+            &mut reader,
+            TlsResumptionSnapshot::decode_fields,
+         )?,
+         removed_resumption_wormhole_names: decode_string_vec(&mut reader)?,
       };
 
       reader.finish()?;
@@ -282,7 +309,93 @@ impl CredentialDelta
       encode_vec(&mut writer, &self.updated_api, ApiCredential::encode_fields)?;
       encode_string_vec(&mut writer, &self.removed_api_names)?;
       writer.string(&self.reason)?;
+      encode_vec(
+         &mut writer,
+         &self.updated_resumption_snapshots,
+         TlsResumptionSnapshot::encode_fields,
+      )?;
+      encode_string_vec(&mut writer, &self.removed_resumption_wormhole_names)?;
       Ok(writer.finish())
+   }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TlsResumptionKeyEpoch
+{
+   pub generation: u64,
+   pub role: u8,
+   pub key_id: [u8; 16],
+   pub master_secret: [u8; 32],
+   pub issue_until_ms: i64,
+   pub accept_until_ms: i64,
+}
+
+impl TlsResumptionKeyEpoch
+{
+   fn decode_fields(reader: &mut Reader<'_>) -> io::Result<Self>
+   {
+      let generation = reader.u64()?;
+      let role = reader.u8()?;
+      if role > 1
+      {
+         return Err(invalid_data("invalid tls resumption key role"));
+      }
+      let mut key_id = [0u8; 16];
+      key_id.copy_from_slice(reader.raw(16)?);
+      let mut master_secret = [0u8; 32];
+      master_secret.copy_from_slice(reader.raw(32)?);
+      Ok(Self {
+         generation,
+         role,
+         key_id,
+         master_secret,
+         issue_until_ms: reader.i64()?,
+         accept_until_ms: reader.i64()?,
+      })
+   }
+
+   fn encode_fields(&self, writer: &mut Writer) -> io::Result<()>
+   {
+      if self.role > 1
+      {
+         return Err(invalid_data("invalid tls resumption key role"));
+      }
+      writer.u64(self.generation);
+      writer.u8(self.role);
+      writer.raw(&self.key_id);
+      writer.raw(&self.master_secret);
+      writer.i64(self.issue_until_ms);
+      writer.i64(self.accept_until_ms);
+      Ok(())
+   }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TlsResumptionSnapshot
+{
+   pub generation: u64,
+   pub wormhole_name: String,
+   pub key_ring: Vec<TlsResumptionKeyEpoch>,
+}
+
+impl TlsResumptionSnapshot
+{
+   fn decode_fields(reader: &mut Reader<'_>) -> io::Result<Self>
+   {
+      let snapshot = Self {
+         generation: reader.u64()?,
+         wormhole_name: reader.string()?,
+         key_ring: decode_vec(reader, TlsResumptionKeyEpoch::decode_fields)?,
+      };
+      Ok(snapshot)
+   }
+
+   fn encode_fields(&self, writer: &mut Writer) -> io::Result<()>
+   {
+      writer.u64(self.generation);
+      writer.string(&self.wormhole_name)?;
+      encode_vec(writer, &self.key_ring, TlsResumptionKeyEpoch::encode_fields)?;
+      Ok(())
    }
 }
 
@@ -454,12 +567,17 @@ impl ContainerParameters
       let datacenter_unique_tag = reader.u8()?;
       let flags = decode_vec(&mut reader, |inner| inner.u64())?;
       let has_credential_bundle = reader.boolean()?;
-      let credential_bundle = if has_credential_bundle
-      {
+      let credential_bundle = if has_credential_bundle {
+         let tls_identities = decode_vec(&mut reader, TlsIdentity::decode_fields)?;
+         let api_credentials = decode_vec(&mut reader, ApiCredential::decode_fields)?;
+         let bundle_generation = reader.u64()?;
+         let tls_resumption_snapshots =
+            decode_vec(&mut reader, TlsResumptionSnapshot::decode_fields)?;
          Some(CredentialBundle {
-            tls_identities: decode_vec(&mut reader, TlsIdentity::decode_fields)?,
-            api_credentials: decode_vec(&mut reader, ApiCredential::decode_fields)?,
-            bundle_generation: reader.u64()?,
+            tls_identities,
+            api_credentials,
+            tls_resumption_snapshots,
+            bundle_generation,
          })
       }
       else
@@ -543,9 +661,22 @@ impl ContainerParameters
       writer.boolean(self.credential_bundle.is_some());
       if let Some(bundle) = &self.credential_bundle
       {
-         encode_vec(&mut writer, &bundle.tls_identities, TlsIdentity::encode_fields)?;
-         encode_vec(&mut writer, &bundle.api_credentials, ApiCredential::encode_fields)?;
+         encode_vec(
+            &mut writer,
+            &bundle.tls_identities,
+            TlsIdentity::encode_fields,
+         )?;
+         encode_vec(
+            &mut writer,
+            &bundle.api_credentials,
+            ApiCredential::encode_fields,
+         )?;
          writer.u64(bundle.bundle_generation);
+         encode_vec(
+            &mut writer,
+            &bundle.tls_resumption_snapshots,
+            TlsResumptionSnapshot::encode_fields,
+         )?;
       }
 
       Ok(writer.finish())
@@ -645,49 +776,30 @@ pub trait Dispatch: Sized
 {
    fn begin_shutdown(&mut self, hub: &mut NeuronHub<Self>);
 
-   fn end_of_dynamic_args(&mut self, _hub: &mut NeuronHub<Self>)
-   {
-   }
+   fn end_of_dynamic_args(&mut self, _hub: &mut NeuronHub<Self>) {}
 
    fn advertisement_pairing(
       &mut self,
       _hub: &mut NeuronHub<Self>,
-      _pairing: AdvertisementPairing)
+      _pairing: AdvertisementPairing,
+   )
    {
    }
 
-   fn subscription_pairing(
-      &mut self,
-      _hub: &mut NeuronHub<Self>,
-      _pairing: SubscriptionPairing)
-   {
-   }
+   fn subscription_pairing(&mut self, _hub: &mut NeuronHub<Self>, _pairing: SubscriptionPairing) {}
 
-   fn resource_delta(&mut self, _hub: &mut NeuronHub<Self>, _delta: ResourceDelta)
-   {
-   }
+   fn resource_delta(&mut self, _hub: &mut NeuronHub<Self>, _delta: ResourceDelta) {}
 
-   fn credentials_refresh(
-      &mut self,
-      _hub: &mut NeuronHub<Self>,
-      _delta: CredentialDelta)
-   {
-   }
+   fn credentials_refresh(&mut self, _hub: &mut NeuronHub<Self>, _delta: CredentialDelta) {}
 
-   fn wormholes_refresh(&mut self, _hub: &mut NeuronHub<Self>, _payload: &[u8])
-   {
-   }
+   fn wormholes_refresh(&mut self, _hub: &mut NeuronHub<Self>, _payload: &[u8]) {}
 
-   fn message_from_prodigy(&mut self, _hub: &mut NeuronHub<Self>, _payload: &[u8])
-   {
-   }
+   fn message_from_prodigy(&mut self, _hub: &mut NeuronHub<Self>, _payload: &[u8]) {}
 }
 
 impl Dispatch for DefaultDispatch
 {
-   fn begin_shutdown(&mut self, _hub: &mut NeuronHub<Self>)
-   {
-   }
+   fn begin_shutdown(&mut self, _hub: &mut NeuronHub<Self>) {}
 }
 
 pub struct NeuronHub<D: Dispatch>
@@ -700,8 +812,7 @@ pub struct NeuronHub<D: Dispatch>
    pub parameters: ContainerParameters,
 }
 
-impl<D: Dispatch> NeuronHub<D>
-{
+impl<D: Dispatch> NeuronHub<D> {
    pub fn new(parameters: ContainerParameters, dispatch: D) -> io::Result<Self>
    {
       if parameters.neuron_fd < 0
@@ -725,7 +836,10 @@ impl<D: Dispatch> NeuronHub<D>
       Self::new_borrowed_transport(parameters, dispatch)
    }
 
-   pub fn new_borrowed_transport(parameters: ContainerParameters, dispatch: D) -> io::Result<Self>
+   pub fn new_borrowed_transport(
+      parameters: ContainerParameters,
+      dispatch: D,
+   ) -> io::Result<Self>
    {
       Ok(Self {
          stream: None,
@@ -779,9 +893,7 @@ impl<D: Dispatch> NeuronHub<D>
 
    pub fn run_forever(&mut self) -> io::Result<()>
    {
-      while self.run_once()?
-      {
-      }
+      while self.run_once()? {}
 
       Ok(())
    }
@@ -797,7 +909,11 @@ impl<D: Dispatch> NeuronHub<D>
       Ok(outbound)
    }
 
-   pub fn handle_bytes(&mut self, decoder: &mut FrameDecoder, bytes: &[u8]) -> io::Result<Vec<Vec<u8>>>
+   pub fn handle_bytes(
+      &mut self,
+      decoder: &mut FrameDecoder,
+      bytes: &[u8],
+   ) -> io::Result<Vec<Vec<u8>>>
    {
       let mut outbound = Vec::new();
       for frame in decoder.feed(bytes)?
@@ -911,38 +1027,35 @@ impl<D: Dispatch> NeuronHub<D>
    {
       match frame.topic
       {
-         ContainerTopic::None =>
-         {
+         ContainerTopic::None => {
             self.with_dispatch(|dispatch, hub| dispatch.end_of_dynamic_args(hub));
          }
-         ContainerTopic::Ping =>
-         {
+         ContainerTopic::Ping => {
             self.queue_empty(ContainerTopic::Ping);
          }
-         ContainerTopic::Pong | ContainerTopic::Healthy | ContainerTopic::RuntimeReady | ContainerTopic::Statistics | ContainerTopic::ResourceDeltaAck =>
-         {
-         }
-         ContainerTopic::Stop =>
-         {
+         ContainerTopic::Pong
+         | ContainerTopic::Healthy
+         | ContainerTopic::RuntimeReady
+         | ContainerTopic::Statistics
+         | ContainerTopic::ResourceDeltaAck => {}
+         ContainerTopic::Stop => {
             self.shutdown_requested = true;
             self.with_dispatch(|dispatch, hub| dispatch.begin_shutdown(hub));
          }
-         ContainerTopic::AdvertisementPairing =>
-         {
+         ContainerTopic::AdvertisementPairing => {
             let pairing = AdvertisementPairing::decode_payload(&frame.payload)?;
             self.with_dispatch(|dispatch, hub| dispatch.advertisement_pairing(hub, pairing));
          }
-         ContainerTopic::SubscriptionPairing =>
-         {
+         ContainerTopic::SubscriptionPairing => {
             let pairing = SubscriptionPairing::decode_payload(&frame.payload)?;
             self.with_dispatch(|dispatch, hub| dispatch.subscription_pairing(hub, pairing));
          }
-         ContainerTopic::Message =>
-         {
-            self.with_dispatch(|dispatch, hub| dispatch.message_from_prodigy(hub, &frame.payload));
+         ContainerTopic::Message => {
+            self.with_dispatch(|dispatch, hub| {
+               dispatch.message_from_prodigy(hub, &frame.payload)
+            });
          }
-         ContainerTopic::ResourceDelta =>
-         {
+         ContainerTopic::ResourceDelta => {
             let delta = ResourceDelta::decode_payload(&frame.payload)?;
             self.with_dispatch(|dispatch, hub| dispatch.resource_delta(hub, delta));
             if let Some(accepted) = self.control_policy.resource_delta_ack
@@ -950,14 +1063,12 @@ impl<D: Dispatch> NeuronHub<D>
                self.queue_resource_delta_ack(accepted);
             }
          }
-         ContainerTopic::DatacenterUniqueTag =>
-         {
+         ContainerTopic::DatacenterUniqueTag => {
             let mut reader = Reader::new(&frame.payload);
             self.parameters.datacenter_unique_tag = reader.u8()?;
             reader.finish()?;
          }
-         ContainerTopic::CredentialsRefresh =>
-         {
+         ContainerTopic::CredentialsRefresh => {
             if !frame.payload.is_empty()
             {
                let delta = CredentialDelta::decode(&frame.payload)?;
@@ -968,8 +1079,7 @@ impl<D: Dispatch> NeuronHub<D>
                }
             }
          }
-         ContainerTopic::WormholesRefresh =>
-         {
+         ContainerTopic::WormholesRefresh => {
             self.with_dispatch(|dispatch, hub| dispatch.wormholes_refresh(hub, &frame.payload));
          }
       }
@@ -1052,7 +1162,8 @@ impl FrameHeader
          return Err(invalid_data("invalid frame padding"));
       }
 
-      if usize::try_from(size).map_err(|_| invalid_data("frame too large"))? % FRAME_ALIGNMENT != 0
+      if usize::try_from(size).map_err(|_| invalid_data("frame too large"))? % FRAME_ALIGNMENT
+         != 0
       {
          return Err(invalid_data("frame size must be 16-byte aligned"));
       }
@@ -1174,7 +1285,8 @@ fn read_frame(reader: &mut impl Read) -> io::Result<Option<MessageFrame>>
    }
 
    let header = FrameHeader::decode(&header_bytes)?;
-   let remaining = usize::try_from(header.size).map_err(|_| invalid_data("frame too large"))? - FRAME_HEADER_SIZE;
+   let remaining = usize::try_from(header.size).map_err(|_| invalid_data("frame too large"))?
+      - FRAME_HEADER_SIZE;
    let payload_len = remaining - header.padding as usize;
 
    let mut payload_and_padding = vec![0u8; remaining];
@@ -1223,7 +1335,12 @@ fn read_exact_or_eof(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<bo
       match reader.read(&mut buffer[offset..])?
       {
          0 if offset == 0 => return Ok(false),
-         0 => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected eof")),
+         0 => {
+            return Err(io::Error::new(
+               io::ErrorKind::UnexpectedEof,
+               "unexpected eof",
+            ))
+         }
          read => offset += read,
       }
    }
@@ -1243,8 +1360,8 @@ fn read_all_from_fd(fd: RawFd) -> io::Result<Vec<u8>>
 fn encode_vec<T>(
    writer: &mut Writer,
    items: &[T],
-   encode_item: impl Fn(&T, &mut Writer) -> io::Result<()>)
-   -> io::Result<()>
+   encode_item: impl Fn(&T, &mut Writer) -> io::Result<()>,
+) -> io::Result<()>
 {
    writer.u32(checked_u32(items.len())?);
    for item in items
@@ -1257,8 +1374,8 @@ fn encode_vec<T>(
 
 fn decode_vec<T>(
    reader: &mut Reader<'_>,
-   decode_item: impl Fn(&mut Reader<'_>) -> io::Result<T>)
-   -> io::Result<Vec<T>>
+   decode_item: impl Fn(&mut Reader<'_>) -> io::Result<T>,
+) -> io::Result<Vec<T>>
 {
    let count = reader.u32()? as usize;
    let mut items = Vec::with_capacity(count);
@@ -1296,8 +1413,7 @@ struct Reader<'a>
    offset: usize,
 }
 
-impl<'a> Reader<'a>
-{
+impl<'a> Reader<'a> {
    fn new(bytes: &'a [u8]) -> Self
    {
       Self { bytes, offset: 0 }
@@ -1305,10 +1421,16 @@ impl<'a> Reader<'a>
 
    fn raw(&mut self, count: usize) -> io::Result<&'a [u8]>
    {
-      let end = self.offset.checked_add(count).ok_or_else(|| invalid_data("overflow"))?;
+      let end = self
+         .offset
+         .checked_add(count)
+         .ok_or_else(|| invalid_data("overflow"))?;
       if end > self.bytes.len()
       {
-         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated input"));
+         return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated input",
+         ));
       }
 
       let slice = &self.bytes[self.offset..end];
@@ -1468,8 +1590,7 @@ impl Writer
 }
 
 #[cfg(test)]
-mod tests
-{
+mod tests {
    use super::*;
    use std::cell::RefCell;
    use std::io::Cursor;
@@ -1481,31 +1602,25 @@ mod tests
       include_bytes!("../fixtures/startup.credential_delta.full.bin");
    const FIXTURE_CONTAINER_PARAMETERS: &[u8] =
       include_bytes!("../fixtures/startup.container_parameters.full.bin");
-   const FIXTURE_HEALTHY_FRAME: &[u8] =
-      include_bytes!("../fixtures/frame.healthy.empty.bin");
+   const FIXTURE_HEALTHY_FRAME: &[u8] = include_bytes!("../fixtures/frame.healthy.empty.bin");
    const FIXTURE_CREDENTIALS_REFRESH_ACK_FRAME: &[u8] =
       include_bytes!("../fixtures/frame.credentials_refresh_ack.empty.bin");
    const FIXTURE_RESOURCE_DELTA_ACK_FRAME: &[u8] =
       include_bytes!("../fixtures/frame.resource_delta_ack.accepted.bin");
-   const FIXTURE_STATISTICS_FRAME: &[u8] =
-      include_bytes!("../fixtures/frame.statistics.demo.bin");
+   const FIXTURE_STATISTICS_FRAME: &[u8] = include_bytes!("../fixtures/frame.statistics.demo.bin");
 
    struct NoopDispatch;
 
    impl Dispatch for NoopDispatch
    {
-      fn begin_shutdown(&mut self, _hub: &mut NeuronHub<Self>)
-      {
-      }
+      fn begin_shutdown(&mut self, _hub: &mut NeuronHub<Self>) {}
    }
 
    struct QueueDispatch;
 
    impl Dispatch for QueueDispatch
    {
-      fn begin_shutdown(&mut self, _hub: &mut NeuronHub<Self>)
-      {
-      }
+      fn begin_shutdown(&mut self, _hub: &mut NeuronHub<Self>) {}
 
       fn resource_delta(&mut self, hub: &mut NeuronHub<Self>, _delta: ResourceDelta)
       {
@@ -1521,9 +1636,7 @@ mod tests
 
    impl Dispatch for RecordingDispatch
    {
-      fn begin_shutdown(&mut self, _hub: &mut NeuronHub<Self>)
-      {
-      }
+      fn begin_shutdown(&mut self, _hub: &mut NeuronHub<Self>) {}
 
       fn wormholes_refresh(&mut self, _hub: &mut NeuronHub<Self>, payload: &[u8])
       {
@@ -1566,6 +1679,8 @@ mod tests
             metadata,
          }],
          removed_api_names: vec!["legacy_token".into()],
+         updated_resumption_snapshots: Vec::new(),
+         removed_resumption_wormhole_names: Vec::new(),
          reason: "rotation".into(),
       };
 
@@ -1617,6 +1732,7 @@ mod tests
          credential_bundle: Some(CredentialBundle {
             tls_identities: Vec::new(),
             api_credentials: Vec::new(),
+            tls_resumption_snapshots: Vec::new(),
             bundle_generation: 123,
          }),
       };
@@ -1645,21 +1761,29 @@ mod tests
       })
       .unwrap();
 
-      encode_vec(&mut writer, &parameters.subscription_pairings, |item, inner| {
-         item.secret.encode(inner);
-         item.address.encode(inner);
-         inner.u64(item.service);
-         inner.u16(item.port);
-         Ok(())
-      })
+      encode_vec(
+         &mut writer,
+         &parameters.subscription_pairings,
+         |item, inner| {
+            item.secret.encode(inner);
+            item.address.encode(inner);
+            inner.u64(item.service);
+            inner.u16(item.port);
+            Ok(())
+         },
+      )
       .unwrap();
 
-      encode_vec(&mut writer, &parameters.advertisement_pairings, |item, inner| {
-         item.secret.encode(inner);
-         item.address.encode(inner);
-         inner.u64(item.service);
-         Ok(())
-      })
+      encode_vec(
+         &mut writer,
+         &parameters.advertisement_pairings,
+         |item, inner| {
+            item.secret.encode(inner);
+            item.address.encode(inner);
+            inner.u64(item.service);
+            Ok(())
+         },
+      )
       .unwrap();
 
       parameters.private6.encode(&mut writer);
@@ -1674,9 +1798,25 @@ mod tests
       writer.boolean(parameters.credential_bundle.is_some());
       if let Some(bundle) = &parameters.credential_bundle
       {
-         encode_vec(&mut writer, &bundle.tls_identities, TlsIdentity::encode_fields).unwrap();
-         encode_vec(&mut writer, &bundle.api_credentials, ApiCredential::encode_fields).unwrap();
+         encode_vec(
+            &mut writer,
+            &bundle.tls_identities,
+            TlsIdentity::encode_fields,
+         )
+         .unwrap();
+         encode_vec(
+            &mut writer,
+            &bundle.api_credentials,
+            ApiCredential::encode_fields,
+         )
+         .unwrap();
          writer.u64(bundle.bundle_generation);
+         encode_vec(
+            &mut writer,
+            &bundle.tls_resumption_snapshots,
+            TlsResumptionSnapshot::encode_fields,
+         )
+         .unwrap();
       }
 
       writer.finish()
@@ -1725,6 +1865,7 @@ mod tests
          credential_bundle: Some(CredentialBundle {
             tls_identities: Vec::new(),
             api_credentials: Vec::new(),
+            tls_resumption_snapshots: Vec::new(),
             bundle_generation: 101,
          }),
       };
@@ -1745,7 +1886,8 @@ mod tests
       assert_eq!(frame.topic, ContainerTopic::Message);
       assert_eq!(frame.payload, payload);
 
-      let header = FrameHeader::decode(encoded[0..FRAME_HEADER_SIZE].try_into().unwrap()).unwrap();
+      let header =
+         FrameHeader::decode(encoded[0..FRAME_HEADER_SIZE].try_into().unwrap()).unwrap();
       assert_eq!(header.topic, ContainerTopic::Message);
       assert_eq!(header.header_size as usize, FRAME_HEADER_SIZE);
       assert_eq!(usize::try_from(header.size).unwrap() % FRAME_ALIGNMENT, 0);
@@ -1769,7 +1911,17 @@ mod tests
       assert_eq!(bundle.bundle_generation, 101);
       assert_eq!(bundle.tls_identities.len(), 1);
       assert_eq!(bundle.tls_identities[0].name, "demo-cert");
-      assert_eq!(bundle.api_credentials[0].metadata.get("scope").unwrap(), "demo");
+      assert_eq!(
+         bundle.api_credentials[0].metadata.get("scope").unwrap(),
+         "demo"
+      );
+      assert_eq!(bundle.tls_resumption_snapshots.len(), 1);
+      assert_eq!(bundle.tls_resumption_snapshots[0].generation, 103);
+      assert_eq!(
+         bundle.tls_resumption_snapshots[0].wormhole_name,
+         "public-api-quic"
+      );
+      assert_eq!(bundle.tls_resumption_snapshots[0].key_ring.len(), 1);
    }
 
    #[test]
@@ -1780,6 +1932,12 @@ mod tests
       assert_eq!(delta.removed_tls_names, vec!["legacy-cert"]);
       assert_eq!(delta.removed_api_names, vec!["legacy-token"]);
       assert_eq!(delta.reason, "fixture-rotation");
+      assert_eq!(delta.updated_resumption_snapshots.len(), 1);
+      assert_eq!(delta.updated_resumption_snapshots[0].generation, 104);
+      assert_eq!(
+         delta.removed_resumption_wormhole_names,
+         vec!["legacy-public-api-quic"]
+      );
    }
 
    #[test]
@@ -1792,7 +1950,9 @@ mod tests
       assert_eq!(parameters.advertisement_pairings[0].application_id, 0x3344);
       assert_eq!(parameters.datacenter_unique_tag, 23);
       assert_eq!(parameters.flags, vec![44, 55, 66]);
-      assert_eq!(parameters.credential_bundle.unwrap().bundle_generation, 101);
+      let bundle = parameters.credential_bundle.unwrap();
+      assert_eq!(bundle.bundle_generation, 101);
+      assert_eq!(bundle.tls_resumption_snapshots.len(), 1);
    }
 
    #[test]
@@ -1809,21 +1969,39 @@ mod tests
          .unwrap();
       assert_eq!(frame.topic, ContainerTopic::Statistics);
       assert_eq!(frame.payload.len(), 32);
-      assert_eq!(u64::from_le_bytes(frame.payload[0..8].try_into().unwrap()), 1);
-      assert_eq!(u64::from_le_bytes(frame.payload[8..16].try_into().unwrap()), 2);
-      assert_eq!(u64::from_le_bytes(frame.payload[16..24].try_into().unwrap()), 3);
-      assert_eq!(u64::from_le_bytes(frame.payload[24..32].try_into().unwrap()), 4);
+      assert_eq!(
+         u64::from_le_bytes(frame.payload[0..8].try_into().unwrap()),
+         1
+      );
+      assert_eq!(
+         u64::from_le_bytes(frame.payload[8..16].try_into().unwrap()),
+         2
+      );
+      assert_eq!(
+         u64::from_le_bytes(frame.payload[16..24].try_into().unwrap()),
+         3
+      );
+      assert_eq!(
+         u64::from_le_bytes(frame.payload[24..32].try_into().unwrap()),
+         4
+      );
       assert_eq!(build_ready_frame().unwrap(), FIXTURE_HEALTHY_FRAME);
       assert_eq!(
          build_statistics_frame(&[
             MetricPair { key: 1, value: 2 },
             MetricPair { key: 3, value: 4 },
-         ]).unwrap(),
-         FIXTURE_STATISTICS_FRAME);
-      assert_eq!(build_resource_delta_ack_frame(true).unwrap(), FIXTURE_RESOURCE_DELTA_ACK_FRAME);
+         ])
+         .unwrap(),
+         FIXTURE_STATISTICS_FRAME
+      );
+      assert_eq!(
+         build_resource_delta_ack_frame(true).unwrap(),
+         FIXTURE_RESOURCE_DELTA_ACK_FRAME
+      );
       assert_eq!(
          build_credentials_refresh_ack_frame().unwrap(),
-         FIXTURE_CREDENTIALS_REFRESH_ACK_FRAME);
+         FIXTURE_CREDENTIALS_REFRESH_ACK_FRAME
+      );
 
       let runtime_ready = read_frame(&mut Cursor::new(build_runtime_ready_frame().unwrap()))
          .unwrap()
@@ -1861,7 +2039,10 @@ mod tests
       };
 
       let outbound = hub.handle_decoded_frame(&frame).unwrap();
-      assert_eq!(outbound, vec![build_message_frame(ContainerTopic::Ping, &[]).unwrap()]);
+      assert_eq!(
+         outbound,
+         vec![build_message_frame(ContainerTopic::Ping, &[]).unwrap()]
+      );
    }
 
    #[test]
@@ -1874,21 +2055,28 @@ mod tests
       };
       let mut hub = NeuronHub::new_borrowed_transport(parameters, dispatch).unwrap();
 
-      assert!(hub.handle_decoded_frame(&MessageFrame {
-         topic: ContainerTopic::RuntimeReady,
-         payload: Vec::new(),
-      }).unwrap().is_empty());
+      assert!(hub
+         .handle_decoded_frame(&MessageFrame {
+            topic: ContainerTopic::RuntimeReady,
+            payload: Vec::new(),
+         })
+         .unwrap()
+         .is_empty());
 
-      assert!(hub.handle_decoded_frame(&MessageFrame {
-         topic: ContainerTopic::WormholesRefresh,
-         payload: b"worm".to_vec(),
-      }).unwrap().is_empty());
+      assert!(hub
+         .handle_decoded_frame(&MessageFrame {
+            topic: ContainerTopic::WormholesRefresh,
+            payload: b"worm".to_vec(),
+         })
+         .unwrap()
+         .is_empty());
       assert_eq!(*wormholes_refreshes.borrow(), vec![b"worm".to_vec()]);
 
       hub.queue_runtime_ready();
       assert_eq!(
          hub.drain_outbound_bytes().unwrap(),
-         vec![build_runtime_ready_frame().unwrap()]);
+         vec![build_runtime_ready_frame().unwrap()]
+      );
    }
 
    #[test]
@@ -1935,10 +2123,13 @@ mod tests
       );
 
       assert!(!hub.shutdown_requested());
-      assert!(hub.handle_decoded_frame(&MessageFrame {
-         topic: ContainerTopic::Stop,
-         payload: Vec::new(),
-      }).unwrap().is_empty());
+      assert!(hub
+         .handle_decoded_frame(&MessageFrame {
+            topic: ContainerTopic::Stop,
+            payload: Vec::new(),
+         })
+         .unwrap()
+         .is_empty());
       assert!(hub.shutdown_requested());
    }
 }

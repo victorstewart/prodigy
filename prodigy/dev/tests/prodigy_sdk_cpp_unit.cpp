@@ -3,6 +3,7 @@
 #include <prodigy/sdk/cpp/opinionated/aegis_stream.h>
 #include <prodigy/sdk/cpp/opinionated/pairings.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -24,6 +25,7 @@ public:
     }
     else
     {
+      std::fprintf(stderr, "FAIL: %s\n", name);
       basics_log("FAIL: %s\n", name);
       failed += 1;
     }
@@ -240,6 +242,12 @@ int main(void)
           bundle.apiCredentials[0].metadata.find("scope") != bundle.apiCredentials[0].metadata.end() &&
           bundle.apiCredentials[0].metadata.at("scope") == "demo",
       "credential bundle api credential");
+  suite.expect(
+      bundle.tlsResumptionSnapshots.size() == 1 &&
+          bundle.tlsResumptionSnapshots[0].generation == 103 &&
+          bundle.tlsResumptionSnapshots[0].wormholeName == "public-api-quic" &&
+          bundle.tlsResumptionSnapshots[0].keyRing.size() == 1,
+      "credential bundle resumption snapshot");
 
   ProdigySDK::CredentialDelta delta;
   suite.expect(
@@ -249,6 +257,13 @@ int main(void)
   suite.expect(delta.removedTLSNames.size() == 1 && equalString(delta.removedTLSNames[0], "legacy-cert"), "credential delta removed tls");
   suite.expect(delta.removedAPINames.size() == 1 && equalString(delta.removedAPINames[0], "legacy-token"), "credential delta removed api");
   suite.expect(equalString(delta.reason, "fixture-rotation"), "credential delta reason");
+  suite.expect(
+      delta.updatedResumptionSnapshots.size() == 1 &&
+          delta.updatedResumptionSnapshots[0].generation == 104 &&
+          delta.updatedResumptionSnapshots[0].wormholeName == "public-api-quic" &&
+          delta.removedResumptionWormholeNames.size() == 1 &&
+          delta.removedResumptionWormholeNames[0] == "legacy-public-api-quic",
+      "credential delta resumption update and removal");
 
   ProdigySDK::ContainerParameters parameters;
   suite.expect(
@@ -279,7 +294,8 @@ int main(void)
       "container parameters advertisement pairing");
   suite.expect(
       parameters.credentialBundle.has_value() &&
-          parameters.credentialBundle->bundleGeneration == 101,
+          parameters.credentialBundle->bundleGeneration == 101 &&
+          parameters.credentialBundle->tlsResumptionSnapshots.size() == 1,
       "container parameters credential bundle");
 
   ProdigySDK::Opinionated::PairingBook pairingBook;
@@ -356,6 +372,38 @@ int main(void)
           equalBytes(builtFrame, readFixture("frame.credentials_refresh_ack.empty.bin")),
       "build credentials refresh ack frame");
 
+  ProdigySDK::TlsResumptionApplyAck resumptionAck;
+  resumptionAck.results.push_back(ProdigySDK::TlsResumptionApplyResult {
+      "public-api-quic",
+      12'345,
+      true,
+      "",
+  });
+  resumptionAck.results.push_back(ProdigySDK::TlsResumptionApplyResult {
+      "admin-api-quic",
+      12'346,
+      false,
+      "stale generation",
+  });
+
+  ProdigySDK::Bytes typedCredentialAckFrame;
+  ProdigySDK::MessageFrame typedAckFrame;
+  ProdigySDK::TlsResumptionApplyAck decodedResumptionAck;
+  suite.expect(
+      ProdigySDK::buildCredentialsRefreshAckFrame(typedCredentialAckFrame, resumptionAck) == ProdigySDK::Result::ok &&
+          ProdigySDK::parseMessageFrame(typedCredentialAckFrame, typedAckFrame) == ProdigySDK::Result::ok &&
+          typedAckFrame.topic == ProdigySDK::ContainerTopic::credentialsRefresh &&
+          typedAckFrame.payload.empty() == false &&
+          ProdigySDK::decodeTlsResumptionApplyAckPayload(typedAckFrame.payload, decodedResumptionAck) == ProdigySDK::Result::ok,
+      "build typed credentials refresh ack frame");
+  suite.expect(
+      decodedResumptionAck.results.size() == 2 &&
+          decodedResumptionAck.results[0].wormholeName == "public-api-quic" &&
+          decodedResumptionAck.results[0].generation == 12'345 &&
+          decodedResumptionAck.results[0].success &&
+          decodedResumptionAck.results[1].failureReason == "stale generation",
+      "typed credentials refresh ack payload preserves resumption apply results");
+
   ProdigySDK::Bytes pingFrameBytes = readFixture("frame.ping.empty.bin");
   ProdigySDK::FrameDecoder decoder;
   std::vector<ProdigySDK::MessageFrame> decodedFrames;
@@ -404,8 +452,30 @@ int main(void)
       hub.handleFrame(parseFixtureFrame("frame.credentials_refresh.full.bin"), automaticResponses) == ProdigySDK::Result::ok &&
           dispatch.credentialsRefreshCount == 1 &&
           dispatch.lastCredentialDelta.bundleGeneration == 102 &&
-          equalString(dispatch.lastCredentialDelta.reason, "fixture-rotation"),
+          equalString(dispatch.lastCredentialDelta.reason, "fixture-rotation") &&
+          dispatch.lastCredentialDelta.updatedResumptionSnapshots.size() == 1,
       "hub credentials refresh dispatch");
+
+  RecordingDispatch resumptionDispatch;
+  ProdigySDK::NeuronHub resumptionHub(&resumptionDispatch, parameters);
+  resumptionHub.withAutoAcks();
+  std::vector<ProdigySDK::MessageFrame> resumptionResponses;
+  suite.expect(
+      resumptionHub.handleFrame(parseFixtureFrame("frame.credentials_refresh.full.bin"), resumptionResponses) == ProdigySDK::Result::ok &&
+          resumptionDispatch.credentialsRefreshCount == 1 &&
+          resumptionDispatch.lastCredentialDelta.updatedResumptionSnapshots.size() == 1,
+      "hub credentials refresh dispatches resumption delta");
+  std::vector<ProdigySDK::Bytes> resumptionQueuedResponses;
+  suite.expect(
+      resumptionHub.drainQueuedResponseBytes(resumptionQueuedResponses) == ProdigySDK::Result::ok &&
+          resumptionQueuedResponses.empty(),
+      "hub auto credentials ack skips resumption delta until application ack");
+  resumptionHub.applyCredentialDeltaLocally(resumptionDispatch.lastCredentialDelta);
+  suite.expect(
+      resumptionHub.parameters.credentialBundle.has_value() &&
+          resumptionHub.parameters.credentialBundle->bundleGeneration == 102 &&
+          resumptionHub.parameters.credentialBundle->tlsResumptionSnapshots[0].generation == 103,
+      "hub local credential update leaves resumption storage to app");
 
   suite.expect(
       hub.handleFrame(parseFixtureFrame("frame.message.demo.bin"), automaticResponses) == ProdigySDK::Result::ok &&
@@ -492,6 +562,16 @@ int main(void)
       hub.acknowledgeCredentialsRefresh(outboundCredentialAckFrame) == ProdigySDK::Result::ok &&
           equalBytes(outboundCredentialAckFrame, readFixture("frame.credentials_refresh_ack.empty.bin")),
       "hub credentials refresh ack builder");
+
+  ProdigySDK::Bytes outboundTypedCredentialAckFrame;
+  ProdigySDK::MessageFrame outboundTypedAckFrame;
+  ProdigySDK::TlsResumptionApplyAck outboundDecodedResumptionAck;
+  suite.expect(
+      hub.acknowledgeCredentialsRefresh(outboundTypedCredentialAckFrame, resumptionAck) == ProdigySDK::Result::ok &&
+          ProdigySDK::parseMessageFrame(outboundTypedCredentialAckFrame, outboundTypedAckFrame) == ProdigySDK::Result::ok &&
+          ProdigySDK::decodeTlsResumptionApplyAckPayload(outboundTypedAckFrame.payload, outboundDecodedResumptionAck) == ProdigySDK::Result::ok &&
+          outboundDecodedResumptionAck.results.size() == 2,
+      "hub typed credentials refresh ack builder");
 
   int sockets[2] = {-1, -1};
   if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0)

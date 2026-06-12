@@ -18,6 +18,7 @@ namespace ProdigySDK {
 constexpr inline char SDKVersion[] = "1.0.0";
 constexpr inline char WireSeries[] = "WIRE_V1";
 constexpr inline std::uint32_t WireProtocolVersion = 1;
+constexpr inline std::uint32_t MaxWireCollectionElements = 16u * 1024u;
 
 enum class Result : std::int32_t {
   ok = 0,
@@ -66,9 +67,37 @@ struct ApiCredential {
   std::map<std::string, std::string> metadata;
 };
 
+enum class TlsResumptionKeyRole : std::uint8_t {
+  issueAndAccept = 0,
+  acceptOnly = 1,
+};
+
+struct TlsResumptionKeyEpoch {
+  std::uint64_t generation = 0;
+  TlsResumptionKeyRole role = TlsResumptionKeyRole::acceptOnly;
+  std::array<std::uint8_t, 16> keyID {};
+  std::array<std::uint8_t, 32> masterSecret {};
+  std::int64_t issueUntilMs = 0;
+  std::int64_t acceptUntilMs = 0;
+};
+
+struct TlsResumptionSnapshot {
+  std::uint64_t generation = 0;
+  std::string wormholeName;
+  std::vector<TlsResumptionKeyEpoch> keyRing;
+};
+
+struct TlsResumptionApplyResult {
+  std::string wormholeName;
+  std::uint64_t generation = 0;
+  bool success = false;
+  std::string failureReason;
+};
+
 struct CredentialBundle {
   std::vector<TlsIdentity> tlsIdentities;
   std::vector<ApiCredential> apiCredentials;
+  std::vector<TlsResumptionSnapshot> tlsResumptionSnapshots;
   std::uint64_t bundleGeneration = 0;
 };
 
@@ -78,8 +107,73 @@ struct CredentialDelta {
   std::vector<std::string> removedTLSNames;
   std::vector<ApiCredential> updatedAPI;
   std::vector<std::string> removedAPINames;
+  std::vector<TlsResumptionSnapshot> updatedResumptionSnapshots;
+  std::vector<std::string> removedResumptionWormholeNames;
   std::string reason;
 };
+
+struct TlsResumptionApplyAck {
+  std::vector<TlsResumptionApplyResult> results;
+};
+
+static inline bool credentialDeltaHasResumption(const CredentialDelta& delta)
+{
+  return delta.updatedResumptionSnapshots.empty() == false ||
+         delta.removedResumptionWormholeNames.empty() == false;
+}
+
+static inline void applyCredentialDelta(CredentialBundle& bundle, const CredentialDelta& delta)
+{
+  auto eraseTlsByName = [&](const std::string& name) {
+    for (auto it = bundle.tlsIdentities.begin(); it != bundle.tlsIdentities.end();)
+    {
+      if (it->name == name)
+      {
+        it = bundle.tlsIdentities.erase(it);
+      }
+      else
+      {
+        ++it;
+      }
+    }
+  };
+
+  auto eraseApiByName = [&](const std::string& name) {
+    for (auto it = bundle.apiCredentials.begin(); it != bundle.apiCredentials.end();)
+    {
+      if (it->name == name)
+      {
+        it = bundle.apiCredentials.erase(it);
+      }
+      else
+      {
+        ++it;
+      }
+    }
+  };
+
+  for (const std::string& name : delta.removedTLSNames)
+  {
+    eraseTlsByName(name);
+  }
+  for (const std::string& name : delta.removedAPINames)
+  {
+    eraseApiByName(name);
+  }
+
+  for (const TlsIdentity& identity : delta.updatedTLS)
+  {
+    eraseTlsByName(identity.name);
+    bundle.tlsIdentities.push_back(identity);
+  }
+  for (const ApiCredential& credential : delta.updatedAPI)
+  {
+    eraseApiByName(credential.name);
+    bundle.apiCredentials.push_back(credential);
+  }
+
+  bundle.bundleGeneration = delta.bundleGeneration;
+}
 
 struct AdvertisedPort {
   std::uint64_t service = 0;
@@ -224,6 +318,7 @@ constexpr static std::uint8_t frameAlignment = 16;
 constexpr static std::array<std::uint8_t, 8> containerParametersMagic = {'P', 'R', 'D', 'P', 'A', 'R', '0', '1'};
 constexpr static std::array<std::uint8_t, 8> credentialBundleMagic = {'P', 'R', 'D', 'B', 'U', 'N', '0', '1'};
 constexpr static std::array<std::uint8_t, 8> credentialDeltaMagic = {'P', 'R', 'D', 'D', 'E', 'L', '0', '1'};
+constexpr static std::array<std::uint8_t, 8> tlsResumptionApplyAckMagic = {'P', 'R', 'D', 'A', 'C', 'K', '0', '1'};
 
 static inline std::uint16_t inferredApplicationID(std::uint64_t service)
 {
@@ -288,6 +383,18 @@ static inline void appendU64LE(Bytes& output, std::uint64_t value)
   }
 }
 
+static inline void appendI64LE(Bytes& output, std::int64_t value)
+{
+  std::uint64_t raw = 0;
+  std::memcpy(&raw, &value, sizeof(raw));
+  appendU64LE(output, raw);
+}
+
+static inline void appendBool(Bytes& output, bool value)
+{
+  appendU8(output, value ? 1u : 0u);
+}
+
 static inline bool appendString(Bytes& output, const std::string& value)
 {
   if (value.size() > std::numeric_limits<std::uint32_t>::max())
@@ -297,6 +404,25 @@ static inline bool appendString(Bytes& output, const std::string& value)
 
   appendU32LE(output, static_cast<std::uint32_t>(value.size()));
   output.insert(output.end(), value.begin(), value.end());
+  return true;
+}
+
+static inline bool appendStringVector(Bytes& output, const std::vector<std::string>& values)
+{
+  if (values.size() > std::numeric_limits<std::uint32_t>::max())
+  {
+    return false;
+  }
+
+  appendU32LE(output, static_cast<std::uint32_t>(values.size()));
+  for (const std::string& value : values)
+  {
+    if (appendString(output, value) == false)
+    {
+      return false;
+    }
+  }
+
   return true;
 }
 
@@ -385,6 +511,11 @@ public:
     return true;
   }
 
+  bool boundedU32(std::uint32_t& value, std::uint32_t maxValue)
+  {
+    return u32(value) && value <= maxValue;
+  }
+
   bool i32(std::int32_t& value)
   {
     const std::uint8_t *bytes = nullptr;
@@ -433,12 +564,31 @@ public:
     return true;
   }
 
+  template <std::size_t N>
+  bool fixedBytes(std::array<std::uint8_t, N>& value)
+  {
+    const std::uint8_t *bytes = nullptr;
+    if (raw(value.size(), bytes) == false || bytes == nullptr)
+    {
+      return false;
+    }
+
+    std::memcpy(value.data(), bytes, value.size());
+    return true;
+  }
+
   bool string(std::string& value)
   {
     std::uint32_t length = 0;
     if (u32(length) == false)
     {
       return false;
+    }
+
+    if (length == 0)
+    {
+      value.clear();
+      return true;
     }
 
     const std::uint8_t *bytes = nullptr;
@@ -479,7 +629,7 @@ static inline bool decodeIPPrefix(Reader& reader, IPPrefix& prefix)
 static inline bool decodeStringVector(Reader& reader, std::vector<std::string>& values)
 {
   std::uint32_t count = 0;
-  if (reader.u32(count) == false)
+  if (reader.boundedU32(count, MaxWireCollectionElements) == false)
   {
     return false;
   }
@@ -503,7 +653,7 @@ static inline bool decodeStringVector(Reader& reader, std::vector<std::string>& 
 static inline bool decodeIPAddressVector(Reader& reader, std::vector<IPAddress>& values)
 {
   std::uint32_t count = 0;
-  if (reader.u32(count) == false)
+  if (reader.boundedU32(count, MaxWireCollectionElements) == false)
   {
     return false;
   }
@@ -548,7 +698,7 @@ static inline bool decodeApiCredential(Reader& reader, ApiCredential& credential
       reader.i64(credential.activeFromMs) == false ||
       reader.i64(credential.sunsetAtMs) == false ||
       reader.string(credential.material) == false ||
-      reader.u32(metadataCount) == false)
+      reader.boundedU32(metadataCount, MaxWireCollectionElements) == false)
   {
     return false;
   }
@@ -569,11 +719,147 @@ static inline bool decodeApiCredential(Reader& reader, ApiCredential& credential
   return true;
 }
 
-static inline bool decodeCredentialBundleFields(Reader& reader, CredentialBundle& bundle)
+static inline bool validTlsResumptionKeyRole(std::uint8_t value)
+{
+  return value <= static_cast<std::uint8_t>(TlsResumptionKeyRole::acceptOnly);
+}
+
+static inline bool decodeTlsResumptionKeyEpoch(Reader& reader, TlsResumptionKeyEpoch& epoch)
+{
+  std::uint8_t role = 0;
+  if (reader.u64(epoch.generation) == false ||
+      reader.u8(role) == false ||
+      validTlsResumptionKeyRole(role) == false ||
+      reader.fixedBytes(epoch.keyID) == false ||
+      reader.fixedBytes(epoch.masterSecret) == false ||
+      reader.i64(epoch.issueUntilMs) == false ||
+      reader.i64(epoch.acceptUntilMs) == false)
+  {
+    return false;
+  }
+
+  epoch.role = static_cast<TlsResumptionKeyRole>(role);
+  return true;
+}
+
+static inline bool decodeTlsResumptionSnapshot(Reader& reader, TlsResumptionSnapshot& snapshot)
+{
+  std::uint32_t keyCount = 0;
+  if (reader.u64(snapshot.generation) == false ||
+      reader.string(snapshot.wormholeName) == false ||
+      reader.boundedU32(keyCount, MaxWireCollectionElements) == false)
+  {
+    return false;
+  }
+
+  snapshot.keyRing.clear();
+  snapshot.keyRing.reserve(keyCount);
+  for (std::uint32_t index = 0; index < keyCount; index += 1)
+  {
+    TlsResumptionKeyEpoch epoch;
+    if (decodeTlsResumptionKeyEpoch(reader, epoch) == false)
+    {
+      return false;
+    }
+
+    snapshot.keyRing.push_back(epoch);
+  }
+
+  return true;
+}
+
+static inline bool decodeTlsResumptionSnapshots(Reader& reader, std::vector<TlsResumptionSnapshot>& snapshots)
+{
+  std::uint32_t count = 0;
+  if (reader.boundedU32(count, MaxWireCollectionElements) == false)
+  {
+    return false;
+  }
+
+  snapshots.clear();
+  snapshots.reserve(count);
+  for (std::uint32_t index = 0; index < count; index += 1)
+  {
+    TlsResumptionSnapshot snapshot;
+    if (decodeTlsResumptionSnapshot(reader, snapshot) == false)
+    {
+      return false;
+    }
+
+    snapshots.push_back(std::move(snapshot));
+  }
+
+  return true;
+}
+
+static inline bool appendTlsResumptionApplyResults(Bytes& output, const std::vector<TlsResumptionApplyResult>& results)
+{
+  if (results.size() > std::numeric_limits<std::uint32_t>::max())
+  {
+    return false;
+  }
+
+  appendU32LE(output, static_cast<std::uint32_t>(results.size()));
+  for (const TlsResumptionApplyResult& result : results)
+  {
+    if (appendString(output, result.wormholeName) == false)
+    {
+      return false;
+    }
+
+    appendU64LE(output, result.generation);
+    appendBool(output, result.success);
+    if (appendString(output, result.failureReason) == false)
+    {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static inline bool decodeTlsResumptionApplyResults(Reader& reader, std::vector<TlsResumptionApplyResult>& results)
+{
+  std::uint32_t count = 0;
+  if (reader.boundedU32(count, MaxWireCollectionElements) == false)
+  {
+    return false;
+  }
+
+  results.clear();
+  results.reserve(count);
+  for (std::uint32_t index = 0; index < count; index += 1)
+  {
+    TlsResumptionApplyResult result;
+    if (reader.string(result.wormholeName) == false ||
+        reader.u64(result.generation) == false ||
+        reader.boolean(result.success) == false ||
+        reader.string(result.failureReason) == false)
+    {
+      return false;
+    }
+
+    results.push_back(std::move(result));
+  }
+
+  return true;
+}
+
+static inline bool appendTlsResumptionApplyAckFields(Bytes& output, const TlsResumptionApplyAck& result)
+{
+  return appendTlsResumptionApplyResults(output, result.results);
+}
+
+static inline bool decodeTlsResumptionApplyAckFields(Reader& reader, TlsResumptionApplyAck& result)
+{
+  return decodeTlsResumptionApplyResults(reader, result.results);
+}
+
+static inline bool decodeCredentialBundleBaseFields(Reader& reader, CredentialBundle& bundle)
 {
   std::uint32_t tlsCount = 0;
   std::uint32_t apiCount = 0;
-  if (reader.u32(tlsCount) == false)
+  if (reader.boundedU32(tlsCount, MaxWireCollectionElements) == false)
   {
     return false;
   }
@@ -591,7 +877,7 @@ static inline bool decodeCredentialBundleFields(Reader& reader, CredentialBundle
     bundle.tlsIdentities.push_back(std::move(identity));
   }
 
-  if (reader.u32(apiCount) == false)
+  if (reader.boundedU32(apiCount, MaxWireCollectionElements) == false)
   {
     return false;
   }
@@ -609,7 +895,14 @@ static inline bool decodeCredentialBundleFields(Reader& reader, CredentialBundle
     bundle.apiCredentials.push_back(std::move(credential));
   }
 
+  bundle.tlsResumptionSnapshots.clear();
   return reader.u64(bundle.bundleGeneration);
+}
+
+static inline bool decodeCredentialBundleFields(Reader& reader, CredentialBundle& bundle)
+{
+  return decodeCredentialBundleBaseFields(reader, bundle) &&
+         decodeTlsResumptionSnapshots(reader, bundle.tlsResumptionSnapshots);
 }
 
 static inline bool decodeAdvertisementPairingPayload(Reader& reader, AdvertisementPairing& pairing)
@@ -657,13 +950,15 @@ inline Result decodeCredentialBundle(const std::uint8_t *data, std::size_t size,
   }
 
   Detail::Reader reader(data, size);
+  CredentialBundle decoded;
   if (Detail::consumeMagic(reader, Detail::credentialBundleMagic) == false ||
-      Detail::decodeCredentialBundleFields(reader, bundle) == false ||
+      Detail::decodeCredentialBundleFields(reader, decoded) == false ||
       reader.done() == false)
   {
     return Result::protocol;
   }
 
+  bundle = std::move(decoded);
   return Result::ok;
 }
 
@@ -680,17 +975,18 @@ inline Result decodeCredentialDelta(const std::uint8_t *data, std::size_t size, 
   }
 
   Detail::Reader reader(data, size);
+  CredentialDelta decoded;
   std::uint32_t updatedTLSCount = 0;
   std::uint32_t updatedAPICount = 0;
   if (Detail::consumeMagic(reader, Detail::credentialDeltaMagic) == false ||
-      reader.u64(delta.bundleGeneration) == false ||
-      reader.u32(updatedTLSCount) == false)
+      reader.u64(decoded.bundleGeneration) == false ||
+      reader.boundedU32(updatedTLSCount, MaxWireCollectionElements) == false)
   {
     return Result::protocol;
   }
 
-  delta.updatedTLS.clear();
-  delta.updatedTLS.reserve(updatedTLSCount);
+  decoded.updatedTLS.clear();
+  decoded.updatedTLS.reserve(updatedTLSCount);
   for (std::uint32_t index = 0; index < updatedTLSCount; index += 1)
   {
     TlsIdentity identity;
@@ -699,17 +995,17 @@ inline Result decodeCredentialDelta(const std::uint8_t *data, std::size_t size, 
       return Result::protocol;
     }
 
-    delta.updatedTLS.push_back(std::move(identity));
+    decoded.updatedTLS.push_back(std::move(identity));
   }
 
-  if (Detail::decodeStringVector(reader, delta.removedTLSNames) == false ||
-      reader.u32(updatedAPICount) == false)
+  if (Detail::decodeStringVector(reader, decoded.removedTLSNames) == false ||
+      reader.boundedU32(updatedAPICount, MaxWireCollectionElements) == false)
   {
     return Result::protocol;
   }
 
-  delta.updatedAPI.clear();
-  delta.updatedAPI.reserve(updatedAPICount);
+  decoded.updatedAPI.clear();
+  decoded.updatedAPI.reserve(updatedAPICount);
   for (std::uint32_t index = 0; index < updatedAPICount; index += 1)
   {
     ApiCredential credential;
@@ -718,16 +1014,19 @@ inline Result decodeCredentialDelta(const std::uint8_t *data, std::size_t size, 
       return Result::protocol;
     }
 
-    delta.updatedAPI.push_back(std::move(credential));
+    decoded.updatedAPI.push_back(std::move(credential));
   }
 
-  if (Detail::decodeStringVector(reader, delta.removedAPINames) == false ||
-      reader.string(delta.reason) == false ||
+  if (Detail::decodeStringVector(reader, decoded.removedAPINames) == false ||
+      reader.string(decoded.reason) == false ||
+      Detail::decodeTlsResumptionSnapshots(reader, decoded.updatedResumptionSnapshots) == false ||
+      Detail::decodeStringVector(reader, decoded.removedResumptionWormholeNames) == false ||
       reader.done() == false)
   {
     return Result::protocol;
   }
 
+  delta = std::move(decoded);
   return Result::ok;
 }
 
@@ -743,7 +1042,7 @@ inline Result decodeContainerParameters(const std::uint8_t *data, std::size_t si
     return Result::argument;
   }
 
-  auto decode = [&](bool consumeLegacyPublicEgressFields) -> Result {
+  auto decode = [&]() -> Result {
     Detail::Reader reader(data, size);
     ContainerParameters decoded;
     std::uint32_t advertiseCount = 0;
@@ -760,7 +1059,7 @@ inline Result decodeContainerParameters(const std::uint8_t *data, std::size_t si
         reader.i32(decoded.neuronFD) == false ||
         reader.i32(decoded.lowCPU) == false ||
         reader.i32(decoded.highCPU) == false ||
-        reader.u32(advertiseCount) == false)
+        reader.boundedU32(advertiseCount, MaxWireCollectionElements) == false)
     {
       return Result::protocol;
     }
@@ -778,7 +1077,7 @@ inline Result decodeContainerParameters(const std::uint8_t *data, std::size_t si
       decoded.advertises.push_back(port);
     }
 
-    if (reader.u32(subscriptionPairingCount) == false)
+    if (reader.boundedU32(subscriptionPairingCount, MaxWireCollectionElements) == false)
     {
       return Result::protocol;
     }
@@ -801,7 +1100,7 @@ inline Result decodeContainerParameters(const std::uint8_t *data, std::size_t si
       decoded.subscriptionPairings.push_back(pairing);
     }
 
-    if (reader.u32(advertisementPairingCount) == false)
+    if (reader.boundedU32(advertisementPairingCount, MaxWireCollectionElements) == false)
     {
       return Result::protocol;
     }
@@ -828,22 +1127,9 @@ inline Result decodeContainerParameters(const std::uint8_t *data, std::size_t si
       return Result::protocol;
     }
 
-    if (consumeLegacyPublicEgressFields)
-    {
-      IPPrefix ignoredPublic6;
-      bool ignoredRequiresPublic4 = false;
-      bool ignoredRequiresPublic6 = false;
-      if (Detail::decodeIPPrefix(reader, ignoredPublic6) == false ||
-          reader.boolean(ignoredRequiresPublic4) == false ||
-          reader.boolean(ignoredRequiresPublic6) == false)
-      {
-        return Result::protocol;
-      }
-    }
-
     if (reader.boolean(decoded.justCrashed) == false ||
         reader.u8(decoded.datacenterUniqueTag) == false ||
-        reader.u32(flagCount) == false)
+        reader.boundedU32(flagCount, MaxWireCollectionElements) == false)
     {
       return Result::protocol;
     }
@@ -890,13 +1176,7 @@ inline Result decodeContainerParameters(const std::uint8_t *data, std::size_t si
     return Result::ok;
   };
 
-  Result result = decode(false);
-  if (result == Result::ok)
-  {
-    return result;
-  }
-
-  return decode(true);
+  return decode();
 }
 
 inline Result decodeContainerParameters(const Bytes& input, ContainerParameters& parameters)
@@ -995,6 +1275,26 @@ inline Result decodeResourceDeltaPayload(const Bytes& payload, ResourceDelta& de
   return decodeResourceDeltaPayload(payload.data(), payload.size(), delta);
 }
 
+inline Result decodeTlsResumptionApplyAckPayload(const std::uint8_t *payload, std::size_t payloadSize, TlsResumptionApplyAck& result)
+{
+  if (payload == nullptr && payloadSize > 0)
+  {
+    return Result::argument;
+  }
+
+  Detail::Reader reader(payload, payloadSize);
+  return Detail::consumeMagic(reader, Detail::tlsResumptionApplyAckMagic) &&
+                 Detail::decodeTlsResumptionApplyAckFields(reader, result) &&
+                 reader.done()
+             ? Result::ok
+             : Result::protocol;
+}
+
+inline Result decodeTlsResumptionApplyAckPayload(const Bytes& payload, TlsResumptionApplyAck& result)
+{
+  return decodeTlsResumptionApplyAckPayload(payload.data(), payload.size(), result);
+}
+
 inline Result buildMessageFrame(
     Bytes& output,
     ContainerTopic topic,
@@ -1072,6 +1372,26 @@ inline Result buildResourceDeltaAckFrame(Bytes& output, bool accepted)
 inline Result buildCredentialsRefreshAckFrame(Bytes& output)
 {
   return buildMessageFrame(output, ContainerTopic::credentialsRefresh, nullptr, 0);
+}
+
+inline Result buildTlsResumptionApplyAckPayload(Bytes& output, const TlsResumptionApplyAck& result)
+{
+  output.clear();
+  output.insert(output.end(), Detail::tlsResumptionApplyAckMagic.begin(), Detail::tlsResumptionApplyAckMagic.end());
+  return Detail::appendTlsResumptionApplyAckFields(output, result) ? Result::ok : Result::argument;
+}
+
+inline Result buildCredentialsRefreshAckFrame(Bytes& output, const TlsResumptionApplyAck& result)
+{
+  Bytes payload;
+  Result payloadResult = buildTlsResumptionApplyAckPayload(payload, result);
+  if (payloadResult != Result::ok)
+  {
+    output.clear();
+    return payloadResult;
+  }
+
+  return buildMessageFrame(output, ContainerTopic::credentialsRefresh, payload);
 }
 
 inline Result encodeMessageFrames(const std::vector<MessageFrame>& frames, std::vector<Bytes>& output)
@@ -1246,8 +1566,7 @@ public:
   explicit NeuronHub(Dispatch *target, ContainerParameters startupParameters)
       : dispatch(target),
         parameters(std::move(startupParameters))
-  {
-  }
+  {}
 
   NeuronHub& withControlPolicy(ControlPolicy policy)
   {
@@ -1265,6 +1584,16 @@ public:
   bool shutdownRequested(void) const
   {
     return shutdown;
+  }
+
+  void applyCredentialDeltaLocally(const CredentialDelta& delta)
+  {
+    if (parameters.credentialBundle.has_value() == false)
+    {
+      parameters.credentialBundle = CredentialBundle {};
+    }
+
+    applyCredentialDelta(*parameters.credentialBundle, delta);
   }
 
   Result signalReady(Bytes& output) const
@@ -1298,6 +1627,11 @@ public:
   Result acknowledgeCredentialsRefresh(Bytes& output) const
   {
     return buildCredentialsRefreshAckFrame(output);
+  }
+
+  Result acknowledgeCredentialsRefresh(Bytes& output, const TlsResumptionApplyAck& result) const
+  {
+    return buildCredentialsRefreshAckFrame(output, result);
   }
 
   void queueReady(void)
@@ -1337,6 +1671,22 @@ public:
   void queueCredentialsRefreshAck(void)
   {
     queuedResponses.push_back(MessageFrame {ContainerTopic::credentialsRefresh, {}});
+  }
+
+  Result queueCredentialsRefreshAck(const TlsResumptionApplyAck& result)
+  {
+    Bytes payload;
+    Result buildResult = buildTlsResumptionApplyAckPayload(payload, result);
+    if (buildResult != Result::ok)
+    {
+      return buildResult;
+    }
+
+    queuedResponses.push_back(MessageFrame {
+        ContainerTopic::credentialsRefresh,
+        std::move(payload),
+    });
+    return Result::ok;
   }
 
   Result drainQueuedResponseBytes(std::vector<Bytes>& output)
@@ -1473,7 +1823,7 @@ public:
             dispatch->credentialsRefresh(*this, delta);
           }
 
-          if (controlPolicy.credentialsRefreshAck)
+          if (controlPolicy.credentialsRefreshAck && credentialDeltaHasResumption(delta) == false)
           {
             queueCredentialsRefreshAck();
           }

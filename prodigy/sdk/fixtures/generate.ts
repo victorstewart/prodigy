@@ -245,6 +245,19 @@ function writeAPICredential(writer: Writer, credential: APIFixture): void
    }
 }
 
+function writeFixtureResumptionSnapshot(writer: Writer, generation: bigint): void
+{
+   writer.u64(generation)
+   writer.string("public-api-quic")
+   writer.u32(1)
+   writer.u64(generation)
+   writer.u8(0)
+   writer.raw(Uint8Array.from(Array.from({ length: 16 }, (_value, index) => 0x90 + index)))
+   writer.raw(Uint8Array.from(Array.from({ length: 32 }, (_value, index) => 0xa0 + index)))
+   writer.i64(1710003600000n)
+   writer.i64(1710007200000n)
+}
+
 function encodeCredentialBundleFields(bundle: BundleFixture): Buffer
 {
    const writer = new Writer()
@@ -261,6 +274,8 @@ function encodeCredentialBundleFields(bundle: BundleFixture): Buffer
    }
 
    writer.u64(bundle.bundleGeneration)
+   writer.u32(1)
+   writeFixtureResumptionSnapshot(writer, 103n)
    return writer.finish()
 }
 
@@ -292,6 +307,9 @@ function encodeCredentialDelta(delta: DeltaFixture): Buffer
 
    writeStringArray(writer, delta.removedAPINames)
    writer.string(delta.reason)
+   writer.u32(1)
+   writeFixtureResumptionSnapshot(writer, 104n)
+   writeStringArray(writer, ["legacy-public-api-quic"])
    return writer.finish()
 }
 
@@ -588,15 +606,19 @@ function main(): void
    const decodedBundle = decodeCredentialBundle(credentialBundleBytes)
    assert.equal(decodedBundle.tlsIdentities[0]?.name, "demo-cert")
    assert.equal(decodedBundle.apiCredentials[0]?.metadata.get("scope"), "demo")
+   assert.equal(decodedBundle.tlsResumptionSnapshots[0]?.wormholeName, "public-api-quic")
 
    const decodedDelta = decodeCredentialDelta(credentialDeltaBytes)
    assert.equal(decodedDelta.reason, "fixture-rotation")
    assert.deepEqual(decodedDelta.removedTLSNames, ["legacy-cert"])
+   assert.equal(decodedDelta.updatedResumptionSnapshots[0]?.generation, 104n)
+   assert.deepEqual(decodedDelta.removedResumptionWormholeNames, ["legacy-public-api-quic"])
 
    const decodedParameters = decodeContainerParameters(containerParametersBytes)
    assert.equal(decodedParameters.datacenterUniqueTag, 23)
    assert.equal(decodedParameters.flags.length, 3)
    assert.equal(decodedParameters.credentialBundle?.bundleGeneration, 101n)
+   assert.equal(decodedParameters.credentialBundle?.tlsResumptionSnapshots[0]?.keyRing.length, 1)
 
    const parsedStatistics = decodeMetricPairs(statisticsPayload)
    assert.deepEqual(parsedStatistics, [

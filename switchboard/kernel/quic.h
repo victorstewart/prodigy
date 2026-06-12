@@ -1,13 +1,16 @@
 #include <ebpf/kernel/aes.h>
 
 #include <switchboard/common/constants.h>
+#include <switchboard/common/balancer.policy.h>
 #include <switchboard/common/quic.cid.h>
 
 #pragma once
 
-struct quic_parse_result {
+struct quic_route_result {
   struct container_id containerID;
   bool is_initial;
+  bool fallback_allowed;
+  bool had_valid_prodigy_cid;
 };
 
 struct {
@@ -17,14 +20,13 @@ struct {
   __uint(max_entries, MAX_PORTALS * 2);
 } quic_cid_aes_decrypt_map SEC(".maps");
 
-__attribute__((__always_inline__)) static inline bool parse_quic(struct container_id *containerID, const struct portal_meta *portal_meta, void *data, void *data_end, bool is_ipv6, const struct flow_key *flow)
+__attribute__((__always_inline__)) static inline struct quic_route_result parse_quic_route(const struct portal_meta *portal_meta, void *data, void *data_end, bool is_ipv6, const struct flow_key *flow)
 {
-  containerID->hasID = false;
-  bool allow_hash_fallback = false;
+  struct quic_route_result result = {};
 
   if (portal_meta == NULL)
   {
-    return false;
+    return result;
   }
 
   __u64 off = calc_offset(is_ipv6);
@@ -33,7 +35,7 @@ __attribute__((__always_inline__)) static inline bool parse_quic(struct containe
   /*                                      |QUIC PKT TYPE|           */
   if ((data + off + sizeof(struct udphdr) + sizeof(__u8)) > data_end)
   {
-    return false;
+    return result;
   }
 
   __u8 *quic_data = data + off + sizeof(struct udphdr);
@@ -42,38 +44,49 @@ __attribute__((__always_inline__)) static inline bool parse_quic(struct containe
 
   if ((*pkt_type & QUIC_V1_LONG_HEADER) == QUIC_V1_LONG_HEADER)
   {
-    // packet with long header
-    if ((void *)(quic_data + sizeof(struct quic_long_header)) > data_end)
+    // Packet with a long header. Parse the packet type and declared DCID
+    // length before requiring Prodigy's fixed-size routing CID.
+    if ((void *)(quic_data + 6) > data_end)
     {
-      return false;
+      return result;
     }
 
-    struct quic_long_header *lheader = (struct quic_long_header *)quic_data;
     __u8 packet_type = (*pkt_type & QUIC_V1_PACKET_TYPE_MASK);
-
-    // Prodigy CIDs use one exact fixed-size schema.
-    if (lheader->conn_id_lens != QUIC_CID_LEN)
-    {
-      return false;
-    }
+    result.is_initial = packet_type == QUIC_V1_CLIENT_INITIAL;
 
     if (packet_type == QUIC_V1_RETRY)
     {
-      return false; // client should never send Retry packets to the server
+      result.fallback_allowed = false;
+      return result; // client should never send Retry packets to the server
     }
 
-    if (packet_type == QUIC_V1_CLIENT_INITIAL || packet_type == QUIC_V1_0RTT)
+    __u8 declared_dcid_len = *(quic_data + 5);
+    if (switchboardQuicV1DestinationCidLengthValid(declared_dcid_len) == false)
     {
-      allow_hash_fallback = true;
+      result.fallback_allowed = false;
+      return result;
+    }
+    result.fallback_allowed = switchboardQuicV1LongHeaderAllowsHashFallback(packet_type, declared_dcid_len);
+
+    __u8 *dst_cid = quic_data + 6;
+    if ((void *)(dst_cid + declared_dcid_len) > data_end)
+    {
+      result.fallback_allowed = false;
+      return result;
     }
 
-    encrypted_cid = lheader->dst_cid;
+    if (switchboardQuicV1DestinationCidUsesProdigySchema(declared_dcid_len) == false)
+    {
+      return result;
+    }
+
+    encrypted_cid = dst_cid;
   }
   else
   {
     if ((void *)(quic_data + sizeof(struct quic_short_header)) > data_end)
     {
-      return false;
+      return result;
     }
 
     struct quic_short_header *sheader = (struct quic_short_header *)quic_data;
@@ -155,18 +168,30 @@ __attribute__((__always_inline__)) static inline bool parse_quic(struct containe
           if (quicCidTagMatches(expected_tag, cid_tag))
           {
             // network byte order on purpose
-            containerID->value[0] = cid[1];
-            containerID->value[1] = cid[2];
-            containerID->value[2] = cid[3];
-            containerID->value[3] = cid[4];
-            containerID->value[4] = cid[5];
+            result.containerID.value[0] = cid[1];
+            result.containerID.value[1] = cid[2];
+            result.containerID.value[2] = cid[3];
+            result.containerID.value[3] = cid[4];
+            result.containerID.value[4] = cid[5];
 
-            containerID->hasID = true;
+            result.containerID.hasID = true;
+            result.had_valid_prodigy_cid = true;
           }
         }
       }
     }
   }
 
-  return allow_hash_fallback;
+  return result;
+}
+
+__attribute__((__always_inline__)) static inline bool parse_quic(struct container_id *containerID, const struct portal_meta *portal_meta, void *data, void *data_end, bool is_ipv6, const struct flow_key *flow)
+{
+  struct quic_route_result result = parse_quic_route(portal_meta, data, data_end, is_ipv6, flow);
+  if (containerID)
+  {
+    bpf_memcpy(containerID, &result.containerID, sizeof(struct container_id));
+  }
+
+  return result.fallback_allowed;
 }

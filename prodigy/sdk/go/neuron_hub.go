@@ -65,19 +65,37 @@ type ApiCredential struct {
 	Metadata     map[string]string
 }
 
+type TlsResumptionKeyEpoch struct {
+	Generation    uint64
+	Role          uint8
+	KeyID         [16]byte
+	MasterSecret  [32]byte
+	IssueUntilMs  int64
+	AcceptUntilMs int64
+}
+
+type TlsResumptionSnapshot struct {
+	Generation   uint64
+	WormholeName string
+	KeyRing      []TlsResumptionKeyEpoch
+}
+
 type CredentialBundle struct {
-	TLSIdentities    []TlsIdentity
-	APICredentials   []ApiCredential
-	BundleGeneration uint64
+	TLSIdentities          []TlsIdentity
+	APICredentials         []ApiCredential
+	TLSResumptionSnapshots []TlsResumptionSnapshot
+	BundleGeneration       uint64
 }
 
 type CredentialDelta struct {
-	BundleGeneration uint64
-	UpdatedTLS       []TlsIdentity
-	RemovedTLSNames  []string
-	UpdatedAPI       []ApiCredential
-	RemovedAPINames  []string
-	Reason           string
+	BundleGeneration               uint64
+	UpdatedTLS                     []TlsIdentity
+	RemovedTLSNames                []string
+	UpdatedAPI                     []ApiCredential
+	RemovedAPINames                []string
+	UpdatedResumptionSnapshots     []TlsResumptionSnapshot
+	RemovedResumptionWormholeNames []string
+	Reason                         string
 }
 
 type AdvertisedPort struct {
@@ -810,6 +828,9 @@ func decodeCredentialBundleFromDecoder(decoder *byteDecoder) (CredentialBundle, 
 	if bundle.BundleGeneration, err = decoder.u64(); err != nil {
 		return CredentialBundle{}, err
 	}
+	if bundle.TLSResumptionSnapshots, err = decoder.tlsResumptionSnapshots(); err != nil {
+		return CredentialBundle{}, err
+	}
 
 	return bundle, nil
 }
@@ -851,6 +872,12 @@ func decodeCredentialDeltaFromDecoder(decoder *byteDecoder) (CredentialDelta, er
 		return CredentialDelta{}, err
 	}
 	if delta.Reason, err = decoder.string(); err != nil {
+		return CredentialDelta{}, err
+	}
+	if delta.UpdatedResumptionSnapshots, err = decoder.tlsResumptionSnapshots(); err != nil {
+		return CredentialDelta{}, err
+	}
+	if delta.RemovedResumptionWormholeNames, err = decoder.stringArray(); err != nil {
 		return CredentialDelta{}, err
 	}
 	return delta, nil
@@ -1201,6 +1228,76 @@ func (decoder *byteDecoder) stringArray() ([]string, error) {
 		}
 	}
 	return values, nil
+}
+
+func (decoder *byteDecoder) skipStringArray() error {
+	count, err := decoder.u32()
+	if err != nil {
+		return err
+	}
+	for index := uint32(0); index < count; index += 1 {
+		if _, err = decoder.string(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (decoder *byteDecoder) tlsResumptionKeyEpoch() (TlsResumptionKeyEpoch, error) {
+	var epoch TlsResumptionKeyEpoch
+	var err error
+	if epoch.Generation, err = decoder.u64(); err != nil {
+		return epoch, err
+	}
+	if epoch.Role, err = decoder.u8(); err != nil {
+		return epoch, err
+	}
+	if epoch.Role > 1 {
+		return epoch, errors.New("prodigy: invalid tls resumption key role")
+	}
+	keyID, err := decoder.bytes(16)
+	if err != nil {
+		return epoch, err
+	}
+	copy(epoch.KeyID[:], keyID)
+	secret, err := decoder.bytes(32)
+	if err != nil {
+		return epoch, err
+	}
+	copy(epoch.MasterSecret[:], secret)
+	if epoch.IssueUntilMs, err = decoder.i64(); err != nil {
+		return epoch, err
+	}
+	epoch.AcceptUntilMs, err = decoder.i64()
+	return epoch, err
+}
+
+func (decoder *byteDecoder) tlsResumptionSnapshots() ([]TlsResumptionSnapshot, error) {
+	count, err := decoder.u32()
+	if err != nil {
+		return nil, err
+	}
+	snapshots := make([]TlsResumptionSnapshot, int(count))
+	for snapshotIndex := uint32(0); snapshotIndex < count; snapshotIndex += 1 {
+		snapshot := &snapshots[snapshotIndex]
+		if snapshot.Generation, err = decoder.u64(); err != nil {
+			return nil, err
+		}
+		if snapshot.WormholeName, err = decoder.string(); err != nil {
+			return nil, err
+		}
+		keyCount, err := decoder.u32()
+		if err != nil {
+			return nil, err
+		}
+		snapshot.KeyRing = make([]TlsResumptionKeyEpoch, int(keyCount))
+		for keyIndex := uint32(0); keyIndex < keyCount; keyIndex += 1 {
+			if snapshot.KeyRing[keyIndex], err = decoder.tlsResumptionKeyEpoch(); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return snapshots, nil
 }
 
 func (decoder *byteDecoder) ipAddress() (IPAddress, error) {

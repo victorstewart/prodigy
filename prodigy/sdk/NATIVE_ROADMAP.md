@@ -9,7 +9,7 @@ Complete.
 - explicit startup bootstrap wire codec
 - explicit `CredentialBundle` wire codec
 - explicit `CredentialDelta` wire codec
-- legacy Bitsery read fallback during rollout
+- hard cutover to the current packed readers
 
 ## Phase 2
 
@@ -41,7 +41,7 @@ Build conformance assets.
 - golden binary fixtures for startup payloads
 - golden binary fixtures for each control-topic payload
 - cross-language fixture readers
-- one compatibility matrix that proves legacy C++ and native runtimes interoperate during rollout
+- one conformance matrix that proves C++ and native runtimes consume the same current bytes
 
 Current state:
 
@@ -49,7 +49,7 @@ Current state:
 - generator and manifest are checked in
 - wire and fixture bump policy now lives in `prodigy/sdk/VERSIONING.md` and `prodigy/sdk/versioning.json`
 - per-language fixture consumers now exist for C, C++, Rust, Go, Python, and TypeScript
-- `sdk/compatibility_matrix.sh` now runs the shared fixture corpus across all six transport-agnostic runtimes plus the legacy Ring-backed Prodigy C++ path
+- `sdk/compatibility_matrix.sh` now runs the shared fixture corpus across all six transport-agnostic runtimes plus the Ring-backed Prodigy C++ path
 
 ## Phase 4
 
