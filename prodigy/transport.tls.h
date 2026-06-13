@@ -1,6 +1,6 @@
 #pragma once
 
-#include <prodigy/tls.resumption.h>
+#include <prodigy/server.state.h>
 #include <services/vault.h>
 #include <services/bitsery.h>
 #include <services/crypto.h>

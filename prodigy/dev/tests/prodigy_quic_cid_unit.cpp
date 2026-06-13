@@ -154,8 +154,18 @@ int main(void)
       0xee,
       0xff,
   };
+  uint8_t key1[16] = {};
+  memcpy(key1, key0, sizeof(key1));
+  prodigyForceBiphasalKeyPhase(key1, 1);
+  suite.expect(prodigyBiphasalKeyPhase(key1) == 1, "quic_cid_biphasal_key_force_phase1");
+  prodigyForceBiphasalKeyPhase(key1, 0);
+  suite.expect(prodigyBiphasalKeyPhase(key1) == 0, "quic_cid_biphasal_key_force_phase0");
+  prodigyForceBiphasalKeyPhase(key1, 1);
+
   ProdigyQuicCidEncryptor cidEncryptor = {};
   suite.expect(cidEncryptor.setKey(key0), "quic_cid_encryptor_initializes");
+  ProdigyQuicCidEncryptor cidEncryptorPhase1 = {};
+  suite.expect(cidEncryptorPhase1.setKey(key1), "quic_cid_encryptor_phase1_initializes");
 
   uint8_t containerID[5] = {0x7a, 0x01, 0x02, 0x03, 0x04};
   struct sockaddr_in destination = {};
@@ -169,8 +179,7 @@ int main(void)
         cidEncryptor,
         containerID,
         &nonceCursor,
-        reinterpret_cast<const struct sockaddr *>(&destination),
-        0);
+        reinterpret_cast<const struct sockaddr *>(&destination));
 
     uint32_t extractedNonce = 0;
     suite.expect(cid.id_len == 16, "quic_cid_generate_index0_returns_16_bytes");
@@ -182,16 +191,15 @@ int main(void)
   {
     uint32_t nonceCursor = 19;
     ProdigyQuicCID cid = prodigyGenerateQuicCID(
-        cidEncryptor,
+        cidEncryptorPhase1,
         containerID,
         &nonceCursor,
-        reinterpret_cast<const struct sockaddr *>(&destination),
-        1);
+        reinterpret_cast<const struct sockaddr *>(&destination));
 
     uint32_t extractedNonce = 0;
     suite.expect(cid.id_len == 16, "quic_cid_generate_index1_returns_16_bytes");
     suite.expect(quicCidEncryptedKeyIndex(cid.id) == 1, "quic_cid_generate_index1_matches_requested_bit");
-    suite.expect(decryptAndValidateIPv4CID(key0, cid, containerID, destination.sin_addr.s_addr, destination.sin_port, extractedNonce), "quic_cid_generate_index1_roundtrips_and_validates_tag");
+    suite.expect(decryptAndValidateIPv4CID(key1, cid, containerID, destination.sin_addr.s_addr, destination.sin_port, extractedNonce), "quic_cid_generate_index1_roundtrips_and_validates_tag");
     suite.expect(nonceCursor == extractedNonce + 1, "quic_cid_generate_index1_advances_nonce_cursor");
   }
 
@@ -199,7 +207,7 @@ int main(void)
     struct sockaddr unsupported = {};
     unsupported.sa_family = AF_UNIX;
     uint32_t nonceCursor = 77;
-    ProdigyQuicCID cid = prodigyGenerateQuicCID(cidEncryptor, containerID, &nonceCursor, &unsupported, 0);
+    ProdigyQuicCID cid = prodigyGenerateQuicCID(cidEncryptor, containerID, &nonceCursor, &unsupported);
     suite.expect(cid.id_len == 0, "quic_cid_generate_rejects_unsupported_family");
     suite.expect(nonceCursor == 77, "quic_cid_generate_preserves_nonce_on_failure");
   }
@@ -215,8 +223,7 @@ int main(void)
         cidEncryptor,
         containerID,
         &nonceCursor,
-        reinterpret_cast<const struct sockaddr *>(&destination6),
-        0);
+        reinterpret_cast<const struct sockaddr *>(&destination6));
 
     uint32_t extractedNonce = 0;
     suite.expect(cid.id_len == 16, "quic_cid_generate_ipv6_returns_16_bytes");

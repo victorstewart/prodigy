@@ -13,6 +13,7 @@
 #include <openssl/ssl.h>
 #include <openssl/tls1.h>
 
+#include <prodigy/biphasal.key.h>
 #include <services/prodigy.h>
 
 enum class TlsResumptionKeyRole : uint8_t {
@@ -34,6 +35,16 @@ public:
   int64_t issueUntilMs = 0;
   int64_t acceptUntilMs = 0;
 };
+
+static inline uint8_t prodigyTlsResumptionEpochPhase(const TlsResumptionKeyEpoch& epoch)
+{
+  return prodigyBiphasalKeyPhase(epoch.masterSecret);
+}
+
+static inline void prodigyTlsResumptionForceEpochPhase(TlsResumptionKeyEpoch& epoch, uint8_t phase)
+{
+  prodigyForceBiphasalKeyPhase(epoch.masterSecret, phase);
+}
 
 template <typename S>
 static void serialize(S&& serializer, TlsResumptionKeyEpoch& epoch)

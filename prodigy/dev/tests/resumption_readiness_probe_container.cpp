@@ -449,7 +449,6 @@ private:
   ProdigyQuicCidEncryptor quicCidEncryptor;
   sockaddr_storage quicCidDestination = {};
   uint8_t quicCidContainerID[5] = {};
-  uint8_t quicCidActiveKeyIndex = 0;
   uint32_t quicCidNonceCursor = 1;
   bool quicCidGeneratorReady = false;
 
@@ -769,7 +768,6 @@ private:
 
     memcpy(quicCidContainerID, containerID, sizeof(quicCidContainerID));
     memcpy(&quicCidDestination, &destination, sizeof(destination));
-    quicCidActiveKeyIndex = activeKeyIndex;
     quicCidGeneratorReady = true;
 
     ProdigyQuicCID cid = generatePicoquicRoutingCid();
@@ -798,8 +796,7 @@ private:
         quicCidEncryptor,
         quicCidContainerID,
         &quicCidNonceCursor,
-        reinterpret_cast<const sockaddr *>(&quicCidDestination),
-        quicCidActiveKeyIndex);
+        reinterpret_cast<const sockaddr *>(&quicCidDestination));
   }
 
   static void picoquicConnectionIDCallback(

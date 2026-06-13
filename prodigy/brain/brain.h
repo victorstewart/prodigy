@@ -2313,10 +2313,11 @@ public:
     return uint64_t(rotationHours) * 60ULL * 60ULL * 1000ULL;
   }
 
-  static void mintWormholeQuicCidKeyMaterial(uint128_t& keyMaterial)
+  static void mintWormholeQuicCidKeyMaterial(uint128_t& keyMaterial, uint8_t phase)
   {
     uint8_t key[16] = {};
     Crypto::fillWithSecureRandomBytes(key, sizeof(key));
+    prodigyForceBiphasalKeyPhase(key, phase);
     wormholeQuicCidStoreKeyBytes(keyMaterial, key);
   }
 
@@ -2342,12 +2343,25 @@ public:
 
     if (wormhole.hasQuicCidKeyState == false)
     {
-      mintWormholeQuicCidKeyMaterial(wormhole.quicCidKeyState.keyMaterialByIndex[0]);
-      mintWormholeQuicCidKeyMaterial(wormhole.quicCidKeyState.keyMaterialByIndex[1]);
+      mintWormholeQuicCidKeyMaterial(wormhole.quicCidKeyState.keyMaterialByIndex[0], 0);
+      mintWormholeQuicCidKeyMaterial(wormhole.quicCidKeyState.keyMaterialByIndex[1], 1);
       wormhole.quicCidKeyState.activeKeyIndex = 0;
       wormhole.quicCidKeyState.rotatedAtMs = nowMs;
       wormhole.hasQuicCidKeyState = true;
       return true;
+    }
+
+    for (uint8_t keyIndex = 0; keyIndex < 2; ++keyIndex)
+    {
+      if (wormhole.quicCidKeyState.keyMaterialByIndex[keyIndex] == uint128_t(0))
+      {
+        mintWormholeQuicCidKeyMaterial(wormhole.quicCidKeyState.keyMaterialByIndex[keyIndex], keyIndex);
+        changed = true;
+      }
+      else if (wormholeQuicCidForceKeyMaterialPhase(wormhole.quicCidKeyState.keyMaterialByIndex[keyIndex], keyIndex))
+      {
+        changed = true;
+      }
     }
 
     if (wormhole.quicCidKeyState.rotatedAtMs <= 0)
@@ -2368,7 +2382,7 @@ public:
     }
 
     uint8_t nextKeyIndex = wormholeQuicCidInactiveKeyIndex(wormhole.quicCidKeyState);
-    mintWormholeQuicCidKeyMaterial(wormhole.quicCidKeyState.keyMaterialByIndex[nextKeyIndex]);
+    mintWormholeQuicCidKeyMaterial(wormhole.quicCidKeyState.keyMaterialByIndex[nextKeyIndex], nextKeyIndex);
     wormhole.quicCidKeyState.activeKeyIndex = nextKeyIndex;
     wormhole.quicCidKeyState.rotatedAtMs = nowMs;
     wormhole.hasQuicCidKeyState = true;
@@ -3181,13 +3195,27 @@ public:
            snapshot.keyRing.size() > 0;
   }
 
-  void mintTlsResumptionEpoch(TlsResumptionKeyEpoch& epoch, uint64_t generation, int64_t nowMs)
+  static uint8_t tlsResumptionNextEpochPhase(const TlsResumptionSnapshot& snapshot)
+  {
+    for (const TlsResumptionKeyEpoch& epoch : snapshot.keyRing)
+    {
+      if (epoch.generation == snapshot.generation)
+      {
+        return prodigyTlsResumptionEpochPhase(epoch) ^ 0x01u;
+      }
+    }
+
+    return 0;
+  }
+
+  void mintTlsResumptionEpoch(TlsResumptionKeyEpoch& epoch, uint64_t generation, int64_t nowMs, uint8_t phase)
   {
     epoch = TlsResumptionKeyEpoch();
     epoch.generation = generation;
     epoch.role = TlsResumptionKeyRole::acceptOnly;
     Crypto::fillWithSecureRandomBytes(epoch.keyID, sizeof(epoch.keyID));
     Crypto::fillWithSecureRandomBytes(epoch.masterSecret, sizeof(epoch.masterSecret));
+    prodigyTlsResumptionForceEpochPhase(epoch, phase);
     const int64_t baseMs = nowMs > 0 ? nowMs : 0;
     epoch.issueUntilMs = 0;
     uint64_t acceptWindowMs = prodigyTlsResumptionTicketLifetimeMs;
@@ -3239,7 +3267,7 @@ public:
     snapshot.wormholeName = wormhole.name;
 
     TlsResumptionKeyEpoch epoch = {};
-    mintTlsResumptionEpoch(epoch, generation, nowMs);
+    mintTlsResumptionEpoch(epoch, generation, nowMs, 0);
     snapshot.keyRing.push_back(epoch);
 
     BrainTlsResumptionWormholeState state = {};
@@ -3657,7 +3685,7 @@ public:
     uint64_t generation = mintNextTlsResumptionGeneration(snapshot->generation);
 
     TlsResumptionKeyEpoch epoch = {};
-    mintTlsResumptionEpoch(epoch, generation, nowMs);
+    mintTlsResumptionEpoch(epoch, generation, nowMs, tlsResumptionNextEpochPhase(*snapshot));
     snapshot->generation = generation;
     snapshot->keyRing.push_back(epoch);
 
@@ -3775,6 +3803,7 @@ public:
       }
 
       const uint32_t before = uint32_t(snapshot->keyRing.size());
+      const uint8_t nextPhase = tlsResumptionNextEpochPhase(*snapshot);
       auto firstExpired = std::remove_if(snapshot->keyRing.begin(), snapshot->keyRing.end(), [&](const TlsResumptionKeyEpoch& epoch) {
         return epoch.acceptUntilMs > 0 && epoch.acceptUntilMs <= nowMs;
       });
@@ -3790,7 +3819,7 @@ public:
         const uint64_t generation = mintNextTlsResumptionGeneration(snapshot->generation);
 
         TlsResumptionKeyEpoch epoch = {};
-        mintTlsResumptionEpoch(epoch, generation, nowMs);
+        mintTlsResumptionEpoch(epoch, generation, nowMs, nextPhase);
         snapshot->generation = generation;
         snapshot->keyRing.push_back(epoch);
         clearTlsResumptionAcksForWormhole(deploymentID, wormhole.name);

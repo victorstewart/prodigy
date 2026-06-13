@@ -9,7 +9,8 @@
 #include <networking/private4.h>
 #include <services/prodigy.h>
 #include <services/vault.h>
-#include <prodigy/tls.resumption.h>
+#include <prodigy/biphasal.key.h>
+#include <prodigy/server.state.h>
 
 #ifndef PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
 #define PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION PRODIGY_DEBUG
@@ -4324,6 +4325,23 @@ static inline void wormholeQuicCidStoreKeyBytes(uint128_t& keyMaterial, const ui
   }
 
   memcpy(&keyMaterial, key, 16);
+}
+
+static inline uint8_t wormholeQuicCidKeyMaterialPhase(uint128_t keyMaterial)
+{
+  uint8_t key[16] = {};
+  wormholeQuicCidExtractKeyBytes(keyMaterial, key);
+  return prodigyBiphasalKeyPhase(key);
+}
+
+static inline bool wormholeQuicCidForceKeyMaterialPhase(uint128_t& keyMaterial, uint8_t phase)
+{
+  uint8_t key[16] = {};
+  wormholeQuicCidExtractKeyBytes(keyMaterial, key);
+  uint8_t before = prodigyBiphasalKeyPhase(key);
+  prodigyForceBiphasalKeyPhase(key, phase);
+  wormholeQuicCidStoreKeyBytes(keyMaterial, key);
+  return before != (phase & 0x01u);
 }
 
 template <typename T>

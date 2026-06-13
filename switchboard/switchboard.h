@@ -62,7 +62,6 @@ public:
   bool hasQuicCidKeyState = false;
   // QUIC CID keys are Switchboard routing metadata only. They are unrelated to
   // TLS resumption ticket keys and must not be used for TLS ticket encryption.
-  uint8_t quicCidActiveKeyIndex = 0;
   uint128_t quicCidKeyMaterialByIndex[2] = {};
   std::array<uint32_t, RING_SIZE> hashRing;
   uint32_t slot;
@@ -704,9 +703,10 @@ private:
         quic_cid_aes_decrypt_state aesState = {};
         // This BPF map holds only QUIC CID routing decrypt state, never TLS
         // session-resumption ticket material.
-        buildQuicCidDecryptState(portal->quicCidKeyMaterialByIndex[keyIndex], aesState);
+        uint128_t keyMaterial = portal->quicCidKeyMaterialByIndex[keyIndex];
+        buildQuicCidDecryptState(keyMaterial, aesState);
 
-        uint32_t mapIndex = quicCidPortalDecryptMapIndex(portal->slot, keyIndex);
+        uint32_t mapIndex = quicCidPortalDecryptMapIndex(portal->slot, wormholeQuicCidKeyMaterialPhase(keyMaterial));
         if (bpf_map_update_elem(map_fd, &mapIndex, &aesState, BPF_ANY) != 0)
         {
           basics_log("Switchboard decrypt-state update failed (%d)\n", errno);
@@ -1184,7 +1184,6 @@ private:
     }
 
     portal->hasQuicCidKeyState = true;
-    portal->quicCidActiveKeyIndex = wormhole.quicCidKeyState.activeKeyIndex & 0x01;
     portal->quicCidKeyMaterialByIndex[0] = wormhole.quicCidKeyState.keyMaterialByIndex[0];
     portal->quicCidKeyMaterialByIndex[1] = wormhole.quicCidKeyState.keyMaterialByIndex[1];
   }

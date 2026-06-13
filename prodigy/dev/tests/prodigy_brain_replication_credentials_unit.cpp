@@ -3244,7 +3244,7 @@ static bool tlsResumptionSnapshotHasEpoch(const TlsResumptionSnapshot *snapshot,
   return false;
 }
 
-static bool tlsResumptionSnapshotHasEpochRole(const TlsResumptionSnapshot *snapshot, uint64_t generation, TlsResumptionKeyRole role)
+static bool tlsResumptionSnapshotHasEpochRole(const TlsResumptionSnapshot *snapshot, uint64_t generation, TlsResumptionKeyRole role, int phase = -1)
 {
   if (snapshot == nullptr)
   {
@@ -3255,7 +3255,7 @@ static bool tlsResumptionSnapshotHasEpochRole(const TlsResumptionSnapshot *snaps
   {
     if (epoch.generation == generation && epoch.role == role)
     {
-      return true;
+      return phase < 0 || prodigyTlsResumptionEpochPhase(epoch) == uint8_t(phase);
     }
   }
 
@@ -3531,6 +3531,7 @@ static void testTlsResumptionRotationAckCoverage(TestSuite& suite)
   suite.expect(failure.size() == 0, "resumption_rotation_initial_rollout_no_failure");
   suite.expect(snapshot != nullptr && snapshot->keyRing.size() == 1, "resumption_rotation_initial_key_count");
   suite.expect(snapshot != nullptr && snapshot->keyRing[0].role == TlsResumptionKeyRole::acceptOnly, "resumption_rotation_initial_accept_only");
+  suite.expect(snapshot != nullptr && prodigyTlsResumptionEpochPhase(snapshot->keyRing[0]) == 0, "resumption_rotation_initial_phase0");
   const uint64_t firstGeneration = snapshot != nullptr ? snapshot->generation : 0;
 
   coverageIs(false, "resumption_rotation_blocks_without_acks");
@@ -3586,6 +3587,7 @@ static void testTlsResumptionRotationAckCoverage(TestSuite& suite)
   const uint64_t secondGeneration = next != nullptr ? next->generation : 0;
   suite.expect(secondGeneration > firstGeneration, "resumption_rotation_next_generation_increases");
   suite.expect(next != nullptr && next->keyRing.size() == 2, "resumption_rotation_next_keeps_old_epoch");
+  suite.expect(tlsResumptionSnapshotHasEpochRole(next, secondGeneration, TlsResumptionKeyRole::acceptOnly, 1), "resumption_rotation_next_accept_only_phase1");
   coverageIs(false, "resumption_rotation_next_rollout_clears_old_acks");
   expectAck(containerA, firstGeneration, false, "resumption_rotation_old_generation_ack_ignored_after_next");
   expectAck(containerA, secondGeneration, true, "resumption_rotation_records_next_ack_a");
@@ -3609,7 +3611,7 @@ static void testTlsResumptionRotationAckCoverage(TestSuite& suite)
   suite.expect(thirdGeneration > secondGeneration, "resumption_rotation_scheduler_generation_increases");
   suite.expect(scheduled != nullptr && scheduled->keyRing.size() == 2, "resumption_rotation_scheduler_keeps_old_for_accept");
   suite.expect(tlsResumptionSnapshotHasEpoch(scheduled, secondGeneration), "resumption_rotation_scheduler_old_epoch_present");
-  suite.expect(tlsResumptionSnapshotHasEpochRole(scheduled, thirdGeneration, TlsResumptionKeyRole::acceptOnly), "resumption_rotation_scheduler_new_epoch_accept_only");
+  suite.expect(tlsResumptionSnapshotHasEpochRole(scheduled, thirdGeneration, TlsResumptionKeyRole::acceptOnly, 0), "resumption_rotation_scheduler_new_epoch_accept_only_phase0");
   suite.expect(brain.advanceTlsResumptionLifecycleForDeployment(plan, 1'700'000'101'550, false, false) == 0, "resumption_rotation_scheduler_blocks_without_new_acks");
 
   expectAck(containerA, thirdGeneration, true, "resumption_rotation_scheduler_records_ack_a");
@@ -6030,6 +6032,8 @@ static void testQuicWormholeStateRefreshReplaysToNeuronsFollowersAndContainers(T
   suite.expect(deployment.plan.wormholes[0].quicCidKeyState.rotatedAtMs == nowMs, "quic_wormhole_refresh_sets_rotated_at");
   suite.expect(deployment.plan.wormholes[0].quicCidKeyState.keyMaterialByIndex[0] != uint128_t(0), "quic_wormhole_refresh_sets_key_slot_0");
   suite.expect(deployment.plan.wormholes[0].quicCidKeyState.keyMaterialByIndex[1] != uint128_t(0), "quic_wormhole_refresh_sets_key_slot_1");
+  suite.expect(wormholeQuicCidKeyMaterialPhase(deployment.plan.wormholes[0].quicCidKeyState.keyMaterialByIndex[0]) == 0, "quic_wormhole_refresh_sets_key_slot_0_phase0");
+  suite.expect(wormholeQuicCidKeyMaterialPhase(deployment.plan.wormholes[0].quicCidKeyState.keyMaterialByIndex[1]) == 1, "quic_wormhole_refresh_sets_key_slot_1_phase1");
   suite.expect(container.wormholes.size() == 1, "quic_wormhole_refresh_updates_live_container_wormholes");
   suite.expect(equalSerializedObjects(container.wormholes[0], deployment.plan.wormholes[0]), "quic_wormhole_refresh_live_container_matches_plan");
   suite.expect(brain.persistCalls == 1, "quic_wormhole_refresh_persists_runtime_state");
@@ -6141,6 +6145,8 @@ static void testQuicWormholeRotationAndNoopPaths(TestSuite& suite)
   suite.expect(deployment.plan.wormholes[0].quicCidKeyState.rotationHours == 24, "quic_wormhole_refresh_defaults_rotation_hours");
   suite.expect(deployment.plan.wormholes[0].quicCidKeyState.activeKeyIndex == 1, "quic_wormhole_refresh_clamps_active_key_index");
   suite.expect(deployment.plan.wormholes[0].quicCidKeyState.rotatedAtMs == initialNowMs, "quic_wormhole_refresh_sets_missing_rotated_at");
+  suite.expect(wormholeQuicCidKeyMaterialPhase(deployment.plan.wormholes[0].quicCidKeyState.keyMaterialByIndex[0]) == 0, "quic_wormhole_refresh_normalizes_key_slot_0_phase0");
+  suite.expect(wormholeQuicCidKeyMaterialPhase(deployment.plan.wormholes[0].quicCidKeyState.keyMaterialByIndex[1]) == 1, "quic_wormhole_refresh_normalizes_key_slot_1_phase1");
   suite.expect(brain.persistCalls == 1, "quic_wormhole_refresh_persists_normalized_state");
 
   uint128_t slot0BeforeRotation = deployment.plan.wormholes[0].quicCidKeyState.keyMaterialByIndex[0];
@@ -6155,6 +6161,7 @@ static void testQuicWormholeRotationAndNoopPaths(TestSuite& suite)
   suite.expect(deployment.plan.wormholes[0].quicCidKeyState.activeKeyIndex == 0, "quic_wormhole_refresh_switches_to_inactive_key_after_rotation");
   suite.expect(deployment.plan.wormholes[0].quicCidKeyState.rotatedAtMs == initialNowMs + (2 * 60 * 60 * 1000), "quic_wormhole_refresh_updates_rotated_at_after_rotation");
   suite.expect(deployment.plan.wormholes[0].quicCidKeyState.keyMaterialByIndex[0] != slot0BeforeRotation, "quic_wormhole_refresh_rekeys_rotated_slot");
+  suite.expect(wormholeQuicCidKeyMaterialPhase(deployment.plan.wormholes[0].quicCidKeyState.keyMaterialByIndex[0]) == 0, "quic_wormhole_refresh_rotated_slot_keeps_phase0");
   suite.expect(brain.persistCalls == 2, "quic_wormhole_refresh_persists_rotated_state");
 }
 

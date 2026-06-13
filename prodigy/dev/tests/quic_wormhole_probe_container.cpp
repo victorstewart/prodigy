@@ -149,8 +149,7 @@ private:
         cidEncryptor,
         containerID,
         &nonceCursor,
-        reinterpret_cast<const struct sockaddr *>(&destination),
-        activeKeyIndex);
+        reinterpret_cast<const struct sockaddr *>(&destination));
     if (cid.id_len == 0)
     {
       failure = "cid_generation_failed";

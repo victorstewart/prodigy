@@ -19,6 +19,8 @@
 
 #include <macros/quic.h>
 
+#include <prodigy/biphasal.key.h>
+
 #include <switchboard/common/quic.cid.h>
 
 struct ProdigyQuicCID {
@@ -32,6 +34,7 @@ class ProdigyQuicCidEncryptor {
 private:
 
   EVP_CIPHER_CTX *context_ = nullptr;
+  uint8_t keyPhase_ = 0;
 
 public:
 
@@ -69,7 +72,13 @@ public:
       return false;
     }
 
+    keyPhase_ = prodigyBiphasalKeyPhase(key);
     return EVP_CIPHER_CTX_set_padding(context_, 0) == 1;
+  }
+
+  uint8_t keyPhase(void) const
+  {
+    return keyPhase_;
   }
 
   bool encryptBlock(const uint8_t plaintext[16], uint8_t ciphertext[16])
@@ -137,7 +146,7 @@ __attribute__((__always_inline__)) static inline ProdigyQuicCID prodigyGenerateQ
     const uint8_t container_id[5],
     uint32_t *nonceCursor,
     const struct sockaddr *destination,
-    uint8_t requiredEncryptedKeyIndex)
+    uint8_t requiredEncryptedKeyIndex = 2)
 {
   ProdigyQuicCID cid_returned = {};
 
@@ -146,7 +155,15 @@ __attribute__((__always_inline__)) static inline ProdigyQuicCID prodigyGenerateQ
     return cid_returned;
   }
 
-  requiredEncryptedKeyIndex &= 0x01;
+  if (requiredEncryptedKeyIndex > 1)
+  {
+    requiredEncryptedKeyIndex = encryptor.keyPhase();
+  }
+  else if (requiredEncryptedKeyIndex != encryptor.keyPhase())
+  {
+    return cid_returned;
+  }
+
   uint32_t nonce = *nonceCursor;
   for (uint32_t attempt = 0; attempt < 256; ++attempt)
   {
