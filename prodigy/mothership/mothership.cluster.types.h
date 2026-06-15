@@ -19,7 +19,12 @@ enum class MothershipClusterProvider : uint8_t {
   gcp = 1,
   aws = 2,
   azure = 3,
-  vultr = 4
+  vultr = 4,
+  cloudflare = 5,
+  route53 = 6,
+  gcpCloudDNS = 7,
+  azureDNS = 8,
+  vultrDNS = 9
 };
 
 enum class MothershipClusterControlKind : uint8_t {
@@ -257,6 +262,8 @@ public:
   String providerScope;
   String providerCredentialName;
   bool propagateProviderCredentialToProdigy = false;
+  MothershipClusterProvider dnsProvider = MothershipClusterProvider::unknown;
+  String dnsProviderCredentialName;
   MothershipProdigyClusterAwsConfig aws;
   MothershipProdigyClusterGcpConfig gcp;
   MothershipProdigyClusterAzureConfig azure;
@@ -302,6 +309,8 @@ static void serialize(S&& serializer, MothershipProdigyCluster& cluster)
   serializer.text1b(cluster.providerScope, UINT32_MAX);
   serializer.text1b(cluster.providerCredentialName, UINT32_MAX);
   serializer.value1b(cluster.propagateProviderCredentialToProdigy);
+  serializer.value1b(cluster.dnsProvider);
+  serializer.text1b(cluster.dnsProviderCredentialName, UINT32_MAX);
   serializer.object(cluster.aws);
   serializer.object(cluster.gcp);
   serializer.object(cluster.azure);
@@ -625,6 +634,16 @@ static inline bool mothershipClusterProviderSupportsManagedBGP(MothershipCluster
   return provider == MothershipClusterProvider::vultr;
 }
 
+static inline bool mothershipClusterProviderIsIaaS(MothershipClusterProvider provider)
+{
+  return provider == MothershipClusterProvider::gcp || provider == MothershipClusterProvider::aws || provider == MothershipClusterProvider::azure || provider == MothershipClusterProvider::vultr;
+}
+
+static inline bool mothershipClusterProviderIsDNS(MothershipClusterProvider provider)
+{
+  return provider == MothershipClusterProvider::cloudflare || provider == MothershipClusterProvider::route53 || provider == MothershipClusterProvider::gcpCloudDNS || provider == MothershipClusterProvider::azureDNS || provider == MothershipClusterProvider::vultrDNS;
+}
+
 static inline const char *mothershipClusterProviderName(MothershipClusterProvider provider)
 {
   switch (provider)
@@ -648,6 +667,26 @@ static inline const char *mothershipClusterProviderName(MothershipClusterProvide
     case MothershipClusterProvider::vultr:
       {
         return "vultr";
+      }
+    case MothershipClusterProvider::cloudflare:
+      {
+        return "cloudflare";
+      }
+    case MothershipClusterProvider::route53:
+      {
+        return "route53";
+      }
+    case MothershipClusterProvider::gcpCloudDNS:
+      {
+        return "gcp-cloud-dns";
+      }
+    case MothershipClusterProvider::azureDNS:
+      {
+        return "azure-dns";
+      }
+    case MothershipClusterProvider::vultrDNS:
+      {
+        return "vultr-dns";
       }
   }
 
@@ -677,6 +716,36 @@ static inline bool parseMothershipClusterProvider(const String& value, Mothershi
   if (value.equal("vultr"_ctv))
   {
     provider = MothershipClusterProvider::vultr;
+    return true;
+  }
+
+  if (value.equal("cloudflare"_ctv))
+  {
+    provider = MothershipClusterProvider::cloudflare;
+    return true;
+  }
+
+  if (value.equal("route53"_ctv) || value.equal("aws-route53"_ctv))
+  {
+    provider = MothershipClusterProvider::route53;
+    return true;
+  }
+
+  if (value.equal("gcp-cloud-dns"_ctv) || value.equal("google-cloud-dns"_ctv))
+  {
+    provider = MothershipClusterProvider::gcpCloudDNS;
+    return true;
+  }
+
+  if (value.equal("azure-dns"_ctv))
+  {
+    provider = MothershipClusterProvider::azureDNS;
+    return true;
+  }
+
+  if (value.equal("vultr-dns"_ctv))
+  {
+    provider = MothershipClusterProvider::vultrDNS;
     return true;
   }
 

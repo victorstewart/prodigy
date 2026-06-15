@@ -109,6 +109,7 @@ public:
   String impersonateServiceAccount;
   String credentialPath;
   String scope;
+  bytell_hash_map<String, String> metadata;
   bool allowPropagateToProdigy = false;
   int64_t createdAtMs = 0;
   int64_t updatedAtMs = 0;
@@ -124,6 +125,10 @@ static void serialize(S&& serializer, MothershipProviderCredential& credential)
   serializer.text1b(credential.impersonateServiceAccount, UINT32_MAX);
   serializer.text1b(credential.credentialPath, UINT32_MAX);
   serializer.text1b(credential.scope, UINT32_MAX);
+  serializer.ext(credential.metadata, bitsery::ext::BytellHashMap {}, [](S& serializer, String& key, String& value) {
+    serializer.text1b(key, UINT32_MAX);
+    serializer.text1b(value, UINT32_MAX);
+  });
   serializer.value1b(credential.allowPropagateToProdigy);
   serializer.value8b(credential.createdAtMs);
   serializer.value8b(credential.updatedAtMs);
@@ -208,6 +213,71 @@ static inline bool resolveMothershipClusterInlineProviderCredentialOverride(Moth
     credential.allowPropagateToProdigy = true;
   }
 
+  if (failure)
+  {
+    failure->clear();
+  }
+  return true;
+}
+
+static inline bool resolveMothershipClusterInlineDNSProviderCredentialOverride(MothershipProdigyCluster& cluster, MothershipProviderCredential& credential, String *failure = nullptr)
+{
+  if (cluster.dnsProvider == MothershipClusterProvider::unknown)
+  {
+    cluster.dnsProvider = credential.provider;
+  }
+  else if (credential.provider == MothershipClusterProvider::unknown)
+  {
+    credential.provider = cluster.dnsProvider;
+  }
+  else if (cluster.dnsProvider != credential.provider)
+  {
+    if (failure)
+    {
+      failure->assign("dnsProviderCredentialOverride provider does not match dnsProvider");
+    }
+    return false;
+  }
+
+  if (mothershipClusterProviderIsDNS(cluster.dnsProvider) == false)
+  {
+    if (failure)
+    {
+      failure->assign("dnsProviderCredentialOverride provider is not a DNS provider");
+    }
+    return false;
+  }
+
+  if (cluster.dnsProviderCredentialName.size() == 0)
+  {
+    if (credential.name.size() > 0)
+    {
+      cluster.dnsProviderCredentialName = credential.name;
+    }
+    else if (cluster.name.size() > 0)
+    {
+      cluster.dnsProviderCredentialName.snprintf<"{}-dns"_ctv>(cluster.name);
+    }
+  }
+
+  if (credential.name.size() == 0)
+  {
+    credential.name = cluster.dnsProviderCredentialName;
+  }
+  else if (cluster.dnsProviderCredentialName.size() == 0)
+  {
+    cluster.dnsProviderCredentialName = credential.name;
+  }
+  else if (credential.name.equals(cluster.dnsProviderCredentialName) == false)
+  {
+    if (failure)
+    {
+      failure->assign("dnsProviderCredentialOverride name does not match dnsProviderCredentialName");
+    }
+    return false;
+  }
+
+  credential.allowPropagateToProdigy = true;
   if (failure)
   {
     failure->clear();

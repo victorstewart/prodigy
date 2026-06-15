@@ -1673,29 +1673,29 @@ int main(void)
     brain.machines.insert(&active);
     brain.machines.insert(&inactive);
 
-    RegisteredRoutableAddress hosted = {};
+    DistributableExternalSubnet hosted = {};
     hosted.uuid = uint128_t(0xB001);
     hosted.name.assign("hosted-route"_ctv);
-    hosted.kind = RoutableAddressKind::testFakeAddress;
-    hosted.family = ExternalAddressFamily::ipv6;
     hosted.machineUUID = active.uuid;
-    hosted.address = IPAddress("2602:fac0:0:12ab:34cd::77", true);
-    brain.brainConfig.routableAddresses.push_back(hosted);
+    hosted.ingressScope = RoutableIngressScope::singleMachine;
+    hosted.usage = ExternalSubnetUsage::wormholes;
+    hosted.subnet = IPPrefix("2602:fac0:0:12ab:34cd::77", true, 128);
+    brain.brainConfig.distributableExternalSubnets.push_back(hosted);
 
-    RegisteredRoutableAddress duplicate = hosted;
+    DistributableExternalSubnet duplicate = hosted;
     duplicate.uuid = uint128_t(0xB002);
-    brain.brainConfig.routableAddresses.push_back(duplicate);
+    brain.brainConfig.distributableExternalSubnets.push_back(duplicate);
 
-    RegisteredRoutableAddress foreign = hosted;
+    DistributableExternalSubnet foreign = hosted;
     foreign.uuid = uint128_t(0xB003);
     foreign.machineUUID = inactive.uuid;
-    foreign.address = IPAddress("2602:fac0:0:12ab:34cd::99", true);
-    brain.brainConfig.routableAddresses.push_back(foreign);
+    foreign.subnet = IPPrefix("2602:fac0:0:12ab:34cd::99", true, 128);
+    brain.brainConfig.distributableExternalSubnets.push_back(foreign);
 
-    RegisteredRoutableAddress empty = hosted;
+    DistributableExternalSubnet empty = hosted;
     empty.uuid = uint128_t(0xB004);
-    empty.address = {};
-    brain.brainConfig.routableAddresses.push_back(empty);
+    empty.subnet = {};
+    brain.brainConfig.distributableExternalSubnets.push_back(empty);
 
     Vector<IPPrefix> prefixes = {};
     brain.testBuildHostedSwitchboardIngressPrefixes(&active, prefixes);
@@ -1706,8 +1706,8 @@ int main(void)
       bool sawForeignPrefix = false;
       for (const IPPrefix& prefix : prefixes)
       {
-        sawHostedPrefix = sawHostedPrefix || (prefix.cidr == 128 && prefix.containsAddress(hosted.address));
-        sawForeignPrefix = sawForeignPrefix || (prefix.cidr == 128 && prefix.containsAddress(foreign.address));
+        sawHostedPrefix = sawHostedPrefix || prefix.equals(hosted.subnet);
+        sawForeignPrefix = sawForeignPrefix || prefix.equals(foreign.subnet);
       }
       suite.expect(sawHostedPrefix && sawForeignPrefix, "build_hosted_switchboard_ingress_prefixes_matches_registered_addresses");
     }
@@ -1734,8 +1734,8 @@ int main(void)
         bool sawForeignPrefix = false;
         for (const IPPrefix& prefix : decoded)
         {
-          sawHostedPrefix = sawHostedPrefix || (prefix.cidr == 128 && prefix.containsAddress(hosted.address));
-          sawForeignPrefix = sawForeignPrefix || (prefix.cidr == 128 && prefix.containsAddress(foreign.address));
+          sawHostedPrefix = sawHostedPrefix || prefix.equals(hosted.subnet);
+          sawForeignPrefix = sawForeignPrefix || prefix.equals(foreign.subnet);
         }
         sawHostedPrefixes = sawHostedPrefix && sawForeignPrefix;
       }
@@ -1912,14 +1912,14 @@ int main(void)
     brain.machines.insert(&local);
     brain.machines.insert(&remote);
 
-    RegisteredRoutableAddress hostedIngress = {};
+    DistributableExternalSubnet hostedIngress = {};
     hostedIngress.uuid = uint128_t(0x9901);
     hostedIngress.name.assign("nametag"_ctv);
-    hostedIngress.kind = RoutableAddressKind::testFakeAddress;
-    hostedIngress.family = ExternalAddressFamily::ipv6;
     hostedIngress.machineUUID = remote.uuid;
-    hostedIngress.address = IPAddress("2001:db8:100::c", true);
-    brain.brainConfig.routableAddresses.push_back(hostedIngress);
+    hostedIngress.ingressScope = RoutableIngressScope::singleMachine;
+    hostedIngress.usage = ExternalSubnetUsage::wormholes;
+    hostedIngress.subnet = IPPrefix("2001:db8:100::c", true, 128);
+    brain.brainConfig.distributableExternalSubnets.push_back(hostedIngress);
 
     SwitchboardOverlayRoutingConfig config = {};
     suite.expect(brain.testBuildSwitchboardOverlayRoutingConfig(&local, config), "build_overlay_routing_config_builds_routes");

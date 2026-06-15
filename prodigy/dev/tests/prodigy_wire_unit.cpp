@@ -113,6 +113,17 @@ static bool equalTlsResumptionWormholeConfig(const TlsResumptionWormholeConfig& 
          equalStringVector(lhs.sniNames, rhs.sniNames);
 }
 
+static bool equalWormholeDNSConfig(const WormholeDNSConfig& lhs, const WormholeDNSConfig& rhs)
+{
+  return lhs.provider.equal(rhs.provider) &&
+         lhs.credentialName.equal(rhs.credentialName) &&
+         lhs.zone.equal(rhs.zone) &&
+         lhs.name.equal(rhs.name) &&
+         lhs.type.equal(rhs.type) &&
+         lhs.ttl == rhs.ttl &&
+         lhs.allowSingleMachine == rhs.allowSingleMachine;
+}
+
 static bool equalTlsResumptionSnapshots(const Vector<TlsResumptionSnapshot>& lhs, const Vector<TlsResumptionSnapshot>& rhs)
 {
   if (lhs.size() != rhs.size())
@@ -201,6 +212,22 @@ static bool equalCredentialDelta(const CredentialDelta& lhs, const CredentialDel
   return true;
 }
 
+static bool equalRoutableResourceLeaseReport(const RoutableResourceLeaseReport& lhs, const RoutableResourceLeaseReport& rhs)
+{
+  if (lhs.success != rhs.success || lhs.failure.equal(rhs.failure) == false || lhs.leases.size() != rhs.leases.size())
+  {
+    return false;
+  }
+  for (uint32_t index = 0; index < lhs.leases.size(); index += 1)
+  {
+    if ((lhs.leases[index] == rhs.leases[index]) == false)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
 static bool equalWhitehole(const Whitehole& lhs, const Whitehole& rhs)
 {
   return lhs.transport == rhs.transport &&
@@ -224,9 +251,11 @@ static bool equalWormhole(const Wormhole& lhs, const Wormhole& rhs)
          lhs.userCapacity.maximum == rhs.userCapacity.maximum &&
          lhs.hasQuicCidKeyState == rhs.hasQuicCidKeyState &&
          lhs.source == rhs.source &&
-         lhs.routableAddressUUID == rhs.routableAddressUUID &&
+         lhs.routablePrefixUUID == rhs.routablePrefixUUID &&
          lhs.hasTlsResumptionConfig == rhs.hasTlsResumptionConfig &&
          equalTlsResumptionWormholeConfig(lhs.tlsResumption, rhs.tlsResumption) &&
+         lhs.hasDNSConfig == rhs.hasDNSConfig &&
+         equalWormholeDNSConfig(lhs.dns, rhs.dns) &&
          lhs.quicCidKeyState.rotationHours == rhs.quicCidKeyState.rotationHours &&
          lhs.quicCidKeyState.activeKeyIndex == rhs.quicCidKeyState.activeKeyIndex &&
          lhs.quicCidKeyState.rotatedAtMs == rhs.quicCidKeyState.rotatedAtMs &&
@@ -506,10 +535,17 @@ static Wormhole makeContainerParametersWormhole(void)
   wormhole.userCapacity.minimum = 1;
   wormhole.userCapacity.maximum = 32;
   wormhole.hasQuicCidKeyState = true;
-  wormhole.source = ExternalAddressSource::registeredRoutableAddress;
-  wormhole.routableAddressUUID = uint128_t(0xAABBCCDD0011);
+  wormhole.source = ExternalAddressSource::registeredRoutablePrefix;
+  wormhole.routablePrefixUUID = uint128_t(0xAABBCCDD0011);
   wormhole.hasTlsResumptionConfig = true;
   wormhole.tlsResumption = makeTlsResumptionWormholeConfig();
+  wormhole.hasDNSConfig = true;
+  wormhole.dns.provider = "cloudflare"_ctv;
+  wormhole.dns.credentialName = "cf-prod"_ctv;
+  wormhole.dns.zone = "example.com"_ctv;
+  wormhole.dns.name = "api.example.com"_ctv;
+  wormhole.dns.type = "AAAA"_ctv;
+  wormhole.dns.ttl = 300;
   wormhole.quicCidKeyState.rotationHours = 12;
   wormhole.quicCidKeyState.activeKeyIndex = 1;
   wormhole.quicCidKeyState.rotatedAtMs = 123'456'789;
@@ -543,6 +579,29 @@ static CredentialDelta makeCredentialDelta(void)
   return delta;
 }
 
+static RoutableResourceLeaseReport makeRoutableResourceLeaseReport(void)
+{
+  RoutableResourceLeaseReport report = {};
+  report.success = true;
+
+  RoutableResourceLease lease = {};
+  lease.kind = RoutableResourceLeaseKind::dnsRecord;
+  lease.owner.applicationID = 501;
+  lease.owner.deploymentID = 6001;
+  lease.owner.lineageID = 7001;
+  lease.owner.name.assign("api"_ctv);
+  lease.registeredPrefixUUID = uint128_t(0x8888);
+  lease.address = IPAddress("203.0.113.10", false);
+  lease.dnsProvider.assign("cloudflare"_ctv);
+  lease.dnsCredentialName.assign("cf-prod"_ctv);
+  lease.dnsZone.assign("example.com"_ctv);
+  lease.dnsName.assign("api.example.com"_ctv);
+  lease.dnsType.assign("A"_ctv);
+  lease.dnsTTL = 300;
+  report.leases.push_back(std::move(lease));
+  return report;
+}
+
 template <typename T, typename Equal>
 static void expectWireRoundTrip(TestSuite& suite, const T& expected, const char *decodeName, const char *roundTripName, Equal equal)
 {
@@ -561,6 +620,7 @@ int main(void)
   expectWireRoundTrip(suite, makeTlsResumptionKeyEpoch(9), "tls_resumption_key_epoch_decode_state", "tls_resumption_key_epoch_roundtrip_state", prodigyTlsResumptionKeyEpochsEqual);
   expectWireRoundTrip(suite, makeTlsResumptionSnapshot(), "tls_resumption_snapshot_decode_state", "tls_resumption_snapshot_roundtrip_state", prodigyTlsResumptionSnapshotsEqual);
   expectWireRoundTrip(suite, makeTlsResumptionApplyResult(), "tls_resumption_apply_result_decode_state", "tls_resumption_apply_result_roundtrip_state", equalTlsResumptionApplyResult);
+  expectWireRoundTrip(suite, makeRoutableResourceLeaseReport(), "routable_resource_lease_report_decode_state", "routable_resource_lease_report_roundtrip_state", equalRoutableResourceLeaseReport);
 
   {
     ProdigyResumptionRegistry registry;

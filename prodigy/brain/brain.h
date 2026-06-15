@@ -26,6 +26,7 @@ static inline cppsort::verge_adapter<cppsort::ska_sorter> sorter;
 #include <prodigy/brain.reachability.h>
 #include <prodigy/cluster.bootstrap.h>
 #include <prodigy/cluster.machine.helpers.h>
+#include <prodigy/dns.provider.h>
 #include <prodigy/ingress.validation.h>
 #include <prodigy/routable.address.helpers.h>
 #include <prodigy/remote.bootstrap.h>
@@ -185,8 +186,11 @@ static inline bool brainAddCertificateSubjectAltNames(X509 *cert, const Vector<S
 
 inline void BrainBase::sendNeuronSwitchboardRoutableSubnets(void)
 {
+  Vector<DistributableExternalSubnet> subnets = {};
+  buildSwitchboardFleetRoutableSubnets(subnets);
+
   String serializedSubnets;
-  BitseryEngine::serialize(serializedSubnets, brainConfig.distributableExternalSubnets);
+  BitseryEngine::serialize(serializedSubnets, subnets);
 
   for (Machine *machine : machines)
   {
@@ -197,6 +201,18 @@ inline void BrainBase::sendNeuronSwitchboardRoutableSubnets(void)
 
     Message::construct(machine->neuron.wBuffer, NeuronTopic::configureSwitchboardRoutableSubnets, serializedSubnets);
     Ring::queueSend(&machine->neuron);
+  }
+}
+
+inline void BrainBase::buildSwitchboardFleetRoutableSubnets(Vector<DistributableExternalSubnet>& subnets) const
+{
+  subnets.clear();
+  for (const DistributableExternalSubnet& subnet : brainConfig.distributableExternalSubnets)
+  {
+    if (subnet.ingressScope == RoutableIngressScope::switchboardFleet)
+    {
+      subnets.push_back(subnet);
+    }
   }
 }
 
@@ -220,25 +236,12 @@ inline void BrainBase::buildHostedSwitchboardIngressPrefixes(Machine *machine, V
     prefixes.push_back(candidate);
   };
 
-  // Contract: every Switchboard instance must converge the same hosted
-  // ingress portal, target, and overlay routing state. Packets can enter
-  // through any Switchboard and still reach the same correct destination, so
-  // registered hosted prefixes are global routing data, not owner-local data
-  // filtered to address.machineUUID.
-  for (const RegisteredRoutableAddress& address : brainConfig.routableAddresses)
+  for (const DistributableExternalSubnet& subnet : brainConfig.distributableExternalSubnets)
   {
-    if (address.address.isNull())
+    if (subnet.ingressScope == RoutableIngressScope::singleMachine && subnet.machineUUID != 0 && subnet.subnet.network.isNull() == false)
     {
-      continue;
+      appendPrefixIfMissing(subnet.subnet.canonicalized());
     }
-
-    IPPrefix prefix = {};
-    if (makeHostedIngressPrefixForAddress(address.address, prefix) == false)
-    {
-      continue;
-    }
-
-    appendPrefixIfMissing(prefix);
   }
 }
 
@@ -503,9 +506,9 @@ inline bool BrainBase::buildSwitchboardOverlayRoutingConfig(Machine *machine, Sw
     }
   }
 
-  for (const RegisteredRoutableAddress& address : brainConfig.routableAddresses)
+  for (const DistributableExternalSubnet& subnet : brainConfig.distributableExternalSubnets)
   {
-    if (address.address.isNull() || address.machineUUID == 0 || address.machineUUID == machine->uuid)
+    if (subnet.ingressScope != RoutableIngressScope::singleMachine || subnet.machineUUID == 0 || subnet.machineUUID == machine->uuid || subnet.subnet.network.isNull())
     {
       continue;
     }
@@ -513,7 +516,7 @@ inline bool BrainBase::buildSwitchboardOverlayRoutingConfig(Machine *machine, Sw
     Machine *owner = nullptr;
     for (Machine *candidate : machines)
     {
-      if (candidate != nullptr && candidate->uuid == address.machineUUID)
+      if (candidate != nullptr && candidate->uuid == subnet.machineUUID)
       {
         owner = candidate;
         break;
@@ -525,13 +528,7 @@ inline bool BrainBase::buildSwitchboardOverlayRoutingConfig(Machine *machine, Sw
       continue;
     }
 
-    IPPrefix prefix = {};
-    if (makeHostedIngressPrefixForAddress(address.address, prefix) == false)
-    {
-      continue;
-    }
-
-    appendHostedIngressRouteIfMissing(prefix, owner->fragment);
+    appendHostedIngressRouteIfMissing(subnet.subnet.canonicalized(), owner->fragment);
   }
 
   return true;
@@ -583,7 +580,9 @@ inline void BrainBase::sendNeuronSwitchboardStateSync(Machine *machine)
   Message::construct(machine->neuron.wBuffer, NeuronTopic::configureRuntimeEnvironment, serializedEnvironment);
 
   String serializedSubnets;
-  BitseryEngine::serialize(serializedSubnets, brainConfig.distributableExternalSubnets);
+  Vector<DistributableExternalSubnet> subnets = {};
+  buildSwitchboardFleetRoutableSubnets(subnets);
+  BitseryEngine::serialize(serializedSubnets, subnets);
   Message::construct(machine->neuron.wBuffer, NeuronTopic::configureSwitchboardRoutableSubnets, serializedSubnets);
 
   Vector<IPPrefix> hostedPrefixes = {};
@@ -670,7 +669,7 @@ inline void BrainBase::sendNeuronOpenSwitchboardWormholes(ContainerView *contain
   bool refreshHostedIngressPrefixes = false;
   for (const Wormhole& wormhole : wormholes)
   {
-    if (wormhole.source == ExternalAddressSource::registeredRoutableAddress)
+    if (wormhole.source == ExternalAddressSource::registeredRoutablePrefix)
     {
       refreshHostedIngressPrefixes = true;
       break;
@@ -911,6 +910,7 @@ public:
   ino_t mothershipUnixSocketPathInode = 0;
   bytell_hash_map<uint64_t, Mothership *> spinApplicationMotherships;
   bytell_hash_map<uint128_t, Machine *> machinesByUUID;
+  ProdigyDNSProvider *dnsProvider = nullptr;
 
   bytell_hash_map<String, uint32_t> nReservedRequestedBySlug;
   bytell_hash_map<uint16_t, ApplicationTlsVaultFactory> tlsVaultFactoriesByApp;
@@ -1564,6 +1564,7 @@ public:
 
     masterAuthorityRuntimeState.statefulWorkerTopologyUpgradeOperations = statefulWorkerTopologyUpgradeRuntimeState;
     masterAuthorityRuntimeState.deferredStatefulScaleIntents = deferredStatefulScaleIntentRuntimeState;
+    masterAuthorityRuntimeState.routableResourceLeases = routableResourceLeaseRuntimeState;
     masterAuthorityRuntimeState.hasCompletedInitialMasterElection = hasCompletedInitialMasterElection;
     masterAuthorityRuntimeState.nextMintedClientTlsGeneration = nextMintedClientTlsGeneration;
     masterAuthorityRuntimeState.nextTlsResumptionGeneration = nextTlsResumptionGeneration;
@@ -1579,6 +1580,775 @@ public:
   void noteDeferredStatefulScaleIntentRuntimeStateChanged(void) override
   {
     noteMasterAuthorityRuntimeStateChanged();
+  }
+
+  void noteRoutableResourceLeaseRuntimeStateChanged(void) override
+  {
+    noteMasterAuthorityRuntimeStateChanged();
+  }
+
+  virtual ProdigyDNSProvider *resolveDNSProvider(const String& provider)
+  {
+    if (dnsProvider == nullptr || brainConfig.dnsProvider.size() == 0 || routableResourceDNSPartEquals(provider, brainConfig.dnsProvider, false) == false)
+    {
+      return nullptr;
+    }
+    return dnsProvider->supportsProvider(provider) ? dnsProvider : nullptr;
+  }
+
+  bool applyDNSRecordLease(const RoutableResourceLease& lease, bool remove, String& failure)
+  {
+    failure.clear();
+    if (lease.kind != RoutableResourceLeaseKind::dnsRecord)
+    {
+      return true;
+    }
+
+    ProdigyDNSRecordBinding binding = {};
+    if (prodigyBuildDNSRecordBinding(lease, binding, &failure) == false)
+    {
+      return false;
+    }
+
+    const ApiCredential *credential = findDNSCredential(lease.owner.applicationID, lease.dnsCredentialName);
+    if (credential == nullptr)
+    {
+      failure.assign("DNS credential is not registered"_ctv);
+      return false;
+    }
+    if (routableResourceDNSPartEquals(credential->provider, lease.dnsProvider, false) == false)
+    {
+      failure.assign("DNS credential provider mismatch"_ctv);
+      return false;
+    }
+
+    ProdigyDNSProvider *provider = resolveDNSProvider(lease.dnsProvider);
+    if (provider == nullptr)
+    {
+      failure.assign("DNS provider is not configured"_ctv);
+      return false;
+    }
+
+    return remove ? provider->remove(binding, *credential, failure) : provider->upsert(binding, *credential, failure);
+  }
+
+  bool applyDeploymentDNSRecordLeases(const Vector<RoutableResourceLease>& leases, String& failure)
+  {
+    failure.clear();
+    Vector<RoutableResourceLease> applied = {};
+    for (const RoutableResourceLease& lease : leases)
+    {
+      if (lease.kind != RoutableResourceLeaseKind::dnsRecord)
+      {
+        continue;
+      }
+      if (applyDNSRecordLease(lease, false, failure) == false)
+      {
+        String rollbackFailure = {};
+        for (const RoutableResourceLease& rollback : applied)
+        {
+          if (applyDNSRecordLease(rollback, true, rollbackFailure) == false)
+          {
+            basics_log("dns rollback failed failure=%s\n", rollbackFailure.c_str());
+          }
+        }
+        return false;
+      }
+      applied.push_back(lease);
+    }
+    return true;
+  }
+
+  uint32_t reconcileDNSRecordLeases(String *failure = nullptr)
+  {
+    if (failure)
+    {
+      failure->clear();
+    }
+    if (weAreMaster == false)
+    {
+      return 0;
+    }
+
+    uint32_t applied = 0;
+    for (const RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
+    {
+      if (lease.kind != RoutableResourceLeaseKind::dnsRecord)
+      {
+        continue;
+      }
+
+      String leaseFailure = {};
+      if (applyDNSRecordLease(lease, false, leaseFailure))
+      {
+        applied += 1;
+        continue;
+      }
+
+      if (failure != nullptr && failure->size() == 0)
+      {
+        *failure = leaseFailure;
+      }
+      basics_log("dns reconcile failed failure=%s\n", leaseFailure.c_str());
+    }
+    return applied;
+  }
+
+  bool resolveDeploymentWormholeDNSBinding(const DeploymentPlan& plan, Wormhole& wormhole, String& failure) const
+  {
+    failure.clear();
+    if (wormhole.hasDNSConfig == false || wormhole.dns.bindingName.size() == 0)
+    {
+      return true;
+    }
+
+    RoutableResourceLeaseOwner owner = deploymentRoutableResourceLeaseOwner(plan);
+    const RoutableResourceLease *binding = nullptr;
+    for (const RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
+    {
+      if (lease.kind != RoutableResourceLeaseKind::dnsRecord || lease.owner.applicationID != plan.config.applicationID || lease.owner.name.equals(wormhole.dns.bindingName) == false || routableResourceLeaseOwnersCompatible(lease.owner, owner) == false)
+      {
+        continue;
+      }
+      if (binding != nullptr)
+      {
+        failure.assign("wormhole DNS binding name is ambiguous"_ctv);
+        return false;
+      }
+      binding = &lease;
+    }
+    if (binding == nullptr)
+    {
+      failure.assign("wormhole DNS binding was not found"_ctv);
+      return false;
+    }
+    if (binding->address.isNull() || binding->registeredPrefixUUID == 0)
+    {
+      failure.assign("wormhole DNS binding has no attached routable address"_ctv);
+      return false;
+    }
+
+    String requestedType = wormhole.dns.type;
+    if (requestedType.size() > 0 && normalizeDNSRecordType(requestedType) == false)
+    {
+      failure.assign("wormhole DNS record type must be A, AAAA, CNAME, or TXT"_ctv);
+      return false;
+    }
+    if ((wormhole.dns.provider.size() > 0 && routableResourceDNSPartEquals(wormhole.dns.provider, binding->dnsProvider, false) == false) ||
+        (wormhole.dns.credentialName.size() > 0 && wormhole.dns.credentialName.equals(binding->dnsCredentialName) == false) ||
+        (wormhole.dns.zone.size() > 0 && routableResourceDNSPartEquals(wormhole.dns.zone, binding->dnsZone, true) == false) ||
+        (wormhole.dns.name.size() > 0 && routableResourceDNSPartEquals(wormhole.dns.name, binding->dnsName, true) == false) ||
+        (requestedType.size() > 0 && routableResourceDNSPartEquals(requestedType, binding->dnsType, false) == false) ||
+        (wormhole.dns.ttl != 0 && wormhole.dns.ttl != binding->dnsTTL))
+    {
+      failure.assign("wormhole DNS binding config conflicts with binding"_ctv);
+      return false;
+    }
+
+    String bindingName = wormhole.dns.bindingName;
+    bool allowSingleMachine = wormhole.dns.allowSingleMachine;
+    wormhole.source = ExternalAddressSource::registeredRoutablePrefix;
+    wormhole.routablePrefixUUID = binding->registeredPrefixUUID;
+    wormhole.externalAddress = binding->address;
+    wormhole.dns = WormholeDNSConfig();
+    wormhole.dns.bindingName = bindingName;
+    wormhole.dns.provider = binding->dnsProvider;
+    wormhole.dns.credentialName = binding->dnsCredentialName;
+    wormhole.dns.zone = binding->dnsZone;
+    wormhole.dns.name = binding->dnsName;
+    wormhole.dns.type = binding->dnsType;
+    if (wormhole.dns.type.size() == 0)
+    {
+      wormhole.dns.type.assign(wormhole.externalAddress.is6 ? "AAAA" : "A");
+    }
+    wormhole.dns.ttl = binding->dnsTTL;
+    wormhole.dns.allowSingleMachine = allowSingleMachine;
+    return true;
+  }
+
+  bool reserveDeploymentWormholeAddressLeases(const DeploymentPlan& plan, String& failure, bool commit)
+  {
+    failure.clear();
+    RoutableResourceLeaseOwner owner = deploymentRoutableResourceLeaseOwner(plan);
+
+    Vector<RoutableResourceLease> leases = {};
+    auto reserveLease = [&](RoutableResourceLease&& lease, StringType auto&& conflictFailure, StringType auto&& duplicateFailure) -> bool {
+      bool present = false;
+      for (const RoutableResourceLease& existing : routableResourceLeaseRuntimeState)
+      {
+        if (existing.kind == lease.kind && routableResourceLeaseResourcesIntersect(existing, lease) && routableResourceLeaseOwnersCompatible(existing.owner, lease.owner))
+        {
+          present = true;
+          break;
+        }
+        if (routableResourceLeasesConflict(existing, lease))
+        {
+          failure.assign(conflictFailure);
+          return false;
+        }
+      }
+      for (const RoutableResourceLease& pending : leases)
+      {
+        if (pending.kind != lease.kind || routableResourceLeaseResourcesIntersect(pending, lease) == false)
+        {
+          continue;
+        }
+        if (lease.kind == RoutableResourceLeaseKind::dnsRecord)
+        {
+          failure.assign(duplicateFailure);
+          return false;
+        }
+        present = true;
+        break;
+      }
+      if (present == false)
+      {
+        leases.push_back(std::move(lease));
+      }
+      return true;
+    };
+
+    for (const Wormhole& wormhole : plan.wormholes)
+    {
+      if (wormhole.externalAddress.isNull())
+      {
+        failure.assign("wormhole routable address is empty"_ctv);
+        return false;
+      }
+
+      RoutableResourceLease lease = {};
+      lease.kind = RoutableResourceLeaseKind::wormholeAddress;
+      lease.owner = owner;
+      lease.owner.name = wormhole.name;
+      lease.registeredPrefixUUID = wormhole.routablePrefixUUID;
+      lease.address = wormhole.externalAddress;
+
+      if (reserveLease(std::move(lease), "wormhole routable address is already owned"_ctv, "wormhole routable address is already declared"_ctv) == false)
+      {
+        return false;
+      }
+
+      if (wormhole.hasDNSConfig)
+      {
+        String dnsType = {};
+        if (wormholeDNSRecordType(wormhole, dnsType, &failure) == false)
+        {
+          return false;
+        }
+
+        RoutableResourceLease dnsLease = {};
+        dnsLease.kind = RoutableResourceLeaseKind::dnsRecord;
+        dnsLease.owner = owner;
+        dnsLease.owner.name = wormhole.name;
+        dnsLease.registeredPrefixUUID = wormhole.routablePrefixUUID;
+        dnsLease.address = wormhole.externalAddress;
+        dnsLease.dnsProvider = wormhole.dns.provider;
+        dnsLease.dnsCredentialName = wormhole.dns.credentialName;
+        dnsLease.dnsZone = wormhole.dns.zone;
+        dnsLease.dnsName = wormhole.dns.name;
+        dnsLease.dnsType = dnsType;
+        dnsLease.dnsTTL = wormhole.dns.ttl;
+        if (reserveLease(std::move(dnsLease), "wormhole DNS record is already owned"_ctv, "wormhole DNS record is already declared"_ctv) == false)
+        {
+          return false;
+        }
+      }
+    }
+
+    if (commit && leases.empty() == false)
+    {
+      if (applyDeploymentDNSRecordLeases(leases, failure) == false)
+      {
+        return false;
+      }
+      routableResourceLeaseRuntimeState.insert(routableResourceLeaseRuntimeState.end(), leases.begin(), leases.end());
+      noteRoutableResourceLeaseRuntimeStateChanged();
+    }
+    return true;
+  }
+
+  bool transferRoutableResourceLeaseToApplicationHead(RoutableResourceLease& lease)
+  {
+    if (lease.kind != RoutableResourceLeaseKind::wormholeAddress && lease.kind != RoutableResourceLeaseKind::whiteholeAddressPort && lease.kind != RoutableResourceLeaseKind::dnsRecord)
+    {
+      return false;
+    }
+
+    auto appIt = deploymentsByApp.find(lease.owner.applicationID);
+    if (appIt == deploymentsByApp.end() || appIt->second == nullptr || appIt->second->plan.config.deploymentID() == lease.owner.deploymentID)
+    {
+      return false;
+    }
+
+    RoutableResourceLeaseOwner owner = deploymentRoutableResourceLeaseOwner(appIt->second->plan);
+    if (routableResourceLeaseOwnersCompatible(lease.owner, owner) == false)
+    {
+      return false;
+    }
+
+    if (lease.kind == RoutableResourceLeaseKind::whiteholeAddressPort)
+    {
+      for (const auto& [shardGroup, containers] : appIt->second->containersByShardGroup)
+      {
+        (void)shardGroup;
+        for (ContainerView *container : containers)
+        {
+          if (container == nullptr || container->state == ContainerState::destroying || container->state == ContainerState::destroyed)
+          {
+            continue;
+          }
+          for (const Whitehole& whitehole : container->whiteholes)
+          {
+            if (whitehole.hasAddress && whitehole.address.equals(lease.address) && whitehole.sourcePort == lease.sourcePort)
+            {
+              lease.owner = owner;
+              return true;
+            }
+          }
+        }
+      }
+      return false;
+    }
+
+    for (const Wormhole& wormhole : appIt->second->plan.wormholes)
+    {
+      if (wormhole.externalAddress.equals(lease.address) == false)
+      {
+        continue;
+      }
+      if (lease.kind == RoutableResourceLeaseKind::dnsRecord)
+      {
+        String dnsType = {};
+        if (wormhole.hasDNSConfig == false || wormholeDNSRecordType(wormhole, dnsType) == false)
+        {
+          continue;
+        }
+
+        RoutableResourceLease candidate = {};
+        candidate.kind = RoutableResourceLeaseKind::dnsRecord;
+        candidate.dnsProvider = wormhole.dns.provider;
+        candidate.dnsCredentialName = wormhole.dns.credentialName;
+        candidate.dnsZone = wormhole.dns.zone;
+        candidate.dnsName = wormhole.dns.name;
+        candidate.dnsType = dnsType;
+        candidate.dnsTTL = wormhole.dns.ttl;
+        if (routableResourceDNSIdentityMatches(lease, candidate) == false)
+        {
+          continue;
+        }
+
+        lease.dnsProvider = candidate.dnsProvider;
+        lease.dnsCredentialName = candidate.dnsCredentialName;
+        lease.dnsZone = candidate.dnsZone;
+        lease.dnsName = candidate.dnsName;
+        lease.dnsType = candidate.dnsType;
+        lease.dnsTTL = candidate.dnsTTL;
+      }
+
+      lease.owner = owner;
+      lease.owner.name = wormhole.name;
+      lease.registeredPrefixUUID = wormhole.routablePrefixUUID;
+      lease.address = wormhole.externalAddress;
+      return true;
+    }
+
+    return false;
+  }
+
+  bool validateDNSBindingLease(RoutableResourceLease& lease, String& failure) const
+  {
+    failure.clear();
+    lease.kind = RoutableResourceLeaseKind::dnsRecord;
+    if (lease.owner.applicationID == 0)
+    {
+      failure.assign("DNS binding applicationID required"_ctv);
+      return false;
+    }
+    if (lease.owner.name.size() == 0 || lease.dnsProvider.size() == 0 || lease.dnsCredentialName.size() == 0 || lease.dnsZone.size() == 0 || lease.dnsName.size() == 0 || lease.dnsTTL == 0)
+    {
+      failure.assign("DNS binding requires bindingName, provider, credentialName, zone, name, and ttl"_ctv);
+      return false;
+    }
+    if (lease.address.isNull() || lease.registeredPrefixUUID == 0)
+    {
+      failure.assign("DNS binding requires routablePrefixUUID and address"_ctv);
+      return false;
+    }
+    if (brainConfig.dnsProvider.size() == 0 || routableResourceDNSPartEquals(lease.dnsProvider, brainConfig.dnsProvider, false) == false)
+    {
+      failure.assign("DNS binding provider is not enabled for this cluster"_ctv);
+      return false;
+    }
+
+    const DistributableExternalSubnet *prefix = findRegisteredRoutablePrefix(brainConfig.distributableExternalSubnets, lease.registeredPrefixUUID);
+    if (prefix == nullptr)
+    {
+      failure.assign("DNS binding routablePrefixUUID is not registered"_ctv);
+      return false;
+    }
+    if (distributableExternalSubnetAllowsWormholes(*prefix) == false)
+    {
+      failure.assign("DNS binding registered prefix is not usable for wormholes"_ctv);
+      return false;
+    }
+    if (prefix->ingressScope != RoutableIngressScope::switchboardFleet)
+    {
+      failure.assign("DNS binding requires switchboardFleet ingressScope"_ctv);
+      return false;
+    }
+    if (prefix->subnet.canonicalized().containsAddress(lease.address) == false)
+    {
+      failure.assign("DNS binding address is outside registered routable prefix"_ctv);
+      return false;
+    }
+
+    if (lease.dnsType.size() == 0)
+    {
+      lease.dnsType.assign(lease.address.is6 ? "AAAA" : "A");
+    }
+    if (normalizeDNSRecordType(lease.dnsType) == false)
+    {
+      failure.assign("DNS binding record type must be A, AAAA, CNAME, or TXT"_ctv);
+      return false;
+    }
+    if ((lease.dnsType.equal("A"_ctv) && lease.address.is6) || (lease.dnsType.equal("AAAA"_ctv) && lease.address.is6 == false) || lease.dnsType.equal("CNAME"_ctv) || lease.dnsType.equal("TXT"_ctv))
+    {
+      failure.assign("DNS binding record type must match the address family"_ctv);
+      return false;
+    }
+
+    if (lease.owner.lineageID == 0)
+    {
+      lease.owner.lineageID = lease.owner.applicationID;
+    }
+
+    const ApiCredential *credential = findDNSCredential(lease.owner.applicationID, lease.dnsCredentialName);
+    if (credential == nullptr)
+    {
+      failure.assign("DNS binding credential is not registered"_ctv);
+      return false;
+    }
+    if (routableResourceDNSPartEquals(credential->provider, lease.dnsProvider, false) == false)
+    {
+      failure.assign("DNS binding credential provider mismatch"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  static RoutableResourceLease dnsBindingAddressLease(const RoutableResourceLease& dnsLease)
+  {
+    RoutableResourceLease lease = {};
+    lease.kind = RoutableResourceLeaseKind::wormholeAddress;
+    lease.owner = dnsLease.owner;
+    lease.registeredPrefixUUID = dnsLease.registeredPrefixUUID;
+    lease.address = dnsLease.address;
+    return lease;
+  }
+
+  bool routablePrefixHasOwnedResourceLease(uint128_t prefixUUID) const
+  {
+    for (const RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
+    {
+      if (prefixUUID != 0 && lease.registeredPrefixUUID == prefixUUID)
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool deploymentUsesDNSBinding(const DeploymentPlan& plan, const RoutableResourceLease& dnsLease) const
+  {
+    RoutableResourceLeaseOwner owner = deploymentRoutableResourceLeaseOwner(plan);
+    if (routableResourceLeaseOwnersCompatible(dnsLease.owner, owner) == false)
+    {
+      return false;
+    }
+    for (const Wormhole& wormhole : plan.wormholes)
+    {
+      if (wormhole.hasDNSConfig == false)
+      {
+        continue;
+      }
+      if (wormhole.dns.bindingName.size() > 0 && wormhole.dns.bindingName.equals(dnsLease.owner.name))
+      {
+        return true;
+      }
+      if (wormhole.externalAddress.equals(dnsLease.address) == false)
+      {
+        continue;
+      }
+
+      String dnsType = {};
+      if (wormholeDNSRecordType(wormhole, dnsType) == false)
+      {
+        continue;
+      }
+      RoutableResourceLease candidate = {};
+      candidate.kind = RoutableResourceLeaseKind::dnsRecord;
+      candidate.dnsProvider = wormhole.dns.provider;
+      candidate.dnsZone = wormhole.dns.zone;
+      candidate.dnsName = wormhole.dns.name;
+      candidate.dnsType = dnsType;
+      if (routableResourceDNSIdentityMatches(dnsLease, candidate))
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool dnsBindingLeaseInUse(const RoutableResourceLease& dnsLease) const
+  {
+    for (const auto& [deploymentID, deployment] : deployments)
+    {
+      (void)deploymentID;
+      if (deployment != nullptr && deploymentUsesDNSBinding(deployment->plan, dnsLease))
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool upsertDNSBindingLease(RoutableResourceLease lease, RoutableResourceLeaseReport& response)
+  {
+    response = {};
+    if (validateDNSBindingLease(lease, response.failure) == false)
+    {
+      return false;
+    }
+
+    RoutableResourceLease addressLease = dnsBindingAddressLease(lease);
+    Vector<RoutableResourceLease> retained;
+    retained.reserve(routableResourceLeaseRuntimeState.size() + 2);
+    for (const RoutableResourceLease& existing : routableResourceLeaseRuntimeState)
+    {
+      if (existing.kind == RoutableResourceLeaseKind::dnsRecord && existing.owner.name.equals(lease.owner.name) && routableResourceLeaseOwnersCompatible(existing.owner, lease.owner) &&
+          (routableResourceDNSIdentityMatches(existing, lease) == false || existing.registeredPrefixUUID != lease.registeredPrefixUUID || existing.address.equals(lease.address) == false))
+      {
+        response.failure.assign("DNS binding name is already owned"_ctv);
+        return false;
+      }
+      if (existing.kind == RoutableResourceLeaseKind::dnsRecord && routableResourceDNSIdentityMatches(existing, lease) && routableResourceLeaseOwnersCompatible(existing.owner, lease.owner))
+      {
+        continue;
+      }
+      if (existing.kind == RoutableResourceLeaseKind::wormholeAddress && existing.registeredPrefixUUID == lease.registeredPrefixUUID && existing.address.equals(lease.address) && existing.owner == lease.owner)
+      {
+        continue;
+      }
+      retained.push_back(existing);
+    }
+    for (const RoutableResourceLease& existing : retained)
+    {
+      if (routableResourceLeasesConflict(existing, addressLease) || routableResourceLeasesConflict(existing, lease))
+      {
+        response.failure.assign("DNS binding conflicts with an owned routable resource"_ctv);
+        return false;
+      }
+    }
+    if (applyDNSRecordLease(lease, false, response.failure) == false)
+    {
+      return false;
+    }
+
+    retained.push_back(addressLease);
+    retained.push_back(lease);
+    routableResourceLeaseRuntimeState = std::move(retained);
+    noteRoutableResourceLeaseRuntimeStateChanged();
+    response.leases.push_back(addressLease);
+    response.leases.push_back(lease);
+    response.success = true;
+    return true;
+  }
+
+  bool deleteDNSBindingLease(RoutableResourceLease request, RoutableResourceLeaseReport& response)
+  {
+    response = {};
+    request.kind = RoutableResourceLeaseKind::dnsRecord;
+    if (request.dnsProvider.size() == 0 || request.dnsZone.size() == 0 || request.dnsName.size() == 0 || request.dnsType.size() == 0)
+    {
+      response.failure.assign("delete DNS binding requires provider, zone, name, and type"_ctv);
+      return false;
+    }
+    if (normalizeDNSRecordType(request.dnsType) == false)
+    {
+      response.failure.assign("delete DNS binding record type invalid"_ctv);
+      return false;
+    }
+
+    const RoutableResourceLease *matched = nullptr;
+    for (const RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
+    {
+      if (lease.kind == RoutableResourceLeaseKind::dnsRecord && routableResourceDNSIdentityMatches(lease, request))
+      {
+        matched = &lease;
+        break;
+      }
+    }
+    if (matched == nullptr)
+    {
+      response.success = true;
+      return true;
+    }
+
+    RoutableResourceLease dnsLease = *matched;
+    RoutableResourceLease addressLease = dnsBindingAddressLease(dnsLease);
+    if (dnsBindingLeaseInUse(dnsLease))
+    {
+      response.failure.assign("DNS binding is in use"_ctv);
+      return false;
+    }
+    if (applyDNSRecordLease(dnsLease, true, response.failure) == false)
+    {
+      return false;
+    }
+
+    for (auto it = routableResourceLeaseRuntimeState.begin(); it != routableResourceLeaseRuntimeState.end();)
+    {
+      if ((it->kind == RoutableResourceLeaseKind::dnsRecord && routableResourceDNSIdentityMatches(*it, dnsLease)) ||
+          (it->kind == RoutableResourceLeaseKind::wormholeAddress && routableResourceLeaseResourcesIntersect(*it, addressLease) && it->owner == addressLease.owner))
+      {
+        it = routableResourceLeaseRuntimeState.erase(it);
+        continue;
+      }
+      ++it;
+    }
+    noteRoutableResourceLeaseRuntimeStateChanged();
+    response.leases.push_back(dnsLease);
+    response.success = true;
+    return true;
+  }
+
+  bool validateDeploymentWormholeDNSConfig(const DeploymentPlan& plan, const Wormhole& wormhole, String& failure) const
+  {
+    failure.clear();
+    if (wormhole.hasDNSConfig == false)
+    {
+      return true;
+    }
+    if (wormhole.source != ExternalAddressSource::registeredRoutablePrefix)
+    {
+      failure.assign("wormhole DNS requires source=registeredRoutablePrefix"_ctv);
+      return false;
+    }
+    if (wormhole.externalAddress.isNull())
+    {
+      failure.assign("wormhole DNS requires a claimed routable address"_ctv);
+      return false;
+    }
+    if (wormhole.dns.provider.size() == 0 || wormhole.dns.credentialName.size() == 0 || wormhole.dns.zone.size() == 0 || wormhole.dns.name.size() == 0 || wormhole.dns.ttl == 0)
+    {
+      failure.assign("wormhole DNS config requires provider, credentialName, zone, name, and ttl"_ctv);
+      return false;
+    }
+    if (brainConfig.dnsProvider.size() == 0)
+    {
+      failure.assign("cluster DNS provider is not configured"_ctv);
+      return false;
+    }
+    if (routableResourceDNSPartEquals(wormhole.dns.provider, brainConfig.dnsProvider, false) == false)
+    {
+      failure.assign("wormhole DNS provider is not enabled for this cluster"_ctv);
+      return false;
+    }
+
+    const DistributableExternalSubnet *prefix = findRegisteredRoutablePrefix(brainConfig.distributableExternalSubnets, wormhole.routablePrefixUUID);
+    if (prefix == nullptr)
+    {
+      failure.assign("wormhole DNS routablePrefixUUID is not registered"_ctv);
+      return false;
+    }
+    if (distributableExternalSubnetAllowsWormholes(*prefix) == false)
+    {
+      failure.assign("wormhole DNS registered prefix is not usable for wormholes"_ctv);
+      return false;
+    }
+    if (prefix->subnet.canonicalized().containsAddress(wormhole.externalAddress) == false)
+    {
+      failure.assign("wormhole DNS claimed address is outside registered routable prefix"_ctv);
+      return false;
+    }
+    if (prefix->ingressScope == RoutableIngressScope::singleMachine && wormhole.dns.allowSingleMachine == false)
+    {
+      failure.assign("wormhole DNS on singleMachine prefixes requires allowSingleMachine=true"_ctv);
+      return false;
+    }
+
+    String dnsType = {};
+    if (wormholeDNSRecordType(wormhole, dnsType, &failure) == false)
+    {
+      return false;
+    }
+
+    const ApiCredential *credential = findDNSCredential(plan.config.applicationID, wormhole.dns.credentialName);
+    if (credential == nullptr)
+    {
+      failure.assign("wormhole DNS credential is not registered"_ctv);
+      return false;
+    }
+    if (routableResourceDNSPartEquals(credential->provider, wormhole.dns.provider, false) == false)
+    {
+      failure.assign("wormhole DNS credential provider mismatch"_ctv);
+      return false;
+    }
+
+    return true;
+  }
+
+  uint32_t releaseRoutableResourceLeasesForDeployment(uint64_t deploymentID) override
+  {
+    uint32_t changed = 0;
+    for (RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
+    {
+      if (lease.owner.deploymentID == deploymentID && transferRoutableResourceLeaseToApplicationHead(lease))
+      {
+        changed += 1;
+      }
+    }
+
+    bool dnsDeleteFailed = false;
+    for (const RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
+    {
+      if (lease.owner.deploymentID != deploymentID || lease.kind != RoutableResourceLeaseKind::dnsRecord)
+      {
+        continue;
+      }
+
+      String failure = {};
+      if (applyDNSRecordLease(lease, true, failure) == false)
+      {
+        dnsDeleteFailed = true;
+        basics_log("dns delete failed failure=%s\n", failure.c_str());
+      }
+    }
+    if (dnsDeleteFailed)
+    {
+      if (changed > 0)
+      {
+        noteRoutableResourceLeaseRuntimeStateChanged();
+      }
+      return changed;
+    }
+
+    for (auto it = routableResourceLeaseRuntimeState.begin(); it != routableResourceLeaseRuntimeState.end();)
+    {
+      if (it->owner.deploymentID != deploymentID)
+      {
+        ++it;
+        continue;
+      }
+
+      it = routableResourceLeaseRuntimeState.erase(it);
+      changed += 1;
+    }
+    if (changed > 0)
+    {
+      noteRoutableResourceLeaseRuntimeStateChanged();
+    }
+    return changed;
   }
 
   void upsertManagedMachineSchemaConfig(const ProdigyManagedMachineSchema& managedSchema)
@@ -2223,6 +2993,7 @@ public:
     hasCompletedInitialMasterElection = masterAuthorityRuntimeState.hasCompletedInitialMasterElection;
     statefulWorkerTopologyUpgradeRuntimeState = masterAuthorityRuntimeState.statefulWorkerTopologyUpgradeOperations;
     deferredStatefulScaleIntentRuntimeState = masterAuthorityRuntimeState.deferredStatefulScaleIntents;
+    routableResourceLeaseRuntimeState = masterAuthorityRuntimeState.routableResourceLeases;
     if (masterAuthorityRuntimeState.nextPendingAddMachinesOperationID == 0)
     {
       masterAuthorityRuntimeState.nextPendingAddMachinesOperationID = 1;
@@ -2236,6 +3007,7 @@ public:
     restoreTlsResumptionSnapshotsByWormhole(masterAuthorityRuntimeState.tlsResumptionSnapshotsByWormhole, false);
     restorePersistentUpdateSelfState(masterAuthorityRuntimeState.updateSelf);
     syncManagedMachineSchemaConfigs(previousSchemas, masterAuthorityRuntimeState.machineSchemas);
+    (void)reconcileDNSRecordLeases();
   }
 
   bool applyReplicatedMasterAuthorityRuntimeState(const ProdigyMasterAuthorityRuntimeState& incoming, bool persist = true)
@@ -2274,10 +3046,12 @@ public:
     }
     statefulWorkerTopologyUpgradeRuntimeState = masterAuthorityRuntimeState.statefulWorkerTopologyUpgradeOperations;
     deferredStatefulScaleIntentRuntimeState = masterAuthorityRuntimeState.deferredStatefulScaleIntents;
+    routableResourceLeaseRuntimeState = masterAuthorityRuntimeState.routableResourceLeases;
     nextMintedClientTlsGeneration = (sanitizedIncoming.nextMintedClientTlsGeneration == 0) ? 1 : sanitizedIncoming.nextMintedClientTlsGeneration;
     nextTlsResumptionGeneration = sanitizedIncoming.nextTlsResumptionGeneration;
     restoreTlsResumptionSnapshotsByWormhole(sanitizedIncoming.tlsResumptionSnapshotsByWormhole, true);
     syncManagedMachineSchemaConfigs(previousSchemas, masterAuthorityRuntimeState.machineSchemas);
+    (void)reconcileDNSRecordLeases();
 
     if (persist)
     {
@@ -2730,7 +3504,7 @@ public:
     return true;
   }
 
-  bool refreshDeploymentRegisteredRoutableAddressWormholes(ApplicationDeployment *deployment)
+  bool refreshDeploymentRegisteredRoutablePrefixWormholes(ApplicationDeployment *deployment)
   {
     if (deployment == nullptr)
     {
@@ -2740,14 +3514,15 @@ public:
     bool changed = false;
     for (Wormhole& wormhole : deployment->plan.wormholes)
     {
-      if (wormhole.source != ExternalAddressSource::registeredRoutableAddress || wormhole.routableAddressUUID == 0)
+      if (wormhole.source != ExternalAddressSource::registeredRoutablePrefix || wormhole.routablePrefixUUID == 0)
       {
         continue;
       }
 
       IPAddress previousAddress = wormhole.externalAddress;
       String resolveFailure = {};
-      if (resolveWormholeRegisteredRoutableAddress(brainConfig.routableAddresses, wormhole, &resolveFailure) == false)
+      RoutableResourceLeaseOwner owner = deployment->routableResourceLeaseOwner();
+      if (resolveWormholeRegisteredRoutablePrefix(brainConfig.distributableExternalSubnets, wormhole, &resolveFailure, &routableResourceLeaseRuntimeState, &owner) == false)
       {
         continue;
       }
@@ -2766,7 +3541,7 @@ public:
     return publishDeploymentWormholeState(deployment);
   }
 
-  void refreshAllDeploymentRegisteredRoutableAddressWormholes(void)
+  void refreshAllDeploymentRegisteredRoutablePrefixWormholes(void)
   {
     if (weAreMaster == false)
     {
@@ -2776,7 +3551,7 @@ public:
     for (const auto& [deploymentID, deployment] : deployments)
     {
       (void)deploymentID;
-      (void)refreshDeploymentRegisteredRoutableAddressWormholes(deployment);
+      (void)refreshDeploymentRegisteredRoutablePrefixWormholes(deployment);
     }
   }
 
@@ -2940,6 +3715,16 @@ public:
     }
 
     return nullptr;
+  }
+
+  const ApiCredential *findDNSCredential(uint16_t applicationID, const String& name) const
+  {
+    if (brainConfig.dnsCredential.name.size() > 0 && brainConfig.dnsCredential.name.equals(name))
+    {
+      return &brainConfig.dnsCredential;
+    }
+    auto setIt = apiCredentialSetsByApp.find(applicationID);
+    return setIt == apiCredentialSetsByApp.end() ? nullptr : findApiCredential(setIt->second, name);
   }
 
   bool shouldAcceptTlsFactoryReplication(const ApplicationTlsVaultFactory& incoming, const ApplicationTlsVaultFactory *existing) const
@@ -7313,20 +8098,12 @@ public:
     owned = {};
     owned.uuid = source.uuid;
     owned.name.assign(source.name);
+    owned.kind = source.kind;
     owned.subnet = source.subnet;
     owned.routing = source.routing;
     owned.usage = source.usage;
-  }
-
-  static void ownRegisteredRoutableAddress(const RegisteredRoutableAddress& source, RegisteredRoutableAddress& owned)
-  {
-    owned = {};
-    owned.uuid = source.uuid;
-    owned.name.assign(source.name);
-    owned.kind = source.kind;
-    owned.family = source.family;
+    owned.ingressScope = source.ingressScope;
     owned.machineUUID = source.machineUUID;
-    owned.address = source.address;
     owned.providerPool.assign(source.providerPool);
     owned.providerAllocationID.assign(source.providerAllocationID);
     owned.providerAssociationID.assign(source.providerAssociationID);
@@ -7368,12 +8145,6 @@ public:
       DistributableExternalSubnet ownedSubnet = {};
       ownDistributableExternalSubnet(sourceSubnet, ownedSubnet);
       owned.distributableExternalSubnets.push_back(std::move(ownedSubnet));
-    }
-    for (const RegisteredRoutableAddress& sourceAddress : source.routableAddresses)
-    {
-      RegisteredRoutableAddress ownedAddress = {};
-      ownRegisteredRoutableAddress(sourceAddress, ownedAddress);
-      owned.routableAddresses.push_back(std::move(ownedAddress));
     }
     owned.reporter.to.assign(source.reporter.to);
     owned.reporter.from.assign(source.reporter.from);
@@ -8087,210 +8858,6 @@ public:
     }
 
     return nullptr;
-  }
-
-  static bool addressLooksPublicRoutable(const IPAddress& address)
-  {
-    if (address.isNull())
-    {
-      return false;
-    }
-
-    if (address.is6 == false)
-    {
-      return isRFC1918Private4(address.v4) == false;
-    }
-
-    const uint8_t *v6 = address.v6;
-    if (v6[0] == 0xfe && (v6[1] & 0xc0) == 0x80)
-    {
-      return false;
-    }
-
-    if ((v6[0] & 0xfe) == 0xfc)
-    {
-      return false;
-    }
-
-    return true;
-  }
-
-  bool resolveMachinePublicRouteAddress(const Machine *machine, ExternalAddressFamily family, IPAddress& address, String *addressText = nullptr) const
-  {
-    address = {};
-    if (addressText)
-    {
-      addressText->clear();
-    }
-
-    if (machine == nullptr)
-    {
-      return false;
-    }
-
-    auto tryLiteral = [&](const String& text) -> bool {
-      if (text.size() == 0)
-      {
-        return false;
-      }
-
-      IPAddress candidate = {};
-      if (ClusterMachine::parseIPAddressLiteral(text, candidate) == false)
-      {
-        return false;
-      }
-
-      if (candidate.is6 != (family == ExternalAddressFamily::ipv6))
-      {
-        return false;
-      }
-
-      if (addressLooksPublicRoutable(candidate) == false)
-      {
-        return false;
-      }
-
-      address = candidate;
-      if (addressText)
-      {
-        addressText->assign(text);
-      }
-
-      return true;
-    };
-
-    if (tryLiteral(machine->publicAddress))
-    {
-      return true;
-    }
-
-    for (const ClusterMachinePeerAddress& candidate : machine->peerAddresses)
-    {
-      if (tryLiteral(candidate.address))
-      {
-        return true;
-      }
-    }
-
-    return tryLiteral(machine->sshAddress);
-  }
-
-  Machine *chooseMachineForPublicRoute(ExternalAddressFamily family, uint128_t preferredMachineUUID, IPAddress& address, String *addressText = nullptr) const
-  {
-    address = {};
-    if (addressText)
-    {
-      addressText->clear();
-    }
-
-    if (preferredMachineUUID != 0)
-    {
-      Machine *preferred = findMachineByUUID(preferredMachineUUID);
-      if (resolveMachinePublicRouteAddress(preferred, family, address, addressText))
-      {
-        return preferred;
-      }
-
-      return nullptr;
-    }
-
-    Vector<Machine *> sorted = {};
-    sorted.reserve(machines.size());
-    for (Machine *machine : machines)
-    {
-      if (machine != nullptr && machine->uuid != 0)
-      {
-        sorted.push_back(machine);
-      }
-    }
-
-    std::sort(sorted.begin(), sorted.end(), [](const Machine *lhs, const Machine *rhs) -> bool {
-      return prodigyMachineIdentityComesBefore(*lhs, *rhs);
-    });
-
-    for (Machine *machine : sorted)
-    {
-      if (resolveMachinePublicRouteAddress(machine, family, address, addressText))
-      {
-        return machine;
-      }
-    }
-
-    return nullptr;
-  }
-
-  Machine *chooseMachineForHostedRoute(uint128_t preferredMachineUUID) const
-  {
-    if (preferredMachineUUID != 0)
-    {
-      return findMachineByUUID(preferredMachineUUID);
-    }
-
-    Vector<Machine *> sorted = {};
-    sorted.reserve(machines.size());
-    for (Machine *machine : machines)
-    {
-      if (machine != nullptr && machine->uuid != 0)
-      {
-        sorted.push_back(machine);
-      }
-    }
-
-    std::sort(sorted.begin(), sorted.end(), [](const Machine *lhs, const Machine *rhs) -> bool {
-      if (lhs == nullptr || rhs == nullptr)
-      {
-        return lhs != nullptr && rhs == nullptr;
-      }
-
-      bool lhsHealthyActive = lhs->state == MachineState::healthy && neuronControlStreamActive(lhs);
-      bool rhsHealthyActive = rhs->state == MachineState::healthy && neuronControlStreamActive(rhs);
-      if (lhsHealthyActive != rhsHealthyActive)
-      {
-        return lhsHealthyActive;
-      }
-
-      if (lhs->isBrain != rhs->isBrain)
-      {
-        return lhs->isBrain == false;
-      }
-
-      if (lhs->hasInternetAccess != rhs->hasInternetAccess)
-      {
-        return lhs->hasInternetAccess;
-      }
-
-      return prodigyMachineIdentityComesBefore(*lhs, *rhs);
-    });
-
-    return sorted.empty() ? nullptr : sorted[0];
-  }
-
-  bool resolveTestFakePublicPrefix(ExternalAddressFamily family, IPPrefix& prefix) const
-  {
-    prefix = {};
-    if (brainConfig.runtimeEnvironment.test.enabled == false)
-    {
-      return false;
-    }
-
-    if (family == ExternalAddressFamily::ipv4)
-    {
-      if (brainConfig.runtimeEnvironment.test.enableFakeIpv4Boundary == false || brainConfig.runtimeEnvironment.test.fakePublicSubnet4.network.isNull())
-      {
-        return false;
-      }
-
-      prefix = brainConfig.runtimeEnvironment.test.fakePublicSubnet4;
-      return true;
-    }
-
-    if (brainConfig.runtimeEnvironment.test.fakePublicSubnet6.network.isNull())
-    {
-      return false;
-    }
-
-    prefix = brainConfig.runtimeEnvironment.test.fakePublicSubnet6;
-    return true;
   }
 
   bool clusterTopologyContainsMachineIdentity(const ClusterTopology& topology, const ClusterMachine& clusterMachine) const
@@ -10456,6 +11023,7 @@ public:
     // interrupted addMachines journaling can resume immediately on promotion.
     deploymentPlans.clear();
     resumePendingAddMachinesOperations();
+    (void)reconcileDNSRecordLeases();
     if (ignited)
     {
       refreshMachineFragmentAssignmentsIfPossible();
@@ -15774,6 +16342,7 @@ public:
           Message::extractArg<ArgumentNature::fixed>(args, deploymentID);
 
           deploymentPlans.erase(deploymentID);
+          releaseRoutableResourceLeasesForDeployment(deploymentID);
           if (removeTlsResumptionStateForDeployment(deploymentID, false) > 0)
           {
             refreshMasterAuthorityRuntimeStateFromLiveFields();
@@ -16611,6 +17180,7 @@ public:
               deployments.erase(it);
             }
 
+            releaseRoutableResourceLeasesForDeployment(previous->plan.config.deploymentID());
             delete previous;
 
             break;
@@ -18652,33 +19222,142 @@ public:
           {
             response.failure.assign("usage invalid"_ctv);
           }
-          else if (environmentBGPEnabled() == false)
+          else if (routablePrefixKindIsValid(request.subnet.kind) == false)
           {
-            response.failure.assign("routable subnet registration requires bgp-enabled environment"_ctv);
+            response.failure.assign("kind invalid"_ctv);
+          }
+          else if (routableIngressScopeIsValid(request.subnet.ingressScope) == false)
+          {
+            response.failure.assign("ingressScope invalid"_ctv);
+          }
+          else if (request.subnet.ingressScope == RoutableIngressScope::switchboardFleet && request.subnet.machineUUID != 0)
+          {
+            response.failure.assign("switchboardFleet routable prefix must not set machineUUID"_ctv);
+          }
+          else if (request.subnet.ingressScope == RoutableIngressScope::switchboardFleet && environmentBGPEnabled() == false)
+          {
+            response.failure.assign("switchboardFleet routable prefix registration requires bgp-enabled environment"_ctv);
           }
           else if (request.subnet.routing != ExternalSubnetRouting::switchboardBGP)
           {
-            response.failure.assign("routable subnet registration only supports switchboardBGP"_ctv);
+            response.failure.assign("routable prefix registration only supports BGP"_ctv);
+          }
+          else if (request.subnet.kind == RoutablePrefixKind::elastic && request.subnet.ingressScope != RoutableIngressScope::singleMachine)
+          {
+            response.failure.assign("elastic routable prefixes require singleMachine ingressScope"_ctv);
+          }
+          else if (request.subnet.kind == RoutablePrefixKind::elastic && elasticPrefixIntentIsValid(request.elasticIntent) == false)
+          {
+            response.failure.assign("elasticIntent invalid"_ctv);
+          }
+          else if (request.subnet.kind == RoutablePrefixKind::elastic && request.subnet.subnet.network.isNull() == false)
+          {
+            response.failure.assign("elastic routable prefixes must be provider allocated"_ctv);
+          }
+          else if (request.subnet.kind == RoutablePrefixKind::elastic && request.family != ExternalAddressFamily::ipv4 && request.family != ExternalAddressFamily::ipv6)
+          {
+            response.failure.assign("elastic routable prefix family invalid"_ctv);
+          }
+          else if (request.subnet.kind == RoutablePrefixKind::BGP && (request.requestedAddress.size() > 0 || request.subnet.providerPool.size() > 0))
+          {
+            response.failure.assign("BGP routable prefixes do not accept provider fields"_ctv);
           }
           else
           {
-            request.subnet.subnet.canonicalize();
-
-            if (routableExternalSubnetHasSupportedBreadth(request.subnet) == false)
+            if (request.subnet.kind == RoutablePrefixKind::elastic)
             {
-              if (request.subnet.subnet.network.is6)
+              for (const DistributableExternalSubnet& existing : brainConfig.distributableExternalSubnets)
               {
-                response.failure.assign("routable ipv6 subnet prefix must be between /4 and /48"_ctv);
+                if ((request.subnet.uuid != 0 && existing.uuid == request.subnet.uuid) || existing.name.equals(request.subnet.name))
+                {
+                  if (existing.kind != RoutablePrefixKind::elastic || (request.subnet.uuid != 0 && existing.uuid != request.subnet.uuid))
+                  {
+                    response.failure.assign("routable prefix already exists with different configuration; unregister it first"_ctv);
+                  }
+                  else
+                  {
+                    request.subnet = existing;
+                    response.success = true;
+                    response.created = false;
+                  }
+                  break;
+                }
+              }
+            }
+
+            if (response.success == false && request.subnet.ingressScope == RoutableIngressScope::singleMachine)
+            {
+              Machine *owner = request.subnet.machineUUID == 0 ? nullptr : findMachineByUUID(request.subnet.machineUUID);
+              if (request.subnet.machineUUID == 0)
+              {
+                for (Machine *machine : machines)
+                {
+                  if (machine == nullptr || machine->uuid == 0)
+                  {
+                    continue;
+                  }
+                  if (owner != nullptr)
+                  {
+                    response.failure.assign("singleMachine routable prefix requires machineUUID when multiple machines exist"_ctv);
+                    break;
+                  }
+                  owner = machine;
+                }
+              }
+
+              if (response.failure.size() == 0 && owner == nullptr)
+              {
+                response.failure.assign("singleMachine routable prefix machineUUID is not registered"_ctv);
+              }
+              else if (response.failure.size() == 0)
+              {
+                request.subnet.machineUUID = owner->uuid;
+              }
+            }
+
+            if (request.subnet.kind == RoutablePrefixKind::elastic && response.success == false && response.failure.size() == 0)
+            {
+              if (iaas == nullptr)
+              {
+                response.failure.assign("elastic routable prefix requires active iaas runtime"_ctv);
               }
               else
               {
-                response.failure.assign("routable ipv4 subnet prefix must be between /4 and /24"_ctv);
+                Machine *targetMachine = findMachineByUUID(request.subnet.machineUUID);
+                if (targetMachine == nullptr || targetMachine->cloudID.size() == 0)
+                {
+                  response.failure.assign("elastic routable prefix requires a cloud-backed target machine"_ctv);
+                }
+                else if (neuronControlStreamActive(targetMachine) == false)
+                {
+                  response.failure.assign("target machine neuron control stream is not active"_ctv);
+                }
+                else if (iaas->assignProviderElasticAddress(targetMachine,
+                                                            request.family,
+                                                            request.elasticIntent,
+                                                            request.requestedAddress,
+                                                            request.subnet.providerPool,
+                                                            request.subnet.subnet,
+                                                            request.subnet.providerAllocationID,
+                                                            request.subnet.providerAssociationID,
+                                                            request.subnet.releaseOnRemove,
+                                                            response.failure) == false)
+                {
+                  request.subnet.subnet = {};
+                }
               }
+            }
+
+            request.subnet.subnet.canonicalize();
+
+            if (response.success == false && response.failure.size() == 0 && routableExternalSubnetHasSupportedBreadth(request.subnet) == false)
+            {
+              response.failure.assign("routable prefix CIDR is invalid"_ctv);
             }
 
             for (const DistributableExternalSubnet& existing : brainConfig.distributableExternalSubnets)
             {
-              if (response.failure.size() > 0)
+              if (response.success || response.failure.size() > 0)
               {
                 break;
               }
@@ -18690,13 +19369,13 @@ public:
 
               if (ipPrefixesOverlap(existing.subnet, request.subnet.subnet))
               {
-                response.failure.snprintf<"routable subnet overlaps existing subnet '{}'"_ctv>(existing.name);
+                response.failure.snprintf<"routable prefix overlaps existing prefix '{}'"_ctv>(existing.name);
                 break;
               }
             }
 
             bool replaced = false;
-            if (response.failure.size() == 0)
+            if (response.success == false && response.failure.size() == 0)
             {
               for (DistributableExternalSubnet& existing : brainConfig.distributableExternalSubnets)
               {
@@ -18723,7 +19402,9 @@ public:
                 brainConfig.distributableExternalSubnets.push_back(request.subnet);
               }
 
+              refreshAllDeploymentRegisteredRoutablePrefixWormholes();
               sendNeuronSwitchboardRoutableSubnets();
+              sendNeuronSwitchboardHostedIngressPrefixes();
               sendNeuronSwitchboardOverlayRoutes();
 
               String serializedBrainConfig;
@@ -18736,6 +19417,9 @@ public:
           }
 
           response.subnet = request.subnet;
+          response.family = request.family;
+          response.elasticIntent = request.elasticIntent;
+          response.requestedAddress = request.requestedAddress;
 
           String serializedResponse;
           BitseryEngine::serialize(serializedResponse, response);
@@ -18768,6 +19452,25 @@ public:
             {
               if (it->name.equals(request.name))
               {
+                if (routablePrefixHasOwnedResourceLease(it->uuid))
+                {
+                  response.failure.assign("routable prefix has owned resources"_ctv);
+                  break;
+                }
+                if (it->kind == RoutablePrefixKind::elastic)
+                {
+                  if (iaas == nullptr)
+                  {
+                    response.failure.assign("provider elastic prefix cleanup requires active iaas runtime"_ctv);
+                    break;
+                  }
+
+                  if (iaas->releaseProviderElasticAddress(*it, response.failure) == false)
+                  {
+                    break;
+                  }
+                }
+
                 brainConfig.distributableExternalSubnets.erase(it);
                 removed = true;
                 break;
@@ -18777,6 +19480,7 @@ public:
             if (removed)
             {
               sendNeuronSwitchboardRoutableSubnets();
+              sendNeuronSwitchboardHostedIngressPrefixes();
               sendNeuronSwitchboardOverlayRoutes();
 
               String serializedBrainConfig;
@@ -18785,8 +19489,11 @@ public:
               persistLocalRuntimeState();
             }
 
-            response.success = true;
-            response.removed = removed;
+            if (response.failure.size() == 0)
+            {
+              response.success = true;
+              response.removed = removed;
+            }
           }
 
           if (response.name.size() == 0)
@@ -18810,329 +19517,58 @@ public:
           Message::construct(mothership->wBuffer, MothershipTopic::pullRoutableSubnets, serializedResponse);
           break;
         }
-      case MothershipTopic::registerRoutableAddress:
+      case MothershipTopic::pullRoutableResourceLeases:
         {
-          String serializedRequest;
-          Message::extractToStringView(args, serializedRequest);
-
-          RoutableAddressRegistration request = {};
-          RoutableAddressRegistration response = {};
-          response.success = false;
-
-          if (BitseryEngine::deserializeSafe(serializedRequest, request) == false)
-          {
-            response.failure.assign("invalid routable address payload"_ctv);
-          }
-          else if (request.name.size() == 0)
-          {
-            response.failure.assign("name required"_ctv);
-          }
-          else
-          {
-            RegisteredRoutableAddress *existing = findRegisteredRoutableAddress(brainConfig.routableAddresses, request.name, request.uuid);
-            if (existing != nullptr)
-            {
-              String existingAddressText = {};
-              (void)ClusterMachine::renderIPAddressLiteral(existing->address, existingAddressText);
-
-              bool sameRequest = existing->kind == request.kind && existing->family == request.family && (request.machineUUID == 0 || request.machineUUID == existing->machineUUID) && (request.providerPool.size() == 0 || request.providerPool.equals(existing->providerPool)) && (request.requestedAddress.size() == 0 || request.requestedAddress.equals(existingAddressText));
-
-              if (sameRequest == false)
-              {
-                response.failure.assign("routable address already exists with different configuration; unregister it first"_ctv);
-              }
-              else
-              {
-                response.success = true;
-                response.created = false;
-                response.uuid = existing->uuid;
-                response.machineUUID = existing->machineUUID;
-                response.address = existing->address;
-              }
-            }
-
-            RegisteredRoutableAddress resolved = {};
-            resolved.uuid = request.uuid;
-            resolved.name = request.name;
-            resolved.kind = request.kind;
-            resolved.family = request.family;
-            resolved.providerPool = request.providerPool;
-
-            Machine *targetMachine = nullptr;
-
-            if (response.success == false && response.failure.size() == 0)
-            {
-              if (request.kind == RoutableAddressKind::testFakeAddress)
-              {
-                if (request.requestedAddress.size() > 0 || request.providerPool.size() > 0)
-                {
-                  response.failure.assign("test fake routable addresses do not accept requestedAddress or providerPool"_ctv);
-                }
-                else
-                {
-                  IPPrefix fakePrefix = {};
-                  if (resolveTestFakePublicPrefix(request.family, fakePrefix) == false)
-                  {
-                    response.failure.assign("test fake routable address requires a configured fake public subnet for that family"_ctv);
-                  }
-                  else
-                  {
-                    targetMachine = chooseMachineForHostedRoute(request.machineUUID);
-                    if (targetMachine == nullptr)
-                    {
-                      response.failure.assign("unable to select target machine for test fake routable address"_ctv);
-                    }
-                    else if (neuronControlStreamActive(targetMachine) == false)
-                    {
-                      response.failure.assign("target machine neuron control stream is not active"_ctv);
-                    }
-                    else if (allocateUniqueRegisteredAddressFromPrefix(fakePrefix, brainConfig.routableAddresses, resolved.address) == false)
-                    {
-                      response.failure.assign("failed to allocate unique test fake routable address"_ctv);
-                    }
-                  }
-                }
-              }
-              else if (request.kind == RoutableAddressKind::anyHostPublicAddress)
-              {
-                if (request.requestedAddress.size() > 0 || request.providerPool.size() > 0)
-                {
-                  response.failure.assign("anyHostPublicAddress does not accept requestedAddress or providerPool"_ctv);
-                }
-                else
-                {
-                  String addressText = {};
-                  targetMachine = chooseMachineForPublicRoute(request.family, request.machineUUID, resolved.address, &addressText);
-                  if (targetMachine == nullptr)
-                  {
-                    response.failure.assign("no machine with a matching public routable address is available"_ctv);
-                  }
-                  else if (neuronControlStreamActive(targetMachine) == false)
-                  {
-                    response.failure.assign("target machine neuron control stream is not active"_ctv);
-                  }
-                }
-              }
-              else if (request.kind == RoutableAddressKind::providerElasticAddress)
-              {
-                if (iaas == nullptr)
-                {
-                  response.failure.assign("provider elastic address requires active iaas runtime"_ctv);
-                }
-                else
-                {
-                  if (request.machineUUID != 0)
-                  {
-                    targetMachine = findMachineByUUID(request.machineUUID);
-                  }
-
-                  if (targetMachine == nullptr)
-                  {
-                    Vector<Machine *> sorted = {};
-                    for (Machine *machine : machines)
-                    {
-                      if (machine != nullptr && machine->cloudID.size() > 0)
-                      {
-                        sorted.push_back(machine);
-                      }
-                    }
-
-                    std::sort(sorted.begin(), sorted.end(), [](const Machine *lhs, const Machine *rhs) -> bool {
-                      return prodigyMachineIdentityComesBefore(*lhs, *rhs);
-                    });
-
-                    if (sorted.empty() == false)
-                    {
-                      targetMachine = sorted[0];
-                    }
-                  }
-
-                  if (targetMachine == nullptr)
-                  {
-                    response.failure.assign("provider elastic address requires a cloud-backed target machine"_ctv);
-                  }
-                  else if (neuronControlStreamActive(targetMachine) == false)
-                  {
-                    response.failure.assign("target machine neuron control stream is not active"_ctv);
-                  }
-                  else
-                  {
-                    bool releaseOnRemove = false;
-                    String allocationID = {};
-                    String associationID = {};
-                    if (iaas->assignProviderElasticAddress(targetMachine,
-                                                           request.family,
-                                                           request.requestedAddress,
-                                                           request.providerPool,
-                                                           resolved.address,
-                                                           allocationID,
-                                                           associationID,
-                                                           releaseOnRemove,
-                                                           response.failure) == false)
-                    {
-                      resolved.address = {};
-                    }
-                    else
-                    {
-                      resolved.providerAllocationID = allocationID;
-                      resolved.providerAssociationID = associationID;
-                      resolved.releaseOnRemove = releaseOnRemove;
-                    }
-                  }
-                }
-              }
-
-              if (response.failure.size() == 0 && targetMachine != nullptr)
-              {
-                if (const RegisteredRoutableAddress *duplicate = findRegisteredRoutableAddressByConcreteAddress(brainConfig.routableAddresses, resolved.address);
-                    duplicate != nullptr)
-                {
-                  response.failure.assign("routable address already registered; unregister the existing entry first"_ctv);
-                }
-              }
-
-              if (response.failure.size() == 0 && targetMachine != nullptr)
-              {
-                resolved.machineUUID = targetMachine->uuid;
-
-                if (resolved.uuid == 0)
-                {
-                  resolved.uuid = Random::generateNumberWithNBits<128, uint128_t>();
-                }
-
-                brainConfig.routableAddresses.push_back(resolved);
-                refreshAllDeploymentRegisteredRoutableAddressWormholes();
-                for (Machine *machine : machines)
-                {
-                  if (machine != nullptr)
-                  {
-                    sendNeuronSwitchboardStateSync(machine);
-                  }
-                }
-
-                String serializedBrainConfig = {};
-                BitseryEngine::serialize(serializedBrainConfig, brainConfig);
-                queueBrainReplication(BrainTopic::replicateBrainConfig, serializedBrainConfig);
-                persistLocalRuntimeState();
-
-                response.success = true;
-                response.created = true;
-                response.uuid = resolved.uuid;
-                response.machineUUID = resolved.machineUUID;
-                response.address = resolved.address;
-              }
-            }
-          }
-
-          response.name = request.name;
-          response.kind = request.kind;
-          response.family = request.family;
-          response.requestedAddress = request.requestedAddress;
-          response.providerPool = request.providerPool;
-
-          String serializedResponse = {};
-          BitseryEngine::serialize(serializedResponse, response);
-          Message::construct(mothership->wBuffer, MothershipTopic::registerRoutableAddress, serializedResponse);
-          break;
-        }
-      case MothershipTopic::unregisterRoutableAddress:
-        {
-          String serializedRequest;
-          Message::extractToStringView(args, serializedRequest);
-
-          RoutableAddressUnregistration request = {};
-          RoutableAddressUnregistration response = {};
-          response.success = false;
-
-          if (BitseryEngine::deserializeSafe(serializedRequest, request) == false)
-          {
-            response.failure.assign("invalid routable address unregister payload"_ctv);
-          }
-          else if (request.name.size() == 0 && request.uuid == 0)
-          {
-            response.failure.assign("name or uuid required"_ctv);
-          }
-          else
-          {
-            bool removed = false;
-            for (auto it = brainConfig.routableAddresses.begin(); it != brainConfig.routableAddresses.end(); ++it)
-            {
-              if (registeredRoutableAddressMatchesIdentity(*it, request.name, request.uuid) == false)
-              {
-                continue;
-              }
-
-              if (it->kind == RoutableAddressKind::providerElasticAddress)
-              {
-                if (iaas == nullptr)
-                {
-                  response.failure.assign("provider elastic address cleanup requires active iaas runtime"_ctv);
-                  break;
-                }
-
-                if (iaas->releaseProviderElasticAddress(*it, response.failure) == false)
-                {
-                  break;
-                }
-              }
-
-              response.uuid = it->uuid;
-              if (response.name.size() == 0)
-              {
-                response.name = it->name;
-              }
-
-              brainConfig.routableAddresses.erase(it);
-              removed = true;
-              break;
-            }
-
-            if (response.failure.size() == 0)
-            {
-              if (removed)
-              {
-                for (Machine *machine : machines)
-                {
-                  if (machine != nullptr)
-                  {
-                    sendNeuronSwitchboardStateSync(machine);
-                  }
-                }
-
-                String serializedBrainConfig = {};
-                BitseryEngine::serialize(serializedBrainConfig, brainConfig);
-                queueBrainReplication(BrainTopic::replicateBrainConfig, serializedBrainConfig);
-                persistLocalRuntimeState();
-              }
-
-              response.success = true;
-              response.removed = removed;
-            }
-          }
-
-          if (response.name.size() == 0)
-          {
-            response.name = request.name;
-          }
-          if (response.uuid == 0)
-          {
-            response.uuid = request.uuid;
-          }
-
-          String serializedResponse = {};
-          BitseryEngine::serialize(serializedResponse, response);
-          Message::construct(mothership->wBuffer, MothershipTopic::unregisterRoutableAddress, serializedResponse);
-          break;
-        }
-      case MothershipTopic::pullRoutableAddresses:
-        {
-          RoutableAddressRegistryReport response = {};
-          response.addresses = brainConfig.routableAddresses;
+          RoutableResourceLeaseReport response = {};
+          response.leases = routableResourceLeaseRuntimeState;
           response.success = true;
 
-          String serializedResponse = {};
+          String serializedResponse;
           BitseryEngine::serialize(serializedResponse, response);
-          Message::construct(mothership->wBuffer, MothershipTopic::pullRoutableAddresses, serializedResponse);
+          Message::construct(mothership->wBuffer, MothershipTopic::pullRoutableResourceLeases, serializedResponse);
+          break;
+        }
+      case MothershipTopic::upsertDNSBinding:
+      case MothershipTopic::deleteDNSBinding:
+        {
+          String serializedRequest;
+          Message::extractToStringView(args, serializedRequest);
+
+          RoutableResourceLeaseReport request = {};
+          RoutableResourceLeaseReport response = {};
+          if (BitseryEngine::deserializeSafe(serializedRequest, request) == false || request.leases.size() != 1)
+          {
+            response.failure.assign("DNS binding request requires one lease"_ctv);
+          }
+          else if (MothershipTopic(message->topic) == MothershipTopic::upsertDNSBinding)
+          {
+            (void)upsertDNSBindingLease(request.leases[0], response);
+          }
+          else
+          {
+            (void)deleteDNSBindingLease(request.leases[0], response);
+          }
+
+          String serializedResponse;
+          BitseryEngine::serialize(serializedResponse, response);
+          Message::construct(mothership->wBuffer, MothershipTopic(message->topic), serializedResponse);
+          break;
+        }
+      case MothershipTopic::pullDNSBindings:
+        {
+          RoutableResourceLeaseReport response = {};
+          for (const RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
+          {
+            if (lease.kind == RoutableResourceLeaseKind::dnsRecord)
+            {
+              response.leases.push_back(lease);
+            }
+          }
+          response.success = true;
+
+          String serializedResponse;
+          BitseryEngine::serialize(serializedResponse, response);
+          Message::construct(mothership->wBuffer, MothershipTopic::pullDNSBindings, serializedResponse);
           break;
         }
       case MothershipTopic::pullClusterReport:
@@ -20511,29 +20947,16 @@ public:
             }
           }
 
-          if (needsDistributedExternalAddressFamily(deployment->plan, ExternalAddressFamily::ipv4) && findAllocatableDistributableExternalSubnetForFamily(
-                                                                                                          brainConfig,
-                                                                                                          ExternalAddressFamily::ipv4,
-                                                                                                          ExternalSubnetUsage::whiteholes) == nullptr)
-          {
-            rejectInvalidPlan("invalid plan: no registered distributable ipv4 subnet usable for whiteholes leaves the required 16 host bits"_ctv);
-            return;
-          }
-
-          if (needsDistributedExternalAddressFamily(deployment->plan, ExternalAddressFamily::ipv6) && findAllocatableDistributableExternalSubnetForFamily(
-                                                                                                          brainConfig,
-                                                                                                          ExternalAddressFamily::ipv6,
-                                                                                                          ExternalSubnetUsage::whiteholes) == nullptr)
-          {
-            rejectInvalidPlan("invalid plan: no registered distributable ipv6 subnet usable for whiteholes leaves the required 40 host bits"_ctv);
-            return;
-          }
-
           for (const Wormhole& wormhole : deployment->plan.wormholes)
           {
-            if (wormhole.source != ExternalAddressSource::distributableSubnet && wormhole.source != ExternalAddressSource::registeredRoutableAddress)
+            if (wormhole.source != ExternalAddressSource::distributableSubnet && wormhole.source != ExternalAddressSource::registeredRoutablePrefix)
             {
-              rejectInvalidPlan("invalid plan: wormholes currently require source == distributableSubnet or registeredRoutableAddress"_ctv);
+              rejectInvalidPlan("invalid plan: wormholes currently require source == distributableSubnet or registeredRoutablePrefix"_ctv);
+              return;
+            }
+            if (wormhole.hasDNSConfig && wormhole.source != ExternalAddressSource::registeredRoutablePrefix && wormhole.dns.bindingName.size() == 0)
+            {
+              rejectInvalidPlan("invalid plan: wormhole DNS requires source=registeredRoutablePrefix"_ctv);
               return;
             }
           }
@@ -20546,13 +20969,33 @@ public:
               return;
             }
 
-            if (wormhole.source == ExternalAddressSource::registeredRoutableAddress)
+            if (wormhole.hasDNSConfig && wormhole.dns.bindingName.size() > 0)
+            {
+              String dnsBindingFailure = {};
+              if (resolveDeploymentWormholeDNSBinding(deployment->plan, wormhole, dnsBindingFailure) == false)
+              {
+                rejectInvalidPlan(String("invalid plan: "_ctv) + dnsBindingFailure);
+                return;
+              }
+            }
+
+            if (wormhole.source == ExternalAddressSource::registeredRoutablePrefix)
             {
               String resolveFailure = {};
-              if (resolveWormholeRegisteredRoutableAddress(brainConfig.routableAddresses, wormhole, &resolveFailure) == false)
+              RoutableResourceLeaseOwner owner = deploymentRoutableResourceLeaseOwner(deployment->plan);
+              if (resolveWormholeRegisteredRoutablePrefix(brainConfig.distributableExternalSubnets, wormhole, &resolveFailure, &routableResourceLeaseRuntimeState, &owner) == false)
               {
                 rejectInvalidPlan(String("invalid plan: "_ctv) + resolveFailure);
                 return;
+              }
+              if (wormhole.hasDNSConfig)
+              {
+                String dnsFailure = {};
+                if (validateDeploymentWormholeDNSConfig(deployment->plan, wormhole, dnsFailure) == false)
+                {
+                  rejectInvalidPlan(String("invalid plan: "_ctv) + dnsFailure);
+                  return;
+                }
               }
 
               continue;
@@ -20583,6 +21026,13 @@ public:
             }
           }
 
+          String wormholeLeaseFailure = {};
+          if (reserveDeploymentWormholeAddressLeases(deployment->plan, wormholeLeaseFailure, false) == false)
+          {
+            rejectInvalidPlan(String("invalid plan: "_ctv) + wormholeLeaseFailure);
+            return;
+          }
+
           (void)prepareDeploymentPlanWormholeQuicCidState(deployment->plan, Time::now<TimeResolution::ms>());
 
           for (Whitehole& whitehole : deployment->plan.whiteholes)
@@ -20597,20 +21047,19 @@ public:
               continue;
             }
 
-            if (whitehole.source == ExternalAddressSource::distributableSubnet)
+            if (whitehole.source == ExternalAddressSource::registeredRoutablePrefix)
             {
-              if (findAllocatableDistributableExternalSubnetForFamily(
+              if (findWhiteholeRoutablePrefixForFamily(
                       brainConfig,
-                      whitehole.family,
-                      ExternalSubnetUsage::whiteholes) == nullptr)
+                      whitehole.family) == nullptr)
               {
                 if (whitehole.family == ExternalAddressFamily::ipv6)
                 {
-                  rejectInvalidPlan("invalid plan: no registered distributable ipv6 subnet usable for whiteholes leaves the required 40 host bits"_ctv);
+                  rejectInvalidPlan("invalid plan: no registered routable ipv6 prefix usable for whiteholes"_ctv);
                 }
                 else
                 {
-                  rejectInvalidPlan("invalid plan: no registered distributable ipv4 subnet usable for whiteholes leaves the required 16 host bits"_ctv);
+                  rejectInvalidPlan("invalid plan: no registered routable ipv4 prefix usable for whiteholes"_ctv);
                 }
 
                 return;
@@ -20621,7 +21070,7 @@ public:
 
             if (whitehole.source != ExternalAddressSource::hostPublicAddress)
             {
-              rejectInvalidPlan("invalid plan: whiteholes currently require source == hostPublicAddress or distributableSubnet"_ctv);
+              rejectInvalidPlan("invalid plan: whiteholes currently require source == hostPublicAddress or registeredRoutablePrefix"_ctv);
               return;
             }
           }
@@ -20663,6 +21112,11 @@ public:
 
           deployment->plan.config.containerBlobSHA256 = trustedContainerBlobSHA256;
           deployment->plan.config.containerBlobBytes = trustedContainerBlobBytes;
+          if (reserveDeploymentWormholeAddressLeases(deployment->plan, wormholeLeaseFailure, true) == false)
+          {
+            rejectInvalidPlan(String("invalid plan: "_ctv) + wormholeLeaseFailure);
+            return;
+          }
 
           String trustedSerializedPlan = {};
           BitseryEngine::serialize(trustedSerializedPlan, deployment->plan);

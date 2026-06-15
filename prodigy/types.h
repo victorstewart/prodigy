@@ -250,7 +250,7 @@ enum class ExternalAddressSource : uint8_t {
 
   distributableSubnet = 0,
   hostPublicAddress = 1,
-  registeredRoutableAddress = 2
+  registeredRoutablePrefix = 2
 };
 
 enum class ExternalSubnetRouting : uint8_t {
@@ -266,11 +266,23 @@ enum class ExternalSubnetUsage : uint8_t {
   both = 2
 };
 
-enum class RoutableAddressKind : uint8_t {
+enum class RoutableIngressScope : uint8_t {
 
-  testFakeAddress = 0,
-  anyHostPublicAddress = 1,
-  providerElasticAddress = 2
+  switchboardFleet = 0,
+  singleMachine = 1
+};
+
+enum class RoutablePrefixKind : uint8_t {
+
+  BGP = 0,
+  elastic = 1
+};
+
+enum class ElasticPrefixIntent : uint8_t {
+
+  any = 0,
+  create = 1,
+  anyOrCreate = 2
 };
 
 class Whitehole {
@@ -278,7 +290,7 @@ public:
 
   ExternalAddressTransport transport = ExternalAddressTransport::tcp;
   ExternalAddressFamily family = ExternalAddressFamily::ipv6;
-  ExternalAddressSource source = ExternalAddressSource::distributableSubnet;
+  ExternalAddressSource source = ExternalAddressSource::registeredRoutablePrefix;
   bool hasAddress = false;
   IPAddress address;
   uint16_t sourcePort = 0;
@@ -302,9 +314,16 @@ public:
 
   uint128_t uuid = 0;
   String name;
+  RoutablePrefixKind kind = RoutablePrefixKind::BGP;
   IPPrefix subnet;
   ExternalSubnetRouting routing = ExternalSubnetRouting::switchboardBGP;
   ExternalSubnetUsage usage = ExternalSubnetUsage::wormholes;
+  RoutableIngressScope ingressScope = RoutableIngressScope::switchboardFleet;
+  uint128_t machineUUID = 0;
+  String providerPool;
+  String providerAllocationID;
+  String providerAssociationID;
+  bool releaseOnRemove = false;
 };
 
 template <typename S>
@@ -312,15 +331,25 @@ static void serialize(S&& serializer, DistributableExternalSubnet& subnet)
 {
   serializer.value16b(subnet.uuid);
   serializer.text1b(subnet.name, UINT32_MAX);
+  serializer.value1b(subnet.kind);
   serializer.object(subnet.subnet);
   serializer.value1b(subnet.routing);
   serializer.value1b(subnet.usage);
+  serializer.value1b(subnet.ingressScope);
+  serializer.value16b(subnet.machineUUID);
+  serializer.text1b(subnet.providerPool, UINT32_MAX);
+  serializer.text1b(subnet.providerAllocationID, UINT32_MAX);
+  serializer.text1b(subnet.providerAssociationID, UINT32_MAX);
+  serializer.value1b(subnet.releaseOnRemove);
 }
 
 class RoutableSubnetRegistration {
 public:
 
   DistributableExternalSubnet subnet;
+  ExternalAddressFamily family = ExternalAddressFamily::ipv4;
+  ElasticPrefixIntent elasticIntent = ElasticPrefixIntent::create;
+  String requestedAddress;
   bool success = false;
   bool created = false;
   String failure;
@@ -330,6 +359,9 @@ template <typename S>
 static void serialize(S&& serializer, RoutableSubnetRegistration& payload)
 {
   serializer.object(payload.subnet);
+  serializer.value1b(payload.family);
+  serializer.value1b(payload.elasticIntent);
+  serializer.text1b(payload.requestedAddress, UINT32_MAX);
   serializer.value1b(payload.success);
   serializer.value1b(payload.created);
   serializer.text1b(payload.failure, UINT32_MAX);
@@ -365,104 +397,6 @@ template <typename S>
 static void serialize(S&& serializer, RoutableSubnetRegistryReport& payload)
 {
   serializer.object(payload.subnets);
-  serializer.value1b(payload.success);
-  serializer.text1b(payload.failure, UINT32_MAX);
-}
-
-class RegisteredRoutableAddress {
-public:
-
-  uint128_t uuid = 0;
-  String name;
-  RoutableAddressKind kind = RoutableAddressKind::testFakeAddress;
-  ExternalAddressFamily family = ExternalAddressFamily::ipv4;
-  uint128_t machineUUID = 0;
-  IPAddress address = {};
-  String providerPool;
-  String providerAllocationID;
-  String providerAssociationID;
-  bool releaseOnRemove = false;
-};
-
-template <typename S>
-static void serialize(S&& serializer, RegisteredRoutableAddress& address)
-{
-  serializer.value16b(address.uuid);
-  serializer.text1b(address.name, UINT32_MAX);
-  serializer.value1b(address.kind);
-  serializer.value1b(address.family);
-  serializer.value16b(address.machineUUID);
-  serializer.object(address.address);
-  serializer.text1b(address.providerPool, UINT32_MAX);
-  serializer.text1b(address.providerAllocationID, UINT32_MAX);
-  serializer.text1b(address.providerAssociationID, UINT32_MAX);
-  serializer.value1b(address.releaseOnRemove);
-}
-
-class RoutableAddressRegistration {
-public:
-
-  String name;
-  uint128_t uuid = 0;
-  RoutableAddressKind kind = RoutableAddressKind::testFakeAddress;
-  ExternalAddressFamily family = ExternalAddressFamily::ipv4;
-  uint128_t machineUUID = 0;
-  String requestedAddress;
-  String providerPool;
-  IPAddress address = {};
-  bool success = false;
-  bool created = false;
-  String failure;
-};
-
-template <typename S>
-static void serialize(S&& serializer, RoutableAddressRegistration& payload)
-{
-  serializer.text1b(payload.name, UINT32_MAX);
-  serializer.value16b(payload.uuid);
-  serializer.value1b(payload.kind);
-  serializer.value1b(payload.family);
-  serializer.value16b(payload.machineUUID);
-  serializer.text1b(payload.requestedAddress, UINT32_MAX);
-  serializer.text1b(payload.providerPool, UINT32_MAX);
-  serializer.object(payload.address);
-  serializer.value1b(payload.success);
-  serializer.value1b(payload.created);
-  serializer.text1b(payload.failure, UINT32_MAX);
-}
-
-class RoutableAddressUnregistration {
-public:
-
-  String name;
-  uint128_t uuid = 0;
-  bool success = false;
-  bool removed = false;
-  String failure;
-};
-
-template <typename S>
-static void serialize(S&& serializer, RoutableAddressUnregistration& payload)
-{
-  serializer.text1b(payload.name, UINT32_MAX);
-  serializer.value16b(payload.uuid);
-  serializer.value1b(payload.success);
-  serializer.value1b(payload.removed);
-  serializer.text1b(payload.failure, UINT32_MAX);
-}
-
-class RoutableAddressRegistryReport {
-public:
-
-  Vector<RegisteredRoutableAddress> addresses;
-  bool success = false;
-  String failure;
-};
-
-template <typename S>
-static void serialize(S&& serializer, RoutableAddressRegistryReport& payload)
-{
-  serializer.object(payload.addresses);
   serializer.value1b(payload.success);
   serializer.text1b(payload.failure, UINT32_MAX);
 }
@@ -2544,6 +2478,35 @@ static void serialize(S&& serializer, OperatingSystemUpdatePolicy& policy)
   serializer.value1b(policy.includeVMs);
 }
 
+class ApiCredential {
+public:
+
+  String name;
+  String provider;
+  uint64_t generation = 0;
+  int64_t expiresAtMs = 0;
+  int64_t activeFromMs = 0;
+  int64_t sunsetAtMs = 0;
+  String material;
+  bytell_hash_map<String, String> metadata;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ApiCredential& credential)
+{
+  serializer.text1b(credential.name, UINT32_MAX);
+  serializer.text1b(credential.provider, UINT32_MAX);
+  serializer.value8b(credential.generation);
+  serializer.value8b(credential.expiresAtMs);
+  serializer.value8b(credential.activeFromMs);
+  serializer.value8b(credential.sunsetAtMs);
+  serializer.text1b(credential.material, UINT32_MAX);
+  serializer.ext(credential.metadata, bitsery::ext::BytellHashMap {}, [](S& serializer, String& key, String& value) {
+    serializer.text1b(key, UINT32_MAX);
+    serializer.text1b(value, UINT32_MAX);
+  });
+}
+
 class BrainConfig {
 public:
 
@@ -2569,7 +2532,8 @@ public:
   String remoteProdigyPath;
   String controlSocketPath;
   Vector<DistributableExternalSubnet> distributableExternalSubnets;
-  Vector<RegisteredRoutableAddress> routableAddresses;
+  String dnsProvider;
+  ApiCredential dnsCredential;
 
   EmailReporter reporter;
   // Generic VM image URI for cloud providers (e.g., GCP: projects/<p>/global/images/<image>)
@@ -2607,7 +2571,8 @@ static void serialize(S&& serializer, BrainConfig& config)
   serializer.text1b(config.remoteProdigyPath, UINT32_MAX);
   serializer.text1b(config.controlSocketPath, UINT32_MAX);
   serializer.object(config.distributableExternalSubnets);
-  serializer.object(config.routableAddresses);
+  serializer.text1b(config.dnsProvider, UINT32_MAX);
+  serializer.object(config.dnsCredential);
   serializer.object(config.reporter);
   serializer.text1b(config.vmImageURI, UINT32_MAX);
   serializer.value1b(config.osUpdatesEnabled);
@@ -4238,6 +4203,44 @@ static inline uint32_t serviceUserCapacityPlanningWeight(const ServiceUserCapaci
   return 1;
 }
 
+class WormholeDNSConfig {
+public:
+
+  String provider;
+  String credentialName;
+  String zone;
+  String name;
+  String bindingName;
+  String type;
+  uint32_t ttl = 0;
+  bool allowSingleMachine = false;
+};
+
+template <typename S>
+static void serialize(S&& serializer, WormholeDNSConfig& config)
+{
+  serializer.text1b(config.provider, UINT32_MAX);
+  serializer.text1b(config.credentialName, UINT32_MAX);
+  serializer.text1b(config.zone, UINT32_MAX);
+  serializer.text1b(config.name, UINT32_MAX);
+  serializer.text1b(config.bindingName, UINT32_MAX);
+  serializer.text1b(config.type, UINT32_MAX);
+  serializer.value4b(config.ttl);
+  serializer.value1b(config.allowSingleMachine);
+}
+
+static inline bool normalizeDNSRecordType(String& type)
+{
+  String normalized = {};
+  for (uint32_t index = 0; index < type.size(); ++index)
+  {
+    normalized.append(char(std::toupper(static_cast<unsigned char>(type[index]))));
+  }
+  type = std::move(normalized);
+
+  return type.equal("A"_ctv) || type.equal("AAAA"_ctv) || type.equal("CNAME"_ctv) || type.equal("TXT"_ctv);
+}
+
 struct Wormhole {
 
   String name;
@@ -4249,9 +4252,11 @@ struct Wormhole {
   ServiceUserCapacity userCapacity;
   bool hasQuicCidKeyState = false;
   ExternalAddressSource source = ExternalAddressSource::distributableSubnet;
-  uint128_t routableAddressUUID = 0;
+  uint128_t routablePrefixUUID = 0;
   bool hasTlsResumptionConfig = false;
   TlsResumptionWormholeConfig tlsResumption;
+  bool hasDNSConfig = false;
+  WormholeDNSConfig dns;
   class QuicCidKeyState {
   public:
 
@@ -4284,10 +4289,45 @@ static void serialize(S&& serializer, Wormhole& wormhole)
   serializer.object(wormhole.userCapacity);
   serializer.value1b(wormhole.hasQuicCidKeyState);
   serializer.value1b(wormhole.source);
-  serializer.value16b(wormhole.routableAddressUUID);
+  serializer.value16b(wormhole.routablePrefixUUID);
   serializer.value1b(wormhole.hasTlsResumptionConfig);
   serializer.object(wormhole.tlsResumption);
+  serializer.value1b(wormhole.hasDNSConfig);
+  serializer.object(wormhole.dns);
   serializer.object(wormhole.quicCidKeyState);
+}
+
+static inline bool wormholeDNSRecordType(const Wormhole& wormhole, String& type, String *failure = nullptr)
+{
+  type = wormhole.dns.type;
+  if (type.size() == 0)
+  {
+    if (wormhole.externalAddress.is6)
+    {
+      type.assign("AAAA"_ctv);
+    }
+    else
+    {
+      type.assign("A"_ctv);
+    }
+  }
+  if (normalizeDNSRecordType(type) == false)
+  {
+    if (failure)
+    {
+      failure->assign("wormhole DNS record type must be A, AAAA, CNAME, or TXT"_ctv);
+    }
+    return false;
+  }
+  if ((type.equal("A"_ctv) && wormhole.externalAddress.is6) || (type.equal("AAAA"_ctv) && wormhole.externalAddress.is6 == false) || type.equal("CNAME"_ctv) || type.equal("TXT"_ctv))
+  {
+    if (failure)
+    {
+      failure->assign("wormhole DNS record type must match the claimed address family"_ctv);
+    }
+    return false;
+  }
+  return true;
 }
 
 static inline bool wormholeUsesQuicCidEncryption(const Wormhole& wormhole)
@@ -4344,34 +4384,6 @@ static inline bool wormholeQuicCidForceKeyMaterialPhase(uint128_t& keyMaterial, 
   return before != (phase & 0x01u);
 }
 
-template <typename T>
-static bool needsDistributedExternalAddressFamily(const T& value, ExternalAddressFamily family)
-{
-  for (const Whitehole& need : value.whiteholes)
-  {
-    if (need.source == ExternalAddressSource::distributableSubnet && need.family == family)
-    {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-template <typename T>
-static bool needsHostPublicExternalAddressFamily(const T& value, ExternalAddressFamily family)
-{
-  for (const Whitehole& need : value.whiteholes)
-  {
-    if (need.source == ExternalAddressSource::hostPublicAddress && need.family == family)
-    {
-      return true;
-    }
-  }
-
-  return false;
-}
-
 static inline bool distributableExternalSubnetMatchesFamily(const DistributableExternalSubnet& subnet, ExternalAddressFamily family)
 {
   return subnet.subnet.network.is6 == (family == ExternalAddressFamily::ipv6);
@@ -4382,6 +4394,11 @@ static inline bool distributableExternalSubnetContainsAddress(const Distributabl
   return subnet.subnet.network.is6 == address.is6 && subnet.subnet.containsAddress(address);
 }
 
+static inline bool distributableExternalSubnetIsHostPrefix(const DistributableExternalSubnet& subnet)
+{
+  return subnet.subnet.cidr == (subnet.subnet.network.is6 ? 128 : 32);
+}
+
 static inline bool ipPrefixesOverlap(const IPPrefix& lhs, const IPPrefix& rhs)
 {
   if (lhs.network.is6 != rhs.network.is6)
@@ -4389,7 +4406,15 @@ static inline bool ipPrefixesOverlap(const IPPrefix& lhs, const IPPrefix& rhs)
     return false;
   }
 
-  return lhs.containsAddress(rhs.network) || rhs.containsAddress(lhs.network);
+  uint8_t maxCidr = lhs.network.is6 ? 128 : 32;
+  if (lhs.cidr > maxCidr || rhs.cidr > maxCidr)
+  {
+    return false;
+  }
+
+  IPPrefix a = lhs.canonicalized();
+  IPPrefix b = rhs.canonicalized();
+  return a.containsAddress(b.network) || b.containsAddress(a.network);
 }
 
 static inline uint8_t distributableExternalSubnetRequiredHostBits(ExternalAddressFamily family)
@@ -4402,26 +4427,9 @@ static inline uint8_t distributableExternalSubnetRequiredHostBits(ExternalAddres
   return 16;
 }
 
-static inline uint8_t routableExternalSubnetWidestPrefixLength(ExternalAddressFamily family)
-{
-  (void)family;
-  return 4;
-}
-
-static inline uint8_t routableExternalSubnetMostSpecificPrefixLength(ExternalAddressFamily family)
-{
-  if (family == ExternalAddressFamily::ipv6)
-  {
-    return 48;
-  }
-
-  return 24;
-}
-
 static inline bool routableExternalSubnetHasSupportedBreadth(const DistributableExternalSubnet& subnet)
 {
-  ExternalAddressFamily family = subnet.subnet.network.is6 ? ExternalAddressFamily::ipv6 : ExternalAddressFamily::ipv4;
-  return subnet.subnet.cidr >= routableExternalSubnetWidestPrefixLength(family) && subnet.subnet.cidr <= routableExternalSubnetMostSpecificPrefixLength(family);
+  return subnet.subnet.cidr <= (subnet.subnet.network.is6 ? 128 : 32);
 }
 
 static inline bool distributableExternalSubnetCanAllocateAddresses(const DistributableExternalSubnet& subnet)
@@ -4443,6 +4451,21 @@ static inline bool distributableExternalSubnetAllowsWhiteholes(const Distributab
 static inline bool externalSubnetUsageIsValid(ExternalSubnetUsage usage)
 {
   return usage == ExternalSubnetUsage::wormholes || usage == ExternalSubnetUsage::whiteholes || usage == ExternalSubnetUsage::both;
+}
+
+static inline bool routableIngressScopeIsValid(RoutableIngressScope scope)
+{
+  return scope == RoutableIngressScope::switchboardFleet || scope == RoutableIngressScope::singleMachine;
+}
+
+static inline bool routablePrefixKindIsValid(RoutablePrefixKind kind)
+{
+  return kind == RoutablePrefixKind::BGP || kind == RoutablePrefixKind::elastic;
+}
+
+static inline bool elasticPrefixIntentIsValid(ElasticPrefixIntent intent)
+{
+  return intent == ElasticPrefixIntent::any || intent == ElasticPrefixIntent::create || intent == ElasticPrefixIntent::anyOrCreate;
 }
 
 class TlsIdentity {
@@ -4477,35 +4500,6 @@ static void serialize(S&& serializer, TlsIdentity& identity)
   serializer.object(identity.ipSans);
   serializer.container(identity.tags, UINT32_MAX, [](S& serializer, String& tag) {
     serializer.text1b(tag, UINT32_MAX);
-  });
-}
-
-class ApiCredential {
-public:
-
-  String name;
-  String provider;
-  uint64_t generation = 0;
-  int64_t expiresAtMs = 0;
-  int64_t activeFromMs = 0;
-  int64_t sunsetAtMs = 0;
-  String material;
-  bytell_hash_map<String, String> metadata;
-};
-
-template <typename S>
-static void serialize(S&& serializer, ApiCredential& credential)
-{
-  serializer.text1b(credential.name, UINT32_MAX);
-  serializer.text1b(credential.provider, UINT32_MAX);
-  serializer.value8b(credential.generation);
-  serializer.value8b(credential.expiresAtMs);
-  serializer.value8b(credential.activeFromMs);
-  serializer.value8b(credential.sunsetAtMs);
-  serializer.text1b(credential.material, UINT32_MAX);
-  serializer.ext(credential.metadata, bitsery::ext::BytellHashMap {}, [](S& serializer, String& key, String& value) {
-    serializer.text1b(key, UINT32_MAX);
-    serializer.text1b(value, UINT32_MAX);
   });
 }
 
@@ -5224,6 +5218,160 @@ static void serialize(S&& serializer, ProdigyPendingAddMachinesOperation& operat
   serializer.text1b(operation.lastFailure, UINT32_MAX);
 }
 
+enum class RoutableResourceLeaseKind : uint8_t {
+  wormholeAddress = 0,
+  whiteholeAddressPort = 1,
+  dnsRecord = 2
+};
+
+class RoutableResourceLeaseOwner {
+public:
+
+  uint16_t applicationID = 0;
+  uint64_t deploymentID = 0;
+  uint64_t lineageID = 0;
+  String name;
+
+  bool operator==(const RoutableResourceLeaseOwner& other) const
+  {
+    return applicationID == other.applicationID && deploymentID == other.deploymentID && lineageID == other.lineageID && name.equals(other.name);
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, RoutableResourceLeaseOwner& owner)
+{
+  serializer.value2b(owner.applicationID);
+  serializer.value8b(owner.deploymentID);
+  serializer.value8b(owner.lineageID);
+  serializer.text1b(owner.name, UINT32_MAX);
+}
+
+class RoutableResourceLease {
+public:
+
+  RoutableResourceLeaseKind kind = RoutableResourceLeaseKind::wormholeAddress;
+  RoutableResourceLeaseOwner owner;
+  uint128_t registeredPrefixUUID = 0;
+  IPAddress address;
+  uint16_t sourcePort = 0;
+  String dnsProvider;
+  String dnsCredentialName;
+  String dnsZone;
+  String dnsName;
+  String dnsType;
+  uint32_t dnsTTL = 0;
+
+  bool operator==(const RoutableResourceLease& other) const
+  {
+    return kind == other.kind && owner == other.owner && registeredPrefixUUID == other.registeredPrefixUUID && address.equals(other.address) && sourcePort == other.sourcePort && dnsProvider.equals(other.dnsProvider) && dnsCredentialName.equals(other.dnsCredentialName) && dnsZone.equals(other.dnsZone) && dnsName.equals(other.dnsName) && dnsType.equals(other.dnsType) && dnsTTL == other.dnsTTL;
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, RoutableResourceLease& lease)
+{
+  serializer.value1b(lease.kind);
+  serializer.object(lease.owner);
+  serializer.value16b(lease.registeredPrefixUUID);
+  serializer.object(lease.address);
+  serializer.value2b(lease.sourcePort);
+  serializer.text1b(lease.dnsProvider, UINT32_MAX);
+  serializer.text1b(lease.dnsCredentialName, UINT32_MAX);
+  serializer.text1b(lease.dnsZone, UINT32_MAX);
+  serializer.text1b(lease.dnsName, UINT32_MAX);
+  serializer.text1b(lease.dnsType, UINT32_MAX);
+  serializer.value4b(lease.dnsTTL);
+}
+
+class RoutableResourceLeaseReport {
+public:
+
+  Vector<RoutableResourceLease> leases;
+  bool success = false;
+  String failure;
+};
+
+template <typename S>
+static void serialize(S&& serializer, RoutableResourceLeaseReport& payload)
+{
+  serializer.object(payload.leases);
+  serializer.value1b(payload.success);
+  serializer.text1b(payload.failure, UINT32_MAX);
+}
+
+static inline bool routableResourceLeaseOwnersCompatible(const RoutableResourceLeaseOwner& lhs, const RoutableResourceLeaseOwner& rhs)
+{
+  if (lhs.deploymentID != 0 && lhs.deploymentID == rhs.deploymentID)
+  {
+    return true;
+  }
+
+  return lhs.applicationID != 0 && lhs.applicationID == rhs.applicationID && lhs.lineageID != 0 && lhs.lineageID == rhs.lineageID;
+}
+
+static inline bool routableResourceDNSPartEquals(const String& lhs, const String& rhs, bool trimTrailingDot)
+{
+  size_t lhsSize = lhs.size();
+  size_t rhsSize = rhs.size();
+  if (trimTrailingDot)
+  {
+    while (lhsSize > 0 && lhs[lhsSize - 1] == '.')
+    {
+      lhsSize -= 1;
+    }
+    while (rhsSize > 0 && rhs[rhsSize - 1] == '.')
+    {
+      rhsSize -= 1;
+    }
+  }
+  if (lhsSize != rhsSize)
+  {
+    return false;
+  }
+  for (size_t index = 0; index < lhsSize; ++index)
+  {
+    if (std::tolower(static_cast<unsigned char>(lhs[index])) != std::tolower(static_cast<unsigned char>(rhs[index])))
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+static inline bool routableResourceDNSIdentityMatches(const RoutableResourceLease& lhs, const RoutableResourceLease& rhs)
+{
+  return routableResourceDNSPartEquals(lhs.dnsProvider, rhs.dnsProvider, false) &&
+         routableResourceDNSPartEquals(lhs.dnsZone, rhs.dnsZone, true) &&
+         routableResourceDNSPartEquals(lhs.dnsName, rhs.dnsName, true) &&
+         routableResourceDNSPartEquals(lhs.dnsType, rhs.dnsType, false);
+}
+
+static inline bool routableResourceLeaseResourcesIntersect(const RoutableResourceLease& lhs, const RoutableResourceLease& rhs)
+{
+  if (lhs.kind == RoutableResourceLeaseKind::dnsRecord && rhs.kind == RoutableResourceLeaseKind::dnsRecord)
+  {
+    return routableResourceDNSIdentityMatches(lhs, rhs);
+  }
+
+  if (lhs.kind == RoutableResourceLeaseKind::wormholeAddress && rhs.kind == RoutableResourceLeaseKind::wormholeAddress)
+  {
+    return lhs.address.isNull() == false && lhs.address.equals(rhs.address);
+  }
+
+  if (lhs.kind == RoutableResourceLeaseKind::whiteholeAddressPort && rhs.kind == RoutableResourceLeaseKind::whiteholeAddressPort)
+  {
+    return lhs.sourcePort != 0 && lhs.sourcePort == rhs.sourcePort && lhs.address.equals(rhs.address);
+  }
+
+  return false;
+}
+
+static inline bool routableResourceLeasesConflict(const RoutableResourceLease& lhs, const RoutableResourceLease& rhs)
+{
+  return routableResourceLeaseOwnersCompatible(lhs.owner, rhs.owner) == false && routableResourceLeaseResourcesIntersect(lhs, rhs);
+}
+
 class ProdigyMasterAuthorityRuntimeState {
 public:
 
@@ -5238,11 +5386,12 @@ public:
   Vector<ProdigyStatefulWorkerTopologyUpgradeOperation> statefulWorkerTopologyUpgradeOperations;
   Vector<ProdigyDeferredStatefulScaleIntent> deferredStatefulScaleIntents;
   Vector<ProdigyManagedMachineSchema> machineSchemas;
+  Vector<RoutableResourceLease> routableResourceLeases;
   ProdigyPersistentUpdateSelfState updateSelf;
 
   bool operator==(const ProdigyMasterAuthorityRuntimeState& other) const
   {
-    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || machineSchemas.size() != other.machineSchemas.size() || updateSelf != other.updateSelf)
+    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || updateSelf != other.updateSelf)
     {
       return false;
     }
@@ -5288,6 +5437,14 @@ public:
       }
     }
 
+    for (uint32_t index = 0; index < routableResourceLeases.size(); ++index)
+    {
+      if ((routableResourceLeases[index] == other.routableResourceLeases[index]) == false)
+      {
+        return false;
+      }
+    }
+
     return true;
   }
 
@@ -5311,6 +5468,7 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
   serializer.object(state.statefulWorkerTopologyUpgradeOperations);
   serializer.object(state.deferredStatefulScaleIntents);
   serializer.object(state.machineSchemas);
+  serializer.object(state.routableResourceLeases);
   serializer.object(state.updateSelf);
 }
 

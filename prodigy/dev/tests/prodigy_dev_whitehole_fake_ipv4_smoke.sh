@@ -344,7 +344,7 @@ cat > "${plan_json}" <<EOF
     {
       "transport": "quic",
       "family": "ipv4",
-      "source": "distributableSubnet"
+      "source": "registeredRoutablePrefix"
     }
   ],
   "moveConstructively": true,

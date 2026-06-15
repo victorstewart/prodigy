@@ -220,9 +220,10 @@ public:
   }
   virtual bool assignProviderElasticAddress(Machine *machine,
                                             ExternalAddressFamily family,
+                                            ElasticPrefixIntent intent,
                                             const String& requestedAddress,
                                             const String& providerPool,
-                                            IPAddress& assignedAddress,
+                                            IPPrefix& assignedPrefix,
                                             String& allocationID,
                                             String& associationID,
                                             bool& releaseOnRemove,
@@ -230,18 +231,19 @@ public:
   {
     (void)machine;
     (void)family;
+    (void)intent;
     (void)requestedAddress;
     (void)providerPool;
-    assignedAddress = {};
+    assignedPrefix = {};
     allocationID.clear();
     associationID.clear();
     releaseOnRemove = false;
     error.assign("assignProviderElasticAddress not implemented"_ctv);
     return false;
   }
-  virtual bool releaseProviderElasticAddress(const RegisteredRoutableAddress& address, String& error)
+  virtual bool releaseProviderElasticAddress(const DistributableExternalSubnet& prefix, String& error)
   {
-    (void)address;
+    (void)prefix;
     error.assign("releaseProviderElasticAddress not implemented"_ctv);
     return false;
   }

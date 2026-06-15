@@ -718,6 +718,13 @@ static inline bool mothershipResolveScopeHostPublicCapabilities(
         providesHostPublic6 = true;
         return true;
       }
+    case MothershipClusterProvider::unknown:
+    case MothershipClusterProvider::vultr:
+    case MothershipClusterProvider::cloudflare:
+    case MothershipClusterProvider::route53:
+    case MothershipClusterProvider::gcpCloudDNS:
+    case MothershipClusterProvider::azureDNS:
+    case MothershipClusterProvider::vultrDNS:
     default:
       {
         if (failure)
@@ -1325,6 +1332,11 @@ static inline ProdigyEnvironmentKind mothershipEnvironmentKindFromProvider(Mothe
         return ProdigyEnvironmentKind::vultr;
       }
     case MothershipClusterProvider::unknown:
+    case MothershipClusterProvider::cloudflare:
+    case MothershipClusterProvider::route53:
+    case MothershipClusterProvider::gcpCloudDNS:
+    case MothershipClusterProvider::azureDNS:
+    case MothershipClusterProvider::vultrDNS:
       {
         break;
       }

@@ -242,23 +242,23 @@ int main(void)
   brain.machines.insert(&local);
   brain.machines.insert(&remote);
 
-  RegisteredRoutableAddress localIngress = {};
+  DistributableExternalSubnet localIngress = {};
   localIngress.uuid = uint128_t(0x9901);
   localIngress.name.assign("nametag-local"_ctv);
-  localIngress.kind = RoutableAddressKind::testFakeAddress;
-  localIngress.family = ExternalAddressFamily::ipv6;
   localIngress.machineUUID = local.uuid;
-  localIngress.address = IPAddress("2001:db8:100::b", true);
-  brain.brainConfig.routableAddresses.push_back(localIngress);
+  localIngress.ingressScope = RoutableIngressScope::singleMachine;
+  localIngress.usage = ExternalSubnetUsage::wormholes;
+  localIngress.subnet = IPPrefix("2001:db8:100::b", true, 128);
+  brain.brainConfig.distributableExternalSubnets.push_back(localIngress);
 
-  RegisteredRoutableAddress remoteIngress = {};
+  DistributableExternalSubnet remoteIngress = {};
   remoteIngress.uuid = uint128_t(0x9902);
   remoteIngress.name.assign("nametag-remote"_ctv);
-  remoteIngress.kind = RoutableAddressKind::testFakeAddress;
-  remoteIngress.family = ExternalAddressFamily::ipv6;
   remoteIngress.machineUUID = remote.uuid;
-  remoteIngress.address = IPAddress("2001:db8:100::c", true);
-  brain.brainConfig.routableAddresses.push_back(remoteIngress);
+  remoteIngress.ingressScope = RoutableIngressScope::singleMachine;
+  remoteIngress.usage = ExternalSubnetUsage::wormholes;
+  remoteIngress.subnet = IPPrefix("2001:db8:100::c", true, 128);
+  brain.brainConfig.distributableExternalSubnets.push_back(remoteIngress);
 
   SwitchboardOverlayRoutingConfig config = {};
   suite.expect(brain.testBuildSwitchboardOverlayRoutingConfig(&local, config), "build_overlay_routing_config_accepts_machine");

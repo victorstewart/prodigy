@@ -2,6 +2,7 @@
 #include <services/debug.h>
 #include <prodigy/brain/brain.h>
 #include <prodigy/bootstrap.config.h>
+#include <prodigy/dns.providers.h>
 #include <prodigy/netdev.detect.h>
 #include <prodigy/persistent.state.h>
 #include <prodigy/iaas/runtime/runtime.h>
@@ -1061,6 +1062,7 @@ public:
     }
 
     iaas = new RuntimeAwareBrainIaaS(&persistentStateStore, effectiveBootstrapConfig, persistentBootState);
+    dnsProvider = new ProdigyDefaultDNSProvider();
   }
 
   bool loadAuthoritativeClusterTopology(ClusterTopology& topology) const override

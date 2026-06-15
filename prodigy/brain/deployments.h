@@ -1087,11 +1087,13 @@ static NeuronContainerMetricPolicy deriveNeuronMetricPolicyForDeployment(const D
   return policy;
 }
 
-static const DistributableExternalSubnet *findDistributableExternalSubnetForFamily(
+static const DistributableExternalSubnet *findWhiteholeRoutablePrefixForFamily(
     const BrainConfig& config,
     ExternalAddressFamily family,
-    ExternalSubnetUsage usage = ExternalSubnetUsage::wormholes)
+    const Machine *machine = nullptr,
+    uint128_t *requiredMachineUUID = nullptr)
 {
+  uint128_t required = 0;
   for (const DistributableExternalSubnet& subnet : config.distributableExternalSubnets)
   {
     if (distributableExternalSubnetMatchesFamily(subnet, family) == false)
@@ -1099,87 +1101,39 @@ static const DistributableExternalSubnet *findDistributableExternalSubnetForFami
       continue;
     }
 
-    if (usage == ExternalSubnetUsage::wormholes && distributableExternalSubnetAllowsWormholes(subnet) == false)
+    if (distributableExternalSubnetAllowsWhiteholes(subnet) == false)
     {
       continue;
     }
 
-    if (usage == ExternalSubnetUsage::whiteholes && distributableExternalSubnetAllowsWhiteholes(subnet) == false)
+    if (subnet.ingressScope == RoutableIngressScope::singleMachine)
     {
-      continue;
-    }
-
-    if (usage == ExternalSubnetUsage::both && (distributableExternalSubnetAllowsWormholes(subnet) == false || distributableExternalSubnetAllowsWhiteholes(subnet) == false))
-    {
-      continue;
+      if (subnet.machineUUID == 0)
+      {
+        continue;
+      }
+      if (machine != nullptr && subnet.machineUUID != machine->uuid)
+      {
+        if (required == 0)
+        {
+          required = subnet.machineUUID;
+        }
+        continue;
+      }
+      if (requiredMachineUUID)
+      {
+        *requiredMachineUUID = subnet.machineUUID;
+      }
     }
 
     return &subnet;
   }
 
-  return nullptr;
-}
-
-static const DistributableExternalSubnet *findAllocatableDistributableExternalSubnetForFamily(
-    const BrainConfig& config,
-    ExternalAddressFamily family,
-    ExternalSubnetUsage usage = ExternalSubnetUsage::wormholes)
-{
-  for (const DistributableExternalSubnet& subnet : config.distributableExternalSubnets)
+  if (requiredMachineUUID)
   {
-    if (distributableExternalSubnetMatchesFamily(subnet, family) == false)
-    {
-      continue;
-    }
-
-    if (usage == ExternalSubnetUsage::wormholes && distributableExternalSubnetAllowsWormholes(subnet) == false)
-    {
-      continue;
-    }
-
-    if (usage == ExternalSubnetUsage::whiteholes && distributableExternalSubnetAllowsWhiteholes(subnet) == false)
-    {
-      continue;
-    }
-
-    if (usage == ExternalSubnetUsage::both && (distributableExternalSubnetAllowsWormholes(subnet) == false || distributableExternalSubnetAllowsWhiteholes(subnet) == false))
-    {
-      continue;
-    }
-
-    if (distributableExternalSubnetCanAllocateAddresses(subnet))
-    {
-      return &subnet;
-    }
+    *requiredMachineUUID = required;
   }
-
   return nullptr;
-}
-
-static IPPrefix buildDistributedExternalIPv6Address(const DistributableExternalSubnet& subnet, uint8_t datacenterFragment, uint32_t machineFragment, uint8_t containerFragment)
-{
-  IPPrefix address = subnet.subnet.canonicalized();
-  address.cidr = 128;
-
-  address.network.v6[11] = datacenterFragment;
-  address.network.v6[12] = static_cast<uint8_t>((machineFragment >> 16) & 0xFF);
-  address.network.v6[13] = static_cast<uint8_t>((machineFragment >> 8) & 0xFF);
-  address.network.v6[14] = static_cast<uint8_t>(machineFragment & 0xFF);
-  address.network.v6[15] = containerFragment;
-
-  return address;
-}
-
-static IPPrefix buildDistributedExternalIPv4Address(const DistributableExternalSubnet& subnet, uint32_t machineFragment, uint8_t containerFragment)
-{
-  IPPrefix address = subnet.subnet.canonicalized();
-  address.cidr = 32;
-
-  uint32_t base = ntohl(address.network.v4);
-  uint32_t suffix = (uint32_t(machineFragment & 0xFF) << 8) | uint32_t(containerFragment);
-  address.network.v4 = htonl(base | suffix);
-
-  return address;
 }
 
 enum class DeploymentTimeoutFlags : uint64_t {
@@ -3218,6 +3172,7 @@ private:
       bool sameDeploymentID = (previous->plan.config.deploymentID() == plan.config.deploymentID());
       if (sameDeploymentID == false)
       {
+        thisBrain->releaseRoutableResourceLeasesForDeployment(previous->plan.config.deploymentID());
         thisBrain->queueBrainReplication(BrainTopic::cullDeployment, previous->plan.config.deploymentID());
         ContainerStore::destroy(previous->plan.config.deploymentID());
       }
@@ -6842,8 +6797,10 @@ public:
       Machine *machine,
       Whitehole& whitehole,
       uint128_t *requiredMachineUUID = nullptr,
-      const ContainerView *container = nullptr)
+      const ContainerView *container = nullptr,
+      const RoutableResourceLeaseOwner *owner = nullptr)
   {
+    (void)container;
     if (requiredMachineUUID)
     {
       *requiredMachineUUID = 0;
@@ -6869,52 +6826,44 @@ public:
       return true;
     }
 
-    if (whitehole.source == ExternalAddressSource::distributableSubnet)
+    if (whitehole.source == ExternalAddressSource::registeredRoutablePrefix)
     {
-      const DistributableExternalSubnet *subnet = findAllocatableDistributableExternalSubnetForFamily(
+      const DistributableExternalSubnet *subnet = findWhiteholeRoutablePrefixForFamily(
           thisBrain->brainConfig,
           whitehole.family,
-          ExternalSubnetUsage::whiteholes);
+          machine,
+          requiredMachineUUID);
       if (subnet == nullptr)
       {
         return false;
       }
 
-      if (requiredMachineUUID)
+      IPPrefix registered = subnet->subnet.canonicalized();
+      uint64_t firstOffset = distributableExternalSubnetIsHostPrefix(*subnet) ? 0 : 1;
+      for (uint64_t offset = firstOffset; offset < firstOffset + 65'536u; ++offset)
       {
-        *requiredMachineUUID = machine->uuid;
+        IPAddress candidate = {};
+        if (routablePrefixAddressAtOffset(registered, offset, candidate) == false)
+        {
+          break;
+        }
+        if (candidate.isNull() == false && whiteholeAddressHasFreePort(candidate, owner))
+        {
+          whitehole.address = candidate;
+          whitehole.hasAddress = true;
+          return true;
+        }
       }
 
-      if (container == nullptr)
-      {
-        return true;
-      }
-
-      IPPrefix sourceAddress = {};
-      if (whitehole.family == ExternalAddressFamily::ipv6)
-      {
-        sourceAddress = buildDistributedExternalIPv6Address(
-            *subnet,
-            thisBrain->brainConfig.datacenterFragment,
-            machine->fragment,
-            container->fragment);
-      }
-      else
-      {
-        sourceAddress = buildDistributedExternalIPv4Address(*subnet, machine->fragment, container->fragment);
-      }
-
-      whitehole.address = sourceAddress.network;
-      whitehole.hasAddress = true;
-      return true;
+      return false;
     }
 
     return false;
   }
 
-  static bool whiteholeAddressPortAlreadyInUse(Machine *machine, ContainerView *skipContainer, const IPAddress& address, uint16_t sourcePort, ExternalAddressTransport transport)
+  static bool whiteholeAddressPortAlreadyInUse(const IPAddress& address, uint16_t sourcePort, const RoutableResourceLeaseOwner *owner = nullptr)
   {
-    if (machine == nullptr || address.isNull() || sourcePort == 0)
+    if (address.isNull() || sourcePort == 0)
     {
       return false;
     }
@@ -6934,29 +6883,47 @@ public:
 
       for (const Whitehole& existing : candidate->whiteholes)
       {
-        if (candidate->machine == nullptr || candidate->machine->uuid != machine->uuid)
+        if (existing.sourcePort == sourcePort && existing.address.equals(address))
         {
-          continue;
-        }
-
-        if (existing.sourcePort == sourcePort && existing.transport == transport && existing.address.equals(address))
-        {
-          if (candidate == skipContainer && existing.sourcePort == 0)
-          {
-            continue;
-          }
-
           return true;
         }
+      }
+    }
+
+    RoutableResourceLease lease = {};
+    lease.kind = RoutableResourceLeaseKind::whiteholeAddressPort;
+    if (owner != nullptr)
+    {
+      lease.owner = *owner;
+    }
+    lease.address = address;
+    lease.sourcePort = sourcePort;
+    for (const RoutableResourceLease& existing : thisBrain->routableResourceLeaseRuntimeState)
+    {
+      if (routableResourceLeasesConflict(existing, lease))
+      {
+        return true;
       }
     }
 
     return false;
   }
 
-  static bool allocateWhiteholeSourcePort(Machine *machine, ContainerView *container, Whitehole& whitehole)
+  static bool whiteholeAddressHasFreePort(const IPAddress& address, const RoutableResourceLeaseOwner *owner = nullptr)
   {
-    if (machine == nullptr || whitehole.address.isNull())
+    for (uint32_t port = 49'152; port <= 65'535; ++port)
+    {
+      if (whiteholeAddressPortAlreadyInUse(address, uint16_t(port), owner) == false)
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static bool allocateWhiteholeSourcePort(Whitehole& whitehole, const RoutableResourceLeaseOwner *owner = nullptr)
+  {
+    if (whitehole.address.isNull())
     {
       return false;
     }
@@ -6964,7 +6931,7 @@ public:
     for (uint32_t port = 49'152; port <= 65'535; ++port)
     {
       uint16_t candidatePort = uint16_t(port);
-      if (whiteholeAddressPortAlreadyInUse(machine, container, whitehole.address, candidatePort, whitehole.transport))
+      if (whiteholeAddressPortAlreadyInUse(whitehole.address, candidatePort, owner))
       {
         continue;
       }
@@ -6980,6 +6947,79 @@ public:
     }
 
     return false;
+  }
+
+  RoutableResourceLeaseOwner routableResourceLeaseOwner(void) const
+  {
+    RoutableResourceLeaseOwner owner = {};
+    owner.applicationID = plan.config.applicationID;
+    owner.deploymentID = plan.config.deploymentID();
+    owner.lineageID = plan.config.applicationID;
+    return owner;
+  }
+
+  bool reserveWhiteholeAddressPortLease(const Whitehole& whitehole, const RoutableResourceLeaseOwner& owner)
+  {
+    if (whitehole.hasAddress == false || whitehole.address.isNull() || whitehole.sourcePort == 0)
+    {
+      return false;
+    }
+
+    RoutableResourceLease lease = {};
+    lease.kind = RoutableResourceLeaseKind::whiteholeAddressPort;
+    lease.owner = owner;
+    lease.address = whitehole.address;
+    lease.sourcePort = whitehole.sourcePort;
+    for (const DistributableExternalSubnet& subnet : thisBrain->brainConfig.distributableExternalSubnets)
+    {
+      if (distributableExternalSubnetAllowsWhiteholes(subnet) && distributableExternalSubnetContainsAddress(subnet, whitehole.address))
+      {
+        lease.registeredPrefixUUID = subnet.uuid;
+        break;
+      }
+    }
+    for (const RoutableResourceLease& existing : thisBrain->routableResourceLeaseRuntimeState)
+    {
+      if (existing.kind == lease.kind && existing.sourcePort == lease.sourcePort && existing.address.equals(lease.address) && routableResourceLeaseOwnersCompatible(existing.owner, lease.owner))
+      {
+        return true;
+      }
+      if (routableResourceLeasesConflict(existing, lease))
+      {
+        return false;
+      }
+    }
+
+    thisBrain->routableResourceLeaseRuntimeState.push_back(lease);
+    thisBrain->noteRoutableResourceLeaseRuntimeStateChanged();
+    return true;
+  }
+
+  bool releaseWhiteholeAddressPortLease(const Whitehole& whitehole, const RoutableResourceLeaseOwner& owner)
+  {
+    if (whitehole.hasAddress == false || whitehole.address.isNull() || whitehole.sourcePort == 0)
+    {
+      return false;
+    }
+
+    bool released = false;
+    for (auto it = thisBrain->routableResourceLeaseRuntimeState.begin(); it != thisBrain->routableResourceLeaseRuntimeState.end();)
+    {
+      if (it->kind == RoutableResourceLeaseKind::whiteholeAddressPort && it->owner.deploymentID == owner.deploymentID && it->address.equals(whitehole.address) && it->sourcePort == whitehole.sourcePort)
+      {
+        it = thisBrain->routableResourceLeaseRuntimeState.erase(it);
+        released = true;
+      }
+      else
+      {
+        ++it;
+      }
+    }
+    if (released)
+    {
+      thisBrain->noteRoutableResourceLeaseRuntimeStateChanged();
+    }
+    return released;
   }
 
   static uint32_t nFitOnMachine(ApplicationDeployment *deployment, Machine *machine, uint32_t budget, const MachineResourcesDelta& deltas = MachineResourcesDelta {}, const ApplicationConfig *configOverride = nullptr)
@@ -7033,22 +7073,27 @@ public:
 
     for (const Wormhole& wormhole : deployment->plan.wormholes)
     {
-      if (wormhole.source != ExternalAddressSource::registeredRoutableAddress)
+      if (wormhole.source != ExternalAddressSource::registeredRoutablePrefix)
       {
         continue;
       }
 
-      const RegisteredRoutableAddress *registered = findRegisteredRoutableAddress(
-          thisBrain->brainConfig.routableAddresses,
-          wormhole.routableAddressUUID);
+      const DistributableExternalSubnet *registered = findRegisteredRoutablePrefix(
+          thisBrain->brainConfig.distributableExternalSubnets,
+          wormhole.routablePrefixUUID);
       if (registered == nullptr)
       {
-        return logWormholeReject("registered-routable-address-missing");
+        return logWormholeReject("registered-routable-prefix-missing");
+      }
+
+      if (registered->ingressScope != RoutableIngressScope::singleMachine)
+      {
+        continue;
       }
 
       if (registered->machineUUID == 0)
       {
-        return logWormholeReject("registered-routable-address-machine-missing");
+        return logWormholeReject("registered-routable-prefix-machine-missing");
       }
 
       if (requiredWormholeMachineUUID == 0)
@@ -7057,12 +7102,12 @@ public:
       }
       else if (requiredWormholeMachineUUID != registered->machineUUID)
       {
-        return logWormholeReject("registered-routable-address-machine-conflict");
+        return logWormholeReject("registered-routable-prefix-machine-conflict");
       }
 
       if (requiredWormholeMachineUUID != machine->uuid)
       {
-        return logWormholeReject("registered-routable-address-machine-mismatch");
+        return logWormholeReject("registered-routable-prefix-machine-mismatch");
       }
     }
 
@@ -7115,22 +7160,6 @@ public:
       {
         requiredWhiteholeMachineUUID = whiteholeMachineUUID;
       }
-    }
-
-    if (needsDistributedExternalAddressFamily(deployment->plan, ExternalAddressFamily::ipv4) && findAllocatableDistributableExternalSubnetForFamily(
-                                                                                                    thisBrain->brainConfig,
-                                                                                                    ExternalAddressFamily::ipv4,
-                                                                                                    ExternalSubnetUsage::whiteholes) == nullptr)
-    {
-      return logWhiteholeReject("missing-distributable-ipv4-subnet");
-    }
-
-    if (needsDistributedExternalAddressFamily(deployment->plan, ExternalAddressFamily::ipv6) && findAllocatableDistributableExternalSubnetForFamily(
-                                                                                                    thisBrain->brainConfig,
-                                                                                                    ExternalAddressFamily::ipv6,
-                                                                                                    ExternalSubnetUsage::whiteholes) == nullptr)
-    {
-      return logWhiteholeReject("missing-distributable-ipv6-subnet");
     }
 
     int64_t nCores = static_cast<int64_t>(machine->nLogicalCores_available) + static_cast<int64_t>(deltas.nLogicalCores);
@@ -7907,6 +7936,15 @@ public:
   {
     // Prevent double-destroy; out-of-band confirmations after a forced local destroy should not re-enter.
     assert(container->state != ContainerState::destroyed && "containerDestroyed called on an already-destroyed container");
+    RoutableResourceLeaseOwner owner = {};
+    owner.applicationID = container->applicationID;
+    owner.deploymentID = container->deploymentID;
+    owner.lineageID = container->applicationID;
+    for (const Whitehole& whitehole : container->whiteholes)
+    {
+      releaseWhiteholeAddressPortLease(whitehole, owner);
+    }
+
     thisBrain->containers.erase(container->uuid);
 
     container->state = ContainerState::destroyed;
@@ -8317,6 +8355,7 @@ public:
             container->wormholes = plan.wormholes;
             container->whiteholes = plan.whiteholes;
 
+            RoutableResourceLeaseOwner whiteholeLeaseOwner = routableResourceLeaseOwner();
             for (Whitehole& whitehole : container->whiteholes)
             {
               whitehole.hasAddress = false;
@@ -8324,7 +8363,7 @@ public:
               whitehole.sourcePort = 0;
               whitehole.bindingNonce = 0;
 
-              if (resolveWhiteholeSourceAddressForScheduling(machine, whitehole, nullptr, container) == false || whitehole.hasAddress == false || allocateWhiteholeSourcePort(machine, container, whitehole) == false)
+              if (resolveWhiteholeSourceAddressForScheduling(machine, whitehole, nullptr, container, &whiteholeLeaseOwner) == false || whitehole.hasAddress == false || allocateWhiteholeSourcePort(whitehole, &whiteholeLeaseOwner) == false || reserveWhiteholeAddressPortLease(whitehole, whiteholeLeaseOwner) == false)
               {
                 whitehole.hasAddress = false;
                 whitehole.address = {};
@@ -9201,6 +9240,7 @@ public:
     }
 
     thisBrain->deploymentsByApp.erase(plan.config.applicationID);
+    thisBrain->releaseRoutableResourceLeasesForDeployment(plan.config.deploymentID());
     if (auto it = thisBrain->deployments.find(plan.config.deploymentID()); it != thisBrain->deployments.end())
     {
       if (it->second == this)

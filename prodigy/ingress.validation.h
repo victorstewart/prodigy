@@ -260,8 +260,8 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
     case MothershipTopic::mintClientTlsIdentity:
     case MothershipTopic::registerRoutableSubnet:
     case MothershipTopic::unregisterRoutableSubnet:
-    case MothershipTopic::registerRoutableAddress:
-    case MothershipTopic::unregisterRoutableAddress:
+    case MothershipTopic::upsertDNSBinding:
+    case MothershipTopic::deleteDNSBinding:
       {
         return consumeVariable(cursor, terminal) && cursor == terminal;
       }
@@ -294,7 +294,8 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
       }
     case MothershipTopic::pullClusterReport:
     case MothershipTopic::pullRoutableSubnets:
-    case MothershipTopic::pullRoutableAddresses:
+    case MothershipTopic::pullRoutableResourceLeases:
+    case MothershipTopic::pullDNSBindings:
       {
         return (cursor == terminal);
       }

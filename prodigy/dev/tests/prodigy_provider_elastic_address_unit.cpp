@@ -285,7 +285,7 @@ static void testAwsAllocateElasticFromPool(TestSuite& suite)
   Machine machine = {};
   machine.cloudID = "i-123"_ctv;
 
-  IPAddress assigned = {};
+  IPPrefix assigned = {};
   String allocationID = {};
   String associationID = {};
   bool releaseOnRemove = false;
@@ -293,6 +293,7 @@ static void testAwsAllocateElasticFromPool(TestSuite& suite)
   bool ok = aws.assignProviderElasticAddress(
       &machine,
       ExternalAddressFamily::ipv4,
+      ElasticPrefixIntent::create,
       String(),
       "pool-1"_ctv,
       assigned,
@@ -303,7 +304,7 @@ static void testAwsAllocateElasticFromPool(TestSuite& suite)
 
   suite.expect(ok, "aws_allocate_elastic_from_pool_success");
   suite.expect(error.size() == 0, "aws_allocate_elastic_from_pool_no_error");
-  suite.expect(assigned.is6 == false && assigned.v4 != 0, "aws_allocate_elastic_from_pool_assigned_ipv4");
+  suite.expect(assigned.cidr == 32 && assigned.network.is6 == false && assigned.network.v4 != 0, "aws_allocate_elastic_from_pool_assigned_ipv4_prefix");
   suite.expect(allocationID == "eipalloc-123"_ctv, "aws_allocate_elastic_from_pool_allocation_id");
   suite.expect(associationID == "eipassoc-123"_ctv, "aws_allocate_elastic_from_pool_association_id");
   suite.expect(releaseOnRemove, "aws_allocate_elastic_from_pool_release_flag");
@@ -322,14 +323,14 @@ static void testAwsAllocateElasticFromPool(TestSuite& suite)
   call.response = "<ReleaseAddressResponse/>"_ctv;
   aws.expected.push_back(call);
 
-  RegisteredRoutableAddress address = {};
-  address.kind = RoutableAddressKind::providerElasticAddress;
-  address.providerAllocationID = allocationID;
-  address.providerAssociationID = associationID;
-  address.releaseOnRemove = releaseOnRemove;
+  DistributableExternalSubnet prefix = {};
+  prefix.kind = RoutablePrefixKind::elastic;
+  prefix.providerAllocationID = allocationID;
+  prefix.providerAssociationID = associationID;
+  prefix.releaseOnRemove = releaseOnRemove;
 
   error.clear();
-  ok = aws.releaseProviderElasticAddress(address, error);
+  ok = aws.releaseProviderElasticAddress(prefix, error);
   suite.expect(ok, "aws_allocate_elastic_from_pool_release_success");
   suite.expect(error.size() == 0, "aws_allocate_elastic_from_pool_release_no_error");
   suite.expect(aws.nextExpected == aws.expected.size(), "aws_allocate_elastic_from_pool_release_consumed_calls");
@@ -394,7 +395,7 @@ static void testAwsExplicitCredentialMaterialWinsOverInstanceProfile(TestSuite& 
   Machine machine = {};
   machine.cloudID = "i-456"_ctv;
 
-  IPAddress assigned = {};
+  IPPrefix assigned = {};
   String allocationID = {};
   String associationID = {};
   bool releaseOnRemove = false;
@@ -402,6 +403,7 @@ static void testAwsExplicitCredentialMaterialWinsOverInstanceProfile(TestSuite& 
   bool ok = aws.assignProviderElasticAddress(
       &machine,
       ExternalAddressFamily::ipv4,
+      ElasticPrefixIntent::create,
       String(),
       "pool-2"_ctv,
       assigned,
@@ -412,7 +414,7 @@ static void testAwsExplicitCredentialMaterialWinsOverInstanceProfile(TestSuite& 
 
   suite.expect(ok, "aws_explicit_credential_material_wins_over_instance_profile_success");
   suite.expect(error.size() == 0, "aws_explicit_credential_material_wins_over_instance_profile_no_error");
-  suite.expect(assigned.is6 == false && assigned.v4 != 0, "aws_explicit_credential_material_wins_over_instance_profile_assigned_ipv4");
+  suite.expect(assigned.cidr == 32 && assigned.network.is6 == false && assigned.network.v4 != 0, "aws_explicit_credential_material_wins_over_instance_profile_assigned_ipv4_prefix");
   suite.expect(allocationID == "eipalloc-456"_ctv, "aws_explicit_credential_material_wins_over_instance_profile_allocation_id");
   suite.expect(associationID == "eipassoc-456"_ctv, "aws_explicit_credential_material_wins_over_instance_profile_association_id");
   suite.expect(releaseOnRemove, "aws_explicit_credential_material_wins_over_instance_profile_release_flag");
@@ -483,7 +485,7 @@ static void testGcpRequestedElasticMove(TestSuite& suite)
   Machine machine = {};
   machine.cloudID = "111"_ctv;
 
-  IPAddress assigned = {};
+  IPPrefix assigned = {};
   String allocationID = {};
   String associationID = {};
   bool releaseOnRemove = false;
@@ -491,6 +493,7 @@ static void testGcpRequestedElasticMove(TestSuite& suite)
   bool ok = gcp.assignProviderElasticAddress(
       &machine,
       ExternalAddressFamily::ipv4,
+      ElasticPrefixIntent::any,
       "34.1.2.3"_ctv,
       String(),
       assigned,
@@ -501,7 +504,7 @@ static void testGcpRequestedElasticMove(TestSuite& suite)
 
   suite.expect(ok, "gcp_requested_elastic_move_success");
   suite.expect(error.size() == 0, "gcp_requested_elastic_move_no_error");
-  suite.expect(assigned.is6 == false && assigned.v4 != 0, "gcp_requested_elastic_move_assigned_ipv4");
+  suite.expect(assigned.cidr == 32 && assigned.network.is6 == false && assigned.network.v4 != 0, "gcp_requested_elastic_move_assigned_ipv4_prefix");
   suite.expect(allocationID == "existing-ip"_ctv, "gcp_requested_elastic_move_allocation_id");
   suite.expect(associationID == "target-brain|nic0|External NAT"_ctv, "gcp_requested_elastic_move_association_id");
   suite.expect(releaseOnRemove == false, "gcp_requested_elastic_move_release_flag");
@@ -522,14 +525,14 @@ static void testGcpRequestedElasticMove(TestSuite& suite)
   call.response = "{\"status\":\"DONE\"}"_ctv;
   gcp.expected.push_back(call);
 
-  RegisteredRoutableAddress address = {};
-  address.kind = RoutableAddressKind::providerElasticAddress;
-  address.providerAllocationID = allocationID;
-  address.providerAssociationID = associationID;
-  address.releaseOnRemove = releaseOnRemove;
+  DistributableExternalSubnet prefix = {};
+  prefix.kind = RoutablePrefixKind::elastic;
+  prefix.providerAllocationID = allocationID;
+  prefix.providerAssociationID = associationID;
+  prefix.releaseOnRemove = releaseOnRemove;
 
   error.clear();
-  ok = gcp.releaseProviderElasticAddress(address, error);
+  ok = gcp.releaseProviderElasticAddress(prefix, error);
   suite.expect(ok, "gcp_requested_elastic_release_success");
   suite.expect(error.size() == 0, "gcp_requested_elastic_release_no_error");
   suite.expect(gcp.nextExpected == gcp.expected.size(), "gcp_requested_elastic_release_consumed_calls");
@@ -595,7 +598,7 @@ static void testAzureAllocateElasticFromPrefix(TestSuite& suite)
   Machine machine = {};
   machine.cloudID = "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1"_ctv;
 
-  IPAddress assigned = {};
+  IPPrefix assigned = {};
   String allocationID = {};
   String associationID = {};
   bool releaseOnRemove = false;
@@ -603,6 +606,7 @@ static void testAzureAllocateElasticFromPrefix(TestSuite& suite)
   bool ok = azure.assignProviderElasticAddress(
       &machine,
       ExternalAddressFamily::ipv4,
+      ElasticPrefixIntent::create,
       String(),
       "poolA"_ctv,
       assigned,
@@ -613,7 +617,7 @@ static void testAzureAllocateElasticFromPrefix(TestSuite& suite)
 
   suite.expect(ok, "azure_allocate_elastic_from_prefix_success");
   suite.expect(error.size() == 0, "azure_allocate_elastic_from_prefix_no_error");
-  suite.expect(assigned.is6 == false && assigned.v4 != 0, "azure_allocate_elastic_from_prefix_assigned_ipv4");
+  suite.expect(assigned.cidr == 32 && assigned.network.is6 == false && assigned.network.v4 != 0, "azure_allocate_elastic_from_prefix_assigned_ipv4_prefix");
   suite.expect(stringContains(allocationID, "/publicIPAddresses/ntg-pip-"_ctv), "azure_allocate_elastic_from_prefix_allocation_id");
   suite.expect(associationID == "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/nic1/ipConfigurations/ipconfig1"_ctv, "azure_allocate_elastic_from_prefix_association_id");
   suite.expect(releaseOnRemove, "azure_allocate_elastic_from_prefix_release_flag");
@@ -653,14 +657,14 @@ static void testAzureAllocateElasticFromPrefix(TestSuite& suite)
   call.response = "{\"error\":{\"message\":\"Not Found\"}}"_ctv;
   azure.expected.push_back(call);
 
-  RegisteredRoutableAddress address = {};
-  address.kind = RoutableAddressKind::providerElasticAddress;
-  address.providerAllocationID = allocationID;
-  address.providerAssociationID = associationID;
-  address.releaseOnRemove = true;
+  DistributableExternalSubnet prefix = {};
+  prefix.kind = RoutablePrefixKind::elastic;
+  prefix.providerAllocationID = allocationID;
+  prefix.providerAssociationID = associationID;
+  prefix.releaseOnRemove = true;
 
   error.clear();
-  ok = azure.releaseProviderElasticAddress(address, error);
+  ok = azure.releaseProviderElasticAddress(prefix, error);
   suite.expect(ok, "azure_allocate_elastic_from_prefix_release_success");
   suite.expect(error.size() == 0, "azure_allocate_elastic_from_prefix_release_no_error");
   suite.expect(azure.nextExpected == azure.expected.size(), "azure_allocate_elastic_from_prefix_release_consumed_calls");

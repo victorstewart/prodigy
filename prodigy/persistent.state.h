@@ -2109,6 +2109,7 @@ public:
   String bootstrapSshPrivateKeyOpenSSH;
   String bootstrapSshHostPrivateKeyOpenSSH;
   String reporterPassword;
+  String dnsCredentialMaterial;
   bytell_hash_map<uint16_t, ProdigyPersistentApplicationTlsVaultFactorySecrets> tlsVaultFactorySecretsByApp;
   bytell_hash_map<uint16_t, ProdigyPersistentApplicationApiCredentialSetSecrets> apiCredentialSecretsByApp;
   Vector<ProdigyPersistentTlsResumptionEpochSecret> tlsResumptionEpochSecrets;
@@ -2117,7 +2118,7 @@ public:
 
   bool empty(void) const
   {
-    return bootstrapSshPrivateKeyOpenSSH.size() == 0 && bootstrapSshHostPrivateKeyOpenSSH.size() == 0 && reporterPassword.size() == 0 && tlsVaultFactorySecretsByApp.empty() && apiCredentialSecretsByApp.empty() && tlsResumptionEpochSecrets.empty() && transportTLSAuthorityClusterRootKeyPem.size() == 0 && pendingAddMachinesOperationSecrets.empty();
+    return bootstrapSshPrivateKeyOpenSSH.size() == 0 && bootstrapSshHostPrivateKeyOpenSSH.size() == 0 && reporterPassword.size() == 0 && dnsCredentialMaterial.size() == 0 && tlsVaultFactorySecretsByApp.empty() && apiCredentialSecretsByApp.empty() && tlsResumptionEpochSecrets.empty() && transportTLSAuthorityClusterRootKeyPem.size() == 0 && pendingAddMachinesOperationSecrets.empty();
   }
 
   void clear(void)
@@ -2125,6 +2126,7 @@ public:
     prodigyClearPersistentSecretString(bootstrapSshPrivateKeyOpenSSH);
     prodigyClearPersistentSecretString(bootstrapSshHostPrivateKeyOpenSSH);
     prodigyClearPersistentSecretString(reporterPassword);
+    prodigyClearPersistentSecretString(dnsCredentialMaterial);
     prodigyClearPersistentSecretString(transportTLSAuthorityClusterRootKeyPem);
 
     for (auto& [applicationID, factorySecrets] : tlsVaultFactorySecretsByApp)
@@ -2162,6 +2164,7 @@ static void serialize(S&& serializer, ProdigyPersistentBrainSnapshotSecrets& sec
   serializer.text1b(secrets.bootstrapSshPrivateKeyOpenSSH, UINT32_MAX);
   serializer.text1b(secrets.bootstrapSshHostPrivateKeyOpenSSH, UINT32_MAX);
   serializer.text1b(secrets.reporterPassword, UINT32_MAX);
+  serializer.text1b(secrets.dnsCredentialMaterial, UINT32_MAX);
   serializer.object(secrets.tlsVaultFactorySecretsByApp);
   serializer.object(secrets.apiCredentialSecretsByApp);
   serializer.object(secrets.tlsResumptionEpochSecrets);
@@ -2227,9 +2230,11 @@ static inline void prodigyExtractPersistentBrainSnapshotSecrets(
   secrets.bootstrapSshPrivateKeyOpenSSH = publicSnapshot.brainConfig.bootstrapSshKeyPackage.privateKeyOpenSSH;
   secrets.bootstrapSshHostPrivateKeyOpenSSH = publicSnapshot.brainConfig.bootstrapSshHostKeyPackage.privateKeyOpenSSH;
   secrets.reporterPassword = publicSnapshot.brainConfig.reporter.password;
+  secrets.dnsCredentialMaterial = publicSnapshot.brainConfig.dnsCredential.material;
   prodigyClearPersistentSSHPrivateKey(publicSnapshot.brainConfig.bootstrapSshKeyPackage);
   prodigyClearPersistentSSHPrivateKey(publicSnapshot.brainConfig.bootstrapSshHostKeyPackage);
   prodigyClearPersistentSecretString(publicSnapshot.brainConfig.reporter.password);
+  prodigyClearPersistentSecretString(publicSnapshot.brainConfig.dnsCredential.material);
 
   for (auto& [applicationID, factory] : publicSnapshot.masterAuthority.tlsVaultFactoriesByApp)
   {
@@ -2322,6 +2327,7 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
   snapshot.brainConfig.bootstrapSshKeyPackage.privateKeyOpenSSH = secrets.bootstrapSshPrivateKeyOpenSSH;
   snapshot.brainConfig.bootstrapSshHostKeyPackage.privateKeyOpenSSH = secrets.bootstrapSshHostPrivateKeyOpenSSH;
   snapshot.brainConfig.reporter.password = secrets.reporterPassword;
+  snapshot.brainConfig.dnsCredential.material = secrets.dnsCredentialMaterial;
 
   for (const auto& [applicationID, factorySecrets] : secrets.tlsVaultFactorySecretsByApp)
   {

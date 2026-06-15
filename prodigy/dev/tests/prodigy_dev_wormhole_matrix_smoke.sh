@@ -214,14 +214,19 @@ register_address()
 {
    local family="$1"
    local log_path="$2"
+   local prefix="198.18.0.1/32"
+   if [[ "${family}" == "ipv6" ]]
+   then
+      prefix="2602:fac0:0:12ab:34cd::1/128"
+   fi
    local request
-   request="$(printf '{"name":"wormhole-%s","kind":"testFakeAddress","family":"%s"}' "${family}" "${family}")"
+   request="$(printf '{"name":"wormhole-%s","kind":"BGP","prefix":"%s","usage":"wormholes","ingressScope":"singleMachine"}' "${family}" "${prefix}")"
 
    if ! env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
-      "${MOTHERSHIP_BIN}" registerRoutableAddress "${cluster_name}" "${request}" \
+      "${MOTHERSHIP_BIN}" registerRoutableSubnet "${cluster_name}" "${request}" \
       >"${log_path}" 2>&1
    then
-      echo "FAIL: registerRoutableAddress ${family} failed"
+      echo "FAIL: registerRoutableSubnet ${family} failed"
       sed -n '1,160p' "${log_path}" || true
       exit 1
    fi
@@ -234,10 +239,10 @@ parse_registered_address()
 import re, sys
 text = open(sys.argv[1], "r", encoding="utf-8").read()
 uuid = re.search(r"\buuid=([0-9a-fA-Fx]+)", text)
-address = re.search(r"\baddress=([0-9a-fA-F:\\.]+)", text)
-if not uuid or not address:
+prefix = re.search(r"\bprefix=([^\s]+)", text)
+if not uuid or not prefix:
     raise SystemExit(1)
-print(uuid.group(1), address.group(1))
+print(uuid.group(1), prefix.group(1).split("/", 1)[0])
 PY
 }
 
@@ -253,7 +258,7 @@ EOF
 
 if [[ -z "${routable4_uuid}" || -z "${routable4_address}" || -z "${routable6_uuid}" || -z "${routable6_address}" ]]
 then
-   echo "FAIL: unable to parse registered routable addresses"
+   echo "FAIL: unable to parse registered routable prefixes"
    sed -n '1,120p' "${register4_log}" || true
    sed -n '1,120p' "${register6_log}" || true
    exit 1
@@ -311,32 +316,32 @@ cat > "${plan_json}" <<EOF
   },
   "wormholes": [
     {
-      "source": "registeredRoutableAddress",
-      "routableAddressUUID": "${routable4_uuid}",
+      "source": "registeredRoutablePrefix",
+      "routablePrefixUUID": "${routable4_uuid}",
       "externalPort": 42401,
       "containerPort": 18401,
       "layer4": "UDP",
       "isQuic": false
     },
     {
-      "source": "registeredRoutableAddress",
-      "routableAddressUUID": "${routable4_uuid}",
+      "source": "registeredRoutablePrefix",
+      "routablePrefixUUID": "${routable4_uuid}",
       "externalPort": 42402,
       "containerPort": 18402,
       "layer4": "TCP",
       "isQuic": false
     },
     {
-      "source": "registeredRoutableAddress",
-      "routableAddressUUID": "${routable6_uuid}",
+      "source": "registeredRoutablePrefix",
+      "routablePrefixUUID": "${routable6_uuid}",
       "externalPort": 42403,
       "containerPort": 18403,
       "layer4": "UDP",
       "isQuic": false
     },
     {
-      "source": "registeredRoutableAddress",
-      "routableAddressUUID": "${routable6_uuid}",
+      "source": "registeredRoutablePrefix",
+      "routablePrefixUUID": "${routable6_uuid}",
       "externalPort": 42404,
       "containerPort": 18404,
       "layer4": "TCP",

@@ -254,9 +254,10 @@ public:
 
   bool assignProviderElasticAddress(Machine *machine,
                                     ExternalAddressFamily family,
+                                    ElasticPrefixIntent intent,
                                     const String& requestedAddress,
                                     const String& providerPool,
-                                    IPAddress& assignedAddress,
+                                    IPPrefix& assignedPrefix,
                                     String& allocationID,
                                     String& associationID,
                                     bool& releaseOnRemove,
@@ -264,18 +265,19 @@ public:
   {
     return activeDelegate()->assignProviderElasticAddress(machine,
                                                           family,
+                                                          intent,
                                                           requestedAddress,
                                                           providerPool,
-                                                          assignedAddress,
+                                                          assignedPrefix,
                                                           allocationID,
                                                           associationID,
                                                           releaseOnRemove,
                                                           error);
   }
 
-  bool releaseProviderElasticAddress(const RegisteredRoutableAddress& address, String& error) override
+  bool releaseProviderElasticAddress(const DistributableExternalSubnet& prefix, String& error) override
   {
-    return activeDelegate()->releaseProviderElasticAddress(address, error);
+    return activeDelegate()->releaseProviderElasticAddress(prefix, error);
   }
 
   uint32_t supportedMachineKindsMask() const override

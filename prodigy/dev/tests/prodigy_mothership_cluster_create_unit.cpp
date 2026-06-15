@@ -754,6 +754,32 @@ int main(void)
   suite.expect(::setenv("PATH", fakePath.c_str(), 1) == 0, "set_fake_path");
 
   {
+    MothershipProdigyCluster cluster = {};
+    cluster.name = "dns-enabled"_ctv;
+    cluster.clusterUUID = 0xD501;
+    cluster.deploymentMode = MothershipClusterDeploymentMode::local;
+    cluster.controls.push_back(makeUnixControl("/run/prodigy/control.sock"_ctv));
+    cluster.dnsProvider = MothershipClusterProvider::gcpCloudDNS;
+    cluster.dnsProviderCredentialName = "gcp-dns"_ctv;
+
+    MothershipProviderCredential dnsCredential = {};
+    dnsCredential.name = "gcp-dns"_ctv;
+    dnsCredential.provider = MothershipClusterProvider::gcpCloudDNS;
+    dnsCredential.material = "gcp-bearer"_ctv;
+    dnsCredential.allowPropagateToProdigy = true;
+    dnsCredential.metadata["project"_ctv] = "prod-project"_ctv;
+
+    BrainConfig config = {};
+    String failure = {};
+    suite.expect(mothershipBuildClusterBrainConfig(cluster, nullptr, config, &failure, &dnsCredential), "cluster_dns_brain_config_builds");
+    suite.expect(config.dnsProvider.equal("gcp-cloud-dns"_ctv), "cluster_dns_brain_config_provider");
+    suite.expect(config.dnsCredential.name.equal("gcp-dns"_ctv), "cluster_dns_brain_config_credential_name");
+    suite.expect(config.dnsCredential.provider.equal("gcp-cloud-dns"_ctv), "cluster_dns_brain_config_credential_provider");
+    suite.expect(config.dnsCredential.material.equal("gcp-bearer"_ctv), "cluster_dns_brain_config_credential_material");
+    suite.expect(config.dnsCredential.metadata["project"_ctv].equal("prod-project"_ctv), "cluster_dns_brain_config_credential_metadata");
+  }
+
+  {
     FakeProvisionBrainIaaS iaas;
     ClusterMachine cloudMachine = makeTopologyMachine("aws-brain-vm"_ctv, "10.7.0.10"_ctv, true, ClusterMachineSource::adopted, ClusterMachineBacking::cloud);
     cloudMachine.cloud.cloudID = "i-tagged-seed"_ctv;

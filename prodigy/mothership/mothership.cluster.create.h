@@ -118,6 +118,11 @@ static inline bool mothershipMapClusterProviderEnvironment(MothershipClusterProv
         return true;
       }
     case MothershipClusterProvider::unknown:
+    case MothershipClusterProvider::cloudflare:
+    case MothershipClusterProvider::route53:
+    case MothershipClusterProvider::gcpCloudDNS:
+    case MothershipClusterProvider::azureDNS:
+    case MothershipClusterProvider::vultrDNS:
       {
         environment = ProdigyEnvironmentKind::unknown;
         return false;
@@ -222,9 +227,60 @@ static inline bool mothershipBuildClusterProvisioningRuntimeEnvironment(const Mo
   return true;
 }
 
+static inline bool mothershipBuildClusterDNSCredential(const MothershipProdigyCluster& cluster, const MothershipProviderCredential *source, ApiCredential& credential, String *failure = nullptr)
+{
+  credential = {};
+  if (cluster.dnsProvider == MothershipClusterProvider::unknown)
+  {
+    if (failure)
+    {
+      failure->clear();
+    }
+    return true;
+  }
+  if (source == nullptr)
+  {
+    if (failure)
+    {
+      failure->assign("cluster DNS requires provider credential"_ctv);
+    }
+    return false;
+  }
+  if (source->provider != cluster.dnsProvider)
+  {
+    if (failure)
+    {
+      failure->assign("cluster DNS credential provider mismatch"_ctv);
+    }
+    return false;
+  }
+  if (source->allowPropagateToProdigy == false)
+  {
+    if (failure)
+    {
+      failure->assign("cluster DNS credential does not allow Prodigy propagation"_ctv);
+    }
+    return false;
+  }
+
+  credential.name = cluster.dnsProviderCredentialName;
+  credential.provider.assign(mothershipClusterProviderName(cluster.dnsProvider));
+  credential.generation = uint64_t(source->updatedAtMs > 0 ? source->updatedAtMs : source->createdAtMs);
+  if (MothershipProviderCredentialRegistry::resolveCredentialMaterial(*source, credential.material, failure) == false)
+  {
+    return false;
+  }
+  credential.metadata = source->metadata;
+  if (failure)
+  {
+    failure->clear();
+  }
+  return true;
+}
+
 static inline bool mothershipResolveClusterControlSocketPath(const MothershipProdigyCluster& cluster, String& controlSocketPath, String *failure);
 
-static inline bool mothershipBuildClusterBrainConfig(const MothershipProdigyCluster& cluster, const MothershipProviderCredential *credential, BrainConfig& config, String *failure = nullptr)
+static inline bool mothershipBuildClusterBrainConfig(const MothershipProdigyCluster& cluster, const MothershipProviderCredential *credential, BrainConfig& config, String *failure = nullptr, const MothershipProviderCredential *dnsCredential = nullptr)
 {
   config = {};
   if (failure)
@@ -264,6 +320,15 @@ static inline bool mothershipBuildClusterBrainConfig(const MothershipProdigyClus
   if (mothershipBuildClusterRuntimeEnvironment(cluster, credential, config.runtimeEnvironment, failure) == false)
   {
     return false;
+  }
+
+  if (cluster.dnsProvider != MothershipClusterProvider::unknown)
+  {
+    config.dnsProvider.assign(mothershipClusterProviderName(cluster.dnsProvider));
+    if (mothershipBuildClusterDNSCredential(cluster, dnsCredential, config.dnsCredential, failure) == false)
+    {
+      return false;
+    }
   }
 
   return true;
@@ -666,7 +731,7 @@ public:
   virtual bool upsertMachineSchemas(const MothershipProdigyCluster& cluster, const Vector<ProdigyManagedMachineSchemaPatch>& patches, ClusterTopology& topology, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) = 0;
 };
 
-static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, const MothershipProviderCredential *credential, MothershipClusterCreateHooks& hooks, MothershipClusterCreateTimingSummary *timingSummary = nullptr, String *failure = nullptr)
+static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, const MothershipProviderCredential *credential, MothershipClusterCreateHooks& hooks, MothershipClusterCreateTimingSummary *timingSummary = nullptr, String *failure = nullptr, const MothershipProviderCredential *dnsCredential = nullptr)
 {
   if (failure)
   {
@@ -674,7 +739,7 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
   }
 
   BrainConfig config = {};
-  if (mothershipBuildClusterBrainConfig(cluster, credential, config, failure) == false)
+  if (mothershipBuildClusterBrainConfig(cluster, credential, config, failure, dnsCredential) == false)
   {
     return false;
   }

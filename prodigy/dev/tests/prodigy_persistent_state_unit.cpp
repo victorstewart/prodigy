@@ -74,7 +74,8 @@ static void expectTransportCertificateBackdated(TestSuite& suite, const String& 
   }
 
   time_t latestAllowedNotBefore = std::time(nullptr) - (ProdigyTransportTLSNotBeforeBackdateSeconds - 30);
-  suite.expect(X509_cmp_time(X509_get0_notBefore(cert), &latestAllowedNotBefore) <= 0, name);
+  int cmp = ASN1_TIME_cmp_time_t(X509_get0_notBefore(cert), latestAllowedNotBefore);
+  suite.expect(cmp != -2 && cmp <= 0, name);
   X509_free(cert);
 }
 
@@ -962,6 +963,19 @@ int main(void)
   deferredScaleIntent.targetStorageMB = 96;
   deferredScaleIntent.updatedAtMs = 123'456'814;
   storedSnapshot.masterAuthority.runtimeState.deferredStatefulScaleIntents.push_back(deferredScaleIntent);
+  RoutableResourceLease storedLease = {};
+  storedLease.kind = RoutableResourceLeaseKind::dnsRecord;
+  storedLease.owner.applicationID = applicationID;
+  storedLease.owner.deploymentID = storedPlan.config.deploymentID();
+  storedLease.owner.lineageID = storedPlan.config.deploymentID();
+  storedLease.owner.name.assign("public-api"_ctv);
+  storedLease.registeredPrefixUUID = 0xFACE44;
+  storedLease.address = IPAddress("198.51.100.44", false);
+  storedLease.dnsProvider.assign("cloudflare"_ctv);
+  storedLease.dnsZone.assign("example.com"_ctv);
+  storedLease.dnsName.assign("api.example.com"_ctv);
+  storedLease.dnsType.assign("A"_ctv);
+  storedSnapshot.masterAuthority.runtimeState.routableResourceLeases.push_back(storedLease);
 
   ProdigyMetricSample metricA = {};
   metricA.ms = 1'700'000'001'000;
@@ -1180,6 +1194,9 @@ int main(void)
     suite.expect(
         loadedSnapshot.masterAuthority.runtimeState.deferredStatefulScaleIntents.size() == 1 && loadedSnapshot.masterAuthority.runtimeState.deferredStatefulScaleIntents[0].targetShardGroups == 2 && loadedSnapshot.masterAuthority.runtimeState.deferredStatefulScaleIntents[0].targetLogicalCores == 4,
         "load_snapshot_restores_deferred_stateful_scale_intent");
+    suite.expect(
+        loadedSnapshot.masterAuthority.runtimeState.routableResourceLeases.size() == 1 && loadedSnapshot.masterAuthority.runtimeState.routableResourceLeases[0] == storedLease,
+        "load_snapshot_restores_routable_resource_lease");
     suite.expect(loadedSnapshot.brainConfig.runtimeEnvironment.providerCredentialMaterial.size() == 0, "load_snapshot_scrubs_provider_credential");
     suite.expect(loadedSnapshot.brainConfig.runtimeEnvironment.aws.bootstrapCredentialRefreshCommand.size() == 0, "load_snapshot_scrubs_refresh_command");
 

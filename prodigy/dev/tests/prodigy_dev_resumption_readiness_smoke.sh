@@ -219,12 +219,12 @@ then
    exit 1
 fi
 
-register_request='{"name":"resumption-test-ipv4","kind":"testFakeAddress","family":"ipv4"}'
+register_request='{"name":"resumption-test-ipv4","kind":"BGP","prefix":"198.18.0.1/32","usage":"wormholes","ingressScope":"singleMachine"}'
 if ! env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
-   "${MOTHERSHIP_BIN}" registerRoutableAddress "${cluster_name}" "${register_request}" \
+   "${MOTHERSHIP_BIN}" registerRoutableSubnet "${cluster_name}" "${register_request}" \
    >"${register_log}" 2>&1
 then
-   fail_with_log "registerRoutableAddress failed" "${register_log}" 160
+   fail_with_log "registerRoutableSubnet failed" "${register_log}" 160
 fi
 
 read -r routable_uuid routable_address <<EOF
@@ -232,17 +232,17 @@ $(python3 - "${register_log}" <<'PY'
 import re, sys
 text = open(sys.argv[1], "r", encoding="utf-8").read()
 uuid = re.search(r"\buuid=([0-9a-fA-Fx]+)", text)
-address = re.search(r"\baddress=([0-9a-fA-F:\\.]+)", text)
-if not uuid or not address:
+prefix = re.search(r"\bprefix=([^\s]+)", text)
+if not uuid or not prefix:
     raise SystemExit(1)
-print(uuid.group(1), address.group(1))
+print(uuid.group(1), prefix.group(1).split("/", 1)[0])
 PY
 )
 EOF
 
 if [[ -z "${routable_uuid}" || -z "${routable_address}" ]]
 then
-   fail_with_log "unable to parse registered resumption routable address" "${register_log}" 120
+   fail_with_log "unable to parse registered resumption routable prefix" "${register_log}" 120
 fi
 
 artifact_project_dir="${tmpdir}/resumption-readiness-artifact"
@@ -325,8 +325,8 @@ cat > "${plan_json}" <<EOF
   "wormholes": [
     {
       "name": "resumption-tcp",
-      "source": "registeredRoutableAddress",
-      "routableAddressUUID": "${routable_uuid}",
+      "source": "registeredRoutablePrefix",
+      "routablePrefixUUID": "${routable_uuid}",
       "externalPort": 42501,
       "containerPort": 18501,
       "layer4": "TCP",
@@ -338,8 +338,8 @@ cat > "${plan_json}" <<EOF
     },
     {
       "name": "resumption-quic",
-      "source": "registeredRoutableAddress",
-      "routableAddressUUID": "${routable_uuid}",
+      "source": "registeredRoutablePrefix",
+      "routablePrefixUUID": "${routable_uuid}",
       "externalPort": 42502,
       "containerPort": 18502,
       "layer4": "UDP",

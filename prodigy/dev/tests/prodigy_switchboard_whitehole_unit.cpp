@@ -1238,7 +1238,7 @@ int main(void)
   Whitehole whitehole = {};
   whitehole.transport = ExternalAddressTransport::quic;
   whitehole.family = ExternalAddressFamily::ipv6;
-  whitehole.source = ExternalAddressSource::distributableSubnet;
+  whitehole.source = ExternalAddressSource::registeredRoutablePrefix;
   whitehole.hasAddress = true;
   whitehole.address = IPAddress("2001:db8::44", true);
   whitehole.sourcePort = 5353;

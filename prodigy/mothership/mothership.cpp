@@ -250,9 +250,9 @@ static bool parseExternalAddressSource(const String& value, ExternalAddressSourc
     return true;
   }
 
-  if (value.equal("registeredRoutableAddress"_ctv) || value.equal("ExternalAddressSource::registeredRoutableAddress"_ctv))
+  if (value.equal("registeredRoutablePrefix"_ctv) || value.equal("ExternalAddressSource::registeredRoutablePrefix"_ctv))
   {
-    source = ExternalAddressSource::registeredRoutableAddress;
+    source = ExternalAddressSource::registeredRoutablePrefix;
     return true;
   }
 
@@ -261,7 +261,7 @@ static bool parseExternalAddressSource(const String& value, ExternalAddressSourc
 
 static bool parseExternalSubnetRouting(const String& value, ExternalSubnetRouting& routing)
 {
-  if (value.equal("switchboardBGP"_ctv) || value.equal("bgp"_ctv) || value.equal("ExternalSubnetRouting::switchboardBGP"_ctv))
+  if (value.equal("BGP"_ctv) || value.equal("switchboardBGP"_ctv) || value.equal("bgp"_ctv) || value.equal("ExternalSubnetRouting::switchboardBGP"_ctv))
   {
     routing = ExternalSubnetRouting::switchboardBGP;
     return true;
@@ -299,17 +299,148 @@ static bool parseExternalSubnetUsage(const String& value, ExternalSubnetUsage& u
   return false;
 }
 
+static bool parseRoutableIngressScope(const String& value, RoutableIngressScope& scope)
+{
+  if (value.equal("switchboardFleet"_ctv) || value.equal("RoutableIngressScope::switchboardFleet"_ctv))
+  {
+    scope = RoutableIngressScope::switchboardFleet;
+    return true;
+  }
+
+  if (value.equal("singleMachine"_ctv) || value.equal("RoutableIngressScope::singleMachine"_ctv))
+  {
+    scope = RoutableIngressScope::singleMachine;
+    return true;
+  }
+
+  return false;
+}
+
+static bool parseRoutablePrefixKind(const String& value, RoutablePrefixKind& kind)
+{
+  if (value.equal("BGP"_ctv) || value.equal("RoutablePrefixKind::BGP"_ctv))
+  {
+    kind = RoutablePrefixKind::BGP;
+    return true;
+  }
+
+  if (value.equal("elastic"_ctv) || value.equal("RoutablePrefixKind::elastic"_ctv))
+  {
+    kind = RoutablePrefixKind::elastic;
+    return true;
+  }
+
+  return false;
+}
+
+static bool parseElasticPrefixIntent(const String& value, ElasticPrefixIntent& intent)
+{
+  if (value.equal("any"_ctv) || value.equal("ElasticPrefixIntent::any"_ctv))
+  {
+    intent = ElasticPrefixIntent::any;
+    return true;
+  }
+
+  if (value.equal("create"_ctv) || value.equal("ElasticPrefixIntent::create"_ctv))
+  {
+    intent = ElasticPrefixIntent::create;
+    return true;
+  }
+
+  if (value.equal("anyOrCreate"_ctv) || value.equal("ElasticPrefixIntent::anyOrCreate"_ctv))
+  {
+    intent = ElasticPrefixIntent::anyOrCreate;
+    return true;
+  }
+
+  return false;
+}
+
+static bool parseRoutablePrefixLiteral(const char *value, IPPrefix& prefix)
+{
+  if (parseCIDRPrefix(value, prefix))
+  {
+    return true;
+  }
+
+  IPAddress address = {};
+  if (ClusterMachine::parseIPAddressLiteral(value, address) == false)
+  {
+    return false;
+  }
+
+  prefix.network = address;
+  prefix.cidr = address.is6 ? 128 : 32;
+  prefix.canonicalize();
+  return true;
+}
+
 static const char *externalSubnetRoutingName(ExternalSubnetRouting routing)
 {
   switch (routing)
   {
     case ExternalSubnetRouting::switchboardBGP:
       {
-        return "switchboardBGP";
+        return "BGP";
       }
     case ExternalSubnetRouting::switchboardPinnedRoute:
       {
         return "switchboardPinnedRoute";
+      }
+  }
+
+  return "unknown";
+}
+
+static const char *routableIngressScopeName(RoutableIngressScope scope)
+{
+  switch (scope)
+  {
+    case RoutableIngressScope::switchboardFleet:
+      {
+        return "switchboardFleet";
+      }
+    case RoutableIngressScope::singleMachine:
+      {
+        return "singleMachine";
+      }
+  }
+
+  return "unknown";
+}
+
+static const char *routablePrefixKindName(RoutablePrefixKind kind)
+{
+  switch (kind)
+  {
+    case RoutablePrefixKind::BGP:
+      {
+        return "BGP";
+      }
+    case RoutablePrefixKind::elastic:
+      {
+        return "elastic";
+      }
+  }
+
+  return "unknown";
+}
+
+static const char *elasticPrefixIntentName(ElasticPrefixIntent intent)
+{
+  switch (intent)
+  {
+    case ElasticPrefixIntent::any:
+      {
+        return "any";
+      }
+    case ElasticPrefixIntent::create:
+      {
+        return "create";
+      }
+    case ElasticPrefixIntent::anyOrCreate:
+      {
+        return "anyOrCreate";
       }
   }
 
@@ -332,6 +463,21 @@ static const char *externalSubnetUsageName(ExternalSubnetUsage usage)
       {
         return "both";
       }
+  }
+
+  return "unknown";
+}
+
+static const char *routableResourceLeaseKindName(RoutableResourceLeaseKind kind)
+{
+  switch (kind)
+  {
+    case RoutableResourceLeaseKind::wormholeAddress:
+      return "wormholeAddress";
+    case RoutableResourceLeaseKind::whiteholeAddressPort:
+      return "whiteholeAddressPort";
+    case RoutableResourceLeaseKind::dnsRecord:
+      return "dnsRecord";
   }
 
   return "unknown";
@@ -1969,6 +2115,14 @@ static void printManagedCluster(const MothershipProdigyCluster& cluster)
     }
   }
 
+  if (cluster.dnsProvider != MothershipClusterProvider::unknown)
+  {
+    String dnsCredentialName = cluster.dnsProviderCredentialName;
+    basics_log("    dnsProvider=%s dnsProviderCredentialName=%s\n",
+               mothershipClusterProviderName(cluster.dnsProvider),
+               dnsCredentialName.c_str());
+  }
+
   for (const MothershipProdigyClusterControl& control : cluster.controls)
   {
     String path = control.path;
@@ -2172,7 +2326,7 @@ static void printProviderCredential(const MothershipProviderCredential& credenti
   String impersonateServiceAccount = credential.impersonateServiceAccount;
   String credentialPath = credential.credentialPath;
 
-  basics_log("  name=%s provider=%s mode=%s scope=%s allowPropagateToProdigy=%d materialPresent=%d materialBytes=%u impersonateServiceAccount=%s credentialPath=%s createdAtMs=%lld updatedAtMs=%lld\n",
+  basics_log("  name=%s provider=%s mode=%s scope=%s allowPropagateToProdigy=%d materialPresent=%d materialBytes=%u metadata=%u impersonateServiceAccount=%s credentialPath=%s createdAtMs=%lld updatedAtMs=%lld\n",
              name.c_str(),
              mothershipClusterProviderName(credential.provider),
              mothershipProviderCredentialModeName(credential.mode),
@@ -2180,10 +2334,17 @@ static void printProviderCredential(const MothershipProviderCredential& credenti
              int(credential.allowPropagateToProdigy),
              int(credential.material.size() > 0),
              unsigned(credential.material.size()),
+             unsigned(credential.metadata.size()),
              impersonateServiceAccount.c_str(),
              credentialPath.c_str(),
              (long long)credential.createdAtMs,
              (long long)credential.updatedAtMs);
+  for (const auto& [key, value] : credential.metadata)
+  {
+    String renderedKey = key;
+    String renderedValue = value;
+    basics_log("    metadata %s=%s\n", renderedKey.c_str(), renderedValue.c_str());
+  }
 }
 
 static bool resolveServiceName(String serviceName, uint64_t& service)
@@ -5476,6 +5637,52 @@ private:
     return true;
   }
 
+  bool validateClusterDNSProviderCredentialReference(const MothershipProdigyCluster& cluster, String& failure, MothershipProviderCredential *credentialOut = nullptr)
+  {
+    if (cluster.dnsProvider == MothershipClusterProvider::unknown)
+    {
+      failure.clear();
+      return true;
+    }
+
+    if (cluster.dnsProviderCredentialName.size() == 0)
+    {
+      failure.assign("cluster DNS requires dnsProviderCredentialName"_ctv);
+      return false;
+    }
+
+    MothershipProviderCredential credential = {};
+    MothershipProviderCredentialRegistry providerCredentialRegistry = openProviderCredentialRegistry();
+    if (providerCredentialRegistry.getCredential(cluster.dnsProviderCredentialName, credential, &failure) == false)
+    {
+      if (failure.equal("record not found"_ctv))
+      {
+        failure.assign("cluster dnsProviderCredentialName is not registered"_ctv);
+      }
+      return false;
+    }
+
+    if (credential.provider != cluster.dnsProvider)
+    {
+      failure.assign("cluster dnsProviderCredentialName provider does not match dnsProvider"_ctv);
+      return false;
+    }
+
+    if (credential.allowPropagateToProdigy == false)
+    {
+      failure.assign("cluster dnsProviderCredentialName does not allow Prodigy propagation"_ctv);
+      return false;
+    }
+
+    if (credentialOut != nullptr)
+    {
+      *credentialOut = credential;
+    }
+
+    failure.clear();
+    return true;
+  }
+
   bool inferClusterMachineSchemaCpuCapabilities(MothershipProdigyCluster& cluster, const MothershipProviderCredential *credential, String& failure)
   {
     failure.clear();
@@ -5674,7 +5881,7 @@ private:
 
     for (const MothershipProdigyCluster& cluster : clusters)
     {
-      if (cluster.providerCredentialName.equals(name))
+      if (cluster.providerCredentialName.equals(name) || cluster.dnsProviderCredentialName.equals(name))
       {
         if (referencingClusterName != nullptr)
         {
@@ -9647,7 +9854,7 @@ private:
 
           Wormhole& wormhole = plan.wormholes.emplace_back();
           bool addressWasSet = false;
-          bool routableAddressUUIDWasSet = false;
+          bool routablePrefixUUIDWasSet = false;
           bool sourceWasSet = false;
           bool quicCidKeyRotationHoursWasSet = false;
 
@@ -9811,11 +10018,11 @@ private:
 
               sourceWasSet = true;
             }
-            else if (key.equal("routableAddressUUID"_ctv))
+            else if (key.equal("routablePrefixUUID"_ctv))
             {
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
-                basics_log("wormhole.routableAddressUUID requires a string\n");
+                basics_log("wormhole.routablePrefixUUID requires a string\n");
                 exit(EXIT_FAILURE);
               }
 
@@ -9823,18 +10030,18 @@ private:
               value.setInvariant(item.value.get_c_str());
               if (value.size() == 0)
               {
-                basics_log("wormhole.routableAddressUUID cannot be empty\n");
+                basics_log("wormhole.routablePrefixUUID cannot be empty\n");
                 exit(EXIT_FAILURE);
               }
 
-              wormhole.routableAddressUUID = String::numberFromHexString<uint128_t>(value);
-              if (wormhole.routableAddressUUID == 0)
+              wormhole.routablePrefixUUID = String::numberFromHexString<uint128_t>(value);
+              if (wormhole.routablePrefixUUID == 0)
               {
-                basics_log("wormhole.routableAddressUUID invalid\n");
+                basics_log("wormhole.routablePrefixUUID invalid\n");
                 exit(EXIT_FAILURE);
               }
 
-              routableAddressUUIDWasSet = true;
+              routablePrefixUUIDWasSet = true;
             }
             else if (key.equal("tlsResumption"_ctv))
             {
@@ -9847,6 +10054,17 @@ private:
 
               wormhole.hasTlsResumptionConfig = true;
             }
+            else if (key.equal("dns"_ctv))
+            {
+              String failure = {};
+              if (mothershipParseWormholeDNSConfig(item.value, wormhole.dns, &failure) == false)
+              {
+                basics_log("%s\n", failure.c_str());
+                exit(EXIT_FAILURE);
+              }
+
+              wormhole.hasDNSConfig = true;
+            }
             else
             {
               basics_log("wormhole invalid field\n");
@@ -9854,9 +10072,15 @@ private:
             }
           }
 
-          if (addressWasSet == false && routableAddressUUIDWasSet == false)
+          const bool dnsBinding = wormhole.hasDNSConfig && wormhole.dns.bindingName.size() > 0;
+          if (dnsBinding && sourceWasSet == false)
           {
-            basics_log("wormhole.externalAddress or wormhole.routableAddressUUID field required\n");
+            wormhole.source = ExternalAddressSource::registeredRoutablePrefix;
+            sourceWasSet = true;
+          }
+          if (addressWasSet == false && routablePrefixUUIDWasSet == false && dnsBinding == false)
+          {
+            basics_log("wormhole.externalAddress or wormhole.routablePrefixUUID field required\n");
             exit(EXIT_FAILURE);
           }
           if (wormhole.externalPort == 0)
@@ -9879,19 +10103,24 @@ private:
             basics_log("wormhole.source field required\n");
             exit(EXIT_FAILURE);
           }
-          if (addressWasSet && routableAddressUUIDWasSet)
+          if (addressWasSet && routablePrefixUUIDWasSet && wormhole.source != ExternalAddressSource::registeredRoutablePrefix)
           {
-            basics_log("wormhole.externalAddress and wormhole.routableAddressUUID are mutually exclusive\n");
+            basics_log("wormhole.externalAddress and wormhole.routablePrefixUUID are mutually exclusive\n");
             exit(EXIT_FAILURE);
           }
-          if (wormhole.source == ExternalAddressSource::registeredRoutableAddress && routableAddressUUIDWasSet == false)
+          if (wormhole.source == ExternalAddressSource::registeredRoutablePrefix && routablePrefixUUIDWasSet == false && dnsBinding == false)
           {
-            basics_log("wormhole.source=registeredRoutableAddress requires wormhole.routableAddressUUID\n");
+            basics_log("wormhole.source=registeredRoutablePrefix requires wormhole.routablePrefixUUID\n");
             exit(EXIT_FAILURE);
           }
-          if (wormhole.source != ExternalAddressSource::registeredRoutableAddress && routableAddressUUIDWasSet)
+          if (wormhole.source != ExternalAddressSource::registeredRoutablePrefix && routablePrefixUUIDWasSet)
           {
-            basics_log("wormhole.routableAddressUUID requires source=registeredRoutableAddress\n");
+            basics_log("wormhole.routablePrefixUUID requires source=registeredRoutablePrefix\n");
+            exit(EXIT_FAILURE);
+          }
+          if (wormhole.hasDNSConfig && wormhole.source != ExternalAddressSource::registeredRoutablePrefix)
+          {
+            basics_log("wormhole.dns requires source=registeredRoutablePrefix\n");
             exit(EXIT_FAILURE);
           }
           if (wormhole.isQuic && wormhole.layer4 != IPPROTO_UDP)
@@ -10009,9 +10238,9 @@ private:
             exit(EXIT_FAILURE);
           }
 
-          if (need.source != ExternalAddressSource::hostPublicAddress && need.source != ExternalAddressSource::distributableSubnet)
+          if (need.source != ExternalAddressSource::hostPublicAddress && need.source != ExternalAddressSource::registeredRoutablePrefix)
           {
-            basics_log("whiteholes currently require source == hostPublicAddress or distributableSubnet\n");
+            basics_log("whiteholes currently require source == hostPublicAddress or registeredRoutablePrefix\n");
             exit(EXIT_FAILURE);
           }
 
@@ -10472,15 +10701,22 @@ private:
       for (uint32_t index = 0; index < plan.wormholes.size(); index += 1)
       {
         const Wormhole& wormhole = plan.wormholes[index];
-        if (wormhole.source != ExternalAddressSource::distributableSubnet && wormhole.source != ExternalAddressSource::registeredRoutableAddress)
+        if (wormhole.source != ExternalAddressSource::distributableSubnet && wormhole.source != ExternalAddressSource::registeredRoutablePrefix)
         {
-          basics_log("wormholes currently require source == distributableSubnet or registeredRoutableAddress\n");
+          basics_log("wormholes currently require source == distributableSubnet or registeredRoutablePrefix\n");
           exit(EXIT_FAILURE);
         }
 
-        if (wormhole.source == ExternalAddressSource::registeredRoutableAddress && wormhole.routableAddressUUID == 0)
+        const bool dnsBinding = wormhole.hasDNSConfig && wormhole.dns.bindingName.size() > 0;
+        if (wormhole.source == ExternalAddressSource::registeredRoutablePrefix && wormhole.routablePrefixUUID == 0 && dnsBinding == false)
         {
-          basics_log("wormholes with source == registeredRoutableAddress require routableAddressUUID\n");
+          basics_log("wormholes with source == registeredRoutablePrefix require routablePrefixUUID\n");
+          exit(EXIT_FAILURE);
+        }
+
+        if (wormhole.hasDNSConfig && wormhole.source != ExternalAddressSource::registeredRoutablePrefix)
+        {
+          basics_log("wormholes with dns require source == registeredRoutablePrefix\n");
           exit(EXIT_FAILURE);
         }
 
@@ -10510,9 +10746,9 @@ private:
     {
       for (const Whitehole& whitehole : plan.whiteholes)
       {
-        if (whitehole.source != ExternalAddressSource::hostPublicAddress && whitehole.source != ExternalAddressSource::distributableSubnet)
+        if (whitehole.source != ExternalAddressSource::hostPublicAddress && whitehole.source != ExternalAddressSource::registeredRoutablePrefix)
         {
-          basics_log("whiteholes currently require source == hostPublicAddress or distributableSubnet\n");
+          basics_log("whiteholes currently require source == hostPublicAddress or registeredRoutablePrefix\n");
           exit(EXIT_FAILURE);
         }
       }
@@ -11112,6 +11348,32 @@ private:
         }
 
         request.scope.assign(field.value.get_c_str());
+      }
+      else if (key.equal("metadata"_ctv))
+      {
+        if (field.value.type() != simdjson::dom::element_type::OBJECT)
+        {
+          basics_log("%s.metadata requires object\n", context);
+          return false;
+        }
+        for (auto metadataField : field.value.get_object())
+        {
+          if (metadataField.value.type() != simdjson::dom::element_type::STRING)
+          {
+            basics_log("%s.metadata requires string values\n", context);
+            return false;
+          }
+          String metadataKey = {};
+          metadataKey.setInvariant(metadataField.key.data(), metadataField.key.size());
+          if (metadataKey.size() == 0)
+          {
+            basics_log("%s.metadata contains empty key\n", context);
+            return false;
+          }
+          String metadataValue = {};
+          metadataValue.assign(metadataField.value.get_c_str());
+          request.metadata.insert_or_assign(metadataKey, metadataValue);
+        }
       }
       else if (key.equal("allowPropagateToProdigy"_ctv))
       {
@@ -12845,7 +13107,9 @@ private:
 
     MothershipProdigyCluster request = {};
     MothershipProviderCredential providerCredentialOverride = {};
+    MothershipProviderCredential dnsProviderCredentialOverride = {};
     bool hasProviderCredentialOverride = false;
+    bool hasDNSProviderCredentialOverride = false;
 
     String json;
     json.append(argv[0]);
@@ -12963,6 +13227,41 @@ private:
         }
 
         hasProviderCredentialOverride = true;
+      }
+      else if (key.equal("dnsProvider"_ctv))
+      {
+        if (field.value.type() != simdjson::dom::element_type::STRING)
+        {
+          basics_log("createCluster.dnsProvider requires string\n");
+          exit(EXIT_FAILURE);
+        }
+
+        String provider;
+        provider.setInvariant(field.value.get_c_str());
+        if (parseMothershipClusterProvider(provider, request.dnsProvider) == false)
+        {
+          basics_log("createCluster.dnsProvider invalid\n");
+          exit(EXIT_FAILURE);
+        }
+      }
+      else if (key.equal("dnsProviderCredentialName"_ctv))
+      {
+        if (field.value.type() != simdjson::dom::element_type::STRING)
+        {
+          basics_log("createCluster.dnsProviderCredentialName requires string\n");
+          exit(EXIT_FAILURE);
+        }
+
+        request.dnsProviderCredentialName.assign(field.value.get_c_str());
+      }
+      else if (key.equal("dnsProviderCredentialOverride"_ctv))
+      {
+        if (parseProviderCredentialJSON(field.value, dnsProviderCredentialOverride, "createCluster.dnsProviderCredentialOverride", false) == false)
+        {
+          exit(EXIT_FAILURE);
+        }
+
+        hasDNSProviderCredentialOverride = true;
       }
       else if (key.equal("providerScope"_ctv))
       {
@@ -13391,6 +13690,23 @@ private:
       }
     }
 
+    if (hasDNSProviderCredentialOverride)
+    {
+      if (resolveMothershipClusterInlineDNSProviderCredentialOverride(request, dnsProviderCredentialOverride, &failure) == false)
+      {
+        basics_log("createCluster success=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
+        exit(EXIT_FAILURE);
+      }
+
+      MothershipProviderCredential storedCredential = {};
+      MothershipProviderCredentialRegistry providerCredentialRegistry = openProviderCredentialRegistry();
+      if (providerCredentialRegistry.upsertCredential(dnsProviderCredentialOverride, &storedCredential, &failure) == false)
+      {
+        basics_log("createCluster success=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
+        exit(EXIT_FAILURE);
+      }
+    }
+
     MothershipProviderCredential referencedCredential = {};
     MothershipProviderCredential *credentialPtr = nullptr;
     if (validateClusterProviderCredentialReference(request, failure, &referencedCredential) == false)
@@ -13402,6 +13718,19 @@ private:
     if (request.providerCredentialName.size() > 0)
     {
       credentialPtr = &referencedCredential;
+    }
+
+    MothershipProviderCredential referencedDNSCredential = {};
+    MothershipProviderCredential *dnsCredentialPtr = nullptr;
+    if (validateClusterDNSProviderCredentialReference(request, failure, &referencedDNSCredential) == false)
+    {
+      basics_log("createCluster success=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
+      exit(EXIT_FAILURE);
+    }
+
+    if (request.dnsProvider != MothershipClusterProvider::unknown)
+    {
+      dnsCredentialPtr = &referencedDNSCredential;
     }
 
     if (inferClusterMachineSchemaCpuCapabilities(request, credentialPtr, failure) == false)
@@ -13422,7 +13751,7 @@ private:
 
     ClusterCreateHooks hooks(this);
     MothershipClusterCreateTimingSummary timingSummary = {};
-    if (mothershipStandUpCluster(stored, credentialPtr, hooks, &timingSummary, &failure) == false)
+    if (mothershipStandUpCluster(stored, credentialPtr, hooks, &timingSummary, &failure, dnsCredentialPtr) == false)
     {
       persistClusterRefreshFailure(stored, failure);
 #if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
@@ -14044,6 +14373,8 @@ private:
     RoutableSubnetRegistration request = {};
     bool sawSubnet = false;
     bool sawUsage = false;
+    bool sawFamily = false;
+    bool sawElasticIntent = false;
 
     String json;
     json.append(argv[1]);
@@ -14072,21 +14403,90 @@ private:
 
         request.subnet.name.assign(field.value.get_c_str());
       }
-      else if (key.equal("subnet"_ctv))
+      else if (key.equal("kind"_ctv))
       {
         if (field.value.type() != simdjson::dom::element_type::STRING)
         {
-          basics_log("registerRoutableSubnet.subnet requires string\n");
+          basics_log("registerRoutableSubnet.kind requires string\n");
           exit(EXIT_FAILURE);
         }
 
-        if (parseCIDRPrefix(field.value.get_c_str(), request.subnet.subnet) == false)
+        String kind;
+        kind.setInvariant(field.value.get_c_str());
+        if (parseRoutablePrefixKind(kind, request.subnet.kind) == false)
         {
-          basics_log("registerRoutableSubnet.subnet invalid CIDR\n");
+          basics_log("registerRoutableSubnet.kind invalid\n");
+          exit(EXIT_FAILURE);
+        }
+      }
+      else if (key.equal("subnet"_ctv) || key.equal("prefix"_ctv))
+      {
+        if (field.value.type() != simdjson::dom::element_type::STRING)
+        {
+          basics_log("registerRoutableSubnet.prefix requires string\n");
+          exit(EXIT_FAILURE);
+        }
+
+        if (parseRoutablePrefixLiteral(field.value.get_c_str(), request.subnet.subnet) == false)
+        {
+          basics_log("registerRoutableSubnet.prefix invalid\n");
           exit(EXIT_FAILURE);
         }
 
         sawSubnet = true;
+      }
+      else if (key.equal("uuid"_ctv))
+      {
+        if (field.value.type() != simdjson::dom::element_type::STRING)
+        {
+          basics_log("registerRoutableSubnet.uuid requires string\n");
+          exit(EXIT_FAILURE);
+        }
+
+        String value;
+        value.setInvariant(field.value.get_c_str());
+        request.subnet.uuid = String::numberFromHexString<uint128_t>(value);
+        if (request.subnet.uuid == 0)
+        {
+          basics_log("registerRoutableSubnet.uuid invalid\n");
+          exit(EXIT_FAILURE);
+        }
+      }
+      else if (key.equal("family"_ctv))
+      {
+        if (field.value.type() != simdjson::dom::element_type::STRING)
+        {
+          basics_log("registerRoutableSubnet.family requires string\n");
+          exit(EXIT_FAILURE);
+        }
+
+        String value;
+        value.setInvariant(field.value.get_c_str());
+        if (parseExternalAddressFamily(value, request.family) == false)
+        {
+          basics_log("registerRoutableSubnet.family invalid\n");
+          exit(EXIT_FAILURE);
+        }
+
+        sawFamily = true;
+      }
+      else if (key.equal("elasticIntent"_ctv) || key.equal("intent"_ctv))
+      {
+        if (field.value.type() != simdjson::dom::element_type::STRING)
+        {
+          basics_log("registerRoutableSubnet.elasticIntent requires string\n");
+          exit(EXIT_FAILURE);
+        }
+
+        String value;
+        value.setInvariant(field.value.get_c_str());
+        if (parseElasticPrefixIntent(value, request.elasticIntent) == false)
+        {
+          basics_log("registerRoutableSubnet.elasticIntent invalid\n");
+          exit(EXIT_FAILURE);
+        }
+
+        sawElasticIntent = true;
       }
       else if (key.equal("routing"_ctv))
       {
@@ -14122,6 +14522,59 @@ private:
 
         sawUsage = true;
       }
+      else if (key.equal("ingressScope"_ctv))
+      {
+        if (field.value.type() != simdjson::dom::element_type::STRING)
+        {
+          basics_log("registerRoutableSubnet.ingressScope requires string\n");
+          exit(EXIT_FAILURE);
+        }
+
+        String scope;
+        scope.setInvariant(field.value.get_c_str());
+        if (parseRoutableIngressScope(scope, request.subnet.ingressScope) == false)
+        {
+          basics_log("registerRoutableSubnet.ingressScope invalid\n");
+          exit(EXIT_FAILURE);
+        }
+      }
+      else if (key.equal("machineUUID"_ctv))
+      {
+        if (field.value.type() != simdjson::dom::element_type::STRING)
+        {
+          basics_log("registerRoutableSubnet.machineUUID requires string\n");
+          exit(EXIT_FAILURE);
+        }
+
+        String value;
+        value.setInvariant(field.value.get_c_str());
+        request.subnet.machineUUID = String::numberFromHexString<uint128_t>(value);
+        if (request.subnet.machineUUID == 0)
+        {
+          basics_log("registerRoutableSubnet.machineUUID invalid\n");
+          exit(EXIT_FAILURE);
+        }
+      }
+      else if (key.equal("requestedAddress"_ctv))
+      {
+        if (field.value.type() != simdjson::dom::element_type::STRING)
+        {
+          basics_log("registerRoutableSubnet.requestedAddress requires string\n");
+          exit(EXIT_FAILURE);
+        }
+
+        request.requestedAddress.assign(field.value.get_c_str());
+      }
+      else if (key.equal("providerPool"_ctv))
+      {
+        if (field.value.type() != simdjson::dom::element_type::STRING)
+        {
+          basics_log("registerRoutableSubnet.providerPool requires string\n");
+          exit(EXIT_FAILURE);
+        }
+
+        request.subnet.providerPool.assign(field.value.get_c_str());
+      }
       else
       {
         basics_log("registerRoutableSubnet invalid field\n");
@@ -14137,13 +14590,43 @@ private:
 
     if (request.subnet.routing != ExternalSubnetRouting::switchboardBGP)
     {
-      basics_log("registerRoutableSubnet only supports routing=switchboardBGP\n");
+      basics_log("registerRoutableSubnet only supports routing=BGP\n");
       exit(EXIT_FAILURE);
     }
 
-    if (sawSubnet == false)
+    if (request.subnet.kind == RoutablePrefixKind::BGP && (request.requestedAddress.size() > 0 || request.subnet.providerPool.size() > 0 || sawFamily || sawElasticIntent))
     {
-      basics_log("registerRoutableSubnet.subnet required\n");
+      basics_log("registerRoutableSubnet BGP prefixes do not accept elastic fields\n");
+      exit(EXIT_FAILURE);
+    }
+
+    if (request.subnet.ingressScope == RoutableIngressScope::switchboardFleet && request.subnet.machineUUID != 0)
+    {
+      basics_log("registerRoutableSubnet switchboardFleet must not set machineUUID\n");
+      exit(EXIT_FAILURE);
+    }
+
+    if (request.subnet.kind == RoutablePrefixKind::BGP && sawSubnet == false)
+    {
+      basics_log("registerRoutableSubnet.prefix required\n");
+      exit(EXIT_FAILURE);
+    }
+
+    if (request.subnet.kind == RoutablePrefixKind::elastic && sawSubnet)
+    {
+      basics_log("registerRoutableSubnet elastic prefixes are provider allocated; omit prefix\n");
+      exit(EXIT_FAILURE);
+    }
+
+    if (request.subnet.kind == RoutablePrefixKind::elastic && sawFamily == false)
+    {
+      basics_log("registerRoutableSubnet elastic prefix requires family\n");
+      exit(EXIT_FAILURE);
+    }
+
+    if (request.subnet.kind == RoutablePrefixKind::elastic && sawElasticIntent == false)
+    {
+      basics_log("registerRoutableSubnet elastic prefix requires elasticIntent\n");
       exit(EXIT_FAILURE);
     }
 
@@ -14153,16 +14636,9 @@ private:
       exit(EXIT_FAILURE);
     }
 
-    if (routableExternalSubnetHasSupportedBreadth(request.subnet) == false)
+    if (request.subnet.kind == RoutablePrefixKind::BGP && routableExternalSubnetHasSupportedBreadth(request.subnet) == false)
     {
-      if (request.subnet.subnet.network.is6)
-      {
-        basics_log("registerRoutableSubnet ipv6 subnets must be between /4 and /48\n");
-      }
-      else
-      {
-        basics_log("registerRoutableSubnet ipv4 subnets must be between /4 and /24\n");
-      }
+      basics_log("registerRoutableSubnet prefix CIDR is invalid\n");
       exit(EXIT_FAILURE);
     }
 
@@ -14201,15 +14677,22 @@ private:
     (void)formatCIDRPrefix(response.subnet.subnet, prefixBuffer, sizeof(prefixBuffer));
     String subnetUUIDText = {};
     subnetUUIDText.assignItoh(response.subnet.uuid);
+    String machineUUIDText = {};
+    machineUUIDText.assignItoh(response.subnet.machineUUID);
 
-    basics_log("registerRoutableSubnet success=%d created=%d name=%s uuid=%s subnet=%s routing=%s usage=%s failure=%s\n",
+    basics_log("registerRoutableSubnet success=%d created=%d name=%s uuid=%s kind=%s prefix=%s routing=%s usage=%s ingressScope=%s machineUUID=%s elasticIntent=%s family=%s failure=%s\n",
                int(response.success),
                int(response.created),
                response.subnet.name.c_str(),
                subnetUUIDText.c_str(),
+               routablePrefixKindName(response.subnet.kind),
                prefixBuffer,
                externalSubnetRoutingName(response.subnet.routing),
                externalSubnetUsageName(response.subnet.usage),
+               routableIngressScopeName(response.subnet.ingressScope),
+               machineUUIDText.c_str(),
+               elasticPrefixIntentName(response.elasticIntent),
+               response.family == ExternalAddressFamily::ipv6 ? "ipv6" : "ipv4",
                (response.failure.size() ? response.failure.c_str() : ""));
 
     if (response.success == false)
@@ -14343,378 +14826,348 @@ private:
       String subnetName = subnet.name;
       String subnetUUIDText = {};
       subnetUUIDText.assignItoh(subnet.uuid);
-      basics_log("  name=%s uuid=%s subnet=%s routing=%s usage=%s\n",
+      String machineUUIDText = {};
+      machineUUIDText.assignItoh(subnet.machineUUID);
+      basics_log("  name=%s uuid=%s kind=%s prefix=%s routing=%s usage=%s ingressScope=%s machineUUID=%s\n",
                  subnetName.c_str(),
                  subnetUUIDText.c_str(),
+                 routablePrefixKindName(subnet.kind),
                  prefixBuffer,
                  externalSubnetRoutingName(subnet.routing),
-                 externalSubnetUsageName(subnet.usage));
+                 externalSubnetUsageName(subnet.usage),
+                 routableIngressScopeName(subnet.ingressScope),
+                 machineUUIDText.c_str());
     }
   }
 
-  void runRegisterRoutableAddress(int argc, char *argv[])
+  void runPullRoutableResourceLeases(int argc, char *argv[])
   {
-    if (argc < 2)
+    if (argc < 1)
     {
-      basics_log("too few arguments. ex: registerRoutableAddress [target: local|clusterName|clusterUUID] [json]\n");
+      basics_log("too few arguments. ex: pullRoutableResourceLeases [target: local|clusterName|clusterUUID]\n");
       exit(EXIT_FAILURE);
     }
 
-    if (configureControlTarget(argv[0]) == false)
+    if (configureControlTarget(argv[0]) == false || socket.connect() != 0)
     {
       exit(EXIT_FAILURE);
     }
 
-    RoutableAddressRegistration request = {};
-    bool sawKind = false;
-    bool sawFamily = false;
+    Message::construct(socket.wBuffer, MothershipTopic::pullRoutableResourceLeases);
+    if (socket.send() == false)
+    {
+      exit(EXIT_FAILURE);
+    }
 
-    String json = {};
-    json.append(argv[1]);
+    Message *responseMessage = socket.recvExpectedTopic(MothershipTopic::pullRoutableResourceLeases);
+    if (responseMessage == nullptr)
+    {
+      exit(EXIT_FAILURE);
+    }
+
+    String serializedResponse;
+    uint8_t *responseArgs = responseMessage->args;
+    Message::extractToStringView(responseArgs, serializedResponse);
+
+    RoutableResourceLeaseReport response;
+    if (BitseryEngine::deserializeSafe(serializedResponse, response) == false)
+    {
+      basics_log("pullRoutableResourceLeases response decode failed\n");
+      exit(EXIT_FAILURE);
+    }
+    if (response.success == false)
+    {
+      basics_log("pullRoutableResourceLeases success=0 failure=%s\n", (response.failure.size() ? response.failure.c_str() : ""));
+      exit(EXIT_FAILURE);
+    }
+
+    basics_log("pullRoutableResourceLeases success=1 count=%u\n", unsigned(response.leases.size()));
+    for (const RoutableResourceLease& lease : response.leases)
+    {
+      String prefixUUIDText, addressText;
+      prefixUUIDText.assignItoh(lease.registeredPrefixUUID);
+      if (lease.address.isNull() == false)
+      {
+        (void)ClusterMachine::renderIPAddressLiteral(lease.address, addressText);
+      }
+
+      String ownerName = lease.owner.name;
+      String dnsProvider = lease.dnsProvider;
+      String dnsCredentialName = lease.dnsCredentialName;
+      String dnsZone = lease.dnsZone;
+      String dnsName = lease.dnsName;
+      String dnsType = lease.dnsType;
+      basics_log("  kind=%s app=%u deployment=%llu lineage=%llu owner=%s address=%s sourcePort=%u registeredPrefixUUID=%s dns=%s/%s/%s/%s credential=%s ttl=%u\n",
+                 routableResourceLeaseKindName(lease.kind),
+                 unsigned(lease.owner.applicationID),
+                 (unsigned long long)lease.owner.deploymentID,
+                 (unsigned long long)lease.owner.lineageID,
+                 ownerName.c_str(),
+                 addressText.c_str(),
+                 unsigned(lease.sourcePort),
+                 prefixUUIDText.c_str(),
+                 dnsProvider.c_str(),
+                 dnsZone.c_str(),
+                 dnsName.c_str(),
+                 dnsType.c_str(),
+                 dnsCredentialName.c_str(),
+                 unsigned(lease.dnsTTL));
+    }
+  }
+
+  void parseDNSBindingLeaseJSON(const char *input, RoutableResourceLease& lease, const char *operation)
+  {
+    lease = {};
+    lease.kind = RoutableResourceLeaseKind::dnsRecord;
+
+    String json;
+    json.append(input);
     json.need(simdjson::SIMDJSON_PADDING);
 
     simdjson::dom::parser parser;
     simdjson::dom::element doc;
     if (parser.parse(json.data(), json.size()).get(doc))
     {
-      basics_log("invalid json for registerRoutableAddress\n");
+      basics_log("invalid json for %s\n", operation);
       exit(EXIT_FAILURE);
     }
 
     for (auto field : doc.get_object())
     {
-      String key = {};
+      String key;
       key.setInvariant(field.key.data(), field.key.size());
-
-      if (key.equal("name"_ctv))
+      if (key.equal("bindingName"_ctv))
       {
         if (field.value.type() != simdjson::dom::element_type::STRING)
         {
-          basics_log("registerRoutableAddress.name requires string\n");
+          basics_log("%s.bindingName requires string\n", operation);
           exit(EXIT_FAILURE);
         }
-
-        request.name.assign(field.value.get_c_str());
+        lease.owner.name.assign(field.value.get_c_str());
       }
-      else if (key.equal("kind"_ctv))
+      else if (key.equal("applicationID"_ctv))
+      {
+        int64_t value = 0;
+        if (field.value.type() != simdjson::dom::element_type::INT64 || field.value.get(value) != simdjson::SUCCESS || value <= 0 || value > UINT16_MAX)
+        {
+          basics_log("%s.applicationID invalid\n", operation);
+          exit(EXIT_FAILURE);
+        }
+        lease.owner.applicationID = uint16_t(value);
+        lease.owner.lineageID = uint64_t(lease.owner.applicationID);
+      }
+      else if (key.equal("ttl"_ctv))
+      {
+        if (mothershipParseJSONUInt32(field.value, lease.dnsTTL, false) == false)
+        {
+          basics_log("%s.ttl invalid\n", operation);
+          exit(EXIT_FAILURE);
+        }
+      }
+      else if (key.equal("deploymentID"_ctv) || key.equal("lineageID"_ctv))
+      {
+        uint64_t value = 0;
+        if (mothershipParseJSONUInt64(field.value, value) == false)
+        {
+          basics_log("%s.%s invalid\n", operation, key.c_str());
+          exit(EXIT_FAILURE);
+        }
+        if (key.equal("deploymentID"_ctv))
+        {
+          lease.owner.deploymentID = uint64_t(value);
+        }
+        else if (key.equal("lineageID"_ctv))
+        {
+          lease.owner.lineageID = uint64_t(value);
+        }
+      }
+      else if (key.equal("routablePrefixUUID"_ctv) || key.equal("registeredPrefixUUID"_ctv))
       {
         if (field.value.type() != simdjson::dom::element_type::STRING)
         {
-          basics_log("registerRoutableAddress.kind requires string\n");
+          basics_log("%s.routablePrefixUUID requires string\n", operation);
           exit(EXIT_FAILURE);
         }
-
-        String value = {};
+        String value;
         value.setInvariant(field.value.get_c_str());
-        if (parseRoutableAddressKind(value, request.kind) == false)
+        lease.registeredPrefixUUID = String::numberFromHexString<uint128_t>(value);
+        if (lease.registeredPrefixUUID == 0)
         {
-          basics_log("registerRoutableAddress.kind invalid\n");
-          exit(EXIT_FAILURE);
-        }
-
-        sawKind = true;
-      }
-      else if (key.equal("family"_ctv))
-      {
-        if (field.value.type() != simdjson::dom::element_type::STRING)
-        {
-          basics_log("registerRoutableAddress.family requires string\n");
-          exit(EXIT_FAILURE);
-        }
-
-        String value = {};
-        value.setInvariant(field.value.get_c_str());
-        if (parseExternalAddressFamily(value, request.family) == false)
-        {
-          basics_log("registerRoutableAddress.family invalid\n");
-          exit(EXIT_FAILURE);
-        }
-
-        sawFamily = true;
-      }
-      else if (key.equal("machineUUID"_ctv))
-      {
-        if (field.value.type() != simdjson::dom::element_type::STRING)
-        {
-          basics_log("registerRoutableAddress.machineUUID requires string\n");
-          exit(EXIT_FAILURE);
-        }
-
-        String value = {};
-        value.setInvariant(field.value.get_c_str());
-        request.machineUUID = String::numberFromHexString<uint128_t>(value);
-        if (request.machineUUID == 0)
-        {
-          basics_log("registerRoutableAddress.machineUUID invalid\n");
+          basics_log("%s.routablePrefixUUID invalid\n", operation);
           exit(EXIT_FAILURE);
         }
       }
-      else if (key.equal("uuid"_ctv))
+      else if (key.equal("address"_ctv) || key.equal("externalAddress"_ctv))
       {
+        String value;
         if (field.value.type() != simdjson::dom::element_type::STRING)
         {
-          basics_log("registerRoutableAddress.uuid requires string\n");
+          basics_log("%s.address invalid\n", operation);
           exit(EXIT_FAILURE);
         }
-
-        String value = {};
-        value.setInvariant(field.value.get_c_str());
-        request.uuid = String::numberFromHexString<uint128_t>(value);
-        if (request.uuid == 0)
+        value.assign(field.value.get_c_str());
+        if (ClusterMachine::parseIPAddressLiteral(value, lease.address) == false)
         {
-          basics_log("registerRoutableAddress.uuid invalid\n");
+          basics_log("%s.address invalid\n", operation);
           exit(EXIT_FAILURE);
         }
       }
-      else if (key.equal("requestedAddress"_ctv))
+      else if (key.equal("provider"_ctv) || key.equal("credentialName"_ctv) || key.equal("zone"_ctv) || key.equal("name"_ctv) || key.equal("type"_ctv))
       {
         if (field.value.type() != simdjson::dom::element_type::STRING)
         {
-          basics_log("registerRoutableAddress.requestedAddress requires string\n");
+          basics_log("%s.%s requires string\n", operation, key.c_str());
           exit(EXIT_FAILURE);
         }
-
-        request.requestedAddress.assign(field.value.get_c_str());
-      }
-      else if (key.equal("providerPool"_ctv))
-      {
-        if (field.value.type() != simdjson::dom::element_type::STRING)
+        if (key.equal("provider"_ctv))
         {
-          basics_log("registerRoutableAddress.providerPool requires string\n");
-          exit(EXIT_FAILURE);
+          lease.dnsProvider.assign(field.value.get_c_str());
         }
-
-        request.providerPool.assign(field.value.get_c_str());
+        else if (key.equal("credentialName"_ctv))
+        {
+          lease.dnsCredentialName.assign(field.value.get_c_str());
+        }
+        else if (key.equal("zone"_ctv))
+        {
+          lease.dnsZone.assign(field.value.get_c_str());
+        }
+        else if (key.equal("name"_ctv))
+        {
+          lease.dnsName.assign(field.value.get_c_str());
+        }
+        else
+        {
+          lease.dnsType.assign(field.value.get_c_str());
+        }
       }
       else
       {
-        basics_log("registerRoutableAddress invalid field\n");
+        basics_log("%s invalid field\n", operation);
         exit(EXIT_FAILURE);
       }
     }
-
-    if (request.name.size() == 0)
-    {
-      basics_log("registerRoutableAddress.name required\n");
-      exit(EXIT_FAILURE);
-    }
-
-    if (sawKind == false)
-    {
-      basics_log("registerRoutableAddress.kind required\n");
-      exit(EXIT_FAILURE);
-    }
-
-    if (sawFamily == false)
-    {
-      basics_log("registerRoutableAddress.family required\n");
-      exit(EXIT_FAILURE);
-    }
-
-    if (socket.connect() != 0)
-    {
-      exit(EXIT_FAILURE);
-    }
-
-    uint32_t headerOffset = Message::appendHeader(socket.wBuffer, MothershipTopic::registerRoutableAddress);
-    Message::serializeAndAppendObject(socket.wBuffer, request);
-    Message::finish(socket.wBuffer, headerOffset);
-
-    if (socket.send() == false)
-    {
-      exit(EXIT_FAILURE);
-    }
-
-    Message *responseMessage = socket.recvExpectedTopic(MothershipTopic::registerRoutableAddress);
-    if (responseMessage == nullptr)
-    {
-      exit(EXIT_FAILURE);
-    }
-
-    String serializedResponse = {};
-    uint8_t *responseArgs = responseMessage->args;
-    Message::extractToStringView(responseArgs, serializedResponse);
-
-    RoutableAddressRegistration response = {};
-    if (BitseryEngine::deserializeSafe(serializedResponse, response) == false)
-    {
-      basics_log("registerRoutableAddress response decode failed\n");
-      exit(EXIT_FAILURE);
-    }
-
-    String uuidText = {};
-    uuidText.assignItoh(response.uuid);
-    String machineUUIDText = {};
-    machineUUIDText.assignItoh(response.machineUUID);
-    String addressText = {};
-    if (ClusterMachine::renderIPAddressLiteral(response.address, addressText) == false)
-    {
-      addressText.assign("<invalid>"_ctv);
-    }
-
-    basics_log("registerRoutableAddress success=%d created=%d name=%s uuid=%s kind=%s family=%s machineUUID=%s address=%s failure=%s\n",
-               int(response.success),
-               int(response.created),
-               response.name.c_str(),
-               uuidText.c_str(),
-               routableAddressKindName(response.kind),
-               response.family == ExternalAddressFamily::ipv6 ? "ipv6" : "ipv4",
-               machineUUIDText.c_str(),
-               addressText.c_str(),
-               (response.failure.size() ? response.failure.c_str() : ""));
-
-    if (response.success == false)
-    {
-      exit(EXIT_FAILURE);
-    }
   }
 
-  void runUnregisterRoutableAddress(int argc, char *argv[])
+  void runDNSBindingMutation(MothershipTopic topic, int argc, char *argv[])
   {
+    const char *operation = prodigyMothershipTopicName(topic);
     if (argc < 2)
     {
-      basics_log("too few arguments. ex: unregisterRoutableAddress [target: local|clusterName|clusterUUID] [name|uuid]\n");
+      basics_log("too few arguments. ex: %s [target: local|clusterName|clusterUUID] [json]\n", operation);
       exit(EXIT_FAILURE);
     }
 
-    if (configureControlTarget(argv[0]) == false)
+    RoutableResourceLeaseReport request = {};
+    RoutableResourceLease lease = {};
+    parseDNSBindingLeaseJSON(argv[1], lease, operation);
+    request.leases.push_back(lease);
+
+    if (configureControlTarget(argv[0]) == false || socket.connect() != 0)
     {
       exit(EXIT_FAILURE);
     }
 
-    RoutableAddressUnregistration request = {};
-    String identifier = {};
-    identifier.assign(argv[1]);
-    request.name = identifier;
-    request.uuid = String::numberFromHexString<uint128_t>(identifier);
-
-    if (request.name.size() == 0 && request.uuid == 0)
-    {
-      basics_log("unregisterRoutableAddress requires name or uuid\n");
-      exit(EXIT_FAILURE);
-    }
-
-    if (socket.connect() != 0)
-    {
-      exit(EXIT_FAILURE);
-    }
-
-    uint32_t headerOffset = Message::appendHeader(socket.wBuffer, MothershipTopic::unregisterRoutableAddress);
+    uint32_t headerOffset = Message::appendHeader(socket.wBuffer, topic);
     Message::serializeAndAppendObject(socket.wBuffer, request);
     Message::finish(socket.wBuffer, headerOffset);
-
     if (socket.send() == false)
     {
       exit(EXIT_FAILURE);
     }
 
-    Message *responseMessage = socket.recvExpectedTopic(MothershipTopic::unregisterRoutableAddress);
+    Message *responseMessage = socket.recvExpectedTopic(topic);
     if (responseMessage == nullptr)
     {
       exit(EXIT_FAILURE);
     }
 
-    String serializedResponse = {};
+    String serializedResponse;
     uint8_t *responseArgs = responseMessage->args;
     Message::extractToStringView(responseArgs, serializedResponse);
 
-    RoutableAddressUnregistration response = {};
+    RoutableResourceLeaseReport response = {};
     if (BitseryEngine::deserializeSafe(serializedResponse, response) == false)
     {
-      basics_log("unregisterRoutableAddress response decode failed\n");
+      basics_log("%s response decode failed\n", operation);
       exit(EXIT_FAILURE);
     }
 
-    String uuidText = {};
-    uuidText.assignItoh(response.uuid);
-    basics_log("unregisterRoutableAddress success=%d removed=%d name=%s uuid=%s failure=%s\n",
-               int(response.success),
-               int(response.removed),
-               response.name.c_str(),
-               uuidText.c_str(),
-               (response.failure.size() ? response.failure.c_str() : ""));
-
+    basics_log("%s success=%d count=%u failure=%s\n", operation, int(response.success), unsigned(response.leases.size()), (response.failure.size() ? response.failure.c_str() : ""));
     if (response.success == false)
     {
       exit(EXIT_FAILURE);
     }
   }
 
-  void runPullRoutableAddresses(int argc, char *argv[])
+  void runPullDNSBindings(int argc, char *argv[])
   {
     if (argc < 1)
     {
-      basics_log("too few arguments. ex: pullRoutableAddresses [target: local|clusterName|clusterUUID]\n");
+      basics_log("too few arguments. ex: pullDNSBindings [target: local|clusterName|clusterUUID]\n");
       exit(EXIT_FAILURE);
     }
 
-    if (configureControlTarget(argv[0]) == false)
+    if (configureControlTarget(argv[0]) == false || socket.connect() != 0)
     {
       exit(EXIT_FAILURE);
     }
 
-    if (socket.connect() != 0)
-    {
-      exit(EXIT_FAILURE);
-    }
-
-    Message::construct(socket.wBuffer, MothershipTopic::pullRoutableAddresses);
-
+    Message::construct(socket.wBuffer, MothershipTopic::pullDNSBindings);
     if (socket.send() == false)
     {
       exit(EXIT_FAILURE);
     }
 
-    Message *responseMessage = socket.recvExpectedTopic(MothershipTopic::pullRoutableAddresses);
+    Message *responseMessage = socket.recvExpectedTopic(MothershipTopic::pullDNSBindings);
     if (responseMessage == nullptr)
     {
       exit(EXIT_FAILURE);
     }
 
-    String serializedResponse = {};
+    String serializedResponse;
     uint8_t *responseArgs = responseMessage->args;
     Message::extractToStringView(responseArgs, serializedResponse);
 
-    RoutableAddressRegistryReport response = {};
+    RoutableResourceLeaseReport response = {};
     if (BitseryEngine::deserializeSafe(serializedResponse, response) == false)
     {
-      basics_log("pullRoutableAddresses response decode failed\n");
+      basics_log("pullDNSBindings response decode failed\n");
       exit(EXIT_FAILURE);
     }
-
     if (response.success == false)
     {
-      basics_log("pullRoutableAddresses success=0 failure=%s\n", (response.failure.size() ? response.failure.c_str() : ""));
+      basics_log("pullDNSBindings success=0 failure=%s\n", (response.failure.size() ? response.failure.c_str() : ""));
       exit(EXIT_FAILURE);
     }
 
-    basics_log("pullRoutableAddresses success=1 count=%u\n", unsigned(response.addresses.size()));
-    for (const RegisteredRoutableAddress& address : response.addresses)
+    basics_log("pullDNSBindings success=1 count=%u\n", unsigned(response.leases.size()));
+    for (const RoutableResourceLease& lease : response.leases)
     {
-      String uuidText = {};
-      uuidText.assignItoh(address.uuid);
-      String machineUUIDText = {};
-      machineUUIDText.assignItoh(address.machineUUID);
-      String addressText = {};
-      String nameText = {};
-      nameText.assign(address.name);
-      String providerPoolText = {};
-      providerPoolText.assign(address.providerPool);
-      if (ClusterMachine::renderIPAddressLiteral(address.address, addressText) == false)
-      {
-        addressText.assign("<invalid>"_ctv);
-      }
-
-      basics_log("  name=%s uuid=%s kind=%s family=%s machineUUID=%s address=%s providerPool=%s\n",
-                 nameText.c_str(),
-                 uuidText.c_str(),
-                 routableAddressKindName(address.kind),
-                 address.family == ExternalAddressFamily::ipv6 ? "ipv6" : "ipv4",
-                 machineUUIDText.c_str(),
+      String addressText, prefixUUIDText, ownerName, dnsProvider, dnsZone, dnsName, dnsType, credentialName;
+      (void)ClusterMachine::renderIPAddressLiteral(lease.address, addressText);
+      prefixUUIDText.assignItoh(lease.registeredPrefixUUID);
+      ownerName = lease.owner.name;
+      dnsProvider = lease.dnsProvider;
+      dnsZone = lease.dnsZone;
+      dnsName = lease.dnsName;
+      dnsType = lease.dnsType;
+      credentialName = lease.dnsCredentialName;
+      basics_log("  bindingName=%s app=%u deployment=%llu lineage=%llu address=%s registeredPrefixUUID=%s dns=%s/%s/%s/%s credential=%s ttl=%u\n",
+                 ownerName.c_str(),
+                 unsigned(lease.owner.applicationID),
+                 (unsigned long long)lease.owner.deploymentID,
+                 (unsigned long long)lease.owner.lineageID,
                  addressText.c_str(),
-                 providerPoolText.c_str());
+                 prefixUUIDText.c_str(),
+                 dnsProvider.c_str(),
+                 dnsZone.c_str(),
+                 dnsName.c_str(),
+                 dnsType.c_str(),
+                 credentialName.c_str(),
+                 unsigned(lease.dnsTTL));
     }
   }
+
   void runUpsertTlsVaultFactory(int argc, char *argv[])
   {
     if (argc < 2)
@@ -15508,17 +15961,21 @@ public:
     {
       runPullRoutableSubnets(argc, argv);
     }
-    else if (operation.equal("registerRoutableAddress"_ctv))
+    else if (operation.equal("pullRoutableResourceLeases"_ctv))
     {
-      runRegisterRoutableAddress(argc, argv);
+      runPullRoutableResourceLeases(argc, argv);
     }
-    else if (operation.equal("unregisterRoutableAddress"_ctv))
+    else if (operation.equal("upsertDNSBinding"_ctv))
     {
-      runUnregisterRoutableAddress(argc, argv);
+      runDNSBindingMutation(MothershipTopic::upsertDNSBinding, argc, argv);
     }
-    else if (operation.equal("pullRoutableAddresses"_ctv))
+    else if (operation.equal("deleteDNSBinding"_ctv))
     {
-      runPullRoutableAddresses(argc, argv);
+      runDNSBindingMutation(MothershipTopic::deleteDNSBinding, argc, argv);
+    }
+    else if (operation.equal("pullDNSBindings"_ctv))
+    {
+      runPullDNSBindings(argc, argv);
     }
     else if (operation.equal("mintClientTlsIdentity"_ctv))
     {
@@ -15537,7 +15994,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, configureTestCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, registerRoutableAddress, unregisterRoutableAddress, pullRoutableAddresses, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity]";
+        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, configureTestCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }
@@ -15572,6 +16029,7 @@ int main(int argc, char *argv[])
     message.append("\taccepts required minMachines plus optional ingressGBPerHour and egressGBPerHour, and now considers up to three distinct machine types per recommendation\n");
     message.append("createCluster [json]\n");
     message.append("\tcreates a managed Prodigy cluster record, assigns a clusterUUID, and uses providerCredentialName or an inline providerCredentialOverride secret block\n");
+    message.append("\toptionally enables one cluster DNS provider with dnsProvider plus dnsProviderCredentialName or dnsProviderCredentialOverride; see prodigy/docs/dns-providers.md\n");
     message.append("\tfor persistent fake clusters, prefer deploymentMode=test instead of invoking prodigy_dev_netns_harness.sh directly\n");
     message.append("configureTestCluster [workspaceRoot] [machineCount] [nBrains] [brainBootstrapFamily] [enableFakeIpv4Boundary:0|1] [interContainerMTU] [datacenterFragment] [autoscaleIntervalSeconds] [schema] [kind] [nLogicalCores] [nMemoryMB] [nStorageMB]\n");
     message.append("\tvalidates a disposable test-cluster config, derives BrainConfig, and sends one configure request to the synthesized test control socket without persisting cluster state\n");
@@ -15604,17 +16062,19 @@ int main(int argc, char *argv[])
     message.append("reserveServiceID [target: dev|prod|local|clusterName|clusterUUID] [json]\n");
     message.append("\treserves and returns a serviceID for a reserved application service name\n");
     message.append("registerRoutableSubnet [target: local|clusterName|clusterUUID] [json]\n");
-    message.append("\tregisters or updates a bgp-announced routable subnet; ipv4 must be /4../24 and ipv6 must be /4../48, the environment must have bgp enabled, and json.usage must be wormholes, whiteholes, or both\n");
+    message.append("\tregisters or updates a routable prefix; BGP json.prefix may be CIDR or bare IP; elastic requires json.family and json.elasticIntent any|create|anyOrCreate; json.usage must be wormholes, whiteholes, or both; singleMachine may omit machineUUID only in a one-machine cluster\n");
     message.append("unregisterRoutableSubnet [target: local|clusterName|clusterUUID] [name]\n");
-    message.append("\tremoves a routable subnet from the replicated registry by name\n");
+    message.append("\tremoves a routable prefix from the replicated registry by name\n");
     message.append("pullRoutableSubnets [target: local|clusterName|clusterUUID]\n");
-    message.append("\tlists the currently registered routable subnets\n");
-    message.append("registerRoutableAddress [target: local|clusterName|clusterUUID] [json]\n");
-    message.append("\tregisters an exact externally reachable address of kind testFakeAddress, anyHostPublicAddress, or providerElasticAddress and returns its uuid\n");
-    message.append("unregisterRoutableAddress [target: local|clusterName|clusterUUID] [name|uuid]\n");
-    message.append("\tremoves a registered exact routable address by name or uuid\n");
-    message.append("pullRoutableAddresses [target: local|clusterName|clusterUUID]\n");
-    message.append("\tlists the currently registered exact routable addresses\n");
+    message.append("\tlists the currently registered routable prefixes\n");
+    message.append("pullRoutableResourceLeases [target: local|clusterName|clusterUUID]\n");
+    message.append("\tlists live routable ownership leases for wormhole addresses, whitehole IP:port tuples, and DNS records\n");
+    message.append("upsertDNSBinding [target: local|clusterName|clusterUUID] [json]\n");
+    message.append("\tcreates or updates a DNS binding plus attached routable address lease; json requires bindingName, applicationID, routablePrefixUUID, address, provider, credentialName, zone, name, ttl; type defaults from address family\n");
+    message.append("deleteDNSBinding [target: local|clusterName|clusterUUID] [json]\n");
+    message.append("\tdeletes an owned DNS binding by provider, zone, name, and type after provider DNS deletion succeeds\n");
+    message.append("pullDNSBindings [target: local|clusterName|clusterUUID]\n");
+    message.append("\tlists live DNS binding leases\n");
     message.append("upsertTlsVaultFactory [target: local|clusterName|clusterUUID] [json]\n");
     message.append("\tcreates/updates an application TLS vault factory\n");
     message.append("upsertApiCredentialSet [target: local|clusterName|clusterUUID] [json]\n");

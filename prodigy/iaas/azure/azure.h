@@ -4408,15 +4408,16 @@ public:
 
   bool assignProviderElasticAddress(Machine *machine,
                                     ExternalAddressFamily family,
+                                    ElasticPrefixIntent intent,
                                     const String& requestedAddress,
                                     const String& providerPool,
-                                    IPAddress& assignedAddress,
+                                    IPPrefix& assignedPrefix,
                                     String& allocationID,
                                     String& associationID,
                                     bool& releaseOnRemove,
                                     String& error) override
   {
-    assignedAddress = {};
+    assignedPrefix = {};
     allocationID.clear();
     associationID.clear();
     releaseOnRemove = false;
@@ -4439,9 +4440,21 @@ public:
       return false;
     }
 
-    if (requestedAddress.size() > 0 && providerPool.size() > 0)
+    if (elasticPrefixIntentIsValid(intent) == false)
     {
-      error.assign("azure elastic address cannot combine requestedAddress with providerPool"_ctv);
+      error.assign("azure elastic prefix intent invalid"_ctv);
+      return false;
+    }
+
+    if (intent == ElasticPrefixIntent::create && requestedAddress.size() > 0)
+    {
+      error.assign("azure elastic create intent does not accept requestedAddress"_ctv);
+      return false;
+    }
+
+    if (intent == ElasticPrefixIntent::any && requestedAddress.size() == 0)
+    {
+      error.assign("azure elastic any intent requires requestedAddress"_ctv);
       return false;
     }
 
@@ -4456,16 +4469,29 @@ public:
 
     String publicAddress = {};
     String existingIPConfigurationID = {};
-    if (requestedAddress.size() > 0)
+    bool useExisting = requestedAddress.size() > 0 && intent != ElasticPrefixIntent::create;
+    if (useExisting)
     {
+      if (providerPool.size() > 0)
+      {
+        error.assign("azure elastic any intent cannot combine requestedAddress with providerPool"_ctv);
+        return false;
+      }
+
       if (fetchPublicIPAddressByConcreteAddress(requestedAddress, allocationID, existingIPConfigurationID, publicAddress, error) == false)
       {
-        return false;
+        if (intent != ElasticPrefixIntent::anyOrCreate)
+        {
+          return false;
+        }
+
+        error.clear();
+        useExisting = false;
       }
 
       releaseOnRemove = false;
     }
-    else
+    if (useExisting == false)
     {
       if (createPublicIPAddress(providerPool, allocationID, publicAddress, error) == false)
       {
@@ -4513,44 +4539,47 @@ public:
       return false;
     }
 
+    IPAddress assignedAddress = {};
     if (ClusterMachine::parseIPAddressLiteral(publicAddress, assignedAddress) == false)
     {
       error.assign("azure elastic address parse failed"_ctv);
       cleanupOnFailure();
       return false;
     }
+    assignedPrefix.network = assignedAddress;
+    assignedPrefix.cidr = assignedAddress.is6 ? 128 : 32;
 
     return true;
   }
 
-  bool releaseProviderElasticAddress(const RegisteredRoutableAddress& address, String& error) override
+  bool releaseProviderElasticAddress(const DistributableExternalSubnet& prefix, String& error) override
   {
     error.clear();
-    if (address.kind != RoutableAddressKind::providerElasticAddress)
+    if (prefix.kind != RoutablePrefixKind::elastic)
     {
       return true;
     }
 
-    if (address.providerAssociationID.size() > 0)
+    if (prefix.providerAssociationID.size() > 0)
     {
-      if (detachPublicIPAddressAssociation(address.providerAssociationID, error) == false)
+      if (detachPublicIPAddressAssociation(prefix.providerAssociationID, error) == false)
       {
         return false;
       }
     }
 
-    if (address.providerAllocationID.size() > 0)
+    if (prefix.providerAllocationID.size() > 0)
     {
-      (void)waitForPublicIPAddressState(address.providerAllocationID, String(), false, nullptr, error);
+      (void)waitForPublicIPAddressState(prefix.providerAllocationID, String(), false, nullptr, error);
       if (error.size() > 0)
       {
         return false;
       }
     }
 
-    if (address.releaseOnRemove)
+    if (prefix.releaseOnRemove)
     {
-      if (deletePublicIPAddressResource(address.providerAllocationID, error) == false)
+      if (deletePublicIPAddressResource(prefix.providerAllocationID, error) == false)
       {
         return false;
       }

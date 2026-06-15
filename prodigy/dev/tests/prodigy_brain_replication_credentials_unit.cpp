@@ -216,6 +216,51 @@ public:
   }
 };
 
+class TestDNSProvider final : public ProdigyDNSProvider {
+public:
+
+  uint32_t upsertCalls = 0;
+  uint32_t removeCalls = 0;
+  bool failUpsert = false;
+  bool failRemove = false;
+  Vector<ProdigyDNSRecordBinding> upserts;
+  Vector<ProdigyDNSRecordBinding> removes;
+  String lastCredentialMaterial;
+
+  bool supportsProvider(const String& provider) const override
+  {
+    return routableResourceDNSPartEquals(provider, "cloudflare"_ctv, false);
+  }
+
+  bool upsert(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  {
+    upsertCalls += 1;
+    upserts.push_back(record);
+    lastCredentialMaterial = credential.material;
+    if (failUpsert)
+    {
+      failure.assign("injected DNS upsert failure"_ctv);
+      return false;
+    }
+    failure.clear();
+    return true;
+  }
+
+  bool remove(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  {
+    (void)credential;
+    removeCalls += 1;
+    removes.push_back(record);
+    if (failRemove)
+    {
+      failure.assign("injected DNS remove failure"_ctv);
+      return false;
+    }
+    failure.clear();
+    return true;
+  }
+};
+
 class PairingTrackingContainerView : public ContainerView {
 public:
 
@@ -465,6 +510,52 @@ public:
   {
     destroyCalls += 1;
     lastDestroyedUUID = (machine ? machine->uuid : 0);
+  }
+};
+
+class ElasticPrefixBrainIaaS final : public NoopBrainIaaS {
+public:
+
+  uint32_t assignCalls = 0;
+  uint32_t releaseCalls = 0;
+  Machine *lastMachine = nullptr;
+  ExternalAddressFamily lastFamily = ExternalAddressFamily::ipv4;
+  ElasticPrefixIntent lastIntent = ElasticPrefixIntent::create;
+  String lastRequestedAddress = {};
+  String lastProviderPool = {};
+  DistributableExternalSubnet lastReleased = {};
+
+  bool assignProviderElasticAddress(Machine *machine,
+                                    ExternalAddressFamily family,
+                                    ElasticPrefixIntent intent,
+                                    const String& requestedAddress,
+                                    const String& providerPool,
+                                    IPPrefix& assignedPrefix,
+                                    String& allocationID,
+                                    String& associationID,
+                                    bool& releaseOnRemove,
+                                    String& error) override
+  {
+    assignCalls += 1;
+    lastMachine = machine;
+    lastFamily = family;
+    lastIntent = intent;
+    lastRequestedAddress.assign(requestedAddress);
+    lastProviderPool.assign(providerPool);
+    assignedPrefix = IPPrefix("198.51.100.88", false, 32);
+    allocationID.assign("alloc-88"_ctv);
+    associationID.assign("assoc-88"_ctv);
+    releaseOnRemove = true;
+    error.clear();
+    return true;
+  }
+
+  bool releaseProviderElasticAddress(const DistributableExternalSubnet& prefix, String& error) override
+  {
+    releaseCalls += 1;
+    lastReleased = prefix;
+    error.clear();
+    return true;
   }
 };
 
@@ -5864,14 +5955,14 @@ static void testReplicatedBrainConfigReplaysFullSwitchboardState(TestSuite& suit
   BrainConfig replicated = {};
   replicated.runtimeEnvironment.test.enabled = true;
 
-  RegisteredRoutableAddress address = {};
-  address.uuid = uint128_t(0xABC123);
-  address.name.assign("public-route"_ctv);
-  address.kind = RoutableAddressKind::testFakeAddress;
-  address.family = ExternalAddressFamily::ipv6;
-  address.machineUUID = machine.uuid;
-  address.address = IPAddress("2602:fac0:0:12ab:34cd::77", true);
-  replicated.routableAddresses.push_back(address);
+  DistributableExternalSubnet prefix = {};
+  prefix.uuid = uint128_t(0xABC123);
+  prefix.name.assign("public-route"_ctv);
+  prefix.machineUUID = machine.uuid;
+  prefix.ingressScope = RoutableIngressScope::singleMachine;
+  prefix.usage = ExternalSubnetUsage::wormholes;
+  prefix.subnet = IPPrefix("2602:fac0:0:12ab:34cd::77", true, 128);
+  replicated.distributableExternalSubnets.push_back(prefix);
 
   brain.brainConfig = replicated;
   brain.loadBrainConfigIf();
@@ -5931,7 +6022,7 @@ static void testSwitchboardStateSyncReplaysWhiteholes(TestSuite& suite)
   Whitehole whitehole = {};
   whitehole.transport = ExternalAddressTransport::tcp;
   whitehole.family = ExternalAddressFamily::ipv4;
-  whitehole.source = ExternalAddressSource::distributableSubnet;
+  whitehole.source = ExternalAddressSource::registeredRoutablePrefix;
   whitehole.hasAddress = true;
   whitehole.address = IPAddress("203.0.113.77", false);
   whitehole.sourcePort = 55'123;
@@ -6165,7 +6256,352 @@ static void testQuicWormholeRotationAndNoopPaths(TestSuite& suite)
   suite.expect(brain.persistCalls == 2, "quic_wormhole_refresh_persists_rotated_state");
 }
 
-static void testRegisteredRoutableAddressRefreshReplaysToNeuronsFollowersAndContainers(TestSuite& suite)
+static void testWormholeAddressLeasesReserveAndConflict(TestSuite& suite)
+{
+  TestBrain brain;
+
+  DeploymentPlan plan = {};
+  plan.config.applicationID = 61'100;
+  plan.config.versionID = 1;
+  Wormhole wormhole = {};
+  wormhole.name = "api"_ctv;
+  wormhole.externalAddress = IPAddress("203.0.113.200", false);
+  wormhole.externalPort = 443;
+  wormhole.containerPort = 8443;
+  wormhole.layer4 = IPPROTO_TCP;
+  plan.wormholes.push_back(wormhole);
+
+  String failure = {};
+  suite.expect(brain.reserveDeploymentWormholeAddressLeases(plan, failure, false), "wormhole_address_lease_dry_run_accepts_unowned_address");
+  suite.expect(brain.routableResourceLeaseRuntimeState.empty(), "wormhole_address_lease_dry_run_does_not_mutate");
+  suite.expect(brain.reserveDeploymentWormholeAddressLeases(plan, failure, true), "wormhole_address_lease_commit_accepts_unowned_address");
+  suite.expect(brain.routableResourceLeaseRuntimeState.size() == 1, "wormhole_address_lease_commit_records_one_lease");
+  suite.expect(brain.masterAuthorityRuntimeState.routableResourceLeases.size() == 1, "wormhole_address_lease_commit_mirrors_master_runtime_state");
+  suite.expect(brain.reserveDeploymentWormholeAddressLeases(plan, failure, true), "wormhole_address_lease_commit_is_idempotent");
+  suite.expect(brain.routableResourceLeaseRuntimeState.size() == 1, "wormhole_address_lease_idempotent_keeps_one_lease");
+
+  DeploymentPlan sameAppUpgrade = plan;
+  sameAppUpgrade.config.versionID = 2;
+  suite.expect(brain.reserveDeploymentWormholeAddressLeases(sameAppUpgrade, failure, false), "wormhole_address_lease_allows_same_lineage_upgrade");
+
+  DeploymentPlan otherApp = plan;
+  otherApp.config.applicationID = 61'101;
+  otherApp.config.versionID = 1;
+  suite.expect(brain.reserveDeploymentWormholeAddressLeases(otherApp, failure, false) == false, "wormhole_address_lease_rejects_other_application_conflict");
+  suite.expect(failure.equal("wormhole routable address is already owned"_ctv), "wormhole_address_lease_conflict_failure_text");
+}
+
+static void testRegisteredPrefixWormholeAddressAllocation(TestSuite& suite)
+{
+  TestBrain brain = {};
+  DistributableExternalSubnet prefix = {};
+  prefix.uuid = uint128_t(0xCC3301);
+  prefix.usage = ExternalSubnetUsage::wormholes;
+  prefix.subnet = IPPrefix("198.51.100.0", false, 30);
+  brain.brainConfig.distributableExternalSubnets.push_back(prefix);
+
+  auto makePlan = [&](uint16_t applicationID) {
+    DeploymentPlan plan = {};
+    plan.config.applicationID = applicationID;
+    plan.config.versionID = 1;
+    Wormhole wormhole = {};
+    wormhole.name = "api"_ctv;
+    wormhole.externalPort = 443;
+    wormhole.containerPort = 8443;
+    wormhole.layer4 = IPPROTO_TCP;
+    wormhole.source = ExternalAddressSource::registeredRoutablePrefix;
+    wormhole.routablePrefixUUID = prefix.uuid;
+    plan.wormholes.push_back(wormhole);
+    return plan;
+  };
+  String failure = {};
+  DeploymentPlan first = makePlan(61'200);
+  RoutableResourceLeaseOwner firstOwner = deploymentRoutableResourceLeaseOwner(first);
+  suite.expect(resolveWormholeRegisteredRoutablePrefix(brain.brainConfig.distributableExternalSubnets, first.wormholes[0], &failure, &brain.routableResourceLeaseRuntimeState, &firstOwner), "registered_prefix_wormhole_allocates_first_address");
+  suite.expect(first.wormholes[0].externalAddress.equals(IPAddress("198.51.100.1", false)), "registered_prefix_wormhole_first_address");
+  suite.expect(brain.reserveDeploymentWormholeAddressLeases(first, failure, true), "registered_prefix_wormhole_commits_first_address");
+
+  DeploymentPlan second = makePlan(61'201);
+  RoutableResourceLeaseOwner secondOwner = deploymentRoutableResourceLeaseOwner(second);
+  suite.expect(resolveWormholeRegisteredRoutablePrefix(brain.brainConfig.distributableExternalSubnets, second.wormholes[0], &failure, &brain.routableResourceLeaseRuntimeState, &secondOwner), "registered_prefix_wormhole_skips_owned_address");
+  suite.expect(second.wormholes[0].externalAddress.equals(IPAddress("198.51.100.2", false)), "registered_prefix_wormhole_second_address");
+  suite.expect(brain.reserveDeploymentWormholeAddressLeases(second, failure, false), "registered_prefix_wormhole_second_address_reserves");
+
+  DeploymentPlan explicitConflict = makePlan(61'202);
+  explicitConflict.wormholes[0].externalAddress = first.wormholes[0].externalAddress;
+  RoutableResourceLeaseOwner conflictOwner = deploymentRoutableResourceLeaseOwner(explicitConflict);
+  suite.expect(resolveWormholeRegisteredRoutablePrefix(brain.brainConfig.distributableExternalSubnets, explicitConflict.wormholes[0], &failure, &brain.routableResourceLeaseRuntimeState, &conflictOwner), "registered_prefix_wormhole_accepts_explicit_contained_conflict_before_lease_check");
+  suite.expect(brain.reserveDeploymentWormholeAddressLeases(explicitConflict, failure, false) == false, "registered_prefix_wormhole_rejects_explicit_owned_address");
+}
+
+static void testWormholeDNSLeasesAndCredentialValidation(TestSuite& suite)
+{
+  auto addPrefixAndCredential = [](TestBrain& brain, uint16_t applicationID, RoutableIngressScope scope = RoutableIngressScope::switchboardFleet) {
+    DistributableExternalSubnet prefix = {};
+    prefix.uuid = uint128_t(0xDD4401);
+    prefix.usage = ExternalSubnetUsage::wormholes;
+    prefix.ingressScope = scope;
+    prefix.subnet = IPPrefix("203.0.113.0", false, 24);
+    brain.brainConfig.distributableExternalSubnets.push_back(prefix);
+    brain.brainConfig.dnsProvider = "cloudflare"_ctv;
+
+    ApplicationApiCredentialSet set = {};
+    set.applicationID = applicationID;
+    ApiCredential credential = {};
+    credential.name = "cf-prod"_ctv;
+    credential.provider = "Cloudflare"_ctv;
+    credential.material = "secret"_ctv;
+    set.credentials.push_back(credential);
+    brain.apiCredentialSetsByApp[set.applicationID] = set;
+  };
+
+  auto makePlan = [](uint16_t applicationID, uint64_t versionID, const char *address) {
+    DeploymentPlan plan = {};
+    plan.config.applicationID = applicationID;
+    plan.config.versionID = versionID;
+    Wormhole wormhole = {};
+    wormhole.name = "api"_ctv;
+    wormhole.externalAddress = IPAddress(address, false);
+    wormhole.externalPort = 443;
+    wormhole.containerPort = 8443;
+    wormhole.layer4 = IPPROTO_TCP;
+    wormhole.source = ExternalAddressSource::registeredRoutablePrefix;
+    wormhole.routablePrefixUUID = uint128_t(0xDD4401);
+    wormhole.hasDNSConfig = true;
+    wormhole.dns.provider = "cloudflare"_ctv;
+    wormhole.dns.credentialName = "cf-prod"_ctv;
+    wormhole.dns.zone = "Example.COM."_ctv;
+    wormhole.dns.name = "Api.Example.COM."_ctv;
+    wormhole.dns.ttl = 300;
+    plan.wormholes.push_back(wormhole);
+    return plan;
+  };
+
+  TestBrain brain = {};
+  TestDNSProvider dns = {};
+  brain.dnsProvider = &dns;
+  addPrefixAndCredential(brain, 61'400);
+  String failure = {};
+  DeploymentPlan plan = makePlan(61'400, 1, "203.0.113.10");
+  suite.expect(brain.validateDeploymentWormholeDNSConfig(plan, plan.wormholes[0], failure), "wormhole_dns_validation_accepts_registered_credential");
+  suite.expect(brain.reserveDeploymentWormholeAddressLeases(plan, failure, false), "wormhole_dns_lease_dry_run_accepts");
+  suite.expect(brain.routableResourceLeaseRuntimeState.empty(), "wormhole_dns_lease_dry_run_does_not_mutate");
+  suite.expect(dns.upsertCalls == 0, "wormhole_dns_lease_dry_run_does_not_apply_record");
+  suite.expect(brain.reserveDeploymentWormholeAddressLeases(plan, failure, true), "wormhole_dns_lease_commit_accepts");
+  suite.expect(brain.routableResourceLeaseRuntimeState.size() == 2, "wormhole_dns_lease_commit_records_address_and_dns");
+  suite.expect(dns.upsertCalls == 1, "wormhole_dns_lease_commit_applies_record");
+  suite.expect(dns.upserts.size() == 1 && dns.upserts[0].values.size() == 1 && dns.upserts[0].values[0].equal("203.0.113.10"_ctv), "wormhole_dns_lease_commit_targets_claimed_address");
+  suite.expect(dns.upserts.size() == 1 && dns.upserts[0].credentialName.equal("cf-prod"_ctv), "wormhole_dns_lease_commit_uses_named_credential");
+  suite.expect(dns.upserts.size() == 1 && dns.upserts[0].ttl == 300, "wormhole_dns_lease_commit_preserves_ttl");
+
+  TestBrain clusterCredentialBrain = {};
+  TestDNSProvider clusterDNS = {};
+  clusterCredentialBrain.dnsProvider = &clusterDNS;
+  addPrefixAndCredential(clusterCredentialBrain, 61'407);
+  clusterCredentialBrain.brainConfig.dnsCredential.name = "cluster-cf"_ctv;
+  clusterCredentialBrain.brainConfig.dnsCredential.provider = "cloudflare"_ctv;
+  clusterCredentialBrain.brainConfig.dnsCredential.material = "cluster-secret"_ctv;
+  DeploymentPlan clusterCredentialPlan = makePlan(61'407, 1, "203.0.113.42");
+  clusterCredentialPlan.wormholes[0].dns.credentialName = "cluster-cf"_ctv;
+  suite.expect(clusterCredentialBrain.validateDeploymentWormholeDNSConfig(clusterCredentialPlan, clusterCredentialPlan.wormholes[0], failure), "wormhole_dns_validation_accepts_cluster_credential");
+  suite.expect(clusterCredentialBrain.reserveDeploymentWormholeAddressLeases(clusterCredentialPlan, failure, true), "wormhole_dns_lease_commit_uses_cluster_credential");
+  suite.expect(clusterDNS.lastCredentialMaterial.equal("cluster-secret"_ctv), "wormhole_dns_provider_receives_cluster_credential");
+
+  ProdigyPersistentMasterAuthorityPackage dnsPackage = {};
+  brain.capturePersistentMasterAuthorityPackage(dnsPackage);
+
+  TestDNSProvider followerDNS = {};
+  TestBrain followerRestore = {};
+  followerRestore.dnsProvider = &followerDNS;
+  followerRestore.brainConfig.dnsProvider = "cloudflare"_ctv;
+  followerRestore.applyPersistentMasterAuthorityPackage(dnsPackage);
+  suite.expect(followerDNS.upsertCalls == 0, "wormhole_dns_restore_follower_does_not_apply_record");
+
+  TestDNSProvider restoreDNS = {};
+  TestBrain masterRestore = {};
+  masterRestore.weAreMaster = true;
+  masterRestore.dnsProvider = &restoreDNS;
+  masterRestore.brainConfig.dnsProvider = "cloudflare"_ctv;
+  masterRestore.applyPersistentMasterAuthorityPackage(dnsPackage);
+  suite.expect(restoreDNS.upsertCalls == 1, "wormhole_dns_restore_master_reconciles_record");
+  suite.expect(restoreDNS.upserts.size() == 1 && restoreDNS.upserts[0].values.size() == 1 && restoreDNS.upserts[0].values[0].equal("203.0.113.10"_ctv), "wormhole_dns_restore_master_targets_claimed_address");
+
+  TestDNSProvider replicatedDNS = {};
+  TestBrain replicatedMaster = {};
+  replicatedMaster.weAreMaster = true;
+  replicatedMaster.dnsProvider = &replicatedDNS;
+  replicatedMaster.brainConfig.dnsProvider = "cloudflare"_ctv;
+  replicatedMaster.apiCredentialSetsByApp = brain.apiCredentialSetsByApp;
+  ProdigyMasterAuthorityRuntimeState replicatedState = dnsPackage.runtimeState;
+  replicatedState.generation += 100;
+  suite.expect(replicatedMaster.applyReplicatedMasterAuthorityRuntimeState(replicatedState, false), "wormhole_dns_replicated_master_state_applies");
+  suite.expect(replicatedDNS.upsertCalls == 1, "wormhole_dns_replicated_master_state_reconciles_record");
+
+  bool sawDNSLease = false;
+  for (const RoutableResourceLease& lease : brain.routableResourceLeaseRuntimeState)
+  {
+    if (lease.kind == RoutableResourceLeaseKind::dnsRecord)
+    {
+      sawDNSLease = true;
+      suite.expect(lease.address.equals(IPAddress("203.0.113.10", false)), "wormhole_dns_lease_records_claimed_address");
+      suite.expect(lease.dnsType.equal("A"_ctv), "wormhole_dns_lease_infers_ipv4_a_record");
+      suite.expect(lease.dnsProvider.equal("cloudflare"_ctv), "wormhole_dns_lease_records_provider");
+      suite.expect(lease.dnsCredentialName.equal("cf-prod"_ctv), "wormhole_dns_lease_records_credential");
+      suite.expect(lease.dnsTTL == 300, "wormhole_dns_lease_records_ttl");
+    }
+  }
+  suite.expect(sawDNSLease, "wormhole_dns_lease_records_dns_kind");
+
+  addPrefixAndCredential(brain, 61'401);
+  DeploymentPlan other = makePlan(61'401, 1, "203.0.113.11");
+  other.wormholes[0].dns.provider = "CLOUDFLARE"_ctv;
+  other.wormholes[0].dns.zone = "example.com"_ctv;
+  other.wormholes[0].dns.name = "api.example.com"_ctv;
+  suite.expect(brain.validateDeploymentWormholeDNSConfig(other, other.wormholes[0], failure), "wormhole_dns_validation_casefolds_provider_zone_name");
+  suite.expect(brain.reserveDeploymentWormholeAddressLeases(other, failure, false) == false, "wormhole_dns_lease_rejects_other_application_record");
+  suite.expect(failure.equal("wormhole DNS record is already owned"_ctv), "wormhole_dns_lease_conflict_failure_text");
+  suite.expect(dns.upsertCalls == 1, "wormhole_dns_conflict_does_not_apply_record");
+
+  DeploymentPlan missing = makePlan(61'400, 2, "203.0.113.12");
+  missing.wormholes[0].dns.credentialName = "missing"_ctv;
+  suite.expect(brain.validateDeploymentWormholeDNSConfig(missing, missing.wormholes[0], failure) == false, "wormhole_dns_validation_rejects_missing_credential");
+  suite.expect(failure.equal("wormhole DNS credential is not registered"_ctv), "wormhole_dns_validation_missing_credential_text");
+
+  DeploymentPlan wrongProvider = makePlan(61'400, 2, "203.0.113.12");
+  wrongProvider.wormholes[0].dns.provider = "route53"_ctv;
+  suite.expect(brain.validateDeploymentWormholeDNSConfig(wrongProvider, wrongProvider.wormholes[0], failure) == false, "wormhole_dns_validation_rejects_provider_mismatch");
+  suite.expect(failure.equal("wormhole DNS provider is not enabled for this cluster"_ctv), "wormhole_dns_validation_provider_mismatch_text");
+
+  DeploymentPlan wrongFamily = makePlan(61'400, 2, "203.0.113.12");
+  wrongFamily.wormholes[0].dns.type = "AAAA"_ctv;
+  suite.expect(brain.validateDeploymentWormholeDNSConfig(wrongFamily, wrongFamily.wormholes[0], failure) == false, "wormhole_dns_validation_rejects_family_mismatch");
+  suite.expect(failure.equal("wormhole DNS record type must match the claimed address family"_ctv), "wormhole_dns_validation_family_mismatch_text");
+
+  TestBrain singleMachineBrain = {};
+  addPrefixAndCredential(singleMachineBrain, 61'402, RoutableIngressScope::singleMachine);
+  DeploymentPlan singleMachine = makePlan(61'402, 1, "203.0.113.13");
+  suite.expect(singleMachineBrain.validateDeploymentWormholeDNSConfig(singleMachine, singleMachine.wormholes[0], failure) == false, "wormhole_dns_validation_rejects_single_machine_without_opt_in");
+  suite.expect(failure.equal("wormhole DNS on singleMachine prefixes requires allowSingleMachine=true"_ctv), "wormhole_dns_validation_single_machine_failure_text");
+  singleMachine.wormholes[0].dns.allowSingleMachine = true;
+  suite.expect(singleMachineBrain.validateDeploymentWormholeDNSConfig(singleMachine, singleMachine.wormholes[0], failure), "wormhole_dns_validation_accepts_single_machine_opt_in");
+
+  TestBrain duplicateBrain = {};
+  DeploymentPlan duplicate = makePlan(61'403, 1, "203.0.113.20");
+  Wormhole duplicateWormhole = duplicate.wormholes[0];
+  duplicateWormhole.name = "api2"_ctv;
+  duplicateWormhole.externalAddress = IPAddress("203.0.113.21", false);
+  duplicate.wormholes.push_back(duplicateWormhole);
+  suite.expect(duplicateBrain.reserveDeploymentWormholeAddressLeases(duplicate, failure, false) == false, "wormhole_dns_lease_rejects_duplicate_record_in_plan");
+  suite.expect(failure.equal("wormhole DNS record is already declared"_ctv), "wormhole_dns_lease_duplicate_record_failure_text");
+
+  TestBrain transferBrain = {};
+  TestDNSProvider transferDNS = {};
+  transferBrain.dnsProvider = &transferDNS;
+  addPrefixAndCredential(transferBrain, 61'404);
+  DeploymentPlan previous = makePlan(61'404, 1, "203.0.113.30");
+  DeploymentPlan current = makePlan(61'404, 2, "203.0.113.30");
+  suite.expect(transferBrain.reserveDeploymentWormholeAddressLeases(previous, failure, true), "wormhole_dns_transfer_fixture_claims_previous");
+  ApplicationDeployment currentDeployment = {};
+  currentDeployment.plan = current;
+  transferBrain.deploymentsByApp.insert_or_assign(current.config.applicationID, &currentDeployment);
+  suite.expect(transferBrain.releaseRoutableResourceLeasesForDeployment(previous.config.deploymentID()) == 2, "wormhole_dns_transfer_rewrites_address_and_dns_owner");
+  suite.expect(transferBrain.routableResourceLeaseRuntimeState.size() == 2, "wormhole_dns_transfer_keeps_two_leases");
+  suite.expect(transferDNS.removeCalls == 0, "wormhole_dns_transfer_keeps_record_applied");
+  for (const RoutableResourceLease& lease : transferBrain.routableResourceLeaseRuntimeState)
+  {
+    suite.expect(lease.owner.deploymentID == current.config.deploymentID(), "wormhole_dns_transfer_targets_current_deployment");
+  }
+
+  TestBrain failBrain = {};
+  TestDNSProvider failDNS = {};
+  failDNS.failUpsert = true;
+  failBrain.dnsProvider = &failDNS;
+  addPrefixAndCredential(failBrain, 61'405);
+  DeploymentPlan failPlan = makePlan(61'405, 1, "203.0.113.40");
+  suite.expect(failBrain.reserveDeploymentWormholeAddressLeases(failPlan, failure, true) == false, "wormhole_dns_apply_failure_rejects_commit");
+  suite.expect(failure.equal("injected DNS upsert failure"_ctv), "wormhole_dns_apply_failure_surfaces_provider_error");
+  suite.expect(failBrain.routableResourceLeaseRuntimeState.empty(), "wormhole_dns_apply_failure_does_not_commit_leases");
+
+  TestBrain deleteBrain = {};
+  TestDNSProvider deleteDNS = {};
+  deleteBrain.dnsProvider = &deleteDNS;
+  addPrefixAndCredential(deleteBrain, 61'406);
+  DeploymentPlan deletePlan = makePlan(61'406, 1, "203.0.113.41");
+  suite.expect(deleteBrain.reserveDeploymentWormholeAddressLeases(deletePlan, failure, true), "wormhole_dns_delete_failure_fixture_claims_address");
+  deleteDNS.failRemove = true;
+  suite.expect(deleteBrain.releaseRoutableResourceLeasesForDeployment(deletePlan.config.deploymentID()) == 0, "wormhole_dns_delete_failure_keeps_lease_owner");
+  suite.expect(deleteBrain.routableResourceLeaseRuntimeState.size() == 2, "wormhole_dns_delete_failure_keeps_leases");
+  deleteDNS.failRemove = false;
+  suite.expect(deleteBrain.releaseRoutableResourceLeasesForDeployment(deletePlan.config.deploymentID()) == 2, "wormhole_dns_delete_success_releases_leases");
+  suite.expect(deleteDNS.removeCalls == 2, "wormhole_dns_delete_retries_after_failure");
+}
+
+static void testWormholeAddressLeaseReleaseAndUpgradeTransfer(TestSuite& suite)
+{
+  TestBrain brain;
+
+  auto makePlan = [](uint16_t applicationID, uint64_t versionID) {
+    DeploymentPlan plan = {};
+    plan.config.applicationID = applicationID;
+    plan.config.versionID = versionID;
+    Wormhole wormhole = {};
+    wormhole.name = "api"_ctv;
+    wormhole.externalAddress = IPAddress("203.0.113.210", false);
+    wormhole.externalPort = 443;
+    wormhole.containerPort = 8443;
+    wormhole.layer4 = IPPROTO_TCP;
+    plan.wormholes.push_back(wormhole);
+    return plan;
+  };
+
+  String failure = {};
+  DeploymentPlan released = makePlan(61'300, 1);
+  DeploymentPlan otherApp = makePlan(61'301, 1);
+  suite.expect(brain.reserveDeploymentWormholeAddressLeases(released, failure, true), "wormhole_address_lease_release_fixture_claims_address");
+  suite.expect(brain.releaseRoutableResourceLeasesForDeployment(released.config.deploymentID()) == 1, "wormhole_address_lease_release_removes_owner");
+  suite.expect(brain.routableResourceLeaseRuntimeState.empty(), "wormhole_address_lease_release_clears_runtime_state");
+  suite.expect(brain.reserveDeploymentWormholeAddressLeases(otherApp, failure, false), "wormhole_address_lease_release_frees_address_for_other_app");
+
+  brain.routableResourceLeaseRuntimeState.clear();
+  DeploymentPlan previous = makePlan(61'302, 1);
+  DeploymentPlan current = makePlan(61'302, 2);
+  suite.expect(brain.reserveDeploymentWormholeAddressLeases(previous, failure, true), "wormhole_address_lease_transfer_fixture_claims_previous");
+  ApplicationDeployment currentDeployment = {};
+  currentDeployment.plan = current;
+  brain.deploymentsByApp.insert_or_assign(current.config.applicationID, &currentDeployment);
+  suite.expect(brain.releaseRoutableResourceLeasesForDeployment(previous.config.deploymentID()) == 1, "wormhole_address_lease_transfer_rewrites_owner");
+  suite.expect(brain.routableResourceLeaseRuntimeState.size() == 1, "wormhole_address_lease_transfer_keeps_one_lease");
+  suite.expect(brain.routableResourceLeaseRuntimeState[0].owner.deploymentID == current.config.deploymentID(), "wormhole_address_lease_transfer_targets_current_deployment");
+  suite.expect(brain.reserveDeploymentWormholeAddressLeases(otherApp, failure, false) == false, "wormhole_address_lease_transfer_keeps_other_app_blocked");
+
+  brain.deploymentsByApp.clear();
+  brain.routableResourceLeaseRuntimeState.clear();
+  DeploymentPlan previousWhitehole = makePlan(61'303, 1);
+  DeploymentPlan currentWhitehole = makePlan(61'303, 2);
+  RoutableResourceLease whiteholeLease = {};
+  whiteholeLease.kind = RoutableResourceLeaseKind::whiteholeAddressPort;
+  whiteholeLease.owner = deploymentRoutableResourceLeaseOwner(previousWhitehole);
+  whiteholeLease.address = IPAddress("198.18.22.44", false);
+  whiteholeLease.sourcePort = 49'152;
+  brain.routableResourceLeaseRuntimeState.push_back(whiteholeLease);
+  ApplicationDeployment currentWhiteholeDeployment = {};
+  currentWhiteholeDeployment.plan = currentWhitehole;
+  currentWhiteholeDeployment.nShardGroups = 1;
+  ContainerView currentContainer = {};
+  currentContainer.state = ContainerState::healthy;
+  Whitehole currentLease = {};
+  currentLease.hasAddress = true;
+  currentLease.address = whiteholeLease.address;
+  currentLease.sourcePort = whiteholeLease.sourcePort;
+  currentWhiteholeDeployment.containersByShardGroup.insert(0, &currentContainer);
+  currentContainer.whiteholes.push_back(currentLease);
+  brain.deploymentsByApp.insert_or_assign(currentWhitehole.config.applicationID, &currentWhiteholeDeployment);
+  suite.expect(brain.releaseRoutableResourceLeasesForDeployment(previousWhitehole.config.deploymentID()) == 1, "whitehole_ip_port_lease_transfer_rewrites_owner");
+  suite.expect(brain.routableResourceLeaseRuntimeState.size() == 1, "whitehole_ip_port_lease_transfer_keeps_one_lease");
+  suite.expect(brain.routableResourceLeaseRuntimeState[0].owner.deploymentID == currentWhitehole.config.deploymentID(), "whitehole_ip_port_lease_transfer_targets_current_deployment");
+}
+
+static void testRegisteredRoutablePrefixRefreshReplaysToNeuronsFollowersAndContainers(TestSuite& suite)
 {
   TestBrain brain = {};
   NoopBrainIaaS iaas;
@@ -6202,35 +6638,34 @@ static void testRegisteredRoutableAddressRefreshReplaysToNeuronsFollowersAndCont
   deployment.plan = makeDeploymentPlan(52'003, 1008);
 
   Wormhole wormhole = {};
-  wormhole.externalAddress = IPAddress("203.0.113.10", false);
   wormhole.externalPort = 443;
   wormhole.containerPort = 8443;
   wormhole.layer4 = IPPROTO_UDP;
   wormhole.isQuic = true;
-  wormhole.source = ExternalAddressSource::registeredRoutableAddress;
-  wormhole.routableAddressUUID = uint128_t(0x1234);
+  wormhole.source = ExternalAddressSource::registeredRoutablePrefix;
+  wormhole.routablePrefixUUID = uint128_t(0x1234);
   deployment.plan.wormholes.push_back(wormhole);
   deployment.containers.insert(&container);
 
-  RegisteredRoutableAddress registered = {};
-  registered.uuid = wormhole.routableAddressUUID;
+  DistributableExternalSubnet registered = {};
+  registered.uuid = wormhole.routablePrefixUUID;
   registered.name = "nametag-test-address"_ctv;
-  registered.family = ExternalAddressFamily::ipv4;
-  registered.kind = RoutableAddressKind::testFakeAddress;
   registered.machineUUID = machine.uuid;
-  registered.address = IPAddress("203.0.113.55", false);
-  brain.brainConfig.routableAddresses.push_back(registered);
+  registered.ingressScope = RoutableIngressScope::singleMachine;
+  registered.usage = ExternalSubnetUsage::wormholes;
+  registered.subnet = IPPrefix("203.0.113.55", false, 32);
+  brain.brainConfig.distributableExternalSubnets.push_back(registered);
 
   brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
   brain.deploymentPlans.insert_or_assign(deployment.plan.config.deploymentID(), deployment.plan);
 
-  bool changed = brain.refreshDeploymentRegisteredRoutableAddressWormholes(&deployment);
+  bool changed = brain.refreshDeploymentRegisteredRoutablePrefixWormholes(&deployment);
 
   suite.expect(changed, "registered_routable_refresh_changes_deployment_plan");
   suite.expect(deployment.plan.wormholes.size() == 1, "registered_routable_refresh_keeps_single_wormhole");
-  suite.expect(deployment.plan.wormholes[0].externalAddress.equals(registered.address), "registered_routable_refresh_updates_deployment_external_address");
+  suite.expect(deployment.plan.wormholes[0].externalAddress.equals(registered.subnet.network), "registered_routable_refresh_updates_deployment_external_address");
   suite.expect(container.wormholes.size() == 1, "registered_routable_refresh_updates_live_container_wormholes");
-  suite.expect(container.wormholes[0].externalAddress.equals(registered.address), "registered_routable_refresh_live_container_matches_resolved_address");
+  suite.expect(container.wormholes[0].externalAddress.equals(registered.subnet.network), "registered_routable_refresh_live_container_matches_resolved_address");
   suite.expect(brain.persistCalls == 1, "registered_routable_refresh_persists_runtime_state");
 
   bool sawNeuronOpen = false;
@@ -6296,10 +6731,10 @@ static void testRegisteredRoutableAddressRefreshReplaysToNeuronsFollowersAndCont
   suite.expect(sawNeuronOpen, "registered_routable_refresh_replays_open_switchboard_wormholes");
   suite.expect(sawContainerRefresh, "registered_routable_refresh_replays_container_wormhole_refresh");
   suite.expect(sawFollowerReplication, "registered_routable_refresh_replicates_serialized_deployment_to_followers");
-  suite.expect(brain.refreshDeploymentRegisteredRoutableAddressWormholes(&deployment) == false, "registered_routable_refresh_noop_when_address_already_current");
+  suite.expect(brain.refreshDeploymentRegisteredRoutablePrefixWormholes(&deployment) == false, "registered_routable_refresh_noop_when_address_already_current");
 }
 
-static void testRegisteredRoutableAddressWormholesRefreshHostedIngressBeforeOpen(TestSuite& suite)
+static void testRegisteredRoutablePrefixWormholesRefreshHostedIngressBeforeOpen(TestSuite& suite)
 {
   TestBrain brain = {};
   NoopBrainIaaS iaas;
@@ -6329,14 +6764,14 @@ static void testRegisteredRoutableAddressWormholesRefreshHostedIngressBeforeOpen
   brain.machines.insert(&remote);
   brain.machinesByUUID.insert_or_assign(remote.uuid, &remote);
 
-  RegisteredRoutableAddress registered = {};
+  DistributableExternalSubnet registered = {};
   registered.uuid = uint128_t(0x7788);
   registered.name = "wormhole-hosted-prefix"_ctv;
-  registered.family = ExternalAddressFamily::ipv6;
-  registered.kind = RoutableAddressKind::anyHostPublicAddress;
   registered.machineUUID = host.uuid;
-  registered.address = IPAddress("2001:db8:100::99", true);
-  brain.brainConfig.routableAddresses.push_back(registered);
+  registered.ingressScope = RoutableIngressScope::singleMachine;
+  registered.usage = ExternalSubnetUsage::wormholes;
+  registered.subnet = IPPrefix("2001:db8:100::99", true, 128);
+  brain.brainConfig.distributableExternalSubnets.push_back(registered);
 
   ContainerView container = {};
   container.uuid = uint128_t(0xABCD3234);
@@ -6351,8 +6786,8 @@ static void testRegisteredRoutableAddressWormholesRefreshHostedIngressBeforeOpen
   wormhole.containerPort = 8443;
   wormhole.layer4 = IPPROTO_UDP;
   wormhole.isQuic = true;
-  wormhole.source = ExternalAddressSource::registeredRoutableAddress;
-  wormhole.routableAddressUUID = registered.uuid;
+  wormhole.source = ExternalAddressSource::registeredRoutablePrefix;
+  wormhole.routablePrefixUUID = registered.uuid;
   wormholes.push_back(wormhole);
 
   brain.sendNeuronOpenSwitchboardWormholes(&container, wormholes);
@@ -6380,7 +6815,7 @@ static void testRegisteredRoutableAddressWormholesRefreshHostedIngressBeforeOpen
         if (BitseryEngine::deserializeSafe(payload, prefixes))
         {
           IPPrefix expectedPrefix = {};
-          if (makeHostedIngressPrefixForAddress(registered.address, expectedPrefix))
+          if (makeHostedIngressPrefixForAddress(registered.subnet.network, expectedPrefix))
           {
             for (const IPPrefix& prefix : prefixes)
             {
@@ -7266,67 +7701,7 @@ static void testImportedTlsFactoryEnablesBundleBuild(TestSuite& suite)
   suite.expect(containerPlan.credentialBundle.tlsIdentities[0].name.equal("inbound_server_tls"_ctv), "mothership_upsert_tls_valid_import_bundle_name");
 }
 
-static void testRegisterRoutableAddressSkipsZeroUUIDHostedMachines(TestSuite& suite)
-{
-  TestBrain brain;
-  Mothership mothership;
-  NoopBrainIaaS iaas;
-  brain.iaas = &iaas;
-  brain.weAreMaster = true;
-  brain.noMasterYet = false;
-  brain.brainConfig.runtimeEnvironment.test.enabled = true;
-  brain.brainConfig.runtimeEnvironment.test.enableFakeIpv4Boundary = true;
-  brain.brainConfig.runtimeEnvironment.test.fakePublicSubnet4.network = IPAddress("198.18.0.0", false);
-  brain.brainConfig.runtimeEnvironment.test.fakePublicSubnet4.cidr = 16;
-  brain.brainConfig.runtimeEnvironment.test.fakePublicSubnet4.canonicalize();
-
-  Machine zeroUUIDMachine = {};
-  zeroUUIDMachine.slug.assign("bootstrap"_ctv);
-  zeroUUIDMachine.privateAddress.assign("10.0.0.10"_ctv);
-  zeroUUIDMachine.neuron.isFixedFile = true;
-  zeroUUIDMachine.neuron.fslot = 7;
-  zeroUUIDMachine.neuron.connected = true;
-
-  Machine ownedMachine = {};
-  ownedMachine.uuid = uint128_t(0x2222);
-  ownedMachine.slug.assign("bootstrap"_ctv);
-  ownedMachine.privateAddress.assign("10.0.0.11"_ctv);
-  ownedMachine.neuron.isFixedFile = true;
-  ownedMachine.neuron.fslot = 8;
-  ownedMachine.neuron.connected = true;
-
-  brain.machines.insert(&zeroUUIDMachine);
-  brain.machines.insert(&ownedMachine);
-  brain.machinesByUUID.insert_or_assign(ownedMachine.uuid, &ownedMachine);
-
-  RoutableAddressRegistration request = {};
-  request.name.assign("whitehole-test-ipv4"_ctv);
-  request.kind = RoutableAddressKind::testFakeAddress;
-  request.family = ExternalAddressFamily::ipv4;
-
-  String serializedRequest;
-  BitseryEngine::serialize(serializedRequest, request);
-
-  String messageBuffer;
-  Message *message = buildMothershipMessage(messageBuffer, MothershipTopic::registerRoutableAddress, serializedRequest);
-  brain.mothershipHandler(&mothership, message);
-
-  Message *responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
-  String serializedResponse;
-  uint8_t *responseArgs = responseMessage->args;
-  Message::extractToStringView(responseArgs, serializedResponse);
-
-  RoutableAddressRegistration response = {};
-  suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response), "mothership_register_routable_address_deserializes_response");
-  suite.expect(response.success, "mothership_register_routable_address_skips_zero_uuid_machine");
-  suite.expect(response.created, "mothership_register_routable_address_creates_test_fake_address");
-  suite.expect(response.machineUUID == ownedMachine.uuid, "mothership_register_routable_address_uses_nonzero_machine_uuid");
-  suite.expect(response.address.isNull() == false, "mothership_register_routable_address_allocates_concrete_address");
-  suite.expect(brain.brainConfig.routableAddresses.size() == 1, "mothership_register_routable_address_persists_address");
-  suite.expect(brain.brainConfig.routableAddresses[0].machineUUID == ownedMachine.uuid, "mothership_register_routable_address_persists_nonzero_machine_uuid");
-}
-
-static void testRegisterRoutableAddressUsesPublicPeerCandidateWhenMachineFieldIsEmpty(TestSuite& suite)
+static void testRegisterRoutablePrefixAcceptsSingleMachineHostPrefix(TestSuite& suite)
 {
   TestBrain brain;
   Mothership mothership;
@@ -7336,30 +7711,22 @@ static void testRegisterRoutableAddressUsesPublicPeerCandidateWhenMachineFieldIs
   brain.noMasterYet = false;
 
   Machine machine = {};
-  machine.uuid = uint128_t(0x3344);
-  machine.slug.assign("bootstrap"_ctv);
-  machine.sshAddress.assign("10.0.0.11"_ctv);
-  machine.privateAddress.assign("10.0.0.11"_ctv);
-  machine.neuron.isFixedFile = true;
-  machine.neuron.fslot = 9;
-  machine.neuron.connected = true;
-  prodigyAppendUniqueClusterMachinePeerAddress(machine.peerAddresses, ClusterMachinePeerAddress {"10.0.0.11"_ctv, 24, "10.0.0.1"_ctv});
-  prodigyAppendUniqueClusterMachinePeerAddress(machine.peerAddresses, ClusterMachinePeerAddress {"fd00:10::b"_ctv, 64, "fd00:10::1"_ctv});
-  prodigyAppendUniqueClusterMachinePeerAddress(machine.peerAddresses, ClusterMachinePeerAddress {"2001:db8:100::b"_ctv, 64, "fd00:10::1"_ctv});
-
+  machine.uuid = uint128_t(0x3355);
+  machine.slug.assign("prefix-host"_ctv);
   brain.machines.insert(&machine);
   brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
 
-  RoutableAddressRegistration request = {};
-  request.name.assign("public-ipv6-route"_ctv);
-  request.kind = RoutableAddressKind::anyHostPublicAddress;
-  request.family = ExternalAddressFamily::ipv6;
+  RoutableSubnetRegistration request = {};
+  request.subnet.name.assign("single-host-prefix"_ctv);
+  request.subnet.subnet = IPPrefix("2001:db8:100::55", true, 128);
+  request.subnet.usage = ExternalSubnetUsage::wormholes;
+  request.subnet.ingressScope = RoutableIngressScope::singleMachine;
 
   String serializedRequest = {};
   BitseryEngine::serialize(serializedRequest, request);
 
   String messageBuffer = {};
-  Message *message = buildMothershipMessage(messageBuffer, MothershipTopic::registerRoutableAddress, serializedRequest);
+  Message *message = buildMothershipMessage(messageBuffer, MothershipTopic::registerRoutableSubnet, serializedRequest);
   brain.mothershipHandler(&mothership, message);
 
   Message *responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
@@ -7367,15 +7734,311 @@ static void testRegisterRoutableAddressUsesPublicPeerCandidateWhenMachineFieldIs
   uint8_t *responseArgs = responseMessage->args;
   Message::extractToStringView(responseArgs, serializedResponse);
 
-  RoutableAddressRegistration response = {};
-  suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response), "mothership_register_routable_address_public_peer_deserializes_response");
-  suite.expect(response.success, "mothership_register_routable_address_public_peer_accepts_peer_candidate");
-  suite.expect(response.created, "mothership_register_routable_address_public_peer_creates_route");
-  suite.expect(response.machineUUID == machine.uuid, "mothership_register_routable_address_public_peer_keeps_machine_uuid");
+  RoutableSubnetRegistration response = {};
+  suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response), "mothership_register_routable_prefix_deserializes_response");
+  suite.expect(response.success, "mothership_register_routable_prefix_accepts_single_machine_without_bgp");
+  suite.expect(response.created, "mothership_register_routable_prefix_creates_single_machine_host_prefix");
+  suite.expect(brain.brainConfig.distributableExternalSubnets.size() == 1, "mothership_register_routable_prefix_persists_prefix");
+  if (brain.brainConfig.distributableExternalSubnets.size() == 1)
+  {
+    const DistributableExternalSubnet& stored = brain.brainConfig.distributableExternalSubnets[0];
+    suite.expect(stored.ingressScope == RoutableIngressScope::singleMachine, "mothership_register_routable_prefix_persists_single_machine_scope");
+    suite.expect(stored.machineUUID == machine.uuid, "mothership_register_routable_prefix_persists_machine_uuid");
+    suite.expect(stored.subnet.equals(request.subnet.subnet), "mothership_register_routable_prefix_persists_host_prefix");
+  }
 
-  String addressText = {};
-  suite.expect(ClusterMachine::renderIPAddressLiteral(response.address, addressText), "mothership_register_routable_address_public_peer_renders_address");
-  suite.expect(addressText.equals("2001:db8:100::b"_ctv), "mothership_register_routable_address_public_peer_uses_public_ipv6_candidate");
+  TestBrain ambiguousBrain;
+  Mothership ambiguousMothership;
+  Machine other = {};
+  other.uuid = uint128_t(0x3356);
+  ambiguousBrain.weAreMaster = true;
+  ambiguousBrain.machines.insert(&machine);
+  ambiguousBrain.machines.insert(&other);
+  ambiguousBrain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+  ambiguousBrain.machinesByUUID.insert_or_assign(other.uuid, &other);
+
+  String ambiguousBuffer = {};
+  Message *ambiguousMessage = buildMothershipMessage(ambiguousBuffer, MothershipTopic::registerRoutableSubnet, serializedRequest);
+  ambiguousBrain.mothershipHandler(&ambiguousMothership, ambiguousMessage);
+
+  responseMessage = reinterpret_cast<Message *>(ambiguousMothership.wBuffer.data());
+  responseArgs = responseMessage->args;
+  Message::extractToStringView(responseArgs, serializedResponse);
+  suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response), "mothership_register_routable_prefix_ambiguous_deserializes_response");
+  suite.expect(response.success == false, "mothership_register_routable_prefix_rejects_ambiguous_single_machine_owner");
+}
+
+static void testRegisterRoutablePrefixAllocatesElasticPrefix(TestSuite& suite)
+{
+  TestBrain brain;
+  Mothership mothership;
+  ElasticPrefixBrainIaaS iaas;
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+
+  Machine machine = {};
+  machine.uuid = uint128_t(0x3366);
+  machine.cloudID.assign("cloud-3366"_ctv);
+  machine.neuron.isFixedFile = true;
+  machine.neuron.fslot = 8;
+  machine.neuron.connected = true;
+  brain.machines.insert(&machine);
+  brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+
+  RoutableSubnetRegistration request = {};
+  request.subnet.name.assign("elastic-prefix"_ctv);
+  request.subnet.kind = RoutablePrefixKind::elastic;
+  request.subnet.usage = ExternalSubnetUsage::wormholes;
+  request.subnet.ingressScope = RoutableIngressScope::singleMachine;
+  request.subnet.providerPool.assign("pool-a"_ctv);
+  request.family = ExternalAddressFamily::ipv4;
+  request.elasticIntent = ElasticPrefixIntent::create;
+
+  String serializedRequest = {};
+  BitseryEngine::serialize(serializedRequest, request);
+
+  String messageBuffer = {};
+  Message *message = buildMothershipMessage(messageBuffer, MothershipTopic::registerRoutableSubnet, serializedRequest);
+  brain.mothershipHandler(&mothership, message);
+
+  Message *responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
+  String serializedResponse = {};
+  uint8_t *responseArgs = responseMessage->args;
+  Message::extractToStringView(responseArgs, serializedResponse);
+
+  RoutableSubnetRegistration response = {};
+  suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response), "mothership_register_elastic_prefix_deserializes_response");
+  suite.expect(response.success, "mothership_register_elastic_prefix_success");
+  suite.expect(response.created, "mothership_register_elastic_prefix_created");
+  suite.expect(iaas.assignCalls == 1, "mothership_register_elastic_prefix_calls_provider");
+  suite.expect(iaas.lastMachine == &machine, "mothership_register_elastic_prefix_uses_single_machine");
+  suite.expect(iaas.lastFamily == ExternalAddressFamily::ipv4, "mothership_register_elastic_prefix_passes_family");
+  suite.expect(iaas.lastIntent == ElasticPrefixIntent::create, "mothership_register_elastic_prefix_passes_intent");
+  suite.expect(iaas.lastProviderPool.equal("pool-a"_ctv), "mothership_register_elastic_prefix_passes_pool");
+  suite.expect(brain.brainConfig.distributableExternalSubnets.size() == 1, "mothership_register_elastic_prefix_persists_one_prefix");
+  if (brain.brainConfig.distributableExternalSubnets.size() == 1)
+  {
+    const DistributableExternalSubnet& stored = brain.brainConfig.distributableExternalSubnets[0];
+    suite.expect(stored.kind == RoutablePrefixKind::elastic, "mothership_register_elastic_prefix_persists_kind");
+    suite.expect(stored.subnet.equals(IPPrefix("198.51.100.88", false, 32)), "mothership_register_elastic_prefix_persists_host_prefix");
+    suite.expect(stored.machineUUID == machine.uuid, "mothership_register_elastic_prefix_persists_machine_uuid");
+    suite.expect(stored.providerAllocationID.equal("alloc-88"_ctv), "mothership_register_elastic_prefix_persists_allocation");
+    suite.expect(stored.providerAssociationID.equal("assoc-88"_ctv), "mothership_register_elastic_prefix_persists_association");
+    suite.expect(stored.releaseOnRemove, "mothership_register_elastic_prefix_persists_release_flag");
+  }
+
+  String unregisterRequestBuffer = {};
+  RoutableSubnetUnregistration unregisterRequest = {};
+  unregisterRequest.name.assign("elastic-prefix"_ctv);
+  BitseryEngine::serialize(unregisterRequestBuffer, unregisterRequest);
+
+  RoutableSubnetUnregistration unregisterResponse = {};
+  auto sendUnregister = [&]() -> bool {
+    String unregisterMessageBuffer = {};
+    message = buildMothershipMessage(unregisterMessageBuffer, MothershipTopic::unregisterRoutableSubnet, unregisterRequestBuffer);
+    mothership.wBuffer.clear();
+    brain.mothershipHandler(&mothership, message);
+    responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
+    responseArgs = responseMessage->args;
+    Message::extractToStringView(responseArgs, serializedResponse);
+    unregisterResponse = {};
+    return BitseryEngine::deserializeSafe(serializedResponse, unregisterResponse);
+  };
+
+  RoutableResourceLease liveLease = {};
+  liveLease.kind = RoutableResourceLeaseKind::wormholeAddress;
+  liveLease.owner.applicationID = 625;
+  liveLease.owner.deploymentID = 1;
+  liveLease.owner.lineageID = 625;
+  liveLease.registeredPrefixUUID = brain.brainConfig.distributableExternalSubnets[0].uuid;
+  liveLease.address = IPAddress("198.51.100.88", false);
+  brain.routableResourceLeaseRuntimeState.push_back(liveLease);
+  suite.expect(sendUnregister(), "mothership_unregister_elastic_prefix_in_use_deserializes_response");
+  suite.expect(unregisterResponse.success == false, "mothership_unregister_elastic_prefix_rejects_owned_resource");
+  suite.expect(unregisterResponse.failure.equal("routable prefix has owned resources"_ctv), "mothership_unregister_elastic_prefix_owned_resource_failure_text");
+  suite.expect(iaas.releaseCalls == 0, "mothership_unregister_elastic_prefix_in_use_skips_provider_release");
+  suite.expect(brain.brainConfig.distributableExternalSubnets.size() == 1, "mothership_unregister_elastic_prefix_in_use_keeps_prefix");
+  brain.routableResourceLeaseRuntimeState.clear();
+
+  suite.expect(sendUnregister(), "mothership_unregister_elastic_prefix_deserializes_response");
+  suite.expect(unregisterResponse.success && unregisterResponse.removed, "mothership_unregister_elastic_prefix_success");
+  suite.expect(iaas.releaseCalls == 1, "mothership_unregister_elastic_prefix_releases_provider");
+  suite.expect(iaas.lastReleased.providerAllocationID.equal("alloc-88"_ctv), "mothership_unregister_elastic_prefix_release_allocation");
+  suite.expect(brain.brainConfig.distributableExternalSubnets.empty(), "mothership_unregister_elastic_prefix_removes_prefix");
+}
+
+static void testPullRoutableResourceLeasesTopic(TestSuite& suite)
+{
+  TestBrain brain;
+  Mothership mothership;
+  brain.weAreMaster = true;
+
+  RoutableResourceLease lease = {};
+  lease.kind = RoutableResourceLeaseKind::whiteholeAddressPort;
+  lease.owner.applicationID = 515;
+  lease.owner.deploymentID = 9001;
+  lease.owner.lineageID = 42;
+  lease.owner.name.assign("egress"_ctv);
+  lease.registeredPrefixUUID = uint128_t(0x515);
+  lease.address = IPAddress("198.18.0.9", false);
+  lease.sourcePort = 49'152;
+  brain.routableResourceLeaseRuntimeState.push_back(lease);
+
+  String messageBuffer = {};
+  Message *message = buildMothershipMessage(messageBuffer, MothershipTopic::pullRoutableResourceLeases);
+  brain.mothershipHandler(&mothership, message);
+
+  Message *responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
+  suite.expect(MothershipTopic(responseMessage->topic) == MothershipTopic::pullRoutableResourceLeases, "mothership_pull_routable_leases_topic");
+
+  String serializedResponse = {};
+  uint8_t *responseArgs = responseMessage->args;
+  Message::extractToStringView(responseArgs, serializedResponse);
+  RoutableResourceLeaseReport response = {};
+  suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response), "mothership_pull_routable_leases_deserializes_response");
+  suite.expect(response.success, "mothership_pull_routable_leases_success");
+  suite.expect(response.leases.size() == 1 && response.leases[0] == lease, "mothership_pull_routable_leases_returns_runtime_state");
+}
+
+static void testDNSBindingTopicsReserveAddressAndApplyProvider(TestSuite& suite)
+{
+  TestBrain brain;
+  Mothership mothership;
+  TestDNSProvider dns;
+  brain.weAreMaster = true;
+  brain.dnsProvider = &dns;
+  brain.brainConfig.dnsProvider = "cloudflare"_ctv;
+
+  DistributableExternalSubnet prefix = {};
+  prefix.uuid = uint128_t(0xDDBB01);
+  prefix.usage = ExternalSubnetUsage::wormholes;
+  prefix.ingressScope = RoutableIngressScope::switchboardFleet;
+  prefix.subnet = IPPrefix("203.0.113.0", false, 24);
+  brain.brainConfig.distributableExternalSubnets.push_back(prefix);
+
+  ApplicationApiCredentialSet set = {};
+  set.applicationID = 624;
+  ApiCredential credential = {};
+  credential.name = "cf-prod"_ctv;
+  credential.provider = "cloudflare"_ctv;
+  credential.material = "secret"_ctv;
+  set.credentials.push_back(credential);
+  brain.apiCredentialSetsByApp[set.applicationID] = set;
+
+  RoutableResourceLease binding = {};
+  binding.kind = RoutableResourceLeaseKind::dnsRecord;
+  binding.owner.applicationID = set.applicationID;
+  binding.owner.name = "api-binding"_ctv;
+  binding.registeredPrefixUUID = prefix.uuid;
+  binding.address = IPAddress("203.0.113.77", false);
+  binding.dnsProvider = "cloudflare"_ctv;
+  binding.dnsCredentialName = "cf-prod"_ctv;
+  binding.dnsZone = "example.com."_ctv;
+  binding.dnsName = "api.example.com."_ctv;
+  binding.dnsTTL = 300;
+
+  RoutableResourceLeaseReport request = {};
+  request.leases.push_back(binding);
+  String serializedRequest = {};
+  BitseryEngine::serialize(serializedRequest, request);
+  String messageBuffer = {};
+  Message *message = buildMothershipMessage(messageBuffer, MothershipTopic::upsertDNSBinding, serializedRequest);
+  brain.mothershipHandler(&mothership, message);
+
+  Message *responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
+  suite.expect(MothershipTopic(responseMessage->topic) == MothershipTopic::upsertDNSBinding, "mothership_upsert_dns_binding_topic");
+  String serializedResponse = {};
+  uint8_t *responseArgs = responseMessage->args;
+  Message::extractToStringView(responseArgs, serializedResponse);
+  RoutableResourceLeaseReport response = {};
+  suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response), "mothership_upsert_dns_binding_deserializes_response");
+  suite.expect(response.success, "mothership_upsert_dns_binding_success");
+  suite.expect(response.leases.size() == 2, "mothership_upsert_dns_binding_returns_address_and_dns_leases");
+  suite.expect(brain.routableResourceLeaseRuntimeState.size() == 2, "mothership_upsert_dns_binding_persists_two_leases");
+  suite.expect(dns.upsertCalls == 1 && dns.upserts[0].values.size() == 1 && dns.upserts[0].values[0].equal("203.0.113.77"_ctv), "mothership_upsert_dns_binding_applies_provider_record");
+
+  RoutableResourceLease movedBinding = binding;
+  movedBinding.address = IPAddress("203.0.113.78", false);
+  RoutableResourceLeaseReport movedResponse = {};
+  suite.expect(brain.upsertDNSBindingLease(movedBinding, movedResponse) == false, "dns_binding_upsert_rejects_duplicate_binding_name_move");
+  suite.expect(movedResponse.failure.equal("DNS binding name is already owned"_ctv), "dns_binding_upsert_duplicate_binding_name_failure_text");
+  suite.expect(dns.upsertCalls == 1, "dns_binding_upsert_duplicate_binding_name_does_not_apply_provider");
+
+  DeploymentPlan boundPlan = {};
+  boundPlan.config.applicationID = set.applicationID;
+  boundPlan.config.versionID = 1;
+  Wormhole boundWormhole = {};
+  boundWormhole.name = "api"_ctv;
+  boundWormhole.externalPort = 443;
+  boundWormhole.containerPort = 8443;
+  boundWormhole.layer4 = IPPROTO_TCP;
+  boundWormhole.hasDNSConfig = true;
+  boundWormhole.dns.bindingName = "api-binding"_ctv;
+  boundPlan.wormholes.push_back(boundWormhole);
+  String failure = {};
+  suite.expect(brain.resolveDeploymentWormholeDNSBinding(boundPlan, boundPlan.wormholes[0], failure), "wormhole_dns_binding_resolves_existing_binding");
+  suite.expect(boundPlan.wormholes[0].source == ExternalAddressSource::registeredRoutablePrefix, "wormhole_dns_binding_sets_registered_prefix_source");
+  suite.expect(boundPlan.wormholes[0].routablePrefixUUID == prefix.uuid, "wormhole_dns_binding_sets_prefix_uuid");
+  suite.expect(boundPlan.wormholes[0].externalAddress.equals(IPAddress("203.0.113.77", false)), "wormhole_dns_binding_sets_address");
+  suite.expect(boundPlan.wormholes[0].dns.provider.equal("cloudflare"_ctv) && boundPlan.wormholes[0].dns.name.equal("api.example.com."_ctv), "wormhole_dns_binding_copies_record_config");
+  suite.expect(brain.validateDeploymentWormholeDNSConfig(boundPlan, boundPlan.wormholes[0], failure), "wormhole_dns_binding_validates_resolved_config");
+  suite.expect(brain.reserveDeploymentWormholeAddressLeases(boundPlan, failure, true), "wormhole_dns_binding_reuses_owned_leases");
+  suite.expect(brain.routableResourceLeaseRuntimeState.size() == 2, "wormhole_dns_binding_does_not_duplicate_leases");
+  suite.expect(dns.upsertCalls == 1, "wormhole_dns_binding_does_not_reapply_provider_record");
+
+  DeploymentPlan conflictingPlan = boundPlan;
+  conflictingPlan.wormholes[0] = boundWormhole;
+  conflictingPlan.wormholes[0].dns.name = "other.example.com."_ctv;
+  suite.expect(brain.resolveDeploymentWormholeDNSBinding(conflictingPlan, conflictingPlan.wormholes[0], failure) == false, "wormhole_dns_binding_rejects_inline_conflict");
+  suite.expect(failure.equal("wormhole DNS binding config conflicts with binding"_ctv), "wormhole_dns_binding_inline_conflict_text");
+
+  mothership.wBuffer.clear();
+  messageBuffer.clear();
+  message = buildMothershipMessage(messageBuffer, MothershipTopic::pullDNSBindings);
+  brain.mothershipHandler(&mothership, message);
+  responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
+  suite.expect(MothershipTopic(responseMessage->topic) == MothershipTopic::pullDNSBindings, "mothership_pull_dns_bindings_topic");
+  responseArgs = responseMessage->args;
+  Message::extractToStringView(responseArgs, serializedResponse);
+  suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response), "mothership_pull_dns_bindings_deserializes_response");
+  suite.expect(response.success && response.leases.size() == 1 && response.leases[0].kind == RoutableResourceLeaseKind::dnsRecord, "mothership_pull_dns_bindings_filters_dns_leases");
+
+  RoutableResourceLease deletion = {};
+  deletion.dnsProvider = "cloudflare"_ctv;
+  deletion.dnsZone = "example.com"_ctv;
+  deletion.dnsName = "api.example.com"_ctv;
+  deletion.dnsType = "A"_ctv;
+  auto sendDeleteBinding = [&]() -> bool {
+    request.leases.clear();
+    request.leases.push_back(deletion);
+    serializedRequest.clear();
+    BitseryEngine::serialize(serializedRequest, request);
+    mothership.wBuffer.clear();
+    messageBuffer.clear();
+    message = buildMothershipMessage(messageBuffer, MothershipTopic::deleteDNSBinding, serializedRequest);
+    brain.mothershipHandler(&mothership, message);
+    responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
+    responseArgs = responseMessage->args;
+    Message::extractToStringView(responseArgs, serializedResponse);
+    response = {};
+    return MothershipTopic(responseMessage->topic) == MothershipTopic::deleteDNSBinding && BitseryEngine::deserializeSafe(serializedResponse, response);
+  };
+
+  ApplicationDeployment liveDeployment = {};
+  liveDeployment.plan = boundPlan;
+  brain.deployments.insert_or_assign(boundPlan.config.deploymentID(), &liveDeployment);
+  suite.expect(sendDeleteBinding(), "mothership_delete_dns_binding_in_use_deserializes_response");
+  suite.expect(response.success == false, "mothership_delete_dns_binding_rejects_live_deployment");
+  suite.expect(response.failure.equal("DNS binding is in use"_ctv), "mothership_delete_dns_binding_in_use_failure_text");
+  suite.expect(dns.removeCalls == 0, "mothership_delete_dns_binding_in_use_does_not_remove_provider_record");
+  suite.expect(brain.routableResourceLeaseRuntimeState.size() == 2, "mothership_delete_dns_binding_in_use_keeps_leases");
+  brain.deployments.erase(boundPlan.config.deploymentID());
+
+  suite.expect(sendDeleteBinding(), "mothership_delete_dns_binding_deserializes_response");
+  suite.expect(response.success, "mothership_delete_dns_binding_success");
+  suite.expect(dns.removeCalls == 1, "mothership_delete_dns_binding_removes_provider_record");
+  suite.expect(brain.routableResourceLeaseRuntimeState.empty(), "mothership_delete_dns_binding_releases_address_and_dns_leases");
 }
 
 static void testApplicationIdentityInvariants(TestSuite& suite)
@@ -7940,7 +8603,7 @@ static void testNeuronWhiteholeBindingBookkeepingWithoutPrograms(TestSuite& suit
   Whitehole valid = {};
   valid.transport = ExternalAddressTransport::quic;
   valid.family = ExternalAddressFamily::ipv6;
-  valid.source = ExternalAddressSource::distributableSubnet;
+  valid.source = ExternalAddressSource::registeredRoutablePrefix;
   valid.hasAddress = true;
   valid.address = IPAddress("2001:db8::44", true);
   valid.sourcePort = 5353;
@@ -10535,8 +11198,8 @@ static void testNeuronRecvDispatchesPairingAndCredentialMessages(TestSuite& suit
       wormhole.containerPort = 9443;
       wormhole.layer4 = IPPROTO_UDP;
       wormhole.isQuic = true;
-      wormhole.source = ExternalAddressSource::registeredRoutableAddress;
-      wormhole.routableAddressUUID = uint128_t(0x4455);
+      wormhole.source = ExternalAddressSource::registeredRoutablePrefix;
+      wormhole.routablePrefixUUID = uint128_t(0x4455);
 
       Vector<Wormhole> wormholes = {};
       wormholes.push_back(wormhole);
@@ -10719,8 +11382,8 @@ static void testNeuronOpenSwitchboardWormholesSyncsOwningRuntime(TestSuite& suit
       wormhole.containerPort = 8443;
       wormhole.layer4 = IPPROTO_UDP;
       wormhole.isQuic = true;
-      wormhole.source = ExternalAddressSource::registeredRoutableAddress;
-      wormhole.routableAddressUUID = uint128_t(0xAABBCCDD);
+      wormhole.source = ExternalAddressSource::registeredRoutablePrefix;
+      wormhole.routablePrefixUUID = uint128_t(0xAABBCCDD);
 
       Vector<Wormhole> wormholes = {};
       wormholes.push_back(wormhole);
@@ -15036,8 +15699,12 @@ int main(void)
   testSwitchboardStateSyncReplaysWhiteholes(suite);
   testQuicWormholeStateRefreshReplaysToNeuronsFollowersAndContainers(suite);
   testQuicWormholeRotationAndNoopPaths(suite);
-  testRegisteredRoutableAddressRefreshReplaysToNeuronsFollowersAndContainers(suite);
-  testRegisteredRoutableAddressWormholesRefreshHostedIngressBeforeOpen(suite);
+  testWormholeAddressLeasesReserveAndConflict(suite);
+  testRegisteredPrefixWormholeAddressAllocation(suite);
+  testWormholeDNSLeasesAndCredentialValidation(suite);
+  testWormholeAddressLeaseReleaseAndUpgradeTransfer(suite);
+  testRegisteredRoutablePrefixRefreshReplaysToNeuronsFollowersAndContainers(suite);
+  testRegisteredRoutablePrefixWormholesRefreshHostedIngressBeforeOpen(suite);
   testApplyReplicatedDeploymentPlanLiveStateUpdatesTrackedContainers(suite);
   testApplyReplicatedDeploymentPlanCleansTlsResumptionState(suite);
   testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(suite);
@@ -15053,8 +15720,10 @@ int main(void)
   testReconcileManagedMachineSchemasSkipsEmptySchemaState(suite);
   testImportedTlsFactoryValidationRejectsBrokenPem(suite);
   testImportedTlsFactoryEnablesBundleBuild(suite);
-  testRegisterRoutableAddressSkipsZeroUUIDHostedMachines(suite);
-  testRegisterRoutableAddressUsesPublicPeerCandidateWhenMachineFieldIsEmpty(suite);
+  testRegisterRoutablePrefixAcceptsSingleMachineHostPrefix(suite);
+  testRegisterRoutablePrefixAllocatesElasticPrefix(suite);
+  testPullRoutableResourceLeasesTopic(suite);
+  testDNSBindingTopicsReserveAddressAndApplyProvider(suite);
   testApplicationIdentityInvariants(suite);
   testApplicationReservationInitializersAndAllocators(suite);
   testApplicationReservationValidationFailures(suite);

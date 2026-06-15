@@ -4,85 +4,13 @@
 
 #include <prodigy/types.h>
 
-static inline const char *routableAddressKindName(RoutableAddressKind kind)
+static inline const DistributableExternalSubnet *findRegisteredRoutablePrefix(const Vector<DistributableExternalSubnet>& prefixes, uint128_t uuid)
 {
-  switch (kind)
+  for (const DistributableExternalSubnet& prefix : prefixes)
   {
-    case RoutableAddressKind::testFakeAddress:
-      {
-        return "testFakeAddress";
-      }
-    case RoutableAddressKind::anyHostPublicAddress:
-      {
-        return "anyHostPublicAddress";
-      }
-    case RoutableAddressKind::providerElasticAddress:
-      {
-        return "providerElasticAddress";
-      }
-  }
-
-  return "testFakeAddress";
-}
-
-static inline bool parseRoutableAddressKind(const String& value, RoutableAddressKind& kind)
-{
-  if (value.equal("testFakeAddress"_ctv) || value.equal("RoutableAddressKind::testFakeAddress"_ctv))
-  {
-    kind = RoutableAddressKind::testFakeAddress;
-    return true;
-  }
-
-  if (value.equal("anyHostPublicAddress"_ctv) || value.equal("routeToAny"_ctv) || value.equal("RoutableAddressKind::anyHostPublicAddress"_ctv))
-  {
-    kind = RoutableAddressKind::anyHostPublicAddress;
-    return true;
-  }
-
-  if (value.equal("providerElasticAddress"_ctv) || value.equal("elasticAddress"_ctv) || value.equal("RoutableAddressKind::providerElasticAddress"_ctv))
-  {
-    kind = RoutableAddressKind::providerElasticAddress;
-    return true;
-  }
-
-  return false;
-}
-
-static inline bool registeredRoutableAddressMatchesUUID(const RegisteredRoutableAddress& address, uint128_t uuid)
-{
-  return uuid != 0 && address.uuid == uuid;
-}
-
-static inline bool registeredRoutableAddressMatchesName(const RegisteredRoutableAddress& address, const String& name)
-{
-  return name.size() > 0 && address.name.equals(name);
-}
-
-static inline bool registeredRoutableAddressMatchesIdentity(const RegisteredRoutableAddress& address, const String& name, uint128_t uuid)
-{
-  return registeredRoutableAddressMatchesUUID(address, uuid) || registeredRoutableAddressMatchesName(address, name);
-}
-
-static inline RegisteredRoutableAddress *findRegisteredRoutableAddress(Vector<RegisteredRoutableAddress>& addresses, const String& name, uint128_t uuid)
-{
-  for (RegisteredRoutableAddress& address : addresses)
-  {
-    if (registeredRoutableAddressMatchesIdentity(address, name, uuid))
+    if (uuid != 0 && prefix.uuid == uuid)
     {
-      return &address;
-    }
-  }
-
-  return nullptr;
-}
-
-static inline const RegisteredRoutableAddress *findRegisteredRoutableAddress(const Vector<RegisteredRoutableAddress>& addresses, uint128_t uuid)
-{
-  for (const RegisteredRoutableAddress& address : addresses)
-  {
-    if (registeredRoutableAddressMatchesUUID(address, uuid))
-    {
-      return &address;
+      return &prefix;
     }
   }
 
@@ -104,197 +32,160 @@ static inline bool makeHostedIngressPrefixForAddress(const IPAddress& address, I
   return true;
 }
 
-static inline bool registeredRoutableAddressEquals(const RegisteredRoutableAddress& lhs, const RegisteredRoutableAddress& rhs)
+static inline RoutableResourceLeaseOwner deploymentRoutableResourceLeaseOwner(const DeploymentPlan& plan)
 {
-  return lhs.uuid == rhs.uuid && lhs.name.equals(rhs.name) && lhs.kind == rhs.kind && lhs.family == rhs.family && lhs.machineUUID == rhs.machineUUID && lhs.address.equals(rhs.address) && lhs.providerPool.equals(rhs.providerPool) && lhs.providerAllocationID.equals(rhs.providerAllocationID) && lhs.providerAssociationID.equals(rhs.providerAssociationID) && lhs.releaseOnRemove == rhs.releaseOnRemove;
+  RoutableResourceLeaseOwner owner = {};
+  owner.applicationID = plan.config.applicationID;
+  owner.deploymentID = plan.config.deploymentID();
+  owner.lineageID = plan.config.applicationID;
+  return owner;
 }
 
-static inline bool registeredRoutableAddressPresent(const Vector<RegisteredRoutableAddress>& addresses, const IPAddress& candidate)
+static inline bool routablePrefixAddressAtOffset(const IPPrefix& source, uint64_t offset, IPAddress& address)
 {
-  for (const RegisteredRoutableAddress& address : addresses)
+  IPPrefix prefix = source.canonicalized();
+  uint8_t maxCidr = prefix.network.is6 ? 128 : 32;
+  if (prefix.cidr > maxCidr || (prefix.cidr == maxCidr && offset != 0))
   {
-    if (address.address.equals(candidate))
-    {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-static inline const RegisteredRoutableAddress *findRegisteredRoutableAddressByConcreteAddress(const Vector<RegisteredRoutableAddress>& addresses, const IPAddress& candidate)
-{
-  for (const RegisteredRoutableAddress& address : addresses)
-  {
-    if (address.address.equals(candidate))
-    {
-      return &address;
-    }
-  }
-
-  return nullptr;
-}
-
-static inline bool allocateCandidateAddressFromPrefix(const IPPrefix& prefix, uint64_t hostValue, IPAddress& address)
-{
-  if (prefix.network.isNull())
-  {
-    address = {};
     return false;
   }
 
   address = prefix.network;
   if (address.is6 == false)
   {
-    uint8_t hostBits = uint8_t(32 - std::min<uint8_t>(prefix.cidr, 32));
-    if (hostBits == 0)
+    uint64_t value = uint64_t(ntohl(address.v4)) + offset;
+    if (value > UINT32_MAX)
     {
       return false;
     }
-
-    uint64_t limit = (hostBits >= 32) ? uint64_t(UINT32_MAX) : ((uint64_t(1) << hostBits) - 1);
-    if (hostValue == 0 || hostValue > limit)
+    address.v4 = htonl(uint32_t(value));
+  }
+  else
+  {
+    for (int index = 15; offset != 0 && index >= 0; --index)
+    {
+      uint64_t value = uint64_t(address.v6[index]) + (offset & 0xffu);
+      address.v6[index] = uint8_t(value);
+      offset = (offset >> 8u) + (value >> 8u);
+    }
+    if (offset != 0)
     {
       return false;
     }
-
-    uint32_t network = ntohl(prefix.network.v4);
-    uint32_t mask = (hostBits >= 32) ? UINT32_MAX : ((uint32_t(1) << hostBits) - 1u);
-    network |= (uint32_t(hostValue) & mask);
-    address.v4 = htonl(network);
-    return true;
   }
 
-  uint8_t hostBits = uint8_t(128 - std::min<uint8_t>(prefix.cidr, 128));
-  if (hostBits == 0)
-  {
-    return false;
-  }
-
-  uint8_t usableBits = std::min<uint8_t>(hostBits, 64);
-  uint64_t limit = (usableBits >= 64) ? UINT64_MAX : ((uint64_t(1) << usableBits) - 1);
-  if (hostValue == 0 || hostValue > limit)
-  {
-    return false;
-  }
-
-  uint64_t tail = 0;
-  for (uint32_t index = 0; index < 8; ++index)
-  {
-    tail = (tail << 8) | uint64_t(prefix.network.v6[8 + index]);
-  }
-
-  uint64_t mask = (usableBits >= 64) ? UINT64_MAX : ((uint64_t(1) << usableBits) - 1);
-  tail |= (hostValue & mask);
-
-  for (int index = 15; index >= 8; --index)
-  {
-    address.v6[index] = uint8_t(tail & 0xFFu);
-    tail >>= 8;
-  }
-
-  return true;
+  return prefix.containsAddress(address);
 }
 
-static inline bool allocateUniqueRegisteredAddressFromPrefix(const IPPrefix& prefix, const Vector<RegisteredRoutableAddress>& existing, IPAddress& address)
+static inline bool wormholeAddressLeaseConflicts(const Vector<RoutableResourceLease> *leases, const RoutableResourceLeaseOwner *owner, uint128_t prefixUUID, const IPAddress& address)
 {
-  address = {};
-  if (prefix.network.isNull())
+  if (leases == nullptr || owner == nullptr)
   {
     return false;
   }
 
-  uint8_t totalBits = prefix.network.is6 ? 128 : 32;
-  if (prefix.cidr >= totalBits)
+  RoutableResourceLease lease = {};
+  lease.kind = RoutableResourceLeaseKind::wormholeAddress;
+  lease.owner = *owner;
+  lease.registeredPrefixUUID = prefixUUID;
+  lease.address = address;
+  for (const RoutableResourceLease& existing : *leases)
   {
-    return false;
-  }
-
-  uint8_t hostBits = uint8_t(totalBits - prefix.cidr);
-  uint64_t maxAttempts = 65'535;
-  if (hostBits < 16)
-  {
-    maxAttempts = (uint64_t(1) << hostBits) - 1;
-  }
-
-  if (maxAttempts == 0)
-  {
-    return false;
-  }
-
-  for (uint64_t hostValue = 1; hostValue <= maxAttempts; ++hostValue)
-  {
-    IPAddress candidate = {};
-    if (allocateCandidateAddressFromPrefix(prefix, hostValue, candidate) == false)
+    if (routableResourceLeasesConflict(existing, lease))
     {
-      continue;
+      return true;
     }
-
-    if (prefix.containsAddress(candidate) == false)
-    {
-      continue;
-    }
-
-    if (registeredRoutableAddressPresent(existing, candidate))
-    {
-      continue;
-    }
-
-    address = candidate;
-    return true;
   }
-
   return false;
 }
 
-static inline bool resolveWormholeRegisteredRoutableAddress(const Vector<RegisteredRoutableAddress>& addresses, Wormhole& wormhole, String *failure = nullptr)
+static inline bool resolveWormholeRegisteredRoutablePrefix(const Vector<DistributableExternalSubnet>& prefixes,
+                                                           Wormhole& wormhole,
+                                                           String *failure = nullptr,
+                                                           const Vector<RoutableResourceLease> *leases = nullptr,
+                                                           const RoutableResourceLeaseOwner *owner = nullptr)
 {
   if (failure)
   {
     failure->clear();
   }
 
-  if (wormhole.source != ExternalAddressSource::registeredRoutableAddress)
+  if (wormhole.source != ExternalAddressSource::registeredRoutablePrefix)
   {
     if (failure)
     {
-      failure->assign("wormhole source is not registeredRoutableAddress"_ctv);
+      failure->assign("wormhole source is not registeredRoutablePrefix"_ctv);
     }
 
     return false;
   }
 
-  if (wormhole.routableAddressUUID == 0)
+  if (wormhole.routablePrefixUUID == 0)
   {
     if (failure)
     {
-      failure->assign("wormhole source=registeredRoutableAddress requires routableAddressUUID"_ctv);
+      failure->assign("wormhole source=registeredRoutablePrefix requires routablePrefixUUID"_ctv);
     }
 
     return false;
   }
 
-  const RegisteredRoutableAddress *registeredAddress = findRegisteredRoutableAddress(addresses, wormhole.routableAddressUUID);
-  if (registeredAddress == nullptr)
+  const DistributableExternalSubnet *prefix = findRegisteredRoutablePrefix(prefixes, wormhole.routablePrefixUUID);
+  if (prefix == nullptr)
   {
     if (failure)
     {
-      failure->assign("wormhole routableAddressUUID is not registered"_ctv);
+      failure->assign("wormhole routablePrefixUUID is not a registered prefix"_ctv);
     }
 
     return false;
   }
 
-  if (registeredAddress->address.isNull())
+  if (distributableExternalSubnetAllowsWormholes(*prefix) == false)
   {
     if (failure)
     {
-      failure->assign("registered routable address has no concrete address"_ctv);
+      failure->assign("registered routable prefix is not usable for wormholes"_ctv);
     }
 
     return false;
   }
 
-  wormhole.externalAddress = registeredAddress->address;
-  return true;
+  IPPrefix registered = prefix->subnet.canonicalized();
+  if (wormhole.externalAddress.isNull() == false)
+  {
+    if (registered.containsAddress(wormhole.externalAddress))
+    {
+      return true;
+    }
+
+    if (failure)
+    {
+      failure->assign("wormhole externalAddress is outside registered routable prefix"_ctv);
+    }
+
+    return false;
+  }
+
+  uint64_t firstOffset = distributableExternalSubnetIsHostPrefix(*prefix) ? 0 : 1;
+  for (uint64_t offset = firstOffset; offset < firstOffset + 65'536u; ++offset)
+  {
+    IPAddress candidate = {};
+    if (routablePrefixAddressAtOffset(registered, offset, candidate) == false)
+    {
+      break;
+    }
+    if (candidate.isNull() == false && wormholeAddressLeaseConflicts(leases, owner, prefix->uuid, candidate) == false)
+    {
+      wormhole.externalAddress = candidate;
+      return true;
+    }
+  }
+
+  if (failure)
+  {
+    failure->assign("no free address in registered routable prefix"_ctv);
+  }
+
+  return false;
 }

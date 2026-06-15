@@ -412,6 +412,7 @@ public:
   bytell_hash_map<uint64_t, DeploymentPlan> deploymentPlans;
   Vector<ProdigyStatefulWorkerTopologyUpgradeOperation> statefulWorkerTopologyUpgradeRuntimeState;
   Vector<ProdigyDeferredStatefulScaleIntent> deferredStatefulScaleIntentRuntimeState;
+  Vector<RoutableResourceLease> routableResourceLeaseRuntimeState;
 
   virtual void noteStatefulWorkerTopologyUpgradeRuntimeStateChanged(void)
   {
@@ -419,6 +420,32 @@ public:
 
   virtual void noteDeferredStatefulScaleIntentRuntimeStateChanged(void)
   {
+  }
+
+  virtual void noteRoutableResourceLeaseRuntimeStateChanged(void)
+  {
+  }
+
+  virtual uint32_t releaseRoutableResourceLeasesForDeployment(uint64_t deploymentID)
+  {
+    uint32_t released = 0;
+    for (auto it = routableResourceLeaseRuntimeState.begin(); it != routableResourceLeaseRuntimeState.end();)
+    {
+      if (it->owner.deploymentID == deploymentID)
+      {
+        it = routableResourceLeaseRuntimeState.erase(it);
+        released += 1;
+      }
+      else
+      {
+        ++it;
+      }
+    }
+    if (released > 0)
+    {
+      noteRoutableResourceLeaseRuntimeStateChanged();
+    }
+    return released;
   }
 
   // these will be culled once every 10 minutes
@@ -607,6 +634,10 @@ public:
     spinApplicationFailed(deployment, reason);
 
     failedDeployments.insert_or_assign(deploymentID, reason);
+    if (preserveContainerImage == false)
+    {
+      releaseRoutableResourceLeasesForDeployment(deploymentID);
+    }
     persistLocalRuntimeState();
 
     failedDeploymentCleaner.setTimeoutMs(prodigyBrainFailedDeploymentCleanerIntervalMs); // 90 seconds
@@ -1028,6 +1059,7 @@ public:
   void sendNeuronSwitchboardOverlayRoutes(void);
   void sendNeuronSwitchboardOverlayRoutes(Machine *machine);
   void sendNeuronSwitchboardStateSync(Machine *machine);
+  void buildSwitchboardFleetRoutableSubnets(Vector<DistributableExternalSubnet>& subnets) const;
   void buildHostedSwitchboardIngressPrefixes(Machine *machine, Vector<IPPrefix>& prefixes) const;
   bool whiteholeTargetsNeuronMachine(ContainerView *container, Machine *targetMachine, const Whitehole& whitehole) const;
   void collectWhiteholesForNeuronMachine(ContainerView *container, Machine *targetMachine, const Vector<Whitehole>& sourceWhiteholes, Vector<Whitehole>& whiteholes) const;

@@ -1365,6 +1365,24 @@ private:
       return false;
     }
 
+    if ((cluster.dnsProvider == MothershipClusterProvider::unknown) != (cluster.dnsProviderCredentialName.size() == 0))
+    {
+      if (failure)
+      {
+        failure->assign("cluster DNS requires both dnsProvider and dnsProviderCredentialName");
+      }
+      return false;
+    }
+
+    if (cluster.dnsProvider != MothershipClusterProvider::unknown && mothershipClusterProviderIsDNS(cluster.dnsProvider) == false)
+    {
+      if (failure)
+      {
+        failure->assign("cluster dnsProvider must be cloudflare, route53, gcp-cloud-dns, azure-dns, or vultr-dns");
+      }
+      return false;
+    }
+
     if (validateOSUpdatePoliciesForStorage(cluster.osUpdatePolicies, failure) == false)
     {
       return false;
@@ -1534,6 +1552,15 @@ private:
         if (failure)
         {
           failure->assign("remote clusters require provider");
+        }
+        return false;
+      }
+
+      if (mothershipClusterProviderIsIaaS(cluster.provider) == false)
+      {
+        if (failure)
+        {
+          failure->assign("remote cluster provider must be gcp, aws, azure, or vultr");
         }
         return false;
       }
@@ -1926,6 +1953,15 @@ public:
       if (failure)
       {
         failure->assign("clusterUUID is immutable for an existing cluster");
+      }
+      return false;
+    }
+
+    if (hadExistingCluster && stored.dnsProvider != existingCluster.dnsProvider)
+    {
+      if (failure)
+      {
+        failure->assign("dnsProvider is immutable for an existing cluster");
       }
       return false;
     }

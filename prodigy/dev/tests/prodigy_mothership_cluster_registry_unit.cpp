@@ -278,7 +278,7 @@ static NeuronBGPPeerConfig makeEnvironmentBGPPeer(const char *peerAddress, const
 
 static bool equalClusters(const MothershipProdigyCluster& lhs, const MothershipProdigyCluster& rhs)
 {
-  return lhs.name.equals(rhs.name) && lhs.clusterUUID == rhs.clusterUUID && lhs.deploymentMode == rhs.deploymentMode && lhs.architecture == rhs.architecture && lhs.includeLocalMachine == rhs.includeLocalMachine && lhs.provider == rhs.provider && lhs.providerScope.equals(rhs.providerScope) && lhs.providerCredentialName.equals(rhs.providerCredentialName) && lhs.propagateProviderCredentialToProdigy == rhs.propagateProviderCredentialToProdigy && equalAwsConfig(lhs.aws, rhs.aws) && equalGcpConfig(lhs.gcp, rhs.gcp) && equalAzureConfig(lhs.azure, rhs.azure) && equalControls(lhs.controls, rhs.controls) && lhs.nBrains == rhs.nBrains && equalMachineSchemas(lhs.machineSchemas, rhs.machineSchemas) && equalMachines(lhs.machines, rhs.machines) && lhs.topology == rhs.topology && lhs.bootstrapSshUser.equals(rhs.bootstrapSshUser) && lhs.bootstrapSshKeyPackage == rhs.bootstrapSshKeyPackage && lhs.bootstrapSshHostKeyPackage == rhs.bootstrapSshHostKeyPackage && lhs.bootstrapSshPrivateKeyPath.equals(rhs.bootstrapSshPrivateKeyPath) && lhs.remoteProdigyPath.equals(rhs.remoteProdigyPath) && lhs.sharedCPUOvercommitPermille == rhs.sharedCPUOvercommitPermille && lhs.osUpdatesEnabled == rhs.osUpdatesEnabled && equalOSUpdatePolicies(lhs.osUpdatePolicies, rhs.osUpdatePolicies) && lhs.maxOSDrains == rhs.maxOSDrains && lhs.machineUpdateCadenceMins == rhs.machineUpdateCadenceMins && equalEnvironmentBGP(lhs.bgp, rhs.bgp) && equalTestConfig(lhs.test, rhs.test) && lhs.desiredEnvironment == rhs.desiredEnvironment && lhs.environmentConfigured == rhs.environmentConfigured && lhs.lastRefreshMs == rhs.lastRefreshMs && lhs.lastRefreshFailure.equals(rhs.lastRefreshFailure);
+  return lhs.name.equals(rhs.name) && lhs.clusterUUID == rhs.clusterUUID && lhs.deploymentMode == rhs.deploymentMode && lhs.architecture == rhs.architecture && lhs.includeLocalMachine == rhs.includeLocalMachine && lhs.provider == rhs.provider && lhs.providerScope.equals(rhs.providerScope) && lhs.providerCredentialName.equals(rhs.providerCredentialName) && lhs.propagateProviderCredentialToProdigy == rhs.propagateProviderCredentialToProdigy && lhs.dnsProvider == rhs.dnsProvider && lhs.dnsProviderCredentialName.equals(rhs.dnsProviderCredentialName) && equalAwsConfig(lhs.aws, rhs.aws) && equalGcpConfig(lhs.gcp, rhs.gcp) && equalAzureConfig(lhs.azure, rhs.azure) && equalControls(lhs.controls, rhs.controls) && lhs.nBrains == rhs.nBrains && equalMachineSchemas(lhs.machineSchemas, rhs.machineSchemas) && equalMachines(lhs.machines, rhs.machines) && lhs.topology == rhs.topology && lhs.bootstrapSshUser.equals(rhs.bootstrapSshUser) && lhs.bootstrapSshKeyPackage == rhs.bootstrapSshKeyPackage && lhs.bootstrapSshHostKeyPackage == rhs.bootstrapSshHostKeyPackage && lhs.bootstrapSshPrivateKeyPath.equals(rhs.bootstrapSshPrivateKeyPath) && lhs.remoteProdigyPath.equals(rhs.remoteProdigyPath) && lhs.sharedCPUOvercommitPermille == rhs.sharedCPUOvercommitPermille && lhs.osUpdatesEnabled == rhs.osUpdatesEnabled && equalOSUpdatePolicies(lhs.osUpdatePolicies, rhs.osUpdatePolicies) && lhs.maxOSDrains == rhs.maxOSDrains && lhs.machineUpdateCadenceMins == rhs.machineUpdateCadenceMins && equalEnvironmentBGP(lhs.bgp, rhs.bgp) && equalTestConfig(lhs.test, rhs.test) && lhs.desiredEnvironment == rhs.desiredEnvironment && lhs.environmentConfigured == rhs.environmentConfigured && lhs.lastRefreshMs == rhs.lastRefreshMs && lhs.lastRefreshFailure.equals(rhs.lastRefreshFailure);
 }
 
 static void assignFixtureBootstrapSSHKeyPackage(MothershipProdigyCluster& cluster)
@@ -419,6 +419,8 @@ int main(void)
   remoteCreated.provider = MothershipClusterProvider::aws;
   remoteCreated.providerCredentialName = "aws-prod"_ctv;
   remoteCreated.providerScope = "acct-prod/us-east-1"_ctv;
+  remoteCreated.dnsProvider = MothershipClusterProvider::cloudflare;
+  remoteCreated.dnsProviderCredentialName = "cloudflare-prod"_ctv;
   remoteCreated.aws.instanceProfileName = "prodigy-controller-profile"_ctv;
   remoteCreated.controls.push_back(MothershipProdigyClusterControl {
       .kind = MothershipClusterControlKind::unixSocket,
@@ -1009,6 +1011,19 @@ int main(void)
     suite.expect(upsertExistingRemoteAdopted, "upsert_existing_remote_adopted");
     suite.expect(refreshedRemoteAdopted.lastRefreshMs == 424'242, "upsert_existing_remote_adopted_refresh_ms");
     storedRemoteAdopted = refreshedRemoteAdopted;
+
+    MothershipProdigyCluster changedDNSProvider = storedRemoteCreated;
+    changedDNSProvider.dnsProvider = MothershipClusterProvider::route53;
+    changedDNSProvider.dnsProviderCredentialName = "route53-prod"_ctv;
+    bool upsertChangedDNSProvider = registry.upsertCluster(changedDNSProvider, nullptr, &failure);
+    suite.expect(upsertChangedDNSProvider == false, "upsert_existing_dns_provider_change_rejected");
+    suite.expect(failure.equals("dnsProvider is immutable for an existing cluster"_ctv), "upsert_existing_dns_provider_change_reason");
+
+    MothershipProdigyCluster changedDNSCredential = storedRemoteCreated;
+    changedDNSCredential.dnsProviderCredentialName = "cloudflare-rotated"_ctv;
+    bool upsertChangedDNSCredential = registry.upsertCluster(changedDNSCredential, nullptr, &failure);
+    suite.expect(upsertChangedDNSCredential, "upsert_existing_dns_credential_change_allowed");
+    storedRemoteCreated = changedDNSCredential;
 
     MothershipProdigyCluster topologyOwner = remoteCreated;
     topologyOwner.name = "topology-owner"_ctv;

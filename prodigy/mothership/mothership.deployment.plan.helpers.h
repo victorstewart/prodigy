@@ -1033,6 +1033,165 @@ static inline bool mothershipParseWormholeTlsResumptionConfig(
   return true;
 }
 
+static inline bool mothershipParseWormholeDNSConfig(
+    const simdjson::dom::element& value,
+    WormholeDNSConfig& config,
+    String *failure = nullptr)
+{
+  if (failure)
+  {
+    failure->clear();
+  }
+
+  if (value.type() != simdjson::dom::element_type::OBJECT)
+  {
+    if (failure)
+    {
+      failure->assign("wormhole.dns requires a document"_ctv);
+    }
+    return false;
+  }
+
+  bool ttlSet = false;
+  config = WormholeDNSConfig();
+  for (auto field : value.get_object())
+  {
+    String key = {};
+    key.setInvariant(field.key.data(), field.key.size());
+
+    auto parseString = [&](String& out, StringType auto&& message) -> bool {
+      if (field.value.type() != simdjson::dom::element_type::STRING)
+      {
+        if (failure)
+        {
+          failure->assign(message);
+        }
+        return false;
+      }
+      out.assign(field.value.get_c_str());
+      return true;
+    };
+
+    if (key.equal("provider"_ctv))
+    {
+      if (parseString(config.provider, "wormhole.dns.provider requires a string"_ctv) == false)
+      {
+        return false;
+      }
+    }
+    else if (key.equal("credentialName"_ctv))
+    {
+      if (parseString(config.credentialName, "wormhole.dns.credentialName requires a string"_ctv) == false)
+      {
+        return false;
+      }
+    }
+    else if (key.equal("zone"_ctv))
+    {
+      if (parseString(config.zone, "wormhole.dns.zone requires a string"_ctv) == false)
+      {
+        return false;
+      }
+    }
+    else if (key.equal("name"_ctv))
+    {
+      if (parseString(config.name, "wormhole.dns.name requires a string"_ctv) == false)
+      {
+        return false;
+      }
+    }
+    else if (key.equal("bindingName"_ctv))
+    {
+      if (parseString(config.bindingName, "wormhole.dns.bindingName requires a string"_ctv) == false)
+      {
+        return false;
+      }
+    }
+    else if (key.equal("type"_ctv))
+    {
+      if (parseString(config.type, "wormhole.dns.type requires a string"_ctv) == false)
+      {
+        return false;
+      }
+      if (normalizeDNSRecordType(config.type) == false)
+      {
+        if (failure)
+        {
+          failure->assign("wormhole.dns.type must be A, AAAA, CNAME, or TXT"_ctv);
+        }
+        return false;
+      }
+    }
+    else if (key.equal("ttl"_ctv))
+    {
+      uint64_t ttl = 0;
+      if (field.value.type() == simdjson::dom::element_type::INT64)
+      {
+        int64_t signedTTL = 0;
+        (void)field.value.get(signedTTL);
+        if (signedTTL > 0)
+        {
+          ttl = uint64_t(signedTTL);
+        }
+      }
+      else if (field.value.type() == simdjson::dom::element_type::UINT64)
+      {
+        (void)field.value.get(ttl);
+      }
+
+      if (ttl == 0 || ttl > UINT32_MAX)
+      {
+        if (failure)
+        {
+          failure->assign("wormhole.dns.ttl must be in 1..4294967295"_ctv);
+        }
+        return false;
+      }
+      config.ttl = uint32_t(ttl);
+      ttlSet = true;
+    }
+    else if (key.equal("allowSingleMachine"_ctv))
+    {
+      if (field.value.type() != simdjson::dom::element_type::BOOL)
+      {
+        if (failure)
+        {
+          failure->assign("wormhole.dns.allowSingleMachine requires a bool"_ctv);
+        }
+        return false;
+      }
+      (void)field.value.get(config.allowSingleMachine);
+    }
+    else if (key.equal("values"_ctv) || key.equal("value"_ctv))
+    {
+      if (failure)
+      {
+        failure->assign("wormhole.dns values are derived from the claimed address"_ctv);
+      }
+      return false;
+    }
+    else
+    {
+      if (failure)
+      {
+        failure->assign("wormhole.dns invalid field"_ctv);
+      }
+      return false;
+    }
+  }
+
+  if (config.bindingName.size() == 0 && (config.provider.size() == 0 || config.credentialName.size() == 0 || config.zone.size() == 0 || config.name.size() == 0 || ttlSet == false))
+  {
+    if (failure)
+    {
+      failure->assign("wormhole.dns requires bindingName or provider, credentialName, zone, name, and ttl"_ctv);
+    }
+    return false;
+  }
+
+  return true;
+}
+
 static inline bool mothershipParseApplicationMachineSelectionField(
     const String& key,
     const simdjson::dom::element& value,

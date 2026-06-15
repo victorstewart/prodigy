@@ -3164,15 +3164,16 @@ public:
 
   bool assignProviderElasticAddress(Machine *machine,
                                     ExternalAddressFamily family,
+                                    ElasticPrefixIntent intent,
                                     const String& requestedAddress,
                                     const String& providerPool,
-                                    IPAddress& assignedAddress,
+                                    IPPrefix& assignedPrefix,
                                     String& allocationID,
                                     String& associationID,
                                     bool& releaseOnRemove,
                                     String& error) override
   {
-    assignedAddress = {};
+    assignedPrefix = {};
     allocationID.clear();
     associationID.clear();
     releaseOnRemove = false;
@@ -3190,24 +3191,49 @@ public:
       return false;
     }
 
+    if (elasticPrefixIntentIsValid(intent) == false)
+    {
+      error.assign("aws elastic prefix intent invalid"_ctv);
+      return false;
+    }
+
+    if (intent == ElasticPrefixIntent::create && requestedAddress.size() > 0)
+    {
+      error.assign("aws elastic create intent does not accept requestedAddress"_ctv);
+      return false;
+    }
+
+    if (intent == ElasticPrefixIntent::any && requestedAddress.size() == 0)
+    {
+      error.assign("aws elastic any intent requires requestedAddress"_ctv);
+      return false;
+    }
+
     String publicAddress = {};
-    if (requestedAddress.size() > 0)
+    bool useExisting = requestedAddress.size() > 0 && intent != ElasticPrefixIntent::create;
+    if (useExisting)
     {
       if (providerPool.size() > 0)
       {
-        error.assign("aws elastic address cannot combine requestedAddress with providerPool"_ctv);
+        error.assign("aws elastic any intent cannot combine requestedAddress with providerPool"_ctv);
         return false;
       }
 
       String existingAssociationID = {};
       if (describeElasticAddressByPublicIP(requestedAddress, publicAddress, allocationID, existingAssociationID, error) == false)
       {
-        return false;
+        if (intent != ElasticPrefixIntent::anyOrCreate)
+        {
+          return false;
+        }
+
+        error.clear();
+        useExisting = false;
       }
 
       releaseOnRemove = false;
     }
-    else
+    if (useExisting == false)
     {
       if (allocateElasticAddress(providerPool, publicAddress, allocationID, error) == false)
       {
@@ -3228,6 +3254,7 @@ public:
       return false;
     }
 
+    IPAddress assignedAddress = {};
     if (ClusterMachine::parseIPAddressLiteral(publicAddress, assignedAddress) == false)
     {
       error.assign("aws elastic address parse failed"_ctv);
@@ -3243,28 +3270,30 @@ public:
       }
       return false;
     }
+    assignedPrefix.network = assignedAddress;
+    assignedPrefix.cidr = assignedAddress.is6 ? 128 : 32;
 
     error.clear();
     return true;
   }
 
-  bool releaseProviderElasticAddress(const RegisteredRoutableAddress& address, String& error) override
+  bool releaseProviderElasticAddress(const DistributableExternalSubnet& prefix, String& error) override
   {
     error.clear();
 
-    if (address.kind != RoutableAddressKind::providerElasticAddress)
+    if (prefix.kind != RoutablePrefixKind::elastic)
     {
       return true;
     }
 
-    if (disassociateElasticAddress(address.providerAssociationID, error) == false)
+    if (disassociateElasticAddress(prefix.providerAssociationID, error) == false)
     {
       return false;
     }
 
-    if (address.releaseOnRemove)
+    if (prefix.releaseOnRemove)
     {
-      if (releaseElasticAddressAllocation(address.providerAllocationID, error) == false)
+      if (releaseElasticAddressAllocation(prefix.providerAllocationID, error) == false)
       {
         return false;
       }

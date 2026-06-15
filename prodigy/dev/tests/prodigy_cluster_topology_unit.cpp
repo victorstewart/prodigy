@@ -226,14 +226,16 @@ int main(void)
   suite.expect(clusterTopologyBrainCountSatisfiesQuorum(2) == false, "cluster_topology_quorum_even_invalid");
   suite.expect(clusterTopologyBrainCountSatisfiesQuorum(1) == false, "cluster_topology_quorum_small_invalid");
 
-  suite.expect(routableExternalSubnetHasSupportedBreadth(makeSubnet("0.0.0.0/4")), "routable_subnet_breadth_ipv4_accepts_slash4");
-  suite.expect(routableExternalSubnetHasSupportedBreadth(makeSubnet("0.0.0.0/3")) == false, "routable_subnet_breadth_ipv4_rejects_broader_than_slash4");
-  suite.expect(routableExternalSubnetHasSupportedBreadth(makeSubnet("203.0.113.0/24")), "routable_subnet_breadth_ipv4_accepts_slash24");
-  suite.expect(routableExternalSubnetHasSupportedBreadth(makeSubnet("203.0.113.17/25")) == false, "routable_subnet_breadth_ipv4_rejects_more_specific_than_slash24");
-  suite.expect(routableExternalSubnetHasSupportedBreadth(makeSubnet("2000::/4")), "routable_subnet_breadth_ipv6_accepts_slash4");
-  suite.expect(routableExternalSubnetHasSupportedBreadth(makeSubnet("2000::/3")) == false, "routable_subnet_breadth_ipv6_rejects_broader_than_slash4");
-  suite.expect(routableExternalSubnetHasSupportedBreadth(makeSubnet("2001:db8::/48")), "routable_subnet_breadth_ipv6_accepts_slash48");
-  suite.expect(routableExternalSubnetHasSupportedBreadth(makeSubnet("2001:db8::17/49")) == false, "routable_subnet_breadth_ipv6_rejects_more_specific_than_slash48");
+  suite.expect(routableExternalSubnetHasSupportedBreadth(makeSubnet("0.0.0.0/0")), "routable_subnet_breadth_ipv4_accepts_slash0");
+  suite.expect(routableExternalSubnetHasSupportedBreadth(makeSubnet("203.0.113.17/32")), "routable_subnet_breadth_ipv4_accepts_host_prefix");
+  DistributableExternalSubnet invalid4 = makeSubnet("203.0.113.17/32");
+  invalid4.subnet.cidr = 33;
+  suite.expect(routableExternalSubnetHasSupportedBreadth(invalid4) == false, "routable_subnet_breadth_ipv4_rejects_invalid_cidr");
+  suite.expect(routableExternalSubnetHasSupportedBreadth(makeSubnet("::/0")), "routable_subnet_breadth_ipv6_accepts_slash0");
+  suite.expect(routableExternalSubnetHasSupportedBreadth(makeSubnet("2001:db8::17/128")), "routable_subnet_breadth_ipv6_accepts_host_prefix");
+  DistributableExternalSubnet invalid6 = makeSubnet("2001:db8::17/128");
+  invalid6.subnet.cidr = 129;
+  suite.expect(routableExternalSubnetHasSupportedBreadth(invalid6) == false, "routable_subnet_breadth_ipv6_rejects_invalid_cidr");
   suite.expect(distributableExternalSubnetCanAllocateAddresses(makeSubnet("198.18.0.0/16")), "routable_subnet_ipv4_allocatable_host_bits");
   suite.expect(distributableExternalSubnetCanAllocateAddresses(makeSubnet("198.18.0.0/24")) == false, "routable_subnet_ipv4_rejects_insufficient_host_bits_for_distribution");
   suite.expect(distributableExternalSubnetCanAllocateAddresses(makeSubnet("2001:db8::/88")), "routable_subnet_ipv6_allocatable_host_bits");
@@ -256,12 +258,6 @@ int main(void)
     suite.expect(externalSubnetUsageIsValid(both.usage), "routable_subnet_usage_both_valid");
   }
 
-  RoutableAddressKind parsedRoutableAddressKind = RoutableAddressKind::testFakeAddress;
-  suite.expect(parseRoutableAddressKind("routeToAny"_ctv, parsedRoutableAddressKind), "routable_address_kind_parse_route_to_any");
-  suite.expect(parsedRoutableAddressKind == RoutableAddressKind::anyHostPublicAddress, "routable_address_kind_parse_route_to_any_kind");
-  suite.expect(parseRoutableAddressKind("elasticAddress"_ctv, parsedRoutableAddressKind), "routable_address_kind_parse_elastic_address");
-  suite.expect(parsedRoutableAddressKind == RoutableAddressKind::providerElasticAddress, "routable_address_kind_parse_elastic_address_kind");
-
   {
     IPPrefix hostedIPv4Prefix = {};
     suite.expect(makeHostedIngressPrefixForAddress(IPAddress("203.0.113.7", false), hostedIPv4Prefix), "hosted_ingress_prefix_ipv4_generated");
@@ -277,62 +273,49 @@ int main(void)
   }
 
   {
-    Vector<RegisteredRoutableAddress> existingAddresses = {};
-    RegisteredRoutableAddress occupied = {};
-    occupied.address = IPAddress("198.18.0.1", false);
-    existingAddresses.push_back(occupied);
-
-    IPPrefix fakePrefix = {};
-    fakePrefix.network = IPAddress("198.18.0.0", false);
-    fakePrefix.cidr = 29;
-    fakePrefix.canonicalize();
-
-    IPAddress allocated = {};
-    suite.expect(allocateUniqueRegisteredAddressFromPrefix(fakePrefix, existingAddresses, allocated), "routable_address_allocate_ipv4_from_fake_prefix");
-    suite.expect(allocated.equals(IPAddress("198.18.0.2", false)), "routable_address_allocate_ipv4_skips_existing");
-    suite.expect(findRegisteredRoutableAddressByConcreteAddress(existingAddresses, occupied.address) == &existingAddresses[0], "routable_address_find_by_concrete_ipv4_address");
-  }
-
-  {
-    Vector<RegisteredRoutableAddress> existingAddresses = {};
-    RegisteredRoutableAddress occupied = {};
-    occupied.address = IPAddress("2602:fac0:0:12ab:34cd::1", true);
-    existingAddresses.push_back(occupied);
-
-    IPPrefix fakePrefix = {};
-    fakePrefix.network = IPAddress("2602:fac0:0:12ab:34cd::", true);
-    fakePrefix.cidr = 124;
-    fakePrefix.canonicalize();
-
-    IPAddress allocated = {};
-    suite.expect(allocateUniqueRegisteredAddressFromPrefix(fakePrefix, existingAddresses, allocated), "routable_address_allocate_ipv6_from_fake_prefix");
-    suite.expect(allocated.equals(IPAddress("2602:fac0:0:12ab:34cd::2", true)), "routable_address_allocate_ipv6_skips_existing");
-    suite.expect(findRegisteredRoutableAddressByConcreteAddress(existingAddresses, occupied.address) == &existingAddresses[0], "routable_address_find_by_concrete_ipv6_address");
-  }
-
-  {
-    Vector<RegisteredRoutableAddress> registeredAddresses = {};
-    RegisteredRoutableAddress registered = {};
+    Vector<DistributableExternalSubnet> registeredPrefixes = {};
+    DistributableExternalSubnet registered = {};
     registered.uuid = uint128_t(0xABCDEF);
-    registered.family = ExternalAddressFamily::ipv4;
     registered.machineUUID = uint128_t(0x123456);
-    registered.address = IPAddress("203.0.113.45", false);
-    registeredAddresses.push_back(registered);
+    registered.ingressScope = RoutableIngressScope::singleMachine;
+    registered.usage = ExternalSubnetUsage::wormholes;
+    registered.subnet = IPPrefix("203.0.113.45", false, 32);
+    registeredPrefixes.push_back(registered);
 
     Wormhole wormhole = {};
-    wormhole.source = ExternalAddressSource::registeredRoutableAddress;
-    wormhole.routableAddressUUID = registered.uuid;
+    wormhole.source = ExternalAddressSource::registeredRoutablePrefix;
+    wormhole.routablePrefixUUID = registered.uuid;
 
     String resolveFailure = {};
-    suite.expect(resolveWormholeRegisteredRoutableAddress(registeredAddresses, wormhole, &resolveFailure), "wormhole_routable_address_uuid_resolves");
-    suite.expect(wormhole.externalAddress.equals(registered.address), "wormhole_routable_address_uuid_sets_external_address");
+    suite.expect(resolveWormholeRegisteredRoutablePrefix(registeredPrefixes, wormhole, &resolveFailure), "wormhole_routable_prefix_uuid_resolves_host_prefix");
+    suite.expect(wormhole.externalAddress.equals(registered.subnet.network), "wormhole_routable_prefix_uuid_sets_external_address");
 
     Wormhole missing = {};
-    missing.source = ExternalAddressSource::registeredRoutableAddress;
-    missing.routableAddressUUID = uint128_t(0x1234);
+    missing.source = ExternalAddressSource::registeredRoutablePrefix;
+    missing.routablePrefixUUID = uint128_t(0x1234);
     resolveFailure.clear();
-    suite.expect(resolveWormholeRegisteredRoutableAddress(registeredAddresses, missing, &resolveFailure) == false, "wormhole_routable_address_uuid_rejects_missing_registration");
-    suite.expect(resolveFailure.size() > 0, "wormhole_routable_address_uuid_missing_registration_failure");
+    suite.expect(resolveWormholeRegisteredRoutablePrefix(registeredPrefixes, missing, &resolveFailure) == false, "wormhole_routable_prefix_uuid_rejects_missing_registration");
+    suite.expect(resolveFailure.size() > 0, "wormhole_routable_prefix_uuid_missing_registration_failure");
+
+    registeredPrefixes[0].subnet = IPPrefix("203.0.113.0", false, 24);
+    wormhole.externalAddress = {};
+    resolveFailure.clear();
+    suite.expect(resolveWormholeRegisteredRoutablePrefix(registeredPrefixes, wormhole, &resolveFailure), "wormhole_routable_prefix_uuid_allocates_from_parent_prefix");
+    suite.expect(wormhole.externalAddress.equals(IPAddress("203.0.113.1", false)), "wormhole_routable_prefix_uuid_sets_first_parent_address");
+
+    wormhole.externalAddress = IPAddress("203.0.113.77", false);
+    suite.expect(resolveWormholeRegisteredRoutablePrefix(registeredPrefixes, wormhole, &resolveFailure), "wormhole_routable_prefix_uuid_accepts_explicit_contained_address");
+    suite.expect(wormhole.externalAddress.equals(IPAddress("203.0.113.77", false)), "wormhole_routable_prefix_uuid_keeps_explicit_contained_address");
+
+    wormhole.externalAddress = IPAddress("203.0.114.77", false);
+    suite.expect(resolveWormholeRegisteredRoutablePrefix(registeredPrefixes, wormhole, &resolveFailure) == false, "wormhole_routable_prefix_uuid_rejects_explicit_outside_address");
+    suite.expect(resolveFailure.equal("wormhole externalAddress is outside registered routable prefix"_ctv), "wormhole_routable_prefix_uuid_outside_failure_text");
+
+    registeredPrefixes[0].subnet = IPPrefix("2001:db8:44::", true, 48);
+    wormhole.externalAddress = {};
+    resolveFailure.clear();
+    suite.expect(resolveWormholeRegisteredRoutablePrefix(registeredPrefixes, wormhole, &resolveFailure), "wormhole_routable_prefix_uuid_allocates_from_ipv6_48");
+    suite.expect(wormhole.externalAddress.equals(IPAddress("2001:db8:44::1", true)), "wormhole_routable_prefix_uuid_sets_first_ipv6_48_address");
   }
 
   ClusterMachine adoptedIdentityByUUID = {};

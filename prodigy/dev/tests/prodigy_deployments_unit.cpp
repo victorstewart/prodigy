@@ -3,6 +3,7 @@
 #include <services/debug.h>
 #include <prodigy/brain/brain.h>
 #include <prodigy/containerstore.h>
+#include <prodigy/dns.providers.h>
 #include <prodigy/mothership/mothership.deployment.plan.helpers.h>
 #include <prodigy/neuron/containers.h>
 
@@ -226,6 +227,84 @@ static bool stringContains(const String& haystack, const char *needle)
   return haystackView.find(needle) != std::string_view::npos;
 }
 
+class CapturedDNSHTTPRequest {
+public:
+
+  String method;
+  String url;
+  String body;
+};
+
+template <class Provider>
+class RecordingHTTPDNSProvider final : public Provider {
+public:
+
+  Vector<CapturedDNSHTTPRequest> requests;
+  Vector<String> responses;
+  Vector<long> httpCodes;
+
+protected:
+
+  bool sendHTTP(ProdigyDNSHTTPRequest& request, String& response, long& httpCode, String& failure) override
+  {
+    CapturedDNSHTTPRequest captured = {};
+    captured.method = request.method;
+    captured.url = request.url;
+    captured.body = request.body;
+    uint64_t index = requests.size();
+    requests.push_back(captured);
+    if (index < responses.size())
+    {
+      response = responses[index];
+    }
+    else
+    {
+      response.assign("{}"_ctv);
+    }
+    httpCode = index < httpCodes.size() ? httpCodes[index] : 200;
+    failure.clear();
+    return true;
+  }
+};
+
+using RecordingCloudflareDNSProvider = RecordingHTTPDNSProvider<CloudflareDNSProvider>;
+using RecordingGcpCloudDNSProvider = RecordingHTTPDNSProvider<GcpCloudDNSProvider>;
+using RecordingAzureDNSProvider = RecordingHTTPDNSProvider<AzureDNSProvider>;
+using RecordingVultrDNSProvider = RecordingHTTPDNSProvider<VultrDNSProvider>;
+
+class RecordingRoute53DNSProvider final : public Route53DNSProvider {
+public:
+
+  Vector<CapturedDNSHTTPRequest> requests;
+  Vector<String> responses;
+  Vector<long> httpCodes;
+  String url;
+  String region;
+  String body;
+
+protected:
+
+  bool sendAWS(const char *requestMethod, const String& requestURL, const String& requestRegion, const AwsCredentialMaterial& credential, const String *requestBody, String& response, long& httpCode) override
+  {
+    (void)credential;
+    CapturedDNSHTTPRequest captured = {};
+    captured.method.assign(requestMethod);
+    captured.url = requestURL;
+    if (requestBody != nullptr)
+    {
+      captured.body = *requestBody;
+    }
+    uint64_t index = requests.size();
+    requests.push_back(captured);
+    url = requestURL;
+    region = requestRegion;
+    body = requestBody == nullptr ? String() : *requestBody;
+    response = index < responses.size() ? responses[index] : String("<ok/>"_ctv);
+    httpCode = index < httpCodes.size() ? httpCodes[index] : 200;
+    return true;
+  }
+};
+
 static uid_t fixtureWritableUserID(void)
 {
   if (geteuid() == 0)
@@ -414,6 +493,189 @@ static bool armNeuronControlStream(Machine& machine, ScopedSocketPair& sockets)
 int main(void)
 {
   TestSuite suite;
+
+  {
+    IPPrefix all4("0.0.0.0", false, 0);
+    IPPrefix host4("203.0.113.9", false, 32);
+    IPPrefix left4("198.51.100.0", false, 25);
+    IPPrefix right4("198.51.100.128", false, 25);
+    IPPrefix parent4("198.51.100.99", false, 24);
+    IPPrefix child4("198.51.100.200", false, 32);
+    IPPrefix all6("::", true, 0);
+    IPPrefix host6("2001:db8::1", true, 128);
+    IPPrefix parent6("2001:db8:abcd:1200::beef", true, 48);
+    IPPrefix child6("2001:db8:abcd:12ff::1", true, 128);
+    IPPrefix invalid4("198.51.100.0", false, 33);
+    IPPrefix invalid6("2001:db8::", true, 129);
+
+    suite.expect(ipPrefixesOverlap(all4, host4), "ip_prefixes_overlap_ipv4_zero_contains_host");
+    suite.expect(ipPrefixesOverlap(all6, host6), "ip_prefixes_overlap_ipv6_zero_contains_host");
+    suite.expect(ipPrefixesOverlap(parent4, child4), "ip_prefixes_overlap_ipv4_parent_child_canonicalizes_parent");
+    suite.expect(ipPrefixesOverlap(parent6, child6), "ip_prefixes_overlap_ipv6_parent_child_canonicalizes_parent");
+    suite.expect(ipPrefixesOverlap(left4, right4) == false, "ip_prefixes_overlap_ipv4_adjacent_disjoint");
+    suite.expect(ipPrefixesOverlap(parent4, host6) == false, "ip_prefixes_overlap_family_mismatch");
+    suite.expect(ipPrefixesOverlap(host4, host4), "ip_prefixes_overlap_ipv4_host_exact");
+    suite.expect(ipPrefixesOverlap(host6, host6), "ip_prefixes_overlap_ipv6_host_exact");
+    suite.expect(ipPrefixesOverlap(invalid4, host4) == false, "ip_prefixes_overlap_rejects_invalid_ipv4_cidr");
+    suite.expect(ipPrefixesOverlap(invalid6, host6) == false, "ip_prefixes_overlap_rejects_invalid_ipv6_cidr");
+  }
+
+  {
+    auto owner = [](uint16_t app, uint64_t version, uint64_t lineage, const char *name) {
+      RoutableResourceLeaseOwner value = {};
+      value.applicationID = app;
+      value.deploymentID = (uint64_t(app) << 48) | version;
+      value.lineageID = lineage;
+      value.name.assign(name);
+      return value;
+    };
+    auto addressLease = [](RoutableResourceLeaseKind kind, const RoutableResourceLeaseOwner& owner, const char *ip, uint16_t port = 0) {
+      RoutableResourceLease value = {};
+      value.kind = kind;
+      value.owner = owner;
+      value.address = IPAddress(ip, false);
+      value.sourcePort = port;
+      return value;
+    };
+
+    RoutableResourceLeaseOwner ownerA = owner(42, 1, 7001, "api-v1");
+    RoutableResourceLeaseOwner ownerUpgrade = owner(42, 2, 7001, "api-v2");
+    RoutableResourceLeaseOwner ownerB = owner(43, 1, 9001, "other");
+    RoutableResourceLease wormholeA = addressLease(RoutableResourceLeaseKind::wormholeAddress, ownerA, "198.51.100.10");
+    RoutableResourceLease wormholeUpgrade = addressLease(RoutableResourceLeaseKind::wormholeAddress, ownerUpgrade, "198.51.100.10");
+    RoutableResourceLease wormholeB = addressLease(RoutableResourceLeaseKind::wormholeAddress, ownerB, "198.51.100.10");
+    suite.expect(routableResourceLeasesConflict(wormholeA, wormholeB), "routable_lease_conflicts_on_duplicate_wormhole_address");
+    suite.expect(routableResourceLeasesConflict(wormholeA, wormholeUpgrade) == false, "routable_lease_allows_same_lineage_wormhole_transfer");
+
+    RoutableResourceLease whiteholeA = addressLease(RoutableResourceLeaseKind::whiteholeAddressPort, ownerA, "198.51.100.20", 50'000);
+    RoutableResourceLease whiteholeB = addressLease(RoutableResourceLeaseKind::whiteholeAddressPort, ownerB, "198.51.100.20", 50'000);
+    RoutableResourceLease whiteholeNextPort = addressLease(RoutableResourceLeaseKind::whiteholeAddressPort, ownerB, "198.51.100.20", 50'001);
+    suite.expect(routableResourceLeasesConflict(whiteholeA, whiteholeB), "routable_lease_conflicts_on_duplicate_whitehole_ip_port");
+    suite.expect(routableResourceLeasesConflict(whiteholeA, whiteholeNextPort) == false, "routable_lease_allows_whitehole_same_ip_different_port");
+
+    RoutableResourceLease dnsA = {};
+    dnsA.kind = RoutableResourceLeaseKind::dnsRecord;
+    dnsA.owner = ownerA;
+    dnsA.dnsProvider = "Cloudflare"_ctv;
+    dnsA.dnsCredentialName = "cf-prod"_ctv;
+    dnsA.dnsZone = "Example.COM."_ctv;
+    dnsA.dnsName = "Api.Example.COM."_ctv;
+    dnsA.dnsType = "A"_ctv;
+    dnsA.dnsTTL = 300;
+    RoutableResourceLease dnsB = dnsA;
+    dnsB.owner = ownerB;
+    dnsB.dnsProvider = "cloudflare"_ctv;
+    dnsB.dnsZone = "example.com"_ctv;
+    dnsB.dnsName = "api.example.com"_ctv;
+    dnsB.dnsType = "a"_ctv;
+    suite.expect(routableResourceLeasesConflict(dnsA, dnsB), "routable_lease_conflicts_on_canonical_dns_identity");
+  }
+
+  {
+    ProdigyDNSRecordBinding record = {};
+    record.provider = "cloudflare"_ctv;
+    record.credentialName = "dns"_ctv;
+    record.zone = "zone-123"_ctv;
+    record.name = "api.example.com."_ctv;
+    record.type = "A"_ctv;
+    record.values.push_back("203.0.113.10"_ctv);
+    record.ttl = 300;
+
+    ApiCredential credential = {};
+    credential.material = "token"_ctv;
+    String failure = {};
+
+    suite.expect(prodigyDNSRelativeName("api.example.com."_ctv, "example.com"_ctv).equal("api"_ctv), "dns_provider_relative_name_trims_zone_and_trailing_dot");
+
+    ProdigyDefaultDNSProvider defaults = {};
+    suite.expect(defaults.supportsProvider("cloudflare"_ctv), "dns_provider_default_supports_cloudflare");
+    suite.expect(defaults.supportsProvider("route53"_ctv), "dns_provider_default_supports_route53");
+    suite.expect(defaults.supportsProvider("gcp-cloud-dns"_ctv), "dns_provider_default_supports_gcp");
+    suite.expect(defaults.supportsProvider("azure-dns"_ctv), "dns_provider_default_supports_azure");
+    suite.expect(defaults.supportsProvider("vultr-dns"_ctv), "dns_provider_default_supports_vultr");
+
+    RecordingCloudflareDNSProvider cloudflare = {};
+    cloudflare.responses.push_back("{\"result\":[]}"_ctv);
+    cloudflare.responses.push_back("{\"success\":true}"_ctv);
+    suite.expect(cloudflare.upsert(record, credential, failure), "dns_provider_cloudflare_create_succeeds");
+    suite.expect(cloudflare.requests.size() == 2, "dns_provider_cloudflare_create_lists_then_writes");
+    suite.expect(cloudflare.requests.size() == 2 && cloudflare.requests[0].method.equal("GET"_ctv), "dns_provider_cloudflare_create_lists");
+    suite.expect(cloudflare.requests.size() == 2 && cloudflare.requests[1].method.equal("POST"_ctv), "dns_provider_cloudflare_create_posts");
+    suite.expect(cloudflare.requests.size() == 2 && stringContains(cloudflare.requests[1].body, "\"content\":\"203.0.113.10\""), "dns_provider_cloudflare_create_body_targets_address");
+
+    RecordingCloudflareDNSProvider cloudflareConflict = {};
+    cloudflareConflict.responses.push_back("{\"result\":[{\"id\":\"rec-2\",\"type\":\"A\",\"name\":\"api.example.com.\",\"content\":\"203.0.113.11\"}]}"_ctv);
+    suite.expect(cloudflareConflict.upsert(record, credential, failure) == false, "dns_provider_cloudflare_rejects_existing_different_record");
+    suite.expect(failure.equal("DNS record already exists with different value"_ctv), "dns_provider_cloudflare_conflict_failure_text");
+    suite.expect(cloudflareConflict.requests.size() == 1, "dns_provider_cloudflare_conflict_does_not_write");
+
+    RecordingCloudflareDNSProvider cloudflareDelete = {};
+    cloudflareDelete.responses.push_back("{\"result\":[{\"id\":\"rec-1\",\"type\":\"A\",\"name\":\"api.example.com.\",\"content\":\"203.0.113.10\"}]}"_ctv);
+    cloudflareDelete.responses.push_back("{}"_ctv);
+    suite.expect(cloudflareDelete.remove(record, credential, failure), "dns_provider_cloudflare_delete_succeeds");
+    suite.expect(cloudflareDelete.requests.size() == 2 && cloudflareDelete.requests[1].method.equal("DELETE"_ctv), "dns_provider_cloudflare_delete_uses_record_id");
+    suite.expect(cloudflareDelete.requests.size() == 2 && stringContains(cloudflareDelete.requests[1].url, "/rec-1"), "dns_provider_cloudflare_delete_url_contains_record_id");
+
+    RecordingRoute53DNSProvider route53 = {};
+    record.provider = "route53"_ctv;
+    record.zone = "/hostedzone/Z123"_ctv;
+    credential.material = "AKIA:SECRET"_ctv;
+    suite.expect(route53.upsert(record, credential, failure), "dns_provider_route53_upsert_succeeds");
+    suite.expect(route53.requests.size() == 2, "dns_provider_route53_upsert_lists_then_writes");
+    suite.expect(route53.requests.size() == 2 && route53.requests[0].method.equal("GET"_ctv), "dns_provider_route53_upsert_lists_first");
+    suite.expect(route53.requests.size() == 2 && route53.requests[1].method.equal("POST"_ctv), "dns_provider_route53_upsert_posts_change");
+    suite.expect(stringContains(route53.url, "/hostedzone/Z123/rrset"), "dns_provider_route53_url_uses_hosted_zone");
+    suite.expect(route53.region.equal("us-east-1"_ctv), "dns_provider_route53_defaults_region");
+    suite.expect(stringContains(route53.body, "<Action>CREATE</Action>"), "dns_provider_route53_body_creates_missing_record");
+    suite.expect(stringContains(route53.body, "<Value>203.0.113.10</Value>"), "dns_provider_route53_body_targets_address");
+
+    RecordingRoute53DNSProvider route53Conflict = {};
+    route53Conflict.responses.push_back("<ListResourceRecordSetsResponse><ResourceRecordSets><ResourceRecordSet><Name>api.example.com.</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>203.0.113.11</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></ResourceRecordSets></ListResourceRecordSetsResponse>"_ctv);
+    suite.expect(route53Conflict.upsert(record, credential, failure) == false, "dns_provider_route53_rejects_existing_different_record");
+    suite.expect(failure.equal("DNS record already exists with different value"_ctv), "dns_provider_route53_conflict_failure_text");
+    suite.expect(route53Conflict.requests.size() == 1, "dns_provider_route53_conflict_does_not_write");
+
+    RecordingGcpCloudDNSProvider gcp = {};
+    record.provider = "gcp-cloud-dns"_ctv;
+    record.zone = "prod-zone"_ctv;
+    credential.material = "token"_ctv;
+    credential.metadata.clear();
+    credential.metadata["project"_ctv] = "proj"_ctv;
+    gcp.responses.push_back("{\"rrsets\":[]}"_ctv);
+    gcp.responses.push_back("{\"id\":\"change-1\"}"_ctv);
+    suite.expect(gcp.upsert(record, credential, failure), "dns_provider_gcp_create_succeeds");
+    suite.expect(gcp.requests.size() == 2 && gcp.requests[0].method.equal("GET"_ctv) && gcp.requests[1].method.equal("POST"_ctv), "dns_provider_gcp_lists_then_writes");
+
+    RecordingGcpCloudDNSProvider gcpConflict = {};
+    gcpConflict.responses.push_back("{\"rrsets\":[{\"name\":\"api.example.com.\",\"type\":\"A\",\"rrdatas\":[\"203.0.113.11\"]}]}"_ctv);
+    suite.expect(gcpConflict.upsert(record, credential, failure) == false, "dns_provider_gcp_rejects_existing_different_record");
+    suite.expect(gcpConflict.requests.size() == 1, "dns_provider_gcp_conflict_does_not_write");
+
+    RecordingAzureDNSProvider azure = {};
+    record.provider = "azure-dns"_ctv;
+    record.zone = "example.com"_ctv;
+    credential.metadata.clear();
+    credential.metadata["subscriptionID"_ctv] = "sub"_ctv;
+    credential.metadata["resourceGroup"_ctv] = "rg"_ctv;
+    azure.httpCodes.push_back(404);
+    azure.httpCodes.push_back(200);
+    azure.responses.push_back("{}"_ctv);
+    azure.responses.push_back("{}"_ctv);
+    suite.expect(azure.upsert(record, credential, failure), "dns_provider_azure_create_succeeds");
+    suite.expect(azure.requests.size() == 2 && azure.requests[0].method.equal("GET"_ctv) && azure.requests[1].method.equal("PUT"_ctv), "dns_provider_azure_gets_then_writes");
+
+    RecordingAzureDNSProvider azureConflict = {};
+    azureConflict.responses.push_back("{\"properties\":{\"ARecords\":[{\"ipv4Address\":\"203.0.113.11\"}]}}"_ctv);
+    suite.expect(azureConflict.upsert(record, credential, failure) == false, "dns_provider_azure_rejects_existing_different_record");
+    suite.expect(azureConflict.requests.size() == 1, "dns_provider_azure_conflict_does_not_write");
+
+    RecordingVultrDNSProvider vultrConflict = {};
+    record.provider = "vultr-dns"_ctv;
+    credential.metadata.clear();
+    vultrConflict.responses.push_back("{\"records\":[{\"id\":\"rec-3\",\"type\":\"A\",\"name\":\"api\",\"data\":\"203.0.113.11\"}]}"_ctv);
+    suite.expect(vultrConflict.upsert(record, credential, failure) == false, "dns_provider_vultr_rejects_existing_different_record");
+    suite.expect(vultrConflict.requests.size() == 1, "dns_provider_vultr_conflict_does_not_write");
+  }
 
   {
     Advertisement scheduledAdvertisement(0x1001, ContainerState::scheduled, ContainerState::destroying, 7001);
@@ -2557,8 +2819,8 @@ int main(void)
     wormhole.layer4 = IPPROTO_UDP;
     wormhole.isQuic = true;
     wormhole.hasQuicCidKeyState = true;
-    wormhole.source = ExternalAddressSource::registeredRoutableAddress;
-    wormhole.routableAddressUUID = uint128_t(0xAABBCCDD0011);
+    wormhole.source = ExternalAddressSource::registeredRoutablePrefix;
+    wormhole.routablePrefixUUID = uint128_t(0xAABBCCDD0011);
     wormhole.quicCidKeyState.rotationHours = 12;
     wormhole.quicCidKeyState.activeKeyIndex = 1;
     wormhole.quicCidKeyState.rotatedAtMs = 123'456'789;
@@ -2567,6 +2829,14 @@ int main(void)
     wormhole.hasTlsResumptionConfig = true;
     wormhole.tlsResumption.alpns.push_back("h3"_ctv);
     wormhole.tlsResumption.sniNames.push_back("api.example.com"_ctv);
+    wormhole.hasDNSConfig = true;
+    wormhole.dns.provider = "cloudflare"_ctv;
+    wormhole.dns.credentialName = "cf-prod"_ctv;
+    wormhole.dns.zone = "example.com"_ctv;
+    wormhole.dns.name = "api.example.com"_ctv;
+    wormhole.dns.bindingName = "api-binding"_ctv;
+    wormhole.dns.type = "AAAA"_ctv;
+    wormhole.dns.ttl = 300;
     plan.wormholes.push_back(wormhole);
 
     String serialized;
@@ -2590,6 +2860,14 @@ int main(void)
     suite.expect(roundtrip.wormholes[0].hasTlsResumptionConfig, "deployment_plan_roundtrip_preserves_wormhole_tls_resumption_flag");
     suite.expect(roundtrip.wormholes[0].tlsResumption.alpns.size() == 1 && roundtrip.wormholes[0].tlsResumption.alpns[0].equal("h3"_ctv), "deployment_plan_roundtrip_preserves_wormhole_tls_resumption_alpn");
     suite.expect(roundtrip.wormholes[0].tlsResumption.sniNames.size() == 1 && roundtrip.wormholes[0].tlsResumption.sniNames[0].equal("api.example.com"_ctv), "deployment_plan_roundtrip_preserves_wormhole_tls_resumption_sni");
+    suite.expect(roundtrip.wormholes[0].hasDNSConfig, "deployment_plan_roundtrip_preserves_wormhole_dns_flag");
+    suite.expect(roundtrip.wormholes[0].dns.provider.equal("cloudflare"_ctv), "deployment_plan_roundtrip_preserves_wormhole_dns_provider");
+    suite.expect(roundtrip.wormholes[0].dns.credentialName.equal("cf-prod"_ctv), "deployment_plan_roundtrip_preserves_wormhole_dns_credential");
+    suite.expect(roundtrip.wormholes[0].dns.zone.equal("example.com"_ctv), "deployment_plan_roundtrip_preserves_wormhole_dns_zone");
+    suite.expect(roundtrip.wormholes[0].dns.name.equal("api.example.com"_ctv), "deployment_plan_roundtrip_preserves_wormhole_dns_name");
+    suite.expect(roundtrip.wormholes[0].dns.bindingName.equal("api-binding"_ctv), "deployment_plan_roundtrip_preserves_wormhole_dns_binding_name");
+    suite.expect(roundtrip.wormholes[0].dns.type.equal("AAAA"_ctv), "deployment_plan_roundtrip_preserves_wormhole_dns_type");
+    suite.expect(roundtrip.wormholes[0].dns.ttl == 300, "deployment_plan_roundtrip_preserves_wormhole_dns_ttl");
   }
 
   {
@@ -3096,6 +3374,17 @@ int main(void)
     operation.updatedAtMs = 123'456'789;
     runtimeState.statefulWorkerTopologyUpgradeOperations.push_back(operation);
 
+    RoutableResourceLease lease = {};
+    lease.kind = RoutableResourceLeaseKind::whiteholeAddressPort;
+    lease.owner.applicationID = 88;
+    lease.owner.deploymentID = 9911;
+    lease.owner.lineageID = 9911;
+    lease.owner.name = "egress"_ctv;
+    lease.registeredPrefixUUID = 0x991100;
+    lease.address = IPAddress("198.51.100.88", false);
+    lease.sourcePort = 50'088;
+    runtimeState.routableResourceLeases.push_back(lease);
+
     String serialized = {};
     BitseryEngine::serialize(serialized, runtimeState);
 
@@ -3109,6 +3398,8 @@ int main(void)
     suite.expect(roundtrip.statefulWorkerTopologyUpgradeOperations.size() == 1 && roundtrip.statefulWorkerTopologyUpgradeOperations[0].phase == StatefulWorkerTopologyUpgradePhase::greenBootstrap, "runtime_state_roundtrip_preserves_stateful_worker_topology_upgrade_phase");
     suite.expect(roundtrip.statefulWorkerTopologyUpgradeOperations.size() == 1 && roundtrip.statefulWorkerTopologyUpgradeOperations[0].targetLogicalCores == 4, "runtime_state_roundtrip_preserves_stateful_worker_topology_upgrade_target_cores");
     suite.expect(roundtrip.statefulWorkerTopologyUpgradeOperations.size() == 1 && roundtrip.statefulWorkerTopologyUpgradeOperations[0].lockedShardGroups.size() == 2, "runtime_state_roundtrip_preserves_stateful_worker_topology_upgrade_locked_groups");
+    suite.expect(roundtrip.routableResourceLeases.size() == 1, "runtime_state_roundtrip_preserves_routable_resource_lease_count");
+    suite.expect(roundtrip.routableResourceLeases.size() == 1 && roundtrip.routableResourceLeases[0] == lease, "runtime_state_roundtrip_preserves_routable_resource_lease");
   }
 
   {
@@ -3284,6 +3575,105 @@ int main(void)
     suite.expect(capturedIntent, "stateful_autoscale_shard_growth_during_topology_upgrade_keeps_deferred_growth_after_unlock");
     suite.expect(deferredIntent.targetShardGroups == 2, "stateful_autoscale_shard_growth_during_topology_upgrade_preserves_target_group_count_after_unlock");
     suite.expect(brain.statefulWorkerTopologyUpgradeRuntimeState.empty(), "stateful_autoscale_shard_growth_during_topology_upgrade_clears_topology_runtime_state_after_unlock");
+
+    thisBrain = savedBrain;
+  }
+
+  {
+    ScopedFreshRing ring;
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+
+    Whitehole existing = {};
+    existing.transport = ExternalAddressTransport::tcp;
+    existing.family = ExternalAddressFamily::ipv4;
+    existing.hasAddress = true;
+    existing.address = IPAddress("198.18.1.9", false);
+    existing.sourcePort = 49'152;
+
+    ContainerView owner {};
+    owner.uuid = uint128_t(0x2001);
+    owner.whiteholes.push_back(existing);
+    brain.containers.insert_or_assign(owner.uuid, &owner);
+
+    suite.expect(ApplicationDeployment::whiteholeAddressPortAlreadyInUse(existing.address, existing.sourcePort),
+                 "whitehole_ip_port_conflict_is_cluster_wide_and_transport_independent");
+    suite.expect(ApplicationDeployment::whiteholeAddressPortAlreadyInUse(existing.address, uint16_t(existing.sourcePort + 1)) == false,
+                 "whitehole_same_ip_different_port_is_available");
+    suite.expect(ApplicationDeployment::whiteholeAddressPortAlreadyInUse(IPAddress("198.18.1.10", false), existing.sourcePort) == false,
+                 "whitehole_same_port_different_ip_is_available");
+
+    Whitehole candidate = existing;
+    candidate.transport = ExternalAddressTransport::quic;
+    candidate.sourcePort = 0;
+    candidate.bindingNonce = 0;
+
+    suite.expect(ApplicationDeployment::allocateWhiteholeSourcePort(candidate),
+                 "whitehole_source_port_allocator_skips_cluster_wide_ip_port_conflict");
+    suite.expect(candidate.sourcePort == uint16_t(existing.sourcePort + 1),
+                 "whitehole_source_port_allocator_reuses_ip_with_next_free_port");
+
+    brain.containers.clear();
+
+    RoutableResourceLeaseOwner leasedOwner = {};
+    leasedOwner.applicationID = 7805;
+    leasedOwner.deploymentID = (uint64_t(leasedOwner.applicationID) << 48) | 1;
+    leasedOwner.lineageID = leasedOwner.applicationID;
+    RoutableResourceLease leasedPort = {};
+    leasedPort.kind = RoutableResourceLeaseKind::whiteholeAddressPort;
+    leasedPort.owner = leasedOwner;
+    leasedPort.address = existing.address;
+    leasedPort.sourcePort = existing.sourcePort;
+    brain.routableResourceLeaseRuntimeState.push_back(leasedPort);
+
+    ApplicationDeployment leaseDeployment {};
+    seedCommonPlan(leaseDeployment, false);
+    leaseDeployment.plan.config.applicationID = 7806;
+    leaseDeployment.plan.config.versionID = 1;
+    RoutableResourceLeaseOwner leaseOwner = leaseDeployment.routableResourceLeaseOwner();
+    RoutableResourceLeaseOwner transferOwner = leasedOwner;
+    transferOwner.deploymentID += 1;
+
+    suite.expect(ApplicationDeployment::whiteholeAddressPortAlreadyInUse(existing.address, existing.sourcePort),
+                 "whitehole_ip_port_conflict_uses_runtime_lease_without_owner");
+    suite.expect(ApplicationDeployment::whiteholeAddressPortAlreadyInUse(existing.address, existing.sourcePort, &leaseOwner),
+                 "whitehole_ip_port_conflict_uses_runtime_lease_for_other_owner");
+    suite.expect(ApplicationDeployment::whiteholeAddressPortAlreadyInUse(existing.address, existing.sourcePort, &transferOwner) == false,
+                 "whitehole_ip_port_lease_allows_same_lineage_transfer");
+    suite.expect(leaseDeployment.reserveWhiteholeAddressPortLease(existing, leaseOwner) == false,
+                 "whitehole_ip_port_reserve_rejects_leased_tuple_for_other_owner");
+
+    candidate.sourcePort = 0;
+    suite.expect(ApplicationDeployment::allocateWhiteholeSourcePort(candidate, &leaseOwner),
+                 "whitehole_source_port_allocator_skips_runtime_lease_conflict");
+    suite.expect(candidate.sourcePort == uint16_t(existing.sourcePort + 1),
+                 "whitehole_source_port_allocator_reuses_ip_after_leased_port");
+    suite.expect(leaseDeployment.reserveWhiteholeAddressPortLease(candidate, leaseOwner),
+                 "whitehole_ip_port_reserve_records_runtime_lease");
+    suite.expect(brain.routableResourceLeaseRuntimeState.size() == 2,
+                 "whitehole_ip_port_reserve_appends_one_runtime_lease");
+    suite.expect(leaseDeployment.reserveWhiteholeAddressPortLease(candidate, leaseOwner) && brain.routableResourceLeaseRuntimeState.size() == 2,
+                 "whitehole_ip_port_reserve_is_idempotent");
+    suite.expect(leaseDeployment.releaseWhiteholeAddressPortLease(candidate, leaseOwner),
+                 "whitehole_ip_port_release_removes_runtime_lease");
+    suite.expect(brain.routableResourceLeaseRuntimeState.size() == 1,
+                 "whitehole_ip_port_release_keeps_unrelated_lease");
+    suite.expect(leaseDeployment.reserveWhiteholeAddressPortLease(candidate, leaseOwner),
+                 "whitehole_ip_port_release_allows_reclaim");
+
+    ContainerView *destroyed = new ContainerView();
+    destroyed->uuid = uint128_t(0x2002);
+    destroyed->applicationID = leaseDeployment.plan.config.applicationID;
+    destroyed->deploymentID = leaseDeployment.plan.config.deploymentID();
+    destroyed->state = ContainerState::destroying;
+    destroyed->whiteholes.push_back(candidate);
+    brain.containers.insert_or_assign(destroyed->uuid, destroyed);
+    leaseDeployment.containerDestroyed(destroyed);
+    suite.expect(brain.containers.contains(uint128_t(0x2002)) == false,
+                 "whitehole_container_destroyed_erases_brain_container_index");
+    suite.expect(brain.routableResourceLeaseRuntimeState.size() == 1,
+                 "whitehole_container_destroyed_releases_lease");
 
     thisBrain = savedBrain;
   }
@@ -5211,6 +5601,89 @@ int main(void)
   }
 
   {
+    WormholeDNSConfig config {};
+    String json = "{\"provider\":\"cloudflare\",\"credentialName\":\"cf-prod\",\"zone\":\"example.com\",\"name\":\"api.example.com\",\"type\":\"a\",\"ttl\":300}"_ctv;
+    json.need(simdjson::SIMDJSON_PADDING);
+
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    String failure;
+    const bool parsedJSON = (parser.parse(json.data(), json.size()).get(doc) == simdjson::SUCCESS);
+    suite.expect(parsedJSON, "mothership_parse_wormhole_dns_json_valid");
+
+    bool parsedField = false;
+    if (parsedJSON)
+    {
+      parsedField = mothershipParseWormholeDNSConfig(doc, config, &failure);
+    }
+
+    suite.expect(parsedField, "mothership_parse_wormhole_dns_parses");
+    suite.expect(failure.size() == 0, "mothership_parse_wormhole_dns_no_failure");
+    suite.expect(config.provider.equal("cloudflare"_ctv), "mothership_parse_wormhole_dns_provider");
+    suite.expect(config.credentialName.equal("cf-prod"_ctv), "mothership_parse_wormhole_dns_credential");
+    suite.expect(config.type.equal("A"_ctv), "mothership_parse_wormhole_dns_normalizes_type");
+    suite.expect(config.ttl == 300, "mothership_parse_wormhole_dns_ttl");
+  }
+
+  {
+    WormholeDNSConfig config {};
+    String json = "{\"bindingName\":\"api-binding\"}"_ctv;
+    json.need(simdjson::SIMDJSON_PADDING);
+
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    String failure;
+    const bool parsedJSON = (parser.parse(json.data(), json.size()).get(doc) == simdjson::SUCCESS);
+    suite.expect(parsedJSON, "mothership_parse_wormhole_dns_binding_json_valid");
+
+    bool parsedField = false;
+    if (parsedJSON)
+    {
+      parsedField = mothershipParseWormholeDNSConfig(doc, config, &failure);
+    }
+
+    suite.expect(parsedField, "mothership_parse_wormhole_dns_binding_parses");
+    suite.expect(failure.size() == 0, "mothership_parse_wormhole_dns_binding_no_failure");
+    suite.expect(config.bindingName.equal("api-binding"_ctv), "mothership_parse_wormhole_dns_binding_name");
+  }
+
+  {
+    WormholeDNSConfig config {};
+    String json = "{\"provider\":\"cloudflare\",\"credentialName\":\"cf-prod\",\"zone\":\"example.com\",\"name\":\"api.example.com\",\"ttl\":0}"_ctv;
+    json.need(simdjson::SIMDJSON_PADDING);
+
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    bool rejected = false;
+    if (parser.parse(json.data(), json.size()).get(doc) == simdjson::SUCCESS)
+    {
+      String failure;
+      rejected = (mothershipParseWormholeDNSConfig(doc, config, &failure) == false);
+      suite.expect(failure == "wormhole.dns.ttl must be in 1..4294967295"_ctv, "mothership_parse_wormhole_dns_zero_ttl_failure_text");
+    }
+
+    suite.expect(rejected, "mothership_parse_wormhole_dns_rejects_zero_ttl");
+  }
+
+  {
+    WormholeDNSConfig config {};
+    String json = "{\"provider\":\"cloudflare\",\"credentialName\":\"cf-prod\",\"zone\":\"example.com\",\"name\":\"api.example.com\",\"ttl\":300,\"values\":[\"203.0.113.1\"]}"_ctv;
+    json.need(simdjson::SIMDJSON_PADDING);
+
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    bool rejected = false;
+    if (parser.parse(json.data(), json.size()).get(doc) == simdjson::SUCCESS)
+    {
+      String failure;
+      rejected = (mothershipParseWormholeDNSConfig(doc, config, &failure) == false);
+      suite.expect(failure == "wormhole.dns values are derived from the claimed address"_ctv, "mothership_parse_wormhole_dns_rejects_values_failure_text");
+    }
+
+    suite.expect(rejected, "mothership_parse_wormhole_dns_rejects_values");
+  }
+
+  {
     DeploymentPlan plan {};
     String json = "{\"useHostNetworkNamespace\":\"yes\"}"_ctv;
     json.need(simdjson::SIMDJSON_PADDING);
@@ -5440,9 +5913,10 @@ int main(void)
     brain.brainConfig.configBySlug.insert_or_assign(worker.slug, workerConfig);
 
     DistributableExternalSubnet subnet = {};
+    subnet.uuid = uint128_t(0x78020001);
     subnet.name = "whitehole-ipv4"_ctv;
     subnet.subnet.network = IPAddress("198.18.0.0", false);
-    subnet.subnet.cidr = 16;
+    subnet.subnet.cidr = 24;
     subnet.subnet.canonicalize();
     subnet.usage = ExternalSubnetUsage::whiteholes;
     brain.brainConfig.distributableExternalSubnets.push_back(subnet);
@@ -5453,15 +5927,40 @@ int main(void)
     Whitehole whitehole = {};
     whitehole.transport = ExternalAddressTransport::tcp;
     whitehole.family = ExternalAddressFamily::ipv4;
-    whitehole.source = ExternalAddressSource::distributableSubnet;
+    whitehole.source = ExternalAddressSource::registeredRoutablePrefix;
     deployment.plan.whiteholes.push_back(whitehole);
 
     uint32_t fit = ApplicationDeployment::nFitOnMachine(&deployment, &worker, 1);
-    suite.expect(fit == 1, "nFitOnMachine_whitehole_distributable_subnet_accepts_whitehole_subnet_usage");
+    suite.expect(fit == 1, "nFitOnMachine_whitehole_registered_prefix_accepts_whitehole_prefix_usage");
+
+    RoutableResourceLeaseOwner ownerA = {};
+    ownerA.applicationID = 7821;
+    ownerA.deploymentID = 780'210'001;
+    ownerA.lineageID = ownerA.applicationID;
+    Whitehole first = whitehole;
+    suite.expect(ApplicationDeployment::resolveWhiteholeSourceAddressForScheduling(&worker, first, nullptr, nullptr, &ownerA),
+                 "whitehole_registered_prefix_resolves_address");
+    suite.expect(first.address.equals(IPAddress("198.18.0.1", false)), "whitehole_registered_prefix_uses_first_host_address");
+    suite.expect(ApplicationDeployment::allocateWhiteholeSourcePort(first, &ownerA), "whitehole_registered_prefix_allocates_first_source_port");
+    suite.expect(first.sourcePort == 49'152, "whitehole_registered_prefix_first_port_is_ephemeral_floor");
+    suite.expect(deployment.reserveWhiteholeAddressPortLease(first, ownerA), "whitehole_registered_prefix_reserves_ip_port");
+    suite.expect(brain.routableResourceLeaseRuntimeState[0].registeredPrefixUUID == subnet.uuid, "whitehole_registered_prefix_lease_records_prefix_uuid");
+
+    RoutableResourceLeaseOwner ownerB = {};
+    ownerB.applicationID = 7822;
+    ownerB.deploymentID = 780'220'001;
+    ownerB.lineageID = ownerB.applicationID;
+    Whitehole second = whitehole;
+    suite.expect(ApplicationDeployment::resolveWhiteholeSourceAddressForScheduling(&worker, second, nullptr, nullptr, &ownerB),
+                 "whitehole_registered_prefix_resolves_shared_address");
+    suite.expect(second.address.equals(first.address), "whitehole_registered_prefix_shares_address");
+    suite.expect(ApplicationDeployment::allocateWhiteholeSourcePort(second, &ownerB), "whitehole_registered_prefix_allocates_next_source_port");
+    suite.expect(second.sourcePort == uint16_t(first.sourcePort + 1), "whitehole_registered_prefix_shares_address_with_unique_port");
+    suite.expect(deployment.reserveWhiteholeAddressPortLease(second, ownerB), "whitehole_registered_prefix_reserves_shared_ip_distinct_port");
 
     brain.brainConfig.distributableExternalSubnets[0].usage = ExternalSubnetUsage::wormholes;
     fit = ApplicationDeployment::nFitOnMachine(&deployment, &worker, 1);
-    suite.expect(fit == 0, "nFitOnMachine_whitehole_distributable_subnet_rejects_wormhole_only_subnet_usage");
+    suite.expect(fit == 0, "nFitOnMachine_whitehole_registered_prefix_rejects_wormhole_only_prefix_usage");
 
     thisBrain = savedBrain;
   }
@@ -5499,14 +5998,14 @@ int main(void)
     other.storageMB_available = 4096;
     brain.machines.insert(&other);
 
-    RegisteredRoutableAddress registered = {};
+    DistributableExternalSubnet registered = {};
     registered.uuid = uint128_t(0xABCD1004);
     registered.name = "wormhole-route"_ctv;
-    registered.family = ExternalAddressFamily::ipv6;
-    registered.kind = RoutableAddressKind::anyHostPublicAddress;
     registered.machineUUID = host.uuid;
-    registered.address = IPAddress("2001:db8:100::44", true);
-    brain.brainConfig.routableAddresses.push_back(registered);
+    registered.ingressScope = RoutableIngressScope::singleMachine;
+    registered.usage = ExternalSubnetUsage::wormholes;
+    registered.subnet = IPPrefix("2001:db8:100::44", true, 128);
+    brain.brainConfig.distributableExternalSubnets.push_back(registered);
 
     ApplicationDeployment deployment;
     seedCommonPlan(deployment, false);
@@ -5516,8 +6015,8 @@ int main(void)
     wormhole.containerPort = 8443;
     wormhole.layer4 = IPPROTO_UDP;
     wormhole.isQuic = true;
-    wormhole.source = ExternalAddressSource::registeredRoutableAddress;
-    wormhole.routableAddressUUID = registered.uuid;
+    wormhole.source = ExternalAddressSource::registeredRoutablePrefix;
+    wormhole.routablePrefixUUID = registered.uuid;
     deployment.plan.wormholes.push_back(wormhole);
 
     uint32_t fit = ApplicationDeployment::nFitOnMachine(&deployment, &host, 1);
@@ -5690,14 +6189,14 @@ int main(void)
     other.memoryMB_available = 4096;
     other.storageMB_available = 4096;
 
-    RegisteredRoutableAddress registered = {};
+    DistributableExternalSubnet registered = {};
     registered.uuid = uint128_t(0x2203);
     registered.name = "claim-route"_ctv;
-    registered.family = ExternalAddressFamily::ipv6;
-    registered.kind = RoutableAddressKind::anyHostPublicAddress;
     registered.machineUUID = host.uuid;
-    registered.address = IPAddress("2001:db8:100::45", true);
-    brain.brainConfig.routableAddresses.push_back(registered);
+    registered.ingressScope = RoutableIngressScope::singleMachine;
+    registered.usage = ExternalSubnetUsage::wormholes;
+    registered.subnet = IPPrefix("2001:db8:100::45", true, 128);
+    brain.brainConfig.distributableExternalSubnets.push_back(registered);
 
     ApplicationDeployment hostDeployment;
     seedCommonPlan(hostDeployment, false);
@@ -5708,8 +6207,8 @@ int main(void)
     wormhole.containerPort = 8443;
     wormhole.layer4 = IPPROTO_UDP;
     wormhole.isQuic = true;
-    wormhole.source = ExternalAddressSource::registeredRoutableAddress;
-    wormhole.routableAddressUUID = registered.uuid;
+    wormhole.source = ExternalAddressSource::registeredRoutablePrefix;
+    wormhole.routablePrefixUUID = registered.uuid;
     hostDeployment.plan.wormholes.push_back(wormhole);
 
     MachineTicket hostTicket {};

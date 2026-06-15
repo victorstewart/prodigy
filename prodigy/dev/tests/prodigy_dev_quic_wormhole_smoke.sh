@@ -212,12 +212,12 @@ then
    exit 1
 fi
 
-register_request='{"name":"quic-test-ipv4","kind":"testFakeAddress","family":"ipv4"}'
+register_request='{"name":"quic-test-ipv4","kind":"BGP","prefix":"198.18.0.1/32","usage":"wormholes","ingressScope":"singleMachine"}'
 if ! env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
-   "${MOTHERSHIP_BIN}" registerRoutableAddress "${cluster_name}" "${register_request}" \
+   "${MOTHERSHIP_BIN}" registerRoutableSubnet "${cluster_name}" "${register_request}" \
    >"${register_log}" 2>&1
 then
-   echo "FAIL: registerRoutableAddress failed"
+   echo "FAIL: registerRoutableSubnet failed"
    sed -n '1,160p' "${register_log}" || true
    exit 1
 fi
@@ -227,17 +227,17 @@ $(python3 - "${register_log}" <<'PY'
 import re, sys
 text = open(sys.argv[1], "r", encoding="utf-8").read()
 uuid = re.search(r"\buuid=([0-9a-fA-Fx]+)", text)
-address = re.search(r"\baddress=([0-9a-fA-F:\\.]+)", text)
-if not uuid or not address:
+prefix = re.search(r"\bprefix=([^\s]+)", text)
+if not uuid or not prefix:
     raise SystemExit(1)
-print(uuid.group(1), address.group(1))
+print(uuid.group(1), prefix.group(1).split("/", 1)[0])
 PY
 )
 EOF
 
 if [[ -z "${routable_uuid}" || -z "${routable_address}" ]]
 then
-   echo "FAIL: unable to parse registered QUIC routable address"
+   echo "FAIL: unable to parse registered QUIC routable prefix"
    sed -n '1,120p' "${register_log}" || true
    exit 1
 fi
@@ -294,8 +294,8 @@ cat > "${plan_json}" <<EOF
   },
   "wormholes": [
     {
-      "source": "registeredRoutableAddress",
-      "routableAddressUUID": "${routable_uuid}",
+      "source": "registeredRoutablePrefix",
+      "routablePrefixUUID": "${routable_uuid}",
       "externalPort": ${external_quic_port},
       "containerPort": ${container_quic_port},
       "layer4": "UDP",

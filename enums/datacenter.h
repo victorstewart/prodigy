@@ -34,9 +34,10 @@ enum class MothershipTopic : uint16_t {
   registerRoutableSubnet,
   unregisterRoutableSubnet,
   pullRoutableSubnets,
-  registerRoutableAddress,
-  unregisterRoutableAddress,
-  pullRoutableAddresses
+  pullRoutableResourceLeases,
+  upsertDNSBinding,
+  deleteDNSBinding,
+  pullDNSBindings
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -81,12 +82,14 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "unregisterRoutableSubnet";
     case MothershipTopic::pullRoutableSubnets:
       return "pullRoutableSubnets";
-    case MothershipTopic::registerRoutableAddress:
-      return "registerRoutableAddress";
-    case MothershipTopic::unregisterRoutableAddress:
-      return "unregisterRoutableAddress";
-    case MothershipTopic::pullRoutableAddresses:
-      return "pullRoutableAddresses";
+    case MothershipTopic::pullRoutableResourceLeases:
+      return "pullRoutableResourceLeases";
+    case MothershipTopic::upsertDNSBinding:
+      return "upsertDNSBinding";
+    case MothershipTopic::deleteDNSBinding:
+      return "deleteDNSBinding";
+    case MothershipTopic::pullDNSBindings:
+      return "pullDNSBindings";
   }
 
   return "unknown";
