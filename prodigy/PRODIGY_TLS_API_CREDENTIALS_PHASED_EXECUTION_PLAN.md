@@ -138,7 +138,6 @@
 | `intermediateCertPem` | `String` | Intermediate CA PEM (encrypted at rest) |
 | `intermediateKeyPem` | `String` | Intermediate key PEM (encrypted at rest) |
 | `defaultLeafValidityMs` | `int64_t` | Default leaf lifetime |
-| `renewLeadPercent` | `uint8_t` | Lead percent before expiry, default `10` |
 | `createdAtMs` | `int64_t` | Creation timestamp |
 | `updatedAtMs` | `int64_t` | Last mutation timestamp |
 
@@ -152,7 +151,6 @@
 | `importIntermediateCertPem` | `String` | Required for `import` |
 | `importIntermediateKeyPem` | `String` | Required for `import` |
 | `defaultLeafValidityMs` | `int64_t` | Requested default validity |
-| `renewLeadPercent` | `uint8_t` | Requested renewal lead percent |
 
 ### 5.8 `TlsVaultFactoryUpsertResponse` fields
 | Field | Type | Description |
@@ -166,7 +164,6 @@
 | `generatedIntermediateCertPem` | `String` | Present only when `mode=generate` and create/update generated new intermediate |
 | `generatedIntermediateKeyPem` | `String` | Present only when `mode=generate` and create/update generated new intermediate |
 | `effectiveLeafValidityMs` | `int64_t` | Persisted default validity |
-| `effectiveRenewLeadPercent` | `uint8_t` | Persisted lead percent |
 
 ### 5.9 `DeploymentTlsIssuancePolicy` fields
 | Field | Type | Description |
@@ -174,7 +171,6 @@
 | `applicationID` | `UUID` | Must map to pre-existing vault factory; hard fail if missing |
 | `enablePerContainerLeafs` | `bool` | If `true`, all deployment containers receive unique leaves |
 | `leafValidityMs` | `int64_t` | Optional override per deployment |
-| `renewLeadPercent` | `uint8_t` | Optional override, default `10` |
 | `identityNames` | `Vector<String>` | Inbound/outbound identities covered by policy |
 | `dnsSans` | `Vector<String>` | DNS subjectAltName values for issued server leaves |
 | `ipSans` | `Vector<IPAddress>` | IP subjectAltName values for issued server leaves |
@@ -240,11 +236,11 @@
 
 ### 6.1 Application inbound TLS policy
 1. Leaf validity is sourced from deployment policy (`leafValidityMs`/days), default 15 days when not overridden.
-2. Renewal scheduling starts when 10% of lifetime remains.
-3. Renewal trigger formula: `renewAtMs = notAfterMs - ceil((notAfterMs - notBeforeMs) * 0.10)`.
-4. For the default 15-day validity, renewal starts at day 13.5 (about 36 hours before expiry).
-5. Per-container jitter window is constrained inside the final 10% window.
-6. Retry interval on failure = 15 minutes.
+2. Renewal scheduling starts after two thirds of actual certificate lifetime is consumed.
+3. Renewal trigger formula: `renewAtMs = notBeforeMs + ((notAfterMs - notBeforeMs) * 667 / 1000)`.
+4. For the default 15-day validity, renewal starts at about day 10 plus bounded deterministic jitter.
+5. The same scheduler covers public ACME certs and generated private root/intermediate/leaf material.
+6. Retry uses bounded exponential backoff plus deterministic jitter.
 7. Escalation threshold = remaining lifetime <= 2%.
 8. Emergency issuance path bypasses normal jitter.
 
@@ -341,7 +337,7 @@
 | Duration estimate | 4 to 6 days |
 | Dependencies | Phase 0 |
 | Code areas | `prodigy/mothership/mothership.cpp`, `prodigy/types.h` |
-| Tasks | Add `MothershipTopic::upsertTlsVaultFactory` handler keyed by `applicationID`. Implement `mode=generate` path that creates root+intermediate and returns them in response. Implement `mode=import` path that validates caller material and persists it. Persist vault factory metadata and encrypted key material. Add `MothershipTopic::upsertApiCredentialSet` handler keyed by `applicationID`; persist API credentials by logical name with generation semantics. Add `MothershipTopic::mintClientTlsIdentity` handler that mints client cert/key/chain from pre-existing vault factory and returns material to caller. Convert existing `tls` parse path from fail-closed to real plan assignment. Add deployment policy flags: `enablePerContainerLeafs`, `leafValidityMs`, `renewLeadPercent`, `applicationID`. Add deployment API credential policy flags: `requiredCredentialNames`, `refreshPushEnabled`. Validate names, validity windows, SAN limits, provider constraints, and existence of app vault factory and app API credential set. Hard-fail deployment admission on unresolved references. Auto-creating vault factories or API keys from deployment parsing is forbidden. Persist into `DeploymentPlan` and `ContainerPlan`. |
+| Tasks | Add `MothershipTopic::upsertTlsVaultFactory` handler keyed by `applicationID`. Implement `mode=generate` path that creates root+intermediate and returns them in response. Implement `mode=import` path that validates caller material and persists it. Persist vault factory metadata and encrypted key material. Add `MothershipTopic::upsertApiCredentialSet` handler keyed by `applicationID`; persist API credentials by logical name with generation semantics. Add `MothershipTopic::mintClientTlsIdentity` handler that mints client cert/key/chain from pre-existing vault factory and returns material to caller. Convert existing `tls` parse path from fail-closed to real plan assignment. Add deployment policy flags: `enablePerContainerLeafs`, `leafValidityMs`, `applicationID`. Add deployment API credential policy flags: `requiredCredentialNames`, `refreshPushEnabled`. Validate names, validity windows, SAN limits, provider constraints, and existence of app vault factory and app API credential set. Hard-fail deployment admission on unresolved references. Auto-creating vault factories or API keys from deployment parsing is forbidden. Persist into `DeploymentPlan` and `ContainerPlan`. |
 | Deliverables | End-to-end config parse to in-memory plan objects |
 | Exit criteria | `DeploymentPlan` and `ContainerPlan` contain validated credential intent data and app vault/API credential references; unresolved references are rejected with hard-fail errors |
 | Rollback | Keep parser accepted but gated by feature flag fallback to old behavior |
@@ -353,7 +349,7 @@
 | Duration estimate | 5 to 8 days |
 | Dependencies | Phase 1 |
 | Code areas | `prodigy/vault.h`, Brain orchestration files under `prodigy/brain/` |
-| Tasks | Create brain-side credential issuer module using persisted `ApplicationTlsVaultFactory` per `applicationID`. If `enablePerContainerLeafs=true`, issue unique per-container leafs for configured identities. Parameterize leaf days to 15 default with per-deployment override. Store issuance metadata and generation index per `(containerUUID, identityName)`. Add renewal scheduler with 10%-remaining trigger and bounded jitter. Implement on-demand client cert mint path servicing `MothershipTopic::mintClientTlsIdentity` requests. |
+| Tasks | Create brain-side credential issuer module using persisted `ApplicationTlsVaultFactory` per `applicationID`. If `enablePerContainerLeafs=true`, issue unique per-container leafs for configured identities. Parameterize leaf days to 15 default with per-deployment override. Store issuance metadata and generation index per `(containerUUID, identityName)`. Add a shared two-thirds actual-lifetime renewal scheduler with bounded jitter/backoff. Implement on-demand client cert mint path servicing `MothershipTopic::mintClientTlsIdentity` requests. |
 | Deliverables | Issuer + scheduler + metadata registry |
 | Exit criteria | Brain can mint generation N+1 and stage delta for target containers |
 | Rollback | Disable scheduler and hold previous generation active |
@@ -461,10 +457,10 @@
 
 ### 11.3 Brain credential scheduler
 1. Create schedule index keyed by `containerUUID` and credential identity name.
-2. Compute next renewal at `notAfterMs - ceil((notAfterMs - notBeforeMs) * renewLeadPercent / 100) - jitter`.
+2. Compute next renewal from actual lifetime at the shared two-thirds consumed-lifetime point.
 3. Trigger immediate replacement for revoked identities.
 4. Publish deltas through Neuron channel with retry tracking.
-5. Read issuance policy from deployment plan (`enablePerContainerLeafs`, `leafValidityMs`, `renewLeadPercent`).
+5. Read issuance policy from deployment plan (`enablePerContainerLeafs`, `leafValidityMs`).
 6. Track API credential set generation per `applicationID` and push deltas when set generation changes.
 7. Filter pushed API credentials to deployment `requiredCredentialNames`.
 8. Handle synchronous/on-demand client cert mint requests from `MothershipTopic::mintClientTlsIdentity`.
@@ -493,7 +489,7 @@
 1. Serialization round-trip for all new credential structs.
 2. Generation ordering and stale-update rejection.
 3. Delta merge and delete semantics.
-4. Renewal scheduler timing calculations around day boundaries, percent-lead triggers, and jitter.
+4. Renewal scheduler timing calculations around actual-lifetime two-thirds triggers, jitter, and bounded backoff.
 5. Vault factory create/update tests for both modes: `generate` and `import`.
 6. Validation tests that `import` rejects incomplete root/intermediate bundles.
 7. API credential set upsert merge/delete behavior by logical name.
@@ -520,7 +516,7 @@
 2. QUIC new-connection handshake switches to generation N+1 while old sessions continue.
 3. Telnyx token rotation while request traffic is live.
 4. APNS client cert rotation while push traffic is live.
-5. 10%-remaining auto-renew event triggers issuance and successful delta apply before expiry.
+5. Two-thirds-lifetime auto-renew event triggers issuance and successful delta apply before expiry.
 6. Minted client cert can complete an outbound mTLS handshake in integration environment.
 
 ## 12.4 Chaos and failure tests
@@ -556,7 +552,7 @@
 7. Client cert mint event with `applicationID`, identity name, generation, and notAfter.
 
 ### 13.3 Alerts
-1. Any identity inside final 10% lifetime window with no pending successful renewal ack.
+1. Any identity past its two-thirds-lifetime renewal point with no pending successful renewal ack.
 2. Refresh ack failure rate above threshold for 10 minutes.
 3. Pending queue depth above threshold per container.
 4. Inbound TLS handshake failure spike correlated with generation cutover.
@@ -644,7 +640,7 @@
 6. End-to-end observability, audit logs, and alerting are active and verified.
 7. App-level vault factory exists and is persisted per `applicationID`.
 8. Both factory modes (`generate`, `import`) are validated and production-ready.
-9. Deployments with per-container issuance flag produce unique leaf certs and rotate at 10%-remaining threshold.
+9. Deployments with per-container issuance flag produce unique leaf certs and rotate at the shared two-thirds lifetime threshold.
 10. API credential registration topic persists keys per `applicationID` and deployment references control per-container distribution.
 11. API credential updates trigger runtime refresh push and successful container ack.
 12. Deployment admission hard-fails when vault factory or required API key references are unresolved; no auto-create/fail-open path exists.
@@ -664,5 +660,5 @@
 3. Approve single-topic bidirectional contract for `MothershipTopic::upsertTlsVaultFactory` and authz model.
 4. Approve single-topic bidirectional contract for `MothershipTopic::upsertApiCredentialSet` and authz model.
 5. Approve single-topic bidirectional contract for `MothershipTopic::mintClientTlsIdentity` and authz model.
-6. Approve renewal policy values: `renewLeadPercent=10`, escalation at <=2% remaining, 24h overlap default.
+6. Approve renewal policy values: shared two-thirds consumed-lifetime renewal, escalation at <=2% remaining, 24h overlap default.
 7. Begin Phase 0 implementation branch with schema and flags only.

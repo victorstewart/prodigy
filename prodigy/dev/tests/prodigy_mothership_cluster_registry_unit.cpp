@@ -142,6 +142,11 @@ static bool equalAzureConfig(const MothershipProdigyClusterAzureConfig& lhs, con
   return lhs.managedIdentityName.equals(rhs.managedIdentityName) && lhs.managedIdentityResourceID.equals(rhs.managedIdentityResourceID);
 }
 
+static bool equalACMEConfig(const ProdigyACMEConfig& lhs, const ProdigyACMEConfig& rhs)
+{
+  return lhs == rhs;
+}
+
 static const String& fixtureSSHDHostPublicKey(void)
 {
   static String hostPublicKey = []() -> String {
@@ -278,7 +283,7 @@ static NeuronBGPPeerConfig makeEnvironmentBGPPeer(const char *peerAddress, const
 
 static bool equalClusters(const MothershipProdigyCluster& lhs, const MothershipProdigyCluster& rhs)
 {
-  return lhs.name.equals(rhs.name) && lhs.clusterUUID == rhs.clusterUUID && lhs.deploymentMode == rhs.deploymentMode && lhs.architecture == rhs.architecture && lhs.includeLocalMachine == rhs.includeLocalMachine && lhs.provider == rhs.provider && lhs.providerScope.equals(rhs.providerScope) && lhs.providerCredentialName.equals(rhs.providerCredentialName) && lhs.propagateProviderCredentialToProdigy == rhs.propagateProviderCredentialToProdigy && lhs.dnsProvider == rhs.dnsProvider && lhs.dnsProviderCredentialName.equals(rhs.dnsProviderCredentialName) && equalAwsConfig(lhs.aws, rhs.aws) && equalGcpConfig(lhs.gcp, rhs.gcp) && equalAzureConfig(lhs.azure, rhs.azure) && equalControls(lhs.controls, rhs.controls) && lhs.nBrains == rhs.nBrains && equalMachineSchemas(lhs.machineSchemas, rhs.machineSchemas) && equalMachines(lhs.machines, rhs.machines) && lhs.topology == rhs.topology && lhs.bootstrapSshUser.equals(rhs.bootstrapSshUser) && lhs.bootstrapSshKeyPackage == rhs.bootstrapSshKeyPackage && lhs.bootstrapSshHostKeyPackage == rhs.bootstrapSshHostKeyPackage && lhs.bootstrapSshPrivateKeyPath.equals(rhs.bootstrapSshPrivateKeyPath) && lhs.remoteProdigyPath.equals(rhs.remoteProdigyPath) && lhs.sharedCPUOvercommitPermille == rhs.sharedCPUOvercommitPermille && lhs.osUpdatesEnabled == rhs.osUpdatesEnabled && equalOSUpdatePolicies(lhs.osUpdatePolicies, rhs.osUpdatePolicies) && lhs.maxOSDrains == rhs.maxOSDrains && lhs.machineUpdateCadenceMins == rhs.machineUpdateCadenceMins && equalEnvironmentBGP(lhs.bgp, rhs.bgp) && equalTestConfig(lhs.test, rhs.test) && lhs.desiredEnvironment == rhs.desiredEnvironment && lhs.environmentConfigured == rhs.environmentConfigured && lhs.lastRefreshMs == rhs.lastRefreshMs && lhs.lastRefreshFailure.equals(rhs.lastRefreshFailure);
+  return lhs.name.equals(rhs.name) && lhs.clusterUUID == rhs.clusterUUID && lhs.deploymentMode == rhs.deploymentMode && lhs.architecture == rhs.architecture && lhs.includeLocalMachine == rhs.includeLocalMachine && lhs.provider == rhs.provider && lhs.providerScope.equals(rhs.providerScope) && lhs.providerCredentialName.equals(rhs.providerCredentialName) && lhs.propagateProviderCredentialToProdigy == rhs.propagateProviderCredentialToProdigy && lhs.dnsProvider == rhs.dnsProvider && lhs.dnsProviderCredentialName.equals(rhs.dnsProviderCredentialName) && equalACMEConfig(lhs.acme, rhs.acme) && equalAwsConfig(lhs.aws, rhs.aws) && equalGcpConfig(lhs.gcp, rhs.gcp) && equalAzureConfig(lhs.azure, rhs.azure) && equalControls(lhs.controls, rhs.controls) && lhs.nBrains == rhs.nBrains && equalMachineSchemas(lhs.machineSchemas, rhs.machineSchemas) && equalMachines(lhs.machines, rhs.machines) && lhs.topology == rhs.topology && lhs.bootstrapSshUser.equals(rhs.bootstrapSshUser) && lhs.bootstrapSshKeyPackage == rhs.bootstrapSshKeyPackage && lhs.bootstrapSshHostKeyPackage == rhs.bootstrapSshHostKeyPackage && lhs.bootstrapSshPrivateKeyPath.equals(rhs.bootstrapSshPrivateKeyPath) && lhs.remoteProdigyPath.equals(rhs.remoteProdigyPath) && lhs.sharedCPUOvercommitPermille == rhs.sharedCPUOvercommitPermille && lhs.machineReservedResources == rhs.machineReservedResources && lhs.osUpdatesEnabled == rhs.osUpdatesEnabled && equalOSUpdatePolicies(lhs.osUpdatePolicies, rhs.osUpdatePolicies) && lhs.maxOSDrains == rhs.maxOSDrains && lhs.machineUpdateCadenceMins == rhs.machineUpdateCadenceMins && equalEnvironmentBGP(lhs.bgp, rhs.bgp) && equalTestConfig(lhs.test, rhs.test) && lhs.desiredEnvironment == rhs.desiredEnvironment && lhs.environmentConfigured == rhs.environmentConfigured && lhs.lastRefreshMs == rhs.lastRefreshMs && lhs.lastRefreshFailure.equals(rhs.lastRefreshFailure);
 }
 
 static void assignFixtureBootstrapSSHKeyPackage(MothershipProdigyCluster& cluster)
@@ -358,6 +363,7 @@ int main(void)
                                                .nStorageMB = 262'144});
   localAdopted.nBrains = 2;
   localAdopted.sharedCPUOvercommitPermille = 1500;
+  localAdopted.machineReservedResources = prodigySmokeMachineReservedResources;
   localAdopted.bootstrapSshPrivateKeyPath = "/root/.ssh/homelab"_ctv;
   localAdopted.bgp.specified = true;
   localAdopted.bgp.config.enabled = true;
@@ -421,6 +427,8 @@ int main(void)
   remoteCreated.providerScope = "acct-prod/us-east-1"_ctv;
   remoteCreated.dnsProvider = MothershipClusterProvider::cloudflare;
   remoteCreated.dnsProviderCredentialName = "cloudflare-prod"_ctv;
+  remoteCreated.acme.accountEmail = "ops@example.com"_ctv;
+  remoteCreated.acme.termsAgreed = true;
   remoteCreated.aws.instanceProfileName = "prodigy-controller-profile"_ctv;
   remoteCreated.controls.push_back(MothershipProdigyClusterControl {
       .kind = MothershipClusterControlKind::unixSocket,
@@ -461,6 +469,9 @@ int main(void)
   storedRemoteCreated.includeLocalMachine = false;
   storedRemoteCreated.bootstrapSshUser = defaultMothershipClusterSSHUser();
   storedRemoteCreated.remoteProdigyPath = defaultMothershipRemoteProdigyPath();
+  storedRemoteCreated.acme.certbotInstall = "bundle"_ctv;
+  storedRemoteCreated.acme.certbotPath = "/opt/prodigy/certbot/bin/certbot"_ctv;
+  storedRemoteCreated.acme.certbotVersion = "5.6.0"_ctv;
 
   MothershipProdigyCluster remoteAdopted = {};
   remoteAdopted.name = "adopted-gcp"_ctv;
@@ -752,6 +763,19 @@ int main(void)
   invalidRemoteBGP.name = "remote-bgp-invalid"_ctv;
   invalidRemoteBGP.bgp = localAdopted.bgp;
 
+  MothershipProdigyCluster invalidACMENoDNS = remoteManagedGcp;
+  invalidACMENoDNS.name = "remote-acme-no-dns"_ctv;
+  invalidACMENoDNS.acme.accountEmail = "ops@example.com"_ctv;
+  invalidACMENoDNS.acme.termsAgreed = true;
+
+  MothershipProdigyCluster invalidACMENoTerms = remoteCreated;
+  invalidACMENoTerms.name = "remote-acme-no-terms"_ctv;
+  invalidACMENoTerms.acme.termsAgreed = false;
+
+  MothershipProdigyCluster invalidACMESystemCertbot = remoteCreated;
+  invalidACMESystemCertbot.name = "remote-acme-system-certbot"_ctv;
+  invalidACMESystemCertbot.acme.certbotInstall = "system"_ctv;
+
   MothershipProdigyCluster remoteVultrBGP = remoteCreated;
   remoteVultrBGP.name = "remote-vultr-bgp"_ctv;
   remoteVultrBGP.provider = MothershipClusterProvider::vultr;
@@ -767,6 +791,9 @@ int main(void)
   storedRemoteVultrBGP.includeLocalMachine = false;
   storedRemoteVultrBGP.bootstrapSshUser = defaultMothershipClusterSSHUser();
   storedRemoteVultrBGP.remoteProdigyPath = defaultMothershipRemoteProdigyPath();
+  storedRemoteVultrBGP.acme.certbotInstall = "bundle"_ctv;
+  storedRemoteVultrBGP.acme.certbotPath = "/opt/prodigy/certbot/bin/certbot"_ctv;
+  storedRemoteVultrBGP.acme.certbotVersion = "5.6.0"_ctv;
 
   MothershipProdigyCluster invalidSharedCPUOvercommit = local;
   invalidSharedCPUOvercommit.name = "local-invalid-overcommit"_ctv;
@@ -1025,6 +1052,12 @@ int main(void)
     suite.expect(upsertChangedDNSCredential, "upsert_existing_dns_credential_change_allowed");
     storedRemoteCreated = changedDNSCredential;
 
+    MothershipProdigyCluster changedACME = storedRemoteCreated;
+    changedACME.acme.accountEmail = "security@example.com"_ctv;
+    bool upsertChangedACME = registry.upsertCluster(changedACME, nullptr, &failure);
+    suite.expect(upsertChangedACME == false, "upsert_existing_acme_change_rejected");
+    suite.expect(failure.equals("acme config is immutable for an existing cluster"_ctv), "upsert_existing_acme_change_reason");
+
     MothershipProdigyCluster topologyOwner = remoteCreated;
     topologyOwner.name = "topology-owner"_ctv;
     topologyOwner.topology.version = 7;
@@ -1126,6 +1159,18 @@ int main(void)
     bool createRemoteBGP = registry.createCluster(invalidRemoteBGP, nullptr, &failure);
     suite.expect(createRemoteBGP == false, "create_remote_bgp_rejected");
     suite.expect(failure.equals("remote cluster provider does not support bgp"_ctv), "create_remote_bgp_reason");
+
+    bool createInvalidACMENoDNS = registry.createCluster(invalidACMENoDNS, nullptr, &failure);
+    suite.expect(createInvalidACMENoDNS == false, "create_invalid_acme_no_dns_rejected");
+    suite.expect(failure.equals("cluster ACME requires cluster DNS"_ctv), "create_invalid_acme_no_dns_reason");
+
+    bool createInvalidACMENoTerms = registry.createCluster(invalidACMENoTerms, nullptr, &failure);
+    suite.expect(createInvalidACMENoTerms == false, "create_invalid_acme_no_terms_rejected");
+    suite.expect(failure.equals("cluster ACME requires acme.termsAgreed=true"_ctv), "create_invalid_acme_no_terms_reason");
+
+    bool createInvalidACMESystemCertbot = registry.createCluster(invalidACMESystemCertbot, nullptr, &failure);
+    suite.expect(createInvalidACMESystemCertbot == false, "create_invalid_acme_system_certbot_rejected");
+    suite.expect(failure.equals("cluster ACME certbotInstall must be bundle"_ctv), "create_invalid_acme_system_certbot_reason");
 
     bool createRemoteVultrBGP = registry.createCluster(remoteVultrBGP, &createdCluster, &failure);
     if (!createRemoteVultrBGP)

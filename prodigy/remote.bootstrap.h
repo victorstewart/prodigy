@@ -185,7 +185,7 @@ static inline bool prodigyConnectBlockingSSHSession(
   {
     if (failure)
     {
-      failure->snprintf<"failed to connect to ssh address {}:{}"_ctv>(sshAddress, unsigned(sshPort));
+      failure->snprintf<"failed to connect to ssh address {}:{itoa}"_ctv>(sshAddress, unsigned(sshPort));
     }
     return false;
   }
@@ -203,6 +203,15 @@ static inline bool prodigyConnectBlockingSSHSession(
   }
 
   libssh2_session_set_blocking(session, 1);
+  if (libssh2_session_method_pref(session, LIBSSH2_METHOD_HOSTKEY, "ssh-ed25519") != 0)
+  {
+    if (failure)
+    {
+      failure->assign("failed to prefer ed25519 ssh host key"_ctv);
+    }
+    prodigyCloseBlockingSSHSession(session, fd);
+    return false;
+  }
 
   if (libssh2_session_handshake(session, fd) != 0)
   {
@@ -995,7 +1004,7 @@ static inline bool prodigyUploadLocalFileToSSHSession(LIBSSH2_SESSION *session, 
 
   if (success == false && failure)
   {
-    failure->snprintf<"failed to upload local file {} writeResult={} sessionErr={} sftpErr={itoa} localReadErr={}"_ctv>(localPath, int64_t(lastWriteResult), sessionError, sftpError, localReadError ? 1 : 0);
+    failure->snprintf<"failed to upload local file {} writeResult={itoa} sessionErr={itoa} sftpErr={itoa} localReadErr={itoa}"_ctv>(localPath, int64_t(lastWriteResult), sessionError, sftpError, localReadError ? 1 : 0);
   }
 
   return success;
@@ -1007,6 +1016,7 @@ public:
   MachineCpuArchitecture architecture = MachineCpuArchitecture::unknown;
   ClusterMachineSSH ssh;
   Vault::SSHKeyPackage bootstrapSshKeyPackage;
+  ProdigyACMEConfig acme;
   String remoteBootstrapSSHPrivateKeyPath;
   String remoteBootstrapSSHPublicKeyPath;
   String localBundlePath;
@@ -1306,8 +1316,19 @@ static inline bool prodigyBuildRemoteBootstrapTransportTLSState(
   return true;
 }
 
+static inline void prodigyAppendRemoteContainerRootCommand(String& command, bool systemdUnit = false)
+{
+  command.append("mkdir -p /var/lib/prodigy /containers; fs=$(stat -f -c "_ctv);
+  command.append(systemdUnit ? "%%T" : "%T");
+  command.append(" /containers 2>/dev/null || true); if [ \"$fs\" != btrfs ]; then if mountpoint -q /containers; then echo '/containers must be btrfs' >&2; exit 1; fi; img=/var/lib/prodigy/containers.btrfs.loop; if [ ! -e \"$img\" ]; then truncate -s 16G \"$img\" && mkfs.btrfs -f \"$img\" >/dev/null; fi; mount -o loop,nosuid,nodev \"$img\" /containers; fi; mkdir -p /containers/store /containers/storage"_ctv);
+}
+
 static inline void renderProdigySystemdUnit(const String& remoteBinaryPath, const String& remoteLibraryDirectory, const String& controlSocketDirectory, String& unit)
 {
+  String containerRootCommand = {};
+  String installRoot = {};
+  prodigyAppendRemoteContainerRootCommand(containerRootCommand, true);
+  prodigyDirname(remoteBinaryPath, installRoot);
   unit.clear();
   unit.append("[Unit]\n"_ctv);
   unit.append("Description=Prodigy\n"_ctv);
@@ -1317,6 +1338,19 @@ static inline void renderProdigySystemdUnit(const String& remoteBinaryPath, cons
   unit.append("Type=simple\n"_ctv);
   unit.append("Environment=LD_LIBRARY_PATH="_ctv);
   unit.append(remoteLibraryDirectory);
+  unit.append("\n"_ctv);
+  unit.append("Environment=PRODIGY_HOST_INGRESS_EBPF="_ctv);
+  unit.append(installRoot);
+#if NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE
+  unit.append("/host.ingress.router.dev.ebpf.o\n"_ctv);
+#else
+  unit.append("/host.ingress.router.ebpf.o\n"_ctv);
+#endif
+  unit.append("Environment=PRODIGY_HOST_EGRESS_EBPF="_ctv);
+  unit.append(installRoot);
+  unit.append("/host.egress.router.ebpf.o\n"_ctv);
+  unit.append("ExecStartPre=/bin/sh -lc "_ctv);
+  prodigyAppendShellSingleQuoted(unit, containerRootCommand);
   unit.append("\n"_ctv);
   unit.append("ExecStartPre=/usr/bin/mkdir -p "_ctv);
   unit.append(controlSocketDirectory);
@@ -1568,6 +1602,7 @@ static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& cluster
   plan.ssh.privateKeyPath = clusterMachine.ssh.privateKeyPath;
   plan.ssh.hostPublicKeyOpenSSH = clusterMachine.ssh.hostPublicKeyOpenSSH;
   plan.bootstrapSshKeyPackage = request.bootstrapSshKeyPackage;
+  plan.acme = request.acme;
   String localExecutablePath = {};
   (void)prodigyResolveCurrentExecutablePath(localExecutablePath);
   if (prodigyResolvePreferredBootstrapBundleArtifact(localExecutablePath, plan.architecture, request.remoteProdigyPath, plan.localBundlePath, failure) == false)
@@ -1626,7 +1661,7 @@ static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& cluster
   plan.remoteUnitTempPath.assign(remoteRootParent);
   if (plan.remoteUnitTempPath.size() > 0 && plan.remoteUnitTempPath[plan.remoteUnitTempPath.size() - 1] != '/')
   {
-    plan.remoteUnitTempPath.append('/');
+    plan.remoteUnitTempPath.append("/"_ctv);
   }
   plan.remoteUnitTempPath.append("prodigy.service.tmp"_ctv);
   plan.remoteStagePayloadPath.assign("/tmp/prodigy.remote-bootstrap.payload.tar"_ctv);
@@ -1636,7 +1671,7 @@ static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& cluster
   plan.installPaths.bundleTempPath.assign(remoteRootParent);
   if (plan.installPaths.bundleTempPath.size() > 0 && plan.installPaths.bundleTempPath[plan.installPaths.bundleTempPath.size() - 1] != '/')
   {
-    plan.installPaths.bundleTempPath.append('/');
+    plan.installPaths.bundleTempPath.append("/"_ctv);
   }
   plan.installPaths.bundleTempPath.append("prodigy.bundle.tar.zst"_ctv);
   plan.installPaths.bundleTempPath.append(".tmp"_ctv);
@@ -1661,7 +1696,7 @@ static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& cluster
 
   plan.mkdirCommand.assign("mkdir -p "_ctv);
   prodigyAppendShellSingleQuoted(plan.mkdirCommand, remoteRootParent);
-  plan.mkdirCommand.append(" /var/lib/prodigy"_ctv);
+  plan.mkdirCommand.append(" /var/lib/prodigy /containers/store /containers/storage"_ctv);
   if (plan.controlSocketDirectory.size() > 0)
   {
     plan.mkdirCommand.append(" "_ctv);
@@ -1682,8 +1717,10 @@ static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& cluster
   String tempBundleSHA256Path = {};
   prodigyResolveBundleSHA256Path(tempBundlePath, tempBundleSHA256Path);
 
-  plan.installCommand.assign("set -eu; systemctl stop prodigy || true; if ! command -v zstd >/dev/null 2>&1; then if command -v apt-get >/dev/null 2>&1; then export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y zstd; else echo 'missing zstd decompressor on remote host' >&2; exit 1; fi; fi; "_ctv);
+  plan.installCommand.assign("set -eu; systemctl stop prodigy || true; if ! command -v zstd >/dev/null 2>&1 || ! command -v btrfs >/dev/null 2>&1 || ! command -v mkfs.btrfs >/dev/null 2>&1; then if command -v apt-get >/dev/null 2>&1; then export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y --no-install-recommends zstd btrfs-progs; else echo 'missing zstd or btrfs-progs on remote host' >&2; exit 1; fi; fi; "_ctv);
   plan.installCommand.append(plan.mkdirCommand);
+  plan.installCommand.append("; "_ctv);
+  prodigyAppendRemoteContainerRootCommand(plan.installCommand);
   plan.installCommand.append("; tar --no-same-owner --same-permissions -xf "_ctv);
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.remoteStagePayloadPath);
   plan.installCommand.append(" -C /; rm -f "_ctv);
@@ -1720,6 +1757,25 @@ static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& cluster
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.installPaths.installRootTemp);
   plan.installCommand.append(" "_ctv);
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.installPaths.installRoot);
+  if (plan.acme.configured())
+  {
+    String certbotWheelhousePath = {};
+    certbotWheelhousePath.assign(plan.installPaths.toolsDirectory);
+    if (certbotWheelhousePath.size() > 0 && certbotWheelhousePath[certbotWheelhousePath.size() - 1] != '/')
+    {
+      certbotWheelhousePath.append("/"_ctv);
+    }
+    certbotWheelhousePath.append(prodigyCertbotManagedWheelhouse);
+
+    plan.installCommand.append("; venvProbe=/tmp/prodigy-certbot-venv-probe.$$; rm -rf \"$venvProbe\"; if ! command -v python3 >/dev/null 2>&1 || ! python3 -m venv \"$venvProbe\" >/dev/null 2>&1; then rm -rf \"$venvProbe\"; if command -v apt-get >/dev/null 2>&1; then export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates; else echo 'missing python3 venv support on remote host' >&2; exit 1; fi; fi; rm -rf \"$venvProbe\"; test -r "_ctv);
+    prodigyAppendShellSingleQuoted(plan.installCommand, certbotWheelhousePath);
+    plan.installCommand.append("; rm -rf /opt/prodigy/certbot.prev /opt/prodigy/certbot.wheels; if [ -e /opt/prodigy/certbot ]; then mv /opt/prodigy/certbot /opt/prodigy/certbot.prev; fi; mkdir -p /opt/prodigy /opt/prodigy/certbot.wheels; python3 -m venv /opt/prodigy/certbot; tar --zstd -xf "_ctv);
+    prodigyAppendShellSingleQuoted(plan.installCommand, certbotWheelhousePath);
+    plan.installCommand.append(" -C /opt/prodigy/certbot.wheels; /opt/prodigy/certbot/bin/pip install --no-index --no-cache-dir --disable-pip-version-check --find-links /opt/prodigy/certbot.wheels 'certbot==5.6.0'; /opt/prodigy/certbot/bin/certbot --version | grep -F '5.6.0'; rm -rf /opt/prodigy/certbot.wheels /opt/prodigy/certbot.prev"_ctv);
+  }
+  plan.installCommand.append("; mkdir -p /usr/lib/prodigy; for hook in acme-present-dns-01 acme-cleanup-dns-01 acme-import-lineage; do ln -sf "_ctv);
+  prodigyAppendShellSingleQuoted(plan.installCommand, plan.installPaths.toolsDirectory);
+  plan.installCommand.append("/$hook /usr/lib/prodigy/$hook; done"_ctv);
   plan.installCommand.append("; "_ctv);
   plan.installCommand.append("LD_LIBRARY_PATH="_ctv);
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.installPaths.libraryDirectory);
@@ -1900,7 +1956,7 @@ static inline bool prodigyBuildRemoteBootstrapStagePath(const String& stagingRoo
   stagedPath.assign(stagingRoot);
   if (stagedPath.size() > 0 && stagedPath[stagedPath.size() - 1] != '/')
   {
-    stagedPath.append('/');
+    stagedPath.append("/"_ctv);
   }
   stagedPath.append(remoteAbsolutePath.substr(1, remoteAbsolutePath.size() - 1, Copy::yes));
   return true;
@@ -2541,7 +2597,7 @@ public:
     }
 
     String connectFailure = {};
-    connectFailure.snprintf<"ssh tcp connect failed result={}"_ctv>(int64_t(result));
+    connectFailure.snprintf<"ssh tcp connect failed result={itoa}"_ctv>(int64_t(result));
     if (task->connectAttemptFailed())
     {
       task->recordConnectFailure(connectFailure, true);
@@ -2572,7 +2628,7 @@ public:
     if (result < 0)
     {
       task->failed = true;
-      task->lastFailure.snprintf<"ssh io wait failed result={}"_ctv>(int64_t(result));
+      task->lastFailure.snprintf<"ssh io wait failed result={itoa}"_ctv>(int64_t(result));
     }
 
     task->co_consume();
@@ -2609,8 +2665,30 @@ public:
       return;
     }
 
-    if (task->phase == Task::Phase::connecting && task->shouldReconnect())
+    if (task->phase == Task::Phase::connecting || task->phase == Task::Phase::authenticating)
     {
+      String connectFailure = {};
+      connectFailure.assign("ssh transport closed during "_ctv);
+      if (task->activeStep.size() > 0)
+      {
+        connectFailure.append(task->activeStep);
+      }
+      else
+      {
+        connectFailure.append("connect"_ctv);
+      }
+      if (task->connectAttemptFailed())
+      {
+        task->recordConnectFailure(connectFailure, false);
+        return;
+      }
+
+      if (task->shouldReconnect() == false)
+      {
+        task->complete(false, connectFailure, false);
+        return;
+      }
+
       prodigyLogRemoteBootstrapStep("retry", "connect", task->prepared.plan, nullptr);
       task->recreateSocket();
       task->socketInstalled = true;
@@ -2706,6 +2784,91 @@ static inline bool prodigyExecutePreparedRemoteBootstrapPlans(
   return true;
 }
 
+static inline bool prodigyExecutePreparedRemoteBootstrapPlanBlocking(ProdigyPreparedRemoteBootstrapPlan& prepared, String *failure = nullptr)
+{
+  if (failure)
+  {
+    failure->clear();
+  }
+
+  auto cleanup = [&]() -> void {
+    prodigyCleanupPreparedRemoteBootstrapPayload(prepared);
+  };
+
+  auto fail = [&](const char *step, LIBSSH2_SESSION *& session, int& fd) -> bool {
+    String detail = {};
+    if (failure != nullptr)
+    {
+      detail.assign(*failure);
+    }
+    prodigyLogRemoteBootstrapStep("failed", step, prepared.plan, &detail);
+    prodigyCloseBlockingSSHSession(session, fd);
+    cleanup();
+    return false;
+  };
+
+  LIBSSH2_SESSION *session = nullptr;
+  int fd = -1;
+  prodigyLogRemoteBootstrapStep("start", "connect", prepared.plan, nullptr);
+  const Vault::SSHKeyPackage *package = prepared.plan.ssh.privateKeyPath.size() == 0 && prodigyBootstrapSSHKeyPackageConfigured(prepared.plan.bootstrapSshKeyPackage)
+                                            ? &prepared.plan.bootstrapSshKeyPackage
+                                            : nullptr;
+  String connectFailure = {};
+  int64_t connectDeadlineMs = Time::now<TimeResolution::ms>() + int64_t(prepared.plan.connectRetryBudgetMs);
+  while (prodigyConnectBlockingSSHSession(
+             prepared.plan.ssh.address,
+             prepared.plan.ssh.port,
+             prepared.plan.ssh.hostPublicKeyOpenSSH,
+             prepared.plan.ssh.user,
+             prepared.plan.ssh.privateKeyPath,
+             package,
+             session,
+             fd,
+             &connectFailure) == false)
+  {
+    if (prepared.plan.connectRetryBudgetMs == 0 || Time::now<TimeResolution::ms>() >= connectDeadlineMs)
+    {
+      if (failure)
+      {
+        failure->assign(connectFailure);
+      }
+      return fail("connect", session, fd);
+    }
+
+    usleep(useconds_t(prodigyRemoteBootstrapSSHRetrySleepMs) * 1000u);
+  }
+
+  prodigyLogRemoteBootstrapStep("ok", "connect", prepared.plan, nullptr);
+  String bundleDetail = {};
+  bundleDetail.snprintf<"localBundle={} bytes={itoa} sha256={}"_ctv>(prepared.plan.localBundlePath, prepared.bundleBytes, prepared.bundleSHA256);
+  prodigyLogRemoteBootstrapStep("ok", "resolve-bundle", prepared.plan, &bundleDetail);
+
+  String uploadDetail = {};
+  uploadDetail.snprintf<"local={} remote={} bytes={itoa} mode={itoa}"_ctv>(
+      prepared.localStagePayloadPath,
+      prepared.plan.remoteStagePayloadPath,
+      prodigyMeasureLocalFileSize(prepared.localStagePayloadPath),
+      uint64_t(0600));
+  prodigyLogRemoteBootstrapStep("start", "upload-stage-payload", prepared.plan, &uploadDetail);
+  if (prodigyUploadLocalFileToSSHSession(session, fd, prepared.localStagePayloadPath, prepared.plan.remoteStagePayloadPath, 0600, failure) == false)
+  {
+    return fail("upload-stage-payload", session, fd);
+  }
+  prodigyLogRemoteBootstrapStep("ok", "upload-stage-payload", prepared.plan, &uploadDetail);
+
+  prodigyLogRemoteBootstrapStep("start", "install", prepared.plan, nullptr);
+  if (prodigyRunBlockingSSHCommand(session, fd, prepared.plan.installCommand, failure, 600'000) == false)
+  {
+    return fail("install", session, fd);
+  }
+
+  prodigyLogRemoteBootstrapStep("ok", "install", prepared.plan, nullptr);
+  prodigyLogRemoteBootstrapStep("ok", "complete", prepared.plan, nullptr);
+  prodigyCloseBlockingSSHSession(session, fd);
+  cleanup();
+  return true;
+}
+
 static inline bool prodigyExecuteRemoteBootstrapPlan(const ProdigyRemoteBootstrapPlan& plan, String *failure = nullptr)
 {
   if (failure)
@@ -2719,7 +2882,5 @@ static inline bool prodigyExecuteRemoteBootstrapPlan(const ProdigyRemoteBootstra
     return false;
   }
 
-  Vector<ProdigyPreparedRemoteBootstrapPlan> preparedPlans = {};
-  preparedPlans.push_back(std::move(prepared));
-  return prodigyExecutePreparedRemoteBootstrapPlans(preparedPlans, nullptr, failure);
+  return prodigyExecutePreparedRemoteBootstrapPlanBlocking(prepared, failure);
 }

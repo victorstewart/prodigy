@@ -124,6 +124,9 @@ def test_frame_helpers(params: prodigy.ContainerParameters) -> None:
    assert prodigy.build_statistics_frame([prodigy.MetricPair(1, 2), prodigy.MetricPair(3, 4)]) == fixture_bytes("frame.statistics.demo.bin")
    assert prodigy.build_resource_delta_ack_frame(True) == fixture_bytes("frame.resource_delta_ack.accepted.bin")
    assert prodigy.build_credentials_refresh_ack_frame() == fixture_bytes("frame.credentials_refresh_ack.empty.bin")
+   credential_ack = prodigy.parse_message_frame(prodigy.build_credentials_refresh_ack_frame(b"PRDCAC01payload"))
+   assert credential_ack.topic == prodigy.ContainerTopic.CREDENTIALS_REFRESH
+   assert credential_ack.payload == b"PRDCAC01payload"
 
    decoder = prodigy.FrameDecoder()
    ping = prodigy.build_message_frame(prodigy.ContainerTopic.PING)

@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cctype>
+#include <cstdio>
 #include <string_view>
+#include <sys/wait.h>
 
 #include <curl/curl.h>
 #include <simdjson.h>
@@ -50,6 +52,107 @@ static inline bool prodigyDNSCredentialMetadata(const ApiCredential& credential,
     return false;
   }
   value = it->second;
+  return true;
+}
+
+static inline void prodigyDNSTrimTrailingASCIIWhitespace(String& value)
+{
+  while (value.size() > 0)
+  {
+    uint8_t ch = value[value.size() - 1];
+    if (ch != ' ' && ch != '\n' && ch != '\r' && ch != '\t')
+    {
+      return;
+    }
+    value.resize(value.size() - 1);
+  }
+}
+
+static inline bool prodigyDNSRunCommandCaptureOutput(const String& command, String& output, String& failure)
+{
+  output.clear();
+  String owned = {};
+  owned.assign(command);
+  owned.addNullTerminator();
+
+  FILE *pipe = ::popen(owned.c_str(), "r");
+  if (pipe == nullptr)
+  {
+    failure.assign("DNS bearer refresh command spawn failed"_ctv);
+    return false;
+  }
+
+  char buffer[4096];
+  while (true)
+  {
+    size_t nRead = fread(buffer, 1, sizeof(buffer), pipe);
+    if (nRead > 0)
+    {
+      output.append(reinterpret_cast<const uint8_t *>(buffer), nRead);
+    }
+    if (nRead < sizeof(buffer))
+    {
+      break;
+    }
+  }
+
+  int status = ::pclose(pipe);
+  prodigyDNSTrimTrailingASCIIWhitespace(output);
+  if (status == 0)
+  {
+    failure.clear();
+    return true;
+  }
+
+  if (output.size() > 0)
+  {
+    failure.assign(output);
+  }
+  else if (WIFEXITED(status))
+  {
+    failure.snprintf<"DNS bearer refresh command exited with status {itoa}"_ctv>(uint32_t(WEXITSTATUS(status)));
+  }
+  else
+  {
+    failure.assign("DNS bearer refresh command failed"_ctv);
+  }
+  return false;
+}
+
+static inline bool prodigyDNSResolveBearerToken(const ApiCredential& credential, String& token, String& failure)
+{
+  String command = {};
+  if (prodigyDNSCredentialMetadata(credential, "bearerRefreshCommand", command))
+  {
+    if (prodigyDNSRunCommandCaptureOutput(command, token, failure) == false)
+    {
+      return false;
+    }
+    if (token.size() == 0)
+    {
+      failure.assign("DNS bearer refresh command returned empty output"_ctv);
+      return false;
+    }
+    return true;
+  }
+  if (credential.material.size() > 0)
+  {
+    token = credential.material;
+    failure.clear();
+    return true;
+  }
+  failure.assign("DNS bearer credential material or metadata.bearerRefreshCommand required"_ctv);
+  return false;
+}
+
+static inline bool prodigyDNSApplyBearerAuth(ProdigyDNSHTTPRequest& request, const ApiCredential& credential, String& failure)
+{
+  String token = {};
+  if (prodigyDNSResolveBearerToken(credential, token, failure) == false)
+  {
+    return false;
+  }
+  request.bearer(token);
   return true;
 }
 
@@ -144,19 +247,113 @@ static inline bool prodigyDNSAppendRecordJSON(String& body, const ProdigyDNSReco
   return true;
 }
 
-static inline bool prodigyDNSOneValue(simdjson::dom::array values, const String& value)
+static inline void prodigyDNSQuoteTXTValue(const String& value, String& quoted)
 {
-  uint32_t n = 0;
-  for (simdjson::dom::element item : values)
+  quoted.assign("\""_ctv);
+  for (uint64_t index = 0; index < value.size(); ++index)
   {
-    std::string_view text = {};
-    if (item.get(text) != simdjson::SUCCESS || String(text).equals(value) == false)
+    if (value[index] == '"' || value[index] == '\\')
     {
-      return false;
+      quoted.append('\\');
     }
-    n += 1;
+    quoted.append(value[index]);
   }
-  return n == 1;
+  quoted.append('"');
+}
+
+static inline void prodigyDNSUnquoteTXTValue(const String& value, String& unquoted)
+{
+  unquoted.clear();
+  if (value.size() < 2 || value[0] != '"' || value[value.size() - 1] != '"')
+  {
+    unquoted = value;
+    return;
+  }
+  for (uint64_t index = 1; index + 1 < value.size(); ++index)
+  {
+    if (value[index] == '\\' && index + 2 < value.size())
+    {
+      index += 1;
+    }
+    unquoted.append(value[index]);
+  }
+}
+
+static inline bool prodigyDNSProviderValueEquals(const ProdigyDNSRecordBinding& record, const String& providerValue, const String& rawValue)
+{
+  if (routableResourceDNSPartEquals(record.type, "TXT"_ctv, false) == false)
+  {
+    return providerValue.equals(rawValue);
+  }
+  String unquoted = {};
+  prodigyDNSUnquoteTXTValue(providerValue, unquoted);
+  return unquoted.equals(rawValue);
+}
+
+static inline bool prodigyDNSValuesContain(const ProdigyDNSRecordBinding& record, const Vector<String>& values, const String& rawValue)
+{
+  for (const String& value : values)
+  {
+    if (prodigyDNSProviderValueEquals(record, value, rawValue))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+static inline bool prodigyDNSRemoveProviderValue(const ProdigyDNSRecordBinding& record, Vector<String>& values, const String& rawValue)
+{
+  for (auto it = values.begin(); it != values.end(); ++it)
+  {
+    if (prodigyDNSProviderValueEquals(record, *it, rawValue))
+    {
+      values.erase(it);
+      return true;
+    }
+  }
+  return false;
+}
+
+static inline void prodigyDNSAppendGcpRRSet(String& body, const ProdigyDNSRecordBinding& record, const Vector<String>& values)
+{
+  body.append("{\"name\":"_ctv);
+  appendEscapedJSONString(body, record.name);
+  prodigyDNSAppendJSONKV(body, "type", record.type);
+  body.snprintf_add<",\"ttl\":{itoa},\"rrdatas\":["_ctv>(record.ttl);
+  for (uint64_t index = 0; index < values.size(); ++index)
+  {
+    if (index > 0)
+    {
+      body.append(',');
+    }
+    appendEscapedJSONString(body, values[index]);
+  }
+  body.append("]}"_ctv);
+}
+
+static inline void prodigyDNSAppendAzureRecordSetJSON(String& body, const ProdigyDNSRecordBinding& record, const Vector<String>& values)
+{
+  body.snprintf<"{\"properties\":{\"TTL\":{itoa},\""_ctv>(record.ttl);
+  if (routableResourceDNSPartEquals(record.type, "TXT"_ctv, false))
+  {
+    body.append("TXTRecords\":["_ctv);
+    for (uint64_t index = 0; index < values.size(); ++index)
+    {
+      if (index > 0)
+      {
+        body.append(',');
+      }
+      body.append("{\"value\":["_ctv);
+      appendEscapedJSONString(body, values[index]);
+      body.append("]}"_ctv);
+    }
+    body.append("]}}"_ctv);
+    return;
+  }
+  body.append(record.type.equal("AAAA"_ctv) ? "AAAARecords\":[{\"ipv6Address\":" : "ARecords\":[{\"ipv4Address\":");
+  appendEscapedJSONString(body, values[0]);
+  body.append("}]}}"_ctv);
 }
 
 static inline bool prodigyDNSExistingRecordConflict(String& failure)
@@ -165,7 +362,16 @@ static inline bool prodigyDNSExistingRecordConflict(String& failure)
   return false;
 }
 
-static inline bool prodigyDNSFindJSONRecord(const String& response, const char *arrayName, const ProdigyDNSRecordBinding& record, const String& name, const char *valueField, ProdigyDNSRecordPresence& presence, String& id, String& failure)
+static inline bool prodigyDNSFindJSONRecord(
+    const String& response,
+    const char *arrayName,
+    const ProdigyDNSRecordBinding& record,
+    const String& name,
+    const char *valueField,
+    bool exactOnly,
+    ProdigyDNSRecordPresence& presence,
+    String& id,
+    String& failure)
 {
   presence = ProdigyDNSRecordPresence::missing;
   id.clear();
@@ -206,8 +412,12 @@ static inline bool prodigyDNSFindJSONRecord(const String& response, const char *
         routableResourceDNSPartEquals(String(rowType), record.type, false) &&
         routableResourceDNSPartEquals(String(rowName), name, true))
     {
-      if (String(rowValue).equals(recordValue) == false)
+      if (prodigyDNSProviderValueEquals(record, String(rowValue), recordValue) == false)
       {
+        if (exactOnly)
+        {
+          continue;
+        }
         return prodigyDNSExistingRecordConflict(failure);
       }
       presence = ProdigyDNSRecordPresence::exact;
@@ -219,14 +429,10 @@ static inline bool prodigyDNSFindJSONRecord(const String& response, const char *
   return true;
 }
 
-static inline bool prodigyDNSFindGcpRecord(const String& response, const ProdigyDNSRecordBinding& record, ProdigyDNSRecordPresence& presence, String& failure)
+static inline bool prodigyDNSCollectGcpRecordValues(const String& response, const ProdigyDNSRecordBinding& record, Vector<String>& values, bool& found, String& failure)
 {
-  presence = ProdigyDNSRecordPresence::missing;
-  String recordValue = {};
-  if (prodigyDNSRecordSingleValue(record, recordValue, failure) == false)
-  {
-    return false;
-  }
+  values.clear();
+  found = false;
 
   String text = {};
   text.assign(response);
@@ -250,18 +456,25 @@ static inline bool prodigyDNSFindGcpRecord(const String& response, const Prodigy
   {
     std::string_view rowName = {};
     std::string_view rowType = {};
-    simdjson::dom::array values;
+    simdjson::dom::array rrdatas;
     if (row["name"].get(rowName) == simdjson::SUCCESS &&
         row["type"].get(rowType) == simdjson::SUCCESS &&
-        row["rrdatas"].get(values) == simdjson::SUCCESS &&
+        row["rrdatas"].get(rrdatas) == simdjson::SUCCESS &&
         routableResourceDNSPartEquals(String(rowName), record.name, true) &&
         routableResourceDNSPartEquals(String(rowType), record.type, false))
     {
-      if (prodigyDNSOneValue(values, recordValue) == false)
+      found = true;
+      values.clear();
+      for (simdjson::dom::element item : rrdatas)
       {
-        return prodigyDNSExistingRecordConflict(failure);
+        std::string_view value = {};
+        if (item.get(value) != simdjson::SUCCESS)
+        {
+          failure.assign("gcp cloud dns rrset parse failed"_ctv);
+          return false;
+        }
+        values.push_back(String(value));
       }
-      presence = ProdigyDNSRecordPresence::exact;
       failure.clear();
       return true;
     }
@@ -270,7 +483,7 @@ static inline bool prodigyDNSFindGcpRecord(const String& response, const Prodigy
   return true;
 }
 
-static inline bool prodigyDNSFindAzureRecord(const String& response, const ProdigyDNSRecordBinding& record, ProdigyDNSRecordPresence& presence, String& failure)
+static inline bool prodigyDNSFindGcpRecord(const String& response, const ProdigyDNSRecordBinding& record, ProdigyDNSRecordPresence& presence, String& failure)
 {
   presence = ProdigyDNSRecordPresence::missing;
   String recordValue = {};
@@ -278,6 +491,31 @@ static inline bool prodigyDNSFindAzureRecord(const String& response, const Prodi
   {
     return false;
   }
+
+  Vector<String> values = {};
+  bool found = false;
+  if (prodigyDNSCollectGcpRecordValues(response, record, values, found, failure) == false)
+  {
+    return false;
+  }
+  if (found == false)
+  {
+    failure.clear();
+    return true;
+  }
+  if (values.size() != 1 || prodigyDNSProviderValueEquals(record, values[0], recordValue) == false)
+  {
+    return prodigyDNSExistingRecordConflict(failure);
+  }
+  presence = ProdigyDNSRecordPresence::exact;
+  failure.clear();
+  return true;
+}
+
+static inline bool prodigyDNSCollectAzureRecordValues(const String& response, const ProdigyDNSRecordBinding& record, Vector<String>& values, bool& found, String& failure)
+{
+  values.clear();
+  found = false;
 
   String text = {};
   text.assign(response);
@@ -292,25 +530,79 @@ static inline bool prodigyDNSFindAzureRecord(const String& response, const Prodi
 
   simdjson::dom::element properties;
   simdjson::dom::array rows;
-  const char *arrayName = record.type.equal("AAAA"_ctv) ? "AAAARecords" : "ARecords";
-  const char *valueName = record.type.equal("AAAA"_ctv) ? "ipv6Address" : "ipv4Address";
+  const bool isAAAA = routableResourceDNSPartEquals(record.type, "AAAA"_ctv, false);
+  const bool isTXT = routableResourceDNSPartEquals(record.type, "TXT"_ctv, false);
+  const char *arrayName = isTXT ? "TXTRecords" : (isAAAA ? "AAAARecords" : "ARecords");
+  const char *valueName = isTXT ? "value" : (isAAAA ? "ipv6Address" : "ipv4Address");
   if (doc["properties"].get(properties) != simdjson::SUCCESS || properties[arrayName].get(rows) != simdjson::SUCCESS)
   {
     failure.clear();
     return true;
   }
 
-  uint32_t n = 0;
+  found = true;
   for (simdjson::dom::element row : rows)
   {
-    std::string_view value = {};
-    if (row[valueName].get(value) != simdjson::SUCCESS || String(value).equals(recordValue) == false)
+    if (isTXT)
     {
-      return prodigyDNSExistingRecordConflict(failure);
+      simdjson::dom::array strings;
+      if (row[valueName].get(strings) != simdjson::SUCCESS)
+      {
+        failure.assign("azure dns record set parse failed"_ctv);
+        return false;
+      }
+      String joined = {};
+      for (simdjson::dom::element item : strings)
+      {
+        std::string_view value = {};
+        if (item.get(value) != simdjson::SUCCESS)
+        {
+          failure.assign("azure dns record set parse failed"_ctv);
+          return false;
+        }
+        joined.append(String(value));
+      }
+      values.push_back(joined);
+      continue;
     }
-    n += 1;
+
+    std::string_view value = {};
+    if (row[valueName].get(value) != simdjson::SUCCESS)
+    {
+      failure.assign("azure dns record set parse failed"_ctv);
+      return false;
+    }
+    values.push_back(String(value));
   }
-  presence = n == 1 ? ProdigyDNSRecordPresence::exact : ProdigyDNSRecordPresence::missing;
+  failure.clear();
+  return true;
+}
+
+static inline bool prodigyDNSFindAzureRecord(const String& response, const ProdigyDNSRecordBinding& record, ProdigyDNSRecordPresence& presence, String& failure)
+{
+  presence = ProdigyDNSRecordPresence::missing;
+  String recordValue = {};
+  if (prodigyDNSRecordSingleValue(record, recordValue, failure) == false)
+  {
+    return false;
+  }
+
+  Vector<String> values = {};
+  bool found = false;
+  if (prodigyDNSCollectAzureRecordValues(response, record, values, found, failure) == false)
+  {
+    return false;
+  }
+  if (found == false)
+  {
+    failure.clear();
+    return true;
+  }
+  if (values.size() != 1 || prodigyDNSProviderValueEquals(record, values[0], recordValue) == false)
+  {
+    return prodigyDNSExistingRecordConflict(failure);
+  }
+  presence = ProdigyDNSRecordPresence::exact;
   failure.clear();
   return true;
 }

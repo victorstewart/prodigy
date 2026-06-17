@@ -28,7 +28,19 @@ public:
 
 static bool equalCredentials(const MothershipProviderCredential& lhs, const MothershipProviderCredential& rhs)
 {
-  return lhs.name.equals(rhs.name) && lhs.provider == rhs.provider && lhs.mode == rhs.mode && lhs.material.equals(rhs.material) && lhs.impersonateServiceAccount.equals(rhs.impersonateServiceAccount) && lhs.credentialPath.equals(rhs.credentialPath) && lhs.scope.equals(rhs.scope) && lhs.allowPropagateToProdigy == rhs.allowPropagateToProdigy && lhs.createdAtMs == rhs.createdAtMs && lhs.updatedAtMs == rhs.updatedAtMs;
+  if (lhs.name.equals(rhs.name) == false || lhs.provider != rhs.provider || lhs.mode != rhs.mode || lhs.material.equals(rhs.material) == false || lhs.impersonateServiceAccount.equals(rhs.impersonateServiceAccount) == false || lhs.credentialPath.equals(rhs.credentialPath) == false || lhs.scope.equals(rhs.scope) == false || lhs.allowPropagateToProdigy != rhs.allowPropagateToProdigy || lhs.createdAtMs != rhs.createdAtMs || lhs.updatedAtMs != rhs.updatedAtMs || lhs.metadata.size() != rhs.metadata.size())
+  {
+    return false;
+  }
+  for (const auto& [key, value] : lhs.metadata)
+  {
+    auto it = rhs.metadata.find(key);
+    if (it == rhs.metadata.end() || it->second.equals(value) == false)
+    {
+      return false;
+    }
+  }
+  return true;
 }
 
 static bool listContainsCredential(const Vector<MothershipProviderCredential>& credentials, const MothershipProviderCredential& needle)
@@ -135,7 +147,7 @@ int main(void)
   suite.expect(writeExecutableScript(fakeAwsPath,
                                      "#!/usr/bin/env bash\n"
                                      "set -e\n"
-                                     "if [ \"$1\" = \"configure\" ] && [ \"$2\" = \"export-credentials\" ] && [ \"$3\" = \"--format\" ] && [ \"$4\" = \"process\" ]; then\n"
+                                     "if [ \"$1\" = \"configure\" ] && [ \"$2\" = \"export-credentials\" ] && [ \"$3\" = \"--profile\" ] && [ \"$4\" = \"prodigy\" ] && [ \"$5\" = \"--format\" ] && [ \"$6\" = \"process\" ]; then\n"
                                      "  printf '%s\\n' '{\"Version\":1,\"AccessKeyId\":\"ASIAEXAMPLE\",\"SecretAccessKey\":\"secret\",\"SessionToken\":\"session\",\"Expiration\":\"2026-03-22T10:00:00Z\"}'\n"
                                      "  exit 0\n"
                                      "fi\n"
@@ -317,10 +329,12 @@ int main(void)
     awsCli.provider = MothershipClusterProvider::aws;
     awsCli.mode = MothershipProviderCredentialMode::awsCli;
     awsCli.scope = "acct-cli/us-east-1"_ctv;
+    awsCli.metadata["profile"_ctv] = "prodigy"_ctv;
     bool createAwsCli = registry.createCredential(awsCli, &storedAwsCli, &failure);
     suite.expect(createAwsCli, "create_aws_cli_profile");
     suite.expect(storedAwsCli.material.size() == 0, "create_aws_cli_profile_material_cleared");
     suite.expect(storedAwsCli.mode == MothershipProviderCredentialMode::awsCli, "create_aws_cli_profile_mode");
+    suite.expect(storedAwsCli.metadata["profile"_ctv].equals("prodigy"_ctv), "create_aws_cli_profile_metadata");
 
     MothershipProviderCredential awsImds = {};
     awsImds.name = "aws-imds"_ctv;
@@ -371,7 +385,7 @@ int main(void)
     bool applyAwsCliRuntime = MothershipProviderCredentialRegistry::applyCredentialToRuntimeEnvironment(storedAwsCli, awsCliRuntime, &failure);
     suite.expect(applyAwsCliRuntime, "apply_aws_cli_runtime_environment");
     suite.expect(awsCliRuntime.providerCredentialMaterial.equals("{\"Version\":1,\"AccessKeyId\":\"ASIAEXAMPLE\",\"SecretAccessKey\":\"secret\",\"SessionToken\":\"session\",\"Expiration\":\"2026-03-22T10:00:00Z\"}"_ctv), "apply_aws_cli_runtime_environment_material");
-    suite.expect(stringContains(awsCliRuntime.aws.bootstrapCredentialRefreshCommand, "aws configure export-credentials --format process"), "apply_aws_cli_runtime_environment_refresh_command");
+    suite.expect(stringContains(awsCliRuntime.aws.bootstrapCredentialRefreshCommand, "aws configure export-credentials --profile 'prodigy' --format process"), "apply_aws_cli_runtime_environment_refresh_command");
 
     MothershipProviderCredential azureCli = {};
     azureCli.name = "azure-cli"_ctv;
@@ -510,6 +524,19 @@ int main(void)
     suite.expect(updatedAws.updatedAtMs >= storedAws.updatedAtMs, "upsert_aws_updates_updatedAtMs");
     suite.expect(updatedAws.material.equals("aws-secret-2"_ctv), "upsert_aws_material_changed");
     suite.expect(updatedAws.allowPropagateToProdigy, "upsert_aws_allow_propagate");
+    storedAws = updatedAws;
+
+    MothershipProviderCredential metadataOnlyAws = {};
+    metadataOnlyAws.name = "aws-prod"_ctv;
+    metadataOnlyAws.provider = MothershipClusterProvider::aws;
+    metadataOnlyAws.metadata["dnsScope"_ctv] = "native-zone"_ctv;
+    metadataOnlyAws.metadata["dnsZones"_ctv] = "example.com"_ctv;
+
+    bool upsertMetadataOnlyAws = registry.upsertCredential(metadataOnlyAws, &updatedAws, &failure);
+    suite.expect(upsertMetadataOnlyAws, "upsert_metadata_only_preserves_static_material");
+    suite.expect(updatedAws.material.equals("aws-secret-2"_ctv), "upsert_metadata_only_keeps_material");
+    suite.expect(updatedAws.metadata["dnsScope"_ctv].equals("native-zone"_ctv), "upsert_metadata_only_adds_dns_scope");
+    suite.expect(updatedAws.metadata["dnsZones"_ctv].equals("example.com"_ctv), "upsert_metadata_only_adds_dns_zones");
     storedAws = updatedAws;
 
     bool createAzure = registry.createCredential(azure, &storedAzure, &failure);

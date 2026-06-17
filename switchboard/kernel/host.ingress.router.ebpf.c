@@ -1,10 +1,6 @@
 #include <ebpf/kernel/includes.h>
 #include <ebpf/kernel/containersubnet.h>
 
-#ifndef NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-#define NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE 0
-#endif
-
 #include <switchboard/common/checksum.h>
 #include <switchboard/common/constants.h>
 #include <switchboard/kernel/csum.h>
@@ -13,9 +9,7 @@
 #include <switchboard/kernel/layer4.h>
 #include <switchboard/kernel/overlay.encap.h>
 #include <switchboard/kernel/overlay.routing.h>
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
 #include <switchboard/kernel/portal.routing.h>
-#endif
 #include <switchboard/kernel/whitehole.routing.h>
 
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
@@ -28,11 +22,11 @@ struct
   __uint(max_entries, 16);
   __type(key, __u32);
   __type(value, __u64);
-} dev_host_route_stats SEC(".maps");
+} dev_host_stats SEC(".maps");
 
 __attribute__((__always_inline__)) static inline void bump_dev_host_route_stat(__u32 index)
 {
-  __u64 *slot = bpf_map_lookup_elem(&dev_host_route_stats, &index);
+  __u64 *slot = bpf_map_lookup_elem(&dev_host_stats, &index);
   if (slot)
   {
     __sync_fetch_and_add(slot, 1);
@@ -86,7 +80,7 @@ __attribute__((__always_inline__)) static inline bool lookup_whitehole_reply_bin
     return false;
   }
 
-  struct switchboard_whitehole_binding *reply = bpf_map_lookup_elem(&whitehole_reply_flows, &flow);
+  struct switchboard_whitehole_binding *reply = bpf_map_lookup_elem(&white_replies, &flow);
   if (reply == NULL)
   {
     return false;
@@ -136,7 +130,7 @@ __attribute__((__always_inline__)) static inline bool lookup_whitehole_reply_bin
     return false;
   }
 
-  struct switchboard_whitehole_binding *reply = bpf_map_lookup_elem(&whitehole_reply_flows, &flow);
+  struct switchboard_whitehole_binding *reply = bpf_map_lookup_elem(&white_replies, &flow);
   if (reply == NULL)
   {
     return false;
@@ -146,7 +140,6 @@ __attribute__((__always_inline__)) static inline bool lookup_whitehole_reply_bin
   return true;
 }
 
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
 __attribute__((__always_inline__)) static inline bool overlay_inner_ipv4_matches_external_portal(struct iphdr *inner4, void *data_end)
 {
   if ((void *)(inner4 + 1) > data_end || inner4->ihl != 5)
@@ -184,7 +177,7 @@ __attribute__((__always_inline__)) static inline bool overlay_inner_ipv4_matches
   portal.addr4 = inner4->daddr;
   portal.port = destPort;
   portal.proto = inner4->protocol;
-  return bpf_map_lookup_elem(&external_portals, &portal) != NULL;
+  return bpf_map_lookup_elem(&ext_portals, &portal) != NULL;
 }
 
 __attribute__((__always_inline__)) static inline bool overlay_inner_ipv6_matches_external_portal(struct ipv6hdr *inner6, void *data_end)
@@ -224,9 +217,8 @@ __attribute__((__always_inline__)) static inline bool overlay_inner_ipv6_matches
   bpf_memcpy(portal.addr6, inner6->daddr.s6_addr32, sizeof(portal.addr6));
   portal.port = destPort;
   portal.proto = inner6->nexthdr;
-  return bpf_map_lookup_elem(&external_portals, &portal) != NULL;
+  return bpf_map_lookup_elem(&ext_portals, &portal) != NULL;
 }
-#endif
 
 __attribute__((__always_inline__)) static inline bool overlay_inner_targets_local(__u8 inner_proto, void *inner_l3, void *data_end)
 {
@@ -243,11 +235,7 @@ __attribute__((__always_inline__)) static inline bool overlay_inner_targets_loca
       return true;
     }
 
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
     return overlay_inner_ipv4_matches_external_portal(inner4, data_end);
-#else
-    return false;
-#endif
   }
 
   if (inner_proto == IPPROTO_IPV6)
@@ -263,11 +251,7 @@ __attribute__((__always_inline__)) static inline bool overlay_inner_targets_loca
       return true;
     }
 
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
     return overlay_inner_ipv6_matches_external_portal(inner6, data_end);
-#else
-    return false;
-#endif
   }
 
   return false;
@@ -331,7 +315,6 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_whitehole_re
   return TC_ACT_OK;
 }
 
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
 __attribute__((__always_inline__)) static inline int maybe_redirect_ipv4_portal_packet(struct __sk_buff *skb, struct ethhdr *eth, void *data_end, bool *handled)
 {
   if (handled == NULL)
@@ -396,7 +379,7 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_ipv4_portal_
   }
 
   __u32 zeroidx = 0;
-  struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&local_container_subnet_map, &zeroidx);
+  struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
   if (switchboardContainerIDTargetsLocalMachine(&containerID, localSubnet) == false)
   {
     int overlayAction = TC_ACT_OK;
@@ -494,7 +477,7 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_ipv6_portal_
   }
 
   __u32 zeroidx = 0;
-  struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&local_container_subnet_map, &zeroidx);
+  struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
   if (switchboardContainerIDTargetsLocalMachine(&containerID, localSubnet) == false)
   {
     int overlayAction = TC_ACT_OK;
@@ -527,7 +510,6 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_ipv6_portal_
 
   return TC_ACT_SHOT;
 }
-#endif
 
 __attribute__((__always_inline__)) static inline bool maybe_decap_overlay_packet(struct __sk_buff *skb)
 {
@@ -759,7 +741,7 @@ __attribute__((__always_inline__)) static inline bool should_fast_pass_native_ho
 }
 
 SEC("tcx/ingress")
-int host_ingress_router(struct __sk_buff *skb)
+int host_ingress(struct __sk_buff *skb)
 {
 #if PRODIGY_DEBUG
   logSKB(skb);
@@ -785,7 +767,6 @@ int host_ingress_router(struct __sk_buff *skb)
     return whiteholeReplyAction;
   }
 
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
   bool handledIPv4Portal = false;
   int ipv4PortalAction = maybe_redirect_ipv4_portal_packet(skb, eth, data_end, &handledIPv4Portal);
   if (handledIPv4Portal)
@@ -799,7 +780,6 @@ int host_ingress_router(struct __sk_buff *skb)
   {
     return ipv6PortalAction;
   }
-#endif
 
   bool handledHostedIngress = false;
   int hostedIngressAction = maybe_route_hosted_ingress_packet(skb, eth, data_end, &handledHostedIngress);
@@ -955,14 +935,12 @@ int host_ingress_router(struct __sk_buff *skb)
       return TC_ACT_SHOT;
     }
 
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
     bool handledDecappedIPv4Portal = false;
     int decappedIPv4PortalAction = maybe_redirect_ipv4_portal_packet(skb, eth, data_end, &handledDecappedIPv4Portal);
     if (handledDecappedIPv4Portal)
     {
       return decappedIPv4PortalAction;
     }
-#endif
 
     if (lookup_whitehole_reply_binding_ipv4(eth, data_end, &replyBinding))
     {
@@ -987,7 +965,7 @@ int host_ingress_router(struct __sk_buff *skb)
     if (overlayRoutablePrefixesContainIPv4(iph->daddr))
     {
       __u32 zeroidx = 0;
-      struct local_container_subnet6 *localcontainersubnet6 = bpf_map_lookup_elem(&local_container_subnet_map, &zeroidx);
+      struct local_container_subnet6 *localcontainersubnet6 = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
       struct container_id containerID = {.value = {0}, .hasID = false};
       if (setContainerIDFromDistributedIPv4(&containerID, iph->daddr, localcontainersubnet6) == false)
       {

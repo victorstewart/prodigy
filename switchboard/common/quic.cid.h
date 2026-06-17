@@ -45,7 +45,7 @@ __attribute__((__always_inline__)) static inline void quicCidBuildIPv6Destinatio
 
 __attribute__((__always_inline__)) static inline void quicCidDeriveTagFromDestinationKey(__u8 tag[QUIC_CID_TAG_LEN], __u8 cidv, const __u8 container_id[5], __u32 nonce, const __u8 destination_key[QUIC_CID_DESTINATION_KEY_LEN], __u16 destination_port_network_order, __u8 proto)
 {
-  __u8 auth_block[33];
+  __u8 auth_block[33] __attribute__((aligned(4)));
   const __u8 *nonce_bytes = (const __u8 *)&nonce;
   const __u8 *port_bytes = (const __u8 *)&destination_port_network_order;
 

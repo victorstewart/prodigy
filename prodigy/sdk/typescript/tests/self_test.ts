@@ -143,6 +143,9 @@ async function main(): Promise<void>
    assert.deepEqual(sdk.buildStatisticsFrame([{ key: 1n, value: 2n }, { key: 3n, value: 4n }]), fixtureBytes("frame.statistics.demo.bin"))
    assert.deepEqual(sdk.buildResourceDeltaAckFrame(true), fixtureBytes("frame.resource_delta_ack.accepted.bin"))
    assert.deepEqual(sdk.buildCredentialsRefreshAckFrame(), fixtureBytes("frame.credentials_refresh_ack.empty.bin"))
+   const credentialAck = sdk.parseMessageFrame(sdk.buildCredentialsRefreshAckFrame(Buffer.from("PRDCAC01payload")))
+   assert.equal(credentialAck.topic, sdk.ContainerTopic.CredentialsRefresh)
+   assert.deepEqual(credentialAck.payload, Buffer.from("PRDCAC01payload"))
 
    const decoder = new sdk.FrameDecoder()
    const ping = sdk.buildMessageFrame(sdk.ContainerTopic.Ping)

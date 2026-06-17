@@ -17,12 +17,14 @@ constexpr static uint8_t containerParametersMagic[8] = {'P', 'R', 'D', 'P', 'A',
 constexpr static uint8_t credentialBundleMagic[8] = {'P', 'R', 'D', 'B', 'U', 'N', '0', '1'};
 constexpr static uint8_t credentialDeltaMagic[8] = {'P', 'R', 'D', 'D', 'E', 'L', '0', '1'};
 constexpr static uint8_t tlsResumptionApplyAckMagic[8] = {'P', 'R', 'D', 'A', 'C', 'K', '0', '1'};
+constexpr static uint8_t credentialApplyAckMagic[8] = {'P', 'R', 'D', 'C', 'A', 'C', '0', '1'};
 constexpr static uint32_t maxControlFrameBytes = 256u * 1024u * 1024u;
 constexpr static uint32_t maxWireStringBytes = 16u * 1024u * 1024u;
 constexpr static uint32_t maxWireCollectionElements = 16u * 1024u;
 
 static bool deserializeCredentialDelta(const String& input, CredentialDelta& delta);
 static bool deserializeTlsResumptionApplyAck(const String& input, TlsResumptionApplyAck& ack);
+static bool deserializeCredentialApplyAck(const String& input, CredentialApplyAck& ack);
 
 class Writer {
 public:
@@ -673,6 +675,29 @@ static bool extractTlsResumptionApplyResults(Reader& reader, Vector<TlsResumptio
   });
 }
 
+static bool appendTlsIdentityApplyResults(Writer& writer, const Vector<TlsIdentityApplyResult>& results)
+{
+  return appendBoundedVector<TlsIdentityApplyResult>(writer, results, [&](const TlsIdentityApplyResult& result) {
+    if (writer.string(result.identityName) == false)
+    {
+      return false;
+    }
+    writer.u64(result.generation);
+    writer.boolean(result.success);
+    return writer.string(result.failureReason);
+  });
+}
+
+static bool extractTlsIdentityApplyResults(Reader& reader, Vector<TlsIdentityApplyResult>& results)
+{
+  return extractBoundedVector<TlsIdentityApplyResult>(reader, results, [&](TlsIdentityApplyResult& result) {
+    return reader.string(result.identityName) &&
+           reader.u64(result.generation) &&
+           reader.boolean(result.success) &&
+           reader.string(result.failureReason);
+  });
+}
+
 static bool appendCredentialBundleFields(Writer& writer, const CredentialBundle& bundle)
 {
   if (bundle.tlsIdentities.size() > std::numeric_limits<uint32_t>::max() ||
@@ -867,6 +892,18 @@ static bool extractTlsResumptionApplyAckFields(Reader& reader, TlsResumptionAppl
   return extractTlsResumptionApplyResults(reader, ack.results);
 }
 
+static bool appendCredentialApplyAckFields(Writer& writer, const CredentialApplyAck& ack)
+{
+  return appendTlsIdentityApplyResults(writer, ack.tlsResults) &&
+         appendTlsResumptionApplyResults(writer, ack.resumptionResults);
+}
+
+static bool extractCredentialApplyAckFields(Reader& reader, CredentialApplyAck& ack)
+{
+  return extractTlsIdentityApplyResults(reader, ack.tlsResults) &&
+         extractTlsResumptionApplyResults(reader, ack.resumptionResults);
+}
+
 template <typename TopicType>
 static bool constructPackedFrame(StringDescendent auto& output, TopicType topic, const String& payload)
 {
@@ -1018,6 +1055,13 @@ static bool deserializeTlsResumptionApplyAckFramePayload(const uint8_t *input, u
   return deserializeTlsResumptionApplyAck(payload, ack);
 }
 
+static bool deserializeCredentialApplyAckFramePayload(const uint8_t *input, uint64_t inputSize, CredentialApplyAck& ack)
+{
+  String payload;
+  payload.setInvariant(const_cast<uint8_t *>(input), inputSize);
+  return deserializeCredentialApplyAck(payload, ack);
+}
+
 static uint32_t countSubscriptionPairings(const ContainerParameters& parameters)
 {
   uint64_t count = 0;
@@ -1114,6 +1158,29 @@ static bool deserializeTlsResumptionApplyAck(const String& input, TlsResumptionA
   TlsResumptionApplyAck decoded;
   if (reader.header(tlsResumptionApplyAckMagic) == false ||
       extractTlsResumptionApplyAckFields(reader, decoded) == false ||
+      reader.done() == false)
+  {
+    return false;
+  }
+
+  ack = std::move(decoded);
+  return true;
+}
+
+static bool serializeCredentialApplyAck(String& output, const CredentialApplyAck& ack)
+{
+  output.clear();
+  Writer writer(output);
+  writer.header(credentialApplyAckMagic);
+  return appendCredentialApplyAckFields(writer, ack);
+}
+
+static bool deserializeCredentialApplyAck(const String& input, CredentialApplyAck& ack)
+{
+  Reader reader(input);
+  CredentialApplyAck decoded;
+  if (reader.header(credentialApplyAckMagic) == false ||
+      extractCredentialApplyAckFields(reader, decoded) == false ||
       reader.done() == false)
   {
     return false;

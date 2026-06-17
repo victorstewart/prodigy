@@ -94,6 +94,13 @@ struct TlsResumptionApplyResult {
   std::string failureReason;
 };
 
+struct TlsIdentityApplyResult {
+  std::string identityName;
+  std::uint64_t generation = 0;
+  bool success = false;
+  std::string failureReason;
+};
+
 struct CredentialBundle {
   std::vector<TlsIdentity> tlsIdentities;
   std::vector<ApiCredential> apiCredentials;
@@ -114,6 +121,11 @@ struct CredentialDelta {
 
 struct TlsResumptionApplyAck {
   std::vector<TlsResumptionApplyResult> results;
+};
+
+struct CredentialApplyAck {
+  std::vector<TlsIdentityApplyResult> tlsResults;
+  std::vector<TlsResumptionApplyResult> resumptionResults;
 };
 
 static inline bool credentialDeltaHasResumption(const CredentialDelta& delta)
@@ -319,6 +331,7 @@ constexpr static std::array<std::uint8_t, 8> containerParametersMagic = {'P', 'R
 constexpr static std::array<std::uint8_t, 8> credentialBundleMagic = {'P', 'R', 'D', 'B', 'U', 'N', '0', '1'};
 constexpr static std::array<std::uint8_t, 8> credentialDeltaMagic = {'P', 'R', 'D', 'D', 'E', 'L', '0', '1'};
 constexpr static std::array<std::uint8_t, 8> tlsResumptionApplyAckMagic = {'P', 'R', 'D', 'A', 'C', 'K', '0', '1'};
+constexpr static std::array<std::uint8_t, 8> credentialApplyAckMagic = {'P', 'R', 'D', 'C', 'A', 'C', '0', '1'};
 
 static inline std::uint16_t inferredApplicationID(std::uint64_t service)
 {
@@ -855,6 +868,71 @@ static inline bool decodeTlsResumptionApplyAckFields(Reader& reader, TlsResumpti
   return decodeTlsResumptionApplyResults(reader, result.results);
 }
 
+static inline bool appendTlsIdentityApplyResults(Bytes& output, const std::vector<TlsIdentityApplyResult>& results)
+{
+  if (results.size() > std::numeric_limits<std::uint32_t>::max())
+  {
+    return false;
+  }
+
+  appendU32LE(output, static_cast<std::uint32_t>(results.size()));
+  for (const TlsIdentityApplyResult& result : results)
+  {
+    if (appendString(output, result.identityName) == false)
+    {
+      return false;
+    }
+
+    appendU64LE(output, result.generation);
+    appendBool(output, result.success);
+    if (appendString(output, result.failureReason) == false)
+    {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static inline bool decodeTlsIdentityApplyResults(Reader& reader, std::vector<TlsIdentityApplyResult>& results)
+{
+  std::uint32_t count = 0;
+  if (reader.boundedU32(count, MaxWireCollectionElements) == false)
+  {
+    return false;
+  }
+
+  results.clear();
+  results.reserve(count);
+  for (std::uint32_t index = 0; index < count; index += 1)
+  {
+    TlsIdentityApplyResult result;
+    if (reader.string(result.identityName) == false ||
+        reader.u64(result.generation) == false ||
+        reader.boolean(result.success) == false ||
+        reader.string(result.failureReason) == false)
+    {
+      return false;
+    }
+
+    results.push_back(std::move(result));
+  }
+
+  return true;
+}
+
+static inline bool appendCredentialApplyAckFields(Bytes& output, const CredentialApplyAck& result)
+{
+  return appendTlsIdentityApplyResults(output, result.tlsResults) &&
+         appendTlsResumptionApplyResults(output, result.resumptionResults);
+}
+
+static inline bool decodeCredentialApplyAckFields(Reader& reader, CredentialApplyAck& result)
+{
+  return decodeTlsIdentityApplyResults(reader, result.tlsResults) &&
+         decodeTlsResumptionApplyResults(reader, result.resumptionResults);
+}
+
 static inline bool decodeCredentialBundleBaseFields(Reader& reader, CredentialBundle& bundle)
 {
   std::uint32_t tlsCount = 0;
@@ -1295,6 +1373,26 @@ inline Result decodeTlsResumptionApplyAckPayload(const Bytes& payload, TlsResump
   return decodeTlsResumptionApplyAckPayload(payload.data(), payload.size(), result);
 }
 
+inline Result decodeCredentialApplyAckPayload(const std::uint8_t *payload, std::size_t payloadSize, CredentialApplyAck& result)
+{
+  if (payload == nullptr && payloadSize > 0)
+  {
+    return Result::argument;
+  }
+
+  Detail::Reader reader(payload, payloadSize);
+  return Detail::consumeMagic(reader, Detail::credentialApplyAckMagic) &&
+                 Detail::decodeCredentialApplyAckFields(reader, result) &&
+                 reader.done()
+             ? Result::ok
+             : Result::protocol;
+}
+
+inline Result decodeCredentialApplyAckPayload(const Bytes& payload, CredentialApplyAck& result)
+{
+  return decodeCredentialApplyAckPayload(payload.data(), payload.size(), result);
+}
+
 inline Result buildMessageFrame(
     Bytes& output,
     ContainerTopic topic,
@@ -1385,6 +1483,26 @@ inline Result buildCredentialsRefreshAckFrame(Bytes& output, const TlsResumption
 {
   Bytes payload;
   Result payloadResult = buildTlsResumptionApplyAckPayload(payload, result);
+  if (payloadResult != Result::ok)
+  {
+    output.clear();
+    return payloadResult;
+  }
+
+  return buildMessageFrame(output, ContainerTopic::credentialsRefresh, payload);
+}
+
+inline Result buildCredentialApplyAckPayload(Bytes& output, const CredentialApplyAck& result)
+{
+  output.clear();
+  output.insert(output.end(), Detail::credentialApplyAckMagic.begin(), Detail::credentialApplyAckMagic.end());
+  return Detail::appendCredentialApplyAckFields(output, result) ? Result::ok : Result::argument;
+}
+
+inline Result buildCredentialsRefreshAckFrame(Bytes& output, const CredentialApplyAck& result)
+{
+  Bytes payload;
+  Result payloadResult = buildCredentialApplyAckPayload(payload, result);
   if (payloadResult != Result::ok)
   {
     output.clear();
@@ -1634,6 +1752,11 @@ public:
     return buildCredentialsRefreshAckFrame(output, result);
   }
 
+  Result acknowledgeCredentialsRefresh(Bytes& output, const CredentialApplyAck& result) const
+  {
+    return buildCredentialsRefreshAckFrame(output, result);
+  }
+
   void queueReady(void)
   {
     queuedResponses.push_back(MessageFrame {ContainerTopic::healthy, {}});
@@ -1677,6 +1800,22 @@ public:
   {
     Bytes payload;
     Result buildResult = buildTlsResumptionApplyAckPayload(payload, result);
+    if (buildResult != Result::ok)
+    {
+      return buildResult;
+    }
+
+    queuedResponses.push_back(MessageFrame {
+        ContainerTopic::credentialsRefresh,
+        std::move(payload),
+    });
+    return Result::ok;
+  }
+
+  Result queueCredentialsRefreshAck(const CredentialApplyAck& result)
+  {
+    Bytes payload;
+    Result buildResult = buildCredentialApplyAckPayload(payload, result);
     if (buildResult != Result::ok)
     {
       return buildResult;

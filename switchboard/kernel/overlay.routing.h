@@ -16,7 +16,7 @@ __attribute__((__always_inline__)) static inline bool overlayRoutablePrefixesCon
       .addr = dest_ip,
   };
 
-  return bpf_map_lookup_elem(&overlay_routable_prefixes4, &key) != NULL;
+  return bpf_map_lookup_elem(&ovl_pfx4, &key) != NULL;
 }
 
 __attribute__((__always_inline__)) static inline bool overlayRoutablePrefixesContainIPv6(const __u32 dstv6[4])
@@ -26,7 +26,7 @@ __attribute__((__always_inline__)) static inline bool overlayRoutablePrefixesCon
   };
   bpf_memcpy(key.addr, dstv6, sizeof(key.addr));
 
-  return bpf_map_lookup_elem(&overlay_routable_prefixes6, &key) != NULL;
+  return bpf_map_lookup_elem(&ovl_pfx6, &key) != NULL;
 }
 
 __attribute__((__always_inline__)) static inline bool lookupHostedIngressMachineFragmentIPv4(__be32 dst, __u32 *machine_fragment)
@@ -41,7 +41,7 @@ __attribute__((__always_inline__)) static inline bool lookupHostedIngressMachine
       .addr = dst,
   };
 
-  struct switchboard_overlay_hosted_ingress_route4 *route = bpf_map_lookup_elem(&overlay_hosted_ingress_routes4, &key);
+  struct switchboard_overlay_hosted_ingress_route4 *route = bpf_map_lookup_elem(&ovl_host4, &key);
   if (route == NULL || route->machine_fragment == 0)
   {
     return false;
@@ -63,7 +63,7 @@ __attribute__((__always_inline__)) static inline bool lookupHostedIngressMachine
   };
   bpf_memcpy(key.addr, dstv6, sizeof(key.addr));
 
-  struct switchboard_overlay_hosted_ingress_route6 *route = bpf_map_lookup_elem(&overlay_hosted_ingress_routes6, &key);
+  struct switchboard_overlay_hosted_ingress_route6 *route = bpf_map_lookup_elem(&ovl_host6, &key);
   if (route == NULL || route->machine_fragment == 0)
   {
     return false;
@@ -76,7 +76,7 @@ __attribute__((__always_inline__)) static inline bool lookupHostedIngressMachine
 __attribute__((__always_inline__)) static inline bool overlayContainerNetworkEnabled(void)
 {
   __u32 zeroidx = 0;
-  struct switchboard_overlay_config *config = bpf_map_lookup_elem(&overlay_config_map, &zeroidx);
+  struct switchboard_overlay_config *config = bpf_map_lookup_elem(&ovl_config, &zeroidx);
   if (config == NULL)
   {
     return false;
@@ -95,7 +95,7 @@ __attribute__((__always_inline__)) static inline bool redirectContainerFragment(
     pkt->containerID.value[4] = container_fragment;
   }
 
-  __u32 *primary_device_idx = bpf_map_lookup_elem(&container_device_map, &container_index);
+  __u32 *primary_device_idx = bpf_map_lookup_elem(&ct_dev_map, &container_index);
   if (primary_device_idx == NULL)
   {
     return false;
@@ -197,7 +197,7 @@ __attribute__((__always_inline__)) static inline struct switchboard_overlay_mach
     return NULL;
   }
 
-  return bpf_map_lookup_elem(&overlay_machine_routes_full, key);
+  return bpf_map_lookup_elem(&ovl_mach_full, key);
 }
 
 __attribute__((__always_inline__)) static inline struct switchboard_overlay_machine_route *lookupOverlayMachineRouteLow8(const struct switchboard_overlay_machine_route_key *key)
@@ -207,7 +207,7 @@ __attribute__((__always_inline__)) static inline struct switchboard_overlay_mach
     return NULL;
   }
 
-  return bpf_map_lookup_elem(&overlay_machine_routes_low8, key);
+  return bpf_map_lookup_elem(&ovl_mach_low8, key);
 }
 
 __attribute__((__always_inline__)) static inline struct switchboard_overlay_machine_route *lookupOverlayMachineRouteByFragment(__u32 machine_fragment)

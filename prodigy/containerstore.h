@@ -3,6 +3,7 @@
 #include <prodigy/bundle.artifact.h>
 
 #include <cerrno>
+#include <cstring>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -11,6 +12,13 @@ class ContainerStore {
 private:
 
   static inline bytell_hash_set<uint64_t> contents;
+
+  static String errnoString(int err)
+  {
+    String text = {};
+    text.assign(strerror(err));
+    return text;
+  }
 
   static String pathForContainerImageWithinRoot(const String& storeRoot, uint64_t deploymentID)
   {
@@ -46,9 +54,8 @@ private:
 
       if (failureReport)
       {
-        String errnoText = {};
-        errnoText.assign(strerror(errno));
-        failureReport->snprintf<"blob write failed errno={}({})"_ctv>(errno, errnoText);
+        int err = errno;
+        failureReport->snprintf<"blob write failed errno={itoa}({})"_ctv>(uint64_t(err), errnoString(err));
       }
       return false;
     }
@@ -74,9 +81,8 @@ private:
     {
       if (failureReport)
       {
-        String errnoText = {};
-        errnoText.assign(strerror(errno));
-        failureReport->snprintf<"failed to open blob parent directory {} errno={}({})"_ctv>(parentPath, errno, errnoText);
+        int err = errno;
+        failureReport->snprintf<"failed to open blob parent directory {} errno={itoa}({})"_ctv>(parentPath, uint64_t(err), errnoString(err));
       }
       return false;
     }
@@ -86,9 +92,7 @@ private:
     ::close(dirfd);
     if (ok == false && failureReport)
     {
-      String errnoText = {};
-      errnoText.assign(strerror(syncErrno));
-      failureReport->snprintf<"failed to fsync blob parent directory {} errno={}({})"_ctv>(parentPath, syncErrno, errnoText);
+      failureReport->snprintf<"failed to fsync blob parent directory {} errno={itoa}({})"_ctv>(parentPath, uint64_t(syncErrno), errnoString(syncErrno));
     }
 
     return ok;
@@ -123,7 +127,8 @@ private:
     {
       if (failureReport)
       {
-        failureReport->snprintf<"failed to create temporary blob path for {} errno={}({})"_ctv>(finalPath, errno, String(strerror(errno)));
+        int err = errno;
+        failureReport->snprintf<"failed to create temporary blob path for {} errno={itoa}({})"_ctv>(finalPath, uint64_t(err), errnoString(err));
       }
       return false;
     }
@@ -137,7 +142,8 @@ private:
       ok = false;
       if (failureReport)
       {
-        failureReport->snprintf<"failed to chmod temporary blob {} errno={}({})"_ctv>(createdTempPath, errno, String(strerror(errno)));
+        int err = errno;
+        failureReport->snprintf<"failed to chmod temporary blob {} errno={itoa}({})"_ctv>(createdTempPath, uint64_t(err), errnoString(err));
       }
     }
 
@@ -151,7 +157,8 @@ private:
       ok = false;
       if (failureReport)
       {
-        failureReport->snprintf<"failed to fsync temporary blob {} errno={}({})"_ctv>(createdTempPath, errno, String(strerror(errno)));
+        int err = errno;
+        failureReport->snprintf<"failed to fsync temporary blob {} errno={itoa}({})"_ctv>(createdTempPath, uint64_t(err), errnoString(err));
       }
     }
 
@@ -160,7 +167,8 @@ private:
       ok = false;
       if (failureReport)
       {
-        failureReport->snprintf<"failed to close temporary blob {} errno={}({})"_ctv>(createdTempPath, errno, String(strerror(errno)));
+        int err = errno;
+        failureReport->snprintf<"failed to close temporary blob {} errno={itoa}({})"_ctv>(createdTempPath, uint64_t(err), errnoString(err));
       }
     }
 
@@ -171,7 +179,8 @@ private:
       ok = false;
       if (failureReport)
       {
-        failureReport->snprintf<"failed to rename temporary blob {} -> {} errno={}({})"_ctv>(createdTempPath, finalPath, errno, String(strerror(errno)));
+        int err = errno;
+        failureReport->snprintf<"failed to rename temporary blob {} -> {} errno={itoa}({})"_ctv>(createdTempPath, finalPath, uint64_t(err), errnoString(err));
       }
     }
 
@@ -298,7 +307,7 @@ private:
     {
       if (failureReport)
       {
-        failureReport->snprintf<"container blob size mismatch expected={} actual={}"_ctv>(*expectedBytes, payloadBytes);
+        failureReport->snprintf<"container blob size mismatch expected={itoa} actual={itoa}"_ctv>(*expectedBytes, payloadBytes);
       }
       return false;
     }

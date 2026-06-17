@@ -215,21 +215,6 @@ static inline bool mothershipParseDeploymentPlanTlsPolicy(
 
       policy.leafValidityDays = static_cast<uint32_t>(parsed);
     }
-    else if (key.equal("renewLeadPercent"_ctv))
-    {
-      int64_t parsed = 0;
-      if (subfield.value.type() != simdjson::dom::element_type::INT64 || subfield.value.get(parsed) != simdjson::SUCCESS || parsed <= 0 || parsed >= 100)
-      {
-        if (failure)
-        {
-          failure->assign("tls.renewLeadPercent must be in 1..99"_ctv);
-        }
-
-        return false;
-      }
-
-      policy.renewLeadPercent = static_cast<uint8_t>(parsed);
-    }
     else if (key.equal("identityNames"_ctv))
     {
       String context = {};
@@ -910,6 +895,46 @@ static inline bool mothershipParseSharedCPUOvercommitValue(
   return true;
 }
 
+static inline bool mothershipParseResourceReservationValue(
+    const simdjson::dom::element& value,
+    ProdigyMachineReservedResources& outResources,
+    String *failure = nullptr,
+    const String& fieldName = "resourceReservation"_ctv)
+{
+  if (failure)
+  {
+    failure->clear();
+  }
+
+  if (value.type() != simdjson::dom::element_type::STRING)
+  {
+    if (failure)
+    {
+      failure->snprintf<"{} requires production or smoke"_ctv>(fieldName);
+    }
+    return false;
+  }
+
+  String profile = {};
+  profile.setInvariant(value.get_c_str());
+  if (profile.equal("production"_ctv))
+  {
+    outResources = prodigyMachineReservedResources;
+    return true;
+  }
+  if (profile.equal("smoke"_ctv) || profile.equal("demo"_ctv) || profile.equal("dev"_ctv))
+  {
+    outResources = prodigySmokeMachineReservedResources;
+    return true;
+  }
+
+  if (failure)
+  {
+    failure->snprintf<"{} must be production or smoke"_ctv>(fieldName);
+  }
+  return false;
+}
+
 static inline bool mothershipParseWormholeQuicCidKeyRotationHours(
     const simdjson::dom::element& value,
     Wormhole& wormhole,
@@ -1187,6 +1212,165 @@ static inline bool mothershipParseWormholeDNSConfig(
       failure->assign("wormhole.dns requires bindingName or provider, credentialName, zone, name, and ttl"_ctv);
     }
     return false;
+  }
+
+  return true;
+}
+
+static inline bool mothershipParseWormholePublicTLSConfig(
+    const simdjson::dom::element& value,
+    WormholePublicTLSConfig& config,
+    bool& enabled,
+    String *failure = nullptr)
+{
+  config = WormholePublicTLSConfig();
+  enabled = false;
+  if (failure)
+  {
+    failure->clear();
+  }
+
+  if (value.type() == simdjson::dom::element_type::BOOL)
+  {
+    (void)value.get(enabled);
+    return true;
+  }
+
+  if (value.type() != simdjson::dom::element_type::OBJECT)
+  {
+    if (failure)
+    {
+      failure->assign("wormhole.publicTLS requires bool or document"_ctv);
+    }
+    return false;
+  }
+
+  enabled = true;
+  for (auto field : value.get_object())
+  {
+    String key = {};
+    key.setInvariant(field.key.data(), field.key.size());
+
+    auto parseString = [&](String& out, StringType auto&& message) -> bool {
+      if (field.value.type() != simdjson::dom::element_type::STRING)
+      {
+        if (failure)
+        {
+          failure->assign(message);
+        }
+        return false;
+      }
+      out.assign(field.value.get_c_str());
+      if (out.size() == 0)
+      {
+        if (failure)
+        {
+          failure->assign(message);
+        }
+        return false;
+      }
+      return true;
+    };
+
+    if (key.equal("enabled"_ctv))
+    {
+      if (field.value.type() != simdjson::dom::element_type::BOOL)
+      {
+        if (failure)
+        {
+          failure->assign("wormhole.publicTLS.enabled requires a bool"_ctv);
+        }
+        return false;
+      }
+      (void)field.value.get(enabled);
+    }
+    else if (key.equal("identityName"_ctv))
+    {
+      if (parseString(config.identityName, "wormhole.publicTLS.identityName requires a non-empty string"_ctv) == false)
+      {
+        return false;
+      }
+      if (prodigySafePathSegment(config.identityName) == false)
+      {
+        if (failure)
+        {
+          failure->assign("wormhole.publicTLS.identityName must be a safe path segment"_ctv);
+        }
+        return false;
+      }
+    }
+    else if (key.equal("issuer"_ctv))
+    {
+      if (parseString(config.issuer, "wormhole.publicTLS.issuer requires a non-empty string"_ctv) == false)
+      {
+        return false;
+      }
+      if (config.issuer.equal("letsencrypt"_ctv) == false)
+      {
+        if (failure)
+        {
+          failure->assign("wormhole.publicTLS.issuer must be letsencrypt"_ctv);
+        }
+        return false;
+      }
+    }
+    else if (key.equal("domains"_ctv))
+    {
+      String context = {};
+      context.assign("wormhole.publicTLS.domains"_ctv);
+      if (mothershipParseStringArray(field.value, config.domains, context, failure) == false)
+      {
+        return false;
+      }
+    }
+    else if (key.equal("keyType"_ctv))
+    {
+      if (parseString(config.keyType, "wormhole.publicTLS.keyType requires a non-empty string"_ctv) == false)
+      {
+        return false;
+      }
+      if (config.keyType.equal("ecdsa"_ctv) == false && config.keyType.equal("rsa"_ctv) == false)
+      {
+        if (failure)
+        {
+          failure->assign("wormhole.publicTLS.keyType must be ecdsa or rsa"_ctv);
+        }
+        return false;
+      }
+    }
+    else if (key.equal("staging"_ctv))
+    {
+      if (field.value.type() != simdjson::dom::element_type::BOOL)
+      {
+        if (failure)
+        {
+          failure->assign("wormhole.publicTLS.staging requires a bool"_ctv);
+        }
+        return false;
+      }
+      (void)field.value.get(config.staging);
+    }
+    else if (key.equal("renewAfterLifetimePermille"_ctv))
+    {
+      uint32_t parsed = 0;
+      if (mothershipParseJSONUInt32(field.value, parsed, false) == false || parsed >= 1000)
+      {
+        if (failure)
+        {
+          failure->assign("wormhole.publicTLS.renewAfterLifetimePermille must be in 1..999"_ctv);
+        }
+        return false;
+      }
+      config.renewAfterLifetimePermille = uint16_t(parsed);
+    }
+    else
+    {
+      if (failure)
+      {
+        failure->assign("wormhole.publicTLS invalid field"_ctv);
+      }
+      return false;
+    }
   }
 
   return true;

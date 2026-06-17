@@ -38,7 +38,7 @@ __attribute__((__always_inline__)) static inline bool whitehole_binding_lookup(_
   key.port = port;
   key.proto = proto;
 
-  struct switchboard_whitehole_binding *found = bpf_map_lookup_elem(&whitehole_bindings, &key);
+  struct switchboard_whitehole_binding *found = bpf_map_lookup_elem(&whiteholes, &key);
   if (found == NULL)
   {
     return false;

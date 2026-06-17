@@ -19,6 +19,7 @@ import {
    type ReactorSink,
    sameIPv6Address,
    type SubscriptionPairing,
+   type TlsIdentity,
 } from "../neuron_hub.ts"
 
 const EXCHANGE_COUNT = 3
@@ -43,6 +44,7 @@ class PairingDispatch extends DefaultDispatch
    readonly advertisementPairings: AdvertisementPairing[] = []
    readonly subscriptionPairings: SubscriptionPairing[] = []
    private readonly onPairingsChanged: () => void
+   private readonly tlsIdentities = new Map<string, TlsIdentity>()
    private pairingEvents = 0
    private resourceDeltaEvents = 0
    private credentialsRefreshEvents = 0
@@ -60,6 +62,11 @@ class PairingDispatch extends DefaultDispatch
       this.pairingEvents = 0
       this.resourceDeltaEvents = 0
       this.credentialsRefreshEvents = 0
+      this.tlsIdentities.clear()
+      for (const identity of parameters.credentialBundle?.tlsIdentities ?? [])
+      {
+         this.tlsIdentities.set(identity.name, identity)
+      }
       for (const pairing of parameters.advertisementPairings)
       {
          this.applyAdvertisementPairing(pairing)
@@ -102,8 +109,16 @@ class PairingDispatch extends DefaultDispatch
       this.publishStats(hub)
    }
 
-   override credentialsRefresh(hub: NeuronHub, _delta: CredentialDelta): void
+   override credentialsRefresh(hub: NeuronHub, delta: CredentialDelta): void
    {
+      for (const name of delta.removedTLSNames)
+      {
+         this.tlsIdentities.delete(name)
+      }
+      for (const identity of delta.updatedTLS)
+      {
+         this.tlsIdentities.set(identity.name, identity)
+      }
       this.credentialsRefreshEvents += 1
       hub.acknowledgeCredentialsRefresh()
       this.publishStats(hub)

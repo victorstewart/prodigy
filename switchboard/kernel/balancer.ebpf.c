@@ -67,7 +67,7 @@ __attribute__((__always_inline__)) static inline bool ownedRoutablePrefixesConta
       .addr = dest_ip,
   };
 
-  return bpf_map_lookup_elem(&owned_routable_prefixes4, &key) != NULL;
+  return bpf_map_lookup_elem(&owned_pfx4, &key) != NULL;
 }
 
 __attribute__((__always_inline__)) static inline bool ownedRoutablePrefixesContainIPv6(const __u32 dstv6[4])
@@ -77,7 +77,7 @@ __attribute__((__always_inline__)) static inline bool ownedRoutablePrefixesConta
   };
   bpf_memcpy(key.addr, dstv6, sizeof(key.addr));
 
-  return bpf_map_lookup_elem(&owned_routable_prefixes6, &key) != NULL;
+  return bpf_map_lookup_elem(&owned_pfx6, &key) != NULL;
 }
 
 __attribute__((__always_inline__)) static inline struct switchboard_overlay_machine_route *balancerLookupOverlayMachineRouteByFragment(__u32 machine_fragment)
@@ -91,7 +91,7 @@ __attribute__((__always_inline__)) static inline struct switchboard_overlay_mach
       .fragment = machine_fragment,
   };
 
-  struct switchboard_overlay_machine_route *route = bpf_map_lookup_elem(&overlay_machine_routes_full, &key);
+  struct switchboard_overlay_machine_route *route = bpf_map_lookup_elem(&ovl_mach_full, &key);
   if (route != NULL)
   {
     return route;
@@ -103,7 +103,7 @@ __attribute__((__always_inline__)) static inline struct switchboard_overlay_mach
     return NULL;
   }
 
-  return bpf_map_lookup_elem(&overlay_machine_routes_low8, &key);
+  return bpf_map_lookup_elem(&ovl_mach_low8, &key);
 }
 
 __attribute__((__always_inline__)) static inline struct switchboard_overlay_machine_route *balancerLookupOverlayMachineRouteForContainer(struct container_id *containerID)
@@ -124,11 +124,11 @@ struct
   __uint(max_entries, 16);
   __type(key, __u32);
   __type(value, __u64);
-} dev_fake_route_stats SEC(".maps");
+} dev_rt_stats SEC(".maps");
 
 __attribute__((__always_inline__)) static inline void bump_dev_fake_route_stat(__u32 index)
 {
-  __u64 *slot = bpf_map_lookup_elem(&dev_fake_route_stats, &index);
+  __u64 *slot = bpf_map_lookup_elem(&dev_rt_stats, &index);
   if (slot)
   {
     __sync_fetch_and_add(slot, 1);
@@ -235,15 +235,7 @@ __attribute__((__always_inline__)) static inline int process_l3_headers(struct p
     }
     else if (iph->protocol == IPPROTO_ICMP)
     {
-      __be32 subnet_mask = __constant_htonl(0xFF000000); // 255.0.0.0 in network byte order
-      __be32 subnet = __constant_htonl(0x0A000000); // 10.0.0.0 in network byte order
-
-      if ((iph->saddr & subnet_mask) == subnet) // within 10.0.0.0/8 so either came from another machine, or switch or router
-      {
-        return XDP_PASS; // pass to kernel
-      }
-
-      return XDP_DROP;
+      return XDP_PASS;
     }
     else
     {
@@ -296,7 +288,7 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
 
   if (whitehole_bound)
   {
-    struct switchboard_whitehole_binding *reply_binding = bpf_map_lookup_elem(&whitehole_reply_flows, &pckt.flow);
+    struct switchboard_whitehole_binding *reply_binding = bpf_map_lookup_elem(&white_replies, &pckt.flow);
     if (whitehole_binding_matches(&whitehole_binding, reply_binding) == false)
     {
       return XDP_DROP;
@@ -322,12 +314,12 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
   struct portal_meta *portal_meta = NULL;
   if (whitehole_bound == false)
   {
-    portal_meta = bpf_map_lookup_elem(&external_portals, &portal); // check if this is an open portal
+    portal_meta = bpf_map_lookup_elem(&ext_portals, &portal); // check if this is an open portal
   }
 
-  bool destination_is_owned_routable = is_ipv6 ? ownedRoutablePrefixesContainIPv6(pckt.flow.dstv6) : ownedRoutablePrefixesContainIPv4(pckt.flow.dst);
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-  struct local_container_subnet6 *localcontainersubnet6 = bpf_map_lookup_elem(&local_container_subnet_map, &zeroidx);
+  bool destination_is_owned_routable = is_ipv6 ? ownedRoutablePrefixesContainIPv6(pckt.flow.dstv6) : ownedRoutablePrefixesContainIPv4(pckt.flow.dst);
+  struct local_container_subnet6 *localcontainersubnet6 = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
   bool direct_fake_delivery = false;
 
   if (!portal_meta && !is_ipv6 && localcontainersubnet6 && destination_is_owned_routable)
@@ -348,10 +340,7 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
   }
 #endif
 
-  // Unknown public ingress fails closed. Unknown private/container/control traffic
-  // stays on the existing host path.
-
-  setCheckpoint("process_packet: checkpoint 1"); // they're being passed right here... which means a problem with the external_portals
+  setCheckpoint("process_packet: checkpoint 1"); // they're being passed right here... which means a problem with the ext_portals
 
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
   if (!portal_meta && !direct_fake_delivery && !whitehole_bound)
@@ -363,11 +352,6 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
     bump_dev_fake_route_stat(2);
 #endif
     setCheckpoint("process_packet: !portal_meta");
-    if (destination_is_owned_routable)
-    {
-      return XDP_DROP;
-    }
-
     return XDP_PASS;
   }
 
@@ -394,7 +378,7 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
     {
       setCheckpoint("process_packet: isQuic");
 
-      quic_route = parse_quic_route(portal_meta, data, data_end, is_ipv6, &pckt.flow);
+      parse_quic_route(&quic_route, portal_meta, data, data_end, is_ipv6, &pckt.flow);
       bpf_memcpy(&containerID, &quic_route.containerID, sizeof(struct container_id));
 
       if (containerID.hasID)
@@ -439,7 +423,7 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
   }
 
 #if !NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-  struct local_container_subnet6 *localcontainersubnet6 = bpf_map_lookup_elem(&local_container_subnet_map, &zeroidx);
+  struct local_container_subnet6 *localcontainersubnet6 = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
 #endif
 
   if (portal_meta != NULL && is_ipv6)
@@ -485,7 +469,7 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
     setCheckpoint("process_packet: checkpoint 6");
 
     // Same-machine delivery does not need overlay encapsulation. Keep the
-    // packet native and let host_ingress_router redirect it to the target
+    // packet native and let host_ingress redirect it to the target
     // container using the already-selected destination prefix/address.
     if (localDelivery)
     {
@@ -539,7 +523,7 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
 }
 
 SEC("xdp")
-int balancer_ingress(struct xdp_md *xdp)
+int bal_ingress(struct xdp_md *xdp)
 {
   logXDP(xdp);
 

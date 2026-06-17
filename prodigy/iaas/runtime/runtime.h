@@ -222,6 +222,11 @@ public:
     return providerDelegate ? providerDelegate->supportsAuthoritativeMachineSchemaCpuCapabilityInference() : bootstrapDelegate.supportsAuthoritativeMachineSchemaCpuCapabilityInference();
   }
 
+  bool preflightClusterCreate(const BrainIaaSClusterCreatePreflight& preflight, String& error) override
+  {
+    return activeDelegate()->preflightClusterCreate(preflight, error);
+  }
+
   void hardRebootMachine(uint128_t uuid) override
   {
     activeDelegate()->hardRebootMachine(uuid);
@@ -258,6 +263,7 @@ public:
                                     const String& requestedAddress,
                                     const String& providerPool,
                                     IPPrefix& assignedPrefix,
+                                    IPPrefix& deliveryPrefix,
                                     String& allocationID,
                                     String& associationID,
                                     bool& releaseOnRemove,
@@ -269,6 +275,7 @@ public:
                                                           requestedAddress,
                                                           providerPool,
                                                           assignedPrefix,
+                                                          deliveryPrefix,
                                                           allocationID,
                                                           associationID,
                                                           releaseOnRemove,

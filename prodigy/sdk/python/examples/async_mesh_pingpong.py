@@ -22,6 +22,7 @@ from prodigy_sdk import (
    ReactorEvent,
    ResourceDelta,
    SubscriptionPairing,
+   TlsIdentity,
 )
 
 PING_COUNT = 3
@@ -56,8 +57,11 @@ class MeshDispatch(DefaultDispatch):
       self.credentials_refresh_events = 0
       self._active_advertisements: dict[tuple[int, int, bytes], AdvertisementPairing] = {}
       self._active_subscriptions: dict[tuple[int, int, int, bytes], SubscriptionPairing] = {}
+      self._tls_identities: dict[str, TlsIdentity] = {}
 
    def seed(self, parameters: ContainerParameters) -> None:
+      if parameters.credential_bundle is not None:
+         self._tls_identities = {identity.name: identity for identity in parameters.credential_bundle.tls_identities}
       for pairing in parameters.advertisement_pairings:
          self._track_advertisement(pairing)
       for pairing in parameters.subscription_pairings:
@@ -87,7 +91,10 @@ class MeshDispatch(DefaultDispatch):
       self.publish_stats(hub)
 
    def credentials_refresh(self, hub: NeuronHub, delta: CredentialDelta) -> None:
-      del delta
+      for name in delta.removed_tls_names:
+         self._tls_identities.pop(name, None)
+      for identity in delta.updated_tls:
+         self._tls_identities[identity.name] = identity
       self.credentials_refresh_events += 1
       hub.acknowledge_credentials_refresh()
       self.publish_stats(hub)

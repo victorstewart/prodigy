@@ -51,7 +51,7 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
     }
 
     key.port = udph->source;
-    struct switchboard_wormhole_egress_binding *binding = bpf_map_lookup_elem(&wormhole_egress_bindings, &key);
+    struct switchboard_wormhole_egress_binding *binding = bpf_map_lookup_elem(&wh_egress, &key);
     if (binding == NULL)
     {
       setBufferOnPacket((__u8 *)"wormhole:udp_nomap", sizeof("wormhole:udp_nomap") - 1);
@@ -99,7 +99,7 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
     }
 
     key.port = tcph->source;
-    struct switchboard_wormhole_egress_binding *binding = bpf_map_lookup_elem(&wormhole_egress_bindings, &key);
+    struct switchboard_wormhole_egress_binding *binding = bpf_map_lookup_elem(&wh_egress, &key);
     if (binding == NULL)
     {
       setBufferOnPacket((__u8 *)"wormhole:tcp_nomap", sizeof("wormhole:tcp_nomap") - 1);
@@ -205,7 +205,7 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
   key.port = sourcePort;
   key.proto = proto;
 
-  struct switchboard_wormhole_egress_binding *binding = bpf_map_lookup_elem(&wormhole_egress_bindings4, &key);
+  struct switchboard_wormhole_egress_binding *binding = bpf_map_lookup_elem(&wh_egress4, &key);
   if (binding == NULL)
   {
     return false;
@@ -329,7 +329,7 @@ __attribute__((__always_inline__)) static inline int switchboardMaybeLearnWhiteh
 
   struct flow_key reverse = {};
   reverse_flow_key(&flow, &reverse);
-  bpf_map_update_elem(&whitehole_reply_flows, &reverse, &binding, BPF_ANY);
+  bpf_map_update_elem(&white_replies, &reverse, &binding, BPF_ANY);
   return TC_ACT_OK;
 }
 
@@ -381,7 +381,7 @@ __attribute__((__always_inline__)) static inline int switchboardMaybeLearnWhiteh
 
   struct flow_key reverse = {};
   reverse_flow_key(&flow, &reverse);
-  bpf_map_update_elem(&whitehole_reply_flows, &reverse, &binding, BPF_ANY);
+  bpf_map_update_elem(&white_replies, &reverse, &binding, BPF_ANY);
   return TC_ACT_OK;
 }
 

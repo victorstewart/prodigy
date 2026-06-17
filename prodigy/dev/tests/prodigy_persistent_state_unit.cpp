@@ -73,9 +73,11 @@ static void expectTransportCertificateBackdated(TestSuite& suite, const String& 
     return;
   }
 
+  std::tm notBeforeTM = {};
+  const bool parsedNotBefore = ASN1_TIME_to_tm(X509_get0_notBefore(cert), &notBeforeTM) == 1;
+  time_t notBefore = parsedNotBefore ? timegm(&notBeforeTM) : time_t(-1);
   time_t latestAllowedNotBefore = std::time(nullptr) - (ProdigyTransportTLSNotBeforeBackdateSeconds - 30);
-  int cmp = ASN1_TIME_cmp_time_t(X509_get0_notBefore(cert), latestAllowedNotBefore);
-  suite.expect(cmp != -2 && cmp <= 0, name);
+  suite.expect(parsedNotBefore && notBefore <= latestAllowedNotBefore, name);
   X509_free(cert);
 }
 
@@ -160,6 +162,28 @@ static bool equalMachineConfig(const MachineConfig& lhs, const MachineConfig& rh
   return lhs.kind == rhs.kind && lhs.slug.equals(rhs.slug) && lhs.nLogicalCores == rhs.nLogicalCores && lhs.nMemoryMB == rhs.nMemoryMB && lhs.nStorageMB == rhs.nStorageMB && lhs.vmImageURI.equals(rhs.vmImageURI) && lhs.gcpInstanceTemplate.equals(rhs.gcpInstanceTemplate) && lhs.gcpInstanceTemplateSpot.equals(rhs.gcpInstanceTemplateSpot) && lhs.providesHostPublic4 == rhs.providesHostPublic4 && lhs.providesHostPublic6 == rhs.providesHostPublic6;
 }
 
+static bool equalStringMap(const bytell_hash_map<String, String>& lhs, const bytell_hash_map<String, String>& rhs)
+{
+  if (lhs.size() != rhs.size())
+  {
+    return false;
+  }
+  for (const auto& [key, value] : lhs)
+  {
+    auto it = rhs.find(key);
+    if (it == rhs.end() || value.equals(it->second) == false)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool equalApiCredential(const ApiCredential& lhs, const ApiCredential& rhs)
+{
+  return lhs.name.equals(rhs.name) && lhs.provider.equals(rhs.provider) && lhs.generation == rhs.generation && lhs.expiresAtMs == rhs.expiresAtMs && lhs.activeFromMs == rhs.activeFromMs && lhs.sunsetAtMs == rhs.sunsetAtMs && lhs.material.equals(rhs.material) && equalStringMap(lhs.metadata, rhs.metadata);
+}
+
 static bool equalBrainConfigs(const BrainConfig& lhs, const BrainConfig& rhs)
 {
   auto equalOSUpdatePolicies = [](const Vector<OperatingSystemUpdatePolicy>& left, const Vector<OperatingSystemUpdatePolicy>& right) -> bool {
@@ -179,7 +203,7 @@ static bool equalBrainConfigs(const BrainConfig& lhs, const BrainConfig& rhs)
     return true;
   };
 
-  if (lhs.clusterUUID != rhs.clusterUUID || lhs.datacenterFragment != rhs.datacenterFragment || lhs.autoscaleIntervalSeconds != rhs.autoscaleIntervalSeconds || lhs.sharedCPUOvercommitPermille != rhs.sharedCPUOvercommitPermille || lhs.requiredBrainCount != rhs.requiredBrainCount || lhs.architecture != rhs.architecture || lhs.bootstrapSshUser.equals(rhs.bootstrapSshUser) == false || lhs.bootstrapSshKeyPackage != rhs.bootstrapSshKeyPackage || lhs.bootstrapSshHostKeyPackage != rhs.bootstrapSshHostKeyPackage || lhs.bootstrapSshPrivateKeyPath.equals(rhs.bootstrapSshPrivateKeyPath) == false || lhs.remoteProdigyPath.equals(rhs.remoteProdigyPath) == false || lhs.controlSocketPath.equals(rhs.controlSocketPath) == false || lhs.vmImageURI.equals(rhs.vmImageURI) == false || lhs.osUpdatesEnabled != rhs.osUpdatesEnabled || equalOSUpdatePolicies(lhs.osUpdatePolicies, rhs.osUpdatePolicies) == false || lhs.maxOSDrains != rhs.maxOSDrains || lhs.machineUpdateCadenceMins != rhs.machineUpdateCadenceMins || equalRuntimeEnvironment(lhs.runtimeEnvironment, rhs.runtimeEnvironment) == false || lhs.configBySlug.size() != rhs.configBySlug.size())
+  if (lhs.clusterUUID != rhs.clusterUUID || lhs.datacenterFragment != rhs.datacenterFragment || lhs.autoscaleIntervalSeconds != rhs.autoscaleIntervalSeconds || lhs.sharedCPUOvercommitPermille != rhs.sharedCPUOvercommitPermille || (lhs.machineReservedResources == rhs.machineReservedResources) == false || lhs.requiredBrainCount != rhs.requiredBrainCount || lhs.architecture != rhs.architecture || lhs.bootstrapSshUser.equals(rhs.bootstrapSshUser) == false || lhs.bootstrapSshKeyPackage != rhs.bootstrapSshKeyPackage || lhs.bootstrapSshHostKeyPackage != rhs.bootstrapSshHostKeyPackage || lhs.bootstrapSshPrivateKeyPath.equals(rhs.bootstrapSshPrivateKeyPath) == false || lhs.remoteProdigyPath.equals(rhs.remoteProdigyPath) == false || lhs.controlSocketPath.equals(rhs.controlSocketPath) == false || lhs.dnsProvider.equals(rhs.dnsProvider) == false || equalApiCredential(lhs.dnsCredential, rhs.dnsCredential) == false || (lhs.acme == rhs.acme) == false || lhs.vmImageURI.equals(rhs.vmImageURI) == false || lhs.osUpdatesEnabled != rhs.osUpdatesEnabled || equalOSUpdatePolicies(lhs.osUpdatePolicies, rhs.osUpdatePolicies) == false || lhs.maxOSDrains != rhs.maxOSDrains || lhs.machineUpdateCadenceMins != rhs.machineUpdateCadenceMins || equalRuntimeEnvironment(lhs.runtimeEnvironment, rhs.runtimeEnvironment) == false || lhs.configBySlug.size() != rhs.configBySlug.size())
   {
     return false;
   }
@@ -677,6 +701,7 @@ int main(void)
   storedSnapshot.brainConfig.clusterUUID = 0x3301;
   storedSnapshot.brainConfig.autoscaleIntervalSeconds = 91;
   storedSnapshot.brainConfig.sharedCPUOvercommitPermille = 1500;
+  storedSnapshot.brainConfig.machineReservedResources = prodigySmokeMachineReservedResources;
   storedSnapshot.brainConfig.requiredBrainCount = 3;
   storedSnapshot.brainConfig.architecture = MachineCpuArchitecture::x86_64;
   storedSnapshot.brainConfig.bootstrapSshUser = "root"_ctv;
@@ -792,7 +817,6 @@ int main(void)
   storedFactory.keySourceMode = 1;
   storedFactory.scheme = uint8_t(CryptoScheme::ed25519);
   storedFactory.defaultLeafValidityDays = 30;
-  storedFactory.renewLeadPercent = 15;
   storedFactory.createdAtMs = 123'456'700;
   storedFactory.updatedAtMs = 123'456'799;
   suite.expect(generateApplicationTlsFactory(storedFactory, parseFailure), "generate_application_tls_factory");
@@ -977,6 +1001,51 @@ int main(void)
   storedLease.dnsType.assign("A"_ctv);
   storedSnapshot.masterAuthority.runtimeState.routableResourceLeases.push_back(storedLease);
 
+  String publicTlsPrivateKeyNeedle = {};
+  publicTlsPrivateKeyNeedle.assign("public-tls-private-key-material"_ctv);
+  PublicTlsCertificateState storedPublicTls = {};
+  storedPublicTls.spec.applicationID = applicationID;
+  storedPublicTls.spec.deploymentID = storedPlan.config.deploymentID();
+  storedPublicTls.spec.wormholeName.assign("public-api-quic"_ctv);
+  storedPublicTls.spec.identityName.assign("public-api-quic-public"_ctv);
+  storedPublicTls.spec.domains.push_back("api.example.com"_ctv);
+  storedPublicTls.spec.issuer.assign("letsencrypt"_ctv);
+  storedPublicTls.spec.keyType.assign("ecdsa"_ctv);
+  storedPublicTls.spec.dnsProvider.assign("cloudflare"_ctv);
+  storedPublicTls.spec.dnsCredentialName.assign("prod-dns"_ctv);
+  storedPublicTls.spec.dnsZone.assign("example.com"_ctv);
+  storedPublicTls.spec.dnsTTL = 60;
+  storedPublicTls.identity.name.assign("public-api-quic-public"_ctv);
+  storedPublicTls.identity.generation = 5;
+  storedPublicTls.identity.notBeforeMs = 1'700'000'000'000;
+  storedPublicTls.identity.notAfterMs = 1'700'086'400'000;
+  storedPublicTls.identity.certPem.assign("public-cert-pem"_ctv);
+  storedPublicTls.identity.keyPem = publicTlsPrivateKeyNeedle;
+  storedPublicTls.identity.chainPem.assign("public-chain-pem"_ctv);
+  storedPublicTls.identity.dnsSans.push_back("api.example.com"_ctv);
+  storedPublicTls.certbotCertName.assign("app-public-api-quic"_ctv);
+  storedPublicTls.lineagePath.assign("/var/lib/prodigy/certbot/cluster/config/live/app-public-api-quic"_ctv);
+  storedPublicTls.generation = 5;
+  storedPublicTls.nextRenewAtMs = prodigyCertificateRenewAtMs(storedPublicTls.identity.notBeforeMs, storedPublicTls.identity.notAfterMs, storedPublicTls.spec.renewAfterLifetimePermille);
+  storedPublicTls.lastAttemptMs = 1'700'010'000'000;
+  storedPublicTls.lastSuccessMs = 1'700'010'001'000;
+  storedSnapshot.masterAuthority.runtimeState.publicTlsCertificates.push_back(storedPublicTls);
+
+  PrivateTlsVaultLifecycleState storedPrivateLifecycle = {};
+  storedPrivateLifecycle.applicationID = applicationID;
+  storedPrivateLifecycle.factoryGeneration = storedFactory.factoryGeneration;
+  storedPrivateLifecycle.rootNotBeforeMs = 1'700'000'000'000;
+  storedPrivateLifecycle.rootNotAfterMs = 1'725'920'000'000;
+  storedPrivateLifecycle.intermediateNotBeforeMs = 1'700'000'000'000;
+  storedPrivateLifecycle.intermediateNotAfterMs = 1'708'640'000'000;
+  storedPrivateLifecycle.leafNotBeforeMs = 1'700'000'000'000;
+  storedPrivateLifecycle.leafNotAfterMs = 1'701'296'000'000;
+  storedPrivateLifecycle.leafNextRenewAtMs = prodigyCertificateRenewAtMs(storedPrivateLifecycle.leafNotBeforeMs, storedPrivateLifecycle.leafNotAfterMs, prodigyDefaultCertificateRenewAfterLifetimePermille);
+  storedPrivateLifecycle.nextRenewAtMs = prodigyEarliestPositiveMs(
+      prodigyCertificateRenewAtMs(storedPrivateLifecycle.intermediateNotBeforeMs, storedPrivateLifecycle.intermediateNotAfterMs, prodigyDefaultCertificateRenewAfterLifetimePermille),
+      storedPrivateLifecycle.leafNextRenewAtMs);
+  storedSnapshot.masterAuthority.runtimeState.privateTlsVaultLifecycles.push_back(storedPrivateLifecycle);
+
   ProdigyMetricSample metricA = {};
   metricA.ms = 1'700'000'001'000;
   metricA.deploymentID = storedPlan.config.deploymentID();
@@ -1100,6 +1169,16 @@ int main(void)
         suite.expect(secretCredentialIt->second.credentials[0].material.equals(storedCredential.material), "extract_snapshot_secrets_captures_api_credential_value");
       }
     }
+
+    suite.expect(
+        publicSnapshot.masterAuthority.runtimeState.publicTlsCertificates.size() == 1 &&
+            publicSnapshot.masterAuthority.runtimeState.publicTlsCertificates[0].identity.keyPem.size() == 0,
+        "extract_snapshot_secrets_scrubs_public_tls_key");
+    suite.expect(
+        extractedSecrets.publicTlsCertificateSecrets.size() == 1 &&
+            extractedSecrets.publicTlsCertificateSecrets[0].identityName.equals(storedPublicTls.identity.name) &&
+            extractedSecrets.publicTlsCertificateSecrets[0].keyPem.equals(publicTlsPrivateKeyNeedle),
+        "extract_snapshot_secrets_captures_public_tls_key");
   }
 
   String localBrainStateJSON = {};
@@ -1197,6 +1276,14 @@ int main(void)
     suite.expect(
         loadedSnapshot.masterAuthority.runtimeState.routableResourceLeases.size() == 1 && loadedSnapshot.masterAuthority.runtimeState.routableResourceLeases[0] == storedLease,
         "load_snapshot_restores_routable_resource_lease");
+    suite.expect(
+        loadedSnapshot.masterAuthority.runtimeState.publicTlsCertificates.size() == 1 &&
+            prodigyPublicTlsCertificateStatesEqual(loadedSnapshot.masterAuthority.runtimeState.publicTlsCertificates[0], storedPublicTls),
+        "load_snapshot_restores_public_tls_certificate_state");
+    suite.expect(
+        loadedSnapshot.masterAuthority.runtimeState.privateTlsVaultLifecycles.size() == 1 &&
+            prodigyPrivateTlsVaultLifecycleStatesEqual(loadedSnapshot.masterAuthority.runtimeState.privateTlsVaultLifecycles[0], storedPrivateLifecycle),
+        "load_snapshot_restores_private_tls_lifecycle_state");
     suite.expect(loadedSnapshot.brainConfig.runtimeEnvironment.providerCredentialMaterial.size() == 0, "load_snapshot_scrubs_provider_credential");
     suite.expect(loadedSnapshot.brainConfig.runtimeEnvironment.aws.bootstrapCredentialRefreshCommand.size() == 0, "load_snapshot_scrubs_refresh_command");
 
@@ -1445,12 +1532,17 @@ int main(void)
     suite.expect(stringContains(rawPublicSnapshotRecord, storedLocalBrainState.transportTLS.clusterRootKeyPem) == false, "raw_public_snapshot_record_scrubs_transport_root_key");
     suite.expect(stringContains(rawPublicSnapshotRecord, pendingAddMachinesOperation.request.bootstrapSshKeyPackage.privateKeyOpenSSH) == false, "raw_public_snapshot_record_scrubs_pending_bootstrap_private_key");
     suite.expect(stringContains(rawPublicSnapshotRecord, resumptionMasterSecretNeedle) == false, "raw_public_snapshot_record_scrubs_tls_resumption_master_secret");
+    suite.expect(stringContains(rawPublicSnapshotRecord, publicTlsPrivateKeyNeedle) == false, "raw_public_snapshot_record_scrubs_public_tls_private_key");
     auto publicResumptionSnapshotIt = storedSnapshotRecord.state.masterAuthority.runtimeState.tlsResumptionSnapshotsByWormhole.find(resumptionRegistryKey);
     suite.expect(
         publicResumptionSnapshotIt != storedSnapshotRecord.state.masterAuthority.runtimeState.tlsResumptionSnapshotsByWormhole.end() &&
             publicResumptionSnapshotIt->second.keyRing.size() == 1 &&
             prodigyPersistentSecretBytesAreZero(publicResumptionSnapshotIt->second.keyRing[0].masterSecret, sizeof(publicResumptionSnapshotIt->second.keyRing[0].masterSecret)),
         "raw_public_snapshot_record_zeroes_tls_resumption_master_secret");
+    suite.expect(
+        storedSnapshotRecord.state.masterAuthority.runtimeState.publicTlsCertificates.size() == 1 &&
+            storedSnapshotRecord.state.masterAuthority.runtimeState.publicTlsCertificates[0].identity.keyPem.size() == 0,
+        "raw_public_snapshot_record_zeroes_public_tls_private_key");
 
     String snapshotSecretKey = {};
     prodigyBuildPersistentSecretRecordKey("snapshot", storedSnapshotRecord.secretVersion, snapshotSecretKey);
@@ -1465,6 +1557,7 @@ int main(void)
     suite.expect(stringContains(rawSnapshotSecretRecord, storedLocalBrainState.transportTLS.clusterRootKeyPem), "raw_snapshot_secret_record_keeps_transport_root_key");
     suite.expect(stringContains(rawSnapshotSecretRecord, pendingAddMachinesOperation.request.bootstrapSshKeyPackage.privateKeyOpenSSH), "raw_snapshot_secret_record_keeps_pending_bootstrap_private_key");
     suite.expect(stringContains(rawSnapshotSecretRecord, resumptionMasterSecretNeedle), "raw_snapshot_secret_record_keeps_tls_resumption_master_secret");
+    suite.expect(stringContains(rawSnapshotSecretRecord, publicTlsPrivateKeyNeedle), "raw_snapshot_secret_record_keeps_public_tls_private_key");
 
     String rawPublicLocalBrainStateRecord = {};
     suite.expect(readRawTidesDBRecord(dbPath, "brain"_ctv, "local_brain_state"_ctv, rawPublicLocalBrainStateRecord, &failure), "read_raw_public_local_brain_state_record");

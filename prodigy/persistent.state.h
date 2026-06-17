@@ -651,7 +651,7 @@ static inline void renderProdigyPersistentLocalBrainStateJSON(const ProdigyPersi
   if (state.transportTLS.clusterRootCertPem.size() > 0 || state.transportTLS.clusterRootKeyPem.size() > 0 || state.transportTLS.localCertPem.size() > 0 || state.transportTLS.localKeyPem.size() > 0 || state.transportTLS.generation > 0)
   {
     json.append(",\"generation\":"_ctv);
-    json.append(String(state.transportTLS.generation));
+    json.snprintf_add<"{itoa}"_ctv>(state.transportTLS.generation);
 
     json.append(",\"clusterRootCertPem\":"_ctv);
     appendEscapedJSONString(json, state.transportTLS.clusterRootCertPem);
@@ -1753,7 +1753,7 @@ static inline void renderProdigyPersistentBootStateJSON(const ProdigyPersistentB
       if (runtimeEnvironment.bgp.config.community != 0)
       {
         json.append(",\"community\":"_ctv);
-        json.append(String(runtimeEnvironment.bgp.config.community));
+        json.snprintf_add<"{itoa}"_ctv>(runtimeEnvironment.bgp.config.community);
       }
 
       if (runtimeEnvironment.bgp.config.nextHop4.isNull() == false)
@@ -1788,7 +1788,7 @@ static inline void renderProdigyPersistentBootStateJSON(const ProdigyPersistentB
 
           const NeuronBGPPeerConfig& peer = runtimeEnvironment.bgp.config.peers[index];
           json.append("{\"peerASN\":"_ctv);
-          json.append(String(uint32_t(peer.peerASN)));
+          json.snprintf_add<"{itoa}"_ctv>(uint32_t(peer.peerASN));
 
           String peerAddress = {};
           if (prodigyRenderIPAddressText(peer.peerAddress, peerAddress))
@@ -1813,7 +1813,7 @@ static inline void renderProdigyPersistentBootStateJSON(const ProdigyPersistentB
           if (peer.hopLimit > 0)
           {
             json.append(",\"hopLimit\":"_ctv);
-            json.append(String(uint32_t(peer.hopLimit)));
+            json.snprintf_add<"{itoa}"_ctv>(uint32_t(peer.hopLimit));
           }
 
           json.append("}"_ctv);
@@ -1858,7 +1858,7 @@ static inline void prodigyBuildPersistentSecretRecordKey(const char *baseKey, ui
 {
   key.assign(baseKey);
   key.append("#"_ctv);
-  key.append(String(version));
+  key.snprintf_add<"{itoa}"_ctv>(version);
 }
 
 static inline void prodigyClearPersistentSecretString(String& value)
@@ -2076,6 +2076,27 @@ static void serialize(S&& serializer, ProdigyPersistentTlsResumptionEpochSecret&
   }
 }
 
+class ProdigyPersistentPublicTlsCertificateSecret {
+public:
+
+  String identityName;
+  uint64_t generation = 0;
+  String keyPem;
+
+  void clear(void)
+  {
+    prodigyClearPersistentSecretString(keyPem);
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyPersistentPublicTlsCertificateSecret& secret)
+{
+  serializer.text1b(secret.identityName, UINT32_MAX);
+  serializer.value8b(secret.generation);
+  serializer.text1b(secret.keyPem, UINT32_MAX);
+}
+
 class ProdigyPersistentPendingAddMachinesOperationSecrets {
 public:
 
@@ -2113,12 +2134,13 @@ public:
   bytell_hash_map<uint16_t, ProdigyPersistentApplicationTlsVaultFactorySecrets> tlsVaultFactorySecretsByApp;
   bytell_hash_map<uint16_t, ProdigyPersistentApplicationApiCredentialSetSecrets> apiCredentialSecretsByApp;
   Vector<ProdigyPersistentTlsResumptionEpochSecret> tlsResumptionEpochSecrets;
+  Vector<ProdigyPersistentPublicTlsCertificateSecret> publicTlsCertificateSecrets;
   String transportTLSAuthorityClusterRootKeyPem;
   Vector<ProdigyPersistentPendingAddMachinesOperationSecrets> pendingAddMachinesOperationSecrets;
 
   bool empty(void) const
   {
-    return bootstrapSshPrivateKeyOpenSSH.size() == 0 && bootstrapSshHostPrivateKeyOpenSSH.size() == 0 && reporterPassword.size() == 0 && dnsCredentialMaterial.size() == 0 && tlsVaultFactorySecretsByApp.empty() && apiCredentialSecretsByApp.empty() && tlsResumptionEpochSecrets.empty() && transportTLSAuthorityClusterRootKeyPem.size() == 0 && pendingAddMachinesOperationSecrets.empty();
+    return bootstrapSshPrivateKeyOpenSSH.size() == 0 && bootstrapSshHostPrivateKeyOpenSSH.size() == 0 && reporterPassword.size() == 0 && dnsCredentialMaterial.size() == 0 && tlsVaultFactorySecretsByApp.empty() && apiCredentialSecretsByApp.empty() && tlsResumptionEpochSecrets.empty() && publicTlsCertificateSecrets.empty() && transportTLSAuthorityClusterRootKeyPem.size() == 0 && pendingAddMachinesOperationSecrets.empty();
   }
 
   void clear(void)
@@ -2146,6 +2168,11 @@ public:
       epochSecret.clear();
     }
 
+    for (auto& certificateSecret : publicTlsCertificateSecrets)
+    {
+      certificateSecret.clear();
+    }
+
     for (auto& operationSecrets : pendingAddMachinesOperationSecrets)
     {
       operationSecrets.clear();
@@ -2154,6 +2181,7 @@ public:
     tlsVaultFactorySecretsByApp.clear();
     apiCredentialSecretsByApp.clear();
     tlsResumptionEpochSecrets.clear();
+    publicTlsCertificateSecrets.clear();
     pendingAddMachinesOperationSecrets.clear();
   }
 };
@@ -2168,6 +2196,7 @@ static void serialize(S&& serializer, ProdigyPersistentBrainSnapshotSecrets& sec
   serializer.object(secrets.tlsVaultFactorySecretsByApp);
   serializer.object(secrets.apiCredentialSecretsByApp);
   serializer.object(secrets.tlsResumptionEpochSecrets);
+  serializer.object(secrets.publicTlsCertificateSecrets);
   serializer.text1b(secrets.transportTLSAuthorityClusterRootKeyPem, UINT32_MAX);
   serializer.object(secrets.pendingAddMachinesOperationSecrets);
 }
@@ -2294,6 +2323,20 @@ static inline void prodigyExtractPersistentBrainSnapshotSecrets(
     }
   }
 
+  for (PublicTlsCertificateState& certificate : publicSnapshot.masterAuthority.runtimeState.publicTlsCertificates)
+  {
+    if (certificate.identity.keyPem.size() > 0)
+    {
+      ProdigyPersistentPublicTlsCertificateSecret certificateSecret = {};
+      certificateSecret.identityName = certificate.identity.name;
+      certificateSecret.generation = certificate.identity.generation;
+      certificateSecret.keyPem = certificate.identity.keyPem;
+      secrets.publicTlsCertificateSecrets.push_back(certificateSecret);
+    }
+
+    prodigyClearPersistentSecretString(certificate.identity.keyPem);
+  }
+
   secrets.transportTLSAuthorityClusterRootKeyPem = publicSnapshot.masterAuthority.runtimeState.transportTLSAuthority.clusterRootKeyPem;
   prodigyClearPersistentSecretString(publicSnapshot.masterAuthority.runtimeState.transportTLSAuthority.clusterRootKeyPem);
 
@@ -2336,7 +2379,7 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
     {
       if (failure)
       {
-        failure->snprintf<"persistent brain snapshot tls factory secrets missing app {}"_ctv>(String(applicationID));
+        failure->snprintf<"persistent brain snapshot tls factory secrets missing app {itoa}"_ctv>(applicationID);
       }
       return false;
     }
@@ -2352,7 +2395,7 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
     {
       if (failure)
       {
-        failure->snprintf<"persistent brain snapshot api credential secrets missing app {}"_ctv>(String(applicationID));
+        failure->snprintf<"persistent brain snapshot api credential secrets missing app {itoa}"_ctv>(applicationID);
       }
       return false;
     }
@@ -2409,8 +2452,32 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
     {
       if (failure)
       {
-        failure->snprintf<"persistent brain snapshot resumption secret missing epoch {}"_ctv>(
-            String(epochSecret.generation));
+        failure->snprintf<"persistent brain snapshot resumption secret missing epoch {itoa}"_ctv>(
+            epochSecret.generation);
+      }
+      return false;
+    }
+  }
+
+  for (const ProdigyPersistentPublicTlsCertificateSecret& certificateSecret : secrets.publicTlsCertificateSecrets)
+  {
+    bool matched = false;
+    for (PublicTlsCertificateState& certificate : snapshot.masterAuthority.runtimeState.publicTlsCertificates)
+    {
+      if (certificate.identity.name.equals(certificateSecret.identityName) && certificate.identity.generation == certificateSecret.generation)
+      {
+        certificate.identity.keyPem = certificateSecret.keyPem;
+        matched = true;
+        break;
+      }
+    }
+
+    if (matched == false)
+    {
+      if (failure)
+      {
+        failure->snprintf<"persistent brain snapshot public tls secret missing certificate {}"_ctv>(
+            certificateSecret.identityName);
       }
       return false;
     }
@@ -2436,8 +2503,8 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
     {
       if (failure)
       {
-        failure->snprintf<"persistent brain snapshot add-machines secrets missing operation {}"_ctv>(
-            String(operationSecrets.operationID));
+        failure->snprintf<"persistent brain snapshot add-machines secrets missing operation {itoa}"_ctv>(
+            operationSecrets.operationID);
       }
       return false;
     }

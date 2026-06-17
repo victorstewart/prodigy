@@ -98,6 +98,15 @@ public:
     (void)containerUUID;
   }
 
+  virtual void reportContainerFailed(uint128_t containerUUID, int64_t failureTimeMs, int terminalSignal, const String& crashReport, bool restart)
+  {
+    (void)containerUUID;
+    (void)failureTimeMs;
+    (void)terminalSignal;
+    (void)crashReport;
+    (void)restart;
+  }
+
   virtual void refreshContainerSwitchboardWormholes(Container *container)
   {
     (void)container;

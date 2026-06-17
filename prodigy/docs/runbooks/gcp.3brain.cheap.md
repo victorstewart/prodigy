@@ -23,9 +23,35 @@ Keep early test runs short. Instances, disks, static IPs, templates, and VPC res
 Bootstrap identity:
 
 ```text
-roles/compute.instanceAdmin.v1 on the target project or constrained scope
+roles/compute.instanceAdmin.v1 on the target project
 roles/iam.serviceAccountUser on the runtime service account
 ```
+
+`createCluster` preflight checks the bootstrap identity for these project permissions and reports every missing permission returned by GCP:
+
+```text
+compute.disks.create
+compute.disks.delete
+compute.instanceTemplates.create
+compute.instanceTemplates.delete
+compute.instanceTemplates.get
+compute.instanceTemplates.useReadOnly
+compute.instances.create
+compute.instances.delete
+compute.instances.get
+compute.instances.list
+compute.instances.setLabels
+compute.instances.setMetadata
+compute.instances.setServiceAccount
+compute.machineTypes.get
+compute.networks.get
+compute.subnetworks.get
+compute.subnetworks.use
+compute.subnetworks.useExternalIp
+compute.zones.get
+```
+
+It also checks `iam.serviceAccounts.actAs` on `gcp.serviceAccountEmail`.
 
 Runtime service account:
 

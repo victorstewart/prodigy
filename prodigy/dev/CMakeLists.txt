@@ -177,6 +177,8 @@ set(PRODIGY_SDK_ENABLE_TESTS OFF CACHE BOOL "Disable standalone SDK tests when e
 add_subdirectory("${PRODIGY_ROOT}/prodigy/sdk" "${CMAKE_BINARY_DIR}/sdk")
 
 find_program(PRODIGY_CLANG_EXECUTABLE clang REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+find_program(PRODIGY_TAR_EXECUTABLE tar REQUIRED)
 
 set(PRODIGY_BUNDLED_FIO_BIN "" CACHE FILEPATH "Path to fio binary bundled with Prodigy")
 set(PRODIGY_BUNDLED_IPERF3_BIN "" CACHE FILEPATH "Path to iperf3 binary bundled with Prodigy")
@@ -186,6 +188,8 @@ set(PRODIGY_BUNDLED_BW_MEM_BIN "" CACHE FILEPATH "Path to lmbench bw_mem binary 
 set(PRODIGY_BUNDLED_SPEEDTEST_BIN "" CACHE FILEPATH "Path to official Ookla speedtest binary bundled with Prodigy")
 set(PRODIGY_BUNDLED_SPEEDTEST_VERSION "1.2.0" CACHE STRING "Pinned official Ookla Speedtest CLI version used for bundle auto-download")
 set(PRODIGY_BUNDLED_SPEEDTEST_DOWNLOAD_URL "" CACHE STRING "Override URL for the official Ookla Speedtest CLI archive")
+set(PRODIGY_BUNDLED_CERTBOT_VERSION "5.6.0" CACHE STRING "Certbot version bundled with Prodigy")
+set(PRODIGY_BUNDLED_CERTBOT_WHEELHOUSE "" CACHE FILEPATH "Optional prebuilt Certbot wheelhouse tar.zst")
 
 function(prodigy_resolve_bundled_program output_var command_name cache_help)
    if (${output_var} STREQUAL "")
@@ -368,6 +372,32 @@ prodigy_resolve_bundled_program(PRODIGY_BUNDLED_LAT_MEM_RD_BIN lat_mem_rd "Path 
 prodigy_resolve_bundled_program(PRODIGY_BUNDLED_BW_MEM_BIN bw_mem "Path to lmbench bw_mem binary bundled with Prodigy")
 prodigy_resolve_official_speedtest(PRODIGY_BUNDLED_SPEEDTEST_BIN "Path to official Ookla speedtest binary bundled with Prodigy")
 
+set(PRODIGY_CERTBOT_WHEELHOUSE_OUTPUT "${CMAKE_BINARY_DIR}/prodigy.certbot-${PRODIGY_BUNDLED_CERTBOT_VERSION}.wheelhouse.tar.zst")
+set(PRODIGY_CERTBOT_WHEELHOUSE_DIR "${CMAKE_BINARY_DIR}/certbot-wheelhouse")
+set(PRODIGY_CERTBOT_WHEELHOUSE_VENV "${CMAKE_BINARY_DIR}/certbot-wheelhouse-venv")
+if (PRODIGY_BUNDLED_CERTBOT_WHEELHOUSE STREQUAL "")
+   add_custom_command(
+      OUTPUT "${PRODIGY_CERTBOT_WHEELHOUSE_OUTPUT}"
+      COMMAND "${CMAKE_COMMAND}" -E rm -rf "${PRODIGY_CERTBOT_WHEELHOUSE_DIR}" "${PRODIGY_CERTBOT_WHEELHOUSE_VENV}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory "${PRODIGY_CERTBOT_WHEELHOUSE_DIR}"
+      COMMAND "${Python3_EXECUTABLE}" -m venv "${PRODIGY_CERTBOT_WHEELHOUSE_VENV}"
+      COMMAND "${PRODIGY_CERTBOT_WHEELHOUSE_VENV}/bin/python" -m ensurepip --upgrade
+      COMMAND "${PRODIGY_CERTBOT_WHEELHOUSE_VENV}/bin/python" -m pip install --upgrade pip
+      COMMAND /bin/sh -c "for py in 310 311 312 313 314; do '${PRODIGY_CERTBOT_WHEELHOUSE_VENV}/bin/python' -m pip download --only-binary=:all: --platform manylinux_2_34_x86_64 --platform manylinux2014_x86_64 --implementation cp --python-version $py --abi cp$py --abi abi3 --abi none --dest '${PRODIGY_CERTBOT_WHEELHOUSE_DIR}' 'certbot==${PRODIGY_BUNDLED_CERTBOT_VERSION}' 'typing-extensions>=4.9'; done"
+      COMMAND "${PRODIGY_TAR_EXECUTABLE}" --zstd -cf "${PRODIGY_CERTBOT_WHEELHOUSE_OUTPUT}" -C "${PRODIGY_CERTBOT_WHEELHOUSE_DIR}" .
+      COMMENT "Building Certbot ${PRODIGY_BUNDLED_CERTBOT_VERSION} wheelhouse"
+      VERBATIM
+   )
+else()
+   add_custom_command(
+      OUTPUT "${PRODIGY_CERTBOT_WHEELHOUSE_OUTPUT}"
+      COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${PRODIGY_BUNDLED_CERTBOT_WHEELHOUSE}" "${PRODIGY_CERTBOT_WHEELHOUSE_OUTPUT}"
+      DEPENDS "${PRODIGY_BUNDLED_CERTBOT_WHEELHOUSE}"
+      COMMENT "Using configured Certbot wheelhouse"
+      VERBATIM
+   )
+endif()
+
 set(PRODIGY_BUNDLED_TOOL_BINARIES
    "${PRODIGY_BUNDLED_FIO_BIN}"
    "${PRODIGY_BUNDLED_IPERF3_BIN}"
@@ -382,6 +412,12 @@ set(DISCOMBOBULATOR_CARGO_LOCK "${PRODIGY_ROOT}/prodigy/discombobulator/Cargo.lo
 set(DISCOMBOBULATOR_CARGO_TARGET_DIR "${CMAKE_BINARY_DIR}/discombobulator-target")
 file(GLOB DISCOMBOBULATOR_SOURCE_FILES CONFIGURE_DEPENDS
    "${PRODIGY_ROOT}/prodigy/discombobulator/src/*.rs")
+set(PRODIGY_ACME_HOOK_SCRIPTS
+   "${PRODIGY_ROOT}/prodigy/acme/acme-present-dns-01"
+   "${PRODIGY_ROOT}/prodigy/acme/acme-cleanup-dns-01"
+   "${PRODIGY_ROOT}/prodigy/acme/acme-import-lineage"
+)
+install(PROGRAMS ${PRODIGY_ACME_HOOK_SCRIPTS} DESTINATION lib/prodigy)
 
 add_executable(prodigy ${PRODIGY_ROOT}/prodigy/prodigy.cpp)
 add_executable(mothership ${PRODIGY_ROOT}/prodigy/mothership/mothership.cpp)
@@ -395,6 +431,7 @@ add_executable(prodigy_whitehole_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tes
 add_executable(prodigy_quic_wormhole_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/quic_wormhole_probe_container.cpp)
 add_executable(prodigy_wormhole_matrix_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/wormhole_matrix_probe_container.cpp)
 add_executable(prodigy_resumption_readiness_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/resumption_readiness_probe_container.cpp)
+add_executable(prodigy_public_tls_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/public_tls_probe_container.cpp)
 set(
    PRODIGY_RUNTIME_CONTAINER_PROBE_TARGETS
    prodigy_pingpong_container
@@ -406,6 +443,7 @@ set(
    prodigy_quic_wormhole_probe_container
    prodigy_wormhole_matrix_probe_container
    prodigy_resumption_readiness_probe_container
+   prodigy_public_tls_probe_container
 )
 add_executable(prodigy_gpu_device_mount_smoke ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_gpu_device_mount_smoke.cpp)
 add_executable(prodigy_shared_cpu_affinity_seccomp_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_shared_cpu_affinity_seccomp_unit.cpp)
@@ -586,6 +624,7 @@ endif()
 target_link_libraries(prodigy_sdk_c_selftest PRIVATE Prodigy::SdkC)
 target_link_libraries(prodigy_sdk_cpp_unit PRIVATE Prodigy::SdkCppOpinionated)
 target_link_libraries(prodigy_resumption_readiness_probe_container PRIVATE picoquic::picoquic)
+target_link_libraries(prodigy_public_tls_probe_container PRIVATE openssl::ssl openssl::crypto)
 target_include_directories(prodigy_resumption_readiness_probe_container PRIVATE "${PRODIGY_ROOT}/.depos/.root/downloads/picoquic/release/master-6a14757/src/picoquic")
 
 set(PRODIGY_PTHREAD_TARGETS ${PRODIGY_ALL_BUILD_TARGETS})
@@ -613,7 +652,7 @@ target_compile_definitions(prodigy_wire_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_sdk_c_selftest PUBLIC PRODIGY_SDK_FIXTURES_DIR="${PRODIGY_ROOT}/prodigy/sdk/fixtures")
 target_compile_definitions(prodigy_sdk_cpp_unit PUBLIC PRODIGY_DEBUG=1 PRODIGY_SDK_FIXTURE_DIR="${PRODIGY_ROOT}/prodigy/sdk/fixtures")
 target_compile_definitions(prodigy_mesh_unit PUBLIC PRODIGY_DEBUG=1)
-target_compile_definitions(prodigy_deployments_unit PUBLIC PRODIGY_DEBUG=1)
+target_compile_definitions(prodigy_deployments_unit PUBLIC PRODIGY_DEBUG=1 PRODIGY_ACME_HOOKS_DIR="${PRODIGY_ROOT}/prodigy/acme")
 target_compile_definitions(prodigy_ring_recvmsg_multishot_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_brain_config_ssh_replication_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_brain_replication_credentials_unit PUBLIC PRODIGY_DEBUG=1)
@@ -640,6 +679,7 @@ target_compile_options(prodigy_whitehole_probe_container PUBLIC -O2)
 target_compile_options(prodigy_quic_wormhole_probe_container PUBLIC -O2)
 target_compile_options(prodigy_wormhole_matrix_probe_container PUBLIC -O2)
 target_compile_options(prodigy_resumption_readiness_probe_container PUBLIC -O2)
+target_compile_options(prodigy_public_tls_probe_container PUBLIC -O2)
 target_compile_options(prodigy_gpu_device_mount_smoke PUBLIC -O2)
 target_compile_options(prodigy_shared_cpu_affinity_seccomp_unit PUBLIC -O2)
 target_compile_options(prodigy_metrics_unit PUBLIC -O2)
@@ -692,16 +732,19 @@ target_compile_options(prodigy_mothership_test_cluster_runner_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_provider_credential_registry_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_provider_machine_destroy_unit PUBLIC -O2)
 if (PRODIGY_ENABLE_FUZZ_TESTS)
-   target_compile_options(prodigy_pairing_parser_fuzz PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=fuzzer,address)
-   target_link_options(prodigy_pairing_parser_fuzz PRIVATE -fsanitize=fuzzer,address)
-   target_compile_options(prodigy_mothership_topic_fuzz PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=fuzzer,address)
-   target_link_options(prodigy_mothership_topic_fuzz PRIVATE -fsanitize=fuzzer,address)
-   target_compile_options(prodigy_brain_topic_fuzz PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=fuzzer,address)
-   target_link_options(prodigy_brain_topic_fuzz PRIVATE -fsanitize=fuzzer,address)
-   target_compile_options(prodigy_neuron_topic_fuzz PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=fuzzer,address)
-   target_link_options(prodigy_neuron_topic_fuzz PRIVATE -fsanitize=fuzzer,address)
-   target_compile_options(prodigy_container_topic_fuzz PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=fuzzer,address)
-   target_link_options(prodigy_container_topic_fuzz PRIVATE -fsanitize=fuzzer,address)
+   set(PRODIGY_FUZZ_SANITIZER fuzzer,address)
+   if (DEFINED PRODIGY_BASICS_TIDESDB_PACKAGE_NAME AND PRODIGY_BASICS_TIDESDB_PACKAGE_NAME MATCHES "mimalloc_object")
+      set(PRODIGY_FUZZ_SANITIZER fuzzer)
+   endif()
+   foreach(prodigy_fuzz_target IN ITEMS
+      prodigy_pairing_parser_fuzz
+      prodigy_mothership_topic_fuzz
+      prodigy_brain_topic_fuzz
+      prodigy_neuron_topic_fuzz
+      prodigy_container_topic_fuzz)
+      target_compile_options(${prodigy_fuzz_target} PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=${PRODIGY_FUZZ_SANITIZER})
+      target_link_options(${prodigy_fuzz_target} PRIVATE -fsanitize=${PRODIGY_FUZZ_SANITIZER})
+   endforeach()
 endif()
 
 
@@ -711,8 +754,9 @@ target_link_options(prodigy_provider_rack_unit PRIVATE -fno-lto)
 target_link_options(prodigy_provider_elastic_address_unit PRIVATE -fno-lto)
 
 # -g adds BTF information, which we need to access the maps
+set(PRODIGY_EBPF_COMPILE_FLAGS -g -O2 -target bpf -Werror -I${PRODIGY_ROOT} ${PRODIGY_EBPF_INCLUDE_ARGS} -DPRODIGY_DEBUG=1)
 add_custom_command(OUTPUT tunnel_to_nic.ebpf.o
-                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" -g -O2 -target bpf -I${PRODIGY_ROOT} ${PRODIGY_EBPF_INCLUDE_ARGS} -DPRODIGY_DEBUG=1 -MMD -MF tunnel_to_nic.ebpf.o.d -c ${CMAKE_CURRENT_SOURCE_DIR}/tunnel_to_nic.ebpf.c -o tunnel_to_nic.ebpf.o
+                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" ${PRODIGY_EBPF_COMPILE_FLAGS} -MMD -MF tunnel_to_nic.ebpf.o.d -c ${CMAKE_CURRENT_SOURCE_DIR}/tunnel_to_nic.ebpf.c -o tunnel_to_nic.ebpf.o
                    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tunnel_to_nic.ebpf.c
                    DEPFILE tunnel_to_nic.ebpf.o.d)
 
@@ -720,7 +764,7 @@ add_custom_target(tunnel_to_nic ALL DEPENDS tunnel_to_nic.ebpf.o)
 
 # Build the switchboard balancer object used by the neuron-owned switchboard runtime.
 add_custom_command(OUTPUT balancer.ebpf.o
-                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" -g -O2 -target bpf -I${PRODIGY_ROOT} ${PRODIGY_EBPF_INCLUDE_ARGS} -DPRODIGY_DEBUG=1 -MMD -MF balancer.ebpf.o.d -c ${PRODIGY_ROOT}/switchboard/kernel/balancer.ebpf.c -o balancer.ebpf.o
+                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" ${PRODIGY_EBPF_COMPILE_FLAGS} -MMD -MF balancer.ebpf.o.d -c ${PRODIGY_ROOT}/switchboard/kernel/balancer.ebpf.c -o balancer.ebpf.o
                    DEPENDS ${PRODIGY_ROOT}/switchboard/kernel/balancer.ebpf.c
                    DEPFILE balancer.ebpf.o.d)
 
@@ -728,35 +772,35 @@ add_custom_target(balancer_router ALL DEPENDS balancer.ebpf.o)
 
 # Build the host ingress router object required by the isolated netns harness.
 add_custom_command(OUTPUT host.ingress.router.ebpf.o
-                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" -g -O2 -target bpf -I${PRODIGY_ROOT} ${PRODIGY_EBPF_INCLUDE_ARGS} -DPRODIGY_DEBUG=1 -MMD -MF host.ingress.router.ebpf.o.d -c ${PRODIGY_ROOT}/switchboard/kernel/host.ingress.router.ebpf.c -o host.ingress.router.ebpf.o
+                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" ${PRODIGY_EBPF_COMPILE_FLAGS} -MMD -MF host.ingress.router.ebpf.o.d -c ${PRODIGY_ROOT}/switchboard/kernel/host.ingress.router.ebpf.c -o host.ingress.router.ebpf.o
                    DEPENDS ${PRODIGY_ROOT}/switchboard/kernel/host.ingress.router.ebpf.c
                    DEPFILE host.ingress.router.ebpf.o.d)
 
 add_custom_target(host_ingress_router ALL DEPENDS host.ingress.router.ebpf.o)
 
 add_custom_command(OUTPUT host.ingress.router.dev.ebpf.o
-                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" -g -O2 -target bpf -I${PRODIGY_ROOT} ${PRODIGY_EBPF_INCLUDE_ARGS} -DPRODIGY_DEBUG=1 -DNAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE=1 -MMD -MF host.ingress.router.dev.ebpf.o.d -c ${PRODIGY_ROOT}/switchboard/kernel/host.ingress.router.ebpf.c -o host.ingress.router.dev.ebpf.o
+                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" ${PRODIGY_EBPF_COMPILE_FLAGS} -DNAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE=1 -MMD -MF host.ingress.router.dev.ebpf.o.d -c ${PRODIGY_ROOT}/switchboard/kernel/host.ingress.router.ebpf.c -o host.ingress.router.dev.ebpf.o
                    DEPENDS ${PRODIGY_ROOT}/switchboard/kernel/host.ingress.router.ebpf.c
                    DEPFILE host.ingress.router.dev.ebpf.o.d)
 
 add_custom_target(host_ingress_router_dev DEPENDS host.ingress.router.dev.ebpf.o)
 
 add_custom_command(OUTPUT host.egress.router.ebpf.o
-                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" -g -O2 -target bpf -I${PRODIGY_ROOT} ${PRODIGY_EBPF_INCLUDE_ARGS} -DPRODIGY_DEBUG=1 -MMD -MF host.egress.router.ebpf.o.d -c ${PRODIGY_ROOT}/switchboard/kernel/host.egress.router.ebpf.c -o host.egress.router.ebpf.o
+                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" ${PRODIGY_EBPF_COMPILE_FLAGS} -MMD -MF host.egress.router.ebpf.o.d -c ${PRODIGY_ROOT}/switchboard/kernel/host.egress.router.ebpf.c -o host.egress.router.ebpf.o
                    DEPENDS ${PRODIGY_ROOT}/switchboard/kernel/host.egress.router.ebpf.c
                    DEPFILE host.egress.router.ebpf.o.d)
 
 add_custom_target(host_egress_router ALL DEPENDS host.egress.router.ebpf.o)
 
 add_custom_command(OUTPUT container.ingress.router.ebpf.o
-                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" -g -O2 -target bpf -I${PRODIGY_ROOT} ${PRODIGY_EBPF_INCLUDE_ARGS} -DPRODIGY_DEBUG=1 -MMD -MF container.ingress.router.ebpf.o.d -c ${PRODIGY_ROOT}/switchboard/kernel/container.ingress.router.ebpf.c -o container.ingress.router.ebpf.o
+                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" ${PRODIGY_EBPF_COMPILE_FLAGS} -MMD -MF container.ingress.router.ebpf.o.d -c ${PRODIGY_ROOT}/switchboard/kernel/container.ingress.router.ebpf.c -o container.ingress.router.ebpf.o
                    DEPENDS ${PRODIGY_ROOT}/switchboard/kernel/container.ingress.router.ebpf.c
                    DEPFILE container.ingress.router.ebpf.o.d)
 
 add_custom_target(container_ingress_router ALL DEPENDS container.ingress.router.ebpf.o)
 
 add_custom_command(OUTPUT container.egress.router.ebpf.o
-                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" -g -O2 -target bpf -I${PRODIGY_ROOT} ${PRODIGY_EBPF_INCLUDE_ARGS} -DPRODIGY_DEBUG=1 -MMD -MF container.egress.router.ebpf.o.d -c ${PRODIGY_ROOT}/switchboard/kernel/container.egress.router.ebpf.c -o container.egress.router.ebpf.o
+                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" ${PRODIGY_EBPF_COMPILE_FLAGS} -MMD -MF container.egress.router.ebpf.o.d -c ${PRODIGY_ROOT}/switchboard/kernel/container.egress.router.ebpf.c -o container.egress.router.ebpf.o
                    DEPENDS ${PRODIGY_ROOT}/switchboard/kernel/container.egress.router.ebpf.c
                    DEPFILE container.egress.router.ebpf.o.d)
 
@@ -772,7 +816,7 @@ add_dependencies(prodigy_switchboard_whitehole_unit
 
 # Build the boundary fake-ipv4 NAT object used by netns ingress/egress testing.
 add_custom_command(OUTPUT fake_ipv4_boundary_nat.ebpf.o
-                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" -g -O2 -target bpf -I${PRODIGY_ROOT} ${PRODIGY_EBPF_INCLUDE_ARGS} -DPRODIGY_DEBUG=1 -MMD -MF fake_ipv4_boundary_nat.ebpf.o.d -c ${CMAKE_CURRENT_SOURCE_DIR}/fake_ipv4_boundary_nat.ebpf.c -o fake_ipv4_boundary_nat.ebpf.o
+                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" ${PRODIGY_EBPF_COMPILE_FLAGS} -MMD -MF fake_ipv4_boundary_nat.ebpf.o.d -c ${CMAKE_CURRENT_SOURCE_DIR}/fake_ipv4_boundary_nat.ebpf.c -o fake_ipv4_boundary_nat.ebpf.o
                    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/fake_ipv4_boundary_nat.ebpf.c
                    DEPFILE fake_ipv4_boundary_nat.ebpf.o.d)
 
@@ -803,9 +847,16 @@ add_custom_command(
            --tool-binary "${PRODIGY_BUNDLED_LAT_MEM_RD_BIN}"
            --tool-binary "${PRODIGY_BUNDLED_BW_MEM_BIN}"
            --tool-binary "${PRODIGY_BUNDLED_SPEEDTEST_BIN}"
+           --tool-binary "$<TARGET_FILE:mothership>"
+           --tool-binary "${PRODIGY_CERTBOT_WHEELHOUSE_OUTPUT}"
+           --tool-binary "${PRODIGY_ROOT}/prodigy/acme/acme-present-dns-01"
+           --tool-binary "${PRODIGY_ROOT}/prodigy/acme/acme-cleanup-dns-01"
+           --tool-binary "${PRODIGY_ROOT}/prodigy/acme/acme-import-lineage"
    DEPENDS prodigy
+           mothership
            balancer.ebpf.o
            host.ingress.router.ebpf.o
+           host.ingress.router.dev.ebpf.o
            host.egress.router.ebpf.o
            container.ingress.router.ebpf.o
            container.egress.router.ebpf.o
@@ -813,6 +864,8 @@ add_custom_command(
            fake_ipv4_boundary_nat.ebpf.o
            "${DISCOMBOBULATOR_MANIFEST}"
            "${DISCOMBOBULATOR_CARGO_LOCK}"
+           "${PRODIGY_CERTBOT_WHEELHOUSE_OUTPUT}"
+           ${PRODIGY_ACME_HOOK_SCRIPTS}
            ${DISCOMBOBULATOR_SOURCE_FILES}
    COMMENT "Packaging ${PRODIGY_BUNDLE_OUTPUT}"
    COMMAND_EXPAND_LISTS
@@ -910,6 +963,11 @@ if (PROJECT_ENABLE_TESTS)
    )
 
    add_test(
+      NAME prodigy_dev_acme_staging_smoke
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_acme_staging_smoke.sh ${CMAKE_BINARY_DIR}/mothership ${PRODIGY_ROOT} ${PRODIGY_CERTBOT_WHEELHOUSE_OUTPUT}
+   )
+
+   add_test(
       NAME prodigy_dev_single_ns_mothership_boot
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_single_ns_mothership_boot.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership
    )
@@ -919,6 +977,7 @@ if (PROJECT_ENABLE_TESTS)
    set_tests_properties(prodigy_dev_host_tcp_unit PROPERTIES SKIP_RETURN_CODE 77)
    set_tests_properties(prodigy_dev_container_netkit_mtu_unit PROPERTIES SKIP_RETURN_CODE 77)
    set_tests_properties(prodigy_dev_accepted_fixed_file_sender_unit PROPERTIES SKIP_RETURN_CODE 77)
+   set_tests_properties(prodigy_dev_acme_staging_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
    add_test(
       NAME prodigy_dev_test_cluster_membership_smoke

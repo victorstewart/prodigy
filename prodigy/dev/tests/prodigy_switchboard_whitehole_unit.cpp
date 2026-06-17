@@ -554,6 +554,25 @@ static std::vector<uint8_t> makeIPv4L4EthernetFrame(const struct in_addr& source
   return frame;
 }
 
+static std::vector<uint8_t> makeIPv4ICMPEthernetFrame(const struct in_addr& source, const struct in_addr& destination)
+{
+  std::vector<uint8_t> frame(sizeof(struct ethhdr) + sizeof(struct iphdr) + 8);
+  std::memset(frame.data(), 0, frame.size());
+
+  struct ethhdr *eth = reinterpret_cast<struct ethhdr *>(frame.data());
+  eth->h_proto = htons(ETH_P_IP);
+
+  struct iphdr *ip4 = reinterpret_cast<struct iphdr *>(frame.data() + sizeof(struct ethhdr));
+  ip4->version = 4;
+  ip4->ihl = 5;
+  ip4->ttl = 64;
+  ip4->protocol = IPPROTO_ICMP;
+  ip4->tot_len = htons(uint16_t(frame.size() - sizeof(struct ethhdr)));
+  ip4->saddr = source.s_addr;
+  ip4->daddr = destination.s_addr;
+  return frame;
+}
+
 static std::vector<uint8_t> makeIPv6L4EthernetFrame(const uint8_t source[16],
                                                     const uint8_t destination[16],
                                                     uint8_t proto,
@@ -621,7 +640,7 @@ static bool installSingleContainerPortalRing(BPFProgram& program, uint32_t slot,
   bool outerUpdated = false;
   if (ringFilled)
   {
-    program.openMap("container_id_hash_rings"_ctv, [&](int mapFD) -> void {
+    program.openMap("cid_rings"_ctv, [&](int mapFD) -> void {
       outerUpdated = mapFD >= 0 && bpf_map_update_elem(mapFD, &slot, &ringFD, BPF_ANY) == 0;
     });
   }
@@ -637,7 +656,7 @@ static void exerciseHostIngressGenericPortal(TestSuite& suite, bool ipv6, uint8_
   ingressObjectPath.append("/host.ingress.router.dev.ebpf.o"_ctv);
 
   BPFProgram ingressProgram = {};
-  suite.expect(ingressProgram.load(ingressObjectPath, "host_ingress_router"_ctv),
+  suite.expect(ingressProgram.load(ingressObjectPath, "host_ingress"_ctv),
                ipv6
                    ? (proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv6_tcp_portal_loads_program" : "switchboard_host_ingress_ipv6_udp_portal_loads_program")
                    : (proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv4_tcp_portal_loads_program" : "switchboard_host_ingress_ipv4_udp_portal_loads_program"));
@@ -652,11 +671,11 @@ static void exerciseHostIngressGenericPortal(TestSuite& suite, bool ipv6, uint8_
   localSubnet.mpfx[0] = 0x52;
   localSubnet.mpfx[1] = 0xdf;
   localSubnet.mpfx[2] = 0x39;
-  ingressProgram.setArrayElement("local_container_subnet_map"_ctv, 0, localSubnet);
+  ingressProgram.setArrayElement("lc_subnet"_ctv, 0, localSubnet);
 
   constexpr uint8_t containerFragment = 0x4e;
   uint32_t redirectIfidx = 93;
-  ingressProgram.setArrayElement("container_device_map"_ctv, containerFragment, redirectIfidx);
+  ingressProgram.setArrayElement("ct_dev_map"_ctv, containerFragment, redirectIfidx);
 
   uint8_t containerID[5] = {localSubnet.dpfx, localSubnet.mpfx[0], localSubnet.mpfx[1], localSubnet.mpfx[2], containerFragment};
   portal_meta meta = {};
@@ -696,7 +715,7 @@ static void exerciseHostIngressGenericPortal(TestSuite& suite, bool ipv6, uint8_
   }
 
   bool portalUpdated = false;
-  ingressProgram.openMap("external_portals"_ctv, [&](int mapFD) -> void {
+  ingressProgram.openMap("ext_portals"_ctv, [&](int mapFD) -> void {
     portalUpdated = mapFD >= 0 && bpf_map_update_elem(mapFD, &portal, &meta, BPF_ANY) == 0;
   });
   suite.expect(portalUpdated,
@@ -709,7 +728,7 @@ static void exerciseHostIngressGenericPortal(TestSuite& suite, bool ipv6, uint8_
   std::memcpy(targetKey.container, containerID, sizeof(targetKey.container));
   uint16_t targetPort = htons(containerPortHost);
   bool targetUpdated = false;
-  ingressProgram.openMap("wormhole_target_ports"_ctv, [&](int mapFD) -> void {
+  ingressProgram.openMap("wh_targets"_ctv, [&](int mapFD) -> void {
     targetUpdated = mapFD >= 0 && bpf_map_update_elem(mapFD, &targetKey, &targetPort, BPF_ANY) == 0;
   });
   suite.expect(targetUpdated,
@@ -799,7 +818,7 @@ static void exerciseHostIngressPlainLocalIPv6(TestSuite& suite, uint8_t proto)
   ingressObjectPath.append("/host.ingress.router.ebpf.o"_ctv);
 
   BPFProgram ingressProgram = {};
-  expectNamed(ingressProgram.load(ingressObjectPath, "host_ingress_router"_ctv), "loads_program");
+  expectNamed(ingressProgram.load(ingressObjectPath, "host_ingress"_ctv), "loads_program");
   if (ingressProgram.prog_fd < 0)
   {
     return;
@@ -810,11 +829,11 @@ static void exerciseHostIngressPlainLocalIPv6(TestSuite& suite, uint8_t proto)
   localSubnet.mpfx[0] = 0x52;
   localSubnet.mpfx[1] = 0xdf;
   localSubnet.mpfx[2] = 0x39;
-  ingressProgram.setArrayElement("local_container_subnet_map"_ctv, 0, localSubnet);
+  ingressProgram.setArrayElement("lc_subnet"_ctv, 0, localSubnet);
 
   constexpr uint8_t containerFragment = 0x4e;
   uint32_t redirectIfidx = 7;
-  ingressProgram.setArrayElement("container_device_map"_ctv, containerFragment, redirectIfidx);
+  ingressProgram.setArrayElement("ct_dev_map"_ctv, containerFragment, redirectIfidx);
 
   uint8_t source6[16] = {0x26, 0x02, 0xfa, 0xc0, 0, 0, 0x12, 0xab, 0xff, 0xff, 0, 0, 0, 0, 0, 0x01};
   uint8_t destination6[16] = {};
@@ -862,7 +881,7 @@ static void exerciseHostIngressHostedIngressRoute(TestSuite& suite, bool ipv6, u
   ingressObjectPath.append("/host.ingress.router.ebpf.o"_ctv);
 
   BPFProgram ingressProgram = {};
-  expectNamed(ingressProgram.load(ingressObjectPath, "host_ingress_router"_ctv), "loads_program");
+  expectNamed(ingressProgram.load(ingressObjectPath, "host_ingress"_ctv), "loads_program");
   if (ingressProgram.prog_fd < 0)
   {
     return;
@@ -884,7 +903,7 @@ static void exerciseHostIngressHostedIngressRoute(TestSuite& suite, bool ipv6, u
   gatewayMAC.mac[3] = 0x11;
   gatewayMAC.mac[4] = 0x00;
   gatewayMAC.mac[5] = 0x01;
-  ingressProgram.setArrayElement("gateway_mac_map"_ctv, 0, gatewayMAC);
+  ingressProgram.setArrayElement("gw_mac_map"_ctv, 0, gatewayMAC);
 
   const uint32_t machineFragment = 0x000002u;
   if (ipv6)
@@ -892,7 +911,7 @@ static void exerciseHostIngressHostedIngressRoute(TestSuite& suite, bool ipv6, u
     switchboard_overlay_hosted_ingress_route6 hosted = {};
     hosted.machine_fragment = machineFragment;
     switchboard_overlay_prefix6_key hostedKey = switchboardMakeOverlayPrefix6Key(makePrefix("2001:db8::1/128"));
-    expectNamed(updateProgramMapElement(ingressProgram, "overlay_hosted_ingress_routes6"_ctv, hostedKey, hosted),
+    expectNamed(updateProgramMapElement(ingressProgram, "ovl_host6"_ctv, hostedKey, hosted),
                 "sets_hosted_route");
   }
   else
@@ -900,7 +919,7 @@ static void exerciseHostIngressHostedIngressRoute(TestSuite& suite, bool ipv6, u
     switchboard_overlay_hosted_ingress_route4 hosted = {};
     hosted.machine_fragment = machineFragment;
     switchboard_overlay_prefix4_key hostedKey = switchboardMakeOverlayPrefix4Key(makePrefix("198.18.0.1/32"));
-    expectNamed(updateProgramMapElement(ingressProgram, "overlay_hosted_ingress_routes4"_ctv, hostedKey, hosted),
+    expectNamed(updateProgramMapElement(ingressProgram, "ovl_host4"_ctv, hostedKey, hosted),
                 "sets_hosted_route");
   }
 
@@ -910,7 +929,7 @@ static void exerciseHostIngressHostedIngressRoute(TestSuite& suite, bool ipv6, u
   parseIPv6Bytes("fd00:10::a", route.source6);
   parseIPv6Bytes("fd00:10::b", route.next_hop6);
   switchboard_overlay_machine_route_key routeKey = switchboardMakeOverlayMachineRouteKey(machineFragment);
-  expectNamed(updateProgramMapElement(ingressProgram, "overlay_machine_routes_full"_ctv, routeKey, route),
+  expectNamed(updateProgramMapElement(ingressProgram, "ovl_mach_full"_ctv, routeKey, route),
               "sets_machine_route");
 
   struct in_addr source4 = {};
@@ -992,7 +1011,7 @@ static void exerciseHostIngressRemotePortalRoute(TestSuite& suite, bool ipv6, ui
   ingressObjectPath.append("/host.ingress.router.dev.ebpf.o"_ctv);
 
   BPFProgram ingressProgram = {};
-  expectNamed(ingressProgram.load(ingressObjectPath, "host_ingress_router"_ctv), "loads_program");
+  expectNamed(ingressProgram.load(ingressObjectPath, "host_ingress"_ctv), "loads_program");
   if (ingressProgram.prog_fd < 0)
   {
     return;
@@ -1003,7 +1022,7 @@ static void exerciseHostIngressRemotePortalRoute(TestSuite& suite, bool ipv6, ui
   localSubnet.mpfx[0] = 0x52;
   localSubnet.mpfx[1] = 0xdf;
   localSubnet.mpfx[2] = 0x39;
-  ingressProgram.setArrayElement("local_container_subnet_map"_ctv, 0, localSubnet);
+  ingressProgram.setArrayElement("lc_subnet"_ctv, 0, localSubnet);
 
   constexpr uint32_t remoteMachineFragment = 0x0016255bu;
   uint8_t remoteContainerID[5] = {0x01, 0x16, 0x25, 0x5b, 0x4e};
@@ -1030,7 +1049,7 @@ static void exerciseHostIngressRemotePortalRoute(TestSuite& suite, bool ipv6, ui
     switchboard_overlay_hosted_ingress_route6 hosted = {};
     hosted.machine_fragment = remoteMachineFragment;
     switchboard_overlay_prefix6_key hostedKey = switchboardMakeOverlayPrefix6Key(makePrefix("2001:db8:100::44/128"));
-    expectNamed(updateProgramMapElement(ingressProgram, "overlay_hosted_ingress_routes6"_ctv, hostedKey, hosted),
+    expectNamed(updateProgramMapElement(ingressProgram, "ovl_host6"_ctv, hostedKey, hosted),
                 "sets_hosted_route");
   }
   else
@@ -1042,11 +1061,11 @@ static void exerciseHostIngressRemotePortalRoute(TestSuite& suite, bool ipv6, ui
     switchboard_overlay_hosted_ingress_route4 hosted = {};
     hosted.machine_fragment = remoteMachineFragment;
     switchboard_overlay_prefix4_key hostedKey = switchboardMakeOverlayPrefix4Key(makePrefix("198.18.0.1/32"));
-    expectNamed(updateProgramMapElement(ingressProgram, "overlay_hosted_ingress_routes4"_ctv, hostedKey, hosted),
+    expectNamed(updateProgramMapElement(ingressProgram, "ovl_host4"_ctv, hostedKey, hosted),
                 "sets_hosted_route");
   }
 
-  expectNamed(updateProgramMapElement(ingressProgram, "external_portals"_ctv, portal, meta),
+  expectNamed(updateProgramMapElement(ingressProgram, "ext_portals"_ctv, portal, meta),
               "installs_portal");
 
   switchboard_overlay_machine_route route = {};
@@ -1055,7 +1074,7 @@ static void exerciseHostIngressRemotePortalRoute(TestSuite& suite, bool ipv6, ui
   parseIPv6Bytes("fd00:10::a", route.source6);
   parseIPv6Bytes("fd00:10::b", route.next_hop6);
   switchboard_overlay_machine_route_key routeKey = switchboardMakeOverlayMachineRouteKey(remoteMachineFragment);
-  expectNamed(updateProgramMapElement(ingressProgram, "overlay_machine_routes_full"_ctv, routeKey, route),
+  expectNamed(updateProgramMapElement(ingressProgram, "ovl_mach_full"_ctv, routeKey, route),
               "sets_machine_route");
 
   std::vector<uint8_t> frame = ipv6
@@ -1122,7 +1141,7 @@ static void exerciseBalancerRemotePortalRoutesWithOverlay(TestSuite& suite)
   balancerObjectPath.append("/balancer.ebpf.o"_ctv);
 
   BPFProgram balancerProgram = {};
-  expectNamed(balancerProgram.load(balancerObjectPath, "balancer_ingress"_ctv), "loads_program");
+  expectNamed(balancerProgram.load(balancerObjectPath, "bal_ingress"_ctv), "loads_program");
   if (balancerProgram.prog_fd < 0)
   {
     return;
@@ -1133,7 +1152,7 @@ static void exerciseBalancerRemotePortalRoutesWithOverlay(TestSuite& suite)
   localSubnet.mpfx[0] = 0x52;
   localSubnet.mpfx[1] = 0xdf;
   localSubnet.mpfx[2] = 0x39;
-  balancerProgram.setArrayElement("local_container_subnet_map"_ctv, 0, localSubnet);
+  balancerProgram.setArrayElement("lc_subnet"_ctv, 0, localSubnet);
 
   mac localMAC = {};
   localMAC.mac[0] = 0x02;
@@ -1151,7 +1170,7 @@ static void exerciseBalancerRemotePortalRoutesWithOverlay(TestSuite& suite)
   gatewayMAC.mac[3] = 0x11;
   gatewayMAC.mac[4] = 0x00;
   gatewayMAC.mac[5] = 0x01;
-  balancerProgram.setArrayElement("gateway_mac_map"_ctv, 0, gatewayMAC);
+  balancerProgram.setArrayElement("gw_mac_map"_ctv, 0, gatewayMAC);
 
   struct in_addr external4 = {};
   struct in_addr client4 = {};
@@ -1162,7 +1181,7 @@ static void exerciseBalancerRemotePortalRoutesWithOverlay(TestSuite& suite)
   ownedKey.prefixlen = 32;
   ownedKey.addr = external4.s_addr;
   __u8 present = 1;
-  expectNamed(updateProgramMapElement(balancerProgram, "owned_routable_prefixes4"_ctv, ownedKey, present),
+  expectNamed(updateProgramMapElement(balancerProgram, "owned_pfx4"_ctv, ownedKey, present),
               "sets_owned_external_prefix");
 
   portal_definition portal = {};
@@ -1172,7 +1191,7 @@ static void exerciseBalancerRemotePortalRoutesWithOverlay(TestSuite& suite)
 
   portal_meta meta = {};
   meta.slot = 31;
-  expectNamed(updateProgramMapElement(balancerProgram, "external_portals"_ctv, portal, meta),
+  expectNamed(updateProgramMapElement(balancerProgram, "ext_portals"_ctv, portal, meta),
               "installs_external_portal");
 
   uint8_t remoteContainerID[5] = {0x01, 0x16, 0x25, 0x5b, 0x4e};
@@ -1185,7 +1204,7 @@ static void exerciseBalancerRemotePortalRoutesWithOverlay(TestSuite& suite)
   parseIPv6Bytes("fd00:10::a", route.source6);
   parseIPv6Bytes("fd00:10::b", route.next_hop6);
   switchboard_overlay_machine_route_key routeKey = switchboardMakeOverlayMachineRouteKey(0x0016255bu);
-  expectNamed(updateProgramMapElement(balancerProgram, "overlay_machine_routes_full"_ctv, routeKey, route),
+  expectNamed(updateProgramMapElement(balancerProgram, "ovl_mach_full"_ctv, routeKey, route),
               "sets_machine_route");
 
   std::vector<uint8_t> frame = makeIPv4L4EthernetFrame(client4, external4, IPPROTO_TCP, 49'152, 443);
@@ -1221,6 +1240,60 @@ static void exerciseBalancerRemotePortalRoutesWithOverlay(TestSuite& suite)
     expectNamed(inner4->daddr == external4.s_addr, "preserves_external_destination");
     expectNamed(inner4->protocol == IPPROTO_TCP, "preserves_protocol");
   }
+
+  balancerProgram.close();
+}
+
+static void exerciseBalancerOwnedRoutableMissPassesToKernel(TestSuite& suite)
+{
+  const char *label = "switchboard_balancer_owned_routable_miss_passes_to_kernel";
+  auto expectNamed = [&](bool condition, const char *suffix) -> void {
+    char name[256] = {};
+    std::snprintf(name, sizeof(name), "%s_%s", label, suffix);
+    suite.expect(condition, name);
+  };
+
+  String balancerObjectPath = {};
+  balancerObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+  balancerObjectPath.append("/balancer.ebpf.o"_ctv);
+
+  BPFProgram balancerProgram = {};
+  expectNamed(balancerProgram.load(balancerObjectPath, "bal_ingress"_ctv), "loads_program");
+  if (balancerProgram.prog_fd < 0)
+  {
+    return;
+  }
+
+  struct in_addr external4 = {};
+  struct in_addr client4 = {};
+  expectNamed(inet_pton(AF_INET, "198.18.0.1", &external4) == 1, "parses_external");
+  expectNamed(inet_pton(AF_INET, "203.0.113.99", &client4) == 1, "parses_client");
+
+  switchboard_owned_routable_prefix4_key ownedKey = {};
+  ownedKey.prefixlen = 32;
+  ownedKey.addr = external4.s_addr;
+  __u8 present = 1;
+  expectNamed(updateProgramMapElement(balancerProgram, "owned_pfx4"_ctv, ownedKey, present),
+              "sets_owned_external_prefix");
+
+  auto runPassCase = [&](const char *suffix, const std::vector<uint8_t>& frame) -> void {
+    std::vector<uint8_t> output(frame.size() + 64u);
+    LIBBPF_OPTS(bpf_test_run_opts, opts,
+                .data_in = frame.data(),
+                .data_out = output.data(),
+                .data_size_in = static_cast<__u32>(frame.size()),
+                .data_size_out = static_cast<__u32>(output.size()),
+                .repeat = 1, );
+
+    int runResult = bpf_prog_test_run_opts(balancerProgram.prog_fd, &opts);
+    expectNamed(runResult == 0, suffix);
+    char passName[128] = {};
+    std::snprintf(passName, sizeof(passName), "%s_returns_xdp_pass", suffix);
+    expectNamed(opts.retval == XDP_PASS, passName);
+  };
+
+  runPassCase("tcp_no_portal", makeIPv4L4EthernetFrame(client4, external4, IPPROTO_TCP, 49'152, 22));
+  runPassCase("icmp", makeIPv4ICMPEthernetFrame(client4, external4));
 
   balancerProgram.close();
 }
@@ -1282,7 +1355,7 @@ int main(void)
     (void)unlink(sharedPinPath.c_str());
 
     BPFProgram egressProgram = {};
-    suite.expect(egressProgram.load(egressObjectPath, "host_egress_router"_ctv), "switchboard_whitehole_reply_flow_reuse_loads_host_egress_program");
+    suite.expect(egressProgram.load(egressObjectPath, "host_egress"_ctv), "switchboard_whitehole_reply_flow_reuse_loads_host_egress_program");
 
     bool pinnedReplyMap = switchboardPinWhiteholeReplyFlowMap(&egressProgram, testIfindex);
     suite.expect(pinnedReplyMap, "switchboard_whitehole_reply_flow_reuse_pins_egress_reply_map_before_ingress_load");
@@ -1290,26 +1363,26 @@ int main(void)
     bool reusedPinnedReplyMap = false;
     BPFProgram ingressProgram = {};
     bool ingressLoaded = ingressProgram.load(ingressObjectPath,
-                                             "host_ingress_router"_ctv,
+                                             "host_ingress"_ctv,
                                              [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
                                                reusedPinnedReplyMap = switchboardReusePinnedWhiteholeReplyFlowMap(obj, testIfindex, inner_map_fds);
                                              });
     suite.expect(ingressLoaded, "switchboard_whitehole_reply_flow_reuse_loads_host_ingress_program");
     suite.expect(reusedPinnedReplyMap, "switchboard_whitehole_reply_flow_reuse_reuses_pinned_map_for_ingress_program");
 
-    uint32_t egressReplyMapID = programMapID(egressProgram, "whitehole_reply_flows"_ctv);
-    uint32_t ingressReplyMapID = programMapID(ingressProgram, "whitehole_reply_flows"_ctv);
+    uint32_t egressReplyMapID = programMapID(egressProgram, "white_replies"_ctv);
+    uint32_t ingressReplyMapID = programMapID(ingressProgram, "white_replies"_ctv);
     suite.expect(egressReplyMapID != 0, "switchboard_whitehole_reply_flow_reuse_resolves_egress_map_id");
     suite.expect(ingressReplyMapID == egressReplyMapID, "switchboard_whitehole_reply_flow_reuse_shares_reply_flow_map_between_egress_and_ingress");
 
     if (ingressLoaded)
     {
-      suite.expect(programMapID(ingressProgram, "external_portals"_ctv) == 0,
-                   "switchboard_host_ingress_production_omits_ipv4_portal_map");
-      suite.expect(programMapID(ingressProgram, "wormhole_target_ports"_ctv) == 0,
-                   "switchboard_host_ingress_production_omits_wormhole_target_port_map");
-      suite.expect(programMapID(ingressProgram, "quic_cid_aes_decrypt_map"_ctv) == 0,
-                   "switchboard_host_ingress_production_omits_quic_decrypt_map");
+      suite.expect(programMapID(ingressProgram, "ext_portals"_ctv) != 0,
+                   "switchboard_host_ingress_production_has_portal_map");
+      suite.expect(programMapID(ingressProgram, "wh_targets"_ctv) != 0,
+                   "switchboard_host_ingress_production_has_wormhole_target_port_map");
+      suite.expect(programMapID(ingressProgram, "quic_cid_dec"_ctv) != 0,
+                   "switchboard_host_ingress_production_has_quic_decrypt_map");
     }
 
     (void)unlink(sharedPinPath.c_str());
@@ -1321,7 +1394,7 @@ int main(void)
     ingressObjectPath.append("/host.ingress.router.dev.ebpf.o"_ctv);
 
     BPFProgram ingressProgram = {};
-    suite.expect(ingressProgram.load(ingressObjectPath, "host_ingress_router"_ctv),
+    suite.expect(ingressProgram.load(ingressObjectPath, "host_ingress"_ctv),
                  "switchboard_host_ingress_ipv4_quic_portal_loads_host_ingress_program");
 
     if (ingressProgram.prog_fd >= 0)
@@ -1331,10 +1404,10 @@ int main(void)
       localSubnet.mpfx[0] = 0x52;
       localSubnet.mpfx[1] = 0xdf;
       localSubnet.mpfx[2] = 0x39;
-      ingressProgram.setArrayElement("local_container_subnet_map"_ctv, 0, localSubnet);
+      ingressProgram.setArrayElement("lc_subnet"_ctv, 0, localSubnet);
 
       uint32_t redirectIfidx = 91;
-      ingressProgram.setArrayElement("container_device_map"_ctv, 0x4e, redirectIfidx);
+      ingressProgram.setArrayElement("ct_dev_map"_ctv, 0x4e, redirectIfidx);
 
       struct in_addr externalAddress = {};
       struct in_addr clientAddress = {};
@@ -1375,7 +1448,7 @@ int main(void)
       meta.slot = 7;
 
       bool portalUpdated = false;
-      ingressProgram.openMap("external_portals"_ctv, [&](int mapFD) -> void {
+      ingressProgram.openMap("ext_portals"_ctv, [&](int mapFD) -> void {
         portalUpdated = mapFD >= 0 && bpf_map_update_elem(mapFD, &portal, &meta, BPF_ANY) == 0;
       });
       suite.expect(portalUpdated,
@@ -1387,7 +1460,7 @@ int main(void)
       uint16_t targetPort = htons(19'443);
 
       bool targetUpdated = false;
-      ingressProgram.openMap("wormhole_target_ports"_ctv, [&](int mapFD) -> void {
+      ingressProgram.openMap("wh_targets"_ctv, [&](int mapFD) -> void {
         targetUpdated = mapFD >= 0 && bpf_map_update_elem(mapFD, &targetKey, &targetPort, BPF_ANY) == 0;
       });
       suite.expect(targetUpdated,
@@ -1402,7 +1475,7 @@ int main(void)
 
       uint32_t decryptIndex = quicCidPortalDecryptMapIndex(meta.slot, 0);
       bool decryptUpdated = false;
-      ingressProgram.openMap("quic_cid_aes_decrypt_map"_ctv, [&](int mapFD) -> void {
+      ingressProgram.openMap("quic_cid_dec"_ctv, [&](int mapFD) -> void {
         decryptUpdated = mapFD >= 0 && bpf_map_update_elem(mapFD, &decryptIndex, &aesState, BPF_ANY) == 0;
       });
       suite.expect(decryptUpdated,
@@ -1446,7 +1519,7 @@ int main(void)
     ingressObjectPath.append("/host.ingress.router.dev.ebpf.o"_ctv);
 
     BPFProgram ingressProgram = {};
-    suite.expect(ingressProgram.load(ingressObjectPath, "host_ingress_router"_ctv),
+    suite.expect(ingressProgram.load(ingressObjectPath, "host_ingress"_ctv),
                  "switchboard_host_ingress_decapped_ipv4_quic_portal_loads_host_ingress_program");
 
     if (ingressProgram.prog_fd >= 0)
@@ -1456,10 +1529,10 @@ int main(void)
       localSubnet.mpfx[0] = 0x52;
       localSubnet.mpfx[1] = 0xdf;
       localSubnet.mpfx[2] = 0x39;
-      ingressProgram.setArrayElement("local_container_subnet_map"_ctv, 0, localSubnet);
+      ingressProgram.setArrayElement("lc_subnet"_ctv, 0, localSubnet);
 
       uint32_t redirectIfidx = 92;
-      ingressProgram.setArrayElement("container_device_map"_ctv, 0x4e, redirectIfidx);
+      ingressProgram.setArrayElement("ct_dev_map"_ctv, 0x4e, redirectIfidx);
 
       struct in_addr externalAddress = {};
       struct in_addr clientAddress = {};
@@ -1500,7 +1573,7 @@ int main(void)
       meta.slot = 9;
 
       bool portalUpdated = false;
-      ingressProgram.openMap("external_portals"_ctv, [&](int mapFD) -> void {
+      ingressProgram.openMap("ext_portals"_ctv, [&](int mapFD) -> void {
         portalUpdated = mapFD >= 0 && bpf_map_update_elem(mapFD, &portal, &meta, BPF_ANY) == 0;
       });
       suite.expect(portalUpdated,
@@ -1512,7 +1585,7 @@ int main(void)
       uint16_t targetPort = htons(19'443);
 
       bool targetUpdated = false;
-      ingressProgram.openMap("wormhole_target_ports"_ctv, [&](int mapFD) -> void {
+      ingressProgram.openMap("wh_targets"_ctv, [&](int mapFD) -> void {
         targetUpdated = mapFD >= 0 && bpf_map_update_elem(mapFD, &targetKey, &targetPort, BPF_ANY) == 0;
       });
       suite.expect(targetUpdated,
@@ -1527,7 +1600,7 @@ int main(void)
 
       uint32_t decryptIndex = quicCidPortalDecryptMapIndex(meta.slot, 0);
       bool decryptUpdated = false;
-      ingressProgram.openMap("quic_cid_aes_decrypt_map"_ctv, [&](int mapFD) -> void {
+      ingressProgram.openMap("quic_cid_dec"_ctv, [&](int mapFD) -> void {
         decryptUpdated = mapFD >= 0 && bpf_map_update_elem(mapFD, &decryptIndex, &aesState, BPF_ANY) == 0;
       });
       suite.expect(decryptUpdated,
@@ -1581,7 +1654,7 @@ int main(void)
     ingressObjectPath.append("/host.ingress.router.ebpf.o"_ctv);
 
     BPFProgram ingressProgram = {};
-    suite.expect(ingressProgram.load(ingressObjectPath, "host_ingress_router"_ctv),
+    suite.expect(ingressProgram.load(ingressObjectPath, "host_ingress"_ctv),
                  "switchboard_host_ingress_overlay_local_delivery_loads_host_ingress_program");
 
     if (ingressProgram.prog_fd >= 0)
@@ -1591,10 +1664,10 @@ int main(void)
       localSubnet.mpfx[0] = 0x6e;
       localSubnet.mpfx[1] = 0xa2;
       localSubnet.mpfx[2] = 0x7b;
-      ingressProgram.setArrayElement("local_container_subnet_map"_ctv, 0, localSubnet);
+      ingressProgram.setArrayElement("lc_subnet"_ctv, 0, localSubnet);
 
       uint32_t redirectIfidx = 77;
-      ingressProgram.setArrayElement("container_device_map"_ctv, 0x7e, redirectIfidx);
+      ingressProgram.setArrayElement("ct_dev_map"_ctv, 0x7e, redirectIfidx);
 
       uint8_t outerSrc[16] = {0xfd, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0b};
       uint8_t outerDst[16] = {0xfd, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0c};
@@ -1648,6 +1721,7 @@ int main(void)
   exerciseHostIngressRemotePortalRoute(suite, false, IPPROTO_TCP);
   exerciseHostIngressRemotePortalRoute(suite, true, IPPROTO_UDP);
   exerciseHostIngressRemotePortalRoute(suite, true, IPPROTO_TCP);
+  exerciseBalancerOwnedRoutableMissPassesToKernel(suite);
   exerciseBalancerRemotePortalRoutesWithOverlay(suite);
   exerciseHostIngressPlainLocalIPv6(suite, IPPROTO_UDP);
   exerciseHostIngressPlainLocalIPv6(suite, IPPROTO_TCP);
@@ -1658,7 +1732,7 @@ int main(void)
     ingressObjectPath.append("/host.ingress.router.ebpf.o"_ctv);
 
     BPFProgram ingressProgram = {};
-    suite.expect(ingressProgram.load(ingressObjectPath, "host_ingress_router"_ctv),
+    suite.expect(ingressProgram.load(ingressObjectPath, "host_ingress"_ctv),
                  "switchboard_host_ingress_overlay_local_delivery_live_packet_loads_host_ingress_program");
 
     if (ingressProgram.prog_fd >= 0)
@@ -1668,10 +1742,10 @@ int main(void)
       localSubnet.mpfx[0] = 0x52;
       localSubnet.mpfx[1] = 0xdf;
       localSubnet.mpfx[2] = 0x39;
-      ingressProgram.setArrayElement("local_container_subnet_map"_ctv, 0, localSubnet);
+      ingressProgram.setArrayElement("lc_subnet"_ctv, 0, localSubnet);
 
       uint32_t redirectIfidx = 7;
-      ingressProgram.setArrayElement("container_device_map"_ctv, 0x4e, redirectIfidx);
+      ingressProgram.setArrayElement("ct_dev_map"_ctv, 0x4e, redirectIfidx);
 
       uint8_t outerSrc[16] = {0xfd, 0x00, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a};
       uint8_t outerDst[16] = {0xfd, 0x00, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0b};
@@ -1717,7 +1791,7 @@ int main(void)
     ingressObjectPath.append("/container.ingress.router.ebpf.o"_ctv);
 
     BPFProgram ingressProgram = {};
-    suite.expect(ingressProgram.load(ingressObjectPath, "container_ingress_router"_ctv),
+    suite.expect(ingressProgram.load(ingressObjectPath, "ct_ingress"_ctv),
                  "switchboard_container_ingress_overlay_delivery_loads_program");
 
     if (ingressProgram.prog_fd >= 0)

@@ -221,10 +221,15 @@ public:
 
   uint32_t upsertCalls = 0;
   uint32_t removeCalls = 0;
+  uint32_t presentTXTCalls = 0;
+  uint32_t cleanupTXTCalls = 0;
   bool failUpsert = false;
   bool failRemove = false;
   Vector<ProdigyDNSRecordBinding> upserts;
   Vector<ProdigyDNSRecordBinding> removes;
+  Vector<ProdigyDNSRecordBinding> presentedTXT;
+  Vector<ProdigyDNSRecordBinding> cleanedTXT;
+  Vector<ProdigyDNSRecordBinding> activeTXT;
   String lastCredentialMaterial;
 
   bool supportsProvider(const String& provider) const override
@@ -255,6 +260,64 @@ public:
     {
       failure.assign("injected DNS remove failure"_ctv);
       return false;
+    }
+    failure.clear();
+    return true;
+  }
+
+  bool presentTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  {
+    presentTXTCalls += 1;
+    presentedTXT.push_back(record);
+    lastCredentialMaterial = credential.material;
+    if (failUpsert)
+    {
+      failure.assign("injected DNS upsert failure"_ctv);
+      return false;
+    }
+    String value = {};
+    if (prodigyDNSRecordSingleTXTValue(record, value, failure) == false)
+    {
+      return false;
+    }
+    bool exists = false;
+    for (const ProdigyDNSRecordBinding& active : activeTXT)
+    {
+      exists = exists || (routableResourceDNSPartEquals(active.name, record.name, true) && active.values.size() == 1 && active.values[0].equals(value));
+    }
+    if (exists == false)
+    {
+      activeTXT.push_back(record);
+    }
+    failure.clear();
+    return true;
+  }
+
+  bool cleanupTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  {
+    (void)credential;
+    cleanupTXTCalls += 1;
+    cleanedTXT.push_back(record);
+    if (failRemove)
+    {
+      failure.assign("injected DNS remove failure"_ctv);
+      return false;
+    }
+    String value = {};
+    if (prodigyDNSRecordSingleTXTValue(record, value, failure) == false)
+    {
+      return false;
+    }
+    for (auto it = activeTXT.begin(); it != activeTXT.end();)
+    {
+      if (routableResourceDNSPartEquals(it->name, record.name, true) && it->values.size() == 1 && it->values[0].equals(value))
+      {
+        it = activeTXT.erase(it);
+      }
+      else
+      {
+        ++it;
+      }
     }
     failure.clear();
     return true;
@@ -531,6 +594,7 @@ public:
                                     const String& requestedAddress,
                                     const String& providerPool,
                                     IPPrefix& assignedPrefix,
+                                    IPPrefix& deliveryPrefix,
                                     String& allocationID,
                                     String& associationID,
                                     bool& releaseOnRemove,
@@ -543,6 +607,7 @@ public:
     lastRequestedAddress.assign(requestedAddress);
     lastProviderPool.assign(providerPool);
     assignedPrefix = IPPrefix("198.51.100.88", false, 32);
+    deliveryPrefix = IPPrefix("10.0.0.88", false, 32);
     allocationID.assign("alloc-88"_ctv);
     associationID.assign("assoc-88"_ctv);
     releaseOnRemove = true;
@@ -2022,6 +2087,11 @@ static bool writeTextFile(const std::filesystem::path& path, const std::string& 
   return output.good();
 }
 
+static std::string toStdString(const String& text)
+{
+  return std::string(reinterpret_cast<const char *>(text.data()), text.size());
+}
+
 static bool writeSizedFile(const std::filesystem::path& path, uint64_t bytes)
 {
   std::ofstream output(path, std::ios::binary | std::ios::trunc);
@@ -2798,7 +2868,6 @@ static bool generateApplicationTlsFactory(ApplicationTlsVaultFactory& factory, S
   failure.clear();
   factory.scheme = uint8_t(scheme);
   factory.defaultLeafValidityDays = 15;
-  factory.renewLeadPercent = 10;
 
   X509 *rootCert = nullptr;
   EVP_PKEY *rootKey = nullptr;
@@ -2840,6 +2909,20 @@ static bool generateApplicationTlsFactory(ApplicationTlsVaultFactory& factory, S
   }
 
   return ok;
+}
+
+static void installACMEZoneDNSCredential(TestBrain& brain, uint16_t applicationID, const String& name, const String& zone)
+{
+  ApplicationApiCredentialSet set = {};
+  set.applicationID = applicationID;
+  ApiCredential credential = {};
+  credential.name = name;
+  credential.provider = "cloudflare"_ctv;
+  credential.material = "secret"_ctv;
+  credential.metadata.insert_or_assign("dnsScope"_ctv, "native-zone"_ctv);
+  credential.metadata.insert_or_assign("dnsZones"_ctv, zone);
+  set.credentials.push_back(credential);
+  brain.apiCredentialSetsByApp[applicationID] = set;
 }
 
 static bool certificateHasDnsSan(const String& certPem, const String& expected)
@@ -2915,6 +2998,105 @@ static bool certificateHasIpSan(const String& certPem, const IPAddress& expected
 
   X509_free(cert);
   return found;
+}
+
+static bool generateACMELineage(const std::filesystem::path& path, const Vector<String>& domains, String& certPem, String& keyPem, const Vector<IPAddress> *ipSans = nullptr, bool enableServerAuth = true, String *chainPem = nullptr)
+{
+  String failure = {};
+  ApplicationTlsVaultFactory factory = {};
+  factory.applicationID = 1;
+  factory.factoryGeneration = 1;
+  if (generateApplicationTlsFactory(factory, failure, CryptoScheme::p256) == false)
+  {
+    return false;
+  }
+
+  X509 *interCert = VaultPem::x509FromPem(factory.intermediateCertPem);
+  EVP_PKEY *interKey = VaultPem::privateKeyFromPem(factory.intermediateKeyPem);
+  X509 *leafCert = nullptr;
+  EVP_PKEY *leafKey = nullptr;
+  VaultCertificateRequest request = {};
+  request.type = CertificateType::server;
+  request.scheme = CryptoScheme::p256;
+  request.subjectCommonName = domains.empty() ? "acme.example.com"_ctv : domains[0];
+  request.enableServerAuth = enableServerAuth;
+  generateCertificateAndKeys(request, interCert, interKey, leafCert, leafKey);
+
+  Vector<IPAddress> noIPSans = {};
+  bool ok = interCert != nullptr && interKey != nullptr && leafCert != nullptr && leafKey != nullptr &&
+            brainAddCertificateSubjectAltNames(leafCert, domains, ipSans ? *ipSans : noIPSans) &&
+            X509_gmtime_adj(X509_getm_notBefore(leafCert), 0) != nullptr &&
+            X509_time_adj_ex(X509_getm_notAfter(leafCert), 90, 0, nullptr) != nullptr &&
+            X509_sign(leafCert, interKey, EVP_sha256()) != 0 &&
+            VaultPem::x509ToPem(leafCert, certPem) &&
+            VaultPem::privateKeyToPem(leafKey, keyPem);
+
+  if (ok)
+  {
+    String chain = factory.intermediateCertPem;
+    chain.append(factory.rootCertPem);
+    if (chainPem)
+    {
+      *chainPem = chain;
+    }
+    String fullchain = certPem;
+    fullchain.append(chain);
+    ok = writeTextFile(path / "fullchain.pem", toStdString(fullchain)) &&
+         writeTextFile(path / "privkey.pem", toStdString(keyPem));
+  }
+
+  if (interCert)
+  {
+    X509_free(interCert);
+  }
+  if (interKey)
+  {
+    EVP_PKEY_free(interKey);
+  }
+  if (leafCert)
+  {
+    X509_free(leafCert);
+  }
+  if (leafKey)
+  {
+    EVP_PKEY_free(leafKey);
+  }
+  return ok;
+}
+
+static bool stringVectorContains(const Vector<String>& values, const String& needle)
+{
+  for (const String& value : values)
+  {
+    if (value.equal(needle))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool extractQueuedCredentialDelta(Machine& machine, uint128_t& containerUUID, CredentialDelta& delta)
+{
+  if (machine.neuron.wBuffer.size() == 0)
+  {
+    return false;
+  }
+
+  Message *message = reinterpret_cast<Message *>(machine.neuron.wBuffer.data());
+  if (NeuronTopic(message->topic) != NeuronTopic::refreshContainerCredentials)
+  {
+    return false;
+  }
+
+  String serialized = {};
+  uint8_t *args = message->args;
+  if (Message::extractArg<ArgumentNature::fixed>(args, containerUUID) == false)
+  {
+    return false;
+  }
+  Message::extractToStringView(args, serialized);
+  return ProdigyWire::deserializeCredentialDelta(serialized, delta);
 }
 
 static bool generateTransportAuthority(ProdigyTransportTLSAuthority& authority, String& failure)
@@ -3456,7 +3638,6 @@ static void testCredentialBundleBuildAndApply(TestSuite& suite)
   deploymentPlan.tlsIssuancePolicy.applicationID = 6;
   deploymentPlan.tlsIssuancePolicy.enablePerContainerLeafs = true;
   deploymentPlan.tlsIssuancePolicy.leafValidityDays = 15;
-  deploymentPlan.tlsIssuancePolicy.renewLeadPercent = 10;
   deploymentPlan.tlsIssuancePolicy.identityNames.push_back("inbound_server_tls"_ctv);
   deploymentPlan.tlsIssuancePolicy.dnsSans.push_back("nametag.social"_ctv);
   deploymentPlan.tlsIssuancePolicy.dnsSans.push_back("dev.nametag.social"_ctv);
@@ -3465,7 +3646,15 @@ static void testCredentialBundleBuildAndApply(TestSuite& suite)
   deploymentPlan.hasApiCredentialPolicy = true;
   deploymentPlan.apiCredentialPolicy.applicationID = 6;
   deploymentPlan.apiCredentialPolicy.requiredCredentialNames.push_back("telnyx_bearer"_ctv);
+  deploymentPlan.apiCredentialPolicy.requiredCredentialNames.push_back("cloudflare_dns"_ctv);
+  deploymentPlan.apiCredentialPolicy.requiredCredentialNames.push_back("route53_dns"_ctv);
   deploymentPlan.apiCredentialPolicy.requiredCredentialNames.push_back("missing_name"_ctv);
+  deploymentPlan.apiCredentialPolicy.refreshPushEnabled = true;
+  Wormhole dnsWormhole = {};
+  dnsWormhole.name = "api"_ctv;
+  dnsWormhole.hasDNSConfig = true;
+  dnsWormhole.dns.credentialName = "route53_dns"_ctv;
+  deploymentPlan.wormholes.push_back(dnsWormhole);
 
   ApplicationApiCredentialSet set;
   set.applicationID = 6;
@@ -3485,13 +3674,28 @@ static void testCredentialBundleBuildAndApply(TestSuite& suite)
   unrelated.material.assign("other-secret"_ctv);
   set.credentials.push_back(unrelated);
 
+  ApiCredential scopedDNS;
+  scopedDNS.name.assign("cloudflare_dns"_ctv);
+  scopedDNS.provider.assign("cloudflare"_ctv);
+  scopedDNS.generation = 3;
+  scopedDNS.material.assign("dns-secret"_ctv);
+  scopedDNS.metadata.insert_or_assign("dnsScope"_ctv, "native-zone"_ctv);
+  scopedDNS.metadata.insert_or_assign("dnsZones"_ctv, "example.com"_ctv);
+  set.credentials.push_back(scopedDNS);
+
+  ApiCredential wormholeDNS;
+  wormholeDNS.name.assign("route53_dns"_ctv);
+  wormholeDNS.provider.assign("route53"_ctv);
+  wormholeDNS.generation = 4;
+  wormholeDNS.material.assign("route53-secret"_ctv);
+  set.credentials.push_back(wormholeDNS);
+
   brain.apiCredentialSetsByApp.insert_or_assign(set.applicationID, set);
 
   ApplicationTlsVaultFactory factory = {};
   factory.applicationID = 6;
   factory.factoryGeneration = 77;
   factory.defaultLeafValidityDays = 15;
-  factory.renewLeadPercent = 10;
   String failure = {};
   suite.expect(generateApplicationTlsFactory(factory, failure, CryptoScheme::p256), "bundle_build_generate_tls_factory");
   suite.expect(failure.size() == 0, "bundle_build_generate_tls_factory_no_failure");
@@ -3522,6 +3726,33 @@ static void testCredentialBundleBuildAndApply(TestSuite& suite)
   suite.expect(containerPlan.credentialBundle.apiCredentials.size() == 1, "apply_credentials_copies_bundle");
   suite.expect(containerPlan.credentialBundle.tlsIdentities.size() == 1, "apply_credentials_copies_tls_bundle");
   suite.expect(containerPlan.credentialBundle.bundleGeneration == 77, "apply_credentials_copies_generation");
+
+  Machine machine = {};
+  machine.uuid = uint128_t(0x6006);
+  machine.neuron.isFixedFile = true;
+  machine.neuron.fslot = 6;
+  machine.neuron.connected = true;
+  ContainerView liveContainer = {};
+  liveContainer.uuid = uint128_t(0x6007);
+  liveContainer.machine = &machine;
+  liveContainer.deploymentID = deploymentPlan.config.deploymentID();
+  liveContainer.state = ContainerState::healthy;
+  ApplicationDeployment deployment = {};
+  deployment.plan = deploymentPlan;
+  deployment.containers.insert(&liveContainer);
+  brain.deployments.insert_or_assign(deploymentPlan.config.deploymentID(), &deployment);
+  Vector<String> updatedNames = {};
+  updatedNames.push_back("telnyx_bearer"_ctv);
+  updatedNames.push_back("cloudflare_dns"_ctv);
+  updatedNames.push_back("route53_dns"_ctv);
+  Vector<String> removedNames = {};
+  brain.pushApiCredentialDeltaToLiveContainers(6, set, updatedNames, removedNames, "unit-api-refresh"_ctv);
+  uint128_t refreshedContainer = {};
+  CredentialDelta delta = {};
+  suite.expect(extractQueuedCredentialDelta(machine, refreshedContainer, delta), "api_credential_delta_filters_dns_credentials");
+  suite.expect(delta.updatedApi.size() == 1 && delta.updatedApi[0].name.equal("telnyx_bearer"_ctv), "api_credential_delta_delivers_only_app_credential");
+  suite.expect(stringVectorContains(delta.removedApiNames, "cloudflare_dns"_ctv) && stringVectorContains(delta.removedApiNames, "route53_dns"_ctv), "api_credential_delta_removes_dns_credentials");
+  brain.deployments.erase(deploymentPlan.config.deploymentID());
 
   DeploymentPlan noPolicyPlan;
   ContainerPlan noPolicyContainerPlan;
@@ -3753,7 +3984,6 @@ static void testBrainHandlerReplicationPaths(TestSuite& suite)
   existingTls.factoryGeneration = 5;
   existingTls.updatedAtMs = 200;
   existingTls.defaultLeafValidityDays = 15;
-  existingTls.renewLeadPercent = 10;
   existingTls.keySourceMode = 1;
   existingTls.scheme = uint8_t(CryptoScheme::ed25519);
   suite.expect(generateApplicationTlsFactory(existingTls, failure), "replicate_tls_generate_existing_factory");
@@ -3926,6 +4156,60 @@ static void testBrainHandlerReplicationPaths(TestSuite& suite)
   pendingOperation.updatedAtMs = 12'345;
   pendingOperation.lastFailure.assign("waiting for resume"_ctv);
   runtimeState.pendingAddMachinesOperations.push_back(pendingOperation);
+
+  PublicTlsCertificateState publicTls = {};
+  publicTls.spec.applicationID = plan.config.applicationID;
+  publicTls.spec.deploymentID = plan.config.deploymentID();
+  publicTls.spec.wormholeName.assign("api"_ctv);
+  publicTls.spec.identityName.assign("api-public"_ctv);
+  publicTls.spec.domains.push_back("api.example.com"_ctv);
+  publicTls.spec.issuer.assign("letsencrypt"_ctv);
+  publicTls.spec.keyType.assign("ecdsa"_ctv);
+  publicTls.spec.staging = true;
+  publicTls.spec.dnsProvider.assign("cloudflare"_ctv);
+  publicTls.spec.dnsCredentialName.assign("prod-dns"_ctv);
+  publicTls.spec.dnsZone.assign("example.com"_ctv);
+  publicTls.spec.dnsTTL = 60;
+  publicTls.identity.name = publicTls.spec.identityName;
+  publicTls.identity.generation = 3;
+  publicTls.identity.notBeforeMs = 1'700'000'000'000;
+  publicTls.identity.notAfterMs = 1'700'086'400'000;
+  publicTls.identity.certPem.assign("cert"_ctv);
+  publicTls.identity.keyPem.assign("key"_ctv);
+  publicTls.identity.chainPem.assign("chain"_ctv);
+  publicTls.identity.dnsSans.push_back("api.example.com"_ctv);
+  publicTls.certbotCertName.assign("app40001-api"_ctv);
+  publicTls.lineagePath.assign("/var/lib/prodigy/certbot/7788/config/live/app40001-api"_ctv);
+  publicTls.generation = publicTls.identity.generation;
+  publicTls.nextRenewAtMs = prodigyCertificateRenewAtMs(publicTls.identity.notBeforeMs, publicTls.identity.notAfterMs, publicTls.spec.renewAfterLifetimePermille);
+  publicTls.lastAttemptMs = 1'700'010'000'000;
+  publicTls.lastSuccessMs = 1'700'010'001'000;
+  AcmeDNS01ChallengeState challenge = {};
+  challenge.provider = publicTls.spec.dnsProvider;
+  challenge.credentialName = publicTls.spec.dnsCredentialName;
+  challenge.zone = publicTls.spec.dnsZone;
+  challenge.name.assign("_acme-challenge.api.example.com."_ctv);
+  challenge.validation.assign("token"_ctv);
+  challenge.ttl = 60;
+  publicTls.pendingDNS01Challenges.push_back(challenge);
+  runtimeState.publicTlsCertificates.push_back(publicTls);
+
+  PrivateTlsVaultLifecycleState privateTls = {};
+  privateTls.applicationID = publicTls.spec.applicationID;
+  privateTls.factoryGeneration = 6;
+  privateTls.rootNotBeforeMs = 1'700'000'000'000;
+  privateTls.rootNotAfterMs = 1'725'920'000'000;
+  privateTls.intermediateNotBeforeMs = 1'700'000'000'000;
+  privateTls.intermediateNotAfterMs = 1'708'640'000'000;
+  privateTls.leafNotBeforeMs = 1'700'000'000'000;
+  privateTls.leafNotAfterMs = 1'701'296'000'000;
+  privateTls.leafNextRenewAtMs = prodigyCertificateRenewAtMs(privateTls.leafNotBeforeMs, privateTls.leafNotAfterMs, prodigyDefaultCertificateRenewAfterLifetimePermille);
+  privateTls.nextRenewAtMs = prodigyEarliestPositiveMs(
+      prodigyCertificateRenewAtMs(privateTls.intermediateNotBeforeMs, privateTls.intermediateNotAfterMs, prodigyDefaultCertificateRenewAfterLifetimePermille),
+      privateTls.leafNextRenewAtMs);
+  privateTls.lastAttemptMs = 1'700'020'000'000;
+  privateTls.lastSuccessMs = 1'700'020'001'000;
+  runtimeState.privateTlsVaultLifecycles.push_back(privateTls);
   {
     String serialized;
     BitseryEngine::serialize(serialized, runtimeState);
@@ -3937,6 +4221,8 @@ static void testBrainHandlerReplicationPaths(TestSuite& suite)
   suite.expect(brain.masterAuthorityRuntimeState == expectedRuntimeState, "replicate_master_authority_applies_runtime_state");
   suite.expect(brain.nextMintedClientTlsGeneration == runtimeState.nextMintedClientTlsGeneration, "replicate_master_authority_updates_client_tls_generation");
   suite.expect(brain.masterAuthorityRuntimeState.pendingAddMachinesOperations.size() == 1, "replicate_master_authority_restores_pending_addmachines_operation");
+  suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates.size() == 1 && prodigyPublicTlsCertificateStatesEqual(brain.masterAuthorityRuntimeState.publicTlsCertificates[0], publicTls), "replicate_master_authority_restores_public_tls_certificate_state");
+  suite.expect(brain.masterAuthorityRuntimeState.privateTlsVaultLifecycles.size() == 1 && prodigyPrivateTlsVaultLifecycleStatesEqual(brain.masterAuthorityRuntimeState.privateTlsVaultLifecycles[0], privateTls), "replicate_master_authority_restores_private_tls_lifecycle_state");
   suite.expect(brain.masterAuthorityApplyCalls == 1, "replicate_master_authority_calls_apply_hook");
   suite.expect(brain.persistCalls == 8, "replicate_master_authority_persists_on_apply");
 
@@ -3994,7 +4280,6 @@ static void testReconcileStateReplicatesCredentialAndTlsState(TestSuite& suite)
   tlsFactory.factoryGeneration = 77;
   tlsFactory.updatedAtMs = 111;
   tlsFactory.defaultLeafValidityDays = 21;
-  tlsFactory.renewLeadPercent = 15;
   tlsFactory.keySourceMode = 1;
   tlsFactory.scheme = uint8_t(CryptoScheme::ed25519);
   String failure;
@@ -4399,6 +4684,16 @@ static void testMothershipConfigureOwnsMachineConfigsForManagedSchemas(TestSuite
   incoming.runtimeEnvironment.aws.bootstrapCredentialRefreshFailureHint = "run aws sso login --profile default"_ctv;
   incoming.runtimeEnvironment.aws.instanceProfileName = "prodigy-controller-profile"_ctv;
   incoming.runtimeEnvironment.aws.instanceProfileArn = "arn:aws:iam::123456789012:instance-profile/prodigy-controller-profile"_ctv;
+  incoming.dnsProvider = "cloudflare"_ctv;
+  incoming.dnsCredential.name = "cluster-cf"_ctv;
+  incoming.dnsCredential.provider = "cloudflare"_ctv;
+  incoming.dnsCredential.material = "cf-token"_ctv;
+  incoming.dnsCredential.metadata.insert_or_assign("dnsZones"_ctv, "example.com"_ctv);
+  incoming.acme.accountEmail = "ops@example.com"_ctv;
+  incoming.acme.certbotInstall = "bundle"_ctv;
+  incoming.acme.certbotPath = "/opt/prodigy/certbot/bin/certbot"_ctv;
+  incoming.acme.certbotVersion = "5.6.0"_ctv;
+  incoming.acme.termsAgreed = true;
 
   MachineConfig machineConfig = {};
   machineConfig.slug = "c7i-flex.large"_ctv;
@@ -4445,6 +4740,16 @@ static void testMothershipConfigureOwnsMachineConfigsForManagedSchemas(TestSuite
   suite.expect(brain.brainConfig.runtimeEnvironment.aws.instanceProfileName.isInvariant() == false, "mothership_configure_owns_aws_instance_profile_name");
   suite.expect(brain.brainConfig.runtimeEnvironment.aws.instanceProfileArn.equals(incoming.runtimeEnvironment.aws.instanceProfileArn), "mothership_configure_copies_aws_instance_profile_arn");
   suite.expect(brain.brainConfig.runtimeEnvironment.aws.instanceProfileArn.isInvariant() == false, "mothership_configure_owns_aws_instance_profile_arn");
+  suite.expect(brain.brainConfig.dnsProvider.equal("cloudflare"_ctv), "mothership_configure_applies_dns_provider");
+  suite.expect(brain.brainConfig.dnsProvider.isInvariant() == false, "mothership_configure_owns_dns_provider");
+  suite.expect(brain.brainConfig.dnsCredential.name.equal("cluster-cf"_ctv), "mothership_configure_applies_dns_credential_name");
+  suite.expect(brain.brainConfig.dnsCredential.material.equal("cf-token"_ctv), "mothership_configure_applies_dns_credential_material");
+  suite.expect(brain.brainConfig.dnsCredential.metadata["dnsZones"_ctv].equal("example.com"_ctv), "mothership_configure_applies_dns_credential_metadata");
+  suite.expect(brain.brainConfig.acme.accountEmail.equal("ops@example.com"_ctv), "mothership_configure_applies_acme_email");
+  suite.expect(brain.brainConfig.acme.certbotInstall.equal("bundle"_ctv), "mothership_configure_applies_acme_certbot_install");
+  suite.expect(brain.brainConfig.acme.certbotPath.equal("/opt/prodigy/certbot/bin/certbot"_ctv), "mothership_configure_applies_acme_certbot_path");
+  suite.expect(brain.brainConfig.acme.certbotVersion.equal("5.6.0"_ctv), "mothership_configure_applies_acme_certbot_version");
+  suite.expect(brain.brainConfig.acme.termsAgreed, "mothership_configure_applies_acme_terms");
 
   serializedConfigure.reset();
   configureBuffer.reset();
@@ -4575,6 +4880,7 @@ static void testMothershipConfigureLowersSharedCPUOvercommitWithoutMovingClaims(
 
   BrainConfig incoming = {};
   incoming.sharedCPUOvercommitPermille = 1000;
+  incoming.machineReservedResources = prodigySmokeMachineReservedResources;
   MachineConfig machineConfig = {};
   machineConfig.slug = machine.slug;
   machineConfig.nLogicalCores = 4;
@@ -4590,6 +4896,8 @@ static void testMothershipConfigureLowersSharedCPUOvercommitWithoutMovingClaims(
   brain.mothershipHandler(&mothership, configureMessage);
 
   suite.expect(brain.brainConfig.sharedCPUOvercommitPermille == 1000, "mothership_configure_applies_shared_cpu_overcommit");
+  suite.expect(brain.brainConfig.machineReservedResources == prodigySmokeMachineReservedResources, "mothership_configure_applies_resource_reservation");
+  suite.expect(machine.ownedLogicalCores == 4, "mothership_configure_resource_reservation_keeps_smoke_cores");
   suite.expect(brain.persistCalls == 1, "mothership_configure_shared_cpu_overcommit_persists_runtime_state");
   suite.expect(machine.claims.size() == 1, "mothership_configure_shared_cpu_overcommit_keeps_existing_claims");
   suite.expect(machine.sharedCPUMillisCommitted == 6000, "mothership_configure_shared_cpu_overcommit_preserves_committed_shared_cpu");
@@ -6654,6 +6962,7 @@ static void testRegisteredRoutablePrefixRefreshReplaysToNeuronsFollowersAndConta
   registered.ingressScope = RoutableIngressScope::singleMachine;
   registered.usage = ExternalSubnetUsage::wormholes;
   registered.subnet = IPPrefix("203.0.113.55", false, 32);
+  registered.deliverySubnet = IPPrefix("10.0.0.55", false, 32);
   brain.brainConfig.distributableExternalSubnets.push_back(registered);
 
   brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
@@ -6664,8 +6973,10 @@ static void testRegisteredRoutablePrefixRefreshReplaysToNeuronsFollowersAndConta
   suite.expect(changed, "registered_routable_refresh_changes_deployment_plan");
   suite.expect(deployment.plan.wormholes.size() == 1, "registered_routable_refresh_keeps_single_wormhole");
   suite.expect(deployment.plan.wormholes[0].externalAddress.equals(registered.subnet.network), "registered_routable_refresh_updates_deployment_external_address");
+  suite.expect(deployment.plan.wormholes[0].deliveryAddress.equals(registered.deliverySubnet.network), "registered_routable_refresh_updates_deployment_delivery_address");
   suite.expect(container.wormholes.size() == 1, "registered_routable_refresh_updates_live_container_wormholes");
   suite.expect(container.wormholes[0].externalAddress.equals(registered.subnet.network), "registered_routable_refresh_live_container_matches_resolved_address");
+  suite.expect(container.wormholes[0].deliveryAddress.equals(registered.deliverySubnet.network), "registered_routable_refresh_live_container_matches_delivery_address");
   suite.expect(brain.persistCalls == 1, "registered_routable_refresh_persists_runtime_state");
 
   bool sawNeuronOpen = false;
@@ -6771,6 +7082,7 @@ static void testRegisteredRoutablePrefixWormholesRefreshHostedIngressBeforeOpen(
   registered.ingressScope = RoutableIngressScope::singleMachine;
   registered.usage = ExternalSubnetUsage::wormholes;
   registered.subnet = IPPrefix("2001:db8:100::99", true, 128);
+  registered.deliverySubnet = IPPrefix("2001:db8:200::99", true, 128);
   brain.brainConfig.distributableExternalSubnets.push_back(registered);
 
   ContainerView container = {};
@@ -6782,6 +7094,7 @@ static void testRegisteredRoutablePrefixWormholesRefreshHostedIngressBeforeOpen(
   Vector<Wormhole> wormholes = {};
   Wormhole wormhole = {};
   wormhole.externalAddress = IPAddress("2001:db8:100::1", true);
+  wormhole.deliveryAddress = registered.deliverySubnet.network;
   wormhole.externalPort = 443;
   wormhole.containerPort = 8443;
   wormhole.layer4 = IPPROTO_UDP;
@@ -6815,7 +7128,7 @@ static void testRegisteredRoutablePrefixWormholesRefreshHostedIngressBeforeOpen(
         if (BitseryEngine::deserializeSafe(payload, prefixes))
         {
           IPPrefix expectedPrefix = {};
-          if (makeHostedIngressPrefixForAddress(registered.subnet.network, expectedPrefix))
+          if (makeHostedIngressPrefixForAddress(registered.deliverySubnet.network, expectedPrefix))
           {
             for (const IPPrefix& prefix : prefixes)
             {
@@ -7223,6 +7536,64 @@ static void testUpdateSelfFinalRelinquishPersistsDesignatedHandoff(TestSuite& su
   brain.brains.erase(&designatedPeer);
 }
 
+static void testUpdateProdigyRespondsBeforeSingleBrainTransition(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+
+  String stagedPath = prodigyStagedBundlePath();
+  String previousStagedBundle = {};
+  bool hadStagedBundle = prodigyFileReadable(stagedPath);
+  if (hadStagedBundle)
+  {
+    Filesystem::openReadAtClose(-1, stagedPath, previousStagedBundle);
+  }
+  auto restoreStagedBundle = [&]() {
+    if (hadStagedBundle)
+    {
+      Filesystem::openWriteAtClose(-1, stagedPath, previousStagedBundle);
+    }
+    else
+    {
+      ::unlink(stagedPath.c_str());
+    }
+  };
+
+  TestBrain brain = {};
+  brain.nBrains = 1;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+
+  Mothership mothership = {};
+  mothership.isFixedFile = true;
+  mothership.fslot = 42;
+  brain.mothership = &mothership;
+  brain.activeMotherships.insert(&mothership);
+
+  String bundle = "unit-update-bundle"_ctv;
+  String messageBuffer = {};
+  Message *message = buildMothershipMessage(messageBuffer, MothershipTopic::updateProdigy, bundle);
+  brain.mothershipHandler(&mothership, message);
+
+  Message *responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
+  String serializedResponse = {};
+  uint8_t *responseArgs = responseMessage->args;
+  Message::extractToStringView(responseArgs, serializedResponse);
+  MothershipResponse response = {};
+  suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response), "update_prodigy_response_deserializes");
+  suite.expect(response.success, "update_prodigy_response_success");
+  suite.expect(brain.updateSelfTransitionAfterMothershipAck, "update_prodigy_single_brain_defers_transition_until_ack");
+  suite.expect(brain.transitionToNewBundleCalls == 0, "update_prodigy_single_brain_no_transition_before_ack_send");
+
+  mothership.pendingSend = true;
+  mothership.pendingSendBytes = uint32_t(mothership.wBuffer.outstandingBytes());
+  mothership.noteSendQueued();
+  brain.sendHandler(static_cast<void *>(&mothership), int(mothership.pendingSendBytes));
+  suite.expect(brain.transitionToNewBundleCalls == 1, "update_prodigy_single_brain_transitions_after_ack_send");
+
+  brain.activeMotherships.erase(&mothership);
+  restoreStagedBundle();
+}
+
 static void testPersistentMasterAuthorityPackageRestore(TestSuite& suite)
 {
   TestBrain source;
@@ -7234,7 +7605,6 @@ static void testPersistentMasterAuthorityPackageRestore(TestSuite& suite)
   tlsFactory.factoryGeneration = 4;
   tlsFactory.updatedAtMs = 111;
   tlsFactory.defaultLeafValidityDays = 20;
-  tlsFactory.renewLeadPercent = 10;
   tlsFactory.keySourceMode = 1;
   tlsFactory.scheme = uint8_t(CryptoScheme::ed25519);
   suite.expect(generateApplicationTlsFactory(tlsFactory, failure), "restore_package_generate_tls_factory");
@@ -7621,7 +7991,6 @@ static void testImportedTlsFactoryValidationRejectsBrokenPem(TestSuite& suite)
   request.importRootKeyPem.assign("invalid-root-key"_ctv);
   request.importIntermediateCertPem.assign("invalid-intermediate-cert"_ctv);
   request.importIntermediateKeyPem.assign("invalid-intermediate-key"_ctv);
-  request.renewLeadPercent = 10;
 
   String serializedRequest;
   BitseryEngine::serialize(serializedRequest, request);
@@ -7666,7 +8035,6 @@ static void testImportedTlsFactoryEnablesBundleBuild(TestSuite& suite)
   request.importIntermediateCertPem = generated.intermediateCertPem;
   request.importIntermediateKeyPem = generated.intermediateKeyPem;
   request.defaultLeafValidityDays = 15;
-  request.renewLeadPercent = 10;
 
   String serializedRequest;
   BitseryEngine::serialize(serializedRequest, request);
@@ -7683,14 +8051,23 @@ static void testImportedTlsFactoryEnablesBundleBuild(TestSuite& suite)
   TlsVaultFactoryUpsertResponse response = {};
   suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response), "mothership_upsert_tls_valid_import_deserializes_response");
   suite.expect(response.success, "mothership_upsert_tls_valid_import_success");
+  suite.expect(brain.masterAuthorityRuntimeState.privateTlsVaultLifecycles.size() == 1, "mothership_upsert_tls_valid_import_records_lifecycle");
+  if (brain.masterAuthorityRuntimeState.privateTlsVaultLifecycles.size() == 1)
+  {
+    const PrivateTlsVaultLifecycleState& lifecycle = brain.masterAuthorityRuntimeState.privateTlsVaultLifecycles[0];
+    suite.expect(lifecycle.applicationID == request.applicationID && lifecycle.factoryGeneration == response.factoryGeneration, "mothership_upsert_tls_valid_import_lifecycle_identity");
+    suite.expect(lifecycle.rootNotBeforeMs > 0 && lifecycle.rootNotAfterMs > lifecycle.rootNotBeforeMs, "mothership_upsert_tls_valid_import_lifecycle_root_times");
+    suite.expect(lifecycle.intermediateNotBeforeMs > 0 && lifecycle.intermediateNotAfterMs > lifecycle.intermediateNotBeforeMs, "mothership_upsert_tls_valid_import_lifecycle_intermediate_times");
+    suite.expect(lifecycle.leafNextRenewAtMs > lifecycle.leafNotBeforeMs && lifecycle.nextRenewAtMs == lifecycle.leafNextRenewAtMs, "mothership_upsert_tls_valid_import_lifecycle_leaf_drives_next_renewal");
+  }
 
   DeploymentPlan deploymentPlan;
   deploymentPlan.config.applicationID = request.applicationID;
+  deploymentPlan.config.versionID = 1;
   deploymentPlan.hasTlsIssuancePolicy = true;
   deploymentPlan.tlsIssuancePolicy.applicationID = request.applicationID;
   deploymentPlan.tlsIssuancePolicy.enablePerContainerLeafs = true;
   deploymentPlan.tlsIssuancePolicy.leafValidityDays = 15;
-  deploymentPlan.tlsIssuancePolicy.renewLeadPercent = 10;
   deploymentPlan.tlsIssuancePolicy.identityNames.push_back("inbound_server_tls"_ctv);
 
   ContainerView container;
@@ -7699,6 +8076,735 @@ static void testImportedTlsFactoryEnablesBundleBuild(TestSuite& suite)
   suite.expect(containerPlan.hasCredentialBundle, "mothership_upsert_tls_valid_import_sets_bundle_flag");
   suite.expect(containerPlan.credentialBundle.tlsIdentities.size() == 1, "mothership_upsert_tls_valid_import_builds_tls_bundle");
   suite.expect(containerPlan.credentialBundle.tlsIdentities[0].name.equal("inbound_server_tls"_ctv), "mothership_upsert_tls_valid_import_bundle_name");
+
+  ApplicationDeployment deployment = {};
+  deployment.plan = deploymentPlan;
+  container.uuid = uint128_t(0x6002);
+  container.state = ContainerState::healthy;
+  deployment.containers.insert(&container);
+  brain.deployments.insert_or_assign(deploymentPlan.config.deploymentID(), &deployment);
+  suite.expect(brain.pushPrivateTlsIdentityDeltaToLiveContainers(request.applicationID, "unit-test"_ctv) == 1, "mothership_upsert_tls_valid_import_pushes_live_tls_delta");
+}
+
+static void testCertificateLifecycleSchedulers(TestSuite& suite)
+{
+  {
+    int64_t baseRenewAtMs = prodigyCertificateRenewAtMs(1000, 1000 + int64_t(90) * 24 * 60 * 60 * 1000, prodigyDefaultCertificateRenewAfterLifetimePermille);
+    suite.expect(TestBrain::certificateLifecycleJitteredRenewAtMs(0, 1) == 0, "certificate_lifecycle_jitter_keeps_zero_renewal_disabled");
+    suite.expect(TestBrain::certificateLifecycleJitteredRenewAtMs(baseRenewAtMs, 1) == baseRenewAtMs + 1, "certificate_lifecycle_jitter_is_deterministic");
+    suite.expect(TestBrain::certificateLifecycleBackoffMs(1, 0) == TestBrain::certificateLifecycleBaseRetryDelayMs, "certificate_lifecycle_backoff_starts_at_base_delay");
+    suite.expect(TestBrain::certificateLifecycleBackoffMs(3, 0) == TestBrain::certificateLifecycleBaseRetryDelayMs * 4, "certificate_lifecycle_backoff_grows_exponentially");
+    suite.expect(TestBrain::certificateLifecycleBackoffMs(UINT32_MAX, 0) == TestBrain::certificateLifecycleMaxRetryDelayMs, "certificate_lifecycle_backoff_is_capped");
+    suite.expect(TestBrain::certificateLifecycleBackoffActive(1000, 1000, 0, 1, 0), "certificate_lifecycle_backoff_blocks_same_tick_retry");
+    suite.expect(TestBrain::certificateLifecycleBackoffActive(1000 + TestBrain::certificateLifecycleBaseRetryDelayMs, 1000, 0, 1, 0) == false, "certificate_lifecycle_backoff_expires_at_delay");
+  }
+
+  {
+    TestBrain brain;
+    brain.brainConfig.clusterUUID = uint128_t(0xAC01);
+    brain.brainConfig.controlSocketPath = "/run/prodigy/control.sock"_ctv;
+    brain.brainConfig.acme.accountEmail = "ops@example.com"_ctv;
+    brain.brainConfig.acme.termsAgreed = true;
+
+    DeploymentPlan plan = makeDeploymentPlan(60'010, 7);
+    installACMEZoneDNSCredential(brain, plan.config.applicationID, "prod-dns"_ctv, "example.com"_ctv);
+    Wormhole wormhole = {};
+    wormhole.name = "api"_ctv;
+    wormhole.hasDNSConfig = true;
+    wormhole.dns.provider = "cloudflare"_ctv;
+    wormhole.dns.credentialName = "prod-dns"_ctv;
+    wormhole.dns.zone = "023e105f4ecef8ad9ca31a8372d0c353"_ctv;
+    wormhole.dns.name = "Api.Example.COM."_ctv;
+    wormhole.dns.ttl = 60;
+    plan.wormholes.push_back(wormhole);
+
+    WormholePublicTLSConfig publicTLS = {};
+    publicTLS.wormholeName = wormhole.name;
+    publicTLS.identityName = "api-public"_ctv;
+    plan.publicTLS.push_back(publicTLS);
+
+    String failure = {};
+    suite.expect(brain.reconcilePublicTlsCertificateStatesForDeployment(plan, failure), "public_tls_reconcile_creates_state");
+    suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates.size() == 1, "public_tls_reconcile_state_count");
+    suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].spec.domains.size() == 1 && brain.masterAuthorityRuntimeState.publicTlsCertificates[0].spec.domains[0].equal("api.example.com"_ctv), "public_tls_reconcile_derives_canonical_domain");
+    suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].spec.dnsZone.equal("023e105f4ecef8ad9ca31a8372d0c353"_ctv), "public_tls_reconcile_preserves_provider_zone_id");
+
+    ScopedTempDir certbotTemp;
+    if (suite.require(certbotTemp.valid(), "public_tls_scheduler_lock_temp_dir") == false)
+    {
+      return;
+    }
+    ProdigyCertbotPaths paths = {};
+    paths.certbotPath = "/bin/false"_ctv;
+    std::string configDirText = (certbotTemp.path / "config").string();
+    std::string workDirText = (certbotTemp.path / "work").string();
+    paths.configDir.assign(configDirText.data(), configDirText.size());
+    paths.workDir.assign(workDirText.data(), workDirText.size());
+
+    int64_t nowMs = Time::now<TimeResolution::ms>();
+    int lockFD = -1;
+    bool lockBusy = false;
+    suite.expect(prodigyAcquireCertbotCertificateLock(brain.brainConfig, brain.masterAuthorityRuntimeState.publicTlsCertificates[0], paths, lockFD, &lockBusy, &failure), "public_tls_scheduler_lock_fixture_acquires");
+    suite.expect(brain.advancePublicTlsCertificateLifecycles(nowMs, paths) == 0, "public_tls_scheduler_lock_blocks_duplicate_spawn");
+    suite.expect(brain.publicTlsCertbotPids.empty() && brain.publicTlsCertbotLockFDs.empty(), "public_tls_scheduler_lock_skips_child_state");
+    suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].lastAttemptMs == 0, "public_tls_scheduler_lock_does_not_record_attempt");
+    prodigyReleaseCertbotLockFD(lockFD);
+
+    suite.expect(brain.advancePublicTlsCertificateLifecycles(nowMs, paths) == 1, "public_tls_scheduler_starts_certbot");
+    suite.expect(brain.publicTlsCertbotLockFDs.size() == 1, "public_tls_scheduler_records_certbot_lock");
+
+    uint32_t reaped = 0;
+    for (uint32_t attempt = 0; attempt < 100 && reaped == 0; attempt += 1)
+    {
+      reaped = brain.reapPublicTlsCertbotProcesses(Time::now<TimeResolution::ms>());
+      if (reaped == 0)
+      {
+        usleep(1000);
+      }
+    }
+    suite.expect(reaped == 1, "public_tls_scheduler_reaps_certbot");
+    suite.expect(brain.publicTlsCertbotLockFDs.empty(), "public_tls_scheduler_reap_releases_certbot_lock");
+    suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].lastSuccessMs == 0 && brain.masterAuthorityRuntimeState.publicTlsCertificates[0].lastFailure.size() > 0, "public_tls_scheduler_requires_import_hook");
+    suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].failureCount == 1, "public_tls_scheduler_records_failure_count");
+    suite.expect(brain.advancePublicTlsCertificateLifecycles(nowMs, paths) == 0, "public_tls_scheduler_backoff_blocks_same_tick_retry");
+  }
+
+  {
+    TestBrain brain;
+    brain.brainConfig.acme.accountEmail = "ops@example.com"_ctv;
+    brain.brainConfig.acme.termsAgreed = true;
+
+    DeploymentPlan plan = makeDeploymentPlan(60'017, 13);
+    installACMEZoneDNSCredential(brain, plan.config.applicationID, "prod-dns"_ctv, "example.com"_ctv);
+
+    RoutableResourceLease binding = {};
+    binding.kind = RoutableResourceLeaseKind::dnsRecord;
+    binding.owner = deploymentRoutableResourceLeaseOwner(plan);
+    binding.owner.name = "api-binding"_ctv;
+    binding.registeredPrefixUUID = uint128_t(0xAC1701);
+    binding.address = IPAddress("203.0.113.17", false);
+    binding.dnsProvider = "cloudflare"_ctv;
+    binding.dnsCredentialName = "prod-dns"_ctv;
+    binding.dnsZone = "example.com"_ctv;
+    binding.dnsName = "api.example.com"_ctv;
+    binding.dnsTTL = 60;
+    brain.routableResourceLeaseRuntimeState.push_back(binding);
+
+    Wormhole wormhole = {};
+    wormhole.name = "api"_ctv;
+    wormhole.hasDNSConfig = true;
+    wormhole.dns.bindingName = "api-binding"_ctv;
+    plan.wormholes.push_back(wormhole);
+
+    WormholePublicTLSConfig publicTLS = {};
+    publicTLS.wormholeName = wormhole.name;
+    publicTLS.identityName = "api-public"_ctv;
+    plan.publicTLS.push_back(publicTLS);
+
+    String failure = {};
+    suite.expect(brain.reconcilePublicTlsCertificateStatesForDeployment(plan, failure) == false && failure.equal("public TLS requires resolved wormhole DNS provider, credentialName, zone, and ttl"_ctv), "public_tls_reconcile_requires_resolved_dns_binding");
+    suite.expect(brain.resolveDeploymentWormholeDNSBinding(plan, plan.wormholes[0], failure), "public_tls_reconcile_resolves_dns_binding");
+    suite.expect(brain.reconcilePublicTlsCertificateStatesForDeployment(plan, failure), "public_tls_reconcile_accepts_resolved_dns_binding");
+    suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates.size() == 1, "public_tls_reconcile_dns_binding_state_count");
+    if (brain.masterAuthorityRuntimeState.publicTlsCertificates.size() == 1)
+    {
+      const PublicTlsCertificateSpec& spec = brain.masterAuthorityRuntimeState.publicTlsCertificates[0].spec;
+      suite.expect(spec.domains.size() == 1 && spec.domains[0].equal("api.example.com"_ctv), "public_tls_reconcile_dns_binding_derives_domain");
+      suite.expect(spec.dnsProvider.equal("cloudflare"_ctv) && spec.dnsCredentialName.equal("prod-dns"_ctv) && spec.dnsZone.equal("example.com"_ctv) && spec.dnsTTL == 60, "public_tls_reconcile_dns_binding_copies_provider_config");
+    }
+  }
+
+  {
+    TestBrain brain;
+    brain.brainConfig.acme.accountEmail = "ops@example.com"_ctv;
+    brain.brainConfig.acme.termsAgreed = true;
+
+    DeploymentPlan plan = makeDeploymentPlan(60'013, 10);
+    Wormhole wormhole = {};
+    wormhole.name = "api"_ctv;
+    wormhole.hasDNSConfig = true;
+    wormhole.dns.provider = "cloudflare"_ctv;
+    wormhole.dns.credentialName = "prod-dns"_ctv;
+    wormhole.dns.zone = "example.com"_ctv;
+    wormhole.dns.name = "api.example.com"_ctv;
+    wormhole.dns.ttl = 60;
+    plan.wormholes.push_back(wormhole);
+    WormholePublicTLSConfig publicTLS = {};
+    publicTLS.wormholeName = wormhole.name;
+    publicTLS.identityName = "api-public"_ctv;
+    plan.publicTLS.push_back(publicTLS);
+
+    String failure = {};
+    suite.expect(brain.reconcilePublicTlsCertificateStatesForDeployment(plan, failure) == false && failure.equal("public TLS DNS credential is not registered"_ctv), "public_tls_reconcile_requires_dns_credential");
+    installACMEZoneDNSCredential(brain, plan.config.applicationID, "prod-dns"_ctv, "example.net"_ctv);
+    suite.expect(brain.reconcilePublicTlsCertificateStatesForDeployment(plan, failure) == false && failure.equal("ACME DNS credential does not cover challenge zone"_ctv), "public_tls_reconcile_rejects_out_of_scope_dns_credential");
+
+    TestBrain accountBrain;
+    accountBrain.brainConfig.acme.accountEmail = "ops@example.com"_ctv;
+    accountBrain.brainConfig.acme.termsAgreed = true;
+    ApplicationApiCredentialSet accountSet = {};
+    accountSet.applicationID = plan.config.applicationID;
+    ApiCredential accountCredential = {};
+    accountCredential.name = "prod-dns"_ctv;
+    accountCredential.provider = "cloudflare"_ctv;
+    accountCredential.material = "secret"_ctv;
+    accountCredential.metadata.insert_or_assign("dnsScope"_ctv, "native-account"_ctv);
+    accountSet.credentials.push_back(accountCredential);
+    accountBrain.apiCredentialSetsByApp[accountSet.applicationID] = accountSet;
+    suite.expect(accountBrain.reconcilePublicTlsCertificateStatesForDeployment(plan, failure) == false && failure.equal("ACME DNS native-account scope requires dnsAccountScopeAccepted=true"_ctv), "public_tls_reconcile_rejects_unacknowledged_native_account_scope");
+    accountBrain.apiCredentialSetsByApp[accountSet.applicationID].credentials[0].metadata.insert_or_assign("dnsAccountScopeAccepted"_ctv, "true"_ctv);
+    suite.expect(accountBrain.reconcilePublicTlsCertificateStatesForDeployment(plan, failure), "public_tls_reconcile_accepts_native_account_scope");
+    DeploymentPlan outsideDomainPlan = plan;
+    outsideDomainPlan.publicTLS[0].domains.push_back("other.example.net"_ctv);
+    suite.expect(accountBrain.reconcilePublicTlsCertificateStatesForDeployment(outsideDomainPlan, failure) == false && failure.equal("public TLS domain is not covered by wormhole DNS"_ctv), "public_tls_reconcile_rejects_domain_outside_declared_dns");
+    plan.publicTLS[0].identityName = "../bad"_ctv;
+    suite.expect(accountBrain.reconcilePublicTlsCertificateStatesForDeployment(plan, failure) == false && failure.equal("public TLS identityName must be a safe path segment"_ctv), "public_tls_reconcile_rejects_unsafe_identity_name");
+
+    TestBrain serializedPlanBrain;
+    serializedPlanBrain.brainConfig.acme.accountEmail = "ops@example.com"_ctv;
+    serializedPlanBrain.brainConfig.acme.termsAgreed = true;
+    installACMEZoneDNSCredential(serializedPlanBrain, plan.config.applicationID, "prod-dns"_ctv, "example.com"_ctv);
+    DeploymentPlan invalidPublicTLS = makeDeploymentPlan(60'013, 10);
+    invalidPublicTLS.wormholes.push_back(wormhole);
+    invalidPublicTLS.publicTLS.push_back(publicTLS);
+    invalidPublicTLS.publicTLS[0].issuer = "other-ca"_ctv;
+    suite.expect(serializedPlanBrain.reconcilePublicTlsCertificateStatesForDeployment(invalidPublicTLS, failure) == false && failure.equal("public TLS issuer must be letsencrypt"_ctv), "public_tls_reconcile_rejects_serialized_issuer");
+    invalidPublicTLS.publicTLS[0] = publicTLS;
+    invalidPublicTLS.publicTLS[0].keyType = "ed25519"_ctv;
+    suite.expect(serializedPlanBrain.reconcilePublicTlsCertificateStatesForDeployment(invalidPublicTLS, failure) == false && failure.equal("public TLS keyType must be ecdsa or rsa"_ctv), "public_tls_reconcile_rejects_serialized_key_type");
+    invalidPublicTLS.publicTLS[0] = publicTLS;
+    invalidPublicTLS.publicTLS[0].renewAfterLifetimePermille = 0;
+    suite.expect(serializedPlanBrain.reconcilePublicTlsCertificateStatesForDeployment(invalidPublicTLS, failure) == false && failure.equal("public TLS renewAfterLifetimePermille must be in 1..999"_ctv), "public_tls_reconcile_rejects_serialized_renew_after");
+    invalidPublicTLS.publicTLS[0] = publicTLS;
+    invalidPublicTLS.publicTLS[0].domains.push_back("203.0.113.44"_ctv);
+    suite.expect(serializedPlanBrain.reconcilePublicTlsCertificateStatesForDeployment(invalidPublicTLS, failure) == false && failure.equal("ACME DNS-01 identifier must be a DNS name"_ctv), "public_tls_reconcile_rejects_ip_literal_domain");
+    invalidPublicTLS.publicTLS[0] = publicTLS;
+    invalidPublicTLS.publicTLS[0].domains.push_back("api_example.com"_ctv);
+    suite.expect(serializedPlanBrain.reconcilePublicTlsCertificateStatesForDeployment(invalidPublicTLS, failure) == false && failure.equal("ACME DNS-01 identifier is not a valid DNS name"_ctv), "public_tls_reconcile_rejects_invalid_dns_identifier");
+
+    DeploymentPlan privateIdentityCollisionPlan = makeDeploymentPlan(60'013, 10);
+    privateIdentityCollisionPlan.wormholes.push_back(wormhole);
+    privateIdentityCollisionPlan.hasTlsIssuancePolicy = true;
+    privateIdentityCollisionPlan.tlsIssuancePolicy.applicationID = privateIdentityCollisionPlan.config.applicationID;
+    privateIdentityCollisionPlan.tlsIssuancePolicy.enablePerContainerLeafs = true;
+    privateIdentityCollisionPlan.tlsIssuancePolicy.identityNames.push_back(publicTLS.identityName);
+    privateIdentityCollisionPlan.publicTLS.push_back(publicTLS);
+    suite.expect(serializedPlanBrain.reconcilePublicTlsCertificateStatesForDeployment(privateIdentityCollisionPlan, failure) == false && failure.equal("public TLS identityName conflicts with private TLS identityName"_ctv), "public_tls_reconcile_rejects_private_identity_collision");
+    suite.expect(serializedPlanBrain.masterAuthorityRuntimeState.publicTlsCertificates.empty(), "public_tls_reconcile_private_identity_collision_creates_no_state");
+
+    DeploymentPlan duplicateIdentityPlan = makeDeploymentPlan(60'013, 10);
+    duplicateIdentityPlan.wormholes.push_back(wormhole);
+    Wormhole secondWormhole = wormhole;
+    secondWormhole.name = "api2"_ctv;
+    secondWormhole.dns.name = "api2.example.com"_ctv;
+    duplicateIdentityPlan.wormholes.push_back(secondWormhole);
+    duplicateIdentityPlan.publicTLS.push_back(publicTLS);
+    WormholePublicTLSConfig secondPublicTLS = publicTLS;
+    secondPublicTLS.wormholeName = secondWormhole.name;
+    duplicateIdentityPlan.publicTLS.push_back(secondPublicTLS);
+    suite.expect(serializedPlanBrain.reconcilePublicTlsCertificateStatesForDeployment(duplicateIdentityPlan, failure) == false && failure.equal("public TLS identityName is already used"_ctv), "public_tls_reconcile_rejects_duplicate_identity_name");
+    suite.expect(serializedPlanBrain.masterAuthorityRuntimeState.publicTlsCertificates.empty(), "public_tls_reconcile_duplicate_identity_creates_no_state");
+  }
+
+  {
+    ScopedTempDir temp;
+    if (suite.require(temp.valid(), "public_tls_scheduler_timeout_temp_dir") == false)
+    {
+      return;
+    }
+    std::filesystem::path certbotPath = temp.path / "sleep-certbot";
+    suite.expect(writeTextFile(certbotPath, "#!/bin/sh\nsleep 30\n"), "public_tls_scheduler_timeout_writes_certbot_script");
+    std::filesystem::permissions(certbotPath, std::filesystem::perms::owner_exec | std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+
+    TestBrain brain;
+    TestDNSProvider dns;
+    brain.dnsProvider = &dns;
+    brain.brainConfig.clusterUUID = uint128_t(0xAC03);
+    brain.brainConfig.controlSocketPath = "/run/prodigy/control.sock"_ctv;
+    brain.brainConfig.dnsProvider = "cloudflare"_ctv;
+    brain.brainConfig.acme.accountEmail = "ops@example.com"_ctv;
+    brain.brainConfig.acme.termsAgreed = true;
+
+    DeploymentPlan plan = makeDeploymentPlan(60'015, 11);
+    installACMEZoneDNSCredential(brain, plan.config.applicationID, "prod-dns"_ctv, "example.com"_ctv);
+    Wormhole wormhole = {};
+    wormhole.name = "api"_ctv;
+    wormhole.hasDNSConfig = true;
+    wormhole.dns.provider = "cloudflare"_ctv;
+    wormhole.dns.credentialName = "prod-dns"_ctv;
+    wormhole.dns.zone = "example.com"_ctv;
+    wormhole.dns.name = "api.example.com"_ctv;
+    wormhole.dns.ttl = 60;
+    plan.wormholes.push_back(wormhole);
+    WormholePublicTLSConfig publicTLS = {};
+    publicTLS.wormholeName = wormhole.name;
+    publicTLS.identityName = "api-public"_ctv;
+    plan.publicTLS.push_back(publicTLS);
+
+    String failure = {};
+    suite.expect(brain.reconcilePublicTlsCertificateStatesForDeployment(plan, failure), "public_tls_scheduler_timeout_creates_state");
+    ProdigyDNSRecordBinding staleTXT = {};
+    staleTXT.provider = "cloudflare"_ctv;
+    staleTXT.credentialName = "prod-dns"_ctv;
+    staleTXT.zone = "example.com"_ctv;
+    staleTXT.name = "_acme-challenge.api.example.com."_ctv;
+    staleTXT.type = "TXT"_ctv;
+    staleTXT.values.push_back("stale-token"_ctv);
+    staleTXT.ttl = 60;
+    dns.activeTXT.push_back(staleTXT);
+    brain.masterAuthorityRuntimeState.publicTlsCertificates[0].pendingDNS01Challenges.push_back(TestBrain::acmeDNS01ChallengeStateFromRecord(staleTXT));
+    ProdigyCertbotPaths paths = {};
+    std::string certbotPathText = certbotPath.string();
+    paths.certbotPath.assign(certbotPathText.data(), certbotPathText.size());
+    int64_t nowMs = Time::now<TimeResolution::ms>();
+    suite.expect(brain.advancePublicTlsCertificateLifecycles(nowMs, paths) == 1, "public_tls_scheduler_timeout_starts_certbot");
+    String key = TestBrain::publicTlsCertificateRuntimeKey(brain.masterAuthorityRuntimeState.publicTlsCertificates[0]);
+    brain.publicTlsCertbotStartedAtMs.insert_or_assign(key, nowMs - TestBrain::publicTlsCertbotTimeoutMs - 1);
+    suite.expect(brain.reapPublicTlsCertbotProcesses(nowMs) == 1, "public_tls_scheduler_timeout_reaps_certbot");
+    suite.expect(brain.publicTlsCertbotPids.empty() && brain.publicTlsCertbotStartedAtMs.empty(), "public_tls_scheduler_timeout_clears_process_state");
+    suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].lastFailure.equal("certbot process timed out"_ctv), "public_tls_scheduler_timeout_records_failure");
+    suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].pendingDNS01Challenges.empty(), "public_tls_scheduler_timeout_forgets_cleaned_txt_value");
+    suite.expect(dns.cleanupTXTCalls == 1 && dns.activeTXT.empty(), "public_tls_scheduler_timeout_cleans_pending_txt_value");
+  }
+
+  {
+    TestBrain brain;
+    brain.brainConfig.acme.accountEmail = "ops@example.com"_ctv;
+    brain.brainConfig.acme.termsAgreed = true;
+    installACMEZoneDNSCredential(brain, 60'014, "prod-dns"_ctv, "example.com"_ctv);
+
+    auto publicTLSPlan = [](uint64_t versionID, const String& dnsName) {
+      DeploymentPlan plan = makeDeploymentPlan(60'014, versionID);
+      Wormhole wormhole = {};
+      wormhole.name = "api"_ctv;
+      wormhole.hasDNSConfig = true;
+      wormhole.dns.provider = "cloudflare"_ctv;
+      wormhole.dns.credentialName = "prod-dns"_ctv;
+      wormhole.dns.zone = "example.com"_ctv;
+      wormhole.dns.name = dnsName;
+      wormhole.dns.ttl = 60;
+      plan.wormholes.push_back(wormhole);
+      WormholePublicTLSConfig publicTLS = {};
+      publicTLS.wormholeName = wormhole.name;
+      publicTLS.identityName = "api-public"_ctv;
+      plan.publicTLS.push_back(publicTLS);
+      return plan;
+    };
+
+    String failure = {};
+    DeploymentPlan v1 = publicTLSPlan(1, "api.example.com"_ctv);
+    suite.expect(brain.reconcilePublicTlsCertificateStatesForDeployment(v1, failure), "public_tls_reconcile_upgrade_seeds_state");
+    brain.masterAuthorityRuntimeState.publicTlsCertificates[0].identity.name = "api-public"_ctv;
+    brain.masterAuthorityRuntimeState.publicTlsCertificates[0].identity.generation = 7;
+    brain.masterAuthorityRuntimeState.publicTlsCertificates[0].identity.certPem = "cert-v7"_ctv;
+    brain.masterAuthorityRuntimeState.publicTlsCertificates[0].identity.keyPem = "key-v7"_ctv;
+    brain.masterAuthorityRuntimeState.publicTlsCertificates[0].identity.notBeforeMs = 1'700'000'000'000;
+    brain.masterAuthorityRuntimeState.publicTlsCertificates[0].identity.notAfterMs = 1'700'086'400'000;
+    brain.masterAuthorityRuntimeState.publicTlsCertificates[0].identity.dnsSans.push_back("api.example.com"_ctv);
+
+    DeploymentPlan v2 = publicTLSPlan(2, "api.example.com"_ctv);
+    suite.expect(brain.reconcilePublicTlsCertificateStatesForDeployment(v2, failure), "public_tls_reconcile_upgrade_transfers_compatible_state");
+    suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates.size() == 1, "public_tls_reconcile_upgrade_keeps_single_state");
+    suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].spec.deploymentID == v2.config.deploymentID(), "public_tls_reconcile_upgrade_moves_owner");
+    suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].identity.certPem.equal("cert-v7"_ctv) && brain.masterAuthorityRuntimeState.publicTlsCertificates[0].identity.keyPem.equal("key-v7"_ctv), "public_tls_reconcile_upgrade_reuses_material");
+
+    DeploymentPlan v2Renew = publicTLSPlan(2, "api.example.com"_ctv);
+    v2Renew.publicTLS[0].renewAfterLifetimePermille = 500;
+    suite.expect(brain.reconcilePublicTlsCertificateStatesForDeployment(v2Renew, failure), "public_tls_reconcile_renew_policy_keeps_material");
+    const PublicTlsCertificateState& renewedPolicy = brain.masterAuthorityRuntimeState.publicTlsCertificates[0];
+    int64_t expectedRenewAtMs = TestBrain::certificateLifecycleJitteredRenewAtMs(
+        prodigyCertificateRenewAtMs(renewedPolicy.identity.notBeforeMs, renewedPolicy.identity.notAfterMs, renewedPolicy.spec.renewAfterLifetimePermille),
+        TestBrain::publicTlsCertificateJitterSeed(renewedPolicy));
+    suite.expect(renewedPolicy.identity.certPem.equal("cert-v7"_ctv) && renewedPolicy.nextRenewAtMs == expectedRenewAtMs, "public_tls_reconcile_renew_policy_reschedules_material");
+
+    DeploymentPlan v2Staging = publicTLSPlan(2, "api.example.com"_ctv);
+    v2Staging.publicTLS[0].staging = true;
+    suite.expect(brain.reconcilePublicTlsCertificateStatesForDeployment(v2Staging, failure), "public_tls_reconcile_staging_flip_updates_state");
+    suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].identity.certPem.size() == 0 && brain.masterAuthorityRuntimeState.publicTlsCertificates[0].nextRenewAtMs == 0, "public_tls_reconcile_staging_flip_drops_material");
+
+    ApplicationDeployment head = {};
+    DeploymentPlan v3 = publicTLSPlan(3, "api2.example.com"_ctv);
+    head.plan = v3;
+    brain.deploymentsByApp.insert_or_assign(v3.config.applicationID, &head);
+    suite.expect(brain.reconcilePublicTlsCertificateStatesForDeployment(v3, failure), "public_tls_reconcile_changed_domain_creates_new_state");
+    suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates.size() == 2, "public_tls_reconcile_changed_domain_keeps_old_until_release");
+    suite.expect(brain.releasePublicTlsCertificatesForDeployment(v2.config.deploymentID()) == 1, "public_tls_release_removes_untransferred_old_state");
+    suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates.size() == 1 && brain.masterAuthorityRuntimeState.publicTlsCertificates[0].spec.deploymentID == v3.config.deploymentID(), "public_tls_release_leaves_new_owner_state");
+  }
+
+  {
+    ScopedTempDir temp;
+    if (suite.require(temp.valid(), "public_tls_scheduler_recovery_temp_dir") == false)
+    {
+      return;
+    }
+
+    TestBrain brain;
+    brain.brainConfig.clusterUUID = uint128_t(0xAC02);
+    brain.brainConfig.controlSocketPath = "/run/prodigy/control.sock"_ctv;
+    brain.brainConfig.acme.accountEmail = "ops@example.com"_ctv;
+    brain.brainConfig.acme.termsAgreed = true;
+
+    DeploymentPlan plan = makeDeploymentPlan(60'012, 9);
+    installACMEZoneDNSCredential(brain, plan.config.applicationID, "prod-dns"_ctv, "example.com"_ctv);
+    Wormhole wormhole = {};
+    wormhole.name = "api"_ctv;
+    wormhole.hasDNSConfig = true;
+    wormhole.dns.provider = "cloudflare"_ctv;
+    wormhole.dns.credentialName = "prod-dns"_ctv;
+    wormhole.dns.zone = "example.com"_ctv;
+    wormhole.dns.name = "api.example.com"_ctv;
+    wormhole.dns.ttl = 60;
+    plan.wormholes.push_back(wormhole);
+
+    WormholePublicTLSConfig publicTLS = {};
+    publicTLS.wormholeName = wormhole.name;
+    publicTLS.identityName = "api-public"_ctv;
+    publicTLS.staging = true;
+    plan.publicTLS.push_back(publicTLS);
+
+    String failure = {};
+    suite.expect(brain.reconcilePublicTlsCertificateStatesForDeployment(plan, failure), "public_tls_scheduler_recovery_creates_state");
+    if (suite.require(brain.masterAuthorityRuntimeState.publicTlsCertificates.size() == 1, "public_tls_scheduler_recovery_state_count") == false)
+    {
+      return;
+    }
+
+    PublicTlsCertificateState& certificate = brain.masterAuthorityRuntimeState.publicTlsCertificates[0];
+    std::filesystem::path configDir = temp.path / "config";
+    std::filesystem::path lineageDir = configDir / "live" / toStdString(certificate.certbotCertName);
+    std::filesystem::create_directories(lineageDir);
+    Vector<String> domains = certificate.spec.domains;
+    String certPem = {};
+    String keyPem = {};
+    suite.expect(generateACMELineage(lineageDir, domains, certPem, keyPem), "public_tls_scheduler_recovery_writes_lineage");
+
+    certificate.lastAttemptMs = 1;
+    certificate.lastSuccessMs = 0;
+    certificate.failureCount = 2;
+    certificate.lastFailure.clear();
+    ProdigyCertbotPaths paths = {};
+    std::string configDirText = configDir.string();
+    paths.configDir.assign(configDirText.data(), configDirText.size());
+
+    suite.expect(brain.advancePublicTlsCertificateLifecycles(Time::now<TimeResolution::ms>(), paths) == 0, "public_tls_scheduler_recovery_imports_without_spawn");
+    suite.expect(certificate.identity.certPem.equals(certPem) && certificate.identity.keyPem.equals(keyPem), "public_tls_scheduler_recovery_imports_lineage_identity");
+    suite.expect(certificate.lastSuccessMs >= certificate.lastAttemptMs && certificate.lastFailure.size() == 0, "public_tls_scheduler_recovery_records_success");
+    suite.expect(certificate.failureCount == 0, "public_tls_scheduler_recovery_clears_failure_count");
+    suite.expect(brain.publicTlsCertbotPids.empty(), "public_tls_scheduler_recovery_leaves_no_child_pid");
+  }
+
+  {
+    ScopedTempDir temp;
+    if (suite.require(temp.valid(), "public_tls_scheduler_fake_certbot_temp_dir") == false)
+    {
+      return;
+    }
+
+    std::filesystem::path fixtureDir = temp.path / "fixture";
+    std::filesystem::create_directories(fixtureDir);
+    Vector<String> domains = {};
+    domains.push_back("api.example.com"_ctv);
+    String certPem = {};
+    String keyPem = {};
+    suite.expect(generateACMELineage(fixtureDir, domains, certPem, keyPem), "public_tls_scheduler_fake_certbot_writes_fixture");
+
+    TestBrain brain;
+    TestDNSProvider dns;
+    brain.dnsProvider = &dns;
+    brain.brainConfig.dnsProvider = "cloudflare"_ctv;
+    brain.brainConfig.clusterUUID = uint128_t(0xAC04);
+    brain.brainConfig.controlSocketPath = "/run/prodigy/control.sock"_ctv;
+    brain.brainConfig.acme.accountEmail = "ops@example.com"_ctv;
+    brain.brainConfig.acme.termsAgreed = true;
+
+    DeploymentPlan plan = makeDeploymentPlan(60'016, 12);
+    installACMEZoneDNSCredential(brain, plan.config.applicationID, "prod-dns"_ctv, "example.com"_ctv);
+    brain.apiCredentialSetsByApp[plan.config.applicationID].credentials[0].metadata.insert_or_assign("acmePropagationDelayMs"_ctv, "0"_ctv);
+    Wormhole wormhole = {};
+    wormhole.name = "api"_ctv;
+    wormhole.hasDNSConfig = true;
+    wormhole.dns.provider = "cloudflare"_ctv;
+    wormhole.dns.credentialName = "prod-dns"_ctv;
+    wormhole.dns.zone = "example.com"_ctv;
+    wormhole.dns.name = "api.example.com"_ctv;
+    wormhole.dns.ttl = 60;
+    plan.wormholes.push_back(wormhole);
+    WormholePublicTLSConfig publicTLS = {};
+    publicTLS.wormholeName = wormhole.name;
+    publicTLS.identityName = "api-public"_ctv;
+    publicTLS.staging = true;
+    plan.publicTLS.push_back(publicTLS);
+
+    String failure = {};
+    suite.expect(brain.reconcilePublicTlsCertificateStatesForDeployment(plan, failure), "public_tls_scheduler_fake_certbot_creates_state");
+    if (suite.require(brain.masterAuthorityRuntimeState.publicTlsCertificates.size() == 1, "public_tls_scheduler_fake_certbot_state_count") == false)
+    {
+      return;
+    }
+
+    Machine machine = {};
+    machine.uuid = uint128_t(0xAC1601);
+    machine.neuron.isFixedFile = true;
+    machine.neuron.fslot = 9;
+    machine.neuron.connected = true;
+    ContainerView container = {};
+    container.uuid = uint128_t(0xAC1602);
+    container.machine = &machine;
+    container.deploymentID = plan.config.deploymentID();
+    container.state = ContainerState::healthy;
+    ApplicationDeployment deployment = {};
+    deployment.plan = plan;
+    deployment.containers.insert(&container);
+    brain.deployments.insert_or_assign(plan.config.deploymentID(), &deployment);
+
+    std::filesystem::path certbotPath = temp.path / "fake-certbot";
+    std::filesystem::path configDir = temp.path / "config";
+    PublicTlsCertificateState& certificate = brain.masterAuthorityRuntimeState.publicTlsCertificates[0];
+    AcmeDNS01ChallengeRequest dnsRequest = {};
+    dnsRequest.clusterUUID = brain.brainConfig.clusterUUID;
+    dnsRequest.applicationID = plan.config.applicationID;
+    dnsRequest.deploymentID = plan.config.deploymentID();
+    dnsRequest.wormholeName = wormhole.name;
+    dnsRequest.certName = certificate.certbotCertName;
+    dnsRequest.identifier = "api.example.com"_ctv;
+    dnsRequest.validation = "fake-certbot-token"_ctv;
+    AcmeDNS01ChallengeResponse dnsResponse = {};
+    suite.expect(brain.applyACMEDNS01Challenge(dnsRequest, false, dnsResponse) && dnsResponse.success, "public_tls_scheduler_fake_dns_presents_challenge");
+    suite.expect(dns.activeTXT.size() == 1 && dns.activeTXT[0].name.equal("_acme-challenge.api.example.com."_ctv) && dns.activeTXT[0].values[0].equal("fake-certbot-token"_ctv), "public_tls_scheduler_fake_dns_records_value");
+    suite.expect(certificate.pendingDNS01Challenges.size() == 1, "public_tls_scheduler_fake_dns_records_pending_value");
+    suite.expect(brain.applyACMEDNS01Challenge(dnsRequest, true, dnsResponse) && dnsResponse.success, "public_tls_scheduler_fake_dns_cleans_challenge");
+    suite.expect(dns.activeTXT.empty() && certificate.pendingDNS01Challenges.empty(), "public_tls_scheduler_fake_dns_cleans_value");
+    std::filesystem::path lineageDir = configDir / "live" / toStdString(certificate.certbotCertName);
+    std::string script = "#!/bin/sh\nmkdir -p '" + lineageDir.string() + "' || exit 3\ncp '" + (fixtureDir / "fullchain.pem").string() + "' '" + (lineageDir / "fullchain.pem").string() + "' || exit 4\ncp '" + (fixtureDir / "privkey.pem").string() + "' '" + (lineageDir / "privkey.pem").string() + "' || exit 5\n";
+    suite.expect(writeTextFile(certbotPath, script), "public_tls_scheduler_fake_certbot_writes_script");
+    std::filesystem::permissions(certbotPath, std::filesystem::perms::owner_exec | std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+
+    ProdigyCertbotPaths paths = {};
+    std::string certbotPathText = certbotPath.string();
+    std::string configDirText = configDir.string();
+    paths.certbotPath.assign(certbotPathText.data(), certbotPathText.size());
+    paths.configDir.assign(configDirText.data(), configDirText.size());
+
+    int64_t nowMs = Time::now<TimeResolution::ms>();
+    suite.expect(brain.advancePublicTlsCertificateLifecycles(nowMs, paths) == 1, "public_tls_scheduler_fake_certbot_spawns");
+    uint32_t reaped = 0;
+    for (uint32_t attempt = 0; attempt < 100 && reaped == 0; attempt += 1)
+    {
+      reaped = brain.reapPublicTlsCertbotProcesses(Time::now<TimeResolution::ms>());
+      if (reaped == 0)
+      {
+        usleep(1000);
+      }
+    }
+    suite.expect(reaped == 1, "public_tls_scheduler_fake_certbot_reaps");
+    suite.expect(certificate.lastFailure.equal("certbot completed without importing lineage"_ctv), "public_tls_scheduler_fake_certbot_requires_recovery_import");
+    suite.expect(brain.advancePublicTlsCertificateLifecycles(nowMs, paths) == 0, "public_tls_scheduler_fake_certbot_recovers_lineage");
+    suite.expect(certificate.identity.certPem.equals(certPem) && certificate.identity.keyPem.equals(keyPem), "public_tls_scheduler_fake_certbot_imports_identity");
+
+    uint128_t refreshedContainer = 0;
+    CredentialDelta delta = {};
+    suite.expect(extractQueuedCredentialDelta(machine, refreshedContainer, delta), "public_tls_scheduler_fake_certbot_pushes_delta");
+    suite.expect(refreshedContainer == container.uuid && delta.updatedTls.size() == 1 && delta.updatedTls[0].keyPem.equals(keyPem), "public_tls_scheduler_fake_certbot_delta_carries_key");
+  }
+
+  {
+    TestBrain brain;
+    ApplicationTlsVaultFactory factory = {};
+    String failure = {};
+    factory.applicationID = 60'011;
+    factory.factoryGeneration = 5;
+    factory.keySourceMode = 0;
+    factory.defaultLeafValidityDays = 15;
+    suite.expect(generateApplicationTlsFactory(factory, failure, CryptoScheme::p256), "private_tls_scheduler_generates_factory");
+    brain.tlsVaultFactoriesByApp.insert_or_assign(factory.applicationID, factory);
+    suite.expect(brain.upsertPrivateTlsVaultLifecycleState(factory, Time::now<TimeResolution::ms>(), &failure), "private_tls_scheduler_seeds_lifecycle");
+    brain.masterAuthorityRuntimeState.privateTlsVaultLifecycles[0].nextRenewAtMs = 1;
+    brain.masterAuthorityRuntimeState.privateTlsVaultLifecycles[0].leafNextRenewAtMs = 2;
+
+    DeploymentPlan plan = makeDeploymentPlan(factory.applicationID, 8);
+    plan.hasTlsIssuancePolicy = true;
+    plan.tlsIssuancePolicy.applicationID = factory.applicationID;
+    plan.tlsIssuancePolicy.enablePerContainerLeafs = true;
+    plan.tlsIssuancePolicy.identityNames.push_back("inbound_server_tls"_ctv);
+
+    Machine machine = {};
+    machine.neuron.isFixedFile = true;
+    machine.neuron.fslot = 10;
+    machine.neuron.connected = true;
+
+    ContainerView container = {};
+    container.uuid = uint128_t(0xC011);
+    container.machine = &machine;
+    container.deploymentID = plan.config.deploymentID();
+    container.state = ContainerState::healthy;
+
+    ApplicationDeployment deployment = {};
+    deployment.plan = plan;
+    deployment.containers.insert(&container);
+    brain.deployments.insert_or_assign(plan.config.deploymentID(), &deployment);
+    brain.containers.insert_or_assign(container.uuid, &container);
+
+    CredentialBundle initialBundle = {};
+    uint64_t initialBundleGeneration = 0;
+    suite.expect(brain.buildTlsBundleForContainer(plan, container, initialBundle, initialBundleGeneration) && initialBundle.tlsIdentities.size() == 1, "private_tls_scheduler_builds_initial_leaf");
+    container.hasCredentialBundle = true;
+    container.credentialBundle = initialBundle;
+
+    int64_t nowMs = Time::now<TimeResolution::ms>();
+    suite.expect(brain.advancePrivateTlsVaultLifecycles(nowMs, true) == 1, "private_tls_scheduler_advances_lifecycle");
+    suite.expect(brain.tlsVaultFactoriesByApp[factory.applicationID].factoryGeneration == factory.factoryGeneration + 1, "private_tls_scheduler_rotates_authority_generation");
+    suite.expect(brain.masterAuthorityRuntimeState.privateTlsVaultLifecycles[0].lastSuccessMs == nowMs, "private_tls_scheduler_records_success");
+
+    uint128_t refreshedContainer = 0;
+    CredentialDelta delta = {};
+    suite.expect(extractQueuedCredentialDelta(machine, refreshedContainer, delta), "private_tls_scheduler_queues_delta");
+    suite.expect(refreshedContainer == container.uuid && delta.updatedTls.size() == 1 && delta.updatedTls[0].keyPem.size() > 0, "private_tls_scheduler_distributes_leaf");
+    suite.expect(delta.updatedTls.size() == 1 && delta.updatedTls[0].generation == factory.factoryGeneration + 1, "private_tls_scheduler_authority_renewal_bumps_identity_generation");
+    suite.expect(container.credentialBundle.tlsIdentities.size() == 1 && container.credentialBundle.tlsIdentities[0].generation == factory.factoryGeneration, "private_tls_scheduler_keeps_old_leaf_until_ack");
+    suite.expect(container.hasPendingCredentialBundle && container.pendingCredentialBundle.tlsIdentities.size() == 1 && container.pendingCredentialBundle.tlsIdentities[0].generation == factory.factoryGeneration + 1, "private_tls_scheduler_stages_new_leaf_until_ack");
+    suite.expect(brain.noteContainerCredentialRefreshAck(container.uuid), "private_tls_scheduler_ack_promotes_leaf");
+
+    uint64_t authorityGeneration = brain.tlsVaultFactoriesByApp[factory.applicationID].factoryGeneration;
+    machine.neuron.wBuffer.clear();
+    brain.masterAuthorityRuntimeState.privateTlsVaultLifecycles[0].nextRenewAtMs = 1;
+    brain.masterAuthorityRuntimeState.privateTlsVaultLifecycles[0].leafNextRenewAtMs = 1;
+    suite.expect(brain.advancePrivateTlsVaultLifecycles(nowMs + 1, true) == 1, "private_tls_scheduler_advances_leaf_lifecycle");
+    suite.expect(brain.tlsVaultFactoriesByApp[factory.applicationID].factoryGeneration == authorityGeneration + 1, "private_tls_scheduler_leaf_renewal_bumps_factory_generation");
+    suite.expect(extractQueuedCredentialDelta(machine, refreshedContainer, delta), "private_tls_scheduler_queues_leaf_delta");
+    suite.expect(delta.updatedTls.size() == 1 && delta.updatedTls[0].generation == authorityGeneration + 1, "private_tls_scheduler_leaf_renewal_bumps_identity_generation");
+    suite.expect(brain.noteContainerCredentialRefreshAck(container.uuid), "private_tls_scheduler_ack_promotes_second_leaf");
+
+    ApplicationTlsVaultFactory authorityBefore = brain.tlsVaultFactoriesByApp[factory.applicationID];
+    PrivateTlsVaultLifecycleState& authorityLifecycle = brain.masterAuthorityRuntimeState.privateTlsVaultLifecycles[0];
+    int64_t rootBaseRenewAtMs = prodigyCertificateRenewAtMs(authorityLifecycle.rootNotBeforeMs, authorityLifecycle.rootNotAfterMs, prodigyDefaultCertificateRenewAfterLifetimePermille);
+    int64_t rootRenewAtMs = TestBrain::certificateLifecycleJitteredRenewAtMs(rootBaseRenewAtMs, TestBrain::privateTlsVaultJitterSeed(authorityLifecycle) ^ 0xA11CE001ULL);
+    PrivateTlsVaultLifecycleState authorityProbe = authorityLifecycle;
+    authorityProbe.intermediateNotBeforeMs = 0;
+    authorityProbe.intermediateNotAfterMs = 0;
+    authorityProbe.nextRenewAtMs = rootBaseRenewAtMs;
+    suite.expect(rootRenewAtMs > rootBaseRenewAtMs, "private_tls_scheduler_authority_jitter_fixture");
+    suite.expect(TestBrain::privateTlsAuthorityRenewalDue(authorityProbe) == false, "private_tls_scheduler_authority_waits_for_jittered_deadline");
+    authorityProbe.nextRenewAtMs = rootRenewAtMs;
+    suite.expect(TestBrain::privateTlsAuthorityRenewalDue(authorityProbe), "private_tls_scheduler_authority_due_at_jittered_deadline");
+
+    int64_t intermediateBaseRenewAtMs = prodigyCertificateRenewAtMs(authorityLifecycle.intermediateNotBeforeMs, authorityLifecycle.intermediateNotAfterMs, prodigyDefaultCertificateRenewAfterLifetimePermille);
+    int64_t intermediateRenewAtMs = TestBrain::certificateLifecycleJitteredRenewAtMs(intermediateBaseRenewAtMs, TestBrain::privateTlsVaultJitterSeed(authorityLifecycle) ^ 0xA11CE002ULL);
+    PrivateTlsVaultLifecycleState intermediateProbe = authorityLifecycle;
+    intermediateProbe.rootNotBeforeMs = 0;
+    intermediateProbe.rootNotAfterMs = 0;
+    intermediateProbe.nextRenewAtMs = intermediateBaseRenewAtMs;
+    suite.expect(intermediateRenewAtMs > intermediateBaseRenewAtMs, "private_tls_scheduler_intermediate_jitter_fixture");
+    suite.expect(TestBrain::privateTlsAuthorityRenewalDue(intermediateProbe) == false, "private_tls_scheduler_intermediate_waits_for_jittered_deadline");
+    intermediateProbe.nextRenewAtMs = intermediateRenewAtMs;
+    suite.expect(TestBrain::privateTlsAuthorityRenewalDue(intermediateProbe), "private_tls_scheduler_intermediate_due_at_jittered_deadline");
+
+    authorityLifecycle.nextRenewAtMs = rootRenewAtMs;
+    authorityLifecycle.leafNextRenewAtMs = rootRenewAtMs + 1;
+    uint64_t acceptedPrivateGeneration = container.credentialBundle.tlsIdentities[0].generation;
+    String acceptedPrivateChain = container.credentialBundle.tlsIdentities[0].chainPem;
+    machine.neuron.wBuffer.clear();
+    suite.expect(rootRenewAtMs > nowMs && brain.advancePrivateTlsVaultLifecycles(rootRenewAtMs, true) == 1, "private_tls_scheduler_advances_authority_lifecycle_at_two_thirds");
+    const ApplicationTlsVaultFactory& authorityAfter = brain.tlsVaultFactoriesByApp[factory.applicationID];
+    suite.expect(authorityAfter.rootCertPem.equals(authorityBefore.rootCertPem) == false && authorityAfter.intermediateCertPem.equals(authorityBefore.intermediateCertPem) == false, "private_tls_scheduler_rotates_root_and_intermediate_material");
+    suite.expect(extractQueuedCredentialDelta(machine, refreshedContainer, delta), "private_tls_scheduler_queues_authority_delta");
+    String authorityChain = authorityAfter.intermediateCertPem;
+    authorityChain.append(authorityAfter.rootCertPem);
+    suite.expect(delta.updatedTls.size() == 1 && delta.updatedTls[0].generation == authorityAfter.factoryGeneration && delta.updatedTls[0].chainPem.equals(authorityChain), "private_tls_scheduler_authority_delta_carries_rotated_chain");
+    suite.expect(container.credentialBundle.tlsIdentities.size() == 1 && container.credentialBundle.tlsIdentities[0].generation == acceptedPrivateGeneration && container.credentialBundle.tlsIdentities[0].chainPem.equals(acceptedPrivateChain), "private_tls_scheduler_authority_overlap_keeps_old_chain_until_ack");
+    suite.expect(container.hasPendingCredentialBundle && container.pendingCredentialBundle.tlsIdentities.size() == 1 && container.pendingCredentialBundle.tlsIdentities[0].generation == authorityAfter.factoryGeneration && container.pendingCredentialBundle.tlsIdentities[0].chainPem.equals(authorityChain), "private_tls_scheduler_authority_overlap_stages_rotated_chain");
+  }
+
+  {
+    TestBrain brain;
+    ApplicationTlsVaultFactory factory = {};
+    String failure = {};
+    factory.applicationID = 60'014;
+    factory.factoryGeneration = 3;
+    factory.keySourceMode = 0;
+    factory.defaultLeafValidityDays = 30;
+    suite.expect(generateApplicationTlsFactory(factory, failure, CryptoScheme::p256), "private_tls_scheduler_override_generates_factory");
+    factory.defaultLeafValidityDays = 30;
+    brain.tlsVaultFactoriesByApp.insert_or_assign(factory.applicationID, factory);
+    int64_t leafNotBeforeMs = 1'000'000;
+    suite.expect(brain.upsertPrivateTlsVaultLifecycleState(factory, leafNotBeforeMs, &failure), "private_tls_scheduler_override_seeds_lifecycle");
+    PrivateTlsVaultLifecycleState& lifecycle = brain.masterAuthorityRuntimeState.privateTlsVaultLifecycles[0];
+    int64_t dayMs = int64_t(24) * 60 * 60 * 1000;
+    int64_t defaultRenewAtMs = TestBrain::certificateLifecycleJitteredRenewAtMs(prodigyCertificateRenewAtMs(leafNotBeforeMs, leafNotBeforeMs + int64_t(30) * dayMs, prodigyDefaultCertificateRenewAfterLifetimePermille), TestBrain::privateTlsVaultJitterSeed(lifecycle) ^ 0xA11CE003ULL);
+    suite.expect(lifecycle.leafNextRenewAtMs == defaultRenewAtMs, "private_tls_scheduler_override_starts_with_factory_default_leaf_schedule");
+
+    DeploymentPlan plan = makeDeploymentPlan(factory.applicationID, 11);
+    plan.hasTlsIssuancePolicy = true;
+    plan.tlsIssuancePolicy.applicationID = factory.applicationID;
+    plan.tlsIssuancePolicy.enablePerContainerLeafs = true;
+    plan.tlsIssuancePolicy.leafValidityDays = 3;
+    plan.tlsIssuancePolicy.identityNames.push_back("short_leaf_tls"_ctv);
+    ApplicationDeployment deployment = {};
+    deployment.plan = plan;
+    brain.deployments.insert_or_assign(plan.config.deploymentID(), &deployment);
+
+    int64_t overrideRenewAtMs = TestBrain::certificateLifecycleJitteredRenewAtMs(prodigyCertificateRenewAtMs(leafNotBeforeMs, leafNotBeforeMs + int64_t(3) * dayMs, prodigyDefaultCertificateRenewAfterLifetimePermille), TestBrain::privateTlsVaultJitterSeed(lifecycle) ^ 0xA11CE003ULL);
+    suite.expect(overrideRenewAtMs < defaultRenewAtMs, "private_tls_scheduler_override_fixture_shortens_schedule");
+    suite.expect(brain.advancePrivateTlsVaultLifecycles(overrideRenewAtMs - 1, false) == 0, "private_tls_scheduler_override_waits_until_short_leaf_deadline");
+    suite.expect(lifecycle.leafNextRenewAtMs == overrideRenewAtMs && lifecycle.nextRenewAtMs <= overrideRenewAtMs, "private_tls_scheduler_override_recomputes_shortest_live_leaf_schedule");
+    suite.expect(brain.advancePrivateTlsVaultLifecycles(overrideRenewAtMs, false) == 1, "private_tls_scheduler_override_advances_at_short_leaf_deadline");
+    suite.expect(brain.tlsVaultFactoriesByApp[factory.applicationID].factoryGeneration == factory.factoryGeneration + 1, "private_tls_scheduler_override_bumps_generation");
+    suite.expect(brain.masterAuthorityRuntimeState.privateTlsVaultLifecycles[0].leafNotAfterMs == overrideRenewAtMs + int64_t(3) * dayMs, "private_tls_scheduler_override_preserves_short_leaf_window_after_refresh");
+  }
+
+  {
+    TestBrain brain;
+    ApplicationTlsVaultFactory factory = {};
+    String failure = {};
+    factory.applicationID = 60'012;
+    factory.factoryGeneration = 5;
+    factory.keySourceMode = 1;
+    factory.defaultLeafValidityDays = 15;
+    suite.expect(generateApplicationTlsFactory(factory, failure, CryptoScheme::p256), "private_tls_scheduler_imported_generates_factory");
+    brain.tlsVaultFactoriesByApp.insert_or_assign(factory.applicationID, factory);
+    suite.expect(brain.upsertPrivateTlsVaultLifecycleState(factory, Time::now<TimeResolution::ms>(), &failure), "private_tls_scheduler_imported_seeds_lifecycle");
+    brain.masterAuthorityRuntimeState.privateTlsVaultLifecycles[0].nextRenewAtMs = 1;
+    brain.masterAuthorityRuntimeState.privateTlsVaultLifecycles[0].leafNextRenewAtMs = 1;
+
+    DeploymentPlan plan = makeDeploymentPlan(factory.applicationID, 9);
+    plan.hasTlsIssuancePolicy = true;
+    plan.tlsIssuancePolicy.applicationID = factory.applicationID;
+    plan.tlsIssuancePolicy.enablePerContainerLeafs = true;
+    plan.tlsIssuancePolicy.identityNames.push_back("inbound_server_tls"_ctv);
+
+    Machine machine = {};
+    machine.neuron.isFixedFile = true;
+    machine.neuron.fslot = 10;
+    machine.neuron.connected = true;
+
+    ContainerView container = {};
+    container.uuid = uint128_t(0xC012);
+    container.machine = &machine;
+    container.deploymentID = plan.config.deploymentID();
+    container.state = ContainerState::healthy;
+
+    ApplicationDeployment deployment = {};
+    deployment.plan = plan;
+    deployment.containers.insert(&container);
+    brain.deployments.insert_or_assign(plan.config.deploymentID(), &deployment);
+
+    int64_t nowMs = Time::now<TimeResolution::ms>();
+    suite.expect(brain.advancePrivateTlsVaultLifecycles(nowMs, true) == 1, "private_tls_scheduler_imported_advances_leaf_lifecycle");
+    suite.expect(brain.tlsVaultFactoriesByApp[factory.applicationID].factoryGeneration == factory.factoryGeneration + 1, "private_tls_scheduler_imported_leaf_bumps_factory_generation");
+
+    uint128_t refreshedContainer = 0;
+    CredentialDelta delta = {};
+    suite.expect(extractQueuedCredentialDelta(machine, refreshedContainer, delta), "private_tls_scheduler_imported_queues_leaf_delta");
+    suite.expect(refreshedContainer == container.uuid && delta.updatedTls.size() == 1 && delta.updatedTls[0].generation == factory.factoryGeneration + 1, "private_tls_scheduler_imported_distributes_leaf");
+
+    PrivateTlsVaultLifecycleState& lifecycle = brain.masterAuthorityRuntimeState.privateTlsVaultLifecycles[0];
+    lifecycle.nextRenewAtMs = TestBrain::certificateLifecycleJitteredRenewAtMs(prodigyCertificateRenewAtMs(lifecycle.rootNotBeforeMs, lifecycle.rootNotAfterMs, prodigyDefaultCertificateRenewAfterLifetimePermille), TestBrain::privateTlsVaultJitterSeed(lifecycle) ^ 0xA11CE001ULL);
+    machine.neuron.wBuffer.clear();
+    suite.expect(brain.advancePrivateTlsVaultLifecycles(lifecycle.nextRenewAtMs, true) == 0, "private_tls_scheduler_imported_blocks_authority_lifecycle");
+    suite.expect(brain.masterAuthorityRuntimeState.privateTlsVaultLifecycles[0].lastFailure.equal("external tls vault authority material requires operator refresh"_ctv), "private_tls_scheduler_imported_authority_requires_operator");
+    suite.expect(brain.masterAuthorityRuntimeState.privateTlsVaultLifecycles[0].failureCount == 1, "private_tls_scheduler_imported_authority_records_failure_count");
+    suite.expect(brain.advancePrivateTlsVaultLifecycles(lifecycle.nextRenewAtMs, true) == 0, "private_tls_scheduler_imported_authority_backoff_blocks_same_tick_retry");
+  }
 }
 
 static void testRegisterRoutablePrefixAcceptsSingleMachineHostPrefix(TestSuite& suite)
@@ -7968,6 +9074,14 @@ static void testDNSBindingTopicsReserveAddressAndApplyProvider(TestSuite& suite)
   DeploymentPlan boundPlan = {};
   boundPlan.config.applicationID = set.applicationID;
   boundPlan.config.versionID = 1;
+  boundPlan.config.architecture = nametagCurrentBuildMachineArchitecture();
+  boundPlan.config.filesystemMB = 64;
+  boundPlan.config.storageMB = 64;
+  boundPlan.config.memoryMB = 128;
+  boundPlan.config.nLogicalCores = 1;
+  boundPlan.stateless.nBase = 1;
+  boundPlan.stateless.maxPerRackRatio = 1.0f;
+  boundPlan.stateless.maxPerMachineRatio = 1.0f;
   Wormhole boundWormhole = {};
   boundWormhole.name = "api"_ctv;
   boundWormhole.externalPort = 443;
@@ -7976,6 +9090,48 @@ static void testDNSBindingTopicsReserveAddressAndApplyProvider(TestSuite& suite)
   boundWormhole.hasDNSConfig = true;
   boundWormhole.dns.bindingName = "api-binding"_ctv;
   boundPlan.wormholes.push_back(boundWormhole);
+  Machine machine = {};
+  machine.uuid = uint128_t(0xDDBB02);
+  machine.state = MachineState::healthy;
+  machine.lifetime = MachineLifetime::ondemand;
+  machine.hardware.cpu.architecture = boundPlan.config.architecture;
+  machine.nLogicalCores_available = 2;
+  machine.memoryMB_available = 4096;
+  machine.storageMB_available = 65'536;
+  Rack rack = {};
+  rack.uuid = 1;
+  machine.rackUUID = rack.uuid;
+  machine.rack = &rack;
+  rack.machines.insert(&machine);
+  brain.racks.insert_or_assign(rack.uuid, &rack);
+  brain.machines.insert(&machine);
+  BrainBase *previousBrain = thisBrain;
+  thisBrain = &brain;
+
+  String measureBuffer = {};
+  uint32_t measureHeader = Message::appendHeader(measureBuffer, MothershipTopic::measureApplication);
+  String serializedPlan = {};
+  BitseryEngine::serialize(serializedPlan, boundPlan);
+  Message::appendValue(measureBuffer, serializedPlan);
+  Message::finish(measureBuffer, measureHeader);
+  mothership.wBuffer.clear();
+  brain.mothershipHandler(&mothership, reinterpret_cast<Message *>(measureBuffer.data()));
+  responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
+  suite.expect(MothershipTopic(responseMessage->topic) == MothershipTopic::measureApplication, "measure_application_dns_binding_topic");
+  responseArgs = responseMessage->args;
+  uint32_t nBase = 0;
+  uint32_t nSurge = 0;
+  uint32_t nFit = 0;
+  Message::extractArg<ArgumentNature::fixed>(responseArgs, nBase);
+  Message::extractArg<ArgumentNature::fixed>(responseArgs, nSurge);
+  Message::extractArg<ArgumentNature::fixed>(responseArgs, nFit);
+  suite.expect(nBase == 1, "measure_application_dns_binding_base_target");
+  suite.expect(nSurge == 0, "measure_application_dns_binding_surge_target");
+  suite.expect(nFit >= 1, "measure_application_resolves_wormhole_dns_binding");
+  thisBrain = previousBrain;
+  brain.machines.erase(&machine);
+  brain.racks.erase(rack.uuid);
+
   String failure = {};
   suite.expect(brain.resolveDeploymentWormholeDNSBinding(boundPlan, boundPlan.wormholes[0], failure), "wormhole_dns_binding_resolves_existing_binding");
   suite.expect(boundPlan.wormholes[0].source == ExternalAddressSource::registeredRoutablePrefix, "wormhole_dns_binding_sets_registered_prefix_source");
@@ -8039,6 +9195,549 @@ static void testDNSBindingTopicsReserveAddressAndApplyProvider(TestSuite& suite)
   suite.expect(response.success, "mothership_delete_dns_binding_success");
   suite.expect(dns.removeCalls == 1, "mothership_delete_dns_binding_removes_provider_record");
   suite.expect(brain.routableResourceLeaseRuntimeState.empty(), "mothership_delete_dns_binding_releases_address_and_dns_leases");
+
+  DistributableExternalSubnet prefix6 = {};
+  prefix6.uuid = uint128_t(0xDDBB06);
+  prefix6.usage = ExternalSubnetUsage::wormholes;
+  prefix6.ingressScope = RoutableIngressScope::switchboardFleet;
+  prefix6.subnet = IPPrefix("2001:db8:113::", true, 64);
+  brain.brainConfig.distributableExternalSubnets.push_back(prefix6);
+
+  RoutableResourceLease binding6 = binding;
+  binding6.owner.name = "api-v6-binding"_ctv;
+  binding6.registeredPrefixUUID = prefix6.uuid;
+  binding6.address = IPAddress("2001:db8:113::77", true);
+  binding6.dnsName = "v6.example.com."_ctv;
+  binding6.dnsType = "AAAA"_ctv;
+  RoutableResourceLeaseReport response6 = {};
+  suite.expect(brain.upsertDNSBindingLease(binding6, response6), "dns_binding_upsert_aaaa_success");
+
+  DeploymentPlan boundPlan6 = boundPlan;
+  boundPlan6.config.versionID = 2;
+  boundPlan6.wormholes[0] = boundWormhole;
+  boundPlan6.wormholes[0].dns.bindingName = "api-v6-binding"_ctv;
+  ApplicationDeployment liveDeployment6 = {};
+  liveDeployment6.plan = boundPlan6;
+  brain.deployments.insert_or_assign(boundPlan6.config.deploymentID(), &liveDeployment6);
+
+  deletion.dnsName = "v6.example.com"_ctv;
+  deletion.dnsType = "AAAA"_ctv;
+  suite.expect(sendDeleteBinding(), "mothership_delete_dns_binding_aaaa_in_use_deserializes_response");
+  suite.expect(response.success == false, "mothership_delete_dns_binding_aaaa_rejects_live_deployment");
+  suite.expect(response.failure.equal("DNS binding is in use"_ctv), "mothership_delete_dns_binding_aaaa_in_use_failure_text");
+  suite.expect(dns.removeCalls == 1, "mothership_delete_dns_binding_aaaa_in_use_does_not_remove_provider_record");
+
+  mothership.wBuffer.clear();
+  messageBuffer.clear();
+  message = buildMothershipMessage(messageBuffer, MothershipTopic::teardownDNSBindings);
+  brain.mothershipHandler(&mothership, message);
+  responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
+  suite.expect(MothershipTopic(responseMessage->topic) == MothershipTopic::teardownDNSBindings, "mothership_teardown_dns_bindings_topic");
+  responseArgs = responseMessage->args;
+  Message::extractToStringView(responseArgs, serializedResponse);
+  response = {};
+  suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response), "mothership_teardown_dns_bindings_deserializes_response");
+  suite.expect(response.success, "mothership_teardown_dns_bindings_success");
+  suite.expect(response.leases.size() == 1 && response.leases[0].dnsType.equal("AAAA"_ctv), "mothership_teardown_dns_bindings_reports_aaaa");
+  suite.expect(dns.removeCalls == 2, "mothership_teardown_dns_bindings_removes_provider_record");
+  suite.expect(dns.removes.size() == 2 && dns.removes[1].type.equal("AAAA"_ctv) && dns.removes[1].values.size() == 1 && dns.removes[1].values[0].equal("2001:db8:113::77"_ctv), "mothership_teardown_dns_bindings_removes_aaaa_value");
+  suite.expect(brain.routableResourceLeaseRuntimeState.empty(), "mothership_teardown_dns_bindings_releases_aaaa_address_and_dns_leases");
+  brain.deployments.erase(boundPlan6.config.deploymentID());
+}
+
+static void testACMEDNS01ChallengeTopicsUsePublicTlsState(TestSuite& suite)
+{
+  TestBrain brain;
+  Mothership mothership;
+  TestDNSProvider dns;
+  brain.weAreMaster = true;
+  brain.brainConfig.clusterUUID = uint128_t(0xAC702);
+  brain.dnsProvider = &dns;
+  brain.brainConfig.dnsProvider = "cloudflare"_ctv;
+
+  ApplicationApiCredentialSet set = {};
+  set.applicationID = 702;
+  ApiCredential credential = {};
+  credential.name = "cf-prod"_ctv;
+  credential.provider = "cloudflare"_ctv;
+  credential.material = "secret"_ctv;
+  credential.metadata.insert_or_assign("dnsScope"_ctv, "native-zone"_ctv);
+  credential.metadata.insert_or_assign("dnsZones"_ctv, "example.com"_ctv);
+  credential.metadata.insert_or_assign("acmePropagationDelayMs"_ctv, "0"_ctv);
+  set.credentials.push_back(credential);
+  brain.apiCredentialSetsByApp[set.applicationID] = set;
+
+  PublicTlsCertificateState certificate = {};
+  certificate.spec.applicationID = set.applicationID;
+  certificate.spec.deploymentID = 9001;
+  certificate.spec.wormholeName = "api"_ctv;
+  certificate.spec.identityName = "api-public"_ctv;
+  certificate.spec.domains.push_back("*.example.com"_ctv);
+  certificate.spec.dnsProvider = "cloudflare"_ctv;
+  certificate.spec.dnsCredentialName = "cf-prod"_ctv;
+  certificate.spec.dnsZone = "example.com"_ctv;
+  certificate.spec.dnsTTL = 45;
+  certificate.certbotCertName = "app702-api"_ctv;
+  brain.masterAuthorityRuntimeState.publicTlsCertificates.push_back(certificate);
+  ProdigyDNSRecordBinding delayRecord = {};
+  delayRecord.ttl = certificate.spec.dnsTTL;
+  ApiCredential defaultCredential = {};
+  suite.expect(TestBrain::acmeDNSPropagationDelayMs(delayRecord, credential) == 0, "mothership_acme_present_dns01_test_uses_zero_propagation_delay");
+  suite.expect(TestBrain::acmeDNSPropagationDelayMs(delayRecord, defaultCredential) == 45'000, "mothership_acme_present_dns01_default_delay_uses_ttl");
+  String containmentFailure = {};
+  ApiCredential exactCredential = credential;
+  exactCredential.metadata.clear();
+  exactCredential.metadata.insert_or_assign("dnsScope"_ctv, "native-exact"_ctv);
+  exactCredential.metadata.insert_or_assign("dnsRecords"_ctv, "_acme-challenge.example.com."_ctv);
+  suite.expect(TestBrain::acmeDNSCredentialAllowsRecord(exactCredential, "_acme-challenge.example.com."_ctv, containmentFailure), "mothership_acme_dns_scope_allows_native_exact");
+  exactCredential.metadata.insert_or_assign("dnsScope"_ctv, "webhook-exact"_ctv);
+  suite.expect(TestBrain::acmeDNSCredentialAllowsRecord(exactCredential, "_acme-challenge.example.com."_ctv, containmentFailure), "mothership_acme_dns_scope_allows_webhook_exact");
+  exactCredential.metadata.clear();
+  exactCredential.metadata.insert_or_assign("dnsScope"_ctv, "native-account"_ctv);
+  suite.expect(TestBrain::acmeDNSCredentialAllowsRecord(exactCredential, "_acme-challenge.example.com."_ctv, containmentFailure) == false && containmentFailure.equal("ACME DNS native-account scope requires dnsAccountScopeAccepted=true"_ctv), "mothership_acme_dns_scope_rejects_unacknowledged_native_account");
+  exactCredential.metadata.insert_or_assign("dnsAccountScopeAccepted"_ctv, "true"_ctv);
+  suite.expect(TestBrain::acmeDNSCredentialAllowsRecord(exactCredential, "_acme-challenge.example.com."_ctv, containmentFailure), "mothership_acme_dns_scope_allows_native_account");
+
+  AcmeDNS01ChallengeRequest request = {};
+  request.clusterUUID = brain.brainConfig.clusterUUID;
+  request.applicationID = set.applicationID;
+  request.deploymentID = certificate.spec.deploymentID;
+  request.wormholeName = "api"_ctv;
+  request.certName = "app702-api"_ctv;
+  request.identifier = "*.example.com"_ctv;
+  request.validation = "token-1"_ctv;
+
+  auto sendChallenge = [&](MothershipTopic topic, AcmeDNS01ChallengeResponse& response) -> bool {
+    String serializedRequest = {};
+    BitseryEngine::serialize(serializedRequest, request);
+    String messageBuffer = {};
+    Message *message = buildMothershipMessage(messageBuffer, topic, serializedRequest);
+    mothership.wBuffer.clear();
+    brain.mothershipHandler(&mothership, message);
+    Message *responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
+    if (MothershipTopic(responseMessage->topic) != topic)
+    {
+      return false;
+    }
+    String serializedResponse = {};
+    uint8_t *responseArgs = responseMessage->args;
+    Message::extractToStringView(responseArgs, serializedResponse);
+    return BitseryEngine::deserializeSafe(serializedResponse, response);
+  };
+
+  AcmeDNS01ChallengeResponse response = {};
+  suite.expect(sendChallenge(MothershipTopic::presentACMEDNS01Challenge, response), "mothership_acme_present_dns01_deserializes_response");
+  suite.expect(response.success, "mothership_acme_present_dns01_success");
+  suite.expect(dns.presentTXTCalls == 1, "mothership_acme_present_dns01_calls_provider");
+  suite.expect(dns.presentedTXT.size() == 1 && dns.presentedTXT[0].name.equal("_acme-challenge.example.com."_ctv), "mothership_acme_present_dns01_canonicalizes_wildcard");
+  suite.expect(dns.presentedTXT.size() == 1 && dns.presentedTXT[0].type.equal("TXT"_ctv) && dns.presentedTXT[0].values.size() == 1 && dns.presentedTXT[0].values[0].equal("token-1"_ctv), "mothership_acme_present_dns01_uses_exact_txt_value");
+  suite.expect(dns.presentedTXT.size() == 1 && dns.presentedTXT[0].ttl == 45, "mothership_acme_present_dns01_uses_certificate_ttl");
+  suite.expect(dns.activeTXT.size() == 1 && dns.activeTXT[0].values[0].equal("token-1"_ctv), "mothership_acme_present_dns01_tracks_first_txt_value");
+  suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].pendingDNS01Challenges.size() == 1, "mothership_acme_present_dns01_records_pending_value");
+  suite.expect(brain.routableResourceLeaseRuntimeState.empty(), "mothership_acme_present_dns01_does_not_create_routable_lease");
+
+  request.validation = "token-2"_ctv;
+  response = {};
+  suite.expect(sendChallenge(MothershipTopic::presentACMEDNS01Challenge, response), "mothership_acme_present_dns01_second_value_response");
+  suite.expect(response.success, "mothership_acme_present_dns01_second_value_success");
+  suite.expect(dns.activeTXT.size() == 2, "mothership_acme_present_dns01_preserves_simultaneous_values");
+  suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].pendingDNS01Challenges.size() == 2, "mothership_acme_present_dns01_records_second_pending_value");
+
+  request.validation = "token-1"_ctv;
+  response = {};
+  suite.expect(sendChallenge(MothershipTopic::cleanupACMEDNS01Challenge, response), "mothership_acme_cleanup_dns01_deserializes_response");
+  suite.expect(response.success, "mothership_acme_cleanup_dns01_success");
+  suite.expect(dns.cleanupTXTCalls == 1 && dns.cleanedTXT.size() == 1 && dns.cleanedTXT[0].name.equal("_acme-challenge.example.com."_ctv), "mothership_acme_cleanup_dns01_removes_exact_name");
+  suite.expect(dns.activeTXT.size() == 1 && dns.activeTXT[0].values[0].equal("token-2"_ctv), "mothership_acme_cleanup_dns01_preserves_other_value");
+  suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].pendingDNS01Challenges.size() == 1 && brain.masterAuthorityRuntimeState.publicTlsCertificates[0].pendingDNS01Challenges[0].validation.equal("token-2"_ctv), "mothership_acme_cleanup_dns01_forgets_only_exact_value");
+  suite.expect(brain.routableResourceLeaseRuntimeState.empty(), "mothership_acme_cleanup_dns01_does_not_create_routable_lease");
+
+  brain.apiCredentialSetsByApp[set.applicationID].credentials[0].metadata.insert_or_assign("dnsZones"_ctv, "example.net"_ctv);
+  response = {};
+  suite.expect(sendChallenge(MothershipTopic::presentACMEDNS01Challenge, response), "mothership_acme_present_dns01_rejects_out_of_scope_credential_response");
+  suite.expect(response.success == false && response.failure.equal("ACME DNS credential does not cover challenge zone"_ctv), "mothership_acme_present_dns01_rejects_out_of_scope_credential");
+  suite.expect(dns.presentTXTCalls == 2, "mothership_acme_present_dns01_out_of_scope_skips_provider");
+
+  request.identifier = "evil.example.net"_ctv;
+  response = {};
+  suite.expect(sendChallenge(MothershipTopic::presentACMEDNS01Challenge, response), "mothership_acme_present_dns01_rejects_wrong_domain_response");
+  suite.expect(response.success == false && response.failure.equal("ACME identifier is not in certificate domains"_ctv), "mothership_acme_present_dns01_rejects_wrong_domain");
+  suite.expect(dns.presentTXTCalls == 2, "mothership_acme_present_dns01_wrong_domain_skips_provider");
+
+  brain.apiCredentialSetsByApp[set.applicationID].credentials[0].metadata.insert_or_assign("dnsZones"_ctv, "example.com"_ctv);
+  request.identifier = "*.example.com"_ctv;
+  request.clusterUUID = uint128_t(0xBAD702);
+  response = {};
+  suite.expect(sendChallenge(MothershipTopic::presentACMEDNS01Challenge, response), "mothership_acme_present_dns01_rejects_wrong_cluster_response");
+  suite.expect(response.success == false && response.failure.equal("ACME hook cluster UUID mismatch"_ctv), "mothership_acme_present_dns01_rejects_wrong_cluster");
+  suite.expect(dns.presentTXTCalls == 2, "mothership_acme_present_dns01_wrong_cluster_skips_provider");
+  request.clusterUUID = brain.brainConfig.clusterUUID;
+  suite.expect(brain.releasePublicTlsCertificatesForDeployment(certificate.spec.deploymentID) == 1, "mothership_acme_release_removes_certificate_state");
+  suite.expect(dns.cleanupTXTCalls == 2 && dns.cleanedTXT.back().values[0].equal("token-2"_ctv), "mothership_acme_release_cleans_pending_txt_value");
+  suite.expect(dns.activeTXT.empty(), "mothership_acme_release_leaves_no_active_txt_values");
+}
+
+static void testACMELineageImportValidatesAndDistributesPublicTls(TestSuite& suite)
+{
+  ScopedTempDir temp;
+  if (suite.require(temp.valid(), "mothership_acme_import_temp_dir") == false)
+  {
+    return;
+  }
+
+  Vector<String> domains = {};
+  domains.push_back("api.example.com"_ctv);
+  domains.push_back("*.example.com"_ctv);
+
+  const char *certbotCertName = "app703-api";
+  std::filesystem::path lineageDir = temp.path / "live" / certbotCertName;
+  std::filesystem::create_directories(lineageDir);
+  std::string lineagePath = lineageDir.string();
+  String certPem = {};
+  String keyPem = {};
+  if (suite.require(generateACMELineage(lineageDir, domains, certPem, keyPem), "mothership_acme_import_generates_lineage") == false)
+  {
+    return;
+  }
+
+  TestBrain brain;
+  Mothership mothership;
+  brain.weAreMaster = true;
+  brain.brainConfig.clusterUUID = uint128_t(0xAC703);
+
+  DeploymentPlan plan = makeDeploymentPlan(703, 91);
+  WormholePublicTLSConfig publicTLS = {};
+  publicTLS.wormholeName = "api"_ctv;
+  publicTLS.identityName = "api-public"_ctv;
+  publicTLS.domains = domains;
+  publicTLS.renewAfterLifetimePermille = 667;
+  publicTLS.staging = true;
+  plan.publicTLS.push_back(publicTLS);
+
+  PublicTlsCertificateState certificate = {};
+  certificate.spec.applicationID = plan.config.applicationID;
+  certificate.spec.deploymentID = plan.config.deploymentID();
+  certificate.spec.wormholeName = publicTLS.wormholeName;
+  certificate.spec.identityName = publicTLS.identityName;
+  certificate.spec.domains = domains;
+  certificate.spec.issuer = "letsencrypt"_ctv;
+  certificate.spec.keyType = "ecdsa"_ctv;
+  certificate.spec.staging = publicTLS.staging;
+  certificate.spec.renewAfterLifetimePermille = publicTLS.renewAfterLifetimePermille;
+  certificate.certbotCertName.assign(certbotCertName);
+  certificate.lineagePath.assign(lineagePath.data(), lineagePath.size());
+  certificate.failureCount = 4;
+  certificate.lastFailure = "previous acme failure"_ctv;
+  brain.masterAuthorityRuntimeState.publicTlsCertificates.push_back(certificate);
+
+  Machine machine = {};
+  machine.uuid = uint128_t(0xAC703);
+  machine.neuron.isFixedFile = true;
+  machine.neuron.fslot = 9;
+  machine.neuron.connected = true;
+  Machine secondMachine = {};
+  secondMachine.uuid = uint128_t(0xAC705);
+  secondMachine.neuron.isFixedFile = true;
+  secondMachine.neuron.fslot = 10;
+  secondMachine.neuron.connected = true;
+
+  ContainerView container = {};
+  container.uuid = uint128_t(0xAC704);
+  container.machine = &machine;
+  container.deploymentID = plan.config.deploymentID();
+  container.state = ContainerState::healthy;
+  ContainerView secondContainer = {};
+  secondContainer.uuid = uint128_t(0xAC706);
+  secondContainer.machine = &secondMachine;
+  secondContainer.deploymentID = plan.config.deploymentID();
+  secondContainer.state = ContainerState::healthy;
+
+  ApplicationDeployment deployment = {};
+  deployment.plan = plan;
+  deployment.containers.insert(&container);
+  deployment.containers.insert(&secondContainer);
+  brain.deployments.insert_or_assign(plan.config.deploymentID(), &deployment);
+
+  AcmeLineageImportRequest request = {};
+  request.clusterUUID = brain.brainConfig.clusterUUID;
+  request.applicationID = plan.config.applicationID;
+  request.deploymentID = plan.config.deploymentID();
+  request.wormholeName = publicTLS.wormholeName;
+  request.certName = certificate.certbotCertName;
+  request.lineagePath.assign(lineagePath.data(), lineagePath.size());
+  request.renewedDomains = domains;
+
+  String serializedRequest = {};
+  BitseryEngine::serialize(serializedRequest, request);
+  String messageBuffer = {};
+  Message *message = buildMothershipMessage(messageBuffer, MothershipTopic::importACMELineage, serializedRequest);
+  brain.mothershipHandler(&mothership, message);
+
+  Message *responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
+  String serializedResponse = {};
+  uint8_t *responseArgs = responseMessage->args;
+  Message::extractToStringView(responseArgs, serializedResponse);
+  AcmeLineageImportResponse response = {};
+  suite.expect(MothershipTopic(responseMessage->topic) == MothershipTopic::importACMELineage, "mothership_acme_import_response_topic");
+  suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response), "mothership_acme_import_deserializes_response");
+  suite.expect(response.success, "mothership_acme_import_success");
+
+  const PublicTlsCertificateState& stored = brain.masterAuthorityRuntimeState.publicTlsCertificates[0];
+  suite.expect(stored.identity.name.equal("api-public"_ctv), "mothership_acme_import_sets_identity_name");
+  suite.expect(stored.identity.certPem.equals(certPem), "mothership_acme_import_stores_leaf_cert");
+  suite.expect(stored.identity.keyPem.equals(keyPem), "mothership_acme_import_stores_private_key");
+  suite.expect(stored.identity.chainPem.size() > certPem.size(), "mothership_acme_import_stores_chain");
+  suite.expect(stored.identity.dnsSans.size() == 2 && stored.identity.dnsSans[0].equal("api.example.com"_ctv) && stored.identity.dnsSans[1].equal("*.example.com"_ctv), "mothership_acme_import_stores_dns_sans");
+  suite.expect(stringVectorContains(stored.identity.tags, "public"_ctv) && stringVectorContains(stored.identity.tags, "letsencrypt"_ctv) && stringVectorContains(stored.identity.tags, "wormhole:api"_ctv), "mothership_acme_import_tags_public_identity");
+  suite.expect(stored.identity.notAfterMs > stored.identity.notBeforeMs, "mothership_acme_import_stores_lifetime");
+  suite.expect(stored.nextRenewAtMs > stored.identity.notBeforeMs && stored.nextRenewAtMs < stored.identity.notAfterMs, "mothership_acme_import_sets_next_renewal");
+  suite.expect(response.generation == stored.identity.generation && stored.generation == stored.identity.generation, "mothership_acme_import_generation_matches_identity");
+  suite.expect(stored.lastSuccessMs == stored.lastAttemptMs && stored.lastFailure.size() == 0, "mothership_acme_import_records_success");
+  suite.expect(stored.failureCount == 0, "mothership_acme_import_clears_failure_count");
+  suite.expect(brain.persistCalls >= 1, "mothership_acme_import_persists_runtime_state");
+
+  uint128_t refreshedContainer = 0;
+  CredentialDelta delta = {};
+  suite.expect(extractQueuedCredentialDelta(machine, refreshedContainer, delta), "mothership_acme_import_queues_tls_delta");
+  suite.expect(refreshedContainer == container.uuid, "mothership_acme_import_delta_targets_container");
+  suite.expect(delta.updatedTls.size() == 1 && delta.updatedTls[0].keyPem.equals(keyPem), "mothership_acme_import_delta_carries_same_key");
+  suite.expect(delta.bundleGeneration == stored.identity.generation && delta.updatedTls[0].generation == stored.identity.generation, "mothership_acme_import_delta_generation_tracks_identity");
+  uint128_t secondRefreshedContainer = 0;
+  CredentialDelta secondDelta = {};
+  suite.expect(extractQueuedCredentialDelta(secondMachine, secondRefreshedContainer, secondDelta), "mothership_acme_import_queues_second_tls_delta");
+  suite.expect(secondRefreshedContainer == secondContainer.uuid && secondDelta.updatedTls.size() == 1 && secondDelta.updatedTls[0].keyPem.equals(keyPem) && secondDelta.updatedTls[0].generation == delta.updatedTls[0].generation, "mothership_acme_import_delta_carries_same_key_to_every_container");
+  suite.expect(secondDelta.bundleGeneration == stored.identity.generation, "mothership_acme_import_second_delta_generation_tracks_identity");
+
+  CredentialBundle startupBundle = {};
+  ContainerView startupContainer = {};
+  suite.expect(brain.buildCredentialBundleForContainer(plan, startupContainer, startupBundle), "mothership_acme_import_startup_bundle_builds");
+  suite.expect(startupBundle.tlsIdentities.size() == 1 && startupBundle.tlsIdentities[0].keyPem.equals(keyPem), "mothership_acme_import_startup_bundle_carries_public_tls");
+  suite.expect(startupBundle.bundleGeneration == stored.identity.generation, "mothership_acme_import_startup_bundle_generation_tracks_identity");
+
+  uint64_t firstGeneration = stored.identity.generation;
+  String renewedCertPem = {};
+  String renewedKeyPem = {};
+  suite.expect(generateACMELineage(lineageDir, domains, renewedCertPem, renewedKeyPem), "mothership_acme_import_generates_renewed_lineage");
+  machine.neuron.wBuffer.clear();
+  secondMachine.neuron.wBuffer.clear();
+  AcmeLineageImportResponse renewedResponse = {};
+  suite.expect(brain.importACMELineage(request, renewedResponse), "mothership_acme_import_renewal_success");
+  const PublicTlsCertificateState& renewedStored = brain.masterAuthorityRuntimeState.publicTlsCertificates[0];
+  suite.expect(renewedResponse.generation == firstGeneration + 1 && renewedStored.identity.generation == renewedResponse.generation && renewedStored.generation == renewedResponse.generation, "mothership_acme_import_renewal_increments_generation");
+  suite.expect(renewedStored.identity.certPem.equals(renewedCertPem) && renewedStored.identity.keyPem.equals(renewedKeyPem), "mothership_acme_import_renewal_stores_new_lineage");
+  suite.expect(extractQueuedCredentialDelta(machine, refreshedContainer, delta), "mothership_acme_import_renewal_queues_tls_delta");
+  suite.expect(delta.updatedTls.size() == 1 && delta.updatedTls[0].generation == renewedResponse.generation && delta.updatedTls[0].keyPem.equals(renewedKeyPem) && delta.bundleGeneration == renewedResponse.generation, "mothership_acme_import_renewal_delta_tracks_generation");
+  suite.expect(extractQueuedCredentialDelta(secondMachine, secondRefreshedContainer, secondDelta), "mothership_acme_import_renewal_queues_second_tls_delta");
+  suite.expect(secondDelta.updatedTls.size() == 1 && secondDelta.updatedTls[0].generation == renewedResponse.generation && secondDelta.updatedTls[0].keyPem.equals(renewedKeyPem) && secondDelta.bundleGeneration == renewedResponse.generation, "mothership_acme_import_renewal_delta_reaches_every_container");
+  startupBundle = {};
+  suite.expect(brain.buildCredentialBundleForContainer(plan, startupContainer, startupBundle), "mothership_acme_import_renewal_startup_bundle_builds");
+  suite.expect(startupBundle.tlsIdentities.size() == 1 && startupBundle.tlsIdentities[0].generation == renewedResponse.generation && startupBundle.tlsIdentities[0].keyPem.equals(renewedKeyPem) && startupBundle.bundleGeneration == renewedResponse.generation, "mothership_acme_import_renewal_startup_bundle_tracks_generation");
+
+  auto directImportFails = [&](const std::filesystem::path& path, const String& expectedFailure, bool managedPath = false) -> bool {
+    TestBrain importBrain;
+    importBrain.brainConfig.clusterUUID = brain.brainConfig.clusterUUID;
+    importBrain.masterAuthorityRuntimeState.publicTlsCertificates.push_back(certificate);
+    AcmeLineageImportRequest invalidRequest = request;
+    std::string invalidLineagePath = path.string();
+    invalidRequest.lineagePath.assign(invalidLineagePath.data(), invalidLineagePath.size());
+    if (managedPath)
+    {
+      importBrain.masterAuthorityRuntimeState.publicTlsCertificates[0].lineagePath = invalidRequest.lineagePath;
+    }
+    AcmeLineageImportResponse invalidResponse = {};
+    return importBrain.importACMELineage(invalidRequest, invalidResponse) == false && invalidResponse.failure.equal(expectedFailure);
+  };
+
+  suite.expect(directImportFails(temp.path, "ACME lineage path is not managed by this cluster"_ctv), "mothership_acme_import_rejects_unmanaged_lineage_path");
+  AcmeLineageImportRequest wrongClusterRequest = request;
+  wrongClusterRequest.clusterUUID = uint128_t(0xBAD703);
+  AcmeLineageImportResponse wrongClusterResponse = {};
+  suite.expect(brain.importACMELineage(wrongClusterRequest, wrongClusterResponse) == false && wrongClusterResponse.failure.equal("ACME hook cluster UUID mismatch"_ctv), "mothership_acme_import_rejects_wrong_cluster");
+
+  PublicTlsCertificateState nonStagingCertificate = certificate;
+  nonStagingCertificate.spec.staging = false;
+  TestBrain nonStagingBrain;
+  nonStagingBrain.brainConfig.clusterUUID = brain.brainConfig.clusterUUID;
+  nonStagingBrain.masterAuthorityRuntimeState.publicTlsCertificates.push_back(nonStagingCertificate);
+  AcmeLineageImportResponse nonStagingResponse = {};
+  suite.expect(nonStagingBrain.importACMELineage(request, nonStagingResponse) == false && nonStagingResponse.failure.equal("ACME certificate chain is not trusted"_ctv), "mothership_acme_import_rejects_untrusted_non_staging_chain");
+
+  ScopedTempDir ipTemp;
+  Vector<IPAddress> ipSans = {};
+  ipSans.push_back(IPAddress("203.0.113.70", false));
+  String ignoredCert = {};
+  String ignoredKey = {};
+  String wrongChain = {};
+  ScopedTempDir chainTemp;
+  ScopedTempDir invalidChainTemp;
+  std::filesystem::path chainDir = chainTemp.path / "live" / certbotCertName;
+  std::filesystem::path invalidChainDir = invalidChainTemp.path / "live" / certbotCertName;
+  std::filesystem::create_directories(chainDir);
+  std::filesystem::create_directories(invalidChainDir);
+  suite.expect(chainTemp.valid() && invalidChainTemp.valid() && generateACMELineage(chainDir, domains, ignoredCert, ignoredKey, nullptr, true, &wrongChain), "mothership_acme_import_generates_wrong_chain_lineage");
+  String invalidFullchain = certPem;
+  invalidFullchain.append(wrongChain);
+  suite.expect(writeTextFile(invalidChainDir / "fullchain.pem", toStdString(invalidFullchain)) && writeTextFile(invalidChainDir / "privkey.pem", toStdString(keyPem)), "mothership_acme_import_writes_invalid_chain_lineage");
+  suite.expect(directImportFails(invalidChainDir, "ACME certificate chain is invalid"_ctv, true), "mothership_acme_import_rejects_invalid_chain");
+
+  std::filesystem::path ipDir = ipTemp.path / "live" / certbotCertName;
+  std::filesystem::create_directories(ipDir);
+  suite.expect(ipTemp.valid() && generateACMELineage(ipDir, domains, ignoredCert, ignoredKey, &ipSans), "mothership_acme_import_generates_ip_san_lineage");
+  suite.expect(directImportFails(ipDir, "ACME certificate contains unexpected IP SANs"_ctv, true), "mothership_acme_import_rejects_ip_sans");
+
+  ScopedTempDir ekuTemp;
+  ignoredCert.clear();
+  ignoredKey.clear();
+  std::filesystem::path ekuDir = ekuTemp.path / "live" / certbotCertName;
+  std::filesystem::create_directories(ekuDir);
+  suite.expect(ekuTemp.valid() && generateACMELineage(ekuDir, domains, ignoredCert, ignoredKey, nullptr, false), "mothership_acme_import_generates_no_server_auth_lineage");
+  suite.expect(directImportFails(ekuDir, "ACME certificate is not valid for server authentication"_ctv, true), "mothership_acme_import_rejects_missing_server_auth");
+}
+
+static PublicTlsCertificateState makePublicTlsAckTestCertificate(const DeploymentPlan& plan)
+{
+  PublicTlsCertificateState certificate = {};
+  certificate.spec.applicationID = plan.config.applicationID;
+  certificate.spec.deploymentID = plan.config.deploymentID();
+  certificate.spec.wormholeName = "api"_ctv;
+  certificate.spec.identityName = "api-public"_ctv;
+  certificate.spec.domains.push_back("api.example.com"_ctv);
+  certificate.spec.issuer = "letsencrypt"_ctv;
+  certificate.spec.keyType = "ecdsa"_ctv;
+  certificate.certbotCertName = "app704-api"_ctv;
+  certificate.identity.name = certificate.spec.identityName;
+  certificate.identity.generation = 3;
+  certificate.identity.certPem = "cert-v3"_ctv;
+  certificate.identity.keyPem = "key-v3"_ctv;
+  certificate.identity.chainPem = "chain-v3"_ctv;
+  certificate.identity.dnsSans = certificate.spec.domains;
+  return certificate;
+}
+
+static void testTlsIdentityAckAndStaleState(TestSuite& suite)
+{
+  TestBrain brain = {};
+  brain.weAreMaster = true;
+
+  DeploymentPlan plan = makeDeploymentPlan(704, 11);
+  WormholePublicTLSConfig publicTLS = {};
+  publicTLS.wormholeName = "api"_ctv;
+  publicTLS.identityName = "api-public"_ctv;
+  publicTLS.domains.push_back("api.example.com"_ctv);
+  plan.publicTLS.push_back(publicTLS);
+
+  PublicTlsCertificateState certificate = makePublicTlsAckTestCertificate(plan);
+  brain.masterAuthorityRuntimeState.publicTlsCertificates.push_back(certificate);
+
+  Machine machine = {};
+  machine.uuid = uint128_t(0x7041);
+  machine.private4 = 0x0A000041;
+  machine.fragment = 0x1241;
+  machine.state = MachineState::healthy;
+  machine.runtimeReady = true;
+  machine.neuron.machine = &machine;
+  machine.neuron.isFixedFile = true;
+  machine.neuron.fslot = 41;
+  machine.neuron.connected = true;
+
+  ContainerView container = {};
+  container.uuid = uint128_t(0x7042);
+  container.machine = &machine;
+  container.deploymentID = plan.config.deploymentID();
+  container.applicationID = plan.config.applicationID;
+  container.lifetime = ApplicationLifetime::base;
+  container.state = ContainerState::healthy;
+  container.fragment = 2;
+  container.createdAtMs = 123'704;
+
+  ApplicationDeployment deployment = {};
+  deployment.plan = plan;
+  deployment.containers.insert(&container);
+  brain.deployments.insert_or_assign(plan.config.deploymentID(), &deployment);
+  brain.containers.insert_or_assign(container.uuid, &container);
+
+  String failure = {};
+  suite.expect(brain.tlsIdentityCoverageSatisfied(plan, &failure) == false, "tls_identity_freshness_missing_before_push");
+  suite.expect(failure.size() > 0, "tls_identity_freshness_missing_reports_failure");
+
+  TlsIdentity oldIdentity = certificate.identity;
+  oldIdentity.generation -= 1;
+  container.hasCredentialBundle = true;
+  container.credentialBundle.bundleGeneration = 99;
+  container.credentialBundle.tlsIdentities.push_back(oldIdentity);
+
+  suite.expect(brain.pushPublicTlsIdentityDeltaToLiveContainers(brain.masterAuthorityRuntimeState.publicTlsCertificates[0], "unit-test"_ctv) == 1, "tls_identity_freshness_pushes_public_delta");
+  suite.expect(container.hasPendingCredentialBundle, "tls_identity_freshness_records_pending_bundle");
+  uint128_t refreshedContainer = 0;
+  CredentialDelta pushedDelta = {};
+  suite.expect(extractQueuedCredentialDelta(machine, refreshedContainer, pushedDelta) && refreshedContainer == container.uuid && pushedDelta.bundleGeneration == 99 && container.pendingCredentialBundle.bundleGeneration == 99, "tls_identity_freshness_preserves_bundle_generation");
+  suite.expect(container.credentialBundle.tlsIdentities.size() == 1 && container.credentialBundle.tlsIdentities[0].generation == oldIdentity.generation, "tls_identity_freshness_keeps_old_generation_until_ack");
+  bool pending = false;
+  suite.expect(brain.containerTlsIdentitiesFresh(plan, container, &pending, nullptr) == false && pending, "tls_identity_freshness_pending_until_ack");
+
+  DeploymentStatusReport report = deployment.generateReport();
+  brain.summarizeDeploymentTlsIdentityFreshness(&deployment, report);
+  suite.expect(report.nTlsIdentityExpected == 1 && report.nTlsIdentityStale == 1 && report.nTlsIdentityPending == 1, "tls_identity_freshness_report_counts_pending_stale");
+
+  container.pendingCredentialBundleSinceMs = Time::now<TimeResolution::ms>() - TestBrain::credentialDeltaAckTimeoutMs - 1;
+  report = deployment.generateReport();
+  brain.summarizeDeploymentTlsIdentityFreshness(&deployment, report);
+  suite.expect(report.nTlsIdentityExpected == 1 && report.nTlsIdentityStale == 1 && report.nTlsIdentityPending == 0, "tls_identity_freshness_pending_expires_to_stale");
+  machine.neuron.wBuffer.clear();
+  suite.expect(brain.retryStaleTlsIdentityDeltas() == 1, "tls_identity_freshness_retries_expired_pending");
+  suite.expect(container.hasPendingCredentialBundle && container.pendingCredentialBundleSinceMs > 0, "tls_identity_freshness_retry_records_new_pending");
+
+  CredentialApplyAck rejectedAck = {};
+  TlsIdentityApplyResult tlsApply = {};
+  tlsApply.identityName = certificate.identity.name;
+  tlsApply.generation = certificate.identity.generation;
+  tlsApply.success = false;
+  tlsApply.failureReason = "application rejected TLS identity"_ctv;
+  rejectedAck.tlsResults.push_back(tlsApply);
+  suite.expect(brain.noteContainerCredentialApplyAck(container.uuid, rejectedAck) == false, "tls_identity_freshness_typed_reject_does_not_promote");
+  suite.expect(container.hasPendingCredentialBundle == false && container.credentialRefreshFailure.equal("application rejected TLS identity"_ctv), "tls_identity_freshness_typed_reject_records_failure");
+  suite.expect(container.credentialBundle.tlsIdentities.size() == 1 && container.credentialBundle.tlsIdentities[0].generation == oldIdentity.generation, "tls_identity_freshness_typed_reject_preserves_old_generation");
+  pending = false;
+  suite.expect(brain.containerTlsIdentitiesFresh(plan, container, &pending, nullptr) == false && pending == false, "tls_identity_freshness_rejected_is_stale_not_pending");
+
+  machine.neuron.wBuffer.clear();
+  suite.expect(brain.retryStaleTlsIdentityDeltas() == 1, "tls_identity_freshness_retries_after_typed_reject");
+  tlsApply.success = true;
+  tlsApply.failureReason.clear();
+  CredentialApplyAck acceptedAck = {};
+  acceptedAck.tlsResults.push_back(tlsApply);
+  suite.expect(brain.noteContainerCredentialApplyAck(container.uuid, acceptedAck), "tls_identity_freshness_typed_ack_promotes_pending");
+  suite.expect(container.hasPendingCredentialBundle == false && container.hasCredentialBundle, "tls_identity_freshness_ack_clears_pending");
+  suite.expect(container.credentialRefreshFailure.size() == 0, "tls_identity_freshness_typed_ack_clears_failure");
+  suite.expect(brain.tlsIdentityCoverageSatisfied(plan, &failure), "tls_identity_freshness_satisfied_after_ack");
+
+  report = deployment.generateReport();
+  brain.summarizeDeploymentTlsIdentityFreshness(&deployment, report);
+  suite.expect(report.nTlsIdentityExpected == 1 && report.nTlsIdentityFresh == 1 && report.nTlsIdentityStale == 0 && report.nTlsIdentityPending == 0, "tls_identity_freshness_report_counts_fresh");
+
+  container.hasCredentialBundle = false;
+  container.credentialBundle = {};
+  ContainerPlan uploadedPlan = container.generatePlan(plan);
+  uploadedPlan.hasCredentialBundle = true;
+  uploadedPlan.credentialBundle.tlsIdentities.push_back(certificate.identity);
+
+  String uploadBuffer = {};
+  uint32_t headerOffset = Message::appendHeader(uploadBuffer, NeuronTopic::stateUpload);
+  local_container_subnet6 fragment = {};
+  fragment.dpfx = 1;
+  fragment.mpfx[0] = 0x00;
+  fragment.mpfx[1] = 0x12;
+  fragment.mpfx[2] = 0x41;
+  Message::appendAlignedBuffer<Alignment::one>(uploadBuffer, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
+  String serializedPlan = {};
+  BitseryEngine::serialize(serializedPlan, uploadedPlan);
+  Message::appendValue(uploadBuffer, serializedPlan);
+  Message::finish(uploadBuffer, headerOffset);
+
+  Message *message = reinterpret_cast<Message *>(uploadBuffer.data());
+  brain.neuronHandler(&machine.neuron, message);
+  suite.expect(container.hasCredentialBundle && container.credentialBundle.tlsIdentities.size() == 1, "tls_identity_freshness_state_upload_restores_bundle");
+  suite.expect(brain.tlsIdentityCoverageSatisfied(plan, &failure), "tls_identity_freshness_state_upload_satisfies_coverage");
 }
 
 static void testApplicationIdentityInvariants(TestSuite& suite)
@@ -11059,6 +12758,36 @@ static void testNeuronRecvDispatchesPairingAndCredentialMessages(TestSuite& suit
   }
 
   {
+    BrainSocketFixture fixture(suite, "neuron_recv_credential_apply_ack");
+    if (fixture.ready)
+    {
+      CredentialApplyAck ack = {};
+      TlsIdentityApplyResult tls = {};
+      tls.identityName.assign("api-public"_ctv);
+      tls.generation = 7;
+      tls.success = false;
+      tls.failureReason.assign("rejected"_ctv);
+      ack.tlsResults.push_back(tls);
+
+      String ackPayload = {};
+      suite.expect(
+          ProdigyWire::serializeCredentialApplyAck(ackPayload, ack),
+          "neuron_recv_credential_apply_ack_serializes_result");
+
+      String inbound = {};
+      buildNeuronMessage(inbound, NeuronTopic::refreshContainerCredentials, uint128_t(0x7021), ackPayload);
+      suite.require(
+          seedBrainInboundForTest(suite, fixture.neuron, "neuron_recv_credential_apply_ack", inbound),
+          "neuron_recv_credential_apply_ack_seeds_inbound");
+      uint32_t dispatchCount = recvAndDispatchBrainForTest(fixture.neuron, int(inbound.size()));
+
+      suite.expect(dispatchCount == 1, "neuron_recv_credential_apply_ack_dispatches_once");
+      suite.expect(fixture.neuron.brainOutboundForTest().size() == 0, "neuron_recv_credential_apply_ack_emits_no_outbound_frames");
+      suite.expect(TestNeuron::brainStreamIsClosingForTest(fixture.neuron.brainStreamForTest()) == false, "neuron_recv_credential_apply_ack_keeps_stream_open");
+    }
+  }
+
+  {
     BrainSocketFixture fixture(suite, "neuron_recv_credential_malformed");
     if (fixture.ready)
     {
@@ -12080,6 +13809,71 @@ static void testNeuronHandlerStoresRequestedContainerBlob(TestSuite& suite)
   suite.expect(storedBlob.equals(containerBlob), "neuron_request_container_blob_stores_blob");
 
   ContainerStore::destroy(deploymentID);
+
+  String missingBuffer = {};
+  Message *missingMessage = buildNeuronMessage(missingBuffer, NeuronTopic::requestContainerBlob, deploymentID, String());
+  neuron.neuronHandler(missingMessage);
+  suite.expect(ContainerStore::contains(deploymentID) == false, "neuron_request_container_blob_skips_empty_payload");
+}
+
+static void testNeuronSpinContainerRejectReportsFailure(TestSuite& suite)
+{
+  TestNeuron neuron = {};
+  neuron.seedBrainStreamForTest(false);
+
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &neuron;
+
+  ContainerPlan plan = {};
+  plan.uuid = uint128_t(0x62013001);
+  plan.config.applicationID = 62'013;
+  plan.config.versionID = 1;
+  plan.config.containerBlobSHA256.assign("invalid"_ctv);
+  plan.config.containerBlobBytes = 3;
+  const uint64_t deploymentID = plan.config.deploymentID();
+  ContainerStore::destroy(deploymentID);
+
+  String imagePath = ContainerStore::pathForContainerImage(deploymentID);
+  suite.expect(Filesystem::createDirectoryAt(-1, "/containers"_ctv, 0755) >= 0 || errno == EEXIST, "spin_container_reject_create_containers_root");
+  suite.expect(Filesystem::createDirectoryAt(-1, "/containers/store"_ctv, 0755) >= 0 || errno == EEXIST, "spin_container_reject_create_store_root");
+  suite.expect(Filesystem::openWriteAtClose(-1, imagePath, "bad"_ctv) == 3, "spin_container_reject_fixture_blob");
+
+  NeuronContainerBootstrap bootstrap = {};
+  bootstrap.plan = plan;
+  String serialized = {};
+  BitseryEngine::serialize(serialized, bootstrap);
+
+  String buffer = {};
+  Message *message = buildNeuronMessage(buffer, NeuronTopic::spinContainer, uint128_t(0), serialized);
+  neuron.dispatchBrainMessageForTest(message);
+
+  uint32_t failures = 0;
+  uint128_t failedUUID = 0;
+  bool restarted = true;
+  String report = {};
+  forEachMessageInBuffer(neuron.brainOutboundForTest(), [&](Message *frame) {
+    if (NeuronTopic(frame->topic) != NeuronTopic::containerFailed)
+    {
+      return;
+    }
+    uint8_t *args = frame->args;
+    int64_t ignoredAt = 0;
+    int ignoredSignal = 0;
+    Message::extractArg<ArgumentNature::fixed>(args, failedUUID);
+    Message::extractArg<ArgumentNature::fixed>(args, ignoredAt);
+    Message::extractArg<ArgumentNature::fixed>(args, ignoredSignal);
+    Message::extractToStringView(args, report);
+    Message::extractArg<ArgumentNature::fixed>(args, restarted);
+    failures += 1;
+  });
+
+  suite.expect(failures == 1, "spin_container_reject_reports_one_failure");
+  suite.expect(failedUUID == plan.uuid, "spin_container_reject_reports_plan_uuid");
+  suite.expect(restarted == false, "spin_container_reject_reports_non_restart");
+  suite.expect(report.size() > 0, "spin_container_reject_reports_reason");
+
+  ContainerStore::destroy(deploymentID);
+  thisNeuron = previousNeuron;
 }
 
 static void testNeuronStateUploadSkipsExistingLiveContainer(TestSuite& suite)
@@ -12764,6 +14558,66 @@ static void testBrainNeuronStateUploadHealthyContainerClearsWaiters(TestSuite& s
   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
   brain.deployments.erase(deployment.plan.config.deploymentID());
   brain.neurons.erase(&machine.neuron);
+  brain.machinesByUUID.erase(machine.uuid);
+  brain.machines.erase(&machine);
+  thisBrain = previousBrain;
+}
+
+static void testDeployingContainerFailureFailsDeployment(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+  TestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+
+  BrainBase *previousBrain = thisBrain;
+  thisBrain = &brain;
+
+  Rack rack = {};
+  rack.uuid = 62'049;
+  Machine machine = {};
+  machine.uuid = uint128_t(0x5490);
+  machine.state = MachineState::healthy;
+  machine.rack = &rack;
+  machine.neuron.machine = &machine;
+  brain.machines.insert(&machine);
+  brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+
+  ApplicationDeployment deployment = {};
+  deployment.plan = makeDeploymentPlan(62'049, 1);
+  deployment.plan.canaryCount = 0;
+  deployment.plan.stateless.nBase = 1;
+  deployment.state = DeploymentState::deploying;
+  deployment.nTargetBase = 1;
+  deployment.nDeployedBase = 1;
+  brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+  brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
+
+  ContainerView *container = new ContainerView();
+  container->uuid = uint128_t(0x5491);
+  container->deploymentID = deployment.plan.config.deploymentID();
+  container->applicationID = deployment.plan.config.applicationID;
+  container->machine = &machine;
+  container->lifetime = ApplicationLifetime::base;
+  container->state = ContainerState::scheduled;
+  deployment.containers.insert(container);
+  deployment.countPerMachine[&machine] = 1;
+  deployment.countPerRack[&rack] = 1;
+  deployment.waitingOnContainers.insert_or_assign(container, ContainerState::healthy);
+  brain.containers.insert_or_assign(container->uuid, container);
+  machine.upsertContainerIndexEntry(container->deploymentID, container);
+
+  deployment.containerFailed(container, int64_t(1'700'000'000'013), 0, "image rejected"_ctv, false);
+
+  suite.expect(deployment.state == DeploymentState::failed, "deploying_container_failure_marks_deployment_failed");
+  suite.expect(deployment.waitingOnContainers.empty(), "deploying_container_failure_clears_waiters");
+  suite.expect(brain.containers.contains(uint128_t(0x5491)) == false, "deploying_container_failure_removes_container");
+  suite.expect(brain.failedDeployments.contains(deployment.plan.config.deploymentID()), "deploying_container_failure_records_failed_deployment");
+
+  brain.failedDeployments.erase(deployment.plan.config.deploymentID());
+  brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
+  brain.deployments.erase(deployment.plan.config.deploymentID());
   brain.machinesByUUID.erase(machine.uuid);
   brain.machines.erase(&machine);
   thisBrain = previousBrain;
@@ -14685,6 +16539,27 @@ static void testBrainNeuronHandlerQueuesRequestedContainerBlob(TestSuite& suite)
   suite.expect(observedBlob.equals(containerBlob), "brain_neuron_request_container_blob_preserves_blob_payload");
 
   ContainerStore::destroy(deploymentID);
+
+  const uint64_t missingDeploymentID = deploymentID + 1;
+  String missingBuffer = {};
+  Message *missingMessage = buildNeuronMessage(missingBuffer, NeuronTopic::requestContainerBlob, missingDeploymentID);
+  brain.neuronHandler(&machine.neuron, missingMessage);
+
+  bool sawMissingResponse = false;
+  forEachMessageInBuffer(machine.neuron.wBuffer, [&](Message *frame) {
+    if (NeuronTopic(frame->topic) != NeuronTopic::requestContainerBlob)
+    {
+      return;
+    }
+
+    uint8_t *args = frame->args;
+    uint64_t frameDeploymentID = 0;
+    String frameBlob = {};
+    Message::extractArg<ArgumentNature::fixed>(args, frameDeploymentID);
+    Message::extractToStringView(args, frameBlob);
+    sawMissingResponse = sawMissingResponse || (frameDeploymentID == missingDeploymentID && frameBlob.size() == 0);
+  });
+  suite.expect(sawMissingResponse, "brain_neuron_request_container_blob_missing_emits_empty_payload");
 }
 
 static void testBrainNeuronHandlerOwnsRegistrationKernelString(TestSuite& suite)
@@ -15712,6 +17587,7 @@ int main(void)
   testUpdateSelfPeerRegistrationCreditsReconnectWithoutBootNsChange(suite);
   testMaybeRelinquishMasterSelectsLowestPeerKey(suite);
   testUpdateSelfFinalRelinquishPersistsDesignatedHandoff(suite);
+  testUpdateProdigyRespondsBeforeSingleBrainTransition(suite);
   testPersistentMasterAuthorityPackageRestore(suite);
   testResumePendingAddMachinesOperations(suite);
   testResumePendingAddMachinesRefreshesProvisionalCreatedMachine(suite);
@@ -15720,10 +17596,14 @@ int main(void)
   testReconcileManagedMachineSchemasSkipsEmptySchemaState(suite);
   testImportedTlsFactoryValidationRejectsBrokenPem(suite);
   testImportedTlsFactoryEnablesBundleBuild(suite);
+  testCertificateLifecycleSchedulers(suite);
   testRegisterRoutablePrefixAcceptsSingleMachineHostPrefix(suite);
   testRegisterRoutablePrefixAllocatesElasticPrefix(suite);
   testPullRoutableResourceLeasesTopic(suite);
   testDNSBindingTopicsReserveAddressAndApplyProvider(suite);
+  testACMEDNS01ChallengeTopicsUsePublicTlsState(suite);
+  testACMELineageImportValidatesAndDistributesPublicTls(suite);
+  testTlsIdentityAckAndStaleState(suite);
   testApplicationIdentityInvariants(suite);
   testApplicationReservationInitializersAndAllocators(suite);
   testApplicationReservationValidationFailures(suite);
@@ -15775,6 +17655,7 @@ int main(void)
   testNeuronContainerHandlerMarksMasterLocalContainerHealthyWithActiveBrainStream(suite);
   testNeuronContainerHandlerForwardsStatisticsToBrain(suite);
   testNeuronHandlerStoresRequestedContainerBlob(suite);
+  testNeuronSpinContainerRejectReportsFailure(suite);
   testNeuronStateUploadSkipsExistingLiveContainer(suite);
   testNeuronHandlerKillContainerStopsContainerAndEchoesBrain(suite);
   testBrainNeuronHandlerMarksContainerHealthyOnceAndClearsWaiters(suite);
@@ -15785,6 +17666,7 @@ int main(void)
   testBrainNeuronHandlerHealthyReplacementPointerClearsEquivalentWaiter(suite);
   testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(suite);
   testBrainNeuronStateUploadHealthyContainerClearsWaiters(suite);
+  testDeployingContainerFailureFailsDeployment(suite);
   testBrainNeuronStateUploadRestoresOnlyActiveMeshServices(suite);
   testBrainNeuronStateUploadRuntimeReadyFalseClearsStatefulTopologyBarrier(suite);
   testBrainNeuronStateUploadRequiresMatchingAssignedFragmentForMachineRuntimeReady(suite);

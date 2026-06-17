@@ -95,7 +95,7 @@ struct
   __uint(max_entries, 1);
   __type(key, __u32);
   __type(value, __u32);
-} nat4_port_cursor SEC(".maps");
+} nat4_cursor SEC(".maps");
 
 struct
 {
@@ -203,7 +203,7 @@ static __always_inline bool parse_ipv4_l4(struct __sk_buff *skb, struct iphdr **
 static __always_inline bool pick_nat_port(__u8 proto, __be16 *nat_port_out)
 {
   __u32 zero = 0;
-  __u32 *cursor = bpf_map_lookup_elem(&nat4_port_cursor, &zero);
+  __u32 *cursor = bpf_map_lookup_elem(&nat4_cursor, &zero);
   __u32 base = (cursor && *cursor > 0) ? *cursor : DEV_NAT_PORT_MIN;
   __u32 span = (DEV_NAT_PORT_MAX - DEV_NAT_PORT_MIN + 1);
 
@@ -281,7 +281,7 @@ static __always_inline int rewrite_l4_port(struct __sk_buff *skb, __u32 l4_offse
 }
 
 SEC("tc/egress")
-int fake_ipv4_boundary_nat_egress(struct __sk_buff *skb)
+int fake_nat_eg(struct __sk_buff *skb)
 {
   struct iphdr *iph = NULL;
   __u32 l4_offset = 0;
@@ -376,7 +376,7 @@ int fake_ipv4_boundary_nat_egress(struct __sk_buff *skb)
 }
 
 SEC("tc/ingress")
-int fake_ipv4_boundary_nat_ingress(struct __sk_buff *skb)
+int fake_nat_in(struct __sk_buff *skb)
 {
   struct iphdr *iph = NULL;
   __u32 l4_offset = 0;

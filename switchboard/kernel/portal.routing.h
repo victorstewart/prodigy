@@ -28,7 +28,7 @@ __attribute__((__always_inline__)) static inline __u32 switchboardPacketHash(str
 
 __attribute__((__always_inline__)) static inline void switchboardConnectionTableLookup(struct container_id *containerID, struct packet_description *pckt)
 {
-  struct container_id *tentativeContainerID = bpf_map_lookup_elem(&percpu_lru_mapping, &pckt->flow);
+  struct container_id *tentativeContainerID = bpf_map_lookup_elem(&lru_mapping, &pckt->flow);
 
   if (tentativeContainerID)
   {
@@ -42,7 +42,7 @@ __attribute__((__always_inline__)) static inline void switchboardSelectContainer
                                                                                  bool isIPv6)
 {
   __u32 hashringIndex = portalMeta->slot;
-  __u32 *hashringID = bpf_map_lookup_elem(&container_id_hash_rings, &hashringIndex);
+  __u32 *hashringID = bpf_map_lookup_elem(&cid_rings, &hashringIndex);
 
   if (hashringID)
   {
@@ -55,7 +55,7 @@ __attribute__((__always_inline__)) static inline void switchboardSelectContainer
 
       if (pckt->flow.proto == IPPROTO_TCP)
       {
-        bpf_map_update_elem(&percpu_lru_mapping, &pckt->flow, containerID, BPF_ANY);
+        bpf_map_update_elem(&lru_mapping, &pckt->flow, containerID, BPF_ANY);
       }
     }
   }
@@ -73,7 +73,7 @@ __attribute__((__always_inline__)) static inline bool switchboardLookupWormholeT
   };
   bpf_memcpy(key.container, containerID->value, sizeof(key.container));
 
-  __u16 *value = bpf_map_lookup_elem(&wormhole_target_ports, &key);
+  __u16 *value = bpf_map_lookup_elem(&wh_targets, &key);
   if (value == NULL || *value == 0)
   {
     return false;
@@ -107,7 +107,7 @@ __attribute__((__always_inline__)) static inline int switchboardResolveExternalP
   portal.port = pckt->flow.port16[1];
   portal.proto = pckt->flow.proto;
 
-  struct portal_meta *portalMeta = bpf_map_lookup_elem(&external_portals, &portal);
+  struct portal_meta *portalMeta = bpf_map_lookup_elem(&ext_portals, &portal);
   if (portalMeta == NULL)
   {
     return SWITCHBOARD_PORTAL_TARGET_NONE;
@@ -120,7 +120,8 @@ __attribute__((__always_inline__)) static inline int switchboardResolveExternalP
 
   if (portalMeta->flags & F_QUIC_PORTAL)
   {
-    struct quic_route_result route = parse_quic_route(portalMeta, data, data_end, isIPv6, &pckt->flow);
+    struct quic_route_result route = {};
+    parse_quic_route(&route, portalMeta, data, data_end, isIPv6, &pckt->flow);
     bpf_memcpy(containerID, &route.containerID, sizeof(struct container_id));
     if (containerID->hasID == false && route.fallback_allowed == false)
     {

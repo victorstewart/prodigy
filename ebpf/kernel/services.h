@@ -56,7 +56,7 @@ __attribute__((__always_inline__)) static inline bool from_us_to_gateway(struct 
     return false;
   }
 
-  struct mac *gateway_mac = bpf_map_lookup_elem(&gateway_mac_map, &zeroidx);
+  struct mac *gateway_mac = bpf_map_lookup_elem(&gw_mac_map, &zeroidx);
   if (!gateway_mac)
   {
     return false;
@@ -86,7 +86,7 @@ __attribute__((__always_inline__)) static inline bool from_us_to_overlay_next_ho
 __attribute__((__always_inline__)) static inline bool containerRequiresPublic4(void)
 {
   __u32 zeroidx = 0;
-  struct container_network_policy *policy = bpf_map_lookup_elem(&container_network_policy_map, &zeroidx);
+  struct container_network_policy *policy = bpf_map_lookup_elem(&ct_net_policy, &zeroidx);
   if (!policy)
   {
     return false;
@@ -97,7 +97,7 @@ __attribute__((__always_inline__)) static inline bool containerRequiresPublic4(v
 __attribute__((__always_inline__)) static inline bool containerRequiresPublic6(void)
 {
   __u32 zeroidx = 0;
-  struct container_network_policy *policy = bpf_map_lookup_elem(&container_network_policy_map, &zeroidx);
+  struct container_network_policy *policy = bpf_map_lookup_elem(&ct_net_policy, &zeroidx);
   if (!policy)
   {
     return false;
@@ -108,7 +108,7 @@ __attribute__((__always_inline__)) static inline bool containerRequiresPublic6(v
 __attribute__((__always_inline__)) static inline __u32 containerInterContainerMTU(void)
 {
   __u32 zeroidx = 0;
-  struct container_network_policy *policy = bpf_map_lookup_elem(&container_network_policy_map, &zeroidx);
+  struct container_network_policy *policy = bpf_map_lookup_elem(&ct_net_policy, &zeroidx);
   if (!policy)
   {
     return 0;

@@ -67,7 +67,7 @@ static inline __u32 rol32(__u32 word, __u32 shift)
  *
  * Returns the hash value of the key. The result depends on endianness.
  */
-static inline __u32 jhash(const void *key, __u32 length, __u32 initval)
+__attribute__((__always_inline__)) static inline __u32 jhash(const void *key, __u32 length, __u32 initval)
 {
   __u32 a, b, c;
   const __u8 *k = (const __u8 *)key;

@@ -32,19 +32,10 @@ public:
     {
       return false;
     }
+    Vector<String> values = {};
+    values.push_back(value);
 
-    ProdigyDNSHTTPRequest request = {};
-    request.method.assign("PUT"_ctv);
-    request.url = url;
-    request.header("Content-Type: application/json");
-    request.bearer(credential.material);
-    request.body.snprintf<"{\"properties\":{\"TTL\":{itoa},\""_ctv>(record.ttl);
-    request.body.append(record.type.equal("AAAA"_ctv) ? "AAAARecords\":[{\"ipv6Address\":" : "ARecords\":[{\"ipv4Address\":");
-    appendEscapedJSONString(request.body, value);
-    request.body.append("}]}}"_ctv);
-    String response = {};
-    long httpCode = 0;
-    return acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "azure dns upsert failed");
+    return putRecord(record, credential, url, values, failure);
   }
 
   bool remove(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
@@ -65,13 +56,17 @@ public:
       return true;
     }
 
-    ProdigyDNSHTTPRequest request = {};
-    request.method.assign("DELETE"_ctv);
-    request.url = url;
-    request.bearer(credential.material);
-    String response = {};
-    long httpCode = 0;
-    return acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "azure dns delete failed");
+    return deleteRecord(record, credential, url, failure);
+  }
+
+  bool presentTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  {
+    return changeTXT(false, record, credential, failure);
+  }
+
+  bool cleanupTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  {
+    return changeTXT(true, record, credential, failure);
   }
 
 private:
@@ -111,12 +106,115 @@ private:
     return true;
   }
 
+  bool changeTXT(bool removing, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
+  {
+    String value = {};
+    if (prodigyDNSRecordSingleTXTValue(record, value, failure) == false)
+    {
+      return false;
+    }
+    String url = {};
+    if (recordSetURL(record, credential, url, failure) == false)
+    {
+      return false;
+    }
+    Vector<String> values = {};
+    bool found = false;
+    if (loadRecord(record, credential, url, values, found, failure) == false)
+    {
+      return false;
+    }
+    if (removing)
+    {
+      if (found == false || prodigyDNSRemoveProviderValue(record, values, value) == false)
+      {
+        failure.clear();
+        return true;
+      }
+      if (values.size() == 0)
+      {
+        return deleteRecord(record, credential, url, failure);
+      }
+    }
+    else
+    {
+      if (prodigyDNSValuesContain(record, values, value))
+      {
+        failure.clear();
+        return true;
+      }
+      values.push_back(value);
+    }
+    return putRecord(record, credential, url, values, failure);
+  }
+
+  bool putRecord(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, const String& url, const Vector<String>& values, String& failure)
+  {
+    ProdigyDNSHTTPRequest request = {};
+    request.method.assign("PUT"_ctv);
+    request.url = url;
+    request.header("Content-Type: application/json");
+    if (prodigyDNSApplyBearerAuth(request, credential, failure) == false)
+    {
+      return false;
+    }
+    prodigyDNSAppendAzureRecordSetJSON(request.body, record, values);
+    String response = {};
+    long httpCode = 0;
+    return acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "azure dns upsert failed");
+  }
+
+  bool deleteRecord(const ProdigyDNSRecordBinding&, const ApiCredential& credential, const String& url, String& failure)
+  {
+    ProdigyDNSHTTPRequest request = {};
+    request.method.assign("DELETE"_ctv);
+    request.url = url;
+    if (prodigyDNSApplyBearerAuth(request, credential, failure) == false)
+    {
+      return false;
+    }
+    String response = {};
+    long httpCode = 0;
+    return acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "azure dns delete failed");
+  }
+
   bool findRecord(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, const String& url, ProdigyDNSRecordPresence& presence, String& failure)
+  {
+    presence = ProdigyDNSRecordPresence::missing;
+    String recordValue = {};
+    if (prodigyDNSRecordSingleValue(record, recordValue, failure) == false)
+    {
+      return false;
+    }
+    Vector<String> values = {};
+    bool found = false;
+    if (loadRecord(record, credential, url, values, found, failure) == false)
+    {
+      return false;
+    }
+    if (found == false)
+    {
+      failure.clear();
+      return true;
+    }
+    if (values.size() != 1 || prodigyDNSProviderValueEquals(record, values[0], recordValue) == false)
+    {
+      return prodigyDNSExistingRecordConflict(failure);
+    }
+    presence = ProdigyDNSRecordPresence::exact;
+    failure.clear();
+    return true;
+  }
+
+  bool loadRecord(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, const String& url, Vector<String>& values, bool& found, String& failure)
   {
     ProdigyDNSHTTPRequest request = {};
     request.method.assign("GET"_ctv);
     request.url = url;
-    request.bearer(credential.material);
+    if (prodigyDNSApplyBearerAuth(request, credential, failure) == false)
+    {
+      return false;
+    }
     String response = {};
     long httpCode = 0;
     if (sendHTTP(request, response, httpCode, failure) == false)
@@ -125,7 +223,8 @@ private:
     }
     if (httpCode == 404)
     {
-      presence = ProdigyDNSRecordPresence::missing;
+      values.clear();
+      found = false;
       failure.clear();
       return true;
     }
@@ -133,6 +232,6 @@ private:
     {
       return false;
     }
-    return prodigyDNSFindAzureRecord(response, record, presence, failure);
+    return prodigyDNSCollectAzureRecordValues(response, record, values, found, failure);
   }
 };

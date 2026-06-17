@@ -93,10 +93,6 @@ constexpr static enum bpf_attach_type prodigyContainerEgressNetkitAttachType()
   return BPF_NETKIT_PEER;
 }
 
-#ifndef NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE
-#define NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE 0
-#endif
-
 static void installDatacenterMeshRoutes(NetDevice& device, uint8_t datacenterFragment)
 {
   auto addDatacenterRoute = [&](const container_network_subnet6_prefix& subnet) -> void {
@@ -148,7 +144,7 @@ static void prodigySyncOverlayPresenceMap(BPFProgram *program,
   program->openMap(mapName, [&](int map_fd) -> void {
     if (map_fd < 0)
     {
-      basics_log("Prodigy missing overlay presence map\n");
+      basics_log("Prodigy missing overlay presence map=%s\n", mapName.c_str());
       return;
     }
 
@@ -156,14 +152,20 @@ static void prodigySyncOverlayPresenceMap(BPFProgram *program,
     {
       if (prodigyOverlayKeyPresent(desiredKeys, existing, equals) == false)
       {
-        bpf_map_delete_elem(map_fd, &existing);
+        if (bpf_map_delete_elem(map_fd, &existing) != 0)
+        {
+          basics_log("Prodigy overlay presence delete failed map=%s errno=%d\n", mapName.c_str(), errno);
+        }
       }
     }
 
     __u8 present = 1;
     for (const Key& desired : desiredKeys)
     {
-      bpf_map_update_elem(map_fd, &desired, &present, BPF_ANY);
+      if (bpf_map_update_elem(map_fd, &desired, &present, BPF_ANY) != 0)
+      {
+        basics_log("Prodigy overlay presence update failed map=%s errno=%d\n", mapName.c_str(), errno);
+      }
     }
   });
 
@@ -193,7 +195,7 @@ static void prodigySyncOverlayValueMap(BPFProgram *program,
   program->openMap(mapName, [&](int map_fd) -> void {
     if (map_fd < 0)
     {
-      basics_log("Prodigy missing overlay value map\n");
+      basics_log("Prodigy missing overlay value map=%s\n", mapName.c_str());
       return;
     }
 
@@ -201,13 +203,19 @@ static void prodigySyncOverlayValueMap(BPFProgram *program,
     {
       if (prodigyOverlayKeyPresent(desiredKeys, existing, equals) == false)
       {
-        bpf_map_delete_elem(map_fd, &existing);
+        if (bpf_map_delete_elem(map_fd, &existing) != 0)
+        {
+          basics_log("Prodigy overlay value delete failed map=%s errno=%d\n", mapName.c_str(), errno);
+        }
       }
     }
 
     for (const auto& entry : desiredEntries)
     {
-      bpf_map_update_elem(map_fd, &entry.first, &entry.second, BPF_ANY);
+      if (bpf_map_update_elem(map_fd, &entry.first, &entry.second, BPF_ANY) != 0)
+      {
+        basics_log("Prodigy overlay value update failed map=%s errno=%d\n", mapName.c_str(), errno);
+      }
     }
   });
 
@@ -281,14 +289,14 @@ static void prodigySyncOverlayEgressRoutingProgram(BPFProgram *program,
   switchboardBuildOverlayPrefixKeys(config.overlaySubnets, desiredPrefixes4, desiredPrefixes6);
 
   prodigySyncOverlayPresenceMap(program,
-                                "overlay_routable_prefixes4"_ctv,
+                                "ovl_pfx4"_ctv,
                                 installedPrefixes4,
                                 desiredPrefixes4,
                                 [](const switchboard_overlay_prefix4_key& lhs, const switchboard_overlay_prefix4_key& rhs) -> bool {
                                   return switchboardOverlayPrefix4Equals(lhs, rhs);
                                 });
   prodigySyncOverlayPresenceMap(program,
-                                "overlay_routable_prefixes6"_ctv,
+                                "ovl_pfx6"_ctv,
                                 installedPrefixes6,
                                 desiredPrefixes6,
                                 [](const switchboard_overlay_prefix6_key& lhs, const switchboard_overlay_prefix6_key& rhs) -> bool {
@@ -300,14 +308,14 @@ static void prodigySyncOverlayEgressRoutingProgram(BPFProgram *program,
   prodigyBuildOverlayDesiredRoutes(config, desiredRoutesFull, desiredRoutesLow8);
 
   prodigySyncOverlayValueMap(program,
-                             "overlay_machine_routes_full"_ctv,
+                             "ovl_mach_full"_ctv,
                              installedRouteKeysFull,
                              desiredRoutesFull,
                              [](const switchboard_overlay_machine_route_key& lhs, const switchboard_overlay_machine_route_key& rhs) -> bool {
                                return switchboardOverlayMachineRouteKeyEquals(lhs, rhs);
                              });
   prodigySyncOverlayValueMap(program,
-                             "overlay_machine_routes_low8"_ctv,
+                             "ovl_mach_low8"_ctv,
                              installedRouteKeysLow8,
                              desiredRoutesLow8,
                              [](const switchboard_overlay_machine_route_key& lhs, const switchboard_overlay_machine_route_key& rhs) -> bool {
@@ -319,14 +327,14 @@ static void prodigySyncOverlayEgressRoutingProgram(BPFProgram *program,
   prodigyBuildOverlayDesiredHostedIngressRoutes(config, desiredHostedIngressRoutes4, desiredHostedIngressRoutes6);
 
   prodigySyncOverlayValueMap(program,
-                             "overlay_hosted_ingress_routes4"_ctv,
+                             "ovl_host4"_ctv,
                              installedHostedIngressRouteKeys4,
                              desiredHostedIngressRoutes4,
                              [](const switchboard_overlay_prefix4_key& lhs, const switchboard_overlay_prefix4_key& rhs) -> bool {
                                return switchboardOverlayPrefix4Equals(lhs, rhs);
                              });
   prodigySyncOverlayValueMap(program,
-                             "overlay_hosted_ingress_routes6"_ctv,
+                             "ovl_host6"_ctv,
                              installedHostedIngressRouteKeys6,
                              desiredHostedIngressRoutes6,
                              [](const switchboard_overlay_prefix6_key& lhs, const switchboard_overlay_prefix6_key& rhs) -> bool {
@@ -337,7 +345,7 @@ static void prodigySyncOverlayEgressRoutingProgram(BPFProgram *program,
   {
     switchboard_overlay_config overlayConfig = {};
     overlayConfig.container_network_enabled = config.containerNetworkViaOverlay ? 1 : 0;
-    program->setArrayElement("overlay_config_map"_ctv, 0, overlayConfig);
+    program->setArrayElement("ovl_config"_ctv, 0, overlayConfig);
   }
 }
 
@@ -434,14 +442,6 @@ static void addAddressIfMissing(Vector<IPPrefix>& addresses, const IPPrefix& can
     addresses.emplace_back(candidate);
   }
 }
-
-#if NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE
-static bool devFakeIPv4ModeEnabled(void)
-{
-  const char *mode = getenv("PRODIGY_DEV_FAKE_IPV4_MODE");
-  return (mode && mode[0] == '1' && mode[1] == '\0');
-}
-#endif
 
 static bool writeProcSysctlValue(const char *path, const char *value)
 {
@@ -654,7 +654,7 @@ private:
     }
 
     bool ok = true;
-    program->openMap("container_device_map"_ctv, [&](int mapFD) -> void {
+    program->openMap("ct_dev_map"_ctv, [&](int mapFD) -> void {
       bool traceHostIngress = (ownerUUID == 0);
 
       if (mapFD < 0)
@@ -738,7 +738,7 @@ private:
           prodigyAppendAttachTrace(traceLine);
         }
 
-        if (writeContainerDeviceMapEntry(mapFD, fragment, desiredIfidx, "container_device_map", ownerUUID, failureReport) == false)
+        if (writeContainerDeviceMapEntry(mapFD, fragment, desiredIfidx, "ct_dev_map", ownerUUID, failureReport) == false)
         {
           ok = false;
         }
@@ -849,7 +849,7 @@ public:
     }
 
     prodigySyncOverlayValueMap(peer_program,
-                               "whitehole_bindings"_ctv,
+                               "whiteholes"_ctv,
                                installedPeerWhiteholeBindingKeys,
                                desiredBindings,
                                [](const portal_definition& lhs, const portal_definition& rhs) -> bool {
@@ -1083,10 +1083,10 @@ public:
     peer_program = netdevs.host.loadPreattachedProgram(prodigyContainerEgressNetkitAttachType(), path);
     if (peer_program)
     {
-      peer_program->setArrayElement("local_container_subnet_map"_ctv, 0, thisNeuron->lcsubnet6);
+      peer_program->setArrayElement("lc_subnet"_ctv, 0, thisNeuron->lcsubnet6);
       peer_program->setArrayElement("mac_map"_ctv, 0, thisNeuron->eth.mac);
-      peer_program->setArrayElement("gateway_mac_map"_ctv, 0, thisNeuron->eth.gateway_mac);
-      peer_program->setArrayElement("container_network_policy_map"_ctv, 0, networkPolicy);
+      peer_program->setArrayElement("gw_mac_map"_ctv, 0, thisNeuron->eth.gateway_mac);
+      peer_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
       syncPeerWhiteholeBindings();
     }
 
@@ -1094,7 +1094,7 @@ public:
     primary_program = netdevs.host.loadPreattachedProgram(prodigyContainerIngressNetkitAttachType(), path);
     if (primary_program)
     {
-      primary_program->setArrayElement("container_network_policy_map"_ctv, 0, networkPolicy);
+      primary_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
     }
 
     bool synced = syncContainerDeviceMaps(this, nullptr, failureReport);
@@ -1227,26 +1227,19 @@ public:
       peer.addIP(whiteholeAddress);
     }
 
-#if NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE
-    if (devFakeIPv4ModeEnabled())
+    for (const Wormhole& wormhole : plan.wormholes)
     {
-      // Fake-boundary dev tests inject IPv4 portal packets from inside the
-      // ecosystem with the external /32 still as destination. Production
-      // boundary ingress normalizes external traffic before container entry.
-      for (const Wormhole& wormhole : plan.wormholes)
+      const IPAddress& address = wormholeSwitchboardAddress(wormhole);
+      if (address.isNull() || address.is6)
       {
-        if (wormhole.externalAddress.isNull() || wormhole.externalAddress.is6)
-        {
-          continue;
-        }
-
-        IPPrefix wormholeAddress = {};
-        wormholeAddress.network = wormhole.externalAddress;
-        wormholeAddress.cidr = 32;
-        peer.addIP(wormholeAddress);
+        continue;
       }
+
+      IPPrefix wormholeAddress = {};
+      wormholeAddress.network = address;
+      wormholeAddress.cidr = 32;
+      peer.addIP(wormholeAddress);
     }
-#endif
 
     peer.addDefaultRoutes();
 
@@ -1308,7 +1301,7 @@ public:
     }
 
     path.assign("/root/prodigy/container.egress.router.ebpf.o"_ctv);
-    peer_program = host.attachBPF(prodigyContainerEgressNetkitAttachType(), path, "container_egress_router"_ctv,
+    peer_program = host.attachBPF(prodigyContainerEgressNetkitAttachType(), path, "ct_egress"_ctv,
                                   [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
                                     (void)switchboardReusePinnedWhiteholeReplyFlowMap(obj, thisNeuron->eth.ifidx, inner_map_fds);
                                   });
@@ -1351,14 +1344,14 @@ public:
       }
       return false;
     }
-    peer_program->setArrayElement("local_container_subnet_map"_ctv, 0, thisNeuron->lcsubnet6);
+    peer_program->setArrayElement("lc_subnet"_ctv, 0, thisNeuron->lcsubnet6);
     peer_program->setArrayElement("mac_map"_ctv, 0, thisNeuron->eth.mac);
-    peer_program->setArrayElement("gateway_mac_map"_ctv, 0, thisNeuron->eth.gateway_mac);
-    peer_program->setArrayElement("container_network_policy_map"_ctv, 0, networkPolicy);
+    peer_program->setArrayElement("gw_mac_map"_ctv, 0, thisNeuron->eth.gateway_mac);
+    peer_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
     syncPeerWhiteholeBindings();
 
     path.assign("/root/prodigy/container.ingress.router.ebpf.o"_ctv);
-    primary_program = host.attachBPF(prodigyContainerIngressNetkitAttachType(), path, "container_ingress_router"_ctv);
+    primary_program = host.attachBPF(prodigyContainerIngressNetkitAttachType(), path, "ct_ingress"_ctv);
     if (primary_program == nullptr)
     {
       if (failureReport)
@@ -1384,7 +1377,7 @@ public:
                  (unsigned long long)plan.uuid,
                  unsigned(plan.config.applicationID));
     }
-    primary_program->setArrayElement("container_network_policy_map"_ctv, 0, networkPolicy);
+    primary_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
 
     if (syncContainerDeviceMaps(this, nullptr, failureReport) == false)
     {
@@ -1482,6 +1475,14 @@ private:
 
   int slicefd;
   static inline bool rootCgroupSeeded = false;
+
+  static void reportSpinContainerFailure(const ContainerPlan& plan, const String& report)
+  {
+    if (thisNeuron)
+    {
+      thisNeuron->reportContainerFailed(plan.uuid, Time::now<TimeResolution::ms>(), 0, report, false);
+    }
+  }
 
   static void ensureSigchldIsWaitable(void)
   {
@@ -4906,7 +4907,7 @@ private:
     {
       if (failureReport)
       {
-        failureReport->snprintf<"container blob size exceeds maximum: {} > {}"_ctv>(
+        failureReport->snprintf<"container blob size exceeds maximum: {itoa} > {itoa}"_ctv>(
             expectedBytes,
             maxCompressedContainerBlobBytes);
       }
@@ -5109,15 +5110,6 @@ private:
       return false;
     }
 
-    if (mount(nullptr, targetPath.c_str(), nullptr, MS_BIND | MS_REMOUNT | MS_NOSUID, nullptr) != 0)
-    {
-      if (failureReport)
-      {
-        failureReport->snprintf<"failed to remount host device {}"_ctv>(sourcePath);
-      }
-      return false;
-    }
-
     return true;
   }
 
@@ -5173,15 +5165,6 @@ private:
       if (failureReport)
       {
         failureReport->snprintf<"failed to bind mount gpu device {}"_ctv>(sourcePath);
-      }
-      return false;
-    }
-
-    if (mount(nullptr, targetPath.c_str(), nullptr, MS_BIND | MS_REMOUNT | MS_NOSUID, nullptr) != 0)
-    {
-      if (failureReport)
-      {
-        failureReport->snprintf<"failed to remount gpu device {}"_ctv>(targetPath);
       }
       return false;
     }
@@ -7414,7 +7397,7 @@ public:
     return true;
   }
 
-  static bool mountRootFSInCurrentNamespace(Container *container, bool isRestart, int idMapPID)
+  static bool mountRootFSInCurrentNamespace(Container *container, bool isRestart, int idMapPID, String *failureReport = nullptr)
   {
     (void)isRestart;
     String path;
@@ -7425,6 +7408,20 @@ public:
 
     int containersAccess = access("/containers", F_OK);
     int containersAccessErrno = errno;
+    auto fail = [&](const char *stage, int err, const String *detail = nullptr) -> bool {
+      if (failureReport)
+      {
+        String stageText = {};
+        stageText.assign(stage);
+        failureReport->snprintf<"{} errno={itoa}({}) root={}"_ctv>(stageText, err, String(strerror(err)), containerRoot);
+        if (detail != nullptr && detail->size() > 0)
+        {
+          failureReport->append(" reason="_ctv);
+          failureReport->append(*detail);
+        }
+      }
+      return false;
+    };
 
     String rootfsFailure = {};
     int rootfd = -1;
@@ -7444,7 +7441,7 @@ public:
                    (unsigned long long)container->plan.uuid,
                    rootfsFailure.c_str());
       }
-      return false;
+      return fail("open rootfs", openErrno, &rootfsFailure);
     }
 
     int oldrootFD = -1;
@@ -7456,7 +7453,7 @@ public:
                  errno,
                  strerror(errno));
       close(rootfd);
-      return false;
+      return fail("create oldroot", errno);
     }
     close(oldrootFD);
 
@@ -7469,15 +7466,18 @@ public:
       {
         if (mount2(path, path, MOUNT_ATTR_NOSUID) != 0)
         {
+          int fallbackErrno = errno;
+          String idmapFailure = {};
+          idmapFailure.snprintf<"idmapErrno={itoa}({})"_ctv>(idmapErrno, String(strerror(idmapErrno)));
           basics_log("mountRootFS idmap fallback mount failed uuid=%llu path=%s idmapErrno=%d(%s) fallbackErrno=%d(%s)\n",
                      (unsigned long long)container->plan.uuid,
                      path.c_str(),
                      idmapErrno,
                      strerror(idmapErrno),
-                     errno,
-                     strerror(errno));
+                     fallbackErrno,
+                     strerror(fallbackErrno));
           close(rootfd);
-          return false;
+          return fail("idmap fallback mount rootfs", fallbackErrno, &idmapFailure);
         }
 
         useIDMapMounts = false;
@@ -7490,7 +7490,7 @@ public:
                    idmapErrno,
                    strerror(idmapErrno));
         close(rootfd);
-        return false;
+        return fail("idmap mount rootfs", idmapErrno);
       }
     }
 
@@ -7506,7 +7506,7 @@ public:
                  errno,
                  strerror(errno),
                  postMountRootfsFailure.c_str());
-      return false;
+      return fail("reopen rootfs", errno, &postMountRootfsFailure);
     }
 
     String launchTargetFailure = {};
@@ -7517,7 +7517,7 @@ public:
                  containerRoot.c_str(),
                  launchTargetFailure.size() > 0 ? launchTargetFailure.c_str() : "unknown");
       close(rootfd);
-      return false;
+      return fail("validate launch targets", EINVAL, &launchTargetFailure);
     }
 
     close(rootfd);
@@ -7529,7 +7529,7 @@ public:
                  (unsigned long long)container->plan.uuid,
                  containerRoot.c_str(),
                  deviceMountFailure.c_str());
-      return false;
+      return fail("mount host devices", errno, &deviceMountFailure);
     }
 
     if (container->plan.config.storageMB > 0)
@@ -7612,7 +7612,7 @@ public:
                  (unsigned long long)container->plan.uuid,
                  containerRoot.c_str(),
                  gpuMountFailure.c_str());
-      return false;
+      return fail("validate gpu rootfs", errno, &gpuMountFailure);
     }
     if (mountAssignedGPUDevicesInCurrentNamespace(container, containerRoot, gpuRootFD, &gpuMountFailure) == false)
     {
@@ -7621,7 +7621,7 @@ public:
                  (unsigned long long)container->plan.uuid,
                  containerRoot.c_str(),
                  gpuMountFailure.c_str());
-      return false;
+      return fail("mount gpu devices", errno, &gpuMountFailure);
     }
     close(gpuRootFD);
 
@@ -7636,7 +7636,7 @@ public:
                  path.c_str(),
                  errno,
                  strerror(errno));
-      return false;
+      return fail("mount proc", errno);
     }
 
     path.assign(containerRoot);
@@ -7650,7 +7650,7 @@ public:
                  path2.c_str(),
                  errno,
                  strerror(errno));
-      return false;
+      return fail("pivot_root", errno);
     }
 
     umount2("/oldroot", MNT_DETACH);
@@ -8120,6 +8120,28 @@ public:
     {
       close(startupSync[1]);
       close(socs[0]);
+      bool insideContainerRoot = false;
+      auto failStartup = [&](const char *stage, const String *detail = nullptr) -> void {
+        String report = {};
+        report.assign(stage);
+        if (detail != nullptr && detail->size() > 0)
+        {
+          report.append(": "_ctv);
+          report.append(*detail);
+        }
+        if (insideContainerRoot)
+        {
+          Filesystem::openWriteAtClose(-1, "/crashreport.txt"_ctv, report);
+        }
+        else if (container->rootfsPath.size() > 0)
+        {
+          String path = {};
+          path.assign(container->rootfsPath);
+          path.append("/crashreport.txt"_ctv);
+          Filesystem::openWriteAtClose(-1, path, report);
+        }
+        _exit(containerStartupFailureExitCode);
+      };
 
       String privilegedFDCloseFailure = {};
       if (closeContainerChildPrivilegedFDs(container, &privilegedFDCloseFailure) == false)
@@ -8127,7 +8149,7 @@ public:
         basics_log("startContainer failed to close inherited privileged fds uuid=%llu reason=%s\n",
                    (unsigned long long)container->plan.uuid,
                    privilegedFDCloseFailure.c_str());
-        _exit(containerStartupFailureExitCode);
+        failStartup("close privileged fds failed", &privilegedFDCloseFailure);
       }
 
       StartupSyncPayload startupPayload;
@@ -8137,7 +8159,13 @@ public:
 
       if (startupRead != ssize_t(sizeof(startupPayload)) || startupPayload.startSignal != 1 || (childUsesUserNamespace && startupPayload.idMapPID <= 0))
       {
-        _exit(containerStartupFailureExitCode);
+        String startupFailure = {};
+        startupFailure.snprintf<"read={} signal={} idMapPID={} userns={}"_ctv>(
+            startupRead,
+            startupPayload.startSignal,
+            startupPayload.idMapPID,
+            int(childUsesUserNamespace));
+        failStartup("startup sync failed", &startupFailure);
       }
 
       setuid(0);
@@ -8149,30 +8177,36 @@ public:
         basics_log("startContainer failed to set no_new_privs uuid=%llu reason=%s\n",
                    (unsigned long long)container->plan.uuid,
                    noNewPrivsFailure.c_str());
-        _exit(containerStartupFailureExitCode);
+        failStartup("no_new_privs failed", &noNewPrivsFailure);
       }
 
-      if (mountRootFSInCurrentNamespace(container, isRestart, startupPayload.idMapPID) == false)
+      String mountRootFailure = {};
+      if (mountRootFSInCurrentNamespace(container, isRestart, startupPayload.idMapPID, &mountRootFailure) == false)
       {
-        _exit(containerStartupFailureExitCode);
+        failStartup("mount rootfs failed", &mountRootFailure);
       }
+      insideContainerRoot = true;
 
       if (sethostname("x", 1) != 0)
       {
+        String hostnameFailure = {};
+        hostnameFailure.snprintf<"errno={}({})"_ctv>(errno, String(strerror(errno)));
         basics_log("startContainer sethostname failed uuid=%llu errno=%d(%s)\n",
                    (unsigned long long)container->plan.uuid,
                    errno,
                    strerror(errno));
-        _exit(containerStartupFailureExitCode);
+        failStartup("sethostname failed", &hostnameFailure);
       }
 
       if (setdomainname("x", 1) != 0)
       {
+        String domainFailure = {};
+        domainFailure.snprintf<"errno={}({})"_ctv>(errno, String(strerror(errno)));
         basics_log("startContainer setdomainname failed uuid=%llu errno=%d(%s)\n",
                    (unsigned long long)container->plan.uuid,
                    errno,
                    strerror(errno));
-        _exit(containerStartupFailureExitCode);
+        failStartup("setdomainname failed", &domainFailure);
       }
 
       String fastOpenFailure = {};
@@ -8181,7 +8215,7 @@ public:
         basics_log("startContainer failed to enable tcp_fastopen uuid=%llu reason=%s\n",
                    (unsigned long long)container->plan.uuid,
                    fastOpenFailure.c_str());
-        _exit(containerStartupFailureExitCode);
+        failStartup("tcp_fastopen failed", &fastOpenFailure);
       }
 
       String policyFailure = {};
@@ -8190,17 +8224,19 @@ public:
         basics_log("startContainer failed to apply post-mount security policy uuid=%llu reason=%s\n",
                    (unsigned long long)container->plan.uuid,
                    policyFailure.c_str());
-        _exit(containerStartupFailureExitCode);
+        failStartup("post-mount security policy failed", &policyFailure);
       }
 
       if (chdir(container->executeCwd.c_str()) != 0)
       {
+        String chdirFailure = {};
+        chdirFailure.snprintf<"cwd={} errno={}({})"_ctv>(container->executeCwd, errno, String(strerror(errno)));
         basics_log("startContainer chdir failed uuid=%llu cwd=%s errno=%d(%s)\n",
                    (unsigned long long)container->plan.uuid,
                    container->executeCwd.c_str(),
                    errno,
                    strerror(errno));
-        _exit(containerStartupFailureExitCode);
+        failStartup("chdir failed", &chdirFailure);
       }
 
       int execNeuronFD = socs[1];
@@ -8210,7 +8246,7 @@ public:
         basics_log("startContainer failed to move inherited neuron fd uuid=%llu reason=%s\n",
                    (unsigned long long)container->plan.uuid,
                    execDescriptorFailure.c_str());
-        _exit(containerStartupFailureExitCode);
+        failStartup("move neuron fd failed", &execDescriptorFailure);
       }
 
       ContainerParameters parameters;
@@ -8298,7 +8334,7 @@ public:
       }
       else if (ProdigyWire::serializeContainerParameters(serializedParameters, parameters) == false)
       {
-        _exit(containerStartupFailureExitCode);
+        failStartup("serialize compact container params failed");
       }
 
       int pfd = Memfd::create("container.params"_ctv);
@@ -8315,7 +8351,7 @@ public:
           basics_log("startContainer failed to move inherited params fd uuid=%llu reason=%s\n",
                      (unsigned long long)container->plan.uuid,
                      execDescriptorFailure.c_str());
-          _exit(containerStartupFailureExitCode);
+          failStartup("move params fd failed", &execDescriptorFailure);
         }
 
         String paramsFDText = {};
@@ -8346,7 +8382,7 @@ public:
 
         if (foundEquals == false || equalsIndex == 0)
         {
-          _exit(containerStartupFailureExitCode);
+          failStartup("invalid execute env");
         }
 
         String key = {};
@@ -8362,7 +8398,9 @@ public:
                      key.c_str(),
                      errno,
                      strerror(errno));
-          _exit(containerStartupFailureExitCode);
+          String setenvFailure = {};
+          setenvFailure.snprintf<"key={} errno={}({})"_ctv>(key, errno, String(strerror(errno)));
+          failStartup("setenv failed", &setenvFailure);
         }
       }
 
@@ -8371,8 +8409,23 @@ public:
         basics_log("startContainer failed to sanitize inherited exec fds uuid=%llu reason=%s\n",
                    (unsigned long long)container->plan.uuid,
                    execDescriptorFailure.c_str());
-        _exit(containerStartupFailureExitCode);
+        failStartup("sanitize exec fds failed", &execDescriptorFailure);
       }
+
+      mkdir("/logs", S_IRWXU);
+      auto redirectLogFD = [](const char *path, int targetFD) {
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR);
+        if (fd >= 0)
+        {
+          dup2(fd, targetFD);
+          if (fd != targetFD)
+          {
+            close(fd);
+          }
+        }
+      };
+      redirectLogFD("/logs/stdout.log", STDOUT_FILENO);
+      redirectLogFD("/logs/stderr.log", STDERR_FILENO);
 
       extern char **environ;
       Vector<char *> args;
@@ -8392,11 +8445,24 @@ public:
       int usrLdAccess = access("/usr/lib64/ld-linux-x86-64.so.2", R_OK);
       int usrLdAccessErrno = errno;
       execve(argv0, args.data(), environ);
+      int execErrno = errno;
+      String execFailureReport = {};
+      execFailureReport.snprintf<"execve failed path={} errno={}({}) bin={}({}) ld={}({}) usrld={}({})"_ctv>(
+          container->executePath,
+          execErrno,
+          String(strerror(execErrno)),
+          binaryAccess,
+          binaryAccessErrno,
+          ldAccess,
+          ldAccessErrno,
+          usrLdAccess,
+          usrLdAccessErrno);
+      Filesystem::openWriteAtClose(-1, "/crashreport.txt"_ctv, execFailureReport);
       basics_log("startContainer execve failed uuid=%llu path=%s errno=%d(%s)\n",
                  (unsigned long long)container->plan.uuid,
                  argv0,
-                 errno,
-                 strerror(errno));
+                 execErrno,
+                 strerror(execErrno));
       basics_log("startContainer pre-exec access uuid=%llu bin=%d(%d) ld=%d(%d) usrld=%d(%d)\n",
                  (unsigned long long)container->plan.uuid,
                  binaryAccess,
@@ -8407,7 +8473,7 @@ public:
                  usrLdAccessErrno);
 
       // when PID 1, process only receive receives signals it has set a mask for.... so this doesn't really matter for us?
-      _exit(containerStartupFailureExitCode);
+      failStartup("execve failed", &execFailureReport);
     }
     else // host, clone doesn't return until child calls exec
     {
@@ -8622,12 +8688,16 @@ public:
 
     if (access(compressedContainerPath.c_str(), R_OK) != 0)
     {
+      int imageErrno = errno;
       std::fprintf(stderr, "spinContainer missing image deploymentID=%llu path=%s errno=%d(%s)\n",
                    (unsigned long long)deploymentID,
                    compressedContainerPath.c_str(),
-                   errno,
-                   strerror(errno));
+                   imageErrno,
+                   strerror(imageErrno));
       std::fflush(stderr);
+      String report = {};
+      report.snprintf<"missing container image {} errno={itoa}({})"_ctv>(compressedContainerPath, uint64_t(imageErrno), String(strerror(imageErrno)));
+      reportSpinContainerFailure(plan, report);
       co_return;
     }
 
@@ -8647,6 +8717,11 @@ public:
                    compressedContainerPath.c_str(),
                    (blobVerificationFailure.size() > 0 ? blobVerificationFailure.c_str() : "unknown"));
       std::fflush(stderr);
+      if (blobVerificationFailure.size() == 0)
+      {
+        blobVerificationFailure.assign("container image verification failed"_ctv);
+      }
+      reportSpinContainerFailure(plan, blobVerificationFailure);
       co_return;
     }
     std::fprintf(stderr, "spinContainer verify ok deploymentID=%llu\n",
@@ -8665,6 +8740,9 @@ public:
       std::fprintf(stderr, "spinContainer createContainer returned null deploymentID=%llu\n",
                    (unsigned long long)deploymentID);
       std::fflush(stderr);
+      String report = {};
+      report.assign("createContainer returned null"_ctv);
+      reportSpinContainerFailure(plan, report);
       co_return;
     }
 
@@ -8693,6 +8771,7 @@ public:
                    unsigned(plan.config.applicationID),
                    failureReport.c_str());
       std::fflush(stderr);
+      reportSpinContainerFailure(plan, failureReport);
       co_return;
     }
 

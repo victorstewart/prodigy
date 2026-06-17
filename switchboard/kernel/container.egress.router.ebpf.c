@@ -18,9 +18,9 @@ struct
   __uint(max_entries, 16);
   __type(key, __u32);
   __type(value, __u64);
-} container_router_stats_map SEC(".maps");
+} ct_stats SEC(".maps");
 
-// container_router_stats_map indexes:
+// ct_stats indexes:
 // 0 entered
 // 1 dropped_over_mtu
 // 2 dropped_public_ipv4
@@ -32,7 +32,7 @@ struct
 
 static __always_inline void bumpPacketCounter(__u32 index)
 {
-  __u64 *slot = bpf_map_lookup_elem(&container_router_stats_map, &index);
+  __u64 *slot = bpf_map_lookup_elem(&ct_stats, &index);
   if (slot)
   {
     __sync_fetch_and_add(slot, 1);
@@ -40,7 +40,7 @@ static __always_inline void bumpPacketCounter(__u32 index)
 }
 
 SEC("netkit/peer")
-int container_egress_router(struct __sk_buff *skb)
+int ct_egress(struct __sk_buff *skb)
 {
   logSKB(skb);
 
@@ -175,7 +175,7 @@ int container_egress_router(struct __sk_buff *skb)
       }
 
       __u32 zeroidx = 0;
-      struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&local_container_subnet_map, &zeroidx);
+      struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
       if (switchboardContainerIDTargetsLocalMachine(&containerID, localSubnet))
       {
         setCheckpoint("redirectPortalToContainer");
@@ -190,7 +190,7 @@ redirect_to_nic:
   bumpPacketCounter(4);
 
   __u32 zeroidx = 0;
-  __u32 *nic_idx = bpf_map_lookup_elem(&container_device_map, &zeroidx);
+  __u32 *nic_idx = bpf_map_lookup_elem(&ct_dev_map, &zeroidx);
   if (!nic_idx)
   {
     return NETKIT_DROP;

@@ -761,6 +761,11 @@ int main(void)
     cluster.controls.push_back(makeUnixControl("/run/prodigy/control.sock"_ctv));
     cluster.dnsProvider = MothershipClusterProvider::gcpCloudDNS;
     cluster.dnsProviderCredentialName = "gcp-dns"_ctv;
+    cluster.acme.accountEmail = "ops@example.com"_ctv;
+    cluster.acme.certbotInstall = "bundle"_ctv;
+    cluster.acme.certbotPath = "/opt/prodigy/certbot/bin/certbot"_ctv;
+    cluster.acme.certbotVersion = "5.6.0"_ctv;
+    cluster.acme.termsAgreed = true;
 
     MothershipProviderCredential dnsCredential = {};
     dnsCredential.name = "gcp-dns"_ctv;
@@ -777,6 +782,14 @@ int main(void)
     suite.expect(config.dnsCredential.provider.equal("gcp-cloud-dns"_ctv), "cluster_dns_brain_config_credential_provider");
     suite.expect(config.dnsCredential.material.equal("gcp-bearer"_ctv), "cluster_dns_brain_config_credential_material");
     suite.expect(config.dnsCredential.metadata["project"_ctv].equal("prod-project"_ctv), "cluster_dns_brain_config_credential_metadata");
+    suite.expect(config.acme.accountEmail.equal("ops@example.com"_ctv), "cluster_acme_brain_config_email");
+    suite.expect(config.acme.certbotInstall.equal("bundle"_ctv), "cluster_acme_brain_config_certbot_install");
+    suite.expect(config.acme.certbotPath.equal("/opt/prodigy/certbot/bin/certbot"_ctv), "cluster_acme_brain_config_certbot_path");
+    suite.expect(config.acme.certbotVersion.equal("5.6.0"_ctv), "cluster_acme_brain_config_certbot_version");
+    suite.expect(config.acme.termsAgreed, "cluster_acme_brain_config_terms");
+    AddMachines bootstrapRequest = {};
+    suite.expect(mothershipBuildClusterBootstrapRequest(cluster, bootstrapRequest, &failure), "cluster_acme_bootstrap_request_builds");
+    suite.expect(bootstrapRequest.acme == cluster.acme, "cluster_acme_bootstrap_request_carries_acme");
   }
 
   {
@@ -973,6 +986,7 @@ int main(void)
     suite.expect(hooks.lastConfig.datacenterFragment == cluster.datacenterFragment, "create_local_minimal_config_fragment");
     suite.expect(hooks.lastConfig.autoscaleIntervalSeconds == cluster.autoscaleIntervalSeconds, "create_local_minimal_config_autoscale_interval");
     suite.expect(hooks.lastConfig.sharedCPUOvercommitPermille == cluster.sharedCPUOvercommitPermille, "create_local_minimal_config_shared_cpu_overcommit");
+    suite.expect(hooks.lastConfig.machineReservedResources == prodigyMachineReservedResources, "create_local_minimal_config_resource_reservation");
     suite.expect(hooks.lastConfig.osUpdatesEnabled == cluster.osUpdatesEnabled, "create_local_minimal_config_os_updates_enabled");
     suite.expect(hooks.lastConfig.osUpdatePolicies.size() == 1, "create_local_minimal_config_os_update_policy_count");
     suite.expect(hooks.lastConfig.osUpdatePolicies.size() == 1 && hooks.lastConfig.osUpdatePolicies[0].osID == "ubuntu"_ctv, "create_local_minimal_config_os_update_policy_os_id");
@@ -995,6 +1009,7 @@ int main(void)
     cluster.deploymentMode = MothershipClusterDeploymentMode::test;
     cluster.nBrains = 2;
     cluster.sharedCPUOvercommitPermille = 1500;
+    cluster.machineReservedResources = prodigySmokeMachineReservedResources;
     cluster.test.specified = true;
     cluster.test.workspaceRoot = "/tmp/test-local"_ctv;
     cluster.test.machineCount = 3;
@@ -1027,6 +1042,7 @@ int main(void)
     suite.expect(cluster.topology == hooks.fetchedTopology, "create_test_topology_persisted");
     suite.expect(cluster.environmentConfigured, "create_test_environment_configured");
     suite.expect(hooks.lastConfig.sharedCPUOvercommitPermille == 1500, "create_test_config_shared_cpu_overcommit");
+    suite.expect(hooks.lastConfig.machineReservedResources == prodigySmokeMachineReservedResources, "create_test_config_resource_reservation");
     suite.expect(hooks.lastConfig.runtimeEnvironment.test.enabled, "create_test_runtime_env_test_enabled");
     suite.expect(hooks.lastConfig.runtimeEnvironment.test.interContainerMTU == 9000, "create_test_runtime_env_inter_container_mtu");
     suite.expect(equalCallSequence(hooks.callSequence, {ClusterCreateCall::startTestCluster,

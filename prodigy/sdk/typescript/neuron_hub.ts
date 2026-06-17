@@ -937,9 +937,9 @@ export function buildResourceDeltaAckFrame(accepted: boolean): Buffer
    return buildMessageFrame(ContainerTopic.ResourceDeltaAck, Buffer.from([accepted ? 1 : 0]))
 }
 
-export function buildCredentialsRefreshAckFrame(): Buffer
+export function buildCredentialsRefreshAckFrame(payload: Uint8Array = Buffer.alloc(0)): Buffer
 {
-   return buildMessageFrame(ContainerTopic.CredentialsRefresh)
+   return buildMessageFrame(ContainerTopic.CredentialsRefresh, payload)
 }
 
 export function aegisFrameBytesForPlaintext(plaintextBytes: number): number
@@ -1356,9 +1356,9 @@ export class NeuronHub
       this.sendEncoded(buildResourceDeltaAckFrame(accepted))
    }
 
-   acknowledgeCredentialsRefresh(): void
+   acknowledgeCredentialsRefresh(payload: Uint8Array = Buffer.alloc(0)): void
    {
-      this.sendEncoded(buildCredentialsRefreshAckFrame())
+      this.sendEncoded(buildCredentialsRefreshAckFrame(payload))
    }
 
    handleFrame(frame: MessageFrame): MessageFrame[]

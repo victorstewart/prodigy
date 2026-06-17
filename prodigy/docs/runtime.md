@@ -1,27 +1,28 @@
-# Runtime startup and state
+#Runtime startup and state
 
-This document captures the runtime startup contract, persistent-state behavior, local/test cluster notes, and runtime update workflow.
+This document captures the runtime startup contract, persistent - state behavior, local / test cluster notes, and runtime update workflow.
 
-## Startup seed
+                                                                                                                  ##Startup seed
 
-On first boot, Prodigy can be seeded by either:
+                                                                                                                      On first boot,
+    Prodigy can be seeded by either :
 
-```text
---boot-json
---boot-json-path
+```text-- boot - json-- boot - json - path
 ```
 
-The boot seed is persist-only. Later boots load local state from TidesDB.
+    The boot seed is persist -
+    only.Later boots load local state from TidesDB.
 
-Default local state path:
+        Default local state path :
 
-```text
-/var/lib/prodigy/state
+```text /
+        var / lib / prodigy / state
 ```
 
-A first-boot seed must include:
+        A first -
+    boot seed must include :
 
-- bootstrap peers;
+    -bootstrap peers;
 - node role;
 - control socket path.
 
@@ -100,6 +101,9 @@ Prodigy schedules against an explicit machine budget. Current safe defaults rese
 | Storage | 4 GiB |
 
 These defaults are intentionally conservative and may be lowered as runtime footprint measurements mature.
+Non-production demo/smoke clusters can set `"resourceReservation": "smoke"`
+at `createCluster` time to reserve zero CPU, memory, and storage for placement
+accounting. The default is `"production"` and remains the only production mode.
 
 Capacity accounting:
 
@@ -115,7 +119,7 @@ Operating principles:
 - no separate managed control plane required for the basic model;
 - no mandatory service-mesh sidecars for every process;
 - explicit capacity reservation so overload behavior is predictable;
-- cloud-provider lifecycle control so unused machines can be removed quickly;
+- cloud - provider lifecycle control so unused machines can be removed quickly;
 - pricing and recommendation paths designed around provider machine offers, including hourly/on-demand and spot-style markets, with reserved-capacity support handled by provider adapters as available.
 
 ## Storage quotas
@@ -125,14 +129,15 @@ Hosts that back `/containers` with Btrfs can use squota for per-container storag
 Requirements:
 
 - Linux kernel `>= 6.7`;
-- recent `btrfs-progs` with squota support;
+- recent `btrfs - progs` with squota support;
 - `btrfs quota enable -s /containers` at bootstrap.
 
 Neuron reads referenced bytes and limits through `libbtrfsutil` for `storageUtilPct`. If squota is unavailable, storage utilization metrics are disabled while CPU and memory metrics continue.
 
 ## Autoscaling
 
-Prodigy local metrics use deterministic `uint64_t` metric keys. Containers emit batched samples through `ContainerTopic::statistics`; Neuron forwards them to Brain as `NeuronTopic::containerStatistics`; Brain keeps raw per-container samples in memory and computes scaler values over each scaler's `lookbackSeconds` window.
+Prodigy local metrics use deterministic `uint64_t` metric keys. Containers emit batched samples through `ContainerTopic::statistics`;
+Neuron forwards them to Brain as `NeuronTopic::containerStatistics`; Brain keeps raw per-container samples in memory and computes scaler values over each scaler's `lookbackSeconds` window.
 
 Horizontal scalers are available for stateless and stateful deployments. Stateful deployments never autoscale down.
 

@@ -295,7 +295,13 @@ private:
 
     if (credential.mode == MothershipProviderCredentialMode::awsCli)
     {
-      command.assign("aws configure export-credentials --format process 2>&1"_ctv);
+      command.assign("aws configure export-credentials"_ctv);
+      if (auto it = credential.metadata.find("profile"_ctv); it != credential.metadata.end() && stringHasContent(it->second))
+      {
+        command.append(" --profile "_ctv);
+        appendShellSingleQuoted(command, it->second);
+      }
+      command.append(" --format process 2>&1"_ctv);
       return true;
     }
 
@@ -872,6 +878,17 @@ public:
       }
 
       stored.createdAtMs = existing.createdAtMs;
+      if (stored.mode == MothershipProviderCredentialMode::staticMaterial && stored.material.size() == 0)
+      {
+        stored.material = existing.material;
+      }
+      for (const auto& [key, value] : existing.metadata)
+      {
+        if (stored.metadata.find(key) == stored.metadata.end())
+        {
+          stored.metadata.insert_or_assign(key, value);
+        }
+      }
     }
 
     if (normalizeCredentialForStorage(stored, !exists, failure) == false)

@@ -362,11 +362,12 @@ static inline void prodigyBuildBootstrapSSHCloudConfig(const String& configuredU
   config.append("      PubkeyAuthentication yes\n"_ctv);
   if (configureHostKey)
   {
-    config.append("  - path: /etc/ssh/ssh_host_ed25519_key\n"_ctv);
+    config.append("  - path: /etc/prodigy-bootstrap-ssh_host_ed25519_key\n"_ctv);
     config.append("    owner: root:root\n"_ctv);
     config.append("    permissions: '0600'\n"_ctv);
     config.append("    content: |\n"_ctv);
-    for (uint64_t index = 0; index < hostKeyPackage.privateKeyOpenSSH.size(); ++index)
+    uint64_t index = 0;
+    while (index < hostKeyPackage.privateKeyOpenSSH.size())
     {
       config.append("      "_ctv);
       while (index < hostKeyPackage.privateKeyOpenSSH.size())
@@ -386,7 +387,7 @@ static inline void prodigyBuildBootstrapSSHCloudConfig(const String& configuredU
       config.append("\n"_ctv);
     }
 
-    config.append("  - path: /etc/ssh/ssh_host_ed25519_key.pub\n"_ctv);
+    config.append("  - path: /etc/prodigy-bootstrap-ssh_host_ed25519_key.pub\n"_ctv);
     config.append("    owner: root:root\n"_ctv);
     config.append("    permissions: '0644'\n"_ctv);
     config.append("    content: |\n"_ctv);
@@ -421,7 +422,11 @@ static inline void prodigyBuildBootstrapSSHCloudConfig(const String& configuredU
     config.append(sshUser);
     config.append("/.ssh/authorized_keys || true\n"_ctv);
   }
-  config.append("  - systemctl restart sshd || systemctl restart ssh || service sshd restart || service ssh restart\n"_ctv);
+  if (configureHostKey)
+  {
+    config.append("  - sh -c 'mkdir -p /etc/ssh && cp /etc/prodigy-bootstrap-ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key && cp /etc/prodigy-bootstrap-ssh_host_ed25519_key.pub /etc/ssh/ssh_host_ed25519_key.pub && chown 0:0 /etc/ssh/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key.pub && chmod 600 /etc/ssh/ssh_host_ed25519_key && chmod 644 /etc/ssh/ssh_host_ed25519_key.pub && rm -f /etc/prodigy-bootstrap-ssh_host_ed25519_key /etc/prodigy-bootstrap-ssh_host_ed25519_key.pub'\n"_ctv);
+  }
+  config.append("  - sh -c 'systemctl restart sshd || systemctl restart ssh || service sshd restart || service ssh restart'\n"_ctv);
 }
 
 static inline void prodigyAppendEscapedJSONStringLiteral(String& output, const String& value)

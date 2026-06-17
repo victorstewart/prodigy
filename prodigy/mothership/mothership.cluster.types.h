@@ -264,6 +264,7 @@ public:
   bool propagateProviderCredentialToProdigy = false;
   MothershipClusterProvider dnsProvider = MothershipClusterProvider::unknown;
   String dnsProviderCredentialName;
+  ProdigyACMEConfig acme;
   MothershipProdigyClusterAwsConfig aws;
   MothershipProdigyClusterGcpConfig gcp;
   MothershipProdigyClusterAzureConfig azure;
@@ -283,6 +284,7 @@ public:
   String bootstrapSshPrivateKeyPath;
   String remoteProdigyPath;
   uint16_t sharedCPUOvercommitPermille = 1000;
+  ProdigyMachineReservedResources machineReservedResources;
   bool osUpdatesEnabled = false;
   Vector<OperatingSystemUpdatePolicy> osUpdatePolicies;
   uint32_t maxOSDrains = 1;
@@ -311,6 +313,7 @@ static void serialize(S&& serializer, MothershipProdigyCluster& cluster)
   serializer.value1b(cluster.propagateProviderCredentialToProdigy);
   serializer.value1b(cluster.dnsProvider);
   serializer.text1b(cluster.dnsProviderCredentialName, UINT32_MAX);
+  serializer.object(cluster.acme);
   serializer.object(cluster.aws);
   serializer.object(cluster.gcp);
   serializer.object(cluster.azure);
@@ -327,6 +330,7 @@ static void serialize(S&& serializer, MothershipProdigyCluster& cluster)
   serializer.text1b(cluster.bootstrapSshPrivateKeyPath, UINT32_MAX);
   serializer.text1b(cluster.remoteProdigyPath, UINT32_MAX);
   serializer.value2b(cluster.sharedCPUOvercommitPermille);
+  serializer.object(cluster.machineReservedResources);
   serializer.value1b(cluster.osUpdatesEnabled);
   serializer.container(cluster.osUpdatePolicies, UINT32_MAX);
   serializer.value4b(cluster.maxOSDrains);

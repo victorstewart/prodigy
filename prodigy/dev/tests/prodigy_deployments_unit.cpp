@@ -3,6 +3,7 @@
 #include <services/debug.h>
 #include <prodigy/brain/brain.h>
 #include <prodigy/containerstore.h>
+#include <prodigy/acme.certbot.h>
 #include <prodigy/dns.providers.h>
 #include <prodigy/mothership/mothership.deployment.plan.helpers.h>
 #include <prodigy/neuron/containers.h>
@@ -232,6 +233,7 @@ public:
 
   String method;
   String url;
+  Vector<String> headers;
   String body;
 };
 
@@ -251,6 +253,12 @@ protected:
     captured.method = request.method;
     captured.url = request.url;
     captured.body = request.body;
+    for (curl_slist *header = request.headers; header != nullptr; header = header->next)
+    {
+      String value = {};
+      value.assign(header->data);
+      captured.headers.push_back(value);
+    }
     uint64_t index = requests.size();
     requests.push_back(captured);
     if (index < responses.size())
@@ -301,6 +309,27 @@ protected:
     body = requestBody == nullptr ? String() : *requestBody;
     response = index < responses.size() ? responses[index] : String("<ok/>"_ctv);
     httpCode = index < httpCodes.size() ? httpCodes[index] : 200;
+    return true;
+  }
+};
+
+class AddressOnlyDNSProvider final : public ProdigyDNSProvider {
+public:
+
+  bool supportsProvider(const String& provider) const override
+  {
+    return provider.equal("address-only"_ctv);
+  }
+
+  bool upsert(const ProdigyDNSRecordBinding&, const ApiCredential&, String& failure) override
+  {
+    failure.clear();
+    return true;
+  }
+
+  bool remove(const ProdigyDNSRecordBinding&, const ApiCredential&, String& failure) override
+  {
+    failure.clear();
     return true;
   }
 };
@@ -408,6 +437,17 @@ static bool writeFileFixture(const std::filesystem::path& path, const String& pa
 
   String targetPath = stringFromFilesystemPath(path);
   return Filesystem::openWriteAtClose(-1, targetPath, payload) >= 0;
+}
+
+static bool readFileFixture(const std::filesystem::path& path, String& payload)
+{
+  payload.clear();
+  if (std::filesystem::exists(path) == false)
+  {
+    return false;
+  }
+  Filesystem::openReadAtClose(-1, stringFromFilesystemPath(path), payload);
+  return true;
 }
 
 static String repeatedString(uint64_t bytes, char fill)
@@ -600,11 +640,13 @@ int main(void)
     suite.expect(cloudflare.upsert(record, credential, failure), "dns_provider_cloudflare_create_succeeds");
     suite.expect(cloudflare.requests.size() == 2, "dns_provider_cloudflare_create_lists_then_writes");
     suite.expect(cloudflare.requests.size() == 2 && cloudflare.requests[0].method.equal("GET"_ctv), "dns_provider_cloudflare_create_lists");
+    suite.expect(cloudflare.requests.size() == 2 && stringContains(cloudflare.requests[0].url, "name=api.example.com"), "dns_provider_cloudflare_create_query_omits_trailing_dot");
     suite.expect(cloudflare.requests.size() == 2 && cloudflare.requests[1].method.equal("POST"_ctv), "dns_provider_cloudflare_create_posts");
     suite.expect(cloudflare.requests.size() == 2 && stringContains(cloudflare.requests[1].body, "\"content\":\"203.0.113.10\""), "dns_provider_cloudflare_create_body_targets_address");
+    suite.expect(cloudflare.requests.size() == 2 && stringContains(cloudflare.requests[1].body, "\"name\":\"api.example.com\""), "dns_provider_cloudflare_create_body_omits_trailing_dot");
 
     RecordingCloudflareDNSProvider cloudflareConflict = {};
-    cloudflareConflict.responses.push_back("{\"result\":[{\"id\":\"rec-2\",\"type\":\"A\",\"name\":\"api.example.com.\",\"content\":\"203.0.113.11\"}]}"_ctv);
+    cloudflareConflict.responses.push_back("{\"result\":[{\"id\":\"rec-2\",\"type\":\"A\",\"name\":\"api.example.com\",\"content\":\"203.0.113.11\"}]}"_ctv);
     suite.expect(cloudflareConflict.upsert(record, credential, failure) == false, "dns_provider_cloudflare_rejects_existing_different_record");
     suite.expect(failure.equal("DNS record already exists with different value"_ctv), "dns_provider_cloudflare_conflict_failure_text");
     suite.expect(cloudflareConflict.requests.size() == 1, "dns_provider_cloudflare_conflict_does_not_write");
@@ -638,13 +680,15 @@ int main(void)
     RecordingGcpCloudDNSProvider gcp = {};
     record.provider = "gcp-cloud-dns"_ctv;
     record.zone = "prod-zone"_ctv;
-    credential.material = "token"_ctv;
+    credential.material = "stale-gcp-token"_ctv;
     credential.metadata.clear();
     credential.metadata["project"_ctv] = "proj"_ctv;
+    credential.metadata["bearerRefreshCommand"_ctv] = "printf refreshed-gcp"_ctv;
     gcp.responses.push_back("{\"rrsets\":[]}"_ctv);
     gcp.responses.push_back("{\"id\":\"change-1\"}"_ctv);
     suite.expect(gcp.upsert(record, credential, failure), "dns_provider_gcp_create_succeeds");
     suite.expect(gcp.requests.size() == 2 && gcp.requests[0].method.equal("GET"_ctv) && gcp.requests[1].method.equal("POST"_ctv), "dns_provider_gcp_lists_then_writes");
+    suite.expect(gcp.requests.size() == 2 && gcp.requests[0].headers.size() == 1 && gcp.requests[0].headers[0].equal("Authorization: Bearer refreshed-gcp"_ctv), "dns_provider_gcp_refresh_command_supplies_bearer");
 
     RecordingGcpCloudDNSProvider gcpConflict = {};
     gcpConflict.responses.push_back("{\"rrsets\":[{\"name\":\"api.example.com.\",\"type\":\"A\",\"rrdatas\":[\"203.0.113.11\"]}]}"_ctv);
@@ -654,15 +698,18 @@ int main(void)
     RecordingAzureDNSProvider azure = {};
     record.provider = "azure-dns"_ctv;
     record.zone = "example.com"_ctv;
+    credential.material = "stale-azure-token"_ctv;
     credential.metadata.clear();
     credential.metadata["subscriptionID"_ctv] = "sub"_ctv;
     credential.metadata["resourceGroup"_ctv] = "rg"_ctv;
+    credential.metadata["bearerRefreshCommand"_ctv] = "printf refreshed-azure"_ctv;
     azure.httpCodes.push_back(404);
     azure.httpCodes.push_back(200);
     azure.responses.push_back("{}"_ctv);
     azure.responses.push_back("{}"_ctv);
     suite.expect(azure.upsert(record, credential, failure), "dns_provider_azure_create_succeeds");
     suite.expect(azure.requests.size() == 2 && azure.requests[0].method.equal("GET"_ctv) && azure.requests[1].method.equal("PUT"_ctv), "dns_provider_azure_gets_then_writes");
+    suite.expect(azure.requests.size() == 2 && azure.requests[0].headers.size() == 1 && azure.requests[0].headers[0].equal("Authorization: Bearer refreshed-azure"_ctv), "dns_provider_azure_refresh_command_supplies_bearer");
 
     RecordingAzureDNSProvider azureConflict = {};
     azureConflict.responses.push_back("{\"properties\":{\"ARecords\":[{\"ipv4Address\":\"203.0.113.11\"}]}}"_ctv);
@@ -675,6 +722,131 @@ int main(void)
     vultrConflict.responses.push_back("{\"records\":[{\"id\":\"rec-3\",\"type\":\"A\",\"name\":\"api\",\"data\":\"203.0.113.11\"}]}"_ctv);
     suite.expect(vultrConflict.upsert(record, credential, failure) == false, "dns_provider_vultr_rejects_existing_different_record");
     suite.expect(vultrConflict.requests.size() == 1, "dns_provider_vultr_conflict_does_not_write");
+
+    ProdigyDNSRecordBinding txt = {};
+    txt.zone = "example.com"_ctv;
+    txt.name = "_acme-challenge.api.example.com."_ctv;
+    txt.type = "TXT"_ctv;
+    txt.values.push_back("token-1"_ctv);
+    txt.ttl = 60;
+
+    AddressOnlyDNSProvider addressOnly = {};
+    suite.expect(addressOnly.presentTXT(txt, credential, failure) == false && failure.equal("DNS provider does not implement ACME TXT present"_ctv), "dns_provider_base_present_txt_fails_closed");
+    suite.expect(addressOnly.cleanupTXT(txt, credential, failure) == false && failure.equal("DNS provider does not implement ACME TXT cleanup"_ctv), "dns_provider_base_cleanup_txt_fails_closed");
+
+    RecordingCloudflareDNSProvider cloudflareTXT = {};
+    txt.provider = "cloudflare"_ctv;
+    credential.material = "token"_ctv;
+    credential.metadata.clear();
+    cloudflareTXT.responses.push_back("{\"result\":[{\"id\":\"old\",\"type\":\"TXT\",\"name\":\"_acme-challenge.api.example.com.\",\"content\":\"old-token\"}]}"_ctv);
+    cloudflareTXT.responses.push_back("{\"success\":true}"_ctv);
+    suite.expect(cloudflareTXT.presentTXT(txt, credential, failure), "dns_provider_cloudflare_present_txt_ignores_sibling_value");
+    suite.expect(cloudflareTXT.requests.size() == 2 && cloudflareTXT.requests[1].method.equal("POST"_ctv), "dns_provider_cloudflare_present_txt_posts_missing_exact_value");
+
+    RecordingCloudflareDNSProvider cloudflareTXTCleanup = {};
+    cloudflareTXTCleanup.responses.push_back("{\"result\":[{\"id\":\"old\",\"type\":\"TXT\",\"name\":\"_acme-challenge.api.example.com.\",\"content\":\"old-token\"},{\"id\":\"new\",\"type\":\"TXT\",\"name\":\"_acme-challenge.api.example.com.\",\"content\":\"token-1\"}]}"_ctv);
+    cloudflareTXTCleanup.responses.push_back("{}"_ctv);
+    suite.expect(cloudflareTXTCleanup.cleanupTXT(txt, credential, failure), "dns_provider_cloudflare_cleanup_txt_removes_exact_value");
+    suite.expect(cloudflareTXTCleanup.requests.size() == 2 && stringContains(cloudflareTXTCleanup.requests[1].url, "/new"), "dns_provider_cloudflare_cleanup_txt_uses_exact_record_id");
+
+    RecordingCloudflareDNSProvider cloudflareTXTMissingCleanup = {};
+    cloudflareTXTMissingCleanup.responses.push_back("{\"result\":[{\"id\":\"old\",\"type\":\"TXT\",\"name\":\"_acme-challenge.api.example.com.\",\"content\":\"old-token\"}]}"_ctv);
+    suite.expect(cloudflareTXTMissingCleanup.cleanupTXT(txt, credential, failure), "dns_provider_cloudflare_cleanup_txt_missing_exact_value_succeeds");
+    suite.expect(cloudflareTXTMissingCleanup.requests.size() == 1, "dns_provider_cloudflare_cleanup_txt_missing_exact_value_does_not_delete");
+
+    RecordingRoute53DNSProvider route53TXT = {};
+    txt.provider = "route53"_ctv;
+    txt.zone = "/hostedzone/Z123"_ctv;
+    credential.material = "AKIA:SECRET"_ctv;
+    route53TXT.responses.push_back("<ListResourceRecordSetsResponse><ResourceRecordSets><ResourceRecordSet><Name>_acme-challenge.api.example.com.</Name><Type>TXT</Type><TTL>60</TTL><ResourceRecords><ResourceRecord><Value>\"old-token\"</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></ResourceRecordSets></ListResourceRecordSetsResponse>"_ctv);
+    suite.expect(route53TXT.presentTXT(txt, credential, failure), "dns_provider_route53_present_txt_merges_rrset");
+    suite.expect(stringContains(route53TXT.body, "<Action>UPSERT</Action>"), "dns_provider_route53_present_txt_upserts");
+    suite.expect(stringContains(route53TXT.body, "<Value>&quot;old-token&quot;</Value>") && stringContains(route53TXT.body, "<Value>&quot;token-1&quot;</Value>"), "dns_provider_route53_present_txt_preserves_sibling");
+
+    RecordingRoute53DNSProvider route53TXTXML = {};
+    ProdigyDNSRecordBinding xmlTXT = txt;
+    xmlTXT.values.clear();
+    xmlTXT.values.push_back("token&<\"quote"_ctv);
+    suite.expect(route53TXTXML.presentTXT(xmlTXT, credential, failure), "dns_provider_route53_present_txt_xml_escapes");
+    suite.expect(stringContains(route53TXTXML.body, "<Value>&quot;token&amp;&lt;\\&quot;quote&quot;</Value>"), "dns_provider_route53_present_txt_xml_escaped_value");
+
+    RecordingRoute53DNSProvider route53TXTCleanup = {};
+    route53TXTCleanup.responses.push_back("<ListResourceRecordSetsResponse><ResourceRecordSets><ResourceRecordSet><Name>_acme-challenge.api.example.com.</Name><Type>TXT</Type><TTL>60</TTL><ResourceRecords><ResourceRecord><Value>\"old-token\"</Value></ResourceRecord><ResourceRecord><Value>\"token-1\"</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></ResourceRecordSets></ListResourceRecordSetsResponse>"_ctv);
+    suite.expect(route53TXTCleanup.cleanupTXT(txt, credential, failure), "dns_provider_route53_cleanup_txt_preserves_sibling");
+    suite.expect(stringContains(route53TXTCleanup.body, "<Action>UPSERT</Action>") && stringContains(route53TXTCleanup.body, "<Value>&quot;old-token&quot;</Value>") && stringContains(route53TXTCleanup.body, "<Value>&quot;token-1&quot;</Value>") == false, "dns_provider_route53_cleanup_txt_removes_exact_value");
+
+    RecordingRoute53DNSProvider route53TXTDelete = {};
+    route53TXTDelete.responses.push_back("<ListResourceRecordSetsResponse><ResourceRecordSets><ResourceRecordSet><Name>_acme-challenge.api.example.com.</Name><Type>TXT</Type><TTL>60</TTL><ResourceRecords><ResourceRecord><Value>\"token-1\"</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></ResourceRecordSets></ListResourceRecordSetsResponse>"_ctv);
+    suite.expect(route53TXTDelete.cleanupTXT(txt, credential, failure), "dns_provider_route53_cleanup_txt_deletes_empty_rrset");
+    suite.expect(stringContains(route53TXTDelete.body, "<Action>DELETE</Action>") && stringContains(route53TXTDelete.body, "<Value>&quot;token-1&quot;</Value>"), "dns_provider_route53_cleanup_txt_delete_body_targets_old_rrset");
+
+    RecordingGcpCloudDNSProvider gcpTXT = {};
+    txt.provider = "gcp-cloud-dns"_ctv;
+    txt.zone = "prod-zone"_ctv;
+    credential.material = "token"_ctv;
+    credential.metadata.clear();
+    credential.metadata["project"_ctv] = "proj"_ctv;
+    credential.metadata["bearerRefreshCommand"_ctv] = "printf refreshed-gcp-txt"_ctv;
+    gcpTXT.responses.push_back("{\"rrsets\":[{\"name\":\"_acme-challenge.api.example.com.\",\"type\":\"TXT\",\"ttl\":60,\"rrdatas\":[\"\\\"old-token\\\"\"]}]}"_ctv);
+    gcpTXT.responses.push_back("{\"id\":\"change-1\"}"_ctv);
+    suite.expect(gcpTXT.presentTXT(txt, credential, failure), "dns_provider_gcp_present_txt_merges_rrset");
+    suite.expect(gcpTXT.requests.size() == 2 && stringContains(gcpTXT.requests[1].body, "\"deletions\"") && stringContains(gcpTXT.requests[1].body, "\"additions\""), "dns_provider_gcp_present_txt_replaces_rrset");
+    suite.expect(stringContains(gcpTXT.requests[1].body, "\\\"old-token\\\"") && stringContains(gcpTXT.requests[1].body, "\\\"token-1\\\""), "dns_provider_gcp_present_txt_preserves_sibling");
+    suite.expect(gcpTXT.requests.size() == 2 && gcpTXT.requests[0].headers.size() == 1 && gcpTXT.requests[1].headers.size() == 2 && gcpTXT.requests[0].headers[0].equal("Authorization: Bearer refreshed-gcp-txt"_ctv) && gcpTXT.requests[1].headers[1].equal("Authorization: Bearer refreshed-gcp-txt"_ctv), "dns_provider_gcp_present_txt_refreshes_bearer");
+
+    RecordingGcpCloudDNSProvider gcpTXTCleanup = {};
+    gcpTXTCleanup.responses.push_back("{\"rrsets\":[{\"name\":\"_acme-challenge.api.example.com.\",\"type\":\"TXT\",\"ttl\":60,\"rrdatas\":[\"\\\"old-token\\\"\",\"\\\"token-1\\\"\"]}]}"_ctv);
+    gcpTXTCleanup.responses.push_back("{\"id\":\"change-2\"}"_ctv);
+    suite.expect(gcpTXTCleanup.cleanupTXT(txt, credential, failure), "dns_provider_gcp_cleanup_txt_preserves_sibling");
+    suite.expect(gcpTXTCleanup.requests.size() == 2 && stringContains(gcpTXTCleanup.requests[1].body, "\"deletions\"") && stringContains(gcpTXTCleanup.requests[1].body, "\"additions\""), "dns_provider_gcp_cleanup_txt_replaces_rrset");
+    suite.expect(stringContains(gcpTXTCleanup.requests[1].body, "\\\"old-token\\\"") && stringContains(gcpTXTCleanup.requests[1].body, "\\\"token-1\\\""), "dns_provider_gcp_cleanup_txt_delete_mentions_old_rrset");
+
+    RecordingGcpCloudDNSProvider gcpTXTDelete = {};
+    gcpTXTDelete.responses.push_back("{\"rrsets\":[{\"name\":\"_acme-challenge.api.example.com.\",\"type\":\"TXT\",\"ttl\":60,\"rrdatas\":[\"\\\"token-1\\\"\"]}]}"_ctv);
+    gcpTXTDelete.responses.push_back("{\"id\":\"change-3\"}"_ctv);
+    suite.expect(gcpTXTDelete.cleanupTXT(txt, credential, failure), "dns_provider_gcp_cleanup_txt_deletes_empty_rrset");
+    suite.expect(gcpTXTDelete.requests.size() == 2 && stringContains(gcpTXTDelete.requests[1].body, "\"deletions\"") && stringContains(gcpTXTDelete.requests[1].body, "\"additions\"") == false, "dns_provider_gcp_cleanup_txt_delete_omits_empty_additions");
+
+    RecordingAzureDNSProvider azureTXT = {};
+    txt.provider = "azure-dns"_ctv;
+    txt.zone = "example.com"_ctv;
+    credential.metadata.clear();
+    credential.metadata["subscriptionID"_ctv] = "sub"_ctv;
+    credential.metadata["resourceGroup"_ctv] = "rg"_ctv;
+    credential.metadata["bearerRefreshCommand"_ctv] = "printf refreshed-azure-txt"_ctv;
+    azureTXT.responses.push_back("{\"properties\":{\"TXTRecords\":[{\"value\":[\"old-token\"]}]}}"_ctv);
+    azureTXT.responses.push_back("{}"_ctv);
+    suite.expect(azureTXT.presentTXT(txt, credential, failure), "dns_provider_azure_present_txt_merges_rrset");
+    suite.expect(azureTXT.requests.size() == 2 && azureTXT.requests[1].method.equal("PUT"_ctv), "dns_provider_azure_present_txt_puts_rrset");
+    suite.expect(stringContains(azureTXT.requests[1].body, "\"TXTRecords\"") && stringContains(azureTXT.requests[1].body, "\"old-token\"") && stringContains(azureTXT.requests[1].body, "\"token-1\""), "dns_provider_azure_present_txt_preserves_sibling");
+    suite.expect(azureTXT.requests.size() == 2 && azureTXT.requests[0].headers.size() == 1 && azureTXT.requests[1].headers.size() == 2 && azureTXT.requests[0].headers[0].equal("Authorization: Bearer refreshed-azure-txt"_ctv) && azureTXT.requests[1].headers[1].equal("Authorization: Bearer refreshed-azure-txt"_ctv), "dns_provider_azure_present_txt_refreshes_bearer");
+
+    RecordingAzureDNSProvider azureTXTCleanup = {};
+    azureTXTCleanup.responses.push_back("{\"properties\":{\"TXTRecords\":[{\"value\":[\"old-token\"]},{\"value\":[\"token-1\"]}]}}"_ctv);
+    azureTXTCleanup.responses.push_back("{}"_ctv);
+    suite.expect(azureTXTCleanup.cleanupTXT(txt, credential, failure), "dns_provider_azure_cleanup_txt_preserves_sibling");
+    suite.expect(azureTXTCleanup.requests.size() == 2 && azureTXTCleanup.requests[1].method.equal("PUT"_ctv), "dns_provider_azure_cleanup_txt_puts_remaining_rrset");
+    suite.expect(stringContains(azureTXTCleanup.requests[1].body, "\"old-token\"") && stringContains(azureTXTCleanup.requests[1].body, "\"token-1\"") == false, "dns_provider_azure_cleanup_txt_removes_exact_value");
+
+    RecordingAzureDNSProvider azureTXTDelete = {};
+    azureTXTDelete.responses.push_back("{\"properties\":{\"TXTRecords\":[{\"value\":[\"token-1\"]}]}}"_ctv);
+    azureTXTDelete.responses.push_back("{}"_ctv);
+    suite.expect(azureTXTDelete.cleanupTXT(txt, credential, failure), "dns_provider_azure_cleanup_txt_deletes_empty_rrset");
+    suite.expect(azureTXTDelete.requests.size() == 2 && azureTXTDelete.requests[1].method.equal("DELETE"_ctv), "dns_provider_azure_cleanup_txt_delete_uses_delete");
+
+    RecordingVultrDNSProvider vultrTXT = {};
+    txt.provider = "vultr-dns"_ctv;
+    credential.material = "token"_ctv;
+    credential.metadata.clear();
+    vultrTXT.responses.push_back("{\"records\":[{\"id\":\"old\",\"type\":\"TXT\",\"name\":\"_acme-challenge.api\",\"data\":\"old-token\"}]}"_ctv);
+    vultrTXT.responses.push_back("{}"_ctv);
+    suite.expect(vultrTXT.presentTXT(txt, credential, failure), "dns_provider_vultr_present_txt_ignores_sibling_value");
+    suite.expect(vultrTXT.requests.size() == 2 && vultrTXT.requests[1].method.equal("POST"_ctv), "dns_provider_vultr_present_txt_posts_missing_exact_value");
+
+    RecordingVultrDNSProvider vultrTXTMissingCleanup = {};
+    vultrTXTMissingCleanup.responses.push_back("{\"records\":[{\"id\":\"old\",\"type\":\"TXT\",\"name\":\"_acme-challenge.api\",\"data\":\"old-token\"}]}"_ctv);
+    suite.expect(vultrTXTMissingCleanup.cleanupTXT(txt, credential, failure), "dns_provider_vultr_cleanup_txt_missing_exact_value_succeeds");
+    suite.expect(vultrTXTMissingCleanup.requests.size() == 1, "dns_provider_vultr_cleanup_txt_missing_exact_value_does_not_delete");
   }
 
   {
@@ -2763,7 +2935,6 @@ int main(void)
     plan.tlsIssuancePolicy.applicationID = 42;
     plan.tlsIssuancePolicy.enablePerContainerLeafs = true;
     plan.tlsIssuancePolicy.leafValidityDays = 15;
-    plan.tlsIssuancePolicy.renewLeadPercent = 10;
     plan.tlsIssuancePolicy.identityNames.push_back("inbound_server_tls"_ctv);
     plan.tlsIssuancePolicy.dnsSans.push_back("nametag.social"_ctv);
     plan.tlsIssuancePolicy.dnsSans.push_back("dev.nametag.social"_ctv);
@@ -2839,6 +3010,16 @@ int main(void)
     wormhole.dns.ttl = 300;
     plan.wormholes.push_back(wormhole);
 
+    WormholePublicTLSConfig publicTLS = {};
+    publicTLS.wormholeName = "public-api-quic"_ctv;
+    publicTLS.identityName = "public-api-quic-public"_ctv;
+    publicTLS.domains.push_back("api.example.com"_ctv);
+    publicTLS.issuer = "letsencrypt"_ctv;
+    publicTLS.keyType = "ecdsa"_ctv;
+    publicTLS.staging = true;
+    publicTLS.renewAfterLifetimePermille = 667;
+    plan.publicTLS.push_back(publicTLS);
+
     String serialized;
     BitseryEngine::serialize(serialized, plan);
 
@@ -2868,6 +3049,14 @@ int main(void)
     suite.expect(roundtrip.wormholes[0].dns.bindingName.equal("api-binding"_ctv), "deployment_plan_roundtrip_preserves_wormhole_dns_binding_name");
     suite.expect(roundtrip.wormholes[0].dns.type.equal("AAAA"_ctv), "deployment_plan_roundtrip_preserves_wormhole_dns_type");
     suite.expect(roundtrip.wormholes[0].dns.ttl == 300, "deployment_plan_roundtrip_preserves_wormhole_dns_ttl");
+    suite.expect(roundtrip.publicTLS.size() == 1, "deployment_plan_roundtrip_preserves_public_tls_count");
+    suite.expect(roundtrip.publicTLS[0].wormholeName.equal("public-api-quic"_ctv), "deployment_plan_roundtrip_preserves_public_tls_wormhole");
+    suite.expect(roundtrip.publicTLS[0].identityName.equal("public-api-quic-public"_ctv), "deployment_plan_roundtrip_preserves_public_tls_identity");
+    suite.expect(roundtrip.publicTLS[0].domains.size() == 1 && roundtrip.publicTLS[0].domains[0].equal("api.example.com"_ctv), "deployment_plan_roundtrip_preserves_public_tls_domain");
+    suite.expect(roundtrip.publicTLS[0].issuer.equal("letsencrypt"_ctv), "deployment_plan_roundtrip_preserves_public_tls_issuer");
+    suite.expect(roundtrip.publicTLS[0].keyType.equal("ecdsa"_ctv), "deployment_plan_roundtrip_preserves_public_tls_key_type");
+    suite.expect(roundtrip.publicTLS[0].staging == true, "deployment_plan_roundtrip_preserves_public_tls_staging");
+    suite.expect(roundtrip.publicTLS[0].renewAfterLifetimePermille == 667, "deployment_plan_roundtrip_preserves_public_tls_renew_after");
   }
 
   {
@@ -3385,6 +3574,53 @@ int main(void)
     lease.sourcePort = 50'088;
     runtimeState.routableResourceLeases.push_back(lease);
 
+    PublicTlsCertificateState publicCert = {};
+    publicCert.spec.applicationID = 88;
+    publicCert.spec.deploymentID = 9911;
+    publicCert.spec.wormholeName = "api"_ctv;
+    publicCert.spec.identityName = "api-public"_ctv;
+    publicCert.spec.domains.push_back("api.example.com"_ctv);
+    publicCert.spec.issuer = "letsencrypt"_ctv;
+    publicCert.spec.keyType = "ecdsa"_ctv;
+    publicCert.spec.dnsProvider = "cloudflare"_ctv;
+    publicCert.spec.dnsCredentialName = "prod-dns"_ctv;
+    publicCert.spec.dnsZone = "example.com"_ctv;
+    publicCert.spec.dnsTTL = 60;
+    publicCert.identity.name = "api-public"_ctv;
+    publicCert.identity.generation = 4;
+    publicCert.identity.notBeforeMs = 1'700'000'000'000;
+    publicCert.identity.notAfterMs = 1'700'086'400'000;
+    publicCert.identity.certPem = "cert"_ctv;
+    publicCert.identity.keyPem = "key"_ctv;
+    publicCert.identity.chainPem = "chain"_ctv;
+    publicCert.identity.dnsSans.push_back("api.example.com"_ctv);
+    publicCert.certbotCertName = "app88-api"_ctv;
+    publicCert.lineagePath = "/var/lib/prodigy/certbot/cluster/config/live/app88-api"_ctv;
+    publicCert.generation = 4;
+    publicCert.nextRenewAtMs = prodigyCertificateRenewAtMs(publicCert.identity.notBeforeMs, publicCert.identity.notAfterMs, publicCert.spec.renewAfterLifetimePermille);
+    publicCert.lastAttemptMs = 1'700'010'000'000;
+    publicCert.lastSuccessMs = 1'700'010'001'000;
+    publicCert.failureCount = 2;
+    publicCert.lastFailure = "previous public tls failure"_ctv;
+    runtimeState.publicTlsCertificates.push_back(publicCert);
+
+    PrivateTlsVaultLifecycleState privateVault = {};
+    privateVault.applicationID = 88;
+    privateVault.factoryGeneration = 12;
+    privateVault.rootNotBeforeMs = 1'700'000'000'000;
+    privateVault.rootNotAfterMs = 1'725'920'000'000;
+    privateVault.intermediateNotBeforeMs = 1'700'000'000'000;
+    privateVault.intermediateNotAfterMs = 1'708'640'000'000;
+    privateVault.leafNotBeforeMs = 1'700'000'000'000;
+    privateVault.leafNotAfterMs = 1'701'296'000'000;
+    privateVault.leafNextRenewAtMs = prodigyCertificateRenewAtMs(privateVault.leafNotBeforeMs, privateVault.leafNotAfterMs, prodigyDefaultCertificateRenewAfterLifetimePermille);
+    privateVault.nextRenewAtMs = prodigyEarliestPositiveMs(
+        prodigyCertificateRenewAtMs(privateVault.intermediateNotBeforeMs, privateVault.intermediateNotAfterMs, prodigyDefaultCertificateRenewAfterLifetimePermille),
+        privateVault.leafNextRenewAtMs);
+    privateVault.failureCount = 3;
+    privateVault.lastFailure = "previous private tls failure"_ctv;
+    runtimeState.privateTlsVaultLifecycles.push_back(privateVault);
+
     String serialized = {};
     BitseryEngine::serialize(serialized, runtimeState);
 
@@ -3400,6 +3636,243 @@ int main(void)
     suite.expect(roundtrip.statefulWorkerTopologyUpgradeOperations.size() == 1 && roundtrip.statefulWorkerTopologyUpgradeOperations[0].lockedShardGroups.size() == 2, "runtime_state_roundtrip_preserves_stateful_worker_topology_upgrade_locked_groups");
     suite.expect(roundtrip.routableResourceLeases.size() == 1, "runtime_state_roundtrip_preserves_routable_resource_lease_count");
     suite.expect(roundtrip.routableResourceLeases.size() == 1 && roundtrip.routableResourceLeases[0] == lease, "runtime_state_roundtrip_preserves_routable_resource_lease");
+    suite.expect(roundtrip.publicTlsCertificates.size() == 1, "runtime_state_roundtrip_preserves_public_tls_certificate_count");
+    suite.expect(roundtrip.publicTlsCertificates.size() == 1 && prodigyPublicTlsCertificateStatesEqual(roundtrip.publicTlsCertificates[0], publicCert), "runtime_state_roundtrip_preserves_public_tls_certificate");
+    suite.expect(roundtrip.privateTlsVaultLifecycles.size() == 1, "runtime_state_roundtrip_preserves_private_tls_vault_lifecycle_count");
+    suite.expect(roundtrip.privateTlsVaultLifecycles.size() == 1 && prodigyPrivateTlsVaultLifecycleStatesEqual(roundtrip.privateTlsVaultLifecycles[0], privateVault), "runtime_state_roundtrip_preserves_private_tls_vault_lifecycle");
+    suite.expect(publicCert.nextRenewAtMs == 1'700'057'628'800, "certificate_renew_at_uses_two_thirds_actual_lifetime");
+  }
+
+  {
+    BrainConfig config = {};
+    config.clusterUUID = 0xA11CE;
+    config.controlSocketPath = "/run/prodigy/control.sock"_ctv;
+    config.remoteProdigyPath = "/opt/prodigy-root"_ctv;
+    config.acme.accountEmail = "ops@example.com"_ctv;
+    config.acme.certbotInstall = "bundle"_ctv;
+    config.acme.certbotPath = "/opt/prodigy/certbot/bin/certbot"_ctv;
+    config.acme.certbotVersion = "5.6.0"_ctv;
+    config.acme.termsAgreed = true;
+
+    PublicTlsCertificateState cert = {};
+    cert.spec.applicationID = 7;
+    cert.spec.deploymentID = 12'345;
+    cert.spec.wormholeName = "api"_ctv;
+    cert.spec.identityName = "api-public"_ctv;
+    cert.spec.keyType = "ecdsa"_ctv;
+    cert.spec.staging = true;
+    cert.spec.domains.push_back("api.example.com"_ctv);
+    cert.spec.domains.push_back("*.example.com"_ctv);
+    cert.certbotCertName = "app7-api"_ctv;
+
+    ProdigyCertbotCommand command = {};
+    String failure = {};
+    suite.expect(prodigyBuildCertbotCertonlyCommand(config, cert, {}, command, &failure), "certbot_certonly_command_builds");
+    suite.expect(failure.size() == 0, "certbot_certonly_command_no_failure");
+    suite.expect(command.argv.size() >= 30 && command.argv[0].equal("/opt/prodigy/certbot/bin/certbot"_ctv) && command.argv[1].equal("certonly"_ctv), "certbot_certonly_command_starts_managed_certbot");
+    BrainConfig noSocketConfig = config;
+    noSocketConfig.controlSocketPath.clear();
+    ProdigyCertbotCommand badCommand = {};
+    suite.expect(prodigyBuildCertbotCertonlyCommand(noSocketConfig, cert, {}, badCommand, &failure) == false, "certbot_certonly_command_requires_control_socket");
+    suite.expect(failure.equal("public TLS Certbot requires cluster control socket"_ctv), "certbot_certonly_command_control_socket_failure");
+    BrainConfig noClusterConfig = config;
+    noClusterConfig.clusterUUID = 0;
+    suite.expect(prodigyBuildCertbotCertonlyCommand(noClusterConfig, cert, {}, badCommand, &failure) == false, "certbot_certonly_command_requires_cluster_uuid");
+    suite.expect(failure.equal("public TLS Certbot requires cluster UUID"_ctv), "certbot_certonly_command_cluster_uuid_failure");
+    BrainConfig systemCertbotConfig = config;
+    systemCertbotConfig.acme.certbotInstall = "system"_ctv;
+    suite.expect(prodigyBuildCertbotCertonlyCommand(systemCertbotConfig, cert, {}, badCommand, &failure) == false, "certbot_certonly_command_rejects_system_certbot");
+    suite.expect(failure.equal("ACME Certbot install must be bundle"_ctv), "certbot_certonly_command_rejects_system_certbot_reason");
+    ProdigyCertbotPaths badPaths = {};
+    badPaths.certbotPath = "/tmp/ambient-certbot"_ctv;
+    suite.expect(prodigyBuildCertbotCertonlyCommand(config, cert, badPaths, badCommand, &failure) == false, "certbot_certonly_command_rejects_path_override");
+    suite.expect(failure.equal("ACME Certbot path override does not match managed cluster path"_ctv), "certbot_certonly_command_rejects_path_override_reason");
+
+    auto hasAdjacent = [&](const String& flag, const String& value) -> bool {
+      for (uint32_t index = 0; index + 1 < command.argv.size(); index += 1)
+      {
+        if (command.argv[index].equal(flag) && command.argv[index + 1].equals(value))
+        {
+          return true;
+        }
+      }
+      return false;
+    };
+    auto hasArg = [&](const String& arg) -> bool {
+      for (const String& value : command.argv)
+      {
+        if (value.equal(arg))
+        {
+          return true;
+        }
+      }
+      return false;
+    };
+    auto hasEnv = [&](const String& expected) -> bool {
+      for (const String& entry : command.env)
+      {
+        if (entry.equals(expected))
+        {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    String clusterText;
+    clusterText.assignItoh(config.clusterUUID);
+    String expectedConfigDir;
+    expectedConfigDir.assign("/var/lib/prodigy/certbot/"_ctv);
+    expectedConfigDir.append(clusterText);
+    expectedConfigDir.append("/config"_ctv);
+    String expectedLogsDir;
+    expectedLogsDir.assign("/var/log/prodigy/certbot/"_ctv);
+    expectedLogsDir.append(clusterText);
+    String expectedClusterEnv;
+    expectedClusterEnv.assign("PRODIGY_CLUSTER_UUID="_ctv);
+    expectedClusterEnv.append(clusterText);
+
+    suite.expect(hasAdjacent("--cert-name"_ctv, "app7-api"_ctv), "certbot_certonly_command_cert_name");
+    suite.expect(hasAdjacent("--email"_ctv, "ops@example.com"_ctv), "certbot_certonly_command_email");
+    suite.expect(hasAdjacent("--key-type"_ctv, "ecdsa"_ctv), "certbot_certonly_command_key_type");
+    suite.expect(hasAdjacent("-d"_ctv, "api.example.com"_ctv) && hasAdjacent("-d"_ctv, "*.example.com"_ctv), "certbot_certonly_command_domains");
+    suite.expect(hasArg("--manual"_ctv) && hasArg("--agree-tos"_ctv) && hasArg("--test-cert"_ctv) && hasArg("--force-renewal"_ctv) && hasArg("--no-directory-hooks"_ctv), "certbot_certonly_command_modes");
+    suite.expect(hasAdjacent("--config-dir"_ctv, expectedConfigDir), "certbot_certonly_command_default_config_dir");
+    suite.expect(hasAdjacent("--logs-dir"_ctv, expectedLogsDir), "certbot_certonly_command_default_logs_dir");
+    suite.expect(hasEnv("PRODIGY_CONTROL_SOCKET=/run/prodigy/control.sock"_ctv), "certbot_certonly_env_control_socket");
+    suite.expect(hasEnv("PRODIGY_MOTHERSHIP_SOCKET=/run/prodigy/control.sock"_ctv), "certbot_certonly_env_mothership_socket");
+    suite.expect(hasEnv("PRODIGY_MOTHERSHIP=/opt/prodigy-root/tools/mothership"_ctv), "certbot_certonly_env_mothership_path");
+    suite.expect(hasEnv(expectedClusterEnv), "certbot_certonly_env_cluster_uuid");
+    suite.expect(hasEnv("PRODIGY_ACME_CERT_NAME=app7-api"_ctv), "certbot_certonly_env_cert_name");
+    suite.expect(hasEnv("PRODIGY_ACME_APPLICATION_ID=7"_ctv), "certbot_certonly_env_application");
+    suite.expect(hasEnv("PRODIGY_ACME_DEPLOYMENT_ID=12345"_ctv), "certbot_certonly_env_deployment");
+    suite.expect(hasEnv("PRODIGY_ACME_WORMHOLE_NAME=api"_ctv), "certbot_certonly_env_wormhole");
+
+    setenv("AWS_SECRET_ACCESS_KEY", "must-not-leak", 1);
+    Vector<String> childEnv = {};
+    Vector<String> overrides = {};
+    overrides.push_back("PRODIGY_ONLY=1"_ctv);
+    prodigyBuildEnvironmentWithOverrides(overrides, childEnv);
+    auto childHasEnv = [&](const String& expected) -> bool {
+      for (const String& entry : childEnv)
+      {
+        if (entry.equals(expected))
+        {
+          return true;
+        }
+      }
+      return false;
+    };
+    auto childHasEnvPrefix = [&](const String& prefix) -> bool {
+      for (const String& entry : childEnv)
+      {
+        if (entry.size() >= prefix.size() && entry.substr(0, prefix.size()).equals(prefix))
+        {
+          return true;
+        }
+      }
+      return false;
+    };
+    suite.expect(childHasEnv("PATH=/usr/sbin:/usr/bin:/sbin:/bin"_ctv), "certbot_child_env_has_minimal_path");
+    suite.expect(childHasEnv("LANG=C.UTF-8"_ctv), "certbot_child_env_has_minimal_lang");
+    suite.expect(childHasEnv("PRODIGY_ONLY=1"_ctv), "certbot_child_env_keeps_override");
+    suite.expect(childHasEnvPrefix("AWS_SECRET_ACCESS_KEY="_ctv) == false, "certbot_child_env_drops_parent_secret");
+    unsetenv("AWS_SECRET_ACCESS_KEY");
+
+    String recordName = {};
+    suite.expect(prodigyACMEDNS01RecordName("*.example.com"_ctv, recordName, &failure) && recordName.equal("_acme-challenge.example.com."_ctv), "acme_dns01_record_name_canonicalizes_wildcard");
+    suite.expect(prodigyACMEDNS01RecordName("API.Example.COM."_ctv, recordName, &failure) && recordName.equal("_acme-challenge.api.example.com."_ctv), "acme_dns01_record_name_canonicalizes_fqdn");
+    suite.expect(prodigyACMEDNS01RecordName("https://api.example.com"_ctv, recordName, &failure) == false && failure.equal("ACME DNS-01 identifier is not a valid DNS name"_ctv), "acme_dns01_record_name_rejects_url");
+
+    setenv("PRODIGY_ACME_APPLICATION_ID", "7", 1);
+    setenv("PRODIGY_ACME_DEPLOYMENT_ID", "12345", 1);
+    setenv("PRODIGY_ACME_WORMHOLE_NAME", "api", 1);
+    setenv("PRODIGY_ACME_CERT_NAME", "app7-api", 1);
+    setenv("PRODIGY_CLUSTER_UUID", clusterText.c_str(), 1);
+    setenv("CERTBOT_IDENTIFIER", "*.example.com", 1);
+    setenv("CERTBOT_VALIDATION", "txt-token", 1);
+    AcmeDNS01ChallengeRequest challenge = {};
+    suite.expect(prodigyBuildACMEDNS01ChallengeRequestFromEnv(challenge, &failure), "acme_dns01_hook_request_parses_env");
+    suite.expect(challenge.clusterUUID == config.clusterUUID && challenge.applicationID == 7 && challenge.deploymentID == 12'345 && challenge.certName.equal("app7-api"_ctv) && challenge.validation.equal("txt-token"_ctv), "acme_dns01_hook_request_values");
+
+    setenv("RENEWED_LINEAGE", "/var/lib/prodigy/certbot/config/live/app7-api", 1);
+    setenv("RENEWED_DOMAINS", "api.example.com *.example.com", 1);
+    AcmeLineageImportRequest import = {};
+    suite.expect(prodigyBuildACMELineageImportRequestFromEnv(import, &failure), "acme_import_hook_request_parses_env");
+    suite.expect(import.clusterUUID == config.clusterUUID && import.renewedDomains.size() == 2 && import.renewedDomains[0].equal("api.example.com"_ctv) && import.renewedDomains[1].equal("*.example.com"_ctv), "acme_import_hook_request_splits_domains");
+    setenv("PRODIGY_CLUSTER_UUID", "0", 1);
+    suite.expect(prodigyBuildACMEDNS01ChallengeRequestFromEnv(challenge, &failure) == false && failure.equal("invalid environment variable PRODIGY_CLUSTER_UUID"_ctv), "acme_dns01_hook_request_rejects_zero_cluster_uuid");
+    setenv("PRODIGY_CLUSTER_UUID", clusterText.c_str(), 1);
+
+    TemporaryDirectory hookTemp;
+    suite.expect(hookTemp.create(), "acme_hook_wrapper_temp_created");
+    std::filesystem::path fakeMothership = filesystemPathFromString(hookTemp.path) / "mothership";
+    suite.expect(writeFileFixture(fakeMothership, "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\"; done > \"$PRODIGY_ACME_HOOK_CAPTURE\"\n") && makeFileExecutableFixture(fakeMothership), "acme_hook_wrapper_fake_mothership_ready");
+    auto hookDelegates = [&](const char *name, const char *operation, const char *target) -> bool {
+      std::filesystem::path hook = std::filesystem::path(PRODIGY_ACME_HOOKS_DIR) / name;
+      if (std::filesystem::exists(hook) == false ||
+          (std::filesystem::status(hook).permissions() & std::filesystem::perms::owner_exec) == std::filesystem::perms::none)
+      {
+        return false;
+      }
+      std::filesystem::path capture = filesystemPathFromString(hookTemp.path) / name;
+      Vector<String> argv = {};
+      argv.push_back(stringFromFilesystemPath(hook));
+      Vector<String> env = {};
+      String mothershipEnv = {};
+      mothershipEnv.assign("PRODIGY_MOTHERSHIP="_ctv);
+      mothershipEnv.append(stringFromFilesystemPath(fakeMothership));
+      env.push_back(std::move(mothershipEnv));
+      String captureEnv = {};
+      captureEnv.assign("PRODIGY_ACME_HOOK_CAPTURE="_ctv);
+      captureEnv.append(stringFromFilesystemPath(capture));
+      env.push_back(std::move(captureEnv));
+      if (target != nullptr)
+      {
+        String targetEnv = {};
+        targetEnv.assign("PRODIGY_ACME_TARGET="_ctv);
+        targetEnv.append(target);
+        env.push_back(std::move(targetEnv));
+      }
+      int status = -1;
+      String runFailure = {};
+      String output = {};
+      String expected = {};
+      expected.assign(operation);
+      expected.append("\n"_ctv);
+      if (target != nullptr)
+      {
+        expected.append(target);
+        expected.append("\n"_ctv);
+      }
+      return prodigyRunBlockingArgv(argv, env, &status, &runFailure) && status == 0 && readFileFixture(capture, output) && output.equals(expected);
+    };
+    suite.expect(hookDelegates("acme-present-dns-01", "acme-present-dns-01", nullptr), "acme_present_hook_wrapper_delegates");
+    suite.expect(hookDelegates("acme-cleanup-dns-01", "acme-cleanup-dns-01", "local"), "acme_cleanup_hook_wrapper_delegates_target");
+    suite.expect(hookDelegates("acme-import-lineage", "acme-import-lineage", "local"), "acme_import_hook_wrapper_delegates_target");
+    String presentHook = {};
+    String cleanupHook = {};
+    suite.expect(readFileFixture(std::filesystem::path(PRODIGY_ACME_HOOKS_DIR) / "acme-present-dns-01", presentHook) && stringContains(presentHook, ">&2"), "acme_present_hook_keeps_certbot_auth_output_quiet");
+    suite.expect(readFileFixture(std::filesystem::path(PRODIGY_ACME_HOOKS_DIR) / "acme-cleanup-dns-01", cleanupHook) && stringContains(cleanupHook, ">&2"), "acme_cleanup_hook_keeps_stdout_quiet");
+
+    unsetenv("PRODIGY_ACME_APPLICATION_ID");
+    unsetenv("PRODIGY_ACME_DEPLOYMENT_ID");
+    unsetenv("PRODIGY_ACME_WORMHOLE_NAME");
+    unsetenv("PRODIGY_ACME_CERT_NAME");
+    unsetenv("PRODIGY_CLUSTER_UUID");
+    unsetenv("CERTBOT_IDENTIFIER");
+    unsetenv("CERTBOT_VALIDATION");
+    unsetenv("RENEWED_LINEAGE");
+    unsetenv("RENEWED_DOMAINS");
+
+    cert.certbotCertName = "../bad"_ctv;
+    suite.expect(prodigyBuildCertbotCertonlyCommand(config, cert, {}, command, &failure) == false, "certbot_certonly_command_rejects_unsafe_cert_name");
+    suite.expect(failure.equal("public TLS cert name must be a safe path segment"_ctv), "certbot_certonly_command_unsafe_cert_name_failure");
+    cert.certbotCertName = "app7-api"_ctv;
+
+    config.acme.termsAgreed = false;
+    suite.expect(prodigyBuildCertbotCertonlyCommand(config, cert, {}, command, &failure) == false, "certbot_certonly_command_requires_terms");
+    suite.expect(failure.equal("ACME accountEmail and termsAgreed are required"_ctv), "certbot_certonly_command_terms_failure");
   }
 
   {
@@ -5253,7 +5726,7 @@ int main(void)
 
   {
     DeploymentPlan plan {};
-    String json = "{\"tls\":{\"applicationID\":42,\"enablePerContainerLeafs\":true,\"leafValidityDays\":15,\"renewLeadPercent\":10,\"identityNames\":[\"inbound_server_tls\"],\"dnsSans\":[\"nametag.social\",\"dev.nametag.social\"],\"ipSans\":[\"10.0.0.18\",\"fd7a:115c:a1e0::18\"]}}"_ctv;
+    String json = "{\"tls\":{\"applicationID\":42,\"enablePerContainerLeafs\":true,\"leafValidityDays\":15,\"identityNames\":[\"inbound_server_tls\"],\"dnsSans\":[\"nametag.social\",\"dev.nametag.social\"],\"ipSans\":[\"10.0.0.18\",\"fd7a:115c:a1e0::18\"]}}"_ctv;
     json.need(simdjson::SIMDJSON_PADDING);
 
     simdjson::dom::parser parser;
@@ -5290,6 +5763,32 @@ int main(void)
     suite.expect(plan.tlsIssuancePolicy.ipSans.size() == 2, "mothership_parse_tls_policy_sets_ip_sans");
     suite.expect(plan.tlsIssuancePolicy.ipSans.size() == 2 && plan.tlsIssuancePolicy.ipSans[0].equals(IPAddress("10.0.0.18", false)), "mothership_parse_tls_policy_sets_ipv4_san");
     suite.expect(plan.tlsIssuancePolicy.ipSans.size() == 2 && plan.tlsIssuancePolicy.ipSans[1].equals(IPAddress("fd7a:115c:a1e0::18", true)), "mothership_parse_tls_policy_sets_ipv6_san");
+  }
+
+  {
+    DeploymentPlan plan {};
+    String json = "{\"tls\":{\"applicationID\":42,\"enablePerContainerLeafs\":true,\"renewLeadPercent\":10,\"identityNames\":[\"inbound_server_tls\"]}}"_ctv;
+    json.need(simdjson::SIMDJSON_PADDING);
+
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    suite.expect(parser.parse(json.data(), json.size()).get(doc) == simdjson::SUCCESS, "mothership_parse_tls_policy_rejects_renew_lead_json_valid");
+    for (auto field : doc.get_object())
+    {
+      String key;
+      key.setInvariant(field.key.data(), field.key.size());
+      if (key == "tls"_ctv)
+      {
+        String failure;
+        auto resolver = [](const String& reference, uint16_t& applicationID) -> bool {
+          (void)reference;
+          applicationID = 0;
+          return false;
+        };
+        suite.expect(mothershipParseDeploymentPlanTlsPolicy(field.value, plan, resolver, &failure) == false, "mothership_parse_tls_policy_rejects_renew_lead_percent");
+        suite.expect(failure.equal("tls invalid field"_ctv), "mothership_parse_tls_policy_rejects_renew_lead_percent_failure");
+      }
+    }
   }
 
   {
@@ -5681,6 +6180,110 @@ int main(void)
     }
 
     suite.expect(rejected, "mothership_parse_wormhole_dns_rejects_values");
+  }
+
+  {
+    WormholePublicTLSConfig config {};
+    bool enabled = false;
+    String json = "true"_ctv;
+    json.need(simdjson::SIMDJSON_PADDING);
+
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    String failure;
+    bool parsedField = false;
+    if (parser.parse(json.data(), json.size()).get(doc) == simdjson::SUCCESS)
+    {
+      parsedField = mothershipParseWormholePublicTLSConfig(doc, config, enabled, &failure);
+    }
+
+    suite.expect(parsedField && enabled, "mothership_parse_wormhole_public_tls_bool_enables");
+    suite.expect(config.issuer.equal("letsencrypt"_ctv), "mothership_parse_wormhole_public_tls_bool_default_issuer");
+    suite.expect(config.keyType.equal("ecdsa"_ctv), "mothership_parse_wormhole_public_tls_bool_default_key_type");
+    suite.expect(config.renewAfterLifetimePermille == prodigyDefaultCertificateRenewAfterLifetimePermille, "mothership_parse_wormhole_public_tls_bool_default_renew_after");
+    suite.expect(failure.size() == 0, "mothership_parse_wormhole_public_tls_bool_no_failure");
+  }
+
+  {
+    WormholePublicTLSConfig config {};
+    bool enabled = false;
+    String json =
+        "{\"enabled\":true,\"identityName\":\"api-public\",\"issuer\":\"letsencrypt\",\"domains\":[\"api.example.com\",\"*.example.com\"],\"keyType\":\"ecdsa\",\"staging\":true,\"renewAfterLifetimePermille\":667}"_ctv;
+    json.need(simdjson::SIMDJSON_PADDING);
+
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    String failure;
+    bool parsedField = false;
+    if (parser.parse(json.data(), json.size()).get(doc) == simdjson::SUCCESS)
+    {
+      parsedField = mothershipParseWormholePublicTLSConfig(doc, config, enabled, &failure);
+    }
+
+    suite.expect(parsedField && enabled, "mothership_parse_wormhole_public_tls_object_parses");
+    suite.expect(config.identityName.equal("api-public"_ctv), "mothership_parse_wormhole_public_tls_identity");
+    suite.expect(config.domains.size() == 2, "mothership_parse_wormhole_public_tls_domains");
+    suite.expect(config.domains.size() == 2 && config.domains[1].equal("*.example.com"_ctv), "mothership_parse_wormhole_public_tls_wildcard_domain");
+    suite.expect(config.staging, "mothership_parse_wormhole_public_tls_staging");
+    suite.expect(config.renewAfterLifetimePermille == 667, "mothership_parse_wormhole_public_tls_renew_after");
+    suite.expect(failure.size() == 0, "mothership_parse_wormhole_public_tls_no_failure");
+  }
+
+  {
+    WormholePublicTLSConfig config {};
+    bool enabled = false;
+    String json = "{\"keyType\":\"ed25519\"}"_ctv;
+    json.need(simdjson::SIMDJSON_PADDING);
+
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    bool rejected = false;
+    if (parser.parse(json.data(), json.size()).get(doc) == simdjson::SUCCESS)
+    {
+      String failure;
+      rejected = (mothershipParseWormholePublicTLSConfig(doc, config, enabled, &failure) == false);
+      suite.expect(failure == "wormhole.publicTLS.keyType must be ecdsa or rsa"_ctv, "mothership_parse_wormhole_public_tls_key_type_failure_text");
+    }
+
+    suite.expect(rejected, "mothership_parse_wormhole_public_tls_rejects_key_type");
+  }
+
+  {
+    WormholePublicTLSConfig config {};
+    bool enabled = false;
+    String json = "{\"identityName\":\"../bad\"}"_ctv;
+    json.need(simdjson::SIMDJSON_PADDING);
+
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    bool rejected = false;
+    if (parser.parse(json.data(), json.size()).get(doc) == simdjson::SUCCESS)
+    {
+      String failure;
+      rejected = (mothershipParseWormholePublicTLSConfig(doc, config, enabled, &failure) == false);
+      suite.expect(failure == "wormhole.publicTLS.identityName must be a safe path segment"_ctv, "mothership_parse_wormhole_public_tls_identity_name_failure_text");
+    }
+
+    suite.expect(rejected, "mothership_parse_wormhole_public_tls_rejects_unsafe_identity_name");
+  }
+
+  {
+    WormholePublicTLSConfig config {};
+    bool enabled = false;
+    String json = "{\"renewAfterLifetimePermille\":1000}"_ctv;
+    json.need(simdjson::SIMDJSON_PADDING);
+
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    bool rejected = false;
+    if (parser.parse(json.data(), json.size()).get(doc) == simdjson::SUCCESS)
+    {
+      String failure;
+      rejected = (mothershipParseWormholePublicTLSConfig(doc, config, enabled, &failure) == false);
+      suite.expect(failure == "wormhole.publicTLS.renewAfterLifetimePermille must be in 1..999"_ctv, "mothership_parse_wormhole_public_tls_renew_after_failure_text");
+    }
+
+    suite.expect(rejected, "mothership_parse_wormhole_public_tls_rejects_renew_after");
   }
 
   {

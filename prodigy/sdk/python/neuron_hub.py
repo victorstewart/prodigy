@@ -654,8 +654,8 @@ def build_resource_delta_ack_frame(accepted: bool) -> bytes:
    return build_message_frame(ContainerTopic.RESOURCE_DELTA_ACK, struct.pack("<B", 1 if accepted else 0))
 
 
-def build_credentials_refresh_ack_frame() -> bytes:
-   return build_message_frame(ContainerTopic.CREDENTIALS_REFRESH)
+def build_credentials_refresh_ack_frame(payload: bytes = b"") -> bytes:
+   return build_message_frame(ContainerTopic.CREDENTIALS_REFRESH, payload)
 
 
 def aegis_frame_bytes_for_plaintext(plaintext_bytes: int) -> int:
@@ -916,8 +916,8 @@ class NeuronHub:
    def acknowledge_resource_delta(self, accepted: bool) -> None:
       self._send(ContainerTopic.RESOURCE_DELTA_ACK, struct.pack("<B", 1 if accepted else 0))
 
-   def acknowledge_credentials_refresh(self) -> None:
-      self._send(ContainerTopic.CREDENTIALS_REFRESH)
+   def acknowledge_credentials_refresh(self, payload: bytes = b"") -> None:
+      self._send(ContainerTopic.CREDENTIALS_REFRESH, payload)
 
    def handle_frame(self, frame: MessageFrame) -> list[MessageFrame]:
       topic = frame.topic

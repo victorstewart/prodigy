@@ -7,12 +7,12 @@ struct {
   __type(key, __u32); // local machines are assigned a /120, so 1 byte variable.. aka 256 possible container addresses
   __type(value, __u32); // ifidx of container's host side primary netkit device
   __uint(max_entries, 256);
-} container_device_map SEC(".maps");
+} ct_dev_map SEC(".maps");
 
 __attribute__((__always_inline__)) static inline bool localSubnetContainsDaddr(__be8 *addr6)
 {
   __u32 zeroidx = 0;
-  struct local_container_subnet6 *localsubnet6 = bpf_map_lookup_elem(&local_container_subnet_map, &zeroidx);
+  struct local_container_subnet6 *localsubnet6 = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
 
   if (localsubnet6)
   {
@@ -32,7 +32,7 @@ __attribute__((__always_inline__)) static inline int redirectToContainer(__be8 *
     pkt->containerID.value[4] = container_index; // obviously we left the local subnet bytes 0 here
   }
 
-  __u32 *primary_device_idx = bpf_map_lookup_elem(&container_device_map, &container_index); // look up container's primary netkit device for this address
+  __u32 *primary_device_idx = bpf_map_lookup_elem(&ct_dev_map, &container_index); // look up container's primary netkit device for this address
 
   if (primary_device_idx) // host-side primary netkit device for the destination container
   {
@@ -71,7 +71,7 @@ __attribute__((__always_inline__)) static inline int redirectL2ToNIC(struct __sk
   setCheckpoint("redirectToNIC: checkpoint 1");
 
   __u32 zeroidx = 0; // NIC is container 0, unused address
-  __u32 *nic_idx = bpf_map_lookup_elem(&container_device_map, &zeroidx); // look up container's primary netkit device for this address
+  __u32 *nic_idx = bpf_map_lookup_elem(&ct_dev_map, &zeroidx); // look up container's primary netkit device for this address
 
   if (!nic_idx)
   {
@@ -96,7 +96,7 @@ __attribute__((__always_inline__)) static inline int redirectL3ToNIC(struct __sk
   setCheckpoint("redirectToNIC: checkpoint 1");
 
   __u32 zeroidx = 0; // NIC is container 0, unused address
-  __u32 *nic_idx = bpf_map_lookup_elem(&container_device_map, &zeroidx);
+  __u32 *nic_idx = bpf_map_lookup_elem(&ct_dev_map, &zeroidx);
   if (!nic_idx)
   {
     return NETKIT_DROP;

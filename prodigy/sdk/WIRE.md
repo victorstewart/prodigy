@@ -129,7 +129,7 @@ The delivered snapshot is keyed by `wormhole_name` and only carries the key epoc
 
 Magic: `PRDACK01`
 
-Container-to-neuron credential-refresh ACKs may carry this payload when resumption snapshots or deltas were applied.
+Legacy container-to-neuron credential-refresh ACKs may carry this payload when only resumption snapshots or deltas were applied.
 
 Field order:
 
@@ -145,6 +145,26 @@ Field order:
 4. `failure_reason: string`
 
 This ACK result must never include ticket values, key IDs, master secrets, TLS private keys, API credential material, or other secret material.
+
+### `CredentialApplyAck`
+
+Magic: `PRDCAC01`
+
+Container-to-neuron credential-refresh ACKs should carry this payload when the application wants to report TLS identity apply success or rejection, optionally alongside resumption results.
+
+Field order:
+
+1. `tls_results: array<TlsIdentityApplyResult>`
+2. `resumption_results: array<TlsResumptionApplyResult>`
+
+### `TlsIdentityApplyResult`
+
+Field order:
+
+1. `identity_name: string`
+2. `generation: u64`
+3. `success: bool`
+4. `failure_reason: string`
 
 ## Control Socket Frame
 
@@ -293,9 +313,9 @@ Packed payload length: 1 byte
 
 #### `credentialsRefresh`
 
-Payload: either empty or raw `TlsResumptionApplyAck` encoded with `PRDACK01`
+Payload: empty, raw `CredentialApplyAck` encoded with `PRDCAC01`, or raw legacy `TlsResumptionApplyAck` encoded with `PRDACK01`
 
-Empty payload is accepted only as the generic ACK for a non-resumption credential refresh. A typed `TlsResumptionApplyAck` payload is required when the container is acknowledging TLS resumption snapshots or deltas, because resumption readiness depends on `wormhole_name`, generation, and success/failure.
+Empty payload is accepted only as a success ACK for a non-resumption credential refresh. `CredentialApplyAck` reports TLS identity apply success or rejection. A typed resumption result is required when acknowledging TLS resumption snapshots or deltas, because resumption readiness depends on `wormhole_name`, generation, and success/failure.
 
 ## Validation Requirements
 
@@ -309,7 +329,7 @@ These checks should be enforced even in high-performance implementations.
 - `statistics` payload length must be a multiple of 16 bytes
 - `credentialsRefresh` payload is either:
   - from neuron to container: a full `PRDDEL01` blob
-  - from container to neuron: empty generic ACK or a `PRDACK01` resumption apply ACK
+  - from container to neuron: empty success ACK, `PRDCAC01` credential apply ACK, or legacy `PRDACK01` resumption apply ACK
 
 ## Performance Notes
 

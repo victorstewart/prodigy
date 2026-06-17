@@ -733,6 +733,24 @@ int main(void)
   suite.expect(wholeMachineResolved.ownedLogicalCores == 6, "cluster_machine_whole_machine_resolve_cores");
   suite.expect(wholeMachineResolved.ownedMemoryMB == 28'672, "cluster_machine_whole_machine_resolve_memory");
   suite.expect(wholeMachineResolved.ownedStorageMB == 200'704, "cluster_machine_whole_machine_resolve_storage");
+
+  MachineConfig tinySmokeConfig = {
+      .kind = MachineConfig::MachineKind::vm,
+      .slug = "tiny-smoke"_ctv,
+      .nLogicalCores = 2,
+      .nMemoryMB = 3846,
+      .nStorageMB = 2048};
+  ClusterMachine tinyProduction = created;
+  suite.expect(clusterMachineApplyOwnedResourcesFromConfig(tinyProduction, tinySmokeConfig), "cluster_machine_tiny_production_resolve");
+  suite.expect(tinyProduction.ownedLogicalCores == 0, "cluster_machine_tiny_production_reserve_cores");
+  suite.expect(tinyProduction.ownedMemoryMB == 0, "cluster_machine_tiny_production_reserve_memory");
+  suite.expect(tinyProduction.ownedStorageMB == 0, "cluster_machine_tiny_production_reserve_storage");
+  ClusterMachine tinySmoke = created;
+  suite.expect(clusterMachineApplyOwnedResourcesFromConfig(tinySmoke, tinySmokeConfig, prodigySmokeMachineReservedResources), "cluster_machine_tiny_smoke_resolve");
+  suite.expect(tinySmoke.ownedLogicalCores == 2, "cluster_machine_tiny_smoke_cores");
+  suite.expect(tinySmoke.ownedMemoryMB == 3846, "cluster_machine_tiny_smoke_memory");
+  suite.expect(tinySmoke.ownedStorageMB == 2048, "cluster_machine_tiny_smoke_storage");
+
   uint32_t resolvedPrivate4 = 0;
   suite.expect(created.resolvePrivate4(resolvedPrivate4), "cluster_machine_resolve_private4_asymmetric_ipv4");
   suite.expect(resolvedPrivate4 == IPAddress("10.0.0.11", false).v4, "cluster_machine_resolve_private4_preserves_network_order");

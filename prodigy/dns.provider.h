@@ -25,6 +25,16 @@ static inline bool prodigyDNSRecordSingleValue(const ProdigyDNSRecordBinding& re
   return true;
 }
 
+static inline bool prodigyDNSRecordSingleTXTValue(const ProdigyDNSRecordBinding& record, String& value, String& failure)
+{
+  if (routableResourceDNSPartEquals(record.type, "TXT"_ctv, false) == false)
+  {
+    failure.assign("DNS TXT operation requires type TXT"_ctv);
+    return false;
+  }
+  return prodigyDNSRecordSingleValue(record, value, failure);
+}
+
 static inline bool prodigyBuildDNSRecordBinding(const RoutableResourceLease& lease, ProdigyDNSRecordBinding& binding, String *failure = nullptr)
 {
   binding = {};
@@ -68,4 +78,26 @@ public:
   virtual bool supportsProvider(const String& provider) const = 0;
   virtual bool upsert(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) = 0;
   virtual bool remove(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) = 0;
+  virtual bool presentTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
+  {
+    String ignored = {};
+    if (prodigyDNSRecordSingleTXTValue(record, ignored, failure) == false)
+    {
+      return false;
+    }
+    (void)credential;
+    failure.assign("DNS provider does not implement ACME TXT present"_ctv);
+    return false;
+  }
+  virtual bool cleanupTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
+  {
+    String ignored = {};
+    if (prodigyDNSRecordSingleTXTValue(record, ignored, failure) == false)
+    {
+      return false;
+    }
+    (void)credential;
+    failure.assign("DNS provider does not implement ACME TXT cleanup"_ctv);
+    return false;
+  }
 };

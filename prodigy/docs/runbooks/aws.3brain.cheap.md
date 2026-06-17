@@ -29,16 +29,22 @@ prodigy-controller-profile
 Minimum practical action set for the validated runbook:
 
 ```text
+ec2:Describe*
 ec2:RunInstances
 ec2:TerminateInstances
 ec2:CreateLaunchTemplate
 ec2:CreateLaunchTemplateVersion
+ec2:ModifyLaunchTemplate
 ec2:DeleteLaunchTemplate
-ec2:Describe*
+ec2:CreateSecurityGroup
+ec2:AuthorizeSecurityGroupIngress
+iam:GetInstanceProfile
 iam:PassRole
 ```
 
-A read-only EC2 role is not sufficient.
+A read-only EC2 role is not sufficient. `iam:GetInstanceProfile` lets Mothership reject a missing runtime profile before it creates resources. `iam:PassRole` is required because every created AWS brain must boot with an EC2 instance profile; local AWS CLI credentials are only the bootstrap identity, not the long-lived runtime identity.
+
+Before cluster creation is admitted, Mothership preflights the configured AWS credential by resolving the instance profile, describing the target EC2 environment, and issuing EC2 dry-run checks for the create/launch/terminate/template/security-group actions above. Failure here rejects `createCluster` before the cluster record is persisted or any VM is created. After prerequisite discovery succeeds, failed dry-run actions are reported together in one error.
 
 ## Authenticate locally
 
@@ -85,6 +91,9 @@ cat > aws.credential.json <<JSON
   "provider": "aws",
   "mode": "awsCli",
   "scope": "${AWS_ACCOUNT_ID}/${AWS_REGION}",
+  "metadata": {
+    "profile": "${AWS_PROFILE}"
+  },
   "allowPropagateToProdigy": false
 }
 JSON

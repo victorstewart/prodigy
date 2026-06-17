@@ -150,6 +150,38 @@ static bool equalTlsResumptionApplyResult(const TlsResumptionApplyResult& lhs, c
          lhs.failureReason.equal(rhs.failureReason);
 }
 
+static bool equalTlsIdentityApplyResult(const TlsIdentityApplyResult& lhs, const TlsIdentityApplyResult& rhs)
+{
+  return lhs.identityName.equal(rhs.identityName) &&
+         lhs.generation == rhs.generation &&
+         lhs.success == rhs.success &&
+         lhs.failureReason.equal(rhs.failureReason);
+}
+
+static bool equalCredentialApplyAck(const CredentialApplyAck& lhs, const CredentialApplyAck& rhs)
+{
+  if (lhs.tlsResults.size() != rhs.tlsResults.size() ||
+      lhs.resumptionResults.size() != rhs.resumptionResults.size())
+  {
+    return false;
+  }
+  for (uint32_t index = 0; index < lhs.tlsResults.size(); index += 1)
+  {
+    if (equalTlsIdentityApplyResult(lhs.tlsResults[index], rhs.tlsResults[index]) == false)
+    {
+      return false;
+    }
+  }
+  for (uint32_t index = 0; index < lhs.resumptionResults.size(); index += 1)
+  {
+    if (equalTlsResumptionApplyResult(lhs.resumptionResults[index], rhs.resumptionResults[index]) == false)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
 static bool equalCredentialBundle(const CredentialBundle& lhs, const CredentialBundle& rhs)
 {
   if (lhs.bundleGeneration != rhs.bundleGeneration ||
@@ -243,6 +275,7 @@ static bool equalWormhole(const Wormhole& lhs, const Wormhole& rhs)
 {
   return lhs.name.equal(rhs.name) &&
          lhs.externalAddress.equals(rhs.externalAddress) &&
+         lhs.deliveryAddress.equals(rhs.deliveryAddress) &&
          lhs.externalPort == rhs.externalPort &&
          lhs.containerPort == rhs.containerPort &&
          lhs.layer4 == rhs.layer4 &&
@@ -493,6 +526,24 @@ static TlsResumptionApplyAck makeTlsResumptionApplyAck(void)
   return ack;
 }
 
+static TlsIdentityApplyResult makeTlsIdentityApplyResult(void)
+{
+  TlsIdentityApplyResult tls;
+  tls.identityName.assign("api-public"_ctv);
+  tls.generation = 77;
+  tls.success = false;
+  tls.failureReason.assign("key rejected"_ctv);
+  return tls;
+}
+
+static CredentialApplyAck makeCredentialApplyAck(void)
+{
+  CredentialApplyAck ack;
+  ack.tlsResults.push_back(makeTlsIdentityApplyResult());
+  ack.resumptionResults.push_back(makeTlsResumptionApplyResult());
+  return ack;
+}
+
 static ContainerParameters makeContainerParameters(void)
 {
   ContainerParameters parameters;
@@ -528,6 +579,7 @@ static Wormhole makeContainerParametersWormhole(void)
   Wormhole wormhole = {};
   wormhole.name.assign("public-api-quic"_ctv);
   wormhole.externalAddress = IPAddress("2001:db8::44", true);
+  wormhole.deliveryAddress = IPAddress("2001:db8:1::44", true);
   wormhole.externalPort = 443;
   wormhole.containerPort = 8443;
   wormhole.layer4 = IPPROTO_UDP;
@@ -620,6 +672,7 @@ int main(void)
   expectWireRoundTrip(suite, makeTlsResumptionKeyEpoch(9), "tls_resumption_key_epoch_decode_state", "tls_resumption_key_epoch_roundtrip_state", prodigyTlsResumptionKeyEpochsEqual);
   expectWireRoundTrip(suite, makeTlsResumptionSnapshot(), "tls_resumption_snapshot_decode_state", "tls_resumption_snapshot_roundtrip_state", prodigyTlsResumptionSnapshotsEqual);
   expectWireRoundTrip(suite, makeTlsResumptionApplyResult(), "tls_resumption_apply_result_decode_state", "tls_resumption_apply_result_roundtrip_state", equalTlsResumptionApplyResult);
+  expectWireRoundTrip(suite, makeTlsIdentityApplyResult(), "tls_identity_apply_result_decode_state", "tls_identity_apply_result_roundtrip_state", equalTlsIdentityApplyResult);
   expectWireRoundTrip(suite, makeRoutableResourceLeaseReport(), "routable_resource_lease_report_decode_state", "routable_resource_lease_report_roundtrip_state", equalRoutableResourceLeaseReport);
 
   {
@@ -726,6 +779,35 @@ int main(void)
         decodedFromFrame.results.size() == 1 &&
             equalTlsResumptionApplyResult(expected.results[0], decodedFromFrame.results[0]),
         "tls_resumption_apply_ack_frame_roundtrip_wire");
+  }
+
+  {
+    CredentialApplyAck expected = makeCredentialApplyAck();
+    String encoded;
+    suite.expect(ProdigyWire::serializeCredentialApplyAck(encoded, expected), "credential_apply_ack_encode_wire");
+
+    CredentialApplyAck decoded;
+    suite.expect(ProdigyWire::deserializeCredentialApplyAck(encoded, decoded), "credential_apply_ack_decode_wire");
+    suite.expect(equalCredentialApplyAck(expected, decoded), "credential_apply_ack_roundtrip_wire");
+
+    String frame;
+    suite.expect(
+        ProdigyWire::constructPackedFrame(frame, ContainerTopic::credentialsRefresh, encoded),
+        "credential_apply_ack_frame_encode_wire");
+    Message *message = reinterpret_cast<Message *>(frame.data());
+
+    suite.expect(
+        ProdigyIngressValidation::validateContainerPayloadForNeuron(message->topic, message->args, message->terminal()),
+        "credential_apply_ack_valid_for_neuron");
+    suite.expect(
+        ProdigyIngressValidation::validateContainerPayloadForHub(message->topic, message->args, message->terminal()) == false,
+        "credential_apply_ack_not_valid_as_hub_delta");
+
+    CredentialApplyAck decodedFromFrame;
+    suite.expect(
+        ProdigyWire::deserializeCredentialApplyAckFramePayload(message->args, uint64_t(message->terminal() - message->args), decodedFromFrame),
+        "credential_apply_ack_frame_decode_wire");
+    suite.expect(equalCredentialApplyAck(expected, decodedFromFrame), "credential_apply_ack_frame_roundtrip_wire");
   }
 
   {

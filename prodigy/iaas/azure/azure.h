@@ -4,6 +4,7 @@
 #include <prodigy/iaas/bootstrap.ssh.h>
 #include <prodigy/brain/base.h>
 #include <prodigy/brain/machine.h>
+#include <prodigy/child.process.signal.h>
 #include <prodigy/cluster.machine.helpers.h>
 #include <prodigy/netdev.detect.h>
 #include <services/base64.h>
@@ -1467,6 +1468,7 @@ private:
     ownedCommand.assign(command);
     ownedCommand.addNullTerminator();
 
+    (void)prodigyEnsureSigchldDefaultWaitable();
     FILE *pipe = ::popen(ownedCommand.c_str(), "r");
     if (pipe == nullptr)
     {
@@ -1521,6 +1523,70 @@ private:
   static bool azureHasPrefix(const String& value, const String& prefix)
   {
     return value.size() >= prefix.size() && memcmp(value.data(), prefix.data(), prefix.size()) == 0;
+  }
+
+  static bool azureActionPatternMatches(std::string_view patternView, const char *action)
+  {
+    String pattern = {};
+    String lowerPattern = {};
+    String actionText = {};
+    String lowerAction = {};
+    pattern.assign(patternView);
+    actionText.assign(action);
+    lowercaseString(pattern, lowerPattern);
+    lowercaseString(actionText, lowerAction);
+
+    if (lowerPattern == "*"_ctv)
+    {
+      return true;
+    }
+
+    int64_t star = lowerPattern.findChar('*');
+    if (star >= 0)
+    {
+      String prefix = lowerPattern.substr(0, uint64_t(star), Copy::yes);
+      String suffix = lowerPattern.substr(uint64_t(star + 1), lowerPattern.size() - uint64_t(star + 1), Copy::yes);
+      return azureHasPrefix(lowerAction, prefix) && lowerAction.size() >= suffix.size() && memcmp(lowerAction.data() + lowerAction.size() - suffix.size(), suffix.data(), suffix.size()) == 0;
+    }
+
+    return lowerPattern == lowerAction;
+  }
+
+  static bool azureActionArrayMatches(simdjson::dom::element array, const char *action)
+  {
+    if (array.is_array() == false)
+    {
+      return false;
+    }
+
+    for (auto entry : array.get_array())
+    {
+      std::string_view pattern = {};
+      if (entry.get(pattern) == simdjson::SUCCESS && azureActionPatternMatches(pattern, action))
+      {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  static bool azurePermissionsAllowAction(simdjson::dom::element doc, const char *action, String& failure)
+  {
+    if (auto values = doc["value"]; values.is_array())
+    {
+      for (auto permission : values.get_array())
+      {
+        if (azureActionArrayMatches(permission["actions"], action) && azureActionArrayMatches(permission["notActions"], action) == false)
+        {
+          failure.clear();
+          return true;
+        }
+      }
+    }
+
+    failure.snprintf<"azure missing permission {}"_ctv>(String(action));
+    return false;
   }
 
   static bool azureExtractResourceIDSegment(const String& resourceID, const char *segmentKey, String& segmentValue)
@@ -1717,7 +1783,7 @@ private:
       return false;
     }
 
-    if (azureHasBootstrapAccessTokenRefreshCommand())
+    if (runtimeEnvironment.azure.managedIdentityResourceID.size() == 0 && azureHasBootstrapAccessTokenRefreshCommand())
     {
       return refreshAzureBootstrapAccessToken(failure);
     }
@@ -1776,7 +1842,8 @@ private:
 
     AzureMetadataClient metadata;
     String response;
-    String metadataPath = "/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F"_ctv;
+    String metadataPath = {};
+    metadataPath.assign("/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F"_ctv);
     if (runtimeEnvironment.azure.managedIdentityResourceID.size() > 0)
     {
       metadataPath.append("&msi_res_id="_ctv);
@@ -3650,6 +3717,118 @@ public:
     networkSecurityGroupID.clear();
   }
 
+  bool preflightClusterCreate(const BrainIaaSClusterCreatePreflight& preflight, String& error) override
+  {
+    error.clear();
+
+    const MachineConfig *config = nullptr;
+    for (const MachineConfig& candidate : preflight.configs)
+    {
+      if (candidate.kind == MachineConfig::MachineKind::vm && candidate.vmImageURI.size() > 0 && candidate.providerMachineType.size() > 0)
+      {
+        config = &candidate;
+        break;
+      }
+    }
+
+    if (config == nullptr)
+    {
+      error.assign("azure preflight requires a vm machine schema with vmImageURI and providerMachineType"_ctv);
+      return false;
+    }
+
+    if (preflight.azureManagedIdentityResourceID.size() == 0)
+    {
+      error.assign("azure preflight requires azure.managedIdentityResourceID or azure.managedIdentityName"_ctv);
+      return false;
+    }
+
+    String identityName = {};
+    if (azureExtractResourceIDSegment(preflight.azureManagedIdentityResourceID, "userAssignedIdentities", identityName) == false)
+    {
+      error.assign("azure managed identity resource id is invalid"_ctv);
+      return false;
+    }
+
+    if (ensureScope(error) == false)
+    {
+      return false;
+    }
+
+    String imageReferenceJSON = {};
+    if (buildAzureImageReference(*config, imageReferenceJSON, error) == false)
+    {
+      return false;
+    }
+
+    String url = {};
+    url.snprintf<"https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Authorization/permissions?api-version=2022-04-01"_ctv>(
+        subscriptionID,
+        resourceGroup);
+
+    String response = {};
+    if (sendARM("GET", url, nullptr, response, error) == false)
+    {
+      return false;
+    }
+
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc = {};
+    if (azureParseJSONDocument(response, parser, doc, &error, "azure permissions response parse failed"_ctv) == false)
+    {
+      return false;
+    }
+
+    constexpr static const char *required[] = {
+        "Microsoft.Authorization/roleAssignments/read",
+        "Microsoft.Authorization/roleAssignments/write",
+        "Microsoft.Compute/skus/read",
+        "Microsoft.Compute/virtualMachines/delete",
+        "Microsoft.Compute/virtualMachines/read",
+        "Microsoft.Compute/virtualMachines/restart/action",
+        "Microsoft.Compute/virtualMachines/write",
+        "Microsoft.ManagedIdentity/userAssignedIdentities/read",
+        "Microsoft.ManagedIdentity/userAssignedIdentities/write",
+        "Microsoft.Network/networkInterfaces/delete",
+        "Microsoft.Network/networkInterfaces/read",
+        "Microsoft.Network/networkInterfaces/write",
+        "Microsoft.Network/networkSecurityGroups/read",
+        "Microsoft.Network/networkSecurityGroups/write",
+        "Microsoft.Network/publicIPAddresses/delete",
+        "Microsoft.Network/publicIPAddresses/read",
+        "Microsoft.Network/publicIPAddresses/write",
+        "Microsoft.Network/virtualNetworks/read",
+        "Microsoft.Network/virtualNetworks/write",
+        "Microsoft.Resources/subscriptions/resourceGroups/read",
+        "Microsoft.Resources/subscriptions/resourceGroups/write",
+    };
+    String missing = {};
+    for (uint32_t index = 0; index < sizeof(required) / sizeof(required[0]); ++index)
+    {
+      if (azurePermissionsAllowAction(doc, required[index], error) == false)
+      {
+        if (missing.size() == 0)
+        {
+          missing.assign("azure missing permissions: "_ctv);
+        }
+        else
+        {
+          missing.append(", "_ctv);
+        }
+        missing.append(String(required[index]));
+      }
+    }
+
+    if (missing.size() > 0)
+    {
+      error = missing;
+      return false;
+    }
+
+    error.clear();
+    return true;
+  }
+
   bool inferMachineSchemaCpuCapability(const MachineConfig& config, MachineSchemaCpuCapability& capability, String& error) override
   {
     capability = {};
@@ -4412,12 +4591,14 @@ public:
                                     const String& requestedAddress,
                                     const String& providerPool,
                                     IPPrefix& assignedPrefix,
+                                    IPPrefix& deliveryPrefix,
                                     String& allocationID,
                                     String& associationID,
                                     bool& releaseOnRemove,
                                     String& error) override
   {
     assignedPrefix = {};
+    deliveryPrefix = {};
     allocationID.clear();
     associationID.clear();
     releaseOnRemove = false;
@@ -4548,6 +4729,7 @@ public:
     }
     assignedPrefix.network = assignedAddress;
     assignedPrefix.cidr = assignedAddress.is6 ? 128 : 32;
+    (void)prodigyMachinePrivateAddressHostPrefix(*machine, family, deliveryPrefix);
 
     return true;
   }

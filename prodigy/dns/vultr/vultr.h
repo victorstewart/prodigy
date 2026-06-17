@@ -24,22 +24,7 @@ public:
       failure.clear();
       return true;
     }
-
-    ProdigyDNSHTTPRequest request = {};
-    request.method.assign("POST"_ctv);
-    if (vultrURL(record.zone, {}, request.url, failure) == false)
-    {
-      return false;
-    }
-    request.header("Content-Type: application/json");
-    request.bearer(credential.material);
-    if (prodigyDNSAppendRecordJSON(request.body, record, "data", &relativeName, failure) == false)
-    {
-      return false;
-    }
-    String response = {};
-    long httpCode = 0;
-    return acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "vultr dns upsert failed");
+    return create(record, relativeName, credential, failure);
   }
 
   bool remove(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
@@ -57,16 +42,17 @@ public:
       return true;
     }
 
-    ProdigyDNSHTTPRequest request = {};
-    request.method.assign("DELETE"_ctv);
-    if (vultrURL(record.zone, id, request.url, failure) == false)
-    {
-      return false;
-    }
-    request.bearer(credential.material);
-    String response = {};
-    long httpCode = 0;
-    return acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "vultr dns delete failed");
+    return removeExact(record, credential, id, failure);
+  }
+
+  bool presentTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  {
+    return changeTXT(false, record, credential, failure);
+  }
+
+  bool cleanupTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  {
+    return changeTXT(true, record, credential, failure);
   }
 
 private:
@@ -91,7 +77,66 @@ private:
     return true;
   }
 
-  bool findRecord(const ProdigyDNSRecordBinding& record, const String& relativeName, const ApiCredential& credential, ProdigyDNSRecordPresence& presence, String& id, String& failure)
+  bool changeTXT(bool removing, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
+  {
+    String ignored = {};
+    if (prodigyDNSRecordSingleTXTValue(record, ignored, failure) == false)
+    {
+      return false;
+    }
+    String id = {};
+    String relativeName = prodigyDNSRelativeName(record.name, record.zone);
+    ProdigyDNSRecordPresence presence = {};
+    if (findRecord(record, relativeName, credential, presence, id, failure, true) == false)
+    {
+      return false;
+    }
+    if (presence == ProdigyDNSRecordPresence::exact)
+    {
+      return removing ? removeExact(record, credential, id, failure) : true;
+    }
+    if (removing)
+    {
+      failure.clear();
+      return true;
+    }
+    return create(record, relativeName, credential, failure);
+  }
+
+  bool create(const ProdigyDNSRecordBinding& record, const String& relativeName, const ApiCredential& credential, String& failure)
+  {
+    ProdigyDNSHTTPRequest request = {};
+    request.method.assign("POST"_ctv);
+    if (vultrURL(record.zone, {}, request.url, failure) == false)
+    {
+      return false;
+    }
+    request.header("Content-Type: application/json");
+    request.bearer(credential.material);
+    if (prodigyDNSAppendRecordJSON(request.body, record, "data", &relativeName, failure) == false)
+    {
+      return false;
+    }
+    String response = {};
+    long httpCode = 0;
+    return acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "vultr dns upsert failed");
+  }
+
+  bool removeExact(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, const String& id, String& failure)
+  {
+    ProdigyDNSHTTPRequest request = {};
+    request.method.assign("DELETE"_ctv);
+    if (vultrURL(record.zone, id, request.url, failure) == false)
+    {
+      return false;
+    }
+    request.bearer(credential.material);
+    String response = {};
+    long httpCode = 0;
+    return acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "vultr dns delete failed");
+  }
+
+  bool findRecord(const ProdigyDNSRecordBinding& record, const String& relativeName, const ApiCredential& credential, ProdigyDNSRecordPresence& presence, String& id, String& failure, bool exactOnly = false)
   {
     ProdigyDNSHTTPRequest request = {};
     request.method.assign("GET"_ctv);
@@ -106,6 +151,6 @@ private:
     {
       return false;
     }
-    return prodigyDNSFindJSONRecord(response, "records", record, relativeName, "data", presence, id, failure);
+    return prodigyDNSFindJSONRecord(response, "records", record, relativeName, "data", exactOnly, presence, id, failure);
   }
 };

@@ -20,9 +20,19 @@ public:
     return change(true, record, credential, failure);
   }
 
+  bool presentTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  {
+    return changeTXT(false, record, credential, failure);
+  }
+
+  bool cleanupTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  {
+    return changeTXT(true, record, credential, failure);
+  }
+
 private:
 
-  bool change(bool removing, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
+  bool credentialPaths(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& projectPath, String& zonePath, String& failure)
   {
     String project = {};
     if (prodigyDNSCredentialMetadata(credential, "project", project) == false)
@@ -31,13 +41,21 @@ private:
       return false;
     }
 
-    String projectPath = {};
-    String zonePath = {};
     if (prodigyDNSEncodePathPart(project, projectPath, failure) == false || prodigyDNSEncodePathPart(record.zone, zonePath, failure) == false)
     {
       return false;
     }
+    return true;
+  }
 
+  bool change(bool removing, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
+  {
+    String projectPath = {};
+    String zonePath = {};
+    if (credentialPaths(record, credential, projectPath, zonePath, failure) == false)
+    {
+      return false;
+    }
     ProdigyDNSRecordPresence presence = {};
     if (findRecord(record, credential, projectPath, zonePath, presence, failure) == false)
     {
@@ -66,7 +84,10 @@ private:
     request.method.assign("POST"_ctv);
     request.url.snprintf<"https://dns.googleapis.com/dns/v1/projects/{}/managedZones/{}/changes"_ctv>(projectPath, zonePath);
     request.header("Content-Type: application/json");
-    request.bearer(credential.material);
+    if (prodigyDNSApplyBearerAuth(request, credential, failure) == false)
+    {
+      return false;
+    }
     request.body.assign("{\""_ctv);
     request.body.append(removing ? "deletions" : "additions");
     request.body.append("\":[{\"name\":"_ctv);
@@ -80,7 +101,105 @@ private:
     return acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "gcp cloud dns change failed");
   }
 
+  bool changeTXT(bool removing, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
+  {
+    String value = {};
+    if (prodigyDNSRecordSingleTXTValue(record, value, failure) == false)
+    {
+      return false;
+    }
+    String projectPath = {};
+    String zonePath = {};
+    if (credentialPaths(record, credential, projectPath, zonePath, failure) == false)
+    {
+      return false;
+    }
+
+    String response = {};
+    if (listRecordSets(record, credential, projectPath, zonePath, response, failure) == false)
+    {
+      return false;
+    }
+    Vector<String> oldValues = {};
+    bool found = false;
+    if (prodigyDNSCollectGcpRecordValues(response, record, oldValues, found, failure) == false)
+    {
+      return false;
+    }
+    Vector<String> newValues = oldValues;
+    if (removing)
+    {
+      if (found == false || prodigyDNSRemoveProviderValue(record, newValues, value) == false)
+      {
+        failure.clear();
+        return true;
+      }
+    }
+    else
+    {
+      if (prodigyDNSValuesContain(record, newValues, value))
+      {
+        failure.clear();
+        return true;
+      }
+      String quoted = {};
+      prodigyDNSQuoteTXTValue(value, quoted);
+      newValues.push_back(quoted);
+    }
+    return changeRRSet(record, credential, projectPath, zonePath, found ? &oldValues : nullptr, newValues.size() == 0 ? nullptr : &newValues, failure);
+  }
+
+  bool changeRRSet(
+      const ProdigyDNSRecordBinding& record,
+      const ApiCredential& credential,
+      const String& projectPath,
+      const String& zonePath,
+      const Vector<String> *deletions,
+      const Vector<String> *additions,
+      String& failure)
+  {
+    ProdigyDNSHTTPRequest request = {};
+    request.method.assign("POST"_ctv);
+    request.url.snprintf<"https://dns.googleapis.com/dns/v1/projects/{}/managedZones/{}/changes"_ctv>(projectPath, zonePath);
+    request.header("Content-Type: application/json");
+    if (prodigyDNSApplyBearerAuth(request, credential, failure) == false)
+    {
+      return false;
+    }
+    request.body.assign("{"_ctv);
+    if (deletions)
+    {
+      request.body.append("\"deletions\":["_ctv);
+      prodigyDNSAppendGcpRRSet(request.body, record, *deletions);
+      request.body.append(']');
+    }
+    if (additions)
+    {
+      if (deletions)
+      {
+        request.body.append(',');
+      }
+      request.body.append("\"additions\":["_ctv);
+      prodigyDNSAppendGcpRRSet(request.body, record, *additions);
+      request.body.append(']');
+    }
+    request.body.append('}');
+    String response = {};
+    long httpCode = 0;
+    return acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "gcp cloud dns change failed");
+  }
+
   bool findRecord(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, const String& projectPath, const String& zonePath, ProdigyDNSRecordPresence& presence, String& failure)
+  {
+    String response = {};
+    if (listRecordSets(record, credential, projectPath, zonePath, response, failure) == false)
+    {
+      return false;
+    }
+    return prodigyDNSFindGcpRecord(response, record, presence, failure);
+  }
+
+  bool listRecordSets(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, const String& projectPath, const String& zonePath, String& response, String& failure)
   {
     String name = {};
     String type = {};
@@ -91,13 +210,15 @@ private:
     ProdigyDNSHTTPRequest request = {};
     request.method.assign("GET"_ctv);
     request.url.snprintf<"https://dns.googleapis.com/dns/v1/projects/{}/managedZones/{}/rrsets?name={}&type={}"_ctv>(projectPath, zonePath, name, type);
-    request.bearer(credential.material);
-    String response = {};
+    if (prodigyDNSApplyBearerAuth(request, credential, failure) == false)
+    {
+      return false;
+    }
     long httpCode = 0;
     if (acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "gcp cloud dns rrset list failed") == false)
     {
       return false;
     }
-    return prodigyDNSFindGcpRecord(response, record, presence, failure);
+    return true;
   }
 };

@@ -8,6 +8,13 @@
 
 #include <services/filesystem.h>
 
+static inline String prodigyContainerErrnoString(int err)
+{
+  String text = {};
+  text.assign(strerror(err));
+  return text;
+}
+
 constexpr static uint32_t prodigyDiscombobulatorAppContractVersion = 1;
 
 static inline String prodigyDiscombobulatorBlobHeaderText(void)
@@ -50,7 +57,8 @@ static inline bool prodigyOpenContainerBlobPayloadAfterContractHeader(
   {
     if (failureReport)
     {
-      failureReport->snprintf<"failed to open container blob {} errno={}({})"_ctv>(blobPath, errno, String(strerror(errno)));
+      int err = errno;
+      failureReport->snprintf<"failed to open container blob {} errno={itoa}({})"_ctv>(blobPath, uint64_t(err), prodigyContainerErrnoString(err));
     }
     return false;
   }
@@ -89,7 +97,8 @@ static inline bool prodigyOpenContainerBlobPayloadAfterContractHeader(
 
     if (failureReport)
     {
-      failureReport->snprintf<"failed to read container blob contract header errno={}({})"_ctv>(errno, String(strerror(errno)));
+      int err = errno;
+      failureReport->snprintf<"failed to read container blob contract header errno={itoa}({})"_ctv>(uint64_t(err), prodigyContainerErrnoString(err));
     }
     close(openedFD);
     return false;

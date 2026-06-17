@@ -506,6 +506,10 @@ func (hub *NeuronHub) AcknowledgeCredentialsRefresh() error {
 	return hub.sendEmpty(ContainerTopicCredentialsRefresh)
 }
 
+func (hub *NeuronHub) AcknowledgeCredentialsRefreshPayload(payload []byte) error {
+	return hub.sendFrame(ContainerTopicCredentialsRefresh, payload)
+}
+
 func (hub *NeuronHub) CredentialsRefreshAck() error {
 	return hub.AcknowledgeCredentialsRefresh()
 }
@@ -918,6 +922,10 @@ func BuildResourceDeltaAckFrame(accepted bool) []byte {
 
 func BuildCredentialsRefreshAckFrame() []byte {
 	return BuildMessageFrame(ContainerTopicCredentialsRefresh, nil)
+}
+
+func BuildCredentialsRefreshAckPayloadFrame(payload []byte) []byte {
+	return BuildMessageFrame(ContainerTopicCredentialsRefresh, payload)
 }
 
 func ParseMessageFrame(data []byte) (MessageFrame, error) {

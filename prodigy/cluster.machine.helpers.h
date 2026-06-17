@@ -12,6 +12,29 @@
 #include <prodigy/types.h>
 #include <prodigy/brain/machine.h>
 
+static inline bool prodigyMachinePrivateAddressHostPrefix(const Machine& machine, ExternalAddressFamily family, IPPrefix& prefix)
+{
+  prefix = {};
+  bool want6 = family == ExternalAddressFamily::ipv6;
+  IPAddress address = {};
+  if (machine.privateAddress.size() > 0 && ClusterMachine::parseIPAddressLiteral(machine.privateAddress, address) && address.is6 == want6)
+  {
+    prefix.network = address;
+    prefix.cidr = want6 ? 128 : 32;
+    return true;
+  }
+
+  if (want6 == false && machine.private4 != 0)
+  {
+    prefix.network.v4 = machine.private4;
+    prefix.network.is6 = false;
+    prefix.cidr = 32;
+    return true;
+  }
+
+  return false;
+}
+
 static inline void prodigyCollectMachinePeerAddresses(const Machine& machine, Vector<ClusterMachinePeerAddress>& candidates)
 {
   candidates.clear();
@@ -466,7 +489,7 @@ static inline bool prodigyMachineIdentityComesBefore(const Machine& lhs, const M
                                       rhs.type.data(), rhs.type.data() + rhs.type.size());
 }
 
-static inline void prodigyPopulateCreatedClusterMachineFromSnapshot(ClusterMachine& clusterMachine, Machine *snapshot, const CreateMachinesInstruction& instruction, const MachineConfig& machineConfig, const String& defaultSSHUser, const String& defaultSSHPrivateKeyPath, const String& defaultSSHHostPublicKeyOpenSSH)
+static inline void prodigyPopulateCreatedClusterMachineFromSnapshot(ClusterMachine& clusterMachine, Machine *snapshot, const CreateMachinesInstruction& instruction, const MachineConfig& machineConfig, const String& defaultSSHUser, const String& defaultSSHPrivateKeyPath, const String& defaultSSHHostPublicKeyOpenSSH, const ProdigyMachineReservedResources& reservedResources = prodigyMachineReservedResources)
 {
   clusterMachine = {};
   clusterMachine.source = ClusterMachineSource::created;
@@ -508,7 +531,7 @@ static inline void prodigyPopulateCreatedClusterMachineFromSnapshot(ClusterMachi
   uint32_t resolvedLogicalCores = machineConfig.nLogicalCores > 0 ? machineConfig.nLogicalCores : snapshot->totalLogicalCores;
   uint32_t resolvedMemoryMB = machineConfig.nMemoryMB > 0 ? machineConfig.nMemoryMB : snapshot->totalMemoryMB;
   uint32_t resolvedStorageMB = machineConfig.nStorageMB > 0 ? machineConfig.nStorageMB : snapshot->totalStorageMB;
-  clusterMachineApplyOwnedResourcesFromTotals(clusterMachine, resolvedLogicalCores, resolvedMemoryMB, resolvedStorageMB);
+  clusterMachineApplyOwnedResourcesFromTotals(clusterMachine, resolvedLogicalCores, resolvedMemoryMB, resolvedStorageMB, reservedResources);
 
   if (clusterMachine.addresses.privateAddresses.empty() && snapshot->private4 != 0)
   {
@@ -544,7 +567,7 @@ static inline void prodigyPopulateCreatedClusterMachineFromSnapshot(ClusterMachi
   }
 }
 
-static inline void prodigyPopulateCreatedClusterMachineFromAcceptance(ClusterMachine& clusterMachine, const String& cloudID, const CreateMachinesInstruction& instruction, const MachineConfig& machineConfig, const String& defaultSSHUser, const String& defaultSSHPrivateKeyPath, const String& defaultSSHHostPublicKeyOpenSSH)
+static inline void prodigyPopulateCreatedClusterMachineFromAcceptance(ClusterMachine& clusterMachine, const String& cloudID, const CreateMachinesInstruction& instruction, const MachineConfig& machineConfig, const String& defaultSSHUser, const String& defaultSSHPrivateKeyPath, const String& defaultSSHHostPublicKeyOpenSSH, const ProdigyMachineReservedResources& reservedResources = prodigyMachineReservedResources)
 {
   clusterMachine = {};
   clusterMachine.source = ClusterMachineSource::created;
@@ -569,10 +592,11 @@ static inline void prodigyPopulateCreatedClusterMachineFromAcceptance(ClusterMac
       clusterMachine,
       machineConfig.nLogicalCores,
       machineConfig.nMemoryMB,
-      machineConfig.nStorageMB);
+      machineConfig.nStorageMB,
+      reservedResources);
 }
 
-static inline void prodigyRefreshCreatedClusterMachineFromSnapshot(ClusterMachine& clusterMachine, Machine *snapshot, const String& defaultSSHUser, const String& defaultSSHPrivateKeyPath, const String& defaultSSHHostPublicKeyOpenSSH)
+static inline void prodigyRefreshCreatedClusterMachineFromSnapshot(ClusterMachine& clusterMachine, Machine *snapshot, const String& defaultSSHUser, const String& defaultSSHPrivateKeyPath, const String& defaultSSHHostPublicKeyOpenSSH, const ProdigyMachineReservedResources& reservedResources = prodigyMachineReservedResources)
 {
   ClusterMachine refreshed = clusterMachine;
   refreshed.ssh.address = snapshot->sshAddress;
@@ -614,18 +638,7 @@ static inline void prodigyRefreshCreatedClusterMachineFromSnapshot(ClusterMachin
   refreshed.totalLogicalCores = snapshot->totalLogicalCores > 0 ? snapshot->totalLogicalCores : refreshed.totalLogicalCores;
   refreshed.totalMemoryMB = snapshot->totalMemoryMB > 0 ? snapshot->totalMemoryMB : refreshed.totalMemoryMB;
   refreshed.totalStorageMB = snapshot->totalStorageMB > 0 ? snapshot->totalStorageMB : refreshed.totalStorageMB;
-  if (refreshed.ownedLogicalCores == 0)
-  {
-    refreshed.ownedLogicalCores = refreshed.totalLogicalCores;
-  }
-  if (refreshed.ownedMemoryMB == 0)
-  {
-    refreshed.ownedMemoryMB = refreshed.totalMemoryMB;
-  }
-  if (refreshed.ownedStorageMB == 0)
-  {
-    refreshed.ownedStorageMB = refreshed.totalStorageMB;
-  }
+  (void)clusterMachineApplyOwnedResourcesFromTotals(refreshed, refreshed.totalLogicalCores, refreshed.totalMemoryMB, refreshed.totalStorageMB, reservedResources);
 
   if (refreshed.addresses.privateAddresses.empty() && snapshot->private4 != 0)
   {
@@ -1179,7 +1192,7 @@ static inline bool prodigyResolveMachineInternetSourceAddress(const Machine& mac
   return false;
 }
 
-static inline void prodigyApplyHardwareProfileToClusterMachine(ClusterMachine& machine, const MachineHardwareProfile& hardware)
+static inline void prodigyApplyHardwareProfileToClusterMachine(ClusterMachine& machine, const MachineHardwareProfile& hardware, const ProdigyMachineReservedResources& reservedResources = prodigyMachineReservedResources)
 {
   machine.hardware = hardware;
   machine.hasInternetAccess = prodigyMachineHardwareHasInternetAccess(hardware);
@@ -1204,7 +1217,7 @@ static inline void prodigyApplyHardwareProfileToClusterMachine(ClusterMachine& m
   }
 
   machine.totalStorageMB = uint32_t(totalStorageMB);
-  (void)clusterMachineApplyOwnedResourcesFromTotals(machine, machine.totalLogicalCores, machine.totalMemoryMB, machine.totalStorageMB);
+  (void)clusterMachineApplyOwnedResourcesFromTotals(machine, machine.totalLogicalCores, machine.totalMemoryMB, machine.totalStorageMB, reservedResources);
 }
 
 static inline void prodigyApplyHardwareProfileToMachine(Machine& machine, const MachineHardwareProfile& hardware)

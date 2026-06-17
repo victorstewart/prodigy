@@ -11,7 +11,7 @@ struct {
   __type(key, __u32);
   __type(value, __u32);
   __uint(max_entries, 1);
-} packet_counter_map SEC(".maps");
+} pkt_counter SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -338,7 +338,7 @@ __attribute__((__always_inline__)) static inline void logEthFrameShallow(struct 
 __attribute__((__always_inline__)) static inline void logPacket(struct ethhdr *eth, void *data_end)
 {
   __u32 zeroidx = 0;
-  __u32 *count = bpf_map_lookup_elem(&packet_counter_map, &zeroidx);
+  __u32 *count = bpf_map_lookup_elem(&pkt_counter, &zeroidx);
 
   __u32 packetIndex = 0;
 
@@ -369,7 +369,7 @@ __attribute__((__always_inline__)) static inline void logPacket(struct ethhdr *e
         bpf_map_update_elem(&packet_map, &packetIndex, pkt, BPF_ANY);
 
         packetIndex += 1;
-        bpf_map_update_elem(&packet_counter_map, &zeroidx, &packetIndex, BPF_ANY);
+        bpf_map_update_elem(&pkt_counter, &zeroidx, &packetIndex, BPF_ANY);
       }
     }
   }
@@ -378,7 +378,7 @@ __attribute__((__always_inline__)) static inline void logPacket(struct ethhdr *e
 __attribute__((__always_inline__)) static inline void logPacketShallow(struct ethhdr *eth, void *data_end)
 {
   __u32 zeroidx = 0;
-  __u32 *count = bpf_map_lookup_elem(&packet_counter_map, &zeroidx);
+  __u32 *count = bpf_map_lookup_elem(&pkt_counter, &zeroidx);
 
   __u32 packetIndex = 0;
 
@@ -409,7 +409,7 @@ __attribute__((__always_inline__)) static inline void logPacketShallow(struct et
         bpf_map_update_elem(&packet_map, &packetIndex, pkt, BPF_ANY);
 
         packetIndex += 1;
-        bpf_map_update_elem(&packet_counter_map, &zeroidx, &packetIndex, BPF_ANY);
+        bpf_map_update_elem(&pkt_counter, &zeroidx, &packetIndex, BPF_ANY);
       }
     }
   }
@@ -446,7 +446,7 @@ __attribute__((__always_inline__)) static inline void logSKB(struct __sk_buff *s
 __attribute__((__always_inline__)) static inline struct packet *getPacket(void)
 {
   __u32 zeroidx = 0;
-  __u32 *count = bpf_map_lookup_elem(&packet_counter_map, &zeroidx);
+  __u32 *count = bpf_map_lookup_elem(&pkt_counter, &zeroidx);
 
   if (count)
   {

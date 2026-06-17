@@ -855,6 +855,11 @@ static inline bool awsIsLaunchTemplateMissingFailure(const String& failure)
   return awsContainsCString(failure, "InvalidLaunchTemplateName") || awsContainsCString(failure, "does not exist");
 }
 
+static inline bool awsIsDryRunSuccessFailure(const String& failure)
+{
+  return awsContainsCString(failure, "DryRunOperation") || awsContainsCString(failure, "Request would have succeeded");
+}
+
 class AwsNeuronIaaS : public NeuronIaaS {
 public:
 
@@ -1288,11 +1293,55 @@ protected:
     return true;
   }
 
+  virtual bool sendIAMRequest(const String& actionBody, String& response, String& failure, long *httpCode = nullptr)
+  {
+    if (ensureCredential(failure) == false)
+    {
+      return false;
+    }
+
+    struct curl_slist *headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded; charset=utf-8");
+
+    long localHTTPCode = 0;
+    bool ok = AwsHttp::send("POST", "https://iam.amazonaws.com/"_ctv, "us-east-1"_ctv, "iam"_ctv, credential, headers, &actionBody, response, &localHTTPCode);
+    curl_slist_free_all(headers);
+    if (httpCode)
+    {
+      *httpCode = localHTTPCode;
+    }
+
+    if (ok == false)
+    {
+      failure.assign("aws iam request transport failed"_ctv);
+      return false;
+    }
+
+    if (localHTTPCode < 200 || localHTTPCode >= 300)
+    {
+      String message;
+      if (awsExtractXMLValue(response, "Message", message) == false)
+      {
+        message.assign("aws iam request failed"_ctv);
+      }
+      failure = message;
+      return false;
+    }
+
+    failure.clear();
+    return true;
+  }
+
 private:
 
   bool request(const String& actionBody, String& response, String& failure, long *httpCode = nullptr)
   {
     return sendElasticEC2Request(actionBody, response, failure, httpCode);
+  }
+
+  bool iamRequest(const String& actionBody, String& response, String& failure, long *httpCode = nullptr)
+  {
+    return sendIAMRequest(actionBody, response, failure, httpCode);
   }
 
   bool describeElasticAddressByPublicIP(const String& requestedAddress, String& publicAddress, String& allocationID, String& associationID, String& failure)
@@ -1973,6 +2022,37 @@ private:
     return true;
   }
 
+  bool findDefaultSecurityGroup(const String& vpcID, String& groupID, String& failure)
+  {
+    groupID.clear();
+
+    bool first = true;
+    String filters = {};
+    awsAppendQueryParam(filters, "Filter.1.Name"_ctv, "vpc-id"_ctv, first);
+    awsAppendQueryParam(filters, "Filter.1.Value.1"_ctv, vpcID, first);
+    awsAppendQueryParam(filters, "Filter.2.Name"_ctv, "group-name"_ctv, first);
+    awsAppendQueryParam(filters, "Filter.2.Value.1"_ctv, "default"_ctv, first);
+
+    Vector<String> groupBlocks;
+    describeSecurityGroups(filters, groupBlocks, failure);
+    if (failure.size() > 0)
+    {
+      return false;
+    }
+
+    for (const String& block : groupBlocks)
+    {
+      if (awsExtractXMLValue(block, "groupId", groupID))
+      {
+        failure.clear();
+        return true;
+      }
+    }
+
+    failure.assign("aws default security group missing"_ctv);
+    return false;
+  }
+
   bool createBootstrapSecurityGroup(const String& vpcID, String& groupID, String& failure)
   {
     groupID.clear();
@@ -2096,6 +2176,22 @@ private:
     return authorizeBootstrapMeshIngress(securityGroupID, failure);
   }
 
+  static void awsAppendInstanceProfile(String& body, const String& prefix, const String& instanceProfileName, const String& instanceProfileArn, bool& first)
+  {
+    String key = {};
+
+    if (instanceProfileArn.size() > 0)
+    {
+      key.snprintf<"{}.Arn"_ctv>(prefix);
+      awsAppendQueryParam(body, key, instanceProfileArn, first);
+    }
+    else if (instanceProfileName.size() > 0)
+    {
+      key.snprintf<"{}.Name"_ctv>(prefix);
+      awsAppendQueryParam(body, key, instanceProfileName, first);
+    }
+  }
+
   static void awsAppendBootstrapLaunchTemplateData(
       String& body,
       const String& prefix,
@@ -2122,16 +2218,8 @@ private:
     key.snprintf<"{}.NetworkInterface.1.SecurityGroupId.1"_ctv>(prefix);
     awsAppendQueryParam(body, key, securityGroupID, first);
 
-    if (instanceProfileArn.size() > 0)
-    {
-      key.snprintf<"{}.IamInstanceProfile.Arn"_ctv>(prefix);
-      awsAppendQueryParam(body, key, instanceProfileArn, first);
-    }
-    else if (instanceProfileName.size() > 0)
-    {
-      key.snprintf<"{}.IamInstanceProfile.Name"_ctv>(prefix);
-      awsAppendQueryParam(body, key, instanceProfileName, first);
-    }
+    key.snprintf<"{}.IamInstanceProfile"_ctv>(prefix);
+    awsAppendInstanceProfile(body, key, instanceProfileName, instanceProfileArn, first);
   }
 
   bool describeBootstrapLaunchTemplate(const String& launchTemplateName, String& launchTemplateID, String& defaultVersionNumber, String& latestVersionNumber, String& failure)
@@ -2374,6 +2462,255 @@ private:
     return true;
   }
 
+  bool configuredInstanceProfileName(String& name, String& failure) const
+  {
+    name = runtimeEnvironment.aws.instanceProfileName;
+    if (name.size() > 0)
+    {
+      failure.clear();
+      return true;
+    }
+
+    const String& arn = runtimeEnvironment.aws.instanceProfileArn;
+    int64_t slash = arn.rfindChar('/');
+    if (slash >= 0 && uint64_t(slash + 1) < arn.size())
+    {
+      name.assign(arn.substr(uint64_t(slash + 1), arn.size() - uint64_t(slash + 1), Copy::yes));
+      failure.clear();
+      return true;
+    }
+
+    failure.assign("aws preflight requires aws.instanceProfileName or aws.instanceProfileArn so created brains can use IMDS"_ctv);
+    return false;
+  }
+
+  bool requireInstanceProfile(String& failure)
+  {
+    String name = {};
+    if (configuredInstanceProfileName(name, failure) == false)
+    {
+      return false;
+    }
+
+    bool first = true;
+    String body = {};
+    awsAppendQueryParam(body, "Action"_ctv, "GetInstanceProfile"_ctv, first);
+    awsAppendQueryParam(body, "Version"_ctv, "2010-05-08"_ctv, first);
+    awsAppendQueryParam(body, "InstanceProfileName"_ctv, name, first);
+
+    String response = {};
+    if (iamRequest(body, response, failure) == false)
+    {
+      String detail = failure;
+      failure.assign("aws instance profile preflight failed: "_ctv);
+      failure.append(detail);
+      return false;
+    }
+
+    failure.clear();
+    return true;
+  }
+
+  bool dryRunEC2(String body, const char *label, String& failure)
+  {
+    bool first = body.size() == 0;
+    awsAppendQueryParam(body, "DryRun"_ctv, "true"_ctv, first);
+
+    String response = {};
+    String detail = {};
+    if (request(body, response, detail) == false)
+    {
+      if (awsIsDryRunSuccessFailure(detail))
+      {
+        failure.clear();
+        return true;
+      }
+
+      failure.assign("aws "_ctv);
+      failure.append(label);
+      failure.append(" preflight failed: "_ctv);
+      failure.append(detail.size() ? detail : String("unknown failure"_ctv));
+      return false;
+    }
+
+    failure.assign("aws "_ctv);
+    failure.append(label);
+    failure.append(" preflight unexpectedly succeeded with DryRun=true"_ctv);
+    return false;
+  }
+
+  void appendLaunchTemplatePreflightData(String& body, const String& imageID, const String& instanceType, bool& first)
+  {
+    awsAppendQueryParam(body, "LaunchTemplateData.ImageId"_ctv, imageID, first);
+    awsAppendQueryParam(body, "LaunchTemplateData.InstanceType"_ctv, instanceType, first);
+    awsAppendInstanceProfile(
+        body,
+        "LaunchTemplateData.IamInstanceProfile"_ctv,
+        runtimeEnvironment.aws.instanceProfileName,
+        runtimeEnvironment.aws.instanceProfileArn,
+        first);
+  }
+
+  bool dryRunLaunchTemplateCreate(const MachineConfig& config, const String& imageID, String& failure)
+  {
+    bool first = true;
+    String body = {};
+    awsAppendQueryParam(body, "Action"_ctv, "CreateLaunchTemplate"_ctv, first);
+    awsAppendQueryParam(body, "Version"_ctv, "2016-11-15"_ctv, first);
+    awsAppendQueryParam(body, "LaunchTemplateName"_ctv, "prodigy-preflight"_ctv, first);
+    awsAppendQueryParam(body, "VersionDescription"_ctv, "prodigy-preflight"_ctv, first);
+    appendLaunchTemplatePreflightData(body, imageID, config.providerMachineType, first);
+    return dryRunEC2(body, "CreateLaunchTemplate", failure);
+  }
+
+  bool dryRunLaunchTemplateUpdate(const MachineConfig& config, const String& imageID, const String& launchTemplateName, String& failure)
+  {
+    bool first = true;
+    String body = {};
+    awsAppendQueryParam(body, "Action"_ctv, "CreateLaunchTemplateVersion"_ctv, first);
+    awsAppendQueryParam(body, "Version"_ctv, "2016-11-15"_ctv, first);
+    awsAppendQueryParam(body, "LaunchTemplateName"_ctv, launchTemplateName, first);
+    awsAppendQueryParam(body, "VersionDescription"_ctv, "prodigy-preflight"_ctv, first);
+    appendLaunchTemplatePreflightData(body, imageID, config.providerMachineType, first);
+    if (dryRunEC2(body, "CreateLaunchTemplateVersion", failure) == false)
+    {
+      return false;
+    }
+
+    first = true;
+    body.clear();
+    awsAppendQueryParam(body, "Action"_ctv, "ModifyLaunchTemplate"_ctv, first);
+    awsAppendQueryParam(body, "Version"_ctv, "2016-11-15"_ctv, first);
+    awsAppendQueryParam(body, "LaunchTemplateName"_ctv, launchTemplateName, first);
+    awsAppendQueryParam(body, "SetDefaultVersion"_ctv, "1"_ctv, first);
+    return dryRunEC2(body, "ModifyLaunchTemplate", failure);
+  }
+
+  bool dryRunRunInstances(const MachineConfig& config, const String& imageID, String& failure)
+  {
+    bool first = true;
+    String body = {};
+    awsAppendQueryParam(body, "Action"_ctv, "RunInstances"_ctv, first);
+    awsAppendQueryParam(body, "Version"_ctv, "2016-11-15"_ctv, first);
+    awsAppendQueryParam(body, "ImageId"_ctv, imageID, first);
+    awsAppendQueryParam(body, "InstanceType"_ctv, config.providerMachineType, first);
+    awsAppendQueryParam(body, "MinCount"_ctv, "1"_ctv, first);
+    awsAppendQueryParam(body, "MaxCount"_ctv, "1"_ctv, first);
+    awsAppendQueryParam(body, "TagSpecification.1.ResourceType"_ctv, "instance"_ctv, first);
+    awsAppendQueryParam(body, "TagSpecification.1.Tag.1.Key"_ctv, "app"_ctv, first);
+    awsAppendQueryParam(body, "TagSpecification.1.Tag.1.Value"_ctv, "prodigy"_ctv, first);
+    awsAppendInstanceProfile(body, "IamInstanceProfile"_ctv, runtimeEnvironment.aws.instanceProfileName, runtimeEnvironment.aws.instanceProfileArn, first);
+    return dryRunEC2(body, "RunInstances", failure);
+  }
+
+  bool dryRunTerminateInstances(const String& instanceID, String& failure)
+  {
+    bool first = true;
+    String body = {};
+    awsAppendQueryParam(body, "Action"_ctv, "TerminateInstances"_ctv, first);
+    awsAppendQueryParam(body, "Version"_ctv, "2016-11-15"_ctv, first);
+    awsAppendQueryParam(body, "InstanceId.1"_ctv, instanceID, first);
+    return dryRunEC2(body, "TerminateInstances", failure);
+  }
+
+  bool dryRunDeleteLaunchTemplate(const String& launchTemplateName, String& failure)
+  {
+    bool first = true;
+    String body = {};
+    awsAppendQueryParam(body, "Action"_ctv, "DeleteLaunchTemplate"_ctv, first);
+    awsAppendQueryParam(body, "Version"_ctv, "2016-11-15"_ctv, first);
+    awsAppendQueryParam(body, "LaunchTemplateName"_ctv, launchTemplateName, first);
+    return dryRunEC2(body, "DeleteLaunchTemplate", failure);
+  }
+
+  bool dryRunCreateSecurityGroup(const String& vpcID, String& failure)
+  {
+    bool first = true;
+    String body = {};
+    awsAppendQueryParam(body, "Action"_ctv, "CreateSecurityGroup"_ctv, first);
+    awsAppendQueryParam(body, "Version"_ctv, "2016-11-15"_ctv, first);
+    awsAppendQueryParam(body, "GroupName"_ctv, "prodigy-bootstrap-ssh-preflight"_ctv, first);
+    awsAppendQueryParam(body, "GroupDescription"_ctv, "Prodigy bootstrap preflight"_ctv, first);
+    awsAppendQueryParam(body, "VpcId"_ctv, vpcID, first);
+    return dryRunEC2(body, "CreateSecurityGroup", failure);
+  }
+
+  bool dryRunAuthorizeBootstrapIngress(const String& groupID, bool mesh, String& failure)
+  {
+    bool first = true;
+    String body = {};
+    awsAppendQueryParam(body, "Action"_ctv, "AuthorizeSecurityGroupIngress"_ctv, first);
+    awsAppendQueryParam(body, "Version"_ctv, "2016-11-15"_ctv, first);
+    awsAppendQueryParam(body, "GroupId"_ctv, groupID.size() ? groupID : String("sg-00000000000000000"_ctv), first);
+    if (mesh)
+    {
+      awsAppendQueryParam(body, "IpPermissions.1.IpProtocol"_ctv, "-1"_ctv, first);
+      awsAppendQueryParam(body, "IpPermissions.1.Groups.1.GroupId"_ctv, groupID.size() ? groupID : String("sg-00000000000000000"_ctv), first);
+      return dryRunEC2(body, "AuthorizeSecurityGroupIngress(mesh)", failure);
+    }
+
+    awsAppendQueryParam(body, "IpProtocol"_ctv, "tcp"_ctv, first);
+    awsAppendQueryParam(body, "FromPort"_ctv, "22"_ctv, first);
+    awsAppendQueryParam(body, "ToPort"_ctv, "22"_ctv, first);
+    awsAppendQueryParam(body, "CidrIp"_ctv, "0.0.0.0/0"_ctv, first);
+    return dryRunEC2(body, "AuthorizeSecurityGroupIngress(ssh)", failure);
+  }
+
+  static void appendPreflightFailure(String& failures, const String& failure)
+  {
+    if (failure.size() == 0)
+    {
+      return;
+    }
+    if (failures.size() > 0)
+    {
+      failures.append("; "_ctv);
+    }
+    failures.append(failure);
+  }
+
+  bool preflightBootstrapPlacement(String& failure)
+  {
+    String vpcID = {};
+    String subnetID = {};
+    String groupID = {};
+    if (findDefaultVPC(vpcID, failure) == false || findBootstrapSubnet(vpcID, subnetID, failure) == false || findBootstrapSecurityGroup(vpcID, groupID, failure) == false)
+    {
+      return false;
+    }
+
+    String failures = {};
+    String stepFailure = {};
+    if (groupID.size() == 0 && dryRunCreateSecurityGroup(vpcID, stepFailure) == false)
+    {
+      appendPreflightFailure(failures, stepFailure);
+    }
+
+    String ingressGroupID = groupID;
+    if (ingressGroupID.size() == 0 && findDefaultSecurityGroup(vpcID, ingressGroupID, stepFailure) == false)
+    {
+      appendPreflightFailure(failures, stepFailure);
+    }
+
+    if (ingressGroupID.size() > 0 && dryRunAuthorizeBootstrapIngress(ingressGroupID, false, stepFailure) == false)
+    {
+      appendPreflightFailure(failures, stepFailure);
+    }
+    if (ingressGroupID.size() > 0 && dryRunAuthorizeBootstrapIngress(ingressGroupID, true, stepFailure) == false)
+    {
+      appendPreflightFailure(failures, stepFailure);
+    }
+
+    if (failures.size() > 0)
+    {
+      failure = failures;
+      return false;
+    }
+
+    failure.clear();
+    return true;
+  }
+
   void terminateCreatedInstances(const Vector<String>& instanceIDs)
   {
     if (instanceIDs.size() == 0)
@@ -2415,6 +2752,107 @@ public:
     region.clear();
     credential = {};
     credentialLoaded = false;
+  }
+
+  bool preflightClusterCreate(const BrainIaaSClusterCreatePreflight& preflight, String& error) override
+  {
+    error.clear();
+
+    const MachineConfig *config = nullptr;
+    for (const MachineConfig& candidate : preflight.configs)
+    {
+      if (candidate.kind == MachineConfig::MachineKind::vm && candidate.vmImageURI.size() > 0 && candidate.providerMachineType.size() > 0)
+      {
+        config = &candidate;
+        break;
+      }
+    }
+
+    if (config == nullptr)
+    {
+      error.assign("aws preflight requires a vm machine schema with vmImageURI and providerMachineType"_ctv);
+      return false;
+    }
+
+    if (requireInstanceProfile(error) == false)
+    {
+      return false;
+    }
+
+    Vector<String> instances = {};
+    describeInstances(""_ctv, instances, error);
+    if (error.size() > 0)
+    {
+      String detail = error;
+      error.assign("aws DescribeInstances preflight failed: "_ctv);
+      error.append(detail);
+      return false;
+    }
+
+    String failures = {};
+    String stepFailure = {};
+    if (preflightBootstrapPlacement(stepFailure) == false)
+    {
+      appendPreflightFailure(failures, stepFailure);
+    }
+
+    String imageID = {};
+    if (resolveCanonicalUbuntuImageID(config->vmImageURI, imageID, error) == false)
+    {
+      return false;
+    }
+
+    if (dryRunLaunchTemplateCreate(*config, imageID, stepFailure) == false)
+    {
+      appendPreflightFailure(failures, stepFailure);
+    }
+
+    String launchTemplateID = {};
+    String defaultVersionNumber = {};
+    String latestVersionNumber = {};
+    const String& launchTemplateName = runtimeEnvironment.aws.bootstrapLaunchTemplateName;
+    if (describeBootstrapLaunchTemplate(launchTemplateName, launchTemplateID, defaultVersionNumber, latestVersionNumber, error) == false)
+    {
+      return false;
+    }
+
+    if (launchTemplateID.size() > 0 && runtimeEnvironment.aws.bootstrapLaunchTemplateVersion == "$Default"_ctv)
+    {
+      if (dryRunLaunchTemplateUpdate(*config, imageID, launchTemplateName, stepFailure) == false)
+      {
+        appendPreflightFailure(failures, stepFailure);
+      }
+    }
+
+    if (dryRunRunInstances(*config, imageID, stepFailure) == false)
+    {
+      appendPreflightFailure(failures, stepFailure);
+    }
+    String existingInstanceID = {};
+    for (const String& block : instances)
+    {
+      if (awsExtractXMLValue(block, "instanceId", existingInstanceID))
+      {
+        break;
+      }
+    }
+    if (existingInstanceID.size() > 0 && dryRunTerminateInstances(existingInstanceID, stepFailure) == false)
+    {
+      appendPreflightFailure(failures, stepFailure);
+    }
+    if (launchTemplateID.size() > 0 && dryRunDeleteLaunchTemplate(launchTemplateName, stepFailure) == false)
+    {
+      appendPreflightFailure(failures, stepFailure);
+    }
+
+    if (failures.size() > 0)
+    {
+      error = failures;
+      return false;
+    }
+
+    error.clear();
+    return true;
   }
 
   bool inferMachineSchemaCpuCapability(const MachineConfig& config, MachineSchemaCpuCapability& capability, String& error) override
@@ -2783,9 +3221,25 @@ public:
           Machine *machine = buildMachineFromInstanceBlock(block);
           MachineProvisioningProgress& progress = provisioningProgress.upsert(config.slug, config.providerMachineType, machine->cloudID, machine->cloudID);
           prodigyPopulateMachineProvisioningProgressFromMachine(progress, *machine);
-          if (awsExtractInstanceStateName(block, stateName) == false || stateName != "running"_ctv || prodigyMachineProvisioningReady(*machine) == false)
+          bool addressesReady = prodigyMachineProvisioningReady(*machine);
+          bool sshReady = addressesReady && prodigyMachineSSHSocketAcceptingConnections(*machine, 2000);
+          if (awsExtractInstanceStateName(block, stateName) == false || stateName != "running"_ctv || sshReady == false)
           {
-            progress.status = stateName.size() > 0 ? stateName : "waiting-for-running"_ctv;
+            if (stateName != "running"_ctv)
+            {
+              progress.status = stateName.size() > 0 ? stateName : "waiting-for-running"_ctv;
+            }
+            else
+            {
+              if (addressesReady)
+              {
+                progress.status.assign("waiting-for-ssh-accept"_ctv);
+              }
+              else
+              {
+                progress.status.assign("waiting-for-addresses"_ctv);
+              }
+            }
             progress.ready = false;
             ready = false;
           }
@@ -3168,12 +3622,14 @@ public:
                                     const String& requestedAddress,
                                     const String& providerPool,
                                     IPPrefix& assignedPrefix,
+                                    IPPrefix& deliveryPrefix,
                                     String& allocationID,
                                     String& associationID,
                                     bool& releaseOnRemove,
                                     String& error) override
   {
     assignedPrefix = {};
+    deliveryPrefix = {};
     allocationID.clear();
     associationID.clear();
     releaseOnRemove = false;
@@ -3272,6 +3728,7 @@ public:
     }
     assignedPrefix.network = assignedAddress;
     assignedPrefix.cidr = assignedAddress.is6 ? 128 : 32;
+    (void)prodigyMachinePrivateAddressHostPrefix(*machine, family, deliveryPrefix);
 
     error.clear();
     return true;

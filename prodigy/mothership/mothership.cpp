@@ -41,6 +41,7 @@
 #include <prodigy/mothership/mothership.pricing.h>
 #include <prodigy/mothership/mothership.provider.credentials.h>
 #include <prodigy/mothership/mothership.provider.machine.destroy.h>
+#include <prodigy/acme.certbot.h>
 #include <prodigy/types.h>
 
 // for now every time we create a new application or service we're going to have to recompile the mothership so that
@@ -1177,6 +1178,79 @@ static bool parseClusterAzureConfigJSON(simdjson::dom::element value, Mothership
   return true;
 }
 
+static bool parseClusterACMEConfigJSON(simdjson::dom::element value, ProdigyACMEConfig& config, const char *context)
+{
+  if (value.type() != simdjson::dom::element_type::OBJECT)
+  {
+    basics_log("%s requires object\n", context);
+    return false;
+  }
+
+  ProdigyACMEConfig parsed = {};
+  for (auto field : value.get_object())
+  {
+    String key = {};
+    key.setInvariant(field.key.data(), field.key.size());
+
+    if (key.equal("accountEmail"_ctv))
+    {
+      if (field.value.type() != simdjson::dom::element_type::STRING)
+      {
+        basics_log("%s.accountEmail requires string\n", context);
+        return false;
+      }
+
+      parsed.accountEmail.assign(field.value.get_c_str());
+    }
+    else if (key.equal("termsAgreed"_ctv))
+    {
+      if (field.value.type() != simdjson::dom::element_type::BOOL || field.value.get(parsed.termsAgreed) != simdjson::SUCCESS)
+      {
+        basics_log("%s.termsAgreed requires bool\n", context);
+        return false;
+      }
+    }
+    else if (key.equal("certbotInstall"_ctv))
+    {
+      if (field.value.type() != simdjson::dom::element_type::STRING)
+      {
+        basics_log("%s.certbotInstall requires string\n", context);
+        return false;
+      }
+
+      parsed.certbotInstall.assign(field.value.get_c_str());
+    }
+    else if (key.equal("certbotPath"_ctv))
+    {
+      if (field.value.type() != simdjson::dom::element_type::STRING)
+      {
+        basics_log("%s.certbotPath requires string\n", context);
+        return false;
+      }
+
+      parsed.certbotPath.assign(field.value.get_c_str());
+    }
+    else if (key.equal("certbotVersion"_ctv))
+    {
+      if (field.value.type() != simdjson::dom::element_type::STRING)
+      {
+        basics_log("%s.certbotVersion requires string\n", context);
+        return false;
+      }
+
+      parsed.certbotVersion.assign(field.value.get_c_str());
+    }
+    else
+    {
+      basics_log("%s invalid field\n", context);
+      return false;
+    }
+  }
+
+  config = std::move(parsed);
+  return true;
+}
+
 static bool parseClusterMachineSchemaPatchJSON(simdjson::dom::element value, MothershipProdigyClusterMachineSchemaPatch& patch, const char *context)
 {
   if (value.type() != simdjson::dom::element_type::OBJECT)
@@ -2122,6 +2196,18 @@ static void printManagedCluster(const MothershipProdigyCluster& cluster)
                mothershipClusterProviderName(cluster.dnsProvider),
                dnsCredentialName.c_str());
   }
+  if (cluster.acme.configured())
+  {
+    String accountEmail = cluster.acme.accountEmail;
+    basics_log("    acme.accountEmail=%s acme.termsAgreed=%d\n",
+               accountEmail.c_str(),
+               int(cluster.acme.termsAgreed));
+  }
+  basics_log("    resourceReservation=%s reserved=%u/%u/%u\n",
+             prodigyMachineReservedResourcesProfileName(cluster.machineReservedResources),
+             unsigned(cluster.machineReservedResources.logicalCores),
+             unsigned(cluster.machineReservedResources.memoryMB),
+             unsigned(cluster.machineReservedResources.storageMB));
 
   for (const MothershipProdigyClusterControl& control : cluster.controls)
   {
@@ -3761,7 +3847,8 @@ static bool bootstrapLocalProdigy(const ProdigyPersistentBootState& bootState, S
     return false;
   }
 
-  String mkdirCommand = "mkdir -p /var/lib/prodigy"_ctv;
+  String mkdirCommand = {};
+  mkdirCommand.assign("mkdir -p /var/lib/prodigy"_ctv);
   if (controlSocketDirectory.size() > 0)
   {
     mkdirCommand.append(" "_ctv);
@@ -3980,7 +4067,7 @@ private:
     int fd = -1;
     if (mothershipOpenConnectedSocket(tcpAddress, tcpPort, fd) == false)
     {
-      lastConnectFailure.snprintf<"failed to connect tcp {}:{}"_ctv>(tcpAddress, unsigned(tcpPort));
+      lastConnectFailure.snprintf<"failed to connect tcp {}:{itoa}"_ctv>(tcpAddress, unsigned(tcpPort));
       printConnectFailure();
       return false;
     }
@@ -4171,7 +4258,7 @@ private:
         (void)::unlink(knownHostsPath.c_str());
         if (failure)
         {
-          failure->snprintf<"timed out waiting for ssh tunnel {} via ssh {}:{}"_ctv>(path, machine.ssh.address, unsigned(machine.ssh.port));
+          failure->snprintf<"timed out waiting for ssh tunnel {} via ssh {}:{itoa}"_ctv>(path, machine.ssh.address, unsigned(machine.ssh.port));
         }
         return false;
       }
@@ -5735,6 +5822,78 @@ private:
     return true;
   }
 
+  bool preflightClusterProviderCreate(const MothershipProdigyCluster& cluster, const MothershipProviderCredential *credential, String& failure)
+  {
+    failure.clear();
+
+    if (cluster.deploymentMode != MothershipClusterDeploymentMode::remote || cluster.machineSchemas.empty())
+    {
+      return true;
+    }
+
+    ProdigyRuntimeEnvironmentConfig provisioningEnvironment = {};
+    if (mothershipBuildClusterProvisioningRuntimeEnvironment(cluster, credential, provisioningEnvironment, &failure) == false)
+    {
+      return false;
+    }
+
+    std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(provisioningEnvironment);
+    if (provider == nullptr)
+    {
+      failure.assign("cluster provider does not support create preflight"_ctv);
+      return false;
+    }
+
+    BrainIaaSClusterCreatePreflight preflight = {};
+    preflight.gcpServiceAccountEmail = cluster.gcp.serviceAccountEmail;
+    preflight.gcpNetwork = cluster.gcp.network;
+    preflight.gcpSubnetwork = cluster.gcp.subnetwork;
+    preflight.azureManagedIdentityResourceID = cluster.azure.managedIdentityResourceID;
+    if (preflight.azureManagedIdentityResourceID.size() == 0 && cluster.azure.managedIdentityName.size() > 0)
+    {
+      String subscriptionID = {};
+      String resourceGroup = {};
+      String location = {};
+      if (parseAzureProviderScope(cluster.providerScope, subscriptionID, resourceGroup, location, &failure) == false)
+      {
+        return false;
+      }
+      preflight.azureManagedIdentityResourceID.snprintf<
+          "/subscriptions/{}/resourceGroups/{}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/{}"_ctv>(
+          subscriptionID,
+          resourceGroup,
+          cluster.azure.managedIdentityName);
+    }
+
+    for (const MothershipProdigyClusterMachineSchema& schema : cluster.machineSchemas)
+    {
+      if (schema.budget == 0)
+      {
+        continue;
+      }
+
+      MachineConfig config = {};
+      mothershipBuildMachineConfigFromSchema(schema, config);
+      preflight.configs.push_back(std::move(config));
+    }
+
+    if (preflight.configs.empty())
+    {
+      return true;
+    }
+
+    provider->configureRuntimeEnvironment(provisioningEnvironment);
+    if (provider->preflightClusterCreate(preflight, failure) == false)
+    {
+      String detail = failure;
+      failure.assign("cluster provider preflight failed: "_ctv);
+      failure.append(detail.size() ? detail : String("unknown failure"_ctv));
+      return false;
+    }
+
+    return true;
+  }
+
   bool destroyCloudClusterMachines(const MothershipProdigyCluster& cluster, const Vector<ClusterMachine>& createdMachines, uint32_t& destroyedCloudMachines, String& failure)
   {
     failure.clear();
@@ -5773,6 +5932,62 @@ private:
     }
 
     destroyedCloudMachines = uint32_t(createdMachines.size());
+    return true;
+  }
+
+  bool removeClusterDNSBindings(const MothershipProdigyCluster& cluster, uint32_t& removedDNSRecords, String& failure)
+  {
+    failure.clear();
+    removedDNSRecords = 0;
+    if (cluster.dnsProvider == MothershipClusterProvider::unknown)
+    {
+      return true;
+    }
+    if (socket.configureCluster(cluster, &failure) == false)
+    {
+      return false;
+    }
+    if (socket.connect() != 0)
+    {
+      failure = socket.connectFailureDetail().size() ? socket.connectFailureDetail() : String("failed to connect to cluster control socket for DNS teardown"_ctv);
+      return false;
+    }
+
+    Message::construct(socket.wBuffer, MothershipTopic::teardownDNSBindings);
+    if (socket.send() == false)
+    {
+      socket.close();
+      failure = socket.ioFailureDetail().size() ? socket.ioFailureDetail() : String("failed to send DNS teardown request"_ctv);
+      return false;
+    }
+
+    Message *responseMessage = socket.recvExpectedTopic(MothershipTopic::teardownDNSBindings);
+    if (responseMessage == nullptr)
+    {
+      socket.close();
+      failure = socket.ioFailureDetail().size() ? socket.ioFailureDetail() : String("timed out waiting for DNS teardown response"_ctv);
+      return false;
+    }
+
+    String serializedResponse = {};
+    uint8_t *responseArgs = responseMessage->args;
+    Message::extractToStringView(responseArgs, serializedResponse);
+
+    RoutableResourceLeaseReport response = {};
+    if (BitseryEngine::deserializeSafe(serializedResponse, response) == false)
+    {
+      socket.close();
+      failure.assign("DNS teardown response decode failed"_ctv);
+      return false;
+    }
+    socket.close();
+    if (response.success == false)
+    {
+      failure = response.failure.size() ? response.failure : String("DNS teardown failed"_ctv);
+      return false;
+    }
+
+    removedDNSRecords = uint32_t(response.leases.size());
     return true;
   }
 
@@ -5819,6 +6034,17 @@ private:
     explicit RemoveClusterHooks(Mothership *mothership)
         : mothership(mothership)
     {}
+
+    bool removeDNSBindings(const MothershipProdigyCluster& cluster, uint32_t& removed, String *failure = nullptr) override
+    {
+      String localFailure = {};
+      bool ok = mothership->removeClusterDNSBindings(cluster, removed, localFailure);
+      if (failure != nullptr)
+      {
+        *failure = localFailure;
+      }
+      return ok;
+    }
 
     bool stopTestCluster(const MothershipProdigyCluster& cluster, String *failure = nullptr) override
     {
@@ -6453,8 +6679,8 @@ private:
     return true;
   }
 
-  template <typename Payload>
-  bool requestTopicRoundTrip(MothershipTopic topic, const Payload& request, Payload& response, String& failure)
+  template <typename Request, typename Response>
+  bool requestTopicRoundTrip(MothershipTopic topic, const Request& request, Response& response, String& failure)
   {
     response = {};
     String topicName = {};
@@ -6474,7 +6700,7 @@ private:
     }
 
     String serializedRequest = {};
-    Payload requestCopy = request;
+    Request requestCopy = request;
     BitseryEngine::serialize(serializedRequest, requestCopy);
     Message::construct(socket.wBuffer, topic, serializedRequest);
 
@@ -7605,7 +7831,7 @@ private:
     if (MothershipTopic(response->topic) != MothershipTopic::pullClusterReport)
     {
       String failure = {};
-      failure.snprintf<"unexpected response topic {}"_ctv>(uint32_t(response->topic));
+      failure.snprintf<"unexpected response topic {itoa}"_ctv>(uint32_t(response->topic));
       failClusterReport(failure);
     }
 
@@ -9857,6 +10083,8 @@ private:
           bool routablePrefixUUIDWasSet = false;
           bool sourceWasSet = false;
           bool quicCidKeyRotationHoursWasSet = false;
+          WormholePublicTLSConfig publicTLS = {};
+          bool publicTLSEnabled = false;
 
           for (auto item : subfield.get_object())
           {
@@ -10065,6 +10293,15 @@ private:
 
               wormhole.hasDNSConfig = true;
             }
+            else if (key.equal("publicTLS"_ctv))
+            {
+              String failure = {};
+              if (mothershipParseWormholePublicTLSConfig(item.value, publicTLS, publicTLSEnabled, &failure) == false)
+              {
+                basics_log("%s\n", failure.c_str());
+                exit(EXIT_FAILURE);
+              }
+            }
             else
             {
               basics_log("wormhole invalid field\n");
@@ -10145,6 +10382,34 @@ private:
               basics_log("wormhole.tlsResumption.enabled requires TCP or QUIC-over-UDP wormhole\n");
               exit(EXIT_FAILURE);
             }
+          }
+          if (publicTLSEnabled)
+          {
+            if (wormhole.name.size() == 0)
+            {
+              basics_log("wormhole.name required when wormhole.publicTLS.enabled\n");
+              exit(EXIT_FAILURE);
+            }
+            if (wormhole.hasDNSConfig == false)
+            {
+              basics_log("wormhole.publicTLS requires wormhole.dns\n");
+              exit(EXIT_FAILURE);
+            }
+            if (publicTLS.identityName.size() == 0)
+            {
+              publicTLS.identityName.snprintf<"{}-public"_ctv>(wormhole.name);
+            }
+            if (publicTLS.domains.size() == 0 && wormhole.dns.name.size() > 0)
+            {
+              publicTLS.domains.push_back(wormhole.dns.name);
+            }
+            if (publicTLS.domains.size() == 0 && wormhole.dns.bindingName.size() == 0)
+            {
+              basics_log("wormhole.publicTLS requires domains, wormhole.dns.name, or wormhole.dns.bindingName\n");
+              exit(EXIT_FAILURE);
+            }
+            publicTLS.wormholeName = wormhole.name;
+            plan.publicTLS.push_back(std::move(publicTLS));
           }
         }
       }
@@ -11054,7 +11319,10 @@ private:
             {
               if (responseMessage.size() > 0)
               {
-                basics_log("%s\n", responseMessage.c_str());
+                String message = {};
+                message.assign(responseMessage);
+                message.addNullTerminator();
+                basics_log("%s\n", message.c_str());
               }
               basics_log("SpinApplicationResponseCode::invalidPlan\n");
               break;
@@ -11118,7 +11386,10 @@ private:
 
               if (message.size() > 0)
               {
-                basics_log("%s\n", message.c_str());
+                String owned = {};
+                owned.assign(message);
+                owned.addNullTerminator();
+                basics_log("%s\n", owned.c_str());
               }
               break;
             }
@@ -11132,7 +11403,10 @@ private:
               }
               if (message.size() > 0)
               {
-                basics_log("%s\n", message.c_str());
+                String owned = {};
+                owned.assign(message);
+                owned.addNullTerminator();
+                basics_log("%s\n", owned.c_str());
               }
               exit(EXIT_FAILURE);
             }
@@ -11151,7 +11425,10 @@ private:
               }
               if (message.size() > 0)
               {
-                basics_log("%s\n", message.c_str());
+                String owned = {};
+                owned.assign(message);
+                owned.addNullTerminator();
+                basics_log("%s\n", owned.c_str());
               }
               exit(EXIT_FAILURE);
             }
@@ -11364,7 +11641,7 @@ private:
             return false;
           }
           String metadataKey = {};
-          metadataKey.setInvariant(metadataField.key.data(), metadataField.key.size());
+          metadataKey.assign(metadataField.key.data(), metadataField.key.size());
           if (metadataKey.size() == 0)
           {
             basics_log("%s.metadata contains empty key\n", context);
@@ -11790,18 +12067,74 @@ private:
     }
   }
 
+  static bool resolveJSONArgument(const char *operation, const char *arg, String& json)
+  {
+    json.clear();
+    if (arg == nullptr)
+    {
+      basics_log("%s json argument required\n", operation);
+      return false;
+    }
+
+    if (std::strcmp(arg, "-") == 0)
+    {
+      uint8_t buffer[8192];
+      for (;;)
+      {
+        ssize_t n = ::read(STDIN_FILENO, buffer, sizeof(buffer));
+        if (n > 0)
+        {
+          json.append(buffer, uint64_t(n));
+          continue;
+        }
+        if (n == 0)
+        {
+          return true;
+        }
+        if (errno == EINTR)
+        {
+          continue;
+        }
+        basics_log("%s failed to read json from stdin\n", operation);
+        return false;
+      }
+    }
+
+    if (arg[0] == '@')
+    {
+      if (arg[1] == '\0')
+      {
+        basics_log("%s @path is empty\n", operation);
+        return false;
+      }
+      Filesystem::openReadAtClose(-1, String(arg + 1), json);
+      if (json.size() == 0)
+      {
+        basics_log("%s failed to read json file\n", operation);
+        return false;
+      }
+      return true;
+    }
+
+    json.append(arg);
+    return true;
+  }
+
   void runCreateProviderCredential(int argc, char *argv[])
   {
     if (argc < 1)
     {
-      basics_log("too few arguments. ex: createProviderCredential [json]\n");
+      basics_log("too few arguments. ex: createProviderCredential [json|-|@path]\n");
       exit(EXIT_FAILURE);
     }
 
     MothershipProviderCredential request = {};
 
     String json;
-    json.append(argv[0]);
+    if (resolveJSONArgument("createProviderCredential", argv[0], json) == false)
+    {
+      exit(EXIT_FAILURE);
+    }
     json.need(simdjson::SIMDJSON_PADDING);
 
     simdjson::dom::parser parser;
@@ -13101,7 +13434,7 @@ private:
   {
     if (argc < 1)
     {
-      basics_log("too few arguments. ex: createCluster [json]\n");
+      basics_log("too few arguments. ex: createCluster [json|-|@path]\n");
       exit(EXIT_FAILURE);
     }
 
@@ -13112,7 +13445,10 @@ private:
     bool hasDNSProviderCredentialOverride = false;
 
     String json;
-    json.append(argv[0]);
+    if (resolveJSONArgument("createCluster", argv[0], json) == false)
+    {
+      exit(EXIT_FAILURE);
+    }
     json.need(simdjson::SIMDJSON_PADDING);
 
     simdjson::dom::parser parser;
@@ -13262,6 +13598,13 @@ private:
         }
 
         hasDNSProviderCredentialOverride = true;
+      }
+      else if (key.equal("acme"_ctv))
+      {
+        if (parseClusterACMEConfigJSON(field.value, request.acme, "createCluster.acme") == false)
+        {
+          exit(EXIT_FAILURE);
+        }
       }
       else if (key.equal("providerScope"_ctv))
       {
@@ -13599,6 +13942,15 @@ private:
           exit(EXIT_FAILURE);
         }
       }
+      else if (key.equal("resourceReservation"_ctv))
+      {
+        String failure = {};
+        if (mothershipParseResourceReservationValue(field.value, request.machineReservedResources, &failure, "createCluster.resourceReservation"_ctv) == false)
+        {
+          basics_log("%s\n", failure.c_str());
+          exit(EXIT_FAILURE);
+        }
+      }
       else if (key.equal("osUpdatePolicies"_ctv))
       {
         if (parseOperatingSystemUpdatePolicyArrayJSON(field.value, request.osUpdatePolicies, "createCluster.osUpdatePolicies") == false)
@@ -13734,6 +14086,12 @@ private:
     }
 
     if (inferClusterMachineSchemaCpuCapabilities(request, credentialPtr, failure) == false)
+    {
+      basics_log("createCluster success=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
+      exit(EXIT_FAILURE);
+    }
+
+    if (preflightClusterProviderCreate(request, credentialPtr, failure) == false)
     {
       basics_log("createCluster success=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
       exit(EXIT_FAILURE);
@@ -14025,8 +14383,9 @@ private:
       }
     }
 
-    basics_log("removeCluster success=1 removed=1 identity=%s wipedLocalMachine=%u wipedAdoptedMachines=%u destroyedCreatedCloudMachines=%u\n",
+    basics_log("removeCluster success=1 removed=1 identity=%s removedDNSRecords=%u wipedLocalMachine=%u wipedAdoptedMachines=%u destroyedCreatedCloudMachines=%u\n",
                name.c_str(),
+               unsigned(summary.removedDNSRecords),
                unsigned(summary.stoppedLocalMachine),
                unsigned(summary.wipedAdoptedMachines),
                unsigned(summary.destroyedCreatedCloudMachines));
@@ -14102,8 +14461,36 @@ private:
         exit(EXIT_FAILURE);
       }
 
-      basics_log("updateProdigy dispatched: stage=%s bytes=%u path=%s sha256=%s\n",
-                 argv[0], bundleSize, bundlePath.c_str(), actualBundleDigest.c_str());
+      Message *responseMessage = socket.recvExpectedTopic(MothershipTopic::updateProdigy, 512);
+      if (responseMessage == nullptr)
+      {
+        String failureDetail = socket.ioFailureDetail();
+        basics_log("updateProdigy success=0 failure=%s\n",
+                   failureDetail.size() ? failureDetail.c_str() : "timed out waiting for updateProdigy response");
+        socket.close();
+        exit(EXIT_FAILURE);
+      }
+
+      String serializedResponse = {};
+      uint8_t *responseArgs = responseMessage->args;
+      Message::extractToStringView(responseArgs, serializedResponse);
+      MothershipResponse response = {};
+      if (BitseryEngine::deserializeSafe(serializedResponse, response) == false)
+      {
+        basics_log("updateProdigy success=0 failure=invalid response payload\n");
+        socket.close();
+        exit(EXIT_FAILURE);
+      }
+      if (response.success == false)
+      {
+        basics_log("updateProdigy success=0 failure=%s\n",
+                   response.failure.size() ? response.failure.c_str() : "remote bundle staging failed");
+        socket.close();
+        exit(EXIT_FAILURE);
+      }
+
+      basics_log("updateProdigy success=1 staged=1 bytes=%u path=%s sha256=%s\n",
+                 bundleSize, bundlePath.c_str(), actualBundleDigest.c_str());
       socket.close();
     }
     else
@@ -15185,7 +15572,6 @@ private:
     request.scheme = 0; // p256
     request.mode = 0;
     request.defaultLeafValidityDays = 15;
-    request.renewLeadPercent = 10;
 
     String json;
     json.append(argv[1]);
@@ -15285,16 +15671,6 @@ private:
           exit(EXIT_FAILURE);
         }
         request.defaultLeafValidityDays = uint32_t(value);
-      }
-      else if (key.equal("renewLeadPercent"_ctv))
-      {
-        int64_t value = 0;
-        if (field.value.type() != simdjson::dom::element_type::INT64 || field.value.get(value) != simdjson::SUCCESS || value <= 0 || value >= 100)
-        {
-          basics_log("upsertTlsVaultFactory.renewLeadPercent invalid\n");
-          exit(EXIT_FAILURE);
-        }
-        request.renewLeadPercent = uint8_t(value);
       }
       else
       {
@@ -15796,6 +16172,67 @@ private:
     }
   }
 
+  void runACMEDNS01ChallengeHook(MothershipTopic topic, int argc, char *argv[])
+  {
+    const char *target = argc > 0 ? argv[0] : "local";
+    const char *operation = prodigyMothershipTopicName(topic);
+
+    AcmeDNS01ChallengeRequest request = {};
+    String failure = {};
+    if (prodigyBuildACMEDNS01ChallengeRequestFromEnv(request, &failure) == false)
+    {
+      basics_log("%s success=0 failure=%s\n", operation, failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    if (configureControlTarget(target) == false)
+    {
+      exit(EXIT_FAILURE);
+    }
+
+    AcmeDNS01ChallengeResponse response = {};
+    if (requestTopicRoundTrip(topic, request, response, failure) == false)
+    {
+      basics_log("%s success=0 failure=%s\n", operation, failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    basics_log("%s success=1 provider=%s zone=%s name=%s ttl=%u\n",
+               operation,
+               response.provider.c_str(),
+               response.zone.c_str(),
+               response.recordName.c_str(),
+               unsigned(response.ttl));
+  }
+
+  void runACMELineageImportHook(int argc, char *argv[])
+  {
+    const char *target = argc > 0 ? argv[0] : "local";
+
+    AcmeLineageImportRequest request = {};
+    String failure = {};
+    if (prodigyBuildACMELineageImportRequestFromEnv(request, &failure) == false)
+    {
+      basics_log("importACMELineage success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    if (configureControlTarget(target) == false)
+    {
+      exit(EXIT_FAILURE);
+    }
+
+    AcmeLineageImportResponse response = {};
+    if (requestTopicRoundTrip(MothershipTopic::importACMELineage, request, response, failure) == false)
+    {
+      basics_log("importACMELineage success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    basics_log("importACMELineage success=1 certName=%s generation=%llu nextRenewAtMs=%lld\n",
+               response.certName.c_str(),
+               (unsigned long long)response.generation,
+               (long long)response.nextRenewAtMs);
+  }
+
 #ifdef PRODIGY_MOTHERSHIP_TEST_ACCESS
 
 public:
@@ -15981,6 +16418,18 @@ public:
     {
       runMintClientTlsIdentity(argc, argv);
     }
+    else if (operation.equal("acme-present-dns-01"_ctv))
+    {
+      runACMEDNS01ChallengeHook(MothershipTopic::presentACMEDNS01Challenge, argc, argv);
+    }
+    else if (operation.equal("acme-cleanup-dns-01"_ctv))
+    {
+      runACMEDNS01ChallengeHook(MothershipTopic::cleanupACMEDNS01Challenge, argc, argv);
+    }
+    else if (operation.equal("acme-import-lineage"_ctv))
+    {
+      runACMELineageImportHook(argc, argv);
+    }
     else
     {
       basics_log("operation invalid\n");
@@ -15994,7 +16443,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, configureTestCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity]";
+        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, configureTestCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }
@@ -16006,7 +16455,7 @@ int main(int argc, char *argv[])
   {
     String message;
     message.append("the following operations are available:\n"_ctv);
-    message.append("createProviderCredential [json]\n");
+    message.append("createProviderCredential [json|-|@path]\n");
     message.append("\tcreates a named provider auth profile in Mothership's local credential registry\n");
     message.append("pullProviderCredential [name]\n");
     message.append("\tshows one provider auth profile without printing any secret material\n");
@@ -16027,9 +16476,9 @@ int main(int argc, char *argv[])
     message.append("recommendClusterForApplications [json]\n");
     message.append("\trecommends the cheapest AWS/GCP/Azure cluster for a required country and billingModel=hourly|spot, optionally under budget, across providers=[\"all\"] or an explicit provider set\n");
     message.append("\taccepts required minMachines plus optional ingressGBPerHour and egressGBPerHour, and now considers up to three distinct machine types per recommendation\n");
-    message.append("createCluster [json]\n");
+    message.append("createCluster [json|-|@path]\n");
     message.append("\tcreates a managed Prodigy cluster record, assigns a clusterUUID, and uses providerCredentialName or an inline providerCredentialOverride secret block\n");
-    message.append("\toptionally enables one cluster DNS provider with dnsProvider plus dnsProviderCredentialName or dnsProviderCredentialOverride; see prodigy/docs/dns-providers.md\n");
+    message.append("\toptionally enables one cluster DNS provider and ACME with dnsProvider plus acme.accountEmail/acme.termsAgreed; see prodigy/docs/dns-providers.md\n");
     message.append("\tfor persistent fake clusters, prefer deploymentMode=test instead of invoking prodigy_dev_netns_harness.sh directly\n");
     message.append("configureTestCluster [workspaceRoot] [machineCount] [nBrains] [brainBootstrapFamily] [enableFakeIpv4Boundary:0|1] [interContainerMTU] [datacenterFragment] [autoscaleIntervalSeconds] [schema] [kind] [nLogicalCores] [nMemoryMB] [nStorageMB]\n");
     message.append("\tvalidates a disposable test-cluster config, derives BrainConfig, and sends one configure request to the synthesized test control socket without persisting cluster state\n");
@@ -16081,6 +16530,12 @@ int main(int argc, char *argv[])
     message.append("\tcreates/updates API credential set for an application\n");
     message.append("mintClientTlsIdentity [target: local|clusterName|clusterUUID] [json]\n");
     message.append("\tmints a client TLS identity from an existing application vault factory\n");
+    message.append("acme-present-dns-01 [optional target]\n");
+    message.append("\tCertbot auth hook: presents the exact DNS-01 TXT value through the cluster DNS provider using Prodigy and Certbot environment\n");
+    message.append("acme-cleanup-dns-01 [optional target]\n");
+    message.append("\tCertbot cleanup hook: removes only the exact DNS-01 TXT value for the active challenge\n");
+    message.append("acme-import-lineage [optional target]\n");
+    message.append("\tCertbot deploy hook: requests renewed lineage import into Prodigy\n");
     if (message.size() > 0)
     {
       std::fwrite(message.c_str(), 1, message.size(), stdout);

@@ -39,6 +39,14 @@ public:
   {
   }
 
+  void credentialsRefresh(const CredentialDelta&) override
+  {
+    if (neuronHub != nullptr)
+    {
+      neuronHub->acknowledgeCredentialsRefresh();
+    }
+  }
+
   void endOfDynamicArgs(void) override
   {
     signalReadyOnce();

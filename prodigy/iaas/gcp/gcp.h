@@ -3571,6 +3571,7 @@ private:
     prodigyAppendEscapedJSONStringLiteral(body, accessConfigName);
     body.append(",\"type\":\"ONE_TO_ONE_NAT\",\"natIP\":"_ctv);
     prodigyAppendEscapedJSONStringLiteral(body, publicAddress);
+    body.append(",\"networkTier\":\"PREMIUM\""_ctv);
     body.append("}"_ctv);
 
     String response = {};
@@ -3912,6 +3913,83 @@ private:
     return waitForElasticRegionOperation(operationName, error);
   }
 
+  bool testIamPermissions(const String& url, const char *const *permissions, uint32_t count, const char *label, String& error)
+  {
+    String body = {};
+    body.append("{\"permissions\":["_ctv);
+    for (uint32_t index = 0; index < count; ++index)
+    {
+      if (index > 0)
+      {
+        body.append(',');
+      }
+      String permission = {};
+      permission.assign(permissions[index]);
+      prodigyAppendEscapedJSONStringLiteral(body, permission);
+    }
+    body.append("]}"_ctv);
+
+    String response = {};
+    String transportFailure = {};
+    long httpStatus = 0;
+    if (sendElasticComputeRequest("POST", url, &body, response, &httpStatus, transportFailure) == false)
+    {
+      if (parseAPIErrorMessage(response, error) == false)
+      {
+        error = transportFailure.size() > 0 ? transportFailure : "gcp iam permissions test failed"_ctv;
+      }
+      return false;
+    }
+
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc = {};
+    if (parser.parse(response.c_str(), response.size()).get(doc))
+    {
+      error.assign("gcp iam permissions response parse failed"_ctv);
+      return false;
+    }
+
+    String missing = {};
+    for (uint32_t index = 0; index < count; ++index)
+    {
+      bool found = false;
+      if (auto returned = doc["permissions"]; returned.is_array())
+      {
+        for (auto entry : returned.get_array())
+        {
+          std::string_view text = {};
+          if (entry.get(text) == simdjson::SUCCESS && text == permissions[index])
+          {
+            found = true;
+            break;
+          }
+        }
+      }
+
+      if (found == false)
+      {
+        if (missing.size() == 0)
+        {
+          missing.snprintf<"gcp {} missing permissions: "_ctv>(String(label));
+        }
+        else
+        {
+          missing.append(", "_ctv);
+        }
+        missing.append(String(permissions[index]));
+      }
+    }
+
+    if (missing.size() > 0)
+    {
+      error = missing;
+      return false;
+    }
+
+    error.clear();
+    return true;
+  }
+
 public:
 
   void boot(void) override {}
@@ -3928,6 +4006,97 @@ public:
 
   bool supportsAuthoritativeMachineSchemaCpuCapabilityInference(void) const override
   {
+    return true;
+  }
+
+  bool preflightClusterCreate(const BrainIaaSClusterCreatePreflight& preflight, String& error) override
+  {
+    error.clear();
+
+    const MachineConfig *config = nullptr;
+    for (const MachineConfig& candidate : preflight.configs)
+    {
+      if (candidate.kind == MachineConfig::MachineKind::vm && candidate.vmImageURI.size() > 0 && candidate.providerMachineType.size() > 0)
+      {
+        config = &candidate;
+        break;
+      }
+    }
+
+    if (config == nullptr)
+    {
+      error.assign("gcp preflight requires a vm machine schema with vmImageURI and providerMachineType"_ctv);
+      return false;
+    }
+
+    if (preflight.gcpServiceAccountEmail.size() == 0)
+    {
+      error.assign("gcp preflight requires gcp.serviceAccountEmail"_ctv);
+      return false;
+    }
+
+    if (ensureProjectZone() == false || ensureToken(&error) == false)
+    {
+      if (error.size() == 0)
+      {
+        error.assign("gcp auth failed"_ctv);
+      }
+      return false;
+    }
+
+    constexpr static const char *projectPermissions[] = {
+        "compute.disks.create",
+        "compute.disks.delete",
+        "compute.instanceTemplates.create",
+        "compute.instanceTemplates.delete",
+        "compute.instanceTemplates.get",
+        "compute.instanceTemplates.useReadOnly",
+        "compute.instances.create",
+        "compute.instances.delete",
+        "compute.instances.get",
+        "compute.instances.list",
+        "compute.instances.setLabels",
+        "compute.instances.setMetadata",
+        "compute.instances.setServiceAccount",
+        "compute.machineTypes.get",
+        "compute.networks.get",
+        "compute.subnetworks.get",
+        "compute.subnetworks.use",
+        "compute.subnetworks.useExternalIp",
+        "compute.zones.get",
+    };
+    String projectURL = {};
+    projectURL.snprintf<"https://cloudresourcemanager.googleapis.com/v1/projects/{}:testIamPermissions"_ctv>(projectId);
+    String projectError = {};
+    bool projectOK = testIamPermissions(projectURL, projectPermissions, uint32_t(sizeof(projectPermissions) / sizeof(projectPermissions[0])), "project", projectError);
+
+    constexpr static const char *serviceAccountPermissions[] = {"iam.serviceAccounts.actAs"};
+    String serviceAccountURL = {};
+    serviceAccountURL.snprintf<"https://iam.googleapis.com/v1/projects/{}/serviceAccounts/"_ctv>(projectId);
+    appendPercentEncoded(serviceAccountURL, preflight.gcpServiceAccountEmail);
+    serviceAccountURL.append(":testIamPermissions"_ctv);
+    String serviceAccountError = {};
+    bool serviceAccountOK = testIamPermissions(serviceAccountURL, serviceAccountPermissions, uint32_t(sizeof(serviceAccountPermissions) / sizeof(serviceAccountPermissions[0])), "service account", serviceAccountError);
+
+    if (projectOK == false || serviceAccountOK == false)
+    {
+      error.clear();
+      if (projectOK == false)
+      {
+        error.append(projectError);
+      }
+      if (serviceAccountOK == false)
+      {
+        if (error.size() > 0)
+        {
+          error.append("; "_ctv);
+        }
+        error.append(serviceAccountError);
+      }
+      return false;
+    }
+
+    error.clear();
     return true;
   }
 
@@ -5104,12 +5273,14 @@ public:
                                     const String& requestedAddress,
                                     const String& providerPool,
                                     IPPrefix& assignedPrefix,
+                                    IPPrefix& deliveryPrefix,
                                     String& allocationID,
                                     String& associationID,
                                     bool& releaseOnRemove,
                                     String& error) override
   {
     assignedPrefix = {};
+    deliveryPrefix = {};
     allocationID.clear();
     associationID.clear();
     releaseOnRemove = false;
@@ -5265,6 +5436,7 @@ public:
     }
     assignedPrefix.network = assignedAddress;
     assignedPrefix.cidr = assignedAddress.is6 ? 128 : 32;
+    (void)prodigyMachinePrivateAddressHostPrefix(*machine, family, deliveryPrefix);
 
     return true;
   }

@@ -3015,8 +3015,8 @@ setup_fake_ipv4_boundary()
       return 1
    fi
 
-   egress_prog_pin="${fake_ipv4_boundary_pin_dir}/fake_ipv4_boundary_nat_egress"
-   ingress_prog_pin="${fake_ipv4_boundary_pin_dir}/fake_ipv4_boundary_nat_ingress"
+   egress_prog_pin="${fake_ipv4_boundary_pin_dir}/fake_nat_eg"
+   ingress_prog_pin="${fake_ipv4_boundary_pin_dir}/fake_nat_in"
    if [[ ! -f "${egress_prog_pin}" || ! -f "${ingress_prog_pin}" ]]
    then
       echo "FAIL: fake ipv4 boundary eBPF pinned programs missing under ${fake_ipv4_boundary_pin_dir}"
@@ -3236,7 +3236,7 @@ find_map_id_for_prog()
 
       # BPF map names are capped at 15 bytes by the kernel, so bpftool can
       # report a truncated map_name (for example "local_container" for
-      # "local_container_subnet_map"). Accept exact and prefix matches.
+      # "lc_subnet"). Accept exact and prefix matches.
       if [[ "${map_name}" == "${target_name}" || "${target_name}" == "${map_name}"* || "${map_name}" == "${target_name}"* ]]
       then
          echo "${map_id}"
@@ -3286,7 +3286,7 @@ configure_dev_switchboard_balancer_on_gateway()
    local gateway_ns="${child_names[$gateway_idx]}"
 
    local already_attached=0
-   if ip netns exec "${gateway_ns}" bpftool net 2>/dev/null | rg -q 'xdp[[:space:]].*balancer_ingress'
+   if ip netns exec "${gateway_ns}" bpftool net 2>/dev/null | rg -q 'xdp[[:space:]].*bal_ingress'
    then
       already_attached=1
    fi
@@ -3364,9 +3364,9 @@ configure_dev_switchboard_balancer_on_gateway()
    local local_subnet_map_id=""
    local mac_map_id=""
    local gateway_mac_map_id=""
-   local_subnet_map_id="$(find_map_id_for_prog "${gateway_ns}" "${prog_id}" "local_container_subnet_map" || true)"
+   local_subnet_map_id="$(find_map_id_for_prog "${gateway_ns}" "${prog_id}" "lc_subnet" || true)"
    mac_map_id="$(find_map_id_for_prog "${gateway_ns}" "${prog_id}" "mac_map" || true)"
-   gateway_mac_map_id="$(find_map_id_for_prog "${gateway_ns}" "${prog_id}" "gateway_mac_map" || true)"
+   gateway_mac_map_id="$(find_map_id_for_prog "${gateway_ns}" "${prog_id}" "gw_mac_map" || true)"
 
    if [[ -z "${local_subnet_map_id}" || -z "${mac_map_id}" || -z "${gateway_mac_map_id}" ]]
    then
@@ -3425,7 +3425,7 @@ configure_dev_switchboard_balancer_on_gateway()
    host_ingress_prog_id="$(
       ip netns exec "${gateway_ns}" bpftool net 2>/dev/null \
          | awk '
-            /tcx\/ingress/ && /host_ingress_router/ {
+            /tcx\/ingress/ && /host_ingress/ {
                for (i = 1; i <= NF; ++i) {
                   if ($i == "prog_id" && (i + 1) <= NF) {
                      print $(i + 1);
@@ -3441,7 +3441,7 @@ configure_dev_switchboard_balancer_on_gateway()
       host_ingress_prog_id="$(
          ip netns exec "${gateway_ns}" bpftool prog show 2>/dev/null \
             | awk '
-               /name host_ingress_router/ {
+               /name host_ingress/ {
                   gsub(":", "", $1);
                   print $1;
                   exit;
@@ -3452,7 +3452,7 @@ configure_dev_switchboard_balancer_on_gateway()
 
    if [[ -n "${host_ingress_prog_id}" ]]
    then
-      host_local_subnet_map_id="$(find_map_id_for_prog "${gateway_ns}" "${host_ingress_prog_id}" "local_container_subnet_map" || true)"
+      host_local_subnet_map_id="$(find_map_id_for_prog "${gateway_ns}" "${host_ingress_prog_id}" "lc_subnet" || true)"
       if [[ -n "${host_local_subnet_map_id}" ]]
       then
          host_local_subnet_lookup="$(
@@ -3498,7 +3498,7 @@ configure_dev_switchboard_balancer_on_gateway()
       printf -v machine_hex '%02x' "${machine_fragment_fallback}"
       local_subnet_hex="${dpfx_hex} 00 00 ${machine_hex}"
       lookup_preview="$(printf '%s' "${host_local_subnet_lookup}" | tr '\n' ' ' | tr -d '"' | sed 's/[[:space:]]\+/ /g' | cut -c1-160)"
-      echo "WARN: unable to read host_ingress local_container_subnet_map in ${gateway_ns}; host_prog=${host_ingress_prog_id:-none} host_map=${host_local_subnet_map_id:-none} lookup=${lookup_preview:-none} fallback subnet=${local_subnet_hex}"
+      echo "WARN: unable to read host_ingress lc_subnet in ${gateway_ns}; host_prog=${host_ingress_prog_id:-none} host_map=${host_local_subnet_map_id:-none} lookup=${lookup_preview:-none} fallback subnet=${local_subnet_hex}"
    fi
 
    if [[ -n "${switchboard_balancer_machine_fragment_override}" ]]
@@ -3521,17 +3521,17 @@ configure_dev_switchboard_balancer_on_gateway()
    local local_subnet_update_err=""
    if ! local_subnet_update_err="$(ip netns exec "${gateway_ns}" bpftool map update id "${local_subnet_map_id}" key hex ${key_hex} value hex ${local_subnet_hex} 2>&1)"
    then
-      echo "WARN: unable to update local_container_subnet_map in ${gateway_ns} err='${local_subnet_update_err}'"
+      echo "WARN: unable to update lc_subnet in ${gateway_ns} err='${local_subnet_update_err}'"
       return 0
    fi
 
-   # Keep all host_ingress_router local-subnet maps aligned with balancer so
+   # Keep all host_ingress local-subnet maps aligned with balancer so
    # local-pass encapsulated packets are recognized and redirected into netkit.
    local host_prog_candidate=""
    for host_prog_candidate in $(
       ip netns exec "${gateway_ns}" bpftool prog show 2>/dev/null \
          | awk '
-            /name host_ingress_router/ {
+            /name host_ingress/ {
                gsub(":", "", $1);
                print $1;
             }
@@ -3544,7 +3544,7 @@ configure_dev_switchboard_balancer_on_gateway()
       fi
 
       local host_candidate_map_id=""
-      host_candidate_map_id="$(find_map_id_for_prog "${gateway_ns}" "${host_prog_candidate}" "local_container_subnet_map" || true)"
+      host_candidate_map_id="$(find_map_id_for_prog "${gateway_ns}" "${host_prog_candidate}" "lc_subnet" || true)"
       if [[ -z "${host_candidate_map_id}" ]]
       then
          continue
@@ -3553,7 +3553,7 @@ configure_dev_switchboard_balancer_on_gateway()
       local host_candidate_update_err=""
       if ! host_candidate_update_err="$(ip netns exec "${gateway_ns}" bpftool map update id "${host_candidate_map_id}" key hex ${key_hex} value hex ${local_subnet_hex} 2>&1)"
       then
-         echo "WARN: unable to sync host_ingress local_container_subnet_map in ${gateway_ns} prog=${host_prog_candidate} map=${host_candidate_map_id} err='${host_candidate_update_err}'"
+         echo "WARN: unable to sync host_ingress lc_subnet in ${gateway_ns} prog=${host_prog_candidate} map=${host_candidate_map_id} err='${host_candidate_update_err}'"
       fi
    done
 
@@ -3567,7 +3567,7 @@ configure_dev_switchboard_balancer_on_gateway()
    local gateway_mac_update_err=""
    if ! gateway_mac_update_err="$(ip netns exec "${gateway_ns}" bpftool map update id "${gateway_mac_map_id}" key hex ${key_hex} value hex ${gateway_mac_hex} 2>&1)"
    then
-      echo "WARN: unable to update gateway_mac_map in ${gateway_ns} err='${gateway_mac_update_err}'"
+      echo "WARN: unable to update gw_mac_map in ${gateway_ns} err='${gateway_mac_update_err}'"
       return 0
    fi
 
@@ -3591,7 +3591,7 @@ attach_dev_switchboard_balancer_to_namespace()
       return 1
    fi
 
-   if ip netns exec "${target_ns}" bpftool net 2>/dev/null | rg -q 'xdp[[:space:]].*balancer_ingress'
+   if ip netns exec "${target_ns}" bpftool net 2>/dev/null | rg -q 'xdp[[:space:]].*bal_ingress'
    then
       echo "SWITCHBOARD_BALANCER_PREATTACHED existing ns=${target_ns} if=bond0"
       return 0
@@ -3797,20 +3797,20 @@ dump_fake_ipv4_path_diagnostics()
    echo "DEV_FAKE_ROUTE_DIAG balancer_prog_id=${balancer_prog_id:-none}"
    if [[ -n "${balancer_prog_id}" ]]
    then
-      dev_stats_map_id="$(find_map_id_for_prog "${gateway_ns}" "${balancer_prog_id}" "dev_fake_route_stats" || true)"
-      balancer_local_subnet_map_id="$(find_map_id_for_prog "${gateway_ns}" "${balancer_prog_id}" "local_container_subnet_map" || true)"
+      dev_stats_map_id="$(find_map_id_for_prog "${gateway_ns}" "${balancer_prog_id}" "dev_rt_stats" || true)"
+      balancer_local_subnet_map_id="$(find_map_id_for_prog "${gateway_ns}" "${balancer_prog_id}" "lc_subnet" || true)"
 
       echo "DEV_FAKE_ROUTE_DIAG balancer_map_ids dev_stats=${dev_stats_map_id:-none} local_subnet=${balancer_local_subnet_map_id:-none}"
 
       if [[ -n "${dev_stats_map_id}" ]]
       then
-         echo "--- DEV_FAKE_ROUTE_DIAG balancer dev_fake_route_stats dump ---"
+         echo "--- DEV_FAKE_ROUTE_DIAG balancer dev_rt_stats dump ---"
          ip netns exec "${gateway_ns}" bpftool map dump id "${dev_stats_map_id}" 2>/dev/null || true
       fi
 
       if [[ -n "${balancer_local_subnet_map_id}" ]]
       then
-         echo "--- DEV_FAKE_ROUTE_DIAG balancer local_container_subnet_map[0] ---"
+         echo "--- DEV_FAKE_ROUTE_DIAG balancer lc_subnet[0] ---"
          ip netns exec "${gateway_ns}" bpftool map lookup id "${balancer_local_subnet_map_id}" key hex ${key_hex} 2>/dev/null || true
       fi
    fi
@@ -3818,7 +3818,7 @@ dump_fake_ipv4_path_diagnostics()
    host_ingress_prog_id="$(
       ip netns exec "${gateway_ns}" bpftool net 2>/dev/null \
          | awk '
-            /tcx\/ingress/ && /host_ingress_router/ {
+            /tcx\/ingress/ && /host_ingress/ {
                for (i = 1; i <= NF; ++i) {
                   if ($i == "prog_id" && (i + 1) <= NF) {
                      print $(i + 1);
@@ -3834,7 +3834,7 @@ dump_fake_ipv4_path_diagnostics()
       host_ingress_prog_id="$(
          ip netns exec "${gateway_ns}" bpftool prog show 2>/dev/null \
             | awk '
-               /name host_ingress_router/ {
+               /name host_ingress/ {
                   gsub(":", "", $1);
                   print $1;
                   exit;
@@ -3846,20 +3846,20 @@ dump_fake_ipv4_path_diagnostics()
    echo "DEV_FAKE_ROUTE_DIAG host_ingress_prog_id=${host_ingress_prog_id:-none}"
    if [[ -n "${host_ingress_prog_id}" ]]
    then
-      host_local_subnet_map_id="$(find_map_id_for_prog "${gateway_ns}" "${host_ingress_prog_id}" "local_container_subnet_map" || true)"
+      host_local_subnet_map_id="$(find_map_id_for_prog "${gateway_ns}" "${host_ingress_prog_id}" "lc_subnet" || true)"
       local host_dev_stats_map_id=""
-      host_dev_stats_map_id="$(find_map_id_for_prog "${gateway_ns}" "${host_ingress_prog_id}" "dev_host_route_stats" || true)"
+      host_dev_stats_map_id="$(find_map_id_for_prog "${gateway_ns}" "${host_ingress_prog_id}" "dev_host_stats" || true)"
       echo "DEV_FAKE_ROUTE_DIAG host_ingress_local_subnet_map_id=${host_local_subnet_map_id:-none}"
       echo "DEV_FAKE_ROUTE_DIAG host_ingress_dev_host_route_stats_map_id=${host_dev_stats_map_id:-none}"
       if [[ -n "${host_local_subnet_map_id}" ]]
       then
-         echo "--- DEV_FAKE_ROUTE_DIAG host_ingress local_container_subnet_map[0] ---"
+         echo "--- DEV_FAKE_ROUTE_DIAG host_ingress lc_subnet[0] ---"
          ip netns exec "${gateway_ns}" bpftool map lookup id "${host_local_subnet_map_id}" key hex ${key_hex} 2>/dev/null || true
       fi
 
       if [[ -n "${host_dev_stats_map_id}" ]]
       then
-         echo "--- DEV_FAKE_ROUTE_DIAG host_ingress dev_host_route_stats dump ---"
+         echo "--- DEV_FAKE_ROUTE_DIAG host_ingress dev_host_stats dump ---"
          ip netns exec "${gateway_ns}" bpftool map dump id "${host_dev_stats_map_id}" 2>/dev/null || true
       fi
    fi
@@ -3868,7 +3868,7 @@ dump_fake_ipv4_path_diagnostics()
    then
       local host_counter_map_id=""
       local host_packet_map_id=""
-      host_counter_map_id="$(find_map_id_for_prog "${gateway_ns}" "${host_ingress_prog_id}" "packet_counter_map" || true)"
+      host_counter_map_id="$(find_map_id_for_prog "${gateway_ns}" "${host_ingress_prog_id}" "pkt_counter" || true)"
       host_packet_map_id="$(find_map_id_for_prog "${gateway_ns}" "${host_ingress_prog_id}" "packet_map" || true)"
       if [[ -n "${host_counter_map_id}" ]]
       then
@@ -3916,7 +3916,7 @@ dump_fake_ipv4_path_diagnostics()
          fi
 
          case "${container_prog_name}" in
-            container_egress_router|container_ingress_router)
+            ct_egress|ct_ingress)
                ;;
             *)
                continue
@@ -3925,8 +3925,8 @@ dump_fake_ipv4_path_diagnostics()
 
          local policy_map_id=""
          local stats_map_id=""
-         policy_map_id="$(find_map_id_for_prog "${container_ns}" "${attached_prog_id}" "container_network_policy_map" || true)"
-         stats_map_id="$(find_map_id_for_prog "${container_ns}" "${attached_prog_id}" "container_router_stats_map" || true)"
+         policy_map_id="$(find_map_id_for_prog "${container_ns}" "${attached_prog_id}" "ct_net_policy" || true)"
+         stats_map_id="$(find_map_id_for_prog "${container_ns}" "${attached_prog_id}" "ct_stats" || true)"
 
          echo "DEV_FAKE_ROUTE_DIAG ns=${container_ns} dev=${dev_name} attach=${attach_type} container_prog id=${attached_prog_id} name=${container_prog_name:-unknown} policy_map=${policy_map_id:-none} stats_map=${stats_map_id:-none}"
 

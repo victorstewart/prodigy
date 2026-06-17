@@ -460,13 +460,13 @@ static void testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntri
   container.peer_program = &peerProgram;
   neuron.registerContainerForTest(&container);
 
-  if (suite.require(peerProgram.load(objectPath, "container_egress_router"_ctv), "container_peer_overlay_sync_loads_egress_router"))
+  if (suite.require(peerProgram.load(objectPath, "ct_egress"_ctv), "container_peer_overlay_sync_loads_egress_router"))
   {
     neuron.seedOverlayRoutingConfigForTest(config);
     neuron.syncOverlayRoutingProgramsForTest();
 
     switchboard_overlay_config overlayConfig = {};
-    peerProgram.getArrayElement("overlay_config_map"_ctv, 0, overlayConfig);
+    peerProgram.getArrayElement("ovl_config"_ctv, 0, overlayConfig);
     suite.expect(overlayConfig.container_network_enabled == 1, "container_peer_overlay_sync_sets_overlay_enabled");
 
     Vector<switchboard_overlay_prefix4_key> desiredPrefixes4 = {};
@@ -474,16 +474,16 @@ static void testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntri
     switchboardBuildOverlayPrefixKeys(config.overlaySubnets, desiredPrefixes4, desiredPrefixes6);
 
     __u8 present = 0;
-    suite.expect(desiredPrefixes4.size() == 1 && lookupProgramMapElement(peerProgram, "overlay_routable_prefixes4"_ctv, desiredPrefixes4[0], present) && present == 1,
+    suite.expect(desiredPrefixes4.size() == 1 && lookupProgramMapElement(peerProgram, "ovl_pfx4"_ctv, desiredPrefixes4[0], present) && present == 1,
                  "container_peer_overlay_sync_populates_ipv4_prefix_map");
 
     present = 0;
-    suite.expect(desiredPrefixes6.size() == 1 && lookupProgramMapElement(peerProgram, "overlay_routable_prefixes6"_ctv, desiredPrefixes6[0], present) && present == 1,
+    suite.expect(desiredPrefixes6.size() == 1 && lookupProgramMapElement(peerProgram, "ovl_pfx6"_ctv, desiredPrefixes6[0], present) && present == 1,
                  "container_peer_overlay_sync_populates_ipv6_prefix_map");
 
     switchboard_overlay_machine_route routeValue = {};
     suite.expect(lookupProgramMapElement(peerProgram,
-                                         "overlay_machine_routes_full"_ctv,
+                                         "ovl_mach_full"_ctv,
                                          switchboardMakeOverlayMachineRouteKey(route2.machineFragment),
                                          routeValue),
                  "container_peer_overlay_sync_populates_full_route_map");
@@ -495,14 +495,14 @@ static void testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntri
     suite.expect(std::memcmp(routeValue.next_hop_mac, expectedRoute2MAC, sizeof(expectedRoute2MAC)) == 0, "container_peer_overlay_sync_preserves_route_direct_mac");
 
     suite.expect(lookupProgramMapElement(peerProgram,
-                                         "overlay_machine_routes_low8"_ctv,
+                                         "ovl_mach_low8"_ctv,
                                          switchboardMakeOverlayMachineRouteKey(route1.machineFragment & 0xFFu),
                                          routeValue),
                  "container_peer_overlay_sync_populates_unique_low8_route");
     suite.expect(routeValue.use_gateway_mac == 1, "container_peer_overlay_sync_preserves_gateway_route_flag");
     routeValue = {};
     suite.expect(lookupProgramMapElement(peerProgram,
-                                         "overlay_machine_routes_low8"_ctv,
+                                         "ovl_mach_low8"_ctv,
                                          switchboardMakeOverlayMachineRouteKey(route2.machineFragment & 0xFFu),
                                          routeValue) == false,
                  "container_peer_overlay_sync_drops_ambiguous_low8_route");
@@ -510,7 +510,7 @@ static void testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntri
     switchboard_overlay_hosted_ingress_route4 hostedIngressValue4 = {};
     switchboard_overlay_prefix4_key hostedIngressKey4 = switchboardMakeOverlayPrefix4Key(hostedIngress4.prefix);
     suite.expect(lookupProgramMapElement(peerProgram,
-                                         "overlay_hosted_ingress_routes4"_ctv,
+                                         "ovl_host4"_ctv,
                                          hostedIngressKey4,
                                          hostedIngressValue4),
                  "container_peer_overlay_sync_populates_ipv4_hosted_ingress_route_map");
@@ -520,7 +520,7 @@ static void testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntri
     switchboard_overlay_hosted_ingress_route6 hostedIngressValue6 = {};
     switchboard_overlay_prefix6_key hostedIngressKey6 = switchboardMakeOverlayPrefix6Key(hostedIngress6.prefix);
     suite.expect(lookupProgramMapElement(peerProgram,
-                                         "overlay_hosted_ingress_routes6"_ctv,
+                                         "ovl_host6"_ctv,
                                          hostedIngressKey6,
                                          hostedIngressValue6),
                  "container_peer_overlay_sync_populates_ipv6_hosted_ingress_route_map");
@@ -532,33 +532,33 @@ static void testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntri
     neuron.syncOverlayRoutingProgramsForTest();
 
     overlayConfig = {};
-    peerProgram.getArrayElement("overlay_config_map"_ctv, 0, overlayConfig);
+    peerProgram.getArrayElement("ovl_config"_ctv, 0, overlayConfig);
     suite.expect(overlayConfig.container_network_enabled == 0, "container_peer_overlay_sync_clears_overlay_enabled");
 
     present = 0;
-    suite.expect(lookupProgramMapElement(peerProgram, "overlay_routable_prefixes4"_ctv, desiredPrefixes4[0], present) == false, "container_peer_overlay_sync_removes_ipv4_prefix_map_entries");
+    suite.expect(lookupProgramMapElement(peerProgram, "ovl_pfx4"_ctv, desiredPrefixes4[0], present) == false, "container_peer_overlay_sync_removes_ipv4_prefix_map_entries");
     present = 0;
-    suite.expect(lookupProgramMapElement(peerProgram, "overlay_routable_prefixes6"_ctv, desiredPrefixes6[0], present) == false, "container_peer_overlay_sync_removes_ipv6_prefix_map_entries");
+    suite.expect(lookupProgramMapElement(peerProgram, "ovl_pfx6"_ctv, desiredPrefixes6[0], present) == false, "container_peer_overlay_sync_removes_ipv6_prefix_map_entries");
     routeValue = {};
     suite.expect(lookupProgramMapElement(peerProgram,
-                                         "overlay_machine_routes_full"_ctv,
+                                         "ovl_mach_full"_ctv,
                                          switchboardMakeOverlayMachineRouteKey(route2.machineFragment),
                                          routeValue) == false,
                  "container_peer_overlay_sync_removes_full_route_map_entries");
     suite.expect(lookupProgramMapElement(peerProgram,
-                                         "overlay_machine_routes_low8"_ctv,
+                                         "ovl_mach_low8"_ctv,
                                          switchboardMakeOverlayMachineRouteKey(route1.machineFragment & 0xFFu),
                                          routeValue) == false,
                  "container_peer_overlay_sync_removes_low8_route_map_entries");
     hostedIngressValue4 = {};
     suite.expect(lookupProgramMapElement(peerProgram,
-                                         "overlay_hosted_ingress_routes4"_ctv,
+                                         "ovl_host4"_ctv,
                                          hostedIngressKey4,
                                          hostedIngressValue4) == false,
                  "container_peer_overlay_sync_removes_ipv4_hosted_ingress_route_map_entries");
     hostedIngressValue6 = {};
     suite.expect(lookupProgramMapElement(peerProgram,
-                                         "overlay_hosted_ingress_routes6"_ctv,
+                                         "ovl_host6"_ctv,
                                          hostedIngressKey6,
                                          hostedIngressValue6) == false,
                  "container_peer_overlay_sync_removes_ipv6_hosted_ingress_route_map_entries");
@@ -577,7 +577,7 @@ static void testContainerPeerRuntimeSyncPopulatesAndClearsWormholeEgressBindings
   objectPath.append("/container.egress.router.ebpf.o"_ctv);
 
   BPFProgram peerProgram = {};
-  if (suite.require(peerProgram.load(objectPath, "container_egress_router"_ctv), "container_peer_runtime_sync_loads_egress_router"))
+  if (suite.require(peerProgram.load(objectPath, "ct_egress"_ctv), "container_peer_runtime_sync_loads_egress_router"))
   {
     SwitchboardWormholeEgressBindingEntry stale = {};
     stale.key = makeWormholeEgressKey(0xca, 0x01020305u, 9443, IPPROTO_UDP);
@@ -593,7 +593,7 @@ static void testContainerPeerRuntimeSyncPopulatesAndClearsWormholeEgressBindings
 
     switchboard_wormhole_egress_binding loadedBinding = {};
     suite.expect(lookupProgramMapElement(peerProgram,
-                                         "wormhole_egress_bindings"_ctv,
+                                         "wh_egress"_ctv,
                                          stale.key,
                                          loadedBinding),
                  "container_peer_runtime_sync_seeds_stale_binding");
@@ -612,14 +612,14 @@ static void testContainerPeerRuntimeSyncPopulatesAndClearsWormholeEgressBindings
 
     loadedBinding = {};
     suite.expect(lookupProgramMapElement(peerProgram,
-                                         "wormhole_egress_bindings"_ctv,
+                                         "wh_egress"_ctv,
                                          stale.key,
                                          loadedBinding) == false,
                  "container_peer_runtime_sync_removes_stale_binding");
 
     loadedBinding = {};
     suite.expect(lookupProgramMapElement(peerProgram,
-                                         "wormhole_egress_bindings"_ctv,
+                                         "wh_egress"_ctv,
                                          desired.key,
                                          loadedBinding),
                  "container_peer_runtime_sync_populates_desired_binding");
@@ -638,7 +638,7 @@ static void testContainerPeerRuntimeSyncPopulatesAndClearsWormholeEgressBindings
 
     loadedBinding = {};
     suite.expect(lookupProgramMapElement(peerProgram,
-                                         "wormhole_egress_bindings"_ctv,
+                                         "wh_egress"_ctv,
                                          desired.key,
                                          loadedBinding) == false,
                  "container_peer_runtime_sync_clears_removed_bindings");
@@ -654,7 +654,7 @@ static void testContainerPeerEgressRouterLoadsAfterWormholeSourceRewrite(TestSui
   objectPath.append("/container.egress.router.ebpf.o"_ctv);
 
   BPFProgram peerProgram = {};
-  suite.expect(peerProgram.load(objectPath, "container_egress_router"_ctv),
+  suite.expect(peerProgram.load(objectPath, "ct_egress"_ctv),
                "container_peer_egress_router_loads_after_wormhole_source_rewrite");
   peerProgram.close();
 }
@@ -666,14 +666,14 @@ static void testContainerPeerEgressRouterDropsPacketsOverConfiguredMTU(TestSuite
   objectPath.append("/container.egress.router.ebpf.o"_ctv);
 
   BPFProgram peerProgram = {};
-  suite.expect(peerProgram.load(objectPath, "container_egress_router"_ctv),
+  suite.expect(peerProgram.load(objectPath, "ct_egress"_ctv),
                "container_peer_egress_router_drop_over_mtu_loads_program");
 
   if (peerProgram.prog_fd >= 0)
   {
     container_network_policy networkPolicy = {};
     networkPolicy.interContainerMTU = 1280u;
-    peerProgram.setArrayElement("container_network_policy_map"_ctv, 0, networkPolicy);
+    peerProgram.setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
 
     Vector<uint8_t> payload = {};
     payload.resize(1300u);
@@ -705,7 +705,7 @@ static void testContainerPeerEgressRouterDropsPacketsOverConfiguredMTU(TestSuite
                  "container_peer_egress_router_drop_over_mtu_returns_drop");
 
     __u64 oversizeDrops = 0;
-    peerProgram.getArrayElement("container_router_stats_map"_ctv, 1, oversizeDrops);
+    peerProgram.getArrayElement("ct_stats"_ctv, 1, oversizeDrops);
     suite.expect(oversizeDrops == 1,
                  "container_peer_egress_router_drop_over_mtu_bumps_stat");
   }
@@ -806,7 +806,7 @@ static void testContainerPeerEgressRouterRewritesCrossMachineWormholeReplyForOve
   objectPath.append("/container.egress.router.ebpf.o"_ctv);
 
   BPFProgram peerProgram = {};
-  suite.expect(peerProgram.load(objectPath, "container_egress_router"_ctv),
+  suite.expect(peerProgram.load(objectPath, "ct_egress"_ctv),
                "container_peer_egress_router_cross_machine_wormhole_reply_loads_program");
 
   if (peerProgram.prog_fd >= 0)
@@ -816,10 +816,10 @@ static void testContainerPeerEgressRouterRewritesCrossMachineWormholeReplyForOve
     localSubnet.mpfx[0] = 0xf4;
     localSubnet.mpfx[1] = 0x54;
     localSubnet.mpfx[2] = 0xa6;
-    peerProgram.setArrayElement("local_container_subnet_map"_ctv, 0, localSubnet);
+    peerProgram.setArrayElement("lc_subnet"_ctv, 0, localSubnet);
 
     __u32 nicIfidx = 77;
-    peerProgram.setArrayElement("container_device_map"_ctv, 0, nicIfidx);
+    peerProgram.setArrayElement("ct_dev_map"_ctv, 0, nicIfidx);
 
     mac localMAC = {};
     localMAC.mac[0] = 0x02;
@@ -837,11 +837,11 @@ static void testContainerPeerEgressRouterRewritesCrossMachineWormholeReplyForOve
     gatewayMAC.mac[3] = 0x11;
     gatewayMAC.mac[4] = 0x00;
     gatewayMAC.mac[5] = 0x01;
-    peerProgram.setArrayElement("gateway_mac_map"_ctv, 0, gatewayMAC);
+    peerProgram.setArrayElement("gw_mac_map"_ctv, 0, gatewayMAC);
 
     switchboard_overlay_config overlayConfig = {};
     overlayConfig.container_network_enabled = 1;
-    peerProgram.setArrayElement("overlay_config_map"_ctv, 0, overlayConfig);
+    peerProgram.setArrayElement("ovl_config"_ctv, 0, overlayConfig);
 
     switchboard_overlay_machine_route route = {};
     route.family = SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6;
@@ -849,7 +849,7 @@ static void testContainerPeerEgressRouterRewritesCrossMachineWormholeReplyForOve
     parseIPv6Bytes("fd00:10::c", route.source6);
     parseIPv6Bytes("fd00:10::a", route.next_hop6);
     switchboard_overlay_machine_route_key routeKey = switchboardMakeOverlayMachineRouteKey(0xe1607cu);
-    suite.expect(updateProgramMapElement(peerProgram, "overlay_machine_routes_full"_ctv, routeKey, route),
+    suite.expect(updateProgramMapElement(peerProgram, "ovl_mach_full"_ctv, routeKey, route),
                  "container_peer_egress_router_cross_machine_wormhole_reply_sets_overlay_route");
 
     switchboard_wormhole_egress_key bindingKey = makeWormholeEgressKey(0x01, 0xeef454a6u, 8443, IPPROTO_UDP);
@@ -858,7 +858,7 @@ static void testContainerPeerEgressRouterRewritesCrossMachineWormholeReplyForOve
     binding.port = htons(443);
     binding.proto = IPPROTO_UDP;
     binding.is_ipv6 = 1;
-    suite.expect(updateProgramMapElement(peerProgram, "wormhole_egress_bindings"_ctv, bindingKey, binding),
+    suite.expect(updateProgramMapElement(peerProgram, "wh_egress"_ctv, bindingKey, binding),
                  "container_peer_egress_router_cross_machine_wormhole_reply_sets_binding");
 
     Vector<uint8_t> payload = {};
@@ -999,17 +999,17 @@ static void testContainerPeerEgressRouterEncapsulatesHostedIngress(TestSuite& su
   objectPath.append("/container.egress.router.ebpf.o"_ctv);
 
   BPFProgram peerProgram = {};
-  expectNamed(peerProgram.load(objectPath, "container_egress_router"_ctv), "loads_program");
+  expectNamed(peerProgram.load(objectPath, "ct_egress"_ctv), "loads_program");
 
   if (peerProgram.prog_fd >= 0)
   {
     container_network_policy networkPolicy = {};
     networkPolicy.requiresPublic4 = 1;
     networkPolicy.interContainerMTU = 9000;
-    peerProgram.setArrayElement("container_network_policy_map"_ctv, 0, networkPolicy);
+    peerProgram.setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
 
     __u32 nicIfidx = 77;
-    peerProgram.setArrayElement("container_device_map"_ctv, 0, nicIfidx);
+    peerProgram.setArrayElement("ct_dev_map"_ctv, 0, nicIfidx);
 
     mac localMAC = {};
     localMAC.mac[0] = 0x02;
@@ -1027,7 +1027,7 @@ static void testContainerPeerEgressRouterEncapsulatesHostedIngress(TestSuite& su
     gatewayMAC.mac[3] = 0x11;
     gatewayMAC.mac[4] = 0x00;
     gatewayMAC.mac[5] = 0x01;
-    peerProgram.setArrayElement("gateway_mac_map"_ctv, 0, gatewayMAC);
+    peerProgram.setArrayElement("gw_mac_map"_ctv, 0, gatewayMAC);
 
     const uint32_t machineFragment = 0x000002u;
     if (ipv6)
@@ -1035,7 +1035,7 @@ static void testContainerPeerEgressRouterEncapsulatesHostedIngress(TestSuite& su
       switchboard_overlay_hosted_ingress_route6 hosted = {};
       hosted.machine_fragment = machineFragment;
       switchboard_overlay_prefix6_key hostedKey = switchboardMakeOverlayPrefix6Key(makePrefix("2001:db8::1/128"));
-      expectNamed(updateProgramMapElement(peerProgram, "overlay_hosted_ingress_routes6"_ctv, hostedKey, hosted),
+      expectNamed(updateProgramMapElement(peerProgram, "ovl_host6"_ctv, hostedKey, hosted),
                   "sets_hosted_route");
     }
     else
@@ -1043,7 +1043,7 @@ static void testContainerPeerEgressRouterEncapsulatesHostedIngress(TestSuite& su
       switchboard_overlay_hosted_ingress_route4 hosted = {};
       hosted.machine_fragment = machineFragment;
       switchboard_overlay_prefix4_key hostedKey = switchboardMakeOverlayPrefix4Key(makePrefix("198.18.0.1/32"));
-      expectNamed(updateProgramMapElement(peerProgram, "overlay_hosted_ingress_routes4"_ctv, hostedKey, hosted),
+      expectNamed(updateProgramMapElement(peerProgram, "ovl_host4"_ctv, hostedKey, hosted),
                   "sets_hosted_route");
     }
 
@@ -1053,7 +1053,7 @@ static void testContainerPeerEgressRouterEncapsulatesHostedIngress(TestSuite& su
     parseIPv6Bytes("fd00:10::a", route.source6);
     parseIPv6Bytes("fd00:10::b", route.next_hop6);
     switchboard_overlay_machine_route_key routeKey = switchboardMakeOverlayMachineRouteKey(machineFragment);
-    expectNamed(updateProgramMapElement(peerProgram, "overlay_machine_routes_full"_ctv, routeKey, route),
+    expectNamed(updateProgramMapElement(peerProgram, "ovl_mach_full"_ctv, routeKey, route),
                 "sets_machine_route");
 
     Vector<uint8_t> payload = {};
@@ -1183,7 +1183,7 @@ static void testContainerPeerEgressRouterRewritesIPv4WormholeSource(TestSuite& s
   objectPath.append("/container.egress.router.ebpf.o"_ctv);
 
   BPFProgram peerProgram = {};
-  expectNamed(peerProgram.load(objectPath, "container_egress_router"_ctv), "loads_program");
+  expectNamed(peerProgram.load(objectPath, "ct_egress"_ctv), "loads_program");
   if (peerProgram.prog_fd < 0)
   {
     return;
@@ -1192,10 +1192,10 @@ static void testContainerPeerEgressRouterRewritesIPv4WormholeSource(TestSuite& s
   container_network_policy networkPolicy = {};
   networkPolicy.requiresPublic4 = 1;
   networkPolicy.interContainerMTU = 9000;
-  peerProgram.setArrayElement("container_network_policy_map"_ctv, 0, networkPolicy);
+  peerProgram.setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
 
   __u32 nicIfidx = 77;
-  peerProgram.setArrayElement("container_device_map"_ctv, 0, nicIfidx);
+  peerProgram.setArrayElement("ct_dev_map"_ctv, 0, nicIfidx);
 
   mac localMAC = {};
   localMAC.mac[0] = 0x02;
@@ -1213,7 +1213,7 @@ static void testContainerPeerEgressRouterRewritesIPv4WormholeSource(TestSuite& s
   gatewayMAC.mac[3] = 0x11;
   gatewayMAC.mac[4] = 0x00;
   gatewayMAC.mac[5] = 0x01;
-  peerProgram.setArrayElement("gateway_mac_map"_ctv, 0, gatewayMAC);
+  peerProgram.setArrayElement("gw_mac_map"_ctv, 0, gatewayMAC);
 
   switchboard_wormhole_egress4_key bindingKey = makeWormholeEgress4Key("198.18.0.1", 8443, proto);
   switchboard_wormhole_egress_binding binding = {};
@@ -1221,7 +1221,7 @@ static void testContainerPeerEgressRouterRewritesIPv4WormholeSource(TestSuite& s
   binding.port = htons(443);
   binding.proto = proto;
   binding.is_ipv6 = 0;
-  expectNamed(updateProgramMapElement(peerProgram, "wormhole_egress_bindings4"_ctv, bindingKey, binding),
+  expectNamed(updateProgramMapElement(peerProgram, "wh_egress4"_ctv, bindingKey, binding),
               "sets_ipv4_binding");
 
   Vector<uint8_t> payload = {};

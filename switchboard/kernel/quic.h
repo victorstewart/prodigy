@@ -18,15 +18,13 @@ struct {
   __type(key, __u32);
   __type(value, struct aes_decrypt_state);
   __uint(max_entries, MAX_PORTALS * 2);
-} quic_cid_aes_decrypt_map SEC(".maps");
+} quic_cid_dec SEC(".maps");
 
-__attribute__((__always_inline__)) static inline struct quic_route_result parse_quic_route(const struct portal_meta *portal_meta, void *data, void *data_end, bool is_ipv6, const struct flow_key *flow)
+__attribute__((__always_inline__)) static inline void parse_quic_route_common(struct quic_route_result *result, __u32 portal_slot, void *data, void *data_end, bool is_ipv6, const struct flow_key *flow)
 {
-  struct quic_route_result result = {};
-
-  if (portal_meta == NULL)
+  if (result == NULL)
   {
-    return result;
+    return;
   }
 
   __u64 off = calc_offset(is_ipv6);
@@ -35,7 +33,7 @@ __attribute__((__always_inline__)) static inline struct quic_route_result parse_
   /*                                      |QUIC PKT TYPE|           */
   if ((data + off + sizeof(struct udphdr) + sizeof(__u8)) > data_end)
   {
-    return result;
+    return;
   }
 
   __u8 *quic_data = data + off + sizeof(struct udphdr);
@@ -48,36 +46,36 @@ __attribute__((__always_inline__)) static inline struct quic_route_result parse_
     // length before requiring Prodigy's fixed-size routing CID.
     if ((void *)(quic_data + 6) > data_end)
     {
-      return result;
+      return;
     }
 
     __u8 packet_type = (*pkt_type & QUIC_V1_PACKET_TYPE_MASK);
-    result.is_initial = packet_type == QUIC_V1_CLIENT_INITIAL;
+    result->is_initial = packet_type == QUIC_V1_CLIENT_INITIAL;
 
     if (packet_type == QUIC_V1_RETRY)
     {
-      result.fallback_allowed = false;
-      return result; // client should never send Retry packets to the server
+      result->fallback_allowed = false;
+      return; // client should never send Retry packets to the server
     }
 
     __u8 declared_dcid_len = *(quic_data + 5);
     if (switchboardQuicV1DestinationCidLengthValid(declared_dcid_len) == false)
     {
-      result.fallback_allowed = false;
-      return result;
+      result->fallback_allowed = false;
+      return;
     }
-    result.fallback_allowed = switchboardQuicV1LongHeaderAllowsHashFallback(packet_type, declared_dcid_len);
+    result->fallback_allowed = switchboardQuicV1LongHeaderAllowsHashFallback(packet_type, declared_dcid_len);
 
     __u8 *dst_cid = quic_data + 6;
     if ((void *)(dst_cid + declared_dcid_len) > data_end)
     {
-      result.fallback_allowed = false;
-      return result;
+      result->fallback_allowed = false;
+      return;
     }
 
     if (switchboardQuicV1DestinationCidUsesProdigySchema(declared_dcid_len) == false)
     {
-      return result;
+      return;
     }
 
     encrypted_cid = dst_cid;
@@ -86,7 +84,7 @@ __attribute__((__always_inline__)) static inline struct quic_route_result parse_
   {
     if ((void *)(quic_data + sizeof(struct quic_short_header)) > data_end)
     {
-      return result;
+      return;
     }
 
     struct quic_short_header *sheader = (struct quic_short_header *)quic_data;
@@ -139,8 +137,8 @@ __attribute__((__always_inline__)) static inline struct quic_route_result parse_
     if ((void *)(encrypted_cid + 16) <= data_end)
     {
       __u8 key_index = quicCidEncryptedKeyIndex(encrypted_cid);
-      __u32 decrypt_index = quicCidPortalDecryptMapIndex(portal_meta->slot, key_index);
-      struct aes_decrypt_state *aes_state = bpf_map_lookup_elem(&quic_cid_aes_decrypt_map, &decrypt_index);
+      __u32 decrypt_index = quicCidPortalDecryptMapIndex(portal_slot, key_index);
+      struct aes_decrypt_state *aes_state = bpf_map_lookup_elem(&quic_cid_dec, &decrypt_index);
 
       if (aes_state)
       {
@@ -168,26 +166,53 @@ __attribute__((__always_inline__)) static inline struct quic_route_result parse_
           if (quicCidTagMatches(expected_tag, cid_tag))
           {
             // network byte order on purpose
-            result.containerID.value[0] = cid[1];
-            result.containerID.value[1] = cid[2];
-            result.containerID.value[2] = cid[3];
-            result.containerID.value[3] = cid[4];
-            result.containerID.value[4] = cid[5];
+            result->containerID.value[0] = cid[1];
+            result->containerID.value[1] = cid[2];
+            result->containerID.value[2] = cid[3];
+            result->containerID.value[3] = cid[4];
+            result->containerID.value[4] = cid[5];
 
-            result.containerID.hasID = true;
-            result.had_valid_prodigy_cid = true;
+            result->containerID.hasID = true;
+            result->had_valid_prodigy_cid = true;
           }
         }
       }
     }
   }
 
-  return result;
+  return;
+}
+
+__attribute__((noinline)) static void parse_quic_route4(struct quic_route_result *result, __u32 portal_slot, void *data, void *data_end, const struct flow_key *flow)
+{
+  parse_quic_route_common(result, portal_slot, data, data_end, false, flow);
+}
+
+__attribute__((noinline)) static void parse_quic_route6(struct quic_route_result *result, __u32 portal_slot, void *data, void *data_end, const struct flow_key *flow)
+{
+  parse_quic_route_common(result, portal_slot, data, data_end, true, flow);
+}
+
+__attribute__((__always_inline__)) static inline void parse_quic_route(struct quic_route_result *result, const struct portal_meta *portal_meta, void *data, void *data_end, bool is_ipv6, const struct flow_key *flow)
+{
+  if (portal_meta == NULL)
+  {
+    return;
+  }
+  if (is_ipv6)
+  {
+    parse_quic_route6(result, portal_meta->slot, data, data_end, flow);
+  }
+  else
+  {
+    parse_quic_route4(result, portal_meta->slot, data, data_end, flow);
+  }
 }
 
 __attribute__((__always_inline__)) static inline bool parse_quic(struct container_id *containerID, const struct portal_meta *portal_meta, void *data, void *data_end, bool is_ipv6, const struct flow_key *flow)
 {
-  struct quic_route_result result = parse_quic_route(portal_meta, data, data_end, is_ipv6, flow);
+  struct quic_route_result result = {};
+  parse_quic_route(&result, portal_meta, data, data_end, is_ipv6, flow);
   if (containerID)
   {
     bpf_memcpy(containerID, &result.containerID, sizeof(struct container_id));

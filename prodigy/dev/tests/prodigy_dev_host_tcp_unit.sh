@@ -262,8 +262,8 @@ wait_for_brain_transport_path()
          fi
 
          if nsenter -t "'"${brain_pid}"'" -n ip -4 addr show dev bond0 2>/dev/null | grep -F "inet '"${brain_ip}"'/24" >/dev/null 2>&1 \
-            && nsenter -t "'"${brain_pid}"'" -m -n bpftool net show 2>/dev/null | grep -F "host_ingress_router" >/dev/null 2>&1 \
-            && nsenter -t "'"${brain_pid}"'" -m -n bpftool net show 2>/dev/null | grep -F "host_egress_router" >/dev/null 2>&1
+            && nsenter -t "'"${brain_pid}"'" -m -n bpftool net show 2>/dev/null | grep -F "host_ingress" >/dev/null 2>&1 \
+            && nsenter -t "'"${brain_pid}"'" -m -n bpftool net show 2>/dev/null | grep -F "host_egress" >/dev/null 2>&1
          then
             exit 0
          fi

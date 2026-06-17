@@ -37,7 +37,11 @@ enum class MothershipTopic : uint16_t {
   pullRoutableResourceLeases,
   upsertDNSBinding,
   deleteDNSBinding,
-  pullDNSBindings
+  pullDNSBindings,
+  teardownDNSBindings,
+  presentACMEDNS01Challenge,
+  cleanupACMEDNS01Challenge,
+  importACMELineage
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -90,6 +94,14 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "deleteDNSBinding";
     case MothershipTopic::pullDNSBindings:
       return "pullDNSBindings";
+    case MothershipTopic::teardownDNSBindings:
+      return "teardownDNSBindings";
+    case MothershipTopic::presentACMEDNS01Challenge:
+      return "presentACMEDNS01Challenge";
+    case MothershipTopic::cleanupACMEDNS01Challenge:
+      return "cleanupACMEDNS01Challenge";
+    case MothershipTopic::importACMELineage:
+      return "importACMELineage";
   }
 
   return "unknown";

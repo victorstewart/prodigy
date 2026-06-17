@@ -19,7 +19,7 @@ Keep early test runs short. Public IP addresses, disks, NICs, and resource group
 
 ## Required Azure permissions
 
-For the low-friction path, use `Contributor` on the target subscription or resource group plus the managed-identity permissions needed for user-assigned identities.
+For the low-friction path, use `Owner` or `Contributor` plus enough RBAC administration to assign roles. Plain `Contributor` is not enough because it normally excludes `Microsoft.Authorization/roleAssignments/write`.
 
 For a tighter split:
 
@@ -30,6 +30,32 @@ Managed Identity Operator to assign a user-assigned identity to VMs
 Virtual Machine Contributor to create/update VMs that carry that identity
 ```
 
+`createCluster` preflight checks the target resource group for these ARM actions and reports every missing action:
+
+```text
+Microsoft.Authorization/roleAssignments/read
+Microsoft.Authorization/roleAssignments/write
+Microsoft.Compute/skus/read
+Microsoft.Compute/virtualMachines/delete
+Microsoft.Compute/virtualMachines/read
+Microsoft.Compute/virtualMachines/restart/action
+Microsoft.Compute/virtualMachines/write
+Microsoft.ManagedIdentity/userAssignedIdentities/read
+Microsoft.ManagedIdentity/userAssignedIdentities/write
+Microsoft.Network/networkInterfaces/delete
+Microsoft.Network/networkInterfaces/read
+Microsoft.Network/networkInterfaces/write
+Microsoft.Network/networkSecurityGroups/read
+Microsoft.Network/networkSecurityGroups/write
+Microsoft.Network/publicIPAddresses/delete
+Microsoft.Network/publicIPAddresses/read
+Microsoft.Network/publicIPAddresses/write
+Microsoft.Network/virtualNetworks/read
+Microsoft.Network/virtualNetworks/write
+Microsoft.Resources/subscriptions/resourceGroups/read
+Microsoft.Resources/subscriptions/resourceGroups/write
+```
+
 ## Authenticate locally
 
 ```bash
@@ -38,6 +64,8 @@ export RUN_ID="${RUN_ID:-$(date -u +%Y%m%d-%H%M%S)}"
 export AZURE_SUBSCRIPTION_ID="REPLACE_AZURE_SUBSCRIPTION_ID"
 export AZURE_LOCATION="${AZURE_LOCATION:-northcentralus}"
 export RUN_RG="prodigy-${RUN_ID}"
+export AZURE_MANAGED_IDENTITY_NAME="prodigy-${RUN_ID}-controller"
+export AZURE_MANAGED_IDENTITY_ID="/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${RUN_RG}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/${AZURE_MANAGED_IDENTITY_NAME}"
 export AZURE_PROVIDER_SCOPE="subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${RUN_RG}/locations/${AZURE_LOCATION}"
 export BOOTSTRAP_SSH_KEY="REPLACE_PATH_TO_BOOTSTRAP_PRIVATE_KEY"
 
@@ -63,6 +91,9 @@ cat > azure.cluster.json <<JSON
     "mode": "azureCli",
     "scope": "${AZURE_PROVIDER_SCOPE}",
     "allowPropagateToProdigy": false
+  },
+  "azure": {
+    "managedIdentityResourceID": "${AZURE_MANAGED_IDENTITY_ID}"
   },
   "controls": [
     {

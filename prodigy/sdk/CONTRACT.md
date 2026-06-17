@@ -48,6 +48,7 @@ These are the semantic callbacks every SDK should expose, even if the exact lang
 - `credentialsRefresh`
   - callback: `credentialsRefresh`
   - note: only when payload is non-empty
+  - TLS note: apply `updatedTls` to the in-memory identity source for future handshakes before ACKing; leave existing connections on their current context
 - `message`
   - callback: `messageFromProdigy`
   - note: payload stays opaque bytes
@@ -61,7 +62,7 @@ No callback is required for:
 - `resourceDeltaAck`
 - `datacenterUniqueTag`
 - empty inbound `credentialsRefresh` ack frames
-- typed inbound `credentialsRefresh` resumption ACK frames
+- typed inbound `credentialsRefresh` credential/resumption ACK frames
 
 ## Default Frame-Handler Semantics
 
@@ -92,7 +93,9 @@ Ack behavior is policy-driven:
   - or the SDK may auto-queue one if configured
 - `credentialsRefresh`
   - application may explicitly send an empty `credentialsRefresh` ack
-  - application must send a typed `TlsResumptionApplyAck` ack when it applies TLS resumption snapshots or deltas, because resumption readiness is per wormhole and generation
+  - empty ACK marks non-resumption credential updates, including public/private `TlsIdentity` generations, as successfully applied by that container for master-brain freshness tracking
+  - application may send a typed `CredentialApplyAck` to report `TlsIdentity` generation success or rejection
+  - application must include typed resumption results when it applies TLS resumption snapshots or deltas, because resumption readiness is per wormhole and generation
   - or the SDK may auto-queue one if configured
 
 ## Required Outbound Operations

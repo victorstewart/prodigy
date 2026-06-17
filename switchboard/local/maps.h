@@ -12,7 +12,7 @@ struct {
   __type(value, struct portal_meta);
   __uint(max_entries, MAX_PORTALS);
   __uint(map_flags, NO_FLAGS);
-} external_portals SEC(".maps");
+} ext_portals SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
@@ -20,7 +20,7 @@ struct {
   __type(value, __u16);
   __uint(max_entries, MAX_PORTALS * 256);
   __uint(map_flags, NO_FLAGS);
-} wormhole_target_ports SEC(".maps");
+} wh_targets SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
@@ -28,7 +28,7 @@ struct {
   __type(value, struct switchboard_wormhole_egress_binding);
   __uint(max_entries, MAX_PORTALS * 256);
   __uint(map_flags, NO_FLAGS);
-} wormhole_egress_bindings SEC(".maps");
+} wh_egress SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
@@ -36,4 +36,4 @@ struct {
   __type(value, struct switchboard_wormhole_egress_binding);
   __uint(max_entries, MAX_PORTALS * 256);
   __uint(map_flags, NO_FLAGS);
-} wormhole_egress_bindings4 SEC(".maps");
+} wh_egress4 SEC(".maps");

@@ -8104,6 +8104,7 @@ public:
 
     thisBrain->batphone.sendEmail(thisBrain->brainConfig.reporter.from, thisBrain->brainConfig.reporter.to, "Container Crashed!"_ctv, alert);
 
+    bool failedBeforeDeployHealthy = false;
     if (container->deploymentID == plan.config.deploymentID())
     {
       ApplicationLifetime lifetime = container->lifetime;
@@ -8126,6 +8127,7 @@ public:
       failureReport.wasCanary = (lifetime == ApplicationLifetime::canary);
 
       failedCanary = (lifetime == ApplicationLifetime::canary);
+      failedBeforeDeployHealthy = restarted == false && failedCanary == false && state == DeploymentState::deploying && waitingOnContainers.contains(container);
     }
     // else a container from the previous deployment failed
 
@@ -8137,6 +8139,12 @@ public:
 
     if (restarted == false)
     {
+      if (failedBeforeDeployHealthy)
+      {
+        state = DeploymentState::failed;
+        stateChangedAtMs = Time::now<TimeResolution::ms>();
+      }
+
       countPerMachine[container->machine] -= 1;
       countPerRack[container->machine->rack] -= 1;
 
@@ -8153,6 +8161,11 @@ public:
       if (failedCanary)
       {
         resumeFailedCanaryRollbackAfterContainerCleanup();
+        return;
+      }
+      if (failedBeforeDeployHealthy)
+      {
+        thisBrain->deploymentFailed(this, plan.config.deploymentID(), report.size() ? report : String("container failed before becoming healthy"_ctv));
         return;
       }
     }
@@ -8384,6 +8397,10 @@ public:
               prodigyPopulateDefaultStatefulTopology(containerPlan.statefulTopology, containerPlan.shardGroup, containerPlan.config);
             }
             thisBrain->applyCredentialsToContainerPlan(plan, *container, containerPlan);
+            container->hasCredentialBundle = containerPlan.hasCredentialBundle;
+            container->credentialBundle = containerPlan.credentialBundle;
+            container->hasPendingCredentialBundle = false;
+            container->pendingCredentialBundle = {};
             NeuronContainerMetricPolicy metricPolicy = deriveNeuronMetricPolicyForDeployment(plan);
 
             NeuronContainerBootstrap bootstrap;

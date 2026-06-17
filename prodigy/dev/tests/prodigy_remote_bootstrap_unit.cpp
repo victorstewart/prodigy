@@ -560,7 +560,9 @@ int main(void)
   suite.expect(stringContains(bootstrapCloudConfig, "disable_root: false"), "bootstrap_cloud_config_disables_root_lockout");
   suite.expect(stringContains(bootstrapCloudConfig, "name: root"), "bootstrap_cloud_config_targets_root_user");
   suite.expect(stringContains(bootstrapCloudConfig, "PermitRootLogin prohibit-password"), "bootstrap_cloud_config_enables_root_pubkey_login");
-  suite.expect(stringContains(bootstrapCloudConfig, "path: /etc/ssh/ssh_host_ed25519_key"), "bootstrap_cloud_config_writes_host_private_key");
+  suite.expect(stringContains(bootstrapCloudConfig, "path: /etc/prodigy-bootstrap-ssh_host_ed25519_key"), "bootstrap_cloud_config_writes_host_private_key");
+  suite.expect(stringContains(bootstrapCloudConfig, "-----END OPENSSH PRIVATE KEY-----"), "bootstrap_cloud_config_embeds_host_private_key_footer");
+  suite.expect(stringContains(bootstrapCloudConfig, "cp /etc/prodigy-bootstrap-ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key"), "bootstrap_cloud_config_installs_host_private_key_after_cloud_init_ssh");
   suite.expect(stringContains(bootstrapCloudConfig, bootstrapHostKeyPackage.publicKeyOpenSSH.c_str()), "bootstrap_cloud_config_embeds_host_public_key");
   suite.expect(stringContains(bootstrapCloudConfig, bootstrapPublicKey.c_str()), "bootstrap_cloud_config_embeds_public_key");
 
@@ -569,6 +571,15 @@ int main(void)
   suite.expect(stringContains(nonRootBootstrapCloudConfig, "name: ubuntu"), "bootstrap_cloud_config_uses_configured_non_root_user");
   suite.expect(stringContains(nonRootBootstrapCloudConfig, "sudo: ALL=(ALL) NOPASSWD:ALL") == false, "bootstrap_cloud_config_omits_non_root_sudo");
   suite.expect(stringContains(nonRootBootstrapCloudConfig, "groups: [adm, sudo]") == false, "bootstrap_cloud_config_omits_non_root_sudo_groups");
+
+  String defaultPortKnownHost = {};
+  suite.expect(renderOpenSSHKnownHostLine("127.0.0.1"_ctv, 22, bootstrapHostKeyPackage.publicKeyOpenSSH, defaultPortKnownHost, &failure), "openssh_known_host_renders_default_port");
+  suite.expect(stringContains(defaultPortKnownHost, "[127.0.0.1]:22") == false, "openssh_known_host_default_port_is_plain_host");
+  suite.expect(stringContains(defaultPortKnownHost, "127.0.0.1 ssh-ed25519"), "openssh_known_host_default_port_matches_openssh");
+
+  String customPortKnownHost = {};
+  suite.expect(renderOpenSSHKnownHostLine("127.0.0.1"_ctv, 2222, bootstrapHostKeyPackage.publicKeyOpenSSH, customPortKnownHost, &failure), "openssh_known_host_renders_custom_port");
+  suite.expect(stringContains(customPortKnownHost, "[127.0.0.1]:2222 ssh-ed25519"), "openssh_known_host_custom_port_is_bracketed");
 
   ScopedSSHD sshd = {};
   suite.expect(sshd.ready(), "blocking_ssh_fixture_ready");
@@ -721,6 +732,7 @@ int main(void)
       "build_remote_bootstrap_plan");
   suite.expect(failure.size() == 0, "build_remote_bootstrap_plan_clears_failure");
   ProdigyRemoteBootstrapPlan multiBrainPlan = plan;
+  suite.expect(plan.acme == request.acme, "plan_acme_config_copied");
   suite.expect(plan.ssh.address.equals("10.0.0.31"_ctv), "plan_uses_private_address_when_ssh_address_missing");
   suite.expect(plan.ssh.port == 22, "plan_defaults_ssh_port");
   suite.expect(plan.ssh.hostPublicKeyOpenSSH.equals(request.bootstrapSshHostKeyPackage.publicKeyOpenSSH), "plan_carries_ssh_host_public_key");
@@ -941,6 +953,18 @@ int main(void)
   suite.expect(failure.size() == 0, "build_remote_bootstrap_plan_single_seed_clears_failure");
   ProdigyRemoteBootstrapPlan singleSeedPlan = plan;
 
+  AddMachines acmeRequest = request;
+  acmeRequest.acme.accountEmail = "ops@example.com"_ctv;
+  acmeRequest.acme.certbotInstall = "bundle"_ctv;
+  acmeRequest.acme.certbotPath = "/opt/prodigy/certbot/bin/certbot"_ctv;
+  acmeRequest.acme.certbotVersion = "5.6.0"_ctv;
+  acmeRequest.acme.termsAgreed = true;
+  ProdigyRemoteBootstrapPlan acmePlan = {};
+  suite.expect(
+      prodigyBuildRemoteBootstrapPlan(singleSeed, acmeRequest, singleSeedTopology, runtimeEnvironment, acmePlan, &failure),
+      "build_remote_bootstrap_plan_acme");
+  suite.expect(failure.size() == 0, "build_remote_bootstrap_plan_acme_clears_failure");
+
   ProdigyPersistentBootState singleSeedBootState = {};
   suite.expect(parseProdigyPersistentBootStateJSON(plan.bootJSON, singleSeedBootState, &failure), "plan_boot_json_single_seed_parses");
   suite.expect(singleSeedBootState.bootstrapConfig.bootstrapPeers.size() == 0, "plan_boot_json_single_seed_excludes_self_peer");
@@ -1092,6 +1116,8 @@ int main(void)
   suite.expect(stringContains(plan.mkdirCommand, "mkdir -p"), "plan_mkdir_command_prefix");
   suite.expect(stringContains(plan.mkdirCommand, "/opt"), "plan_mkdir_command_remote_root_parent");
   suite.expect(stringContains(plan.mkdirCommand, "/var/lib/prodigy"), "plan_mkdir_command_var_lib");
+  suite.expect(stringContains(plan.mkdirCommand, "/containers/store"), "plan_mkdir_command_container_store");
+  suite.expect(stringContains(plan.mkdirCommand, "/containers/storage"), "plan_mkdir_command_container_storage");
   suite.expect(stringContains(plan.mkdirCommand, "/run/prodigy"), "plan_mkdir_command_control_dir");
   String expectedBootstrapSSHDirectoryQuoted = {};
   prodigyAppendShellSingleQuoted(expectedBootstrapSSHDirectoryQuoted, expectedBootstrapSSHDirectory);
@@ -1122,7 +1148,21 @@ int main(void)
   suite.expect(stringContains(singleSeedPlan.installCommand, "/tmp/prodigy.remote-bootstrap.payload.tar"), "plan_install_command_stage_payload_path");
   suite.expect(stringContains(singleSeedPlan.installCommand, "rm -f '/tmp/prodigy.remote-bootstrap.payload.tar'"), "plan_install_command_removes_stage_payload");
   suite.expect(stringContains(singleSeedPlan.installCommand, "command -v zstd"), "plan_install_command_zstd_preflight");
-  suite.expect(stringContains(singleSeedPlan.installCommand, "apt-get install -y zstd"), "plan_install_command_zstd_install_fallback");
+  suite.expect(stringContains(singleSeedPlan.installCommand, "command -v btrfs"), "plan_install_command_btrfs_preflight");
+  suite.expect(stringContains(singleSeedPlan.installCommand, "apt-get install -y --no-install-recommends zstd"), "plan_install_command_zstd_install_fallback");
+  suite.expect(stringContains(singleSeedPlan.installCommand, "btrfs-progs"), "plan_install_command_btrfs_install_fallback");
+  suite.expect(stringContains(singleSeedPlan.installCommand, "mkfs.btrfs -f"), "plan_install_command_container_root_mkfs");
+  suite.expect(stringContains(singleSeedPlan.installCommand, "mount -o loop,nosuid,nodev"), "plan_install_command_container_root_mount");
+  suite.expect(stringContains(singleSeedPlan.installCommand, "command -v certbot") == false, "plan_install_command_never_trusts_host_certbot");
+  suite.expect(stringContains(singleSeedPlan.installCommand, "apt-get install") && stringContains(singleSeedPlan.installCommand, "certbot") == false, "plan_install_command_no_certbot_without_acme");
+  suite.expect(stringContains(acmePlan.installCommand, "prodigy.certbot-5.6.0.wheelhouse.tar.zst"), "plan_acme_install_command_uses_certbot_wheelhouse");
+  suite.expect(stringContains(acmePlan.installCommand, "prodigy-certbot-venv-probe"), "plan_acme_install_command_probes_real_venv_creation");
+  suite.expect(stringContains(acmePlan.installCommand, "python3 -m venv /opt/prodigy/certbot"), "plan_acme_install_command_creates_managed_venv");
+  suite.expect(stringContains(acmePlan.installCommand, "certbot.new") == false, "plan_acme_install_command_uses_final_venv_path");
+  suite.expect(stringContains(acmePlan.installCommand, "certbot==5.6.0"), "plan_acme_install_command_installs_pinned_certbot");
+  suite.expect(stringContains(acmePlan.installCommand, "/opt/prodigy/certbot/bin/certbot --version | grep -F '5.6.0'"), "plan_acme_install_command_verifies_certbot_version");
+  suite.expect(stringContains(acmePlan.installCommand, "command -v certbot") == false, "plan_acme_install_command_does_not_probe_host_certbot");
+  suite.expect(stringContains(acmePlan.installCommand, "apt-get install -y --no-install-recommends zstd certbot") == false, "plan_acme_install_command_does_not_install_system_certbot");
   suite.expect(stringContains(singleSeedPlan.installCommand, "ldconfig -p") == false, "plan_install_command_skips_libatomic_preflight");
   suite.expect(stringContains(singleSeedPlan.installCommand, "apt-get install -y libatomic1") == false, "plan_install_command_skips_libatomic_install_fallback");
   suite.expect(stringContains(singleSeedPlan.installCommand, "systemctl stop prodigy || true;"), "plan_install_command_stops_before_replace");
@@ -1144,6 +1184,7 @@ int main(void)
   suite.expect(stringContains(singleSeedPlan.installCommand, "python3 -c"), "plan_install_command_waits_for_control_socket_with_python");
   suite.expect(stringContains(singleSeedPlan.installCommand, "/run/prodigy/control.sock"), "plan_install_command_waits_for_control_socket_path");
   suite.expect(stringContains(singleSeedPlan.installCommand, "systemctl restart prodigy && python3 -c"), "plan_install_command_restart_waits_for_socket");
+  suite.expect(stringContains(singleSeedPlan.installCommand, "stat -f -c %T /containers"), "plan_install_command_checks_container_fs_type");
   String expectedPlanDiagnosticsNeedle = {};
   expectedPlanDiagnosticsNeedle.snprintf<"|| { timeout {itoa}s sh -lc"_ctv>(uint64_t(prodigyRemoteBootstrapSocketDiagnosticsTimeoutSeconds));
   suite.expect(stringContains(singleSeedPlan.installCommand, expectedPlanDiagnosticsNeedle.c_str()), "plan_install_command_wait_failure_collects_diagnostics");
@@ -1156,7 +1197,18 @@ int main(void)
   suite.expect(stringContains(multiBrainPlan.installCommand, "systemctl restart prodigy && rm -rf"), "plan_install_command_multi_brain_restarts_without_socket_wait");
 
   suite.expect(stringContains(plan.systemdUnit, "Environment=LD_LIBRARY_PATH=/opt/prodigy-root/lib"), "plan_systemd_ld_library_path");
+#if NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE
+  suite.expect(stringContains(plan.systemdUnit, "Environment=PRODIGY_HOST_INGRESS_EBPF=/opt/prodigy-root/host.ingress.router.dev.ebpf.o"), "plan_systemd_host_ingress_ebpf");
+#else
+  suite.expect(stringContains(plan.systemdUnit, "Environment=PRODIGY_HOST_INGRESS_EBPF=/opt/prodigy-root/host.ingress.router.ebpf.o"), "plan_systemd_host_ingress_ebpf");
+#endif
+  suite.expect(stringContains(plan.systemdUnit, "Environment=PRODIGY_HOST_EGRESS_EBPF=/opt/prodigy-root/host.egress.router.ebpf.o"), "plan_systemd_host_egress_ebpf");
   suite.expect(stringContains(plan.systemdUnit, "ExecStart=/opt/prodigy-root/prodigy"), "plan_systemd_execstart");
+  suite.expect(stringContains(plan.systemdUnit, "ExecStartPre=/bin/sh -lc"), "plan_systemd_container_root_execstartpre");
+  suite.expect(stringContains(plan.systemdUnit, "stat -f -c %%T /containers"), "plan_systemd_escapes_stat_percent");
+  suite.expect(stringContains(plan.systemdUnit, "stat -f -c /tmp /containers") == false, "plan_systemd_never_expands_stat_percent");
+  suite.expect(stringContains(plan.systemdUnit, "mkfs.btrfs -f"), "plan_systemd_container_root_mkfs");
+  suite.expect(stringContains(plan.systemdUnit, "mount -o loop,nosuid,nodev"), "plan_systemd_container_root_mount");
   suite.expect(stringContains(plan.systemdUnit, "ExecStartPre=/usr/bin/mkdir -p /run/prodigy /var/lib/prodigy /opt/prodigy-root/lib"), "plan_systemd_execstartpre");
   suite.expect(stringContains(plan.systemdUnit, "WantedBy=multi-user.target"), "plan_systemd_wanted_by");
 

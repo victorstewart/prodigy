@@ -150,6 +150,10 @@ func TestFixtureFrames(t *testing.T) {
 	if got := BuildCredentialsRefreshAckFrame(); string(got) != string(fixtureBytes(t, "frame.credentials_refresh_ack.empty.bin")) {
 		t.Fatalf("BuildCredentialsRefreshAckFrame mismatch")
 	}
+	credentialAck, err := ParseMessageFrame(BuildCredentialsRefreshAckPayloadFrame([]byte("PRDCAC01payload")))
+	if err != nil || credentialAck.Topic != ContainerTopicCredentialsRefresh || string(credentialAck.Payload) != "PRDCAC01payload" {
+		t.Fatalf("BuildCredentialsRefreshAckPayloadFrame mismatch")
+	}
 }
 
 type recordingDispatch struct {

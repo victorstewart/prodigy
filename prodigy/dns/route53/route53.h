@@ -3,14 +3,28 @@
 #include <prodigy/dns/provider.http.h>
 #include <prodigy/iaas/aws/aws.h>
 
-static inline bool prodigyDNSFindRoute53Record(const String& response, const ProdigyDNSRecordBinding& record, ProdigyDNSRecordPresence& presence, String& failure)
+static inline void prodigyDNSCollectRoute53ResourceRecords(const String& row, Vector<String>& blocks)
 {
-  presence = ProdigyDNSRecordPresence::missing;
-  String recordValue = {};
-  if (prodigyDNSRecordSingleValue(record, recordValue, failure) == false)
+  blocks.clear();
+  uint64_t search = 0;
+  while (true)
   {
-    return false;
+    uint64_t open = awsFindToken(row, "<ResourceRecord>", search);
+    uint64_t close = open == uint64_t(-1) ? uint64_t(-1) : awsFindToken(row, "</ResourceRecord>", open);
+    if (open == uint64_t(-1) || close == uint64_t(-1))
+    {
+      return;
+    }
+    open += strlen("<ResourceRecord>");
+    blocks.push_back(row.substr(open, close - open, Copy::yes));
+    search = close + strlen("</ResourceRecord>");
   }
+}
+
+static inline bool prodigyDNSCollectRoute53RecordValues(const String& response, const ProdigyDNSRecordBinding& record, Vector<String>& values, bool& found, String& failure)
+{
+  values.clear();
+  found = false;
 
   uint64_t open = awsFindToken(response, "<ResourceRecordSet>", 0);
   uint64_t close = open == uint64_t(-1) ? uint64_t(-1) : awsFindToken(response, "</ResourceRecordSet>", open);
@@ -34,20 +48,78 @@ static inline bool prodigyDNSFindRoute53Record(const String& response, const Pro
     return true;
   }
 
-  Vector<String> values = {};
-  awsCollectSetItemBlocks(row, "ResourceRecords", values);
-  if (values.size() != 1)
+  Vector<String> blocks = {};
+  prodigyDNSCollectRoute53ResourceRecords(row, blocks);
+  found = true;
+  for (const String& block : blocks)
   {
-    return prodigyDNSExistingRecordConflict(failure);
+    String value = {};
+    if (awsExtractXMLValue(block, "Value", value) == false)
+    {
+      failure.assign("route53 dns list response parse failed"_ctv);
+      return false;
+    }
+    values.push_back(value);
   }
-  String value = {};
-  if (awsExtractXMLValue(values[0], "Value", value) == false || value.equals(recordValue) == false)
+  failure.clear();
+  return true;
+}
+
+static inline bool prodigyDNSFindRoute53Record(const String& response, const ProdigyDNSRecordBinding& record, ProdigyDNSRecordPresence& presence, String& failure)
+{
+  presence = ProdigyDNSRecordPresence::missing;
+  String recordValue = {};
+  if (prodigyDNSRecordSingleValue(record, recordValue, failure) == false)
+  {
+    return false;
+  }
+
+  Vector<String> values = {};
+  bool found = false;
+  if (prodigyDNSCollectRoute53RecordValues(response, record, values, found, failure) == false)
+  {
+    return false;
+  }
+  if (found == false)
+  {
+    failure.clear();
+    return true;
+  }
+  if (values.size() != 1 || prodigyDNSProviderValueEquals(record, values[0], recordValue) == false)
   {
     return prodigyDNSExistingRecordConflict(failure);
   }
   presence = ProdigyDNSRecordPresence::exact;
   failure.clear();
   return true;
+}
+
+static inline void prodigyDNSAppendRoute53XMLText(String& body, const String& value)
+{
+  for (uint64_t index = 0; index < value.size(); index += 1)
+  {
+    switch (value[index])
+    {
+      case '&':
+        body.append("&amp;"_ctv);
+        break;
+      case '<':
+        body.append("&lt;"_ctv);
+        break;
+      case '>':
+        body.append("&gt;"_ctv);
+        break;
+      case '"':
+        body.append("&quot;"_ctv);
+        break;
+      case '\'':
+        body.append("&apos;"_ctv);
+        break;
+      default:
+        body.append(value[index]);
+        break;
+    }
+  }
 }
 
 class Route53DNSProvider : public ProdigyDNSProvider {
@@ -68,6 +140,16 @@ public:
     return change(true, record, credential, failure);
   }
 
+  bool presentTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  {
+    return changeTXT(false, record, credential, failure);
+  }
+
+  bool cleanupTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  {
+    return changeTXT(true, record, credential, failure);
+  }
+
 protected:
 
   virtual bool sendAWS(const char *method, const String& url, const String& region, const AwsCredentialMaterial& credential, const String *body, String& response, long& httpCode)
@@ -81,25 +163,40 @@ protected:
 
 private:
 
-  bool change(bool removing, const ProdigyDNSRecordBinding& record, const ApiCredential& apiCredential, String& failure)
+  bool prepare(
+      const ProdigyDNSRecordBinding& record,
+      const ApiCredential& apiCredential,
+      AwsCredentialMaterial& credential,
+      String& zone,
+      String& region,
+      String& failure)
   {
-    AwsCredentialMaterial credential = {};
     if (parseAwsCredentialMaterial(apiCredential.material, credential, &failure) == false)
     {
       return false;
     }
 
-    String zone = record.zone;
+    zone = record.zone;
     if (zone.size() >= 12 && zone.substr(0, 12).equal("/hostedzone/"_ctv))
     {
       zone = zone.substr(12, zone.size() - 12, Copy::yes);
     }
-    String region = {};
     if (prodigyDNSCredentialMetadata(apiCredential, "region", region) == false)
     {
       region.assign("us-east-1"_ctv);
     }
+    return true;
+  }
 
+  bool change(bool removing, const ProdigyDNSRecordBinding& record, const ApiCredential& apiCredential, String& failure)
+  {
+    AwsCredentialMaterial credential = {};
+    String zone = {};
+    String region = {};
+    if (prepare(record, apiCredential, credential, zone, region, failure) == false)
+    {
+      return false;
+    }
     ProdigyDNSRecordPresence presence = {};
     if (findRecord(record, credential, zone, region, presence, failure) == false)
     {
@@ -123,18 +220,89 @@ private:
     {
       return false;
     }
+    Vector<String> values = {};
+    values.push_back(value);
+    return changeRecordSet(removing ? "DELETE" : "CREATE", record, credential, zone, region, values, failure);
+  }
 
+  bool changeTXT(bool removing, const ProdigyDNSRecordBinding& record, const ApiCredential& apiCredential, String& failure)
+  {
+    String value = {};
+    if (prodigyDNSRecordSingleTXTValue(record, value, failure) == false)
+    {
+      return false;
+    }
+    AwsCredentialMaterial credential = {};
+    String zone = {};
+    String region = {};
+    if (prepare(record, apiCredential, credential, zone, region, failure) == false)
+    {
+      return false;
+    }
+    String response = {};
+    if (listRecordSets(record, credential, zone, region, response, failure) == false)
+    {
+      return false;
+    }
+    Vector<String> oldValues = {};
+    bool found = false;
+    if (prodigyDNSCollectRoute53RecordValues(response, record, oldValues, found, failure) == false)
+    {
+      return false;
+    }
+    Vector<String> newValues = oldValues;
+    if (removing)
+    {
+      if (found == false || prodigyDNSRemoveProviderValue(record, newValues, value) == false)
+      {
+        failure.clear();
+        return true;
+      }
+      if (newValues.size() == 0)
+      {
+        return changeRecordSet("DELETE", record, credential, zone, region, oldValues, failure);
+      }
+    }
+    else
+    {
+      if (prodigyDNSValuesContain(record, newValues, value))
+      {
+        failure.clear();
+        return true;
+      }
+      String quoted = {};
+      prodigyDNSQuoteTXTValue(value, quoted);
+      newValues.push_back(quoted);
+    }
+    return changeRecordSet("UPSERT", record, credential, zone, region, newValues, failure);
+  }
+
+  bool changeRecordSet(
+      const char *action,
+      const ProdigyDNSRecordBinding& record,
+      const AwsCredentialMaterial& credential,
+      const String& zone,
+      const String& region,
+      const Vector<String>& values,
+      String& failure)
+  {
     String url = {};
     url.snprintf<"https://route53.amazonaws.com/2013-04-01/hostedzone/{}/rrset"_ctv>(zone);
-    String action = {};
-    action.assign(removing ? "DELETE" : "CREATE");
+    String actionText = {};
+    actionText.assign(action);
     String body = {};
-    body.snprintf<"<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>{}</Action><ResourceRecordSet><Name>{}</Name><Type>{}</Type><TTL>{itoa}</TTL><ResourceRecords><ResourceRecord><Value>{}</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>"_ctv>(
-        action,
-        record.name,
-        record.type,
-        record.ttl,
-        value);
+    body.snprintf<"<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>{}</Action><ResourceRecordSet><Name>"_ctv>(actionText);
+    prodigyDNSAppendRoute53XMLText(body, record.name);
+    body.append("</Name><Type>"_ctv);
+    prodigyDNSAppendRoute53XMLText(body, record.type);
+    body.snprintf_add<"</Type><TTL>{itoa}</TTL><ResourceRecords>"_ctv>(record.ttl);
+    for (const String& value : values)
+    {
+      body.append("<ResourceRecord><Value>"_ctv);
+      prodigyDNSAppendRoute53XMLText(body, value);
+      body.append("</Value></ResourceRecord>"_ctv);
+    }
+    body.append("</ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>"_ctv);
     String response = {};
     long httpCode = 0;
     if (sendAWS("POST", url, region, credential, &body, response, httpCode) == false)
@@ -153,6 +321,16 @@ private:
 
   bool findRecord(const ProdigyDNSRecordBinding& record, const AwsCredentialMaterial& credential, const String& zone, const String& region, ProdigyDNSRecordPresence& presence, String& failure)
   {
+    String response = {};
+    if (listRecordSets(record, credential, zone, region, response, failure) == false)
+    {
+      return false;
+    }
+    return prodigyDNSFindRoute53Record(response, record, presence, failure);
+  }
+
+  bool listRecordSets(const ProdigyDNSRecordBinding& record, const AwsCredentialMaterial& credential, const String& zone, const String& region, String& response, String& failure)
+  {
     String name = {};
     String type = {};
     if (prodigyDNSEncodePathPart(record.name, name, failure) == false || prodigyDNSEncodePathPart(record.type, type, failure) == false)
@@ -161,7 +339,6 @@ private:
     }
     String url = {};
     url.snprintf<"https://route53.amazonaws.com/2013-04-01/hostedzone/{}/rrset?name={}&type={}&maxitems=1"_ctv>(zone, name, type);
-    String response = {};
     long httpCode = 0;
     if (sendAWS("GET", url, region, credential, nullptr, response, httpCode) == false)
     {
@@ -173,6 +350,6 @@ private:
       failure.snprintf<"route53 dns list failed [http={itoa}]: {}"_ctv>(uint32_t(httpCode), response);
       return false;
     }
-    return prodigyDNSFindRoute53Record(response, record, presence, failure);
+    return true;
   }
 };

@@ -173,7 +173,7 @@ static inline bool mothershipConnectSSHSession(
   {
     if (failure)
     {
-      failure->snprintf<"failed to connect to ssh address {}:{}"_ctv>(machine.ssh.address, unsigned(machine.ssh.port));
+      failure->snprintf<"failed to connect to ssh address {}:{itoa}"_ctv>(machine.ssh.address, unsigned(machine.ssh.port));
     }
     return false;
   }
@@ -191,6 +191,15 @@ static inline bool mothershipConnectSSHSession(
   }
 
   libssh2_session_set_blocking(session, 1);
+  if (libssh2_session_method_pref(session, LIBSSH2_METHOD_HOSTKEY, "ssh-ed25519") != 0)
+  {
+    if (failure)
+    {
+      failure->assign("failed to prefer ed25519 ssh host key");
+    }
+    mothershipCloseSSHSession(session, fd);
+    return false;
+  }
 
   if (libssh2_session_handshake(session, fd) != 0)
   {

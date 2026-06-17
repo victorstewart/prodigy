@@ -25,6 +25,12 @@ public:
   uint64_t destructionWaiterDeploymentID = 0;
   bool suppressStartupPairingNotifications = false;
   bool runtimeReady = false;
+  bool hasCredentialBundle = false;
+  bool hasPendingCredentialBundle = false;
+  int64_t pendingCredentialBundleSinceMs = 0;
+  CredentialBundle credentialBundle;
+  CredentialBundle pendingCredentialBundle;
+  String credentialRefreshFailure;
   bool statefulTopologyCutoverReady = false;
   uint32_t statefulTopologyCutoverSourceEpoch = 0;
   uint32_t statefulTopologyCutoverTargetEpoch = 0;
@@ -514,6 +520,8 @@ public:
     plan.createdAtMs = createdAtMs;
     plan.shardGroup = shardGroup;
     plan.nShardGroups = (plan.isStateful ? deploymentShardGroups : 0);
+    plan.hasCredentialBundle = hasCredentialBundle;
+    plan.credentialBundle = credentialBundle;
 
     return plan;
   }

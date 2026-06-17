@@ -292,6 +292,7 @@ static inline bool mothershipBuildClusterBrainConfig(const MothershipProdigyClus
   config.datacenterFragment = cluster.datacenterFragment;
   config.autoscaleIntervalSeconds = cluster.autoscaleIntervalSeconds;
   config.sharedCPUOvercommitPermille = cluster.sharedCPUOvercommitPermille;
+  config.machineReservedResources = cluster.machineReservedResources;
 
   for (const MothershipProdigyClusterMachineSchema& machineSchema : cluster.machineSchemas)
   {
@@ -330,6 +331,7 @@ static inline bool mothershipBuildClusterBrainConfig(const MothershipProdigyClus
       return false;
     }
   }
+  config.acme = cluster.acme;
 
   return true;
 }
@@ -385,6 +387,7 @@ static inline bool mothershipBuildClusterBootstrapRequest(const MothershipProdig
   request.bootstrapSshHostKeyPackage = cluster.bootstrapSshHostKeyPackage;
   request.bootstrapSshPrivateKeyPath = cluster.bootstrapSshPrivateKeyPath;
   request.remoteProdigyPath = cluster.remoteProdigyPath;
+  request.acme = cluster.acme;
   request.clusterUUID = cluster.clusterUUID;
   request.architecture = cluster.architecture;
   return mothershipResolveClusterControlSocketPath(cluster, request.controlSocketPath, failure);
@@ -661,7 +664,7 @@ static inline bool mothershipProvisionCreatedSeedMachine(
   }
 
   Machine *snapshot = *createdSnapshots.begin();
-  prodigyPopulateCreatedClusterMachineFromSnapshot(seedMachine, snapshot, instruction, machineConfig, cluster.bootstrapSshUser, cluster.bootstrapSshPrivateKeyPath, cluster.bootstrapSshHostKeyPackage.publicKeyOpenSSH);
+  prodigyPopulateCreatedClusterMachineFromSnapshot(seedMachine, snapshot, instruction, machineConfig, cluster.bootstrapSshUser, cluster.bootstrapSshPrivateKeyPath, cluster.bootstrapSshHostKeyPackage.publicKeyOpenSSH, cluster.machineReservedResources);
   prodigyDestroyMachineSnapshot(snapshot);
 
   if (failure)

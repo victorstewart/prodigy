@@ -20,6 +20,7 @@ use prodigy_sdk::{
    NeuronHub,
    ResourceDelta,
    SubscriptionPairing,
+   TlsIdentity,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
@@ -61,6 +62,7 @@ enum Event
 struct MeshDispatch
 {
    sink: ReactorSink<Event>,
+   tls_identities: Vec<TlsIdentity>,
 }
 
 impl Dispatch for MeshDispatch
@@ -134,6 +136,15 @@ impl Dispatch for MeshDispatch
       hub: &mut NeuronHub<Self>,
       delta: CredentialDelta)
    {
+      for name in &delta.removed_tls_names
+      {
+         self.tls_identities.retain(|identity| identity.name != *name);
+      }
+      for identity in &delta.updated_tls
+      {
+         self.tls_identities.retain(|current| current.name != identity.name);
+         self.tls_identities.push(identity.clone());
+      }
       hub.queue_credentials_refresh_ack();
       queue_stats(
          hub,
@@ -157,6 +168,7 @@ async fn main() -> io::Result<()>
    let mut reactor = TokioReactor::new();
    let dispatch = MeshDispatch {
       sink: reactor.sink(),
+      tls_identities: Vec::new(),
    };
    let mut neuron = reactor.attach_neuron(TokioNeuron::from_process(dispatch)?);
    let parameters = neuron.parameters().clone();

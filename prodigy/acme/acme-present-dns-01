@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+: "${PRODIGY_MOTHERSHIP:?PRODIGY_MOTHERSHIP required}"
+PRODIGY_ROOT="$(dirname "$(dirname "$PRODIGY_MOTHERSHIP")")"
+[ ! -d "${PRODIGY_ROOT}/lib" ] || export LD_LIBRARY_PATH="${PRODIGY_ROOT}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+if [ "${PRODIGY_ACME_TARGET:-}" ]; then
+  exec "$PRODIGY_MOTHERSHIP" acme-present-dns-01 "$PRODIGY_ACME_TARGET" >&2
+fi
+exec "$PRODIGY_MOTHERSHIP" acme-present-dns-01 >&2

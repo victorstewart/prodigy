@@ -1,11 +1,20 @@
 #include <limits.h>
+#include <cerrno>
+#include <cctype>
 #include <cpp-sort/adapters/verge_adapter.h>
 #include <services/debug.h>
 #include <cpp-sort/sorters/ska_sorter.h>
+#include <cstdlib>
+#include <ctime>
+#include <cstring>
 #include <ifaddrs.h>
 #include <macros/time.h>
 #include <memory>
 #include <net/if.h>
+#include <openssl/x509v3.h>
+#include <openssl/x509_vfy.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 static inline cppsort::verge_adapter<cppsort::ska_sorter> sorter;
 
@@ -23,6 +32,7 @@ static inline cppsort::verge_adapter<cppsort::ska_sorter> sorter;
 
 #include <prodigy/bootstrap.config.h>
 #include <prodigy/bundle.artifact.h>
+#include <prodigy/acme.certbot.h>
 #include <prodigy/brain.reachability.h>
 #include <prodigy/cluster.bootstrap.h>
 #include <prodigy/cluster.machine.helpers.h>
@@ -240,7 +250,7 @@ inline void BrainBase::buildHostedSwitchboardIngressPrefixes(Machine *machine, V
   {
     if (subnet.ingressScope == RoutableIngressScope::singleMachine && subnet.machineUUID != 0 && subnet.subnet.network.isNull() == false)
     {
-      appendPrefixIfMissing(subnet.subnet.canonicalized());
+      appendPrefixIfMissing(distributableExternalSubnetSwitchboardSubnet(subnet).canonicalized());
     }
   }
 }
@@ -344,7 +354,7 @@ inline bool BrainBase::buildSwitchboardOverlayRoutingConfig(Machine *machine, Sw
   {
     if (subnet.routing == ExternalSubnetRouting::switchboardPinnedRoute)
     {
-      config.overlaySubnets.push_back(subnet.subnet);
+      config.overlaySubnets.push_back(distributableExternalSubnetSwitchboardSubnet(subnet));
     }
   }
 
@@ -528,7 +538,7 @@ inline bool BrainBase::buildSwitchboardOverlayRoutingConfig(Machine *machine, Sw
       continue;
     }
 
-    appendHostedIngressRouteIfMissing(subnet.subnet.canonicalized(), owner->fragment);
+    appendHostedIngressRouteIfMissing(distributableExternalSubnetSwitchboardSubnet(subnet).canonicalized(), owner->fragment);
   }
 
   return true;
@@ -858,6 +868,7 @@ public:
   uint128_t updateSelfPlannedMasterPeerKey = 0;
   uint128_t pendingDesignatedMasterPeerKey = 0;
   bool updateSelfUseStagedBundleOnly = false;
+  bool updateSelfTransitionAfterMothershipAck = false;
   String updateSelfBundleBlob;
   bytell_hash_set<uint128_t> updateSelfBundleIssuedPeerKeys;
   bytell_hash_set<uint128_t> updateSelfBundleEchoPeerKeys;
@@ -868,6 +879,11 @@ public:
   bytell_hash_set<uint128_t> updateSelfTransitionIssuedPeerKeys;
   bytell_hash_set<uint128_t> updateSelfRelinquishIssuedPeerKeys;
   constexpr static int64_t connectFailureLogIntervalMs = prodigyBrainConnectFailureLogIntervalMs;
+  constexpr static int64_t certificateLifecycleBaseRetryDelayMs = 5 * 60 * 1000;
+  constexpr static int64_t certificateLifecycleMaxRetryDelayMs = 60 * 60 * 1000;
+  constexpr static int64_t certificateLifecycleMaxJitterMs = 15 * 60 * 1000;
+  constexpr static int64_t credentialDeltaAckTimeoutMs = 5 * 60 * 1000;
+  constexpr static int64_t publicTlsCertbotTimeoutMs = 60 * 60 * 1000;
   bytell_hash_map<uint64_t, int64_t> connectFailureNextLogMsByKey;
 
   // not master brain
@@ -916,6 +932,9 @@ public:
   bytell_hash_map<uint16_t, ApplicationTlsVaultFactory> tlsVaultFactoriesByApp;
   bytell_hash_map<uint16_t, ApplicationApiCredentialSet> apiCredentialSetsByApp;
   bytell_hash_map<uint64_t, BrainTlsResumptionDeploymentState> tlsResumptionStateByDeployment;
+  bytell_hash_map<String, pid_t> publicTlsCertbotPids;
+  bytell_hash_map<String, int64_t> publicTlsCertbotStartedAtMs;
+  bytell_hash_map<String, int> publicTlsCertbotLockFDs;
   bytell_hash_map<String, uint16_t> reservedApplicationIDsByName;
   bytell_hash_map<uint16_t, String> reservedApplicationNamesByID;
   bytell_hash_map<String, ApplicationServiceIdentity> reservedApplicationServicesByNameKey;
@@ -999,7 +1018,7 @@ public:
   String makeReservedServiceNameKey(uint16_t applicationID, const String& serviceName) const
   {
     String key;
-    key.snprintf<"{}:{}"_ctv>(applicationID, serviceName);
+    key.snprintf<"{itoa}:{}"_ctv>(applicationID, serviceName);
     return key;
   }
 
@@ -1632,6 +1651,1442 @@ public:
     return remove ? provider->remove(binding, *credential, failure) : provider->upsert(binding, *credential, failure);
   }
 
+  static bool credentialBundleHasTlsIdentityGeneration(const CredentialBundle& bundle, const String& name, uint64_t generation)
+  {
+    for (const TlsIdentity& identity : bundle.tlsIdentities)
+    {
+      if (identity.name.equals(name) && identity.generation == generation)
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static void noteContainerCredentialBundleApplied(ContainerView *container, const CredentialBundle *bundle)
+  {
+    if (container == nullptr)
+    {
+      return;
+    }
+    container->hasPendingCredentialBundle = false;
+    container->pendingCredentialBundleSinceMs = 0;
+    container->pendingCredentialBundle = {};
+    container->hasCredentialBundle = bundle != nullptr;
+    container->credentialBundle = bundle == nullptr ? CredentialBundle {} : *bundle;
+    container->credentialRefreshFailure.clear();
+  }
+
+  static void noteContainerCredentialDeltaPending(ContainerView *container, const CredentialDelta& delta)
+  {
+    if (container == nullptr)
+    {
+      return;
+    }
+    CredentialBundle next = container->hasPendingCredentialBundle ? container->pendingCredentialBundle : container->credentialBundle;
+    applyCredentialDelta(next, delta);
+    container->pendingCredentialBundle = std::move(next);
+    container->hasPendingCredentialBundle = true;
+    container->pendingCredentialBundleSinceMs = Time::now<TimeResolution::ms>();
+    container->credentialRefreshFailure.clear();
+  }
+
+  bool noteContainerCredentialRefreshAck(uint128_t containerUUID)
+  {
+    auto containerIt = containers.find(containerUUID);
+    if (containerIt == containers.end() || containerIt->second == nullptr || containerIt->second->hasPendingCredentialBundle == false)
+    {
+      return false;
+    }
+    ContainerView *container = containerIt->second;
+    container->credentialBundle = std::move(container->pendingCredentialBundle);
+    container->pendingCredentialBundle = {};
+    container->hasCredentialBundle = true;
+    container->hasPendingCredentialBundle = false;
+    container->pendingCredentialBundleSinceMs = 0;
+    container->credentialRefreshFailure.clear();
+    return true;
+  }
+
+  static bool credentialBundleHasTlsIdentityApplyResult(const CredentialBundle& bundle, const TlsIdentityApplyResult& result)
+  {
+    for (const TlsIdentity& identity : bundle.tlsIdentities)
+    {
+      if (identity.name.equals(result.identityName) && identity.generation == result.generation)
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool noteContainerCredentialApplyAck(uint128_t containerUUID, const CredentialApplyAck& ack)
+  {
+    auto containerIt = containers.find(containerUUID);
+    if (containerIt == containers.end() || containerIt->second == nullptr)
+    {
+      return false;
+    }
+    ContainerView *container = containerIt->second;
+    if (container->hasPendingCredentialBundle == false || ack.tlsResults.empty())
+    {
+      return noteContainerCredentialRefreshAck(containerUUID);
+    }
+
+    bool accepted = true;
+    String failure = {};
+    for (const TlsIdentityApplyResult& result : ack.tlsResults)
+    {
+      if (result.success == false || credentialBundleHasTlsIdentityApplyResult(container->pendingCredentialBundle, result) == false)
+      {
+        accepted = false;
+        failure = result.failureReason.size() ? result.failureReason : "TLS identity refresh was rejected"_ctv;
+        break;
+      }
+    }
+    for (const TlsIdentity& identity : container->pendingCredentialBundle.tlsIdentities)
+    {
+      bool found = false;
+      for (const TlsIdentityApplyResult& result : ack.tlsResults)
+      {
+        if (identity.name.equals(result.identityName) && identity.generation == result.generation && result.success)
+        {
+          found = true;
+          break;
+        }
+      }
+      if (found == false)
+      {
+        accepted = false;
+        if (failure.size() == 0)
+        {
+          failure.assign("TLS identity refresh ACK did not cover every pending identity"_ctv);
+        }
+        break;
+      }
+    }
+    if (accepted)
+    {
+      return noteContainerCredentialRefreshAck(containerUUID);
+    }
+
+    container->pendingCredentialBundle = {};
+    container->hasPendingCredentialBundle = false;
+    container->pendingCredentialBundleSinceMs = 0;
+    container->credentialRefreshFailure = std::move(failure);
+    return false;
+  }
+
+  const PublicTlsCertificateState *findPublicTlsCertificateState(uint16_t applicationID, uint64_t deploymentID, const String& wormholeName, const String& certName) const
+  {
+    for (const PublicTlsCertificateState& certificate : masterAuthorityRuntimeState.publicTlsCertificates)
+    {
+      const String& storedCertName = certificate.certbotCertName.size() ? certificate.certbotCertName : certificate.spec.identityName;
+      if (certificate.spec.applicationID == applicationID &&
+          certificate.spec.deploymentID == deploymentID &&
+          certificate.spec.wormholeName.equals(wormholeName) &&
+          storedCertName.equals(certName))
+      {
+        return &certificate;
+      }
+    }
+    return nullptr;
+  }
+
+  PublicTlsCertificateState *findPublicTlsCertificateState(uint16_t applicationID, uint64_t deploymentID, const String& wormholeName, const String& certName)
+  {
+    return const_cast<PublicTlsCertificateState *>(static_cast<const Brain *>(this)->findPublicTlsCertificateState(applicationID, deploymentID, wormholeName, certName));
+  }
+
+  static bool publicTlsCertificateCoversIdentifier(const PublicTlsCertificateState& certificate, const String& identifier)
+  {
+    for (const String& domain : certificate.spec.domains)
+    {
+      if (routableResourceDNSPartEquals(domain, identifier, true))
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static uint32_t publicTlsDomainMatchCount(const Vector<String>& domains, const String& target)
+  {
+    uint32_t count = 0;
+    for (const String& domain : domains)
+    {
+      count += routableResourceDNSPartEquals(domain, target, true) ? 1 : 0;
+    }
+    return count;
+  }
+
+  static bool publicTlsDomainSetsEqual(const Vector<String>& lhs, const Vector<String>& rhs)
+  {
+    if (lhs.size() != rhs.size())
+    {
+      return false;
+    }
+    for (const String& domain : lhs)
+    {
+      if (publicTlsDomainMatchCount(lhs, domain) != publicTlsDomainMatchCount(rhs, domain))
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static uint64_t certificateLifecycleMix(uint64_t seed, const String& value)
+  {
+    uint64_t hash = seed ? seed : 1'469'598'103'934'665'603ULL;
+    for (uint64_t index = 0; index < value.size(); index += 1)
+    {
+      hash ^= uint8_t(value[index]);
+      hash *= 1'099'511'628'211ULL;
+    }
+    return hash;
+  }
+
+  static int64_t certificateLifecycleJitterMs(uint64_t seed)
+  {
+    return certificateLifecycleMaxJitterMs <= 0 ? 0 : int64_t(seed % uint64_t(certificateLifecycleMaxJitterMs + 1));
+  }
+
+  static int64_t certificateLifecycleJitteredRenewAtMs(int64_t renewAtMs, uint64_t seed)
+  {
+    return renewAtMs <= 0 ? 0 : renewAtMs + certificateLifecycleJitterMs(seed);
+  }
+
+  static int64_t certificateLifecycleBackoffMs(uint32_t failureCount, uint64_t seed)
+  {
+    uint32_t shifts = failureCount > 1 ? std::min<uint32_t>(failureCount - 1, 5) : 0;
+    int64_t delay = certificateLifecycleBaseRetryDelayMs << shifts;
+    return std::min<int64_t>(delay, certificateLifecycleMaxRetryDelayMs) + certificateLifecycleJitterMs(seed);
+  }
+
+  static bool certificateLifecycleBackoffActive(int64_t nowMs, int64_t lastAttemptMs, int64_t lastSuccessMs, uint32_t failureCount, uint64_t seed)
+  {
+    return lastAttemptMs > lastSuccessMs && (nowMs <= lastAttemptMs || nowMs - lastAttemptMs < certificateLifecycleBackoffMs(failureCount, seed));
+  }
+
+  static uint64_t publicTlsCertificateJitterSeed(const PublicTlsCertificateState& certificate)
+  {
+    uint64_t seed = (uint64_t(certificate.spec.applicationID) << 48) ^ certificate.spec.deploymentID;
+    seed = certificateLifecycleMix(seed, certificate.spec.wormholeName);
+    seed = certificateLifecycleMix(seed, certificate.spec.identityName);
+    for (const String& domain : certificate.spec.domains)
+    {
+      seed = certificateLifecycleMix(seed, domain);
+    }
+    return seed;
+  }
+
+  static uint64_t privateTlsVaultJitterSeed(const ApplicationTlsVaultFactory& factory)
+  {
+    return (uint64_t(factory.applicationID) << 32) ^ factory.factoryGeneration;
+  }
+
+  static uint64_t privateTlsVaultJitterSeed(const PrivateTlsVaultLifecycleState& lifecycle)
+  {
+    return (uint64_t(lifecycle.applicationID) << 32) ^ lifecycle.factoryGeneration;
+  }
+
+  template <typename T>
+  static int64_t privateTlsVaultRenewAtMs(const T& seedSource, int64_t notBeforeMs, int64_t notAfterMs, uint64_t salt)
+  {
+    return certificateLifecycleJitteredRenewAtMs(prodigyCertificateRenewAtMs(notBeforeMs, notAfterMs, prodigyDefaultCertificateRenewAfterLifetimePermille), privateTlsVaultJitterSeed(seedSource) ^ salt);
+  }
+
+  static void noteCertificateFailure(uint32_t& failureCount, String& storedFailure, const String& failure)
+  {
+    storedFailure = failure;
+    if (failureCount < UINT32_MAX)
+    {
+      failureCount += 1;
+    }
+  }
+
+  static bool acmeDNSCredentialListAllows(const String& list, const String& recordName, bool zoneMatch)
+  {
+    for (size_t index = 0; index < list.size();)
+    {
+      while (index < list.size() && (list[index] == ',' || list[index] == ';' || std::isspace(static_cast<unsigned char>(list[index]))))
+      {
+        index += 1;
+      }
+      size_t begin = index;
+      while (index < list.size() && list[index] != ',' && list[index] != ';' && std::isspace(static_cast<unsigned char>(list[index])) == false)
+      {
+        index += 1;
+      }
+      if (index == begin)
+      {
+        continue;
+      }
+
+      String token;
+      token.assign(list.data() + begin, index - begin);
+      if (zoneMatch == false && routableResourceDNSPartEquals(token, recordName, true))
+      {
+        return true;
+      }
+      if (zoneMatch)
+      {
+        size_t recordSize = recordName.size();
+        size_t tokenSize = token.size();
+        while (recordSize > 0 && recordName[recordSize - 1] == '.')
+        {
+          recordSize -= 1;
+        }
+        while (tokenSize > 0 && token[tokenSize - 1] == '.')
+        {
+          tokenSize -= 1;
+        }
+        if (tokenSize > 0 &&
+            recordSize >= tokenSize &&
+            (recordSize == tokenSize || recordName[recordSize - tokenSize - 1] == '.') &&
+            routableResourceDNSPartEquals(recordName.substr(recordSize - tokenSize, tokenSize, Copy::no), token.substr(0, tokenSize, Copy::no), true))
+        {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  static bool acmeDNSCredentialAllowsRecord(const ApiCredential& credential, const String& recordName, String& failure)
+  {
+    failure.clear();
+    auto scopeIt = credential.metadata.find("dnsScope"_ctv);
+    if (scopeIt == credential.metadata.end())
+    {
+      failure.assign("ACME DNS credential scope is not declared"_ctv);
+      return false;
+    }
+    const String& scope = scopeIt->second;
+    if (routableResourceDNSPartEquals(scope, "native-account"_ctv, false))
+    {
+      auto intentIt = credential.metadata.find("dnsAccountScopeAccepted"_ctv);
+      if (intentIt != credential.metadata.end() && (intentIt->second.equal("1"_ctv) || routableResourceDNSPartEquals(intentIt->second, "true"_ctv, false)))
+      {
+        return true;
+      }
+      failure.assign("ACME DNS native-account scope requires dnsAccountScopeAccepted=true"_ctv);
+      return false;
+    }
+    if (routableResourceDNSPartEquals(scope, "native-zone"_ctv, false))
+    {
+      auto zonesIt = credential.metadata.find("dnsZones"_ctv);
+      if (zonesIt == credential.metadata.end())
+      {
+        zonesIt = credential.metadata.find("dnsZone"_ctv);
+      }
+      if (zonesIt != credential.metadata.end() && acmeDNSCredentialListAllows(zonesIt->second, recordName, true))
+      {
+        return true;
+      }
+      failure.assign("ACME DNS credential does not cover challenge zone"_ctv);
+      return false;
+    }
+    if (routableResourceDNSPartEquals(scope, "native-exact"_ctv, false) || routableResourceDNSPartEquals(scope, "webhook-exact"_ctv, false))
+    {
+      auto recordsIt = credential.metadata.find("dnsRecords"_ctv);
+      if (recordsIt == credential.metadata.end())
+      {
+        recordsIt = credential.metadata.find("dnsRecord"_ctv);
+      }
+      if (recordsIt != credential.metadata.end() && acmeDNSCredentialListAllows(recordsIt->second, recordName, false))
+      {
+        return true;
+      }
+      failure.assign("ACME DNS credential does not cover challenge record"_ctv);
+      return false;
+    }
+    failure.assign("ACME DNS credential scope is invalid"_ctv);
+    return false;
+  }
+
+  static bool acmeDNSRecordCoveredByDeclaredDNS(const WormholeDNSConfig& dns, const ApiCredential& credential, const String& recordName)
+  {
+    String declaredRecord = {};
+    if (dns.name.size() && prodigyACMEDNS01RecordName(dns.name, declaredRecord) && declaredRecord.equals(recordName))
+    {
+      return true;
+    }
+    if (dns.zone.size() && acmeDNSCredentialListAllows(dns.zone, recordName, true))
+    {
+      return true;
+    }
+    if (auto zonesIt = credential.metadata.find("dnsZones"_ctv); zonesIt != credential.metadata.end() && acmeDNSCredentialListAllows(zonesIt->second, recordName, true))
+    {
+      return true;
+    }
+    if (auto zoneIt = credential.metadata.find("dnsZone"_ctv); zoneIt != credential.metadata.end() && acmeDNSCredentialListAllows(zoneIt->second, recordName, true))
+    {
+      return true;
+    }
+    if (auto recordsIt = credential.metadata.find("dnsRecords"_ctv); recordsIt != credential.metadata.end() && acmeDNSCredentialListAllows(recordsIt->second, recordName, false))
+    {
+      return true;
+    }
+    if (auto recordIt = credential.metadata.find("dnsRecord"_ctv); recordIt != credential.metadata.end() && acmeDNSCredentialListAllows(recordIt->second, recordName, false))
+    {
+      return true;
+    }
+    return false;
+  }
+
+  static size_t publicTlsFindLiteral(const String& text, const char *literal, size_t start = 0)
+  {
+    const size_t literalSize = std::strlen(literal);
+    if (literalSize == 0 || start > text.size() || literalSize > text.size() - start)
+    {
+      return SIZE_MAX;
+    }
+    for (size_t index = start; index + literalSize <= text.size(); ++index)
+    {
+      if (std::memcmp(text.data() + index, literal, literalSize) == 0)
+      {
+        return index;
+      }
+    }
+    return SIZE_MAX;
+  }
+
+  static bool splitFirstPEMCertificate(const String& fullchainPem, String& leafPem, String& chainPem, String& failure)
+  {
+    leafPem.clear();
+    chainPem.clear();
+    const char *beginMarker = "-----BEGIN CERTIFICATE-----";
+    const char *endMarker = "-----END CERTIFICATE-----";
+    size_t begin = publicTlsFindLiteral(fullchainPem, beginMarker);
+    size_t end = begin == SIZE_MAX ? SIZE_MAX : publicTlsFindLiteral(fullchainPem, endMarker, begin);
+    if (begin == SIZE_MAX || end == SIZE_MAX)
+    {
+      failure.assign("ACME fullchain is missing a PEM certificate"_ctv);
+      return false;
+    }
+    end += std::strlen(endMarker);
+    while (end < fullchainPem.size() && (fullchainPem[end] == '\n' || fullchainPem[end] == '\r'))
+    {
+      end += 1;
+    }
+    leafPem.assign(fullchainPem.substr(begin, end - begin, Copy::yes));
+    chainPem.assign(fullchainPem.substr(end, fullchainPem.size() - end, Copy::yes));
+    if (publicTlsFindLiteral(chainPem, beginMarker) == SIZE_MAX)
+    {
+      failure.assign("ACME fullchain is missing chain certificates"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  static void freeX509Certificates(Vector<X509 *>& certs)
+  {
+    for (X509 *cert : certs)
+    {
+      if (cert)
+      {
+        X509_free(cert);
+      }
+    }
+    certs.clear();
+  }
+
+  static bool x509PEMCertificates(const String& pem, Vector<X509 *>& certs, String& failure)
+  {
+    certs.clear();
+    const char *beginMarker = "-----BEGIN CERTIFICATE-----";
+    const char *endMarker = "-----END CERTIFICATE-----";
+    for (size_t offset = 0;;)
+    {
+      size_t begin = publicTlsFindLiteral(pem, beginMarker, offset);
+      if (begin == SIZE_MAX)
+      {
+        break;
+      }
+      size_t end = publicTlsFindLiteral(pem, endMarker, begin);
+      if (end == SIZE_MAX)
+      {
+        failure.assign("ACME certificate chain PEM is incomplete"_ctv);
+        freeX509Certificates(certs);
+        return false;
+      }
+      end += std::strlen(endMarker);
+      String certPem = {};
+      certPem.assign(pem.substr(begin, end - begin, Copy::yes));
+      X509 *cert = VaultPem::x509FromPem(certPem);
+      if (cert == nullptr)
+      {
+        failure.assign("ACME certificate chain PEM is invalid"_ctv);
+        freeX509Certificates(certs);
+        return false;
+      }
+      certs.push_back(cert);
+      offset = end;
+    }
+    return true;
+  }
+
+  static bool x509CertificateIssuedBy(X509 *cert, X509 *issuer)
+  {
+    EVP_PKEY *issuerKey = issuer == nullptr ? nullptr : X509_get_pubkey(issuer);
+    bool ok = cert != nullptr && issuer != nullptr && issuerKey != nullptr &&
+              X509_check_issued(issuer, cert) == X509_V_OK &&
+              X509_verify(cert, issuerKey) == 1;
+    if (issuerKey)
+    {
+      EVP_PKEY_free(issuerKey);
+    }
+    return ok;
+  }
+
+  static bool x509ChainLinksValid(X509 *leafCert, const String& chainPem, String& failure)
+  {
+    Vector<X509 *> chain = {};
+    if (x509PEMCertificates(chainPem, chain, failure) == false)
+    {
+      return false;
+    }
+    if (chain.empty())
+    {
+      failure.assign("ACME fullchain is missing chain certificates"_ctv);
+      return false;
+    }
+
+    X509 *issued = leafCert;
+    for (X509 *issuer : chain)
+    {
+      if (x509CertificateIssuedBy(issued, issuer) == false)
+      {
+        failure.assign("ACME certificate chain is invalid"_ctv);
+        freeX509Certificates(chain);
+        return false;
+      }
+      issued = issuer;
+    }
+    freeX509Certificates(chain);
+    return true;
+  }
+
+  static bool x509ChainTrustedBySystem(X509 *leafCert, const String& chainPem, String& failure)
+  {
+    Vector<X509 *> chain = {};
+    if (x509PEMCertificates(chainPem, chain, failure) == false)
+    {
+      return false;
+    }
+
+    STACK_OF(X509) *untrusted = sk_X509_new_null();
+    X509_STORE *store = X509_STORE_new();
+    X509_STORE_CTX *ctx = X509_STORE_CTX_new();
+    bool ok = leafCert != nullptr && untrusted != nullptr && store != nullptr && ctx != nullptr &&
+              X509_STORE_set_default_paths(store) == 1;
+    for (X509 *cert : chain)
+    {
+      ok = ok && sk_X509_push(untrusted, cert) != 0;
+    }
+    ok = ok &&
+         X509_STORE_CTX_init(ctx, store, leafCert, untrusted) == 1 &&
+         X509_verify_cert(ctx) == 1;
+
+    if (ctx)
+    {
+      X509_STORE_CTX_free(ctx);
+    }
+    if (store)
+    {
+      X509_STORE_free(store);
+    }
+    if (untrusted)
+    {
+      sk_X509_free(untrusted);
+    }
+    freeX509Certificates(chain);
+    if (ok == false)
+    {
+      failure.assign("ACME certificate chain is not trusted"_ctv);
+    }
+    return ok;
+  }
+
+  static bool readACMELineageFile(const String& lineagePath, const char *name, String& output, String& failure)
+  {
+    String path = {};
+    path.snprintf<"{}/{}"_ctv>(lineagePath, String(name));
+    Filesystem::openReadAtClose(-1, path, output);
+    if (output.size() == 0)
+    {
+      failure.snprintf<"failed to read ACME lineage file {}"_ctv>(path);
+      return false;
+    }
+    return true;
+  }
+
+  static bool acmeLineagePathMatchesExpected(const String& lineagePath, const String& certName, const String& expectedLineagePath)
+  {
+    if (lineagePath.size() == 0 || lineagePath[0] != '/' || expectedLineagePath.size() == 0 || expectedLineagePath[0] != '/' || prodigySafePathSegment(certName) == false)
+    {
+      return false;
+    }
+    uint64_t lineageEnd = lineagePath.size();
+    uint64_t expectedEnd = expectedLineagePath.size();
+    while (lineageEnd > 1 && lineagePath[lineageEnd - 1] == '/')
+    {
+      lineageEnd -= 1;
+    }
+    while (expectedEnd > 1 && expectedLineagePath[expectedEnd - 1] == '/')
+    {
+      expectedEnd -= 1;
+    }
+    return lineageEnd == expectedEnd && lineagePath.substr(0, lineageEnd, Copy::yes).equals(expectedLineagePath.substr(0, expectedEnd, Copy::yes));
+  }
+
+  static bool x509DNSSubjectAltNames(X509 *cert, Vector<String>& dnsSans, String& failure)
+  {
+    dnsSans.clear();
+    GENERAL_NAMES *names = cert == nullptr ? nullptr : static_cast<GENERAL_NAMES *>(X509_get_ext_d2i(cert, NID_subject_alt_name, nullptr, nullptr));
+    if (names == nullptr)
+    {
+      failure.assign("ACME certificate is missing DNS SANs"_ctv);
+      return false;
+    }
+
+    for (int index = 0; index < sk_GENERAL_NAME_num(names); ++index)
+    {
+      const GENERAL_NAME *name = sk_GENERAL_NAME_value(names, index);
+      if (name == nullptr || name->type != GEN_DNS || name->d.dNSName == nullptr)
+      {
+        continue;
+      }
+      const int length = ASN1_STRING_length(name->d.dNSName);
+      const unsigned char *bytes = ASN1_STRING_get0_data(name->d.dNSName);
+      if (length <= 0 || bytes == nullptr)
+      {
+        continue;
+      }
+      String dns = {};
+      dns.assign(reinterpret_cast<const char *>(bytes), size_t(length));
+      dnsSans.push_back(std::move(dns));
+    }
+
+    sk_GENERAL_NAME_pop_free(names, GENERAL_NAME_free);
+    if (dnsSans.empty())
+    {
+      failure.assign("ACME certificate is missing DNS SANs"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  static bool x509HasIPAddressSubjectAltName(X509 *cert)
+  {
+    GENERAL_NAMES *names = cert == nullptr ? nullptr : static_cast<GENERAL_NAMES *>(X509_get_ext_d2i(cert, NID_subject_alt_name, nullptr, nullptr));
+    if (names == nullptr)
+    {
+      return false;
+    }
+    bool found = false;
+    for (int index = 0; index < sk_GENERAL_NAME_num(names); ++index)
+    {
+      const GENERAL_NAME *name = sk_GENERAL_NAME_value(names, index);
+      if (name != nullptr && name->type == GEN_IPADD)
+      {
+        found = true;
+        break;
+      }
+    }
+    sk_GENERAL_NAME_pop_free(names, GENERAL_NAME_free);
+    return found;
+  }
+
+  static bool x509HasExtendedKeyUsage(X509 *cert, int nid)
+  {
+    EXTENDED_KEY_USAGE *usage = cert == nullptr ? nullptr : static_cast<EXTENDED_KEY_USAGE *>(X509_get_ext_d2i(cert, NID_ext_key_usage, nullptr, nullptr));
+    if (usage == nullptr)
+    {
+      return false;
+    }
+    bool found = false;
+    for (int index = 0; index < sk_ASN1_OBJECT_num(usage); ++index)
+    {
+      const ASN1_OBJECT *object = sk_ASN1_OBJECT_value(usage, index);
+      if (object != nullptr && OBJ_obj2nid(object) == nid)
+      {
+        found = true;
+        break;
+      }
+    }
+    sk_ASN1_OBJECT_pop_free(usage, ASN1_OBJECT_free);
+    return found;
+  }
+
+  static bool publicTlsKeyMatchesSpec(EVP_PKEY *key, const String& keyType)
+  {
+    int baseID = key == nullptr ? EVP_PKEY_NONE : EVP_PKEY_base_id(key);
+    return (keyType.equal("ecdsa"_ctv) && baseID == EVP_PKEY_EC) ||
+           (keyType.equal("rsa"_ctv) && baseID == EVP_PKEY_RSA);
+  }
+
+  static bool publicTlsCertificateMatchesDeployment(const DeploymentPlan& plan, const PublicTlsCertificateState& certificate)
+  {
+    if (plan.config.applicationID != certificate.spec.applicationID || plan.config.deploymentID() != certificate.spec.deploymentID)
+    {
+      return false;
+    }
+    for (const WormholePublicTLSConfig& config : plan.publicTLS)
+    {
+      if (config.wormholeName.equals(certificate.spec.wormholeName) && config.identityName.equals(certificate.spec.identityName))
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static bool publicTlsCertificateTransferCompatible(const PublicTlsCertificateState& certificate, const PublicTlsCertificateSpec& spec)
+  {
+    return certificate.identity.certPem.size() > 0 &&
+           certificate.spec.applicationID == spec.applicationID &&
+           certificate.spec.identityName.equals(spec.identityName) &&
+           certificate.spec.issuer.equals(spec.issuer) &&
+           certificate.spec.keyType.equals(spec.keyType) &&
+           certificate.spec.staging == spec.staging &&
+           publicTlsDomainSetsEqual(certificate.spec.domains, spec.domains);
+  }
+
+  static void publicTlsCertbotName(const PublicTlsCertificateSpec& spec, String& certName)
+  {
+    String applicationID = {};
+    applicationID.snprintf<"{itoa}"_ctv>(uint64_t(spec.applicationID));
+    certName.assign("app"_ctv);
+    certName.append(applicationID);
+    certName.append("-"_ctv);
+    certName.append(spec.identityName);
+  }
+
+  static String publicTlsCertificateRuntimeKey(const PublicTlsCertificateSpec& spec, const String& certName)
+  {
+    String key = {};
+    key.snprintf<"{itoa}:{}:{}:{}"_ctv>(spec.deploymentID, spec.wormholeName, spec.identityName, certName);
+    return key;
+  }
+
+  static String publicTlsCertificateRuntimeKey(const PublicTlsCertificateState& certificate)
+  {
+    return publicTlsCertificateRuntimeKey(certificate.spec, certificate.certbotCertName.size() ? certificate.certbotCertName : certificate.spec.identityName);
+  }
+
+  static AcmeDNS01ChallengeState acmeDNS01ChallengeStateFromRecord(const ProdigyDNSRecordBinding& record)
+  {
+    AcmeDNS01ChallengeState state = {};
+    state.provider = record.provider;
+    state.credentialName = record.credentialName;
+    state.zone = record.zone;
+    state.name = record.name;
+    state.validation = record.values.empty() ? String() : record.values[0];
+    state.ttl = record.ttl;
+    return state;
+  }
+
+  static ProdigyDNSRecordBinding acmeDNS01ChallengeRecordFromState(const AcmeDNS01ChallengeState& state)
+  {
+    ProdigyDNSRecordBinding record = {};
+    record.provider = state.provider;
+    record.credentialName = state.credentialName;
+    record.zone = state.zone;
+    record.name = state.name;
+    record.type.assign("TXT"_ctv);
+    record.values.push_back(state.validation);
+    record.ttl = state.ttl;
+    return record;
+  }
+
+  static bool rememberPublicTlsPendingDNS01Challenge(PublicTlsCertificateState& certificate, const ProdigyDNSRecordBinding& record)
+  {
+    AcmeDNS01ChallengeState state = acmeDNS01ChallengeStateFromRecord(record);
+    for (const AcmeDNS01ChallengeState& existing : certificate.pendingDNS01Challenges)
+    {
+      if (prodigyACMEDNS01ChallengeStatesEqual(existing, state))
+      {
+        return false;
+      }
+    }
+    certificate.pendingDNS01Challenges.push_back(std::move(state));
+    return true;
+  }
+
+  static bool forgetPublicTlsPendingDNS01Challenge(PublicTlsCertificateState& certificate, const ProdigyDNSRecordBinding& record)
+  {
+    AcmeDNS01ChallengeState state = acmeDNS01ChallengeStateFromRecord(record);
+    for (auto it = certificate.pendingDNS01Challenges.begin(); it != certificate.pendingDNS01Challenges.end(); ++it)
+    {
+      if (prodigyACMEDNS01ChallengeStatesEqual(*it, state))
+      {
+        certificate.pendingDNS01Challenges.erase(it);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool cleanupPublicTlsPendingDNS01Challenges(PublicTlsCertificateState& certificate)
+  {
+    bool changed = false;
+    for (auto it = certificate.pendingDNS01Challenges.begin(); it != certificate.pendingDNS01Challenges.end();)
+    {
+      const ApiCredential *credential = findDNSCredential(certificate.spec.applicationID, it->credentialName);
+      ProdigyDNSProvider *provider = credential == nullptr || routableResourceDNSPartEquals(credential->provider, it->provider, false) == false ? nullptr : resolveDNSProvider(it->provider);
+      String ignoredFailure = {};
+      ProdigyDNSRecordBinding record = acmeDNS01ChallengeRecordFromState(*it);
+      if (provider != nullptr && provider->cleanupTXT(record, *credential, ignoredFailure))
+      {
+        it = certificate.pendingDNS01Challenges.erase(it);
+        changed = true;
+      }
+      else
+      {
+        ++it;
+      }
+    }
+    return changed;
+  }
+
+  PublicTlsCertificateState *findPublicTlsCertificateStateByRuntimeKey(const String& key)
+  {
+    for (PublicTlsCertificateState& certificate : masterAuthorityRuntimeState.publicTlsCertificates)
+    {
+      if (publicTlsCertificateRuntimeKey(certificate).equals(key))
+      {
+        return &certificate;
+      }
+    }
+    return nullptr;
+  }
+
+  void releasePublicTlsCertbotLock(const String& key)
+  {
+    auto lockIt = publicTlsCertbotLockFDs.find(key);
+    if (lockIt == publicTlsCertbotLockFDs.end())
+    {
+      return;
+    }
+    int fd = lockIt->second;
+    prodigyReleaseCertbotLockFD(fd);
+    publicTlsCertbotLockFDs.erase(lockIt);
+  }
+
+  void cancelPublicTlsCertbotProcess(const String& key)
+  {
+    auto it = publicTlsCertbotPids.find(key);
+    if (it != publicTlsCertbotPids.end())
+    {
+      pid_t pid = it->second;
+      if (pid > 0)
+      {
+        int status = 0;
+        kill(pid, SIGTERM);
+        if (waitpid(pid, &status, WNOHANG) == 0)
+        {
+          kill(pid, SIGKILL);
+          (void)waitpid(pid, &status, 0);
+        }
+      }
+      publicTlsCertbotPids.erase(it);
+    }
+    publicTlsCertbotStartedAtMs.erase(key);
+    releasePublicTlsCertbotLock(key);
+  }
+
+  PublicTlsCertificateState *findTransferablePublicTlsCertificateState(const PublicTlsCertificateSpec& spec)
+  {
+    for (PublicTlsCertificateState& certificate : masterAuthorityRuntimeState.publicTlsCertificates)
+    {
+      if (certificate.spec.deploymentID != spec.deploymentID &&
+          publicTlsCertbotPids.find(publicTlsCertificateRuntimeKey(certificate)) == publicTlsCertbotPids.end() &&
+          publicTlsCertificateTransferCompatible(certificate, spec))
+      {
+        return &certificate;
+      }
+    }
+    return nullptr;
+  }
+
+  static const Wormhole *findDeploymentWormholeByName(const DeploymentPlan& plan, const String& name)
+  {
+    for (const Wormhole& wormhole : plan.wormholes)
+    {
+      if (wormhole.name.equals(name))
+      {
+        return &wormhole;
+      }
+    }
+    return nullptr;
+  }
+
+  bool buildPublicTlsCertificateSpecForDeployment(const DeploymentPlan& plan, const WormholePublicTLSConfig& config, PublicTlsCertificateSpec& spec, String& certName, String& failure) const
+  {
+    spec = {};
+    certName.clear();
+    failure.clear();
+
+    const Wormhole *wormhole = findDeploymentWormholeByName(plan, config.wormholeName);
+    if (wormhole == nullptr)
+    {
+      failure.assign("public TLS wormhole was not found"_ctv);
+      return false;
+    }
+    if (brainConfig.acme.accountEmail.size() == 0 || brainConfig.acme.termsAgreed == false)
+    {
+      failure.assign("public TLS requires cluster ACME accountEmail and termsAgreed"_ctv);
+      return false;
+    }
+    if (wormhole->hasDNSConfig == false || wormhole->dns.provider.size() == 0 || wormhole->dns.credentialName.size() == 0 || wormhole->dns.zone.size() == 0 || wormhole->dns.ttl == 0)
+    {
+      failure.assign("public TLS requires resolved wormhole DNS provider, credentialName, zone, and ttl"_ctv);
+      return false;
+    }
+
+    spec.applicationID = plan.config.applicationID;
+    spec.deploymentID = plan.config.deploymentID();
+    spec.wormholeName = config.wormholeName;
+    spec.identityName = config.identityName;
+    Vector<String> domains = config.domains;
+    if (domains.empty() && wormhole->dns.name.size() > 0)
+    {
+      domains.push_back(wormhole->dns.name);
+    }
+    for (const String& domain : domains)
+    {
+      String canonical = {};
+      if (prodigyCanonicalACMEDNSIdentifier(domain, canonical, &failure) == false)
+      {
+        return false;
+      }
+      spec.domains.push_back(std::move(canonical));
+    }
+    if (spec.identityName.size() == 0 || spec.domains.empty())
+    {
+      failure.assign("public TLS requires identityName and domains"_ctv);
+      return false;
+    }
+    if (prodigySafePathSegment(spec.identityName) == false)
+    {
+      failure.assign("public TLS identityName must be a safe path segment"_ctv);
+      return false;
+    }
+    if (plan.hasTlsIssuancePolicy && plan.tlsIssuancePolicy.enablePerContainerLeafs)
+    {
+      for (const String& privateIdentityName : plan.tlsIssuancePolicy.identityNames)
+      {
+        if (privateIdentityName.equals(spec.identityName))
+        {
+          failure.assign("public TLS identityName conflicts with private TLS identityName"_ctv);
+          return false;
+        }
+      }
+    }
+    if (config.issuer.equal("letsencrypt"_ctv) == false)
+    {
+      failure.assign("public TLS issuer must be letsencrypt"_ctv);
+      return false;
+    }
+    if (config.keyType.equal("ecdsa"_ctv) == false && config.keyType.equal("rsa"_ctv) == false)
+    {
+      failure.assign("public TLS keyType must be ecdsa or rsa"_ctv);
+      return false;
+    }
+    if (config.renewAfterLifetimePermille == 0 || config.renewAfterLifetimePermille >= 1000)
+    {
+      failure.assign("public TLS renewAfterLifetimePermille must be in 1..999"_ctv);
+      return false;
+    }
+    const ApiCredential *credential = findDNSCredential(plan.config.applicationID, wormhole->dns.credentialName);
+    if (credential == nullptr)
+    {
+      failure.assign("public TLS DNS credential is not registered"_ctv);
+      return false;
+    }
+    if (routableResourceDNSPartEquals(credential->provider, wormhole->dns.provider, false) == false)
+    {
+      failure.assign("public TLS DNS credential provider mismatch"_ctv);
+      return false;
+    }
+    for (const String& domain : spec.domains)
+    {
+      String recordName;
+      if (prodigyACMEDNS01RecordName(domain, recordName, &failure) == false)
+      {
+        return false;
+      }
+      if (acmeDNSRecordCoveredByDeclaredDNS(wormhole->dns, *credential, recordName) == false)
+      {
+        failure.assign("public TLS domain is not covered by wormhole DNS"_ctv);
+        return false;
+      }
+      if (acmeDNSCredentialAllowsRecord(*credential, recordName, failure) == false)
+      {
+        return false;
+      }
+    }
+    spec.issuer = config.issuer;
+    spec.keyType = config.keyType;
+    spec.staging = config.staging;
+    spec.dnsProvider = wormhole->dns.provider;
+    spec.dnsCredentialName = wormhole->dns.credentialName;
+    spec.dnsZone = wormhole->dns.zone;
+    spec.dnsTTL = wormhole->dns.ttl;
+    spec.renewAfterLifetimePermille = config.renewAfterLifetimePermille;
+    publicTlsCertbotName(spec, certName);
+    return true;
+  }
+
+  bool reconcilePublicTlsCertificateStatesForDeployment(const DeploymentPlan& plan, String& failure)
+  {
+    failure.clear();
+    bool changed = false;
+    Vector<PublicTlsCertificateSpec> desiredSpecs = {};
+    Vector<String> desiredKeys = {};
+    Vector<String> desiredCertNames = {};
+
+    for (const WormholePublicTLSConfig& config : plan.publicTLS)
+    {
+      PublicTlsCertificateSpec spec = {};
+      String certName = {};
+      if (buildPublicTlsCertificateSpecForDeployment(plan, config, spec, certName, failure) == false)
+      {
+        return false;
+      }
+      for (const String& desiredCertName : desiredCertNames)
+      {
+        if (desiredCertName.equals(certName))
+        {
+          failure.assign("public TLS identityName is already used"_ctv);
+          return false;
+        }
+      }
+      desiredCertNames.push_back(certName);
+      desiredSpecs.push_back(std::move(spec));
+      desiredKeys.push_back(publicTlsCertificateRuntimeKey(desiredSpecs.back(), certName));
+    }
+
+    for (uint32_t index = 0; index < desiredSpecs.size(); ++index)
+    {
+      const PublicTlsCertificateSpec& spec = desiredSpecs[index];
+      const String& certName = desiredCertNames[index];
+      const String& key = desiredKeys[index];
+      PublicTlsCertificateState *existing = findPublicTlsCertificateStateByRuntimeKey(key);
+      if (existing == nullptr)
+      {
+        existing = findTransferablePublicTlsCertificateState(spec);
+      }
+      if (existing == nullptr)
+      {
+        PublicTlsCertificateState state = {};
+        state.spec = spec;
+        state.certbotCertName = certName;
+        masterAuthorityRuntimeState.publicTlsCertificates.push_back(std::move(state));
+        changed = true;
+        continue;
+      }
+
+      bool keepIdentity = existing->identity.certPem.size() > 0 &&
+                          existing->spec.identityName.equals(spec.identityName) &&
+                          existing->spec.issuer.equals(spec.issuer) &&
+                          existing->spec.keyType.equals(spec.keyType) &&
+                          existing->spec.staging == spec.staging &&
+                          publicTlsDomainSetsEqual(existing->spec.domains, spec.domains);
+      if (prodigyPublicTlsCertificateSpecsEqual(existing->spec, spec) == false || existing->certbotCertName.equals(certName) == false)
+      {
+        existing->spec = spec;
+        existing->certbotCertName = certName;
+        if (keepIdentity == false)
+        {
+          existing->identity = {};
+          existing->nextRenewAtMs = 0;
+        }
+        else if (existing->identity.notAfterMs > existing->identity.notBeforeMs)
+        {
+          existing->nextRenewAtMs = certificateLifecycleJitteredRenewAtMs(
+              prodigyCertificateRenewAtMs(existing->identity.notBeforeMs, existing->identity.notAfterMs, existing->spec.renewAfterLifetimePermille),
+              publicTlsCertificateJitterSeed(*existing));
+        }
+        changed = true;
+      }
+    }
+
+    for (auto it = masterAuthorityRuntimeState.publicTlsCertificates.begin(); it != masterAuthorityRuntimeState.publicTlsCertificates.end();)
+    {
+      if (it->spec.deploymentID != plan.config.deploymentID())
+      {
+        ++it;
+        continue;
+      }
+      bool retained = false;
+      String key = publicTlsCertificateRuntimeKey(*it);
+      for (const String& desired : desiredKeys)
+      {
+        if (desired.equals(key))
+        {
+          retained = true;
+          break;
+        }
+      }
+      if (retained)
+      {
+        ++it;
+      }
+      else
+      {
+        cancelPublicTlsCertbotProcess(key);
+        (void)cleanupPublicTlsPendingDNS01Challenges(*it);
+        it = masterAuthorityRuntimeState.publicTlsCertificates.erase(it);
+        changed = true;
+      }
+    }
+
+    if (changed)
+    {
+      noteMasterAuthorityRuntimeStateChanged();
+    }
+    return true;
+  }
+
+  bool transferPublicTlsCertificateToApplicationHead(PublicTlsCertificateState& certificate)
+  {
+    auto appIt = deploymentsByApp.find(certificate.spec.applicationID);
+    if (appIt == deploymentsByApp.end() || appIt->second == nullptr || appIt->second->plan.config.deploymentID() == certificate.spec.deploymentID ||
+        publicTlsCertbotPids.find(publicTlsCertificateRuntimeKey(certificate)) != publicTlsCertbotPids.end())
+    {
+      return false;
+    }
+
+    for (const WormholePublicTLSConfig& config : appIt->second->plan.publicTLS)
+    {
+      PublicTlsCertificateSpec spec = {};
+      String certName = {};
+      String failure = {};
+      if (buildPublicTlsCertificateSpecForDeployment(appIt->second->plan, config, spec, certName, failure) == false ||
+          publicTlsCertificateTransferCompatible(certificate, spec) == false)
+      {
+        continue;
+      }
+      String newKey = publicTlsCertificateRuntimeKey(spec, certName);
+      PublicTlsCertificateState *existing = findPublicTlsCertificateStateByRuntimeKey(newKey);
+      if (existing != nullptr && existing != &certificate)
+      {
+        return false;
+      }
+      (void)cleanupPublicTlsPendingDNS01Challenges(certificate);
+      certificate.spec = spec;
+      certificate.certbotCertName = certName;
+      return true;
+    }
+    return false;
+  }
+
+  uint32_t releasePublicTlsCertificatesForDeployment(uint64_t deploymentID)
+  {
+    uint32_t changed = 0;
+    for (auto it = masterAuthorityRuntimeState.publicTlsCertificates.begin(); it != masterAuthorityRuntimeState.publicTlsCertificates.end();)
+    {
+      if (it->spec.deploymentID != deploymentID)
+      {
+        ++it;
+        continue;
+      }
+      if (transferPublicTlsCertificateToApplicationHead(*it))
+      {
+        changed += 1;
+        ++it;
+        continue;
+      }
+      cancelPublicTlsCertbotProcess(publicTlsCertificateRuntimeKey(*it));
+      (void)cleanupPublicTlsPendingDNS01Challenges(*it);
+      it = masterAuthorityRuntimeState.publicTlsCertificates.erase(it);
+      changed += 1;
+    }
+    if (changed > 0)
+    {
+      noteMasterAuthorityRuntimeStateChanged();
+    }
+    return changed;
+  }
+
+  bool applyACMEDNS01Challenge(const AcmeDNS01ChallengeRequest& request, bool cleanup, AcmeDNS01ChallengeResponse& response)
+  {
+    response = {};
+    if (request.clusterUUID == 0 || brainConfig.clusterUUID == 0 || request.clusterUUID != brainConfig.clusterUUID)
+    {
+      response.failure.assign("ACME hook cluster UUID mismatch"_ctv);
+      return false;
+    }
+    if (request.applicationID == 0 || request.deploymentID == 0 || request.wormholeName.size() == 0 || request.certName.size() == 0 || request.identifier.size() == 0 || request.validation.size() == 0)
+    {
+      response.failure.assign("ACME DNS-01 request is incomplete"_ctv);
+      return false;
+    }
+
+    PublicTlsCertificateState *certificate = findPublicTlsCertificateState(request.applicationID, request.deploymentID, request.wormholeName, request.certName);
+    if (certificate == nullptr)
+    {
+      response.failure.assign("ACME certificate state is not registered"_ctv);
+      return false;
+    }
+    if (publicTlsCertificateCoversIdentifier(*certificate, request.identifier) == false)
+    {
+      response.failure.assign("ACME identifier is not in certificate domains"_ctv);
+      return false;
+    }
+
+    ProdigyDNSRecordBinding record = {};
+    record.provider = certificate->spec.dnsProvider;
+    record.credentialName = certificate->spec.dnsCredentialName;
+    record.zone = certificate->spec.dnsZone;
+    record.type.assign("TXT"_ctv);
+    record.values.push_back(request.validation);
+    record.ttl = certificate->spec.dnsTTL ? certificate->spec.dnsTTL : 60;
+    if (record.provider.size() == 0 || record.credentialName.size() == 0 || record.zone.size() == 0 ||
+        prodigyACMEDNS01RecordName(request.identifier, record.name, &response.failure) == false)
+    {
+      if (response.failure.size() == 0)
+      {
+        response.failure.assign("ACME certificate DNS config is incomplete"_ctv);
+      }
+      return false;
+    }
+
+    const ApiCredential *credential = findDNSCredential(request.applicationID, record.credentialName);
+    if (credential == nullptr)
+    {
+      response.failure.assign("ACME DNS credential is not registered"_ctv);
+      return false;
+    }
+    if (routableResourceDNSPartEquals(credential->provider, record.provider, false) == false)
+    {
+      response.failure.assign("ACME DNS credential provider mismatch"_ctv);
+      return false;
+    }
+    if (acmeDNSCredentialAllowsRecord(*credential, record.name, response.failure) == false)
+    {
+      return false;
+    }
+
+    ProdigyDNSProvider *provider = resolveDNSProvider(record.provider);
+    if (provider == nullptr)
+    {
+      response.failure.assign("ACME DNS provider is not configured"_ctv);
+      return false;
+    }
+
+    if ((cleanup ? provider->cleanupTXT(record, *credential, response.failure) : provider->presentTXT(record, *credential, response.failure)) == false)
+    {
+      return false;
+    }
+    bool pendingChanged = cleanup ? forgetPublicTlsPendingDNS01Challenge(*certificate, record) : rememberPublicTlsPendingDNS01Challenge(*certificate, record);
+    if (pendingChanged)
+    {
+      noteMasterAuthorityRuntimeStateChanged();
+    }
+    if (cleanup == false)
+    {
+      sleepMs(acmeDNSPropagationDelayMs(record, *credential));
+    }
+
+    response.success = true;
+    response.recordName = record.name;
+    response.provider = record.provider;
+    response.zone = record.zone;
+    response.ttl = record.ttl;
+    return true;
+  }
+
+  static uint32_t acmeDNSPropagationDelayMs(const ProdigyDNSRecordBinding& record, const ApiCredential& credential)
+  {
+    String key = {};
+    key.assign("acmePropagationDelayMs"_ctv);
+    if (auto it = credential.metadata.find(key); it != credential.metadata.end())
+    {
+      char *end = nullptr;
+      errno = 0;
+      String raw = it->second;
+      unsigned long parsed = std::strtoul(raw.c_str(), &end, 10);
+      if (end != raw.c_str() && *end == '\0' && errno == 0)
+      {
+        return uint32_t(std::min<unsigned long>(parsed, 300'000UL));
+      }
+    }
+    uint64_t ttlMs = uint64_t(record.ttl ? record.ttl : 60) * 1000;
+    return uint32_t(std::min<uint64_t>(std::max<uint64_t>(ttlMs, 5000), 60'000));
+  }
+
+  static void sleepMs(uint32_t ms)
+  {
+    while (ms > 0)
+    {
+      uint32_t chunk = std::min<uint32_t>(ms, 1000);
+      usleep(chunk * 1000);
+      ms -= chunk;
+    }
+  }
+
+  bool importACMELineage(const AcmeLineageImportRequest& request, AcmeLineageImportResponse& response)
+  {
+    response = {};
+    response.certName = request.certName;
+    if (request.clusterUUID == 0 || brainConfig.clusterUUID == 0 || request.clusterUUID != brainConfig.clusterUUID)
+    {
+      response.failure.assign("ACME hook cluster UUID mismatch"_ctv);
+      return false;
+    }
+    if (request.applicationID == 0 || request.deploymentID == 0 || request.wormholeName.size() == 0 || request.certName.size() == 0 || request.lineagePath.size() == 0 || request.renewedDomains.empty())
+    {
+      response.failure.assign("ACME lineage import request is incomplete"_ctv);
+      return false;
+    }
+    PublicTlsCertificateState *certificate = findPublicTlsCertificateState(request.applicationID, request.deploymentID, request.wormholeName, request.certName);
+    if (certificate == nullptr)
+    {
+      response.failure.assign("ACME certificate state is not registered"_ctv);
+      return false;
+    }
+
+    certificate->lastAttemptMs = Time::now<TimeResolution::ms>();
+    auto fail = [&]() -> bool {
+      noteCertificateFailure(certificate->failureCount, certificate->lastFailure, response.failure);
+      noteMasterAuthorityRuntimeStateChanged();
+      return false;
+    };
+
+    if (publicTlsDomainSetsEqual(certificate->spec.domains, request.renewedDomains) == false)
+    {
+      response.failure.assign("ACME renewed domains do not match certificate spec"_ctv);
+      return fail();
+    }
+    String expectedLineagePath = certificate->lineagePath;
+    if (expectedLineagePath.size() == 0)
+    {
+      prodigyCertbotLineagePath(brainConfig, *certificate, {}, expectedLineagePath);
+    }
+    if (acmeLineagePathMatchesExpected(request.lineagePath, request.certName, expectedLineagePath) == false)
+    {
+      response.failure.assign("ACME lineage path is not managed by this cluster"_ctv);
+      return fail();
+    }
+
+    String fullchainPem = {};
+    String keyPem = {};
+    String leafPem = {};
+    String chainPem = {};
+    if (readACMELineageFile(request.lineagePath, "fullchain.pem", fullchainPem, response.failure) == false ||
+        readACMELineageFile(request.lineagePath, "privkey.pem", keyPem, response.failure) == false ||
+        splitFirstPEMCertificate(fullchainPem, leafPem, chainPem, response.failure) == false)
+    {
+      return fail();
+    }
+
+    X509 *leafCert = VaultPem::x509FromPem(leafPem);
+    EVP_PKEY *leafKey = VaultPem::privateKeyFromPem(keyPem);
+    Vector<String> certDNSNames = {};
+    int64_t notBeforeMs = 0;
+    int64_t notAfterMs = 0;
+    bool ok = leafCert != nullptr && leafKey != nullptr;
+    if (ok && X509_check_private_key(leafCert, leafKey) != 1)
+    {
+      response.failure.assign("ACME certificate does not match private key"_ctv);
+      ok = false;
+    }
+    if (ok && x509ChainLinksValid(leafCert, chainPem, response.failure) == false)
+    {
+      ok = false;
+    }
+    if (ok && certificate->spec.staging == false && x509ChainTrustedBySystem(leafCert, chainPem, response.failure) == false)
+    {
+      ok = false;
+    }
+    if (ok && publicTlsKeyMatchesSpec(leafKey, certificate->spec.keyType) == false)
+    {
+      response.failure.assign("ACME private key type does not match certificate spec"_ctv);
+      ok = false;
+    }
+    if (ok && x509DNSSubjectAltNames(leafCert, certDNSNames, response.failure) == false)
+    {
+      ok = false;
+    }
+    if (ok && publicTlsDomainSetsEqual(certificate->spec.domains, certDNSNames) == false)
+    {
+      response.failure.assign("ACME certificate SANs do not match certificate spec"_ctv);
+      ok = false;
+    }
+    if (ok && x509HasIPAddressSubjectAltName(leafCert))
+    {
+      response.failure.assign("ACME certificate contains unexpected IP SANs"_ctv);
+      ok = false;
+    }
+    if (ok && x509HasExtendedKeyUsage(leafCert, NID_server_auth) == false)
+    {
+      response.failure.assign("ACME certificate is not valid for server authentication"_ctv);
+      ok = false;
+    }
+    if (ok && (x509TimeToEpochMs(X509_get0_notBefore(leafCert), notBeforeMs) == false || x509TimeToEpochMs(X509_get0_notAfter(leafCert), notAfterMs) == false || notAfterMs <= notBeforeMs))
+    {
+      response.failure.assign("ACME certificate lifetime is invalid"_ctv);
+      ok = false;
+    }
+
+    if (leafCert)
+    {
+      X509_free(leafCert);
+    }
+    if (leafKey)
+    {
+      EVP_PKEY_free(leafKey);
+    }
+    if (ok == false)
+    {
+      if (response.failure.size() == 0)
+      {
+        response.failure.assign("ACME lineage import failed"_ctv);
+      }
+      return fail();
+    }
+
+    uint64_t generation = certificate->generation > certificate->identity.generation ? certificate->generation : certificate->identity.generation;
+    generation += generation < UINT64_MAX ? 1 : 0;
+
+    TlsIdentity identity = {};
+    identity.name = certificate->spec.identityName;
+    identity.generation = generation;
+    identity.notBeforeMs = notBeforeMs;
+    identity.notAfterMs = notAfterMs;
+    identity.certPem = std::move(leafPem);
+    identity.keyPem = std::move(keyPem);
+    identity.chainPem = std::move(chainPem);
+    identity.dnsSans = certificate->spec.domains;
+    identity.tags.push_back("public"_ctv);
+    identity.tags.push_back(certificate->spec.issuer.size() ? certificate->spec.issuer : "letsencrypt"_ctv);
+    String wormholeTag = {};
+    wormholeTag.snprintf<"wormhole:{}"_ctv>(certificate->spec.wormholeName);
+    identity.tags.push_back(std::move(wormholeTag));
+
+    certificate->identity = std::move(identity);
+    certificate->certbotCertName = request.certName;
+    certificate->lineagePath = request.lineagePath;
+    certificate->generation = generation;
+    certificate->nextRenewAtMs = certificateLifecycleJitteredRenewAtMs(prodigyCertificateRenewAtMs(notBeforeMs, notAfterMs, certificate->spec.renewAfterLifetimePermille), publicTlsCertificateJitterSeed(*certificate));
+    certificate->lastSuccessMs = certificate->lastAttemptMs;
+    certificate->failureCount = 0;
+    certificate->lastFailure.clear();
+    (void)cleanupPublicTlsPendingDNS01Challenges(*certificate);
+    response.success = true;
+    response.generation = generation;
+    response.nextRenewAtMs = certificate->nextRenewAtMs;
+
+    noteMasterAuthorityRuntimeStateChanged();
+    (void)pushPublicTlsIdentityDeltaToLiveContainers(*certificate, "acme-lineage-import"_ctv);
+    return true;
+  }
+
   bool applyDeploymentDNSRecordLeases(const Vector<RoutableResourceLease>& leases, String& failure)
   {
     failure.clear();
@@ -2222,6 +3677,54 @@ public:
     return true;
   }
 
+  bool teardownDNSBindingLeases(RoutableResourceLeaseReport& response)
+  {
+    response = {};
+    for (const RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
+    {
+      if (lease.kind != RoutableResourceLeaseKind::dnsRecord)
+      {
+        continue;
+      }
+      if (applyDNSRecordLease(lease, true, response.failure) == false)
+      {
+        return false;
+      }
+      response.leases.push_back(lease);
+    }
+
+    auto removeLease = [&](const RoutableResourceLease& lease) -> bool {
+      for (const RoutableResourceLease& dnsLease : response.leases)
+      {
+        RoutableResourceLease addressLease = dnsBindingAddressLease(dnsLease);
+        if ((lease.kind == RoutableResourceLeaseKind::dnsRecord && routableResourceDNSIdentityMatches(lease, dnsLease) && lease.owner == dnsLease.owner) ||
+            (lease.kind == RoutableResourceLeaseKind::wormholeAddress && lease.registeredPrefixUUID == addressLease.registeredPrefixUUID && lease.address.equals(addressLease.address) && lease.owner == addressLease.owner))
+        {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    for (auto it = routableResourceLeaseRuntimeState.begin(); it != routableResourceLeaseRuntimeState.end();)
+    {
+      if (removeLease(*it))
+      {
+        it = routableResourceLeaseRuntimeState.erase(it);
+        continue;
+      }
+      ++it;
+    }
+    if (response.leases.empty() == false)
+    {
+      noteRoutableResourceLeaseRuntimeStateChanged();
+    }
+
+    response.success = true;
+    response.failure.clear();
+    return true;
+  }
+
   bool validateDeploymentWormholeDNSConfig(const DeploymentPlan& plan, const Wormhole& wormhole, String& failure) const
   {
     failure.clear();
@@ -2300,6 +3803,7 @@ public:
 
   uint32_t releaseRoutableResourceLeasesForDeployment(uint64_t deploymentID) override
   {
+    uint32_t publicTlsChanged = releasePublicTlsCertificatesForDeployment(deploymentID);
     uint32_t changed = 0;
     for (RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
     {
@@ -2330,7 +3834,7 @@ public:
       {
         noteRoutableResourceLeaseRuntimeStateChanged();
       }
-      return changed;
+      return publicTlsChanged + changed;
     }
 
     for (auto it = routableResourceLeaseRuntimeState.begin(); it != routableResourceLeaseRuntimeState.end();)
@@ -2348,7 +3852,7 @@ public:
     {
       noteRoutableResourceLeaseRuntimeStateChanged();
     }
-    return changed;
+    return publicTlsChanged + changed;
   }
 
   void upsertManagedMachineSchemaConfig(const ProdigyManagedMachineSchema& managedSchema)
@@ -2560,7 +4064,8 @@ public:
             candidate,
             operation.request.bootstrapSshUser,
             operation.request.bootstrapSshPrivateKeyPath,
-            operation.request.bootstrapSshHostKeyPackage.publicKeyOpenSSH);
+            operation.request.bootstrapSshHostKeyPackage.publicKeyOpenSSH,
+            brainConfig.machineReservedResources);
         if (refreshed != machine)
         {
           machine = std::move(refreshed);
@@ -3290,6 +4795,7 @@ public:
     container->explicitStatefulTopology = plan.statefulTopology;
     container->subscriptions = plan.subscriptions;
     container->advertisements = plan.advertisements;
+    noteContainerCredentialBundleApplied(container, plan.hasCredentialBundle ? &plan.credentialBundle : nullptr);
     container->remainingSubscriberCapacity = deployment->plan.minimumSubscriberCapacity;
 
     if (mesh != nullptr)
@@ -3604,6 +5110,186 @@ public:
     }
   }
 
+  static bool x509TimeToEpochMs(const ASN1_TIME *time, int64_t& epochMs)
+  {
+    epochMs = 0;
+    if (time == nullptr)
+    {
+      return false;
+    }
+
+    std::tm tm = {};
+    if (ASN1_TIME_to_tm(time, &tm) != 1)
+    {
+      return false;
+    }
+
+    time_t seconds = timegm(&tm);
+    if (seconds < 0 || seconds > INT64_MAX / 1000)
+    {
+      return false;
+    }
+    epochMs = int64_t(seconds) * 1000;
+    return true;
+  }
+
+  bool buildPrivateTlsVaultLifecycleState(const ApplicationTlsVaultFactory& factory, int64_t leafNotBeforeMs, PrivateTlsVaultLifecycleState& state, String *failure = nullptr) const
+  {
+    state = {};
+    if (failure)
+    {
+      failure->clear();
+    }
+
+    X509 *rootCert = VaultPem::x509FromPem(factory.rootCertPem);
+    X509 *intermediateCert = VaultPem::x509FromPem(factory.intermediateCertPem);
+    bool ok = rootCert != nullptr && intermediateCert != nullptr &&
+              x509TimeToEpochMs(X509_get0_notBefore(rootCert), state.rootNotBeforeMs) &&
+              x509TimeToEpochMs(X509_get0_notAfter(rootCert), state.rootNotAfterMs) &&
+              x509TimeToEpochMs(X509_get0_notBefore(intermediateCert), state.intermediateNotBeforeMs) &&
+              x509TimeToEpochMs(X509_get0_notAfter(intermediateCert), state.intermediateNotAfterMs);
+    if (rootCert)
+    {
+      X509_free(rootCert);
+    }
+    if (intermediateCert)
+    {
+      X509_free(intermediateCert);
+    }
+    if (ok == false)
+    {
+      if (failure)
+      {
+        failure->assign("failed to read tls vault certificate lifetimes"_ctv);
+      }
+      return false;
+    }
+
+    uint32_t leafValidityDays = privateTlsLeafValidityDays(factory);
+    state.applicationID = factory.applicationID;
+    state.factoryGeneration = factory.factoryGeneration;
+    state.mode = factory.keySourceMode == 0 ? ProdigyCertificateLifecycleMode::managed : ProdigyCertificateLifecycleMode::externalManual;
+    state.leafNotBeforeMs = leafNotBeforeMs;
+    state.leafNotAfterMs = leafNotBeforeMs + int64_t(leafValidityDays) * 24 * 60 * 60 * 1000;
+    int64_t rootRenewAtMs = privateTlsVaultRenewAtMs(factory, state.rootNotBeforeMs, state.rootNotAfterMs, 0xA11CE001ULL);
+    int64_t intermediateRenewAtMs = privateTlsVaultRenewAtMs(factory, state.intermediateNotBeforeMs, state.intermediateNotAfterMs, 0xA11CE002ULL);
+    state.leafNextRenewAtMs = privateTlsVaultRenewAtMs(factory, state.leafNotBeforeMs, state.leafNotAfterMs, 0xA11CE003ULL);
+    state.nextRenewAtMs = prodigyEarliestPositiveMs(
+        prodigyEarliestPositiveMs(rootRenewAtMs, intermediateRenewAtMs),
+        state.leafNextRenewAtMs);
+    return true;
+  }
+
+  uint32_t privateTlsLeafValidityDays(const ApplicationTlsVaultFactory& factory) const
+  {
+    uint32_t days = factory.defaultLeafValidityDays ? factory.defaultLeafValidityDays : 15;
+    for (const auto& [deploymentID, deployment] : deployments)
+    {
+      (void)deploymentID;
+      if (deployment == nullptr || deployment->plan.hasTlsIssuancePolicy == false)
+      {
+        continue;
+      }
+      const DeploymentTlsIssuancePolicy& policy = deployment->plan.tlsIssuancePolicy;
+      if (policy.applicationID == factory.applicationID && policy.enablePerContainerLeafs && policy.identityNames.empty() == false && policy.leafValidityDays > 0 && policy.leafValidityDays < days)
+      {
+        days = policy.leafValidityDays;
+      }
+    }
+    return days;
+  }
+
+  bool refreshPrivateTlsLeafSchedule(const ApplicationTlsVaultFactory& factory, PrivateTlsVaultLifecycleState& lifecycle)
+  {
+    int64_t leafNotAfterMs = lifecycle.leafNotBeforeMs + int64_t(privateTlsLeafValidityDays(factory)) * 24 * 60 * 60 * 1000;
+    int64_t leafNextRenewAtMs = privateTlsVaultRenewAtMs(lifecycle, lifecycle.leafNotBeforeMs, leafNotAfterMs, 0xA11CE003ULL);
+    if (leafNextRenewAtMs <= 0 || (lifecycle.leafNextRenewAtMs > 0 && leafNextRenewAtMs >= lifecycle.leafNextRenewAtMs))
+    {
+      return false;
+    }
+    lifecycle.leafNotAfterMs = leafNotAfterMs;
+    lifecycle.leafNextRenewAtMs = leafNextRenewAtMs;
+    lifecycle.nextRenewAtMs = prodigyEarliestPositiveMs(
+        prodigyEarliestPositiveMs(
+            privateTlsVaultRenewAtMs(lifecycle, lifecycle.rootNotBeforeMs, lifecycle.rootNotAfterMs, 0xA11CE001ULL),
+            privateTlsVaultRenewAtMs(lifecycle, lifecycle.intermediateNotBeforeMs, lifecycle.intermediateNotAfterMs, 0xA11CE002ULL)),
+        lifecycle.leafNextRenewAtMs);
+    return true;
+  }
+
+  static bool generateManagedTlsVaultFactoryMaterial(ApplicationTlsVaultFactory& factory, String *failure = nullptr)
+  {
+    if (failure)
+    {
+      failure->clear();
+    }
+
+    X509 *rootCert = nullptr;
+    EVP_PKEY *rootKey = nullptr;
+    X509 *interCert = nullptr;
+    EVP_PKEY *interKey = nullptr;
+
+    CryptoScheme scheme = (factory.scheme == uint8_t(CryptoScheme::ed25519)) ? CryptoScheme::ed25519 : CryptoScheme::p256;
+    VaultCertificateRequest rootRequest = {};
+    rootRequest.type = CertificateType::root;
+    rootRequest.scheme = scheme;
+    generateCertificateAndKeys(rootRequest, nullptr, nullptr, rootCert, rootKey);
+
+    VaultCertificateRequest intermediateRequest = {};
+    intermediateRequest.type = CertificateType::intermediary;
+    intermediateRequest.scheme = scheme;
+    generateCertificateAndKeys(intermediateRequest, rootCert, rootKey, interCert, interKey);
+
+    bool ok = rootCert != nullptr && rootKey != nullptr && interCert != nullptr && interKey != nullptr &&
+              VaultPem::x509ToPem(rootCert, factory.rootCertPem) &&
+              VaultPem::privateKeyToPem(rootKey, factory.rootKeyPem) &&
+              VaultPem::x509ToPem(interCert, factory.intermediateCertPem) &&
+              VaultPem::privateKeyToPem(interKey, factory.intermediateKeyPem);
+
+    if (rootCert)
+    {
+      X509_free(rootCert);
+    }
+    if (rootKey)
+    {
+      EVP_PKEY_free(rootKey);
+    }
+    if (interCert)
+    {
+      X509_free(interCert);
+    }
+    if (interKey)
+    {
+      EVP_PKEY_free(interKey);
+    }
+
+    if (ok == false && failure)
+    {
+      failure->assign("failed to generate tls vault material"_ctv);
+    }
+    return ok;
+  }
+
+  bool upsertPrivateTlsVaultLifecycleState(const ApplicationTlsVaultFactory& factory, int64_t leafNotBeforeMs, String *failure = nullptr)
+  {
+    PrivateTlsVaultLifecycleState state = {};
+    if (buildPrivateTlsVaultLifecycleState(factory, leafNotBeforeMs, state, failure) == false)
+    {
+      return false;
+    }
+
+    for (PrivateTlsVaultLifecycleState& existing : masterAuthorityRuntimeState.privateTlsVaultLifecycles)
+    {
+      if (existing.applicationID == state.applicationID)
+      {
+        existing = state;
+        return true;
+      }
+    }
+    masterAuthorityRuntimeState.privateTlsVaultLifecycles.push_back(state);
+    return true;
+  }
+
   bool validateApplicationTlsVaultFactoryMaterial(const ApplicationTlsVaultFactory& factory, String *failure = nullptr) const
   {
     if (failure)
@@ -3725,6 +5411,25 @@ public:
     }
     auto setIt = apiCredentialSetsByApp.find(applicationID);
     return setIt == apiCredentialSetsByApp.end() ? nullptr : findApiCredential(setIt->second, name);
+  }
+
+  static bool apiCredentialMayReachContainer(const DeploymentPlan& plan, const ApiCredential& credential)
+  {
+    if (credential.metadata.find("dnsScope"_ctv) != credential.metadata.end() ||
+        credential.metadata.find("dnsZones"_ctv) != credential.metadata.end() ||
+        credential.metadata.find("dnsZone"_ctv) != credential.metadata.end() ||
+        credential.metadata.find("dnsRecords"_ctv) != credential.metadata.end())
+    {
+      return false;
+    }
+    for (const Wormhole& wormhole : plan.wormholes)
+    {
+      if (wormhole.hasDNSConfig && credential.name.equals(wormhole.dns.credentialName))
+      {
+        return false;
+      }
+    }
+    return true;
   }
 
   bool shouldAcceptTlsFactoryReplication(const ApplicationTlsVaultFactory& incoming, const ApplicationTlsVaultFactory *existing) const
@@ -3934,6 +5639,27 @@ public:
           (unsigned long long)factory.factoryGeneration);
     }
 
+    return produced;
+  }
+
+  bool buildPublicTlsBundleForContainer(const DeploymentPlan& deploymentPlan, CredentialBundle& bundle, uint64_t& bundleGeneration) const
+  {
+    bool produced = false;
+    for (const PublicTlsCertificateState& certificate : masterAuthorityRuntimeState.publicTlsCertificates)
+    {
+      if (publicTlsCertificateMatchesDeployment(deploymentPlan, certificate) == false ||
+          certificate.identity.certPem.size() == 0 ||
+          certificate.identity.keyPem.size() == 0)
+      {
+        continue;
+      }
+      bundle.tlsIdentities.push_back(certificate.identity);
+      produced = true;
+      if (certificate.identity.generation > bundleGeneration)
+      {
+        bundleGeneration = certificate.identity.generation;
+      }
+    }
     return produced;
   }
 
@@ -4229,7 +5955,7 @@ public:
       {
         if (failure)
         {
-          failure->snprintf<"missing resumption ACK for traffic-serving container {}"_ctv>(String(container->uuid));
+          failure->snprintf<"missing resumption ACK for traffic-serving container {}"_ctv>(String::toHex(container->uuid));
         }
         return false;
       }
@@ -4239,7 +5965,7 @@ public:
       {
         if (failure)
         {
-          failure->snprintf<"resumption ACK not successful for container {}"_ctv>(String(container->uuid));
+          failure->snprintf<"resumption ACK not successful for container {}"_ctv>(String::toHex(container->uuid));
         }
         return false;
       }
@@ -4257,14 +5983,42 @@ public:
     return true;
   }
 
-  uint32_t pushCredentialDeltaToLiveContainers(const DeploymentPlan& deploymentPlan, const CredentialDelta& delta)
+  static uint64_t containerCredentialBundleGeneration(const ContainerView *container)
   {
+    uint64_t generation = 0;
+    if (container != nullptr && container->hasCredentialBundle)
+    {
+      generation = container->credentialBundle.bundleGeneration;
+    }
+    if (container != nullptr && container->hasPendingCredentialBundle && container->pendingCredentialBundle.bundleGeneration > generation)
+    {
+      generation = container->pendingCredentialBundle.bundleGeneration;
+    }
+    return generation;
+  }
+
+  bool pushCredentialDeltaToContainer(ContainerView *container, CredentialDelta delta)
+  {
+    if (container == nullptr)
+    {
+      return false;
+    }
+    delta.bundleGeneration = std::max(delta.bundleGeneration, containerCredentialBundleGeneration(container));
     String serializedDelta = {};
     if (ProdigyWire::serializeCredentialDelta(serializedDelta, delta) == false)
     {
-      return 0;
+      return false;
     }
+    if (container->canProxySendToNeuron())
+    {
+      noteContainerCredentialDeltaPending(container, delta);
+    }
+    container->proxySend(NeuronTopic::refreshContainerCredentials, container->uuid, serializedDelta);
+    return true;
+  }
 
+  uint32_t pushCredentialDeltaToLiveContainers(const DeploymentPlan& deploymentPlan, const CredentialDelta& delta)
+  {
     uint32_t eligibleContainers = 0;
     auto deploymentIt = deployments.find(deploymentPlan.config.deploymentID());
     if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
@@ -4285,8 +6039,7 @@ public:
         case ContainerState::healthy:
         case ContainerState::crashedRestarting:
           {
-            eligibleContainers += 1;
-            container->proxySend(NeuronTopic::refreshContainerCredentials, container->uuid, serializedDelta);
+            eligibleContainers += pushCredentialDeltaToContainer(container, delta) ? 1 : 0;
             break;
           }
         default:
@@ -4744,8 +6497,11 @@ public:
         {
           if (const ApiCredential *credential = findApiCredential(set, requiredName); credential != nullptr)
           {
-            bundle.apiCredentials.push_back(*credential);
-            produced = true;
+            if (apiCredentialMayReachContainer(deploymentPlan, *credential))
+            {
+              bundle.apiCredentials.push_back(*credential);
+              produced = true;
+            }
           }
         }
 
@@ -4757,6 +6513,11 @@ public:
     }
 
     if (buildTlsBundleForContainer(deploymentPlan, container, bundle, bundleGeneration))
+    {
+      produced = true;
+    }
+
+    if (buildPublicTlsBundleForContainer(deploymentPlan, bundle, bundleGeneration))
     {
       produced = true;
     }
@@ -4783,6 +6544,490 @@ public:
       plan.hasCredentialBundle = false;
       plan.credentialBundle = CredentialBundle();
     }
+  }
+
+  bool containerTlsIdentitiesFresh(const DeploymentPlan& deploymentPlan, const ContainerView& container, bool *pending = nullptr, String *failure = nullptr)
+  {
+    if (pending)
+    {
+      *pending = false;
+    }
+    if (failure)
+    {
+      failure->clear();
+    }
+
+    CredentialBundle expected = {};
+    if (buildCredentialBundleForContainer(deploymentPlan, container, expected) == false || expected.tlsIdentities.empty())
+    {
+      return true;
+    }
+
+    for (const TlsIdentity& identity : expected.tlsIdentities)
+    {
+      bool fresh = container.hasCredentialBundle && credentialBundleHasTlsIdentityGeneration(container.credentialBundle, identity.name, identity.generation);
+      if (fresh)
+      {
+        continue;
+      }
+      if (pending && container.hasPendingCredentialBundle &&
+          (container.pendingCredentialBundleSinceMs <= 0 || Time::now<TimeResolution::ms>() - container.pendingCredentialBundleSinceMs < credentialDeltaAckTimeoutMs) &&
+          credentialBundleHasTlsIdentityGeneration(container.pendingCredentialBundle, identity.name, identity.generation))
+      {
+        *pending = true;
+      }
+      if (failure)
+      {
+        failure->snprintf<"container {} is missing TLS identity {} generation {itoa}"_ctv>(String::toHex(container.uuid), identity.name, identity.generation);
+      }
+      return false;
+    }
+
+    return true;
+  }
+
+  bool tlsIdentityCoverageSatisfied(const DeploymentPlan& deploymentPlan, String *failure = nullptr)
+  {
+    if (failure)
+    {
+      failure->clear();
+    }
+    auto deploymentIt = deployments.find(deploymentPlan.config.deploymentID());
+    if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
+    {
+      if (failure)
+      {
+        failure->assign("TLS identity deployment missing"_ctv);
+      }
+      return false;
+    }
+
+    bool sawExpected = false;
+    for (ContainerView *container : deploymentIt->second->containers)
+    {
+      if (container == nullptr || container->state != ContainerState::healthy)
+      {
+        continue;
+      }
+      CredentialBundle expected = {};
+      if (buildCredentialBundleForContainer(deploymentPlan, *container, expected) == false || expected.tlsIdentities.empty())
+      {
+        continue;
+      }
+      sawExpected = true;
+      if (containerTlsIdentitiesFresh(deploymentPlan, *container, nullptr, failure) == false)
+      {
+        return false;
+      }
+    }
+
+    if (sawExpected == false && (deploymentPlan.hasTlsIssuancePolicy || deploymentPlan.publicTLS.empty() == false))
+    {
+      if (failure)
+      {
+        failure->assign("no healthy TLS identity containers"_ctv);
+      }
+      return false;
+    }
+    return true;
+  }
+
+  void summarizeDeploymentTlsIdentityFreshness(const ApplicationDeployment *deployment, DeploymentStatusReport& report)
+  {
+    if (deployment == nullptr)
+    {
+      return;
+    }
+    for (ContainerView *container : deployment->containers)
+    {
+      if (container == nullptr || container->state != ContainerState::healthy)
+      {
+        continue;
+      }
+      CredentialBundle expected = {};
+      if (buildCredentialBundleForContainer(deployment->plan, *container, expected) == false || expected.tlsIdentities.empty())
+      {
+        continue;
+      }
+      report.nTlsIdentityExpected += 1;
+      bool pending = false;
+      if (containerTlsIdentitiesFresh(deployment->plan, *container, &pending, nullptr))
+      {
+        report.nTlsIdentityFresh += 1;
+      }
+      else
+      {
+        report.nTlsIdentityStale += 1;
+        report.nTlsIdentityPending += pending ? 1 : 0;
+      }
+    }
+  }
+
+  uint32_t retryStaleTlsIdentityDeltas(void)
+  {
+    uint32_t sent = 0;
+    for (const auto& [deploymentID, deployment] : deployments)
+    {
+      (void)deploymentID;
+      if (deployment == nullptr)
+      {
+        continue;
+      }
+      for (ContainerView *container : deployment->containers)
+      {
+        if (container == nullptr)
+        {
+          continue;
+        }
+        if (container->state != ContainerState::scheduled && container->state != ContainerState::healthy && container->state != ContainerState::crashedRestarting)
+        {
+          continue;
+        }
+        bool pending = false;
+        if (containerTlsIdentitiesFresh(deployment->plan, *container, &pending, nullptr) || pending)
+        {
+          continue;
+        }
+
+        CredentialBundle expected = {};
+        if (buildCredentialBundleForContainer(deployment->plan, *container, expected) == false || expected.tlsIdentities.empty())
+        {
+          continue;
+        }
+        CredentialDelta delta = {};
+        delta.bundleGeneration = expected.bundleGeneration;
+        delta.updatedTls = std::move(expected.tlsIdentities);
+        delta.reason = "tls-identity-stale-retry"_ctv;
+        sent += pushCredentialDeltaToContainer(container, delta) ? 1 : 0;
+      }
+    }
+    return sent;
+  }
+
+  uint32_t pushPublicTlsIdentityDeltaToLiveContainers(const PublicTlsCertificateState& certificate, const String& reason)
+  {
+    if (certificate.identity.certPem.size() == 0 || certificate.identity.keyPem.size() == 0)
+    {
+      return 0;
+    }
+
+    auto deploymentIt = deployments.find(certificate.spec.deploymentID);
+    if (deploymentIt == deployments.end() || deploymentIt->second == nullptr || publicTlsCertificateMatchesDeployment(deploymentIt->second->plan, certificate) == false)
+    {
+      return 0;
+    }
+
+    CredentialDelta delta = {};
+    delta.bundleGeneration = certificate.identity.generation;
+    delta.updatedTls.push_back(certificate.identity);
+    delta.reason = reason;
+    return pushCredentialDeltaToLiveContainers(deploymentIt->second->plan, delta);
+  }
+
+  uint32_t pushPrivateTlsIdentityDeltaToLiveContainers(uint16_t applicationID, const String& reason)
+  {
+    uint32_t sent = 0;
+    for (const auto& [deploymentID, deployment] : deployments)
+    {
+      (void)deploymentID;
+      if (deployment == nullptr ||
+          deployment->plan.hasTlsIssuancePolicy == false ||
+          deployment->plan.tlsIssuancePolicy.applicationID != applicationID)
+      {
+        continue;
+      }
+
+      for (ContainerView *container : deployment->containers)
+      {
+        if (container == nullptr)
+        {
+          continue;
+        }
+        if (container->state != ContainerState::scheduled && container->state != ContainerState::healthy && container->state != ContainerState::crashedRestarting)
+        {
+          continue;
+        }
+
+        CredentialBundle bundle = {};
+        uint64_t bundleGeneration = 0;
+        if (buildTlsBundleForContainer(deployment->plan, *container, bundle, bundleGeneration) == false || bundle.tlsIdentities.empty())
+        {
+          continue;
+        }
+
+        CredentialDelta delta = {};
+        delta.bundleGeneration = bundleGeneration;
+        delta.updatedTls = std::move(bundle.tlsIdentities);
+        delta.reason = reason;
+        sent += pushCredentialDeltaToContainer(container, delta) ? 1 : 0;
+      }
+    }
+    return sent;
+  }
+
+  static bool privateTlsAuthorityRenewalDueAt(const PrivateTlsVaultLifecycleState& lifecycle, int64_t nowMs)
+  {
+    int64_t rootRenewAtMs = privateTlsVaultRenewAtMs(lifecycle, lifecycle.rootNotBeforeMs, lifecycle.rootNotAfterMs, 0xA11CE001ULL);
+    int64_t interRenewAtMs = privateTlsVaultRenewAtMs(lifecycle, lifecycle.intermediateNotBeforeMs, lifecycle.intermediateNotAfterMs, 0xA11CE002ULL);
+    return (rootRenewAtMs > 0 && rootRenewAtMs <= nowMs) || (interRenewAtMs > 0 && interRenewAtMs <= nowMs);
+  }
+
+  static bool privateTlsAuthorityRenewalDue(const PrivateTlsVaultLifecycleState& lifecycle)
+  {
+    return privateTlsAuthorityRenewalDueAt(lifecycle, lifecycle.nextRenewAtMs);
+  }
+
+  uint32_t reapPublicTlsCertbotProcesses(int64_t nowMs)
+  {
+    uint32_t reaped = 0;
+    for (auto it = publicTlsCertbotPids.begin(); it != publicTlsCertbotPids.end();)
+    {
+      int status = 0;
+      pid_t result = waitpid(it->second, &status, WNOHANG);
+      int waitErrno = result < 0 ? errno : 0;
+      String failure = {};
+      if (result == 0)
+      {
+        auto started = publicTlsCertbotStartedAtMs.find(it->first);
+        if (started == publicTlsCertbotStartedAtMs.end() || started->second <= 0 || nowMs - started->second < publicTlsCertbotTimeoutMs)
+        {
+          ++it;
+          continue;
+        }
+        kill(it->second, SIGKILL);
+        result = waitpid(it->second, &status, 0);
+        waitErrno = result < 0 ? errno : 0;
+        failure.assign("certbot process timed out"_ctv);
+      }
+
+      PublicTlsCertificateState *certificate = findPublicTlsCertificateStateByRuntimeKey(it->first);
+      if (certificate != nullptr)
+      {
+        if (failure.size() == 0 && result < 0)
+        {
+          if (waitErrno == ECHILD && certificate->lastSuccessMs < certificate->lastAttemptMs)
+          {
+            failure.assign("certbot completed without importing lineage"_ctv);
+          }
+          else if (waitErrno != ECHILD)
+          {
+            failure.assign("certbot process was not waitable"_ctv);
+          }
+        }
+        else if (failure.size() == 0 && result >= 0 && (WIFEXITED(status) == false || WEXITSTATUS(status) != 0))
+        {
+          failure.assign("certbot exited without issuing certificate"_ctv);
+        }
+        else if (failure.size() == 0 && result >= 0 && certificate->lastSuccessMs < certificate->lastAttemptMs)
+        {
+          failure.assign("certbot completed without importing lineage"_ctv);
+        }
+        if (failure.size() > 0)
+        {
+          noteCertificateFailure(certificate->failureCount, certificate->lastFailure, failure);
+        }
+        (void)cleanupPublicTlsPendingDNS01Challenges(*certificate);
+      }
+      publicTlsCertbotStartedAtMs.erase(it->first);
+      releasePublicTlsCertbotLock(it->first);
+      it = publicTlsCertbotPids.erase(it);
+      reaped += 1;
+      if (certificate != nullptr)
+      {
+        noteMasterAuthorityRuntimeStateChanged();
+      }
+    }
+    (void)nowMs;
+    return reaped;
+  }
+
+  bool recoverPublicTlsCertificateLineage(PublicTlsCertificateState& certificate, const ProdigyCertbotPaths& paths)
+  {
+    if (certificate.lastAttemptMs <= certificate.lastSuccessMs ||
+        (certificate.lastFailure.size() > 0 && certificate.lastFailure.equal("certbot completed without importing lineage"_ctv) == false))
+    {
+      return false;
+    }
+    AcmeLineageImportRequest request = {};
+    request.clusterUUID = brainConfig.clusterUUID;
+    request.applicationID = certificate.spec.applicationID;
+    request.deploymentID = certificate.spec.deploymentID;
+    request.wormholeName = certificate.spec.wormholeName;
+    request.certName = certificate.certbotCertName.size() ? certificate.certbotCertName : certificate.spec.identityName;
+    request.renewedDomains = certificate.spec.domains;
+    if (certificate.lineagePath.size() == 0)
+    {
+      prodigyCertbotLineagePath(brainConfig, certificate, paths, certificate.lineagePath);
+    }
+    request.lineagePath = certificate.lineagePath;
+
+    AcmeLineageImportResponse response = {};
+    return importACMELineage(request, response);
+  }
+
+  uint32_t advancePublicTlsCertificateLifecycles(int64_t nowMs, const ProdigyCertbotPaths& paths = {})
+  {
+    uint32_t started = 0;
+    (void)reapPublicTlsCertbotProcesses(nowMs);
+    for (PublicTlsCertificateState& certificate : masterAuthorityRuntimeState.publicTlsCertificates)
+    {
+      if (certificate.identity.certPem.size() > 0 && certificate.nextRenewAtMs > nowMs)
+      {
+        continue;
+      }
+      String key = publicTlsCertificateRuntimeKey(certificate);
+      if (publicTlsCertbotPids.find(key) != publicTlsCertbotPids.end())
+      {
+        continue;
+      }
+      if (certificate.lastAttemptMs > certificate.lastSuccessMs && recoverPublicTlsCertificateLineage(certificate, paths))
+      {
+        continue;
+      }
+      if (certificateLifecycleBackoffActive(nowMs, certificate.lastAttemptMs, certificate.lastSuccessMs, certificate.failureCount, publicTlsCertificateJitterSeed(certificate)))
+      {
+        continue;
+      }
+
+      ProdigyCertbotCommand command = {};
+      String failure = {};
+      if (prodigyBuildCertbotCertonlyCommand(brainConfig, certificate, paths, command, &failure) == false)
+      {
+        certificate.lastAttemptMs = nowMs;
+        noteCertificateFailure(certificate.failureCount, certificate.lastFailure, failure);
+        noteMasterAuthorityRuntimeStateChanged();
+        continue;
+      }
+      prodigyCertbotLineagePath(brainConfig, certificate, paths, certificate.lineagePath);
+
+      int lockFD = -1;
+      bool lockBusy = false;
+      if (prodigyAcquireCertbotCertificateLock(brainConfig, certificate, paths, lockFD, &lockBusy, &failure) == false)
+      {
+        if (lockBusy)
+        {
+          continue;
+        }
+        certificate.lastAttemptMs = nowMs;
+        noteCertificateFailure(certificate.failureCount, certificate.lastFailure, failure);
+        noteMasterAuthorityRuntimeStateChanged();
+        continue;
+      }
+
+      pid_t pid = -1;
+      certificate.lastAttemptMs = nowMs;
+      if (prodigySpawnArgv(command.argv, command.env, pid, &failure) == false)
+      {
+        prodigyReleaseCertbotLockFD(lockFD);
+        noteCertificateFailure(certificate.failureCount, certificate.lastFailure, failure);
+        noteMasterAuthorityRuntimeStateChanged();
+        continue;
+      }
+
+      certificate.lastFailure.clear();
+      publicTlsCertbotPids.insert_or_assign(key, pid);
+      publicTlsCertbotStartedAtMs.insert_or_assign(key, nowMs);
+      releasePublicTlsCertbotLock(key);
+      publicTlsCertbotLockFDs.insert_or_assign(key, lockFD);
+      noteMasterAuthorityRuntimeStateChanged();
+      started += 1;
+    }
+    return started;
+  }
+
+  uint32_t advancePrivateTlsVaultLifecycles(int64_t nowMs, bool pushDelta = true)
+  {
+    uint32_t advanced = 0;
+    for (PrivateTlsVaultLifecycleState& lifecycle : masterAuthorityRuntimeState.privateTlsVaultLifecycles)
+    {
+      auto factoryIt = tlsVaultFactoriesByApp.find(lifecycle.applicationID);
+      if (factoryIt != tlsVaultFactoriesByApp.end() && refreshPrivateTlsLeafSchedule(factoryIt->second, lifecycle))
+      {
+        noteMasterAuthorityRuntimeStateChanged();
+      }
+      if (lifecycle.nextRenewAtMs <= 0 || lifecycle.nextRenewAtMs > nowMs || certificateLifecycleBackoffActive(nowMs, lifecycle.lastAttemptMs, lifecycle.lastSuccessMs, lifecycle.failureCount, privateTlsVaultJitterSeed(lifecycle)))
+      {
+        continue;
+      }
+
+      lifecycle.lastAttemptMs = nowMs;
+      if (factoryIt == tlsVaultFactoriesByApp.end())
+      {
+        String failure = {};
+        failure.assign("tls vault factory is missing"_ctv);
+        noteCertificateFailure(lifecycle.failureCount, lifecycle.lastFailure, failure);
+        noteMasterAuthorityRuntimeStateChanged();
+        continue;
+      }
+      ApplicationTlsVaultFactory factory = factoryIt->second;
+      bool rotateAuthority = privateTlsAuthorityRenewalDueAt(lifecycle, nowMs);
+      if (rotateAuthority && (lifecycle.mode != ProdigyCertificateLifecycleMode::managed || factory.keySourceMode != 0))
+      {
+        String failure = {};
+        failure.assign("external tls vault authority material requires operator refresh"_ctv);
+        noteCertificateFailure(lifecycle.failureCount, lifecycle.lastFailure, failure);
+        noteMasterAuthorityRuntimeStateChanged();
+        continue;
+      }
+
+      factory.updatedAtMs = nowMs;
+      if (factory.factoryGeneration < UINT64_MAX)
+      {
+        factory.factoryGeneration += 1;
+      }
+      if (rotateAuthority)
+      {
+        String failure = {};
+        if (generateManagedTlsVaultFactoryMaterial(factory, &failure) == false || validateApplicationTlsVaultFactoryMaterial(factory, &failure) == false)
+        {
+          noteCertificateFailure(lifecycle.failureCount, lifecycle.lastFailure, failure);
+          noteMasterAuthorityRuntimeStateChanged();
+          continue;
+        }
+      }
+      tlsVaultFactoriesByApp.insert_or_assign(factory.applicationID, factory);
+      if (nBrains > 1)
+      {
+        String serializedFactory = {};
+        BitseryEngine::serialize(serializedFactory, factory);
+        queueBrainReplication(BrainTopic::replicateTlsVaultFactory, serializedFactory);
+      }
+
+      PrivateTlsVaultLifecycleState next = {};
+      String failure = {};
+      if (buildPrivateTlsVaultLifecycleState(factory, nowMs, next, &failure) == false)
+      {
+        noteCertificateFailure(lifecycle.failureCount, lifecycle.lastFailure, failure);
+        noteMasterAuthorityRuntimeStateChanged();
+        continue;
+      }
+      next.lastAttemptMs = nowMs;
+      next.lastSuccessMs = nowMs;
+      next.failureCount = 0;
+      lifecycle = std::move(next);
+      noteMasterAuthorityRuntimeStateChanged();
+      if (pushDelta)
+      {
+        String reason = {};
+        if (rotateAuthority)
+        {
+          reason.assign("tls-vault-authority-renewal"_ctv);
+        }
+        else
+        {
+          reason.assign("tls-vault-leaf-renewal"_ctv);
+        }
+        (void)pushPrivateTlsIdentityDeltaToLiveContainers(factory.applicationID, reason);
+      }
+      advanced += 1;
+    }
+    return advanced;
+  }
+
+  uint32_t advanceCertificateLifecycles(int64_t nowMs, bool pushDelta = true, const ProdigyCertbotPaths& paths = {})
+  {
+    uint32_t advanced = advancePublicTlsCertificateLifecycles(nowMs, paths) + advancePrivateTlsVaultLifecycles(nowMs, pushDelta);
+    return advanced + (pushDelta ? retryStaleTlsIdentityDeltas() : 0);
   }
 
   void pushApiCredentialDeltaToLiveContainers(uint16_t applicationID, const ApplicationApiCredentialSet& set, const Vector<String>& updatedNames, const Vector<String>& removedNames, const String& reason)
@@ -4831,23 +7076,24 @@ public:
         {
           if (const ApiCredential *credential = findApiCredential(set, requiredName); credential != nullptr)
           {
-            delta.updatedApi.push_back(*credential);
+            if (apiCredentialMayReachContainer(deployment->plan, *credential))
+            {
+              delta.updatedApi.push_back(*credential);
+            }
+            else if (containsCredentialName(delta.removedApiNames, requiredName) == false)
+            {
+              delta.removedApiNames.push_back(requiredName);
+            }
           }
         }
 
-        if (containsCredentialName(removedNames, requiredName))
+        if (containsCredentialName(removedNames, requiredName) && containsCredentialName(delta.removedApiNames, requiredName) == false)
         {
           delta.removedApiNames.push_back(requiredName);
         }
       }
 
       if (delta.updatedApi.size() == 0 && delta.removedApiNames.size() == 0)
-      {
-        continue;
-      }
-
-      String serializedDelta;
-      if (ProdigyWire::serializeCredentialDelta(serializedDelta, delta) == false)
       {
         continue;
       }
@@ -4865,7 +7111,7 @@ public:
           case ContainerState::healthy:
           case ContainerState::crashedRestarting:
             {
-              container->proxySend(NeuronTopic::refreshContainerCredentials, container->uuid, serializedDelta);
+              (void)pushCredentialDeltaToContainer(container, delta);
               break;
             }
           default:
@@ -8100,6 +10346,7 @@ public:
     owned.name.assign(source.name);
     owned.kind = source.kind;
     owned.subnet = source.subnet;
+    owned.deliverySubnet = source.deliverySubnet;
     owned.routing = source.routing;
     owned.usage = source.usage;
     owned.ingressScope = source.ingressScope;
@@ -8132,6 +10379,7 @@ public:
     owned.datacenterFragment = source.datacenterFragment;
     owned.autoscaleIntervalSeconds = source.autoscaleIntervalSeconds;
     owned.sharedCPUOvercommitPermille = source.sharedCPUOvercommitPermille;
+    owned.machineReservedResources = source.machineReservedResources;
     owned.requiredBrainCount = source.requiredBrainCount;
     owned.architecture = source.architecture;
     owned.bootstrapSshUser.assign(source.bootstrapSshUser);
@@ -8146,6 +10394,26 @@ public:
       ownDistributableExternalSubnet(sourceSubnet, ownedSubnet);
       owned.distributableExternalSubnets.push_back(std::move(ownedSubnet));
     }
+    owned.dnsProvider.assign(source.dnsProvider);
+    owned.dnsCredential.name.assign(source.dnsCredential.name);
+    owned.dnsCredential.provider.assign(source.dnsCredential.provider);
+    owned.dnsCredential.generation = source.dnsCredential.generation;
+    owned.dnsCredential.expiresAtMs = source.dnsCredential.expiresAtMs;
+    owned.dnsCredential.activeFromMs = source.dnsCredential.activeFromMs;
+    owned.dnsCredential.sunsetAtMs = source.dnsCredential.sunsetAtMs;
+    owned.dnsCredential.material.assign(source.dnsCredential.material);
+    for (const auto& [key, value] : source.dnsCredential.metadata)
+    {
+      String ownedKey, ownedValue;
+      ownedKey.assign(key);
+      ownedValue.assign(value);
+      owned.dnsCredential.metadata.insert_or_assign(std::move(ownedKey), std::move(ownedValue));
+    }
+    owned.acme.accountEmail.assign(source.acme.accountEmail);
+    owned.acme.certbotInstall.assign(source.acme.certbotInstall);
+    owned.acme.certbotPath.assign(source.acme.certbotPath);
+    owned.acme.certbotVersion.assign(source.acme.certbotVersion);
+    owned.acme.termsAgreed = source.acme.termsAgreed;
     owned.reporter.to.assign(source.reporter.to);
     owned.reporter.from.assign(source.reporter.from);
     owned.reporter.smtp.assign(source.reporter.smtp);
@@ -8228,7 +10496,8 @@ public:
           machine->totalStorageMB,
           resolvedOwnedLogicalCores,
           resolvedOwnedMemoryMB,
-          resolvedOwnedStorageMB);
+          resolvedOwnedStorageMB,
+          brainConfig.machineReservedResources);
     }
 
     machine->ownedLogicalCores = resolvedOwnedLogicalCores;
@@ -8398,13 +10667,13 @@ public:
             continue;
           }
 
-          prodigyApplyHardwareProfileToClusterMachine(clusterMachine, hardware);
+          prodigyApplyHardwareProfileToClusterMachine(clusterMachine, hardware, brainConfig.machineReservedResources);
           if (brainConfig.runtimeEnvironment.test.enabled)
           {
             auto configIt = brainConfig.configBySlug.find(machine->slug);
             if (configIt != brainConfig.configBySlug.end())
             {
-              (void)clusterMachineApplyOwnedResourcesFromConfig(clusterMachine, configIt->second);
+              (void)clusterMachineApplyOwnedResourcesFromConfig(clusterMachine, configIt->second, brainConfig.machineReservedResources);
             }
           }
           updatedTopology = true;
@@ -9516,7 +11785,7 @@ public:
                  uint32_t(probedResources.peerAddresses.size()));
     std::fflush(stderr);
 
-    if (clusterMachineApplyOwnedResourcesFromTotals(normalized, probedResources.totalLogicalCores, probedResources.totalMemoryMB, probedResources.totalStorageMB, &failure) == false)
+    if (clusterMachineApplyOwnedResourcesFromTotals(normalized, probedResources.totalLogicalCores, probedResources.totalMemoryMB, probedResources.totalStorageMB, brainConfig.machineReservedResources, &failure) == false)
     {
       return false;
     }
@@ -11624,7 +13893,7 @@ public:
       }
 
       message.snprintf_add<"Slug: {}\n"_ctv>(slug);
-      message.snprintf_add<"nMachines: {}\n"_ctv>(nMoreMachines);
+      message.snprintf_add<"nMachines: {itoa}\n"_ctv>(nMoreMachines);
 
       switch (machineLifetime)
       {
@@ -13147,6 +15416,9 @@ public:
           checkForSpotTerminations();
           refreshAllDeploymentWormholeQuicCidState(true);
           (void)advanceAllDeploymentTlsResumptionLifecycles(true);
+          (void)advanceCertificateLifecycles(Time::now<TimeResolution::ms>());
+          spotDecomissionChecker.setTimeoutMs(prodigyBrainSpotDecommissionCheckIntervalMs);
+          Ring::queueTimeout(&spotDecomissionChecker);
           break;
         }
       default:
@@ -14582,6 +16854,7 @@ public:
       uint32_t submittedBytes = activeMothership->pendingSendBytes;
       bool pendingSendBefore = activeMothership->pendingSend;
       sendHandler(activeMothership, result);
+      bool updateAckDrained = updateSelfTransitionAfterMothershipAck && result > 0 && activeMothership->pendingSend == false && activeMothership->wBuffer.outstandingBytes() == 0;
       std::fprintf(stderr, "prodigy mothership send-complete result=%d submittedBytes=%u bytesBefore=%zu bytesAfter=%zu stream=%p fixedFD=%d fslot=%d active=%d pendingSendBefore=%d pendingSendAfter=%d pendingSendBytesAfter=%u\n",
                    result,
                    unsigned(submittedBytes),
@@ -14595,6 +16868,18 @@ public:
                    int(activeMothership->pendingSend),
                    unsigned(activeMothership->pendingSendBytes));
       std::fflush(stderr);
+      if (updateAckDrained)
+      {
+        transitionLocalUpdateToNewBundle();
+        return;
+      }
+      if (updateSelfTransitionAfterMothershipAck && result <= 0)
+      {
+        basics_log("updateProdigy aborting local transition because mothership ack send failed result=%d\n", result);
+        updateSelfTransitionAfterMothershipAck = false;
+        resetUpdateSelfState();
+        noteMasterAuthorityRuntimeStateChanged();
+      }
       closeMothershipAfterSendDrainIfNeeded(activeMothership, "send-complete-drained");
       if (Ring::socketIsClosing(activeMothership) && activeMothership->pendingSend == false && activeMothership->wBuffer.outstandingBytes() == 0)
       {
@@ -15248,6 +17533,16 @@ public:
     _exit(EXIT_FAILURE);
   }
 
+  void transitionLocalUpdateToNewBundle(void)
+  {
+    updateSelfTransitionAfterMothershipAck = false;
+    boottimens = Time::now<TimeResolution::ns>();
+    forfeitMasterStatus();
+    resetUpdateSelfState();
+    noteMasterAuthorityRuntimeStateChanged();
+    transitionToNewBundle();
+  }
+
   void resetUpdateSelfState(bool clearBundleBlob = true)
   {
     updateSelfState = UpdateSelfState::idle;
@@ -15655,11 +17950,11 @@ public:
 
     if (expectedPeerEchos == 0)
     {
-      boottimens = Time::now<TimeResolution::ns>();
-      forfeitMasterStatus();
-      resetUpdateSelfState();
-      noteMasterAuthorityRuntimeStateChanged();
-      transitionToNewBundle();
+      if (updateSelfTransitionAfterMothershipAck)
+      {
+        return;
+      }
+      transitionLocalUpdateToNewBundle();
       return;
     }
 
@@ -17922,7 +20217,8 @@ public:
               *machineConfig,
               request->bootstrapSshUser,
               request->bootstrapSshPrivateKeyPath,
-              request->bootstrapSshHostKeyPackage.publicKeyOpenSSH);
+              request->bootstrapSshHostKeyPackage.publicKeyOpenSSH,
+              owner->brainConfig.machineReservedResources);
           bool inserted = false;
           if (prodigyUpsertClusterMachineByIdentity(targetTopology->machines, createdMachine, &inserted))
           {
@@ -17968,13 +20264,15 @@ public:
               *machineConfig,
               request->bootstrapSshUser,
               request->bootstrapSshPrivateKeyPath,
-              request->bootstrapSshHostKeyPackage.publicKeyOpenSSH);
+              request->bootstrapSshHostKeyPackage.publicKeyOpenSSH,
+              owner->brainConfig.machineReservedResources);
           prodigyRefreshCreatedClusterMachineFromSnapshot(
               createdMachine,
               const_cast<Machine *>(&machine),
               request->bootstrapSshUser,
               request->bootstrapSshPrivateKeyPath,
-              request->bootstrapSshHostKeyPackage.publicKeyOpenSSH);
+              request->bootstrapSshHostKeyPackage.publicKeyOpenSSH,
+              owner->brainConfig.machineReservedResources);
 
           bool inserted = false;
           if (prodigyUpsertClusterMachineByIdentity(targetTopology->machines, createdMachine, &inserted))
@@ -18381,7 +20679,7 @@ public:
           {
             Machine *snapshot = orderedSnapshots[index];
             ClusterMachine createdMachine = {};
-            prodigyPopulateCreatedClusterMachineFromSnapshot(createdMachine, snapshot, instruction, machineConfig, request.bootstrapSshUser, request.bootstrapSshPrivateKeyPath, request.bootstrapSshHostKeyPackage.publicKeyOpenSSH);
+            prodigyPopulateCreatedClusterMachineFromSnapshot(createdMachine, snapshot, instruction, machineConfig, request.bootstrapSshUser, request.bootstrapSshPrivateKeyPath, request.bootstrapSshHostKeyPackage.publicKeyOpenSSH, brainConfig.machineReservedResources);
 
             bool duplicateCreatedIdentity = false;
             for (const ClusterMachine& pendingCreatedMachine : createdMachines)
@@ -18865,6 +21163,7 @@ public:
             brainConfig.sharedCPUOvercommitPermille = incomingConfig.sharedCPUOvercommitPermille;
           }
 
+          brainConfig.machineReservedResources = incomingConfig.machineReservedResources;
           brainConfig.requiredBrainCount = incomingConfig.requiredBrainCount;
           brainConfig.architecture = incomingConfig.architecture;
           brainConfig.bootstrapSshUser = incomingConfig.bootstrapSshUser;
@@ -18882,6 +21181,21 @@ public:
           if (incomingConfig.distributableExternalSubnets.empty() == false)
           {
             brainConfig.distributableExternalSubnets = incomingConfig.distributableExternalSubnets;
+          }
+
+          if (incomingConfig.dnsProvider.size() > 0)
+          {
+            brainConfig.dnsProvider = incomingConfig.dnsProvider;
+          }
+
+          if (incomingConfig.dnsCredential.name.size() > 0)
+          {
+            brainConfig.dnsCredential = incomingConfig.dnsCredential;
+          }
+
+          if (incomingConfig.acme.configured())
+          {
+            brainConfig.acme = incomingConfig.acme;
           }
 
           if (incomingConfig.reporter.to.size() > 0 || incomingConfig.reporter.from.size() > 0 || incomingConfig.reporter.smtp.size() > 0 || incomingConfig.reporter.password.size() > 0)
@@ -19338,17 +21652,20 @@ public:
                                                             request.requestedAddress,
                                                             request.subnet.providerPool,
                                                             request.subnet.subnet,
+                                                            request.subnet.deliverySubnet,
                                                             request.subnet.providerAllocationID,
                                                             request.subnet.providerAssociationID,
                                                             request.subnet.releaseOnRemove,
                                                             response.failure) == false)
                 {
                   request.subnet.subnet = {};
+                  request.subnet.deliverySubnet = {};
                 }
               }
             }
 
             request.subnet.subnet.canonicalize();
+            request.subnet.deliverySubnet.canonicalize();
 
             if (response.success == false && response.failure.size() == 0 && routableExternalSubnetHasSupportedBreadth(request.subnet) == false)
             {
@@ -19554,6 +21871,49 @@ public:
           Message::construct(mothership->wBuffer, MothershipTopic(message->topic), serializedResponse);
           break;
         }
+      case MothershipTopic::presentACMEDNS01Challenge:
+      case MothershipTopic::cleanupACMEDNS01Challenge:
+        {
+          String serializedRequest;
+          Message::extractToStringView(args, serializedRequest);
+
+          AcmeDNS01ChallengeRequest request = {};
+          AcmeDNS01ChallengeResponse response = {};
+          if (BitseryEngine::deserializeSafe(serializedRequest, request) == false)
+          {
+            response.failure.assign("invalid ACME DNS-01 request payload"_ctv);
+          }
+          else
+          {
+            (void)applyACMEDNS01Challenge(request, MothershipTopic(message->topic) == MothershipTopic::cleanupACMEDNS01Challenge, response);
+          }
+
+          String serializedResponse;
+          BitseryEngine::serialize(serializedResponse, response);
+          Message::construct(mothership->wBuffer, MothershipTopic(message->topic), serializedResponse);
+          break;
+        }
+      case MothershipTopic::importACMELineage:
+        {
+          String serializedRequest;
+          Message::extractToStringView(args, serializedRequest);
+
+          AcmeLineageImportRequest request = {};
+          AcmeLineageImportResponse response = {};
+          if (BitseryEngine::deserializeSafe(serializedRequest, request) == false)
+          {
+            response.failure.assign("invalid ACME lineage import request payload"_ctv);
+          }
+          else
+          {
+            (void)importACMELineage(request, response);
+          }
+
+          String serializedResponse;
+          BitseryEngine::serialize(serializedResponse, response);
+          Message::construct(mothership->wBuffer, MothershipTopic::importACMELineage, serializedResponse);
+          break;
+        }
       case MothershipTopic::pullDNSBindings:
         {
           RoutableResourceLeaseReport response = {};
@@ -19569,6 +21929,16 @@ public:
           String serializedResponse;
           BitseryEngine::serialize(serializedResponse, response);
           Message::construct(mothership->wBuffer, MothershipTopic::pullDNSBindings, serializedResponse);
+          break;
+        }
+      case MothershipTopic::teardownDNSBindings:
+        {
+          RoutableResourceLeaseReport response = {};
+          (void)teardownDNSBindingLeases(response);
+
+          String serializedResponse;
+          BitseryEngine::serialize(serializedResponse, response);
+          Message::construct(mothership->wBuffer, MothershipTopic::teardownDNSBindings, serializedResponse);
           break;
         }
       case MothershipTopic::pullClusterReport:
@@ -19958,7 +22328,9 @@ public:
 
             do
             {
-              areport.deploymentReports.push_back(workingDeployment->generateReport());
+              DeploymentStatusReport deploymentReport = workingDeployment->generateReport();
+              summarizeDeploymentTlsIdentityFreshness(workingDeployment, deploymentReport);
+              areport.deploymentReports.push_back(std::move(deploymentReport));
               workingDeployment = workingDeployment->previous;
 
             } while (workingDeployment);
@@ -20074,7 +22446,9 @@ public:
 
               do
               {
-                report.deploymentReports.push_back(workingDeployment->generateReport());
+                DeploymentStatusReport deploymentReport = workingDeployment->generateReport();
+                summarizeDeploymentTlsIdentityFreshness(workingDeployment, deploymentReport);
+                report.deploymentReports.push_back(std::move(deploymentReport));
                 workingDeployment = workingDeployment->previous;
 
               } while (workingDeployment);
@@ -20126,29 +22500,51 @@ public:
           String newBundle;
           Message::extractToStringView(args, newBundle);
 
-          Filesystem::openWriteAtClose(-1, prodigyStagedBundlePath(), newBundle);
-
-          // Persist payload for retries in distributed mode by default.
-          // The staged fast path is only safe when every brain shares one writable
-          // /root staging area, so it is opt-in via PRODIGY_DEV_SHARED_STAGE_BUNDLE=1.
-          updateSelfUseStagedBundleOnly = devSharedStagedBundleEnabled();
-          if (updateSelfUseStagedBundleOnly)
+          MothershipResponse response = {};
+          int written = Filesystem::openWriteAtClose(-1, prodigyStagedBundlePath(), newBundle);
+          if (written < 0 || uint64_t(written) != newBundle.size())
           {
-            updateSelfBundleBlob.clear();
-          }
-          else
-          {
-            updateSelfBundleBlob.assign(newBundle);
+            response.failure.snprintf<"failed to stage update bundle bytes={itoa} expected={itoa}"_ctv>(
+                int64_t(written),
+                uint64_t(newBundle.size()));
           }
 
           uint32_t expectedPeerEchos = 0;
-          for (BrainView *bv : brains)
+          if (response.failure.size() == 0)
           {
-            if (peerSocketActive(bv))
+            response.success = true;
+
+            // Persist payload for retries in distributed mode by default.
+            // The staged fast path is only safe when every brain shares one writable
+            // /root staging area, so it is opt-in via PRODIGY_DEV_SHARED_STAGE_BUNDLE=1.
+            updateSelfUseStagedBundleOnly = devSharedStagedBundleEnabled();
+            if (updateSelfUseStagedBundleOnly)
             {
-              expectedPeerEchos += 1;
+              updateSelfBundleBlob.clear();
+            }
+            else
+            {
+              updateSelfBundleBlob.assign(newBundle);
+            }
+
+            for (BrainView *bv : brains)
+            {
+              if (peerSocketActive(bv))
+              {
+                expectedPeerEchos += 1;
+              }
             }
           }
+
+          String serializedResponse = {};
+          BitseryEngine::serialize(serializedResponse, response);
+          Message::construct(mothership->wBuffer, MothershipTopic::updateProdigy, serializedResponse);
+          if (response.success == false)
+          {
+            break;
+          }
+
+          updateSelfTransitionAfterMothershipAck = expectedPeerEchos == 0 && streamIsActive(mothership);
 
           // now wait for the echos
           beginUpdateSelfBundle(expectedPeerEchos);
@@ -20398,10 +22794,6 @@ public:
           {
             response.failure.assign("mode invalid"_ctv);
           }
-          else if (request.renewLeadPercent == 0 || request.renewLeadPercent >= 100)
-          {
-            response.failure.assign("renewLeadPercent must be in 1..99"_ctv);
-          }
           else
           {
             response.applicationID = request.applicationID;
@@ -20427,8 +22819,6 @@ public:
             {
               factory.defaultLeafValidityDays = request.defaultLeafValidityDays;
             }
-            factory.renewLeadPercent = request.renewLeadPercent;
-
             if (request.mode == 0)
             {
               X509 *rootCert = nullptr;
@@ -20508,15 +22898,21 @@ public:
             if (response.failure.size() == 0)
             {
               factory.factoryGeneration += 1;
+              if (upsertPrivateTlsVaultLifecycleState(factory, factory.updatedAtMs, &response.failure) == false)
+              {
+                factory.factoryGeneration -= 1;
+              }
+            }
+
+            if (response.failure.size() == 0)
+            {
               tlsVaultFactoriesByApp.insert_or_assign(request.applicationID, factory);
-              persistLocalRuntimeState();
 
               response.success = true;
               response.created = created;
               response.mode = factory.keySourceMode;
               response.factoryGeneration = factory.factoryGeneration;
               response.effectiveLeafValidityDays = factory.defaultLeafValidityDays;
-              response.effectiveRenewLeadPercent = factory.renewLeadPercent;
 
               if (nBrains > 1)
               {
@@ -20524,6 +22920,9 @@ public:
                 BitseryEngine::serialize(serializedFactory, factory);
                 queueBrainReplication(BrainTopic::replicateTlsVaultFactory, serializedFactory);
               }
+
+              noteMasterAuthorityRuntimeStateChanged();
+              (void)pushPrivateTlsIdentityDeltaToLiveContainers(request.applicationID, "tls-vault-factory-upsert"_ctv);
             }
           }
 
@@ -20782,7 +23181,21 @@ public:
           }
 
           // we could schedule this many
-          uint32_t nFit = deployment->measure();
+          bool resolved = true;
+          for (Wormhole& wormhole : deployment->plan.wormholes)
+          {
+            if (wormhole.hasDNSConfig && wormhole.dns.bindingName.size() > 0)
+            {
+              String failure = {};
+              if (resolveDeploymentWormholeDNSBinding(deployment->plan, wormhole, failure) == false)
+              {
+                basics_log("measureApplication DNS binding failed: %s\n", failure.c_str());
+                resolved = false;
+                break;
+              }
+            }
+          }
+          uint32_t nFit = resolved ? deployment->measure() : 0;
 
           if (nFit == 0 && deployment->plan.whiteholes.empty() == false)
           {
@@ -20852,12 +23265,20 @@ public:
 
           BitseryEngine::deserialize(serializedPlan, deployment->plan);
           auto rejectInvalidPlan = [&](const String& reason) {
-            delete deployment;
+            String message = reason.size() ? reason : String("invalid plan: unspecified admission failure"_ctv);
+            basics_log("spinApplication invalidPlan: %s\n", message.c_str());
             Message::construct(
                 mothership->wBuffer,
                 MothershipTopic::spinApplication,
                 uint8_t(SpinApplicationResponseCode::invalidPlan),
-                reason);
+                message);
+            delete deployment;
+          };
+          auto rejectInvalidPlanFailure = [&](const String& failure, const String& fallback) {
+            const String& detail = failure.size() > 0 ? failure : fallback;
+            String reason;
+            reason.snprintf<"invalid plan: {}"_ctv>(detail);
+            rejectInvalidPlan(reason);
           };
 
           if (deployment->plan.config.applicationID != applicationID)
@@ -20974,7 +23395,7 @@ public:
               String dnsBindingFailure = {};
               if (resolveDeploymentWormholeDNSBinding(deployment->plan, wormhole, dnsBindingFailure) == false)
               {
-                rejectInvalidPlan(String("invalid plan: "_ctv) + dnsBindingFailure);
+                rejectInvalidPlanFailure(dnsBindingFailure, "wormhole DNS binding resolution failed without detail"_ctv);
                 return;
               }
             }
@@ -20985,7 +23406,7 @@ public:
               RoutableResourceLeaseOwner owner = deploymentRoutableResourceLeaseOwner(deployment->plan);
               if (resolveWormholeRegisteredRoutablePrefix(brainConfig.distributableExternalSubnets, wormhole, &resolveFailure, &routableResourceLeaseRuntimeState, &owner) == false)
               {
-                rejectInvalidPlan(String("invalid plan: "_ctv) + resolveFailure);
+                rejectInvalidPlanFailure(resolveFailure, "wormhole routable prefix resolution failed without detail"_ctv);
                 return;
               }
               if (wormhole.hasDNSConfig)
@@ -20993,7 +23414,7 @@ public:
                 String dnsFailure = {};
                 if (validateDeploymentWormholeDNSConfig(deployment->plan, wormhole, dnsFailure) == false)
                 {
-                  rejectInvalidPlan(String("invalid plan: "_ctv) + dnsFailure);
+                  rejectInvalidPlanFailure(dnsFailure, "wormhole DNS validation failed without detail"_ctv);
                   return;
                 }
               }
@@ -21029,8 +23450,20 @@ public:
           String wormholeLeaseFailure = {};
           if (reserveDeploymentWormholeAddressLeases(deployment->plan, wormholeLeaseFailure, false) == false)
           {
-            rejectInvalidPlan(String("invalid plan: "_ctv) + wormholeLeaseFailure);
+            rejectInvalidPlanFailure(wormholeLeaseFailure, "wormhole lease preflight failed without detail"_ctv);
             return;
+          }
+
+          for (const WormholePublicTLSConfig& publicTLS : deployment->plan.publicTLS)
+          {
+            PublicTlsCertificateSpec ignoredSpec = {};
+            String ignoredCertName = {};
+            String publicTLSFailure = {};
+            if (buildPublicTlsCertificateSpecForDeployment(deployment->plan, publicTLS, ignoredSpec, ignoredCertName, publicTLSFailure) == false)
+            {
+              rejectInvalidPlanFailure(publicTLSFailure, "public TLS preflight failed without detail"_ctv);
+              return;
+            }
           }
 
           (void)prepareDeploymentPlanWormholeQuicCidState(deployment->plan, Time::now<TimeResolution::ms>());
@@ -21114,9 +23547,17 @@ public:
           deployment->plan.config.containerBlobBytes = trustedContainerBlobBytes;
           if (reserveDeploymentWormholeAddressLeases(deployment->plan, wormholeLeaseFailure, true) == false)
           {
-            rejectInvalidPlan(String("invalid plan: "_ctv) + wormholeLeaseFailure);
+            rejectInvalidPlanFailure(wormholeLeaseFailure, "wormhole lease commit failed without detail"_ctv);
             return;
           }
+          String publicTLSFailure = {};
+          if (reconcilePublicTlsCertificateStatesForDeployment(deployment->plan, publicTLSFailure) == false)
+          {
+            rejectInvalidPlanFailure(publicTLSFailure, "public TLS reconcile failed without detail"_ctv);
+            return;
+          }
+
+          (void)advanceCertificateLifecycles(Time::now<TimeResolution::ms>());
 
           String trustedSerializedPlan = {};
           BitseryEngine::serialize(trustedSerializedPlan, deployment->plan);
@@ -21478,6 +23919,7 @@ public:
             container->explicitStatefulTopology = plan.statefulTopology;
             container->subscriptions = plan.subscriptions;
             container->advertisements = plan.advertisements;
+            noteContainerCredentialBundleApplied(container, plan.hasCredentialBundle ? &plan.credentialBundle : nullptr);
             if (previousState == ContainerState::healthy &&
                 uploadedState == ContainerState::healthy &&
                 previousPairingAddress != container->pairingAddress())
@@ -21750,12 +24192,14 @@ public:
           // containerUUID(16)
           uint128_t containerUUID = 0;
           Message::extractArg<ArgumentNature::fixed>(args, containerUUID);
-          TlsResumptionApplyAck result = {};
           if (args < message->terminal())
           {
             String serializedAck = {};
             Message::extractToStringView(args, serializedAck);
-            if (ProdigyWire::deserializeTlsResumptionApplyAck(serializedAck, result) == false)
+            CredentialApplyAck credentialAck = {};
+            TlsResumptionApplyAck resumptionAck = {};
+            bool genericAck = ProdigyWire::deserializeCredentialApplyAck(serializedAck, credentialAck);
+            if (genericAck == false && ProdigyWire::deserializeTlsResumptionApplyAck(serializedAck, resumptionAck) == false)
             {
               basics_log("brain refreshContainerCredentialsAckInvalid uuid=%llu bytes=%llu\n",
                          (unsigned long long)containerUUID,
@@ -21765,8 +24209,29 @@ public:
             }
 
             const int64_t nowMs = Time::now<TimeResolution::ms>();
-            (void)recordTlsResumptionApplyAck(containerUUID, result);
-            for (const TlsResumptionApplyResult& resumptionResult : result.results)
+            if (genericAck)
+            {
+              (void)noteContainerCredentialApplyAck(containerUUID, credentialAck);
+              resumptionAck.results = std::move(credentialAck.resumptionResults);
+            }
+            else
+            {
+              (void)noteContainerCredentialRefreshAck(containerUUID);
+            }
+            (void)recordTlsResumptionApplyAck(containerUUID, resumptionAck);
+            if (genericAck)
+            {
+              for (const TlsIdentityApplyResult& tlsResult : credentialAck.tlsResults)
+              {
+                basics_log("brain refreshContainerCredentialsTlsAck uuid=%llu identity=%.*s generation=%llu success=%u\n",
+                           (unsigned long long)containerUUID,
+                           int(tlsResult.identityName.size()),
+                           reinterpret_cast<const char *>(tlsResult.identityName.data()),
+                           (unsigned long long)tlsResult.generation,
+                           unsigned(tlsResult.success));
+              }
+            }
+            for (const TlsResumptionApplyResult& resumptionResult : resumptionAck.results)
             {
               basics_log("brain refreshContainerCredentialsAck uuid=%llu wormhole=%.*s generation=%llu success=%u\n",
                          (unsigned long long)containerUUID,
@@ -21786,6 +24251,7 @@ public:
           }
           else
           {
+            (void)noteContainerCredentialRefreshAck(containerUUID);
             basics_log("brain refreshContainerCredentialsAck uuid=%llu\n",
                        (unsigned long long)containerUUID);
           }

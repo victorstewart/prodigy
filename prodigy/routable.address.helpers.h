@@ -99,6 +99,28 @@ static inline bool wormholeAddressLeaseConflicts(const Vector<RoutableResourceLe
   return false;
 }
 
+static inline bool resolveWormholeDeliveryAddress(const DistributableExternalSubnet& prefix, Wormhole& wormhole, String *failure)
+{
+  wormhole.deliveryAddress = {};
+  if (prefix.deliverySubnet.network.isNull())
+  {
+    return true;
+  }
+
+  IPPrefix delivery = prefix.deliverySubnet.canonicalized();
+  if (distributableExternalSubnetIsHostPrefix(prefix) && delivery.cidr == prefix.subnet.cidr && delivery.network.is6 == wormhole.externalAddress.is6)
+  {
+    wormhole.deliveryAddress = delivery.network;
+    return true;
+  }
+
+  if (failure)
+  {
+    failure->assign("registered routable prefix deliverySubnet must match a host prefix"_ctv);
+  }
+  return false;
+}
+
 static inline bool resolveWormholeRegisteredRoutablePrefix(const Vector<DistributableExternalSubnet>& prefixes,
                                                            Wormhole& wormhole,
                                                            String *failure = nullptr,
@@ -156,7 +178,7 @@ static inline bool resolveWormholeRegisteredRoutablePrefix(const Vector<Distribu
   {
     if (registered.containsAddress(wormhole.externalAddress))
     {
-      return true;
+      return resolveWormholeDeliveryAddress(*prefix, wormhole, failure);
     }
 
     if (failure)
@@ -178,7 +200,7 @@ static inline bool resolveWormholeRegisteredRoutablePrefix(const Vector<Distribu
     if (candidate.isNull() == false && wormholeAddressLeaseConflicts(leases, owner, prefix->uuid, candidate) == false)
     {
       wormhole.externalAddress = candidate;
-      return true;
+      return resolveWormholeDeliveryAddress(*prefix, wormhole, failure);
     }
   }
 

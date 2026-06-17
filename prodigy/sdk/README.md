@@ -76,7 +76,8 @@ The standalone Aegis examples are intentionally runnable without Prodigy runtime
 - load startup parameters from `PRODIGY_PARAMS_FD` or `argv[1]`
 - seed local state from startup pairings
 - process live pairing updates on the shared control stream
-- ACK `resourceDelta`, empty `credentialsRefresh`, and raw or typed resumption `credentialsRefresh` ACKs
+- ACK `resourceDelta`, empty `credentialsRefresh`, typed TLS identity apply, and resumption `credentialsRefresh` ACKs
+- apply `updatedTls` to the TLS identity source for new handshakes before ACKing; existing connections keep their current TLS context
 - send `healthy` only after the container is ready
 
 ## Legacy Compatibility Notes

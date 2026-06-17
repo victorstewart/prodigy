@@ -1179,7 +1179,7 @@ public:
         std::lock_guard<std::mutex> lock(probeTlsResumptionMutex);
         issueReady = probeTlsResumptionRegistry.currentIssueKey(snapshot.wormholeName, tlsNowMs(nullptr)) != nullptr;
       }
-      String containerUUIDText = neuronHub ? String(neuronHub->parameters.uuid) : String();
+      String containerUUIDText = neuronHub ? String::toHex(neuronHub->parameters.uuid) : String();
       char detail[256] = {};
       const bool applySuccess = std::all_of(
           localApply.results.begin(),

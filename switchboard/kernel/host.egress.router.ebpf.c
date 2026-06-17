@@ -4,7 +4,7 @@
 #include <switchboard/kernel/egress.routing.h>
 
 SEC("tcx/egress")
-int host_egress_router(struct __sk_buff *skb)
+int host_egress(struct __sk_buff *skb)
 {
 #if PRODIGY_DEBUG
   logSKB(skb);

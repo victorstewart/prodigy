@@ -355,7 +355,7 @@ public:
 constexpr static inline uint32_t vultrCreateRecoveryPollSleepMs = 500u;
 constexpr static inline uint32_t vultrCreateRecoveryMaxAttempts = 48u;
 constexpr static inline uint32_t vultrMachineProvisioningUnchangedPollSleepMs = 250u;
-constexpr static inline uint32_t vultrMachineProvisioningTimeoutMs = 180'000u;
+constexpr static inline uint32_t vultrMachineProvisioningTimeoutMs = 600'000u;
 
 static inline struct curl_slist *vultr_auth_headers(const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment)
 {
@@ -703,7 +703,7 @@ static inline void vultrManagedVPCSubnet(const String& region, String& subnet, u
   uint32_t secondOctet = (regionHash % 254u) + 1u;
   uint32_t thirdOctet = ((regionHash >> 8) & 0x0fu) * 16u;
   prefixLength = vultrManagedVPCPrefixLength();
-  subnet.snprintf<"10.{}.{}.0"_ctv>(secondOctet, thirdOctet);
+  subnet.snprintf<"10.{itoa}.{itoa}.0"_ctv>(secondOctet, thirdOctet);
 }
 
 static inline bool vultrMachineKindUsesManagedVPC(MachineConfig::MachineKind kind)
@@ -2144,7 +2144,7 @@ private:
     body.append(",\"v4_subnet\":"_ctv);
     prodigyAppendEscapedJSONStringLiteral(body, wantedSubnet);
     body.append(",\"v4_subnet_mask\":"_ctv);
-    body.append(String(wantedPrefixLength));
+    body.snprintf_add<"{itoa}"_ctv>(wantedPrefixLength);
     body.append("}"_ctv);
 
     String createResponse = {};
@@ -2153,7 +2153,7 @@ private:
     curl_slist_free_all(h);
     if (ok == false || httpCode < 200 || httpCode >= 300)
     {
-      error.assign("vultr vpc create failed"_ctv);
+      error.snprintf<"vultr vpc create failed http={itoa} body={}"_ctv>(uint32_t(httpCode), createResponse);
       return false;
     }
 

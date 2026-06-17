@@ -3,7 +3,9 @@
 #include <arpa/inet.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
+#include <cerrno>
 #include <cstring>
+#include <services/debug.h>
 #include <unistd.h>
 
 #include <ebpf/common/structs.h>
@@ -95,14 +97,23 @@ static inline bool switchboardPinWhiteholeReplyFlowMap(Program *program, uint32_
   String path = {};
   switchboardWhiteholeReplyFlowPinPath(path, ifindex);
 
-  program->openMap("whitehole_reply_flows"_ctv, [&](int map_fd) -> void {
+  program->openMap("white_replies"_ctv, [&](int map_fd) -> void {
     if (map_fd < 0)
     {
+      basics_log("Switchboard missing white_replies map for pin ifidx=%u\n", ifindex);
       return;
     }
 
     (void)unlink(path.c_str());
-    pinned = (bpf_obj_pin(map_fd, path.c_str()) == 0);
+    int result = bpf_obj_pin(map_fd, path.c_str());
+    pinned = (result == 0);
+    if (result != 0)
+    {
+      basics_log("Switchboard white_replies pin failed ifidx=%u path=%s errno=%d\n",
+                 ifindex,
+                 path.c_str(),
+                 errno);
+    }
   });
 
   return pinned;
@@ -121,12 +132,27 @@ static inline bool switchboardReusePinnedWhiteholeReplyFlowMap(struct bpf_object
   int pinnedReplyMapFD = bpf_obj_get(path.c_str());
   if (pinnedReplyMapFD < 0)
   {
+    basics_log("Switchboard white_replies pinned map open failed ifidx=%u path=%s errno=%d\n",
+               ifindex,
+               path.c_str(),
+               errno);
     return false;
   }
 
-  struct bpf_map *replyMap = bpf_object__find_map_by_name(obj, "whitehole_reply_flows");
-  if (replyMap == nullptr || bpf_map__reuse_fd(replyMap, pinnedReplyMapFD) != 0)
+  struct bpf_map *replyMap = bpf_object__find_map_by_name(obj, "white_replies");
+  if (replyMap == nullptr)
   {
+    basics_log("Switchboard white_replies map missing while reusing pinned fd ifidx=%u\n", ifindex);
+    ::close(pinnedReplyMapFD);
+    return false;
+  }
+
+  if (bpf_map__reuse_fd(replyMap, pinnedReplyMapFD) != 0)
+  {
+    basics_log("Switchboard white_replies map reuse failed ifidx=%u fd=%d errno=%d\n",
+               ifindex,
+               pinnedReplyMapFD,
+               errno);
     ::close(pinnedReplyMapFD);
     return false;
   }

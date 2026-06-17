@@ -23,22 +23,7 @@ public:
       failure.clear();
       return true;
     }
-
-    ProdigyDNSHTTPRequest request = {};
-    request.method.assign("POST"_ctv);
-    if (cloudflareURL(record, {}, request.url, failure) == false)
-    {
-      return false;
-    }
-    request.header("Content-Type: application/json");
-    request.bearer(credential.material);
-    if (prodigyDNSAppendRecordJSON(request.body, record, "content", nullptr, failure) == false)
-    {
-      return false;
-    }
-    String response = {};
-    long httpCode = 0;
-    return acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "cloudflare dns upsert failed");
+    return create(record, credential, failure);
   }
 
   bool remove(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
@@ -55,16 +40,17 @@ public:
       return true;
     }
 
-    ProdigyDNSHTTPRequest request = {};
-    request.method.assign("DELETE"_ctv);
-    if (cloudflareURL(record, id, request.url, failure) == false)
-    {
-      return false;
-    }
-    request.bearer(credential.material);
-    String response = {};
-    long httpCode = 0;
-    return acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "cloudflare dns delete failed");
+    return removeExact(record, credential, id, failure);
+  }
+
+  bool presentTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  {
+    return changeTXT(false, record, credential, failure);
+  }
+
+  bool cleanupTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  {
+    return changeTXT(true, record, credential, failure);
   }
 
 private:
@@ -89,7 +75,66 @@ private:
     return true;
   }
 
-  bool findRecord(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, ProdigyDNSRecordPresence& presence, String& id, String& failure)
+  bool changeTXT(bool removing, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
+  {
+    String ignored = {};
+    if (prodigyDNSRecordSingleTXTValue(record, ignored, failure) == false)
+    {
+      return false;
+    }
+    String id = {};
+    ProdigyDNSRecordPresence presence = {};
+    if (findRecord(record, credential, presence, id, failure, true) == false)
+    {
+      return false;
+    }
+    if (presence == ProdigyDNSRecordPresence::exact)
+    {
+      return removing ? removeExact(record, credential, id, failure) : true;
+    }
+    if (removing)
+    {
+      failure.clear();
+      return true;
+    }
+    return create(record, credential, failure);
+  }
+
+  bool create(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
+  {
+    ProdigyDNSHTTPRequest request = {};
+    request.method.assign("POST"_ctv);
+    if (cloudflareURL(record, {}, request.url, failure) == false)
+    {
+      return false;
+    }
+    request.header("Content-Type: application/json");
+    request.bearer(credential.material);
+    String name = cloudflareRecordName(record.name);
+    if (prodigyDNSAppendRecordJSON(request.body, record, "content", &name, failure) == false)
+    {
+      return false;
+    }
+    String response = {};
+    long httpCode = 0;
+    return acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "cloudflare dns upsert failed");
+  }
+
+  bool removeExact(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, const String& id, String& failure)
+  {
+    ProdigyDNSHTTPRequest request = {};
+    request.method.assign("DELETE"_ctv);
+    if (cloudflareURL(record, id, request.url, failure) == false)
+    {
+      return false;
+    }
+    request.bearer(credential.material);
+    String response = {};
+    long httpCode = 0;
+    return acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "cloudflare dns delete failed");
+  }
+
+  bool findRecord(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, ProdigyDNSRecordPresence& presence, String& id, String& failure, bool exactOnly = false)
   {
     ProdigyDNSHTTPRequest request = {};
     request.method.assign("GET"_ctv);
@@ -99,7 +144,8 @@ private:
     }
     String type = {};
     String name = {};
-    if (prodigyDNSEncodePathPart(record.type, type, failure) == false || prodigyDNSEncodePathPart(record.name, name, failure) == false)
+    String normalizedName = cloudflareRecordName(record.name);
+    if (prodigyDNSEncodePathPart(record.type, type, failure) == false || prodigyDNSEncodePathPart(normalizedName, name, failure) == false)
     {
       return false;
     }
@@ -111,6 +157,16 @@ private:
     {
       return false;
     }
-    return prodigyDNSFindJSONRecord(response, "result", record, record.name, "content", presence, id, failure);
+    return prodigyDNSFindJSONRecord(response, "result", record, normalizedName, "content", exactOnly, presence, id, failure);
+  }
+
+  static String cloudflareRecordName(const String& name)
+  {
+    String value = name;
+    while (value.size() > 0 && value[value.size() - 1] == '.')
+    {
+      value.resize(value.size() - 1);
+    }
+    return value;
   }
 };

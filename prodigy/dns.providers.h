@@ -40,6 +40,28 @@ public:
     return provider->remove(record, credential, failure);
   }
 
+  bool presentTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  {
+    ProdigyDNSProvider *provider = resolve(record.provider);
+    if (provider == nullptr)
+    {
+      failure.assign("DNS provider is not configured"_ctv);
+      return false;
+    }
+    return provider->presentTXT(record, credential, failure);
+  }
+
+  bool cleanupTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  {
+    ProdigyDNSProvider *provider = resolve(record.provider);
+    if (provider == nullptr)
+    {
+      failure.assign("DNS provider is not configured"_ctv);
+      return false;
+    }
+    return provider->cleanupTXT(record, credential, failure);
+  }
+
 private:
 
   CloudflareDNSProvider cloudflare;

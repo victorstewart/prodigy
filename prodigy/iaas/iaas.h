@@ -15,6 +15,16 @@ class CoroutineStack;
 class Machine;
 class BrainView;
 
+class BrainIaaSClusterCreatePreflight {
+public:
+
+  Vector<MachineConfig> configs;
+  String gcpServiceAccountEmail;
+  String gcpNetwork;
+  String gcpSubnetwork;
+  String azureManagedIdentityResourceID;
+};
+
 class BrainIaaSMachineProvisioningProgressSink {
 public:
 
@@ -192,6 +202,12 @@ public:
   {
     return false;
   }
+  virtual bool preflightClusterCreate(const BrainIaaSClusterCreatePreflight& preflight, String& error)
+  {
+    (void)preflight;
+    error.clear();
+    return true;
+  }
   virtual void spinMachines(CoroutineStack *coro, MachineLifetime lifetime, const MachineConfig& config, uint32_t count, bytell_hash_set<Machine *>& newMachines, String& error) = 0;
   virtual void spinMachines(CoroutineStack *coro, MachineLifetime lifetime, const MachineConfig& config, uint32_t count, bool isBrain, bytell_hash_set<Machine *>& newMachines, String& error)
   {
@@ -224,6 +240,7 @@ public:
                                             const String& requestedAddress,
                                             const String& providerPool,
                                             IPPrefix& assignedPrefix,
+                                            IPPrefix& deliveryPrefix,
                                             String& allocationID,
                                             String& associationID,
                                             bool& releaseOnRemove,
@@ -235,6 +252,7 @@ public:
     (void)requestedAddress;
     (void)providerPool;
     assignedPrefix = {};
+    deliveryPrefix = {};
     allocationID.clear();
     associationID.clear();
     releaseOnRemove = false;

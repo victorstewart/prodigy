@@ -273,7 +273,7 @@ protected:
     program->openMap(mapName, [&](int map_fd) -> void {
       if (map_fd < 0)
       {
-        basics_log("Neuron missing overlay presence map\n");
+        basics_log("Neuron missing overlay presence map=%s\n", mapName.c_str());
         return;
       }
 
@@ -281,14 +281,20 @@ protected:
       {
         if (overlayKeyPresent(desiredKeys, existing, equals) == false)
         {
-          bpf_map_delete_elem(map_fd, &existing);
+          if (bpf_map_delete_elem(map_fd, &existing) != 0)
+          {
+            basics_log("Neuron overlay presence delete failed map=%s errno=%d\n", mapName.c_str(), errno);
+          }
         }
       }
 
       __u8 present = 1;
       for (const Key& desired : desiredKeys)
       {
-        bpf_map_update_elem(map_fd, &desired, &present, BPF_ANY);
+        if (bpf_map_update_elem(map_fd, &desired, &present, BPF_ANY) != 0)
+        {
+          basics_log("Neuron overlay presence update failed map=%s errno=%d\n", mapName.c_str(), errno);
+        }
       }
     });
 
@@ -318,7 +324,7 @@ protected:
     program->openMap(mapName, [&](int map_fd) -> void {
       if (map_fd < 0)
       {
-        basics_log("Neuron missing overlay value map\n");
+        basics_log("Neuron missing overlay value map=%s\n", mapName.c_str());
         return;
       }
 
@@ -326,13 +332,19 @@ protected:
       {
         if (overlayKeyPresent(desiredKeys, existing, equals) == false)
         {
-          bpf_map_delete_elem(map_fd, &existing);
+          if (bpf_map_delete_elem(map_fd, &existing) != 0)
+          {
+            basics_log("Neuron overlay value delete failed map=%s errno=%d\n", mapName.c_str(), errno);
+          }
         }
       }
 
       for (const auto& entry : desiredEntries)
       {
-        bpf_map_update_elem(map_fd, &entry.first, &entry.second, BPF_ANY);
+        if (bpf_map_update_elem(map_fd, &entry.first, &entry.second, BPF_ANY) != 0)
+        {
+          basics_log("Neuron overlay value update failed map=%s errno=%d\n", mapName.c_str(), errno);
+        }
       }
     });
 
@@ -386,14 +398,14 @@ protected:
                                            installedIngressHostedIngressRouteKeys6);
 
     syncOverlayPresenceMap(tcx_egress_program,
-                           "overlay_routable_prefixes4"_ctv,
+                           "ovl_pfx4"_ctv,
                            installedEgressOverlayPrefixes4,
                            desiredPrefixes4,
                            [](const switchboard_overlay_prefix4_key& lhs, const switchboard_overlay_prefix4_key& rhs) -> bool {
                              return switchboardOverlayPrefix4Equals(lhs, rhs);
                            });
     syncOverlayPresenceMap(tcx_egress_program,
-                           "overlay_routable_prefixes6"_ctv,
+                           "ovl_pfx6"_ctv,
                            installedEgressOverlayPrefixes6,
                            desiredPrefixes6,
                            [](const switchboard_overlay_prefix6_key& lhs, const switchboard_overlay_prefix6_key& rhs) -> bool {
@@ -428,7 +440,7 @@ protected:
     }
 
     syncOverlayValueMap(tcx_egress_program,
-                        "whitehole_bindings"_ctv,
+                        "whiteholes"_ctv,
                         installedEgressWhiteholeBindingKeys,
                         desiredBindings,
                         [](const portal_definition& lhs, const portal_definition& rhs) -> bool {
@@ -1997,7 +2009,7 @@ protected:
     {
       if ((tcx_egress_program = eth.loadPreattachedProgram(BPF_TCX_EGRESS, hostEgressPath)) == nullptr)
       {
-        tcx_egress_program = eth.attachBPF(BPF_TCX_EGRESS, hostEgressPath, "host_egress_router"_ctv);
+        tcx_egress_program = eth.attachBPF(BPF_TCX_EGRESS, hostEgressPath, "host_egress"_ctv);
         if (tcx_egress_program)
         {
           basics_log("setupNetworking attached host egress path=%s ifidx=%d\n",
@@ -2031,35 +2043,56 @@ protected:
         basics_log("setupNetworking skipping host ingress attach because whitehole reply flow pinning failed ifidx=%d\n",
                    eth.ifidx);
       }
-      else if ((tcx_ingress_program = eth.loadPreattachedProgram(BPF_TCX_INGRESS, hostIngressPath)))
-      {
-        basics_log("setupNetworking loaded preattached host ingress path=%s ifidx=%d\n",
-                   hostIngressPath.c_str(), eth.ifidx);
-        // so we could gather our fragment this way but we don't need to
-        // tcx_ingress_program->getArrayElement("local_container_subnet_map"_ctv, 0, lcsubnet6);
-
-        // if we used the getULA(IPAddress& ula) on EthDevice with systemd network config files
-        // to make subnets and fragments persist across operating system reboots.. but...
-      }
       else
       {
-        eth.addIP(containerSubnet6);
-
-        // load and setup tcx ingress program
-        tcx_ingress_program = eth.attachBPF(BPF_TCX_INGRESS, hostIngressPath, "host_ingress_router"_ctv,
-                                            [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
-                                              (void)switchboardReusePinnedWhiteholeReplyFlowMap(obj, eth.ifidx, inner_map_fds);
-                                            });
+        tcx_ingress_program = eth.loadPreattachedProgram(BPF_TCX_INGRESS, hostIngressPath);
+#if NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE
         if (tcx_ingress_program)
         {
-          basics_log("setupNetworking attached host ingress path=%s ifidx=%d\n",
+          bool hasPortalMaps = false;
+          tcx_ingress_program->openMap("ext_portals"_ctv, [&](int mapFD) -> void {
+            hasPortalMaps = mapFD >= 0;
+          });
+          if (hasPortalMaps == false)
+          {
+            basics_log("setupNetworking detaching stale host ingress without portal maps path=%s ifidx=%d\n",
+                       hostIngressPath.c_str(), eth.ifidx);
+            eth.detachBPF(BPF_TCX_INGRESS);
+            tcx_ingress_program = nullptr;
+          }
+        }
+#endif
+
+        if (tcx_ingress_program)
+        {
+          basics_log("setupNetworking loaded preattached host ingress path=%s ifidx=%d\n",
                      hostIngressPath.c_str(), eth.ifidx);
-          tcx_ingress_program->setArrayElement("local_container_subnet_map"_ctv, 0, lcsubnet6);
+          // so we could gather our fragment this way but we don't need to
+          // tcx_ingress_program->getArrayElement("lc_subnet"_ctv, 0, lcsubnet6);
+
+          // if we used the getULA(IPAddress& ula) on EthDevice with systemd network config files
+          // to make subnets and fragments persist across operating system reboots.. but...
         }
         else
         {
-          basics_log("setupNetworking failed to attach host ingress path=%s ifidx=%d\n",
-                     hostIngressPath.c_str(), eth.ifidx);
+          eth.addIP(containerSubnet6);
+
+          // load and setup tcx ingress program
+          tcx_ingress_program = eth.attachBPF(BPF_TCX_INGRESS, hostIngressPath, "host_ingress"_ctv,
+                                              [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
+                                                (void)switchboardReusePinnedWhiteholeReplyFlowMap(obj, eth.ifidx, inner_map_fds);
+                                              });
+          if (tcx_ingress_program)
+          {
+            basics_log("setupNetworking attached host ingress path=%s ifidx=%d\n",
+                       hostIngressPath.c_str(), eth.ifidx);
+            tcx_ingress_program->setArrayElement("lc_subnet"_ctv, 0, lcsubnet6);
+          }
+          else
+          {
+            basics_log("setupNetworking failed to attach host ingress path=%s ifidx=%d\n",
+                       hostIngressPath.c_str(), eth.ifidx);
+          }
         }
       }
     }
@@ -2072,13 +2105,13 @@ protected:
 
     if (tcx_ingress_program)
     {
-      tcx_ingress_program->setArrayElement("local_container_subnet_map"_ctv, 0, lcsubnet6);
+      tcx_ingress_program->setArrayElement("lc_subnet"_ctv, 0, lcsubnet6);
     }
 
     if (tcx_egress_program)
     {
       tcx_egress_program->setArrayElement("mac_map"_ctv, 0, eth.mac);
-      tcx_egress_program->setArrayElement("gateway_mac_map"_ctv, 0, eth.gateway_mac);
+      tcx_egress_program->setArrayElement("gw_mac_map"_ctv, 0, eth.gateway_mac);
       (void)switchboardPinWhiteholeReplyFlowMap(tcx_egress_program, eth.ifidx);
     }
 
@@ -2770,15 +2803,7 @@ public:
                  unsigned(crashReport.size()),
                  (previewBytes > 0 ? preview.c_str() : "<empty>"));
 
-      // containerUUID(16) approxTimeMs(8) signal(4) report{4} restarted(1)
-      if (brain)
-      {
-        Message::construct(brain->wBuffer, NeuronTopic::containerFailed, containerUUID, failureTimeMs, terminalSignal, crashReport, restart);
-        if (streamIsActive(brain))
-        {
-          Ring::queueSend(brain);
-        }
-      }
+      reportContainerFailed(containerUUID, failureTimeMs, terminalSignal, crashReport, restart);
 
       if (restart)
       {
@@ -3249,8 +3274,7 @@ public:
                   }
 
                   String empty;
-                  Message::construct(brain->wBuffer, NeuronTopic::containerFailed, container->plan.uuid, 0, 0, empty, restarted);
-                  Ring::queueSend(brain);
+                  reportContainerFailed(container->plan.uuid, 0, 0, empty, restarted);
                   continue;
                 }
               }
@@ -3286,13 +3310,8 @@ public:
                 ContainerManager::destroyContainer(container);
               }
 
-              // containerUUID(16) approxTimeMs(8) signal(4) report{4} restarted(1)
               String empty;
-              Message::construct(brain->wBuffer, NeuronTopic::containerFailed, container->plan.uuid, 0, 0, empty, restarted);
-              if (streamIsActive(brain))
-              {
-                Ring::queueSend(brain);
-              }
+              reportContainerFailed(container->plan.uuid, 0, 0, empty, restarted);
             }
           }
 
@@ -3428,14 +3447,17 @@ public:
                        (unsigned long long)(pendingContainerDownloads.contains(deploymentID) ? pendingContainerDownloads.countEntriesFor(deploymentID) : 0));
           std::fflush(stderr);
 
-          String containerStoreFailure = {};
-          if (ContainerStore::store(deploymentID, containerBlob, nullptr, nullptr, nullptr, nullptr, &containerStoreFailure) == false)
+          if (containerBlob.size() > 0)
           {
-            std::fprintf(stderr,
-                         "neuron requestContainerBlob store failed deploymentID=%llu reason=%s\n",
-                         (unsigned long long)deploymentID,
-                         (containerStoreFailure.size() > 0 ? containerStoreFailure.c_str() : "unknown"));
-            std::fflush(stderr);
+            String containerStoreFailure = {};
+            if (ContainerStore::store(deploymentID, containerBlob, nullptr, nullptr, nullptr, nullptr, &containerStoreFailure) == false)
+            {
+              std::fprintf(stderr,
+                           "neuron requestContainerBlob store failed deploymentID=%llu reason=%s\n",
+                           (unsigned long long)deploymentID,
+                           (containerStoreFailure.size() > 0 ? containerStoreFailure.c_str() : "unknown"));
+              std::fflush(stderr);
+            }
           }
 
           if (auto pendingIt = pendingContainerDownloads.find(deploymentID); pendingIt != pendingContainerDownloads.end())
@@ -4805,5 +4827,18 @@ public:
     metricSampleStateByContainer.erase(container->plan.uuid);
 
     RingDispatcher::eraseMultiplexee(container);
+  }
+
+  void reportContainerFailed(uint128_t containerUUID, int64_t failureTimeMs, int terminalSignal, const String& crashReport, bool restart) override
+  {
+    if (brain == nullptr)
+    {
+      return;
+    }
+    Message::construct(brain->wBuffer, NeuronTopic::containerFailed, containerUUID, failureTimeMs, terminalSignal, crashReport, restart);
+    if (streamIsActive(brain))
+    {
+      Ring::queueSend(brain);
+    }
   }
 };

@@ -262,6 +262,9 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
     case MothershipTopic::unregisterRoutableSubnet:
     case MothershipTopic::upsertDNSBinding:
     case MothershipTopic::deleteDNSBinding:
+    case MothershipTopic::presentACMEDNS01Challenge:
+    case MothershipTopic::cleanupACMEDNS01Challenge:
+    case MothershipTopic::importACMELineage:
       {
         return consumeVariable(cursor, terminal) && cursor == terminal;
       }
@@ -296,6 +299,7 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
     case MothershipTopic::pullRoutableSubnets:
     case MothershipTopic::pullRoutableResourceLeases:
     case MothershipTopic::pullDNSBindings:
+    case MothershipTopic::teardownDNSBindings:
       {
         return (cursor == terminal);
       }
@@ -729,8 +733,10 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
           return false;
         }
 
-        TlsResumptionApplyAck result;
-        return ProdigyWire::deserializeTlsResumptionApplyAck(serializedAck, result);
+        CredentialApplyAck credentialAck;
+        TlsResumptionApplyAck resumptionAck;
+        return ProdigyWire::deserializeCredentialApplyAck(serializedAck, credentialAck) ||
+               ProdigyWire::deserializeTlsResumptionApplyAck(serializedAck, resumptionAck);
       }
     case NeuronTopic::spotTerminationImminent:
     case NeuronTopic::ping:
@@ -1059,8 +1065,10 @@ static bool validateContainerPayloadForNeuron(uint16_t rawTopic, uint8_t *args, 
           return true;
         }
 
-        TlsResumptionApplyAck result;
-        return ProdigyWire::deserializeTlsResumptionApplyAckFramePayload(args, uint64_t(terminal - args), result);
+        CredentialApplyAck credentialAck;
+        TlsResumptionApplyAck resumptionAck;
+        return ProdigyWire::deserializeCredentialApplyAckFramePayload(args, uint64_t(terminal - args), credentialAck) ||
+               ProdigyWire::deserializeTlsResumptionApplyAckFramePayload(args, uint64_t(terminal - args), resumptionAck);
       }
     default:
       {

@@ -55,7 +55,8 @@ type meshEvent struct {
 
 type meshDispatch struct {
 	neuronhub.DispatchBase
-	sink neuronhub.ReactorSink[meshEvent]
+	sink          neuronhub.ReactorSink[meshEvent]
+	tlsIdentities map[string]neuronhub.TlsIdentity
 }
 
 func (dispatch *meshDispatch) EndOfDynamicArgs(hub *neuronhub.NeuronHub) {
@@ -108,6 +109,12 @@ func (dispatch *meshDispatch) ResourceDelta(hub *neuronhub.NeuronHub, delta neur
 }
 
 func (dispatch *meshDispatch) CredentialsRefresh(hub *neuronhub.NeuronHub, delta neuronhub.CredentialDelta) {
+	for _, name := range delta.RemovedTLSNames {
+		delete(dispatch.tlsIdentities, name)
+	}
+	for _, identity := range delta.UpdatedTLS {
+		dispatch.tlsIdentities[identity.Name] = identity
+	}
 	if err := hub.AcknowledgeCredentialsRefresh(); err != nil {
 		dispatch.sink.EmitError(err)
 		return
@@ -132,10 +139,15 @@ func main() {
 
 func run() error {
 	reactor := neuronhub.NewReactor[meshEvent]()
-	dispatch := &meshDispatch{sink: reactor.Sink()}
+	dispatch := &meshDispatch{sink: reactor.Sink(), tlsIdentities: map[string]neuronhub.TlsIdentity{}}
 	hub, err := neuronhub.NewNeuronHub(dispatch, nil)
 	if err != nil {
 		return err
+	}
+	if hub.Parameters.CredentialBundle != nil {
+		for _, identity := range hub.Parameters.CredentialBundle.TLSIdentities {
+			dispatch.tlsIdentities[identity.Name] = identity
+		}
 	}
 
 	handle, err := reactor.AttachNeuron(hub)

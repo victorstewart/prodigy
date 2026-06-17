@@ -8,7 +8,7 @@ struct {
   __type(key, struct portal_definition);
   __type(value, struct portal_meta);
   __uint(max_entries, MAX_PORTALS);
-} external_portals SEC(".maps");
+} ext_portals SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_LPM_TRIE);
@@ -16,7 +16,7 @@ struct {
   __type(value, __u8);
   __uint(max_entries, MAX_OWNED_ROUTABLE_PREFIXES);
   __uint(map_flags, BPF_F_NO_PREALLOC);
-} owned_routable_prefixes4 SEC(".maps");
+} owned_pfx4 SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_LPM_TRIE);
@@ -24,7 +24,7 @@ struct {
   __type(value, __u8);
   __uint(max_entries, MAX_OWNED_ROUTABLE_PREFIXES);
   __uint(map_flags, BPF_F_NO_PREALLOC);
-} owned_routable_prefixes6 SEC(".maps");
+} owned_pfx6 SEC(".maps");
 
 struct portal_ring {
   __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -39,28 +39,28 @@ struct {
   __uint(value_size, sizeof(__u32));
   __uint(max_entries, MAX_PORTALS);
   __array(values, struct portal_ring);
-} container_id_hash_rings SEC(".maps");
+} cid_rings SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __type(key, struct switchboard_wormhole_target_key);
   __type(value, __u16);
   __uint(max_entries, MAX_PORTALS * 256);
-} wormhole_target_ports SEC(".maps");
+} wh_targets SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __type(key, struct switchboard_wormhole_egress_key);
   __type(value, struct switchboard_wormhole_egress_binding);
   __uint(max_entries, MAX_PORTALS * 256);
-} wormhole_egress_bindings SEC(".maps");
+} wh_egress SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __type(key, struct switchboard_wormhole_egress4_key);
   __type(value, struct switchboard_wormhole_egress_binding);
   __uint(max_entries, MAX_PORTALS * 256);
-} wormhole_egress_bindings4 SEC(".maps");
+} wh_egress4 SEC(".maps");
 
 // src address to container address suffix
 struct {
@@ -68,4 +68,4 @@ struct {
   __type(key, struct flow_key);
   __type(value, struct container_id);
   __uint(max_entries, LRU_SIZE);
-} percpu_lru_mapping SEC(".maps");
+} lru_mapping SEC(".maps");

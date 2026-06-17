@@ -330,8 +330,10 @@ Inbound semantics for the shared frame handler:
     - empty payload means ack/no-op
     - non-empty payload may be delivered raw or decoded to `CredentialDelta`, depending on SDK boundary
     - the C SDK intentionally delivers this payload raw
-  - ack behavior: if the SDK offers auto-ack policy, it may queue an empty outbound `credentialsRefresh` frame after a successful non-resumption callback
-  - resumption ack behavior: when the refresh applies TLS resumption snapshots or deltas, the outbound ACK must carry `TlsResumptionApplyAck` with only per-wormhole resumption results
+    - apps using `updatedTls` must install the new cert/key/chain source for future handshakes before ACKing; existing connections keep their current TLS context
+  - ack behavior: if the SDK offers auto-ack policy, it may queue an empty outbound `credentialsRefresh` frame after a successful non-resumption callback; Prodigy uses this ACK to mark non-resumption TLS identity generations fresh for that container
+  - typed ack behavior: `CredentialApplyAck` reports `TlsIdentity` generation success or rejection and may also include per-wormhole resumption results
+  - resumption ack behavior: legacy resumption-only ACKs may still carry `TlsResumptionApplyAck` with only per-wormhole resumption results
 
 ## Control Payloads
 
@@ -390,8 +392,9 @@ Field order:
 ### `credentialsRefresh`
 
 - neuron -> container: raw `CredentialDelta` blob including `PRDDEL01`
-- container -> neuron: empty payload means generic non-resumption ACK
-- container -> neuron for resumption: raw `TlsResumptionApplyAck` blob including `PRDACK01`
+- container -> neuron: empty payload means non-resumption success ACK
+- container -> neuron for TLS identity success/failure: raw `CredentialApplyAck` blob including `PRDCAC01`
+- container -> neuron for resumption-only legacy ACKs: raw `TlsResumptionApplyAck` blob including `PRDACK01`
 
 ### `message`
 
@@ -524,12 +527,12 @@ An SDK implementation is conformant when it can:
 - decode `ContainerParameters`
 - decode `CredentialBundle`
 - deliver raw `CredentialDelta` bytes or decode `CredentialDelta`
-- build raw `credentialsRefresh` ACK frames, and encode `TlsResumptionApplyAck` only if it exposes a typed ACK helper
+- build raw `credentialsRefresh` ACK frames, and encode `CredentialApplyAck` when it exposes typed TLS identity apply results
 - load startup parameters from `PRODIGY_PARAMS_FD` first and `argv[1]` second
 - parse and build control frames incrementally
 - handle all current control topics with the semantics in this file
 - maintain cached `datacenter_unique_tag` state from bootstrap and live updates
-- publish `healthy`, `statistics`, `resourceDeltaAck`, empty `credentialsRefresh` ack frames, and typed `credentialsRefresh` resumption ACK frames for resumption updates
+- publish `healthy`, `statistics`, `resourceDeltaAck`, empty `credentialsRefresh` ack frames, typed `CredentialApplyAck` frames, and legacy typed resumption ACK frames when needed
 - decode packed pairing, resource, and credential payloads
 - reject removed compatibility payloads in the in-tree contract
 - if it implements Aegis support, match the pairing-hash, TFO, frame, and encrypt/decrypt rules above

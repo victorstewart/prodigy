@@ -231,6 +231,76 @@ private:
     return false;
   }
 
+  static bool normalizeClusterACME(MothershipProdigyCluster& cluster, String *failure)
+  {
+    if (cluster.acme.configured() == false)
+    {
+      return true;
+    }
+    if (cluster.acme.accountEmail.size() == 0)
+    {
+      if (failure)
+      {
+        failure->assign("cluster ACME requires acme.accountEmail");
+      }
+      return false;
+    }
+    if (cluster.acme.termsAgreed == false)
+    {
+      if (failure)
+      {
+        failure->assign("cluster ACME requires acme.termsAgreed=true");
+      }
+      return false;
+    }
+    if (cluster.dnsProvider == MothershipClusterProvider::unknown)
+    {
+      if (failure)
+      {
+        failure->assign("cluster ACME requires cluster DNS");
+      }
+      return false;
+    }
+
+    if (cluster.acme.certbotInstall.size() == 0)
+    {
+      cluster.acme.certbotInstall.assign(prodigyCertbotManagedInstall);
+    }
+    if (cluster.acme.certbotPath.size() == 0)
+    {
+      cluster.acme.certbotPath.assign(prodigyCertbotManagedPath);
+    }
+    if (cluster.acme.certbotVersion.size() == 0)
+    {
+      cluster.acme.certbotVersion.assign(prodigyCertbotManagedVersion);
+    }
+    if (cluster.acme.certbotInstall.equals("bundle"_ctv) == false)
+    {
+      if (failure)
+      {
+        failure->assign("cluster ACME certbotInstall must be bundle");
+      }
+      return false;
+    }
+    if (cluster.acme.certbotPath.equals("/opt/prodigy/certbot/bin/certbot"_ctv) == false)
+    {
+      if (failure)
+      {
+        failure->assign("cluster ACME certbotPath must be /opt/prodigy/certbot/bin/certbot");
+      }
+      return false;
+    }
+    if (cluster.acme.certbotVersion.equals("5.6.0"_ctv) == false)
+    {
+      if (failure)
+      {
+        failure->assign("cluster ACME certbotVersion must be 5.6.0");
+      }
+      return false;
+    }
+    return true;
+  }
+
   static bool parseAzureScopeTriplet(const String& scope, String& subscriptionID, String& resourceGroup, String& location)
   {
     subscriptionID.clear();
@@ -1383,6 +1453,11 @@ private:
       return false;
     }
 
+    if (normalizeClusterACME(cluster, failure) == false)
+    {
+      return false;
+    }
+
     if (validateOSUpdatePoliciesForStorage(cluster.osUpdatePolicies, failure) == false)
     {
       return false;
@@ -1962,6 +2037,16 @@ public:
       if (failure)
       {
         failure->assign("dnsProvider is immutable for an existing cluster");
+      }
+      return false;
+    }
+
+    if (hadExistingCluster &&
+        (stored.acme == existingCluster.acme) == false)
+    {
+      if (failure)
+      {
+        failure->assign("acme config is immutable for an existing cluster");
       }
       return false;
     }

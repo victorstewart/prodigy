@@ -14,6 +14,7 @@ private:
   class Statistic {
   public:
 
+    virtual ~Statistic() = default;
     virtual void takeMeasurement(uint64_t measurement) = 0;
     virtual uint64_t consume(void) = 0;
   };

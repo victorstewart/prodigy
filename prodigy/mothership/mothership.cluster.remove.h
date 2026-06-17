@@ -7,6 +7,7 @@ class MothershipClusterRemoveSummary {
 public:
 
   bool stoppedLocalMachine = false;
+  uint32_t removedDNSRecords = 0;
   uint32_t wipedAdoptedMachines = 0;
   uint32_t destroyedCreatedCloudMachines = 0;
 };
@@ -16,6 +17,7 @@ public:
 
   virtual ~MothershipClusterRemoveHooks() = default;
 
+  virtual bool removeDNSBindings(const MothershipProdigyCluster& cluster, uint32_t& removed, String *failure = nullptr) = 0;
   virtual bool stopTestCluster(const MothershipProdigyCluster& cluster, String *failure = nullptr) = 0;
   virtual bool stopAndWipeLocalMachine(const MothershipProdigyCluster& cluster, String *failure = nullptr) = 0;
   virtual bool stopAndWipeAdoptedMachine(const MothershipProdigyCluster& cluster, const MothershipProdigyClusterMachine& machine, String *failure = nullptr) = 0;
@@ -237,6 +239,11 @@ static inline bool mothershipRemoveClusterRuntime(const MothershipProdigyCluster
   if (failure)
   {
     failure->clear();
+  }
+
+  if (hooks.removeDNSBindings(cluster, summary.removedDNSRecords, failure) == false)
+  {
+    return false;
   }
 
   if (cluster.deploymentMode == MothershipClusterDeploymentMode::test)

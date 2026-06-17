@@ -404,6 +404,40 @@ int main(void)
           decodedResumptionAck.results[1].failureReason == "stale generation",
       "typed credentials refresh ack payload preserves resumption apply results");
 
+  ProdigySDK::CredentialApplyAck credentialAck;
+  credentialAck.tlsResults.push_back(ProdigySDK::TlsIdentityApplyResult {
+      "api-public",
+      77,
+      true,
+      "",
+  });
+  credentialAck.tlsResults.push_back(ProdigySDK::TlsIdentityApplyResult {
+      "admin-public",
+      78,
+      false,
+      "application rejected TLS identity",
+  });
+  credentialAck.resumptionResults = resumptionAck.results;
+
+  ProdigySDK::Bytes credentialApplyAckFrame;
+  ProdigySDK::MessageFrame credentialApplyAckMessage;
+  ProdigySDK::CredentialApplyAck decodedCredentialAck;
+  suite.expect(
+      ProdigySDK::buildCredentialsRefreshAckFrame(credentialApplyAckFrame, credentialAck) == ProdigySDK::Result::ok &&
+          ProdigySDK::parseMessageFrame(credentialApplyAckFrame, credentialApplyAckMessage) == ProdigySDK::Result::ok &&
+          credentialApplyAckMessage.topic == ProdigySDK::ContainerTopic::credentialsRefresh &&
+          ProdigySDK::decodeCredentialApplyAckPayload(credentialApplyAckMessage.payload, decodedCredentialAck) == ProdigySDK::Result::ok,
+      "build credential apply ack frame");
+  suite.expect(
+      decodedCredentialAck.tlsResults.size() == 2 &&
+          decodedCredentialAck.tlsResults[0].identityName == "api-public" &&
+          decodedCredentialAck.tlsResults[0].generation == 77 &&
+          decodedCredentialAck.tlsResults[0].success &&
+          decodedCredentialAck.tlsResults[1].failureReason == "application rejected TLS identity" &&
+          decodedCredentialAck.resumptionResults.size() == 2 &&
+          decodedCredentialAck.resumptionResults[1].wormholeName == "admin-api-quic",
+      "credential apply ack payload preserves TLS and resumption results");
+
   ProdigySDK::Bytes pingFrameBytes = readFixture("frame.ping.empty.bin");
   ProdigySDK::FrameDecoder decoder;
   std::vector<ProdigySDK::MessageFrame> decodedFrames;
@@ -572,6 +606,16 @@ int main(void)
           ProdigySDK::decodeTlsResumptionApplyAckPayload(outboundTypedAckFrame.payload, outboundDecodedResumptionAck) == ProdigySDK::Result::ok &&
           outboundDecodedResumptionAck.results.size() == 2,
       "hub typed credentials refresh ack builder");
+
+  ProdigySDK::Bytes outboundCredentialApplyAckFrame;
+  ProdigySDK::MessageFrame outboundCredentialApplyAckMessage;
+  ProdigySDK::CredentialApplyAck outboundDecodedCredentialAck;
+  suite.expect(
+      hub.acknowledgeCredentialsRefresh(outboundCredentialApplyAckFrame, credentialAck) == ProdigySDK::Result::ok &&
+          ProdigySDK::parseMessageFrame(outboundCredentialApplyAckFrame, outboundCredentialApplyAckMessage) == ProdigySDK::Result::ok &&
+          ProdigySDK::decodeCredentialApplyAckPayload(outboundCredentialApplyAckMessage.payload, outboundDecodedCredentialAck) == ProdigySDK::Result::ok &&
+          outboundDecodedCredentialAck.tlsResults.size() == 2,
+      "hub credential apply ack builder");
 
   int sockets[2] = {-1, -1};
   if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0)

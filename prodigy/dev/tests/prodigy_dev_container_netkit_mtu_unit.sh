@@ -793,23 +793,23 @@ container_netkit_gso_segs="$(extract_link_detail_field gso_max_segs nsenter -t "
 container_netkit_gro="$(extract_link_detail_field gro_max_size nsenter -t "${container_pid}" -n ip -details link show dev "${container_netkit_if}")"
 container_netkit_gso_ipv4="$(extract_link_detail_field gso_ipv4_max_size nsenter -t "${container_pid}" -n ip -details link show dev "${container_netkit_if}")"
 container_netkit_gro_ipv4="$(extract_link_detail_field gro_ipv4_max_size nsenter -t "${container_pid}" -n ip -details link show dev "${container_netkit_if}")"
-egress_prog_id="$(find_netkit_prog_id "${brain_pid}" "${host_netkit_if}" "container_egress_router")"
+egress_prog_id="$(find_netkit_prog_id "${brain_pid}" "${host_netkit_if}" "ct_egress")"
 
 if [[ -z "${egress_prog_id}" ]]
 then
    fail "unable to resolve attached container egress program id for ${host_netkit_if}"
 fi
 
-policy_map_id="$(find_named_map_id_for_prog "${brain_pid}" "${egress_prog_id}" "container_network_policy_map" || true)"
+policy_map_id="$(find_named_map_id_for_prog "${brain_pid}" "${egress_prog_id}" "ct_net_policy" || true)"
 if [[ -z "${policy_map_id}" ]]
 then
-   fail "unable to resolve container_network_policy_map for program ${egress_prog_id}"
+   fail "unable to resolve ct_net_policy for program ${egress_prog_id}"
 fi
 
 policy_mtu="$(lookup_policy_inter_container_mtu "${brain_pid}" "${policy_map_id}" || true)"
 if [[ -z "${policy_mtu}" ]]
 then
-   fail "unable to read container_network_policy_map for program ${egress_prog_id}"
+   fail "unable to read ct_net_policy for program ${egress_prog_id}"
 fi
 
 echo "observed host mtu=${host_netkit_mtu} host_gso=${host_netkit_gso} host_gso_segs=${host_netkit_gso_segs} host_gro=${host_netkit_gro} host_gso_ipv4=${host_netkit_gso_ipv4} host_gro_ipv4=${host_netkit_gro_ipv4} container mtu=${container_netkit_mtu} container_gso=${container_netkit_gso} container_gso_segs=${container_netkit_gso_segs} container_gro=${container_netkit_gro} container_gso_ipv4=${container_netkit_gso_ipv4} container_gro_ipv4=${container_netkit_gro_ipv4} policy interContainerMTU=${policy_mtu} brain=${brain_index} host_if=${host_netkit_if} container_if=${container_netkit_if} prog_id=${egress_prog_id} policy_map=${policy_map_id}"

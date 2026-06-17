@@ -13,7 +13,9 @@
 
 namespace {
 using ProdigySDK::AdvertisementPairing;
+using ProdigySDK::applyCredentialDelta;
 using ProdigySDK::ContainerParameters;
+using ProdigySDK::CredentialBundle;
 using ProdigySDK::CredentialDelta;
 using ProdigySDK::Dispatch;
 using ProdigySDK::IPAddress;
@@ -154,12 +156,14 @@ struct State {
   std::string readBuffer;
   std::optional<SubscriptionPairing> subscription;
   std::vector<AdvertisementPairing> advertisements;
+  CredentialBundle credentials;
   std::uint64_t pairingEvents = 0;
   std::uint64_t resourceDeltaEvents = 0;
   std::uint64_t credentialRefreshEvents = 0;
 
   explicit State(const ContainerParameters& parameters)
-      : advertiser(parameters.advertises.empty() == false)
+      : advertiser(parameters.advertises.empty() == false),
+        credentials(parameters.credentialBundle.value_or(CredentialBundle {}))
   {
   }
 
@@ -240,7 +244,7 @@ struct State {
 
   void noteCredentialsRefresh(NeuronHub& hub, const CredentialDelta& delta)
   {
-    (void)delta;
+    applyCredentialDelta(credentials, delta);
     note(hub, credentialRefreshEvents, statCredentialActivity);
   }
 
