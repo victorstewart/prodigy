@@ -1603,9 +1603,7 @@ int main(void)
       {
         String actualDigest = {};
         uint64_t actualBytes = 0;
-        bool stored = ContainerStore::systemStore(
-            SystemContainerKind::mothershipTunnelProvider,
-            tunnelDigest,
+        bool stored = ContainerStore::systemStore(tunnelDigest,
             tunnelPayload.size(),
             tunnelPayload,
             &actualDigest,
@@ -1616,22 +1614,19 @@ int main(void)
         suite.expect(actualDigest.equals(tunnelDigest), "system_container_store_reports_digest");
         suite.expect(actualBytes == tunnelPayload.size(), "system_container_store_reports_size");
         suite.expect(
-            ContainerStore::systemVerify(SystemContainerKind::mothershipTunnelProvider, tunnelDigest, tunnelPayload.size(), nullptr, nullptr, &verificationFailure, &systemStoreRoot.path),
+            ContainerStore::systemVerify(tunnelDigest, tunnelPayload.size(), nullptr, nullptr, &verificationFailure, &systemStoreRoot.path),
             "system_container_store_verifies_tunnel_provider_blob");
         String loadedSystemBlob = {};
         suite.expect(
-            ContainerStore::systemLoadVerified(SystemContainerKind::mothershipTunnelProvider, tunnelDigest, tunnelPayload.size(), loadedSystemBlob, &verificationFailure, &systemStoreRoot.path),
+            ContainerStore::systemLoadVerified(tunnelDigest, tunnelPayload.size(), loadedSystemBlob, &verificationFailure, &systemStoreRoot.path),
             "system_container_store_loads_verified_tunnel_provider_blob");
         suite.expect(loadedSystemBlob.equals(tunnelPayload), "system_container_store_loads_original_tunnel_provider_blob");
         suite.expect(
-            ContainerStore::systemStore(SystemContainerKind::mothershipTunnelProvider, expectedDigest, payload.size(), payload, nullptr, nullptr, &verificationFailure, &systemStoreRoot.path) == false,
+            ContainerStore::systemStore(expectedDigest, payload.size(), payload, nullptr, nullptr, &verificationFailure, &systemStoreRoot.path) == false,
             "system_container_store_rejects_app_blob_for_tunnel_provider_kind");
         suite.expect(
             stringContains(verificationFailure, "mothership tunnel-provider contract header"),
             "system_container_store_reports_app_blob_contract_mismatch");
-        suite.expect(
-            ContainerStore::systemStore(static_cast<SystemContainerKind>(99), tunnelDigest, tunnelPayload.size(), tunnelPayload, nullptr, nullptr, &verificationFailure, &systemStoreRoot.path) == false,
-            "system_container_store_rejects_unknown_kind");
       }
     }
   }

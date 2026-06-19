@@ -21,7 +21,6 @@
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <arpa/inet.h>
-#include <netdb.h>
 #include <algorithm>
 #include <cctype>
 #include <cstring>
@@ -116,14 +115,6 @@ static void installDatacenterMeshRoutes(NetDevice& device, uint8_t datacenterFra
   };
 
   addDatacenterRoute(container_network_subnet6);
-}
-
-static IPPrefix systemEgressInternalIPv4Prefix(uint8_t fragment, uint8_t machineFragment = 0)
-{
-  IPPrefix prefix = {};
-  prefix.network.v4 = htonl(0xC6120000u | (uint32_t(machineFragment) << 8) | uint32_t(fragment ? fragment : 1u));
-  prefix.cidr = 32;
-  return prefix;
 }
 
 template <typename Key, typename Equals>
@@ -588,8 +579,7 @@ public:
   Vector<String> executeEnv;
   String executeCwd;
   MachineCpuArchitecture executeArchitecture = MachineCpuArchitecture::unknown;
-  String systemEgressHostsFile;
-  Vector<container_egress_allow_key> systemEgressAllowlist;
+  container_egress_allow_key systemEgressAllow = {};
   String storageRootPath;
   String storagePayloadPath;
   Vector<StorageLoopDevice> storageLoopDevices;
@@ -609,184 +599,34 @@ public:
     return isSystemContainer() && plan.systemEgressHost.size() > 0 && plan.systemEgressPort != 0;
   }
 
-  static bool systemEgressHostAliasSafe(const String& host)
-  {
-    if (host.size() == 0)
-    {
-      return false;
-    }
-    for (uint64_t index = 0; index < host.size(); ++index)
-    {
-      unsigned char c = static_cast<unsigned char>(host[index]);
-      if (std::isalnum(c) == 0 && c != '.' && c != '-' && c != '_')
-      {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  static bool systemEgressAllowlistContains(const Vector<container_egress_allow_key>& keys, const container_egress_allow_key& key)
-  {
-    for (const container_egress_allow_key& candidate : keys)
-    {
-      if (std::memcmp(&candidate, &key, sizeof(key)) == 0)
-      {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  bool addSystemEgressAllowKey(const container_egress_allow_key& key, String *failureReport = nullptr)
-  {
-    if (systemEgressAllowlistContains(systemEgressAllowlist, key))
-    {
-      return true;
-    }
-    if (systemEgressAllowlist.size() >= CONTAINER_EGRESS_ALLOWLIST_MAX_ENTRIES)
-    {
-      if (failureReport)
-      {
-        failureReport->snprintf<"system egress policy resolved more than {itoa} addresses"_ctv>(CONTAINER_EGRESS_ALLOWLIST_MAX_ENTRIES);
-      }
-      return false;
-    }
-    systemEgressAllowlist.push_back(key);
-    return true;
-  }
-
-  bool resolveSystemEgressPolicyRule(String& hostsFile, String *failureReport = nullptr)
-  {
-    String ownedHost = {};
-    ownedHost.assign(plan.systemEgressHost);
-    struct in_addr literal4 = {};
-    struct in6_addr literal6 = {};
-    bool literal = inet_pton(AF_INET, ownedHost.c_str(), &literal4) == 1 || inet_pton(AF_INET6, ownedHost.c_str(), &literal6) == 1;
-    if (literal == false && systemEgressHostAliasSafe(plan.systemEgressHost) == false)
-    {
-      if (failureReport)
-      {
-        failureReport->assign("system egress policy host is not a safe hosts-file alias"_ctv);
-      }
-      return false;
-    }
-
-    String portText = {};
-    portText.assignItoa(plan.systemEgressPort);
-    struct addrinfo hints = {};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-    struct addrinfo *results = nullptr;
-    int rc = getaddrinfo(ownedHost.c_str(), portText.c_str(), &hints, &results);
-    if (rc != 0)
-    {
-      if (failureReport)
-      {
-        failureReport->snprintf<"system egress policy host {} did not resolve: {}"_ctv>(plan.systemEgressHost, String(gai_strerror(rc)));
-      }
-      return false;
-    }
-
-    bool resolved = false;
-    for (struct addrinfo *candidate = results; candidate != nullptr; candidate = candidate->ai_next)
-    {
-      container_egress_allow_key key = {};
-      char addressText[INET6_ADDRSTRLEN] = {};
-      if (candidate->ai_family == AF_INET)
-      {
-        const struct sockaddr_in *addr = reinterpret_cast<const struct sockaddr_in *>(candidate->ai_addr);
-        if (mothershipTunnelProviderEgressIPv4HostAddressIsDenied(ntohl(addr->sin_addr.s_addr)))
-        {
-          freeaddrinfo(results);
-          if (failureReport)
-          {
-            failureReport->snprintf<"system egress policy host {} resolved to denied IPv4 address"_ctv>(plan.systemEgressHost);
-          }
-          return false;
-        }
-        if (inet_ntop(AF_INET, &addr->sin_addr, addressText, sizeof(addressText)) == nullptr)
-        {
-          continue;
-        }
-        key.family = 4;
-        key.proto = IPPROTO_TCP;
-        key.port = addr->sin_port;
-        key.addr.v4 = addr->sin_addr.s_addr;
-      }
-      else if (candidate->ai_family == AF_INET6)
-      {
-        const struct sockaddr_in6 *addr = reinterpret_cast<const struct sockaddr_in6 *>(candidate->ai_addr);
-        if (inet_ntop(AF_INET6, &addr->sin6_addr, addressText, sizeof(addressText)) == nullptr)
-        {
-          continue;
-        }
-        String rendered = {};
-        rendered.assign(addressText);
-        if (mothershipTunnelProviderEgressLiteralIsDenied(rendered))
-        {
-          freeaddrinfo(results);
-          if (failureReport)
-          {
-            failureReport->snprintf<"system egress policy host {} resolved to denied IPv6 address"_ctv>(plan.systemEgressHost);
-          }
-          return false;
-        }
-        key.family = 6;
-        key.proto = IPPROTO_TCP;
-        key.port = addr->sin6_port;
-        std::memcpy(key.addr.v6, addr->sin6_addr.s6_addr, sizeof(key.addr.v6));
-      }
-      else
-      {
-        continue;
-      }
-
-      if (addSystemEgressAllowKey(key, failureReport) == false)
-      {
-        freeaddrinfo(results);
-        return false;
-      }
-      if (literal == false)
-      {
-        hostsFile.append(addressText);
-        hostsFile.append(' ');
-        hostsFile.append(plan.systemEgressHost);
-        hostsFile.append('\n');
-      }
-      resolved = true;
-    }
-    freeaddrinfo(results);
-    if (resolved == false && failureReport)
-    {
-      failureReport->snprintf<"system egress policy host {} produced no usable addresses"_ctv>(plan.systemEgressHost);
-    }
-    return resolved;
-  }
-
   bool prepareSystemEgressPolicy(String *failureReport = nullptr)
   {
-    systemEgressAllowlist.clear();
-    systemEgressHostsFile.clear();
+    systemEgressAllow = {};
     if (systemEgressConstrained() == false)
     {
       return true;
     }
-    systemEgressHostsFile.assign("127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n"_ctv);
-    if (resolveSystemEgressPolicyRule(systemEgressHostsFile, failureReport) == false)
-    {
-      return false;
-    }
 
-    if (systemEgressAllowlist.empty())
+    uint32_t egressAddress = 0;
+    if (mothershipTunnelProviderEgressIPv4Literal(plan.systemEgressHost, egressAddress) == false)
     {
       if (failureReport)
       {
-        failureReport->assign("system egress policy resolved no addresses"_ctv);
+        failureReport->assign("system egress host must be an IPv4 literal"_ctv);
       }
       return false;
     }
+    if (mothershipTunnelProviderEgressIPv4HostAddressIsDenied(egressAddress))
+    {
+      if (failureReport)
+      {
+        failureReport->assign("system egress literal denied"_ctv);
+      }
+      return false;
+    }
+    systemEgressAllow.addr = htonl(egressAddress);
+    systemEgressAllow.proto = IPPROTO_TCP;
+    systemEgressAllow.port = htons(plan.systemEgressPort);
     return true;
   }
 
@@ -796,7 +636,7 @@ public:
     {
       return true;
     }
-    if (peer_program == nullptr || systemEgressAllowlist.empty())
+    if (peer_program == nullptr || systemEgressAllow.proto == 0)
     {
       if (failureReport)
       {
@@ -813,10 +653,7 @@ public:
       }
       __u8 value = 1;
       ok = true;
-      for (const container_egress_allow_key& key : systemEgressAllowlist)
-      {
-        ok = ok && bpf_map_update_elem(mapFD, &key, &value, BPF_ANY) == 0;
-      }
+      ok = bpf_map_update_elem(mapFD, &systemEgressAllow, &value, BPF_ANY) == 0;
     });
     if (ok == false && failureReport)
     {
@@ -1147,42 +984,13 @@ public:
     return configuredMTU;
   }
 
-  uint8_t systemEgressFakeMachineFragment(void) const
-  {
-#if NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE
-    if (thisNeuron && thisNeuron->configuredFakeIpv4Boundary && thisNeuron->lcsubnet6.dpfx != 0)
-    {
-      return thisNeuron->lcsubnet6.mpfx[2] ? thisNeuron->lcsubnet6.mpfx[2] : 1;
-    }
-#endif
-    return 0;
-  }
-
   bool buildContainerNetworkPolicy(struct container_network_policy& networkPolicy, String *failureReport = nullptr) const
   {
     networkPolicy = {};
     networkPolicy.requiresPublic4 = (needsAnyExternalAddressFamily(plan, ExternalAddressFamily::ipv4) || systemEgressConstrained()) ? 1 : 0;
     networkPolicy.requiresPublic6 = needsAnyExternalAddressFamily(plan, ExternalAddressFamily::ipv6) ? 1 : 0;
     networkPolicy.egressAllowlistOnly = systemEgressConstrained() ? 1 : 0;
-    networkPolicy.containerFragment = plan.fragment;
     networkPolicy.interContainerMTU = desiredInterContainerMTU(failureReport);
-    if (networkPolicy.egressAllowlistOnly)
-    {
-      if (thisNeuron == nullptr || thisNeuron->private4.is6 || thisNeuron->private4.isNull() || plan.fragment == 0)
-      {
-        if (failureReport && failureReport->size() == 0)
-        {
-          failureReport->snprintf<"system container {itoa} egress requires host IPv4 source and nonzero fragment"_ctv>(plan.uuid);
-        }
-        return false;
-      }
-      networkPolicy.systemEgressSource4 = thisNeuron->private4.v4;
-      uint8_t fakeMachineFragment = systemEgressFakeMachineFragment();
-      if (fakeMachineFragment != 0)
-      {
-        networkPolicy.systemEgressSource4 = systemEgressInternalIPv4Prefix(plan.fragment, fakeMachineFragment).network.v4;
-      }
-    }
     return !(thisNeuron && thisNeuron->configuredInterContainerMTU != 0 && networkPolicy.interContainerMTU == 0);
   }
 
@@ -1501,11 +1309,6 @@ public:
       peer.addIP(prefix);
     }
 
-    if (systemEgressConstrained())
-    {
-      peer.addIP(systemEgressInternalIPv4Prefix(plan.fragment));
-    }
-
     for (const Whitehole& whitehole : plan.whiteholes)
     {
       if (whitehole.hasAddress == false || whitehole.address.isNull())
@@ -1596,7 +1399,6 @@ public:
     peer_program = host.attachBPF(prodigyContainerEgressNetkitAttachType(), path, "ct_egress"_ctv,
                                   [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
                                     (void)switchboardReusePinnedWhiteholeReplyFlowMap(obj, thisNeuron->eth.ifidx, inner_map_fds);
-                                    (void)switchboardReusePinnedSystemEgressNATMap(obj, thisNeuron->eth.ifidx, inner_map_fds);
                                   });
     if (peer_program == nullptr)
     {
@@ -5423,49 +5225,6 @@ private:
     return true;
   }
 
-  static bool writeContainerRootFSFileAtNoSymlinks(int rootfd, const String& absolutePath, const String& payload, String *failureReport = nullptr)
-  {
-    String relativePath = {};
-    if (containerAbsolutePathToRelative(absolutePath, relativePath, "system container file"_ctv, false, failureReport) == false)
-    {
-      return false;
-    }
-
-    int fd = -1;
-    if (openContainerFileAtNoSymlinks(rootfd, relativePath, true, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH, fd, failureReport) == false)
-    {
-      return false;
-    }
-
-    bool ok = true;
-    if (ftruncate(fd, 0) != 0)
-    {
-      if (failureReport)
-      {
-        failureReport->snprintf<"failed to truncate container rootfs file {} errno={}({})"_ctv>(absolutePath, errno, String(strerror(errno)));
-      }
-      ok = false;
-    }
-    for (uint64_t written = 0; ok && written < payload.size();)
-    {
-      ssize_t result = write(fd, payload.data() + written, size_t(payload.size() - written));
-      if (result > 0)
-      {
-        written += uint64_t(result);
-      }
-      else if (result == 0 || (result < 0 && errno != EINTR))
-      {
-        if (failureReport)
-        {
-          failureReport->snprintf<"failed to write container rootfs file {} errno={}({})"_ctv>(absolutePath, errno, String(strerror(errno)));
-        }
-        ok = false;
-      }
-    }
-    close(fd);
-    return ok;
-  }
-
   static bool bindMountSystemSocketIntoRootFS(int rootfd, const String& sourcePath, const String& absoluteTargetPath, const String& containerRoot, String *failureReport = nullptr)
   {
     String relativeTargetPath = {};
@@ -5512,10 +5271,6 @@ private:
     if (container->isSystemContainer() == false)
     {
       return true;
-    }
-    if (container->systemEgressHostsFile.size() > 0 && writeContainerRootFSFileAtNoSymlinks(rootfd, "/etc/hosts"_ctv, container->systemEgressHostsFile, failureReport) == false)
-    {
-      return false;
     }
     if (container->plan.systemGatewaySocketSourcePath.size() > 0 &&
         bindMountSystemSocketIntoRootFS(rootfd, container->plan.systemGatewaySocketSourcePath, container->plan.systemGatewaySocketTargetPath, containerRoot, failureReport) == false)
@@ -7216,7 +6971,7 @@ public:
     if (container->isSystemContainer())
     {
       artifactKey.assign("system."_ctv);
-      artifactKey.append(prodigySystemContainerKindName(plan.systemContainerKind));
+      artifactKey.append("mothership-tunnel-provider"_ctv);
       artifactKey.append("."_ctv);
       artifactKey.append(plan.config.containerBlobSHA256);
     }
@@ -9173,12 +8928,12 @@ public:
     uint64_t deploymentID = plan.config.deploymentID();
     bool systemContainer = plan.systemContainerKind != SystemContainerKind::none;
     String compressedContainerPath = systemContainer
-        ? ContainerStore::systemPathForArtifact(plan.systemContainerKind, plan.config.containerBlobSHA256)
+        ? ContainerStore::systemPathForArtifact(plan.config.containerBlobSHA256)
         : ContainerStore::pathForContainerImage(deploymentID);
     if (systemContainer)
     {
       String systemVerificationFailure = {};
-      if (ContainerStore::systemVerify(plan.systemContainerKind, plan.config.containerBlobSHA256, plan.config.containerBlobBytes, nullptr, nullptr, &systemVerificationFailure) == false)
+      if (ContainerStore::systemVerify(plan.config.containerBlobSHA256, plan.config.containerBlobBytes, nullptr, nullptr, &systemVerificationFailure) == false)
       {
         if (systemVerificationFailure.size() == 0)
         {

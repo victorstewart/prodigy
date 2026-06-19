@@ -1015,7 +1015,7 @@ public:
     }
   }
 
-  bool queueBrainSystemContainerArtifactReplicationToPeer(BrainView *brain, SystemContainerKind kind, const String& sha256, uint64_t bytes, const String& blob)
+  bool queueBrainSystemContainerArtifactReplicationToPeer(BrainView *brain, const String& sha256, uint64_t bytes, const String& blob)
   {
     const uint64_t appendBytes = (uint64_t(sha256.size()) + uint64_t(blob.size()) + brainPeerReplicationFrameHeadroomBytes);
     if (allowBrainPeerReplicationAppend(brain, appendBytes, "replicateSystemContainerArtifact"_ctv) == false)
@@ -1028,12 +1028,12 @@ public:
       queueBrainPeerLargePayloadKeepalive(brain);
     }
 
-    Message::construct(brain->wBuffer, BrainTopic::replicateSystemContainerArtifact, kind, sha256, bytes, blob);
+    Message::construct(brain->wBuffer, BrainTopic::replicateSystemContainerArtifact, sha256, bytes, blob);
     Ring::queueSend(brain);
     return true;
   }
 
-  void queueBrainSystemContainerArtifactReplication(SystemContainerKind kind, const String& sha256, uint64_t bytes, const String& blob)
+  void queueBrainSystemContainerArtifactReplication(const String& sha256, uint64_t bytes, const String& blob)
   {
     for (BrainView *brain : brains)
     {
@@ -1041,7 +1041,7 @@ public:
       {
         continue;
       }
-      (void)queueBrainSystemContainerArtifactReplicationToPeer(brain, kind, sha256, bytes, blob);
+      (void)queueBrainSystemContainerArtifactReplicationToPeer(brain, sha256, bytes, blob);
     }
   }
 

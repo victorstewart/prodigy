@@ -25,19 +25,6 @@ public:
 
   bool authenticated = false;
   bool openedControlSocket = false;
-  uint64_t clientToControlBytes = 0;
-  uint64_t controlToClientBytes = 0;
-};
-
-class MothershipTunnelGatewayPeerPolicy {
-public:
-
-  bool requireUID = false;
-  uid_t uid = 0;
-  bool requireGID = false;
-  gid_t gid = 0;
-  bool requireCgroupV2Path = false;
-  String cgroupV2Path;
 };
 
 class MothershipTunnelGatewayUnixListener {
@@ -158,92 +145,13 @@ static inline bool mothershipTunnelGatewayCreateUnixListener(const String& socke
   return true;
 }
 
-static inline bool mothershipTunnelGatewayReadPeerCgroupV2Path(pid_t pid, String& cgroupV2Path, String *failure = nullptr)
-{
-  cgroupV2Path.clear();
-  if (pid <= 0)
-  {
-    if (failure)
-    {
-      failure->assign("mothership tunnel gateway peer pid required"_ctv);
-    }
-    return false;
-  }
-
-  String path;
-  path.snprintf<"/proc/{itoa}/cgroup"_ctv>(uint64_t(pid));
-  FILE *file = std::fopen(path.c_str(), "rb");
-  if (file == nullptr)
-  {
-    if (failure)
-    {
-      failure->snprintf<"mothership tunnel gateway peer cgroup read failed: {}"_ctv>(String(std::strerror(errno)));
-    }
-    return false;
-  }
-
-  char line[4096];
-  while (std::fgets(line, sizeof(line), file) != nullptr)
-  {
-    if (std::strncmp(line, "0::", 3) != 0)
-    {
-      continue;
-    }
-
-    const char *begin = line + 3;
-    const char *end = begin;
-    while (*end != '\0' && *end != '\n' && *end != '\r')
-    {
-      ++end;
-    }
-    cgroupV2Path.append(begin, size_t(end - begin));
-    std::fclose(file);
-    if (cgroupV2Path.size() == 0)
-    {
-      if (failure)
-      {
-        failure->assign("mothership tunnel gateway peer cgroup v2 path empty"_ctv);
-      }
-      return false;
-    }
-    if (failure)
-    {
-      failure->clear();
-    }
-    return true;
-  }
-
-  std::fclose(file);
-  if (failure)
-  {
-    failure->assign("mothership tunnel gateway peer cgroup v2 path missing"_ctv);
-  }
-  return false;
-}
-
-static inline bool mothershipTunnelGatewayPeerAllowed(int streamFD, const MothershipTunnelGatewayPeerPolicy& policy, String *failure = nullptr)
+static inline bool mothershipTunnelGatewayPeerAllowed(int streamFD, String *failure = nullptr)
 {
   if (streamFD < 0)
   {
     if (failure)
     {
       failure->assign("mothership tunnel gateway peer fd required"_ctv);
-    }
-    return false;
-  }
-  if (policy.requireUID == false && policy.requireGID == false && policy.requireCgroupV2Path == false)
-  {
-    if (failure)
-    {
-      failure->clear();
-    }
-    return true;
-  }
-  if (policy.requireCgroupV2Path && policy.cgroupV2Path.size() == 0)
-  {
-    if (failure)
-    {
-      failure->assign("mothership tunnel gateway peer cgroup policy path required"_ctv);
     }
     return false;
   }
@@ -259,29 +167,13 @@ static inline bool mothershipTunnelGatewayPeerAllowed(int streamFD, const Mother
     }
     return false;
   }
-  if ((policy.requireUID && peer.uid != policy.uid) || (policy.requireGID && peer.gid != policy.gid))
+  if (peer.uid != uid_t(prodigyMothershipTunnelProviderRuntimeUID))
   {
     if (failure)
     {
       failure->assign("mothership tunnel gateway peer credentials rejected"_ctv);
     }
     return false;
-  }
-  if (policy.requireCgroupV2Path)
-  {
-    String peerCgroupV2Path;
-    if (mothershipTunnelGatewayReadPeerCgroupV2Path(peer.pid, peerCgroupV2Path, failure) == false)
-    {
-      return false;
-    }
-    if (peerCgroupV2Path.equal(policy.cgroupV2Path) == false)
-    {
-      if (failure)
-      {
-        failure->assign("mothership tunnel gateway peer cgroup rejected"_ctv);
-      }
-      return false;
-    }
   }
 #else
   if (failure)
@@ -298,7 +190,7 @@ static inline bool mothershipTunnelGatewayPeerAllowed(int streamFD, const Mother
   return true;
 }
 
-static inline bool mothershipTunnelGatewayAcceptUnixStream(int listenerFD, const MothershipTunnelGatewayPeerPolicy& policy, int& streamFD, String *failure = nullptr)
+static inline bool mothershipTunnelGatewayAcceptUnixStream(int listenerFD, int& streamFD, String *failure = nullptr)
 {
   streamFD = -1;
   for (;;)
@@ -327,7 +219,7 @@ static inline bool mothershipTunnelGatewayAcceptUnixStream(int listenerFD, const
     return false;
   }
 
-  if (mothershipTunnelGatewayPeerAllowed(streamFD, policy, failure) == false)
+  if (mothershipTunnelGatewayPeerAllowed(streamFD, failure) == false)
   {
     ::close(streamFD);
     streamFD = -1;
@@ -469,7 +361,6 @@ static inline bool mothershipTunnelGatewayProxyLoop(SSL *tls, int tlsFD, int con
         {
           return false;
         }
-        result.clientToControlBytes += uint64_t(rc);
       }
       else if (SSL_get_error(tls, rc) == SSL_ERROR_ZERO_RETURN)
       {
@@ -498,7 +389,6 @@ static inline bool mothershipTunnelGatewayProxyLoop(SSL *tls, int tlsFD, int con
         {
           return false;
         }
-        result.controlToClientBytes += uint64_t(rc);
       }
       else if (rc == 0)
       {
@@ -524,7 +414,6 @@ static inline bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
     int streamFD,
     const String& controlSocketPath,
     const MothershipTunnelGatewayAuth& auth,
-    uint128_t clusterUUID,
     MothershipTunnelGatewaySessionResult *sessionResult = nullptr,
     String *failure = nullptr)
 {
@@ -548,10 +437,6 @@ static inline bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
   if (streamFD < 0)
   {
     return fail("mothership tunnel gateway stream fd required"_ctv);
-  }
-  if (clusterUUID == 0 || auth.clusterUUID != clusterUUID)
-  {
-    return fail("mothership tunnel gateway auth clusterUUID mismatch"_ctv);
   }
   if (mothershipTunnelGatewayAuthMaterialValid(auth, failure) == false)
   {
@@ -599,7 +484,7 @@ static inline bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
   clientCert.reset(SSL_get1_peer_certificate(tls.get()));
   String clientCertPem = {};
   if (VaultPem::x509ToPem(clientCert.get(), clientCertPem) == false ||
-      mothershipTunnelGatewayAuthorizeClientCertificate(auth, clientCertPem, clusterUUID, failure) == false)
+      mothershipTunnelGatewayAuthorizeClientCertificate(auth, clientCertPem, failure) == false)
   {
     if (sessionResult)
     {
@@ -629,26 +514,5 @@ static inline bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
   {
     failure->clear();
   }
-  return ok;
-}
-
-static inline bool mothershipTunnelGatewayAcceptAuthenticatedControlSession(
-    int listenerFD,
-    const MothershipTunnelGatewayPeerPolicy& peerPolicy,
-    const String& controlSocketPath,
-    const MothershipTunnelGatewayAuth& auth,
-    uint128_t clusterUUID,
-    MothershipTunnelGatewaySessionResult *sessionResult = nullptr,
-    String *failure = nullptr)
-{
-  int streamFD = -1;
-  if (mothershipTunnelGatewayAcceptUnixStream(listenerFD, peerPolicy, streamFD, failure) == false)
-  {
-    return false;
-  }
-
-  bool ok = mothershipTunnelGatewayProxyAuthenticatedControlStream(streamFD, controlSocketPath, auth, clusterUUID, sessionResult, failure);
-  (void)::shutdown(streamFD, SHUT_RDWR);
-  ::close(streamFD);
   return ok;
 }

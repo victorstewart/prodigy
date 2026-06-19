@@ -866,76 +866,6 @@ static void exerciseHostIngressPlainLocalIPv6(TestSuite& suite, uint8_t proto)
   ingressProgram.close();
 }
 
-static void exerciseHostIngressSystemEgressNATReply(TestSuite& suite)
-{
-  String ingressObjectPath = {};
-  ingressObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
-  ingressObjectPath.append("/host.ingress.router.ebpf.o"_ctv);
-
-  BPFProgram ingressProgram = {};
-  suite.expect(ingressProgram.load(ingressObjectPath, "host_ingress"_ctv),
-               "switchboard_host_ingress_system_egress_nat_loads_program");
-  if (ingressProgram.prog_fd < 0)
-  {
-    return;
-  }
-
-  constexpr uint8_t containerFragment = 0x4e;
-  uint32_t redirectIfidx = 91;
-  ingressProgram.setArrayElement("ct_dev_map"_ctv, containerFragment, redirectIfidx);
-
-  struct in_addr remote4 = {};
-  struct in_addr host4 = {};
-  struct in_addr inside4 = {};
-  suite.expect(inet_pton(AF_INET, "93.184.216.34", &remote4) == 1,
-               "switchboard_host_ingress_system_egress_nat_remote_parses");
-  suite.expect(inet_pton(AF_INET, "10.8.0.44", &host4) == 1,
-               "switchboard_host_ingress_system_egress_nat_host_parses");
-  suite.expect(inet_pton(AF_INET, "198.18.0.78", &inside4) == 1,
-               "switchboard_host_ingress_system_egress_nat_inside_parses");
-
-  flow_key reply = {};
-  reply.src = remote4.s_addr;
-  reply.dst = host4.s_addr;
-  reply.proto = IPPROTO_TCP;
-  reply.port16[0] = htons(443);
-  reply.port16[1] = htons(49'152);
-
-  switchboard_system_egress_nat_binding binding = {};
-  binding.container.hasID = true;
-  binding.container.value[4] = containerFragment;
-  binding.inside_addr4 = inside4.s_addr;
-  suite.expect(updateProgramMapElement(ingressProgram, "system_egress_nat"_ctv, reply, binding),
-               "switchboard_host_ingress_system_egress_nat_installs_reply");
-
-  std::vector<uint8_t> frame = makeIPv4L4EthernetFrame(remote4, host4, IPPROTO_TCP, 443, 49'152);
-  std::vector<uint8_t> output(frame.size());
-  LIBBPF_OPTS(bpf_test_run_opts, opts,
-              .data_in = frame.data(),
-              .data_out = output.data(),
-              .data_size_in = static_cast<__u32>(frame.size()),
-              .data_size_out = static_cast<__u32>(output.size()),
-              .repeat = 1, );
-
-  int runResult = bpf_prog_test_run_opts(ingressProgram.prog_fd, &opts);
-  suite.expect(runResult == 0, "switchboard_host_ingress_system_egress_nat_test_run_succeeds");
-  suite.expect(opts.retval == TC_ACT_REDIRECT, "switchboard_host_ingress_system_egress_nat_redirects_to_container");
-
-  if (runResult == 0 && opts.data_size_out >= sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr))
-  {
-    const struct ethhdr *outEth = reinterpret_cast<const struct ethhdr *>(output.data());
-    const struct iphdr *outIP = reinterpret_cast<const struct iphdr *>(output.data() + sizeof(struct ethhdr));
-    const struct tcphdr *outTCP = reinterpret_cast<const struct tcphdr *>(outIP + 1);
-    suite.expect(outEth->h_proto == htons(ETH_P_IP), "switchboard_host_ingress_system_egress_nat_preserves_ethertype");
-    suite.expect(outIP->saddr == remote4.s_addr, "switchboard_host_ingress_system_egress_nat_preserves_source");
-    suite.expect(outIP->daddr == inside4.s_addr, "switchboard_host_ingress_system_egress_nat_restores_inside_destination");
-    suite.expect(outTCP->source == htons(443), "switchboard_host_ingress_system_egress_nat_preserves_source_port");
-    suite.expect(outTCP->dest == htons(49'152), "switchboard_host_ingress_system_egress_nat_preserves_destination_port");
-  }
-
-  ingressProgram.close();
-}
-
 static void exerciseHostIngressHostedIngressRoute(TestSuite& suite, bool ipv6, uint8_t proto)
 {
   const char *label = ipv6
@@ -1410,8 +1340,6 @@ int main(void)
   String pinPath = {};
   switchboardWhiteholeReplyFlowPinPath(pinPath, 17);
   suite.expect(pinPath == "/sys/fs/bpf/prodigy_whitehole_reply_flows_17"_ctv, "switchboard_whitehole_pin_path_uses_interface_index");
-  switchboardSystemEgressNATPinPath(pinPath, 17);
-  suite.expect(pinPath == "/sys/fs/bpf/prodigy_system_egress_nat_17"_ctv, "switchboard_system_egress_nat_pin_path_uses_interface_index");
 
   {
     String egressObjectPath = {};
@@ -1424,41 +1352,29 @@ int main(void)
 
     uint32_t testIfindex = uint32_t(::getpid());
     String sharedWhiteholePinPath = {};
-    String sharedSystemEgressPinPath = {};
     switchboardWhiteholeReplyFlowPinPath(sharedWhiteholePinPath, testIfindex);
-    switchboardSystemEgressNATPinPath(sharedSystemEgressPinPath, testIfindex);
     (void)unlink(sharedWhiteholePinPath.c_str());
-    (void)unlink(sharedSystemEgressPinPath.c_str());
 
     BPFProgram egressProgram = {};
     suite.expect(egressProgram.load(egressObjectPath, "host_egress"_ctv), "switchboard_whitehole_reply_flow_reuse_loads_host_egress_program");
 
     bool pinnedReplyMap = switchboardPinWhiteholeReplyFlowMap(&egressProgram, testIfindex);
     suite.expect(pinnedReplyMap, "switchboard_whitehole_reply_flow_reuse_pins_egress_reply_map_before_ingress_load");
-    bool pinnedSystemEgressMap = switchboardPinSystemEgressNATMap(&egressProgram, testIfindex);
-    suite.expect(pinnedSystemEgressMap, "switchboard_system_egress_nat_reuse_pins_egress_map_before_ingress_load");
 
     bool reusedPinnedReplyMap = false;
-    bool reusedPinnedSystemEgressMap = false;
     BPFProgram ingressProgram = {};
     bool ingressLoaded = ingressProgram.load(ingressObjectPath,
                                              "host_ingress"_ctv,
                                              [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
                                                reusedPinnedReplyMap = switchboardReusePinnedWhiteholeReplyFlowMap(obj, testIfindex, inner_map_fds);
-                                               reusedPinnedSystemEgressMap = switchboardReusePinnedSystemEgressNATMap(obj, testIfindex, inner_map_fds);
                                              });
     suite.expect(ingressLoaded, "switchboard_whitehole_reply_flow_reuse_loads_host_ingress_program");
     suite.expect(reusedPinnedReplyMap, "switchboard_whitehole_reply_flow_reuse_reuses_pinned_map_for_ingress_program");
-    suite.expect(reusedPinnedSystemEgressMap, "switchboard_system_egress_nat_reuse_reuses_pinned_map_for_ingress_program");
 
     uint32_t egressReplyMapID = programMapID(egressProgram, "white_replies"_ctv);
     uint32_t ingressReplyMapID = programMapID(ingressProgram, "white_replies"_ctv);
-    uint32_t egressSystemEgressMapID = programMapID(egressProgram, "system_egress_nat"_ctv);
-    uint32_t ingressSystemEgressMapID = programMapID(ingressProgram, "system_egress_nat"_ctv);
     suite.expect(egressReplyMapID != 0, "switchboard_whitehole_reply_flow_reuse_resolves_egress_map_id");
     suite.expect(ingressReplyMapID == egressReplyMapID, "switchboard_whitehole_reply_flow_reuse_shares_reply_flow_map_between_egress_and_ingress");
-    suite.expect(egressSystemEgressMapID != 0, "switchboard_system_egress_nat_reuse_resolves_egress_map_id");
-    suite.expect(ingressSystemEgressMapID == egressSystemEgressMapID, "switchboard_system_egress_nat_reuse_shares_map_between_egress_and_ingress");
 
     if (ingressLoaded)
     {
@@ -1471,7 +1387,6 @@ int main(void)
     }
 
     (void)unlink(sharedWhiteholePinPath.c_str());
-    (void)unlink(sharedSystemEgressPinPath.c_str());
   }
 
   {
@@ -1811,8 +1726,6 @@ int main(void)
   exerciseBalancerRemotePortalRoutesWithOverlay(suite);
   exerciseHostIngressPlainLocalIPv6(suite, IPPROTO_UDP);
   exerciseHostIngressPlainLocalIPv6(suite, IPPROTO_TCP);
-  exerciseHostIngressSystemEgressNATReply(suite);
-
   {
     String ingressObjectPath = {};
     ingressObjectPath.assign(PRODIGY_TEST_BINARY_DIR);

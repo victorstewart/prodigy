@@ -2028,7 +2028,6 @@ protected:
       }
 
       bool whiteholeReplyFlowPinned = false;
-      bool systemEgressNATPinned = false;
       if (tcx_egress_program)
       {
         whiteholeReplyFlowPinned = switchboardPinWhiteholeReplyFlowMap(tcx_egress_program, eth.ifidx);
@@ -2037,15 +2036,9 @@ protected:
           basics_log("setupNetworking failed to pin host whitehole reply flow map ifidx=%d\n",
                      eth.ifidx);
         }
-        systemEgressNATPinned = switchboardPinSystemEgressNATMap(tcx_egress_program, eth.ifidx);
-        if (systemEgressNATPinned == false)
-        {
-          basics_log("setupNetworking failed to pin host system egress nat map ifidx=%d\n",
-                     eth.ifidx);
-        }
       }
 
-      if (whiteholeReplyFlowPinned == false || systemEgressNATPinned == false)
+      if (whiteholeReplyFlowPinned == false)
       {
         basics_log("setupNetworking skipping host ingress attach because shared flow map pinning failed ifidx=%d\n",
                    eth.ifidx);
@@ -2088,7 +2081,6 @@ protected:
           tcx_ingress_program = eth.attachBPF(BPF_TCX_INGRESS, hostIngressPath, "host_ingress"_ctv,
                                               [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
                                                 (void)switchboardReusePinnedWhiteholeReplyFlowMap(obj, eth.ifidx, inner_map_fds);
-                                                (void)switchboardReusePinnedSystemEgressNATMap(obj, eth.ifidx, inner_map_fds);
                                               });
           if (tcx_ingress_program)
           {
@@ -2121,7 +2113,6 @@ protected:
       tcx_egress_program->setArrayElement("mac_map"_ctv, 0, eth.mac);
       tcx_egress_program->setArrayElement("gw_mac_map"_ctv, 0, eth.gateway_mac);
       (void)switchboardPinWhiteholeReplyFlowMap(tcx_egress_program, eth.ifidx);
-      (void)switchboardPinSystemEgressNATMap(tcx_egress_program, eth.ifidx);
     }
 
     iaas->setLocalContainerPrefixes(localPrefixes);

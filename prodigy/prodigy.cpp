@@ -769,17 +769,6 @@ public:
   std::atomic<bool> mothershipTunnelGatewayStopRequested = false;
   std::atomic<int> mothershipTunnelGatewayActiveStreamFD = -1;
   std::atomic<uint64_t> mothershipTunnelGatewayFailureCount = 0;
-  std::mutex mothershipTunnelGatewayPeerPolicyMutex;
-  MothershipTunnelGatewayPeerPolicy mothershipTunnelGatewayPeerPolicy;
-
-  static void buildMothershipTunnelProviderCgroupV2Path(uint128_t containerUUID, String& path)
-  {
-    String containerName;
-    containerName.assignItoa(containerUUID);
-    path.assign("/containers.slice/"_ctv);
-    path.append(containerName);
-    path.append(".slice/leaf"_ctv);
-  }
 
   bool claimLocalClusterOwnership(uint128_t clusterUUID, String *failure = nullptr) override
   {
@@ -1072,19 +1061,10 @@ public:
     int listenerFD = mothershipTunnelGatewayListener.fd;
     String controlSocketPath = mothershipUnixSocketPath;
     MothershipTunnelGatewayAuth gatewayAuthCopy = gatewayAuth;
-    uint128_t clusterUUID = brainConfig.clusterUUID;
     mothershipTunnelGatewayStopRequested.store(false);
     mothershipTunnelGatewayActiveStreamFD.store(-1);
     mothershipTunnelGatewayFailureCount.store(0);
-    {
-      std::lock_guard<std::mutex> lock(mothershipTunnelGatewayPeerPolicyMutex);
-      mothershipTunnelGatewayPeerPolicy = {};
-      mothershipTunnelGatewayPeerPolicy.requireUID = true;
-      mothershipTunnelGatewayPeerPolicy.uid = uid_t(prodigyMothershipTunnelProviderRuntimeUID);
-      mothershipTunnelGatewayPeerPolicy.requireGID = true;
-      mothershipTunnelGatewayPeerPolicy.gid = gid_t(prodigyMothershipTunnelProviderRuntimeUID);
-    }
-    mothershipTunnelGatewayThread = std::thread([this, listenerFD, controlSocketPath, gatewayAuthCopy, clusterUUID]() mutable {
+    mothershipTunnelGatewayThread = std::thread([this, listenerFD, controlSocketPath, gatewayAuthCopy]() mutable {
       while (mothershipTunnelGatewayStopRequested.load() == false)
       {
         pollfd descriptor = {};
@@ -1120,12 +1100,7 @@ public:
 
         int streamFD = -1;
         String sessionFailure = {};
-        MothershipTunnelGatewayPeerPolicy peerPolicy = {};
-        {
-          std::lock_guard<std::mutex> lock(mothershipTunnelGatewayPeerPolicyMutex);
-          peerPolicy = mothershipTunnelGatewayPeerPolicy;
-        }
-        if (mothershipTunnelGatewayAcceptUnixStream(listenerFD, peerPolicy, streamFD, &sessionFailure) == false)
+        if (mothershipTunnelGatewayAcceptUnixStream(listenerFD, streamFD, &sessionFailure) == false)
         {
           if (mothershipTunnelGatewayStopRequested.load() == false)
           {
@@ -1136,14 +1111,12 @@ public:
 
         mothershipTunnelGatewayActiveStreamFD.store(streamFD);
         MothershipTunnelGatewaySessionResult sessionResult = {};
-        bool ok = mothershipTunnelGatewayProxyAuthenticatedControlStream(streamFD, controlSocketPath, gatewayAuthCopy, clusterUUID, &sessionResult, &sessionFailure);
+        bool ok = mothershipTunnelGatewayProxyAuthenticatedControlStream(streamFD, controlSocketPath, gatewayAuthCopy, &sessionResult, &sessionFailure);
         if (ok)
         {
           noteMothershipTunnelProviderControlSession(
               sessionResult.authenticated,
-              sessionResult.openedControlSocket,
-              sessionResult.clientToControlBytes,
-              sessionResult.controlToClientBytes);
+              sessionResult.openedControlSocket);
         }
         (void)::shutdown(streamFD, SHUT_RDWR);
         ::close(streamFD);
@@ -1177,15 +1150,10 @@ public:
       mothershipTunnelGatewayThread.join();
     }
     mothershipTunnelGatewayActiveStreamFD.store(-1);
-    {
-      std::lock_guard<std::mutex> lock(mothershipTunnelGatewayPeerPolicyMutex);
-      mothershipTunnelGatewayPeerPolicy = {};
-    }
   }
 
-  bool startMothershipTunnelProviderInstance(const MothershipTunnelProviderSpec& spec, const MothershipTunnelGatewayAuth& gatewayAuth, const String& artifactBlob, uint64_t generation, uint128_t& containerUUID, String *failure = nullptr)
+  bool startMothershipTunnelProviderInstance(const MothershipTunnelProviderSpec& spec, const String& artifactBlob, uint128_t& containerUUID, String *failure = nullptr)
   {
-    (void)gatewayAuth;
     containerUUID = 0;
     if (mothershipTunnelProviderSpecValid(spec, failure) == false)
     {
@@ -1212,35 +1180,23 @@ public:
     containerUUID = Random::generateNumberWithNBits<128, uint128_t>();
     containerPlan.uuid = containerUUID;
     containerPlan.config.type = ApplicationType::stateless;
-    containerPlan.config.versionID = generation;
+    containerPlan.createdAtMs = Time::now<TimeResolution::ms>();
+    containerPlan.config.versionID = uint64_t(containerPlan.createdAtMs);
     containerPlan.config.containerBlobSHA256.assign(spec.artifactSha256);
     containerPlan.config.containerBlobBytes = spec.artifactBytes;
-    containerPlan.config.filesystemMB = spec.resources.nStorageMB;
-    containerPlan.config.memoryMB = spec.resources.nMemoryMB;
-    containerPlan.config.nLogicalCores = spec.resources.nLogicalCores;
+    containerPlan.config.filesystemMB = 128;
+    containerPlan.config.memoryMB = 128;
+    containerPlan.config.nLogicalCores = 1;
     containerPlan.config.cpuMode = ApplicationCPUMode::isolated;
     containerPlan.config.sTilKillable = 30;
     containerPlan.restartOnFailure = true;
     containerPlan.fragment = prodigyMothershipTunnelProviderRuntimeFragment;
-    containerPlan.systemContainerKind = spec.containerKind;
+    containerPlan.systemContainerKind = SystemContainerKind::mothershipTunnelProvider;
     containerPlan.systemGatewaySocketSourcePath.assign(mothershipTunnelProviderHostGatewaySocketPath);
     containerPlan.systemGatewaySocketTargetPath.assign(mothershipTunnelProviderMothershipSocketPath);
-    containerPlan.systemEgressHost.assign(spec.egress.host);
-    containerPlan.systemEgressPort = spec.egress.port;
+    containerPlan.systemEgressHost.assign(spec.egressHost);
+    containerPlan.systemEgressPort = spec.egressPort;
     containerPlan.state = ContainerState::scheduled;
-    containerPlan.createdAtMs = Time::now<TimeResolution::ms>();
-
-    String providerCgroupV2Path;
-    buildMothershipTunnelProviderCgroupV2Path(containerUUID, providerCgroupV2Path);
-    {
-      std::lock_guard<std::mutex> lock(mothershipTunnelGatewayPeerPolicyMutex);
-      mothershipTunnelGatewayPeerPolicy.requireUID = true;
-      mothershipTunnelGatewayPeerPolicy.uid = uid_t(prodigyMothershipTunnelProviderRuntimeUID);
-      mothershipTunnelGatewayPeerPolicy.requireGID = true;
-      mothershipTunnelGatewayPeerPolicy.gid = gid_t(prodigyMothershipTunnelProviderRuntimeUID);
-      mothershipTunnelGatewayPeerPolicy.requireCgroupV2Path = true;
-      mothershipTunnelGatewayPeerPolicy.cgroupV2Path = providerCgroupV2Path;
-    }
 
     Vector<String> env = {};
     auto pushEnv = [&](StringType auto&& key, const String& value) {
@@ -1250,10 +1206,10 @@ public:
       env.push_back(std::move(assignment));
     };
     String edgePort = {};
-    edgePort.assignItoa(spec.egress.port);
+    edgePort.assignItoa(spec.egressPort);
     pushEnv("PRODIGY_CONTAINER_KIND="_ctv, mothershipTunnelProviderContainerKindValue);
     pushEnv("PRODIGY_MOTHERSHIP_SOCKET="_ctv, mothershipTunnelProviderMothershipSocketPath);
-    pushEnv("PRODIGY_TUNNEL_EGRESS_HOST="_ctv, spec.egress.host);
+    pushEnv("PRODIGY_TUNNEL_EGRESS_HOST="_ctv, spec.egressHost);
     pushEnv("PRODIGY_TUNNEL_EGRESS_PORT="_ctv, edgePort);
     containerPlan.systemExecuteEnv = std::move(env);
 
@@ -1276,7 +1232,7 @@ public:
     return true;
   }
 
-  bool startMothershipTunnelProviderRuntime(const MothershipTunnelProviderSpec& spec, const MothershipTunnelGatewayAuth& gatewayAuth, const String& artifactBlob, uint64_t generation, uint128_t& containerUUID, String *failure = nullptr) override
+  bool startMothershipTunnelProviderRuntime(const MothershipTunnelProviderSpec& spec, const MothershipTunnelGatewayAuth& gatewayAuth, const String& artifactBlob, uint128_t& containerUUID, String *failure = nullptr) override
   {
     containerUUID = 0;
     if (startMothershipTunnelGateway(spec, gatewayAuth, failure) == false)
@@ -1284,7 +1240,7 @@ public:
       return false;
     }
 
-    if (startMothershipTunnelProviderInstance(spec, gatewayAuth, artifactBlob, generation, containerUUID, failure) && containerUUID != 0)
+    if (startMothershipTunnelProviderInstance(spec, artifactBlob, containerUUID, failure) && containerUUID != 0)
     {
       return true;
     }
@@ -1309,16 +1265,6 @@ public:
       it->second->killedOnPurpose = true;
       it->second->pendingKillAckToBrain = false;
       ContainerManager::killContainer(it->second);
-    }
-    String providerCgroupV2Path;
-    buildMothershipTunnelProviderCgroupV2Path(containerUUID, providerCgroupV2Path);
-    {
-      std::lock_guard<std::mutex> lock(mothershipTunnelGatewayPeerPolicyMutex);
-      if (mothershipTunnelGatewayPeerPolicy.cgroupV2Path.equal(providerCgroupV2Path))
-      {
-        mothershipTunnelGatewayPeerPolicy.requireCgroupV2Path = false;
-        mothershipTunnelGatewayPeerPolicy.cgroupV2Path.clear();
-      }
     }
   }
 

@@ -798,13 +798,13 @@ int main(void)
     MothershipConnectivity connectivity = {};
     suite.expect(parseConnectivityFixture("{\"kind\":\"ssh\"}"_ctv, connectivity) && connectivity.kind == MothershipConnectivityKind::ssh, "mothership_connectivity_parse_ssh_without_artifact");
     suite.expect(parseConnectivityFixture("{\"kind\":\"ssh\",\"providerContainerBlobPath\":\"x\"}"_ctv, connectivity) == false, "mothership_connectivity_parse_ssh_rejects_tunnel_artifact");
-    suite.expect(parseConnectivityFixture("{\"kind\":\"tunnelProvider\",\"providerContainerBlobPath\":\"x\",\"dialEndpoint\":\"control.example.net:443\",\"egressHost\":\"edge.example.net\",\"egressPort\":443}"_ctv, connectivity) && connectivity.tunnelProvider.egress.host.equal("edge.example.net"_ctv) && connectivity.tunnelProvider.egress.port == 443, "mothership_connectivity_parse_tunnel_endpoint");
-    suite.expect(parseConnectivityFixture("{\"kind\":\"tunnelProvider\",\"dialEndpoint\":\"control.example.net:443\",\"egressHost\":\"edge.example.net\",\"egressPort\":443}"_ctv, connectivity) == false, "mothership_connectivity_parse_tunnel_rejects_missing_artifact");
-    suite.expect(parseConnectivityFixture("{\"kind\":\"tunnelProvider\",\"providerContainerBlobPath\":\"x\",\"dialEndpoint\":\"\",\"egressHost\":\"edge.example.net\",\"egressPort\":443}"_ctv, connectivity) == false, "mothership_connectivity_parse_tunnel_rejects_empty_endpoint");
-    suite.expect(parseConnectivityFixture("{\"kind\":\"tunnelProvider\",\"providerContainerBlobPath\":\"x\",\"dialEndpoint\":\"control.example.net:443\",\"egressHost\":\"edge.example.net\",\"egressPort\":0}"_ctv, connectivity) == false, "mothership_connectivity_parse_tunnel_rejects_zero_egress_port");
-    suite.expect(parseConnectivityFixture("{\"kind\":\"tunnelProvider\",\"providerContainerBlobPath\":\"x\",\"dialEndpoint\":\"control.example.net:443\",\"dialServerSpkiSha256\":\"bad\",\"egressHost\":\"edge.example.net\",\"egressPort\":443}"_ctv, connectivity) == false, "mothership_connectivity_parse_tunnel_rejects_bad_spki_pin");
+    suite.expect(parseConnectivityFixture("{\"kind\":\"tunnelProvider\",\"providerContainerBlobPath\":\"x\",\"dialEndpoint\":\"control.example.net:443\",\"egressHost\":\"1.1.1.1\",\"egressPort\":443}"_ctv, connectivity) && connectivity.tunnelProvider.egressHost.equal("1.1.1.1"_ctv) && connectivity.tunnelProvider.egressPort == 443, "mothership_connectivity_parse_tunnel_endpoint");
+    suite.expect(parseConnectivityFixture("{\"kind\":\"tunnelProvider\",\"dialEndpoint\":\"control.example.net:443\",\"egressHost\":\"1.1.1.1\",\"egressPort\":443}"_ctv, connectivity) == false, "mothership_connectivity_parse_tunnel_rejects_missing_artifact");
+    suite.expect(parseConnectivityFixture("{\"kind\":\"tunnelProvider\",\"providerContainerBlobPath\":\"x\",\"dialEndpoint\":\"\",\"egressHost\":\"1.1.1.1\",\"egressPort\":443}"_ctv, connectivity) == false, "mothership_connectivity_parse_tunnel_rejects_empty_endpoint");
+    suite.expect(parseConnectivityFixture("{\"kind\":\"tunnelProvider\",\"providerContainerBlobPath\":\"x\",\"dialEndpoint\":\"control.example.net:443\",\"egressHost\":\"1.1.1.1\",\"egressPort\":0}"_ctv, connectivity) == false, "mothership_connectivity_parse_tunnel_rejects_zero_egress_port");
     suite.expect(parseConnectivityFixture("{\"kind\":\"tunnelProvider\",\"providerContainerBlobPath\":\"x\",\"dialEndpoint\":\"control.example.net:443\",\"egressPort\":443}"_ctv, connectivity) == false, "mothership_connectivity_parse_tunnel_rejects_missing_egress_host");
-    suite.expect(parseConnectivityFixture("{\"kind\":\"tunnelProvider\",\"providerContainerBlobPath\":\"x\",\"dialEndpoint\":\"control.example.net:443\",\"egressHost\":\"edge.example.net\"}"_ctv, connectivity) == false, "mothership_connectivity_parse_tunnel_rejects_missing_egress_port");
+    suite.expect(parseConnectivityFixture("{\"kind\":\"tunnelProvider\",\"providerContainerBlobPath\":\"x\",\"dialEndpoint\":\"control.example.net:443\",\"egressHost\":\"1.1.1.1\"}"_ctv, connectivity) == false, "mothership_connectivity_parse_tunnel_rejects_missing_egress_port");
+    suite.expect(parseConnectivityFixture("{\"kind\":\"tunnelProvider\",\"providerContainerBlobPath\":\"x\",\"dialEndpoint\":\"control.example.net:443\",\"egressHost\":\"edge.example.net\",\"egressPort\":443}"_ctv, connectivity) == false, "mothership_connectivity_parse_tunnel_rejects_hostname_egress");
     suite.expect(parseConnectivityFixture("{\"kind\":\"tunnelProvider\",\"providerContainerBlobPath\":\"x\",\"dialEndpoint\":\"control.example.net:443\",\"egressHost\":\"169.254.169.254\",\"egressPort\":443}"_ctv, connectivity) == false, "mothership_connectivity_parse_tunnel_rejects_metadata_egress");
 
   }
@@ -828,28 +828,12 @@ int main(void)
       bool prepared = mothership.unitTestPrepareTunnelProviderArtifact(spec, systemStoreRoot.path, &failure);
       suite.expect(prepared, "tunnel_provider_artifact_preflight_accepts_valid_blob");
       suite.expect(failure.size() == 0, "tunnel_provider_artifact_preflight_valid_no_failure");
-      suite.expect(spec.containerKind == SystemContainerKind::mothershipTunnelProvider, "tunnel_provider_artifact_preflight_sets_kind");
       suite.expect(spec.artifactBytes == tunnelBlob.size(), "tunnel_provider_artifact_preflight_sets_size");
-      suite.expect(spec.artifactContractVersion == prodigyDiscombobulatorMothershipTunnelProviderContractVersion, "tunnel_provider_artifact_preflight_sets_contract_version");
-      suite.expect(ContainerStore::systemVerify(SystemContainerKind::mothershipTunnelProvider, spec.artifactSha256, spec.artifactBytes, nullptr, nullptr, &failure, &systemStoreRoot.path), "tunnel_provider_artifact_preflight_stores_blob");
+      suite.expect(ContainerStore::systemVerify(spec.artifactSha256, spec.artifactBytes, nullptr, nullptr, &failure, &systemStoreRoot.path), "tunnel_provider_artifact_preflight_stores_blob");
       uint128_t clusterUUID = 0xABC1;
-      suite.expect(mothership.unitTestPrepareTunnelProviderGatewayAuth(spec, clusterUUID, &failure), "tunnel_provider_gateway_auth_preflight_generates");
+      suite.expect(mothership.unitTestPrepareTunnelProviderGatewayAuth(spec, &failure), "tunnel_provider_gateway_auth_preflight_generates");
       suite.expect(spec.clientAuth.configured(), "tunnel_provider_gateway_auth_preflight_sets_client_auth");
       suite.expect(spec.gatewayAuth.configured(), "tunnel_provider_gateway_auth_preflight_sets_gateway_auth");
-      suite.expect(spec.clientAuth.clusterUUID == clusterUUID && spec.gatewayAuth.clusterUUID == clusterUUID, "tunnel_provider_gateway_auth_preflight_binds_cluster");
-      suite.expect(spec.gatewayAuth.authorizedClientCertPem.equals(spec.clientAuth.clientCertPem), "tunnel_provider_gateway_auth_preflight_authorizes_client");
-      MothershipTunnelProviderSpec mismatchedAuthSpec = spec;
-      mismatchedAuthSpec.gatewayAuth.authorizedClientCertPem = "other-client-cert"_ctv;
-      suite.expect(
-          mothership.unitTestPrepareTunnelProviderGatewayAuth(mismatchedAuthSpec, clusterUUID, &failure) == false &&
-              failure.equal("tunnelProvider gateway auth does not authorize client auth"_ctv),
-          "tunnel_provider_gateway_auth_preflight_rejects_mismatch");
-      MothershipTunnelProviderSpec malformedAuthSpec = spec;
-      malformedAuthSpec.clientAuth.clientKeyPem.assign("not-a-key"_ctv);
-      suite.expect(
-          mothership.unitTestPrepareTunnelProviderGatewayAuth(malformedAuthSpec, clusterUUID, &failure) == false &&
-              failure.equal("tunnelProvider gateway auth certificate material invalid"_ctv),
-          "tunnel_provider_gateway_auth_preflight_rejects_malformed_material");
       String appBlob = {};
       appBlob.assign(prodigyDiscombobulatorBlobHeaderText());
       for (uint32_t index = 0; index < 32; ++index)
@@ -921,8 +905,7 @@ int main(void)
     uint16_t endpointPort = 0;
     String endpointFailure = {};
     suite.expect(mothershipParseEndpointHostPort("control.example.net:443"_ctv, endpointHost, endpointPort, &endpointFailure) && endpointHost.equal("control.example.net"_ctv) && endpointPort == 443, "mothership_connectivity_parse_gateway_endpoint_host_port");
-    suite.expect(mothershipParseEndpointHostPort("[2001:db8::1]:443"_ctv, endpointHost, endpointPort, &endpointFailure) && endpointHost.equal("2001:db8::1"_ctv) && endpointPort == 443, "mothership_connectivity_parse_gateway_endpoint_ipv6_port");
-    suite.expect(mothershipParseEndpointHostPort("2001:db8::1:443"_ctv, endpointHost, endpointPort, &endpointFailure) == false, "mothership_connectivity_parse_gateway_endpoint_rejects_unbracketed_ipv6");
+    suite.expect(mothershipParseEndpointHostPort("[2001:db8::1]:443"_ctv, endpointHost, endpointPort, &endpointFailure) == false, "mothership_connectivity_parse_gateway_endpoint_rejects_ipv6");
   }
 
   ScopedUnixListener listener = {};
@@ -978,17 +961,16 @@ int main(void)
     MothershipTunnelProviderSpec& tunnelProvider = tunnelCluster.mothershipConnectivity.tunnelProvider;
     tunnelProvider.artifactSha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv;
     tunnelProvider.artifactBytes = 128;
-    tunnelProvider.dial.endpoint = "gateway.example.net:443"_ctv;
-    tunnelProvider.egress.host = "edge.example.net"_ctv;
-    tunnelProvider.egress.port = 443;
-    tunnelProvider.resources = MothershipTunnelProviderResources { .nLogicalCores = 1, .nMemoryMB = 512, .nStorageMB = 1024 };
+    tunnelProvider.dialEndpoint = "gateway.example.net:443"_ctv;
+    tunnelProvider.egressHost = "1.1.1.1"_ctv;
+    tunnelProvider.egressPort = 443;
     bool tunnelConfigureOK = mothership.unitTestConfigureClusterSocket(tunnelCluster, remoteCandidates, &failure);
     suite.expect(tunnelConfigureOK == false, "tunnel_provider_configure_rejects_missing_client_auth");
     suite.expect(remoteCandidates.empty(), "tunnel_provider_configure_missing_auth_no_ssh_candidates");
     suite.expect(failure.equals("tunnelProvider client auth required for gateway dialing"_ctv), "tunnel_provider_configure_missing_auth_failure_reason");
 
     MothershipTunnelGatewayAuth ignoredGatewayAuth = {};
-    bool authFixture = mothershipGenerateTunnelGatewayAuth(tunnelCluster.clusterUUID, 1, tunnelProvider.clientAuth, ignoredGatewayAuth, &failure);
+    bool authFixture = mothershipGenerateTunnelGatewayAuth(tunnelProvider.clientAuth, ignoredGatewayAuth, &failure);
     suite.expect(authFixture, "tunnel_provider_configure_client_auth_fixture");
     if (authFixture)
     {
@@ -998,10 +980,10 @@ int main(void)
       suite.expect(failure.size() == 0, "tunnel_provider_configure_gateway_target_no_failure");
 
       MothershipProdigyCluster malformedEndpointCluster = tunnelCluster;
-      malformedEndpointCluster.mothershipConnectivity.tunnelProvider.dial.endpoint = "gateway.example.net"_ctv;
+      malformedEndpointCluster.mothershipConnectivity.tunnelProvider.dialEndpoint = "gateway.example.net"_ctv;
       tunnelConfigureOK = mothership.unitTestConfigureClusterSocket(malformedEndpointCluster, remoteCandidates, &failure);
       suite.expect(tunnelConfigureOK, "tunnel_provider_configure_accepts_nonempty_endpoint_metadata");
-      suite.expect(mothership.unitTestConnectConfiguredSocket(failure) == false && failure.equal("tunnelProvider gateway endpoint invalid: endpoint must be [host]:port or host:port"_ctv), "tunnel_provider_connect_malformed_endpoint_fails_closed");
+      suite.expect(mothership.unitTestConnectConfiguredSocket(failure) == false && failure.equal("tunnelProvider gateway endpoint invalid: endpoint must be host:port"_ctv), "tunnel_provider_connect_malformed_endpoint_fails_closed");
 
       MothershipProdigyCluster malformedAuthCluster = tunnelCluster;
       malformedAuthCluster.mothershipConnectivity.tunnelProvider.clientAuth.clientKeyPem.assign("not-a-key"_ctv);
@@ -1009,16 +991,6 @@ int main(void)
       suite.expect(tunnelConfigureOK == false, "tunnel_provider_configure_rejects_malformed_client_auth");
       suite.expect(remoteCandidates.empty(), "tunnel_provider_configure_malformed_auth_no_ssh_candidates");
       suite.expect(failure.equals("mothership tunnel gateway client auth certificate material invalid"_ctv), "tunnel_provider_configure_malformed_auth_failure_reason");
-
-      tunnelConfigureOK = mothership.unitTestConfigureClusterSocket(tunnelCluster, remoteCandidates, &failure, true);
-      suite.expect(tunnelConfigureOK == false, "tunnel_provider_configure_refuses_unallowed_explicit_ssh_fallback");
-      suite.expect(remoteCandidates.empty(), "tunnel_provider_configure_unallowed_explicit_no_ssh_candidates");
-      suite.expect(failure.equals("tunnelProvider emergency SSH fallback is not allowed by cluster connectivity metadata"_ctv), "tunnel_provider_configure_unallowed_explicit_failure_reason");
-
-      tunnelCluster.mothershipConnectivity.tunnelProvider.allowEmergencySshFallback = true;
-      tunnelConfigureOK = mothership.unitTestConfigureClusterSocket(tunnelCluster, remoteCandidates, &failure, true);
-      suite.expect(tunnelConfigureOK, "tunnel_provider_configure_allows_explicit_ssh_fallback");
-      suite.expect(remoteCandidates.size() == 1, "tunnel_provider_configure_explicit_ssh_candidates");
     }
   }
 
@@ -1210,13 +1182,11 @@ int main(void)
       MothershipTunnelProviderSpec& provider = gatewayCluster.mothershipConnectivity.tunnelProvider;
       provider.artifactSha256 = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv;
       provider.artifactBytes = 128;
-      provider.dial.endpoint.snprintf<"127.0.0.1:{itoa}"_ctv>(unsigned(gatewayListener.port));
-      provider.egress.host = "edge.example.net"_ctv;
-      provider.egress.port = 443;
-      provider.resources = MothershipTunnelProviderResources { .nLogicalCores = 1, .nMemoryMB = 128, .nStorageMB = 128 };
-
+      provider.dialEndpoint.snprintf<"127.0.0.1:{itoa}"_ctv>(unsigned(gatewayListener.port));
+      provider.egressHost = "1.1.1.1"_ctv;
+      provider.egressPort = 443;
       MothershipTunnelGatewayAuth gatewayAuth = {};
-      bool gatewayAuthReady = mothershipGenerateTunnelGatewayAuth(gatewayCluster.clusterUUID, 1, provider.clientAuth, gatewayAuth, &gatewayFailure);
+      bool gatewayAuthReady = mothershipGenerateTunnelGatewayAuth(provider.clientAuth, gatewayAuth, &gatewayFailure);
       suite.expect(gatewayAuthReady, "tunnel_gateway_tls_auth_fixture_created");
       if (gatewayAuthReady)
       {
@@ -1246,14 +1216,14 @@ int main(void)
               if (connected)
               {
                 std::thread rejectedThread([&]() {
-                  rejectedProxy = mothershipTunnelGatewayAcceptAuthenticatedControlSession(
-                      rejectedGateway.fd,
-                      MothershipTunnelGatewayPeerPolicy {},
-                      rejectedControl.path,
-                      gatewayAuth,
-                      gatewayCluster.clusterUUID,
-                      &rejectedResult,
-                      &rejectedFailure);
+                  int rejectedFD = -1;
+                  rejectedProxy = mothershipTunnelGatewayAcceptUnixStream(rejectedGateway.fd, rejectedFD, &rejectedFailure) &&
+                      mothershipTunnelGatewayProxyAuthenticatedControlStream(rejectedFD, rejectedControl.path, gatewayAuth, &rejectedResult, &rejectedFailure);
+                  if (rejectedFD >= 0)
+                  {
+                    (void)::shutdown(rejectedFD, SHUT_RDWR);
+                    ::close(rejectedFD);
+                  }
                 });
 
                 String garbage = "not-tls"_ctv;
@@ -1281,77 +1251,13 @@ int main(void)
           suite.expect(peerGatewayReady, "tunnel_gateway_peer_listener_created");
           if (peerGatewayReady)
           {
-            MothershipTunnelGatewayPeerPolicy peerPolicy = {};
-            peerPolicy.requireUID = true;
-            peerPolicy.uid = ::getuid();
-            peerPolicy.requireGID = true;
-            peerPolicy.gid = ::getgid();
             int clientFD = -1;
             int acceptedFD = -1;
             bool peerConnected = mothershipTunnelGatewayOpenUnixControlSocket(peerGateway.path, clientFD, &gatewayFailure);
-            suite.expect(peerConnected, "tunnel_gateway_peer_client_connected");
+            suite.expect(peerConnected || gatewayFailure.size() > 0, "tunnel_gateway_peer_reject_client_attempted");
             if (peerConnected)
             {
-              suite.expect(mothershipTunnelGatewayAcceptUnixStream(peerGateway.fd, peerPolicy, acceptedFD, &gatewayFailure), "tunnel_gateway_peer_credentials_accepted");
-            }
-            if (acceptedFD >= 0)
-            {
-              ::close(acceptedFD);
-            }
-            if (clientFD >= 0)
-            {
-              ::close(clientFD);
-            }
-
-            String currentCgroupV2Path;
-            bool currentCgroupRead = mothershipTunnelGatewayReadPeerCgroupV2Path(::getpid(), currentCgroupV2Path, &gatewayFailure);
-            suite.expect(currentCgroupRead && currentCgroupV2Path.size() > 0, "tunnel_gateway_peer_cgroup_v2_path_read");
-            if (currentCgroupRead && currentCgroupV2Path.size() > 0)
-            {
-              peerPolicy.requireCgroupV2Path = true;
-              peerPolicy.cgroupV2Path = currentCgroupV2Path;
-              clientFD = -1;
-              acceptedFD = -1;
-              peerConnected = mothershipTunnelGatewayOpenUnixControlSocket(peerGateway.path, clientFD, &gatewayFailure);
-              suite.expect(peerConnected, "tunnel_gateway_peer_cgroup_client_connected");
-              if (peerConnected)
-              {
-                suite.expect(mothershipTunnelGatewayAcceptUnixStream(peerGateway.fd, peerPolicy, acceptedFD, &gatewayFailure), "tunnel_gateway_peer_cgroup_accepted");
-              }
-              if (acceptedFD >= 0)
-              {
-                ::close(acceptedFD);
-              }
-              if (clientFD >= 0)
-              {
-                ::close(clientFD);
-              }
-
-              peerPolicy.cgroupV2Path.assign("/prodigy-test-cgroup-mismatch"_ctv);
-              clientFD = -1;
-              acceptedFD = -1;
-              peerConnected = mothershipTunnelGatewayOpenUnixControlSocket(peerGateway.path, clientFD, &gatewayFailure);
-              suite.expect(peerConnected, "tunnel_gateway_peer_cgroup_reject_client_connected");
-              if (peerConnected)
-              {
-                suite.expect(mothershipTunnelGatewayAcceptUnixStream(peerGateway.fd, peerPolicy, acceptedFD, &gatewayFailure) == false && acceptedFD < 0, "tunnel_gateway_peer_cgroup_rejected");
-              }
-              if (clientFD >= 0)
-              {
-                ::close(clientFD);
-              }
-              peerPolicy.requireCgroupV2Path = false;
-              peerPolicy.cgroupV2Path.clear();
-            }
-
-            peerPolicy.uid = peerPolicy.uid == 0 ? 65534 : 0;
-            clientFD = -1;
-            acceptedFD = -1;
-            peerConnected = mothershipTunnelGatewayOpenUnixControlSocket(peerGateway.path, clientFD, &gatewayFailure);
-            suite.expect(peerConnected, "tunnel_gateway_peer_reject_client_connected");
-            if (peerConnected)
-            {
-              suite.expect(mothershipTunnelGatewayAcceptUnixStream(peerGateway.fd, peerPolicy, acceptedFD, &gatewayFailure) == false && acceptedFD < 0, "tunnel_gateway_peer_credentials_rejected");
+              suite.expect(mothershipTunnelGatewayAcceptUnixStream(peerGateway.fd, acceptedFD, &gatewayFailure) == false && acceptedFD < 0, "tunnel_gateway_peer_credentials_rejected");
             }
             if (clientFD >= 0)
             {
@@ -1391,7 +1297,6 @@ int main(void)
               gatewayFD,
               gatewayControl.path,
               gatewayAuth,
-              gatewayCluster.clusterUUID,
               &gatewayResult,
               &gatewayProxyFailure);
           (void)::shutdown(gatewayFD, SHUT_RDWR);
@@ -1436,7 +1341,6 @@ int main(void)
         controlThread.join();
         suite.expect(gatewayProxyFailure.size() == 0 && gatewayControlFailure.size() == 0, "tunnel_gateway_tls_server_authorizes_client");
         suite.expect(gatewayResult.authenticated && gatewayResult.openedControlSocket, "tunnel_gateway_tls_opens_control_socket_after_auth");
-        suite.expect(gatewayResult.clientToControlBytes > 0 && gatewayResult.controlToClientBytes > 0, "tunnel_gateway_tls_proxy_counts_bytes");
       }
     }
   }

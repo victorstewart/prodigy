@@ -1952,14 +1952,12 @@ class ProdigyPersistentStoredMothershipTunnelGatewayAuth {
 public:
 
   uint64_t secretVersion = 0;
-  MothershipTunnelGatewayAuth auth;
 };
 
 template <typename S>
 static void serialize(S&& serializer, ProdigyPersistentStoredMothershipTunnelGatewayAuth& record)
 {
   serializer.value8b(record.secretVersion);
-  serializer.object(record.auth);
 }
 
 class ProdigyPersistentStoredMothershipConnectivityRuntimeConfig {
@@ -2251,23 +2249,6 @@ static void serialize(S&& serializer, ProdigyPersistentLocalBrainStateSecrets& s
 {
   serializer.text1b(secrets.clusterRootKeyPem, UINT32_MAX);
   serializer.text1b(secrets.localKeyPem, UINT32_MAX);
-}
-
-class ProdigyPersistentMothershipTunnelGatewayAuthSecrets {
-public:
-
-  String serverKeyPem;
-
-  void clear(void)
-  {
-    prodigyClearPersistentSecretString(serverKeyPem);
-  }
-};
-
-template <typename S>
-static void serialize(S&& serializer, ProdigyPersistentMothershipTunnelGatewayAuthSecrets& secrets)
-{
-  serializer.text1b(secrets.serverKeyPem, UINT32_MAX);
 }
 
 static inline void prodigyExtractPersistentBootStateSecrets(
@@ -2579,24 +2560,6 @@ static inline void prodigyApplyPersistentLocalBrainStateSecrets(
   state.transportTLS.localKeyPem = secrets.localKeyPem;
 }
 
-static inline void prodigyExtractPersistentMothershipTunnelGatewayAuthSecrets(
-    const MothershipTunnelGatewayAuth& auth,
-    MothershipTunnelGatewayAuth& publicAuth,
-    ProdigyPersistentMothershipTunnelGatewayAuthSecrets& secrets)
-{
-  publicAuth = auth;
-  secrets.clear();
-  secrets.serverKeyPem = auth.serverKeyPem;
-  prodigyClearPersistentSecretString(publicAuth.serverKeyPem);
-}
-
-static inline void prodigyApplyPersistentMothershipTunnelGatewayAuthSecrets(
-    MothershipTunnelGatewayAuth& auth,
-    const ProdigyPersistentMothershipTunnelGatewayAuthSecrets& secrets)
-{
-  auth.serverKeyPem = secrets.serverKeyPem;
-}
-
 template <typename T>
 static bool prodigyPersistentSerializedEqual(const T& lhs, const T& rhs)
 {
@@ -2648,23 +2611,11 @@ static bool prodigyPersistentStoredRecordPayloadEquals(const String& serialized,
   return payload.size() == 0 || std::memcmp(serializedBytes + sizeof(uint64_t), payload.data(), payload.size()) == 0;
 }
 
-template <typename StoredRecord, typename LegacyRecord>
+template <typename StoredRecord>
 static bool prodigyLoadPersistentStoredRecord(const String& serialized, StoredRecord& record)
 {
   record = {};
-  if (BitseryEngine::deserializeSafe(serialized, record))
-  {
-    return true;
-  }
-
-  LegacyRecord legacy = {};
-  if (BitseryEngine::deserializeSafe(serialized, legacy))
-  {
-    record.state = std::move(legacy);
-    return true;
-  }
-
-  return false;
+  return BitseryEngine::deserializeSafe(serialized, record);
 }
 
 class ProdigyPersistentStateStore {
@@ -2689,7 +2640,7 @@ private:
       return false;
     }
 
-    if (prodigyLoadPersistentStoredRecord<ProdigyPersistentStoredBootState, ProdigyPersistentBootState>(serialized, record) == false)
+    if (prodigyLoadPersistentStoredRecord(serialized, record) == false)
     {
       if (failure)
       {
@@ -2709,7 +2660,7 @@ private:
       return false;
     }
 
-    if (prodigyLoadPersistentStoredRecord<ProdigyPersistentStoredBrainSnapshot, ProdigyPersistentBrainSnapshot>(serialized, record) == false)
+    if (prodigyLoadPersistentStoredRecord(serialized, record) == false)
     {
       if (failure)
       {
@@ -2729,7 +2680,7 @@ private:
       return false;
     }
 
-    if (prodigyLoadPersistentStoredRecord<ProdigyPersistentStoredLocalBrainState, ProdigyPersistentLocalBrainState>(serialized, record) == false)
+    if (prodigyLoadPersistentStoredRecord(serialized, record) == false)
     {
       if (failure)
       {
@@ -3337,24 +3288,25 @@ public:
       return false;
     }
 
-    auth = stored.auth;
-    if (stored.secretVersion != 0)
+    if (stored.secretVersion == 0)
     {
-      ProdigyPersistentMothershipTunnelGatewayAuthSecrets secrets = {};
-      bool ok = loadSecretRecord(
-          brainColumnFamily,
-          mothershipTunnelGatewayAuthKey,
-          stored.secretVersion,
-          secrets,
-          "invalid persistent mothership tunnel gateway auth secrets",
-          failure);
-      if (ok == false)
+      if (failure)
       {
-        return false;
+        failure->assign("invalid persistent mothership tunnel gateway auth record"_ctv);
       }
+      return false;
+    }
 
-      prodigyApplyPersistentMothershipTunnelGatewayAuthSecrets(auth, secrets);
-      secrets.clear();
+    bool ok = loadSecretRecord(
+        brainColumnFamily,
+        mothershipTunnelGatewayAuthKey,
+        stored.secretVersion,
+        auth,
+        "invalid persistent mothership tunnel gateway auth secrets",
+        failure);
+    if (ok == false)
+    {
+      return false;
     }
 
     return true;
@@ -3449,21 +3401,15 @@ public:
       return false;
     }
 
-    MothershipTunnelGatewayAuth publicAuth = {};
-    ProdigyPersistentMothershipTunnelGatewayAuthSecrets secrets = {};
-    prodigyExtractPersistentMothershipTunnelGatewayAuthSecrets(auth, publicAuth, secrets);
-
     uint64_t previousVersion = previousMothershipTunnelGatewayAuthSecretVersion();
     uint64_t newVersion = prodigyGeneratePersistentSecretVersion();
-    if (saveSecretRecord(brainColumnFamily, mothershipTunnelGatewayAuthKey, newVersion, secrets, failure) == false)
+    if (saveSecretRecord(brainColumnFamily, mothershipTunnelGatewayAuthKey, newVersion, auth, failure) == false)
     {
-      secrets.clear();
       return false;
     }
 
     ProdigyPersistentStoredMothershipTunnelGatewayAuth stored = {};
     stored.secretVersion = newVersion;
-    stored.auth = std::move(publicAuth);
 
     String serialized = {};
     BitseryEngine::serialize(serialized, stored);
@@ -3474,7 +3420,6 @@ public:
     }
 
     Vault::secureClearString(serialized);
-    secrets.clear();
     return ok;
   }
 

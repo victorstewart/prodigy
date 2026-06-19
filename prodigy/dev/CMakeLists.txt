@@ -421,7 +421,7 @@ install(PROGRAMS ${PRODIGY_ACME_HOOK_SCRIPTS} DESTINATION lib/prodigy)
 
 add_executable(prodigy ${PRODIGY_ROOT}/prodigy/prodigy.cpp)
 add_executable(mothership ${PRODIGY_ROOT}/prodigy/mothership/mothership.cpp)
-add_executable(prodigy_mothership_tunnel_provider ${PRODIGY_ROOT}/prodigy/mothership/mothership.tunnel.provider.cpp)
+add_executable(prodigy_mothership_tunnel_provider ${CMAKE_CURRENT_SOURCE_DIR}/tests/mothership_tunnel_provider_fixture.cpp)
 set_target_properties(prodigy_mothership_tunnel_provider PROPERTIES OUTPUT_NAME mothership-tunnel-provider)
 add_executable(prodigy_ready_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/ready_container.cpp)
 add_executable(prodigy_pingpong_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
@@ -854,14 +854,12 @@ add_custom_command(
            --tool-binary "${PRODIGY_BUNDLED_BW_MEM_BIN}"
            --tool-binary "${PRODIGY_BUNDLED_SPEEDTEST_BIN}"
            --tool-binary "$<TARGET_FILE:mothership>"
-           --tool-binary "$<TARGET_FILE:prodigy_mothership_tunnel_provider>"
            --tool-binary "${PRODIGY_CERTBOT_WHEELHOUSE_OUTPUT}"
            --tool-binary "${PRODIGY_ROOT}/prodigy/acme/acme-present-dns-01"
            --tool-binary "${PRODIGY_ROOT}/prodigy/acme/acme-cleanup-dns-01"
            --tool-binary "${PRODIGY_ROOT}/prodigy/acme/acme-import-lineage"
    DEPENDS prodigy
            mothership
-           prodigy_mothership_tunnel_provider
            balancer.ebpf.o
            host.ingress.router.ebpf.o
            host.ingress.router.dev.ebpf.o

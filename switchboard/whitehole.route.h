@@ -85,11 +85,6 @@ static inline void switchboardWhiteholeReplyFlowPinPath(String& path, uint32_t i
   path.snprintf<"/sys/fs/bpf/prodigy_whitehole_reply_flows_{itoa}"_ctv>(ifindex);
 }
 
-static inline void switchboardSystemEgressNATPinPath(String& path, uint32_t ifindex)
-{
-  path.snprintf<"/sys/fs/bpf/prodigy_system_egress_nat_{itoa}"_ctv>(ifindex);
-}
-
 template <typename Program>
 static inline bool switchboardPinProgramMap(Program *program, uint32_t ifindex, const char *mapName, void (*pinPath)(String&, uint32_t))
 {
@@ -175,18 +170,7 @@ static inline bool switchboardPinWhiteholeReplyFlowMap(Program *program, uint32_
   return switchboardPinProgramMap(program, ifindex, "white_replies", switchboardWhiteholeReplyFlowPinPath);
 }
 
-template <typename Program>
-static inline bool switchboardPinSystemEgressNATMap(Program *program, uint32_t ifindex)
-{
-  return switchboardPinProgramMap(program, ifindex, "system_egress_nat", switchboardSystemEgressNATPinPath);
-}
-
 static inline bool switchboardReusePinnedWhiteholeReplyFlowMap(struct bpf_object *obj, uint32_t ifindex, Vector<int>& inner_map_fds)
 {
   return switchboardReusePinnedProgramMap(obj, ifindex, "white_replies", switchboardWhiteholeReplyFlowPinPath, inner_map_fds);
-}
-
-static inline bool switchboardReusePinnedSystemEgressNATMap(struct bpf_object *obj, uint32_t ifindex, Vector<int>& inner_map_fds)
-{
-  return switchboardReusePinnedProgramMap(obj, ifindex, "system_egress_nat", switchboardSystemEgressNATPinPath, inner_map_fds);
 }

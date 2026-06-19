@@ -103,37 +103,6 @@ __attribute__((__always_inline__)) static inline bool lookup_whitehole_reply_bin
   return true;
 }
 
-__attribute__((__always_inline__)) static inline bool lookup_system_egress_nat_reply_binding_ipv4(struct ethhdr *eth, void *data_end, struct switchboard_system_egress_nat_binding *binding)
-{
-  struct iphdr *iph = (struct iphdr *)(eth + 1);
-  if ((void *)(iph + 1) > data_end || iph->ihl != 5)
-  {
-    return false;
-  }
-
-  struct flow_key flow = {};
-  flow.src = iph->saddr;
-  flow.dst = iph->daddr;
-  flow.proto = iph->protocol;
-
-  struct switchboard_l4_ports l4 = {};
-  if (switchboard_parse_l4_ports((void *)(iph + 1), data_end, iph->protocol, sizeof(struct ethhdr) + sizeof(struct iphdr), &l4) == false)
-  {
-    return false;
-  }
-  flow.port16[0] = l4.source;
-  flow.port16[1] = l4.dest;
-
-  struct switchboard_system_egress_nat_binding *reply = bpf_map_lookup_elem(&system_egress_nat, &flow);
-  if (reply == NULL)
-  {
-    return false;
-  }
-
-  bpf_memcpy(binding, reply, sizeof(*binding));
-  return true;
-}
-
 __attribute__((__always_inline__)) static inline bool overlay_inner_ipv4_matches_external_portal(struct iphdr *inner4, void *data_end)
 {
   if ((void *)(inner4 + 1) > data_end || inner4->ihl != 5)
@@ -267,85 +236,6 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_whitehole_re
   }
 
   return TC_ACT_OK;
-}
-
-__attribute__((__always_inline__)) static inline int maybe_redirect_system_egress_nat_reply(struct __sk_buff *skb, struct ethhdr *eth, void *data_end, bool *handled)
-{
-  if (handled == NULL)
-  {
-    return TC_ACT_OK;
-  }
-
-  *handled = false;
-  if (eth == NULL || eth->h_proto != BE_ETH_P_IP)
-  {
-    return TC_ACT_OK;
-  }
-
-  struct switchboard_system_egress_nat_binding binding = {};
-  if (lookup_system_egress_nat_reply_binding_ipv4(eth, data_end, &binding) == false)
-  {
-    return TC_ACT_OK;
-  }
-
-  *handled = true;
-  if (binding.container.hasID == false || binding.inside_addr4 == 0)
-  {
-    return TC_ACT_SHOT;
-  }
-
-  __u32 l3Offset = sizeof(struct ethhdr);
-  struct iphdr *iph = (struct iphdr *)(eth + 1);
-  __u8 proto = iph->protocol;
-  __be32 oldDest4 = iph->daddr;
-  __be32 newDest4 = binding.inside_addr4;
-  if (oldDest4 != newDest4)
-  {
-    struct switchboard_l4_ports l4 = {};
-    if (switchboard_parse_l4_ports((void *)(iph + 1), data_end, proto, l3Offset + sizeof(struct iphdr), &l4) == false)
-    {
-      return TC_ACT_SHOT;
-    }
-
-    if (bpf_l3_csum_replace(skb,
-                            l3Offset + __builtin_offsetof(struct iphdr, check),
-                            oldDest4,
-                            newDest4,
-                            sizeof(__be32)) != 0 ||
-        bpf_skb_store_bytes(skb,
-                            l3Offset + __builtin_offsetof(struct iphdr, daddr),
-                            &newDest4,
-                            sizeof(newDest4),
-                            switchboardPacketRewriteStoreFlags()) != 0)
-    {
-      return TC_ACT_SHOT;
-    }
-
-    if ((proto == IPPROTO_TCP || l4.udpChecksumPresent) &&
-        replace_l4_checksum_word32_skb(skb,
-                                       l4.checksumOffset,
-                                       oldDest4,
-                                       newDest4,
-                                       BPF_F_PSEUDO_HDR) != 0)
-    {
-      return TC_ACT_SHOT;
-    }
-  }
-
-  data_end = (void *)(long)skb->data_end;
-  eth = (struct ethhdr *)(long)skb->data;
-  if ((void *)(eth + 1) > data_end)
-  {
-    return TC_ACT_SHOT;
-  }
-
-  null_mac_addresses(eth);
-  if (redirectContainerFragment(binding.container.value[4], true))
-  {
-    return setInstruction(TC_ACT_REDIRECT);
-  }
-
-  return TC_ACT_SHOT;
 }
 
 __attribute__((__always_inline__)) static inline int maybe_redirect_ipv4_portal_packet(struct __sk_buff *skb, struct ethhdr *eth, void *data_end, bool *handled)
@@ -737,12 +627,6 @@ __attribute__((__always_inline__)) static inline bool should_fast_pass_native_ho
       return false;
     }
 
-    struct switchboard_system_egress_nat_binding natBinding = {};
-    if (lookup_system_egress_nat_reply_binding_ipv4(eth, data_end, &natBinding))
-    {
-      return false;
-    }
-
     return true;
   }
 
@@ -797,13 +681,6 @@ int host_ingress(struct __sk_buff *skb)
   if ((void *)(eth + 1) > data_end)
   {
     return TC_ACT_SHOT;
-  }
-
-  bool handledSystemEgressNATReply = false;
-  int systemEgressNATReplyAction = maybe_redirect_system_egress_nat_reply(skb, eth, data_end, &handledSystemEgressNATReply);
-  if (handledSystemEgressNATReply)
-  {
-    return systemEgressNATReplyAction;
   }
 
   bool handledWhiteholeReply = false;

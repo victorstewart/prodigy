@@ -74,55 +74,6 @@ static void serialize(S&& serializer, MothershipProdigyClusterControl& control)
   serializer.text1b(control.path, UINT32_MAX);
 }
 
-class MothershipTunnelProviderEgress {
-public:
-
-  String host;
-  uint16_t port = 0;
-};
-
-template <typename S>
-static void serialize(S&& serializer, MothershipTunnelProviderEgress& egress)
-{
-  serializer.text1b(egress.host, UINT32_MAX);
-  serializer.value2b(egress.port);
-}
-
-class MothershipTunnelProviderDialConfig {
-public:
-
-  String endpoint;
-  String serverName;
-  String serverSpkiSha256;
-};
-
-template <typename S>
-static void serialize(S&& serializer, MothershipTunnelProviderDialConfig& config)
-{
-  serializer.text1b(config.endpoint, UINT32_MAX);
-  serializer.text1b(config.serverName, UINT32_MAX);
-  serializer.text1b(config.serverSpkiSha256, UINT32_MAX);
-}
-
-class MothershipTunnelProviderResources {
-public:
-
-  uint32_t nLogicalCores = 1;
-  uint32_t nMemoryMB = 128;
-  uint32_t nStorageMB = 128;
-};
-
-constexpr static uint32_t mothershipTunnelProviderMaxLogicalCores = 16;
-constexpr static uint32_t mothershipTunnelProviderMaxMemoryMB = 32 * 1024;
-constexpr static uint32_t mothershipTunnelProviderMaxStorageMB = 256 * 1024;
-
-static inline bool mothershipTunnelProviderResourcesInBounds(const MothershipTunnelProviderResources& resources)
-{
-  return resources.nLogicalCores > 0 && resources.nLogicalCores <= mothershipTunnelProviderMaxLogicalCores &&
-      resources.nMemoryMB > 0 && resources.nMemoryMB <= mothershipTunnelProviderMaxMemoryMB &&
-      resources.nStorageMB > 0 && resources.nStorageMB <= mothershipTunnelProviderMaxStorageMB;
-}
-
 static inline bool mothershipTunnelProviderEgressIPv4HostAddressIsDenied(uint32_t address)
 {
   return isRFC1918Private4(htonl(address)) ||
@@ -139,124 +90,56 @@ static inline bool mothershipTunnelProviderEgressIPv4HostAddressIsDenied(uint32_
       (address & 0xffffff00u) == 0xcb007100u;
 }
 
-static inline bool mothershipTunnelProviderEgressLiteralIsDenied(const String& host)
+static inline bool mothershipTunnelProviderEgressIPv4Literal(const String& host, uint32_t& address)
 {
   String ownedHost = {};
   ownedHost.assign(host);
-
   struct in_addr ipv4 = {};
-  if (inet_pton(AF_INET, ownedHost.c_str(), &ipv4) == 1)
+  if (inet_pton(AF_INET, ownedHost.c_str(), &ipv4) != 1)
   {
-    return mothershipTunnelProviderEgressIPv4HostAddressIsDenied(ntohl(ipv4.s_addr));
-  }
-
-  struct in6_addr ipv6 = {};
-  if (inet_pton(AF_INET6, ownedHost.c_str(), &ipv6) != 1)
-  {
+    address = 0;
     return false;
   }
-
-  const uint8_t *bytes = ipv6.s6_addr;
-  bool unspecified = true;
-  bool first10BytesZero = true;
-  bool first12BytesZero = true;
-  for (uint8_t index = 0; index < 16; ++index)
-  {
-    unspecified = unspecified && bytes[index] == 0;
-    first10BytesZero = first10BytesZero && (index >= 10 || bytes[index] == 0);
-    first12BytesZero = first12BytesZero && (index >= 12 || bytes[index] == 0);
-  }
-
-  if (first12BytesZero || (first10BytesZero && bytes[10] == 0xff && bytes[11] == 0xff))
-  {
-    uint32_t embeddedIPv4 =
-        (uint32_t(bytes[12]) << 24) |
-        (uint32_t(bytes[13]) << 16) |
-        (uint32_t(bytes[14]) << 8) |
-        uint32_t(bytes[15]);
-    if (mothershipTunnelProviderEgressIPv4HostAddressIsDenied(embeddedIPv4))
-    {
-      return true;
-    }
-  }
-
-  return unspecified ||
-      IN6_IS_ADDR_LOOPBACK(&ipv6) ||
-      IN6_IS_ADDR_MULTICAST(&ipv6) ||
-      (bytes[0] & 0xfe) == 0xfc ||
-      (bytes[0] == 0xfe && (bytes[1] & 0xc0) == 0x80) ||
-      (bytes[0] == 0x20 && bytes[1] == 0x01 && ((bytes[2] & 0xfe) == 0x00 || (bytes[2] == 0x0d && bytes[3] == 0xb8))) ||
-      (bytes[0] == 0x20 && bytes[1] == 0x02);
+  address = ntohl(ipv4.s_addr);
+  return true;
 }
 
-template <typename S>
-static void serialize(S&& serializer, MothershipTunnelProviderResources& resources)
-{
-  serializer.value4b(resources.nLogicalCores);
-  serializer.value4b(resources.nMemoryMB);
-  serializer.value4b(resources.nStorageMB);
-}
-
-class MothershipTunnelGatewayClientAuth {
-public:
-
-  uint64_t generation = 0;
-  uint128_t clusterUUID = 0;
+struct MothershipTunnelGatewayClientAuth {
   String rootCertPem;
   String clientCertPem;
   String clientKeyPem;
 
   bool configured(void) const
   {
-    return generation > 0 && clusterUUID != 0 && rootCertPem.size() > 0 && clientCertPem.size() > 0 && clientKeyPem.size() > 0;
+    return rootCertPem.size() > 0 && clientCertPem.size() > 0 && clientKeyPem.size() > 0;
   }
 };
 
 template <typename S>
 static void serialize(S&& serializer, MothershipTunnelGatewayClientAuth& auth)
 {
-  serializer.value8b(auth.generation);
-  serializer.value16b(auth.clusterUUID);
   serializer.text1b(auth.rootCertPem, UINT32_MAX);
   serializer.text1b(auth.clientCertPem, UINT32_MAX);
   serializer.text1b(auth.clientKeyPem, UINT32_MAX);
 }
 
-class MothershipTunnelGatewayAuth {
-public:
-
-  uint64_t generation = 0;
-  uint128_t clusterUUID = 0;
+struct MothershipTunnelGatewayAuth {
   String rootCertPem;
   String serverCertPem;
   String serverKeyPem;
-  String authorizedClientCertPem;
 
   bool configured(void) const
   {
-    return generation > 0 && clusterUUID != 0 && rootCertPem.size() > 0 && serverCertPem.size() > 0 && serverKeyPem.size() > 0 && authorizedClientCertPem.size() > 0;
+    return rootCertPem.size() > 0 && serverCertPem.size() > 0 && serverKeyPem.size() > 0;
   }
 };
 
 template <typename S>
 static void serialize(S&& serializer, MothershipTunnelGatewayAuth& auth)
 {
-  serializer.value8b(auth.generation);
-  serializer.value16b(auth.clusterUUID);
   serializer.text1b(auth.rootCertPem, UINT32_MAX);
   serializer.text1b(auth.serverCertPem, UINT32_MAX);
   serializer.text1b(auth.serverKeyPem, UINT32_MAX);
-  serializer.text1b(auth.authorizedClientCertPem, UINT32_MAX);
-}
-
-static inline bool mothershipTunnelGatewayAuthAuthorizesClient(const MothershipTunnelGatewayClientAuth& clientAuth, const MothershipTunnelGatewayAuth& gatewayAuth)
-{
-  return clientAuth.configured() &&
-      gatewayAuth.configured() &&
-      clientAuth.generation == gatewayAuth.generation &&
-      clientAuth.clusterUUID == gatewayAuth.clusterUUID &&
-      clientAuth.rootCertPem.equals(gatewayAuth.rootCertPem) &&
-      clientAuth.clientCertPem.equals(gatewayAuth.authorizedClientCertPem);
 }
 
 static inline bool mothershipTunnelGatewayLeafIssuedByRoot(X509 *rootCert, EVP_PKEY *rootPublicKey, X509 *leafCert)
@@ -325,13 +208,10 @@ static inline bool mothershipTunnelGatewayAuthMaterialValid(const MothershipTunn
   MothershipTunnelX509Ptr rootCert(VaultPem::x509FromPem(auth.rootCertPem), X509_free);
   MothershipTunnelX509Ptr serverCert(VaultPem::x509FromPem(auth.serverCertPem), X509_free);
   MothershipTunnelPKeyPtr serverKey(VaultPem::privateKeyFromPem(auth.serverKeyPem), EVP_PKEY_free);
-  MothershipTunnelX509Ptr clientCert(VaultPem::x509FromPem(auth.authorizedClientCertPem), X509_free);
   MothershipTunnelPKeyPtr rootPublicKey(rootCert ? X509_get_pubkey(rootCert.get()) : nullptr, EVP_PKEY_free);
   bool ok = auth.configured() &&
       rootCert != nullptr &&
-      mothershipTunnelGatewayLeafKeyMatches(rootCert.get(), rootPublicKey.get(), serverCert.get(), serverKey.get(), NID_server_auth) &&
-      mothershipTunnelGatewayLeafIssuedByRoot(rootCert.get(), rootPublicKey.get(), clientCert.get()) &&
-      mothershipTunnelGatewayLeafHasExtendedKeyUsage(clientCert.get(), NID_client_auth);
+      mothershipTunnelGatewayLeafKeyMatches(rootCert.get(), rootPublicKey.get(), serverCert.get(), serverKey.get(), NID_server_auth);
 
   if (ok == false)
   {
@@ -349,16 +229,8 @@ static inline bool mothershipTunnelGatewayAuthMaterialValid(const MothershipTunn
   return true;
 }
 
-static inline bool mothershipTunnelGatewayAuthorizeClientCertificate(const MothershipTunnelGatewayAuth& auth, const String& presentedClientCertPem, uint128_t clusterUUID, String *failure = nullptr)
+static inline bool mothershipTunnelGatewayAuthorizeClientCertificate(const MothershipTunnelGatewayAuth& auth, const String& presentedClientCertPem, String *failure = nullptr)
 {
-  if (clusterUUID == 0 || auth.clusterUUID != clusterUUID)
-  {
-    if (failure)
-    {
-      failure->assign("mothership tunnel gateway auth clusterUUID mismatch"_ctv);
-    }
-    return false;
-  }
   if (mothershipTunnelGatewayAuthMaterialValid(auth, failure) == false)
   {
     return false;
@@ -374,14 +246,6 @@ static inline bool mothershipTunnelGatewayAuthorizeClientCertificate(const Mothe
     if (failure)
     {
       failure->assign("mothership tunnel gateway client certificate invalid"_ctv);
-    }
-    return false;
-  }
-  if (presentedClientCertPem.equals(auth.authorizedClientCertPem) == false)
-  {
-    if (failure)
-    {
-      failure->assign("mothership tunnel gateway client certificate unauthorized"_ctv);
     }
     return false;
   }
@@ -457,22 +321,12 @@ static inline bool mothershipIssueTunnelGatewayLeaf(
 }
 
 static inline bool mothershipGenerateTunnelGatewayAuth(
-    uint128_t clusterUUID,
-    uint64_t generation,
     MothershipTunnelGatewayClientAuth& clientAuth,
     MothershipTunnelGatewayAuth& gatewayAuth,
     String *failure = nullptr)
 {
   clientAuth = {};
   gatewayAuth = {};
-  if (clusterUUID == 0 || generation == 0)
-  {
-    if (failure)
-    {
-      failure->assign("mothership tunnel gateway auth clusterUUID and generation required"_ctv);
-    }
-    return false;
-  }
 
   Vault::TransportCertificateOptions options = {};
   options.subjectOrganization = "Prodigy Mothership Tunnel"_ctv;
@@ -483,11 +337,7 @@ static inline bool mothershipGenerateTunnelGatewayAuth(
     return false;
   }
 
-  clientAuth.generation = generation;
-  clientAuth.clusterUUID = clusterUUID;
   clientAuth.rootCertPem = gatewayAuth.rootCertPem;
-  gatewayAuth.generation = generation;
-  gatewayAuth.clusterUUID = clusterUUID;
 
   if (mothershipIssueTunnelGatewayLeaf(gatewayAuth.rootCertPem, rootKeyPem, Random::generateNumberWithNBits<128, uint128_t>(), false, true, clientAuth.clientCertPem, clientAuth.clientKeyPem, failure) == false ||
       mothershipIssueTunnelGatewayLeaf(gatewayAuth.rootCertPem, rootKeyPem, Random::generateNumberWithNBits<128, uint128_t>(), true, false, gatewayAuth.serverCertPem, gatewayAuth.serverKeyPem, failure) == false)
@@ -499,7 +349,6 @@ static inline bool mothershipGenerateTunnelGatewayAuth(
   }
   Vault::secureClearString(rootKeyPem);
 
-  gatewayAuth.authorizedClientCertPem = clientAuth.clientCertPem;
   if (failure)
   {
     failure->clear();
@@ -507,17 +356,12 @@ static inline bool mothershipGenerateTunnelGatewayAuth(
   return true;
 }
 
-class MothershipTunnelProviderSpec {
-public:
-
-  SystemContainerKind containerKind = SystemContainerKind::mothershipTunnelProvider;
+struct MothershipTunnelProviderSpec {
   String artifactSha256;
   uint64_t artifactBytes = 0;
-  uint32_t artifactContractVersion = prodigyDiscombobulatorMothershipTunnelProviderContractVersion;
-  MothershipTunnelProviderDialConfig dial;
-  MothershipTunnelProviderEgress egress;
-  MothershipTunnelProviderResources resources;
-  bool allowEmergencySshFallback = false;
+  String dialEndpoint;
+  String egressHost;
+  uint16_t egressPort = 0;
   MothershipTunnelGatewayClientAuth clientAuth;
 
   // Create-time inputs only. These fields are intentionally omitted from
@@ -529,20 +373,15 @@ public:
 template <typename S>
 static void serialize(S&& serializer, MothershipTunnelProviderSpec& spec)
 {
-  serializer.value1b(spec.containerKind);
   serializer.text1b(spec.artifactSha256, 64);
   serializer.value8b(spec.artifactBytes);
-  serializer.value4b(spec.artifactContractVersion);
-  serializer.object(spec.dial);
-  serializer.object(spec.egress);
-  serializer.object(spec.resources);
-  serializer.value1b(spec.allowEmergencySshFallback);
+  serializer.text1b(spec.dialEndpoint, UINT32_MAX);
+  serializer.text1b(spec.egressHost, UINT32_MAX);
+  serializer.value2b(spec.egressPort);
   serializer.object(spec.clientAuth);
 }
 
-class MothershipConnectivity {
-public:
-
+struct MothershipConnectivity {
   MothershipConnectivityKind kind = MothershipConnectivityKind::ssh;
   MothershipTunnelProviderSpec tunnelProvider;
 };
@@ -560,35 +399,14 @@ constexpr static auto mothershipTunnelProviderContainerKindValue = "mothershipTu
 constexpr static auto mothershipTunnelProviderMothershipSocketPath = "/run/prodigy/mothership.sock"_ctv;
 constexpr static auto mothershipTunnelProviderHostGatewaySocketPath = "/run/prodigy/mothership-tunnel-gateway.sock"_ctv;
 
-class MothershipTunnelProviderRuntimeState {
-public:
-
-  uint64_t generation = 0;
-  uint128_t masterBrainUUID = 0;
+struct MothershipTunnelProviderRuntimeState {
   uint128_t localContainerUUID = 0;
-  String artifactSha256;
-  String specSha256;
-  bool running = false;
-  bool healthy = false;
   String lastFailure;
 };
 
-template <typename S>
-static void serialize(S&& serializer, MothershipTunnelProviderRuntimeState& state)
-{
-  serializer.value8b(state.generation);
-  serializer.value16b(state.masterBrainUUID);
-  serializer.value16b(state.localContainerUUID);
-  serializer.text1b(state.artifactSha256, 64);
-  serializer.text1b(state.specSha256, 64);
-  serializer.value1b(state.running);
-  serializer.value1b(state.healthy);
-  serializer.text1b(state.lastFailure, UINT32_MAX);
-}
-
 static inline bool mothershipTunnelProviderSpecValid(const MothershipTunnelProviderSpec& spec, String *failure = nullptr)
 {
-  if (spec.containerKind != SystemContainerKind::mothershipTunnelProvider || prodigyIsSHA256HexDigest(spec.artifactSha256) == false || spec.artifactBytes == 0 || spec.artifactContractVersion != prodigyDiscombobulatorMothershipTunnelProviderContractVersion)
+  if (prodigyIsSHA256HexDigest(spec.artifactSha256) == false || spec.artifactBytes == 0)
   {
     if (failure)
     {
@@ -597,7 +415,7 @@ static inline bool mothershipTunnelProviderSpecValid(const MothershipTunnelProvi
     return false;
   }
 
-  if (spec.dial.endpoint.size() == 0 || (spec.dial.serverSpkiSha256.size() > 0 && prodigyIsSHA256HexDigest(spec.dial.serverSpkiSha256) == false))
+  if (spec.dialEndpoint.size() == 0)
   {
     if (failure)
     {
@@ -606,7 +424,7 @@ static inline bool mothershipTunnelProviderSpecValid(const MothershipTunnelProvi
     return false;
   }
 
-  if (spec.egress.host.size() == 0 || spec.egress.port == 0)
+  if (spec.egressHost.size() == 0 || spec.egressPort == 0)
   {
     if (failure)
     {
@@ -614,20 +432,20 @@ static inline bool mothershipTunnelProviderSpecValid(const MothershipTunnelProvi
     }
     return false;
   }
-  if (mothershipTunnelProviderEgressLiteralIsDenied(spec.egress.host))
+  uint32_t egressAddress = 0;
+  if (mothershipTunnelProviderEgressIPv4Literal(spec.egressHost, egressAddress) == false)
+  {
+    if (failure)
+    {
+      failure->assign("mothership tunnel-provider egress literal invalid"_ctv);
+    }
+    return false;
+  }
+  if (mothershipTunnelProviderEgressIPv4HostAddressIsDenied(egressAddress))
   {
     if (failure)
     {
       failure->assign("mothership tunnel-provider egress literal denied"_ctv);
-    }
-    return false;
-  }
-
-  if (mothershipTunnelProviderResourcesInBounds(spec.resources) == false)
-  {
-    if (failure)
-    {
-      failure->assign("mothership tunnel-provider resources invalid"_ctv);
     }
     return false;
   }
@@ -647,7 +465,6 @@ static inline void mothershipStripMothershipOnlyConnectivityFields(MothershipCon
     return;
   }
 
-  config.tunnelProvider.allowEmergencySshFallback = false;
   config.tunnelProvider.clientAuth = {};
   config.tunnelProvider.providerContainerBlobPath.clear();
   config.tunnelProvider.gatewayAuth = {};
@@ -673,7 +490,7 @@ static inline bool mothershipConnectivityRuntimeConfigValid(const MothershipConn
     return false;
   }
 
-  if (config.tunnelProvider.allowEmergencySshFallback || config.tunnelProvider.clientAuth.configured() || config.tunnelProvider.providerContainerBlobPath.size() > 0 || config.tunnelProvider.gatewayAuth.configured())
+  if (config.tunnelProvider.clientAuth.configured() || config.tunnelProvider.providerContainerBlobPath.size() > 0 || config.tunnelProvider.gatewayAuth.configured())
   {
     if (failure)
     {

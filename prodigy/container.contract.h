@@ -26,23 +26,6 @@ static inline String prodigyContainerErrnoString(int err)
 constexpr static uint32_t prodigyDiscombobulatorAppContractVersion = 1;
 constexpr static uint32_t prodigyDiscombobulatorMothershipTunnelProviderContractVersion = 1;
 
-static inline const char *prodigySystemContainerKindName(SystemContainerKind kind)
-{
-  switch (kind)
-  {
-    case SystemContainerKind::none:
-      {
-        return "none";
-      }
-    case SystemContainerKind::mothershipTunnelProvider:
-      {
-        return "mothership-tunnel-provider";
-      }
-  }
-
-  return "unknown";
-}
-
 static inline String prodigyDiscombobulatorBlobHeaderText(void)
 {
   String text = {};

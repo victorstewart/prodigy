@@ -12685,28 +12685,27 @@ public:
     return true;
   }
 
-  virtual bool storeSystemContainerArtifact(SystemContainerKind kind, const String& sha256, uint64_t bytes, const String& blob, String *failure = nullptr)
+  virtual bool storeSystemContainerArtifact(const String& sha256, uint64_t bytes, const String& blob, String *failure = nullptr)
   {
-    return ContainerStore::systemStore(kind, sha256, bytes, blob, nullptr, nullptr, failure);
+    return ContainerStore::systemStore(sha256, bytes, blob, nullptr, nullptr, failure);
   }
 
-  virtual bool systemContainerArtifactPresent(SystemContainerKind kind, const String& sha256, uint64_t bytes)
+  virtual bool systemContainerArtifactPresent(const String& sha256, uint64_t bytes)
   {
     String failure = {};
-    return ContainerStore::systemVerify(kind, sha256, bytes, nullptr, nullptr, &failure);
+    return ContainerStore::systemVerify(sha256, bytes, nullptr, nullptr, &failure);
   }
 
-  virtual bool loadSystemContainerArtifact(SystemContainerKind kind, const String& sha256, uint64_t bytes, String& blob, String *failure = nullptr)
+  virtual bool loadSystemContainerArtifact(const String& sha256, uint64_t bytes, String& blob, String *failure = nullptr)
   {
-    return ContainerStore::systemLoadVerified(kind, sha256, bytes, blob, failure);
+    return ContainerStore::systemLoadVerified(sha256, bytes, blob, failure);
   }
 
-  virtual bool startMothershipTunnelProviderRuntime(const MothershipTunnelProviderSpec& spec, const MothershipTunnelGatewayAuth& gatewayAuth, const String& artifactBlob, uint64_t generation, uint128_t& containerUUID, String *failure = nullptr)
+  virtual bool startMothershipTunnelProviderRuntime(const MothershipTunnelProviderSpec& spec, const MothershipTunnelGatewayAuth& gatewayAuth, const String& artifactBlob, uint128_t& containerUUID, String *failure = nullptr)
   {
     (void)spec;
     (void)gatewayAuth;
     (void)artifactBlob;
-    (void)generation;
     containerUUID = 0;
     if (failure)
     {
@@ -12720,16 +12719,22 @@ public:
     (void)containerUUID;
   }
 
-  void noteMothershipTunnelProviderControlSession(bool authenticated, bool openedControlSocket, uint64_t clientToControlBytes, uint64_t controlToClientBytes)
+  void stopMothershipTunnelProviderLocalInstance(void)
+  {
+    if (mothershipTunnelProviderRuntimeState.localContainerUUID != 0)
+    {
+      stopMothershipTunnelProviderRuntime(mothershipTunnelProviderRuntimeState.localContainerUUID);
+    }
+    mothershipTunnelProviderRuntimeState.localContainerUUID = 0;
+  }
+
+  void noteMothershipTunnelProviderControlSession(bool authenticated, bool openedControlSocket)
   {
     if (mothershipConnectivity.kind == MothershipConnectivityKind::tunnelProvider &&
-        mothershipTunnelProviderRuntimeState.running &&
+        mothershipTunnelProviderRuntimeState.localContainerUUID != 0 &&
         authenticated &&
-        openedControlSocket &&
-        clientToControlBytes > 0 &&
-        controlToClientBytes > 0)
+        openedControlSocket)
     {
-      mothershipTunnelProviderRuntimeState.healthy = true;
       mothershipTunnelProviderRuntimeState.lastFailure.clear();
     }
   }
@@ -12742,7 +12747,6 @@ public:
       return false;
     }
 
-    mothershipTunnelProviderRuntimeState.healthy = false;
     if (restarted)
     {
       mothershipTunnelProviderRuntimeState.lastFailure.assign("mothership tunnel provider restarted: "_ctv);
@@ -12761,7 +12765,6 @@ public:
     }
     if (restarted == false)
     {
-      mothershipTunnelProviderRuntimeState.running = false;
       mothershipTunnelProviderRuntimeState.localContainerUUID = 0;
       stopMothershipTunnelProviderRuntime(containerUUID);
     }
@@ -12777,7 +12780,6 @@ public:
     if (weAreMaster && neuron != nullptr && neuron->machine != nullptr)
     {
       bool currentLocal = mothershipConnectivity.kind == MothershipConnectivityKind::tunnelProvider &&
-                          mothershipTunnelProviderRuntimeState.running &&
                           plan.uuid == mothershipTunnelProviderRuntimeState.localContainerUUID;
       if (currentLocal == false)
       {
@@ -12787,17 +12789,17 @@ public:
     return true;
   }
 
-  bool applySystemContainerArtifact(SystemContainerKind kind, const String& sha256, uint64_t bytes, const String& blob, bool replicateToPeers, String *failure = nullptr)
+  bool applySystemContainerArtifact(const String& sha256, uint64_t bytes, const String& blob, bool replicateToPeers, String *failure = nullptr)
   {
-    bool alreadyStored = systemContainerArtifactPresent(kind, sha256, bytes);
-    if (alreadyStored == false && storeSystemContainerArtifact(kind, sha256, bytes, blob, failure) == false)
+    bool alreadyStored = systemContainerArtifactPresent(sha256, bytes);
+    if (alreadyStored == false && storeSystemContainerArtifact(sha256, bytes, blob, failure) == false)
     {
       return false;
     }
 
     if (replicateToPeers && alreadyStored == false)
     {
-      queueBrainSystemContainerArtifactReplication(kind, sha256, bytes, blob);
+      queueBrainSystemContainerArtifactReplication(sha256, bytes, blob);
     }
     reconcileMothershipTunnelProviderRuntimeState();
 
@@ -12812,58 +12814,20 @@ public:
   {
     if (mothershipConnectivity.kind != MothershipConnectivityKind::tunnelProvider)
     {
-      if (mothershipTunnelProviderRuntimeState.running || mothershipTunnelProviderRuntimeState.localContainerUUID != 0)
-      {
-        stopMothershipTunnelProviderRuntime(mothershipTunnelProviderRuntimeState.localContainerUUID);
-      }
+      stopMothershipTunnelProviderLocalInstance();
       mothershipTunnelProviderRuntimeState = {};
       return;
     }
 
     const MothershipTunnelProviderSpec& spec = mothershipConnectivity.tunnelProvider;
     MothershipTunnelProviderRuntimeState& state = mothershipTunnelProviderRuntimeState;
-    auto stopLocalInstance = [&]() -> void {
-      if (state.running || state.localContainerUUID != 0)
-      {
-        stopMothershipTunnelProviderRuntime(state.localContainerUUID);
-      }
-      state.running = false;
-      state.healthy = false;
-      state.localContainerUUID = 0;
-    };
     auto failStopped = [&](auto&& failureText) -> void {
-      stopLocalInstance();
+      stopMothershipTunnelProviderLocalInstance();
       state.lastFailure.assign(failureText);
     };
 
-    String serializedSpec = {};
-    String specSha256 = {};
-    BitseryEngine::serialize(serializedSpec, spec);
-    if (prodigyComputeSHA256Hex(serializedSpec, specSha256) == false)
-    {
-      failStopped("tunnel provider spec fingerprint failed"_ctv);
-      return;
-    }
-
-    if (state.specSha256.equals(specSha256) == false)
-    {
-      stopLocalInstance();
-      if (state.generation < UINT64_MAX)
-      {
-        state.generation += 1;
-      }
-      state.specSha256.assign(specSha256);
-      state.artifactSha256.assign(spec.artifactSha256);
-      state.lastFailure.clear();
-    }
-
-    state.masterBrainUUID = selfBrainUUID();
     if (isActiveMaster() == false)
     {
-      if (BrainView *masterPeer = currentMasterPeer(); masterPeer != nullptr && masterPeer->uuid != 0)
-      {
-        state.masterBrainUUID = masterPeer->uuid;
-      }
       failStopped("not active master"_ctv);
       return;
     }
@@ -12874,7 +12838,7 @@ public:
       return;
     }
 
-    if (systemContainerArtifactPresent(spec.containerKind, spec.artifactSha256, spec.artifactBytes) == false)
+    if (systemContainerArtifactPresent(spec.artifactSha256, spec.artifactBytes) == false)
     {
       failStopped("tunnel provider artifact missing from system store"_ctv);
       return;
@@ -12882,7 +12846,7 @@ public:
 
     String artifactBlob = {};
     String artifactFailure = {};
-    if (loadSystemContainerArtifact(spec.containerKind, spec.artifactSha256, spec.artifactBytes, artifactBlob, &artifactFailure) == false)
+    if (loadSystemContainerArtifact(spec.artifactSha256, spec.artifactBytes, artifactBlob, &artifactFailure) == false)
     {
       if (artifactFailure.size() == 0)
       {
@@ -12899,29 +12863,20 @@ public:
       return;
     }
 
-    if (state.running == false &&
-        state.localContainerUUID == 0 &&
+    if (state.localContainerUUID == 0 &&
         state.lastFailure.size() >= mothershipTunnelProviderTerminalFailurePrefix.size() &&
         memcmp(state.lastFailure.data(), mothershipTunnelProviderTerminalFailurePrefix.data(), mothershipTunnelProviderTerminalFailurePrefix.size()) == 0)
     {
       return;
     }
 
-    if (state.running && state.localContainerUUID != 0)
+    if (state.localContainerUUID != 0)
     {
-      if (state.healthy)
-      {
-        state.lastFailure.clear();
-      }
-      else if (state.lastFailure.size() == 0)
-      {
-        state.lastFailure.assign(mothershipTunnelProviderPendingHealth);
-      }
       return;
     }
 
     uint128_t containerUUID = 0;
-    if (startMothershipTunnelProviderRuntime(spec, mothershipTunnelGatewayAuth, artifactBlob, state.generation, containerUUID, &launchFailure) == false)
+    if (startMothershipTunnelProviderRuntime(spec, mothershipTunnelGatewayAuth, artifactBlob, containerUUID, &launchFailure) == false)
     {
       if (launchFailure.size() == 0)
       {
@@ -12936,8 +12891,6 @@ public:
       return;
     }
 
-    state.running = true;
-    state.healthy = false;
     state.localContainerUUID = containerUUID;
     state.lastFailure.assign(mothershipTunnelProviderPendingHealth);
   }
@@ -12951,10 +12904,23 @@ public:
       return false;
     }
 
+    String currentSerialized = {};
+    String nextSerialized = {};
+    BitseryEngine::serialize(currentSerialized, mothershipConnectivity);
+    BitseryEngine::serialize(nextSerialized, owned);
+    bool configChanged = currentSerialized.equals(nextSerialized) == false;
+    Vault::secureClearString(currentSerialized);
+    Vault::secureClearString(nextSerialized);
+
     mothershipConnectivity = std::move(owned);
     if (persistMothershipConnectivityRuntimeConfig(mothershipConnectivity, failure) == false)
     {
       return false;
+    }
+    if (configChanged)
+    {
+      stopMothershipTunnelProviderLocalInstance();
+      mothershipTunnelProviderRuntimeState.lastFailure.clear();
     }
     reconcileMothershipTunnelProviderRuntimeState();
 
@@ -12979,15 +12945,6 @@ public:
       if (failure)
       {
         failure->assign("mothership tunnel gateway auth incomplete"_ctv);
-      }
-      return false;
-    }
-
-    if (brainConfig.clusterUUID == 0 || incoming.clusterUUID != brainConfig.clusterUUID)
-    {
-      if (failure)
-      {
-        failure->assign("mothership tunnel gateway auth clusterUUID mismatch"_ctv);
       }
       return false;
     }
@@ -18993,21 +18950,18 @@ public:
         }
       case BrainTopic::replicateSystemContainerArtifact:
         {
-          SystemContainerKind kind = SystemContainerKind::none;
           String sha256;
           uint64_t bytes = 0;
           String blob;
-          Message::extractArg<ArgumentNature::fixed>(args, kind);
           Message::extractToStringView(args, sha256);
           Message::extractArg<ArgumentNature::fixed>(args, bytes);
           Message::extractToStringView(args, blob);
 
           String storeFailure = {};
-          if (applySystemContainerArtifact(kind, sha256, bytes, blob, false, &storeFailure) == false)
+          if (applySystemContainerArtifact(sha256, bytes, blob, false, &storeFailure) == false)
           {
             basics_log(
-                "replicateSystemContainerArtifact store failed kind=%s sha256=%s bytes=%llu reason=%s\n",
-                prodigySystemContainerKindName(kind),
+                "replicateSystemContainerArtifact store failed sha256=%s bytes=%llu reason=%s\n",
                 sha256.c_str(),
                 (unsigned long long)bytes,
                 (storeFailure.size() > 0 ? storeFailure.c_str() : "unknown"));
@@ -21722,17 +21676,15 @@ public:
         }
       case MothershipTopic::configureSystemContainerArtifact:
         {
-          SystemContainerKind kind = SystemContainerKind::none;
           String sha256;
           uint64_t bytes = 0;
           String blob;
-          Message::extractArg<ArgumentNature::fixed>(args, kind);
           Message::extractToStringView(args, sha256);
           Message::extractArg<ArgumentNature::fixed>(args, bytes);
           Message::extractToStringView(args, blob);
 
           MothershipResponse response = {};
-          response.success = applySystemContainerArtifact(kind, sha256, bytes, blob, true, &response.failure);
+          response.success = applySystemContainerArtifact(sha256, bytes, blob, true, &response.failure);
 
           String serializedResponse;
           BitseryEngine::serialize(serializedResponse, response);
@@ -22425,9 +22377,6 @@ public:
           if (mothershipConnectivity.kind == MothershipConnectivityKind::tunnelProvider)
           {
             reconcileMothershipTunnelProviderRuntimeState();
-            report.mothershipConnectivity.runningOnMaster = mothershipTunnelProviderRuntimeState.running;
-            report.mothershipConnectivity.healthy = mothershipTunnelProviderRuntimeState.healthy;
-            report.mothershipConnectivity.generation = mothershipTunnelProviderRuntimeState.generation;
             report.mothershipConnectivity.lastFailure.assign(mothershipTunnelProviderRuntimeState.lastFailure);
           }
           int64_t nowMs = Time::now<TimeResolution::ms>();

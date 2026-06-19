@@ -11,7 +11,6 @@
 #include <fcntl.h>
 #include <libssh2.h>
 #include <linux/capability.h>
-#include <netdb.h>
 #include <openssl/ssl.h>
 #include <simdjson.h>
 #include <signal.h>
@@ -226,32 +225,17 @@ static bool mothershipParseEndpointHostPort(const String& endpoint, String& host
   String endpointText = {};
   endpointText.assign(endpoint);
   const char *text = endpointText.c_str();
-  const char *portText = nullptr;
-  if (text[0] == '[')
+  const char *colon = std::strrchr(text, ':');
+  if (colon == nullptr || colon == text || colon[1] == '\0' || std::strchr(text, ':') != colon)
   {
-    const char *end = std::strchr(text, ']');
-    if (end == nullptr || end == text + 1 || end[1] != ':')
-    {
-      return fail("endpoint must be [host]:port or host:port"_ctv);
-    }
-    host.append(text + 1, uint32_t(end - text - 1));
-    portText = end + 2;
+    return fail("endpoint must be host:port"_ctv);
   }
-  else
-  {
-    const char *colon = std::strrchr(text, ':');
-    if (colon == nullptr || colon == text || colon[1] == '\0' || std::strchr(text, ':') != colon)
-    {
-      return fail("endpoint must be [host]:port or host:port"_ctv);
-    }
-    host.append(text, uint32_t(colon - text));
-    portText = colon + 1;
-  }
+  host.append(text, uint32_t(colon - text));
 
   char *endPort = nullptr;
   errno = 0;
-  unsigned long parsedPort = std::strtoul(portText, &endPort, 10);
-  if (endPort == portText || *endPort != '\0' || errno != 0 || parsedPort == 0 || parsedPort > UINT16_MAX)
+  unsigned long parsedPort = std::strtoul(colon + 1, &endPort, 10);
+  if (endPort == colon + 1 || *endPort != '\0' || errno != 0 || parsedPort == 0 || parsedPort > UINT16_MAX)
   {
     host.clear();
     return fail("endpoint port invalid"_ctv);
@@ -265,44 +249,15 @@ static bool mothershipParseEndpointHostPort(const String& endpoint, String& host
   return true;
 }
 
-static bool mothershipComputeCertificateSPKISHA256Hex(X509 *cert, String& digest, String *failure = nullptr)
-{
-  digest.clear();
-  const X509_PUBKEY *spki = cert == nullptr ? nullptr : X509_get_X509_PUBKEY(cert);
-  int derSize = spki == nullptr ? -1 : i2d_X509_PUBKEY(spki, nullptr);
-  if (derSize <= 0)
-  {
-    if (failure)
-    {
-      failure->assign("failed to encode certificate spki"_ctv);
-    }
-    return false;
-  }
-
-  unsigned char *der = static_cast<unsigned char *>(OPENSSL_malloc(size_t(derSize)));
-  unsigned char *cursor = der;
-  bool ok = der != nullptr && i2d_X509_PUBKEY(spki, &cursor) == derSize &&
-      prodigyComputeSHA256Hex(der, uint64_t(derSize), digest, failure);
-  if (der != nullptr)
-  {
-    OPENSSL_free(der);
-  }
-  if (ok == false && failure && failure->size() == 0)
-  {
-    failure->assign("failed to hash certificate spki"_ctv);
-  }
-  return ok;
-}
-
 static bool parseExternalAddressTransport(const String& value, ExternalAddressTransport& transport)
 {
-  if (value.equal("tcp"_ctv) || value.equal("TCP"_ctv) || value.equal("ExternalAddressTransport::tcp"_ctv))
+  if (value.equal("tcp"_ctv) || value.equal("TCP"_ctv))
   {
     transport = ExternalAddressTransport::tcp;
     return true;
   }
 
-  if (value.equal("quic"_ctv) || value.equal("QUIC"_ctv) || value.equal("ExternalAddressTransport::quic"_ctv))
+  if (value.equal("quic"_ctv) || value.equal("QUIC"_ctv))
   {
     transport = ExternalAddressTransport::quic;
     return true;
@@ -313,13 +268,13 @@ static bool parseExternalAddressTransport(const String& value, ExternalAddressTr
 
 static bool parseExternalAddressFamily(const String& value, ExternalAddressFamily& family)
 {
-  if (value.equal("ipv4"_ctv) || value.equal("IPv4"_ctv) || value.equal("ExternalAddressFamily::ipv4"_ctv))
+  if (value.equal("ipv4"_ctv) || value.equal("IPv4"_ctv))
   {
     family = ExternalAddressFamily::ipv4;
     return true;
   }
 
-  if (value.equal("ipv6"_ctv) || value.equal("IPv6"_ctv) || value.equal("ExternalAddressFamily::ipv6"_ctv))
+  if (value.equal("ipv6"_ctv) || value.equal("IPv6"_ctv))
   {
     family = ExternalAddressFamily::ipv6;
     return true;
@@ -330,19 +285,19 @@ static bool parseExternalAddressFamily(const String& value, ExternalAddressFamil
 
 static bool parseExternalAddressSource(const String& value, ExternalAddressSource& source)
 {
-  if (value.equal("distributableSubnet"_ctv) || value.equal("distributedSubnet"_ctv) || value.equal("ExternalAddressSource::distributableSubnet"_ctv))
+  if (value.equal("distributableSubnet"_ctv) || value.equal("distributedSubnet"_ctv))
   {
     source = ExternalAddressSource::distributableSubnet;
     return true;
   }
 
-  if (value.equal("hostPublicAddress"_ctv) || value.equal("ExternalAddressSource::hostPublicAddress"_ctv))
+  if (value.equal("hostPublicAddress"_ctv))
   {
     source = ExternalAddressSource::hostPublicAddress;
     return true;
   }
 
-  if (value.equal("registeredRoutablePrefix"_ctv) || value.equal("ExternalAddressSource::registeredRoutablePrefix"_ctv))
+  if (value.equal("registeredRoutablePrefix"_ctv))
   {
     source = ExternalAddressSource::registeredRoutablePrefix;
     return true;
@@ -353,13 +308,13 @@ static bool parseExternalAddressSource(const String& value, ExternalAddressSourc
 
 static bool parseExternalSubnetRouting(const String& value, ExternalSubnetRouting& routing)
 {
-  if (value.equal("BGP"_ctv) || value.equal("switchboardBGP"_ctv) || value.equal("bgp"_ctv) || value.equal("ExternalSubnetRouting::switchboardBGP"_ctv))
+  if (value.equal("BGP"_ctv) || value.equal("switchboardBGP"_ctv) || value.equal("bgp"_ctv))
   {
     routing = ExternalSubnetRouting::switchboardBGP;
     return true;
   }
 
-  if (value.equal("switchboardPinnedRoute"_ctv) || value.equal("pinnedRoute"_ctv) || value.equal("ExternalSubnetRouting::switchboardPinnedRoute"_ctv))
+  if (value.equal("switchboardPinnedRoute"_ctv) || value.equal("pinnedRoute"_ctv))
   {
     routing = ExternalSubnetRouting::switchboardPinnedRoute;
     return true;
@@ -370,19 +325,19 @@ static bool parseExternalSubnetRouting(const String& value, ExternalSubnetRoutin
 
 static bool parseExternalSubnetUsage(const String& value, ExternalSubnetUsage& usage)
 {
-  if (value.equal("wormholes"_ctv) || value.equal("ExternalSubnetUsage::wormholes"_ctv))
+  if (value.equal("wormholes"_ctv))
   {
     usage = ExternalSubnetUsage::wormholes;
     return true;
   }
 
-  if (value.equal("whiteholes"_ctv) || value.equal("ExternalSubnetUsage::whiteholes"_ctv))
+  if (value.equal("whiteholes"_ctv))
   {
     usage = ExternalSubnetUsage::whiteholes;
     return true;
   }
 
-  if (value.equal("both"_ctv) || value.equal("ExternalSubnetUsage::both"_ctv))
+  if (value.equal("both"_ctv))
   {
     usage = ExternalSubnetUsage::both;
     return true;
@@ -393,13 +348,13 @@ static bool parseExternalSubnetUsage(const String& value, ExternalSubnetUsage& u
 
 static bool parseRoutableIngressScope(const String& value, RoutableIngressScope& scope)
 {
-  if (value.equal("switchboardFleet"_ctv) || value.equal("RoutableIngressScope::switchboardFleet"_ctv))
+  if (value.equal("switchboardFleet"_ctv))
   {
     scope = RoutableIngressScope::switchboardFleet;
     return true;
   }
 
-  if (value.equal("singleMachine"_ctv) || value.equal("RoutableIngressScope::singleMachine"_ctv))
+  if (value.equal("singleMachine"_ctv))
   {
     scope = RoutableIngressScope::singleMachine;
     return true;
@@ -410,13 +365,13 @@ static bool parseRoutableIngressScope(const String& value, RoutableIngressScope&
 
 static bool parseRoutablePrefixKind(const String& value, RoutablePrefixKind& kind)
 {
-  if (value.equal("BGP"_ctv) || value.equal("RoutablePrefixKind::BGP"_ctv))
+  if (value.equal("BGP"_ctv))
   {
     kind = RoutablePrefixKind::BGP;
     return true;
   }
 
-  if (value.equal("elastic"_ctv) || value.equal("RoutablePrefixKind::elastic"_ctv))
+  if (value.equal("elastic"_ctv))
   {
     kind = RoutablePrefixKind::elastic;
     return true;
@@ -427,19 +382,19 @@ static bool parseRoutablePrefixKind(const String& value, RoutablePrefixKind& kin
 
 static bool parseElasticPrefixIntent(const String& value, ElasticPrefixIntent& intent)
 {
-  if (value.equal("any"_ctv) || value.equal("ElasticPrefixIntent::any"_ctv))
+  if (value.equal("any"_ctv))
   {
     intent = ElasticPrefixIntent::any;
     return true;
   }
 
-  if (value.equal("create"_ctv) || value.equal("ElasticPrefixIntent::create"_ctv))
+  if (value.equal("create"_ctv))
   {
     intent = ElasticPrefixIntent::create;
     return true;
   }
 
-  if (value.equal("anyOrCreate"_ctv) || value.equal("ElasticPrefixIntent::anyOrCreate"_ctv))
+  if (value.equal("anyOrCreate"_ctv))
   {
     intent = ElasticPrefixIntent::anyOrCreate;
     return true;
@@ -577,19 +532,19 @@ static const char *routableResourceLeaseKindName(RoutableResourceLeaseKind kind)
 
 static bool parseMothershipClusterDeploymentMode(const String& value, MothershipClusterDeploymentMode& mode)
 {
-  if (value.equal("local"_ctv) || value.equal("MothershipClusterDeploymentMode::local"_ctv))
+  if (value.equal("local"_ctv))
   {
     mode = MothershipClusterDeploymentMode::local;
     return true;
   }
 
-  if (value.equal("remote"_ctv) || value.equal("MothershipClusterDeploymentMode::remote"_ctv))
+  if (value.equal("remote"_ctv))
   {
     mode = MothershipClusterDeploymentMode::remote;
     return true;
   }
 
-  if (value.equal("test"_ctv) || value.equal("MothershipClusterDeploymentMode::test"_ctv))
+  if (value.equal("test"_ctv))
   {
     mode = MothershipClusterDeploymentMode::test;
     return true;
@@ -600,7 +555,7 @@ static bool parseMothershipClusterDeploymentMode(const String& value, Mothership
 
 static bool parseMothershipClusterControlKind(const String& value, MothershipClusterControlKind& kind)
 {
-  if (value.equal("unixSocket"_ctv) || value.equal("unix"_ctv) || value.equal("MothershipClusterControlKind::unixSocket"_ctv))
+  if (value.equal("unixSocket"_ctv) || value.equal("unix"_ctv))
   {
     kind = MothershipClusterControlKind::unixSocket;
     return true;
@@ -609,32 +564,15 @@ static bool parseMothershipClusterControlKind(const String& value, MothershipClu
   return false;
 }
 
-static bool parseMothershipConnectivityKind(const String& value, MothershipConnectivityKind& kind)
-{
-  if (value.equal("ssh"_ctv) || value.equal("MothershipConnectivityKind::ssh"_ctv))
-  {
-    kind = MothershipConnectivityKind::ssh;
-    return true;
-  }
-
-  if (value.equal("tunnelProvider"_ctv) || value.equal("MothershipConnectivityKind::tunnelProvider"_ctv))
-  {
-    kind = MothershipConnectivityKind::tunnelProvider;
-    return true;
-  }
-
-  return false;
-}
-
 static bool parseMothershipClusterTestHostMode(const String& value, MothershipClusterTestHostMode& mode)
 {
-  if (value.equal("local"_ctv) || value.equal("MothershipClusterTestHostMode::local"_ctv))
+  if (value.equal("local"_ctv))
   {
     mode = MothershipClusterTestHostMode::local;
     return true;
   }
 
-  if (value.equal("ssh"_ctv) || value.equal("MothershipClusterTestHostMode::ssh"_ctv))
+  if (value.equal("ssh"_ctv))
   {
     mode = MothershipClusterTestHostMode::ssh;
     return true;
@@ -645,25 +583,25 @@ static bool parseMothershipClusterTestHostMode(const String& value, MothershipCl
 
 static bool parseMothershipClusterTestBootstrapFamily(const String& value, MothershipClusterTestBootstrapFamily& family)
 {
-  if (value.equal("ipv4"_ctv) || value.equal("MothershipClusterTestBootstrapFamily::ipv4"_ctv))
+  if (value.equal("ipv4"_ctv))
   {
     family = MothershipClusterTestBootstrapFamily::ipv4;
     return true;
   }
 
-  if (value.equal("private6"_ctv) || value.equal("MothershipClusterTestBootstrapFamily::private6"_ctv))
+  if (value.equal("private6"_ctv))
   {
     family = MothershipClusterTestBootstrapFamily::private6;
     return true;
   }
 
-  if (value.equal("public6"_ctv) || value.equal("MothershipClusterTestBootstrapFamily::public6"_ctv))
+  if (value.equal("public6"_ctv))
   {
     family = MothershipClusterTestBootstrapFamily::public6;
     return true;
   }
 
-  if (value.equal("multihome6"_ctv) || value.equal("MothershipClusterTestBootstrapFamily::multihome6"_ctv))
+  if (value.equal("multihome6"_ctv))
   {
     family = MothershipClusterTestBootstrapFamily::multihome6;
     return true;
@@ -674,13 +612,13 @@ static bool parseMothershipClusterTestBootstrapFamily(const String& value, Mothe
 
 static bool parseMothershipClusterMachineSource(const String& value, MothershipClusterMachineSource& source)
 {
-  if (value.equal("adopted"_ctv) || value.equal("MothershipClusterMachineSource::adopted"_ctv))
+  if (value.equal("adopted"_ctv))
   {
     source = MothershipClusterMachineSource::adopted;
     return true;
   }
 
-  if (value.equal("created"_ctv) || value.equal("MothershipClusterMachineSource::created"_ctv))
+  if (value.equal("created"_ctv))
   {
     source = MothershipClusterMachineSource::created;
     return true;
@@ -691,13 +629,13 @@ static bool parseMothershipClusterMachineSource(const String& value, MothershipC
 
 static bool parseMachineKind(const String& value, MachineConfig::MachineKind& kind)
 {
-  if (value.equal("bareMetal"_ctv) || value.equal("MachineKind::bareMetal"_ctv) || value.equal("MachineConfig::MachineKind::bareMetal"_ctv))
+  if (value.equal("bareMetal"_ctv))
   {
     kind = MachineConfig::MachineKind::bareMetal;
     return true;
   }
 
-  if (value.equal("vm"_ctv) || value.equal("MachineKind::vm"_ctv) || value.equal("MachineConfig::MachineKind::vm"_ctv))
+  if (value.equal("vm"_ctv))
   {
     kind = MachineConfig::MachineKind::vm;
     return true;
@@ -708,25 +646,25 @@ static bool parseMachineKind(const String& value, MachineConfig::MachineKind& ki
 
 static bool parseMachineLifetime(const String& value, MachineLifetime& lifetime)
 {
-  if (value.equal("owned"_ctv) || value.equal("MachineLifetime::owned"_ctv))
+  if (value.equal("owned"_ctv))
   {
     lifetime = MachineLifetime::owned;
     return true;
   }
 
-  if (value.equal("reserved"_ctv) || value.equal("MachineLifetime::reserved"_ctv))
+  if (value.equal("reserved"_ctv))
   {
     lifetime = MachineLifetime::reserved;
     return true;
   }
 
-  if (value.equal("ondemand"_ctv) || value.equal("MachineLifetime::ondemand"_ctv))
+  if (value.equal("ondemand"_ctv))
   {
     lifetime = MachineLifetime::ondemand;
     return true;
   }
 
-  if (value.equal("spot"_ctv) || value.equal("MachineLifetime::spot"_ctv))
+  if (value.equal("spot"_ctv))
   {
     lifetime = MachineLifetime::spot;
     return true;
@@ -737,13 +675,13 @@ static bool parseMachineLifetime(const String& value, MachineLifetime& lifetime)
 
 static bool parseClusterMachineBacking(const String& value, ClusterMachineBacking& backing)
 {
-  if (value.equal("owned"_ctv) || value.equal("ClusterMachineBacking::owned"_ctv))
+  if (value.equal("owned"_ctv))
   {
     backing = ClusterMachineBacking::owned;
     return true;
   }
 
-  if (value.equal("cloud"_ctv) || value.equal("ClusterMachineBacking::cloud"_ctv))
+  if (value.equal("cloud"_ctv))
   {
     backing = ClusterMachineBacking::cloud;
     return true;
@@ -779,19 +717,19 @@ static const char *machineLifetimeName(MachineLifetime lifetime)
 
 static bool parseClusterMachineOwnershipMode(const String& value, ClusterMachineOwnershipMode& mode)
 {
-  if (value.equal("wholeMachine"_ctv) || value.equal("ClusterMachineOwnershipMode::wholeMachine"_ctv))
+  if (value.equal("wholeMachine"_ctv))
   {
     mode = ClusterMachineOwnershipMode::wholeMachine;
     return true;
   }
 
-  if (value.equal("hardCaps"_ctv) || value.equal("ClusterMachineOwnershipMode::hardCaps"_ctv))
+  if (value.equal("hardCaps"_ctv))
   {
     mode = ClusterMachineOwnershipMode::hardCaps;
     return true;
   }
 
-  if (value.equal("percentages"_ctv) || value.equal("ClusterMachineOwnershipMode::percentages"_ctv))
+  if (value.equal("percentages"_ctv))
   {
     mode = ClusterMachineOwnershipMode::percentages;
     return true;
@@ -2055,7 +1993,15 @@ static bool parseMothershipConnectivityJSON(simdjson::dom::element value, Mother
 
       String kind = {};
       kind.setInvariant(field.value.get_c_str());
-      if (parseMothershipConnectivityKind(kind, parsed.kind) == false)
+      if (kind.equal("ssh"_ctv))
+      {
+        parsed.kind = MothershipConnectivityKind::ssh;
+      }
+      else if (kind.equal("tunnelProvider"_ctv))
+      {
+        parsed.kind = MothershipConnectivityKind::tunnelProvider;
+      }
+      else
       {
         basics_log("%s.kind invalid\n", context);
         return false;
@@ -2069,39 +2015,16 @@ static bool parseMothershipConnectivityJSON(simdjson::dom::element value, Mother
         return false;
       }
     }
-    else if (key.equal("allowEmergencySshFallback"_ctv))
-    {
-      if (field.value.type() != simdjson::dom::element_type::BOOL || field.value.get(parsed.tunnelProvider.allowEmergencySshFallback) != simdjson::SUCCESS)
-      {
-        basics_log("%s.allowEmergencySshFallback requires bool\n", context);
-        return false;
-      }
-      sawTunnelField = true;
-    }
     else if (key.equal("dialEndpoint"_ctv))
     {
-      if (requireString(field.value, "dialEndpoint", parsed.tunnelProvider.dial.endpoint) == false)
-      {
-        return false;
-      }
-    }
-    else if (key.equal("dialServerName"_ctv))
-    {
-      if (requireString(field.value, "dialServerName", parsed.tunnelProvider.dial.serverName) == false)
-      {
-        return false;
-      }
-    }
-    else if (key.equal("dialServerSpkiSha256"_ctv))
-    {
-      if (requireString(field.value, "dialServerSpkiSha256", parsed.tunnelProvider.dial.serverSpkiSha256) == false)
+      if (requireString(field.value, "dialEndpoint", parsed.tunnelProvider.dialEndpoint) == false)
       {
         return false;
       }
     }
     else if (key.equal("egressHost"_ctv))
     {
-      if (requireString(field.value, "egressHost", parsed.tunnelProvider.egress.host) == false)
+      if (requireString(field.value, "egressHost", parsed.tunnelProvider.egressHost) == false)
       {
         return false;
       }
@@ -2114,28 +2037,7 @@ static bool parseMothershipConnectivityJSON(simdjson::dom::element value, Mother
         basics_log("%s.egressPort invalid\n", context);
         return false;
       }
-      parsed.tunnelProvider.egress.port = uint16_t(port);
-    }
-    else if (key.equal("nLogicalCores"_ctv))
-    {
-      if (requireU32(field.value, "nLogicalCores", parsed.tunnelProvider.resources.nLogicalCores) == false)
-      {
-        return false;
-      }
-    }
-    else if (key.equal("nMemoryMB"_ctv))
-    {
-      if (requireU32(field.value, "nMemoryMB", parsed.tunnelProvider.resources.nMemoryMB) == false)
-      {
-        return false;
-      }
-    }
-    else if (key.equal("nStorageMB"_ctv))
-    {
-      if (requireU32(field.value, "nStorageMB", parsed.tunnelProvider.resources.nStorageMB) == false)
-      {
-        return false;
-      }
+      parsed.tunnelProvider.egressPort = uint16_t(port);
     }
     else
     {
@@ -2159,22 +2061,18 @@ static bool parseMothershipConnectivityJSON(simdjson::dom::element value, Mother
   if (parsed.kind == MothershipConnectivityKind::tunnelProvider)
   {
     if (parsed.tunnelProvider.providerContainerBlobPath.size() == 0 ||
-        parsed.tunnelProvider.dial.endpoint.size() == 0 ||
-        parsed.tunnelProvider.egress.host.size() == 0 ||
-        parsed.tunnelProvider.egress.port == 0 ||
-        mothershipTunnelProviderResourcesInBounds(parsed.tunnelProvider.resources) == false)
+        parsed.tunnelProvider.dialEndpoint.size() == 0 ||
+        parsed.tunnelProvider.egressHost.size() == 0 ||
+        parsed.tunnelProvider.egressPort == 0)
     {
-      basics_log("%s tunnelProvider requires artifact path, dial endpoint, TCP egress endpoint, and bounded resources\n", context);
+      basics_log("%s tunnelProvider requires artifact path, dial endpoint, and TCP egress endpoint\n", context);
       return false;
     }
-    if (parsed.tunnelProvider.dial.serverSpkiSha256.size() > 0 && prodigyIsSHA256HexDigest(parsed.tunnelProvider.dial.serverSpkiSha256) == false)
+    uint32_t egressAddress = 0;
+    if (mothershipTunnelProviderEgressIPv4Literal(parsed.tunnelProvider.egressHost, egressAddress) == false ||
+        mothershipTunnelProviderEgressIPv4HostAddressIsDenied(egressAddress))
     {
-      basics_log("%s tunnelProvider dial SPKI pin invalid\n", context);
-      return false;
-    }
-    if (mothershipTunnelProviderEgressLiteralIsDenied(parsed.tunnelProvider.egress.host))
-    {
-      basics_log("%s tunnelProvider egress host must not be private, local, metadata, multicast, or reserved literal IP\n", context);
+      basics_log("%s tunnelProvider egress host must be a public IPv4 literal\n", context);
       return false;
     }
   }
@@ -2508,16 +2406,15 @@ static void printManagedCluster(const MothershipProdigyCluster& cluster)
   if (cluster.mothershipConnectivity.kind == MothershipConnectivityKind::tunnelProvider)
   {
     const MothershipTunnelProviderSpec& spec = cluster.mothershipConnectivity.tunnelProvider;
-    String endpoint = spec.dial.endpoint;
-    String egressHost = spec.egress.host;
+    String endpoint = spec.dialEndpoint;
+    String egressHost = spec.egressHost;
     String artifactSha256 = spec.artifactSha256;
-    basics_log("    tunnelProvider endpoint=%s egress=%s:%u artifactSha256=%s artifactBytes=%llu allowEmergencySshFallback=%d\n",
+    basics_log("    tunnelProvider endpoint=%s egress=%s:%u artifactSha256=%s artifactBytes=%llu\n",
                endpoint.c_str(),
                egressHost.c_str(),
-               unsigned(spec.egress.port),
+               unsigned(spec.egressPort),
                artifactSha256.c_str(),
-               (unsigned long long)spec.artifactBytes,
-               int(spec.allowEmergencySshFallback));
+               (unsigned long long)spec.artifactBytes);
   }
 
   if ((cluster.deploymentMode == MothershipClusterDeploymentMode::remote) || (cluster.deploymentMode == MothershipClusterDeploymentMode::local && cluster.machines.empty() == false))
@@ -4240,7 +4137,7 @@ private:
   uint16_t tcpPort = 0;
   Vector<String> controlPaths;
   Vector<MothershipProdigyClusterMachine> remoteMachines;
-  MothershipTunnelProviderDialConfig tunnelGatewayDial;
+  String tunnelGatewayEndpoint;
   MothershipTunnelGatewayClientAuth tunnelGatewayClientAuth;
   Vault::SSHKeyPackage clusterBootstrapSshKeyPackage;
   String clusterBootstrapSshPrivateKeyPath;
@@ -4286,7 +4183,7 @@ private:
     sshTransportIOTimeoutMs = defaultSshTransportIOTimeoutMs;
     controlPaths.clear();
     remoteMachines.clear();
-    tunnelGatewayDial = {};
+    tunnelGatewayEndpoint.clear();
     tunnelGatewayClientAuth = {};
     clusterBootstrapSshKeyPackage.clear();
     clusterBootstrapSshPrivateKeyPath.clear();
@@ -4412,7 +4309,7 @@ private:
     String host = {};
     uint16_t port = 0;
     String failure = {};
-    if (mothershipParseEndpointHostPort(tunnelGatewayDial.endpoint, host, port, &failure) == false)
+    if (mothershipParseEndpointHostPort(tunnelGatewayEndpoint, host, port, &failure) == false)
     {
       lastConnectFailure.snprintf<"tunnelProvider gateway endpoint invalid: {}"_ctv>(failure);
       printConnectFailure();
@@ -4474,10 +4371,6 @@ private:
       return fail("tunnelProvider gateway TLS session setup failed"_ctv);
     }
     SSL_set_mode(tls.get(), SSL_MODE_AUTO_RETRY);
-    if (tunnelGatewayDial.serverName.size() > 0 && SSL_set_tlsext_host_name(tls.get(), tunnelGatewayDial.serverName.c_str()) != 1)
-    {
-      return fail("tunnelProvider gateway TLS SNI setup failed"_ctv);
-    }
     if (SSL_connect(tls.get()) != 1 || SSL_get_verify_result(tls.get()) != X509_V_OK)
     {
       return fail("tunnelProvider gateway TLS handshake failed"_ctv);
@@ -4490,15 +4383,6 @@ private:
         mothershipTunnelGatewayLeafHasExtendedKeyUsage(peerCert.get(), NID_server_auth) == false)
     {
       return fail("tunnelProvider gateway server certificate invalid"_ctv);
-    }
-
-    if (tunnelGatewayDial.serverSpkiSha256.size() > 0)
-    {
-      String actualSPKI = {};
-      if (mothershipComputeCertificateSPKISHA256Hex(peerCert.get(), actualSPKI, &failure) == false || actualSPKI.equals(tunnelGatewayDial.serverSpkiSha256) == false)
-      {
-        return fail("tunnelProvider gateway server SPKI pin mismatch"_ctv);
-      }
     }
 
     tunnelGatewayTLSContext = context.release();
@@ -5034,61 +4918,39 @@ public:
     return false;
   }
 
-  bool configureCluster(const MothershipProdigyCluster& cluster, String *failure = nullptr, bool explicitEmergencySshFallback = false)
+  bool configureCluster(const MothershipProdigyCluster& cluster, String *failure = nullptr)
   {
     clearTarget();
     targetLabel = cluster.name;
 
     if (cluster.mothershipConnectivity.kind == MothershipConnectivityKind::tunnelProvider)
     {
-      if (explicitEmergencySshFallback)
+      const MothershipTunnelProviderSpec& spec = cluster.mothershipConnectivity.tunnelProvider;
+      MothershipConnectivityRuntimeConfig runtimeConfig = {};
+      if (mothershipBuildClusterMothershipConnectivityRuntimeConfig(cluster, runtimeConfig, failure) == false)
       {
-        if (cluster.mothershipConnectivity.tunnelProvider.allowEmergencySshFallback == false)
-        {
-          if (failure)
-          {
-            failure->assign("tunnelProvider emergency SSH fallback is not allowed by cluster connectivity metadata"_ctv);
-          }
-          return false;
-        }
+        return false;
       }
-      else
+      if (spec.clientAuth.configured() == false)
       {
-        const MothershipTunnelProviderSpec& spec = cluster.mothershipConnectivity.tunnelProvider;
-        MothershipConnectivityRuntimeConfig runtimeConfig = {};
-        if (mothershipBuildClusterMothershipConnectivityRuntimeConfig(cluster, runtimeConfig, failure) == false)
-        {
-          return false;
-        }
-        if (spec.clientAuth.configured() == false)
-        {
-          if (failure)
-          {
-            failure->assign("tunnelProvider client auth required for gateway dialing"_ctv);
-          }
-          return false;
-        }
-        if (spec.clientAuth.clusterUUID != cluster.clusterUUID)
-        {
-          if (failure)
-          {
-            failure->assign("tunnelProvider client auth clusterUUID mismatch"_ctv);
-          }
-          return false;
-        }
-        if (mothershipTunnelGatewayClientAuthMaterialValid(spec.clientAuth, failure) == false)
-        {
-          return false;
-        }
-        tunnelGatewayDial = spec.dial;
-        tunnelGatewayClientAuth = spec.clientAuth;
-        transportMode = TransportMode::tunnelGateway;
         if (failure)
         {
-          failure->clear();
+          failure->assign("tunnelProvider client auth required for gateway dialing"_ctv);
         }
-        return true;
+        return false;
       }
+      if (mothershipTunnelGatewayClientAuthMaterialValid(spec.clientAuth, failure) == false)
+      {
+        return false;
+      }
+      tunnelGatewayEndpoint = spec.dialEndpoint;
+      tunnelGatewayClientAuth = spec.clientAuth;
+      transportMode = TransportMode::tunnelGateway;
+      if (failure)
+      {
+        failure->clear();
+      }
+      return true;
     }
 
     clusterBootstrapSshKeyPackage = cluster.bootstrapSshKeyPackage;
@@ -6144,7 +6006,6 @@ private:
     if (debugSystemStoreRoot != nullptr)
     {
       stored = ContainerStore::systemStore(
-          SystemContainerKind::mothershipTunnelProvider,
           digest,
           blob.size(),
           blob,
@@ -6159,7 +6020,6 @@ private:
 #endif
     {
       stored = ContainerStore::systemStore(
-          SystemContainerKind::mothershipTunnelProvider,
           digest,
           blob.size(),
           blob,
@@ -6177,10 +6037,8 @@ private:
       return false;
     }
 
-    spec.containerKind = SystemContainerKind::mothershipTunnelProvider;
     spec.artifactSha256 = actualDigest;
     spec.artifactBytes = actualBytes;
-    spec.artifactContractVersion = prodigyDiscombobulatorMothershipTunnelProviderContractVersion;
     return true;
   }
 
@@ -6197,63 +6055,11 @@ private:
     } while (cluster.clusterUUID == 0);
   }
 
-  static bool prepareTunnelProviderGatewayAuthForCreate(MothershipTunnelProviderSpec& spec, uint128_t clusterUUID, String *failure)
+  static bool prepareTunnelProviderGatewayAuthForCreate(MothershipTunnelProviderSpec& spec, String *failure)
   {
-    if (clusterUUID == 0)
-    {
-      if (failure)
-      {
-        failure->assign("tunnelProvider clusterUUID required for gateway auth"_ctv);
-      }
-      return false;
-    }
-
-    if (spec.clientAuth.configured() && spec.gatewayAuth.configured())
-    {
-      if (mothershipTunnelGatewayAuthAuthorizesClient(spec.clientAuth, spec.gatewayAuth) == false)
-      {
-        if (failure)
-        {
-          failure->assign("tunnelProvider gateway auth does not authorize client auth"_ctv);
-        }
-        return false;
-      }
-
-      if (spec.clientAuth.clusterUUID != clusterUUID)
-      {
-        if (failure)
-        {
-          failure->assign("tunnelProvider gateway auth clusterUUID mismatch"_ctv);
-        }
-        return false;
-      }
-
-      if (mothershipTunnelGatewayClientAuthMaterialValid(spec.clientAuth) == false || mothershipTunnelGatewayAuthMaterialValid(spec.gatewayAuth) == false)
-      {
-        if (failure)
-        {
-          failure->assign("tunnelProvider gateway auth certificate material invalid"_ctv);
-        }
-        return false;
-      }
-
-      if (failure)
-      {
-        failure->clear();
-      }
-      return true;
-    }
-
-    if (spec.clientAuth.configured() || spec.gatewayAuth.configured())
-    {
-      if (failure)
-      {
-        failure->assign("tunnelProvider gateway auth must be fully generated or omitted"_ctv);
-      }
-      return false;
-    }
-
-    return mothershipGenerateTunnelGatewayAuth(clusterUUID, 1, spec.clientAuth, spec.gatewayAuth, failure);
+    spec.clientAuth = {};
+    spec.gatewayAuth = {};
+    return mothershipGenerateTunnelGatewayAuth(spec.clientAuth, spec.gatewayAuth, failure);
   }
 
   bool configureControlTarget(const char *arg, String *failureOut = nullptr)
@@ -6300,8 +6106,7 @@ private:
       return false;
     }
 
-    const char *emergencyFallback = std::getenv("PRODIGY_MOTHERSHIP_EMERGENCY_SSH_FALLBACK");
-    if (socket.configureCluster(cluster, &failure, emergencyFallback != nullptr && std::strcmp(emergencyFallback, "1") == 0) == false)
+    if (socket.configureCluster(cluster, &failure) == false)
     {
       if (failureOut)
       {
@@ -8261,7 +8066,7 @@ private:
           const MothershipTunnelProviderSpec& providerSpec = cluster.mothershipConnectivity.tunnelProvider;
           String artifactBlob = {};
           String artifactFailure = {};
-          if (ContainerStore::systemLoadVerified(providerSpec.containerKind, providerSpec.artifactSha256, providerSpec.artifactBytes, artifactBlob, &artifactFailure) == false)
+          if (ContainerStore::systemLoadVerified(providerSpec.artifactSha256, providerSpec.artifactBytes, artifactBlob, &artifactFailure) == false)
           {
             if (artifactFailure.size() > 0)
             {
@@ -8277,7 +8082,6 @@ private:
           Message::construct(
               owner->socket.wBuffer,
               MothershipTopic::configureSystemContainerArtifact,
-              providerSpec.containerKind,
               providerSpec.artifactSha256,
               providerSpec.artifactBytes,
               artifactBlob);
@@ -14857,7 +14661,7 @@ private:
         basics_log("createCluster success=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
         exit(EXIT_FAILURE);
       }
-      if (prepareTunnelProviderGatewayAuthForCreate(request.mothershipConnectivity.tunnelProvider, request.clusterUUID, &failure) == false)
+      if (prepareTunnelProviderGatewayAuthForCreate(request.mothershipConnectivity.tunnelProvider, &failure) == false)
       {
         basics_log("createCluster success=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
         exit(EXIT_FAILURE);
@@ -17095,10 +16899,10 @@ public:
     return hooks.applyAddMachines(cluster, request, topology, nullptr, failure);
   }
 
-  bool unitTestConfigureClusterSocket(const MothershipProdigyCluster& cluster, Vector<MothershipProdigyClusterMachine>& remoteCandidates, String *failure = nullptr, bool explicitEmergencySshFallback = false)
+  bool unitTestConfigureClusterSocket(const MothershipProdigyCluster& cluster, Vector<MothershipProdigyClusterMachine>& remoteCandidates, String *failure = nullptr)
   {
     remoteCandidates.clear();
-    if (socket.configureCluster(cluster, failure, explicitEmergencySshFallback) == false)
+    if (socket.configureCluster(cluster, failure) == false)
     {
       return false;
     }
@@ -17123,9 +16927,9 @@ public:
     return prepareTunnelProviderArtifactForCreate(spec, failure, &systemStoreRoot);
   }
 
-  bool unitTestPrepareTunnelProviderGatewayAuth(MothershipTunnelProviderSpec& spec, uint128_t clusterUUID, String *failure = nullptr)
+  bool unitTestPrepareTunnelProviderGatewayAuth(MothershipTunnelProviderSpec& spec, String *failure = nullptr)
   {
-    return prepareTunnelProviderGatewayAuthForCreate(spec, clusterUUID, failure);
+    return prepareTunnelProviderGatewayAuthForCreate(spec, failure);
   }
 #endif
 

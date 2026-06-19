@@ -4191,34 +4191,16 @@ static void serialize(S&& serializer, MachineStatusReport& report)
   serializer.object(report.hardware);
 }
 
-class MothershipConnectivityStatusReport {
-public:
-
+struct MothershipConnectivityStatusReport {
   String kind;
-  bool runningOnMaster = false;
-  bool healthy = false;
-  uint64_t generation = 0;
   String lastFailure;
 
   void stringify(String& string) const
   {
-    if (kind.size() == 0)
+    if (kind.size() > 0)
     {
-      return;
+      string.snprintf_add<"mothershipConnectivity kind={} lastFailure={}\n"_ctv>(kind, lastFailure);
     }
-
-    if (runningOnMaster == false && healthy == false && generation == 0 && lastFailure.size() == 0)
-    {
-      string.snprintf_add<"mothershipConnectivity kind={}\n"_ctv>(kind);
-      return;
-    }
-
-    string.snprintf_add<"mothershipConnectivity kind={} runningOnMaster={itoa} healthy={itoa} generation={itoa} lastFailure={}\n"_ctv>(
-        kind,
-        runningOnMaster ? 1u : 0u,
-        healthy ? 1u : 0u,
-        generation,
-        lastFailure);
   }
 };
 
@@ -4226,9 +4208,6 @@ template <typename S>
 static void serialize(S&& serializer, MothershipConnectivityStatusReport& report)
 {
   serializer.text1b(report.kind, UINT32_MAX);
-  serializer.value1b(report.runningOnMaster);
-  serializer.value1b(report.healthy);
-  serializer.value8b(report.generation);
   serializer.text1b(report.lastFailure, UINT32_MAX);
 }
 

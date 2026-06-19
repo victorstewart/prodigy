@@ -1227,15 +1227,6 @@ private:
       return false;
     }
 
-    if (spec.clientAuth.clusterUUID != cluster.clusterUUID)
-    {
-      if (failure)
-      {
-        failure->assign("tunnelProvider.clientAuth clusterUUID mismatch");
-      }
-      return false;
-    }
-
     return true;
   }
 

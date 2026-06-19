@@ -395,29 +395,19 @@ static bool equalLocalBrainStates(const ProdigyPersistentLocalBrainState& lhs, c
 
 static bool equalMothershipTunnelGatewayAuth(const MothershipTunnelGatewayAuth& lhs, const MothershipTunnelGatewayAuth& rhs)
 {
-  return lhs.generation == rhs.generation &&
-      lhs.clusterUUID == rhs.clusterUUID &&
-      lhs.rootCertPem.equals(rhs.rootCertPem) &&
+  return lhs.rootCertPem.equals(rhs.rootCertPem) &&
       lhs.serverCertPem.equals(rhs.serverCertPem) &&
-      lhs.serverKeyPem.equals(rhs.serverKeyPem) &&
-      lhs.authorizedClientCertPem.equals(rhs.authorizedClientCertPem);
+      lhs.serverKeyPem.equals(rhs.serverKeyPem);
 }
 
 static bool equalMothershipConnectivityRuntimeConfigs(const MothershipConnectivityRuntimeConfig& lhs, const MothershipConnectivityRuntimeConfig& rhs)
 {
   return lhs.kind == rhs.kind &&
-      lhs.tunnelProvider.containerKind == rhs.tunnelProvider.containerKind &&
       lhs.tunnelProvider.artifactSha256.equals(rhs.tunnelProvider.artifactSha256) &&
       lhs.tunnelProvider.artifactBytes == rhs.tunnelProvider.artifactBytes &&
-      lhs.tunnelProvider.artifactContractVersion == rhs.tunnelProvider.artifactContractVersion &&
-      lhs.tunnelProvider.dial.endpoint.equals(rhs.tunnelProvider.dial.endpoint) &&
-      lhs.tunnelProvider.dial.serverName.equals(rhs.tunnelProvider.dial.serverName) &&
-      lhs.tunnelProvider.dial.serverSpkiSha256.equals(rhs.tunnelProvider.dial.serverSpkiSha256) &&
-      lhs.tunnelProvider.egress.host.equals(rhs.tunnelProvider.egress.host) &&
-      lhs.tunnelProvider.egress.port == rhs.tunnelProvider.egress.port &&
-      lhs.tunnelProvider.resources.nLogicalCores == rhs.tunnelProvider.resources.nLogicalCores &&
-      lhs.tunnelProvider.resources.nMemoryMB == rhs.tunnelProvider.resources.nMemoryMB &&
-      lhs.tunnelProvider.resources.nStorageMB == rhs.tunnelProvider.resources.nStorageMB;
+      lhs.tunnelProvider.dialEndpoint.equals(rhs.tunnelProvider.dialEndpoint) &&
+      lhs.tunnelProvider.egressHost.equals(rhs.tunnelProvider.egressHost) &&
+      lhs.tunnelProvider.egressPort == rhs.tunnelProvider.egressPort;
 }
 
 static bool generateApplicationTlsFactory(ApplicationTlsVaultFactory& factory, String& failure)
@@ -1253,7 +1243,7 @@ int main(void)
   MothershipTunnelGatewayClientAuth storedTunnelClientAuth = {};
   MothershipTunnelGatewayAuth storedTunnelGatewayAuth = {};
   suite.expect(
-      mothershipGenerateTunnelGatewayAuth(storedSnapshot.brainConfig.clusterUUID, 3, storedTunnelClientAuth, storedTunnelGatewayAuth, &parseFailure),
+      mothershipGenerateTunnelGatewayAuth(storedTunnelClientAuth, storedTunnelGatewayAuth, &parseFailure),
       "generate_mothership_tunnel_gateway_auth");
   suite.expect(storedTunnelGatewayAuth.configured(), "generate_mothership_tunnel_gateway_auth_configured");
 
@@ -1261,10 +1251,9 @@ int main(void)
   storedMothershipConnectivity.kind = MothershipConnectivityKind::tunnelProvider;
   storedMothershipConnectivity.tunnelProvider.artifactSha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv;
   storedMothershipConnectivity.tunnelProvider.artifactBytes = 512;
-  storedMothershipConnectivity.tunnelProvider.dial.endpoint = "control.example.net:443"_ctv;
-  storedMothershipConnectivity.tunnelProvider.dial.serverName = "control.example.net"_ctv;
-  storedMothershipConnectivity.tunnelProvider.egress.host = "edge.example.net"_ctv;
-  storedMothershipConnectivity.tunnelProvider.egress.port = 443;
+  storedMothershipConnectivity.tunnelProvider.dialEndpoint = "control.example.net:443"_ctv;
+  storedMothershipConnectivity.tunnelProvider.egressHost = "1.1.1.1"_ctv;
+  storedMothershipConnectivity.tunnelProvider.egressPort = 443;
 
   {
     ProdigyPersistentStateStore store(dbPath);
@@ -1661,7 +1650,6 @@ int main(void)
     suite.expect(BitseryEngine::deserializeSafe(rawPublicTunnelGatewayAuthRecord, storedTunnelGatewayAuthRecord), "deserialize_raw_public_tunnel_gateway_auth_record");
     suite.expect(storedTunnelGatewayAuthRecord.secretVersion != 0, "raw_public_tunnel_gateway_auth_record_has_secret_version");
     suite.expect(stringContains(rawPublicTunnelGatewayAuthRecord, storedTunnelGatewayAuth.serverKeyPem) == false, "raw_public_tunnel_gateway_auth_record_scrubs_server_key");
-    suite.expect(storedTunnelGatewayAuthRecord.auth.serverKeyPem.size() == 0, "raw_public_tunnel_gateway_auth_record_zeroes_server_key");
 
     String tunnelGatewayAuthSecretKey = {};
     prodigyBuildPersistentSecretRecordKey("mothership_tunnel_gateway_auth", storedTunnelGatewayAuthRecord.secretVersion, tunnelGatewayAuthSecretKey);

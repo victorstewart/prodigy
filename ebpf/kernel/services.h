@@ -116,42 +116,12 @@ __attribute__((__always_inline__)) static inline bool containerEgressAllowlistOn
   return (policy->egressAllowlistOnly != 0);
 }
 
-__attribute__((__always_inline__)) static inline bool containerSystemEgressIPv4Config(__be32 *source4, __u8 *fragment)
-{
-  if (source4 == NULL || fragment == NULL)
-  {
-    return false;
-  }
-
-  __u32 zeroidx = 0;
-  struct container_network_policy *policy = bpf_map_lookup_elem(&ct_net_policy, &zeroidx);
-  if (!policy || policy->egressAllowlistOnly == 0 || policy->systemEgressSource4 == 0 || policy->containerFragment == 0)
-  {
-    return false;
-  }
-
-  *source4 = policy->systemEgressSource4;
-  *fragment = policy->containerFragment;
-  return true;
-}
-
 __attribute__((__always_inline__)) static inline bool containerEgressAllow4(__be32 daddr, __u8 proto, __be16 port)
 {
   struct container_egress_allow_key key = {};
-  key.family = 4;
   key.proto = proto;
   key.port = port;
-  key.addr.v4 = daddr;
-  return bpf_map_lookup_elem(&ct_egress_allow, &key) != NULL;
-}
-
-__attribute__((__always_inline__)) static inline bool containerEgressAllow6(const __u8 daddr[16], __u8 proto, __be16 port)
-{
-  struct container_egress_allow_key key = {};
-  key.family = 6;
-  key.proto = proto;
-  key.port = port;
-  bpf_memcpy(key.addr.v6, daddr, sizeof(key.addr.v6));
+  key.addr = daddr;
   return bpf_map_lookup_elem(&ct_egress_allow, &key) != NULL;
 }
 
