@@ -18,19 +18,19 @@ excluding evidence artifacts under `prodigy/docs/tunnel-provider-refactor/*`.
 | State | Files | Insertions | Deletions |
 |---|---:|---:|---:|
 | Draft feature baseline | 52 | 7437 | 434 |
-| Current branch | 57 | 5917 | 613 |
+| Current branch | 57 | 5913 | 870 |
 
 Category ledger:
 
 | Category | Draft net | Current net | Net removed |
 |---|---:|---:|---:|
-| Production | +4883 | +3261 | 1622 |
-| Tests | +2081 | +2006 | 75 |
+| Production | +4883 | +3041 | 1842 |
+| Tests | +2081 | +1965 | 116 |
 | Docs | +30 | +28 | 2 |
 | Build metadata | +9 | +9 | 0 |
 
 The current project gate command, excluding evidence artifacts, reports
-`+5917 -613 net +5304` across 57 files. The full diff including evidence
+`+5913 -870 net +5043` across 57 files. The full diff including evidence
 artifacts is intentionally larger because this report and ledger are tracked.
 
 ## Lines Removed By Subsystem
@@ -55,7 +55,7 @@ artifacts is intentionally larger because this report and ledger are tracked.
 - Gateway health event: the runtime now marks provider health when authenticated TLS opens the guarded control socket, not after the proxy loop exits.
 - Brain reconcile artifact surface: hard-cut the speculative vector of system artifact refs to the single supported system artifact reference.
 - Prodigy launch hook surface: collapsed five one-use gateway/provider launch helpers into the single Brain `startMothershipTunnelProviderRuntime`/`stopMothershipTunnelProviderRuntime` boundary.
-- Mothership control client surface: deleted the unreachable direct TCP stage mode and made Brain's default control ingress Unix-only, so only tests that explicitly need loopback TCP override it.
+- Mothership control surface: deleted the unreachable direct TCP client stage and the disabled Brain TCP listener; supported control ingress is local Unix, SSH-forwarded Unix, or tunnel gateway.
 
 See `LINE_LEDGER.tsv` for per-path numbers.
 
@@ -106,6 +106,7 @@ Fixed or hard-cut:
 - `MothershipConnectivityRuntimeConfig` is deleted; the runtime path now uses the same canonical `MothershipConnectivity` model after explicitly stripping Mothership-only fields.
 - Prodigy tunnel-provider launch no longer exposes separate prepare/start/stop helper methods for the gateway and provider instance; the single runtime hook owns validation, listener creation, provider launch, cgroup capture, gateway start, and cleanup ordering.
 - `MothershipSocket::stageTcp` is deleted; cluster control targets now resolve only to local Unix, SSH-forwarded Unix, or tunnel gateway transports.
+- The Brain TCP Mothership listener is deleted; master control ingress arms only the Unix socket.
 
 Superseded by later user direction:
 
@@ -191,6 +192,7 @@ All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 - After deleting the `MothershipConnectivityRuntimeConfig` alias: `git diff --check`; `cmake --build .run/build-egress --target prodigy mothership prodigy_brain_replication_credentials_unit prodigy_persistent_state_unit prodigy_mothership_cluster_registry_unit --parallel 16`; `.run/build-egress/prodigy_brain_replication_credentials_unit`; `.run/build-egress/prodigy_persistent_state_unit`; `.run/build-egress/prodigy_mothership_cluster_registry_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test and after the focused units.
 - After collapsing Prodigy's one-use tunnel gateway/provider launch helpers: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_brain_replication_credentials_unit prodigy_mothership_unix_connect_unit --parallel 16`; `.run/build-egress/prodigy_brain_replication_credentials_unit`; `.run/build-egress/prodigy_mothership_unix_connect_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test and after the focused units.
 - After deleting the unreachable direct TCP control stage and defaulting Brain's no-op control ingress hook: `git diff --check`; `cmake --build .run/build-egress --target prodigy mothership prodigy_brain_replication_credentials_unit prodigy_persistent_state_unit prodigy_brain_config_ssh_replication_unit prodigy_brain_ipv6_topology_unit prodigy_brain_master_uuid_unit prodigy_brain_overlay_hosted_ingress_unit prodigy_mothership_unix_connect_unit --parallel 16`; `.run/build-egress/prodigy_brain_replication_credentials_unit`; `.run/build-egress/prodigy_persistent_state_unit`; `.run/build-egress/prodigy_brain_config_ssh_replication_unit`; `.run/build-egress/prodigy_brain_ipv6_topology_unit`; `.run/build-egress/prodigy_brain_master_uuid_unit`; `.run/build-egress/prodigy_brain_overlay_hosted_ingress_unit`; `.run/build-egress/prodigy_mothership_unix_connect_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test and after the focused units.
+- After deleting the disabled Brain TCP Mothership listener: `git diff --check`; `cmake --build .run/build-egress --target prodigy mothership prodigy_brain_replication_credentials_unit prodigy_persistent_state_unit prodigy_brain_config_ssh_replication_unit prodigy_brain_master_uuid_unit prodigy_mothership_unix_connect_unit --parallel 16`; `.run/build-egress/prodigy_brain_replication_credentials_unit`; `.run/build-egress/prodigy_persistent_state_unit`; `.run/build-egress/prodigy_brain_config_ssh_replication_unit`; `.run/build-egress/prodigy_brain_master_uuid_unit`; `.run/build-egress/prodigy_mothership_unix_connect_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test and after the focused units.
 
 Earlier validation on the same branch also covered the broader build/test matrix:
 cluster registry, deployments, bundle artifact, BPF attach units, host/container

@@ -37,11 +37,6 @@ public:
 
   uint32_t persistCalls = 0;
 
-  void configureMothershipControlIngress(String& mothershipEndpoint) override
-  {
-    mothershipEndpoint.assign("127.0.0.1"_ctv);
-  }
-
   void pushSpinApplicationProgressToMothership(ApplicationDeployment *deployment, const String& message) override
   {
     (void)deployment;

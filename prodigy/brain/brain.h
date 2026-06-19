@@ -922,8 +922,6 @@ public:
   Mothership *mothership = nullptr;
   bytell_hash_set<Mothership *> activeMotherships;
   bytell_hash_set<Mothership *> closingMotherships;
-  TCPSocket mothershipSocket;
-  bool mothershipAcceptArmed = false;
   UnixSocket mothershipUnixSocket;
   bool mothershipUnixAcceptArmed = false;
   String mothershipUnixSocketPath;
@@ -8276,53 +8274,6 @@ public:
       brain_saddrlen = sizeof(brain_saddr);
       Ring::queueAccept(&brainSocket, reinterpret_cast<struct sockaddr *>(&brain_saddr), &brain_saddrlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
     }
-    else if (socket == (void *)&mothershipSocket)
-    {
-      mothershipAcceptArmed = false;
-      std::fprintf(stderr, "prodigy mothership accept transport=tcp result=%d master=%d existing=%p listenerFD=%d listenerFslot=%d\n",
-                   fslot,
-                   int(weAreMaster),
-                   static_cast<void *>(mothership),
-                   mothershipSocket.fd,
-                   mothershipSocket.fslot);
-      std::fflush(stderr);
-
-      if (fslot >= 0)
-      {
-        if (weAreMaster == false)
-        {
-          // Followers never own commander control-plane sockets.
-          std::fprintf(stderr, "prodigy mothership accept-close transport=tcp reason=follower acceptedFslot=%d\n", fslot);
-          std::fflush(stderr);
-          Ring::queueCloseRaw(fslot);
-        }
-        else
-        {
-          mothership = new Mothership();
-          mothership->fslot = fslot;
-          mothership->isFixedFile = true;
-          mothership->isNonBlocking = true;
-          Ring::publishSocketGeneration(mothership);
-          activeMotherships.insert(mothership);
-          const int fixedFD = loggableSocketFD(mothership);
-          std::fprintf(stderr, "prodigy mothership accept-adopt transport=tcp source=cqe acceptedFslot=%d fixedFD=%d isFixed=%d\n",
-                       fslot,
-                       fixedFD,
-                       int(mothership->isFixedFile));
-          std::fflush(stderr);
-
-          RingDispatcher::installMultiplexee(mothership, this);
-          queueMothershipReceiveIfNeeded(mothership, "accept-tcp-cqe");
-        }
-      }
-
-      if (weAreMaster)
-      {
-        // Keep the listener continuously armed so rapid mothership retries
-        // are accepted and explicitly rejected instead of filling backlog.
-        queueMothershipListenersIfNeeded();
-      }
-    }
     else if (socket == (void *)&mothershipUnixSocket)
     {
       mothershipUnixAcceptArmed = false;
@@ -8368,7 +8319,7 @@ public:
 
       if (weAreMaster)
       {
-        queueMothershipListenersIfNeeded();
+        queueMothershipUnixAcceptIfNeeded();
       }
     }
   }
@@ -9966,17 +9917,6 @@ public:
         disarmNeuronControlReconnect(neuron);
       }
     }
-    else if (socket == (void *)&mothershipSocket)
-    {
-      basics_log("mothership listener socket closed weAreMaster=%d\n", int(weAreMaster));
-      mothershipAcceptArmed = false;
-      RingDispatcher::eraseMultiplexee(&mothershipSocket);
-
-      if (weAreMaster)
-      {
-        armMothershipListener();
-      }
-    }
     else if (socket == (void *)&mothershipUnixSocket)
     {
       basics_log("mothership unix listener socket closed weAreMaster=%d path=%s\n", int(weAreMaster), mothershipUnixSocketPath.c_str());
@@ -10006,7 +9946,7 @@ public:
       delete activeMothership;
       if (weAreMaster)
       {
-        queueMothershipListenersIfNeeded();
+        queueMothershipUnixAcceptIfNeeded();
       }
     }
     else if (closingMotherships.contains(static_cast<Mothership *>(socket)))
@@ -10021,7 +9961,7 @@ public:
       delete closingStream;
       if (weAreMaster)
       {
-        queueMothershipListenersIfNeeded();
+        queueMothershipUnixAcceptIfNeeded();
       }
     }
     else if (sshs.contains(static_cast<MachineSSH *>(socket)))
@@ -12676,15 +12616,6 @@ public:
     }
   }
 
-  virtual void configureMothershipControlIngress(String& mothershipEndpoint)
-  {
-    mothershipEndpoint.clear();
-  }
-
-  virtual void teardownMothershipControlIngress(void)
-  {
-  }
-
   virtual bool storeSystemContainerArtifact(const String& sha256, uint64_t bytes, const String& blob, String *failure = nullptr)
   {
     return ContainerStore::systemStore(sha256, bytes, blob, nullptr, nullptr, failure);
@@ -13361,91 +13292,6 @@ public:
     }
   }
 
-  bool armMothershipListener(void)
-  {
-    // Recreate a clean listener socket for bootstrap and master transitions.
-    mothershipAcceptArmed = false;
-    mothershipSocket.recreateSocket();
-    mothershipSocket.isFixedFile = false;
-    mothershipSocket.pendingSend = false;
-    mothershipSocket.pendingSendBytes = 0;
-    mothershipSocket.pendingRecv = false;
-
-    String mothershipEndpoint;
-    configureMothershipControlIngress(mothershipEndpoint);
-    if (mothershipEndpoint.size() == 0)
-    {
-      // Unix-socket-only control mode leaves the legacy TCP listener disabled.
-      return false;
-    }
-
-    mothershipSocket.setIPVersion(AF_INET);
-    mothershipSocket.setSaddr(mothershipEndpoint, uint16_t(ReservedPorts::mothership));
-
-    constexpr uint32_t bindRetryLimit = 50;
-    bool listenerBound = false;
-    for (uint32_t attempt = 1; attempt <= bindRetryLimit; attempt++)
-    {
-      if (::bind(mothershipSocket.fd, mothershipSocket.saddr<struct sockaddr>(), mothershipSocket.saddrLen) == 0)
-      {
-        listenerBound = true;
-        break;
-      }
-
-      int err = errno;
-      if (err == EADDRINUSE)
-      {
-        if (attempt == bindRetryLimit)
-        {
-          basics_log("armMothershipListener bind busy after retries; deferring election\n");
-          ::close(mothershipSocket.fd);
-          mothershipSocket.fd = -1;
-          return false;
-        }
-
-        usleep(20'000);
-        continue;
-      }
-
-      basics_log("armMothershipListener bind failed errno=%d(%s)\n", err, strerror(err));
-      std::abort();
-    }
-
-    if (listenerBound == false)
-    {
-      return false;
-    }
-
-    if (::listen(mothershipSocket.fd, SOMAXCONN) != 0)
-    {
-      int err = errno;
-      basics_log("armMothershipListener listen failed errno=%d(%s)\n", err, strerror(err));
-      std::abort();
-    }
-
-    RingDispatcher::installMultiplexee(&mothershipSocket, this);
-    Ring::installFDIntoFixedFileSlot(&mothershipSocket);
-    // Bootstrap path: selfElectAsMaster() sets weAreMaster after this call,
-    // so do not gate the first accept arm on weAreMaster.
-    if (Ring::socketIsClosing(&mothershipSocket) == false)
-    {
-      Ring::queueAccept(&mothershipSocket, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
-      mothershipAcceptArmed = true;
-      basics_log("armMothershipListener queued initial accept isFixed=%d fd=%d fslot=%d weAreMaster=%d\n",
-                 int(mothershipSocket.isFixedFile),
-                 mothershipSocket.fd,
-                 mothershipSocket.fslot,
-                 int(weAreMaster));
-      std::fprintf(stderr, "prodigy mothership listen-arm transport=tcp listenerFD=%d listenerFslot=%d master=%d phase=initial\n",
-                   mothershipSocket.fd,
-                   mothershipSocket.fslot,
-                   int(weAreMaster));
-      std::fflush(stderr);
-    }
-
-    return true;
-  }
-
 protected:
 
   virtual bool installNeuronControlSocketFromBrain(NeuronView *neuron)
@@ -13474,10 +13320,8 @@ public:
     weAreMaster = false;
     noMasterYet = true;
     reconcileMothershipTunnelProviderRuntimeState();
-    mothershipAcceptArmed = false;
     mothershipUnixAcceptArmed = false;
 
-    teardownMothershipControlIngress();
     unlinkMothershipUnixSocketPath("forfeit-master");
 
     // Relinquishing master also relinquishes any active mothership control stream.
@@ -13494,20 +13338,6 @@ public:
       {
         queueCloseIfActive(stream);
       }
-    }
-
-    if (mothershipSocket.isFixedFile)
-    {
-      if (mothershipSocket.fslot >= 0 && Ring::socketIsClosing(&mothershipSocket) == false)
-      {
-        RingDispatcher::eraseMultiplexee(&mothershipSocket);
-        abandonSocketGeneration(&mothershipSocket);
-      }
-    }
-    else if (mothershipSocket.fd >= 0 && Ring::socketIsClosing(&mothershipSocket) == false)
-    {
-      RingDispatcher::eraseMultiplexee(&mothershipSocket);
-      abandonSocketGeneration(&mothershipSocket);
     }
 
     if (mothershipUnixSocket.isFixedFile)
@@ -13566,8 +13396,6 @@ public:
       weAreMaster = false;
       return false;
     }
-
-    (void)armMothershipListener();
 
     noMasterYet = false;
     pendingDesignatedMasterPeerKey = 0;
@@ -13775,7 +13603,6 @@ public:
       // Peer-master convergence must hard-stop any stale local ownership too.
       // Followers never hold commander or neuron control sockets.
       unlinkMothershipUnixSocketPath("elect-peer-master");
-      queueCloseIfActive(&mothershipSocket);
       queueCloseIfActive(&mothershipUnixSocket);
       if (activeMotherships.empty() == false)
       {
@@ -16199,7 +16026,7 @@ public:
     std::fflush(stderr);
     if (weAreMaster)
     {
-      queueMothershipListenersIfNeeded();
+      queueMothershipUnixAcceptIfNeeded();
     }
   }
 
@@ -16264,7 +16091,7 @@ public:
 
     if (weAreMaster)
     {
-      queueMothershipListenersIfNeeded();
+      queueMothershipUnixAcceptIfNeeded();
     }
   }
 
@@ -16514,7 +16341,7 @@ public:
       stream->rBuffer.clear();
       if (weAreMaster)
       {
-        queueMothershipListenersIfNeeded();
+        queueMothershipUnixAcceptIfNeeded();
       }
       queueCloseIfActive(stream);
       return false;
@@ -16572,7 +16399,7 @@ public:
       stream->rBuffer.clear();
       if (weAreMaster)
       {
-        queueMothershipListenersIfNeeded();
+        queueMothershipUnixAcceptIfNeeded();
       }
       queueCloseIfActive(stream);
       return false;
@@ -16592,47 +16419,6 @@ public:
                  stream->fslot);
     std::fflush(stderr);
     return streamIsActive(stream);
-  }
-
-  void queueMothershipAcceptIfNeeded(void)
-  {
-    if (weAreMaster == false)
-    {
-      return;
-    }
-
-    if (mothershipAcceptArmed)
-    {
-      return;
-    }
-
-    if (Ring::socketIsClosing(&mothershipSocket))
-    {
-      return;
-    }
-
-    bool listenerActive = false;
-    if (mothershipSocket.isFixedFile)
-    {
-      listenerActive = (mothershipSocket.fslot >= 0);
-    }
-    else
-    {
-      listenerActive = (mothershipSocket.fd >= 0);
-    }
-
-    if (listenerActive == false)
-    {
-      return;
-    }
-
-    Ring::queueAccept(&mothershipSocket, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
-    mothershipAcceptArmed = true;
-    std::fprintf(stderr, "prodigy mothership listen-arm transport=tcp listenerFD=%d listenerFslot=%d master=%d\n",
-                 mothershipSocket.fd,
-                 mothershipSocket.fslot,
-                 int(weAreMaster));
-    std::fflush(stderr);
   }
 
   void queueMothershipUnixAcceptIfNeeded(void)
@@ -16675,12 +16461,6 @@ public:
                  mothershipUnixSocket.fslot,
                  int(weAreMaster));
     std::fflush(stderr);
-  }
-
-  void queueMothershipListenersIfNeeded(void)
-  {
-    queueMothershipAcceptIfNeeded();
-    queueMothershipUnixAcceptIfNeeded();
   }
 
   Mothership *activeMothershipFromSocket(void *socket)
@@ -17141,7 +16921,7 @@ public:
         std::fflush(stderr);
         if (weAreMaster && closeCompletion == false)
         {
-          queueMothershipListenersIfNeeded();
+          queueMothershipUnixAcceptIfNeeded();
         }
         if (activeMothership->pendingSend == false && activeMothership->pendingRecv == false && activeMothership->wBuffer.outstandingBytes() == 0)
         {
@@ -17232,7 +17012,7 @@ public:
     Mothership *activeMothership = activeMothershipFromSocket(socket);
     if (result <= 0 && activeMothership != nullptr && weAreMaster)
     {
-      queueMothershipListenersIfNeeded();
+      queueMothershipUnixAcceptIfNeeded();
     }
 
     if (brains.contains(static_cast<BrainView *>(socket)))

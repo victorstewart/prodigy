@@ -2880,18 +2880,14 @@ int main(void)
       return true;
     };
 
-    int mothershipTcpPair[2] = {-1, -1};
     int mothershipUnixPair[2] = {-1, -1};
     int mothershipStreamPair[2] = {-1, -1};
     int neuronPair[2] = {-1, -1};
 
-    if (makeSocketPair("elect_brain_to_master_follower_convergence_creates_mothership_tcp_pair", mothershipTcpPair) &&
-        makeSocketPair("elect_brain_to_master_follower_convergence_creates_mothership_unix_pair", mothershipUnixPair) &&
+    if (makeSocketPair("elect_brain_to_master_follower_convergence_creates_mothership_unix_pair", mothershipUnixPair) &&
         makeSocketPair("elect_brain_to_master_follower_convergence_creates_mothership_stream_pair", mothershipStreamPair) &&
         makeSocketPair("elect_brain_to_master_follower_convergence_creates_neuron_pair", neuronPair))
     {
-      brain.mothershipSocket.fd = mothershipTcpPair[0];
-      brain.mothershipSocket.isFixedFile = false;
       brain.mothershipUnixSocket.fd = mothershipUnixPair[0];
       brain.mothershipUnixSocket.isFixedFile = false;
 
@@ -2936,7 +2932,6 @@ int main(void)
       suite.expect(brain.pendingDesignatedMasterPeerKey == 0, "elect_brain_to_master_follower_convergence_clears_pending_designated_master");
       suite.expect(brain.hasCompletedInitialMasterElection, "elect_brain_to_master_follower_convergence_marks_initial_election_complete");
       suite.expect(brain.persistCalls == 1, "elect_brain_to_master_follower_convergence_persists");
-      suite.expect(Ring::socketIsClosing(&brain.mothershipSocket), "elect_brain_to_master_follower_convergence_closes_mothership_tcp_listener");
       suite.expect(Ring::socketIsClosing(&brain.mothershipUnixSocket), "elect_brain_to_master_follower_convergence_closes_mothership_unix_listener");
       if (followerSocketPath.size() > 0)
       {
@@ -2971,7 +2966,7 @@ int main(void)
       }
     }
 
-    for (int *fds : {mothershipTcpPair, mothershipUnixPair, mothershipStreamPair, neuronPair})
+    for (int *fds : {mothershipUnixPair, mothershipStreamPair, neuronPair})
     {
       if (fds[0] >= 0)
       {
@@ -6321,27 +6316,6 @@ int main(void)
 
       cleanupNeuronSocket(machine.neuron, peerFD);
     }
-  }
-
-  {
-    TestBrain brain = {};
-    brain.iaas = new NoopBrainIaaS();
-    brain.mothershipAcceptArmed = true;
-
-    brain.testCloseHandler(&brain.mothershipSocket);
-
-    suite.expect(brain.mothershipAcceptArmed == false, "brain_close_handler_mothership_listener_disarms_accept");
-  }
-
-  {
-    TestBrain brain = {};
-    brain.iaas = new NoopBrainIaaS();
-    brain.weAreMaster = true;
-    brain.mothershipAcceptArmed = true;
-
-    brain.testCloseHandler(&brain.mothershipSocket);
-
-    suite.expect(brain.mothershipAcceptArmed == false, "brain_close_handler_mothership_listener_master_clears_accept_when_tcp_disabled");
   }
 
   withUniqueMothershipSocket("brain_close_handler_mothership_unix_listener_rearms_when_master", [&] {

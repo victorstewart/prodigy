@@ -89,11 +89,6 @@ public:
   uint128_t nextMothershipTunnelProviderContainerUUID = 0x77070001;
   uint128_t lastStoppedMothershipTunnelProviderContainerUUID = 0;
 
-  void configureMothershipControlIngress(String& mothershipEndpoint) override
-  {
-    mothershipEndpoint.assign("127.0.0.1"_ctv);
-  }
-
   void armMachineNeuronControl(Machine *machine) override
   {
     (void)machine;
