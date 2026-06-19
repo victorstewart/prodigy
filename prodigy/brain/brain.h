@@ -12695,11 +12695,10 @@ public:
     return ContainerStore::systemLoadVerified(sha256, bytes, blob, failure);
   }
 
-  virtual bool startMothershipTunnelProviderRuntime(const MothershipTunnelProviderSpec& spec, const MothershipTunnelGatewayAuth& gatewayAuth, const String& artifactBlob, uint128_t& containerUUID, String *failure = nullptr)
+  virtual bool startMothershipTunnelProviderRuntime(const MothershipTunnelProviderSpec& spec, const MothershipTunnelGatewayAuth& gatewayAuth, uint128_t& containerUUID, String *failure = nullptr)
   {
     (void)spec;
     (void)gatewayAuth;
-    (void)artifactBlob;
     containerUUID = 0;
     if (failure)
     {
@@ -12937,18 +12936,6 @@ public:
       return;
     }
 
-    String artifactBlob = {};
-    String artifactFailure = {};
-    if (loadSystemContainerArtifact(spec.artifactSha256, spec.artifactBytes, artifactBlob, &artifactFailure) == false)
-    {
-      if (artifactFailure.size() == 0)
-      {
-        artifactFailure.assign("tunnel provider artifact verification failed"_ctv);
-      }
-      failStopped(TunnelProviderPhase::awaitingMaterial, artifactFailure);
-      return;
-    }
-
     String launchFailure = {};
     if (mothershipTunnelProviderSpecValid(spec, &launchFailure) == false)
     {
@@ -12958,7 +12945,7 @@ public:
 
     uint128_t containerUUID = 0;
     state.phase = TunnelProviderPhase::starting;
-    if (startMothershipTunnelProviderRuntime(spec, mothershipTunnelGatewayAuth, artifactBlob, containerUUID, &launchFailure) == false)
+    if (startMothershipTunnelProviderRuntime(spec, mothershipTunnelGatewayAuth, containerUUID, &launchFailure) == false)
     {
       if (launchFailure.size() == 0)
       {

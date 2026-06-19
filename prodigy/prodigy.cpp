@@ -1070,7 +1070,7 @@ public:
     mothershipTunnelGateway.stop();
   }
 
-  bool startMothershipTunnelProviderInstance(const MothershipTunnelProviderSpec& spec, const String& artifactBlob, uint128_t& containerUUID, String *providerCgroup, String *failure = nullptr)
+  bool startMothershipTunnelProviderInstance(const MothershipTunnelProviderSpec& spec, uint128_t& containerUUID, String *providerCgroup, String *failure = nullptr)
   {
     containerUUID = 0;
     if (providerCgroup)
@@ -1085,15 +1085,6 @@ public:
       }
       return false;
     }
-    if (artifactBlob.size() != spec.artifactBytes)
-    {
-      if (failure)
-      {
-        failure->assign("mothership tunnel provider artifact size mismatch"_ctv);
-      }
-      return false;
-    }
-
     ContainerPlan containerPlan = {};
     containerUUID = Random::generateNumberWithNBits<128, uint128_t>();
     uint32_t egressAddress = 0;
@@ -1147,7 +1138,7 @@ public:
     return true;
   }
 
-  bool startMothershipTunnelProviderRuntime(const MothershipTunnelProviderSpec& spec, const MothershipTunnelGatewayAuth& gatewayAuth, const String& artifactBlob, uint128_t& containerUUID, String *failure = nullptr) override
+  bool startMothershipTunnelProviderRuntime(const MothershipTunnelProviderSpec& spec, const MothershipTunnelGatewayAuth& gatewayAuth, uint128_t& containerUUID, String *failure = nullptr) override
   {
     containerUUID = 0;
     if (prepareMothershipTunnelGateway(spec, failure) == false)
@@ -1156,7 +1147,7 @@ public:
     }
 
     String providerCgroup = {};
-    if (startMothershipTunnelProviderInstance(spec, artifactBlob, containerUUID, &providerCgroup, failure) &&
+    if (startMothershipTunnelProviderInstance(spec, containerUUID, &providerCgroup, failure) &&
         containerUUID != 0 &&
         startMothershipTunnelGateway(gatewayAuth, providerCgroup, failure))
     {

@@ -86,7 +86,6 @@ public:
   String lastStoredSystemContainerBlob = {};
   MothershipTunnelProviderSpec lastMothershipTunnelProviderSpec = {};
   MothershipTunnelGatewayAuth lastMothershipTunnelProviderGatewayAuth = {};
-  String lastMothershipTunnelProviderArtifactBlob = {};
   uint128_t nextMothershipTunnelProviderContainerUUID = 0x77070001;
   uint128_t lastStoppedMothershipTunnelProviderContainerUUID = 0;
 
@@ -161,12 +160,11 @@ public:
     return true;
   }
 
-  bool startMothershipTunnelProviderRuntime(const MothershipTunnelProviderSpec& spec, const MothershipTunnelGatewayAuth& gatewayAuth, const String& artifactBlob, uint128_t& containerUUID, String *failure = nullptr) override
+  bool startMothershipTunnelProviderRuntime(const MothershipTunnelProviderSpec& spec, const MothershipTunnelGatewayAuth& gatewayAuth, uint128_t& containerUUID, String *failure = nullptr) override
   {
     mothershipTunnelRuntimeStartCalls += 1;
     lastMothershipTunnelProviderSpec = spec;
     lastMothershipTunnelProviderGatewayAuth = gatewayAuth;
-    lastMothershipTunnelProviderArtifactBlob = artifactBlob;
     if (mothershipTunnelRuntimeStartSucceeds == false)
     {
       containerUUID = 0;
@@ -4913,7 +4911,7 @@ static void testMothershipTunnelProviderRuntimeLaunchBoundary(TestSuite& suite)
   suite.expect(state.phase == TunnelProviderPhase::awaitingSession, "mothership_tunnel_runtime_launch_phase");
   suite.expect(state.lastFailure.equal("waiting for authenticated tunnel session"_ctv), "mothership_tunnel_runtime_launch_waits_for_gateway_session");
   suite.expect(brain.mothershipTunnelRuntimeStartCalls == 1, "mothership_tunnel_runtime_launch_starts_once");
-  suite.expect(brain.lastMothershipTunnelProviderArtifactBlob.equal(blob), "mothership_tunnel_runtime_launch_carries_verified_blob");
+  suite.expect(brain.systemContainerLoadCalls == 0, "mothership_tunnel_runtime_launch_does_not_load_artifact_blob");
   suite.expect(equalSerializedObjects(brain.lastMothershipTunnelProviderGatewayAuth, auth), "mothership_tunnel_runtime_launch_carries_gateway_auth");
   suite.expect(equalSerializedObjects(brain.lastMothershipTunnelProviderSpec, config.tunnelProvider), "mothership_tunnel_runtime_launch_carries_spec");
 

@@ -18,19 +18,19 @@ excluding evidence artifacts under `prodigy/docs/tunnel-provider-refactor/*`.
 | State | Files | Insertions | Deletions |
 |---|---:|---:|---:|
 | Draft feature baseline | 52 | 7437 | 434 |
-| Current branch | 56 | 5881 | 540 |
+| Current branch | 56 | 5857 | 540 |
 
 Category ledger:
 
 | Category | Draft net | Current net | Net removed |
 |---|---:|---:|---:|
-| Production | +4883 | +3306 | 1577 |
-| Tests | +2081 | +1998 | 83 |
+| Production | +4883 | +3284 | 1599 |
+| Tests | +2081 | +1996 | 85 |
 | Docs | +30 | +28 | 2 |
 | Build metadata | +9 | +9 | 0 |
 
 The current project gate command, excluding evidence artifacts, reports
-`+5881 -540 net +5341` across 56 files. The full diff including evidence
+`+5857 -540 net +5317` across 56 files. The full diff including evidence
 artifacts is intentionally larger because this report and ledger are tracked.
 
 ## Lines Removed By Subsystem
@@ -47,6 +47,7 @@ artifacts is intentionally larger because this report and ledger are tracked.
 - System launch contract: deleted mutable `ContainerPlan` env/socket fields and the redundant provider-kind runtime env; Neuron now derives the fixed socket graft and provider env from `SystemContainerKind`.
 - Gateway implementation: moved socket/TLS/proxy code from the public header into a compiled runtime and centralized session result/failure publication.
 - System egress plan: replaced the variable-length `ContainerPlan` egress host/port pair and Neuron-side parser state with a prevalidated numeric `SystemContainerEgressPolicy`; text is rendered only at the provider env boundary.
+- Artifact launch boundary: removed the full verified artifact load/copy from Brain reconcile and deleted the artifact blob parameter from Brain/Prodigy provider launch hooks.
 
 See `LINE_LEDGER.tsv` for per-path numbers.
 
@@ -81,6 +82,7 @@ Fixed or hard-cut:
 - System-provider launch no longer serializes env or socket paths through `ContainerPlan`; the provider-kind env check is deleted because kind is already proven by artifact header and typed launch state.
 - ProdigyBrain no longer owns gateway thread, active FD, stop flag, or failure counter state directly; it owns one `MothershipTunnelGatewayRuntime`.
 - System-provider egress no longer serializes a textual host through `ContainerPlan` or reparses that host in Neuron; Prodigy launch validates the public IPv4 literal once and Neuron derives the BPF allowlist key from numeric plan data.
+- Tunnel-provider launch no longer loads the full system artifact into a `String` or passes artifact bytes through the Brain/Prodigy launch hook.
 
 Superseded by later user direction:
 
@@ -149,6 +151,7 @@ All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 - After deleting mutable system-provider env/socket launch fields from `ContainerPlan`: `git diff --check`; incremental `cmake --build .run/build-cgroup --target prodigy mothership prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit prodigy_container_overlay_sync_unit prodigy_persistent_state_unit prodigy_mothership_cluster_registry_unit --parallel 16`; `.run/build-cgroup/prodigy_mothership_unix_connect_unit`; `.run/build-cgroup/prodigy_brain_replication_credentials_unit`; `PRODIGY_DEV_ALLOW_BPF_ATTACH=1 .run/build-cgroup/prodigy_container_overlay_sync_unit`; `.run/build-cgroup/prodigy_persistent_state_unit`; `.run/build-cgroup/prodigy_mothership_cluster_registry_unit`.
 - After moving gateway socket/TLS/proxy implementation out of the public header: `git diff --check`; incremental `cmake --build .run/build-cgroup --target prodigy prodigy_mothership_unix_connect_unit --parallel 16`; `.run/build-cgroup/prodigy_mothership_unix_connect_unit`.
 - After replacing textual system egress in `ContainerPlan` with a numeric policy tuple in fresh VM worktree `/work/prodigy-verify-egress-CNEz6U`: `git diff --check`; `cmake -S prodigy/dev -B .run/build-egress -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++`; `cmake --build .run/build-egress --target prodigy mothership prodigy_container_overlay_sync_unit prodigy_mothership_cluster_registry_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-egress/prodigy_mothership_cluster_registry_unit`; `PRODIGY_DEV_ALLOW_BPF_ATTACH=1 .run/build-egress/prodigy_container_overlay_sync_unit`.
+- After deleting the provider launch artifact blob path in the same fresh VM worktree: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-egress/prodigy_brain_replication_credentials_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test and after the focused unit.
 
 Earlier validation on the same branch also covered the broader build/test matrix:
 cluster registry, deployments, bundle artifact, BPF attach units, host/container
@@ -169,7 +172,7 @@ Recorded binary/object sizes from the VM RelWithDebInfo build:
 | `host.ingress.router.ebpf.o` | 454296 |
 | `container.egress.router.ebpf.o` | 427800 |
 
-Focused unit counters now prove that a running provider report/reconcile performs no artifact presence check and no artifact load in the tested path.
+Focused unit counters now prove that a running provider report/reconcile performs no artifact presence check, and that provider launch performs no artifact load after the artifact is present.
 
 Not measured: clean build wall time, incremental cluster-type fanout, gateway throughput/latency, 100k reconcile counters, artifact byte-copy counters, and BPF instruction deltas against `main`.
 

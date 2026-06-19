@@ -6,7 +6,7 @@ production	7	0	7	ebpf/kernel/maps.h
 production	20	0	20	ebpf/kernel/services.h
 production	6	2	4	enums/datacenter.h
 production	30	0	30	prodigy/brain/base.h
-production	558	29	529	prodigy/brain/brain.h
+production	545	29	516	prodigy/brain/brain.h
 production	2	1	1	prodigy/brain/machine.h
 production	116	4	112	prodigy/container.contract.h
 production	163	2	161	prodigy/containerstore.h
@@ -16,7 +16,7 @@ test	2	2	0	prodigy/dev/tests/prodigy_brain_config_ssh_replication_unit.cpp
 test	2	2	0	prodigy/dev/tests/prodigy_brain_ipv6_topology_unit.cpp
 test	2	2	0	prodigy/dev/tests/prodigy_brain_master_uuid_unit.cpp
 test	2	2	0	prodigy/dev/tests/prodigy_brain_overlay_hosted_ingress_unit.cpp
-test	733	9	724	prodigy/dev/tests/prodigy_brain_replication_credentials_unit.cpp
+test	731	9	722	prodigy/dev/tests/prodigy_brain_replication_credentials_unit.cpp
 test	3	1	2	prodigy/dev/tests/prodigy_brain_topic_fuzz.cpp
 test	107	0	107	prodigy/dev/tests/prodigy_container_overlay_sync_unit.cpp
 test	70	4	66	prodigy/dev/tests/prodigy_deployments_unit.cpp
@@ -47,7 +47,7 @@ production	1	0	1	prodigy/neuron/base.h
 production	349	135	214	prodigy/neuron/containers.h
 production	28	18	10	prodigy/neuron/neuron.h
 production	16	18	-2	prodigy/persistent.state.h
-production	207	2	205	prodigy/prodigy.cpp
+production	198	2	196	prodigy/prodigy.cpp
 production	60	0	60	prodigy/system.container.policy.h
 production	215	1	214	prodigy/types.h
 production	27	0	27	switchboard/kernel/container.egress.router.ebpf.c

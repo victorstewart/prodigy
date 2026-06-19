@@ -39,6 +39,8 @@
 | `cmake -S prodigy/dev -B .run/build-egress -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++` after numeric system-egress plan change | pass |
 | `cmake --build .run/build-egress --target prodigy mothership prodigy_container_overlay_sync_unit prodigy_mothership_cluster_registry_unit prodigy_brain_replication_credentials_unit --parallel 16` after numeric system-egress plan change | pass |
 | `.run/build-egress/prodigy_mothership_cluster_registry_unit` after numeric system-egress plan change | pass |
+| `cmake --build .run/build-egress --target prodigy prodigy_brain_replication_credentials_unit --parallel 16` after deleting the launch artifact blob path | pass |
+| `.run/build-egress/prodigy_brain_replication_credentials_unit` after deleting the launch artifact blob path | pass |
 
 ## Privileged Tests Run In VM
 
@@ -73,4 +75,5 @@ Reason: the focused VM verification proved the touched unit/BPF paths, but the o
 - `PRODIGY_CONTAINER_KIND` launch env is deleted; artifact header plus typed launch state carry that identity.
 - Gateway socket/TLS/proxy implementation moved to compiled `.cpp`; public header is declarations only.
 - System-provider egress is carried through `ContainerPlan` as a numeric `SystemContainerEgressPolicy`; Neuron no longer reparses a serialized text host before installing the BPF allowlist.
+- Tunnel-provider launch no longer calls `loadSystemContainerArtifact` or passes an artifact blob through the Brain/Prodigy launch hook.
 - Remote branch head matches local head.
