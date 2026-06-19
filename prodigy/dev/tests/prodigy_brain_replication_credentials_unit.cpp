@@ -4946,14 +4946,21 @@ static void testMothershipTunnelProviderRuntimeLaunchBoundary(TestSuite& suite)
 static void testMothershipTunnelProviderGatewaySessionMarksHealthy(TestSuite& suite)
 {
   TestBrain brain;
+  brain.weAreMaster = true;
   brain.mothershipConnectivity.kind = MothershipConnectivityKind::tunnelProvider;
+  brain.mothershipTunnelGatewayAuth = makeTunnelGatewayAuth();
   brain.mothershipTunnelProviderRuntimeState.localContainerUUID = 123;
   brain.mothershipTunnelProviderRuntimeState.phase = TunnelProviderPhase::awaitingSession;
   brain.mothershipTunnelProviderRuntimeState.lastFailure.assign("waiting for gateway session"_ctv);
 
   brain.noteMothershipTunnelProviderControlSession(true, true);
   suite.expect(brain.mothershipTunnelProviderRuntimeState.phase == TunnelProviderPhase::healthy, "mothership_tunnel_runtime_gateway_session_marks_healthy");
+  suite.expect(brain.mothershipTunnelProviderRuntimeState.lastHealthyAtMs > 0, "mothership_tunnel_runtime_gateway_session_records_health_time");
   suite.expect(brain.mothershipTunnelProviderRuntimeState.lastFailure.size() == 0, "mothership_tunnel_runtime_gateway_session_clears_failure");
+  brain.mothershipTunnelProviderRuntimeState.lastHealthyAtMs = Time::now<TimeResolution::ms>() - TestBrain::mothershipTunnelProviderSessionHealthTtlMs - 1;
+  brain.reconcileMothershipTunnelProviderRuntimeState();
+  suite.expect(brain.mothershipTunnelProviderRuntimeState.localContainerUUID == 123 && brain.mothershipTunnelProviderRuntimeState.phase == TunnelProviderPhase::awaitingSession, "mothership_tunnel_runtime_gateway_session_health_ages_out");
+  suite.expect(brain.mothershipTunnelProviderRuntimeState.lastFailure.equal("waiting for authenticated tunnel session"_ctv), "mothership_tunnel_runtime_gateway_session_age_out_waits_for_live_session");
 
   TestBrain notRunning;
   notRunning.mothershipConnectivity.kind = MothershipConnectivityKind::tunnelProvider;

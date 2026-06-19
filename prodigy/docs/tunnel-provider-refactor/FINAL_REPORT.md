@@ -18,19 +18,19 @@ excluding evidence artifacts under `prodigy/docs/tunnel-provider-refactor/*`.
 | State | Files | Insertions | Deletions |
 |---|---:|---:|---:|
 | Draft feature baseline | 52 | 7437 | 434 |
-| Current branch | 55 | 5740 | 526 |
+| Current branch | 55 | 5756 | 526 |
 
 Category ledger:
 
 | Category | Draft net | Current net | Net removed |
 |---|---:|---:|---:|
-| Production | +4883 | +3198 | 1685 |
-| Tests | +2081 | +1981 | 100 |
+| Production | +4883 | +3207 | 1676 |
+| Tests | +2081 | +1988 | 93 |
 | Docs | +30 | +28 | 2 |
 | Build metadata | +9 | +7 | 2 |
 
 The current project gate command, excluding evidence artifacts, reports
-`+5740 -526 net +5214` across 55 files. The full diff including evidence
+`+5756 -526 net +5230` across 55 files. The full diff including evidence
 artifacts is intentionally larger because this report and ledger are tracked.
 
 ## Lines Removed By Subsystem
@@ -65,6 +65,7 @@ Fixed or hard-cut:
 - Running-provider reconcile/report returns before artifact presence/load work; focused counters cover this path.
 - Provider health/status no longer carries redundant derived report fields.
 - Provider failure no longer disables a generation by matching a diagnostic string prefix; it enters explicit backoff and can retry.
+- Provider health now ages out after a bounded control-session TTL instead of staying healthy forever after one session.
 - Uploaded provider state is intercepted by `SystemContainerKind::mothershipTunnelProvider`, not by the reserved fragment alone.
 - Tunnel endpoint input is hard-cut to public IPv4 literal TCP.
 - Cluster schema types no longer own certificate parsing/generation, egress policy helpers, runtime policy, or Brain runtime state.
@@ -91,7 +92,7 @@ connectivity kind != tunnelProvider -> disabled
 not active master -> disabled
 missing auth/artifact -> awaitingMaterial
 artifact/auth/spec present -> starting -> awaitingSession
-authenticated control session -> healthy
+authenticated control session -> healthy until TTL expires
 provider failure -> backoff with retry deadline
 ```
 
@@ -129,9 +130,7 @@ All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 - `cmake --build .run/phase-runtime --target prodigy mothership prodigy_brain_replication_credentials_unit prodigy_brain_topic_fuzz -j16`
 - `./prodigy_brain_replication_credentials_unit`
 - `./prodigy_brain_topic_fuzz -runs=100000`
-- `cmake --build .run/phase-runtime --target prodigy_brain_replication_credentials_unit -j16`
-- `./prodigy_brain_replication_credentials_unit`
-- `cmake --build .run/phase-runtime --target prodigy -j16`
+- Repeated `cmake --build .run/phase-runtime --target prodigy_brain_replication_credentials_unit -j16`, `./prodigy_brain_replication_credentials_unit`, and `cmake --build .run/phase-runtime --target prodigy -j16` after the system-kind upload identity and health-aging slices.
 
 Earlier validation on the same branch also covered the broader build/test matrix:
 cluster registry, deployments, bundle artifact, BPF attach units, host/container
@@ -159,7 +158,7 @@ Not measured: clean build wall time, incremental cluster-type fanout, gateway th
 ## Remaining Risks
 
 - Full original definition of done is not met.
-- Runtime health now has an explicit phase enum, but health aging and jittered timer-driven retry remain incomplete.
+- Runtime health now has an explicit phase enum and TTL aging; jittered timer-driven retry remains incomplete.
 - Control-plane activation is one Mothership configure request plus artifact-first Brain replication and a master-authority desired-state transition.
 - Gateway I/O/deadline/backpressure behavior is covered by focused tests but not a full nonblocking state-machine proof.
 - Artifact provenance remains weaker than the signed-envelope design requested in the original goal.

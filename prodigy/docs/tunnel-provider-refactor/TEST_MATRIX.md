@@ -18,6 +18,8 @@
 | `cmake --build .run/phase-runtime --target prodigy_brain_replication_credentials_unit -j16` | pass |
 | `.run/phase-runtime/prodigy_brain_replication_credentials_unit` after system-kind upload identity change | pass |
 | `cmake --build .run/phase-runtime --target prodigy -j16` | pass |
+| `.run/phase-runtime/prodigy_brain_replication_credentials_unit` after health-aging change | pass |
+| `cmake --build .run/phase-runtime --target prodigy -j16` after health-aging change | pass |
 
 ## Privileged Tests Run In VM
 
@@ -42,4 +44,5 @@ Reason: the focused VM verification proved the touched unit/BPF paths, but the o
 - Product LOC gate met.
 - Running provider report/reconcile skips artifact presence/load in focused counter tests.
 - Provider state upload is keyed by `SystemContainerKind`, not the reserved fragment alone.
+- Provider health ages out from one historical authenticated session in focused Brain tests.
 - Remote branch head matches local head.

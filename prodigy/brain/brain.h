@@ -889,6 +889,7 @@ public:
   constexpr static int64_t publicTlsCertbotTimeoutMs = 60 * 60 * 1000;
   constexpr static int64_t mothershipTunnelProviderBaseRetryDelayMs = 5 * 1000;
   constexpr static int64_t mothershipTunnelProviderMaxRetryDelayMs = 5 * 60 * 1000;
+  constexpr static int64_t mothershipTunnelProviderSessionHealthTtlMs = 60 * 1000;
   bytell_hash_map<uint64_t, int64_t> connectFailureNextLogMsByKey;
 
   // not master brain
@@ -953,6 +954,7 @@ public:
     uint128_t localContainerUUID = 0;
     uint32_t failureCount = 0;
     int64_t nextRetryMs = 0;
+    int64_t lastHealthyAtMs = 0;
     String lastFailure;
   } mothershipTunnelProviderRuntimeState;
   uint16_t nextReservableApplicationID = 1;
@@ -12748,6 +12750,7 @@ public:
       mothershipTunnelProviderRuntimeState.phase = TunnelProviderPhase::healthy;
       mothershipTunnelProviderRuntimeState.failureCount = 0;
       mothershipTunnelProviderRuntimeState.nextRetryMs = 0;
+      mothershipTunnelProviderRuntimeState.lastHealthyAtMs = Time::now<TimeResolution::ms>();
       mothershipTunnelProviderRuntimeState.lastFailure.clear();
     }
   }
@@ -12914,6 +12917,12 @@ public:
 
     if (state.localContainerUUID != 0)
     {
+      if (state.phase == TunnelProviderPhase::healthy &&
+          state.lastHealthyAtMs + mothershipTunnelProviderSessionHealthTtlMs < Time::now<TimeResolution::ms>())
+      {
+        state.phase = TunnelProviderPhase::awaitingSession;
+        state.lastFailure.assign("waiting for authenticated tunnel session"_ctv);
+      }
       return;
     }
 
