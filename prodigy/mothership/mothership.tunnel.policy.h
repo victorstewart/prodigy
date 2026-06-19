@@ -95,10 +95,3 @@ static inline bool mothershipConnectivityRuntimeConfigValid(const MothershipConn
 
   return mothershipTunnelProviderSpecValid(config.tunnelProvider, failure);
 }
-
-static inline bool mothershipBuildMothershipConnectivityRuntimeConfig(const MothershipConnectivity& connectivity, MothershipConnectivityRuntimeConfig& config, String *failure = nullptr)
-{
-  config = connectivity;
-  mothershipStripMothershipOnlyConnectivityFields(config);
-  return mothershipConnectivityRuntimeConfigValid(config, failure);
-}

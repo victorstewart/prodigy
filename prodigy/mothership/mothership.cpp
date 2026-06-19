@@ -8056,7 +8056,9 @@ private:
           MothershipTunnelProviderConfigureRequest request = {};
           request.artifactBlob = std::move(artifactBlob);
           request.desired.gatewayAuth = tunnelProviderGatewayAuth;
-          if (mothershipBuildMothershipConnectivityRuntimeConfig(cluster.mothershipConnectivity, request.desired.connectivity, &requestFailure) == false)
+          request.desired.connectivity = cluster.mothershipConnectivity;
+          mothershipStripMothershipOnlyConnectivityFields(request.desired.connectivity);
+          if (mothershipConnectivityRuntimeConfigValid(request.desired.connectivity, &requestFailure) == false)
           {
             return false;
           }
