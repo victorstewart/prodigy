@@ -586,7 +586,7 @@ public:
     return pathForSystemArtifactWithinRoot(storeRoot ? *storeRoot : String("/containers/system-store"_ctv), sha256);
   }
 
-  static bool systemStore(const String& sha256, uint64_t bytes, const String& blob, String *actualDigest = nullptr, uint64_t *actualBytes = nullptr, String *failureReport = nullptr, const String *storeRoot = nullptr)
+  static bool systemStore(const String& sha256, uint64_t bytes, const String& blob, String *failureReport = nullptr, const String *storeRoot = nullptr)
   {
     if (validateSystemArtifactKey(sha256, bytes, failureReport) == false || validateSystemArtifactContract(blob, failureReport) == false)
     {
@@ -599,7 +599,7 @@ public:
     prodigyDirname(path, parent);
     (void)Filesystem::createDirectoryAt(-1, root, 0755);
     (void)Filesystem::createDirectoryAt(-1, parent, 0755);
-    return storeBlobAtPath(path, blob, actualDigest, actualBytes, &sha256, &bytes, failureReport);
+    return storeBlobAtPath(path, blob, nullptr, nullptr, &sha256, &bytes, failureReport);
   }
 
   static bool systemVerify(const String& sha256, uint64_t bytes, String *actualDigest = nullptr, uint64_t *actualBytes = nullptr, String *failureReport = nullptr, const String *storeRoot = nullptr)

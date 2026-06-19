@@ -18,19 +18,19 @@ excluding evidence artifacts under `prodigy/docs/tunnel-provider-refactor/*`.
 | State | Files | Insertions | Deletions |
 |---|---:|---:|---:|
 | Draft feature baseline | 52 | 7437 | 434 |
-| Current branch | 57 | 5762 | 870 |
+| Current branch | 57 | 5749 | 870 |
 
 Category ledger:
 
 | Category | Draft net | Current net | Net removed |
 |---|---:|---:|---:|
-| Production | +4883 | +2887 | 1996 |
-| Tests | +2081 | +1968 | 113 |
+| Production | +4883 | +2881 | 2002 |
+| Tests | +2081 | +1961 | 120 |
 | Docs | +30 | +28 | 2 |
 | Build metadata | +9 | +9 | 0 |
 
 The current project gate command, excluding evidence artifacts, reports
-`+5762 -870 net +4892` across 57 files. The full diff including evidence
+`+5749 -870 net +4879` across 57 files. The full diff including evidence
 artifacts is intentionally larger because this report and ledger are tracked.
 
 ## Lines Removed By Subsystem
@@ -59,6 +59,7 @@ artifacts is intentionally larger because this report and ledger are tracked.
 - System artifact store surface: collapsed single-use private system-store wrappers into the public store/verify/load boundary and deleted the product provider-header validator that existed only for tests.
 - Provider egress spec: hard-cut persisted text host/port fields to one numeric `SystemContainerEgressPolicy`; create JSON text is parsed once at the boundary, and runtime launch copies the numeric tuple.
 - Brain desired-state commit: deleted the capture/sync/prepared-apply wrappers so one helper owns the tunnel desired-state mutation, runtime stop/reset, reconcile, and optional master-authority persistence.
+- System artifact store API: deleted redundant actual digest/byte out-params from `ContainerStore::systemStore`; callers already hold the enforced key.
 
 See `LINE_LEDGER.tsv` for per-path numbers.
 
@@ -113,6 +114,7 @@ Fixed or hard-cut:
 - `ContainerStore` no longer carries private forwarding helpers for the single system artifact kind, and the tunnel-provider header validator is test-local instead of exported as production API.
 - Tunnel-provider persisted/runtime spec carries numeric egress policy, not text host/port, so runtime launch no longer reparses egress.
 - Brain tunnel desired-state application now has one commit boundary after create/runtime sanitization; there is no separate prepared-state sync wrapper.
+- System artifact store no longer reports digest/size copies from the write path; create preflight records the already computed enforced key.
 
 Superseded by later user direction:
 
@@ -202,6 +204,7 @@ All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 - After flattening the system artifact store helpers in fresh VM worktree `/work/prodigy-verify-system-artifact-HJV8QE`: `git diff --check`; `cmake -S prodigy/dev -B .run/build-system-artifact -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++`; `cmake --build .run/build-system-artifact --target prodigy mothership prodigy_deployments_unit prodigy_brain_replication_credentials_unit prodigy_mothership_unix_connect_unit --parallel 16`; `.run/build-system-artifact/prodigy_deployments_unit`; `.run/build-system-artifact/prodigy_brain_replication_credentials_unit`; `.run/build-system-artifact/prodigy_mothership_unix_connect_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test and after the focused units.
 - After hard-cutting provider egress from persisted text fields to numeric policy in fresh VM worktree `/work/prodigy-verify-numeric-egress-Kwi2Rh`: `git diff --check`; `cmake -S prodigy/dev -B .run/build-numeric-egress -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++`; `cmake --build .run/build-numeric-egress --target prodigy mothership prodigy_mothership_unix_connect_unit prodigy_mothership_cluster_registry_unit prodigy_brain_replication_credentials_unit prodigy_persistent_state_unit --parallel 16`; `.run/build-numeric-egress/prodigy_mothership_cluster_registry_unit`; `.run/build-numeric-egress/prodigy_mothership_unix_connect_unit`; `.run/build-numeric-egress/prodigy_brain_replication_credentials_unit`; `.run/build-numeric-egress/prodigy_persistent_state_unit`. The first cluster-registry unit run exposed that `0.0.0.0` is now numeric-unconfigured instead of a persisted denied address; that stale case was removed, the unit was rebuilt, and all focused units then exited 0. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before and after build/test.
 - After collapsing Brain tunnel desired-state commit wrappers in the same VM worktree: `git diff --check`; incremental `cmake --build .run/build-numeric-egress --target prodigy mothership prodigy_brain_replication_credentials_unit prodigy_persistent_state_unit prodigy_brain_topic_fuzz --parallel 16`; `.run/build-numeric-egress/prodigy_brain_replication_credentials_unit`; `.run/build-numeric-egress/prodigy_persistent_state_unit`; `.run/build-numeric-egress/prodigy_brain_topic_fuzz -runs=100000`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before and after build/test.
+- After collapsing the redundant `ContainerStore::systemStore` output API in the same VM worktree: `git diff --check`; incremental `cmake --build .run/build-numeric-egress --target prodigy mothership prodigy_deployments_unit prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-numeric-egress/prodigy_deployments_unit`; `.run/build-numeric-egress/prodigy_mothership_unix_connect_unit`; `.run/build-numeric-egress/prodigy_brain_replication_credentials_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` after build/test.
 
 Earlier validation on the same branch also covered the broader build/test matrix:
 cluster registry, deployments, bundle artifact, BPF attach units, host/container

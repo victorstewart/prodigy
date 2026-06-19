@@ -19,10 +19,10 @@ test	0	9	-9	prodigy/dev/tests/prodigy_brain_overlay_hosted_ingress_unit.cpp
 test	744	15	729	prodigy/dev/tests/prodigy_brain_replication_credentials_unit.cpp
 test	3	1	2	prodigy/dev/tests/prodigy_brain_topic_fuzz.cpp
 test	107	0	107	prodigy/dev/tests/prodigy_container_overlay_sync_unit.cpp
-test	81	4	77	prodigy/dev/tests/prodigy_deployments_unit.cpp
+test	75	4	71	prodigy/dev/tests/prodigy_deployments_unit.cpp
 test	114	1	113	prodigy/dev/tests/prodigy_mothership_cluster_registry_unit.cpp
 test	2	1	1	prodigy/dev/tests/prodigy_mothership_topic_fuzz.cpp
-test	619	4	615	prodigy/dev/tests/prodigy_mothership_unix_connect_unit.cpp
+test	618	4	614	prodigy/dev/tests/prodigy_mothership_unix_connect_unit.cpp
 test	31	9	22	prodigy/dev/tests/prodigy_persistent_state_unit.cpp
 test	5	5	0	prodigy/dev/tests/prodigy_switchboard_whitehole_unit.cpp
 production	17	11	6	prodigy/discombobulator/src/build.rs
@@ -38,7 +38,7 @@ production	19	10	9	prodigy/ingress.validation.h
 production	1	0	1	prodigy/mothership/mothership.cluster.create.h
 production	76	4	72	prodigy/mothership/mothership.cluster.registry.h
 production	21	0	21	prodigy/mothership/mothership.cluster.types.h
-production	606	63	543	prodigy/mothership/mothership.cpp
+production	600	63	537	prodigy/mothership/mothership.cpp
 production	275	0	275	prodigy/mothership/mothership.tunnel.auth.h
 production	617	0	617	prodigy/mothership/mothership.tunnel.gateway.cpp
 production	62	0	62	prodigy/mothership/mothership.tunnel.gateway.h

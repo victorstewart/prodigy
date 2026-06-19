@@ -12618,7 +12618,7 @@ public:
 
   virtual bool storeSystemContainerArtifact(const String& sha256, uint64_t bytes, const String& blob, String *failure = nullptr)
   {
-    return ContainerStore::systemStore(sha256, bytes, blob, nullptr, nullptr, failure);
+    return ContainerStore::systemStore(sha256, bytes, blob, failure);
   }
 
   virtual bool systemContainerArtifactPresent(const String& sha256, uint64_t bytes)

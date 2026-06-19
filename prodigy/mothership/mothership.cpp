@@ -5908,8 +5908,6 @@ private:
       return false;
     }
 
-    String actualDigest = {};
-    uint64_t actualBytes = 0;
     String storeFailure = {};
     bool stored = false;
 #if PRODIGY_DEBUG
@@ -5919,8 +5917,6 @@ private:
           digest,
           blob.size(),
           blob,
-          &actualDigest,
-          &actualBytes,
           &storeFailure,
           debugSystemStoreRoot);
     }
@@ -5933,8 +5929,6 @@ private:
           digest,
           blob.size(),
           blob,
-          &actualDigest,
-          &actualBytes,
           &storeFailure);
     }
 
@@ -5947,8 +5941,8 @@ private:
       return false;
     }
 
-    spec.artifactSha256 = actualDigest;
-    spec.artifactBytes = actualBytes;
+    spec.artifactSha256 = digest;
+    spec.artifactBytes = blob.size();
     return true;
   }
 

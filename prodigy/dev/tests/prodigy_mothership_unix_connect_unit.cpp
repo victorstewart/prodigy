@@ -832,7 +832,6 @@ int main(void)
       suite.expect(failure.size() == 0, "tunnel_provider_artifact_preflight_valid_no_failure");
       suite.expect(spec.artifactBytes == tunnelBlob.size(), "tunnel_provider_artifact_preflight_sets_size");
       suite.expect(ContainerStore::systemVerify(spec.artifactSha256, spec.artifactBytes, nullptr, nullptr, &failure, &systemStoreRoot.path), "tunnel_provider_artifact_preflight_stores_blob");
-      uint128_t clusterUUID = 0xABC1;
       MothershipTunnelGatewayAuth gatewayAuth = {};
       suite.expect(mothership.unitTestPrepareTunnelProviderGatewayAuth(spec, gatewayAuth, &failure), "tunnel_provider_gateway_auth_preflight_generates");
       suite.expect(spec.clientAuth.configured(), "tunnel_provider_gateway_auth_preflight_sets_client_auth");
