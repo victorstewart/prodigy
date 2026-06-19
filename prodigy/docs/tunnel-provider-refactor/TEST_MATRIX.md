@@ -12,6 +12,9 @@
 | `prodigy_deployments_unit` | pass |
 | `prodigy_bundle_artifact_unit` | pass |
 | `cargo test --all-targets` in `prodigy/discombobulator` | pass |
+| `cmake --build .run/phase-runtime --target prodigy mothership prodigy_brain_replication_credentials_unit prodigy_brain_topic_fuzz -j16` | pass |
+| `.run/phase-runtime/prodigy_brain_replication_credentials_unit` | pass |
+| `.run/phase-runtime/prodigy_brain_topic_fuzz -runs=100000` | pass |
 
 ## Privileged Tests Run In VM
 
@@ -34,4 +37,5 @@ Reason: the focused VM verification proved the touched unit/BPF paths, but the o
 - Built-in provider moved to test fixture target.
 - Source-IP-only NAT code removed.
 - Product LOC gate met.
+- Running provider report/reconcile skips artifact presence/load in focused counter tests.
 - Remote branch head matches local head.

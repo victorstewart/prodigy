@@ -57,6 +57,31 @@ enum class MothershipConnectivityKind : uint8_t {
   tunnelProvider = 1
 };
 
+enum class TunnelProviderPhase : uint8_t {
+  disabled,
+  awaitingMaterial,
+  starting,
+  awaitingSession,
+  healthy,
+  backoff,
+  stopping
+};
+
+static inline const char *tunnelProviderPhaseName(TunnelProviderPhase phase)
+{
+  switch (phase)
+  {
+    case TunnelProviderPhase::disabled: return "disabled";
+    case TunnelProviderPhase::awaitingMaterial: return "awaitingMaterial";
+    case TunnelProviderPhase::starting: return "starting";
+    case TunnelProviderPhase::awaitingSession: return "awaitingSession";
+    case TunnelProviderPhase::healthy: return "healthy";
+    case TunnelProviderPhase::backoff: return "backoff";
+    case TunnelProviderPhase::stopping: return "stopping";
+  }
+  return "unknown";
+}
+
 struct MothershipTunnelGatewayClientAuth {
   String rootCertPem;
   String clientCertPem;
@@ -4350,13 +4375,14 @@ static void serialize(S&& serializer, MachineStatusReport& report)
 
 struct MothershipConnectivityStatusReport {
   String kind;
+  TunnelProviderPhase tunnelProviderPhase = TunnelProviderPhase::disabled;
   String lastFailure;
 
   void stringify(String& string) const
   {
     if (kind.size() > 0)
     {
-      string.snprintf_add<"mothershipConnectivity kind={} lastFailure={}\n"_ctv>(kind, lastFailure);
+      string.snprintf_add<"mothershipConnectivity kind={} phase={} lastFailure={}\n"_ctv>(kind, String(tunnelProviderPhaseName(tunnelProviderPhase)), lastFailure);
     }
   }
 };
@@ -4365,6 +4391,7 @@ template <typename S>
 static void serialize(S&& serializer, MothershipConnectivityStatusReport& report)
 {
   serializer.text1b(report.kind, UINT32_MAX);
+  serializer.value1b(report.tunnelProviderPhase);
   serializer.text1b(report.lastFailure, UINT32_MAX);
 }
 

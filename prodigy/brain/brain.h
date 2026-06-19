@@ -887,8 +887,8 @@ public:
   constexpr static int64_t certificateLifecycleMaxJitterMs = 15 * 60 * 1000;
   constexpr static int64_t credentialDeltaAckTimeoutMs = 5 * 60 * 1000;
   constexpr static int64_t publicTlsCertbotTimeoutMs = 60 * 60 * 1000;
-  constexpr static auto mothershipTunnelProviderPendingHealth = "waiting for authenticated tunnel session"_ctv;
-  constexpr static auto mothershipTunnelProviderTerminalFailurePrefix = "mothership tunnel provider exited: "_ctv;
+  constexpr static int64_t mothershipTunnelProviderBaseRetryDelayMs = 5 * 1000;
+  constexpr static int64_t mothershipTunnelProviderMaxRetryDelayMs = 5 * 60 * 1000;
   bytell_hash_map<uint64_t, int64_t> connectFailureNextLogMsByKey;
 
   // not master brain
@@ -949,7 +949,10 @@ public:
   MothershipConnectivityRuntimeConfig mothershipConnectivity;
   MothershipTunnelGatewayAuth mothershipTunnelGatewayAuth;
   struct {
+    TunnelProviderPhase phase = TunnelProviderPhase::disabled;
     uint128_t localContainerUUID = 0;
+    uint32_t failureCount = 0;
+    int64_t nextRetryMs = 0;
     String lastFailure;
   } mothershipTunnelProviderRuntimeState;
   uint16_t nextReservableApplicationID = 1;
@@ -12708,10 +12711,28 @@ public:
     (void)containerUUID;
   }
 
+  static int64_t mothershipTunnelProviderRetryDelayMs(uint32_t failureCount)
+  {
+    int64_t delayMs = mothershipTunnelProviderBaseRetryDelayMs;
+    for (uint32_t i = 1; i < failureCount && delayMs < mothershipTunnelProviderMaxRetryDelayMs; ++i)
+    {
+      delayMs = std::min(delayMs * 2, mothershipTunnelProviderMaxRetryDelayMs);
+    }
+    return delayMs;
+  }
+
+  template <typename Diagnostic>
+  void noteMothershipTunnelProviderPhase(TunnelProviderPhase phase, Diagnostic&& diagnostic)
+  {
+    mothershipTunnelProviderRuntimeState.phase = phase;
+    mothershipTunnelProviderRuntimeState.lastFailure.assign(diagnostic);
+  }
+
   void stopMothershipTunnelProviderLocalInstance(void)
   {
     if (mothershipTunnelProviderRuntimeState.localContainerUUID != 0)
     {
+      mothershipTunnelProviderRuntimeState.phase = TunnelProviderPhase::stopping;
       stopMothershipTunnelProviderRuntime(mothershipTunnelProviderRuntimeState.localContainerUUID);
     }
     mothershipTunnelProviderRuntimeState.localContainerUUID = 0;
@@ -12724,6 +12745,9 @@ public:
         authenticated &&
         openedControlSocket)
     {
+      mothershipTunnelProviderRuntimeState.phase = TunnelProviderPhase::healthy;
+      mothershipTunnelProviderRuntimeState.failureCount = 0;
+      mothershipTunnelProviderRuntimeState.nextRetryMs = 0;
       mothershipTunnelProviderRuntimeState.lastFailure.clear();
     }
   }
@@ -12738,11 +12762,15 @@ public:
 
     if (restarted)
     {
+      mothershipTunnelProviderRuntimeState.phase = TunnelProviderPhase::awaitingSession;
       mothershipTunnelProviderRuntimeState.lastFailure.assign("mothership tunnel provider restarted: "_ctv);
     }
     else
     {
-      mothershipTunnelProviderRuntimeState.lastFailure.assign(mothershipTunnelProviderTerminalFailurePrefix);
+      mothershipTunnelProviderRuntimeState.phase = TunnelProviderPhase::backoff;
+      mothershipTunnelProviderRuntimeState.failureCount += 1;
+      mothershipTunnelProviderRuntimeState.nextRetryMs = Time::now<TimeResolution::ms>() + mothershipTunnelProviderRetryDelayMs(mothershipTunnelProviderRuntimeState.failureCount);
+      mothershipTunnelProviderRuntimeState.lastFailure.assign("mothership tunnel provider exited: "_ctv);
     }
     if (report.size() > 0)
     {
@@ -12867,26 +12895,36 @@ public:
 
     const MothershipTunnelProviderSpec& spec = mothershipConnectivity.tunnelProvider;
     auto& state = mothershipTunnelProviderRuntimeState;
-    auto failStopped = [&](auto&& failureText) -> void {
+    auto failStopped = [&](TunnelProviderPhase phase, auto&& failureText) -> void {
       stopMothershipTunnelProviderLocalInstance();
-      state.lastFailure.assign(failureText);
+      noteMothershipTunnelProviderPhase(phase, failureText);
     };
 
     if (isActiveMaster() == false)
     {
-      failStopped("not active master"_ctv);
+      failStopped(TunnelProviderPhase::disabled, "not active master"_ctv);
       return;
     }
 
     if (mothershipTunnelGatewayAuth.configured() == false)
     {
-      failStopped("mothership tunnel gateway auth missing"_ctv);
+      failStopped(TunnelProviderPhase::awaitingMaterial, "mothership tunnel gateway auth missing"_ctv);
+      return;
+    }
+
+    if (state.localContainerUUID != 0)
+    {
       return;
     }
 
     if (systemContainerArtifactPresent(spec.artifactSha256, spec.artifactBytes) == false)
     {
-      failStopped("tunnel provider artifact missing from system store"_ctv);
+      failStopped(TunnelProviderPhase::awaitingMaterial, "tunnel provider artifact missing from system store"_ctv);
+      return;
+    }
+
+    if (state.phase == TunnelProviderPhase::backoff && Time::now<TimeResolution::ms>() < state.nextRetryMs)
+    {
       return;
     }
 
@@ -12898,47 +12936,42 @@ public:
       {
         artifactFailure.assign("tunnel provider artifact verification failed"_ctv);
       }
-      failStopped(artifactFailure);
+      failStopped(TunnelProviderPhase::awaitingMaterial, artifactFailure);
       return;
     }
 
     String launchFailure = {};
     if (mothershipTunnelProviderSpecValid(spec, &launchFailure) == false)
     {
-      failStopped(launchFailure);
-      return;
-    }
-
-    if (state.localContainerUUID == 0 &&
-        state.lastFailure.size() >= mothershipTunnelProviderTerminalFailurePrefix.size() &&
-        memcmp(state.lastFailure.data(), mothershipTunnelProviderTerminalFailurePrefix.data(), mothershipTunnelProviderTerminalFailurePrefix.size()) == 0)
-    {
-      return;
-    }
-
-    if (state.localContainerUUID != 0)
-    {
+      failStopped(TunnelProviderPhase::awaitingMaterial, launchFailure);
       return;
     }
 
     uint128_t containerUUID = 0;
+    state.phase = TunnelProviderPhase::starting;
     if (startMothershipTunnelProviderRuntime(spec, mothershipTunnelGatewayAuth, artifactBlob, containerUUID, &launchFailure) == false)
     {
       if (launchFailure.size() == 0)
       {
         launchFailure.assign("mothership tunnel provider runtime launch failed"_ctv);
       }
-      failStopped(launchFailure);
+      state.failureCount += 1;
+      state.nextRetryMs = Time::now<TimeResolution::ms>() + mothershipTunnelProviderRetryDelayMs(state.failureCount);
+      failStopped(TunnelProviderPhase::backoff, launchFailure);
       return;
     }
     if (containerUUID == 0)
     {
-      failStopped("mothership tunnel provider launch returned empty container uuid"_ctv);
+      state.failureCount += 1;
+      state.nextRetryMs = Time::now<TimeResolution::ms>() + mothershipTunnelProviderRetryDelayMs(state.failureCount);
+      failStopped(TunnelProviderPhase::backoff, "mothership tunnel provider launch returned empty container uuid"_ctv);
       return;
     }
 
     state.localContainerUUID = containerUUID;
-    state.lastFailure.assign(mothershipTunnelProviderPendingHealth);
+    state.phase = TunnelProviderPhase::awaitingSession;
+    state.nextRetryMs = 0;
+    state.lastFailure.assign("waiting for authenticated tunnel session"_ctv);
   }
 
   MothershipTunnelProviderDesiredState captureMothershipTunnelProviderDesiredState(void) const
@@ -12994,7 +13027,7 @@ public:
     mothershipTunnelProviderRuntimeState = {};
     if (failure.size() > 0)
     {
-      mothershipTunnelProviderRuntimeState.lastFailure = failure;
+      noteMothershipTunnelProviderPhase(TunnelProviderPhase::awaitingMaterial, failure);
     }
   }
 
@@ -13007,7 +13040,7 @@ public:
     if (changed)
     {
       stopMothershipTunnelProviderLocalInstance();
-      mothershipTunnelProviderRuntimeState.lastFailure.clear();
+      mothershipTunnelProviderRuntimeState = {};
     }
     reconcileMothershipTunnelProviderRuntimeState();
     return changed;
@@ -22421,6 +22454,7 @@ public:
           if (mothershipConnectivity.kind == MothershipConnectivityKind::tunnelProvider)
           {
             reconcileMothershipTunnelProviderRuntimeState();
+            report.mothershipConnectivity.tunnelProviderPhase = mothershipTunnelProviderRuntimeState.phase;
             report.mothershipConnectivity.lastFailure.assign(mothershipTunnelProviderRuntimeState.lastFailure);
           }
           int64_t nowMs = Time::now<TimeResolution::ms>();

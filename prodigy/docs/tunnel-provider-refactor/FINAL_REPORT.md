@@ -1,6 +1,6 @@
 # Tunnel Provider Runtime Refactor Report
 
-This report records the current pushed branch state. It is not a claim that the
+This report records the current branch state. It is not a claim that the
 original downloaded goal is fully complete; later user direction hard-cut legacy
 compatibility and source-NAT work that the original file requested.
 
@@ -18,19 +18,19 @@ excluding evidence artifacts under `prodigy/docs/tunnel-provider-refactor/*`.
 | State | Files | Insertions | Deletions |
 |---|---:|---:|---:|
 | Draft feature baseline | 52 | 7437 | 434 |
-| Current branch | 55 | 5640 | 526 |
+| Current branch | 55 | 5724 | 526 |
 
 Category ledger:
 
 | Category | Draft net | Current net | Net removed |
 |---|---:|---:|---:|
-| Production | +4883 | +3137 | 1746 |
-| Tests | +2081 | +1942 | 139 |
+| Production | +4883 | +3198 | 1685 |
+| Tests | +2081 | +1965 | 116 |
 | Docs | +30 | +28 | 2 |
 | Build metadata | +9 | +7 | 2 |
 
 The current project gate command, excluding evidence artifacts, reports
-`+5640 -526 net +5114` across 55 files. The full diff including evidence
+`+5724 -526 net +5198` across 55 files. The full diff including evidence
 artifacts is intentionally larger because this report and ledger are tracked.
 
 ## Lines Removed By Subsystem
@@ -42,13 +42,14 @@ artifacts is intentionally larger because this report and ledger are tracked.
 - Control activation: collapsed split artifact/auth/connectivity configure into one Mothership desired-state request, artifact-by-digest backfill, and master-authority state replication.
 - Parser/compatibility surface: removed enum-qualified JSON compatibility spellings and speculative QUIC/multi-egress surface.
 - Tests: tabled and compressed several tunnel/gateway/system-egress assertions while keeping focused coverage.
+- Runtime phase: replaced diagnostic-prefix control flow with explicit `TunnelProviderPhase` transitions and bounded retry state.
 
 See `LINE_LEDGER.tsv` for per-path numbers.
 
 ## Surviving Feature-Specific Surface
 
 - `MothershipTunnelProviderSpec`: persisted operator-facing tunnel metadata and client auth.
-- Brain-owned anonymous runtime state: local provider UUID plus bounded diagnostic text.
+- Brain-owned anonymous runtime state: phase, local provider UUID, retry count/deadline, and bounded diagnostic text.
 - `SystemContainerKind::mothershipTunnelProvider`: typed runtime identity for system container launch.
 - `mothership.tunnel.gateway.h`: still contains gateway implementation; it was reduced but remains a large header.
 - `ContainerPlan` system fields: still carries system-container kind/socket/egress data; this is not the full dedicated plan extension requested by the original goal.
@@ -61,7 +62,9 @@ Fixed or hard-cut:
 - Built-in tunnel provider is no longer production code.
 - Source-address-only NAT was removed; current system egress is a single public IPv4 TCP allowlist.
 - No-op runtime state no longer serializes/hashes the spec on every reconcile.
+- Running-provider reconcile/report returns before artifact presence/load work; focused counters cover this path.
 - Provider health/status no longer carries redundant derived report fields.
+- Provider failure no longer disables a generation by matching a diagnostic string prefix; it enters explicit backoff and can retry.
 - Tunnel endpoint input is hard-cut to public IPv4 literal TCP.
 - Cluster schema types no longer own certificate parsing/generation, egress policy helpers, runtime policy, or Brain runtime state.
 - Tunnel desired state is folded into `ProdigyMasterAuthorityRuntimeState`; the old dedicated Brain topic and persistent record are deleted.
@@ -80,15 +83,15 @@ Still open relative to the original goal:
 
 ## State And Transport
 
-Current state is compact but not the full requested enum state machine:
+Current state uses the compact `TunnelProviderPhase` enum, but not the full requested lifecycle implementation:
 
 ```text
-connectivity kind != tunnelProvider -> stop local provider
-not active master -> stop local provider
-missing auth/artifact -> no launch, record failure
-artifact/auth/spec present -> launch typed system container and gateway
-authenticated control session -> clear failure text
-provider failure -> clear local UUID and record failure
+connectivity kind != tunnelProvider -> disabled
+not active master -> disabled
+missing auth/artifact -> awaitingMaterial
+artifact/auth/spec present -> starting -> awaitingSession
+authenticated control session -> healthy
+provider failure -> backoff with retry deadline
 ```
 
 Transport remains:
@@ -121,6 +124,10 @@ All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 - `./prodigy_persistent_state_unit`
 - `./prodigy_brain_replication_credentials_unit`
 - `./prodigy_brain_topic_fuzz -runs=100000`
+- `CC=clang CXX=clang++ cmake -S prodigy/dev -B .run/phase-runtime -DCMAKE_BUILD_TYPE=Release`
+- `cmake --build .run/phase-runtime --target prodigy mothership prodigy_brain_replication_credentials_unit prodigy_brain_topic_fuzz -j16`
+- `./prodigy_brain_replication_credentials_unit`
+- `./prodigy_brain_topic_fuzz -runs=100000`
 
 Earlier validation on the same branch also covered the broader build/test matrix:
 cluster registry, deployments, bundle artifact, BPF attach units, host/container
@@ -141,12 +148,14 @@ Recorded binary/object sizes from the VM RelWithDebInfo build:
 | `host.ingress.router.ebpf.o` | 454296 |
 | `container.egress.router.ebpf.o` | 427800 |
 
+Focused unit counters now prove that a running provider report/reconcile performs no artifact presence check and no artifact load in the tested path.
+
 Not measured: clean build wall time, incremental cluster-type fanout, gateway throughput/latency, 100k reconcile counters, artifact byte-copy counters, and BPF instruction deltas against `main`.
 
 ## Remaining Risks
 
 - Full original definition of done is not met.
-- Runtime health is still represented by failure text rather than a compact explicit phase enum.
+- Runtime health now has an explicit phase enum, but health aging and jittered timer-driven retry remain incomplete.
 - Control-plane activation is one Mothership configure request plus artifact-first Brain replication and a master-authority desired-state transition.
 - Gateway I/O/deadline/backpressure behavior is covered by focused tests but not a full nonblocking state-machine proof.
 - Artifact provenance remains weaker than the signed-envelope design requested in the original goal.

@@ -76,6 +76,8 @@ public:
   String rejectClusterOwnershipFailure = {};
   uint32_t transitionToNewBundleCalls = 0;
   uint32_t systemContainerStoreCalls = 0;
+  uint32_t systemContainerPresentCalls = 0;
+  uint32_t systemContainerLoadCalls = 0;
   uint32_t mothershipTunnelRuntimeStartCalls = 0;
   uint32_t mothershipTunnelRuntimeStopCalls = 0;
   bool mothershipTunnelRuntimeStartSucceeds = false;
@@ -134,11 +136,13 @@ public:
 
   bool systemContainerArtifactPresent(const String& sha256, uint64_t bytes) override
   {
+    systemContainerPresentCalls += 1;
     return lastStoredSystemContainerSha256.equal(sha256) && lastStoredSystemContainerBytes == bytes;
   }
 
   bool loadSystemContainerArtifact(const String& sha256, uint64_t bytes, String& blob, String *failure = nullptr) override
   {
+    systemContainerLoadCalls += 1;
     if (systemContainerArtifactPresent(sha256, bytes) == false)
     {
       blob.clear();
@@ -4822,6 +4826,7 @@ static void testMothershipTunnelProviderDesiredStateMasterAuthorityReplicationAp
   deniedRuntimeState.mothershipTunnelProviderDesiredState = deniedDesired;
   suite.expect(deniedBrain.applyReplicatedMasterAuthorityRuntimeState(deniedRuntimeState, false), "mothership_connectivity_rejects_metadata_runtime_egress_master_state_applies");
   suite.expect(deniedBrain.mothershipConnectivity.kind == MothershipConnectivityKind::ssh, "mothership_connectivity_rejects_metadata_runtime_egress_clears_local_config");
+  suite.expect(deniedBrain.mothershipTunnelProviderRuntimeState.phase == TunnelProviderPhase::awaitingMaterial, "mothership_connectivity_rejects_metadata_runtime_egress_phase");
   suite.expect(deniedBrain.mothershipTunnelProviderRuntimeState.lastFailure.equal("mothership tunnel-provider egress literal denied"_ctv), "mothership_connectivity_rejects_metadata_runtime_egress_reason");
 }
 
@@ -4836,6 +4841,7 @@ static void testMothershipTunnelProviderRuntimeStateConfigChanges(TestSuite& sui
   String failure = {};
   suite.require(brain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "mothership_tunnel_runtime_initial_apply");
   suite.expect(brain.mothershipTunnelProviderRuntimeState.localContainerUUID == 0, "mothership_tunnel_runtime_not_running_without_launcher");
+  suite.expect(brain.mothershipTunnelProviderRuntimeState.phase == TunnelProviderPhase::awaitingMaterial, "mothership_tunnel_runtime_requires_artifact_phase");
   suite.expect(brain.mothershipTunnelProviderRuntimeState.lastFailure.equal("tunnel provider artifact missing from system store"_ctv), "mothership_tunnel_runtime_requires_artifact");
 
   suite.require(brain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "mothership_tunnel_runtime_repeat_apply");
@@ -4861,6 +4867,7 @@ static void testMothershipTunnelProviderRuntimeStateRequiresActiveMaster(TestSui
   suite.require(brain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "mothership_tunnel_runtime_non_master_apply");
   const auto& state = brain.mothershipTunnelProviderRuntimeState;
   suite.expect(state.localContainerUUID == 0, "mothership_tunnel_runtime_non_master_stopped");
+  suite.expect(state.phase == TunnelProviderPhase::disabled, "mothership_tunnel_runtime_non_master_phase");
   suite.expect(state.lastFailure.equal("not active master"_ctv), "mothership_tunnel_runtime_non_master_failure");
   suite.expect(brain.mothershipTunnelRuntimeStopCalls == 1 && brain.lastStoppedMothershipTunnelProviderContainerUUID == 123, "mothership_tunnel_runtime_non_master_stops_local_instance");
 
@@ -4871,6 +4878,7 @@ static void testMothershipTunnelProviderRuntimeStateRequiresActiveMaster(TestSui
   relinquishingBrain.forfeitMasterStatus();
   const auto& relinquishedState = relinquishingBrain.mothershipTunnelProviderRuntimeState;
   suite.expect(relinquishedState.localContainerUUID == 0, "mothership_tunnel_runtime_relinquish_stopped");
+  suite.expect(relinquishedState.phase == TunnelProviderPhase::disabled, "mothership_tunnel_runtime_relinquish_phase");
   suite.expect(relinquishedState.lastFailure.equal("not active master"_ctv), "mothership_tunnel_runtime_relinquish_failure");
   suite.expect(relinquishingBrain.mothershipTunnelRuntimeStopCalls == 1 && relinquishingBrain.lastStoppedMothershipTunnelProviderContainerUUID == 456, "mothership_tunnel_runtime_relinquish_stops_local_instance");
 }
@@ -4898,15 +4906,23 @@ static void testMothershipTunnelProviderRuntimeLaunchBoundary(TestSuite& suite)
 
   const auto& state = brain.mothershipTunnelProviderRuntimeState;
   suite.expect(state.localContainerUUID == brain.nextMothershipTunnelProviderContainerUUID, "mothership_tunnel_runtime_launch_marks_running");
+  suite.expect(state.phase == TunnelProviderPhase::awaitingSession, "mothership_tunnel_runtime_launch_phase");
   suite.expect(state.lastFailure.equal("waiting for authenticated tunnel session"_ctv), "mothership_tunnel_runtime_launch_waits_for_gateway_session");
   suite.expect(brain.mothershipTunnelRuntimeStartCalls == 1, "mothership_tunnel_runtime_launch_starts_once");
   suite.expect(brain.lastMothershipTunnelProviderArtifactBlob.equal(blob), "mothership_tunnel_runtime_launch_carries_verified_blob");
   suite.expect(equalSerializedObjects(brain.lastMothershipTunnelProviderGatewayAuth, auth), "mothership_tunnel_runtime_launch_carries_gateway_auth");
   suite.expect(equalSerializedObjects(brain.lastMothershipTunnelProviderSpec, config.tunnelProvider), "mothership_tunnel_runtime_launch_carries_spec");
 
+  uint32_t presentCallsAfterLaunch = brain.systemContainerPresentCalls;
+  uint32_t loadCallsAfterLaunch = brain.systemContainerLoadCalls;
   suite.require(brain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "mothership_tunnel_runtime_launch_repeat_config_apply");
   suite.expect(brain.mothershipTunnelRuntimeStartCalls == 1, "mothership_tunnel_runtime_launch_repeat_does_not_restart");
+  suite.expect(brain.systemContainerPresentCalls == presentCallsAfterLaunch && brain.systemContainerLoadCalls == loadCallsAfterLaunch, "mothership_tunnel_runtime_launch_repeat_is_artifact_o1");
   suite.expect(brain.mothershipTunnelProviderRuntimeState.lastFailure.equal("waiting for authenticated tunnel session"_ctv), "mothership_tunnel_runtime_launch_repeat_keeps_pending_health");
+  ClusterStatusReport runningReport = {};
+  suite.require(pullClusterStatusReportForTest(brain, runningReport), "mothership_tunnel_runtime_running_report_deserializes");
+  suite.expect(runningReport.mothershipConnectivity.tunnelProviderPhase == TunnelProviderPhase::awaitingSession, "mothership_tunnel_runtime_running_report_phase");
+  suite.expect(brain.systemContainerPresentCalls == presentCallsAfterLaunch && brain.systemContainerLoadCalls == loadCallsAfterLaunch, "mothership_tunnel_runtime_running_report_is_artifact_o1");
 
   config.tunnelProvider.dialEndpoint = "control-restarted.example.net:443"_ctv;
   suite.require(brain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "mothership_tunnel_runtime_launch_spec_change_apply");
@@ -4924,7 +4940,7 @@ static void testMothershipTunnelProviderRuntimeLaunchBoundary(TestSuite& suite)
   suite.require(gatewayFailureBrain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "mothership_tunnel_runtime_gateway_failure_desired_apply");
   suite.require(gatewayFailureBrain.applySystemContainerArtifact(config.tunnelProvider.artifactSha256, config.tunnelProvider.artifactBytes, blob, false, &failure), "mothership_tunnel_runtime_gateway_failure_artifact_apply");
   suite.expect(gatewayFailureBrain.mothershipTunnelRuntimeStartCalls == 1, "mothership_tunnel_runtime_gateway_failure_attempts_runtime");
-  suite.expect(gatewayFailureBrain.mothershipTunnelProviderRuntimeState.localContainerUUID == 0 && gatewayFailureBrain.mothershipTunnelProviderRuntimeState.lastFailure.equal("injected tunnel runtime launch failure"_ctv), "mothership_tunnel_runtime_gateway_failure_stops_runtime");
+  suite.expect(gatewayFailureBrain.mothershipTunnelProviderRuntimeState.localContainerUUID == 0 && gatewayFailureBrain.mothershipTunnelProviderRuntimeState.phase == TunnelProviderPhase::backoff && gatewayFailureBrain.mothershipTunnelProviderRuntimeState.lastFailure.equal("injected tunnel runtime launch failure"_ctv), "mothership_tunnel_runtime_gateway_failure_stops_runtime");
 }
 
 static void testMothershipTunnelProviderGatewaySessionMarksHealthy(TestSuite& suite)
@@ -4932,9 +4948,11 @@ static void testMothershipTunnelProviderGatewaySessionMarksHealthy(TestSuite& su
   TestBrain brain;
   brain.mothershipConnectivity.kind = MothershipConnectivityKind::tunnelProvider;
   brain.mothershipTunnelProviderRuntimeState.localContainerUUID = 123;
+  brain.mothershipTunnelProviderRuntimeState.phase = TunnelProviderPhase::awaitingSession;
   brain.mothershipTunnelProviderRuntimeState.lastFailure.assign("waiting for gateway session"_ctv);
 
   brain.noteMothershipTunnelProviderControlSession(true, true);
+  suite.expect(brain.mothershipTunnelProviderRuntimeState.phase == TunnelProviderPhase::healthy, "mothership_tunnel_runtime_gateway_session_marks_healthy");
   suite.expect(brain.mothershipTunnelProviderRuntimeState.lastFailure.size() == 0, "mothership_tunnel_runtime_gateway_session_clears_failure");
 
   TestBrain notRunning;
@@ -4974,11 +4992,15 @@ static void testMothershipTunnelProviderContainerFailureStopsRuntime(TestSuite& 
       buildNeuronMessage(messageBuffer, NeuronTopic::containerFailed, providerUUID, int64_t(0), int(125), "startup failed before exec"_ctv, false));
 
   suite.expect(brain.mothershipTunnelProviderRuntimeState.localContainerUUID == 0, "mothership_tunnel_runtime_failure_stops_runtime");
+  suite.expect(brain.mothershipTunnelProviderRuntimeState.phase == TunnelProviderPhase::backoff, "mothership_tunnel_runtime_failure_enters_backoff");
   suite.expect(brain.mothershipTunnelProviderRuntimeState.lastFailure.equal("mothership tunnel provider exited: startup failed before exec"_ctv), "mothership_tunnel_runtime_failure_reports_exit");
   suite.expect(brain.mothershipTunnelRuntimeStopCalls == 1, "mothership_tunnel_runtime_failure_stops_runtime_hook");
 
   brain.reconcileMothershipTunnelProviderRuntimeState();
-  suite.expect(brain.mothershipTunnelRuntimeStartCalls == 1, "mothership_tunnel_runtime_failure_does_not_relaunch_same_spec");
+  suite.expect(brain.mothershipTunnelRuntimeStartCalls == 1, "mothership_tunnel_runtime_failure_waits_for_backoff");
+  brain.mothershipTunnelProviderRuntimeState.nextRetryMs = 0;
+  brain.reconcileMothershipTunnelProviderRuntimeState();
+  suite.expect(brain.mothershipTunnelRuntimeStartCalls == 2 && brain.mothershipTunnelProviderRuntimeState.phase == TunnelProviderPhase::awaitingSession, "mothership_tunnel_runtime_failure_retries_after_backoff");
 }
 
 static void testMothershipTunnelProviderStateUploadKillsStaleProvider(TestSuite& suite)
@@ -5063,6 +5085,7 @@ static void testClusterReportIncludesMothershipConnectivityStatus(TestSuite& sui
   ClusterStatusReport report = {};
   suite.require(pullClusterStatusReportForTest(brain, report), "cluster_report_mothership_connectivity_deserializes");
   suite.expect(report.mothershipConnectivity.kind.equal("tunnelProvider"_ctv), "cluster_report_mothership_connectivity_kind");
+  suite.expect(report.mothershipConnectivity.tunnelProviderPhase == TunnelProviderPhase::awaitingMaterial, "cluster_report_mothership_connectivity_phase");
   suite.expect(
       report.mothershipConnectivity.lastFailure.equal("tunnel provider artifact missing from system store"_ctv),
       "cluster_report_mothership_connectivity_missing_artifact_failure");

@@ -6,6 +6,7 @@
 - Focused C++ target build completed with `--parallel 16`.
 - BPF object builds completed for host ingress and container egress routers.
 - Focused BPF runtime tests passed under `PRODIGY_DEV_ALLOW_BPF_ATTACH=1`.
+- Focused Brain unit counters prove running-provider reconcile/report does not call artifact presence or load hooks.
 
 ## Size Snapshot
 
