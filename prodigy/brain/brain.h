@@ -12676,8 +12676,14 @@ public:
     }
   }
 
-  virtual void configureMothershipControlIngress(String& mothershipEndpoint) = 0;
-  virtual void teardownMothershipControlIngress(void) = 0;
+  virtual void configureMothershipControlIngress(String& mothershipEndpoint)
+  {
+    mothershipEndpoint.clear();
+  }
+
+  virtual void teardownMothershipControlIngress(void)
+  {
+  }
 
   virtual bool storeSystemContainerArtifact(const String& sha256, uint64_t bytes, const String& blob, String *failure = nullptr)
   {

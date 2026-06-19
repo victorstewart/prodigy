@@ -991,15 +991,6 @@ public:
     return true;
   }
 
-  void configureMothershipControlIngress(String& mothershipEndpoint) override
-  {
-    mothershipEndpoint.clear();
-  }
-
-  void teardownMothershipControlIngress(void) override
-  {
-  }
-
   static void noteMothershipTunnelGatewayFailure(void *, uint64_t failures, String& failure)
   {
     basics_log("ProdigyBrain mothership tunnel gateway session failed count=%llu reason=%s\n",

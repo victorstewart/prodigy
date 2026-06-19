@@ -42,10 +42,6 @@ public:
     mothershipEndpoint.assign("127.0.0.1"_ctv);
   }
 
-  void teardownMothershipControlIngress(void) override
-  {
-  }
-
   void pushSpinApplicationProgressToMothership(ApplicationDeployment *deployment, const String& message) override
   {
     (void)deployment;

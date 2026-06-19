@@ -4115,7 +4115,6 @@ public:
 
   enum class TransportMode : uint8_t {
     none = 0,
-    stageTcp = 1,
     localUnix = 2,
     remoteSshUnix = 3,
     tunnelGateway = 4
@@ -4135,8 +4134,6 @@ private:
   String targetLabel;
   String lastConnectFailure;
   String lastIOFailure;
-  String tcpAddress;
-  uint16_t tcpPort = 0;
   Vector<String> controlPaths;
   Vector<MothershipProdigyClusterMachine> remoteMachines;
   String tunnelGatewayEndpoint;
@@ -4160,8 +4157,6 @@ private:
     {
       case TransportMode::none:
         return "none";
-      case TransportMode::stageTcp:
-        return "stageTcp";
       case TransportMode::localUnix:
         return "localUnix";
       case TransportMode::remoteSshUnix:
@@ -4179,8 +4174,6 @@ private:
     targetLabel.clear();
     lastConnectFailure.clear();
     lastIOFailure.clear();
-    tcpAddress.clear();
-    tcpPort = 0;
     sshTransportIOTimeoutMs = defaultSshTransportIOTimeoutMs;
     controlPaths.clear();
     remoteMachines.clear();
@@ -4278,21 +4271,6 @@ private:
       (void)SSL_shutdown(tunnelGatewayTLS.get());
       tunnelGatewayTLS.reset();
     }
-  }
-
-  bool connectStageTcp(void)
-  {
-    int fd = -1;
-    if (mothershipOpenConnectedSocket(tcpAddress, tcpPort, fd) == false)
-    {
-      lastConnectFailure.snprintf<"failed to connect tcp {}:{itoa}"_ctv>(tcpAddress, unsigned(tcpPort));
-      printConnectFailure();
-      return false;
-    }
-
-    lastConnectFailure.clear();
-    transportFD = fd;
-    return true;
   }
 
   bool connectTunnelGateway(void)
@@ -5099,10 +5077,6 @@ public:
 
     switch (transportMode)
     {
-      case TransportMode::stageTcp:
-        {
-          return connectStageTcp() ? 0 : -1;
-        }
       case TransportMode::localUnix:
       case TransportMode::remoteSshUnix:
         {

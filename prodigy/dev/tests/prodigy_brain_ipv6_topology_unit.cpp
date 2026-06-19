@@ -296,15 +296,6 @@ public:
     return getExistingMasterUUID();
   }
 
-  void configureMothershipControlIngress(String& mothershipEndpoint) override
-  {
-    mothershipEndpoint.clear();
-  }
-
-  void teardownMothershipControlIngress(void) override
-  {
-  }
-
   void pushSpinApplicationProgressToMothership(ApplicationDeployment *deployment, const String& message) override
   {
     (void)deployment;

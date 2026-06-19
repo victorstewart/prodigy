@@ -35,10 +35,6 @@ public:
     mothershipEndpoint.assign("127.0.0.1"_ctv);
   }
 
-  void teardownMothershipControlIngress(void) override
-  {
-  }
-
   void armMachineNeuronControl(Machine *machine) override
   {
     (void)machine;
