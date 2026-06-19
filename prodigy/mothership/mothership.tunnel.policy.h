@@ -74,7 +74,6 @@ static inline void mothershipStripMothershipOnlyConnectivityFields(MothershipCon
   }
 
   config.tunnelProvider.clientAuth = {};
-  config.tunnelProvider.providerContainerBlobPath.clear();
   config.tunnelProvider.gatewayAuth = {};
 }
 
@@ -90,7 +89,7 @@ static inline bool mothershipConnectivityRuntimeConfigValid(const MothershipConn
     return mothershipTunnelPolicyFail(failure, "mothership connectivity kind invalid"_ctv);
   }
 
-  if (config.tunnelProvider.clientAuth.configured() || config.tunnelProvider.providerContainerBlobPath.size() > 0 || config.tunnelProvider.gatewayAuth.configured())
+  if (config.tunnelProvider.clientAuth.configured() || config.tunnelProvider.gatewayAuth.configured())
   {
     return mothershipTunnelPolicyFail(failure, "mothership tunnel-provider runtime config contains mothership-only fields"_ctv);
   }

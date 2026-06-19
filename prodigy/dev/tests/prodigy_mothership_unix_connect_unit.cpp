@@ -213,7 +213,8 @@ static bool parseConnectivityFixture(String json, MothershipConnectivity& connec
   json.need(simdjson::SIMDJSON_PADDING);
   simdjson::dom::parser parser;
   simdjson::dom::element doc;
-  return parser.parse(json.data(), json.size()).get(doc) == simdjson::SUCCESS && parseMothershipConnectivityJSON(doc, connectivity, "connectivity");
+  String providerContainerBlobPath = {};
+  return parser.parse(json.data(), json.size()).get(doc) == simdjson::SUCCESS && parseMothershipConnectivityJSON(doc, connectivity, providerContainerBlobPath, "connectivity");
 }
 
 static MachineConfig makeMachineConfig(const String& slug, MachineConfig::MachineKind kind, uint32_t nLogicalCores, uint32_t nMemoryMB, uint32_t nStorageMB)
@@ -821,12 +822,12 @@ int main(void)
       tunnelBlob.assign(prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText());
       tunnelBlob.append("tunnel-provider-payload"_ctv);
       std::filesystem::path tunnelBlobPath = filesystemPathFromString(workspace.path) / "mothership-tunnel-provider.blob";
+      String tunnelBlobPathText = stringFromFilesystemPath(tunnelBlobPath);
       suite.expect(writeFileFixture(tunnelBlobPath, tunnelBlob), "tunnel_provider_artifact_fixture_written");
 
       MothershipTunnelProviderSpec spec = {};
-      spec.providerContainerBlobPath = stringFromFilesystemPath(tunnelBlobPath);
       String failure = {};
-      bool prepared = mothership.unitTestPrepareTunnelProviderArtifact(spec, systemStoreRoot.path, &failure);
+      bool prepared = mothership.unitTestPrepareTunnelProviderArtifact(spec, tunnelBlobPathText, systemStoreRoot.path, &failure);
       suite.expect(prepared, "tunnel_provider_artifact_preflight_accepts_valid_blob");
       suite.expect(failure.size() == 0, "tunnel_provider_artifact_preflight_valid_no_failure");
       suite.expect(spec.artifactBytes == tunnelBlob.size(), "tunnel_provider_artifact_preflight_sets_size");
@@ -842,10 +843,10 @@ int main(void)
         appBlob.append("app-payload"_ctv);
       }
       std::filesystem::path appBlobPath = filesystemPathFromString(workspace.path) / "app.blob";
+      String appBlobPathText = stringFromFilesystemPath(appBlobPath);
       suite.expect(writeFileFixture(appBlobPath, appBlob), "tunnel_provider_artifact_app_fixture_written");
       MothershipTunnelProviderSpec appSpec = {};
-      appSpec.providerContainerBlobPath = stringFromFilesystemPath(appBlobPath);
-      suite.expect(mothership.unitTestPrepareTunnelProviderArtifact(appSpec, systemStoreRoot.path, &failure) == false, "tunnel_provider_artifact_preflight_rejects_app_blob");
+      suite.expect(mothership.unitTestPrepareTunnelProviderArtifact(appSpec, appBlobPathText, systemStoreRoot.path, &failure) == false, "tunnel_provider_artifact_preflight_rejects_app_blob");
     }
   }
 #endif

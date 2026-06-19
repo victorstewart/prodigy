@@ -1495,7 +1495,6 @@ int main(void)
     bool createTunnel = registry.createCluster(tunnel, &storedTunnel, &failure);
     suite.expect(createTunnel, "create_tunnel_provider_connectivity");
     suite.expect(storedTunnel.mothershipConnectivity.kind == MothershipConnectivityKind::tunnelProvider, "create_tunnel_provider_kind_preserved");
-    suite.expect(storedTunnel.mothershipConnectivity.tunnelProvider.providerContainerBlobPath.size() == 0, "create_tunnel_provider_path_not_persisted");
     suite.expect(storedTunnel.mothershipConnectivity.tunnelProvider.clientAuth.configured(), "create_tunnel_provider_client_auth_persisted");
     suite.expect(storedTunnel.mothershipConnectivity.tunnelProvider.gatewayAuth.configured() == false, "create_tunnel_provider_gateway_auth_not_persisted");
     MothershipProdigyCluster loadedTunnel = {};

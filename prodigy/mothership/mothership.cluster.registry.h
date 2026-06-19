@@ -1202,7 +1202,6 @@ private:
     }
 
     MothershipTunnelProviderSpec& spec = cluster.mothershipConnectivity.tunnelProvider;
-    spec.providerContainerBlobPath.clear();
     spec.gatewayAuth = {};
 
     MothershipConnectivityRuntimeConfig runtimeConfig = {};

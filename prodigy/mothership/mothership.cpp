@@ -1945,7 +1945,7 @@ static bool parseMothershipClusterMachinesJSON(simdjson::dom::element value, Vec
   return true;
 }
 
-static bool parseMothershipConnectivityJSON(simdjson::dom::element value, MothershipConnectivity& connectivity, const char *context)
+static bool parseMothershipConnectivityJSON(simdjson::dom::element value, MothershipConnectivity& connectivity, String& providerContainerBlobPath, const char *context)
 {
   if (value.type() != simdjson::dom::element_type::OBJECT)
   {
@@ -1956,6 +1956,7 @@ static bool parseMothershipConnectivityJSON(simdjson::dom::element value, Mother
   MothershipConnectivity parsed = {};
   bool sawKind = false;
   bool sawTunnelField = false;
+  providerContainerBlobPath.clear();
   auto requireString = [&](simdjson::dom::element fieldValue, const char *fieldName, String& target) -> bool {
     if (fieldValue.type() != simdjson::dom::element_type::STRING)
     {
@@ -2012,7 +2013,7 @@ static bool parseMothershipConnectivityJSON(simdjson::dom::element value, Mother
     }
     else if (key.equal("providerContainerBlobPath"_ctv))
     {
-      if (requireString(field.value, "providerContainerBlobPath", parsed.tunnelProvider.providerContainerBlobPath) == false)
+      if (requireString(field.value, "providerContainerBlobPath", providerContainerBlobPath) == false)
       {
         return false;
       }
@@ -2062,7 +2063,7 @@ static bool parseMothershipConnectivityJSON(simdjson::dom::element value, Mother
 
   if (parsed.kind == MothershipConnectivityKind::tunnelProvider)
   {
-    if (parsed.tunnelProvider.providerContainerBlobPath.size() == 0 ||
+    if (providerContainerBlobPath.size() == 0 ||
         parsed.tunnelProvider.dialEndpoint.size() == 0 ||
         parsed.tunnelProvider.egressHost.size() == 0 ||
         parsed.tunnelProvider.egressPort == 0)
@@ -5921,6 +5922,7 @@ private:
 
   static bool prepareTunnelProviderArtifactForCreate(
       MothershipTunnelProviderSpec& spec,
+      const String& providerContainerBlobPath,
       String *failure,
       const String *debugSystemStoreRoot = nullptr)
   {
@@ -5930,7 +5932,7 @@ private:
     }
 
     String blob = {};
-    Filesystem::openReadAtClose(-1, spec.providerContainerBlobPath, blob);
+    Filesystem::openReadAtClose(-1, providerContainerBlobPath, blob);
     if (blob.size() == 0)
     {
       if (failure)
@@ -13992,6 +13994,7 @@ private:
     }
 
     MothershipProdigyCluster request = {};
+    String tunnelProviderBlobPath = {};
     MothershipProviderCredential providerCredentialOverride = {};
     MothershipProviderCredential dnsProviderCredentialOverride = {};
     bool hasProviderCredentialOverride = false;
@@ -14268,7 +14271,7 @@ private:
       }
       else if (key.equal("mothershipConnectivity"_ctv))
       {
-        if (parseMothershipConnectivityJSON(field.value, request.mothershipConnectivity, "createCluster.mothershipConnectivity") == false)
+        if (parseMothershipConnectivityJSON(field.value, request.mothershipConnectivity, tunnelProviderBlobPath, "createCluster.mothershipConnectivity") == false)
         {
           exit(EXIT_FAILURE);
         }
@@ -14588,7 +14591,7 @@ private:
     if (request.mothershipConnectivity.kind == MothershipConnectivityKind::tunnelProvider)
     {
       ensureClusterUUIDForCreate(request);
-      if (prepareTunnelProviderArtifactForCreate(request.mothershipConnectivity.tunnelProvider, &failure) == false)
+      if (prepareTunnelProviderArtifactForCreate(request.mothershipConnectivity.tunnelProvider, tunnelProviderBlobPath, &failure) == false)
       {
         basics_log("createCluster success=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
         exit(EXIT_FAILURE);
@@ -16854,9 +16857,9 @@ public:
     return ok;
   }
 
-  bool unitTestPrepareTunnelProviderArtifact(MothershipTunnelProviderSpec& spec, const String& systemStoreRoot, String *failure = nullptr)
+  bool unitTestPrepareTunnelProviderArtifact(MothershipTunnelProviderSpec& spec, const String& providerContainerBlobPath, const String& systemStoreRoot, String *failure = nullptr)
   {
-    return prepareTunnelProviderArtifactForCreate(spec, failure, &systemStoreRoot);
+    return prepareTunnelProviderArtifactForCreate(spec, providerContainerBlobPath, failure, &systemStoreRoot);
   }
 
   bool unitTestPrepareTunnelProviderGatewayAuth(MothershipTunnelProviderSpec& spec, String *failure = nullptr)

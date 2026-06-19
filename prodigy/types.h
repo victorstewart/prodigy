@@ -142,9 +142,8 @@ struct MothershipTunnelProviderSpec {
   uint16_t egressPort = 0;
   MothershipTunnelGatewayClientAuth clientAuth;
 
-  // Create-time inputs only. These fields are intentionally omitted from
-  // serialization so the registry stores only stable client-side metadata.
-  String providerContainerBlobPath;
+  // Create-time server auth only. Omitted from serialization so the registry
+  // stores only stable client-side metadata.
   MothershipTunnelGatewayAuth gatewayAuth;
 };
 
