@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <networking/includes.h>
-#include <services/base64.h>
+#include <cstdint>
+
+#include <services/hash.h>
 #include <types/types.containers.h>
 
 #define nShardsPerStatefulApplication 1024
