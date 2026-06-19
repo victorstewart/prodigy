@@ -22,8 +22,8 @@
 | `cmake --build .run/phase-runtime --target prodigy -j16` after health-aging change | pass |
 | `cmake -S prodigy/dev -B .run/build-cgroup -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++` | pass |
 | `cmake --build .run/build-cgroup --target prodigy mothership prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit --parallel 16` | pass |
-| `.run/build-cgroup/prodigy_mothership_unix_connect_unit` after gateway cgroup identity change | pass |
-| `.run/build-cgroup/prodigy_brain_replication_credentials_unit` after gateway cgroup identity change | pass |
+| `.run/build-cgroup/prodigy_mothership_unix_connect_unit` after gateway cgroup identity/densification change | pass |
+| `.run/build-cgroup/prodigy_brain_replication_credentials_unit` after gateway cgroup identity/densification change | pass |
 
 ## Privileged Tests Run In VM
 

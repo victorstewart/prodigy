@@ -162,19 +162,14 @@ static inline bool mothershipTunnelGatewayPeerCgroupAllowed(pid_t peerPid, const
 
   String path = {};
   path.snprintf<"/proc/{itoa}/cgroup"_ctv>(uint64_t(peerPid));
-  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  char actual[512];
-  ssize_t bytes = fd >= 0 ? ::read(fd, actual, sizeof(actual)) : -1;
-  if (fd >= 0)
-  {
-    ::close(fd);
-  }
+  String actual = {};
+  Filesystem::openReadAtClose(-1, path, actual, 512);
 
   String expected = {};
   expected.assign("0::"_ctv);
   expected.append(expectedCgroup);
   expected.append("\n"_ctv);
-  if (bytes != ssize_t(expected.size()) || std::memcmp(actual, expected.data(), expected.size()) != 0)
+  if (actual.equal(expected) == false)
   {
     if (failure)
     {

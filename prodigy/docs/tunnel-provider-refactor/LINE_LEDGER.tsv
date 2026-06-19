@@ -40,7 +40,7 @@ production	88	4	84	prodigy/mothership/mothership.cluster.registry.h
 production	21	0	21	prodigy/mothership/mothership.cluster.types.h
 production	675	45	630	prodigy/mothership/mothership.cpp
 production	208	0	208	prodigy/mothership/mothership.tunnel.auth.h
-production	567	0	567	prodigy/mothership/mothership.tunnel.gateway.h
+production	562	0	562	prodigy/mothership/mothership.tunnel.gateway.h
 production	120	0	120	prodigy/mothership/mothership.tunnel.policy.h
 production	1	0	1	prodigy/neuron/base.h
 production	370	135	235	prodigy/neuron/containers.h
