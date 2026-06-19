@@ -5885,23 +5885,6 @@ private:
       return false;
     }
 
-    String headerText = prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText();
-    if (blob.size() <= headerText.size())
-    {
-      if (failure)
-      {
-        failure->assign("tunnelProvider.providerContainerBlobPath payload required"_ctv);
-      }
-      return false;
-    }
-
-    String header = {};
-    header.assign(blob.substr(0, headerText.size(), Copy::yes));
-    if (prodigyValidateDiscombobulatorMothershipTunnelProviderBlobHeaderText(header, failure) == false)
-    {
-      return false;
-    }
-
     String digest = {};
     if (prodigyComputeSHA256Hex(blob, digest, failure) == false)
     {

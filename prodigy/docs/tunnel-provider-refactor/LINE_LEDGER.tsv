@@ -38,7 +38,7 @@ production	19	10	9	prodigy/ingress.validation.h
 production	1	0	1	prodigy/mothership/mothership.cluster.create.h
 production	76	4	72	prodigy/mothership/mothership.cluster.registry.h
 production	21	0	21	prodigy/mothership/mothership.cluster.types.h
-production	600	63	537	prodigy/mothership/mothership.cpp
+production	583	63	520	prodigy/mothership/mothership.cpp
 production	275	0	275	prodigy/mothership/mothership.tunnel.auth.h
 production	617	0	617	prodigy/mothership/mothership.tunnel.gateway.cpp
 production	62	0	62	prodigy/mothership/mothership.tunnel.gateway.h
