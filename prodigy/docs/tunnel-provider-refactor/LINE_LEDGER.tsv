@@ -36,10 +36,10 @@ doc	14	0	14	prodigy/docs/runtime.md
 doc	14	0	14	prodigy/docs/security.md
 production	24	10	14	prodigy/ingress.validation.h
 production	6	0	6	prodigy/mothership/mothership.cluster.create.h
-production	88	4	84	prodigy/mothership/mothership.cluster.registry.h
+production	89	4	85	prodigy/mothership/mothership.cluster.registry.h
 production	21	0	21	prodigy/mothership/mothership.cluster.types.h
-production	668	45	623	prodigy/mothership/mothership.cpp
-production	257	0	257	prodigy/mothership/mothership.tunnel.auth.h
+production	639	45	594	prodigy/mothership/mothership.cpp
+production	298	0	298	prodigy/mothership/mothership.tunnel.auth.h
 production	539	0	539	prodigy/mothership/mothership.tunnel.gateway.h
 production	120	0	120	prodigy/mothership/mothership.tunnel.policy.h
 production	1	0	1	prodigy/neuron/base.h

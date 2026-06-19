@@ -18,19 +18,19 @@ excluding evidence artifacts under `prodigy/docs/tunnel-provider-refactor/*`.
 | State | Files | Insertions | Deletions |
 |---|---:|---:|---:|
 | Draft feature baseline | 52 | 7437 | 434 |
-| Current branch | 55 | 5880 | 538 |
+| Current branch | 55 | 5893 | 538 |
 
 Category ledger:
 
 | Category | Draft net | Current net | Net removed |
 |---|---:|---:|---:|
-| Production | +4883 | +3306 | 1577 |
+| Production | +4883 | +3319 | 1564 |
 | Tests | +2081 | +2001 | 80 |
 | Docs | +30 | +28 | 2 |
 | Build metadata | +9 | +7 | 2 |
 
 The current project gate command, excluding evidence artifacts, reports
-`+5880 -538 net +5342` across 55 files. The full diff including evidence
+`+5893 -538 net +5355` across 55 files. The full diff including evidence
 artifacts is intentionally larger because this report and ledger are tracked.
 
 ## Lines Removed By Subsystem
@@ -43,7 +43,7 @@ artifacts is intentionally larger because this report and ledger are tracked.
 - Parser/compatibility surface: removed enum-qualified JSON compatibility spellings and speculative QUIC/multi-egress surface.
 - Tests: tabled and compressed several tunnel/gateway/system-egress assertions while keeping focused coverage.
 - Runtime phase: replaced diagnostic-prefix control flow with explicit `TunnelProviderPhase` transitions and bounded retry state.
-- Gateway TLS: moved server context construction to gateway start and shared the client/server SSL_CTX certificate setup helper.
+- Gateway TLS: moved server/client context construction out of session connect loops and shared the SSL_CTX certificate setup/peer-authorization helper.
 
 See `LINE_LEDGER.tsv` for per-path numbers.
 
@@ -70,6 +70,7 @@ Fixed or hard-cut:
 - Uploaded provider state is intercepted by `SystemContainerKind::mothershipTunnelProvider`, not by the reserved fragment alone.
 - Gateway accept now starts only after the launched provider cgroup is known, and each Unix peer must match the provider UID plus that exact cgroup before TLS/control proxying.
 - Gateway TLS server context is configured once at gateway start instead of reparsing root/server PEM and round-tripping peer certificates on every accepted session.
+- Tunnel gateway clients cache parsed client TLS context at cluster configuration, no longer store the raw client auth bundle on `MothershipSocket`, and reuse that context across reconnects.
 - Tunnel endpoint input is hard-cut to public IPv4 literal TCP.
 - Cluster schema types no longer own certificate parsing/generation, egress policy helpers, runtime policy, or Brain runtime state.
 - Tunnel desired state is folded into `ProdigyMasterAuthorityRuntimeState`; the old dedicated Brain topic and persistent record are deleted.
@@ -137,6 +138,7 @@ All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 - In fresh VM worktree `/work/prodigy-verify-cgroup-9YBkT2` at `e24d08e` plus the cgroup-gateway patch: `git diff --check`; `cmake -S prodigy/dev -B .run/build-cgroup -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++`; `cmake --build .run/build-cgroup --target prodigy mothership prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-cgroup/prodigy_mothership_unix_connect_unit`; `.run/build-cgroup/prodigy_brain_replication_credentials_unit`.
 - After replacing manual cgroup file syscalls with the existing bounded file-read helper in the same VM worktree: `git diff --check`; incremental `cmake --build .run/build-cgroup --target prodigy mothership prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-cgroup/prodigy_mothership_unix_connect_unit`; `.run/build-cgroup/prodigy_brain_replication_credentials_unit`.
 - After caching gateway TLS context and consolidating client/server SSL_CTX certificate setup in the same VM worktree: `git diff --check`; incremental `cmake --build .run/build-cgroup --target prodigy mothership prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-cgroup/prodigy_mothership_unix_connect_unit`; `.run/build-cgroup/prodigy_brain_replication_credentials_unit`.
+- After caching the tunnel gateway client TLS context and deleting the duplicate client-auth validator: `git diff --check`; incremental `cmake --build .run/build-cgroup --target prodigy mothership prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit prodigy_mothership_cluster_registry_unit --parallel 16`; `.run/build-cgroup/prodigy_mothership_unix_connect_unit`; `.run/build-cgroup/prodigy_brain_replication_credentials_unit`; `.run/build-cgroup/prodigy_mothership_cluster_registry_unit`.
 
 Earlier validation on the same branch also covered the broader build/test matrix:
 cluster registry, deployments, bundle artifact, BPF attach units, host/container

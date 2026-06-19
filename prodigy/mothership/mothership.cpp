@@ -4140,13 +4140,12 @@ private:
   Vector<String> controlPaths;
   Vector<MothershipProdigyClusterMachine> remoteMachines;
   String tunnelGatewayEndpoint;
-  MothershipTunnelGatewayClientAuth tunnelGatewayClientAuth;
+  MothershipTunnelGatewayTLSContext tunnelGatewayClientTLS;
   Vault::SSHKeyPackage clusterBootstrapSshKeyPackage;
   String clusterBootstrapSshPrivateKeyPath;
   String matchedFrameBuffer;
   int transportFD = -1;
-  SSL_CTX *tunnelGatewayTLSContext = nullptr;
-  SSL *tunnelGatewayTLS = nullptr;
+  std::unique_ptr<SSL, decltype(&SSL_free)> tunnelGatewayTLS{nullptr, SSL_free};
   LIBSSH2_SESSION *sshSession = nullptr;
   LIBSSH2_CHANNEL *sshChannel = nullptr;
   int sshFD = -1;
@@ -4186,7 +4185,7 @@ private:
     controlPaths.clear();
     remoteMachines.clear();
     tunnelGatewayEndpoint.clear();
-    tunnelGatewayClientAuth = {};
+    tunnelGatewayClientTLS.clear();
     clusterBootstrapSshKeyPackage.clear();
     clusterBootstrapSshPrivateKeyPath.clear();
     sshTunnelKnownHostsPath.clear();
@@ -4274,20 +4273,10 @@ private:
 
   void disconnectTunnelGateway(void)
   {
-    SSL *tls = tunnelGatewayTLS;
-    SSL_CTX *context = tunnelGatewayTLSContext;
-    tunnelGatewayTLS = nullptr;
-    tunnelGatewayTLSContext = nullptr;
-
-    if (tls != nullptr)
+    if (tunnelGatewayTLS != nullptr)
     {
-      (void)SSL_shutdown(tls);
-      SSL_free(tls);
-    }
-
-    if (context != nullptr)
-    {
-      SSL_CTX_free(context);
+      (void)SSL_shutdown(tunnelGatewayTLS.get());
+      tunnelGatewayTLS.reset();
     }
   }
 
@@ -4332,13 +4321,8 @@ private:
         ::close(*value);
       }
     });
-    std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> context(nullptr, SSL_CTX_free);
     std::unique_ptr<SSL, decltype(&SSL_free)> tls(nullptr, SSL_free);
-    MothershipTunnelX509Ptr rootCert(nullptr, X509_free);
-    MothershipTunnelX509Ptr clientCert(nullptr, X509_free);
-    MothershipTunnelPKeyPtr clientKey(nullptr, EVP_PKEY_free);
     MothershipTunnelX509Ptr peerCert(nullptr, X509_free);
-    MothershipTunnelPKeyPtr rootPublicKey(nullptr, EVP_PKEY_free);
 
     auto fail = [&](auto&& text) -> bool {
       lastConnectFailure.assign(text);
@@ -4346,21 +4330,12 @@ private:
       return false;
     };
 
-    rootCert.reset(VaultPem::x509FromPem(tunnelGatewayClientAuth.rootCertPem));
-    clientCert.reset(VaultPem::x509FromPem(tunnelGatewayClientAuth.clientCertPem));
-    clientKey.reset(VaultPem::privateKeyFromPem(tunnelGatewayClientAuth.clientKeyPem));
-    context.reset(SSL_CTX_new(TLS_client_method()));
-    if (rootCert == nullptr || clientCert == nullptr || clientKey == nullptr || context == nullptr)
+    if (tunnelGatewayClientTLS.configured() == false)
     {
-      return fail("tunnelProvider gateway TLS material invalid"_ctv);
+      return fail("tunnelProvider gateway TLS context missing"_ctv);
     }
 
-    if (mothershipTunnelTLSUseCertificate(context.get(), rootCert.get(), clientCert.get(), clientKey.get(), SSL_VERIFY_PEER) == false)
-    {
-      return fail("tunnelProvider gateway TLS context setup failed"_ctv);
-    }
-
-    tls.reset(SSL_new(context.get()));
+    tls.reset(SSL_new(tunnelGatewayClientTLS.context.get()));
     if (tls == nullptr || SSL_set_fd(tls.get(), fd) != 1)
     {
       return fail("tunnelProvider gateway TLS session setup failed"_ctv);
@@ -4372,16 +4347,13 @@ private:
     }
 
     peerCert.reset(SSL_get1_peer_certificate(tls.get()));
-    rootPublicKey.reset(X509_get_pubkey(rootCert.get()));
-    if (peerCert == nullptr || rootPublicKey == nullptr ||
-        mothershipTunnelGatewayLeafIssuedByRoot(rootCert.get(), rootPublicKey.get(), peerCert.get()) == false ||
-        mothershipTunnelGatewayLeafHasExtendedKeyUsage(peerCert.get(), NID_server_auth) == false)
+    if (tunnelGatewayClientTLS.authorizeServerCertificate(peerCert.get(), &lastConnectFailure) == false)
     {
-      return fail("tunnelProvider gateway server certificate invalid"_ctv);
+      printConnectFailure();
+      return false;
     }
 
-    tunnelGatewayTLSContext = context.release();
-    tunnelGatewayTLS = tls.release();
+    tunnelGatewayTLS = std::move(tls);
     transportFD = fd;
     fd = -1;
     lastConnectFailure.clear();
@@ -4753,12 +4725,12 @@ private:
 
     if (transportMode == TransportMode::tunnelGateway && tunnelGatewayTLS != nullptr)
     {
-      int rc = SSL_read(tunnelGatewayTLS, buffer, int(std::min<size_t>(len, INT_MAX)));
+      int rc = SSL_read(tunnelGatewayTLS.get(), buffer, int(std::min<size_t>(len, INT_MAX)));
       if (rc > 0)
       {
         return rc;
       }
-      if (SSL_get_error(tunnelGatewayTLS, rc) == SSL_ERROR_ZERO_RETURN)
+      if (SSL_get_error(tunnelGatewayTLS.get(), rc) == SSL_ERROR_ZERO_RETURN)
       {
         return 0;
       }
@@ -4834,7 +4806,7 @@ private:
       while (sent < len)
       {
         int chunk = int(std::min<size_t>(len - sent, INT_MAX));
-        int rc = SSL_write(tunnelGatewayTLS, buffer + sent, chunk);
+        int rc = SSL_write(tunnelGatewayTLS.get(), buffer + sent, chunk);
         if (rc <= 0)
         {
           return false;
@@ -4934,12 +4906,11 @@ public:
         }
         return false;
       }
-      if (mothershipTunnelGatewayClientAuthMaterialValid(spec.clientAuth, failure) == false)
+      if (tunnelGatewayClientTLS.configure(spec.clientAuth, failure) == false)
       {
         return false;
       }
       tunnelGatewayEndpoint = spec.dialEndpoint;
-      tunnelGatewayClientAuth = spec.clientAuth;
       transportMode = TransportMode::tunnelGateway;
       if (failure)
       {

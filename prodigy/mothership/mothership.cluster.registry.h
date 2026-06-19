@@ -1220,7 +1220,8 @@ private:
       return false;
     }
 
-    if (mothershipTunnelGatewayClientAuthMaterialValid(spec.clientAuth) == false)
+    MothershipTunnelGatewayTLSContext clientTLS = {};
+    if (clientTLS.configure(spec.clientAuth) == false)
     {
       if (failure)
       {

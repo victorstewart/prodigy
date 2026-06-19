@@ -27,6 +27,8 @@
 | `cmake --build .run/build-cgroup --target prodigy mothership prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit --parallel 16` after cached gateway TLS context change | pass |
 | `.run/build-cgroup/prodigy_mothership_unix_connect_unit` after cached gateway TLS context change | pass |
 | `.run/build-cgroup/prodigy_brain_replication_credentials_unit` after cached gateway TLS context change | pass |
+| `cmake --build .run/build-cgroup --target prodigy mothership prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit prodigy_mothership_cluster_registry_unit --parallel 16` after cached tunnel-client TLS context change | pass |
+| `.run/build-cgroup/prodigy_mothership_cluster_registry_unit` after cached tunnel-client TLS context change | pass |
 
 ## Privileged Tests Run In VM
 
@@ -54,4 +56,5 @@ Reason: the focused VM verification proved the touched unit/BPF paths, but the o
 - Provider health ages out from one historical authenticated session in focused Brain tests.
 - Gateway accepts only after provider launch and rejects Unix peers outside the launched provider cgroup.
 - Gateway server TLS context is cached before accept-loop start and reused for authenticated control sessions.
+- Tunnel gateway client TLS context is cached at cluster configuration and reused across reconnects.
 - Remote branch head matches local head.

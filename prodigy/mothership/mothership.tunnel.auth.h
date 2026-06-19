@@ -86,21 +86,6 @@ static inline bool mothershipTunnelGatewayLeafKeyMatches(X509 *rootCert, EVP_PKE
       mothershipTunnelGatewayLeafHasExtendedKeyUsage(leafCert, extendedKeyUsageNid);
 }
 
-static inline bool mothershipTunnelGatewayClientAuthMaterialValid(const MothershipTunnelGatewayClientAuth& auth, String *failure = nullptr)
-{
-  MothershipTunnelX509Ptr rootCert(VaultPem::x509FromPem(auth.rootCertPem), X509_free);
-  MothershipTunnelX509Ptr clientCert(VaultPem::x509FromPem(auth.clientCertPem), X509_free);
-  MothershipTunnelPKeyPtr clientKey(VaultPem::privateKeyFromPem(auth.clientKeyPem), EVP_PKEY_free);
-  MothershipTunnelPKeyPtr rootPublicKey(rootCert ? X509_get_pubkey(rootCert.get()) : nullptr, EVP_PKEY_free);
-  bool ok = auth.configured() && mothershipTunnelGatewayLeafKeyMatches(rootCert.get(), rootPublicKey.get(), clientCert.get(), clientKey.get(), NID_client_auth);
-
-  if (ok == false)
-  {
-    return mothershipTunnelAuthFail(failure, "mothership tunnel gateway client auth certificate material invalid"_ctv);
-  }
-  return mothershipTunnelAuthOk(failure);
-}
-
 static inline bool mothershipTunnelGatewayAuthMaterialValid(const MothershipTunnelGatewayAuth& auth, String *failure = nullptr)
 {
   MothershipTunnelX509Ptr rootCert(VaultPem::x509FromPem(auth.rootCertPem), X509_free);
@@ -125,31 +110,41 @@ public:
   MothershipTunnelX509Ptr root{nullptr, X509_free};
   MothershipTunnelPKeyPtr rootPublicKey{nullptr, EVP_PKEY_free};
 
-  bool configure(const MothershipTunnelGatewayAuth& auth, String *failure = nullptr)
+  void clear(void)
   {
     context.reset();
-    root.reset(VaultPem::x509FromPem(auth.rootCertPem));
-    rootPublicKey.reset(root ? X509_get_pubkey(root.get()) : nullptr);
-    MothershipTunnelX509Ptr serverCert(VaultPem::x509FromPem(auth.serverCertPem), X509_free);
-    MothershipTunnelPKeyPtr serverKey(VaultPem::privateKeyFromPem(auth.serverKeyPem), EVP_PKEY_free);
+    root.reset();
+    rootPublicKey.reset();
+  }
 
-    auto fail = [&](auto&& text) -> bool {
-      context.reset();
-      root.reset();
-      rootPublicKey.reset();
-      return mothershipTunnelAuthFail(failure, text);
-    };
-    if (auth.configured() == false || mothershipTunnelGatewayLeafKeyMatches(root.get(), rootPublicKey.get(), serverCert.get(), serverKey.get(), NID_server_auth) == false)
-    {
-      return fail("mothership tunnel gateway auth certificate material invalid"_ctv);
-    }
+  bool configure(const MothershipTunnelGatewayAuth& auth, String *failure = nullptr)
+  {
+    return configure(
+        auth.configured(),
+        auth.rootCertPem,
+        auth.serverCertPem,
+        auth.serverKeyPem,
+        TLS_server_method(),
+        NID_server_auth,
+        SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+        "mothership tunnel gateway auth certificate material invalid"_ctv,
+        "mothership tunnel gateway TLS context setup failed"_ctv,
+        failure);
+  }
 
-    context.reset(SSL_CTX_new(TLS_server_method()));
-    if (mothershipTunnelTLSUseCertificate(context.get(), root.get(), serverCert.get(), serverKey.get(), SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT) == false)
-    {
-      return fail("mothership tunnel gateway TLS context setup failed"_ctv);
-    }
-    return mothershipTunnelAuthOk(failure);
+  bool configure(const MothershipTunnelGatewayClientAuth& auth, String *failure = nullptr)
+  {
+    return configure(
+        auth.configured(),
+        auth.rootCertPem,
+        auth.clientCertPem,
+        auth.clientKeyPem,
+        TLS_client_method(),
+        NID_client_auth,
+        SSL_VERIFY_PEER,
+        "mothership tunnel gateway client auth certificate material invalid"_ctv,
+        "tunnelProvider gateway TLS context setup failed"_ctv,
+        failure);
   }
 
   bool configured(void) const
@@ -159,10 +154,56 @@ public:
 
   bool authorizeClientCertificate(X509 *clientCert, String *failure = nullptr) const
   {
-    if (mothershipTunnelGatewayLeafIssuedByRoot(root.get(), rootPublicKey.get(), clientCert) == false ||
-        mothershipTunnelGatewayLeafHasExtendedKeyUsage(clientCert, NID_client_auth) == false)
+    return authorize(clientCert, NID_client_auth, "mothership tunnel gateway client certificate invalid"_ctv, failure);
+  }
+
+  bool authorizeServerCertificate(X509 *serverCert, String *failure = nullptr) const
+  {
+    return authorize(serverCert, NID_server_auth, "tunnelProvider gateway server certificate invalid"_ctv, failure);
+  }
+
+private:
+
+  template <typename MaterialFailure, typename ContextFailure>
+  bool configure(
+      bool materialConfigured,
+      const String& rootPem,
+      const String& leafCertPem,
+      const String& leafKeyPem,
+      const SSL_METHOD *method,
+      int extendedKeyUsageNid,
+      int verifyMode,
+      const MaterialFailure& materialFailure,
+      const ContextFailure& contextFailure,
+      String *failure)
+  {
+    clear();
+    root.reset(VaultPem::x509FromPem(rootPem));
+    rootPublicKey.reset(root ? X509_get_pubkey(root.get()) : nullptr);
+    MothershipTunnelX509Ptr leafCert(VaultPem::x509FromPem(leafCertPem), X509_free);
+    MothershipTunnelPKeyPtr leafKey(VaultPem::privateKeyFromPem(leafKeyPem), EVP_PKEY_free);
+    if (materialConfigured == false || mothershipTunnelGatewayLeafKeyMatches(root.get(), rootPublicKey.get(), leafCert.get(), leafKey.get(), extendedKeyUsageNid) == false)
     {
-      return mothershipTunnelAuthFail(failure, "mothership tunnel gateway client certificate invalid"_ctv);
+      clear();
+      return mothershipTunnelAuthFail(failure, materialFailure);
+    }
+
+    context.reset(SSL_CTX_new(method));
+    if (mothershipTunnelTLSUseCertificate(context.get(), root.get(), leafCert.get(), leafKey.get(), verifyMode) == false)
+    {
+      clear();
+      return mothershipTunnelAuthFail(failure, contextFailure);
+    }
+    return mothershipTunnelAuthOk(failure);
+  }
+
+  template <typename Failure>
+  bool authorize(X509 *peerCert, int extendedKeyUsageNid, const Failure& failureText, String *failure) const
+  {
+    if (mothershipTunnelGatewayLeafIssuedByRoot(root.get(), rootPublicKey.get(), peerCert) == false ||
+        mothershipTunnelGatewayLeafHasExtendedKeyUsage(peerCert, extendedKeyUsageNid) == false)
+    {
+      return mothershipTunnelAuthFail(failure, failureText);
     }
     return mothershipTunnelAuthOk(failure);
   }
