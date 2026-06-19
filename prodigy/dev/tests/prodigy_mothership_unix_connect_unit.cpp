@@ -859,7 +859,6 @@ int main(void)
     if (edgeListener.port != 0 && gatewayListener.fd >= 0)
     {
       String providerBinary = PRODIGY_TEST_BINARY_DIR "/mothership-tunnel-provider";
-      ScopedEnvVar kindEnv("PRODIGY_CONTAINER_KIND", "mothershipTunnelProvider");
       ScopedEnvVar socketEnv("PRODIGY_MOTHERSHIP_SOCKET", gatewayListener.path);
       String edgePort = {};
       edgePort.assignItoa(edgeListener.port);

@@ -1205,26 +1205,9 @@ public:
     containerPlan.restartOnFailure = true;
     containerPlan.fragment = prodigyMothershipTunnelProviderRuntimeFragment;
     containerPlan.systemContainerKind = SystemContainerKind::mothershipTunnelProvider;
-    containerPlan.systemGatewaySocketSourcePath.assign(mothershipTunnelProviderHostGatewaySocketPath);
-    containerPlan.systemGatewaySocketTargetPath.assign(mothershipTunnelProviderMothershipSocketPath);
     containerPlan.systemEgressHost.assign(spec.egressHost);
     containerPlan.systemEgressPort = spec.egressPort;
     containerPlan.state = ContainerState::scheduled;
-
-    Vector<String> env = {};
-    auto pushEnv = [&](StringType auto&& key, const String& value) {
-      String assignment = {};
-      assignment.assign(key);
-      assignment.append(value);
-      env.push_back(std::move(assignment));
-    };
-    String edgePort = {};
-    edgePort.assignItoa(spec.egressPort);
-    pushEnv("PRODIGY_CONTAINER_KIND="_ctv, mothershipTunnelProviderContainerKindValue);
-    pushEnv("PRODIGY_MOTHERSHIP_SOCKET="_ctv, mothershipTunnelProviderMothershipSocketPath);
-    pushEnv("PRODIGY_TUNNEL_EGRESS_HOST="_ctv, spec.egressHost);
-    pushEnv("PRODIGY_TUNNEL_EGRESS_PORT="_ctv, edgePort);
-    containerPlan.systemExecuteEnv = std::move(env);
 
     ContainerManager::spinContainer(containerPlan, 0, NeuronContainerMetricPolicy {});
     auto containerIt = thisNeuron->containers.find(containerUUID);

@@ -11,7 +11,7 @@ production	2	1	1	prodigy/brain/machine.h
 production	102	4	98	prodigy/container.contract.h
 production	163	2	161	prodigy/containerstore.h
 build	7	0	7	prodigy/dev/CMakeLists.txt
-test	278	0	278	prodigy/dev/tests/mothership_tunnel_provider_fixture.cpp
+test	276	0	276	prodigy/dev/tests/mothership_tunnel_provider_fixture.cpp
 test	2	2	0	prodigy/dev/tests/prodigy_brain_config_ssh_replication_unit.cpp
 test	2	2	0	prodigy/dev/tests/prodigy_brain_ipv6_topology_unit.cpp
 test	2	2	0	prodigy/dev/tests/prodigy_brain_master_uuid_unit.cpp
@@ -22,7 +22,7 @@ test	107	0	107	prodigy/dev/tests/prodigy_container_overlay_sync_unit.cpp
 test	70	4	66	prodigy/dev/tests/prodigy_deployments_unit.cpp
 test	130	1	129	prodigy/dev/tests/prodigy_mothership_cluster_registry_unit.cpp
 test	2	1	1	prodigy/dev/tests/prodigy_mothership_topic_fuzz.cpp
-test	579	4	575	prodigy/dev/tests/prodigy_mothership_unix_connect_unit.cpp
+test	578	4	574	prodigy/dev/tests/prodigy_mothership_unix_connect_unit.cpp
 test	33	2	31	prodigy/dev/tests/prodigy_persistent_state_unit.cpp
 test	5	5	0	prodigy/dev/tests/prodigy_switchboard_whitehole_unit.cpp
 production	17	11	6	prodigy/discombobulator/src/build.rs
@@ -41,14 +41,14 @@ production	21	0	21	prodigy/mothership/mothership.cluster.types.h
 production	639	45	594	prodigy/mothership/mothership.cpp
 production	298	0	298	prodigy/mothership/mothership.tunnel.auth.h
 production	539	0	539	prodigy/mothership/mothership.tunnel.gateway.h
-production	120	0	120	prodigy/mothership/mothership.tunnel.policy.h
+production	116	0	116	prodigy/mothership/mothership.tunnel.policy.h
 production	1	0	1	prodigy/neuron/base.h
-production	370	135	235	prodigy/neuron/containers.h
+production	379	135	244	prodigy/neuron/containers.h
 production	28	18	10	prodigy/neuron/neuron.h
 production	16	18	-2	prodigy/persistent.state.h
-production	310	2	308	prodigy/prodigy.cpp
-production	37	0	37	prodigy/system.container.policy.h
-production	223	1	222	prodigy/types.h
+production	293	2	291	prodigy/prodigy.cpp
+production	40	0	40	prodigy/system.container.policy.h
+production	217	1	216	prodigy/types.h
 production	27	0	27	switchboard/kernel/container.egress.router.ebpf.c
 production	24	75	-51	switchboard/kernel/egress.routing.h
 production	15	92	-77	switchboard/kernel/host.ingress.router.ebpf.c

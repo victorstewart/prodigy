@@ -6831,9 +6831,6 @@ public:
 
   uint8_t fragment;
   SystemContainerKind systemContainerKind = SystemContainerKind::none;
-  Vector<String> systemExecuteEnv;
-  String systemGatewaySocketSourcePath;
-  String systemGatewaySocketTargetPath;
   String systemEgressHost;
   uint16_t systemEgressPort = 0;
   Vector<Wormhole> wormholes;
@@ -7084,9 +7081,6 @@ static void serialize(S&& serializer, ContainerPlan& plan)
   serializer.value1b(plan.restartOnFailure);
   serializer.value1b(plan.fragment);
   serializer.value1b(plan.systemContainerKind);
-  serializer.container(plan.systemExecuteEnv, UINT32_MAX);
-  serializer.text1b(plan.systemGatewaySocketSourcePath, UINT32_MAX);
-  serializer.text1b(plan.systemGatewaySocketTargetPath, UINT32_MAX);
   serializer.text1b(plan.systemEgressHost, UINT32_MAX);
   serializer.value2b(plan.systemEgressPort);
   serializer.object(plan.wormholes);

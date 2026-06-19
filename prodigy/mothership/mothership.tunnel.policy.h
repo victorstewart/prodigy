@@ -3,10 +3,6 @@
 #include <prodigy/mothership/mothership.cluster.types.h>
 #include <prodigy/system.container.policy.h>
 
-constexpr static auto mothershipTunnelProviderContainerKindValue = "mothershipTunnelProvider"_ctv;
-constexpr static auto mothershipTunnelProviderMothershipSocketPath = "/run/prodigy/mothership.sock"_ctv;
-constexpr static auto mothershipTunnelProviderHostGatewaySocketPath = "/run/prodigy/mothership-tunnel-gateway.sock"_ctv;
-
 using MothershipConnectivityRuntimeConfig = MothershipConnectivity;
 
 class MothershipTunnelProviderConfigureRequest {

@@ -247,14 +247,12 @@ static int fail(const char *message)
 int main()
 {
   std::signal(SIGPIPE, SIG_IGN);
-  const char *kind = std::getenv("PRODIGY_CONTAINER_KIND");
   const char *gatewaySocket = std::getenv("PRODIGY_MOTHERSHIP_SOCKET");
   const char *egressHost = std::getenv("PRODIGY_TUNNEL_EGRESS_HOST");
   const char *egressPort = std::getenv("PRODIGY_TUNNEL_EGRESS_PORT");
   TunnelProviderEndpoint endpoint;
   endpoint.host.assign(egressHost == nullptr ? "" : egressHost);
-  if (kind == nullptr || std::strcmp(kind, "mothershipTunnelProvider") != 0 ||
-      gatewaySocket == nullptr || gatewaySocket[0] == '\0' ||
+  if (gatewaySocket == nullptr || gatewaySocket[0] == '\0' ||
       endpoint.host.empty() || parsePort(egressPort, endpoint.port) == false)
   {
     return fail("invalid launch environment");

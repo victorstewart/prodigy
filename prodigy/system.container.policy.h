@@ -6,6 +6,9 @@
 #include <networking/ip.h>
 #include <services/prodigy.h>
 
+constexpr static auto mothershipTunnelProviderMothershipSocketPath = "/run/prodigy/mothership.sock"_ctv;
+constexpr static auto mothershipTunnelProviderHostGatewaySocketPath = "/run/prodigy/mothership-tunnel-gateway.sock"_ctv;
+
 static inline bool prodigySystemEgressIPv4HostAddressIsDenied(uint32_t address)
 {
   return isRFC1918Private4(htonl(address)) ||

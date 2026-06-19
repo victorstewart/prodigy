@@ -5268,12 +5268,11 @@ private:
 
   static bool materializeSystemContainerRootFSMounts(Container *container, int rootfd, const String& containerRoot, String *failureReport = nullptr)
   {
-    if (container->isSystemContainer() == false)
+    if (container->plan.systemContainerKind != SystemContainerKind::mothershipTunnelProvider)
     {
       return true;
     }
-    if (container->plan.systemGatewaySocketSourcePath.size() > 0 &&
-        bindMountSystemSocketIntoRootFS(rootfd, container->plan.systemGatewaySocketSourcePath, container->plan.systemGatewaySocketTargetPath, containerRoot, failureReport) == false)
+    if (bindMountSystemSocketIntoRootFS(rootfd, mothershipTunnelProviderHostGatewaySocketPath, mothershipTunnelProviderMothershipSocketPath, containerRoot, failureReport) == false)
     {
       return false;
     }
@@ -8594,9 +8593,19 @@ public:
       unsetenv("_STDBUF_O");
       unsetenv("_STDBUF_E");
 
-      for (const String& assignment : container->plan.systemExecuteEnv)
+      if (container->plan.systemContainerKind == SystemContainerKind::mothershipTunnelProvider)
       {
-        container->executeEnv.push_back(assignment);
+        String port = {};
+        port.assignItoa(container->plan.systemEgressPort);
+        auto pushSystemEnv = [&](StringType auto&& key, const String& value) {
+          String assignment = {};
+          assignment.assign(key);
+          assignment.append(value);
+          container->executeEnv.push_back(std::move(assignment));
+        };
+        pushSystemEnv("PRODIGY_MOTHERSHIP_SOCKET="_ctv, mothershipTunnelProviderMothershipSocketPath);
+        pushSystemEnv("PRODIGY_TUNNEL_EGRESS_HOST="_ctv, container->plan.systemEgressHost);
+        pushSystemEnv("PRODIGY_TUNNEL_EGRESS_PORT="_ctv, port);
       }
 
       for (const String& assignment : container->executeEnv)

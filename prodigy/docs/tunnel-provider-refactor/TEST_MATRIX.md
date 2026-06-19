@@ -29,6 +29,11 @@
 | `.run/build-cgroup/prodigy_brain_replication_credentials_unit` after cached gateway TLS context change | pass |
 | `cmake --build .run/build-cgroup --target prodigy mothership prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit prodigy_mothership_cluster_registry_unit --parallel 16` after cached tunnel-client TLS context change | pass |
 | `.run/build-cgroup/prodigy_mothership_cluster_registry_unit` after cached tunnel-client TLS context change | pass |
+| `cmake --build .run/build-cgroup --target prodigy mothership prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit prodigy_container_overlay_sync_unit prodigy_persistent_state_unit prodigy_mothership_cluster_registry_unit --parallel 16` after system launch-contract cut | pass |
+| `.run/build-cgroup/prodigy_mothership_unix_connect_unit` after system launch-contract cut | pass |
+| `.run/build-cgroup/prodigy_brain_replication_credentials_unit` after system launch-contract cut | pass |
+| `.run/build-cgroup/prodigy_persistent_state_unit` after system launch-contract cut | pass |
+| `.run/build-cgroup/prodigy_mothership_cluster_registry_unit` after system launch-contract cut | pass |
 
 ## Privileged Tests Run In VM
 
@@ -36,6 +41,7 @@
 |---|---|
 | `PRODIGY_DEV_ALLOW_BPF_ATTACH=1 ./prodigy_switchboard_whitehole_unit` | pass |
 | `PRODIGY_DEV_ALLOW_BPF_ATTACH=1 ./prodigy_container_overlay_sync_unit` | pass |
+| `PRODIGY_DEV_ALLOW_BPF_ATTACH=1 .run/build-cgroup/prodigy_container_overlay_sync_unit` after system launch-contract cut | pass |
 
 ## Privileged Tests Not Run
 
@@ -57,4 +63,6 @@ Reason: the focused VM verification proved the touched unit/BPF paths, but the o
 - Gateway accepts only after provider launch and rejects Unix peers outside the launched provider cgroup.
 - Gateway server TLS context is cached before accept-loop start and reused for authenticated control sessions.
 - Tunnel gateway client TLS context is cached at cluster configuration and reused across reconnects.
+- System-provider socket/env launch data is derived from `SystemContainerKind`, not serialized through `ContainerPlan`.
+- `PRODIGY_CONTAINER_KIND` launch env is deleted; artifact header plus typed launch state carry that identity.
 - Remote branch head matches local head.
