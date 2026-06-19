@@ -32,7 +32,7 @@ Category ledger:
 The prior project gate command, which counts Discombobulator test/build changes
 inside the production bucket, reports `+5625 -498 net +5127` across 54 files
 and keeps the production bucket at `+3193` net. The full diff including
-evidence artifacts is `63 files, 6018 insertions, 500 deletions`.
+evidence artifacts is `63 files, 6019 insertions, 500 deletions`.
 
 ## Lines Removed By Subsystem
 
