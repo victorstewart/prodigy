@@ -419,16 +419,21 @@ private:
     return true;
   }
 
+  static bool validateSystemArtifactContractHeader(const String& header, String *failureReport = nullptr)
+  {
+    return prodigyValidateDiscombobulatorMothershipTunnelProviderBlobHeaderText(header, failureReport);
+  }
+
   static bool validateSystemArtifactContract(const String& blob, String *failureReport = nullptr)
   {
     String headerText = prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText();
     String header = {};
     header.assign(blob.substr(0, headerText.size(), Copy::yes));
-    if (prodigyValidateDiscombobulatorMothershipTunnelProviderBlobHeaderText(header, failureReport) == false)
+    if (validateSystemArtifactContractHeader(header, failureReport) == false)
     {
       return false;
     }
-    if (blob.size() == headerText.size())
+    if (blob.size() <= headerText.size())
     {
       if (failureReport)
       {
@@ -460,9 +465,18 @@ private:
       return false;
     }
 
-    String blob = {};
-    Filesystem::openReadAtClose(-1, path, blob);
-    return validateSystemArtifactContract(blob, failureReport);
+    String headerText = prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText();
+    if (bytes <= headerText.size())
+    {
+      if (failureReport)
+      {
+        failureReport->assign("system container artifact payload required"_ctv);
+      }
+      return false;
+    }
+    String header = {};
+    Filesystem::openReadAtClose(-1, path, header, headerText.size());
+    return validateSystemArtifactContractHeader(header, failureReport);
   }
 
 public:

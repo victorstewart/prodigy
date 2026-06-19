@@ -44,6 +44,9 @@
 | `cmake --build .run/build-egress --target prodigy prodigy_brain_replication_credentials_unit prodigy_container_overlay_sync_unit prodigy_persistent_state_unit --parallel 16` after replacing fake app config with `SystemContainerRuntimePlan` | pass |
 | `.run/build-egress/prodigy_persistent_state_unit` after `SystemContainerRuntimePlan` | pass |
 | `.run/build-egress/prodigy_brain_replication_credentials_unit` after `SystemContainerRuntimePlan` | pass |
+| `cmake --build .run/build-egress --target prodigy prodigy_deployments_unit prodigy_brain_replication_credentials_unit --parallel 16` after bounding system artifact header verification | pass |
+| `.run/build-egress/prodigy_deployments_unit` after bounding system artifact header verification | pass |
+| `.run/build-egress/prodigy_brain_replication_credentials_unit` after bounding system artifact header verification | pass |
 
 ## Privileged Tests Run In VM
 
@@ -81,4 +84,5 @@ Reason: the focused VM verification proved the touched unit/BPF paths, but the o
 - System-provider egress is carried through `ContainerPlan` as a numeric `SystemContainerEgressPolicy`; Neuron no longer reparses a serialized text host before installing the BPF allowlist.
 - Tunnel-provider launch no longer calls `loadSystemContainerArtifact` or passes an artifact blob through the Brain/Prodigy launch hook.
 - System-provider kind, artifact reference, egress tuple, and fixed runtime resources live in `ContainerPlan::system`; provider launch no longer populates fake stateless-application config fields.
+- `ContainerStore::systemVerify` reads only the fixed contract header after digest/size verification instead of loading the full artifact for header validation.
 - Remote branch head matches local head.
