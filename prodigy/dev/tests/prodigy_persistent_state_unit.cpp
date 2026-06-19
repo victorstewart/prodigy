@@ -1069,7 +1069,7 @@ int main(void)
       "generate_mothership_tunnel_gateway_auth");
   suite.expect(storedTunnelGatewayAuth.configured(), "generate_mothership_tunnel_gateway_auth_configured");
 
-  MothershipConnectivityRuntimeConfig storedMothershipConnectivity = {};
+  MothershipConnectivity storedMothershipConnectivity = {};
   storedMothershipConnectivity.kind = MothershipConnectivityKind::tunnelProvider;
   storedMothershipConnectivity.tunnelProvider.artifactSha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv;
   storedMothershipConnectivity.tunnelProvider.artifactBytes = 512;

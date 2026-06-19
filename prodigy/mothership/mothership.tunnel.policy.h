@@ -3,8 +3,6 @@
 #include <prodigy/mothership/mothership.cluster.types.h>
 #include <prodigy/system.container.policy.h>
 
-using MothershipConnectivityRuntimeConfig = MothershipConnectivity;
-
 struct MothershipTunnelProviderConfigureRequest {
   MothershipTunnelProviderDesiredState desired;
   String artifactBlob;
@@ -65,7 +63,7 @@ static inline bool mothershipTunnelProviderSpecValid(const MothershipTunnelProvi
   return mothershipTunnelPolicyOk(failure);
 }
 
-static inline void mothershipStripMothershipOnlyConnectivityFields(MothershipConnectivityRuntimeConfig& config)
+static inline void mothershipStripMothershipOnlyConnectivityFields(MothershipConnectivity& config)
 {
   if (config.kind != MothershipConnectivityKind::tunnelProvider)
   {
@@ -76,7 +74,7 @@ static inline void mothershipStripMothershipOnlyConnectivityFields(MothershipCon
   config.tunnelProvider.clientAuth = {};
 }
 
-static inline bool mothershipConnectivityRuntimeConfigValid(const MothershipConnectivityRuntimeConfig& config, String *failure = nullptr)
+static inline bool mothershipConnectivityRuntimeConfigValid(const MothershipConnectivity& config, String *failure = nullptr)
 {
   if (config.kind == MothershipConnectivityKind::ssh)
   {

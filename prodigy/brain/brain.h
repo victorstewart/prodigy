@@ -947,7 +947,7 @@ public:
   bytell_hash_map<uint64_t, ApplicationServiceIdentity> reservedApplicationServicesByID;
   bytell_hash_map<uint32_t, String> reservedApplicationServiceNamesBySlotKey;
   bytell_hash_map<uint16_t, uint8_t> nextReservableServiceSlotByApplication;
-  MothershipConnectivityRuntimeConfig mothershipConnectivity;
+  MothershipConnectivity mothershipConnectivity;
   MothershipTunnelGatewayAuth mothershipTunnelGatewayAuth;
   struct {
     TunnelProviderPhase phase = TunnelProviderPhase::disabled;

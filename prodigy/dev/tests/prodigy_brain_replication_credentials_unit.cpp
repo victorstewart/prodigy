@@ -4563,9 +4563,9 @@ static void testSystemContainerArtifactReplicationQueuesTypedBlob(TestSuite& sui
   suite.expect(follower.wBuffer.size() == 0, "system_container_artifact_replication_skips_old_peer");
 }
 
-static MothershipConnectivityRuntimeConfig makeTunnelRuntimeConnectivityConfig(void)
+static MothershipConnectivity makeTunnelRuntimeConnectivityConfig(void)
 {
-  MothershipConnectivityRuntimeConfig config = {};
+  MothershipConnectivity config = {};
   config.kind = MothershipConnectivityKind::tunnelProvider;
   config.tunnelProvider.artifactSha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv;
   config.tunnelProvider.artifactBytes = 512;
@@ -4584,7 +4584,7 @@ static MothershipTunnelGatewayAuth makeTunnelGatewayAuth(void)
   return auth;
 }
 
-static MothershipTunnelProviderDesiredState makeTunnelProviderDesiredState(const MothershipConnectivityRuntimeConfig& config, const MothershipTunnelGatewayAuth& auth)
+static MothershipTunnelProviderDesiredState makeTunnelProviderDesiredState(const MothershipConnectivity& config, const MothershipTunnelGatewayAuth& auth)
 {
   MothershipTunnelProviderDesiredState desired = {};
   desired.connectivity = config;
@@ -4592,7 +4592,7 @@ static MothershipTunnelProviderDesiredState makeTunnelProviderDesiredState(const
   return desired;
 }
 
-static MothershipTunnelProviderConfigureRequest makeTunnelProviderConfigureRequest(const MothershipConnectivityRuntimeConfig& config, const MothershipTunnelGatewayAuth& auth, const String& blob)
+static MothershipTunnelProviderConfigureRequest makeTunnelProviderConfigureRequest(const MothershipConnectivity& config, const MothershipTunnelGatewayAuth& auth, const String& blob)
 {
   MothershipTunnelProviderConfigureRequest request = {};
   request.desired = makeTunnelProviderDesiredState(config, auth);
@@ -4602,7 +4602,7 @@ static MothershipTunnelProviderConfigureRequest makeTunnelProviderConfigureReque
 
 static void testMothershipTunnelProviderRuntimeSpecIsStrict(TestSuite& suite)
 {
-  MothershipConnectivityRuntimeConfig config = makeTunnelRuntimeConnectivityConfig();
+  MothershipConnectivity config = makeTunnelRuntimeConnectivityConfig();
   String failure = {};
   suite.expect(mothershipConnectivityRuntimeConfigValid(config, &failure), "mothership_tunnel_runtime_spec_valid");
   config.tunnelProvider.egressPort = 0;
@@ -4616,7 +4616,7 @@ static void testMothershipTunnelProviderConfigureAppliesAtomicallyAndReplicates(
   BrainView follower;
   String blob = prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText();
   blob.append("payload"_ctv);
-  MothershipConnectivityRuntimeConfig config = makeTunnelRuntimeConnectivityConfig();
+  MothershipConnectivity config = makeTunnelRuntimeConnectivityConfig();
   String artifactSha256 = {};
   suite.require(prodigyComputeSHA256Hex(blob, artifactSha256), "mothership_tunnel_provider_configure_blob_sha");
   config.tunnelProvider.artifactSha256 = artifactSha256;
@@ -4716,7 +4716,7 @@ static void testMothershipTunnelProviderReconcileBackfillsDesiredStateAndArtifac
 
   String blob = prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText();
   blob.append("payload"_ctv);
-  MothershipConnectivityRuntimeConfig config = makeTunnelRuntimeConnectivityConfig();
+  MothershipConnectivity config = makeTunnelRuntimeConnectivityConfig();
   String artifactSha256 = {};
   suite.require(prodigyComputeSHA256Hex(blob, artifactSha256), "mothership_tunnel_provider_reconcile_blob_sha");
   config.tunnelProvider.artifactSha256 = artifactSha256;
@@ -4816,7 +4816,7 @@ static void testMothershipTunnelProviderDesiredStateMasterAuthorityReplicationAp
 {
   TestBrain brain;
   BrainView peer;
-  MothershipConnectivityRuntimeConfig config = makeTunnelRuntimeConnectivityConfig();
+  MothershipConnectivity config = makeTunnelRuntimeConnectivityConfig();
   MothershipTunnelGatewayAuth auth = makeTunnelGatewayAuth();
   suite.require(auth.configured(), "mothership_tunnel_provider_master_authority_replication_fixture_configured");
   brain.brainConfig.clusterUUID = 0x7707;
@@ -4836,7 +4836,7 @@ static void testMothershipTunnelProviderDesiredStateMasterAuthorityReplicationAp
   suite.expect(brain.masterAuthorityApplyCalls == 1 && brain.persistCalls == 1, "mothership_tunnel_provider_master_authority_replication_persists_master_snapshot");
 
   TestBrain deniedBrain;
-  MothershipConnectivityRuntimeConfig denied = makeTunnelRuntimeConnectivityConfig();
+  MothershipConnectivity denied = makeTunnelRuntimeConnectivityConfig();
   denied.tunnelProvider.egressHost = "169.254.169.254"_ctv;
   MothershipTunnelProviderDesiredState deniedDesired = makeTunnelProviderDesiredState(denied, auth);
   ProdigyMasterAuthorityRuntimeState deniedRuntimeState = {};
@@ -4855,7 +4855,7 @@ static void testMothershipTunnelProviderRuntimeStateConfigChanges(TestSuite& sui
   MothershipTunnelGatewayAuth auth = makeTunnelGatewayAuth();
   suite.require(auth.configured(), "mothership_tunnel_runtime_auth_fixture_configured");
   brain.brainConfig.clusterUUID = 0x7707;
-  MothershipConnectivityRuntimeConfig config = makeTunnelRuntimeConnectivityConfig();
+  MothershipConnectivity config = makeTunnelRuntimeConnectivityConfig();
   String failure = {};
   suite.require(brain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "mothership_tunnel_runtime_initial_apply");
   suite.expect(brain.mothershipTunnelProviderRuntimeState.localContainerUUID == 0, "mothership_tunnel_runtime_not_running_without_launcher");
@@ -4879,7 +4879,7 @@ static void testMothershipTunnelProviderRuntimeStateRequiresActiveMaster(TestSui
   TestBrain brain;
   brain.mothershipTunnelProviderRuntimeState.localContainerUUID = 123;
 
-  MothershipConnectivityRuntimeConfig config = makeTunnelRuntimeConnectivityConfig();
+  MothershipConnectivity config = makeTunnelRuntimeConnectivityConfig();
   MothershipTunnelGatewayAuth auth = makeTunnelGatewayAuth();
   String failure = {};
   suite.require(brain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "mothership_tunnel_runtime_non_master_apply");
@@ -4912,7 +4912,7 @@ static void testMothershipTunnelProviderRuntimeLaunchBoundary(TestSuite& suite)
 
   String blob = prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText();
   blob.append("payload"_ctv);
-  MothershipConnectivityRuntimeConfig config = makeTunnelRuntimeConnectivityConfig();
+  MothershipConnectivity config = makeTunnelRuntimeConnectivityConfig();
   String artifactSha256 = {};
   suite.require(prodigyComputeSHA256Hex(blob, artifactSha256), "mothership_tunnel_runtime_launch_blob_sha");
   config.tunnelProvider.artifactSha256 = artifactSha256;
@@ -4947,7 +4947,7 @@ static void testMothershipTunnelProviderRuntimeLaunchBoundary(TestSuite& suite)
   suite.expect(brain.mothershipTunnelRuntimeStopCalls == 1 && brain.lastStoppedMothershipTunnelProviderContainerUUID == brain.nextMothershipTunnelProviderContainerUUID, "mothership_tunnel_runtime_launch_spec_change_stops_old");
   suite.expect(brain.mothershipTunnelRuntimeStartCalls == 2 && brain.mothershipTunnelProviderRuntimeState.localContainerUUID == brain.nextMothershipTunnelProviderContainerUUID, "mothership_tunnel_runtime_launch_spec_change_restarts");
 
-  MothershipConnectivityRuntimeConfig sshConfig = {};
+  MothershipConnectivity sshConfig = {};
   suite.require(brain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(sshConfig, {}), false, &failure), "mothership_tunnel_runtime_launch_ssh_cutover_apply");
   suite.expect(brain.mothershipTunnelRuntimeStopCalls == 2, "mothership_tunnel_runtime_launch_ssh_cutover_stops_runtime");
   suite.expect(brain.mothershipTunnelProviderRuntimeState.localContainerUUID == 0, "mothership_tunnel_runtime_launch_ssh_cutover_clears_runtime");
@@ -4998,7 +4998,7 @@ static void testMothershipTunnelProviderContainerFailureStopsRuntime(TestSuite& 
 
   String blob = prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText();
   blob.append("payload"_ctv);
-  MothershipConnectivityRuntimeConfig config = makeTunnelRuntimeConnectivityConfig();
+  MothershipConnectivity config = makeTunnelRuntimeConnectivityConfig();
   String artifactSha256 = {};
   suite.require(prodigyComputeSHA256Hex(blob, artifactSha256), "mothership_tunnel_runtime_failure_blob_sha");
   config.tunnelProvider.artifactSha256 = artifactSha256;
@@ -5118,7 +5118,7 @@ static void testClusterReportIncludesMothershipConnectivityStatus(TestSuite& sui
   suite.expect(defaultReport.mothershipConnectivity.kind.equal("ssh"_ctv), "cluster_report_default_mothership_connectivity_kind");
   suite.expect(defaultReport.mothershipConnectivity.lastFailure.size() == 0, "cluster_report_default_mothership_connectivity_tunnel_status_empty");
 
-  MothershipConnectivityRuntimeConfig config = makeTunnelRuntimeConnectivityConfig();
+  MothershipConnectivity config = makeTunnelRuntimeConnectivityConfig();
   MothershipTunnelGatewayAuth auth = makeTunnelGatewayAuth();
   String failure = {};
   suite.require(brain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "cluster_report_mothership_connectivity_setup");

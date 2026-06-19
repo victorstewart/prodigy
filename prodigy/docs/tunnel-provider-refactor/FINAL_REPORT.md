@@ -18,19 +18,19 @@ excluding evidence artifacts under `prodigy/docs/tunnel-provider-refactor/*`.
 | State | Files | Insertions | Deletions |
 |---|---:|---:|---:|
 | Draft feature baseline | 52 | 7437 | 434 |
-| Current branch | 57 | 5984 | 567 |
+| Current branch | 57 | 5982 | 567 |
 
 Category ledger:
 
 | Category | Draft net | Current net | Net removed |
 |---|---:|---:|---:|
-| Production | +4883 | +3335 | 1548 |
+| Production | +4883 | +3333 | 1550 |
 | Tests | +2081 | +2045 | 36 |
 | Docs | +30 | +28 | 2 |
 | Build metadata | +9 | +9 | 0 |
 
 The current project gate command, excluding evidence artifacts, reports
-`+5984 -567 net +5417` across 57 files. The full diff including evidence
+`+5982 -567 net +5415` across 57 files. The full diff including evidence
 artifacts is intentionally larger because this report and ledger are tracked.
 
 ## Lines Removed By Subsystem
@@ -101,6 +101,7 @@ Fixed or hard-cut:
 - Tunnel activation now hard-rejects connected Brain peers below the current binary protocol, and the new system-artifact replication topic is not sent to old peers.
 - Brain artifact ingress validation now matches the actual `sha256, bytes, blob` wire payload instead of a stale kind-prefixed intermediate shape.
 - The single-use connectivity runtime-config builder wrapper is deleted; create-time tunnel activation now copies, strips, and validates the runtime connectivity inline.
+- `MothershipConnectivityRuntimeConfig` is deleted; the runtime path now uses the same canonical `MothershipConnectivity` model after explicitly stripping Mothership-only fields.
 
 Superseded by later user direction:
 
@@ -183,6 +184,7 @@ All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 - After hard-cutting Brain reconcile to one system artifact reference: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_brain_replication_credentials_unit prodigy_brain_topic_fuzz --parallel 16`; `.run/build-egress/prodigy_brain_replication_credentials_unit`; `.run/build-egress/prodigy_brain_topic_fuzz -runs=100000`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before and after build/test.
 - After bumping the binary protocol and gating tunnel activation/artifact replication from old Brain peers: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_brain_replication_credentials_unit prodigy_brain_topic_fuzz --parallel 16`; `.run/build-egress/prodigy_brain_replication_credentials_unit`; `.run/build-egress/prodigy_brain_topic_fuzz -runs=100000`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test and after the focused runs.
 - After deleting the single-use runtime-connectivity builder wrapper: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_mothership_cluster_registry_unit --parallel 16`; `.run/build-egress/prodigy_mothership_cluster_registry_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test and after the focused unit.
+- After deleting the `MothershipConnectivityRuntimeConfig` alias: `git diff --check`; `cmake --build .run/build-egress --target prodigy mothership prodigy_brain_replication_credentials_unit prodigy_persistent_state_unit prodigy_mothership_cluster_registry_unit --parallel 16`; `.run/build-egress/prodigy_brain_replication_credentials_unit`; `.run/build-egress/prodigy_persistent_state_unit`; `.run/build-egress/prodigy_mothership_cluster_registry_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test and after the focused units.
 
 Earlier validation on the same branch also covered the broader build/test matrix:
 cluster registry, deployments, bundle artifact, BPF attach units, host/container
