@@ -18,19 +18,19 @@ excluding evidence artifacts under `prodigy/docs/tunnel-provider-refactor/*`.
 | State | Files | Insertions | Deletions |
 |---|---:|---:|---:|
 | Draft feature baseline | 52 | 7437 | 434 |
-| Current branch | 56 | 5977 | 566 |
+| Current branch | 56 | 5962 | 566 |
 
 Category ledger:
 
 | Category | Draft net | Current net | Net removed |
 |---|---:|---:|---:|
-| Production | +4883 | +3345 | 1538 |
+| Production | +4883 | +3330 | 1553 |
 | Tests | +2081 | +2029 | 52 |
 | Docs | +30 | +28 | 2 |
 | Build metadata | +9 | +9 | 0 |
 
 The current project gate command, excluding evidence artifacts, reports
-`+5977 -566 net +5411` across 56 files. The full diff including evidence
+`+5962 -566 net +5396` across 56 files. The full diff including evidence
 artifacts is intentionally larger because this report and ledger are tracked.
 
 ## Lines Removed By Subsystem
@@ -53,6 +53,7 @@ artifacts is intentionally larger because this report and ledger are tracked.
 - Create auth boundary: removed server auth from `MothershipTunnelProviderSpec`; gateway server auth is create-only hook input and only the client auth persists.
 - Gateway I/O retry path: TLS accept/read/write now treats OpenSSL `WANT_READ`/`WANT_WRITE` as bounded wait states and drains buffered TLS plaintext before polling the socket again.
 - Gateway health event: the runtime now marks provider health when authenticated TLS opens the guarded control socket, not after the proxy loop exits.
+- Brain reconcile artifact surface: hard-cut the speculative vector of system artifact refs to the single supported system artifact reference.
 
 See `LINE_LEDGER.tsv` for per-path numbers.
 
@@ -96,6 +97,7 @@ Fixed or hard-cut:
 - Gateway proxy sessions set socket receive/send timeouts and enforce a bounded idle poll timeout; focused coverage proves an authenticated idle session closes only after the guarded control socket opens.
 - Gateway TLS accept/read/write handles OpenSSL retry states under the same bounded idle timeout instead of failing a healthy session on `WANT_READ`/`WANT_WRITE`.
 - Gateway runtime health no longer depends on a mutable session-result struct or a clean proxy-loop exit; the authenticated control-open event is the only health callback.
+- Brain reconcile now advertises one system artifact reference instead of a vector, matching the single supported `SystemContainerKind`.
 
 Superseded by later user direction:
 
@@ -174,6 +176,7 @@ All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 - After handling OpenSSL gateway retry states and deleting the dead runtime-config ownership helper: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-egress/prodigy_mothership_unix_connect_unit`; `.run/build-egress/prodigy_brain_replication_credentials_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test.
 - After densifying the gateway retry path and deleting a trivial cluster-connectivity wrapper: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_mothership_unix_connect_unit --parallel 16`; `.run/build-egress/prodigy_mothership_unix_connect_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test.
 - After deleting the gateway session-result carrier and making authenticated control-open the health callback: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit prodigy_mothership_cluster_registry_unit --parallel 16`; `.run/build-egress/prodigy_mothership_unix_connect_unit`; `.run/build-egress/prodigy_brain_replication_credentials_unit`; `.run/build-egress/prodigy_mothership_cluster_registry_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before and after build/test.
+- After hard-cutting Brain reconcile to one system artifact reference: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_brain_replication_credentials_unit prodigy_brain_topic_fuzz --parallel 16`; `.run/build-egress/prodigy_brain_replication_credentials_unit`; `.run/build-egress/prodigy_brain_topic_fuzz -runs=100000`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before and after build/test.
 
 Earlier validation on the same branch also covered the broader build/test matrix:
 cluster registry, deployments, bundle artifact, BPF attach units, host/container

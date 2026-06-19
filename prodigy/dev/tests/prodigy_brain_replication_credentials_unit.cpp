@@ -4756,7 +4756,7 @@ static void testMothershipTunnelProviderReconcileBackfillsDesiredStateAndArtifac
   SystemContainerArtifactRef ref = {};
   ref.sha256 = config.tunnelProvider.artifactSha256;
   ref.bytes = config.tunnelProvider.artifactBytes;
-  request.systemArtifacts.push_back(ref);
+  request.systemArtifact = ref;
   serializedRequest.clear();
   messageBuffer.clear();
   BitseryEngine::serialize(serializedRequest, request);

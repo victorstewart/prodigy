@@ -227,14 +227,14 @@ class BrainReconcileStateRequest {
 public:
 
   Vector<uint64_t> deploymentIDs;
-  Vector<SystemContainerArtifactRef> systemArtifacts;
+  SystemContainerArtifactRef systemArtifact;
 };
 
 template <typename S>
 static void serialize(S&& serializer, BrainReconcileStateRequest& request)
 {
   serializer.object(request.deploymentIDs);
-  serializer.object(request.systemArtifacts);
+  serializer.object(request.systemArtifact);
 }
 
 static inline const char *machineCpuArchitectureName(MachineCpuArchitecture architecture)

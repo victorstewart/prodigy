@@ -12826,21 +12826,9 @@ public:
     return true;
   }
 
-  bool systemArtifactRefsContain(const Vector<SystemContainerArtifactRef>& refs, const String& sha256, uint64_t bytes) const
+  void capturePresentSystemArtifactRef(SystemContainerArtifactRef& ref)
   {
-    for (const SystemContainerArtifactRef& ref : refs)
-    {
-      if (ref.bytes == bytes && ref.sha256.equal(sha256))
-      {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  void capturePresentSystemArtifactRefs(Vector<SystemContainerArtifactRef>& refs)
-  {
-    refs.clear();
+    ref = {};
     if (mothershipConnectivity.kind != MothershipConnectivityKind::tunnelProvider)
     {
       return;
@@ -12849,14 +12837,12 @@ public:
     const MothershipTunnelProviderSpec& spec = mothershipConnectivity.tunnelProvider;
     if (systemContainerArtifactPresent(spec.artifactSha256, spec.artifactBytes))
     {
-      SystemContainerArtifactRef ref = {};
       ref.sha256 = spec.artifactSha256;
       ref.bytes = spec.artifactBytes;
-      refs.push_back(std::move(ref));
     }
   }
 
-  void queueMissingSystemContainerArtifactsForPeer(BrainView *peer, const Vector<SystemContainerArtifactRef>& peerArtifacts)
+  void queueMissingSystemContainerArtifactForPeer(BrainView *peer, const SystemContainerArtifactRef& peerArtifact)
   {
     if (peer == nullptr)
     {
@@ -12870,7 +12856,7 @@ public:
     }
 
     const MothershipTunnelProviderSpec& spec = connectivity.tunnelProvider;
-    if (systemArtifactRefsContain(peerArtifacts, spec.artifactSha256, spec.artifactBytes))
+    if (peerArtifact.bytes == spec.artifactBytes && peerArtifact.sha256.equal(spec.artifactSha256))
     {
       return;
     }
@@ -13039,14 +13025,13 @@ public:
     return changed;
   }
 
-  bool applyPreparedMothershipTunnelProviderDesiredState(const MothershipTunnelProviderDesiredState& desired, bool replicateToPeers, bool persist = true, String *failure = nullptr)
+  bool applyPreparedMothershipTunnelProviderDesiredState(const MothershipTunnelProviderDesiredState& desired, bool replicateToPeers, String *failure = nullptr)
   {
     bool changed = syncPreparedMothershipTunnelProviderDesiredState(desired);
     if (changed || (masterAuthorityRuntimeState.mothershipTunnelProviderDesiredState == desired) == false)
     {
-      noteMasterAuthorityRuntimeStateChanged(replicateToPeers, persist);
+      noteMasterAuthorityRuntimeStateChanged(replicateToPeers, true);
     }
-
     if (failure)
     {
       failure->clear();
@@ -13058,7 +13043,7 @@ public:
   {
     MothershipTunnelProviderDesiredState desired = {};
     return prepareMothershipTunnelProviderDesiredState(incoming, desired, failure) &&
-           applyPreparedMothershipTunnelProviderDesiredState(desired, replicateToPeers, true, failure);
+           applyPreparedMothershipTunnelProviderDesiredState(desired, replicateToPeers, failure);
   }
 
   bool applyMothershipTunnelProviderConfigureRequest(const MothershipTunnelProviderConfigureRequest& request, bool replicateToPeers, String *failure = nullptr)
@@ -13085,7 +13070,7 @@ public:
       {
         return false;
       }
-      if (applyPreparedMothershipTunnelProviderDesiredState(desired, false, true, failure) == false)
+      if (applyPreparedMothershipTunnelProviderDesiredState(desired, false, failure) == false)
       {
         return false;
       }
@@ -13104,7 +13089,7 @@ public:
       return true;
     }
 
-    return applyPreparedMothershipTunnelProviderDesiredState(desired, replicateToPeers, true, failure);
+    return applyPreparedMothershipTunnelProviderDesiredState(desired, replicateToPeers, failure);
   }
 
   void configureMothershipUnixSocketPath(String& mothershipSocketPath)
@@ -19185,7 +19170,7 @@ public:
             Message::construct(bv->wBuffer, BrainTopic::cullDeployment, deploymentID);
           }
           refreshMasterAuthorityRuntimeStateFromLiveFields();
-          queueMissingSystemContainerArtifactsForPeer(bv, request.systemArtifacts);
+          queueMissingSystemContainerArtifactForPeer(bv, request.systemArtifact);
           for (const auto& [applicationName, applicationID] : reservedApplicationIDsByName)
           {
             Message::construct(bv->wBuffer, BrainTopic::replicateApplicationIDReservation, applicationID, applicationName);
@@ -19482,7 +19467,7 @@ public:
                   {
                     request.deploymentIDs.push_back(plan.config.deploymentID());
                   }
-                  capturePresentSystemArtifactRefs(request.systemArtifacts);
+                  capturePresentSystemArtifactRef(request.systemArtifact);
 
                   String serializedRequest = {};
                   BitseryEngine::serialize(serializedRequest, request);
