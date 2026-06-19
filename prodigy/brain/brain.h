@@ -12670,19 +12670,10 @@ public:
 
   virtual void configureMothershipControlIngress(String& mothershipEndpoint) = 0;
   virtual void teardownMothershipControlIngress(void) = 0;
-  virtual bool persistMothershipConnectivityRuntimeConfig(const MothershipConnectivityRuntimeConfig& config, String *failure = nullptr)
+  virtual bool persistMothershipTunnelProviderDesiredState(const MothershipConnectivityRuntimeConfig& connectivity, const MothershipTunnelGatewayAuth& gatewayAuth, String *failure = nullptr)
   {
-    (void)config;
-    if (failure)
-    {
-      failure->clear();
-    }
-    return true;
-  }
-
-  virtual bool persistMothershipTunnelGatewayAuth(const MothershipTunnelGatewayAuth& auth, String *failure = nullptr)
-  {
-    (void)auth;
+    (void)connectivity;
+    (void)gatewayAuth;
     if (failure)
     {
       failure->clear();
@@ -12900,29 +12891,55 @@ public:
     state.lastFailure.assign(mothershipTunnelProviderPendingHealth);
   }
 
-  bool applyMothershipConnectivityRuntimeConfig(const MothershipConnectivityRuntimeConfig& incoming, bool replicateToPeers, String *failure = nullptr)
+  void queueMothershipTunnelProviderDesiredStateReplication(const MothershipTunnelProviderDesiredState& desired)
   {
-    MothershipConnectivityRuntimeConfig owned = {};
-    mothershipOwnConnectivityRuntimeConfig(incoming, owned);
-    if (mothershipConnectivityRuntimeConfigValid(owned, failure) == false)
+    String serialized;
+    MothershipTunnelProviderDesiredState owned = desired;
+    BitseryEngine::serialize(serialized, owned);
+    queueBrainReplication(BrainTopic::replicateMothershipTunnelProviderState, serialized);
+    Vault::secureClearString(serialized);
+  }
+
+  bool prepareMothershipTunnelProviderDesiredState(const MothershipTunnelProviderDesiredState& incoming, MothershipTunnelProviderDesiredState& desired, String *failure = nullptr)
+  {
+    desired = {};
+    mothershipOwnConnectivityRuntimeConfig(incoming.connectivity, desired.connectivity);
+    if (mothershipConnectivityRuntimeConfigValid(desired.connectivity, failure) == false)
     {
       return false;
     }
 
-    String currentSerialized = {};
-    String nextSerialized = {};
-    BitseryEngine::serialize(currentSerialized, mothershipConnectivity);
-    BitseryEngine::serialize(nextSerialized, owned);
-    bool configChanged = currentSerialized.equals(nextSerialized) == false;
-    Vault::secureClearString(currentSerialized);
-    Vault::secureClearString(nextSerialized);
+    if (desired.connectivity.kind == MothershipConnectivityKind::tunnelProvider)
+    {
+      if (incoming.gatewayAuth.configured() == false)
+      {
+        if (failure)
+        {
+          failure->assign("mothership tunnel gateway auth incomplete"_ctv);
+        }
+        return false;
+      }
 
-    mothershipConnectivity = std::move(owned);
-    if (persistMothershipConnectivityRuntimeConfig(mothershipConnectivity, failure) == false)
+      if (mothershipTunnelGatewayAuthMaterialValid(incoming.gatewayAuth, failure) == false)
+      {
+        return false;
+      }
+      desired.gatewayAuth = incoming.gatewayAuth;
+    }
+    return true;
+  }
+
+  bool applyPreparedMothershipTunnelProviderDesiredState(const MothershipTunnelProviderDesiredState& desired, bool replicateToPeers, String *failure = nullptr)
+  {
+    bool changed = mothershipConnectivityRuntimeConfigEqual(mothershipConnectivity, desired.connectivity) == false ||
+                   mothershipTunnelGatewayAuthEqual(mothershipTunnelGatewayAuth, desired.gatewayAuth) == false;
+    if (persistMothershipTunnelProviderDesiredState(desired.connectivity, desired.gatewayAuth, failure) == false)
     {
       return false;
     }
-    if (configChanged)
+    mothershipConnectivity = desired.connectivity;
+    mothershipTunnelGatewayAuth = desired.gatewayAuth;
+    if (changed)
     {
       stopMothershipTunnelProviderLocalInstance();
       mothershipTunnelProviderRuntimeState.lastFailure.clear();
@@ -12931,9 +12948,7 @@ public:
 
     if (replicateToPeers)
     {
-      String serialized;
-      BitseryEngine::serialize(serialized, mothershipConnectivity);
-      queueBrainReplication(BrainTopic::replicateMothershipConnectivity, serialized);
+      queueMothershipTunnelProviderDesiredStateReplication(desired);
     }
 
     if (failure)
@@ -12943,42 +12958,57 @@ public:
     return true;
   }
 
-  bool applyMothershipTunnelGatewayAuth(const MothershipTunnelGatewayAuth& incoming, bool replicateToPeers, String *failure = nullptr)
+  bool applyMothershipTunnelProviderDesiredState(const MothershipTunnelProviderDesiredState& incoming, bool replicateToPeers, String *failure = nullptr)
   {
-    if (incoming.configured() == false)
+    MothershipTunnelProviderDesiredState desired = {};
+    return prepareMothershipTunnelProviderDesiredState(incoming, desired, failure) &&
+           applyPreparedMothershipTunnelProviderDesiredState(desired, replicateToPeers, failure);
+  }
+
+  bool applyMothershipTunnelProviderConfigureRequest(const MothershipTunnelProviderConfigureRequest& request, bool replicateToPeers, String *failure = nullptr)
+  {
+    MothershipTunnelProviderDesiredState desired = {};
+    if (prepareMothershipTunnelProviderDesiredState(request.desired, desired, failure) == false)
     {
+      return false;
+    }
+
+    if (desired.connectivity.kind == MothershipConnectivityKind::tunnelProvider)
+    {
+      const MothershipTunnelProviderSpec& spec = desired.connectivity.tunnelProvider;
+      bool alreadyStored = systemContainerArtifactPresent(spec.artifactSha256, spec.artifactBytes);
+      if (alreadyStored == false && request.artifactBlob.size() == 0)
+      {
+        if (failure)
+        {
+          failure->assign("mothership tunnel provider artifact missing"_ctv);
+        }
+        return false;
+      }
+      if (alreadyStored == false && storeSystemContainerArtifact(spec.artifactSha256, spec.artifactBytes, request.artifactBlob, failure) == false)
+      {
+        return false;
+      }
+      if (applyPreparedMothershipTunnelProviderDesiredState(desired, false, failure) == false)
+      {
+        return false;
+      }
+      if (replicateToPeers)
+      {
+        if (alreadyStored == false)
+        {
+          queueBrainSystemContainerArtifactReplication(spec.artifactSha256, spec.artifactBytes, request.artifactBlob);
+        }
+        queueMothershipTunnelProviderDesiredStateReplication(desired);
+      }
       if (failure)
       {
-        failure->assign("mothership tunnel gateway auth incomplete"_ctv);
+        failure->clear();
       }
-      return false;
+      return true;
     }
 
-    if (mothershipTunnelGatewayAuthMaterialValid(incoming, failure) == false)
-    {
-      return false;
-    }
-
-    mothershipTunnelGatewayAuth = incoming;
-    if (persistMothershipTunnelGatewayAuth(mothershipTunnelGatewayAuth, failure) == false)
-    {
-      return false;
-    }
-    reconcileMothershipTunnelProviderRuntimeState();
-
-    if (replicateToPeers)
-    {
-      String serialized;
-      BitseryEngine::serialize(serialized, mothershipTunnelGatewayAuth);
-      queueBrainReplication(BrainTopic::replicateMothershipTunnelGatewayAuth, serialized);
-      Vault::secureClearString(serialized);
-    }
-
-    if (failure)
-    {
-      failure->clear();
-    }
-    return true;
+    return applyPreparedMothershipTunnelProviderDesiredState(desired, replicateToPeers, failure);
   }
 
   void configureMothershipUnixSocketPath(String& mothershipSocketPath)
@@ -18974,30 +19004,16 @@ public:
 
           break;
         }
-      case BrainTopic::replicateMothershipConnectivity:
+      case BrainTopic::replicateMothershipTunnelProviderState:
         {
           String serialized;
           Message::extractToStringView(args, serialized);
 
-          MothershipConnectivityRuntimeConfig incoming = {};
+          MothershipTunnelProviderDesiredState incoming = {};
           String failure = {};
-          if (BitseryEngine::deserializeSafe(serialized, incoming) == false || applyMothershipConnectivityRuntimeConfig(incoming, false, &failure) == false)
+          if (BitseryEngine::deserializeSafe(serialized, incoming) == false || applyMothershipTunnelProviderDesiredState(incoming, false, &failure) == false)
           {
-            basics_log("replicateMothershipConnectivity failed reason=%s\n", failure.size() > 0 ? failure.c_str() : "invalid payload");
-          }
-
-          break;
-        }
-      case BrainTopic::replicateMothershipTunnelGatewayAuth:
-        {
-          String serialized;
-          Message::extractToStringView(args, serialized);
-
-          MothershipTunnelGatewayAuth incoming = {};
-          String failure = {};
-          if (BitseryEngine::deserializeSafe(serialized, incoming) == false || applyMothershipTunnelGatewayAuth(incoming, false, &failure) == false)
-          {
-            basics_log("replicateMothershipTunnelGatewayAuth failed reason=%s\n", failure.size() > 0 ? failure.c_str() : "invalid payload");
+            basics_log("replicateMothershipTunnelProviderState failed reason=%s\n", failure.size() > 0 ? failure.c_str() : "invalid payload");
           }
 
           break;
@@ -21679,63 +21695,25 @@ public:
 
           break;
         }
-      case MothershipTopic::configureSystemContainerArtifact:
-        {
-          String sha256;
-          uint64_t bytes = 0;
-          String blob;
-          Message::extractToStringView(args, sha256);
-          Message::extractArg<ArgumentNature::fixed>(args, bytes);
-          Message::extractToStringView(args, blob);
-
-          MothershipResponse response = {};
-          response.success = applySystemContainerArtifact(sha256, bytes, blob, true, &response.failure);
-
-          String serializedResponse;
-          BitseryEngine::serialize(serializedResponse, response);
-          Message::construct(mothership->wBuffer, MothershipTopic::configureSystemContainerArtifact, serializedResponse);
-          break;
-        }
-      case MothershipTopic::configureMothershipConnectivity:
+      case MothershipTopic::configureMothershipTunnelProvider:
         {
           String serialized;
           Message::extractToStringView(args, serialized);
 
           MothershipResponse response = {};
-          MothershipConnectivityRuntimeConfig incoming = {};
+          MothershipTunnelProviderConfigureRequest incoming = {};
           if (BitseryEngine::deserializeSafe(serialized, incoming))
           {
-            response.success = applyMothershipConnectivityRuntimeConfig(incoming, true, &response.failure);
+            response.success = applyMothershipTunnelProviderConfigureRequest(incoming, true, &response.failure);
           }
           else
           {
-            response.failure.assign("invalid mothership connectivity payload"_ctv);
+            response.failure.assign("invalid mothership tunnel provider payload"_ctv);
           }
 
           String serializedResponse;
           BitseryEngine::serialize(serializedResponse, response);
-          Message::construct(mothership->wBuffer, MothershipTopic::configureMothershipConnectivity, serializedResponse);
-          break;
-        }
-      case MothershipTopic::configureMothershipTunnelGatewayAuth:
-        {
-          String serialized;
-          Message::extractToStringView(args, serialized);
-
-          MothershipResponse response = {};
-          MothershipTunnelGatewayAuth incoming = {};
-          if (BitseryEngine::deserializeSafe(serialized, incoming))
-          {
-            response.success = applyMothershipTunnelGatewayAuth(incoming, true, &response.failure);
-          }
-          else
-          {
-            response.failure.assign("invalid mothership tunnel gateway auth payload"_ctv);
-          }
-
-          String serializedResponse;
-          BitseryEngine::serialize(serializedResponse, response);
-          Message::construct(mothership->wBuffer, MothershipTopic::configureMothershipTunnelGatewayAuth, serializedResponse);
+          Message::construct(mothership->wBuffer, MothershipTopic::configureMothershipTunnelProvider, serializedResponse);
           break;
         }
       case MothershipTopic::upsertMachineSchemas:

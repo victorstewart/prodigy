@@ -1,57 +1,53 @@
-path	category	before_added	before_removed	after_added	after_removed	net_lines_removed	reason_surviving
-ebpf/common/structs.h	production	15	1	10	1	5	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-ebpf/kernel/maps.h	production	7	0	7	0	0	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-ebpf/kernel/services.h	production	50	0	20	0	30	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/brain/base.h	production	30	0	30	0	0	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/brain/brain.h	production	509	16	463	16	46	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/brain/machine.h	production	2	1	2	1	0	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/container.contract.h	production	105	4	88	4	17	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/containerstore.h	production	180	2	163	2	17	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/dev/CMakeLists.txt	build	9	0	7	0	2	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/dev/tests/mothership_tunnel_provider_fixture.cpp	test	0	0	278	0	-278	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/dev/tests/prodigy_brain_config_ssh_replication_unit.cpp	test	2	2	2	2	0	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/dev/tests/prodigy_brain_ipv6_topology_unit.cpp	test	2	2	2	2	0	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/dev/tests/prodigy_brain_master_uuid_unit.cpp	test	2	2	2	2	0	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/dev/tests/prodigy_brain_overlay_hosted_ingress_unit.cpp	test	2	2	2	2	0	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/dev/tests/prodigy_brain_replication_credentials_unit.cpp	test	736	8	703	8	33	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/dev/tests/prodigy_brain_topic_fuzz.cpp	test	5	1	5	1	0	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/dev/tests/prodigy_bundle_artifact_unit.cpp	test	3	1	0	0	2	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/dev/tests/prodigy_container_overlay_sync_unit.cpp	test	157	0	107	0	50	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/dev/tests/prodigy_deployments_unit.cpp	test	75	4	70	4	5	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/dev/tests/prodigy_mothership_cluster_registry_unit.cpp	test	170	1	130	1	40	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/dev/tests/prodigy_mothership_topic_fuzz.cpp	test	4	1	4	1	0	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/dev/tests/prodigy_mothership_unix_connect_unit.cpp	test	663	2	567	2	96	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/dev/tests/prodigy_persistent_state_unit.cpp	test	113	2	101	2	12	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/dev/tests/prodigy_switchboard_whitehole_unit.cpp	test	91	4	5	5	87	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/discombobulator/src/build.rs	production	17	11	17	11	0	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/discombobulator/src/build_portable.rs	production	11	10	11	10	0	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/discombobulator/src/cli.rs	production	1	0	1	0	0	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/discombobulator/src/plan.rs	production	11	9	11	9	0	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/discombobulator/src/registry.rs	production	2	0	2	0	0	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/discombobulator/tests/build_smoke.rs	test	90	11	90	11	0	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/discombobulator/tests/parser.rs	test	10	1	10	1	0	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/docs/runtime.md	doc	14	0	14	0	0	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/docs/security.md	doc	16	0	14	0	2	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/ingress.validation.h	production	48	0	48	0	0	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/mothership/mothership.cluster.create.h	production	5	0	6	0	-1	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/mothership/mothership.cluster.registry.h	production	95	4	88	4	7	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/mothership/mothership.cluster.types.h	production	655	0	101	0	554	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/mothership/mothership.cpp	production	863	6	708	45	194	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/mothership/mothership.tunnel.auth.h	production	0	0	208	0	-208	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/mothership/mothership.tunnel.gateway.h	production	654	0	518	0	136	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/mothership/mothership.tunnel.policy.h	production	0	0	104	0	-104	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/mothership/mothership.tunnel.provider.cpp	production	278	0	0	0	278	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/neuron/base.h	production	1	0	1	0	0	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/neuron/containers.h	production	611	123	366	123	245	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/neuron/neuron.h	production	38	19	28	18	9	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/persistent.state.h	production	265	0	229	17	53	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/prodigy.cpp	production	355	2	302	2	53	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/system.container.policy.h	production	0	0	37	0	-37	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-prodigy/types.h	production	57	0	36	0	21	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-switchboard/common/structs.h	production	5	0	0	0	5	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-switchboard/kernel/container.egress.router.ebpf.c	production	51	0	27	0	24	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-switchboard/kernel/egress.routing.h	production	115	75	24	75	91	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-switchboard/kernel/host.ingress.router.ebpf.c	production	134	88	15	92	123	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-switchboard/kernel/l4.ports.h	production	47	0	47	0	0	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-switchboard/kernel/whitehole.maps.h	production	7	0	0	0	7	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
-switchboard/whitehole.route.h	production	49	19	33	19	16	current branch still depends on this path for the surviving implementation, tests, docs, or build metadata
+category	insertions	deletions	net	path
+production	10	1	9	ebpf/common/structs.h
+production	7	0	7	ebpf/kernel/maps.h
+production	20	0	20	ebpf/kernel/services.h
+production	30	0	30	prodigy/brain/base.h
+production	441	16	425	prodigy/brain/brain.h
+production	2	1	1	prodigy/brain/machine.h
+production	88	4	84	prodigy/container.contract.h
+production	163	2	161	prodigy/containerstore.h
+build	7	0	7	prodigy/dev/CMakeLists.txt
+test	278	0	278	prodigy/dev/tests/mothership_tunnel_provider_fixture.cpp
+test	2	2	0	prodigy/dev/tests/prodigy_brain_config_ssh_replication_unit.cpp
+test	2	2	0	prodigy/dev/tests/prodigy_brain_ipv6_topology_unit.cpp
+test	2	2	0	prodigy/dev/tests/prodigy_brain_master_uuid_unit.cpp
+test	2	2	0	prodigy/dev/tests/prodigy_brain_overlay_hosted_ingress_unit.cpp
+test	597	8	589	prodigy/dev/tests/prodigy_brain_replication_credentials_unit.cpp
+test	4	1	3	prodigy/dev/tests/prodigy_brain_topic_fuzz.cpp
+test	107	0	107	prodigy/dev/tests/prodigy_container_overlay_sync_unit.cpp
+test	70	4	66	prodigy/dev/tests/prodigy_deployments_unit.cpp
+test	130	1	129	prodigy/dev/tests/prodigy_mothership_cluster_registry_unit.cpp
+test	2	1	1	prodigy/dev/tests/prodigy_mothership_topic_fuzz.cpp
+test	570	4	566	prodigy/dev/tests/prodigy_mothership_unix_connect_unit.cpp
+test	74	2	72	prodigy/dev/tests/prodigy_persistent_state_unit.cpp
+test	5	5	0	prodigy/dev/tests/prodigy_switchboard_whitehole_unit.cpp
+production	17	11	6	prodigy/discombobulator/src/build.rs
+production	11	10	1	prodigy/discombobulator/src/build_portable.rs
+production	1	0	1	prodigy/discombobulator/src/cli.rs
+production	11	9	2	prodigy/discombobulator/src/plan.rs
+production	2	0	2	prodigy/discombobulator/src/registry.rs
+test	90	11	79	prodigy/discombobulator/tests/build_smoke.rs
+test	10	1	9	prodigy/discombobulator/tests/parser.rs
+doc	14	0	14	prodigy/docs/runtime.md
+doc	14	0	14	prodigy/docs/security.md
+production	24	0	24	prodigy/ingress.validation.h
+production	6	0	6	prodigy/mothership/mothership.cluster.create.h
+production	88	4	84	prodigy/mothership/mothership.cluster.registry.h
+production	101	0	101	prodigy/mothership/mothership.cluster.types.h
+production	675	45	630	prodigy/mothership/mothership.cpp
+production	208	0	208	prodigy/mothership/mothership.tunnel.auth.h
+production	518	0	518	prodigy/mothership/mothership.tunnel.gateway.h
+production	158	0	158	prodigy/mothership/mothership.tunnel.policy.h
+production	1	0	1	prodigy/neuron/base.h
+production	366	123	243	prodigy/neuron/containers.h
+production	28	18	10	prodigy/neuron/neuron.h
+production	156	17	139	prodigy/persistent.state.h
+production	291	2	289	prodigy/prodigy.cpp
+production	37	0	37	prodigy/system.container.policy.h
+production	36	0	36	prodigy/types.h
+production	27	0	27	switchboard/kernel/container.egress.router.ebpf.c
+production	24	75	-51	switchboard/kernel/egress.routing.h
+production	15	92	-77	switchboard/kernel/host.ingress.router.ebpf.c
+production	47	0	47	switchboard/kernel/l4.ports.h
+production	33	19	14	switchboard/whitehole.route.h

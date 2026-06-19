@@ -667,13 +667,14 @@ static bool createUnixListener(ScopedUnixListener& listener, String& failure)
 {
   failure.clear();
 
+  static std::atomic<uint64_t> unixListenerCounter = 0;
   char pathBuffer[sizeof(sockaddr_un::sun_path)] = {};
   std::snprintf(
       pathBuffer,
       sizeof(pathBuffer),
-      "/tmp/nametag-mship-%d-%u.sock",
+      "/tmp/nametag-mship-%d-%llu.sock",
       int(::getpid()),
-      unsigned(Time::now<TimeResolution::ms>() & 0xffffffffu));
+      (unsigned long long)unixListenerCounter.fetch_add(1, std::memory_order_relaxed));
   listener.path.assign(pathBuffer);
 
   (void)::unlink(listener.path.c_str());

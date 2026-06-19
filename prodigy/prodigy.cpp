@@ -1004,14 +1004,9 @@ public:
   {
   }
 
-  bool persistMothershipConnectivityRuntimeConfig(const MothershipConnectivityRuntimeConfig& config, String *failure = nullptr) override
+  bool persistMothershipTunnelProviderDesiredState(const MothershipConnectivityRuntimeConfig& connectivity, const MothershipTunnelGatewayAuth& gatewayAuth, String *failure = nullptr) override
   {
-    return persistentStateStore.saveMothershipConnectivityRuntimeConfig(config, failure);
-  }
-
-  bool persistMothershipTunnelGatewayAuth(const MothershipTunnelGatewayAuth& auth, String *failure = nullptr) override
-  {
-    return persistentStateStore.saveMothershipTunnelGatewayAuth(auth, failure);
+    return persistentStateStore.saveMothershipTunnelProviderDesiredState(connectivity, gatewayAuth, failure);
   }
 
   void noteMothershipTunnelGatewayFailure(String failure)
@@ -1331,15 +1326,9 @@ public:
     }
 
     String connectivityFailure = {};
-    if (persistentStateStore.loadMothershipConnectivityRuntimeConfig(mothershipConnectivity, &connectivityFailure) == false && connectivityFailure.size() > 0 && connectivityFailure != "record not found"_ctv)
+    if (persistentStateStore.loadMothershipTunnelProviderDesiredState(mothershipConnectivity, mothershipTunnelGatewayAuth, &connectivityFailure) == false && connectivityFailure.size() > 0 && connectivityFailure != "record not found"_ctv)
     {
-      basics_log("ProdigyBrain mothership connectivity load failed: %s\n", connectivityFailure.c_str());
-    }
-
-    String tunnelGatewayAuthFailure = {};
-    if (persistentStateStore.loadMothershipTunnelGatewayAuth(mothershipTunnelGatewayAuth, &tunnelGatewayAuthFailure) == false && tunnelGatewayAuthFailure.size() > 0 && tunnelGatewayAuthFailure != "record not found"_ctv)
-    {
-      basics_log("ProdigyBrain mothership tunnel gateway auth load failed: %s\n", tunnelGatewayAuthFailure.c_str());
+      basics_log("ProdigyBrain mothership tunnel provider desired state load failed: %s\n", connectivityFailure.c_str());
     }
 
     prodigyBackfillBrainConfigSSHFromBootState(persistentBootState, brainConfig);

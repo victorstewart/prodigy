@@ -8081,67 +8081,34 @@ private:
             return false;
           }
 
-          Message::construct(
-              owner->socket.wBuffer,
-              MothershipTopic::configureSystemContainerArtifact,
-              providerSpec.artifactSha256,
-              providerSpec.artifactBytes,
-              artifactBlob);
-          if (owner->socket.send() == false)
-          {
-            requestFailure.assign("failed to send system container artifact request"_ctv);
-            return false;
-          }
-          if (recvMothershipResponse(
-              MothershipTopic::configureSystemContainerArtifact,
-              "timed out waiting for system container artifact acknowledgement"_ctv,
-              "system container artifact configuration rejected"_ctv) == false)
-          {
-            return false;
-          }
-
           if (providerSpec.gatewayAuth.configured() == false)
           {
             requestFailure.assign("tunnelProvider gateway auth missing from create context"_ctv);
             return false;
           }
 
-          MothershipTunnelGatewayAuth gatewayAuth = providerSpec.gatewayAuth;
-          String serializedGatewayAuth = {};
-          BitseryEngine::serialize(serializedGatewayAuth, gatewayAuth);
-          Message::construct(owner->socket.wBuffer, MothershipTopic::configureMothershipTunnelGatewayAuth, serializedGatewayAuth);
-          Vault::secureClearString(serializedGatewayAuth);
-          if (owner->socket.send() == false)
-          {
-            requestFailure.assign("failed to send mothership tunnel gateway auth request"_ctv);
-            return false;
-          }
-          if (recvMothershipResponse(
-              MothershipTopic::configureMothershipTunnelGatewayAuth,
-              "timed out waiting for mothership tunnel gateway auth acknowledgement"_ctv,
-              "mothership tunnel gateway auth configuration rejected"_ctv) == false)
+          MothershipTunnelProviderConfigureRequest request = {};
+          request.artifactBlob = std::move(artifactBlob);
+          request.desired.gatewayAuth = providerSpec.gatewayAuth;
+          if (mothershipBuildClusterMothershipConnectivityRuntimeConfig(cluster, request.desired.connectivity, &requestFailure) == false)
           {
             return false;
           }
 
-          MothershipConnectivityRuntimeConfig connectivity = {};
-          if (mothershipBuildClusterMothershipConnectivityRuntimeConfig(cluster, connectivity, &requestFailure) == false)
-          {
-            return false;
-          }
-
-          String serializedConnectivity = {};
-          BitseryEngine::serialize(serializedConnectivity, connectivity);
-          Message::construct(owner->socket.wBuffer, MothershipTopic::configureMothershipConnectivity, serializedConnectivity);
+          String serializedRequest = {};
+          BitseryEngine::serialize(serializedRequest, request);
+          Message::construct(owner->socket.wBuffer, MothershipTopic::configureMothershipTunnelProvider, serializedRequest);
+          Vault::secureClearString(serializedRequest);
+          Vault::secureClearString(request.artifactBlob);
           if (owner->socket.send() == false)
           {
-            requestFailure.assign("failed to send mothership connectivity request"_ctv);
+            requestFailure.assign("failed to send mothership tunnel provider request"_ctv);
             return false;
           }
           if (recvMothershipResponse(
-              MothershipTopic::configureMothershipConnectivity,
-              "timed out waiting for mothership connectivity acknowledgement"_ctv,
-              "mothership connectivity configuration rejected"_ctv) == false)
+              MothershipTopic::configureMothershipTunnelProvider,
+              "timed out waiting for mothership tunnel provider acknowledgement"_ctv,
+              "mothership tunnel provider configuration rejected"_ctv) == false)
           {
             return false;
           }

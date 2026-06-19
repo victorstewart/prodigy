@@ -265,32 +265,9 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
     case MothershipTopic::presentACMEDNS01Challenge:
     case MothershipTopic::cleanupACMEDNS01Challenge:
     case MothershipTopic::importACMELineage:
-    case MothershipTopic::configureMothershipConnectivity:
-    case MothershipTopic::configureMothershipTunnelGatewayAuth:
+    case MothershipTopic::configureMothershipTunnelProvider:
       {
         return consumeVariable(cursor, terminal) && cursor == terminal;
-      }
-    case MothershipTopic::configureSystemContainerArtifact:
-      {
-        uint8_t kind = 0;
-        uint64_t bytes = 0;
-        if (extractFixed(cursor, terminal, kind) == false)
-        {
-          return false;
-        }
-        if (consumeVariable(cursor, terminal) == false)
-        {
-          return false;
-        }
-        if (extractFixed(cursor, terminal, bytes) == false)
-        {
-          return false;
-        }
-        if (consumeVariable(cursor, terminal) == false)
-        {
-          return false;
-        }
-        return (cursor == terminal);
       }
     case MothershipTopic::spinApplication:
       {
@@ -386,8 +363,7 @@ static bool validateBrainPayload(uint16_t rawTopic, uint8_t *args, uint8_t *term
         return (cursor == terminal);
       }
     case BrainTopic::replicateContainerRuntimeState:
-    case BrainTopic::replicateMothershipConnectivity:
-    case BrainTopic::replicateMothershipTunnelGatewayAuth:
+    case BrainTopic::replicateMothershipTunnelProviderState:
       {
         if (consumeVariable(cursor, terminal) == false)
         {

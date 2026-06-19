@@ -71,8 +71,7 @@ public:
   uint32_t persistCalls = 0;
   uint32_t masterAuthorityApplyCalls = 0;
   uint32_t clusterOwnershipCalls = 0;
-  uint32_t mothershipConnectivityPersistCalls = 0;
-  uint32_t mothershipTunnelGatewayAuthPersistCalls = 0;
+  uint32_t mothershipTunnelProviderDesiredStatePersistCalls = 0;
   uint128_t lastClaimedClusterUUID = 0;
   bool rejectClusterOwnership = false;
   String rejectClusterOwnershipFailure = {};
@@ -123,21 +122,11 @@ public:
     persistCalls += 1;
   }
 
-  bool persistMothershipConnectivityRuntimeConfig(const MothershipConnectivityRuntimeConfig& config, String *failure = nullptr) override
+  bool persistMothershipTunnelProviderDesiredState(const MothershipConnectivityRuntimeConfig& connectivity, const MothershipTunnelGatewayAuth& gatewayAuth, String *failure = nullptr) override
   {
-    mothershipConnectivityPersistCalls += 1;
-    mothershipOwnConnectivityRuntimeConfig(config, lastPersistedMothershipConnectivity);
-    if (failure)
-    {
-      failure->clear();
-    }
-    return true;
-  }
-
-  bool persistMothershipTunnelGatewayAuth(const MothershipTunnelGatewayAuth& auth, String *failure = nullptr) override
-  {
-    mothershipTunnelGatewayAuthPersistCalls += 1;
-    lastPersistedMothershipTunnelGatewayAuth = auth;
+    mothershipTunnelProviderDesiredStatePersistCalls += 1;
+    mothershipOwnConnectivityRuntimeConfig(connectivity, lastPersistedMothershipConnectivity);
+    lastPersistedMothershipTunnelGatewayAuth = gatewayAuth;
     if (failure)
     {
       failure->clear();
@@ -4578,74 +4567,6 @@ static void testSystemContainerArtifactReplicationQueuesTypedBlob(TestSuite& sui
   suite.expect(sawArtifact, "system_container_artifact_replication_queues_typed_blob");
 }
 
-static void testMothershipSystemContainerArtifactConfigureStoresAndReplicates(TestSuite& suite)
-{
-  TestBrain brain;
-  Mothership mothership;
-  BrainView follower;
-  brain.weAreMaster = true;
-  follower.connected = true;
-  follower.weConnectToIt = true;
-  follower.isFixedFile = true;
-  follower.fslot = 18;
-  brain.brains.insert(&follower);
-
-  String blob = prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText();
-  blob.append("payload"_ctv);
-  String sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv;
-
-  String messageBuffer;
-  Message *message = buildMothershipMessage(
-      messageBuffer,
-      MothershipTopic::configureSystemContainerArtifact,
-      sha256,
-      blob.size(),
-      blob);
-  brain.mothershipHandler(&mothership, message);
-
-  suite.expect(brain.systemContainerStoreCalls == 1, "mothership_system_artifact_configure_stores_once");
-  suite.expect(brain.lastStoredSystemContainerSha256.equal(sha256), "mothership_system_artifact_configure_stores_sha256");
-  suite.expect(brain.lastStoredSystemContainerBytes == blob.size(), "mothership_system_artifact_configure_stores_bytes");
-  suite.expect(brain.lastStoredSystemContainerBlob.equal(blob), "mothership_system_artifact_configure_stores_blob");
-
-  Message *responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
-  String serializedResponse = {};
-  uint8_t *responseArgs = responseMessage->args;
-  Message::extractToStringView(responseArgs, serializedResponse);
-  MothershipResponse response = {};
-  suite.expect(MothershipTopic(responseMessage->topic) == MothershipTopic::configureSystemContainerArtifact, "mothership_system_artifact_configure_response_topic");
-  suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response) && response.success, "mothership_system_artifact_configure_response_success");
-
-  auto countReplications = [&]() -> uint32_t {
-    uint32_t count = 0;
-    forEachMessageInBuffer(follower.wBuffer, [&](Message *queued) {
-      if (BrainTopic(queued->topic) != BrainTopic::replicateSystemContainerArtifact)
-      {
-        return;
-      }
-
-      uint8_t *args = queued->args;
-      String queuedSha256;
-      uint64_t queuedBytes = 0;
-      String queuedBlob;
-      Message::extractToStringView(args, queuedSha256);
-      Message::extractArg<ArgumentNature::fixed>(args, queuedBytes);
-      Message::extractToStringView(args, queuedBlob);
-
-      if (queuedSha256.equal(sha256) && queuedBytes == blob.size() && queuedBlob.equal(blob))
-      {
-        count += 1;
-      }
-    });
-    return count;
-  };
-  suite.expect(countReplications() == 1, "mothership_system_artifact_configure_replicates_to_brains");
-
-  brain.mothershipHandler(&mothership, message);
-  suite.expect(brain.systemContainerStoreCalls == 1, "mothership_system_artifact_configure_duplicate_skips_store");
-  suite.expect(countReplications() == 1, "mothership_system_artifact_configure_duplicate_skips_replication");
-}
-
 static MothershipConnectivityRuntimeConfig makeTunnelRuntimeConnectivityConfig(void)
 {
   MothershipConnectivityRuntimeConfig config = {};
@@ -4667,6 +4588,22 @@ static MothershipTunnelGatewayAuth makeTunnelGatewayAuth(void)
   return auth;
 }
 
+static MothershipTunnelProviderDesiredState makeTunnelProviderDesiredState(const MothershipConnectivityRuntimeConfig& config, const MothershipTunnelGatewayAuth& auth)
+{
+  MothershipTunnelProviderDesiredState desired = {};
+  desired.connectivity = config;
+  desired.gatewayAuth = auth;
+  return desired;
+}
+
+static MothershipTunnelProviderConfigureRequest makeTunnelProviderConfigureRequest(const MothershipConnectivityRuntimeConfig& config, const MothershipTunnelGatewayAuth& auth, const String& blob)
+{
+  MothershipTunnelProviderConfigureRequest request = {};
+  request.desired = makeTunnelProviderDesiredState(config, auth);
+  request.artifactBlob = blob;
+  return request;
+}
+
 static void testMothershipTunnelProviderRuntimeSpecIsStrict(TestSuite& suite)
 {
   MothershipConnectivityRuntimeConfig config = makeTunnelRuntimeConnectivityConfig();
@@ -4676,13 +4613,20 @@ static void testMothershipTunnelProviderRuntimeSpecIsStrict(TestSuite& suite)
   suite.expect(mothershipConnectivityRuntimeConfigValid(config, &failure) == false && failure.equal("mothership tunnel-provider egress endpoint invalid"_ctv), "mothership_tunnel_runtime_spec_rejects_empty_egress");
 }
 
-static void testMothershipTunnelGatewayAuthConfigureAppliesAndReplicates(TestSuite& suite)
+static void testMothershipTunnelProviderConfigureAppliesAtomicallyAndReplicates(TestSuite& suite)
 {
   TestBrain brain;
   Mothership mothership;
   BrainView follower;
+  String blob = prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText();
+  blob.append("payload"_ctv);
+  MothershipConnectivityRuntimeConfig config = makeTunnelRuntimeConnectivityConfig();
+  String artifactSha256 = {};
+  suite.require(prodigyComputeSHA256Hex(blob, artifactSha256), "mothership_tunnel_provider_configure_blob_sha");
+  config.tunnelProvider.artifactSha256 = artifactSha256;
+  config.tunnelProvider.artifactBytes = blob.size();
   MothershipTunnelGatewayAuth auth = makeTunnelGatewayAuth();
-  suite.require(auth.configured(), "mothership_tunnel_gateway_auth_fixture_configured");
+  suite.require(auth.configured(), "mothership_tunnel_provider_configure_auth_fixture_configured");
   brain.weAreMaster = true;
   brain.brainConfig.clusterUUID = 0x7707;
   follower.connected = true;
@@ -4691,47 +4635,67 @@ static void testMothershipTunnelGatewayAuthConfigureAppliesAndReplicates(TestSui
   follower.fslot = 18;
   brain.brains.insert(&follower);
 
-  String serialized;
-  BitseryEngine::serialize(serialized, auth);
+  MothershipTunnelProviderConfigureRequest request = makeTunnelProviderConfigureRequest(config, auth, blob);
+  String serialized = {};
+  BitseryEngine::serialize(serialized, request);
 
   String messageBuffer;
-  Message *message = buildMothershipMessage(messageBuffer, MothershipTopic::configureMothershipTunnelGatewayAuth, serialized);
+  Message *message = buildMothershipMessage(messageBuffer, MothershipTopic::configureMothershipTunnelProvider, serialized);
   brain.mothershipHandler(&mothership, message);
 
-  suite.expect(equalSerializedObjects(brain.mothershipTunnelGatewayAuth, auth), "mothership_tunnel_gateway_auth_configure_applies");
-  suite.expect(brain.mothershipTunnelGatewayAuthPersistCalls == 1, "mothership_tunnel_gateway_auth_configure_persists");
-  suite.expect(equalSerializedObjects(brain.lastPersistedMothershipTunnelGatewayAuth, auth), "mothership_tunnel_gateway_auth_configure_persists_expected");
+  suite.expect(brain.systemContainerStoreCalls == 1, "mothership_tunnel_provider_configure_stores_artifact_once");
+  suite.expect(brain.lastStoredSystemContainerSha256.equal(config.tunnelProvider.artifactSha256), "mothership_tunnel_provider_configure_stores_sha256");
+  suite.expect(brain.lastStoredSystemContainerBytes == blob.size(), "mothership_tunnel_provider_configure_stores_bytes");
+  suite.expect(brain.lastStoredSystemContainerBlob.equal(blob), "mothership_tunnel_provider_configure_stores_blob");
+  suite.expect(equalSerializedObjects(brain.mothershipConnectivity, config), "mothership_tunnel_provider_configure_applies_runtime_config");
+  suite.expect(equalSerializedObjects(brain.mothershipTunnelGatewayAuth, auth), "mothership_tunnel_provider_configure_applies_gateway_auth");
+  suite.expect(brain.mothershipTunnelProviderDesiredStatePersistCalls == 1, "mothership_tunnel_provider_configure_persists_once");
+  suite.expect(equalSerializedObjects(brain.lastPersistedMothershipConnectivity, config), "mothership_tunnel_provider_configure_persists_config");
+  suite.expect(equalSerializedObjects(brain.lastPersistedMothershipTunnelGatewayAuth, auth), "mothership_tunnel_provider_configure_persists_auth");
 
   Message *responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
   String serializedResponse = {};
   uint8_t *responseArgs = responseMessage->args;
   Message::extractToStringView(responseArgs, serializedResponse);
   MothershipResponse response = {};
-  suite.expect(MothershipTopic(responseMessage->topic) == MothershipTopic::configureMothershipTunnelGatewayAuth, "mothership_tunnel_gateway_auth_configure_response_topic");
-  suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response) && response.success, "mothership_tunnel_gateway_auth_configure_response_success");
+  suite.expect(MothershipTopic(responseMessage->topic) == MothershipTopic::configureMothershipTunnelProvider, "mothership_tunnel_provider_configure_response_topic");
+  suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response) && response.success, "mothership_tunnel_provider_configure_response_success");
 
   TestBrain malformedAuthBrain;
   malformedAuthBrain.brainConfig.clusterUUID = 0x7707;
-  MothershipTunnelGatewayAuth malformedAuth = auth;
-  malformedAuth.serverKeyPem.assign("not-a-key"_ctv);
+  MothershipTunnelProviderDesiredState malformedDesired = makeTunnelProviderDesiredState(config, auth);
+  malformedDesired.gatewayAuth.serverKeyPem.assign("not-a-key"_ctv);
   String malformedAuthFailure = {};
-  suite.expect(malformedAuthBrain.applyMothershipTunnelGatewayAuth(malformedAuth, false, &malformedAuthFailure) == false && malformedAuthFailure.equal("mothership tunnel gateway auth certificate material invalid"_ctv), "mothership_tunnel_gateway_auth_rejects_malformed_material");
-  suite.expect(malformedAuthBrain.mothershipTunnelGatewayAuthPersistCalls == 0, "mothership_tunnel_gateway_auth_rejects_malformed_before_persist");
+  suite.expect(malformedAuthBrain.applyMothershipTunnelProviderDesiredState(malformedDesired, false, &malformedAuthFailure) == false && malformedAuthFailure.equal("mothership tunnel gateway auth certificate material invalid"_ctv), "mothership_tunnel_provider_rejects_malformed_material");
+  suite.expect(malformedAuthBrain.mothershipTunnelProviderDesiredStatePersistCalls == 0, "mothership_tunnel_provider_rejects_malformed_before_persist");
 
-  bool sawReplication = false;
+  bool sawArtifact = false;
+  bool sawDesired = false;
   forEachMessageInBuffer(follower.wBuffer, [&](Message *queued) {
-    if (BrainTopic(queued->topic) != BrainTopic::replicateMothershipTunnelGatewayAuth)
+    uint8_t *args = queued->args;
+    if (BrainTopic(queued->topic) == BrainTopic::replicateSystemContainerArtifact)
     {
+      String queuedSha256 = {};
+      uint64_t queuedBytes = 0;
+      String queuedBlob = {};
+      Message::extractToStringView(args, queuedSha256);
+      Message::extractArg<ArgumentNature::fixed>(args, queuedBytes);
+      Message::extractToStringView(args, queuedBlob);
+      sawArtifact = queuedSha256.equal(config.tunnelProvider.artifactSha256) && queuedBytes == blob.size() && queuedBlob.equal(blob);
       return;
     }
-
-    uint8_t *args = queued->args;
-    String replicatedSerialized = {};
-    Message::extractToStringView(args, replicatedSerialized);
-    MothershipTunnelGatewayAuth replicated = {};
-    sawReplication = BitseryEngine::deserializeSafe(replicatedSerialized, replicated) && equalSerializedObjects(replicated, auth);
+    if (BrainTopic(queued->topic) == BrainTopic::replicateMothershipTunnelProviderState)
+    {
+      String replicatedSerialized = {};
+      Message::extractToStringView(args, replicatedSerialized);
+      MothershipTunnelProviderDesiredState replicated = {};
+      sawDesired = BitseryEngine::deserializeSafe(replicatedSerialized, replicated) &&
+                   equalSerializedObjects(replicated.connectivity, config) &&
+                   equalSerializedObjects(replicated.gatewayAuth, auth);
+    }
   });
-  suite.expect(sawReplication, "mothership_tunnel_gateway_auth_configure_replicates");
+  suite.expect(sawArtifact, "mothership_tunnel_provider_configure_replicates_artifact");
+  suite.expect(sawDesired, "mothership_tunnel_provider_configure_replicates_desired_state");
 }
 
 static void testMothershipTunnelGatewayClientCertificateAdmission(TestSuite& suite)
@@ -4747,97 +4711,34 @@ static void testMothershipTunnelGatewayClientCertificateAdmission(TestSuite& sui
 
 }
 
-static void testMothershipTunnelGatewayAuthBrainReplicationApplies(TestSuite& suite)
+static void testMothershipTunnelProviderDesiredStateBrainReplicationApplies(TestSuite& suite)
 {
   TestBrain brain;
   BrainView peer;
+  MothershipConnectivityRuntimeConfig config = makeTunnelRuntimeConnectivityConfig();
   MothershipTunnelGatewayAuth auth = makeTunnelGatewayAuth();
-  suite.require(auth.configured(), "mothership_tunnel_gateway_auth_replication_fixture_configured");
+  suite.require(auth.configured(), "mothership_tunnel_provider_state_replication_fixture_configured");
   brain.brainConfig.clusterUUID = 0x7707;
-  String serialized;
-  BitseryEngine::serialize(serialized, auth);
+  MothershipTunnelProviderDesiredState desired = makeTunnelProviderDesiredState(config, auth);
+  String serialized = {};
+  BitseryEngine::serialize(serialized, desired);
 
   String messageBuffer;
-  Message *message = buildBrainMessage(messageBuffer, BrainTopic::replicateMothershipTunnelGatewayAuth, serialized);
+  Message *message = buildBrainMessage(messageBuffer, BrainTopic::replicateMothershipTunnelProviderState, serialized);
   brain.brainHandler(&peer, message);
 
-  suite.expect(equalSerializedObjects(brain.mothershipTunnelGatewayAuth, auth), "mothership_tunnel_gateway_auth_brain_replication_applies");
-  suite.expect(brain.mothershipTunnelGatewayAuthPersistCalls == 1, "mothership_tunnel_gateway_auth_brain_replication_persists");
-}
-
-static void testMothershipConnectivityConfigureAppliesAndReplicates(TestSuite& suite)
-{
-  TestBrain brain;
-  NoopBrainIaaS iaas;
-  Mothership mothership;
-  BrainView follower;
-  brain.iaas = &iaas;
-  brain.weAreMaster = true;
-  brain.noMasterYet = false;
-  follower.connected = true;
-  follower.weConnectToIt = true;
-  follower.isFixedFile = true;
-  follower.fslot = 18;
-  brain.brains.insert(&follower);
-
-  MothershipConnectivityRuntimeConfig config = makeTunnelRuntimeConnectivityConfig();
-  String serialized;
-  BitseryEngine::serialize(serialized, config);
-
-  String messageBuffer;
-  Message *message = buildMothershipMessage(messageBuffer, MothershipTopic::configureMothershipConnectivity, serialized);
-  brain.mothershipHandler(&mothership, message);
-
-  suite.expect(equalSerializedObjects(brain.mothershipConnectivity, config), "mothership_connectivity_configure_applies_runtime_config");
-  suite.expect(brain.mothershipConnectivityPersistCalls == 1, "mothership_connectivity_configure_persists_runtime_config");
-  suite.expect(equalSerializedObjects(brain.lastPersistedMothershipConnectivity, config), "mothership_connectivity_configure_persists_expected_config");
-
-  Message *responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
-  String serializedResponse = {};
-  uint8_t *responseArgs = responseMessage->args;
-  Message::extractToStringView(responseArgs, serializedResponse);
-  MothershipResponse response = {};
-  suite.expect(MothershipTopic(responseMessage->topic) == MothershipTopic::configureMothershipConnectivity, "mothership_connectivity_configure_response_topic");
-  suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response) && response.success, "mothership_connectivity_configure_response_success");
-
-  bool sawReplication = false;
-  forEachMessageInBuffer(follower.wBuffer, [&](Message *queued) {
-    if (BrainTopic(queued->topic) != BrainTopic::replicateMothershipConnectivity)
-    {
-      return;
-    }
-
-    uint8_t *args = queued->args;
-    String replicatedSerialized = {};
-    Message::extractToStringView(args, replicatedSerialized);
-    MothershipConnectivityRuntimeConfig replicated = {};
-    sawReplication = BitseryEngine::deserializeSafe(replicatedSerialized, replicated) && equalSerializedObjects(replicated, config);
-  });
-  suite.expect(sawReplication, "mothership_connectivity_configure_replicates_to_brains");
-}
-
-static void testMothershipConnectivityBrainReplicationApplies(TestSuite& suite)
-{
-  TestBrain brain;
-  BrainView peer;
-  MothershipConnectivityRuntimeConfig config = makeTunnelRuntimeConnectivityConfig();
-  String serialized;
-  BitseryEngine::serialize(serialized, config);
-
-  String messageBuffer;
-  Message *message = buildBrainMessage(messageBuffer, BrainTopic::replicateMothershipConnectivity, serialized);
-  brain.brainHandler(&peer, message);
-
-  suite.expect(equalSerializedObjects(brain.mothershipConnectivity, config), "mothership_connectivity_brain_replication_applies");
-  suite.expect(brain.mothershipConnectivityPersistCalls == 1, "mothership_connectivity_brain_replication_persists");
+  suite.expect(equalSerializedObjects(brain.mothershipConnectivity, config), "mothership_tunnel_provider_state_brain_replication_applies_config");
+  suite.expect(equalSerializedObjects(brain.mothershipTunnelGatewayAuth, auth), "mothership_tunnel_provider_state_brain_replication_applies_auth");
+  suite.expect(brain.mothershipTunnelProviderDesiredStatePersistCalls == 1, "mothership_tunnel_provider_state_brain_replication_persists");
 
   TestBrain deniedBrain;
   MothershipConnectivityRuntimeConfig denied = makeTunnelRuntimeConnectivityConfig();
   denied.tunnelProvider.egressHost = "169.254.169.254"_ctv;
+  MothershipTunnelProviderDesiredState deniedDesired = makeTunnelProviderDesiredState(denied, auth);
   String failure = {};
-  suite.expect(deniedBrain.applyMothershipConnectivityRuntimeConfig(denied, false, &failure) == false, "mothership_connectivity_rejects_metadata_runtime_egress");
+  suite.expect(deniedBrain.applyMothershipTunnelProviderDesiredState(deniedDesired, false, &failure) == false, "mothership_connectivity_rejects_metadata_runtime_egress");
   suite.expect(failure.equal("mothership tunnel-provider egress literal denied"_ctv), "mothership_connectivity_rejects_metadata_runtime_egress_reason");
-  suite.expect(deniedBrain.mothershipConnectivityPersistCalls == 0, "mothership_connectivity_rejects_metadata_runtime_egress_before_persist");
+  suite.expect(deniedBrain.mothershipTunnelProviderDesiredStatePersistCalls == 0, "mothership_connectivity_rejects_metadata_runtime_egress_before_persist");
 }
 
 static void testMothershipTunnelProviderRuntimeStateConfigChanges(TestSuite& suite)
@@ -4849,22 +4750,19 @@ static void testMothershipTunnelProviderRuntimeStateConfigChanges(TestSuite& sui
   brain.brainConfig.clusterUUID = 0x7707;
   MothershipConnectivityRuntimeConfig config = makeTunnelRuntimeConnectivityConfig();
   String failure = {};
-  suite.require(brain.applyMothershipConnectivityRuntimeConfig(config, false, &failure), "mothership_tunnel_runtime_initial_apply");
+  suite.require(brain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "mothership_tunnel_runtime_initial_apply");
   suite.expect(brain.mothershipTunnelProviderRuntimeState.localContainerUUID == 0, "mothership_tunnel_runtime_not_running_without_launcher");
-  suite.expect(brain.mothershipTunnelProviderRuntimeState.lastFailure.equal("mothership tunnel gateway auth missing"_ctv), "mothership_tunnel_runtime_requires_gateway_auth");
+  suite.expect(brain.mothershipTunnelProviderRuntimeState.lastFailure.equal("tunnel provider artifact missing from system store"_ctv), "mothership_tunnel_runtime_requires_artifact");
 
-  suite.require(brain.applyMothershipConnectivityRuntimeConfig(config, false, &failure), "mothership_tunnel_runtime_repeat_apply");
+  suite.require(brain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "mothership_tunnel_runtime_repeat_apply");
   suite.expect(brain.mothershipTunnelRuntimeStopCalls == 0, "mothership_tunnel_runtime_repeat_apply_idempotent");
 
   config.tunnelProvider.dialEndpoint = "control2.example.net:443"_ctv;
-  suite.require(brain.applyMothershipConnectivityRuntimeConfig(config, false, &failure), "mothership_tunnel_runtime_spec_changed_apply");
-  suite.expect(brain.mothershipTunnelProviderRuntimeState.lastFailure.equal("mothership tunnel gateway auth missing"_ctv), "mothership_tunnel_runtime_spec_change_rechecks_gateway_auth");
-
-  suite.require(brain.applyMothershipTunnelGatewayAuth(auth, false, &failure), "mothership_tunnel_runtime_auth_apply");
-  suite.expect(brain.mothershipTunnelProviderRuntimeState.lastFailure.equal("tunnel provider artifact missing from system store"_ctv), "mothership_tunnel_runtime_auth_unblocks_artifact_check");
+  suite.require(brain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "mothership_tunnel_runtime_spec_changed_apply");
+  suite.expect(brain.mothershipTunnelProviderRuntimeState.lastFailure.equal("tunnel provider artifact missing from system store"_ctv), "mothership_tunnel_runtime_spec_change_rechecks_store");
 
   config.tunnelProvider.artifactSha256 = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"_ctv;
-  suite.require(brain.applyMothershipConnectivityRuntimeConfig(config, false, &failure), "mothership_tunnel_runtime_artifact_changed_apply");
+  suite.require(brain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "mothership_tunnel_runtime_artifact_changed_apply");
   suite.expect(brain.mothershipTunnelProviderRuntimeState.lastFailure.equal("tunnel provider artifact missing from system store"_ctv), "mothership_tunnel_runtime_artifact_change_rechecks_store");
 }
 
@@ -4874,8 +4772,9 @@ static void testMothershipTunnelProviderRuntimeStateRequiresActiveMaster(TestSui
   brain.mothershipTunnelProviderRuntimeState.localContainerUUID = 123;
 
   MothershipConnectivityRuntimeConfig config = makeTunnelRuntimeConnectivityConfig();
+  MothershipTunnelGatewayAuth auth = makeTunnelGatewayAuth();
   String failure = {};
-  suite.require(brain.applyMothershipConnectivityRuntimeConfig(config, false, &failure), "mothership_tunnel_runtime_non_master_apply");
+  suite.require(brain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "mothership_tunnel_runtime_non_master_apply");
   const auto& state = brain.mothershipTunnelProviderRuntimeState;
   suite.expect(state.localContainerUUID == 0, "mothership_tunnel_runtime_non_master_stopped");
   suite.expect(state.lastFailure.equal("not active master"_ctv), "mothership_tunnel_runtime_non_master_failure");
@@ -4883,7 +4782,7 @@ static void testMothershipTunnelProviderRuntimeStateRequiresActiveMaster(TestSui
 
   TestBrain relinquishingBrain;
   relinquishingBrain.weAreMaster = true;
-  suite.require(relinquishingBrain.applyMothershipConnectivityRuntimeConfig(config, false, &failure), "mothership_tunnel_runtime_relinquish_apply");
+  suite.require(relinquishingBrain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "mothership_tunnel_runtime_relinquish_apply");
   relinquishingBrain.mothershipTunnelProviderRuntimeState.localContainerUUID = 456;
   relinquishingBrain.forfeitMasterStatus();
   const auto& relinquishedState = relinquishingBrain.mothershipTunnelProviderRuntimeState;
@@ -4910,8 +4809,7 @@ static void testMothershipTunnelProviderRuntimeLaunchBoundary(TestSuite& suite)
   config.tunnelProvider.artifactBytes = blob.size();
 
   String failure = {};
-  suite.require(brain.applyMothershipConnectivityRuntimeConfig(config, false, &failure), "mothership_tunnel_runtime_launch_config_apply");
-  suite.require(brain.applyMothershipTunnelGatewayAuth(auth, false, &failure), "mothership_tunnel_runtime_launch_auth_apply");
+  suite.require(brain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "mothership_tunnel_runtime_launch_desired_apply");
   suite.require(brain.applySystemContainerArtifact(config.tunnelProvider.artifactSha256, config.tunnelProvider.artifactBytes, blob, false, &failure), "mothership_tunnel_runtime_launch_artifact_apply");
 
   const auto& state = brain.mothershipTunnelProviderRuntimeState;
@@ -4922,25 +4820,24 @@ static void testMothershipTunnelProviderRuntimeLaunchBoundary(TestSuite& suite)
   suite.expect(equalSerializedObjects(brain.lastMothershipTunnelProviderGatewayAuth, auth), "mothership_tunnel_runtime_launch_carries_gateway_auth");
   suite.expect(equalSerializedObjects(brain.lastMothershipTunnelProviderSpec, config.tunnelProvider), "mothership_tunnel_runtime_launch_carries_spec");
 
-  suite.require(brain.applyMothershipConnectivityRuntimeConfig(config, false, &failure), "mothership_tunnel_runtime_launch_repeat_config_apply");
+  suite.require(brain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "mothership_tunnel_runtime_launch_repeat_config_apply");
   suite.expect(brain.mothershipTunnelRuntimeStartCalls == 1, "mothership_tunnel_runtime_launch_repeat_does_not_restart");
   suite.expect(brain.mothershipTunnelProviderRuntimeState.lastFailure.equal("waiting for authenticated tunnel session"_ctv), "mothership_tunnel_runtime_launch_repeat_keeps_pending_health");
 
   config.tunnelProvider.dialEndpoint = "control-restarted.example.net:443"_ctv;
-  suite.require(brain.applyMothershipConnectivityRuntimeConfig(config, false, &failure), "mothership_tunnel_runtime_launch_spec_change_apply");
+  suite.require(brain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "mothership_tunnel_runtime_launch_spec_change_apply");
   suite.expect(brain.mothershipTunnelRuntimeStopCalls == 1 && brain.lastStoppedMothershipTunnelProviderContainerUUID == brain.nextMothershipTunnelProviderContainerUUID, "mothership_tunnel_runtime_launch_spec_change_stops_old");
   suite.expect(brain.mothershipTunnelRuntimeStartCalls == 2 && brain.mothershipTunnelProviderRuntimeState.localContainerUUID == brain.nextMothershipTunnelProviderContainerUUID, "mothership_tunnel_runtime_launch_spec_change_restarts");
 
   MothershipConnectivityRuntimeConfig sshConfig = {};
-  suite.require(brain.applyMothershipConnectivityRuntimeConfig(sshConfig, false, &failure), "mothership_tunnel_runtime_launch_ssh_cutover_apply");
+  suite.require(brain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(sshConfig, {}), false, &failure), "mothership_tunnel_runtime_launch_ssh_cutover_apply");
   suite.expect(brain.mothershipTunnelRuntimeStopCalls == 2, "mothership_tunnel_runtime_launch_ssh_cutover_stops_runtime");
   suite.expect(brain.mothershipTunnelProviderRuntimeState.localContainerUUID == 0, "mothership_tunnel_runtime_launch_ssh_cutover_clears_runtime");
 
   TestBrain gatewayFailureBrain;
   gatewayFailureBrain.weAreMaster = true;
   gatewayFailureBrain.brainConfig.clusterUUID = 0x7707;
-  suite.require(gatewayFailureBrain.applyMothershipConnectivityRuntimeConfig(config, false, &failure), "mothership_tunnel_runtime_gateway_failure_config_apply");
-  suite.require(gatewayFailureBrain.applyMothershipTunnelGatewayAuth(auth, false, &failure), "mothership_tunnel_runtime_gateway_failure_auth_apply");
+  suite.require(gatewayFailureBrain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "mothership_tunnel_runtime_gateway_failure_desired_apply");
   suite.require(gatewayFailureBrain.applySystemContainerArtifact(config.tunnelProvider.artifactSha256, config.tunnelProvider.artifactBytes, blob, false, &failure), "mothership_tunnel_runtime_gateway_failure_artifact_apply");
   suite.expect(gatewayFailureBrain.mothershipTunnelRuntimeStartCalls == 1, "mothership_tunnel_runtime_gateway_failure_attempts_runtime");
   suite.expect(gatewayFailureBrain.mothershipTunnelProviderRuntimeState.localContainerUUID == 0 && gatewayFailureBrain.mothershipTunnelProviderRuntimeState.lastFailure.equal("injected tunnel runtime launch failure"_ctv), "mothership_tunnel_runtime_gateway_failure_stops_runtime");
@@ -4981,8 +4878,7 @@ static void testMothershipTunnelProviderContainerFailureStopsRuntime(TestSuite& 
   config.tunnelProvider.artifactBytes = blob.size();
 
   String failure = {};
-  suite.require(brain.applyMothershipConnectivityRuntimeConfig(config, false, &failure), "mothership_tunnel_runtime_failure_config_apply");
-  suite.require(brain.applyMothershipTunnelGatewayAuth(auth, false, &failure), "mothership_tunnel_runtime_failure_auth_apply");
+  suite.require(brain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "mothership_tunnel_runtime_failure_desired_apply");
   suite.require(brain.applySystemContainerArtifact(config.tunnelProvider.artifactSha256, config.tunnelProvider.artifactBytes, blob, false, &failure), "mothership_tunnel_runtime_failure_artifact_apply");
 
   uint128_t providerUUID = brain.mothershipTunnelProviderRuntimeState.localContainerUUID;
@@ -5076,15 +4972,16 @@ static void testClusterReportIncludesMothershipConnectivityStatus(TestSuite& sui
   suite.expect(defaultReport.mothershipConnectivity.lastFailure.size() == 0, "cluster_report_default_mothership_connectivity_tunnel_status_empty");
 
   MothershipConnectivityRuntimeConfig config = makeTunnelRuntimeConnectivityConfig();
+  MothershipTunnelGatewayAuth auth = makeTunnelGatewayAuth();
   String failure = {};
-  suite.require(brain.applyMothershipConnectivityRuntimeConfig(config, false, &failure), "cluster_report_mothership_connectivity_setup");
+  suite.require(brain.applyMothershipTunnelProviderDesiredState(makeTunnelProviderDesiredState(config, auth), false, &failure), "cluster_report_mothership_connectivity_setup");
 
   ClusterStatusReport report = {};
   suite.require(pullClusterStatusReportForTest(brain, report), "cluster_report_mothership_connectivity_deserializes");
   suite.expect(report.mothershipConnectivity.kind.equal("tunnelProvider"_ctv), "cluster_report_mothership_connectivity_kind");
   suite.expect(
-      report.mothershipConnectivity.lastFailure.equal("mothership tunnel gateway auth missing"_ctv),
-      "cluster_report_mothership_connectivity_missing_gateway_auth_failure");
+      report.mothershipConnectivity.lastFailure.equal("tunnel provider artifact missing from system store"_ctv),
+      "cluster_report_mothership_connectivity_missing_artifact_failure");
 }
 
 static void testDeploymentReplicationBackpressureClosesPeer(TestSuite& suite)
@@ -18217,13 +18114,10 @@ int main(void)
   testBrainHandlerReplicationPaths(suite);
   testReconcileStateReplicatesCredentialAndTlsState(suite);
   testSystemContainerArtifactReplicationQueuesTypedBlob(suite);
-  testMothershipSystemContainerArtifactConfigureStoresAndReplicates(suite);
   testMothershipTunnelProviderRuntimeSpecIsStrict(suite);
-  testMothershipTunnelGatewayAuthConfigureAppliesAndReplicates(suite);
+  testMothershipTunnelProviderConfigureAppliesAtomicallyAndReplicates(suite);
   testMothershipTunnelGatewayClientCertificateAdmission(suite);
-  testMothershipTunnelGatewayAuthBrainReplicationApplies(suite);
-  testMothershipConnectivityConfigureAppliesAndReplicates(suite);
-  testMothershipConnectivityBrainReplicationApplies(suite);
+  testMothershipTunnelProviderDesiredStateBrainReplicationApplies(suite);
   testMothershipTunnelProviderRuntimeStateConfigChanges(suite);
   testMothershipTunnelProviderRuntimeStateRequiresActiveMaster(suite);
   testMothershipTunnelProviderRuntimeLaunchBoundary(suite);

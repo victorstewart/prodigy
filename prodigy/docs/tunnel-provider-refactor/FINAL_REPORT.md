@@ -18,21 +18,21 @@ excluding evidence artifacts under `prodigy/docs/tunnel-provider-refactor/*`.
 | State | Files | Insertions | Deletions |
 |---|---:|---:|---:|
 | Draft feature baseline | 52 | 7437 | 434 |
-| Current branch | 52 | 5864 | 493 |
+| Current branch | 52 | 5622 | 495 |
 
 Category ledger:
 
 | Category | Draft net | Current net | Net removed |
 |---|---:|---:|---:|
-| Production | +4883 | +3302 | 1581 |
-| Tests | +2081 | +2034 | 47 |
+| Production | +4883 | +3193 | 1690 |
+| Tests | +2081 | +1899 | 182 |
 | Docs | +30 | +28 | 2 |
 | Build metadata | +9 | +7 | 2 |
 
 The prior project gate command, which counts Discombobulator test/build changes
-inside the production bucket, reports `production +3851 -461 net +3390`.
-The full diff including evidence artifacts is `60 files, 6249 insertions, 493
-deletions`.
+inside the production bucket, reports `+5625 -498 net +5127` across 54 files
+and keeps the production bucket at `+3193` net. The full diff including
+evidence artifacts is `63 files, 6018 insertions, 500 deletions`.
 
 ## Lines Removed By Subsystem
 
@@ -40,6 +40,7 @@ deletions`.
 - Runtime state: deleted generation SHA fingerprinting and derived `running`/`healthy` fields.
 - Schema boundary: removed OpenSSL/auth helpers, egress helpers, runtime policy, and Brain runtime state from `mothership.cluster.types.h`.
 - Network path: deleted source-address-only NAT/reply state and dead IPv6 allowlist plumbing.
+- Control activation: collapsed split artifact/auth/connectivity configure into one Mothership desired-state request and one Brain desired-state replication topic.
 - Parser/compatibility surface: removed enum-qualified JSON compatibility spellings and speculative QUIC/multi-egress surface.
 - Tests: tabled and compressed several tunnel/gateway/system-egress assertions while keeping focused coverage.
 
@@ -52,7 +53,7 @@ See `LINE_LEDGER.tsv` for per-path numbers.
 - `SystemContainerKind::mothershipTunnelProvider`: typed runtime identity for system container launch.
 - `mothership.tunnel.gateway.h`: still contains gateway implementation; it was reduced but remains a large header.
 - `ContainerPlan` system fields: still carries system-container kind/socket/egress data; this is not the full dedicated plan extension requested by the original goal.
-- Mothership/Brain configuration topics for artifact, gateway auth, and connectivity still exist.
+- Brain still has separate artifact transport plus desired-state replication because followers must receive artifact bytes before activating desired state.
 
 ## Release Blockers
 
@@ -72,7 +73,6 @@ Superseded by later user direction:
 
 Still open relative to the original goal:
 
-- Three partial tunnel Mothership topics and three Brain replication topics remain.
 - Desired state is not fully folded into `ProdigyMasterAuthorityRuntimeState`.
 - Gateway implementation is still header-heavy and blocking-oriented.
 - Artifact envelope is integrity/type declaration, not signed trusted provenance.
@@ -118,16 +118,17 @@ Current design removes the source-IP-only NAT path and keeps system-provider egr
 All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 
 - `git diff --check`
-- `cmake --build .run/tunnel-provider-latest --parallel 16 --target prodigy_mothership_unix_connect_unit prodigy_mothership_cluster_registry_unit prodigy_persistent_state_unit prodigy_brain_replication_credentials_unit prodigy_container_overlay_sync_unit prodigy_switchboard_whitehole_unit prodigy_deployments_unit prodigy_bundle_artifact_unit prodigy_mothership_tunnel_provider host_ingress_router container_egress_router`
+- `cmake --build .run/tunnel-provider-latest --parallel 16 --target prodigy_brain_replication_credentials_unit prodigy_persistent_state_unit prodigy_brain_topic_fuzz prodigy_mothership_topic_fuzz prodigy_mothership_unix_connect_unit mothership prodigy`
 - `./prodigy_mothership_unix_connect_unit`
-- `./prodigy_mothership_cluster_registry_unit`
 - `./prodigy_persistent_state_unit`
 - `./prodigy_brain_replication_credentials_unit`
-- `./prodigy_deployments_unit`
-- `./prodigy_bundle_artifact_unit`
-- `PRODIGY_DEV_ALLOW_BPF_ATTACH=1 ./prodigy_switchboard_whitehole_unit`
-- `PRODIGY_DEV_ALLOW_BPF_ATTACH=1 ./prodigy_container_overlay_sync_unit`
-- `cargo test --all-targets` in `prodigy/discombobulator`
+- `./prodigy_brain_topic_fuzz -runs=4096`
+- `./prodigy_mothership_topic_fuzz -runs=4096`
+
+Earlier validation on the same branch also covered the broader build/test matrix:
+cluster registry, deployments, bundle artifact, BPF attach units, host/container
+eBPF targets, the tunnel-provider fixture, and Discombobulator `cargo test
+--all-targets`.
 
 ## Measurements
 
@@ -149,6 +150,6 @@ Not measured: clean build wall time, incremental cluster-type fanout, gateway th
 
 - Full original definition of done is not met.
 - Runtime health is still represented by failure text rather than a compact explicit phase enum.
-- Control-plane activation remains multi-topic and can still have partial-state edge cases.
+- Control-plane activation is one Mothership configure request plus artifact-first Brain replication, but it is still not a master-authority desired-state transition.
 - Gateway I/O/deadline/backpressure behavior is covered by focused tests but not a full nonblocking state-machine proof.
 - Artifact provenance remains weaker than the signed-envelope design requested in the original goal.

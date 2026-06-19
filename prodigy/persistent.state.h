@@ -1950,28 +1950,18 @@ static void serialize(S&& serializer, ProdigyPersistentStoredLocalBrainState& re
   serializer.object(record.state);
 }
 
-class ProdigyPersistentStoredMothershipTunnelGatewayAuth {
+class ProdigyPersistentStoredMothershipTunnelProviderDesiredState {
 public:
 
-  uint64_t secretVersion = 0;
+  uint64_t gatewayAuthSecretVersion = 0;
+  MothershipConnectivityRuntimeConfig connectivity;
 };
 
 template <typename S>
-static void serialize(S&& serializer, ProdigyPersistentStoredMothershipTunnelGatewayAuth& record)
+static void serialize(S&& serializer, ProdigyPersistentStoredMothershipTunnelProviderDesiredState& record)
 {
-  serializer.value8b(record.secretVersion);
-}
-
-class ProdigyPersistentStoredMothershipConnectivityRuntimeConfig {
-public:
-
-  MothershipConnectivityRuntimeConfig config;
-};
-
-template <typename S>
-static void serialize(S&& serializer, ProdigyPersistentStoredMothershipConnectivityRuntimeConfig& record)
-{
-  serializer.object(record.config);
+  serializer.value8b(record.gatewayAuthSecretVersion);
+  serializer.object(record.connectivity);
 }
 
 class ProdigyPersistentBootStateSecrets {
@@ -2628,8 +2618,7 @@ private:
   constexpr static const char *bootKey = "local";
   constexpr static const char *brainSnapshotKey = "snapshot";
   constexpr static const char *localBrainStateKey = "local_brain_state";
-  constexpr static const char *mothershipTunnelGatewayAuthKey = "mothership_tunnel_gateway_auth";
-  constexpr static const char *mothershipConnectivityKey = "mothership_connectivity";
+  constexpr static const char *mothershipTunnelProviderDesiredStateKey = "mothership_tunnel_provider_state";
 
   TidesDB db;
   TidesDB secretsDb;
@@ -2694,39 +2683,19 @@ private:
     return true;
   }
 
-  bool loadStoredMothershipTunnelGatewayAuthRecord(ProdigyPersistentStoredMothershipTunnelGatewayAuth& record, String *failure = nullptr)
+  bool loadStoredMothershipTunnelProviderDesiredStateRecord(ProdigyPersistentStoredMothershipTunnelProviderDesiredState& record, String *failure = nullptr)
   {
     String serialized = {};
-    if (db.read(brainColumnFamily, mothershipTunnelGatewayAuthKey, serialized, failure) == false)
+    if (db.read(brainColumnFamily, mothershipTunnelProviderDesiredStateKey, serialized, failure) == false)
     {
       return false;
     }
 
-    if (BitseryEngine::deserializeSafe(serialized, record) == false)
-    {
-      if (failure)
-      {
-        failure->assign("invalid persistent mothership tunnel gateway auth");
-      }
-      return false;
-    }
-
-    return true;
-  }
-
-  bool loadStoredMothershipConnectivityRuntimeConfigRecord(ProdigyPersistentStoredMothershipConnectivityRuntimeConfig& record, String *failure = nullptr)
-  {
-    String serialized = {};
-    if (db.read(brainColumnFamily, mothershipConnectivityKey, serialized, failure) == false)
-    {
-      return false;
-    }
-
-    if (BitseryEngine::deserializeSafe(serialized, record) == false || mothershipConnectivityRuntimeConfigValid(record.config, failure) == false)
+    if (BitseryEngine::deserializeSafe(serialized, record) == false || mothershipConnectivityRuntimeConfigValid(record.connectivity, failure) == false)
     {
       if (failure && failure->size() == 0)
       {
-        failure->assign("invalid persistent mothership connectivity");
+        failure->assign("invalid persistent mothership tunnel provider desired state");
       }
       return false;
     }
@@ -2831,13 +2800,13 @@ private:
     return 0;
   }
 
-  uint64_t previousMothershipTunnelGatewayAuthSecretVersion(void)
+  uint64_t previousMothershipTunnelProviderSecretVersion(void)
   {
-    ProdigyPersistentStoredMothershipTunnelGatewayAuth record = {};
+    ProdigyPersistentStoredMothershipTunnelProviderDesiredState record = {};
     String failure = {};
-    if (loadStoredMothershipTunnelGatewayAuthRecord(record, &failure))
+    if (loadStoredMothershipTunnelProviderDesiredStateRecord(record, &failure))
     {
-      return record.secretVersion;
+      return record.gatewayAuthSecretVersion;
     }
 
     return 0;
@@ -3282,62 +3251,63 @@ public:
     return ok;
   }
 
-  bool loadMothershipTunnelGatewayAuth(MothershipTunnelGatewayAuth& auth, String *failure = nullptr)
+  bool loadMothershipTunnelProviderDesiredState(MothershipConnectivityRuntimeConfig& connectivity, MothershipTunnelGatewayAuth& gatewayAuth, String *failure = nullptr)
   {
-    ProdigyPersistentStoredMothershipTunnelGatewayAuth stored = {};
-    if (loadStoredMothershipTunnelGatewayAuthRecord(stored, failure) == false)
+    ProdigyPersistentStoredMothershipTunnelProviderDesiredState stored = {};
+    if (loadStoredMothershipTunnelProviderDesiredStateRecord(stored, failure) == false)
     {
       return false;
     }
 
-    if (stored.secretVersion == 0)
+    mothershipOwnConnectivityRuntimeConfig(stored.connectivity, connectivity);
+    gatewayAuth = {};
+    if (connectivity.kind != MothershipConnectivityKind::tunnelProvider)
     {
       if (failure)
       {
-        failure->assign("invalid persistent mothership tunnel gateway auth record"_ctv);
+        failure->clear();
+      }
+      return true;
+    }
+
+    if (stored.gatewayAuthSecretVersion == 0)
+    {
+      if (failure)
+      {
+        failure->assign("invalid persistent mothership tunnel provider desired state"_ctv);
       }
       return false;
     }
 
-    bool ok = loadSecretRecord(
+    return loadSecretRecord(
         brainColumnFamily,
-        mothershipTunnelGatewayAuthKey,
-        stored.secretVersion,
-        auth,
+        mothershipTunnelProviderDesiredStateKey,
+        stored.gatewayAuthSecretVersion,
+        gatewayAuth,
         "invalid persistent mothership tunnel gateway auth secrets",
         failure);
-    if (ok == false)
-    {
-      return false;
-    }
-
-    return true;
   }
 
-  bool loadMothershipConnectivityRuntimeConfig(MothershipConnectivityRuntimeConfig& config, String *failure = nullptr)
+  bool saveMothershipTunnelProviderDesiredState(const MothershipConnectivityRuntimeConfig& connectivity, const MothershipTunnelGatewayAuth& gatewayAuth, String *failure = nullptr)
   {
-    ProdigyPersistentStoredMothershipConnectivityRuntimeConfig stored = {};
-    if (loadStoredMothershipConnectivityRuntimeConfigRecord(stored, failure) == false)
+    if (mothershipConnectivityRuntimeConfigValid(connectivity, failure) == false)
     {
       return false;
     }
 
-    mothershipOwnConnectivityRuntimeConfig(stored.config, config);
-    return true;
-  }
-
-  bool saveMothershipConnectivityRuntimeConfig(const MothershipConnectivityRuntimeConfig& config, String *failure = nullptr)
-  {
-    if (mothershipConnectivityRuntimeConfigValid(config, failure) == false)
+    bool tunnel = connectivity.kind == MothershipConnectivityKind::tunnelProvider;
+    if (tunnel && mothershipTunnelGatewayAuthMaterialValid(gatewayAuth, failure) == false)
     {
       return false;
     }
 
-    MothershipConnectivityRuntimeConfig existing = {};
+    MothershipConnectivityRuntimeConfig existingConnectivity = {};
+    MothershipTunnelGatewayAuth existingGatewayAuth = {};
     String loadFailure = {};
-    if (loadMothershipConnectivityRuntimeConfig(existing, &loadFailure))
+    if (loadMothershipTunnelProviderDesiredState(existingConnectivity, existingGatewayAuth, &loadFailure))
     {
-      if (prodigyPersistentSerializedEqual(existing, config))
+      if (mothershipConnectivityRuntimeConfigEqual(existingConnectivity, connectivity) &&
+          (tunnel == false || mothershipTunnelGatewayAuthEqual(existingGatewayAuth, gatewayAuth)))
       {
         if (failure)
         {
@@ -3355,70 +3325,27 @@ public:
       return false;
     }
 
-    ProdigyPersistentStoredMothershipConnectivityRuntimeConfig stored = {};
-    mothershipOwnConnectivityRuntimeConfig(config, stored.config);
+    uint64_t previousVersion = previousMothershipTunnelProviderSecretVersion();
+    uint64_t newVersion = tunnel ? prodigyGeneratePersistentSecretVersion() : 0;
+    if (tunnel && saveSecretRecord(brainColumnFamily, mothershipTunnelProviderDesiredStateKey, newVersion, gatewayAuth, failure) == false)
+    {
+      return false;
+    }
+
+    ProdigyPersistentStoredMothershipTunnelProviderDesiredState stored = {};
+    stored.gatewayAuthSecretVersion = newVersion;
+    mothershipOwnConnectivityRuntimeConfig(connectivity, stored.connectivity);
 
     String serialized = {};
     BitseryEngine::serialize(serialized, stored);
-    bool ok = db.write(brainColumnFamily, mothershipConnectivityKey, serialized, failure);
-    Vault::secureClearString(serialized);
-    return ok;
-  }
-
-  bool saveMothershipTunnelGatewayAuth(const MothershipTunnelGatewayAuth& auth, String *failure = nullptr)
-  {
-    if (auth.configured() == false)
-    {
-      if (failure)
-      {
-        failure->assign("mothership tunnel gateway auth incomplete"_ctv);
-      }
-      return false;
-    }
-
-    if (mothershipTunnelGatewayAuthMaterialValid(auth, failure) == false)
-    {
-      return false;
-    }
-
-    MothershipTunnelGatewayAuth existingAuth = {};
-    String loadFailure = {};
-    if (loadMothershipTunnelGatewayAuth(existingAuth, &loadFailure))
-    {
-      if (prodigyPersistentSerializedEqual(existingAuth, auth))
-      {
-        if (failure)
-        {
-          failure->clear();
-        }
-        return true;
-      }
-    }
-    else if (loadFailure.size() > 0 && loadFailure != "record not found"_ctv)
-    {
-      if (failure)
-      {
-        failure->assign(loadFailure);
-      }
-      return false;
-    }
-
-    uint64_t previousVersion = previousMothershipTunnelGatewayAuthSecretVersion();
-    uint64_t newVersion = prodigyGeneratePersistentSecretVersion();
-    if (saveSecretRecord(brainColumnFamily, mothershipTunnelGatewayAuthKey, newVersion, auth, failure) == false)
-    {
-      return false;
-    }
-
-    ProdigyPersistentStoredMothershipTunnelGatewayAuth stored = {};
-    stored.secretVersion = newVersion;
-
-    String serialized = {};
-    BitseryEngine::serialize(serialized, stored);
-    bool ok = db.write(brainColumnFamily, mothershipTunnelGatewayAuthKey, serialized, failure);
+    bool ok = db.write(brainColumnFamily, mothershipTunnelProviderDesiredStateKey, serialized, failure);
     if (ok && previousVersion != newVersion)
     {
-      removeSecretRecordBestEffort(brainColumnFamily, mothershipTunnelGatewayAuthKey, previousVersion);
+      removeSecretRecordBestEffort(brainColumnFamily, mothershipTunnelProviderDesiredStateKey, previousVersion);
+    }
+    else if (ok == false && newVersion != 0)
+    {
+      removeSecretRecordBestEffort(brainColumnFamily, mothershipTunnelProviderDesiredStateKey, newVersion);
     }
 
     Vault::secureClearString(serialized);
