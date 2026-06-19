@@ -18,19 +18,19 @@ excluding evidence artifacts under `prodigy/docs/tunnel-provider-refactor/*`.
 | State | Files | Insertions | Deletions |
 |---|---:|---:|---:|
 | Draft feature baseline | 52 | 7437 | 434 |
-| Current branch | 57 | 5732 | 870 |
+| Current branch | 57 | 5775 | 870 |
 
 Category ledger:
 
 | Category | Draft net | Current net | Net removed |
 |---|---:|---:|---:|
-| Production | +4883 | +2864 | 2019 |
-| Tests | +2081 | +1961 | 120 |
+| Production | +4883 | +2899 | 1984 |
+| Tests | +2081 | +1969 | 112 |
 | Docs | +30 | +28 | 2 |
 | Build metadata | +9 | +9 | 0 |
 
 The current project gate command, excluding evidence artifacts, reports
-`+5732 -870 net +4862` across 57 files. The full diff including evidence
+`+5775 -870 net +4905` across 57 files. The full diff including evidence
 artifacts is intentionally larger because this report and ledger are tracked.
 
 ## Lines Removed By Subsystem
@@ -61,6 +61,7 @@ artifacts is intentionally larger because this report and ledger are tracked.
 - Brain desired-state commit: deleted the capture/sync/prepared-apply wrappers so one helper owns the tunnel desired-state mutation, runtime stop/reset, reconcile, and optional master-authority persistence.
 - System artifact store API: deleted redundant actual digest/byte out-params from `ContainerStore::systemStore`; callers already hold the enforced key.
 - Artifact create preflight: deleted duplicate Mothership-side provider header validation; `ContainerStore::systemStore` owns the system artifact contract boundary.
+- System artifact ingest: create-time provider preflight now hands the blob to a content-addressed system-store boundary, which computes the artifact key once and atomically writes under that key; expected-key replication verifies digest/size in memory before writing.
 
 See `LINE_LEDGER.tsv` for per-path numbers.
 
@@ -118,6 +119,7 @@ Fixed or hard-cut:
 - System artifact store no longer reports digest/size copies from the write path; create preflight records the already computed enforced key.
 - Tunnel-provider create preflight no longer validates the same provider header before calling the system artifact store; invalid kind/version/payload errors come from the store boundary.
 - System artifact load no longer validates the same provider header after `systemVerify`; the load path checks that the full read returns the verified byte count.
+- System artifact ingest no longer hashes once in Mothership, hashes again inside `ContainerStore::systemStore`, then rehashes the written file; the system-store boundary owns key computation/validation and writes atomically.
 
 Superseded by later user direction:
 
@@ -210,6 +212,7 @@ All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 - After collapsing the redundant `ContainerStore::systemStore` output API in the same VM worktree: `git diff --check`; incremental `cmake --build .run/build-numeric-egress --target prodigy mothership prodigy_deployments_unit prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-numeric-egress/prodigy_deployments_unit`; `.run/build-numeric-egress/prodigy_mothership_unix_connect_unit`; `.run/build-numeric-egress/prodigy_brain_replication_credentials_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` after build/test.
 - After deleting duplicate Mothership-side provider artifact header validation: `git diff --check`; incremental `cmake --build .run/build-numeric-egress --target prodigy mothership prodigy_mothership_unix_connect_unit --parallel 16`; `.run/build-numeric-egress/prodigy_mothership_unix_connect_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before and after build/test.
 - After removing duplicate post-load system artifact header validation: `git diff --check`; incremental `cmake --build .run/build-numeric-egress --target prodigy mothership prodigy_deployments_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-numeric-egress/prodigy_deployments_unit`; `.run/build-numeric-egress/prodigy_brain_replication_credentials_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before and after build/test.
+- After moving system artifact ingest to a content-addressed store boundary and adding digest-mismatch coverage: `git diff --check`; incremental `cmake --build .run/build-numeric-egress --target prodigy mothership prodigy_deployments_unit prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-numeric-egress/prodigy_deployments_unit`; `.run/build-numeric-egress/prodigy_mothership_unix_connect_unit`; `.run/build-numeric-egress/prodigy_brain_replication_credentials_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before and after build/test.
 
 Earlier validation on the same branch also covered the broader build/test matrix:
 cluster registry, deployments, bundle artifact, BPF attach units, host/container
@@ -230,7 +233,7 @@ Recorded binary/object sizes from the VM RelWithDebInfo build:
 | `host.ingress.router.ebpf.o` | 454296 |
 | `container.egress.router.ebpf.o` | 427800 |
 
-Focused unit counters now prove that a running provider report/reconcile performs no artifact presence check, and that provider launch performs no artifact load after the artifact is present. Static code evidence shows `systemVerify` reads only the fixed header after digest/size verification; explicit artifact transfer/load paths still read the full blob.
+Focused unit counters now prove that a running provider report/reconcile performs no artifact presence check, and that provider launch performs no artifact load after the artifact is present. Static code evidence shows `systemVerify` reads only the fixed header after digest/size verification; explicit artifact transfer/load paths still read the full blob. System artifact ingest now hashes the in-memory blob once, checks any supplied expected key before writing, and atomically writes without a post-write file rehash.
 
 Not measured: clean build wall time, incremental cluster-type fanout, gateway throughput/latency, 100k reconcile counters, artifact byte-copy counters, and BPF instruction deltas against `main`.
 

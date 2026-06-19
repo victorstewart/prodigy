@@ -9,7 +9,7 @@ production	34	0	34	prodigy/brain/base.h
 production	517	247	270	prodigy/brain/brain.h
 production	2	1	1	prodigy/brain/machine.h
 production	102	4	98	prodigy/container.contract.h
-production	159	2	157	prodigy/containerstore.h
+production	198	2	196	prodigy/containerstore.h
 build	11	2	9	prodigy/dev/CMakeLists.txt
 test	276	0	276	prodigy/dev/tests/mothership_tunnel_provider_fixture.cpp
 test	0	9	-9	prodigy/dev/tests/prodigy_brain_config_ssh_replication_unit.cpp
@@ -19,7 +19,7 @@ test	0	9	-9	prodigy/dev/tests/prodigy_brain_overlay_hosted_ingress_unit.cpp
 test	744	15	729	prodigy/dev/tests/prodigy_brain_replication_credentials_unit.cpp
 test	3	1	2	prodigy/dev/tests/prodigy_brain_topic_fuzz.cpp
 test	107	0	107	prodigy/dev/tests/prodigy_container_overlay_sync_unit.cpp
-test	75	4	71	prodigy/dev/tests/prodigy_deployments_unit.cpp
+test	83	4	79	prodigy/dev/tests/prodigy_deployments_unit.cpp
 test	114	1	113	prodigy/dev/tests/prodigy_mothership_cluster_registry_unit.cpp
 test	2	1	1	prodigy/dev/tests/prodigy_mothership_topic_fuzz.cpp
 test	618	4	614	prodigy/dev/tests/prodigy_mothership_unix_connect_unit.cpp
@@ -38,7 +38,7 @@ production	19	10	9	prodigy/ingress.validation.h
 production	1	0	1	prodigy/mothership/mothership.cluster.create.h
 production	76	4	72	prodigy/mothership/mothership.cluster.registry.h
 production	21	0	21	prodigy/mothership/mothership.cluster.types.h
-production	583	63	520	prodigy/mothership/mothership.cpp
+production	579	63	516	prodigy/mothership/mothership.cpp
 production	275	0	275	prodigy/mothership/mothership.tunnel.auth.h
 production	617	0	617	prodigy/mothership/mothership.tunnel.gateway.cpp
 production	62	0	62	prodigy/mothership/mothership.tunnel.gateway.h

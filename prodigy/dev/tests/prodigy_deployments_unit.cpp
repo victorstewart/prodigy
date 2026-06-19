@@ -1626,6 +1626,14 @@ int main(void)
             ContainerStore::systemLoadVerified(tunnelDigest, tunnelPayload.size(), loadedSystemBlob, &verificationFailure, &systemStoreRoot.path),
             "system_container_store_loads_verified_tunnel_provider_blob");
         suite.expect(loadedSystemBlob.equals(tunnelPayload), "system_container_store_loads_original_tunnel_provider_blob");
+        String wrongTunnelDigest = {};
+        wrongTunnelDigest.assign("0000000000000000000000000000000000000000000000000000000000000000"_ctv);
+        suite.expect(
+            ContainerStore::systemStore(wrongTunnelDigest, tunnelPayload.size(), tunnelPayload, &verificationFailure, &systemStoreRoot.path) == false,
+            "system_container_store_rejects_digest_mismatch");
+        suite.expect(
+            stringContains(verificationFailure, "sha256 mismatch"),
+            "system_container_store_reports_digest_mismatch");
         suite.expect(
             ContainerStore::systemStore(expectedDigest, payload.size(), payload, &verificationFailure, &systemStoreRoot.path) == false,
             "system_container_store_rejects_app_blob_for_tunnel_provider_kind");

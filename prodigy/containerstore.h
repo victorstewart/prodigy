@@ -340,6 +340,17 @@ private:
     return true;
   }
 
+  static bool storeSystemBlobWithKey(const String& sha256, uint64_t bytes, const String& blob, String *failureReport, const String *storeRoot)
+  {
+    String root = storeRoot ? *storeRoot : String("/containers/system-store"_ctv);
+    String path = pathForSystemArtifactWithinRoot(root, sha256);
+    String parent = {};
+    prodigyDirname(path, parent);
+    (void)Filesystem::createDirectoryAt(-1, root, 0755);
+    (void)Filesystem::createDirectoryAt(-1, parent, 0755);
+    return atomicWriteFile(path, blob, failureReport);
+  }
+
   static bool validateAppContainerArtifactContract(const String& containerBlob, String *failureReport = nullptr)
   {
     String headerText = prodigyDiscombobulatorBlobHeaderText();
@@ -592,14 +603,42 @@ public:
     {
       return false;
     }
+    String computedDigest = {};
+    if (prodigyComputeSHA256Hex(blob, computedDigest, failureReport) == false)
+    {
+      return false;
+    }
+    if (computedDigest != sha256)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"container blob sha256 mismatch expected={} actual={}"_ctv>(sha256, computedDigest);
+      }
+      return false;
+    }
+    if (blob.size() != bytes)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"container blob size mismatch expected={itoa} actual={itoa}"_ctv>(bytes, blob.size());
+      }
+      return false;
+    }
 
-    String root = storeRoot ? *storeRoot : String("/containers/system-store"_ctv);
-    String path = pathForSystemArtifactWithinRoot(root, sha256);
-    String parent = {};
-    prodigyDirname(path, parent);
-    (void)Filesystem::createDirectoryAt(-1, root, 0755);
-    (void)Filesystem::createDirectoryAt(-1, parent, 0755);
-    return storeBlobAtPath(path, blob, nullptr, nullptr, &sha256, &bytes, failureReport);
+    return storeSystemBlobWithKey(sha256, bytes, blob, failureReport, storeRoot);
+  }
+
+  static bool systemStore(const String& blob, String& sha256, uint64_t& bytes, String *failureReport = nullptr, const String *storeRoot = nullptr)
+  {
+    sha256.clear();
+    bytes = 0;
+    if (validateSystemArtifactContract(blob, failureReport) == false || prodigyComputeSHA256Hex(blob, sha256, failureReport) == false)
+    {
+      return false;
+    }
+
+    bytes = blob.size();
+    return storeSystemBlobWithKey(sha256, bytes, blob, failureReport, storeRoot);
   }
 
   static bool systemVerify(const String& sha256, uint64_t bytes, String *actualDigest = nullptr, uint64_t *actualBytes = nullptr, String *failureReport = nullptr, const String *storeRoot = nullptr)

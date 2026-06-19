@@ -5885,21 +5885,17 @@ private:
       return false;
     }
 
-    String digest = {};
-    if (prodigyComputeSHA256Hex(blob, digest, failure) == false)
-    {
-      return false;
-    }
-
     String storeFailure = {};
+    String artifactSha256 = {};
+    uint64_t artifactBytes = 0;
     bool stored = false;
 #if PRODIGY_DEBUG
     if (debugSystemStoreRoot != nullptr)
     {
       stored = ContainerStore::systemStore(
-          digest,
-          blob.size(),
           blob,
+          artifactSha256,
+          artifactBytes,
           &storeFailure,
           debugSystemStoreRoot);
     }
@@ -5909,9 +5905,9 @@ private:
 #endif
     {
       stored = ContainerStore::systemStore(
-          digest,
-          blob.size(),
           blob,
+          artifactSha256,
+          artifactBytes,
           &storeFailure);
     }
 
@@ -5924,8 +5920,8 @@ private:
       return false;
     }
 
-    spec.artifactSha256 = digest;
-    spec.artifactBytes = blob.size();
+    spec.artifactSha256 = std::move(artifactSha256);
+    spec.artifactBytes = artifactBytes;
     return true;
   }
 
