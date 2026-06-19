@@ -1602,7 +1602,7 @@ public:
     masterAuthorityRuntimeState.nextMintedClientTlsGeneration = nextMintedClientTlsGeneration;
     masterAuthorityRuntimeState.nextTlsResumptionGeneration = nextTlsResumptionGeneration;
     masterAuthorityRuntimeState.tlsResumptionSnapshotsByWormhole = captureTlsResumptionSnapshotsByWormhole();
-    masterAuthorityRuntimeState.mothershipTunnelProviderDesiredState = captureMothershipTunnelProviderDesiredState();
+    masterAuthorityRuntimeState.mothershipTunnelProviderDesiredState = {mothershipConnectivity, mothershipTunnelGatewayAuth};
     masterAuthorityRuntimeState.updateSelf = capturePersistentUpdateSelfState();
   }
 
@@ -12885,14 +12885,6 @@ public:
     state.lastFailure.assign("waiting for authenticated tunnel session"_ctv);
   }
 
-  MothershipTunnelProviderDesiredState captureMothershipTunnelProviderDesiredState(void) const
-  {
-    MothershipTunnelProviderDesiredState desired = {};
-    desired.connectivity = mothershipConnectivity;
-    desired.gatewayAuth = mothershipTunnelGatewayAuth;
-    return desired;
-  }
-
   bool prepareMothershipTunnelProviderDesiredState(const MothershipTunnelProviderDesiredState& incoming, MothershipTunnelProviderDesiredState& desired, String *failure = nullptr)
   {
     desired = {};
@@ -12915,13 +12907,35 @@ public:
     return true;
   }
 
+  void commitMothershipTunnelProviderDesiredState(const MothershipTunnelProviderDesiredState& desired, bool replicateToPeers, bool persistAuthority, String *failure = nullptr)
+  {
+    bool changed = mothershipConnectivity != desired.connectivity ||
+                   (mothershipTunnelGatewayAuth == desired.gatewayAuth) == false;
+    mothershipConnectivity = desired.connectivity;
+    mothershipTunnelGatewayAuth = desired.gatewayAuth;
+    if (changed)
+    {
+      stopMothershipTunnelProviderLocalInstance();
+      mothershipTunnelProviderRuntimeState = {};
+    }
+    reconcileMothershipTunnelProviderRuntimeState();
+    if (persistAuthority && (changed || (masterAuthorityRuntimeState.mothershipTunnelProviderDesiredState == desired) == false))
+    {
+      noteMasterAuthorityRuntimeStateChanged(replicateToPeers, true);
+    }
+    if (failure)
+    {
+      failure->clear();
+    }
+  }
+
   void restoreMothershipTunnelProviderDesiredStateFromMasterAuthority(void)
   {
     MothershipTunnelProviderDesiredState desired = {};
     String failure = {};
     if (prepareMothershipTunnelProviderDesiredState(masterAuthorityRuntimeState.mothershipTunnelProviderDesiredState, desired, &failure))
     {
-      (void)syncPreparedMothershipTunnelProviderDesiredState(desired);
+      commitMothershipTunnelProviderDesiredState(desired, false, false);
       return;
     }
 
@@ -12935,40 +12949,15 @@ public:
     }
   }
 
-  bool syncPreparedMothershipTunnelProviderDesiredState(const MothershipTunnelProviderDesiredState& desired)
-  {
-    bool changed = mothershipConnectivity != desired.connectivity ||
-                   (mothershipTunnelGatewayAuth == desired.gatewayAuth) == false;
-    mothershipConnectivity = desired.connectivity;
-    mothershipTunnelGatewayAuth = desired.gatewayAuth;
-    if (changed)
-    {
-      stopMothershipTunnelProviderLocalInstance();
-      mothershipTunnelProviderRuntimeState = {};
-    }
-    reconcileMothershipTunnelProviderRuntimeState();
-    return changed;
-  }
-
-  bool applyPreparedMothershipTunnelProviderDesiredState(const MothershipTunnelProviderDesiredState& desired, bool replicateToPeers, String *failure = nullptr)
-  {
-    bool changed = syncPreparedMothershipTunnelProviderDesiredState(desired);
-    if (changed || (masterAuthorityRuntimeState.mothershipTunnelProviderDesiredState == desired) == false)
-    {
-      noteMasterAuthorityRuntimeStateChanged(replicateToPeers, true);
-    }
-    if (failure)
-    {
-      failure->clear();
-    }
-    return true;
-  }
-
   bool applyMothershipTunnelProviderDesiredState(const MothershipTunnelProviderDesiredState& incoming, bool replicateToPeers, String *failure = nullptr)
   {
     MothershipTunnelProviderDesiredState desired = {};
-    return prepareMothershipTunnelProviderDesiredState(incoming, desired, failure) &&
-           applyPreparedMothershipTunnelProviderDesiredState(desired, replicateToPeers, failure);
+    if (prepareMothershipTunnelProviderDesiredState(incoming, desired, failure) == false)
+    {
+      return false;
+    }
+    commitMothershipTunnelProviderDesiredState(desired, replicateToPeers, true, failure);
+    return true;
   }
 
   bool applyMothershipTunnelProviderConfigureRequest(const MothershipTunnelProviderConfigureRequest& request, bool replicateToPeers, String *failure = nullptr)
@@ -13006,10 +12995,7 @@ public:
       {
         return false;
       }
-      if (applyPreparedMothershipTunnelProviderDesiredState(desired, false, failure) == false)
-      {
-        return false;
-      }
+      commitMothershipTunnelProviderDesiredState(desired, false, true, failure);
       if (replicateToPeers)
       {
         if (alreadyStored == false)
@@ -13025,7 +13011,8 @@ public:
       return true;
     }
 
-    return applyPreparedMothershipTunnelProviderDesiredState(desired, replicateToPeers, failure);
+    commitMothershipTunnelProviderDesiredState(desired, replicateToPeers, true, failure);
+    return true;
   }
 
   void configureMothershipUnixSocketPath(String& mothershipSocketPath)
