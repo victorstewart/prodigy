@@ -4955,7 +4955,7 @@ static void testMothershipTunnelProviderGatewaySessionMarksHealthy(TestSuite& su
   brain.mothershipTunnelProviderRuntimeState.phase = TunnelProviderPhase::awaitingSession;
   brain.mothershipTunnelProviderRuntimeState.lastFailure.assign("waiting for gateway session"_ctv);
 
-  brain.noteMothershipTunnelProviderControlSession(true, true);
+  brain.noteMothershipTunnelProviderControlSession();
   suite.expect(brain.mothershipTunnelProviderRuntimeState.phase == TunnelProviderPhase::healthy, "mothership_tunnel_runtime_gateway_session_marks_healthy");
   suite.expect(brain.mothershipTunnelProviderRuntimeState.lastHealthyAtMs > 0, "mothership_tunnel_runtime_gateway_session_records_health_time");
   suite.expect(brain.mothershipTunnelProviderRuntimeState.lastFailure.size() == 0, "mothership_tunnel_runtime_gateway_session_clears_failure");
@@ -4967,7 +4967,7 @@ static void testMothershipTunnelProviderGatewaySessionMarksHealthy(TestSuite& su
   TestBrain notRunning;
   notRunning.mothershipConnectivity.kind = MothershipConnectivityKind::tunnelProvider;
   notRunning.mothershipTunnelProviderRuntimeState.lastFailure.assign("waiting for gateway session"_ctv);
-  notRunning.noteMothershipTunnelProviderControlSession(true, true);
+  notRunning.noteMothershipTunnelProviderControlSession();
   suite.expect(notRunning.mothershipTunnelProviderRuntimeState.lastFailure.size() > 0, "mothership_tunnel_runtime_session_requires_running_provider");
 }
 

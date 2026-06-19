@@ -12,25 +12,25 @@ compatibility and source-NAT work that the original file requested.
 
 ## Line Counts
 
-Code diff scope is `prodigy ebpf switchboard` against `origin/main`,
+Code diff scope is `depofiles ebpf enums prodigy switchboard` against `origin/main`,
 excluding evidence artifacts under `prodigy/docs/tunnel-provider-refactor/*`.
 
 | State | Files | Insertions | Deletions |
 |---|---:|---:|---:|
 | Draft feature baseline | 52 | 7437 | 434 |
-| Current branch | 55 | 6007 | 564 |
+| Current branch | 56 | 5977 | 566 |
 
 Category ledger:
 
 | Category | Draft net | Current net | Net removed |
 |---|---:|---:|---:|
-| Production | +4883 | +3373 | 1510 |
-| Tests | +2081 | +2033 | 48 |
+| Production | +4883 | +3345 | 1538 |
+| Tests | +2081 | +2029 | 52 |
 | Docs | +30 | +28 | 2 |
 | Build metadata | +9 | +9 | 0 |
 
 The current project gate command, excluding evidence artifacts, reports
-`+6007 -564 net +5443` across 55 files. The full diff including evidence
+`+5977 -566 net +5411` across 56 files. The full diff including evidence
 artifacts is intentionally larger because this report and ledger are tracked.
 
 ## Lines Removed By Subsystem
@@ -45,13 +45,14 @@ artifacts is intentionally larger because this report and ledger are tracked.
 - Runtime phase: replaced diagnostic-prefix control flow with explicit `TunnelProviderPhase` transitions and bounded retry state.
 - Gateway TLS: moved server/client context construction out of session connect loops and shared the SSL_CTX certificate setup/peer-authorization helper.
 - System launch contract: deleted mutable `ContainerPlan` env/socket fields and the redundant provider-kind runtime env; Neuron now derives the fixed socket graft and provider env from `SystemContainerKind`.
-- Gateway implementation: moved socket/TLS/proxy code from the public header into a compiled runtime and centralized session result/failure publication.
+- Gateway implementation: moved socket/TLS/proxy code from the public header into a compiled runtime and deleted the session-result carrier.
 - System egress plan: replaced the variable-length `ContainerPlan` egress host/port pair and Neuron-side parser state with a prevalidated numeric `SystemContainerEgressPolicy`; text is rendered only at the provider env boundary.
 - Artifact launch boundary: removed the full verified artifact load/copy from Brain reconcile and deleted the artifact blob parameter from Brain/Prodigy provider launch hooks.
 - System plan boundary: folded kind, artifact reference, egress tuple, and fixed runtime resources into one typed `SystemContainerRuntimePlan`, so provider launch no longer seeds fake stateless-application config fields.
 - System artifact verification: `ContainerStore::systemVerify` now validates digest/size and reads only the fixed contract header instead of loading the whole artifact a second time for header validation.
 - Create auth boundary: removed server auth from `MothershipTunnelProviderSpec`; gateway server auth is create-only hook input and only the client auth persists.
 - Gateway I/O retry path: TLS accept/read/write now treats OpenSSL `WANT_READ`/`WANT_WRITE` as bounded wait states and drains buffered TLS plaintext before polling the socket again.
+- Gateway health event: the runtime now marks provider health when authenticated TLS opens the guarded control socket, not after the proxy loop exits.
 
 See `LINE_LEDGER.tsv` for per-path numbers.
 
@@ -94,6 +95,7 @@ Fixed or hard-cut:
 - System artifact presence/verification no longer allocates a full artifact blob just to validate the contract header; full blob reads remain only for explicit artifact transfer/load paths.
 - Gateway proxy sessions set socket receive/send timeouts and enforce a bounded idle poll timeout; focused coverage proves an authenticated idle session closes only after the guarded control socket opens.
 - Gateway TLS accept/read/write handles OpenSSL retry states under the same bounded idle timeout instead of failing a healthy session on `WANT_READ`/`WANT_WRITE`.
+- Gateway runtime health no longer depends on a mutable session-result struct or a clean proxy-loop exit; the authenticated control-open event is the only health callback.
 
 Superseded by later user direction:
 
@@ -115,7 +117,7 @@ Current state uses the compact `TunnelProviderPhase` enum, but not the full requ
 connectivity kind != tunnelProvider -> disabled
 not active master -> disabled
 missing auth/artifact -> awaitingMaterial
-artifact/auth/spec present -> starting -> awaitingSession
+artifact/auth/spec present -> awaitingSession
 authenticated control session -> healthy until TTL expires
 provider failure -> backoff with retry deadline
 ```
@@ -171,6 +173,7 @@ All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 - After removing create-only gateway server auth from the runtime spec: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_mothership_unix_connect_unit prodigy_mothership_cluster_registry_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-egress/prodigy_mothership_unix_connect_unit`; `.run/build-egress/prodigy_mothership_cluster_registry_unit`; `.run/build-egress/prodigy_brain_replication_credentials_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test.
 - After handling OpenSSL gateway retry states and deleting the dead runtime-config ownership helper: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-egress/prodigy_mothership_unix_connect_unit`; `.run/build-egress/prodigy_brain_replication_credentials_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test.
 - After densifying the gateway retry path and deleting a trivial cluster-connectivity wrapper: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_mothership_unix_connect_unit --parallel 16`; `.run/build-egress/prodigy_mothership_unix_connect_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test.
+- After deleting the gateway session-result carrier and making authenticated control-open the health callback: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit prodigy_mothership_cluster_registry_unit --parallel 16`; `.run/build-egress/prodigy_mothership_unix_connect_unit`; `.run/build-egress/prodigy_brain_replication_credentials_unit`; `.run/build-egress/prodigy_mothership_cluster_registry_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before and after build/test.
 
 Earlier validation on the same branch also covered the broader build/test matrix:
 cluster registry, deployments, bundle artifact, BPF attach units, host/container

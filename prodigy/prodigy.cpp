@@ -1007,9 +1007,9 @@ public:
                failure.size() > 0 ? failure.c_str() : "unspecified");
   }
 
-  static void noteMothershipTunnelGatewaySession(void *context, const MothershipTunnelGatewaySessionResult& result)
+  static void noteMothershipTunnelGatewaySession(void *context)
   {
-    static_cast<ProdigyBrain *>(context)->noteMothershipTunnelProviderControlSession(result.authenticated, result.openedControlSocket);
+    static_cast<ProdigyBrain *>(context)->noteMothershipTunnelProviderControlSession();
   }
 
   bool prepareMothershipTunnelGateway(const MothershipTunnelProviderSpec& spec, String *failure = nullptr)

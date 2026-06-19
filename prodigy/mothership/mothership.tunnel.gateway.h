@@ -10,11 +10,6 @@
 struct MothershipTunnelGatewayAuth;
 class MothershipTunnelGatewayTLSContext;
 
-struct MothershipTunnelGatewaySessionResult {
-  bool authenticated = false;
-  bool openedControlSocket = false;
-};
-
 struct MothershipTunnelGatewayUnixListener {
   String path;
   int fd = -1;
@@ -28,7 +23,7 @@ struct MothershipTunnelGatewayUnixListener {
 };
 
 using MothershipTunnelGatewayFailureCallback = void (*)(void *context, uint64_t failures, String& failure);
-using MothershipTunnelGatewaySessionCallback = void (*)(void *context, const MothershipTunnelGatewaySessionResult& result);
+using MothershipTunnelGatewaySessionCallback = void (*)(void *context);
 
 struct MothershipTunnelGatewayRuntime {
   MothershipTunnelGatewayUnixListener listener;
@@ -61,6 +56,7 @@ bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
     int streamFD,
     const String& controlSocketPath,
     const MothershipTunnelGatewayTLSContext& tlsContext,
-    MothershipTunnelGatewaySessionResult *sessionResult = nullptr,
     String *failure = nullptr,
-    int idleTimeoutMs = 120'000);
+    int idleTimeoutMs = 120'000,
+    void *callbackContext = nullptr,
+    MothershipTunnelGatewaySessionCallback sessionCallback = nullptr);

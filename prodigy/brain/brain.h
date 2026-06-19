@@ -12733,18 +12733,15 @@ public:
   {
     if (mothershipTunnelProviderRuntimeState.localContainerUUID != 0)
     {
-      mothershipTunnelProviderRuntimeState.phase = TunnelProviderPhase::stopping;
       stopMothershipTunnelProviderRuntime(mothershipTunnelProviderRuntimeState.localContainerUUID);
     }
     mothershipTunnelProviderRuntimeState.localContainerUUID = 0;
   }
 
-  void noteMothershipTunnelProviderControlSession(bool authenticated, bool openedControlSocket)
+  void noteMothershipTunnelProviderControlSession(void)
   {
     if (mothershipConnectivity.kind == MothershipConnectivityKind::tunnelProvider &&
-        mothershipTunnelProviderRuntimeState.localContainerUUID != 0 &&
-        authenticated &&
-        openedControlSocket)
+        mothershipTunnelProviderRuntimeState.localContainerUUID != 0)
     {
       mothershipTunnelProviderRuntimeState.phase = TunnelProviderPhase::healthy;
       mothershipTunnelProviderRuntimeState.failureCount = 0;
@@ -12944,7 +12941,6 @@ public:
     }
 
     uint128_t containerUUID = 0;
-    state.phase = TunnelProviderPhase::starting;
     if (startMothershipTunnelProviderRuntime(spec, mothershipTunnelGatewayAuth, containerUUID, &launchFailure) == false)
     {
       if (launchFailure.size() == 0)

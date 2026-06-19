@@ -1201,13 +1201,11 @@ private:
       return false;
     }
 
-    MothershipConnectivityRuntimeConfig runtimeConfig = {};
-    if (mothershipBuildMothershipConnectivityRuntimeConfig(cluster.mothershipConnectivity, runtimeConfig, failure) == false)
+    MothershipTunnelProviderSpec& spec = cluster.mothershipConnectivity.tunnelProvider;
+    if (mothershipTunnelProviderSpecValid(spec, failure) == false)
     {
       return false;
     }
-
-    MothershipTunnelProviderSpec& spec = cluster.mothershipConnectivity.tunnelProvider;
     if (spec.clientAuth.configured() == false)
     {
       if (failure)

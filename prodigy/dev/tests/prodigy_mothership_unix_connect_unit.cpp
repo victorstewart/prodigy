@@ -1211,7 +1211,6 @@ int main(void)
               suite.expect((gatewayStat.st_mode & 0777) == 0600, "tunnel_gateway_unix_listener_provider_mode");
 
               int clientFD = -1;
-              MothershipTunnelGatewaySessionResult rejectedResult = {};
               String rejectedFailure = {};
               bool rejectedProxy = true;
               bool connected = mothershipTunnelGatewayOpenUnixControlSocket(rejectedGateway.path, clientFD, &rejectedFailure);
@@ -1221,7 +1220,7 @@ int main(void)
                 std::thread rejectedThread([&]() {
                   int rejectedFD = -1;
                   rejectedProxy = mothershipTunnelGatewayAcceptUnixStream(rejectedGateway.fd, rejectedFD, &rejectedFailure) &&
-                      mothershipTunnelGatewayProxyAuthenticatedControlStream(rejectedFD, rejectedControl.path, gatewayTLS, &rejectedResult, &rejectedFailure);
+                      mothershipTunnelGatewayProxyAuthenticatedControlStream(rejectedFD, rejectedControl.path, gatewayTLS, &rejectedFailure);
                   if (rejectedFD >= 0)
                   {
                     (void)::shutdown(rejectedFD, SHUT_RDWR);
@@ -1240,7 +1239,7 @@ int main(void)
               rejectedPoll.fd = rejectedControl.fd;
               rejectedPoll.events = POLLIN;
               int rejectedReady = ::poll(&rejectedPoll, 1, 50);
-              suite.expect(rejectedProxy == false && rejectedResult.authenticated == false && rejectedResult.openedControlSocket == false, "tunnel_gateway_rejects_malformed_auth_before_control_open");
+              suite.expect(rejectedProxy == false, "tunnel_gateway_rejects_malformed_auth_before_control_open");
               suite.expect(rejectedReady == 0, "tunnel_gateway_reject_does_not_touch_control_socket");
             }
           }
@@ -1283,9 +1282,9 @@ int main(void)
           suite.expect(idleControlReady, "tunnel_gateway_idle_control_listener_created");
           if (idleControlReady)
           {
-            MothershipTunnelGatewaySessionResult idleResult = {};
             String idleFailure = {};
             bool idleProxy = true;
+            bool idleOpenedControl = false;
             std::thread idleGatewayThread([&]() {
               int gatewayFD = ::accept(gatewayListener.fd, nullptr, nullptr);
               if (gatewayFD < 0)
@@ -1293,7 +1292,7 @@ int main(void)
                 idleFailure.snprintf<"gateway idle accept failed: {}"_ctv>(String(std::strerror(errno)));
                 return;
               }
-              idleProxy = mothershipTunnelGatewayProxyAuthenticatedControlStream(gatewayFD, idleControl.path, gatewayTLS, &idleResult, &idleFailure, 100);
+              idleProxy = mothershipTunnelGatewayProxyAuthenticatedControlStream(gatewayFD, idleControl.path, gatewayTLS, &idleFailure, 100, &idleOpenedControl, [](void *context) { *static_cast<bool *>(context) = true; });
               (void)::shutdown(gatewayFD, SHUT_RDWR);
               ::close(gatewayFD);
             });
@@ -1315,12 +1314,11 @@ int main(void)
               }
             }
             idleGatewayThread.join();
-            suite.expect(idleProxy == false && idleResult.authenticated && idleResult.openedControlSocket, "tunnel_gateway_idle_timeout_closes_authenticated_session");
+            suite.expect(idleProxy == false && idleOpenedControl, "tunnel_gateway_idle_timeout_closes_authenticated_session");
             suite.expect(idleFailure.equal("mothership tunnel gateway proxy idle timeout"_ctv), "tunnel_gateway_idle_timeout_failure_reason");
           }
         }
 
-        MothershipTunnelGatewaySessionResult gatewayResult = {};
         ControlServerState gatewayControlState = {};
         String gatewayControlFailure = {};
         String gatewayProxyFailure = {};
@@ -1351,7 +1349,6 @@ int main(void)
               gatewayFD,
               gatewayControl.path,
               gatewayTLS,
-              &gatewayResult,
               &gatewayProxyFailure);
           (void)::shutdown(gatewayFD, SHUT_RDWR);
           ::close(gatewayFD);
@@ -1394,7 +1391,6 @@ int main(void)
         gatewayControlState.stopRequested.store(true);
         controlThread.join();
         suite.expect(gatewayProxyFailure.size() == 0 && gatewayControlFailure.size() == 0, "tunnel_gateway_tls_server_authorizes_client");
-        suite.expect(gatewayResult.authenticated && gatewayResult.openedControlSocket, "tunnel_gateway_tls_opens_control_socket_after_auth");
       }
     }
   }

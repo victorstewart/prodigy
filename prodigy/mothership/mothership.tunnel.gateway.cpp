@@ -438,20 +438,12 @@ bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
     int streamFD,
     const String& controlSocketPath,
     const MothershipTunnelGatewayTLSContext& tlsContext,
-    MothershipTunnelGatewaySessionResult *sessionResult,
     String *failure,
-    int idleTimeoutMs)
+    int idleTimeoutMs,
+    void *callbackContext,
+    MothershipTunnelGatewaySessionCallback sessionCallback)
 {
-  MothershipTunnelGatewaySessionResult result = {};
-  auto publish = [&]() {
-    if (sessionResult)
-    {
-      *sessionResult = result;
-    }
-  };
-  publish();
   auto fail = [&](auto&& text) -> bool {
-    publish();
     return mothershipTunnelGatewayFail(failure, text);
   };
 
@@ -466,7 +458,6 @@ bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
   idleTimeoutMs = std::max(idleTimeoutMs, 1);
   if (mothershipTunnelGatewaySetTimeout(streamFD, idleTimeoutMs, failure) == false)
   {
-    publish();
     return false;
   }
   std::unique_ptr<SSL, decltype(&SSL_free)> tls(nullptr, SSL_free);
@@ -494,7 +485,6 @@ bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
     int retry = mothershipTunnelGatewayTLSRetry(tls.get(), rc, idleTimeoutMs, "mothership tunnel gateway TLS accept failed"_ctv, failure);
     if (retry <= 0)
     {
-      publish();
       return retry == 0 ? fail("mothership tunnel gateway TLS accept failed"_ctv) : false;
     }
   }
@@ -505,25 +495,23 @@ bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
   clientCert.reset(SSL_get1_peer_certificate(tls.get()));
   if (tlsContext.authorizeClientCertificate(clientCert.get(), failure) == false)
   {
-    publish();
     return false;
   }
-  result.authenticated = true;
   if (mothershipTunnelGatewayOpenUnixControlSocket(controlSocketPath, controlFD, failure) == false)
   {
-    publish();
     return false;
   }
   if (mothershipTunnelGatewaySetTimeout(controlFD, idleTimeoutMs, failure) == false)
   {
     closeControl();
-    publish();
     return false;
   }
-  result.openedControlSocket = true;
+  if (sessionCallback)
+  {
+    sessionCallback(callbackContext);
+  }
   bool ok = mothershipTunnelGatewayProxyLoop(tls.get(), controlFD, idleTimeoutMs, failure);
   closeControl();
-  publish();
   return ok ? mothershipTunnelGatewayOk(failure) : false;
 }
 
@@ -609,12 +597,7 @@ bool MothershipTunnelGatewayRuntime::start(
         continue;
       }
       activeStreamFD.store(streamFD);
-      MothershipTunnelGatewaySessionResult sessionResult = {};
-      bool ok = mothershipTunnelGatewayProxyAuthenticatedControlStream(streamFD, ownedControlSocketPath, *gatewayTLS, &sessionResult, &sessionFailure);
-      if (ok && sessionCallback)
-      {
-        sessionCallback(callbackContext, sessionResult);
-      }
+      bool ok = mothershipTunnelGatewayProxyAuthenticatedControlStream(streamFD, ownedControlSocketPath, *gatewayTLS, &sessionFailure, 120'000, callbackContext, sessionCallback);
       (void)::shutdown(streamFD, SHUT_RDWR);
       ::close(streamFD);
       int expectedStreamFD = streamFD;

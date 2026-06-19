@@ -60,11 +60,9 @@ enum class MothershipConnectivityKind : uint8_t {
 enum class TunnelProviderPhase : uint8_t {
   disabled,
   awaitingMaterial,
-  starting,
   awaitingSession,
   healthy,
-  backoff,
-  stopping
+  backoff
 };
 
 static inline const char *tunnelProviderPhaseName(TunnelProviderPhase phase)
@@ -73,11 +71,9 @@ static inline const char *tunnelProviderPhaseName(TunnelProviderPhase phase)
   {
     case TunnelProviderPhase::disabled: return "disabled";
     case TunnelProviderPhase::awaitingMaterial: return "awaitingMaterial";
-    case TunnelProviderPhase::starting: return "starting";
     case TunnelProviderPhase::awaitingSession: return "awaitingSession";
     case TunnelProviderPhase::healthy: return "healthy";
     case TunnelProviderPhase::backoff: return "backoff";
-    case TunnelProviderPhase::stopping: return "stopping";
   }
   return "unknown";
 }

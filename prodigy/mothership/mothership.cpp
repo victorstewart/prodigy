@@ -4893,8 +4893,7 @@ public:
     if (cluster.mothershipConnectivity.kind == MothershipConnectivityKind::tunnelProvider)
     {
       const MothershipTunnelProviderSpec& spec = cluster.mothershipConnectivity.tunnelProvider;
-      MothershipConnectivityRuntimeConfig runtimeConfig = {};
-      if (mothershipBuildMothershipConnectivityRuntimeConfig(cluster.mothershipConnectivity, runtimeConfig, failure) == false)
+      if (mothershipTunnelProviderSpecValid(spec, failure) == false)
       {
         return false;
       }
