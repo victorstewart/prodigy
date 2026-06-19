@@ -4525,6 +4525,7 @@ static void testSystemContainerArtifactReplicationQueuesTypedBlob(TestSuite& sui
   TestBrain brain;
   BrainView follower;
   follower.connected = true;
+  follower.version = ProdigyBinaryVersion;
   follower.weConnectToIt = true;
   follower.isFixedFile = true;
   follower.fslot = 18;
@@ -4555,6 +4556,11 @@ static void testSystemContainerArtifactReplicationQueuesTypedBlob(TestSuite& sui
   });
 
   suite.expect(sawArtifact, "system_container_artifact_replication_queues_typed_blob");
+
+  follower.wBuffer.clear();
+  follower.version = 0;
+  brain.queueBrainSystemContainerArtifactReplicationForTest(sha256, blob.size(), blob);
+  suite.expect(follower.wBuffer.size() == 0, "system_container_artifact_replication_skips_old_peer");
 }
 
 static MothershipConnectivityRuntimeConfig makeTunnelRuntimeConnectivityConfig(void)
@@ -4621,6 +4627,7 @@ static void testMothershipTunnelProviderConfigureAppliesAtomicallyAndReplicates(
   brain.nBrains = 2;
   brain.brainConfig.clusterUUID = 0x7707;
   follower.connected = true;
+  follower.version = ProdigyBinaryVersion;
   follower.weConnectToIt = true;
   follower.isFixedFile = true;
   follower.fslot = 18;
@@ -4685,6 +4692,14 @@ static void testMothershipTunnelProviderConfigureAppliesAtomicallyAndReplicates(
   });
   suite.expect(sawArtifact, "mothership_tunnel_provider_configure_replicates_artifact");
   suite.expect(sawMasterAuthority, "mothership_tunnel_provider_configure_replicates_master_authority_desired_state");
+
+  TestBrain oldPeerBrain;
+  BrainView oldPeer;
+  oldPeer.connected = true;
+  oldPeerBrain.brains.insert(&oldPeer);
+  String oldPeerFailure = {};
+  suite.expect(oldPeerBrain.applyMothershipTunnelProviderConfigureRequest(request, true, &oldPeerFailure) == false && oldPeerFailure.equal("mothership tunnel provider requires current brain peer binary"_ctv), "mothership_tunnel_provider_configure_rejects_old_brain_peer");
+  suite.expect(oldPeerBrain.systemContainerStoreCalls == 0, "mothership_tunnel_provider_configure_rejects_old_peer_before_store");
 }
 
 static void testMothershipTunnelProviderReconcileBackfillsDesiredStateAndArtifact(TestSuite& suite)
@@ -4692,6 +4707,7 @@ static void testMothershipTunnelProviderReconcileBackfillsDesiredStateAndArtifac
   TestBrain brain;
   BrainView peer;
   peer.connected = true;
+  peer.version = ProdigyBinaryVersion;
   peer.weConnectToIt = true;
   peer.isFixedFile = true;
   peer.fslot = 18;

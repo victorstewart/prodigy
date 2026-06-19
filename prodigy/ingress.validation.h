@@ -394,12 +394,7 @@ static bool validateBrainPayload(uint16_t rawTopic, uint8_t *args, uint8_t *term
       }
     case BrainTopic::replicateSystemContainerArtifact:
       {
-        uint8_t kind = 0;
         uint64_t bytes = 0;
-        if (extractFixed(cursor, terminal, kind) == false)
-        {
-          return false;
-        }
         if (consumeVariable(cursor, terminal) == false)
         {
           return false;

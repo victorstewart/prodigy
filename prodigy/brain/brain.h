@@ -13057,6 +13057,17 @@ public:
     if (desired.connectivity.kind == MothershipConnectivityKind::tunnelProvider)
     {
       const MothershipTunnelProviderSpec& spec = desired.connectivity.tunnelProvider;
+      for (BrainView *brain : brains)
+      {
+        if (replicateToPeers && brain != nullptr && brain->connected && brain->version < ProdigyBinaryVersion)
+        {
+          if (failure)
+          {
+            failure->assign("mothership tunnel provider requires current brain peer binary"_ctv);
+          }
+          return false;
+        }
+      }
       bool alreadyStored = systemContainerArtifactPresent(spec.artifactSha256, spec.artifactBytes);
       if (alreadyStored == false && request.artifactBlob.size() == 0)
       {

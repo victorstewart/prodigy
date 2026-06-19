@@ -1018,6 +1018,10 @@ public:
   bool queueBrainSystemContainerArtifactReplicationToPeer(BrainView *brain, const String& sha256, uint64_t bytes, const String& blob)
   {
     const uint64_t appendBytes = (uint64_t(sha256.size()) + uint64_t(blob.size()) + brainPeerReplicationFrameHeadroomBytes);
+    if (brain != nullptr && brain->version < ProdigyBinaryVersion)
+    {
+      return false;
+    }
     if (allowBrainPeerReplicationAppend(brain, appendBytes, "replicateSystemContainerArtifact"_ctv) == false)
     {
       return false;
