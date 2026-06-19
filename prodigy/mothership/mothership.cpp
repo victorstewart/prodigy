@@ -219,11 +219,6 @@ static bool mothershipParseEndpointHostPort(const String& endpoint, String& host
     return false;
   };
 
-  if (endpoint.size() == 0)
-  {
-    return fail("endpoint is empty"_ctv);
-  }
-
   String endpointText = {};
   endpointText.assign(endpoint);
   const char *text = endpointText.c_str();
@@ -1956,31 +1951,8 @@ static bool parseMothershipConnectivityJSON(simdjson::dom::element value, Mother
   MothershipConnectivity parsed = {};
   bool sawKind = false;
   bool sawTunnelField = false;
+  String egressHost = {};
   providerContainerBlobPath.clear();
-  auto requireString = [&](simdjson::dom::element fieldValue, const char *fieldName, String& target) -> bool {
-    if (fieldValue.type() != simdjson::dom::element_type::STRING)
-    {
-      basics_log("%s.%s requires string\n", context, fieldName);
-      return false;
-    }
-    target.assign(fieldValue.get_c_str());
-    sawTunnelField = true;
-    return true;
-  };
-  auto requireU32 = [&](simdjson::dom::element fieldValue, const char *fieldName, uint32_t& target) -> bool {
-    uint64_t parsedValue = 0;
-    if ((fieldValue.type() != simdjson::dom::element_type::INT64 && fieldValue.type() != simdjson::dom::element_type::UINT64) ||
-        fieldValue.get(parsedValue) != simdjson::SUCCESS ||
-        parsedValue == 0 ||
-        parsedValue > UINT32_MAX)
-    {
-      basics_log("%s.%s invalid\n", context, fieldName);
-      return false;
-    }
-    target = uint32_t(parsedValue);
-    sawTunnelField = true;
-    return true;
-  };
   for (auto field : value.get_object())
   {
     String key = {};
@@ -2011,41 +1983,47 @@ static bool parseMothershipConnectivityJSON(simdjson::dom::element value, Mother
       }
       sawKind = true;
     }
-    else if (key.equal("providerContainerBlobPath"_ctv))
-    {
-      if (requireString(field.value, "providerContainerBlobPath", providerContainerBlobPath) == false)
-      {
-        return false;
-      }
-    }
-    else if (key.equal("dialEndpoint"_ctv))
-    {
-      if (requireString(field.value, "dialEndpoint", parsed.tunnelProvider.dialEndpoint) == false)
-      {
-        return false;
-      }
-    }
-    else if (key.equal("egressHost"_ctv))
-    {
-      if (requireString(field.value, "egressHost", parsed.tunnelProvider.egressHost) == false)
-      {
-        return false;
-      }
-    }
     else if (key.equal("egressPort"_ctv))
     {
-      uint32_t port = 0;
-      if (requireU32(field.value, "egressPort", port) == false || port > UINT16_MAX)
+      uint64_t port = 0;
+      if ((field.value.type() != simdjson::dom::element_type::INT64 && field.value.type() != simdjson::dom::element_type::UINT64) ||
+          field.value.get(port) != simdjson::SUCCESS ||
+          port == 0 ||
+          port > UINT16_MAX)
       {
         basics_log("%s.egressPort invalid\n", context);
         return false;
       }
-      parsed.tunnelProvider.egressPort = uint16_t(port);
+      parsed.tunnelProvider.egress.port = uint16_t(port);
+      sawTunnelField = true;
     }
     else
     {
-      basics_log("%s invalid field\n", context);
-      return false;
+      String *target = nullptr;
+      if (key.equal("providerContainerBlobPath"_ctv))
+      {
+        target = &providerContainerBlobPath;
+      }
+      else if (key.equal("dialEndpoint"_ctv))
+      {
+        target = &parsed.tunnelProvider.dialEndpoint;
+      }
+      else if (key.equal("egressHost"_ctv))
+      {
+        target = &egressHost;
+      }
+      else
+      {
+        basics_log("%s invalid field\n", context);
+        return false;
+      }
+      if (field.value.type() != simdjson::dom::element_type::STRING)
+      {
+        basics_log("%s tunnelProvider field requires string\n", context);
+        return false;
+      }
+      target->assign(field.value.get_c_str());
+      sawTunnelField = true;
     }
   }
 
@@ -2065,14 +2043,13 @@ static bool parseMothershipConnectivityJSON(simdjson::dom::element value, Mother
   {
     if (providerContainerBlobPath.size() == 0 ||
         parsed.tunnelProvider.dialEndpoint.size() == 0 ||
-        parsed.tunnelProvider.egressHost.size() == 0 ||
-        parsed.tunnelProvider.egressPort == 0)
+        egressHost.size() == 0 ||
+        parsed.tunnelProvider.egress.port == 0)
     {
       basics_log("%s tunnelProvider requires artifact path, dial endpoint, and TCP egress endpoint\n", context);
       return false;
     }
-    uint32_t egressAddress = 0;
-    if (prodigySystemEgressPublicIPv4Literal(parsed.tunnelProvider.egressHost, egressAddress) == false)
+    if (prodigySystemEgressPublicIPv4Literal(egressHost, parsed.tunnelProvider.egress.address4) == false)
     {
       basics_log("%s tunnelProvider egress host must be a public IPv4 literal\n", context);
       return false;
@@ -2409,12 +2386,13 @@ static void printManagedCluster(const MothershipProdigyCluster& cluster)
   {
     const MothershipTunnelProviderSpec& spec = cluster.mothershipConnectivity.tunnelProvider;
     String endpoint = spec.dialEndpoint;
-    String egressHost = spec.egressHost;
+    String egressHost = {};
+    (void)prodigySystemEgressIPv4Text(spec.egress.address4, egressHost);
     String artifactSha256 = spec.artifactSha256;
     basics_log("    tunnelProvider endpoint=%s egress=%s:%u artifactSha256=%s artifactBytes=%llu\n",
                endpoint.c_str(),
                egressHost.c_str(),
-               unsigned(spec.egressPort),
+               unsigned(spec.egress.port),
                artifactSha256.c_str(),
                (unsigned long long)spec.artifactBytes);
   }
@@ -4873,14 +4851,6 @@ public:
       const MothershipTunnelProviderSpec& spec = cluster.mothershipConnectivity.tunnelProvider;
       if (mothershipTunnelProviderSpecValid(spec, failure) == false)
       {
-        return false;
-      }
-      if (spec.clientAuth.configured() == false)
-      {
-        if (failure)
-        {
-          failure->assign("tunnelProvider client auth required for gateway dialing"_ctv);
-        }
         return false;
       }
       if (tunnelGatewayClientTLS.configure(spec.clientAuth, failure) == false)

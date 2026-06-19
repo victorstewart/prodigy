@@ -62,7 +62,7 @@ static bool equalMothershipConnectivity(const MothershipConnectivity& lhs, const
 {
   const MothershipTunnelProviderSpec& lt = lhs.tunnelProvider;
   const MothershipTunnelProviderSpec& rt = rhs.tunnelProvider;
-  if (lhs.kind != rhs.kind || lt.artifactSha256.equals(rt.artifactSha256) == false || lt.artifactBytes != rt.artifactBytes || lt.dialEndpoint.equals(rt.dialEndpoint) == false || lt.egressHost.equals(rt.egressHost) == false || lt.egressPort != rt.egressPort)
+  if (lhs.kind != rhs.kind || lt.artifactSha256.equals(rt.artifactSha256) == false || lt.artifactBytes != rt.artifactBytes || lt.dialEndpoint.equals(rt.dialEndpoint) == false || lt.egress.address4 != rt.egress.address4 || lt.egress.port != rt.egress.port)
   {
     return false;
   }
@@ -1476,8 +1476,8 @@ int main(void)
     tunnel.mothershipConnectivity.tunnelProvider.artifactSha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv;
     tunnel.mothershipConnectivity.tunnelProvider.artifactBytes = 256;
     tunnel.mothershipConnectivity.tunnelProvider.dialEndpoint = "control.example.net:443"_ctv;
-    tunnel.mothershipConnectivity.tunnelProvider.egressHost = "1.1.1.1"_ctv;
-    tunnel.mothershipConnectivity.tunnelProvider.egressPort = 443;
+    tunnel.mothershipConnectivity.tunnelProvider.egress.address4 = 0x01010101;
+    tunnel.mothershipConnectivity.tunnelProvider.egress.port = 443;
     auto reissueTunnelClientAuth = [&](MothershipProdigyCluster& candidate, uint128_t clusterUUID, const char *testName) {
       MothershipTunnelGatewayAuth ignored = {};
       candidate.clusterUUID = clusterUUID;
@@ -1511,26 +1511,18 @@ int main(void)
 
     MothershipProdigyCluster missingEgress = tunnel;
     missingEgress.name = "local-tunnel-missing-egress"_ctv;
-    missingEgress.mothershipConnectivity.tunnelProvider.egressHost.clear();
+    missingEgress.mothershipConnectivity.tunnelProvider.egress.address4 = 0;
     bool createMissingEgress = registry.createCluster(missingEgress, nullptr, &failure);
     suite.expect(createMissingEgress == false, "create_tunnel_provider_missing_egress_rejected");
     suite.expect(failure.equals("mothership tunnel-provider egress endpoint invalid"_ctv), "create_tunnel_provider_missing_egress_reason");
 
     MothershipProdigyCluster zeroPort = tunnel;
     zeroPort.name = "local-tunnel-zero-port"_ctv;
-    zeroPort.mothershipConnectivity.tunnelProvider.egressPort = 0;
+    zeroPort.mothershipConnectivity.tunnelProvider.egress.port = 0;
     bool createZeroPort = registry.createCluster(zeroPort, nullptr, &failure);
     suite.expect(createZeroPort == false, "create_tunnel_provider_zero_port_rejected");
 
-    MothershipProdigyCluster hostnameEgress = tunnel;
-    hostnameEgress.name = "local-tunnel-hostname-egress"_ctv;
-    hostnameEgress.mothershipConnectivity.tunnelProvider.egressHost = "edge.example.net"_ctv;
-    bool createHostnameEgress = registry.createCluster(hostnameEgress, nullptr, &failure);
-    suite.expect(createHostnameEgress == false, "create_tunnel_provider_hostname_egress_rejected");
-    suite.expect(failure.equals("mothership tunnel-provider egress literal invalid"_ctv), "create_tunnel_provider_hostname_egress_reason");
-
     const char *deniedEgressHosts[] = {
-        "0.0.0.0",
         "10.0.0.1",
         "100.64.0.1",
         "127.0.0.1",
@@ -1548,7 +1540,7 @@ int main(void)
       MothershipProdigyCluster deniedEgress = tunnel;
       deniedEgress.name = String();
       deniedEgress.name.snprintf<"local-tunnel-denied-egress-{itoa}"_ctv>(uint64_t(index));
-      deniedEgress.mothershipConnectivity.tunnelProvider.egressHost = String(deniedEgressHosts[index]);
+      (void)prodigySystemEgressIPv4Literal(String(deniedEgressHosts[index]), deniedEgress.mothershipConnectivity.tunnelProvider.egress.address4);
       bool createDeniedEgress = registry.createCluster(deniedEgress, nullptr, &failure);
       suite.expect(createDeniedEgress == false, "create_tunnel_provider_denied_literal_egress_rejected");
       suite.expect(failure.equals("mothership tunnel-provider egress literal denied"_ctv), "create_tunnel_provider_denied_literal_egress_reason");
@@ -1559,7 +1551,7 @@ int main(void)
     missingAuth.mothershipConnectivity.tunnelProvider.clientAuth = {};
     bool createMissingAuth = registry.createCluster(missingAuth, nullptr, &failure);
     suite.expect(createMissingAuth == false, "create_tunnel_provider_missing_auth_rejected");
-    suite.expect(failure.equals("tunnelProvider.clientAuth required"_ctv), "create_tunnel_provider_missing_auth_reason");
+    suite.expect(failure.equals("tunnelProvider.clientAuth certificate material invalid"_ctv), "create_tunnel_provider_missing_auth_reason");
 
   }
 

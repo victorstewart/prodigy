@@ -1065,8 +1065,8 @@ int main(void)
   storedMothershipConnectivity.tunnelProvider.artifactSha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv;
   storedMothershipConnectivity.tunnelProvider.artifactBytes = 512;
   storedMothershipConnectivity.tunnelProvider.dialEndpoint = "control.example.net:443"_ctv;
-  storedMothershipConnectivity.tunnelProvider.egressHost = "1.1.1.1"_ctv;
-  storedMothershipConnectivity.tunnelProvider.egressPort = 443;
+  storedMothershipConnectivity.tunnelProvider.egress.address4 = 0x01010101;
+  storedMothershipConnectivity.tunnelProvider.egress.port = 443;
   storedSnapshot.masterAuthority.runtimeState.mothershipTunnelProviderDesiredState.connectivity = storedMothershipConnectivity;
   storedSnapshot.masterAuthority.runtimeState.mothershipTunnelProviderDesiredState.gatewayAuth = storedTunnelGatewayAuth;
 

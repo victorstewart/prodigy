@@ -18,19 +18,19 @@ excluding evidence artifacts under `prodigy/docs/tunnel-provider-refactor/*`.
 | State | Files | Insertions | Deletions |
 |---|---:|---:|---:|
 | Draft feature baseline | 52 | 7437 | 434 |
-| Current branch | 57 | 5892 | 870 |
+| Current branch | 57 | 5775 | 870 |
 
 Category ledger:
 
 | Category | Draft net | Current net | Net removed |
 |---|---:|---:|---:|
-| Production | +4883 | +3009 | 1874 |
-| Tests | +2081 | +1976 | 105 |
+| Production | +4883 | +2900 | 1983 |
+| Tests | +2081 | +1968 | 113 |
 | Docs | +30 | +28 | 2 |
 | Build metadata | +9 | +9 | 0 |
 
 The current project gate command, excluding evidence artifacts, reports
-`+5892 -870 net +5022` across 57 files. The full diff including evidence
+`+5775 -870 net +4905` across 57 files. The full diff including evidence
 artifacts is intentionally larger because this report and ledger are tracked.
 
 ## Lines Removed By Subsystem
@@ -57,12 +57,13 @@ artifacts is intentionally larger because this report and ledger are tracked.
 - Prodigy launch hook surface: collapsed five one-use gateway/provider launch helpers into the single Brain `startMothershipTunnelProviderRuntime`/`stopMothershipTunnelProviderRuntime` boundary.
 - Mothership control surface: deleted the unreachable direct TCP client stage and the disabled Brain TCP listener; supported control ingress is local Unix, SSH-forwarded Unix, or tunnel gateway.
 - System artifact store surface: collapsed single-use private system-store wrappers into the public store/verify/load boundary and deleted the product provider-header validator that existed only for tests.
+- Provider egress spec: hard-cut persisted text host/port fields to one numeric `SystemContainerEgressPolicy`; create JSON text is parsed once at the boundary, and runtime launch copies the numeric tuple.
 
 See `LINE_LEDGER.tsv` for per-path numbers.
 
 ## Surviving Feature-Specific Surface
 
-- `MothershipTunnelProviderSpec`: persisted operator-facing tunnel metadata and client auth.
+- `MothershipTunnelProviderSpec`: persisted operator-facing endpoint metadata, artifact identity, numeric egress policy, and client auth.
 - Brain-owned anonymous runtime state: phase, local provider UUID, retry count/deadline, and bounded diagnostic text.
 - `SystemContainerKind::mothershipTunnelProvider`: typed runtime identity for system container launch.
 - `mothership.tunnel.gateway.h`: compact public declarations for listener, proxy helpers, and `MothershipTunnelGatewayRuntime`.
@@ -109,6 +110,7 @@ Fixed or hard-cut:
 - `MothershipSocket::stageTcp` is deleted; cluster control targets now resolve only to local Unix, SSH-forwarded Unix, or tunnel gateway transports.
 - The Brain TCP Mothership listener is deleted; master control ingress arms only the Unix socket.
 - `ContainerStore` no longer carries private forwarding helpers for the single system artifact kind, and the tunnel-provider header validator is test-local instead of exported as production API.
+- Tunnel-provider persisted/runtime spec carries numeric egress policy, not text host/port, so runtime launch no longer reparses egress.
 
 Superseded by later user direction:
 
@@ -119,7 +121,7 @@ Still open relative to the original goal:
 
 - Gateway I/O is bounded by socket/idle timeouts and handles OpenSSL retry states, but is not a full nonblocking backpressure/half-close state machine.
 - Artifact envelope is integrity/type declaration, not signed trusted provenance.
-- Dedicated system-container plan extension is incomplete; the remaining mutable surface is the required artifact reference and egress tuple.
+- System-container plan state is down to the required artifact reference and numeric egress tuple.
 - Full rolling-upgrade protocol gating remains incomplete; this branch now gates tunnel activation and the new artifact topic on the bumped Brain binary version, but broader mixed-binary behavior is not fully proven.
 
 ## State And Transport
@@ -196,6 +198,7 @@ All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 - After deleting the unreachable direct TCP control stage and defaulting Brain's no-op control ingress hook: `git diff --check`; `cmake --build .run/build-egress --target prodigy mothership prodigy_brain_replication_credentials_unit prodigy_persistent_state_unit prodigy_brain_config_ssh_replication_unit prodigy_brain_ipv6_topology_unit prodigy_brain_master_uuid_unit prodigy_brain_overlay_hosted_ingress_unit prodigy_mothership_unix_connect_unit --parallel 16`; `.run/build-egress/prodigy_brain_replication_credentials_unit`; `.run/build-egress/prodigy_persistent_state_unit`; `.run/build-egress/prodigy_brain_config_ssh_replication_unit`; `.run/build-egress/prodigy_brain_ipv6_topology_unit`; `.run/build-egress/prodigy_brain_master_uuid_unit`; `.run/build-egress/prodigy_brain_overlay_hosted_ingress_unit`; `.run/build-egress/prodigy_mothership_unix_connect_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test and after the focused units.
 - After deleting the disabled Brain TCP Mothership listener: `git diff --check`; `cmake --build .run/build-egress --target prodigy mothership prodigy_brain_replication_credentials_unit prodigy_persistent_state_unit prodigy_brain_config_ssh_replication_unit prodigy_brain_master_uuid_unit prodigy_mothership_unix_connect_unit --parallel 16`; `.run/build-egress/prodigy_brain_replication_credentials_unit`; `.run/build-egress/prodigy_persistent_state_unit`; `.run/build-egress/prodigy_brain_config_ssh_replication_unit`; `.run/build-egress/prodigy_brain_master_uuid_unit`; `.run/build-egress/prodigy_mothership_unix_connect_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test and after the focused units.
 - After flattening the system artifact store helpers in fresh VM worktree `/work/prodigy-verify-system-artifact-HJV8QE`: `git diff --check`; `cmake -S prodigy/dev -B .run/build-system-artifact -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++`; `cmake --build .run/build-system-artifact --target prodigy mothership prodigy_deployments_unit prodigy_brain_replication_credentials_unit prodigy_mothership_unix_connect_unit --parallel 16`; `.run/build-system-artifact/prodigy_deployments_unit`; `.run/build-system-artifact/prodigy_brain_replication_credentials_unit`; `.run/build-system-artifact/prodigy_mothership_unix_connect_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test and after the focused units.
+- After hard-cutting provider egress from persisted text fields to numeric policy in fresh VM worktree `/work/prodigy-verify-numeric-egress-Kwi2Rh`: `git diff --check`; `cmake -S prodigy/dev -B .run/build-numeric-egress -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++`; `cmake --build .run/build-numeric-egress --target prodigy mothership prodigy_mothership_unix_connect_unit prodigy_mothership_cluster_registry_unit prodigy_brain_replication_credentials_unit prodigy_persistent_state_unit --parallel 16`; `.run/build-numeric-egress/prodigy_mothership_cluster_registry_unit`; `.run/build-numeric-egress/prodigy_mothership_unix_connect_unit`; `.run/build-numeric-egress/prodigy_brain_replication_credentials_unit`; `.run/build-numeric-egress/prodigy_persistent_state_unit`. The first cluster-registry unit run exposed that `0.0.0.0` is now numeric-unconfigured instead of a persisted denied address; that stale case was removed, the unit was rebuilt, and all focused units then exited 0. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before and after build/test.
 
 Earlier validation on the same branch also covered the broader build/test matrix:
 cluster registry, deployments, bundle artifact, BPF attach units, host/container

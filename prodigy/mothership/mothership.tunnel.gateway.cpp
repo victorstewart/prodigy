@@ -24,30 +24,19 @@
 
 static bool mothershipTunnelGatewayFail(String *failure, const auto& text)
 {
-  if (failure)
-  {
-    failure->assign(text);
-  }
+  if (failure) { failure->assign(text); }
   return false;
 }
 
 static bool mothershipTunnelGatewayFailErrno(String *failure, const auto& text)
 {
-  if (failure)
-  {
-    failure->assign(text);
-    failure->append(": "_ctv);
-    failure->append(String(std::strerror(errno)));
-  }
+  if (failure) { failure->assign(text); failure->append(": "_ctv); failure->append(String(std::strerror(errno))); }
   return false;
 }
 
 static bool mothershipTunnelGatewayOk(String *failure)
 {
-  if (failure)
-  {
-    failure->clear();
-  }
+  if (failure) { failure->clear(); }
   return true;
 }
 

@@ -4561,8 +4561,8 @@ static MothershipConnectivity makeTunnelRuntimeConnectivityConfig(void)
   config.tunnelProvider.artifactSha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv;
   config.tunnelProvider.artifactBytes = 512;
   config.tunnelProvider.dialEndpoint = "control.example.net:443"_ctv;
-  config.tunnelProvider.egressHost = "1.1.1.1"_ctv;
-  config.tunnelProvider.egressPort = 443;
+  config.tunnelProvider.egress.address4 = 0x01010101;
+  config.tunnelProvider.egress.port = 443;
   return config;
 }
 
@@ -4596,7 +4596,7 @@ static void testMothershipTunnelProviderRuntimeSpecIsStrict(TestSuite& suite)
   MothershipConnectivity config = makeTunnelRuntimeConnectivityConfig();
   String failure = {};
   suite.expect(mothershipConnectivityRuntimeConfigValid(config, &failure), "mothership_tunnel_runtime_spec_valid");
-  config.tunnelProvider.egressPort = 0;
+  config.tunnelProvider.egress.port = 0;
   suite.expect(mothershipConnectivityRuntimeConfigValid(config, &failure) == false && failure.equal("mothership tunnel-provider egress endpoint invalid"_ctv), "mothership_tunnel_runtime_spec_rejects_empty_egress");
 }
 
@@ -4828,7 +4828,7 @@ static void testMothershipTunnelProviderDesiredStateMasterAuthorityReplicationAp
 
   TestBrain deniedBrain;
   MothershipConnectivity denied = makeTunnelRuntimeConnectivityConfig();
-  denied.tunnelProvider.egressHost = "169.254.169.254"_ctv;
+  denied.tunnelProvider.egress.address4 = 0xa9fea9fe;
   MothershipTunnelProviderDesiredState deniedDesired = makeTunnelProviderDesiredState(denied, auth);
   ProdigyMasterAuthorityRuntimeState deniedRuntimeState = {};
   deniedRuntimeState.generation = 1;

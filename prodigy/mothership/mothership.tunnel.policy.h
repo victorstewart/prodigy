@@ -18,19 +18,13 @@ static void serialize(S&& serializer, MothershipTunnelProviderConfigureRequest& 
 template <typename Text>
 static inline bool mothershipTunnelPolicyFail(String *failure, const Text& text)
 {
-  if (failure)
-  {
-    failure->assign(text);
-  }
+  if (failure) { failure->assign(text); }
   return false;
 }
 
 static inline bool mothershipTunnelPolicyOk(String *failure)
 {
-  if (failure)
-  {
-    failure->clear();
-  }
+  if (failure) { failure->clear(); }
   return true;
 }
 
@@ -46,16 +40,11 @@ static inline bool mothershipTunnelProviderSpecValid(const MothershipTunnelProvi
     return mothershipTunnelPolicyFail(failure, "mothership tunnel-provider dial config invalid"_ctv);
   }
 
-  if (spec.egressHost.size() == 0 || spec.egressPort == 0)
+  if (spec.egress.configured() == false)
   {
     return mothershipTunnelPolicyFail(failure, "mothership tunnel-provider egress endpoint invalid"_ctv);
   }
-  uint32_t egressAddress = 0;
-  if (prodigySystemEgressIPv4Literal(spec.egressHost, egressAddress) == false)
-  {
-    return mothershipTunnelPolicyFail(failure, "mothership tunnel-provider egress literal invalid"_ctv);
-  }
-  if (prodigySystemEgressIPv4HostAddressIsDenied(egressAddress))
+  if (prodigySystemEgressIPv4HostAddressIsDenied(spec.egress.address4))
   {
     return mothershipTunnelPolicyFail(failure, "mothership tunnel-provider egress literal denied"_ctv);
   }

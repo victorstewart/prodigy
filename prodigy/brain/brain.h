@@ -12651,12 +12651,8 @@ public:
 
   static int64_t mothershipTunnelProviderRetryDelayMs(uint32_t failureCount)
   {
-    int64_t delayMs = mothershipTunnelProviderBaseRetryDelayMs;
-    for (uint32_t i = 1; i < failureCount && delayMs < mothershipTunnelProviderMaxRetryDelayMs; ++i)
-    {
-      delayMs = std::min(delayMs * 2, mothershipTunnelProviderMaxRetryDelayMs);
-    }
-    return delayMs;
+    uint32_t shifts = failureCount > 1 ? std::min<uint32_t>(failureCount - 1, 6) : 0;
+    return std::min<int64_t>(mothershipTunnelProviderBaseRetryDelayMs << shifts, mothershipTunnelProviderMaxRetryDelayMs);
   }
 
   template <typename Diagnostic>
@@ -12909,16 +12905,8 @@ public:
 
     if (desired.connectivity.kind == MothershipConnectivityKind::tunnelProvider)
     {
-      if (incoming.gatewayAuth.configured() == false)
-      {
-        if (failure)
-        {
-          failure->assign("mothership tunnel gateway auth incomplete"_ctv);
-        }
-        return false;
-      }
-
-      if (mothershipTunnelGatewayAuthMaterialValid(incoming.gatewayAuth, failure) == false)
+      MothershipTunnelGatewayTLSContext gatewayTLS = {};
+      if (gatewayTLS.configure(incoming.gatewayAuth, failure) == false)
       {
         return false;
       }

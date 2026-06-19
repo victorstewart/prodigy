@@ -16,19 +16,13 @@ using MothershipTunnelPKeyPtr = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_fre
 template <typename Text>
 static inline bool mothershipTunnelAuthFail(String *failure, const Text& text)
 {
-  if (failure)
-  {
-    failure->assign(text);
-  }
+  if (failure) { failure->assign(text); }
   return false;
 }
 
 static inline bool mothershipTunnelAuthOk(String *failure)
 {
-  if (failure)
-  {
-    failure->clear();
-  }
+  if (failure) { failure->clear(); }
   return true;
 }
 
@@ -84,23 +78,6 @@ static inline bool mothershipTunnelGatewayLeafKeyMatches(X509 *rootCert, EVP_PKE
       X509_check_private_key(leafCert, leafKey) == 1 &&
       mothershipTunnelGatewayLeafIssuedByRoot(rootCert, rootPublicKey, leafCert) &&
       mothershipTunnelGatewayLeafHasExtendedKeyUsage(leafCert, extendedKeyUsageNid);
-}
-
-static inline bool mothershipTunnelGatewayAuthMaterialValid(const MothershipTunnelGatewayAuth& auth, String *failure = nullptr)
-{
-  MothershipTunnelX509Ptr rootCert(VaultPem::x509FromPem(auth.rootCertPem), X509_free);
-  MothershipTunnelX509Ptr serverCert(VaultPem::x509FromPem(auth.serverCertPem), X509_free);
-  MothershipTunnelPKeyPtr serverKey(VaultPem::privateKeyFromPem(auth.serverKeyPem), EVP_PKEY_free);
-  MothershipTunnelPKeyPtr rootPublicKey(rootCert ? X509_get_pubkey(rootCert.get()) : nullptr, EVP_PKEY_free);
-  bool ok = auth.configured() &&
-      rootCert != nullptr &&
-      mothershipTunnelGatewayLeafKeyMatches(rootCert.get(), rootPublicKey.get(), serverCert.get(), serverKey.get(), NID_server_auth);
-
-  if (ok == false)
-  {
-    return mothershipTunnelAuthFail(failure, "mothership tunnel gateway auth certificate material invalid"_ctv);
-  }
-  return mothershipTunnelAuthOk(failure);
 }
 
 class MothershipTunnelGatewayTLSContext {

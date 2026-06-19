@@ -1206,14 +1206,6 @@ private:
     {
       return false;
     }
-    if (spec.clientAuth.configured() == false)
-    {
-      if (failure)
-      {
-        failure->assign("tunnelProvider.clientAuth required");
-      }
-      return false;
-    }
 
     MothershipTunnelGatewayTLSContext clientTLS = {};
     if (clientTLS.configure(spec.clientAuth) == false)

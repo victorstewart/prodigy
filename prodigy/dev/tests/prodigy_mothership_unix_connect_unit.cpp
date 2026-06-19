@@ -800,7 +800,7 @@ int main(void)
     MothershipConnectivity connectivity = {};
     suite.expect(parseConnectivityFixture("{\"kind\":\"ssh\"}"_ctv, connectivity) && connectivity.kind == MothershipConnectivityKind::ssh, "mothership_connectivity_parse_ssh_without_artifact");
     suite.expect(parseConnectivityFixture("{\"kind\":\"ssh\",\"providerContainerBlobPath\":\"x\"}"_ctv, connectivity) == false, "mothership_connectivity_parse_ssh_rejects_tunnel_artifact");
-    suite.expect(parseConnectivityFixture("{\"kind\":\"tunnelProvider\",\"providerContainerBlobPath\":\"x\",\"dialEndpoint\":\"control.example.net:443\",\"egressHost\":\"1.1.1.1\",\"egressPort\":443}"_ctv, connectivity) && connectivity.tunnelProvider.egressHost.equal("1.1.1.1"_ctv) && connectivity.tunnelProvider.egressPort == 443, "mothership_connectivity_parse_tunnel_endpoint");
+    suite.expect(parseConnectivityFixture("{\"kind\":\"tunnelProvider\",\"providerContainerBlobPath\":\"x\",\"dialEndpoint\":\"control.example.net:443\",\"egressHost\":\"1.1.1.1\",\"egressPort\":443}"_ctv, connectivity) && connectivity.tunnelProvider.egress.address4 == 0x01010101 && connectivity.tunnelProvider.egress.port == 443, "mothership_connectivity_parse_tunnel_endpoint");
     suite.expect(parseConnectivityFixture("{\"kind\":\"tunnelProvider\",\"dialEndpoint\":\"control.example.net:443\",\"egressHost\":\"1.1.1.1\",\"egressPort\":443}"_ctv, connectivity) == false, "mothership_connectivity_parse_tunnel_rejects_missing_artifact");
     suite.expect(parseConnectivityFixture("{\"kind\":\"tunnelProvider\",\"providerContainerBlobPath\":\"x\",\"dialEndpoint\":\"\",\"egressHost\":\"1.1.1.1\",\"egressPort\":443}"_ctv, connectivity) == false, "mothership_connectivity_parse_tunnel_rejects_empty_endpoint");
     suite.expect(parseConnectivityFixture("{\"kind\":\"tunnelProvider\",\"providerContainerBlobPath\":\"x\",\"dialEndpoint\":\"control.example.net:443\",\"egressHost\":\"1.1.1.1\",\"egressPort\":0}"_ctv, connectivity) == false, "mothership_connectivity_parse_tunnel_rejects_zero_egress_port");
@@ -964,12 +964,12 @@ int main(void)
     tunnelProvider.artifactSha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv;
     tunnelProvider.artifactBytes = 128;
     tunnelProvider.dialEndpoint = "gateway.example.net:443"_ctv;
-    tunnelProvider.egressHost = "1.1.1.1"_ctv;
-    tunnelProvider.egressPort = 443;
+    tunnelProvider.egress.address4 = 0x01010101;
+    tunnelProvider.egress.port = 443;
     bool tunnelConfigureOK = mothership.unitTestConfigureClusterSocket(tunnelCluster, remoteCandidates, &failure);
     suite.expect(tunnelConfigureOK == false, "tunnel_provider_configure_rejects_missing_client_auth");
     suite.expect(remoteCandidates.empty(), "tunnel_provider_configure_missing_auth_no_ssh_candidates");
-    suite.expect(failure.equals("tunnelProvider client auth required for gateway dialing"_ctv), "tunnel_provider_configure_missing_auth_failure_reason");
+    suite.expect(failure.equals("mothership tunnel gateway client auth certificate material invalid"_ctv), "tunnel_provider_configure_missing_auth_failure_reason");
 
     MothershipTunnelGatewayAuth ignoredGatewayAuth = {};
     bool authFixture = mothershipGenerateTunnelGatewayAuth(tunnelProvider.clientAuth, ignoredGatewayAuth, &failure);
@@ -1185,8 +1185,8 @@ int main(void)
       provider.artifactSha256 = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv;
       provider.artifactBytes = 128;
       provider.dialEndpoint.snprintf<"127.0.0.1:{itoa}"_ctv>(unsigned(gatewayListener.port));
-      provider.egressHost = "1.1.1.1"_ctv;
-      provider.egressPort = 443;
+      provider.egress.address4 = 0x01010101;
+      provider.egress.port = 443;
       MothershipTunnelGatewayAuth gatewayAuth = {};
       MothershipTunnelGatewayTLSContext gatewayTLS = {};
       bool gatewayTLSReady = mothershipGenerateTunnelGatewayAuth(provider.clientAuth, gatewayAuth, &gatewayFailure) && gatewayTLS.configure(gatewayAuth, &gatewayFailure);

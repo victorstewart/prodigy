@@ -134,8 +134,7 @@ struct MothershipTunnelProviderSpec {
   String artifactSha256;
   uint64_t artifactBytes = 0;
   String dialEndpoint;
-  String egressHost;
-  uint16_t egressPort = 0;
+  SystemContainerEgressPolicy egress;
   MothershipTunnelGatewayClientAuth clientAuth;
 };
 
@@ -145,8 +144,7 @@ static void serialize(S&& serializer, MothershipTunnelProviderSpec& spec)
   serializer.text1b(spec.artifactSha256, 64);
   serializer.value8b(spec.artifactBytes);
   serializer.text1b(spec.dialEndpoint, UINT32_MAX);
-  serializer.text1b(spec.egressHost, UINT32_MAX);
-  serializer.value2b(spec.egressPort);
+  serializer.object(spec.egress);
   serializer.object(spec.clientAuth);
 }
 
@@ -155,8 +153,8 @@ static inline bool operator==(const MothershipTunnelProviderSpec& lhs, const Mot
   return lhs.artifactSha256.equal(rhs.artifactSha256) &&
          lhs.artifactBytes == rhs.artifactBytes &&
          lhs.dialEndpoint.equal(rhs.dialEndpoint) &&
-         lhs.egressHost.equal(rhs.egressHost) &&
-         lhs.egressPort == rhs.egressPort &&
+         lhs.egress.address4 == rhs.egress.address4 &&
+         lhs.egress.port == rhs.egress.port &&
          lhs.clientAuth == rhs.clientAuth;
 }
 

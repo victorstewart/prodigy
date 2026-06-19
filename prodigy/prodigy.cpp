@@ -1048,17 +1048,6 @@ public:
 
     ContainerPlan containerPlan = {};
     containerUUID = Random::generateNumberWithNBits<128, uint128_t>();
-    uint32_t egressAddress = 0;
-    if (prodigySystemEgressPublicIPv4Literal(spec.egressHost, egressAddress) == false || spec.egressPort == 0)
-    {
-      if (failure)
-      {
-        failure->assign("mothership tunnel provider egress endpoint invalid"_ctv);
-      }
-      stopMothershipTunnelProviderRuntime(containerUUID);
-      containerUUID = 0;
-      return false;
-    }
     containerPlan.uuid = containerUUID;
     containerPlan.createdAtMs = Time::now<TimeResolution::ms>();
     containerPlan.restartOnFailure = true;
@@ -1066,8 +1055,7 @@ public:
     containerPlan.system.kind = SystemContainerKind::mothershipTunnelProvider;
     containerPlan.system.artifact.sha256.assign(spec.artifactSha256);
     containerPlan.system.artifact.bytes = spec.artifactBytes;
-    containerPlan.system.egress.address4 = egressAddress;
-    containerPlan.system.egress.port = spec.egressPort;
+    containerPlan.system.egress = spec.egress;
     containerPlan.state = ContainerState::scheduled;
 
     ContainerManager::spinContainer(containerPlan, 0, NeuronContainerMetricPolicy {});
