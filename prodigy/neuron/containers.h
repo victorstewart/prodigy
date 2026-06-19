@@ -32,7 +32,7 @@
 #include <services/memfd.h>
 #include <prodigy/build.identity.h>
 #include <prodigy/container.contract.h>
-#include <prodigy/mothership/mothership.cluster.types.h>
+#include <prodigy/system.container.policy.h>
 #include <prodigy/wire.h>
 #include <prodigy/child.process.signal.h>
 
@@ -608,7 +608,7 @@ public:
     }
 
     uint32_t egressAddress = 0;
-    if (mothershipTunnelProviderEgressIPv4Literal(plan.systemEgressHost, egressAddress) == false)
+    if (prodigySystemEgressIPv4Literal(plan.systemEgressHost, egressAddress) == false)
     {
       if (failureReport)
       {
@@ -616,7 +616,7 @@ public:
       }
       return false;
     }
-    if (mothershipTunnelProviderEgressIPv4HostAddressIsDenied(egressAddress))
+    if (prodigySystemEgressIPv4HostAddressIsDenied(egressAddress))
     {
       if (failureReport)
       {

@@ -8,35 +8,37 @@ compatibility and source-NAT work that the original file requested.
 
 - Base: `aeff7aa7bd99ed41b46ab6ee3ea2a3e5338d0d65` (`origin/main`)
 - Draft feature baseline: `240a63381c344402f757cfa3f14f7875bf1eaf2c`
-- Current branch head: `dff1df27f63161df6bb3daee24d6df15a5c10ebb`
 - Branch: `origin/work/tunnel-provider-runtime-hardcut`
 
 ## Line Counts
 
-Diff scope is `prodigy ebpf switchboard` against `origin/main`.
+Code diff scope is `prodigy ebpf switchboard` against `origin/main`,
+excluding evidence artifacts under `prodigy/docs/tunnel-provider-refactor/*`.
 
 | State | Files | Insertions | Deletions |
 |---|---:|---:|---:|
 | Draft feature baseline | 52 | 7437 | 434 |
-| Current branch | 49 | 5873 | 493 |
-| Refactor delta from draft | 33 | 415 | 2038 |
+| Current branch | 52 | 5864 | 493 |
 
 Category ledger:
 
 | Category | Draft net | Current net | Net removed |
 |---|---:|---:|---:|
-| Production | +4883 | +3311 | 1572 |
+| Production | +4883 | +3302 | 1581 |
 | Tests | +2081 | +2034 | 47 |
 | Docs | +30 | +28 | 2 |
 | Build metadata | +9 | +7 | 2 |
 
 The prior project gate command, which counts Discombobulator test/build changes
-inside the production bucket, reports `production +3860 -461 net +3399`.
+inside the production bucket, reports `production +3851 -461 net +3390`.
+The full diff including evidence artifacts is `60 files, 6249 insertions, 493
+deletions`.
 
 ## Lines Removed By Subsystem
 
 - Provider binary: moved out of product code to `prodigy/dev/tests/mothership_tunnel_provider_fixture.cpp`.
 - Runtime state: deleted generation SHA fingerprinting and derived `running`/`healthy` fields.
+- Schema boundary: removed OpenSSL/auth helpers, egress helpers, runtime policy, and Brain runtime state from `mothership.cluster.types.h`.
 - Network path: deleted source-address-only NAT/reply state and dead IPv6 allowlist plumbing.
 - Parser/compatibility surface: removed enum-qualified JSON compatibility spellings and speculative QUIC/multi-egress surface.
 - Tests: tabled and compressed several tunnel/gateway/system-egress assertions while keeping focused coverage.
@@ -46,7 +48,7 @@ See `LINE_LEDGER.tsv` for per-path numbers.
 ## Surviving Feature-Specific Surface
 
 - `MothershipTunnelProviderSpec`: persisted operator-facing tunnel metadata and client auth.
-- `MothershipTunnelProviderRuntimeState`: local provider UUID plus bounded diagnostic text.
+- Brain-owned anonymous runtime state: local provider UUID plus bounded diagnostic text.
 - `SystemContainerKind::mothershipTunnelProvider`: typed runtime identity for system container launch.
 - `mothership.tunnel.gateway.h`: still contains gateway implementation; it was reduced but remains a large header.
 - `ContainerPlan` system fields: still carries system-container kind/socket/egress data; this is not the full dedicated plan extension requested by the original goal.
@@ -61,6 +63,7 @@ Fixed or hard-cut:
 - No-op runtime state no longer serializes/hashes the spec on every reconcile.
 - Provider health/status no longer carries redundant derived report fields.
 - Tunnel endpoint input is hard-cut to public IPv4 literal TCP.
+- Cluster schema types no longer own certificate parsing/generation, egress policy helpers, runtime policy, or Brain runtime state.
 
 Superseded by later user direction:
 
@@ -115,16 +118,15 @@ Current design removes the source-IP-only NAT path and keeps system-provider egr
 All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 
 - `git diff --check`
-- `cmake --build .run/tunnel-provider-latest --parallel 16 --target prodigy_mothership_unix_connect_unit prodigy_mothership_cluster_registry_unit prodigy_persistent_state_unit prodigy_brain_replication_credentials_unit prodigy_container_overlay_sync_unit prodigy_switchboard_whitehole_unit prodigy_deployments_unit prodigy_mothership_tunnel_provider host_ingress_router container_egress_router`
+- `cmake --build .run/tunnel-provider-latest --parallel 16 --target prodigy_mothership_unix_connect_unit prodigy_mothership_cluster_registry_unit prodigy_persistent_state_unit prodigy_brain_replication_credentials_unit prodigy_container_overlay_sync_unit prodigy_switchboard_whitehole_unit prodigy_deployments_unit prodigy_bundle_artifact_unit prodigy_mothership_tunnel_provider host_ingress_router container_egress_router`
 - `./prodigy_mothership_unix_connect_unit`
 - `./prodigy_mothership_cluster_registry_unit`
 - `./prodigy_persistent_state_unit`
 - `./prodigy_brain_replication_credentials_unit`
 - `./prodigy_deployments_unit`
+- `./prodigy_bundle_artifact_unit`
 - `PRODIGY_DEV_ALLOW_BPF_ATTACH=1 ./prodigy_switchboard_whitehole_unit`
 - `PRODIGY_DEV_ALLOW_BPF_ATTACH=1 ./prodigy_container_overlay_sync_unit`
-- `cmake --build .run/tunnel-provider-latest --parallel 16 --target prodigy_bundle_artifact_unit`
-- `./prodigy_bundle_artifact_unit`
 - `cargo test --all-targets` in `prodigy/discombobulator`
 
 ## Measurements

@@ -9,6 +9,7 @@
 #include <prodigy/mothership/mothership.cluster.reconcile.h>
 #include <prodigy/mothership/mothership.cluster.test.h>
 #include <prodigy/mothership/mothership.provider.credentials.h>
+#include <prodigy/mothership/mothership.tunnel.policy.h>
 #include <prodigy/persistent.state.h>
 
 enum class MothershipClusterSeedMode : uint8_t {

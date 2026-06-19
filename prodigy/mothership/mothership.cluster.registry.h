@@ -10,6 +10,8 @@
 #include <prodigy/mothership/mothership.cluster.reconcile.h>
 #include <prodigy/mothership/mothership.cluster.test.h>
 #include <prodigy/mothership/mothership.cluster.types.h>
+#include <prodigy/mothership/mothership.tunnel.auth.h>
+#include <prodigy/mothership/mothership.tunnel.policy.h>
 
 class MothershipClusterRegistry {
 private:

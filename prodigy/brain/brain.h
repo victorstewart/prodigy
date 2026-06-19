@@ -39,6 +39,8 @@ static inline cppsort::verge_adapter<cppsort::ska_sorter> sorter;
 #include <prodigy/dns.provider.h>
 #include <prodigy/ingress.validation.h>
 #include <prodigy/mothership/mothership.cluster.types.h>
+#include <prodigy/mothership/mothership.tunnel.auth.h>
+#include <prodigy/mothership/mothership.tunnel.policy.h>
 #include <prodigy/routable.address.helpers.h>
 #include <prodigy/remote.bootstrap.h>
 #include <prodigy/brain/timing.knobs.h>
@@ -946,7 +948,10 @@ public:
   bytell_hash_map<uint16_t, uint8_t> nextReservableServiceSlotByApplication;
   MothershipConnectivityRuntimeConfig mothershipConnectivity;
   MothershipTunnelGatewayAuth mothershipTunnelGatewayAuth;
-  MothershipTunnelProviderRuntimeState mothershipTunnelProviderRuntimeState;
+  struct {
+    uint128_t localContainerUUID = 0;
+    String lastFailure;
+  } mothershipTunnelProviderRuntimeState;
   uint16_t nextReservableApplicationID = 1;
   uint64_t nextMintedClientTlsGeneration = 1;
   uint64_t nextTlsResumptionGeneration = 1;
@@ -12820,7 +12825,7 @@ public:
     }
 
     const MothershipTunnelProviderSpec& spec = mothershipConnectivity.tunnelProvider;
-    MothershipTunnelProviderRuntimeState& state = mothershipTunnelProviderRuntimeState;
+    auto& state = mothershipTunnelProviderRuntimeState;
     auto failStopped = [&](auto&& failureText) -> void {
       stopMothershipTunnelProviderLocalInstance();
       state.lastFailure.assign(failureText);

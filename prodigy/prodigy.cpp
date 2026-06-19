@@ -7,6 +7,7 @@
 #include <prodigy/persistent.state.h>
 #include <prodigy/iaas/runtime/runtime.h>
 #include <prodigy/mothership/mothership.tunnel.gateway.h>
+#include <prodigy/mothership/mothership.tunnel.policy.h>
 
 #include <arpa/inet.h>
 #include <algorithm>

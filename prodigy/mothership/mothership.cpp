@@ -38,6 +38,8 @@
 #include <prodigy/mothership/mothership.cluster.registry.h>
 #include <prodigy/mothership/mothership.ssh.h>
 #include <prodigy/mothership/mothership.deployment.plan.helpers.h>
+#include <prodigy/mothership/mothership.tunnel.auth.h>
+#include <prodigy/mothership/mothership.tunnel.policy.h>
 #include <prodigy/mothership/mothership.pricing.command.helpers.h>
 #include <prodigy/mothership/mothership.pricing.h>
 #include <prodigy/mothership/mothership.provider.credentials.h>
@@ -2069,8 +2071,8 @@ static bool parseMothershipConnectivityJSON(simdjson::dom::element value, Mother
       return false;
     }
     uint32_t egressAddress = 0;
-    if (mothershipTunnelProviderEgressIPv4Literal(parsed.tunnelProvider.egressHost, egressAddress) == false ||
-        mothershipTunnelProviderEgressIPv4HostAddressIsDenied(egressAddress))
+    if (prodigySystemEgressIPv4Literal(parsed.tunnelProvider.egressHost, egressAddress) == false ||
+        prodigySystemEgressIPv4HostAddressIsDenied(egressAddress))
     {
       basics_log("%s tunnelProvider egress host must be a public IPv4 literal\n", context);
       return false;

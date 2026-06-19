@@ -18,7 +18,7 @@
 
 #include <openssl/ssl.h>
 
-#include <prodigy/mothership/mothership.cluster.types.h>
+#include <prodigy/mothership/mothership.tunnel.auth.h>
 
 class MothershipTunnelGatewaySessionResult {
 public:

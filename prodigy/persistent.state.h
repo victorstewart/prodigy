@@ -10,6 +10,8 @@
 #include <databases/embedded/tidesdb.h>
 #include <prodigy/bootstrap.config.h>
 #include <prodigy/mothership/mothership.cluster.types.h>
+#include <prodigy/mothership/mothership.tunnel.auth.h>
+#include <prodigy/mothership/mothership.tunnel.policy.h>
 #include <prodigy/runtime.environment.h>
 #include <prodigy/transport.tls.h>
 #include <prodigy/types.h>
