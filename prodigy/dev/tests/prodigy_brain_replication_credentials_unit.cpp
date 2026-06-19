@@ -5031,7 +5031,7 @@ static void testMothershipTunnelProviderStateUploadKillsStaleProvider(TestSuite&
     ContainerPlan plan = {};
     plan.uuid = containerUUID;
     plan.fragment = prodigyMothershipTunnelProviderRuntimeFragment;
-    plan.systemContainerKind = kind;
+    plan.system.kind = kind;
     plan.state = ContainerState::healthy;
     String serializedPlan = {};
     BitseryEngine::serialize(serializedPlan, plan);

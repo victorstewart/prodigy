@@ -12792,7 +12792,7 @@ public:
 
   bool handleUploadedMothershipTunnelProviderContainer(NeuronView *neuron, const ContainerPlan& plan)
   {
-    if (plan.systemContainerKind != SystemContainerKind::mothershipTunnelProvider)
+    if (plan.system.kind != SystemContainerKind::mothershipTunnelProvider)
     {
       return false;
     }

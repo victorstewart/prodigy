@@ -41,6 +41,9 @@
 | `.run/build-egress/prodigy_mothership_cluster_registry_unit` after numeric system-egress plan change | pass |
 | `cmake --build .run/build-egress --target prodigy prodigy_brain_replication_credentials_unit --parallel 16` after deleting the launch artifact blob path | pass |
 | `.run/build-egress/prodigy_brain_replication_credentials_unit` after deleting the launch artifact blob path | pass |
+| `cmake --build .run/build-egress --target prodigy prodigy_brain_replication_credentials_unit prodigy_container_overlay_sync_unit prodigy_persistent_state_unit --parallel 16` after replacing fake app config with `SystemContainerRuntimePlan` | pass |
+| `.run/build-egress/prodigy_persistent_state_unit` after `SystemContainerRuntimePlan` | pass |
+| `.run/build-egress/prodigy_brain_replication_credentials_unit` after `SystemContainerRuntimePlan` | pass |
 
 ## Privileged Tests Run In VM
 
@@ -50,6 +53,7 @@
 | `PRODIGY_DEV_ALLOW_BPF_ATTACH=1 ./prodigy_container_overlay_sync_unit` | pass |
 | `PRODIGY_DEV_ALLOW_BPF_ATTACH=1 .run/build-cgroup/prodigy_container_overlay_sync_unit` after system launch-contract cut | pass |
 | `PRODIGY_DEV_ALLOW_BPF_ATTACH=1 .run/build-egress/prodigy_container_overlay_sync_unit` after numeric system-egress plan change | pass |
+| `PRODIGY_DEV_ALLOW_BPF_ATTACH=1 .run/build-egress/prodigy_container_overlay_sync_unit` after `SystemContainerRuntimePlan` | pass |
 
 ## Privileged Tests Not Run
 
@@ -76,4 +80,5 @@ Reason: the focused VM verification proved the touched unit/BPF paths, but the o
 - Gateway socket/TLS/proxy implementation moved to compiled `.cpp`; public header is declarations only.
 - System-provider egress is carried through `ContainerPlan` as a numeric `SystemContainerEgressPolicy`; Neuron no longer reparses a serialized text host before installing the BPF allowlist.
 - Tunnel-provider launch no longer calls `loadSystemContainerArtifact` or passes an artifact blob through the Brain/Prodigy launch hook.
+- System-provider kind, artifact reference, egress tuple, and fixed runtime resources live in `ContainerPlan::system`; provider launch no longer populates fake stateless-application config fields.
 - Remote branch head matches local head.

@@ -585,7 +585,7 @@ public:
 
   bool isSystemContainer(void) const
   {
-    return plan.systemContainerKind != SystemContainerKind::none;
+    return plan.isSystemContainer();
   }
 
   bool exposesNeuronSocket(void) const
@@ -595,7 +595,7 @@ public:
 
   bool systemEgressConstrained(void) const
   {
-    return isSystemContainer() && plan.systemEgress.configured();
+    return isSystemContainer() && plan.system.egress.configured();
   }
 
   bool syncSystemEgressAllowlist(String *failureReport = nullptr)
@@ -614,9 +614,9 @@ public:
     }
 
     container_egress_allow_key key = {};
-    key.addr = htonl(plan.systemEgress.address4);
+    key.addr = htonl(plan.system.egress.address4);
     key.proto = IPPROTO_TCP;
-    key.port = htons(plan.systemEgress.port);
+    key.port = htons(plan.system.egress.port);
 
     bool ok = false;
     peer_program->openMap("ct_egress_allow"_ctv, [&](int mapFD) -> void {
@@ -1044,7 +1044,7 @@ public:
     killedOnPurpose = true;
 
     killSwitch = new TimeoutPacket();
-    killSwitch->setTimeoutMs(plan.config.sTilKillable * 1000);
+    killSwitch->setTimeoutMs(plan.stopTimeoutSeconds() * 1000);
 
     killSwitch->identifier = plan.uuid;
     killSwitch->flags = uint64_t(NeuronTimeoutFlags::killContainer);
@@ -5241,7 +5241,7 @@ private:
 
   static bool materializeSystemContainerRootFSMounts(Container *container, int rootfd, const String& containerRoot, String *failureReport = nullptr)
   {
-    if (container->plan.systemContainerKind != SystemContainerKind::mothershipTunnelProvider)
+    if (container->plan.system.kind != SystemContainerKind::mothershipTunnelProvider)
     {
       return true;
     }
@@ -6296,7 +6296,7 @@ public:
     Filesystem::openWriteAtClose(middirfd, "cgroup.max.descendants"_ctv, "1"_ctv);
     Filesystem::openWriteAtClose(middirfd, "cgroup.max.depth"_ctv, "1"_ctv);
 
-    if (applicationUsesSharedCPUs(container->plan.config))
+    if (container->plan.usesSharedCPUs())
     {
       uint16_t reservedCores = prodigyContainerReservedCoreCount(thisNeuron->lcoreCount);
       uint16_t firstContainerCore = (reservedCores < thisNeuron->lcoreCount) ? reservedCores : (thisNeuron->lcoreCount - 1);
@@ -6304,7 +6304,7 @@ public:
     }
     else
     {
-      path.snprintf<"{itoa}-{itoa}"_ctv>(container->lcores[0], container->lcores[container->plan.config.nLogicalCores - 1]);
+      path.snprintf<"{itoa}-{itoa}"_ctv>(container->lcores[0], container->lcores[container->plan.logicalCores() - 1]);
     }
     Filesystem::openWriteAtClose(middirfd, "cpuset.cpus"_ctv, path);
 
@@ -6331,7 +6331,7 @@ public:
     maxPids_string.assignItoa(prodigyContainerRuntimeLimits.maxPids);
     Filesystem::openWriteAtClose(middirfd, "pids.max"_ctv, maxPids_string);
 
-    path.snprintf<"{itoa}M"_ctv>(container->plan.config.memoryMB);
+    path.snprintf<"{itoa}M"_ctv>(container->plan.memoryMB());
     Filesystem::openWriteAtClose(middirfd, "memory.low"_ctv, path);
     Filesystem::openWriteAtClose(middirfd, "memory.high"_ctv, path);
 
@@ -6395,7 +6395,7 @@ public:
       {
         container->lcores[span] = index;
 
-        if (++span == container->plan.config.nLogicalCores)
+        if (++span == container->plan.logicalCores())
         {
           return true;
         }
@@ -6413,11 +6413,12 @@ public:
   // neuron still fails closed if its cgroup CPU view or bookkeeping disagrees.
   static bool allocateCores(Container *container)
   {
-    if (container->plan.config.nLogicalCores == 0 || container->plan.config.nLogicalCores > 256 || thisNeuron->lcoreCount <= nReservedCores || container->plan.config.nLogicalCores > thisNeuron->lcoreCount - nReservedCores)
+    uint32_t requestedCores = container->plan.logicalCores();
+    if (requestedCores == 0 || requestedCores > 256 || thisNeuron->lcoreCount <= nReservedCores || requestedCores > thisNeuron->lcoreCount - nReservedCores)
     {
       std::fprintf(stderr,
                    "allocateCores rejected request=%u lcoreCount=%u reserved=%u reason=invalid-request-or-range\n",
-                   unsigned(container->plan.config.nLogicalCores),
+                   unsigned(requestedCores),
                    unsigned(thisNeuron->lcoreCount),
                    unsigned(nReservedCores));
       std::fflush(stderr);
@@ -6450,13 +6451,14 @@ public:
             }
           }
 
-          if (owner == nullptr || owner->plan.config.nLogicalCores == 0 || owner->plan.config.nLogicalCores > 256)
+          uint32_t ownerRequestedCores = owner ? owner->plan.logicalCores() : 0;
+          if (owner == nullptr || ownerRequestedCores == 0 || ownerRequestedCores > 256)
           {
             index++;
             continue;
           }
 
-          uint16_t ownerCores = owner->plan.config.nLogicalCores;
+          uint16_t ownerCores = uint16_t(ownerRequestedCores);
           if (index != holeIndex)
           {
             uint16_t nShift = index - holeIndex;
@@ -6538,7 +6540,7 @@ public:
       {
         std::fprintf(stderr,
                      "allocateCores rejected request=%u lcoreCount=%u reserved=%u reason=no-contiguous-span lcores[0..7]=%u,%u,%u,%u,%u,%u,%u,%u\n",
-                     unsigned(container->plan.config.nLogicalCores),
+                     unsigned(requestedCores),
                      unsigned(thisNeuron->lcoreCount),
                      unsigned(nReservedCores),
                      unsigned(thisNeuron->lcores[0]),
@@ -6554,9 +6556,9 @@ public:
       }
     }
 
-    for (uint16_t index = 0; index < container->plan.config.nLogicalCores; index++)
+    for (uint16_t index = 0; index < requestedCores; index++)
     {
-      thisNeuron->lcores[container->lcores[index]] = container->plan.config.nLogicalCores;
+      thisNeuron->lcores[container->lcores[index]] = requestedCores;
     }
 
     return true;
@@ -6787,9 +6789,9 @@ public:
     }
     container->resourceDeltaMode = Container::ResourceDeltaMode::none;
 
-    if (applicationUsesIsolatedCPUs(container->plan.config))
+    if (container->plan.usesIsolatedCPUs())
     {
-      for (uint16_t index = 0; index < container->plan.config.nLogicalCores; index++)
+      for (uint16_t index = 0; index < container->plan.logicalCores(); index++)
       {
         uint16_t lcore = container->lcores[index];
         if (lcore < thisNeuron->lcoreCount && lcore < 256)
@@ -6856,14 +6858,14 @@ public:
     container->userID = 65'535 * uint32_t(container->plan.fragment);
     container->rBuffer.reserve(8_KB);
     container->wBuffer.reserve(16_KB);
-    if (applicationUsesIsolatedCPUs(container->plan.config))
+    if (container->plan.usesIsolatedCPUs())
     {
       if (allocateCores(container) == false)
       {
         basics_log("createContainer rejected deploymentID=%llu appID=%u reason=insufficient isolated cores requested=%u lcoreCount=%u\n",
                    (unsigned long long)plan.config.deploymentID(),
                    unsigned(plan.config.applicationID),
-                   unsigned(plan.config.nLogicalCores),
+                   unsigned(plan.logicalCores()),
                    unsigned(thisNeuron->lcoreCount));
         delete container;
         container = nullptr;
@@ -6939,7 +6941,7 @@ public:
       artifactKey.assign("system."_ctv);
       artifactKey.append("mothership-tunnel-provider"_ctv);
       artifactKey.append("."_ctv);
-      artifactKey.append(plan.config.containerBlobSHA256);
+      artifactKey.append(plan.system.artifact.sha256);
     }
     else
     {
@@ -7200,7 +7202,7 @@ public:
     String artifactLimitFailure = {};
     if (validateContainerArtifactResourceLimits(
             receivedSubvolumePath,
-            storageBytesForMB(plan.config.filesystemMB),
+            storageBytesForMB(plan.filesystemMB()),
             maxContainerArtifactEntries,
             maxContainerArtifactRegularFileBytes,
             &artifactLimitFailure) == false)
@@ -8035,7 +8037,7 @@ public:
       }
     }
 
-    if (applicationUsesSharedCPUs(container->plan.config))
+    if (container->plan.usesSharedCPUs())
     {
       // Shared CPU mode stays OS-scheduled and must not let the workload pin itself.
       if (denySyscallByName("sched_setaffinity") == false)
@@ -8454,7 +8456,7 @@ public:
       parameters.nLogicalCores = uint16_t(applicationSharedCPUCoreHint(container->plan.config));
       parameters.cpuMode = container->plan.config.cpuMode;
       parameters.requestedCPUMillis = applicationRequestedCPUMillis(container->plan.config);
-      if (applicationUsesIsolatedCPUs(container->plan.config))
+      if (container->plan.usesIsolatedCPUs())
       {
         parameters.lowCPU = container->lcores[0];
         parameters.highCPU = container->lcores[container->plan.config.nLogicalCores - 1];
@@ -8566,15 +8568,15 @@ public:
       unsetenv("_STDBUF_O");
       unsetenv("_STDBUF_E");
 
-      if (container->plan.systemContainerKind == SystemContainerKind::mothershipTunnelProvider)
+      if (container->plan.system.kind == SystemContainerKind::mothershipTunnelProvider)
       {
         String host = {};
-        if (prodigySystemEgressIPv4Text(container->plan.systemEgress.address4, host) == false)
+        if (prodigySystemEgressIPv4Text(container->plan.system.egress.address4, host) == false)
         {
           failStartup("format system egress host failed");
         }
         String port = {};
-        port.assignItoa(container->plan.systemEgress.port);
+        port.assignItoa(container->plan.system.egress.port);
         auto pushSystemEnv = [&](StringType auto&& key, const String& value) {
           String assignment = {};
           assignment.assign(key);
@@ -8772,7 +8774,7 @@ public:
       }
       logStartStage("network-ready");
 
-      if (applicationUsesIsolatedCPUs(container->plan.config))
+      if (container->plan.usesIsolatedCPUs())
       {
         // Apply an explicit affinity mask as a safety backstop even when cgroup
         // constraints are unavailable; this keeps container CPU usage bounded to
@@ -8780,7 +8782,7 @@ public:
         cpu_set_t affinity;
         CPU_ZERO(&affinity);
 
-        uint16_t nAffinityCores = container->plan.config.nLogicalCores;
+        uint16_t nAffinityCores = uint16_t(container->plan.logicalCores());
         for (uint16_t index = 0; index < nAffinityCores; index++)
         {
           uint16_t lcore = container->lcores[index];
@@ -8907,14 +8909,14 @@ public:
     }
 
     uint64_t deploymentID = plan.config.deploymentID();
-    bool systemContainer = plan.systemContainerKind != SystemContainerKind::none;
+    bool systemContainer = plan.isSystemContainer();
     String compressedContainerPath = systemContainer
-        ? ContainerStore::systemPathForArtifact(plan.config.containerBlobSHA256)
+        ? ContainerStore::systemPathForArtifact(plan.system.artifact.sha256)
         : ContainerStore::pathForContainerImage(deploymentID);
     if (systemContainer)
     {
       String systemVerificationFailure = {};
-      if (ContainerStore::systemVerify(plan.config.containerBlobSHA256, plan.config.containerBlobBytes, nullptr, nullptr, &systemVerificationFailure) == false)
+      if (ContainerStore::systemVerify(plan.system.artifact.sha256, plan.system.artifact.bytes, nullptr, nullptr, &systemVerificationFailure) == false)
       {
         if (systemVerificationFailure.size() == 0)
         {
@@ -9231,9 +9233,9 @@ public:
 
     container->destroyCloseCompleted = (waitingForCloseEvent == false);
 
-    if (applicationUsesIsolatedCPUs(container->plan.config))
+    if (container->plan.usesIsolatedCPUs())
     {
-      for (uint16_t index = 0; index < container->plan.config.nLogicalCores; index++)
+      for (uint16_t index = 0; index < container->plan.logicalCores(); index++)
       {
         thisNeuron->lcores[container->lcores[index]] = 0;
       }

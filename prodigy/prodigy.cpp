@@ -1097,21 +1097,18 @@ public:
       return false;
     }
     containerPlan.uuid = containerUUID;
-    containerPlan.config.type = ApplicationType::stateless;
     containerPlan.createdAtMs = Time::now<TimeResolution::ms>();
-    containerPlan.config.versionID = uint64_t(containerPlan.createdAtMs);
-    containerPlan.config.containerBlobSHA256.assign(spec.artifactSha256);
-    containerPlan.config.containerBlobBytes = spec.artifactBytes;
-    containerPlan.config.filesystemMB = 128;
-    containerPlan.config.memoryMB = 128;
-    containerPlan.config.nLogicalCores = 1;
-    containerPlan.config.cpuMode = ApplicationCPUMode::isolated;
-    containerPlan.config.sTilKillable = 30;
     containerPlan.restartOnFailure = true;
     containerPlan.fragment = prodigyMothershipTunnelProviderRuntimeFragment;
-    containerPlan.systemContainerKind = SystemContainerKind::mothershipTunnelProvider;
-    containerPlan.systemEgress.address4 = egressAddress;
-    containerPlan.systemEgress.port = spec.egressPort;
+    containerPlan.system.kind = SystemContainerKind::mothershipTunnelProvider;
+    containerPlan.system.artifact.sha256.assign(spec.artifactSha256);
+    containerPlan.system.artifact.bytes = spec.artifactBytes;
+    containerPlan.system.filesystemMB = 128;
+    containerPlan.system.memoryMB = 128;
+    containerPlan.system.nLogicalCores = 1;
+    containerPlan.system.stopTimeoutSeconds = 30;
+    containerPlan.system.egress.address4 = egressAddress;
+    containerPlan.system.egress.port = spec.egressPort;
     containerPlan.state = ContainerState::scheduled;
 
     ContainerManager::spinContainer(containerPlan, 0, NeuronContainerMetricPolicy {});

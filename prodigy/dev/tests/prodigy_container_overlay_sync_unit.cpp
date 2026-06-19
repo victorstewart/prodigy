@@ -665,9 +665,9 @@ static void testSystemEgressPolicyConstrainsIPv4(TestSuite& suite)
   neuron.private4 = IPAddress("10.8.0.44", false);
 
   Container container = {};
-  container.plan.systemContainerKind = SystemContainerKind::mothershipTunnelProvider;
-  container.plan.systemEgress.address4 = 0x5db8d822u;
-  container.plan.systemEgress.port = 443;
+  container.plan.system.kind = SystemContainerKind::mothershipTunnelProvider;
+  container.plan.system.egress.address4 = 0x5db8d822u;
+  container.plan.system.egress.port = 443;
   container.plan.fragment = 0x4e;
 
   container_network_policy policy = {};

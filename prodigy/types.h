@@ -220,6 +220,30 @@ static void serialize(S&& serializer, SystemContainerArtifactRef& ref)
   serializer.value8b(ref.bytes);
 }
 
+struct SystemContainerRuntimePlan {
+  SystemContainerKind kind = SystemContainerKind::none;
+  SystemContainerArtifactRef artifact;
+  SystemContainerEgressPolicy egress;
+  uint32_t filesystemMB = 0;
+  uint32_t memoryMB = 0;
+  uint16_t nLogicalCores = 0;
+  uint16_t stopTimeoutSeconds = 0;
+
+  bool configured(void) const { return kind != SystemContainerKind::none; }
+};
+
+template <typename S>
+static void serialize(S&& serializer, SystemContainerRuntimePlan& plan)
+{
+  serializer.value1b(plan.kind);
+  serializer.object(plan.artifact);
+  serializer.object(plan.egress);
+  serializer.value4b(plan.filesystemMB);
+  serializer.value4b(plan.memoryMB);
+  serializer.value2b(plan.nLogicalCores);
+  serializer.value2b(plan.stopTimeoutSeconds);
+}
+
 class BrainReconcileStateRequest {
 public:
 
@@ -6830,8 +6854,7 @@ public:
   bool restartOnFailure;
 
   uint8_t fragment;
-  SystemContainerKind systemContainerKind = SystemContainerKind::none;
-  SystemContainerEgressPolicy systemEgress;
+  SystemContainerRuntimePlan system;
   Vector<Wormhole> wormholes;
   Vector<Whitehole> whiteholes;
   bool useHostNetworkNamespace = false;
@@ -7049,6 +7072,14 @@ public:
   {
     state = ContainerState::scheduled;
   }
+
+  bool isSystemContainer(void) const { return system.configured(); }
+  bool usesSharedCPUs(void) const { return isSystemContainer() == false && applicationUsesSharedCPUs(config); }
+  bool usesIsolatedCPUs(void) const { return usesSharedCPUs() == false; }
+  uint32_t logicalCores(void) const { return isSystemContainer() ? system.nLogicalCores : config.nLogicalCores; }
+  uint32_t memoryMB(void) const { return isSystemContainer() ? system.memoryMB : config.memoryMB; }
+  uint32_t filesystemMB(void) const { return isSystemContainer() ? system.filesystemMB : config.filesystemMB; }
+  uint32_t stopTimeoutSeconds(void) const { return isSystemContainer() ? system.stopTimeoutSeconds : config.sTilKillable; }
 };
 
 template <typename S>
@@ -7079,8 +7110,7 @@ static void serialize(S&& serializer, ContainerPlan& plan)
 
   serializer.value1b(plan.restartOnFailure);
   serializer.value1b(plan.fragment);
-  serializer.value1b(plan.systemContainerKind);
-  serializer.object(plan.systemEgress);
+  serializer.object(plan.system);
   serializer.object(plan.wormholes);
   serializer.object(plan.whiteholes);
   serializer.value1b(plan.useHostNetworkNamespace);
