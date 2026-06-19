@@ -5018,10 +5018,11 @@ static void testMothershipTunnelProviderStateUploadKillsStaleProvider(TestSuite&
   machine.neuron.isFixedFile = true;
   machine.neuron.fslot = 23;
 
-  auto uploadProviderPlan = [&](uint128_t containerUUID) {
+  auto uploadProviderPlan = [&](uint128_t containerUUID, SystemContainerKind kind = SystemContainerKind::mothershipTunnelProvider) {
     ContainerPlan plan = {};
     plan.uuid = containerUUID;
     plan.fragment = prodigyMothershipTunnelProviderRuntimeFragment;
+    plan.systemContainerKind = kind;
     plan.state = ContainerState::healthy;
     String serializedPlan = {};
     BitseryEngine::serialize(serializedPlan, plan);
@@ -5065,6 +5066,21 @@ static void testMothershipTunnelProviderStateUploadKillsStaleProvider(TestSuite&
   });
   suite.expect(killFrames == 0, "mothership_tunnel_state_upload_keeps_current_provider");
   suite.expect(brain.containers.contains(uint128_t(0x77070003)) == false && brain.containers.contains(uint128_t(0x77070001)) == false, "mothership_tunnel_state_upload_skips_app_container_index");
+
+  machine.neuron.wBuffer.clear();
+  uploadProviderPlan(0x77070004, SystemContainerKind::none);
+  killFrames = 0;
+  forEachMessageInBuffer(machine.neuron.wBuffer, [&](Message *queued) {
+    if (NeuronTopic(queued->topic) == NeuronTopic::killContainer)
+    {
+      killFrames += 1;
+    }
+  });
+  suite.expect(killFrames == 0, "mothership_tunnel_state_upload_fragment_only_does_not_kill");
+  ContainerPlan fragmentOnlyPlan = {};
+  fragmentOnlyPlan.uuid = 0x77070005;
+  fragmentOnlyPlan.fragment = prodigyMothershipTunnelProviderRuntimeFragment;
+  suite.expect(brain.handleUploadedMothershipTunnelProviderContainer(&machine.neuron, fragmentOnlyPlan) == false, "mothership_tunnel_state_upload_fragment_only_is_not_provider");
 }
 
 static void testClusterReportIncludesMothershipConnectivityStatus(TestSuite& suite)

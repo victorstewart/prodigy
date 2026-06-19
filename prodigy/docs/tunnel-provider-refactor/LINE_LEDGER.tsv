@@ -16,7 +16,7 @@ test	2	2	0	prodigy/dev/tests/prodigy_brain_config_ssh_replication_unit.cpp
 test	2	2	0	prodigy/dev/tests/prodigy_brain_ipv6_topology_unit.cpp
 test	2	2	0	prodigy/dev/tests/prodigy_brain_master_uuid_unit.cpp
 test	2	2	0	prodigy/dev/tests/prodigy_brain_overlay_hosted_ingress_unit.cpp
-test	706	9	697	prodigy/dev/tests/prodigy_brain_replication_credentials_unit.cpp
+test	722	9	713	prodigy/dev/tests/prodigy_brain_replication_credentials_unit.cpp
 test	3	1	2	prodigy/dev/tests/prodigy_brain_topic_fuzz.cpp
 test	107	0	107	prodigy/dev/tests/prodigy_container_overlay_sync_unit.cpp
 test	70	4	66	prodigy/dev/tests/prodigy_deployments_unit.cpp

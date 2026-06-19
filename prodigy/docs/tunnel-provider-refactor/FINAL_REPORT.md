@@ -18,19 +18,19 @@ excluding evidence artifacts under `prodigy/docs/tunnel-provider-refactor/*`.
 | State | Files | Insertions | Deletions |
 |---|---:|---:|---:|
 | Draft feature baseline | 52 | 7437 | 434 |
-| Current branch | 55 | 5724 | 526 |
+| Current branch | 55 | 5740 | 526 |
 
 Category ledger:
 
 | Category | Draft net | Current net | Net removed |
 |---|---:|---:|---:|
 | Production | +4883 | +3198 | 1685 |
-| Tests | +2081 | +1965 | 116 |
+| Tests | +2081 | +1981 | 100 |
 | Docs | +30 | +28 | 2 |
 | Build metadata | +9 | +7 | 2 |
 
 The current project gate command, excluding evidence artifacts, reports
-`+5724 -526 net +5198` across 55 files. The full diff including evidence
+`+5740 -526 net +5214` across 55 files. The full diff including evidence
 artifacts is intentionally larger because this report and ledger are tracked.
 
 ## Lines Removed By Subsystem
@@ -65,6 +65,7 @@ Fixed or hard-cut:
 - Running-provider reconcile/report returns before artifact presence/load work; focused counters cover this path.
 - Provider health/status no longer carries redundant derived report fields.
 - Provider failure no longer disables a generation by matching a diagnostic string prefix; it enters explicit backoff and can retry.
+- Uploaded provider state is intercepted by `SystemContainerKind::mothershipTunnelProvider`, not by the reserved fragment alone.
 - Tunnel endpoint input is hard-cut to public IPv4 literal TCP.
 - Cluster schema types no longer own certificate parsing/generation, egress policy helpers, runtime policy, or Brain runtime state.
 - Tunnel desired state is folded into `ProdigyMasterAuthorityRuntimeState`; the old dedicated Brain topic and persistent record are deleted.
@@ -128,6 +129,9 @@ All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 - `cmake --build .run/phase-runtime --target prodigy mothership prodigy_brain_replication_credentials_unit prodigy_brain_topic_fuzz -j16`
 - `./prodigy_brain_replication_credentials_unit`
 - `./prodigy_brain_topic_fuzz -runs=100000`
+- `cmake --build .run/phase-runtime --target prodigy_brain_replication_credentials_unit -j16`
+- `./prodigy_brain_replication_credentials_unit`
+- `cmake --build .run/phase-runtime --target prodigy -j16`
 
 Earlier validation on the same branch also covered the broader build/test matrix:
 cluster registry, deployments, bundle artifact, BPF attach units, host/container
