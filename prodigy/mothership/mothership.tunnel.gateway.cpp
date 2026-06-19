@@ -12,6 +12,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -259,6 +260,16 @@ bool mothershipTunnelGatewayOpenUnixControlSocket(const String& socketPath, int&
   return mothershipTunnelGatewayOk(failure);
 }
 
+static bool mothershipTunnelGatewaySetTimeout(int fd, int timeoutMs, String *failure = nullptr)
+{
+  timeval timeout = {timeoutMs / 1000, (timeoutMs % 1000) * 1000};
+  if (::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0 && ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0)
+  {
+    return true;
+  }
+  return mothershipTunnelGatewayFailErrno(failure, "mothership tunnel gateway socket timeout setup failed"_ctv);
+}
+
 static bool mothershipTunnelGatewayWriteAllFD(int fd, const uint8_t *buffer, size_t bytes, String *failure = nullptr)
 {
   while (bytes > 0)
@@ -302,7 +313,7 @@ static bool mothershipTunnelGatewayWriteAllTLS(SSL *tls, const uint8_t *buffer, 
   return mothershipTunnelGatewayOk(failure);
 }
 
-static bool mothershipTunnelGatewayProxyLoop(SSL *tls, int tlsFD, int controlFD, String *failure = nullptr)
+static bool mothershipTunnelGatewayProxyLoop(SSL *tls, int tlsFD, int controlFD, int idleTimeoutMs, String *failure = nullptr)
 {
   uint8_t buffer[16 * 1024];
   for (;;)
@@ -313,7 +324,11 @@ static bool mothershipTunnelGatewayProxyLoop(SSL *tls, int tlsFD, int controlFD,
     descriptors[1].fd = controlFD;
     descriptors[1].events = POLLIN;
 
-    int ready = ::poll(descriptors, 2, -1);
+    int ready = ::poll(descriptors, 2, idleTimeoutMs);
+    if (ready == 0)
+    {
+      return mothershipTunnelGatewayFail(failure, "mothership tunnel gateway proxy idle timeout"_ctv);
+    }
     if (ready < 0)
     {
       if (errno == EINTR)
@@ -386,7 +401,8 @@ bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
     const String& controlSocketPath,
     const MothershipTunnelGatewayTLSContext& tlsContext,
     MothershipTunnelGatewaySessionResult *sessionResult,
-    String *failure)
+    String *failure,
+    int idleTimeoutMs)
 {
   MothershipTunnelGatewaySessionResult result = {};
   mothershipTunnelGatewayPublishSessionResult(sessionResult, result);
@@ -402,6 +418,12 @@ bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
   if (tlsContext.configured() == false)
   {
     return fail("mothership tunnel gateway TLS context missing"_ctv);
+  }
+  idleTimeoutMs = std::max(idleTimeoutMs, 1);
+  if (mothershipTunnelGatewaySetTimeout(streamFD, idleTimeoutMs, failure) == false)
+  {
+    mothershipTunnelGatewayPublishSessionResult(sessionResult, result);
+    return false;
   }
   std::unique_ptr<SSL, decltype(&SSL_free)> tls(nullptr, SSL_free);
   std::unique_ptr<X509, decltype(&X509_free)> clientCert(nullptr, X509_free);
@@ -430,8 +452,14 @@ bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
     mothershipTunnelGatewayPublishSessionResult(sessionResult, result);
     return false;
   }
+  if (mothershipTunnelGatewaySetTimeout(controlFD, idleTimeoutMs, failure) == false)
+  {
+    closeControl();
+    mothershipTunnelGatewayPublishSessionResult(sessionResult, result);
+    return false;
+  }
   result.openedControlSocket = true;
-  bool ok = mothershipTunnelGatewayProxyLoop(tls.get(), streamFD, controlFD, failure);
+  bool ok = mothershipTunnelGatewayProxyLoop(tls.get(), streamFD, controlFD, idleTimeoutMs, failure);
   closeControl();
   mothershipTunnelGatewayPublishSessionResult(sessionResult, result);
   return ok ? mothershipTunnelGatewayOk(failure) : false;

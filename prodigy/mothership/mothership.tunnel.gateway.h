@@ -68,4 +68,5 @@ bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
     const String& controlSocketPath,
     const MothershipTunnelGatewayTLSContext& tlsContext,
     MothershipTunnelGatewaySessionResult *sessionResult = nullptr,
-    String *failure = nullptr);
+    String *failure = nullptr,
+    int idleTimeoutMs = 120'000);

@@ -87,6 +87,7 @@ Fixed or hard-cut:
 - Tunnel-provider launch no longer loads the full system artifact into a `String` or passes artifact bytes through the Brain/Prodigy launch hook.
 - Tunnel-provider launch no longer populates `ApplicationConfig` type/version/artifact/resource fields for the system container; Neuron consumes `ContainerPlan::system` for system artifact verification, extraction limits, cgroups, kill timeout, and egress.
 - System artifact presence/verification no longer allocates a full artifact blob just to validate the contract header; full blob reads remain only for explicit artifact transfer/load paths.
+- Gateway proxy sessions set socket receive/send timeouts and enforce a bounded idle poll timeout; focused coverage proves an authenticated idle session closes only after the guarded control socket opens.
 
 Superseded by later user direction:
 
@@ -95,7 +96,7 @@ Superseded by later user direction:
 
 Still open relative to the original goal:
 
-- Gateway I/O remains blocking-oriented; implementation is compiled but not a full nonblocking deadline/backpressure/half-close state machine.
+- Gateway I/O is bounded by socket and idle timeouts, but is not a full nonblocking backpressure/half-close state machine.
 - Artifact envelope is integrity/type declaration, not signed trusted provenance.
 - Dedicated system-container plan extension is incomplete; the remaining mutable surface is the required egress tuple.
 - Full rolling-upgrade protocol gating is not implemented.
@@ -158,6 +159,7 @@ All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 - After deleting the provider launch artifact blob path in the same fresh VM worktree: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-egress/prodigy_brain_replication_credentials_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test and after the focused unit.
 - After replacing provider fake app config with `SystemContainerRuntimePlan`: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_brain_replication_credentials_unit prodigy_container_overlay_sync_unit prodigy_persistent_state_unit --parallel 16`; `.run/build-egress/prodigy_persistent_state_unit`; `.run/build-egress/prodigy_brain_replication_credentials_unit`; `PRODIGY_DEV_ALLOW_BPF_ATTACH=1 .run/build-egress/prodigy_container_overlay_sync_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test and after the focused units.
 - After bounding system artifact header verification: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_deployments_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-egress/prodigy_deployments_unit`; `.run/build-egress/prodigy_brain_replication_credentials_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test and after the focused units.
+- After bounding gateway proxy socket/idle waits: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_mothership_unix_connect_unit --parallel 16`; `.run/build-egress/prodigy_mothership_unix_connect_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test.
 
 Earlier validation on the same branch also covered the broader build/test matrix:
 cluster registry, deployments, bundle artifact, BPF attach units, host/container
@@ -187,5 +189,5 @@ Not measured: clean build wall time, incremental cluster-type fanout, gateway th
 - Full original definition of done is not met.
 - Runtime health now has an explicit phase enum and TTL aging; jittered timer-driven retry remains incomplete.
 - Control-plane activation is one Mothership configure request plus artifact-first Brain replication and a master-authority desired-state transition.
-- Gateway I/O/deadline/backpressure behavior is covered by focused tests but not a full nonblocking state-machine proof.
+- Gateway I/O/deadline behavior is covered by focused tests; backpressure and half-close behavior are not a full nonblocking state-machine proof.
 - Artifact provenance remains weaker than the signed-envelope design requested in the original goal.

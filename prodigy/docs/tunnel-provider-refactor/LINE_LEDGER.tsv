@@ -22,7 +22,7 @@ test	107	0	107	prodigy/dev/tests/prodigy_container_overlay_sync_unit.cpp
 test	70	4	66	prodigy/dev/tests/prodigy_deployments_unit.cpp
 test	130	1	129	prodigy/dev/tests/prodigy_mothership_cluster_registry_unit.cpp
 test	2	1	1	prodigy/dev/tests/prodigy_mothership_topic_fuzz.cpp
-test	578	4	574	prodigy/dev/tests/prodigy_mothership_unix_connect_unit.cpp
+test	621	4	617	prodigy/dev/tests/prodigy_mothership_unix_connect_unit.cpp
 test	33	2	31	prodigy/dev/tests/prodigy_persistent_state_unit.cpp
 test	5	5	0	prodigy/dev/tests/prodigy_switchboard_whitehole_unit.cpp
 production	17	11	6	prodigy/discombobulator/src/build.rs
@@ -40,8 +40,8 @@ production	89	4	85	prodigy/mothership/mothership.cluster.registry.h
 production	21	0	21	prodigy/mothership/mothership.cluster.types.h
 production	638	45	593	prodigy/mothership/mothership.cpp
 production	298	0	298	prodigy/mothership/mothership.tunnel.auth.h
-production	555	0	555	prodigy/mothership/mothership.tunnel.gateway.cpp
-production	71	0	71	prodigy/mothership/mothership.tunnel.gateway.h
+production	583	0	583	prodigy/mothership/mothership.tunnel.gateway.cpp
+production	72	0	72	prodigy/mothership/mothership.tunnel.gateway.h
 production	116	0	116	prodigy/mothership/mothership.tunnel.policy.h
 production	1	0	1	prodigy/neuron/base.h
 production	374	158	216	prodigy/neuron/containers.h

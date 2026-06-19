@@ -1275,6 +1275,49 @@ int main(void)
                        "tunnel_gateway_peer_cgroup_mismatch_rejected");
         }
 
+        {
+          ScopedUnixListener idleControl = {};
+          bool idleControlReady = createUnixListener(idleControl, gatewayFailure);
+          suite.expect(idleControlReady, "tunnel_gateway_idle_control_listener_created");
+          if (idleControlReady)
+          {
+            MothershipTunnelGatewaySessionResult idleResult = {};
+            String idleFailure = {};
+            bool idleProxy = true;
+            std::thread idleGatewayThread([&]() {
+              int gatewayFD = ::accept(gatewayListener.fd, nullptr, nullptr);
+              if (gatewayFD < 0)
+              {
+                idleFailure.snprintf<"gateway idle accept failed: {}"_ctv>(String(std::strerror(errno)));
+                return;
+              }
+              idleProxy = mothershipTunnelGatewayProxyAuthenticatedControlStream(gatewayFD, idleControl.path, gatewayTLS, &idleResult, &idleFailure, 100);
+              (void)::shutdown(gatewayFD, SHUT_RDWR);
+              ::close(gatewayFD);
+            });
+
+            MothershipSocket idleSocket = {};
+            bool idleConnected = idleSocket.configureCluster(gatewayCluster, &failure) && idleSocket.connect() == 0;
+            suite.expect(idleConnected, "tunnel_gateway_idle_client_connects");
+            if (idleConnected)
+            {
+              std::this_thread::sleep_for(std::chrono::milliseconds(500));
+              idleSocket.close();
+            }
+            else
+            {
+              int unblockFD = -1;
+              if (mothershipOpenConnectedSocket("127.0.0.1"_ctv, gatewayListener.port, unblockFD))
+              {
+                ::close(unblockFD);
+              }
+            }
+            idleGatewayThread.join();
+            suite.expect(idleProxy == false && idleResult.authenticated && idleResult.openedControlSocket, "tunnel_gateway_idle_timeout_closes_authenticated_session");
+            suite.expect(idleFailure.equal("mothership tunnel gateway proxy idle timeout"_ctv), "tunnel_gateway_idle_timeout_failure_reason");
+          }
+        }
+
         MothershipTunnelGatewaySessionResult gatewayResult = {};
         ControlServerState gatewayControlState = {};
         String gatewayControlFailure = {};

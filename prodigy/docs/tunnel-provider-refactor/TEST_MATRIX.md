@@ -47,6 +47,8 @@
 | `cmake --build .run/build-egress --target prodigy prodigy_deployments_unit prodigy_brain_replication_credentials_unit --parallel 16` after bounding system artifact header verification | pass |
 | `.run/build-egress/prodigy_deployments_unit` after bounding system artifact header verification | pass |
 | `.run/build-egress/prodigy_brain_replication_credentials_unit` after bounding system artifact header verification | pass |
+| `cmake --build .run/build-egress --target prodigy prodigy_mothership_unix_connect_unit --parallel 16` after bounding gateway proxy socket/idle waits | pass |
+| `.run/build-egress/prodigy_mothership_unix_connect_unit` after bounding gateway proxy socket/idle waits | pass |
 
 ## Privileged Tests Run In VM
 
@@ -85,4 +87,5 @@ Reason: the focused VM verification proved the touched unit/BPF paths, but the o
 - Tunnel-provider launch no longer calls `loadSystemContainerArtifact` or passes an artifact blob through the Brain/Prodigy launch hook.
 - System-provider kind, artifact reference, egress tuple, and fixed runtime resources live in `ContainerPlan::system`; provider launch no longer populates fake stateless-application config fields.
 - `ContainerStore::systemVerify` reads only the fixed contract header after digest/size verification instead of loading the full artifact for header validation.
+- Gateway proxy sessions apply socket receive/send timeouts and an idle poll timeout; focused coverage proves authenticated idle sessions close after the control socket opens.
 - Remote branch head matches local head.
