@@ -4355,17 +4355,10 @@ private:
       return fail("tunnelProvider gateway TLS material invalid"_ctv);
     }
 
-    X509_STORE *store = SSL_CTX_get_cert_store(context.get());
-    if (store == nullptr || X509_STORE_add_cert(store, rootCert.get()) != 1 ||
-        SSL_CTX_use_certificate(context.get(), clientCert.get()) != 1 ||
-        SSL_CTX_use_PrivateKey(context.get(), clientKey.get()) != 1 ||
-        SSL_CTX_check_private_key(context.get()) != 1 ||
-        SSL_CTX_set_min_proto_version(context.get(), TLS1_3_VERSION) != 1 ||
-        SSL_CTX_set_ciphersuites(context.get(), "TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256") != 1)
+    if (mothershipTunnelTLSUseCertificate(context.get(), rootCert.get(), clientCert.get(), clientKey.get(), SSL_VERIFY_PEER) == false)
     {
       return fail("tunnelProvider gateway TLS context setup failed"_ctv);
     }
-    SSL_CTX_set_verify(context.get(), SSL_VERIFY_PEER, nullptr);
 
     tls.reset(SSL_new(context.get()));
     if (tls == nullptr || SSL_set_fd(tls.get(), fd) != 1)

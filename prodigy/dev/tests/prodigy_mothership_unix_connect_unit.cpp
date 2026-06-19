@@ -1187,9 +1187,10 @@ int main(void)
       provider.egressHost = "1.1.1.1"_ctv;
       provider.egressPort = 443;
       MothershipTunnelGatewayAuth gatewayAuth = {};
-      bool gatewayAuthReady = mothershipGenerateTunnelGatewayAuth(provider.clientAuth, gatewayAuth, &gatewayFailure);
-      suite.expect(gatewayAuthReady, "tunnel_gateway_tls_auth_fixture_created");
-      if (gatewayAuthReady)
+      MothershipTunnelGatewayTLSContext gatewayTLS = {};
+      bool gatewayTLSReady = mothershipGenerateTunnelGatewayAuth(provider.clientAuth, gatewayAuth, &gatewayFailure) && gatewayTLS.configure(gatewayAuth, &gatewayFailure);
+      suite.expect(gatewayTLSReady, "tunnel_gateway_tls_auth_fixture_created");
+      if (gatewayTLSReady)
       {
         {
           ScopedUnixListener rejectedControl = {};
@@ -1219,7 +1220,7 @@ int main(void)
                 std::thread rejectedThread([&]() {
                   int rejectedFD = -1;
                   rejectedProxy = mothershipTunnelGatewayAcceptUnixStream(rejectedGateway.fd, rejectedFD, &rejectedFailure) &&
-                      mothershipTunnelGatewayProxyAuthenticatedControlStream(rejectedFD, rejectedControl.path, gatewayAuth, &rejectedResult, &rejectedFailure);
+                      mothershipTunnelGatewayProxyAuthenticatedControlStream(rejectedFD, rejectedControl.path, gatewayTLS, &rejectedResult, &rejectedFailure);
                   if (rejectedFD >= 0)
                   {
                     (void)::shutdown(rejectedFD, SHUT_RDWR);
@@ -1305,7 +1306,7 @@ int main(void)
           bool proxied = mothershipTunnelGatewayProxyAuthenticatedControlStream(
               gatewayFD,
               gatewayControl.path,
-              gatewayAuth,
+              gatewayTLS,
               &gatewayResult,
               &gatewayProxyFailure);
           (void)::shutdown(gatewayFD, SHUT_RDWR);

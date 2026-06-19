@@ -18,19 +18,19 @@ excluding evidence artifacts under `prodigy/docs/tunnel-provider-refactor/*`.
 | State | Files | Insertions | Deletions |
 |---|---:|---:|---:|
 | Draft feature baseline | 52 | 7437 | 434 |
-| Current branch | 55 | 5852 | 538 |
+| Current branch | 55 | 5880 | 538 |
 
 Category ledger:
 
 | Category | Draft net | Current net | Net removed |
 |---|---:|---:|---:|
-| Production | +4883 | +3283 | 1600 |
-| Tests | +2081 | +1996 | 85 |
+| Production | +4883 | +3306 | 1577 |
+| Tests | +2081 | +2001 | 80 |
 | Docs | +30 | +28 | 2 |
 | Build metadata | +9 | +7 | 2 |
 
 The current project gate command, excluding evidence artifacts, reports
-`+5852 -538 net +5314` across 55 files. The full diff including evidence
+`+5880 -538 net +5342` across 55 files. The full diff including evidence
 artifacts is intentionally larger because this report and ledger are tracked.
 
 ## Lines Removed By Subsystem
@@ -43,6 +43,7 @@ artifacts is intentionally larger because this report and ledger are tracked.
 - Parser/compatibility surface: removed enum-qualified JSON compatibility spellings and speculative QUIC/multi-egress surface.
 - Tests: tabled and compressed several tunnel/gateway/system-egress assertions while keeping focused coverage.
 - Runtime phase: replaced diagnostic-prefix control flow with explicit `TunnelProviderPhase` transitions and bounded retry state.
+- Gateway TLS: moved server context construction to gateway start and shared the client/server SSL_CTX certificate setup helper.
 
 See `LINE_LEDGER.tsv` for per-path numbers.
 
@@ -51,7 +52,7 @@ See `LINE_LEDGER.tsv` for per-path numbers.
 - `MothershipTunnelProviderSpec`: persisted operator-facing tunnel metadata and client auth.
 - Brain-owned anonymous runtime state: phase, local provider UUID, retry count/deadline, and bounded diagnostic text.
 - `SystemContainerKind::mothershipTunnelProvider`: typed runtime identity for system container launch.
-- `mothership.tunnel.gateway.h`: still contains gateway implementation; it was reduced but remains a large header.
+- `mothership.tunnel.gateway.h`: still contains gateway implementation; it now consumes a cached TLS context but remains a large header.
 - `ContainerPlan` system fields: still carries system-container kind/socket/egress data; this is not the full dedicated plan extension requested by the original goal.
 - Brain still has separate artifact-byte transport because followers must receive artifact bytes before activating the desired state carried in `ProdigyMasterAuthorityRuntimeState`.
 
@@ -68,6 +69,7 @@ Fixed or hard-cut:
 - Provider health now ages out after a bounded control-session TTL instead of staying healthy forever after one session.
 - Uploaded provider state is intercepted by `SystemContainerKind::mothershipTunnelProvider`, not by the reserved fragment alone.
 - Gateway accept now starts only after the launched provider cgroup is known, and each Unix peer must match the provider UID plus that exact cgroup before TLS/control proxying.
+- Gateway TLS server context is configured once at gateway start instead of reparsing root/server PEM and round-tripping peer certificates on every accepted session.
 - Tunnel endpoint input is hard-cut to public IPv4 literal TCP.
 - Cluster schema types no longer own certificate parsing/generation, egress policy helpers, runtime policy, or Brain runtime state.
 - Tunnel desired state is folded into `ProdigyMasterAuthorityRuntimeState`; the old dedicated Brain topic and persistent record are deleted.
@@ -134,6 +136,7 @@ All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 - Repeated `cmake --build .run/phase-runtime --target prodigy_brain_replication_credentials_unit -j16`, `./prodigy_brain_replication_credentials_unit`, and `cmake --build .run/phase-runtime --target prodigy -j16` after the system-kind upload identity and health-aging slices.
 - In fresh VM worktree `/work/prodigy-verify-cgroup-9YBkT2` at `e24d08e` plus the cgroup-gateway patch: `git diff --check`; `cmake -S prodigy/dev -B .run/build-cgroup -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++`; `cmake --build .run/build-cgroup --target prodigy mothership prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-cgroup/prodigy_mothership_unix_connect_unit`; `.run/build-cgroup/prodigy_brain_replication_credentials_unit`.
 - After replacing manual cgroup file syscalls with the existing bounded file-read helper in the same VM worktree: `git diff --check`; incremental `cmake --build .run/build-cgroup --target prodigy mothership prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-cgroup/prodigy_mothership_unix_connect_unit`; `.run/build-cgroup/prodigy_brain_replication_credentials_unit`.
+- After caching gateway TLS context and consolidating client/server SSL_CTX certificate setup in the same VM worktree: `git diff --check`; incremental `cmake --build .run/build-cgroup --target prodigy mothership prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-cgroup/prodigy_mothership_unix_connect_unit`; `.run/build-cgroup/prodigy_brain_replication_credentials_unit`.
 
 Earlier validation on the same branch also covered the broader build/test matrix:
 cluster registry, deployments, bundle artifact, BPF attach units, host/container

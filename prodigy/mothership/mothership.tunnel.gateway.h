@@ -457,7 +457,7 @@ static inline bool mothershipTunnelGatewayProxyLoop(SSL *tls, int tlsFD, int con
 static inline bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
     int streamFD,
     const String& controlSocketPath,
-    const MothershipTunnelGatewayAuth& auth,
+    const MothershipTunnelGatewayTLSContext& tlsContext,
     MothershipTunnelGatewaySessionResult *sessionResult = nullptr,
     String *failure = nullptr)
 {
@@ -482,17 +482,13 @@ static inline bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
   {
     return fail("mothership tunnel gateway stream fd required"_ctv);
   }
-  if (mothershipTunnelGatewayAuthMaterialValid(auth, failure) == false)
+  if (tlsContext.configured() == false)
   {
-    return false;
+    return fail("mothership tunnel gateway TLS context missing"_ctv);
   }
 
-  std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> context(nullptr, SSL_CTX_free);
   std::unique_ptr<SSL, decltype(&SSL_free)> tls(nullptr, SSL_free);
-  std::unique_ptr<X509, decltype(&X509_free)> root(nullptr, X509_free);
-  std::unique_ptr<X509, decltype(&X509_free)> serverCert(nullptr, X509_free);
   std::unique_ptr<X509, decltype(&X509_free)> clientCert(nullptr, X509_free);
-  std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> serverKey(nullptr, EVP_PKEY_free);
   int controlFD = -1;
   auto closeControl = [&]() {
     if (controlFD >= 0)
@@ -502,33 +498,14 @@ static inline bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
     }
   };
 
-  root.reset(VaultPem::x509FromPem(auth.rootCertPem));
-  serverCert.reset(VaultPem::x509FromPem(auth.serverCertPem));
-  serverKey.reset(VaultPem::privateKeyFromPem(auth.serverKeyPem));
-  context.reset(SSL_CTX_new(TLS_server_method()));
-  X509_STORE *store = context ? SSL_CTX_get_cert_store(context.get()) : nullptr;
-  if (root == nullptr || serverCert == nullptr || serverKey == nullptr || store == nullptr ||
-      X509_STORE_add_cert(store, root.get()) != 1 ||
-      SSL_CTX_use_certificate(context.get(), serverCert.get()) != 1 ||
-      SSL_CTX_use_PrivateKey(context.get(), serverKey.get()) != 1 ||
-      SSL_CTX_check_private_key(context.get()) != 1 ||
-      SSL_CTX_set_min_proto_version(context.get(), TLS1_3_VERSION) != 1 ||
-      SSL_CTX_set_ciphersuites(context.get(), "TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256") != 1)
-  {
-    return fail("mothership tunnel gateway TLS context setup failed"_ctv);
-  }
-  SSL_CTX_set_verify(context.get(), SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
-
-  tls.reset(SSL_new(context.get()));
+  tls.reset(SSL_new(tlsContext.context.get()));
   if (tls == nullptr || SSL_set_fd(tls.get(), streamFD) != 1 || SSL_accept(tls.get()) != 1 || SSL_get_verify_result(tls.get()) != X509_V_OK)
   {
     return fail("mothership tunnel gateway TLS accept failed"_ctv);
   }
 
   clientCert.reset(SSL_get1_peer_certificate(tls.get()));
-  String clientCertPem = {};
-  if (VaultPem::x509ToPem(clientCert.get(), clientCertPem) == false ||
-      mothershipTunnelGatewayAuthorizeClientCertificate(auth, clientCertPem, failure) == false)
+  if (tlsContext.authorizeClientCertificate(clientCert.get(), failure) == false)
   {
     if (sessionResult)
     {

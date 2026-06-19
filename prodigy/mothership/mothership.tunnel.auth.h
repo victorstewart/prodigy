@@ -2,6 +2,7 @@
 
 #include <memory>
 
+#include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 #include <openssl/x509_vfy.h>
 
@@ -28,6 +29,23 @@ static inline bool mothershipTunnelAuthOk(String *failure)
   {
     failure->clear();
   }
+  return true;
+}
+
+static inline bool mothershipTunnelTLSUseCertificate(SSL_CTX *context, X509 *rootCert, X509 *leafCert, EVP_PKEY *leafKey, int verifyMode)
+{
+  X509_STORE *store = context ? SSL_CTX_get_cert_store(context) : nullptr;
+  if (store == nullptr || rootCert == nullptr || leafCert == nullptr || leafKey == nullptr ||
+      X509_STORE_add_cert(store, rootCert) != 1 ||
+      SSL_CTX_use_certificate(context, leafCert) != 1 ||
+      SSL_CTX_use_PrivateKey(context, leafKey) != 1 ||
+      SSL_CTX_check_private_key(context) != 1 ||
+      SSL_CTX_set_min_proto_version(context, TLS1_3_VERSION) != 1 ||
+      SSL_CTX_set_ciphersuites(context, "TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256") != 1)
+  {
+    return false;
+  }
+  SSL_CTX_set_verify(context, verifyMode, nullptr);
   return true;
 }
 
@@ -100,24 +118,55 @@ static inline bool mothershipTunnelGatewayAuthMaterialValid(const MothershipTunn
   return mothershipTunnelAuthOk(failure);
 }
 
-static inline bool mothershipTunnelGatewayAuthorizeClientCertificate(const MothershipTunnelGatewayAuth& auth, const String& presentedClientCertPem, String *failure = nullptr)
-{
-  if (mothershipTunnelGatewayAuthMaterialValid(auth, failure) == false)
+class MothershipTunnelGatewayTLSContext {
+public:
+
+  std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> context{nullptr, SSL_CTX_free};
+  MothershipTunnelX509Ptr root{nullptr, X509_free};
+  MothershipTunnelPKeyPtr rootPublicKey{nullptr, EVP_PKEY_free};
+
+  bool configure(const MothershipTunnelGatewayAuth& auth, String *failure = nullptr)
   {
-    return false;
+    context.reset();
+    root.reset(VaultPem::x509FromPem(auth.rootCertPem));
+    rootPublicKey.reset(root ? X509_get_pubkey(root.get()) : nullptr);
+    MothershipTunnelX509Ptr serverCert(VaultPem::x509FromPem(auth.serverCertPem), X509_free);
+    MothershipTunnelPKeyPtr serverKey(VaultPem::privateKeyFromPem(auth.serverKeyPem), EVP_PKEY_free);
+
+    auto fail = [&](auto&& text) -> bool {
+      context.reset();
+      root.reset();
+      rootPublicKey.reset();
+      return mothershipTunnelAuthFail(failure, text);
+    };
+    if (auth.configured() == false || mothershipTunnelGatewayLeafKeyMatches(root.get(), rootPublicKey.get(), serverCert.get(), serverKey.get(), NID_server_auth) == false)
+    {
+      return fail("mothership tunnel gateway auth certificate material invalid"_ctv);
+    }
+
+    context.reset(SSL_CTX_new(TLS_server_method()));
+    if (mothershipTunnelTLSUseCertificate(context.get(), root.get(), serverCert.get(), serverKey.get(), SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT) == false)
+    {
+      return fail("mothership tunnel gateway TLS context setup failed"_ctv);
+    }
+    return mothershipTunnelAuthOk(failure);
   }
 
-  MothershipTunnelX509Ptr rootCert(VaultPem::x509FromPem(auth.rootCertPem), X509_free);
-  MothershipTunnelX509Ptr clientCert(VaultPem::x509FromPem(presentedClientCertPem), X509_free);
-  MothershipTunnelPKeyPtr rootPublicKey(rootCert ? X509_get_pubkey(rootCert.get()) : nullptr, EVP_PKEY_free);
-  bool validClient = mothershipTunnelGatewayLeafIssuedByRoot(rootCert.get(), rootPublicKey.get(), clientCert.get()) && mothershipTunnelGatewayLeafHasExtendedKeyUsage(clientCert.get(), NID_client_auth);
-
-  if (validClient == false)
+  bool configured(void) const
   {
-    return mothershipTunnelAuthFail(failure, "mothership tunnel gateway client certificate invalid"_ctv);
+    return context != nullptr && root != nullptr && rootPublicKey != nullptr;
   }
-  return mothershipTunnelAuthOk(failure);
-}
+
+  bool authorizeClientCertificate(X509 *clientCert, String *failure = nullptr) const
+  {
+    if (mothershipTunnelGatewayLeafIssuedByRoot(root.get(), rootPublicKey.get(), clientCert) == false ||
+        mothershipTunnelGatewayLeafHasExtendedKeyUsage(clientCert, NID_client_auth) == false)
+    {
+      return mothershipTunnelAuthFail(failure, "mothership tunnel gateway client certificate invalid"_ctv);
+    }
+    return mothershipTunnelAuthOk(failure);
+  }
+};
 
 static inline bool mothershipIssueTunnelGatewayLeaf(
     const String& rootCertPem,

@@ -1069,11 +1069,15 @@ public:
 
     int listenerFD = mothershipTunnelGatewayListener.fd;
     String controlSocketPath = mothershipUnixSocketPath;
-    MothershipTunnelGatewayAuth gatewayAuthCopy = gatewayAuth;
+    auto gatewayTLS = std::make_unique<MothershipTunnelGatewayTLSContext>();
+    if (gatewayTLS->configure(gatewayAuth, failure) == false)
+    {
+      return false;
+    }
     mothershipTunnelGatewayStopRequested.store(false);
     mothershipTunnelGatewayActiveStreamFD.store(-1);
     mothershipTunnelGatewayFailureCount.store(0);
-    mothershipTunnelGatewayThread = std::thread([this, listenerFD, controlSocketPath, gatewayAuthCopy, expectedProviderCgroup]() mutable {
+    mothershipTunnelGatewayThread = std::thread([this, listenerFD, controlSocketPath, gatewayTLS = std::move(gatewayTLS), expectedProviderCgroup]() {
       while (mothershipTunnelGatewayStopRequested.load() == false)
       {
         pollfd descriptor = {};
@@ -1120,7 +1124,7 @@ public:
 
         mothershipTunnelGatewayActiveStreamFD.store(streamFD);
         MothershipTunnelGatewaySessionResult sessionResult = {};
-        bool ok = mothershipTunnelGatewayProxyAuthenticatedControlStream(streamFD, controlSocketPath, gatewayAuthCopy, &sessionResult, &sessionFailure);
+        bool ok = mothershipTunnelGatewayProxyAuthenticatedControlStream(streamFD, controlSocketPath, *gatewayTLS, &sessionResult, &sessionFailure);
         if (ok)
         {
           noteMothershipTunnelProviderControlSession(

@@ -4785,12 +4785,16 @@ static void testMothershipTunnelGatewayClientCertificateAdmission(TestSuite& sui
 {
   MothershipTunnelGatewayClientAuth clientAuth = {};
   MothershipTunnelGatewayAuth auth = {};
+  MothershipTunnelGatewayTLSContext context = {};
   String failure = {};
   suite.require(mothershipGenerateTunnelGatewayAuth(clientAuth, auth, &failure), "mothership_tunnel_gateway_admission_fixture_generated");
-  suite.expect(mothershipTunnelGatewayAuthorizeClientCertificate(auth, clientAuth.clientCertPem, &failure), "mothership_tunnel_gateway_admits_authorized_client");
+  suite.require(context.configure(auth, &failure), "mothership_tunnel_gateway_admission_context_configured");
+  MothershipTunnelX509Ptr clientCert(VaultPem::x509FromPem(clientAuth.clientCertPem), X509_free);
+  MothershipTunnelX509Ptr serverCert(VaultPem::x509FromPem(auth.serverCertPem), X509_free);
+  suite.expect(context.authorizeClientCertificate(clientCert.get(), &failure), "mothership_tunnel_gateway_admits_authorized_client");
   suite.expect(failure.size() == 0, "mothership_tunnel_gateway_admit_clears_failure");
-  suite.expect(mothershipTunnelGatewayAuthorizeClientCertificate(auth, "not-a-cert"_ctv, &failure) == false && failure.equal("mothership tunnel gateway client certificate invalid"_ctv), "mothership_tunnel_gateway_rejects_malformed_client_cert");
-  suite.expect(mothershipTunnelGatewayAuthorizeClientCertificate(auth, auth.serverCertPem, &failure) == false && failure.equal("mothership tunnel gateway client certificate invalid"_ctv), "mothership_tunnel_gateway_rejects_server_cert_as_client");
+  suite.expect(context.authorizeClientCertificate(nullptr, &failure) == false && failure.equal("mothership tunnel gateway client certificate invalid"_ctv), "mothership_tunnel_gateway_rejects_missing_client_cert");
+  suite.expect(context.authorizeClientCertificate(serverCert.get(), &failure) == false && failure.equal("mothership tunnel gateway client certificate invalid"_ctv), "mothership_tunnel_gateway_rejects_server_cert_as_client");
 
 }
 
