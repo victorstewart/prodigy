@@ -666,8 +666,8 @@ static void testSystemEgressPolicyConstrainsIPv4(TestSuite& suite)
 
   Container container = {};
   container.plan.systemContainerKind = SystemContainerKind::mothershipTunnelProvider;
-  container.plan.systemEgressHost = "198.51.100.10"_ctv;
-  container.plan.systemEgressPort = 443;
+  container.plan.systemEgress.address4 = 0x5db8d822u;
+  container.plan.systemEgress.port = 443;
   container.plan.fragment = 0x4e;
 
   container_network_policy policy = {};

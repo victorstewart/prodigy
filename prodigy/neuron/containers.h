@@ -579,7 +579,6 @@ public:
   Vector<String> executeEnv;
   String executeCwd;
   MachineCpuArchitecture executeArchitecture = MachineCpuArchitecture::unknown;
-  container_egress_allow_key systemEgressAllow = {};
   String storageRootPath;
   String storagePayloadPath;
   Vector<StorageLoopDevice> storageLoopDevices;
@@ -596,38 +595,7 @@ public:
 
   bool systemEgressConstrained(void) const
   {
-    return isSystemContainer() && plan.systemEgressHost.size() > 0 && plan.systemEgressPort != 0;
-  }
-
-  bool prepareSystemEgressPolicy(String *failureReport = nullptr)
-  {
-    systemEgressAllow = {};
-    if (systemEgressConstrained() == false)
-    {
-      return true;
-    }
-
-    uint32_t egressAddress = 0;
-    if (prodigySystemEgressIPv4Literal(plan.systemEgressHost, egressAddress) == false)
-    {
-      if (failureReport)
-      {
-        failureReport->assign("system egress host must be an IPv4 literal"_ctv);
-      }
-      return false;
-    }
-    if (prodigySystemEgressIPv4HostAddressIsDenied(egressAddress))
-    {
-      if (failureReport)
-      {
-        failureReport->assign("system egress literal denied"_ctv);
-      }
-      return false;
-    }
-    systemEgressAllow.addr = htonl(egressAddress);
-    systemEgressAllow.proto = IPPROTO_TCP;
-    systemEgressAllow.port = htons(plan.systemEgressPort);
-    return true;
+    return isSystemContainer() && plan.systemEgress.configured();
   }
 
   bool syncSystemEgressAllowlist(String *failureReport = nullptr)
@@ -636,7 +604,7 @@ public:
     {
       return true;
     }
-    if (peer_program == nullptr || systemEgressAllow.proto == 0)
+    if (peer_program == nullptr)
     {
       if (failureReport)
       {
@@ -644,6 +612,11 @@ public:
       }
       return false;
     }
+
+    container_egress_allow_key key = {};
+    key.addr = htonl(plan.systemEgress.address4);
+    key.proto = IPPROTO_TCP;
+    key.port = htons(plan.systemEgress.port);
 
     bool ok = false;
     peer_program->openMap("ct_egress_allow"_ctv, [&](int mapFD) -> void {
@@ -653,7 +626,7 @@ public:
       }
       __u8 value = 1;
       ok = true;
-      ok = bpf_map_update_elem(mapFD, &systemEgressAllow, &value, BPF_ANY) == 0;
+      ok = bpf_map_update_elem(mapFD, &key, &value, BPF_ANY) == 0;
     });
     if (ok == false && failureReport)
     {
@@ -8595,8 +8568,13 @@ public:
 
       if (container->plan.systemContainerKind == SystemContainerKind::mothershipTunnelProvider)
       {
+        String host = {};
+        if (prodigySystemEgressIPv4Text(container->plan.systemEgress.address4, host) == false)
+        {
+          failStartup("format system egress host failed");
+        }
         String port = {};
-        port.assignItoa(container->plan.systemEgressPort);
+        port.assignItoa(container->plan.systemEgress.port);
         auto pushSystemEnv = [&](StringType auto&& key, const String& value) {
           String assignment = {};
           assignment.assign(key);
@@ -8604,7 +8582,7 @@ public:
           container->executeEnv.push_back(std::move(assignment));
         };
         pushSystemEnv("PRODIGY_MOTHERSHIP_SOCKET="_ctv, mothershipTunnelProviderMothershipSocketPath);
-        pushSystemEnv("PRODIGY_TUNNEL_EGRESS_HOST="_ctv, container->plan.systemEgressHost);
+        pushSystemEnv("PRODIGY_TUNNEL_EGRESS_HOST="_ctv, host);
         pushSystemEnv("PRODIGY_TUNNEL_EGRESS_PORT="_ctv, port);
       }
 
@@ -8989,14 +8967,6 @@ public:
       String report = {};
       report.assign("createContainer returned null"_ctv);
       reportSpinContainerFailure(plan, report);
-      co_return;
-    }
-
-    String systemEgressFailure = {};
-    if (container->prepareSystemEgressPolicy(&systemEgressFailure) == false)
-    {
-      cleanupContainerAfterFailedCreate(container);
-      reportSpinContainerFailure(plan, systemEgressFailure.size() ? systemEgressFailure : String("system egress policy failed"_ctv));
       co_return;
     }
 

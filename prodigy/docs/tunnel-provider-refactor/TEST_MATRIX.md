@@ -36,6 +36,9 @@
 | `.run/build-cgroup/prodigy_mothership_cluster_registry_unit` after system launch-contract cut | pass |
 | `cmake --build .run/build-cgroup --target prodigy prodigy_mothership_unix_connect_unit --parallel 16` after gateway implementation split | pass |
 | `.run/build-cgroup/prodigy_mothership_unix_connect_unit` after gateway implementation split | pass |
+| `cmake -S prodigy/dev -B .run/build-egress -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++` after numeric system-egress plan change | pass |
+| `cmake --build .run/build-egress --target prodigy mothership prodigy_container_overlay_sync_unit prodigy_mothership_cluster_registry_unit prodigy_brain_replication_credentials_unit --parallel 16` after numeric system-egress plan change | pass |
+| `.run/build-egress/prodigy_mothership_cluster_registry_unit` after numeric system-egress plan change | pass |
 
 ## Privileged Tests Run In VM
 
@@ -44,6 +47,7 @@
 | `PRODIGY_DEV_ALLOW_BPF_ATTACH=1 ./prodigy_switchboard_whitehole_unit` | pass |
 | `PRODIGY_DEV_ALLOW_BPF_ATTACH=1 ./prodigy_container_overlay_sync_unit` | pass |
 | `PRODIGY_DEV_ALLOW_BPF_ATTACH=1 .run/build-cgroup/prodigy_container_overlay_sync_unit` after system launch-contract cut | pass |
+| `PRODIGY_DEV_ALLOW_BPF_ATTACH=1 .run/build-egress/prodigy_container_overlay_sync_unit` after numeric system-egress plan change | pass |
 
 ## Privileged Tests Not Run
 
@@ -68,4 +72,5 @@ Reason: the focused VM verification proved the touched unit/BPF paths, but the o
 - System-provider socket/env launch data is derived from `SystemContainerKind`, not serialized through `ContainerPlan`.
 - `PRODIGY_CONTAINER_KIND` launch env is deleted; artifact header plus typed launch state carry that identity.
 - Gateway socket/TLS/proxy implementation moved to compiled `.cpp`; public header is declarations only.
+- System-provider egress is carried through `ContainerPlan` as a numeric `SystemContainerEgressPolicy`; Neuron no longer reparses a serialized text host before installing the BPF allowlist.
 - Remote branch head matches local head.

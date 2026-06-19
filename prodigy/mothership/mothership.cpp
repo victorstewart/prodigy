@@ -2071,8 +2071,7 @@ static bool parseMothershipConnectivityJSON(simdjson::dom::element value, Mother
       return false;
     }
     uint32_t egressAddress = 0;
-    if (prodigySystemEgressIPv4Literal(parsed.tunnelProvider.egressHost, egressAddress) == false ||
-        prodigySystemEgressIPv4HostAddressIsDenied(egressAddress))
+    if (prodigySystemEgressPublicIPv4Literal(parsed.tunnelProvider.egressHost, egressAddress) == false)
     {
       basics_log("%s tunnelProvider egress host must be a public IPv4 literal\n", context);
       return false;

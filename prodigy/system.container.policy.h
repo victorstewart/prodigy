@@ -38,3 +38,23 @@ static inline bool prodigySystemEgressIPv4Literal(const String& host, uint32_t& 
   address = ntohl(ipv4.s_addr);
   return true;
 }
+
+static inline bool prodigySystemEgressPublicIPv4Literal(const String& host, uint32_t& address)
+{
+  return prodigySystemEgressIPv4Literal(host, address) &&
+         prodigySystemEgressIPv4HostAddressIsDenied(address) == false;
+}
+
+static inline bool prodigySystemEgressIPv4Text(uint32_t address, String& text)
+{
+  char buffer[INET_ADDRSTRLEN] = {};
+  in_addr ipv4 = {};
+  ipv4.s_addr = htonl(address);
+  if (inet_ntop(AF_INET, &ipv4, buffer, sizeof(buffer)) == nullptr)
+  {
+    text.clear();
+    return false;
+  }
+  text.assign(buffer);
+  return true;
+}

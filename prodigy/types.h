@@ -6831,8 +6831,7 @@ public:
 
   uint8_t fragment;
   SystemContainerKind systemContainerKind = SystemContainerKind::none;
-  String systemEgressHost;
-  uint16_t systemEgressPort = 0;
+  SystemContainerEgressPolicy systemEgress;
   Vector<Wormhole> wormholes;
   Vector<Whitehole> whiteholes;
   bool useHostNetworkNamespace = false;
@@ -7081,8 +7080,7 @@ static void serialize(S&& serializer, ContainerPlan& plan)
   serializer.value1b(plan.restartOnFailure);
   serializer.value1b(plan.fragment);
   serializer.value1b(plan.systemContainerKind);
-  serializer.text1b(plan.systemEgressHost, UINT32_MAX);
-  serializer.value2b(plan.systemEgressPort);
+  serializer.object(plan.systemEgress);
   serializer.object(plan.wormholes);
   serializer.object(plan.whiteholes);
   serializer.value1b(plan.useHostNetworkNamespace);

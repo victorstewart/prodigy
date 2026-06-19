@@ -13,6 +13,20 @@ enum class SystemContainerKind : uint8_t {
   mothershipTunnelProvider = 1
 };
 
+struct SystemContainerEgressPolicy {
+  uint32_t address4 = 0;
+  uint16_t port = 0;
+
+  bool configured(void) const { return address4 != 0 && port != 0; }
+};
+
+template <typename S>
+static void serialize(S&& serializer, SystemContainerEgressPolicy& policy)
+{
+  serializer.value4b(policy.address4);
+  serializer.value2b(policy.port);
+}
+
 constexpr static uint8_t prodigyMothershipTunnelProviderRuntimeFragment = 254;
 constexpr static uint32_t prodigyMothershipTunnelProviderRuntimeUID = 65'535u * uint32_t(prodigyMothershipTunnelProviderRuntimeFragment);
 
