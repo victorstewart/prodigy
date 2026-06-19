@@ -9,20 +9,6 @@ constexpr static auto mothershipTunnelProviderHostGatewaySocketPath = "/run/prod
 
 using MothershipConnectivityRuntimeConfig = MothershipConnectivity;
 
-class MothershipTunnelProviderDesiredState {
-public:
-
-  MothershipConnectivityRuntimeConfig connectivity;
-  MothershipTunnelGatewayAuth gatewayAuth;
-};
-
-template <typename S>
-static void serialize(S&& serializer, MothershipTunnelProviderDesiredState& state)
-{
-  serializer.object(state.connectivity);
-  serializer.object(state.gatewayAuth);
-}
-
 class MothershipTunnelProviderConfigureRequest {
 public:
 
@@ -37,38 +23,14 @@ static void serialize(S&& serializer, MothershipTunnelProviderConfigureRequest& 
   serializer.text1b(request.artifactBlob, UINT32_MAX);
 }
 
-static inline bool mothershipTunnelGatewayAuthEqual(const MothershipTunnelGatewayAuth& lhs, const MothershipTunnelGatewayAuth& rhs)
-{
-  return lhs.rootCertPem.equal(rhs.rootCertPem) &&
-         lhs.serverCertPem.equal(rhs.serverCertPem) &&
-         lhs.serverKeyPem.equal(rhs.serverKeyPem);
-}
-
-static inline bool mothershipTunnelProviderSpecRuntimeEqual(const MothershipTunnelProviderSpec& lhs, const MothershipTunnelProviderSpec& rhs)
-{
-  return lhs.artifactSha256.equal(rhs.artifactSha256) &&
-         lhs.artifactBytes == rhs.artifactBytes &&
-         lhs.dialEndpoint.equal(rhs.dialEndpoint) &&
-         lhs.egressHost.equal(rhs.egressHost) &&
-         lhs.egressPort == rhs.egressPort &&
-         lhs.clientAuth.rootCertPem.equal(rhs.clientAuth.rootCertPem) &&
-         lhs.clientAuth.clientCertPem.equal(rhs.clientAuth.clientCertPem) &&
-         lhs.clientAuth.clientKeyPem.equal(rhs.clientAuth.clientKeyPem);
-}
-
-static inline bool mothershipConnectivityRuntimeConfigEqual(const MothershipConnectivityRuntimeConfig& lhs, const MothershipConnectivityRuntimeConfig& rhs)
-{
-  return lhs.kind == rhs.kind &&
-         (lhs.kind != MothershipConnectivityKind::tunnelProvider ||
-          mothershipTunnelProviderSpecRuntimeEqual(lhs.tunnelProvider, rhs.tunnelProvider));
-}
-
 template <typename Text>
 static inline bool mothershipTunnelPolicyFail(String *failure, const Text& text)
 {
   if (failure)
   {
-    failure->assign(text);
+    String owned = {};
+    owned.assign(text.data(), text.size());
+    *failure = std::move(owned);
   }
   return false;
 }

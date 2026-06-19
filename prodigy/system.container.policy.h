@@ -25,7 +25,7 @@ static inline bool prodigySystemEgressIPv4HostAddressIsDenied(uint32_t address)
 static inline bool prodigySystemEgressIPv4Literal(const String& host, uint32_t& address)
 {
   String ownedHost = {};
-  ownedHost.assign(host);
+  ownedHost.assign(host.data(), host.size());
   struct in_addr ipv4 = {};
   if (inet_pton(AF_INET, ownedHost.c_str(), &ipv4) != 1)
   {

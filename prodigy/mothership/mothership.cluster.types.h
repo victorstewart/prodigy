@@ -33,11 +33,6 @@ enum class MothershipClusterControlKind : uint8_t {
   unixSocket = 0
 };
 
-enum class MothershipConnectivityKind : uint8_t {
-  ssh = 0,
-  tunnelProvider = 1
-};
-
 enum class MothershipClusterMachineSource : uint8_t {
   adopted = 0,
   created = 1
@@ -67,81 +62,6 @@ static void serialize(S&& serializer, MothershipProdigyClusterControl& control)
 {
   serializer.value1b(control.kind);
   serializer.text1b(control.path, UINT32_MAX);
-}
-
-struct MothershipTunnelGatewayClientAuth {
-  String rootCertPem;
-  String clientCertPem;
-  String clientKeyPem;
-
-  bool configured(void) const
-  {
-    return rootCertPem.size() > 0 && clientCertPem.size() > 0 && clientKeyPem.size() > 0;
-  }
-};
-
-template <typename S>
-static void serialize(S&& serializer, MothershipTunnelGatewayClientAuth& auth)
-{
-  serializer.text1b(auth.rootCertPem, UINT32_MAX);
-  serializer.text1b(auth.clientCertPem, UINT32_MAX);
-  serializer.text1b(auth.clientKeyPem, UINT32_MAX);
-}
-
-struct MothershipTunnelGatewayAuth {
-  String rootCertPem;
-  String serverCertPem;
-  String serverKeyPem;
-
-  bool configured(void) const
-  {
-    return rootCertPem.size() > 0 && serverCertPem.size() > 0 && serverKeyPem.size() > 0;
-  }
-};
-
-template <typename S>
-static void serialize(S&& serializer, MothershipTunnelGatewayAuth& auth)
-{
-  serializer.text1b(auth.rootCertPem, UINT32_MAX);
-  serializer.text1b(auth.serverCertPem, UINT32_MAX);
-  serializer.text1b(auth.serverKeyPem, UINT32_MAX);
-}
-
-struct MothershipTunnelProviderSpec {
-  String artifactSha256;
-  uint64_t artifactBytes = 0;
-  String dialEndpoint;
-  String egressHost;
-  uint16_t egressPort = 0;
-  MothershipTunnelGatewayClientAuth clientAuth;
-
-  // Create-time inputs only. These fields are intentionally omitted from
-  // serialization so the registry stores only stable client-side metadata.
-  String providerContainerBlobPath;
-  MothershipTunnelGatewayAuth gatewayAuth;
-};
-
-template <typename S>
-static void serialize(S&& serializer, MothershipTunnelProviderSpec& spec)
-{
-  serializer.text1b(spec.artifactSha256, 64);
-  serializer.value8b(spec.artifactBytes);
-  serializer.text1b(spec.dialEndpoint, UINT32_MAX);
-  serializer.text1b(spec.egressHost, UINT32_MAX);
-  serializer.value2b(spec.egressPort);
-  serializer.object(spec.clientAuth);
-}
-
-struct MothershipConnectivity {
-  MothershipConnectivityKind kind = MothershipConnectivityKind::ssh;
-  MothershipTunnelProviderSpec tunnelProvider;
-};
-
-template <typename S>
-static void serialize(S&& serializer, MothershipConnectivity& connectivity)
-{
-  serializer.value1b(connectivity.kind);
-  serializer.object(connectivity.tunnelProvider);
 }
 
 class MothershipProdigyClusterGcpConfig {

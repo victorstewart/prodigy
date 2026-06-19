@@ -1004,11 +1004,6 @@ public:
   {
   }
 
-  bool persistMothershipTunnelProviderDesiredState(const MothershipConnectivityRuntimeConfig& connectivity, const MothershipTunnelGatewayAuth& gatewayAuth, String *failure = nullptr) override
-  {
-    return persistentStateStore.saveMothershipTunnelProviderDesiredState(connectivity, gatewayAuth, failure);
-  }
-
   void noteMothershipTunnelGatewayFailure(String failure)
   {
     uint64_t failures = mothershipTunnelGatewayFailureCount.fetch_add(1) + 1;
@@ -1323,12 +1318,6 @@ public:
       brainConfig = persistedBrainSnapshot.brainConfig;
       applyPersistentMasterAuthorityPackage(persistedBrainSnapshot.masterAuthority);
       metrics.importSamples(persistedBrainSnapshot.metricSamples);
-    }
-
-    String connectivityFailure = {};
-    if (persistentStateStore.loadMothershipTunnelProviderDesiredState(mothershipConnectivity, mothershipTunnelGatewayAuth, &connectivityFailure) == false && connectivityFailure.size() > 0 && connectivityFailure != "record not found"_ctv)
-    {
-      basics_log("ProdigyBrain mothership tunnel provider desired state load failed: %s\n", connectivityFailure.c_str());
     }
 
     prodigyBackfillBrainConfigSSHFromBootState(persistentBootState, brainConfig);

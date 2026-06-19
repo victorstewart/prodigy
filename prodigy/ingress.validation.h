@@ -363,7 +363,6 @@ static bool validateBrainPayload(uint16_t rawTopic, uint8_t *args, uint8_t *term
         return (cursor == terminal);
       }
     case BrainTopic::replicateContainerRuntimeState:
-    case BrainTopic::replicateMothershipTunnelProviderState:
       {
         if (consumeVariable(cursor, terminal) == false)
         {
@@ -426,16 +425,7 @@ static bool validateBrainPayload(uint16_t rawTopic, uint8_t *args, uint8_t *term
       }
     case BrainTopic::reconcileState:
       {
-        while (cursor < terminal)
-        {
-          uint64_t deploymentID = 0;
-          if (extractFixed(cursor, terminal, deploymentID) == false)
-          {
-            return false;
-          }
-        }
-
-        return (cursor == terminal);
+        return consumeVariable(cursor, terminal) && cursor == terminal;
       }
     case BrainTopic::registration:
       {

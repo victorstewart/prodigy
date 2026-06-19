@@ -52,6 +52,163 @@ static void serialize(S&& serializer, SSHKeyPackage& package)
 
 } // namespace Vault
 
+enum class MothershipConnectivityKind : uint8_t {
+  ssh = 0,
+  tunnelProvider = 1
+};
+
+struct MothershipTunnelGatewayClientAuth {
+  String rootCertPem;
+  String clientCertPem;
+  String clientKeyPem;
+
+  bool configured(void) const
+  {
+    return rootCertPem.size() > 0 && clientCertPem.size() > 0 && clientKeyPem.size() > 0;
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipTunnelGatewayClientAuth& auth)
+{
+  serializer.text1b(auth.rootCertPem, UINT32_MAX);
+  serializer.text1b(auth.clientCertPem, UINT32_MAX);
+  serializer.text1b(auth.clientKeyPem, UINT32_MAX);
+}
+
+static inline bool operator==(const MothershipTunnelGatewayClientAuth& lhs, const MothershipTunnelGatewayClientAuth& rhs)
+{
+  return lhs.rootCertPem.equal(rhs.rootCertPem) &&
+         lhs.clientCertPem.equal(rhs.clientCertPem) &&
+         lhs.clientKeyPem.equal(rhs.clientKeyPem);
+}
+
+struct MothershipTunnelGatewayAuth {
+  String rootCertPem;
+  String serverCertPem;
+  String serverKeyPem;
+
+  bool configured(void) const
+  {
+    return rootCertPem.size() > 0 && serverCertPem.size() > 0 && serverKeyPem.size() > 0;
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipTunnelGatewayAuth& auth)
+{
+  serializer.text1b(auth.rootCertPem, UINT32_MAX);
+  serializer.text1b(auth.serverCertPem, UINT32_MAX);
+  serializer.text1b(auth.serverKeyPem, UINT32_MAX);
+}
+
+static inline bool operator==(const MothershipTunnelGatewayAuth& lhs, const MothershipTunnelGatewayAuth& rhs)
+{
+  return lhs.rootCertPem.equal(rhs.rootCertPem) &&
+         lhs.serverCertPem.equal(rhs.serverCertPem) &&
+         lhs.serverKeyPem.equal(rhs.serverKeyPem);
+}
+
+struct MothershipTunnelProviderSpec {
+  String artifactSha256;
+  uint64_t artifactBytes = 0;
+  String dialEndpoint;
+  String egressHost;
+  uint16_t egressPort = 0;
+  MothershipTunnelGatewayClientAuth clientAuth;
+
+  // Create-time inputs only. These fields are intentionally omitted from
+  // serialization so the registry stores only stable client-side metadata.
+  String providerContainerBlobPath;
+  MothershipTunnelGatewayAuth gatewayAuth;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipTunnelProviderSpec& spec)
+{
+  serializer.text1b(spec.artifactSha256, 64);
+  serializer.value8b(spec.artifactBytes);
+  serializer.text1b(spec.dialEndpoint, UINT32_MAX);
+  serializer.text1b(spec.egressHost, UINT32_MAX);
+  serializer.value2b(spec.egressPort);
+  serializer.object(spec.clientAuth);
+}
+
+static inline bool operator==(const MothershipTunnelProviderSpec& lhs, const MothershipTunnelProviderSpec& rhs)
+{
+  return lhs.artifactSha256.equal(rhs.artifactSha256) &&
+         lhs.artifactBytes == rhs.artifactBytes &&
+         lhs.dialEndpoint.equal(rhs.dialEndpoint) &&
+         lhs.egressHost.equal(rhs.egressHost) &&
+         lhs.egressPort == rhs.egressPort &&
+         lhs.clientAuth == rhs.clientAuth;
+}
+
+struct MothershipConnectivity {
+  MothershipConnectivityKind kind = MothershipConnectivityKind::ssh;
+  MothershipTunnelProviderSpec tunnelProvider;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipConnectivity& connectivity)
+{
+  serializer.value1b(connectivity.kind);
+  serializer.object(connectivity.tunnelProvider);
+}
+
+static inline bool operator==(const MothershipConnectivity& lhs, const MothershipConnectivity& rhs)
+{
+  return lhs.kind == rhs.kind &&
+         (lhs.kind != MothershipConnectivityKind::tunnelProvider || lhs.tunnelProvider == rhs.tunnelProvider);
+}
+
+class MothershipTunnelProviderDesiredState {
+public:
+
+  MothershipConnectivity connectivity;
+  MothershipTunnelGatewayAuth gatewayAuth;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipTunnelProviderDesiredState& state)
+{
+  serializer.object(state.connectivity);
+  serializer.object(state.gatewayAuth);
+}
+
+static inline bool operator==(const MothershipTunnelProviderDesiredState& lhs, const MothershipTunnelProviderDesiredState& rhs)
+{
+  return lhs.connectivity == rhs.connectivity && lhs.gatewayAuth == rhs.gatewayAuth;
+}
+
+class SystemContainerArtifactRef {
+public:
+
+  String sha256;
+  uint64_t bytes = 0;
+};
+
+template <typename S>
+static void serialize(S&& serializer, SystemContainerArtifactRef& ref)
+{
+  serializer.text1b(ref.sha256, 64);
+  serializer.value8b(ref.bytes);
+}
+
+class BrainReconcileStateRequest {
+public:
+
+  Vector<uint64_t> deploymentIDs;
+  Vector<SystemContainerArtifactRef> systemArtifacts;
+};
+
+template <typename S>
+static void serialize(S&& serializer, BrainReconcileStateRequest& request)
+{
+  serializer.object(request.deploymentIDs);
+  serializer.object(request.systemArtifacts);
+}
+
 static inline const char *machineCpuArchitectureName(MachineCpuArchitecture architecture)
 {
   switch (architecture)
@@ -6093,11 +6250,12 @@ public:
   Vector<RoutableResourceLease> routableResourceLeases;
   Vector<PublicTlsCertificateState> publicTlsCertificates;
   Vector<PrivateTlsVaultLifecycleState> privateTlsVaultLifecycles;
+  MothershipTunnelProviderDesiredState mothershipTunnelProviderDesiredState;
   ProdigyPersistentUpdateSelfState updateSelf;
 
   bool operator==(const ProdigyMasterAuthorityRuntimeState& other) const
   {
-    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || updateSelf != other.updateSelf)
+    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf)
     {
       return false;
     }
@@ -6193,6 +6351,7 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
   serializer.object(state.routableResourceLeases);
   serializer.object(state.publicTlsCertificates);
   serializer.object(state.privateTlsVaultLifecycles);
+  serializer.object(state.mothershipTunnelProviderDesiredState);
   serializer.object(state.updateSelf);
 }
 

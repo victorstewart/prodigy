@@ -1599,6 +1599,7 @@ public:
     masterAuthorityRuntimeState.nextMintedClientTlsGeneration = nextMintedClientTlsGeneration;
     masterAuthorityRuntimeState.nextTlsResumptionGeneration = nextTlsResumptionGeneration;
     masterAuthorityRuntimeState.tlsResumptionSnapshotsByWormhole = captureTlsResumptionSnapshotsByWormhole();
+    masterAuthorityRuntimeState.mothershipTunnelProviderDesiredState = captureMothershipTunnelProviderDesiredState();
     masterAuthorityRuntimeState.updateSelf = capturePersistentUpdateSelfState();
   }
 
@@ -4522,6 +4523,7 @@ public:
                                       : masterAuthorityRuntimeState.nextTlsResumptionGeneration;
     restoreTlsResumptionSnapshotsByWormhole(masterAuthorityRuntimeState.tlsResumptionSnapshotsByWormhole, false);
     restorePersistentUpdateSelfState(masterAuthorityRuntimeState.updateSelf);
+    restoreMothershipTunnelProviderDesiredStateFromMasterAuthority();
     syncManagedMachineSchemaConfigs(previousSchemas, masterAuthorityRuntimeState.machineSchemas);
     (void)reconcileDNSRecordLeases();
   }
@@ -4566,6 +4568,7 @@ public:
     nextMintedClientTlsGeneration = (sanitizedIncoming.nextMintedClientTlsGeneration == 0) ? 1 : sanitizedIncoming.nextMintedClientTlsGeneration;
     nextTlsResumptionGeneration = sanitizedIncoming.nextTlsResumptionGeneration;
     restoreTlsResumptionSnapshotsByWormhole(sanitizedIncoming.tlsResumptionSnapshotsByWormhole, true);
+    restoreMothershipTunnelProviderDesiredStateFromMasterAuthority();
     syncManagedMachineSchemaConfigs(previousSchemas, masterAuthorityRuntimeState.machineSchemas);
     (void)reconcileDNSRecordLeases();
 
@@ -12670,16 +12673,6 @@ public:
 
   virtual void configureMothershipControlIngress(String& mothershipEndpoint) = 0;
   virtual void teardownMothershipControlIngress(void) = 0;
-  virtual bool persistMothershipTunnelProviderDesiredState(const MothershipConnectivityRuntimeConfig& connectivity, const MothershipTunnelGatewayAuth& gatewayAuth, String *failure = nullptr)
-  {
-    (void)connectivity;
-    (void)gatewayAuth;
-    if (failure)
-    {
-      failure->clear();
-    }
-    return true;
-  }
 
   virtual bool storeSystemContainerArtifact(const String& sha256, uint64_t bytes, const String& blob, String *failure = nullptr)
   {
@@ -12806,6 +12799,63 @@ public:
     return true;
   }
 
+  bool systemArtifactRefsContain(const Vector<SystemContainerArtifactRef>& refs, const String& sha256, uint64_t bytes) const
+  {
+    for (const SystemContainerArtifactRef& ref : refs)
+    {
+      if (ref.bytes == bytes && ref.sha256.equal(sha256))
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void capturePresentSystemArtifactRefs(Vector<SystemContainerArtifactRef>& refs)
+  {
+    refs.clear();
+    if (mothershipConnectivity.kind != MothershipConnectivityKind::tunnelProvider)
+    {
+      return;
+    }
+
+    const MothershipTunnelProviderSpec& spec = mothershipConnectivity.tunnelProvider;
+    if (systemContainerArtifactPresent(spec.artifactSha256, spec.artifactBytes))
+    {
+      SystemContainerArtifactRef ref = {};
+      ref.sha256 = spec.artifactSha256;
+      ref.bytes = spec.artifactBytes;
+      refs.push_back(std::move(ref));
+    }
+  }
+
+  void queueMissingSystemContainerArtifactsForPeer(BrainView *peer, const Vector<SystemContainerArtifactRef>& peerArtifacts)
+  {
+    if (peer == nullptr)
+    {
+      return;
+    }
+
+    const MothershipConnectivity& connectivity = masterAuthorityRuntimeState.mothershipTunnelProviderDesiredState.connectivity;
+    if (connectivity.kind != MothershipConnectivityKind::tunnelProvider)
+    {
+      return;
+    }
+
+    const MothershipTunnelProviderSpec& spec = connectivity.tunnelProvider;
+    if (systemArtifactRefsContain(peerArtifacts, spec.artifactSha256, spec.artifactBytes))
+    {
+      return;
+    }
+
+    String blob = {};
+    String failure = {};
+    if (loadSystemContainerArtifact(spec.artifactSha256, spec.artifactBytes, blob, &failure))
+    {
+      (void)queueBrainSystemContainerArtifactReplicationToPeer(peer, spec.artifactSha256, spec.artifactBytes, blob);
+    }
+  }
+
   void reconcileMothershipTunnelProviderRuntimeState(void)
   {
     if (mothershipConnectivity.kind != MothershipConnectivityKind::tunnelProvider)
@@ -12891,13 +12941,12 @@ public:
     state.lastFailure.assign(mothershipTunnelProviderPendingHealth);
   }
 
-  void queueMothershipTunnelProviderDesiredStateReplication(const MothershipTunnelProviderDesiredState& desired)
+  MothershipTunnelProviderDesiredState captureMothershipTunnelProviderDesiredState(void) const
   {
-    String serialized;
-    MothershipTunnelProviderDesiredState owned = desired;
-    BitseryEngine::serialize(serialized, owned);
-    queueBrainReplication(BrainTopic::replicateMothershipTunnelProviderState, serialized);
-    Vault::secureClearString(serialized);
+    MothershipTunnelProviderDesiredState desired = {};
+    desired.connectivity = mothershipConnectivity;
+    desired.gatewayAuth = mothershipTunnelGatewayAuth;
+    return desired;
   }
 
   bool prepareMothershipTunnelProviderDesiredState(const MothershipTunnelProviderDesiredState& incoming, MothershipTunnelProviderDesiredState& desired, String *failure = nullptr)
@@ -12929,14 +12978,30 @@ public:
     return true;
   }
 
-  bool applyPreparedMothershipTunnelProviderDesiredState(const MothershipTunnelProviderDesiredState& desired, bool replicateToPeers, String *failure = nullptr)
+  void restoreMothershipTunnelProviderDesiredStateFromMasterAuthority(void)
   {
-    bool changed = mothershipConnectivityRuntimeConfigEqual(mothershipConnectivity, desired.connectivity) == false ||
-                   mothershipTunnelGatewayAuthEqual(mothershipTunnelGatewayAuth, desired.gatewayAuth) == false;
-    if (persistMothershipTunnelProviderDesiredState(desired.connectivity, desired.gatewayAuth, failure) == false)
+    MothershipTunnelProviderDesiredState desired = {};
+    String failure = {};
+    if (prepareMothershipTunnelProviderDesiredState(masterAuthorityRuntimeState.mothershipTunnelProviderDesiredState, desired, &failure))
     {
-      return false;
+      (void)syncPreparedMothershipTunnelProviderDesiredState(desired);
+      return;
     }
+
+    mothershipConnectivity = {};
+    mothershipTunnelGatewayAuth = {};
+    stopMothershipTunnelProviderLocalInstance();
+    mothershipTunnelProviderRuntimeState = {};
+    if (failure.size() > 0)
+    {
+      mothershipTunnelProviderRuntimeState.lastFailure = failure;
+    }
+  }
+
+  bool syncPreparedMothershipTunnelProviderDesiredState(const MothershipTunnelProviderDesiredState& desired)
+  {
+    bool changed = mothershipConnectivity != desired.connectivity ||
+                   (mothershipTunnelGatewayAuth == desired.gatewayAuth) == false;
     mothershipConnectivity = desired.connectivity;
     mothershipTunnelGatewayAuth = desired.gatewayAuth;
     if (changed)
@@ -12945,10 +13010,15 @@ public:
       mothershipTunnelProviderRuntimeState.lastFailure.clear();
     }
     reconcileMothershipTunnelProviderRuntimeState();
+    return changed;
+  }
 
-    if (replicateToPeers)
+  bool applyPreparedMothershipTunnelProviderDesiredState(const MothershipTunnelProviderDesiredState& desired, bool replicateToPeers, bool persist = true, String *failure = nullptr)
+  {
+    bool changed = syncPreparedMothershipTunnelProviderDesiredState(desired);
+    if (changed || (masterAuthorityRuntimeState.mothershipTunnelProviderDesiredState == desired) == false)
     {
-      queueMothershipTunnelProviderDesiredStateReplication(desired);
+      noteMasterAuthorityRuntimeStateChanged(replicateToPeers, persist);
     }
 
     if (failure)
@@ -12962,7 +13032,7 @@ public:
   {
     MothershipTunnelProviderDesiredState desired = {};
     return prepareMothershipTunnelProviderDesiredState(incoming, desired, failure) &&
-           applyPreparedMothershipTunnelProviderDesiredState(desired, replicateToPeers, failure);
+           applyPreparedMothershipTunnelProviderDesiredState(desired, replicateToPeers, true, failure);
   }
 
   bool applyMothershipTunnelProviderConfigureRequest(const MothershipTunnelProviderConfigureRequest& request, bool replicateToPeers, String *failure = nullptr)
@@ -12989,7 +13059,7 @@ public:
       {
         return false;
       }
-      if (applyPreparedMothershipTunnelProviderDesiredState(desired, false, failure) == false)
+      if (applyPreparedMothershipTunnelProviderDesiredState(desired, false, true, failure) == false)
       {
         return false;
       }
@@ -12999,7 +13069,7 @@ public:
         {
           queueBrainSystemContainerArtifactReplication(spec.artifactSha256, spec.artifactBytes, request.artifactBlob);
         }
-        queueMothershipTunnelProviderDesiredStateReplication(desired);
+        queueMasterAuthorityRuntimeStateReplication();
       }
       if (failure)
       {
@@ -13008,7 +13078,7 @@ public:
       return true;
     }
 
-    return applyPreparedMothershipTunnelProviderDesiredState(desired, replicateToPeers, failure);
+    return applyPreparedMothershipTunnelProviderDesiredState(desired, replicateToPeers, true, failure);
   }
 
   void configureMothershipUnixSocketPath(String& mothershipSocketPath)
@@ -19004,20 +19074,6 @@ public:
 
           break;
         }
-      case BrainTopic::replicateMothershipTunnelProviderState:
-        {
-          String serialized;
-          Message::extractToStringView(args, serialized);
-
-          MothershipTunnelProviderDesiredState incoming = {};
-          String failure = {};
-          if (BitseryEngine::deserializeSafe(serialized, incoming) == false || applyMothershipTunnelProviderDesiredState(incoming, false, &failure) == false)
-          {
-            basics_log("replicateMothershipTunnelProviderState failed reason=%s\n", failure.size() > 0 ? failure.c_str() : "invalid payload");
-          }
-
-          break;
-        }
       // we're done with this.... either it failed and we're erasing it... or we replaced it and fully transitioned to the new deployment
       case BrainTopic::cullDeployment:
         {
@@ -19039,20 +19095,22 @@ public:
       case BrainTopic::reconcileState:
         {
           uint8_t *args = message->args;
-          uint8_t *terminal = message->terminal();
 
           // check what they have and send back culls and replications
 
-          bytell_hash_set<uint64_t> deploymentIDs;
-
-          do
+          String serializedRequest = {};
+          Message::extractToStringView(args, serializedRequest);
+          BrainReconcileStateRequest request = {};
+          if (BitseryEngine::deserializeSafe(serializedRequest, request) == false)
           {
-            uint64_t deploymentID;
-            Message::extractArg<ArgumentNature::fixed>(args, deploymentID);
+            break;
+          }
 
+          bytell_hash_set<uint64_t> deploymentIDs;
+          for (uint64_t deploymentID : request.deploymentIDs)
+          {
             deploymentIDs.insert(deploymentID);
-
-          } while (args < terminal);
+          }
 
           uint64_t before = bv->wBuffer.size();
 
@@ -19100,6 +19158,8 @@ public:
           {
             Message::construct(bv->wBuffer, BrainTopic::cullDeployment, deploymentID);
           }
+          refreshMasterAuthorityRuntimeStateFromLiveFields();
+          queueMissingSystemContainerArtifactsForPeer(bv, request.systemArtifacts);
           for (const auto& [applicationName, applicationID] : reservedApplicationIDsByName)
           {
             Message::construct(bv->wBuffer, BrainTopic::replicateApplicationIDReservation, applicationID, applicationName);
@@ -19127,7 +19187,6 @@ public:
           }
           {
             String serializedRuntimeState;
-            refreshMasterAuthorityRuntimeStateFromLiveFields();
             ProdigyMasterAuthorityRuntimeState replicatedRuntimeState = masterAuthorityRuntimeState;
             replicatedRuntimeState.updateSelf = {};
             BitseryEngine::serialize(serializedRuntimeState, replicatedRuntimeState);
@@ -19392,14 +19451,16 @@ public:
                   // send the deployments we have
                   // the master will respond with any to cull and any we don't have yet
 
-                  uint32_t headerOffset = Message::appendHeader(bv->wBuffer, BrainTopic::reconcileState);
-
+                  BrainReconcileStateRequest request = {};
                   for (const auto& [deploymentID, plan] : deploymentPlans)
                   {
-                    Message::append(bv->wBuffer, plan.config.deploymentID());
+                    request.deploymentIDs.push_back(plan.config.deploymentID());
                   }
+                  capturePresentSystemArtifactRefs(request.systemArtifacts);
 
-                  Message::finish(bv->wBuffer, headerOffset);
+                  String serializedRequest = {};
+                  BitseryEngine::serialize(serializedRequest, request);
+                  Message::construct(bv->wBuffer, BrainTopic::reconcileState, serializedRequest);
                 }
               }
             }

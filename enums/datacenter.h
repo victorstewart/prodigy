@@ -136,8 +136,7 @@ enum class BrainTopic : uint16_t {
   replicateContainerHealthy,
   replicateContainerRuntimeReady,
   replicateContainerRuntimeState,
-  replicateSystemContainerArtifact,
-  replicateMothershipTunnelProviderState
+  replicateSystemContainerArtifact
 };
 
 enum class NeuronTopic : uint16_t {
