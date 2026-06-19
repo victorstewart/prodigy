@@ -1267,6 +1267,14 @@ int main(void)
           }
         }
 
+        {
+          String cgroupFailure = {};
+          suite.expect(mothershipTunnelGatewayPeerCgroupAllowed(getpid(), ""_ctv, &cgroupFailure), "tunnel_gateway_peer_cgroup_empty_policy_allows");
+          suite.expect(mothershipTunnelGatewayPeerCgroupAllowed(getpid(), "/containers.slice/not-current.slice/leaf"_ctv, &cgroupFailure) == false &&
+                           cgroupFailure.equal("mothership tunnel gateway peer cgroup rejected"_ctv),
+                       "tunnel_gateway_peer_cgroup_mismatch_rejected");
+        }
+
         MothershipTunnelGatewaySessionResult gatewayResult = {};
         ControlServerState gatewayControlState = {};
         String gatewayControlFailure = {};

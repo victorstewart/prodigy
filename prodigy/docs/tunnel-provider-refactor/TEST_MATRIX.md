@@ -20,6 +20,10 @@
 | `cmake --build .run/phase-runtime --target prodigy -j16` | pass |
 | `.run/phase-runtime/prodigy_brain_replication_credentials_unit` after health-aging change | pass |
 | `cmake --build .run/phase-runtime --target prodigy -j16` after health-aging change | pass |
+| `cmake -S prodigy/dev -B .run/build-cgroup -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++` | pass |
+| `cmake --build .run/build-cgroup --target prodigy mothership prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit --parallel 16` | pass |
+| `.run/build-cgroup/prodigy_mothership_unix_connect_unit` after gateway cgroup identity change | pass |
+| `.run/build-cgroup/prodigy_brain_replication_credentials_unit` after gateway cgroup identity change | pass |
 
 ## Privileged Tests Run In VM
 
@@ -45,4 +49,5 @@ Reason: the focused VM verification proved the touched unit/BPF paths, but the o
 - Running provider report/reconcile skips artifact presence/load in focused counter tests.
 - Provider state upload is keyed by `SystemContainerKind`, not the reserved fragment alone.
 - Provider health ages out from one historical authenticated session in focused Brain tests.
+- Gateway accepts only after provider launch and rejects Unix peers outside the launched provider cgroup.
 - Remote branch head matches local head.

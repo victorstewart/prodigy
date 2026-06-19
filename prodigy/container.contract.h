@@ -16,6 +16,20 @@ enum class SystemContainerKind : uint8_t {
 constexpr static uint8_t prodigyMothershipTunnelProviderRuntimeFragment = 254;
 constexpr static uint32_t prodigyMothershipTunnelProviderRuntimeUID = 65'535u * uint32_t(prodigyMothershipTunnelProviderRuntimeFragment);
 
+static inline void prodigyContainerCgroupSlicePath(const String& containerName, String& path)
+{
+  path.assign("/sys/fs/cgroup/containers.slice/"_ctv);
+  path.append(containerName);
+  path.append(".slice"_ctv);
+}
+
+static inline void prodigyContainerCgroupProcLeafSuffix(const String& containerName, String& path)
+{
+  path.assign("/containers.slice/"_ctv);
+  path.append(containerName);
+  path.append(".slice/leaf"_ctv);
+}
+
 static inline String prodigyContainerErrnoString(int err)
 {
   String text = {};

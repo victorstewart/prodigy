@@ -8,7 +8,7 @@ production	6	2	4	enums/datacenter.h
 production	30	0	30	prodigy/brain/base.h
 production	558	29	529	prodigy/brain/brain.h
 production	2	1	1	prodigy/brain/machine.h
-production	88	4	84	prodigy/container.contract.h
+production	102	4	98	prodigy/container.contract.h
 production	163	2	161	prodigy/containerstore.h
 build	7	0	7	prodigy/dev/CMakeLists.txt
 test	278	0	278	prodigy/dev/tests/mothership_tunnel_provider_fixture.cpp
@@ -22,7 +22,7 @@ test	107	0	107	prodigy/dev/tests/prodigy_container_overlay_sync_unit.cpp
 test	70	4	66	prodigy/dev/tests/prodigy_deployments_unit.cpp
 test	130	1	129	prodigy/dev/tests/prodigy_mothership_cluster_registry_unit.cpp
 test	2	1	1	prodigy/dev/tests/prodigy_mothership_topic_fuzz.cpp
-test	570	4	566	prodigy/dev/tests/prodigy_mothership_unix_connect_unit.cpp
+test	578	4	574	prodigy/dev/tests/prodigy_mothership_unix_connect_unit.cpp
 test	33	2	31	prodigy/dev/tests/prodigy_persistent_state_unit.cpp
 test	5	5	0	prodigy/dev/tests/prodigy_switchboard_whitehole_unit.cpp
 production	17	11	6	prodigy/discombobulator/src/build.rs
@@ -40,13 +40,13 @@ production	88	4	84	prodigy/mothership/mothership.cluster.registry.h
 production	21	0	21	prodigy/mothership/mothership.cluster.types.h
 production	675	45	630	prodigy/mothership/mothership.cpp
 production	208	0	208	prodigy/mothership/mothership.tunnel.auth.h
-production	518	0	518	prodigy/mothership/mothership.tunnel.gateway.h
+production	567	0	567	prodigy/mothership/mothership.tunnel.gateway.h
 production	120	0	120	prodigy/mothership/mothership.tunnel.policy.h
 production	1	0	1	prodigy/neuron/base.h
-production	366	123	243	prodigy/neuron/containers.h
+production	370	135	235	prodigy/neuron/containers.h
 production	28	18	10	prodigy/neuron/neuron.h
 production	16	18	-2	prodigy/persistent.state.h
-production	280	2	278	prodigy/prodigy.cpp
+production	306	2	304	prodigy/prodigy.cpp
 production	37	0	37	prodigy/system.container.policy.h
 production	223	1	222	prodigy/types.h
 production	27	0	27	switchboard/kernel/container.egress.router.ebpf.c

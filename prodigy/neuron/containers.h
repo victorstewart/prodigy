@@ -6301,9 +6301,7 @@ public:
   static int create_cgroupv2(const Container *container)
   {
     String path;
-    path.assign("/sys/fs/cgroup/containers.slice/"_ctv);
-    path.append(container->name);
-    path.append(".slice"_ctv);
+    prodigyContainerCgroupSlicePath(container->name, path);
 
     int middirfd = Filesystem::createOpenDirectoryAt(-1, path);
     if (middirfd < 0)
@@ -6510,9 +6508,7 @@ public:
             }
 
             String path;
-            path.assign("/sys/fs/cgroup/containers.slice/"_ctv);
-            path.append(owner->name);
-            path.append(".slice"_ctv);
+            prodigyContainerCgroupSlicePath(owner->name, path);
 
             int slicefd = Filesystem::createOpenDirectoryAt(-1, path);
 
@@ -6597,9 +6593,7 @@ public:
   static bool openContainerSliceFD(const Container *container, int& sliceFD, String *pathOut = nullptr)
   {
     String path;
-    path.assign("/sys/fs/cgroup/containers.slice/"_ctv);
-    path.append(container->name);
-    path.append(".slice"_ctv);
+    prodigyContainerCgroupSlicePath(container->name, path);
 
     sliceFD = Filesystem::openDirectoryAt(-1, path);
     if (sliceFD < 0)
@@ -9309,9 +9303,7 @@ public:
     std::fflush(stderr);
 
     // destroy cgroup tree
-    path.assign("/sys/fs/cgroup/containers.slice/"_ctv);
-    path.append(container->name);
-    path.append(".slice"_ctv);
+    prodigyContainerCgroupSlicePath(container->name, path);
     rmdir(path.c_str());
 
     std::fprintf(stderr, "destroyContainer cgroup-teardown-end uuid=%llu waitingForCloseEvent=%d\n",

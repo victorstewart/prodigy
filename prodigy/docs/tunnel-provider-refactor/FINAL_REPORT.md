@@ -18,19 +18,19 @@ excluding evidence artifacts under `prodigy/docs/tunnel-provider-refactor/*`.
 | State | Files | Insertions | Deletions |
 |---|---:|---:|---:|
 | Draft feature baseline | 52 | 7437 | 434 |
-| Current branch | 55 | 5756 | 526 |
+| Current branch | 55 | 5857 | 538 |
 
 Category ledger:
 
 | Category | Draft net | Current net | Net removed |
 |---|---:|---:|---:|
-| Production | +4883 | +3207 | 1676 |
-| Tests | +2081 | +1988 | 93 |
+| Production | +4883 | +3288 | 1595 |
+| Tests | +2081 | +1996 | 85 |
 | Docs | +30 | +28 | 2 |
 | Build metadata | +9 | +7 | 2 |
 
 The current project gate command, excluding evidence artifacts, reports
-`+5756 -526 net +5230` across 55 files. The full diff including evidence
+`+5857 -538 net +5319` across 55 files. The full diff including evidence
 artifacts is intentionally larger because this report and ledger are tracked.
 
 ## Lines Removed By Subsystem
@@ -67,6 +67,7 @@ Fixed or hard-cut:
 - Provider failure no longer disables a generation by matching a diagnostic string prefix; it enters explicit backoff and can retry.
 - Provider health now ages out after a bounded control-session TTL instead of staying healthy forever after one session.
 - Uploaded provider state is intercepted by `SystemContainerKind::mothershipTunnelProvider`, not by the reserved fragment alone.
+- Gateway accept now starts only after the launched provider cgroup is known, and each Unix peer must match the provider UID plus that exact cgroup before TLS/control proxying.
 - Tunnel endpoint input is hard-cut to public IPv4 literal TCP.
 - Cluster schema types no longer own certificate parsing/generation, egress policy helpers, runtime policy, or Brain runtime state.
 - Tunnel desired state is folded into `ProdigyMasterAuthorityRuntimeState`; the old dedicated Brain topic and persistent record are deleted.
@@ -131,6 +132,7 @@ All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 - `./prodigy_brain_replication_credentials_unit`
 - `./prodigy_brain_topic_fuzz -runs=100000`
 - Repeated `cmake --build .run/phase-runtime --target prodigy_brain_replication_credentials_unit -j16`, `./prodigy_brain_replication_credentials_unit`, and `cmake --build .run/phase-runtime --target prodigy -j16` after the system-kind upload identity and health-aging slices.
+- In fresh VM worktree `/work/prodigy-verify-cgroup-9YBkT2` at `e24d08e` plus the cgroup-gateway patch: `git diff --check`; `cmake -S prodigy/dev -B .run/build-cgroup -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++`; `cmake --build .run/build-cgroup --target prodigy mothership prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-cgroup/prodigy_mothership_unix_connect_unit`; `.run/build-cgroup/prodigy_brain_replication_credentials_unit`.
 
 Earlier validation on the same branch also covered the broader build/test matrix:
 cluster registry, deployments, bundle artifact, BPF attach units, host/container

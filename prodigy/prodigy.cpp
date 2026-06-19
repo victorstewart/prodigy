@@ -1015,7 +1015,7 @@ public:
     }
   }
 
-  bool startMothershipTunnelGateway(const MothershipTunnelProviderSpec& spec, const MothershipTunnelGatewayAuth& gatewayAuth, String *failure = nullptr)
+  bool prepareMothershipTunnelGateway(const MothershipTunnelProviderSpec& spec, String *failure = nullptr)
   {
     if (mothershipTunnelProviderSpecValid(spec, failure) == false)
     {
@@ -1049,13 +1049,31 @@ public:
       return false;
     }
 
+    if (failure)
+    {
+      failure->clear();
+    }
+    return true;
+  }
+
+  bool startMothershipTunnelGateway(const MothershipTunnelGatewayAuth& gatewayAuth, const String& expectedProviderCgroup, String *failure = nullptr)
+  {
+    if (mothershipTunnelGatewayListener.fd < 0 || expectedProviderCgroup.size() == 0)
+    {
+      if (failure)
+      {
+        failure->assign("mothership tunnel gateway provider identity missing"_ctv);
+      }
+      return false;
+    }
+
     int listenerFD = mothershipTunnelGatewayListener.fd;
     String controlSocketPath = mothershipUnixSocketPath;
     MothershipTunnelGatewayAuth gatewayAuthCopy = gatewayAuth;
     mothershipTunnelGatewayStopRequested.store(false);
     mothershipTunnelGatewayActiveStreamFD.store(-1);
     mothershipTunnelGatewayFailureCount.store(0);
-    mothershipTunnelGatewayThread = std::thread([this, listenerFD, controlSocketPath, gatewayAuthCopy]() mutable {
+    mothershipTunnelGatewayThread = std::thread([this, listenerFD, controlSocketPath, gatewayAuthCopy, expectedProviderCgroup]() mutable {
       while (mothershipTunnelGatewayStopRequested.load() == false)
       {
         pollfd descriptor = {};
@@ -1091,7 +1109,7 @@ public:
 
         int streamFD = -1;
         String sessionFailure = {};
-        if (mothershipTunnelGatewayAcceptUnixStream(listenerFD, streamFD, &sessionFailure) == false)
+        if (mothershipTunnelGatewayAcceptUnixStream(listenerFD, streamFD, &sessionFailure, expectedProviderCgroup) == false)
         {
           if (mothershipTunnelGatewayStopRequested.load() == false)
           {
@@ -1143,12 +1161,12 @@ public:
     mothershipTunnelGatewayActiveStreamFD.store(-1);
   }
 
-  bool startMothershipTunnelProviderInstance(const MothershipTunnelProviderSpec& spec, const String& artifactBlob, uint128_t& containerUUID, String *failure = nullptr)
+  bool startMothershipTunnelProviderInstance(const MothershipTunnelProviderSpec& spec, const String& artifactBlob, uint128_t& containerUUID, String *providerCgroup, String *failure = nullptr)
   {
     containerUUID = 0;
-    if (mothershipTunnelProviderSpecValid(spec, failure) == false)
+    if (providerCgroup)
     {
-      return false;
+      providerCgroup->clear();
     }
     if (thisNeuron == nullptr)
     {
@@ -1205,7 +1223,8 @@ public:
     containerPlan.systemExecuteEnv = std::move(env);
 
     ContainerManager::spinContainer(containerPlan, 0, NeuronContainerMetricPolicy {});
-    if (auto it = thisNeuron->containers.find(containerUUID); it == thisNeuron->containers.end() || it->second == nullptr || it->second->cgroup < 0)
+    auto containerIt = thisNeuron->containers.find(containerUUID);
+    if (containerIt == thisNeuron->containers.end() || containerIt->second == nullptr || containerIt->second->cgroup < 0)
     {
       stopMothershipTunnelProviderInstance(containerUUID);
       containerUUID = 0;
@@ -1214,6 +1233,10 @@ public:
         failure->assign("mothership tunnel provider cgroup unavailable"_ctv);
       }
       return false;
+    }
+    if (providerCgroup)
+    {
+      prodigyContainerCgroupProcLeafSuffix(containerIt->second->name, *providerCgroup);
     }
 
     if (failure)
@@ -1226,12 +1249,15 @@ public:
   bool startMothershipTunnelProviderRuntime(const MothershipTunnelProviderSpec& spec, const MothershipTunnelGatewayAuth& gatewayAuth, const String& artifactBlob, uint128_t& containerUUID, String *failure = nullptr) override
   {
     containerUUID = 0;
-    if (startMothershipTunnelGateway(spec, gatewayAuth, failure) == false)
+    if (prepareMothershipTunnelGateway(spec, failure) == false)
     {
       return false;
     }
 
-    if (startMothershipTunnelProviderInstance(spec, artifactBlob, containerUUID, failure) && containerUUID != 0)
+    String providerCgroup = {};
+    if (startMothershipTunnelProviderInstance(spec, artifactBlob, containerUUID, &providerCgroup, failure) &&
+        containerUUID != 0 &&
+        startMothershipTunnelGateway(gatewayAuth, providerCgroup, failure))
     {
       return true;
     }

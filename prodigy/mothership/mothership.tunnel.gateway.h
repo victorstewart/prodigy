@@ -145,7 +145,52 @@ static inline bool mothershipTunnelGatewayCreateUnixListener(const String& socke
   return true;
 }
 
-static inline bool mothershipTunnelGatewayPeerAllowed(int streamFD, String *failure = nullptr)
+static inline bool mothershipTunnelGatewayPeerCgroupAllowed(pid_t peerPid, const String& expectedCgroup, String *failure = nullptr)
+{
+  if (expectedCgroup.size() == 0)
+  {
+    return true;
+  }
+  if (peerPid <= 0)
+  {
+    if (failure)
+    {
+      failure->assign("mothership tunnel gateway peer pid invalid"_ctv);
+    }
+    return false;
+  }
+
+  String path = {};
+  path.snprintf<"/proc/{itoa}/cgroup"_ctv>(uint64_t(peerPid));
+  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  char actual[512];
+  ssize_t bytes = fd >= 0 ? ::read(fd, actual, sizeof(actual)) : -1;
+  if (fd >= 0)
+  {
+    ::close(fd);
+  }
+
+  String expected = {};
+  expected.assign("0::"_ctv);
+  expected.append(expectedCgroup);
+  expected.append("\n"_ctv);
+  if (bytes != ssize_t(expected.size()) || std::memcmp(actual, expected.data(), expected.size()) != 0)
+  {
+    if (failure)
+    {
+      failure->assign("mothership tunnel gateway peer cgroup rejected"_ctv);
+    }
+    return false;
+  }
+
+  if (failure)
+  {
+    failure->clear();
+  }
+  return true;
+}
+
+static inline bool mothershipTunnelGatewayPeerAllowed(int streamFD, String *failure = nullptr, const String& expectedCgroup = ""_ctv)
 {
   if (streamFD < 0)
   {
@@ -175,6 +220,10 @@ static inline bool mothershipTunnelGatewayPeerAllowed(int streamFD, String *fail
     }
     return false;
   }
+  if (mothershipTunnelGatewayPeerCgroupAllowed(peer.pid, expectedCgroup, failure) == false)
+  {
+    return false;
+  }
 #else
   if (failure)
   {
@@ -190,7 +239,7 @@ static inline bool mothershipTunnelGatewayPeerAllowed(int streamFD, String *fail
   return true;
 }
 
-static inline bool mothershipTunnelGatewayAcceptUnixStream(int listenerFD, int& streamFD, String *failure = nullptr)
+static inline bool mothershipTunnelGatewayAcceptUnixStream(int listenerFD, int& streamFD, String *failure = nullptr, const String& expectedCgroup = ""_ctv)
 {
   streamFD = -1;
   for (;;)
@@ -219,7 +268,7 @@ static inline bool mothershipTunnelGatewayAcceptUnixStream(int listenerFD, int& 
     return false;
   }
 
-  if (mothershipTunnelGatewayPeerAllowed(streamFD, failure) == false)
+  if (mothershipTunnelGatewayPeerAllowed(streamFD, failure, expectedCgroup) == false)
   {
     ::close(streamFD);
     streamFD = -1;
