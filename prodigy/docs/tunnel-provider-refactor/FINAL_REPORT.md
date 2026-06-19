@@ -49,7 +49,7 @@ artifacts is intentionally larger because this report and ledger are tracked.
 - System egress plan: replaced the variable-length `ContainerPlan` egress host/port pair and Neuron-side parser state with a prevalidated numeric `SystemContainerEgressPolicy`; text is rendered only at the provider env boundary.
 - Artifact launch boundary: removed the full verified artifact load/copy from Brain reconcile and deleted the artifact blob parameter from Brain/Prodigy provider launch hooks.
 - System plan boundary: folded kind, artifact reference, egress tuple, and fixed runtime resources into one typed `SystemContainerRuntimePlan`, so provider launch no longer seeds fake stateless-application config fields.
-- System artifact verification: `ContainerStore::systemVerify` now validates digest/size and reads only the fixed contract header instead of loading the whole artifact a second time for header validation.
+- System artifact verification: `ContainerStore::systemVerify` now validates digest/size and reads only the fixed contract header instead of loading the whole artifact a second time for header validation; `systemLoadVerified` no longer reparses that header after loading bytes already verified by key and size.
 - Create auth boundary: removed server auth from `MothershipTunnelProviderSpec`; gateway server auth is create-only hook input and only the client auth persists.
 - Gateway I/O retry path: TLS accept/read/write now treats OpenSSL `WANT_READ`/`WANT_WRITE` as bounded wait states and drains buffered TLS plaintext before polling the socket again.
 - Gateway health event: the runtime now marks provider health when authenticated TLS opens the guarded control socket, not after the proxy loop exits.
@@ -117,6 +117,7 @@ Fixed or hard-cut:
 - Brain tunnel desired-state application now has one commit boundary after create/runtime sanitization; there is no separate prepared-state sync wrapper.
 - System artifact store no longer reports digest/size copies from the write path; create preflight records the already computed enforced key.
 - Tunnel-provider create preflight no longer validates the same provider header before calling the system artifact store; invalid kind/version/payload errors come from the store boundary.
+- System artifact load no longer validates the same provider header after `systemVerify`; the load path checks that the full read returns the verified byte count.
 
 Superseded by later user direction:
 
@@ -208,6 +209,7 @@ All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 - After collapsing Brain tunnel desired-state commit wrappers in the same VM worktree: `git diff --check`; incremental `cmake --build .run/build-numeric-egress --target prodigy mothership prodigy_brain_replication_credentials_unit prodigy_persistent_state_unit prodigy_brain_topic_fuzz --parallel 16`; `.run/build-numeric-egress/prodigy_brain_replication_credentials_unit`; `.run/build-numeric-egress/prodigy_persistent_state_unit`; `.run/build-numeric-egress/prodigy_brain_topic_fuzz -runs=100000`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before and after build/test.
 - After collapsing the redundant `ContainerStore::systemStore` output API in the same VM worktree: `git diff --check`; incremental `cmake --build .run/build-numeric-egress --target prodigy mothership prodigy_deployments_unit prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-numeric-egress/prodigy_deployments_unit`; `.run/build-numeric-egress/prodigy_mothership_unix_connect_unit`; `.run/build-numeric-egress/prodigy_brain_replication_credentials_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` after build/test.
 - After deleting duplicate Mothership-side provider artifact header validation: `git diff --check`; incremental `cmake --build .run/build-numeric-egress --target prodigy mothership prodigy_mothership_unix_connect_unit --parallel 16`; `.run/build-numeric-egress/prodigy_mothership_unix_connect_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before and after build/test.
+- After removing duplicate post-load system artifact header validation: `git diff --check`; incremental `cmake --build .run/build-numeric-egress --target prodigy mothership prodigy_deployments_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-numeric-egress/prodigy_deployments_unit`; `.run/build-numeric-egress/prodigy_brain_replication_credentials_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before and after build/test.
 
 Earlier validation on the same branch also covered the broader build/test matrix:
 cluster registry, deployments, bundle artifact, BPF attach units, host/container

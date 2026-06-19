@@ -634,7 +634,7 @@ public:
       return false;
     }
     Filesystem::openReadAtClose(-1, pathForSystemArtifactWithinRoot(root, sha256), blob);
-    if (blob.size() == 0)
+    if (blob.size() != bytes)
     {
       if (failureReport)
       {
@@ -642,7 +642,7 @@ public:
       }
       return false;
     }
-    return validateSystemArtifactContract(blob, failureReport);
+    return true;
   }
 
   static void destroy(uint64_t deploymentID)
