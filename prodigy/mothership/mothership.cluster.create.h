@@ -281,11 +281,6 @@ static inline bool mothershipBuildClusterDNSCredential(const MothershipProdigyCl
 
 static inline bool mothershipResolveClusterControlSocketPath(const MothershipProdigyCluster& cluster, String& controlSocketPath, String *failure);
 
-static inline bool mothershipBuildClusterMothershipConnectivityRuntimeConfig(const MothershipProdigyCluster& cluster, MothershipConnectivityRuntimeConfig& config, String *failure = nullptr)
-{
-  return mothershipBuildMothershipConnectivityRuntimeConfig(cluster.mothershipConnectivity, config, failure);
-}
-
 static inline bool mothershipBuildClusterBrainConfig(const MothershipProdigyCluster& cluster, const MothershipProviderCredential *credential, BrainConfig& config, String *failure = nullptr, const MothershipProviderCredential *dnsCredential = nullptr)
 {
   config = {};

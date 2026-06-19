@@ -272,33 +272,30 @@ static bool mothershipTunnelGatewaySetTimeout(int fd, int timeoutMs, String *fai
 
 static bool mothershipTunnelGatewayWaitFD(int fd, short events, int timeoutMs, String *failure = nullptr)
 {
-  for (;;)
+  pollfd descriptor = {fd, events, 0};
+  int ready = 0;
+  do
   {
-    pollfd descriptor = {fd, events, 0};
-    int ready = ::poll(&descriptor, 1, timeoutMs);
-    if (ready > 0)
-    {
-      return (descriptor.revents & events) != 0
-                 ? true
-                 : mothershipTunnelGatewayFail(failure, "mothership tunnel gateway proxy peer closed"_ctv);
-    }
-    if (ready == 0)
-    {
-      return mothershipTunnelGatewayFail(failure, "mothership tunnel gateway proxy idle timeout"_ctv);
-    }
-    if (errno != EINTR)
-    {
-      return mothershipTunnelGatewayFailErrno(failure, "mothership tunnel gateway proxy poll failed"_ctv);
-    }
+    descriptor.revents = 0;
+    ready = ::poll(&descriptor, 1, timeoutMs);
+  } while (ready < 0 && errno == EINTR);
+  if (ready > 0)
+  {
+    return (descriptor.revents & events) != 0
+               ? true
+               : mothershipTunnelGatewayFail(failure, "mothership tunnel gateway proxy peer closed"_ctv);
   }
+  return ready == 0
+             ? mothershipTunnelGatewayFail(failure, "mothership tunnel gateway proxy idle timeout"_ctv)
+             : mothershipTunnelGatewayFailErrno(failure, "mothership tunnel gateway proxy poll failed"_ctv);
 }
 
-static int mothershipTunnelGatewayTLSRetry(SSL *tls, int rc, int fd, int timeoutMs, const auto& failureText, String *failure = nullptr)
+static int mothershipTunnelGatewayTLSRetry(SSL *tls, int rc, int timeoutMs, const auto& failureText, String *failure = nullptr)
 {
   int error = SSL_get_error(tls, rc);
   if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE)
   {
-    return mothershipTunnelGatewayWaitFD(fd, error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT, timeoutMs, failure) ? 1 : -1;
+    return mothershipTunnelGatewayWaitFD(SSL_get_fd(tls), error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT, timeoutMs, failure) ? 1 : -1;
   }
   if (error == SSL_ERROR_ZERO_RETURN)
   {
@@ -345,7 +342,7 @@ static bool mothershipTunnelGatewayWriteAllTLS(SSL *tls, const uint8_t *buffer, 
       bytes -= size_t(rc);
       continue;
     }
-    int retry = mothershipTunnelGatewayTLSRetry(tls, rc, SSL_get_fd(tls), idleTimeoutMs, "mothership tunnel gateway TLS write failed"_ctv, failure);
+    int retry = mothershipTunnelGatewayTLSRetry(tls, rc, idleTimeoutMs, "mothership tunnel gateway TLS write failed"_ctv, failure);
     if (retry > 0)
     {
       continue;
@@ -356,13 +353,13 @@ static bool mothershipTunnelGatewayWriteAllTLS(SSL *tls, const uint8_t *buffer, 
   return mothershipTunnelGatewayOk(failure);
 }
 
-static bool mothershipTunnelGatewayProxyLoop(SSL *tls, int tlsFD, int controlFD, int idleTimeoutMs, String *failure = nullptr)
+static bool mothershipTunnelGatewayProxyLoop(SSL *tls, int controlFD, int idleTimeoutMs, String *failure = nullptr)
 {
   uint8_t buffer[16 * 1024];
   for (;;)
   {
     pollfd descriptors[2] = {};
-    descriptors[0].fd = tlsFD;
+    descriptors[0].fd = SSL_get_fd(tls);
     descriptors[0].events = POLLIN;
     descriptors[1].fd = controlFD;
     descriptors[1].events = POLLIN;
@@ -398,7 +395,7 @@ static bool mothershipTunnelGatewayProxyLoop(SSL *tls, int tlsFD, int controlFD,
       }
       else
       {
-        int retry = mothershipTunnelGatewayTLSRetry(tls, rc, tlsFD, idleTimeoutMs, "mothership tunnel gateway TLS read failed"_ctv, failure);
+        int retry = mothershipTunnelGatewayTLSRetry(tls, rc, idleTimeoutMs, "mothership tunnel gateway TLS read failed"_ctv, failure);
         if (retry > 0)
         {
           continue;
@@ -437,14 +434,6 @@ static bool mothershipTunnelGatewayProxyLoop(SSL *tls, int tlsFD, int controlFD,
   }
 }
 
-static void mothershipTunnelGatewayPublishSessionResult(MothershipTunnelGatewaySessionResult *destination, const MothershipTunnelGatewaySessionResult& result)
-{
-  if (destination)
-  {
-    *destination = result;
-  }
-}
-
 bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
     int streamFD,
     const String& controlSocketPath,
@@ -454,9 +443,15 @@ bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
     int idleTimeoutMs)
 {
   MothershipTunnelGatewaySessionResult result = {};
-  mothershipTunnelGatewayPublishSessionResult(sessionResult, result);
+  auto publish = [&]() {
+    if (sessionResult)
+    {
+      *sessionResult = result;
+    }
+  };
+  publish();
   auto fail = [&](auto&& text) -> bool {
-    mothershipTunnelGatewayPublishSessionResult(sessionResult, result);
+    publish();
     return mothershipTunnelGatewayFail(failure, text);
   };
 
@@ -471,7 +466,7 @@ bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
   idleTimeoutMs = std::max(idleTimeoutMs, 1);
   if (mothershipTunnelGatewaySetTimeout(streamFD, idleTimeoutMs, failure) == false)
   {
-    mothershipTunnelGatewayPublishSessionResult(sessionResult, result);
+    publish();
     return false;
   }
   std::unique_ptr<SSL, decltype(&SSL_free)> tls(nullptr, SSL_free);
@@ -496,10 +491,10 @@ bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
     {
       break;
     }
-    int retry = mothershipTunnelGatewayTLSRetry(tls.get(), rc, streamFD, idleTimeoutMs, "mothership tunnel gateway TLS accept failed"_ctv, failure);
+    int retry = mothershipTunnelGatewayTLSRetry(tls.get(), rc, idleTimeoutMs, "mothership tunnel gateway TLS accept failed"_ctv, failure);
     if (retry <= 0)
     {
-      mothershipTunnelGatewayPublishSessionResult(sessionResult, result);
+      publish();
       return retry == 0 ? fail("mothership tunnel gateway TLS accept failed"_ctv) : false;
     }
   }
@@ -510,25 +505,25 @@ bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
   clientCert.reset(SSL_get1_peer_certificate(tls.get()));
   if (tlsContext.authorizeClientCertificate(clientCert.get(), failure) == false)
   {
-    mothershipTunnelGatewayPublishSessionResult(sessionResult, result);
+    publish();
     return false;
   }
   result.authenticated = true;
   if (mothershipTunnelGatewayOpenUnixControlSocket(controlSocketPath, controlFD, failure) == false)
   {
-    mothershipTunnelGatewayPublishSessionResult(sessionResult, result);
+    publish();
     return false;
   }
   if (mothershipTunnelGatewaySetTimeout(controlFD, idleTimeoutMs, failure) == false)
   {
     closeControl();
-    mothershipTunnelGatewayPublishSessionResult(sessionResult, result);
+    publish();
     return false;
   }
   result.openedControlSocket = true;
-  bool ok = mothershipTunnelGatewayProxyLoop(tls.get(), streamFD, controlFD, idleTimeoutMs, failure);
+  bool ok = mothershipTunnelGatewayProxyLoop(tls.get(), controlFD, idleTimeoutMs, failure);
   closeControl();
-  mothershipTunnelGatewayPublishSessionResult(sessionResult, result);
+  publish();
   return ok ? mothershipTunnelGatewayOk(failure) : false;
 }
 

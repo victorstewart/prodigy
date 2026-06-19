@@ -4894,7 +4894,7 @@ public:
     {
       const MothershipTunnelProviderSpec& spec = cluster.mothershipConnectivity.tunnelProvider;
       MothershipConnectivityRuntimeConfig runtimeConfig = {};
-      if (mothershipBuildClusterMothershipConnectivityRuntimeConfig(cluster, runtimeConfig, failure) == false)
+      if (mothershipBuildMothershipConnectivityRuntimeConfig(cluster.mothershipConnectivity, runtimeConfig, failure) == false)
       {
         return false;
       }
@@ -8057,7 +8057,7 @@ private:
           MothershipTunnelProviderConfigureRequest request = {};
           request.artifactBlob = std::move(artifactBlob);
           request.desired.gatewayAuth = tunnelProviderGatewayAuth;
-          if (mothershipBuildClusterMothershipConnectivityRuntimeConfig(cluster, request.desired.connectivity, &requestFailure) == false)
+          if (mothershipBuildMothershipConnectivityRuntimeConfig(cluster.mothershipConnectivity, request.desired.connectivity, &requestFailure) == false)
           {
             return false;
           }

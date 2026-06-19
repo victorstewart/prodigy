@@ -35,12 +35,12 @@ test	10	1	9	prodigy/discombobulator/tests/parser.rs
 doc	14	0	14	prodigy/docs/runtime.md
 doc	14	0	14	prodigy/docs/security.md
 production	24	10	14	prodigy/ingress.validation.h
-production	6	0	6	prodigy/mothership/mothership.cluster.create.h
+production	1	0	1	prodigy/mothership/mothership.cluster.create.h
 production	86	4	82	prodigy/mothership/mothership.cluster.registry.h
 production	21	0	21	prodigy/mothership/mothership.cluster.types.h
 production	646	48	598	prodigy/mothership/mothership.cpp
 production	298	0	298	prodigy/mothership/mothership.tunnel.auth.h
-production	650	0	650	prodigy/mothership/mothership.tunnel.gateway.cpp
+production	645	0	645	prodigy/mothership/mothership.tunnel.gateway.cpp
 production	66	0	66	prodigy/mothership/mothership.tunnel.gateway.h
 production	104	0	104	prodigy/mothership/mothership.tunnel.policy.h
 production	1	0	1	prodigy/neuron/base.h
