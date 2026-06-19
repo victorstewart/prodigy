@@ -8,8 +8,8 @@ production	6	2	4	enums/datacenter.h
 production	34	0	34	prodigy/brain/base.h
 production	542	247	295	prodigy/brain/brain.h
 production	2	1	1	prodigy/brain/machine.h
-production	116	4	112	prodigy/container.contract.h
-production	177	2	175	prodigy/containerstore.h
+production	102	4	98	prodigy/container.contract.h
+production	159	2	157	prodigy/containerstore.h
 build	11	2	9	prodigy/dev/CMakeLists.txt
 test	276	0	276	prodigy/dev/tests/mothership_tunnel_provider_fixture.cpp
 test	0	9	-9	prodigy/dev/tests/prodigy_brain_config_ssh_replication_unit.cpp
@@ -19,7 +19,7 @@ test	0	9	-9	prodigy/dev/tests/prodigy_brain_overlay_hosted_ingress_unit.cpp
 test	744	15	729	prodigy/dev/tests/prodigy_brain_replication_credentials_unit.cpp
 test	3	1	2	prodigy/dev/tests/prodigy_brain_topic_fuzz.cpp
 test	107	0	107	prodigy/dev/tests/prodigy_container_overlay_sync_unit.cpp
-test	70	4	66	prodigy/dev/tests/prodigy_deployments_unit.cpp
+test	81	4	77	prodigy/dev/tests/prodigy_deployments_unit.cpp
 test	122	1	121	prodigy/dev/tests/prodigy_mothership_cluster_registry_unit.cpp
 test	2	1	1	prodigy/dev/tests/prodigy_mothership_topic_fuzz.cpp
 test	619	4	615	prodigy/dev/tests/prodigy_mothership_unix_connect_unit.cpp

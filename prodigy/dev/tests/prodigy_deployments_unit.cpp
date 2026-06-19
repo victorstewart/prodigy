@@ -89,6 +89,17 @@ public:
   }
 };
 
+static bool tunnelProviderHeaderValid(const String& blobPath, String *failureReport)
+{
+  int fd = -1;
+  bool ok = prodigyOpenMothershipTunnelProviderBlobPayloadAfterContractHeader(blobPath, fd, failureReport);
+  if (fd >= 0)
+  {
+    close(fd);
+  }
+  return ok;
+}
+
 class PairingCountingContainerView : public ContainerView {
 public:
 
@@ -1577,10 +1588,10 @@ int main(void)
           Filesystem::openWriteAtClose(-1, stringFromFilesystemPath(tunnelBlobPath), tunnelPayload) >= 0,
           "mothership_tunnel_provider_blob_fixture_written");
       suite.expect(
-          prodigyValidateMothershipTunnelProviderBlobHeader(stringFromFilesystemPath(tunnelBlobPath), &verificationFailure),
+          tunnelProviderHeaderValid(stringFromFilesystemPath(tunnelBlobPath), &verificationFailure),
           "mothership_tunnel_provider_header_accepts_tunnel_blob");
       suite.expect(
-          prodigyValidateMothershipTunnelProviderBlobHeader(stringFromFilesystemPath(blobPath), &verificationFailure) == false,
+          tunnelProviderHeaderValid(stringFromFilesystemPath(blobPath), &verificationFailure) == false,
           "mothership_tunnel_provider_header_rejects_app_blob");
 
       std::filesystem::path unknownTunnelBlobPath = filesystemPathFromString(workspace.path) / "mothership-tunnel-provider-v2.blob";
@@ -1590,7 +1601,7 @@ int main(void)
           Filesystem::openWriteAtClose(-1, stringFromFilesystemPath(unknownTunnelBlobPath), unknownTunnelPayload) >= 0,
           "mothership_tunnel_provider_unknown_contract_fixture_written");
       suite.expect(
-          prodigyValidateMothershipTunnelProviderBlobHeader(stringFromFilesystemPath(unknownTunnelBlobPath), &verificationFailure) == false,
+          tunnelProviderHeaderValid(stringFromFilesystemPath(unknownTunnelBlobPath), &verificationFailure) == false,
           "mothership_tunnel_provider_header_rejects_unknown_contract_version");
 
       String tunnelDigest = {};

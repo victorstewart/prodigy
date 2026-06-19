@@ -225,17 +225,3 @@ static inline bool prodigyValidateDiscombobulatorContainerBlobHeader(
   close(fd);
   return true;
 }
-
-static inline bool prodigyValidateMothershipTunnelProviderBlobHeader(
-    const String& blobPath,
-    String *failureReport = nullptr)
-{
-  int fd = -1;
-  if (prodigyOpenMothershipTunnelProviderBlobPayloadAfterContractHeader(blobPath, fd, failureReport) == false)
-  {
-    return false;
-  }
-
-  close(fd);
-  return true;
-}
