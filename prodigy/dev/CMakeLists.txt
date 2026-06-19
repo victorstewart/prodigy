@@ -419,7 +419,9 @@ set(PRODIGY_ACME_HOOK_SCRIPTS
 )
 install(PROGRAMS ${PRODIGY_ACME_HOOK_SCRIPTS} DESTINATION lib/prodigy)
 
-add_executable(prodigy ${PRODIGY_ROOT}/prodigy/prodigy.cpp)
+set(PRODIGY_MOTHERSHIP_TUNNEL_GATEWAY_SOURCE "${PRODIGY_ROOT}/prodigy/mothership/mothership.tunnel.gateway.cpp")
+
+add_executable(prodigy ${PRODIGY_ROOT}/prodigy/prodigy.cpp ${PRODIGY_MOTHERSHIP_TUNNEL_GATEWAY_SOURCE})
 add_executable(mothership ${PRODIGY_ROOT}/prodigy/mothership/mothership.cpp)
 add_executable(prodigy_mothership_tunnel_provider ${CMAKE_CURRENT_SOURCE_DIR}/tests/mothership_tunnel_provider_fixture.cpp)
 set_target_properties(prodigy_mothership_tunnel_provider PROPERTIES OUTPUT_NAME mothership-tunnel-provider)
@@ -494,7 +496,7 @@ add_executable(prodigy_mothership_cluster_reconcile_unit ${CMAKE_CURRENT_SOURCE_
 add_executable(prodigy_mothership_cluster_remove_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cluster_remove_unit.cpp)
 add_executable(prodigy_mothership_cluster_create_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cluster_create_unit.cpp)
 add_executable(prodigy_mothership_addmachines_progress_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_addmachines_progress_unit.cpp)
-add_executable(prodigy_mothership_unix_connect_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_unix_connect_unit.cpp)
+add_executable(prodigy_mothership_unix_connect_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_unix_connect_unit.cpp ${PRODIGY_MOTHERSHIP_TUNNEL_GATEWAY_SOURCE})
 add_executable(prodigy_mothership_test_cluster_runner_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_test_cluster_runner_unit.cpp)
 add_executable(prodigy_mothership_provider_credential_registry_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_provider_credential_registry_unit.cpp)
 add_executable(prodigy_mothership_provider_machine_destroy_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_provider_machine_destroy_unit.cpp)

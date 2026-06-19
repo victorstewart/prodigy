@@ -34,6 +34,8 @@
 | `.run/build-cgroup/prodigy_brain_replication_credentials_unit` after system launch-contract cut | pass |
 | `.run/build-cgroup/prodigy_persistent_state_unit` after system launch-contract cut | pass |
 | `.run/build-cgroup/prodigy_mothership_cluster_registry_unit` after system launch-contract cut | pass |
+| `cmake --build .run/build-cgroup --target prodigy prodigy_mothership_unix_connect_unit --parallel 16` after gateway implementation split | pass |
+| `.run/build-cgroup/prodigy_mothership_unix_connect_unit` after gateway implementation split | pass |
 
 ## Privileged Tests Run In VM
 
@@ -65,4 +67,5 @@ Reason: the focused VM verification proved the touched unit/BPF paths, but the o
 - Tunnel gateway client TLS context is cached at cluster configuration and reused across reconnects.
 - System-provider socket/env launch data is derived from `SystemContainerKind`, not serialized through `ContainerPlan`.
 - `PRODIGY_CONTAINER_KIND` launch env is deleted; artifact header plus typed launch state carry that identity.
+- Gateway socket/TLS/proxy implementation moved to compiled `.cpp`; public header is declarations only.
 - Remote branch head matches local head.

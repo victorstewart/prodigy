@@ -18,19 +18,19 @@ excluding evidence artifacts under `prodigy/docs/tunnel-provider-refactor/*`.
 | State | Files | Insertions | Deletions |
 |---|---:|---:|---:|
 | Draft feature baseline | 52 | 7437 | 434 |
-| Current branch | 55 | 5875 | 538 |
+| Current branch | 56 | 5871 | 540 |
 
 Category ledger:
 
 | Category | Draft net | Current net | Net removed |
 |---|---:|---:|---:|
-| Production | +4883 | +3304 | 1579 |
+| Production | +4883 | +3296 | 1587 |
 | Tests | +2081 | +1998 | 83 |
 | Docs | +30 | +28 | 2 |
-| Build metadata | +9 | +7 | 2 |
+| Build metadata | +9 | +9 | 0 |
 
 The current project gate command, excluding evidence artifacts, reports
-`+5875 -538 net +5337` across 55 files. The full diff including evidence
+`+5871 -540 net +5331` across 56 files. The full diff including evidence
 artifacts is intentionally larger because this report and ledger are tracked.
 
 ## Lines Removed By Subsystem
@@ -45,6 +45,7 @@ artifacts is intentionally larger because this report and ledger are tracked.
 - Runtime phase: replaced diagnostic-prefix control flow with explicit `TunnelProviderPhase` transitions and bounded retry state.
 - Gateway TLS: moved server/client context construction out of session connect loops and shared the SSL_CTX certificate setup/peer-authorization helper.
 - System launch contract: deleted mutable `ContainerPlan` env/socket fields and the redundant provider-kind runtime env; Neuron now derives the fixed socket graft and provider env from `SystemContainerKind`.
+- Gateway implementation: moved socket/TLS/proxy code from the public header into a compiled runtime and centralized session result/failure publication.
 
 See `LINE_LEDGER.tsv` for per-path numbers.
 
@@ -53,7 +54,8 @@ See `LINE_LEDGER.tsv` for per-path numbers.
 - `MothershipTunnelProviderSpec`: persisted operator-facing tunnel metadata and client auth.
 - Brain-owned anonymous runtime state: phase, local provider UUID, retry count/deadline, and bounded diagnostic text.
 - `SystemContainerKind::mothershipTunnelProvider`: typed runtime identity for system container launch.
-- `mothership.tunnel.gateway.h`: still contains gateway implementation; it now consumes a cached TLS context but remains a large header.
+- `mothership.tunnel.gateway.h`: compact public declarations for listener, proxy helpers, and `MothershipTunnelGatewayRuntime`.
+- `mothership.tunnel.gateway.cpp`: owns the Unix socket, TLS, proxy, and runtime accept-loop implementation.
 - `ContainerPlan` system fields: still carries system-container kind plus the live egress tuple; socket grafting and launch env are derived by Neuron.
 - Brain still has separate artifact-byte transport because followers must receive artifact bytes before activating the desired state carried in `ProdigyMasterAuthorityRuntimeState`.
 
@@ -76,6 +78,7 @@ Fixed or hard-cut:
 - Cluster schema types no longer own certificate parsing/generation, egress policy helpers, runtime policy, or Brain runtime state.
 - Tunnel desired state is folded into `ProdigyMasterAuthorityRuntimeState`; the old dedicated Brain topic and persistent record are deleted.
 - System-provider launch no longer serializes env or socket paths through `ContainerPlan`; the provider-kind env check is deleted because kind is already proven by artifact header and typed launch state.
+- ProdigyBrain no longer owns gateway thread, active FD, stop flag, or failure counter state directly; it owns one `MothershipTunnelGatewayRuntime`.
 
 Superseded by later user direction:
 
@@ -84,7 +87,7 @@ Superseded by later user direction:
 
 Still open relative to the original goal:
 
-- Gateway implementation is still header-heavy and blocking-oriented.
+- Gateway I/O remains blocking-oriented; implementation is compiled but not a full nonblocking deadline/backpressure/half-close state machine.
 - Artifact envelope is integrity/type declaration, not signed trusted provenance.
 - Dedicated system-container plan extension is incomplete; the remaining mutable surface is the required egress tuple.
 - Full rolling-upgrade protocol gating is not implemented.
@@ -142,6 +145,7 @@ All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 - After caching gateway TLS context and consolidating client/server SSL_CTX certificate setup in the same VM worktree: `git diff --check`; incremental `cmake --build .run/build-cgroup --target prodigy mothership prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-cgroup/prodigy_mothership_unix_connect_unit`; `.run/build-cgroup/prodigy_brain_replication_credentials_unit`.
 - After caching the tunnel gateway client TLS context and deleting the duplicate client-auth validator: `git diff --check`; incremental `cmake --build .run/build-cgroup --target prodigy mothership prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit prodigy_mothership_cluster_registry_unit --parallel 16`; `.run/build-cgroup/prodigy_mothership_unix_connect_unit`; `.run/build-cgroup/prodigy_brain_replication_credentials_unit`; `.run/build-cgroup/prodigy_mothership_cluster_registry_unit`.
 - After deleting mutable system-provider env/socket launch fields from `ContainerPlan`: `git diff --check`; incremental `cmake --build .run/build-cgroup --target prodigy mothership prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit prodigy_container_overlay_sync_unit prodigy_persistent_state_unit prodigy_mothership_cluster_registry_unit --parallel 16`; `.run/build-cgroup/prodigy_mothership_unix_connect_unit`; `.run/build-cgroup/prodigy_brain_replication_credentials_unit`; `PRODIGY_DEV_ALLOW_BPF_ATTACH=1 .run/build-cgroup/prodigy_container_overlay_sync_unit`; `.run/build-cgroup/prodigy_persistent_state_unit`; `.run/build-cgroup/prodigy_mothership_cluster_registry_unit`.
+- After moving gateway socket/TLS/proxy implementation out of the public header: `git diff --check`; incremental `cmake --build .run/build-cgroup --target prodigy prodigy_mothership_unix_connect_unit --parallel 16`; `.run/build-cgroup/prodigy_mothership_unix_connect_unit`.
 
 Earlier validation on the same branch also covered the broader build/test matrix:
 cluster registry, deployments, bundle artifact, BPF attach units, host/container

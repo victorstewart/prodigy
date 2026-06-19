@@ -1,24 +1,14 @@
 #pragma once
 
-#include <algorithm>
-#include <cerrno>
-#include <climits>
-#include <cstdio>
-#include <cstring>
-#include <filesystem>
-#include <memory>
-#include <utility>
-#include <fcntl.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
+#include <atomic>
+#include <cstdint>
+#include <thread>
 #include <sys/types.h>
-#include <sys/un.h>
-#include <unistd.h>
 
-#include <openssl/ssl.h>
+#include <services/prodigy.h>
 
-#include <prodigy/mothership/mothership.tunnel.auth.h>
+struct MothershipTunnelGatewayAuth;
+class MothershipTunnelGatewayTLSContext;
 
 class MothershipTunnelGatewaySessionResult {
 public:
@@ -37,503 +27,45 @@ public:
   MothershipTunnelGatewayUnixListener(const MothershipTunnelGatewayUnixListener&) = delete;
   MothershipTunnelGatewayUnixListener& operator=(const MothershipTunnelGatewayUnixListener&) = delete;
 
-  ~MothershipTunnelGatewayUnixListener()
-  {
-    close();
-  }
-
-  void close(void)
-  {
-    if (fd >= 0)
-    {
-      ::close(fd);
-      fd = -1;
-    }
-    if (path.size() > 0)
-    {
-      (void)::unlink(path.c_str());
-      path.clear();
-    }
-  }
+  ~MothershipTunnelGatewayUnixListener();
+  void close(void);
 };
 
-static inline bool mothershipTunnelGatewayUnixAddress(const String& socketPath, sockaddr_un& address, socklen_t& addressLen, const char *label, String *failure = nullptr)
-{
-  String ownedPath = {};
-  ownedPath.assign(socketPath);
-  if (ownedPath.size() == 0 || ownedPath.size() >= sizeof(address.sun_path))
-  {
-    if (failure)
-    {
-      failure->snprintf<"mothership tunnel gateway {} socket path invalid"_ctv>(String(label));
-    }
-    return false;
-  }
+using MothershipTunnelGatewayFailureCallback = void (*)(void *context, uint64_t failures, String& failure);
+using MothershipTunnelGatewaySessionCallback = void (*)(void *context, const MothershipTunnelGatewaySessionResult& result);
 
-  address = {};
-  address.sun_family = AF_UNIX;
-  std::snprintf(address.sun_path, sizeof(address.sun_path), "%s", ownedPath.c_str());
-  addressLen = socklen_t(sizeof(address.sun_family) + std::strlen(address.sun_path));
-  return true;
-}
+class MothershipTunnelGatewayRuntime {
+public:
 
-static inline bool mothershipTunnelGatewayCreateUnixListener(const String& socketPath, MothershipTunnelGatewayUnixListener& listener, String *failure = nullptr)
-{
-  listener.close();
-  String ownedPath = {};
-  ownedPath.assign(socketPath);
+  MothershipTunnelGatewayUnixListener listener;
+  std::thread thread;
+  std::atomic<bool> stopRequested = false;
+  std::atomic<int> activeStreamFD = -1;
+  std::atomic<uint64_t> failureCount = 0;
 
-  std::error_code createError;
-  std::filesystem::path parent = std::filesystem::path(ownedPath.c_str()).parent_path();
-  if (parent.empty() == false)
-  {
-    std::filesystem::create_directories(parent, createError);
-    if (createError)
-    {
-      if (failure)
-      {
-        failure->snprintf<"mothership tunnel gateway socket directory create failed: {}"_ctv>(String(createError.message().c_str()));
-      }
-      return false;
-    }
-  }
+  MothershipTunnelGatewayRuntime(void) = default;
+  MothershipTunnelGatewayRuntime(const MothershipTunnelGatewayRuntime&) = delete;
+  MothershipTunnelGatewayRuntime& operator=(const MothershipTunnelGatewayRuntime&) = delete;
+  ~MothershipTunnelGatewayRuntime();
 
-  sockaddr_un address = {};
-  socklen_t addressLen = 0;
-  if (mothershipTunnelGatewayUnixAddress(ownedPath, address, addressLen, "listen", failure) == false)
-  {
-    return false;
-  }
+  bool start(
+      const String& controlSocketPath,
+      const MothershipTunnelGatewayAuth& gatewayAuth,
+      const String& expectedProviderCgroup,
+      void *callbackContext,
+      MothershipTunnelGatewaySessionCallback sessionCallback,
+      MothershipTunnelGatewayFailureCallback failureCallback,
+      String *failure = nullptr);
+  void stop(void);
+};
 
-  listener.fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (listener.fd < 0)
-  {
-    if (failure)
-    {
-      failure->snprintf<"mothership tunnel gateway socket create failed: {}"_ctv>(String(std::strerror(errno)));
-    }
-    return false;
-  }
-
-  (void)::unlink(ownedPath.c_str());
-  if (::bind(listener.fd, reinterpret_cast<sockaddr *>(&address), addressLen) != 0 || ::listen(listener.fd, SOMAXCONN) != 0)
-  {
-    if (failure)
-    {
-      failure->snprintf<"mothership tunnel gateway socket listen failed: {}"_ctv>(String(std::strerror(errno)));
-    }
-    (void)::unlink(ownedPath.c_str());
-    listener.close();
-    return false;
-  }
-  if (::chown(ownedPath.c_str(), prodigyMothershipTunnelProviderRuntimeUID, prodigyMothershipTunnelProviderRuntimeUID) != 0 || ::chmod(ownedPath.c_str(), S_IRUSR | S_IWUSR) != 0)
-  {
-    if (failure)
-    {
-      failure->snprintf<"mothership tunnel gateway socket ownership failed: {}"_ctv>(String(std::strerror(errno)));
-    }
-    (void)::unlink(ownedPath.c_str());
-    listener.close();
-    return false;
-  }
-
-  listener.path = std::move(ownedPath);
-  if (failure)
-  {
-    failure->clear();
-  }
-  return true;
-}
-
-static inline bool mothershipTunnelGatewayPeerCgroupAllowed(pid_t peerPid, const String& expectedCgroup, String *failure = nullptr)
-{
-  if (expectedCgroup.size() == 0)
-  {
-    return true;
-  }
-  if (peerPid <= 0)
-  {
-    if (failure)
-    {
-      failure->assign("mothership tunnel gateway peer pid invalid"_ctv);
-    }
-    return false;
-  }
-
-  String path = {};
-  path.snprintf<"/proc/{itoa}/cgroup"_ctv>(uint64_t(peerPid));
-  String actual = {};
-  Filesystem::openReadAtClose(-1, path, actual, 512);
-
-  String expected = {};
-  expected.assign("0::"_ctv);
-  expected.append(expectedCgroup);
-  expected.append("\n"_ctv);
-  if (actual.equal(expected) == false)
-  {
-    if (failure)
-    {
-      failure->assign("mothership tunnel gateway peer cgroup rejected"_ctv);
-    }
-    return false;
-  }
-
-  if (failure)
-  {
-    failure->clear();
-  }
-  return true;
-}
-
-static inline bool mothershipTunnelGatewayPeerAllowed(int streamFD, String *failure = nullptr, const String& expectedCgroup = ""_ctv)
-{
-  if (streamFD < 0)
-  {
-    if (failure)
-    {
-      failure->assign("mothership tunnel gateway peer fd required"_ctv);
-    }
-    return false;
-  }
-
-#ifdef SO_PEERCRED
-  struct ucred peer = {};
-  socklen_t peerLen = sizeof(peer);
-  if (::getsockopt(streamFD, SOL_SOCKET, SO_PEERCRED, &peer, &peerLen) != 0 || peerLen < sizeof(peer))
-  {
-    if (failure)
-    {
-      failure->snprintf<"mothership tunnel gateway peer credential read failed: {}"_ctv>(String(std::strerror(errno)));
-    }
-    return false;
-  }
-  if (peer.uid != uid_t(prodigyMothershipTunnelProviderRuntimeUID))
-  {
-    if (failure)
-    {
-      failure->assign("mothership tunnel gateway peer credentials rejected"_ctv);
-    }
-    return false;
-  }
-  if (mothershipTunnelGatewayPeerCgroupAllowed(peer.pid, expectedCgroup, failure) == false)
-  {
-    return false;
-  }
-#else
-  if (failure)
-  {
-    failure->assign("mothership tunnel gateway peer credentials unsupported"_ctv);
-  }
-  return false;
-#endif
-
-  if (failure)
-  {
-    failure->clear();
-  }
-  return true;
-}
-
-static inline bool mothershipTunnelGatewayAcceptUnixStream(int listenerFD, int& streamFD, String *failure = nullptr, const String& expectedCgroup = ""_ctv)
-{
-  streamFD = -1;
-  for (;;)
-  {
-#if defined(__linux__)
-    streamFD = ::accept4(listenerFD, nullptr, nullptr, SOCK_CLOEXEC);
-#else
-    streamFD = ::accept(listenerFD, nullptr, nullptr);
-    if (streamFD >= 0)
-    {
-      (void)::fcntl(streamFD, F_SETFD, FD_CLOEXEC);
-    }
-#endif
-    if (streamFD >= 0)
-    {
-      break;
-    }
-    if (errno == EINTR)
-    {
-      continue;
-    }
-    if (failure)
-    {
-      failure->snprintf<"mothership tunnel gateway accept failed: {}"_ctv>(String(std::strerror(errno)));
-    }
-    return false;
-  }
-
-  if (mothershipTunnelGatewayPeerAllowed(streamFD, failure, expectedCgroup) == false)
-  {
-    ::close(streamFD);
-    streamFD = -1;
-    return false;
-  }
-  return true;
-}
-
-static inline bool mothershipTunnelGatewayOpenUnixControlSocket(const String& socketPath, int& fd, String *failure = nullptr)
-{
-  fd = -1;
-  String ownedPath = {};
-  ownedPath.assign(socketPath);
-
-  sockaddr_un address = {};
-  socklen_t addressLen = 0;
-  if (mothershipTunnelGatewayUnixAddress(ownedPath, address, addressLen, "control", failure) == false)
-  {
-    return false;
-  }
-
-  fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (fd < 0)
-  {
-    if (failure)
-    {
-      failure->snprintf<"mothership tunnel gateway control socket create failed: {}"_ctv>(String(std::strerror(errno)));
-    }
-    return false;
-  }
-  if (::connect(fd, reinterpret_cast<sockaddr *>(&address), addressLen) != 0)
-  {
-    if (failure)
-    {
-      failure->snprintf<"mothership tunnel gateway control socket connect failed: {}"_ctv>(String(std::strerror(errno)));
-    }
-    ::close(fd);
-    fd = -1;
-    return false;
-  }
-
-  if (failure)
-  {
-    failure->clear();
-  }
-  return true;
-}
-
-static inline bool mothershipTunnelGatewayWriteAllFD(int fd, const uint8_t *buffer, size_t bytes, String *failure = nullptr)
-{
-  while (bytes > 0)
-  {
-    int flags = 0;
-#ifdef MSG_NOSIGNAL
-    flags |= MSG_NOSIGNAL;
-#endif
-    ssize_t rc = ::send(fd, buffer, bytes, flags);
-    if (rc > 0)
-    {
-      buffer += size_t(rc);
-      bytes -= size_t(rc);
-      continue;
-    }
-    if (rc < 0 && errno == EINTR)
-    {
-      continue;
-    }
-    if (failure)
-    {
-      failure->snprintf<"mothership tunnel gateway control write failed: {}"_ctv>(String(std::strerror(errno)));
-    }
-    return false;
-  }
-
-  if (failure)
-  {
-    failure->clear();
-  }
-  return true;
-}
-
-static inline bool mothershipTunnelGatewayWriteAllTLS(SSL *tls, const uint8_t *buffer, size_t bytes, String *failure = nullptr)
-{
-  while (bytes > 0)
-  {
-    int chunk = int(std::min<size_t>(bytes, INT_MAX));
-    int rc = SSL_write(tls, buffer, chunk);
-    if (rc > 0)
-    {
-      buffer += size_t(rc);
-      bytes -= size_t(rc);
-      continue;
-    }
-    if (failure)
-    {
-      failure->assign("mothership tunnel gateway TLS write failed"_ctv);
-    }
-    return false;
-  }
-
-  if (failure)
-  {
-    failure->clear();
-  }
-  return true;
-}
-
-static inline bool mothershipTunnelGatewayProxyLoop(SSL *tls, int tlsFD, int controlFD, MothershipTunnelGatewaySessionResult& result, String *failure = nullptr)
-{
-  uint8_t buffer[16 * 1024];
-  for (;;)
-  {
-    pollfd descriptors[2] = {};
-    descriptors[0].fd = tlsFD;
-    descriptors[0].events = POLLIN;
-    descriptors[1].fd = controlFD;
-    descriptors[1].events = POLLIN;
-
-    int ready = ::poll(descriptors, 2, -1);
-    if (ready < 0)
-    {
-      if (errno == EINTR)
-      {
-        continue;
-      }
-      if (failure)
-      {
-        failure->snprintf<"mothership tunnel gateway proxy poll failed: {}"_ctv>(String(std::strerror(errno)));
-      }
-      return false;
-    }
-
-    if (descriptors[0].revents & POLLIN)
-    {
-      int rc = SSL_read(tls, buffer, sizeof(buffer));
-      if (rc > 0)
-      {
-        if (mothershipTunnelGatewayWriteAllFD(controlFD, buffer, size_t(rc), failure) == false)
-        {
-          return false;
-        }
-      }
-      else if (SSL_get_error(tls, rc) == SSL_ERROR_ZERO_RETURN)
-      {
-        return true;
-      }
-      else
-      {
-        if (failure)
-        {
-          failure->assign("mothership tunnel gateway TLS read failed"_ctv);
-        }
-        return false;
-      }
-    }
-    else if (descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL))
-    {
-      return true;
-    }
-
-    if (descriptors[1].revents & POLLIN)
-    {
-      ssize_t rc = ::recv(controlFD, buffer, sizeof(buffer), 0);
-      if (rc > 0)
-      {
-        if (mothershipTunnelGatewayWriteAllTLS(tls, buffer, size_t(rc), failure) == false)
-        {
-          return false;
-        }
-      }
-      else if (rc == 0)
-      {
-        return true;
-      }
-      else if (errno != EINTR)
-      {
-        if (failure)
-        {
-          failure->snprintf<"mothership tunnel gateway control read failed: {}"_ctv>(String(std::strerror(errno)));
-        }
-        return false;
-      }
-    }
-    else if (descriptors[1].revents & (POLLERR | POLLHUP | POLLNVAL))
-    {
-      return true;
-    }
-  }
-}
-
-static inline bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
+bool mothershipTunnelGatewayCreateUnixListener(const String& socketPath, MothershipTunnelGatewayUnixListener& listener, String *failure = nullptr);
+bool mothershipTunnelGatewayPeerCgroupAllowed(pid_t peerPid, const String& expectedCgroup, String *failure = nullptr);
+bool mothershipTunnelGatewayAcceptUnixStream(int listenerFD, int& streamFD, String *failure = nullptr, const String& expectedCgroup = ""_ctv);
+bool mothershipTunnelGatewayOpenUnixControlSocket(const String& socketPath, int& fd, String *failure = nullptr);
+bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
     int streamFD,
     const String& controlSocketPath,
     const MothershipTunnelGatewayTLSContext& tlsContext,
     MothershipTunnelGatewaySessionResult *sessionResult = nullptr,
-    String *failure = nullptr)
-{
-  MothershipTunnelGatewaySessionResult result = {};
-  if (sessionResult)
-  {
-    *sessionResult = result;
-  }
-  auto fail = [&](auto&& text) -> bool {
-    if (failure)
-    {
-      failure->assign(text);
-    }
-    if (sessionResult)
-    {
-      *sessionResult = result;
-    }
-    return false;
-  };
-
-  if (streamFD < 0)
-  {
-    return fail("mothership tunnel gateway stream fd required"_ctv);
-  }
-  if (tlsContext.configured() == false)
-  {
-    return fail("mothership tunnel gateway TLS context missing"_ctv);
-  }
-
-  std::unique_ptr<SSL, decltype(&SSL_free)> tls(nullptr, SSL_free);
-  std::unique_ptr<X509, decltype(&X509_free)> clientCert(nullptr, X509_free);
-  int controlFD = -1;
-  auto closeControl = [&]() {
-    if (controlFD >= 0)
-    {
-      ::close(controlFD);
-      controlFD = -1;
-    }
-  };
-
-  tls.reset(SSL_new(tlsContext.context.get()));
-  if (tls == nullptr || SSL_set_fd(tls.get(), streamFD) != 1 || SSL_accept(tls.get()) != 1 || SSL_get_verify_result(tls.get()) != X509_V_OK)
-  {
-    return fail("mothership tunnel gateway TLS accept failed"_ctv);
-  }
-
-  clientCert.reset(SSL_get1_peer_certificate(tls.get()));
-  if (tlsContext.authorizeClientCertificate(clientCert.get(), failure) == false)
-  {
-    if (sessionResult)
-    {
-      *sessionResult = result;
-    }
-    return false;
-  }
-  result.authenticated = true;
-
-  if (mothershipTunnelGatewayOpenUnixControlSocket(controlSocketPath, controlFD, failure) == false)
-  {
-    if (sessionResult)
-    {
-      *sessionResult = result;
-    }
-    return false;
-  }
-  result.openedControlSocket = true;
-
-  bool ok = mothershipTunnelGatewayProxyLoop(tls.get(), streamFD, controlFD, result, failure);
-  closeControl();
-  if (sessionResult)
-  {
-    *sessionResult = result;
-  }
-  if (ok && failure)
-  {
-    failure->clear();
-  }
-  return ok;
-}
+    String *failure = nullptr);

@@ -765,11 +765,7 @@ static bool prodigyClaimPersistentLocalClusterOwnership(uint128_t clusterUUID, S
 class ProdigyBrain : public Brain {
 public:
 
-  MothershipTunnelGatewayUnixListener mothershipTunnelGatewayListener;
-  std::thread mothershipTunnelGatewayThread;
-  std::atomic<bool> mothershipTunnelGatewayStopRequested = false;
-  std::atomic<int> mothershipTunnelGatewayActiveStreamFD = -1;
-  std::atomic<uint64_t> mothershipTunnelGatewayFailureCount = 0;
+  MothershipTunnelGatewayRuntime mothershipTunnelGateway;
 
   bool claimLocalClusterOwnership(uint128_t clusterUUID, String *failure = nullptr) override
   {
@@ -1004,15 +1000,16 @@ public:
   {
   }
 
-  void noteMothershipTunnelGatewayFailure(String failure)
+  static void noteMothershipTunnelGatewayFailure(void *, uint64_t failures, String& failure)
   {
-    uint64_t failures = mothershipTunnelGatewayFailureCount.fetch_add(1) + 1;
-    if (failures <= 8 || (failures % 1024) == 0)
-    {
-      basics_log("ProdigyBrain mothership tunnel gateway session failed count=%llu reason=%s\n",
-                 (unsigned long long)failures,
-                 failure.size() > 0 ? failure.c_str() : "unspecified");
-    }
+    basics_log("ProdigyBrain mothership tunnel gateway session failed count=%llu reason=%s\n",
+               (unsigned long long)failures,
+               failure.size() > 0 ? failure.c_str() : "unspecified");
+  }
+
+  static void noteMothershipTunnelGatewaySession(void *context, const MothershipTunnelGatewaySessionResult& result)
+  {
+    static_cast<ProdigyBrain *>(context)->noteMothershipTunnelProviderControlSession(result.authenticated, result.openedControlSocket);
   }
 
   bool prepareMothershipTunnelGateway(const MothershipTunnelProviderSpec& spec, String *failure = nullptr)
@@ -1043,8 +1040,8 @@ public:
       return false;
     }
 
-    stopMothershipTunnelGateway();
-    if (mothershipTunnelGatewayCreateUnixListener(mothershipTunnelProviderHostGatewaySocketPath, mothershipTunnelGatewayListener, failure) == false)
+    mothershipTunnelGateway.stop();
+    if (mothershipTunnelGatewayCreateUnixListener(mothershipTunnelProviderHostGatewaySocketPath, mothershipTunnelGateway.listener, failure) == false)
     {
       return false;
     }
@@ -1058,111 +1055,19 @@ public:
 
   bool startMothershipTunnelGateway(const MothershipTunnelGatewayAuth& gatewayAuth, const String& expectedProviderCgroup, String *failure = nullptr)
   {
-    if (mothershipTunnelGatewayListener.fd < 0 || expectedProviderCgroup.size() == 0)
-    {
-      if (failure)
-      {
-        failure->assign("mothership tunnel gateway provider identity missing"_ctv);
-      }
-      return false;
-    }
-
-    int listenerFD = mothershipTunnelGatewayListener.fd;
-    String controlSocketPath = mothershipUnixSocketPath;
-    auto gatewayTLS = std::make_unique<MothershipTunnelGatewayTLSContext>();
-    if (gatewayTLS->configure(gatewayAuth, failure) == false)
-    {
-      return false;
-    }
-    mothershipTunnelGatewayStopRequested.store(false);
-    mothershipTunnelGatewayActiveStreamFD.store(-1);
-    mothershipTunnelGatewayFailureCount.store(0);
-    mothershipTunnelGatewayThread = std::thread([this, listenerFD, controlSocketPath, gatewayTLS = std::move(gatewayTLS), expectedProviderCgroup]() {
-      while (mothershipTunnelGatewayStopRequested.load() == false)
-      {
-        pollfd descriptor = {};
-        descriptor.fd = listenerFD;
-        descriptor.events = POLLIN;
-        int ready = ::poll(&descriptor, 1, 100);
-        if (ready == 0 || (ready < 0 && errno == EINTR))
-        {
-          continue;
-        }
-        if (ready < 0)
-        {
-          if (mothershipTunnelGatewayStopRequested.load() == false)
-          {
-            String pollFailure = {};
-            pollFailure.snprintf<"mothership tunnel gateway poll failed: {}"_ctv>(String(std::strerror(errno)));
-            noteMothershipTunnelGatewayFailure(pollFailure);
-          }
-          break;
-        }
-        if ((descriptor.revents & POLLIN) == 0)
-        {
-          if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
-          {
-            if (mothershipTunnelGatewayStopRequested.load() == false)
-            {
-              noteMothershipTunnelGatewayFailure(String("mothership tunnel gateway listener closed"));
-            }
-            break;
-          }
-          continue;
-        }
-
-        int streamFD = -1;
-        String sessionFailure = {};
-        if (mothershipTunnelGatewayAcceptUnixStream(listenerFD, streamFD, &sessionFailure, expectedProviderCgroup) == false)
-        {
-          if (mothershipTunnelGatewayStopRequested.load() == false)
-          {
-            noteMothershipTunnelGatewayFailure(sessionFailure);
-          }
-          continue;
-        }
-
-        mothershipTunnelGatewayActiveStreamFD.store(streamFD);
-        MothershipTunnelGatewaySessionResult sessionResult = {};
-        bool ok = mothershipTunnelGatewayProxyAuthenticatedControlStream(streamFD, controlSocketPath, *gatewayTLS, &sessionResult, &sessionFailure);
-        if (ok)
-        {
-          noteMothershipTunnelProviderControlSession(
-              sessionResult.authenticated,
-              sessionResult.openedControlSocket);
-        }
-        (void)::shutdown(streamFD, SHUT_RDWR);
-        ::close(streamFD);
-        int expectedStreamFD = streamFD;
-        (void)mothershipTunnelGatewayActiveStreamFD.compare_exchange_strong(expectedStreamFD, -1);
-        if (ok == false && mothershipTunnelGatewayStopRequested.load() == false)
-        {
-          noteMothershipTunnelGatewayFailure(sessionFailure);
-        }
-      }
-    });
-
-    if (failure)
-    {
-      failure->clear();
-    }
-    return true;
+    return mothershipTunnelGateway.start(
+        mothershipUnixSocketPath,
+        gatewayAuth,
+        expectedProviderCgroup,
+        this,
+        noteMothershipTunnelGatewaySession,
+        noteMothershipTunnelGatewayFailure,
+        failure);
   }
 
   void stopMothershipTunnelGateway(void)
   {
-    mothershipTunnelGatewayStopRequested.store(true);
-    int streamFD = mothershipTunnelGatewayActiveStreamFD.load();
-    if (streamFD >= 0)
-    {
-      (void)::shutdown(streamFD, SHUT_RDWR);
-    }
-    mothershipTunnelGatewayListener.close();
-    if (mothershipTunnelGatewayThread.joinable())
-    {
-      mothershipTunnelGatewayThread.join();
-    }
-    mothershipTunnelGatewayActiveStreamFD.store(-1);
+    mothershipTunnelGateway.stop();
   }
 
   bool startMothershipTunnelProviderInstance(const MothershipTunnelProviderSpec& spec, const String& artifactBlob, uint128_t& containerUUID, String *providerCgroup, String *failure = nullptr)
