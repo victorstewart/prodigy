@@ -833,9 +833,10 @@ int main(void)
       suite.expect(spec.artifactBytes == tunnelBlob.size(), "tunnel_provider_artifact_preflight_sets_size");
       suite.expect(ContainerStore::systemVerify(spec.artifactSha256, spec.artifactBytes, nullptr, nullptr, &failure, &systemStoreRoot.path), "tunnel_provider_artifact_preflight_stores_blob");
       uint128_t clusterUUID = 0xABC1;
-      suite.expect(mothership.unitTestPrepareTunnelProviderGatewayAuth(spec, &failure), "tunnel_provider_gateway_auth_preflight_generates");
+      MothershipTunnelGatewayAuth gatewayAuth = {};
+      suite.expect(mothership.unitTestPrepareTunnelProviderGatewayAuth(spec, gatewayAuth, &failure), "tunnel_provider_gateway_auth_preflight_generates");
       suite.expect(spec.clientAuth.configured(), "tunnel_provider_gateway_auth_preflight_sets_client_auth");
-      suite.expect(spec.gatewayAuth.configured(), "tunnel_provider_gateway_auth_preflight_sets_gateway_auth");
+      suite.expect(gatewayAuth.configured(), "tunnel_provider_gateway_auth_preflight_sets_gateway_auth");
       String appBlob = {};
       appBlob.assign(prodigyDiscombobulatorBlobHeaderText());
       for (uint32_t index = 0; index < 32; ++index)

@@ -1478,29 +1478,22 @@ int main(void)
     tunnel.mothershipConnectivity.tunnelProvider.dialEndpoint = "control.example.net:443"_ctv;
     tunnel.mothershipConnectivity.tunnelProvider.egressHost = "1.1.1.1"_ctv;
     tunnel.mothershipConnectivity.tunnelProvider.egressPort = 443;
-    MothershipTunnelGatewayAuth gatewayAuth = {};
-    suite.expect(
-        mothershipGenerateTunnelGatewayAuth(tunnel.mothershipConnectivity.tunnelProvider.clientAuth, gatewayAuth, &failure),
-        "create_tunnel_provider_generates_gateway_auth");
-    suite.expect(gatewayAuth.configured(), "create_tunnel_provider_gateway_auth_configured");
-    tunnel.mothershipConnectivity.tunnelProvider.gatewayAuth = gatewayAuth;
     auto reissueTunnelClientAuth = [&](MothershipProdigyCluster& candidate, uint128_t clusterUUID, const char *testName) {
       MothershipTunnelGatewayAuth ignored = {};
       candidate.clusterUUID = clusterUUID;
       candidate.mothershipConnectivity.tunnelProvider.clientAuth = {};
       suite.expect(mothershipGenerateTunnelGatewayAuth(candidate.mothershipConnectivity.tunnelProvider.clientAuth, ignored, &failure), testName);
     };
+    reissueTunnelClientAuth(tunnel, tunnel.clusterUUID, "create_tunnel_provider_generates_client_auth");
 
     MothershipProdigyCluster storedTunnel = {};
     bool createTunnel = registry.createCluster(tunnel, &storedTunnel, &failure);
     suite.expect(createTunnel, "create_tunnel_provider_connectivity");
     suite.expect(storedTunnel.mothershipConnectivity.kind == MothershipConnectivityKind::tunnelProvider, "create_tunnel_provider_kind_preserved");
     suite.expect(storedTunnel.mothershipConnectivity.tunnelProvider.clientAuth.configured(), "create_tunnel_provider_client_auth_persisted");
-    suite.expect(storedTunnel.mothershipConnectivity.tunnelProvider.gatewayAuth.configured() == false, "create_tunnel_provider_gateway_auth_not_persisted");
     MothershipProdigyCluster loadedTunnel = {};
     suite.expect(registry.getCluster("local-tunnel"_ctv, loadedTunnel, &failure), "load_tunnel_provider_connectivity");
     suite.expect(equalMothershipConnectivity(storedTunnel.mothershipConnectivity, loadedTunnel.mothershipConnectivity), "load_tunnel_provider_connectivity_matches");
-    suite.expect(loadedTunnel.mothershipConnectivity.tunnelProvider.gatewayAuth.configured() == false, "load_tunnel_provider_gateway_auth_not_persisted");
 
     MothershipProdigyCluster invalidClientAuth = tunnel;
     invalidClientAuth.name = "local-tunnel-invalid-client-auth"_ctv;

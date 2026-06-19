@@ -18,19 +18,19 @@ excluding evidence artifacts under `prodigy/docs/tunnel-provider-refactor/*`.
 | State | Files | Insertions | Deletions |
 |---|---:|---:|---:|
 | Draft feature baseline | 52 | 7437 | 434 |
-| Current branch | 56 | 5923 | 563 |
+| Current branch | 55 | 5955 | 564 |
 
 Category ledger:
 
 | Category | Draft net | Current net | Net removed |
 |---|---:|---:|---:|
-| Production | +4883 | +3327 | 1556 |
-| Tests | +2081 | +1996 | 85 |
+| Production | +4883 | +3321 | 1562 |
+| Tests | +2081 | +2033 | 48 |
 | Docs | +30 | +28 | 2 |
 | Build metadata | +9 | +9 | 0 |
 
 The current project gate command, excluding evidence artifacts, reports
-`+5923 -563 net +5360` across 56 files. The full diff including evidence
+`+5955 -564 net +5391` across 55 files. The full diff including evidence
 artifacts is intentionally larger because this report and ledger are tracked.
 
 ## Lines Removed By Subsystem
@@ -50,6 +50,7 @@ artifacts is intentionally larger because this report and ledger are tracked.
 - Artifact launch boundary: removed the full verified artifact load/copy from Brain reconcile and deleted the artifact blob parameter from Brain/Prodigy provider launch hooks.
 - System plan boundary: folded kind, artifact reference, egress tuple, and fixed runtime resources into one typed `SystemContainerRuntimePlan`, so provider launch no longer seeds fake stateless-application config fields.
 - System artifact verification: `ContainerStore::systemVerify` now validates digest/size and reads only the fixed contract header instead of loading the whole artifact a second time for header validation.
+- Create auth boundary: removed server auth from `MothershipTunnelProviderSpec`; gateway server auth is create-only hook input and only the client auth persists.
 
 See `LINE_LEDGER.tsv` for per-path numbers.
 
@@ -82,6 +83,7 @@ Fixed or hard-cut:
 - Cluster schema types no longer own certificate parsing/generation, egress policy helpers, runtime policy, or Brain runtime state.
 - Tunnel desired state is folded into `ProdigyMasterAuthorityRuntimeState`; the old dedicated Brain topic and persistent record are deleted.
 - `providerContainerBlobPath` is create-only parser output, not a member of the persisted/runtime tunnel-provider spec.
+- Tunnel gateway server auth is create-only launch input, not persisted/runtime provider spec state.
 - System-provider launch no longer serializes env or socket paths through `ContainerPlan`; the provider-kind env check is deleted because kind is already proven by artifact header and typed launch state.
 - System-provider fixed resources are no longer serialized as mutable plan state; `ContainerPlan` derives the single supported system kind's CPU, memory, filesystem, and stop-timeout limits directly.
 - ProdigyBrain no longer owns gateway thread, active FD, stop flag, or failure counter state directly; it owns one `MothershipTunnelGatewayRuntime`.

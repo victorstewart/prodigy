@@ -1201,15 +1201,13 @@ private:
       return false;
     }
 
-    MothershipTunnelProviderSpec& spec = cluster.mothershipConnectivity.tunnelProvider;
-    spec.gatewayAuth = {};
-
     MothershipConnectivityRuntimeConfig runtimeConfig = {};
     if (mothershipBuildMothershipConnectivityRuntimeConfig(cluster.mothershipConnectivity, runtimeConfig, failure) == false)
     {
       return false;
     }
 
+    MothershipTunnelProviderSpec& spec = cluster.mothershipConnectivity.tunnelProvider;
     if (spec.clientAuth.configured() == false)
     {
       if (failure)

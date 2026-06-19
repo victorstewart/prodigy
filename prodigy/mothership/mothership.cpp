@@ -6022,11 +6022,11 @@ private:
     } while (cluster.clusterUUID == 0);
   }
 
-  static bool prepareTunnelProviderGatewayAuthForCreate(MothershipTunnelProviderSpec& spec, String *failure)
+  static bool prepareTunnelProviderGatewayAuthForCreate(MothershipTunnelProviderSpec& spec, MothershipTunnelGatewayAuth& gatewayAuth, String *failure)
   {
     spec.clientAuth = {};
-    spec.gatewayAuth = {};
-    return mothershipGenerateTunnelGatewayAuth(spec.clientAuth, spec.gatewayAuth, failure);
+    gatewayAuth = {};
+    return mothershipGenerateTunnelGatewayAuth(spec.clientAuth, gatewayAuth, failure);
   }
 
   bool configureControlTarget(const char *arg, String *failureOut = nullptr)
@@ -7307,6 +7307,7 @@ private:
   private:
 
     Mothership *owner = nullptr;
+    MothershipTunnelGatewayAuth tunnelProviderGatewayAuth;
 
     class SeedProvisioningProgressPrinter final : public BrainIaaSMachineProvisioningProgressSink {
     private:
@@ -7489,8 +7490,9 @@ private:
 
   public:
 
-    explicit ClusterCreateHooks(Mothership *mothership)
-        : owner(mothership)
+    explicit ClusterCreateHooks(Mothership *mothership, MothershipTunnelGatewayAuth tunnelProviderGatewayAuth = {})
+        : owner(mothership),
+          tunnelProviderGatewayAuth(std::move(tunnelProviderGatewayAuth))
     {}
 
     bool startTestCluster(const MothershipProdigyCluster& cluster, String *failure = nullptr) override
@@ -8046,7 +8048,7 @@ private:
             return false;
           }
 
-          if (providerSpec.gatewayAuth.configured() == false)
+          if (tunnelProviderGatewayAuth.configured() == false)
           {
             requestFailure.assign("tunnelProvider gateway auth missing from create context"_ctv);
             return false;
@@ -8054,7 +8056,7 @@ private:
 
           MothershipTunnelProviderConfigureRequest request = {};
           request.artifactBlob = std::move(artifactBlob);
-          request.desired.gatewayAuth = providerSpec.gatewayAuth;
+          request.desired.gatewayAuth = tunnelProviderGatewayAuth;
           if (mothershipBuildClusterMothershipConnectivityRuntimeConfig(cluster, request.desired.connectivity, &requestFailure) == false)
           {
             return false;
@@ -13995,6 +13997,7 @@ private:
 
     MothershipProdigyCluster request = {};
     String tunnelProviderBlobPath = {};
+    MothershipTunnelGatewayAuth tunnelProviderGatewayAuth = {};
     MothershipProviderCredential providerCredentialOverride = {};
     MothershipProviderCredential dnsProviderCredentialOverride = {};
     bool hasProviderCredentialOverride = false;
@@ -14596,7 +14599,7 @@ private:
         basics_log("createCluster success=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
         exit(EXIT_FAILURE);
       }
-      if (prepareTunnelProviderGatewayAuthForCreate(request.mothershipConnectivity.tunnelProvider, &failure) == false)
+      if (prepareTunnelProviderGatewayAuthForCreate(request.mothershipConnectivity.tunnelProvider, tunnelProviderGatewayAuth, &failure) == false)
       {
         basics_log("createCluster success=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
         exit(EXIT_FAILURE);
@@ -14683,10 +14686,9 @@ private:
         basics_log("createCluster success=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
         exit(EXIT_FAILURE);
       }
-      stored.mothershipConnectivity.tunnelProvider.gatewayAuth = request.mothershipConnectivity.tunnelProvider.gatewayAuth;
     }
 
-    ClusterCreateHooks hooks(this);
+    ClusterCreateHooks hooks(this, std::move(tunnelProviderGatewayAuth));
     MothershipClusterCreateTimingSummary timingSummary = {};
     if (mothershipStandUpCluster(stored, credentialPtr, hooks, &timingSummary, &failure, dnsCredentialPtr) == false)
     {
@@ -16862,9 +16864,9 @@ public:
     return prepareTunnelProviderArtifactForCreate(spec, providerContainerBlobPath, failure, &systemStoreRoot);
   }
 
-  bool unitTestPrepareTunnelProviderGatewayAuth(MothershipTunnelProviderSpec& spec, String *failure = nullptr)
+  bool unitTestPrepareTunnelProviderGatewayAuth(MothershipTunnelProviderSpec& spec, MothershipTunnelGatewayAuth& gatewayAuth, String *failure = nullptr)
   {
-    return prepareTunnelProviderGatewayAuthForCreate(spec, failure);
+    return prepareTunnelProviderGatewayAuthForCreate(spec, gatewayAuth, failure);
   }
 #endif
 
