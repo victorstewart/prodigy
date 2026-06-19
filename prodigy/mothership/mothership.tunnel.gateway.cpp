@@ -270,6 +270,44 @@ static bool mothershipTunnelGatewaySetTimeout(int fd, int timeoutMs, String *fai
   return mothershipTunnelGatewayFailErrno(failure, "mothership tunnel gateway socket timeout setup failed"_ctv);
 }
 
+static bool mothershipTunnelGatewayWaitFD(int fd, short events, int timeoutMs, String *failure = nullptr)
+{
+  for (;;)
+  {
+    pollfd descriptor = {fd, events, 0};
+    int ready = ::poll(&descriptor, 1, timeoutMs);
+    if (ready > 0)
+    {
+      return (descriptor.revents & events) != 0
+                 ? true
+                 : mothershipTunnelGatewayFail(failure, "mothership tunnel gateway proxy peer closed"_ctv);
+    }
+    if (ready == 0)
+    {
+      return mothershipTunnelGatewayFail(failure, "mothership tunnel gateway proxy idle timeout"_ctv);
+    }
+    if (errno != EINTR)
+    {
+      return mothershipTunnelGatewayFailErrno(failure, "mothership tunnel gateway proxy poll failed"_ctv);
+    }
+  }
+}
+
+static int mothershipTunnelGatewayTLSRetry(SSL *tls, int rc, int fd, int timeoutMs, const auto& failureText, String *failure = nullptr)
+{
+  int error = SSL_get_error(tls, rc);
+  if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE)
+  {
+    return mothershipTunnelGatewayWaitFD(fd, error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT, timeoutMs, failure) ? 1 : -1;
+  }
+  if (error == SSL_ERROR_ZERO_RETURN)
+  {
+    return 0;
+  }
+  mothershipTunnelGatewayFail(failure, failureText);
+  return -1;
+}
+
 static bool mothershipTunnelGatewayWriteAllFD(int fd, const uint8_t *buffer, size_t bytes, String *failure = nullptr)
 {
   while (bytes > 0)
@@ -295,7 +333,7 @@ static bool mothershipTunnelGatewayWriteAllFD(int fd, const uint8_t *buffer, siz
   return mothershipTunnelGatewayOk(failure);
 }
 
-static bool mothershipTunnelGatewayWriteAllTLS(SSL *tls, const uint8_t *buffer, size_t bytes, String *failure = nullptr)
+static bool mothershipTunnelGatewayWriteAllTLS(SSL *tls, const uint8_t *buffer, size_t bytes, int idleTimeoutMs, String *failure = nullptr)
 {
   while (bytes > 0)
   {
@@ -307,7 +345,12 @@ static bool mothershipTunnelGatewayWriteAllTLS(SSL *tls, const uint8_t *buffer, 
       bytes -= size_t(rc);
       continue;
     }
-    return mothershipTunnelGatewayFail(failure, "mothership tunnel gateway TLS write failed"_ctv);
+    int retry = mothershipTunnelGatewayTLSRetry(tls, rc, SSL_get_fd(tls), idleTimeoutMs, "mothership tunnel gateway TLS write failed"_ctv, failure);
+    if (retry > 0)
+    {
+      continue;
+    }
+    return retry == 0 ? mothershipTunnelGatewayFail(failure, "mothership tunnel gateway TLS closed during write"_ctv) : false;
   }
 
   return mothershipTunnelGatewayOk(failure);
@@ -324,21 +367,26 @@ static bool mothershipTunnelGatewayProxyLoop(SSL *tls, int tlsFD, int controlFD,
     descriptors[1].fd = controlFD;
     descriptors[1].events = POLLIN;
 
-    int ready = ::poll(descriptors, 2, idleTimeoutMs);
-    if (ready == 0)
+    bool tlsReadable = SSL_pending(tls) > 0;
+    if (tlsReadable == false)
     {
-      return mothershipTunnelGatewayFail(failure, "mothership tunnel gateway proxy idle timeout"_ctv);
-    }
-    if (ready < 0)
-    {
-      if (errno == EINTR)
+      int ready = ::poll(descriptors, 2, idleTimeoutMs);
+      if (ready == 0)
       {
-        continue;
+        return mothershipTunnelGatewayFail(failure, "mothership tunnel gateway proxy idle timeout"_ctv);
       }
-      return mothershipTunnelGatewayFailErrno(failure, "mothership tunnel gateway proxy poll failed"_ctv);
+      if (ready < 0)
+      {
+        if (errno == EINTR)
+        {
+          continue;
+        }
+        return mothershipTunnelGatewayFailErrno(failure, "mothership tunnel gateway proxy poll failed"_ctv);
+      }
+      tlsReadable = (descriptors[0].revents & POLLIN) != 0;
     }
 
-    if (descriptors[0].revents & POLLIN)
+    if (tlsReadable)
     {
       int rc = SSL_read(tls, buffer, sizeof(buffer));
       if (rc > 0)
@@ -348,13 +396,14 @@ static bool mothershipTunnelGatewayProxyLoop(SSL *tls, int tlsFD, int controlFD,
           return false;
         }
       }
-      else if (SSL_get_error(tls, rc) == SSL_ERROR_ZERO_RETURN)
-      {
-        return true;
-      }
       else
       {
-        return mothershipTunnelGatewayFail(failure, "mothership tunnel gateway TLS read failed"_ctv);
+        int retry = mothershipTunnelGatewayTLSRetry(tls, rc, tlsFD, idleTimeoutMs, "mothership tunnel gateway TLS read failed"_ctv, failure);
+        if (retry > 0)
+        {
+          continue;
+        }
+        return retry == 0 ? true : false;
       }
     }
     else if (descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL))
@@ -367,7 +416,7 @@ static bool mothershipTunnelGatewayProxyLoop(SSL *tls, int tlsFD, int controlFD,
       ssize_t rc = ::recv(controlFD, buffer, sizeof(buffer), 0);
       if (rc > 0)
       {
-        if (mothershipTunnelGatewayWriteAllTLS(tls, buffer, size_t(rc), failure) == false)
+        if (mothershipTunnelGatewayWriteAllTLS(tls, buffer, size_t(rc), idleTimeoutMs, failure) == false)
         {
           return false;
         }
@@ -436,7 +485,25 @@ bool mothershipTunnelGatewayProxyAuthenticatedControlStream(
     }
   };
   tls.reset(SSL_new(tlsContext.context.get()));
-  if (tls == nullptr || SSL_set_fd(tls.get(), streamFD) != 1 || SSL_accept(tls.get()) != 1 || SSL_get_verify_result(tls.get()) != X509_V_OK)
+  if (tls == nullptr || SSL_set_fd(tls.get(), streamFD) != 1)
+  {
+    return fail("mothership tunnel gateway TLS accept failed"_ctv);
+  }
+  for (;;)
+  {
+    int rc = SSL_accept(tls.get());
+    if (rc == 1)
+    {
+      break;
+    }
+    int retry = mothershipTunnelGatewayTLSRetry(tls.get(), rc, streamFD, idleTimeoutMs, "mothership tunnel gateway TLS accept failed"_ctv, failure);
+    if (retry <= 0)
+    {
+      mothershipTunnelGatewayPublishSessionResult(sessionResult, result);
+      return retry == 0 ? fail("mothership tunnel gateway TLS accept failed"_ctv) : false;
+    }
+  }
+  if (SSL_get_verify_result(tls.get()) != X509_V_OK)
   {
     return fail("mothership tunnel gateway TLS accept failed"_ctv);
   }

@@ -102,9 +102,3 @@ static inline bool mothershipBuildMothershipConnectivityRuntimeConfig(const Moth
   mothershipStripMothershipOnlyConnectivityFields(config);
   return mothershipConnectivityRuntimeConfigValid(config, failure);
 }
-
-static inline void mothershipOwnConnectivityRuntimeConfig(const MothershipConnectivityRuntimeConfig& source, MothershipConnectivityRuntimeConfig& owned)
-{
-  owned = source;
-  mothershipStripMothershipOnlyConnectivityFields(owned);
-}

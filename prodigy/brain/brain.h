@@ -12981,7 +12981,8 @@ public:
   bool prepareMothershipTunnelProviderDesiredState(const MothershipTunnelProviderDesiredState& incoming, MothershipTunnelProviderDesiredState& desired, String *failure = nullptr)
   {
     desired = {};
-    mothershipOwnConnectivityRuntimeConfig(incoming.connectivity, desired.connectivity);
+    desired.connectivity = incoming.connectivity;
+    mothershipStripMothershipOnlyConnectivityFields(desired.connectivity);
     if (mothershipConnectivityRuntimeConfigValid(desired.connectivity, failure) == false)
     {
       return false;

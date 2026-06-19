@@ -18,19 +18,19 @@ excluding evidence artifacts under `prodigy/docs/tunnel-provider-refactor/*`.
 | State | Files | Insertions | Deletions |
 |---|---:|---:|---:|
 | Draft feature baseline | 52 | 7437 | 434 |
-| Current branch | 55 | 5955 | 564 |
+| Current branch | 55 | 6017 | 564 |
 
 Category ledger:
 
 | Category | Draft net | Current net | Net removed |
 |---|---:|---:|---:|
-| Production | +4883 | +3321 | 1562 |
+| Production | +4883 | +3383 | 1500 |
 | Tests | +2081 | +2033 | 48 |
 | Docs | +30 | +28 | 2 |
 | Build metadata | +9 | +9 | 0 |
 
 The current project gate command, excluding evidence artifacts, reports
-`+5955 -564 net +5391` across 55 files. The full diff including evidence
+`+6017 -564 net +5453` across 55 files. The full diff including evidence
 artifacts is intentionally larger because this report and ledger are tracked.
 
 ## Lines Removed By Subsystem
@@ -51,6 +51,7 @@ artifacts is intentionally larger because this report and ledger are tracked.
 - System plan boundary: folded kind, artifact reference, egress tuple, and fixed runtime resources into one typed `SystemContainerRuntimePlan`, so provider launch no longer seeds fake stateless-application config fields.
 - System artifact verification: `ContainerStore::systemVerify` now validates digest/size and reads only the fixed contract header instead of loading the whole artifact a second time for header validation.
 - Create auth boundary: removed server auth from `MothershipTunnelProviderSpec`; gateway server auth is create-only hook input and only the client auth persists.
+- Gateway I/O retry path: TLS accept/read/write now treats OpenSSL `WANT_READ`/`WANT_WRITE` as bounded wait states and drains buffered TLS plaintext before polling the socket again.
 
 See `LINE_LEDGER.tsv` for per-path numbers.
 
@@ -92,6 +93,7 @@ Fixed or hard-cut:
 - Tunnel-provider launch no longer populates `ApplicationConfig` type/version/artifact/resource fields for the system container; Neuron consumes `ContainerPlan::system` for system artifact verification, extraction limits, cgroups, kill timeout, and egress.
 - System artifact presence/verification no longer allocates a full artifact blob just to validate the contract header; full blob reads remain only for explicit artifact transfer/load paths.
 - Gateway proxy sessions set socket receive/send timeouts and enforce a bounded idle poll timeout; focused coverage proves an authenticated idle session closes only after the guarded control socket opens.
+- Gateway TLS accept/read/write handles OpenSSL retry states under the same bounded idle timeout instead of failing a healthy session on `WANT_READ`/`WANT_WRITE`.
 
 Superseded by later user direction:
 
@@ -100,7 +102,7 @@ Superseded by later user direction:
 
 Still open relative to the original goal:
 
-- Gateway I/O is bounded by socket and idle timeouts, but is not a full nonblocking backpressure/half-close state machine.
+- Gateway I/O is bounded by socket/idle timeouts and handles OpenSSL retry states, but is not a full nonblocking backpressure/half-close state machine.
 - Artifact envelope is integrity/type declaration, not signed trusted provenance.
 - Dedicated system-container plan extension is incomplete; the remaining mutable surface is the required artifact reference and egress tuple.
 - Full rolling-upgrade protocol gating is not implemented.
@@ -166,6 +168,8 @@ All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 - After bounding gateway proxy socket/idle waits: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_mothership_unix_connect_unit --parallel 16`; `.run/build-egress/prodigy_mothership_unix_connect_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test.
 - After deleting mutable system-provider resource fields: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_brain_replication_credentials_unit prodigy_persistent_state_unit prodigy_mothership_unix_connect_unit --parallel 16`; `.run/build-egress/prodigy_brain_replication_credentials_unit`; `.run/build-egress/prodigy_persistent_state_unit`; `.run/build-egress/prodigy_mothership_unix_connect_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test.
 - After removing the create-only provider blob path from the runtime spec: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_mothership_unix_connect_unit prodigy_mothership_cluster_registry_unit --parallel 16`; `.run/build-egress/prodigy_mothership_unix_connect_unit`; `.run/build-egress/prodigy_mothership_cluster_registry_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test.
+- After removing create-only gateway server auth from the runtime spec: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_mothership_unix_connect_unit prodigy_mothership_cluster_registry_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-egress/prodigy_mothership_unix_connect_unit`; `.run/build-egress/prodigy_mothership_cluster_registry_unit`; `.run/build-egress/prodigy_brain_replication_credentials_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test.
+- After handling OpenSSL gateway retry states and deleting the dead runtime-config ownership helper: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_mothership_unix_connect_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-egress/prodigy_mothership_unix_connect_unit`; `.run/build-egress/prodigy_brain_replication_credentials_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test.
 
 Earlier validation on the same branch also covered the broader build/test matrix:
 cluster registry, deployments, bundle artifact, BPF attach units, host/container
