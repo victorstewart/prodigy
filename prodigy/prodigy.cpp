@@ -1012,13 +1012,13 @@ public:
     static_cast<ProdigyBrain *>(context)->noteMothershipTunnelProviderControlSession();
   }
 
-  bool prepareMothershipTunnelGateway(const MothershipTunnelProviderSpec& spec, String *failure = nullptr)
+  bool startMothershipTunnelProviderRuntime(const MothershipTunnelProviderSpec& spec, const MothershipTunnelGatewayAuth& gatewayAuth, uint128_t& containerUUID, String *failure = nullptr) override
   {
+    containerUUID = 0;
     if (mothershipTunnelProviderSpecValid(spec, failure) == false)
     {
       return false;
     }
-
     if (mothershipUnixSocketPath.size() == 0)
     {
       configureMothershipUnixSocketPath(mothershipUnixSocketPath);
@@ -1039,52 +1039,22 @@ public:
       }
       return false;
     }
-
     mothershipTunnelGateway.stop();
     if (mothershipTunnelGatewayCreateUnixListener(mothershipTunnelProviderHostGatewaySocketPath, mothershipTunnelGateway.listener, failure) == false)
     {
       return false;
     }
 
-    if (failure)
-    {
-      failure->clear();
-    }
-    return true;
-  }
-
-  bool startMothershipTunnelGateway(const MothershipTunnelGatewayAuth& gatewayAuth, const String& expectedProviderCgroup, String *failure = nullptr)
-  {
-    return mothershipTunnelGateway.start(
-        mothershipUnixSocketPath,
-        gatewayAuth,
-        expectedProviderCgroup,
-        this,
-        noteMothershipTunnelGatewaySession,
-        noteMothershipTunnelGatewayFailure,
-        failure);
-  }
-
-  void stopMothershipTunnelGateway(void)
-  {
-    mothershipTunnelGateway.stop();
-  }
-
-  bool startMothershipTunnelProviderInstance(const MothershipTunnelProviderSpec& spec, uint128_t& containerUUID, String *providerCgroup, String *failure = nullptr)
-  {
-    containerUUID = 0;
-    if (providerCgroup)
-    {
-      providerCgroup->clear();
-    }
     if (thisNeuron == nullptr)
     {
       if (failure)
       {
         failure->assign("mothership tunnel provider launch requires local neuron"_ctv);
       }
+      stopMothershipTunnelProviderRuntime(containerUUID);
       return false;
     }
+
     ContainerPlan containerPlan = {};
     containerUUID = Random::generateNumberWithNBits<128, uint128_t>();
     uint32_t egressAddress = 0;
@@ -1094,6 +1064,8 @@ public:
       {
         failure->assign("mothership tunnel provider egress endpoint invalid"_ctv);
       }
+      stopMothershipTunnelProviderRuntime(containerUUID);
+      containerUUID = 0;
       return false;
     }
     containerPlan.uuid = containerUUID;
@@ -1111,39 +1083,30 @@ public:
     auto containerIt = thisNeuron->containers.find(containerUUID);
     if (containerIt == thisNeuron->containers.end() || containerIt->second == nullptr || containerIt->second->cgroup < 0)
     {
-      stopMothershipTunnelProviderInstance(containerUUID);
-      containerUUID = 0;
       if (failure)
       {
         failure->assign("mothership tunnel provider cgroup unavailable"_ctv);
       }
-      return false;
-    }
-    if (providerCgroup)
-    {
-      prodigyContainerCgroupProcLeafSuffix(containerIt->second->name, *providerCgroup);
-    }
-
-    if (failure)
-    {
-      failure->clear();
-    }
-    return true;
-  }
-
-  bool startMothershipTunnelProviderRuntime(const MothershipTunnelProviderSpec& spec, const MothershipTunnelGatewayAuth& gatewayAuth, uint128_t& containerUUID, String *failure = nullptr) override
-  {
-    containerUUID = 0;
-    if (prepareMothershipTunnelGateway(spec, failure) == false)
-    {
+      stopMothershipTunnelProviderRuntime(containerUUID);
+      containerUUID = 0;
       return false;
     }
 
     String providerCgroup = {};
-    if (startMothershipTunnelProviderInstance(spec, containerUUID, &providerCgroup, failure) &&
-        containerUUID != 0 &&
-        startMothershipTunnelGateway(gatewayAuth, providerCgroup, failure))
+    prodigyContainerCgroupProcLeafSuffix(containerIt->second->name, providerCgroup);
+    if (mothershipTunnelGateway.start(
+            mothershipUnixSocketPath,
+            gatewayAuth,
+            providerCgroup,
+            this,
+            noteMothershipTunnelGatewaySession,
+            noteMothershipTunnelGatewayFailure,
+            failure))
     {
+      if (failure)
+      {
+        failure->clear();
+      }
       return true;
     }
 
@@ -1156,24 +1119,18 @@ public:
     return false;
   }
 
-  void stopMothershipTunnelProviderInstance(uint128_t containerUUID)
-  {
-    if (thisNeuron == nullptr)
-    {
-      return;
-    }
-    if (auto it = thisNeuron->containers.find(containerUUID); it != thisNeuron->containers.end())
-    {
-      it->second->killedOnPurpose = true;
-      it->second->pendingKillAckToBrain = false;
-      ContainerManager::killContainer(it->second);
-    }
-  }
-
   void stopMothershipTunnelProviderRuntime(uint128_t containerUUID) override
   {
-    stopMothershipTunnelProviderInstance(containerUUID);
-    stopMothershipTunnelGateway();
+    if (thisNeuron != nullptr)
+    {
+      if (auto it = thisNeuron->containers.find(containerUUID); it != thisNeuron->containers.end())
+      {
+        it->second->killedOnPurpose = true;
+        it->second->pendingKillAckToBrain = false;
+        ContainerManager::killContainer(it->second);
+      }
+    }
+    mothershipTunnelGateway.stop();
   }
 
   void respinApplication(ApplicationDeployment *deployment) override
