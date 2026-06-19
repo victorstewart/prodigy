@@ -82,6 +82,7 @@ Fixed or hard-cut:
 - Cluster schema types no longer own certificate parsing/generation, egress policy helpers, runtime policy, or Brain runtime state.
 - Tunnel desired state is folded into `ProdigyMasterAuthorityRuntimeState`; the old dedicated Brain topic and persistent record are deleted.
 - System-provider launch no longer serializes env or socket paths through `ContainerPlan`; the provider-kind env check is deleted because kind is already proven by artifact header and typed launch state.
+- System-provider fixed resources are no longer serialized as mutable plan state; `ContainerPlan` derives the single supported system kind's CPU, memory, filesystem, and stop-timeout limits directly.
 - ProdigyBrain no longer owns gateway thread, active FD, stop flag, or failure counter state directly; it owns one `MothershipTunnelGatewayRuntime`.
 - System-provider egress no longer serializes a textual host through `ContainerPlan` or reparses that host in Neuron; Prodigy launch validates the public IPv4 literal once and Neuron derives the BPF allowlist key from numeric plan data.
 - Tunnel-provider launch no longer loads the full system artifact into a `String` or passes artifact bytes through the Brain/Prodigy launch hook.
@@ -98,7 +99,7 @@ Still open relative to the original goal:
 
 - Gateway I/O is bounded by socket and idle timeouts, but is not a full nonblocking backpressure/half-close state machine.
 - Artifact envelope is integrity/type declaration, not signed trusted provenance.
-- Dedicated system-container plan extension is incomplete; the remaining mutable surface is the required egress tuple.
+- Dedicated system-container plan extension is incomplete; the remaining mutable surface is the required artifact reference and egress tuple.
 - Full rolling-upgrade protocol gating is not implemented.
 
 ## State And Transport
@@ -160,6 +161,7 @@ All commands below were run inside the 16-vCPU `wizard-local` VM guest.
 - After replacing provider fake app config with `SystemContainerRuntimePlan`: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_brain_replication_credentials_unit prodigy_container_overlay_sync_unit prodigy_persistent_state_unit --parallel 16`; `.run/build-egress/prodigy_persistent_state_unit`; `.run/build-egress/prodigy_brain_replication_credentials_unit`; `PRODIGY_DEV_ALLOW_BPF_ATTACH=1 .run/build-egress/prodigy_container_overlay_sync_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test and after the focused units.
 - After bounding system artifact header verification: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_deployments_unit prodigy_brain_replication_credentials_unit --parallel 16`; `.run/build-egress/prodigy_deployments_unit`; `.run/build-egress/prodigy_brain_replication_credentials_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test and after the focused units.
 - After bounding gateway proxy socket/idle waits: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_mothership_unix_connect_unit --parallel 16`; `.run/build-egress/prodigy_mothership_unix_connect_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test.
+- After deleting mutable system-provider resource fields: `git diff --check`; `cmake --build .run/build-egress --target prodigy prodigy_brain_replication_credentials_unit prodigy_persistent_state_unit prodigy_mothership_unix_connect_unit --parallel 16`; `.run/build-egress/prodigy_brain_replication_credentials_unit`; `.run/build-egress/prodigy_persistent_state_unit`; `.run/build-egress/prodigy_mothership_unix_connect_unit`. The guest proved `nproc=16`, `nproc_all=16`, and `Cpus_allowed_list: 0-15` before build/test.
 
 Earlier validation on the same branch also covered the broader build/test matrix:
 cluster registry, deployments, bundle artifact, BPF attach units, host/container

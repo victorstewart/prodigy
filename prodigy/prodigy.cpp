@@ -1103,10 +1103,6 @@ public:
     containerPlan.system.kind = SystemContainerKind::mothershipTunnelProvider;
     containerPlan.system.artifact.sha256.assign(spec.artifactSha256);
     containerPlan.system.artifact.bytes = spec.artifactBytes;
-    containerPlan.system.filesystemMB = 128;
-    containerPlan.system.memoryMB = 128;
-    containerPlan.system.nLogicalCores = 1;
-    containerPlan.system.stopTimeoutSeconds = 30;
     containerPlan.system.egress.address4 = egressAddress;
     containerPlan.system.egress.port = spec.egressPort;
     containerPlan.state = ContainerState::scheduled;

@@ -49,6 +49,10 @@
 | `.run/build-egress/prodigy_brain_replication_credentials_unit` after bounding system artifact header verification | pass |
 | `cmake --build .run/build-egress --target prodigy prodigy_mothership_unix_connect_unit --parallel 16` after bounding gateway proxy socket/idle waits | pass |
 | `.run/build-egress/prodigy_mothership_unix_connect_unit` after bounding gateway proxy socket/idle waits | pass |
+| `cmake --build .run/build-egress --target prodigy prodigy_brain_replication_credentials_unit prodigy_persistent_state_unit prodigy_mothership_unix_connect_unit --parallel 16` after deleting mutable system-provider resource fields | pass |
+| `.run/build-egress/prodigy_brain_replication_credentials_unit` after deleting mutable system-provider resource fields | pass |
+| `.run/build-egress/prodigy_persistent_state_unit` after deleting mutable system-provider resource fields | pass |
+| `.run/build-egress/prodigy_mothership_unix_connect_unit` after deleting mutable system-provider resource fields | pass |
 
 ## Privileged Tests Run In VM
 
@@ -88,4 +92,5 @@ Reason: the focused VM verification proved the touched unit/BPF paths, but the o
 - System-provider kind, artifact reference, egress tuple, and fixed runtime resources live in `ContainerPlan::system`; provider launch no longer populates fake stateless-application config fields.
 - `ContainerStore::systemVerify` reads only the fixed contract header after digest/size verification instead of loading the full artifact for header validation.
 - Gateway proxy sessions apply socket receive/send timeouts and an idle poll timeout; focused coverage proves authenticated idle sessions close after the control socket opens.
+- System-provider CPU, memory, filesystem, and stop-timeout limits are derived by `ContainerPlan` accessors instead of serialized through `SystemContainerRuntimePlan`.
 - Remote branch head matches local head.

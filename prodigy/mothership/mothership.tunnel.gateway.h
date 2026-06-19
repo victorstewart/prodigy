@@ -10,16 +10,12 @@
 struct MothershipTunnelGatewayAuth;
 class MothershipTunnelGatewayTLSContext;
 
-class MothershipTunnelGatewaySessionResult {
-public:
-
+struct MothershipTunnelGatewaySessionResult {
   bool authenticated = false;
   bool openedControlSocket = false;
 };
 
-class MothershipTunnelGatewayUnixListener {
-public:
-
+struct MothershipTunnelGatewayUnixListener {
   String path;
   int fd = -1;
 
@@ -34,9 +30,7 @@ public:
 using MothershipTunnelGatewayFailureCallback = void (*)(void *context, uint64_t failures, String& failure);
 using MothershipTunnelGatewaySessionCallback = void (*)(void *context, const MothershipTunnelGatewaySessionResult& result);
 
-class MothershipTunnelGatewayRuntime {
-public:
-
+struct MothershipTunnelGatewayRuntime {
   MothershipTunnelGatewayUnixListener listener;
   std::thread thread;
   std::atomic<bool> stopRequested = false;

@@ -5,9 +5,7 @@
 
 using MothershipConnectivityRuntimeConfig = MothershipConnectivity;
 
-class MothershipTunnelProviderConfigureRequest {
-public:
-
+struct MothershipTunnelProviderConfigureRequest {
   MothershipTunnelProviderDesiredState desired;
   String artifactBlob;
 };
@@ -24,9 +22,7 @@ static inline bool mothershipTunnelPolicyFail(String *failure, const Text& text)
 {
   if (failure)
   {
-    String owned = {};
-    owned.assign(text.data(), text.size());
-    *failure = std::move(owned);
+    failure->assign(text);
   }
   return false;
 }
