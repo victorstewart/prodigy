@@ -32,6 +32,11 @@ struct switchboard_whitehole_binding {
   __u64 nonce;
 };
 
+struct switchboard_system_egress_nat_binding {
+  struct container_id container;
+  __be32 inside_addr4;
+};
+
 struct switchboard_wormhole_target_key {
   __u32 slot;
   __u8 container[5];

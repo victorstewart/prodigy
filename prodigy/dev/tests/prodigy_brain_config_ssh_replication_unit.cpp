@@ -30,12 +30,12 @@ public:
   uint32_t clusterOwnershipCalls = 0;
   uint128_t lastClaimedClusterUUID = 0;
 
-  void configureCloudflareTunnel(String& mothershipEndpoint) override
+  void configureMothershipControlIngress(String& mothershipEndpoint) override
   {
     mothershipEndpoint.assign("127.0.0.1"_ctv);
   }
 
-  void teardownCloudflareTunnel(void) override
+  void teardownMothershipControlIngress(void) override
   {
   }
 

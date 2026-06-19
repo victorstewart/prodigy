@@ -17,3 +17,10 @@ struct {
   __type(value, struct switchboard_whitehole_binding);
   __uint(max_entries, WHITEHOLE_REPLY_LRU_SIZE);
 } white_replies SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __type(key, struct flow_key);
+  __type(value, struct switchboard_system_egress_nat_binding);
+  __uint(max_entries, WHITEHOLE_REPLY_LRU_SIZE);
+} system_egress_nat SEC(".maps");

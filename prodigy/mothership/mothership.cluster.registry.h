@@ -18,6 +18,7 @@ private:
 
   constexpr static auto clustersColumnFamily = "clusters"_ctv;
   constexpr static auto clustersByUUIDColumnFamily = "clusters_by_uuid"_ctv;
+  constexpr static auto clusterRecordV2Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=2\n\n"_ctv;
 
   static void resolveDefaultDBPath(String& path)
   {
@@ -137,7 +138,35 @@ private:
   {
     String serialized;
     serialized.append(value, valueSize);
-    return BitseryEngine::deserializeSafe(serialized, cluster);
+    String header = {};
+    header.assign(clusterRecordV2Header);
+
+    bool hasV2Header = serialized.size() >= header.size();
+    for (uint64_t index = 0; hasV2Header && index < header.size(); ++index)
+    {
+      if (serialized[index] != header[index])
+      {
+        hasV2Header = false;
+      }
+    }
+
+    if (hasV2Header)
+    {
+      String payload = {};
+      payload.assign(serialized.substr(header.size(), serialized.size() - header.size(), Copy::yes));
+      return BitseryEngine::deserializeSafe(payload, cluster);
+    }
+
+    return false;
+  }
+
+  static void serializeClusterValue(const MothershipProdigyCluster& cluster, String& serialized)
+  {
+    String payload = {};
+    MothershipProdigyCluster mutableCluster = cluster;
+    BitseryEngine::serialize(payload, mutableCluster);
+    serialized.assign(clusterRecordV2Header);
+    serialized.append(payload);
   }
 
   static void ensureClusterUUID(MothershipProdigyCluster& cluster)
@@ -1153,6 +1182,63 @@ private:
     return true;
   }
 
+  static bool normalizeMothershipConnectivityForStorage(MothershipProdigyCluster& cluster, String *failure)
+  {
+    if (cluster.mothershipConnectivity.kind == MothershipConnectivityKind::ssh)
+    {
+      cluster.mothershipConnectivity.tunnelProvider = {};
+      return true;
+    }
+
+    if (cluster.mothershipConnectivity.kind != MothershipConnectivityKind::tunnelProvider)
+    {
+      if (failure)
+      {
+        failure->assign("mothershipConnectivity.kind invalid");
+      }
+      return false;
+    }
+
+    MothershipTunnelProviderSpec& spec = cluster.mothershipConnectivity.tunnelProvider;
+    spec.providerContainerBlobPath.clear();
+    spec.gatewayAuth = {};
+
+    MothershipConnectivityRuntimeConfig runtimeConfig = {};
+    if (mothershipBuildMothershipConnectivityRuntimeConfig(cluster.mothershipConnectivity, runtimeConfig, failure) == false)
+    {
+      return false;
+    }
+
+    if (spec.clientAuth.configured() == false)
+    {
+      if (failure)
+      {
+        failure->assign("tunnelProvider.clientAuth required");
+      }
+      return false;
+    }
+
+    if (mothershipTunnelGatewayClientAuthMaterialValid(spec.clientAuth) == false)
+    {
+      if (failure)
+      {
+        failure->assign("tunnelProvider.clientAuth certificate material invalid");
+      }
+      return false;
+    }
+
+    if (spec.clientAuth.clusterUUID != cluster.clusterUUID)
+    {
+      if (failure)
+      {
+        failure->assign("tunnelProvider.clientAuth clusterUUID mismatch");
+      }
+      return false;
+    }
+
+    return true;
+  }
+
   static bool normalizeClusterForStorage(MothershipProdigyCluster& cluster, String *failure)
   {
     if (cluster.name.size() == 0)
@@ -1413,6 +1499,11 @@ private:
     }
 
     if (validateClusterEnvironmentBGP(cluster.bgp, failure) == false)
+    {
+      return false;
+    }
+
+    if (normalizeMothershipConnectivityForStorage(cluster, failure) == false)
     {
       return false;
     }
@@ -2074,7 +2165,7 @@ public:
       return false;
     }
 
-    BitseryEngine::serialize(serialized, stored);
+    serializeClusterValue(stored, serialized);
     if (db.write(clustersColumnFamily, stored.name, serialized, failure) == false)
     {
       return false;
@@ -2087,7 +2178,7 @@ public:
       if (hadExistingCluster)
       {
         String rollbackSerialized = {};
-        BitseryEngine::serialize(rollbackSerialized, existingCluster);
+        serializeClusterValue(existingCluster, rollbackSerialized);
         String rollbackFailure = {};
         (void)db.write(clustersColumnFamily, existingCluster.name, rollbackSerialized, &rollbackFailure);
       }
@@ -2238,7 +2329,7 @@ public:
     }
 
     String serializedCluster = {};
-    BitseryEngine::serialize(serializedCluster, cluster);
+    serializeClusterValue(cluster, serializedCluster);
 
     if (db.remove(clustersColumnFamily, name, failure) == false)
     {

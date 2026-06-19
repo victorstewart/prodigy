@@ -1,6 +1,7 @@
 #pragma once
 
 #include <prodigy/bundle.artifact.h>
+#include <prodigy/container.contract.h>
 
 #include <cerrno>
 #include <cstring>
@@ -339,6 +340,148 @@ private:
     return true;
   }
 
+  static bool validateAppContainerArtifactContract(const String& containerBlob, String *failureReport = nullptr)
+  {
+    String headerText = prodigyDiscombobulatorBlobHeaderText();
+    String header = {};
+    header.assign(containerBlob.substr(0, headerText.size(), Copy::yes));
+    return prodigyValidateDiscombobulatorBlobHeaderText(header, failureReport);
+  }
+
+  static bool storeAppContainerBlobAtPath(
+      const String& finalPath,
+      const String& containerBlob,
+      String *actualDigest = nullptr,
+      uint64_t *actualBytes = nullptr,
+      const String *expectedDigest = nullptr,
+      const uint64_t *expectedBytes = nullptr,
+      String *failureReport = nullptr)
+  {
+    if (failureReport)
+    {
+      failureReport->clear();
+    }
+    if (actualDigest)
+    {
+      actualDigest->clear();
+    }
+    if (actualBytes)
+    {
+      *actualBytes = 0;
+    }
+    if (validateAppContainerArtifactContract(containerBlob, failureReport) == false)
+    {
+      return false;
+    }
+
+    return storeBlobAtPath(finalPath, containerBlob, actualDigest, actualBytes, expectedDigest, expectedBytes, failureReport);
+  }
+
+  static String pathForSystemKindRootWithinRoot(const String& storeRoot, SystemContainerKind kind)
+  {
+    String path = {};
+    path.assign(storeRoot);
+    if (path.size() == 0 || path[path.size() - 1] != '/')
+    {
+      path.append('/');
+    }
+    path.append(prodigySystemContainerKindName(kind));
+    return path;
+  }
+
+  static String pathForSystemArtifactWithinRoot(const String& storeRoot, SystemContainerKind kind, const String& sha256)
+  {
+    String path = pathForSystemKindRootWithinRoot(storeRoot, kind);
+    path.append('/');
+    path.append(sha256);
+    path.append(".blob"_ctv);
+    return path;
+  }
+
+  static bool validateSystemArtifactKey(SystemContainerKind kind, const String& sha256, uint64_t bytes, String *failureReport = nullptr)
+  {
+    if (kind != SystemContainerKind::mothershipTunnelProvider)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("system container kind unsupported"_ctv);
+      }
+      return false;
+    }
+    if (prodigyIsSHA256HexDigest(sha256) == false)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"system container sha256 is invalid: {}"_ctv>(sha256);
+      }
+      return false;
+    }
+    if (bytes == 0)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("system container artifact bytes required"_ctv);
+      }
+      return false;
+    }
+    return true;
+  }
+
+  static bool validateSystemArtifactContract(SystemContainerKind kind, const String& blob, String *failureReport = nullptr)
+  {
+    if (kind != SystemContainerKind::mothershipTunnelProvider)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("system container kind unsupported"_ctv);
+      }
+      return false;
+    }
+
+    String headerText = prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText();
+    String header = {};
+    header.assign(blob.substr(0, headerText.size(), Copy::yes));
+    if (prodigyValidateDiscombobulatorMothershipTunnelProviderBlobHeaderText(header, failureReport) == false)
+    {
+      return false;
+    }
+    if (blob.size() == headerText.size())
+    {
+      if (failureReport)
+      {
+        failureReport->assign("system container artifact payload required"_ctv);
+      }
+      return false;
+    }
+    return true;
+  }
+
+  static bool storeSystemBlobAtRoot(const String& storeRoot, SystemContainerKind kind, const String& sha256, uint64_t bytes, const String& blob, String *actualDigest = nullptr, uint64_t *actualBytes = nullptr, String *failureReport = nullptr)
+  {
+    if (validateSystemArtifactKey(kind, sha256, bytes, failureReport) == false || validateSystemArtifactContract(kind, blob, failureReport) == false)
+    {
+      return false;
+    }
+
+    (void)Filesystem::createDirectoryAt(-1, storeRoot, 0755);
+    (void)Filesystem::createDirectoryAt(-1, pathForSystemKindRootWithinRoot(storeRoot, kind), 0755);
+    return storeBlobAtPath(pathForSystemArtifactWithinRoot(storeRoot, kind, sha256), blob, actualDigest, actualBytes, &sha256, &bytes, failureReport);
+  }
+
+  static bool verifySystemBlobAtRoot(const String& storeRoot, SystemContainerKind kind, const String& sha256, uint64_t bytes, String *actualDigest = nullptr, uint64_t *actualBytes = nullptr, String *failureReport = nullptr)
+  {
+    String path = pathForSystemArtifactWithinRoot(storeRoot, kind, sha256);
+    if (validateSystemArtifactKey(kind, sha256, bytes, failureReport) == false ||
+        verifyStoredBlobAtPath(path, sha256, bytes, actualDigest, actualBytes, failureReport) == false)
+    {
+      return false;
+    }
+
+    String blob = {};
+    Filesystem::openReadAtClose(-1, path, blob);
+    return validateSystemArtifactContract(kind, blob, failureReport);
+  }
+
 public:
 
   static inline bool autoDestroy; // false if brain, else true
@@ -364,7 +507,7 @@ public:
       const uint64_t *expectedBytes = nullptr,
       String *failureReport = nullptr)
   {
-    return storeBlobAtPath(
+    return storeAppContainerBlobAtPath(
         pathForContainerImageWithinRoot(storeRoot, deploymentID),
         containerBlob,
         actualDigest,
@@ -407,7 +550,7 @@ public:
       const uint64_t *expectedBytes = nullptr,
       String *failureReport = nullptr)
   {
-    if (storeBlobAtPath(
+    if (storeAppContainerBlobAtPath(
             pathForContainerImage(deploymentID),
             containerBlob,
             actualDigest,
@@ -486,6 +629,41 @@ public:
     }
 
     return false;
+  }
+
+  static String systemPathForArtifact(SystemContainerKind kind, const String& sha256, const String *storeRoot = nullptr)
+  {
+    return pathForSystemArtifactWithinRoot(storeRoot ? *storeRoot : String("/containers/system-store"_ctv), kind, sha256);
+  }
+
+  static bool systemStore(SystemContainerKind kind, const String& sha256, uint64_t bytes, const String& blob, String *actualDigest = nullptr, uint64_t *actualBytes = nullptr, String *failureReport = nullptr, const String *storeRoot = nullptr)
+  {
+    return storeSystemBlobAtRoot(storeRoot ? *storeRoot : String("/containers/system-store"_ctv), kind, sha256, bytes, blob, actualDigest, actualBytes, failureReport);
+  }
+
+  static bool systemVerify(SystemContainerKind kind, const String& sha256, uint64_t bytes, String *actualDigest = nullptr, uint64_t *actualBytes = nullptr, String *failureReport = nullptr, const String *storeRoot = nullptr)
+  {
+    return verifySystemBlobAtRoot(storeRoot ? *storeRoot : String("/containers/system-store"_ctv), kind, sha256, bytes, actualDigest, actualBytes, failureReport);
+  }
+
+  static bool systemLoadVerified(SystemContainerKind kind, const String& sha256, uint64_t bytes, String& blob, String *failureReport = nullptr, const String *storeRoot = nullptr)
+  {
+    String root = storeRoot ? *storeRoot : String("/containers/system-store"_ctv);
+    blob.clear();
+    if (verifySystemBlobAtRoot(root, kind, sha256, bytes, nullptr, nullptr, failureReport) == false)
+    {
+      return false;
+    }
+    Filesystem::openReadAtClose(-1, pathForSystemArtifactWithinRoot(root, kind, sha256), blob);
+    if (blob.size() == 0)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("system container artifact unreadable after verification"_ctv);
+      }
+      return false;
+    }
+    return validateSystemArtifactContract(kind, blob, failureReport);
   }
 
   static void destroy(uint64_t deploymentID)

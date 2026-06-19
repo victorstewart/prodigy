@@ -6,13 +6,17 @@
 #include <prodigy/netdev.detect.h>
 #include <prodigy/persistent.state.h>
 #include <prodigy/iaas/runtime/runtime.h>
+#include <prodigy/mothership/mothership.tunnel.gateway.h>
 
 #include <arpa/inet.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
+#include <thread>
 #include <utility>
 #include <sys/stat.h>
 #include <sys/file.h>
@@ -760,6 +764,23 @@ static bool prodigyClaimPersistentLocalClusterOwnership(uint128_t clusterUUID, S
 class ProdigyBrain : public Brain {
 public:
 
+  MothershipTunnelGatewayUnixListener mothershipTunnelGatewayListener;
+  std::thread mothershipTunnelGatewayThread;
+  std::atomic<bool> mothershipTunnelGatewayStopRequested = false;
+  std::atomic<int> mothershipTunnelGatewayActiveStreamFD = -1;
+  std::atomic<uint64_t> mothershipTunnelGatewayFailureCount = 0;
+  std::mutex mothershipTunnelGatewayPeerPolicyMutex;
+  MothershipTunnelGatewayPeerPolicy mothershipTunnelGatewayPeerPolicy;
+
+  static void buildMothershipTunnelProviderCgroupV2Path(uint128_t containerUUID, String& path)
+  {
+    String containerName;
+    containerName.assignItoa(containerUUID);
+    path.assign("/containers.slice/"_ctv);
+    path.append(containerName);
+    path.append(".slice/leaf"_ctv);
+  }
+
   bool claimLocalClusterOwnership(uint128_t clusterUUID, String *failure = nullptr) override
   {
     String localFailure = {};
@@ -984,13 +1005,327 @@ public:
     return true;
   }
 
-  void configureCloudflareTunnel(String& mothershipEndpoint) override
+  void configureMothershipControlIngress(String& mothershipEndpoint) override
   {
     mothershipEndpoint.clear();
   }
 
-  void teardownCloudflareTunnel(void) override
+  void teardownMothershipControlIngress(void) override
   {
+  }
+
+  bool persistMothershipConnectivityRuntimeConfig(const MothershipConnectivityRuntimeConfig& config, String *failure = nullptr) override
+  {
+    return persistentStateStore.saveMothershipConnectivityRuntimeConfig(config, failure);
+  }
+
+  bool persistMothershipTunnelGatewayAuth(const MothershipTunnelGatewayAuth& auth, String *failure = nullptr) override
+  {
+    return persistentStateStore.saveMothershipTunnelGatewayAuth(auth, failure);
+  }
+
+  void noteMothershipTunnelGatewayFailure(String failure)
+  {
+    uint64_t failures = mothershipTunnelGatewayFailureCount.fetch_add(1) + 1;
+    if (failures <= 8 || (failures % 1024) == 0)
+    {
+      basics_log("ProdigyBrain mothership tunnel gateway session failed count=%llu reason=%s\n",
+                 (unsigned long long)failures,
+                 failure.size() > 0 ? failure.c_str() : "unspecified");
+    }
+  }
+
+  bool startMothershipTunnelGateway(const MothershipTunnelProviderSpec& spec, const MothershipTunnelGatewayAuth& gatewayAuth, String *failure = nullptr)
+  {
+    if (mothershipTunnelProviderSpecValid(spec, failure) == false)
+    {
+      return false;
+    }
+
+    if (mothershipUnixSocketPath.size() == 0)
+    {
+      configureMothershipUnixSocketPath(mothershipUnixSocketPath);
+    }
+    if (mothershipUnixSocketPath.size() == 0 || mothershipUnixSocketPathHasLiveListener(mothershipUnixSocketPath) == false)
+    {
+      if (failure)
+      {
+        failure->assign("mothership tunnel gateway control socket missing"_ctv);
+      }
+      return false;
+    }
+    if (mothershipUnixSocketPath.equal(mothershipTunnelProviderHostGatewaySocketPath))
+    {
+      if (failure)
+      {
+        failure->assign("mothership tunnel gateway must not expose raw control socket"_ctv);
+      }
+      return false;
+    }
+
+    stopMothershipTunnelGateway();
+    if (mothershipTunnelGatewayCreateUnixListener(mothershipTunnelProviderHostGatewaySocketPath, mothershipTunnelGatewayListener, failure) == false)
+    {
+      return false;
+    }
+
+    int listenerFD = mothershipTunnelGatewayListener.fd;
+    String controlSocketPath = mothershipUnixSocketPath;
+    MothershipTunnelGatewayAuth gatewayAuthCopy = gatewayAuth;
+    uint128_t clusterUUID = brainConfig.clusterUUID;
+    mothershipTunnelGatewayStopRequested.store(false);
+    mothershipTunnelGatewayActiveStreamFD.store(-1);
+    mothershipTunnelGatewayFailureCount.store(0);
+    {
+      std::lock_guard<std::mutex> lock(mothershipTunnelGatewayPeerPolicyMutex);
+      mothershipTunnelGatewayPeerPolicy = {};
+      mothershipTunnelGatewayPeerPolicy.requireUID = true;
+      mothershipTunnelGatewayPeerPolicy.uid = uid_t(prodigyMothershipTunnelProviderRuntimeUID);
+      mothershipTunnelGatewayPeerPolicy.requireGID = true;
+      mothershipTunnelGatewayPeerPolicy.gid = gid_t(prodigyMothershipTunnelProviderRuntimeUID);
+    }
+    mothershipTunnelGatewayThread = std::thread([this, listenerFD, controlSocketPath, gatewayAuthCopy, clusterUUID]() mutable {
+      while (mothershipTunnelGatewayStopRequested.load() == false)
+      {
+        pollfd descriptor = {};
+        descriptor.fd = listenerFD;
+        descriptor.events = POLLIN;
+        int ready = ::poll(&descriptor, 1, 100);
+        if (ready == 0 || (ready < 0 && errno == EINTR))
+        {
+          continue;
+        }
+        if (ready < 0)
+        {
+          if (mothershipTunnelGatewayStopRequested.load() == false)
+          {
+            String pollFailure = {};
+            pollFailure.snprintf<"mothership tunnel gateway poll failed: {}"_ctv>(String(std::strerror(errno)));
+            noteMothershipTunnelGatewayFailure(pollFailure);
+          }
+          break;
+        }
+        if ((descriptor.revents & POLLIN) == 0)
+        {
+          if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+          {
+            if (mothershipTunnelGatewayStopRequested.load() == false)
+            {
+              noteMothershipTunnelGatewayFailure(String("mothership tunnel gateway listener closed"));
+            }
+            break;
+          }
+          continue;
+        }
+
+        int streamFD = -1;
+        String sessionFailure = {};
+        MothershipTunnelGatewayPeerPolicy peerPolicy = {};
+        {
+          std::lock_guard<std::mutex> lock(mothershipTunnelGatewayPeerPolicyMutex);
+          peerPolicy = mothershipTunnelGatewayPeerPolicy;
+        }
+        if (mothershipTunnelGatewayAcceptUnixStream(listenerFD, peerPolicy, streamFD, &sessionFailure) == false)
+        {
+          if (mothershipTunnelGatewayStopRequested.load() == false)
+          {
+            noteMothershipTunnelGatewayFailure(sessionFailure);
+          }
+          continue;
+        }
+
+        mothershipTunnelGatewayActiveStreamFD.store(streamFD);
+        MothershipTunnelGatewaySessionResult sessionResult = {};
+        bool ok = mothershipTunnelGatewayProxyAuthenticatedControlStream(streamFD, controlSocketPath, gatewayAuthCopy, clusterUUID, &sessionResult, &sessionFailure);
+        if (ok)
+        {
+          noteMothershipTunnelProviderControlSession(
+              sessionResult.authenticated,
+              sessionResult.openedControlSocket,
+              sessionResult.clientToControlBytes,
+              sessionResult.controlToClientBytes);
+        }
+        (void)::shutdown(streamFD, SHUT_RDWR);
+        ::close(streamFD);
+        int expectedStreamFD = streamFD;
+        (void)mothershipTunnelGatewayActiveStreamFD.compare_exchange_strong(expectedStreamFD, -1);
+        if (ok == false && mothershipTunnelGatewayStopRequested.load() == false)
+        {
+          noteMothershipTunnelGatewayFailure(sessionFailure);
+        }
+      }
+    });
+
+    if (failure)
+    {
+      failure->clear();
+    }
+    return true;
+  }
+
+  void stopMothershipTunnelGateway(void)
+  {
+    mothershipTunnelGatewayStopRequested.store(true);
+    int streamFD = mothershipTunnelGatewayActiveStreamFD.load();
+    if (streamFD >= 0)
+    {
+      (void)::shutdown(streamFD, SHUT_RDWR);
+    }
+    mothershipTunnelGatewayListener.close();
+    if (mothershipTunnelGatewayThread.joinable())
+    {
+      mothershipTunnelGatewayThread.join();
+    }
+    mothershipTunnelGatewayActiveStreamFD.store(-1);
+    {
+      std::lock_guard<std::mutex> lock(mothershipTunnelGatewayPeerPolicyMutex);
+      mothershipTunnelGatewayPeerPolicy = {};
+    }
+  }
+
+  bool startMothershipTunnelProviderInstance(const MothershipTunnelProviderSpec& spec, const MothershipTunnelGatewayAuth& gatewayAuth, const String& artifactBlob, uint64_t generation, uint128_t& containerUUID, String *failure = nullptr)
+  {
+    (void)gatewayAuth;
+    containerUUID = 0;
+    if (mothershipTunnelProviderSpecValid(spec, failure) == false)
+    {
+      return false;
+    }
+    if (thisNeuron == nullptr)
+    {
+      if (failure)
+      {
+        failure->assign("mothership tunnel provider launch requires local neuron"_ctv);
+      }
+      return false;
+    }
+    if (artifactBlob.size() != spec.artifactBytes)
+    {
+      if (failure)
+      {
+        failure->assign("mothership tunnel provider artifact size mismatch"_ctv);
+      }
+      return false;
+    }
+
+    ContainerPlan containerPlan = {};
+    containerUUID = Random::generateNumberWithNBits<128, uint128_t>();
+    containerPlan.uuid = containerUUID;
+    containerPlan.config.type = ApplicationType::stateless;
+    containerPlan.config.versionID = generation;
+    containerPlan.config.containerBlobSHA256.assign(spec.artifactSha256);
+    containerPlan.config.containerBlobBytes = spec.artifactBytes;
+    containerPlan.config.filesystemMB = spec.resources.nStorageMB;
+    containerPlan.config.memoryMB = spec.resources.nMemoryMB;
+    containerPlan.config.nLogicalCores = spec.resources.nLogicalCores;
+    containerPlan.config.cpuMode = ApplicationCPUMode::isolated;
+    containerPlan.config.sTilKillable = 30;
+    containerPlan.restartOnFailure = true;
+    containerPlan.fragment = prodigyMothershipTunnelProviderRuntimeFragment;
+    containerPlan.systemContainerKind = spec.containerKind;
+    containerPlan.systemGatewaySocketSourcePath.assign(mothershipTunnelProviderHostGatewaySocketPath);
+    containerPlan.systemGatewaySocketTargetPath.assign(mothershipTunnelProviderMothershipSocketPath);
+    containerPlan.systemEgressHost.assign(spec.egress.host);
+    containerPlan.systemEgressPort = spec.egress.port;
+    containerPlan.state = ContainerState::scheduled;
+    containerPlan.createdAtMs = Time::now<TimeResolution::ms>();
+
+    String providerCgroupV2Path;
+    buildMothershipTunnelProviderCgroupV2Path(containerUUID, providerCgroupV2Path);
+    {
+      std::lock_guard<std::mutex> lock(mothershipTunnelGatewayPeerPolicyMutex);
+      mothershipTunnelGatewayPeerPolicy.requireUID = true;
+      mothershipTunnelGatewayPeerPolicy.uid = uid_t(prodigyMothershipTunnelProviderRuntimeUID);
+      mothershipTunnelGatewayPeerPolicy.requireGID = true;
+      mothershipTunnelGatewayPeerPolicy.gid = gid_t(prodigyMothershipTunnelProviderRuntimeUID);
+      mothershipTunnelGatewayPeerPolicy.requireCgroupV2Path = true;
+      mothershipTunnelGatewayPeerPolicy.cgroupV2Path = providerCgroupV2Path;
+    }
+
+    Vector<String> env = {};
+    auto pushEnv = [&](StringType auto&& key, const String& value) {
+      String assignment = {};
+      assignment.assign(key);
+      assignment.append(value);
+      env.push_back(std::move(assignment));
+    };
+    String edgePort = {};
+    edgePort.assignItoa(spec.egress.port);
+    pushEnv("PRODIGY_CONTAINER_KIND="_ctv, mothershipTunnelProviderContainerKindValue);
+    pushEnv("PRODIGY_MOTHERSHIP_SOCKET="_ctv, mothershipTunnelProviderMothershipSocketPath);
+    pushEnv("PRODIGY_TUNNEL_EGRESS_HOST="_ctv, spec.egress.host);
+    pushEnv("PRODIGY_TUNNEL_EGRESS_PORT="_ctv, edgePort);
+    containerPlan.systemExecuteEnv = std::move(env);
+
+    ContainerManager::spinContainer(containerPlan, 0, NeuronContainerMetricPolicy {});
+    if (auto it = thisNeuron->containers.find(containerUUID); it == thisNeuron->containers.end() || it->second == nullptr || it->second->cgroup < 0)
+    {
+      stopMothershipTunnelProviderInstance(containerUUID);
+      containerUUID = 0;
+      if (failure)
+      {
+        failure->assign("mothership tunnel provider cgroup unavailable"_ctv);
+      }
+      return false;
+    }
+
+    if (failure)
+    {
+      failure->clear();
+    }
+    return true;
+  }
+
+  bool startMothershipTunnelProviderRuntime(const MothershipTunnelProviderSpec& spec, const MothershipTunnelGatewayAuth& gatewayAuth, const String& artifactBlob, uint64_t generation, uint128_t& containerUUID, String *failure = nullptr) override
+  {
+    containerUUID = 0;
+    if (startMothershipTunnelGateway(spec, gatewayAuth, failure) == false)
+    {
+      return false;
+    }
+
+    if (startMothershipTunnelProviderInstance(spec, gatewayAuth, artifactBlob, generation, containerUUID, failure) && containerUUID != 0)
+    {
+      return true;
+    }
+
+    if (failure && failure->size() == 0)
+    {
+      failure->assign("mothership tunnel provider launch failed"_ctv);
+    }
+    stopMothershipTunnelProviderRuntime(containerUUID);
+    containerUUID = 0;
+    return false;
+  }
+
+  void stopMothershipTunnelProviderInstance(uint128_t containerUUID)
+  {
+    if (thisNeuron == nullptr)
+    {
+      return;
+    }
+    if (auto it = thisNeuron->containers.find(containerUUID); it != thisNeuron->containers.end())
+    {
+      it->second->killedOnPurpose = true;
+      it->second->pendingKillAckToBrain = false;
+      ContainerManager::killContainer(it->second);
+    }
+    String providerCgroupV2Path;
+    buildMothershipTunnelProviderCgroupV2Path(containerUUID, providerCgroupV2Path);
+    {
+      std::lock_guard<std::mutex> lock(mothershipTunnelGatewayPeerPolicyMutex);
+      if (mothershipTunnelGatewayPeerPolicy.cgroupV2Path.equal(providerCgroupV2Path))
+      {
+        mothershipTunnelGatewayPeerPolicy.requireCgroupV2Path = false;
+        mothershipTunnelGatewayPeerPolicy.cgroupV2Path.clear();
+      }
+    }
+  }
+
+  void stopMothershipTunnelProviderRuntime(uint128_t containerUUID) override
+  {
+    stopMothershipTunnelProviderInstance(containerUUID);
+    stopMothershipTunnelGateway();
   }
 
   void respinApplication(ApplicationDeployment *deployment) override
@@ -1028,6 +1363,7 @@ public:
 
   bool prepareForBundleExec(String& failure) override
   {
+    stopMothershipTunnelProviderRuntime(mothershipTunnelProviderRuntimeState.localContainerUUID);
     if (persistentStateStore.saveLocalBrainState(persistentLocalBrainState, &failure) == false)
     {
       return false;
@@ -1047,6 +1383,18 @@ public:
       metrics.importSamples(persistedBrainSnapshot.metricSamples);
     }
 
+    String connectivityFailure = {};
+    if (persistentStateStore.loadMothershipConnectivityRuntimeConfig(mothershipConnectivity, &connectivityFailure) == false && connectivityFailure.size() > 0 && connectivityFailure != "record not found"_ctv)
+    {
+      basics_log("ProdigyBrain mothership connectivity load failed: %s\n", connectivityFailure.c_str());
+    }
+
+    String tunnelGatewayAuthFailure = {};
+    if (persistentStateStore.loadMothershipTunnelGatewayAuth(mothershipTunnelGatewayAuth, &tunnelGatewayAuthFailure) == false && tunnelGatewayAuthFailure.size() > 0 && tunnelGatewayAuthFailure != "record not found"_ctv)
+    {
+      basics_log("ProdigyBrain mothership tunnel gateway auth load failed: %s\n", tunnelGatewayAuthFailure.c_str());
+    }
+
     prodigyBackfillBrainConfigSSHFromBootState(persistentBootState, brainConfig);
 
     if (masterAuthorityRuntimeState.transportTLSAuthority.canMintForCluster() == false && persistentLocalBrainState.canMintTransportTLS())
@@ -1063,6 +1411,11 @@ public:
 
     iaas = new RuntimeAwareBrainIaaS(&persistentStateStore, effectiveBootstrapConfig, persistentBootState);
     dnsProvider = new ProdigyDefaultDNSProvider();
+  }
+
+  ~ProdigyBrain()
+  {
+    stopMothershipTunnelProviderRuntime(mothershipTunnelProviderRuntimeState.localContainerUUID);
   }
 
   bool loadAuthoritativeClusterTopology(ClusterTopology& topology) const override

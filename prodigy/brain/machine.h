@@ -10,6 +10,7 @@
 #include <networking/reconnector.h>
 #include <prodigy/transport.tls.h>
 #include <prodigy/machine.hardware.types.h>
+#include <prodigy/container.contract.h>
 #include <prodigy/types.h>
 #include <SG14/inplace_function.h>
 
@@ -339,7 +340,7 @@ public:
     {
       fragment = Random::generateNumberWithNBits<8, uint8_t>();
 
-    } while (usedContainerFragments.contains(fragment));
+    } while (fragment == prodigyMothershipTunnelProviderRuntimeFragment || usedContainerFragments.contains(fragment));
 
     usedContainerFragments.insert(fragment);
 

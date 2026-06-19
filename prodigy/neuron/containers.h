@@ -21,15 +21,19 @@
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <filesystem>
 #include <limits>
 #include <string>
 
+#include <ebpf/common/structs.h>
 #include <services/memfd.h>
 #include <prodigy/build.identity.h>
 #include <prodigy/container.contract.h>
+#include <prodigy/mothership/mothership.cluster.types.h>
 #include <prodigy/wire.h>
 #include <prodigy/child.process.signal.h>
 
@@ -112,6 +116,14 @@ static void installDatacenterMeshRoutes(NetDevice& device, uint8_t datacenterFra
   };
 
   addDatacenterRoute(container_network_subnet6);
+}
+
+static IPPrefix systemEgressInternalIPv4Prefix(uint8_t fragment, uint8_t machineFragment = 0)
+{
+  IPPrefix prefix = {};
+  prefix.network.v4 = htonl(0xC6120000u | (uint32_t(machineFragment) << 8) | uint32_t(fragment ? fragment : 1u));
+  prefix.cidr = 32;
+  return prefix;
 }
 
 template <typename Key, typename Equals>
@@ -576,9 +588,242 @@ public:
   Vector<String> executeEnv;
   String executeCwd;
   MachineCpuArchitecture executeArchitecture = MachineCpuArchitecture::unknown;
+  String systemEgressHostsFile;
+  Vector<container_egress_allow_key> systemEgressAllowlist;
   String storageRootPath;
   String storagePayloadPath;
   Vector<StorageLoopDevice> storageLoopDevices;
+
+  bool isSystemContainer(void) const
+  {
+    return plan.systemContainerKind != SystemContainerKind::none;
+  }
+
+  bool exposesNeuronSocket(void) const
+  {
+    return isSystemContainer() == false;
+  }
+
+  bool systemEgressConstrained(void) const
+  {
+    return isSystemContainer() && plan.systemEgressHost.size() > 0 && plan.systemEgressPort != 0;
+  }
+
+  static bool systemEgressHostAliasSafe(const String& host)
+  {
+    if (host.size() == 0)
+    {
+      return false;
+    }
+    for (uint64_t index = 0; index < host.size(); ++index)
+    {
+      unsigned char c = static_cast<unsigned char>(host[index]);
+      if (std::isalnum(c) == 0 && c != '.' && c != '-' && c != '_')
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static bool systemEgressAllowlistContains(const Vector<container_egress_allow_key>& keys, const container_egress_allow_key& key)
+  {
+    for (const container_egress_allow_key& candidate : keys)
+    {
+      if (std::memcmp(&candidate, &key, sizeof(key)) == 0)
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool addSystemEgressAllowKey(const container_egress_allow_key& key, String *failureReport = nullptr)
+  {
+    if (systemEgressAllowlistContains(systemEgressAllowlist, key))
+    {
+      return true;
+    }
+    if (systemEgressAllowlist.size() >= CONTAINER_EGRESS_ALLOWLIST_MAX_ENTRIES)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"system egress policy resolved more than {itoa} addresses"_ctv>(CONTAINER_EGRESS_ALLOWLIST_MAX_ENTRIES);
+      }
+      return false;
+    }
+    systemEgressAllowlist.push_back(key);
+    return true;
+  }
+
+  bool resolveSystemEgressPolicyRule(String& hostsFile, String *failureReport = nullptr)
+  {
+    String ownedHost = {};
+    ownedHost.assign(plan.systemEgressHost);
+    struct in_addr literal4 = {};
+    struct in6_addr literal6 = {};
+    bool literal = inet_pton(AF_INET, ownedHost.c_str(), &literal4) == 1 || inet_pton(AF_INET6, ownedHost.c_str(), &literal6) == 1;
+    if (literal == false && systemEgressHostAliasSafe(plan.systemEgressHost) == false)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("system egress policy host is not a safe hosts-file alias"_ctv);
+      }
+      return false;
+    }
+
+    String portText = {};
+    portText.assignItoa(plan.systemEgressPort);
+    struct addrinfo hints = {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    struct addrinfo *results = nullptr;
+    int rc = getaddrinfo(ownedHost.c_str(), portText.c_str(), &hints, &results);
+    if (rc != 0)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"system egress policy host {} did not resolve: {}"_ctv>(plan.systemEgressHost, String(gai_strerror(rc)));
+      }
+      return false;
+    }
+
+    bool resolved = false;
+    for (struct addrinfo *candidate = results; candidate != nullptr; candidate = candidate->ai_next)
+    {
+      container_egress_allow_key key = {};
+      char addressText[INET6_ADDRSTRLEN] = {};
+      if (candidate->ai_family == AF_INET)
+      {
+        const struct sockaddr_in *addr = reinterpret_cast<const struct sockaddr_in *>(candidate->ai_addr);
+        if (mothershipTunnelProviderEgressIPv4HostAddressIsDenied(ntohl(addr->sin_addr.s_addr)))
+        {
+          freeaddrinfo(results);
+          if (failureReport)
+          {
+            failureReport->snprintf<"system egress policy host {} resolved to denied IPv4 address"_ctv>(plan.systemEgressHost);
+          }
+          return false;
+        }
+        if (inet_ntop(AF_INET, &addr->sin_addr, addressText, sizeof(addressText)) == nullptr)
+        {
+          continue;
+        }
+        key.family = 4;
+        key.proto = IPPROTO_TCP;
+        key.port = addr->sin_port;
+        key.addr.v4 = addr->sin_addr.s_addr;
+      }
+      else if (candidate->ai_family == AF_INET6)
+      {
+        const struct sockaddr_in6 *addr = reinterpret_cast<const struct sockaddr_in6 *>(candidate->ai_addr);
+        if (inet_ntop(AF_INET6, &addr->sin6_addr, addressText, sizeof(addressText)) == nullptr)
+        {
+          continue;
+        }
+        String rendered = {};
+        rendered.assign(addressText);
+        if (mothershipTunnelProviderEgressLiteralIsDenied(rendered))
+        {
+          freeaddrinfo(results);
+          if (failureReport)
+          {
+            failureReport->snprintf<"system egress policy host {} resolved to denied IPv6 address"_ctv>(plan.systemEgressHost);
+          }
+          return false;
+        }
+        key.family = 6;
+        key.proto = IPPROTO_TCP;
+        key.port = addr->sin6_port;
+        std::memcpy(key.addr.v6, addr->sin6_addr.s6_addr, sizeof(key.addr.v6));
+      }
+      else
+      {
+        continue;
+      }
+
+      if (addSystemEgressAllowKey(key, failureReport) == false)
+      {
+        freeaddrinfo(results);
+        return false;
+      }
+      if (literal == false)
+      {
+        hostsFile.append(addressText);
+        hostsFile.append(' ');
+        hostsFile.append(plan.systemEgressHost);
+        hostsFile.append('\n');
+      }
+      resolved = true;
+    }
+    freeaddrinfo(results);
+    if (resolved == false && failureReport)
+    {
+      failureReport->snprintf<"system egress policy host {} produced no usable addresses"_ctv>(plan.systemEgressHost);
+    }
+    return resolved;
+  }
+
+  bool prepareSystemEgressPolicy(String *failureReport = nullptr)
+  {
+    systemEgressAllowlist.clear();
+    systemEgressHostsFile.clear();
+    if (systemEgressConstrained() == false)
+    {
+      return true;
+    }
+    systemEgressHostsFile.assign("127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n"_ctv);
+    if (resolveSystemEgressPolicyRule(systemEgressHostsFile, failureReport) == false)
+    {
+      return false;
+    }
+
+    if (systemEgressAllowlist.empty())
+    {
+      if (failureReport)
+      {
+        failureReport->assign("system egress policy resolved no addresses"_ctv);
+      }
+      return false;
+    }
+    return true;
+  }
+
+  bool syncSystemEgressAllowlist(String *failureReport = nullptr)
+  {
+    if (systemEgressConstrained() == false)
+    {
+      return true;
+    }
+    if (peer_program == nullptr || systemEgressAllowlist.empty())
+    {
+      if (failureReport)
+      {
+        failureReport->assign("system egress allowlist unavailable"_ctv);
+      }
+      return false;
+    }
+
+    bool ok = false;
+    peer_program->openMap("ct_egress_allow"_ctv, [&](int mapFD) -> void {
+      if (mapFD < 0)
+      {
+        return;
+      }
+      __u8 value = 1;
+      ok = true;
+      for (const container_egress_allow_key& key : systemEgressAllowlist)
+      {
+        ok = ok && bpf_map_update_elem(mapFD, &key, &value, BPF_ANY) == 0;
+      }
+    });
+    if (ok == false && failureReport)
+    {
+      failureReport->assign("failed to sync system egress allowlist"_ctv);
+    }
+    return ok;
+  }
 
   BPFProgram *peer_program = nullptr;
   BPFProgram *primary_program = nullptr;
@@ -902,12 +1147,42 @@ public:
     return configuredMTU;
   }
 
+  uint8_t systemEgressFakeMachineFragment(void) const
+  {
+#if NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE
+    if (thisNeuron && thisNeuron->configuredFakeIpv4Boundary && thisNeuron->lcsubnet6.dpfx != 0)
+    {
+      return thisNeuron->lcsubnet6.mpfx[2] ? thisNeuron->lcsubnet6.mpfx[2] : 1;
+    }
+#endif
+    return 0;
+  }
+
   bool buildContainerNetworkPolicy(struct container_network_policy& networkPolicy, String *failureReport = nullptr) const
   {
     networkPolicy = {};
-    networkPolicy.requiresPublic4 = needsAnyExternalAddressFamily(plan, ExternalAddressFamily::ipv4) ? 1 : 0;
+    networkPolicy.requiresPublic4 = (needsAnyExternalAddressFamily(plan, ExternalAddressFamily::ipv4) || systemEgressConstrained()) ? 1 : 0;
     networkPolicy.requiresPublic6 = needsAnyExternalAddressFamily(plan, ExternalAddressFamily::ipv6) ? 1 : 0;
+    networkPolicy.egressAllowlistOnly = systemEgressConstrained() ? 1 : 0;
+    networkPolicy.containerFragment = plan.fragment;
     networkPolicy.interContainerMTU = desiredInterContainerMTU(failureReport);
+    if (networkPolicy.egressAllowlistOnly)
+    {
+      if (thisNeuron == nullptr || thisNeuron->private4.is6 || thisNeuron->private4.isNull() || plan.fragment == 0)
+      {
+        if (failureReport && failureReport->size() == 0)
+        {
+          failureReport->snprintf<"system container {itoa} egress requires host IPv4 source and nonzero fragment"_ctv>(plan.uuid);
+        }
+        return false;
+      }
+      networkPolicy.systemEgressSource4 = thisNeuron->private4.v4;
+      uint8_t fakeMachineFragment = systemEgressFakeMachineFragment();
+      if (fakeMachineFragment != 0)
+      {
+        networkPolicy.systemEgressSource4 = systemEgressInternalIPv4Prefix(plan.fragment, fakeMachineFragment).network.v4;
+      }
+    }
     return !(thisNeuron && thisNeuron->configuredInterContainerMTU != 0 && networkPolicy.interContainerMTU == 0);
   }
 
@@ -1087,6 +1362,18 @@ public:
       peer_program->setArrayElement("mac_map"_ctv, 0, thisNeuron->eth.mac);
       peer_program->setArrayElement("gw_mac_map"_ctv, 0, thisNeuron->eth.gateway_mac);
       peer_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
+      if (syncSystemEgressAllowlist(failureReport) == false)
+      {
+        if (peernetnsfd >= 0)
+        {
+          ::close(peernetnsfd);
+        }
+        if (hostnetnsfd >= 0)
+        {
+          ::close(hostnetnsfd);
+        }
+        return false;
+      }
       syncPeerWhiteholeBindings();
     }
 
@@ -1214,6 +1501,11 @@ public:
       peer.addIP(prefix);
     }
 
+    if (systemEgressConstrained())
+    {
+      peer.addIP(systemEgressInternalIPv4Prefix(plan.fragment));
+    }
+
     for (const Whitehole& whitehole : plan.whiteholes)
     {
       if (whitehole.hasAddress == false || whitehole.address.isNull())
@@ -1304,6 +1596,7 @@ public:
     peer_program = host.attachBPF(prodigyContainerEgressNetkitAttachType(), path, "ct_egress"_ctv,
                                   [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
                                     (void)switchboardReusePinnedWhiteholeReplyFlowMap(obj, thisNeuron->eth.ifidx, inner_map_fds);
+                                    (void)switchboardReusePinnedSystemEgressNATMap(obj, thisNeuron->eth.ifidx, inner_map_fds);
                                   });
     if (peer_program == nullptr)
     {
@@ -1348,6 +1641,18 @@ public:
     peer_program->setArrayElement("mac_map"_ctv, 0, thisNeuron->eth.mac);
     peer_program->setArrayElement("gw_mac_map"_ctv, 0, thisNeuron->eth.gateway_mac);
     peer_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
+    if (syncSystemEgressAllowlist(failureReport) == false)
+    {
+      if (peernetnsfd >= 0)
+      {
+        ::close(peernetnsfd);
+      }
+      if (hostnetnsfd >= 0)
+      {
+        ::close(hostnetnsfd);
+      }
+      return false;
+    }
     syncPeerWhiteholeBindings();
 
     path.assign("/root/prodigy/container.ingress.router.ebpf.o"_ctv);
@@ -1461,6 +1766,11 @@ public:
 
   static void pop(Container *container)
   {
+    if (container->isSystemContainer())
+    {
+      return;
+    }
+
     uint64_t deploymentID = container->plan.config.deploymentID();
 
     if (--log[deploymentID] == 0 && ContainerStore::autoDestroy)
@@ -4502,7 +4812,7 @@ private:
       return false;
     }
 
-    if (fchownat(descriptor, "", userID, groupID, AT_EMPTY_PATH) != 0)
+    if (fchownat(descriptor, "", userID, groupID, AT_EMPTY_PATH) != 0 && fchown(descriptor, userID, groupID) != 0)
     {
       if (failureReport)
       {
@@ -4556,7 +4866,7 @@ private:
       }
     }
 
-    int openFlags = O_CLOEXEC | O_NOFOLLOW;
+    int openFlags = O_CLOEXEC | O_NOFOLLOW | O_RDWR;
     if (create)
     {
       openFlags |= O_CREAT;
@@ -5107,6 +5417,109 @@ private:
       {
         failureReport->snprintf<"failed to bind mount host device {}"_ctv>(sourcePath);
       }
+      return false;
+    }
+
+    return true;
+  }
+
+  static bool writeContainerRootFSFileAtNoSymlinks(int rootfd, const String& absolutePath, const String& payload, String *failureReport = nullptr)
+  {
+    String relativePath = {};
+    if (containerAbsolutePathToRelative(absolutePath, relativePath, "system container file"_ctv, false, failureReport) == false)
+    {
+      return false;
+    }
+
+    int fd = -1;
+    if (openContainerFileAtNoSymlinks(rootfd, relativePath, true, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH, fd, failureReport) == false)
+    {
+      return false;
+    }
+
+    bool ok = true;
+    if (ftruncate(fd, 0) != 0)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to truncate container rootfs file {} errno={}({})"_ctv>(absolutePath, errno, String(strerror(errno)));
+      }
+      ok = false;
+    }
+    for (uint64_t written = 0; ok && written < payload.size();)
+    {
+      ssize_t result = write(fd, payload.data() + written, size_t(payload.size() - written));
+      if (result > 0)
+      {
+        written += uint64_t(result);
+      }
+      else if (result == 0 || (result < 0 && errno != EINTR))
+      {
+        if (failureReport)
+        {
+          failureReport->snprintf<"failed to write container rootfs file {} errno={}({})"_ctv>(absolutePath, errno, String(strerror(errno)));
+        }
+        ok = false;
+      }
+    }
+    close(fd);
+    return ok;
+  }
+
+  static bool bindMountSystemSocketIntoRootFS(int rootfd, const String& sourcePath, const String& absoluteTargetPath, const String& containerRoot, String *failureReport = nullptr)
+  {
+    String relativeTargetPath = {};
+    if (containerAbsolutePathToRelative(absoluteTargetPath, relativeTargetPath, "system container socket"_ctv, false, failureReport) == false)
+    {
+      return false;
+    }
+
+    struct stat sourceStat = {};
+    if (sourcePath.size() == 0 || sourcePath[0] != '/' || pathStat(sourcePath, sourceStat) == false || S_ISSOCK(sourceStat.st_mode) == 0)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"system container socket source {} is invalid"_ctv>(sourcePath);
+      }
+      return false;
+    }
+
+    if (createContainerFileAtNoSymlinks(rootfd, relativeTargetPath, S_IRUSR | S_IWUSR, failureReport) == false)
+    {
+      return false;
+    }
+
+    String targetPath = {};
+    targetPath.assign(containerRoot);
+    targetPath.append(absoluteTargetPath);
+    String sourcePathText = {};
+    sourcePathText.assign(sourcePath);
+    if (mount(sourcePathText.c_str(), targetPath.c_str(), nullptr, MS_BIND, nullptr) != 0 ||
+        mount(nullptr, targetPath.c_str(), nullptr, MS_BIND | MS_REMOUNT | MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr) != 0)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to bind mount system container socket {} to {} errno={}({})"_ctv>(sourcePath, absoluteTargetPath, errno, String(strerror(errno)));
+      }
+      return false;
+    }
+
+    return true;
+  }
+
+  static bool materializeSystemContainerRootFSMounts(Container *container, int rootfd, const String& containerRoot, String *failureReport = nullptr)
+  {
+    if (container->isSystemContainer() == false)
+    {
+      return true;
+    }
+    if (container->systemEgressHostsFile.size() > 0 && writeContainerRootFSFileAtNoSymlinks(rootfd, "/etc/hosts"_ctv, container->systemEgressHostsFile, failureReport) == false)
+    {
+      return false;
+    }
+    if (container->plan.systemGatewaySocketSourcePath.size() > 0 &&
+        bindMountSystemSocketIntoRootFS(rootfd, container->plan.systemGatewaySocketSourcePath, container->plan.systemGatewaySocketTargetPath, containerRoot, failureReport) == false)
+    {
       return false;
     }
 
@@ -6761,8 +7174,11 @@ public:
           unsigned(plan.config.applicationID));
     }
 
-    IPPrefix containerNetwork6 = thisNeuron->generateAddress(container_network_subnet6, plan.fragment, 128);
-    addAddressIfMissing(container->plan.addresses, containerNetwork6);
+    if (container->isSystemContainer() == false)
+    {
+      IPPrefix containerNetwork6 = thisNeuron->generateAddress(container_network_subnet6, plan.fragment, 128);
+      addAddressIfMissing(container->plan.addresses, containerNetwork6);
+    }
     basics_log(
         "createContainer networking needsExternal4=%d needsExternal6=%d directAddresses=%u\n",
         int(needsAnyExternalAddressFamily(plan, ExternalAddressFamily::ipv4)),
@@ -6796,8 +7212,23 @@ public:
       }
     } extractionLock;
 
+    String artifactKey = {};
+    if (container->isSystemContainer())
+    {
+      artifactKey.assign("system."_ctv);
+      artifactKey.append(prodigySystemContainerKindName(plan.systemContainerKind));
+      artifactKey.append("."_ctv);
+      artifactKey.append(plan.config.containerBlobSHA256);
+    }
+    else
+    {
+      artifactKey.assignItoa(plan.config.deploymentID());
+    }
+
     String extractionLockPath;
-    extractionLockPath.snprintf<"/containers/store/.extract.{itoa}.lock"_ctv>(plan.config.deploymentID());
+    extractionLockPath.assign("/containers/store/.extract."_ctv);
+    extractionLockPath.append(artifactKey);
+    extractionLockPath.append(".lock"_ctv);
     extractionLock.fd = open(extractionLockPath.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     if (extractionLock.fd < 0)
     {
@@ -6823,9 +7254,7 @@ public:
 
     String receiveScratchPath = {};
     receiveScratchPath.assign("/containers/store/.receive."_ctv);
-    String deploymentIDText = {};
-    deploymentIDText.assignItoa(plan.config.deploymentID());
-    receiveScratchPath.append(deploymentIDText);
+    receiveScratchPath.append(artifactKey);
     receiveScratchPath.append("."_ctv);
     receiveScratchPath.append(container->name);
     if (createDirectoryTree(receiveScratchPath) == false)
@@ -6878,7 +7307,10 @@ public:
 
       int compressedPayloadFD = -1;
       String contractFailure = {};
-      if (prodigyOpenContainerBlobPayloadAfterContractHeader(compressedContainerPath, compressedPayloadFD, &contractFailure) == false)
+      bool contractOK = container->isSystemContainer()
+          ? prodigyOpenMothershipTunnelProviderBlobPayloadAfterContractHeader(compressedContainerPath, compressedPayloadFD, &contractFailure)
+          : prodigyOpenContainerBlobPayloadAfterContractHeader(compressedContainerPath, compressedPayloadFD, &contractFailure);
+      if (contractOK == false)
       {
         basics_log("createContainer rejected container blob contract: %s\n", contractFailure.c_str());
         restoreSigChld();
@@ -7520,6 +7952,17 @@ public:
       return fail("validate launch targets", EINVAL, &launchTargetFailure);
     }
 
+    String systemMountFailure = {};
+    if (materializeSystemContainerRootFSMounts(container, rootfd, containerRoot, &systemMountFailure) == false)
+    {
+      basics_log("mountRootFS system container mounts failed uuid=%llu root=%s reason=%s\n",
+                 (unsigned long long)container->plan.uuid,
+                 containerRoot.c_str(),
+                 systemMountFailure.c_str());
+      close(rootfd);
+      return fail("system container mounts", EINVAL, &systemMountFailure);
+    }
+
     close(rootfd);
 
     String deviceMountFailure = {};
@@ -7952,6 +8395,20 @@ private:
 
 public:
 
+  static void queueContainerWaitid(Container *container)
+  {
+    container->waitidPending = true;
+    container->destroyCloseCompleted = false;
+#ifdef __linux__
+    if (container->pidfd >= 0)
+    {
+      Ring::queueWaitid(container, static_cast<idtype_t>(3), id_t(container->pidfd));
+      return;
+    }
+#endif
+    Ring::queueWaitid(container, P_PID, id_t(container->pid));
+  }
+
   static bool adjustRunningContainerResources(Container *container, uint16_t targetCores, uint32_t targetMemoryMB, uint32_t targetStorageMB, String *failureReport = nullptr)
   {
     return applyContainerResourceTargets(container, targetCores, targetMemoryMB, targetStorageMB, failureReport);
@@ -8015,8 +8472,22 @@ public:
     }
     logStartStage("metadata-ready");
 
-    int socs[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, socs) != 0)
+    bool exposeNeuronSocket = container->exposesNeuronSocket();
+    int socs[2] = {-1, -1};
+    auto closeNeuronSocketPair = [&]() -> void {
+      if (socs[0] >= 0)
+      {
+        close(socs[0]);
+        socs[0] = -1;
+      }
+      if (socs[1] >= 0)
+      {
+        close(socs[1]);
+        socs[1] = -1;
+      }
+    };
+
+    if (exposeNeuronSocket && socketpair(AF_UNIX, SOCK_STREAM, 0, socs) != 0)
     {
       if (failureReport)
       {
@@ -8024,7 +8495,7 @@ public:
       }
       return false;
     }
-    logStartStage("socketpair-ready");
+    logStartStage(exposeNeuronSocket ? "socketpair-ready" : "socketpair-skipped");
 
     int startupSync[2];
     if (pipe2(startupSync, O_CLOEXEC) != 0)
@@ -8033,8 +8504,7 @@ public:
       {
         failureReport->snprintf<"pipe2(startupSync) failed for container {itoa}: {}"_ctv>(container->plan.uuid, String(strerror(errno)));
       }
-      close(socs[0]);
-      close(socs[1]);
+      closeNeuronSocketPair();
       return false;
     }
     logStartStage("pipe-ready");
@@ -8057,8 +8527,7 @@ public:
 
       close(startupSync[0]);
       close(startupSync[1]);
-      close(socs[0]);
-      close(socs[1]);
+      closeNeuronSocketPair();
       return false;
     }
     logStartStage("seccomp-ready");
@@ -8110,8 +8579,7 @@ public:
 
       close(startupSync[0]);
       close(startupSync[1]);
-      close(socs[0]);
-      close(socs[1]);
+      closeNeuronSocketPair();
       return false;
     }
     logStartStage(container->pid == 0 ? "clone-child" : "clone-parent");
@@ -8119,7 +8587,10 @@ public:
     if (container->pid == 0) // child
     {
       close(startupSync[1]);
-      close(socs[0]);
+      if (socs[0] >= 0)
+      {
+        close(socs[0]);
+      }
       bool insideContainerRoot = false;
       auto failStartup = [&](const char *stage, const String *detail = nullptr) -> void {
         String report = {};
@@ -8239,9 +8710,9 @@ public:
         failStartup("chdir failed", &chdirFailure);
       }
 
-      int execNeuronFD = socs[1];
+      int execNeuronFD = exposeNeuronSocket ? socs[1] : -1;
       String execDescriptorFailure = {};
-      if (moveContainerExecDescriptorAboveMinimum(execNeuronFD, &execDescriptorFailure) == false)
+      if (exposeNeuronSocket && moveContainerExecDescriptorAboveMinimum(execNeuronFD, &execDescriptorFailure) == false)
       {
         basics_log("startContainer failed to move inherited neuron fd uuid=%llu reason=%s\n",
                    (unsigned long long)container->plan.uuid,
@@ -8249,6 +8720,9 @@ public:
         failStartup("move neuron fd failed", &execDescriptorFailure);
       }
 
+      int execParamsFD = -1;
+      if (exposeNeuronSocket)
+      {
       ContainerParameters parameters;
       parameters.uuid = container->plan.uuid;
       parameters.neuronFD = execNeuronFD;
@@ -8338,7 +8812,6 @@ public:
       }
 
       int pfd = Memfd::create("container.params"_ctv);
-      int execParamsFD = -1;
       if (pfd >= 0)
       {
         Memfd::writeAll(pfd, serializedParameters);
@@ -8358,6 +8831,11 @@ public:
         paramsFDText.assignItoa(uint64_t(execParamsFD));
         setenv("PRODIGY_PARAMS_FD", paramsFDText.c_str(), 1);
       }
+      }
+      else
+      {
+        unsetenv("PRODIGY_PARAMS_FD");
+      }
 
       // The parent process is launched under stdbuf in tests, which injects
       // LD_PRELOAD for line-buffering. That path does not exist in container
@@ -8366,6 +8844,11 @@ public:
       unsetenv("_STDBUF_I");
       unsetenv("_STDBUF_O");
       unsetenv("_STDBUF_E");
+
+      for (const String& assignment : container->plan.systemExecuteEnv)
+      {
+        container->executeEnv.push_back(assignment);
+      }
 
       for (const String& assignment : container->executeEnv)
       {
@@ -8479,11 +8962,17 @@ public:
     {
       seccomp_release(containerSeccomp);
       close(startupSync[0]);
-      close(socs[1]);
+      if (socs[1] >= 0)
+      {
+        close(socs[1]);
+      }
       if (useUserNamespace && mapIDs(container, failureReport) == false)
       {
         close(startupSync[1]);
-        close(socs[0]);
+        if (socs[0] >= 0)
+        {
+          close(socs[0]);
+        }
 
         kill(container->pid, SIGKILL);
         waitpid(container->pid, nullptr, 0);
@@ -8498,19 +8987,29 @@ public:
       }
       logStartStage("ids-mapped");
 
-      container->setUnixPairHalf(socs[0]);
+      if (exposeNeuronSocket)
+      {
+        container->setUnixPairHalf(socs[0]);
+      }
 
-      if (container->plan.requiresDatacenterUniqueTag)
+      if (exposeNeuronSocket && container->plan.requiresDatacenterUniqueTag)
       {
         Message::construct(container->wBuffer, ContainerTopic::datacenterUniqueTag, thisNeuron->datacenterUniqueTag());
       }
 
-      if (container->plan.useHostNetworkNamespace == false)
+      if (container->isSystemContainer() && container->systemEgressConstrained() == false)
+      {
+        logStartStage("system-network-skipped");
+      }
+      else if (container->plan.useHostNetworkNamespace == false)
       {
         if (container->setupNetwork(failureReport) == false)
         {
           close(startupSync[1]);
-          close(socs[0]);
+          if (socs[0] >= 0)
+          {
+            close(socs[0]);
+          }
 
           kill(container->pid, SIGKILL);
           waitpid(container->pid, nullptr, 0);
@@ -8567,27 +9066,31 @@ public:
 
       thisNeuron->pushContainer(container);
       logStartStage("pushed");
-      appendContainerTrace(container,
-                           "startContainer after-push pendingSend=%d pendingRecv=%d outstanding=%llu isFixed=%d fslot=%d registeredFD=%d fd=%d\n",
-                           int(container->pendingSend),
-                           int(container->pendingRecv),
-                           (unsigned long long)container->queuedSendOutstandingBytes(),
-                           int(container->isFixedFile),
-                           container->fslot,
-                           (container->isFixedFile && container->fslot >= 0 ? Ring::getFDFromFixedFileSlot(container->fslot) : container->fd),
-                           container->fd);
-      Ring::queueRecv(container);
-      appendContainerTrace(container,
-                           "startContainer after-queueRecv pendingSend=%d pendingRecv=%d outstanding=%llu\n",
-                           int(container->pendingSend),
-                           int(container->pendingRecv),
-                           (unsigned long long)container->queuedSendOutstandingBytes());
-      container->waitidPending = true;
-      container->destroyCloseCompleted = false;
-      Ring::queueWaitid(container, P_PID, container->pid);
+      if (exposeNeuronSocket)
+      {
+        appendContainerTrace(container,
+                             "startContainer after-push pendingSend=%d pendingRecv=%d outstanding=%llu isFixed=%d fslot=%d registeredFD=%d fd=%d\n",
+                             int(container->pendingSend),
+                             int(container->pendingRecv),
+                             (unsigned long long)container->queuedSendOutstandingBytes(),
+                             int(container->isFixedFile),
+                             container->fslot,
+                             (container->isFixedFile && container->fslot >= 0 ? Ring::getFDFromFixedFileSlot(container->fslot) : container->fd),
+                             container->fd);
+        Ring::queueRecv(container);
+        appendContainerTrace(container,
+                             "startContainer after-queueRecv pendingSend=%d pendingRecv=%d outstanding=%llu\n",
+                             int(container->pendingSend),
+                             int(container->pendingRecv),
+                             (unsigned long long)container->queuedSendOutstandingBytes());
+      }
+      queueContainerWaitid(container);
       logStartStage("waitid-queued");
-      seedDynamicData(container);
-      logStartStage("dynamic-seeded");
+      if (exposeNeuronSocket)
+      {
+        seedDynamicData(container);
+        logStartStage("dynamic-seeded");
+      }
 
       StartupSyncPayload startupPayload;
       startupPayload.startSignal = 1;
@@ -8619,16 +9122,19 @@ public:
       }
       logStartStage("cgroup-thawed");
 
-      Ring::queueRecv(container, container->plan.config.msTilHealthy);
-      appendContainerTrace(container,
-                           "startContainer after-health-timeout pendingSend=%d pendingRecv=%d pendingSendBytes=%u outstanding=%llu isFixed=%d fslot=%d registeredFD=%d\n",
-                           int(container->pendingSend),
-                           int(container->pendingRecv),
-                           unsigned(container->pendingSendBytes),
-                           (unsigned long long)container->queuedSendOutstandingBytes(),
-                           int(container->isFixedFile),
-                           container->fslot,
-                           (container->isFixedFile && container->fslot >= 0 ? Ring::getFDFromFixedFileSlot(container->fslot) : container->fd));
+      if (exposeNeuronSocket)
+      {
+        Ring::queueRecv(container, container->plan.config.msTilHealthy);
+        appendContainerTrace(container,
+                             "startContainer after-health-timeout pendingSend=%d pendingRecv=%d pendingSendBytes=%u outstanding=%llu isFixed=%d fslot=%d registeredFD=%d\n",
+                             int(container->pendingSend),
+                             int(container->pendingRecv),
+                             unsigned(container->pendingSendBytes),
+                             (unsigned long long)container->queuedSendOutstandingBytes(),
+                             int(container->isFixedFile),
+                             container->fslot,
+                             (container->isFixedFile && container->fslot >= 0 ? Ring::getFDFromFixedFileSlot(container->fslot) : container->fd));
+      }
       logStartStage("complete");
       return true;
     }
@@ -8665,84 +9171,74 @@ public:
     }
 
     uint64_t deploymentID = plan.config.deploymentID();
-    String compressedContainerPath = ContainerStore::pathForContainerImage(deploymentID);
-    std::fprintf(stderr, "spinContainer begin deploymentID=%llu replaceUUID=%llu path=%s contains=%d\n",
-                 (unsigned long long)deploymentID,
-                 (unsigned long long)replaceContainerUUID,
-                 compressedContainerPath.c_str(),
-                 int(ContainerStore::contains(deploymentID)));
-    std::fflush(stderr);
-    if (ContainerStore::contains(deploymentID) == false)
+    bool systemContainer = plan.systemContainerKind != SystemContainerKind::none;
+    String compressedContainerPath = systemContainer
+        ? ContainerStore::systemPathForArtifact(plan.systemContainerKind, plan.config.containerBlobSHA256)
+        : ContainerStore::pathForContainerImage(deploymentID);
+    if (systemContainer)
+    {
+      String systemVerificationFailure = {};
+      if (ContainerStore::systemVerify(plan.systemContainerKind, plan.config.containerBlobSHA256, plan.config.containerBlobBytes, nullptr, nullptr, &systemVerificationFailure) == false)
+      {
+        if (systemVerificationFailure.size() == 0)
+        {
+          systemVerificationFailure.assign("system container artifact verification failed"_ctv);
+        }
+        reportSpinContainerFailure(plan, systemVerificationFailure);
+        co_return;
+      }
+    }
+    else if (ContainerStore::contains(deploymentID) == false)
     {
       CoroutineStack pullWaiter;
       uint32_t suspendIndex = pullWaiter.nextSuspendIndex();
       thisNeuron->downloadContainer(&pullWaiter, deploymentID);
       co_await pullWaiter.suspendAtIndex(suspendIndex);
-      std::fprintf(stderr, "spinContainer download resumed deploymentID=%llu path=%s contains=%d readable=%d\n",
-                   (unsigned long long)deploymentID,
-                   compressedContainerPath.c_str(),
-                   int(ContainerStore::contains(deploymentID)),
-                   int(access(compressedContainerPath.c_str(), R_OK) == 0));
-      std::fflush(stderr);
     }
 
     if (access(compressedContainerPath.c_str(), R_OK) != 0)
     {
       int imageErrno = errno;
-      std::fprintf(stderr, "spinContainer missing image deploymentID=%llu path=%s errno=%d(%s)\n",
-                   (unsigned long long)deploymentID,
-                   compressedContainerPath.c_str(),
-                   imageErrno,
-                   strerror(imageErrno));
-      std::fflush(stderr);
       String report = {};
       report.snprintf<"missing container image {} errno={itoa}({})"_ctv>(compressedContainerPath, uint64_t(imageErrno), String(strerror(imageErrno)));
       reportSpinContainerFailure(plan, report);
       co_return;
     }
 
-    std::fprintf(stderr, "spinContainer verify begin deploymentID=%llu path=%s\n",
-                 (unsigned long long)deploymentID,
-                 compressedContainerPath.c_str());
-    std::fflush(stderr);
-    String blobVerificationFailure = {};
-    if (verifyCompressedContainerBlob(
-            compressedContainerPath,
-            plan.config.containerBlobSHA256,
-            plan.config.containerBlobBytes,
-            &blobVerificationFailure) == false)
+    if (systemContainer == false)
     {
-      std::fprintf(stderr, "spinContainer rejected image deploymentID=%llu path=%s reason=%s\n",
-                   (unsigned long long)deploymentID,
-                   compressedContainerPath.c_str(),
-                   (blobVerificationFailure.size() > 0 ? blobVerificationFailure.c_str() : "unknown"));
-      std::fflush(stderr);
-      if (blobVerificationFailure.size() == 0)
+      String blobVerificationFailure = {};
+      if (verifyCompressedContainerBlob(
+              compressedContainerPath,
+              plan.config.containerBlobSHA256,
+              plan.config.containerBlobBytes,
+              &blobVerificationFailure) == false)
       {
-        blobVerificationFailure.assign("container image verification failed"_ctv);
+        if (blobVerificationFailure.size() == 0)
+        {
+          blobVerificationFailure.assign("container image verification failed"_ctv);
+        }
+        reportSpinContainerFailure(plan, blobVerificationFailure);
+        co_return;
       }
-      reportSpinContainerFailure(plan, blobVerificationFailure);
-      co_return;
+      ContainerRegistry::retain(deploymentID);
     }
-    std::fprintf(stderr, "spinContainer verify ok deploymentID=%llu\n",
-                 (unsigned long long)deploymentID);
-    std::fflush(stderr);
-
-    ContainerRegistry::retain(deploymentID);
 
     Container *container = nullptr;
-    std::fprintf(stderr, "spinContainer create begin deploymentID=%llu\n",
-                 (unsigned long long)deploymentID);
-    std::fflush(stderr);
     createContainer(plan, compressedContainerPath, container);
     if (container == nullptr)
     {
-      std::fprintf(stderr, "spinContainer createContainer returned null deploymentID=%llu\n",
-                   (unsigned long long)deploymentID);
-      std::fflush(stderr);
       String report = {};
       report.assign("createContainer returned null"_ctv);
       reportSpinContainerFailure(plan, report);
+      co_return;
+    }
+
+    String systemEgressFailure = {};
+    if (container->prepareSystemEgressPolicy(&systemEgressFailure) == false)
+    {
+      cleanupContainerAfterFailedCreate(container);
+      reportSpinContainerFailure(plan, systemEgressFailure.size() ? systemEgressFailure : String("system egress policy failed"_ctv));
       co_return;
     }
 
@@ -8766,21 +9262,9 @@ public:
         thisNeuron->closeWhiteholesForLocalContainer(container->plan.fragment);
       }
       cleanupContainerAfterFailedCreate(container);
-      std::fprintf(stderr, "spinContainer start failed deploymentID=%llu appID=%u reason=%s\n",
-                   (unsigned long long)plan.config.deploymentID(),
-                   unsigned(plan.config.applicationID),
-                   failureReport.c_str());
-      std::fflush(stderr);
       reportSpinContainerFailure(plan, failureReport);
       co_return;
     }
-
-    std::fprintf(stderr, "spinContainer start ok deploymentID=%llu appID=%u containerUUID=%llu pid=%d\n",
-                 (unsigned long long)plan.config.deploymentID(),
-                 unsigned(plan.config.applicationID),
-                 (unsigned long long)container->plan.uuid,
-                 int(container->pid));
-    std::fflush(stderr);
   }
 
   static void killContainer(Container *container)
@@ -8990,7 +9474,11 @@ public:
 
     bool waitingForCloseEvent = false;
 
-    if (Ring::socketIsClosing(container) == false)
+    if (container->exposesNeuronSocket() == false)
+    {
+      waitingForCloseEvent = false;
+    }
+    else if (Ring::socketIsClosing(container) == false)
     {
       if (container->isFixedFile == false)
       {

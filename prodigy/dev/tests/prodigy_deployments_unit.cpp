@@ -1568,6 +1568,71 @@ int main(void)
       suite.expect(
           stringContains(verificationFailure, "Discombobulator app-container contract header"),
           "container_blob_digest_verifier_reports_missing_contract_header");
+
+      std::filesystem::path tunnelBlobPath = filesystemPathFromString(workspace.path) / "mothership-tunnel-provider.blob";
+      String tunnelPayload = {};
+      tunnelPayload.assign(prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText());
+      tunnelPayload.append("tunnel-provider-payload"_ctv);
+      suite.expect(
+          Filesystem::openWriteAtClose(-1, stringFromFilesystemPath(tunnelBlobPath), tunnelPayload) >= 0,
+          "mothership_tunnel_provider_blob_fixture_written");
+      suite.expect(
+          prodigyValidateMothershipTunnelProviderBlobHeader(stringFromFilesystemPath(tunnelBlobPath), &verificationFailure),
+          "mothership_tunnel_provider_header_accepts_tunnel_blob");
+      suite.expect(
+          prodigyValidateMothershipTunnelProviderBlobHeader(stringFromFilesystemPath(blobPath), &verificationFailure) == false,
+          "mothership_tunnel_provider_header_rejects_app_blob");
+
+      std::filesystem::path unknownTunnelBlobPath = filesystemPathFromString(workspace.path) / "mothership-tunnel-provider-v2.blob";
+      String unknownTunnelPayload = {};
+      unknownTunnelPayload.assign("PRODIGY-DISCOMBOBULATOR-MOTHERSHIP-TUNNEL-PROVIDER\ncontract=prodigy-mothership-tunnel-provider\ncontract_version=2\ncontainer_kind=mothershipTunnelProvider\nrequires_standard_neuron_socket=false\nrequires_mothership_tunnel_gateway=true\nnetwork_policy=tcpEgressOnly\n\npayload"_ctv);
+      suite.expect(
+          Filesystem::openWriteAtClose(-1, stringFromFilesystemPath(unknownTunnelBlobPath), unknownTunnelPayload) >= 0,
+          "mothership_tunnel_provider_unknown_contract_fixture_written");
+      suite.expect(
+          prodigyValidateMothershipTunnelProviderBlobHeader(stringFromFilesystemPath(unknownTunnelBlobPath), &verificationFailure) == false,
+          "mothership_tunnel_provider_header_rejects_unknown_contract_version");
+
+      String tunnelDigest = {};
+      suite.expect(
+          prodigyComputeSHA256Hex(tunnelPayload, tunnelDigest, &digestFailure),
+          "mothership_tunnel_provider_blob_sha256_computed");
+      TemporaryDirectory systemStoreRoot;
+      suite.expect(systemStoreRoot.create(), "system_container_store_fixture_mkdtemp_created");
+      if (systemStoreRoot.path.size() > 0)
+      {
+        String actualDigest = {};
+        uint64_t actualBytes = 0;
+        bool stored = ContainerStore::systemStore(
+            SystemContainerKind::mothershipTunnelProvider,
+            tunnelDigest,
+            tunnelPayload.size(),
+            tunnelPayload,
+            &actualDigest,
+            &actualBytes,
+            &verificationFailure,
+            &systemStoreRoot.path);
+        suite.expect(stored, "system_container_store_stores_tunnel_provider_blob");
+        suite.expect(actualDigest.equals(tunnelDigest), "system_container_store_reports_digest");
+        suite.expect(actualBytes == tunnelPayload.size(), "system_container_store_reports_size");
+        suite.expect(
+            ContainerStore::systemVerify(SystemContainerKind::mothershipTunnelProvider, tunnelDigest, tunnelPayload.size(), nullptr, nullptr, &verificationFailure, &systemStoreRoot.path),
+            "system_container_store_verifies_tunnel_provider_blob");
+        String loadedSystemBlob = {};
+        suite.expect(
+            ContainerStore::systemLoadVerified(SystemContainerKind::mothershipTunnelProvider, tunnelDigest, tunnelPayload.size(), loadedSystemBlob, &verificationFailure, &systemStoreRoot.path),
+            "system_container_store_loads_verified_tunnel_provider_blob");
+        suite.expect(loadedSystemBlob.equals(tunnelPayload), "system_container_store_loads_original_tunnel_provider_blob");
+        suite.expect(
+            ContainerStore::systemStore(SystemContainerKind::mothershipTunnelProvider, expectedDigest, payload.size(), payload, nullptr, nullptr, &verificationFailure, &systemStoreRoot.path) == false,
+            "system_container_store_rejects_app_blob_for_tunnel_provider_kind");
+        suite.expect(
+            stringContains(verificationFailure, "mothership tunnel-provider contract header"),
+            "system_container_store_reports_app_blob_contract_mismatch");
+        suite.expect(
+            ContainerStore::systemStore(static_cast<SystemContainerKind>(99), tunnelDigest, tunnelPayload.size(), tunnelPayload, nullptr, nullptr, &verificationFailure, &systemStoreRoot.path) == false,
+            "system_container_store_rejects_unknown_kind");
+      }
     }
   }
 
@@ -1602,8 +1667,8 @@ int main(void)
     if (storeRoot.path.size() > 0)
     {
       const uint64_t deploymentID = 987'654'321ULL;
-      String firstPayload = {};
-      firstPayload.assign("abcdefghijklmnopqrstuvwxyz0123456789"_ctv);
+      String firstPayload = prodigyDiscombobulatorBlobHeaderText();
+      firstPayload.append("abcdefghijklmnopqrstuvwxyz0123456789"_ctv);
       String firstDigest = {};
       uint64_t firstBytes = 0;
       String failure = {};
@@ -1624,8 +1689,8 @@ int main(void)
       String storedPath = ContainerStore::debugPathForContainerImageAtRoot(storeRoot.path, deploymentID);
       suite.expect(Filesystem::fileSize(storedPath) == firstPayload.size(), "container_store_debug_store_writes_initial_exact_size");
 
-      String secondPayload = {};
-      secondPayload.assign("tiny"_ctv);
+      String secondPayload = prodigyDiscombobulatorBlobHeaderText();
+      secondPayload.append("tiny"_ctv);
       String secondDigest = {};
       uint64_t secondBytes = 0;
       stored = ContainerStore::debugStoreAtRoot(
@@ -1671,6 +1736,12 @@ int main(void)
           &failure);
       suite.expect(verified == false, "container_store_debug_verify_rejects_mismatched_size");
       suite.expect(stringContains(failure, "blob size mismatch"), "container_store_debug_verify_reports_mismatched_size");
+
+      String tunnelPayload = prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText();
+      tunnelPayload.append("tunnel-provider-payload"_ctv);
+      stored = ContainerStore::debugStoreAtRoot(storeRoot.path, deploymentID + 1, tunnelPayload, nullptr, nullptr, nullptr, nullptr, &failure);
+      suite.expect(stored == false, "container_store_rejects_tunnel_provider_blob_as_app");
+      suite.expect(stringContains(failure, "app-container contract header"), "container_store_reports_tunnel_provider_app_contract_mismatch");
     }
   }
 

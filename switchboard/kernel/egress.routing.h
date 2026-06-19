@@ -3,6 +3,7 @@
 #include <ebpf/kernel/containersubnet.h>
 
 #include <switchboard/kernel/csum.h>
+#include <switchboard/kernel/l4.ports.h>
 #include <switchboard/kernel/maps.h>
 #include <switchboard/kernel/overlay.encap.h>
 #include <switchboard/kernel/overlay.routing.h>
@@ -171,38 +172,16 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
   }
 
   __u32 l4Offset = l3Offset + sizeof(struct iphdr);
-  __be16 sourcePort = 0;
-  __u32 checksumOffset = 0;
-  bool udpChecksumPresent = true;
-
-  if (proto == IPPROTO_UDP)
+  struct switchboard_l4_ports l4 = {};
+  if (switchboard_parse_l4_ports((__u8 *)data + l4Offset, data_end, proto, l4Offset, &l4) == false)
   {
-    struct udphdr *udph = (struct udphdr *)((__u8 *)data + l4Offset);
-    if ((void *)(udph + 1) > data_end)
-    {
-      return false;
-    }
-
-    sourcePort = udph->source;
-    checksumOffset = l4Offset + __builtin_offsetof(struct udphdr, check);
-    udpChecksumPresent = (udph->check != 0);
-  }
-  else
-  {
-    struct tcphdr *tcph = (struct tcphdr *)((__u8 *)data + l4Offset);
-    if ((void *)(tcph + 1) > data_end)
-    {
-      return false;
-    }
-
-    sourcePort = tcph->source;
-    checksumOffset = l4Offset + __builtin_offsetof(struct tcphdr, check);
+    return false;
   }
 
   struct switchboard_wormhole_egress4_key key;
   bpf_memset(&key, 0, sizeof(key));
   key.addr = iph->saddr;
-  key.port = sourcePort;
+  key.port = l4.source;
   key.proto = proto;
 
   struct switchboard_wormhole_egress_binding *binding = bpf_map_lookup_elem(&wh_egress4, &key);
@@ -223,7 +202,7 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
 
   const __u64 rewriteFlags = switchboardPacketRewriteStoreFlags();
   __be32 oldSourceAddress = iph->saddr;
-  __be16 oldSourcePort = sourcePort;
+  __be16 oldSourcePort = l4.source;
 
   if (oldSourceAddress != bindingAddress)
   {
@@ -241,10 +220,10 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
       return false;
     }
 
-    if (proto == IPPROTO_TCP || udpChecksumPresent)
+    if (proto == IPPROTO_TCP || l4.udpChecksumPresent)
     {
       if (replace_l4_checksum_word32_skb(skb,
-                                         checksumOffset,
+                                         l4.checksumOffset,
                                          oldSourceAddress,
                                          bindingAddress,
                                          BPF_F_PSEUDO_HDR) != 0)
@@ -265,10 +244,10 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
       return false;
     }
 
-    if (proto == IPPROTO_TCP || udpChecksumPresent)
+    if (proto == IPPROTO_TCP || l4.udpChecksumPresent)
     {
       if (replace_l4_checksum_word16_skb(skb,
-                                         checksumOffset,
+                                         l4.checksumOffset,
                                          oldSourcePort,
                                          bindingPort,
                                          0) != 0)
@@ -276,6 +255,97 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
         return false;
       }
     }
+  }
+
+  return true;
+}
+
+__attribute__((__always_inline__)) static inline bool switchboardRewriteSystemEgressIPv4SKB(struct __sk_buff *skb)
+{
+  void *data = (void *)(long)skb->data;
+  void *data_end = (void *)(long)skb->data_end;
+  if (data == NULL || data_end == NULL || skb->protocol != bpf_htons(ETH_P_IP))
+  {
+    return false;
+  }
+
+  struct ethhdr *eth = (struct ethhdr *)data;
+  __u32 l3Offset = 0;
+  if ((void *)(eth + 1) <= data_end && eth->h_proto == bpf_htons(ETH_P_IP))
+  {
+    l3Offset = sizeof(struct ethhdr);
+  }
+
+  struct iphdr *iph = (struct iphdr *)((__u8 *)data + l3Offset);
+  if ((void *)(iph + 1) > data_end || iph->ihl != 5)
+  {
+    return false;
+  }
+
+  __be32 outsideSource4 = 0;
+  __u8 containerFragment = 0;
+  if (containerSystemEgressIPv4Config(&outsideSource4, &containerFragment) == false || iph->saddr == 0 || iph->saddr == outsideSource4)
+  {
+    return false;
+  }
+
+  __u8 proto = iph->protocol;
+  __u32 l4Offset = l3Offset + sizeof(struct iphdr);
+  struct switchboard_l4_ports l4 = {};
+  if (switchboard_parse_l4_ports((__u8 *)data + l4Offset, data_end, proto, l4Offset, &l4) == false)
+  {
+    return false;
+  }
+
+  __u32 zeroidx = 0;
+  struct local_container_subnet6 *subnet = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
+  if (subnet == NULL || subnet->dpfx == 0)
+  {
+    return false;
+  }
+
+  struct flow_key reply = {};
+  reply.src = iph->daddr;
+  reply.dst = outsideSource4;
+  reply.proto = proto;
+  reply.port16[0] = l4.dest;
+  reply.port16[1] = l4.source;
+
+  struct switchboard_system_egress_nat_binding binding = {};
+  binding.container.hasID = true;
+  binding.container.value[0] = subnet->dpfx;
+  binding.container.value[1] = subnet->mpfx[0];
+  binding.container.value[2] = subnet->mpfx[1];
+  binding.container.value[3] = subnet->mpfx[2];
+  binding.container.value[4] = containerFragment;
+  binding.inside_addr4 = iph->saddr;
+  if (bpf_map_update_elem(&system_egress_nat, &reply, &binding, BPF_ANY) != 0)
+  {
+    return false;
+  }
+
+  __be32 insideSource4 = iph->saddr;
+  if (bpf_l3_csum_replace(skb,
+                          l3Offset + __builtin_offsetof(struct iphdr, check),
+                          insideSource4,
+                          outsideSource4,
+                          sizeof(__be32)) != 0 ||
+      bpf_skb_store_bytes(skb,
+                          l3Offset + __builtin_offsetof(struct iphdr, saddr),
+                          &outsideSource4,
+                          sizeof(outsideSource4),
+                          switchboardPacketRewriteStoreFlags()) != 0)
+  {
+    return false;
+  }
+
+  if (proto == IPPROTO_TCP || l4.udpChecksumPresent)
+  {
+    return replace_l4_checksum_word32_skb(skb,
+                                          l4.checksumOffset,
+                                          insideSource4,
+                                          outsideSource4,
+                                          BPF_F_PSEUDO_HDR) == 0;
   }
 
   return true;
@@ -294,32 +364,17 @@ __attribute__((__always_inline__)) static inline int switchboardMaybeLearnWhiteh
   flow.dst = iph->daddr;
   flow.proto = iph->protocol;
 
-  if (iph->protocol == IPPROTO_TCP)
-  {
-    struct tcphdr *tcph = (struct tcphdr *)(iph + 1);
-    if ((void *)(tcph + 1) > data_end)
-    {
-      return TC_ACT_SHOT;
-    }
-
-    flow.port16[0] = tcph->source;
-    flow.port16[1] = tcph->dest;
-  }
-  else if (iph->protocol == IPPROTO_UDP)
-  {
-    struct udphdr *udph = (struct udphdr *)(iph + 1);
-    if ((void *)(udph + 1) > data_end)
-    {
-      return TC_ACT_SHOT;
-    }
-
-    flow.port16[0] = udph->source;
-    flow.port16[1] = udph->dest;
-  }
-  else
+  struct switchboard_l4_ports l4 = {};
+  if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
   {
     return TC_ACT_OK;
   }
+  if (switchboard_parse_l4_ports((void *)(iph + 1), data_end, iph->protocol, sizeof(struct ethhdr) + sizeof(struct iphdr), &l4) == false)
+  {
+    return TC_ACT_SHOT;
+  }
+  flow.port16[0] = l4.source;
+  flow.port16[1] = l4.dest;
 
   struct switchboard_whitehole_binding binding = {};
   if (whitehole_binding_lookup(flow.proto, false, &flow.src, flow.port16[0], &binding) == false)
@@ -346,32 +401,17 @@ __attribute__((__always_inline__)) static inline int switchboardMaybeLearnWhiteh
   bpf_memcpy(flow.dstv6, ip6h->daddr.s6_addr32, sizeof(flow.dstv6));
   flow.proto = ip6h->nexthdr;
 
-  if (ip6h->nexthdr == IPPROTO_TCP)
-  {
-    struct tcphdr *tcph = (struct tcphdr *)(ip6h + 1);
-    if ((void *)(tcph + 1) > data_end)
-    {
-      return TC_ACT_SHOT;
-    }
-
-    flow.port16[0] = tcph->source;
-    flow.port16[1] = tcph->dest;
-  }
-  else if (ip6h->nexthdr == IPPROTO_UDP)
-  {
-    struct udphdr *udph = (struct udphdr *)(ip6h + 1);
-    if ((void *)(udph + 1) > data_end)
-    {
-      return TC_ACT_SHOT;
-    }
-
-    flow.port16[0] = udph->source;
-    flow.port16[1] = udph->dest;
-  }
-  else
+  struct switchboard_l4_ports l4 = {};
+  if (ip6h->nexthdr != IPPROTO_TCP && ip6h->nexthdr != IPPROTO_UDP)
   {
     return TC_ACT_OK;
   }
+  if (switchboard_parse_l4_ports((void *)(ip6h + 1), data_end, ip6h->nexthdr, sizeof(struct ethhdr) + sizeof(struct ipv6hdr), &l4) == false)
+  {
+    return TC_ACT_SHOT;
+  }
+  flow.port16[0] = l4.source;
+  flow.port16[1] = l4.dest;
 
   struct switchboard_whitehole_binding binding = {};
   if (whitehole_binding_lookup(flow.proto, true, flow.srcv6, flow.port16[0], &binding) == false)

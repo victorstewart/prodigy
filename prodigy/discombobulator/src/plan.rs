@@ -10,6 +10,7 @@ use std::path::{Component, Path, PathBuf};
 pub enum OutputKind {
     App,
     Base,
+    MothershipTunnelProvider,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -239,16 +240,17 @@ pub fn resolve_build_spec(
         }
     }
 
-    match output_kind {
-        OutputKind::App => {
-            if execute.is_none() {
-                bail!("app builds require EXECUTE");
-            }
+    if let Some(label) = match output_kind {
+        OutputKind::App => Some("app"),
+        OutputKind::MothershipTunnelProvider => Some("mothership tunnel provider"),
+        OutputKind::Base => None,
+    } {
+        if execute.is_none() {
+            bail!("{label} builds require EXECUTE");
         }
-        OutputKind::Base => {
-            if execute.is_some() {
-                bail!("base builds reject EXECUTE");
-            }
+    } else {
+        if execute.is_some() {
+            bail!("base builds reject EXECUTE");
         }
     }
 

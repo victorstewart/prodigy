@@ -69,6 +69,57 @@ int ct_egress(struct __sk_buff *skb)
     return NETKIT_DROP;
   }
 
+  if (containerEgressAllowlistOnly())
+  {
+    __u8 proto = 0;
+    __be16 port = 0;
+    if (protocol == BE_ETH_P_IP)
+    {
+      struct iphdr *iph = (struct iphdr *)l3_data;
+      if ((void *)(iph + 1) > data_end || iph->ihl != 5)
+      {
+        return NETKIT_DROP;
+      }
+      proto = iph->protocol;
+      struct switchboard_l4_ports l4 = {};
+      if (switchboard_parse_l4_ports((void *)(iph + 1), data_end, proto, l3Offset + sizeof(struct iphdr), &l4) == false)
+      {
+        return NETKIT_DROP;
+      }
+      port = l4.dest;
+      if (containerEgressAllow4(iph->daddr, proto, port) == false)
+      {
+        return NETKIT_DROP;
+      }
+      if (switchboardRewriteSystemEgressIPv4SKB(skb) == false)
+      {
+        return NETKIT_DROP;
+      }
+      goto redirect_to_nic;
+    }
+    if (protocol == BE_ETH_P_IPV6)
+    {
+      struct ipv6hdr *ipv6h = (struct ipv6hdr *)l3_data;
+      if ((void *)(ipv6h + 1) > data_end)
+      {
+        return NETKIT_DROP;
+      }
+      proto = ipv6h->nexthdr;
+      struct switchboard_l4_ports l4 = {};
+      if (switchboard_parse_l4_ports((void *)(ipv6h + 1), data_end, proto, l3Offset + sizeof(struct ipv6hdr), &l4) == false)
+      {
+        return NETKIT_DROP;
+      }
+      port = l4.dest;
+      if (containerEgressAllow6(ipv6h->daddr.s6_addr, proto, port) == false)
+      {
+        return NETKIT_DROP;
+      }
+      goto redirect_to_nic;
+    }
+    return NETKIT_DROP;
+  }
+
   if (protocol == BE_ETH_P_IP && containerRequiresPublic4() == false)
   {
     bumpPacketCounter(2);

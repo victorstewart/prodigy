@@ -157,6 +157,7 @@ pub fn run(command: BuildCommand) -> Result<()> {
     let output_kind = match command.kind {
         OutputKindArg::App => OutputKind::App,
         OutputKindArg::Base => OutputKind::Base,
+        OutputKindArg::MothershipTunnelProvider => OutputKind::MothershipTunnelProvider,
     };
     let resolved = resolve_build_spec(&spec, output_kind, &build_args)?;
 
@@ -367,7 +368,7 @@ fn execute_supported_subset(
     )?;
 
     let artifact_root = match output_kind {
-        OutputKind::App => {
+        OutputKind::App | OutputKind::MothershipTunnelProvider => {
             let projected_root = session.work_root().join("final");
             assemble_app_tree(&workspace_root, &projected_root, resolved)?;
 
@@ -403,15 +404,7 @@ fn execute_supported_subset(
             None
         },
     )?;
-    materialize_output_blob(
-        &artifact_path,
-        output_path,
-        if output_kind == OutputKind::App {
-            Some(discombobulator_blob_header())
-        } else {
-            None
-        },
-    )?;
+    materialize_output_blob(&artifact_path, output_path, output_blob_header(output_kind))?;
     maybe_inject_test_fault("registry-update");
     registry.upsert_artifact(&ArtifactRecord {
         kind: artifact_kind.to_string(),
@@ -431,6 +424,7 @@ fn output_kind_name(output_kind: OutputKind) -> &'static str {
     match output_kind {
         OutputKind::App => "app",
         OutputKind::Base => "base",
+        OutputKind::MothershipTunnelProvider => "mothership-tunnel-provider",
     }
 }
 
@@ -520,7 +514,7 @@ fn remove_stale_unreferenced_artifacts(
     storage: &StorageRoot,
     referenced_artifacts: &BTreeSet<PathBuf>,
 ) -> Result<()> {
-    for kind in ["apps", "bases"] {
+    for kind in ["apps", "bases", "mothership-tunnel-providers"] {
         let kind_root = storage.root().join("artifacts").join(kind);
         remove_stale_unreferenced_leaf_entries(&kind_root, referenced_artifacts)?;
     }
@@ -2276,6 +2270,18 @@ fn write_launch_metadata(path: &Path, resolved: &ResolvedBuildSpec) -> Result<()
 
 fn discombobulator_blob_header() -> &'static [u8] {
     b"PRODIGY-DISCOMBOBULATOR-APP-CONTAINER\ncontract=prodigy-container-artifact\ncontract_version=1\n\n"
+}
+
+fn mothership_tunnel_provider_blob_header() -> &'static [u8] {
+    b"PRODIGY-DISCOMBOBULATOR-MOTHERSHIP-TUNNEL-PROVIDER\ncontract=prodigy-mothership-tunnel-provider\ncontract_version=1\ncontainer_kind=mothershipTunnelProvider\nrequires_standard_neuron_socket=false\nrequires_mothership_tunnel_gateway=true\nnetwork_policy=tcpEgressOnly\n\n"
+}
+
+fn output_blob_header(output_kind: OutputKind) -> Option<&'static [u8]> {
+    match output_kind {
+        OutputKind::App => Some(discombobulator_blob_header()),
+        OutputKind::MothershipTunnelProvider => Some(mothership_tunnel_provider_blob_header()),
+        OutputKind::Base => None,
+    }
 }
 
 fn publish_cached_artifact(

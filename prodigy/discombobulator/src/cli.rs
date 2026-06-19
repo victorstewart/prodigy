@@ -58,6 +58,7 @@ pub struct BundleFlatCommand {
 pub enum OutputKindArg {
     App,
     Base,
+    MothershipTunnelProvider,
 }
 
 #[derive(Args)]

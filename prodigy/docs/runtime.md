@@ -148,3 +148,17 @@ Vertical scalers are stateful-only and scale up only. Brain clamps per-instance 
 Prodigy applies a hard seccomp deny floor for kernel-control and host-observation syscalls such as `bpf`, `ptrace`, `process_vm_*`, `process_madvise`, `kcmp`, `pidfd_*`, mount or namespace mutation, module loading, keyring mutation, kernel log access, host time control, accounting, quota control, and related host-control operations.
 
 Shared CPU mode also denies `sched_setaffinity` so workloads cannot self-pin. Review the deny floor when upgrading the supported Linux syscall surface.
+
+## Mothership tunnel-provider runtime
+
+`mothershipConnectivity.kind=tunnelProvider` is a system-container mode for cluster control reachability. It is not an application deployment path. A regular deploy must not create this container kind.
+
+The provider must run only on the active master Brain. Master loss, relinquish, or update transition must stop the local provider; a new master starts its own verified instance and kills stale tunnel-provider fragments reported by reachable old Neurons.
+
+Tunnel-provider launch hardening is an implementation invariant, not external launch metadata. The runtime omits host networking, overlay attachment, wormholes, whiteholes, mesh identity, SDK socket, provider/app credentials, TLS vault mounts, pairings, admin capabilities, raw sockets, mutable mounts, host-observation syscalls, and raw host mothership socket mounts. It runs with private namespaces, read-only rootfs, tmpfs writable state, minimal `/dev`, no-new-privileges, an empty capability set, host-control seccomp denial, spec-derived resource limits, gateway-mediated control through `/run/prodigy/mothership-tunnel-gateway.sock`, and allowlist-only egress.
+
+Network access is enforced in the provider's private netns by the container egress router. Runtime launch resolves the configured egress hostname before clone, rejects private/local/metadata/multicast/reserved resolved IPs, writes `/etc/hosts` entries for accepted hostnames, and loads the exact TCP destination tuple into a per-container BPF allowlist. The provider receives `PRODIGY_TUNNEL_EGRESS_HOST` and `PRODIGY_TUNNEL_EGRESS_PORT` from that endpoint. Provider resource requests are capped at 16 logical cores, 32 GiB memory, and 256 GiB storage.
+
+If a tunnel is misconfigured, normal cluster commands fail closed instead of silently downgrading to SSH. A one-command recovery attempt must set `PRODIGY_MOTHERSHIP_EMERGENCY_SSH_FALLBACK=1`, and it works only when the stored tunnel-provider metadata has `allowEmergencySshFallback=true`; otherwise recovery is out-of-band host/provider access followed by a corrected tunnel spec.
+
+Create-time seed requests use the bootstrap control path until the tunnel-provider config has been delivered. The seed-configure path sends Brain the verified system artifact, gateway auth, and secret-free runtime connectivity config. Brain persists and replicates gateway auth and runtime connectivity outside `BrainConfig`. The concrete Prodigy Brain runtime hook owns `/run/prodigy/mothership-tunnel-gateway.sock`, authenticates gateway sessions before opening the raw control socket, marks tunnel health only after authenticated bidirectional proxy traffic, restricts peers to the provider UID/GID and expected cgroup v2 leaf, and stops the runtime on spec changes, SSH cutover, master loss, or provider terminal failure.

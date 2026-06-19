@@ -479,6 +479,7 @@ fn output_kind_name(kind: OutputKindArg) -> &'static str {
     match kind {
         OutputKindArg::App => "app",
         OutputKindArg::Base => "base",
+        OutputKindArg::MothershipTunnelProvider => "mothership-tunnel-provider",
     }
 }
 
@@ -543,18 +544,18 @@ fn translate_host_path(path: &Path, staged_roots: &[StagedHostRoot]) -> Result<S
     let canonical =
         fs::canonicalize(path).with_context(|| format!("failed to access {}", path.display()))?;
     for staged_root in staged_roots {
-        if !path_is_within(&canonical, &staged_root.host_root) {
+        let host_root = fs::canonicalize(&staged_root.host_root)
+            .with_context(|| format!("failed to access {}", staged_root.host_root.display()))?;
+        if !path_is_within(&canonical, &host_root) {
             continue;
         }
-        let relative = canonical
-            .strip_prefix(&staged_root.host_root)
-            .with_context(|| {
-                format!(
-                    "failed to compute relative path from {} to {}",
-                    staged_root.host_root.display(),
-                    canonical.display()
-                )
-            })?;
+        let relative = canonical.strip_prefix(&host_root).with_context(|| {
+            format!(
+                "failed to compute relative path from {} to {}",
+                host_root.display(),
+                canonical.display()
+            )
+        })?;
         return remote_join_path(&staged_root.remote_root, relative);
     }
 

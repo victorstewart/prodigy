@@ -9,6 +9,7 @@
 #include <networking/private4.h>
 #include <services/prodigy.h>
 #include <services/vault.h>
+#include <prodigy/container.contract.h>
 #include <prodigy/biphasal.key.h>
 #include <prodigy/server.state.h>
 
@@ -4190,6 +4191,47 @@ static void serialize(S&& serializer, MachineStatusReport& report)
   serializer.object(report.hardware);
 }
 
+class MothershipConnectivityStatusReport {
+public:
+
+  String kind;
+  bool runningOnMaster = false;
+  bool healthy = false;
+  uint64_t generation = 0;
+  String lastFailure;
+
+  void stringify(String& string) const
+  {
+    if (kind.size() == 0)
+    {
+      return;
+    }
+
+    if (runningOnMaster == false && healthy == false && generation == 0 && lastFailure.size() == 0)
+    {
+      string.snprintf_add<"mothershipConnectivity kind={}\n"_ctv>(kind);
+      return;
+    }
+
+    string.snprintf_add<"mothershipConnectivity kind={} runningOnMaster={itoa} healthy={itoa} generation={itoa} lastFailure={}\n"_ctv>(
+        kind,
+        runningOnMaster ? 1u : 0u,
+        healthy ? 1u : 0u,
+        generation,
+        lastFailure);
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipConnectivityStatusReport& report)
+{
+  serializer.text1b(report.kind, UINT32_MAX);
+  serializer.value1b(report.runningOnMaster);
+  serializer.value1b(report.healthy);
+  serializer.value8b(report.generation);
+  serializer.text1b(report.lastFailure, UINT32_MAX);
+}
+
 class ClusterStatusReport {
 public:
 
@@ -4201,6 +4243,7 @@ public:
   uint32_t nApplications;
   Vector<MachineStatusReport> machineReports;
   Vector<ApplicationStatusReport> applicationReports;
+  MothershipConnectivityStatusReport mothershipConnectivity;
 
   void stringify(String& string) const
   {
@@ -4213,6 +4256,7 @@ public:
     string.snprintf_add<"nMachines: {itoa}\n"_ctv>(nMachines);
     string.snprintf_add<"nSpotMachines: {itoa}\n"_ctv>(nSpotMachines);
     string.snprintf_add<"nApplications: {itoa}\n"_ctv>(nApplications);
+    mothershipConnectivity.stringify(string);
 
     for (const MachineStatusReport& mreport : machineReports)
     {
@@ -4236,6 +4280,7 @@ static void serialize(S&& serializer, ClusterStatusReport& report)
   serializer.value4b(report.nApplications);
   serializer.object(report.machineReports);
   serializer.object(report.applicationReports);
+  serializer.object(report.mothershipConnectivity);
 }
 
 static inline void prodigyStripMachineHardwareCapturesForClusterReport(MachineHardwareProfile& hardware)
@@ -6620,6 +6665,12 @@ public:
   bool restartOnFailure;
 
   uint8_t fragment;
+  SystemContainerKind systemContainerKind = SystemContainerKind::none;
+  Vector<String> systemExecuteEnv;
+  String systemGatewaySocketSourcePath;
+  String systemGatewaySocketTargetPath;
+  String systemEgressHost;
+  uint16_t systemEgressPort = 0;
   Vector<Wormhole> wormholes;
   Vector<Whitehole> whiteholes;
   bool useHostNetworkNamespace = false;
@@ -6867,6 +6918,12 @@ static void serialize(S&& serializer, ContainerPlan& plan)
 
   serializer.value1b(plan.restartOnFailure);
   serializer.value1b(plan.fragment);
+  serializer.value1b(plan.systemContainerKind);
+  serializer.container(plan.systemExecuteEnv, UINT32_MAX);
+  serializer.text1b(plan.systemGatewaySocketSourcePath, UINT32_MAX);
+  serializer.text1b(plan.systemGatewaySocketTargetPath, UINT32_MAX);
+  serializer.text1b(plan.systemEgressHost, UINT32_MAX);
+  serializer.value2b(plan.systemEgressPort);
   serializer.object(plan.wormholes);
   serializer.object(plan.whiteholes);
   serializer.value1b(plan.useHostNetworkNamespace);

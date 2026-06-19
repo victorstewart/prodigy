@@ -421,6 +421,8 @@ install(PROGRAMS ${PRODIGY_ACME_HOOK_SCRIPTS} DESTINATION lib/prodigy)
 
 add_executable(prodigy ${PRODIGY_ROOT}/prodigy/prodigy.cpp)
 add_executable(mothership ${PRODIGY_ROOT}/prodigy/mothership/mothership.cpp)
+add_executable(prodigy_mothership_tunnel_provider ${PRODIGY_ROOT}/prodigy/mothership/mothership.tunnel.provider.cpp)
+set_target_properties(prodigy_mothership_tunnel_provider PROPERTIES OUTPUT_NAME mothership-tunnel-provider)
 add_executable(prodigy_ready_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/ready_container.cpp)
 add_executable(prodigy_pingpong_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
 add_executable(prodigy_pingpong_container_alt ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
@@ -640,6 +642,7 @@ target_compile_definitions(prodigy_ready_container PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_bundle_artifact_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
 target_compile_definitions(prodigy_mothership_cluster_report_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}" PRODIGY_ROOT_DIR="${PRODIGY_ROOT}")
 target_compile_definitions(prodigy_mothership_restart_persistence_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
+target_compile_definitions(prodigy_mothership_unix_connect_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
 target_compile_definitions(prodigy_pingpong_container PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_pingpong_container_alt PUBLIC PRODIGY_DEBUG=1 PRODIGY_PINGPONG_DEFAULT_PORT=19091)
 target_compile_definitions(prodigy_pingpong_container_noport PUBLIC PRODIGY_DEBUG=1 PRODIGY_PINGPONG_DISABLE_SERVER=1)
@@ -669,6 +672,9 @@ endif()
 
 target_compile_options(prodigy PUBLIC -O2) # -g -flto
 target_compile_options(mothership PUBLIC -O2) # -g -flto
+if (NOT CMAKE_EXE_LINKER_FLAGS MATCHES "sanitize")
+   target_link_options(prodigy_mothership_tunnel_provider PRIVATE -static)
+endif()
 target_compile_options(prodigy_ready_container PUBLIC -O2)
 target_compile_options(prodigy_pingpong_container PUBLIC -O2)
 target_compile_options(prodigy_pingpong_container_alt PUBLIC -O2)
@@ -848,12 +854,14 @@ add_custom_command(
            --tool-binary "${PRODIGY_BUNDLED_BW_MEM_BIN}"
            --tool-binary "${PRODIGY_BUNDLED_SPEEDTEST_BIN}"
            --tool-binary "$<TARGET_FILE:mothership>"
+           --tool-binary "$<TARGET_FILE:prodigy_mothership_tunnel_provider>"
            --tool-binary "${PRODIGY_CERTBOT_WHEELHOUSE_OUTPUT}"
            --tool-binary "${PRODIGY_ROOT}/prodigy/acme/acme-present-dns-01"
            --tool-binary "${PRODIGY_ROOT}/prodigy/acme/acme-cleanup-dns-01"
            --tool-binary "${PRODIGY_ROOT}/prodigy/acme/acme-import-lineage"
    DEPENDS prodigy
            mothership
+           prodigy_mothership_tunnel_provider
            balancer.ebpf.o
            host.ingress.router.ebpf.o
            host.ingress.router.dev.ebpf.o
@@ -888,6 +896,7 @@ add_custom_command(
 add_custom_target(prodigy_bundle_sha256 DEPENDS "${PRODIGY_BUNDLE_SHA256_OUTPUT}")
 add_dependencies(prodigy_bundle prodigy_bundle_sha256)
 add_dependencies(prodigy_bundle_artifact_unit prodigy_bundle prodigy_bundle_sha256)
+add_dependencies(prodigy_mothership_unix_connect_unit prodigy_mothership_tunnel_provider)
 add_dependencies(prodigy_mothership_cluster_report_unit mothership)
 add_dependencies(prodigy_mothership_restart_persistence_unit mothership prodigy_bundle prodigy_bundle_sha256)
 add_dependencies(prodigy_remote_bootstrap_smoke prodigy_bundle)

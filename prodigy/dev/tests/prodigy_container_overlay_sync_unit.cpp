@@ -4,6 +4,7 @@
 
 #include <prodigy/neuron/neuron.h>
 #include <switchboard/common/checksum.h>
+#include <switchboard/kernel/structs.h>
 #include <switchboard/overlay.route.h>
 
 #include <arpa/inet.h>
@@ -176,6 +177,23 @@ static switchboard_wormhole_egress4_key makeWormholeEgress4Key(const char *sourc
   key.addr = parseIPv4Address(sourceIPv4).s_addr;
   key.port = htons(containerPort);
   key.proto = proto;
+  return key;
+}
+
+static container_egress_allow_key makeContainerEgressAllowKey(const char *address, uint16_t port, uint8_t proto, bool ipv6)
+{
+  container_egress_allow_key key = {};
+  key.family = ipv6 ? 6 : 4;
+  key.proto = proto;
+  key.port = htons(port);
+  if (ipv6)
+  {
+    parseIPv6Bytes(address, key.addr.v6);
+  }
+  else
+  {
+    key.addr.v4 = parseIPv4Address(address).s_addr;
+  }
   return key;
 }
 
@@ -647,6 +665,28 @@ static void testContainerPeerRuntimeSyncPopulatesAndClearsWormholeEgressBindings
   peerProgram.close();
 }
 
+static void testSystemEgressPolicyAllowsIPv4Replies(TestSuite& suite)
+{
+  OverlayTestNeuron neuron = {};
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &neuron;
+  neuron.private4 = IPAddress("10.8.0.44", false);
+
+  Container container = {};
+  container.plan.systemContainerKind = SystemContainerKind::mothershipTunnelProvider;
+  container.plan.systemEgressHost = "198.51.100.10"_ctv;
+  container.plan.systemEgressPort = 443;
+  container.plan.fragment = 0x4e;
+
+  container_network_policy policy = {};
+  suite.expect(container.buildContainerNetworkPolicy(policy), "system_egress_policy_builds");
+  suite.expect(policy.egressAllowlistOnly == 1, "system_egress_policy_constrains_egress");
+  suite.expect(policy.requiresPublic4 == 1, "system_egress_policy_allows_ipv4_replies");
+  suite.expect(policy.systemEgressSource4 == neuron.private4.v4, "system_egress_policy_sets_source");
+
+  thisNeuron = previousNeuron;
+}
+
 static void testContainerPeerEgressRouterLoadsAfterWormholeSourceRewrite(TestSuite& suite)
 {
   String objectPath = {};
@@ -708,6 +748,121 @@ static void testContainerPeerEgressRouterDropsPacketsOverConfiguredMTU(TestSuite
     peerProgram.getArrayElement("ct_stats"_ctv, 1, oversizeDrops);
     suite.expect(oversizeDrops == 1,
                  "container_peer_egress_router_drop_over_mtu_bumps_stat");
+  }
+
+  peerProgram.close();
+}
+
+static void testContainerPeerEgressRouterEnforcesSystemAllowlist(TestSuite& suite)
+{
+  String objectPath = {};
+  objectPath.assign(PRODIGY_TEST_BINARY_DIR);
+  objectPath.append("/container.egress.router.ebpf.o"_ctv);
+
+  BPFProgram peerProgram = {};
+  suite.expect(peerProgram.load(objectPath, "ct_egress"_ctv),
+               "container_peer_egress_router_system_allowlist_loads_program");
+
+  if (peerProgram.prog_fd >= 0)
+  {
+    container_network_policy networkPolicy = {};
+    networkPolicy.egressAllowlistOnly = 1;
+    networkPolicy.containerFragment = 0x4e;
+    networkPolicy.interContainerMTU = 9000;
+    networkPolicy.systemEgressSource4 = parseIPv4Address("10.8.0.44").s_addr;
+    peerProgram.setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
+
+    local_container_subnet6 localSubnet = {};
+    localSubnet.dpfx = 0x01;
+    localSubnet.mpfx[0] = 0x52;
+    localSubnet.mpfx[1] = 0xdf;
+    localSubnet.mpfx[2] = 0x39;
+    peerProgram.setArrayElement("lc_subnet"_ctv, 0, localSubnet);
+
+    __u32 nicIfidx = 77;
+    peerProgram.setArrayElement("ct_dev_map"_ctv, 0, nicIfidx);
+
+    mac localMAC = {};
+    localMAC.mac[5] = 0x0a;
+    peerProgram.setArrayElement("mac_map"_ctv, 0, localMAC);
+
+    mac gatewayMAC = {};
+    gatewayMAC.mac[5] = 0x01;
+    peerProgram.setArrayElement("gw_mac_map"_ctv, 0, gatewayMAC);
+
+    __u8 allowed = 1;
+    container_egress_allow_key allow4 = makeContainerEgressAllowKey("93.184.216.34", 443, IPPROTO_UDP, false);
+    container_egress_allow_key allow6 = makeContainerEgressAllowKey("2606:4700:4700::1111", 8443, IPPROTO_TCP, true);
+    suite.expect(updateProgramMapElement(peerProgram, "ct_egress_allow"_ctv, allow4, allowed),
+                 "container_peer_egress_router_system_allowlist_sets_ipv4_rule");
+    suite.expect(updateProgramMapElement(peerProgram, "ct_egress_allow"_ctv, allow6, allowed),
+                 "container_peer_egress_router_system_allowlist_sets_ipv6_rule");
+
+    Vector<uint8_t> payload = {};
+    payload.resize(16);
+    auto runFrame = [&](const Vector<uint8_t>& frame, const char *name, Vector<uint8_t> *observed) -> int {
+      Vector<uint8_t> output = {};
+      output.resize(frame.size() + 64u);
+      LIBBPF_OPTS(bpf_test_run_opts, opts,
+                  .data_in = const_cast<uint8_t *>(frame.data()),
+                  .data_out = output.data(),
+                  .data_size_in = static_cast<__u32>(frame.size()),
+                  .data_size_out = static_cast<__u32>(output.size()),
+                  .repeat = 1, );
+      int runResult = bpf_prog_test_run_opts(peerProgram.prog_fd, &opts);
+      suite.expect(runResult == 0, name);
+      if (runResult == 0 && observed)
+      {
+        *observed = output;
+      }
+      return runResult == 0 ? int(opts.retval) : -1;
+    };
+
+    Vector<uint8_t> allowedIPv4Output = {};
+    suite.expect(runFrame(makeIPv4L4FrameWithPayload("198.51.100.10", "93.184.216.34", IPPROTO_UDP, 49'152, 443, payload),
+                          "container_peer_egress_router_system_allowlist_ipv4_allowed_runs",
+                          &allowedIPv4Output) == TC_ACT_REDIRECT,
+                 "container_peer_egress_router_system_allowlist_ipv4_allowed_redirects");
+    if (allowedIPv4Output.size() >= sizeof(struct ethhdr) + sizeof(struct iphdr))
+    {
+      const struct iphdr *outIP = reinterpret_cast<const struct iphdr *>(allowedIPv4Output.data() + sizeof(struct ethhdr));
+      suite.expect(outIP->saddr == networkPolicy.systemEgressSource4,
+                   "container_peer_egress_router_system_allowlist_ipv4_rewrites_source");
+    }
+    flow_key replyFlow = {};
+    replyFlow.src = parseIPv4Address("93.184.216.34").s_addr;
+    replyFlow.dst = networkPolicy.systemEgressSource4;
+    replyFlow.proto = IPPROTO_UDP;
+    replyFlow.port16[0] = htons(443);
+    replyFlow.port16[1] = htons(49'152);
+    switchboard_system_egress_nat_binding natBinding = {};
+    suite.expect(lookupProgramMapElement(peerProgram, "system_egress_nat"_ctv, replyFlow, natBinding),
+                 "container_peer_egress_router_system_allowlist_ipv4_learns_nat_reply");
+    suite.expect(natBinding.inside_addr4 == parseIPv4Address("198.51.100.10").s_addr,
+                 "container_peer_egress_router_system_allowlist_ipv4_remembers_inside_source");
+    suite.expect(natBinding.container.hasID &&
+                     natBinding.container.value[0] == localSubnet.dpfx &&
+                     natBinding.container.value[1] == localSubnet.mpfx[0] &&
+                     natBinding.container.value[2] == localSubnet.mpfx[1] &&
+                     natBinding.container.value[3] == localSubnet.mpfx[2] &&
+                     natBinding.container.value[4] == networkPolicy.containerFragment,
+                 "container_peer_egress_router_system_allowlist_ipv4_remembers_container");
+    suite.expect(runFrame(makeIPv4L4FrameWithPayload("198.51.100.10", "93.184.216.34", IPPROTO_UDP, 49'152, 53, payload),
+                          "container_peer_egress_router_system_allowlist_dns_denied_runs",
+                          nullptr) == NETKIT_DROP,
+                 "container_peer_egress_router_system_allowlist_dns_denied_drops");
+    suite.expect(runFrame(makeIPv4L4FrameWithPayload("198.51.100.10", "93.184.216.34", IPPROTO_TCP, 49'152, 443, payload),
+                          "container_peer_egress_router_system_allowlist_proto_denied_runs",
+                          nullptr) == NETKIT_DROP,
+                 "container_peer_egress_router_system_allowlist_proto_denied_drops");
+    suite.expect(runFrame(makeIPv6L4FrameWithPayload("2606:4700:4700::100", "2606:4700:4700::1111", IPPROTO_TCP, 49'152, 8443, payload, true),
+                          "container_peer_egress_router_system_allowlist_ipv6_allowed_runs",
+                          nullptr) == TC_ACT_REDIRECT,
+                 "container_peer_egress_router_system_allowlist_ipv6_allowed_redirects");
+    suite.expect(runFrame(makeIPv6L4FrameWithPayload("2606:4700:4700::100", "fd00::1", IPPROTO_TCP, 49'152, 8443, payload, true),
+                          "container_peer_egress_router_system_allowlist_ipv6_unlisted_runs",
+                          nullptr) == NETKIT_DROP,
+                 "container_peer_egress_router_system_allowlist_ipv6_unlisted_drops");
   }
 
   peerProgram.close();
@@ -1296,8 +1451,10 @@ int main(void)
 
   testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntries(suite);
   testContainerPeerRuntimeSyncPopulatesAndClearsWormholeEgressBindings(suite);
+  testSystemEgressPolicyAllowsIPv4Replies(suite);
   testContainerPeerEgressRouterLoadsAfterWormholeSourceRewrite(suite);
   testContainerPeerEgressRouterDropsPacketsOverConfiguredMTU(suite);
+  testContainerPeerEgressRouterEnforcesSystemAllowlist(suite);
   testWormholeEgressBindingReconcilePreservesDesiredKeysDuringStaleRemoval(suite);
   testWormholeRewriteLayoutResolvesEthernetAndL3Frames(suite);
   testContainerPeerEgressRouterRewritesCrossMachineWormholeReplyForOverlay(suite);

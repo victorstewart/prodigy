@@ -133,7 +133,7 @@ fn rejects_shell_form_run() {
 }
 
 #[test]
-fn output_kind_validation_requires_execute_for_apps_and_rejects_it_for_bases() {
+fn output_kind_validation_requires_execute_for_runnables_and_rejects_it_for_bases() {
     let app_spec = parse_build_spec(
         r#"
       FROM scratch for x86_64
@@ -143,6 +143,15 @@ fn output_kind_validation_requires_execute_for_apps_and_rejects_it_for_bases() {
     .unwrap();
     let app_error = resolve_build_spec(&app_spec, OutputKind::App, &BTreeMap::new()).unwrap_err();
     assert!(format!("{app_error:#}").contains("app builds require EXECUTE"));
+    let tunnel_error = resolve_build_spec(
+        &app_spec,
+        OutputKind::MothershipTunnelProvider,
+        &BTreeMap::new(),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{tunnel_error:#}").contains("mothership tunnel provider builds require EXECUTE")
+    );
 
     let base_spec = parse_build_spec(
         r#"

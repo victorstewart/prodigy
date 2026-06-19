@@ -2028,6 +2028,7 @@ protected:
       }
 
       bool whiteholeReplyFlowPinned = false;
+      bool systemEgressNATPinned = false;
       if (tcx_egress_program)
       {
         whiteholeReplyFlowPinned = switchboardPinWhiteholeReplyFlowMap(tcx_egress_program, eth.ifidx);
@@ -2036,11 +2037,17 @@ protected:
           basics_log("setupNetworking failed to pin host whitehole reply flow map ifidx=%d\n",
                      eth.ifidx);
         }
+        systemEgressNATPinned = switchboardPinSystemEgressNATMap(tcx_egress_program, eth.ifidx);
+        if (systemEgressNATPinned == false)
+        {
+          basics_log("setupNetworking failed to pin host system egress nat map ifidx=%d\n",
+                     eth.ifidx);
+        }
       }
 
-      if (whiteholeReplyFlowPinned == false)
+      if (whiteholeReplyFlowPinned == false || systemEgressNATPinned == false)
       {
-        basics_log("setupNetworking skipping host ingress attach because whitehole reply flow pinning failed ifidx=%d\n",
+        basics_log("setupNetworking skipping host ingress attach because shared flow map pinning failed ifidx=%d\n",
                    eth.ifidx);
       }
       else
@@ -2081,6 +2088,7 @@ protected:
           tcx_ingress_program = eth.attachBPF(BPF_TCX_INGRESS, hostIngressPath, "host_ingress"_ctv,
                                               [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
                                                 (void)switchboardReusePinnedWhiteholeReplyFlowMap(obj, eth.ifidx, inner_map_fds);
+                                                (void)switchboardReusePinnedSystemEgressNATMap(obj, eth.ifidx, inner_map_fds);
                                               });
           if (tcx_ingress_program)
           {
@@ -2113,6 +2121,7 @@ protected:
       tcx_egress_program->setArrayElement("mac_map"_ctv, 0, eth.mac);
       tcx_egress_program->setArrayElement("gw_mac_map"_ctv, 0, eth.gateway_mac);
       (void)switchboardPinWhiteholeReplyFlowMap(tcx_egress_program, eth.ifidx);
+      (void)switchboardPinSystemEgressNATMap(tcx_egress_program, eth.ifidx);
     }
 
     iaas->setLocalContainerPrefixes(localPrefixes);
@@ -2759,27 +2768,33 @@ public:
       }
       else
       {
-        if (infop.si_status == containerStartupFailureExitCode)
+        String path;
+        path.snprintf<"/containers/{}/crashreport.txt"_ctv>(containerName);
+        Filesystem::openReadAtClose(-1, path, crashReport);
+        if (crashReport.size() > 0)
         {
-          crashReport.assign("startup failed before exec"_ctv);
+          Filesystem::eraseFile(path);
         }
-        else
+        else if (container->rootfsPath.size() > 0)
         {
-          String path;
-          path.snprintf<"/containers/{}/crashreport.txt"_ctv>(containerName);
-
+          path.assign(container->rootfsPath);
+          path.append("/crashreport.txt"_ctv);
           Filesystem::openReadAtClose(-1, path, crashReport);
           if (crashReport.size() > 0)
           {
             Filesystem::eraseFile(path);
           }
-          else
-          {
-            crashReport.assign("exited with code "_ctv);
-            String exitCode;
-            exitCode.assignItoa(infop.si_status);
-            crashReport.append(exitCode);
-          }
+        }
+        if (crashReport.size() == 0 && infop.si_status == containerStartupFailureExitCode)
+        {
+          crashReport.assign("startup failed before exec"_ctv);
+        }
+        else if (crashReport.size() == 0)
+        {
+          crashReport.assign("exited with code "_ctv);
+          String exitCode;
+          exitCode.assignItoa(infop.si_status);
+          crashReport.append(exitCode);
         }
       }
 
@@ -3291,9 +3306,7 @@ public:
               path.snprintf<"/containers/{}/neuron.soc"_ctv>(container->name);
               container->setSocketPath(path.c_str());
               pushContainer(container);
-              container->waitidPending = true;
-              container->destroyCloseCompleted = false;
-              Ring::queueWaitid(container, P_PID, container->pid);
+              ContainerManager::queueContainerWaitid(container);
               Ring::queueConnect(container);
             }
             else
@@ -3401,6 +3414,7 @@ public:
           {
             prodigyApplyInternalRuntimeEnvironmentDefaults(config);
             configuredInterContainerMTU = config.test.enabled ? config.test.interContainerMTU : 0;
+            configuredFakeIpv4Boundary = config.test.enabled && config.test.enableFakeIpv4Boundary;
             if (uint32_t maxSegmentSize = controlPlaneTCPMaxSegmentSize(AF_INET6); maxSegmentSize > 0)
             {
               if (brainListener.isFixedFile && brainListener.fslot >= 0)
@@ -4795,6 +4809,12 @@ public:
   {
     containers.insert_or_assign(container->plan.uuid, container);
     containerByPid.insert_or_assign(container->pid, container);
+    RingDispatcher::installMultiplexee(container, this);
+
+    if (container->exposesNeuronSocket() == false)
+    {
+      return;
+    }
 
     if (container->plan.wormholes.empty() == false)
     {
@@ -4803,7 +4823,6 @@ public:
       refreshContainerSwitchboardWormholes(container);
     }
 
-    RingDispatcher::installMultiplexee(container, this);
     Ring::installFDIntoFixedFileSlot(container);
     if (container->isFixedFile == false || container->fslot < 0)
     {

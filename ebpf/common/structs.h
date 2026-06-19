@@ -33,8 +33,22 @@ struct local_container_subnet6 {
 struct container_network_policy {
   __u8 requiresPublic4;
   __u8 requiresPublic6;
-  __u16 reserved;
+  __u8 egressAllowlistOnly;
+  __u8 containerFragment;
   __u32 interContainerMTU;
+  __be32 systemEgressSource4;
+};
+
+#define CONTAINER_EGRESS_ALLOWLIST_MAX_ENTRIES 64
+
+struct container_egress_allow_key {
+  __u8 family;
+  __u8 proto;
+  __be16 port;
+  union {
+    __be32 v4;
+    __u8 v6[16];
+  } addr;
 };
 
 struct quic_long_header {

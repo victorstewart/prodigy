@@ -25,6 +25,19 @@ fn discombobulator_blob_header() -> &'static [u8] {
     b"PRODIGY-DISCOMBOBULATOR-APP-CONTAINER\ncontract=prodigy-container-artifact\ncontract_version=1\n\n"
 }
 
+fn mothership_tunnel_provider_blob_header() -> &'static [u8] {
+    b"PRODIGY-DISCOMBOBULATOR-MOTHERSHIP-TUNNEL-PROVIDER\ncontract=prodigy-mothership-tunnel-provider\ncontract_version=1\ncontainer_kind=mothershipTunnelProvider\nrequires_standard_neuron_socket=false\nrequires_mothership_tunnel_gateway=true\nnetwork_policy=tcpEgressOnly\n\n"
+}
+
+fn blob_contract_header(bytes: &[u8]) -> Option<&'static [u8]> {
+    [
+        discombobulator_blob_header(),
+        mothership_tunnel_provider_blob_header(),
+    ]
+    .into_iter()
+    .find(|header| bytes.starts_with(*header))
+}
+
 fn assert_discombobulator_blob_header(output_blob: &Path) {
     let bytes = fs::read(output_blob).unwrap();
     assert!(
@@ -34,10 +47,27 @@ fn assert_discombobulator_blob_header(output_blob: &Path) {
     );
 }
 
+fn assert_mothership_tunnel_provider_blob_header(output_blob: &Path) {
+    let bytes = fs::read(output_blob).unwrap();
+    assert!(
+        bytes.starts_with(mothership_tunnel_provider_blob_header()),
+        "{} is missing Discombobulator mothership tunnel-provider blob header",
+        output_blob.display()
+    );
+}
+
+fn assert_output_contract_header(kind: &str, output_blob: &Path) {
+    match kind {
+        "app" => assert_discombobulator_blob_header(output_blob),
+        "mothership-tunnel-provider" => assert_mothership_tunnel_provider_blob_header(output_blob),
+        _ => {}
+    }
+}
+
 fn blob_payload_bytes(blob: &Path) -> Vec<u8> {
     let bytes = fs::read(blob).unwrap();
-    if bytes.starts_with(discombobulator_blob_header()) {
-        return bytes[discombobulator_blob_header().len()..].to_vec();
+    if let Some(header) = blob_contract_header(&bytes) {
+        return bytes[header.len()..].to_vec();
     }
 
     bytes
@@ -45,12 +75,12 @@ fn blob_payload_bytes(blob: &Path) -> Vec<u8> {
 
 fn zstd_payload_for_blob(blob: &Path, temp: &Path) -> PathBuf {
     let bytes = fs::read(blob).unwrap();
-    if bytes.starts_with(discombobulator_blob_header()) == false {
+    let Some(header) = blob_contract_header(&bytes) else {
         return blob.to_path_buf();
-    }
+    };
 
     let payload = temp.join("payload-after-discombobulator-header.zst");
-    fs::write(&payload, &bytes[discombobulator_blob_header().len()..]).unwrap();
+    fs::write(&payload, &bytes[header.len()..]).unwrap();
     payload
 }
 
@@ -304,6 +334,56 @@ fn app_survive_projection_excludes_undeclared_files_and_keeps_private_metadata_o
     assert!(metadata.contains("\"execute_cwd\": \"/app\""));
     assert!(metadata.contains("\"execute_arch\": \"x86_64\""));
     assert!(metadata.contains("\"MODE=prod\""));
+}
+
+#[test]
+fn mothership_tunnel_provider_build_emits_system_contract_header() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path();
+    let source_dir = project.join("srcctx");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::copy(
+        if Path::new("/bin/true").exists() {
+            "/bin/true"
+        } else {
+            "/usr/bin/true"
+        },
+        source_dir.join("provider"),
+    )
+    .unwrap();
+
+    let discombobulator_file = project.join("TunnelProvider.DiscombobuFile");
+    fs::write(
+        &discombobulator_file,
+        r#"
+      FROM scratch for x86_64
+      COPY {src} ./provider /tunnel/provider
+      SURVIVE /tunnel/provider
+      EXECUTE ["/tunnel/provider"]
+      "#,
+    )
+    .unwrap();
+
+    let output_blob = project.join("tunnel-provider.blob.zst");
+    build_blob_with_contexts(
+        project,
+        &discombobulator_file,
+        &output_blob,
+        "mothership-tunnel-provider",
+        &[format!("src={}", source_dir.display())],
+    );
+
+    let connection = open_registry(project);
+    let rows = query_artifacts_by_kind(&connection, "mothership-tunnel-provider");
+    assert_eq!(rows.len(), 1);
+    let cached_path = PathBuf::from(&rows[0].path);
+    assert!(cached_path.starts_with(
+        project.join(".discombobulator/artifacts/mothership-tunnel-providers/x86_64")
+    ));
+    assert_eq!(
+        blob_payload_bytes(&output_blob),
+        fs::read(cached_path).unwrap()
+    );
 }
 
 #[test]
@@ -4087,9 +4167,7 @@ fn build_blob(project: &Path, file: &Path, output: &Path, kind: &str) {
         "{}",
         String::from_utf8_lossy(&build.stderr)
     );
-    if kind == "app" {
-        assert_discombobulator_blob_header(output);
-    }
+    assert_output_contract_header(kind, output);
 }
 
 fn remote_fetch(project: &Path, remote: &str, image: &str, arch: &str) -> std::process::Output {
@@ -4144,9 +4222,7 @@ fn build_blob_with_contexts(
         "{}",
         String::from_utf8_lossy(&build.stderr)
     );
-    if kind == "app" {
-        assert_discombobulator_blob_header(output);
-    }
+    assert_output_contract_header(kind, output);
 }
 
 fn assert_fault_injected(output: &std::process::Output, stage: &str) {
@@ -4697,6 +4773,9 @@ fn count_cached_artifacts(project: &Path, kind: &str, arch: &str) -> usize {
     let directory = match kind {
         "app" => project.join(format!(".discombobulator/artifacts/apps/{arch}")),
         "base" => project.join(format!(".discombobulator/artifacts/bases/{arch}")),
+        "mothership-tunnel-provider" => project.join(format!(
+            ".discombobulator/artifacts/mothership-tunnel-providers/{arch}"
+        )),
         other => panic!("unsupported artifact kind {other}"),
     };
     if directory.exists() == false {

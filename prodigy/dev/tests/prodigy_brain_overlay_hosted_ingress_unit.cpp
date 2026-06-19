@@ -168,12 +168,12 @@ public:
     return buildSwitchboardOverlayRoutingConfig(machine, config);
   }
 
-  void configureCloudflareTunnel(String& mothershipEndpoint) override
+  void configureMothershipControlIngress(String& mothershipEndpoint) override
   {
     mothershipEndpoint.clear();
   }
 
-  void teardownCloudflareTunnel(void) override
+  void teardownMothershipControlIngress(void) override
   {
   }
 

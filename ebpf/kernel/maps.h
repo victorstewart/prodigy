@@ -27,3 +27,10 @@ struct {
   __type(value, struct container_network_policy);
   __uint(max_entries, 1);
 } ct_net_policy SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, struct container_egress_allow_key);
+  __type(value, __u8);
+  __uint(max_entries, CONTAINER_EGRESS_ALLOWLIST_MAX_ENTRIES);
+} ct_egress_allow SEC(".maps");

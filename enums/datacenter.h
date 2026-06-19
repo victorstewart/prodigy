@@ -41,7 +41,10 @@ enum class MothershipTopic : uint16_t {
   teardownDNSBindings,
   presentACMEDNS01Challenge,
   cleanupACMEDNS01Challenge,
-  importACMELineage
+  importACMELineage,
+  configureMothershipConnectivity,
+  configureSystemContainerArtifact,
+  configureMothershipTunnelGatewayAuth
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -102,6 +105,12 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "cleanupACMEDNS01Challenge";
     case MothershipTopic::importACMELineage:
       return "importACMELineage";
+    case MothershipTopic::configureMothershipConnectivity:
+      return "configureMothershipConnectivity";
+    case MothershipTopic::configureSystemContainerArtifact:
+      return "configureSystemContainerArtifact";
+    case MothershipTopic::configureMothershipTunnelGatewayAuth:
+      return "configureMothershipTunnelGatewayAuth";
   }
 
   return "unknown";
@@ -132,7 +141,10 @@ enum class BrainTopic : uint16_t {
   replicateTdAppend,
   replicateContainerHealthy,
   replicateContainerRuntimeReady,
-  replicateContainerRuntimeState
+  replicateContainerRuntimeState,
+  replicateSystemContainerArtifact,
+  replicateMothershipConnectivity,
+  replicateMothershipTunnelGatewayAuth
 };
 
 enum class NeuronTopic : uint16_t {

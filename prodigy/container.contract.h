@@ -8,6 +8,14 @@
 
 #include <services/filesystem.h>
 
+enum class SystemContainerKind : uint8_t {
+  none = 0,
+  mothershipTunnelProvider = 1
+};
+
+constexpr static uint8_t prodigyMothershipTunnelProviderRuntimeFragment = 254;
+constexpr static uint32_t prodigyMothershipTunnelProviderRuntimeUID = 65'535u * uint32_t(prodigyMothershipTunnelProviderRuntimeFragment);
+
 static inline String prodigyContainerErrnoString(int err)
 {
   String text = {};
@@ -16,6 +24,24 @@ static inline String prodigyContainerErrnoString(int err)
 }
 
 constexpr static uint32_t prodigyDiscombobulatorAppContractVersion = 1;
+constexpr static uint32_t prodigyDiscombobulatorMothershipTunnelProviderContractVersion = 1;
+
+static inline const char *prodigySystemContainerKindName(SystemContainerKind kind)
+{
+  switch (kind)
+  {
+    case SystemContainerKind::none:
+      {
+        return "none";
+      }
+    case SystemContainerKind::mothershipTunnelProvider:
+      {
+        return "mothership-tunnel-provider";
+      }
+  }
+
+  return "unknown";
+}
 
 static inline String prodigyDiscombobulatorBlobHeaderText(void)
 {
@@ -23,6 +49,20 @@ static inline String prodigyDiscombobulatorBlobHeaderText(void)
   text.assign("PRODIGY-DISCOMBOBULATOR-APP-CONTAINER\n"_ctv);
   text.append("contract=prodigy-container-artifact\n"_ctv);
   text.append("contract_version=1\n"_ctv);
+  text.append("\n"_ctv);
+  return text;
+}
+
+static inline String prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText(void)
+{
+  String text = {};
+  text.assign("PRODIGY-DISCOMBOBULATOR-MOTHERSHIP-TUNNEL-PROVIDER\n"_ctv);
+  text.append("contract=prodigy-mothership-tunnel-provider\n"_ctv);
+  text.append("contract_version=1\n"_ctv);
+  text.append("container_kind=mothershipTunnelProvider\n"_ctv);
+  text.append("requires_standard_neuron_socket=false\n"_ctv);
+  text.append("requires_mothership_tunnel_gateway=true\n"_ctv);
+  text.append("network_policy=tcpEgressOnly\n"_ctv);
   text.append("\n"_ctv);
   return text;
 }
@@ -43,8 +83,26 @@ static inline bool prodigyValidateDiscombobulatorBlobHeaderText(
   return true;
 }
 
-static inline bool prodigyOpenContainerBlobPayloadAfterContractHeader(
+static inline bool prodigyValidateDiscombobulatorMothershipTunnelProviderBlobHeaderText(
+    const String& header,
+    String *failureReport = nullptr)
+{
+  if (header.equal(prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText()) == false)
+  {
+    if (failureReport)
+    {
+      failureReport->assign("container blob is missing the supported Discombobulator mothership tunnel-provider contract header"_ctv);
+    }
+    return false;
+  }
+
+  return true;
+}
+
+static inline bool prodigyOpenBlobPayloadAfterContractHeaderText(
     const String& blobPath,
+    const String& expectedHeader,
+    const char *contractDescription,
     int& fd,
     String *failureReport = nullptr)
 {
@@ -63,7 +121,6 @@ static inline bool prodigyOpenContainerBlobPayloadAfterContractHeader(
     return false;
   }
 
-  String expectedHeader = prodigyDiscombobulatorBlobHeaderText();
   String actualHeader = {};
   actualHeader.need(expectedHeader.size());
   uint64_t readBytes = 0;
@@ -84,7 +141,7 @@ static inline bool prodigyOpenContainerBlobPayloadAfterContractHeader(
     {
       if (failureReport)
       {
-        failureReport->assign("container blob is missing the supported Discombobulator app-container contract header: ended before header completed"_ctv);
+        failureReport->snprintf<"container blob is missing the supported Discombobulator {} contract header: ended before header completed"_ctv>(String(contractDescription));
       }
       close(openedFD);
       return false;
@@ -104,8 +161,12 @@ static inline bool prodigyOpenContainerBlobPayloadAfterContractHeader(
     return false;
   }
 
-  if (prodigyValidateDiscombobulatorBlobHeaderText(actualHeader, failureReport) == false)
+  if (actualHeader.equal(expectedHeader) == false)
   {
+    if (failureReport)
+    {
+      failureReport->snprintf<"container blob is missing the supported Discombobulator {} contract header"_ctv>(String(contractDescription));
+    }
     close(openedFD);
     return false;
   }
@@ -114,12 +175,52 @@ static inline bool prodigyOpenContainerBlobPayloadAfterContractHeader(
   return true;
 }
 
+static inline bool prodigyOpenContainerBlobPayloadAfterContractHeader(
+    const String& blobPath,
+    int& fd,
+    String *failureReport = nullptr)
+{
+  return prodigyOpenBlobPayloadAfterContractHeaderText(
+      blobPath,
+      prodigyDiscombobulatorBlobHeaderText(),
+      "app-container",
+      fd,
+      failureReport);
+}
+
+static inline bool prodigyOpenMothershipTunnelProviderBlobPayloadAfterContractHeader(
+    const String& blobPath,
+    int& fd,
+    String *failureReport = nullptr)
+{
+  return prodigyOpenBlobPayloadAfterContractHeaderText(
+      blobPath,
+      prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText(),
+      "mothership tunnel-provider",
+      fd,
+      failureReport);
+}
+
 static inline bool prodigyValidateDiscombobulatorContainerBlobHeader(
     const String& blobPath,
     String *failureReport = nullptr)
 {
   int fd = -1;
   if (prodigyOpenContainerBlobPayloadAfterContractHeader(blobPath, fd, failureReport) == false)
+  {
+    return false;
+  }
+
+  close(fd);
+  return true;
+}
+
+static inline bool prodigyValidateMothershipTunnelProviderBlobHeader(
+    const String& blobPath,
+    String *failureReport = nullptr)
+{
+  int fd = -1;
+  if (prodigyOpenMothershipTunnelProviderBlobPayloadAfterContractHeader(blobPath, fd, failureReport) == false)
   {
     return false;
   }

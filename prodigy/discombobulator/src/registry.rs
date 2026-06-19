@@ -31,6 +31,7 @@ impl StorageRoot {
             "imports/oci",
             "artifacts/apps",
             "artifacts/bases",
+            "artifacts/mothership-tunnel-providers",
             "work",
             "tmp",
         ] {
@@ -82,6 +83,7 @@ impl StorageRoot {
         let directory = match kind {
             "app" => "artifacts/apps",
             "base" => "artifacts/bases",
+            "mothership-tunnel-provider" => "artifacts/mothership-tunnel-providers",
             other => panic!("unsupported artifact kind {other}"),
         };
         self.root.join(directory).join(arch)

@@ -37,12 +37,12 @@ public:
 
   uint32_t persistCalls = 0;
 
-  void configureCloudflareTunnel(String& mothershipEndpoint) override
+  void configureMothershipControlIngress(String& mothershipEndpoint) override
   {
     mothershipEndpoint.assign("127.0.0.1"_ctv);
   }
 
-  void teardownCloudflareTunnel(void) override
+  void teardownMothershipControlIngress(void) override
   {
   }
 
@@ -391,6 +391,33 @@ static NeuronBGPPeerConfig makeBGPConfigPeer(const char *peerAddress, const char
 static bool equalLocalBrainStates(const ProdigyPersistentLocalBrainState& lhs, const ProdigyPersistentLocalBrainState& rhs)
 {
   return lhs.uuid == rhs.uuid && lhs.ownerClusterUUID == rhs.ownerClusterUUID && lhs.transportTLS == rhs.transportTLS;
+}
+
+static bool equalMothershipTunnelGatewayAuth(const MothershipTunnelGatewayAuth& lhs, const MothershipTunnelGatewayAuth& rhs)
+{
+  return lhs.generation == rhs.generation &&
+      lhs.clusterUUID == rhs.clusterUUID &&
+      lhs.rootCertPem.equals(rhs.rootCertPem) &&
+      lhs.serverCertPem.equals(rhs.serverCertPem) &&
+      lhs.serverKeyPem.equals(rhs.serverKeyPem) &&
+      lhs.authorizedClientCertPem.equals(rhs.authorizedClientCertPem);
+}
+
+static bool equalMothershipConnectivityRuntimeConfigs(const MothershipConnectivityRuntimeConfig& lhs, const MothershipConnectivityRuntimeConfig& rhs)
+{
+  return lhs.kind == rhs.kind &&
+      lhs.tunnelProvider.containerKind == rhs.tunnelProvider.containerKind &&
+      lhs.tunnelProvider.artifactSha256.equals(rhs.tunnelProvider.artifactSha256) &&
+      lhs.tunnelProvider.artifactBytes == rhs.tunnelProvider.artifactBytes &&
+      lhs.tunnelProvider.artifactContractVersion == rhs.tunnelProvider.artifactContractVersion &&
+      lhs.tunnelProvider.dial.endpoint.equals(rhs.tunnelProvider.dial.endpoint) &&
+      lhs.tunnelProvider.dial.serverName.equals(rhs.tunnelProvider.dial.serverName) &&
+      lhs.tunnelProvider.dial.serverSpkiSha256.equals(rhs.tunnelProvider.dial.serverSpkiSha256) &&
+      lhs.tunnelProvider.egress.host.equals(rhs.tunnelProvider.egress.host) &&
+      lhs.tunnelProvider.egress.port == rhs.tunnelProvider.egress.port &&
+      lhs.tunnelProvider.resources.nLogicalCores == rhs.tunnelProvider.resources.nLogicalCores &&
+      lhs.tunnelProvider.resources.nMemoryMB == rhs.tunnelProvider.resources.nMemoryMB &&
+      lhs.tunnelProvider.resources.nStorageMB == rhs.tunnelProvider.resources.nStorageMB;
 }
 
 static bool generateApplicationTlsFactory(ApplicationTlsVaultFactory& factory, String& failure)
@@ -1223,6 +1250,22 @@ int main(void)
     X509_free(parsedLocalCert);
   }
 
+  MothershipTunnelGatewayClientAuth storedTunnelClientAuth = {};
+  MothershipTunnelGatewayAuth storedTunnelGatewayAuth = {};
+  suite.expect(
+      mothershipGenerateTunnelGatewayAuth(storedSnapshot.brainConfig.clusterUUID, 3, storedTunnelClientAuth, storedTunnelGatewayAuth, &parseFailure),
+      "generate_mothership_tunnel_gateway_auth");
+  suite.expect(storedTunnelGatewayAuth.configured(), "generate_mothership_tunnel_gateway_auth_configured");
+
+  MothershipConnectivityRuntimeConfig storedMothershipConnectivity = {};
+  storedMothershipConnectivity.kind = MothershipConnectivityKind::tunnelProvider;
+  storedMothershipConnectivity.tunnelProvider.artifactSha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv;
+  storedMothershipConnectivity.tunnelProvider.artifactBytes = 512;
+  storedMothershipConnectivity.tunnelProvider.dial.endpoint = "control.example.net:443"_ctv;
+  storedMothershipConnectivity.tunnelProvider.dial.serverName = "control.example.net"_ctv;
+  storedMothershipConnectivity.tunnelProvider.egress.host = "edge.example.net"_ctv;
+  storedMothershipConnectivity.tunnelProvider.egress.port = 443;
+
   {
     ProdigyPersistentStateStore store(dbPath);
     String failure;
@@ -1247,6 +1290,26 @@ int main(void)
       basics_log("detail save_local_brain_state: %s\n", failure.c_str());
     }
     suite.expect(saveLocalBrainState, "save_local_brain_state");
+
+    MothershipTunnelGatewayAuth malformedTunnelGatewayAuth = storedTunnelGatewayAuth;
+    malformedTunnelGatewayAuth.serverKeyPem.assign("not-a-key"_ctv);
+    suite.expect(store.saveMothershipTunnelGatewayAuth(malformedTunnelGatewayAuth, &failure) == false && failure.equal("mothership tunnel gateway auth certificate material invalid"_ctv), "save_malformed_tunnel_gateway_auth_rejected");
+    MothershipTunnelGatewayAuth absentTunnelGatewayAuth = {};
+    suite.expect(store.loadMothershipTunnelGatewayAuth(absentTunnelGatewayAuth, &failure) == false && failure.equal("record not found"_ctv), "save_malformed_tunnel_gateway_auth_writes_no_record");
+
+    bool saveTunnelGatewayAuth = store.saveMothershipTunnelGatewayAuth(storedTunnelGatewayAuth, &failure);
+    if (!saveTunnelGatewayAuth)
+    {
+      basics_log("detail save_tunnel_gateway_auth: %s\n", failure.c_str());
+    }
+    suite.expect(saveTunnelGatewayAuth, "save_tunnel_gateway_auth");
+
+    bool saveMothershipConnectivity = store.saveMothershipConnectivityRuntimeConfig(storedMothershipConnectivity, &failure);
+    if (!saveMothershipConnectivity)
+    {
+      basics_log("detail save_mothership_connectivity: %s\n", failure.c_str());
+    }
+    suite.expect(saveMothershipConnectivity, "save_mothership_connectivity");
 
     ProdigyPersistentBootState loadedBootState = {};
     bool loadBoot = store.loadBootState(loadedBootState, &failure);
@@ -1315,6 +1378,24 @@ int main(void)
     }
     suite.expect(loadLocalBrainState, "load_local_brain_state");
     suite.expect(equalLocalBrainStates(storedLocalBrainState, loadedLocalBrainState), "load_local_brain_state_roundtrip");
+
+    MothershipTunnelGatewayAuth loadedTunnelGatewayAuth = {};
+    bool loadTunnelGatewayAuth = store.loadMothershipTunnelGatewayAuth(loadedTunnelGatewayAuth, &failure);
+    if (!loadTunnelGatewayAuth)
+    {
+      basics_log("detail load_tunnel_gateway_auth: %s\n", failure.c_str());
+    }
+    suite.expect(loadTunnelGatewayAuth, "load_tunnel_gateway_auth");
+    suite.expect(equalMothershipTunnelGatewayAuth(storedTunnelGatewayAuth, loadedTunnelGatewayAuth), "load_tunnel_gateway_auth_roundtrip");
+
+    MothershipConnectivityRuntimeConfig loadedMothershipConnectivity = {};
+    bool loadMothershipConnectivity = store.loadMothershipConnectivityRuntimeConfig(loadedMothershipConnectivity, &failure);
+    if (!loadMothershipConnectivity)
+    {
+      basics_log("detail load_mothership_connectivity: %s\n", failure.c_str());
+    }
+    suite.expect(loadMothershipConnectivity, "load_mothership_connectivity");
+    suite.expect(equalMothershipConnectivityRuntimeConfigs(storedMothershipConnectivity, loadedMothershipConnectivity), "load_mothership_connectivity_roundtrip");
   }
 
   {
@@ -1574,11 +1655,26 @@ int main(void)
     suite.expect(stringContains(rawLocalBrainStateSecretRecord, storedLocalBrainState.transportTLS.clusterRootKeyPem), "raw_local_brain_state_secret_record_keeps_cluster_root_key");
     suite.expect(stringContains(rawLocalBrainStateSecretRecord, storedLocalBrainState.transportTLS.localKeyPem), "raw_local_brain_state_secret_record_keeps_local_key");
 
+    String rawPublicTunnelGatewayAuthRecord = {};
+    suite.expect(readRawTidesDBRecord(dbPath, "brain"_ctv, "mothership_tunnel_gateway_auth"_ctv, rawPublicTunnelGatewayAuthRecord, &failure), "read_raw_public_tunnel_gateway_auth_record");
+    ProdigyPersistentStoredMothershipTunnelGatewayAuth storedTunnelGatewayAuthRecord = {};
+    suite.expect(BitseryEngine::deserializeSafe(rawPublicTunnelGatewayAuthRecord, storedTunnelGatewayAuthRecord), "deserialize_raw_public_tunnel_gateway_auth_record");
+    suite.expect(storedTunnelGatewayAuthRecord.secretVersion != 0, "raw_public_tunnel_gateway_auth_record_has_secret_version");
+    suite.expect(stringContains(rawPublicTunnelGatewayAuthRecord, storedTunnelGatewayAuth.serverKeyPem) == false, "raw_public_tunnel_gateway_auth_record_scrubs_server_key");
+    suite.expect(storedTunnelGatewayAuthRecord.auth.serverKeyPem.size() == 0, "raw_public_tunnel_gateway_auth_record_zeroes_server_key");
+
+    String tunnelGatewayAuthSecretKey = {};
+    prodigyBuildPersistentSecretRecordKey("mothership_tunnel_gateway_auth", storedTunnelGatewayAuthRecord.secretVersion, tunnelGatewayAuthSecretKey);
+    String rawTunnelGatewayAuthSecretRecord = {};
+    suite.expect(readRawTidesDBRecord(secretsDBPath, "brain"_ctv, tunnelGatewayAuthSecretKey, rawTunnelGatewayAuthSecretRecord, &failure), "read_raw_tunnel_gateway_auth_secret_record");
+    suite.expect(stringContains(rawTunnelGatewayAuthSecretRecord, storedTunnelGatewayAuth.serverKeyPem), "raw_tunnel_gateway_auth_secret_record_keeps_server_key");
+
     {
       ProdigyPersistentStateStore store(dbPath);
       suite.expect(store.saveBootState(storedBootState, &failure), "duplicate_save_boot");
       suite.expect(store.saveBrainSnapshot(storedSnapshot, &failure), "duplicate_save_snapshot");
       suite.expect(store.saveLocalBrainState(storedLocalBrainState, &failure), "duplicate_save_local_brain_state");
+      suite.expect(store.saveMothershipTunnelGatewayAuth(storedTunnelGatewayAuth, &failure), "duplicate_save_tunnel_gateway_auth");
     }
 
     String rawPublicBootRecordAfterDuplicateSave = {};
@@ -1599,11 +1695,18 @@ int main(void)
     suite.expect(BitseryEngine::deserializeSafe(rawPublicLocalBrainStateRecordAfterDuplicateSave, storedLocalRecordAfterDuplicateSave), "deserialize_raw_public_local_brain_state_record_after_duplicate_save");
     suite.expect(storedLocalRecordAfterDuplicateSave.secretVersion == storedLocalRecord.secretVersion, "duplicate_save_local_brain_state_preserves_secret_version");
 
+    String rawPublicTunnelGatewayAuthRecordAfterDuplicateSave = {};
+    suite.expect(readRawTidesDBRecord(dbPath, "brain"_ctv, "mothership_tunnel_gateway_auth"_ctv, rawPublicTunnelGatewayAuthRecordAfterDuplicateSave, &failure), "read_raw_public_tunnel_gateway_auth_record_after_duplicate_save");
+    ProdigyPersistentStoredMothershipTunnelGatewayAuth storedTunnelGatewayAuthRecordAfterDuplicateSave = {};
+    suite.expect(BitseryEngine::deserializeSafe(rawPublicTunnelGatewayAuthRecordAfterDuplicateSave, storedTunnelGatewayAuthRecordAfterDuplicateSave), "deserialize_raw_public_tunnel_gateway_auth_record_after_duplicate_save");
+    suite.expect(storedTunnelGatewayAuthRecordAfterDuplicateSave.secretVersion == storedTunnelGatewayAuthRecord.secretVersion, "duplicate_save_tunnel_gateway_auth_preserves_secret_version");
+
     ProdigyPersistentStateStore store(dbPath);
 
     ProdigyPersistentBootState loadedBootState = {};
     ProdigyPersistentBrainSnapshot loadedSnapshot = {};
     ProdigyPersistentLocalBrainState loadedLocalBrainState = {};
+    MothershipTunnelGatewayAuth loadedTunnelGatewayAuth = {};
 
     bool reopenBoot = store.loadBootState(loadedBootState, &failure);
     if (!reopenBoot)
@@ -1628,6 +1731,14 @@ int main(void)
     }
     suite.expect(reopenLocalBrainState, "reopen_local_brain_state");
     suite.expect(equalLocalBrainStates(storedLocalBrainState, loadedLocalBrainState), "reopen_local_brain_state_roundtrip");
+
+    bool reopenTunnelGatewayAuth = store.loadMothershipTunnelGatewayAuth(loadedTunnelGatewayAuth, &failure);
+    if (!reopenTunnelGatewayAuth)
+    {
+      basics_log("detail reopen_tunnel_gateway_auth: %s\n", failure.c_str());
+    }
+    suite.expect(reopenTunnelGatewayAuth, "reopen_tunnel_gateway_auth");
+    suite.expect(equalMothershipTunnelGatewayAuth(storedTunnelGatewayAuth, loadedTunnelGatewayAuth), "reopen_tunnel_gateway_auth_roundtrip");
 
     bool removeSnapshot = store.removeBrainSnapshot(&failure);
     if (!removeSnapshot)

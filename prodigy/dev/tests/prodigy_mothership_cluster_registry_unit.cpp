@@ -58,6 +58,25 @@ static bool equalControls(const Vector<MothershipProdigyClusterControl>& lhs, co
   return true;
 }
 
+static bool equalMothershipConnectivity(const MothershipConnectivity& lhs, const MothershipConnectivity& rhs)
+{
+  const MothershipTunnelProviderSpec& lt = lhs.tunnelProvider;
+  const MothershipTunnelProviderSpec& rt = rhs.tunnelProvider;
+  if (lhs.kind != rhs.kind || lt.containerKind != rt.containerKind || lt.artifactSha256.equals(rt.artifactSha256) == false || lt.artifactBytes != rt.artifactBytes || lt.artifactContractVersion != rt.artifactContractVersion || lt.dial.endpoint.equals(rt.dial.endpoint) == false || lt.dial.serverName.equals(rt.dial.serverName) == false || lt.dial.serverSpkiSha256.equals(rt.dial.serverSpkiSha256) == false || lt.egress.host.equals(rt.egress.host) == false || lt.egress.port != rt.egress.port || lt.resources.nLogicalCores != rt.resources.nLogicalCores || lt.resources.nMemoryMB != rt.resources.nMemoryMB || lt.resources.nStorageMB != rt.resources.nStorageMB || lt.allowEmergencySshFallback != rt.allowEmergencySshFallback)
+  {
+    return false;
+  }
+
+  const MothershipTunnelGatewayClientAuth& la = lt.clientAuth;
+  const MothershipTunnelGatewayClientAuth& ra = rt.clientAuth;
+  if (la.generation != ra.generation || la.clusterUUID != ra.clusterUUID || la.rootCertPem.equals(ra.rootCertPem) == false || la.clientCertPem.equals(ra.clientCertPem) == false || la.clientKeyPem.equals(ra.clientKeyPem) == false)
+  {
+    return false;
+  }
+
+  return true;
+}
+
 static bool equalMachineSchemas(const Vector<MothershipProdigyClusterMachineSchema>& lhs, const Vector<MothershipProdigyClusterMachineSchema>& rhs)
 {
   if (lhs.size() != rhs.size())
@@ -283,7 +302,7 @@ static NeuronBGPPeerConfig makeEnvironmentBGPPeer(const char *peerAddress, const
 
 static bool equalClusters(const MothershipProdigyCluster& lhs, const MothershipProdigyCluster& rhs)
 {
-  return lhs.name.equals(rhs.name) && lhs.clusterUUID == rhs.clusterUUID && lhs.deploymentMode == rhs.deploymentMode && lhs.architecture == rhs.architecture && lhs.includeLocalMachine == rhs.includeLocalMachine && lhs.provider == rhs.provider && lhs.providerScope.equals(rhs.providerScope) && lhs.providerCredentialName.equals(rhs.providerCredentialName) && lhs.propagateProviderCredentialToProdigy == rhs.propagateProviderCredentialToProdigy && lhs.dnsProvider == rhs.dnsProvider && lhs.dnsProviderCredentialName.equals(rhs.dnsProviderCredentialName) && equalACMEConfig(lhs.acme, rhs.acme) && equalAwsConfig(lhs.aws, rhs.aws) && equalGcpConfig(lhs.gcp, rhs.gcp) && equalAzureConfig(lhs.azure, rhs.azure) && equalControls(lhs.controls, rhs.controls) && lhs.nBrains == rhs.nBrains && equalMachineSchemas(lhs.machineSchemas, rhs.machineSchemas) && equalMachines(lhs.machines, rhs.machines) && lhs.topology == rhs.topology && lhs.bootstrapSshUser.equals(rhs.bootstrapSshUser) && lhs.bootstrapSshKeyPackage == rhs.bootstrapSshKeyPackage && lhs.bootstrapSshHostKeyPackage == rhs.bootstrapSshHostKeyPackage && lhs.bootstrapSshPrivateKeyPath.equals(rhs.bootstrapSshPrivateKeyPath) && lhs.remoteProdigyPath.equals(rhs.remoteProdigyPath) && lhs.sharedCPUOvercommitPermille == rhs.sharedCPUOvercommitPermille && lhs.machineReservedResources == rhs.machineReservedResources && lhs.osUpdatesEnabled == rhs.osUpdatesEnabled && equalOSUpdatePolicies(lhs.osUpdatePolicies, rhs.osUpdatePolicies) && lhs.maxOSDrains == rhs.maxOSDrains && lhs.machineUpdateCadenceMins == rhs.machineUpdateCadenceMins && equalEnvironmentBGP(lhs.bgp, rhs.bgp) && equalTestConfig(lhs.test, rhs.test) && lhs.desiredEnvironment == rhs.desiredEnvironment && lhs.environmentConfigured == rhs.environmentConfigured && lhs.lastRefreshMs == rhs.lastRefreshMs && lhs.lastRefreshFailure.equals(rhs.lastRefreshFailure);
+  return lhs.name.equals(rhs.name) && lhs.clusterUUID == rhs.clusterUUID && lhs.deploymentMode == rhs.deploymentMode && lhs.architecture == rhs.architecture && lhs.includeLocalMachine == rhs.includeLocalMachine && lhs.provider == rhs.provider && lhs.providerScope.equals(rhs.providerScope) && lhs.providerCredentialName.equals(rhs.providerCredentialName) && lhs.propagateProviderCredentialToProdigy == rhs.propagateProviderCredentialToProdigy && lhs.dnsProvider == rhs.dnsProvider && lhs.dnsProviderCredentialName.equals(rhs.dnsProviderCredentialName) && equalACMEConfig(lhs.acme, rhs.acme) && equalAwsConfig(lhs.aws, rhs.aws) && equalGcpConfig(lhs.gcp, rhs.gcp) && equalAzureConfig(lhs.azure, rhs.azure) && equalControls(lhs.controls, rhs.controls) && equalMothershipConnectivity(lhs.mothershipConnectivity, rhs.mothershipConnectivity) && lhs.nBrains == rhs.nBrains && equalMachineSchemas(lhs.machineSchemas, rhs.machineSchemas) && equalMachines(lhs.machines, rhs.machines) && lhs.topology == rhs.topology && lhs.bootstrapSshUser.equals(rhs.bootstrapSshUser) && lhs.bootstrapSshKeyPackage == rhs.bootstrapSshKeyPackage && lhs.bootstrapSshHostKeyPackage == rhs.bootstrapSshHostKeyPackage && lhs.bootstrapSshPrivateKeyPath.equals(rhs.bootstrapSshPrivateKeyPath) && lhs.remoteProdigyPath.equals(rhs.remoteProdigyPath) && lhs.sharedCPUOvercommitPermille == rhs.sharedCPUOvercommitPermille && lhs.machineReservedResources == rhs.machineReservedResources && lhs.osUpdatesEnabled == rhs.osUpdatesEnabled && equalOSUpdatePolicies(lhs.osUpdatePolicies, rhs.osUpdatePolicies) && lhs.maxOSDrains == rhs.maxOSDrains && lhs.machineUpdateCadenceMins == rhs.machineUpdateCadenceMins && equalEnvironmentBGP(lhs.bgp, rhs.bgp) && equalTestConfig(lhs.test, rhs.test) && lhs.desiredEnvironment == rhs.desiredEnvironment && lhs.environmentConfigured == rhs.environmentConfigured && lhs.lastRefreshMs == rhs.lastRefreshMs && lhs.lastRefreshFailure.equals(rhs.lastRefreshFailure);
 }
 
 static void assignFixtureBootstrapSSHKeyPackage(MothershipProdigyCluster& cluster)
@@ -919,6 +938,8 @@ int main(void)
     }
     suite.expect(createLocal, "create_local");
     suite.expect(createdCluster.clusterUUID != 0, "create_local_cluster_uuid_generated");
+    suite.expect(createdCluster.mothershipConnectivity.kind == MothershipConnectivityKind::ssh, "create_local_defaults_ssh_connectivity");
+    suite.expect(createdCluster.mothershipConnectivity.tunnelProvider.artifactSha256.size() == 0, "create_local_default_ssh_has_no_tunnel_artifact");
     storedLocal.clusterUUID = createdCluster.clusterUUID;
     suite.expect(equalClusters(storedLocal, createdCluster), "create_local_normalized");
 
@@ -1440,6 +1461,154 @@ int main(void)
     }
     suite.expect(listClustersEmpty, "list_clusters_empty");
     suite.expect(clusters.size() == 0, "list_clusters_empty_count");
+  }
+
+  {
+    String tunnelDbPath = {};
+    tunnelDbPath.snprintf<"{}/tunnel"_ctv>(dbPath);
+    MothershipClusterRegistry registry(tunnelDbPath);
+    String failure = {};
+
+    MothershipProdigyCluster tunnel = local;
+    tunnel.name = "local-tunnel"_ctv;
+    tunnel.clusterUUID = 0x7001;
+    tunnel.mothershipConnectivity.kind = MothershipConnectivityKind::tunnelProvider;
+    tunnel.mothershipConnectivity.tunnelProvider.artifactSha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv;
+    tunnel.mothershipConnectivity.tunnelProvider.artifactBytes = 256;
+    tunnel.mothershipConnectivity.tunnelProvider.dial.endpoint = "control.example.net:443"_ctv;
+    tunnel.mothershipConnectivity.tunnelProvider.dial.serverName = "control.example.net"_ctv;
+    tunnel.mothershipConnectivity.tunnelProvider.egress.host = "edge.example.net"_ctv;
+    tunnel.mothershipConnectivity.tunnelProvider.egress.port = 443;
+    MothershipTunnelGatewayAuth gatewayAuth = {};
+    suite.expect(
+        mothershipGenerateTunnelGatewayAuth(tunnel.clusterUUID, 1, tunnel.mothershipConnectivity.tunnelProvider.clientAuth, gatewayAuth, &failure),
+        "create_tunnel_provider_generates_gateway_auth");
+    suite.expect(gatewayAuth.configured(), "create_tunnel_provider_gateway_auth_configured");
+    suite.expect(tunnel.mothershipConnectivity.tunnelProvider.clientAuth.clusterUUID == tunnel.clusterUUID, "create_tunnel_provider_client_auth_binds_cluster");
+    suite.expect(gatewayAuth.authorizedClientCertPem.equals(tunnel.mothershipConnectivity.tunnelProvider.clientAuth.clientCertPem), "create_tunnel_provider_gateway_auth_binds_client");
+    tunnel.mothershipConnectivity.tunnelProvider.gatewayAuth = gatewayAuth;
+    auto reissueTunnelClientAuth = [&](MothershipProdigyCluster& candidate, uint128_t clusterUUID, const char *testName) {
+      MothershipTunnelGatewayAuth ignored = {};
+      candidate.clusterUUID = clusterUUID;
+      candidate.mothershipConnectivity.tunnelProvider.clientAuth = {};
+      suite.expect(mothershipGenerateTunnelGatewayAuth(clusterUUID, 1, candidate.mothershipConnectivity.tunnelProvider.clientAuth, ignored, &failure), testName);
+    };
+
+    MothershipProdigyCluster storedTunnel = {};
+    bool createTunnel = registry.createCluster(tunnel, &storedTunnel, &failure);
+    suite.expect(createTunnel, "create_tunnel_provider_connectivity");
+    suite.expect(storedTunnel.mothershipConnectivity.kind == MothershipConnectivityKind::tunnelProvider, "create_tunnel_provider_kind_preserved");
+    suite.expect(storedTunnel.mothershipConnectivity.tunnelProvider.providerContainerBlobPath.size() == 0, "create_tunnel_provider_path_not_persisted");
+    suite.expect(storedTunnel.mothershipConnectivity.tunnelProvider.clientAuth.configured(), "create_tunnel_provider_client_auth_persisted");
+    suite.expect(storedTunnel.mothershipConnectivity.tunnelProvider.gatewayAuth.configured() == false, "create_tunnel_provider_gateway_auth_not_persisted");
+    MothershipProdigyCluster loadedTunnel = {};
+    suite.expect(registry.getCluster("local-tunnel"_ctv, loadedTunnel, &failure), "load_tunnel_provider_connectivity");
+    suite.expect(equalMothershipConnectivity(storedTunnel.mothershipConnectivity, loadedTunnel.mothershipConnectivity), "load_tunnel_provider_connectivity_matches");
+    suite.expect(loadedTunnel.mothershipConnectivity.tunnelProvider.gatewayAuth.configured() == false, "load_tunnel_provider_gateway_auth_not_persisted");
+
+    MothershipProdigyCluster invalidClientAuth = tunnel;
+    invalidClientAuth.name = "local-tunnel-invalid-client-auth"_ctv;
+    invalidClientAuth.mothershipConnectivity.tunnelProvider.clientAuth.clientKeyPem.assign("not-a-key"_ctv);
+    bool createInvalidClientAuth = registry.createCluster(invalidClientAuth, nullptr, &failure);
+    suite.expect(createInvalidClientAuth == false, "create_tunnel_provider_invalid_client_auth_rejected");
+    suite.expect(failure.equals("tunnelProvider.clientAuth certificate material invalid"_ctv), "create_tunnel_provider_invalid_client_auth_reason");
+
+    MothershipProdigyCluster missingEndpoint = tunnel;
+    missingEndpoint.name = "local-tunnel-missing-endpoint"_ctv;
+    missingEndpoint.mothershipConnectivity.tunnelProvider.dial.endpoint.clear();
+    bool createMissingEndpoint = registry.createCluster(missingEndpoint, nullptr, &failure);
+    suite.expect(createMissingEndpoint == false, "create_tunnel_provider_missing_endpoint_rejected");
+    suite.expect(failure.equals("mothership tunnel-provider dial config invalid"_ctv), "create_tunnel_provider_missing_endpoint_reason");
+
+    MothershipProdigyCluster invalidSpkiPin = tunnel;
+    invalidSpkiPin.name = "local-tunnel-invalid-spki-pin"_ctv;
+    invalidSpkiPin.mothershipConnectivity.tunnelProvider.dial.serverSpkiSha256 = "not-a-sha256"_ctv;
+    bool createInvalidSpkiPin = registry.createCluster(invalidSpkiPin, nullptr, &failure);
+    suite.expect(createInvalidSpkiPin == false, "create_tunnel_provider_invalid_spki_pin_rejected");
+    suite.expect(failure.equals("mothership tunnel-provider dial config invalid"_ctv), "create_tunnel_provider_invalid_spki_pin_reason");
+
+    MothershipProdigyCluster missingEgress = tunnel;
+    missingEgress.name = "local-tunnel-missing-egress"_ctv;
+    missingEgress.mothershipConnectivity.tunnelProvider.egress.host.clear();
+    bool createMissingEgress = registry.createCluster(missingEgress, nullptr, &failure);
+    suite.expect(createMissingEgress == false, "create_tunnel_provider_missing_egress_rejected");
+    suite.expect(failure.equals("mothership tunnel-provider egress endpoint invalid"_ctv), "create_tunnel_provider_missing_egress_reason");
+
+    MothershipProdigyCluster zeroPort = tunnel;
+    zeroPort.name = "local-tunnel-zero-port"_ctv;
+    zeroPort.mothershipConnectivity.tunnelProvider.egress.port = 0;
+    bool createZeroPort = registry.createCluster(zeroPort, nullptr, &failure);
+    suite.expect(createZeroPort == false, "create_tunnel_provider_zero_port_rejected");
+
+    MothershipProdigyCluster oversizedResources = tunnel;
+    oversizedResources.name = "local-tunnel-oversized-resources"_ctv;
+    oversizedResources.mothershipConnectivity.tunnelProvider.resources.nLogicalCores = mothershipTunnelProviderMaxLogicalCores + 1;
+    bool createOversizedResources = registry.createCluster(oversizedResources, nullptr, &failure);
+    suite.expect(createOversizedResources == false, "create_tunnel_provider_oversized_resources_rejected");
+    suite.expect(failure.equals("mothership tunnel-provider resources invalid"_ctv), "create_tunnel_provider_oversized_resources_reason");
+
+    MothershipProdigyCluster publicLiteral = tunnel;
+    publicLiteral.name = "local-tunnel-public-literal"_ctv;
+    reissueTunnelClientAuth(publicLiteral, 0x7003, "create_tunnel_provider_public_literal_auth");
+    publicLiteral.mothershipConnectivity.tunnelProvider.egress.host = "1.1.1.1"_ctv;
+    bool createPublicLiteral = registry.createCluster(publicLiteral, nullptr, &failure);
+    suite.expect(createPublicLiteral, "create_tunnel_provider_public_literal_egress_allowed");
+
+    MothershipProdigyCluster publicMappedLiteral = tunnel;
+    publicMappedLiteral.name = "local-tunnel-public-mapped-literal"_ctv;
+    reissueTunnelClientAuth(publicMappedLiteral, 0x7004, "create_tunnel_provider_public_mapped_literal_auth");
+    publicMappedLiteral.mothershipConnectivity.tunnelProvider.egress.host = "::ffff:1.1.1.1"_ctv;
+    bool createPublicMappedLiteral = registry.createCluster(publicMappedLiteral, nullptr, &failure);
+    suite.expect(createPublicMappedLiteral, "create_tunnel_provider_public_mapped_literal_egress_allowed");
+
+    const char *deniedEgressHosts[] = {
+        "0.0.0.0",
+        "10.0.0.1",
+        "100.64.0.1",
+        "127.0.0.1",
+        "169.254.169.254",
+        "172.16.0.1",
+        "192.0.2.1",
+        "192.88.99.1",
+        "192.168.0.1",
+        "198.18.0.1",
+        "198.51.100.1",
+        "203.0.113.1",
+        "224.0.0.1",
+        "::",
+        "::1",
+        "::10.0.0.1",
+        "::ffff:10.0.0.1",
+        "::ffff:169.254.169.254",
+        "2001:db8::1",
+        "2002::1",
+        "fc00::1",
+        "fe80::1",
+        "ff02::1"};
+    for (uint32_t index = 0; index < sizeof(deniedEgressHosts) / sizeof(deniedEgressHosts[0]); ++index)
+    {
+      MothershipProdigyCluster deniedEgress = tunnel;
+      deniedEgress.name = String();
+      deniedEgress.name.snprintf<"local-tunnel-denied-egress-{itoa}"_ctv>(uint64_t(index));
+      deniedEgress.mothershipConnectivity.tunnelProvider.egress.host = String(deniedEgressHosts[index]);
+      bool createDeniedEgress = registry.createCluster(deniedEgress, nullptr, &failure);
+      suite.expect(createDeniedEgress == false, "create_tunnel_provider_denied_literal_egress_rejected");
+      suite.expect(failure.equals("mothership tunnel-provider egress literal denied"_ctv), "create_tunnel_provider_denied_literal_egress_reason");
+    }
+
+    MothershipProdigyCluster missingAuth = tunnel;
+    missingAuth.name = "local-tunnel-missing-auth"_ctv;
+    missingAuth.mothershipConnectivity.tunnelProvider.clientAuth = {};
+    bool createMissingAuth = registry.createCluster(missingAuth, nullptr, &failure);
+    suite.expect(createMissingAuth == false, "create_tunnel_provider_missing_auth_rejected");
+    suite.expect(failure.equals("tunnelProvider.clientAuth required"_ctv), "create_tunnel_provider_missing_auth_reason");
+
+    MothershipProdigyCluster wrongAuthCluster = tunnel;
+    wrongAuthCluster.name = "local-tunnel-wrong-auth-cluster"_ctv;
+    wrongAuthCluster.clusterUUID = 0x7002;
+    bool createWrongAuthCluster = registry.createCluster(wrongAuthCluster, nullptr, &failure);
+    suite.expect(createWrongAuthCluster == false, "create_tunnel_provider_wrong_auth_cluster_rejected");
+    suite.expect(failure.equals("tunnelProvider.clientAuth clusterUUID mismatch"_ctv), "create_tunnel_provider_wrong_auth_cluster_reason");
   }
 
   std::error_code cleanupError;

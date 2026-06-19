@@ -169,6 +169,7 @@ int main(void)
   suite.expect(stringContains(tarListing, "tools/lat_mem_rd"), "bundle_contains_lat_mem_rd_tool");
   suite.expect(stringContains(tarListing, "tools/bw_mem"), "bundle_contains_bw_mem_tool");
   suite.expect(stringContains(tarListing, "tools/speedtest"), "bundle_contains_speedtest_tool");
+  suite.expect(stringContains(tarListing, "tools/mothership-tunnel-provider"), "bundle_contains_mothership_tunnel_provider_tool");
   suite.expect(stringContains(tarListing, "lib/libc.so.6") == false, "bundle_excludes_libc");
   suite.expect(stringContains(tarListing, "lib/libm.so.6") == false, "bundle_excludes_libm");
   suite.expect(stringContains(tarListing, "lib/libresolv.so.2") == false, "bundle_excludes_libresolv");
@@ -324,7 +325,8 @@ int main(void)
       "sysbench",
       "lat_mem_rd",
       "bw_mem",
-      "speedtest"};
+      "speedtest",
+      "mothership-tunnel-provider"};
 
   for (const char *requiredTool : requiredTools)
   {

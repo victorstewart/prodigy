@@ -38,6 +38,7 @@ static inline cppsort::verge_adapter<cppsort::ska_sorter> sorter;
 #include <prodigy/cluster.machine.helpers.h>
 #include <prodigy/dns.provider.h>
 #include <prodigy/ingress.validation.h>
+#include <prodigy/mothership/mothership.cluster.types.h>
 #include <prodigy/routable.address.helpers.h>
 #include <prodigy/remote.bootstrap.h>
 #include <prodigy/brain/timing.knobs.h>
@@ -884,6 +885,8 @@ public:
   constexpr static int64_t certificateLifecycleMaxJitterMs = 15 * 60 * 1000;
   constexpr static int64_t credentialDeltaAckTimeoutMs = 5 * 60 * 1000;
   constexpr static int64_t publicTlsCertbotTimeoutMs = 60 * 60 * 1000;
+  constexpr static auto mothershipTunnelProviderPendingHealth = "waiting for authenticated tunnel session"_ctv;
+  constexpr static auto mothershipTunnelProviderTerminalFailurePrefix = "mothership tunnel provider exited: "_ctv;
   bytell_hash_map<uint64_t, int64_t> connectFailureNextLogMsByKey;
 
   // not master brain
@@ -941,6 +944,9 @@ public:
   bytell_hash_map<uint64_t, ApplicationServiceIdentity> reservedApplicationServicesByID;
   bytell_hash_map<uint32_t, String> reservedApplicationServiceNamesBySlotKey;
   bytell_hash_map<uint16_t, uint8_t> nextReservableServiceSlotByApplication;
+  MothershipConnectivityRuntimeConfig mothershipConnectivity;
+  MothershipTunnelGatewayAuth mothershipTunnelGatewayAuth;
+  MothershipTunnelProviderRuntimeState mothershipTunnelProviderRuntimeState;
   uint16_t nextReservableApplicationID = 1;
   uint64_t nextMintedClientTlsGeneration = 1;
   uint64_t nextTlsResumptionGeneration = 1;
@@ -12657,8 +12663,361 @@ public:
     }
   }
 
-  virtual void configureCloudflareTunnel(String& mothershipEndpoint) = 0;
-  virtual void teardownCloudflareTunnel(void) = 0;
+  virtual void configureMothershipControlIngress(String& mothershipEndpoint) = 0;
+  virtual void teardownMothershipControlIngress(void) = 0;
+  virtual bool persistMothershipConnectivityRuntimeConfig(const MothershipConnectivityRuntimeConfig& config, String *failure = nullptr)
+  {
+    (void)config;
+    if (failure)
+    {
+      failure->clear();
+    }
+    return true;
+  }
+
+  virtual bool persistMothershipTunnelGatewayAuth(const MothershipTunnelGatewayAuth& auth, String *failure = nullptr)
+  {
+    (void)auth;
+    if (failure)
+    {
+      failure->clear();
+    }
+    return true;
+  }
+
+  virtual bool storeSystemContainerArtifact(SystemContainerKind kind, const String& sha256, uint64_t bytes, const String& blob, String *failure = nullptr)
+  {
+    return ContainerStore::systemStore(kind, sha256, bytes, blob, nullptr, nullptr, failure);
+  }
+
+  virtual bool systemContainerArtifactPresent(SystemContainerKind kind, const String& sha256, uint64_t bytes)
+  {
+    String failure = {};
+    return ContainerStore::systemVerify(kind, sha256, bytes, nullptr, nullptr, &failure);
+  }
+
+  virtual bool loadSystemContainerArtifact(SystemContainerKind kind, const String& sha256, uint64_t bytes, String& blob, String *failure = nullptr)
+  {
+    return ContainerStore::systemLoadVerified(kind, sha256, bytes, blob, failure);
+  }
+
+  virtual bool startMothershipTunnelProviderRuntime(const MothershipTunnelProviderSpec& spec, const MothershipTunnelGatewayAuth& gatewayAuth, const String& artifactBlob, uint64_t generation, uint128_t& containerUUID, String *failure = nullptr)
+  {
+    (void)spec;
+    (void)gatewayAuth;
+    (void)artifactBlob;
+    (void)generation;
+    containerUUID = 0;
+    if (failure)
+    {
+      failure->assign("mothership tunnel provider launch hook missing"_ctv);
+    }
+    return false;
+  }
+
+  virtual void stopMothershipTunnelProviderRuntime(uint128_t containerUUID)
+  {
+    (void)containerUUID;
+  }
+
+  void noteMothershipTunnelProviderControlSession(bool authenticated, bool openedControlSocket, uint64_t clientToControlBytes, uint64_t controlToClientBytes)
+  {
+    if (mothershipConnectivity.kind == MothershipConnectivityKind::tunnelProvider &&
+        mothershipTunnelProviderRuntimeState.running &&
+        authenticated &&
+        openedControlSocket &&
+        clientToControlBytes > 0 &&
+        controlToClientBytes > 0)
+    {
+      mothershipTunnelProviderRuntimeState.healthy = true;
+      mothershipTunnelProviderRuntimeState.lastFailure.clear();
+    }
+  }
+
+  bool noteMothershipTunnelProviderInstanceFailed(uint128_t containerUUID, const String& report, bool restarted)
+  {
+    if (mothershipConnectivity.kind != MothershipConnectivityKind::tunnelProvider ||
+        mothershipTunnelProviderRuntimeState.localContainerUUID != containerUUID)
+    {
+      return false;
+    }
+
+    mothershipTunnelProviderRuntimeState.healthy = false;
+    if (restarted)
+    {
+      mothershipTunnelProviderRuntimeState.lastFailure.assign("mothership tunnel provider restarted: "_ctv);
+    }
+    else
+    {
+      mothershipTunnelProviderRuntimeState.lastFailure.assign(mothershipTunnelProviderTerminalFailurePrefix);
+    }
+    if (report.size() > 0)
+    {
+      mothershipTunnelProviderRuntimeState.lastFailure.append(report);
+    }
+    else
+    {
+      mothershipTunnelProviderRuntimeState.lastFailure.append("unknown"_ctv);
+    }
+    if (restarted == false)
+    {
+      mothershipTunnelProviderRuntimeState.running = false;
+      mothershipTunnelProviderRuntimeState.localContainerUUID = 0;
+      stopMothershipTunnelProviderRuntime(containerUUID);
+    }
+    return true;
+  }
+
+  bool handleUploadedMothershipTunnelProviderContainer(NeuronView *neuron, const ContainerPlan& plan)
+  {
+    if (plan.fragment != prodigyMothershipTunnelProviderRuntimeFragment)
+    {
+      return false;
+    }
+    if (weAreMaster && neuron != nullptr && neuron->machine != nullptr)
+    {
+      bool currentLocal = mothershipConnectivity.kind == MothershipConnectivityKind::tunnelProvider &&
+                          mothershipTunnelProviderRuntimeState.running &&
+                          plan.uuid == mothershipTunnelProviderRuntimeState.localContainerUUID;
+      if (currentLocal == false)
+      {
+        neuron->machine->queueSend(NeuronTopic::killContainer, plan.uuid);
+      }
+    }
+    return true;
+  }
+
+  bool applySystemContainerArtifact(SystemContainerKind kind, const String& sha256, uint64_t bytes, const String& blob, bool replicateToPeers, String *failure = nullptr)
+  {
+    bool alreadyStored = systemContainerArtifactPresent(kind, sha256, bytes);
+    if (alreadyStored == false && storeSystemContainerArtifact(kind, sha256, bytes, blob, failure) == false)
+    {
+      return false;
+    }
+
+    if (replicateToPeers && alreadyStored == false)
+    {
+      queueBrainSystemContainerArtifactReplication(kind, sha256, bytes, blob);
+    }
+    reconcileMothershipTunnelProviderRuntimeState();
+
+    if (failure)
+    {
+      failure->clear();
+    }
+    return true;
+  }
+
+  void reconcileMothershipTunnelProviderRuntimeState(void)
+  {
+    if (mothershipConnectivity.kind != MothershipConnectivityKind::tunnelProvider)
+    {
+      if (mothershipTunnelProviderRuntimeState.running || mothershipTunnelProviderRuntimeState.localContainerUUID != 0)
+      {
+        stopMothershipTunnelProviderRuntime(mothershipTunnelProviderRuntimeState.localContainerUUID);
+      }
+      mothershipTunnelProviderRuntimeState = {};
+      return;
+    }
+
+    const MothershipTunnelProviderSpec& spec = mothershipConnectivity.tunnelProvider;
+    MothershipTunnelProviderRuntimeState& state = mothershipTunnelProviderRuntimeState;
+    auto stopLocalInstance = [&]() -> void {
+      if (state.running || state.localContainerUUID != 0)
+      {
+        stopMothershipTunnelProviderRuntime(state.localContainerUUID);
+      }
+      state.running = false;
+      state.healthy = false;
+      state.localContainerUUID = 0;
+    };
+    auto failStopped = [&](auto&& failureText) -> void {
+      stopLocalInstance();
+      state.lastFailure.assign(failureText);
+    };
+
+    String serializedSpec = {};
+    String specSha256 = {};
+    BitseryEngine::serialize(serializedSpec, spec);
+    if (prodigyComputeSHA256Hex(serializedSpec, specSha256) == false)
+    {
+      failStopped("tunnel provider spec fingerprint failed"_ctv);
+      return;
+    }
+
+    if (state.specSha256.equals(specSha256) == false)
+    {
+      stopLocalInstance();
+      if (state.generation < UINT64_MAX)
+      {
+        state.generation += 1;
+      }
+      state.specSha256.assign(specSha256);
+      state.artifactSha256.assign(spec.artifactSha256);
+      state.lastFailure.clear();
+    }
+
+    state.masterBrainUUID = selfBrainUUID();
+    if (isActiveMaster() == false)
+    {
+      if (BrainView *masterPeer = currentMasterPeer(); masterPeer != nullptr && masterPeer->uuid != 0)
+      {
+        state.masterBrainUUID = masterPeer->uuid;
+      }
+      failStopped("not active master"_ctv);
+      return;
+    }
+
+    if (mothershipTunnelGatewayAuth.configured() == false)
+    {
+      failStopped("mothership tunnel gateway auth missing"_ctv);
+      return;
+    }
+
+    if (systemContainerArtifactPresent(spec.containerKind, spec.artifactSha256, spec.artifactBytes) == false)
+    {
+      failStopped("tunnel provider artifact missing from system store"_ctv);
+      return;
+    }
+
+    String artifactBlob = {};
+    String artifactFailure = {};
+    if (loadSystemContainerArtifact(spec.containerKind, spec.artifactSha256, spec.artifactBytes, artifactBlob, &artifactFailure) == false)
+    {
+      if (artifactFailure.size() == 0)
+      {
+        artifactFailure.assign("tunnel provider artifact verification failed"_ctv);
+      }
+      failStopped(artifactFailure);
+      return;
+    }
+
+    String launchFailure = {};
+    if (mothershipTunnelProviderSpecValid(spec, &launchFailure) == false)
+    {
+      failStopped(launchFailure);
+      return;
+    }
+
+    if (state.running == false &&
+        state.localContainerUUID == 0 &&
+        state.lastFailure.size() >= mothershipTunnelProviderTerminalFailurePrefix.size() &&
+        memcmp(state.lastFailure.data(), mothershipTunnelProviderTerminalFailurePrefix.data(), mothershipTunnelProviderTerminalFailurePrefix.size()) == 0)
+    {
+      return;
+    }
+
+    if (state.running && state.localContainerUUID != 0)
+    {
+      if (state.healthy)
+      {
+        state.lastFailure.clear();
+      }
+      else if (state.lastFailure.size() == 0)
+      {
+        state.lastFailure.assign(mothershipTunnelProviderPendingHealth);
+      }
+      return;
+    }
+
+    uint128_t containerUUID = 0;
+    if (startMothershipTunnelProviderRuntime(spec, mothershipTunnelGatewayAuth, artifactBlob, state.generation, containerUUID, &launchFailure) == false)
+    {
+      if (launchFailure.size() == 0)
+      {
+        launchFailure.assign("mothership tunnel provider runtime launch failed"_ctv);
+      }
+      failStopped(launchFailure);
+      return;
+    }
+    if (containerUUID == 0)
+    {
+      failStopped("mothership tunnel provider launch returned empty container uuid"_ctv);
+      return;
+    }
+
+    state.running = true;
+    state.healthy = false;
+    state.localContainerUUID = containerUUID;
+    state.lastFailure.assign(mothershipTunnelProviderPendingHealth);
+  }
+
+  bool applyMothershipConnectivityRuntimeConfig(const MothershipConnectivityRuntimeConfig& incoming, bool replicateToPeers, String *failure = nullptr)
+  {
+    MothershipConnectivityRuntimeConfig owned = {};
+    mothershipOwnConnectivityRuntimeConfig(incoming, owned);
+    if (mothershipConnectivityRuntimeConfigValid(owned, failure) == false)
+    {
+      return false;
+    }
+
+    mothershipConnectivity = std::move(owned);
+    if (persistMothershipConnectivityRuntimeConfig(mothershipConnectivity, failure) == false)
+    {
+      return false;
+    }
+    reconcileMothershipTunnelProviderRuntimeState();
+
+    if (replicateToPeers)
+    {
+      String serialized;
+      BitseryEngine::serialize(serialized, mothershipConnectivity);
+      queueBrainReplication(BrainTopic::replicateMothershipConnectivity, serialized);
+    }
+
+    if (failure)
+    {
+      failure->clear();
+    }
+    return true;
+  }
+
+  bool applyMothershipTunnelGatewayAuth(const MothershipTunnelGatewayAuth& incoming, bool replicateToPeers, String *failure = nullptr)
+  {
+    if (incoming.configured() == false)
+    {
+      if (failure)
+      {
+        failure->assign("mothership tunnel gateway auth incomplete"_ctv);
+      }
+      return false;
+    }
+
+    if (brainConfig.clusterUUID == 0 || incoming.clusterUUID != brainConfig.clusterUUID)
+    {
+      if (failure)
+      {
+        failure->assign("mothership tunnel gateway auth clusterUUID mismatch"_ctv);
+      }
+      return false;
+    }
+
+    if (mothershipTunnelGatewayAuthMaterialValid(incoming, failure) == false)
+    {
+      return false;
+    }
+
+    mothershipTunnelGatewayAuth = incoming;
+    if (persistMothershipTunnelGatewayAuth(mothershipTunnelGatewayAuth, failure) == false)
+    {
+      return false;
+    }
+    reconcileMothershipTunnelProviderRuntimeState();
+
+    if (replicateToPeers)
+    {
+      String serialized;
+      BitseryEngine::serialize(serialized, mothershipTunnelGatewayAuth);
+      queueBrainReplication(BrainTopic::replicateMothershipTunnelGatewayAuth, serialized);
+      Vault::secureClearString(serialized);
+    }
+
+    if (failure)
+    {
+      failure->clear();
+    }
+    return true;
+  }
 
   void configureMothershipUnixSocketPath(String& mothershipSocketPath)
   {
@@ -12923,7 +13282,7 @@ public:
     mothershipSocket.pendingRecv = false;
 
     String mothershipEndpoint;
-    configureCloudflareTunnel(mothershipEndpoint);
+    configureMothershipControlIngress(mothershipEndpoint);
     if (mothershipEndpoint.size() == 0)
     {
       // Unix-socket-only control mode leaves the legacy TCP listener disabled.
@@ -13024,10 +13383,11 @@ public:
     basics_log("forfeitMasterStatus weAreMaster=%d\n", int(weAreMaster));
     weAreMaster = false;
     noMasterYet = true;
+    reconcileMothershipTunnelProviderRuntimeState();
     mothershipAcceptArmed = false;
     mothershipUnixAcceptArmed = false;
 
-    teardownCloudflareTunnel();
+    teardownMothershipControlIngress();
     unlinkMothershipUnixSocketPath("forfeit-master");
 
     // Relinquishing master also relinquishes any active mothership control stream.
@@ -13123,6 +13483,7 @@ public:
     pendingDesignatedMasterPeerKey = 0;
     masterQuorumDegraded = false;
     hasCompletedInitialMasterElection = true;
+    reconcileMothershipTunnelProviderRuntimeState();
     noteMasterAuthorityRuntimeStateChanged();
     refreshAllDeploymentWormholeQuicCidState(false);
     basics_log("selfElectAsMaster complete\n");
@@ -13353,6 +13714,7 @@ public:
     pendingDesignatedMasterPeerKey = 0;
     brain->isMasterBrain = true;
     hasCompletedInitialMasterElection = true;
+    reconcileMothershipTunnelProviderRuntimeState();
     String masterUUIDText = {};
     masterUUIDText.snprintf<"{itoa}"_ctv>(brain->uuid);
     basics_log("electBrainToMaster uuid=%s\n", masterUUIDText.c_str());
@@ -18629,6 +18991,58 @@ public:
 
           break;
         }
+      case BrainTopic::replicateSystemContainerArtifact:
+        {
+          SystemContainerKind kind = SystemContainerKind::none;
+          String sha256;
+          uint64_t bytes = 0;
+          String blob;
+          Message::extractArg<ArgumentNature::fixed>(args, kind);
+          Message::extractToStringView(args, sha256);
+          Message::extractArg<ArgumentNature::fixed>(args, bytes);
+          Message::extractToStringView(args, blob);
+
+          String storeFailure = {};
+          if (applySystemContainerArtifact(kind, sha256, bytes, blob, false, &storeFailure) == false)
+          {
+            basics_log(
+                "replicateSystemContainerArtifact store failed kind=%s sha256=%s bytes=%llu reason=%s\n",
+                prodigySystemContainerKindName(kind),
+                sha256.c_str(),
+                (unsigned long long)bytes,
+                (storeFailure.size() > 0 ? storeFailure.c_str() : "unknown"));
+          }
+
+          break;
+        }
+      case BrainTopic::replicateMothershipConnectivity:
+        {
+          String serialized;
+          Message::extractToStringView(args, serialized);
+
+          MothershipConnectivityRuntimeConfig incoming = {};
+          String failure = {};
+          if (BitseryEngine::deserializeSafe(serialized, incoming) == false || applyMothershipConnectivityRuntimeConfig(incoming, false, &failure) == false)
+          {
+            basics_log("replicateMothershipConnectivity failed reason=%s\n", failure.size() > 0 ? failure.c_str() : "invalid payload");
+          }
+
+          break;
+        }
+      case BrainTopic::replicateMothershipTunnelGatewayAuth:
+        {
+          String serialized;
+          Message::extractToStringView(args, serialized);
+
+          MothershipTunnelGatewayAuth incoming = {};
+          String failure = {};
+          if (BitseryEngine::deserializeSafe(serialized, incoming) == false || applyMothershipTunnelGatewayAuth(incoming, false, &failure) == false)
+          {
+            basics_log("replicateMothershipTunnelGatewayAuth failed reason=%s\n", failure.size() > 0 ? failure.c_str() : "invalid payload");
+          }
+
+          break;
+        }
       // we're done with this.... either it failed and we're erasing it... or we replaced it and fully transitioned to the new deployment
       case BrainTopic::cullDeployment:
         {
@@ -21306,6 +21720,67 @@ public:
 
           break;
         }
+      case MothershipTopic::configureSystemContainerArtifact:
+        {
+          SystemContainerKind kind = SystemContainerKind::none;
+          String sha256;
+          uint64_t bytes = 0;
+          String blob;
+          Message::extractArg<ArgumentNature::fixed>(args, kind);
+          Message::extractToStringView(args, sha256);
+          Message::extractArg<ArgumentNature::fixed>(args, bytes);
+          Message::extractToStringView(args, blob);
+
+          MothershipResponse response = {};
+          response.success = applySystemContainerArtifact(kind, sha256, bytes, blob, true, &response.failure);
+
+          String serializedResponse;
+          BitseryEngine::serialize(serializedResponse, response);
+          Message::construct(mothership->wBuffer, MothershipTopic::configureSystemContainerArtifact, serializedResponse);
+          break;
+        }
+      case MothershipTopic::configureMothershipConnectivity:
+        {
+          String serialized;
+          Message::extractToStringView(args, serialized);
+
+          MothershipResponse response = {};
+          MothershipConnectivityRuntimeConfig incoming = {};
+          if (BitseryEngine::deserializeSafe(serialized, incoming))
+          {
+            response.success = applyMothershipConnectivityRuntimeConfig(incoming, true, &response.failure);
+          }
+          else
+          {
+            response.failure.assign("invalid mothership connectivity payload"_ctv);
+          }
+
+          String serializedResponse;
+          BitseryEngine::serialize(serializedResponse, response);
+          Message::construct(mothership->wBuffer, MothershipTopic::configureMothershipConnectivity, serializedResponse);
+          break;
+        }
+      case MothershipTopic::configureMothershipTunnelGatewayAuth:
+        {
+          String serialized;
+          Message::extractToStringView(args, serialized);
+
+          MothershipResponse response = {};
+          MothershipTunnelGatewayAuth incoming = {};
+          if (BitseryEngine::deserializeSafe(serialized, incoming))
+          {
+            response.success = applyMothershipTunnelGatewayAuth(incoming, true, &response.failure);
+          }
+          else
+          {
+            response.failure.assign("invalid mothership tunnel gateway auth payload"_ctv);
+          }
+
+          String serializedResponse;
+          BitseryEngine::serialize(serializedResponse, response);
+          Message::construct(mothership->wBuffer, MothershipTopic::configureMothershipTunnelGatewayAuth, serializedResponse);
+          break;
+        }
       case MothershipTopic::upsertMachineSchemas:
         {
           String serializedRequest = {};
@@ -21946,6 +22421,15 @@ public:
           ClusterStatusReport report {};
           report.hasTopology = loadOrPersistAuthoritativeClusterTopology(report.topology);
           report.nMachines = machines.size();
+          report.mothershipConnectivity.kind.assign(mothershipConnectivityKindName(mothershipConnectivity.kind));
+          if (mothershipConnectivity.kind == MothershipConnectivityKind::tunnelProvider)
+          {
+            reconcileMothershipTunnelProviderRuntimeState();
+            report.mothershipConnectivity.runningOnMaster = mothershipTunnelProviderRuntimeState.running;
+            report.mothershipConnectivity.healthy = mothershipTunnelProviderRuntimeState.healthy;
+            report.mothershipConnectivity.generation = mothershipTunnelProviderRuntimeState.generation;
+            report.mothershipConnectivity.lastFailure.assign(mothershipTunnelProviderRuntimeState.lastFailure);
+          }
           int64_t nowMs = Time::now<TimeResolution::ms>();
           BrainView *masterPeer = currentMasterPeer();
           const char *clusterProviderName = nullptr;
@@ -23833,6 +24317,10 @@ public:
             }
 
             reportedMachineContainerUUIDs.insert(plan.uuid);
+            if (handleUploadedMothershipTunnelProviderContainer(neuron, plan))
+            {
+              continue;
+            }
             ContainerView *container = nullptr;
             if (auto existing = containers.find(plan.uuid); existing != containers.end())
             {
@@ -24321,6 +24809,23 @@ public:
           uint128_t containerUUID;
           Message::extractArg<ArgumentNature::fixed>(args, containerUUID);
 
+          int64_t approxTimeMs;
+          Message::extractArg<ArgumentNature::fixed>(args, approxTimeMs);
+
+          int signal;
+          Message::extractArg<ArgumentNature::fixed>(args, signal);
+
+          String report;
+          Message::extractToStringView(args, report);
+
+          bool restarted;
+          Message::extractArg<ArgumentNature::fixed>(args, restarted);
+
+          if (noteMothershipTunnelProviderInstanceFailed(containerUUID, report, restarted))
+          {
+            break;
+          }
+
           if (auto it = containers.find(containerUUID); it != containers.end())
           {
             ContainerView *container = it->second;
@@ -24348,18 +24853,6 @@ public:
             {
               break;
             }
-
-            int64_t approxTimeMs;
-            Message::extractArg<ArgumentNature::fixed>(args, approxTimeMs);
-
-            int signal;
-            Message::extractArg<ArgumentNature::fixed>(args, signal);
-
-            String report;
-            Message::extractToStringView(args, report);
-
-            bool restarted;
-            Message::extractArg<ArgumentNature::fixed>(args, restarted);
 
             deployment->containerFailed(container, approxTimeMs, signal, report, restarted);
 

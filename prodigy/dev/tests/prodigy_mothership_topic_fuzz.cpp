@@ -14,7 +14,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     return 0;
   }
 
-  constexpr static std::array<MothershipTopic, 27> topics = {
+  constexpr static std::array topics = {
       MothershipTopic::configure,
       MothershipTopic::upsertMachineSchemas,
       MothershipTopic::deltaMachineBudget,
@@ -42,6 +42,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
       MothershipTopic::presentACMEDNS01Challenge,
       MothershipTopic::cleanupACMEDNS01Challenge,
       MothershipTopic::importACMELineage,
+      MothershipTopic::configureMothershipConnectivity,
+      MothershipTopic::configureSystemContainerArtifact,
+      MothershipTopic::configureMothershipTunnelGatewayAuth,
   };
 
   std::vector<uint8_t> bytes(data, data + size);

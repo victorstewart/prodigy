@@ -42,6 +42,7 @@ public:
 
   EthDevice eth;
   uint32_t configuredInterContainerMTU = 0;
+  bool configuredFakeIpv4Boundary = false;
   BPFProgram *tcx_ingress_program = nullptr;
   BPFProgram *tcx_egress_program = nullptr;
   struct local_container_subnet6 lcsubnet6;

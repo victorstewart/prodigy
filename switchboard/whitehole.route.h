@@ -85,8 +85,13 @@ static inline void switchboardWhiteholeReplyFlowPinPath(String& path, uint32_t i
   path.snprintf<"/sys/fs/bpf/prodigy_whitehole_reply_flows_{itoa}"_ctv>(ifindex);
 }
 
+static inline void switchboardSystemEgressNATPinPath(String& path, uint32_t ifindex)
+{
+  path.snprintf<"/sys/fs/bpf/prodigy_system_egress_nat_{itoa}"_ctv>(ifindex);
+}
+
 template <typename Program>
-static inline bool switchboardPinWhiteholeReplyFlowMap(Program *program, uint32_t ifindex)
+static inline bool switchboardPinProgramMap(Program *program, uint32_t ifindex, const char *mapName, void (*pinPath)(String&, uint32_t))
 {
   if (program == nullptr || ifindex == 0)
   {
@@ -95,12 +100,12 @@ static inline bool switchboardPinWhiteholeReplyFlowMap(Program *program, uint32_
 
   bool pinned = false;
   String path = {};
-  switchboardWhiteholeReplyFlowPinPath(path, ifindex);
+  pinPath(path, ifindex);
 
-  program->openMap("white_replies"_ctv, [&](int map_fd) -> void {
+  program->openMap(String(mapName), [&](int map_fd) -> void {
     if (map_fd < 0)
     {
-      basics_log("Switchboard missing white_replies map for pin ifidx=%u\n", ifindex);
+      basics_log("Switchboard missing %s map for pin ifidx=%u\n", mapName, ifindex);
       return;
     }
 
@@ -109,7 +114,8 @@ static inline bool switchboardPinWhiteholeReplyFlowMap(Program *program, uint32_
     pinned = (result == 0);
     if (result != 0)
     {
-      basics_log("Switchboard white_replies pin failed ifidx=%u path=%s errno=%d\n",
+      basics_log("Switchboard %s pin failed ifidx=%u path=%s errno=%d\n",
+                 mapName,
                  ifindex,
                  path.c_str(),
                  errno);
@@ -119,7 +125,7 @@ static inline bool switchboardPinWhiteholeReplyFlowMap(Program *program, uint32_
   return pinned;
 }
 
-static inline bool switchboardReusePinnedWhiteholeReplyFlowMap(struct bpf_object *obj, uint32_t ifindex, Vector<int>& inner_map_fds)
+static inline bool switchboardReusePinnedProgramMap(struct bpf_object *obj, uint32_t ifindex, const char *mapName, void (*pinPath)(String&, uint32_t), Vector<int>& inner_map_fds)
 {
   if (obj == nullptr || ifindex == 0)
   {
@@ -127,36 +133,60 @@ static inline bool switchboardReusePinnedWhiteholeReplyFlowMap(struct bpf_object
   }
 
   String path = {};
-  switchboardWhiteholeReplyFlowPinPath(path, ifindex);
+  pinPath(path, ifindex);
 
-  int pinnedReplyMapFD = bpf_obj_get(path.c_str());
-  if (pinnedReplyMapFD < 0)
+  int pinnedMapFD = bpf_obj_get(path.c_str());
+  if (pinnedMapFD < 0)
   {
-    basics_log("Switchboard white_replies pinned map open failed ifidx=%u path=%s errno=%d\n",
+    basics_log("Switchboard %s pinned map open failed ifidx=%u path=%s errno=%d\n",
+               mapName,
                ifindex,
                path.c_str(),
                errno);
     return false;
   }
 
-  struct bpf_map *replyMap = bpf_object__find_map_by_name(obj, "white_replies");
-  if (replyMap == nullptr)
+  struct bpf_map *map = bpf_object__find_map_by_name(obj, mapName);
+  if (map == nullptr)
   {
-    basics_log("Switchboard white_replies map missing while reusing pinned fd ifidx=%u\n", ifindex);
-    ::close(pinnedReplyMapFD);
+    basics_log("Switchboard %s map missing while reusing pinned fd ifidx=%u\n", mapName, ifindex);
+    ::close(pinnedMapFD);
     return false;
   }
 
-  if (bpf_map__reuse_fd(replyMap, pinnedReplyMapFD) != 0)
+  if (bpf_map__reuse_fd(map, pinnedMapFD) != 0)
   {
-    basics_log("Switchboard white_replies map reuse failed ifidx=%u fd=%d errno=%d\n",
+    basics_log("Switchboard %s map reuse failed ifidx=%u fd=%d errno=%d\n",
+               mapName,
                ifindex,
-               pinnedReplyMapFD,
+               pinnedMapFD,
                errno);
-    ::close(pinnedReplyMapFD);
+    ::close(pinnedMapFD);
     return false;
   }
 
-  inner_map_fds.push_back(pinnedReplyMapFD);
+  inner_map_fds.push_back(pinnedMapFD);
   return true;
+}
+
+template <typename Program>
+static inline bool switchboardPinWhiteholeReplyFlowMap(Program *program, uint32_t ifindex)
+{
+  return switchboardPinProgramMap(program, ifindex, "white_replies", switchboardWhiteholeReplyFlowPinPath);
+}
+
+template <typename Program>
+static inline bool switchboardPinSystemEgressNATMap(Program *program, uint32_t ifindex)
+{
+  return switchboardPinProgramMap(program, ifindex, "system_egress_nat", switchboardSystemEgressNATPinPath);
+}
+
+static inline bool switchboardReusePinnedWhiteholeReplyFlowMap(struct bpf_object *obj, uint32_t ifindex, Vector<int>& inner_map_fds)
+{
+  return switchboardReusePinnedProgramMap(obj, ifindex, "white_replies", switchboardWhiteholeReplyFlowPinPath, inner_map_fds);
+}
+
+static inline bool switchboardReusePinnedSystemEgressNATMap(struct bpf_object *obj, uint32_t ifindex, Vector<int>& inner_map_fds)
+{
+  return switchboardReusePinnedProgramMap(obj, ifindex, "system_egress_nat", switchboardSystemEgressNATPinPath, inner_map_fds);
 }
