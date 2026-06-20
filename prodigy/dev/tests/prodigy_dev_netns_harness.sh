@@ -50,6 +50,7 @@ brain_bootstrap_family="${PRODIGY_DEV_BRAIN_BOOTSTRAP_FAMILY:-ipv4}"
 workspace_root=""
 manifest_path=""
 tunnel_ebpf=""
+private_ipv4_prefix="${PRODIGY_DEV_PRIVATE_IPV4_PREFIX:-10.0.0}"
 host_ingress_ebpf=""
 host_egress_ebpf=""
 enable_fake_ipv4_boundary="${PRODIGY_DEV_ENABLE_FAKE_IPV4_BOUNDARY:-0}"
@@ -244,6 +245,9 @@ do
          ;;
       --brain-bootstrap-family=*)
          brain_bootstrap_family="${1#*=}"
+         ;;
+      --private-ipv4-prefix=*)
+         private_ipv4_prefix="${1#*=}"
          ;;
       --inter-container-mtu=*)
          cluster_link_mtu="${1#*=}"
@@ -569,6 +573,27 @@ fi
 if [[ "${brain_bootstrap_family}" != "ipv4" && "${brain_bootstrap_family}" != "private6" && "${brain_bootstrap_family}" != "public6" && "${brain_bootstrap_family}" != "multihome6" ]]
 then
    echo "FAIL: --brain-bootstrap-family must be ipv4, private6, public6, or multihome6"
+   exit 1
+fi
+
+private_ipv4_gateway="${private_ipv4_prefix}.1"
+validate_private_ipv4_prefix()
+{
+   local IFS=.
+   local -a octets=($1)
+   local octet
+   [[ "${#octets[@]}" -eq 3 ]] || return 1
+   for octet in "${octets[@]}"
+   do
+      [[ "${octet}" =~ ^[0-9]+$ ]] || return 1
+      [[ "${octet}" -le 255 ]] || return 1
+   done
+   [[ "${octets[0]}" -eq 10 || ("${octets[0]}" -eq 172 && "${octets[1]}" -ge 16 && "${octets[1]}" -le 31) || ("${octets[0]}" -eq 192 && "${octets[1]}" -eq 168) ]] || return 1
+}
+
+if ! validate_private_ipv4_prefix "${private_ipv4_prefix}"
+then
+   echo "FAIL: --private-ipv4-prefix must be an RFC1918 A.B.C prefix"
    exit 1
 fi
 
@@ -1851,7 +1876,7 @@ assigned_brain_public_ips6=()
 for idx in $(seq 1 "${node_count}")
 do
    host_octet=$((9 + idx))
-   assigned_brain_ips+=("10.0.0.${host_octet}")
+   assigned_brain_ips+=("${private_ipv4_prefix}.${host_octet}")
    assigned_brain_ips6+=("fd00:10::$(printf '%x' "${host_octet}")")
    if [[ "${enable_fake_ipv4_boundary}" == "1" ]]
    then
@@ -2892,7 +2917,7 @@ done
 ip netns exec "${parent_ns}" ip link add prodigy-br0 type bridge
 ip netns exec "${parent_ns}" ip link set dev prodigy-br0 type bridge mcast_snooping 0
 set_link_packet_budget "${parent_ns}" prodigy-br0
-ip netns exec "${parent_ns}" ip addr add 10.0.0.1/24 dev prodigy-br0
+ip netns exec "${parent_ns}" ip addr add "${private_ipv4_gateway}/24" dev prodigy-br0
 ip netns exec "${parent_ns}" ip -6 addr add fd00:10::1/64 nodad dev prodigy-br0
 if [[ "${enable_fake_ipv4_boundary}" == "1" ]]
 then
@@ -2925,7 +2950,7 @@ do
    ip netns exec "${ns}" ip addr add "${brain_ip}/24" dev bond0
    ip netns exec "${ns}" ip -6 addr add "${brain_ip6}/64" nodad dev bond0
    ip netns exec "${ns}" ip -6 addr add "${brain_public_ip6}/64" nodad dev bond0
-   ip netns exec "${ns}" ip route replace default via 10.0.0.1 dev bond0
+   ip netns exec "${ns}" ip route replace default via "${private_ipv4_gateway}" dev bond0
    ip netns exec "${ns}" ip -6 route replace default via fd00:10::1 dev bond0
 done
 
@@ -3396,16 +3421,16 @@ configure_dev_switchboard_balancer_on_gateway()
    local machine_fragment_fallback="${switchboard_gateway_ip##*.}"
 
    local_mac="$(ip netns exec "${gateway_ns}" cat /sys/class/net/bond0/address 2>/dev/null || true)"
-   gateway_mac="$(ip netns exec "${gateway_ns}" ip neigh show 10.0.0.1 dev bond0 2>/dev/null | awk '/lladdr/ {print $5; exit}')"
+   gateway_mac="$(ip netns exec "${gateway_ns}" ip neigh show "${private_ipv4_gateway}" dev bond0 2>/dev/null | awk '/lladdr/ {print $5; exit}')"
    if [[ -z "${gateway_mac}" ]]
    then
-      ip netns exec "${gateway_ns}" ping -c1 -W1 10.0.0.1 >/dev/null 2>&1 || true
-      gateway_mac="$(ip netns exec "${gateway_ns}" ip neigh show 10.0.0.1 dev bond0 2>/dev/null | awk '/lladdr/ {print $5; exit}')"
+      ip netns exec "${gateway_ns}" ping -c1 -W1 "${private_ipv4_gateway}" >/dev/null 2>&1 || true
+      gateway_mac="$(ip netns exec "${gateway_ns}" ip neigh show "${private_ipv4_gateway}" dev bond0 2>/dev/null | awk '/lladdr/ {print $5; exit}')"
    fi
 
    if [[ -z "${gateway_mac}" ]]
    then
-      # In this harness topology, 10.0.0.1 is parent_ns/prodigy-br0.
+      # In this harness topology, private_ipv4_gateway is parent_ns/prodigy-br0.
       # Fall back to the bridge MAC if ARP table priming is delayed.
       gateway_mac="$(ip netns exec "${parent_ns}" cat /sys/class/net/prodigy-br0/address 2>/dev/null || true)"
    fi
