@@ -3780,7 +3780,27 @@ static void mothershipBuildPersistentTestClusterStopCommand(const MothershipProd
   mothershipAppendPersistentTestClusterWorkspaceCleanup(cluster.test.workspaceRoot, command);
 }
 
-static bool mothershipWaitForLocalTestClusterReady(const MothershipProdigyCluster& cluster, String *failure = nullptr, int timeoutMs = 180'000)
+static int mothershipLocalTestClusterReadyTimeoutMs(void)
+{
+  constexpr int defaultTimeoutMs = 180'000;
+  const char *text = std::getenv("PRODIGY_MOTHERSHIP_LOCAL_TEST_CLUSTER_READY_TIMEOUT_MS");
+  if (text == nullptr || text[0] == '\0')
+  {
+    return defaultTimeoutMs;
+  }
+
+  errno = 0;
+  char *end = nullptr;
+  long parsed = std::strtol(text, &end, 10);
+  if (errno != 0 || end == text || *end != '\0' || parsed <= 0 || parsed > INT_MAX)
+  {
+    return defaultTimeoutMs;
+  }
+
+  return int(parsed);
+}
+
+static bool mothershipWaitForLocalTestClusterReady(const MothershipProdigyCluster& cluster, String *failure = nullptr, int timeoutMs = mothershipLocalTestClusterReadyTimeoutMs())
 {
   String manifestPath = {};
   mothershipResolveTestClusterManifestPath(cluster, manifestPath);

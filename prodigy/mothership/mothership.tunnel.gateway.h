@@ -5,6 +5,7 @@
 #include <thread>
 #include <sys/types.h>
 
+#include <includes.h>
 #include <services/prodigy.h>
 
 struct MothershipTunnelGatewayAuth;
