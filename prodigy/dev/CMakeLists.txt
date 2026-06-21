@@ -561,8 +561,11 @@ set(PRODIGY_ALL_BUILD_TARGETS
 set(PRODIGY_COMMON_DEPO_TARGETS
    basics::basics
    cppsort::cppsort
+   libbpf::libbpf
    libcap::libcap
+   libcurl::libcurl
    libseccomp::libseccomp
+   simdjson::simdjson
 )
 
 set(PRODIGY_BUNDLE_OUTPUT "${CMAKE_BINARY_DIR}/prodigy.${PRODIGY_RESOLVED_TARGET_ARCH}.bundle.tar.zst")
@@ -621,9 +624,8 @@ foreach(prodigy_target IN LISTS PRODIGY_ALL_BUILD_TARGETS)
    target_include_directories(${prodigy_target} PRIVATE "${PRODIGY_ROOT}")
    depos_link(${prodigy_target} PRIVATE ${PRODIGY_COMMON_DEPO_TARGETS})
 endforeach()
-depos_link(prodigy PRIVATE libbpf::libbpf libcurl::libcurl simdjson::simdjson)
-depos_link(mothership PRIVATE libcurl::libcurl simdjson::simdjson)
-depos_link(prodigy_test_cluster_boot_json PRIVATE simdjson::simdjson)
+depos_link(prodigy PRIVATE ${PRODIGY_COMMON_DEPO_TARGETS})
+depos_link(mothership PRIVATE ${PRODIGY_COMMON_DEPO_TARGETS})
 
 if (NOT TARGET Prodigy::SdkCppOpinionated)
    message(FATAL_ERROR "Prodigy dev requires Prodigy::SdkCppOpinionated for the SDK-owned neuron hub fixture coverage.")
