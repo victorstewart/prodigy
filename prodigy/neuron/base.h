@@ -21,6 +21,8 @@ enum class NeuronTimeoutFlags : uint64_t {
 };
 
 class Container;
+class ContainerPlan;
+class TaskTermination;
 class SwitchboardOverlayRoutingConfig;
 
 class NeuronBase {
@@ -106,6 +108,34 @@ public:
     (void)terminalSignal;
     (void)crashReport;
     (void)restart;
+  }
+
+  virtual bool prepareTaskAttemptLaunch(const ContainerPlan& plan, bool& skipLaunch, String *failureReport = nullptr)
+  {
+    (void)plan;
+    (void)failureReport;
+    skipLaunch = false;
+    return true;
+  }
+
+  virtual void noteTaskAttemptRunning(const ContainerPlan& plan)
+  {
+    (void)plan;
+  }
+
+  virtual bool noteTaskAttemptTerminal(const ContainerPlan& plan, const TaskTermination& termination)
+  {
+    (void)plan;
+    (void)termination;
+    return true;
+  }
+
+  virtual void reportTaskAttemptTerminal(uint64_t deploymentID, uint32_t attemptNumber, uint128_t containerUUID, const TaskTermination& termination)
+  {
+    (void)deploymentID;
+    (void)attemptNumber;
+    (void)containerUUID;
+    (void)termination;
   }
 
   virtual void refreshContainerSwitchboardWormholes(Container *container)

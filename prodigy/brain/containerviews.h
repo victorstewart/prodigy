@@ -12,6 +12,7 @@ public:
   Machine *machine;
   uint64_t deploymentID;
   int64_t createdAtMs;
+  uint32_t taskAttemptNumber = 0;
   Vector<IPPrefix> addresses;
   Vector<Wormhole> wormholes;
   Vector<Whitehole> whiteholes;
@@ -469,7 +470,7 @@ public:
       }
     }
 
-    if (lifetime == ApplicationLifetime::canary)
+    if (dplan.config.type == ApplicationType::task || lifetime == ApplicationLifetime::canary)
     {
       plan.restartOnFailure = false;
     }
@@ -518,6 +519,7 @@ public:
     plan.lifetime = lifetime;
     plan.state = state;
     plan.createdAtMs = createdAtMs;
+    plan.taskAttemptNumber = taskAttemptNumber;
     plan.shardGroup = shardGroup;
     plan.nShardGroups = (plan.isStateful ? deploymentShardGroups : 0);
     plan.hasCredentialBundle = hasCredentialBundle;

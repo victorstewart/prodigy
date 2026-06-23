@@ -229,6 +229,8 @@ struct ControlPolicy {
 
 struct ContainerParameters {
   U128 uuid {};
+  std::uint64_t deploymentID = 0;
+  std::uint32_t taskAttemptNumber = 0;
   std::uint32_t memoryMB = 0;
   std::uint32_t storageMB = 0;
   std::uint16_t logicalCores = 0;
@@ -261,6 +263,7 @@ enum class ContainerTopic : std::uint16_t {
   credentialsRefresh = 12,
   wormholesRefresh = 13,
   runtimeReady = 14,
+  taskResult = 15,
 };
 
 struct MessageFrame {
@@ -1016,7 +1019,7 @@ static inline bool decodeResourceDeltaPayload(Reader& reader, ResourceDelta& del
 
 static inline bool validTopic(std::uint16_t rawTopic)
 {
-  return rawTopic <= static_cast<std::uint16_t>(ContainerTopic::runtimeReady);
+  return rawTopic <= static_cast<std::uint16_t>(ContainerTopic::taskResult);
 }
 } // namespace Detail
 
@@ -1245,7 +1248,15 @@ inline Result decodeContainerParameters(const std::uint8_t *data, std::size_t si
       decoded.credentialBundle.reset();
     }
 
-    if (reader.done() == false)
+    if (reader.done())
+    {
+      parameters = std::move(decoded);
+      return Result::ok;
+    }
+
+    if (reader.u64(decoded.deploymentID) == false ||
+        reader.u32(decoded.taskAttemptNumber) == false ||
+        reader.done() == false)
     {
       return Result::protocol;
     }
@@ -1446,6 +1457,16 @@ inline Result buildReadyFrame(Bytes& output)
 inline Result buildRuntimeReadyFrame(Bytes& output)
 {
   return buildMessageFrame(output, ContainerTopic::runtimeReady, nullptr, 0);
+}
+
+inline Result buildTaskResultFrame(Bytes& output, const Bytes& result)
+{
+  constexpr std::size_t maxTaskResultBytes = 64u * 1024u;
+  if (result.size() > maxTaskResultBytes)
+  {
+    return Result::argument;
+  }
+  return buildMessageFrame(output, ContainerTopic::taskResult, result);
 }
 
 template <typename MetricPairs>
@@ -1767,6 +1788,17 @@ public:
     queuedResponses.push_back(MessageFrame {ContainerTopic::runtimeReady, {}});
   }
 
+  Result queueTaskResult(Bytes result)
+  {
+    constexpr std::size_t maxTaskResultBytes = 64u * 1024u;
+    if (result.size() > maxTaskResultBytes)
+    {
+      return Result::argument;
+    }
+    queuedResponses.push_back(MessageFrame {ContainerTopic::taskResult, std::move(result)});
+    return Result::ok;
+  }
+
   template <typename MetricPairs>
   void queueStatistics(const MetricPairs& metrics)
   {
@@ -1857,6 +1889,7 @@ public:
       case ContainerTopic::healthy:
       case ContainerTopic::runtimeReady:
       case ContainerTopic::statistics:
+      case ContainerTopic::taskResult:
       case ContainerTopic::resourceDeltaAck:
         {
           return Result::ok;

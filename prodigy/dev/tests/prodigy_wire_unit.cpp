@@ -335,6 +335,8 @@ static bool equalContainerParameters(const ContainerParameters& lhs, const Conta
   };
 
   if (lhs.uuid != rhs.uuid ||
+      lhs.deploymentID != rhs.deploymentID ||
+      lhs.taskAttemptNumber != rhs.taskAttemptNumber ||
       lhs.memoryMB != rhs.memoryMB ||
       lhs.storageMB != rhs.storageMB ||
       lhs.nLogicalCores != rhs.nLogicalCores ||
@@ -550,6 +552,8 @@ static ContainerParameters makeContainerParameters(void)
   parameters.uuid = uint128_t(0x1122334455667788ULL);
   parameters.uuid <<= 64;
   parameters.uuid |= uint128_t(0x99AABBCCDDEEFF00ULL);
+  parameters.deploymentID = 0x1234000000000055ULL;
+  parameters.taskAttemptNumber = 3;
   parameters.memoryMB = 1024;
   parameters.storageMB = 2048;
   parameters.nLogicalCores = 3;
@@ -979,6 +983,117 @@ int main(void)
         ProdigyWire::deserializeCredentialDeltaFramePayload(message->args, uint64_t(message->terminal() - message->args), decoded),
         "credential_delta_frame_decode_wire");
     suite.expect(equalCredentialDelta(expected, decoded), "credential_delta_frame_roundtrip_wire");
+  }
+
+  {
+    TaskExecutionRecord once = {};
+    once.executionID = 0x1002000000000003ULL;
+    once.applicationID = 0x1002;
+    once.versionID = 3;
+    once.policy = TaskExecutionPolicy::runOnce;
+    once.state = TaskExecutionState::running;
+    once.currentAttemptNumber = 1;
+    TaskAttemptRecord failed = {};
+    failed.attemptNumber = 1;
+    failed.state = TaskExecutionState::failed;
+    failed.termination.kind = TaskTerminationKind::exited;
+    failed.termination.exitCode = 42;
+    suite.expect(taskExecutionCommitAttempt(once, failed, 1000), "task_run_once_failure_commits");
+    suite.expect(
+        once.state == TaskExecutionState::failed &&
+            once.attemptsFailed == 1 &&
+            once.completedAtMs == 1000 &&
+            once.expiresAtMs == 1000 + prodigyTaskExecutionRecordRetentionMs &&
+            once.expired(once.expiresAtMs) &&
+            once.hasFinalAttempt,
+        "task_run_once_failure_is_terminal_and_retained_24h");
+
+    TaskExecutionRecord retry = {};
+    retry.policy = TaskExecutionPolicy::untilSucceeded;
+    retry.state = TaskExecutionState::running;
+    retry.currentAttemptNumber = 1;
+    suite.expect(taskExecutionCommitAttempt(retry, failed, 2000), "task_until_success_failure_commits");
+    suite.expect(
+        retry.state == TaskExecutionState::retrying &&
+            retry.attemptsFailed == 1 &&
+            retry.terminal() == false &&
+            retry.hasLatestNonSuccessAttempt &&
+            retry.hasFinalAttempt == false,
+        "task_until_success_failure_retries_without_final_record");
+    suite.expect(taskExecutionTransition(retry, TaskExecutionState::assigned, 2100), "task_until_success_retry_reassigns");
+    suite.expect(taskExecutionTransition(retry, TaskExecutionState::running, 2100), "task_until_success_retry_runs");
+    TaskAttemptRecord succeeded = failed;
+    succeeded.attemptNumber = 2;
+    succeeded.state = TaskExecutionState::succeeded;
+    succeeded.termination.exitCode = 0;
+    suite.expect(taskExecutionCommitAttempt(retry, succeeded, 3000), "task_until_success_success_commits");
+    suite.expect(
+        retry.state == TaskExecutionState::succeeded &&
+            retry.attemptsSucceeded == 1 &&
+            retry.attemptsFailed == 1 &&
+            retry.currentAttemptNumber == 2 &&
+            retry.hasFinalAttempt,
+        "task_until_success_success_finishes_logical_execution");
+
+    String encoded;
+    BitseryEngine::serialize(encoded, retry);
+    TaskExecutionRecord decoded = {};
+    suite.expect(BitseryEngine::deserializeSafe(encoded, decoded) && decoded == retry, "task_execution_record_roundtrip_wire");
+
+    TaskAttemptJournalRecord journal = {};
+    journal.deploymentID = once.executionID;
+    journal.attemptNumber = 7;
+    journal.containerUUID = uint128_t(0x5555);
+    journal.state = TaskAttemptJournalState::terminal;
+    journal.updatedAtMs = 4000;
+    journal.hasTermination = true;
+    journal.termination = succeeded.termination;
+    encoded.clear();
+    BitseryEngine::serialize(encoded, journal);
+    TaskAttemptJournalRecord decodedJournal = {};
+    suite.expect(BitseryEngine::deserializeSafe(encoded, decodedJournal) && decodedJournal == journal && journal.terminalOutbox(), "task_attempt_journal_roundtrip_wire");
+
+    String frame;
+    Message::construct(frame, MothershipTopic::pullTaskReport, uint64_t(once.executionID));
+    Message *message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(
+        ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()),
+        "task_report_request_valid_for_mothership");
+
+    TaskTermination termination = {};
+    termination.kind = TaskTerminationKind::exited;
+    termination.result.assign("done"_ctv);
+    String serializedTermination;
+    BitseryEngine::serialize(serializedTermination, termination);
+    frame.clear();
+    Message::construct(frame, NeuronTopic::taskAttemptTerminal, once.executionID, uint32_t(7), uint128_t(0x5555), serializedTermination);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(
+        ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal()),
+        "task_attempt_terminal_valid_for_brain");
+    frame.clear();
+    Message::construct(frame, NeuronTopic::taskAttemptTerminalAck, once.executionID, uint32_t(7));
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(
+        ProdigyIngressValidation::validateNeuronPayloadForNeuron(message->topic, message->args, message->terminal()),
+        "task_attempt_terminal_ack_valid_for_neuron");
+
+    String taskResult;
+    taskResult.assign("ok"_ctv);
+    suite.expect(
+        ProdigyIngressValidation::validateContainerPayloadForNeuron(
+            uint16_t(ContainerTopic::taskResult),
+            reinterpret_cast<uint8_t *>(taskResult.data()),
+            reinterpret_cast<uint8_t *>(taskResult.data() + taskResult.size())),
+        "task_result_valid_for_neuron");
+    Vector<uint8_t> oversizedTaskResult;
+    oversizedTaskResult.resize(prodigyTaskResultMaxBytes + 1);
+    suite.expect(
+        ProdigyIngressValidation::validateContainerPayloadForNeuron(
+            uint16_t(ContainerTopic::taskResult),
+            oversizedTaskResult.data(),
+            oversizedTaskResult.data() + oversizedTaskResult.size()) == false,
+        "task_result_oversize_rejected_for_neuron");
   }
 
   return (suite.failed == 0) ? 0 : 1;

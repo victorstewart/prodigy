@@ -426,6 +426,7 @@ add_executable(mothership ${PRODIGY_ROOT}/prodigy/mothership/mothership.cpp)
 add_executable(prodigy_mothership_tunnel_provider ${CMAKE_CURRENT_SOURCE_DIR}/tests/mothership_tunnel_provider_fixture.cpp)
 set_target_properties(prodigy_mothership_tunnel_provider PROPERTIES OUTPUT_NAME mothership-tunnel-provider)
 add_executable(prodigy_ready_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/ready_container.cpp)
+add_executable(prodigy_task_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/task_probe_container.cpp)
 add_executable(prodigy_pingpong_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
 add_executable(prodigy_pingpong_container_alt ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
 add_executable(prodigy_pingpong_container_noport ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
@@ -438,6 +439,7 @@ add_executable(prodigy_resumption_readiness_probe_container ${CMAKE_CURRENT_SOUR
 add_executable(prodigy_public_tls_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/public_tls_probe_container.cpp)
 set(
    PRODIGY_RUNTIME_CONTAINER_PROBE_TARGETS
+   prodigy_task_probe_container
    prodigy_pingpong_container
    prodigy_pingpong_container_alt
    prodigy_pingpong_container_noport
@@ -683,6 +685,7 @@ if (NOT CMAKE_EXE_LINKER_FLAGS MATCHES "sanitize")
    target_link_options(prodigy_mothership_tunnel_provider PRIVATE -static)
 endif()
 target_compile_options(prodigy_ready_container PUBLIC -O2)
+target_compile_options(prodigy_task_probe_container PUBLIC -O2)
 target_compile_options(prodigy_pingpong_container PUBLIC -O2)
 target_compile_options(prodigy_pingpong_container_alt PUBLIC -O2)
 target_compile_options(prodigy_pingpong_container_noport PUBLIC -O2)
@@ -1107,6 +1110,12 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    set_tests_properties(prodigy_dev_resumption_readiness_smoke PROPERTIES SKIP_RETURN_CODE 77)
 
    add_test(
+      NAME prodigy_dev_task_container_smoke
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_task_container_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_task_probe_container
+   )
+   set_tests_properties(prodigy_dev_task_container_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+   add_test(
       NAME prodigy_dev_deployments_matrix_smoke
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_deployments_matrix.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container ${CMAKE_BINARY_DIR}/prodigy_pingpong_container_alt ${CMAKE_BINARY_DIR}/prodigy_pingpong_container_noport ${CMAKE_BINARY_DIR}/prodigy_pingpong_container_crash --mode=smoke
    )
@@ -1205,6 +1214,7 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       prodigy_dev_quic_wormhole_smoke
       prodigy_dev_wormhole_matrix_smoke
       prodigy_dev_resumption_readiness_smoke
+      prodigy_dev_task_container_smoke
       prodigy_dev_deployments_matrix_smoke
       prodigy_dev_deployments_matrix_ci
    )
@@ -1251,6 +1261,7 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       prodigy_dev_quic_wormhole_smoke
       prodigy_dev_wormhole_matrix_smoke
       prodigy_dev_resumption_readiness_smoke
+      prodigy_dev_task_container_smoke
       prodigy_dev_deployments_matrix_smoke
       prodigy_dev_deployments_matrix_ci
       prodigy_host_egress_bpf_load_smoke

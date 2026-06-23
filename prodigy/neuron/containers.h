@@ -578,6 +578,7 @@ public:
   Vector<String> executeArgs;
   Vector<String> executeEnv;
   String executeCwd;
+  String taskResult;
   MachineCpuArchitecture executeArchitecture = MachineCpuArchitecture::unknown;
   String storageRootPath;
   String storagePayloadPath;
@@ -1565,6 +1566,15 @@ private:
   {
     if (thisNeuron)
     {
+      if (plan.config.type == ApplicationType::task && plan.taskAttemptNumber > 0)
+      {
+        TaskTermination termination = {};
+        termination.kind = TaskTerminationKind::startupFailed;
+        termination.observedAtMs = Time::now<TimeResolution::ms>();
+        termination.summary = report;
+        (void)thisNeuron->noteTaskAttemptTerminal(plan, termination);
+        return;
+      }
       thisNeuron->reportContainerFailed(plan.uuid, Time::now<TimeResolution::ms>(), 0, report, false);
     }
   }
@@ -7031,8 +7041,8 @@ public:
       int compressedPayloadFD = -1;
       String contractFailure = {};
       bool contractOK = container->isSystemContainer()
-          ? prodigyOpenMothershipTunnelProviderBlobPayloadAfterContractHeader(compressedContainerPath, compressedPayloadFD, &contractFailure)
-          : prodigyOpenContainerBlobPayloadAfterContractHeader(compressedContainerPath, compressedPayloadFD, &contractFailure);
+                            ? prodigyOpenMothershipTunnelProviderBlobPayloadAfterContractHeader(compressedContainerPath, compressedPayloadFD, &contractFailure)
+                            : prodigyOpenContainerBlobPayloadAfterContractHeader(compressedContainerPath, compressedPayloadFD, &contractFailure);
       if (contractOK == false)
       {
         basics_log("createContainer rejected container blob contract: %s\n", contractFailure.c_str());
@@ -8446,114 +8456,116 @@ public:
       int execParamsFD = -1;
       if (exposeNeuronSocket)
       {
-      ContainerParameters parameters;
-      parameters.uuid = container->plan.uuid;
-      parameters.neuronFD = execNeuronFD;
-      parameters.justCrashed = isRestart;
+        ContainerParameters parameters;
+        parameters.uuid = container->plan.uuid;
+        parameters.deploymentID = container->plan.config.deploymentID();
+        parameters.taskAttemptNumber = container->plan.taskAttemptNumber;
+        parameters.neuronFD = execNeuronFD;
+        parameters.justCrashed = isRestart;
 
-      parameters.memoryMB = container->plan.config.memoryMB;
-      parameters.storageMB = container->plan.config.storageMB;
-      parameters.nLogicalCores = uint16_t(applicationSharedCPUCoreHint(container->plan.config));
-      parameters.cpuMode = container->plan.config.cpuMode;
-      parameters.requestedCPUMillis = applicationRequestedCPUMillis(container->plan.config);
-      if (container->plan.usesIsolatedCPUs())
-      {
-        parameters.lowCPU = container->lcores[0];
-        parameters.highCPU = container->lcores[container->plan.config.nLogicalCores - 1];
-      }
-      else
-      {
-        parameters.lowCPU = -1;
-        parameters.highCPU = -1;
-      }
-
-      for (const auto& [service, advertisement] : container->plan.advertisements)
-      {
-        parameters.advertisesOnPorts[service] = advertisement.port;
-      }
-
-      parameters.subscriptionPairings = container->plan.subscriptionPairings;
-      parameters.advertisementPairings = container->plan.advertisementPairings;
-      parameters.wormholes = container->plan.wormholes;
-      parameters.whiteholes = container->plan.whiteholes;
-      parameters.statefulMeshRoles = container->plan.statefulMeshRoles;
-      parameters.statefulTopology = container->plan.statefulTopology;
-      for (const IPPrefix& address : container->plan.addresses)
-      {
-        if (address.network.is6)
+        parameters.memoryMB = container->plan.config.memoryMB;
+        parameters.storageMB = container->plan.config.storageMB;
+        parameters.nLogicalCores = uint16_t(applicationSharedCPUCoreHint(container->plan.config));
+        parameters.cpuMode = container->plan.config.cpuMode;
+        parameters.requestedCPUMillis = applicationRequestedCPUMillis(container->plan.config);
+        if (container->plan.usesIsolatedCPUs())
         {
-          parameters.private6 = address;
-          break;
+          parameters.lowCPU = container->lcores[0];
+          parameters.highCPU = container->lcores[container->plan.config.nLogicalCores - 1];
         }
-      }
-
-      prodigyBuildContainerStartupFlags(container->plan, parameters.flags);
-
-      parameters.hasCredentialBundle = container->plan.hasCredentialBundle;
-      if (parameters.hasCredentialBundle)
-      {
-        parameters.credentialBundle = container->plan.credentialBundle;
-      }
-
-      if (parameters.hasCredentialBundle || container->plan.wormholes.empty() == false || container->plan.config.applicationID == 6)
-      {
-        basics_log(
-            "startContainer params appID=%u uuid=%llu hasCredentialBundle=%u tlsIdentities=%u apiCredentials=%u wormholes=%u whiteholes=%u\n",
-            unsigned(container->plan.config.applicationID),
-            (unsigned long long)container->plan.uuid,
-            unsigned(parameters.hasCredentialBundle),
-            unsigned(parameters.credentialBundle.tlsIdentities.size()),
-            unsigned(parameters.credentialBundle.apiCredentials.size()),
-            unsigned(parameters.wormholes.size()),
-            unsigned(parameters.whiteholes.size()));
-      }
-
-      if (container->plan.useHostNetworkNamespace == false && container->plan.whiteholes.empty() == false)
-      {
-        enableWhiteholeNonlocalBind(container->plan);
-      }
-
-      bool needsFullStatefulPayload = (parameters.statefulMeshRoles.client != 0 ||
-                                       parameters.statefulMeshRoles.sibling != 0 ||
-                                       parameters.statefulMeshRoles.cousin != 0 ||
-                                       parameters.statefulMeshRoles.seeding != 0 ||
-                                       parameters.statefulMeshRoles.sharding != 0 ||
-                                       parameters.statefulMeshRoles.topologyBridge != 0 ||
-                                       parameters.statefulTopology.configured());
-
-      // ProdigyWire covers the compact stateless startup path. Wormhole and
-      // whitehole startup data plus stateful mesh and topology metadata use
-      // the full container-parameter serializer.
-      String serializedParameters;
-      if (parameters.wormholes.empty() == false || parameters.whiteholes.empty() == false || needsFullStatefulPayload)
-      {
-        BitseryEngine::serialize(serializedParameters, parameters);
-      }
-      else if (ProdigyWire::serializeContainerParameters(serializedParameters, parameters) == false)
-      {
-        failStartup("serialize compact container params failed");
-      }
-
-      int pfd = Memfd::create("container.params"_ctv);
-      if (pfd >= 0)
-      {
-        Memfd::writeAll(pfd, serializedParameters);
-        // Move the inherited params memfd above the normal low-fd range so
-        // the child can close everything else before exec without relying
-        // on a fragile fixed descriptor number.
-        execParamsFD = pfd;
-        if (moveContainerExecDescriptorAboveMinimum(execParamsFD, &execDescriptorFailure) == false)
+        else
         {
-          basics_log("startContainer failed to move inherited params fd uuid=%llu reason=%s\n",
-                     (unsigned long long)container->plan.uuid,
-                     execDescriptorFailure.c_str());
-          failStartup("move params fd failed", &execDescriptorFailure);
+          parameters.lowCPU = -1;
+          parameters.highCPU = -1;
         }
 
-        String paramsFDText = {};
-        paramsFDText.assignItoa(uint64_t(execParamsFD));
-        setenv("PRODIGY_PARAMS_FD", paramsFDText.c_str(), 1);
-      }
+        for (const auto& [service, advertisement] : container->plan.advertisements)
+        {
+          parameters.advertisesOnPorts[service] = advertisement.port;
+        }
+
+        parameters.subscriptionPairings = container->plan.subscriptionPairings;
+        parameters.advertisementPairings = container->plan.advertisementPairings;
+        parameters.wormholes = container->plan.wormholes;
+        parameters.whiteholes = container->plan.whiteholes;
+        parameters.statefulMeshRoles = container->plan.statefulMeshRoles;
+        parameters.statefulTopology = container->plan.statefulTopology;
+        for (const IPPrefix& address : container->plan.addresses)
+        {
+          if (address.network.is6)
+          {
+            parameters.private6 = address;
+            break;
+          }
+        }
+
+        prodigyBuildContainerStartupFlags(container->plan, parameters.flags);
+
+        parameters.hasCredentialBundle = container->plan.hasCredentialBundle;
+        if (parameters.hasCredentialBundle)
+        {
+          parameters.credentialBundle = container->plan.credentialBundle;
+        }
+
+        if (parameters.hasCredentialBundle || container->plan.wormholes.empty() == false || container->plan.config.applicationID == 6)
+        {
+          basics_log(
+              "startContainer params appID=%u uuid=%llu hasCredentialBundle=%u tlsIdentities=%u apiCredentials=%u wormholes=%u whiteholes=%u\n",
+              unsigned(container->plan.config.applicationID),
+              (unsigned long long)container->plan.uuid,
+              unsigned(parameters.hasCredentialBundle),
+              unsigned(parameters.credentialBundle.tlsIdentities.size()),
+              unsigned(parameters.credentialBundle.apiCredentials.size()),
+              unsigned(parameters.wormholes.size()),
+              unsigned(parameters.whiteholes.size()));
+        }
+
+        if (container->plan.useHostNetworkNamespace == false && container->plan.whiteholes.empty() == false)
+        {
+          enableWhiteholeNonlocalBind(container->plan);
+        }
+
+        bool needsFullStatefulPayload = (parameters.statefulMeshRoles.client != 0 ||
+                                         parameters.statefulMeshRoles.sibling != 0 ||
+                                         parameters.statefulMeshRoles.cousin != 0 ||
+                                         parameters.statefulMeshRoles.seeding != 0 ||
+                                         parameters.statefulMeshRoles.sharding != 0 ||
+                                         parameters.statefulMeshRoles.topologyBridge != 0 ||
+                                         parameters.statefulTopology.configured());
+
+        // ProdigyWire covers the compact stateless startup path. Wormhole and
+        // whitehole startup data plus stateful mesh and topology metadata use
+        // the full container-parameter serializer.
+        String serializedParameters;
+        if (parameters.wormholes.empty() == false || parameters.whiteholes.empty() == false || needsFullStatefulPayload)
+        {
+          BitseryEngine::serialize(serializedParameters, parameters);
+        }
+        else if (ProdigyWire::serializeContainerParameters(serializedParameters, parameters) == false)
+        {
+          failStartup("serialize compact container params failed");
+        }
+
+        int pfd = Memfd::create("container.params"_ctv);
+        if (pfd >= 0)
+        {
+          Memfd::writeAll(pfd, serializedParameters);
+          // Move the inherited params memfd above the normal low-fd range so
+          // the child can close everything else before exec without relying
+          // on a fragile fixed descriptor number.
+          execParamsFD = pfd;
+          if (moveContainerExecDescriptorAboveMinimum(execParamsFD, &execDescriptorFailure) == false)
+          {
+            basics_log("startContainer failed to move inherited params fd uuid=%llu reason=%s\n",
+                       (unsigned long long)container->plan.uuid,
+                       execDescriptorFailure.c_str());
+            failStartup("move params fd failed", &execDescriptorFailure);
+          }
+
+          String paramsFDText = {};
+          paramsFDText.assignItoa(uint64_t(execParamsFD));
+          setenv("PRODIGY_PARAMS_FD", paramsFDText.c_str(), 1);
+        }
       }
       else
       {
@@ -8882,6 +8894,18 @@ public:
 
   static void spinContainer(ContainerPlan plan, uint128_t replaceContainerUUID, const NeuronContainerMetricPolicy& metricPolicy) // copy this into here in case we suspend
   {
+    bool skipLaunch = false;
+    String taskGateFailure = {};
+    if (thisNeuron != nullptr && thisNeuron->prepareTaskAttemptLaunch(plan, skipLaunch, &taskGateFailure) == false)
+    {
+      reportSpinContainerFailure(plan, taskGateFailure);
+      co_return;
+    }
+    if (skipLaunch)
+    {
+      co_return;
+    }
+
     if (rootCgroupSeeded == false)
     {
       seed_root_cgroupv2_subtree_controllers();
@@ -8911,8 +8935,8 @@ public:
     uint64_t deploymentID = plan.config.deploymentID();
     bool systemContainer = plan.isSystemContainer();
     String compressedContainerPath = systemContainer
-        ? ContainerStore::systemPathForArtifact(plan.system.artifact.sha256)
-        : ContainerStore::pathForContainerImage(deploymentID);
+                                         ? ContainerStore::systemPathForArtifact(plan.system.artifact.sha256)
+                                         : ContainerStore::pathForContainerImage(deploymentID);
     if (systemContainer)
     {
       String systemVerificationFailure = {};
@@ -8994,6 +9018,11 @@ public:
       cleanupContainerAfterFailedCreate(container);
       reportSpinContainerFailure(plan, failureReport);
       co_return;
+    }
+
+    if (thisNeuron != nullptr)
+    {
+      thisNeuron->noteTaskAttemptRunning(plan);
     }
   }
 

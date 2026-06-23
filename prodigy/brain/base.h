@@ -515,6 +515,22 @@ public:
   {
     (void)containerUUID;
   }
+  virtual uint32_t nextTaskAttemptNumber(const DeploymentPlan& plan)
+  {
+    (void)plan;
+    return 1;
+  }
+  virtual void noteTaskAttemptAssigned(const DeploymentPlan& plan, const ContainerView& container)
+  {
+    (void)plan;
+    (void)container;
+  }
+  virtual void noteTaskAttemptTerminal(ApplicationDeployment *deployment, ContainerView *container, const TaskTermination& termination)
+  {
+    (void)deployment;
+    (void)container;
+    (void)termination;
+  }
   virtual void applyCredentialsToContainerPlan(const DeploymentPlan& deploymentPlan, const ContainerView& container, ContainerPlan& plan)
   {
     (void)deploymentPlan;

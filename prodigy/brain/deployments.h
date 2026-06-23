@@ -3155,10 +3155,12 @@ private:
 
   void setDeploymentRunning(void)
   {
-    bool rollingBack = (state == DeploymentState::decommissioning);
-
     state = DeploymentState::running;
     stateChangedAtMs = Time::now<TimeResolution::ms>();
+    if (plan.config.type == ApplicationType::task)
+    {
+      return;
+    }
     autoscaleTimer.setTimeoutSeconds(configuredAutoscalePeriodSeconds());
     autoscaleTimer.dispatcher = this;
     autoscaleTimer.flags = uint64_t(DeploymentTimeoutFlags::autoscale);
@@ -3829,6 +3831,10 @@ private:
     container->lifetime = lifetime;
     container->machine = machine;
     container->isStateful = plan.isStateful;
+    if (plan.config.type == ApplicationType::task)
+    {
+      container->taskAttemptNumber = thisBrain->nextTaskAttemptNumber(plan);
+    }
     container->assignedGPUMemoryMBs = std::move(assignedGPUMemoryMBs);
     container->assignedGPUDevices = std::move(assignedGPUDevices);
 
@@ -6106,6 +6112,10 @@ public:
     {
       return;
     }
+    if (plan.config.type == ApplicationType::task)
+    {
+      return;
+    }
 
     bool activeLocalTransition = (state == DeploymentState::deploying || state == DeploymentState::canaries || waitingOnCompactions || waitingOnContainers.size() > 0 || schedulingStack.execution != nullptr || canaryStack != nullptr);
     if (nSuspended > 0)
@@ -7954,6 +7964,45 @@ public:
     delete container;
   }
 
+  void taskAttemptContainerDone(ContainerView *container)
+  {
+    if (container == nullptr)
+    {
+      return;
+    }
+
+    switch (container->lifetime)
+    {
+      case ApplicationLifetime::canary:
+        {
+          if (nDeployedCanary > 0)
+          {
+            nDeployedCanary -= 1;
+          }
+          break;
+        }
+      case ApplicationLifetime::base:
+        {
+          if (nDeployedBase > 0)
+          {
+            nDeployedBase -= 1;
+          }
+          break;
+        }
+      case ApplicationLifetime::surge:
+        {
+          if (nDeployedSurge > 0)
+          {
+            nDeployedSurge -= 1;
+          }
+          break;
+        }
+    }
+
+    destructContainer(container);
+    containerDestroyed(container);
+  }
+
   void failCanaries(void)
   {
     markCanariesFailed();
@@ -8433,7 +8482,14 @@ public:
               thisBrain->sendNeuronOpenSwitchboardWhiteholes(container, container->whiteholes);
             }
 
-            waitingOnContainers.insert_or_assign(container, ContainerState::healthy);
+            if (plan.config.type == ApplicationType::task)
+            {
+              thisBrain->noteTaskAttemptAssigned(plan, *container);
+            }
+            else
+            {
+              waitingOnContainers.insert_or_assign(container, ContainerState::healthy);
+            }
             container->plannedWork = nullptr;
             if (replacingContainer)
             {
@@ -8615,9 +8671,15 @@ public:
 
     if (state == DeploymentState::deploying)
     {
-      thisBrain->pushSpinApplicationProgressToMothership(this, "all containers are deployed and healthy"_ctv);
-      thisBrain->spinApplicationFin(this);
-
+      if (plan.config.type == ApplicationType::task)
+      {
+        thisBrain->pushSpinApplicationProgressToMothership(this, "task attempt dispatched"_ctv);
+      }
+      else
+      {
+        thisBrain->pushSpinApplicationProgressToMothership(this, "all containers are deployed and healthy"_ctv);
+        thisBrain->spinApplicationFin(this);
+      }
       setDeploymentRunning();
     }
 

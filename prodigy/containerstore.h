@@ -447,6 +447,11 @@ public:
 
   static inline bool autoDestroy; // false if brain, else true
 
+  static bool atomicWriteRuntimeFile(const String& finalPath, const String& payload, String *failureReport = nullptr)
+  {
+    return atomicWriteFile(finalPath, payload, failureReport);
+  }
+
   static String pathForContainerImage(uint64_t deploymentID)
   {
     return pathForContainerImageWithinRoot("/containers/store"_ctv, deploymentID);

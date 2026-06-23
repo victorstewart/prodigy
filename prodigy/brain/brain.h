@@ -4465,6 +4465,35 @@ public:
     }
   }
 
+  bool pruneExpiredTaskExecutionRecords(int64_t nowMs)
+  {
+    if (weAreMaster == false)
+    {
+      return false;
+    }
+
+    bool changed = false;
+    for (auto it = masterAuthorityRuntimeState.taskExecutions.begin(); it != masterAuthorityRuntimeState.taskExecutions.end();)
+    {
+      if (it->second.expired(nowMs))
+      {
+        it = masterAuthorityRuntimeState.taskExecutions.erase(it);
+        changed = true;
+      }
+      else
+      {
+        ++it;
+      }
+    }
+
+    if (changed)
+    {
+      noteMasterAuthorityRuntimeStateChanged();
+    }
+
+    return changed;
+  }
+
   void captureAuthoritativeDeploymentPlans(bytell_hash_map<uint64_t, DeploymentPlan>& plans) const
   {
     plans = deploymentPlans;
@@ -4796,6 +4825,7 @@ public:
     }
     container->machine = machine;
     container->createdAtMs = plan.createdAtMs;
+    container->taskAttemptNumber = plan.taskAttemptNumber;
     container->runtime_nLogicalCores = static_cast<uint16_t>(applicationSharedCPUCoreHint(plan.config));
     container->runtime_memoryMB = plan.config.totalMemoryMB();
     container->runtime_storageMB = plan.config.totalStorageMB();
@@ -5392,6 +5422,62 @@ public:
     (void)plan;
     failure.clear();
     return true;
+  }
+
+  static bool validateTaskDeploymentPlan(const DeploymentPlan& plan, String& failure)
+  {
+    failure.clear();
+    if (plan.config.type != ApplicationType::task)
+    {
+      return true;
+    }
+
+    if (plan.config.taskExecutionPolicy != TaskExecutionPolicy::runOnce && plan.config.taskExecutionPolicy != TaskExecutionPolicy::untilSucceeded)
+    {
+      failure.assign("invalid plan: taskExecutionPolicy must be runOnce or untilSucceeded"_ctv);
+      return false;
+    }
+    if (plan.isStateful)
+    {
+      failure.assign("invalid plan: task deployments cannot be stateful"_ctv);
+      return false;
+    }
+    if (plan.stateless.nBase != 1)
+    {
+      failure.assign("invalid plan: task deployments require the normalized implicit single attempt"_ctv);
+      return false;
+    }
+    if (plan.canaryCount > 0 || plan.canariesMustLiveForMinutes > 0)
+    {
+      failure.assign("invalid plan: task deployments cannot configure canaries"_ctv);
+      return false;
+    }
+    if (plan.horizontalScalers.empty() == false || plan.verticalScalers.empty() == false)
+    {
+      failure.assign("invalid plan: task deployments cannot configure scalers"_ctv);
+      return false;
+    }
+    if (plan.wormholes.empty() == false || plan.publicTLS.empty() == false || plan.advertisements.empty() == false)
+    {
+      failure.assign("invalid plan: task deployments cannot publish inbound services"_ctv);
+      return false;
+    }
+
+    return true;
+  }
+
+  static bool computeTaskExecutionFingerprint(const DeploymentPlan& plan, String& fingerprint, String *failure = nullptr)
+  {
+    fingerprint.clear();
+    if (failure)
+    {
+      failure->clear();
+    }
+
+    DeploymentPlan normalized = plan;
+    String payload = {};
+    BitseryEngine::serialize(payload, normalized);
+    return prodigyComputeSHA256Hex(payload, fingerprint, failure);
   }
 
   static bool containsCredentialName(const Vector<String>& names, const String& target)
@@ -15670,7 +15756,9 @@ public:
           checkForSpotTerminations();
           refreshAllDeploymentWormholeQuicCidState(true);
           (void)advanceAllDeploymentTlsResumptionLifecycles(true);
-          (void)advanceCertificateLifecycles(Time::now<TimeResolution::ms>());
+          const int64_t nowMs = Time::now<TimeResolution::ms>();
+          (void)advanceCertificateLifecycles(nowMs);
+          (void)pruneExpiredTaskExecutionRecords(nowMs);
           spotDecomissionChecker.setTimeoutMs(prodigyBrainSpotDecommissionCheckIntervalMs);
           Ring::queueTimeout(&spotDecomissionChecker);
           break;
@@ -19670,6 +19758,14 @@ public:
 
     ApplicationDeployment *previous = nullptr;
 
+    if (deployment->plan.config.type == ApplicationType::task)
+    {
+      deployments.insert_or_assign(deployment->plan.config.deploymentID(), deployment);
+      deployment->deploy();
+      persistLocalRuntimeState();
+      return;
+    }
+
     if (auto it = deploymentsByApp.find(deployment->plan.config.applicationID); it != deploymentsByApp.end())
     {
       previous = it->second;
@@ -19847,15 +19943,125 @@ public:
     clearSpinApplicationMothership(deployment);
   }
 
+  uint32_t nextTaskAttemptNumber(const DeploymentPlan& plan) override
+  {
+    if (auto it = masterAuthorityRuntimeState.taskExecutions.find(plan.config.deploymentID()); it != masterAuthorityRuntimeState.taskExecutions.end())
+    {
+      return it->second.currentAttemptNumber + 1;
+    }
+
+    return 1;
+  }
+
+  void noteTaskAttemptAssigned(const DeploymentPlan& plan, const ContainerView& container) override
+  {
+    auto it = masterAuthorityRuntimeState.taskExecutions.find(plan.config.deploymentID());
+    if (it == masterAuthorityRuntimeState.taskExecutions.end())
+    {
+      return;
+    }
+
+    TaskExecutionRecord& record = it->second;
+    const int64_t nowMs = Time::now<TimeResolution::ms>();
+    String ignored = {};
+    if (taskExecutionTransition(record, TaskExecutionState::assigned, nowMs, &ignored) == false)
+    {
+      return;
+    }
+    (void)taskExecutionTransition(record, TaskExecutionState::running, nowMs, &ignored);
+    record.currentAttemptNumber = container.taskAttemptNumber;
+    record.attemptsStarted += 1;
+    noteMasterAuthorityRuntimeStateChanged();
+  }
+
+  void noteTaskAttemptTerminal(ApplicationDeployment *deployment, ContainerView *container, const TaskTermination& termination) override
+  {
+    if (deployment == nullptr || container == nullptr)
+    {
+      return;
+    }
+
+    auto recordIt = masterAuthorityRuntimeState.taskExecutions.find(deployment->plan.config.deploymentID());
+    if (recordIt == masterAuthorityRuntimeState.taskExecutions.end())
+    {
+      return;
+    }
+
+    const int64_t nowMs = Time::now<TimeResolution::ms>();
+    TaskAttemptRecord attempt = {};
+    attempt.attemptNumber = container->taskAttemptNumber;
+    attempt.containerUUID = container->uuid;
+    attempt.machinePrivate4 = container->machine ? container->machine->private4 : 0;
+    attempt.state = termination.succeeded() ? TaskExecutionState::succeeded : (termination.kind == TaskTerminationKind::cancelled ? TaskExecutionState::cancelled : (termination.kind == TaskTerminationKind::lost ? TaskExecutionState::lost : TaskExecutionState::failed));
+    attempt.acceptedAtMs = container->createdAtMs;
+    attempt.assignedAtMs = container->createdAtMs;
+    attempt.startedAtMs = container->createdAtMs;
+    attempt.completedAtMs = nowMs;
+    attempt.termination = termination;
+    attempt.noRelaunchTombstone = true;
+
+    String transitionFailure = {};
+    if (taskExecutionCommitAttempt(recordIt->second, attempt, nowMs, &transitionFailure) == false)
+    {
+      basics_log("task terminal commit rejected deploymentID=%llu attempt=%u reason=%s\n",
+                 (unsigned long long)deployment->plan.config.deploymentID(),
+                 unsigned(attempt.attemptNumber),
+                 transitionFailure.c_str());
+      return;
+    }
+
+    if (container->machine)
+    {
+      container->machine->queueSend(NeuronTopic::taskAttemptTerminalAck, deployment->plan.config.deploymentID(), container->taskAttemptNumber);
+    }
+    deployment->taskAttemptContainerDone(container);
+    noteMasterAuthorityRuntimeStateChanged();
+
+    if (recordIt->second.state == TaskExecutionState::retrying)
+    {
+      pushSpinApplicationProgressToMothership(deployment, "task attempt failed; retrying"_ctv);
+      deployment->state = DeploymentState::deploying;
+      deployment->stateChangedAtMs = nowMs;
+      deployment->architect(nullptr, false, false, false);
+      deployment->schedule(nullptr);
+      return;
+    }
+
+    spinApplicationFin(deployment);
+    const uint64_t deploymentID = deployment->plan.config.deploymentID();
+    releaseRoutableResourceLeasesForDeployment(deploymentID);
+    ContainerStore::destroy(deploymentID);
+    deploymentPlans.erase(deploymentID);
+    deployments.erase(deploymentID);
+    delete deployment;
+    persistLocalRuntimeState();
+  }
+
   void spinApplicationFin(ApplicationDeployment *deployment) override
   {
     Mothership *stream = spinApplicationMothershipFor(deployment);
     if (stream != nullptr)
     {
-      Message::construct(
-          stream->wBuffer,
-          MothershipTopic::spinApplication,
-          uint8_t(SpinApplicationResponseCode::finished));
+      if (deployment != nullptr && deployment->plan.config.type == ApplicationType::task)
+      {
+        String serializedRecord = {};
+        if (auto it = masterAuthorityRuntimeState.taskExecutions.find(deployment->plan.config.deploymentID()); it != masterAuthorityRuntimeState.taskExecutions.end())
+        {
+          BitseryEngine::serialize(serializedRecord, it->second);
+        }
+        Message::construct(
+            stream->wBuffer,
+            MothershipTopic::spinApplication,
+            uint8_t(SpinApplicationResponseCode::finished),
+            serializedRecord);
+      }
+      else
+      {
+        Message::construct(
+            stream->wBuffer,
+            MothershipTopic::spinApplication,
+            uint8_t(SpinApplicationResponseCode::finished));
+      }
       (void)flushActiveMothershipSendBuffer(stream, "spin-application-fin");
     }
 
@@ -22754,6 +22960,32 @@ public:
           break;
           ;
         }
+      case MothershipTopic::pullTaskReport:
+        {
+          uint64_t deploymentID = 0;
+          Message::extractArg<ArgumentNature::fixed>(args, deploymentID);
+
+          bool found = false;
+          String serializedRecord = {};
+          const int64_t nowMs = Time::now<TimeResolution::ms>();
+          auto recordIt = masterAuthorityRuntimeState.taskExecutions.find(deploymentID);
+          if (recordIt != masterAuthorityRuntimeState.taskExecutions.end())
+          {
+            if (recordIt->second.expired(nowMs))
+            {
+              masterAuthorityRuntimeState.taskExecutions.erase(recordIt);
+              noteMasterAuthorityRuntimeStateChanged();
+            }
+            else
+            {
+              found = true;
+              BitseryEngine::serialize(serializedRecord, recordIt->second);
+            }
+          }
+
+          Message::construct(mothership->wBuffer, MothershipTopic::pullTaskReport, found, serializedRecord);
+          break;
+        }
       case MothershipTopic::updateProdigy:
         {
           // bundleBlob{4}
@@ -23558,6 +23790,12 @@ public:
             rejectInvalidPlan(identityFailure);
             return;
           }
+          String taskPlanFailure = {};
+          if (validateTaskDeploymentPlan(deployment->plan, taskPlanFailure) == false)
+          {
+            rejectInvalidPlan(taskPlanFailure);
+            return;
+          }
 
           if (deployment->plan.isStateful && deployment->plan.canaryCount > 0)
           {
@@ -23779,15 +24017,83 @@ public:
           Message::extractToStringView(args, containerBlob);
 
           String trustedContainerBlobSHA256 = {};
-          uint64_t trustedContainerBlobBytes = 0;
+          uint64_t trustedContainerBlobBytes = containerBlob.size();
+          String digestFailure = {};
+          if (prodigyComputeSHA256Hex(containerBlob, trustedContainerBlobSHA256, &digestFailure) == false)
+          {
+            rejectInvalidPlanFailure(digestFailure, "container blob sha256 computation failed without detail"_ctv);
+            return;
+          }
+
+          String taskFingerprint = {};
+          if (deployment->plan.config.type == ApplicationType::task)
+          {
+            DeploymentPlan fingerprintPlan = deployment->plan;
+            fingerprintPlan.config.containerBlobSHA256 = trustedContainerBlobSHA256;
+            fingerprintPlan.config.containerBlobBytes = trustedContainerBlobBytes;
+            String fingerprintFailure = {};
+            if (computeTaskExecutionFingerprint(fingerprintPlan, taskFingerprint, &fingerprintFailure) == false)
+            {
+              rejectInvalidPlanFailure(fingerprintFailure, "task fingerprint computation failed without detail"_ctv);
+              return;
+            }
+
+            const uint64_t executionID = fingerprintPlan.config.deploymentID();
+            const int64_t nowMs = Time::now<TimeResolution::ms>();
+            auto existingTaskIt = masterAuthorityRuntimeState.taskExecutions.find(executionID);
+            if (existingTaskIt != masterAuthorityRuntimeState.taskExecutions.end() && existingTaskIt->second.expired(nowMs))
+            {
+              masterAuthorityRuntimeState.taskExecutions.erase(existingTaskIt);
+              noteMasterAuthorityRuntimeStateChanged();
+              existingTaskIt = masterAuthorityRuntimeState.taskExecutions.end();
+            }
+            if (existingTaskIt != masterAuthorityRuntimeState.taskExecutions.end())
+            {
+              TaskExecutionRecord& existing = existingTaskIt->second;
+              if (existing.fingerprint != taskFingerprint)
+              {
+                rejectInvalidPlan("invalid plan: task deploymentID already exists with a different immutable task specification"_ctv);
+                return;
+              }
+
+              Mothership *stream = mothership;
+              Message::construct(stream->wBuffer, MothershipTopic::spinApplication, uint8_t(SpinApplicationResponseCode::okay));
+              if (existing.terminal())
+              {
+                String serializedRecord = {};
+                BitseryEngine::serialize(serializedRecord, existing);
+                Message::construct(stream->wBuffer, MothershipTopic::spinApplication, uint8_t(SpinApplicationResponseCode::finished), serializedRecord);
+              }
+              else if (auto liveIt = deployments.find(executionID); liveIt != deployments.end() && liveIt->second != nullptr)
+              {
+                bindSpinApplicationMothership(liveIt->second, stream);
+                String progress = {};
+                progress.snprintf<"attached to existing task execution state={} attempt={}"_ctv>(String(prodigyTaskExecutionStateName(existing.state)), existing.currentAttemptNumber);
+                pushSpinApplicationProgressToMothership(liveIt->second, progress);
+              }
+              else
+              {
+                String progress = {};
+                progress.snprintf<"attached to existing task execution state={} attempt={}"_ctv>(String(prodigyTaskExecutionStateName(existing.state)), existing.currentAttemptNumber);
+                Message::construct(stream->wBuffer, MothershipTopic::spinApplication, uint8_t(SpinApplicationResponseCode::progress), progress);
+              }
+              delete deployment;
+              return;
+            }
+
+            deployment->plan = std::move(fingerprintPlan);
+          }
+
+          String expectedContainerBlobSHA256 = trustedContainerBlobSHA256;
+          uint64_t expectedContainerBlobBytes = trustedContainerBlobBytes;
           String containerStoreFailure = {};
           if (ContainerStore::store(
                   deployment->plan.config.deploymentID(),
                   containerBlob,
                   &trustedContainerBlobSHA256,
                   &trustedContainerBlobBytes,
-                  nullptr,
-                  nullptr,
+                  &expectedContainerBlobSHA256,
+                  &expectedContainerBlobBytes,
                   &containerStoreFailure) == false)
           {
             String reason = {};
@@ -23806,6 +24112,20 @@ public:
 
           deployment->plan.config.containerBlobSHA256 = trustedContainerBlobSHA256;
           deployment->plan.config.containerBlobBytes = trustedContainerBlobBytes;
+          if (deployment->plan.config.type == ApplicationType::task)
+          {
+            TaskExecutionRecord record = {};
+            record.executionID = deployment->plan.config.deploymentID();
+            record.applicationID = deployment->plan.config.applicationID;
+            record.versionID = deployment->plan.config.versionID;
+            record.policy = deployment->plan.config.taskExecutionPolicy;
+            record.state = TaskExecutionState::accepted;
+            record.fingerprint = taskFingerprint;
+            record.acceptedAtMs = Time::now<TimeResolution::ms>();
+            record.updatedAtMs = record.acceptedAtMs;
+            masterAuthorityRuntimeState.taskExecutions.insert_or_assign(record.executionID, record);
+            noteMasterAuthorityRuntimeStateChanged();
+          }
           if (reserveDeploymentWormholeAddressLeases(deployment->plan, wormholeLeaseFailure, true) == false)
           {
             rejectInvalidPlanFailure(wormholeLeaseFailure, "wormhole lease commit failed without detail"_ctv);
@@ -24166,6 +24486,7 @@ public:
             }
             container->machine = neuron->machine;
             container->createdAtMs = plan.createdAtMs;
+            container->taskAttemptNumber = plan.taskAttemptNumber;
             // Neuron state upload currently transmits the serialized container plan.
             // Seed runtime usage from plan resources; live stats update these later.
             container->runtime_nLogicalCores = static_cast<uint16_t>(applicationSharedCPUCoreHint(plan.config));
@@ -24577,6 +24898,46 @@ public:
                          machine ? unsigned(machine->private4) : 0u);
             std::fflush(stderr);
           }
+          break;
+        }
+      case NeuronTopic::taskAttemptTerminal:
+        {
+          uint64_t deploymentID = 0;
+          uint32_t attemptNumber = 0;
+          uint128_t containerUUID = 0;
+          Message::extractArg<ArgumentNature::fixed>(args, deploymentID);
+          Message::extractArg<ArgumentNature::fixed>(args, attemptNumber);
+          Message::extractArg<ArgumentNature::fixed>(args, containerUUID);
+          String serialized = {};
+          Message::extractToStringView(args, serialized);
+          TaskTermination termination = {};
+          if (BitseryEngine::deserializeSafe(serialized, termination) == false)
+          {
+            break;
+          }
+
+          auto containerIt = containers.find(containerUUID);
+          if (containerIt == containers.end() || containerIt->second == nullptr)
+          {
+            auto recordIt = masterAuthorityRuntimeState.taskExecutions.find(deploymentID);
+            if (neuron->machine &&
+                recordIt != masterAuthorityRuntimeState.taskExecutions.end() &&
+                (recordIt->second.terminal() || recordIt->second.currentAttemptNumber > attemptNumber))
+            {
+              neuron->machine->queueSend(NeuronTopic::taskAttemptTerminalAck, deploymentID, attemptNumber);
+            }
+            break;
+          }
+          ContainerView *container = containerIt->second;
+          if (container->deploymentID != deploymentID || container->taskAttemptNumber != attemptNumber || container->uuid != containerUUID)
+          {
+            break;
+          }
+          if (auto deploymentIt = deployments.find(container->deploymentID); deploymentIt != deployments.end() && deploymentIt->second != nullptr && deploymentIt->second->plan.config.type == ApplicationType::task)
+          {
+            noteTaskAttemptTerminal(deploymentIt->second, container, termination);
+          }
+
           break;
         }
       case NeuronTopic::containerFailed:

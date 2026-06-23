@@ -42,7 +42,8 @@ enum class MothershipTopic : uint16_t {
   presentACMEDNS01Challenge,
   cleanupACMEDNS01Challenge,
   importACMELineage,
-  configureMothershipTunnelProvider
+  configureMothershipTunnelProvider,
+  pullTaskReport
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -105,6 +106,8 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "importACMELineage";
     case MothershipTopic::configureMothershipTunnelProvider:
       return "configureMothershipTunnelProvider";
+    case MothershipTopic::pullTaskReport:
+      return "pullTaskReport";
   }
 
   return "unknown";
@@ -172,7 +175,9 @@ enum class NeuronTopic : uint16_t {
   openSwitchboardWormholes,
   closeSwitchboardWormholesToContainer,
   openSwitchboardWhiteholes,
-  closeSwitchboardWhiteholesToContainer
+  closeSwitchboardWhiteholesToContainer,
+  taskAttemptTerminal,
+  taskAttemptTerminalAck
 };
 
 enum class ContainerTopic : uint16_t {
@@ -191,6 +196,7 @@ enum class ContainerTopic : uint16_t {
   credentialsRefresh,
   wormholesRefresh,
   runtimeReady,
+  taskResult,
 };
 
 enum class PulseTopic : uint16_t {
@@ -207,7 +213,42 @@ enum class PulseTopic : uint16_t {
 enum class ApplicationType : uint64_t {
   stateless = 0,
   stateful,
-  tunnel
+  tunnel,
+  task
+};
+
+enum class TaskExecutionPolicy : uint8_t {
+  runOnce = 0,
+  untilSucceeded
+};
+
+enum class TaskExecutionState : uint8_t {
+  accepted = 0,
+  assigned,
+  running,
+  retrying,
+  succeeded,
+  failed,
+  cancelled,
+  lost
+};
+
+enum class TaskAttemptJournalState : uint8_t {
+  accepted = 0,
+  running,
+  terminal,
+  acknowledged
+};
+
+enum class TaskTerminationKind : uint8_t {
+  none = 0,
+  exited,
+  signaled,
+  oomKilled,
+  startupFailed,
+  placementFailed,
+  cancelled,
+  lost
 };
 
 enum class MachineLifetime : uint8_t {

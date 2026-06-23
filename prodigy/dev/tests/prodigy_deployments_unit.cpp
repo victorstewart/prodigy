@@ -541,6 +541,31 @@ static bool armNeuronControlStream(Machine& machine, ScopedSocketPair& sockets)
   return machine.neuron.connected;
 }
 
+static bool seedSchedulableMachine(TestBrain& brain, Rack& rack, Machine& machine, uint128_t uuid, uint32_t private4, const String& slug, ScopedSocketPair& sockets)
+{
+  machine.uuid = uuid;
+  machine.private4 = private4;
+  machine.slug = slug;
+  machine.rack = &rack;
+  machine.state = MachineState::healthy;
+  machine.lifetime = MachineLifetime::owned;
+  machine.isBrain = true;
+  machine.hardware.inventoryComplete = true;
+  machine.hardware.cpu.architecture = nametagCurrentBuildMachineArchitecture();
+  machine.hardware.cpu.logicalCores = machine.ownedLogicalCores = machine.totalLogicalCores = machine.nLogicalCores_available = 8;
+  machine.hardware.memory.totalMB = machine.ownedMemoryMB = machine.totalMemoryMB = machine.memoryMB_available = 8192;
+  machine.ownedStorageMB = machine.totalStorageMB = machine.storageMB_available = 4096;
+  machine.neuron.machine = &machine;
+  machine.neuron.fd = -1;
+  machine.neuron.isFixedFile = true;
+  machine.neuron.fslot = sockets.adoptLeftIntoFixedFileSlot();
+  machine.neuron.connected = machine.neuron.fslot >= 0;
+  machine.runtimeReady = machine.neuron.connected;
+  rack.machines.insert(&machine);
+  brain.machines.insert(&machine);
+  return machine.neuron.connected;
+}
+
 int main(void)
 {
   TestSuite suite;
@@ -1613,10 +1638,10 @@ int main(void)
       if (systemStoreRoot.path.size() > 0)
       {
         bool stored = ContainerStore::systemStore(tunnelDigest,
-            tunnelPayload.size(),
-            tunnelPayload,
-            &verificationFailure,
-            &systemStoreRoot.path);
+                                                  tunnelPayload.size(),
+                                                  tunnelPayload,
+                                                  &verificationFailure,
+                                                  &systemStoreRoot.path);
         suite.expect(stored, "system_container_store_stores_tunnel_provider_blob");
         suite.expect(
             ContainerStore::systemVerify(tunnelDigest, tunnelPayload.size(), nullptr, nullptr, &verificationFailure, &systemStoreRoot.path),
@@ -4520,6 +4545,54 @@ int main(void)
     brain.racks.erase(rackA.uuid);
     brain.racks.erase(rackB.uuid);
     brain.racks.erase(rackC.uuid);
+    thisBrain = savedBrain;
+  }
+
+  {
+    ScopedFreshRing ring;
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+
+    Rack rack = {};
+    rack.uuid = 19'601'101;
+    brain.racks.insert_or_assign(rack.uuid, &rack);
+
+    ScopedSocketPair socket = {};
+    Machine machine = {};
+    bool machineReady =
+        socket.create(suite, "deploy_task_single_attempt_creates_socketpair") &&
+        seedSchedulableMachine(brain, rack, machine, uint128_t(0x19601101), 0x0a000118, "deploy-task"_ctv, socket);
+    suite.expect(machineReady, "deploy_task_single_attempt_seeds_machine");
+
+    ApplicationDeployment deployment;
+    seedCommonPlan(deployment, false);
+    deployment.plan.config.type = ApplicationType::task;
+    deployment.plan.config.taskExecutionPolicy = TaskExecutionPolicy::untilSucceeded;
+    deployment.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+    deployment.plan.stateless.nBase = 1;
+    brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+
+    if (machineReady)
+    {
+      deployment.deploy();
+      ContainerView *container = deployment.containers.size() == 1 ? *deployment.containers.begin() : nullptr;
+      ContainerPlan plan = container ? container->generatePlan(deployment.plan) : ContainerPlan {};
+
+      suite.expect(deployment.state == DeploymentState::running, "deploy_task_single_attempt_runs_after_dispatch");
+      suite.expect(deployment.waitingOnContainers.empty(), "deploy_task_single_attempt_skips_health_waiter");
+      suite.expect(deployment.schedulingStack.execution == nullptr, "deploy_task_single_attempt_does_not_suspend_scheduler");
+      suite.expect(machine.neuron.pendingSend && machine.neuron.wBuffer.size() > 0, "deploy_task_single_attempt_queues_neuron_spin");
+      suite.expect(container && container->taskAttemptNumber == 1, "deploy_task_single_attempt_numbers_attempt");
+      suite.expect(plan.restartOnFailure == false && plan.taskAttemptNumber == 1, "deploy_task_single_attempt_plan_disables_local_restart");
+      suite.expect(brain.progressCount >= 1 && brain.lastProgressMessage.equal("task attempt dispatched"_ctv), "deploy_task_single_attempt_reports_dispatch");
+      suite.expect(brain.finCount == 0 && brain.failureCount == 0, "deploy_task_single_attempt_waits_for_terminal_report");
+    }
+
+    brain.deployments.erase(deployment.plan.config.deploymentID());
+    brain.machines.erase(&machine);
+    brain.racks.erase(rack.uuid);
+    rack.machines.erase(&machine);
     thisBrain = savedBrain;
   }
 

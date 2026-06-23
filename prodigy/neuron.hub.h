@@ -440,6 +440,15 @@ public:
     signalRuntimeReady();
   }
 
+  bool publishTaskResult(const String& result)
+  {
+    if (result.size() > prodigyTaskResultMaxBytes)
+    {
+      return false;
+    }
+    return queuePackedFrame(ContainerTopic::taskResult, result);
+  }
+
   void pushStatisticsToNeuron(void)
   {
     String payload;
@@ -700,6 +709,11 @@ public:
       case ContainerTopic::statistics:
         {
           // statistics is a container->neuron path and should not arrive from neuron.
+          break;
+        }
+      case ContainerTopic::taskResult:
+        {
+          // taskResult is a container->neuron path and should not arrive from neuron.
           break;
         }
       case ContainerTopic::resourceDeltaAck:

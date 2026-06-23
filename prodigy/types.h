@@ -69,11 +69,16 @@ static inline const char *tunnelProviderPhaseName(TunnelProviderPhase phase)
 {
   switch (phase)
   {
-    case TunnelProviderPhase::disabled: return "disabled";
-    case TunnelProviderPhase::awaitingMaterial: return "awaitingMaterial";
-    case TunnelProviderPhase::awaitingSession: return "awaitingSession";
-    case TunnelProviderPhase::healthy: return "healthy";
-    case TunnelProviderPhase::backoff: return "backoff";
+    case TunnelProviderPhase::disabled:
+      return "disabled";
+    case TunnelProviderPhase::awaitingMaterial:
+      return "awaitingMaterial";
+    case TunnelProviderPhase::awaitingSession:
+      return "awaitingSession";
+    case TunnelProviderPhase::healthy:
+      return "healthy";
+    case TunnelProviderPhase::backoff:
+      return "backoff";
   }
   return "unknown";
 }
@@ -210,7 +215,10 @@ struct SystemContainerRuntimePlan {
   SystemContainerArtifactRef artifact;
   SystemContainerEgressPolicy egress;
 
-  bool configured(void) const { return kind != SystemContainerKind::none; }
+  bool configured(void) const
+  {
+    return kind != SystemContainerKind::none;
+  }
 };
 
 template <typename S>
@@ -2965,6 +2973,7 @@ class ApplicationConfig : public ApplicationConfigBase {
 public:
 
   ApplicationType type;
+  TaskExecutionPolicy taskExecutionPolicy = TaskExecutionPolicy::runOnce;
 
   bytell_hash_set<int> capabilities;
 
@@ -3104,6 +3113,428 @@ static void serialize(S&& serializer, ApplicationConfig& config)
   serializer.value4b(config.minInternetDownloadMbps);
   serializer.value4b(config.minInternetUploadMbps);
   serializer.value4b(config.maxInternetLatencyMs);
+  serializer.value1b(config.taskExecutionPolicy);
+}
+
+constexpr static int64_t prodigyTaskExecutionRecordRetentionMs = 24LL * 60LL * 60LL * 1000LL;
+constexpr static uint32_t prodigyTaskResultMaxBytes = 64u * 1024u;
+
+constexpr static const char *prodigyTaskExecutionPolicyName(TaskExecutionPolicy policy)
+{
+  switch (policy)
+  {
+    case TaskExecutionPolicy::runOnce:
+      return "runOnce";
+    case TaskExecutionPolicy::untilSucceeded:
+      return "untilSucceeded";
+  }
+
+  return "unknown";
+}
+
+constexpr static const char *prodigyTaskExecutionStateName(TaskExecutionState state)
+{
+  switch (state)
+  {
+    case TaskExecutionState::accepted:
+      return "accepted";
+    case TaskExecutionState::assigned:
+      return "assigned";
+    case TaskExecutionState::running:
+      return "running";
+    case TaskExecutionState::retrying:
+      return "retrying";
+    case TaskExecutionState::succeeded:
+      return "succeeded";
+    case TaskExecutionState::failed:
+      return "failed";
+    case TaskExecutionState::cancelled:
+      return "cancelled";
+    case TaskExecutionState::lost:
+      return "lost";
+  }
+
+  return "unknown";
+}
+
+constexpr static const char *prodigyTaskTerminationKindName(TaskTerminationKind kind)
+{
+  switch (kind)
+  {
+    case TaskTerminationKind::none:
+      return "none";
+    case TaskTerminationKind::exited:
+      return "exited";
+    case TaskTerminationKind::signaled:
+      return "signaled";
+    case TaskTerminationKind::oomKilled:
+      return "oomKilled";
+    case TaskTerminationKind::startupFailed:
+      return "startupFailed";
+    case TaskTerminationKind::placementFailed:
+      return "placementFailed";
+    case TaskTerminationKind::cancelled:
+      return "cancelled";
+    case TaskTerminationKind::lost:
+      return "lost";
+  }
+
+  return "unknown";
+}
+
+constexpr static const char *prodigyTaskAttemptJournalStateName(TaskAttemptJournalState state)
+{
+  switch (state)
+  {
+    case TaskAttemptJournalState::accepted:
+      return "accepted";
+    case TaskAttemptJournalState::running:
+      return "running";
+    case TaskAttemptJournalState::terminal:
+      return "terminal";
+    case TaskAttemptJournalState::acknowledged:
+      return "acknowledged";
+  }
+
+  return "unknown";
+}
+
+constexpr static bool taskExecutionTerminal(TaskExecutionState state)
+{
+  return state == TaskExecutionState::succeeded || state == TaskExecutionState::failed || state == TaskExecutionState::cancelled || state == TaskExecutionState::lost;
+}
+
+constexpr static bool taskTerminationSucceeded(TaskTerminationKind kind, int32_t exitCode)
+{
+  return kind == TaskTerminationKind::exited && exitCode == 0;
+}
+
+class TaskTermination {
+public:
+
+  TaskTerminationKind kind = TaskTerminationKind::none;
+  int32_t exitCode = 0;
+  int32_t signal = 0;
+  bool oomKilled = false;
+  int64_t observedAtMs = 0;
+  String summary;
+  String result;
+
+  bool succeeded(void) const
+  {
+    return taskTerminationSucceeded(kind, exitCode);
+  }
+
+  bool operator==(const TaskTermination& other) const
+  {
+    return kind == other.kind && exitCode == other.exitCode && signal == other.signal && oomKilled == other.oomKilled && observedAtMs == other.observedAtMs && summary == other.summary && result == other.result;
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, TaskTermination& termination)
+{
+  serializer.value1b(termination.kind);
+  serializer.value4b(termination.exitCode);
+  serializer.value4b(termination.signal);
+  serializer.value1b(termination.oomKilled);
+  serializer.value8b(termination.observedAtMs);
+  serializer.text1b(termination.summary, UINT32_MAX);
+  serializer.text1b(termination.result, prodigyTaskResultMaxBytes);
+}
+
+class TaskAttemptRecord {
+public:
+
+  uint32_t attemptNumber = 0;
+  uint128_t containerUUID = 0;
+  uint32_t machinePrivate4 = 0;
+  TaskExecutionState state = TaskExecutionState::accepted;
+  int64_t acceptedAtMs = 0;
+  int64_t assignedAtMs = 0;
+  int64_t startedAtMs = 0;
+  int64_t completedAtMs = 0;
+  TaskTermination termination;
+  bool noRelaunchTombstone = false;
+
+  bool terminal(void) const
+  {
+    return taskExecutionTerminal(state);
+  }
+
+  bool operator==(const TaskAttemptRecord& other) const
+  {
+    return attemptNumber == other.attemptNumber && containerUUID == other.containerUUID && machinePrivate4 == other.machinePrivate4 && state == other.state && acceptedAtMs == other.acceptedAtMs && assignedAtMs == other.assignedAtMs && startedAtMs == other.startedAtMs && completedAtMs == other.completedAtMs && termination == other.termination && noRelaunchTombstone == other.noRelaunchTombstone;
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, TaskAttemptRecord& attempt)
+{
+  serializer.value4b(attempt.attemptNumber);
+  serializer.value16b(attempt.containerUUID);
+  serializer.value4b(attempt.machinePrivate4);
+  serializer.value1b(attempt.state);
+  serializer.value8b(attempt.acceptedAtMs);
+  serializer.value8b(attempt.assignedAtMs);
+  serializer.value8b(attempt.startedAtMs);
+  serializer.value8b(attempt.completedAtMs);
+  serializer.object(attempt.termination);
+  serializer.value1b(attempt.noRelaunchTombstone);
+}
+
+static inline uint128_t prodigyTaskAttemptJournalKey(uint64_t deploymentID, uint32_t attemptNumber)
+{
+  return (uint128_t(deploymentID) << 64) | uint128_t(attemptNumber);
+}
+
+class TaskAttemptJournalRecord {
+public:
+
+  uint64_t deploymentID = 0;
+  uint32_t attemptNumber = 0;
+  uint128_t containerUUID = 0;
+  TaskAttemptJournalState state = TaskAttemptJournalState::accepted;
+  int64_t updatedAtMs = 0;
+  int64_t expiresAtMs = 0;
+  bool hasTermination = false;
+  TaskTermination termination;
+
+  uint128_t key(void) const
+  {
+    return prodigyTaskAttemptJournalKey(deploymentID, attemptNumber);
+  }
+
+  bool terminalOutbox(void) const
+  {
+    return state == TaskAttemptJournalState::terminal && hasTermination;
+  }
+
+  bool expired(int64_t nowMs) const
+  {
+    return state == TaskAttemptJournalState::acknowledged && expiresAtMs > 0 && nowMs >= expiresAtMs;
+  }
+
+  bool operator==(const TaskAttemptJournalRecord& other) const
+  {
+    return deploymentID == other.deploymentID && attemptNumber == other.attemptNumber && containerUUID == other.containerUUID && state == other.state && updatedAtMs == other.updatedAtMs && expiresAtMs == other.expiresAtMs && hasTermination == other.hasTermination && termination == other.termination;
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, TaskAttemptJournalRecord& record)
+{
+  serializer.value8b(record.deploymentID);
+  serializer.value4b(record.attemptNumber);
+  serializer.value16b(record.containerUUID);
+  serializer.value1b(record.state);
+  serializer.value8b(record.updatedAtMs);
+  serializer.value8b(record.expiresAtMs);
+  serializer.value1b(record.hasTermination);
+  serializer.object(record.termination);
+}
+
+class TaskExecutionRecord {
+public:
+
+  uint64_t executionID = 0;
+  uint16_t applicationID = 0;
+  uint64_t versionID = 0;
+  TaskExecutionPolicy policy = TaskExecutionPolicy::runOnce;
+  TaskExecutionState state = TaskExecutionState::accepted;
+  String fingerprint;
+  uint32_t currentAttemptNumber = 0;
+  uint32_t attemptsStarted = 0;
+  uint32_t attemptsSucceeded = 0;
+  uint32_t attemptsFailed = 0;
+  uint32_t attemptsLost = 0;
+  uint32_t attemptsCancelled = 0;
+  int64_t acceptedAtMs = 0;
+  int64_t updatedAtMs = 0;
+  int64_t completedAtMs = 0;
+  int64_t expiresAtMs = 0;
+  bool hasLatestNonSuccessAttempt = false;
+  TaskAttemptRecord latestNonSuccessAttempt;
+  bool hasFinalAttempt = false;
+  TaskAttemptRecord finalAttempt;
+
+  bool terminal(void) const
+  {
+    return taskExecutionTerminal(state);
+  }
+
+  bool expired(int64_t nowMs) const
+  {
+    return terminal() && expiresAtMs > 0 && nowMs >= expiresAtMs;
+  }
+
+  bool operator==(const TaskExecutionRecord& other) const
+  {
+    return executionID == other.executionID && applicationID == other.applicationID && versionID == other.versionID && policy == other.policy && state == other.state && fingerprint == other.fingerprint && currentAttemptNumber == other.currentAttemptNumber && attemptsStarted == other.attemptsStarted && attemptsSucceeded == other.attemptsSucceeded && attemptsFailed == other.attemptsFailed && attemptsLost == other.attemptsLost && attemptsCancelled == other.attemptsCancelled && acceptedAtMs == other.acceptedAtMs && updatedAtMs == other.updatedAtMs && completedAtMs == other.completedAtMs && expiresAtMs == other.expiresAtMs && hasLatestNonSuccessAttempt == other.hasLatestNonSuccessAttempt && latestNonSuccessAttempt == other.latestNonSuccessAttempt && hasFinalAttempt == other.hasFinalAttempt && finalAttempt == other.finalAttempt;
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, TaskExecutionRecord& record)
+{
+  serializer.value8b(record.executionID);
+  serializer.value2b(record.applicationID);
+  serializer.value8b(record.versionID);
+  serializer.value1b(record.policy);
+  serializer.value1b(record.state);
+  serializer.text1b(record.fingerprint, UINT32_MAX);
+  serializer.value4b(record.currentAttemptNumber);
+  serializer.value4b(record.attemptsStarted);
+  serializer.value4b(record.attemptsSucceeded);
+  serializer.value4b(record.attemptsFailed);
+  serializer.value4b(record.attemptsLost);
+  serializer.value4b(record.attemptsCancelled);
+  serializer.value8b(record.acceptedAtMs);
+  serializer.value8b(record.updatedAtMs);
+  serializer.value8b(record.completedAtMs);
+  serializer.value8b(record.expiresAtMs);
+  serializer.value1b(record.hasLatestNonSuccessAttempt);
+  serializer.object(record.latestNonSuccessAttempt);
+  serializer.value1b(record.hasFinalAttempt);
+  serializer.object(record.finalAttempt);
+}
+
+static inline bool taskExecutionStateTransitionAllowed(TaskExecutionState from, TaskExecutionState to)
+{
+  if (from == to)
+  {
+    return true;
+  }
+
+  if (taskExecutionTerminal(from))
+  {
+    return false;
+  }
+
+  switch (from)
+  {
+    case TaskExecutionState::accepted:
+      return to == TaskExecutionState::assigned || to == TaskExecutionState::failed || to == TaskExecutionState::cancelled || to == TaskExecutionState::lost;
+    case TaskExecutionState::assigned:
+      return to == TaskExecutionState::running || to == TaskExecutionState::succeeded || to == TaskExecutionState::failed || to == TaskExecutionState::cancelled || to == TaskExecutionState::lost || to == TaskExecutionState::retrying;
+    case TaskExecutionState::running:
+      return to == TaskExecutionState::succeeded || to == TaskExecutionState::failed || to == TaskExecutionState::cancelled || to == TaskExecutionState::lost || to == TaskExecutionState::retrying;
+    case TaskExecutionState::retrying:
+      return to == TaskExecutionState::assigned || to == TaskExecutionState::cancelled || to == TaskExecutionState::lost;
+    case TaskExecutionState::succeeded:
+    case TaskExecutionState::failed:
+    case TaskExecutionState::cancelled:
+    case TaskExecutionState::lost:
+      return false;
+  }
+
+  return false;
+}
+
+static inline bool taskExecutionTransition(TaskExecutionRecord& record, TaskExecutionState next, int64_t nowMs, String *failure = nullptr)
+{
+  if (taskExecutionStateTransitionAllowed(record.state, next) == false)
+  {
+    if (failure)
+    {
+      failure->snprintf<"invalid task execution transition from {} to {}"_ctv>(String(prodigyTaskExecutionStateName(record.state)), String(prodigyTaskExecutionStateName(next)));
+    }
+    return false;
+  }
+
+  record.state = next;
+  record.updatedAtMs = nowMs;
+  if (taskExecutionTerminal(next) && record.completedAtMs == 0)
+  {
+    record.completedAtMs = nowMs;
+    record.expiresAtMs = nowMs + prodigyTaskExecutionRecordRetentionMs;
+  }
+
+  return true;
+}
+
+static inline TaskExecutionState taskExecutionStateForAttemptTermination(TaskExecutionPolicy policy, const TaskTermination& termination)
+{
+  if (termination.succeeded())
+  {
+    return TaskExecutionState::succeeded;
+  }
+  if (termination.kind == TaskTerminationKind::cancelled)
+  {
+    return TaskExecutionState::cancelled;
+  }
+  if (termination.kind == TaskTerminationKind::lost && policy == TaskExecutionPolicy::runOnce)
+  {
+    return TaskExecutionState::lost;
+  }
+  if (policy == TaskExecutionPolicy::untilSucceeded)
+  {
+    return TaskExecutionState::retrying;
+  }
+  if (termination.kind == TaskTerminationKind::lost)
+  {
+    return TaskExecutionState::lost;
+  }
+
+  return TaskExecutionState::failed;
+}
+
+static inline bool taskExecutionCommitAttempt(TaskExecutionRecord& record, const TaskAttemptRecord& attempt, int64_t nowMs, String *failure = nullptr)
+{
+  if (attempt.attemptNumber == 0)
+  {
+    if (failure)
+    {
+      failure->assign("task attempt number must be nonzero"_ctv);
+    }
+    return false;
+  }
+  if (record.currentAttemptNumber != 0 && attempt.attemptNumber < record.currentAttemptNumber)
+  {
+    if (failure)
+    {
+      failure->assign("task attempt number moved backwards"_ctv);
+    }
+    return false;
+  }
+
+  TaskExecutionState next = taskExecutionStateForAttemptTermination(record.policy, attempt.termination);
+  if (taskExecutionTransition(record, next, nowMs, failure) == false)
+  {
+    return false;
+  }
+
+  record.currentAttemptNumber = attempt.attemptNumber;
+  record.hasFinalAttempt = taskExecutionTerminal(record.state);
+  if (record.hasFinalAttempt)
+  {
+    record.finalAttempt = attempt;
+  }
+
+  if (attempt.termination.succeeded())
+  {
+    record.attemptsSucceeded += 1;
+  }
+  else if (attempt.termination.kind == TaskTerminationKind::cancelled)
+  {
+    record.attemptsCancelled += 1;
+    record.hasLatestNonSuccessAttempt = true;
+    record.latestNonSuccessAttempt = attempt;
+  }
+  else if (attempt.termination.kind == TaskTerminationKind::lost)
+  {
+    record.attemptsLost += 1;
+    record.hasLatestNonSuccessAttempt = true;
+    record.latestNonSuccessAttempt = attempt;
+  }
+  else
+  {
+    record.attemptsFailed += 1;
+    record.hasLatestNonSuccessAttempt = true;
+    record.latestNonSuccessAttempt = attempt;
+  }
+
+  return true;
 }
 
 class StatefulDeploymentPlan {
@@ -6278,12 +6709,13 @@ public:
   Vector<RoutableResourceLease> routableResourceLeases;
   Vector<PublicTlsCertificateState> publicTlsCertificates;
   Vector<PrivateTlsVaultLifecycleState> privateTlsVaultLifecycles;
+  bytell_hash_map<uint64_t, TaskExecutionRecord> taskExecutions;
   MothershipTunnelProviderDesiredState mothershipTunnelProviderDesiredState;
   ProdigyPersistentUpdateSelfState updateSelf;
 
   bool operator==(const ProdigyMasterAuthorityRuntimeState& other) const
   {
-    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf)
+    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf)
     {
       return false;
     }
@@ -6353,6 +6785,15 @@ public:
       }
     }
 
+    for (const auto& [executionID, record] : taskExecutions)
+    {
+      auto otherIt = other.taskExecutions.find(executionID);
+      if (otherIt == other.taskExecutions.end() || (record == otherIt->second) == false)
+      {
+        return false;
+      }
+    }
+
     return true;
   }
 
@@ -6379,6 +6820,7 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
   serializer.object(state.routableResourceLeases);
   serializer.object(state.publicTlsCertificates);
   serializer.object(state.privateTlsVaultLifecycles);
+  serializer.object(state.taskExecutions);
   serializer.object(state.mothershipTunnelProviderDesiredState);
   serializer.object(state.updateSelf);
 }
@@ -6829,6 +7271,7 @@ public:
   bytell_hash_subvector<uint64_t, SubscriptionPairing> subscriptionPairings;
   bytell_hash_subvector<uint64_t, AdvertisementPairing> advertisementPairings;
   bool restartOnFailure;
+  uint32_t taskAttemptNumber = 0;
 
   uint8_t fragment;
   SystemContainerRuntimePlan system;
@@ -7050,13 +7493,34 @@ public:
     state = ContainerState::scheduled;
   }
 
-  bool isSystemContainer(void) const { return system.configured(); }
-  bool usesSharedCPUs(void) const { return isSystemContainer() == false && applicationUsesSharedCPUs(config); }
-  bool usesIsolatedCPUs(void) const { return usesSharedCPUs() == false; }
-  uint32_t logicalCores(void) const { return isSystemContainer() ? 1 : config.nLogicalCores; }
-  uint32_t memoryMB(void) const { return isSystemContainer() ? 128 : config.memoryMB; }
-  uint32_t filesystemMB(void) const { return isSystemContainer() ? 128 : config.filesystemMB; }
-  uint32_t stopTimeoutSeconds(void) const { return isSystemContainer() ? 30 : config.sTilKillable; }
+  bool isSystemContainer(void) const
+  {
+    return system.configured();
+  }
+  bool usesSharedCPUs(void) const
+  {
+    return isSystemContainer() == false && applicationUsesSharedCPUs(config);
+  }
+  bool usesIsolatedCPUs(void) const
+  {
+    return usesSharedCPUs() == false;
+  }
+  uint32_t logicalCores(void) const
+  {
+    return isSystemContainer() ? 1 : config.nLogicalCores;
+  }
+  uint32_t memoryMB(void) const
+  {
+    return isSystemContainer() ? 128 : config.memoryMB;
+  }
+  uint32_t filesystemMB(void) const
+  {
+    return isSystemContainer() ? 128 : config.filesystemMB;
+  }
+  uint32_t stopTimeoutSeconds(void) const
+  {
+    return isSystemContainer() ? 30 : config.sTilKillable;
+  }
 };
 
 template <typename S>
@@ -7086,6 +7550,7 @@ static void serialize(S&& serializer, ContainerPlan& plan)
   });
 
   serializer.value1b(plan.restartOnFailure);
+  serializer.value4b(plan.taskAttemptNumber);
   serializer.value1b(plan.fragment);
   serializer.object(plan.system);
   serializer.object(plan.wormholes);
@@ -7431,6 +7896,8 @@ class ContainerParameters { // startup payload for container launch; stateful me
 public:
 
   uint128_t uuid;
+  uint64_t deploymentID = 0;
+  uint32_t taskAttemptNumber = 0;
 
   uint32_t memoryMB;
   uint32_t storageMB;
@@ -7466,6 +7933,8 @@ template <typename S>
 static void serialize(S&& serializer, ContainerParameters& params)
 {
   serializer.value16b(params.uuid);
+  serializer.value8b(params.deploymentID);
+  serializer.value4b(params.taskAttemptNumber);
   serializer.value4b(params.memoryMB);
   serializer.value4b(params.storageMB);
   serializer.value2b(params.nLogicalCores);

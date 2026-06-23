@@ -4140,7 +4140,7 @@ private:
   String clusterBootstrapSshPrivateKeyPath;
   String matchedFrameBuffer;
   int transportFD = -1;
-  std::unique_ptr<SSL, decltype(&SSL_free)> tunnelGatewayTLS{nullptr, SSL_free};
+  std::unique_ptr<SSL, decltype(&SSL_free)> tunnelGatewayTLS {nullptr, SSL_free};
   LIBSSH2_SESSION *sshSession = nullptr;
   LIBSSH2_CHANNEL *sshChannel = nullptr;
   int sshFD = -1;
@@ -8011,9 +8011,9 @@ private:
             return false;
           }
           if (recvMothershipResponse(
-              MothershipTopic::configureMothershipTunnelProvider,
-              "timed out waiting for mothership tunnel provider acknowledgement"_ctv,
-              "mothership tunnel provider configuration rejected"_ctv) == false)
+                  MothershipTopic::configureMothershipTunnelProvider,
+                  "timed out waiting for mothership tunnel provider acknowledgement"_ctv,
+                  "mothership tunnel provider configuration rejected"_ctv) == false)
           {
             return false;
           }
@@ -9129,6 +9129,7 @@ private:
         }
 
         bool hasConfigType = false;
+        bool hasTaskExecutionPolicy = false;
         uint32_t configSizeSeenMask = 0;
         for (auto subfield : field.value.get_object())
         {
@@ -9179,9 +9180,40 @@ private:
               plan.config.type = ApplicationType::tunnel;
               hasConfigType = true;
             }
+            else if (value.equal("ApplicationType::task"_ctv))
+            {
+              plan.config.type = ApplicationType::task;
+              hasConfigType = true;
+            }
             else
             {
               basics_log("config.type not recognized\n");
+              exit(EXIT_FAILURE);
+            }
+          }
+          else if (subkey.equal("taskExecutionPolicy"_ctv))
+          {
+            if (subfield.value.type() != simdjson::dom::element_type::STRING)
+            {
+              basics_log("config.taskExecutionPolicy requires a string\n");
+              exit(EXIT_FAILURE);
+            }
+
+            String value;
+            value.setInvariant(subfield.value.get_c_str());
+            if (value.equal("TaskExecutionPolicy::runOnce"_ctv) || value.equal("runOnce"_ctv))
+            {
+              plan.config.taskExecutionPolicy = TaskExecutionPolicy::runOnce;
+              hasTaskExecutionPolicy = true;
+            }
+            else if (value.equal("TaskExecutionPolicy::untilSucceeded"_ctv) || value.equal("untilSucceeded"_ctv))
+            {
+              plan.config.taskExecutionPolicy = TaskExecutionPolicy::untilSucceeded;
+              hasTaskExecutionPolicy = true;
+            }
+            else
+            {
+              basics_log("config.taskExecutionPolicy not recognized\n");
               exit(EXIT_FAILURE);
             }
           }
@@ -9458,6 +9490,16 @@ private:
         if (hasConfigType == false)
         {
           basics_log("config requires type parameter\n");
+          exit(EXIT_FAILURE);
+        }
+        if (plan.config.type == ApplicationType::task && hasTaskExecutionPolicy == false)
+        {
+          basics_log("config.taskExecutionPolicy required for ApplicationType::task\n");
+          exit(EXIT_FAILURE);
+        }
+        if (plan.config.type != ApplicationType::task && hasTaskExecutionPolicy)
+        {
+          basics_log("config.taskExecutionPolicy is valid only for ApplicationType::task\n");
           exit(EXIT_FAILURE);
         }
       }
@@ -11531,6 +11573,50 @@ private:
       }
     }
 
+    if (plan.config.type == ApplicationType::task)
+    {
+      if (plan.isStateful)
+      {
+        basics_log("task deployments cannot be stateful\n");
+        exit(EXIT_FAILURE);
+      }
+      if (plan.stateful.clientPrefix > 0)
+      {
+        basics_log("task deployments cannot provide StatefulDeploymentPlan\n");
+        exit(EXIT_FAILURE);
+      }
+      if (plan.stateless.nBase > 0)
+      {
+        basics_log("task deployments use an implicit single attempt and cannot provide StatelessDeploymentPlan\n");
+        exit(EXIT_FAILURE);
+      }
+      if (plan.canaryCount > 0 || plan.canariesMustLiveForMinutes > 0)
+      {
+        basics_log("task deployments cannot configure canaries\n");
+        exit(EXIT_FAILURE);
+      }
+      if (plan.horizontalScalers.empty() == false || plan.verticalScalers.empty() == false)
+      {
+        basics_log("task deployments cannot configure scalers\n");
+        exit(EXIT_FAILURE);
+      }
+      if (plan.wormholes.empty() == false || plan.publicTLS.empty() == false || plan.advertisements.empty() == false)
+      {
+        basics_log("task deployments cannot publish inbound services\n");
+        exit(EXIT_FAILURE);
+      }
+
+      plan.isStateful = false;
+      plan.stateless.nBase = 1;
+      plan.stateless.maxPerRackRatio = 1.0f;
+      plan.stateless.maxPerMachineRatio = 1.0f;
+      plan.stateless.moveableDuringCompaction = false;
+      plan.canaryCount = 0;
+      plan.canariesMustLiveForMinutes = 0;
+      plan.config.msTilHealthy = 0;
+      plan.config.sTilHealthcheck = 0;
+    }
+
     if (plan.hasTlsIssuancePolicy)
     {
       if (plan.tlsIssuancePolicy.applicationID != plan.config.applicationID)
@@ -11907,6 +11993,28 @@ private:
             }
           case SpinApplicationResponseCode::finished:
             {
+              if (args != response->terminal())
+              {
+                String serializedRecord = {};
+                Message::extractToStringView(args, serializedRecord);
+                TaskExecutionRecord record = {};
+                if (BitseryEngine::deserializeSafe(serializedRecord, record))
+                {
+                  basics_log("taskReport found=1 deploymentID=%llu policy=%s state=%s attempt=%u started=%u succeeded=%u failed=%u lost=%u cancelled=%u completedAtMs=%lld expiresAtMs=%lld resultBytes=%u\n",
+                             (unsigned long long)record.executionID,
+                             prodigyTaskExecutionPolicyName(record.policy),
+                             prodigyTaskExecutionStateName(record.state),
+                             unsigned(record.currentAttemptNumber),
+                             unsigned(record.attemptsStarted),
+                             unsigned(record.attemptsSucceeded),
+                             unsigned(record.attemptsFailed),
+                             unsigned(record.attemptsLost),
+                             unsigned(record.attemptsCancelled),
+                             (long long)record.completedAtMs,
+                             (long long)record.expiresAtMs,
+                             unsigned(record.hasFinalAttempt ? record.finalAttempt.termination.result.size() : 0u));
+                }
+              }
               finished = true;
               break;
             }
@@ -12024,6 +12132,99 @@ private:
     {
       exit(EXIT_FAILURE);
     }
+  }
+
+  void runTaskReport(int argc, char *argv[])
+  {
+    if (argc < 3)
+    {
+      basics_log("too few arguments. ex: taskReport [target: local|clusterName|clusterUUID] [application name] [versionID]\n");
+      exit(EXIT_FAILURE);
+    }
+    if (configureControlTarget(argv[0]) == false)
+    {
+      exit(EXIT_FAILURE);
+    }
+
+    String name;
+    name.setInvariant(argv[1]);
+    uint16_t applicationID = 0;
+    ApplicationIDReserveRequest request;
+    request.applicationName = name;
+    request.createIfMissing = false;
+    ApplicationIDReserveResponse response;
+    if (socket.requestApplicationID(request, response) && response.success && response.applicationID != 0)
+    {
+      applicationID = response.applicationID;
+    }
+    else if (auto it = MeshRegistry::applicationIDMappings.find(name); it != MeshRegistry::applicationIDMappings.end())
+    {
+      applicationID = it->second;
+    }
+    else
+    {
+      basics_log("application name does not exist in reserved application registry\n");
+      exit(EXIT_FAILURE);
+    }
+
+    char *end = nullptr;
+    uint64_t versionID = std::strtoull(argv[2], &end, 10);
+    if (end == argv[2] || *end != '\0' || versionID == 0 || versionID > 281'474'976'710'655ULL)
+    {
+      basics_log("versionID invalid\n");
+      exit(EXIT_FAILURE);
+    }
+
+    const uint64_t deploymentID = (uint64_t(applicationID) << 48) | versionID;
+    if (socket.ensureConnected() == false)
+    {
+      exit(EXIT_FAILURE);
+    }
+
+    Message::construct(socket.wBuffer, MothershipTopic::pullTaskReport, deploymentID);
+    if (socket.send() == false)
+    {
+      exit(EXIT_FAILURE);
+    }
+
+    Message *message = socket.recvExpectedTopic(MothershipTopic::pullTaskReport);
+    if (message == nullptr || MothershipTopic(message->topic) != MothershipTopic::pullTaskReport)
+    {
+      basics_log("taskReport failed: unexpected response\n");
+      exit(EXIT_FAILURE);
+    }
+
+    uint8_t *args = message->args;
+    bool found = false;
+    Message::extractArg<ArgumentNature::fixed>(args, found);
+    String serializedRecord = {};
+    Message::extractToStringView(args, serializedRecord);
+    if (found == false)
+    {
+      basics_log("taskReport found=0 deploymentID=%llu\n", (unsigned long long)deploymentID);
+      exit(EXIT_SUCCESS);
+    }
+
+    TaskExecutionRecord record = {};
+    if (BitseryEngine::deserializeSafe(serializedRecord, record) == false)
+    {
+      basics_log("taskReport failed: invalid report payload\n");
+      exit(EXIT_FAILURE);
+    }
+
+    basics_log("taskReport found=1 deploymentID=%llu policy=%s state=%s attempt=%u started=%u succeeded=%u failed=%u lost=%u cancelled=%u completedAtMs=%lld expiresAtMs=%lld resultBytes=%u\n",
+               (unsigned long long)record.executionID,
+               prodigyTaskExecutionPolicyName(record.policy),
+               prodigyTaskExecutionStateName(record.state),
+               unsigned(record.currentAttemptNumber),
+               unsigned(record.attemptsStarted),
+               unsigned(record.attemptsSucceeded),
+               unsigned(record.attemptsFailed),
+               unsigned(record.attemptsLost),
+               unsigned(record.attemptsCancelled),
+               (long long)record.completedAtMs,
+               (long long)record.expiresAtMs,
+               unsigned(record.hasFinalAttempt ? record.finalAttempt.termination.result.size() : 0u));
   }
 
   bool parseProviderCredentialJSON(simdjson::dom::element doc, MothershipProviderCredential& request, const char *context, bool requireName)
@@ -16826,6 +17027,10 @@ public:
     {
       runApplicationReport(argc, argv);
     }
+    else if (operation.equal("taskReport"_ctv))
+    {
+      runTaskReport(argc, argv);
+    }
     else if (operation.equal("clusterReport"_ctv))
     {
       runClusterReport(argc, argv);
@@ -16979,7 +17184,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, configureTestCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
+        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, configureTestCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, taskReport, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }
@@ -17040,6 +17245,8 @@ int main(int argc, char *argv[])
     message.append("applicationReport [target: local|clusterName|clusterUUID] [application name]\n");
     message.append("\tfetches the state of each deployment of the application\n");
     message.append("\tex: applicationReport local Radar\n");
+    message.append("taskReport [target: local|clusterName|clusterUUID] [application name] [versionID]\n");
+    message.append("\tfetches a retained task execution report\n");
     message.append("updateProdigy [target: local|clusterName|clusterUUID] [path to prodigy binary or bundle]\n");
     message.append("\tpushes the exact prodigy bundle this mothership build was compiled to approve, and rejects any other bundle before dispatch\n");
     message.append("reserveApplicationID [target: local|clusterName|clusterUUID] [json]\n");

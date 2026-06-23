@@ -1268,6 +1268,8 @@ static bool serializeContainerParameters(String& output, const ContainerParamete
       return false;
     }
   }
+  writer.u64(parameters.deploymentID);
+  writer.u32(parameters.taskAttemptNumber);
 
   return true;
 }
@@ -1394,7 +1396,15 @@ static bool deserializeContainerParameters(const String& input, ContainerParamet
       decoded.credentialBundle = CredentialBundle();
     }
 
-    if (reader.done() == false)
+    if (reader.done())
+    {
+      parameters = std::move(decoded);
+      return true;
+    }
+
+    if (reader.u64(decoded.deploymentID) == false ||
+        reader.u32(decoded.taskAttemptNumber) == false ||
+        reader.done() == false)
     {
       return false;
     }

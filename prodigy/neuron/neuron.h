@@ -10,6 +10,7 @@
 #include <string>
 #include <utility>
 #include <poll.h>
+#include <dirent.h>
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
@@ -118,6 +119,7 @@ protected:
   bytell_hash_map<uint128_t, Vector<String>> pendingAdvertisementPairings;
   bytell_hash_map<uint128_t, Vector<String>> pendingSubscriptionPairings;
   bytell_hash_map<uint128_t, Vector<String>> pendingCredentialRefreshes;
+  bytell_hash_map<uint128_t, TaskAttemptJournalRecord> taskAttemptJournal;
   constexpr static uint32_t pendingPairingLimitPerContainer = 128;
   constexpr static uint32_t pendingCredentialRefreshLimitPerContainer = 128;
   constexpr static uint64_t pulseBatteryPassMetricKey = 0x50554C5345504151ULL; // "PULSEPAQ"
@@ -172,6 +174,248 @@ protected:
     }
 
     return (cached == 1);
+  }
+
+  static String taskAttemptJournalRoot(void)
+  {
+    if (const char *root = getenv("PRODIGY_TASK_ATTEMPT_JOURNAL_ROOT"); root && root[0])
+    {
+      String path = {};
+      path.assign(root);
+      return path;
+    }
+    return "/var/lib/prodigy/task-attempts"_ctv;
+  }
+
+  static String taskAttemptJournalPath(uint64_t deploymentID, uint32_t attemptNumber)
+  {
+    String path = taskAttemptJournalRoot();
+    if (path.size() == 0 || path[path.size() - 1] != '/')
+    {
+      path.append('/');
+    }
+    String leaf = {};
+    leaf.snprintf<"{itoa}-{itoa}.bin"_ctv>(deploymentID, uint64_t(attemptNumber));
+    path.append(leaf);
+    return path;
+  }
+
+  bool persistTaskAttemptJournalRecord(TaskAttemptJournalRecord& record, String *failureReport = nullptr)
+  {
+    (void)Filesystem::createDirectoryAt(-1, taskAttemptJournalRoot(), 0755);
+    String payload = {};
+    BitseryEngine::serialize(payload, record);
+    return ContainerStore::atomicWriteRuntimeFile(taskAttemptJournalPath(record.deploymentID, record.attemptNumber), payload, failureReport);
+  }
+
+  void eraseTaskAttemptJournalRecord(const TaskAttemptJournalRecord& record)
+  {
+    (void)::unlink(taskAttemptJournalPath(record.deploymentID, record.attemptNumber).c_str());
+  }
+
+  void pruneExpiredTaskAttemptJournalRecords(int64_t nowMs)
+  {
+    for (auto it = taskAttemptJournal.begin(); it != taskAttemptJournal.end();)
+    {
+      if (it->second.expired(nowMs))
+      {
+        eraseTaskAttemptJournalRecord(it->second);
+        it = taskAttemptJournal.erase(it);
+      }
+      else
+      {
+        ++it;
+      }
+    }
+  }
+
+  void loadTaskAttemptJournal(void)
+  {
+    taskAttemptJournal.clear();
+    String root = taskAttemptJournalRoot();
+    int fd = Filesystem::openDirectoryAt(-1, root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+    {
+      return;
+    }
+
+    DIR *dir = fdopendir(fd);
+    if (dir == nullptr)
+    {
+      close(fd);
+      return;
+    }
+
+    while (struct dirent *entry = readdir(dir))
+    {
+      if (entry->d_name[0] == '.')
+      {
+        continue;
+      }
+
+      String path = root;
+      if (path.size() == 0 || path[path.size() - 1] != '/')
+      {
+        path.append('/');
+      }
+      path.append(entry->d_name);
+      String payload = {};
+      Filesystem::openReadAtClose(-1, path, payload);
+      TaskAttemptJournalRecord record = {};
+      if (payload.size() > 0 && BitseryEngine::deserializeSafe(payload, record) && record.deploymentID > 0 && record.attemptNumber > 0)
+      {
+        taskAttemptJournal.insert_or_assign(record.key(), record);
+      }
+    }
+    closedir(dir);
+    pruneExpiredTaskAttemptJournalRecords(Time::now<TimeResolution::ms>());
+  }
+
+  void replayTerminalTaskAttemptJournal(void)
+  {
+    pruneExpiredTaskAttemptJournalRecords(Time::now<TimeResolution::ms>());
+    for (const auto& [key, record] : taskAttemptJournal)
+    {
+      (void)key;
+      if (record.terminalOutbox())
+      {
+        reportTaskAttemptTerminal(record.deploymentID, record.attemptNumber, record.containerUUID, record.termination);
+      }
+    }
+  }
+
+  bool prepareTaskAttemptLaunch(const ContainerPlan& plan, bool& skipLaunch, String *failureReport = nullptr) override
+  {
+    skipLaunch = false;
+    if (plan.config.type != ApplicationType::task)
+    {
+      return true;
+    }
+
+    const uint64_t deploymentID = plan.config.deploymentID();
+    const uint32_t attemptNumber = plan.taskAttemptNumber;
+    if (deploymentID == 0 || attemptNumber == 0)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("task launch missing deployment or attempt id"_ctv);
+      }
+      return false;
+    }
+
+    const int64_t nowMs = Time::now<TimeResolution::ms>();
+    pruneExpiredTaskAttemptJournalRecords(nowMs);
+    auto key = prodigyTaskAttemptJournalKey(deploymentID, attemptNumber);
+    if (auto it = taskAttemptJournal.find(key); it != taskAttemptJournal.end())
+    {
+      TaskAttemptJournalRecord& record = it->second;
+      skipLaunch = true;
+      if (record.terminalOutbox())
+      {
+        reportTaskAttemptTerminal(record.deploymentID, record.attemptNumber, record.containerUUID, record.termination);
+      }
+      else if (record.state != TaskAttemptJournalState::acknowledged && containers.contains(record.containerUUID) == false)
+      {
+        record.state = TaskAttemptJournalState::terminal;
+        record.updatedAtMs = nowMs;
+        record.expiresAtMs = 0;
+        record.hasTermination = true;
+        record.termination = {};
+        record.termination.kind = TaskTerminationKind::lost;
+        record.termination.observedAtMs = nowMs;
+        record.termination.summary.assign("lost before duplicate task launch"_ctv);
+        if (persistTaskAttemptJournalRecord(record, failureReport) == false)
+        {
+          return false;
+        }
+        reportTaskAttemptTerminal(record.deploymentID, record.attemptNumber, record.containerUUID, record.termination);
+      }
+      return true;
+    }
+
+    TaskAttemptJournalRecord record = {};
+    record.deploymentID = deploymentID;
+    record.attemptNumber = attemptNumber;
+    record.containerUUID = plan.uuid;
+    record.state = TaskAttemptJournalState::accepted;
+    record.updatedAtMs = nowMs;
+    if (persistTaskAttemptJournalRecord(record, failureReport) == false)
+    {
+      return false;
+    }
+    taskAttemptJournal.insert_or_assign(record.key(), record);
+    return true;
+  }
+
+  void noteTaskAttemptRunning(const ContainerPlan& plan) override
+  {
+    if (plan.config.type != ApplicationType::task || plan.taskAttemptNumber == 0)
+    {
+      return;
+    }
+
+    TaskAttemptJournalRecord& record = taskAttemptJournal[prodigyTaskAttemptJournalKey(plan.config.deploymentID(), plan.taskAttemptNumber)];
+    record.deploymentID = plan.config.deploymentID();
+    record.attemptNumber = plan.taskAttemptNumber;
+    record.containerUUID = plan.uuid;
+    record.state = TaskAttemptJournalState::running;
+    record.updatedAtMs = Time::now<TimeResolution::ms>();
+    record.expiresAtMs = 0;
+    record.hasTermination = false;
+    record.termination = {};
+    String ignored = {};
+    (void)persistTaskAttemptJournalRecord(record, &ignored);
+  }
+
+  bool noteTaskAttemptTerminal(const ContainerPlan& plan, const TaskTermination& termination) override
+  {
+    if (plan.config.type != ApplicationType::task || plan.taskAttemptNumber == 0)
+    {
+      return true;
+    }
+
+    TaskAttemptJournalRecord& record = taskAttemptJournal[prodigyTaskAttemptJournalKey(plan.config.deploymentID(), plan.taskAttemptNumber)];
+    record.deploymentID = plan.config.deploymentID();
+    record.attemptNumber = plan.taskAttemptNumber;
+    record.containerUUID = plan.uuid;
+    record.state = TaskAttemptJournalState::terminal;
+    record.updatedAtMs = termination.observedAtMs ? termination.observedAtMs : Time::now<TimeResolution::ms>();
+    record.expiresAtMs = 0;
+    record.hasTermination = true;
+    record.termination = termination;
+
+    String failure = {};
+    if (persistTaskAttemptJournalRecord(record, &failure) == false)
+    {
+      basics_log("task terminal journal persist failed deploymentID=%llu attempt=%u reason=%s\n",
+                 (unsigned long long)record.deploymentID,
+                 unsigned(record.attemptNumber),
+                 failure.c_str());
+      return false;
+    }
+
+    reportTaskAttemptTerminal(record.deploymentID, record.attemptNumber, record.containerUUID, record.termination);
+    return true;
+  }
+
+  void acknowledgeTaskAttemptTerminal(uint64_t deploymentID, uint32_t attemptNumber)
+  {
+    auto it = taskAttemptJournal.find(prodigyTaskAttemptJournalKey(deploymentID, attemptNumber));
+    if (it == taskAttemptJournal.end())
+    {
+      return;
+    }
+
+    TaskAttemptJournalRecord& record = it->second;
+    int64_t nowMs = Time::now<TimeResolution::ms>();
+    record.state = TaskAttemptJournalState::acknowledged;
+    record.updatedAtMs = nowMs;
+    record.expiresAtMs = nowMs + prodigyTaskExecutionRecordRetentionMs;
+    record.hasTermination = false;
+    record.termination = {};
+    String ignored = {};
+    (void)persistTaskAttemptJournalRecord(record, &ignored);
+    pruneExpiredTaskAttemptJournalRecords(nowMs);
   }
 
   template <typename... Args>
@@ -2460,6 +2704,7 @@ public:
   {
     loadKernelVersion();
     loadOSReleaseMetadata();
+    loadTaskAttemptJournal();
     bootTimeMs = registrationBootTimeMs();
 
     private4.is6 = false;
@@ -2679,6 +2924,48 @@ public:
                            int(nonRestartableStartupFailure));
 
     int64_t failureTimeMs = Time::now<TimeResolution::ms>();
+
+    if (container->plan.config.type == ApplicationType::task)
+    {
+      TaskTermination termination = {};
+      termination.observedAtMs = failureTimeMs;
+      termination.result = container->taskResult;
+
+      if (killedOnPurpose)
+      {
+        termination.kind = TaskTerminationKind::cancelled;
+        termination.summary.assign("cancelled"_ctv);
+      }
+      else if (nonRestartableStartupFailure)
+      {
+        termination.kind = TaskTerminationKind::startupFailed;
+        termination.exitCode = infop.si_status;
+        termination.summary.assign("startup failed before exec"_ctv);
+      }
+      else if (infop.si_code == CLD_EXITED)
+      {
+        termination.kind = TaskTerminationKind::exited;
+        termination.exitCode = infop.si_status;
+        termination.summary.snprintf<"exited with code {}"_ctv>(termination.exitCode);
+      }
+      else
+      {
+        termination.kind = TaskTerminationKind::signaled;
+        termination.signal = ContainerManager::terminalSignalForFailedContainer(infop);
+        termination.summary.snprintf<"terminated by signal {}"_ctv>(termination.signal);
+      }
+
+      (void)noteTaskAttemptTerminal(container->plan, termination);
+      if (destroyAfterWait)
+      {
+        ContainerManager::destroyContainer(container);
+      }
+      if (pendingDestroyBeforeWait)
+      {
+        ContainerManager::finalizeContainerDestroyIfReady(container);
+      }
+      return;
+    }
 
     if (killedOnPurpose == false)
     {
@@ -2948,6 +3235,21 @@ public:
 
           break;
         }
+      case ContainerTopic::taskResult:
+        {
+          if (container->plan.config.type != ApplicationType::task)
+          {
+            queueCloseIfActive(container);
+            break;
+          }
+          if (uint64_t(terminal - args) > prodigyTaskResultMaxBytes)
+          {
+            queueCloseIfActive(container);
+            break;
+          }
+          container->taskResult.assign(reinterpret_cast<const char *>(args), uint64_t(terminal - args));
+          break;
+        }
       case ContainerTopic::statistics:
         {
           // [metricKey(8) metricValue(8)]...
@@ -3148,6 +3450,7 @@ public:
           {
             queueNeuronStateUpload();
           }
+          replayTerminalTaskAttemptJournal();
 
           break;
         }
@@ -3268,19 +3571,32 @@ public:
                              (unsigned long long)container->plan.uuid,
                              restoreFailure.c_str());
 
-                  bool restarted = false;
-                  if (container->plan.restartOnFailure)
+                  if (container->plan.config.type == ApplicationType::task)
                   {
-                    restarted = true;
-                    ContainerManager::restartContainer(container);
+                    TaskTermination termination = {};
+                    termination.kind = TaskTerminationKind::lost;
+                    termination.observedAtMs = Time::now<TimeResolution::ms>();
+                    termination.summary.assign("task network restore failed"_ctv);
+                    (void)noteTaskAttemptTerminal(container->plan, termination);
+                    ContainerManager::destroyContainer(container);
                   }
                   else
                   {
-                    ContainerManager::destroyContainer(container);
-                  }
+                    bool restarted = false;
+                    uint128_t restoredUUID = container->plan.uuid;
+                    if (container->plan.restartOnFailure)
+                    {
+                      restarted = true;
+                      ContainerManager::restartContainer(container);
+                    }
+                    else
+                    {
+                      ContainerManager::destroyContainer(container);
+                    }
 
-                  String empty;
-                  reportContainerFailed(container->plan.uuid, 0, 0, empty, restarted);
+                    String empty;
+                    reportContainerFailed(restoredUUID, 0, 0, empty, restarted);
+                  }
                   continue;
                 }
               }
@@ -3297,25 +3613,38 @@ public:
               path.snprintf<"/containers/{}/neuron.soc"_ctv>(container->name);
               container->setSocketPath(path.c_str());
               pushContainer(container);
+              noteTaskAttemptRunning(container->plan);
               ContainerManager::queueContainerWaitid(container);
               Ring::queueConnect(container);
             }
             else
             {
-              bool restarted = false;
-
-              if (container->plan.restartOnFailure)
+              if (container->plan.config.type == ApplicationType::task)
               {
-                restarted = true;
-                ContainerManager::restartContainer(container);
+                TaskTermination termination = {};
+                termination.kind = TaskTerminationKind::lost;
+                termination.observedAtMs = Time::now<TimeResolution::ms>();
+                termination.summary.assign("task process missing during neuron restore"_ctv);
+                (void)noteTaskAttemptTerminal(container->plan, termination);
+                ContainerManager::destroyContainer(container);
               }
               else
               {
-                ContainerManager::destroyContainer(container);
-              }
+                bool restarted = false;
+                uint128_t restoredUUID = container->plan.uuid;
+                if (container->plan.restartOnFailure)
+                {
+                  restarted = true;
+                  ContainerManager::restartContainer(container);
+                }
+                else
+                {
+                  ContainerManager::destroyContainer(container);
+                }
 
-              String empty;
-              reportContainerFailed(container->plan.uuid, 0, 0, empty, restarted);
+                String empty;
+                reportContainerFailed(restoredUUID, 0, 0, empty, restarted);
+              }
             }
           }
 
@@ -3530,6 +3859,15 @@ public:
             Message::construct(brain->wBuffer, NeuronTopic::killContainer, replaceContainerUUID);
           }
 
+          break;
+        }
+      case NeuronTopic::taskAttemptTerminalAck:
+        {
+          uint64_t deploymentID = 0;
+          uint32_t attemptNumber = 0;
+          Message::extractArg<ArgumentNature::fixed>(args, deploymentID);
+          Message::extractArg<ArgumentNature::fixed>(args, attemptNumber);
+          acknowledgeTaskAttemptTerminal(deploymentID, attemptNumber);
           break;
         }
       case NeuronTopic::adjustContainerResources:
@@ -4846,6 +5184,22 @@ public:
       return;
     }
     Message::construct(brain->wBuffer, NeuronTopic::containerFailed, containerUUID, failureTimeMs, terminalSignal, crashReport, restart);
+    if (streamIsActive(brain))
+    {
+      Ring::queueSend(brain);
+    }
+  }
+
+  void reportTaskAttemptTerminal(uint64_t deploymentID, uint32_t attemptNumber, uint128_t containerUUID, const TaskTermination& termination) override
+  {
+    if (brain == nullptr)
+    {
+      return;
+    }
+
+    String serialized = {};
+    BitseryEngine::serialize(serialized, termination);
+    Message::construct(brain->wBuffer, NeuronTopic::taskAttemptTerminal, deploymentID, attemptNumber, containerUUID, serialized);
     if (streamIsActive(brain))
     {
       Ring::queueSend(brain);

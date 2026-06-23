@@ -272,6 +272,7 @@ int main(void)
   suite.expect(parameters.memoryMB == 1536, "container parameters memory");
   suite.expect(parameters.storageMB == 4096, "container parameters storage");
   suite.expect(parameters.logicalCores == 5, "container parameters logical cores");
+  suite.expect(parameters.deploymentID == 0 && parameters.taskAttemptNumber == 0, "container parameters legacy task identity defaults");
   suite.expect(parameters.datacenterUniqueTag == 23, "container parameters datacenter tag");
   suite.expect(parameters.flags.size() == 3 && parameters.flags[0] == 44 && parameters.flags[1] == 55 && parameters.flags[2] == 66, "container parameters flags");
   suite.expect(
@@ -573,6 +574,29 @@ int main(void)
           runtimeReadyFrame.topic == ProdigySDK::ContainerTopic::runtimeReady &&
           runtimeReadyFrame.payload.empty(),
       "hub runtime ready frame builder");
+
+  ProdigySDK::Bytes taskResult {'o', 'k'};
+  ProdigySDK::Bytes outboundTaskResultFrame;
+  ProdigySDK::MessageFrame decodedTaskResultFrame;
+  suite.expect(
+      ProdigySDK::buildTaskResultFrame(outboundTaskResultFrame, taskResult) == ProdigySDK::Result::ok &&
+          ProdigySDK::parseMessageFrame(outboundTaskResultFrame, decodedTaskResultFrame) == ProdigySDK::Result::ok &&
+          decodedTaskResultFrame.topic == ProdigySDK::ContainerTopic::taskResult &&
+          equalBytes(decodedTaskResultFrame.payload, taskResult),
+      "hub task result frame builder");
+  ProdigySDK::NeuronHub taskHub(&dispatch, parameters);
+  std::vector<ProdigySDK::Bytes> queuedTaskResults;
+  suite.expect(
+      taskHub.queueTaskResult(taskResult) == ProdigySDK::Result::ok &&
+          taskHub.drainQueuedResponseBytes(queuedTaskResults) == ProdigySDK::Result::ok &&
+          queuedTaskResults.size() == 1 &&
+          equalBytes(queuedTaskResults[0], outboundTaskResultFrame),
+      "hub task result queued response");
+  ProdigySDK::Bytes oversizedTaskResult(64u * 1024u + 1u);
+  suite.expect(
+      ProdigySDK::buildTaskResultFrame(outboundTaskResultFrame, oversizedTaskResult) == ProdigySDK::Result::argument &&
+          taskHub.queueTaskResult(oversizedTaskResult) == ProdigySDK::Result::argument,
+      "hub task result rejects oversize payload");
 
   ProdigySDK::Bytes outboundStatisticsFrame;
   suite.expect(

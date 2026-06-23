@@ -296,6 +296,15 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
         }
         return (cursor == terminal);
       }
+    case MothershipTopic::pullTaskReport:
+      {
+        uint64_t deploymentID = 0;
+        if (extractFixed(cursor, terminal, deploymentID) == false)
+        {
+          return false;
+        }
+        return (cursor == terminal);
+      }
     case MothershipTopic::pullClusterReport:
     case MothershipTopic::pullRoutableSubnets:
     case MothershipTopic::pullRoutableResourceLeases:
@@ -715,6 +724,29 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
         }
         return (cursor == terminal);
       }
+    case NeuronTopic::taskAttemptTerminal:
+      {
+        uint64_t deploymentID = 0;
+        uint32_t attemptNumber = 0;
+        uint128_t containerUUID = 0;
+        if (extractFixed(cursor, terminal, deploymentID) == false)
+        {
+          return false;
+        }
+        if (extractFixed(cursor, terminal, attemptNumber) == false)
+        {
+          return false;
+        }
+        if (extractFixed(cursor, terminal, containerUUID) == false)
+        {
+          return false;
+        }
+        if (consumeVariable(cursor, terminal) == false)
+        {
+          return false;
+        }
+        return (cursor == terminal);
+      }
     case NeuronTopic::requestContainerBlob:
       {
         uint64_t deploymentID = 0;
@@ -902,6 +934,20 @@ static bool validateNeuronPayloadForNeuron(uint16_t rawTopic, uint8_t *args, uin
         }
         return (cursor == terminal);
       }
+    case NeuronTopic::taskAttemptTerminalAck:
+      {
+        uint64_t deploymentID = 0;
+        uint32_t attemptNumber = 0;
+        if (extractFixed(cursor, terminal, deploymentID) == false)
+        {
+          return false;
+        }
+        if (extractFixed(cursor, terminal, attemptNumber) == false)
+        {
+          return false;
+        }
+        return (cursor == terminal);
+      }
     case NeuronTopic::updateOS:
       {
         if (consumeVariable(cursor, terminal) == false)
@@ -1058,6 +1104,10 @@ static bool validateContainerPayloadForNeuron(uint16_t rawTopic, uint8_t *args, 
       {
         return consumeMetricPairs(cursor, terminal);
       }
+    case ContainerTopic::taskResult:
+      {
+        return uint64_t(terminal - cursor) <= prodigyTaskResultMaxBytes;
+      }
     case ContainerTopic::resourceDeltaAck:
       {
         bool accepted = false;
@@ -1167,6 +1217,10 @@ static bool validateContainerPayloadForHub(uint16_t rawTopic, uint8_t *args, uin
     case ContainerTopic::statistics:
       {
         return consumeMetricPairs(cursor, terminal);
+      }
+    case ContainerTopic::taskResult:
+      {
+        return uint64_t(terminal - cursor) <= prodigyTaskResultMaxBytes;
       }
     case ContainerTopic::resourceDeltaAck:
       {
