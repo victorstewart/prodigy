@@ -501,50 +501,6 @@ protected:
     return false;
   }
 
-  template <typename Key, StringType MapName, typename Equals>
-  void syncOverlayPresenceMap(BPFProgram *program,
-                              MapName&& mapName,
-                              Vector<Key>& installedKeys,
-                              const Vector<Key>& desiredKeys,
-                              Equals&& equals)
-  {
-    if (program == nullptr)
-    {
-      installedKeys = desiredKeys;
-      return;
-    }
-
-    program->openMap(mapName, [&](int map_fd) -> void {
-      if (map_fd < 0)
-      {
-        basics_log("Neuron missing overlay presence map=%s\n", mapName.c_str());
-        return;
-      }
-
-      for (const Key& existing : installedKeys)
-      {
-        if (overlayKeyPresent(desiredKeys, existing, equals) == false)
-        {
-          if (bpf_map_delete_elem(map_fd, &existing) != 0)
-          {
-            basics_log("Neuron overlay presence delete failed map=%s errno=%d\n", mapName.c_str(), errno);
-          }
-        }
-      }
-
-      __u8 present = 1;
-      for (const Key& desired : desiredKeys)
-      {
-        if (bpf_map_update_elem(map_fd, &desired, &present, BPF_ANY) != 0)
-        {
-          basics_log("Neuron overlay presence update failed map=%s errno=%d\n", mapName.c_str(), errno);
-        }
-      }
-    });
-
-    installedKeys = desiredKeys;
-  }
-
   template <typename Key, typename Value, StringType MapName, typename Equals>
   void syncOverlayValueMap(BPFProgram *program,
                            MapName&& mapName,
@@ -628,10 +584,6 @@ protected:
 
   void syncOverlayRoutingPrograms(void)
   {
-    Vector<switchboard_overlay_prefix4_key> desiredPrefixes4 = {};
-    Vector<switchboard_overlay_prefix6_key> desiredPrefixes6 = {};
-    switchboardBuildOverlayPrefixKeys(overlayRoutingConfig.overlaySubnets, desiredPrefixes4, desiredPrefixes6);
-
     prodigySyncOverlayEgressRoutingProgram(tcx_ingress_program,
                                            overlayRoutingConfig,
                                            installedIngressOverlayPrefixes4,
@@ -640,21 +592,6 @@ protected:
                                            installedIngressOverlayRouteKeysLow8,
                                            installedIngressHostedIngressRouteKeys4,
                                            installedIngressHostedIngressRouteKeys6);
-
-    syncOverlayPresenceMap(tcx_egress_program,
-                           "ovl_pfx4"_ctv,
-                           installedEgressOverlayPrefixes4,
-                           desiredPrefixes4,
-                           [](const switchboard_overlay_prefix4_key& lhs, const switchboard_overlay_prefix4_key& rhs) -> bool {
-                             return switchboardOverlayPrefix4Equals(lhs, rhs);
-                           });
-    syncOverlayPresenceMap(tcx_egress_program,
-                           "ovl_pfx6"_ctv,
-                           installedEgressOverlayPrefixes6,
-                           desiredPrefixes6,
-                           [](const switchboard_overlay_prefix6_key& lhs, const switchboard_overlay_prefix6_key& rhs) -> bool {
-                             return switchboardOverlayPrefix6Equals(lhs, rhs);
-                           });
 
     prodigySyncOverlayEgressRoutingProgram(tcx_egress_program,
                                            overlayRoutingConfig,
