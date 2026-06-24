@@ -648,6 +648,39 @@ public:
 
 private:
 
+  class ContainerDeviceMapSnapshot {
+  public:
+
+    uint32_t ifidxByFragment[256] = {};
+  };
+
+  static void addContainerToDeviceMapSnapshot(ContainerDeviceMapSnapshot& snapshot, Container *container, Container *excludedContainer)
+  {
+    if (container == nullptr || container == excludedContainer || container->plan.useHostNetworkNamespace || container->netdevs.areActive() == false)
+    {
+      return;
+    }
+
+    snapshot.ifidxByFragment[container->plan.fragment] = container->netdevs.host.ifidx;
+  }
+
+  static ContainerDeviceMapSnapshot buildContainerDeviceMapSnapshot(Container *extraContainer = nullptr, Container *excludedContainer = nullptr)
+  {
+    ContainerDeviceMapSnapshot snapshot = {};
+    if (thisNeuron == nullptr)
+    {
+      return snapshot;
+    }
+
+    for (const auto& [uuid, container] : thisNeuron->containers)
+    {
+      addContainerToDeviceMapSnapshot(snapshot, container, excludedContainer);
+    }
+
+    addContainerToDeviceMapSnapshot(snapshot, extraContainer, excludedContainer);
+    return snapshot;
+  }
+
   static bool writeContainerDeviceMapEntry(int mapFD, uint32_t fragment, uint32_t ifidx, const char *scope, uint64_t ownerUUID, String *failureReport = nullptr)
   {
     if (mapFD < 0)
@@ -702,7 +735,15 @@ private:
     return true;
   }
 
-  static bool syncContainerDeviceMapForProgram(BPFProgram *program, uint64_t ownerUUID, uint32_t nicIfidx, bool includeNIC, Container *extraContainer = nullptr, Container *excludedContainer = nullptr, String *failureReport = nullptr)
+  static bool syncContainerDeviceMapForProgram(
+      BPFProgram *program,
+      uint64_t ownerUUID,
+      uint32_t nicIfidx,
+      bool includeNIC,
+      const ContainerDeviceMapSnapshot& snapshot,
+      Container *extraContainer = nullptr,
+      Container *excludedContainer = nullptr,
+      String *failureReport = nullptr)
   {
     if (program == nullptr || thisNeuron == nullptr)
     {
@@ -762,26 +803,11 @@ private:
 
       for (uint32_t fragment = 0; fragment < 256; fragment += 1)
       {
-        uint32_t desiredIfidx = (includeNIC && fragment == 0) ? nicIfidx : 0;
-
-        auto considerContainer = [&](Container *container) -> void {
-          if (container == nullptr || container == excludedContainer || container->plan.useHostNetworkNamespace || container->netdevs.areActive() == false)
-          {
-            return;
-          }
-
-          if (container->plan.fragment == fragment)
-          {
-            desiredIfidx = container->netdevs.host.ifidx;
-          }
-        };
-
-        for (const auto& [uuid, container] : thisNeuron->containers)
+        uint32_t desiredIfidx = snapshot.ifidxByFragment[fragment];
+        if (includeNIC && fragment == 0 && desiredIfidx == 0)
         {
-          considerContainer(container);
+          desiredIfidx = nicIfidx;
         }
-
-        considerContainer(extraContainer);
 
         if (traceHostIngress && desiredIfidx != 0)
         {
@@ -812,10 +838,11 @@ private:
     }
 
     bool ok = true;
+    const ContainerDeviceMapSnapshot snapshot = buildContainerDeviceMapSnapshot(extraContainer, excludedContainer);
 
     if (thisNeuron->tcx_ingress_program)
     {
-      ok = syncContainerDeviceMapForProgram(thisNeuron->tcx_ingress_program, 0, 0, false, extraContainer, excludedContainer, failureReport) && ok;
+      ok = syncContainerDeviceMapForProgram(thisNeuron->tcx_ingress_program, 0, 0, false, snapshot, extraContainer, excludedContainer, failureReport) && ok;
     }
 
     auto syncEgressProgram = [&](Container *container) -> void {
@@ -828,6 +855,7 @@ private:
                                             container->plan.uuid,
                                             thisNeuron->eth.ifidx,
                                             true,
+                                            snapshot,
                                             extraContainer,
                                             excludedContainer,
                                             failureReport) &&
