@@ -1,6 +1,8 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <cstring>
 #include <services/debug.h>
 #include <memory>
 
@@ -1287,22 +1289,28 @@ private:
     portal->quicCidKeyMaterialByIndex[1] = wormhole.quicCidKeyState.keyMaterialByIndex[1];
   }
 
-  template <typename Key, typename Equals>
-  static bool ownedRoutablePrefixKeyPresent(const Vector<Key>& keys, const Key& needle, Equals&& equals)
+  static bool ownedRoutablePrefix4KeyLess(const switchboard_owned_routable_prefix4_key& lhs, const switchboard_owned_routable_prefix4_key& rhs)
   {
-    for (const Key& candidate : keys)
+    if (lhs.prefixlen != rhs.prefixlen)
     {
-      if (equals(candidate, needle))
-      {
-        return true;
-      }
+      return lhs.prefixlen < rhs.prefixlen;
     }
 
-    return false;
+    return lhs.addr < rhs.addr;
   }
 
-  template <typename Key, typename Equals>
-  void syncOwnedRoutablePrefixMap(StringType auto&& mapName, Vector<Key>& installedKeys, const Vector<Key>& desiredKeys, Equals&& equals)
+  static bool ownedRoutablePrefix6KeyLess(const switchboard_owned_routable_prefix6_key& lhs, const switchboard_owned_routable_prefix6_key& rhs)
+  {
+    if (lhs.prefixlen != rhs.prefixlen)
+    {
+      return lhs.prefixlen < rhs.prefixlen;
+    }
+
+    return std::memcmp(lhs.addr, rhs.addr, sizeof(lhs.addr)) < 0;
+  }
+
+  template <typename Key, typename Less>
+  void syncOwnedRoutablePrefixMap(StringType auto&& mapName, Vector<Key>& installedKeys, const Vector<Key>& desiredKeys, Less&& less)
   {
     if (bpf_router == nullptr)
     {
@@ -1326,30 +1334,19 @@ private:
                        unsigned(desiredKeys.size()),
                        unsigned(installedKeys.size()));
 
-      for (const Key& existing : installedKeys)
-      {
-        if (ownedRoutablePrefixKeyPresent(desiredKeys, existing, equals) == false)
-        {
-          if (bpf_map_delete_elem(map_fd, &existing) != 0)
-          {
-            basics_log("Switchboard owned-routable delete failed map=%s ifidx=%u errno=%d\n",
-                       mapName.c_str(),
-                       eth.ifidx,
-                       errno);
-            appendAttachLogf("Switchboard owned-routable delete failed ifidx=%u map=%s errno=%d",
-                             eth.ifidx,
-                             mapName.c_str(),
-                             errno);
-          }
-        }
-      }
+      Vector<Key> installedSorted = installedKeys;
+      Vector<Key> desiredSorted = desiredKeys;
+      std::sort(installedSorted.begin(), installedSorted.end(), less);
+      std::sort(desiredSorted.begin(), desiredSorted.end(), less);
 
+      auto installedIt = installedSorted.begin();
+      auto desiredIt = desiredSorted.begin();
       __u8 present = 1;
-      for (const Key& desired : desiredKeys)
+      while (installedIt != installedSorted.end() || desiredIt != desiredSorted.end())
       {
-        if (ownedRoutablePrefixKeyPresent(installedKeys, desired, equals) == false)
+        if (installedIt == installedSorted.end())
         {
-          if (bpf_map_update_elem(map_fd, &desired, &present, BPF_ANY) != 0)
+          if (bpf_map_update_elem(map_fd, &(*desiredIt), &present, BPF_ANY) != 0)
           {
             basics_log("Switchboard owned-routable update failed map=%s ifidx=%u errno=%d\n",
                        mapName.c_str(),
@@ -1360,7 +1357,63 @@ private:
                              mapName.c_str(),
                              errno);
           }
+          ++desiredIt;
+          continue;
         }
+
+        if (desiredIt == desiredSorted.end())
+        {
+          if (bpf_map_delete_elem(map_fd, &(*installedIt)) != 0)
+          {
+            basics_log("Switchboard owned-routable delete failed map=%s ifidx=%u errno=%d\n",
+                       mapName.c_str(),
+                       eth.ifidx,
+                       errno);
+            appendAttachLogf("Switchboard owned-routable delete failed ifidx=%u map=%s errno=%d",
+                             eth.ifidx,
+                             mapName.c_str(),
+                             errno);
+          }
+          ++installedIt;
+          continue;
+        }
+
+        if (less(*installedIt, *desiredIt))
+        {
+          if (bpf_map_delete_elem(map_fd, &(*installedIt)) != 0)
+          {
+            basics_log("Switchboard owned-routable delete failed map=%s ifidx=%u errno=%d\n",
+                       mapName.c_str(),
+                       eth.ifidx,
+                       errno);
+            appendAttachLogf("Switchboard owned-routable delete failed ifidx=%u map=%s errno=%d",
+                             eth.ifidx,
+                             mapName.c_str(),
+                             errno);
+          }
+          ++installedIt;
+          continue;
+        }
+
+        if (less(*desiredIt, *installedIt))
+        {
+          if (bpf_map_update_elem(map_fd, &(*desiredIt), &present, BPF_ANY) != 0)
+          {
+            basics_log("Switchboard owned-routable update failed map=%s ifidx=%u errno=%d\n",
+                       mapName.c_str(),
+                       eth.ifidx,
+                       errno);
+            appendAttachLogf("Switchboard owned-routable update failed ifidx=%u map=%s errno=%d",
+                             eth.ifidx,
+                             mapName.c_str(),
+                             errno);
+          }
+          ++desiredIt;
+          continue;
+        }
+
+        ++installedIt;
+        ++desiredIt;
       }
     });
 
@@ -1387,16 +1440,12 @@ private:
     syncOwnedRoutablePrefixMap("owned_pfx4"_ctv,
                                installedOwnedRoutablePrefixes4,
                                desiredPrefixes4,
-                               [](const switchboard_owned_routable_prefix4_key& lhs, const switchboard_owned_routable_prefix4_key& rhs) -> bool {
-                                 return switchboardOwnedRoutablePrefix4Equals(lhs, rhs);
-                               });
+                               ownedRoutablePrefix4KeyLess);
 
     syncOwnedRoutablePrefixMap("owned_pfx6"_ctv,
                                installedOwnedRoutablePrefixes6,
                                desiredPrefixes6,
-                               [](const switchboard_owned_routable_prefix6_key& lhs, const switchboard_owned_routable_prefix6_key& rhs) -> bool {
-                                 return switchboardOwnedRoutablePrefix6Equals(lhs, rhs);
-                               });
+                               ownedRoutablePrefix6KeyLess);
   }
 
   template <typename Equals>
