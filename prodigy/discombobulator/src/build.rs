@@ -50,6 +50,11 @@ struct MaterializedBase {
     identity: String,
 }
 
+enum FullyCachedBase {
+    Artifact(PathBuf, String, i64),
+    Rootfs(String, PathBuf),
+}
+
 struct BuildSession {
     work_root: PathBuf,
     tmp_root: PathBuf,
@@ -358,10 +363,13 @@ fn execute_supported_subset(
         }
     }
 
-    if output_kind == OutputKind::Base {
-        if let Some((artifact_path, digest, size_bytes)) =
-            try_reuse_fully_cached_base_artifact(storage, resolved, contexts)?
-        {
+    let fully_cached_base = if output_kind == OutputKind::Base {
+        try_reuse_fully_cached_base(storage, resolved, contexts)?
+    } else {
+        None
+    };
+    let fully_cached_base = match fully_cached_base {
+        Some(FullyCachedBase::Artifact(artifact_path, digest, size_bytes)) => {
             if let Some(parent) = output_path.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -379,7 +387,8 @@ fn execute_supported_subset(
             println!("built {}", output_path.display());
             return Ok(());
         }
-    }
+        other => other,
+    };
 
     let session = BuildSession::start(storage)?;
 
@@ -387,33 +396,42 @@ fn execute_supported_subset(
     let workspace_root = runtime_root.join("workspace");
     fs::create_dir_all(&workspace_root)?;
 
-    let base_identity =
-        materialize_base_into_workspace(registry, storage, &session, &workspace_root, resolved)?;
-
-    let final_step_key = execute_steps(
-        storage,
-        &session,
-        &workspace_root,
-        &base_identity,
-        resolved,
-        contexts,
-    )?;
-
-    let artifact_root = match output_kind {
-        OutputKind::App | OutputKind::MothershipTunnelProvider => {
-            let projected_root = session.work_root().join("final");
-            assemble_app_tree(&workspace_root, &projected_root, resolved)?;
-
-            let artifact_root = session.work_root().join("artifact");
-            fs::create_dir_all(artifact_root.join(".prodigy-private"))?;
-            fs::rename(&projected_root, artifact_root.join("rootfs"))?;
-            write_launch_metadata(
-                &artifact_root.join(".prodigy-private/launch.metadata"),
+    let (final_step_key, artifact_root) = match fully_cached_base {
+        Some(FullyCachedBase::Rootfs(step_key, rootfs)) => (step_key, rootfs),
+        _ => {
+            let base_identity = materialize_base_into_workspace(
+                registry,
+                storage,
+                &session,
+                &workspace_root,
                 resolved,
             )?;
-            artifact_root
+            let final_step_key = execute_steps(
+                storage,
+                &session,
+                &workspace_root,
+                &base_identity,
+                resolved,
+                contexts,
+            )?;
+            let artifact_root = match output_kind {
+                OutputKind::App | OutputKind::MothershipTunnelProvider => {
+                    let projected_root = session.work_root().join("final");
+                    assemble_app_tree(&workspace_root, &projected_root, resolved)?;
+
+                    let artifact_root = session.work_root().join("artifact");
+                    fs::create_dir_all(artifact_root.join(".prodigy-private"))?;
+                    fs::rename(&projected_root, artifact_root.join("rootfs"))?;
+                    write_launch_metadata(
+                        &artifact_root.join(".prodigy-private/launch.metadata"),
+                        resolved,
+                    )?;
+                    artifact_root
+                }
+                OutputKind::Base => workspace_root.clone(),
+            };
+            (final_step_key, artifact_root)
         }
-        OutputKind::Base => workspace_root.clone(),
     };
 
     if let Some(parent) = output_path.parent() {
@@ -1012,11 +1030,11 @@ fn base_artifact_cache_key_from_step_key(step_key: &str, arch: Architecture) -> 
     hex::encode(hasher.finalize())
 }
 
-fn try_reuse_fully_cached_base_artifact(
+fn try_reuse_fully_cached_base(
     storage: &StorageRoot,
     resolved: &ResolvedBuildSpec,
     contexts: &BTreeMap<String, PathBuf>,
-) -> Result<Option<(PathBuf, String, i64)>> {
+) -> Result<Option<FullyCachedBase>> {
     if matches!(&resolved.from.source, FromSource::Scratch) == false {
         return Ok(None);
     }
@@ -1025,6 +1043,7 @@ fn try_reuse_fully_cached_base_artifact(
         &format!("scratch:{}", resolved.from.arch.as_str()),
         resolved.from.arch,
     );
+    let mut final_cached_rootfs = None;
     for step in &resolved.steps {
         let step_key =
             compute_step_cache_key(&parent_key, resolved.from.arch, step, contexts, None)?;
@@ -1035,16 +1054,18 @@ fn try_reuse_fully_cached_base_artifact(
             return Ok(None);
         }
         parent_key = step_key;
+        final_cached_rootfs = Some(cached_rootfs);
     }
 
     let artifact_key = base_artifact_cache_key_from_step_key(&parent_key, resolved.from.arch);
     let cached_artifact =
         storage.artifact_blob_path("base", resolved.from.arch.as_str(), &artifact_key);
     if cached_artifact.exists() {
-        return Ok(Some(cached_artifact_metadata(cached_artifact)?));
+        let (path, digest, size_bytes) = cached_artifact_metadata(cached_artifact)?;
+        return Ok(Some(FullyCachedBase::Artifact(path, digest, size_bytes)));
     }
 
-    Ok(None)
+    Ok(final_cached_rootfs.map(|rootfs| FullyCachedBase::Rootfs(parent_key, rootfs)))
 }
 
 fn compute_step_cache_key(
