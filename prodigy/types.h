@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <type_traits>
+#include <utility>
 
 #include <prodigy/machine.hardware.types.h>
 #include <prodigy/runtime.environment.h>
@@ -7722,6 +7724,22 @@ public:
   Value value = {};
 };
 
+template <typename Key, typename Value>
+class ProdigyPersistentMapEntryRef {
+public:
+
+  const Key *key = nullptr;
+  const Value *value = nullptr;
+};
+
+template <typename T>
+struct ProdigyPersistentSerializerIsWriter : std::false_type {
+};
+
+template <typename OutputAdapter, typename Context>
+struct ProdigyPersistentSerializerIsWriter<bitsery::Serializer<OutputAdapter, Context>> : std::true_type {
+};
+
 static inline bool prodigyPersistentStringComesBefore(const String& lhs, const String& rhs)
 {
   size_t common = std::min(lhs.size(), rhs.size());
@@ -7735,7 +7753,31 @@ static inline bool prodigyPersistentStringComesBefore(const String& lhs, const S
 }
 
 template <typename S, typename Key, typename Value, typename SerializeKey, typename SerializeValue, typename Compare>
-static void prodigySerializePersistentMapAsEntries(
+static void prodigyWritePersistentMapAsEntries(
+    S&& serializer,
+    bytell_hash_map<Key, Value>& map,
+    SerializeKey&& serializeKey,
+    SerializeValue&& serializeValue,
+    Compare&& compare)
+{
+  Vector<ProdigyPersistentMapEntryRef<Key, Value>> entries = {};
+  entries.reserve(map.size());
+  for (const auto& [key, value] : map)
+  {
+    entries.push_back(ProdigyPersistentMapEntryRef<Key, Value> {&key, &value});
+  }
+
+  std::sort(entries.begin(), entries.end(), [&](const auto& lhs, const auto& rhs) -> bool {
+    return compare(*lhs.key, *rhs.key);
+  });
+  serializer.container(entries, UINT32_MAX, [&](S& serializer, ProdigyPersistentMapEntryRef<Key, Value>& entry) {
+    serializeKey(serializer, const_cast<Key&>(*entry.key));
+    serializeValue(serializer, const_cast<Value&>(*entry.value));
+  });
+}
+
+template <typename S, typename Key, typename Value, typename SerializeKey, typename SerializeValue, typename Compare>
+static void prodigyReadPersistentMapAsEntries(
     S&& serializer,
     bytell_hash_map<Key, Value>& map,
     SerializeKey&& serializeKey,
@@ -7743,25 +7785,56 @@ static void prodigySerializePersistentMapAsEntries(
     Compare&& compare)
 {
   Vector<ProdigyPersistentMapEntry<Key, Value>> entries = {};
-  entries.reserve(map.size());
-  for (const auto& [key, value] : map)
-  {
-    ProdigyPersistentMapEntry<Key, Value> entry = {};
-    entry.key = key;
-    entry.value = value;
-    entries.push_back(std::move(entry));
-  }
-
-  std::sort(entries.begin(), entries.end(), compare);
   serializer.container(entries, UINT32_MAX, [&](S& serializer, ProdigyPersistentMapEntry<Key, Value>& entry) {
     serializeKey(serializer, entry.key);
     serializeValue(serializer, entry.value);
   });
 
-  map.clear();
+  if (serializer.adapter().error() != bitsery::ReaderError::NoError)
+  {
+    return;
+  }
+
+  std::sort(entries.begin(), entries.end(), [&](const auto& lhs, const auto& rhs) -> bool {
+    return compare(lhs.key, rhs.key);
+  });
+
+  bytell_hash_map<Key, Value> decoded = {};
+  decoded.reserve(entries.size());
   for (ProdigyPersistentMapEntry<Key, Value>& entry : entries)
   {
-    map.insert_or_assign(std::move(entry.key), std::move(entry.value));
+    decoded.insert_or_assign(std::move(entry.key), std::move(entry.value));
+  }
+
+  map.swap(decoded);
+}
+
+template <typename S, typename Key, typename Value, typename SerializeKey, typename SerializeValue, typename Compare>
+static void prodigySerializePersistentMapAsEntries(
+    S&& serializer,
+    bytell_hash_map<Key, Value>& map,
+    SerializeKey&& serializeKey,
+    SerializeValue&& serializeValue,
+    Compare&& compare)
+{
+  using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
+  if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
+  {
+    prodigyWritePersistentMapAsEntries(
+        serializer,
+        map,
+        std::forward<SerializeKey>(serializeKey),
+        std::forward<SerializeValue>(serializeValue),
+        std::forward<Compare>(compare));
+  }
+  else
+  {
+    prodigyReadPersistentMapAsEntries(
+        serializer,
+        map,
+        std::forward<SerializeKey>(serializeKey),
+        std::forward<SerializeValue>(serializeValue),
+        std::forward<Compare>(compare));
   }
 }
 
@@ -7809,8 +7882,8 @@ static void serialize(S&& serializer, ProdigyPersistentMasterAuthorityPackage& p
       [](S& serializer, uint16_t& value) {
         serializer.value2b(value);
       },
-      [](const ProdigyPersistentMapEntry<String, uint16_t>& lhs, const ProdigyPersistentMapEntry<String, uint16_t>& rhs) -> bool {
-        return prodigyPersistentStringComesBefore(lhs.key, rhs.key);
+      [](const String& lhs, const String& rhs) -> bool {
+        return prodigyPersistentStringComesBefore(lhs, rhs);
       });
   if (persistTrace)
   {
@@ -7832,8 +7905,8 @@ static void serialize(S&& serializer, ProdigyPersistentMasterAuthorityPackage& p
       [](S& serializer, String& value) {
         serializer.text1b(value, UINT32_MAX);
       },
-      [](const ProdigyPersistentMapEntry<uint16_t, String>& lhs, const ProdigyPersistentMapEntry<uint16_t, String>& rhs) -> bool {
-        return lhs.key < rhs.key;
+      [](const uint16_t& lhs, const uint16_t& rhs) -> bool {
+        return lhs < rhs;
       });
   if (persistTrace)
   {

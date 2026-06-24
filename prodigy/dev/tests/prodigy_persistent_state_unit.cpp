@@ -329,6 +329,136 @@ static bool equalBrainSnapshots(const ProdigyPersistentBrainSnapshot& lhs, const
   return true;
 }
 
+class PersistentMapTrackedValue {
+public:
+
+  uint32_t payload = 0;
+
+  static inline uint32_t copies = 0;
+  static inline uint32_t moves = 0;
+
+  PersistentMapTrackedValue(void) = default;
+
+  explicit PersistentMapTrackedValue(uint32_t payload)
+      : payload(payload)
+  {
+  }
+
+  PersistentMapTrackedValue(const PersistentMapTrackedValue& other)
+      : payload(other.payload)
+  {
+    copies += 1;
+  }
+
+  PersistentMapTrackedValue& operator=(const PersistentMapTrackedValue& other)
+  {
+    payload = other.payload;
+    copies += 1;
+    return *this;
+  }
+
+  PersistentMapTrackedValue(PersistentMapTrackedValue&& other) noexcept
+      : payload(other.payload)
+  {
+    moves += 1;
+  }
+
+  PersistentMapTrackedValue& operator=(PersistentMapTrackedValue&& other) noexcept
+  {
+    payload = other.payload;
+    moves += 1;
+    return *this;
+  }
+
+  static void resetCounters(void)
+  {
+    copies = 0;
+    moves = 0;
+  }
+};
+
+class PersistentMapSerializationProbe {
+public:
+
+  bytell_hash_map<String, PersistentMapTrackedValue> values;
+};
+
+template <typename S>
+static void serialize(S&& serializer, PersistentMapTrackedValue& value)
+{
+  serializer.value4b(value.payload);
+}
+
+template <typename S>
+static void serialize(S&& serializer, PersistentMapSerializationProbe& probe)
+{
+  prodigySerializePersistentMapAsEntries(
+      serializer,
+      probe.values,
+      [](S& serializer, String& key) {
+        serializer.text1b(key, UINT32_MAX);
+      },
+      [](S& serializer, PersistentMapTrackedValue& value) {
+        serializer.object(value);
+      },
+      [](const String& lhs, const String& rhs) -> bool {
+        return prodigyPersistentStringComesBefore(lhs, rhs);
+      });
+}
+
+static void insertPersistentMapProbeValue(PersistentMapSerializationProbe& probe, const char *key, uint32_t payload)
+{
+  String ownedKey = {};
+  ownedKey.assign(key);
+  probe.values.insert_or_assign(std::move(ownedKey), PersistentMapTrackedValue(payload));
+}
+
+static bool persistentMapProbeContains(const PersistentMapSerializationProbe& probe, const char *key, uint32_t payload)
+{
+  String ownedKey = {};
+  ownedKey.assign(key);
+  auto it = probe.values.find(ownedKey);
+  return it != probe.values.end() && it->second.payload == payload;
+}
+
+static void testPersistentMapDirectionalSerialization(TestSuite& suite)
+{
+  PersistentMapSerializationProbe first = {};
+  insertPersistentMapProbeValue(first, "gamma", 3);
+  insertPersistentMapProbeValue(first, "alpha", 1);
+  insertPersistentMapProbeValue(first, "beta", 2);
+
+  PersistentMapSerializationProbe second = {};
+  insertPersistentMapProbeValue(second, "beta", 2);
+  insertPersistentMapProbeValue(second, "gamma", 3);
+  insertPersistentMapProbeValue(second, "alpha", 1);
+
+  PersistentMapTrackedValue::resetCounters();
+  String firstBytes = {};
+  suite.expect(BitseryEngine::serialize(firstBytes, first) > 0, "persistent_map_directional_writer_serializes");
+  suite.expect(PersistentMapTrackedValue::copies == 0, "persistent_map_directional_writer_avoids_value_copies");
+  suite.expect(PersistentMapTrackedValue::moves == 0, "persistent_map_directional_writer_avoids_value_moves");
+
+  String secondBytes = {};
+  suite.expect(BitseryEngine::serialize(secondBytes, second) > 0, "persistent_map_directional_second_writer_serializes");
+  suite.expect(firstBytes.equals(secondBytes), "persistent_map_directional_writer_is_deterministic");
+
+  PersistentMapSerializationProbe decoded = {};
+  suite.expect(BitseryEngine::deserializeSafe(firstBytes, decoded), "persistent_map_directional_reader_deserializes");
+  suite.expect(decoded.values.size() == 3, "persistent_map_directional_reader_count");
+  suite.expect(persistentMapProbeContains(decoded, "alpha", 1), "persistent_map_directional_reader_alpha");
+  suite.expect(persistentMapProbeContains(decoded, "beta", 2), "persistent_map_directional_reader_beta");
+  suite.expect(persistentMapProbeContains(decoded, "gamma", 3), "persistent_map_directional_reader_gamma");
+
+  PersistentMapSerializationProbe existing = {};
+  insertPersistentMapProbeValue(existing, "sentinel", 99);
+  String truncated = firstBytes;
+  truncated.trim(1);
+  suite.expect(BitseryEngine::deserializeSafe(truncated, existing) == false, "persistent_map_directional_reader_rejects_truncation");
+  suite.expect(existing.values.size() == 1, "persistent_map_directional_failed_reader_preserves_count");
+  suite.expect(persistentMapProbeContains(existing, "sentinel", 99), "persistent_map_directional_failed_reader_preserves_value");
+}
+
 static void testPersistentBrainSnapshotLargeMetricSampleRoundtrip(TestSuite& suite)
 {
   ProdigyPersistentBrainSnapshot snapshot = {};
@@ -433,6 +563,7 @@ static bool generateApplicationTlsFactory(ApplicationTlsVaultFactory& factory, S
 int main(void)
 {
   TestSuite suite;
+  testPersistentMapDirectionalSerialization(suite);
   testPersistentBrainSnapshotLargeMetricSampleRoundtrip(suite);
 
   char scratch[] = "/tmp/nametag-prodigy-persistent-state-XXXXXX";
