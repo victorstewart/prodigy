@@ -17009,173 +17009,107 @@ public:
   }
 #endif
 
+private:
+
+  void runUpsertDNSBinding(int argc, char *argv[])
+  {
+    runDNSBindingMutation(MothershipTopic::upsertDNSBinding, argc, argv);
+  }
+
+  void runDeleteDNSBinding(int argc, char *argv[])
+  {
+    runDNSBindingMutation(MothershipTopic::deleteDNSBinding, argc, argv);
+  }
+
+  void runACMEPresentDNS01ChallengeHook(int argc, char *argv[])
+  {
+    runACMEDNS01ChallengeHook(MothershipTopic::presentACMEDNS01Challenge, argc, argv);
+  }
+
+  void runACMECleanupDNS01ChallengeHook(int argc, char *argv[])
+  {
+    runACMEDNS01ChallengeHook(MothershipTopic::cleanupACMEDNS01Challenge, argc, argv);
+  }
+
 public:
 
   void start(int argc, char *argv[])
   {
-    String operation;
-    operation.setInvariant(argv[0]);
+    struct Command {
+      const char *name;
+      void (Mothership::*handler)(int, char **);
+    };
+
+    constexpr static Command commands[] = {
+        {"acme-cleanup-dns-01",             &Mothership::runACMECleanupDNS01ChallengeHook  },
+        {"acme-import-lineage",             &Mothership::runACMELineageImportHook          },
+        {"acme-present-dns-01",             &Mothership::runACMEPresentDNS01ChallengeHook  },
+        {"applicationReport",               &Mothership::runApplicationReport              },
+        {"clusterReport",                   &Mothership::runClusterReport                  },
+        {"configureTestCluster",            &Mothership::runConfigureTestCluster           },
+        {"createCluster",                   &Mothership::runCreateCluster                  },
+        {"createProviderCredential",        &Mothership::runCreateProviderCredential       },
+        {"deleteDNSBinding",                &Mothership::runDeleteDNSBinding               },
+        {"deleteMachineSchema",             &Mothership::runDeleteMachineSchema            },
+        {"deltaMachineBudget",              &Mothership::runDeltaMachineBudget             },
+        {"deploy",                          &Mothership::runDeploy                         },
+        {"destroyProviderClusterMachines",  &Mothership::runDestroyProviderClusterMachines },
+        {"destroyProviderMachines",         &Mothership::runDestroyProviderMachines        },
+        {"estimateClusterHourlyCost",       &Mothership::runEstimateClusterHourlyCost      },
+        {"mintClientTlsIdentity",           &Mothership::runMintClientTlsIdentity          },
+        {"printClusters",                   &Mothership::runPrintClusters                  },
+        {"pullDNSBindings",                 &Mothership::runPullDNSBindings                },
+        {"pullProviderCredential",          &Mothership::runPullProviderCredential         },
+        {"pullProviderCredentials",         &Mothership::runPullProviderCredentials        },
+        {"pullRoutableResourceLeases",      &Mothership::runPullRoutableResourceLeases     },
+        {"pullRoutableSubnets",             &Mothership::runPullRoutableSubnets            },
+        {"recommendClusterForApplications", &Mothership::runRecommendClusterForApplications},
+        {"registerRoutableSubnet",          &Mothership::runRegisterRoutableSubnet         },
+        {"removeCluster",                   &Mothership::runRemoveCluster                  },
+        {"removeProviderCredential",        &Mothership::runRemoveProviderCredential       },
+        {"reserveApplicationID",            &Mothership::runReserveApplicationID           },
+        {"reserveServiceID",                &Mothership::runReserveServiceID               },
+        {"setLocalClusterMembership",       &Mothership::runSetLocalClusterMembership      },
+        {"setTestClusterMachineCount",      &Mothership::runSetTestClusterMachineCount     },
+        {"surveyProviderMachineOffers",     &Mothership::runSurveyProviderMachineOffers    },
+        {"taskReport",                      &Mothership::runTaskReport                     },
+        {"unregisterRoutableSubnet",        &Mothership::runUnregisterRoutableSubnet       },
+        {"updateProdigy",                   &Mothership::runUpdateProdigy                  },
+        {"upsertApiCredentialSet",          &Mothership::runUpsertApiCredentialSet         },
+        {"upsertDNSBinding",                &Mothership::runUpsertDNSBinding               },
+        {"upsertMachineSchemas",            &Mothership::runUpsertMachineSchemas           },
+        {"upsertTlsVaultFactory",           &Mothership::runUpsertTlsVaultFactory          },
+    };
+
+    const char *operationText = argv[0];
 
     argc -= 1;
     argv += 1;
 
-    if (operation.equal("deploy"_ctv))
+    size_t lower = 0;
+    size_t upper = sizeof(commands) / sizeof(commands[0]);
+    while (lower < upper)
     {
-      runDeploy(argc, argv);
+      size_t mid = lower + ((upper - lower) / 2);
+      int cmp = std::strcmp(commands[mid].name, operationText);
+      if (cmp < 0)
+      {
+        lower = mid + 1;
+      }
+      else
+      {
+        upper = mid;
+      }
     }
-    else if (operation.equal("applicationReport"_ctv))
+
+    if (lower < sizeof(commands) / sizeof(commands[0]) && std::strcmp(commands[lower].name, operationText) == 0)
     {
-      runApplicationReport(argc, argv);
+      (this->*commands[lower].handler)(argc, argv);
+      return;
     }
-    else if (operation.equal("taskReport"_ctv))
-    {
-      runTaskReport(argc, argv);
-    }
-    else if (operation.equal("clusterReport"_ctv))
-    {
-      runClusterReport(argc, argv);
-    }
-    else if (operation.equal("createProviderCredential"_ctv))
-    {
-      runCreateProviderCredential(argc, argv);
-    }
-    else if (operation.equal("pullProviderCredential"_ctv))
-    {
-      runPullProviderCredential(argc, argv);
-    }
-    else if (operation.equal("pullProviderCredentials"_ctv))
-    {
-      runPullProviderCredentials(argc, argv);
-    }
-    else if (operation.equal("removeProviderCredential"_ctv))
-    {
-      runRemoveProviderCredential(argc, argv);
-    }
-    else if (operation.equal("destroyProviderMachines"_ctv))
-    {
-      runDestroyProviderMachines(argc, argv);
-    }
-    else if (operation.equal("destroyProviderClusterMachines"_ctv))
-    {
-      runDestroyProviderClusterMachines(argc, argv);
-    }
-    else if (operation.equal("surveyProviderMachineOffers"_ctv))
-    {
-      runSurveyProviderMachineOffers(argc, argv);
-    }
-    else if (operation.equal("estimateClusterHourlyCost"_ctv))
-    {
-      runEstimateClusterHourlyCost(argc, argv);
-    }
-    else if (operation.equal("recommendClusterForApplications"_ctv))
-    {
-      runRecommendClusterForApplications(argc, argv);
-    }
-    else if (operation.equal("createCluster"_ctv))
-    {
-      runCreateCluster(argc, argv);
-    }
-    else if (operation.equal("configureTestCluster"_ctv))
-    {
-      runConfigureTestCluster(argc, argv);
-    }
-    else if (operation.equal("printClusters"_ctv))
-    {
-      runPrintClusters(argc, argv);
-    }
-    else if (operation.equal("setLocalClusterMembership"_ctv))
-    {
-      runSetLocalClusterMembership(argc, argv);
-    }
-    else if (operation.equal("setTestClusterMachineCount"_ctv))
-    {
-      runSetTestClusterMachineCount(argc, argv);
-    }
-    else if (operation.equal("upsertMachineSchemas"_ctv))
-    {
-      runUpsertMachineSchemas(argc, argv);
-    }
-    else if (operation.equal("deltaMachineBudget"_ctv))
-    {
-      runDeltaMachineBudget(argc, argv);
-    }
-    else if (operation.equal("deleteMachineSchema"_ctv))
-    {
-      runDeleteMachineSchema(argc, argv);
-    }
-    else if (operation.equal("removeCluster"_ctv))
-    {
-      runRemoveCluster(argc, argv);
-    }
-    else if (operation.equal("updateProdigy"_ctv))
-    {
-      runUpdateProdigy(argc, argv);
-    }
-    else if (operation.equal("reserveApplicationID"_ctv))
-    {
-      runReserveApplicationID(argc, argv);
-    }
-    else if (operation.equal("reserveServiceID"_ctv))
-    {
-      runReserveServiceID(argc, argv);
-    }
-    else if (operation.equal("upsertTlsVaultFactory"_ctv))
-    {
-      runUpsertTlsVaultFactory(argc, argv);
-    }
-    else if (operation.equal("upsertApiCredentialSet"_ctv))
-    {
-      runUpsertApiCredentialSet(argc, argv);
-    }
-    else if (operation.equal("registerRoutableSubnet"_ctv))
-    {
-      runRegisterRoutableSubnet(argc, argv);
-    }
-    else if (operation.equal("unregisterRoutableSubnet"_ctv))
-    {
-      runUnregisterRoutableSubnet(argc, argv);
-    }
-    else if (operation.equal("pullRoutableSubnets"_ctv))
-    {
-      runPullRoutableSubnets(argc, argv);
-    }
-    else if (operation.equal("pullRoutableResourceLeases"_ctv))
-    {
-      runPullRoutableResourceLeases(argc, argv);
-    }
-    else if (operation.equal("upsertDNSBinding"_ctv))
-    {
-      runDNSBindingMutation(MothershipTopic::upsertDNSBinding, argc, argv);
-    }
-    else if (operation.equal("deleteDNSBinding"_ctv))
-    {
-      runDNSBindingMutation(MothershipTopic::deleteDNSBinding, argc, argv);
-    }
-    else if (operation.equal("pullDNSBindings"_ctv))
-    {
-      runPullDNSBindings(argc, argv);
-    }
-    else if (operation.equal("mintClientTlsIdentity"_ctv))
-    {
-      runMintClientTlsIdentity(argc, argv);
-    }
-    else if (operation.equal("acme-present-dns-01"_ctv))
-    {
-      runACMEDNS01ChallengeHook(MothershipTopic::presentACMEDNS01Challenge, argc, argv);
-    }
-    else if (operation.equal("acme-cleanup-dns-01"_ctv))
-    {
-      runACMEDNS01ChallengeHook(MothershipTopic::cleanupACMEDNS01Challenge, argc, argv);
-    }
-    else if (operation.equal("acme-import-lineage"_ctv))
-    {
-      runACMELineageImportHook(argc, argv);
-    }
-    else
-    {
-      basics_log("operation invalid\n");
-      exit(EXIT_FAILURE);
-    }
+
+    basics_log("operation invalid\n");
+    exit(EXIT_FAILURE);
   }
 };
 
