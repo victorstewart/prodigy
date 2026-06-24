@@ -837,6 +837,14 @@ public:
   bytell_hash_map<String, BrainTlsResumptionWormholeState> wormholes;
 };
 
+class PublicTlsCertbotJob {
+public:
+
+  pid_t pid = -1;
+  int64_t startedAtMs = 0;
+  int lockFD = -1;
+};
+
 class Brain : public BrainBase, public TimeoutDispatcher {
 public:
 
@@ -936,9 +944,7 @@ public:
   bytell_hash_map<uint16_t, ApplicationTlsVaultFactory> tlsVaultFactoriesByApp;
   bytell_hash_map<uint16_t, ApplicationApiCredentialSet> apiCredentialSetsByApp;
   bytell_hash_map<uint64_t, BrainTlsResumptionDeploymentState> tlsResumptionStateByDeployment;
-  bytell_hash_map<String, pid_t> publicTlsCertbotPids;
-  bytell_hash_map<String, int64_t> publicTlsCertbotStartedAtMs;
-  bytell_hash_map<String, int> publicTlsCertbotLockFDs;
+  bytell_hash_map<String, PublicTlsCertbotJob> publicTlsCertbotJobs;
   bytell_hash_map<String, uint16_t> reservedApplicationIDsByName;
   bytell_hash_map<uint16_t, String> reservedApplicationNamesByID;
   bytell_hash_map<String, ApplicationServiceIdentity> reservedApplicationServicesByNameKey;
@@ -2479,38 +2485,36 @@ public:
     return nullptr;
   }
 
-  void releasePublicTlsCertbotLock(const String& key)
+  static void releasePublicTlsCertbotLock(PublicTlsCertbotJob& job)
   {
-    auto lockIt = publicTlsCertbotLockFDs.find(key);
-    if (lockIt == publicTlsCertbotLockFDs.end())
+    if (job.lockFD < 0)
     {
       return;
     }
-    int fd = lockIt->second;
-    prodigyReleaseCertbotLockFD(fd);
-    publicTlsCertbotLockFDs.erase(lockIt);
+    prodigyReleaseCertbotLockFD(job.lockFD);
+    job.lockFD = -1;
   }
 
   void cancelPublicTlsCertbotProcess(const String& key)
   {
-    auto it = publicTlsCertbotPids.find(key);
-    if (it != publicTlsCertbotPids.end())
+    auto jobIt = publicTlsCertbotJobs.find(key);
+    if (jobIt == publicTlsCertbotJobs.end())
     {
-      pid_t pid = it->second;
-      if (pid > 0)
-      {
-        int status = 0;
-        kill(pid, SIGTERM);
-        if (waitpid(pid, &status, WNOHANG) == 0)
-        {
-          kill(pid, SIGKILL);
-          (void)waitpid(pid, &status, 0);
-        }
-      }
-      publicTlsCertbotPids.erase(it);
+      return;
     }
-    publicTlsCertbotStartedAtMs.erase(key);
-    releasePublicTlsCertbotLock(key);
+    pid_t pid = jobIt->second.pid;
+    if (pid > 0)
+    {
+      int status = 0;
+      kill(pid, SIGTERM);
+      if (waitpid(pid, &status, WNOHANG) == 0)
+      {
+        kill(pid, SIGKILL);
+        (void)waitpid(pid, &status, 0);
+      }
+    }
+    releasePublicTlsCertbotLock(jobIt->second);
+    publicTlsCertbotJobs.erase(jobIt);
   }
 
   PublicTlsCertificateState *findTransferablePublicTlsCertificateState(const PublicTlsCertificateSpec& spec)
@@ -2518,7 +2522,7 @@ public:
     for (PublicTlsCertificateState& certificate : masterAuthorityRuntimeState.publicTlsCertificates)
     {
       if (certificate.spec.deploymentID != spec.deploymentID &&
-          publicTlsCertbotPids.find(publicTlsCertificateRuntimeKey(certificate)) == publicTlsCertbotPids.end() &&
+          publicTlsCertbotJobs.find(publicTlsCertificateRuntimeKey(certificate)) == publicTlsCertbotJobs.end() &&
           publicTlsCertificateTransferCompatible(certificate, spec))
       {
         return &certificate;
@@ -2771,7 +2775,7 @@ public:
   {
     auto appIt = deploymentsByApp.find(certificate.spec.applicationID);
     if (appIt == deploymentsByApp.end() || appIt->second == nullptr || appIt->second->plan.config.deploymentID() == certificate.spec.deploymentID ||
-        publicTlsCertbotPids.find(publicTlsCertificateRuntimeKey(certificate)) != publicTlsCertbotPids.end())
+        publicTlsCertbotJobs.find(publicTlsCertificateRuntimeKey(certificate)) != publicTlsCertbotJobs.end())
     {
       return false;
     }
@@ -6883,22 +6887,22 @@ public:
   uint32_t reapPublicTlsCertbotProcesses(int64_t nowMs)
   {
     uint32_t reaped = 0;
-    for (auto it = publicTlsCertbotPids.begin(); it != publicTlsCertbotPids.end();)
+    for (auto it = publicTlsCertbotJobs.begin(); it != publicTlsCertbotJobs.end();)
     {
+      PublicTlsCertbotJob& job = it->second;
       int status = 0;
-      pid_t result = waitpid(it->second, &status, WNOHANG);
+      pid_t result = waitpid(job.pid, &status, WNOHANG);
       int waitErrno = result < 0 ? errno : 0;
       String failure = {};
       if (result == 0)
       {
-        auto started = publicTlsCertbotStartedAtMs.find(it->first);
-        if (started == publicTlsCertbotStartedAtMs.end() || started->second <= 0 || nowMs - started->second < publicTlsCertbotTimeoutMs)
+        if (job.startedAtMs <= 0 || nowMs - job.startedAtMs < publicTlsCertbotTimeoutMs)
         {
           ++it;
           continue;
         }
-        kill(it->second, SIGKILL);
-        result = waitpid(it->second, &status, 0);
+        kill(job.pid, SIGKILL);
+        result = waitpid(job.pid, &status, 0);
         waitErrno = result < 0 ? errno : 0;
         failure.assign("certbot process timed out"_ctv);
       }
@@ -6931,9 +6935,8 @@ public:
         }
         (void)cleanupPublicTlsPendingDNS01Challenges(*certificate);
       }
-      publicTlsCertbotStartedAtMs.erase(it->first);
-      releasePublicTlsCertbotLock(it->first);
-      it = publicTlsCertbotPids.erase(it);
+      releasePublicTlsCertbotLock(job);
+      it = publicTlsCertbotJobs.erase(it);
       reaped += 1;
       if (certificate != nullptr)
       {
@@ -6979,7 +6982,7 @@ public:
         continue;
       }
       String key = publicTlsCertificateRuntimeKey(certificate);
-      if (publicTlsCertbotPids.find(key) != publicTlsCertbotPids.end())
+      if (publicTlsCertbotJobs.find(key) != publicTlsCertbotJobs.end())
       {
         continue;
       }
@@ -7028,10 +7031,7 @@ public:
       }
 
       certificate.lastFailure.clear();
-      publicTlsCertbotPids.insert_or_assign(key, pid);
-      publicTlsCertbotStartedAtMs.insert_or_assign(key, nowMs);
-      releasePublicTlsCertbotLock(key);
-      publicTlsCertbotLockFDs.insert_or_assign(key, lockFD);
+      publicTlsCertbotJobs.insert_or_assign(key, PublicTlsCertbotJob {pid, nowMs, lockFD});
       noteMasterAuthorityRuntimeStateChanged();
       started += 1;
     }

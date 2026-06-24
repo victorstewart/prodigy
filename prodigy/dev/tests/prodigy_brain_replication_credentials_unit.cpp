@@ -4800,7 +4800,6 @@ static void testMothershipTunnelGatewayClientCertificateAdmission(TestSuite& sui
   suite.expect(failure.size() == 0, "mothership_tunnel_gateway_admit_clears_failure");
   suite.expect(context.authorizeClientCertificate(nullptr, &failure) == false && failure.equal("mothership tunnel gateway client certificate invalid"_ctv), "mothership_tunnel_gateway_rejects_missing_client_cert");
   suite.expect(context.authorizeClientCertificate(serverCert.get(), &failure) == false && failure.equal("mothership tunnel gateway client certificate invalid"_ctv), "mothership_tunnel_gateway_rejects_server_cert_as_client");
-
 }
 
 static void testMothershipTunnelProviderDesiredStateMasterAuthorityReplicationApplies(TestSuite& suite)
@@ -8861,12 +8860,12 @@ static void testCertificateLifecycleSchedulers(TestSuite& suite)
     bool lockBusy = false;
     suite.expect(prodigyAcquireCertbotCertificateLock(brain.brainConfig, brain.masterAuthorityRuntimeState.publicTlsCertificates[0], paths, lockFD, &lockBusy, &failure), "public_tls_scheduler_lock_fixture_acquires");
     suite.expect(brain.advancePublicTlsCertificateLifecycles(nowMs, paths) == 0, "public_tls_scheduler_lock_blocks_duplicate_spawn");
-    suite.expect(brain.publicTlsCertbotPids.empty() && brain.publicTlsCertbotLockFDs.empty(), "public_tls_scheduler_lock_skips_child_state");
+    suite.expect(brain.publicTlsCertbotJobs.empty(), "public_tls_scheduler_lock_skips_child_state");
     suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].lastAttemptMs == 0, "public_tls_scheduler_lock_does_not_record_attempt");
     prodigyReleaseCertbotLockFD(lockFD);
 
     suite.expect(brain.advancePublicTlsCertificateLifecycles(nowMs, paths) == 1, "public_tls_scheduler_starts_certbot");
-    suite.expect(brain.publicTlsCertbotLockFDs.size() == 1, "public_tls_scheduler_records_certbot_lock");
+    suite.expect(brain.publicTlsCertbotJobs.size() == 1 && brain.publicTlsCertbotJobs.begin()->second.lockFD >= 0, "public_tls_scheduler_records_certbot_lock");
 
     uint32_t reaped = 0;
     for (uint32_t attempt = 0; attempt < 100 && reaped == 0; attempt += 1)
@@ -8878,7 +8877,7 @@ static void testCertificateLifecycleSchedulers(TestSuite& suite)
       }
     }
     suite.expect(reaped == 1, "public_tls_scheduler_reaps_certbot");
-    suite.expect(brain.publicTlsCertbotLockFDs.empty(), "public_tls_scheduler_reap_releases_certbot_lock");
+    suite.expect(brain.publicTlsCertbotJobs.empty(), "public_tls_scheduler_reap_releases_certbot_lock");
     suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].lastSuccessMs == 0 && brain.masterAuthorityRuntimeState.publicTlsCertificates[0].lastFailure.size() > 0, "public_tls_scheduler_requires_import_hook");
     suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].failureCount == 1, "public_tls_scheduler_records_failure_count");
     suite.expect(brain.advancePublicTlsCertificateLifecycles(nowMs, paths) == 0, "public_tls_scheduler_backoff_blocks_same_tick_retry");
@@ -9074,9 +9073,14 @@ static void testCertificateLifecycleSchedulers(TestSuite& suite)
     int64_t nowMs = Time::now<TimeResolution::ms>();
     suite.expect(brain.advancePublicTlsCertificateLifecycles(nowMs, paths) == 1, "public_tls_scheduler_timeout_starts_certbot");
     String key = TestBrain::publicTlsCertificateRuntimeKey(brain.masterAuthorityRuntimeState.publicTlsCertificates[0]);
-    brain.publicTlsCertbotStartedAtMs.insert_or_assign(key, nowMs - TestBrain::publicTlsCertbotTimeoutMs - 1);
+    auto jobIt = brain.publicTlsCertbotJobs.find(key);
+    suite.expect(jobIt != brain.publicTlsCertbotJobs.end(), "public_tls_scheduler_timeout_records_child_state");
+    if (jobIt != brain.publicTlsCertbotJobs.end())
+    {
+      jobIt->second.startedAtMs = nowMs - TestBrain::publicTlsCertbotTimeoutMs - 1;
+    }
     suite.expect(brain.reapPublicTlsCertbotProcesses(nowMs) == 1, "public_tls_scheduler_timeout_reaps_certbot");
-    suite.expect(brain.publicTlsCertbotPids.empty() && brain.publicTlsCertbotStartedAtMs.empty(), "public_tls_scheduler_timeout_clears_process_state");
+    suite.expect(brain.publicTlsCertbotJobs.empty(), "public_tls_scheduler_timeout_clears_process_state");
     suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].lastFailure.equal("certbot process timed out"_ctv), "public_tls_scheduler_timeout_records_failure");
     suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].pendingDNS01Challenges.empty(), "public_tls_scheduler_timeout_forgets_cleaned_txt_value");
     suite.expect(dns.cleanupTXTCalls == 1 && dns.activeTXT.empty(), "public_tls_scheduler_timeout_cleans_pending_txt_value");
@@ -9206,7 +9210,7 @@ static void testCertificateLifecycleSchedulers(TestSuite& suite)
     suite.expect(certificate.identity.certPem.equals(certPem) && certificate.identity.keyPem.equals(keyPem), "public_tls_scheduler_recovery_imports_lineage_identity");
     suite.expect(certificate.lastSuccessMs >= certificate.lastAttemptMs && certificate.lastFailure.size() == 0, "public_tls_scheduler_recovery_records_success");
     suite.expect(certificate.failureCount == 0, "public_tls_scheduler_recovery_clears_failure_count");
-    suite.expect(brain.publicTlsCertbotPids.empty(), "public_tls_scheduler_recovery_leaves_no_child_pid");
+    suite.expect(brain.publicTlsCertbotJobs.empty(), "public_tls_scheduler_recovery_leaves_no_child_pid");
   }
 
   {
