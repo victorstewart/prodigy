@@ -898,6 +898,7 @@ fn execute_steps(
         contexts,
     )?;
     let mut parent_key = seed_step_cache_key(base_identity, resolved.from.arch);
+    let mut pending_cached_rootfs: Option<PathBuf> = None;
     for step in &resolved.steps {
         ctx.copy_match_cache.borrow_mut().clear();
         let step_key = compute_step_cache_key(
@@ -912,7 +913,7 @@ fn execute_steps(
             .step_cache_root(ctx.target_arch.as_str(), &step_key);
         let cached_rootfs = cache_root.join("rootfs");
         if cached_rootfs.exists() {
-            restore_workspace_from_cache(&cached_rootfs, ctx.workspace_root)?;
+            pending_cached_rootfs = Some(cached_rootfs);
             parent_key = step_key;
             continue;
         }
@@ -923,9 +924,13 @@ fn execute_steps(
             &format!("{}:{step_key}", ctx.target_arch.as_str()),
         )?;
         if cached_rootfs.exists() {
-            restore_workspace_from_cache(&cached_rootfs, ctx.workspace_root)?;
+            pending_cached_rootfs = Some(cached_rootfs);
             parent_key = step_key;
             continue;
+        }
+
+        if let Some(rootfs) = pending_cached_rootfs.take() {
+            restore_workspace_from_cache(&rootfs, ctx.workspace_root)?;
         }
 
         match step {
@@ -942,6 +947,9 @@ fn execute_steps(
             ctx.workspace_root,
         )?;
         parent_key = step_key;
+    }
+    if let Some(rootfs) = pending_cached_rootfs {
+        restore_workspace_from_cache(&rootfs, ctx.workspace_root)?;
     }
     Ok(parent_key)
 }
