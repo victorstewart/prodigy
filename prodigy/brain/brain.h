@@ -940,7 +940,6 @@ public:
   bytell_hash_map<uint128_t, Machine *> machinesByUUID;
   ProdigyDNSProvider *dnsProvider = nullptr;
 
-  bytell_hash_map<String, uint32_t> nReservedRequestedBySlug;
   bytell_hash_map<uint16_t, ApplicationTlsVaultFactory> tlsVaultFactoriesByApp;
   bytell_hash_map<uint16_t, ApplicationApiCredentialSet> apiCredentialSetsByApp;
   bytell_hash_map<uint64_t, BrainTlsResumptionDeploymentState> tlsResumptionStateByDeployment;
