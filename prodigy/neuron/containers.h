@@ -131,19 +131,50 @@ static bool prodigyOverlayKeyPresent(const Vector<Key>& haystack, const Key& nee
   return false;
 }
 
-template <typename Key, StringType MapName, typename Equals>
+template <typename Key>
+struct ProdigyOverlayPresenceMirror {
+  Vector<Key> keys = {};
+  uint32_t mapID = 0;
+};
+
+static bool prodigyOverlayPrefix4KeyLess(const switchboard_overlay_prefix4_key& lhs, const switchboard_overlay_prefix4_key& rhs)
+{
+  if (lhs.prefixlen != rhs.prefixlen)
+  {
+    return lhs.prefixlen < rhs.prefixlen;
+  }
+
+  return lhs.addr < rhs.addr;
+}
+
+static bool prodigyOverlayPrefix6KeyLess(const switchboard_overlay_prefix6_key& lhs, const switchboard_overlay_prefix6_key& rhs)
+{
+  if (lhs.prefixlen != rhs.prefixlen)
+  {
+    return lhs.prefixlen < rhs.prefixlen;
+  }
+
+  return std::memcmp(lhs.addr, rhs.addr, sizeof(lhs.addr)) < 0;
+}
+
+template <typename Key, StringType MapName, typename Less>
 static void prodigySyncOverlayPresenceMap(BPFProgram *program,
                                           MapName&& mapName,
-                                          Vector<Key>& installedKeys,
-                                          const Vector<Key>& desiredKeys,
-                                          Equals&& equals)
+                                          ProdigyOverlayPresenceMirror<Key>& installed,
+                                          Vector<Key>& desiredKeys,
+                                          Less&& less)
 {
+  std::sort(desiredKeys.begin(), desiredKeys.end(), less);
+
   if (program == nullptr)
   {
-    installedKeys = desiredKeys;
+    installed.keys = desiredKeys;
+    installed.mapID = 0;
     return;
   }
 
+  bool mapInfoAvailable = false;
+  uint32_t mapID = 0;
   program->openMap(mapName, [&](int map_fd) -> void {
     if (map_fd < 0)
     {
@@ -151,28 +182,70 @@ static void prodigySyncOverlayPresenceMap(BPFProgram *program,
       return;
     }
 
-    for (const Key& existing : installedKeys)
+    struct bpf_map_info mapInfo = {};
+    __u32 mapInfoLen = sizeof(mapInfo);
+    mapInfoAvailable = (bpf_map_get_info_by_fd(map_fd, &mapInfo, &mapInfoLen) == 0);
+    mapID = mapInfoAvailable ? uint32_t(mapInfo.id) : 0;
+
+    const bool mirrorTrusted = mapInfoAvailable && installed.mapID != 0 && installed.mapID == mapID;
+    const bool mapRecreated = mapInfoAvailable && installed.mapID != 0 && installed.mapID != mapID;
+    __u8 present = 1;
+    auto installedIt = installed.keys.begin();
+    auto desiredIt = desiredKeys.begin();
+
+    while (installedIt != installed.keys.end() || desiredIt != desiredKeys.end())
     {
-      if (prodigyOverlayKeyPresent(desiredKeys, existing, equals) == false)
+      if (installedIt == installed.keys.end())
       {
-        if (bpf_map_delete_elem(map_fd, &existing) != 0)
+        if (bpf_map_update_elem(map_fd, &(*desiredIt), &present, BPF_ANY) != 0)
+        {
+          basics_log("Prodigy overlay presence update failed map=%s errno=%d\n", mapName.c_str(), errno);
+        }
+        ++desiredIt;
+        continue;
+      }
+
+      if (desiredIt == desiredKeys.end())
+      {
+        if (mapRecreated == false && bpf_map_delete_elem(map_fd, &(*installedIt)) != 0)
         {
           basics_log("Prodigy overlay presence delete failed map=%s errno=%d\n", mapName.c_str(), errno);
         }
+        ++installedIt;
+        continue;
       }
-    }
 
-    __u8 present = 1;
-    for (const Key& desired : desiredKeys)
-    {
-      if (bpf_map_update_elem(map_fd, &desired, &present, BPF_ANY) != 0)
+      if (less(*installedIt, *desiredIt))
+      {
+        if (mapRecreated == false && bpf_map_delete_elem(map_fd, &(*installedIt)) != 0)
+        {
+          basics_log("Prodigy overlay presence delete failed map=%s errno=%d\n", mapName.c_str(), errno);
+        }
+        ++installedIt;
+        continue;
+      }
+
+      if (less(*desiredIt, *installedIt))
+      {
+        if (bpf_map_update_elem(map_fd, &(*desiredIt), &present, BPF_ANY) != 0)
+        {
+          basics_log("Prodigy overlay presence update failed map=%s errno=%d\n", mapName.c_str(), errno);
+        }
+        ++desiredIt;
+        continue;
+      }
+
+      if (mirrorTrusted == false && bpf_map_update_elem(map_fd, &(*desiredIt), &present, BPF_ANY) != 0)
       {
         basics_log("Prodigy overlay presence update failed map=%s errno=%d\n", mapName.c_str(), errno);
       }
+      ++installedIt;
+      ++desiredIt;
     }
   });
 
-  installedKeys = desiredKeys;
+  installed.keys = desiredKeys;
+  installed.mapID = mapInfoAvailable ? mapID : 0;
 }
 
 template <typename Key, typename Value, StringType MapName, typename Equals>
@@ -280,8 +353,8 @@ static void prodigyBuildOverlayDesiredHostedIngressRoutes(const SwitchboardOverl
 
 static void prodigySyncOverlayEgressRoutingProgram(BPFProgram *program,
                                                    const SwitchboardOverlayRoutingConfig& config,
-                                                   Vector<switchboard_overlay_prefix4_key>& installedPrefixes4,
-                                                   Vector<switchboard_overlay_prefix6_key>& installedPrefixes6,
+                                                   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix4_key>& installedPrefixes4,
+                                                   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix6_key>& installedPrefixes6,
                                                    Vector<switchboard_overlay_machine_route_key>& installedRouteKeysFull,
                                                    Vector<switchboard_overlay_machine_route_key>& installedRouteKeysLow8,
                                                    Vector<switchboard_overlay_prefix4_key>& installedHostedIngressRouteKeys4,
@@ -295,16 +368,12 @@ static void prodigySyncOverlayEgressRoutingProgram(BPFProgram *program,
                                 "ovl_pfx4"_ctv,
                                 installedPrefixes4,
                                 desiredPrefixes4,
-                                [](const switchboard_overlay_prefix4_key& lhs, const switchboard_overlay_prefix4_key& rhs) -> bool {
-                                  return switchboardOverlayPrefix4Equals(lhs, rhs);
-                                });
+                                prodigyOverlayPrefix4KeyLess);
   prodigySyncOverlayPresenceMap(program,
                                 "ovl_pfx6"_ctv,
                                 installedPrefixes6,
                                 desiredPrefixes6,
-                                [](const switchboard_overlay_prefix6_key& lhs, const switchboard_overlay_prefix6_key& rhs) -> bool {
-                                  return switchboardOverlayPrefix6Equals(lhs, rhs);
-                                });
+                                prodigyOverlayPrefix6KeyLess);
 
   Vector<std::pair<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route>> desiredRoutesFull = {};
   Vector<std::pair<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route>> desiredRoutesLow8 = {};
@@ -639,8 +708,8 @@ public:
   BPFProgram *peer_program = nullptr;
   BPFProgram *primary_program = nullptr;
   ContainerDeviceMapMirror peerDeviceMapMirror;
-  Vector<switchboard_overlay_prefix4_key> installedPeerOverlayPrefixes4 = {};
-  Vector<switchboard_overlay_prefix6_key> installedPeerOverlayPrefixes6 = {};
+  ProdigyOverlayPresenceMirror<switchboard_overlay_prefix4_key> installedPeerOverlayPrefixes4 = {};
+  ProdigyOverlayPresenceMirror<switchboard_overlay_prefix6_key> installedPeerOverlayPrefixes6 = {};
   Vector<switchboard_overlay_machine_route_key> installedPeerOverlayRouteKeysFull = {};
   Vector<switchboard_overlay_machine_route_key> installedPeerOverlayRouteKeysLow8 = {};
   Vector<switchboard_overlay_prefix4_key> installedPeerHostedIngressRouteKeys4 = {};
