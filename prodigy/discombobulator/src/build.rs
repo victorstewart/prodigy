@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Cursor, Read, Write};
@@ -2575,16 +2575,25 @@ fn resolve_needed_libraries_from_workspace(
     workspace_root: &Path,
     needed: &[String],
 ) -> Result<Vec<PathBuf>> {
+    let library_index = index_workspace_libraries(workspace_root)?;
     let mut resolved = Vec::new();
     for library in needed {
-        resolved.push(resolve_needed_library(workspace_root, library)?);
+        let Some(path) = library_index.get(OsStr::new(library)) else {
+            bail!(
+                "failed to resolve ELF dependency {} inside {}",
+                library,
+                workspace_root.display()
+            );
+        };
+        resolved.push(path.clone());
     }
     resolved.sort();
     resolved.dedup();
     Ok(resolved)
 }
 
-fn resolve_needed_library(workspace_root: &Path, library: &str) -> Result<PathBuf> {
+fn index_workspace_libraries(workspace_root: &Path) -> Result<BTreeMap<OsString, PathBuf>> {
+    let mut libraries = BTreeMap::new();
     for prefix in ["lib", "lib64", "usr/lib", "usr/lib64"] {
         let root = workspace_root.join(prefix);
         if root.exists() == false {
@@ -2592,17 +2601,16 @@ fn resolve_needed_library(workspace_root: &Path, library: &str) -> Result<PathBu
         }
         for entry in WalkDir::new(&root).follow_links(false) {
             let entry = entry?;
-            if entry.file_name() == OsStr::new(library) {
-                return Ok(Path::new("/").join(entry.path().strip_prefix(workspace_root)?));
+            let name = entry.file_name().to_os_string();
+            if libraries.contains_key(&name) == false {
+                libraries.insert(
+                    name,
+                    Path::new("/").join(entry.path().strip_prefix(workspace_root)?),
+                );
             }
         }
     }
-
-    bail!(
-        "failed to resolve ELF dependency {} inside {}",
-        library,
-        workspace_root.display()
-    )
+    Ok(libraries)
 }
 
 fn copy_runtime_path(
