@@ -2816,10 +2816,6 @@ fn copy_internal_entry(source: &Path, destination: &Path) -> Result<()> {
             destination,
             fs::Permissions::from_mode(metadata.permissions().mode()),
         )?;
-        for entry in fs::read_dir(source)? {
-            let entry = entry?;
-            copy_internal_entry(&entry.path(), &destination.join(entry.file_name()))?;
-        }
         return Ok(());
     }
 
