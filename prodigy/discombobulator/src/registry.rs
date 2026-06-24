@@ -4,12 +4,14 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::fs::OpenOptions;
+use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const LOCK_EXCLUSIVE: i32 = 2;
 const LOCK_UNLOCK: i32 = 8;
+const STREAMING_SHA256_THRESHOLD_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct StorageRoot {
@@ -403,9 +405,27 @@ impl Registry {
 }
 
 pub fn sha256_file(path: &Path) -> Result<String> {
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let digest = Sha256::digest(bytes);
-    Ok(hex::encode(digest))
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    if metadata.len() <= STREAMING_SHA256_THRESHOLD_BYTES {
+        let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+        return Ok(hex::encode(Sha256::digest(bytes)));
+    }
+
+    let mut file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn epoch_seconds() -> i64 {

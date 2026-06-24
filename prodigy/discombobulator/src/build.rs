@@ -1075,8 +1075,8 @@ fn hash_copy_source(hasher: &mut Sha256, context_root: &Path, source: &Path) -> 
     }
 
     hasher.update(b"\ntype\nfile\n");
-    let bytes = fs::read(source)?;
-    hasher.update(sha256_prefixed(&bytes).as_bytes());
+    hasher.update(b"sha256:");
+    hasher.update(sha256_file(source)?.as_bytes());
     Ok(())
 }
 
