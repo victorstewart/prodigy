@@ -55,6 +55,18 @@ struct BuildSession {
     tmp_root: PathBuf,
 }
 
+type CopyMatchCache = RefCell<BTreeMap<(String, String), Vec<PathBuf>>>;
+
+struct BuildCtx<'a> {
+    storage: &'a StorageRoot,
+    session: &'a BuildSession,
+    workspace_root: &'a Path,
+    host_arch: Architecture,
+    target_arch: Architecture,
+    contexts: &'a BTreeMap<String, PathBuf>,
+    copy_match_cache: CopyMatchCache,
+}
+
 #[derive(Deserialize, Serialize)]
 struct SessionLease {
     pid: u32,
@@ -106,6 +118,26 @@ impl Drop for BuildSession {
     fn drop(&mut self) {
         let _ = remove_existing_path(&self.work_root);
         let _ = remove_existing_path(&self.tmp_root);
+    }
+}
+
+impl<'a> BuildCtx<'a> {
+    fn new(
+        storage: &'a StorageRoot,
+        session: &'a BuildSession,
+        workspace_root: &'a Path,
+        target_arch: Architecture,
+        contexts: &'a BTreeMap<String, PathBuf>,
+    ) -> Result<Self> {
+        Ok(Self {
+            storage,
+            session,
+            workspace_root,
+            host_arch: host_architecture()?,
+            target_arch,
+            contexts,
+            copy_match_cache: RefCell::new(BTreeMap::new()),
+        })
     }
 }
 
@@ -858,41 +890,56 @@ fn execute_steps(
     resolved: &ResolvedBuildSpec,
     contexts: &BTreeMap<String, PathBuf>,
 ) -> Result<String> {
-    let host_arch = host_architecture()?;
+    let ctx = BuildCtx::new(
+        storage,
+        session,
+        workspace_root,
+        resolved.from.arch,
+        contexts,
+    )?;
     let mut parent_key = seed_step_cache_key(base_identity, resolved.from.arch);
     for step in &resolved.steps {
-        let step_key = compute_step_cache_key(&parent_key, resolved.from.arch, step, contexts)?;
-        let cache_root = storage.step_cache_root(resolved.from.arch.as_str(), &step_key);
+        ctx.copy_match_cache.borrow_mut().clear();
+        let step_key = compute_step_cache_key(
+            &parent_key,
+            ctx.target_arch,
+            step,
+            ctx.contexts,
+            Some(&ctx.copy_match_cache),
+        )?;
+        let cache_root = ctx
+            .storage
+            .step_cache_root(ctx.target_arch.as_str(), &step_key);
         let cached_rootfs = cache_root.join("rootfs");
         if cached_rootfs.exists() {
-            restore_workspace_from_cache(&cached_rootfs, workspace_root)?;
+            restore_workspace_from_cache(&cached_rootfs, ctx.workspace_root)?;
             parent_key = step_key;
             continue;
         }
 
         let _lock = FileLockGuard::acquire(
-            storage,
+            ctx.storage,
             "step-cache",
-            &format!("{}:{step_key}", resolved.from.arch.as_str()),
+            &format!("{}:{step_key}", ctx.target_arch.as_str()),
         )?;
         if cached_rootfs.exists() {
-            restore_workspace_from_cache(&cached_rootfs, workspace_root)?;
+            restore_workspace_from_cache(&cached_rootfs, ctx.workspace_root)?;
             parent_key = step_key;
             continue;
         }
 
         match step {
-            ResolvedBuildStep::Copy(copy) => apply_copy(workspace_root, copy, contexts)?,
+            ResolvedBuildStep::Copy(copy) => apply_copy(&ctx, copy)?,
             ResolvedBuildStep::Run(run) => {
-                execute_run_step(workspace_root, host_arch, resolved.from.arch, run)?
+                execute_run_step(ctx.workspace_root, ctx.host_arch, ctx.target_arch, run)?
             }
         }
         publish_step_cache(
-            storage,
-            session,
-            resolved.from.arch,
+            ctx.storage,
+            ctx.session,
+            ctx.target_arch,
             &step_key,
-            workspace_root,
+            ctx.workspace_root,
         )?;
         parent_key = step_key;
     }
@@ -971,7 +1018,8 @@ fn try_reuse_fully_cached_base_artifact(
         resolved.from.arch,
     );
     for step in &resolved.steps {
-        let step_key = compute_step_cache_key(&parent_key, resolved.from.arch, step, contexts)?;
+        let step_key =
+            compute_step_cache_key(&parent_key, resolved.from.arch, step, contexts, None)?;
         let cached_rootfs = storage
             .step_cache_root(resolved.from.arch.as_str(), &step_key)
             .join("rootfs");
@@ -996,6 +1044,7 @@ fn compute_step_cache_key(
     arch: Architecture,
     step: &ResolvedBuildStep,
     contexts: &BTreeMap<String, PathBuf>,
+    copy_match_cache: Option<&CopyMatchCache>,
 ) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(STEP_CACHE_VERSION.as_bytes());
@@ -1005,21 +1054,12 @@ fn compute_step_cache_key(
     hasher.update(arch.as_str().as_bytes());
     match step {
         ResolvedBuildStep::Copy(copy) => {
-            let context_root = contexts
-                .get(&copy.context)
-                .with_context(|| format!("undefined context {}", copy.context))?;
-            let matches = resolve_context_matches(context_root, &copy.source)?;
-            if matches.is_empty() {
-                bail!(
-                    "COPY source {} matched nothing in context {}",
-                    copy.source,
-                    copy.context
-                );
-            }
+            let (context_root, matches) =
+                resolve_context_matches_for_copy(contexts, copy_match_cache, copy)?;
             hasher.update(b"\nstep\nCOPY\n");
             hasher.update(serde_json::to_vec(copy)?);
             for source in matches {
-                hash_copy_source(&mut hasher, context_root, &source)?;
+                hash_copy_source(&mut hasher, &context_root, &source)?;
             }
         }
         ResolvedBuildStep::Run(run) => {
@@ -1078,6 +1118,38 @@ fn hash_copy_source(hasher: &mut Sha256, context_root: &Path, source: &Path) -> 
     hasher.update(b"sha256:");
     hasher.update(sha256_file(source)?.as_bytes());
     Ok(())
+}
+
+fn resolve_context_matches_for_copy(
+    contexts: &BTreeMap<String, PathBuf>,
+    copy_match_cache: Option<&CopyMatchCache>,
+    copy: &crate::plan::ResolvedCopy,
+) -> Result<(PathBuf, Vec<PathBuf>)> {
+    let context_root = contexts
+        .get(&copy.context)
+        .with_context(|| format!("undefined context {}", copy.context))?
+        .clone();
+    let cache_key = (copy.context.clone(), copy.source.clone());
+    if let Some(cache) = copy_match_cache {
+        if let Some(matches) = cache.borrow().get(&cache_key).cloned() {
+            return Ok((context_root, matches));
+        }
+    }
+
+    let matches = resolve_context_matches(&context_root, &copy.source)?;
+    if matches.is_empty() {
+        bail!(
+            "COPY source {} matched nothing in context {}",
+            copy.source,
+            copy.context
+        );
+    }
+
+    if let Some(cache) = copy_match_cache {
+        cache.borrow_mut().insert(cache_key, matches.clone());
+    }
+
+    Ok((context_root, matches))
 }
 
 fn ensure_context_symlink_target(context_root: &Path, source: &Path, target: &Path) -> Result<()> {
@@ -2110,24 +2182,13 @@ fn remove_existing_path(path: &Path) -> Result<()> {
     }
 }
 
-fn apply_copy(
-    workspace_root: &Path,
-    copy: &crate::plan::ResolvedCopy,
-    contexts: &BTreeMap<String, PathBuf>,
-) -> Result<()> {
-    let context_root = contexts
-        .get(&copy.context)
-        .with_context(|| format!("undefined context {}", copy.context))?;
-    let matches = resolve_context_matches(context_root, &copy.source)?;
-    if matches.is_empty() {
-        bail!(
-            "COPY source {} matched nothing in context {}",
-            copy.source,
-            copy.context
-        );
-    }
+fn apply_copy(ctx: &BuildCtx, copy: &crate::plan::ResolvedCopy) -> Result<()> {
+    let (context_root, matches) =
+        resolve_context_matches_for_copy(ctx.contexts, Some(&ctx.copy_match_cache), copy)?;
 
-    let destination = workspace_root.join(copy.destination.trim_start_matches('/'));
+    let destination = ctx
+        .workspace_root
+        .join(copy.destination.trim_start_matches('/'));
     let destination_is_directory =
         matches.len() > 1 || destination.to_string_lossy().ends_with('/');
     if destination_is_directory {
@@ -2152,7 +2213,7 @@ fn apply_copy(
             destination.clone()
         };
 
-        copy_context_entry(context_root, &source, &target)?;
+        copy_context_entry(&context_root, &source, &target)?;
     }
 
     Ok(())
