@@ -638,6 +638,7 @@ public:
 
   BPFProgram *peer_program = nullptr;
   BPFProgram *primary_program = nullptr;
+  ContainerDeviceMapMirror peerDeviceMapMirror;
   Vector<switchboard_overlay_prefix4_key> installedPeerOverlayPrefixes4 = {};
   Vector<switchboard_overlay_prefix6_key> installedPeerOverlayPrefixes6 = {};
   Vector<switchboard_overlay_machine_route_key> installedPeerOverlayRouteKeysFull = {};
@@ -741,6 +742,7 @@ private:
       uint32_t nicIfidx,
       bool includeNIC,
       const ContainerDeviceMapSnapshot& snapshot,
+      ContainerDeviceMapMirror& mirror,
       Container *extraContainer = nullptr,
       Container *excludedContainer = nullptr,
       String *failureReport = nullptr)
@@ -767,12 +769,15 @@ private:
         return;
       }
 
+      struct bpf_map_info mapInfo = {};
+      __u32 mapInfoLen = sizeof(mapInfo);
+      bool mapInfoAvailable = (bpf_map_get_info_by_fd(mapFD, &mapInfo, &mapInfoLen) == 0);
+      uint32_t mapID = mapInfoAvailable ? uint32_t(mapInfo.id) : 0;
+
       if (traceHostIngress)
       {
-        struct bpf_map_info mapInfo = {};
-        __u32 mapInfoLen = sizeof(mapInfo);
         String traceLine = {};
-        if (bpf_map_get_info_by_fd(mapFD, &mapInfo, &mapInfoLen) == 0)
+        if (mapInfoAvailable)
         {
           traceLine.snprintf<"containerDeviceMap sync begin owner={} includeNIC={} map_fd={} map_id={} map_name={} containers={} extra={} excluded={} nic={}"_ctv>(
               ownerUUID,
@@ -801,12 +806,23 @@ private:
         prodigyAppendAttachTrace(traceLine);
       }
 
+      bool mirrorTrusted = mapInfoAvailable && mirror.valid && mirror.mapID == mapID;
+      ContainerDeviceMapMirror nextMirror = {};
+      nextMirror.valid = mapInfoAvailable;
+      nextMirror.mapID = mapID;
+
       for (uint32_t fragment = 0; fragment < 256; fragment += 1)
       {
         uint32_t desiredIfidx = snapshot.ifidxByFragment[fragment];
         if (includeNIC && fragment == 0 && desiredIfidx == 0)
         {
           desiredIfidx = nicIfidx;
+        }
+
+        nextMirror.ifidxByFragment[fragment] = desiredIfidx;
+        if (mirrorTrusted && mirror.ifidxByFragment[fragment] == desiredIfidx)
+        {
+          continue;
         }
 
         if (traceHostIngress && desiredIfidx != 0)
@@ -825,6 +841,16 @@ private:
           ok = false;
         }
       }
+
+      if (ok && mapInfoAvailable)
+      {
+        mirror = nextMirror;
+      }
+      else
+      {
+        mirror.valid = false;
+        mirror.mapID = 0;
+      }
     });
 
     return ok;
@@ -842,7 +868,7 @@ private:
 
     if (thisNeuron->tcx_ingress_program)
     {
-      ok = syncContainerDeviceMapForProgram(thisNeuron->tcx_ingress_program, 0, 0, false, snapshot, extraContainer, excludedContainer, failureReport) && ok;
+      ok = syncContainerDeviceMapForProgram(thisNeuron->tcx_ingress_program, 0, 0, false, snapshot, thisNeuron->hostIngressDeviceMapMirror, extraContainer, excludedContainer, failureReport) && ok;
     }
 
     auto syncEgressProgram = [&](Container *container) -> void {
@@ -856,6 +882,7 @@ private:
                                             thisNeuron->eth.ifidx,
                                             true,
                                             snapshot,
+                                            container->peerDeviceMapMirror,
                                             extraContainer,
                                             excludedContainer,
                                             failureReport) &&

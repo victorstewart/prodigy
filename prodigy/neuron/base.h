@@ -25,6 +25,14 @@ class ContainerPlan;
 class TaskTermination;
 class SwitchboardOverlayRoutingConfig;
 
+class ContainerDeviceMapMirror {
+public:
+
+  bool valid = false;
+  uint32_t mapID = 0;
+  uint32_t ifidxByFragment[256] = {};
+};
+
 class NeuronBase {
 public:
 
@@ -47,6 +55,7 @@ public:
   bool configuredFakeIpv4Boundary = false;
   BPFProgram *tcx_ingress_program = nullptr;
   BPFProgram *tcx_egress_program = nullptr;
+  ContainerDeviceMapMirror hostIngressDeviceMapMirror;
   struct local_container_subnet6 lcsubnet6;
 
   String metro;
