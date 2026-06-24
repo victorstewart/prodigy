@@ -117,25 +117,23 @@ static void installDatacenterMeshRoutes(NetDevice& device, uint8_t datacenterFra
   addDatacenterRoute(container_network_subnet6);
 }
 
-template <typename Key, typename Equals>
-static bool prodigyOverlayKeyPresent(const Vector<Key>& haystack, const Key& needle, Equals&& equals)
-{
-  for (const Key& candidate : haystack)
-  {
-    if (equals(candidate, needle))
-    {
-      return true;
-    }
-  }
-
-  return false;
-}
-
 template <typename Key>
 struct ProdigyOverlayPresenceMirror {
   Vector<Key> keys = {};
   uint32_t mapID = 0;
 };
+
+template <typename Key, typename Value>
+struct ProdigyOverlayValueMirror {
+  Vector<std::pair<Key, Value>> entries = {};
+  uint32_t mapID = 0;
+};
+
+template <typename Key, typename Less>
+static bool prodigyOverlayKeyEquivalent(const Key& lhs, const Key& rhs, Less&& less)
+{
+  return less(lhs, rhs) == false && less(rhs, lhs) == false;
+}
 
 static bool prodigyOverlayPrefix4KeyLess(const switchboard_overlay_prefix4_key& lhs, const switchboard_overlay_prefix4_key& rhs)
 {
@@ -155,6 +153,67 @@ static bool prodigyOverlayPrefix6KeyLess(const switchboard_overlay_prefix6_key& 
   }
 
   return std::memcmp(lhs.addr, rhs.addr, sizeof(lhs.addr)) < 0;
+}
+
+static bool prodigyOverlayMachineRouteKeyLess(const switchboard_overlay_machine_route_key& lhs, const switchboard_overlay_machine_route_key& rhs)
+{
+  return lhs.fragment < rhs.fragment;
+}
+
+static bool prodigyOverlayHostedIngressRoute4Equals(const switchboard_overlay_hosted_ingress_route4& lhs, const switchboard_overlay_hosted_ingress_route4& rhs)
+{
+  return lhs.machine_fragment == rhs.machine_fragment;
+}
+
+static bool prodigyOverlayHostedIngressRoute6Equals(const switchboard_overlay_hosted_ingress_route6& lhs, const switchboard_overlay_hosted_ingress_route6& rhs)
+{
+  return lhs.machine_fragment == rhs.machine_fragment;
+}
+
+static bool prodigyPortalDefinitionLess(const portal_definition& lhs, const portal_definition& rhs)
+{
+  int addressCompare = std::memcmp(lhs.addr6, rhs.addr6, sizeof(lhs.addr6));
+  if (addressCompare != 0)
+  {
+    return addressCompare < 0;
+  }
+
+  if (lhs.port != rhs.port)
+  {
+    return lhs.port < rhs.port;
+  }
+
+  return lhs.proto < rhs.proto;
+}
+
+template <typename Key, typename Value, typename Less>
+static void prodigySortUniqueOverlayEntries(Vector<std::pair<Key, Value>>& entries, Less&& less)
+{
+  std::stable_sort(entries.begin(), entries.end(), [&](const auto& lhs, const auto& rhs) -> bool {
+    return less(lhs.first, rhs.first);
+  });
+
+  if (entries.empty())
+  {
+    return;
+  }
+
+  uint64_t writeIndex = 0;
+  for (uint64_t readIndex = 1; readIndex < entries.size(); readIndex += 1)
+  {
+    if (prodigyOverlayKeyEquivalent(entries[writeIndex].first, entries[readIndex].first, less))
+    {
+      entries[writeIndex].second = entries[readIndex].second;
+      continue;
+    }
+
+    writeIndex += 1;
+    if (writeIndex != readIndex)
+    {
+      entries[writeIndex] = entries[readIndex];
+    }
+  }
+  entries.resize(writeIndex + 1);
 }
 
 template <typename Key, StringType MapName, typename Less>
@@ -248,26 +307,25 @@ static void prodigySyncOverlayPresenceMap(BPFProgram *program,
   installed.mapID = mapInfoAvailable ? mapID : 0;
 }
 
-template <typename Key, typename Value, StringType MapName, typename Equals>
+template <typename Key, typename Value, StringType MapName, typename Less, typename ValueEquals>
 static void prodigySyncOverlayValueMap(BPFProgram *program,
                                        MapName&& mapName,
-                                       Vector<Key>& installedKeys,
-                                       const Vector<std::pair<Key, Value>>& desiredEntries,
-                                       Equals&& equals)
+                                       ProdigyOverlayValueMirror<Key, Value>& installed,
+                                       Vector<std::pair<Key, Value>>& desiredEntries,
+                                       Less&& less,
+                                       ValueEquals&& valueEquals)
 {
-  Vector<Key> desiredKeys = {};
-  desiredKeys.reserve(desiredEntries.size());
-  for (const auto& entry : desiredEntries)
-  {
-    desiredKeys.push_back(entry.first);
-  }
+  prodigySortUniqueOverlayEntries(desiredEntries, less);
 
   if (program == nullptr)
   {
-    installedKeys = desiredKeys;
+    installed.entries = desiredEntries;
+    installed.mapID = 0;
     return;
   }
 
+  bool mapInfoAvailable = false;
+  uint32_t mapID = 0;
   program->openMap(mapName, [&](int map_fd) -> void {
     if (map_fd < 0)
     {
@@ -275,27 +333,70 @@ static void prodigySyncOverlayValueMap(BPFProgram *program,
       return;
     }
 
-    for (const Key& existing : installedKeys)
+    struct bpf_map_info mapInfo = {};
+    __u32 mapInfoLen = sizeof(mapInfo);
+    mapInfoAvailable = (bpf_map_get_info_by_fd(map_fd, &mapInfo, &mapInfoLen) == 0);
+    mapID = mapInfoAvailable ? uint32_t(mapInfo.id) : 0;
+
+    const bool mirrorTrusted = mapInfoAvailable && installed.mapID != 0 && installed.mapID == mapID;
+    const bool mapRecreated = mapInfoAvailable && installed.mapID != 0 && installed.mapID != mapID;
+    auto installedIt = installed.entries.begin();
+    auto desiredIt = desiredEntries.begin();
+
+    while (installedIt != installed.entries.end() || desiredIt != desiredEntries.end())
     {
-      if (prodigyOverlayKeyPresent(desiredKeys, existing, equals) == false)
+      if (installedIt == installed.entries.end())
       {
-        if (bpf_map_delete_elem(map_fd, &existing) != 0)
+        if (bpf_map_update_elem(map_fd, &desiredIt->first, &desiredIt->second, BPF_ANY) != 0)
+        {
+          basics_log("Prodigy overlay value update failed map=%s errno=%d\n", mapName.c_str(), errno);
+        }
+        ++desiredIt;
+        continue;
+      }
+
+      if (desiredIt == desiredEntries.end())
+      {
+        if (mapRecreated == false && bpf_map_delete_elem(map_fd, &installedIt->first) != 0)
         {
           basics_log("Prodigy overlay value delete failed map=%s errno=%d\n", mapName.c_str(), errno);
         }
+        ++installedIt;
+        continue;
       }
-    }
 
-    for (const auto& entry : desiredEntries)
-    {
-      if (bpf_map_update_elem(map_fd, &entry.first, &entry.second, BPF_ANY) != 0)
+      if (less(installedIt->first, desiredIt->first))
+      {
+        if (mapRecreated == false && bpf_map_delete_elem(map_fd, &installedIt->first) != 0)
+        {
+          basics_log("Prodigy overlay value delete failed map=%s errno=%d\n", mapName.c_str(), errno);
+        }
+        ++installedIt;
+        continue;
+      }
+
+      if (less(desiredIt->first, installedIt->first))
+      {
+        if (bpf_map_update_elem(map_fd, &desiredIt->first, &desiredIt->second, BPF_ANY) != 0)
+        {
+          basics_log("Prodigy overlay value update failed map=%s errno=%d\n", mapName.c_str(), errno);
+        }
+        ++desiredIt;
+        continue;
+      }
+
+      if ((mirrorTrusted == false || valueEquals(installedIt->second, desiredIt->second) == false) &&
+          bpf_map_update_elem(map_fd, &desiredIt->first, &desiredIt->second, BPF_ANY) != 0)
       {
         basics_log("Prodigy overlay value update failed map=%s errno=%d\n", mapName.c_str(), errno);
       }
+      ++installedIt;
+      ++desiredIt;
     }
   });
 
-  installedKeys = desiredKeys;
+  installed.entries = desiredEntries;
+  installed.mapID = mapInfoAvailable ? mapID : 0;
 }
 
 static void prodigyBuildOverlayDesiredRoutes(const SwitchboardOverlayRoutingConfig& config,
@@ -355,10 +456,10 @@ static void prodigySyncOverlayEgressRoutingProgram(BPFProgram *program,
                                                    const SwitchboardOverlayRoutingConfig& config,
                                                    ProdigyOverlayPresenceMirror<switchboard_overlay_prefix4_key>& installedPrefixes4,
                                                    ProdigyOverlayPresenceMirror<switchboard_overlay_prefix6_key>& installedPrefixes6,
-                                                   Vector<switchboard_overlay_machine_route_key>& installedRouteKeysFull,
-                                                   Vector<switchboard_overlay_machine_route_key>& installedRouteKeysLow8,
-                                                   Vector<switchboard_overlay_prefix4_key>& installedHostedIngressRouteKeys4,
-                                                   Vector<switchboard_overlay_prefix6_key>& installedHostedIngressRouteKeys6)
+                                                   ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route>& installedRouteKeysFull,
+                                                   ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route>& installedRouteKeysLow8,
+                                                   ProdigyOverlayValueMirror<switchboard_overlay_prefix4_key, switchboard_overlay_hosted_ingress_route4>& installedHostedIngressRouteKeys4,
+                                                   ProdigyOverlayValueMirror<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6>& installedHostedIngressRouteKeys6)
 {
   Vector<switchboard_overlay_prefix4_key> desiredPrefixes4 = {};
   Vector<switchboard_overlay_prefix6_key> desiredPrefixes6 = {};
@@ -383,16 +484,14 @@ static void prodigySyncOverlayEgressRoutingProgram(BPFProgram *program,
                              "ovl_mach_full"_ctv,
                              installedRouteKeysFull,
                              desiredRoutesFull,
-                             [](const switchboard_overlay_machine_route_key& lhs, const switchboard_overlay_machine_route_key& rhs) -> bool {
-                               return switchboardOverlayMachineRouteKeyEquals(lhs, rhs);
-                             });
+                             prodigyOverlayMachineRouteKeyLess,
+                             switchboardOverlayMachineRouteEquals);
   prodigySyncOverlayValueMap(program,
                              "ovl_mach_low8"_ctv,
                              installedRouteKeysLow8,
                              desiredRoutesLow8,
-                             [](const switchboard_overlay_machine_route_key& lhs, const switchboard_overlay_machine_route_key& rhs) -> bool {
-                               return switchboardOverlayMachineRouteKeyEquals(lhs, rhs);
-                             });
+                             prodigyOverlayMachineRouteKeyLess,
+                             switchboardOverlayMachineRouteEquals);
 
   Vector<std::pair<switchboard_overlay_prefix4_key, switchboard_overlay_hosted_ingress_route4>> desiredHostedIngressRoutes4 = {};
   Vector<std::pair<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6>> desiredHostedIngressRoutes6 = {};
@@ -402,16 +501,14 @@ static void prodigySyncOverlayEgressRoutingProgram(BPFProgram *program,
                              "ovl_host4"_ctv,
                              installedHostedIngressRouteKeys4,
                              desiredHostedIngressRoutes4,
-                             [](const switchboard_overlay_prefix4_key& lhs, const switchboard_overlay_prefix4_key& rhs) -> bool {
-                               return switchboardOverlayPrefix4Equals(lhs, rhs);
-                             });
+                             prodigyOverlayPrefix4KeyLess,
+                             prodigyOverlayHostedIngressRoute4Equals);
   prodigySyncOverlayValueMap(program,
                              "ovl_host6"_ctv,
                              installedHostedIngressRouteKeys6,
                              desiredHostedIngressRoutes6,
-                             [](const switchboard_overlay_prefix6_key& lhs, const switchboard_overlay_prefix6_key& rhs) -> bool {
-                               return switchboardOverlayPrefix6Equals(lhs, rhs);
-                             });
+                             prodigyOverlayPrefix6KeyLess,
+                             prodigyOverlayHostedIngressRoute6Equals);
 
   if (program)
   {
@@ -710,11 +807,11 @@ public:
   ContainerDeviceMapMirror peerDeviceMapMirror;
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix4_key> installedPeerOverlayPrefixes4 = {};
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix6_key> installedPeerOverlayPrefixes6 = {};
-  Vector<switchboard_overlay_machine_route_key> installedPeerOverlayRouteKeysFull = {};
-  Vector<switchboard_overlay_machine_route_key> installedPeerOverlayRouteKeysLow8 = {};
-  Vector<switchboard_overlay_prefix4_key> installedPeerHostedIngressRouteKeys4 = {};
-  Vector<switchboard_overlay_prefix6_key> installedPeerHostedIngressRouteKeys6 = {};
-  Vector<portal_definition> installedPeerWhiteholeBindingKeys = {};
+  ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> installedPeerOverlayRouteKeysFull = {};
+  ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> installedPeerOverlayRouteKeysLow8 = {};
+  ProdigyOverlayValueMirror<switchboard_overlay_prefix4_key, switchboard_overlay_hosted_ingress_route4> installedPeerHostedIngressRouteKeys4 = {};
+  ProdigyOverlayValueMirror<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6> installedPeerHostedIngressRouteKeys6 = {};
+  ProdigyOverlayValueMirror<portal_definition, switchboard_whitehole_binding> installedPeerWhiteholeBindingKeys = {};
 
 private:
 
@@ -1032,9 +1129,8 @@ public:
                                "whiteholes"_ctv,
                                installedPeerWhiteholeBindingKeys,
                                desiredBindings,
-                               [](const portal_definition& lhs, const portal_definition& rhs) -> bool {
-                                 return switchboardPortalDefinitionEquals(lhs, rhs);
-                               });
+                               prodigyPortalDefinitionLess,
+                               switchboardWhiteholeBindingEquals);
   }
 
   void syncPeerWhiteholeBindings(void)

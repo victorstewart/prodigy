@@ -97,23 +97,23 @@ protected:
   SwitchboardOverlayRoutingConfig overlayRoutingConfig;
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix4_key> installedIngressOverlayPrefixes4;
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix6_key> installedIngressOverlayPrefixes6;
-  Vector<switchboard_overlay_machine_route_key> installedIngressOverlayRouteKeysFull;
-  Vector<switchboard_overlay_machine_route_key> installedIngressOverlayRouteKeysLow8;
-  Vector<switchboard_overlay_prefix4_key> installedIngressHostedIngressRouteKeys4;
-  Vector<switchboard_overlay_prefix6_key> installedIngressHostedIngressRouteKeys6;
+  ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> installedIngressOverlayRouteKeysFull;
+  ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> installedIngressOverlayRouteKeysLow8;
+  ProdigyOverlayValueMirror<switchboard_overlay_prefix4_key, switchboard_overlay_hosted_ingress_route4> installedIngressHostedIngressRouteKeys4;
+  ProdigyOverlayValueMirror<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6> installedIngressHostedIngressRouteKeys6;
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix4_key> installedEgressOverlayPrefixes4;
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix6_key> installedEgressOverlayPrefixes6;
-  Vector<switchboard_overlay_machine_route_key> installedOverlayRouteKeysFull;
-  Vector<switchboard_overlay_machine_route_key> installedOverlayRouteKeysLow8;
-  Vector<switchboard_overlay_prefix4_key> installedHostedIngressRouteKeys4;
-  Vector<switchboard_overlay_prefix6_key> installedHostedIngressRouteKeys6;
+  ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> installedOverlayRouteKeysFull;
+  ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> installedOverlayRouteKeysLow8;
+  ProdigyOverlayValueMirror<switchboard_overlay_prefix4_key, switchboard_overlay_hosted_ingress_route4> installedHostedIngressRouteKeys4;
+  ProdigyOverlayValueMirror<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6> installedHostedIngressRouteKeys6;
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix4_key> installedBalancerOverlayPrefixes4;
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix6_key> installedBalancerOverlayPrefixes6;
-  Vector<switchboard_overlay_machine_route_key> installedBalancerOverlayRouteKeysFull;
-  Vector<switchboard_overlay_machine_route_key> installedBalancerOverlayRouteKeysLow8;
-  Vector<switchboard_overlay_prefix4_key> installedBalancerHostedIngressRouteKeys4;
-  Vector<switchboard_overlay_prefix6_key> installedBalancerHostedIngressRouteKeys6;
-  Vector<portal_definition> installedEgressWhiteholeBindingKeys;
+  ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> installedBalancerOverlayRouteKeysFull;
+  ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> installedBalancerOverlayRouteKeysLow8;
+  ProdigyOverlayValueMirror<switchboard_overlay_prefix4_key, switchboard_overlay_hosted_ingress_route4> installedBalancerHostedIngressRouteKeys4;
+  ProdigyOverlayValueMirror<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6> installedBalancerHostedIngressRouteKeys6;
+  ProdigyOverlayValueMirror<portal_definition, switchboard_whitehole_binding> installedEgressWhiteholeBindingKeys;
   bytell_hash_subvector<uint32_t, LocalWhiteholeBindingEntry> whiteholeBindingsByContainer;
   bytell_hash_subvector<uint64_t, CoroutineStack *> pendingContainerDownloads;
   bytell_hash_map<uint128_t, Vector<String>> pendingAdvertisementPairings;
@@ -487,70 +487,6 @@ protected:
     return &overlayRoutingConfig;
   }
 
-  template <typename Key, typename Equals>
-  static bool overlayKeyPresent(const Vector<Key>& haystack, const Key& needle, Equals&& equals)
-  {
-    for (const Key& candidate : haystack)
-    {
-      if (equals(candidate, needle))
-      {
-        return true;
-      }
-    }
-
-    return false;
-  }
-
-  template <typename Key, typename Value, StringType MapName, typename Equals>
-  void syncOverlayValueMap(BPFProgram *program,
-                           MapName&& mapName,
-                           Vector<Key>& installedKeys,
-                           const Vector<std::pair<Key, Value>>& desiredEntries,
-                           Equals&& equals)
-  {
-    Vector<Key> desiredKeys = {};
-    desiredKeys.reserve(desiredEntries.size());
-    for (const auto& entry : desiredEntries)
-    {
-      desiredKeys.push_back(entry.first);
-    }
-
-    if (program == nullptr)
-    {
-      installedKeys = desiredKeys;
-      return;
-    }
-
-    program->openMap(mapName, [&](int map_fd) -> void {
-      if (map_fd < 0)
-      {
-        basics_log("Neuron missing overlay value map=%s\n", mapName.c_str());
-        return;
-      }
-
-      for (const Key& existing : installedKeys)
-      {
-        if (overlayKeyPresent(desiredKeys, existing, equals) == false)
-        {
-          if (bpf_map_delete_elem(map_fd, &existing) != 0)
-          {
-            basics_log("Neuron overlay value delete failed map=%s errno=%d\n", mapName.c_str(), errno);
-          }
-        }
-      }
-
-      for (const auto& entry : desiredEntries)
-      {
-        if (bpf_map_update_elem(map_fd, &entry.first, &entry.second, BPF_ANY) != 0)
-        {
-          basics_log("Neuron overlay value update failed map=%s errno=%d\n", mapName.c_str(), errno);
-        }
-      }
-    });
-
-    installedKeys = desiredKeys;
-  }
-
   void syncContainerOverlayRoutingPrograms(void)
   {
     for (const auto& [uuid, container] : containers)
@@ -620,13 +556,12 @@ protected:
       }
     }
 
-    syncOverlayValueMap(tcx_egress_program,
-                        "whiteholes"_ctv,
-                        installedEgressWhiteholeBindingKeys,
-                        desiredBindings,
-                        [](const portal_definition& lhs, const portal_definition& rhs) -> bool {
-                          return switchboardPortalDefinitionEquals(lhs, rhs);
-                        });
+    prodigySyncOverlayValueMap(tcx_egress_program,
+                               "whiteholes"_ctv,
+                               installedEgressWhiteholeBindingKeys,
+                               desiredBindings,
+                               prodigyPortalDefinitionLess,
+                               switchboardWhiteholeBindingEquals);
   }
 
   void openLocalWhiteholes(uint32_t containerID, const Vector<Whitehole>& whiteholes)
