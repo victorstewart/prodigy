@@ -4926,10 +4926,6 @@ private:
   }
 
   Vector<ScalerState> lastScalerStates;
-  bytell_hash_map<String, uint32_t> upCountByName;
-  bytell_hash_map<String, uint32_t> downCountByName;
-  bytell_hash_map<String, int64_t> lastUpChangeMsByName;
-  bytell_hash_map<String, int64_t> lastDownChangeMsByName;
 
   static bool autoscaleTraceEnabled(void)
   {
