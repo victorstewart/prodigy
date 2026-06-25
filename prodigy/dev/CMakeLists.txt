@@ -375,6 +375,13 @@ prodigy_resolve_official_speedtest(PRODIGY_BUNDLED_SPEEDTEST_BIN "Path to offici
 set(PRODIGY_CERTBOT_WHEELHOUSE_OUTPUT "${CMAKE_BINARY_DIR}/prodigy.certbot-${PRODIGY_BUNDLED_CERTBOT_VERSION}.wheelhouse.tar.zst")
 set(PRODIGY_CERTBOT_WHEELHOUSE_DIR "${CMAKE_BINARY_DIR}/certbot-wheelhouse")
 set(PRODIGY_CERTBOT_WHEELHOUSE_VENV "${CMAKE_BINARY_DIR}/certbot-wheelhouse-venv")
+if (PRODIGY_RESOLVED_TARGET_ARCH STREQUAL "x86_64")
+   set(PRODIGY_CERTBOT_WHEELHOUSE_PLATFORM_ARGS "--platform manylinux_2_34_x86_64 --platform manylinux2014_x86_64")
+elseif (PRODIGY_RESOLVED_TARGET_ARCH STREQUAL "aarch64")
+   set(PRODIGY_CERTBOT_WHEELHOUSE_PLATFORM_ARGS "--platform manylinux_2_34_aarch64 --platform manylinux2014_aarch64")
+else()
+   message(FATAL_ERROR "Unsupported architecture for Certbot wheelhouse: ${PRODIGY_RESOLVED_TARGET_ARCH}. Set PRODIGY_BUNDLED_CERTBOT_WHEELHOUSE explicitly.")
+endif()
 if (PRODIGY_BUNDLED_CERTBOT_WHEELHOUSE STREQUAL "")
    add_custom_command(
       OUTPUT "${PRODIGY_CERTBOT_WHEELHOUSE_OUTPUT}"
@@ -383,7 +390,7 @@ if (PRODIGY_BUNDLED_CERTBOT_WHEELHOUSE STREQUAL "")
       COMMAND "${Python3_EXECUTABLE}" -m venv "${PRODIGY_CERTBOT_WHEELHOUSE_VENV}"
       COMMAND "${PRODIGY_CERTBOT_WHEELHOUSE_VENV}/bin/python" -m ensurepip --upgrade
       COMMAND "${PRODIGY_CERTBOT_WHEELHOUSE_VENV}/bin/python" -m pip install --upgrade pip
-      COMMAND /bin/sh -c "for py in 310 311 312 313 314; do '${PRODIGY_CERTBOT_WHEELHOUSE_VENV}/bin/python' -m pip download --only-binary=:all: --platform manylinux_2_34_x86_64 --platform manylinux2014_x86_64 --implementation cp --python-version $py --abi cp$py --abi abi3 --abi none --dest '${PRODIGY_CERTBOT_WHEELHOUSE_DIR}' 'certbot==${PRODIGY_BUNDLED_CERTBOT_VERSION}' 'typing-extensions>=4.9'; done"
+      COMMAND /bin/sh -c "for py in 310 311 312 313 314; do '${PRODIGY_CERTBOT_WHEELHOUSE_VENV}/bin/python' -m pip download --only-binary=:all: ${PRODIGY_CERTBOT_WHEELHOUSE_PLATFORM_ARGS} --implementation cp --python-version $py --abi cp$py --abi abi3 --abi none --dest '${PRODIGY_CERTBOT_WHEELHOUSE_DIR}' 'certbot==${PRODIGY_BUNDLED_CERTBOT_VERSION}' 'typing-extensions>=4.9'; done"
       COMMAND "${PRODIGY_TAR_EXECUTABLE}" --zstd -cf "${PRODIGY_CERTBOT_WHEELHOUSE_OUTPUT}" -C "${PRODIGY_CERTBOT_WHEELHOUSE_DIR}" .
       COMMENT "Building Certbot ${PRODIGY_BUNDLED_CERTBOT_VERSION} wheelhouse"
       VERBATIM

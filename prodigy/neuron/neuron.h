@@ -2367,7 +2367,7 @@ public:
     int nullFD = openOSUpdateChildFile("/dev/null", O_RDONLY | O_CLOEXEC);
     if (nullFD >= 0)
     {
-      (void)syscall(SYS_dup2, nullFD, STDIN_FILENO);
+      (void)::dup2(nullFD, STDIN_FILENO);
       if (nullFD > STDERR_FILENO)
       {
         (void)syscall(SYS_close, nullFD);
@@ -2377,8 +2377,8 @@ public:
     int logFD = openOSUpdateChildFile("/var/log/prodigy/os-update.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     if (logFD >= 0)
     {
-      (void)syscall(SYS_dup2, logFD, STDOUT_FILENO);
-      (void)syscall(SYS_dup2, logFD, STDERR_FILENO);
+      (void)::dup2(logFD, STDOUT_FILENO);
+      (void)::dup2(logFD, STDERR_FILENO);
       if (logFD > STDERR_FILENO)
       {
         (void)syscall(SYS_close, logFD);
