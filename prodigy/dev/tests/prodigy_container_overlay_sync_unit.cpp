@@ -3,6 +3,7 @@
 #include <services/debug.h>
 
 #include <prodigy/neuron/neuron.h>
+#include <prodigy/quic.cid.generator.h>
 #include <switchboard/common/checksum.h>
 #include <switchboard/kernel/structs.h>
 #include <switchboard/overlay.route.h>
@@ -308,6 +309,63 @@ static Vector<uint8_t> makeIPv6UDPFrameWithPayload(const char *srcIPv6,
                                                    bool includeEthernet)
 {
   return makeIPv6L4FrameWithPayload(srcIPv6, dstIPv6, IPPROTO_UDP, sourcePort, destPort, payload, includeEthernet);
+}
+
+static Vector<uint8_t> makeIPv6QuicLongHeaderFrame(const char *srcIPv6,
+                                                   const char *dstIPv6,
+                                                   uint16_t sourcePort,
+                                                   uint16_t destPort,
+                                                   uint8_t packetType,
+                                                   const ProdigyQuicCID& cid,
+                                                   bool includeEthernet)
+{
+  if (cid.id_len == 0 || cid.id_len > QUIC_CID_LEN)
+  {
+    std::fprintf(stderr, "invalid quic cid length for test frame: %u\n", unsigned(cid.id_len));
+    std::abort();
+  }
+
+  const size_t ethBytes = includeEthernet ? sizeof(struct ethhdr) : 0u;
+  constexpr size_t quicPayloadBytes = sizeof(struct quic_long_header) + 1u;
+  Vector<uint8_t> frame = {};
+  frame.resize(ethBytes + sizeof(struct ipv6hdr) + sizeof(struct udphdr) + quicPayloadBytes);
+  std::memset(frame.data(), 0, frame.size());
+
+  if (includeEthernet)
+  {
+    struct ethhdr *eth = reinterpret_cast<struct ethhdr *>(frame.data());
+    eth->h_proto = bpf_htons(ETH_P_IPV6);
+  }
+
+  struct ipv6hdr *ip6h = reinterpret_cast<struct ipv6hdr *>(frame.data() + ethBytes);
+  ip6h->version = 6;
+  ip6h->nexthdr = IPPROTO_UDP;
+  ip6h->hop_limit = 64;
+  ip6h->payload_len = htons(static_cast<uint16_t>(sizeof(struct udphdr) + quicPayloadBytes));
+  parseIPv6Bytes(srcIPv6, ip6h->saddr.s6_addr);
+  parseIPv6Bytes(dstIPv6, ip6h->daddr.s6_addr);
+
+  struct udphdr *udph = reinterpret_cast<struct udphdr *>(ip6h + 1);
+  udph->source = htons(sourcePort);
+  udph->dest = htons(destPort);
+  udph->len = htons(static_cast<uint16_t>(sizeof(struct udphdr) + quicPayloadBytes));
+
+  struct quic_long_header *quic = reinterpret_cast<struct quic_long_header *>(udph + 1);
+  quic->flags = QUIC_V1_LONG_HEADER | packetType;
+  quic->version = 1;
+  quic->conn_id_lens = cid.id_len;
+  std::memcpy(quic->dst_cid, cid.id, cid.id_len);
+  *(reinterpret_cast<uint8_t *>(quic + 1)) = 0;
+
+  udph->check = compute_ipv6_transport_checksum_portable(
+      ip6h->saddr.s6_addr,
+      ip6h->daddr.s6_addr,
+      IPPROTO_UDP,
+      udph,
+      static_cast<__u32>(sizeof(struct udphdr) + quicPayloadBytes),
+      __builtin_offsetof(struct udphdr, check));
+
+  return frame;
 }
 
 static switchboard_wormhole_egress_key makeLookupKeyFromFrame(const Vector<uint8_t>& frame, __be16 protocol)
@@ -1389,6 +1447,219 @@ static void testContainerPeerEgressRouterRewritesIPv4WormholeSource(TestSuite& s
   peerProgram.close();
 }
 
+static void testContainerPeerEgressRouterRoutesIPv6QuicHighSlotPortal(TestSuite& suite)
+{
+  const char *label = "container_peer_egress_router_ipv6_quic_high_slot_portal";
+  auto expectNamed = [&](bool condition, const char *suffix) -> void {
+    char name[256] = {};
+    std::snprintf(name, sizeof(name), "%s_%s", label, suffix);
+    suite.expect(condition, name);
+  };
+
+  String objectPath = {};
+  objectPath.assign(PRODIGY_TEST_BINARY_DIR);
+  objectPath.append("/container.egress.router.ebpf.o"_ctv);
+
+  BPFProgram peerProgram = {};
+  expectNamed(peerProgram.load(objectPath, "ct_egress"_ctv), "loads_program");
+  if (peerProgram.prog_fd < 0)
+  {
+    return;
+  }
+
+  local_container_subnet6 localSubnet = {};
+  localSubnet.dpfx = 0x01;
+  localSubnet.mpfx[0] = 0xfb;
+  localSubnet.mpfx[1] = 0xde;
+  localSubnet.mpfx[2] = 0xab;
+  peerProgram.setArrayElement("lc_subnet"_ctv, 0, localSubnet);
+
+  container_network_policy networkPolicy = {};
+  networkPolicy.interContainerMTU = 9000u;
+  peerProgram.setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
+
+  __u32 nicIfidx = 77;
+  peerProgram.setArrayElement("ct_dev_map"_ctv, 0, nicIfidx);
+
+  mac localMAC = {};
+  localMAC.mac[0] = 0x02;
+  localMAC.mac[1] = 0x42;
+  localMAC.mac[2] = 0xac;
+  localMAC.mac[3] = 0x11;
+  localMAC.mac[4] = 0x00;
+  localMAC.mac[5] = 0x0a;
+  peerProgram.setArrayElement("mac_map"_ctv, 0, localMAC);
+
+  mac gatewayMAC = {};
+  gatewayMAC.mac[0] = 0x02;
+  gatewayMAC.mac[1] = 0x42;
+  gatewayMAC.mac[2] = 0xac;
+  gatewayMAC.mac[3] = 0x11;
+  gatewayMAC.mac[4] = 0x00;
+  gatewayMAC.mac[5] = 0x01;
+  peerProgram.setArrayElement("gw_mac_map"_ctv, 0, gatewayMAC);
+
+  switchboard_overlay_config overlayConfig = {};
+  overlayConfig.container_network_enabled = 1;
+  peerProgram.setArrayElement("ovl_config"_ctv, 0, overlayConfig);
+
+  switchboard_overlay_machine_route route = {};
+  route.family = SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6;
+  route.use_gateway_mac = 1;
+  parseIPv6Bytes("fd00:10::c", route.source6);
+  parseIPv6Bytes("fd00:10::d", route.next_hop6);
+  switchboard_overlay_machine_route_key routeKey = switchboardMakeOverlayMachineRouteKey(0xad8c51u);
+  expectNamed(updateProgramMapElement(peerProgram, "ovl_mach_full"_ctv, routeKey, route),
+              "sets_remote_app_overlay_route");
+
+  uint8_t appContainerID[5] = {0x01, 0xad, 0x8c, 0x51, 0xb9};
+  uint8_t external6[16] = {};
+  parseIPv6Bytes("2602:fac0:0:12ab:34cd::1", external6);
+
+  uint8_t key[16] = {
+      0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+      0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01};
+  ProdigyQuicCidEncryptor encryptor = {};
+  expectNamed(encryptor.setKey(key), "encryptor_accepts_key");
+
+  struct sockaddr_in6 cidDestination = {};
+  cidDestination.sin6_family = AF_INET6;
+  cidDestination.sin6_port = htons(443);
+  std::memcpy(cidDestination.sin6_addr.s6_addr, external6, sizeof(cidDestination.sin6_addr.s6_addr));
+
+  uint32_t nonceCursor = 11;
+  ProdigyQuicCID cid = prodigyGenerateQuicCID(encryptor,
+                                              appContainerID,
+                                              &nonceCursor,
+                                              reinterpret_cast<const struct sockaddr *>(&cidDestination));
+  expectNamed(cid.id_len == QUIC_CID_LEN, "generates_ipv6_cid");
+
+  portal_definition portal = {};
+  std::memcpy(portal.addr6, external6, sizeof(portal.addr6));
+  portal.port = htons(443);
+  portal.proto = IPPROTO_UDP;
+
+  portal_meta meta = {};
+  meta.flags = F_QUIC_PORTAL;
+  meta.slot = 1020u;
+  expectNamed(updateProgramMapElement(peerProgram, "ext_portals"_ctv, portal, meta),
+              "installs_high_slot_quic_portal");
+
+  switchboard_wormhole_target_key targetKey = {};
+  targetKey.slot = meta.slot;
+  std::memcpy(targetKey.container, appContainerID, sizeof(targetKey.container));
+  uint16_t targetPort = htons(8443);
+  expectNamed(updateProgramMapElement(peerProgram, "wh_targets"_ctv, targetKey, targetPort),
+              "installs_target_container_port");
+
+  struct
+  {
+    uint32_t rk[44];
+  } aesState = {};
+  expectNamed(prodigyBuildQuicCidDecryptRoundKeys(key, aesState.rk),
+              "builds_decrypt_state");
+
+  uint32_t decryptIndex = quicCidPortalDecryptMapIndex(meta.slot, quicCidEncryptedKeyIndex(cid.id));
+  expectNamed(updateProgramMapElement(peerProgram, "quic_cid_dec"_ctv, decryptIndex, aesState),
+              "installs_high_slot_decrypt_state");
+
+  Vector<uint8_t> frame = makeIPv6QuicLongHeaderFrame(
+      "fdf8:d94c:7c33:e26e:ca4b:f501:fbde:ab7e",
+      "2602:fac0:0:12ab:34cd::1",
+      41'252,
+      443,
+      QUIC_V1_HANDSHAKE,
+      cid,
+      true);
+  Vector<uint8_t> output = {};
+  output.resize(frame.size() + sizeof(struct ipv6hdr) + 64u);
+
+  LIBBPF_OPTS(bpf_test_run_opts, opts,
+              .data_in = frame.data(),
+              .data_out = output.data(),
+              .data_size_in = static_cast<__u32>(frame.size()),
+              .data_size_out = static_cast<__u32>(output.size()),
+              .repeat = 1, );
+
+  int runResult = bpf_prog_test_run_opts(peerProgram.prog_fd, &opts);
+  expectNamed(runResult == 0, "test_run_succeeds");
+  if (runResult == 0 && (opts.retval != TC_ACT_REDIRECT || opts.data_size_out != frame.size() + sizeof(struct ipv6hdr)))
+  {
+    __u64 stats[8] = {};
+    for (uint32_t index = 0; index < 8; ++index)
+    {
+      peerProgram.getArrayElement("ct_stats"_ctv, index, stats[index]);
+    }
+    std::fprintf(stderr,
+                 "container_peer_egress_router_ipv6_quic_high_slot_portal debug retval=%u data_size_out=%u expected_size=%zu stats_enter=%llu stats_drop_mtu=%llu stats_ipv6=%llu stats_nic=%llu stats_local=%llu stats_portal_local=%llu\n",
+                 unsigned(opts.retval),
+                 unsigned(opts.data_size_out),
+                 frame.size() + sizeof(struct ipv6hdr),
+                 static_cast<unsigned long long>(stats[0]),
+                 static_cast<unsigned long long>(stats[1]),
+                 static_cast<unsigned long long>(stats[3]),
+                 static_cast<unsigned long long>(stats[4]),
+                 static_cast<unsigned long long>(stats[5]),
+                 static_cast<unsigned long long>(stats[7]));
+  }
+  expectNamed(opts.retval == TC_ACT_REDIRECT, "redirects_to_nic");
+  expectNamed(opts.data_size_out == frame.size() + sizeof(struct ipv6hdr), "adds_outer_ipv6_header");
+
+  if (runResult == 0 && opts.data_size_out >= (sizeof(struct ethhdr) + (2u * sizeof(struct ipv6hdr)) + sizeof(struct udphdr) + sizeof(struct quic_long_header)))
+  {
+    const uint8_t expectedGatewayMAC[6] = {0x02, 0x42, 0xac, 0x11, 0x00, 0x01};
+    const uint8_t expectedLocalMAC[6] = {0x02, 0x42, 0xac, 0x11, 0x00, 0x0a};
+    uint8_t expectedOuterSrc[16] = {};
+    uint8_t expectedOuterDst[16] = {};
+    uint8_t expectedInnerSrc[16] = {};
+    uint8_t expectedInnerDst[16] = {};
+    parseIPv6Bytes("fd00:10::c", expectedOuterSrc);
+    parseIPv6Bytes("fd00:10::d", expectedOuterDst);
+    parseIPv6Bytes("fdf8:d94c:7c33:e26e:ca4b:f501:fbde:ab7e", expectedInnerSrc);
+    parseIPv6Bytes("fdf8:d94c:7c33:e26e:ca4b:f501:ad8c:51b9", expectedInnerDst);
+
+    const struct ethhdr *eth = reinterpret_cast<const struct ethhdr *>(output.data());
+    expectNamed(eth->h_proto == bpf_htons(ETH_P_IPV6), "sets_outer_ethertype");
+    expectNamed(std::memcmp(eth->h_source, expectedLocalMAC, sizeof(expectedLocalMAC)) == 0,
+                "sets_source_mac");
+    expectNamed(std::memcmp(eth->h_dest, expectedGatewayMAC, sizeof(expectedGatewayMAC)) == 0,
+                "sets_gateway_mac");
+
+    const struct ipv6hdr *outer6 = reinterpret_cast<const struct ipv6hdr *>(output.data() + sizeof(struct ethhdr));
+    expectNamed(outer6->nexthdr == IPPROTO_IPV6, "wraps_inner_ipv6");
+    expectNamed(std::memcmp(outer6->saddr.s6_addr, expectedOuterSrc, sizeof(expectedOuterSrc)) == 0,
+                "sets_outer_source");
+    expectNamed(std::memcmp(outer6->daddr.s6_addr, expectedOuterDst, sizeof(expectedOuterDst)) == 0,
+                "sets_outer_destination");
+
+    const struct ipv6hdr *inner6 = reinterpret_cast<const struct ipv6hdr *>(outer6 + 1);
+    const struct udphdr *udph = reinterpret_cast<const struct udphdr *>(inner6 + 1);
+    const struct quic_long_header *quic = reinterpret_cast<const struct quic_long_header *>(udph + 1);
+    __u16 expectedChecksum = compute_ipv6_transport_checksum_portable(
+        inner6->saddr.s6_addr,
+        inner6->daddr.s6_addr,
+        IPPROTO_UDP,
+        udph,
+        ntohs(udph->len),
+        __builtin_offsetof(struct udphdr, check));
+
+    expectNamed(inner6->nexthdr == IPPROTO_UDP, "keeps_udp_inner_protocol");
+    expectNamed(std::memcmp(inner6->saddr.s6_addr, expectedInnerSrc, sizeof(expectedInnerSrc)) == 0,
+                "preserves_probe_source");
+    expectNamed(std::memcmp(inner6->daddr.s6_addr, expectedInnerDst, sizeof(expectedInnerDst)) == 0,
+                "rewrites_destination_to_app_container");
+    expectNamed(ntohs(udph->source) == 41'252, "preserves_source_port");
+    expectNamed(ntohs(udph->dest) == 8443, "rewrites_destination_port");
+    expectNamed(udph->check == expectedChecksum, "recomputes_udp_checksum");
+    expectNamed((quic->flags & QUIC_V1_PACKET_TYPE_MASK) == QUIC_V1_HANDSHAKE,
+                "preserves_handshake_packet_type");
+    expectNamed(quic->conn_id_lens == QUIC_CID_LEN && std::memcmp(quic->dst_cid, cid.id, cid.id_len) == 0,
+                "preserves_routing_cid_payload");
+  }
+
+  peerProgram.close();
+}
+
 int main(void)
 {
   if (const char *allow = std::getenv("PRODIGY_DEV_ALLOW_BPF_ATTACH"); allow == nullptr || std::strcmp(allow, "1") != 0)
@@ -1414,6 +1685,7 @@ int main(void)
   testContainerPeerEgressRouterEncapsulatesHostedIngress(suite, true, IPPROTO_TCP);
   testContainerPeerEgressRouterRewritesIPv4WormholeSource(suite, IPPROTO_UDP);
   testContainerPeerEgressRouterRewritesIPv4WormholeSource(suite, IPPROTO_TCP);
+  testContainerPeerEgressRouterRoutesIPv6QuicHighSlotPortal(suite);
 
   return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

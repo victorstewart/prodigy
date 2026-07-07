@@ -2046,6 +2046,7 @@ private:
     }
 
     SwitchboardPortal *portal = wormhole->portal;
+    wormholesByContainer.eraseEntry(wormhole->containerID, wormhole);
     removeWormholeTargetBinding(wormhole);
     portal->wormholes.erase(wormhole);
 
@@ -2223,12 +2224,18 @@ public:
   {
     if (auto it = wormholesByContainer.find(containerID); it != wormholesByContainer.end())
     {
+      Vector<switchboard_runtime::Wormhole *> closingWormholes;
       for (switchboard_runtime::Wormhole *wormhole : it->second)
       {
-        closeWormhole(wormhole);
+        closingWormholes.push_back(wormhole);
       }
 
       wormholesByContainer.erase(it);
+
+      for (switchboard_runtime::Wormhole *wormhole : closingWormholes)
+      {
+        closeWormhole(wormhole);
+      }
     }
 
     maybeDetachBoundaryRouter();

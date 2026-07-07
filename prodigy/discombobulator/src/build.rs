@@ -44,6 +44,7 @@ const SESSION_STALE_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
 const LOCK_EXCLUSIVE: i32 = 2;
 const LOCK_UNLOCK: i32 = 8;
 const TEST_FAULT_ENV: &str = "DISCOMBOBULATOR_TEST_FAULT";
+const LOOPBACK_BTRFS_SETUP_LOCK_PATH: &str = "/tmp/discombobulator-loopback-btrfs.lock";
 
 struct MaterializedBase {
     root: PathBuf,
@@ -153,6 +154,10 @@ struct FileLockGuard {
 impl FileLockGuard {
     fn acquire(storage: &StorageRoot, namespace: &str, key: &str) -> Result<Self> {
         let lock_path = storage.lock_path(namespace, key);
+        Self::acquire_path(&lock_path)
+    }
+
+    fn acquire_path(lock_path: &Path) -> Result<Self> {
         if let Some(parent) = lock_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -2949,6 +2954,7 @@ impl LoopbackBtrfs {
     }
 
     fn with_prepared_dirs(image_dir: TempDir, mount_dir: TempDir, size: u64) -> Result<Self> {
+        let _setup_lock = FileLockGuard::acquire_path(Path::new(LOOPBACK_BTRFS_SETUP_LOCK_PATH))?;
         let image_path = image_dir.path().join("artifact.btrfs");
         run_command(
             Command::new("truncate")

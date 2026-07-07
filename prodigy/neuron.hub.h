@@ -295,12 +295,10 @@ public:
     {
       for (const SubscriptionPairing& pairing : pairings)
       {
-        uint64_t hash = AegisStream::generateSecretServiceHash(pairing.secret, pairing.service);
-        basics_log("NeuronHub::fillFromMainArgs subpair serviceKey=%llu pairService=%llu port=%u hash=%llu\n",
+        basics_log("NeuronHub::fillFromMainArgs subpair serviceKey=%llu pairService=%llu port=%u\n",
                    (unsigned long long)serviceKey,
                    (unsigned long long)pairing.service,
-                   unsigned(pairing.port),
-                   (unsigned long long)hash);
+                   unsigned(pairing.port));
 
         if (dumpFD >= 0)
         {
@@ -308,11 +306,10 @@ public:
           int lineWritten = snprintf(
               line,
               sizeof(line),
-              "subpair serviceKey=%llu pairService=%llu port=%u hash=%llu\n",
+              "subpair serviceKey=%llu pairService=%llu port=%u\n",
               (unsigned long long)serviceKey,
               (unsigned long long)pairing.service,
-              unsigned(pairing.port),
-              (unsigned long long)hash);
+              unsigned(pairing.port));
           if (lineWritten > 0)
           {
             size_t lineSize = size_t(lineWritten);
@@ -330,11 +327,9 @@ public:
     {
       for (const AdvertisementPairing& pairing : pairings)
       {
-        uint64_t hash = AegisStream::generateSecretServiceHash(pairing.secret, pairing.service);
-        basics_log("NeuronHub::fillFromMainArgs advpair serviceKey=%llu pairService=%llu hash=%llu\n",
+        basics_log("NeuronHub::fillFromMainArgs advpair serviceKey=%llu pairService=%llu\n",
                    (unsigned long long)serviceKey,
-                   (unsigned long long)pairing.service,
-                   (unsigned long long)hash);
+                   (unsigned long long)pairing.service);
 
         if (dumpFD >= 0)
         {
@@ -342,10 +337,9 @@ public:
           int lineWritten = snprintf(
               line,
               sizeof(line),
-              "advpair serviceKey=%llu pairService=%llu hash=%llu\n",
+              "advpair serviceKey=%llu pairService=%llu\n",
               (unsigned long long)serviceKey,
-              (unsigned long long)pairing.service,
-              (unsigned long long)hash);
+              (unsigned long long)pairing.service);
           if (lineWritten > 0)
           {
             size_t lineSize = size_t(lineWritten);

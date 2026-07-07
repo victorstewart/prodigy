@@ -616,6 +616,64 @@ static std::vector<uint8_t> makeIPv6L4EthernetFrame(const uint8_t source[16],
   return frame;
 }
 
+static std::vector<uint8_t> makeIPv6TCPPortalFrameWithOptionsAndPayload(const uint8_t source[16],
+                                                                        const uint8_t destination[16],
+                                                                        uint16_t sourcePort,
+                                                                        uint16_t destinationPort,
+                                                                        size_t tcpOptionsBytes,
+                                                                        size_t payloadBytes)
+{
+  if ((tcpOptionsBytes & 3u) != 0 || tcpOptionsBytes > 40)
+  {
+    std::fprintf(stderr, "invalid tcp option byte count: %zu\n", tcpOptionsBytes);
+    std::abort();
+  }
+
+  const size_t tcpHeaderBytes = sizeof(struct tcphdr) + tcpOptionsBytes;
+  std::vector<uint8_t> frame(sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + tcpHeaderBytes + payloadBytes);
+  std::memset(frame.data(), 0, frame.size());
+
+  struct ethhdr *eth = reinterpret_cast<struct ethhdr *>(frame.data());
+  eth->h_proto = htons(ETH_P_IPV6);
+
+  struct ipv6hdr *ip6 = reinterpret_cast<struct ipv6hdr *>(frame.data() + sizeof(struct ethhdr));
+  ip6->version = 6;
+  ip6->nexthdr = IPPROTO_TCP;
+  ip6->hop_limit = 64;
+  ip6->payload_len = htons(static_cast<uint16_t>(tcpHeaderBytes + payloadBytes));
+  std::memcpy(ip6->saddr.s6_addr, source, sizeof(ip6->saddr.s6_addr));
+  std::memcpy(ip6->daddr.s6_addr, destination, sizeof(ip6->daddr.s6_addr));
+
+  struct tcphdr *tcp = reinterpret_cast<struct tcphdr *>(ip6 + 1);
+  tcp->source = htons(sourcePort);
+  tcp->dest = htons(destinationPort);
+  tcp->seq = htonl(0x19283746);
+  tcp->ack_seq = htonl(0x91827364);
+  tcp->doff = static_cast<uint16_t>(tcpHeaderBytes / 4u);
+  tcp->ack = 1;
+  tcp->psh = 1;
+  tcp->window = htons(4096);
+
+  uint8_t *options = reinterpret_cast<uint8_t *>(tcp + 1);
+  for (size_t index = 0; index < tcpOptionsBytes; index += 1)
+  {
+    options[index] = 1u;
+  }
+
+  uint8_t *payload = reinterpret_cast<uint8_t *>(tcp) + tcpHeaderBytes;
+  for (size_t index = 0; index < payloadBytes; index += 1)
+  {
+    payload[index] = static_cast<uint8_t>((index * 43u + 29u) & 0xffu);
+  }
+
+  tcp->check = htons(checksumIPv6Transport(ip6->saddr.s6_addr,
+                                           ip6->daddr.s6_addr,
+                                           IPPROTO_TCP,
+                                           tcp,
+                                           tcpHeaderBytes + payloadBytes));
+  return frame;
+}
+
 static bool installSingleContainerPortalRing(BPFProgram& program, uint32_t slot, const uint8_t container[5])
 {
   int ringFD = bpf_map_create(BPF_MAP_TYPE_ARRAY, nullptr, sizeof(__u32), sizeof(container_id), RING_SIZE, nullptr);
@@ -798,6 +856,109 @@ static void exerciseHostIngressGenericPortal(TestSuite& suite, bool ipv6, uint8_
         suite.expect(outUDP->dest == targetPort, "switchboard_host_ingress_ipv4_udp_portal_rewrites_container_port");
       }
     }
+  }
+
+  ingressProgram.close();
+}
+
+static void exerciseHostIngressIPv6TCPPortalBrowserSizedPayload(TestSuite& suite)
+{
+  const char *label = "switchboard_host_ingress_ipv6_tcp_portal_browser_sized_payload";
+  auto expectNamed = [&](bool condition, const char *suffix) -> void {
+    char name[256] = {};
+    std::snprintf(name, sizeof(name), "%s_%s", label, suffix);
+    suite.expect(condition, name);
+  };
+
+  String ingressObjectPath = {};
+  ingressObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+  ingressObjectPath.append("/host.ingress.router.dev.ebpf.o"_ctv);
+
+  BPFProgram ingressProgram = {};
+  expectNamed(ingressProgram.load(ingressObjectPath, "host_ingress"_ctv), "loads_program");
+  if (ingressProgram.prog_fd < 0)
+  {
+    return;
+  }
+
+  local_container_subnet6 localSubnet = {};
+  localSubnet.dpfx = 0x01;
+  localSubnet.mpfx[0] = 0x52;
+  localSubnet.mpfx[1] = 0xdf;
+  localSubnet.mpfx[2] = 0x39;
+  ingressProgram.setArrayElement("lc_subnet"_ctv, 0, localSubnet);
+
+  constexpr uint8_t containerFragment = 0x62;
+  uint32_t redirectIfidx = 94;
+  ingressProgram.setArrayElement("ct_dev_map"_ctv, containerFragment, redirectIfidx);
+
+  uint8_t containerID[5] = {localSubnet.dpfx, localSubnet.mpfx[0], localSubnet.mpfx[1], localSubnet.mpfx[2], containerFragment};
+  portal_meta meta = {};
+  meta.flags = 0;
+  meta.slot = 14u;
+  expectNamed(installSingleContainerPortalRing(ingressProgram, meta.slot, containerID), "installs_ring");
+
+  uint8_t external6[16] = {};
+  uint8_t client6[16] = {};
+  expectNamed(inet_pton(AF_INET6, "2602:fac0:0:12ab:34cd::1", external6) == 1, "external_address_parses");
+  expectNamed(inet_pton(AF_INET6, "2001:db8:100::1", client6) == 1, "client_address_parses");
+
+  portal_definition portal = {};
+  std::memcpy(portal.addr6, external6, sizeof(portal.addr6));
+  portal.port = htons(444);
+  portal.proto = IPPROTO_TCP;
+  expectNamed(updateProgramMapElement(ingressProgram, "ext_portals"_ctv, portal, meta), "installs_portal");
+
+  switchboard_wormhole_target_key targetKey = {};
+  targetKey.slot = meta.slot;
+  std::memcpy(targetKey.container, containerID, sizeof(targetKey.container));
+  uint16_t targetPort = htons(8444);
+  expectNamed(updateProgramMapElement(ingressProgram, "wh_targets"_ctv, targetKey, targetPort), "installs_target_port");
+
+  std::vector<uint8_t> frame = makeIPv6TCPPortalFrameWithOptionsAndPayload(
+      client6,
+      external6,
+      42'186,
+      444,
+      12,
+      2020);
+  expectNamed(frame.size() == 2106u, "matches_failed_browser_frame_size");
+
+  std::vector<uint8_t> output(frame.size());
+  LIBBPF_OPTS(bpf_test_run_opts, opts,
+              .data_in = frame.data(),
+              .data_out = output.data(),
+              .data_size_in = static_cast<__u32>(frame.size()),
+              .data_size_out = static_cast<__u32>(output.size()),
+              .repeat = 1, );
+
+  int runResult = bpf_prog_test_run_opts(ingressProgram.prog_fd, &opts);
+  expectNamed(runResult == 0, "test_run_succeeds");
+  expectNamed(opts.retval == TC_ACT_REDIRECT, "redirects_to_container");
+
+  if (runResult == 0 && opts.data_size_out >= sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + sizeof(struct tcphdr))
+  {
+    const struct ethhdr *outEth = reinterpret_cast<const struct ethhdr *>(output.data());
+    const struct ipv6hdr *outIP = reinterpret_cast<const struct ipv6hdr *>(output.data() + sizeof(struct ethhdr));
+    const struct tcphdr *outTCP = reinterpret_cast<const struct tcphdr *>(outIP + 1);
+    uint8_t expectedDestination[16] = {};
+    std::memcpy(expectedDestination, external6, sizeof(expectedDestination));
+    makeContainerIPv6(expectedDestination, localSubnet.dpfx, localSubnet.mpfx[0], localSubnet.mpfx[1], localSubnet.mpfx[2], containerFragment);
+
+    expectNamed(outEth->h_proto == htons(ETH_P_IPV6), "preserves_ethertype");
+    expectNamed(std::memcmp(outIP->daddr.s6_addr, expectedDestination, sizeof(outIP->daddr.s6_addr)) == 0, "rewrites_destination");
+    expectNamed(outTCP->dest == targetPort, "rewrites_container_port");
+    expectNamed(ntohs(outIP->payload_len) == 2052u, "preserves_tcp_segment_size");
+
+    std::vector<uint8_t> expectedSegment(reinterpret_cast<const uint8_t *>(outTCP),
+                                         reinterpret_cast<const uint8_t *>(outTCP) + ntohs(outIP->payload_len));
+    reinterpret_cast<struct tcphdr *>(expectedSegment.data())->check = 0;
+    uint16_t expectedChecksum = htons(checksumIPv6Transport(outIP->saddr.s6_addr,
+                                                            outIP->daddr.s6_addr,
+                                                            IPPROTO_TCP,
+                                                            expectedSegment.data(),
+                                                            expectedSegment.size()));
+    expectNamed(outTCP->check == expectedChecksum, "recomputes_transport_checksum");
   }
 
   ingressProgram.close();
@@ -1714,6 +1875,7 @@ int main(void)
   exerciseHostIngressGenericPortal(suite, false, IPPROTO_TCP);
   exerciseHostIngressGenericPortal(suite, true, IPPROTO_UDP);
   exerciseHostIngressGenericPortal(suite, true, IPPROTO_TCP);
+  exerciseHostIngressIPv6TCPPortalBrowserSizedPayload(suite);
   exerciseHostIngressHostedIngressRoute(suite, false, IPPROTO_UDP);
   exerciseHostIngressHostedIngressRoute(suite, false, IPPROTO_TCP);
   exerciseHostIngressHostedIngressRoute(suite, true, IPPROTO_UDP);
@@ -1848,7 +2010,7 @@ int main(void)
   suite.expect((switchboardOverlayEncapAdjustRoomFlagsIPv4() & BPF_F_ADJ_ROOM_ENCAP_L3_IPV4) != 0, "switchboard_overlay_encap_ipv4_sets_l3_flag");
   suite.expect((switchboardOverlayEncapAdjustRoomFlagsIPv4() & BPF_F_ADJ_ROOM_NO_CSUM_RESET) != 0, "switchboard_overlay_encap_ipv4_preserves_checksum_offload");
   suite.expect((switchboardOverlayEncapAdjustRoomFlagsIPv4() & BPF_F_ADJ_ROOM_FIXED_GSO) == 0, "switchboard_overlay_encap_ipv4_clears_gso");
-  suite.expect(switchboardManualChecksumMaxBytes() == 2050u, "switchboard_manual_checksum_max_bytes_matches_live_quic_reply_budget");
+  suite.expect(switchboardManualChecksumMaxBytes() == 4096u, "switchboard_manual_checksum_max_bytes_covers_browser_tls_portal_budget");
   suite.expect(switchboardManualChecksumSKBChunkBytes() == 128u, "switchboard_manual_checksum_skb_chunk_bytes_is_verifier_safe");
   suite.expect((switchboardManualChecksumSKBChunkBytes() & 3u) == 0u, "switchboard_manual_checksum_skb_chunk_bytes_is_word_aligned");
   suite.expect(switchboardManualChecksumSKBChunkBytes() <= 128u, "switchboard_manual_checksum_skb_chunk_bytes_leaves_stack_headroom");
@@ -1929,6 +2091,7 @@ int main(void)
         switchboardManualChecksumSKBChunkBytes()));
 
     suite.expect(segment.size() == 2050u, "switchboard_wormhole_skb_chunked_checksum_current_live_segment_size_matches_capture");
+    suite.expect(segment.size() <= switchboardManualChecksumMaxBytes(), "switchboard_wormhole_skb_chunked_checksum_current_live_segment_fits_checksum_budget");
     suite.expect(checksumBytesChunked(segment.data(), segment.size(), switchboardManualChecksumSKBChunkBytes()) == checksumBytes(segment.data(), segment.size()), "switchboard_wormhole_skb_chunked_checksum_matches_full_checksum_for_current_live_size");
     suite.expect(emulatedSKBChunkedChecksum == expectedChecksum, "switchboard_wormhole_skb_chunked_transport_checksum_matches_current_live_capture");
   }

@@ -986,7 +986,14 @@ private:
         }
 
         nextMirror.ifidxByFragment[fragment] = desiredIfidx;
-        if (mirrorTrusted && mirror.ifidxByFragment[fragment] == desiredIfidx)
+        bool mapEntryCurrent = mirrorTrusted && mirror.ifidxByFragment[fragment] == desiredIfidx;
+        if (mapEntryCurrent && ownerUUID == 0 && desiredIfidx != 0)
+        {
+          uint32_t readback = 0;
+          mapEntryCurrent = (bpf_map_lookup_elem(mapFD, &fragment, &readback) == 0 && readback == desiredIfidx);
+        }
+
+        if (mapEntryCurrent)
         {
           continue;
         }
@@ -1735,15 +1742,19 @@ public:
 
     if (peer_program)
     {
-      peer_program->close();
+      netdevs.host.detachBPF(prodigyContainerEgressNetkitAttachType());
+      peer_program = nullptr;
     }
     if (primary_program)
     {
-      primary_program->close();
+      netdevs.host.detachBPF(prodigyContainerIngressNetkitAttachType());
+      primary_program = nullptr;
     }
     if (netdevs.areActive())
     {
       netdevs.destroyPair();
+      netdevs.host.name.clear();
+      netdevs.peer.name.clear();
     }
   }
 };

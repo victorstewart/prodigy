@@ -3077,10 +3077,62 @@ public:
           // Deployment scheduling waits on this signal.
           if (brain)
           {
+            if (verboseNeuronSocketLogsEnabled())
+            {
+              std::fprintf(stderr,
+                           "neuron containerHealthy forward-begin uuid=%llu brain=%p active=%d pendingSend=%d pendingRecv=%d wbytes=%u queued=%llu fd=%d fslot=%d\n",
+                           (unsigned long long)container->plan.uuid,
+                           static_cast<void *>(brain),
+                           int(controllingBrainActive),
+                           int(brain->pendingSend),
+                           int(brain->pendingRecv),
+                           unsigned(brain->wBuffer.outstandingBytes()),
+                           (unsigned long long)brain->queuedSendOutstandingBytes(),
+                           brain->fd,
+                           brain->fslot);
+              std::fflush(stderr);
+            }
             Message::construct(brain->wBuffer, NeuronTopic::containerHealthy, container->plan.uuid);
+            if (verboseNeuronSocketLogsEnabled())
+            {
+              std::fprintf(stderr,
+                           "neuron containerHealthy forward-constructed uuid=%llu pendingSend=%d wbytes=%u queued=%llu fd=%d fslot=%d\n",
+                           (unsigned long long)container->plan.uuid,
+                           int(brain->pendingSend),
+                           unsigned(brain->wBuffer.outstandingBytes()),
+                           (unsigned long long)brain->queuedSendOutstandingBytes(),
+                           brain->fd,
+                           brain->fslot);
+              std::fflush(stderr);
+            }
             if (controllingBrainActive)
             {
               Ring::queueSend(brain);
+              if (verboseNeuronSocketLogsEnabled())
+              {
+                std::fprintf(stderr,
+                             "neuron containerHealthy forward-queued uuid=%llu pendingSend=%d pendingSendBytes=%u wbytes=%u queued=%llu fd=%d fslot=%d\n",
+                             (unsigned long long)container->plan.uuid,
+                             int(brain->pendingSend),
+                             unsigned(brain->pendingSendBytes),
+                             unsigned(brain->wBuffer.outstandingBytes()),
+                             (unsigned long long)brain->queuedSendOutstandingBytes(),
+                             brain->fd,
+                             brain->fslot);
+                std::fflush(stderr);
+              }
+            }
+            else if (verboseNeuronSocketLogsEnabled())
+            {
+              std::fprintf(stderr,
+                           "neuron containerHealthy forward-buffered uuid=%llu pendingSend=%d wbytes=%u queued=%llu fd=%d fslot=%d\n",
+                           (unsigned long long)container->plan.uuid,
+                           int(brain->pendingSend),
+                           unsigned(brain->wBuffer.outstandingBytes()),
+                           (unsigned long long)brain->queuedSendOutstandingBytes(),
+                           brain->fd,
+                           brain->fslot);
+              std::fflush(stderr);
             }
           }
 

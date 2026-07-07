@@ -9,10 +9,11 @@
 
 #include <bpf/bpf_endian.h>
 
-// Live public QUIC reply rewrites now reach a 2050-byte UDP transport segment.
-// Keep the ceiling exact so the helper loop bounds stay tight while the
-// maintained battery's current packet still fits.
-#define SWITCHBOARD_MAX_WORMHOLE_CHECKSUM_BYTES 2050u
+// Public wormhole rewrites must tolerate browser/TLS first-flight packets and
+// QUIC replies that exceed a single MTU after GRO/GSO coalescing. Keep the
+// verifier-visible walk bounded, but leave enough room for observed 2052-byte
+// TCP portal segments instead of pinning the ceiling to one captured packet.
+#define SWITCHBOARD_MAX_WORMHOLE_CHECKSUM_BYTES 4096u
 #define SWITCHBOARD_WORMHOLE_SKB_CHECKSUM_CHUNK_BYTES 128u
 
 __attribute__((__always_inline__)) static inline __u32 switchboardManualChecksumMaxBytes(void)

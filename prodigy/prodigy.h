@@ -41,6 +41,18 @@ private:
   NeuronType *neuron = nullptr;
   // the only way master brain is relinquished, is either by choice when we 1) update the operating system or 2) update this program, or by force when 3) the machine fails
 
+  static void exitTraceHandler(int status, void *)
+  {
+    void *frames[32];
+    int nFrames = backtrace(frames, 32);
+    std::fprintf(stderr, "prodigy exit-trace pid=%d status=%d frames=%d\n", int(getpid()), status, nFrames);
+    for (int i = 0; i < nFrames; ++i)
+    {
+      std::fprintf(stderr, "prodigy exit-trace frame[%d]=%p\n", i, frames[i]);
+    }
+    std::fflush(stderr);
+  }
+
   void beforeRing(void)
   {
     Ring::signals[0] = SIGINT;
@@ -111,6 +123,14 @@ public:
     // Also register this Prodigy instance for timeout routing
     RingDispatcher::installMultiplexee(this, this);
     BrainBase::captureLaunchArguments(argc, argv);
+    if (const char *crashReportPath = std::getenv("PRODIGY_CRASH_REPORT_PATH"); crashReportPath && crashReportPath[0])
+    {
+      Guardian::crashReportPath.assign(crashReportPath);
+    }
+    if (const char *exitTrace = std::getenv("PRODIGY_EXIT_TRACE"); exitTrace && exitTrace[0] == '1')
+    {
+      (void)on_exit(exitTraceHandler, nullptr);
+    }
 
     uint32_t sqeCount = 128;
     uint32_t cqeCount = 128;

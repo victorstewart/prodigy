@@ -431,6 +431,20 @@ int main(void)
 
   {
     Vector<MachineNicHardwareProfile> nics = {};
+    MachineNicHardwareProfile packetNic = {};
+    struct sockaddr_ll packetAddress = {};
+    packetAddress.sll_family = AF_PACKET;
+    packetAddress.sll_halen = 6;
+    packetAddress.sll_addr[0] = 0x0a;
+    packetAddress.sll_addr[1] = 0x11;
+    packetAddress.sll_addr[2] = 0x22;
+    packetAddress.sll_addr[3] = 0x33;
+    packetAddress.sll_addr[4] = 0x44;
+    packetAddress.sll_addr[5] = 0x55;
+    suite.expect(prodigyAssignNicMacFromSockaddr(reinterpret_cast<const struct sockaddr *>(&packetAddress), packetNic),
+                 "assign_nic_mac_from_packet_sockaddr");
+    suite.expect(packetNic.mac == "0a:11:22:33:44:55"_ctv, "assign_nic_mac_from_packet_sockaddr_value");
+
     suite.expect(
         prodigyPopulateNicsFromIpLinkJSON(
             nics,

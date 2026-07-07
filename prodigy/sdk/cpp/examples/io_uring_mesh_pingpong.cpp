@@ -6,7 +6,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <vector>
@@ -643,6 +645,12 @@ int main(int argc, char *argv[])
 
   Reactor<Event>::NeuronHandle handle;
   result = reactor.attachNeuron(neuron, handle);
+  if (result != Result::ok)
+  {
+    return 1;
+  }
+
+  result = handle.runtimeReady();
   if (result != Result::ok)
   {
     return 1;

@@ -16,6 +16,7 @@
 #include <simdjson.h>
 #include <spawn.h>
 #include <string>
+#include <linux/if_packet.h>
 #include <sys/statvfs.h>
 #include <sys/wait.h>
 #include <thread>
@@ -2645,6 +2646,33 @@ static inline MachineNicHardwareProfile& prodigyFindOrAppendNicByName(Vector<Mac
   return nic;
 }
 
+static inline bool prodigyAssignNicMacFromSockaddr(const struct sockaddr *address, MachineNicHardwareProfile& nic)
+{
+  if (address == nullptr || address->sa_family != AF_PACKET)
+  {
+    return false;
+  }
+
+  const struct sockaddr_ll *packetAddress = reinterpret_cast<const struct sockaddr_ll *>(address);
+  if (packetAddress->sll_halen != 6)
+  {
+    return false;
+  }
+
+  char text[18] = {};
+  std::snprintf(text,
+                sizeof(text),
+                "%02x:%02x:%02x:%02x:%02x:%02x",
+                unsigned(packetAddress->sll_addr[0]),
+                unsigned(packetAddress->sll_addr[1]),
+                unsigned(packetAddress->sll_addr[2]),
+                unsigned(packetAddress->sll_addr[3]),
+                unsigned(packetAddress->sll_addr[4]),
+                unsigned(packetAddress->sll_addr[5]));
+  nic.mac.assign(text);
+  return true;
+}
+
 static inline const ProdigyNicGatewayMapping *prodigyFindNicGateway(const Vector<ProdigyNicGatewayMapping>& gateways, const String& ifname, bool is6)
 {
   for (const ProdigyNicGatewayMapping& gateway : gateways)
@@ -2713,7 +2741,12 @@ static inline bool prodigyCollectNicInventoryFromProcess(Vector<MachineNicHardwa
     }
 
     MachineNicSubnetHardwareProfile subnet = {};
-    if (ifa->ifa_addr->sa_family == AF_INET)
+    if (ifa->ifa_addr->sa_family == AF_PACKET)
+    {
+      (void)prodigyAssignNicMacFromSockaddr(ifa->ifa_addr, nic);
+      continue;
+    }
+    else if (ifa->ifa_addr->sa_family == AF_INET)
     {
       subnet.address = {};
       subnet.address.is6 = false;

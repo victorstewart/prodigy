@@ -7,6 +7,7 @@
 #include <prodigy/quic.cid.generator.h>
 
 #include <arpa/inet.h>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -19,11 +20,11 @@ public:
   {
     if (condition)
     {
-      basics_log("PASS: %s\n", name);
+      std::fprintf(stderr, "PASS: %s\n", name);
     }
     else
     {
-      basics_log("FAIL: %s\n", name);
+      std::fprintf(stderr, "FAIL: %s\n", name);
       failed += 1;
     }
   }

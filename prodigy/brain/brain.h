@@ -853,6 +853,7 @@ public:
   uint32_t brainPeerKeepaliveSeconds = prodigyBrainPeerKeepaliveSeconds;
   uint32_t brainPeerHeartbeatIntervalMs = prodigyBrainPeerHeartbeatIntervalMs;
   uint32_t brainPeerHeartbeatTimeoutMs = prodigyBrainPeerHeartbeatTimeoutMs;
+  int64_t lastBrainPeerHeartbeatTickMs = 0;
   int64_t boottimens;
 
   TCPSocket brainSocket;
@@ -7516,14 +7517,36 @@ public:
     return true;
   }
 
-  bool shouldWeConnectToBrain(const BrainView *brain) const
+  void collectLocalBrainPeerSourceCandidates(Vector<ClusterMachinePeerAddress>& localCandidates, bool preferNeuronPrivate4BeforeAmbient = false) const
   {
-    if (brain == nullptr)
+    localCandidates = localBrainPeerAddresses;
+    if (localCandidates.empty() && localBrainPeerAddress.isNull() == false)
     {
-      return false;
+      ClusterMachinePeerAddress candidate = {};
+      if (localBrainPeerAddressText.size() > 0)
+      {
+        candidate.address.assign(localBrainPeerAddressText);
+      }
+      else
+      {
+        (void)ClusterMachine::renderIPAddressLiteral(localBrainPeerAddress, candidate.address);
+      }
+
+      if (candidate.address.size() > 0)
+      {
+        prodigyAppendUniqueClusterMachinePeerAddress(localCandidates, candidate);
+      }
     }
 
-    Vector<ClusterMachinePeerAddress> localCandidates = localBrainPeerAddresses;
+    if (preferNeuronPrivate4BeforeAmbient && localCandidates.empty() && thisNeuron != nullptr && thisNeuron->private4.isNull() == false)
+    {
+      ClusterMachinePeerAddress candidate = {};
+      if (ClusterMachine::renderIPAddressLiteral(thisNeuron->private4, candidate.address))
+      {
+        prodigyAppendUniqueClusterMachinePeerAddress(localCandidates, candidate);
+      }
+    }
+
     if (localCandidates.empty() && thisNeuron != nullptr)
     {
       String preferredInterface = {};
@@ -7540,6 +7563,17 @@ public:
         prodigyCollectClusterMachinePeerAddresses(topology.machines[0], localCandidates);
       }
     }
+  }
+
+  bool shouldWeConnectToBrain(const BrainView *brain) const
+  {
+    if (brain == nullptr)
+    {
+      return false;
+    }
+
+    Vector<ClusterMachinePeerAddress> localCandidates = {};
+    collectLocalBrainPeerSourceCandidates(localCandidates, true);
 
     Vector<ClusterMachinePeerAddress> peerCandidates = brain->peerAddresses;
     if (peerCandidates.empty())
@@ -9023,11 +9057,41 @@ public:
     return std::max<int64_t>(brain->connectTimeoutMs, 1);
   }
 
+  bool staleDisconnectedFixedFileBrainPeer(BrainView *brain)
+  {
+    if (brain == nullptr ||
+        brain->isFixedFile == false ||
+        brain->fslot < 0 ||
+        brain->connected ||
+        brain->pendingSend ||
+        brain->pendingRecv ||
+        brain->connectAttemptPending() ||
+        Ring::socketIsClosing(brain))
+    {
+      return false;
+    }
+
+    return brain->quarantined ||
+           brain->reconnectAfterClose;
+  }
+
   void attemptBrainPeerReconnectNow(BrainView *brain, bool persistentReconnect, const char *reason)
   {
     if (brain == nullptr || brains.contains(brain) == false)
     {
       return;
+    }
+
+    if (staleDisconnectedFixedFileBrainPeer(brain))
+    {
+      basics_log("brain reconnect abandoning stale fixedfile private4=%u reason=%s fd=%d fslot=%d quarantined=%d reconnectAfterClose=%d\n",
+                 brain->private4,
+                 (reason ? reason : "unspecified"),
+                 brain->fd,
+                 brain->fslot,
+                 int(brain->quarantined),
+                 int(brain->reconnectAfterClose));
+      abandonSocketGeneration(brain);
     }
 
     if (rawStreamIsActive(brain) || Ring::socketIsClosing(brain) || brain->connectAttemptPending())
@@ -9077,6 +9141,18 @@ public:
     if (brain == nullptr)
     {
       return;
+    }
+
+    if (staleDisconnectedFixedFileBrainPeer(brain))
+    {
+      basics_log("brain reconnect waiter abandoning stale fixedfile private4=%u reason=%s fd=%d fslot=%d quarantined=%d reconnectAfterClose=%d\n",
+                 brain->private4,
+                 (reason ? reason : "unspecified"),
+                 brain->fd,
+                 brain->fslot,
+                 int(brain->quarantined),
+                 int(brain->reconnectAfterClose));
+      abandonSocketGeneration(brain);
     }
 
     if (rawStreamIsActive(brain) || (allowCloseInFlight == false && Ring::socketIsClosing(brain)) || brain->connectAttemptPending())
@@ -9428,6 +9504,13 @@ public:
     }
 
     int64_t nowMs = Time::now<TimeResolution::ms>();
+    int64_t tickLagMs = 0;
+    if (lastBrainPeerHeartbeatTickMs > 0 && nowMs > lastBrainPeerHeartbeatTickMs)
+    {
+      tickLagMs = nowMs - lastBrainPeerHeartbeatTickMs;
+    }
+    lastBrainPeerHeartbeatTickMs = nowMs;
+    const bool localHeartbeatTickLagged = (tickLagMs >= int64_t(brainPeerHeartbeatTimeoutMs));
     for (BrainView *peer : brains)
     {
       auto noteMasterPeerHeartbeatEligibility = [&](uint8_t state, const char *reason) -> void {
@@ -9503,6 +9586,29 @@ public:
       const bool heartbeatOutstanding = (peer->lastHeartbeatSentNonce != peer->lastHeartbeatAckNonce);
       if (heartbeatOutstanding && peer->lastHeartbeatSendMs > 0 && nowMs - peer->lastHeartbeatSendMs >= int64_t(brainPeerHeartbeatTimeoutMs))
       {
+        if (localHeartbeatTickLagged)
+        {
+          basics_log("brainPeerHeartbeat stale-deferred private4=%u tickLagMs=%lld timeoutMs=%u transportEpoch=%u lastAckNonce=%llu lastSentNonce=%llu\n",
+                     peer->private4,
+                     (long long)tickLagMs,
+                     brainPeerHeartbeatTimeoutMs,
+                     unsigned(peer->transportEpoch),
+                     (unsigned long long)peer->lastHeartbeatAckNonce,
+                     (unsigned long long)peer->lastHeartbeatSentNonce);
+          std::fprintf(stderr,
+                       "prodigy debug brainPeerHeartbeat stale-deferred private4=%u tickLagMs=%lld timeoutMs=%u transportEpoch=%u lastAckNonce=%llu lastSentNonce=%llu\n",
+                       peer->private4,
+                       (long long)tickLagMs,
+                       brainPeerHeartbeatTimeoutMs,
+                       unsigned(peer->transportEpoch),
+                       (unsigned long long)peer->lastHeartbeatAckNonce,
+                       (unsigned long long)peer->lastHeartbeatSentNonce);
+          std::fflush(stderr);
+          peer->lastHeartbeatSendMs = nowMs;
+          driveMasterPeerIdentityConvergence(peer, nowMs);
+          continue;
+        }
+
         peer->confirmedMissingTransportEpoch = peer->transportEpoch;
         basics_log("brainPeerHeartbeat stale private4=%u lastLivenessAgoMs=%lld lastAckAgoMs=%lld timeoutMs=%u transportEpoch=%u lastAckNonce=%llu lastSentNonce=%llu lastReceiveAgoMs=%lld lastSendAgoMs=%lld\n",
                    peer->private4,
@@ -9979,6 +10085,8 @@ public:
                    (unsigned long long)neuron->rBuffer.outstandingBytes());
       std::fflush(stderr);
       neuron->cancelPendingConnect();
+
+      retryScheduledContainerWaitersAfterNeuronClose(neuron->machine);
 
       if (weAreMaster && neuron->shouldReconnect())
       {
@@ -10998,23 +11106,8 @@ public:
       return;
     }
 
-    Vector<ClusterMachinePeerAddress> localCandidates = localBrainPeerAddresses;
-    if (localCandidates.empty() && thisNeuron != nullptr)
-    {
-      String preferredInterface = {};
-      preferredInterface.assign(thisNeuron->eth.name);
-      prodigyCollectLocalPeerAddressCandidates(preferredInterface, thisNeuron->private4, localCandidates);
-      if (localCandidates.empty() == false)
-      {
-        ClusterTopology topology = {};
-        ClusterMachine self = {};
-        self.isBrain = true;
-        prodigyAssignClusterMachineAddressesFromPeerCandidates(self.addresses, localCandidates);
-        topology.machines.push_back(self);
-        prodigyNormalizeClusterTopologyPeerAddresses(topology);
-        prodigyCollectClusterMachinePeerAddresses(topology.machines[0], localCandidates);
-      }
-    }
+    Vector<ClusterMachinePeerAddress> localCandidates = {};
+    collectLocalBrainPeerSourceCandidates(localCandidates);
 
     IPAddress peerAddress = {};
     String peerAddressText = {};
@@ -11604,14 +11697,28 @@ public:
     {
       if (brain->fslot >= 0)
       {
-        std::fprintf(stderr,
-                     "prodigy brain init-peer-skip reason=fixedfile-present private4=%u fd=%d isFixed=%d fslot=%d\n",
-                     unsigned(brain->private4),
-                     brain->fd,
-                     int(brain->isFixedFile),
-                     brain->fslot);
-        std::fflush(stderr);
-        return;
+        if (staleDisconnectedFixedFileBrainPeer(brain))
+        {
+          std::fprintf(stderr,
+                       "prodigy brain init-peer-stale-fixedfile private4=%u fd=%d isFixed=%d fslot=%d\n",
+                       unsigned(brain->private4),
+                       brain->fd,
+                       int(brain->isFixedFile),
+                       brain->fslot);
+          std::fflush(stderr);
+          abandonSocketGeneration(brain);
+        }
+        else
+        {
+          std::fprintf(stderr,
+                       "prodigy brain init-peer-skip reason=fixedfile-present private4=%u fd=%d isFixed=%d fslot=%d\n",
+                       unsigned(brain->private4),
+                       brain->fd,
+                       int(brain->isFixedFile),
+                       brain->fslot);
+          std::fflush(stderr);
+          return;
+        }
       }
     }
     else if (brain->fd >= 0)
@@ -14484,6 +14591,29 @@ public:
       }
 
       target->containersByDeploymentID.clear();
+    }
+  }
+
+  void retryScheduledContainerWaitersAfterNeuronClose(Machine *machine)
+  {
+    if (machine == nullptr || weAreMaster == false)
+    {
+      return;
+    }
+
+    Vector<ApplicationDeployment *> affectedDeployments;
+    for (const auto& [deploymentID, deployment] : deployments)
+    {
+      (void)deploymentID;
+      if (deployment && deployment->plan.isStateful == false)
+      {
+        affectedDeployments.push_back(deployment);
+      }
+    }
+
+    for (ApplicationDeployment *deployment : affectedDeployments)
+    {
+      deployment->drainMachine(machine, true, true);
     }
   }
 
@@ -24144,14 +24274,12 @@ public:
           deployments.insert_or_assign(deployment->plan.config.deploymentID(), deployment);
           bindSpinApplicationMothership(deployment, mothership);
 
-          // Replicate lightweight deployment metadata first so a follower can
-          // take over scheduling even if the leader dies during large blob transfer.
-          // Only queue the large blob to a given peer after that peer echoes the
-          // metadata frame, so a slow metadata apply path cannot immediately wedge
-          // the same control socket behind a multi-megabyte follow-up frame.
+          // Initial deploy replication must carry the validated image with the
+          // plan. A metadata-only frame can leave an already-master peer with a
+          // reserved app name but no live deployment chain to report.
           if (nBrains > 1)
           {
-            queueBrainDeploymentReplication(trustedSerializedPlan, ""_ctv);
+            queueBrainDeploymentReplication(trustedSerializedPlan, containerBlob);
           }
 
           Message::construct(mothership->wBuffer, MothershipTopic::spinApplication, uint8_t(SpinApplicationResponseCode::okay));

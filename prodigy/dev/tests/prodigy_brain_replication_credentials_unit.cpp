@@ -1142,32 +1142,32 @@ public:
 
   uint32_t installedIngressOverlayPrefixes4CountForTest(void) const
   {
-    return installedIngressOverlayPrefixes4.size();
+    return installedIngressOverlayPrefixes4.keys.size();
   }
 
   uint32_t installedIngressOverlayPrefixes6CountForTest(void) const
   {
-    return installedIngressOverlayPrefixes6.size();
+    return installedIngressOverlayPrefixes6.keys.size();
   }
 
   uint32_t installedEgressOverlayPrefixes4CountForTest(void) const
   {
-    return installedEgressOverlayPrefixes4.size();
+    return installedEgressOverlayPrefixes4.keys.size();
   }
 
   uint32_t installedEgressOverlayPrefixes6CountForTest(void) const
   {
-    return installedEgressOverlayPrefixes6.size();
+    return installedEgressOverlayPrefixes6.keys.size();
   }
 
   uint32_t installedOverlayRouteKeysFullCountForTest(void) const
   {
-    return installedOverlayRouteKeysFull.size();
+    return installedOverlayRouteKeysFull.entries.size();
   }
 
   uint32_t installedOverlayRouteKeysLow8CountForTest(void) const
   {
-    return installedOverlayRouteKeysLow8.size();
+    return installedOverlayRouteKeysLow8.entries.size();
   }
 
   void seedLocalContainerSubnetForTest(const local_container_subnet6& subnet)
@@ -1202,7 +1202,7 @@ public:
 
   uint32_t installedWhiteholeBindingCountForTest(void) const
   {
-    return installedEgressWhiteholeBindingKeys.size();
+    return installedEgressWhiteholeBindingKeys.entries.size();
   }
 
   bool resolveOptionalHostRouterBPFPathsForTest(String& hostIngressPath, String& hostEgressPath, String *failureReport = nullptr) const
@@ -2809,6 +2809,105 @@ static void testSpinApplicationStagesFollowerBlobReplicationBehindMetadataEcho(T
   brain.deploymentPlans.erase(deployment->plan.config.deploymentID());
   ContainerStore::destroy(deployment->plan.config.deploymentID());
   delete deployment;
+}
+
+static void testSpinApplicationReplicatesInitialBlobWithPlan(TestSuite& suite)
+{
+  StreamingTestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  Mothership mothership = {};
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  brain.nBrains = 3;
+  brain.mothership = &mothership;
+  mothership.isFixedFile = true;
+  mothership.fslot = 1;
+
+  BrainView followerA = {};
+  followerA.connected = true;
+  followerA.isFixedFile = true;
+  followerA.fslot = 11;
+  followerA.private4 = 0x0a00000b;
+  BrainView followerB = {};
+  followerB.connected = true;
+  followerB.isFixedFile = true;
+  followerB.fslot = 12;
+  followerB.private4 = 0x0a00000c;
+  brain.brains.insert(&followerA);
+  brain.brains.insert(&followerB);
+
+  DeploymentPlan plan = {};
+  seedDeployRequestPlan(plan, 62'014);
+  String reserveFailure = {};
+  suite.expect(brain.reserveApplicationIDMapping("SpinBlobApp"_ctv, plan.config.applicationID, &reserveFailure), "spin_application_initial_blob_seed_application");
+
+  ApplicationDeployment *previous = new ApplicationDeployment();
+  seedDeployRequestPlan(previous->plan, plan.config.applicationID);
+  previous->plan.config.versionID = 0;
+  previous->state = DeploymentState::waitingToDeploy;
+  brain.deploymentsByApp.insert_or_assign(plan.config.applicationID, previous);
+  brain.deployments.insert_or_assign(previous->plan.config.deploymentID(), previous);
+
+  String serializedPlan = {};
+  BitseryEngine::serialize(serializedPlan, plan);
+  String containerBlob = prodigyDiscombobulatorBlobHeaderText();
+  containerBlob.append("spin-application-initial-blob"_ctv);
+  ContainerStore::destroy(plan.config.deploymentID());
+
+  String requestBuffer = {};
+  Message *message = buildMothershipMessage(
+      requestBuffer,
+      MothershipTopic::spinApplication,
+      uint16_t(plan.config.applicationID),
+      serializedPlan,
+      containerBlob);
+  brain.mothershipHandler(&mothership, message);
+
+  auto countInitialBlobFrames =
+      [&](BrainView& follower, uint32_t& frameCount, uint32_t& matchingBlobFrames) -> void {
+    frameCount = 0;
+    matchingBlobFrames = 0;
+    forEachMessageInBuffer(follower.wBuffer, [&](Message *frame) {
+      if (BrainTopic(frame->topic) != BrainTopic::replicateDeployment)
+      {
+        return;
+      }
+
+      uint8_t *args = frame->args;
+      String ignoredSerializedPlan = {};
+      Message::extractToStringView(args, ignoredSerializedPlan);
+      String observedBlob = {};
+      Message::extractToStringView(args, observedBlob);
+      frameCount += 1;
+      if (observedBlob.equals(containerBlob))
+      {
+        matchingBlobFrames += 1;
+      }
+    });
+  };
+
+  uint32_t followerAFrames = 0;
+  uint32_t followerABlobs = 0;
+  uint32_t followerBFrames = 0;
+  uint32_t followerBBlobs = 0;
+  countInitialBlobFrames(followerA, followerAFrames, followerABlobs);
+  countInitialBlobFrames(followerB, followerBFrames, followerBBlobs);
+  suite.expect(followerAFrames == 1 && followerABlobs == 1, "spin_application_initial_replication_carries_blob_to_first_peer");
+  suite.expect(followerBFrames == 1 && followerBBlobs == 1, "spin_application_initial_replication_carries_blob_to_second_peer");
+
+  ContainerStore::destroy(plan.config.deploymentID());
+  if (auto it = brain.deployments.find(plan.config.deploymentID()); it != brain.deployments.end())
+  {
+    delete it->second;
+    brain.deployments.erase(it);
+  }
+  brain.deploymentsByApp.erase(plan.config.applicationID);
+  if (auto it = brain.deployments.find(previous->plan.config.deploymentID()); it != brain.deployments.end())
+  {
+    brain.deployments.erase(it);
+  }
+  delete previous;
 }
 
 static void testStatefulRequestMachinesClaimsDeployingMachinesWithSpecializedTicket(TestSuite& suite)
@@ -18280,6 +18379,7 @@ int main(void)
   testSpinApplicationProgressAcceptsDirectFdMothership(suite);
   testSpinApplicationProgressStaysOnOriginalDeployStream(suite);
   testSpinApplicationStagesFollowerBlobReplicationBehindMetadataEcho(suite);
+  testSpinApplicationReplicatesInitialBlobWithPlan(suite);
   testLargePayloadPeerKeepaliveUsesFixedFileSocketCommand(suite);
   testAcceptedBrainPeerSetsLargePayloadUserTimeout(suite);
   testStatefulRequestMachinesClaimsDeployingMachinesWithSpecializedTicket(suite);

@@ -27,6 +27,7 @@ public:
   uint32_t progressCount = 0;
   uint32_t failureCount = 0;
   uint32_t finCount = 0;
+  uint32_t requestMachinesCount = 0;
   String lastProgressMessage = {};
   String lastFailureMessage = {};
 
@@ -62,6 +63,7 @@ public:
 
   void requestMachines(MachineTicket *ticket, ApplicationDeployment *deployment, ApplicationLifetime lifetime, uint32_t nMore) override
   {
+    requestMachinesCount += 1;
     (void)ticket;
     (void)deployment;
     (void)lifetime;
@@ -973,6 +975,143 @@ int main(void)
   }
 
   {
+    ScopedFreshRing ring;
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+
+    Rack rackA {};
+    rackA.uuid = 1905;
+    Rack rackB {};
+    rackB.uuid = 1906;
+    brain.racks.insert_or_assign(rackA.uuid, &rackA);
+    brain.racks.insert_or_assign(rackB.uuid, &rackB);
+
+    Machine closedMachine {};
+    closedMachine.uuid = uint128_t(0x190507);
+    closedMachine.slug = "closed-neuron-source"_ctv;
+    closedMachine.rack = &rackA;
+    closedMachine.state = MachineState::healthy;
+    closedMachine.lifetime = MachineLifetime::owned;
+    closedMachine.nLogicalCores_available = 8;
+    closedMachine.memoryMB_available = 8192;
+    closedMachine.storageMB_available = 4096;
+    closedMachine.neuron.machine = &closedMachine;
+    rackA.machines.insert(&closedMachine);
+    brain.machines.insert(&closedMachine);
+
+    ScopedSocketPair socket = {};
+    bool socketReady = socket.create(suite, "drainMachine_filtered_scheduled_waiter_creates_socketpair");
+
+    Machine targetMachine {};
+    targetMachine.uuid = uint128_t(0x190508);
+    targetMachine.slug = "scheduled-waiter-target"_ctv;
+    targetMachine.rack = &rackB;
+    targetMachine.state = MachineState::healthy;
+    targetMachine.lifetime = MachineLifetime::owned;
+    targetMachine.nLogicalCores_available = 8;
+    targetMachine.memoryMB_available = 8192;
+    targetMachine.storageMB_available = 4096;
+    bool targetReady = socketReady && armNeuronControlStream(targetMachine, socket);
+    rackB.machines.insert(&targetMachine);
+    brain.machines.insert(&targetMachine);
+
+    suite.expect(targetReady, "drainMachine_filtered_scheduled_waiter_seeds_target_control_stream");
+
+    ApplicationDeployment deployment;
+    seedCommonPlan(deployment, false);
+    deployment.plan.stateless.nBase = 2;
+    deployment.nTargetBase = 2;
+    deployment.nDeployedBase = 2;
+    deployment.nHealthyBase = 1;
+    deployment.state = DeploymentState::deploying;
+    brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+
+    ContainerView *scheduled = new ContainerView();
+    scheduled->uuid = uint128_t(0x190501);
+    scheduled->deploymentID = deployment.plan.config.deploymentID();
+    scheduled->applicationID = deployment.plan.config.applicationID;
+    scheduled->machine = &closedMachine;
+    scheduled->lifetime = ApplicationLifetime::base;
+    scheduled->state = ContainerState::scheduled;
+
+    ContainerView *healthy = new ContainerView();
+    healthy->uuid = uint128_t(0x190502);
+    healthy->deploymentID = deployment.plan.config.deploymentID();
+    healthy->applicationID = deployment.plan.config.applicationID;
+    healthy->machine = &closedMachine;
+    healthy->lifetime = ApplicationLifetime::base;
+    healthy->state = ContainerState::healthy;
+
+    deployment.containers.insert(scheduled);
+    deployment.containers.insert(healthy);
+    deployment.waitingOnContainers.insert_or_assign(scheduled, ContainerState::healthy);
+    closedMachine.upsertContainerIndexEntry(healthy->deploymentID, healthy);
+    brain.containers.insert_or_assign(scheduled->uuid, scheduled);
+    brain.containers.insert_or_assign(healthy->uuid, healthy);
+
+    uint128_t scheduledUUID = scheduled->uuid;
+
+    deployment.drainMachine(&closedMachine, true, true);
+
+    suite.expect(brain.containers.contains(scheduledUUID) == false, "drainMachine_filtered_scheduled_waiter_destroys_lost_container");
+    suite.expect(deployment.containers.contains(healthy), "drainMachine_filtered_scheduled_waiter_preserves_healthy_container");
+    suite.expect(closedMachine.containersByDeploymentID.hasEntryFor(healthy->deploymentID, healthy), "drainMachine_filtered_scheduled_waiter_keeps_healthy_machine_index");
+    suite.expect(deployment.waitingOnContainers.contains(scheduled) == false, "drainMachine_filtered_scheduled_waiter_clears_old_waiter");
+
+    ContainerView *replacement = nullptr;
+    for (ContainerView *container : deployment.containers)
+    {
+      if (container != healthy && container->machine == &targetMachine)
+      {
+        replacement = container;
+        break;
+      }
+    }
+
+    suite.expect(replacement != nullptr, "drainMachine_filtered_scheduled_waiter_creates_replacement");
+    suite.expect(replacement == nullptr || replacement->state == ContainerState::scheduled, "drainMachine_filtered_scheduled_waiter_schedules_replacement");
+    suite.expect(replacement == nullptr || targetMachine.containersByDeploymentID.hasEntryFor(replacement->deploymentID, replacement), "drainMachine_filtered_scheduled_waiter_indexes_replacement_target");
+    suite.expect(deployment.waitingOnContainers.size() == 1, "drainMachine_filtered_scheduled_waiter_waits_on_replacement_only");
+    suite.expect(deployment.nDeployedBase == 2, "drainMachine_filtered_scheduled_waiter_preserves_deployed_target");
+    suite.expect(deployment.nHealthyBase == 1, "drainMachine_filtered_scheduled_waiter_preserves_healthy_count");
+
+    Vector<ContainerView *> cleanup;
+    for (ContainerView *container : deployment.containers)
+    {
+      cleanup.push_back(container);
+    }
+    for (ContainerView *container : cleanup)
+    {
+      if (container == nullptr)
+      {
+        continue;
+      }
+      if (container->plannedWork)
+      {
+        deployment.cancelDeploymentWork(container->plannedWork);
+      }
+      deployment.waitingOnContainers.erase(container);
+      deployment.containers.erase(container);
+      if (container->machine)
+      {
+        container->machine->removeContainerIndexEntry(container->deploymentID, container);
+      }
+      brain.containers.erase(container->uuid);
+      delete container;
+    }
+
+    brain.deployments.erase(deployment.plan.config.deploymentID());
+    brain.machines.erase(&closedMachine);
+    brain.machines.erase(&targetMachine);
+    rackA.machines.erase(&closedMachine);
+    rackB.machines.erase(&targetMachine);
+    brain.racks.erase(rackA.uuid);
+    brain.racks.erase(rackB.uuid);
+    thisBrain = savedBrain;
+  }
+
+  {
     TestBrain brain;
     BrainBase *savedBrain = thisBrain;
     thisBrain = &brain;
@@ -1328,21 +1467,28 @@ int main(void)
 
     if (artifactRoot.path.size() > 0)
     {
+      MachineCpuArchitecture currentArchitecture = nametagCurrentBuildMachineArchitecture();
+      String currentArchitectureText = {};
+      currentArchitectureText.assign(machineCpuArchitectureName(currentArchitecture));
+      String metadataJSON = {};
+      metadataJSON.assign(
+          "{\n"
+          "  \"execute_path\": \"/app/hello\",\n"
+          "  \"execute_args\": [\"--port\", \"7777\"],\n"
+          "  \"execute_env\": [\"FOO=bar\", \"BAZ=qux\"],\n"
+          "  \"execute_cwd\": \"/app\",\n"
+          "  \"execute_arch\": \"");
+      metadataJSON.append(currentArchitectureText);
+      metadataJSON.append("\"\n}\n"_ctv);
       suite.expect(
           writeLaunchMetadataFixture(
               artifactRoot.path,
-              R"({
-  "execute_path": "/app/hello",
-  "execute_args": ["--port", "7777"],
-  "execute_env": ["FOO=bar", "BAZ=qux"],
-  "execute_cwd": "/app",
-  "execute_arch": "x86_64"
-})"),
+              metadataJSON.c_str()),
           "launch_metadata_fixture_written");
 
       Container container {};
       container.artifactRootPath.assign(artifactRoot.path);
-      container.plan.config.architecture = MachineCpuArchitecture::x86_64;
+      container.plan.config.architecture = currentArchitecture;
 
       String failure = {};
       bool loaded = ContainerManager::debugLoadContainerLaunchMetadata(&container, &failure);
@@ -1357,7 +1503,7 @@ int main(void)
       suite.expect(container.executeEnv.size() == 2 && container.executeEnv[0] == "FOO=bar"_ctv, "launch_metadata_runtime_loader_sets_execute_env_0");
       suite.expect(container.executeEnv.size() == 2 && container.executeEnv[1] == "BAZ=qux"_ctv, "launch_metadata_runtime_loader_sets_execute_env_1");
       suite.expect(container.executeCwd == "/app"_ctv, "launch_metadata_runtime_loader_sets_execute_cwd");
-      suite.expect(container.executeArchitecture == MachineCpuArchitecture::x86_64, "launch_metadata_runtime_loader_sets_execute_architecture");
+      suite.expect(container.executeArchitecture == currentArchitecture, "launch_metadata_runtime_loader_sets_execute_architecture");
       suite.expect(container.executePath.c_str() != nullptr, "launch_metadata_runtime_loader_materializes_execute_path_c_string");
       suite.expect(container.executeCwd.c_str() != nullptr, "launch_metadata_runtime_loader_materializes_execute_cwd_c_string");
       suite.expect(container.executeArgs.size() == 2 && container.executeArgs[0].c_str() != nullptr, "launch_metadata_runtime_loader_materializes_execute_arg_c_string");
@@ -3625,6 +3771,12 @@ int main(void)
     parameters.statefulTopology.sourceEpoch = 200;
     parameters.statefulTopology.targetEpoch = 400;
     parameters.statefulTopology.bridgeMode = StatefulTopologyBridgeMode::targetToSource;
+    parameters.subscriptionPairings.insert(
+        0x0100000000000101ULL,
+        SubscriptionPairing(uint128_t(0x1111222233334444ULL), uint128_t(0x5555666677778888ULL), 0x0100000000000101ULL, 8443));
+    parameters.advertisementPairings.insert(
+        0x0100000000000102ULL,
+        AdvertisementPairing(uint128_t(0x9999aaaabbbbccccULL), uint128_t(0xddddeeeeffff0001ULL), 0x0100000000000102ULL));
 
     String serialized;
     BitseryEngine::serialize(serialized, parameters);
@@ -3643,6 +3795,23 @@ int main(void)
     suite.expect(roundtrip.statefulTopology.sourceEpoch == 200, "container_parameters_roundtrip_preserves_topology_source_epoch");
     suite.expect(roundtrip.statefulTopology.targetEpoch == 400, "container_parameters_roundtrip_preserves_topology_target_epoch");
     suite.expect(roundtrip.statefulTopology.bridgeMode == StatefulTopologyBridgeMode::targetToSource, "container_parameters_roundtrip_preserves_topology_bridge_mode");
+    auto subscriptionIt = roundtrip.subscriptionPairings.find(0x0100000000000101ULL);
+    bool subscriptionPreserved =
+        subscriptionIt != roundtrip.subscriptionPairings.end() &&
+        subscriptionIt->second.size() == 1 &&
+        subscriptionIt->second[0] == SubscriptionPairing(uint128_t(0x1111222233334444ULL), uint128_t(0x5555666677778888ULL), 0x0100000000000101ULL, 8443);
+    suite.expect(subscriptionPreserved, "container_parameters_roundtrip_preserves_subscription_pairings");
+    if (subscriptionPreserved)
+    {
+      uint64_t hash = AegisStream::generateSecretServiceHash(subscriptionIt->second[0].secret, subscriptionIt->second[0].service);
+      suite.expect(hash != 0, "container_parameters_roundtrip_subscription_pairing_hashes");
+    }
+    auto advertisementIt = roundtrip.advertisementPairings.find(0x0100000000000102ULL);
+    suite.expect(
+        advertisementIt != roundtrip.advertisementPairings.end() &&
+        advertisementIt->second.size() == 1 &&
+        advertisementIt->second[0] == AdvertisementPairing(uint128_t(0x9999aaaabbbbccccULL), uint128_t(0xddddeeeeffff0001ULL), 0x0100000000000102ULL),
+        "container_parameters_roundtrip_preserves_advertisement_pairings");
   }
 
   {
@@ -4087,6 +4256,200 @@ int main(void)
         brain.statefulWorkerTopologyUpgradeRuntimeState.size() == 1 && brain.statefulWorkerTopologyUpgradeRuntimeState[0].targetLogicalCores == 4,
         "stateful_worker_topology_upgrade_persists_runtime_state_target_cores");
 
+    thisBrain = savedBrain;
+  }
+
+  {
+    ScopedFreshRing ring;
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+    brain.brainConfig.runtimeEnvironment.test.enabled = true;
+    brain.brainConfig.architecture = nametagCurrentBuildMachineArchitecture();
+
+    Rack rack {};
+    rack.uuid = 19'603'101;
+    brain.racks.insert_or_assign(rack.uuid, &rack);
+
+    Machine pinned {};
+    pinned.uuid = uint128_t(0x19603101);
+    pinned.slug = "single-prefix-unavailable-host"_ctv;
+    pinned.rack = &rack;
+    pinned.state = MachineState::neuronRebooting;
+    pinned.lifetime = MachineLifetime::owned;
+    pinned.hardware.inventoryComplete = true;
+    pinned.hardware.cpu.architecture = nametagCurrentBuildMachineArchitecture();
+    pinned.hardware.cpu.logicalCores = pinned.ownedLogicalCores = pinned.totalLogicalCores = pinned.nLogicalCores_available = 8;
+    pinned.hardware.memory.totalMB = pinned.ownedMemoryMB = pinned.totalMemoryMB = pinned.memoryMB_available = 8192;
+    pinned.ownedStorageMB = pinned.totalStorageMB = pinned.storageMB_available = 4096;
+    rack.machines.insert(&pinned);
+    brain.machines.insert(&pinned);
+
+    DistributableExternalSubnet registered = {};
+    registered.uuid = uint128_t(0x19603102);
+    registered.name = "single-prefix-unavailable-route"_ctv;
+    registered.machineUUID = pinned.uuid;
+    registered.ingressScope = RoutableIngressScope::singleMachine;
+    registered.usage = ExternalSubnetUsage::wormholes;
+    registered.subnet = IPPrefix("2001:db8:196::2", true, 128);
+    brain.brainConfig.distributableExternalSubnets.push_back(registered);
+
+    ApplicationDeployment deployment;
+    seedCommonPlan(deployment, false);
+    deployment.plan.config.applicationID = 19'631;
+    deployment.plan.config.versionID = 1;
+    deployment.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+    deployment.plan.config.nLogicalCores = 1;
+    deployment.plan.stateless.nBase = 1;
+
+    Wormhole wormhole = {};
+    wormhole.externalPort = 443;
+    wormhole.containerPort = 8443;
+    wormhole.layer4 = IPPROTO_UDP;
+    wormhole.isQuic = true;
+    wormhole.source = ExternalAddressSource::registeredRoutablePrefix;
+    wormhole.routablePrefixUUID = registered.uuid;
+    deployment.plan.wormholes.push_back(wormhole);
+    brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+
+    deployment.deploy();
+
+    suite.expect(brain.requestMachinesCount == 0, "deploy_single_machine_prefix_unavailable_host_does_not_request_new_machine");
+    suite.expect(deployment.state == DeploymentState::deploying, "deploy_single_machine_prefix_unavailable_host_stays_deploying");
+    suite.expect(deployment.nDeployedBase == 0, "deploy_single_machine_prefix_unavailable_host_deploys_zero");
+    suite.expect(deployment.toSchedule.empty(), "deploy_single_machine_prefix_unavailable_host_has_no_schedule");
+    suite.expect(deployment.waitingOnContainers.empty(), "deploy_single_machine_prefix_unavailable_host_has_no_waiters");
+    suite.expect(brain.finCount == 0, "deploy_single_machine_prefix_unavailable_host_does_not_finish_spin");
+
+    brain.deployments.erase(deployment.plan.config.deploymentID());
+    rack.machines.erase(&pinned);
+    brain.machines.erase(&pinned);
+    brain.racks.erase(rack.uuid);
+    thisBrain = savedBrain;
+  }
+
+  {
+    ScopedFreshRing ring;
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+    brain.brainConfig.runtimeEnvironment.test.enabled = true;
+    brain.brainConfig.architecture = nametagCurrentBuildMachineArchitecture();
+
+    Rack rack = {};
+    rack.uuid = 0x19602041;
+    brain.racks.insert_or_assign(rack.uuid, &rack);
+
+    ScopedSocketPair socket = {};
+    bool socketReady = socket.create(suite, "recoverAfterReboot_pending_plan_no_capacity_fixture_socketpair");
+
+    Machine machine = {};
+    machine.uuid = uint128_t(0x19602042);
+    machine.slug = "recover-pending-plan-no-capacity"_ctv;
+    machine.rack = &rack;
+    machine.state = MachineState::healthy;
+    machine.lifetime = MachineLifetime::owned;
+    machine.hardware.cpu.architecture = nametagCurrentBuildMachineArchitecture();
+    bool machineReady = socketReady && armNeuronControlStream(machine, socket);
+    rack.machines.insert(&machine);
+    brain.machines.insert(&machine);
+
+    suite.expect(machineReady, "recoverAfterReboot_pending_plan_no_capacity_fixture_machine_ready");
+
+    ApplicationDeployment deployment;
+    seedCommonPlan(deployment, false);
+    deployment.plan.config.type = ApplicationType::stateless;
+    deployment.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+    deployment.plan.stateless.nBase = 1;
+    deployment.state = DeploymentState::none;
+    deployment.nTargetBase = 1;
+    brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+
+    if (machineReady)
+    {
+      deployment.recoverAfterReboot();
+
+      suite.expect(deployment.nDeployed() == 0, "recoverAfterReboot_pending_plan_no_capacity_does_not_schedule");
+      suite.expect(deployment.state == DeploymentState::none, "recoverAfterReboot_pending_plan_no_capacity_restores_pending_state");
+      suite.expect(deployment.nSuspended == 0, "recoverAfterReboot_pending_plan_no_capacity_does_not_suspend");
+      suite.expect(deployment.schedulingStack.execution == nullptr, "recoverAfterReboot_pending_plan_no_capacity_has_no_scheduler");
+      suite.expect(machine.neuron.pendingSend == false, "recoverAfterReboot_pending_plan_no_capacity_queues_no_neuron_work");
+    }
+
+    brain.deployments.erase(deployment.plan.config.deploymentID());
+    rack.machines.erase(&machine);
+    brain.machines.erase(&machine);
+    brain.racks.erase(rack.uuid);
+    thisBrain = savedBrain;
+  }
+
+  {
+    ScopedFreshRing ring;
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+    brain.brainConfig.runtimeEnvironment.test.enabled = true;
+    brain.brainConfig.architecture = nametagCurrentBuildMachineArchitecture();
+
+    Rack rack = {};
+    rack.uuid = 0x19602031;
+    brain.racks.insert_or_assign(rack.uuid, &rack);
+
+    ScopedSocketPair socket = {};
+    bool socketReady = socket.create(suite, "recoverAfterReboot_pending_plan_fixture_socketpair");
+
+    Machine machine = {};
+    machine.uuid = uint128_t(0x19602032);
+    machine.slug = "recover-pending-plan-target"_ctv;
+    machine.rack = &rack;
+    machine.state = MachineState::healthy;
+    machine.lifetime = MachineLifetime::owned;
+    machine.hardware.cpu.architecture = nametagCurrentBuildMachineArchitecture();
+    machine.nLogicalCores_available = 8;
+    machine.memoryMB_available = 8192;
+    machine.storageMB_available = 4096;
+    bool machineReady = socketReady && armNeuronControlStream(machine, socket);
+    rack.machines.insert(&machine);
+    brain.machines.insert(&machine);
+
+    suite.expect(machineReady, "recoverAfterReboot_pending_plan_fixture_machine_ready");
+
+    ApplicationDeployment deployment;
+    seedCommonPlan(deployment, false);
+    deployment.plan.config.type = ApplicationType::stateless;
+    deployment.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+    deployment.plan.stateless.nBase = 1;
+    deployment.plan.canaryCount = 0;
+    deployment.plan.canariesMustLiveForMinutes = 0;
+    deployment.plan.moveConstructively = true;
+    deployment.plan.useHostNetworkNamespace = false;
+    deployment.plan.requiresDatacenterUniqueTag = false;
+    deployment.state = DeploymentState::none;
+    deployment.nTargetBase = 1;
+    brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+
+    if (machineReady)
+    {
+      deployment.recoverAfterReboot();
+
+      suite.expect(deployment.state == DeploymentState::deploying, "recoverAfterReboot_pending_plan_schedules_underprovisioned");
+      suite.expect(deployment.nDeployedBase == 1, "recoverAfterReboot_pending_plan_deploys_missing_base");
+      suite.expect(deployment.waitingOnContainers.size() == 1, "recoverAfterReboot_pending_plan_waits_for_construct_health");
+      suite.expect(deployment.schedulingStack.execution != nullptr, "recoverAfterReboot_pending_plan_starts_scheduler");
+      suite.expect(machine.neuron.pendingSend && machine.neuron.wBuffer.size() > 0, "recoverAfterReboot_pending_plan_queues_neuron_spin");
+
+      if (deployment.containers.empty() == false)
+      {
+        ContainerView *container = *deployment.containers.begin();
+        deployment.destructContainer(container);
+        deployment.containerDestroyed(container);
+      }
+    }
+
+    brain.deployments.erase(deployment.plan.config.deploymentID());
+    rack.machines.erase(&machine);
+    brain.machines.erase(&machine);
+    brain.racks.erase(rack.uuid);
     thisBrain = savedBrain;
   }
 
@@ -6639,6 +7002,23 @@ int main(void)
     fit = ApplicationDeployment::nFitOnMachine(&deployment, &worker, 1);
     suite.expect(fit == 0, "nFitOnMachine_whitehole_host_public_rejects_machine_without_internet_access");
 
+    brain.brainConfig.runtimeEnvironment.test.enabled = true;
+    worker.private4 = 0x0a00000a;
+    worker.peerAddresses.push_back(ClusterMachinePeerAddress {"10.0.0.10"_ctv, 24});
+
+    fit = ApplicationDeployment::nFitOnMachine(&deployment, &worker, 1);
+    suite.expect(fit == 0, "nFitOnMachine_whitehole_host_public_rejects_private_test_peer_source");
+
+    deployment.plan.whiteholes[0].family = ExternalAddressFamily::ipv6;
+    worker.publicAddress = "2602:fac0:0:12ab:34cd::a"_ctv;
+    fit = ApplicationDeployment::nFitOnMachine(&deployment, &worker, 1);
+    suite.expect(fit == 1, "nFitOnMachine_whitehole_host_public_accepts_test_public_address_with_private_peers");
+
+    deployment.plan.whiteholes[0].family = ExternalAddressFamily::ipv4;
+    brain.brainConfig.runtimeEnvironment.test.enableFakeIpv4Boundary = true;
+    fit = ApplicationDeployment::nFitOnMachine(&deployment, &worker, 1);
+    suite.expect(fit == 1, "nFitOnMachine_whitehole_host_public_accepts_explicit_fake_ipv4_boundary");
+
     thisBrain = savedBrain;
   }
 
@@ -6979,6 +7359,531 @@ int main(void)
     fit = otherDeployment.nFitOnMachineClaim(&otherTicket, &other, 2);
     suite.expect(fit == 0, "nFitOnMachineClaim_wormhole_registered_routable_address_rejects_non_owning_machine");
 
+    thisBrain = savedBrain;
+  }
+
+  {
+    ScopedFreshRing ring;
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+    brain.brainConfig.runtimeEnvironment.test.enabled = true;
+    brain.brainConfig.architecture = nametagCurrentBuildMachineArchitecture();
+
+    Rack hostRack {};
+    hostRack.uuid = 19'603'001;
+    Rack receiverRack {};
+    receiverRack.uuid = 19'603'002;
+    brain.racks.insert_or_assign(hostRack.uuid, &hostRack);
+    brain.racks.insert_or_assign(receiverRack.uuid, &receiverRack);
+
+    ScopedSocketPair hostSocket = {};
+    ScopedSocketPair receiverSocket = {};
+    Machine host {};
+    Machine receiver {};
+    bool machinesReady =
+        hostSocket.create(suite, "deploy_single_machine_prefix_compaction_seeds_host_socket") &&
+        seedSchedulableMachine(brain, hostRack, host, uint128_t(0x19603001), 0x0a000301, "single-prefix-host"_ctv, hostSocket) &&
+        receiverSocket.create(suite, "deploy_single_machine_prefix_compaction_seeds_receiver_socket") &&
+        seedSchedulableMachine(brain, receiverRack, receiver, uint128_t(0x19603002), 0x0a000302, "single-prefix-receiver"_ctv, receiverSocket);
+    suite.expect(machinesReady, "deploy_single_machine_prefix_compaction_seeds_machines");
+
+    host.fragment = 0x31;
+    receiver.fragment = 0x32;
+    host.isolatedLogicalCoresCommitted = host.ownedLogicalCores;
+    prodigyRecomputeMachineCPUAvailability(&host, brain.brainConfig.sharedCPUOvercommitPermille);
+
+    DistributableExternalSubnet registered = {};
+    registered.uuid = uint128_t(0x19603003);
+    registered.name = "single-prefix-compaction-route"_ctv;
+    registered.machineUUID = host.uuid;
+    registered.ingressScope = RoutableIngressScope::singleMachine;
+    registered.usage = ExternalSubnetUsage::wormholes;
+    registered.subnet = IPPrefix("2001:db8:196::1", true, 128);
+    brain.brainConfig.distributableExternalSubnets.push_back(registered);
+
+    ApplicationDeployment donor;
+    seedCommonPlan(donor, false);
+    donor.plan.config.applicationID = 19'604;
+    donor.plan.config.versionID = 1;
+    donor.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+    donor.plan.config.nLogicalCores = 1;
+    donor.plan.stateless.nBase = 1;
+    donor.plan.stateless.moveableDuringCompaction = true;
+    donor.plan.moveConstructively = true;
+    donor.state = DeploymentState::running;
+    donor.nTargetBase = 1;
+    donor.nDeployedBase = 1;
+    donor.nHealthyBase = 1;
+    brain.deployments.insert_or_assign(donor.plan.config.deploymentID(), &donor);
+
+    ContainerView *donorOriginal = new ContainerView();
+    donorOriginal->uuid = uint128_t(0x19603004);
+    donorOriginal->deploymentID = donor.plan.config.deploymentID();
+    donorOriginal->applicationID = donor.plan.config.applicationID;
+    donorOriginal->machine = &host;
+    donorOriginal->lifetime = ApplicationLifetime::base;
+    donorOriginal->state = ContainerState::healthy;
+    donor.containers.insert(donorOriginal);
+    donor.countPerMachine[&host] += 1;
+    donor.countPerRack[&hostRack] += 1;
+    brain.containers.insert_or_assign(donorOriginal->uuid, donorOriginal);
+    host.upsertContainerIndexEntry(donorOriginal->deploymentID, donorOriginal);
+
+    ApplicationDeployment deployment;
+    seedCommonPlan(deployment, false);
+    deployment.plan.config.applicationID = 19'603;
+    deployment.plan.config.versionID = 1;
+    deployment.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+    deployment.plan.config.nLogicalCores = 1;
+    deployment.plan.stateless.nBase = 1;
+    deployment.plan.moveConstructively = true;
+
+    Wormhole wormhole = {};
+    wormhole.externalPort = 443;
+    wormhole.containerPort = 8443;
+    wormhole.layer4 = IPPROTO_UDP;
+    wormhole.isQuic = true;
+    wormhole.source = ExternalAddressSource::registeredRoutablePrefix;
+    wormhole.routablePrefixUUID = registered.uuid;
+    deployment.plan.wormholes.push_back(wormhole);
+    brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+
+    if (machinesReady)
+    {
+      deployment.deploy();
+
+      suite.expect(brain.requestMachinesCount == 0, "deploy_single_machine_prefix_compaction_does_not_request_new_machine");
+      suite.expect(deployment.nDeployedBase == 1, "deploy_single_machine_prefix_compaction_plans_pinned_base");
+      suite.expect(deployment.waitingOnCompactions, "deploy_single_machine_prefix_compaction_waits_on_donor_move");
+
+      if (donor.schedulingStack.execution == nullptr && donor.toSchedule.empty() == false)
+      {
+        donor.schedule(nullptr);
+      }
+
+      ContainerView *donorReplacement = nullptr;
+      for (ContainerView *container : donor.containers)
+      {
+        if (container != donorOriginal && container->machine == &receiver)
+        {
+          donorReplacement = container;
+          break;
+        }
+      }
+      if (donorReplacement == nullptr)
+      {
+        for (const auto& [uuid, container] : brain.containers)
+        {
+          (void)uuid;
+          if (container != donorOriginal && container != nullptr && container->deploymentID == donor.plan.config.deploymentID() && container->machine == &receiver)
+          {
+            donorReplacement = container;
+            break;
+          }
+        }
+      }
+      if (donorReplacement == nullptr)
+      {
+        for (const auto& [container, targetState] : donor.waitingOnContainers)
+        {
+          if (targetState == ContainerState::healthy && container != donorOriginal && container != nullptr && container->machine == &receiver)
+          {
+            donorReplacement = container;
+            break;
+          }
+        }
+      }
+      if (donorReplacement == nullptr)
+      {
+        for (DeploymentWork *work : donor.toSchedule)
+        {
+          StatelessWork *stateless = std::get_if<StatelessWork>(work);
+          if (stateless != nullptr && stateless->container != nullptr && stateless->container != donorOriginal && stateless->container->machine == &receiver)
+          {
+            donorReplacement = stateless->container;
+            break;
+          }
+        }
+      }
+      if (donorReplacement != nullptr && donorReplacement->state == ContainerState::planned && donor.schedulingStack.execution == nullptr)
+      {
+        donor.schedule(nullptr);
+      }
+
+      suite.expect(donorReplacement != nullptr, "deploy_single_machine_prefix_compaction_plans_donor_replacement");
+      suite.expect(donorReplacement == nullptr || donorReplacement->state == ContainerState::scheduled, "deploy_single_machine_prefix_compaction_dispatches_donor_replacement");
+
+      if (donorReplacement != nullptr)
+      {
+        donor.containerIsHealthy(donorReplacement);
+      }
+
+      ContainerView *pinnedContainer = nullptr;
+      for (ContainerView *container : deployment.containers)
+      {
+        if (container->machine == &host)
+        {
+          pinnedContainer = container;
+          break;
+        }
+      }
+
+      suite.expect(deployment.waitingOnCompactions == false, "deploy_single_machine_prefix_compaction_ticket_releases_orchestrator");
+      suite.expect(pinnedContainer != nullptr, "deploy_single_machine_prefix_compaction_creates_pinned_container");
+      suite.expect(pinnedContainer == nullptr || pinnedContainer->state == ContainerState::scheduled, "deploy_single_machine_prefix_compaction_dispatches_pinned_container");
+      suite.expect(pinnedContainer == nullptr || host.containersByDeploymentID.hasEntryFor(pinnedContainer->deploymentID, pinnedContainer), "deploy_single_machine_prefix_compaction_indexes_pinned_container");
+
+      if (pinnedContainer != nullptr)
+      {
+        deployment.containerIsHealthy(pinnedContainer);
+        deployment.destructContainer(pinnedContainer);
+        deployment.containerDestroyed(pinnedContainer);
+      }
+
+      if (donorOriginal != nullptr && donorOriginal->state == ContainerState::destroying)
+      {
+        donor.containerDestroyed(donorOriginal);
+        donorOriginal = nullptr;
+      }
+
+      if (donorReplacement != nullptr && donor.containers.contains(donorReplacement))
+      {
+        donor.destructContainer(donorReplacement);
+        donor.containerDestroyed(donorReplacement);
+      }
+    }
+
+    if (donorOriginal != nullptr)
+    {
+      if (donor.containers.contains(donorOriginal))
+      {
+        donor.destructContainer(donorOriginal);
+      }
+      donor.containerDestroyed(donorOriginal);
+      donorOriginal = nullptr;
+    }
+
+    brain.deployments.erase(deployment.plan.config.deploymentID());
+    brain.deployments.erase(donor.plan.config.deploymentID());
+    brain.brainConfig.distributableExternalSubnets.clear();
+    receiverRack.machines.erase(&receiver);
+    hostRack.machines.erase(&host);
+    brain.machines.erase(&receiver);
+    brain.machines.erase(&host);
+    brain.racks.erase(receiverRack.uuid);
+    brain.racks.erase(hostRack.uuid);
+    thisBrain = savedBrain;
+  }
+
+  {
+    ScopedFreshRing ring;
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+    brain.brainConfig.runtimeEnvironment.test.enabled = true;
+    brain.brainConfig.architecture = nametagCurrentBuildMachineArchitecture();
+
+    Rack rack {};
+    rack.uuid = 19'603'021;
+    brain.racks.insert_or_assign(rack.uuid, &rack);
+
+    ScopedSocketPair socket = {};
+    Machine host {};
+    bool machineReady =
+        socket.create(suite, "compaction_ticket_complete_starts_orchestrator_scheduler_socket") &&
+        seedSchedulableMachine(brain, rack, host, uint128_t(0x19603021), 0x0a000321, "compaction-ticket-host"_ctv, socket);
+    suite.expect(machineReady, "compaction_ticket_complete_starts_orchestrator_scheduler_seeds_machine");
+
+    ApplicationDeployment orchestrator;
+    seedCommonPlan(orchestrator, false);
+    orchestrator.plan.config.applicationID = 19'621;
+    orchestrator.plan.config.versionID = 1;
+    orchestrator.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+    orchestrator.plan.config.nLogicalCores = 1;
+    orchestrator.plan.stateless.nBase = 1;
+    orchestrator.nTargetBase = 1;
+    orchestrator.state = DeploymentState::deploying;
+    brain.deployments.insert_or_assign(orchestrator.plan.config.deploymentID(), &orchestrator);
+
+    ApplicationDeployment donor;
+    seedCommonPlan(donor, false);
+    donor.plan.config.applicationID = 19'622;
+    donor.plan.config.versionID = 1;
+    donor.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+
+    CompactionTicket *ticket = new CompactionTicket();
+    ticket->orchestrator = &orchestrator;
+    ticket->pendingCompactions[&donor] = 1;
+
+    orchestrator.scheduleCompactionWait(ticket);
+    orchestrator.toSchedule.push_back(orchestrator.planStatelessConstruction(&host, ApplicationLifetime::base));
+
+    DeploymentWork *donorWork = donor.planStatelessConstruction(&host, ApplicationLifetime::base);
+    std::get<StatelessWork>(*donorWork).ticket = ticket;
+    donor.toSchedule.push_back(donorWork);
+    donor.schedule(nullptr);
+
+    suite.expect(orchestrator.waitingOnCompactions == false, "compaction_ticket_complete_starts_orchestrator_scheduler_releases_wait");
+    suite.expect(orchestrator.toSchedule.empty(), "compaction_ticket_complete_starts_orchestrator_scheduler_drains_queue");
+    suite.expect(orchestrator.waitingOnContainers.size() == 1, "compaction_ticket_complete_starts_orchestrator_scheduler_dispatches_construct");
+
+    ContainerView *container = nullptr;
+    for (const auto& [waiting, targetState] : orchestrator.waitingOnContainers)
+    {
+      (void)targetState;
+      container = waiting;
+      break;
+    }
+    suite.expect(container != nullptr && container->state == ContainerState::scheduled, "compaction_ticket_complete_starts_orchestrator_scheduler_schedules_container");
+
+    if (container != nullptr)
+    {
+      orchestrator.containerIsHealthy(container);
+      orchestrator.destructContainer(container);
+      orchestrator.containerDestroyed(container);
+    }
+    ContainerView *donorContainer = nullptr;
+    for (const auto& [waiting, targetState] : donor.waitingOnContainers)
+    {
+      (void)targetState;
+      donorContainer = waiting;
+      break;
+    }
+    if (donorContainer != nullptr)
+    {
+      donor.containerIsHealthy(donorContainer);
+      donor.destructContainer(donorContainer);
+      donor.containerDestroyed(donorContainer);
+    }
+
+    brain.deployments.erase(orchestrator.plan.config.deploymentID());
+    rack.machines.erase(&host);
+    brain.machines.erase(&host);
+    brain.racks.erase(rack.uuid);
+    thisBrain = savedBrain;
+  }
+
+  {
+    ScopedFreshRing ring;
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+    brain.brainConfig.runtimeEnvironment.test.enabled = true;
+    brain.brainConfig.architecture = nametagCurrentBuildMachineArchitecture();
+
+    Rack hostRack {};
+    hostRack.uuid = 19'603'011;
+    Rack receiverRack {};
+    receiverRack.uuid = 19'603'012;
+    brain.racks.insert_or_assign(hostRack.uuid, &hostRack);
+    brain.racks.insert_or_assign(receiverRack.uuid, &receiverRack);
+
+    ScopedSocketPair hostSocket = {};
+    ScopedSocketPair receiverSocket = {};
+    Machine host {};
+    Machine receiver {};
+    bool machinesReady =
+        hostSocket.create(suite, "deploy_host_public_whitehole_compaction_rejects_unusable_donor_host_socket") &&
+        seedSchedulableMachine(brain, hostRack, host, uint128_t(0x19603011), 0x0a000311, "host-public-whitehole-donor"_ctv, hostSocket) &&
+        receiverSocket.create(suite, "deploy_host_public_whitehole_compaction_rejects_unusable_donor_receiver_socket") &&
+        seedSchedulableMachine(brain, receiverRack, receiver, uint128_t(0x19603012), 0x0a000312, "host-public-whitehole-receiver"_ctv, receiverSocket);
+    suite.expect(machinesReady, "deploy_host_public_whitehole_compaction_rejects_unusable_donor_seeds_machines");
+
+    host.fragment = 0x311;
+    receiver.fragment = 0x312;
+    host.hasInternetAccess = false;
+    receiver.hasInternetAccess = false;
+    host.hardware.network.internet.sourceAddress = {};
+    receiver.hardware.network.internet.sourceAddress = {};
+    host.peerAddresses.push_back(ClusterMachinePeerAddress {"10.0.3.17"_ctv, 24});
+    receiver.peerAddresses.push_back(ClusterMachinePeerAddress {"10.0.3.18"_ctv, 24});
+    host.isolatedLogicalCoresCommitted = host.ownedLogicalCores;
+    prodigyRecomputeMachineCPUAvailability(&host, brain.brainConfig.sharedCPUOvercommitPermille);
+
+    ApplicationDeployment donor;
+    seedCommonPlan(donor, false);
+    donor.plan.config.applicationID = 19'614;
+    donor.plan.config.versionID = 1;
+    donor.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+    donor.plan.config.nLogicalCores = 1;
+    donor.plan.stateless.nBase = 1;
+    donor.plan.stateless.moveableDuringCompaction = true;
+    donor.plan.moveConstructively = true;
+    donor.state = DeploymentState::running;
+    donor.nTargetBase = 1;
+    donor.nDeployedBase = 1;
+    donor.nHealthyBase = 1;
+    brain.deployments.insert_or_assign(donor.plan.config.deploymentID(), &donor);
+
+    ContainerView *donorOriginal = new ContainerView();
+    donorOriginal->uuid = uint128_t(0x19603014);
+    donorOriginal->deploymentID = donor.plan.config.deploymentID();
+    donorOriginal->applicationID = donor.plan.config.applicationID;
+    donorOriginal->machine = &host;
+    donorOriginal->lifetime = ApplicationLifetime::base;
+    donorOriginal->state = ContainerState::healthy;
+    donor.containers.insert(donorOriginal);
+    donor.countPerMachine[&host] += 1;
+    donor.countPerRack[&hostRack] += 1;
+    brain.containers.insert_or_assign(donorOriginal->uuid, donorOriginal);
+    host.upsertContainerIndexEntry(donorOriginal->deploymentID, donorOriginal);
+
+    ApplicationDeployment deployment;
+    seedCommonPlan(deployment, false);
+    deployment.plan.config.applicationID = 19'613;
+    deployment.plan.config.versionID = 1;
+    deployment.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+    deployment.plan.config.nLogicalCores = 1;
+    deployment.plan.stateless.nBase = 1;
+    deployment.plan.moveConstructively = true;
+
+    Whitehole whitehole = {};
+    whitehole.transport = ExternalAddressTransport::tcp;
+    whitehole.family = ExternalAddressFamily::ipv4;
+    whitehole.source = ExternalAddressSource::hostPublicAddress;
+    deployment.plan.whiteholes.push_back(whitehole);
+    brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+
+    if (machinesReady)
+    {
+      deployment.nTargetBase = 1;
+      deployment.state = DeploymentState::deploying;
+      deployment.architect(nullptr, false, true, false);
+
+      suite.expect(deployment.nDeployedBase == 0, "deploy_host_public_whitehole_compaction_rejects_unusable_donor_deploys_zero");
+      suite.expect(deployment.toSchedule.empty(), "deploy_host_public_whitehole_compaction_rejects_unusable_donor_has_no_sentinel");
+      suite.expect(deployment.waitingOnCompactions == false, "deploy_host_public_whitehole_compaction_rejects_unusable_donor_does_not_wait");
+      suite.expect(donor.toSchedule.empty(), "deploy_host_public_whitehole_compaction_rejects_unusable_donor_leaves_donor_queue_empty");
+      suite.expect(donor.waitingOnContainers.empty(), "deploy_host_public_whitehole_compaction_rejects_unusable_donor_leaves_donor_waiters_empty");
+      suite.expect(donorOriginal->state == ContainerState::healthy, "deploy_host_public_whitehole_compaction_rejects_unusable_donor_keeps_original_healthy");
+    }
+
+    donor.containers.erase(donorOriginal);
+    host.removeContainerIndexEntry(donorOriginal->deploymentID, donorOriginal);
+    brain.containers.erase(donorOriginal->uuid);
+    delete donorOriginal;
+
+    brain.deployments.erase(deployment.plan.config.deploymentID());
+    brain.deployments.erase(donor.plan.config.deploymentID());
+    receiverRack.machines.erase(&receiver);
+    hostRack.machines.erase(&host);
+    brain.machines.erase(&receiver);
+    brain.machines.erase(&host);
+    brain.racks.erase(receiverRack.uuid);
+    brain.racks.erase(hostRack.uuid);
+    thisBrain = savedBrain;
+  }
+
+  {
+    ScopedFreshRing ring;
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+    brain.brainConfig.runtimeEnvironment.test.enabled = true;
+    brain.brainConfig.architecture = nametagCurrentBuildMachineArchitecture();
+
+    Rack hostRack {};
+    hostRack.uuid = 19'603'041;
+    Rack receiverRack {};
+    receiverRack.uuid = 19'603'042;
+    brain.racks.insert_or_assign(hostRack.uuid, &hostRack);
+    brain.racks.insert_or_assign(receiverRack.uuid, &receiverRack);
+
+    ScopedSocketPair hostSocket = {};
+    ScopedSocketPair receiverSocket = {};
+    Machine host {};
+    Machine receiver {};
+    bool machinesReady =
+        hostSocket.create(suite, "deploy_compaction_rejects_final_target_fit_host_socket") &&
+        seedSchedulableMachine(brain, hostRack, host, uint128_t(0x19603041), 0x0a000341, "target-fit-donor"_ctv, hostSocket) &&
+        receiverSocket.create(suite, "deploy_compaction_rejects_final_target_fit_receiver_socket") &&
+        seedSchedulableMachine(brain, receiverRack, receiver, uint128_t(0x19603042), 0x0a000342, "target-fit-receiver"_ctv, receiverSocket);
+    suite.expect(machinesReady, "deploy_compaction_rejects_final_target_fit_seeds_machines");
+
+    host.fragment = 0x341;
+    receiver.fragment = 0x342;
+    host.hasInternetAccess = true;
+    host.hardware.network.internet.attempted = true;
+    host.hardware.network.internet.latencyMs = 10;
+    host.hardware.network.internet.downloadMbps = 0;
+    host.hardware.network.internet.uploadMbps = 100;
+    host.hardware.network.internet.sourceAddress = IPAddress("2001:db8:196::41", true);
+    host.isolatedLogicalCoresCommitted = host.ownedLogicalCores;
+    prodigyRecomputeMachineCPUAvailability(&host, brain.brainConfig.sharedCPUOvercommitPermille);
+
+    ApplicationDeployment donor;
+    seedCommonPlan(donor, false);
+    donor.plan.config.applicationID = 19'634;
+    donor.plan.config.versionID = 1;
+    donor.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+    donor.plan.config.nLogicalCores = 1;
+    donor.plan.stateless.nBase = 1;
+    donor.plan.stateless.moveableDuringCompaction = true;
+    donor.plan.moveConstructively = true;
+    donor.state = DeploymentState::running;
+    donor.nTargetBase = 1;
+    donor.nDeployedBase = 1;
+    donor.nHealthyBase = 1;
+    brain.deployments.insert_or_assign(donor.plan.config.deploymentID(), &donor);
+
+    ContainerView *donorOriginal = new ContainerView();
+    donorOriginal->uuid = uint128_t(0x19603044);
+    donorOriginal->deploymentID = donor.plan.config.deploymentID();
+    donorOriginal->applicationID = donor.plan.config.applicationID;
+    donorOriginal->machine = &host;
+    donorOriginal->lifetime = ApplicationLifetime::base;
+    donorOriginal->state = ContainerState::healthy;
+    donor.containers.insert(donorOriginal);
+    donor.countPerMachine[&host] += 1;
+    donor.countPerRack[&hostRack] += 1;
+    brain.containers.insert_or_assign(donorOriginal->uuid, donorOriginal);
+    host.upsertContainerIndexEntry(donorOriginal->deploymentID, donorOriginal);
+
+    ApplicationDeployment deployment;
+    seedCommonPlan(deployment, false);
+    deployment.plan.config.applicationID = 19'633;
+    deployment.plan.config.versionID = 1;
+    deployment.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+    deployment.plan.config.nLogicalCores = 1;
+    deployment.plan.config.minInternetDownloadMbps = 1;
+    deployment.plan.stateless.nBase = 1;
+    deployment.plan.moveConstructively = true;
+
+    Whitehole whitehole = {};
+    whitehole.transport = ExternalAddressTransport::tcp;
+    whitehole.family = ExternalAddressFamily::ipv6;
+    whitehole.source = ExternalAddressSource::hostPublicAddress;
+    deployment.plan.whiteholes.push_back(whitehole);
+    brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+
+    if (machinesReady)
+    {
+      deployment.nTargetBase = 1;
+      deployment.state = DeploymentState::deploying;
+      deployment.architect(nullptr, false, true, false);
+
+      suite.expect(deployment.nDeployedBase == 0, "deploy_compaction_rejects_final_target_fit_deploys_zero");
+      suite.expect(deployment.toSchedule.empty(), "deploy_compaction_rejects_final_target_fit_has_no_sentinel");
+      suite.expect(deployment.waitingOnCompactions == false, "deploy_compaction_rejects_final_target_fit_does_not_wait");
+      suite.expect(donor.toSchedule.empty(), "deploy_compaction_rejects_final_target_fit_leaves_donor_queue_empty");
+      suite.expect(donor.waitingOnContainers.empty(), "deploy_compaction_rejects_final_target_fit_leaves_donor_waiters_empty");
+      suite.expect(donorOriginal->state == ContainerState::healthy, "deploy_compaction_rejects_final_target_fit_keeps_original_healthy");
+    }
+
+    donor.containers.erase(donorOriginal);
+    host.removeContainerIndexEntry(donorOriginal->deploymentID, donorOriginal);
+    brain.containers.erase(donorOriginal->uuid);
+    delete donorOriginal;
+
+    brain.deployments.erase(deployment.plan.config.deploymentID());
+    brain.deployments.erase(donor.plan.config.deploymentID());
+    receiverRack.machines.erase(&receiver);
+    hostRack.machines.erase(&host);
+    brain.machines.erase(&receiver);
+    brain.machines.erase(&host);
+    brain.racks.erase(receiverRack.uuid);
+    brain.racks.erase(hostRack.uuid);
     thisBrain = savedBrain;
   }
 

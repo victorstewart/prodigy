@@ -193,6 +193,12 @@ private:
     return drainQueuedResponses(neuronIndex);
   }
 
+  Result queueRuntimeReady(std::size_t neuronIndex)
+  {
+    neurons[neuronIndex].neuron->hub.queueRuntimeReady();
+    return drainQueuedResponses(neuronIndex);
+  }
+
   Result queueSend(int fd, Bytes bytes)
   {
     auto operation = std::make_unique<SendOperation>();
@@ -321,6 +327,16 @@ public:
       }
 
       return reactor->queueReady(index);
+    }
+
+    Result runtimeReady(void)
+    {
+      if (reactor == nullptr || index >= reactor->neurons.size() || reactor->neurons[index].neuron == nullptr)
+      {
+        return Result::argument;
+      }
+
+      return reactor->queueRuntimeReady(index);
     }
   };
 

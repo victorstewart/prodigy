@@ -1974,8 +1974,10 @@ pids=()
 status_codes=()
 brain_start_count=()
 active_pids=()
+reaped_pids=()
 declare -A expected_nonzero_pid=()
 declare -A pid_log_by_pid=()
+declare -A reaped_pid=()
 deploy_container_runtime_path=""
 deploy_second_container_runtime_path=""
 deploy_third_container_runtime_path=""
@@ -2291,7 +2293,7 @@ dump_brain_container_artifacts()
    local -a artifact_files=()
    mapfile -t artifact_files < <(
       find "${root}" -maxdepth 4 -type f \
-         \( -name "bootstage.txt" -o -name "crashreport.txt" -o -name "aegis.hash.log" -o -name "params.dump" -o -name "readytrace.log" -o -name "stdout.log" -o -name "stderr.log" \) \
+         \( -name "bootstage.txt" -o -name "crashreport.txt" -o -name "prodigy-crashreport.txt" -o -name "aegis.hash.log" -o -name "params.dump" -o -name "readytrace.log" -o -name "stdout.log" -o -name "stderr.log" \) \
          | sort
    )
 
@@ -3065,7 +3067,7 @@ setup_fake_ipv4_boundary()
    ip netns exec "${parent_ns}" ip -6 addr add "${parent_edge_ip6}/126" dev "${parent_edge_if}"
    ip netns exec "${parent_ns}" ip route replace default via "${host_edge_ip}" dev "${parent_edge_if}"
    ip netns exec "${parent_ns}" ip -6 route replace default via "${host_edge_ip6}" dev "${parent_edge_if}"
-   ip netns exec "${parent_ns}" ip route replace "${fake_ipv4_subnet_cidr}" via "${switchboard_gateway_ip}" dev prodigy-br0
+   ip netns exec "${parent_ns}" ip route replace "${fake_ipv4_subnet_cidr}" via "${switchboard_gateway_ip}" dev prodigy-br0 src "${private_ipv4_gateway}"
    ip netns exec "${parent_ns}" ip -6 route replace "${fake_public6_subnet_cidr}" via "${switchboard_gateway_ip6}" dev prodigy-br0
    ip netns exec "${parent_ns}" sysctl -q -w net.ipv4.ip_forward=1 >/dev/null
    ip netns exec "${parent_ns}" sysctl -q -w net.ipv6.conf.all.forwarding=1 >/dev/null
@@ -3138,7 +3140,7 @@ setup_fake_ipv4_boundary()
    ip netns exec "${parent_ns}" tc filter replace dev "${parent_edge_if}" egress bpf da pinned "${egress_prog_pin}"
    ip netns exec "${parent_ns}" tc filter replace dev "${parent_edge_if}" ingress bpf da pinned "${ingress_prog_pin}"
 
-   echo "BOUNDARY_FAKE_IPV4 enabled edge=${parent_edge_if} uplink4=${host_uplink_if} via4=${host_uplink_gateway} uplink6=${host_uplink_if6} via6=${host_uplink_gateway6:-none} gateway4=${switchboard_gateway_ip} gateway6=${switchboard_gateway_ip6} subnet4=${fake_ipv4_subnet_cidr} subnet6=${fake_public6_subnet_cidr}"
+   echo "BOUNDARY_FAKE_IPV4 enabled edge=${parent_edge_if} uplink4=${host_uplink_if} via4=${host_uplink_gateway} uplink6=${host_uplink_if6} via6=${host_uplink_gateway6:-none} gateway4=${switchboard_gateway_ip} gateway6=${switchboard_gateway_ip6} parentSrc4=${private_ipv4_gateway} subnet4=${fake_ipv4_subnet_cidr} subnet6=${fake_public6_subnet_cidr}"
    return 0
 }
 
@@ -6430,7 +6432,7 @@ run_brain()
    local brain_state_db=""
    brain_state_db="$(brain_state_db_path "${idx}")"
 
-   local -a run_env=(env "PRODIGY_DEV_MODE=1" "PRODIGY_HOST_NETNS_INO=${host_netns_ino}" "PRODIGY_BOOTSTRAP_BRAIN_COUNT=${brains}" "PRODIGY_DEV_SHARED_TRANSPORT_TLS_DIR=/containers/store/prodigy-transport-tls")
+   local -a run_env=(env "PRODIGY_DEV_MODE=1" "PRODIGY_HOST_NETNS_INO=${host_netns_ino}" "PRODIGY_BOOTSTRAP_BRAIN_COUNT=${brains}" "PRODIGY_DEV_SHARED_TRANSPORT_TLS_DIR=/containers/store/prodigy-transport-tls" "PRODIGY_CRASH_REPORT_PATH=/root/prodigy-crashreport.txt")
    if [[ -n "${runtime_host_ingress_ebpf}" ]]
    then
       run_env+=("PRODIGY_HOST_INGRESS_EBPF=${runtime_host_ingress_ebpf}")
@@ -6459,6 +6461,14 @@ run_brain()
    if [[ -n "${PRODIGY_AUTOSCALE_TRACE:-}" ]]
    then
       run_env+=("PRODIGY_AUTOSCALE_TRACE=${PRODIGY_AUTOSCALE_TRACE}")
+   fi
+   if [[ -n "${PRODIGY_NEURON_VERBOSE_LOGS:-}" ]]
+   then
+      run_env+=("PRODIGY_NEURON_VERBOSE_LOGS=${PRODIGY_NEURON_VERBOSE_LOGS}")
+   fi
+   if [[ -n "${PRODIGY_EXIT_TRACE:-}" ]]
+   then
+      run_env+=("PRODIGY_EXIT_TRACE=${PRODIGY_EXIT_TRACE}")
    fi
 	   if [[ -n "${PRODIGY_STATEFUL_TOPOLOGY_ROLLBACK_WINDOW_SECONDS:-}" ]]
 	   then
@@ -6637,6 +6647,28 @@ terminate_all_brains()
          wait "${pid}" >/dev/null 2>&1 || true
       fi
    done
+}
+
+record_exited_brain_wrapper()
+{
+   local pid="$1"
+   local status="$2"
+   local idx=""
+   local logfile="${pid_log_by_pid[$pid]:-}"
+
+   for idx in "${!active_pids[@]}"
+   do
+      if [[ "${active_pids[$idx]:-}" == "${pid}" ]]
+      then
+         active_pids[$idx]=""
+         break
+      fi
+   done
+
+   reaped_pids+=("${pid}")
+   reaped_pid["${pid}"]=1
+   status_codes+=("${status}")
+   echo "BRAIN_EXIT pid=${pid} status=${status} log=${logfile}"
 }
 
 kill_fault_target_brains()
@@ -6818,8 +6850,32 @@ then
 
    while true
    do
-      sleep 3600 &
-      wait $! || true
+      set +e
+      exited_pid=""
+      wait -n "${pids[@]}" 2>/dev/null
+      status=$?
+      set -e
+
+      for pid in "${pids[@]}"
+      do
+         if [[ -n "${reaped_pid[$pid]+x}" ]]
+         then
+            continue
+         fi
+         if ! kill -0 "${pid}" >/dev/null 2>&1
+         then
+            exited_pid="${pid}"
+            break
+         fi
+      done
+
+      if [[ "${status}" -eq 127 || -z "${exited_pid}" ]]
+      then
+         sleep 1
+         continue
+      fi
+
+      record_exited_brain_wrapper "${exited_pid}" "${status}"
    done
 fi
 

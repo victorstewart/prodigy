@@ -211,6 +211,11 @@ static bool resolveMachineWhiteholeInternetSourceAddressForDeployment(const Mach
   prodigyCollectMachinePeerAddresses(*machine, candidates);
   for (const ClusterMachinePeerAddress& candidate : candidates)
   {
+    if (prodigyClusterMachinePeerAddressIsPrivate(candidate))
+    {
+      continue;
+    }
+
     if (candidate.address.size() == 0)
     {
       continue;
@@ -233,6 +238,20 @@ static bool resolveMachineWhiteholeInternetSourceAddressForDeployment(const Mach
       addressText->assign(candidate.address);
     }
     return true;
+  }
+
+  if (machine->publicAddress.size() > 0)
+  {
+    IPAddress candidateAddress = {};
+    if (ClusterMachine::parseIPAddressLiteral(machine->publicAddress, candidateAddress) && candidateAddress.is6 == (family == ExternalAddressFamily::ipv6) && candidateAddress.isNull() == false)
+    {
+      address = candidateAddress;
+      if (addressText)
+      {
+        addressText->assign(machine->publicAddress);
+      }
+      return true;
+    }
   }
 
   return false;
@@ -1843,16 +1862,9 @@ private:
           }
         }
 
-        // now we're moving the minimum number of containers to still achieve nFit
-
-        // generate a stateless work object that sees us WAIT for all of the followings compactions, then schedules n of our application on that machine
-
-        bytell_hash_set<ApplicationDeployment *> compactedDeployments;
-
-        auto applyDonorDelta = [&](const PlannedMove& plannedMove) -> void {
+        auto applyDonorDelta = [&](MachineResourcesDelta& donorDeltas, const PlannedMove& plannedMove) -> void {
           ApplicationDeployment *thisDeployment = thisBrain->deployments.at(plannedMove.deploymentID);
           DeploymentPlan& thisPlan = thisDeployment->plan;
-          MachineResourcesDelta& donorDeltas = deltasByMachine[machineA];
 
           prodigyApplyPlannedMachineScalarDelta(donorDeltas, thisPlan.config, -int64_t(plannedMove.count));
           for (ContainerView *container : plannedMove.bases)
@@ -1867,12 +1879,34 @@ private:
           }
         };
 
+        MachineResourcesDelta simulatedDonorDeltas = deltasByMachine[machineA];
+        for (const PlannedMove& plannedMove : plannedMoves)
+        {
+          applyDonorDelta(simulatedDonorDeltas, plannedMove);
+        }
+
+        uint32_t targetFit = nFitOnMachine(this, machineA, nFit, simulatedDonorDeltas);
+        if (targetFit == 0)
+        {
+          co_return;
+        }
+        if (targetFit < nFit)
+        {
+          nFit = targetFit;
+        }
+
+        // now we're moving the minimum number of containers to still achieve nFit
+
+        // generate a stateless work object that sees us WAIT for all of the followings compactions, then schedules n of our application on that machine
+
+        bytell_hash_set<ApplicationDeployment *> compactedDeployments;
+
         if (planCompactionWork == false)
         {
           for (const PlannedMove& plannedMove : plannedMoves)
           {
             ApplicationDeployment *thisDeployment = thisBrain->deployments.at(plannedMove.deploymentID);
-            applyDonorDelta(plannedMove);
+            applyDonorDelta(deltasByMachine[machineA], plannedMove);
             prodigyApplyPlannedMachineScalarDelta(deltasByMachine[plannedMove.machineB], thisDeployment->plan.config, int64_t(plannedMove.count));
           }
 
@@ -1892,7 +1926,7 @@ private:
 
           uint32_t moveN = plannedMove.count;
 
-          applyDonorDelta(plannedMove);
+          applyDonorDelta(deltasByMachine[machineA], plannedMove);
 
           // moving moveN of deploymentID from machine A to machine B
           prodigyDebitMachineScalarResources(machineB, thisPlan.config, moveN);
@@ -1941,8 +1975,9 @@ private:
               DeploymentWork *cwork = planStatelessConstruction(machineB, lifetime, std::move(assignedGPUMemoryMBs), std::move(assignedGPUDevices));
               DeploymentWork *dwork = planStatelessDestruction(containerToDestroy, "compaction");
 
-              // cwork->ticket = ticket;
-              // dwork->ticket = ticket;
+              // Keep both halves of the planned move tied to the compaction ticket so the orchestrating deployment wakes after donor moves complete.
+              std::get<StatelessWork>(*cwork).ticket = ticket;
+              std::get<StatelessWork>(*dwork).ticket = ticket;
 
               if (thisPlan.moveConstructively)
               {
@@ -1979,25 +2014,7 @@ private:
           deployment->schedule(nullptr);
         }
 
-        DeploymentWork *workAnon = workPool.get();
-        workAnon->emplace<StatelessWork>(ticket);
-        toSchedule.push_back(workAnon);
-
-        waitingOnCompactions = true;
-
-        // Assert a sentinel exists while we are marked waiting on compactions
-        {
-          bool found = false;
-          for (DeploymentWork *w : toSchedule)
-          {
-            if (auto s = std::get_if<StatelessWork>(w); s && s->ticket && s->ticket->orchestrator == this)
-            {
-              found = true;
-              break;
-            }
-          }
-          assert(found && "waitingOnCompactions set without a compaction sentinel enqueued");
-        }
+        scheduleCompactionWait(ticket);
 
         co_yield machineA;
       }
@@ -2110,6 +2127,11 @@ private:
 
     for (Machine *donor : donorMachines)
     {
+      if (machineSatisfiesExternalPlacementForDeployment(this, donor) == false)
+      {
+        continue;
+      }
+
       uint32_t nToFit = nTarget() - nDeployed();
 
       // enforce rack + machine concentration limits
@@ -2137,6 +2159,32 @@ private:
     return ticket;
   }
 
+  bool deploymentRequiresExistingMachinePlacement(void) const
+  {
+    if (thisBrain == nullptr)
+    {
+      return false;
+    }
+
+    for (const Wormhole& wormhole : plan.wormholes)
+    {
+      if (wormhole.source != ExternalAddressSource::registeredRoutablePrefix)
+      {
+        continue;
+      }
+
+      const DistributableExternalSubnet *registered = findRegisteredRoutablePrefix(
+          thisBrain->brainConfig.distributableExternalSubnets,
+          wormhole.routablePrefixUUID);
+      if (registered != nullptr && registered->ingressScope == RoutableIngressScope::singleMachine && registered->machineUUID != 0)
+      {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
   struct DefaultTicketSpecializer {
     void operator()(MachineTicket *) const {}
   };
@@ -2157,6 +2205,10 @@ private:
     } cleanupGuard;
 
     scheduleSurgeOnReserved = false;
+    if (coro == nullptr || deploymentRequiresExistingMachinePlacement())
+    {
+      allowNewMachines = false;
+    }
     MachineTicket *ticket = nullptr;
 
   restart:
@@ -2166,6 +2218,10 @@ private:
     {
       for (Machine *machine : rack->machines)
       {
+        if (prodigyMachineReadyForScheduling(machine) == false)
+        {
+          continue;
+        }
         orderedMachines.push_back(machine);
       }
     }
@@ -2192,6 +2248,12 @@ private:
     for (auto it = extraBin.begin(); it != extraBin.end();) // extraBin will be consumed
     {
       Machine *machine = *it;
+
+      if (prodigyMachineReadyForScheduling(machine) == false)
+      {
+        it = extraBin.erase(it);
+        continue;
+      }
 
       auto deltaIt = deltasByMachine.find(machine);
       const MachineResourcesDelta *deltas = (deltaIt == deltasByMachine.end()) ? nullptr : &deltaIt->second;
@@ -3202,6 +3264,46 @@ private:
     {
       delete retiredSchedulingExecution;
       retiredSchedulingExecution = nullptr;
+    }
+  }
+
+  void completeCompactionTicketWork(CompactionTicket *ticket)
+  {
+    if (ticket == nullptr)
+    {
+      return;
+    }
+
+    auto it = ticket->pendingCompactions.find(this);
+    if (it == ticket->pendingCompactions.end())
+    {
+      return;
+    }
+
+    if (--it->second > 0)
+    {
+      return;
+    }
+
+    ticket->pendingCompactions.erase(it);
+    if (ticket->pendingCompactions.size() > 0)
+    {
+      return;
+    }
+
+    ApplicationDeployment *orchestrator = ticket->orchestrator;
+    if (orchestrator == nullptr)
+    {
+      return;
+    }
+
+    if (orchestrator->schedulingStack.execution)
+    {
+      orchestrator->consumeSchedulingExecution();
+    }
+    else if (orchestrator->toSchedule.empty() == false)
+    {
+      orchestrator->schedule(nullptr);
     }
   }
 
@@ -6259,7 +6361,20 @@ public:
         return;
       }
 
-      architect(nullptr, false, false, false);
+      const bool recoveredPendingStatelessPlan = (state == DeploymentState::none
+                                                && plan.isStateful == false
+                                                && containers.empty()
+                                                && waitingOnContainers.empty()
+                                                && toSchedule.empty());
+      const DeploymentState recoveryStateBeforePromotion = state;
+      const int64_t recoveryStateChangedBeforePromotion = stateChangedAtMs;
+      if (recoveredPendingStatelessPlan)
+      {
+        state = DeploymentState::deploying;
+        stateChangedAtMs = Time::now<TimeResolution::ms>();
+      }
+
+      architect(nullptr, false, recoveredPendingStatelessPlan, recoveredPendingStatelessPlan);
 
       if (toSchedule.size() > 0)
       {
@@ -6275,6 +6390,11 @@ public:
         std::fflush(stderr);
 #endif
         schedule(nullptr);
+      }
+      else if (recoveredPendingStatelessPlan && nDeployed() < nTarget())
+      {
+        state = recoveryStateBeforePromotion;
+        stateChangedAtMs = recoveryStateChangedBeforePromotion;
       }
     }
   }
@@ -6443,6 +6563,29 @@ public:
   void scheduleStatelessConstruction(Machine *machine, ApplicationLifetime lifetime)
   {
     toSchedule.push_back(planStatelessConstruction(machine, lifetime));
+  }
+
+  void scheduleCompactionWait(CompactionTicket *ticket)
+  {
+    DeploymentWork *workAnon = workPool.get();
+    workAnon->emplace<StatelessWork>(ticket);
+    toSchedule.push_back(workAnon);
+
+    waitingOnCompactions = true;
+
+    // Assert a sentinel exists while we are marked waiting on compactions
+    {
+      bool found = false;
+      for (DeploymentWork *w : toSchedule)
+      {
+        if (auto s = std::get_if<StatelessWork>(w); s && s->ticket && s->ticket->orchestrator == this)
+        {
+          found = true;
+          break;
+        }
+      }
+      assert(found && "waitingOnCompactions set without a compaction sentinel enqueued");
+    }
   }
 
   void scheduleStatefulConstruction(Machine *machine, uint32_t shardGroup, DataStrategy dataStrategy)
@@ -7221,6 +7364,66 @@ public:
     return fit;
   }
 
+  static bool machineSatisfiesExternalPlacementForDeployment(ApplicationDeployment *deployment, Machine *machine)
+  {
+    if (deployment == nullptr || machine == nullptr)
+    {
+      return false;
+    }
+
+    uint128_t requiredWormholeMachineUUID = 0;
+    for (const Wormhole& wormhole : deployment->plan.wormholes)
+    {
+      if (wormhole.source != ExternalAddressSource::registeredRoutablePrefix)
+      {
+        continue;
+      }
+
+      const DistributableExternalSubnet *registered = findRegisteredRoutablePrefix(
+          thisBrain->brainConfig.distributableExternalSubnets,
+          wormhole.routablePrefixUUID);
+      if (registered == nullptr)
+      {
+        return false;
+      }
+
+      if (registered->ingressScope != RoutableIngressScope::singleMachine)
+      {
+        continue;
+      }
+
+      if (registered->machineUUID == 0)
+      {
+        return false;
+      }
+
+      if (requiredWormholeMachineUUID == 0)
+      {
+        requiredWormholeMachineUUID = registered->machineUUID;
+      }
+      else if (requiredWormholeMachineUUID != registered->machineUUID)
+      {
+        return false;
+      }
+
+      if (requiredWormholeMachineUUID != machine->uuid)
+      {
+        return false;
+      }
+    }
+
+    for (const Whitehole& whiteholeTemplate : deployment->plan.whiteholes)
+    {
+      Whitehole resolvedWhitehole = whiteholeTemplate;
+      if (resolveWhiteholeSourceAddressForScheduling(machine, resolvedWhitehole, nullptr) == false)
+      {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
   bool waitingOnCompactions = false; // if true, can't use this deployment in further compactions because it's blocked and won't be making progress on any work
 
   bytell_hash_map<ContainerView *, ContainerState> waitingOnContainers; // when creating or destroying, before we can make scheduling progress
@@ -7345,13 +7548,34 @@ public:
 
   // it will first check which deployments were running on that machine
   // there must be some that were not marked for destruction, otherwise this function would've never been called
-  void drainMachine(Machine *machine, bool failed)
+  void drainMachine(Machine *machine, bool failed, bool scheduledHealthyWaitersOnly = false)
   {
     Vector<ContainerView *> containersToRedeploy;
     Vector<ContainerView *> skippedScheduledContainers;
     bytell_hash_set<ContainerView *> seenContainers;
 
-    auto& bin = machine->containersByDeploymentID[plan.config.deploymentID()];
+    if (scheduledHealthyWaitersOnly)
+    {
+      for (const auto& [container, waitState] : waitingOnContainers)
+      {
+        if (waitState == ContainerState::healthy
+            && container != nullptr
+            && container->state == ContainerState::scheduled
+            && container->machine != nullptr
+            && prodigyMachinesShareIdentity(*container->machine, *machine))
+        {
+          machine->upsertContainerIndexEntry(plan.config.deploymentID(), container);
+        }
+      }
+    }
+
+    auto binIt = machine->containersByDeploymentID.find(plan.config.deploymentID());
+    if (binIt == machine->containersByDeploymentID.end())
+    {
+      co_return;
+    }
+
+    auto& bin = binIt->second;
     basics_log("drainMachine deploymentID=%llu machinePrivate4=%u failed=%d binSize=%llu\n",
                (unsigned long long)plan.config.deploymentID(),
                machine->private4,
@@ -7361,6 +7585,22 @@ public:
     for (auto it = bin.begin(); it != bin.end();)
     {
       ContainerView *container = *it;
+      if (scheduledHealthyWaitersOnly)
+      {
+        if (container == nullptr)
+        {
+          it = bin.erase(it);
+          continue;
+        }
+
+        auto waitingIt = waitingOnContainers.find(container);
+        if (container->state != ContainerState::scheduled || waitingIt == waitingOnContainers.end() || waitingIt->second != ContainerState::healthy)
+        {
+          ++it;
+          continue;
+        }
+      }
+
       it = bin.erase(it);
 
       if (container == nullptr)
@@ -8536,18 +8776,7 @@ public:
       {
         if (work.ticket)
         {
-          if (auto it = work.ticket->pendingCompactions.find(this); --it->second == 0)
-          {
-            work.ticket->pendingCompactions.erase(it);
-
-            if (work.ticket->pendingCompactions.size() == 0)
-            {
-              if (work.ticket->waitingOnCompactions)
-              {
-                work.ticket->orchestrator->consumeSchedulingExecution();
-              }
-            }
-          }
+          completeCompactionTicketWork(work.ticket);
         }
       }
     };
@@ -8561,6 +8790,7 @@ public:
       schedulingStack.waiters.push_back(waiter);
     }
 
+  drainSchedulingQueue:
     for (auto it = toSchedule.begin(); it != toSchedule.end(); it = toSchedule.erase(it))
     {
       DeploymentWork *workAnon = *it;
@@ -8648,6 +8878,11 @@ public:
       co_await coro->suspend();
       nSuspended -= 1;
     }
+    if (toSchedule.empty() == false)
+    {
+      last = LifecycleOp::none;
+      goto drainSchedulingQueue;
+    }
 
     for (CoroutineStack *waiter : schedulingStack.waiters)
     {
@@ -8667,6 +8902,11 @@ public:
 
     if (state == DeploymentState::deploying)
     {
+      if (plan.config.type != ApplicationType::task && nDeployed() < nTarget())
+      {
+        co_return;
+      }
+
       if (plan.config.type == ApplicationType::task)
       {
         thisBrain->pushSpinApplicationProgressToMothership(this, "task attempt dispatched"_ctv);
@@ -8881,12 +9121,49 @@ public:
 
       if (plan.isStateful)
       {
-        for (const auto& [machine, ticket] : gatherMachinesForScheduling(coro, scheduleSurgeOnReserved, deltasByMachine, allowCompaction, allowNewMachines, [=, this](MachineTicket *ticket) -> void {
-               ticket->shardGroups = shardsForCreation;
-               buildPlacementTopologyEpochs(ticket->placementTopologyEpochs, shardsForCreation);
-             },
-                                                                         deletedOnMachines, onlyMeasure == false))
+        auto machines = gatherMachinesForScheduling(coro, scheduleSurgeOnReserved, deltasByMachine, allowCompaction, allowNewMachines, [=, this](MachineTicket *ticket) -> void {
+          ticket->shardGroups = shardsForCreation;
+          buildPlacementTopologyEpochs(ticket->placementTopologyEpochs, shardsForCreation);
+        },
+                                                     deletedOnMachines, onlyMeasure == false);
+        while (true)
         {
+          if (machines.hasValue() == false)
+          {
+            if (machines.advance() == false)
+            {
+              if (machines.blocked())
+              {
+                if (coro == nullptr)
+                {
+                  basics_log("architect stateful blocked without coroutine stack deploymentID=%llu\n",
+                             (unsigned long long)plan.config.deploymentID());
+                  co_return;
+                }
+
+                uint32_t generatorSuspendIndex = coro->nextSuspendIndex();
+                if (generatorSuspendIndex == 0)
+                {
+                  basics_log("architect stateful invalid suspend ordering deploymentID=%llu\n",
+                             (unsigned long long)plan.config.deploymentID());
+                  co_return;
+                }
+
+                nSuspended += 1;
+                co_await coro->suspendAtIndex(generatorSuspendIndex - 1);
+                nSuspended -= 1;
+                continue;
+              }
+
+              break;
+            }
+          }
+
+          auto yielded = machines.value();
+          machines.clearValue();
+
+          Machine *machine = yielded.first;
+          MachineTicket *ticket = yielded.second;
           if (machine == nullptr)
           {
             continue;
@@ -8995,10 +9272,47 @@ public:
 
         bool scheduleSurgeOnReserved;
 
-        for (const auto& [machine, ticket] : gatherMachinesForScheduling(coro, scheduleSurgeOnReserved, deltasByMachine, allowCompaction, allowNewMachines, [=](MachineTicket *ticket) -> void {
-             },
-                                                                         deletedOnMachines, onlyMeasure == false))
+        auto machines = gatherMachinesForScheduling(coro, scheduleSurgeOnReserved, deltasByMachine, allowCompaction, allowNewMachines, [=](MachineTicket *ticket) -> void {
+        },
+                                                     deletedOnMachines, onlyMeasure == false);
+        while (true)
         {
+          if (machines.hasValue() == false)
+          {
+            if (machines.advance() == false)
+            {
+              if (machines.blocked())
+              {
+                if (coro == nullptr)
+                {
+                  basics_log("architect stateless blocked without coroutine stack deploymentID=%llu\n",
+                             (unsigned long long)plan.config.deploymentID());
+                  co_return;
+                }
+
+                uint32_t generatorSuspendIndex = coro->nextSuspendIndex();
+                if (generatorSuspendIndex == 0)
+                {
+                  basics_log("architect stateless invalid suspend ordering deploymentID=%llu\n",
+                             (unsigned long long)plan.config.deploymentID());
+                  co_return;
+                }
+
+                nSuspended += 1;
+                co_await coro->suspendAtIndex(generatorSuspendIndex - 1);
+                nSuspended -= 1;
+                continue;
+              }
+
+              break;
+            }
+          }
+
+          auto yielded = machines.value();
+          machines.clearValue();
+
+          Machine *machine = yielded.first;
+          MachineTicket *ticket = yielded.second;
           if (machine == nullptr)
           {
             continue;
@@ -9031,7 +9345,11 @@ public:
 
             if (budget == 0)
             {
-              break; // we loop by machine, so it's possible we've already scheduled all our base or surge
+              if (nDeployed() == nTarget())
+              {
+                break;
+              }
+              continue;
             }
 
             if (uint32_t machineBudget = maxPerMachine - countPerMachine.getIf(machine); machineBudget < budget)
@@ -9045,7 +9363,11 @@ public:
 
             if (budget == 0)
             {
-              break; // we loop by machine, so it's possible we've already scheduled all our base or surge
+              if (nDeployed() == nTarget())
+              {
+                break;
+              }
+              continue;
             }
 
             // nFit doesn't accurately capture the true machine resources... but we could also be destructing
@@ -9383,7 +9705,14 @@ public:
     state = DeploymentState::deploying;
     stateChangedAtMs = Time::now<TimeResolution::ms>();
 
-    architect(coro, false);
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          architect(coro, false);
+        }))
+    {
+      nSuspended += 1;
+      co_await coro->suspendAtIndex(suspendIndex);
+      nSuspended -= 1;
+    }
 
     delete coro;
 
