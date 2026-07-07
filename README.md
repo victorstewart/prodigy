@@ -41,6 +41,11 @@ cargo build --release --manifest-path prodigy/discombobulator/Cargo.toml
 
 The Prodigy runtime and `mothership` use the repository's C++/CMake/Depos project configuration. See [`prodigy/docs/build.md`](prodigy/docs/build.md) for the full build contract and the current build-entrypoint notes.
 
+For native Apple Silicon development under Apple Containerization, see
+[`prodigy/dev/apple-container-kernel/`](prodigy/dev/apple-container-kernel/)
+for the pinned arm64 kernel profile with Prodigy's BPF, Netkit, Btrfs, and
+Landlock requirements.
+
 Runtime networking requirement:
 
 ```bash
