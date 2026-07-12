@@ -555,38 +555,6 @@ install_os_update_script_on_vm()
 #!/bin/sh
 set -eu
 
-wait_for_network()
-{
-   nsenter --net=/proc/1/ns/net -- python3 - "$1" "$2" <<'PY'
-import socket
-import sys
-import time
-
-host = sys.argv[1]
-port = int(sys.argv[2])
-deadline = time.time() + 60
-last = None
-while time.time() < deadline:
-    try:
-        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-        for info in infos:
-            sock = socket.socket(info[0], info[1], info[2])
-            sock.settimeout(3)
-            try:
-                sock.connect(info[4])
-                sock.close()
-                raise SystemExit(0)
-            except Exception as exc:
-                last = exc
-            finally:
-                sock.close()
-    except Exception as exc:
-        last = exc
-    time.sleep(1)
-raise SystemExit("network not ready for %s:%s: %s" % (host, port, last))
-PY
-}
-
 run_package_update()
 {
 EOF_SCRIPT
@@ -601,12 +569,10 @@ EOF_SCRIPT
       if [[ "${FULL_DISTRO_UPGRADE}" == "1" ]]
       then
          cat >> "${script}" <<'EOF_SCRIPT'
-   wait_for_network archive.ubuntu.com 80
    nsenter --net=/proc/1/ns/net -- sh -c 'export DEBIAN_FRONTEND=noninteractive; apt-get -o Acquire::ForceIPv4=true -o APT::Update::Error-Mode=any update; apt-get -o Acquire::ForceIPv4=true -y -o Dpkg::Options::=--force-confold upgrade'
 EOF_SCRIPT
       else
          cat >> "${script}" <<'EOF_SCRIPT'
-   wait_for_network archive.ubuntu.com 80
    nsenter --net=/proc/1/ns/net -- sh -c 'export DEBIAN_FRONTEND=noninteractive; apt-get -o Acquire::ForceIPv4=true -o APT::Update::Error-Mode=any update; apt-get -o Acquire::ForceIPv4=true -y --only-upgrade install bash'
 EOF_SCRIPT
       fi
@@ -615,14 +581,12 @@ EOF_SCRIPT
       if [[ "${FULL_DISTRO_UPGRADE}" == "1" ]]
       then
          cat >> "${script}" <<'EOF_SCRIPT'
-   wait_for_network mirrors.fedoraproject.org 443
    nsenter --net=/proc/1/ns/net -- sh -c 'dnf -y --setopt=ip_resolve=4 upgrade --refresh'
    /usr/sbin/restorecon -RF /usr/sbin/sshd /usr/libexec/openssh /usr/bin/bash /etc/ssh /root
    /usr/sbin/matchpathcon -V /usr/sbin/sshd /usr/libexec/openssh/sshd-session /usr/bin/bash
 EOF_SCRIPT
       else
          cat >> "${script}" <<'EOF_SCRIPT'
-   wait_for_network mirrors.fedoraproject.org 443
    nsenter --net=/proc/1/ns/net -- sh -c 'dnf -y --setopt=ip_resolve=4 makecache --refresh; dnf -y --setopt=ip_resolve=4 upgrade bash --refresh'
 EOF_SCRIPT
       fi

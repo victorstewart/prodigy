@@ -6914,80 +6914,6 @@ static inline bool routableResourceLeasesConflict(const RoutableResourceLease& l
   return routableResourceLeaseOwnersCompatible(lhs.owner, rhs.owner) == false && routableResourceLeaseResourcesIntersect(lhs, rhs);
 }
 
-enum class ProdigyDnsControlClientRole : uint8_t {
-  mothership = 1,
-  prodigy = 2
-};
-
-class ProdigyDnsControlPairingLease {
-public:
-
-  uint128_t leaseID = 0;
-  uint128_t secret = 0;
-  IPAddress clientAddress;
-  uint64_t generation = 0;
-  int64_t expiresAtMs = 0;
-  ProdigyDnsControlClientRole role = ProdigyDnsControlClientRole::prodigy;
-  bool desiredActive = true;
-  bool applied = false;
-
-  bool operator==(const ProdigyDnsControlPairingLease& other) const
-  {
-    return leaseID == other.leaseID && secret == other.secret &&
-           clientAddress.equals(other.clientAddress) &&
-           generation == other.generation &&
-           expiresAtMs == other.expiresAtMs && role == other.role &&
-           desiredActive == other.desiredActive && applied == other.applied;
-  }
-};
-
-template <typename S>
-static void serialize(S&& serializer, ProdigyDnsControlPairingLease& lease)
-{
-  serializer.value16b(lease.leaseID);
-  serializer.value16b(lease.secret);
-  serializer.object(lease.clientAddress);
-  serializer.value8b(lease.generation);
-  serializer.value8b(lease.expiresAtMs);
-  serializer.value1b(lease.role);
-  serializer.value1b(lease.desiredActive);
-  serializer.value1b(lease.applied);
-}
-
-enum class ProdigyDnsControlPairingAction : uint8_t {
-  mint = 1,
-  revoke = 2,
-  reconcile = 3
-};
-
-class ProdigyDnsControlPairingOperation {
-public:
-
-  ProdigyDnsControlPairingAction action = ProdigyDnsControlPairingAction::reconcile;
-  ProdigyDnsControlClientRole role = ProdigyDnsControlClientRole::prodigy;
-  IPAddress clientAddress;
-  int64_t lifetimeMs = 0;
-  uint128_t leaseID = 0;
-  uint64_t generation = 0;
-  ProdigyDnsControlPairingLease lease;
-  bool succeeded = false;
-  String failure;
-};
-
-template <typename S>
-static void serialize(S&& serializer, ProdigyDnsControlPairingOperation& operation)
-{
-  serializer.value1b(operation.action);
-  serializer.value1b(operation.role);
-  serializer.object(operation.clientAddress);
-  serializer.value8b(operation.lifetimeMs);
-  serializer.value16b(operation.leaseID);
-  serializer.value8b(operation.generation);
-  serializer.object(operation.lease);
-  serializer.value1b(operation.succeeded);
-  serializer.text1b(operation.failure, 512);
-}
-
 class ProdigyMasterAuthorityRuntimeState {
 public:
 
@@ -6999,7 +6925,6 @@ public:
   uint64_t nextPendingAddMachinesOperationID = 1;
   uint64_t nextPendingElasticAddressOperationID = 1;
   uint64_t nextDNSIntentRevision = 1;
-  uint64_t nextDnsControlPairingGeneration = 1;
   ProdigyResumptionRegistry::SnapshotMap tlsResumptionSnapshotsByWormhole;
   Vector<ProdigyPendingAddMachinesOperation> pendingAddMachinesOperations;
   Vector<ProdigyPendingAutonomousProvisioningOperation> pendingAutonomousProvisioningOperations;
@@ -7009,7 +6934,6 @@ public:
   Vector<ProdigyDeferredStatefulScaleIntent> deferredStatefulScaleIntents;
   Vector<ProdigyManagedMachineSchema> machineSchemas;
   Vector<RoutableResourceLease> routableResourceLeases;
-  Vector<ProdigyDnsControlPairingLease> dnsControlPairingLeases;
   Vector<PublicTlsCertificateState> publicTlsCertificates;
   Vector<PrivateTlsVaultLifecycleState> privateTlsVaultLifecycles;
   bytell_hash_map<uint64_t, TaskExecutionRecord> taskExecutions;
@@ -7018,11 +6942,6 @@ public:
 
   bool operator==(const ProdigyMasterAuthorityRuntimeState& other) const
   {
-    if (nextDnsControlPairingGeneration != other.nextDnsControlPairingGeneration ||
-        dnsControlPairingLeases.size() != other.dnsControlPairingLeases.size())
-    {
-      return false;
-    }
     if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf)
     {
       return false;
@@ -7101,14 +7020,6 @@ public:
       }
     }
 
-    for (uint32_t index = 0; index < dnsControlPairingLeases.size(); ++index)
-    {
-      if ((dnsControlPairingLeases[index] == other.dnsControlPairingLeases[index]) == false)
-      {
-        return false;
-      }
-    }
-
     for (uint32_t index = 0; index < publicTlsCertificates.size(); ++index)
     {
       if (prodigyPublicTlsCertificateStatesEqual(publicTlsCertificates[index], other.publicTlsCertificates[index]) == false)
@@ -7154,7 +7065,6 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
   serializer.value8b(state.nextPendingAddMachinesOperationID);
   serializer.value8b(state.nextPendingElasticAddressOperationID);
   serializer.value8b(state.nextDNSIntentRevision);
-  serializer.value8b(state.nextDnsControlPairingGeneration);
   serializer.object(state.tlsResumptionSnapshotsByWormhole);
   serializer.object(state.pendingAddMachinesOperations);
   serializer.object(state.pendingAutonomousProvisioningOperations);
@@ -7164,7 +7074,6 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
   serializer.object(state.deferredStatefulScaleIntents);
   serializer.object(state.machineSchemas);
   serializer.object(state.routableResourceLeases);
-  serializer.object(state.dnsControlPairingLeases);
   serializer.object(state.publicTlsCertificates);
   serializer.object(state.privateTlsVaultLifecycles);
   serializer.object(state.taskExecutions);

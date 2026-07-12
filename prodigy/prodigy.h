@@ -42,8 +42,6 @@ private:
   std::unique_ptr<HostControlNetworkType> hostControlNetwork;
   std::unique_ptr<CoroutineStack> startupCoroutine;
   NeuronType *neuron = nullptr;
-  int64_t dnsControlSessionDeadlineNs = 0;
-  constexpr static int64_t dnsControlSessionTimeoutNs = 30'000'000'000LL;
   // the only way master brain is relinquished, is either by choice when we 1) update the operating system or 2) update this program, or by force when 3) the machine fails
 
   static void exitTraceHandler(int status, void *)
@@ -106,35 +104,9 @@ private:
     }
     if (hostControlNetwork->ready() == false)
     {
-      std::fprintf(stderr,
-                   "prodigy DNS control-service configuration failed: %s\n",
-                   hostControlNetwork->failure().size() > 0
-                       ? hostControlNetwork->failure().c_str()
-                       : "invalid DNS control bootstrap state");
+      std::fprintf(stderr, "prodigy host control network initialization failed\n");
       std::abort();
     }
-    if (hostControlNetwork->sessionReady() == false)
-    {
-      const int64_t nowNs = AegisStream::monotonicNowNs();
-      if (dnsControlSessionDeadlineNs == 0)
-      {
-        dnsControlSessionDeadlineNs = nowNs + dnsControlSessionTimeoutNs;
-      }
-      if (nowNs >= dnsControlSessionDeadlineNs)
-      {
-        std::fprintf(stderr,
-                     "prodigy DNS control service unavailable at the configured literal IPv6 endpoint\n");
-        std::abort();
-      }
-      startupTimer.clear();
-      startupTimer.setTimeoutMs(100);
-      startupTimer.dispatcher = nullptr;
-      startupTimer.originator = this;
-      Ring::queueTimeout(&startupTimer);
-      return;
-    }
-    dnsControlSessionDeadlineNs = 0;
-
     neuron = new NeuronType(*hostControlNetwork);
     thisNeuron = neuron;
     startupCoroutine = std::make_unique<CoroutineStack>();

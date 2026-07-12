@@ -266,7 +266,6 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
     case MothershipTopic::cleanupACMEDNS01Challenge:
     case MothershipTopic::importACMELineage:
     case MothershipTopic::configureMothershipTunnelProvider:
-    case MothershipTopic::manageDnsControlPairing:
       {
         return consumeVariable(cursor, terminal) && cursor == terminal;
       }

@@ -5,18 +5,16 @@ endif()
 file(READ "${PRODIGY_ROOT}/prodigy/dev/CMakeLists.txt" BUILD)
 file(READ "${PRODIGY_ROOT}/prodigy/dns/DiscombobuFile.in" DISCOMBOBUFILE)
 file(READ "${PRODIGY_ROOT}/prodigy/dns/prodigy-dns-resolver.deployment.plan.v1.json.in" PLAN)
-file(READ "${PRODIGY_ROOT}/prodigy/dns/prodigy-dns-resolver.control.deployment.plan.v1.json.in" CONTROL_PLAN)
 
 foreach(REQUIRED IN ITEMS
    "add_executable(prodigy_dns_resolver \${PRODIGY_ROOT}/prodigy/dns/resolver.cpp)"
    "list(REMOVE_ITEM PRODIGY_COMMON_LINK_TARGETS prodigy_dns_resolver prodigy_dns_resolver_unit)"
    "depos_link(prodigy_dns_resolver PRIVATE basics::basics)"
-   "depos_link(prodigy_dns_resolver PRIVATE cares::cares)"
-   "depos_link(prodigy_dns_resolver_unit PRIVATE cares::cares)"
+   "set(PRODIGY_CARES_TARGETS"
+   "prodigy_mothership_host_runtime_unit"
    "--kind app"
    "--container-artifact \"\${PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT}\""
-   "--container-plan \"\${PRODIGY_DNS_RESOLVER_DEPLOYMENT_PLAN}\""
-   "--container-plan \"\${PRODIGY_DNS_RESOLVER_CONTROL_PLAN_TEMPLATE}\"")
+   "--container-plan \"\${PRODIGY_DNS_RESOLVER_DEPLOYMENT_PLAN}\"")
    string(FIND "${BUILD}" "${REQUIRED}" OFFSET)
    if (OFFSET EQUAL -1)
       message(FATAL_ERROR "DNS resolver build contract missing: ${REQUIRED}")
@@ -26,21 +24,6 @@ string(FIND "${BUILD}" "target_compile_definitions(prodigy_dns_resolver " DEBUG_
 if (NOT DEBUG_OFFSET EQUAL -1)
    message(FATAL_ERROR "DNS resolver production artifact must not enable diagnostic logging")
 endif()
-string(REGEX MATCHALL "cares::cares" CARES_LINKS "${BUILD}")
-list(LENGTH CARES_LINKS CARES_LINK_COUNT)
-if (NOT CARES_LINK_COUNT EQUAL 2)
-   message(FATAL_ERROR "c-ares must be linked only by the DNS resolver service and its focused unit")
-endif()
-
-foreach(FORBIDDEN_LINK IN ITEMS
-   "depos_link(prodigy PRIVATE cares::cares)"
-   "depos_link(mothership PRIVATE cares::cares)"
-   "depos_link(prodigy_mothership_host_runtime_unit PRIVATE cares::cares)")
-   string(FIND "${BUILD}" "${FORBIDDEN_LINK}" OFFSET)
-   if (NOT OFFSET EQUAL -1)
-      message(FATAL_ERROR "ordinary control binary still links c-ares: ${FORBIDDEN_LINK}")
-   endif()
-endforeach()
 
 foreach(REQUIRED IN ITEMS
    "FROM scratch for @PRODIGY_RESOLVED_TARGET_ARCH@"
@@ -103,26 +86,6 @@ if (NOT WHITEHOLES STREQUAL EXPECTED_WHITEHOLES)
    message(FATAL_ERROR "DNS resolver deployment plan has the wrong whitehole pools: ${WHITEHOLES}")
 endif()
 
-string(JSON CONTROL_WORMHOLES LENGTH "${CONTROL_PLAN}" wormholes)
-string(JSON CONTROL_NAME GET "${CONTROL_PLAN}" wormholes 0 name)
-string(JSON CONTROL_ADDRESS GET "${CONTROL_PLAN}" wormholes 0 externalAddress)
-string(JSON CONTROL_EXTERNAL_PORT GET "${CONTROL_PLAN}" wormholes 0 externalPort)
-string(JSON CONTROL_CONTAINER_PORT GET "${CONTROL_PLAN}" wormholes 0 containerPort)
-string(JSON CONTROL_LAYER4 GET "${CONTROL_PLAN}" wormholes 0 layer4)
-string(JSON CONTROL_IS_QUIC GET "${CONTROL_PLAN}" wormholes 0 isQuic)
-string(JSON CONTROL_SOURCE GET "${CONTROL_PLAN}" wormholes 0 source)
-string(JSON CONTROL_PREFIX GET "${CONTROL_PLAN}" wormholes 0 routablePrefixUUID)
-if (NOT CONTROL_WORMHOLES EQUAL 1 OR
-    NOT CONTROL_NAME STREQUAL "dns-control" OR
-    NOT CONTROL_ADDRESS STREQUAL "@PRODIGY_DNS_CONTROL_EXTERNAL_IPV6@" OR
-    NOT CONTROL_EXTERNAL_PORT EQUAL 5353 OR
-    NOT CONTROL_CONTAINER_PORT EQUAL 5353 OR
-    NOT CONTROL_LAYER4 STREQUAL "TCP" OR CONTROL_IS_QUIC OR
-    NOT CONTROL_SOURCE STREQUAL "registeredRoutablePrefix" OR
-    NOT CONTROL_PREFIX STREQUAL "@PRODIGY_DNS_CONTROL_ROUTABLE_PREFIX_UUID@")
-   message(FATAL_ERROR "DNS resolver control plan violates the strict IPv6/TCP wormhole contract")
-endif()
-
 foreach(FORBIDDEN IN ITEMS "apiCredentials" "tlsCredentials" "credentialUUID" "nThreads")
    string(FIND "${PLAN}" "\"${FORBIDDEN}\"" OFFSET)
    if (NOT OFFSET EQUAL -1)
@@ -139,14 +102,12 @@ file(GLOB_RECURSE PRODIGY_PRODUCTION_CPP_SOURCES
    "${PRODIGY_ROOT}/prodigy/*.cc"
    "${PRODIGY_ROOT}/prodigy/*.cpp"
    "${PRODIGY_ROOT}/prodigy/*.cxx"
+   "${PRODIGY_ROOT}/prodigy/*.c"
+   "${PRODIGY_ROOT}/prodigy/*.py"
+   "${PRODIGY_ROOT}/prodigy/*.rs"
+   "${PRODIGY_ROOT}/prodigy/*.sh"
 )
-list(FILTER PRODIGY_PRODUCTION_CPP_SOURCES EXCLUDE REGEX "/tests?/|/target/")
-file(GLOB PRODIGY_MANAGED_PROBE_SOURCES
-   LIST_DIRECTORIES false
-   RELATIVE "${PRODIGY_ROOT}"
-   "${PRODIGY_ROOT}/prodigy/dev/tests/*container*.cpp"
-)
-list(APPEND PRODIGY_PRODUCTION_CPP_SOURCES ${PRODIGY_MANAGED_PROBE_SOURCES})
+list(FILTER PRODIGY_PRODUCTION_CPP_SOURCES EXCLUDE REGEX "/target/")
 
 # These exact files own provider HTTP policy, not resolver backends.
 set(PRODIGY_HOST_CONTROL_NETWORK_OWNERS
@@ -162,6 +123,8 @@ set(PRODIGY_RESOLVER_OWNERS
    "prodigy/dns/resolver.cpp"
    "prodigy/dns/resolver.h"
    "prodigy/dns/resolver.service.h"
+   "prodigy/host.control.network.h"
+   "prodigy/dev/tests/prodigy_host_control_network_unit.cpp"
 )
 list(SORT PRODIGY_PRODUCTION_CPP_SOURCES)
 foreach(SOURCE IN LISTS PRODIGY_PRODUCTION_CPP_SOURCES)
@@ -171,7 +134,6 @@ foreach(SOURCE IN LISTS PRODIGY_PRODUCTION_CPP_SOURCES)
       foreach(FORBIDDEN IN ITEMS
          "RingAsyncDnsResolver"
          "async.dns.cares"
-         "ares_"
       )
          string(FIND "${CONTENTS}" "${FORBIDDEN}" OFFSET)
          if (NOT OFFSET EQUAL -1)
@@ -180,21 +142,35 @@ foreach(SOURCE IN LISTS PRODIGY_PRODUCTION_CPP_SOURCES)
             )
          endif()
       endforeach()
+      string(REGEX MATCH "(^|[^A-Za-z0-9_])ares_[A-Za-z0-9_]+" CARES_SYMBOL "${CONTENTS}")
+      if (CARES_SYMBOL)
+         message(FATAL_ERROR
+            "${SOURCE} owns the c-ares resolver outside the DNS service: ${CARES_SYMBOL}"
+         )
+      endif()
    endif()
+
+   foreach(FORBIDDEN IN ITEMS
+      "<netdb.h>"
+      "getaddrinfo"
+      "getaddrinfo_a"
+      "freeaddrinfo"
+      "gethostbyaddr"
+      "gethostbyname"
+      "getnameinfo"
+      "res_query"
+      "res_search"
+      "res_send"
+   )
+      string(FIND "${CONTENTS}" "${FORBIDDEN}" OFFSET)
+      if (NOT OFFSET EQUAL -1)
+         message(FATAL_ERROR "${SOURCE} owns synchronous DNS: ${FORBIDDEN}")
+      endif()
+   endforeach()
 
    list(FIND PRODIGY_HOST_CONTROL_NETWORK_OWNERS "${SOURCE}" HOST_CONTROL_OWNER_INDEX)
    if (HOST_CONTROL_OWNER_INDEX EQUAL -1)
       foreach(FORBIDDEN IN ITEMS
-         "<netdb.h>"
-         "getaddrinfo"
-         "getaddrinfo_a"
-         "freeaddrinfo"
-         "gethostbyaddr"
-         "gethostbyname"
-         "getnameinfo"
-         "res_query"
-         "res_search"
-         "res_send"
          "curl_easy_"
          "curl_multi_"
       )

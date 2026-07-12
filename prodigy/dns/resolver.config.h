@@ -22,23 +22,7 @@ struct RuntimeConfig
    IPAddress listenAddress;
    AsyncDnsResolver::Config resolver;
    RingAsyncDnsResolver::BackendConfig backend;
-   bool controlDeployment = false;
 };
-
-inline bool validControlWormhole(const Wormhole& wormhole,
-                                 uint16_t listenPort)
-{
-   return wormhole.name.equal("dns-control"_ctv) &&
-          wormhole.externalAddress.is6 &&
-          wormhole.externalAddress.isNull() == false &&
-          wormhole.externalPort == listenPort &&
-          wormhole.containerPort == listenPort &&
-          wormhole.layer4 == IPPROTO_TCP && wormhole.isQuic == false &&
-          wormhole.source == ExternalAddressSource::registeredRoutablePrefix &&
-          wormhole.routablePrefixUUID != 0 &&
-          wormhole.hasTlsResumptionConfig == false &&
-          wormhole.hasDNSConfig == false;
-}
 
 inline bool addWhiteholeEndpoint(LocalSocketBindSet& endpoints,
                                  const Whitehole& whitehole)
@@ -88,9 +72,9 @@ inline bool configure(const ContainerParameters& parameters,
    {
       return fail("DNS resolver does not accept credentials"_ctv);
    }
-   if (parameters.wormholes.size() > 1)
+   if (parameters.wormholes.empty() == false)
    {
-      return fail("DNS resolver accepts only the strict control wormhole variant"_ctv);
+      return fail("DNS resolver does not accept wormholes"_ctv);
    }
    if (parameters.private6.network.is6 == false ||
        parameters.private6.network.isNull())
@@ -108,15 +92,6 @@ inline bool configure(const ContainerParameters& parameters,
        config.listenPort == 0)
    {
       return fail("DNS resolver advertisement is invalid"_ctv);
-   }
-
-   if (parameters.wormholes.size() == 1)
-   {
-      if (validControlWormhole(parameters.wormholes[0], config.listenPort) == false)
-      {
-         return fail("DNS resolver control wormhole shape is invalid"_ctv);
-      }
-      config.controlDeployment = true;
    }
 
    if (parameters.whiteholes.size() != whiteholeEndpointCount ||

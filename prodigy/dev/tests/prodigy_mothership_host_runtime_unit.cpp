@@ -145,11 +145,11 @@ static bool runActualRuntimeScenario(void)
     {
       MothershipHostRingRuntime runtime;
       inlineRan = runtime.run([&](ProdigyProviderServices services, CoroutineStack *) -> void {
-        servicesInjected = services.http != nullptr;
+        servicesInjected = bool(services.http);
         inlineOnWorker = std::this_thread::get_id() != mainThread;
       });
       bool deferredRan = runtime.run([&](ProdigyProviderServices services, CoroutineStack *coro) -> void {
-        servicesInjected = servicesInjected && services.http != nullptr;
+        servicesInjected = servicesInjected && bool(services.http);
         deferred.begin(coro);
       });
       if (inlineRan == false || deferredRan == false)

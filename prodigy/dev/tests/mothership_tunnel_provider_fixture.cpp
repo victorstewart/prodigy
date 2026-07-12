@@ -9,7 +9,6 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
-#include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -125,34 +124,7 @@ static int connectTCP(const TunnelProviderEndpoint& endpoint)
     return connectLiteral(reinterpret_cast<const sockaddr *>(&address), sizeof(address), AF_INET6);
   }
 
-  char port[8] = {};
-  std::snprintf(port, sizeof(port), "%u", unsigned(endpoint.port));
-  addrinfo hints = {};
-  hints.ai_socktype = SOCK_STREAM;
-  hints.ai_family = AF_UNSPEC;
-
-  addrinfo *addresses = nullptr;
-  if (::getaddrinfo(endpoint.host.c_str(), port, &hints, &addresses) != 0)
-  {
-    return -1;
-  }
-
-  int fd = -1;
-  for (addrinfo *address = addresses; address != nullptr; address = address->ai_next)
-  {
-    fd = ::socket(address->ai_family, address->ai_socktype, address->ai_protocol);
-    if (fd < 0)
-    {
-      continue;
-    }
-    fd = connectWithTimeout(fd, address->ai_addr, address->ai_addrlen);
-    if (fd >= 0)
-    {
-      break;
-    }
-  }
-  ::freeaddrinfo(addresses);
-  return fd;
+  return -1;
 }
 
 static bool writeAll(int fd, const char *buffer, size_t size)

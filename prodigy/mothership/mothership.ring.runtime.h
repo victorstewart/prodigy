@@ -154,7 +154,7 @@ private:
 
     void publishReadiness(void)
     {
-      if (network.sessionReady())
+      if (network.ready())
       {
         owner.markReady();
       }
@@ -286,15 +286,11 @@ private:
     Ring::createRing(256, 512, 64, 16, -1, -1, 32, false, RingProcessIntegration::isolatedWorker);
 
     {
-      ProdigyHostControlNetwork network(ProdigyDnsControlClientRole::mothership);
+      ProdigyHostControlNetwork network;
       if (network.ready() == false)
       {
         std::lock_guard<std::mutex> lock(startupMutex);
-        std::fprintf(stderr,
-                     "mothership DNS control-service configuration failed: %s\n",
-                     network.failure().size() > 0
-                         ? network.failure().c_str()
-                         : "invalid DNS control bootstrap state");
+        std::fprintf(stderr, "mothership host control network initialization failed\n");
         ready = false;
         startupFinished = true;
       }
@@ -327,8 +323,7 @@ private:
             std::chrono::seconds(30),
             [this](void) -> bool { return startupFinished; }) == false)
     {
-      std::fprintf(stderr,
-                   "mothership DNS control service unavailable at the configured literal IPv6 endpoint\n");
+      std::fprintf(stderr, "mothership host runtime initialization timed out\n");
       return false;
     }
     return ready;

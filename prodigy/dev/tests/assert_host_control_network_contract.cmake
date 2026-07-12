@@ -7,10 +7,20 @@ file(READ "${PRODIGY_ROOT}/prodigy/host.http.operation.h" HTTP_OPERATION)
 file(READ "${PRODIGY_ROOT}/prodigy/host.http.admission.h" HTTP_ADMISSION)
 file(READ "${PRODIGY_ROOT}/prodigy/prodigy.h" LIFECYCLE)
 file(READ "${PRODIGY_ROOT}/prodigy/prodigy.cpp" ENTRYPOINT)
+file(READ "${PRODIGY_ROOT}/prodigy/mothership/mothership.ring.runtime.h" MOTHERSHIP)
 file(READ "${PRODIGY_ROOT}/prodigy/iaas/iaas.h" PROVIDER_INTERFACE)
 file(READ "${PRODIGY_ROOT}/prodigy/iaas/runtime/runtime.h" RUNTIME)
 
-string(REGEX MATCHALL "ProdigyDns::ControlClient[ \t]+resolver" RESOLVERS "${OWNER}")
+foreach(DELETED IN ITEMS
+   "prodigy/dns/control.bootstrap.h"
+   "prodigy/dns/control.client.h"
+   "prodigy/dns/control.leases.h")
+   if (EXISTS "${PRODIGY_ROOT}/${DELETED}")
+      message(FATAL_ERROR "deleted DNS control header remains: ${DELETED}")
+   endif()
+endforeach()
+
+string(REGEX MATCHALL "RingAsyncDnsResolver[ \t]+resolver" RESOLVERS "${OWNER}")
 string(REGEX MATCHALL "MultiCurlClient[ \t]+client" CLIENTS "${OWNER}")
 list(LENGTH RESOLVERS RESOLVER_COUNT)
 list(LENGTH CLIENTS CLIENT_COUNT)
@@ -18,14 +28,14 @@ if (NOT RESOLVER_COUNT EQUAL 1 OR NOT CLIENT_COUNT EQUAL 1)
    message(FATAL_ERROR "host control must own exactly one resolver and one HTTP client")
 endif()
 
-string(FIND "${OWNER}" "ProdigyDns::ControlClient resolver;" RESOLVER_OFFSET)
+string(FIND "${OWNER}" "RingAsyncDnsResolver resolver;" RESOLVER_OFFSET)
 string(FIND "${OWNER}" "MultiCurlClient client;" CLIENT_OFFSET)
-string(FIND "${OWNER}" "client(resolver.resolver(), clientConfig())" CLIENT_CONSTRUCTION_OFFSET)
+string(FIND "${OWNER}" "client(resolver, clientConfig())" CLIENT_CONSTRUCTION_OFFSET)
 if (RESOLVER_OFFSET EQUAL -1 OR CLIENT_OFFSET LESS RESOLVER_OFFSET OR CLIENT_CONSTRUCTION_OFFSET EQUAL -1)
    message(FATAL_ERROR "host control resolver/client lifetime order is not explicit")
 endif()
 
-foreach(FORBIDDEN IN ITEMS "std::thread" "curl_easy_" "curl_multi_" "getaddrinfo" "gethostbyname" "RingAsyncDnsResolver" "async.dns.cares" "ares_")
+foreach(FORBIDDEN IN ITEMS "std::thread" "curl_easy_" "curl_multi_" "getaddrinfo" "gethostbyname" "ControlClient" "control.bootstrap" "sessionReady" "readControlBootstrap" "controlBootstrapPath" "ProdigyDnsControlClientRole")
    string(FIND "${OWNER}" "${FORBIDDEN}" OFFSET)
    if (NOT OFFSET EQUAL -1)
       message(FATAL_ERROR "host control owner contains a forbidden alternate execution path: ${FORBIDDEN}")
@@ -33,6 +43,7 @@ foreach(FORBIDDEN IN ITEMS "std::thread" "curl_easy_" "curl_multi_" "getaddrinfo
 endforeach()
 
 foreach(REQUIRED IN ITEMS
+   "#include <networking/async.dns.cares.h>"
    "ProdigyHostHttpAdmission admission;"
    "config.transfers = ProdigyHostHttpAdmission::defaultCapacity;"
    "return admission.submission();"
@@ -116,13 +127,36 @@ foreach(REQUIRED IN ITEMS
    "if (packet == &startupTimer)"
    "startRuntime();"
    "hostControlNetwork = std::make_unique<HostControlNetworkType>();"
-   "hostControlNetwork->sessionReady()"
+   "hostControlNetwork->ready()"
    "neuron = new NeuronType(*hostControlNetwork);"
    "BrainType *brain = new BrainType(*hostControlNetwork);")
    string(FIND "${LIFECYCLE}" "${REQUIRED}" OFFSET)
    if (OFFSET EQUAL -1)
       message(FATAL_ERROR "Prodigy lifecycle is missing host-control ownership: ${REQUIRED}")
    endif()
+endforeach()
+
+foreach(FORBIDDEN IN ITEMS "dnsControlSessionDeadline" "control bootstrap" "sessionReady()" "hostControlNetwork->failure()")
+   string(FIND "${LIFECYCLE}" "${FORBIDDEN}" OFFSET)
+   if (NOT OFFSET EQUAL -1)
+      message(FATAL_ERROR "Prodigy lifecycle retains deleted DNS control state: ${FORBIDDEN}")
+   endif()
+endforeach()
+
+foreach(SOURCE IN ITEMS OWNER LIFECYCLE MOTHERSHIP)
+   foreach(FORBIDDEN IN ITEMS
+      "readControlBootstrap"
+      "controlBootstrapPath"
+      "ProdigyDnsControlClientRole"
+      "ProdigyDns::ControlClient"
+      "control.bootstrap.h"
+      "control.client.h"
+      "control.leases.h")
+      string(FIND "${${SOURCE}}" "${FORBIDDEN}" OFFSET)
+      if (NOT OFFSET EQUAL -1)
+         message(FATAL_ERROR "host startup retains deleted DNS control state: ${FORBIDDEN}")
+      endif()
+   endforeach()
 endforeach()
 
 foreach(REQUIRED IN ITEMS

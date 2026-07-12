@@ -1,13 +1,14 @@
 #pragma once
 
-#include <prodigy/dns/control.client.h>
+#include <networking/async.dns.cares.h>
 #include <prodigy/host.http.admission.h>
+
+#include <utility>
 
 class ProdigyHostControlNetwork final {
 private:
 
-  String initializationFailure;
-  ProdigyDns::ControlClient resolver;
+  RingAsyncDnsResolver resolver;
   MultiCurlClient client;
   ProdigyHostHttpAdmission admission;
   bool stopping = false;
@@ -19,46 +20,17 @@ private:
     return config;
   }
 
-  static ProdigyDns::ControlBootstrap loadBootstrap(
-      ProdigyDnsControlClientRole role,
-      String& failure)
-  {
-    ProdigyDns::ControlBootstrap bootstrap;
-    if (ProdigyDns::readControlBootstrap(
-            String(ProdigyDns::controlBootstrapPath(role)),
-            bootstrap,
-            Time::now<TimeResolution::ms>(),
-            &failure) == false)
-    {
-      return {};
-    }
-    if (bootstrap.valid(Time::now<TimeResolution::ms>(), &failure, &role) == false)
-    {
-      return {};
-    }
-    return bootstrap;
-  }
-
 public:
 
   ProdigyHostControlNetwork()
-      : resolver(loadBootstrap(ProdigyDnsControlClientRole::prodigy,
-                               initializationFailure)),
-        client(resolver.resolver(), clientConfig()),
+      : client(resolver, clientConfig()),
         admission(ProdigyHostHttpOperation::submission(client),
                   ProdigyHostDelayOperation::submission())
   {}
 
-  explicit ProdigyHostControlNetwork(ProdigyDnsControlClientRole role)
-      : resolver(loadBootstrap(role, initializationFailure)),
-        client(resolver.resolver(), clientConfig()),
-        admission(ProdigyHostHttpOperation::submission(client),
-                  ProdigyHostDelayOperation::submission())
-  {}
-
-  explicit ProdigyHostControlNetwork(ProdigyDns::ControlBootstrap bootstrap)
-      : resolver(std::move(bootstrap)),
-        client(resolver.resolver(), clientConfig()),
+  explicit ProdigyHostControlNetwork(RingAsyncDnsResolver::BackendConfig config)
+      : resolver({}, std::move(config)),
+        client(resolver, clientConfig()),
         admission(ProdigyHostHttpOperation::submission(client),
                   ProdigyHostDelayOperation::submission())
   {}
@@ -69,16 +41,6 @@ public:
   bool ready(void) const
   {
     return resolver.ready() && client.ready();
-  }
-
-  bool sessionReady(void) const
-  {
-    return resolver.sessionReady() && client.ready();
-  }
-
-  String& failure(void)
-  {
-    return initializationFailure;
   }
 
   ProdigyHostHttpSubmission http(void)

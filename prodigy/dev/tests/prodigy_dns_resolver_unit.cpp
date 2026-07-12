@@ -3,7 +3,6 @@
 #include <networking/stream.h>
 #include <networking/ring.h>
 #include <prodigy/dns/resolver.service.h>
-#include <prodigy/dns/control.bootstrap.h>
 
 class TestSuite
 {
@@ -73,19 +72,6 @@ static ContainerParameters validParameters(void)
       }
    }
    return parameters;
-}
-
-static Wormhole controlWormhole(void)
-{
-   Wormhole wormhole;
-   wormhole.name.assign("dns-control"_ctv);
-   wormhole.externalAddress = IPAddress("2001:db8:53::1", true);
-   wormhole.externalPort = 5353;
-   wormhole.containerPort = 5353;
-   wormhole.layer4 = IPPROTO_TCP;
-   wormhole.source = ExternalAddressSource::registeredRoutablePrefix;
-   wormhole.routablePrefixUUID = 42;
-   return wormhole;
 }
 
 static bool endpointsAreExact(const LocalSocketBindSet& endpoints)
@@ -175,98 +161,10 @@ static void testRuntimeConfig(TestSuite& suite)
    suite.expect(ProdigyDns::configure(subscribed, config) == false,
                 "dns_config_rejects_subscriptions");
 
-   ContainerParameters control = validParameters();
-   control.wormholes.push_back(controlWormhole());
-   suite.expect(ProdigyDns::configure(control, config, &failure) &&
-                    config.controlDeployment,
-                "dns_config_accepts_strict_control_wormhole");
-
-   ContainerParameters controlIPv4 = control;
-   controlIPv4.wormholes[0].externalAddress = IPAddress("192.0.2.53", false);
-   suite.expect(ProdigyDns::configure(controlIPv4, config) == false,
-                "dns_config_rejects_ipv4_control_wormhole");
-
-   ContainerParameters controlUDP = control;
-   controlUDP.wormholes[0].layer4 = IPPROTO_UDP;
-   suite.expect(ProdigyDns::configure(controlUDP, config) == false,
-                "dns_config_rejects_udp_control_wormhole");
-
-   ContainerParameters twoWormholes = control;
-   twoWormholes.wormholes.push_back(controlWormhole());
-   suite.expect(ProdigyDns::configure(twoWormholes, config) == false,
-                "dns_config_rejects_multiple_control_wormholes");
-}
-
-static void testControlBootstrap(TestSuite& suite)
-{
-   constexpr int64_t nowMs = 1'000;
-   ProdigyDns::ControlBootstrap expected;
-   expected.endpoint = IPAddress("2001:db8:53::1", true);
-   expected.port = 5353;
-   expected.service = MeshRegistry::DNS::resolver;
-   expected.secret = 11;
-   expected.leaseID = 12;
-   expected.generation = 13;
-   expected.expiresAtMs = 2'000;
-   expected.role = ProdigyDnsControlClientRole::mothership;
-
-   suite.expect(std::strcmp(ProdigyDns::controlBootstrapPath(
-                                ProdigyDnsControlClientRole::prodigy),
-                            ProdigyDns::defaultProdigyControlBootstrapPath) == 0 &&
-                    std::strcmp(ProdigyDns::controlBootstrapPath(
-                                    ProdigyDnsControlClientRole::mothership),
-                                ProdigyDns::defaultMothershipControlBootstrapPath) == 0 &&
-                    std::strcmp(ProdigyDns::defaultProdigyControlBootstrapPath,
-                                ProdigyDns::defaultMothershipControlBootstrapPath) != 0,
-                "dns_control_bootstrap_paths_are_role_bound_and_distinct");
-
-   struct stat metadata = {};
-   metadata.st_mode = S_IFREG | 0600;
-   metadata.st_uid = 0;
-   suite.expect(ProdigyDns::validControlBootstrapMetadata(metadata),
-                "dns_control_bootstrap_accepts_root_owned_0600_regular_file");
-   metadata.st_mode = S_IFREG | 0640;
-   suite.expect(ProdigyDns::validControlBootstrapMetadata(metadata) == false,
-                "dns_control_bootstrap_rejects_group_readable_file");
-   metadata.st_mode = S_IFLNK | 0600;
-   suite.expect(ProdigyDns::validControlBootstrapMetadata(metadata) == false,
-                "dns_control_bootstrap_rejects_non_regular_file");
-   metadata.st_mode = S_IFREG | 0600;
-   metadata.st_uid = 1;
-   suite.expect(ProdigyDns::validControlBootstrapMetadata(metadata) == false,
-                "dns_control_bootstrap_rejects_non_root_owner");
-
-   String encoded;
-   ProdigyDns::encodeControlBootstrap(expected, encoded);
-   ProdigyDns::ControlBootstrap decoded;
-   String failure;
-   suite.expect(ProdigyDns::decodeControlBootstrap(
-                    encoded, decoded, nowMs, &failure) &&
-                    decoded.endpoint.equals(expected.endpoint) &&
-                    decoded.port == expected.port &&
-                    decoded.service == expected.service &&
-                    decoded.secret == expected.secret &&
-                    decoded.leaseID == expected.leaseID &&
-                    decoded.generation == expected.generation &&
-                    decoded.expiresAtMs == expected.expiresAtMs &&
-                    decoded.role == expected.role,
-                "dns_control_bootstrap_roundtrips_exact_state");
-
-   const ProdigyDnsControlClientRole prodigyRole =
-       ProdigyDnsControlClientRole::prodigy;
-   suite.expect(decoded.valid(nowMs, &failure, &prodigyRole) == false &&
-                    failure.equal("DNS control pairing lease role is invalid"_ctv),
-                "dns_control_bootstrap_rejects_cross_role_reuse");
-
-   suite.expect(ProdigyDns::decodeControlBootstrap(
-                    encoded, decoded, expected.expiresAtMs, &failure) == false &&
-                    failure.equal("DNS control pairing lease is expired"_ctv),
-                "dns_control_bootstrap_rejects_expired_lease");
-
-   encoded[0] ^= 1;
-   suite.expect(ProdigyDns::decodeControlBootstrap(
-                    encoded, decoded, nowMs, &failure) == false,
-                "dns_control_bootstrap_rejects_wrong_magic");
+   ContainerParameters wormholed = validParameters();
+   wormholed.wormholes.emplace_back();
+   suite.expect(ProdigyDns::configure(wormholed, config) == false,
+                "dns_config_rejects_wormholes");
 }
 
 static void testSessionIdentity(TestSuite& suite)
@@ -406,7 +304,6 @@ int main(void)
 {
    TestSuite suite;
    testRuntimeConfig(suite);
-   testControlBootstrap(suite);
    testSessionIdentity(suite);
    testPairingCollision(suite);
    testResultTranslation(suite);

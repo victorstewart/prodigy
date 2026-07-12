@@ -37,7 +37,6 @@ static inline cppsort::verge_adapter<cppsort::ska_sorter> sorter;
 #include <prodigy/cluster.bootstrap.h>
 #include <prodigy/cluster.machine.helpers.h>
 #include <prodigy/dns.provider.h>
-#include <prodigy/dns/control.leases.h>
 #include <prodigy/ingress.validation.h>
 #include <prodigy/mothership/mothership.cluster.types.h>
 #include <prodigy/mothership/mothership.tunnel.auth.h>
@@ -3556,15 +3555,6 @@ public:
   void reconcileAuthoritativeDNSState(void)
   {
     (void)reconcileDNSRecordLeases();
-    if (masterAuthorityRuntimeState.dnsControlPairingLeases.empty() == false)
-    {
-      ProdigyDnsControlPairingOperation operation = {};
-      operation.action = ProdigyDnsControlPairingAction::reconcile;
-      if (manageDnsControlPairing(operation) == false)
-      {
-        armDNSReconciliationRetry();
-      }
-    }
     for (PublicTlsCertificateState& certificate : masterAuthorityRuntimeState.publicTlsCertificates)
     {
       (void)cleanupPublicTlsPendingDNS01Challenges(certificate);
@@ -4008,138 +3998,6 @@ public:
       }
     }
     return false;
-  }
-
-  static bool persistDnsControlPairingState(
-      void *context,
-      const ProdigyMasterAuthorityRuntimeState&,
-      String *failure)
-  {
-    Brain& brain = *static_cast<Brain *>(context);
-    if (brain.commitMasterAuthorityStateChange())
-    {
-      if (failure)
-      {
-        failure->clear();
-      }
-      return true;
-    }
-    if (failure)
-    {
-      failure->assign("failed to durably commit DNS control pairing state"_ctv);
-    }
-    return false;
-  }
-
-  static bool dispatchDnsControlPairing(
-      void *context,
-      const ProdigyDnsControlPairingLease& lease,
-      bool activate,
-      String *failure)
-  {
-    Brain& brain = *static_cast<Brain *>(context);
-    auto deploymentIt = brain.deploymentsByApp.find(MeshRegistry::DNS::applicationID);
-    if (deploymentIt == brain.deploymentsByApp.end() ||
-        deploymentIt->second == nullptr ||
-        deploymentIt->second->plan.wormholes.size() != 1)
-    {
-      if (failure)
-      {
-        failure->assign("DNS control deployment is unavailable"_ctv);
-      }
-      return false;
-    }
-
-    const Wormhole& ingress = deploymentIt->second->plan.wormholes[0];
-    if (ingress.name.equal("dns-control"_ctv) == false ||
-        ingress.externalAddress.is6 == false ||
-        ingress.externalAddress.isNull() || ingress.externalPort != 5353 ||
-        ingress.containerPort != 5353 || ingress.layer4 != IPPROTO_TCP ||
-        ingress.isQuic ||
-        ingress.source != ExternalAddressSource::registeredRoutablePrefix)
-    {
-      if (failure)
-      {
-        failure->assign("DNS control deployment does not use the strict IPv6/TCP plan"_ctv);
-      }
-      return false;
-    }
-
-    uint128_t clientAddress = 0;
-    std::memcpy(&clientAddress, lease.clientAddress.v6,
-                sizeof(clientAddress));
-    bool dispatched = false;
-    for (ContainerView *container : deploymentIt->second->containers)
-    {
-      if (container && container->canProxySendToNeuron() &&
-          container->advertisingOnPorts.contains(5353))
-      {
-        container->advertisementPairing(
-            lease.secret,
-            clientAddress,
-            MeshRegistry::DNS::resolver,
-            0,
-            activate);
-        dispatched = true;
-      }
-    }
-    if (dispatched == false && failure)
-    {
-      failure->assign("DNS control deployment has no reachable resolver replica"_ctv);
-    }
-    return dispatched;
-  }
-
-  bool manageDnsControlPairing(ProdigyDnsControlPairingOperation& operation)
-  {
-    const ProdigyDnsControlPairingAction action = operation.action;
-    const ProdigyDnsControlClientRole role = operation.role;
-    const IPAddress clientAddress = operation.clientAddress;
-    const int64_t lifetimeMs = operation.lifetimeMs;
-    const uint128_t leaseID = operation.leaseID;
-    const uint64_t generation = operation.generation;
-    operation.lease = {};
-    operation.succeeded = false;
-    operation.failure.clear();
-    if (weAreMaster == false)
-    {
-      operation.failure.assign("DNS control pairings can be managed only by the master"_ctv);
-      return false;
-    }
-
-    ProdigyDns::ControlPairingLeases leases(
-        masterAuthorityRuntimeState,
-        {this, persistDnsControlPairingState, dispatchDnsControlPairing});
-    switch (action)
-    {
-      case ProdigyDnsControlPairingAction::mint:
-        operation.succeeded = leases.mint(
-            role,
-            clientAddress,
-            Time::now<TimeResolution::ms>(),
-            lifetimeMs,
-            operation.lease,
-            &operation.failure);
-        break;
-      case ProdigyDnsControlPairingAction::revoke:
-        operation.succeeded = leases.revoke(
-            leaseID,
-            generation,
-            &operation.failure);
-        break;
-      case ProdigyDnsControlPairingAction::reconcile:
-        operation.succeeded = leases.reconcile(
-            Time::now<TimeResolution::ms>(), &operation.failure);
-        break;
-      default:
-        operation.failure.assign("invalid DNS control pairing action"_ctv);
-        break;
-    }
-    if (masterAuthorityRuntimeState.dnsControlPairingLeases.empty() == false)
-    {
-      armDNSReconciliationRetry();
-    }
-    return operation.succeeded;
   }
 
   bool upsertDNSBindingLease(RoutableResourceLease lease,
@@ -8297,10 +8155,6 @@ public:
 
   bool dnsReconciliationPending(void) const
   {
-    if (masterAuthorityRuntimeState.dnsControlPairingLeases.empty() == false)
-    {
-      return true;
-    }
     for (const RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
     {
       if (lease.kind == RoutableResourceLeaseKind::dnsRecord &&
@@ -23535,35 +23389,6 @@ public:
             BitseryEngine::serialize(serializedResponse, response);
             Message::construct(mothership->wBuffer, MothershipTopic(message->topic), serializedResponse);
           }
-          break;
-        }
-      case MothershipTopic::manageDnsControlPairing:
-        {
-          String serializedRequest;
-          Message::extractToStringView(args, serializedRequest);
-          ProdigyDnsControlPairingOperation operation = {};
-          if (BitseryEngine::deserializeSafe(serializedRequest, operation) == false)
-          {
-            operation = {};
-            operation.failure.assign("invalid DNS control pairing operation"_ctv);
-          }
-          else
-          {
-            (void)manageDnsControlPairing(operation);
-          }
-
-          String serializedResponse;
-          BitseryEngine::serialize(serializedResponse, operation);
-          Message::construct(mothership->wBuffer,
-                             MothershipTopic::manageDnsControlPairing,
-                             serializedResponse);
-          if (serializedResponse.reservedBytes() > 0)
-          {
-            OPENSSL_cleanse(serializedResponse.data(),
-                            serializedResponse.reservedBytes());
-          }
-          OPENSSL_cleanse(&operation.lease.secret,
-                          sizeof(operation.lease.secret));
           break;
         }
       case MothershipTopic::presentACMEDNS01Challenge:

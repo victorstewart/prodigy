@@ -423,7 +423,6 @@ file(GLOB DISCOMBOBULATOR_SOURCE_FILES CONFIGURE_DEPENDS
 set(PRODIGY_DNS_RESOLVER_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-dns-resolver.DiscombobuFile")
 set(PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-dns-resolver.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
 set(PRODIGY_DNS_RESOLVER_DEPLOYMENT_PLAN "${CMAKE_BINARY_DIR}/prodigy-dns-resolver.deployment.plan.v1.json")
-set(PRODIGY_DNS_RESOLVER_CONTROL_PLAN_TEMPLATE "${CMAKE_BINARY_DIR}/prodigy-dns-resolver.control.deployment.plan.v1.template.json")
 configure_file(
    "${PRODIGY_ROOT}/prodigy/dns/DiscombobuFile.in"
    "${PRODIGY_DNS_RESOLVER_DISCOMBOBUFILE}"
@@ -433,11 +432,6 @@ configure_file(
    "${PRODIGY_ROOT}/prodigy/dns/prodigy-dns-resolver.deployment.plan.v1.json.in"
    "${PRODIGY_DNS_RESOLVER_DEPLOYMENT_PLAN}"
    @ONLY
-)
-configure_file(
-   "${PRODIGY_ROOT}/prodigy/dns/prodigy-dns-resolver.control.deployment.plan.v1.json.in"
-   "${PRODIGY_DNS_RESOLVER_CONTROL_PLAN_TEMPLATE}"
-   COPYONLY
 )
 set(PRODIGY_ACME_HOOK_SCRIPTS
    "${PRODIGY_ROOT}/prodigy/acme/acme-present-dns-01"
@@ -548,8 +542,8 @@ add_executable(prodigy_test_cluster_boot_json ${CMAKE_CURRENT_SOURCE_DIR}/tests/
 add_executable(prodigy_bundle_artifact_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_bundle_artifact_unit.cpp)
 add_executable(prodigy_dns_registry_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dns_registry_unit.cpp)
 add_executable(prodigy_dns_resolver_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dns_resolver_unit.cpp)
-add_executable(prodigy_dns_control_leases_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dns_control_leases_unit.cpp)
 add_executable(prodigy_host_http_operation_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_host_http_operation_unit.cpp)
+add_executable(prodigy_host_control_network_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_host_control_network_unit.cpp)
 add_executable(prodigy_host_delay_operation_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_host_delay_operation_unit.cpp)
 add_executable(prodigy_mothership_host_runtime_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_host_runtime_unit.cpp)
 add_executable(prodigy_remote_bootstrap_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_remote_bootstrap_unit.cpp)
@@ -625,8 +619,8 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_bundle_artifact_unit
    prodigy_dns_registry_unit
    prodigy_dns_resolver_unit
-   prodigy_dns_control_leases_unit
    prodigy_host_http_operation_unit
+   prodigy_host_control_network_unit
    prodigy_host_delay_operation_unit
    prodigy_mothership_host_runtime_unit
    prodigy_remote_bootstrap_unit
@@ -718,9 +712,21 @@ foreach(prodigy_target IN LISTS PRODIGY_COMMON_LINK_TARGETS)
    depos_link(${prodigy_target} PRIVATE ${PRODIGY_COMMON_DEPO_TARGETS})
 endforeach()
 depos_link(prodigy_dns_resolver PRIVATE basics::basics)
-depos_link(prodigy_dns_resolver PRIVATE cares::cares)
 depos_link(prodigy_dns_resolver_unit PRIVATE basics::basics)
-depos_link(prodigy_dns_resolver_unit PRIVATE cares::cares)
+set(PRODIGY_CARES_TARGETS
+   prodigy
+   mothership
+   prodigy_dns_resolver
+   prodigy_dns_resolver_unit
+   prodigy_host_control_network_unit
+   prodigy_mothership_host_runtime_unit
+   prodigy_mothership_pricing_unit
+   prodigy_mothership_test_cluster_runner_unit
+   prodigy_mothership_unix_connect_unit
+)
+foreach(prodigy_target IN LISTS PRODIGY_CARES_TARGETS)
+   depos_link(${prodigy_target} PRIVATE cares::cares)
+endforeach()
 depos_link(mothership PRIVATE pthread)
 
 if (NOT TARGET Prodigy::SdkCppOpinionated)
@@ -1019,7 +1025,6 @@ add_custom_command(
            --tool-binary "${PRODIGY_ROOT}/prodigy/acme/acme-import-lineage"
            --container-artifact "${PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT}"
            --container-plan "${PRODIGY_DNS_RESOLVER_DEPLOYMENT_PLAN}"
-           --container-plan "${PRODIGY_DNS_RESOLVER_CONTROL_PLAN_TEMPLATE}"
    DEPENDS prodigy
            mothership
            balancer.ebpf.o
@@ -1037,9 +1042,7 @@ add_custom_command(
            "${PRODIGY_CERTBOT_WHEELHOUSE_OUTPUT}"
            "${PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT}"
            "${PRODIGY_DNS_RESOLVER_DEPLOYMENT_PLAN}"
-           "${PRODIGY_DNS_RESOLVER_CONTROL_PLAN_TEMPLATE}"
            "${PRODIGY_ROOT}/prodigy/dns/prodigy-dns-resolver.deployment.plan.v1.json.in"
-           "${PRODIGY_ROOT}/prodigy/dns/prodigy-dns-resolver.control.deployment.plan.v1.json.in"
            ${PRODIGY_ACME_HOOK_SCRIPTS}
            ${DISCOMBOBULATOR_SOURCE_FILES}
    COMMENT "Packaging ${PRODIGY_BUNDLE_OUTPUT}"
@@ -1520,10 +1523,6 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_dns_resolver_artifact_contract.cmake
    )
    add_test(
-      NAME prodigy_dns_control_service_contract
-      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_dns_control_service_contract.cmake
-   )
-   add_test(
       NAME prodigy_dead_smtp_reporter_hard_cut
       COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_dead_smtp_reporter_hard_cut.cmake
    )
@@ -1572,13 +1571,14 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_dns_resolver_unit
    )
    add_test(
-      NAME prodigy_dns_control_leases_unit
-      COMMAND ${CMAKE_BINARY_DIR}/prodigy_dns_control_leases_unit
-   )
-   add_test(
       NAME prodigy_host_http_operation_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_host_http_operation_unit
    )
+   add_test(
+      NAME prodigy_host_control_network_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_host_control_network_unit
+   )
+   set_tests_properties(prodigy_host_control_network_unit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 10)
    add_test(
       NAME prodigy_host_delay_operation_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_host_delay_operation_unit
