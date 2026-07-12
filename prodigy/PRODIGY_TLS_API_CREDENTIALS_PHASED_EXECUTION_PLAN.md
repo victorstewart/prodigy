@@ -384,7 +384,7 @@
 | Objective | Replace hardcoded credential use with logical-name registry |
 | Duration estimate | 5 to 8 days |
 | Dependencies | Phase 3, Phase 4 |
-| Code areas | `application/application.server.cpp`, `networking/h2nb.client.h`, `application/quic.clientHub.h`, `application/tcp.clientHub.h`, `networking/tls.h` |
+| Code areas | `application/application.server.cpp`, the retired nonblocking H2 client, `application/quic.clientHub.h`, `application/tcp.clientHub.h`, `networking/tls.h` |
 | Tasks | Add app-local credential manager map keyed by name and generation. Feed it from boot bundle and runtime deltas. Replace Telnyx hardcoded bearer with lookup `telnyx_bearer`. Replace inbound TLS file path constants with identity `inbound_server_tls`. Replace APNS path assumptions with identity `apns_client_tls`. |
 | Deliverables | App server consumes credentials by logical name only |
 | Exit criteria | No hardcoded API key literals and no hardcoded TLS identity selection |
@@ -408,7 +408,7 @@
 | Objective | Refresh registered API tokens and client TLS identities live |
 | Duration estimate | 5 to 8 days |
 | Dependencies | Phase 5 |
-| Code areas | `networking/h2nb.client.h`, application operations that construct outbound requests |
+| Code areas | the retired nonblocking H2 client, application operations that construct outbound requests |
 | Tasks | Bind outbound auth header population to credential manager lookup per request. Implement APNS client TLS context refresh path. Add provider-specific adapters for token formats. When `MothershipTopic::upsertApiCredentialSet` updates material, publish runtime push to target containers and verify apply ack. Ensure stale in-flight requests complete with previous generation safely. |
 | Deliverables | Outbound auth and outbound TLS refresh without restart |
 | Exit criteria | Telnyx and APNS credential rollovers succeed in live canary |
