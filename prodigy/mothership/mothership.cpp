@@ -9674,6 +9674,15 @@ private:
               }
             }
           }
+          else if (subkey.equal("rootFilesystemReadOnly"_ctv) || subkey.equal("runAsID"_ctv))
+          {
+            String failure = {};
+            if (mothershipParseApplicationIsolationField(subkey, subfield.value, plan.config, "config"_ctv, &failure) == false)
+            {
+              basics_log("%s\n", failure.c_str());
+              exit(EXIT_FAILURE);
+            }
+          }
           else if (subkey.equal("allowedMachineTypes"_ctv))
           {
             basics_log("config.allowedMachineTypes removed; scheduling is resource-based\n");

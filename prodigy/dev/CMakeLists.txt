@@ -543,6 +543,7 @@ add_executable(prodigy_mothership_pricing_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests
 add_executable(prodigy_provider_rack_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_provider_rack_unit.cpp ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES})
 add_executable(prodigy_provider_elastic_address_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_provider_elastic_address_unit.cpp ${PRODIGY_IAAS_PRICING_PROVIDER_SOURCES})
 add_executable(prodigy_machine_hardware_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_machine_hardware_unit.cpp)
+add_executable(prodigy_machine_fragment_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_machine_fragment_unit.cpp)
 add_executable(prodigy_test_cluster_boot_json ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_test_cluster_boot_json.cpp)
 add_executable(prodigy_bundle_artifact_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_bundle_artifact_unit.cpp)
 add_executable(prodigy_dns_registry_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dns_registry_unit.cpp)
@@ -619,6 +620,7 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_provider_rack_unit
    prodigy_provider_elastic_address_unit
    prodigy_machine_hardware_unit
+   prodigy_machine_fragment_unit
    prodigy_test_cluster_boot_json
    prodigy_bundle_artifact_unit
    prodigy_dns_registry_unit
@@ -839,6 +841,7 @@ target_compile_options(prodigy_mothership_pricing_unit PUBLIC -O0 -fno-lto)
 target_compile_options(prodigy_provider_rack_unit PUBLIC -O0 -fno-lto)
 target_compile_options(prodigy_provider_elastic_address_unit PUBLIC -O0 -fno-lto)
 target_compile_options(prodigy_machine_hardware_unit PUBLIC -O2)
+target_compile_options(prodigy_machine_fragment_unit PUBLIC -O2)
 target_compile_options(prodigy_test_cluster_boot_json PUBLIC -O2)
 target_compile_options(prodigy_bundle_artifact_unit PUBLIC -O2)
 target_compile_options(prodigy_remote_bootstrap_unit PUBLIC -O2)
@@ -1720,6 +1723,11 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    add_test(
       NAME prodigy_machine_hardware_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_machine_hardware_unit
+   )
+
+   add_test(
+      NAME prodigy_machine_fragment_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_machine_fragment_unit
    )
 
    add_test(

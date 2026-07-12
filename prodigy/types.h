@@ -3151,6 +3151,8 @@ public:
   TaskExecutionPolicy taskExecutionPolicy = TaskExecutionPolicy::runOnce;
 
   bytell_hash_set<int> capabilities;
+  bool rootFilesystemReadOnly = false;
+  uint16_t runAsID = 0;
 
   static uint16_t extractApplicationID(uint64_t deploymentID)
   {
@@ -3269,6 +3271,8 @@ static void serialize(S&& serializer, ApplicationConfig& config)
   serializer.value8b(config.config_version);
   serializer.value8b(config.type);
   serializer.object(config.capabilities);
+  serializer.value1b(config.rootFilesystemReadOnly);
+  serializer.value2b(config.runAsID);
   serializer.value2b(config.applicationID);
   serializer.value8b(config.versionID);
   serializer.value1b(config.architecture);

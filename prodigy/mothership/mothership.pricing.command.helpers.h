@@ -396,6 +396,13 @@ static inline bool mothershipParsePricingPlanningApplicationConfigJSON(
         return false;
       }
     }
+    else if (key.equal("rootFilesystemReadOnly"_ctv) || key.equal("runAsID"_ctv))
+    {
+      if (mothershipParseApplicationIsolationField(key, field.value, config, "applications[].config"_ctv, failure) == false)
+      {
+        return false;
+      }
+    }
     else
     {
       String sizeFailure = {};

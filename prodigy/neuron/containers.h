@@ -1,6 +1,7 @@
 #pragma once
 
 #include <fcntl.h> /* Definition of O_* and S_* constants */
+#include <grp.h>
 #include <services/debug.h>
 #include <linux/sched.h> /* Definition of struct clone_args */
 #include <sched.h> /* Definition of CLONE_* constants */
@@ -698,6 +699,14 @@ static void enableWhiteholeNonlocalBind(const ContainerPlan& plan)
   }
 }
 
+static bool prodigyDeriveContainerHostIDs(const ContainerPlan& plan, uint32_t& userID, uint32_t& executionHostID)
+{
+  userID = 65'535 * uint32_t(plan.fragment);
+  executionHostID = userID + plan.config.runAsID;
+  return plan.fragment != 0 && userID != 0 && plan.config.runAsID != UINT16_MAX &&
+         (plan.config.runAsID == 0 || plan.config.capabilities.empty());
+}
+
 class Container : public UnixStream, public WaitableProcess {
 public:
 
@@ -730,6 +739,7 @@ public:
   int cgroup = -1;
   Vector<int> isolatedChildCgroups;
   uint32_t userID = 0;
+  uint32_t executionHostID = 0;
   bool killedOnPurpose = false;
   bool pendingKillAckToBrain = false;
   bool pendingDestroy = false;
@@ -5618,8 +5628,8 @@ private:
 
   static bool prepareContainerRootFSMountTargets(Container *container, int rootfd, String *failureReport = nullptr)
   {
-    uid_t userID = container ? uid_t(container->userID) : 0;
-    gid_t groupID = container ? gid_t(container->userID) : 0;
+    uid_t userID = container ? uid_t(container->executionHostID) : 0;
+    gid_t groupID = container ? gid_t(container->executionHostID) : 0;
 
     int devFD = -1;
     if (openContainerDirectoryTreeAt(rootfd, "dev"_ctv, true, S_IRWXU, devFD, failureReport) == false)
@@ -5647,8 +5657,17 @@ private:
     close(procFD);
 
     int etcFD = -1;
-    if (openContainerDirectoryTreeAt(rootfd, "etc"_ctv, true, S_IRWXU, etcFD, failureReport) == false)
+    if (openContainerDirectoryTreeAt(rootfd, "etc"_ctv, true, 0755, etcFD, failureReport) == false)
     {
+      return false;
+    }
+    if (fchmod(etcFD, 0755) != 0)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to set container /etc mode errno={}({})"_ctv>(errno, String(strerror(errno)));
+      }
+      close(etcFD);
       return false;
     }
     if (assignContainerDescriptorOwnership(etcFD, userID, groupID, failureReport) == false)
@@ -6410,12 +6429,12 @@ public:
     {
       Filesystem::createDirectoryAt(-1, "/containers/storage"_ctv);
       Filesystem::createDirectoryAt(-1, container->storageRootPath);
-      if (chown(container->storageRootPath.c_str(), uid_t(container->userID), gid_t(container->userID)) != 0)
+      if (chown(container->storageRootPath.c_str(), uid_t(container->executionHostID), gid_t(container->executionHostID)) != 0)
       {
-        basics_log("createContainer storage chown failed uuid=%llu path=%s userID=%u errno=%d(%s)\n",
+        basics_log("createContainer storage chown failed uuid=%llu path=%s executionHostID=%u errno=%d(%s)\n",
                    (unsigned long long)container->plan.uuid,
                    container->storageRootPath.c_str(),
-                   unsigned(container->userID),
+                   unsigned(container->executionHostID),
                    errno,
                    strerror(errno));
       }
@@ -6455,12 +6474,12 @@ public:
       return false;
     }
 
-    if (chown(container->storagePayloadPath.c_str(), uid_t(container->userID), gid_t(container->userID)) != 0)
+    if (chown(container->storagePayloadPath.c_str(), uid_t(container->executionHostID), gid_t(container->executionHostID)) != 0)
     {
-      basics_log("createContainer loop storage chown failed uuid=%llu path=%s userID=%u errno=%d(%s)\n",
+      basics_log("createContainer loop storage chown failed uuid=%llu path=%s executionHostID=%u errno=%d(%s)\n",
                  (unsigned long long)container->plan.uuid,
                  container->storagePayloadPath.c_str(),
-                 unsigned(container->userID),
+                 unsigned(container->executionHostID),
                  errno,
                  strerror(errno));
     }
@@ -6969,8 +6988,8 @@ public:
             Filesystem::openWriteAtClose(child, "cpu.max"_ctv, "100000 100000"_ctv) != 13 ||
             fchownat(child,
                      "cgroup.procs",
-                     container->userID,
-                     container->userID,
+                     container->executionHostID,
+                     container->executionHostID,
                      0) != 0)
         {
           if (child >= 0)
@@ -7484,6 +7503,17 @@ public:
 
   static void createContainer(ContainerPlan& plan, const String& compressedContainerPath, Container *& container)
   {
+    container = nullptr;
+    uint32_t userID = 0;
+    uint32_t executionHostID = 0;
+    if (prodigyDeriveContainerHostIDs(plan, userID, executionHostID) == false)
+    {
+      basics_log("createContainer rejected deploymentID=%llu appID=%u reason=invalid user namespace mapping\n",
+                 (unsigned long long)plan.config.deploymentID(),
+                 unsigned(plan.config.applicationID));
+      return;
+    }
+
     if (plan.config.applicationID == 11)
     {
       basics_log("createContainer stage=begin deploymentID=%llu appID=%u compressed=%.*s\n",
@@ -7496,7 +7526,8 @@ public:
     container = new Container();
     container->plan = plan;
     container->name.assignItoa(plan.uuid);
-    container->userID = 65'535 * uint32_t(container->plan.fragment);
+    container->userID = userID;
+    container->executionHostID = executionHostID;
     container->rBuffer.reserve(8_KB);
     container->wBuffer.reserve(16_KB);
     if (container->plan.usesIsolatedCPUs())
@@ -8139,6 +8170,19 @@ public:
 
   static bool mapIDs(Container *container, String *failureReport = nullptr)
   {
+    uint32_t userID = 0;
+    uint32_t executionHostID = 0;
+    if (container == nullptr ||
+        prodigyDeriveContainerHostIDs(container->plan, userID, executionHostID) == false ||
+        container->userID != userID || container->executionHostID != executionHostID)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("refusing zero container user namespace mapping"_ctv);
+      }
+      return false;
+    }
+
     String path;
     String idWrite;
     // posix says the minimum number of userids should be 65535
@@ -8211,6 +8255,8 @@ public:
     String path2;
     String containerRoot;
     bool useIDMapMounts = (idMapPID > 0);
+    const uint64_t rootMountAttributes = MOUNT_ATTR_NOSUID |
+                                         (container->plan.config.rootFilesystemReadOnly ? MOUNT_ATTR_RDONLY : 0);
     containerRoot.assign(container->rootfsPath);
 
     int containersAccess = access("/containers", F_OK);
@@ -8266,12 +8312,12 @@ public:
 
     // this mount has to be first otherwise the others screw up the id mapping
     path.assign(containerRoot);
-    if (mount2(path, path, MOUNT_ATTR_IDMAP | MOUNT_ATTR_NOSUID, idMapPID) != 0)
+    if (mount2(path, path, MOUNT_ATTR_IDMAP | rootMountAttributes, idMapPID) != 0)
     {
       int idmapErrno = errno;
       if (idmapErrno == EPERM || idmapErrno == EOPNOTSUPP || idmapErrno == EINVAL)
       {
-        if (mount2(path, path, MOUNT_ATTR_NOSUID) != 0)
+        if (mount2(path, path, rootMountAttributes) != 0)
         {
           int fallbackErrno = errno;
           String idmapFailure = {};
@@ -8477,14 +8523,14 @@ public:
     return true;
   }
 
-  static bool restrictToCapabilities(Container *container, String *failureReport = nullptr)
+  static bool restrictCapabilityBounds(Container *container, String *failureReport = nullptr)
   {
     cap_iab_t iab_caps = cap_iab_init();
     if (iab_caps == nullptr)
     {
       if (failureReport)
       {
-        failureReport->snprintf<"restrictToCapabilities cap_iab_init failed for container {itoa}: {}"_ctv>(
+        failureReport->snprintf<"restrictCapabilityBounds cap_iab_init failed for container {itoa}: {}"_ctv>(
             container->plan.uuid,
             String(strerror(errno)));
       }
@@ -8502,7 +8548,7 @@ public:
       {
         if (failureReport)
         {
-          failureReport->snprintf<"restrictToCapabilities failed to bound capability {itoa} for container {itoa}: {}"_ctv>(
+          failureReport->snprintf<"restrictCapabilityBounds failed to bound capability {itoa} for container {itoa}: {}"_ctv>(
               uint32_t(index),
               container->plan.uuid,
               String(strerror(errno)));
@@ -8518,7 +8564,7 @@ public:
       {
         if (failureReport)
         {
-          failureReport->snprintf<"restrictToCapabilities failed to allow ambient capability {itoa} for container {itoa}: {}"_ctv>(
+          failureReport->snprintf<"restrictCapabilityBounds failed to allow ambient capability {itoa} for container {itoa}: {}"_ctv>(
               uint32_t(capability),
               container->plan.uuid,
               String(strerror(errno)));
@@ -8532,7 +8578,7 @@ public:
     {
       if (failureReport)
       {
-        failureReport->snprintf<"restrictToCapabilities cap_iab_set_proc failed for container {itoa}: {}"_ctv>(
+        failureReport->snprintf<"restrictCapabilityBounds cap_iab_set_proc failed for container {itoa}: {}"_ctv>(
             container->plan.uuid,
             String(strerror(errno)));
       }
@@ -8540,13 +8586,17 @@ public:
       return false;
     }
     cap_free(iab_caps);
+    return true;
+  }
 
+  static bool applyConfiguredCapabilities(Container *container, String *failureReport = nullptr)
+  {
     cap_t procCaps = cap_init();
     if (procCaps == nullptr)
     {
       if (failureReport)
       {
-        failureReport->snprintf<"restrictToCapabilities cap_init failed for container {itoa}: {}"_ctv>(
+        failureReport->snprintf<"applyConfiguredCapabilities cap_init failed for container {itoa}: {}"_ctv>(
             container->plan.uuid,
             String(strerror(errno)));
       }
@@ -8560,7 +8610,7 @@ public:
       {
         if (failureReport)
         {
-          failureReport->snprintf<"restrictToCapabilities failed to configure process capability {itoa} for container {itoa}: {}"_ctv>(
+          failureReport->snprintf<"applyConfiguredCapabilities failed to configure process capability {itoa} for container {itoa}: {}"_ctv>(
               uint32_t(capability),
               container->plan.uuid,
               String(strerror(errno)));
@@ -8574,7 +8624,7 @@ public:
     {
       if (failureReport)
       {
-        failureReport->snprintf<"restrictToCapabilities cap_set_proc failed for container {itoa}: {}"_ctv>(
+        failureReport->snprintf<"applyConfiguredCapabilities cap_set_proc failed for container {itoa}: {}"_ctv>(
             container->plan.uuid,
             String(strerror(errno)));
       }
@@ -8584,6 +8634,71 @@ public:
 
     cap_free(procCaps);
     return true;
+  }
+
+  static bool dropToApplicationIdentity(Container *container, String *failureReport = nullptr)
+  {
+    const uid_t id = container->plan.config.runAsID;
+    if (id == 0 || container->plan.config.capabilities.empty() == false ||
+        setresgid(id, id, id) != 0 || setresuid(id, id, id) != 0)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to drop container {itoa} to uid/gid {itoa}: {}"_ctv>(
+            container->plan.uuid, uint32_t(id), String(strerror(errno)));
+      }
+      return false;
+    }
+
+    uid_t realUID = 0;
+    uid_t effectiveUID = 0;
+    uid_t savedUID = 0;
+    gid_t realGID = 0;
+    gid_t effectiveGID = 0;
+    gid_t savedGID = 0;
+    if (getgroups(0, nullptr) != 0 ||
+        getresgid(&realGID, &effectiveGID, &savedGID) != 0 ||
+        getresuid(&realUID, &effectiveUID, &savedUID) != 0 ||
+        realUID != id || effectiveUID != id || savedUID != id ||
+        realGID != id || effectiveGID != id || savedGID != id)
+    {
+      if (failureReport && failureReport->size() == 0)
+      {
+        failureReport->snprintf<"container {itoa} identity drop verification failed"_ctv>(container->plan.uuid);
+      }
+      return false;
+    }
+
+    cap_t capabilities = cap_get_proc();
+    if (capabilities == nullptr)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"container {itoa} capability verification failed: {}"_ctv>(
+            container->plan.uuid, String(strerror(errno)));
+      }
+      return false;
+    }
+
+    bool empty = true;
+    for (int capability = 0; capability < cap_max_bits() && empty; ++capability)
+    {
+      for (cap_flag_t flag : {CAP_EFFECTIVE, CAP_PERMITTED, CAP_INHERITABLE})
+      {
+        cap_flag_value_t value = CAP_CLEAR;
+        if (cap_get_flag(capabilities, cap_value_t(capability), flag, &value) != 0 || value != CAP_CLEAR)
+        {
+          empty = false;
+          break;
+        }
+      }
+    }
+    cap_free(capabilities);
+    if (empty == false && failureReport)
+    {
+      failureReport->snprintf<"container {itoa} retained capabilities after identity drop"_ctv>(container->plan.uuid);
+    }
+    return empty;
   }
 
 public:
@@ -8748,7 +8863,10 @@ private:
 
   static bool applyContainerPostMountExecutionSecurityPolicy(Container *container, String *failureReport = nullptr, scmp_filter_ctx prebuiltSeccomp = nullptr)
   {
-    if (restrictToCapabilities(container, failureReport) == false)
+    if (restrictCapabilityBounds(container, failureReport) == false ||
+        (container->plan.config.runAsID != 0
+             ? dropToApplicationIdentity(container, failureReport)
+             : applyConfiguredCapabilities(container, failureReport)) == false)
     {
       return false;
     }
@@ -8873,11 +8991,11 @@ public:
     logStartStage(exposeNeuronSocket ? "socketpair-ready" : "socketpair-skipped");
 
     int startupSync[2];
-    if (pipe2(startupSync, O_CLOEXEC) != 0)
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, startupSync) != 0)
     {
       if (failureReport)
       {
-        failureReport->snprintf<"pipe2(startupSync) failed for container {itoa}: {}"_ctv>(container->plan.uuid, String(strerror(errno)));
+        failureReport->snprintf<"socketpair(startupSync) failed for container {itoa}: {}"_ctv>(container->plan.uuid, String(strerror(errno)));
       }
       closeNeuronSocketPair();
       return false;
@@ -8998,6 +9116,15 @@ public:
         failStartup("close privileged fds failed", &privilegedFDCloseFailure);
       }
 
+      const uint8_t groupsCleared = 1;
+      if (setgroups(0, nullptr) != 0 || getgroups(0, nullptr) != 0 ||
+          write(startupSync[0], &groupsCleared, sizeof(groupsCleared)) != ssize_t(sizeof(groupsCleared)))
+      {
+        String groupsFailure = {};
+        groupsFailure.snprintf<"failed to clear supplementary groups errno={}({})"_ctv>(errno, String(strerror(errno)));
+        failStartup("supplementary group handshake failed", &groupsFailure);
+      }
+
       StartupSyncPayload startupPayload;
       ssize_t startupRead = read(startupSync[0], &startupPayload, sizeof(startupPayload));
       close(startupSync[0]);
@@ -9014,8 +9141,22 @@ public:
         failStartup("startup sync failed", &startupFailure);
       }
 
-      setuid(0);
-      setgid(0);
+      gid_t realGID = -1;
+      gid_t effectiveGID = -1;
+      gid_t savedGID = -1;
+      uid_t realUID = -1;
+      uid_t effectiveUID = -1;
+      uid_t savedUID = -1;
+      if (setresgid(0, 0, 0) != 0 || setresuid(0, 0, 0) != 0 ||
+          getresgid(&realGID, &effectiveGID, &savedGID) != 0 ||
+          getresuid(&realUID, &effectiveUID, &savedUID) != 0 ||
+          realGID != 0 || effectiveGID != 0 || savedGID != 0 ||
+          realUID != 0 || effectiveUID != 0 || savedUID != 0)
+      {
+        String identityFailure = {};
+        identityFailure.snprintf<"failed to establish namespace root errno={}({})"_ctv>(errno, String(strerror(errno)));
+        failStartup("namespace root setup failed", &identityFailure);
+      }
 
       String noNewPrivsFailure = {};
       if (setContainerNoNewPrivileges(container, &noNewPrivsFailure) == false)
@@ -9374,6 +9515,27 @@ public:
       {
         close(socs[1]);
       }
+      uint8_t groupsCleared = 0;
+      if (read(startupSync[1], &groupsCleared, sizeof(groupsCleared)) != ssize_t(sizeof(groupsCleared)) || groupsCleared != 1)
+      {
+        if (failureReport)
+        {
+          failureReport->snprintf<"supplementary group handshake failed for container {itoa}"_ctv>(container->plan.uuid);
+        }
+        close(startupSync[1]);
+        if (socs[0] >= 0)
+        {
+          close(socs[0]);
+        }
+        kill(container->pid, SIGKILL);
+        waitpid(container->pid, nullptr, 0);
+        if (container->pidfd > 0)
+        {
+          close(container->pidfd);
+          container->pidfd = -1;
+        }
+        return false;
+      }
       if (useUserNamespace && mapIDs(container, failureReport) == false)
       {
         close(startupSync[1]);
@@ -9578,6 +9740,7 @@ public:
         CoroutineStack *coro = new CoroutineStack();
 
         Container *old = it->second;
+        const bool hasStorage = old->plan.config.storageMB > 0;
         old->deleteStorageOnCleanUp = false;
         old->resumeAfterShutdown = coro;
         old->stop();
@@ -9586,7 +9749,10 @@ public:
 
         delete coro;
 
-        renameContainerStorageArtifacts(replaceContainerUUID, plan.uuid);
+        if (hasStorage)
+        {
+          renameContainerStorageArtifacts(replaceContainerUUID, plan.uuid);
+        }
       }
     }
 

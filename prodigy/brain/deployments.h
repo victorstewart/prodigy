@@ -8639,6 +8639,11 @@ public:
             container->remainingSubscriberCapacity = plan.minimumSubscriberCapacity;
 
             container->fragment = machine->getContainerFragment();
+            if (container->fragment == 0)
+            {
+              basics_log("container fragment allocation returned reserved fragment zero\n");
+              exit(EXIT_FAILURE);
+            }
             container->setMeshAddress(container_network_subnet6, thisBrain->brainConfig.datacenterFragment, machine->fragment, container->fragment);
             container->addresses.clear();
             container->addresses.emplace_back(container->meshAddress, uint8_t(128));

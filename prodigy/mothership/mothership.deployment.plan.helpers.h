@@ -613,6 +613,24 @@ static inline bool mothershipValidateApplicationRuntimeRequirements(
     return false;
   }
 
+  if (config.runAsID == UINT16_MAX)
+  {
+    if (failure)
+    {
+      failure->snprintf<"{}.runAsID must be between 0 and 65534"_ctv>(contextPrefix);
+    }
+    return false;
+  }
+
+  if (config.runAsID != 0 && config.capabilities.empty() == false)
+  {
+    if (failure)
+    {
+      failure->snprintf<"{}.runAsID requires an empty capability set"_ctv>(contextPrefix);
+    }
+    return false;
+  }
+
   if (config.isolatedChildMemoryMB != 0 &&
       (config.maxPids < 2 ||
        config.maxPids - 1 > prodigyContainerRuntimeLimits.maxIsolatedChildCgroups))
@@ -684,6 +702,49 @@ static inline bool mothershipParseJSONUInt32(
   }
 
   parsed = uint32_t(valueU64);
+  return true;
+}
+
+static inline bool mothershipParseApplicationIsolationField(
+    const String& key,
+    const simdjson::dom::element& value,
+    ApplicationConfig& config,
+    const String& contextPrefix,
+    String *failure = nullptr)
+{
+  if (key.equal("rootFilesystemReadOnly"_ctv))
+  {
+    if (value.type() != simdjson::dom::element_type::BOOL || value.get(config.rootFilesystemReadOnly) != simdjson::SUCCESS)
+    {
+      if (failure)
+      {
+        failure->snprintf<"{}.rootFilesystemReadOnly requires a bool"_ctv>(contextPrefix);
+      }
+      return false;
+    }
+  }
+  else if (key.equal("runAsID"_ctv))
+  {
+    uint32_t runAsID = 0;
+    if (mothershipParseJSONUInt32(value, runAsID, true) == false || runAsID > 65'534)
+    {
+      if (failure)
+      {
+        failure->snprintf<"{}.runAsID must be between 0 and 65534"_ctv>(contextPrefix);
+      }
+      return false;
+    }
+    config.runAsID = uint16_t(runAsID);
+  }
+  else
+  {
+    return false;
+  }
+
+  if (failure)
+  {
+    failure->clear();
+  }
   return true;
 }
 
@@ -888,7 +949,8 @@ static inline bool mothershipParseApplicationConfigSizeField(
   }
 
   uint32_t parsedMB = 0;
-  if ((gb ? mothershipParseJSONSizeGBToMB(value, parsedMB, false) : mothershipParseJSONUInt32(value, parsedMB, false)) == false || parsedMB > maxMB)
+  const bool allowZero = field == MothershipApplicationConfigSizeField::storage;
+  if ((gb ? mothershipParseJSONSizeGBToMB(value, parsedMB, allowZero) : mothershipParseJSONUInt32(value, parsedMB, allowZero)) == false || parsedMB > maxMB)
   {
     if (failure)
     {

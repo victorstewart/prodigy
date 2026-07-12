@@ -3473,13 +3473,22 @@ public:
               }
             }
 
+            uint32_t userID = 0;
+            uint32_t executionHostID = 0;
+            if (prodigyDeriveContainerHostIDs(restoredPlan, userID, executionHostID) == false)
+            {
+              malformedStateUpload = true;
+              break;
+            }
+
             Container *container = new Container();
             container->plan = std::move(restoredPlan);
             container->neuronScalingDimensionsMask = metricPolicy.scalingDimensionsMask;
             container->neuronMetricsCadenceMs = metricPolicy.metricsCadenceMs;
 
             container->name.assignItoa(container->plan.uuid);
-            container->userID = 65'535 * container->plan.fragment;
+            container->userID = userID;
+            container->executionHostID = executionHostID;
 
             String output;
             String path;

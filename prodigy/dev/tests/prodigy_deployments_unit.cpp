@@ -3241,6 +3241,8 @@ int main(void)
     plan.config.applicationID = 42;
     plan.config.versionID = 9;
     plan.config.type = ApplicationType::stateful;
+    plan.config.rootFilesystemReadOnly = true;
+    plan.config.runAsID = 65'534;
     plan.config.containerBlobSHA256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv;
     plan.config.containerBlobBytes = 4096;
     plan.minimumSubscriberCapacity = 11;
@@ -3291,6 +3293,8 @@ int main(void)
 
     suite.expect(decoded, "deployment_plan_roundtrip_deserializes");
     suite.expect(roundtrip.config.config_version == 77, "deployment_plan_roundtrip_preserves_config_version");
+    suite.expect(roundtrip.config.rootFilesystemReadOnly, "deployment_plan_roundtrip_preserves_read_only_root");
+    suite.expect(roundtrip.config.runAsID == 65'534, "deployment_plan_roundtrip_preserves_run_as_id");
     suite.expect(roundtrip.config.minGPUs == 2, "deployment_plan_roundtrip_preserves_min_gpus");
     suite.expect(roundtrip.config.gpuMemoryGB == 24, "deployment_plan_roundtrip_preserves_gpu_memory_gb");
     suite.expect(roundtrip.config.nicSpeedGbps == 10, "deployment_plan_roundtrip_preserves_nic_speed_gbps");
@@ -6270,6 +6274,43 @@ int main(void)
     suite.expect(config.memoryMB == 2u * 1024u, "mothership_parse_application_size_fields_memory_gb_to_mb");
     suite.expect(config.filesystemMB == 512u, "mothership_parse_application_size_fields_filesystem_mb_preserved");
     suite.expect(config.storageMB == 10u * 1024u, "mothership_parse_application_size_fields_storage_gb_to_mb");
+  }
+
+  {
+    ApplicationConfig config = {};
+    String json = "{\"rootFilesystemReadOnly\":true,\"runAsID\":65534,\"storageMB\":0}"_ctv;
+    json.need(simdjson::SIMDJSON_PADDING);
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    uint32_t seenMask = 0;
+    bool parsedAll = parser.parse(json.data(), json.size()).get(doc) == simdjson::SUCCESS;
+    String failure = {};
+    if (parsedAll)
+    {
+      for (auto field : doc.get_object())
+      {
+        String key = {};
+        key.setInvariant(field.key);
+        if (mothershipParseApplicationIsolationField(key, field.value, config, "config"_ctv, &failure) == false &&
+            mothershipParseApplicationConfigSizeField(key, field.value, config, seenMask, "config"_ctv, &failure) == false)
+        {
+          parsedAll = false;
+          break;
+        }
+      }
+    }
+    suite.expect(parsedAll, "mothership_parse_application_isolation_and_zero_storage");
+    suite.expect(config.rootFilesystemReadOnly && config.runAsID == 65'534 && config.storageMB == 0,
+                 "mothership_parse_application_isolation_values");
+
+    config.architecture = MachineCpuArchitecture::x86_64;
+    config.capabilities.insert(CAP_NET_BIND_SERVICE);
+    suite.expect(mothershipValidateApplicationRuntimeRequirements(config, "config"_ctv, &failure) == false,
+                 "mothership_validate_run_as_rejects_capabilities");
+    config.capabilities.clear();
+    config.runAsID = UINT16_MAX;
+    suite.expect(mothershipValidateApplicationRuntimeRequirements(config, "config"_ctv, &failure) == false,
+                 "mothership_validate_run_as_rejects_65535");
   }
 
   {

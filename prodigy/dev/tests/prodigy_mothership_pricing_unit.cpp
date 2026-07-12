@@ -491,7 +491,7 @@ int main(void)
     simdjson::dom::parser parser;
     simdjson::dom::element doc;
     String json = {};
-    suite.expect(parseJSON("{\"architecture\":\"x86_64\",\"nLogicalCores\":2,\"memoryGB\":2,\"filesystemMB\":512,\"storageGB\":10}", json, doc, parser), "pricing_application_config_gb_json");
+    suite.expect(parseJSON("{\"architecture\":\"x86_64\",\"nLogicalCores\":2,\"memoryGB\":2,\"filesystemMB\":512,\"storageMB\":0,\"rootFilesystemReadOnly\":true,\"runAsID\":65534}", json, doc, parser), "pricing_application_config_gb_json");
 
     ApplicationConfig config = {};
     String failure = {};
@@ -502,7 +502,9 @@ int main(void)
     suite.expect(config.sharedCPUMillis == 0u, "pricing_application_config_integer_cpu_clears_shared_millis");
     suite.expect(config.memoryMB == 2u * 1024u, "pricing_application_config_memory_gb_to_mb");
     suite.expect(config.filesystemMB == 512u, "pricing_application_config_filesystem_mb_preserved");
-    suite.expect(config.storageMB == 10u * 1024u, "pricing_application_config_storage_gb_to_mb");
+    suite.expect(config.storageMB == 0, "pricing_application_config_accepts_zero_storage");
+    suite.expect(config.rootFilesystemReadOnly, "pricing_application_config_read_only_root");
+    suite.expect(config.runAsID == 65'534, "pricing_application_config_run_as_id");
   }
 
   {

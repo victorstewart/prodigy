@@ -332,6 +332,13 @@ public:
   bool runtimeReady = false;
   bytell_hash_set<uint32_t> usedContainerFragments;
 
+  bool containerFragmentAvailable(uint8_t fragment) const
+  {
+    return fragment != 0 &&
+           fragment != prodigyMothershipTunnelProviderRuntimeFragment &&
+           usedContainerFragments.contains(fragment) == false;
+  }
+
   uint8_t getContainerFragment(void)
   {
     uint8_t fragment = 0;
@@ -340,7 +347,7 @@ public:
     {
       fragment = Random::generateNumberWithNBits<8, uint8_t>();
 
-    } while (fragment == prodigyMothershipTunnelProviderRuntimeFragment || usedContainerFragments.contains(fragment));
+    } while (containerFragmentAvailable(fragment) == false);
 
     usedContainerFragments.insert(fragment);
 
