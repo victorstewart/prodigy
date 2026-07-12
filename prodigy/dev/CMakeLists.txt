@@ -1515,6 +1515,10 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_declared_network_policy_contract.cmake
    )
    add_test(
+      NAME prodigy_dependency_materialization_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_dependency_materialization_contract.cmake
+   )
+   add_test(
       NAME prodigy_container_cgroup_bounds_contract
       COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_container_cgroup_bounds_contract.cmake
    )
