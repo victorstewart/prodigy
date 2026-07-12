@@ -1192,8 +1192,9 @@ static bool deserializeCredentialApplyAck(const String& input, CredentialApplyAc
 
 static bool serializeContainerParameters(String& output, const ContainerParameters& parameters)
 {
-  if (parameters.advertisesOnPorts.size() > std::numeric_limits<uint32_t>::max() ||
-      parameters.flags.size() > std::numeric_limits<uint32_t>::max())
+   if (parameters.advertisesOnPorts.size() > std::numeric_limits<uint32_t>::max() ||
+      parameters.flags.size() > std::numeric_limits<uint32_t>::max() ||
+      parameters.isolatedChildCgroups.size() > 64)
   {
     return false;
   }
@@ -1213,6 +1214,11 @@ static bool serializeContainerParameters(String& output, const ContainerParamete
   writer.u32(parameters.memoryMB);
   writer.u32(parameters.storageMB);
   writer.u16(parameters.nLogicalCores);
+  writer.u8(uint8_t(parameters.isolatedChildCgroups.size()));
+  for (int32_t fd : parameters.isolatedChildCgroups)
+  {
+    writer.i32(fd);
+  }
   writer.i32(parameters.neuronFD);
   writer.i32(parameters.lowCPU);
   writer.i32(parameters.highCPU);
@@ -1285,6 +1291,24 @@ static bool deserializeContainerParameters(const String& input, ContainerParamet
         reader.u32(decoded.memoryMB) == false ||
         reader.u32(decoded.storageMB) == false ||
         reader.u16(decoded.nLogicalCores) == false ||
+        [&]() {
+          uint8_t count = 0;
+          if (reader.u8(count) == false || count > 64)
+          {
+            return false;
+          }
+          decoded.isolatedChildCgroups.reserve(count);
+          for (uint8_t index = 0; index < count; index += 1)
+          {
+            int32_t fd = -1;
+            if (reader.i32(fd) == false || fd < 3)
+            {
+              return false;
+            }
+            decoded.isolatedChildCgroups.push_back(fd);
+          }
+          return true;
+        }() == false ||
         reader.i32(decoded.neuronFD) == false ||
         reader.i32(decoded.lowCPU) == false ||
         reader.i32(decoded.highCPU) == false)

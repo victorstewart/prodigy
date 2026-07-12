@@ -770,6 +770,11 @@ int main(void)
   invalidRemoteGcpPropagation.name = "managed-gcp-propagation-invalid"_ctv;
   invalidRemoteGcpPropagation.propagateProviderCredentialToProdigy = true;
 
+  MothershipProdigyCluster invalidRemoteGcpSharedTemplate = remoteManagedGcp;
+  invalidRemoteGcpSharedTemplate.name = "managed-gcp-shared-template-invalid"_ctv;
+  invalidRemoteGcpSharedTemplate.machineSchemas[0].gcpInstanceTemplate = "shared-template"_ctv;
+  invalidRemoteGcpSharedTemplate.machineSchemas[1].gcpInstanceTemplateSpot = "shared-template"_ctv;
+
   MothershipProdigyCluster invalidNonGcpWithGcpConfig = remoteCreated;
   invalidNonGcpWithGcpConfig.name = "managed-aws-with-gcp-config"_ctv;
   invalidNonGcpWithGcpConfig.gcp.serviceAccountEmail = "prodigy-brain@prod-cluster.iam.gserviceaccount.com"_ctv;
@@ -1168,6 +1173,10 @@ int main(void)
     bool createRemoteGcpPropagation = registry.createCluster(invalidRemoteGcpPropagation, nullptr, &failure);
     suite.expect(createRemoteGcpPropagation == false, "create_remote_gcp_propagation_rejected");
     suite.expect(failure.equals("gcp remote clusters must not propagate provider credentials to Prodigy"_ctv), "create_remote_gcp_propagation_reason");
+
+    bool createRemoteGcpSharedTemplate = registry.createCluster(invalidRemoteGcpSharedTemplate, nullptr, &failure);
+    suite.expect(createRemoteGcpSharedTemplate == false, "create_remote_gcp_shared_template_rejected");
+    suite.expect(failure.equals("gcp standard and spot machineSchemas require distinct template names"_ctv), "create_remote_gcp_shared_template_reason");
 
     bool createNonGcpWithGcpConfig = registry.createCluster(invalidNonGcpWithGcpConfig, nullptr, &failure);
     suite.expect(createNonGcpWithGcpConfig == false, "create_non_gcp_with_gcp_config_rejected");

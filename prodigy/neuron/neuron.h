@@ -1784,7 +1784,17 @@ protected:
             continue;
           }
 
-          container->plan.applyAdvertisementPairing(AdvertisementPairing(secret, address, service), activate);
+          if (container->plan.applyAdvertisementPairing(AdvertisementPairing(secret, address, service), activate) &&
+              container->syncDeclaredNetworkPairingPolicy() == false)
+          {
+            basics_log("neuron advertisementPairing network policy sync failed containerUUID=%llu\n",
+                       (unsigned long long)container->plan.uuid);
+            if (container->pid > 0)
+            {
+              kill(container->pid, SIGKILL);
+            }
+            continue;
+          }
           String packedPayload;
           if (ProdigyWire::serializeAdvertisementPairingPayload(
                   packedPayload,
@@ -1823,7 +1833,17 @@ protected:
             continue;
           }
 
-          container->plan.applySubscriptionPairing(SubscriptionPairing(secret, address, service, port), activate);
+          if (container->plan.applySubscriptionPairing(SubscriptionPairing(secret, address, service, port), activate) &&
+              container->syncDeclaredNetworkPairingPolicy() == false)
+          {
+            basics_log("neuron subscriptionPairing network policy sync failed containerUUID=%llu\n",
+                       (unsigned long long)container->plan.uuid);
+            if (container->pid > 0)
+            {
+              kill(container->pid, SIGKILL);
+            }
+            continue;
+          }
           String packedPayload;
           if (ProdigyWire::serializeSubscriptionPairingPayload(
                   packedPayload,
@@ -2572,7 +2592,7 @@ public:
     return true;
   }
 
-  virtual void boot(void)
+  virtual void boot(CoroutineStack *coro)
   {
     loadKernelVersion();
     loadOSReleaseMetadata();
@@ -2581,7 +2601,12 @@ public:
 
     private4.is6 = false;
 
-    iaas->gatherSelfData(uuid, metro, isBrain, eth, private4); // this is sync blocking
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          iaas->gatherSelfData(coro, uuid, metro, isBrain, eth, private4);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
 
     gateway4.is6 = false;
     gateway4.v4 = eth.getPrivate4Gateway(private4.v4);
@@ -4121,6 +4146,16 @@ public:
 
             if (changed)
             {
+              if (container->syncDeclaredNetworkPairingPolicy() == false)
+              {
+                basics_log("neuron advertisementPairing network policy sync failed containerUUID=%llu\n",
+                           (unsigned long long)containerUUID);
+                if (container->pid > 0)
+                {
+                  kill(container->pid, SIGKILL);
+                }
+                break;
+              }
               if (streamIsActive(container))
               {
                 String packedPayload;
@@ -4207,6 +4242,16 @@ public:
 
             if (changed)
             {
+              if (container->syncDeclaredNetworkPairingPolicy() == false)
+              {
+                basics_log("neuron subscriptionPairing network policy sync failed containerUUID=%llu\n",
+                           (unsigned long long)containerUUID);
+                if (container->pid > 0)
+                {
+                  kill(container->pid, SIGKILL);
+                }
+                break;
+              }
               if (streamIsActive(container))
               {
                 String packedPayload;

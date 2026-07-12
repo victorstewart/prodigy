@@ -3,8 +3,13 @@
 #include <prodigy/iaas/iaas.h>
 #include <prodigy/brain/machine.h>
 
-static inline bool mothershipDestroyProviderMachines(BrainIaaS& iaas, const Vector<String>& cloudIDs, String *failure = nullptr)
+static inline void mothershipDestroyProviderMachines(CoroutineStack *coro,
+                                                     BrainIaaS& iaas,
+                                                     const Vector<String>& cloudIDs,
+                                                     bool& destroyed,
+                                                     String *failure = nullptr)
 {
+  destroyed = false;
   if (failure)
   {
     failure->clear();
@@ -18,19 +23,49 @@ static inline bool mothershipDestroyProviderMachines(BrainIaaS& iaas, const Vect
       {
         failure->assign("cloudID required"_ctv);
       }
-      return false;
+      co_return;
     }
 
-    Machine machine = {};
-    machine.cloudID = cloudID;
-    iaas.destroyMachine(&machine);
+    String operationFailure;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          iaas.destroyMachine(coro, cloudID, operationFailure);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (operationFailure.empty() == false)
+    {
+      if (failure)
+      {
+        *failure = std::move(operationFailure);
+      }
+      co_return;
+    }
   }
 
-  return true;
+  destroyed = true;
 }
 
-static inline bool mothershipDestroyProviderClusterMachines(BrainIaaS& iaas, const String& clusterUUID, uint32_t& destroyed, String *failure = nullptr)
+// Precondition: the selected provider's machine lifecycle implementation completes inline.
+static inline bool mothershipDestroyProviderMachinesInline(BrainIaaS& iaas,
+                                                           const Vector<String>& cloudIDs,
+                                                           String *failure = nullptr)
 {
+  CoroutineStack coro;
+  bool destroyed = false;
+  mothershipDestroyProviderMachines(&coro, iaas, cloudIDs, destroyed, failure);
+  coro.co_consume();
+  return destroyed;
+}
+
+static inline void mothershipDestroyProviderClusterMachines(CoroutineStack *coro,
+                                                            BrainIaaS& iaas,
+                                                            const String& clusterUUID,
+                                                            uint32_t& destroyed,
+                                                            bool& completed,
+                                                            String *failure = nullptr)
+{
+  completed = false;
   if (failure)
   {
     failure->clear();
@@ -43,18 +78,37 @@ static inline bool mothershipDestroyProviderClusterMachines(BrainIaaS& iaas, con
     {
       failure->assign("clusterUUID required"_ctv);
     }
-    return false;
+    co_return;
   }
 
   String error = {};
-  if (iaas.destroyClusterMachines(clusterUUID, destroyed, error) == false)
+  if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+        iaas.destroyClusterMachines(coro, clusterUUID, destroyed, error);
+      }))
+  {
+    co_await coro->suspendAtIndex(suspendIndex);
+  }
+  if (error.size() > 0)
   {
     if (failure)
     {
       *failure = error;
     }
-    return false;
+    co_return;
   }
 
-  return true;
+  completed = true;
+}
+
+// Precondition: the selected provider's cluster lifecycle implementation completes inline.
+static inline bool mothershipDestroyProviderClusterMachinesInline(BrainIaaS& iaas,
+                                                                  const String& clusterUUID,
+                                                                  uint32_t& destroyed,
+                                                                  String *failure = nullptr)
+{
+  CoroutineStack coro;
+  bool completed = false;
+  mothershipDestroyProviderClusterMachines(&coro, iaas, clusterUUID, destroyed, completed, failure);
+  coro.co_consume();
+  return completed;
 }

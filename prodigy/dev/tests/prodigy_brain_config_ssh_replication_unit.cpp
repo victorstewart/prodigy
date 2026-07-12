@@ -47,9 +47,10 @@ public:
     (void)message;
   }
 
-  void persistLocalRuntimeState(void) override
+  bool persistLocalRuntimeState(void) override
   {
     persistCalls += 1;
+    return true;
   }
 
   bool claimLocalClusterOwnership(uint128_t clusterUUID, String *failure = nullptr) override
@@ -80,14 +81,14 @@ public:
     error.clear();
   }
 
-  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines) override
+  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines, String& failure) override
   {
     (void)coro;
     (void)metro;
     (void)machines;
   }
 
-  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains) override
+  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains, String& failure) override
   {
     (void)coro;
     (void)selfUUID;
@@ -95,9 +96,11 @@ public:
     selfIsBrain = false;
   }
 
-  void hardRebootMachine(uint128_t uuid) override
+  void hardRebootMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
-    (void)uuid;
+    (void)coro;
+    (void)cloudID;
+    failure.clear();
   }
 
   void reportHardwareFailure(uint128_t uuid, const String& report) override
@@ -112,9 +115,11 @@ public:
     (void)decommissionedIDs;
   }
 
-  void destroyMachine(Machine *machine) override
+  void destroyMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
-    (void)machine;
+    (void)coro;
+    (void)cloudID;
+    failure.clear();
   }
 
   uint32_t supportedMachineKindsMask() const override
@@ -159,12 +164,21 @@ static void populateBootstrapSSHConfig(BrainConfig& config)
   config.controlSocketPath = "/run/prodigy/control.sock"_ctv;
 }
 
-static void testReplicateBrainConfigCopiesBootstrapSSHPackages(TestSuite& suite)
+static void testCombinedMasterAuthorityCopiesBootstrapSSHPackages(TestSuite& suite)
 {
   TestBrain brain = {};
   NoopBrainIaaS iaas = {};
   BrainView peer = {};
   brain.iaas = &iaas;
+  brain.noMasterYet = false;
+  peer.connected = true;
+  peer.isFixedFile = true;
+  peer.fslot = 1;
+  peer.registrationFresh = true;
+  peer.uuid = uint128_t(0x550013);
+  peer.boottimens = 550013;
+  peer.existingMasterUUID = peer.uuid;
+  peer.isMasterBrain = true;
 
   BrainConfig replicatedConfig = {};
   populateBootstrapSSHConfig(replicatedConfig);
@@ -172,28 +186,31 @@ static void testReplicateBrainConfigCopiesBootstrapSSHPackages(TestSuite& suite)
   String failure = {};
   suite.expect(
       readFixtureSSHKeyPackages(replicatedConfig.bootstrapSshKeyPackage, replicatedConfig.bootstrapSshHostKeyPackage, failure),
-      "replicate_brain_config_reads_bootstrap_key_packages");
+      "combined_master_authority_reads_bootstrap_key_packages");
 
   String serialized = {};
-  BitseryEngine::serialize(serialized, replicatedConfig);
+  ProdigyMasterAuthorityStateTransition transition;
+  transition.runtimeState.generation = 1;
+  transition.brainConfig = replicatedConfig;
+  BitseryEngine::serialize(serialized, transition);
 
   String messageBuffer = {};
-  Message *message = buildBrainMessage(messageBuffer, BrainTopic::replicateBrainConfig, serialized);
+  Message *message = buildBrainMessage(messageBuffer, BrainTopic::replicateMasterAuthorityState, serialized);
   brain.brainHandler(&peer, message);
 
-  suite.expect(brain.brainConfig.bootstrapSshUser.equals(replicatedConfig.bootstrapSshUser), "replicate_brain_config_applies_bootstrap_user");
-  suite.expect(brain.brainConfig.bootstrapSshKeyPackage == replicatedConfig.bootstrapSshKeyPackage, "replicate_brain_config_applies_bootstrap_key_package");
-  suite.expect(brain.brainConfig.bootstrapSshHostKeyPackage == replicatedConfig.bootstrapSshHostKeyPackage, "replicate_brain_config_applies_bootstrap_host_key_package");
-  suite.expect(brain.clusterOwnershipCalls == 1, "replicate_brain_config_claims_cluster_ownership");
-  suite.expect(brain.lastClaimedClusterUUID == replicatedConfig.clusterUUID, "replicate_brain_config_claims_expected_cluster_uuid");
-  suite.expect(brain.persistCalls == 1, "replicate_brain_config_persists_runtime_state");
+  suite.expect(brain.brainConfig.bootstrapSshUser.equals(replicatedConfig.bootstrapSshUser), "combined_master_authority_applies_bootstrap_user");
+  suite.expect(brain.brainConfig.bootstrapSshKeyPackage == replicatedConfig.bootstrapSshKeyPackage, "combined_master_authority_applies_bootstrap_key_package");
+  suite.expect(brain.brainConfig.bootstrapSshHostKeyPackage == replicatedConfig.bootstrapSshHostKeyPackage, "combined_master_authority_applies_bootstrap_host_key_package");
+  suite.expect(brain.clusterOwnershipCalls == 1, "combined_master_authority_claims_cluster_ownership");
+  suite.expect(brain.lastClaimedClusterUUID == replicatedConfig.clusterUUID, "combined_master_authority_claims_expected_cluster_uuid");
+  suite.expect(brain.persistCalls == 1, "combined_master_authority_persists_runtime_state");
 }
 
 int main(void)
 {
   TestSuite suite = {};
 
-  testReplicateBrainConfigCopiesBootstrapSSHPackages(suite);
+  testCombinedMasterAuthorityCopiesBootstrapSSHPackages(suite);
 
   return suite.failed == 0 ? 0 : 1;
 }

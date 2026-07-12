@@ -9,7 +9,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
-#include <libssh2.h>
+#include <libssh2/libssh2.h>
 #include <linux/capability.h>
 #include <openssl/ssl.h>
 #include <simdjson.h>
@@ -38,12 +38,15 @@
 #include <prodigy/mothership/mothership.cluster.registry.h>
 #include <prodigy/mothership/mothership.ssh.h>
 #include <prodigy/mothership/mothership.deployment.plan.helpers.h>
+#include <prodigy/mothership/mothership.gcp.managed.template.plan.h>
 #include <prodigy/mothership/mothership.tunnel.auth.h>
 #include <prodigy/mothership/mothership.tunnel.policy.h>
 #include <prodigy/mothership/mothership.pricing.command.helpers.h>
 #include <prodigy/mothership/mothership.pricing.h>
 #include <prodigy/mothership/mothership.provider.credentials.h>
 #include <prodigy/mothership/mothership.provider.machine.destroy.h>
+#include <prodigy/mothership/mothership.gcp.host.operations.h>
+#include <prodigy/mothership/mothership.ring.runtime.h>
 #include <prodigy/acme.certbot.h>
 #include <prodigy/types.h>
 
@@ -4135,6 +4138,7 @@ private:
   Vector<String> controlPaths;
   Vector<MothershipProdigyClusterMachine> remoteMachines;
   String tunnelGatewayEndpoint;
+  String tunnelGatewayAddress;
   MothershipTunnelGatewayTLSContext tunnelGatewayClientTLS;
   Vault::SSHKeyPackage clusterBootstrapSshKeyPackage;
   String clusterBootstrapSshPrivateKeyPath;
@@ -4176,6 +4180,7 @@ private:
     controlPaths.clear();
     remoteMachines.clear();
     tunnelGatewayEndpoint.clear();
+    tunnelGatewayAddress.clear();
     tunnelGatewayClientTLS.clear();
     clusterBootstrapSshKeyPackage.clear();
     clusterBootstrapSshPrivateKeyPath.clear();
@@ -4284,7 +4289,7 @@ private:
     }
 
     int fd = -1;
-    if (mothershipOpenConnectedSocket(host, port, fd) == false)
+    if (mothershipOpenNumericConnectedSocket(tunnelGatewayAddress, port, fd) == false)
     {
       lastConnectFailure.snprintf<"failed to connect tunnelProvider gateway {}:{itoa}: {}"_ctv>(host, unsigned(port), String(std::strerror(errno)));
       printConnectFailure();
@@ -4829,6 +4834,16 @@ public:
   {
     return remoteMachines;
   }
+
+  const String& unitTestTunnelGatewayAddress(void) const
+  {
+    return tunnelGatewayAddress;
+  }
+
+  void unitTestOverrideTunnelGatewayAddress(const String& address)
+  {
+    tunnelGatewayAddress = address;
+  }
 #endif
 
   bool setLocal(String *failure = nullptr)
@@ -4873,11 +4888,25 @@ public:
       {
         return false;
       }
+      String dialHost = {};
+      String dialAddress = {};
+      uint16_t dialPort = 0;
+      if (mothershipParseEndpointHostPort(spec.dialEndpoint, dialHost, dialPort, failure) == false ||
+          dialPort != spec.egress.port ||
+          prodigySystemEgressIPv4Text(spec.egress.address4, dialAddress) == false)
+      {
+        if (failure && failure->size() == 0)
+        {
+          failure->assign("mothership tunnel-provider dial and egress endpoints disagree"_ctv);
+        }
+        return false;
+      }
       if (tunnelGatewayClientTLS.configure(spec.clientAuth, failure) == false)
       {
         return false;
       }
       tunnelGatewayEndpoint = spec.dialEndpoint;
+      tunnelGatewayAddress = dialAddress;
       transportMode = TransportMode::tunnelGateway;
       if (failure)
       {
@@ -5774,6 +5803,7 @@ class Mothership {
 private:
 
   MothershipSocket socket;
+  MothershipHostRingRuntime hostRuntime;
 
   static MothershipClusterRegistry openClusterRegistry(void)
   {
@@ -6175,81 +6205,70 @@ private:
     return true;
   }
 
-  bool inferClusterMachineSchemaCpuCapabilities(MothershipProdigyCluster& cluster, const MothershipProviderCredential *credential, String& failure)
+  static void inferClusterMachineSchemaCpuCapabilities(BrainIaaS& provider,
+                                                       CoroutineStack *coro,
+                                                       const MothershipProdigyCluster& cluster,
+                                                       Vector<MachineSchemaCpuCapability>& capabilities,
+                                                       String& failure)
   {
+    capabilities.clear();
     failure.clear();
-
-    if (cluster.deploymentMode != MothershipClusterDeploymentMode::remote || cluster.machineSchemas.empty())
-    {
-      return true;
-    }
-
-    ProdigyRuntimeEnvironmentConfig provisioningEnvironment = {};
-    if (mothershipBuildClusterProvisioningRuntimeEnvironment(cluster, credential, provisioningEnvironment, &failure) == false)
-    {
-      return false;
-    }
-
-    std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(provisioningEnvironment);
-    if (provider == nullptr)
-    {
-      failure.assign("cluster provider does not support schema cpu capability inference"_ctv);
-      return false;
-    }
-
-    provider->configureRuntimeEnvironment(provisioningEnvironment);
-    for (MothershipProdigyClusterMachineSchema& schema : cluster.machineSchemas)
+    capabilities.reserve(cluster.machineSchemas.size());
+    for (const MothershipProdigyClusterMachineSchema& schema : cluster.machineSchemas)
     {
       MachineConfig config = {};
       mothershipBuildMachineConfigFromSchema(schema, config);
 
       MachineSchemaCpuCapability capability = {};
       String schemaFailure = {};
-      if (provider->inferMachineSchemaCpuCapability(config, capability, schemaFailure) == false)
+      if (coro)
+      {
+        if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+              provider.inferMachineSchemaCpuCapability(coro, config, capability, schemaFailure);
+            }))
+        {
+          co_await coro->suspendAtIndex(suspendIndex);
+        }
+      }
+      else
+      {
+        provider.inferMachineSchemaCpuCapability(nullptr, config, capability, schemaFailure);
+      }
+      if (schemaFailure.size() > 0)
       {
         failure.snprintf<"cluster machineSchema '{}' cpu capability inference failed: {}"_ctv>(
             schema.schema,
-            schemaFailure.size() ? schemaFailure : String("unknown failure"_ctv));
-        return false;
+            schemaFailure);
+        co_return;
       }
 
-      schema.cpu = capability;
       if (cluster.architecture != MachineCpuArchitecture::unknown && capability.architecture != MachineCpuArchitecture::unknown && capability.architecture != cluster.architecture)
       {
         failure.snprintf<"cluster machineSchema '{}' architecture '{}' does not match cluster architecture '{}'"_ctv>(
             schema.schema,
             String(machineCpuArchitectureName(capability.architecture)),
             String(machineCpuArchitectureName(cluster.architecture)));
-        return false;
+        co_return;
       }
+      capabilities.push_back(std::move(capability));
     }
-
-    return true;
   }
 
-  bool preflightClusterProviderCreate(const MothershipProdigyCluster& cluster, const MothershipProviderCredential *credential, String& failure)
+  static void publishClusterMachineSchemaCpuCapabilities(MothershipProdigyCluster& cluster,
+                                                         const Vector<MachineSchemaCpuCapability>& capabilities)
   {
+    for (uint32_t index = 0; index < capabilities.size(); ++index)
+    {
+      cluster.machineSchemas[index].cpu = capabilities[index];
+    }
+  }
+
+  static bool buildClusterProviderCreatePreflight(const MothershipProdigyCluster& cluster,
+                                                  BrainIaaSClusterCreatePreflight& preflight,
+                                                  String& failure)
+  {
+    preflight = {};
     failure.clear();
-
-    if (cluster.deploymentMode != MothershipClusterDeploymentMode::remote || cluster.machineSchemas.empty())
-    {
-      return true;
-    }
-
-    ProdigyRuntimeEnvironmentConfig provisioningEnvironment = {};
-    if (mothershipBuildClusterProvisioningRuntimeEnvironment(cluster, credential, provisioningEnvironment, &failure) == false)
-    {
-      return false;
-    }
-
-    std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(provisioningEnvironment);
-    if (provider == nullptr)
-    {
-      failure.assign("cluster provider does not support create preflight"_ctv);
-      return false;
-    }
-
-    BrainIaaSClusterCreatePreflight preflight = {};
     preflight.gcpServiceAccountEmail = cluster.gcp.serviceAccountEmail;
     preflight.gcpNetwork = cluster.gcp.network;
     preflight.gcpSubnetwork = cluster.gcp.subnetwork;
@@ -6281,22 +6300,203 @@ private:
       mothershipBuildMachineConfigFromSchema(schema, config);
       preflight.configs.push_back(std::move(config));
     }
+    return true;
+  }
 
+  static void preflightClusterProviderCreate(BrainIaaS& provider,
+                                             CoroutineStack *coro,
+                                             const BrainIaaSClusterCreatePreflight& preflight,
+                                             String& failure)
+  {
+    failure.clear();
     if (preflight.configs.empty())
+    {
+      co_return;
+    }
+    if (coro)
+    {
+      if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+            provider.preflightClusterCreate(coro, preflight, failure);
+          }))
+      {
+        co_await coro->suspendAtIndex(suspendIndex);
+      }
+    }
+    else
+    {
+      provider.preflightClusterCreate(nullptr, preflight, failure);
+    }
+    if (failure.size() > 0)
+    {
+      String detail = failure;
+      failure.assign("cluster provider preflight failed: "_ctv);
+      failure.append(detail);
+    }
+  }
+
+  bool runGcpClusterValidation(const MothershipProdigyCluster& cluster,
+                               const MothershipProviderCredential *credential,
+                               bool includePreflight,
+                               Vector<MachineSchemaCpuCapability>& capabilities,
+                               String& failure)
+  {
+    failure.clear();
+    if (credential == nullptr)
+    {
+      failure.assign("GCP validation requires a provider credential"_ctv);
+      return false;
+    }
+
+    BrainIaaSClusterCreatePreflight preflight = {};
+    if (includePreflight && buildClusterProviderCreatePreflight(cluster, preflight, failure) == false)
+    {
+      return false;
+    }
+
+    const MultiCurlClient::TimePoint deadline = MultiCurlClient::Clock::now() +
+        (includePreflight ? std::chrono::seconds(30) : std::chrono::seconds(15));
+    ProdigyRuntimeEnvironmentConfig sourceEnvironment = {};
+    sourceEnvironment.kind = ProdigyEnvironmentKind::gcp;
+    sourceEnvironment.providerScope = cluster.providerScope;
+    ProdigyRuntimeEnvironmentConfig jobEnvironment = {};
+    if (MothershipProviderCredentialRegistry::prepareGcpRingRuntimeEnvironment(
+            *credential, sourceEnvironment, jobEnvironment, &failure, deadline) == false)
+    {
+      return false;
+    }
+
+    bool providerCreated = false;
+    bool ran = hostRuntime.run([&](ProdigyProviderServices services, CoroutineStack *coro) -> void {
+      services.operationDeadline = deadline;
+      std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(jobEnvironment, services);
+      providerCreated = provider != nullptr;
+      if (providerCreated)
+      {
+        provider->configureRuntimeEnvironment(jobEnvironment);
+        if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+              inferClusterMachineSchemaCpuCapabilities(*provider, coro, cluster, capabilities, failure);
+            }))
+        {
+          co_await coro->suspendAtIndex(suspendIndex);
+        }
+        if (failure.size() == 0 && includePreflight)
+        {
+          if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                preflightClusterProviderCreate(*provider, coro, preflight, failure);
+              }))
+          {
+            co_await coro->suspendAtIndex(suspendIndex);
+          }
+        }
+      }
+    });
+    if (ran == false)
+    {
+      failure.assign("GCP validation runtime unavailable"_ctv);
+    }
+    else if (providerCreated == false)
+    {
+      failure.assign("cluster provider does not support GCP validation"_ctv);
+    }
+    return failure.size() == 0;
+  }
+
+  bool inferClusterMachineSchemaCpuCapabilities(MothershipProdigyCluster& cluster,
+                                                const MothershipProviderCredential *credential,
+                                                String& failure)
+  {
+    failure.clear();
+    if (cluster.deploymentMode != MothershipClusterDeploymentMode::remote || cluster.machineSchemas.empty())
     {
       return true;
     }
 
-    provider->configureRuntimeEnvironment(provisioningEnvironment);
-    if (provider->preflightClusterCreate(preflight, failure) == false)
+    Vector<MachineSchemaCpuCapability> capabilities = {};
+    if (cluster.provider == MothershipClusterProvider::gcp)
     {
-      String detail = failure;
-      failure.assign("cluster provider preflight failed: "_ctv);
-      failure.append(detail.size() ? detail : String("unknown failure"_ctv));
-      return false;
+      if (runGcpClusterValidation(cluster, credential, false, capabilities, failure) == false)
+      {
+        return false;
+      }
+    }
+    else
+    {
+      ProdigyRuntimeEnvironmentConfig environment = {};
+      if (mothershipBuildClusterProvisioningRuntimeEnvironment(cluster, credential, environment, &failure) == false)
+      {
+        return false;
+      }
+      std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(environment, {});
+      if (provider == nullptr)
+      {
+        failure.assign("cluster provider does not support schema cpu capability inference"_ctv);
+        return false;
+      }
+      provider->configureRuntimeEnvironment(environment);
+      inferClusterMachineSchemaCpuCapabilities(*provider, nullptr, cluster, capabilities, failure);
+      if (failure.size() > 0)
+      {
+        return false;
+      }
+    }
+    publishClusterMachineSchemaCpuCapabilities(cluster, capabilities);
+    return true;
+  }
+
+  bool preflightClusterProviderCreate(const MothershipProdigyCluster& cluster,
+                                      const MothershipProviderCredential *credential,
+                                      String& failure)
+  {
+    failure.clear();
+    if (cluster.deploymentMode != MothershipClusterDeploymentMode::remote || cluster.machineSchemas.empty())
+    {
+      return true;
     }
 
-    return true;
+    BrainIaaSClusterCreatePreflight preflight = {};
+    if (buildClusterProviderCreatePreflight(cluster, preflight, failure) == false || preflight.configs.empty())
+    {
+      return failure.size() == 0;
+    }
+
+    ProdigyRuntimeEnvironmentConfig environment = {};
+    if (mothershipBuildClusterProvisioningRuntimeEnvironment(cluster, credential, environment, &failure) == false)
+    {
+      return false;
+    }
+    std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(environment, {});
+    if (provider == nullptr)
+    {
+      failure.assign("cluster provider does not support create preflight"_ctv);
+      return false;
+    }
+    provider->configureRuntimeEnvironment(environment);
+    preflightClusterProviderCreate(*provider, nullptr, preflight, failure);
+    return failure.size() == 0;
+  }
+
+  bool validateClusterCreate(MothershipProdigyCluster& cluster,
+                             const MothershipProviderCredential *credential,
+                             String& failure)
+  {
+    if (cluster.deploymentMode == MothershipClusterDeploymentMode::remote &&
+        cluster.provider == MothershipClusterProvider::gcp &&
+        cluster.machineSchemas.empty() == false)
+    {
+      Vector<MachineSchemaCpuCapability> capabilities = {};
+      if (runGcpClusterValidation(cluster, credential, true, capabilities, failure) == false)
+      {
+        return false;
+      }
+      publishClusterMachineSchemaCpuCapabilities(cluster, capabilities);
+      return true;
+    }
+
+    if (inferClusterMachineSchemaCpuCapabilities(cluster, credential, failure) == false)
+    {
+      return false;
+    }
+    return preflightClusterProviderCreate(cluster, credential, failure);
   }
 
   bool destroyCloudClusterMachines(const MothershipProdigyCluster& cluster, const Vector<ClusterMachine>& createdMachines, uint32_t& destroyedCloudMachines, String& failure)
@@ -6321,23 +6521,38 @@ private:
       return false;
     }
 
-    std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(runtimeEnvironment);
-    if (provider == nullptr)
-    {
-      failure.assign("failed to construct runtime provider for cluster destroy"_ctv);
-      return false;
-    }
-
-    provider->configureRuntimeEnvironment(runtimeEnvironment);
-
+    Vector<String> cloudIDs;
+    cloudIDs.reserve(createdMachines.size());
     for (const ClusterMachine& createdMachine : createdMachines)
     {
-      Machine machine = prodigyBuildMachineSnapshotFromClusterMachine(createdMachine);
-      provider->destroyMachine(&machine);
+      cloudIDs.push_back(createdMachine.cloud.cloudID);
     }
 
-    destroyedCloudMachines = uint32_t(createdMachines.size());
-    return true;
+    bool destroyed = false;
+    if (runtimeEnvironment.kind == ProdigyEnvironmentKind::gcp)
+    {
+      destroyed = mothershipRunGcpMachineDestroyJob(
+          hostRuntime,
+          credential,
+          runtimeEnvironment,
+          cloudIDs,
+          failure,
+          MultiCurlClient::Clock::now() + std::chrono::minutes(10));
+    }
+    else
+    {
+      std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(runtimeEnvironment, {});
+      if (provider == nullptr)
+      {
+        failure.assign("failed to construct runtime provider for cluster destroy"_ctv);
+        return false;
+      }
+      provider->configureRuntimeEnvironment(runtimeEnvironment);
+      destroyed = mothershipDestroyProviderMachinesInline(*provider, cloudIDs, &failure);
+    }
+
+    destroyedCloudMachines = destroyed ? uint32_t(createdMachines.size()) : 0;
+    return destroyed;
   }
 
   bool removeClusterDNSBindings(const MothershipProdigyCluster& cluster, uint32_t& removedDNSRecords, String& failure)
@@ -7397,7 +7612,24 @@ private:
         return false;
       }
 
-      std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(tagRuntimeEnvironment);
+      if (tagRuntimeEnvironment.kind == ProdigyEnvironmentKind::gcp)
+      {
+        const bool tagged = mothershipRunGcpMachineTagJob(
+            owner->hostRuntime,
+            credential,
+            tagRuntimeEnvironment,
+            cluster.clusterUUID,
+            machines,
+            tagFailure,
+            MultiCurlClient::Clock::now() + std::chrono::minutes(10));
+        if (tagged == false && failure)
+        {
+          failure->assign(tagFailure);
+        }
+        return tagged;
+      }
+
+      std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(tagRuntimeEnvironment, {});
       if (provider == nullptr)
       {
         if (failure)
@@ -7411,7 +7643,7 @@ private:
       provider->configureBootstrapSSHAccess(cluster.bootstrapSshUser, cluster.bootstrapSshKeyPackage, cluster.bootstrapSshHostKeyPackage, cluster.bootstrapSshPrivateKeyPath);
       for (const ClusterMachine& machine : machines)
       {
-        if (prodigyEnsureCloudMachineTagged(*provider, cluster.clusterUUID, machine, &tagFailure) == false)
+        if (prodigyEnsureCloudMachineTaggedInline(*provider, cluster.clusterUUID, machine, &tagFailure) == false)
         {
           if (failure)
           {
@@ -7481,29 +7713,17 @@ private:
         return true;
       }
 
-      const MothershipProdigyClusterMachineSchema *standardSchema = nullptr;
-      const MothershipProdigyClusterMachineSchema *spotSchema = nullptr;
+      bool hasActiveMachineSchema = false;
       for (const MothershipProdigyClusterMachineSchema& schema : cluster.machineSchemas)
       {
-        if (schema.budget == 0)
+        if (schema.budget > 0)
         {
-          continue;
-        }
-
-        if (schema.lifetime == MachineLifetime::spot)
-        {
-          if (spotSchema == nullptr)
-          {
-            spotSchema = &schema;
-          }
-        }
-        else if (standardSchema == nullptr)
-        {
-          standardSchema = &schema;
+          hasActiveMachineSchema = true;
+          break;
         }
       }
 
-      if (standardSchema == nullptr && spotSchema == nullptr)
+      if (hasActiveMachineSchema == false)
       {
         if (failure)
         {
@@ -7525,64 +7745,10 @@ private:
         return false;
       }
 
-      ProdigyRuntimeEnvironmentConfig runtimeEnvironment = {};
-      if (mothershipBuildClusterProvisioningRuntimeEnvironment(cluster, &credential, runtimeEnvironment, &localFailure) == false)
-      {
-        if (failure)
-        {
-          failure->assign(localFailure);
-        }
-        finalizeTiming();
-        return false;
-      }
-
-      std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(runtimeEnvironment);
-      if (provider == nullptr)
-      {
-        if (failure)
-        {
-          failure->assign("failed to construct runtime provider for gcp template preparation"_ctv);
-        }
-        finalizeTiming();
-        return false;
-      }
-
-      provider->configureRuntimeEnvironment(runtimeEnvironment);
       if (cluster.provider == MothershipClusterProvider::gcp)
       {
-        GcpBrainIaaS *gcp = dynamic_cast<GcpBrainIaaS *>(provider.get());
-        if (gcp == nullptr)
-        {
-          if (failure)
-          {
-            failure->assign("failed to construct gcp provider for template preparation"_ctv);
-          }
-          finalizeTiming();
-          return false;
-        }
-
-        auto ensureTemplate = [&](const MothershipProdigyClusterMachineSchema& schema, bool spot) -> bool {
-          MachineConfig config = {};
-          mothershipBuildMachineConfigFromSchema(schema, config);
-          const String& templateName = spot ? schema.gcpInstanceTemplateSpot : schema.gcpInstanceTemplate;
-#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
-          uint64_t providerWaitStartNs = Time::now<TimeResolution::ns>();
-#endif
-          bool ok = gcp->ensureManagedInstanceTemplate(
-              templateName,
-              cluster.gcp.serviceAccountEmail,
-              cluster.gcp.network,
-              cluster.gcp.subnetwork,
-              config,
-              spot,
-              localFailure);
-#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
-          providerWaitNs += (Time::now<TimeResolution::ns>() - providerWaitStartNs);
-#endif
-          return ok;
-        };
-
-        if (standardSchema != nullptr && ensureTemplate(*standardSchema, false) == false)
+        MothershipGcpManagedTemplatePlan plan = {};
+        if (MothershipGcpManagedTemplatePlan::build(cluster, plan, localFailure) == false)
         {
           if (failure)
           {
@@ -7592,7 +7758,58 @@ private:
           return false;
         }
 
-        if (spotSchema != nullptr && ensureTemplate(*spotSchema, true) == false)
+        const MultiCurlClient::TimePoint deadline = MultiCurlClient::Clock::now() +
+            plan.timeout();
+        ProdigyRuntimeEnvironmentConfig sourceEnvironment = {};
+        sourceEnvironment.kind = ProdigyEnvironmentKind::gcp;
+        sourceEnvironment.providerScope = cluster.providerScope;
+        ProdigyRuntimeEnvironmentConfig jobEnvironment = {};
+#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
+        uint64_t providerWaitStartNs = Time::now<TimeResolution::ns>();
+#endif
+        if (MothershipProviderCredentialRegistry::prepareGcpRingRuntimeEnvironment(
+                credential, sourceEnvironment, jobEnvironment, &localFailure, deadline) == false)
+        {
+#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
+          providerWaitNs += (Time::now<TimeResolution::ns>() - providerWaitStartNs);
+#endif
+          if (failure)
+          {
+            failure->assign(localFailure);
+          }
+          finalizeTiming();
+          return false;
+        }
+
+        bool providerCreated = false;
+        bool ran = owner->hostRuntime.run([&](ProdigyProviderServices services, CoroutineStack *coro) -> void {
+          services.operationDeadline = deadline;
+          std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(jobEnvironment, services);
+          GcpBrainIaaS *gcp = dynamic_cast<GcpBrainIaaS *>(provider.get());
+          providerCreated = gcp != nullptr;
+          if (gcp)
+          {
+            gcp->configureRuntimeEnvironment(jobEnvironment);
+            if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                  gcp->prepareManagedInstanceTemplates(coro, plan.specs, localFailure);
+                }))
+            {
+              co_await coro->suspendAtIndex(suspendIndex);
+            }
+          }
+        });
+#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
+        providerWaitNs += (Time::now<TimeResolution::ns>() - providerWaitStartNs);
+#endif
+        if (ran == false)
+        {
+          localFailure.assign("gcp managed template runtime unavailable"_ctv);
+        }
+        else if (providerCreated == false)
+        {
+          localFailure.assign("failed to construct gcp provider for template preparation"_ctv);
+        }
+        if (localFailure.size() > 0)
         {
           if (failure)
           {
@@ -7604,21 +7821,50 @@ private:
       }
       else if (cluster.provider == MothershipClusterProvider::azure)
       {
-        AzureBrainIaaS *azure = dynamic_cast<AzureBrainIaaS *>(provider.get());
-        if (azure == nullptr)
+        ProdigyRuntimeEnvironmentConfig runtimeEnvironment = {};
+        if (mothershipBuildClusterProvisioningRuntimeEnvironment(cluster, &credential, runtimeEnvironment, &localFailure) == false)
         {
           if (failure)
           {
-            failure->assign("failed to construct azure provider for managed identity preparation"_ctv);
+            failure->assign(localFailure);
           }
           finalizeTiming();
           return false;
         }
-
 #if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
         uint64_t providerWaitStartNs = Time::now<TimeResolution::ns>();
 #endif
-        if (azure->ensureManagedClusterIdentity(localFailure) == false)
+        bool providerCreated = false;
+        bool identityPrepared = false;
+        bool ran = owner->hostRuntime.run([&](ProdigyProviderServices services, CoroutineStack *coro) -> void {
+          services.operationDeadline = MultiCurlClient::Clock::now() + std::chrono::minutes(10);
+          std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(runtimeEnvironment, services);
+          if (provider == nullptr)
+          {
+            co_return;
+          }
+          providerCreated = true;
+          provider->configureRuntimeEnvironment(runtimeEnvironment);
+          AzureBrainIaaS *azure = dynamic_cast<AzureBrainIaaS *>(provider.get());
+          if (azure == nullptr)
+          {
+            co_return;
+          }
+          identityPrepared = co_await azure->ensureManagedClusterIdentity(coro, localFailure);
+        });
+        if (ran == false)
+        {
+          localFailure.assign("azure managed identity host Ring unavailable"_ctv);
+        }
+        else if (providerCreated == false)
+        {
+          localFailure.assign("failed to construct azure provider for managed identity preparation"_ctv);
+        }
+        else if (identityPrepared == false && localFailure.empty())
+        {
+          localFailure.assign("azure managed identity preparation failed"_ctv);
+        }
+        if (localFailure.size() > 0)
         {
 #if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
           providerWaitNs += (Time::now<TimeResolution::ns>() - providerWaitStartNs);
@@ -7667,8 +7913,89 @@ private:
         return false;
       }
 
+      SeedProvisioningProgressPrinter progressPrinter(cluster.name);
+      if (cluster.provider == MothershipClusterProvider::gcp)
+      {
+        const MultiCurlClient::TimePoint deadline =
+            MultiCurlClient::Clock::now() +
+            std::chrono::milliseconds(prodigyMachineProvisioningTimeoutMs);
+        ProdigyRuntimeEnvironmentConfig sourceEnvironment = {};
+        sourceEnvironment.kind = ProdigyEnvironmentKind::gcp;
+        sourceEnvironment.providerScope = cluster.providerScope;
+        ProdigyRuntimeEnvironmentConfig jobEnvironment = {};
+        if (MothershipProviderCredentialRegistry::prepareGcpRingRuntimeEnvironment(
+                credential,
+                sourceEnvironment,
+                jobEnvironment,
+                &localFailure,
+                deadline) == false)
+        {
+          if (failure)
+          {
+            failure->assign(localFailure);
+          }
+          return false;
+        }
+
+        bool providerCreated = false;
+        bool provisioned = false;
+        const bool ran = owner->hostRuntime.run(
+            [&](ProdigyProviderServices services, CoroutineStack *coro) -> void {
+              services.operationDeadline = deadline;
+              std::unique_ptr<BrainIaaS> provider =
+                  prodigyCreateProviderBrainIaaS(jobEnvironment, services);
+              GcpBrainIaaS *gcp = dynamic_cast<GcpBrainIaaS *>(provider.get());
+              providerCreated = gcp != nullptr;
+              if (gcp)
+              {
+                gcp->configureRuntimeEnvironment(jobEnvironment);
+                if (uint32_t suspendIndex = coro->nextSuspendIndex();
+                    coro->didSuspend([&](void) -> void {
+                      mothershipProvisionCreatedSeedMachine(coro,
+                                                            cluster,
+                                                            instruction,
+                                                            *gcp,
+                                                            seedMachine,
+                                                            provisioned,
+                                                            &progressPrinter,
+                                                            timingAttribution,
+                                                            &localFailure);
+                    }))
+                {
+                  co_await coro->suspendAtIndex(suspendIndex);
+                }
+              }
+            });
+        if (ran == false)
+        {
+          localFailure.assign("gcp seed provisioning runtime unavailable"_ctv);
+        }
+        else if (providerCreated == false)
+        {
+          localFailure.assign("failed to construct gcp provider for cluster seed provisioning"_ctv);
+        }
+        else if (provisioned == false && localFailure.empty())
+        {
+          localFailure.assign("gcp seed provisioning failed"_ctv);
+        }
+        if (localFailure.empty() == false)
+        {
+          if (failure)
+          {
+            failure->assign(localFailure);
+          }
+          return false;
+        }
+        if (failure)
+        {
+          failure->clear();
+        }
+        return true;
+      }
+
       ProdigyRuntimeEnvironmentConfig runtimeEnvironment = {};
-      if (mothershipBuildClusterProvisioningRuntimeEnvironment(cluster, &credential, runtimeEnvironment, &localFailure) == false)
+      if (mothershipBuildClusterProvisioningRuntimeEnvironment(
+              cluster, &credential, runtimeEnvironment, &localFailure) == false)
       {
         if (failure)
         {
@@ -7677,7 +8004,8 @@ private:
         return false;
       }
 
-      std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(runtimeEnvironment);
+      std::unique_ptr<BrainIaaS> provider =
+          prodigyCreateProviderBrainIaaS(runtimeEnvironment, {});
       if (provider == nullptr)
       {
         if (failure)
@@ -7688,9 +8016,13 @@ private:
       }
 
       provider->configureRuntimeEnvironment(runtimeEnvironment);
-      SeedProvisioningProgressPrinter progressPrinter(cluster.name);
-
-      if (mothershipProvisionCreatedSeedMachine(cluster, instruction, *provider, seedMachine, &progressPrinter, timingAttribution, &localFailure) == false)
+      if (mothershipProvisionCreatedSeedMachineInline(cluster,
+                                                instruction,
+                                                *provider,
+                                                seedMachine,
+                                                &progressPrinter,
+                                                timingAttribution,
+                                                &localFailure) == false)
       {
         if (failure)
         {
@@ -7705,7 +8037,6 @@ private:
       }
       return true;
     }
-
     bool destroyCreatedSeedMachine(const MothershipProdigyCluster& cluster, const ClusterMachine& seedMachine, String *failure = nullptr) override
     {
       if (failure)
@@ -7739,7 +8070,56 @@ private:
         return false;
       }
 
-      std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(runtimeEnvironment);
+      String clusterUUIDTagValue = {};
+      prodigyRenderClusterUUIDTagValue(cluster.clusterUUID, clusterUUIDTagValue);
+
+      uint32_t destroyedClusterMachines = 0;
+      String destroyClusterFailure = {};
+      if (runtimeEnvironment.kind == ProdigyEnvironmentKind::gcp)
+      {
+        const MultiCurlClient::TimePoint cleanupDeadline =
+            MultiCurlClient::Clock::now() + std::chrono::minutes(10);
+        const MultiCurlClient::TimePoint bulkDeadline =
+            cleanupDeadline - std::chrono::minutes(3);
+        (void)mothershipRunGcpClusterDestroyJob(owner->hostRuntime,
+                                                credential,
+                                                runtimeEnvironment,
+                                                clusterUUIDTagValue,
+                                                destroyedClusterMachines,
+                                                destroyClusterFailure,
+                                                bulkDeadline);
+
+        // Label-scoped bulk cleanup is best effort; exact immutable-ID deletion proves the created seed absent.
+        Vector<String> seedCloudIDs;
+        seedCloudIDs.push_back(seedMachine.cloud.cloudID);
+        if (mothershipRunGcpMachineDestroyJob(
+            owner->hostRuntime,
+            credential,
+            runtimeEnvironment,
+            seedCloudIDs,
+            localFailure,
+            cleanupDeadline) == false)
+        {
+          if (failure)
+          {
+            if (localFailure.empty() == false && destroyClusterFailure.empty() == false)
+            {
+              localFailure.append("; bulk cleanup also failed: "_ctv);
+              localFailure.append(destroyClusterFailure);
+            }
+            failure->assign(localFailure.empty() ? destroyClusterFailure : localFailure);
+          }
+          return false;
+        }
+
+        if (failure)
+        {
+          failure->clear();
+        }
+        return true;
+      }
+
+      std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(runtimeEnvironment, {});
       if (provider == nullptr)
       {
         if (failure)
@@ -7748,16 +8128,15 @@ private:
         }
         return false;
       }
-
       provider->configureRuntimeEnvironment(runtimeEnvironment);
-      provider->configureBootstrapSSHAccess(cluster.bootstrapSshUser, cluster.bootstrapSshKeyPackage, cluster.bootstrapSshHostKeyPackage, cluster.bootstrapSshPrivateKeyPath);
-
-      String clusterUUIDTagValue = {};
-      prodigyRenderClusterUUIDTagValue(cluster.clusterUUID, clusterUUIDTagValue);
-
-      uint32_t destroyedClusterMachines = 0;
-      String destroyClusterFailure = {};
-      if (provider->destroyClusterMachines(clusterUUIDTagValue, destroyedClusterMachines, destroyClusterFailure))
+      provider->configureBootstrapSSHAccess(cluster.bootstrapSshUser,
+                                            cluster.bootstrapSshKeyPackage,
+                                            cluster.bootstrapSshHostKeyPackage,
+                                            cluster.bootstrapSshPrivateKeyPath);
+      if (mothershipDestroyProviderClusterMachinesInline(*provider,
+                                                         clusterUUIDTagValue,
+                                                         destroyedClusterMachines,
+                                                         &destroyClusterFailure))
       {
         if (failure)
         {
@@ -7766,16 +8145,16 @@ private:
         return true;
       }
 
-      mothershipDestroyCreatedClusterMachine(*provider, seedMachine);
-      if (destroyClusterFailure.size() > 0)
+      Vector<String> seedCloudIDs;
+      seedCloudIDs.push_back(seedMachine.cloud.cloudID);
+      if (mothershipDestroyProviderMachinesInline(*provider, seedCloudIDs, &localFailure) == false)
       {
         if (failure)
         {
-          failure->assign(destroyClusterFailure);
+          failure->assign(localFailure.empty() ? destroyClusterFailure : localFailure);
         }
         return false;
       }
-
       if (failure)
       {
         failure->clear();
@@ -7832,37 +8211,69 @@ private:
           return false;
         }
 
-        std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(tagRuntimeEnvironment);
-        if (provider == nullptr)
+        if (tagRuntimeEnvironment.kind == ProdigyEnvironmentKind::gcp)
         {
-          if (failure)
-          {
-            failure->assign("failed to construct runtime provider for seed tagging"_ctv);
-          }
-          finalizeTiming();
-          return false;
-        }
-
-        provider->configureRuntimeEnvironment(tagRuntimeEnvironment);
-        provider->configureBootstrapSSHAccess(cluster.bootstrapSshUser, cluster.bootstrapSshKeyPackage, cluster.bootstrapSshHostKeyPackage, cluster.bootstrapSshPrivateKeyPath);
+          Vector<ClusterMachine> seedMachines;
+          seedMachines.push_back(seedMachine);
 #if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
-        uint64_t providerWaitStartNs = Time::now<TimeResolution::ns>();
+          uint64_t providerWaitStartNs = Time::now<TimeResolution::ns>();
 #endif
-        if (prodigyEnsureCloudMachineTagged(*provider, cluster.clusterUUID, seedMachine, &tagFailure) == false)
-        {
+          const bool tagged = mothershipRunGcpMachineTagJob(
+              owner->hostRuntime,
+              credential,
+              tagRuntimeEnvironment,
+              cluster.clusterUUID,
+              seedMachines,
+              tagFailure,
+              MultiCurlClient::Clock::now() + std::chrono::minutes(10));
 #if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
           providerWaitNs += (Time::now<TimeResolution::ns>() - providerWaitStartNs);
 #endif
-          if (failure)
+          if (tagged == false)
           {
-            failure->assign(tagFailure);
+            if (failure)
+            {
+              failure->assign(tagFailure);
+            }
+            finalizeTiming();
+            return false;
           }
-          finalizeTiming();
-          return false;
         }
+        else
+        {
+
+          std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(tagRuntimeEnvironment, {});
+          if (provider == nullptr)
+          {
+            if (failure)
+            {
+              failure->assign("failed to construct runtime provider for seed tagging"_ctv);
+            }
+            finalizeTiming();
+            return false;
+          }
+
+          provider->configureRuntimeEnvironment(tagRuntimeEnvironment);
+          provider->configureBootstrapSSHAccess(cluster.bootstrapSshUser, cluster.bootstrapSshKeyPackage, cluster.bootstrapSshHostKeyPackage, cluster.bootstrapSshPrivateKeyPath);
 #if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
-        providerWaitNs += (Time::now<TimeResolution::ns>() - providerWaitStartNs);
+          uint64_t providerWaitStartNs = Time::now<TimeResolution::ns>();
 #endif
+          if (prodigyEnsureCloudMachineTaggedInline(*provider, cluster.clusterUUID, seedMachine, &tagFailure) == false)
+          {
+#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
+            providerWaitNs += (Time::now<TimeResolution::ns>() - providerWaitStartNs);
+#endif
+            if (failure)
+            {
+              failure->assign(tagFailure);
+            }
+            finalizeTiming();
+            return false;
+          }
+#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
+          providerWaitNs += (Time::now<TimeResolution::ns>() - providerWaitStartNs);
+#endif
+        }
       }
 
       ProdigyRemoteBootstrapPlan plan = {};
@@ -9386,6 +9797,26 @@ private:
               {
                 String failure = {};
                 if (mothershipParseApplicationCPURequest(subfield.value, plan.config, &failure) == false)
+                {
+                  basics_log("%s\n", failure.c_str());
+                  exit(EXIT_FAILURE);
+                }
+              }
+              else if (subkey.equal("maxPids"_ctv))
+              {
+                String failure = {};
+                if (mothershipParseApplicationMaxPids(
+                        subfield.value, plan.config, "config"_ctv, &failure) == false)
+                {
+                  basics_log("%s\n", failure.c_str());
+                  exit(EXIT_FAILURE);
+                }
+              }
+              else if (subkey.equal("isolatedChildMemoryMB"_ctv))
+              {
+                String failure = {};
+                if (mothershipParseApplicationIsolatedChildMemoryMB(
+                        subfield.value, plan.config, "config"_ctv, &failure) == false)
                 {
                   basics_log("%s\n", failure.c_str());
                   exit(EXIT_FAILURE);
@@ -10970,15 +11401,34 @@ private:
           bool transportWasSet = false;
           bool familyWasSet = false;
           bool sourceWasSet = false;
+          bool countWasSet = false;
+          uint32_t count = 1;
 
           for (auto item : subfield.get_object())
           {
             String subkey;
             subkey.setInvariant(item.key.data(), item.key.size());
 
+            if (subkey.equal("count"_ctv))
+            {
+              if (countWasSet)
+              {
+                basics_log("whiteholes.count may only be specified once\n");
+                exit(EXIT_FAILURE);
+              }
+              String failure;
+              if (mothershipParseWhiteholeCount(item.value, count, &failure) == false)
+              {
+                basics_log("%s\n", failure.c_str());
+                exit(EXIT_FAILURE);
+              }
+              countWasSet = true;
+              continue;
+            }
+
             if (item.value.type() != simdjson::dom::element_type::STRING)
             {
-              basics_log("whiteholes fields require strings\n");
+              basics_log("whiteholes transport, family, and source require strings\n");
               exit(EXIT_FAILURE);
             }
 
@@ -11046,7 +11496,12 @@ private:
             exit(EXIT_FAILURE);
           }
 
-          plan.whiteholes.push_back(need);
+          String failure;
+          if (mothershipAppendWhiteholeDeclaration(plan.whiteholes, need, count, &failure) == false)
+          {
+            basics_log("%s\n", failure.c_str());
+            exit(EXIT_FAILURE);
+          }
         }
       }
       else if (key.equal("externalAddressNeeds"_ctv))
@@ -11063,6 +11518,15 @@ private:
       {
         String failure;
         if (mothershipParseDeploymentPlanUseHostNetworkNamespace(field.value, plan, &failure) == false)
+        {
+          basics_log("%s\n", failure.c_str());
+          exit(EXIT_FAILURE);
+        }
+      }
+      else if (key.equal("networkAccess"_ctv))
+      {
+        String failure;
+        if (mothershipParseDeploymentPlanNetworkAccess(field.value, plan, &failure) == false)
         {
           basics_log("%s\n", failure.c_str());
           exit(EXIT_FAILURE);
@@ -11548,11 +12012,20 @@ private:
     {
       for (const Whitehole& whitehole : plan.whiteholes)
       {
-        if (whitehole.source != ExternalAddressSource::hostPublicAddress && whitehole.source != ExternalAddressSource::registeredRoutablePrefix)
+        if (whiteholeDeclarationValid(whitehole) == false)
         {
-          basics_log("whiteholes currently require source == hostPublicAddress or registeredRoutablePrefix\n");
+          basics_log("whiteholes declaration invalid\n");
           exit(EXIT_FAILURE);
         }
+      }
+    }
+
+    {
+      String failure;
+      if (mothershipValidateDeploymentPlanNetworkAccess(plan, &failure) == false)
+      {
+        basics_log("%s\n", failure.c_str());
+        exit(EXIT_FAILURE);
       }
     }
 
@@ -12745,22 +13218,72 @@ private:
     }
   }
 
-  void collectProviderMachineCloudIDs(BrainIaaS& provider, const String& metro, Vector<String>& cloudIDs)
+  bool collectProviderMachineCloudIDs(BrainIaaS& blockingProvider,
+                                      const MothershipProviderCredential& credential,
+                                      const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment,
+                                      const String& metro,
+                                      Vector<String>& cloudIDs,
+                                      String& failure)
   {
     cloudIDs.clear();
-
+    failure.clear();
     bytell_hash_set<Machine *> machines = {};
-    provider.getMachines(nullptr, metro, machines);
-
-    for (Machine *machine : machines)
+    if (runtimeEnvironment.kind != ProdigyEnvironmentKind::gcp)
     {
-      if (machine != nullptr && machine->cloudID.size() > 0)
+      blockingProvider.getMachines(nullptr, metro, machines, failure);
+      for (Machine *machine : machines)
       {
-        cloudIDs.push_back(machine->cloudID);
+        if (machine != nullptr && machine->cloudID.size() > 0)
+        {
+          cloudIDs.push_back(machine->cloudID);
+        }
+        delete machine;
+      }
+      return failure.size() == 0;
+    }
+
+    ProdigyRuntimeEnvironmentConfig jobRuntimeEnvironment = {};
+    if (MothershipProviderCredentialRegistry::prepareGcpRingRuntimeEnvironment(credential, runtimeEnvironment, jobRuntimeEnvironment, &failure) == false)
+    {
+      return false;
+    }
+
+    std::unique_ptr<BrainIaaS> provider;
+    bool providerCreated = false;
+    bool ran = hostRuntime.run([&](ProdigyProviderServices services, CoroutineStack *coro) -> void {
+      provider = prodigyCreateProviderBrainIaaS(jobRuntimeEnvironment, services);
+      providerCreated = provider != nullptr;
+      if (providerCreated)
+      {
+        provider->configureRuntimeEnvironment(jobRuntimeEnvironment);
+        if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+              provider->getMachines(coro, metro, machines, failure);
+            }))
+        {
+          co_await coro->suspendAtIndex(suspendIndex);
+        }
       }
 
-      delete machine;
+      for (Machine *machine : machines)
+      {
+        if (machine != nullptr && machine->cloudID.size() > 0)
+        {
+          cloudIDs.push_back(machine->cloudID);
+        }
+        delete machine;
+      }
+      machines.clear();
+      provider.reset();
+    });
+    if (ran == false)
+    {
+      failure.assign("provider inventory runtime unavailable"_ctv);
     }
+    else if (providerCreated == false)
+    {
+      failure.assign("failed to construct provider iaas"_ctv);
+    }
+    return failure.size() == 0;
   }
 
   static bool resolveJSONArgument(const char *operation, const char *arg, String& json)
@@ -13070,7 +13593,7 @@ private:
       exit(EXIT_FAILURE);
     }
 
-    std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(runtimeEnvironment);
+    std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(runtimeEnvironment, {});
     if (provider == nullptr)
     {
       basics_log("destroyProviderMachines success=0 destroyed=0 failure=failed to construct provider iaas\n");
@@ -13079,7 +13602,23 @@ private:
 
     provider->configureRuntimeEnvironment(runtimeEnvironment);
 
-    if (mothershipDestroyProviderMachines(*provider, cloudIDs, &failure) == false)
+    bool destroyed = false;
+    if (runtimeEnvironment.kind == ProdigyEnvironmentKind::gcp)
+    {
+      const MultiCurlClient::TimePoint deadline =
+          MultiCurlClient::Clock::now() + std::chrono::minutes(10);
+      destroyed = mothershipRunGcpMachineDestroyJob(hostRuntime,
+                                                    credential,
+                                                    runtimeEnvironment,
+                                                    cloudIDs,
+                                                    failure,
+                                                    deadline);
+    }
+    else
+    {
+      destroyed = mothershipDestroyProviderMachinesInline(*provider, cloudIDs, &failure);
+    }
+    if (destroyed == false)
     {
       basics_log("destroyProviderMachines success=0 destroyed=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
       exit(EXIT_FAILURE);
@@ -13089,7 +13628,11 @@ private:
     bool pendingDestroy = true;
     for (uint32_t attempt = 0; attempt < 30 && pendingDestroy; ++attempt)
     {
-      collectProviderMachineCloudIDs(*provider, providerScope, visibleCloudIDs);
+      if (collectProviderMachineCloudIDs(*provider, credential, runtimeEnvironment, providerScope, visibleCloudIDs, failure) == false)
+      {
+        basics_log("destroyProviderMachines success=0 destroyed=0 failure=%s\n", failure.c_str());
+        exit(EXIT_FAILURE);
+      }
       pendingDestroy = false;
 
       for (const String& requestedCloudID : cloudIDs)
@@ -13247,17 +13790,37 @@ private:
       exit(EXIT_FAILURE);
     }
 
-    std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(runtimeEnvironment);
-    if (provider == nullptr)
-    {
-      basics_log("destroyProviderClusterMachines success=0 destroyed=0 failure=failed to construct provider iaas\n");
-      exit(EXIT_FAILURE);
-    }
-
-    provider->configureRuntimeEnvironment(runtimeEnvironment);
-
     uint32_t destroyed = 0;
-    if (mothershipDestroyProviderClusterMachines(*provider, clusterUUID, destroyed, &failure) == false)
+    bool completed = false;
+    if (runtimeEnvironment.kind == ProdigyEnvironmentKind::gcp)
+    {
+      completed = mothershipRunGcpClusterDestroyJob(
+          hostRuntime,
+          credential,
+          runtimeEnvironment,
+          clusterUUID,
+          destroyed,
+          failure,
+          MultiCurlClient::Clock::now() + std::chrono::minutes(10));
+    }
+    else
+    {
+      std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(runtimeEnvironment, {});
+      if (provider == nullptr)
+      {
+        failure.assign("failed to construct provider iaas"_ctv);
+      }
+      else
+      {
+        provider->configureRuntimeEnvironment(runtimeEnvironment);
+        completed = mothershipDestroyProviderClusterMachinesInline(
+            *provider,
+            clusterUUID,
+            destroyed,
+            &failure);
+      }
+    }
+    if (completed == false)
     {
       basics_log("destroyProviderClusterMachines success=0 destroyed=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
       exit(EXIT_FAILURE);
@@ -13517,7 +14080,7 @@ private:
       targetRequest.target = target;
       Vector<MothershipProviderMachineOffer> targetOffers = {};
       String failure = {};
-      if (mothershipSurveyProviderMachineOffers(targetRequest, targetOffers, failure) == false)
+      if (mothershipSurveyProviderMachineOffers(hostRuntime, targetRequest, targetOffers, failure) == false)
       {
         appendPricingTargetFailure(targetFailures, target, failure);
         continue;
@@ -13774,7 +14337,7 @@ private:
     surveyRequest.machineKindsMask = providerMachineKindMaskAll();
 
     Vector<MothershipProviderMachineOffer> offers = {};
-    if (mothershipSurveyProviderMachineOffers(surveyRequest, offers, failure) == false)
+    if (mothershipSurveyProviderMachineOffers(hostRuntime, surveyRequest, offers, failure) == false)
     {
       basics_log("estimateClusterHourlyCost success=0 failure=%s\n", failure.c_str());
       exit(EXIT_FAILURE);
@@ -14029,7 +14592,7 @@ private:
 
       Vector<MothershipProviderMachineOffer> offers = {};
       String failure = {};
-      if (mothershipSurveyProviderMachineOffers(surveyRequest, offers, failure) == false)
+      if (mothershipSurveyProviderMachineOffers(hostRuntime, surveyRequest, offers, failure) == false)
       {
         appendPricingTargetFailure(targetFailures, target, failure);
         continue;
@@ -14805,13 +15368,7 @@ private:
       dnsCredentialPtr = &referencedDNSCredential;
     }
 
-    if (inferClusterMachineSchemaCpuCapabilities(request, credentialPtr, failure) == false)
-    {
-      basics_log("createCluster success=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
-      exit(EXIT_FAILURE);
-    }
-
-    if (preflightClusterProviderCreate(request, credentialPtr, failure) == false)
+    if (validateClusterCreate(request, credentialPtr, failure) == false)
     {
       basics_log("createCluster success=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
       exit(EXIT_FAILURE);

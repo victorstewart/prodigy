@@ -21,7 +21,12 @@ static inline void prodigyDNSCollectRoute53ResourceRecords(const String& row, Ve
   }
 }
 
-static inline bool prodigyDNSCollectRoute53RecordValues(const String& response, const ProdigyDNSRecordBinding& record, Vector<String>& values, bool& found, String& failure)
+static inline bool prodigyDNSCollectRoute53RecordValues(const String& response,
+                                                        const ProdigyDNSRecordBinding& record,
+                                                        Vector<String>& values,
+                                                        bool& found,
+                                                        String& failure,
+                                                        uint32_t *ttl = nullptr)
 {
   values.clear();
   found = false;
@@ -41,6 +46,24 @@ static inline bool prodigyDNSCollectRoute53RecordValues(const String& response, 
   {
     failure.assign("route53 dns list response parse failed"_ctv);
     return false;
+  }
+  if (ttl)
+  {
+    String ttlText;
+    if (awsExtractXMLValue(row, "TTL", ttlText) == false || ttlText.empty())
+    {
+      failure.assign("route53 dns list response TTL missing"_ctv);
+      return false;
+    }
+    for (uint8_t byte : ttlText)
+    {
+      if (byte < '0' || byte > '9')
+      {
+        failure.assign("route53 dns list response TTL invalid"_ctv);
+        return false;
+      }
+    }
+    *ttl = ttlText.toNumber<uint32_t>();
   }
   if (routableResourceDNSPartEquals(name, record.name, true) == false || routableResourceDNSPartEquals(type, record.type, false) == false)
   {
@@ -76,7 +99,8 @@ static inline bool prodigyDNSFindRoute53Record(const String& response, const Pro
 
   Vector<String> values = {};
   bool found = false;
-  if (prodigyDNSCollectRoute53RecordValues(response, record, values, found, failure) == false)
+  uint32_t ttl = 0;
+  if (prodigyDNSCollectRoute53RecordValues(response, record, values, found, failure, &ttl) == false)
   {
     return false;
   }
@@ -85,7 +109,8 @@ static inline bool prodigyDNSFindRoute53Record(const String& response, const Pro
     failure.clear();
     return true;
   }
-  if (values.size() != 1 || prodigyDNSProviderValueEquals(record, values[0], recordValue) == false)
+  if (ttl != record.ttl || values.size() != 1 ||
+      prodigyDNSProviderValueEquals(record, values[0], recordValue) == false)
   {
     return prodigyDNSExistingRecordConflict(failure);
   }
@@ -130,40 +155,68 @@ public:
     return routableResourceDNSPartEquals(provider, "route53"_ctv, false) || routableResourceDNSPartEquals(provider, "aws-route53"_ctv, false);
   }
 
-  bool upsert(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> upsert(CoroutineStack *coro,
+                               const ProdigyDNSRecordBinding& record,
+                               const ApiCredential& credential,
+                               String& failure) override
   {
-    return change(false, record, credential, failure);
+    co_return co_await change(coro, false, record, credential, failure);
   }
 
-  bool remove(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> remove(CoroutineStack *coro,
+                               const ProdigyDNSRecordBinding& record,
+                               const ApiCredential& credential,
+                               String& failure) override
   {
-    return change(true, record, credential, failure);
+    co_return co_await change(coro, true, record, credential, failure);
   }
 
-  bool presentTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> presentTXT(CoroutineStack *coro,
+                                   const ProdigyDNSRecordBinding& record,
+                                   const ApiCredential& credential,
+                                   String& failure) override
   {
-    return changeTXT(false, record, credential, failure);
+    co_return co_await changeTXT(coro, false, record, credential, failure);
   }
 
-  bool cleanupTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> cleanupTXT(CoroutineStack *coro,
+                                   const ProdigyDNSRecordBinding& record,
+                                   const ApiCredential& credential,
+                                   String& failure) override
   {
-    return changeTXT(true, record, credential, failure);
+    co_return co_await changeTXT(coro, true, record, credential, failure);
   }
 
 protected:
 
-  virtual bool sendAWS(const char *method, const String& url, const String& region, const AwsCredentialMaterial& credential, const String *body, String& response, long& httpCode)
+  virtual ProdigyHostTask<bool> sendAWS(CoroutineStack *coro,
+                                        MultiCurlClient::Method method,
+                                        const AwsHttpRequest::Target& target,
+                                        const AwsCredentialMaterial& credential,
+                                        const String *body,
+                                        String& response,
+                                        long& httpCode,
+                                        String& failure)
   {
-    struct curl_slist *headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: text/xml");
-    bool ok = AwsHttp::send(method, url, region, "route53"_ctv, credential, headers, body, response, &httpCode);
-    curl_slist_free_all(headers);
-    return ok;
+    Vector<MultiCurlClient::Header> headers;
+    headers.push_back({"Content-Type"_ctv, "text/xml"_ctv});
+    AwsHttpTransport transport(runtime.http, runtime.delay, runtime.operationDeadline);
+    MultiCurlClient::Result result = co_await transport.sendSigned(
+        coro, target, method, headers, body, credential, &failure);
+    response = std::move(result.body);
+    httpCode = result.statusCode;
+    if (result.status != MultiCurlClient::Status::success)
+    {
+      AwsHttpTransport::assignTransportFailure(result, failure);
+      co_return false;
+    }
+    co_return true;
   }
 
 private:
 
-  bool prepare(
+  ProdigyHostTask<bool> prepare(
+      CoroutineStack *coro,
       const ProdigyDNSRecordBinding& record,
       const ApiCredential& apiCredential,
       AwsCredentialMaterial& credential,
@@ -171,9 +224,24 @@ private:
       String& region,
       String& failure)
   {
-    if (parseAwsCredentialMaterial(apiCredential.material, credential, &failure) == false)
+    String refreshedMaterial;
+    AwsSecretStringScope refreshedMaterialScope(refreshedMaterial);
+    String refreshCommand;
+    if (prodigyDNSCredentialMetadata(apiCredential, "awsCredentialRefreshCommand", refreshCommand))
     {
-      return false;
+      if (co_await ProdigyCommandCapture::run(coro,
+                                              refreshCommand,
+                                              refreshedMaterial,
+                                              runtime.operationDeadline,
+                                              &failure) == false)
+      {
+        co_return false;
+      }
+    }
+    const String& material = refreshCommand.empty() ? apiCredential.material : refreshedMaterial;
+    if (parseAwsCredentialMaterial(material, credential, &failure) == false)
+    {
+      co_return false;
     }
 
     zone = record.zone;
@@ -185,70 +253,85 @@ private:
     {
       region.assign("us-east-1"_ctv);
     }
-    return true;
+    co_return true;
   }
 
-  bool change(bool removing, const ProdigyDNSRecordBinding& record, const ApiCredential& apiCredential, String& failure)
+  ProdigyHostTask<bool> change(CoroutineStack *coro,
+                               bool removing,
+                               const ProdigyDNSRecordBinding& record,
+                               const ApiCredential& apiCredential,
+                               String& failure)
   {
     AwsCredentialMaterial credential = {};
     String zone = {};
     String region = {};
-    if (prepare(record, apiCredential, credential, zone, region, failure) == false)
+    if (co_await prepare(coro, record, apiCredential, credential, zone, region, failure) == false)
     {
-      return false;
+      co_return false;
     }
     ProdigyDNSRecordPresence presence = {};
-    if (findRecord(record, credential, zone, region, presence, failure) == false)
+    if (co_await findRecord(coro, record, credential, zone, region, presence, failure) == false)
     {
-      return false;
+      co_return false;
     }
     if (presence == ProdigyDNSRecordPresence::missing)
     {
       if (removing)
       {
         failure.clear();
-        return true;
+        co_return true;
       }
     }
     else if (removing == false)
     {
       failure.clear();
-      return true;
+      co_return true;
     }
     String value = {};
     if (prodigyDNSRecordSingleValue(record, value, failure) == false)
     {
-      return false;
+      co_return false;
     }
     Vector<String> values = {};
     values.push_back(value);
-    return changeRecordSet(removing ? "DELETE" : "CREATE", record, credential, zone, region, values, failure);
+    co_return co_await changeRecordSet(coro,
+                                       removing ? "DELETE" : "CREATE",
+                                       record,
+                                       credential,
+                                       zone,
+                                       region,
+                                       values,
+                                       failure);
   }
 
-  bool changeTXT(bool removing, const ProdigyDNSRecordBinding& record, const ApiCredential& apiCredential, String& failure)
+  ProdigyHostTask<bool> changeTXT(CoroutineStack *coro,
+                                  bool removing,
+                                  const ProdigyDNSRecordBinding& record,
+                                  const ApiCredential& apiCredential,
+                                  String& failure)
   {
     String value = {};
     if (prodigyDNSRecordSingleTXTValue(record, value, failure) == false)
     {
-      return false;
+      co_return false;
     }
     AwsCredentialMaterial credential = {};
     String zone = {};
     String region = {};
-    if (prepare(record, apiCredential, credential, zone, region, failure) == false)
+    if (co_await prepare(coro, record, apiCredential, credential, zone, region, failure) == false)
     {
-      return false;
+      co_return false;
     }
     String response = {};
-    if (listRecordSets(record, credential, zone, region, response, failure) == false)
+    if (co_await listRecordSets(coro, record, credential, zone, region, response, failure) == false)
     {
-      return false;
+      co_return false;
     }
     Vector<String> oldValues = {};
     bool found = false;
     if (prodigyDNSCollectRoute53RecordValues(response, record, oldValues, found, failure) == false)
     {
-      return false;
+      co_return false;
     }
     Vector<String> newValues = oldValues;
     if (removing)
@@ -256,11 +339,12 @@ private:
       if (found == false || prodigyDNSRemoveProviderValue(record, newValues, value) == false)
       {
         failure.clear();
-        return true;
+        co_return true;
       }
       if (newValues.size() == 0)
       {
-        return changeRecordSet("DELETE", record, credential, zone, region, oldValues, failure);
+        co_return co_await changeRecordSet(
+            coro, "DELETE", record, credential, zone, region, oldValues, failure);
       }
     }
     else
@@ -268,16 +352,18 @@ private:
       if (prodigyDNSValuesContain(record, newValues, value))
       {
         failure.clear();
-        return true;
+        co_return true;
       }
       String quoted = {};
       prodigyDNSQuoteTXTValue(value, quoted);
       newValues.push_back(quoted);
     }
-    return changeRecordSet("UPSERT", record, credential, zone, region, newValues, failure);
+    co_return co_await changeRecordSet(
+        coro, "UPSERT", record, credential, zone, region, newValues, failure);
   }
 
-  bool changeRecordSet(
+  ProdigyHostTask<bool> changeRecordSet(
+      CoroutineStack *coro,
       const char *action,
       const ProdigyDNSRecordBinding& record,
       const AwsCredentialMaterial& credential,
@@ -286,8 +372,11 @@ private:
       const Vector<String>& values,
       String& failure)
   {
-    String url = {};
-    url.snprintf<"https://route53.amazonaws.com/2013-04-01/hostedzone/{}/rrset"_ctv>(zone);
+    AwsHttpRequest::Target target;
+    target.authority.assign("route53.amazonaws.com"_ctv);
+    target.path.snprintf<"/2013-04-01/hostedzone/{}/rrset"_ctv>(zone);
+    target.region.assign(region);
+    target.service.assign("route53"_ctv);
     String actionText = {};
     actionText.assign(action);
     String body = {};
@@ -305,51 +394,85 @@ private:
     body.append("</ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>"_ctv);
     String response = {};
     long httpCode = 0;
-    if (sendAWS("POST", url, region, credential, &body, response, httpCode) == false)
+    if (co_await sendAWS(coro,
+                         MultiCurlClient::Method::post,
+                         target,
+                         credential,
+                         &body,
+                         response,
+                         httpCode,
+                         failure) == false)
     {
-      failure.assign("route53 dns request failed"_ctv);
-      return false;
+      if (failure.empty())
+      {
+        failure.assign("route53 dns request failed"_ctv);
+      }
+      co_return false;
     }
     if (httpCode >= 200 && httpCode < 300)
     {
       failure.clear();
-      return true;
+      co_return true;
     }
-    failure.snprintf<"route53 dns change failed [http={itoa}]: {}"_ctv>(uint32_t(httpCode), response);
-    return false;
+    AwsHttpTransport::assignHttpFailure(
+        "route53 dns change failed"_ctv, httpCode, response, failure);
+    co_return false;
   }
 
-  bool findRecord(const ProdigyDNSRecordBinding& record, const AwsCredentialMaterial& credential, const String& zone, const String& region, ProdigyDNSRecordPresence& presence, String& failure)
+  ProdigyHostTask<bool> findRecord(CoroutineStack *coro,
+                                   const ProdigyDNSRecordBinding& record,
+                                   const AwsCredentialMaterial& credential,
+                                   const String& zone,
+                                   const String& region,
+                                   ProdigyDNSRecordPresence& presence,
+                                   String& failure)
   {
     String response = {};
-    if (listRecordSets(record, credential, zone, region, response, failure) == false)
+    if (co_await listRecordSets(coro, record, credential, zone, region, response, failure) == false)
     {
-      return false;
+      co_return false;
     }
-    return prodigyDNSFindRoute53Record(response, record, presence, failure);
+    co_return prodigyDNSFindRoute53Record(response, record, presence, failure);
   }
 
-  bool listRecordSets(const ProdigyDNSRecordBinding& record, const AwsCredentialMaterial& credential, const String& zone, const String& region, String& response, String& failure)
+  ProdigyHostTask<bool> listRecordSets(CoroutineStack *coro,
+                                       const ProdigyDNSRecordBinding& record,
+                                       const AwsCredentialMaterial& credential,
+                                       const String& zone,
+                                       const String& region,
+                                       String& response,
+                                       String& failure)
   {
-    String name = {};
-    String type = {};
-    if (prodigyDNSEncodePathPart(record.name, name, failure) == false || prodigyDNSEncodePathPart(record.type, type, failure) == false)
-    {
-      return false;
-    }
-    String url = {};
-    url.snprintf<"https://route53.amazonaws.com/2013-04-01/hostedzone/{}/rrset?name={}&type={}&maxitems=1"_ctv>(zone, name, type);
+    AwsHttpRequest::Target target;
+    target.authority.assign("route53.amazonaws.com"_ctv);
+    target.path.snprintf<"/2013-04-01/hostedzone/{}/rrset"_ctv>(zone);
+    target.query.push_back({"name"_ctv, record.name});
+    target.query.push_back({"type"_ctv, record.type});
+    target.query.push_back({"maxitems"_ctv, "1"_ctv});
+    target.region.assign(region);
+    target.service.assign("route53"_ctv);
     long httpCode = 0;
-    if (sendAWS("GET", url, region, credential, nullptr, response, httpCode) == false)
+    if (co_await sendAWS(coro,
+                         MultiCurlClient::Method::get,
+                         target,
+                         credential,
+                         nullptr,
+                         response,
+                         httpCode,
+                         failure) == false)
     {
-      failure.assign("route53 dns list failed"_ctv);
-      return false;
+      if (failure.empty())
+      {
+        failure.assign("route53 dns list failed"_ctv);
+      }
+      co_return false;
     }
     if (httpCode < 200 || httpCode >= 300)
     {
-      failure.snprintf<"route53 dns list failed [http={itoa}]: {}"_ctv>(uint32_t(httpCode), response);
-      return false;
+      AwsHttpTransport::assignHttpFailure(
+          "route53 dns list failed"_ctv, httpCode, response, failure);
+      co_return false;
     }
-    return true;
+    co_return true;
   }
 };

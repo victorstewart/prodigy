@@ -1,22 +1,7 @@
 #pragma once
 
-#include <switchboard/kernel/structs.h>
+#include <switchboard/kernel/flow.h>
 #include <switchboard/kernel/whitehole.maps.h>
-
-__attribute__((__always_inline__)) static inline void reverse_flow_key(const struct flow_key *forward, struct flow_key *reverse)
-{
-  if (forward == NULL || reverse == NULL)
-  {
-    return;
-  }
-
-  bpf_memset(reverse, 0, sizeof(*reverse));
-  bpf_memcpy(reverse->srcv6, forward->dstv6, sizeof(reverse->srcv6));
-  bpf_memcpy(reverse->dstv6, forward->srcv6, sizeof(reverse->dstv6));
-  reverse->port16[0] = forward->port16[1];
-  reverse->port16[1] = forward->port16[0];
-  reverse->proto = forward->proto;
-}
 
 __attribute__((__always_inline__)) static inline bool whitehole_binding_lookup(__u8 proto, bool is_ipv6, const void *address, __be16 port, struct switchboard_whitehole_binding *binding)
 {
@@ -56,4 +41,28 @@ __attribute__((__always_inline__)) static inline bool whitehole_binding_matches(
   }
 
   return lhs->nonce == rhs->nonce && lhs->container.hasID == rhs->container.hasID && bpf_memcmp(lhs->container.value, rhs->container.value, sizeof(lhs->container.value)) == 0;
+}
+
+__attribute__((__always_inline__)) static inline bool whitehole_reply_binding_lookup(const struct flow_key *flow,
+                                                                                      const struct switchboard_whitehole_binding *current,
+                                                                                      struct switchboard_whitehole_binding *binding)
+{
+  if (flow == NULL || current == NULL || binding == NULL)
+  {
+    return false;
+  }
+  struct switchboard_whitehole_reply *reply = bpf_map_lookup_elem(&white_replies, flow);
+  __u64 now = bpf_ktime_get_ns();
+  if (reply == NULL)
+  {
+    return false;
+  }
+  if (reply->expiresAtNs <= now || whitehole_binding_matches(current, &reply->binding) == false)
+  {
+    bpf_map_delete_elem(&white_replies, flow);
+    return false;
+  }
+  reply->expiresAtNs = now + WHITEHOLE_REPLY_IDLE_NS;
+  bpf_memcpy(binding, &reply->binding, sizeof(*binding));
+  return true;
 }

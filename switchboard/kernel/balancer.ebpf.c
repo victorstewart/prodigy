@@ -288,13 +288,13 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
 
   if (whitehole_bound)
   {
-    struct switchboard_whitehole_binding *reply_binding = bpf_map_lookup_elem(&white_replies, &pckt.flow);
-    if (whitehole_binding_matches(&whitehole_binding, reply_binding) == false)
+    struct switchboard_whitehole_binding reply_binding = {};
+    if (whitehole_reply_binding_lookup(&pckt.flow, &whitehole_binding, &reply_binding) == false)
     {
       return XDP_DROP;
     }
 
-    bpf_memcpy(&containerID, &reply_binding->container, sizeof(containerID));
+    bpf_memcpy(&containerID, &reply_binding.container, sizeof(containerID));
   }
 
   struct portal_definition portal = {};

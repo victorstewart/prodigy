@@ -4,17 +4,16 @@
 #include <prodigy/iaas/bootstrap.ssh.h>
 #include <prodigy/brain/base.h>
 #include <prodigy/brain/machine.h>
-#include <prodigy/child.process.signal.h>
 #include <prodigy/cluster.machine.helpers.h>
+#include <prodigy/command.capture.h>
+#include <prodigy/iaas/azure/azure.http.h>
 #include <prodigy/netdev.detect.h>
 #include <services/base64.h>
 
 #include <simdjson.h>
-#include <curl/curl.h>
 #include <limits>
 #include <cctype>
 #include <cstdio>
-#include <sys/wait.h>
 
 class AzureCredentialMaterial {
 public:
@@ -460,60 +459,6 @@ static inline uint32_t azureExtractRackUUID(simdjson::dom::element vm, const Str
   return 0;
 }
 
-class AzureHttp {
-public:
-
-  constexpr static long connectTimeoutMs = 10'000L;
-  constexpr static long timeoutMs = 60'000L;
-
-  static bool ensureGlobalInit(void);
-  static bool appendResponseBytes(String& out, const uint8_t *bytes, uint64_t bytesSize);
-  static void populateTransportFailure(CURLcode rc, const char *errorBuffer, String *transportFailure);
-  static bool send(const char *method, const String& url, const struct curl_slist *headers, const String *body, String& out, long *httpCode = nullptr, String *transportFailure = nullptr);
-
-  class MultiRequest {
-  public:
-
-    CURL *easy = nullptr;
-    struct curl_slist *headers = nullptr;
-    void *context = nullptr;
-    String method = {};
-    String url = {};
-    String body = {};
-    String response = {};
-    String transportFailure = {};
-    long timeoutMs = AzureHttp::timeoutMs;
-    long httpCode = 0;
-    CURLcode curlCode = CURLE_OK;
-    bool completed = false;
-    bool added = false;
-
-    void resetResult(void);
-    void clearTransport(void);
-    ~MultiRequest();
-  };
-
-  class MultiClient {
-  private:
-
-    CURLM *multi = nullptr;
-    Vector<MultiRequest *> completed = {};
-    uint32_t inFlight = 0;
-
-    static size_t writeResponse(char *ptr, size_t size, size_t nmemb, void *userdata);
-    void collectCompleted(void);
-
-  public:
-
-    bool init(void);
-    bool start(MultiRequest& request);
-    bool pump(int timeoutMs);
-    MultiRequest *popCompleted(void);
-    uint32_t pendingCount(void) const;
-    ~MultiClient();
-  };
-};
-
 static inline void azureAppendPercentEncoded(String& out, const String& value)
 {
   constexpr static char hex[] = "0123456789ABCDEF";
@@ -545,9 +490,8 @@ static inline void azureBuildResourceSkusURL(const String& subscriptionID, const
     return;
   }
 
-  // The unfiltered SKU catalog is enormous and regularly exceeds the fixed
-  // AzureHttp timeout. Restrict by location so control-plane SKU lookups stay
-  // bounded and deterministic.
+  // The unfiltered SKU catalog is enormous. Restrict by location so
+  // control-plane SKU lookups stay bounded and deterministic.
   url.append("&%24filter=location%20eq%20%27"_ctv);
   azureAppendPercentEncoded(url, location);
   url.append("%27"_ctv);
@@ -758,41 +702,11 @@ static inline bool azureApplyMachineTypeResourcesToMachine(
   return true;
 }
 
-class AzureMetadataClient {
-public:
-
-  bool get(const String& pathAndQuery, String& out, long *httpCode = nullptr, String *transportFailure = nullptr)
-  {
-    struct curl_slist *headers = nullptr;
-    headers = curl_slist_append(headers, "Metadata: true");
-
-    String url = {};
-    url.snprintf<"http://169.254.169.254{}"_ctv>(pathAndQuery);
-
-    bool ok = AzureHttp::send("GET", url, headers, nullptr, out, httpCode, transportFailure);
-    curl_slist_free_all(headers);
-    return ok;
-  }
-
-  bool get(const char *pathAndQuery, String& out, long *httpCode = nullptr, String *transportFailure = nullptr)
-  {
-    String ownedPath = {};
-    if (pathAndQuery != nullptr)
-    {
-      ownedPath.assign(pathAndQuery);
-    }
-
-    return get(ownedPath, out, httpCode, transportFailure);
-  }
-};
-
 class AzureNeuronIaaS : public NeuronIaaS {
 public:
 
-  void gatherSelfData(uint128_t& uuid, String& metro, bool& isBrain, EthDevice& eth, IPAddress& private4) override
+  void gatherSelfData(CoroutineStack *coro, uint128_t& uuid, String& metro, bool& isBrain, EthDevice& eth, IPAddress& private4) override
   {
-    AzureMetadataClient metadata;
-
     String deviceName;
     if (prodigyResolvePrimaryNetworkDevice(deviceName))
     {
@@ -804,13 +718,17 @@ public:
     isBrain = false;
     private4 = {};
 
-    String instance;
-    if (metadata.get("/metadata/instance?api-version=2021-02-01", instance))
+    String metadataPath = "/metadata/instance?api-version=2021-02-01"_ctv;
+    AzureHttpTransport transport(providerServices.http, providerServices.delay, providerServices.operationDeadline);
+    MultiCurlClient::Result metadata = co_await transport.send(
+        coro,
+        AzureHttpTransport::metadataRequest(metadataPath, providerServices.operationDeadline));
+    if (AzureHttpTransport::succeeded(metadata))
     {
       simdjson::dom::parser parser;
       simdjson::dom::element doc;
 
-      if (azureParseJSONDocument(instance, parser, doc))
+      if (azureParseJSONDocument(metadata.body, parser, doc))
       {
         std::string_view location;
         if (!doc["compute"]["location"].get(location))
@@ -869,12 +787,6 @@ public:
     config = {};
   }
 
-  void downloadContainerToPath(CoroutineStack *coro, uint64_t deploymentID, const String& path) override
-  {
-    (void)coro;
-    (void)deploymentID;
-    (void)path;
-  }
 };
 
 class AzureBrainIaaS : public BrainIaaS {
@@ -950,23 +862,26 @@ private:
     return true;
   }
 
-  bool resolveMachineTypeResources(const String& providerMachineType, AzureMachineTypeResources& resources, String& error)
+  ProdigyHostTask<bool> resolveMachineTypeResources(CoroutineStack *coro,
+                                                    const String& providerMachineType,
+                                                    AzureMachineTypeResources& resources,
+                                                    String& error)
   {
     error.clear();
     if (providerMachineType.size() == 0)
     {
       error.assign("azure providerMachineType missing"_ctv);
-      return false;
+      co_return false;
     }
 
     if (lookupCachedMachineTypeResources(providerMachineType, resources))
     {
-      return true;
+      co_return true;
     }
 
-    if (ensureScope(error) == false || ensureBearerToken(error) == false)
+    if (ensureScope(error) == false || co_await ensureBearerToken(coro, error) == false)
     {
-      return false;
+      co_return false;
     }
 
     String nextLink = {};
@@ -975,7 +890,7 @@ private:
     {
       String response = {};
       long httpCode = 0;
-      if (sendARM("GET", nextLink, nullptr, response, error, &httpCode) == false)
+      if (co_await sendARM(coro, MultiCurlClient::Method::get, nextLink, nullptr, response, error, &httpCode) == false)
       {
         if (httpCode < 200 || httpCode >= 300)
         {
@@ -984,14 +899,14 @@ private:
             error.assign("azure resource skus request failed"_ctv);
           }
         }
-        return false;
+        co_return false;
       }
 
       simdjson::dom::parser parser;
       simdjson::dom::element doc = {};
       if (azureParseJSONDocument(response, parser, doc, &error, "azure resource skus response parse failed"_ctv) == false)
       {
-        return false;
+        co_return false;
       }
 
       if (doc["value"].is_array())
@@ -1013,11 +928,11 @@ private:
           if (azureExtractMachineTypeResources(sku, resources) == false)
           {
             error.assign("azure resource sku missing vCPUs or MemoryGB capability"_ctv);
-            return false;
+            co_return false;
           }
 
           machineTypeResourcesByType.insert_or_assign(providerMachineType, resources);
-          return true;
+          co_return true;
         }
       }
 
@@ -1033,7 +948,7 @@ private:
     }
 
     error.snprintf<"azure resource sku '{}' not found"_ctv>(providerMachineType);
-    return false;
+    co_return false;
   }
 
   static bool parseAzureErrorMessage(const String& response, String& failure)
@@ -1139,84 +1054,6 @@ private:
   static bool azureStringHasContent(const String& value)
   {
     return value.size() > 0 && value[0] != '\0';
-  }
-
-  static void trimTrailingAsciiWhitespace(String& value)
-  {
-    while (value.size() > 0)
-    {
-      uint8_t ch = value[value.size() - 1];
-      if (ch != ' ' && ch != '\n' && ch != '\r' && ch != '\t')
-      {
-        break;
-      }
-
-      value.resize(value.size() - 1);
-    }
-  }
-
-  static bool runCommandCaptureOutput(const String& command, String& output, String *failure)
-  {
-    output.clear();
-    if (failure)
-    {
-      failure->clear();
-    }
-
-    String ownedCommand = {};
-    ownedCommand.assign(command);
-    ownedCommand.addNullTerminator();
-
-    (void)prodigyEnsureSigchldDefaultWaitable();
-    FILE *pipe = ::popen(ownedCommand.c_str(), "r");
-    if (pipe == nullptr)
-    {
-      if (failure)
-      {
-        failure->assign("failed to spawn command"_ctv);
-      }
-      return false;
-    }
-
-    char buffer[4096];
-    while (true)
-    {
-      size_t nRead = fread(buffer, 1, sizeof(buffer), pipe);
-      if (nRead > 0)
-      {
-        output.append(reinterpret_cast<const uint8_t *>(buffer), nRead);
-      }
-
-      if (nRead < sizeof(buffer))
-      {
-        break;
-      }
-    }
-
-    int status = ::pclose(pipe);
-    trimTrailingAsciiWhitespace(output);
-    if (status == 0)
-    {
-      return true;
-    }
-
-    if (failure)
-    {
-      if (output.size() > 0)
-      {
-        failure->assign(output);
-      }
-      else if (WIFEXITED(status))
-      {
-        failure->snprintf<"command exited with status {itoa}"_ctv>(uint32_t(WEXITSTATUS(status)));
-      }
-      else
-      {
-        failure->assign("command failed"_ctv);
-      }
-    }
-
-    return false;
   }
 
   static bool azureHasPrefix(const String& value, const String& prefix)
@@ -1347,12 +1184,12 @@ private:
     return parseAzureProviderScope(runtimeEnvironment.providerScope, subscriptionID, resourceGroup, location, &failure);
   }
 
-  bool ensureResourceGroup(String& failure)
+  ProdigyHostTask<bool> ensureResourceGroup(CoroutineStack *coro, String& failure)
   {
     failure.clear();
     if (ensureScope(failure) == false)
     {
-      return false;
+      co_return false;
     }
 
     String url = {};
@@ -1364,44 +1201,49 @@ private:
     body.snprintf<"{\"location\":\"{}\"}"_ctv>(location);
 
     String response = {};
-    if (sendARM("PUT", url, &body, response, failure) == false)
+    if (co_await sendARM(coro, MultiCurlClient::Method::put, url, &body, response, failure) == false)
     {
-      return false;
+      co_return false;
     }
 
     for (uint32_t attempt = 0; attempt < 120; ++attempt)
     {
       response.clear();
-      if (sendARM("GET", url, nullptr, response, failure) == false)
+      if (co_await sendARM(coro, MultiCurlClient::Method::get, url, nullptr, response, failure) == false)
       {
-        return false;
+        co_return false;
       }
 
       simdjson::dom::parser parser;
       simdjson::dom::element doc = {};
       if (azureParseJSONDocument(response, parser, doc, &failure, "azure resource group json parse failed"_ctv) == false)
       {
-        return false;
+        co_return false;
       }
 
       std::string_view provisioningState = {};
       (void)doc["properties"]["provisioningState"].get(provisioningState);
       if (provisioningState.size() == 0 || provisioningState == "Succeeded")
       {
-        return true;
+        co_return true;
       }
 
       if (provisioningState == "Failed")
       {
         failure.assign("azure resource group provisioning failed"_ctv);
-        return false;
+        co_return false;
       }
 
-      usleep(500 * 1000);
+      AzureHttpTransport transport(providerServices.http, providerServices.delay, providerServices.operationDeadline);
+      if (co_await transport.wait(coro) == false)
+      {
+        failure.assign("azure resource group wait canceled"_ctv);
+        co_return false;
+      }
     }
 
     failure.assign("azure resource group provisioning timed out"_ctv);
-    return false;
+    co_return false;
   }
 
   bool ensureCredential(String& failure)
@@ -1429,13 +1271,17 @@ private:
     return runtimeEnvironment.azure.bootstrapAccessTokenRefreshCommand.size() > 0;
   }
 
-  bool refreshAzureBootstrapAccessToken(String& failure)
+  ProdigyHostTask<bool> refreshAzureBootstrapAccessToken(CoroutineStack *coro, String& failure)
   {
     failure.clear();
 
     String refreshedToken = {};
     String detail = {};
-    if (runCommandCaptureOutput(runtimeEnvironment.azure.bootstrapAccessTokenRefreshCommand, refreshedToken, &detail) == false)
+    if (co_await ProdigyCommandCapture::run(coro,
+                                            runtimeEnvironment.azure.bootstrapAccessTokenRefreshCommand,
+                                            refreshedToken,
+                                            providerServices.operationDeadline,
+                                            &detail) == false)
     {
       if (runtimeEnvironment.azure.bootstrapAccessTokenRefreshFailureHint.size() > 0)
       {
@@ -1450,7 +1296,7 @@ private:
       {
         failure = detail;
       }
-      return false;
+      co_return false;
     }
 
     if (azureStringHasContent(refreshedToken) == false)
@@ -1461,37 +1307,37 @@ private:
         failure.append("\n"_ctv);
         failure.append(runtimeEnvironment.azure.bootstrapAccessTokenRefreshFailureHint);
       }
-      return false;
+      co_return false;
     }
 
     credential.accessToken = refreshedToken;
     bearerToken = refreshedToken;
     bearerTokenExpiryMs = Time::now<TimeResolution::ms>() + Time::minsToMs(50);
-    return true;
+    co_return true;
   }
 
-  bool ensureBearerToken(String& failure)
+  ProdigyHostTask<bool> ensureBearerToken(CoroutineStack *coro, String& failure)
   {
     if (Time::now<TimeResolution::ms>() + 30 * 1000 < bearerTokenExpiryMs && bearerToken.size() > 0)
     {
-      return true;
+      co_return true;
     }
 
     if (ensureCredential(failure) == false)
     {
-      return false;
+      co_return false;
     }
 
     if (runtimeEnvironment.azure.managedIdentityResourceID.size() == 0 && azureHasBootstrapAccessTokenRefreshCommand())
     {
-      return refreshAzureBootstrapAccessToken(failure);
+      co_return co_await refreshAzureBootstrapAccessToken(coro, failure);
     }
 
     if (credential.accessToken.size() > 0)
     {
       bearerToken = credential.accessToken;
       bearerTokenExpiryMs = std::numeric_limits<int64_t>::max();
-      return true;
+      co_return true;
     }
 
     if (credential.clientID.size() > 0 && credential.clientSecret.size() > 0 && credential.tenantID.size() > 0)
@@ -1507,23 +1353,21 @@ private:
       String url = {};
       url.snprintf<"https://login.microsoftonline.com/{}/oauth2/v2.0/token"_ctv>(credential.tenantID);
 
-      struct curl_slist *headers = nullptr;
-      headers = curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded");
-      String response;
-      long httpCode = 0;
-      bool ok = AzureHttp::send("POST", url, headers, &form, response, &httpCode);
-      curl_slist_free_all(headers);
-      if (ok == false || httpCode < 200 || httpCode >= 300)
+      AzureHttpTransport transport(providerServices.http, providerServices.delay, providerServices.operationDeadline);
+      MultiCurlClient::Request request = transport.request(MultiCurlClient::Method::post, url, "login.microsoftonline.com"_ctv, &form);
+      request.headers.push_back({"Content-Type"_ctv, "application/x-www-form-urlencoded"_ctv});
+      MultiCurlClient::Result result = co_await transport.send(coro, std::move(request));
+      if (AzureHttpTransport::succeeded(result) == false)
       {
         failure.assign("azure aad token request failed"_ctv);
-        return false;
+        co_return false;
       }
 
       simdjson::dom::parser parser;
       simdjson::dom::element doc;
-      if (azureParseJSONDocument(response, parser, doc, &failure, "azure aad token json parse failed"_ctv) == false)
+      if (azureParseJSONDocument(result.body, parser, doc, &failure, "azure aad token json parse failed"_ctv) == false)
       {
-        return false;
+        co_return false;
       }
 
       std::string_view accessToken;
@@ -1531,16 +1375,14 @@ private:
       if (doc["access_token"].get(accessToken))
       {
         failure.assign("azure aad token missing access_token"_ctv);
-        return false;
+        co_return false;
       }
       (void)doc["expires_in"].get(expiresIn);
       bearerToken.assign(accessToken);
       bearerTokenExpiryMs = Time::now<TimeResolution::ms>() + int64_t(expiresIn) * 1000LL;
-      return true;
+      co_return true;
     }
 
-    AzureMetadataClient metadata;
-    String response;
     String metadataPath = {};
     metadataPath.assign("/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F"_ctv);
     if (runtimeEnvironment.azure.managedIdentityResourceID.size() > 0)
@@ -1556,24 +1398,25 @@ private:
 
     for (;;)
     {
-      response.clear();
-      long httpCode = 0;
-      String transportFailure = {};
-      if (metadata.get(metadataPath, response, &httpCode, &transportFailure) == false)
+      AzureHttpTransport transport(providerServices.http, providerServices.delay, providerServices.operationDeadline);
+      MultiCurlClient::Result result = co_await transport.send(
+          coro,
+          AzureHttpTransport::metadataRequest(metadataPath, providerServices.operationDeadline));
+      if (result.status != MultiCurlClient::Status::success)
       {
-        lastIdentityFailure.assign(transportFailure.size() > 0 ? transportFailure : "azure managed identity token request failed"_ctv);
+        AzureHttpTransport::assignTransportFailure(result, lastIdentityFailure);
       }
       else
       {
         simdjson::dom::parser parser;
         simdjson::dom::element doc;
-        if (azureParseJSONDocument(response, parser, doc, &lastIdentityFailure, "azure managed identity token json parse failed"_ctv) == false)
+        if (azureParseJSONDocument(result.body, parser, doc, &lastIdentityFailure, "azure managed identity token json parse failed"_ctv) == false)
         {
-          return false;
+          co_return false;
         }
 
         std::string_view accessToken = {};
-        if (httpCode >= 200 && httpCode < 300 && doc["access_token"].get(accessToken) == simdjson::SUCCESS && accessToken.size() > 0)
+        if (result.statusCode >= 200 && result.statusCode < 300 && doc["access_token"].get(accessToken) == simdjson::SUCCESS && accessToken.size() > 0)
         {
           bearerToken.assign(accessToken);
 
@@ -1592,28 +1435,33 @@ private:
           }
 
           bearerTokenExpiryMs = Time::now<TimeResolution::ms>() + int64_t(expiresInSeconds) * 1000LL;
-          return true;
+          co_return true;
         }
 
         lastIdentityFailure.clear();
-        if (parseAzureErrorMessage(response, lastIdentityFailure) == false)
+        if (parseAzureErrorMessage(result.body, lastIdentityFailure) == false)
         {
           lastIdentityFailure.assign("azure managed identity token missing access_token"_ctv);
         }
 
-        if (httpCode > 0)
+        if (result.statusCode > 0)
         {
-          lastIdentityFailure.snprintf_add<" [http={itoa}]"_ctv>(uint32_t(httpCode));
+          lastIdentityFailure.snprintf_add<" [http={itoa}]"_ctv>(uint32_t(result.statusCode));
         }
       }
 
       if (Time::now<TimeResolution::ms>() >= deadlineMs)
       {
         failure.assign(lastIdentityFailure);
-        return false;
+        co_return false;
       }
 
-      usleep(backoffMs * 1000);
+      AzureHttpTransport waitTransport(providerServices.http, providerServices.delay, providerServices.operationDeadline);
+      if (co_await waitTransport.wait(coro, uint64_t(backoffMs) * 1000) == false)
+      {
+        failure.assign(lastIdentityFailure);
+        co_return false;
+      }
       if (backoffMs < 2000)
       {
         backoffMs = std::min<uint32_t>(backoffMs * 2, 2000);
@@ -1621,13 +1469,12 @@ private:
     }
   }
 
-  void buildAuthHeaders(struct curl_slist *& headers)
+  void buildAuthHeaders(MultiCurlClient::Request& request)
   {
-    headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
+    request.headers.push_back({"Content-Type"_ctv, "application/json"_ctv});
     String auth = {};
-    auth.snprintf<"Authorization: Bearer {}"_ctv>(bearerToken);
-    headers = curl_slist_append(headers, auth.c_str());
+    auth.snprintf<"Bearer {}"_ctv>(bearerToken);
+    request.headers.push_back({"Authorization"_ctv, std::move(auth)});
   }
 
   class PendingMachineProvisioning {
@@ -1635,389 +1482,65 @@ private:
 
     String vmName = {};
     String providerMachineType = {};
-  };
-
-  class ConcurrentWaitCoordinator;
-
-  class ConcurrentWaitTask : public CoroutineStack {
-  public:
-
-    ConcurrentWaitCoordinator *coordinator = nullptr;
-    PendingMachineProvisioning pending = {};
-    String schema = {};
-    MachineLifetime lifetime = MachineLifetime::spot;
-    bool sleeping = false;
-    int64_t wakeAtMs = 0;
-    bool done = false;
-    bool success = false;
-    bool provisioningReported = false;
-    String error = {};
-    Machine *machine = nullptr;
-    AzureHttp::MultiRequest request = {};
-
-    ~ConcurrentWaitTask()
-    {
-      if (machine != nullptr)
-      {
-        delete machine;
-        machine = nullptr;
-      }
-    }
-
-    void sleepForMs(uint32_t delayMs)
-    {
-      sleeping = true;
-      wakeAtMs = Time::now<TimeResolution::ms>() + int64_t(delayMs);
-    }
-
-    bool startRequest(void)
-    {
-      request.clearTransport();
-      request.resetResult();
-      request.context = this;
-      request.method.assign("GET"_ctv);
-      request.url.snprintf<"https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Compute/virtualMachines/{}?api-version=2025-04-01"_ctv>(
-          coordinator->owner->subscriptionID,
-          coordinator->owner->resourceGroup,
-          pending.vmName);
-      request.timeoutMs = AzureHttp::timeoutMs;
-      if (coordinator->owner->ensureBearerToken(error) == false)
-      {
-        return false;
-      }
-
-      coordinator->owner->buildAuthHeaders(request.headers);
-      if (request.headers == nullptr)
-      {
-        error.assign("azure auth headers missing"_ctv);
-        return false;
-      }
-
-      if (coordinator->http.start(request) == false)
-      {
-        error.assign("azure concurrent request start failed"_ctv);
-        return false;
-      }
-
-      return true;
-    }
-
-    void execute(void)
-    {
-      int64_t deadlineMs = Time::now<TimeResolution::ms>() + int64_t(prodigyMachineProvisioningTimeoutMs);
-      while (Time::now<TimeResolution::ms>() < deadlineMs)
-      {
-        if (startRequest() == false)
-        {
-          done = true;
-          success = false;
-          co_return;
-        }
-
-        co_await suspend();
-
-        if (request.curlCode != CURLE_OK || request.httpCode < 200 || request.httpCode >= 300)
-        {
-          sleepForMs(prodigyMachineProvisioningPollSleepMs);
-          co_await suspend();
-          continue;
-        }
-
-        simdjson::dom::parser parser;
-        simdjson::dom::element vm = {};
-        if (azureParseJSONDocument(request.response, parser, vm, &error, "azure vm json parse failed"_ctv) == false)
-        {
-          done = true;
-          success = false;
-          co_return;
-        }
-
-        std::string_view provisioningState = {};
-        (void)vm["properties"]["provisioningState"].get(provisioningState);
-        MachineProvisioningProgress& progress = coordinator->owner->provisioningProgress.upsert(schema, pending.providerMachineType, pending.vmName, String());
-        if (provisioningState == "Failed")
-        {
-          progress.status.assign("Failed"_ctv);
-          progress.ready = false;
-          coordinator->owner->provisioningProgress.emitNow();
-          error.assign("azure vm provisioning failed"_ctv);
-          done = true;
-          success = false;
-          co_return;
-        }
-
-        if (machine != nullptr)
-        {
-          delete machine;
-          machine = nullptr;
-        }
-
-        machine = coordinator->owner->buildMachineFromVM(vm);
-        if (machine != nullptr)
-        {
-          progress.cloud.cloudID = machine->cloudID;
-          prodigyPopulateMachineProvisioningProgressFromMachine(progress, *machine);
-        }
-
-        if (machine != nullptr && provisioningState == "Succeeded" && prodigyMachineProvisioningReady(*machine))
-        {
-          progress.status.assign("Succeeded"_ctv);
-          progress.ready = true;
-          if (provisioningReported == false)
-          {
-            coordinator->owner->provisioningProgress.notifyMachineProvisioned(*machine);
-            provisioningReported = true;
-          }
-          coordinator->owner->provisioningProgress.emitNow();
-          machine->lifetime = lifetime;
-          done = true;
-          success = true;
-          co_return;
-        }
-
-        progress.status.assign(provisioningState);
-        progress.ready = false;
-        if (machine != nullptr)
-        {
-          delete machine;
-          machine = nullptr;
-        }
-        coordinator->owner->provisioningProgress.emitMaybe(Time::now<TimeResolution::ms>());
-        sleepForMs(prodigyMachineProvisioningPollSleepMs);
-        co_await suspend();
-      }
-
-      error.assign("azure vm provisioning timed out"_ctv);
-      done = true;
-      success = false;
-    }
-  };
-
-  class ConcurrentWaitCoordinator {
-  public:
-
-    AzureBrainIaaS *owner = nullptr;
-    AzureHttp::MultiClient http = {};
-    Vector<ConcurrentWaitTask *> tasks = {};
-
-    explicit ConcurrentWaitCoordinator(AzureBrainIaaS *thisOwner)
-        : owner(thisOwner)
-    {
-    }
-
-    ~ConcurrentWaitCoordinator()
-    {
-      for (ConcurrentWaitTask *task : tasks)
-      {
-        delete task;
-      }
-      tasks.clear();
-    }
-
-    bool allDone(void) const
-    {
-      for (ConcurrentWaitTask *task : tasks)
-      {
-        if (task != nullptr && task->done == false)
-        {
-          return false;
-        }
-      }
-
-      return true;
-    }
-
-    int64_t nextWakeAtMs(void) const
-    {
-      int64_t nextWake = 0;
-      for (ConcurrentWaitTask *task : tasks)
-      {
-        if (task == nullptr || task->done || task->sleeping == false)
-        {
-          continue;
-        }
-
-        if (nextWake == 0 || task->wakeAtMs < nextWake)
-        {
-          nextWake = task->wakeAtMs;
-        }
-      }
-
-      return nextWake;
-    }
-
-    static void resumeTaskOnce(ConcurrentWaitTask *task)
-    {
-      if (task == nullptr || task->hasSuspendedCoroutines() == false)
-      {
-        return;
-      }
-
-      task->runNextSuspended();
-    }
-
-    void wakeReadySleepers(void)
-    {
-      int64_t nowMs = Time::now<TimeResolution::ms>();
-      for (ConcurrentWaitTask *task : tasks)
-      {
-        if (task == nullptr || task->done || task->sleeping == false || task->wakeAtMs > nowMs)
-        {
-          continue;
-        }
-
-        task->sleeping = false;
-        resumeTaskOnce(task);
-      }
-    }
-
-    bool nudgeDormantTasks(void)
-    {
-      bool nudged = false;
-      for (ConcurrentWaitTask *task : tasks)
-      {
-        if (task == nullptr || task->done || task->sleeping)
-        {
-          continue;
-        }
-
-        resumeTaskOnce(task);
-        nudged = true;
-      }
-
-      return nudged;
-    }
-
-    bool run(const String& schema, MachineLifetime lifetime, const Vector<PendingMachineProvisioning>& pendingMachines, Vector<Machine *>& readyMachines, String& error)
-    {
-      error.clear();
-      readyMachines.clear();
-      uint32_t dormantNudges = 0;
-
-      for (const PendingMachineProvisioning& pending : pendingMachines)
-      {
-        ConcurrentWaitTask *task = new ConcurrentWaitTask();
-        task->coordinator = this;
-        task->pending = pending;
-        task->schema = schema;
-        task->lifetime = lifetime;
-        tasks.push_back(task);
-        task->execute();
-      }
-
-      while (allDone() == false)
-      {
-        wakeReadySleepers();
-
-        while (AzureHttp::MultiRequest *completed = http.popCompleted())
-        {
-          ConcurrentWaitTask *task = reinterpret_cast<ConcurrentWaitTask *>(completed->context);
-          if (task != nullptr && task->done == false)
-          {
-            resumeTaskOnce(task);
-          }
-        }
-
-        if (allDone())
-        {
-          break;
-        }
-
-        int64_t nowMs = Time::now<TimeResolution::ms>();
-        int64_t nextWakeMs = nextWakeAtMs();
-        int timeoutMs = 50;
-        if (nextWakeMs > nowMs)
-        {
-          int64_t delayMs = nextWakeMs - nowMs;
-          timeoutMs = int(delayMs > 50 ? 50 : delayMs);
-        }
-        else if (nextWakeMs == 0 && http.pendingCount() == 0)
-        {
-          if (nudgeDormantTasks())
-          {
-            dormantNudges += 1;
-            if (dormantNudges < 8)
-            {
-              continue;
-            }
-          }
-
-          error.assign("azure concurrent wait stalled with no pending work"_ctv);
-          return false;
-        }
-        else
-        {
-          dormantNudges = 0;
-        }
-
-        if (http.pendingCount() > 0)
-        {
-          if (http.pump(timeoutMs) == false)
-          {
-            error.assign("azure concurrent wait pump failed"_ctv);
-            return false;
-          }
-        }
-        else
-        {
-          usleep(useconds_t(timeoutMs) * 1000u);
-        }
-      }
-
-      for (ConcurrentWaitTask *task : tasks)
-      {
-        if (task == nullptr)
-        {
-          continue;
-        }
-
-        if (task->success == false)
-        {
-          error = task->error;
-          return false;
-        }
-
-        readyMachines.push_back(task->machine);
-        task->machine = nullptr;
-      }
-
-      return true;
-    }
+    bool ready = false;
   };
 
 protected:
 
-  virtual bool sendARMRaw(const char *method, const String& url, const String *body, String& response, long *httpCode, String& failure)
+  virtual ProdigyHostTask<bool> sendARMRaw(CoroutineStack *coro,
+                                          MultiCurlClient::Method method,
+                                          const String& url,
+                                          const String *body,
+                                          String& response,
+                                          long *httpCode,
+                                          String& failure)
   {
-    if (ensureBearerToken(failure) == false)
+    if (co_await ensureBearerToken(coro, failure) == false)
     {
       if (httpCode)
       {
         *httpCode = 0;
       }
-      return false;
+      co_return false;
     }
 
-    struct curl_slist *headers = nullptr;
-    buildAuthHeaders(headers);
-    bool ok = AzureHttp::send(method, url, headers, body, response, httpCode, &failure);
-    curl_slist_free_all(headers);
-    return ok;
+    AzureHttpTransport transport(providerServices.http, providerServices.delay, providerServices.operationDeadline);
+    MultiCurlClient::Request request = transport.request(method, url, "management.azure.com"_ctv, body);
+    buildAuthHeaders(request);
+    MultiCurlClient::Result result = co_await transport.send(coro, std::move(request));
+    response = std::move(result.body);
+    if (httpCode)
+    {
+      *httpCode = result.statusCode;
+    }
+    if (result.status != MultiCurlClient::Status::success)
+    {
+      AzureHttpTransport::assignTransportFailure(result, failure);
+      co_return false;
+    }
+    failure.clear();
+    co_return true;
   }
 
 private:
 
-  bool sendARM(const char *method, const String& url, const String *body, String& response, String& failure, long *httpCode = nullptr)
+  ProdigyHostTask<bool> sendARM(CoroutineStack *coro,
+                               MultiCurlClient::Method method,
+                               const String& url,
+                               const String *body,
+                               String& response,
+                               String& failure,
+                               long *httpCode = nullptr)
   {
     long localHTTPCode = 0;
-    bool ok = sendARMRaw(method, url, body, response, &localHTTPCode, failure);
+    bool ok = co_await sendARMRaw(coro, method, url, body, response, &localHTTPCode, failure);
     if (httpCode)
     {
       *httpCode = localHTTPCode;
     }
     if (ok == false)
     {
-      return false;
+      co_return false;
     }
 
     if (localHTTPCode < 200 || localHTTPCode >= 300)
@@ -2027,11 +1550,11 @@ private:
         failure.assign("azure request failed"_ctv);
       }
       failure.snprintf_add<" [http={itoa}]"_ctv>(uint32_t(localHTTPCode));
-      return false;
+      co_return false;
     }
 
     failure.clear();
-    return true;
+    co_return true;
   }
 
   bool resolvePublicIPPrefixResourceID(const String& providerPool, String& prefixID, String& failure)
@@ -2101,14 +1624,19 @@ private:
     prodigyAppendEscapedJSONStringLiteral(body, value);
   }
 
-  bool fetchPublicIPAddressByConcreteAddress(const String& requestedAddress, String& publicIPID, String& ipConfigurationID, String& concreteAddress, String& failure)
+  ProdigyHostTask<bool> fetchPublicIPAddressByConcreteAddress(CoroutineStack *coro,
+                                                              const String& requestedAddress,
+                                                              String& publicIPID,
+                                                              String& ipConfigurationID,
+                                                              String& concreteAddress,
+                                                              String& failure)
   {
     publicIPID.clear();
     ipConfigurationID.clear();
     concreteAddress.clear();
     if (ensureScope(failure) == false)
     {
-      return false;
+      co_return false;
     }
 
     String url = {};
@@ -2117,16 +1645,16 @@ private:
         resourceGroup);
 
     String response = {};
-    if (sendARM("GET", url, nullptr, response, failure) == false)
+    if (co_await sendARM(coro, MultiCurlClient::Method::get, url, nullptr, response, failure) == false)
     {
-      return false;
+      co_return false;
     }
 
     simdjson::dom::parser parser;
     simdjson::dom::element doc;
     if (azureParseJSONDocument(response, parser, doc, &failure, "azure public ip list json parse failed"_ctv) == false)
     {
-      return false;
+      co_return false;
     }
 
     if (auto values = doc["value"]; values.is_array())
@@ -2143,7 +1671,7 @@ private:
         if (publicIP["id"].get(id))
         {
           failure.assign("azure public ip missing id"_ctv);
-          return false;
+          co_return false;
         }
 
         publicIPID.assign(id);
@@ -2153,42 +1681,46 @@ private:
         {
           ipConfigurationID.assign(ipConfigIDView);
         }
-        return true;
+        co_return true;
       }
     }
 
     failure.snprintf<"azure public ip {} not found"_ctv>(requestedAddress);
-    return false;
+    co_return false;
   }
 
-  bool fetchMachinePrimaryNICAndConfig(const String& machineCloudID, String& nicID, String& ipConfigName, String& failure)
+  ProdigyHostTask<bool> fetchMachinePrimaryNICAndConfig(CoroutineStack *coro,
+                                                        const String& machineCloudID,
+                                                        String& nicID,
+                                                        String& ipConfigName,
+                                                        String& failure)
   {
     nicID.clear();
     ipConfigName.clear();
     if (ensureScope(failure) == false)
     {
-      return false;
+      co_return false;
     }
 
     if (machineCloudID.size() == 0)
     {
       failure.assign("azure machine cloudID required"_ctv);
-      return false;
+      co_return false;
     }
 
     String vmURL = {};
     vmURL.snprintf<"https://management.azure.com{}?api-version=2025-04-01"_ctv>(machineCloudID);
     String vmResponse = {};
-    if (sendARM("GET", vmURL, nullptr, vmResponse, failure) == false)
+    if (co_await sendARM(coro, MultiCurlClient::Method::get, vmURL, nullptr, vmResponse, failure) == false)
     {
-      return false;
+      co_return false;
     }
 
     simdjson::dom::parser vmParser;
     simdjson::dom::element vm;
     if (azureParseJSONDocument(vmResponse, vmParser, vm, &failure, "azure vm json parse failed"_ctv) == false)
     {
-      return false;
+      co_return false;
     }
 
     bool foundPrimaryNic = false;
@@ -2219,22 +1751,22 @@ private:
     if (nicID.size() == 0)
     {
       failure.assign("azure vm missing network interface id"_ctv);
-      return false;
+      co_return false;
     }
 
     String nicURL = {};
     nicURL.snprintf<"https://management.azure.com{}?api-version=2024-05-01"_ctv>(nicID);
     String nicResponse = {};
-    if (sendARM("GET", nicURL, nullptr, nicResponse, failure) == false)
+    if (co_await sendARM(coro, MultiCurlClient::Method::get, nicURL, nullptr, nicResponse, failure) == false)
     {
-      return false;
+      co_return false;
     }
 
     simdjson::dom::parser nicParser;
     simdjson::dom::element nic;
     if (azureParseJSONDocument(nicResponse, nicParser, nic, &failure, "azure nic json parse failed"_ctv) == false)
     {
-      return false;
+      co_return false;
     }
 
     if (auto ipConfigs = nic["properties"]["ipConfigurations"]; ipConfigs.is_array())
@@ -2263,34 +1795,38 @@ private:
     if (ipConfigName.size() == 0)
     {
       failure.assign("azure nic missing ipConfiguration name"_ctv);
-      return false;
+      co_return false;
     }
 
-    return true;
+    co_return true;
   }
 
-  bool patchNICPublicIPAddress(const String& nicID, const String& targetIPConfigName, const String *newPublicIPID, String& failure)
+  ProdigyHostTask<bool> patchNICPublicIPAddress(CoroutineStack *coro,
+                                                const String& nicID,
+                                                const String& targetIPConfigName,
+                                                const String *newPublicIPID,
+                                                String& failure)
   {
     failure.clear();
     if (nicID.size() == 0 || targetIPConfigName.size() == 0)
     {
       failure.assign("azure nic patch requires nicID and ipConfiguration name"_ctv);
-      return false;
+      co_return false;
     }
 
     String nicURL = {};
     nicURL.snprintf<"https://management.azure.com{}?api-version=2024-05-01"_ctv>(nicID);
     String nicResponse = {};
-    if (sendARM("GET", nicURL, nullptr, nicResponse, failure) == false)
+    if (co_await sendARM(coro, MultiCurlClient::Method::get, nicURL, nullptr, nicResponse, failure) == false)
     {
-      return false;
+      co_return false;
     }
 
     simdjson::dom::parser parser;
     simdjson::dom::element nic;
     if (azureParseJSONDocument(nicResponse, parser, nic, &failure, "azure nic json parse failed"_ctv) == false)
     {
-      return false;
+      co_return false;
     }
 
     String body = {};
@@ -2418,7 +1954,7 @@ private:
     if (matchedTarget == false)
     {
       failure.assign("azure target ipConfiguration missing"_ctv);
-      return false;
+      co_return false;
     }
 
     body.append("]"_ctv);
@@ -2464,10 +2000,15 @@ private:
     body.append("}}"_ctv);
 
     String patchResponse = {};
-    return sendARM("PATCH", nicURL, &body, patchResponse, failure);
+    co_return co_await sendARM(coro, MultiCurlClient::Method::patch, nicURL, &body, patchResponse, failure);
   }
 
-  bool waitForPublicIPAddressState(const String& publicIPID, const String& expectedIPConfigurationID, bool expectAttached, String *resolvedAddress, String& failure)
+  ProdigyHostTask<bool> waitForPublicIPAddressState(CoroutineStack *coro,
+                                                    const String& publicIPID,
+                                                    const String& expectedIPConfigurationID,
+                                                    bool expectAttached,
+                                                    String *resolvedAddress,
+                                                    String& failure)
   {
     failure.clear();
     if (resolvedAddress)
@@ -2478,7 +2019,7 @@ private:
     if (publicIPID.size() == 0)
     {
       failure.assign("azure public ip id required"_ctv);
-      return false;
+      co_return false;
     }
 
     for (uint32_t attempt = 0; attempt < 60; ++attempt)
@@ -2487,16 +2028,16 @@ private:
       url.snprintf<"https://management.azure.com{}?api-version=2024-05-01"_ctv>(publicIPID);
 
       String response = {};
-      if (sendARM("GET", url, nullptr, response, failure) == false)
+      if (co_await sendARM(coro, MultiCurlClient::Method::get, url, nullptr, response, failure) == false)
       {
-        return false;
+        co_return false;
       }
 
       simdjson::dom::parser parser;
       simdjson::dom::element doc;
       if (azureParseJSONDocument(response, parser, doc, &failure, "azure public ip json parse failed"_ctv) == false)
       {
-        return false;
+        co_return false;
       }
 
       std::string_view address = {};
@@ -2522,19 +2063,24 @@ private:
       {
         if (ready && attached && matches && resolvedAddress != nullptr && resolvedAddress->size() > 0)
         {
-          return true;
+          co_return true;
         }
         if (ready && attached && matches && resolvedAddress == nullptr)
         {
-          return true;
+          co_return true;
         }
       }
       else if (ready && attached == false)
       {
-        return true;
+        co_return true;
       }
 
-      usleep(500 * 1000);
+      AzureHttpTransport transport(providerServices.http, providerServices.delay, providerServices.operationDeadline);
+      if (co_await transport.wait(coro) == false)
+      {
+        failure.assign("azure public ip wait canceled"_ctv);
+        co_return false;
+      }
     }
 
     if (expectAttached)
@@ -2545,22 +2091,26 @@ private:
     {
       failure.assign("timed out waiting for azure public ip detachment"_ctv);
     }
-    return false;
+    co_return false;
   }
 
-  bool createPublicIPAddress(const String& providerPool, String& publicIPID, String& concreteAddress, String& failure)
+  ProdigyHostTask<bool> createPublicIPAddress(CoroutineStack *coro,
+                                              const String& providerPool,
+                                              String& publicIPID,
+                                              String& concreteAddress,
+                                              String& failure)
   {
     publicIPID.clear();
     concreteAddress.clear();
     if (ensureScope(failure) == false)
     {
-      return false;
+      co_return false;
     }
 
     String prefixID = {};
     if (resolvePublicIPPrefixResourceID(providerPool, prefixID, failure) == false)
     {
-      return false;
+      co_return false;
     }
 
     String publicIPName = {};
@@ -2586,21 +2136,21 @@ private:
     body.append("}}"_ctv);
 
     String response = {};
-    if (sendARM("PUT", url, &body, response, failure) == false)
+    if (co_await sendARM(coro, MultiCurlClient::Method::put, url, &body, response, failure) == false)
     {
-      return false;
+      co_return false;
     }
 
-    return waitForPublicIPAddressState(publicIPID, String(), false, &concreteAddress, failure);
+    co_return co_await waitForPublicIPAddressState(coro, publicIPID, String(), false, &concreteAddress, failure);
   }
 
-  bool waitForNetworkSecurityGroupState(const String& id, String& failure)
+  ProdigyHostTask<bool> waitForNetworkSecurityGroupState(CoroutineStack *coro, const String& id, String& failure)
   {
     failure.clear();
     if (id.size() == 0)
     {
       failure.assign("azure network security group id required"_ctv);
-      return false;
+      co_return false;
     }
 
     for (uint32_t attempt = 0; attempt < 60; ++attempt)
@@ -2609,48 +2159,53 @@ private:
       url.snprintf<"https://management.azure.com{}?api-version=2024-05-01"_ctv>(id);
 
       String response = {};
-      if (sendARM("GET", url, nullptr, response, failure) == false)
+      if (co_await sendARM(coro, MultiCurlClient::Method::get, url, nullptr, response, failure) == false)
       {
-        return false;
+        co_return false;
       }
 
       simdjson::dom::parser parser;
       simdjson::dom::element doc = {};
       if (azureParseJSONDocument(response, parser, doc, &failure, "azure network security group json parse failed"_ctv) == false)
       {
-        return false;
+        co_return false;
       }
 
       std::string_view provisioningState = {};
       (void)doc["properties"]["provisioningState"].get(provisioningState);
       if (provisioningState.size() == 0 || provisioningState == "Succeeded")
       {
-        return true;
+        co_return true;
       }
 
       if (provisioningState == "Failed")
       {
         failure.assign("azure network security group provisioning failed"_ctv);
-        return false;
+        co_return false;
       }
 
-      usleep(500 * 1000);
+      AzureHttpTransport transport(providerServices.http, providerServices.delay, providerServices.operationDeadline);
+      if (co_await transport.wait(coro) == false)
+      {
+        failure.assign("azure network security group wait canceled"_ctv);
+        co_return false;
+      }
     }
 
     failure.assign("azure network security group provisioning timed out"_ctv);
-    return false;
+    co_return false;
   }
 
-  bool ensureNetworkSecurityGroup(String& failure)
+  ProdigyHostTask<bool> ensureNetworkSecurityGroup(CoroutineStack *coro, String& failure)
   {
     if (networkSecurityGroupID.size() > 0)
     {
-      return true;
+      co_return true;
     }
 
     if (ensureScope(failure) == false)
     {
-      return false;
+      co_return false;
     }
 
     networkSecurityGroupID.snprintf<"/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Network/networkSecurityGroups/prodigy-nsg"_ctv>(
@@ -2665,20 +2220,22 @@ private:
         "{\"location\":\"{}\",\"properties\":{\"securityRules\":[{\"name\":\"allow-ssh-inbound\",\"properties\":{\"protocol\":\"Tcp\",\"sourcePortRange\":\"*\",\"destinationPortRange\":\"22\",\"sourceAddressPrefix\":\"*\",\"destinationAddressPrefix\":\"*\",\"access\":\"Allow\",\"priority\":1000,\"direction\":\"Inbound\"}}]}}"_ctv>(location);
 
     String response = {};
-    if (sendARM("PUT", url, &body, response, failure) == false)
+    if (co_await sendARM(coro, MultiCurlClient::Method::put, url, &body, response, failure) == false)
     {
-      return false;
+      co_return false;
     }
 
-    return waitForNetworkSecurityGroupState(networkSecurityGroupID, failure);
+    co_return co_await waitForNetworkSecurityGroupState(coro, networkSecurityGroupID, failure);
   }
 
-  bool detachPublicIPAddressAssociation(const String& ipConfigurationID, String& failure)
+  ProdigyHostTask<bool> detachPublicIPAddressAssociation(CoroutineStack *coro,
+                                                         const String& ipConfigurationID,
+                                                         String& failure)
   {
     failure.clear();
     if (ipConfigurationID.size() == 0)
     {
-      return true;
+      co_return true;
     }
 
     String nicID = {};
@@ -2686,33 +2243,35 @@ private:
     if (parseAzureIPConfigurationID(ipConfigurationID, nicID, ipConfigName) == false)
     {
       failure.assign("azure ipConfiguration id parse failed"_ctv);
-      return false;
+      co_return false;
     }
 
-    return patchNICPublicIPAddress(nicID, ipConfigName, nullptr, failure);
+    co_return co_await patchNICPublicIPAddress(coro, nicID, ipConfigName, nullptr, failure);
   }
 
-  bool deletePublicIPAddressResource(const String& publicIPID, String& failure)
+  ProdigyHostTask<bool> deletePublicIPAddressResource(CoroutineStack *coro,
+                                                      const String& publicIPID,
+                                                      String& failure)
   {
     failure.clear();
     if (publicIPID.size() == 0)
     {
-      return true;
+      co_return true;
     }
 
     String url = {};
     url.snprintf<"https://management.azure.com{}?api-version=2024-05-01"_ctv>(publicIPID);
     String response = {};
     long httpCode = 0;
-    if (sendARMRaw("DELETE", url, nullptr, response, &httpCode, failure) == false)
+    if (co_await sendARMRaw(coro, MultiCurlClient::Method::delete_, url, nullptr, response, &httpCode, failure) == false)
     {
-      return false;
+      co_return false;
     }
 
     if (httpCode == 404)
     {
       failure.clear();
-      return true;
+      co_return true;
     }
 
     if (httpCode < 200 || httpCode >= 300)
@@ -2721,7 +2280,7 @@ private:
       {
         failure.assign("azure public ip delete failed"_ctv);
       }
-      return false;
+      co_return false;
     }
 
     for (uint32_t attempt = 0; attempt < 60; ++attempt)
@@ -2729,34 +2288,39 @@ private:
       String getResponse = {};
       long getCode = 0;
       String transportFailure = {};
-      if (sendARMRaw("GET", url, nullptr, getResponse, &getCode, transportFailure) == false)
+      if (co_await sendARMRaw(coro, MultiCurlClient::Method::get, url, nullptr, getResponse, &getCode, transportFailure) == false)
       {
-        return false;
+        co_return false;
       }
 
       if (getCode == 404)
       {
         failure.clear();
-        return true;
+        co_return true;
       }
 
-      usleep(500 * 1000);
+      AzureHttpTransport transport(providerServices.http, providerServices.delay, providerServices.operationDeadline);
+      if (co_await transport.wait(coro) == false)
+      {
+        failure.assign("azure public ip delete wait canceled"_ctv);
+        co_return false;
+      }
     }
 
     failure.assign("timed out waiting for azure public ip delete"_ctv);
-    return false;
+    co_return false;
   }
 
-  bool ensureSubnet(String& failure)
+  ProdigyHostTask<bool> ensureSubnet(CoroutineStack *coro, String& failure)
   {
     if (subnetID.size() > 0)
     {
-      return true;
+      co_return true;
     }
 
     if (ensureScope(failure) == false)
     {
-      return false;
+      co_return false;
     }
 
     String vnetName = "prodigy-vnet"_ctv;
@@ -2771,44 +2335,49 @@ private:
         "{\"location\":\"{}\",\"properties\":{\"addressSpace\":{\"addressPrefixes\":[\"10.250.0.0/16\"]},\"subnets\":[{\"name\":\"{}\",\"properties\":{\"addressPrefix\":\"10.250.0.0/20\"}}]}}"_ctv>(location, subnetName);
 
     String response = {};
-    if (sendARM("PUT", url, &body, response, failure) == false)
+    if (co_await sendARM(coro, MultiCurlClient::Method::put, url, &body, response, failure) == false)
     {
-      return false;
+      co_return false;
     }
 
     for (uint32_t attempt = 0; attempt < 120; ++attempt)
     {
       response.clear();
-      if (sendARM("GET", url, nullptr, response, failure) == false)
+      if (co_await sendARM(coro, MultiCurlClient::Method::get, url, nullptr, response, failure) == false)
       {
-        return false;
+        co_return false;
       }
 
       simdjson::dom::parser parser;
       simdjson::dom::element vnet = {};
       if (azureParseJSONDocument(response, parser, vnet, &failure, "azure virtual network json parse failed"_ctv) == false)
       {
-        return false;
+        co_return false;
       }
 
       std::string_view provisioningState = {};
       (void)vnet["properties"]["provisioningState"].get(provisioningState);
       if (provisioningState == "Succeeded")
       {
-        return true;
+        co_return true;
       }
 
       if (provisioningState == "Failed")
       {
         failure.assign("azure virtual network provisioning failed"_ctv);
-        return false;
+        co_return false;
       }
 
-      usleep(500 * 1000);
+      AzureHttpTransport transport(providerServices.http, providerServices.delay, providerServices.operationDeadline);
+      if (co_await transport.wait(coro) == false)
+      {
+        failure.assign("azure virtual network wait canceled"_ctv);
+        co_return false;
+      }
     }
 
     failure.assign("azure virtual network provisioning timed out"_ctv);
-    return false;
+    co_return false;
   }
 
   bool buildAzureImageReference(const MachineConfig& config, String& imageReferenceJSON, String& failure)
@@ -2858,7 +2427,11 @@ private:
     return true;
   }
 
-  bool resolveNetworkAddresses(const String& nicID, String& privateAddress, String& publicAddress, String& failure)
+  ProdigyHostTask<bool> resolveNetworkAddresses(CoroutineStack *coro,
+                                                const String& nicID,
+                                                String& privateAddress,
+                                                String& publicAddress,
+                                                String& failure)
   {
     privateAddress.clear();
     publicAddress.clear();
@@ -2866,16 +2439,16 @@ private:
     String nicURL = {};
     nicURL.snprintf<"https://management.azure.com{}?api-version=2024-05-01"_ctv>(nicID);
     String nicResponse;
-    if (sendARM("GET", nicURL, nullptr, nicResponse, failure) == false)
+    if (co_await sendARM(coro, MultiCurlClient::Method::get, nicURL, nullptr, nicResponse, failure) == false)
     {
-      return false;
+      co_return false;
     }
 
     simdjson::dom::parser parser;
     simdjson::dom::element nicDoc;
     if (azureParseJSONDocument(nicResponse, parser, nicDoc, &failure, "azure nic json parse failed"_ctv) == false)
     {
-      return false;
+      co_return false;
     }
 
     String publicIPID = {};
@@ -2907,7 +2480,7 @@ private:
       String publicURL = {};
       publicURL.snprintf<"https://management.azure.com{}?api-version=2024-05-01"_ctv>(publicIPID);
       String publicResponse;
-      if (sendARM("GET", publicURL, nullptr, publicResponse, failure))
+      if (co_await sendARM(coro, MultiCurlClient::Method::get, publicURL, nullptr, publicResponse, failure))
       {
         simdjson::dom::element publicDoc;
         if (azureParseJSONDocument(publicResponse, parser, publicDoc))
@@ -2921,10 +2494,10 @@ private:
       }
     }
 
-    return privateAddress.size() > 0;
+    co_return privateAddress.size() > 0;
   }
 
-  Machine *buildMachineFromVM(simdjson::dom::element vm)
+  ProdigyHostTask<Machine *> buildMachineFromVM(CoroutineStack *coro, simdjson::dom::element vm)
   {
     Machine *machine = new Machine();
     std::string_view resourceID;
@@ -2942,7 +2515,7 @@ private:
       machine->slug.assign(vmSize);
       AzureMachineTypeResources resources = {};
       String resourceLookupFailure = {};
-      if (resolveMachineTypeResources(machine->type, resources, resourceLookupFailure))
+      if (co_await resolveMachineTypeResources(coro, machine->type, resources, resourceLookupFailure))
       {
         String resourceFailure = {};
         if (azureApplyMachineTypeResourcesToMachine(*machine, resources, vm, &resourceFailure) == false)
@@ -2998,7 +2571,7 @@ private:
       String privateAddress;
       String publicAddress;
       String failure;
-      if (resolveNetworkAddresses(String(nicID), privateAddress, publicAddress, failure))
+      if (co_await resolveNetworkAddresses(coro, String(nicID), privateAddress, publicAddress, failure))
       {
         machine->privateAddress = privateAddress;
         machine->publicAddress = publicAddress;
@@ -3018,100 +2591,182 @@ private:
 
     prodigyConfigureMachineNeuronEndpoint(*machine, thisNeuron);
 
-    return machine;
+    co_return machine;
   }
 
-  bool waitForVM(const String& vmName, const String& schema, const String& providerMachineType, Machine *& machine, String& failure)
+  ProdigyHostTask<bool> waitForMachines(CoroutineStack *coro,
+                                        const String& schema,
+                                        MachineLifetime lifetime,
+                                        Vector<PendingMachineProvisioning>& pendingMachines,
+                                        Vector<Machine *>& readyMachines,
+                                        String& failure)
   {
-    machine = nullptr;
-    int64_t deadlineMs = Time::now<TimeResolution::ms>() + int64_t(prodigyMachineProvisioningTimeoutMs);
-    while (Time::now<TimeResolution::ms>() < deadlineMs)
+    readyMachines.clear();
+    uint32_t remaining = uint32_t(pendingMachines.size());
+    const MultiCurlClient::TimePoint localDeadline = MultiCurlClient::Clock::now() +
+                                                     std::chrono::milliseconds(prodigyMachineProvisioningTimeoutMs);
+    const MultiCurlClient::TimePoint deadline = providerServices.operationDeadline < localDeadline ?
+                                                    providerServices.operationDeadline : localDeadline;
+    AzureHttpTransport transport(providerServices.http, providerServices.delay, deadline);
+    while (remaining > 0 && MultiCurlClient::Clock::now() < deadline)
     {
-      String url = {};
-      url.snprintf<"https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Compute/virtualMachines/{}?api-version=2025-04-01"_ctv>(subscriptionID, resourceGroup, vmName);
-      String response;
-      long httpCode = 0;
-      if (sendARM("GET", url, nullptr, response, failure, &httpCode) == false)
+      for (uint32_t waveStart = 0; waveStart < pendingMachines.size();)
       {
-        usleep(useconds_t(prodigyMachineProvisioningPollSleepMs) * 1000u);
-        continue;
+        Vector<MultiCurlClient::Request> requests;
+        Vector<uint32_t> indices;
+        for (uint32_t index = waveStart;
+             index < pendingMachines.size() && requests.size() < AzureHttpTransport::maximumRequestsPerWave;
+             ++index)
+        {
+          waveStart = index + 1;
+          PendingMachineProvisioning& pending = pendingMachines[index];
+          if (pending.ready)
+          {
+            continue;
+          }
+          String url = {};
+          url.snprintf<"https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Compute/virtualMachines/{}?api-version=2025-04-01"_ctv>(
+              subscriptionID,
+              resourceGroup,
+              pending.vmName);
+          MultiCurlClient::Request request = transport.request(MultiCurlClient::Method::get, url, "management.azure.com"_ctv);
+          buildAuthHeaders(request);
+          requests.push_back(std::move(request));
+          indices.push_back(index);
+        }
+        if (requests.empty())
+        {
+          continue;
+        }
+
+        ProdigyHostHttpBatchOperation operation(providerServices.http, *coro);
+        if (operation.submit(std::move(requests)) == false)
+        {
+          failure.assign("azure vm poll submission failed"_ctv);
+          co_return false;
+        }
+        if (operation.mustSuspend())
+        {
+          co_await ProdigyHostSuspend(*coro);
+        }
+        Vector<MultiCurlClient::Result> results;
+        if (operation.takeResults(results) == false || results.size() != indices.size())
+        {
+          failure.assign("azure vm poll completion mismatch"_ctv);
+          co_return false;
+        }
+
+        for (uint32_t resultIndex = 0; resultIndex < results.size(); ++resultIndex)
+        {
+          MultiCurlClient::Result& result = results[resultIndex];
+          PendingMachineProvisioning& pending = pendingMachines[indices[resultIndex]];
+          if (AzureHttpTransport::succeeded(result) == false)
+          {
+            continue;
+          }
+          simdjson::dom::parser parser;
+          simdjson::dom::element vm;
+          if (azureParseJSONDocument(result.body, parser, vm, &failure, "azure vm json parse failed"_ctv) == false)
+          {
+            co_return false;
+          }
+
+          String provisioningState;
+          auto parsedProvisioningState = vm["properties"]["provisioningState"].get_string();
+          if (parsedProvisioningState.error() == simdjson::SUCCESS)
+          {
+            provisioningState.assign(parsedProvisioningState.value_unsafe());
+          }
+          MachineProvisioningProgress& progress = provisioningProgress.upsert(
+              schema,
+              pending.providerMachineType,
+              pending.vmName,
+              String());
+          if (provisioningState == "Failed"_ctv)
+          {
+            progress.status.assign("Failed"_ctv);
+            progress.ready = false;
+            provisioningProgress.emitNow();
+            failure.assign("azure vm provisioning failed"_ctv);
+            co_return false;
+          }
+
+          Machine *machine = co_await buildMachineFromVM(coro, vm);
+          if (machine)
+          {
+            progress.cloud.cloudID = machine->cloudID;
+            prodigyPopulateMachineProvisioningProgressFromMachine(progress, *machine);
+          }
+          if (machine && provisioningState == "Succeeded" && prodigyMachineProvisioningReady(*machine))
+          {
+            machine->lifetime = lifetime;
+            pending.ready = true;
+            --remaining;
+            progress.status.assign("Succeeded"_ctv);
+            progress.ready = true;
+            provisioningProgress.notifyMachineProvisioned(*machine);
+            provisioningProgress.emitNow();
+            readyMachines.push_back(machine);
+          }
+          else
+          {
+            delete machine;
+            progress.status.assign(provisioningState);
+            progress.ready = false;
+            provisioningProgress.emitMaybe(Time::now<TimeResolution::ms>());
+          }
+        }
       }
 
-      simdjson::dom::parser parser;
-      simdjson::dom::element vm;
-      if (azureParseJSONDocument(response, parser, vm, &failure, "azure vm json parse failed"_ctv) == false)
+      if (remaining > 0 && co_await transport.wait(coro, uint64_t(prodigyMachineProvisioningPollSleepMs) * 1000) == false)
       {
-        return false;
+        failure.assign("azure vm provisioning wait canceled"_ctv);
+        co_return false;
       }
-
-      std::string_view provisioningState;
-      (void)vm["properties"]["provisioningState"].get(provisioningState);
-      MachineProvisioningProgress& progress = provisioningProgress.upsert(schema, providerMachineType, vmName, String());
-      if (provisioningState == "Failed")
-      {
-        progress.status.assign("Failed"_ctv);
-        progress.ready = false;
-        provisioningProgress.emitNow();
-        failure.assign("azure vm provisioning failed"_ctv);
-        return false;
-      }
-
-      machine = buildMachineFromVM(vm);
-      if (machine != nullptr)
-      {
-        progress.cloud.cloudID = machine->cloudID;
-        prodigyPopulateMachineProvisioningProgressFromMachine(progress, *machine);
-      }
-      if (provisioningState == "Succeeded" && prodigyMachineProvisioningReady(*machine))
-      {
-        progress.status.assign("Succeeded"_ctv);
-        progress.ready = true;
-        provisioningProgress.emitNow();
-        return true;
-      }
-
-      progress.status.assign(provisioningState);
-      progress.ready = false;
-      delete machine;
-      machine = nullptr;
-      provisioningProgress.emitMaybe(Time::now<TimeResolution::ms>());
-      usleep(useconds_t(prodigyMachineProvisioningPollSleepMs) * 1000u);
     }
 
-    failure.assign("azure vm provisioning timed out"_ctv);
-    return false;
+    if (remaining > 0)
+    {
+      failure.assign("azure vm provisioning timed out"_ctv);
+      co_return false;
+    }
+    failure.clear();
+    co_return true;
   }
 
-  bool ensureVMTags(const String& cloudID, const String& clusterUUID, String& failure)
+  ProdigyHostTask<bool> ensureVMTags(CoroutineStack *coro,
+                                     const String& cloudID,
+                                     const String& clusterUUID,
+                                     String& failure)
   {
     failure.clear();
 
     if (cloudID.size() == 0)
     {
       failure.assign("azure machine cloudID required"_ctv);
-      return false;
+      co_return false;
     }
 
     if (clusterUUID.size() == 0)
     {
       failure.assign("azure clusterUUID tag value required"_ctv);
-      return false;
+      co_return false;
     }
 
     String url = {};
     url.snprintf<"https://management.azure.com{}?api-version=2025-04-01"_ctv>(cloudID);
 
     String response = {};
-    if (sendARM("GET", url, nullptr, response, failure) == false)
+    if (co_await sendARM(coro, MultiCurlClient::Method::get, url, nullptr, response, failure) == false)
     {
-      return false;
+      co_return false;
     }
 
     simdjson::dom::parser parser;
     simdjson::dom::element vm;
     if (azureParseJSONDocument(response, parser, vm, &failure, "azure vm json parse failed"_ctv) == false)
     {
-      return false;
+      co_return false;
     }
 
     bool hasProdigyTag = false;
@@ -3134,7 +2789,7 @@ private:
 
     if (hasProdigyTag && hasClusterTag)
     {
-      return true;
+      co_return true;
     }
 
     String body = {};
@@ -3187,7 +2842,7 @@ private:
     body.append("}}"_ctv);
 
     String patchResponse = {};
-    return sendARM("PATCH", url, &body, patchResponse, failure);
+    co_return co_await sendARM(coro, MultiCurlClient::Method::patch, url, &body, patchResponse, failure);
   }
 
   void buildRoleDefinitionID(const char *roleUUID, String& roleDefinitionID)
@@ -3198,7 +2853,12 @@ private:
         String(roleUUID));
   }
 
-  bool azureRoleAssignmentExists(const String& scope, const String& principalID, const String& roleDefinitionID, bool& exists, String& failure)
+  ProdigyHostTask<bool> azureRoleAssignmentExists(CoroutineStack *coro,
+                                                  const String& scope,
+                                                  const String& principalID,
+                                                  const String& roleDefinitionID,
+                                                  bool& exists,
+                                                  String& failure)
   {
     exists = false;
     failure.clear();
@@ -3211,16 +2871,16 @@ private:
     while (nextURL.size() > 0)
     {
       String response = {};
-      if (sendARM("GET", nextURL, nullptr, response, failure) == false)
+      if (co_await sendARM(coro, MultiCurlClient::Method::get, nextURL, nullptr, response, failure) == false)
       {
-        return false;
+        co_return false;
       }
 
       simdjson::dom::parser parser;
       simdjson::dom::element doc = {};
       if (azureParseJSONDocument(response, parser, doc, &failure, "azure role assignments response parse failed"_ctv) == false)
       {
-        return false;
+        co_return false;
       }
 
       if (doc["value"].is_array())
@@ -3232,7 +2892,7 @@ private:
           if (assignment["properties"]["principalId"].get(assignmentPrincipalID) == simdjson::SUCCESS && assignment["properties"]["roleDefinitionId"].get(assignmentRoleDefinitionID) == simdjson::SUCCESS && String(assignmentPrincipalID) == principalID && String(assignmentRoleDefinitionID) == roleDefinitionID)
           {
             exists = true;
-            return true;
+            co_return true;
           }
         }
       }
@@ -3248,10 +2908,14 @@ private:
       }
     }
 
-    return true;
+    co_return true;
   }
 
-  bool ensureAzureRoleAssignment(const String& scope, const String& principalID, const char *roleUUID, String& failure)
+  ProdigyHostTask<bool> ensureAzureRoleAssignment(CoroutineStack *coro,
+                                                  const String& scope,
+                                                  const String& principalID,
+                                                  const char *roleUUID,
+                                                  String& failure)
   {
     failure.clear();
 
@@ -3259,14 +2923,14 @@ private:
     buildRoleDefinitionID(roleUUID, roleDefinitionID);
 
     bool exists = false;
-    if (azureRoleAssignmentExists(scope, principalID, roleDefinitionID, exists, failure) == false)
+    if (co_await azureRoleAssignmentExists(coro, scope, principalID, roleDefinitionID, exists, failure) == false)
     {
-      return false;
+      co_return false;
     }
 
     if (exists)
     {
-      return true;
+      co_return true;
     }
 
     String body = {};
@@ -3289,25 +2953,30 @@ private:
 
       String response = {};
       String createFailure = {};
-      if (sendARM("PUT", url, &body, response, createFailure))
+      if (co_await sendARM(coro, MultiCurlClient::Method::put, url, &body, response, createFailure))
       {
         failure.clear();
-        return true;
+        co_return true;
       }
 
       bool nowExists = false;
       String verifyFailure = {};
-      if (azureRoleAssignmentExists(scope, principalID, roleDefinitionID, nowExists, verifyFailure) && nowExists)
+      if (co_await azureRoleAssignmentExists(coro, scope, principalID, roleDefinitionID, nowExists, verifyFailure) && nowExists)
       {
         failure.clear();
-        return true;
+        co_return true;
       }
 
       lastFailure = createFailure.size() > 0 ? createFailure : verifyFailure;
       if (attempt + 1 < 20)
       {
         // Fresh managed identities can lag before RBAC sees their principal.
-        usleep(2 * 1000 * 1000);
+        AzureHttpTransport transport(providerServices.http, providerServices.delay, providerServices.operationDeadline);
+        if (co_await transport.wait(coro, 2 * 1000 * 1000) == false)
+        {
+          failure.assign(lastFailure);
+          co_return false;
+        }
       }
     }
 
@@ -3317,35 +2986,35 @@ private:
     }
 
     failure.assign(lastFailure);
-    return false;
+    co_return false;
   }
 
 public:
 
-  bool ensureManagedClusterIdentity(String& failure)
+  ProdigyHostTask<bool> ensureManagedClusterIdentity(CoroutineStack *coro, String& failure)
   {
     failure.clear();
 
     if (runtimeEnvironment.azure.managedIdentityResourceID.size() == 0)
     {
-      return true;
+      co_return true;
     }
 
     if (ensureScope(failure) == false)
     {
-      return false;
+      co_return false;
     }
 
-    if (ensureResourceGroup(failure) == false)
+    if (co_await ensureResourceGroup(coro, failure) == false)
     {
-      return false;
+      co_return false;
     }
 
     String identityName = {};
     if (azureExtractResourceIDSegment(runtimeEnvironment.azure.managedIdentityResourceID, "userAssignedIdentities", identityName) == false)
     {
       failure.assign("azure managed identity resource id is invalid"_ctv);
-      return false;
+      co_return false;
     }
 
     String url = {};
@@ -3355,23 +3024,23 @@ public:
     body.snprintf<"{\"location\":\"{}\"}"_ctv>(location);
 
     String response = {};
-    if (sendARM("PUT", url, &body, response, failure) == false)
+    if (co_await sendARM(coro, MultiCurlClient::Method::put, url, &body, response, failure) == false)
     {
-      return false;
+      co_return false;
     }
 
     simdjson::dom::parser parser;
     simdjson::dom::element doc = {};
     if (azureParseJSONDocument(response, parser, doc, &failure, "azure managed identity response parse failed"_ctv) == false)
     {
-      return false;
+      co_return false;
     }
 
     std::string_view principalIDView = {};
     if (doc["properties"]["principalId"].get(principalIDView) != simdjson::SUCCESS || principalIDView.empty())
     {
       failure.assign("azure managed identity response missing principalId"_ctv);
-      return false;
+      co_return false;
     }
 
     String principalID = {};
@@ -3380,17 +3049,17 @@ public:
     String resourceGroupScope = {};
     resourceGroupScope.snprintf<"/subscriptions/{}/resourceGroups/{}"_ctv>(subscriptionID, resourceGroup);
 
-    if (ensureAzureRoleAssignment(resourceGroupScope, principalID, "b24988ac-6180-42a0-ab88-20f7382dd24c", failure) == false)
+    if (co_await ensureAzureRoleAssignment(coro, resourceGroupScope, principalID, "b24988ac-6180-42a0-ab88-20f7382dd24c", failure) == false)
     {
-      return false;
+      co_return false;
     }
 
-    if (ensureAzureRoleAssignment(runtimeEnvironment.azure.managedIdentityResourceID, principalID, "f1a07417-d97a-45cb-824c-7a7467783830", failure) == false)
+    if (co_await ensureAzureRoleAssignment(coro, runtimeEnvironment.azure.managedIdentityResourceID, principalID, "f1a07417-d97a-45cb-824c-7a7467783830", failure) == false)
     {
-      return false;
+      co_return false;
     }
 
-    return true;
+    co_return true;
   }
 
   void boot(void) override
@@ -3416,7 +3085,7 @@ public:
     networkSecurityGroupID.clear();
   }
 
-  bool preflightClusterCreate(const BrainIaaSClusterCreatePreflight& preflight, String& error) override
+  void preflightClusterCreate(CoroutineStack *coro, const BrainIaaSClusterCreatePreflight& preflight, String& error) override
   {
     error.clear();
 
@@ -3433,31 +3102,31 @@ public:
     if (config == nullptr)
     {
       error.assign("azure preflight requires a vm machine schema with vmImageURI and providerMachineType"_ctv);
-      return false;
+      co_return;
     }
 
     if (preflight.azureManagedIdentityResourceID.size() == 0)
     {
       error.assign("azure preflight requires azure.managedIdentityResourceID or azure.managedIdentityName"_ctv);
-      return false;
+      co_return;
     }
 
     String identityName = {};
     if (azureExtractResourceIDSegment(preflight.azureManagedIdentityResourceID, "userAssignedIdentities", identityName) == false)
     {
       error.assign("azure managed identity resource id is invalid"_ctv);
-      return false;
+      co_return;
     }
 
     if (ensureScope(error) == false)
     {
-      return false;
+      co_return;
     }
 
     String imageReferenceJSON = {};
     if (buildAzureImageReference(*config, imageReferenceJSON, error) == false)
     {
-      return false;
+      co_return;
     }
 
     String url = {};
@@ -3466,16 +3135,16 @@ public:
         resourceGroup);
 
     String response = {};
-    if (sendARM("GET", url, nullptr, response, error) == false)
+    if (co_await sendARM(coro, MultiCurlClient::Method::get, url, nullptr, response, error) == false)
     {
-      return false;
+      co_return;
     }
 
     simdjson::dom::parser parser;
     simdjson::dom::element doc = {};
     if (azureParseJSONDocument(response, parser, doc, &error, "azure permissions response parse failed"_ctv) == false)
     {
-      return false;
+      co_return;
     }
 
     constexpr static const char *required[] = {
@@ -3521,14 +3190,13 @@ public:
     if (missing.size() > 0)
     {
       error = missing;
-      return false;
+      co_return;
     }
 
     error.clear();
-    return true;
   }
 
-  bool inferMachineSchemaCpuCapability(const MachineConfig& config, MachineSchemaCpuCapability& capability, String& error) override
+  void inferMachineSchemaCpuCapability(CoroutineStack *coro, const MachineConfig& config, MachineSchemaCpuCapability& capability, String& error) override
   {
     capability = {};
     error.clear();
@@ -3536,12 +3204,12 @@ public:
     if (config.providerMachineType.size() == 0)
     {
       error.assign("azure schema cpu inference requires providerMachineType"_ctv);
-      return false;
+      co_return;
     }
 
     if (ensureScope(error) == false)
     {
-      return false;
+      co_return;
     }
 
     String nextLink = {};
@@ -3550,7 +3218,7 @@ public:
     {
       String response = {};
       long httpCode = 0;
-      if (sendARM("GET", nextLink, nullptr, response, error, &httpCode) == false)
+      if (co_await sendARM(coro, MultiCurlClient::Method::get, nextLink, nullptr, response, error, &httpCode) == false)
       {
         if (httpCode < 200 || httpCode >= 300)
         {
@@ -3559,14 +3227,14 @@ public:
             error.assign("azure resource skus request failed"_ctv);
           }
         }
-        return false;
+        co_return;
       }
 
       simdjson::dom::parser parser;
       simdjson::dom::element doc = {};
       if (azureParseJSONDocument(response, parser, doc, &error, "azure resource skus response parse failed"_ctv) == false)
       {
-        return false;
+        co_return;
       }
 
       if (doc["value"].is_array())
@@ -3625,7 +3293,7 @@ public:
           if (architectureText.size() == 0)
           {
             error.assign("azure resource sku missing CpuArchitectureType capability"_ctv);
-            return false;
+            co_return;
           }
 
           String lowerArchitecture = {};
@@ -3641,11 +3309,11 @@ public:
           else
           {
             error.snprintf<"azure CpuArchitectureType '{}' unsupported"_ctv>(architectureText);
-            return false;
+            co_return;
           }
 
           capability.provenance = MachineSchemaCpuCapabilityProvenance::unavailable;
-          return true;
+          co_return;
         }
       }
 
@@ -3661,7 +3329,6 @@ public:
     }
 
     error.assign("azure resource sku not found"_ctv);
-    return false;
   }
 
   void configureBootstrapSSHAccess(const String& user, const Vault::SSHKeyPackage& keyPackage, const Vault::SSHKeyPackage& hostKeyPackage, const String& privateKeyPath) override
@@ -3701,12 +3368,11 @@ public:
 
   void spinMachines(CoroutineStack *coro, MachineLifetime lifetime, const MachineConfig& config, uint32_t count, bytell_hash_set<Machine *>& newMachines, String& error) override
   {
-    (void)coro;
     provisioningProgress.reset();
     if (lifetime == MachineLifetime::owned)
     {
       error.assign("azure auto provisioning does not support MachineLifetime::owned"_ctv);
-      return;
+      co_return;
     }
 
     if (ensureScope(error) == false)
@@ -3719,10 +3385,10 @@ public:
                    int(error.size()),
                    error.c_str());
       std::fflush(stderr);
-      return;
+      co_return;
     }
 
-    if (ensureSubnet(error) == false)
+    if (co_await ensureSubnet(coro, error) == false)
     {
       std::fprintf(stderr, "prodigy azure spinMachines-failure step=ensureSubnet schema=%.*s count=%u errorBytes=%zu error=%.*s\n",
                    int(config.slug.size()),
@@ -3732,10 +3398,10 @@ public:
                    int(error.size()),
                    error.c_str());
       std::fflush(stderr);
-      return;
+      co_return;
     }
 
-    if (ensureNetworkSecurityGroup(error) == false)
+    if (co_await ensureNetworkSecurityGroup(coro, error) == false)
     {
       std::fprintf(stderr, "prodigy azure spinMachines-failure step=ensureNetworkSecurityGroup schema=%.*s count=%u errorBytes=%zu error=%.*s\n",
                    int(config.slug.size()),
@@ -3745,7 +3411,7 @@ public:
                    int(error.size()),
                    error.c_str());
       std::fflush(stderr);
-      return;
+      co_return;
     }
 
     String imageReferenceJSON = {};
@@ -3759,7 +3425,7 @@ public:
                    int(error.size()),
                    error.c_str());
       std::fflush(stderr);
-      return;
+      co_return;
     }
 
     String userData = {};
@@ -3775,115 +3441,63 @@ public:
 
       String vmName = {};
       String providerMachineType = {};
-      AzureHttp::MultiRequest request = {};
-      bool processed = false;
     };
 
     Vector<PendingMachineProvisioning> pendingMachines = {};
     Vector<Machine *> readyMachines = {};
     Vector<PendingCreateSubmission> createRequests = {};
+    Vector<MultiCurlClient::Request> requests = {};
     createRequests.reserve(count);
-    auto destroyPendingMachineByName = [&](const String& vmName) -> void {
-      if (vmName.size() == 0)
-      {
-        return;
-      }
-
-      String url = {};
-      url.snprintf<"https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Compute/virtualMachines/{}?api-version=2025-04-01"_ctv>(subscriptionID, resourceGroup, vmName);
-      String response = {};
-      String destroyFailure = {};
-      (void)sendARM("DELETE", url, nullptr, response, destroyFailure);
-    };
-    auto cleanupProvisioningFailure = [&]() -> void {
+    requests.reserve(count);
+    auto cleanupProvisioningFailure = [&]() -> ProdigyHostTask<bool> {
       for (Machine *machine : readyMachines)
       {
-        destroyMachine(machine);
         delete machine;
       }
 
       readyMachines.clear();
       for (const PendingCreateSubmission& submission : createRequests)
       {
-        destroyPendingMachineByName(submission.vmName);
+        if (submission.vmName.size() > 0)
+        {
+          String url = {};
+          url.snprintf<"https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Compute/virtualMachines/{}?api-version=2025-04-01"_ctv>(subscriptionID, resourceGroup, submission.vmName);
+          String response = {};
+          String destroyFailure = {};
+          (void)co_await sendARM(coro, MultiCurlClient::Method::delete_, url, nullptr, response, destroyFailure);
+        }
       }
       createRequests.clear();
       pendingMachines.clear();
+      co_return true;
     };
 
     if (config.slug.size() == 0)
     {
       error.assign("azure machine schema slug missing"_ctv);
-      cleanupProvisioningFailure();
-      return;
+      (void)co_await cleanupProvisioningFailure();
+      co_return;
     }
 
     if (config.providerMachineType.size() == 0)
     {
       error.assign("azure providerMachineType missing"_ctv);
-      cleanupProvisioningFailure();
-      return;
+      (void)co_await cleanupProvisioningFailure();
+      co_return;
     }
 
     AzureMachineTypeResources requestedMachineTypeResources = {};
-    if (resolveMachineTypeResources(config.providerMachineType, requestedMachineTypeResources, error) == false)
+    if (co_await resolveMachineTypeResources(coro, config.providerMachineType, requestedMachineTypeResources, error) == false)
     {
-      cleanupProvisioningFailure();
-      return;
+      (void)co_await cleanupProvisioningFailure();
+      co_return;
     }
 
-    if (ensureBearerToken(error) == false)
+    if (co_await ensureBearerToken(coro, error) == false)
     {
-      cleanupProvisioningFailure();
-      return;
+      (void)co_await cleanupProvisioningFailure();
+      co_return;
     }
-
-    auto processCreateCompletion = [&](PendingCreateSubmission& submission) -> void {
-      if (submission.processed)
-      {
-        return;
-      }
-      submission.processed = true;
-
-      if (submission.request.curlCode != CURLE_OK || submission.request.httpCode < 200 || submission.request.httpCode >= 300)
-      {
-        if (error.size() == 0)
-        {
-          if (parseAzureErrorMessage(submission.request.response, error) == false)
-          {
-            error.assign(submission.request.transportFailure.size() > 0 ? submission.request.transportFailure : "azure vm create failed"_ctv);
-          }
-          if (submission.request.httpCode > 0)
-          {
-            error.snprintf_add<" [http={itoa}]"_ctv>(uint32_t(submission.request.httpCode));
-          }
-        }
-        return;
-      }
-
-      PendingMachineProvisioning& pending = pendingMachines.emplace_back();
-      pending.vmName = submission.vmName;
-      pending.providerMachineType = submission.providerMachineType;
-      String cloudID = {};
-      cloudID.snprintf<"/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Compute/virtualMachines/{}"_ctv>(
-          subscriptionID,
-          resourceGroup,
-          submission.vmName);
-      provisioningProgress.notifyMachineProvisioningAccepted(cloudID);
-    };
-
-    auto drainCreateCompletions = [&](AzureHttp::MultiClient& createClient) -> void {
-      while (AzureHttp::MultiRequest *completed = createClient.popCompleted())
-      {
-        PendingCreateSubmission *submission = reinterpret_cast<PendingCreateSubmission *>(completed->context);
-        if (submission != nullptr)
-        {
-          processCreateCompletion(*submission);
-        }
-      }
-    };
-
-    AzureHttp::MultiClient createClient = {};
     for (uint32_t index = 0; index < count; ++index)
     {
       String providerMachineType = config.providerMachineType;
@@ -3956,40 +3570,65 @@ public:
       PendingCreateSubmission& submission = createRequests.emplace_back();
       submission.vmName = vmName;
       submission.providerMachineType = providerMachineType;
-      submission.request.resetResult();
-      submission.request.context = &submission;
-      submission.request.method.assign("PUT"_ctv);
-      submission.request.url = url;
-      submission.request.body = body;
-      submission.request.timeoutMs = AzureHttp::timeoutMs;
-      buildAuthHeaders(submission.request.headers);
-      if (submission.request.headers == nullptr)
-      {
-        error.assign("azure auth headers missing"_ctv);
-        break;
-      }
-
-      if (createClient.start(submission.request) == false)
-      {
-        error.assign("azure create request start failed"_ctv);
-        break;
-      }
+      AzureHttpTransport transport(providerServices.http, providerServices.delay, providerServices.operationDeadline);
+      MultiCurlClient::Request request = transport.request(MultiCurlClient::Method::put, url, "management.azure.com"_ctv, &body);
+      buildAuthHeaders(request);
+      requests.push_back(std::move(request));
     }
 
-    while (error.size() == 0 && createClient.pendingCount() > 0)
+    for (uint32_t waveStart = 0; error.size() == 0 && waveStart < requests.size();)
     {
-      if (createClient.pump(50) == false)
+      Vector<MultiCurlClient::Request> wave;
+      Vector<uint32_t> indices;
+      while (waveStart < requests.size() && wave.size() < AzureHttpTransport::maximumRequestsPerWave)
       {
-        error.assign("azure create request pump failed"_ctv);
-        break;
+        indices.push_back(waveStart);
+        wave.push_back(std::move(requests[waveStart++]));
       }
 
-      drainCreateCompletions(createClient);
-    }
+      ProdigyHostHttpBatchOperation operation(providerServices.http, *coro);
+      if (operation.submit(std::move(wave)) == false)
+      {
+        error.assign("azure create request submission failed"_ctv);
+        break;
+      }
+      if (operation.mustSuspend())
+      {
+        co_await ProdigyHostSuspend(*coro);
+      }
+      Vector<MultiCurlClient::Result> results;
+      if (operation.takeResults(results) == false || results.size() != indices.size())
+      {
+        error.assign("azure create request completion mismatch"_ctv);
+        break;
+      }
+      for (uint32_t resultIndex = 0; resultIndex < results.size(); ++resultIndex)
+      {
+        MultiCurlClient::Result& result = results[resultIndex];
+        PendingCreateSubmission& submission = createRequests[indices[resultIndex]];
+        if (AzureHttpTransport::succeeded(result) == false)
+        {
+          if (parseAzureErrorMessage(result.body, error) == false)
+          {
+            AzureHttpTransport::assignTransportFailure(result, error);
+          }
+          if (result.statusCode > 0)
+          {
+            error.snprintf_add<" [http={itoa}]"_ctv>(uint32_t(result.statusCode));
+          }
+          break;
+        }
 
-    if (error.size() == 0)
-    {
-      drainCreateCompletions(createClient);
+        PendingMachineProvisioning& pending = pendingMachines.emplace_back();
+        pending.vmName = submission.vmName;
+        pending.providerMachineType = submission.providerMachineType;
+        String cloudID = {};
+        cloudID.snprintf<"/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Compute/virtualMachines/{}"_ctv>(
+            subscriptionID,
+            resourceGroup,
+            submission.vmName);
+        provisioningProgress.notifyMachineProvisioningAccepted(cloudID);
+      }
     }
 
     if (error.size() != 0)
@@ -4001,8 +3640,8 @@ public:
                    int(error.size()),
                    error.c_str());
       std::fflush(stderr);
-      cleanupProvisioningFailure();
-      return;
+      (void)co_await cleanupProvisioningFailure();
+      co_return;
     }
 
     if (pendingMachines.size() != count)
@@ -4010,20 +3649,19 @@ public:
       error.snprintf<"azure create returned {itoa} accepted machines but {itoa} were requested"_ctv>(
           uint32_t(pendingMachines.size()),
           count);
-      cleanupProvisioningFailure();
-      return;
+      (void)co_await cleanupProvisioningFailure();
+      co_return;
     }
 
     if (error.size() == 0 && pendingMachines.size() > 0)
     {
-      ConcurrentWaitCoordinator coordinator(this);
-      (void)coordinator.run(config.slug, lifetime, pendingMachines, readyMachines, error);
+      (void)co_await waitForMachines(coro, config.slug, lifetime, pendingMachines, readyMachines, error);
     }
 
     if (error.size() != 0)
     {
-      cleanupProvisioningFailure();
-      return;
+      (void)co_await cleanupProvisioningFailure();
+      co_return;
     }
 
     for (Machine *machine : readyMachines)
@@ -4032,28 +3670,27 @@ public:
     }
   }
 
-  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines) override
+  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines, String& failure) override
   {
-    (void)coro;
-    String failure;
+    failure.clear();
     if (ensureScope(failure) == false)
     {
-      return;
+      co_return;
     }
 
     String url = {};
     url.snprintf<"https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Compute/virtualMachines?api-version=2025-04-01"_ctv>(subscriptionID, resourceGroup);
     String response;
-    if (sendARM("GET", url, nullptr, response, failure) == false)
+    if (co_await sendARM(coro, MultiCurlClient::Method::get, url, nullptr, response, failure) == false)
     {
-      return;
+      co_return;
     }
 
     simdjson::dom::parser parser;
     simdjson::dom::element doc;
     if (azureParseVMListDocument(response, parser, doc, &failure) == false)
     {
-      return;
+      co_return;
     }
 
     if (auto values = doc["value"]; values.is_array())
@@ -4072,18 +3709,23 @@ public:
           continue;
         }
 
-        machines.insert(buildMachineFromVM(vm));
+        machines.insert(co_await buildMachineFromVM(coro, vm));
       }
     }
   }
 
-  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains) override
+  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains, String& failure) override
   {
-    (void)coro;
     selfIsBrain = false;
+    failure.clear();
 
     bytell_hash_set<Machine *> machines;
-    getMachines(nullptr, location, machines);
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          getMachines(coro, location, machines, failure);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
     for (Machine *machine : machines)
     {
       if (machine->isBrain == false)
@@ -4110,32 +3752,21 @@ public:
     }
   }
 
-  void hardRebootMachine(uint128_t uuid) override
+  void hardRebootMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
-    bytell_hash_set<Machine *> machines;
-    getMachines(nullptr, location, machines);
-    String cloudID = {};
-    for (Machine *machine : machines)
-    {
-      if (machine->uuid == uuid)
-      {
-        cloudID = machine->cloudID;
-      }
-
-      delete machine;
-    }
-
+    failure.clear();
     if (cloudID.size() == 0)
     {
-      return;
+      failure.assign("azure machine cloudID required"_ctv);
+      co_return;
     }
 
     String url = {};
     url.snprintf<"https://management.azure.com{}/restart?api-version=2025-04-01"_ctv>(cloudID);
     String response;
-    String failure;
+    failure.clear();
     String body = "{}"_ctv;
-    (void)sendARM("POST", url, &body, response, failure);
+    (void)co_await sendARM(coro, MultiCurlClient::Method::post, url, &body, response, failure);
   }
 
   void reportHardwareFailure(uint128_t uuid, const String& report) override
@@ -4150,53 +3781,59 @@ public:
     (void)decommissionedIDs;
   }
 
-  void destroyMachine(Machine *machine) override
+  void destroyMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
-    if (machine == nullptr || machine->cloudID.size() == 0)
+    failure.clear();
+    if (cloudID.size() == 0)
     {
-      return;
+      failure.assign("azure machine cloudID required"_ctv);
+      co_return;
     }
 
     String url = {};
-    url.snprintf<"https://management.azure.com{}?api-version=2025-04-01"_ctv>(machine->cloudID);
+    url.snprintf<"https://management.azure.com{}?api-version=2025-04-01"_ctv>(cloudID);
     String response;
-    String failure;
-    (void)sendARM("DELETE", url, nullptr, response, failure);
+    (void)co_await sendARM(coro, MultiCurlClient::Method::delete_, url, nullptr, response, failure);
   }
 
-  bool destroyClusterMachines(const String& clusterUUID, uint32_t& destroyed, String& error) override
+private:
+
+  ProdigyHostTask<bool> destroyClusterMachinesInline(CoroutineStack *coro,
+                                                      const String& clusterUUID,
+                                                      uint32_t& destroyed,
+                                                      String& error)
   {
     destroyed = 0;
 
     if (ensureScope(error) == false)
     {
-      return false;
+      co_return false;
     }
 
     if (clusterUUID.size() == 0)
     {
       error.assign("azure clusterUUID tag value required"_ctv);
-      return false;
+      co_return false;
     }
 
     String listURL = {};
     listURL.snprintf<"https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Compute/virtualMachines?api-version=2025-04-01"_ctv>(subscriptionID, resourceGroup);
 
     Vector<String> cloudIDs = {};
-    auto collectCloudIDs = [&](String& failure) -> bool {
+    auto collectCloudIDs = [&](String& failure) -> ProdigyHostTask<bool> {
       cloudIDs.clear();
 
       String response = {};
-      if (sendARM("GET", listURL, nullptr, response, failure) == false)
+      if (co_await sendARM(coro, MultiCurlClient::Method::get, listURL, nullptr, response, failure) == false)
       {
-        return false;
+        co_return false;
       }
 
       simdjson::dom::parser parser;
       simdjson::dom::element doc;
       if (azureParseJSONDocument(response, parser, doc, &failure, "azure vm list json parse failed"_ctv) == false)
       {
-        return false;
+        co_return false;
       }
 
       if (auto values = doc["value"]; values.is_array())
@@ -4223,17 +3860,17 @@ public:
         }
       }
 
-      return true;
+      co_return true;
     };
 
-    if (collectCloudIDs(error) == false)
+    if (co_await collectCloudIDs(error) == false)
     {
-      return false;
+      co_return false;
     }
 
     if (cloudIDs.size() == 0)
     {
-      return true;
+      co_return true;
     }
 
     destroyed = uint32_t(cloudIDs.size());
@@ -4243,231 +3880,66 @@ public:
       String url = {};
       url.snprintf<"https://management.azure.com{}?api-version=2025-04-01"_ctv>(cloudID);
       String response = {};
-      if (sendARM("DELETE", url, nullptr, response, error) == false)
+      if (co_await sendARM(coro, MultiCurlClient::Method::delete_, url, nullptr, response, error) == false)
       {
-        return false;
+        co_return false;
       }
     }
 
     for (uint32_t attempt = 0; attempt < 60; ++attempt)
     {
-      if (collectCloudIDs(error) == false)
+      if (co_await collectCloudIDs(error) == false)
       {
-        return false;
+        co_return false;
       }
 
       if (cloudIDs.size() == 0)
       {
-        return true;
+        co_return true;
       }
 
-      usleep(2 * 1000 * 1000);
+      AzureHttpTransport transport(providerServices.http, providerServices.delay, providerServices.operationDeadline);
+      if (co_await transport.wait(coro, 2 * 1000 * 1000) == false)
+      {
+        error.assign("azure cluster destroy wait canceled"_ctv);
+        co_return false;
+      }
     }
 
     error.assign("timed out waiting for azure cluster machines to terminate"_ctv);
-    return false;
+    co_return false;
   }
 
-  bool ensureProdigyMachineTags(const String& clusterUUID, Machine *machine, String& error) override
+public:
+
+  void destroyClusterMachines(CoroutineStack *coro, const String& clusterUUID, uint32_t& destroyed, String& error) override
+  {
+    (void)co_await destroyClusterMachinesInline(coro, clusterUUID, destroyed, error);
+    co_return;
+  }
+
+  void ensureProdigyMachineTags(CoroutineStack *coro,
+                                const String& clusterUUID,
+                                const String& cloudID,
+                                String& error) override
   {
     if (ensureScope(error) == false)
     {
-      return false;
+      co_return;
     }
 
-    if (machine == nullptr || machine->cloudID.size() == 0)
+    if (cloudID.size() == 0)
     {
       error.assign("azure machine cloudID required"_ctv);
-      return false;
+      co_return;
     }
 
-    return ensureVMTags(machine->cloudID, clusterUUID, error);
+    (void)co_await ensureVMTags(coro, cloudID, clusterUUID, error);
   }
 
-  bool assignProviderElasticAddress(Machine *machine,
-                                    ExternalAddressFamily family,
-                                    ElasticPrefixIntent intent,
-                                    const String& requestedAddress,
-                                    const String& providerPool,
-                                    IPPrefix& assignedPrefix,
-                                    IPPrefix& deliveryPrefix,
-                                    String& allocationID,
-                                    String& associationID,
-                                    bool& releaseOnRemove,
-                                    String& error) override
-  {
-    assignedPrefix = {};
-    deliveryPrefix = {};
-    allocationID.clear();
-    associationID.clear();
-    releaseOnRemove = false;
-    error.clear();
+private:
 
-    if (ensureScope(error) == false)
-    {
-      return false;
-    }
-
-    if (machine == nullptr || machine->cloudID.size() == 0)
-    {
-      error.assign("azure elastic address requires a cloud-backed target machine"_ctv);
-      return false;
-    }
-
-    if (family != ExternalAddressFamily::ipv4)
-    {
-      error.assign("azure elastic addresses currently support only ipv4"_ctv);
-      return false;
-    }
-
-    if (elasticPrefixIntentIsValid(intent) == false)
-    {
-      error.assign("azure elastic prefix intent invalid"_ctv);
-      return false;
-    }
-
-    if (intent == ElasticPrefixIntent::create && requestedAddress.size() > 0)
-    {
-      error.assign("azure elastic create intent does not accept requestedAddress"_ctv);
-      return false;
-    }
-
-    if (intent == ElasticPrefixIntent::any && requestedAddress.size() == 0)
-    {
-      error.assign("azure elastic any intent requires requestedAddress"_ctv);
-      return false;
-    }
-
-    String nicID = {};
-    String ipConfigName = {};
-    if (fetchMachinePrimaryNICAndConfig(machine->cloudID, nicID, ipConfigName, error) == false)
-    {
-      return false;
-    }
-
-    associationID.snprintf<"{}/ipConfigurations/{}"_ctv>(nicID, ipConfigName);
-
-    String publicAddress = {};
-    String existingIPConfigurationID = {};
-    bool useExisting = requestedAddress.size() > 0 && intent != ElasticPrefixIntent::create;
-    if (useExisting)
-    {
-      if (providerPool.size() > 0)
-      {
-        error.assign("azure elastic any intent cannot combine requestedAddress with providerPool"_ctv);
-        return false;
-      }
-
-      if (fetchPublicIPAddressByConcreteAddress(requestedAddress, allocationID, existingIPConfigurationID, publicAddress, error) == false)
-      {
-        if (intent != ElasticPrefixIntent::anyOrCreate)
-        {
-          return false;
-        }
-
-        error.clear();
-        useExisting = false;
-      }
-
-      releaseOnRemove = false;
-    }
-    if (useExisting == false)
-    {
-      if (createPublicIPAddress(providerPool, allocationID, publicAddress, error) == false)
-      {
-        return false;
-      }
-
-      releaseOnRemove = true;
-    }
-
-    auto cleanupOnFailure = [&]() -> void {
-      if (associationID.size() > 0)
-      {
-        String detachFailure = {};
-        (void)detachPublicIPAddressAssociation(associationID, detachFailure);
-      }
-
-      if (releaseOnRemove && allocationID.size() > 0)
-      {
-        String deleteFailure = {};
-        (void)deletePublicIPAddressResource(allocationID, deleteFailure);
-      }
-    };
-
-    if (existingIPConfigurationID.size() > 0 && existingIPConfigurationID.equals(associationID) == false)
-    {
-      if (detachPublicIPAddressAssociation(existingIPConfigurationID, error) == false)
-      {
-        cleanupOnFailure();
-        return false;
-      }
-    }
-
-    if (existingIPConfigurationID.equals(associationID) == false)
-    {
-      if (patchNICPublicIPAddress(nicID, ipConfigName, &allocationID, error) == false)
-      {
-        cleanupOnFailure();
-        return false;
-      }
-    }
-
-    if (waitForPublicIPAddressState(allocationID, associationID, true, &publicAddress, error) == false)
-    {
-      cleanupOnFailure();
-      return false;
-    }
-
-    IPAddress assignedAddress = {};
-    if (ClusterMachine::parseIPAddressLiteral(publicAddress, assignedAddress) == false)
-    {
-      error.assign("azure elastic address parse failed"_ctv);
-      cleanupOnFailure();
-      return false;
-    }
-    assignedPrefix.network = assignedAddress;
-    assignedPrefix.cidr = assignedAddress.is6 ? 128 : 32;
-    (void)prodigyMachinePrivateAddressHostPrefix(*machine, family, deliveryPrefix);
-
-    return true;
-  }
-
-  bool releaseProviderElasticAddress(const DistributableExternalSubnet& prefix, String& error) override
-  {
-    error.clear();
-    if (prefix.kind != RoutablePrefixKind::elastic)
-    {
-      return true;
-    }
-
-    if (prefix.providerAssociationID.size() > 0)
-    {
-      if (detachPublicIPAddressAssociation(prefix.providerAssociationID, error) == false)
-      {
-        return false;
-      }
-    }
-
-    if (prefix.providerAllocationID.size() > 0)
-    {
-      (void)waitForPublicIPAddressState(prefix.providerAllocationID, String(), false, nullptr, error);
-      if (error.size() > 0)
-      {
-        return false;
-      }
-    }
-
-    if (prefix.releaseOnRemove)
-    {
-      if (deletePublicIPAddressResource(prefix.providerAllocationID, error) == false)
-      {
-        return false;
-      }
-    }
-
-    return true;
-  }
+public:
 
   uint32_t supportedMachineKindsMask() const override
   {

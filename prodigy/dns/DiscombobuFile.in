@@ -1,0 +1,4 @@
+FROM scratch for @PRODIGY_RESOLVED_TARGET_ARCH@
+COPY {resolver} ./prodigy-dns-resolver /app/prodigy-dns-resolver
+SURVIVE /app/prodigy-dns-resolver
+EXECUTE ["/app/prodigy-dns-resolver"]

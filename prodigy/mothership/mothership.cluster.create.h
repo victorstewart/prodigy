@@ -267,11 +267,33 @@ static inline bool mothershipBuildClusterDNSCredential(const MothershipProdigyCl
   credential.name = cluster.dnsProviderCredentialName;
   credential.provider.assign(mothershipClusterProviderName(cluster.dnsProvider));
   credential.generation = uint64_t(source->updatedAtMs > 0 ? source->updatedAtMs : source->createdAtMs);
-  if (MothershipProviderCredentialRegistry::resolveCredentialMaterial(*source, credential.material, failure) == false)
+  ProdigyRuntimeEnvironmentConfig credentialRuntime = {};
+  if (mothershipMapClusterProviderEnvironment(source->provider, credentialRuntime.kind) == false ||
+      MothershipProviderCredentialRegistry::applyCredentialToRuntimeEnvironment(
+          *source, credentialRuntime, failure) == false)
   {
     return false;
   }
+  credential.material = credentialRuntime.providerCredentialMaterial;
   credential.metadata = source->metadata;
+  if (!credentialRuntime.gcp.bootstrapAccessTokenRefreshCommand.empty())
+  {
+    credential.metadata.insert_or_assign(
+        "bearerRefreshCommand"_ctv,
+        credentialRuntime.gcp.bootstrapAccessTokenRefreshCommand);
+  }
+  else if (!credentialRuntime.azure.bootstrapAccessTokenRefreshCommand.empty())
+  {
+    credential.metadata.insert_or_assign(
+        "bearerRefreshCommand"_ctv,
+        credentialRuntime.azure.bootstrapAccessTokenRefreshCommand);
+  }
+  else if (!credentialRuntime.aws.bootstrapCredentialRefreshCommand.empty())
+  {
+    credential.metadata.insert_or_assign(
+        "awsCredentialRefreshCommand"_ctv,
+        credentialRuntime.aws.bootstrapCredentialRefreshCommand);
+  }
   if (failure)
   {
     failure->clear();
@@ -513,15 +535,18 @@ static inline void mothershipBuildSeedTopology(const ClusterMachine& seedMachine
   topology.machines.push_back(seedMachine);
 }
 
-static inline bool mothershipProvisionCreatedSeedMachine(
+static inline void mothershipProvisionCreatedSeedMachine(
+    CoroutineStack *coro,
     const MothershipProdigyCluster& cluster,
     const CreateMachinesInstruction& instruction,
     BrainIaaS& iaas,
     ClusterMachine& seedMachine,
+    bool& provisioned,
     BrainIaaSMachineProvisioningProgressSink *progressSink = nullptr,
     ProdigyTimingAttribution *timingAttribution = nullptr,
     String *failure = nullptr)
 {
+  provisioned = false;
   seedMachine = {};
   if (failure)
   {
@@ -544,6 +569,16 @@ static inline bool mothershipProvisionCreatedSeedMachine(
 #endif
   };
 
+  if (coro == nullptr)
+  {
+    if (failure)
+    {
+      failure->assign("created seed machine coroutine required"_ctv);
+    }
+    finalizeTiming();
+    co_return;
+  }
+
   if (instruction.backing != ClusterMachineBacking::cloud)
   {
     if (failure)
@@ -551,7 +586,7 @@ static inline bool mothershipProvisionCreatedSeedMachine(
       failure->assign("created seed machine currently requires backing=cloud"_ctv);
     }
     finalizeTiming();
-    return false;
+    co_return;
   }
 
   String schemaKey = {};
@@ -566,7 +601,7 @@ static inline bool mothershipProvisionCreatedSeedMachine(
       failure->assign("created seed machine requires cloud.schema"_ctv);
     }
     finalizeTiming();
-    return false;
+    co_return;
   }
 
   const MothershipProdigyClusterMachineSchema *managedSchema = nullptr;
@@ -586,7 +621,7 @@ static inline bool mothershipProvisionCreatedSeedMachine(
       failure->snprintf<"unknown machine schema '{}'"_ctv>(schemaKey);
     }
     finalizeTiming();
-    return false;
+    co_return;
   }
 
   if (instruction.kind != managedSchema->kind)
@@ -596,7 +631,7 @@ static inline bool mothershipProvisionCreatedSeedMachine(
       failure->snprintf<"created machine kind mismatch for schema '{}'"_ctv>(schemaKey);
     }
     finalizeTiming();
-    return false;
+    co_return;
   }
 
   if (iaas.supports(managedSchema->kind) == false)
@@ -606,7 +641,7 @@ static inline bool mothershipProvisionCreatedSeedMachine(
       failure->snprintf<"current runtime environment does not support machine kind for schema '{}'"_ctv>(schemaKey);
     }
     finalizeTiming();
-    return false;
+    co_return;
   }
 
   if (iaas.supportsAutoProvision() == false)
@@ -616,16 +651,23 @@ static inline bool mothershipProvisionCreatedSeedMachine(
       failure->assign("current runtime environment does not support automatic machine provisioning"_ctv);
     }
     finalizeTiming();
-    return false;
+    co_return;
   }
 
   iaas.configureBootstrapSSHAccess(cluster.bootstrapSshUser, cluster.bootstrapSshKeyPackage, cluster.bootstrapSshHostKeyPackage, cluster.bootstrapSshPrivateKeyPath);
   iaas.configureProvisioningProgressSink(progressSink);
+  struct ProgressSinkScope final
+  {
+    BrainIaaS& iaas;
+    ~ProgressSinkScope()
+    {
+      iaas.configureProvisioningProgressSink(nullptr);
+    }
+  } progressSinkScope {iaas};
 
   MachineConfig machineConfig = {};
   mothershipBuildMachineConfigFromSchema(*managedSchema, machineConfig);
 
-  CoroutineStack coro;
   bytell_hash_set<Machine *> createdSnapshots;
   String providerError;
 
@@ -633,13 +675,21 @@ static inline bool mothershipProvisionCreatedSeedMachine(
 #if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
   uint64_t providerWaitStartNs = Time::now<TimeResolution::ns>();
 #endif
-  iaas.spinMachines(&coro, instruction.lifetime, machineConfig, 1, instruction.isBrain, createdSnapshots, providerError);
+  if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+        iaas.spinMachines(coro,
+                          instruction.lifetime,
+                          machineConfig,
+                          1,
+                          instruction.isBrain,
+                          createdSnapshots,
+                          providerError);
+      }))
+  {
+    co_await coro->suspendAtIndex(suspendIndex);
+  }
 #if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
   providerWaitNs += (Time::now<TimeResolution::ns>() - providerWaitStartNs);
 #endif
-  coro.co_consume();
-  iaas.configureProvisioningProgressSink(nullptr);
-
   if (createdSnapshots.size() != 1)
   {
     if (failure)
@@ -656,12 +706,22 @@ static inline bool mothershipProvisionCreatedSeedMachine(
 
     for (Machine *snapshot : createdSnapshots)
     {
-      iaas.destroyMachine(snapshot);
+      String destroyFailure;
+      if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+            iaas.destroyMachine(coro, snapshot->cloudID, destroyFailure);
+          }))
+      {
+        co_await coro->suspendAtIndex(suspendIndex);
+      }
+      if (failure && failure->empty() && destroyFailure.empty() == false)
+      {
+        *failure = std::move(destroyFailure);
+      }
       prodigyDestroyMachineSnapshot(snapshot);
     }
 
     finalizeTiming();
-    return false;
+    co_return;
   }
 
   Machine *snapshot = *createdSnapshots.begin();
@@ -673,22 +733,60 @@ static inline bool mothershipProvisionCreatedSeedMachine(
     failure->clear();
   }
   finalizeTiming();
-  return true;
+  provisioned = true;
+  co_return;
 }
 
-static inline void mothershipDestroyCreatedClusterMachine(BrainIaaS& iaas, const ClusterMachine& clusterMachine)
+// Precondition: the selected provider's provisioning implementation completes inline.
+static inline bool mothershipProvisionCreatedSeedMachineInline(
+    const MothershipProdigyCluster& cluster,
+    const CreateMachinesInstruction& instruction,
+    BrainIaaS& iaas,
+    ClusterMachine& seedMachine,
+    BrainIaaSMachineProvisioningProgressSink *progressSink = nullptr,
+    ProdigyTimingAttribution *timingAttribution = nullptr,
+    String *failure = nullptr)
 {
+  CoroutineStack coro;
+  bool provisioned = false;
+  mothershipProvisionCreatedSeedMachine(&coro,
+                                        cluster,
+                                        instruction,
+                                        iaas,
+                                        seedMachine,
+                                        provisioned,
+                                        progressSink,
+                                        timingAttribution,
+                                        failure);
+  coro.co_consume();
+  return provisioned;
+}
+
+static inline void mothershipDestroyCreatedClusterMachine(CoroutineStack *coro,
+                                                          BrainIaaS& iaas,
+                                                          const ClusterMachine& clusterMachine,
+                                                          String& failure)
+{
+  failure.clear();
   if (clusterMachine.source != ClusterMachineSource::created || clusterMachine.backing != ClusterMachineBacking::cloud || clusterMachine.cloud.cloudID.size() == 0)
   {
-    return;
+    co_return;
   }
 
-  Machine machine = prodigyBuildMachineSnapshotFromClusterMachine(clusterMachine);
-  iaas.destroyMachine(&machine);
+  if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+        iaas.destroyMachine(coro, clusterMachine.cloud.cloudID, failure);
+      }))
+  {
+    co_await coro->suspendAtIndex(suspendIndex);
+  }
 }
 
-static inline void mothershipDestroyCreatedClusterMachines(BrainIaaS& iaas, const ClusterTopology& topology)
+static inline void mothershipDestroyCreatedClusterMachines(CoroutineStack *coro,
+                                                           BrainIaaS& iaas,
+                                                           const ClusterTopology& topology,
+                                                           String& failure)
 {
+  failure.clear();
   Vector<String> destroyedCloudIDs;
 
   for (const ClusterMachine& clusterMachine : topology.machines)
@@ -713,7 +811,16 @@ static inline void mothershipDestroyCreatedClusterMachines(BrainIaaS& iaas, cons
       continue;
     }
 
-    mothershipDestroyCreatedClusterMachine(iaas, clusterMachine);
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          mothershipDestroyCreatedClusterMachine(coro, iaas, clusterMachine, failure);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (failure.empty() == false)
+    {
+      co_return;
+    }
     destroyedCloudIDs.push_back(clusterMachine.cloud.cloudID);
   }
 }

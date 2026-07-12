@@ -43,7 +43,8 @@ enum class MothershipTopic : uint16_t {
   cleanupACMEDNS01Challenge,
   importACMELineage,
   configureMothershipTunnelProvider,
-  pullTaskReport
+  pullTaskReport,
+  manageDnsControlPairing
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -108,6 +109,8 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "configureMothershipTunnelProvider";
     case MothershipTopic::pullTaskReport:
       return "pullTaskReport";
+    case MothershipTopic::manageDnsControlPairing:
+      return "manageDnsControlPairing";
   }
 
   return "unknown";

@@ -5,54 +5,58 @@
 class VultrDNSProvider : public ProdigyHTTPDNSProvider {
 public:
 
+  VultrDNSProvider()
+      : ProdigyHTTPDNSProvider("api.vultr.com"_ctv)
+  {}
+
   bool supportsProvider(const String& provider) const override
   {
     return routableResourceDNSPartEquals(provider, "vultr"_ctv, false) || routableResourceDNSPartEquals(provider, "vultr-dns"_ctv, false);
   }
 
-  bool upsert(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> upsert(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
   {
     String id = {};
     String relativeName = prodigyDNSRelativeName(record.name, record.zone);
     ProdigyDNSRecordPresence presence = {};
-    if (findRecord(record, relativeName, credential, presence, id, failure) == false)
+    if (co_await findRecord(coro, record, relativeName, credential, presence, id, failure) == false)
     {
-      return false;
+      co_return false;
     }
     if (presence == ProdigyDNSRecordPresence::exact)
     {
       failure.clear();
-      return true;
+      co_return true;
     }
-    return create(record, relativeName, credential, failure);
+    co_return co_await create(coro, record, relativeName, credential, failure);
   }
 
-  bool remove(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> remove(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
   {
     String id = {};
     String relativeName = prodigyDNSRelativeName(record.name, record.zone);
     ProdigyDNSRecordPresence presence = {};
-    if (findRecord(record, relativeName, credential, presence, id, failure) == false)
+    if (co_await findRecord(coro, record, relativeName, credential, presence, id, failure) == false)
     {
-      return false;
+      co_return false;
     }
     if (presence == ProdigyDNSRecordPresence::missing)
     {
       failure.clear();
-      return true;
+      co_return true;
     }
 
-    return removeExact(record, credential, id, failure);
+    co_return co_await removeExact(coro, record, credential, id, failure);
   }
 
-  bool presentTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> presentTXT(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
   {
-    return changeTXT(false, record, credential, failure);
+    co_return co_await changeTXT(coro, false, record, credential, failure);
   }
 
-  bool cleanupTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> cleanupTXT(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
   {
-    return changeTXT(true, record, credential, failure);
+    co_return co_await changeTXT(coro, true, record, credential, failure);
   }
 
 private:
@@ -77,80 +81,80 @@ private:
     return true;
   }
 
-  bool changeTXT(bool removing, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
+  ProdigyHostTask<bool> changeTXT(CoroutineStack *coro, bool removing, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
   {
     String ignored = {};
     if (prodigyDNSRecordSingleTXTValue(record, ignored, failure) == false)
     {
-      return false;
+      co_return false;
     }
     String id = {};
     String relativeName = prodigyDNSRelativeName(record.name, record.zone);
     ProdigyDNSRecordPresence presence = {};
-    if (findRecord(record, relativeName, credential, presence, id, failure, true) == false)
+    if (co_await findRecord(coro, record, relativeName, credential, presence, id, failure, true) == false)
     {
-      return false;
+      co_return false;
     }
     if (presence == ProdigyDNSRecordPresence::exact)
     {
-      return removing ? removeExact(record, credential, id, failure) : true;
+      co_return removing ? co_await removeExact(coro, record, credential, id, failure) : true;
     }
     if (removing)
     {
       failure.clear();
-      return true;
+      co_return true;
     }
-    return create(record, relativeName, credential, failure);
+    co_return co_await create(coro, record, relativeName, credential, failure);
   }
 
-  bool create(const ProdigyDNSRecordBinding& record, const String& relativeName, const ApiCredential& credential, String& failure)
+  ProdigyHostTask<bool> create(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const String& relativeName, const ApiCredential& credential, String& failure)
   {
     ProdigyDNSHTTPRequest request = {};
-    request.method.assign("POST"_ctv);
+    request.method = MultiCurlClient::Method::post;
     if (vultrURL(record.zone, {}, request.url, failure) == false)
     {
-      return false;
+      co_return false;
     }
-    request.header("Content-Type: application/json");
+    request.headers.push_back({"Content-Type"_ctv, "application/json"_ctv});
     request.bearer(credential.material);
     if (prodigyDNSAppendRecordJSON(request.body, record, "data", &relativeName, failure) == false)
     {
-      return false;
+      co_return false;
     }
     String response = {};
     long httpCode = 0;
-    return acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "vultr dns upsert failed");
+    co_return acceptHTTP(co_await sendHTTP(coro, request, response, httpCode, failure), httpCode, response, failure, "vultr dns upsert failed");
   }
 
-  bool removeExact(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, const String& id, String& failure)
+  ProdigyHostTask<bool> removeExact(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, const String& id, String& failure)
   {
     ProdigyDNSHTTPRequest request = {};
-    request.method.assign("DELETE"_ctv);
+    request.method = MultiCurlClient::Method::delete_;
     if (vultrURL(record.zone, id, request.url, failure) == false)
     {
-      return false;
+      co_return false;
     }
     request.bearer(credential.material);
     String response = {};
     long httpCode = 0;
-    return acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "vultr dns delete failed");
+    co_return acceptHTTP(co_await sendHTTP(coro, request, response, httpCode, failure), httpCode, response, failure, "vultr dns delete failed");
   }
 
-  bool findRecord(const ProdigyDNSRecordBinding& record, const String& relativeName, const ApiCredential& credential, ProdigyDNSRecordPresence& presence, String& id, String& failure, bool exactOnly = false)
+  ProdigyHostTask<bool> findRecord(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const String& relativeName, const ApiCredential& credential, ProdigyDNSRecordPresence& presence, String& id, String& failure, bool exactOnly = false)
   {
     ProdigyDNSHTTPRequest request = {};
-    request.method.assign("GET"_ctv);
+    request.method = MultiCurlClient::Method::get;
     if (vultrURL(record.zone, {}, request.url, failure) == false)
     {
-      return false;
+      co_return false;
     }
     request.bearer(credential.material);
     String response = {};
     long httpCode = 0;
-    if (acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "vultr dns list failed") == false)
+    if (acceptHTTP(co_await sendHTTP(coro, request, response, httpCode, failure), httpCode, response, failure, "vultr dns list failed") == false)
     {
-      return false;
+      co_return false;
     }
-    return prodigyDNSFindJSONRecord(response, "records", record, relativeName, "data", exactOnly, presence, id, failure);
+    co_return prodigyDNSFindJSONRecord(response, "records", record, relativeName, "data", exactOnly, presence, id, failure);
   }
 };

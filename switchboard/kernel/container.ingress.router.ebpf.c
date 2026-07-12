@@ -1,5 +1,7 @@
 #include <ebpf/kernel/includes.h>
 #include <switchboard/common/checksum.h>
+#include <switchboard/common/public.destination.h>
+#include <switchboard/kernel/container.ingress.policy.h>
 
 // This program is attached as BPF_NETKIT_PRIMARY on the host-side primary
 // endpoint. Upstream netkit runs the program attached to the transmitting
@@ -163,6 +165,29 @@ int ct_ingress(struct __sk_buff *skb)
   else
   {
     bumpPacketCounter(12);
+  }
+
+  __u8 networkMode = containerNetworkMode();
+  if (networkMode == CONTAINER_NETWORK_DENY || networkMode > CONTAINER_NETWORK_DECLARED_ONLY)
+  {
+    return NETKIT_DROP;
+  }
+  if (networkMode == CONTAINER_NETWORK_DECLARED_ONLY && protocol == BE_ETH_P_IPV6)
+  {
+    struct ipv6hdr *ip6h = (struct ipv6hdr *)l3_data;
+    if ((void *)(ip6h + 1) > data_end)
+    {
+      return NETKIT_DROP;
+    }
+    if (switchboardContainerDestinationIPv6(ip6h->daddr.s6_addr))
+    {
+      struct tcphdr *tcp = (struct tcphdr *)(ip6h + 1);
+      if (ip6h->nexthdr != IPPROTO_TCP || (void *)(tcp + 1) > data_end ||
+          containerLearnOrAuthorizeInboundTCP(ip6h, tcp) == false)
+      {
+        return NETKIT_DROP;
+      }
+    }
   }
 
   if (protocol == BE_ETH_P_IP && containerRequiresPublic4() == false)

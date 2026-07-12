@@ -366,6 +366,22 @@ static inline bool mothershipParsePricingPlanningApplicationConfigJSON(
         return false;
       }
     }
+    else if (key.equal("maxPids"_ctv))
+    {
+      if (mothershipParseApplicationMaxPids(
+              field.value, config, "applications[].config"_ctv, failure) == false)
+      {
+        return false;
+      }
+    }
+    else if (key.equal("isolatedChildMemoryMB"_ctv))
+    {
+      if (mothershipParseApplicationIsolatedChildMemoryMB(
+              field.value, config, "applications[].config"_ctv, failure) == false)
+      {
+        return false;
+      }
+    }
     else if (key.equal("architecture"_ctv))
     {
       if (mothershipParseApplicationArchitectureField(field.value, config, "applications[].config"_ctv, failure) == false)

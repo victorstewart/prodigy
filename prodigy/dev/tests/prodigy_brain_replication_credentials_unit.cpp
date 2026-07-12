@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <new>
 #include <fcntl.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
@@ -68,7 +69,23 @@ static std::string testName(const char *prefix, const char *suffix)
 class TestBrain : public Brain {
 public:
 
+  static void completeDNSDelay(void *, TimeoutPacket *packet)
+  {
+    packet->dispatcher->dispatchTimeout(packet);
+  }
+
+  static void cancelDNSDelay(void *, TimeoutPacket *)
+  {}
+
+  TestBrain()
+  {
+    configureDNSProviderRuntime({.delay = {nullptr, completeDNSDelay, cancelDNSDelay}});
+  }
+
   uint32_t persistCalls = 0;
+  bool persistSucceeds = true;
+  BrainConfig lastPersistedBrainConfig = {};
+  ProdigyMasterAuthorityRuntimeState lastPersistedMasterAuthorityState = {};
   uint32_t masterAuthorityApplyCalls = 0;
   uint32_t clusterOwnershipCalls = 0;
   uint128_t lastClaimedClusterUUID = 0;
@@ -106,9 +123,12 @@ public:
     (void)message;
   }
 
-  void persistLocalRuntimeState(void) override
+  bool persistLocalRuntimeState(void) override
   {
     persistCalls += 1;
+    ownBrainConfig(brainConfig, lastPersistedBrainConfig);
+    lastPersistedMasterAuthorityState = masterAuthorityRuntimeState;
+    return persistSucceeds;
   }
 
   bool storeSystemContainerArtifact(const String& sha256, uint64_t bytes, const String& blob, String *failure = nullptr) override
@@ -315,7 +335,7 @@ public:
     return routableResourceDNSPartEquals(provider, "cloudflare"_ctv, false);
   }
 
-  bool upsert(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> upsert(CoroutineStack *, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
   {
     upsertCalls += 1;
     upserts.push_back(record);
@@ -323,13 +343,13 @@ public:
     if (failUpsert)
     {
       failure.assign("injected DNS upsert failure"_ctv);
-      return false;
+      co_return false;
     }
     failure.clear();
-    return true;
+    co_return true;
   }
 
-  bool remove(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> remove(CoroutineStack *, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
   {
     (void)credential;
     removeCalls += 1;
@@ -337,13 +357,13 @@ public:
     if (failRemove)
     {
       failure.assign("injected DNS remove failure"_ctv);
-      return false;
+      co_return false;
     }
     failure.clear();
-    return true;
+    co_return true;
   }
 
-  bool presentTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> presentTXT(CoroutineStack *, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
   {
     presentTXTCalls += 1;
     presentedTXT.push_back(record);
@@ -351,12 +371,12 @@ public:
     if (failUpsert)
     {
       failure.assign("injected DNS upsert failure"_ctv);
-      return false;
+      co_return false;
     }
     String value = {};
     if (prodigyDNSRecordSingleTXTValue(record, value, failure) == false)
     {
-      return false;
+      co_return false;
     }
     bool exists = false;
     for (const ProdigyDNSRecordBinding& active : activeTXT)
@@ -368,10 +388,10 @@ public:
       activeTXT.push_back(record);
     }
     failure.clear();
-    return true;
+    co_return true;
   }
 
-  bool cleanupTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> cleanupTXT(CoroutineStack *, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
   {
     (void)credential;
     cleanupTXTCalls += 1;
@@ -379,12 +399,12 @@ public:
     if (failRemove)
     {
       failure.assign("injected DNS remove failure"_ctv);
-      return false;
+      co_return false;
     }
     String value = {};
     if (prodigyDNSRecordSingleTXTValue(record, value, failure) == false)
     {
-      return false;
+      co_return false;
     }
     for (auto it = activeTXT.begin(); it != activeTXT.end();)
     {
@@ -398,7 +418,7 @@ public:
       }
     }
     failure.clear();
-    return true;
+    co_return true;
   }
 };
 
@@ -568,7 +588,16 @@ static Machine *cloneMachineSnapshot(const Machine& source);
 class NoopBrainIaaS : public BrainIaaS {
 public:
 
+  uint32_t configureRuntimeEnvironmentCalls = 0;
+  ProdigyRuntimeEnvironmentConfig lastRuntimeEnvironment = {};
+
   void boot(void) override {}
+
+  void configureRuntimeEnvironment(const ProdigyRuntimeEnvironmentConfig& config) override
+  {
+    configureRuntimeEnvironmentCalls += 1;
+    lastRuntimeEnvironment = config;
+  }
 
   void spinMachines(CoroutineStack *coro, MachineLifetime lifetime, const MachineConfig& config, uint32_t count, bytell_hash_set<Machine *>& newMachines, String& error) override
   {
@@ -580,14 +609,14 @@ public:
     error.clear();
   }
 
-  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines) override
+  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines, String& failure) override
   {
     (void)coro;
     (void)metro;
     (void)machines;
   }
 
-  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains) override
+  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains, String& failure) override
   {
     (void)coro;
     (void)selfUUID;
@@ -595,9 +624,11 @@ public:
     selfIsBrain = false;
   }
 
-  void hardRebootMachine(uint128_t uuid) override
+  void hardRebootMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
-    (void)uuid;
+    (void)coro;
+    (void)cloudID;
+    failure.clear();
   }
 
   void reportHardwareFailure(uint128_t uuid, const String& report) override
@@ -612,9 +643,11 @@ public:
     (void)decommissionedIDs;
   }
 
-  void destroyMachine(Machine *machine) override
+  void destroyMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
-    (void)machine;
+    (void)coro;
+    (void)cloudID;
+    failure.clear();
   }
 
   uint32_t supportedMachineKindsMask() const override
@@ -629,15 +662,17 @@ public:
   uint32_t hardRebootCalls = 0;
   uint32_t reportHardwareFailureCalls = 0;
   uint32_t destroyCalls = 0;
-  uint128_t lastHardRebootUUID = 0;
+  String lastHardRebootCloudID = {};
   uint128_t lastReportedHardwareFailureUUID = 0;
-  uint128_t lastDestroyedUUID = 0;
+  String lastDestroyedCloudID = {};
   String lastHardwareFailureReport = {};
 
-  void hardRebootMachine(uint128_t uuid) override
+  void hardRebootMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
+    (void)coro;
+    failure.clear();
     hardRebootCalls += 1;
-    lastHardRebootUUID = uuid;
+    lastHardRebootCloudID = cloudID;
   }
 
   void reportHardwareFailure(uint128_t uuid, const String& report) override
@@ -647,57 +682,172 @@ public:
     lastHardwareFailureReport = report;
   }
 
-  void destroyMachine(Machine *machine) override
+  void destroyMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
+    (void)coro;
+    failure.clear();
     destroyCalls += 1;
-    lastDestroyedUUID = (machine ? machine->uuid : 0);
+    lastDestroyedCloudID = cloudID;
   }
 };
 
 class ElasticPrefixBrainIaaS final : public NoopBrainIaaS {
 public:
 
+  bool supportsTransactionalElasticAddresses(void) const override
+  {
+    return true;
+  }
+
+  bool validateProviderElasticAddressPlan(const ProviderElasticAddressPlan& plan,
+                                          const ProviderElasticAddressRequest& request,
+                                          uint128_t transactionNonce) const override
+  {
+    return plan.opaque == "elastic-prefix-test-plan"_ctv &&
+           request.cloudID.empty() == false && transactionNonce != 0;
+  }
+
   uint32_t assignCalls = 0;
   uint32_t releaseCalls = 0;
-  Machine *lastMachine = nullptr;
+  uint32_t failReleaseCalls = 0;
+  uint32_t fenceChanges = 0;
+  bool deferAssignments = false;
+  bool deferCompensations = false;
+  bool deferReleases = false;
+  bool failPrepare = false;
+  uint32_t failCompensationCalls = 0;
+  bool fenceActive = false;
+  bool fenceSucceeds = true;
+  CoroutineStack *pending = nullptr;
+  String lastCloudID = {};
   ExternalAddressFamily lastFamily = ExternalAddressFamily::ipv4;
   ElasticPrefixIntent lastIntent = ElasticPrefixIntent::create;
   String lastRequestedAddress = {};
   String lastProviderPool = {};
-  DistributableExternalSubnet lastReleased = {};
+  ProviderElasticAddressRelease lastReleased = {};
+  Vector<uint128_t> releaseNonces;
+  IPPrefix assignmentPrefix = IPPrefix("198.51.100.88", false, 32);
+  IPPrefix assignmentDeliveryPrefix = {};
+  IPPrefix requestedDeliveryPrefix = {};
+  String assignmentAllocationID = "alloc-88"_ctv;
+  String assignmentAssociationID = "assoc-88"_ctv;
+  bool useRequestedDeliveryPrefix = true;
+  bool assignmentReleaseOnRemove = true;
 
-  bool assignProviderElasticAddress(Machine *machine,
-                                    ExternalAddressFamily family,
-                                    ElasticPrefixIntent intent,
-                                    const String& requestedAddress,
-                                    const String& providerPool,
-                                    IPPrefix& assignedPrefix,
-                                    IPPrefix& deliveryPrefix,
-                                    String& allocationID,
-                                    String& associationID,
-                                    bool& releaseOnRemove,
-                                    String& error) override
+  bool setElasticAddressReleaseFenceActive(bool active) override
   {
-    assignCalls += 1;
-    lastMachine = machine;
-    lastFamily = family;
-    lastIntent = intent;
-    lastRequestedAddress.assign(requestedAddress);
-    lastProviderPool.assign(providerPool);
-    assignedPrefix = IPPrefix("198.51.100.88", false, 32);
-    deliveryPrefix = IPPrefix("10.0.0.88", false, 32);
-    allocationID.assign("alloc-88"_ctv);
-    associationID.assign("assoc-88"_ctv);
-    releaseOnRemove = true;
-    error.clear();
-    return true;
+    fenceChanges += 1;
+    if (fenceSucceeds)
+    {
+      fenceActive = active;
+    }
+    return fenceSucceeds;
   }
 
-  bool releaseProviderElasticAddress(const DistributableExternalSubnet& prefix, String& error) override
+  void prepareProviderElasticAddress(CoroutineStack *coro,
+                                     const ProviderElasticAddressRequest& request,
+                                     uint128_t transactionNonce,
+                                     ProviderElasticAddressPlan& plan,
+                                     String& error) override
+  {
+    (void)coro;
+    (void)transactionNonce;
+    lastCloudID.assign(request.cloudID);
+    lastFamily = request.family;
+    lastIntent = request.intent;
+    lastRequestedAddress.assign(request.requestedAddress);
+    lastProviderPool.assign(request.providerPool);
+    requestedDeliveryPrefix = request.deliveryPrefix;
+    if (failPrepare)
+    {
+      plan = {};
+      error.assign("injected prepare failure"_ctv);
+      co_return;
+    }
+    plan.opaque.assign("elastic-prefix-test-plan"_ctv);
+    error.clear();
+    co_return;
+  }
+
+  void applyProviderElasticAddress(CoroutineStack *coro,
+                                   const ProviderElasticAddressPlan& plan,
+                                   ProviderElasticAddressAssignment& assignment,
+                                   String& error) override
+  {
+    (void)plan;
+    assignCalls += 1;
+    if (deferAssignments)
+    {
+      pending = coro;
+      co_await coro->suspend();
+      pending = nullptr;
+    }
+    assignment.assignedPrefix = assignmentPrefix;
+    assignment.deliveryPrefix = useRequestedDeliveryPrefix ? requestedDeliveryPrefix : assignmentDeliveryPrefix;
+    assignment.allocationID.assign(assignmentAllocationID);
+    assignment.associationID.assign(assignmentAssociationID);
+    assignment.releaseOnRemove = assignmentReleaseOnRemove;
+    error.clear();
+  }
+
+  void compensateProviderElasticAddress(CoroutineStack *coro,
+                                        const ProviderElasticAddressPlan& plan,
+                                        String& error) override
+  {
+    (void)plan;
+    releaseCalls += 1;
+    if (deferCompensations)
+    {
+      pending = coro;
+      co_await coro->suspend();
+      pending = nullptr;
+    }
+    if (failCompensationCalls > 0)
+    {
+      failCompensationCalls -= 1;
+      error.assign("injected compensation failure"_ctv);
+      co_return;
+    }
+    error.clear();
+    co_return;
+  }
+
+  void releaseProviderElasticAddress(CoroutineStack *coro,
+                                     const ProviderElasticAddressRelease& release,
+                                     String& error) override
   {
     releaseCalls += 1;
-    lastReleased = prefix;
+    releaseNonces.push_back(release.transactionNonce);
+    if (deferReleases)
+    {
+      pending = coro;
+      co_await coro->suspend();
+      pending = nullptr;
+    }
+    lastReleased = {};
+    lastReleased.transactionNonce = release.transactionNonce;
+    lastReleased.kind = release.kind;
+    lastReleased.assignedPrefix = release.assignedPrefix;
+    lastReleased.allocationID.assign(release.allocationID);
+    lastReleased.associationID.assign(release.associationID);
+    lastReleased.releaseOnRemove = release.releaseOnRemove;
+    if (failReleaseCalls > 0)
+    {
+      failReleaseCalls -= 1;
+      error.assign("injected release failure"_ctv);
+      co_return;
+    }
     error.clear();
+  }
+
+  bool complete(void)
+  {
+    if (pending == nullptr)
+    {
+      return false;
+    }
+    CoroutineStack *stack = pending;
+    stack->co_consume();
     return true;
   }
 };
@@ -716,7 +866,10 @@ public:
   ResumableAddMachinesBrain *observedBrain = nullptr;
   const Vector<ClusterMachine> *observedAsyncQueuedMachines = nullptr;
   bool sawPendingOperationDuringSpin = false;
+  bool sawAutonomousOperationDuringSpin = false;
   bool sawBootstrapDuringSpin = false;
+  bool provisioningSettled = true;
+  Vector<uint64_t> provisioningOperationIDs;
 
   void boot(void) override {}
 
@@ -728,6 +881,11 @@ public:
     (void)count;
 
     spinCalls += 1;
+    if (observedBrain != nullptr &&
+        observedBrain->masterAuthorityRuntimeState.pendingAutonomousProvisioningOperations.empty() == false)
+    {
+      sawAutonomousOperationDuringSpin = true;
+    }
     error.clear();
     for (Machine *snapshot : snapshotsToReturn)
     {
@@ -759,7 +917,17 @@ public:
     progressSink = sink;
   }
 
-  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines) override
+  void configureProvisioningOperationID(uint64_t operationID) override
+  {
+    provisioningOperationIDs.push_back(operationID);
+  }
+
+  bool provisioningOperationSettled(void) override
+  {
+    return provisioningSettled;
+  }
+
+  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines, String& failure) override
   {
     (void)coro;
     (void)metro;
@@ -772,7 +940,7 @@ public:
     }
   }
 
-  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains) override
+  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains, String& failure) override
   {
     (void)coro;
     (void)selfUUID;
@@ -780,9 +948,11 @@ public:
     selfIsBrain = false;
   }
 
-  void hardRebootMachine(uint128_t uuid) override
+  void hardRebootMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
-    (void)uuid;
+    (void)coro;
+    (void)cloudID;
+    failure.clear();
   }
 
   void reportHardwareFailure(uint128_t uuid, const String& report) override
@@ -797,12 +967,14 @@ public:
     (void)decommissionedIDs;
   }
 
-  void destroyMachine(Machine *machine) override
+  void destroyMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
+    (void)coro;
+    failure.clear();
     destroyCalls += 1;
-    if (machine != nullptr)
+    if (cloudID.empty() == false)
     {
-      destroyedCloudIDs.push_back(machine->cloudID);
+      destroyedCloudIDs.push_back(cloudID);
     }
   }
 
@@ -825,7 +997,7 @@ public:
 class NoopNeuronIaaS final : public NeuronIaaS {
 public:
 
-  void gatherSelfData(uint128_t& uuid, String& metro, bool& isBrain, EthDevice& eth, IPAddress& private4) override
+  void gatherSelfData(CoroutineStack *, uint128_t& uuid, String& metro, bool& isBrain, EthDevice& eth, IPAddress& private4) override
   {
     uuid = 0;
     metro.clear();
@@ -834,12 +1006,6 @@ public:
     private4 = {};
   }
 
-  void downloadContainerToPath(CoroutineStack *coro, uint64_t deploymentID, const String& path) override
-  {
-    (void)coro;
-    (void)deploymentID;
-    (void)path;
-  }
 };
 
 class TestNeuron final : public Neuron {
@@ -2210,6 +2376,48 @@ static Message *buildMothershipMessage(String& buffer, MothershipTopic topic, Ar
   return reinterpret_cast<Message *>(buffer.data());
 }
 
+static void serializeMasterAuthorityTransition(
+    String& serialized,
+    const ProdigyMasterAuthorityRuntimeState& runtimeState,
+    const BrainConfig& brainConfig)
+{
+  ProdigyMasterAuthorityStateTransition transition;
+  transition.runtimeState = runtimeState;
+  transition.brainConfig = brainConfig;
+  BitseryEngine::serialize(serialized, transition);
+}
+
+static void authorizeMasterPeerForTest(TestBrain& brain,
+                                       BrainView& peer,
+                                       int32_t fixedSlot,
+                                       uint128_t uuid,
+                                       int64_t bootNs)
+{
+  brain.noMasterYet = false;
+  peer.connected = true;
+  peer.isFixedFile = true;
+  peer.fslot = fixedSlot;
+  peer.registrationFresh = true;
+  peer.uuid = uuid;
+  peer.boottimens = bootNs;
+  peer.existingMasterUUID = uuid;
+  peer.isMasterBrain = true;
+}
+
+static bool deserializeMasterAuthorityTransition(
+    const String& serialized,
+    ProdigyMasterAuthorityRuntimeState& runtimeState)
+{
+  ProdigyMasterAuthorityStateTransition transition;
+  if (BitseryEngine::deserializeSafe(serialized, transition) == false ||
+      transition.version != ProdigyMasterAuthorityStateTransition::currentVersion)
+  {
+    return false;
+  }
+  runtimeState = std::move(transition.runtimeState);
+  return true;
+}
+
 static bool pullClusterStatusReportForTest(TestBrain& brain, ClusterStatusReport& report)
 {
   Mothership mothership;
@@ -3020,6 +3228,70 @@ static void testStatefulRequestMachinesClaimsDeployingMachinesWithSpecializedTic
   brain.racks.erase(rackC.uuid);
 
   thisBrain = previousBrain;
+}
+
+static void testAutonomousProvisioningJournalReplaysAmbiguousLaunchAfterRestart(TestSuite& suite)
+{
+  ResumableAddMachinesBrain brain;
+  AutoProvisionBrainIaaS iaas;
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  brain.brainConfig.clusterUUID = 0x62004001;
+  iaas.observedBrain = &brain;
+  iaas.provisioningSettled = false;
+
+  MachineConfig machineConfig;
+  machineConfig.slug.assign("aws-autonomous"_ctv);
+  machineConfig.nLogicalCores = 4;
+  machineConfig.nMemoryMB = 4096;
+  machineConfig.nStorageMB = 4096;
+  brain.brainConfig.configBySlug.insert_or_assign(machineConfig.slug, machineConfig);
+
+  ApplicationDeployment deployment;
+  seedDeployRequestPlan(deployment.plan, 62'004);
+  MachineTicket ticket;
+  brain.requestMachines(&ticket, &deployment, ApplicationLifetime::base, 8);
+
+  suite.expect(iaas.spinCalls == 1, "autonomous_provisioning_ambiguous_launch_attempted_once");
+  suite.expect(iaas.sawAutonomousOperationDuringSpin, "autonomous_provisioning_journal_is_durable_before_provider_io");
+  suite.expect(iaas.provisioningOperationIDs.size() == 1 && iaas.provisioningOperationIDs[0] != 0, "autonomous_provisioning_passes_nonzero_operation_id");
+  suite.expect(brain.masterAuthorityRuntimeState.pendingAutonomousProvisioningOperations.size() == 1, "autonomous_provisioning_ambiguous_launch_retains_journal");
+  suite.expect(brain.persistCalls > 0, "autonomous_provisioning_journal_persisted");
+
+  String serializedState;
+  BitseryEngine::serialize(serializedState, brain.masterAuthorityRuntimeState);
+  ProdigyMasterAuthorityRuntimeState restoredState;
+  suite.require(BitseryEngine::deserializeSafe(serializedState, restoredState), "autonomous_provisioning_restart_state_deserializes");
+
+  ResumableAddMachinesBrain restored;
+  AutoProvisionBrainIaaS restoredIaaS;
+  restored.iaas = &restoredIaaS;
+  restored.weAreMaster = true;
+  restored.noMasterYet = false;
+  restored.brainConfig.clusterUUID = brain.brainConfig.clusterUUID;
+  restored.brainConfig.configBySlug.insert_or_assign(machineConfig.slug, machineConfig);
+  restored.masterAuthorityRuntimeState = std::move(restoredState);
+  restoredIaaS.observedBrain = &restored;
+  restoredIaaS.provisioningSettled = false;
+
+  restored.requestMachines(&ticket, &deployment, ApplicationLifetime::base, 1);
+  suite.expect(restoredIaaS.spinCalls == 1, "autonomous_provisioning_restart_reconciles_once");
+  suite.expect(restoredIaaS.provisioningOperationIDs.size() == 1 &&
+                   restoredIaaS.provisioningOperationIDs[0] == iaas.provisioningOperationIDs[0],
+               "autonomous_provisioning_restart_reuses_operation_id");
+  suite.expect(restored.masterAuthorityRuntimeState.pendingAutonomousProvisioningOperations.size() == 1 &&
+                   restored.masterAuthorityRuntimeState.pendingAutonomousProvisioningOperations[0].count == 2,
+               "autonomous_provisioning_restart_reuses_original_intent");
+
+  restoredIaaS.provisioningSettled = true;
+  restored.requestMachines(&ticket, &deployment, ApplicationLifetime::base, 1);
+  suite.expect(restored.masterAuthorityRuntimeState.pendingAutonomousProvisioningOperations.empty(), "autonomous_provisioning_proven_compensation_clears_journal");
+
+  delete brain.mesh;
+  brain.mesh = nullptr;
+  delete restored.mesh;
+  restored.mesh = nullptr;
 }
 
 static void testSpinApplicationFailedFrameCarriesReason(TestSuite& suite)
@@ -4148,7 +4420,7 @@ static void testBrainHandlerReplicationPaths(TestSuite& suite)
   NoopBrainIaaS iaas;
   BrainView peer;
   brain.iaas = &iaas;
-  brain.noMasterYet = false;
+  authorizeMasterPeerForTest(brain, peer, 61, uint128_t(0x6101), 6101);
   String failure;
   String messageBuffer;
 
@@ -4257,6 +4529,8 @@ static void testBrainHandlerReplicationPaths(TestSuite& suite)
   replicatedConfig.bootstrapSshPrivateKeyPath = "/tmp/replica-bootstrap-key"_ctv;
   replicatedConfig.remoteProdigyPath = "/opt/prodigy"_ctv;
   replicatedConfig.controlSocketPath = "/run/prodigy/control.sock"_ctv;
+  replicatedConfig.runtimeEnvironment.kind = ProdigyEnvironmentKind::gcp;
+  replicatedConfig.runtimeEnvironment.providerScope.assign("projects/test/zones/a"_ctv);
   String replicationFailure = {};
   suite.expect(
       prodigyReadSSHKeyPackageFromPrivateKeyPath(
@@ -4272,8 +4546,10 @@ static void testBrainHandlerReplicationPaths(TestSuite& suite)
       "replicate_brain_config_reads_bootstrap_ssh_host_key_package");
   {
     String serialized;
-    BitseryEngine::serialize(serialized, replicatedConfig);
-    Message *message = buildBrainMessage(messageBuffer, BrainTopic::replicateBrainConfig, serialized);
+    ProdigyMasterAuthorityRuntimeState initialRuntimeState;
+    initialRuntimeState.generation = 1;
+    serializeMasterAuthorityTransition(serialized, initialRuntimeState, replicatedConfig);
+    Message *message = buildBrainMessage(messageBuffer, BrainTopic::replicateMasterAuthorityState, serialized);
     brain.brainHandler(&peer, message);
   }
   suite.expect(brain.brainConfig.clusterUUID == replicatedConfig.clusterUUID, "replicate_brain_config_applies_payload");
@@ -4283,6 +4559,9 @@ static void testBrainHandlerReplicationPaths(TestSuite& suite)
   suite.expect(brain.clusterOwnershipCalls == 1, "replicate_brain_config_claims_cluster_ownership");
   suite.expect(brain.lastClaimedClusterUUID == replicatedConfig.clusterUUID, "replicate_brain_config_claims_expected_cluster_uuid");
   suite.expect(brain.persistCalls == 4, "replicate_brain_config_persists_on_apply");
+  suite.expect(iaas.configureRuntimeEnvironmentCalls == 1 &&
+                   iaas.lastRuntimeEnvironment == replicatedConfig.runtimeEnvironment,
+               "combined_master_authority_activates_replicated_runtime_environment");
 
   {
     Message *message = buildBrainMessage(messageBuffer, BrainTopic::replicateApplicationIDReservation, uint16_t(40'001), "ReplicaApp"_ctv);
@@ -4411,7 +4690,7 @@ static void testBrainHandlerReplicationPaths(TestSuite& suite)
   runtimeState.privateTlsVaultLifecycles.push_back(privateTls);
   {
     String serialized;
-    BitseryEngine::serialize(serialized, runtimeState);
+    serializeMasterAuthorityTransition(serialized, runtimeState, brain.brainConfig);
     Message *message = buildBrainMessage(messageBuffer, BrainTopic::replicateMasterAuthorityState, serialized);
     brain.brainHandler(&peer, message);
   }
@@ -4422,16 +4701,16 @@ static void testBrainHandlerReplicationPaths(TestSuite& suite)
   suite.expect(brain.masterAuthorityRuntimeState.pendingAddMachinesOperations.size() == 1, "replicate_master_authority_restores_pending_addmachines_operation");
   suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates.size() == 1 && prodigyPublicTlsCertificateStatesEqual(brain.masterAuthorityRuntimeState.publicTlsCertificates[0], publicTls), "replicate_master_authority_restores_public_tls_certificate_state");
   suite.expect(brain.masterAuthorityRuntimeState.privateTlsVaultLifecycles.size() == 1 && prodigyPrivateTlsVaultLifecycleStatesEqual(brain.masterAuthorityRuntimeState.privateTlsVaultLifecycles[0], privateTls), "replicate_master_authority_restores_private_tls_lifecycle_state");
-  suite.expect(brain.masterAuthorityApplyCalls == 1, "replicate_master_authority_calls_apply_hook");
+  suite.expect(brain.masterAuthorityApplyCalls == 2, "replicate_master_authority_calls_apply_hook");
   suite.expect(brain.persistCalls == 8, "replicate_master_authority_persists_on_apply");
 
   {
     String serialized;
-    BitseryEngine::serialize(serialized, runtimeState);
+    serializeMasterAuthorityTransition(serialized, runtimeState, brain.brainConfig);
     Message *message = buildBrainMessage(messageBuffer, BrainTopic::replicateMasterAuthorityState, serialized);
     brain.brainHandler(&peer, message);
   }
-  suite.expect(brain.masterAuthorityApplyCalls == 1, "replicate_master_authority_ignores_duplicate_state");
+  suite.expect(brain.masterAuthorityApplyCalls == 2, "replicate_master_authority_ignores_duplicate_state");
   suite.expect(brain.persistCalls == 8, "replicate_master_authority_duplicate_does_not_persist");
 
   Vector<ProdigyMetricSample> metricSamples;
@@ -4514,6 +4793,7 @@ static void testReconcileStateReplicatesCredentialAndTlsState(TestSuite& suite)
   bool foundTlsFactory = false;
   bool foundApiSet = false;
   bool foundBrainConfig = false;
+  bool foundSplitBrainConfig = false;
   bool foundMasterAuthority = false;
   bool foundMetricsSnapshot = false;
 
@@ -4546,14 +4826,7 @@ static void testReconcileStateReplicatesCredentialAndTlsState(TestSuite& suite)
     }
     else if (topic == BrainTopic::replicateBrainConfig)
     {
-      String serializedBrainConfig;
-      Message::extractToStringView(args, serializedBrainConfig);
-
-      BrainConfig decoded = {};
-      if (BitseryEngine::deserializeSafe(serializedBrainConfig, decoded) && decoded.clusterUUID == brain.brainConfig.clusterUUID)
-      {
-        foundBrainConfig = true;
-      }
+      foundSplitBrainConfig = true;
     }
     else if (topic == BrainTopic::replicateTlsVaultFactory)
     {
@@ -4582,10 +4855,13 @@ static void testReconcileStateReplicatesCredentialAndTlsState(TestSuite& suite)
       String serializedRuntimeState;
       Message::extractToStringView(args, serializedRuntimeState);
 
-      ProdigyMasterAuthorityRuntimeState decoded = {};
-      if (BitseryEngine::deserializeSafe(serializedRuntimeState, decoded) && decoded.generation == brain.masterAuthorityRuntimeState.generation && decoded.nextMintedClientTlsGeneration == brain.masterAuthorityRuntimeState.nextMintedClientTlsGeneration)
+      ProdigyMasterAuthorityStateTransition decoded = {};
+      if (BitseryEngine::deserializeSafe(serializedRuntimeState, decoded) &&
+          decoded.runtimeState.generation == brain.masterAuthorityRuntimeState.generation &&
+          decoded.runtimeState.nextMintedClientTlsGeneration == brain.masterAuthorityRuntimeState.nextMintedClientTlsGeneration)
       {
         foundMasterAuthority = true;
+        foundBrainConfig = decoded.brainConfig.clusterUUID == brain.brainConfig.clusterUUID;
       }
     }
     else if (topic == BrainTopic::replicateMetricsSnapshot)
@@ -4601,7 +4877,8 @@ static void testReconcileStateReplicatesCredentialAndTlsState(TestSuite& suite)
     }
   });
 
-  suite.expect(foundBrainConfig, "reconcile_state_emits_brain_config_replication");
+  suite.expect(foundBrainConfig && foundSplitBrainConfig == false,
+               "reconcile_state_carries_brain_config_only_in_combined_transition");
   suite.expect(foundReservation, "reconcile_state_emits_application_id_reservation_replication");
   suite.expect(foundServiceReservation, "reconcile_state_emits_service_reservation_replication");
   suite.expect(foundTlsFactory, "reconcile_state_emits_tls_factory_replication");
@@ -4775,7 +5052,7 @@ static void testMothershipTunnelProviderConfigureAppliesAtomicallyAndReplicates(
       String replicatedSerialized = {};
       Message::extractToStringView(args, replicatedSerialized);
       ProdigyMasterAuthorityRuntimeState replicated = {};
-      sawMasterAuthority = BitseryEngine::deserializeSafe(replicatedSerialized, replicated) &&
+      sawMasterAuthority = deserializeMasterAuthorityTransition(replicatedSerialized, replicated) &&
                            equalSerializedObjects(replicated.mothershipTunnelProviderDesiredState.connectivity, config) &&
                            equalSerializedObjects(replicated.mothershipTunnelProviderDesiredState.gatewayAuth, auth);
     }
@@ -4847,7 +5124,7 @@ static void testMothershipTunnelProviderReconcileBackfillsDesiredStateAndArtifac
       String serializedState = {};
       ProdigyMasterAuthorityRuntimeState state = {};
       Message::extractToStringView(args, serializedState);
-      sawMasterAuthority = BitseryEngine::deserializeSafe(serializedState, state) &&
+      sawMasterAuthority = deserializeMasterAuthorityTransition(serializedState, state) &&
                            equalSerializedObjects(state.mothershipTunnelProviderDesiredState.connectivity, config) &&
                            equalSerializedObjects(state.mothershipTunnelProviderDesiredState.gatewayAuth, auth);
       masterAuthorityIndex = index;
@@ -4905,6 +5182,7 @@ static void testMothershipTunnelProviderDesiredStateMasterAuthorityReplicationAp
 {
   TestBrain brain;
   BrainView peer;
+  authorizeMasterPeerForTest(brain, peer, 62, uint128_t(0x6201), 6201);
   MothershipConnectivity config = makeTunnelRuntimeConnectivityConfig();
   MothershipTunnelGatewayAuth auth = makeTunnelGatewayAuth();
   suite.require(auth.configured(), "mothership_tunnel_provider_master_authority_replication_fixture_configured");
@@ -4914,7 +5192,7 @@ static void testMothershipTunnelProviderDesiredStateMasterAuthorityReplicationAp
   runtimeState.generation = 1;
   runtimeState.mothershipTunnelProviderDesiredState = desired;
   String serialized = {};
-  BitseryEngine::serialize(serialized, runtimeState);
+  serializeMasterAuthorityTransition(serialized, runtimeState, brain.brainConfig);
 
   String messageBuffer;
   Message *message = buildBrainMessage(messageBuffer, BrainTopic::replicateMasterAuthorityState, serialized);
@@ -5633,10 +5911,11 @@ static void testMothershipConfigureRejectsClusterTakeover(TestSuite& suite)
   suite.expect(mothership.wBuffer.size() == 0, "mothership_configure_reject_takeover_emits_no_ack");
 }
 
-static void testReplicateBrainConfigRejectsClusterTakeover(TestSuite& suite)
+static void testReplicateMasterAuthorityRejectsClusterTakeover(TestSuite& suite)
 {
   TestBrain brain;
   BrainView peer = {};
+  authorizeMasterPeerForTest(brain, peer, 63, uint128_t(0x6301), 6301);
   String messageBuffer = {};
   brain.rejectClusterOwnership = true;
   brain.rejectClusterOwnershipFailure.assign("local machine already belongs to cluster a and refuses takeover by cluster b"_ctv);
@@ -5645,15 +5924,17 @@ static void testReplicateBrainConfigRejectsClusterTakeover(TestSuite& suite)
   BrainConfig replicatedConfig = {};
   replicatedConfig.clusterUUID = 0x3302;
   String serialized = {};
-  BitseryEngine::serialize(serialized, replicatedConfig);
+  ProdigyMasterAuthorityRuntimeState runtimeState;
+  runtimeState.generation = 1;
+  serializeMasterAuthorityTransition(serialized, runtimeState, replicatedConfig);
 
-  Message *message = buildBrainMessage(messageBuffer, BrainTopic::replicateBrainConfig, serialized);
+  Message *message = buildBrainMessage(messageBuffer, BrainTopic::replicateMasterAuthorityState, serialized);
   brain.brainHandler(&peer, message);
 
-  suite.expect(brain.clusterOwnershipCalls == 1, "replicate_brain_config_reject_takeover_claim_called");
-  suite.expect(brain.lastClaimedClusterUUID == replicatedConfig.clusterUUID, "replicate_brain_config_reject_takeover_claim_expected_cluster_uuid");
-  suite.expect(brain.brainConfig.clusterUUID == 0x3301, "replicate_brain_config_reject_takeover_preserves_cluster_uuid");
-  suite.expect(brain.persistCalls == 0, "replicate_brain_config_reject_takeover_does_not_persist");
+  suite.expect(brain.clusterOwnershipCalls == 1, "replicate_master_authority_reject_takeover_claim_called");
+  suite.expect(brain.lastClaimedClusterUUID == replicatedConfig.clusterUUID, "replicate_master_authority_reject_takeover_claim_expected_cluster_uuid");
+  suite.expect(brain.brainConfig.clusterUUID == 0x3301, "replicate_master_authority_reject_takeover_preserves_cluster_uuid");
+  suite.expect(brain.persistCalls == 0, "replicate_master_authority_reject_takeover_does_not_persist");
 }
 
 static void testMothershipConfigureLowersSharedCPUOvercommitWithoutMovingClaims(TestSuite& suite)
@@ -5760,7 +6041,7 @@ static void testMachineSchemaMutationsQueueRuntimeStateReplication(TestSuite& su
       Message::extractToStringView(args, serialized);
 
       ProdigyMasterAuthorityRuntimeState decoded = {};
-      if (BitseryEngine::deserializeSafe(serialized, decoded))
+      if (deserializeMasterAuthorityTransition(serialized, decoded))
       {
         replicated = decoded;
         found = true;
@@ -6637,6 +6918,7 @@ static void testOSUpdateCommandDeadlineFailsClosed(TestSuite& suite)
 
   Machine *machine = new Machine();
   seedOSUpdateMachine(brain, *machine, "deadline-bare"_ctv, MachineConfig::MachineKind::bareMetal, 0x72109002, "22.04"_ctv);
+  machine->cloudID.assign("cloud-deadline-bare"_ctv);
   machine->rack = rack;
   machine->lifetime = MachineLifetime::owned;
   rack->machines.insert(machine);
@@ -6882,17 +7164,20 @@ static void testMachineSchemaMutationsDriveManagedBudgetActions(TestSuite& suite
   followerBrain.iaas = &followerIaaS;
 
   BrainView replicationPeer = {};
-  replicationPeer.isFixedFile = true;
-  replicationPeer.fslot = 41;
-  replicationPeer.connected = true;
-  replicationPeer.uuid = 0x1001;
+  authorizeMasterPeerForTest(followerBrain,
+                             replicationPeer,
+                             41,
+                             uint128_t(0x1001),
+                             1001);
   replicationPeer.private4 = bootstrapPrivate4;
   followerBrain.brains.insert(&replicationPeer);
 
   String messageBuffer = {};
   auto applyCurrentStateToFollower = [&]() -> bool {
     String serializedRuntimeState = {};
-    BitseryEngine::serialize(serializedRuntimeState, brain.masterAuthorityRuntimeState);
+    serializeMasterAuthorityTransition(serializedRuntimeState,
+                                       brain.masterAuthorityRuntimeState,
+                                       brain.brainConfig);
     Message *runtimeMessage = buildBrainMessage(messageBuffer, BrainTopic::replicateMasterAuthorityState, serializedRuntimeState);
     followerBrain.brainHandler(&replicationPeer, runtimeMessage);
 
@@ -9692,6 +9977,625 @@ static void testRegisterRoutablePrefixAcceptsSingleMachineHostPrefix(TestSuite& 
   suite.expect(response.success == false, "mothership_register_routable_prefix_rejects_ambiguous_single_machine_owner");
 }
 
+static void testElasticSnapshotPersistenceRetriesSameGeneration(TestSuite& suite)
+{
+  TestBrain brain;
+  ElasticPrefixBrainIaaS iaas;
+  brain.iaas = &iaas;
+  brain.brainConfig.runtimeEnvironment.kind = ProdigyEnvironmentKind::gcp;
+  brain.brainConfig.runtimeEnvironment.providerScope.assign("zone-a"_ctv);
+  brain.brainConfig.clusterUUID = uint128_t(0x6500);
+  brain.brainConfig.bootstrapSshUser.assign("old-user"_ctv);
+
+  DistributableExternalSubnet prefix;
+  prefix.uuid = uint128_t(0x3365);
+  prefix.name.assign("elastic-persistence-barrier"_ctv);
+  prefix.kind = RoutablePrefixKind::elastic;
+  prefix.subnet = IPPrefix("198.51.100.65", false, 32);
+  prefix.deliverySubnet = IPPrefix("10.0.0.65", false, 32);
+  prefix.usage = ExternalSubnetUsage::wormholes;
+  prefix.ingressScope = RoutableIngressScope::singleMachine;
+  prefix.machineUUID = uint128_t(0x6501);
+  prefix.providerAllocationID.assign("alloc-65"_ctv);
+  prefix.providerAssociationID.assign("assoc-65"_ctv);
+  prefix.releaseOnRemove = true;
+  brain.brainConfig.distributableExternalSubnets.push_back(prefix);
+
+  ProdigyMasterAuthorityRuntimeState incoming;
+  incoming.generation = 1;
+  incoming.nextPendingElasticAddressOperationID = 2;
+  ProdigyPendingElasticAddressRelease release;
+  release.operationID = 1;
+  release.transitionGeneration = 1;
+  release.transactionNonce = 0x6501;
+  release.prefix = prefix;
+  incoming.pendingElasticAddressReleases.push_back(release);
+  BrainConfig incomingConfig = brain.brainConfig;
+  incomingConfig.bootstrapSshUser.assign("new-user"_ctv);
+  incomingConfig.distributableExternalSubnets.clear();
+  ProdigyMasterAuthorityStateTransition transition;
+  transition.runtimeState = incoming;
+  transition.brainConfig = incomingConfig;
+
+  ProdigyMasterAuthorityStateTransition changedProviderTransition = transition;
+  changedProviderTransition.brainConfig.runtimeEnvironment.providerScope.assign("zone-b"_ctv);
+  suite.expect(brain.applyReplicatedMasterAuthorityTransition(changedProviderTransition, true) == false &&
+                   brain.persistCalls == 0 && brain.clusterOwnershipCalls == 0 &&
+                   brain.masterAuthorityRuntimeState.generation == 0 && iaas.fenceActive == false,
+               "elastic_snapshot_introducing_saga_cannot_change_claimed_provider_runtime");
+
+  brain.persistSucceeds = false;
+  suite.expect(brain.applyReplicatedMasterAuthorityTransition(transition, true) == false &&
+                   brain.masterAuthorityRuntimeState.generation == 0 &&
+                   brain.brainConfig.bootstrapSshUser.equal("old-user"_ctv) &&
+                   brain.masterAuthorityRuntimeStateDurable == false && brain.persistCalls == 1 &&
+                   iaas.fenceActive == false,
+               "elastic_snapshot_failed_persistence_rolls_back_combined_live_state_and_fence");
+  suite.expect(brain.replicatedRuntimeStateCoversPendingElasticAddressOperations(incoming) == false,
+               "elastic_snapshot_failed_persistence_blocks_ack_coverage");
+
+  brain.persistSucceeds = true;
+  suite.expect(brain.applyReplicatedMasterAuthorityTransition(transition, true) &&
+                   brain.masterAuthorityRuntimeState.generation == 1 &&
+                   brain.brainConfig.bootstrapSshUser.equal("new-user"_ctv) &&
+                   brain.masterAuthorityRuntimeStateDurable && brain.persistCalls == 2 &&
+                   brain.lastPersistedBrainConfig.bootstrapSshUser.equal("new-user"_ctv) &&
+                   brain.lastPersistedMasterAuthorityState.generation == 1,
+               "elastic_snapshot_retries_exact_combined_transition");
+  suite.expect(brain.replicatedRuntimeStateCoversPendingElasticAddressOperations(incoming),
+               "elastic_snapshot_ack_covers_exact_persisted_retry");
+  ProdigyRuntimeEnvironmentConfig identicalRuntime = brain.brainConfig.runtimeEnvironment;
+  ProdigyRuntimeEnvironmentConfig changedRuntime = identicalRuntime;
+  changedRuntime.providerScope.assign("zone-b"_ctv);
+  ProdigyRuntimeEnvironmentConfig emptyRuntime;
+  suite.expect(brain.elasticAddressSagaFencesRuntimeEnvironment(identicalRuntime) == false &&
+                   brain.elasticAddressSagaFencesRuntimeEnvironment(changedRuntime) &&
+                   brain.elasticAddressSagaFencesRuntimeEnvironment(emptyRuntime),
+               "elastic_saga_preserves_active_runtime_and_rejects_changed_or_empty_replication");
+
+  ProdigyMasterAuthorityRuntimeState cleared = brain.masterAuthorityRuntimeState;
+  cleared.generation += 1;
+  cleared.pendingElasticAddressReleases.clear();
+  brain.persistSucceeds = false;
+  suite.expect(brain.applyReplicatedMasterAuthorityRuntimeState(cleared, true) == false &&
+                   brain.masterAuthorityRuntimeState.generation == 1 &&
+                   brain.masterAuthorityRuntimeState.pendingElasticAddressReleases.size() == 1 &&
+                   iaas.fenceActive,
+               "elastic_snapshot_removal_persist_failure_keeps_prior_durable_fence_active");
+  brain.persistSucceeds = true;
+
+  TestBrain bounded;
+  for (uint64_t operationID = 1;
+       operationID <= ProdigyBrainElasticAddressCoordinator::maximumQueuedOperations;
+       ++operationID)
+  {
+    ProdigyPendingElasticAddressRelease pendingRelease;
+    pendingRelease.operationID = operationID;
+    pendingRelease.transactionNonce = uint128_t(operationID);
+    bounded.masterAuthorityRuntimeState.pendingElasticAddressReleases.push_back(std::move(pendingRelease));
+    Brain::PendingElasticAddressControlOperation control;
+    control.action = ProdigyBrainElasticAddressCoordinator::Action::release;
+    control.sagaOperationID = operationID;
+    bounded.pendingElasticAddressControlOperations.emplace(operationID, std::move(control));
+  }
+  suite.expect(bounded.pendingElasticAddressLogicalOperationCount() ==
+                   ProdigyBrainElasticAddressCoordinator::maximumQueuedOperations,
+               "elastic_saga_bound_does_not_double_count_inflight_controls");
+  Brain::PendingElasticAddressControlOperation extra;
+  extra.sagaOperationID = ProdigyBrainElasticAddressCoordinator::maximumQueuedOperations + 1;
+  const uint64_t extraOperationID = extra.sagaOperationID;
+  bounded.pendingElasticAddressControlOperations.emplace(extraOperationID, std::move(extra));
+  suite.expect(bounded.pendingElasticAddressLogicalOperationCount() ==
+                   ProdigyBrainElasticAddressCoordinator::maximumQueuedOperations + 1,
+               "elastic_saga_bound_counts_unpersisted_prepare_once");
+}
+
+static DistributableExternalSubnet makeElasticAuditPrefix(uint128_t uuid,
+                                                          const String& name)
+{
+  DistributableExternalSubnet prefix;
+  prefix.uuid = uuid;
+  prefix.name.assign(name);
+  prefix.kind = RoutablePrefixKind::elastic;
+  prefix.subnet = IPPrefix("198.51.100.170", false, 32);
+  prefix.deliverySubnet = IPPrefix("10.0.0.170", false, 32);
+  prefix.usage = ExternalSubnetUsage::wormholes;
+  prefix.ingressScope = RoutableIngressScope::singleMachine;
+  prefix.machineUUID = uint128_t(0x1701);
+  prefix.providerAllocationID.assign("allocation-170"_ctv);
+  prefix.providerAssociationID.assign("association-170"_ctv);
+  prefix.releaseOnRemove = true;
+  return prefix;
+}
+
+static void testCombinedMasterAuthorityAuthorizationAndAckBinding(TestSuite& suite)
+{
+  TestBrain follower;
+  ElasticPrefixBrainIaaS followerIaaS;
+  follower.iaas = &followerIaaS;
+  BrainView currentMaster;
+  BrainView rogue;
+  authorizeMasterPeerForTest(follower, currentMaster, 75, uint128_t(0x7501), 7501);
+  authorizeMasterPeerForTest(follower, rogue, 76, uint128_t(0x7502), 7502);
+  currentMaster.existingMasterUUID = rogue.uuid;
+  rogue.isMasterBrain = false;
+  rogue.existingMasterUUID = currentMaster.uuid;
+
+  ProdigyMasterAuthorityStateTransition transition;
+  transition.runtimeState.generation = 1;
+  transition.runtimeState.nextPendingElasticAddressOperationID = 2;
+  ProdigyPendingElasticAddressRelease release;
+  release.operationID = 1;
+  release.transitionGeneration = 1;
+  release.transactionNonce = uint128_t(0x7503);
+  release.prefix = makeElasticAuditPrefix(uint128_t(0x7504), "authorized-transition"_ctv);
+  transition.runtimeState.pendingElasticAddressReleases.push_back(release);
+  transition.brainConfig.clusterUUID = uint128_t(0x7505);
+  String serialized;
+  BitseryEngine::serialize(serialized, transition);
+  String messageBuffer;
+
+  follower.brainHandler(
+      &rogue,
+      buildBrainMessage(messageBuffer, BrainTopic::replicateMasterAuthorityState, serialized));
+  suite.expect(follower.clusterOwnershipCalls == 0 && follower.persistCalls == 0 &&
+                   follower.masterAuthorityRuntimeState.generation == 0 && rogue.wBuffer.empty(),
+               "master_authority_transition_rejects_non_master_peer_before_ownership_or_persist");
+
+  followerIaaS.fenceSucceeds = false;
+  follower.brainHandler(
+      &currentMaster,
+      buildBrainMessage(messageBuffer, BrainTopic::replicateMasterAuthorityState, serialized));
+  suite.expect(follower.clusterOwnershipCalls == 1 && follower.persistCalls == 0 &&
+                   follower.brainConfig.clusterUUID == 0 &&
+                   follower.masterAuthorityRuntimeState.generation == 0 &&
+                   currentMaster.wBuffer.empty(),
+               "master_authority_transition_fence_failure_preserves_combined_live_state");
+
+  followerIaaS.fenceSucceeds = true;
+  follower.persistSucceeds = false;
+  follower.brainHandler(
+      &currentMaster,
+      buildBrainMessage(messageBuffer, BrainTopic::replicateMasterAuthorityState, serialized));
+  suite.expect(follower.clusterOwnershipCalls == 2 && follower.persistCalls == 1 &&
+                   follower.brainConfig.clusterUUID == 0 &&
+                   follower.masterAuthorityRuntimeState.generation == 0 &&
+                   currentMaster.wBuffer.empty(),
+               "master_authority_transition_persist_failure_is_transactional_and_unacknowledged");
+
+  TestNeuron self;
+  self.uuid = uint128_t(0x7506);
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &self;
+  follower.boottimens = 7506;
+  follower.persistSucceeds = true;
+  follower.brainHandler(
+      &currentMaster,
+      buildBrainMessage(messageBuffer, BrainTopic::replicateMasterAuthorityState, serialized));
+
+  ProdigyMasterAuthorityStateTransitionAck acknowledgement;
+  bool decodedAck = false;
+  forEachMessageInBuffer(currentMaster.wBuffer, [&](Message *message) {
+    if (BrainTopic(message->topic) != BrainTopic::replicateMasterAuthorityState)
+    {
+      return;
+    }
+    uint8_t *args = message->args;
+    String serializedAck;
+    Message::extractToStringView(args, serializedAck);
+    decodedAck = BitseryEngine::deserializeSafe(serializedAck, acknowledgement);
+  });
+  String expectedDigest;
+  suite.require(prodigyComputeSHA256Hex(serialized, expectedDigest),
+                "master_authority_transition_ack_digest_fixture");
+  suite.expect(follower.clusterOwnershipCalls == 3 && follower.persistCalls == 2 &&
+                   follower.brainConfig.clusterUUID == transition.brainConfig.clusterUUID &&
+                   follower.masterAuthorityRuntimeState.generation == 1 && decodedAck &&
+                   acknowledgement.generation == 1 && acknowledgement.peerUUID == self.uuid &&
+                   acknowledgement.peerBootNs == follower.boottimens &&
+                   acknowledgement.transitionDigest.equals(expectedDigest),
+               "master_authority_transition_accepts_current_master_and_acks_exact_combined_bytes");
+  thisNeuron = previousNeuron;
+
+  TestBrain master;
+  TestNeuron masterSelf;
+  masterSelf.uuid = uint128_t(0x7508);
+  previousNeuron = thisNeuron;
+  thisNeuron = &masterSelf;
+  master.weAreMaster = true;
+  BrainView followerPeer;
+  followerPeer.connected = true;
+  followerPeer.isFixedFile = true;
+  followerPeer.fslot = 77;
+  followerPeer.registrationFresh = true;
+  followerPeer.uuid = uint128_t(0x7507);
+  followerPeer.boottimens = 7507;
+  followerPeer.existingMasterUUID = masterSelf.uuid;
+  master.masterAuthorityRuntimeState = transition.runtimeState;
+  master.brainConfig = transition.brainConfig;
+  String sentSerializedTransition;
+  serializeMasterAuthorityTransition(sentSerializedTransition,
+                                     master.masterAuthorityRuntimeState,
+                                     master.brainConfig);
+  String sentTransitionDigest;
+  suite.require(prodigyComputeSHA256Hex(sentSerializedTransition,
+                                       sentTransitionDigest),
+                "master_authority_sent_transition_digest_fixture");
+  master.noteMasterAuthorityTransitionSentToPeer(&followerPeer,
+                                                 master.masterAuthorityRuntimeState,
+                                                 sentTransitionDigest);
+  ProdigyMasterAuthorityStateTransitionAck boundAck;
+  boundAck.generation = 1;
+  boundAck.peerUUID = followerPeer.uuid;
+  boundAck.peerBootNs = followerPeer.boottimens;
+  boundAck.transitionDigest.assign(sentTransitionDigest);
+  followerPeer.existingMasterUUID = uint128_t(0x7509);
+  if (boundAck.transitionDigest.size() == 64)
+  {
+    boundAck.transitionDigest[0] =
+        boundAck.transitionDigest[0] == '0' ? '1' : '0';
+  }
+  master.acknowledgeMasterAuthorityTransition(&followerPeer, boundAck);
+  suite.expect(master.masterAuthorityReplicationByPeer[&followerPeer]
+                       .acknowledgedElasticOperationIDs.empty(),
+               "master_authority_ack_rejects_wrong_combined_transition_digest");
+  boundAck.transitionDigest.assign(sentTransitionDigest);
+  master.acknowledgeMasterAuthorityTransition(&followerPeer, boundAck);
+  suite.expect(master.masterAuthorityReplicationByPeer[&followerPeer]
+                       .acknowledgedElasticOperationIDs.contains(1),
+               "master_authority_ack_accepts_exact_digest_during_registration_convergence");
+  thisNeuron = previousNeuron;
+}
+
+static void testElasticCombinedTransitionAndQuarantine(TestSuite& suite)
+{
+  TestBrain brain;
+  BrainView follower;
+  follower.connected = true;
+  follower.isFixedFile = true;
+  follower.fslot = 70;
+  follower.registrationFresh = true;
+  follower.uuid = uint128_t(0x7001);
+  follower.boottimens = 7001;
+  brain.brains.insert(&follower);
+  brain.nBrains = 2;
+  brain.weAreMaster = true;
+  brain.masterAuthorityRuntimeState.generation = 7;
+  brain.brainConfig.distributableExternalSubnets.push_back(
+      makeElasticAuditPrefix(uint128_t(0x7002), "combined-elastic"_ctv));
+  brain.queueMasterAuthorityRuntimeStateReplication();
+
+  bool sawCombined = false;
+  bool sawSplitConfig = false;
+  forEachMessageInBuffer(follower.wBuffer, [&](Message *message) {
+    if (BrainTopic(message->topic) == BrainTopic::replicateBrainConfig)
+    {
+      sawSplitConfig = true;
+      return;
+    }
+    if (BrainTopic(message->topic) != BrainTopic::replicateMasterAuthorityState)
+    {
+      return;
+    }
+    uint8_t *args = message->args;
+    String serialized;
+    Message::extractToStringView(args, serialized);
+    ProdigyMasterAuthorityStateTransition transition;
+    sawCombined = BitseryEngine::deserializeSafe(serialized, transition) &&
+                  transition.runtimeState.pendingElasticAddressAssignments.empty() &&
+                  transition.brainConfig.distributableExternalSubnets.size() == 1 &&
+                  transition.brainConfig.distributableExternalSubnets[0].name.equal(
+                      "combined-elastic"_ctv);
+  });
+  suite.expect(sawCombined && sawSplitConfig == false,
+               "elastic_assignment_final_transition_carries_registry_and_saga_state_together");
+
+  ProdigyPendingElasticAddressRelease release;
+  release.operationID = 1;
+  release.transitionGeneration = 1;
+  release.transactionNonce = 1;
+  release.prefix = makeElasticAuditPrefix(uint128_t(0x7003), "quarantined-elastic"_ctv);
+  brain.masterAuthorityRuntimeState.pendingElasticAddressReleases.push_back(release);
+  brain.brainConfig.distributableExternalSubnets.clear();
+  DistributableExternalSubnet uuidCollision = release.prefix;
+  uuidCollision.name.assign("uuid-collision"_ctv);
+  DistributableExternalSubnet nameCollision = release.prefix;
+  nameCollision.uuid = uint128_t(0x7004);
+  DistributableExternalSubnet exactCollision = release.prefix;
+  DistributableExternalSubnet unrelated = release.prefix;
+  unrelated.uuid = uint128_t(0x7005);
+  unrelated.name.assign("unrelated-elastic"_ctv);
+  brain.brainConfig.distributableExternalSubnets.push_back(std::move(uuidCollision));
+  brain.brainConfig.distributableExternalSubnets.push_back(std::move(nameCollision));
+  brain.brainConfig.distributableExternalSubnets.push_back(std::move(exactCollision));
+  brain.brainConfig.distributableExternalSubnets.push_back(std::move(unrelated));
+  suite.expect(brain.quarantinePendingElasticAddressReleasePrefixes(
+                   brain.masterAuthorityRuntimeState) &&
+                   brain.brainConfig.distributableExternalSubnets.size() == 1 &&
+                   brain.brainConfig.distributableExternalSubnets[0].uuid == uint128_t(0x7005) &&
+                   brain.brainConfig.distributableExternalSubnets[0].name.equal(
+                       "unrelated-elastic"_ctv),
+               "elastic_release_quarantine_removes_every_uuid_or_name_collision");
+}
+
+static void testElasticReplicationIdentityAndDivergenceGuards(TestSuite& suite)
+{
+  TestBrain brain;
+  brain.masterAuthorityRuntimeState.generation = 5;
+  brain.masterAuthorityRuntimeState.nextPendingElasticAddressOperationID = 1;
+  ProdigyMasterAuthorityRuntimeState divergent = brain.masterAuthorityRuntimeState;
+  divergent.nextPendingElasticAddressOperationID = 2;
+  suite.expect(brain.applyReplicatedMasterAuthorityRuntimeState(divergent, true) == false &&
+                   brain.masterAuthorityRuntimeState.nextPendingElasticAddressOperationID == 1 &&
+                   brain.persistCalls == 0,
+               "elastic_replication_rejects_divergent_same_generation_state");
+
+  ProdigyMasterAuthorityStateTransition divergentConfig;
+  divergentConfig.runtimeState = brain.masterAuthorityRuntimeState;
+  divergentConfig.brainConfig = brain.brainConfig;
+  divergentConfig.brainConfig.clusterUUID = 0x99;
+  suite.expect(brain.applyReplicatedMasterAuthorityTransition(divergentConfig, true) == false &&
+                   brain.brainConfig.clusterUUID == 0,
+               "elastic_replication_rejects_divergent_same_generation_config");
+
+  brain.brainConfig.clusterUUID = uint128_t(0x7103);
+  ProdigyMasterAuthorityStateTransition zeroClusterTransition;
+  zeroClusterTransition.runtimeState = brain.masterAuthorityRuntimeState;
+  zeroClusterTransition.runtimeState.generation += 1;
+  suite.expect(brain.applyReplicatedMasterAuthorityTransition(zeroClusterTransition, true) == false &&
+                   brain.brainConfig.clusterUUID == uint128_t(0x7103) &&
+                   brain.clusterOwnershipCalls == 0 && brain.persistCalls == 0,
+               "master_authority_transition_cannot_clear_claimed_cluster_uuid");
+
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = nullptr;
+  brain.nBrains = 1;
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = 7;
+  brain.durableElasticOperationTransitions.emplace(1, 7);
+  suite.expect(brain.pendingElasticAddressOperationHasMajority(1, 7) == false,
+               "elastic_quorum_rejects_anonymous_local_durable_vote");
+  TestNeuron self;
+  self.uuid = uint128_t(0x7100);
+  thisNeuron = &self;
+  brain.boottimens = 71;
+  brain.nBrains = 5;
+
+  BrainView peerA;
+  BrainView peerB;
+  for (BrainView *peer : {&peerA, &peerB})
+  {
+    peer->connected = true;
+    peer->isFixedFile = true;
+    peer->registrationFresh = true;
+    peer->uuid = uint128_t(0x7101);
+    peer->boottimens = 72;
+    peer->existingMasterUUID = self.uuid;
+  }
+  peerA.fslot = 71;
+  peerB.fslot = 72;
+  brain.brains.insert(&peerA);
+  brain.brains.insert(&peerB);
+  for (BrainView *peer : {&peerA, &peerB})
+  {
+    Brain::MasterAuthorityReplicationPeerState tracking;
+    tracking.uuid = peer->uuid;
+    tracking.bootNs = peer->boottimens;
+    tracking.acknowledgedGeneration = 7;
+    tracking.acknowledgedElasticOperationIDs.insert(1);
+    brain.masterAuthorityReplicationByPeer.emplace(peer, std::move(tracking));
+  }
+  suite.expect(brain.pendingElasticAddressOperationHasMajority(1, 7) == false,
+               "elastic_quorum_counts_duplicate_peer_incarnation_once");
+  peerB.boottimens = 73;
+  brain.masterAuthorityReplicationByPeer[&peerB].bootNs = 73;
+  suite.expect(brain.pendingElasticAddressOperationHasMajority(1, 7) == false,
+               "elastic_quorum_boot_incarnation_refresh_does_not_add_vote");
+  brain.nBrains = 3;
+  brain.masterAuthorityReplicationByPeer[&peerB]
+      .acknowledgedElasticOperationIDs.clear();
+  suite.expect(brain.pendingElasticAddressOperationHasMajority(1, 7) == false,
+               "elastic_quorum_latest_boot_supersedes_old_same_uuid_ack");
+  brain.masterAuthorityReplicationByPeer[&peerB]
+      .acknowledgedElasticOperationIDs.insert(1);
+  brain.nBrains = 5;
+  peerB.uuid = uint128_t(0x7102);
+  brain.masterAuthorityReplicationByPeer[&peerB].uuid = peerB.uuid;
+  suite.expect(brain.pendingElasticAddressOperationHasMajority(1, 7),
+               "elastic_quorum_counts_distinct_stable_brain_uuid");
+
+  ProdigyMasterAuthorityRuntimeState live;
+  live.generation = 8;
+  ProdigyPendingElasticAddressRelease liveRelease;
+  liveRelease.operationID = 1;
+  live.pendingElasticAddressReleases.push_back(std::move(liveRelease));
+  String liveSerializedTransition;
+  serializeMasterAuthorityTransition(liveSerializedTransition,
+                                     live,
+                                     brain.brainConfig);
+  String liveTransitionDigest;
+  suite.require(prodigyComputeSHA256Hex(liveSerializedTransition,
+                                       liveTransitionDigest),
+                "elastic_ack_history_transition_digest_fixture");
+  peerB.boottimens = 74;
+  brain.noteMasterAuthorityTransitionSentToPeer(&peerB,
+                                                live,
+                                                liveTransitionDigest);
+  suite.expect(brain.masterAuthorityReplicationByPeer[&peerB].bootNs == 74 &&
+                   brain.masterAuthorityReplicationByPeer[&peerB]
+                       .acknowledgedElasticOperationIDs.empty() &&
+                   brain.pendingElasticAddressOperationHasMajority(1, 7) == false,
+               "elastic_quorum_boot_refresh_replaces_state_without_adding_vote");
+
+  Brain::MasterAuthorityReplicationPeerState& tracking =
+      brain.masterAuthorityReplicationByPeer[&peerA];
+  tracking.acknowledgedElasticOperationIDs.insert(99);
+  tracking.sentElasticOperationIDsByGeneration[6].insert(99);
+  brain.noteMasterAuthorityTransitionSentToPeer(&peerA,
+                                                live,
+                                                liveTransitionDigest);
+  suite.expect(tracking.acknowledgedElasticOperationIDs.size() == 1 &&
+                   tracking.acknowledgedElasticOperationIDs.contains(1) &&
+                   tracking.sentElasticOperationIDsByGeneration.contains(6) == false,
+               "elastic_ack_history_prunes_non_live_operations");
+  thisNeuron = previousNeuron;
+}
+
+static void configureElasticPrefixTarget(TestBrain& brain,
+                                         Mothership& mothership,
+                                         ElasticPrefixBrainIaaS& iaas,
+                                         Machine& machine,
+                                         int32_t mothershipSlot,
+                                         uint128_t machineUUID,
+                                         const String& cloudID);
+static Message *sendElasticPrefixRegistration(TestBrain& brain,
+                                              Mothership& mothership,
+                                              String& messageBuffer,
+                                              const String& name);
+
+static void testElasticMutationHeadroomAndFenceReconciliation(TestSuite& suite)
+{
+  TestBrain brain;
+  ElasticPrefixBrainIaaS iaas;
+  Mothership mothership;
+  RoutableSubnetRegistration registration;
+  registration.subnet.name.assign("headroom-elastic"_ctv);
+  registration.subnet.kind = RoutablePrefixKind::elastic;
+  registration.subnet.usage = ExternalSubnetUsage::wormholes;
+  registration.subnet.ingressScope = RoutableIngressScope::singleMachine;
+  registration.family = ExternalAddressFamily::ipv4;
+  registration.elasticIntent = ElasticPrefixIntent::create;
+  brain.masterAuthorityRuntimeState.generation = UINT64_MAX - 3;
+  suite.expect(brain.enqueueElasticAddressAssignment(&mothership,
+                                                     iaas,
+                                                     registration,
+                                                     uint128_t(0x7201),
+                                                     "cloud-headroom"_ctv,
+                                                     IPPrefix("10.0.0.72", false, 32)) == false &&
+                   iaas.assignCalls == 0 && iaas.fenceActive == false,
+               "elastic_assignment_generation_saturation_precedes_provider_mutation");
+
+  brain.masterAuthorityRuntimeState.generation = 0;
+  brain.masterAuthorityRuntimeState.nextPendingElasticAddressOperationID = UINT64_MAX;
+  suite.expect(brain.enqueueElasticAddressAssignment(&mothership,
+                                                     iaas,
+                                                     registration,
+                                                     uint128_t(0x7201),
+                                                     "cloud-headroom"_ctv,
+                                                     IPPrefix("10.0.0.72", false, 32)) == false &&
+                   iaas.assignCalls == 0 && iaas.fenceActive == false,
+               "elastic_assignment_operation_id_saturation_releases_provider_fence");
+
+  TestBrain prepareFailureBrain;
+  Mothership prepareFailureMothership;
+  Machine machine;
+  ElasticPrefixBrainIaaS prepareFailureIaaS;
+  prepareFailureIaaS.failPrepare = true;
+  configureElasticPrefixTarget(prepareFailureBrain,
+                               prepareFailureMothership,
+                               prepareFailureIaaS,
+                               machine,
+                               73,
+                               uint128_t(0x7301),
+                               "cloud-prepare-failure"_ctv);
+  String messageBuffer;
+  (void)sendElasticPrefixRegistration(prepareFailureBrain,
+                                      prepareFailureMothership,
+                                      messageBuffer,
+                                      "prepare-failure-elastic"_ctv);
+  suite.expect(prepareFailureIaaS.fenceActive == false &&
+                   prepareFailureBrain.masterAuthorityRuntimeState
+                       .pendingElasticAddressAssignments.empty(),
+               "elastic_prepare_failure_releases_provider_fence");
+  prepareFailureBrain.activeMotherships.erase(&prepareFailureMothership);
+}
+
+static void testElasticPlanBindingAndReleaseNonceSurviveReplication(TestSuite& suite)
+{
+  ProdigyPendingElasticAddressAssignment assignment;
+  assignment.operationID = 1;
+  assignment.transitionGeneration = 1;
+  assignment.transactionNonce = uint128_t(0x7401);
+  assignment.machineUUID = uint128_t(0x7402);
+  assignment.machineCloudID.assign("cloud-binding-original"_ctv);
+  assignment.expectedDeliveryPrefix = IPPrefix("10.0.0.74", false, 32);
+  assignment.registration.subnet.uuid = uint128_t(0x7403);
+  assignment.registration.subnet.name.assign("binding-elastic"_ctv);
+  assignment.registration.subnet.kind = RoutablePrefixKind::elastic;
+  assignment.registration.subnet.usage = ExternalSubnetUsage::wormholes;
+  assignment.registration.subnet.ingressScope = RoutableIngressScope::singleMachine;
+  assignment.registration.subnet.machineUUID = assignment.machineUUID;
+  assignment.registration.subnet.providerPool.assign("pool-binding"_ctv);
+  assignment.registration.family = ExternalAddressFamily::ipv4;
+  assignment.registration.elasticIntent = ElasticPrefixIntent::create;
+  ProviderElasticAddressPlan plan;
+  plan.opaque.assign("opaque-binding-plan"_ctv);
+  assignment.providerPlan.assign(plan.opaque);
+  ProviderElasticAddressRequest request;
+  prodigyElasticAddressRequestFromPendingAssignment(assignment, request);
+  suite.require(prodigyComputeElasticAddressPlanBindingDigest(
+                    plan,
+                    request,
+                    assignment.transactionNonce,
+                    assignment.providerPlanBindingDigest),
+                "elastic_binding_mismatch_fixture_digest");
+  assignment.machineCloudID.assign("cloud-binding-mutated"_ctv);
+
+  ProdigyMasterAuthorityStateTransition mismatched;
+  mismatched.runtimeState.generation = 1;
+  mismatched.runtimeState.nextPendingElasticAddressOperationID = 2;
+  mismatched.runtimeState.pendingElasticAddressAssignments.push_back(std::move(assignment));
+  TestBrain follower;
+  BrainView master;
+  authorizeMasterPeerForTest(follower, master, 74, uint128_t(0x7406), 7406);
+  String serialized;
+  BitseryEngine::serialize(serialized, mismatched);
+  String messageBuffer;
+  Message *message = buildBrainMessage(messageBuffer,
+                                       BrainTopic::replicateMasterAuthorityState,
+                                       serialized);
+  follower.brainHandler(&master, message);
+  suite.expect(follower.persistCalls == 0 &&
+                   follower.masterAuthorityRuntimeState.generation == 0 &&
+                   master.wBuffer.empty(),
+               "elastic_binding_mismatch_rejected_before_persistence_and_ack");
+
+  ProdigyMasterAuthorityRuntimeState releaseState;
+  releaseState.generation = 1;
+  releaseState.nextPendingElasticAddressOperationID = 2;
+  ProdigyPendingElasticAddressRelease release;
+  release.operationID = 1;
+  release.transitionGeneration = 1;
+  release.transactionNonce = uint128_t(0x7404);
+  release.prefix = makeElasticAuditPrefix(uint128_t(0x7405), "nonce-elastic"_ctv);
+  releaseState.pendingElasticAddressReleases.push_back(release);
+
+  TestBrain first;
+  ElasticPrefixBrainIaaS firstProvider;
+  firstProvider.failReleaseCalls = 1;
+  first.iaas = &firstProvider;
+  first.weAreMaster = true;
+  suite.require(first.applyReplicatedMasterAuthorityRuntimeState(releaseState, true),
+                "elastic_release_nonce_first_runtime_restore");
+  suite.expect(firstProvider.releaseNonces.size() == 1 &&
+                   firstProvider.releaseNonces[0] == release.transactionNonce &&
+                   first.masterAuthorityRuntimeState.pendingElasticAddressReleases.size() == 1,
+               "elastic_release_nonce_preserved_on_first_retry_attempt");
+
+  ProdigyMasterAuthorityRuntimeState recovered =
+      first.masterAuthorityRuntimeState;
+  recovered.pendingElasticAddressReleases[0].nextAttemptMs = 0;
+  TestBrain restarted;
+  ElasticPrefixBrainIaaS restartedProvider;
+  restarted.iaas = &restartedProvider;
+  restarted.weAreMaster = true;
+  suite.require(restarted.applyReplicatedMasterAuthorityRuntimeState(recovered, true),
+                "elastic_release_nonce_restart_runtime_restore");
+  suite.expect(restartedProvider.releaseNonces.size() == 1 &&
+                   restartedProvider.releaseNonces[0] == release.transactionNonce,
+               "elastic_release_nonce_preserved_across_restart_retry");
+}
+
 static void testRegisterRoutablePrefixAllocatesElasticPrefix(TestSuite& suite)
 {
   TestBrain brain;
@@ -9700,10 +10604,15 @@ static void testRegisterRoutablePrefixAllocatesElasticPrefix(TestSuite& suite)
   brain.iaas = &iaas;
   brain.weAreMaster = true;
   brain.noMasterYet = false;
+  mothership.isFixedFile = true;
+  mothership.fslot = 31;
+  suite.expect(brain.activateMothershipConnection(&mothership),
+               "mothership_register_elastic_prefix_activates_connection_incarnation");
 
   Machine machine = {};
   machine.uuid = uint128_t(0x3366);
   machine.cloudID.assign("cloud-3366"_ctv);
+  machine.privateAddress.assign("10.0.0.88"_ctv);
   machine.neuron.isFixedFile = true;
   machine.neuron.fslot = 8;
   machine.neuron.connected = true;
@@ -9725,6 +10634,8 @@ static void testRegisterRoutablePrefixAllocatesElasticPrefix(TestSuite& suite)
   String messageBuffer = {};
   Message *message = buildMothershipMessage(messageBuffer, MothershipTopic::registerRoutableSubnet, serializedRequest);
   brain.mothershipHandler(&mothership, message);
+  suite.expect(brain.persistCalls >= 4 && mothership.pendingSend,
+               "mothership_register_elastic_prefix_commits_before_flushing_completion_reply");
 
   Message *responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
   String serializedResponse = {};
@@ -9736,7 +10647,7 @@ static void testRegisterRoutablePrefixAllocatesElasticPrefix(TestSuite& suite)
   suite.expect(response.success, "mothership_register_elastic_prefix_success");
   suite.expect(response.created, "mothership_register_elastic_prefix_created");
   suite.expect(iaas.assignCalls == 1, "mothership_register_elastic_prefix_calls_provider");
-  suite.expect(iaas.lastMachine == &machine, "mothership_register_elastic_prefix_uses_single_machine");
+  suite.expect(iaas.lastCloudID.equal(machine.cloudID), "mothership_register_elastic_prefix_uses_copied_machine_identity");
   suite.expect(iaas.lastFamily == ExternalAddressFamily::ipv4, "mothership_register_elastic_prefix_passes_family");
   suite.expect(iaas.lastIntent == ElasticPrefixIntent::create, "mothership_register_elastic_prefix_passes_intent");
   suite.expect(iaas.lastProviderPool.equal("pool-a"_ctv), "mothership_register_elastic_prefix_passes_pool");
@@ -9788,8 +10699,466 @@ static void testRegisterRoutablePrefixAllocatesElasticPrefix(TestSuite& suite)
   suite.expect(sendUnregister(), "mothership_unregister_elastic_prefix_deserializes_response");
   suite.expect(unregisterResponse.success && unregisterResponse.removed, "mothership_unregister_elastic_prefix_success");
   suite.expect(iaas.releaseCalls == 1, "mothership_unregister_elastic_prefix_releases_provider");
-  suite.expect(iaas.lastReleased.providerAllocationID.equal("alloc-88"_ctv), "mothership_unregister_elastic_prefix_release_allocation");
+  suite.expect(iaas.lastReleased.allocationID.equal("alloc-88"_ctv), "mothership_unregister_elastic_prefix_release_allocation");
   suite.expect(brain.brainConfig.distributableExternalSubnets.empty(), "mothership_unregister_elastic_prefix_removes_prefix");
+  brain.activeMotherships.erase(&mothership);
+}
+
+static void configureElasticPrefixTarget(TestBrain& brain,
+                                         Mothership& mothership,
+                                         ElasticPrefixBrainIaaS& iaas,
+                                         Machine& machine,
+                                         int32_t mothershipSlot,
+                                         uint128_t machineUUID,
+                                         const String& cloudID)
+{
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  mothership.isFixedFile = true;
+  mothership.fslot = mothershipSlot;
+  (void)brain.activateMothershipConnection(&mothership);
+  machine.uuid = machineUUID;
+  machine.cloudID.assign(cloudID);
+  machine.privateAddress.assign("10.0.0.88"_ctv);
+  machine.neuron.isFixedFile = true;
+  machine.neuron.fslot = mothershipSlot + 1;
+  machine.neuron.connected = true;
+  brain.machines.insert(&machine);
+  brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+}
+
+static Message *sendElasticPrefixRegistration(TestBrain& brain,
+                                              Mothership& mothership,
+                                              String& messageBuffer,
+                                              const String& name)
+{
+  RoutableSubnetRegistration request;
+  request.subnet.name.assign(name);
+  request.subnet.kind = RoutablePrefixKind::elastic;
+  request.subnet.usage = ExternalSubnetUsage::wormholes;
+  request.subnet.ingressScope = RoutableIngressScope::singleMachine;
+  request.family = ExternalAddressFamily::ipv4;
+  request.elasticIntent = ElasticPrefixIntent::create;
+  String serializedRequest;
+  BitseryEngine::serialize(serializedRequest, request);
+  Message *message = buildMothershipMessage(messageBuffer,
+                                            MothershipTopic::registerRoutableSubnet,
+                                            serializedRequest);
+  brain.mothershipHandler(&mothership, message);
+  return message;
+}
+
+static bool extractRoutableSubnetRegistrationResponse(String& buffer,
+                                                       RoutableSubnetRegistration& response)
+{
+  if (buffer.empty())
+  {
+    return false;
+  }
+  Message *message = reinterpret_cast<Message *>(buffer.data());
+  String serialized;
+  uint8_t *args = message->args;
+  Message::extractToStringView(args, serialized);
+  return BitseryEngine::deserializeSafe(serialized, response);
+}
+
+static bool extractRoutableSubnetUnregistrationResponse(String& buffer,
+                                                         RoutableSubnetUnregistration& response)
+{
+  if (buffer.empty())
+  {
+    return false;
+  }
+  Message *message = reinterpret_cast<Message *>(buffer.data());
+  String serialized;
+  uint8_t *args = message->args;
+  Message::extractToStringView(args, serialized);
+  return BitseryEngine::deserializeSafe(serialized, response);
+}
+
+static uint32_t countMothershipTopic(String& buffer, MothershipTopic topic)
+{
+  uint32_t count = 0;
+  forEachMessageInBuffer(buffer, [&](Message *message) {
+    count += MothershipTopic(message->topic) == topic;
+  });
+  return count;
+}
+
+static void testElasticPrefixCompletionOwnsAuthorityAndReplyIdentity(TestSuite& suite)
+{
+  {
+    TestBrain brain;
+    Mothership mothership;
+    ElasticPrefixBrainIaaS iaas;
+    Machine machine;
+    iaas.deferAssignments = true;
+    configureElasticPrefixTarget(brain, mothership, iaas, machine, 41, uint128_t(0x4101), "cloud-disconnect"_ctv);
+    String messageBuffer;
+    (void)sendElasticPrefixRegistration(brain, mothership, messageBuffer, "elastic-disconnect"_ctv);
+    suite.expect(iaas.pending != nullptr && brain.pendingElasticAddressControlOperations.size() == 1,
+                 "mothership_register_elastic_prefix_provider_wait_is_brain_owned");
+    suite.expect(mothership.wBuffer.empty(),
+                 "mothership_register_elastic_prefix_defers_same_topic_reply");
+
+    RoutableSubnetUnregistration unregisterRequest;
+    unregisterRequest.name.assign("elastic-disconnect"_ctv);
+    String serializedUnregister;
+    BitseryEngine::serialize(serializedUnregister, unregisterRequest);
+    String unregisterBuffer;
+    Message *unregisterMessage = buildMothershipMessage(unregisterBuffer,
+                                                        MothershipTopic::unregisterRoutableSubnet,
+                                                        serializedUnregister);
+    brain.mothershipHandler(&mothership, unregisterMessage);
+    RoutableSubnetUnregistration unregisterResponse;
+    suite.expect(extractRoutableSubnetUnregistrationResponse(mothership.wBuffer, unregisterResponse) &&
+                     unregisterResponse.failure.equal("routable prefix operation pending"_ctv),
+                 "mothership_unregister_elastic_prefix_rejects_pending_registration");
+    mothership.wBuffer.clear();
+
+    brain.activeMotherships.erase(&mothership);
+    mothership.fslot = -1;
+    mothership.isFixedFile = false;
+    suite.expect(iaas.complete(),
+                 "mothership_register_elastic_prefix_provider_continues_after_disconnect");
+    suite.expect(brain.brainConfig.distributableExternalSubnets.size() == 1 &&
+                     brain.pendingElasticAddressControlOperations.empty() && brain.persistCalls >= 4,
+                 "mothership_register_elastic_prefix_disconnect_still_commits_registry");
+    suite.expect(mothership.wBuffer.empty(),
+                 "mothership_register_elastic_prefix_disconnect_suppresses_stale_reply");
+  }
+
+  {
+    TestBrain brain;
+    Mothership mothership;
+    ElasticPrefixBrainIaaS iaas;
+    Machine machine;
+    iaas.deferAssignments = true;
+    configureElasticPrefixTarget(brain, mothership, iaas, machine, 43, uint128_t(0x4301), "cloud-original"_ctv);
+    String messageBuffer;
+    (void)sendElasticPrefixRegistration(brain, mothership, messageBuffer, "elastic-machine-change"_ctv);
+    machine.cloudID.assign("cloud-replacement"_ctv);
+    suite.expect(iaas.complete(),
+                 "mothership_register_elastic_prefix_machine_change_completes_provider");
+    RoutableSubnetRegistration response;
+    suite.expect(extractRoutableSubnetRegistrationResponse(mothership.wBuffer, response) &&
+                     response.success == false &&
+                     response.failure.equal("target machine identity changed while provider assignment was pending"_ctv),
+                 "mothership_register_elastic_prefix_revalidates_copied_machine_identity");
+    suite.expect(brain.brainConfig.distributableExternalSubnets.empty() && iaas.releaseCalls == 1,
+                 "mothership_register_elastic_prefix_machine_change_compensates_assignment");
+    brain.activeMotherships.erase(&mothership);
+  }
+
+  {
+    TestBrain brain;
+    ElasticPrefixBrainIaaS iaas;
+    Machine machine;
+    alignas(Mothership) uint8_t mothershipStorage[sizeof(Mothership)];
+    Mothership *mothership = new (mothershipStorage) Mothership();
+    iaas.deferAssignments = true;
+    configureElasticPrefixTarget(brain, *mothership, iaas, machine, 44, uint128_t(0x4401), "cloud-incarnation"_ctv);
+    const uint64_t originalIncarnation = mothership->connectionIncarnation;
+    String messageBuffer;
+    (void)sendElasticPrefixRegistration(brain, *mothership, messageBuffer, "elastic-incarnation"_ctv);
+    brain.activeMotherships.erase(mothership);
+    mothership->~Mothership();
+    mothership = new (mothershipStorage) Mothership();
+    mothership->isFixedFile = true;
+    mothership->fslot = 46;
+    suite.expect(brain.activateMothershipConnection(mothership) &&
+                     mothership->connectionIncarnation > originalIncarnation,
+                 "mothership_register_elastic_prefix_reused_pointer_gets_unique_incarnation");
+    suite.expect(iaas.complete(),
+                 "mothership_register_elastic_prefix_reused_pointer_incarnation_completes_provider");
+    suite.expect(brain.brainConfig.distributableExternalSubnets.size() == 1 && brain.persistCalls >= 4,
+                 "mothership_register_elastic_prefix_reused_pointer_incarnation_commits_registry");
+    suite.expect(mothership->wBuffer.empty() && mothership->pendingSend == false,
+                 "mothership_register_elastic_prefix_reused_pointer_incarnation_suppresses_stale_reply");
+    brain.activeMotherships.erase(mothership);
+    mothership->~Mothership();
+  }
+
+  {
+    TestBrain brain;
+    Mothership mothership;
+    ElasticPrefixBrainIaaS iaas;
+    Machine machine;
+    iaas.deferAssignments = true;
+    configureElasticPrefixTarget(brain, mothership, iaas, machine, 45, uint128_t(0x4501), "cloud-authority"_ctv);
+    String messageBuffer;
+    (void)sendElasticPrefixRegistration(brain, mothership, messageBuffer, "elastic-authority"_ctv);
+    brain.activeMotherships.erase(&mothership);
+    machine.neuron.connected = false;
+    machine.neuron.fslot = -1;
+    uint64_t priorEpoch = brain.masterAuthorityEpoch;
+    brain.forfeitMasterStatus();
+    suite.expect(brain.masterAuthorityEpoch == priorEpoch + 1,
+                 "brain_master_forfeit_advances_elastic_operation_authority_epoch");
+    suite.expect(iaas.complete(),
+                 "mothership_register_elastic_prefix_stale_authority_completes_provider");
+    suite.expect(brain.brainConfig.distributableExternalSubnets.empty() && iaas.releaseCalls == 0 &&
+                     brain.masterAuthorityRuntimeState.pendingElasticAddressAssignments.size() == 1 &&
+                     iaas.fenceActive,
+                 "mothership_register_elastic_prefix_stale_authority_retains_durable_saga");
+    suite.expect(mothership.wBuffer.empty(),
+                 "mothership_register_elastic_prefix_stale_authority_suppresses_reply");
+  }
+}
+
+static void testElasticCompensationRetainsOriginalReplyIdentity(TestSuite& suite)
+{
+  {
+    TestBrain brain;
+    Mothership mothership;
+    ElasticPrefixBrainIaaS iaas;
+    Machine machine;
+    iaas.useRequestedDeliveryPrefix = false;
+    iaas.failCompensationCalls = 1;
+    configureElasticPrefixTarget(brain, mothership, iaas, machine, 46,
+                                 uint128_t(0x4601), "cloud-compensation-retry"_ctv);
+    String messageBuffer;
+    (void)sendElasticPrefixRegistration(brain, mothership, messageBuffer,
+                                        "elastic-compensation-retry"_ctv);
+    auto waiting = brain.pendingElasticAddressControlOperations.begin();
+    suite.expect(iaas.releaseCalls == 1 && mothership.wBuffer.empty() &&
+                     brain.pendingElasticAddressControlOperations.size() == 1 &&
+                     waiting->second.mothership == &mothership &&
+                     waiting->second.mothershipIncarnation == mothership.connectionIncarnation,
+                 "elastic_compensation_failure_retains_original_reply_identity");
+
+    brain.masterAuthorityRuntimeState.pendingElasticAddressAssignments[0].nextAttemptMs = 0;
+    brain.reconcilePendingElasticAddressAssignments();
+    RoutableSubnetRegistration response;
+    suite.expect(extractRoutableSubnetRegistrationResponse(mothership.wBuffer, response) &&
+                     response.success == false && response.failure.empty() == false &&
+                     countMothershipTopic(mothership.wBuffer,
+                                          MothershipTopic::registerRoutableSubnet) == 1 &&
+                     iaas.releaseCalls == 2 &&
+                     brain.pendingElasticAddressControlOperations.empty() &&
+                     brain.masterAuthorityRuntimeState.pendingElasticAddressAssignments.empty(),
+                 "elastic_compensation_retry_replies_once_to_original_mothership");
+    brain.reconcilePendingElasticAddressAssignments();
+    suite.expect(countMothershipTopic(mothership.wBuffer,
+                                      MothershipTopic::registerRoutableSubnet) == 1,
+                 "elastic_compensation_retry_does_not_duplicate_terminal_reply");
+    brain.activeMotherships.erase(&mothership);
+  }
+
+  {
+    TestBrain brain;
+    Mothership mothership;
+    ElasticPrefixBrainIaaS iaas;
+    Machine machine;
+    iaas.useRequestedDeliveryPrefix = false;
+    iaas.deferCompensations = true;
+    configureElasticPrefixTarget(brain, mothership, iaas, machine, 48,
+                                 uint128_t(0x4801), "cloud-compensation-persist"_ctv);
+    String messageBuffer;
+    (void)sendElasticPrefixRegistration(brain, mothership, messageBuffer,
+                                        "elastic-compensation-persist"_ctv);
+    suite.require(iaas.pending != nullptr,
+                  "elastic_compensation_final_persist_fixture_defers_provider_completion");
+    brain.persistSucceeds = false;
+    suite.expect(iaas.complete() && mothership.wBuffer.empty() &&
+                     brain.pendingElasticAddressControlOperations.size() == 1 &&
+                     brain.masterAuthorityRuntimeState.pendingElasticAddressAssignments.size() == 1,
+                 "elastic_compensation_final_persist_failure_retains_pending_reply");
+    auto waiting = brain.pendingElasticAddressControlOperations.begin();
+    suite.expect(waiting != brain.pendingElasticAddressControlOperations.end() &&
+                     waiting->second.mothership == &mothership &&
+                     waiting->second.mothershipIncarnation == mothership.connectionIncarnation,
+                 "elastic_compensation_final_persist_failure_retains_original_identity");
+
+    brain.persistSucceeds = true;
+    brain.masterAuthorityRuntimeState.pendingElasticAddressAssignments[0].nextAttemptMs = 0;
+    brain.reconcilePendingElasticAddressAssignments();
+    suite.require(iaas.pending != nullptr,
+                  "elastic_compensation_final_persist_retry_replays_provider_compensation");
+    suite.expect(iaas.complete(),
+                 "elastic_compensation_final_persist_retry_completes_provider");
+    RoutableSubnetRegistration response;
+    suite.expect(extractRoutableSubnetRegistrationResponse(mothership.wBuffer, response) &&
+                     response.success == false && response.failure.empty() == false &&
+                     countMothershipTopic(mothership.wBuffer,
+                                          MothershipTopic::registerRoutableSubnet) == 1 &&
+                     brain.pendingElasticAddressControlOperations.empty() &&
+                     brain.masterAuthorityRuntimeState.pendingElasticAddressAssignments.empty(),
+                 "elastic_compensation_final_persist_retry_replies_once_to_original_mothership");
+    brain.reconcilePendingElasticAddressAssignments();
+    suite.expect(countMothershipTopic(mothership.wBuffer,
+                                      MothershipTopic::registerRoutableSubnet) == 1,
+                 "elastic_compensation_final_persist_retry_does_not_duplicate_reply");
+    brain.activeMotherships.erase(&mothership);
+  }
+}
+
+static void testElasticTerminalPersistenceRetainsOriginalReplyIdentity(TestSuite& suite)
+{
+  {
+    TestBrain brain;
+    Mothership mothership;
+    ElasticPrefixBrainIaaS iaas;
+    Machine machine;
+    iaas.deferAssignments = true;
+    configureElasticPrefixTarget(brain, mothership, iaas, machine, 49,
+                                 uint128_t(0x4901), "cloud-apply-persist"_ctv);
+    String messageBuffer;
+    (void)sendElasticPrefixRegistration(brain, mothership, messageBuffer,
+                                        "elastic-apply-persist"_ctv);
+    suite.require(iaas.pending != nullptr,
+                  "elastic_apply_final_persist_fixture_defers_provider_completion");
+    brain.persistSucceeds = false;
+    suite.expect(iaas.complete() && mothership.wBuffer.empty() &&
+                     brain.brainConfig.distributableExternalSubnets.empty() &&
+                     brain.pendingElasticAddressControlOperations.size() == 1 &&
+                     brain.masterAuthorityRuntimeState.pendingElasticAddressAssignments.size() == 1,
+                 "elastic_apply_final_persist_failure_retains_pending_reply");
+    auto waiting = brain.pendingElasticAddressControlOperations.begin();
+    suite.expect(waiting != brain.pendingElasticAddressControlOperations.end() &&
+                     waiting->second.mothership == &mothership &&
+                     waiting->second.mothershipIncarnation == mothership.connectionIncarnation,
+                 "elastic_apply_final_persist_failure_retains_original_identity");
+
+    brain.persistSucceeds = true;
+    brain.masterAuthorityRuntimeState.pendingElasticAddressAssignments[0].nextAttemptMs = 0;
+    brain.reconcilePendingElasticAddressAssignments();
+    suite.require(iaas.pending != nullptr,
+                  "elastic_apply_final_persist_retry_replays_provider_apply");
+    suite.expect(iaas.complete(),
+                 "elastic_apply_final_persist_retry_completes_provider");
+    RoutableSubnetRegistration response;
+    suite.expect(extractRoutableSubnetRegistrationResponse(mothership.wBuffer, response) &&
+                     response.success && response.created &&
+                     countMothershipTopic(mothership.wBuffer,
+                                          MothershipTopic::registerRoutableSubnet) == 1 &&
+                     brain.pendingElasticAddressControlOperations.empty() &&
+                     brain.masterAuthorityRuntimeState.pendingElasticAddressAssignments.empty(),
+                 "elastic_apply_final_persist_retry_replies_once_to_original_mothership");
+    brain.reconcilePendingElasticAddressAssignments();
+    suite.expect(countMothershipTopic(mothership.wBuffer,
+                                      MothershipTopic::registerRoutableSubnet) == 1,
+                 "elastic_apply_final_persist_retry_does_not_duplicate_reply");
+    brain.activeMotherships.erase(&mothership);
+  }
+
+  {
+    TestBrain brain;
+    Mothership mothership;
+    ElasticPrefixBrainIaaS iaas;
+    Machine machine;
+    iaas.deferReleases = true;
+    configureElasticPrefixTarget(brain, mothership, iaas, machine, 50,
+                                 uint128_t(0x5001), "cloud-release-persist"_ctv);
+    DistributableExternalSubnet prefix =
+        makeElasticAuditPrefix(uint128_t(0x5002), "elastic-release-persist"_ctv);
+    prefix.machineUUID = machine.uuid;
+    brain.brainConfig.distributableExternalSubnets.push_back(prefix);
+    RoutableSubnetUnregistration request;
+    request.name.assign(prefix.name);
+    String serializedRequest;
+    BitseryEngine::serialize(serializedRequest, request);
+    String messageBuffer;
+    Message *message = buildMothershipMessage(messageBuffer,
+                                              MothershipTopic::unregisterRoutableSubnet,
+                                              serializedRequest);
+    brain.mothershipHandler(&mothership, message);
+    suite.require(iaas.pending != nullptr,
+                  "elastic_release_final_persist_fixture_defers_provider_completion");
+    brain.persistSucceeds = false;
+    suite.expect(iaas.complete() && mothership.wBuffer.empty() &&
+                     brain.brainConfig.distributableExternalSubnets.empty() &&
+                     brain.pendingElasticAddressControlOperations.size() == 1 &&
+                     brain.masterAuthorityRuntimeState.pendingElasticAddressReleases.size() == 1,
+                 "elastic_release_final_persist_failure_retains_pending_reply");
+    auto waiting = brain.pendingElasticAddressControlOperations.begin();
+    suite.expect(waiting != brain.pendingElasticAddressControlOperations.end() &&
+                     waiting->second.mothership == &mothership &&
+                     waiting->second.mothershipIncarnation == mothership.connectionIncarnation,
+                 "elastic_release_final_persist_failure_retains_original_identity");
+
+    brain.persistSucceeds = true;
+    brain.masterAuthorityRuntimeState.pendingElasticAddressReleases[0].nextAttemptMs = 0;
+    brain.reconcilePendingElasticAddressReleases();
+    suite.require(iaas.pending != nullptr,
+                  "elastic_release_final_persist_retry_replays_provider_release");
+    suite.expect(iaas.complete(),
+                 "elastic_release_final_persist_retry_completes_provider");
+    RoutableSubnetUnregistration response;
+    suite.expect(extractRoutableSubnetUnregistrationResponse(mothership.wBuffer, response) &&
+                     response.success && response.removed &&
+                     countMothershipTopic(mothership.wBuffer,
+                                          MothershipTopic::unregisterRoutableSubnet) == 1 &&
+                     brain.pendingElasticAddressControlOperations.empty() &&
+                     brain.masterAuthorityRuntimeState.pendingElasticAddressReleases.empty(),
+                 "elastic_release_final_persist_retry_replies_once_to_original_mothership");
+    brain.reconcilePendingElasticAddressReleases();
+    suite.expect(countMothershipTopic(mothership.wBuffer,
+                                      MothershipTopic::unregisterRoutableSubnet) == 1,
+                 "elastic_release_final_persist_retry_does_not_duplicate_reply");
+    brain.activeMotherships.erase(&mothership);
+  }
+}
+
+static void testElasticPrefixReleaseQuarantinesReintroduction(TestSuite& suite)
+{
+  TestBrain brain;
+  Mothership mothership;
+  ElasticPrefixBrainIaaS iaas;
+  Machine machine;
+  iaas.deferReleases = true;
+  configureElasticPrefixTarget(brain, mothership, iaas, machine, 47, uint128_t(0x4701), "cloud-release"_ctv);
+
+  DistributableExternalSubnet prefix;
+  prefix.uuid = uint128_t(0x4702);
+  prefix.name.assign("elastic-release-snapshot"_ctv);
+  prefix.kind = RoutablePrefixKind::elastic;
+  prefix.subnet = IPPrefix("198.51.100.47", false, 32);
+  prefix.deliverySubnet = IPPrefix("10.0.0.47", false, 32);
+  prefix.usage = ExternalSubnetUsage::wormholes;
+  prefix.ingressScope = RoutableIngressScope::singleMachine;
+  prefix.machineUUID = machine.uuid;
+  prefix.providerAllocationID.assign("allocation-original"_ctv);
+  prefix.providerAssociationID.assign("association-original"_ctv);
+  prefix.releaseOnRemove = true;
+  brain.brainConfig.distributableExternalSubnets.push_back(prefix);
+
+  RoutableSubnetUnregistration request;
+  request.name.assign(prefix.name);
+  String serializedRequest;
+  BitseryEngine::serialize(serializedRequest, request);
+  String messageBuffer;
+  Message *message = buildMothershipMessage(messageBuffer,
+                                            MothershipTopic::unregisterRoutableSubnet,
+                                            serializedRequest);
+  brain.mothershipHandler(&mothership, message);
+  suite.expect(iaas.pending != nullptr && mothership.wBuffer.empty() &&
+                   brain.brainConfig.distributableExternalSubnets.empty(),
+               "mothership_unregister_elastic_prefix_quarantines_during_provider_cleanup");
+
+  String registrationBuffer;
+  (void)sendElasticPrefixRegistration(brain,
+                                      mothership,
+                                      registrationBuffer,
+                                      "elastic-release-snapshot"_ctv);
+  RoutableSubnetRegistration registrationResponse;
+  suite.expect(extractRoutableSubnetRegistrationResponse(mothership.wBuffer, registrationResponse) &&
+                   registrationResponse.failure.equal("routable prefix operation pending"_ctv),
+               "mothership_register_elastic_prefix_rejects_pending_release");
+  mothership.wBuffer.clear();
+  DistributableExternalSubnet reintroduced = prefix;
+  reintroduced.providerAllocationID.assign("allocation-replaced"_ctv);
+  brain.brainConfig.distributableExternalSubnets.push_back(std::move(reintroduced));
+  suite.expect(iaas.complete(),
+               "mothership_unregister_elastic_prefix_reintroduced_snapshot_completes_provider");
+  RoutableSubnetUnregistration response;
+  suite.expect(extractRoutableSubnetUnregistrationResponse(mothership.wBuffer, response) &&
+                   response.success && response.removed,
+               "mothership_unregister_elastic_prefix_completes_after_requarantine");
+  suite.expect(brain.brainConfig.distributableExternalSubnets.empty(),
+               "mothership_unregister_elastic_prefix_requarantines_reintroduced_identity");
+  brain.activeMotherships.erase(&mothership);
 }
 
 static void testPullRoutableResourceLeasesTopic(TestSuite& suite)
@@ -10676,6 +12045,8 @@ static void testApplicationReservationInitializersAndAllocators(TestSuite& suite
   brain.initializeApplicationIDReservationState();
 
   uint16_t reservedApplicationID = 0;
+  suite.expect(brain.resolveReservedApplicationID("DNS"_ctv, reservedApplicationID), "reservation_initializer_restores_dns_application");
+  suite.expect(reservedApplicationID == MeshRegistry::DNS::applicationID, "reservation_initializer_restores_dns_application_id");
   suite.expect(brain.resolveReservedApplicationID("Hot"_ctv, reservedApplicationID), "reservation_initializer_restores_hot_application");
   suite.expect(reservedApplicationID == MeshRegistry::Hot::applicationID, "reservation_initializer_restores_hot_application_id");
   suite.expect(brain.resolveReservedApplicationID("EphemeralApp"_ctv, reservedApplicationID) == false, "reservation_initializer_clears_ephemeral_application");
@@ -10686,6 +12057,14 @@ static void testApplicationReservationInitializersAndAllocators(TestSuite& suite
   suite.expect(brain.reserveApplicationIDMapping("FreshStatefulApp"_ctv, 61'000, &reserveFailure), "reservation_initializer_seed_fresh_stateful_application");
 
   brain.initializeApplicationServiceReservationState();
+
+  ApplicationServiceIdentity restoredDNSResolver = {};
+  suite.expect(
+      brain.resolveReservedApplicationService(MeshRegistry::DNS::applicationID, "resolver"_ctv, restoredDNSResolver),
+      "reservation_initializer_restores_dns_resolver_service");
+  suite.expect(restoredDNSResolver.serviceSlot == 1, "reservation_initializer_restores_dns_resolver_slot");
+  suite.expect(restoredDNSResolver.kind == ApplicationServiceIdentity::Kind::stateless, "reservation_initializer_restores_dns_resolver_kind");
+  suite.expect(brain.takeNextReservableServiceSlot(MeshRegistry::DNS::applicationID) == 2, "reservation_initializer_next_dns_slot_starts_after_resolver");
 
   ApplicationServiceIdentity restoredHotClients = {};
   suite.expect(
@@ -16755,8 +18134,6 @@ static void testBrainNeuronHandlerHandlesRestartingContainerFailure(TestSuite& s
   NoopBrainIaaS iaas = {};
   brain.iaas = &iaas;
   brain.weAreMaster = true;
-  brain.brainConfig.reporter.from.assign("alerts@example.com"_ctv);
-  brain.brainConfig.reporter.to.assign("ops@example.com"_ctv);
 
   BrainBase *previousBrain = thisBrain;
   thisBrain = &brain;
@@ -17208,8 +18585,6 @@ static void testBrainNeuronHandlerHandlesNonRestartingContainerFailureAndDrainsM
   TrackingBrainIaaS iaas = {};
   brain.iaas = &iaas;
   brain.weAreMaster = true;
-  brain.brainConfig.reporter.from.assign("alerts@example.com"_ctv);
-  brain.brainConfig.reporter.to.assign("ops@example.com"_ctv);
 
   BrainBase *previousBrain = thisBrain;
   thisBrain = &brain;
@@ -17219,6 +18594,7 @@ static void testBrainNeuronHandlerHandlesNonRestartingContainerFailureAndDrainsM
 
   Machine machine = {};
   machine.uuid = uint128_t(0x5207);
+  machine.cloudID.assign("cloud-5207"_ctv);
   machine.state = MachineState::decommissioning;
   machine.rack = &rack;
   machine.neuron.machine = &machine;
@@ -17259,7 +18635,7 @@ static void testBrainNeuronHandlerHandlesNonRestartingContainerFailureAndDrainsM
   suite.expect(deployment.failureReports.size() == 1, "brain_neuron_container_failed_nonrestart_records_failure_report");
   suite.expect(machine.containersByDeploymentID.size() == 0, "brain_neuron_container_failed_nonrestart_clears_machine_bins");
   suite.expect(iaas.destroyCalls == 1, "brain_neuron_container_failed_nonrestart_drains_machine");
-  suite.expect(iaas.lastDestroyedUUID == machine.uuid, "brain_neuron_container_failed_nonrestart_reports_destroy_uuid");
+  suite.expect(iaas.lastDestroyedCloudID == machine.cloudID, "brain_neuron_container_failed_nonrestart_reports_destroy_cloud_id");
 
   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
   brain.deployments.erase(deployment.plan.config.deploymentID());
@@ -17283,6 +18659,7 @@ static void testBrainNeuronHandlerProcessesKillContainerAckAndDrainsMachine(Test
 
   Machine machine = {};
   machine.uuid = uint128_t(0x5209);
+  machine.cloudID.assign("cloud-5209"_ctv);
   machine.state = MachineState::decommissioning;
   machine.rack = &rack;
   machine.neuron.machine = &machine;
@@ -17306,7 +18683,7 @@ static void testBrainNeuronHandlerProcessesKillContainerAckAndDrainsMachine(Test
 
   suite.expect(brain.containers.contains(uint128_t(0x5210)) == false, "brain_neuron_kill_container_ack_removes_container_index");
   suite.expect(iaas.destroyCalls == 1, "brain_neuron_kill_container_ack_drains_decommissioning_machine");
-  suite.expect(iaas.lastDestroyedUUID == machine.uuid, "brain_neuron_kill_container_ack_reports_destroy_uuid");
+  suite.expect(iaas.lastDestroyedCloudID == machine.cloudID, "brain_neuron_kill_container_ack_reports_destroy_cloud_id");
 
   brain.deployments.erase(deployment.plan.config.deploymentID());
   brain.machinesByUUID.erase(machine.uuid);
@@ -17542,6 +18919,7 @@ static void testBrainNeuronHandlerReportsHardwareFailureAndDecommissionsMachine(
 
   Machine *machine = new Machine();
   machine->uuid = machineUUID;
+  machine->cloudID.assign("cloud-5212"_ctv);
   machine->state = MachineState::healthy;
   machine->rack = rack;
   machine->neuron.machine = machine;
@@ -17563,7 +18941,7 @@ static void testBrainNeuronHandlerReportsHardwareFailureAndDecommissionsMachine(
   suite.expect(iaas.lastHardwareFailureReport == "nvme unreachable"_ctv, "brain_neuron_hardware_failure_preserves_report_text");
   suite.expect(iaas.lastHardwareFailureReport.isInvariant() == false, "brain_neuron_hardware_failure_owns_report_text");
   suite.expect(iaas.destroyCalls == 1, "brain_neuron_hardware_failure_decommissions_machine");
-  suite.expect(iaas.lastDestroyedUUID == machineUUID, "brain_neuron_hardware_failure_preserves_destroy_uuid");
+  suite.expect(iaas.lastDestroyedCloudID == "cloud-5212"_ctv, "brain_neuron_hardware_failure_preserves_destroy_cloud_id");
   suite.expect(brain.findMachineByUUIDForTest(machineUUID) == nullptr, "brain_neuron_hardware_failure_removes_machine_from_cluster");
   suite.expect(brain.racks.contains(rackUUID) == false, "brain_neuron_hardware_failure_removes_empty_rack");
 }
@@ -17602,6 +18980,7 @@ static void testBrainSoftEscalationTimeoutPromotesMachineToHardReboot(TestSuite&
 
   Machine machine = {};
   machine.uuid = uint128_t(0x5214);
+  machine.cloudID.assign("cloud-5214"_ctv);
   machine.state = MachineState::missing;
 
   brain.machines.insert(&machine);
@@ -17620,7 +18999,7 @@ static void testBrainSoftEscalationTimeoutPromotesMachineToHardReboot(TestSuite&
   suite.expect(machine.state == MachineState::hardRebooting, "cluster_health_soft_escalation_promotes_hard_reboot");
   suite.expect(machine.hardRebootAttempts == 1, "cluster_health_soft_escalation_increments_hard_reboot_attempts");
   suite.expect(iaas.hardRebootCalls == 1, "cluster_health_soft_escalation_calls_iaas_reboot");
-  suite.expect(iaas.lastHardRebootUUID == machine.uuid, "cluster_health_soft_escalation_preserves_reboot_uuid");
+  suite.expect(iaas.lastHardRebootCloudID == machine.cloudID, "cluster_health_soft_escalation_preserves_reboot_cloud_id");
   suite.expect(machine.hardRebootWatchdog != nullptr, "cluster_health_soft_escalation_arms_hard_reboot_watchdog");
 
   brain.machinesByUUID.erase(machine.uuid);
@@ -17645,6 +19024,7 @@ static void testBrainHardRebootTimeoutMarksHardwareFailureAndDecommissionsMachin
 
   Machine *machine = new Machine();
   machine->uuid = machineUUID;
+  machine->cloudID.assign("cloud-5215"_ctv);
   machine->state = MachineState::hardRebooting;
   machine->rack = rack;
   machine->neuron.machine = machine;
@@ -17666,7 +19046,7 @@ static void testBrainHardRebootTimeoutMarksHardwareFailureAndDecommissionsMachin
   suite.expect(iaas.reportHardwareFailureCalls == 1, "cluster_health_hard_reboot_timeout_reports_hardware_failure");
   suite.expect(iaas.lastReportedHardwareFailureUUID == machineUUID, "cluster_health_hard_reboot_timeout_preserves_failure_uuid");
   suite.expect(iaas.destroyCalls == 1, "cluster_health_hard_reboot_timeout_decommissions_machine");
-  suite.expect(iaas.lastDestroyedUUID == machineUUID, "cluster_health_hard_reboot_timeout_preserves_destroy_uuid");
+  suite.expect(iaas.lastDestroyedCloudID == "cloud-5215"_ctv, "cluster_health_hard_reboot_timeout_preserves_destroy_cloud_id");
   suite.expect(brain.findMachineByUUIDForTest(machineUUID) == nullptr, "cluster_health_hard_reboot_timeout_removes_machine");
   suite.expect(brain.racks.contains(rackUUID) == false, "cluster_health_hard_reboot_timeout_removes_empty_rack");
 }
@@ -17805,7 +19185,6 @@ static void testBrainIgnitionRequiresNeuronControlBeforeHealthy(TestSuite& suite
   {
     Ring::shutdownForExec();
   }
-
   thisBrain = savedBrain;
 }
 
@@ -18343,6 +19722,11 @@ static void testGetMachinesPreservesTopologyIPv6ControlAddressOverSparseSnapshot
 int main(void)
 {
   TestSuite suite;
+  if (std::getenv("PRODIGY_TEST_AUTONOMOUS_PROVISIONING_JOURNAL") != nullptr)
+  {
+    testAutonomousProvisioningJournalReplaysAmbiguousLaunchAfterRestart(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
   bool createdRing = false;
   if (Ring::getRingFD() <= 0)
   {
@@ -18373,7 +19757,7 @@ int main(void)
   testMothershipConfigureOwnsMachineConfigsForManagedSchemas(suite);
   testMothershipConfigureRejectsClusterTakeover(suite);
   testMothershipConfigureLowersSharedCPUOvercommitWithoutMovingClaims(suite);
-  testReplicateBrainConfigRejectsClusterTakeover(suite);
+  testReplicateMasterAuthorityRejectsClusterTakeover(suite);
   testSpinApplicationInvalidPlanUsesSingleTopicFrame(suite);
   testSpinApplicationProgressAppendsAfterOkayFrame(suite);
   testSpinApplicationProgressAcceptsDirectFdMothership(suite);
@@ -18383,6 +19767,7 @@ int main(void)
   testLargePayloadPeerKeepaliveUsesFixedFileSocketCommand(suite);
   testAcceptedBrainPeerSetsLargePayloadUserTimeout(suite);
   testStatefulRequestMachinesClaimsDeployingMachinesWithSpecializedTicket(suite);
+  testAutonomousProvisioningJournalReplaysAmbiguousLaunchAfterRestart(suite);
   testSpinApplicationFailedFrameCarriesReason(suite);
   testMachineSchemaMutationsQueueRuntimeStateReplication(suite);
   testManagedMachineSchemaRequestCarriesClusterUUID(suite);
@@ -18430,8 +19815,25 @@ int main(void)
   testImportedTlsFactoryValidationRejectsBrokenPem(suite);
   testImportedTlsFactoryEnablesBundleBuild(suite);
   testCertificateLifecycleSchedulers(suite);
-  testRegisterRoutablePrefixAcceptsSingleMachineHostPrefix(suite);
-  testRegisterRoutablePrefixAllocatesElasticPrefix(suite);
+  {
+    TestNeuron elasticTestSelf;
+    elasticTestSelf.uuid = uint128_t(0x3360);
+    NeuronBase *previousNeuron = thisNeuron;
+    thisNeuron = &elasticTestSelf;
+    testRegisterRoutablePrefixAcceptsSingleMachineHostPrefix(suite);
+    testElasticSnapshotPersistenceRetriesSameGeneration(suite);
+    testCombinedMasterAuthorityAuthorizationAndAckBinding(suite);
+    testElasticCombinedTransitionAndQuarantine(suite);
+    testElasticReplicationIdentityAndDivergenceGuards(suite);
+    testElasticMutationHeadroomAndFenceReconciliation(suite);
+    testElasticPlanBindingAndReleaseNonceSurviveReplication(suite);
+    testRegisterRoutablePrefixAllocatesElasticPrefix(suite);
+    testElasticPrefixCompletionOwnsAuthorityAndReplyIdentity(suite);
+    testElasticCompensationRetainsOriginalReplyIdentity(suite);
+    testElasticTerminalPersistenceRetainsOriginalReplyIdentity(suite);
+    testElasticPrefixReleaseQuarantinesReintroduction(suite);
+    thisNeuron = previousNeuron;
+  }
   testPullRoutableResourceLeasesTopic(suite);
   testDNSBindingTopicsReserveAddressAndApplyProvider(suite);
   testACMEDNS01ChallengeTopicsUsePublicTlsState(suite);

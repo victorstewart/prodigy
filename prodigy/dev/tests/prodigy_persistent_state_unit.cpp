@@ -49,9 +49,10 @@ public:
     (void)message;
   }
 
-  void persistLocalRuntimeState(void) override
+  bool persistLocalRuntimeState(void) override
   {
     persistCalls += 1;
+    return true;
   }
 };
 
@@ -119,6 +120,12 @@ static bool readRawTidesDBRecord(const String& dbPath, const String& columnFamil
 {
   TidesDB db(dbPath);
   return db.read(columnFamily, key, value, failure);
+}
+
+static bool writeRawTidesDBRecord(const String& dbPath, const String& columnFamily, const String& key, const String& value, String *failure = nullptr)
+{
+  TidesDB db(dbPath);
+  return db.write(columnFamily, key, value, failure);
 }
 
 static bool cleanupPersistentStateRoots(const String& dbPath)
@@ -840,10 +847,6 @@ int main(void)
   storedSnapshot.brainConfig.maxOSDrains = 2;
   storedSnapshot.brainConfig.machineUpdateCadenceMins = 3;
   storedSnapshot.brainConfig.runtimeEnvironment = storedBootState.runtimeEnvironment;
-  storedSnapshot.brainConfig.reporter.to = "ops@prodigy.local"_ctv;
-  storedSnapshot.brainConfig.reporter.from = "prodigy@prodigy.local"_ctv;
-  storedSnapshot.brainConfig.reporter.smtp = "smtp://mail.prodigy.local:587"_ctv;
-  storedSnapshot.brainConfig.reporter.password = "smtp-app-password"_ctv;
   suite.expect(
       prodigyReadSSHKeyPackageFromPrivateKeyPath(
           prodigyTestBootstrapSeedSSHPrivateKeyPath(),
@@ -1221,6 +1224,122 @@ int main(void)
   prodigyStripMachineHardwareCapturesFromClusterTopology(expectedCaptureStrippedSnapshot.topology);
 
   {
+    String commitDbPath = dbPath;
+    commitDbPath.append(".brain-commit-success"_ctv);
+    suite.expect(cleanupPersistentStateRoots(commitDbPath), "brain_commit_success_cleanup_before");
+
+    ProdigyPersistentStateStore store(commitDbPath);
+    ProdigyPersistentBrainSnapshot cachedSnapshot = {};
+    ProdigyPersistentBootState cachedBootState = {};
+    bool haveCachedSnapshot = false;
+    String failure = {};
+    const ProdigyBrainSnapshotCommitResult result = prodigyCommitBrainSnapshot(
+        store,
+        storedSnapshot,
+        storedBootState,
+        cachedSnapshot,
+        cachedBootState,
+        haveCachedSnapshot,
+        failure);
+
+    suite.expect(result == ProdigyBrainSnapshotCommitResult::snapshotAndBootStateCommitted, "brain_commit_success_result");
+    suite.expect(haveCachedSnapshot, "brain_commit_success_marks_cache_current");
+    suite.expect(equalBrainSnapshots(storedSnapshot, cachedSnapshot), "brain_commit_success_updates_snapshot_cache");
+    suite.expect(equalBootStates(storedBootState, cachedBootState), "brain_commit_success_updates_boot_cache");
+    suite.expect(failure.size() == 0, "brain_commit_success_clears_failure");
+
+    ProdigyPersistentBrainSnapshot loadedSnapshot = {};
+    ProdigyPersistentBootState loadedBootState = {};
+    suite.expect(store.loadBrainSnapshot(loadedSnapshot, &failure), "brain_commit_success_loads_snapshot");
+    suite.expect(equalBrainSnapshots(expectedManagedSnapshot, loadedSnapshot), "brain_commit_success_snapshot_roundtrip");
+    suite.expect(store.loadBootState(loadedBootState, &failure), "brain_commit_success_loads_boot_state");
+    suite.expect(equalBootStates(expectedManagedBootState, loadedBootState), "brain_commit_success_boot_state_roundtrip");
+    store.close();
+    suite.expect(cleanupPersistentStateRoots(commitDbPath), "brain_commit_success_cleanup_after");
+  }
+
+  {
+    String blockedParentPath = dbPath;
+    blockedParentPath.append(".brain-commit-snapshot-failure"_ctv);
+    suite.expect(cleanupPersistentStateRoots(blockedParentPath), "brain_commit_snapshot_failure_cleanup_before");
+    FILE *blocker = std::fopen(blockedParentPath.c_str(), "wb");
+    suite.expect(blocker != nullptr, "brain_commit_snapshot_failure_blocker_created");
+    if (blocker)
+    {
+      std::fclose(blocker);
+    }
+
+    String blockedDbPath = blockedParentPath;
+    blockedDbPath.append("/db"_ctv);
+    ProdigyPersistentStateStore store(blockedDbPath);
+    ProdigyPersistentBrainSnapshot cachedSnapshot = storedSnapshot;
+    cachedSnapshot.topology.version += 100;
+    const ProdigyPersistentBrainSnapshot expectedCachedSnapshot = cachedSnapshot;
+    ProdigyPersistentBootState cachedBootState = storedBootState;
+    cachedBootState.initialTopology.version += 100;
+    const ProdigyPersistentBootState expectedCachedBootState = cachedBootState;
+    bool haveCachedSnapshot = true;
+    String failure = {};
+    const ProdigyBrainSnapshotCommitResult result = prodigyCommitBrainSnapshot(
+        store,
+        storedSnapshot,
+        storedBootState,
+        cachedSnapshot,
+        cachedBootState,
+        haveCachedSnapshot,
+        failure);
+
+    suite.expect(result == ProdigyBrainSnapshotCommitResult::snapshotFailed, "brain_commit_snapshot_failure_result");
+    suite.expect(haveCachedSnapshot, "brain_commit_snapshot_failure_preserves_cache_presence");
+    suite.expect(equalBrainSnapshots(expectedCachedSnapshot, cachedSnapshot), "brain_commit_snapshot_failure_preserves_snapshot_cache");
+    suite.expect(equalBootStates(expectedCachedBootState, cachedBootState), "brain_commit_snapshot_failure_preserves_boot_cache");
+    suite.expect(failure.size() > 0, "brain_commit_snapshot_failure_reports_reason");
+    store.close();
+    suite.expect(cleanupPersistentStateRoots(blockedParentPath), "brain_commit_snapshot_failure_cleanup_after");
+  }
+
+  {
+    String commitDbPath = dbPath;
+    commitDbPath.append(".brain-commit-boot-failure"_ctv);
+    suite.expect(cleanupPersistentStateRoots(commitDbPath), "brain_commit_boot_failure_cleanup_before");
+    String failure = {};
+    suite.expect(
+        writeRawTidesDBRecord(commitDbPath, "boot"_ctv, "local"_ctv, "x"_ctv, &failure),
+        "brain_commit_boot_failure_corrupts_derivative_record");
+
+    ProdigyPersistentStateStore store(commitDbPath);
+    ProdigyPersistentBrainSnapshot committedSnapshot = storedSnapshot;
+    committedSnapshot.topology.version += 200;
+    ProdigyPersistentBrainSnapshot expectedStoredSnapshot = committedSnapshot;
+    prodigyStripManagedCloudBootstrapCredentials(expectedStoredSnapshot.brainConfig.runtimeEnvironment);
+    ProdigyPersistentBrainSnapshot cachedSnapshot = storedSnapshot;
+    ProdigyPersistentBootState cachedBootState = storedBootState;
+    cachedBootState.initialTopology.version += 200;
+    const ProdigyPersistentBootState expectedCachedBootState = cachedBootState;
+    bool haveCachedSnapshot = false;
+    const ProdigyBrainSnapshotCommitResult result = prodigyCommitBrainSnapshot(
+        store,
+        committedSnapshot,
+        storedBootState,
+        cachedSnapshot,
+        cachedBootState,
+        haveCachedSnapshot,
+        failure);
+
+    suite.expect(result == ProdigyBrainSnapshotCommitResult::snapshotCommittedBootStateFailed, "brain_commit_boot_failure_result");
+    suite.expect(haveCachedSnapshot, "brain_commit_boot_failure_marks_snapshot_cache_current");
+    suite.expect(equalBrainSnapshots(committedSnapshot, cachedSnapshot), "brain_commit_boot_failure_updates_snapshot_cache");
+    suite.expect(equalBootStates(expectedCachedBootState, cachedBootState), "brain_commit_boot_failure_preserves_boot_cache");
+    suite.expect(failure.equals("invalid persistent boot state"_ctv), "brain_commit_boot_failure_reports_derivative_failure");
+
+    ProdigyPersistentBrainSnapshot loadedSnapshot = {};
+    suite.expect(store.loadBrainSnapshot(loadedSnapshot, &failure), "brain_commit_boot_failure_loads_committed_snapshot");
+    suite.expect(equalBrainSnapshots(expectedStoredSnapshot, loadedSnapshot), "brain_commit_boot_failure_snapshot_is_authoritative");
+    store.close();
+    suite.expect(cleanupPersistentStateRoots(commitDbPath), "brain_commit_boot_failure_cleanup_after");
+  }
+
+  {
     ProdigyPersistentBrainSnapshot cachedSnapshot = {};
     ProdigyPersistentBrainSnapshot initialSnapshot = expectedManagedSnapshot;
     prodigyReplaceCachedBrainSnapshot(cachedSnapshot, std::move(initialSnapshot));
@@ -1264,12 +1383,8 @@ int main(void)
     suite.expect(
         extractedSecrets.bootstrapSshHostPrivateKeyOpenSSH.equals(expectedManagedSnapshot.brainConfig.bootstrapSshHostKeyPackage.privateKeyOpenSSH),
         "extract_snapshot_secrets_captures_bootstrap_host_private_key");
-    suite.expect(
-        extractedSecrets.reporterPassword.equals(expectedManagedSnapshot.brainConfig.reporter.password),
-        "extract_snapshot_secrets_captures_reporter_password");
     suite.expect(publicSnapshot.brainConfig.bootstrapSshKeyPackage.privateKeyOpenSSH.size() == 0, "extract_snapshot_secrets_scrubs_bootstrap_private_key");
     suite.expect(publicSnapshot.brainConfig.bootstrapSshHostKeyPackage.privateKeyOpenSSH.size() == 0, "extract_snapshot_secrets_scrubs_bootstrap_host_private_key");
-    suite.expect(publicSnapshot.brainConfig.reporter.password.size() == 0, "extract_snapshot_secrets_scrubs_reporter_password");
 
     auto publicFactoryIt = publicSnapshot.masterAuthority.tlsVaultFactoriesByApp.find(applicationID);
     suite.expect(publicFactoryIt != publicSnapshot.masterAuthority.tlsVaultFactoriesByApp.end(), "extract_snapshot_secrets_keeps_tls_factory");
@@ -1670,7 +1785,6 @@ int main(void)
     suite.expect(storedSnapshotRecord.secretVersion != 0, "raw_public_snapshot_record_has_secret_version");
     suite.expect(stringContains(rawPublicSnapshotRecord, storedSnapshot.brainConfig.bootstrapSshKeyPackage.privateKeyOpenSSH) == false, "raw_public_snapshot_record_scrubs_bootstrap_private_key");
     suite.expect(stringContains(rawPublicSnapshotRecord, storedSnapshot.brainConfig.bootstrapSshHostKeyPackage.privateKeyOpenSSH) == false, "raw_public_snapshot_record_scrubs_bootstrap_host_private_key");
-    suite.expect(stringContains(rawPublicSnapshotRecord, storedSnapshot.brainConfig.reporter.password) == false, "raw_public_snapshot_record_scrubs_reporter_password");
     suite.expect(stringContains(rawPublicSnapshotRecord, storedCredential.material) == false, "raw_public_snapshot_record_scrubs_api_credential_material");
     suite.expect(stringContains(rawPublicSnapshotRecord, storedFactory.rootKeyPem) == false, "raw_public_snapshot_record_scrubs_tls_root_key");
     suite.expect(stringContains(rawPublicSnapshotRecord, storedFactory.intermediateKeyPem) == false, "raw_public_snapshot_record_scrubs_tls_intermediate_key");
@@ -1702,7 +1816,6 @@ int main(void)
     suite.expect(readRawTidesDBRecord(secretsDBPath, "brain"_ctv, snapshotSecretKey, rawSnapshotSecretRecord, &failure), "read_raw_snapshot_secret_record");
     suite.expect(stringContains(rawSnapshotSecretRecord, storedSnapshot.brainConfig.bootstrapSshKeyPackage.privateKeyOpenSSH), "raw_snapshot_secret_record_keeps_bootstrap_private_key");
     suite.expect(stringContains(rawSnapshotSecretRecord, storedSnapshot.brainConfig.bootstrapSshHostKeyPackage.privateKeyOpenSSH), "raw_snapshot_secret_record_keeps_bootstrap_host_private_key");
-    suite.expect(stringContains(rawSnapshotSecretRecord, storedSnapshot.brainConfig.reporter.password), "raw_snapshot_secret_record_keeps_reporter_password");
     suite.expect(stringContains(rawSnapshotSecretRecord, storedCredential.material), "raw_snapshot_secret_record_keeps_api_credential_material");
     suite.expect(stringContains(rawSnapshotSecretRecord, storedFactory.rootKeyPem), "raw_snapshot_secret_record_keeps_tls_root_key");
     suite.expect(stringContains(rawSnapshotSecretRecord, storedFactory.intermediateKeyPem), "raw_snapshot_secret_record_keeps_tls_intermediate_key");

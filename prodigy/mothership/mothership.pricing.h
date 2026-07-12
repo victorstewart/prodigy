@@ -6,7 +6,6 @@
 #include <cstdlib>
 #include <limits>
 
-#include <curl/curl.h>
 #include <simdjson.h>
 
 #include <cpp-sort/adapters/verge_adapter.h>
@@ -24,22 +23,131 @@ static inline cppsort::verge_adapter<cppsort::ska_sorter> sorter;
 #include <prodigy/mothership/mothership.deployment.plan.helpers.h>
 #include <prodigy/mothership/mothership.pricing.types.h>
 #include <prodigy/mothership/mothership.provider.credentials.h>
-
-class MothershipGcpPricingShim : public GcpBrainIaaS {
-public:
-
-  bool request(const char *method, const String& url, const String *body, String& response, long *httpStatus, String& failure)
-  {
-    return sendElasticComputeRequest(method, url, body, response, httpStatus, failure);
-  }
-};
+#include <prodigy/mothership/mothership.ring.runtime.h>
 
 class MothershipAzurePricingShim : public AzureBrainIaaS {
 public:
 
-  bool request(const char *method, const String& url, const String *body, String& response, long *httpStatus, String& failure)
+  constexpr static std::chrono::minutes maximumDuration = std::chrono::minutes(5);
+
+  ProdigyHostTask<bool> request(CoroutineStack *coro,
+                                MultiCurlClient::Method method,
+                                const String& url,
+                                const String *body,
+                                String& response,
+                                long *httpStatus,
+                                String& failure)
   {
-    return sendARMRaw(method, url, body, response, httpStatus, failure);
+    co_return co_await sendARMRaw(coro, method, url, body, response, httpStatus, failure);
+  }
+};
+
+class MothershipAwsPricingHttp final
+{
+public:
+
+  constexpr static std::chrono::minutes maximumDuration = std::chrono::minutes(5);
+
+private:
+
+  AwsHttpTransport transport;
+  const AwsCredentialMaterial *credential;
+
+  static AwsHttpRequest::Target target(const String& authority,
+                                       const String& region,
+                                       const String& service)
+  {
+    AwsHttpRequest::Target value;
+    value.authority.assign(authority);
+    value.region.assign(region);
+    value.service.assign(service);
+    return value;
+  }
+
+  ProdigyHostTask<bool> send(CoroutineStack *coro,
+                             const AwsHttpRequest::Target& target,
+                             const Vector<MultiCurlClient::Header>& headers,
+                             const String& body,
+                             const String& failureContext,
+                             String& response,
+                             String& failure,
+                             long *httpCode)
+  {
+    MultiCurlClient::Result result = co_await transport.sendSigned(
+        coro,
+        target,
+        MultiCurlClient::Method::post,
+        headers,
+        &body,
+        *credential,
+        &failure);
+    response = std::move(result.body);
+    if (httpCode)
+    {
+      *httpCode = result.statusCode;
+    }
+    if (result.status != MultiCurlClient::Status::success)
+    {
+      AwsHttpTransport::assignTransportFailure(result, failure);
+      co_return false;
+    }
+    if (result.statusCode < 200 || result.statusCode >= 300)
+    {
+      AwsHttpTransport::assignHttpFailure(
+          failureContext, result.statusCode, response, failure);
+      co_return false;
+    }
+    co_return true;
+  }
+
+public:
+
+  MothershipAwsPricingHttp(ProdigyProviderServices services,
+                           const AwsCredentialMaterial& requestedCredential)
+      : transport(services.http, services.delay, services.operationDeadline),
+        credential(&requestedCredential)
+  {}
+
+  ProdigyHostTask<bool> pricing(CoroutineStack *coro,
+                                const String& body,
+                                String& response,
+                                String& failure,
+                                long *httpCode = nullptr)
+  {
+    Vector<MultiCurlClient::Header> headers;
+    headers.push_back({"Content-Type"_ctv, "application/x-amz-json-1.1"_ctv});
+    headers.push_back({"X-Amz-Target"_ctv, "AWSPriceListService.GetProducts"_ctv});
+    co_return co_await send(
+        coro,
+        target("api.pricing.us-east-1.amazonaws.com"_ctv, "us-east-1"_ctv, "pricing"_ctv),
+        headers,
+        body,
+        "aws pricing request failed"_ctv,
+        response,
+        failure,
+        httpCode);
+  }
+
+  ProdigyHostTask<bool> ec2(CoroutineStack *coro,
+                            const String& region,
+                            const String& body,
+                            String& response,
+                            String& failure,
+                            long *httpCode = nullptr)
+  {
+    String authority;
+    authority.snprintf<"ec2.{}.amazonaws.com"_ctv>(region);
+    Vector<MultiCurlClient::Header> headers;
+    headers.push_back({"Content-Type"_ctv,
+                       "application/x-www-form-urlencoded; charset=utf-8"_ctv});
+    co_return co_await send(coro,
+                            target(authority, region, "ec2"_ctv),
+                            headers,
+                            body,
+                            "aws ec2 request failed"_ctv,
+                            response,
+                            failure,
+                            httpCode);
   }
 };
 
@@ -340,6 +448,186 @@ static inline void mothershipAppendPageTokenQuery(String& url, const String& pag
   url.append("pageToken="_ctv);
   mothershipAppendPercentEncoded(url, pageToken);
 }
+
+class MothershipGcpPricingHttp final
+{
+public:
+
+  constexpr static uint32_t maximumPages = 64;
+  constexpr static uint32_t maximumPageTokenBytes = 2048;
+  constexpr static size_t maximumResponseBytes = 8 * 1024 * 1024;
+  constexpr static size_t maximumTotalResponseBytes = 64 * 1024 * 1024;
+  constexpr static std::chrono::minutes maximumDuration = std::chrono::minutes(2);
+
+private:
+
+  ProdigyHostHttpOperation::Submission http;
+  String token;
+  MultiCurlClient::TimePoint deadline;
+  uint32_t requestedPages = 0;
+  size_t retainedResponseBytes = 0;
+
+  MultiCurlClient::Request request(const String& host, String url) const
+  {
+    MultiCurlClient::Request value;
+    value.url = std::move(url);
+    value.resolveHost = host;
+    value.authority = host;
+    value.method = MultiCurlClient::Method::get;
+    value.family = AsyncDnsResolver::Family::ipv4;
+    value.caSource = MultiCurlClient::CaSource::system;
+    value.connectTimeout = std::chrono::seconds(3);
+    value.overallDeadline = deadline;
+    value.responseBytes = std::min(maximumResponseBytes,
+                                   maximumTotalResponseBytes - retainedResponseBytes);
+    String authorization;
+    authorization.snprintf<"Bearer {}"_ctv>(token);
+    value.headers.push_back({"Authorization"_ctv, std::move(authorization)});
+    value.originPolicy.requiredScheme.assign("https"_ctv);
+    value.originPolicy.requiredHost = host;
+    value.originPolicy.requiredAuthority = host;
+    value.originPolicy.requiredService.assign("443"_ctv);
+    value.originPolicy.requiredResolveHost = host;
+    return value;
+  }
+
+public:
+
+  MothershipGcpPricingHttp(ProdigyHostHttpOperation::Submission requestedHttp,
+                           const String& requestedToken,
+                           MultiCurlClient::TimePoint requestedDeadline)
+      : http(requestedHttp),
+        deadline(requestedDeadline)
+  {
+    token.assign(requestedToken);
+  }
+
+  static bool pagePermitted(uint32_t pages,
+                            size_t retainedResponseBytes,
+                            const String& pageToken,
+                            const bytell_hash_set<String>& requestedPageTokens)
+  {
+    return pages < maximumPages && retainedResponseBytes < maximumTotalResponseBytes &&
+           pageToken.size() <= maximumPageTokenBytes &&
+           (pageToken.empty() || requestedPageTokens.contains(pageToken) == false);
+  }
+
+  void fetchPages(CoroutineStack *coro,
+                  String host,
+                  String baseUrl,
+                  Vector<String>& responses,
+                  String& failure)
+  {
+    responses.clear();
+    failure.clear();
+    if (coro == nullptr || !http || token.empty() ||
+        (host != "compute.googleapis.com"_ctv && host != "cloudbilling.googleapis.com"_ctv))
+    {
+      failure.assign("GCP pricing HTTP configuration invalid"_ctv);
+      co_return;
+    }
+
+    String pageToken;
+    bytell_hash_set<String> requestedPageTokens;
+    while (pagePermitted(requestedPages, retainedResponseBytes, pageToken, requestedPageTokens))
+    {
+      if (MultiCurlClient::Clock::now() >= deadline)
+      {
+        failure.assign("GCP pricing survey deadline exceeded"_ctv);
+        co_return;
+      }
+      if (pageToken.empty() == false)
+      {
+        requestedPageTokens.insert(pageToken);
+      }
+
+      String url;
+      url.assign(baseUrl);
+      mothershipAppendPageTokenQuery(url, pageToken);
+      ProdigyHostHttpOperation operation(http, *coro);
+      ++requestedPages;
+      if (operation.submit(request(host, std::move(url))) == false)
+      {
+        failure.assign("GCP pricing request submission failed"_ctv);
+        co_return;
+      }
+      if (operation.mustSuspend())
+      {
+        co_await coro->suspend();
+      }
+      if (operation.hasResult() == false)
+      {
+        failure.assign("GCP pricing request incomplete"_ctv);
+        co_return;
+      }
+
+      MultiCurlClient::Result result = operation.takeResult();
+      if (result.status != MultiCurlClient::Status::success ||
+          result.statusCode < 200 || result.statusCode >= 300)
+      {
+        failure.assign("GCP pricing request failed"_ctv);
+        co_return;
+      }
+      if (result.body.size() > maximumResponseBytes ||
+          retainedResponseBytes > maximumTotalResponseBytes - result.body.size())
+      {
+        failure.assign("GCP pricing response limit exceeded"_ctv);
+        co_return;
+      }
+
+      if (result.body.need(simdjson::SIMDJSON_PADDING) == false)
+      {
+        failure.assign("GCP pricing response allocation failed"_ctv);
+        co_return;
+      }
+      simdjson::dom::parser parser;
+      simdjson::dom::element document;
+      if (parser.parse(result.body.c_str(), result.body.size()).get(document) || document.is_object() == false)
+      {
+        failure.assign("GCP pricing response parse failed"_ctv);
+        co_return;
+      }
+      String nextPageToken;
+      simdjson::dom::element tokenElement;
+      const simdjson::error_code tokenLookup = document["nextPageToken"].get(tokenElement);
+      if (tokenLookup != simdjson::NO_SUCH_FIELD)
+      {
+        auto tokenView = tokenElement.get_string();
+        if (tokenLookup != simdjson::SUCCESS || tokenView.error() != simdjson::SUCCESS)
+        {
+          failure.assign("GCP pricing page token invalid"_ctv);
+          co_return;
+        }
+        nextPageToken.assign(tokenView.value_unsafe());
+      }
+
+      retainedResponseBytes += result.body.size();
+      responses.push_back(std::move(result.body));
+      if (nextPageToken.empty())
+      {
+        co_return;
+      }
+      pageToken = std::move(nextPageToken);
+    }
+
+    if (retainedResponseBytes >= maximumTotalResponseBytes)
+    {
+      failure.assign("GCP pricing retained response limit exceeded"_ctv);
+    }
+    else if (pageToken.size() > maximumPageTokenBytes)
+    {
+      failure.assign("GCP pricing page token limit exceeded"_ctv);
+    }
+    else if (requestedPageTokens.contains(pageToken))
+    {
+      failure.assign("GCP pricing page token repeated"_ctv);
+    }
+    else
+    {
+      failure.assign("GCP pricing page limit exceeded"_ctv);
+    }
+  }
+};
 
 static inline bool mothershipResolveAwsRegionCountry(const String& region, String& countryKey)
 {
@@ -2138,59 +2426,104 @@ static inline bool mothershipExtractAwsBestUnitPriceMicrousd(
   return priceMicrousd > 0;
 }
 
-static inline bool mothershipSurveyAwsGp3StorageMicrousdPerGBHour(
+enum class MothershipAwsAuxiliaryPricingQuery : uint8_t
+{
+  gp3,
+  internetTransfer
+};
+
+static ProdigyHostTask<bool> mothershipAwsAuxiliaryPricingEntries(
+    MothershipAwsPricingHttp& http,
+    CoroutineStack *coro,
+    MothershipAwsAuxiliaryPricingQuery query,
     const String& region,
-    const AwsCredentialMaterial& credential,
+    Vector<String>& entries,
+    String& failure)
+{
+  entries.clear();
+  String nextToken;
+  bytell_hash_set<String> requestedTokens;
+  for (uint32_t page = 0; page < AwsHttpTransport::maximumPages; ++page)
+  {
+    if (!nextToken.empty() && !requestedTokens.insert(nextToken).second)
+    {
+      failure.assign("aws auxiliary pricing page token repeated"_ctv);
+      co_return false;
+    }
+    String body;
+    if (query == MothershipAwsAuxiliaryPricingQuery::gp3)
+    {
+      awsBuildPricingGetProductsRequestBody(
+          "AmazonEC2"_ctv,
+          {{"regionCode"_ctv, region}, {"volumeApiName"_ctv, "gp3"_ctv}},
+          body,
+          &nextToken);
+    }
+    else
+    {
+      awsBuildPricingGetProductsRequestBody(
+          "AWSDataTransfer"_ctv,
+          {{"fromRegionCode"_ctv, region},
+           {"fromLocationType"_ctv, "AWS Region"_ctv},
+           {"toLocation"_ctv, "External"_ctv},
+           {"transferType"_ctv, "AWS Outbound"_ctv}},
+          body,
+          &nextToken);
+    }
+
+    String response;
+    long httpCode = 0;
+    if (!co_await http.pricing(coro, body, response, failure, &httpCode))
+    {
+      co_return false;
+    }
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    if (parser.parse(response.c_str(), response.size()).get(doc) ||
+        doc["PriceList"].is_array() == false)
+    {
+      failure.assign("aws auxiliary pricing response invalid"_ctv);
+      co_return false;
+    }
+    for (auto encodedEntry : doc["PriceList"].get_array())
+    {
+      auto encoded = encodedEntry.get_string();
+      if (encoded.error() == simdjson::SUCCESS && !encoded.value_unsafe().empty())
+      {
+        entries.push_back(String(encoded.value_unsafe()));
+      }
+    }
+    nextToken.clear();
+    (void)mothershipJsonGetString(doc, "NextToken", nextToken);
+    if (nextToken.empty())
+    {
+      co_return true;
+    }
+  }
+  failure.assign("aws auxiliary pricing page limit exceeded"_ctv);
+  co_return false;
+}
+
+static ProdigyHostTask<bool> mothershipSurveyAwsGp3StorageMicrousdPerGBHour(
+    MothershipAwsPricingHttp& http,
+    CoroutineStack *coro,
+    const String& region,
     uint64_t& perGBHourMicrousd,
     String& failure)
 {
   perGBHourMicrousd = 0;
   failure.clear();
 
-  String body = {};
-  awsBuildPricingGetProductsRequestBody(
-      "AmazonEC2"_ctv,
-      {
-          {"regionCode"_ctv,    region   },
-          {"volumeApiName"_ctv, "gp3"_ctv},
-  },
-      body);
-
-  String response = {};
-  long httpCode = 0;
-  bool ok = awsSendPricingGetProductsRequest(credential, body, response, failure, &httpCode);
-  if (ok == false || httpCode < 200 || httpCode >= 300)
+  Vector<String> entries;
+  if (!co_await mothershipAwsAuxiliaryPricingEntries(
+          http, coro, MothershipAwsAuxiliaryPricingQuery::gp3, region, entries, failure))
   {
-    failure.assign("aws pricing gp3 storage query failed"_ctv);
-    return false;
-  }
-
-  simdjson::dom::parser parser;
-  simdjson::dom::element doc;
-  if (parser.parse(response.c_str(), response.size()).get(doc))
-  {
-    failure.assign("aws pricing gp3 storage response parse failed"_ctv);
-    return false;
-  }
-
-  auto priceList = doc["PriceList"];
-  if (priceList.is_array() == false)
-  {
-    failure.assign("aws pricing gp3 storage response missing PriceList"_ctv);
-    return false;
+    co_return false;
   }
 
   uint64_t monthlyMicrousd = 0;
-  for (auto encodedEntry : priceList.get_array())
+  for (String& entryText : entries)
   {
-    std::string_view encoded = {};
-    if (encodedEntry.get(encoded) != simdjson::SUCCESS || encoded.size() == 0)
-    {
-      continue;
-    }
-
-    String entryText = {};
-    entryText.assign(encoded);
     simdjson::dom::parser entryParser;
     simdjson::dom::element entry;
     if (entryParser.parse(entryText.c_str(), entryText.size()).get(entry))
@@ -2225,16 +2558,17 @@ static inline bool mothershipSurveyAwsGp3StorageMicrousdPerGBHour(
   if (monthlyMicrousd == 0)
   {
     failure.assign("aws pricing gp3 storage price missing"_ctv);
-    return false;
+    co_return false;
   }
 
   perGBHourMicrousd = mothershipPriceMicrousdPerGBHourFromMonthlyRate(monthlyMicrousd);
-  return perGBHourMicrousd > 0;
+  co_return perGBHourMicrousd > 0;
 }
 
-static inline bool mothershipSurveyAwsInternetTransferMicrousdPerGB(
+static ProdigyHostTask<bool> mothershipSurveyAwsInternetTransferMicrousdPerGB(
+    MothershipAwsPricingHttp& http,
+    CoroutineStack *coro,
     const String& region,
-    const AwsCredentialMaterial& credential,
     uint64_t& ingressMicrousdPerGB,
     uint64_t& egressMicrousdPerGB,
     String& failure)
@@ -2243,51 +2577,20 @@ static inline bool mothershipSurveyAwsInternetTransferMicrousdPerGB(
   egressMicrousdPerGB = 0;
   failure.clear();
 
-  String body = {};
-  awsBuildPricingGetProductsRequestBody(
-      "AWSDataTransfer"_ctv,
-      {
-          {"fromRegionCode"_ctv,   region            },
-          {"fromLocationType"_ctv, "AWS Region"_ctv  },
-          {"toLocation"_ctv,       "External"_ctv    },
-          {"transferType"_ctv,     "AWS Outbound"_ctv},
-  },
-      body);
-
-  String response = {};
-  long httpCode = 0;
-  bool ok = awsSendPricingGetProductsRequest(credential, body, response, failure, &httpCode);
-  if (ok == false || httpCode < 200 || httpCode >= 300)
+  Vector<String> entries;
+  if (!co_await mothershipAwsAuxiliaryPricingEntries(
+          http,
+          coro,
+          MothershipAwsAuxiliaryPricingQuery::internetTransfer,
+          region,
+          entries,
+          failure))
   {
-    failure.assign("aws pricing transfer query failed"_ctv);
-    return false;
+    co_return false;
   }
 
-  simdjson::dom::parser parser;
-  simdjson::dom::element doc;
-  if (parser.parse(response.c_str(), response.size()).get(doc))
+  for (String& entryText : entries)
   {
-    failure.assign("aws pricing transfer response parse failed"_ctv);
-    return false;
-  }
-
-  auto priceList = doc["PriceList"];
-  if (priceList.is_array() == false)
-  {
-    failure.assign("aws pricing transfer response missing PriceList"_ctv);
-    return false;
-  }
-
-  for (auto encodedEntry : priceList.get_array())
-  {
-    std::string_view encoded = {};
-    if (encodedEntry.get(encoded) != simdjson::SUCCESS || encoded.size() == 0)
-    {
-      continue;
-    }
-
-    String entryText = {};
-    entryText.assign(encoded);
     simdjson::dom::parser entryParser;
     simdjson::dom::element entry;
     if (entryParser.parse(entryText.c_str(), entryText.size()).get(entry))
@@ -2322,10 +2625,10 @@ static inline bool mothershipSurveyAwsInternetTransferMicrousdPerGB(
   if (egressMicrousdPerGB == 0)
   {
     failure.assign("aws pricing transfer price missing"_ctv);
-    return false;
+    co_return false;
   }
 
-  return true;
+  co_return true;
 }
 
 static inline bool mothershipGcpSkuMaxNonZeroUnitPriceMicrousd(simdjson::dom::element sku, uint64_t& priceMicrousd)
@@ -2518,7 +2821,9 @@ static inline bool mothershipAzureStandardSSDTierCapacityGB(const String& meterN
   return false;
 }
 
-static inline bool mothershipSurveyAzureStorageTiers(
+static inline ProdigyHostTask<bool> mothershipSurveyAzureStorageTiers(
+    AzureHttpTransport& transport,
+    CoroutineStack *coro,
     const String& location,
     Vector<MothershipStoragePricingTier>& tiers,
     String& failure)
@@ -2534,24 +2839,31 @@ static inline bool mothershipSurveyAzureStorageTiers(
   retailUrl.assign("https://prices.azure.com/api/retail/prices?"_ctv);
   azureAppendPercentEncoded(retailUrl, filter);
 
-  Vector<String> responses = {};
   simdjson::dom::parser parser;
   String nextPage = retailUrl;
+  uint32_t pages = 0;
   while (nextPage.size() > 0)
   {
-    String response = {};
-    if (AzureHttp::send("GET", nextPage, nullptr, nullptr, response) == false)
+    if (++pages > AzureHttpTransport::maximumPages)
+    {
+      failure.assign("azure storage prices page limit exceeded"_ctv);
+      co_return false;
+    }
+    MultiCurlClient::Result result = co_await transport.send(
+        coro,
+        transport.request(MultiCurlClient::Method::get, nextPage, "prices.azure.com"_ctv));
+    if (AzureHttpTransport::succeeded(result) == false)
     {
       failure.assign("azure storage prices request failed"_ctv);
-      return false;
+      co_return false;
     }
 
-    responses.push_back(response);
+    String response = std::move(result.body);
     simdjson::dom::element doc;
-    if (parser.parse(responses.back().c_str(), responses.back().size()).get(doc))
+    if (parser.parse(response.c_str(), response.size()).get(doc))
     {
       failure.assign("azure storage prices response parse failed"_ctv);
-      return false;
+      co_return false;
     }
 
     if (doc["Items"].is_array())
@@ -2637,10 +2949,12 @@ static inline bool mothershipSurveyAzureStorageTiers(
   std::sort(tiers.begin(), tiers.end(), [](const MothershipStoragePricingTier& lhs, const MothershipStoragePricingTier& rhs) -> bool {
     return lhs.capacityGB < rhs.capacityGB;
   });
-  return tiers.empty() == false;
+  co_return tiers.empty() == false;
 }
 
-static inline bool mothershipSurveyAzureBandwidthPricing(
+static inline ProdigyHostTask<bool> mothershipSurveyAzureBandwidthPricing(
+    AzureHttpTransport& transport,
+    CoroutineStack *coro,
     const String& location,
     uint64_t& ingressMicrousdPerGB,
     uint64_t& egressMicrousdPerGB,
@@ -2658,24 +2972,31 @@ static inline bool mothershipSurveyAzureBandwidthPricing(
   retailUrl.assign("https://prices.azure.com/api/retail/prices?"_ctv);
   azureAppendPercentEncoded(retailUrl, filter);
 
-  Vector<String> responses = {};
   simdjson::dom::parser parser;
   String nextPage = retailUrl;
+  uint32_t pages = 0;
   while (nextPage.size() > 0)
   {
-    String response = {};
-    if (AzureHttp::send("GET", nextPage, nullptr, nullptr, response) == false)
+    if (++pages > AzureHttpTransport::maximumPages)
+    {
+      failure.assign("azure bandwidth prices page limit exceeded"_ctv);
+      co_return false;
+    }
+    MultiCurlClient::Result result = co_await transport.send(
+        coro,
+        transport.request(MultiCurlClient::Method::get, nextPage, "prices.azure.com"_ctv));
+    if (AzureHttpTransport::succeeded(result) == false)
     {
       failure.assign("azure bandwidth prices request failed"_ctv);
-      return false;
+      co_return false;
     }
 
-    responses.push_back(response);
+    String response = std::move(result.body);
     simdjson::dom::element doc;
-    if (parser.parse(responses.back().c_str(), responses.back().size()).get(doc))
+    if (parser.parse(response.c_str(), response.size()).get(doc))
     {
       failure.assign("azure bandwidth prices response parse failed"_ctv);
-      return false;
+      co_return false;
     }
 
     if (doc["Items"].is_array())
@@ -2733,10 +3054,10 @@ static inline bool mothershipSurveyAzureBandwidthPricing(
   if (egressMicrousdPerGB == 0)
   {
     failure.assign("azure bandwidth egress price missing"_ctv);
-    return false;
+    co_return false;
   }
 
-  return true;
+  co_return true;
 }
 
 static inline bool mothershipExtractAwsOfferPrice(simdjson::dom::element entry, uint64_t& hourlyMicrousd)
@@ -2780,50 +3101,188 @@ static inline bool mothershipExtractAwsOfferPrice(simdjson::dom::element entry, 
   return false;
 }
 
-static inline bool mothershipSurveyAwsSpotPrices(
+static ProdigyHostTask<bool> mothershipResolveAwsPricingAvailabilityZone(
+    MothershipAwsPricingHttp& http,
+    CoroutineStack *coro,
     const String& region,
-    const AwsCredentialMaterial& credential,
+    String& availabilityZone,
+    String& failure)
+{
+  availabilityZone.clear();
+  String vpcID;
+  String nextToken;
+  bytell_hash_set<String> requestedTokens;
+  bool vpcPagesComplete = false;
+  for (uint32_t page = 0; page < AwsHttpTransport::maximumPages; ++page)
+  {
+    if (!nextToken.empty() && !requestedTokens.insert(nextToken).second)
+    {
+      failure.assign("aws default-vpc page token repeated"_ctv);
+      co_return false;
+    }
+    bool first = true;
+    String body;
+    awsAppendQueryParam(body, "Action"_ctv, "DescribeVpcs"_ctv, first);
+    awsAppendQueryParam(body, "Version"_ctv, "2016-11-15"_ctv, first);
+    awsAppendQueryParam(body, "Filter.1.Name"_ctv, "is-default"_ctv, first);
+    awsAppendQueryParam(body, "Filter.1.Value.1"_ctv, "true"_ctv, first);
+    if (!nextToken.empty())
+    {
+      awsAppendQueryParam(body, "NextToken"_ctv, nextToken, first);
+    }
+    String response;
+    long httpCode = 0;
+    if (!co_await http.ec2(coro, region, body, response, failure, &httpCode))
+    {
+      co_return false;
+    }
+    Vector<String> blocks;
+    awsCollectSetItemBlocks(response, "vpcSet", blocks);
+    for (const String& block : blocks)
+    {
+      String candidate;
+      String isDefault;
+      if (!awsExtractXMLValue(block, "vpcId", candidate) ||
+          !awsExtractXMLValue(block, "isDefault", isDefault) ||
+          isDefault != "true"_ctv)
+      {
+        continue;
+      }
+      if (vpcID.empty() || awsStringLess(candidate, vpcID))
+      {
+        vpcID = candidate;
+      }
+    }
+    nextToken.clear();
+    (void)awsExtractXMLValue(response, "nextToken", nextToken);
+    if (nextToken.empty())
+    {
+      if (vpcID.empty())
+      {
+        failure.assign("aws region default vpc missing"_ctv);
+        co_return false;
+      }
+      vpcPagesComplete = true;
+      break;
+    }
+  }
+  if (!vpcPagesComplete)
+  {
+    failure.assign("aws default-vpc page limit exceeded"_ctv);
+    co_return false;
+  }
+
+  Vector<String> subnetBlocks;
+  nextToken.clear();
+  requestedTokens.clear();
+  for (uint32_t page = 0; page < AwsHttpTransport::maximumPages; ++page)
+  {
+    if (!nextToken.empty() && !requestedTokens.insert(nextToken).second)
+    {
+      failure.assign("aws bootstrap-subnet page token repeated"_ctv);
+      co_return false;
+    }
+    bool first = true;
+    String body;
+    awsAppendQueryParam(body, "Action"_ctv, "DescribeSubnets"_ctv, first);
+    awsAppendQueryParam(body, "Version"_ctv, "2016-11-15"_ctv, first);
+    awsAppendQueryParam(body, "Filter.1.Name"_ctv, "vpc-id"_ctv, first);
+    awsAppendQueryParam(body, "Filter.1.Value.1"_ctv, vpcID, first);
+    if (!nextToken.empty())
+    {
+      awsAppendQueryParam(body, "NextToken"_ctv, nextToken, first);
+    }
+    String response;
+    long httpCode = 0;
+    if (!co_await http.ec2(coro, region, body, response, failure, &httpCode))
+    {
+      co_return false;
+    }
+    Vector<String> pageBlocks;
+    awsCollectSetItemBlocks(response, "subnetSet", pageBlocks);
+    for (String& block : pageBlocks)
+    {
+      subnetBlocks.push_back(std::move(block));
+    }
+    nextToken.clear();
+    (void)awsExtractXMLValue(response, "nextToken", nextToken);
+    if (nextToken.empty())
+    {
+      String subnetID;
+      if (!awsSelectBootstrapSubnet(subnetBlocks, subnetID, availabilityZone))
+      {
+        failure.assign("aws bootstrap subnet missing"_ctv);
+        co_return false;
+      }
+      co_return true;
+    }
+  }
+  failure.assign("aws bootstrap-subnet page limit exceeded"_ctv);
+  co_return false;
+}
+
+static ProdigyHostTask<bool> mothershipSurveyAwsSpotPrices(
+    MothershipAwsPricingHttp& http,
+    CoroutineStack *coro,
+    const String& region,
     bytell_hash_map<String, uint64_t>& pricesByType,
     String& failure)
 {
   pricesByType.clear();
   failure.clear();
 
+  String availabilityZone;
+  if (!co_await mothershipResolveAwsPricingAvailabilityZone(
+          http, coro, region, availabilityZone, failure))
+  {
+    co_return false;
+  }
+  const int64_t endSeconds = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+  const int64_t startSeconds = endSeconds - 300;
+  String startTime;
+  String endTime;
+  if (!awsFormatRFC3339Seconds(startSeconds, startTime) ||
+      !awsFormatRFC3339Seconds(endSeconds, endTime))
+  {
+    failure.assign("aws spot pricing time window invalid"_ctv);
+    co_return false;
+  }
+
   String nextToken = {};
+  bytell_hash_set<String> requestedTokens;
+  bytell_hash_map<String, int64_t> newestTimestampByType;
+  uint32_t pages = 0;
   while (true)
   {
+    if (++pages > AwsHttpTransport::maximumPages ||
+        (!nextToken.empty() && !requestedTokens.insert(nextToken).second))
+    {
+      failure.assign("aws spot pricing pagination limit exceeded"_ctv);
+      co_return false;
+    }
     bool first = true;
     String body = {};
     awsAppendQueryParam(body, "Action"_ctv, "DescribeSpotPriceHistory"_ctv, first);
     awsAppendQueryParam(body, "Version"_ctv, "2016-11-15"_ctv, first);
     awsAppendQueryParam(body, "ProductDescription.1"_ctv, "Linux/UNIX"_ctv, first);
     awsAppendQueryParam(body, "MaxResults"_ctv, "1000"_ctv, first);
+    awsAppendQueryParam(body, "AvailabilityZone"_ctv, availabilityZone, first);
+    awsAppendQueryParam(body, "StartTime"_ctv, startTime, first);
+    awsAppendQueryParam(body, "EndTime"_ctv, endTime, first);
     if (nextToken.size() > 0)
     {
       awsAppendQueryParam(body, "NextToken"_ctv, nextToken, first);
     }
 
     String response = {};
-    struct curl_slist *headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded; charset=utf-8");
-    String url = {};
-    url.snprintf<"https://ec2.{}.amazonaws.com/"_ctv>(region);
     long httpCode = 0;
-    bool ok = AwsHttp::send(
-        "POST",
-        url,
-        region,
-        "ec2"_ctv,
-        credential,
-        headers,
-        &body,
-        response,
-        &httpCode);
-    curl_slist_free_all(headers);
+    bool ok = co_await http.ec2(coro, region, body, response, failure, &httpCode);
     if (ok == false || httpCode < 200 || httpCode >= 300)
     {
       failure.assign("aws DescribeSpotPriceHistory failed"_ctv);
-      return false;
+      co_return false;
     }
 
     Vector<String> blocks = {};
@@ -2832,21 +3291,35 @@ static inline bool mothershipSurveyAwsSpotPrices(
     {
       String instanceType = {};
       String spotPrice = {};
-      if (awsExtractXMLValue(block, "instanceType", instanceType) == false || awsExtractXMLValue(block, "spotPrice", spotPrice) == false)
+      String candidateZone;
+      String timestamp;
+      if (awsExtractXMLValue(block, "instanceType", instanceType) == false ||
+          awsExtractXMLValue(block, "spotPrice", spotPrice) == false ||
+          awsExtractXMLValue(block, "availabilityZone", candidateZone) == false ||
+          awsExtractXMLValue(block, "timestamp", timestamp) == false ||
+          candidateZone != availabilityZone)
       {
         continue;
       }
 
       uint64_t spotMicrousd = 0;
-      if (mothershipParseDecimalPriceMicrousd(spotPrice, spotMicrousd) == false || spotMicrousd == 0)
+      int64_t timestampMs = 0;
+      if (!awsParseRFC3339Ms(timestamp, timestampMs) ||
+          mothershipParseDecimalPriceMicrousd(spotPrice, spotMicrousd) == false ||
+          spotMicrousd == 0 || timestampMs > endSeconds * 1000)
       {
         continue;
       }
 
       auto existing = pricesByType.find(instanceType);
-      if (existing == pricesByType.end() || spotMicrousd < existing->second)
+      auto existingTimestamp = newestTimestampByType.find(instanceType);
+      if (existingTimestamp == newestTimestampByType.end() ||
+          timestampMs > existingTimestamp->second ||
+          (timestampMs == existingTimestamp->second &&
+           (existing == pricesByType.end() || spotMicrousd < existing->second)))
       {
         pricesByType.insert_or_assign(instanceType, spotMicrousd);
+        newestTimestampByType.insert_or_assign(instanceType, timestampMs);
       }
     }
 
@@ -2858,7 +3331,7 @@ static inline bool mothershipSurveyAwsSpotPrices(
     }
   }
 
-  return true;
+  co_return true;
 }
 
 static inline bool mothershipAwsFreeTierEligible(const String& instanceType, ProviderMachineBillingModel billingModel)
@@ -2871,7 +3344,9 @@ static inline bool mothershipAwsFreeTierEligible(const String& instanceType, Pro
   return instanceType.equal("t2.micro"_ctv) || instanceType.equal("t3.micro"_ctv) || instanceType.equal("t4g.micro"_ctv);
 }
 
-static inline bool mothershipSurveyAwsOffers(
+static ProdigyHostTask<bool> mothershipSurveyAwsOffers(
+    ProdigyProviderServices services,
+    CoroutineStack *coro,
     const MothershipProviderScopeTarget& resolvedTarget,
     const MothershipProviderCredential& credential,
     const MothershipProviderOfferSurveyRequest& request,
@@ -2885,7 +3360,7 @@ static inline bool mothershipSurveyAwsOffers(
   if (awsScopeRegion(resolvedTarget.providerScope, region) == false)
   {
     failure.assign("aws providerScope region missing"_ctv);
-    return false;
+    co_return false;
   }
 
   String expectedCountryKey = {};
@@ -2895,32 +3370,56 @@ static inline bool mothershipSurveyAwsOffers(
     {
       failure.assign("aws providerScope country mismatch"_ctv);
     }
-    return false;
+    co_return false;
   }
 
   AwsCredentialMaterial awsCredential = {};
-  if (parseAwsCredentialMaterial(credential.material, awsCredential, &failure) == false)
+  ProdigyRuntimeEnvironmentConfig credentialRuntime = {};
+  credentialRuntime.kind = ProdigyEnvironmentKind::aws;
+  if (!MothershipProviderCredentialRegistry::applyCredentialToRuntimeEnvironment(
+          credential, credentialRuntime, &failure))
   {
-    return false;
+    co_return false;
   }
+  String credentialMaterial;
+  credentialMaterial.assign(credentialRuntime.providerCredentialMaterial);
+  AwsSecretStringScope credentialMaterialScope(credentialMaterial);
+  if (!credentialRuntime.aws.bootstrapCredentialRefreshCommand.empty() &&
+      !co_await ProdigyCommandCapture::run(
+          coro,
+          credentialRuntime.aws.bootstrapCredentialRefreshCommand,
+          credentialMaterial,
+          services.operationDeadline,
+          &failure))
+  {
+    co_return false;
+  }
+  if (parseAwsCredentialMaterial(credentialMaterial, awsCredential, &failure) == false)
+  {
+    co_return false;
+  }
+  MothershipAwsPricingHttp http(services, awsCredential);
 
   bytell_hash_map<String, uint64_t> spotPricesByType = {};
-  if (request.billingModel == ProviderMachineBillingModel::spot && mothershipSurveyAwsSpotPrices(region, awsCredential, spotPricesByType, failure) == false)
+  if (request.billingModel == ProviderMachineBillingModel::spot &&
+      co_await mothershipSurveyAwsSpotPrices(http, coro, region, spotPricesByType, failure) == false)
   {
-    return false;
+    co_return false;
   }
 
   uint64_t extraStorageMicrousdPerGBHour = 0;
   uint64_t ingressMicrousdPerGB = 0;
   uint64_t egressMicrousdPerGB = 0;
-  if (mothershipSurveyAwsGp3StorageMicrousdPerGBHour(region, awsCredential, extraStorageMicrousdPerGBHour, failure) == false)
+  if (co_await mothershipSurveyAwsGp3StorageMicrousdPerGBHour(
+          http, coro, region, extraStorageMicrousdPerGBHour, failure) == false)
   {
-    return false;
+    co_return false;
   }
 
-  if (mothershipSurveyAwsInternetTransferMicrousdPerGB(region, awsCredential, ingressMicrousdPerGB, egressMicrousdPerGB, failure) == false)
+  if (co_await mothershipSurveyAwsInternetTransferMicrousdPerGB(
+          http, coro, region, ingressMicrousdPerGB, egressMicrousdPerGB, failure) == false)
   {
-    return false;
+    co_return false;
   }
 
   bool providesHostPublic4 = false;
@@ -2932,13 +3431,21 @@ static inline bool mothershipSurveyAwsOffers(
           providesHostPublic6,
           &failure) == false)
   {
-    return false;
+    co_return false;
   }
 
   bytell_hash_map<String, MothershipProviderMachineOffer> offersByType = {};
   String nextToken = {};
+  bytell_hash_set<String> requestedTokens;
+  uint32_t pages = 0;
   while (true)
   {
+    if (++pages > AwsHttpTransport::maximumPages ||
+        (!nextToken.empty() && !requestedTokens.insert(nextToken).second))
+    {
+      failure.assign("aws pricing pagination limit exceeded"_ctv);
+      co_return false;
+    }
     String body = {};
     awsBuildPricingGetProductsRequestBody(
         "AmazonEC2"_ctv,
@@ -2954,11 +3461,14 @@ static inline bool mothershipSurveyAwsOffers(
 
     String response = {};
     long httpCode = 0;
-    bool ok = awsSendPricingGetProductsRequest(awsCredential, body, response, failure, &httpCode);
+    bool ok = co_await http.pricing(coro, body, response, failure, &httpCode);
     if (ok == false || httpCode < 200 || httpCode >= 300)
     {
-      failure.assign("aws pricing GetProducts failed"_ctv);
-      return false;
+      if (failure.empty())
+      {
+        failure.assign("aws pricing GetProducts failed"_ctv);
+      }
+      co_return false;
     }
 
     simdjson::dom::parser parser;
@@ -2966,14 +3476,14 @@ static inline bool mothershipSurveyAwsOffers(
     if (parser.parse(response.c_str(), response.size()).get(doc))
     {
       failure.assign("aws pricing response parse failed"_ctv);
-      return false;
+      co_return false;
     }
 
     auto priceList = doc["PriceList"];
     if (priceList.is_array() == false)
     {
       failure.assign("aws pricing response missing PriceList"_ctv);
-      return false;
+      co_return false;
     }
 
     for (auto encodedEntry : priceList.get_array())
@@ -3115,10 +3625,10 @@ static inline bool mothershipSurveyAwsOffers(
   if (offers.empty())
   {
     failure.assign("aws pricing survey produced no offers"_ctv);
-    return false;
+    co_return false;
   }
 
-  return true;
+  co_return true;
 }
 
 struct MothershipGcpFamilyPrice {
@@ -3163,10 +3673,11 @@ static inline bool mothershipTextContainsUpper(const String& haystack, const Str
   return false;
 }
 
-static inline bool mothershipSurveyGcpOffers(
+static inline bool mothershipBuildGcpOffers(
     const MothershipProviderScopeTarget& resolvedTarget,
-    const MothershipProviderCredential& credential,
     const MothershipProviderOfferSurveyRequest& request,
+    Vector<String>& machineTypeResponses,
+    Vector<String>& billingResponses,
     Vector<MothershipProviderMachineOffer>& offers,
     String& failure)
 {
@@ -3200,17 +3711,6 @@ static inline bool mothershipSurveyGcpOffers(
     return false;
   }
 
-  ProdigyRuntimeEnvironmentConfig runtime = {};
-  runtime.kind = ProdigyEnvironmentKind::gcp;
-  runtime.providerScope = resolvedTarget.providerScope;
-  if (MothershipProviderCredentialRegistry::applyCredentialToRuntimeEnvironment(credential, runtime, &failure) == false)
-  {
-    return false;
-  }
-
-  MothershipGcpPricingShim shim = {};
-  shim.configureRuntimeEnvironment(runtime);
-
   bool providesHostPublic4 = false;
   bool providesHostPublic6 = false;
   if (mothershipResolveScopeHostPublicCapabilities(
@@ -3223,78 +3723,15 @@ static inline bool mothershipSurveyGcpOffers(
     return false;
   }
 
-  Vector<simdjson::dom::element> machineTypeDocs = {};
-  String pageToken = {};
-  simdjson::dom::parser parser;
-  Vector<String> machineTypeResponses = {};
-  while (true)
-  {
-    String url = {};
-    url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/machineTypes"_ctv>(projectId, zone);
-    mothershipAppendPageTokenQuery(url, pageToken);
-
-    String response = {};
-    long httpStatus = 0;
-    if (shim.request("GET", url, nullptr, response, &httpStatus, failure) == false || httpStatus < 200 || httpStatus >= 300)
-    {
-      if (failure.size() == 0)
-      {
-        failure.assign("gcp machineTypes request failed"_ctv);
-      }
-      return false;
-    }
-
-    machineTypeResponses.push_back(response);
-    simdjson::dom::element doc;
-    if (parser.parse(machineTypeResponses.back().c_str(), machineTypeResponses.back().size()).get(doc))
-    {
-      failure.assign("gcp machineTypes response parse failed"_ctv);
-      return false;
-    }
-
-    if (doc["items"].is_array())
-    {
-      for (auto item : doc["items"].get_array())
-      {
-        machineTypeDocs.push_back(item);
-      }
-    }
-
-    pageToken.clear();
-    (void)mothershipJsonGetString(doc, "nextPageToken", pageToken);
-    if (pageToken.size() == 0)
-    {
-      break;
-    }
-  }
-
   bytell_hash_map<String, MothershipGcpFamilyPrice> familyPricing = {};
   uint64_t storageMicrousdPerGBHour = 0;
   uint64_t ingressMicrousdPerGB = 0;
   uint64_t egressMicrousdPerGB = 0;
-  pageToken.clear();
-  Vector<String> billingResponses = {};
-  simdjson::dom::parser billingParser;
-  while (true)
+  for (String& billingResponse : billingResponses)
   {
-    String url = {};
-    url.assign("https://cloudbilling.googleapis.com/v1/services/6F81-5844-456A/skus?pageSize=5000&currencyCode=USD"_ctv);
-    mothershipAppendPageTokenQuery(url, pageToken);
-
-    String response = {};
-    long httpStatus = 0;
-    if (shim.request("GET", url, nullptr, response, &httpStatus, failure) == false || httpStatus < 200 || httpStatus >= 300)
-    {
-      if (failure.size() == 0)
-      {
-        failure.assign("gcp billing skus request failed"_ctv);
-      }
-      return false;
-    }
-
-    billingResponses.push_back(response);
+    simdjson::dom::parser billingParser;
     simdjson::dom::element doc;
-    if (billingParser.parse(billingResponses.back().c_str(), billingResponses.back().size()).get(doc))
+    if (billingParser.parse(billingResponse.c_str(), billingResponse.size()).get(doc))
     {
       failure.assign("gcp billing skus response parse failed"_ctv);
       return false;
@@ -3428,100 +3865,108 @@ static inline bool mothershipSurveyGcpOffers(
       }
     }
 
-    pageToken.clear();
-    (void)mothershipJsonGetString(doc, "nextPageToken", pageToken);
-    if (pageToken.size() == 0)
-    {
-      break;
-    }
   }
 
-  for (simdjson::dom::element item : machineTypeDocs)
+  for (String& machineTypeResponse : machineTypeResponses)
   {
-    String name = {};
-    if (mothershipJsonGetString(item, "name", name) == false)
+    simdjson::dom::parser parser;
+    simdjson::dom::element document;
+    if (parser.parse(machineTypeResponse.c_str(), machineTypeResponse.size()).get(document))
+    {
+      failure.assign("gcp machineTypes response parse failed"_ctv);
+      return false;
+    }
+    if (document["items"].is_array() == false)
     {
       continue;
     }
-
-    bool isSharedCpu = false;
-    (void)item["isSharedCpu"].get(isSharedCpu);
-    if (isSharedCpu)
+    for (simdjson::dom::element item : document["items"].get_array())
     {
-      continue;
-    }
-
-    String deprecatedState = {};
-    if (mothershipJsonGetString(item["deprecated"], "state", deprecatedState) && (deprecatedState.equal("DELETED"_ctv) || deprecatedState.equal("OBSOLETE"_ctv)))
-    {
-      continue;
-    }
-
-    auto accelerators = item["accelerators"];
-    if (accelerators.is_array())
-    {
-      bool hasAccelerators = false;
-      for (auto accelerator : accelerators.get_array())
-      {
-        (void)accelerator;
-        hasAccelerators = true;
-        break;
-      }
-
-      if (hasAccelerators)
+      String name = {};
+      if (mothershipJsonGetString(item, "name", name) == false)
       {
         continue;
       }
+
+      bool isSharedCpu = false;
+      (void)item["isSharedCpu"].get(isSharedCpu);
+      if (isSharedCpu)
+      {
+        continue;
+      }
+
+      String deprecatedState = {};
+      if (mothershipJsonGetString(item["deprecated"], "state", deprecatedState) && (deprecatedState.equal("DELETED"_ctv) || deprecatedState.equal("OBSOLETE"_ctv)))
+      {
+        continue;
+      }
+
+      auto accelerators = item["accelerators"];
+      if (accelerators.is_array())
+      {
+        bool hasAccelerators = false;
+        for (auto accelerator : accelerators.get_array())
+        {
+          (void)accelerator;
+          hasAccelerators = true;
+          break;
+        }
+
+        if (hasAccelerators)
+        {
+          continue;
+        }
+      }
+
+      uint32_t guestCpus = 0;
+      uint32_t memoryMB = 0;
+      if (mothershipJsonGetUInt32StringOrNumber(item, "guestCpus", guestCpus) == false || mothershipJsonGetUInt32StringOrNumber(item, "memoryMb", memoryMB) == false)
+      {
+        continue;
+      }
+
+      String familyKey = {};
+      mothershipGcpMachineFamilyFromType(name, familyKey);
+      auto familyPrice = familyPricing.find(familyKey);
+      if (familyPrice == familyPricing.end() || familyPrice->second.coreMicrousd == 0 || familyPrice->second.ramGiBMicrousd == 0)
+      {
+        continue;
+      }
+
+      uint64_t hourlyMicrousd = uint64_t(guestCpus) * familyPrice->second.coreMicrousd;
+      hourlyMicrousd += (uint64_t(memoryMB) * familyPrice->second.ramGiBMicrousd) / 1024ull;
+
+      MothershipProviderMachineOffer offer = {};
+      offer.provider = MothershipClusterProvider::gcp;
+      offer.providerScope = resolvedTarget.providerScope;
+      mothershipCountryDisplayFromKey(expectedCountryKey, offer.country);
+      offer.region = region;
+      offer.zone = zone;
+      offer.providerMachineType = name;
+      offer.billingModel = request.billingModel;
+      offer.kind = MachineConfig::MachineKind::vm;
+      offer.nLogicalCores = guestCpus;
+      offer.nMemoryMB = memoryMB;
+      offer.nStorageMBDefault = 20u * 1024u;
+      offer.providesHostPublic4 = providesHostPublic4;
+      offer.providesHostPublic6 = providesHostPublic6;
+      offer.hourlyMicrousd = hourlyMicrousd;
+      offer.extraStorageMicrousdPerGBHour = storageMicrousdPerGBHour;
+      offer.ingressMicrousdPerGB = ingressMicrousdPerGB;
+      offer.egressMicrousdPerGB = egressMicrousdPerGB;
+      if (storageMicrousdPerGBHour > 0 && egressMicrousdPerGB > 0)
+      {
+        offer.priceCompleteness = MothershipProviderOfferPriceCompleteness::computeStorageNetwork;
+      }
+      offer.freeTierEligible = request.billingModel == ProviderMachineBillingModel::hourly && name.equal("e2-micro"_ctv) && (region.equal("us-west1"_ctv) || region.equal("us-central1"_ctv) || region.equal("us-east1"_ctv));
+
+      if (mothershipOfferMatchesSurveyRequest(offer, request) == false)
+      {
+        continue;
+      }
+
+      offers.push_back(offer);
     }
-
-    uint32_t guestCpus = 0;
-    uint32_t memoryMB = 0;
-    if (mothershipJsonGetUInt32StringOrNumber(item, "guestCpus", guestCpus) == false || mothershipJsonGetUInt32StringOrNumber(item, "memoryMb", memoryMB) == false)
-    {
-      continue;
-    }
-
-    String familyKey = {};
-    mothershipGcpMachineFamilyFromType(name, familyKey);
-    auto familyPrice = familyPricing.find(familyKey);
-    if (familyPrice == familyPricing.end() || familyPrice->second.coreMicrousd == 0 || familyPrice->second.ramGiBMicrousd == 0)
-    {
-      continue;
-    }
-
-    uint64_t hourlyMicrousd = uint64_t(guestCpus) * familyPrice->second.coreMicrousd;
-    hourlyMicrousd += (uint64_t(memoryMB) * familyPrice->second.ramGiBMicrousd) / 1024ull;
-
-    MothershipProviderMachineOffer offer = {};
-    offer.provider = MothershipClusterProvider::gcp;
-    offer.providerScope = resolvedTarget.providerScope;
-    mothershipCountryDisplayFromKey(expectedCountryKey, offer.country);
-    offer.region = region;
-    offer.zone = zone;
-    offer.providerMachineType = name;
-    offer.billingModel = request.billingModel;
-    offer.kind = MachineConfig::MachineKind::vm;
-    offer.nLogicalCores = guestCpus;
-    offer.nMemoryMB = memoryMB;
-    offer.nStorageMBDefault = 20u * 1024u;
-    offer.providesHostPublic4 = providesHostPublic4;
-    offer.providesHostPublic6 = providesHostPublic6;
-    offer.hourlyMicrousd = hourlyMicrousd;
-    offer.extraStorageMicrousdPerGBHour = storageMicrousdPerGBHour;
-    offer.ingressMicrousdPerGB = ingressMicrousdPerGB;
-    offer.egressMicrousdPerGB = egressMicrousdPerGB;
-    if (storageMicrousdPerGBHour > 0 && egressMicrousdPerGB > 0)
-    {
-      offer.priceCompleteness = MothershipProviderOfferPriceCompleteness::computeStorageNetwork;
-    }
-    offer.freeTierEligible = request.billingModel == ProviderMachineBillingModel::hourly && name.equal("e2-micro"_ctv) && (region.equal("us-west1"_ctv) || region.equal("us-central1"_ctv) || region.equal("us-east1"_ctv));
-
-    if (mothershipOfferMatchesSurveyRequest(offer, request) == false)
-    {
-      continue;
-    }
-
-    offers.push_back(offer);
   }
 
   mothershipPruneDominatedOffers(offers);
@@ -3532,6 +3977,99 @@ static inline bool mothershipSurveyGcpOffers(
   }
 
   return true;
+}
+
+static inline bool mothershipSurveyGcpOffers(
+    MothershipHostRingRuntime& hostRuntime,
+    const MothershipProviderScopeTarget& resolvedTarget,
+    const MothershipProviderCredential& credential,
+    const MothershipProviderOfferSurveyRequest& request,
+    Vector<MothershipProviderMachineOffer>& offers,
+    String& failure)
+{
+  offers.clear();
+  failure.clear();
+  const MultiCurlClient::TimePoint deadline = MultiCurlClient::Clock::now() +
+                                               MothershipGcpPricingHttp::maximumDuration;
+  String project;
+  String zone;
+  if (mothershipParseGcpProviderScope(resolvedTarget.providerScope, project, zone, &failure) == false)
+  {
+    return false;
+  }
+
+  ProdigyRuntimeEnvironmentConfig source;
+  source.kind = ProdigyEnvironmentKind::gcp;
+  source.providerScope.assign(resolvedTarget.providerScope);
+  ProdigyRuntimeEnvironmentConfig environment;
+  if (MothershipProviderCredentialRegistry::prepareGcpRingRuntimeEnvironment(
+          credential, source, environment, &failure, deadline) == false)
+  {
+    return false;
+  }
+
+  String machineTypesUrl;
+  machineTypesUrl.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/machineTypes"_ctv>(project, zone);
+  String billingUrl;
+  billingUrl.assign("https://cloudbilling.googleapis.com/v1/services/6F81-5844-456A/skus?pageSize=5000&currencyCode=USD"_ctv);
+  Vector<String> machineTypeResponses;
+  Vector<String> billingResponses;
+  bool completed = false;
+  const bool ran = hostRuntime.run([&](ProdigyProviderServices services, CoroutineStack *coro) -> void {
+    services.operationDeadline = deadline;
+    String pricingToken;
+    pricingToken.assign(environment.providerCredentialMaterial);
+    AwsSecretStringScope pricingTokenScope(pricingToken);
+    if (!environment.gcp.bootstrapAccessTokenRefreshCommand.empty() &&
+        !co_await ProdigyCommandCapture::run(
+            coro,
+            environment.gcp.bootstrapAccessTokenRefreshCommand,
+            pricingToken,
+            deadline,
+            &failure))
+    {
+      co_return;
+    }
+    MothershipGcpPricingHttp http(services.http, pricingToken, deadline);
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          http.fetchPages(coro,
+                          "compute.googleapis.com"_ctv,
+                          machineTypesUrl,
+                          machineTypeResponses,
+                          failure);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (failure.empty() == false)
+    {
+      co_return;
+    }
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          http.fetchPages(coro,
+                          "cloudbilling.googleapis.com"_ctv,
+                          billingUrl,
+                          billingResponses,
+                          failure);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (failure.empty())
+    {
+      completed = mothershipBuildGcpOffers(resolvedTarget,
+                                           request,
+                                           machineTypeResponses,
+                                           billingResponses,
+                                           offers,
+                                           failure);
+    }
+  });
+  if (ran == false && failure.empty())
+  {
+    failure.assign("GCP pricing host Ring unavailable"_ctv);
+  }
+  return ran && completed && failure.empty();
 }
 
 static inline bool mothershipAzureCapabilityUInt32(simdjson::dom::element sku, const char *capabilityName, uint32_t& value)
@@ -3572,7 +4110,9 @@ static inline bool mothershipAzureCapabilityUInt32(simdjson::dom::element sku, c
   return false;
 }
 
-static inline bool mothershipSurveyAzureOffers(
+static inline ProdigyHostTask<bool> mothershipSurveyAzureOffers(
+    ProdigyProviderServices services,
+    CoroutineStack *coro,
     const MothershipProviderScopeTarget& resolvedTarget,
     const MothershipProviderCredential& credential,
     const MothershipProviderOfferSurveyRequest& request,
@@ -3587,7 +4127,7 @@ static inline bool mothershipSurveyAzureOffers(
   String location = {};
   if (parseAzureProviderScope(resolvedTarget.providerScope, subscriptionID, resourceGroup, location, &failure) == false)
   {
-    return false;
+    co_return false;
   }
 
   String expectedCountryKey = {};
@@ -3597,7 +4137,7 @@ static inline bool mothershipSurveyAzureOffers(
     {
       failure.assign("azure providerScope country mismatch"_ctv);
     }
-    return false;
+    co_return false;
   }
 
   ProdigyRuntimeEnvironmentConfig runtime = {};
@@ -3605,11 +4145,13 @@ static inline bool mothershipSurveyAzureOffers(
   runtime.providerScope = resolvedTarget.providerScope;
   if (MothershipProviderCredentialRegistry::applyCredentialToRuntimeEnvironment(credential, runtime, &failure) == false)
   {
-    return false;
+    co_return false;
   }
 
   MothershipAzurePricingShim shim = {};
+  shim.configureProviderServices(services);
   shim.configureRuntimeEnvironment(runtime);
+  AzureHttpTransport transport(services.http, services.delay, services.operationDeadline);
 
   bool providesHostPublic4 = false;
   bool providesHostPublic6 = false;
@@ -3620,20 +4162,20 @@ static inline bool mothershipSurveyAzureOffers(
           providesHostPublic6,
           &failure) == false)
   {
-    return false;
+    co_return false;
   }
 
   Vector<MothershipStoragePricingTier> storageTiers = {};
   uint64_t ingressMicrousdPerGB = 0;
   uint64_t egressMicrousdPerGB = 0;
-  if (mothershipSurveyAzureStorageTiers(location, storageTiers, failure) == false)
+  if (co_await mothershipSurveyAzureStorageTiers(transport, coro, location, storageTiers, failure) == false)
   {
-    return false;
+    co_return false;
   }
 
-  if (mothershipSurveyAzureBandwidthPricing(location, ingressMicrousdPerGB, egressMicrousdPerGB, failure) == false)
+  if (co_await mothershipSurveyAzureBandwidthPricing(transport, coro, location, ingressMicrousdPerGB, egressMicrousdPerGB, failure) == false)
   {
-    return false;
+    co_return false;
   }
 
   String skuUrl = {};
@@ -3641,27 +4183,31 @@ static inline bool mothershipSurveyAzureOffers(
 
   bytell_hash_map<String, MothershipProviderMachineOffer> offersByType = {};
   String nextLink = skuUrl;
-  Vector<String> skuResponses = {};
   simdjson::dom::parser skuParser;
+  uint32_t skuPages = 0;
   while (nextLink.size() > 0)
   {
+    if (++skuPages > AzureHttpTransport::maximumPages)
+    {
+      failure.assign("azure resource skus page limit exceeded"_ctv);
+      co_return false;
+    }
     String response = {};
     long httpStatus = 0;
-    if (shim.request("GET", nextLink, nullptr, response, &httpStatus, failure) == false || httpStatus < 200 || httpStatus >= 300)
+    if (co_await shim.request(coro, MultiCurlClient::Method::get, nextLink, nullptr, response, &httpStatus, failure) == false || httpStatus < 200 || httpStatus >= 300)
     {
       if (failure.size() == 0)
       {
         failure.assign("azure resource skus request failed"_ctv);
       }
-      return false;
+      co_return false;
     }
 
-    skuResponses.push_back(response);
     simdjson::dom::element doc;
-    if (skuParser.parse(skuResponses.back().c_str(), skuResponses.back().size()).get(doc))
+    if (skuParser.parse(response.c_str(), response.size()).get(doc))
     {
       failure.assign("azure resource skus response parse failed"_ctv);
-      return false;
+      co_return false;
     }
 
     if (doc["value"].is_array())
@@ -3750,24 +4296,31 @@ static inline bool mothershipSurveyAzureOffers(
   retailUrl.assign("https://prices.azure.com/api/retail/prices?"_ctv);
   azureAppendPercentEncoded(retailUrl, filter);
 
-  Vector<String> retailResponses = {};
   simdjson::dom::parser retailParser;
   String nextPage = retailUrl;
+  uint32_t retailPages = 0;
   while (nextPage.size() > 0)
   {
-    String response = {};
-    if (AzureHttp::send("GET", nextPage, nullptr, nullptr, response) == false)
+    if (++retailPages > AzureHttpTransport::maximumPages)
+    {
+      failure.assign("azure retail prices page limit exceeded"_ctv);
+      co_return false;
+    }
+    MultiCurlClient::Result result = co_await transport.send(
+        coro,
+        transport.request(MultiCurlClient::Method::get, nextPage, "prices.azure.com"_ctv));
+    if (AzureHttpTransport::succeeded(result) == false)
     {
       failure.assign("azure retail prices request failed"_ctv);
-      return false;
+      co_return false;
     }
 
-    retailResponses.push_back(response);
+    String response = std::move(result.body);
     simdjson::dom::element doc;
-    if (retailParser.parse(retailResponses.back().c_str(), retailResponses.back().size()).get(doc))
+    if (retailParser.parse(response.c_str(), response.size()).get(doc))
     {
       failure.assign("azure retail prices response parse failed"_ctv);
-      return false;
+      co_return false;
     }
 
     if (doc["Items"].is_array())
@@ -3867,13 +4420,14 @@ static inline bool mothershipSurveyAzureOffers(
   if (offers.empty())
   {
     failure.assign("azure pricing survey produced no offers"_ctv);
-    return false;
+    co_return false;
   }
 
-  return true;
+  co_return true;
 }
 
 static inline bool mothershipSurveyProviderMachineOffers(
+    MothershipHostRingRuntime& hostRuntime,
     MothershipProviderOfferSurveyRequest request,
     Vector<MothershipProviderMachineOffer>& offers,
     String& failure)
@@ -3895,17 +4449,53 @@ static inline bool mothershipSurveyProviderMachineOffers(
 
   if (request.target.provider == MothershipClusterProvider::aws)
   {
-    return mothershipSurveyAwsOffers(request.target, credential, request, offers, failure);
+    const MultiCurlClient::TimePoint deadline = MultiCurlClient::Clock::now() +
+                                                 MothershipAwsPricingHttp::maximumDuration;
+    bool completed = false;
+    const bool ran = hostRuntime.run([&](ProdigyProviderServices services, CoroutineStack *coro) -> void {
+      services.operationDeadline = deadline;
+      completed = co_await mothershipSurveyAwsOffers(
+          services,
+          coro,
+          request.target,
+          credential,
+          request,
+          offers,
+          failure);
+    });
+    if (!ran && failure.empty())
+    {
+      failure.assign("AWS pricing host Ring unavailable"_ctv);
+    }
+    return ran && completed && failure.empty();
   }
 
   if (request.target.provider == MothershipClusterProvider::gcp)
   {
-    return mothershipSurveyGcpOffers(request.target, credential, request, offers, failure);
+    return mothershipSurveyGcpOffers(hostRuntime, request.target, credential, request, offers, failure);
   }
 
   if (request.target.provider == MothershipClusterProvider::azure)
   {
-    return mothershipSurveyAzureOffers(request.target, credential, request, offers, failure);
+    const MultiCurlClient::TimePoint deadline = MultiCurlClient::Clock::now() +
+                                                 MothershipAzurePricingShim::maximumDuration;
+    bool completed = false;
+    const bool ran = hostRuntime.run([&](ProdigyProviderServices services, CoroutineStack *coro) -> void {
+      services.operationDeadline = deadline;
+      completed = co_await mothershipSurveyAzureOffers(
+          services,
+          coro,
+          request.target,
+          credential,
+          request,
+          offers,
+          failure);
+    });
+    if (ran == false && failure.empty())
+    {
+      failure.assign("Azure pricing host Ring unavailable"_ctv);
+    }
+    return ran && completed && failure.empty();
   }
 
   failure.assign("unsupported provider for pricing survey"_ctv);

@@ -1,5 +1,9 @@
 #include <prodigy/bundle.artifact.h>
+#include <prodigy/container.contract.h>
 #include <services/debug.h>
+#include <services/prodigy.h>
+
+#include <simdjson.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -44,6 +48,102 @@ static bool stringContains(const String& haystack, const char *needle)
   String text = {};
   text.assign(haystack);
   return std::strstr(text.c_str(), needle) != nullptr;
+}
+
+static uint32_t stringOccurrences(const String& haystack, const String& needle)
+{
+  if (needle.empty())
+  {
+    return 0;
+  }
+
+  String text = {};
+  text.assign(haystack);
+  String match = {};
+  match.assign(needle);
+  uint32_t count = 0;
+  const char *cursor = text.c_str();
+  while ((cursor = std::strstr(cursor, match.c_str())) != nullptr)
+  {
+    count += 1;
+    cursor += match.size();
+  }
+  return count;
+}
+
+static mode_t fileMode(const String& path)
+{
+  String pathText = {};
+  pathText.assign(path);
+  struct stat status = {};
+  return ::stat(pathText.c_str(), &status) == 0
+             ? status.st_mode & 0777
+             : mode_t(-1);
+}
+
+static bool filesHaveEqualBytes(const String& left,
+                                const String& right,
+                                String *failure)
+{
+  String expectedDigest = {};
+  String actualDigest = {};
+  uint64_t expectedBytes = 0;
+  return prodigyComputeFileSHA256Hex(
+             left, expectedDigest, &expectedBytes, failure) &&
+         prodigyFileMatchesExpectedSHA256HexAndSize(
+             right, expectedDigest, expectedBytes, actualDigest, nullptr, failure);
+}
+
+static bool jsonTextEquals(simdjson::dom::element field, const char *expected)
+{
+  auto parsed = field.get_string();
+  return parsed.error() == simdjson::SUCCESS &&
+         parsed.value().size() == std::strlen(expected) &&
+         std::memcmp(parsed.value().data(), expected, parsed.value().size()) == 0;
+}
+
+static bool resolverPlanHasExpectedIdentity(const String& path)
+{
+  String pathText = {};
+  pathText.assign(path);
+  String json = {};
+  Filesystem::openReadAtClose(-1, pathText, json);
+  if (json.empty())
+  {
+    return false;
+  }
+  json.need(simdjson::SIMDJSON_PADDING);
+
+  simdjson::dom::parser parser;
+  simdjson::dom::element document;
+  uint64_t applicationID = 0;
+  uint64_t versionID = 0;
+  simdjson::dom::array advertisements;
+  if (parser.parse(json.data(), json.size()).get(document) != simdjson::SUCCESS ||
+      document["config"]["applicationID"].get(applicationID) != simdjson::SUCCESS ||
+      document["config"]["versionID"].get(versionID) != simdjson::SUCCESS ||
+      jsonTextEquals(document["config"]["type"], "ApplicationType::stateless") == false ||
+      jsonTextEquals(document["config"]["architecture"],
+                     machineCpuArchitectureName(nametagCurrentBuildMachineArchitecture())) == false ||
+      document["advertisements"].get(advertisements) != simdjson::SUCCESS)
+  {
+    return false;
+  }
+
+  uint32_t advertisementCount = 0;
+  bool exactAdvertisement = false;
+  for (simdjson::dom::element advertisement : advertisements)
+  {
+    uint64_t port = 0;
+    advertisementCount += 1;
+    exactAdvertisement =
+        jsonTextEquals(advertisement["service"], "MeshRegistry::DNS::resolver") &&
+        advertisement["port"].get(port) == simdjson::SUCCESS &&
+        port == 5353;
+  }
+
+  return applicationID == MeshRegistry::DNS::applicationID && versionID == 1 &&
+         advertisementCount == 1 && exactAdvertisement;
 }
 
 static void trimTrailingWhitespace(String& text)
@@ -161,7 +261,9 @@ int main(void)
   suite.expect(stringContains(tarListing, "host.ingress.router.ebpf.o"), "bundle_contains_host_ingress_ebpf");
   suite.expect(stringContains(tarListing, "host.egress.router.ebpf.o"), "bundle_contains_host_egress_ebpf");
   suite.expect(stringContains(tarListing, "container.ingress.router.ebpf.o"), "bundle_contains_container_ingress_ebpf");
+  suite.expect(stringContains(tarListing, "container.ingress.router.declared.ebpf.o"), "bundle_contains_declared_container_ingress_ebpf");
   suite.expect(stringContains(tarListing, "container.egress.router.ebpf.o"), "bundle_contains_container_egress_ebpf");
+  suite.expect(stringContains(tarListing, "container.egress.router.declared.ebpf.o"), "bundle_contains_declared_container_egress_ebpf");
   suite.expect(stringContains(tarListing, "tunnel_to_nic.ebpf.o"), "bundle_contains_tunnel_to_nic_ebpf");
   suite.expect(stringContains(tarListing, "tools/fio"), "bundle_contains_fio_tool");
   suite.expect(stringContains(tarListing, "tools/iperf3"), "bundle_contains_iperf3_tool");
@@ -169,6 +271,22 @@ int main(void)
   suite.expect(stringContains(tarListing, "tools/lat_mem_rd"), "bundle_contains_lat_mem_rd_tool");
   suite.expect(stringContains(tarListing, "tools/bw_mem"), "bundle_contains_bw_mem_tool");
   suite.expect(stringContains(tarListing, "tools/speedtest"), "bundle_contains_speedtest_tool");
+  String resolverArtifactEntry = {};
+  resolverArtifactEntry.assign("./containers/prodigy-dns-resolver."_ctv);
+  resolverArtifactEntry.append(machineCpuArchitectureName(currentArchitecture));
+  resolverArtifactEntry.append(".container.zst\n"_ctv);
+  suite.expect(stringOccurrences(tarListing, resolverArtifactEntry) == 1,
+               "bundle_contains_exact_dns_resolver_container_name_once");
+  suite.expect(stringOccurrences(tarListing, "./containers/prodigy-dns-resolver."_ctv) == 1,
+               "bundle_contains_only_one_dns_resolver_container");
+  suite.expect(stringOccurrences(
+                   tarListing,
+                   "./containers/plans/prodigy-dns-resolver.deployment.plan.v1.json\n"_ctv) == 1,
+               "bundle_contains_exact_dns_resolver_plan_name_once");
+  suite.expect(stringOccurrences(
+                   tarListing,
+                   "./containers/plans/prodigy-dns-resolver"_ctv) == 1,
+               "bundle_contains_only_one_dns_resolver_plan");
   suite.expect(stringContains(tarListing, "lib/libc.so.6") == false, "bundle_excludes_libc");
   suite.expect(stringContains(tarListing, "lib/libm.so.6") == false, "bundle_excludes_libm");
   suite.expect(stringContains(tarListing, "lib/libresolv.so.2") == false, "bundle_excludes_libresolv");
@@ -303,6 +421,59 @@ int main(void)
   suite.expect(fileExists(installPaths.toolsDirectory), "installed_bundle_tools_directory_exists");
   suite.expect(fileExists(installPaths.bundlePath), "installed_bundle_bundle_exists");
 
+  String installedResolverArtifactPath = {};
+  installedResolverArtifactPath.assign(installRoot);
+  installedResolverArtifactPath.append("/containers/prodigy-dns-resolver."_ctv);
+  installedResolverArtifactPath.append(machineCpuArchitectureName(currentArchitecture));
+  installedResolverArtifactPath.append(".container.zst"_ctv);
+  suite.expect(fileExists(installedResolverArtifactPath), "installed_bundle_dns_resolver_container_exists");
+  suite.expect(fileMode(installedResolverArtifactPath) == 0644,
+               "installed_bundle_dns_resolver_container_mode_0644");
+
+  String generatedResolverArtifactPath = PRODIGY_TEST_BINARY_DIR;
+  if (generatedResolverArtifactPath.size() > 0 &&
+      generatedResolverArtifactPath[generatedResolverArtifactPath.size() - 1] != '/')
+  {
+    generatedResolverArtifactPath.append('/');
+  }
+  generatedResolverArtifactPath.append("prodigy-dns-resolver."_ctv);
+  generatedResolverArtifactPath.append(machineCpuArchitectureName(currentArchitecture));
+  generatedResolverArtifactPath.append(".container.zst"_ctv);
+  suite.expect(filesHaveEqualBytes(generatedResolverArtifactPath,
+                                   installedResolverArtifactPath,
+                                   &failure),
+               "installed_bundle_dns_resolver_container_matches_generated_bytes");
+  suite.expect(failure.size() == 0,
+               "installed_bundle_dns_resolver_container_comparison_clears_failure");
+  suite.expect(prodigyValidateDiscombobulatorContainerBlobHeader(
+                   installedResolverArtifactPath, &failure),
+               "installed_bundle_dns_resolver_container_has_supported_app_header");
+  suite.expect(failure.size() == 0,
+               "installed_bundle_dns_resolver_container_header_clears_failure");
+
+  String installedResolverPlanPath = {};
+  installedResolverPlanPath.assign(installRoot);
+  installedResolverPlanPath.append("/containers/plans/prodigy-dns-resolver.deployment.plan.v1.json"_ctv);
+  suite.expect(fileExists(installedResolverPlanPath), "installed_bundle_dns_resolver_plan_exists");
+  suite.expect(fileMode(installedResolverPlanPath) == 0644,
+               "installed_bundle_dns_resolver_plan_mode_0644");
+
+  String generatedResolverPlanPath = PRODIGY_TEST_BINARY_DIR;
+  if (generatedResolverPlanPath.size() > 0 &&
+      generatedResolverPlanPath[generatedResolverPlanPath.size() - 1] != '/')
+  {
+    generatedResolverPlanPath.append('/');
+  }
+  generatedResolverPlanPath.append("prodigy-dns-resolver.deployment.plan.v1.json"_ctv);
+  suite.expect(filesHaveEqualBytes(generatedResolverPlanPath,
+                                   installedResolverPlanPath,
+                                   &failure),
+               "installed_bundle_dns_resolver_plan_matches_generated_bytes");
+  suite.expect(failure.size() == 0,
+               "installed_bundle_dns_resolver_plan_comparison_clears_failure");
+  suite.expect(resolverPlanHasExpectedIdentity(installedResolverPlanPath),
+               "installed_bundle_dns_resolver_plan_has_exact_identity");
+
   String installedLibstdcppPath = {};
   installedLibstdcppPath.assign(installPaths.libraryDirectory);
   installedLibstdcppPath.append("/libstdc++.so.6"_ctv);
@@ -340,7 +511,9 @@ int main(void)
       "host.ingress.router.ebpf.o",
       "host.egress.router.ebpf.o",
       "container.ingress.router.ebpf.o",
+      "container.ingress.router.declared.ebpf.o",
       "container.egress.router.ebpf.o",
+      "container.egress.router.declared.ebpf.o",
       "tunnel_to_nic.ebpf.o"};
 
   for (const char *requiredObject : requiredObjects)

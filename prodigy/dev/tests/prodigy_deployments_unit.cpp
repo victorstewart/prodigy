@@ -241,6 +241,71 @@ static bool stringContains(const String& haystack, const char *needle)
   return haystackView.find(needle) != std::string_view::npos;
 }
 
+template <class Operation>
+static bool runDNSProviderOperation(Operation&& operation)
+{
+  CoroutineStack coroutine;
+  bool complete = false;
+  bool success = false;
+  [&]() -> void {
+    success = co_await operation(&coroutine);
+    complete = true;
+  }();
+  return complete && success;
+}
+
+template <class Provider>
+static bool testDNSUpsert(Provider& provider, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
+{
+  return runDNSProviderOperation([&](CoroutineStack *coro) {
+    return provider.upsert(coro, record, credential, failure);
+  });
+}
+
+template <class Provider>
+static bool testDNSRemove(Provider& provider, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
+{
+  return runDNSProviderOperation([&](CoroutineStack *coro) {
+    return provider.remove(coro, record, credential, failure);
+  });
+}
+
+template <class Provider>
+static bool testDNSPresentTXT(Provider& provider, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
+{
+  return runDNSProviderOperation([&](CoroutineStack *coro) {
+    return provider.presentTXT(coro, record, credential, failure);
+  });
+}
+
+template <class Provider>
+static bool testDNSCleanupTXT(Provider& provider, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
+{
+  return runDNSProviderOperation([&](CoroutineStack *coro) {
+    return provider.cleanupTXT(coro, record, credential, failure);
+  });
+}
+
+static const char *dnsHTTPMethodName(MultiCurlClient::Method method)
+{
+  switch (method)
+  {
+    case MultiCurlClient::Method::get:
+      return "GET";
+    case MultiCurlClient::Method::head:
+      return "HEAD";
+    case MultiCurlClient::Method::post:
+      return "POST";
+    case MultiCurlClient::Method::put:
+      return "PUT";
+    case MultiCurlClient::Method::patch:
+      return "PATCH";
+    case MultiCurlClient::Method::delete_:
+      return "DELETE";
+  }
+  return "";
+}
+
 class CapturedDNSHTTPRequest {
 public:
 
@@ -260,16 +325,16 @@ public:
 
 protected:
 
-  bool sendHTTP(ProdigyDNSHTTPRequest& request, String& response, long& httpCode, String& failure) override
+  ProdigyHostTask<bool> sendHTTP(CoroutineStack *, ProdigyDNSHTTPRequest& request, String& response, long& httpCode, String& failure) override
   {
     CapturedDNSHTTPRequest captured = {};
-    captured.method = request.method;
+    captured.method.assign(dnsHTTPMethodName(request.method));
     captured.url = request.url;
     captured.body = request.body;
-    for (curl_slist *header = request.headers; header != nullptr; header = header->next)
+    for (const MultiCurlClient::Header& header : request.headers)
     {
       String value = {};
-      value.assign(header->data);
+      value.snprintf<"{}: {}"_ctv>(header.name, header.value);
       captured.headers.push_back(value);
     }
     uint64_t index = requests.size();
@@ -284,7 +349,7 @@ protected:
     }
     httpCode = index < httpCodes.size() ? httpCodes[index] : 200;
     failure.clear();
-    return true;
+    co_return true;
   }
 };
 
@@ -305,24 +370,32 @@ public:
 
 protected:
 
-  bool sendAWS(const char *requestMethod, const String& requestURL, const String& requestRegion, const AwsCredentialMaterial& credential, const String *requestBody, String& response, long& httpCode) override
+  ProdigyHostTask<bool> sendAWS(CoroutineStack *,
+                                MultiCurlClient::Method requestMethod,
+                                const AwsHttpRequest::Target& target,
+                                const AwsCredentialMaterial& credential,
+                                const String *requestBody,
+                                String& response,
+                                long& httpCode,
+                                String& failure) override
   {
     (void)credential;
     CapturedDNSHTTPRequest captured = {};
-    captured.method.assign(requestMethod);
-    captured.url = requestURL;
+    captured.method.assign(dnsHTTPMethodName(requestMethod));
+    captured.url = target.path;
     if (requestBody != nullptr)
     {
       captured.body = *requestBody;
     }
     uint64_t index = requests.size();
     requests.push_back(captured);
-    url = requestURL;
-    region = requestRegion;
+    url = target.path;
+    region = target.region;
     body = requestBody == nullptr ? String() : *requestBody;
     response = index < responses.size() ? responses[index] : String("<ok/>"_ctv);
     httpCode = index < httpCodes.size() ? httpCodes[index] : 200;
-    return true;
+    failure.clear();
+    co_return true;
   }
 };
 
@@ -334,16 +407,16 @@ public:
     return provider.equal("address-only"_ctv);
   }
 
-  bool upsert(const ProdigyDNSRecordBinding&, const ApiCredential&, String& failure) override
+  ProdigyHostTask<bool> upsert(CoroutineStack *, const ProdigyDNSRecordBinding&, const ApiCredential&, String& failure) override
   {
     failure.clear();
-    return true;
+    co_return true;
   }
 
-  bool remove(const ProdigyDNSRecordBinding&, const ApiCredential&, String& failure) override
+  ProdigyHostTask<bool> remove(CoroutineStack *, const ProdigyDNSRecordBinding&, const ApiCredential&, String& failure) override
   {
     failure.clear();
-    return true;
+    co_return true;
   }
 };
 
@@ -675,7 +748,7 @@ int main(void)
     RecordingCloudflareDNSProvider cloudflare = {};
     cloudflare.responses.push_back("{\"result\":[]}"_ctv);
     cloudflare.responses.push_back("{\"success\":true}"_ctv);
-    suite.expect(cloudflare.upsert(record, credential, failure), "dns_provider_cloudflare_create_succeeds");
+    suite.expect(testDNSUpsert(cloudflare, record, credential, failure), "dns_provider_cloudflare_create_succeeds");
     suite.expect(cloudflare.requests.size() == 2, "dns_provider_cloudflare_create_lists_then_writes");
     suite.expect(cloudflare.requests.size() == 2 && cloudflare.requests[0].method.equal("GET"_ctv), "dns_provider_cloudflare_create_lists");
     suite.expect(cloudflare.requests.size() == 2 && stringContains(cloudflare.requests[0].url, "name=api.example.com"), "dns_provider_cloudflare_create_query_omits_trailing_dot");
@@ -685,14 +758,14 @@ int main(void)
 
     RecordingCloudflareDNSProvider cloudflareConflict = {};
     cloudflareConflict.responses.push_back("{\"result\":[{\"id\":\"rec-2\",\"type\":\"A\",\"name\":\"api.example.com\",\"content\":\"203.0.113.11\"}]}"_ctv);
-    suite.expect(cloudflareConflict.upsert(record, credential, failure) == false, "dns_provider_cloudflare_rejects_existing_different_record");
+    suite.expect(testDNSUpsert(cloudflareConflict, record, credential, failure) == false, "dns_provider_cloudflare_rejects_existing_different_record");
     suite.expect(failure.equal("DNS record already exists with different value"_ctv), "dns_provider_cloudflare_conflict_failure_text");
     suite.expect(cloudflareConflict.requests.size() == 1, "dns_provider_cloudflare_conflict_does_not_write");
 
     RecordingCloudflareDNSProvider cloudflareDelete = {};
     cloudflareDelete.responses.push_back("{\"result\":[{\"id\":\"rec-1\",\"type\":\"A\",\"name\":\"api.example.com.\",\"content\":\"203.0.113.10\"}]}"_ctv);
     cloudflareDelete.responses.push_back("{}"_ctv);
-    suite.expect(cloudflareDelete.remove(record, credential, failure), "dns_provider_cloudflare_delete_succeeds");
+    suite.expect(testDNSRemove(cloudflareDelete, record, credential, failure), "dns_provider_cloudflare_delete_succeeds");
     suite.expect(cloudflareDelete.requests.size() == 2 && cloudflareDelete.requests[1].method.equal("DELETE"_ctv), "dns_provider_cloudflare_delete_uses_record_id");
     suite.expect(cloudflareDelete.requests.size() == 2 && stringContains(cloudflareDelete.requests[1].url, "/rec-1"), "dns_provider_cloudflare_delete_url_contains_record_id");
 
@@ -700,7 +773,7 @@ int main(void)
     record.provider = "route53"_ctv;
     record.zone = "/hostedzone/Z123"_ctv;
     credential.material = "AKIA:SECRET"_ctv;
-    suite.expect(route53.upsert(record, credential, failure), "dns_provider_route53_upsert_succeeds");
+    suite.expect(testDNSUpsert(route53, record, credential, failure), "dns_provider_route53_upsert_succeeds");
     suite.expect(route53.requests.size() == 2, "dns_provider_route53_upsert_lists_then_writes");
     suite.expect(route53.requests.size() == 2 && route53.requests[0].method.equal("GET"_ctv), "dns_provider_route53_upsert_lists_first");
     suite.expect(route53.requests.size() == 2 && route53.requests[1].method.equal("POST"_ctv), "dns_provider_route53_upsert_posts_change");
@@ -711,9 +784,16 @@ int main(void)
 
     RecordingRoute53DNSProvider route53Conflict = {};
     route53Conflict.responses.push_back("<ListResourceRecordSetsResponse><ResourceRecordSets><ResourceRecordSet><Name>api.example.com.</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>203.0.113.11</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></ResourceRecordSets></ListResourceRecordSetsResponse>"_ctv);
-    suite.expect(route53Conflict.upsert(record, credential, failure) == false, "dns_provider_route53_rejects_existing_different_record");
+    suite.expect(testDNSUpsert(route53Conflict, record, credential, failure) == false, "dns_provider_route53_rejects_existing_different_record");
     suite.expect(failure.equal("DNS record already exists with different value"_ctv), "dns_provider_route53_conflict_failure_text");
     suite.expect(route53Conflict.requests.size() == 1, "dns_provider_route53_conflict_does_not_write");
+
+    RecordingRoute53DNSProvider route53TTLMismatch = {};
+    route53TTLMismatch.responses.push_back("<ListResourceRecordSetsResponse><ResourceRecordSets><ResourceRecordSet><Name>api.example.com.</Name><Type>A</Type><TTL>301</TTL><ResourceRecords><ResourceRecord><Value>203.0.113.10</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></ResourceRecordSets></ListResourceRecordSetsResponse>"_ctv);
+    suite.expect(testDNSUpsert(route53TTLMismatch, record, credential, failure) == false,
+                 "dns_provider_route53_rejects_existing_different_ttl");
+    suite.expect(route53TTLMismatch.requests.size() == 1,
+                 "dns_provider_route53_ttl_conflict_does_not_write");
 
     RecordingGcpCloudDNSProvider gcp = {};
     record.provider = "gcp-cloud-dns"_ctv;
@@ -724,13 +804,13 @@ int main(void)
     credential.metadata["bearerRefreshCommand"_ctv] = "printf refreshed-gcp"_ctv;
     gcp.responses.push_back("{\"rrsets\":[]}"_ctv);
     gcp.responses.push_back("{\"id\":\"change-1\"}"_ctv);
-    suite.expect(gcp.upsert(record, credential, failure), "dns_provider_gcp_create_succeeds");
+    suite.expect(testDNSUpsert(gcp, record, credential, failure), "dns_provider_gcp_create_succeeds");
     suite.expect(gcp.requests.size() == 2 && gcp.requests[0].method.equal("GET"_ctv) && gcp.requests[1].method.equal("POST"_ctv), "dns_provider_gcp_lists_then_writes");
     suite.expect(gcp.requests.size() == 2 && gcp.requests[0].headers.size() == 1 && gcp.requests[0].headers[0].equal("Authorization: Bearer refreshed-gcp"_ctv), "dns_provider_gcp_refresh_command_supplies_bearer");
 
     RecordingGcpCloudDNSProvider gcpConflict = {};
     gcpConflict.responses.push_back("{\"rrsets\":[{\"name\":\"api.example.com.\",\"type\":\"A\",\"rrdatas\":[\"203.0.113.11\"]}]}"_ctv);
-    suite.expect(gcpConflict.upsert(record, credential, failure) == false, "dns_provider_gcp_rejects_existing_different_record");
+    suite.expect(testDNSUpsert(gcpConflict, record, credential, failure) == false, "dns_provider_gcp_rejects_existing_different_record");
     suite.expect(gcpConflict.requests.size() == 1, "dns_provider_gcp_conflict_does_not_write");
 
     RecordingAzureDNSProvider azure = {};
@@ -745,20 +825,20 @@ int main(void)
     azure.httpCodes.push_back(200);
     azure.responses.push_back("{}"_ctv);
     azure.responses.push_back("{}"_ctv);
-    suite.expect(azure.upsert(record, credential, failure), "dns_provider_azure_create_succeeds");
+    suite.expect(testDNSUpsert(azure, record, credential, failure), "dns_provider_azure_create_succeeds");
     suite.expect(azure.requests.size() == 2 && azure.requests[0].method.equal("GET"_ctv) && azure.requests[1].method.equal("PUT"_ctv), "dns_provider_azure_gets_then_writes");
     suite.expect(azure.requests.size() == 2 && azure.requests[0].headers.size() == 1 && azure.requests[0].headers[0].equal("Authorization: Bearer refreshed-azure"_ctv), "dns_provider_azure_refresh_command_supplies_bearer");
 
     RecordingAzureDNSProvider azureConflict = {};
     azureConflict.responses.push_back("{\"properties\":{\"ARecords\":[{\"ipv4Address\":\"203.0.113.11\"}]}}"_ctv);
-    suite.expect(azureConflict.upsert(record, credential, failure) == false, "dns_provider_azure_rejects_existing_different_record");
+    suite.expect(testDNSUpsert(azureConflict, record, credential, failure) == false, "dns_provider_azure_rejects_existing_different_record");
     suite.expect(azureConflict.requests.size() == 1, "dns_provider_azure_conflict_does_not_write");
 
     RecordingVultrDNSProvider vultrConflict = {};
     record.provider = "vultr-dns"_ctv;
     credential.metadata.clear();
     vultrConflict.responses.push_back("{\"records\":[{\"id\":\"rec-3\",\"type\":\"A\",\"name\":\"api\",\"data\":\"203.0.113.11\"}]}"_ctv);
-    suite.expect(vultrConflict.upsert(record, credential, failure) == false, "dns_provider_vultr_rejects_existing_different_record");
+    suite.expect(testDNSUpsert(vultrConflict, record, credential, failure) == false, "dns_provider_vultr_rejects_existing_different_record");
     suite.expect(vultrConflict.requests.size() == 1, "dns_provider_vultr_conflict_does_not_write");
 
     ProdigyDNSRecordBinding txt = {};
@@ -769,8 +849,8 @@ int main(void)
     txt.ttl = 60;
 
     AddressOnlyDNSProvider addressOnly = {};
-    suite.expect(addressOnly.presentTXT(txt, credential, failure) == false && failure.equal("DNS provider does not implement ACME TXT present"_ctv), "dns_provider_base_present_txt_fails_closed");
-    suite.expect(addressOnly.cleanupTXT(txt, credential, failure) == false && failure.equal("DNS provider does not implement ACME TXT cleanup"_ctv), "dns_provider_base_cleanup_txt_fails_closed");
+    suite.expect(testDNSPresentTXT(addressOnly, txt, credential, failure) == false && failure.equal("DNS provider does not implement ACME TXT present"_ctv), "dns_provider_base_present_txt_fails_closed");
+    suite.expect(testDNSCleanupTXT(addressOnly, txt, credential, failure) == false && failure.equal("DNS provider does not implement ACME TXT cleanup"_ctv), "dns_provider_base_cleanup_txt_fails_closed");
 
     RecordingCloudflareDNSProvider cloudflareTXT = {};
     txt.provider = "cloudflare"_ctv;
@@ -778,18 +858,18 @@ int main(void)
     credential.metadata.clear();
     cloudflareTXT.responses.push_back("{\"result\":[{\"id\":\"old\",\"type\":\"TXT\",\"name\":\"_acme-challenge.api.example.com.\",\"content\":\"old-token\"}]}"_ctv);
     cloudflareTXT.responses.push_back("{\"success\":true}"_ctv);
-    suite.expect(cloudflareTXT.presentTXT(txt, credential, failure), "dns_provider_cloudflare_present_txt_ignores_sibling_value");
+    suite.expect(testDNSPresentTXT(cloudflareTXT, txt, credential, failure), "dns_provider_cloudflare_present_txt_ignores_sibling_value");
     suite.expect(cloudflareTXT.requests.size() == 2 && cloudflareTXT.requests[1].method.equal("POST"_ctv), "dns_provider_cloudflare_present_txt_posts_missing_exact_value");
 
     RecordingCloudflareDNSProvider cloudflareTXTCleanup = {};
     cloudflareTXTCleanup.responses.push_back("{\"result\":[{\"id\":\"old\",\"type\":\"TXT\",\"name\":\"_acme-challenge.api.example.com.\",\"content\":\"old-token\"},{\"id\":\"new\",\"type\":\"TXT\",\"name\":\"_acme-challenge.api.example.com.\",\"content\":\"token-1\"}]}"_ctv);
     cloudflareTXTCleanup.responses.push_back("{}"_ctv);
-    suite.expect(cloudflareTXTCleanup.cleanupTXT(txt, credential, failure), "dns_provider_cloudflare_cleanup_txt_removes_exact_value");
+    suite.expect(testDNSCleanupTXT(cloudflareTXTCleanup, txt, credential, failure), "dns_provider_cloudflare_cleanup_txt_removes_exact_value");
     suite.expect(cloudflareTXTCleanup.requests.size() == 2 && stringContains(cloudflareTXTCleanup.requests[1].url, "/new"), "dns_provider_cloudflare_cleanup_txt_uses_exact_record_id");
 
     RecordingCloudflareDNSProvider cloudflareTXTMissingCleanup = {};
     cloudflareTXTMissingCleanup.responses.push_back("{\"result\":[{\"id\":\"old\",\"type\":\"TXT\",\"name\":\"_acme-challenge.api.example.com.\",\"content\":\"old-token\"}]}"_ctv);
-    suite.expect(cloudflareTXTMissingCleanup.cleanupTXT(txt, credential, failure), "dns_provider_cloudflare_cleanup_txt_missing_exact_value_succeeds");
+    suite.expect(testDNSCleanupTXT(cloudflareTXTMissingCleanup, txt, credential, failure), "dns_provider_cloudflare_cleanup_txt_missing_exact_value_succeeds");
     suite.expect(cloudflareTXTMissingCleanup.requests.size() == 1, "dns_provider_cloudflare_cleanup_txt_missing_exact_value_does_not_delete");
 
     RecordingRoute53DNSProvider route53TXT = {};
@@ -797,7 +877,7 @@ int main(void)
     txt.zone = "/hostedzone/Z123"_ctv;
     credential.material = "AKIA:SECRET"_ctv;
     route53TXT.responses.push_back("<ListResourceRecordSetsResponse><ResourceRecordSets><ResourceRecordSet><Name>_acme-challenge.api.example.com.</Name><Type>TXT</Type><TTL>60</TTL><ResourceRecords><ResourceRecord><Value>\"old-token\"</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></ResourceRecordSets></ListResourceRecordSetsResponse>"_ctv);
-    suite.expect(route53TXT.presentTXT(txt, credential, failure), "dns_provider_route53_present_txt_merges_rrset");
+    suite.expect(testDNSPresentTXT(route53TXT, txt, credential, failure), "dns_provider_route53_present_txt_merges_rrset");
     suite.expect(stringContains(route53TXT.body, "<Action>UPSERT</Action>"), "dns_provider_route53_present_txt_upserts");
     suite.expect(stringContains(route53TXT.body, "<Value>&quot;old-token&quot;</Value>") && stringContains(route53TXT.body, "<Value>&quot;token-1&quot;</Value>"), "dns_provider_route53_present_txt_preserves_sibling");
 
@@ -805,17 +885,17 @@ int main(void)
     ProdigyDNSRecordBinding xmlTXT = txt;
     xmlTXT.values.clear();
     xmlTXT.values.push_back("token&<\"quote"_ctv);
-    suite.expect(route53TXTXML.presentTXT(xmlTXT, credential, failure), "dns_provider_route53_present_txt_xml_escapes");
+    suite.expect(testDNSPresentTXT(route53TXTXML, xmlTXT, credential, failure), "dns_provider_route53_present_txt_xml_escapes");
     suite.expect(stringContains(route53TXTXML.body, "<Value>&quot;token&amp;&lt;\\&quot;quote&quot;</Value>"), "dns_provider_route53_present_txt_xml_escaped_value");
 
     RecordingRoute53DNSProvider route53TXTCleanup = {};
     route53TXTCleanup.responses.push_back("<ListResourceRecordSetsResponse><ResourceRecordSets><ResourceRecordSet><Name>_acme-challenge.api.example.com.</Name><Type>TXT</Type><TTL>60</TTL><ResourceRecords><ResourceRecord><Value>\"old-token\"</Value></ResourceRecord><ResourceRecord><Value>\"token-1\"</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></ResourceRecordSets></ListResourceRecordSetsResponse>"_ctv);
-    suite.expect(route53TXTCleanup.cleanupTXT(txt, credential, failure), "dns_provider_route53_cleanup_txt_preserves_sibling");
+    suite.expect(testDNSCleanupTXT(route53TXTCleanup, txt, credential, failure), "dns_provider_route53_cleanup_txt_preserves_sibling");
     suite.expect(stringContains(route53TXTCleanup.body, "<Action>UPSERT</Action>") && stringContains(route53TXTCleanup.body, "<Value>&quot;old-token&quot;</Value>") && stringContains(route53TXTCleanup.body, "<Value>&quot;token-1&quot;</Value>") == false, "dns_provider_route53_cleanup_txt_removes_exact_value");
 
     RecordingRoute53DNSProvider route53TXTDelete = {};
     route53TXTDelete.responses.push_back("<ListResourceRecordSetsResponse><ResourceRecordSets><ResourceRecordSet><Name>_acme-challenge.api.example.com.</Name><Type>TXT</Type><TTL>60</TTL><ResourceRecords><ResourceRecord><Value>\"token-1\"</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></ResourceRecordSets></ListResourceRecordSetsResponse>"_ctv);
-    suite.expect(route53TXTDelete.cleanupTXT(txt, credential, failure), "dns_provider_route53_cleanup_txt_deletes_empty_rrset");
+    suite.expect(testDNSCleanupTXT(route53TXTDelete, txt, credential, failure), "dns_provider_route53_cleanup_txt_deletes_empty_rrset");
     suite.expect(stringContains(route53TXTDelete.body, "<Action>DELETE</Action>") && stringContains(route53TXTDelete.body, "<Value>&quot;token-1&quot;</Value>"), "dns_provider_route53_cleanup_txt_delete_body_targets_old_rrset");
 
     RecordingGcpCloudDNSProvider gcpTXT = {};
@@ -827,7 +907,7 @@ int main(void)
     credential.metadata["bearerRefreshCommand"_ctv] = "printf refreshed-gcp-txt"_ctv;
     gcpTXT.responses.push_back("{\"rrsets\":[{\"name\":\"_acme-challenge.api.example.com.\",\"type\":\"TXT\",\"ttl\":60,\"rrdatas\":[\"\\\"old-token\\\"\"]}]}"_ctv);
     gcpTXT.responses.push_back("{\"id\":\"change-1\"}"_ctv);
-    suite.expect(gcpTXT.presentTXT(txt, credential, failure), "dns_provider_gcp_present_txt_merges_rrset");
+    suite.expect(testDNSPresentTXT(gcpTXT, txt, credential, failure), "dns_provider_gcp_present_txt_merges_rrset");
     suite.expect(gcpTXT.requests.size() == 2 && stringContains(gcpTXT.requests[1].body, "\"deletions\"") && stringContains(gcpTXT.requests[1].body, "\"additions\""), "dns_provider_gcp_present_txt_replaces_rrset");
     suite.expect(stringContains(gcpTXT.requests[1].body, "\\\"old-token\\\"") && stringContains(gcpTXT.requests[1].body, "\\\"token-1\\\""), "dns_provider_gcp_present_txt_preserves_sibling");
     suite.expect(gcpTXT.requests.size() == 2 && gcpTXT.requests[0].headers.size() == 1 && gcpTXT.requests[1].headers.size() == 2 && gcpTXT.requests[0].headers[0].equal("Authorization: Bearer refreshed-gcp-txt"_ctv) && gcpTXT.requests[1].headers[1].equal("Authorization: Bearer refreshed-gcp-txt"_ctv), "dns_provider_gcp_present_txt_refreshes_bearer");
@@ -835,14 +915,14 @@ int main(void)
     RecordingGcpCloudDNSProvider gcpTXTCleanup = {};
     gcpTXTCleanup.responses.push_back("{\"rrsets\":[{\"name\":\"_acme-challenge.api.example.com.\",\"type\":\"TXT\",\"ttl\":60,\"rrdatas\":[\"\\\"old-token\\\"\",\"\\\"token-1\\\"\"]}]}"_ctv);
     gcpTXTCleanup.responses.push_back("{\"id\":\"change-2\"}"_ctv);
-    suite.expect(gcpTXTCleanup.cleanupTXT(txt, credential, failure), "dns_provider_gcp_cleanup_txt_preserves_sibling");
+    suite.expect(testDNSCleanupTXT(gcpTXTCleanup, txt, credential, failure), "dns_provider_gcp_cleanup_txt_preserves_sibling");
     suite.expect(gcpTXTCleanup.requests.size() == 2 && stringContains(gcpTXTCleanup.requests[1].body, "\"deletions\"") && stringContains(gcpTXTCleanup.requests[1].body, "\"additions\""), "dns_provider_gcp_cleanup_txt_replaces_rrset");
     suite.expect(stringContains(gcpTXTCleanup.requests[1].body, "\\\"old-token\\\"") && stringContains(gcpTXTCleanup.requests[1].body, "\\\"token-1\\\""), "dns_provider_gcp_cleanup_txt_delete_mentions_old_rrset");
 
     RecordingGcpCloudDNSProvider gcpTXTDelete = {};
     gcpTXTDelete.responses.push_back("{\"rrsets\":[{\"name\":\"_acme-challenge.api.example.com.\",\"type\":\"TXT\",\"ttl\":60,\"rrdatas\":[\"\\\"token-1\\\"\"]}]}"_ctv);
     gcpTXTDelete.responses.push_back("{\"id\":\"change-3\"}"_ctv);
-    suite.expect(gcpTXTDelete.cleanupTXT(txt, credential, failure), "dns_provider_gcp_cleanup_txt_deletes_empty_rrset");
+    suite.expect(testDNSCleanupTXT(gcpTXTDelete, txt, credential, failure), "dns_provider_gcp_cleanup_txt_deletes_empty_rrset");
     suite.expect(gcpTXTDelete.requests.size() == 2 && stringContains(gcpTXTDelete.requests[1].body, "\"deletions\"") && stringContains(gcpTXTDelete.requests[1].body, "\"additions\"") == false, "dns_provider_gcp_cleanup_txt_delete_omits_empty_additions");
 
     RecordingAzureDNSProvider azureTXT = {};
@@ -854,7 +934,7 @@ int main(void)
     credential.metadata["bearerRefreshCommand"_ctv] = "printf refreshed-azure-txt"_ctv;
     azureTXT.responses.push_back("{\"properties\":{\"TXTRecords\":[{\"value\":[\"old-token\"]}]}}"_ctv);
     azureTXT.responses.push_back("{}"_ctv);
-    suite.expect(azureTXT.presentTXT(txt, credential, failure), "dns_provider_azure_present_txt_merges_rrset");
+    suite.expect(testDNSPresentTXT(azureTXT, txt, credential, failure), "dns_provider_azure_present_txt_merges_rrset");
     suite.expect(azureTXT.requests.size() == 2 && azureTXT.requests[1].method.equal("PUT"_ctv), "dns_provider_azure_present_txt_puts_rrset");
     suite.expect(stringContains(azureTXT.requests[1].body, "\"TXTRecords\"") && stringContains(azureTXT.requests[1].body, "\"old-token\"") && stringContains(azureTXT.requests[1].body, "\"token-1\""), "dns_provider_azure_present_txt_preserves_sibling");
     suite.expect(azureTXT.requests.size() == 2 && azureTXT.requests[0].headers.size() == 1 && azureTXT.requests[1].headers.size() == 2 && azureTXT.requests[0].headers[0].equal("Authorization: Bearer refreshed-azure-txt"_ctv) && azureTXT.requests[1].headers[1].equal("Authorization: Bearer refreshed-azure-txt"_ctv), "dns_provider_azure_present_txt_refreshes_bearer");
@@ -862,14 +942,14 @@ int main(void)
     RecordingAzureDNSProvider azureTXTCleanup = {};
     azureTXTCleanup.responses.push_back("{\"properties\":{\"TXTRecords\":[{\"value\":[\"old-token\"]},{\"value\":[\"token-1\"]}]}}"_ctv);
     azureTXTCleanup.responses.push_back("{}"_ctv);
-    suite.expect(azureTXTCleanup.cleanupTXT(txt, credential, failure), "dns_provider_azure_cleanup_txt_preserves_sibling");
+    suite.expect(testDNSCleanupTXT(azureTXTCleanup, txt, credential, failure), "dns_provider_azure_cleanup_txt_preserves_sibling");
     suite.expect(azureTXTCleanup.requests.size() == 2 && azureTXTCleanup.requests[1].method.equal("PUT"_ctv), "dns_provider_azure_cleanup_txt_puts_remaining_rrset");
     suite.expect(stringContains(azureTXTCleanup.requests[1].body, "\"old-token\"") && stringContains(azureTXTCleanup.requests[1].body, "\"token-1\"") == false, "dns_provider_azure_cleanup_txt_removes_exact_value");
 
     RecordingAzureDNSProvider azureTXTDelete = {};
     azureTXTDelete.responses.push_back("{\"properties\":{\"TXTRecords\":[{\"value\":[\"token-1\"]}]}}"_ctv);
     azureTXTDelete.responses.push_back("{}"_ctv);
-    suite.expect(azureTXTDelete.cleanupTXT(txt, credential, failure), "dns_provider_azure_cleanup_txt_deletes_empty_rrset");
+    suite.expect(testDNSCleanupTXT(azureTXTDelete, txt, credential, failure), "dns_provider_azure_cleanup_txt_deletes_empty_rrset");
     suite.expect(azureTXTDelete.requests.size() == 2 && azureTXTDelete.requests[1].method.equal("DELETE"_ctv), "dns_provider_azure_cleanup_txt_delete_uses_delete");
 
     RecordingVultrDNSProvider vultrTXT = {};
@@ -878,12 +958,12 @@ int main(void)
     credential.metadata.clear();
     vultrTXT.responses.push_back("{\"records\":[{\"id\":\"old\",\"type\":\"TXT\",\"name\":\"_acme-challenge.api\",\"data\":\"old-token\"}]}"_ctv);
     vultrTXT.responses.push_back("{}"_ctv);
-    suite.expect(vultrTXT.presentTXT(txt, credential, failure), "dns_provider_vultr_present_txt_ignores_sibling_value");
+    suite.expect(testDNSPresentTXT(vultrTXT, txt, credential, failure), "dns_provider_vultr_present_txt_ignores_sibling_value");
     suite.expect(vultrTXT.requests.size() == 2 && vultrTXT.requests[1].method.equal("POST"_ctv), "dns_provider_vultr_present_txt_posts_missing_exact_value");
 
     RecordingVultrDNSProvider vultrTXTMissingCleanup = {};
     vultrTXTMissingCleanup.responses.push_back("{\"records\":[{\"id\":\"old\",\"type\":\"TXT\",\"name\":\"_acme-challenge.api\",\"data\":\"old-token\"}]}"_ctv);
-    suite.expect(vultrTXTMissingCleanup.cleanupTXT(txt, credential, failure), "dns_provider_vultr_cleanup_txt_missing_exact_value_succeeds");
+    suite.expect(testDNSCleanupTXT(vultrTXTMissingCleanup, txt, credential, failure), "dns_provider_vultr_cleanup_txt_missing_exact_value_succeeds");
     suite.expect(vultrTXTMissingCleanup.requests.size() == 1, "dns_provider_vultr_cleanup_txt_missing_exact_value_does_not_delete");
   }
 
@@ -3171,6 +3251,8 @@ int main(void)
     plan.config.minInternetDownloadMbps = 500;
     plan.config.minInternetUploadMbps = 250;
     plan.config.maxInternetLatencyMs = 20;
+    plan.config.maxPids = 5;
+    plan.config.isolatedChildMemoryMB = 64;
     plan.stateful.clientPrefix = 101;
     plan.stateful.siblingPrefix = 102;
     plan.stateful.cousinPrefix = 103;
@@ -3181,6 +3263,7 @@ int main(void)
     plan.stateful.neverShard = false;
     plan.stateful.allMasters = true;
     plan.useHostNetworkNamespace = true;
+    plan.networkAccess = ContainerNetworkAccess::declaredOnly;
     plan.hasTlsIssuancePolicy = true;
     plan.tlsIssuancePolicy.applicationID = 42;
     plan.tlsIssuancePolicy.enablePerContainerLeafs = true;
@@ -3214,10 +3297,14 @@ int main(void)
     suite.expect(roundtrip.config.minInternetDownloadMbps == 500, "deployment_plan_roundtrip_preserves_min_internet_download");
     suite.expect(roundtrip.config.minInternetUploadMbps == 250, "deployment_plan_roundtrip_preserves_min_internet_upload");
     suite.expect(roundtrip.config.maxInternetLatencyMs == 20, "deployment_plan_roundtrip_preserves_max_internet_latency");
+    suite.expect(roundtrip.config.maxPids == 5, "deployment_plan_roundtrip_preserves_max_pids");
+    suite.expect(roundtrip.config.isolatedChildMemoryMB == 64,
+                 "deployment_plan_roundtrip_preserves_isolated_child_memory");
     suite.expect(roundtrip.config.containerBlobSHA256.equals(plan.config.containerBlobSHA256), "deployment_plan_roundtrip_preserves_container_blob_sha256");
     suite.expect(roundtrip.config.containerBlobBytes == plan.config.containerBlobBytes, "deployment_plan_roundtrip_preserves_container_blob_bytes");
     suite.expect(roundtrip.stateful.allMasters == true, "deployment_plan_roundtrip_preserves_all_masters");
     suite.expect(roundtrip.useHostNetworkNamespace == true, "deployment_plan_roundtrip_preserves_host_network_namespace");
+    suite.expect(roundtrip.networkAccess == ContainerNetworkAccess::declaredOnly, "deployment_plan_roundtrip_preserves_network_access");
     suite.expect(roundtrip.hasTlsIssuancePolicy, "deployment_plan_roundtrip_preserves_tls_policy_flag");
     suite.expect(roundtrip.tlsIssuancePolicy.identityNames.size() == 1, "deployment_plan_roundtrip_preserves_tls_identity_count");
     suite.expect(roundtrip.tlsIssuancePolicy.dnsSans.size() == 2, "deployment_plan_roundtrip_preserves_tls_dns_san_count");
@@ -3315,6 +3402,7 @@ int main(void)
     plan.config.applicationID = 88;
     plan.fragment = 9;
     plan.useHostNetworkNamespace = true;
+    plan.networkAccess = ContainerNetworkAccess::declaredOnly;
     plan.restartOnFailure = true;
     plan.runtimeReady = true;
     plan.isStateful = true;
@@ -3362,6 +3450,7 @@ int main(void)
 
     suite.expect(decoded, "container_plan_roundtrip_deserializes");
     suite.expect(roundtrip.useHostNetworkNamespace == true, "container_plan_roundtrip_preserves_host_network_namespace");
+    suite.expect(roundtrip.networkAccess == ContainerNetworkAccess::declaredOnly, "container_plan_roundtrip_preserves_network_access");
     suite.expect(roundtrip.runtimeReady == true, "container_plan_roundtrip_preserves_runtime_ready");
     suite.expect(roundtrip.fragment == 9, "container_plan_roundtrip_preserves_fragment");
     suite.expect(roundtrip.shardGroup == 3, "container_plan_roundtrip_preserves_shard_group");
@@ -3609,6 +3698,7 @@ int main(void)
     container.state = ContainerState::scheduled;
     container.createdAtMs = 123'456;
     container.shardGroup = 7;
+    container.networkAccess = ContainerNetworkAccess::declaredOnly;
     container.assignedGPUMemoryMBs.push_back(24 * 1024u);
     AssignedGPUDevice assignedGPU = {};
     assignedGPU.vendor = "nvidia"_ctv;
@@ -3619,6 +3709,7 @@ int main(void)
 
     ContainerPlan plan = container.generatePlan(deploymentPlan);
     suite.expect(plan.useHostNetworkNamespace == true, "containerview_generatePlan_preserves_host_network_namespace");
+    suite.expect(plan.networkAccess == ContainerNetworkAccess::declaredOnly, "containerview_generatePlan_preserves_network_access");
     suite.expect(plan.requiresDatacenterUniqueTag == true, "containerview_generatePlan_preserves_unique_tag");
     suite.expect(plan.fragment == 17, "containerview_generatePlan_preserves_fragment");
     suite.expect(plan.assignedGPUMemoryMBs.size() == 1 && plan.assignedGPUMemoryMBs[0] == 24 * 1024u, "containerview_generatePlan_preserves_assigned_gpu_memory");
@@ -4585,7 +4676,7 @@ int main(void)
                  "whitehole_ip_port_reserve_rejects_leased_tuple_for_other_owner");
 
     candidate.sourcePort = 0;
-    suite.expect(ApplicationDeployment::allocateWhiteholeSourcePort(candidate, &leaseOwner),
+    suite.expect(ApplicationDeployment::allocateWhiteholeSourcePort(candidate),
                  "whitehole_source_port_allocator_skips_runtime_lease_conflict");
     suite.expect(candidate.sourcePort == uint16_t(existing.sourcePort + 1),
                  "whitehole_source_port_allocator_reuses_ip_after_leased_port");
@@ -6468,6 +6559,79 @@ int main(void)
   }
 
   {
+    ApplicationConfig config {};
+    suite.expect(config.maxPids == prodigyContainerRuntimeLimits.maxPids,
+                 "application_config_max_pids_preserves_existing_default");
+    String json = "{\"maxPids\":5}"_ctv;
+    json.need(simdjson::SIMDJSON_PADDING);
+    simdjson::dom::parser parser;
+    simdjson::dom::element document;
+    bool parsed = false;
+    if (parser.parse(json.data(), json.size()).get(document) == simdjson::SUCCESS)
+    {
+      for (auto field : document.get_object())
+      {
+        String failure = {};
+        parsed = mothershipParseApplicationMaxPids(
+            field.value, config, "config"_ctv, &failure);
+        suite.expect(failure.empty(), "mothership_parse_max_pids_no_failure");
+      }
+    }
+    suite.expect(parsed && config.maxPids == 5,
+                 "mothership_parse_max_pids_accepts_explicit_limit");
+
+    String invalid = "{\"maxPids\":0}"_ctv;
+    invalid.need(simdjson::SIMDJSON_PADDING);
+    if (parser.parse(invalid.data(), invalid.size()).get(document) == simdjson::SUCCESS)
+    {
+      for (auto field : document.get_object())
+      {
+        String failure = {};
+        suite.expect(mothershipParseApplicationMaxPids(
+                         field.value, config, "config"_ctv, &failure) == false,
+                     "mothership_parse_max_pids_rejects_zero");
+      }
+    }
+  }
+
+  for (const char *text : {
+           "{\"isolatedChildMemoryMB\":64,\"maxPids\":5}",
+           "{\"maxPids\":5,\"isolatedChildMemoryMB\":64}"})
+  {
+    ApplicationConfig config {};
+    config.architecture = MachineCpuArchitecture::aarch64;
+    String json(text);
+    json.need(simdjson::SIMDJSON_PADDING);
+    simdjson::dom::parser parser;
+    simdjson::dom::element document;
+    bool parsed = parser.parse(json.data(), json.size()).get(document) == simdjson::SUCCESS;
+    if (parsed)
+    {
+      for (auto field : document.get_object())
+      {
+        String key;
+        key.setInvariant(field.key.data(), field.key.size());
+        String failure;
+        parsed = key.equal("maxPids"_ctv)
+                     ? mothershipParseApplicationMaxPids(
+                           field.value, config, "config"_ctv, &failure)
+                     : mothershipParseApplicationIsolatedChildMemoryMB(
+                           field.value, config, "config"_ctv, &failure);
+        if (parsed == false)
+        {
+          break;
+        }
+      }
+    }
+    String failure;
+    suite.expect(parsed &&
+                     mothershipValidateApplicationRuntimeRequirements(
+                         config, "config"_ctv, &failure) &&
+                     config.maxPids == 5 && config.isolatedChildMemoryMB == 64,
+                 "isolated_child_config_is_field_order_independent");
+  }
+
+  {
     String json = "{\"sharedCpuOvercommit\":1.5}"_ctv;
     json.need(simdjson::SIMDJSON_PADDING);
 
@@ -7076,7 +7240,7 @@ int main(void)
     suite.expect(ApplicationDeployment::resolveWhiteholeSourceAddressForScheduling(&worker, first, nullptr, nullptr, &ownerA),
                  "whitehole_registered_prefix_resolves_address");
     suite.expect(first.address.equals(IPAddress("198.18.0.1", false)), "whitehole_registered_prefix_uses_first_host_address");
-    suite.expect(ApplicationDeployment::allocateWhiteholeSourcePort(first, &ownerA), "whitehole_registered_prefix_allocates_first_source_port");
+    suite.expect(ApplicationDeployment::allocateWhiteholeSourcePort(first), "whitehole_registered_prefix_allocates_first_source_port");
     suite.expect(first.sourcePort == 49'152, "whitehole_registered_prefix_first_port_is_ephemeral_floor");
     suite.expect(deployment.reserveWhiteholeAddressPortLease(first, ownerA), "whitehole_registered_prefix_reserves_ip_port");
     suite.expect(brain.routableResourceLeaseRuntimeState[0].registeredPrefixUUID == subnet.uuid, "whitehole_registered_prefix_lease_records_prefix_uuid");
@@ -7089,7 +7253,7 @@ int main(void)
     suite.expect(ApplicationDeployment::resolveWhiteholeSourceAddressForScheduling(&worker, second, nullptr, nullptr, &ownerB),
                  "whitehole_registered_prefix_resolves_shared_address");
     suite.expect(second.address.equals(first.address), "whitehole_registered_prefix_shares_address");
-    suite.expect(ApplicationDeployment::allocateWhiteholeSourcePort(second, &ownerB), "whitehole_registered_prefix_allocates_next_source_port");
+    suite.expect(ApplicationDeployment::allocateWhiteholeSourcePort(second), "whitehole_registered_prefix_allocates_next_source_port");
     suite.expect(second.sourcePort == uint16_t(first.sourcePort + 1), "whitehole_registered_prefix_shares_address_with_unique_port");
     suite.expect(deployment.reserveWhiteholeAddressPortLease(second, ownerB), "whitehole_registered_prefix_reserves_shared_ip_distinct_port");
 
@@ -10316,6 +10480,258 @@ int main(void)
     suite.expect(brain.failureCount == 1, "canary_rollback_without_previous_reports_failed_deploy");
 
     thisBrain = savedBrain;
+  }
+
+  {
+    auto parseCount = [](const char *text, uint32_t& count) -> bool {
+      String json = {};
+      json.assign(text);
+      json.need(simdjson::SIMDJSON_PADDING);
+      simdjson::dom::parser parser;
+      simdjson::dom::element document;
+      if (parser.parse(json.data(), json.size()).get(document) != simdjson::SUCCESS)
+      {
+        return false;
+      }
+      for (auto field : document.get_object())
+      {
+        String failure = {};
+        return mothershipParseWhiteholeCount(field.value, count, &failure);
+      }
+      return false;
+    };
+
+    uint32_t count = 0;
+    suite.expect(parseCount("{\"count\":64}", count) && count == 64, "mothership_parse_whitehole_count_accepts_positive_integer");
+    suite.expect(parseCount("{\"count\":0}", count) == false, "mothership_parse_whitehole_count_rejects_zero");
+    suite.expect(parseCount("{\"count\":-1}", count) == false, "mothership_parse_whitehole_count_rejects_negative");
+    suite.expect(parseCount("{\"count\":1.5}", count) == false, "mothership_parse_whitehole_count_rejects_fraction");
+    suite.expect(parseCount("{\"count\":\"2\"}", count) == false, "mothership_parse_whitehole_count_rejects_string");
+    suite.expect(parseCount("{\"count\":8193}", count) == false, "mothership_parse_whitehole_count_rejects_per_declaration_overflow");
+    suite.expect(parseCount("{\"count\":18446744073709551616}", count) == false, "mothership_parse_whitehole_count_rejects_integer_overflow");
+
+    Vector<Whitehole> expanded = {};
+    Whitehole tcp4 = {};
+    tcp4.transport = ExternalAddressTransport::tcp;
+    tcp4.family = ExternalAddressFamily::ipv4;
+    tcp4.source = ExternalAddressSource::hostPublicAddress;
+    Whitehole tcp6 = tcp4;
+    tcp6.family = ExternalAddressFamily::ipv6;
+    Whitehole quic4 = tcp4;
+    quic4.transport = ExternalAddressTransport::quic;
+    Whitehole quic6 = quic4;
+    quic6.family = ExternalAddressFamily::ipv6;
+    String failure = {};
+    bool expandedAll =
+        mothershipAppendWhiteholeDeclaration(expanded, tcp4, 64, &failure) &&
+        mothershipAppendWhiteholeDeclaration(expanded, tcp6, 64, &failure) &&
+        mothershipAppendWhiteholeDeclaration(expanded, quic4, 2, &failure) &&
+        mothershipAppendWhiteholeDeclaration(expanded, quic6, 2, &failure);
+    suite.expect(expandedAll && expanded.size() == 132, "mothership_expand_whitehole_counts_creates_exact_allocation_needs");
+    suite.expect(expandedAll && expanded[0].family == ExternalAddressFamily::ipv4 && expanded[63].transport == ExternalAddressTransport::tcp,
+                 "mothership_expand_whitehole_counts_preserves_first_declaration");
+    suite.expect(expandedAll && expanded[64].family == ExternalAddressFamily::ipv6 && expanded[127].transport == ExternalAddressTransport::tcp,
+                 "mothership_expand_whitehole_counts_preserves_second_declaration");
+    suite.expect(expandedAll && expanded[128].family == ExternalAddressFamily::ipv4 && expanded[128].transport == ExternalAddressTransport::quic,
+                 "mothership_expand_whitehole_counts_preserves_third_declaration");
+    suite.expect(expandedAll && expanded[130].family == ExternalAddressFamily::ipv6 && expanded[130].transport == ExternalAddressTransport::quic,
+                 "mothership_expand_whitehole_counts_preserves_fourth_declaration");
+
+    ScopedFreshRing ring;
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+    ApplicationDeployment deployment = {};
+    seedCommonPlan(deployment, false);
+    RoutableResourceLeaseOwner owner = deployment.routableResourceLeaseOwner();
+    bool allocatedAll = expandedAll;
+    for (Whitehole& whitehole : expanded)
+    {
+      whitehole.hasAddress = true;
+      whitehole.address = whitehole.family == ExternalAddressFamily::ipv6
+                              ? IPAddress("2606:4700:4700::1111", true)
+                              : IPAddress("1.1.1.1", false);
+      allocatedAll &= ApplicationDeployment::allocateWhiteholeSourcePort(whitehole) &&
+                      deployment.reserveWhiteholeAddressPortLease(whitehole, owner);
+    }
+    suite.expect(allocatedAll && brain.routableResourceLeaseRuntimeState.size() == 132 && resolvedWhiteholesValid(expanded),
+                 "mothership_expand_whitehole_counts_resolves_distinct_exact_tuples");
+    thisBrain = savedBrain;
+
+    expanded.clear();
+    suite.expect(mothershipAppendWhiteholeDeclaration(expanded, tcp4, 1, &failure) && expanded.size() == 1,
+                 "mothership_expand_whitehole_count_defaults_to_one");
+    expanded.clear();
+    suite.expect(mothershipAppendWhiteholeDeclaration(expanded, tcp4, mothershipMaximumWhiteholes, &failure),
+                 "mothership_expand_whitehole_count_accepts_map_capacity");
+    suite.expect(mothershipAppendWhiteholeDeclaration(expanded, tcp4, 1, &failure) == false,
+                 "mothership_expand_whitehole_count_rejects_total_overflow");
+  }
+
+  {
+    DeploymentPlan plan = {};
+    String json = "{\"networkAccess\":\"declaredOnly\"}"_ctv;
+    json.need(simdjson::SIMDJSON_PADDING);
+    simdjson::dom::parser parser;
+    simdjson::dom::element document;
+    bool parsed = parser.parse(json.data(), json.size()).get(document) == simdjson::SUCCESS;
+    if (parsed)
+    {
+      for (auto field : document.get_object())
+      {
+        String failure = {};
+        parsed = mothershipParseDeploymentPlanNetworkAccess(field.value, plan, &failure);
+      }
+    }
+    suite.expect(parsed && plan.networkAccess == ContainerNetworkAccess::declaredOnly,
+                 "mothership_parse_network_access_accepts_declared_only");
+
+    String invalidJSON = "{\"networkAccess\":true}"_ctv;
+    invalidJSON.need(simdjson::SIMDJSON_PADDING);
+    simdjson::dom::element invalidDocument;
+    bool rejectedNonBool = false;
+    if (parser.parse(invalidJSON.data(), invalidJSON.size()).get(invalidDocument) == simdjson::SUCCESS)
+    {
+      for (auto field : invalidDocument.get_object())
+      {
+        String failure = {};
+        rejectedNonBool = mothershipParseDeploymentPlanNetworkAccess(field.value, plan, &failure) == false;
+      }
+    }
+    suite.expect(rejectedNonBool, "mothership_parse_network_access_rejects_non_string");
+
+    Whitehole whitehole = {};
+    whitehole.transport = ExternalAddressTransport::tcp;
+    whitehole.family = ExternalAddressFamily::ipv6;
+    whitehole.source = ExternalAddressSource::hostPublicAddress;
+    String failure = {};
+    suite.expect(mothershipValidateDeploymentPlanNetworkAccess(plan, &failure),
+                 "declared_network_deployment_validation_allows_service_only_policy");
+    plan.whiteholes.push_back(whitehole);
+    suite.expect(mothershipValidateDeploymentPlanNetworkAccess(plan, &failure),
+                 "declared_network_deployment_validation_accepts_valid_whitehole");
+
+    const int forbiddenCapabilities[] = {CAP_NET_RAW, CAP_NET_ADMIN, CAP_SYS_ADMIN, CAP_BPF};
+    for (int capability : forbiddenCapabilities)
+    {
+      plan.config.capabilities.insert(capability);
+      suite.expect(mothershipValidateDeploymentPlanNetworkAccess(plan, &failure) == false,
+                   "declared_network_deployment_validation_rejects_privileged_capability");
+      plan.config.capabilities.erase(capability);
+    }
+    plan.useHostNetworkNamespace = true;
+    suite.expect(mothershipValidateDeploymentPlanNetworkAccess(plan, &failure) == false,
+                 "declared_network_deployment_validation_rejects_host_netns");
+    plan.useHostNetworkNamespace = false;
+    plan.wormholes.emplace_back();
+    suite.expect(mothershipValidateDeploymentPlanNetworkAccess(plan, &failure) == false,
+                 "declared_network_deployment_validation_rejects_wormholes");
+  }
+
+  {
+    Vector<Whitehole> whiteholes = {};
+    Whitehole valid = {};
+    valid.transport = ExternalAddressTransport::tcp;
+    valid.family = ExternalAddressFamily::ipv6;
+    valid.source = ExternalAddressSource::hostPublicAddress;
+    valid.hasAddress = true;
+    valid.address = IPAddress("2606:4700:4700::1111", true);
+    valid.sourcePort = 41'337;
+    valid.bindingNonce = 7;
+    whiteholes.push_back(valid);
+    suite.expect(resolvedWhiteholesValid(whiteholes), "whitehole_only_runtime_validation_accepts_resolved_tuple");
+
+    auto rejects = [&](const char *name) -> void {
+      suite.expect(resolvedWhiteholesValid(whiteholes) == false, name);
+      whiteholes[0] = valid;
+    };
+    whiteholes[0].address = {};
+    rejects("whitehole_only_runtime_validation_rejects_null_address");
+    whiteholes[0].sourcePort = 0;
+    rejects("whitehole_only_runtime_validation_rejects_zero_port");
+    whiteholes[0].bindingNonce = 0;
+    rejects("whitehole_only_runtime_validation_rejects_zero_nonce");
+    whiteholes[0].transport = static_cast<ExternalAddressTransport>(UINT8_MAX);
+    rejects("whitehole_only_runtime_validation_rejects_unsupported_transport");
+    whiteholes[0].family = static_cast<ExternalAddressFamily>(UINT8_MAX);
+    rejects("whitehole_only_runtime_validation_rejects_unsupported_family");
+    whiteholes[0].source = ExternalAddressSource::distributableSubnet;
+    rejects("whitehole_only_runtime_validation_rejects_unsupported_source");
+    whiteholes[0].family = ExternalAddressFamily::ipv4;
+    rejects("whitehole_only_runtime_validation_rejects_family_mismatch");
+
+    whiteholes.push_back(valid);
+    suite.expect(resolvedWhiteholesValid(whiteholes) == false, "whitehole_only_runtime_validation_rejects_duplicate_tuple");
+    whiteholes[1].transport = ExternalAddressTransport::quic;
+    suite.expect(resolvedWhiteholesValid(whiteholes), "whitehole_only_runtime_validation_allows_same_address_port_for_distinct_transport");
+    whiteholes[1] = valid;
+    whiteholes[1].sourcePort += 1;
+    suite.expect(resolvedWhiteholesValid(whiteholes), "whitehole_only_runtime_validation_allows_distinct_source_port");
+    whiteholes.pop_back();
+
+    ContainerPlan plan = {};
+    plan.networkAccess = ContainerNetworkAccess::declaredOnly;
+    plan.fragment = 7;
+    plan.whiteholes = whiteholes;
+    suite.expect(declaredNetworkAccessValid(plan), "declared_network_runtime_validation_accepts_application_plan");
+
+    constexpr uint64_t resolverService = 0x0100000000000042ULL;
+    plan.whiteholes.clear();
+    plan.subscriptions.emplace(resolverService,
+                               Subscription(resolverService, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::any));
+    plan.subscriptionPairings.insert(resolverService, SubscriptionPairing(11, 22, resolverService, 5353));
+    plan.advertisements.emplace(resolverService,
+                                Advertisement(resolverService, ContainerState::scheduled, ContainerState::destroying, 5353));
+    plan.advertisementPairings.insert(resolverService, AdvertisementPairing(11, 33, resolverService));
+    suite.expect(declaredNetworkAccessValid(plan), "declared_network_runtime_validation_accepts_exact_service_pairings");
+    plan.subscriptionPairings.map[resolverService][0].port = 0;
+    suite.expect(declaredNetworkAccessValid(plan) == false, "declared_network_runtime_validation_rejects_zero_subscription_port");
+    plan.subscriptionPairings.map[resolverService][0].port = 5353;
+
+    plan.system.kind = SystemContainerKind::mothershipTunnelProvider;
+    suite.expect(declaredNetworkAccessValid(plan) == false, "declared_network_runtime_validation_rejects_system_mode");
+
+    Vector<Whitehole> capacity = {};
+    capacity.reserve(MAX_WHITEHOLE_BINDINGS + 1);
+    for (uint32_t index = 1; index <= MAX_WHITEHOLE_BINDINGS; ++index)
+    {
+      Whitehole candidate = valid;
+      candidate.sourcePort = uint16_t(index);
+      candidate.bindingNonce = index;
+      capacity.push_back(candidate);
+    }
+    suite.expect(resolvedWhiteholesValid(capacity), "whitehole_only_runtime_validation_accepts_map_capacity");
+    Whitehole overflow = valid;
+    overflow.sourcePort = uint16_t(MAX_WHITEHOLE_BINDINGS + 1);
+    overflow.bindingNonce = MAX_WHITEHOLE_BINDINGS + 1;
+    capacity.push_back(overflow);
+    suite.expect(resolvedWhiteholesValid(capacity) == false, "whitehole_only_runtime_validation_rejects_map_capacity_overflow");
+
+    plan.system.kind = SystemContainerKind::none;
+    plan.whiteholes = capacity;
+    suite.expect(declaredNetworkAccessValid(plan) == false, "declared_network_runtime_validation_rejects_map_capacity_overflow");
+  }
+
+  {
+    auto public4 = [](const char *text) -> bool {
+      in_addr address = {};
+      return inet_pton(AF_INET, text, &address) == 1 && switchboardPublicDestinationIPv4(address.s_addr);
+    };
+    auto public6 = [](const char *text) -> bool {
+      in6_addr address = {};
+      return inet_pton(AF_INET6, text, &address) == 1 && switchboardPublicDestinationIPv6(address.s6_addr);
+    };
+    suite.expect(public4("1.1.1.1"), "public_destination_classifier_accepts_allocated_ipv4");
+    suite.expect(public4("192.0.0.9"), "public_destination_classifier_accepts_global_ipv4_exception");
+    suite.expect(public4("168.63.129.16") == false, "public_destination_classifier_rejects_cloud_metadata_ipv4");
+    suite.expect(public4("198.51.100.1") == false, "public_destination_classifier_rejects_documentation_ipv4");
+    suite.expect(public6("2606:4700:4700::1111"), "public_destination_classifier_accepts_allocated_ipv6");
+    suite.expect(public6("2001:1::1"), "public_destination_classifier_accepts_global_ipv6_exception");
+    suite.expect(public6("64:ff9b::101:101"), "public_destination_classifier_accepts_public_nat64_destination");
+    suite.expect(public6("::ffff:127.0.0.1") == false, "public_destination_classifier_rejects_mapped_nonpublic_ipv4");
+    suite.expect(public6("2001:db8::1") == false, "public_destination_classifier_rejects_documentation_ipv6");
+    suite.expect(public6("3f00::1") == false, "public_destination_classifier_rejects_unallocated_ipv6");
+    suite.expect(public6("fdf8:d94c:7c33:e26e:ca4b:f500::1") == false, "public_destination_classifier_rejects_container_prefix");
   }
 
   return (suite.failed == 0) ? 0 : 1;

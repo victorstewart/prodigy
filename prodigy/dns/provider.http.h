@@ -1,38 +1,28 @@
 #pragma once
 
+#include <algorithm>
 #include <cctype>
-#include <cstdio>
 #include <string_view>
-#include <sys/wait.h>
 
-#include <curl/curl.h>
 #include <simdjson.h>
 
+#include <prodigy/command.capture.h>
 #include <prodigy/dns.provider.h>
+#include <prodigy/json.h>
 
 class ProdigyDNSHTTPRequest {
 public:
 
-  String method;
+  MultiCurlClient::Method method = MultiCurlClient::Method::get;
   String url;
-  struct curl_slist *headers = nullptr;
+  Vector<MultiCurlClient::Header> headers;
   String body;
-
-  ~ProdigyDNSHTTPRequest()
-  {
-    curl_slist_free_all(headers);
-  }
-
-  void header(const char *value)
-  {
-    headers = curl_slist_append(headers, value);
-  }
 
   void bearer(const String& token)
   {
     String value = {};
-    value.snprintf<"Authorization: Bearer {}"_ctv>(token);
-    header(value.c_str());
+    value.snprintf<"Bearer {}"_ctv>(token);
+    headers.push_back({"Authorization"_ctv, std::move(value)});
   }
 };
 
@@ -55,129 +45,78 @@ static inline bool prodigyDNSCredentialMetadata(const ApiCredential& credential,
   return true;
 }
 
-static inline void prodigyDNSTrimTrailingASCIIWhitespace(String& value)
-{
-  while (value.size() > 0)
-  {
-    uint8_t ch = value[value.size() - 1];
-    if (ch != ' ' && ch != '\n' && ch != '\r' && ch != '\t')
-    {
-      return;
-    }
-    value.resize(value.size() - 1);
-  }
-}
-
-static inline bool prodigyDNSRunCommandCaptureOutput(const String& command, String& output, String& failure)
-{
-  output.clear();
-  String owned = {};
-  owned.assign(command);
-  owned.addNullTerminator();
-
-  FILE *pipe = ::popen(owned.c_str(), "r");
-  if (pipe == nullptr)
-  {
-    failure.assign("DNS bearer refresh command spawn failed"_ctv);
-    return false;
-  }
-
-  char buffer[4096];
-  while (true)
-  {
-    size_t nRead = fread(buffer, 1, sizeof(buffer), pipe);
-    if (nRead > 0)
-    {
-      output.append(reinterpret_cast<const uint8_t *>(buffer), nRead);
-    }
-    if (nRead < sizeof(buffer))
-    {
-      break;
-    }
-  }
-
-  int status = ::pclose(pipe);
-  prodigyDNSTrimTrailingASCIIWhitespace(output);
-  if (status == 0)
-  {
-    failure.clear();
-    return true;
-  }
-
-  if (output.size() > 0)
-  {
-    failure.assign(output);
-  }
-  else if (WIFEXITED(status))
-  {
-    failure.snprintf<"DNS bearer refresh command exited with status {itoa}"_ctv>(uint32_t(WEXITSTATUS(status)));
-  }
-  else
-  {
-    failure.assign("DNS bearer refresh command failed"_ctv);
-  }
-  return false;
-}
-
-static inline bool prodigyDNSResolveBearerToken(const ApiCredential& credential, String& token, String& failure)
+static inline ProdigyHostTask<bool> prodigyDNSResolveBearerToken(CoroutineStack *coro,
+                                                                 const ApiCredential& credential,
+                                                                 String& token,
+                                                                 String& failure,
+                                                                 MultiCurlClient::TimePoint deadline)
 {
   String command = {};
   if (prodigyDNSCredentialMetadata(credential, "bearerRefreshCommand", command))
   {
-    if (prodigyDNSRunCommandCaptureOutput(command, token, failure) == false)
+    if (co_await ProdigyCommandCapture::run(coro,
+                                            command,
+                                            token,
+                                            deadline,
+                                            &failure) == false)
     {
-      return false;
+      co_return false;
     }
     if (token.size() == 0)
     {
       failure.assign("DNS bearer refresh command returned empty output"_ctv);
-      return false;
+      co_return false;
     }
-    return true;
+    co_return true;
   }
   if (credential.material.size() > 0)
   {
     token = credential.material;
     failure.clear();
-    return true;
+    co_return true;
   }
   failure.assign("DNS bearer credential material or metadata.bearerRefreshCommand required"_ctv);
-  return false;
+  co_return false;
 }
 
-static inline bool prodigyDNSApplyBearerAuth(ProdigyDNSHTTPRequest& request, const ApiCredential& credential, String& failure)
+static inline ProdigyHostTask<bool> prodigyDNSApplyBearerAuth(CoroutineStack *coro,
+                                                              ProdigyDNSHTTPRequest& request,
+                                                              const ApiCredential& credential,
+                                                              String& failure,
+                                                              MultiCurlClient::TimePoint deadline)
 {
   String token = {};
-  if (prodigyDNSResolveBearerToken(credential, token, failure) == false)
+  if (co_await prodigyDNSResolveBearerToken(coro, credential, token, failure, deadline) == false)
   {
-    return false;
+    co_return false;
   }
   request.bearer(token);
-  return true;
+  co_return true;
 }
 
 static inline bool prodigyDNSEncodePathPart(const String& value, String& encoded, String& failure)
 {
   encoded.clear();
-  CURL *curl = curl_easy_init();
-  if (curl == nullptr)
+  constexpr static char hex[] = "0123456789ABCDEF";
+  for (uint64_t index = 0; index < value.size(); ++index)
   {
-    failure.assign("dns url encoder init failed"_ctv);
-    return false;
+    const uint8_t byte = value[index];
+    const bool unreserved = (byte >= 'A' && byte <= 'Z') ||
+                            (byte >= 'a' && byte <= 'z') ||
+                            (byte >= '0' && byte <= '9') ||
+                            byte == '-' || byte == '_' || byte == '.' || byte == '~';
+    if (unreserved)
+    {
+      encoded.append(byte);
+    }
+    else
+    {
+      encoded.append('%');
+      encoded.append(uint8_t(hex[(byte >> 4) & 0x0f]));
+      encoded.append(uint8_t(hex[byte & 0x0f]));
+    }
   }
-
-  String text = {};
-  text.assign(value);
-  char *escaped = curl_easy_escape(curl, text.c_str(), int(text.size()));
-  if (escaped == nullptr)
-  {
-    curl_easy_cleanup(curl);
-    failure.assign("dns url encoder escape failed"_ctv);
-    return false;
-  }
-  encoded.assign(escaped);
-  curl_free(escaped);
-  curl_easy_cleanup(curl);
+  failure.clear();
   return true;
 }
 
@@ -228,7 +167,7 @@ static inline void prodigyDNSAppendJSONKV(String& json, const char *key, const S
   json.append('"');
   json.append(key);
   json.append("\":"_ctv);
-  appendEscapedJSONString(json, value);
+  prodigyAppendEscapedJSONStringLiteral(json, value);
 }
 
 static inline bool prodigyDNSAppendRecordJSON(String& body, const ProdigyDNSRecordBinding& record, const char *valueKey, const String *nameOverride, String& failure)
@@ -240,7 +179,7 @@ static inline bool prodigyDNSAppendRecordJSON(String& body, const ProdigyDNSReco
   }
 
   body.assign("{\"type\":"_ctv);
-  appendEscapedJSONString(body, record.type);
+  prodigyAppendEscapedJSONStringLiteral(body, record.type);
   prodigyDNSAppendJSONKV(body, "name", nameOverride ? *nameOverride : record.name);
   prodigyDNSAppendJSONKV(body, valueKey, value);
   body.snprintf_add<",\"ttl\":{itoa}}"_ctv>(record.ttl);
@@ -318,7 +257,7 @@ static inline bool prodigyDNSRemoveProviderValue(const ProdigyDNSRecordBinding& 
 static inline void prodigyDNSAppendGcpRRSet(String& body, const ProdigyDNSRecordBinding& record, const Vector<String>& values)
 {
   body.append("{\"name\":"_ctv);
-  appendEscapedJSONString(body, record.name);
+  prodigyAppendEscapedJSONStringLiteral(body, record.name);
   prodigyDNSAppendJSONKV(body, "type", record.type);
   body.snprintf_add<",\"ttl\":{itoa},\"rrdatas\":["_ctv>(record.ttl);
   for (uint64_t index = 0; index < values.size(); ++index)
@@ -327,7 +266,7 @@ static inline void prodigyDNSAppendGcpRRSet(String& body, const ProdigyDNSRecord
     {
       body.append(',');
     }
-    appendEscapedJSONString(body, values[index]);
+    prodigyAppendEscapedJSONStringLiteral(body, values[index]);
   }
   body.append("]}"_ctv);
 }
@@ -345,14 +284,14 @@ static inline void prodigyDNSAppendAzureRecordSetJSON(String& body, const Prodig
         body.append(',');
       }
       body.append("{\"value\":["_ctv);
-      appendEscapedJSONString(body, values[index]);
+      prodigyAppendEscapedJSONStringLiteral(body, values[index]);
       body.append("]}"_ctv);
     }
     body.append("]}}"_ctv);
     return;
   }
   body.append(record.type.equal("AAAA"_ctv) ? "AAAARecords\":[{\"ipv6Address\":" : "ARecords\":[{\"ipv4Address\":");
-  appendEscapedJSONString(body, values[0]);
+  prodigyAppendEscapedJSONStringLiteral(body, values[0]);
   body.append("}]}}"_ctv);
 }
 
@@ -608,58 +547,81 @@ static inline bool prodigyDNSFindAzureRecord(const String& response, const Prodi
 }
 
 class ProdigyHTTPDNSProvider : public ProdigyDNSProvider {
+private:
+
+  String requiredHost;
+
 protected:
 
-  virtual bool sendHTTP(ProdigyDNSHTTPRequest& request, String& response, long& httpCode, String& failure)
+  explicit ProdigyHTTPDNSProvider(const String& host)
+  {
+    requiredHost.assign(host);
+  }
+
+  virtual ProdigyHostTask<bool> sendHTTP(CoroutineStack *coro,
+                                         ProdigyDNSHTTPRequest& request,
+                                         String& response,
+                                         long& httpCode,
+                                         String& failure)
   {
     response.clear();
     failure.clear();
     httpCode = 0;
-    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK)
+    if (coro == nullptr || runtime.http.submit == nullptr || runtime.http.cancel == nullptr ||
+        requiredHost.empty() || request.body.size() > 1024 * 1024)
     {
-      failure.assign("dns curl init failed"_ctv);
-      return false;
+      failure.assign("DNS HTTP runtime or request unavailable"_ctv);
+      co_return false;
     }
 
-    CURL *curl = curl_easy_init();
-    if (curl == nullptr)
+    MultiCurlClient::Request submitted;
+    submitted.url.assign(request.url);
+    submitted.method = request.method;
+    submitted.headers = request.headers;
+    submitted.body.assign(request.body);
+    submitted.connectTimeout = std::chrono::seconds(10);
+    submitted.firstByteTimeout = std::chrono::seconds(30);
+    submitted.idleTimeout = std::chrono::seconds(30);
+    submitted.responseBytes = 1024 * 1024;
+    submitted.originPolicy.requiredScheme.assign("https"_ctv);
+    submitted.originPolicy.requiredHost.assign(requiredHost);
+    submitted.originPolicy.requiredAuthority.assign(requiredHost);
+    submitted.originPolicy.requiredService.assign("443"_ctv);
+    const MultiCurlClient::TimePoint localDeadline = MultiCurlClient::Clock::now() + std::chrono::seconds(60);
+    submitted.overallDeadline = runtime.operationDeadline < localDeadline ? runtime.operationDeadline : localDeadline;
+
+    ProdigyHostHttpOperation operation(runtime.http, *coro);
+    if (operation.submit(std::move(submitted)) == false)
     {
-      failure.assign("dns curl easy init failed"_ctv);
-      return false;
+      failure.assign("DNS HTTP request submission failed"_ctv);
+      co_return false;
+    }
+    if (operation.mustSuspend())
+    {
+      co_await ProdigyHostSuspend(*coro);
+    }
+    if (operation.hasResult() == false)
+    {
+      failure.assign("DNS HTTP request canceled"_ctv);
+      co_return false;
     }
 
-    String method = {};
-    String url = {};
-    method.assign(request.method);
-    url.assign(request.url);
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 10'000L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 60'000L);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, request.headers);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](char *ptr, size_t size, size_t nmemb, void *userdata) -> size_t {
-      String *out = reinterpret_cast<String *>(userdata);
-      out->append(reinterpret_cast<uint8_t *>(ptr), size * nmemb);
-      return size * nmemb;
-    });
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    String body = {};
-    if (request.body.size() > 0)
+    MultiCurlClient::Result result = operation.takeResult();
+    response = std::move(result.body);
+    httpCode = result.statusCode;
+    if (result.status != MultiCurlClient::Status::success)
     {
-      body.assign(request.body);
-      curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
-      curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, long(body.size()));
+      if (result.status == MultiCurlClient::Status::deadlineExceeded)
+      {
+        failure.assign("DNS HTTP request deadline exceeded"_ctv);
+      }
+      else
+      {
+        failure.assign("DNS HTTP transport failed"_ctv);
+      }
+      co_return false;
     }
-
-    CURLcode rc = curl_easy_perform(curl);
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
-    curl_easy_cleanup(curl);
-    if (rc != CURLE_OK)
-    {
-      failure.assign(curl_easy_strerror(rc));
-      return false;
-    }
-    return true;
+    co_return true;
   }
 
   bool acceptHTTP(bool ok, long httpCode, const String& response, String& failure, const char *context)
@@ -683,7 +645,12 @@ protected:
     if (response.size() > 0)
     {
       failure.append(": "_ctv);
-      failure.append(response);
+      const uint64_t detailBytes = std::min<uint64_t>(response.size(), 512);
+      failure.append(response.data(), detailBytes);
+      if (detailBytes < response.size())
+      {
+        failure.append("..."_ctv);
+      }
     }
     return false;
   }

@@ -1,12 +1,12 @@
 #pragma once
 
-#include <libssh2.h>
+#include <libssh2/libssh2.h>
 
+#include <arpa/inet.h>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
-#include <netdb.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -26,22 +26,30 @@ static inline bool mothershipEnsureLibssh2(void)
   return initialized;
 }
 
-static inline bool mothershipOpenConnectedSocket(const String& address, uint16_t port, int& fdOut)
+static inline bool mothershipOpenNumericConnectedSocket(const String& address, uint16_t port, int& fdOut)
 {
   fdOut = -1;
   String addressText = address;
 
-  char portText[16] = {0};
-  std::snprintf(portText, sizeof(portText), "%u", unsigned(port));
-
-  struct addrinfo hints = {};
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-  hints.ai_protocol = IPPROTO_TCP;
-
-  struct addrinfo *results = nullptr;
-  if (getaddrinfo(addressText.c_str(), portText, &hints, &results) != 0)
+  struct sockaddr_storage destination = {};
+  socklen_t destinationLength = 0;
+  struct sockaddr_in *destination4 = reinterpret_cast<struct sockaddr_in *>(&destination);
+  struct sockaddr_in6 *destination6 = reinterpret_cast<struct sockaddr_in6 *>(&destination);
+  if (inet_pton(AF_INET, addressText.c_str(), &destination4->sin_addr) == 1)
   {
+    destination4->sin_family = AF_INET;
+    destination4->sin_port = htons(port);
+    destinationLength = sizeof(*destination4);
+  }
+  else if (inet_pton(AF_INET6, addressText.c_str(), &destination6->sin6_addr) == 1)
+  {
+    destination6->sin6_family = AF_INET6;
+    destination6->sin6_port = htons(port);
+    destinationLength = sizeof(*destination6);
+  }
+  else
+  {
+    errno = EINVAL;
     return false;
   }
 
@@ -98,25 +106,19 @@ static inline bool mothershipOpenConnectedSocket(const String& address, uint16_t
     return true;
   };
 
-  for (struct addrinfo *candidate = results; candidate != nullptr; candidate = candidate->ai_next)
+  int fd = ::socket(destination.ss_family, SOCK_STREAM, IPPROTO_TCP);
+  if (fd < 0)
   {
-    int fd = ::socket(candidate->ai_family, candidate->ai_socktype, candidate->ai_protocol);
-    if (fd < 0)
-    {
-      continue;
-    }
-
-    if (connectWithTimeout(fd, candidate->ai_addr, candidate->ai_addrlen))
-    {
-      fdOut = fd;
-      freeaddrinfo(results);
-      return true;
-    }
-
-    ::close(fd);
+    return false;
   }
 
-  freeaddrinfo(results);
+  if (connectWithTimeout(fd, reinterpret_cast<const struct sockaddr *>(&destination), destinationLength))
+  {
+    fdOut = fd;
+    return true;
+  }
+
+  ::close(fd);
   return false;
 }
 
@@ -169,7 +171,7 @@ static inline bool mothershipConnectSSHSession(
     return false;
   }
 
-  if (mothershipOpenConnectedSocket(machine.ssh.address, machine.ssh.port, fd) == false)
+  if (mothershipOpenNumericConnectedSocket(machine.ssh.address, machine.ssh.port, fd) == false)
   {
     if (failure)
     {

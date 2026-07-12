@@ -2,6 +2,7 @@
 #include <ebpf/kernel/containersubnet.h>
 
 #include <switchboard/kernel/egress.routing.h>
+#include <switchboard/kernel/container.egress.policy.h>
 #include <switchboard/kernel/portal.routing.h>
 
 // This program is attached as BPF_NETKIT_PEER using the host-side primary
@@ -69,7 +70,12 @@ int ct_egress(struct __sk_buff *skb)
     return NETKIT_DROP;
   }
 
-  if (containerEgressAllowlistOnly())
+  __u8 networkMode = containerNetworkMode();
+  if (networkMode == CONTAINER_NETWORK_DENY || networkMode > CONTAINER_NETWORK_DECLARED_ONLY)
+  {
+    return NETKIT_DROP;
+  }
+  if (networkMode == CONTAINER_NETWORK_DESTINATION_ALLOWLIST)
   {
     __u8 proto = 0;
     __be16 port = 0;
@@ -94,6 +100,39 @@ int ct_egress(struct __sk_buff *skb)
       goto redirect_to_nic;
     }
     return NETKIT_DROP;
+  }
+  if (networkMode == CONTAINER_NETWORK_DECLARED_ONLY)
+  {
+    if (protocol == BE_ETH_P_IP)
+    {
+      struct iphdr *iph = (struct iphdr *)l3_data;
+      if ((void *)(iph + 1) > data_end || iph->ihl != 5 ||
+          containerWhiteholePublicEgressIPv4(iph, data_end) == false)
+      {
+        return NETKIT_DROP;
+      }
+      goto redirect_to_nic;
+    }
+    if (protocol == BE_ETH_P_IPV6)
+    {
+      struct ipv6hdr *ip6h = (struct ipv6hdr *)l3_data;
+      if ((void *)(ip6h + 1) > data_end)
+      {
+        return NETKIT_DROP;
+      }
+      if (containerWhiteholePublicEgressIPv6(ip6h, data_end))
+      {
+        goto redirect_to_nic;
+      }
+      if (containerDeclaredInternalEgressIPv6(ip6h, data_end) == false)
+      {
+        return NETKIT_DROP;
+      }
+    }
+    else
+    {
+      return NETKIT_DROP;
+    }
   }
 
   if (protocol == BE_ETH_P_IP && containerRequiresPublic4() == false)

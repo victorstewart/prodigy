@@ -293,7 +293,11 @@ __attribute__((__always_inline__)) static inline int switchboardMaybeLearnWhiteh
 
   struct flow_key reverse = {};
   reverse_flow_key(&flow, &reverse);
-  bpf_map_update_elem(&white_replies, &reverse, &binding, BPF_ANY);
+  struct switchboard_whitehole_reply reply = {
+      .binding = binding,
+      .expiresAtNs = bpf_ktime_get_ns() + WHITEHOLE_REPLY_IDLE_NS,
+  };
+  bpf_map_update_elem(&white_replies, &reverse, &reply, BPF_ANY);
   return TC_ACT_OK;
 }
 
@@ -330,7 +334,11 @@ __attribute__((__always_inline__)) static inline int switchboardMaybeLearnWhiteh
 
   struct flow_key reverse = {};
   reverse_flow_key(&flow, &reverse);
-  bpf_map_update_elem(&white_replies, &reverse, &binding, BPF_ANY);
+  struct switchboard_whitehole_reply reply = {
+      .binding = binding,
+      .expiresAtNs = bpf_ktime_get_ns() + WHITEHOLE_REPLY_IDLE_NS,
+  };
+  bpf_map_update_elem(&white_replies, &reverse, &reply, BPF_ANY);
   return TC_ACT_OK;
 }
 

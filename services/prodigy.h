@@ -120,6 +120,11 @@ namespace Brain {
 constexpr uint16_t applicationID = 0;
 } // namespace Brain
 
+namespace DNS {
+constexpr uint16_t applicationID = 1;
+constexpr uint64_t resolver = MeshServices::generateStatelessService(applicationID, 1);
+} // namespace DNS
+
 namespace Pulse {
 constexpr uint16_t applicationID = 2;
 constexpr uint64_t clients = MeshServices::generateStatefulService(applicationID, 1);
@@ -193,6 +198,8 @@ static inline bool prefixContains(uint64_t prefix, uint64_t service)
 static inline bytell_hash_map<String, uint64_t> serviceMappings = [](void) -> auto {
   bytell_hash_map<String, uint64_t> mappings;
 
+  mappings["MeshRegistry::DNS::resolver"] = DNS::resolver;
+
   mappings["MeshRegistry::Pulse::clients"] = Pulse::clients;
   mappings["MeshRegistry::Pulse::siblings"] = Pulse::siblings;
   mappings["MeshRegistry::Pulse::seeders"] = Pulse::seeders;
@@ -236,6 +243,7 @@ static inline bytell_hash_map<String, uint64_t> serviceMappings = [](void) -> au
 static inline bytell_hash_map<String, uint16_t> applicationIDMappings = [](void) -> auto {
   bytell_hash_map<String, uint16_t> mappings;
 
+  mappings["DNS"_ctv] = DNS::applicationID;
   mappings["Pulse"_ctv] = Pulse::applicationID;
   mappings["Truth"_ctv] = Truth::applicationID;
   mappings["Hot"_ctv] = Hot::applicationID;
@@ -252,6 +260,7 @@ static inline bytell_hash_map<String, uint16_t> applicationIDMappings = [](void)
 static inline bytell_hash_map<uint16_t, String> applicationNameMappings = [](void) -> auto {
   bytell_hash_map<uint16_t, String> mappings;
 
+  mappings[DNS::applicationID] = "DNS"_ctv;
   mappings[Pulse::applicationID] = "Pulse"_ctv;
   mappings[Truth::applicationID] = "Truth"_ctv;
   mappings[Hot::applicationID] = "Hot"_ctv;

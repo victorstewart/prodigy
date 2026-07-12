@@ -1,6 +1,17 @@
 #pragma once
 
+#include <prodigy/host.async.task.h>
+#include <prodigy/host.delay.operation.h>
+#include <prodigy/host.http.operation.h>
 #include <prodigy/types.h>
+
+class ProdigyDNSProviderRuntime {
+public:
+
+  ProdigyHostHttpSubmission http;
+  ProdigyHostDelayOperation::Submission delay;
+  MultiCurlClient::TimePoint operationDeadline = MultiCurlClient::TimePoint::max();
+};
 
 class ProdigyDNSRecordBinding {
 public:
@@ -71,33 +82,54 @@ static inline bool prodigyBuildDNSRecordBinding(const RoutableResourceLease& lea
 }
 
 class ProdigyDNSProvider {
+protected:
+
+  ProdigyDNSProviderRuntime runtime;
+
 public:
 
   virtual ~ProdigyDNSProvider() = default;
 
+  virtual void configureRuntime(ProdigyDNSProviderRuntime requestedRuntime)
+  {
+    runtime = requestedRuntime;
+  }
+
   virtual bool supportsProvider(const String& provider) const = 0;
-  virtual bool upsert(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) = 0;
-  virtual bool remove(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) = 0;
-  virtual bool presentTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
+  virtual ProdigyHostTask<bool> upsert(CoroutineStack *coro,
+                                       const ProdigyDNSRecordBinding& record,
+                                       const ApiCredential& credential,
+                                       String& failure) = 0;
+  virtual ProdigyHostTask<bool> remove(CoroutineStack *coro,
+                                       const ProdigyDNSRecordBinding& record,
+                                       const ApiCredential& credential,
+                                       String& failure) = 0;
+  virtual ProdigyHostTask<bool> presentTXT(CoroutineStack *,
+                                           const ProdigyDNSRecordBinding& record,
+                                           const ApiCredential& credential,
+                                           String& failure)
   {
     String ignored = {};
     if (prodigyDNSRecordSingleTXTValue(record, ignored, failure) == false)
     {
-      return false;
+      co_return false;
     }
     (void)credential;
     failure.assign("DNS provider does not implement ACME TXT present"_ctv);
-    return false;
+    co_return false;
   }
-  virtual bool cleanupTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
+  virtual ProdigyHostTask<bool> cleanupTXT(CoroutineStack *,
+                                           const ProdigyDNSRecordBinding& record,
+                                           const ApiCredential& credential,
+                                           String& failure)
   {
     String ignored = {};
     if (prodigyDNSRecordSingleTXTValue(record, ignored, failure) == false)
     {
-      return false;
+      co_return false;
     }
     (void)credential;
     failure.assign("DNS provider does not implement ACME TXT cleanup"_ctv);
-    return false;
+    co_return false;
   }
 };

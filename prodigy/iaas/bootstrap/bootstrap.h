@@ -231,10 +231,11 @@ public:
     error.assign("bootstrap iaas cannot provision machines"_ctv);
   }
 
-  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines) override
+  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines, String& failure) override
   {
     (void)coro;
     (void)metro;
+    failure.clear();
 
     Vector<BootstrapPeer> peers;
     collectBootstrapPeers(peers);
@@ -267,10 +268,11 @@ public:
     }
   }
 
-  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains) override
+  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains, String& failure) override
   {
     (void)coro;
     (void)selfUUID;
+    failure.clear();
 
     selfIsBrain = (config.nodeRole == ProdigyBootstrapNodeRole::brain);
 
@@ -309,9 +311,11 @@ public:
     }
   }
 
-  void hardRebootMachine(uint128_t uuid) override
+  void hardRebootMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
-    (void)uuid;
+    (void)coro;
+    (void)cloudID;
+    failure.clear();
   }
 
   void reportHardwareFailure(uint128_t uuid, const String& report) override
@@ -326,9 +330,11 @@ public:
     (void)decommissionedIDs;
   }
 
-  void destroyMachine(Machine *machine) override
+  void destroyMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
-    (void)machine;
+    (void)coro;
+    (void)cloudID;
+    failure.clear();
   }
 
   uint32_t supportedMachineKindsMask() const override
@@ -353,7 +359,7 @@ public:
       : config(bootstrapConfig)
   {}
 
-  void gatherSelfData(uint128_t& uuid, String& metro, bool& isBrain, EthDevice& eth, IPAddress& private4) override
+  void gatherSelfData(CoroutineStack *, uint128_t& uuid, String& metro, bool& isBrain, EthDevice& eth, IPAddress& private4) override
   {
     String deviceName;
     if (prodigyResolvePrimaryNetworkDevice(deviceName))
@@ -376,10 +382,4 @@ public:
     isBrain = (config.nodeRole == ProdigyBootstrapNodeRole::brain);
   }
 
-  void downloadContainerToPath(CoroutineStack *coro, uint64_t deploymentID, const String& path) override
-  {
-    (void)coro;
-    (void)deploymentID;
-    (void)path;
-  }
 };

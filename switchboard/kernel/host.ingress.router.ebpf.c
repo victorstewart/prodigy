@@ -41,8 +41,13 @@ __attribute__((__always_inline__)) static inline void bump_dev_host_route_stat(_
 // primary netkit path for that container
 // otherwise passed to the kernel
 
-__attribute__((__always_inline__)) static inline bool lookup_whitehole_reply_binding_ipv4(struct ethhdr *eth, void *data_end, struct switchboard_whitehole_binding *binding)
+__attribute__((__always_inline__)) static inline bool lookup_whitehole_reply_binding_ipv4(struct ethhdr *eth, void *data_end, struct switchboard_whitehole_binding *binding, bool *bound)
 {
+  if (bound == NULL)
+  {
+    return false;
+  }
+  *bound = false;
   struct iphdr *iph = (struct iphdr *)(eth + 1);
   if ((void *)(iph + 1) > data_end)
   {
@@ -62,18 +67,22 @@ __attribute__((__always_inline__)) static inline bool lookup_whitehole_reply_bin
   flow.port16[0] = l4.source;
   flow.port16[1] = l4.dest;
 
-  struct switchboard_whitehole_binding *reply = bpf_map_lookup_elem(&white_replies, &flow);
-  if (reply == NULL)
+  struct switchboard_whitehole_binding current = {};
+  if (whitehole_binding_lookup(flow.proto, false, &flow.dst, flow.port16[1], &current) == false)
   {
     return false;
   }
-
-  bpf_memcpy(binding, reply, sizeof(*binding));
-  return true;
+  *bound = true;
+  return whitehole_reply_binding_lookup(&flow, &current, binding);
 }
 
-__attribute__((__always_inline__)) static inline bool lookup_whitehole_reply_binding_ipv6(struct ethhdr *eth, void *data_end, struct switchboard_whitehole_binding *binding)
+__attribute__((__always_inline__)) static inline bool lookup_whitehole_reply_binding_ipv6(struct ethhdr *eth, void *data_end, struct switchboard_whitehole_binding *binding, bool *bound)
 {
+  if (bound == NULL)
+  {
+    return false;
+  }
+  *bound = false;
   struct ipv6hdr *ip6h = (struct ipv6hdr *)(eth + 1);
   if ((void *)(ip6h + 1) > data_end)
   {
@@ -93,14 +102,13 @@ __attribute__((__always_inline__)) static inline bool lookup_whitehole_reply_bin
   flow.port16[0] = l4.source;
   flow.port16[1] = l4.dest;
 
-  struct switchboard_whitehole_binding *reply = bpf_map_lookup_elem(&white_replies, &flow);
-  if (reply == NULL)
+  struct switchboard_whitehole_binding current = {};
+  if (whitehole_binding_lookup(flow.proto, true, flow.dstv6, flow.port16[1], &current) == false)
   {
     return false;
   }
-
-  bpf_memcpy(binding, reply, sizeof(*binding));
-  return true;
+  *bound = true;
+  return whitehole_reply_binding_lookup(&flow, &current, binding);
 }
 
 __attribute__((__always_inline__)) static inline bool overlay_inner_ipv4_matches_external_portal(struct iphdr *inner4, void *data_end)
@@ -192,7 +200,8 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_whitehole_re
   if (eth->h_proto == BE_ETH_P_IPV6)
   {
     struct switchboard_whitehole_binding replyBinding = {};
-    if (lookup_whitehole_reply_binding_ipv6(eth, data_end, &replyBinding))
+    bool bound = false;
+    if (lookup_whitehole_reply_binding_ipv6(eth, data_end, &replyBinding, &bound))
     {
       *handled = true;
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
@@ -209,11 +218,17 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_whitehole_re
 
       return TC_ACT_SHOT;
     }
+    if (bound)
+    {
+      *handled = true;
+      return TC_ACT_SHOT;
+    }
   }
   else if (eth->h_proto == BE_ETH_P_IP)
   {
     struct switchboard_whitehole_binding replyBinding = {};
-    if (lookup_whitehole_reply_binding_ipv4(eth, data_end, &replyBinding))
+    bool bound = false;
+    if (lookup_whitehole_reply_binding_ipv4(eth, data_end, &replyBinding, &bound))
     {
       *handled = true;
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
@@ -231,6 +246,11 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_whitehole_re
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
       bump_dev_host_route_stat(7);
 #endif
+      return TC_ACT_SHOT;
+    }
+    if (bound)
+    {
+      *handled = true;
       return TC_ACT_SHOT;
     }
   }
@@ -604,6 +624,7 @@ __attribute__((__always_inline__)) static inline bool should_fast_pass_native_ho
   {
     struct iphdr *iph = (struct iphdr *)(eth + 1);
     struct switchboard_whitehole_binding replyBinding = {};
+    bool whiteholeBound = false;
     if ((void *)(iph + 1) > data_end)
     {
       return false;
@@ -619,7 +640,7 @@ __attribute__((__always_inline__)) static inline bool should_fast_pass_native_ho
       return false;
     }
 
-    if (lookup_whitehole_reply_binding_ipv4(eth, data_end, &replyBinding))
+    if (lookup_whitehole_reply_binding_ipv4(eth, data_end, &replyBinding, &whiteholeBound) || whiteholeBound)
     {
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
       bump_dev_host_route_stat(1);
@@ -634,6 +655,7 @@ __attribute__((__always_inline__)) static inline bool should_fast_pass_native_ho
   {
     struct ipv6hdr *ipv6h = (struct ipv6hdr *)(eth + 1);
     struct switchboard_whitehole_binding replyBinding = {};
+    bool whiteholeBound = false;
     if ((void *)(ipv6h + 1) > data_end)
     {
       return false;
@@ -649,7 +671,7 @@ __attribute__((__always_inline__)) static inline bool should_fast_pass_native_ho
       return false;
     }
 
-    if (lookup_whitehole_reply_binding_ipv6(eth, data_end, &replyBinding))
+    if (lookup_whitehole_reply_binding_ipv6(eth, data_end, &replyBinding, &whiteholeBound) || whiteholeBound)
     {
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
       bump_dev_host_route_stat(8);
@@ -765,6 +787,7 @@ int host_ingress(struct __sk_buff *skb)
   {
     struct ipv6hdr *ipv6h = (struct ipv6hdr *)(eth + 1);
     struct switchboard_whitehole_binding replyBinding = {};
+    bool whiteholeBound = false;
 
     if ((void *)(ipv6h + 1) > data_end)
     {
@@ -813,7 +836,7 @@ int host_ingress(struct __sk_buff *skb)
       }
     }
 
-    if (lookup_whitehole_reply_binding_ipv6(eth, data_end, &replyBinding))
+    if (lookup_whitehole_reply_binding_ipv6(eth, data_end, &replyBinding, &whiteholeBound))
     {
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
       bump_dev_host_route_stat(9);
@@ -827,6 +850,10 @@ int host_ingress(struct __sk_buff *skb)
         return setInstruction(TC_ACT_REDIRECT);
       }
 
+      return TC_ACT_SHOT;
+    }
+    if (whiteholeBound)
+    {
       return TC_ACT_SHOT;
     }
 
@@ -853,6 +880,7 @@ int host_ingress(struct __sk_buff *skb)
   {
     struct iphdr *iph = (struct iphdr *)(eth + 1);
     struct switchboard_whitehole_binding replyBinding = {};
+    bool whiteholeBound = false;
     if ((void *)(iph + 1) > data_end)
     {
       return TC_ACT_SHOT;
@@ -865,7 +893,7 @@ int host_ingress(struct __sk_buff *skb)
       return decappedIPv4PortalAction;
     }
 
-    if (lookup_whitehole_reply_binding_ipv4(eth, data_end, &replyBinding))
+    if (lookup_whitehole_reply_binding_ipv4(eth, data_end, &replyBinding, &whiteholeBound))
     {
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
       bump_dev_host_route_stat(2);
@@ -882,6 +910,10 @@ int host_ingress(struct __sk_buff *skb)
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
       bump_dev_host_route_stat(7);
 #endif
+      return TC_ACT_SHOT;
+    }
+    if (whiteholeBound)
+    {
       return TC_ACT_SHOT;
     }
 

@@ -20,7 +20,6 @@
 #include <prodigy/cluster.machine.helpers.h>
 #include <prodigy/brain/metrics.h>
 #include <prodigy/transport.tls.h>
-#include <networking/email.client.h>
 #include <networking/reconnector.h>
 
 class ContainerView;
@@ -399,7 +398,7 @@ public:
   uint64_t version = ProdigyBinaryVersion;
   BrainConfig brainConfig;
 
-  BrainIaaS *iaas;
+  BrainIaaS *iaas = nullptr;
 
   bytell_hash_map<uint32_t, Rack *> racks;
   bytell_hash_set<Machine *> machines;
@@ -452,8 +451,6 @@ public:
   TimeoutPacket failedDeploymentCleaner;
   bytell_hash_map<uint64_t, String> failedDeployments;
 
-  EmailClient batphone;
-
   bytell_hash_set<uint32_t> usedMachineFragments;
 
   // only master also
@@ -500,8 +497,14 @@ public:
   virtual void pushSpinApplicationProgressToMothership(ApplicationDeployment *deployment, const String& message) = 0;
   virtual void spinApplicationFailed(ApplicationDeployment *deployment, const String& message) = 0;
   virtual void spinApplicationFin(ApplicationDeployment *deployment) = 0;
-  virtual void persistLocalRuntimeState(void)
+  virtual bool persistLocalRuntimeState(void)
   {
+    return true;
+  }
+  virtual bool routablePrefixReleasePending(uint128_t uuid) const
+  {
+    (void)uuid;
+    return false;
   }
   virtual void adoptLocalMachineHardwareProfile(const MachineHardwareProfile& hardware)
   {
@@ -815,37 +818,9 @@ public:
     }
     else // error
     {
-      String message;
-      message.snprintf_add<"when trying to spin {itoa}x {} instances, we got the following error from the cloud provider api:\n\n"_ctv>(count, config.slug);
-      message.snprintf_add<"Error: {}"_ctv>(error);
-
-      String subject;
-
-      switch (lifetime)
-      {
-        case MachineLifetime::owned:
-          {
-            subject.append("Failed to Spin Owned Hardware 🤖"_ctv);
-            break;
-          }
-        case MachineLifetime::reserved:
-          {
-            subject.append("Failed to Spin Reserved Hardware 🤖"_ctv);
-            break;
-          }
-        case MachineLifetime::ondemand:
-          {
-            subject.append("Failed to Spin OnDemand Hardware 🤖"_ctv);
-            break;
-          }
-        case MachineLifetime::spot:
-          {
-            subject.append("Failed to Spin Spot Hardware 🤖"_ctv);
-            break;
-          }
-      }
-
-      batphone.sendEmail(brainConfig.reporter.from, brainConfig.reporter.to, subject, message);
+      basics_log("spinMachines failure lifetime=%u count=%u slug=%.*s error=%s\n",
+                 unsigned(lifetime), unsigned(count), int(config.slug.size()),
+                 reinterpret_cast<const char *>(config.slug.data()), error.c_str());
     }
 
     if (coroWasNull)

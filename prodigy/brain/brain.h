@@ -37,6 +37,7 @@ static inline cppsort::verge_adapter<cppsort::ska_sorter> sorter;
 #include <prodigy/cluster.bootstrap.h>
 #include <prodigy/cluster.machine.helpers.h>
 #include <prodigy/dns.provider.h>
+#include <prodigy/dns/control.leases.h>
 #include <prodigy/ingress.validation.h>
 #include <prodigy/mothership/mothership.cluster.types.h>
 #include <prodigy/mothership/mothership.tunnel.auth.h>
@@ -44,6 +45,9 @@ static inline cppsort::verge_adapter<cppsort::ska_sorter> sorter;
 #include <prodigy/routable.address.helpers.h>
 #include <prodigy/remote.bootstrap.h>
 #include <prodigy/brain/timing.knobs.h>
+#include <prodigy/brain/dns.operations.h>
+#include <prodigy/brain/elastic.address.operations.h>
+#include <prodigy/brain/machine.lifecycle.h>
 #include <prodigy/brain/rack.h>
 #include <prodigy/brain/machine.h>
 
@@ -85,7 +89,8 @@ enum class BrainTimeoutFlags : uint64_t {
   transitionStuck,
   performHardReboot,
   postIgnitionRecovery,
-  spotDecomissionChecker
+  spotDecomissionChecker,
+  dnsReconcileRetry
 };
 
 static inline bool brainAddCertificateSubjectAltNames(X509 *cert, const Vector<String>& dnsSans, const Vector<IPAddress>& ipSans)
@@ -808,6 +813,7 @@ private:
 public:
 
   bool closeAfterSendDrain = false;
+  uint64_t connectionIncarnation = 0;
 
   Mothership()
   {
@@ -845,8 +851,60 @@ public:
   int lockFD = -1;
 };
 
+class ProdigyMasterAuthorityStateTransition
+{
+public:
+
+  constexpr static uint8_t currentVersion = 1;
+
+  uint8_t version = currentVersion;
+  ProdigyMasterAuthorityRuntimeState runtimeState;
+  BrainConfig brainConfig;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyMasterAuthorityStateTransition& transition)
+{
+  serializer.value1b(transition.version);
+  serializer.object(transition.runtimeState);
+  serializer.object(transition.brainConfig);
+}
+
 class Brain : public BrainBase, public TimeoutDispatcher {
 public:
+
+  class PendingElasticAddressControlOperation
+  {
+  public:
+
+    Mothership *mothership = nullptr;
+    BrainIaaS *provider = nullptr;
+    ProdigyBrainElasticAddressCoordinator::Action action = ProdigyBrainElasticAddressCoordinator::Action::prepareAssignment;
+    uint64_t operationID = 0;
+    uint64_t mothershipIncarnation = 0;
+    uint64_t authorityEpoch = 0;
+    uint64_t sagaOperationID = 0;
+    uint128_t transactionNonce = 0;
+    uint128_t machineUUID = 0;
+    bool providerOperationEnqueued = false;
+    String machineCloudID;
+    IPPrefix expectedDeliveryPrefix;
+    RoutableSubnetRegistration registration;
+    RoutableSubnetUnregistration unregistration;
+    DistributableExternalSubnet releasedPrefix;
+  };
+
+  class MasterAuthorityReplicationPeerState
+  {
+  public:
+
+    uint128_t uuid = 0;
+    int64_t bootNs = 0;
+    uint64_t acknowledgedGeneration = 0;
+    bytell_hash_map<uint64_t, bytell_hash_set<uint64_t>> sentElasticOperationIDsByGeneration;
+    bytell_hash_map<uint64_t, String> sentTransitionDigestsByGeneration;
+    bytell_hash_set<uint64_t> acknowledgedElasticOperationIDs;
+  };
 
   // any brain
   uint8_t nBrains = 0;
@@ -865,6 +923,11 @@ public:
 
   bool noMasterYet = true;
   bool weAreMaster = false;
+  uint64_t masterAuthorityEpoch = 1;
+  uint64_t lastMothershipConnectionIncarnation = 0;
+  uint64_t durableMasterAuthorityRuntimeStateGeneration = 0;
+  bool masterAuthorityRuntimeStateDurable = false;
+  bytell_hash_map<uint64_t, uint64_t> durableElasticOperationTransitions;
   bool hasCompletedInitialMasterElection = false;
 
   enum class UpdateSelfState : uint8_t {
@@ -915,6 +978,54 @@ public:
   TimeoutPacket ignitionSwitch;
   TimeoutPacket brainPeerHeartbeatTicker;
   TimeoutPacket spotDecomissionChecker;
+  bool spotDecommissionCheckActive = false;
+  CoroutineStack spotDecommissionCheckCoroutine;
+  ProdigyBrainMachineLifecycleCoordinator machineLifecycle;
+  ProdigyBrainElasticAddressCoordinator elasticAddressOperations;
+  ProdigyBrainDNSOperationCoordinator dnsOperations;
+  TimeoutPacket dnsReconcileRetry;
+  bool dnsReconcileRetryInstalled = false;
+  bool dnsReconcileRetryArmed = false;
+  uint32_t dnsReconcileFailureCount = 0;
+  enum class PendingDNSOperationKind : uint8_t
+  {
+    lease,
+    challenge
+  };
+  class PendingDNSOperation
+  {
+  public:
+
+    PendingDNSOperationKind kind = PendingDNSOperationKind::lease;
+    ProdigyBrainDNSOperationCoordinator::Action action = ProdigyBrainDNSOperationCoordinator::Action::upsert;
+    RoutableResourceLease lease;
+    ProdigyDNSRecordBinding record;
+    String certificateKey;
+    Mothership *stream = nullptr;
+    uint64_t streamIncarnation = 0;
+    MothershipTopic topic = MothershipTopic::presentACMEDNS01Challenge;
+    AcmeDNS01ChallengeResponse *inlineResponse = nullptr;
+    uint64_t controlID = 0;
+  };
+  class PendingDNSControl
+  {
+  public:
+
+    Mothership *stream = nullptr;
+    uint64_t streamIncarnation = 0;
+    MothershipTopic topic = MothershipTopic::upsertDNSBinding;
+    RoutableResourceLeaseReport response;
+    RoutableResourceLeaseReport *inlineResponse = nullptr;
+    uint32_t outstanding = 0;
+  };
+  bytell_hash_map<uint64_t, PendingDNSOperation> pendingDNSOperations;
+  bytell_hash_map<uint64_t, PendingDNSControl> pendingDNSControls;
+  Vector<RoutableResourceLease> appliedDNSRecordLeases;
+  bytell_hash_set<uint64_t> deploymentsWaitingForDNS;
+  uint64_t nextDNSOperationOwner = 1;
+  bytell_hash_map<uint64_t, PendingElasticAddressControlOperation> pendingElasticAddressControlOperations;
+  bytell_hash_map<BrainView *, MasterAuthorityReplicationPeerState> masterAuthorityReplicationByPeer;
+  CoroutineStack brainInventoryCoroutine;
   bytell_hash_map<BrainView *, TimeoutPacket *> brainWaiters;
   bytell_hash_map<BrainView *, TimeoutPacket *> brainReconnectWaiters;
   bytell_hash_map<BrainView *, TimeoutPacket *> brainLivenessWaiters;
@@ -1600,6 +1711,14 @@ public:
     {
       masterAuthorityRuntimeState.nextPendingAddMachinesOperationID = 1;
     }
+    if (masterAuthorityRuntimeState.nextPendingElasticAddressOperationID == 0)
+    {
+      masterAuthorityRuntimeState.nextPendingElasticAddressOperationID = 1;
+    }
+    if (masterAuthorityRuntimeState.nextDNSIntentRevision == 0)
+    {
+      masterAuthorityRuntimeState.nextDNSIntentRevision = 1;
+    }
 
     masterAuthorityRuntimeState.statefulWorkerTopologyUpgradeOperations = statefulWorkerTopologyUpgradeRuntimeState;
     masterAuthorityRuntimeState.deferredStatefulScaleIntents = deferredStatefulScaleIntentRuntimeState;
@@ -1636,7 +1755,150 @@ public:
     return dnsProvider->supportsProvider(provider) ? dnsProvider : nullptr;
   }
 
-  bool applyDNSRecordLease(const RoutableResourceLease& lease, bool remove, String& failure)
+  static void ownDNSRecordLease(RoutableResourceLease& target, const RoutableResourceLease& source)
+  {
+    target = source;
+    target.owner.name.assign(source.owner.name);
+    target.dnsProvider.assign(source.dnsProvider);
+    target.dnsCredentialName.assign(source.dnsCredentialName);
+    target.dnsZone.assign(source.dnsZone);
+    target.dnsName.assign(source.dnsName);
+    target.dnsType.assign(source.dnsType);
+  }
+
+  static void ownDNSRecordBinding(ProdigyDNSRecordBinding& target,
+                                  const ProdigyDNSRecordBinding& source)
+  {
+    target.provider.assign(source.provider);
+    target.credentialName.assign(source.credentialName);
+    target.zone.assign(source.zone);
+    target.name.assign(source.name);
+    target.type.assign(source.type);
+    target.ttl = source.ttl;
+    target.values.clear();
+    for (const String& value : source.values)
+    {
+      target.values.emplace_back().assign(value);
+    }
+  }
+
+  bool dnsRecordLeaseOperationPending(const RoutableResourceLease& lease,
+                                      ProdigyBrainDNSOperationCoordinator::Action action) const
+  {
+    for (const auto& [owner, pending] : pendingDNSOperations)
+    {
+      (void)owner;
+      if (pending.kind == PendingDNSOperationKind::lease && pending.action == action && pending.lease == lease)
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool dnsRecordLeaseApplied(const RoutableResourceLease& lease) const
+  {
+    for (const RoutableResourceLease& applied : appliedDNSRecordLeases)
+    {
+      if (applied == lease)
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  uint64_t mintDNSOperationOwner(void)
+  {
+    uint64_t owner = nextDNSOperationOwner++;
+    if (owner == 0)
+    {
+      owner = nextDNSOperationOwner++;
+    }
+    return owner;
+  }
+
+  uint64_t mintDNSIntentRevision(void)
+  {
+    uint64_t revision = masterAuthorityRuntimeState.nextDNSIntentRevision++;
+    if (revision == 0)
+    {
+      revision = masterAuthorityRuntimeState.nextDNSIntentRevision++;
+    }
+    if (masterAuthorityRuntimeState.nextDNSIntentRevision == 0)
+    {
+      masterAuthorityRuntimeState.nextDNSIntentRevision = 1;
+    }
+    return revision;
+  }
+
+  uint64_t beginDNSControl(Mothership *stream,
+                           MothershipTopic topic,
+                           uint32_t outstanding,
+                           RoutableResourceLeaseReport *inlineResponse)
+  {
+    const uint64_t identifier = mintDNSOperationOwner();
+    PendingDNSControl control;
+    control.stream = stream;
+    control.streamIncarnation = stream == nullptr ? 0 : stream->connectionIncarnation;
+    control.topic = topic;
+    control.inlineResponse = inlineResponse;
+    control.outstanding = outstanding;
+    pendingDNSControls.insert_or_assign(identifier, std::move(control));
+    return identifier;
+  }
+
+  void finishDNSControl(uint64_t controlID,
+                        const RoutableResourceLease& lease,
+                        bool success,
+                        const String& failure)
+  {
+    auto controlIt = pendingDNSControls.find(controlID);
+    if (controlIt == pendingDNSControls.end())
+    {
+      return;
+    }
+    PendingDNSControl& control = controlIt->second;
+    if (success)
+    {
+      if (control.topic == MothershipTopic::upsertDNSBinding)
+      {
+        control.response.leases.push_back(dnsBindingAddressLease(lease));
+      }
+      control.response.leases.push_back(lease);
+    }
+    else if (control.response.failure.empty())
+    {
+      control.response.failure.assign(failure);
+    }
+    if (control.outstanding > 0)
+    {
+      control.outstanding -= 1;
+    }
+    if (control.outstanding != 0)
+    {
+      return;
+    }
+
+    control.response.success = control.response.failure.empty();
+    if (control.inlineResponse != nullptr)
+    {
+      *control.inlineResponse = control.response;
+    }
+    if (control.stream != nullptr && activeMotherships.contains(control.stream) &&
+        control.stream->connectionIncarnation == control.streamIncarnation)
+    {
+      String serializedResponse;
+      BitseryEngine::serialize(serializedResponse, control.response);
+      Message::construct(control.stream->wBuffer, control.topic, serializedResponse);
+      (void)flushActiveMothershipSendBuffer(control.stream, "dns-control-complete");
+    }
+    pendingDNSControls.erase(controlIt);
+  }
+
+  bool enqueueDNSRecordLease(const RoutableResourceLease& lease,
+                             String& failure,
+                             uint64_t controlID = 0)
   {
     failure.clear();
     if (lease.kind != RoutableResourceLeaseKind::dnsRecord)
@@ -1669,7 +1931,43 @@ public:
       return false;
     }
 
-    return remove ? provider->remove(binding, *credential, failure) : provider->upsert(binding, *credential, failure);
+    const ProdigyBrainDNSOperationCoordinator::Action action = lease.dnsDeletePending ?
+                                                                   ProdigyBrainDNSOperationCoordinator::Action::remove :
+                                                                   ProdigyBrainDNSOperationCoordinator::Action::upsert;
+    if (dnsRecordLeaseOperationPending(lease, action))
+    {
+      if (controlID == 0)
+      {
+        return true;
+      }
+      failure.assign("DNS operation is already pending; retry the control request"_ctv);
+      return false;
+    }
+    if (dnsOperations.canEnqueue() == false)
+    {
+      failure.assign("DNS operation queue is full; authoritative intent remains pending"_ctv);
+      return false;
+    }
+
+    const uint64_t owner = mintDNSOperationOwner();
+    PendingDNSOperation pending;
+    pending.kind = PendingDNSOperationKind::lease;
+    pending.action = action;
+    pending.controlID = controlID;
+    ownDNSRecordLease(pending.lease, lease);
+    pendingDNSOperations.insert_or_assign(owner, std::move(pending));
+    if (dnsOperations.enqueue(*provider,
+                              action,
+                              binding,
+                              lease.owner.applicationID,
+                              credential->generation,
+                              owner))
+    {
+      return true;
+    }
+    pendingDNSOperations.erase(owner);
+    failure.assign("DNS operation queue rejected authoritative intent"_ctv);
+    return false;
   }
 
   static bool credentialBundleHasTlsIdentityGeneration(const CredentialBundle& bundle, const String& name, uint64_t generation)
@@ -2453,24 +2751,62 @@ public:
 
   bool cleanupPublicTlsPendingDNS01Challenges(PublicTlsCertificateState& certificate)
   {
-    bool changed = false;
-    for (auto it = certificate.pendingDNS01Challenges.begin(); it != certificate.pendingDNS01Challenges.end();)
+    if (weAreMaster == false)
     {
-      const ApiCredential *credential = findDNSCredential(certificate.spec.applicationID, it->credentialName);
-      ProdigyDNSProvider *provider = credential == nullptr || routableResourceDNSPartEquals(credential->provider, it->provider, false) == false ? nullptr : resolveDNSProvider(it->provider);
-      String ignoredFailure = {};
-      ProdigyDNSRecordBinding record = acmeDNS01ChallengeRecordFromState(*it);
-      if (provider != nullptr && provider->cleanupTXT(record, *credential, ignoredFailure))
+      return false;
+    }
+    const String certificateKey = publicTlsCertificateRuntimeKey(certificate);
+    for (const AcmeDNS01ChallengeState& challenge : certificate.pendingDNS01Challenges)
+    {
+      ProdigyDNSRecordBinding record = acmeDNS01ChallengeRecordFromState(challenge);
+      bool alreadyPending = false;
+      for (const auto& [owner, pending] : pendingDNSOperations)
       {
-        it = certificate.pendingDNS01Challenges.erase(it);
-        changed = true;
+        (void)owner;
+        alreadyPending = pending.kind == PendingDNSOperationKind::challenge &&
+                         pending.action == ProdigyBrainDNSOperationCoordinator::Action::cleanupTXT &&
+                         pending.certificateKey.equals(certificateKey) &&
+                         prodigyACMEDNS01ChallengeStatesEqual(acmeDNS01ChallengeStateFromRecord(pending.record), challenge);
+        if (alreadyPending)
+        {
+          break;
+        }
       }
-      else
+      if (alreadyPending)
       {
-        ++it;
+        continue;
+      }
+
+      const ApiCredential *credential = findDNSCredential(certificate.spec.applicationID, challenge.credentialName);
+      ProdigyDNSProvider *provider = credential == nullptr ||
+                                             routableResourceDNSPartEquals(credential->provider, challenge.provider, false) == false ?
+                                         nullptr :
+                                         resolveDNSProvider(challenge.provider);
+      if (provider == nullptr || dnsOperations.canEnqueue() == false)
+      {
+        armDNSReconciliationRetry();
+        break;
+      }
+      const uint64_t owner = mintDNSOperationOwner();
+      PendingDNSOperation pending;
+      pending.kind = PendingDNSOperationKind::challenge;
+      pending.action = ProdigyBrainDNSOperationCoordinator::Action::cleanupTXT;
+      ownDNSRecordBinding(pending.record, record);
+      pending.certificateKey.assign(certificateKey);
+      pendingDNSOperations.insert_or_assign(owner, std::move(pending));
+      if (!dnsOperations.enqueue(*provider,
+                                ProdigyBrainDNSOperationCoordinator::Action::cleanupTXT,
+                                record,
+                                certificate.spec.applicationID,
+                                credential->generation,
+                                owner))
+      {
+        pendingDNSOperations.erase(owner);
+        armDNSReconciliationRetry();
+        break;
       }
     }
-    return changed;
+    return false;
   }
 
   PublicTlsCertificateState *findPublicTlsCertificateStateByRuntimeKey(const String& key)
@@ -2521,7 +2857,8 @@ public:
   {
     for (PublicTlsCertificateState& certificate : masterAuthorityRuntimeState.publicTlsCertificates)
     {
-      if (certificate.spec.deploymentID != spec.deploymentID &&
+      if (certificate.releasePending == false &&
+          certificate.spec.deploymentID != spec.deploymentID &&
           publicTlsCertbotJobs.find(publicTlsCertificateRuntimeKey(certificate)) == publicTlsCertbotJobs.end() &&
           publicTlsCertificateTransferCompatible(certificate, spec))
       {
@@ -2758,8 +3095,16 @@ public:
       else
       {
         cancelPublicTlsCertbotProcess(key);
+        it->releasePending = true;
         (void)cleanupPublicTlsPendingDNS01Challenges(*it);
-        it = masterAuthorityRuntimeState.publicTlsCertificates.erase(it);
+        if (it->pendingDNS01Challenges.empty())
+        {
+          it = masterAuthorityRuntimeState.publicTlsCertificates.erase(it);
+        }
+        else
+        {
+          ++it;
+        }
         changed = true;
       }
     }
@@ -2799,6 +3144,7 @@ public:
       (void)cleanupPublicTlsPendingDNS01Challenges(certificate);
       certificate.spec = spec;
       certificate.certbotCertName = certName;
+      certificate.releasePending = false;
       return true;
     }
     return false;
@@ -2821,8 +3167,16 @@ public:
         continue;
       }
       cancelPublicTlsCertbotProcess(publicTlsCertificateRuntimeKey(*it));
+      it->releasePending = true;
       (void)cleanupPublicTlsPendingDNS01Challenges(*it);
-      it = masterAuthorityRuntimeState.publicTlsCertificates.erase(it);
+      if (it->pendingDNS01Challenges.empty())
+      {
+        it = masterAuthorityRuntimeState.publicTlsCertificates.erase(it);
+      }
+      else
+      {
+        ++it;
+      }
       changed += 1;
     }
     if (changed > 0)
@@ -2832,7 +3186,10 @@ public:
     return changed;
   }
 
-  bool applyACMEDNS01Challenge(const AcmeDNS01ChallengeRequest& request, bool cleanup, AcmeDNS01ChallengeResponse& response)
+  bool applyACMEDNS01Challenge(const AcmeDNS01ChallengeRequest& request,
+                               bool cleanup,
+                               AcmeDNS01ChallengeResponse& response,
+                               Mothership *replyStream = nullptr)
   {
     response = {};
     if (request.clusterUUID == 0 || brainConfig.clusterUUID == 0 || request.clusterUUID != brainConfig.clusterUUID)
@@ -2898,25 +3255,37 @@ public:
       return false;
     }
 
-    if ((cleanup ? provider->cleanupTXT(record, *credential, response.failure) : provider->presentTXT(record, *credential, response.failure)) == false)
+    const uint64_t owner = mintDNSOperationOwner();
+    PendingDNSOperation pending;
+    pending.kind = PendingDNSOperationKind::challenge;
+    pending.action = cleanup ? ProdigyBrainDNSOperationCoordinator::Action::cleanupTXT :
+                               ProdigyBrainDNSOperationCoordinator::Action::presentTXT;
+    ownDNSRecordBinding(pending.record, record);
+    pending.certificateKey.assign(publicTlsCertificateRuntimeKey(*certificate));
+    pending.stream = replyStream;
+    pending.streamIncarnation = replyStream == nullptr ? 0 : replyStream->connectionIncarnation;
+    pending.topic = cleanup ? MothershipTopic::cleanupACMEDNS01Challenge :
+                              MothershipTopic::presentACMEDNS01Challenge;
+    pending.inlineResponse = replyStream == nullptr ? &response : nullptr;
+    pendingDNSOperations.insert_or_assign(owner, std::move(pending));
+    const uint64_t propagationDelayUs = cleanup ? 0 : uint64_t(acmeDNSPropagationDelayMs(record, *credential)) * 1000;
+    if (!dnsOperations.enqueue(*provider,
+                              cleanup ? ProdigyBrainDNSOperationCoordinator::Action::cleanupTXT :
+                                        ProdigyBrainDNSOperationCoordinator::Action::presentTXT,
+                              record,
+                              request.applicationID,
+                              credential->generation,
+                              owner,
+                              propagationDelayUs))
     {
+      pendingDNSOperations.erase(owner);
+      response.failure.assign("ACME DNS operation queue is full"_ctv);
       return false;
     }
-    bool pendingChanged = cleanup ? forgetPublicTlsPendingDNS01Challenge(*certificate, record) : rememberPublicTlsPendingDNS01Challenge(*certificate, record);
-    if (pendingChanged)
+    if (auto it = pendingDNSOperations.find(owner); it != pendingDNSOperations.end())
     {
-      noteMasterAuthorityRuntimeStateChanged();
+      it->second.inlineResponse = nullptr;
     }
-    if (cleanup == false)
-    {
-      sleepMs(acmeDNSPropagationDelayMs(record, *credential));
-    }
-
-    response.success = true;
-    response.recordName = record.name;
-    response.provider = record.provider;
-    response.zone = record.zone;
-    response.ttl = record.ttl;
     return true;
   }
 
@@ -2937,16 +3306,6 @@ public:
     }
     uint64_t ttlMs = uint64_t(record.ttl ? record.ttl : 60) * 1000;
     return uint32_t(std::min<uint64_t>(std::max<uint64_t>(ttlMs, 5000), 60'000));
-  }
-
-  static void sleepMs(uint32_t ms)
-  {
-    while (ms > 0)
-    {
-      uint32_t chunk = std::min<uint32_t>(ms, 1000);
-      usleep(chunk * 1000);
-      ms -= chunk;
-    }
   }
 
   bool importACMELineage(const AcmeLineageImportRequest& request, AcmeLineageImportResponse& response)
@@ -3109,27 +3468,24 @@ public:
   bool applyDeploymentDNSRecordLeases(const Vector<RoutableResourceLease>& leases, String& failure)
   {
     failure.clear();
-    Vector<RoutableResourceLease> applied = {};
     for (const RoutableResourceLease& lease : leases)
     {
       if (lease.kind != RoutableResourceLeaseKind::dnsRecord)
       {
         continue;
       }
-      if (applyDNSRecordLease(lease, false, failure) == false)
+      String enqueueFailure;
+      if (enqueueDNSRecordLease(lease, enqueueFailure) == false)
       {
-        String rollbackFailure = {};
-        for (const RoutableResourceLease& rollback : applied)
+        if (failure.empty())
         {
-          if (applyDNSRecordLease(rollback, true, rollbackFailure) == false)
-          {
-            basics_log("dns rollback failed failure=%s\n", rollbackFailure.c_str());
-          }
+          failure.assign(enqueueFailure);
         }
-        return false;
+        break;
       }
-      applied.push_back(lease);
     }
+    // The durable leases are authoritative. Admission pressure leaves the
+    // unqueued suffix pending for the deterministic reconciliation refill.
     return true;
   }
 
@@ -3144,7 +3500,22 @@ public:
       return 0;
     }
 
+    for (auto applied = appliedDNSRecordLeases.begin(); applied != appliedDNSRecordLeases.end();)
+    {
+      bool current = false;
+      for (const RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
+      {
+        if (lease == *applied && lease.dnsDeletePending == false)
+        {
+          current = true;
+          break;
+        }
+      }
+      applied = current ? applied + 1 : appliedDNSRecordLeases.erase(applied);
+    }
+
     uint32_t applied = 0;
+    bool rejected = false;
     for (const RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
     {
       if (lease.kind != RoutableResourceLeaseKind::dnsRecord)
@@ -3152,10 +3523,19 @@ public:
         continue;
       }
 
-      String leaseFailure = {};
-      if (applyDNSRecordLease(lease, false, leaseFailure))
+      if (dnsRecordLeaseApplied(lease) ||
+          dnsRecordLeaseOperationPending(lease,
+                                         lease.dnsDeletePending ?
+                                             ProdigyBrainDNSOperationCoordinator::Action::remove :
+                                             ProdigyBrainDNSOperationCoordinator::Action::upsert))
       {
-        applied += 1;
+        applied += dnsRecordLeaseApplied(lease) ? 1 : 0;
+        continue;
+      }
+
+      String leaseFailure = {};
+      if (enqueueDNSRecordLease(lease, leaseFailure))
+      {
         continue;
       }
 
@@ -3163,9 +3543,32 @@ public:
       {
         *failure = leaseFailure;
       }
+      rejected = true;
       basics_log("dns reconcile failed failure=%s\n", leaseFailure.c_str());
     }
+    if (rejected)
+    {
+      armDNSReconciliationRetry();
+    }
     return applied;
+  }
+
+  void reconcileAuthoritativeDNSState(void)
+  {
+    (void)reconcileDNSRecordLeases();
+    if (masterAuthorityRuntimeState.dnsControlPairingLeases.empty() == false)
+    {
+      ProdigyDnsControlPairingOperation operation = {};
+      operation.action = ProdigyDnsControlPairingAction::reconcile;
+      if (manageDnsControlPairing(operation) == false)
+      {
+        armDNSReconciliationRetry();
+      }
+    }
+    for (PublicTlsCertificateState& certificate : masterAuthorityRuntimeState.publicTlsCertificates)
+    {
+      (void)cleanupPublicTlsPendingDNS01Challenges(certificate);
+    }
   }
 
   bool resolveDeploymentWormholeDNSBinding(const DeploymentPlan& plan, Wormhole& wormhole, String& failure) const
@@ -3247,6 +3650,11 @@ public:
 
     Vector<RoutableResourceLease> leases = {};
     auto reserveLease = [&](RoutableResourceLease&& lease, StringType auto&& conflictFailure, StringType auto&& duplicateFailure) -> bool {
+      if (lease.registeredPrefixUUID != 0 && routablePrefixReleasePending(lease.registeredPrefixUUID))
+      {
+        failure.assign("routable prefix cleanup is pending"_ctv);
+        return false;
+      }
       bool present = false;
       for (const RoutableResourceLease& existing : routableResourceLeaseRuntimeState)
       {
@@ -3331,12 +3739,16 @@ public:
 
     if (commit && leases.empty() == false)
     {
-      if (applyDeploymentDNSRecordLeases(leases, failure) == false)
+      for (RoutableResourceLease& lease : leases)
       {
-        return false;
+        if (lease.kind == RoutableResourceLeaseKind::dnsRecord)
+        {
+          lease.dnsIntentRevision = mintDNSIntentRevision();
+        }
       }
       routableResourceLeaseRuntimeState.insert(routableResourceLeaseRuntimeState.end(), leases.begin(), leases.end());
       noteRoutableResourceLeaseRuntimeStateChanged();
+      (void)applyDeploymentDNSRecordLeases(leases, failure);
     }
     return true;
   }
@@ -3423,6 +3835,11 @@ public:
       lease.owner.name = wormhole.name;
       lease.registeredPrefixUUID = wormhole.routablePrefixUUID;
       lease.address = wormhole.externalAddress;
+      if (lease.kind == RoutableResourceLeaseKind::dnsRecord)
+      {
+        lease.dnsDeletePending = false;
+        lease.dnsIntentRevision = mintDNSIntentRevision();
+      }
       return true;
     }
 
@@ -3433,6 +3850,8 @@ public:
   {
     failure.clear();
     lease.kind = RoutableResourceLeaseKind::dnsRecord;
+    lease.dnsDeletePending = false;
+    lease.dnsIntentRevision = 0;
     if (lease.owner.applicationID == 0)
     {
       failure.assign("DNS binding applicationID required"_ctv);
@@ -3446,6 +3865,11 @@ public:
     if (lease.address.isNull() || lease.registeredPrefixUUID == 0)
     {
       failure.assign("DNS binding requires routablePrefixUUID and address"_ctv);
+      return false;
+    }
+    if (routablePrefixReleasePending(lease.registeredPrefixUUID))
+    {
+      failure.assign("DNS binding routable prefix cleanup is pending"_ctv);
       return false;
     }
     if (brainConfig.dnsProvider.size() == 0 || routableResourceDNSPartEquals(lease.dnsProvider, brainConfig.dnsProvider, false) == false)
@@ -3586,7 +4010,141 @@ public:
     return false;
   }
 
-  bool upsertDNSBindingLease(RoutableResourceLease lease, RoutableResourceLeaseReport& response)
+  static bool persistDnsControlPairingState(
+      void *context,
+      const ProdigyMasterAuthorityRuntimeState&,
+      String *failure)
+  {
+    Brain& brain = *static_cast<Brain *>(context);
+    if (brain.commitMasterAuthorityStateChange())
+    {
+      if (failure)
+      {
+        failure->clear();
+      }
+      return true;
+    }
+    if (failure)
+    {
+      failure->assign("failed to durably commit DNS control pairing state"_ctv);
+    }
+    return false;
+  }
+
+  static bool dispatchDnsControlPairing(
+      void *context,
+      const ProdigyDnsControlPairingLease& lease,
+      bool activate,
+      String *failure)
+  {
+    Brain& brain = *static_cast<Brain *>(context);
+    auto deploymentIt = brain.deploymentsByApp.find(MeshRegistry::DNS::applicationID);
+    if (deploymentIt == brain.deploymentsByApp.end() ||
+        deploymentIt->second == nullptr ||
+        deploymentIt->second->plan.wormholes.size() != 1)
+    {
+      if (failure)
+      {
+        failure->assign("DNS control deployment is unavailable"_ctv);
+      }
+      return false;
+    }
+
+    const Wormhole& ingress = deploymentIt->second->plan.wormholes[0];
+    if (ingress.name.equal("dns-control"_ctv) == false ||
+        ingress.externalAddress.is6 == false ||
+        ingress.externalAddress.isNull() || ingress.externalPort != 5353 ||
+        ingress.containerPort != 5353 || ingress.layer4 != IPPROTO_TCP ||
+        ingress.isQuic ||
+        ingress.source != ExternalAddressSource::registeredRoutablePrefix)
+    {
+      if (failure)
+      {
+        failure->assign("DNS control deployment does not use the strict IPv6/TCP plan"_ctv);
+      }
+      return false;
+    }
+
+    uint128_t clientAddress = 0;
+    std::memcpy(&clientAddress, lease.clientAddress.v6,
+                sizeof(clientAddress));
+    bool dispatched = false;
+    for (ContainerView *container : deploymentIt->second->containers)
+    {
+      if (container && container->canProxySendToNeuron() &&
+          container->advertisingOnPorts.contains(5353))
+      {
+        container->advertisementPairing(
+            lease.secret,
+            clientAddress,
+            MeshRegistry::DNS::resolver,
+            0,
+            activate);
+        dispatched = true;
+      }
+    }
+    if (dispatched == false && failure)
+    {
+      failure->assign("DNS control deployment has no reachable resolver replica"_ctv);
+    }
+    return dispatched;
+  }
+
+  bool manageDnsControlPairing(ProdigyDnsControlPairingOperation& operation)
+  {
+    const ProdigyDnsControlPairingAction action = operation.action;
+    const ProdigyDnsControlClientRole role = operation.role;
+    const IPAddress clientAddress = operation.clientAddress;
+    const int64_t lifetimeMs = operation.lifetimeMs;
+    const uint128_t leaseID = operation.leaseID;
+    const uint64_t generation = operation.generation;
+    operation.lease = {};
+    operation.succeeded = false;
+    operation.failure.clear();
+    if (weAreMaster == false)
+    {
+      operation.failure.assign("DNS control pairings can be managed only by the master"_ctv);
+      return false;
+    }
+
+    ProdigyDns::ControlPairingLeases leases(
+        masterAuthorityRuntimeState,
+        {this, persistDnsControlPairingState, dispatchDnsControlPairing});
+    switch (action)
+    {
+      case ProdigyDnsControlPairingAction::mint:
+        operation.succeeded = leases.mint(
+            role,
+            clientAddress,
+            Time::now<TimeResolution::ms>(),
+            lifetimeMs,
+            operation.lease,
+            &operation.failure);
+        break;
+      case ProdigyDnsControlPairingAction::revoke:
+        operation.succeeded = leases.revoke(
+            leaseID,
+            generation,
+            &operation.failure);
+        break;
+      case ProdigyDnsControlPairingAction::reconcile:
+        operation.succeeded = leases.reconcile(
+            Time::now<TimeResolution::ms>(), &operation.failure);
+        break;
+      default:
+        operation.failure.assign("invalid DNS control pairing action"_ctv);
+        break;
+    }
+    if (masterAuthorityRuntimeState.dnsControlPairingLeases.empty() == false)
+    {
+      armDNSReconciliationRetry();
+    }
+    return operation.succeeded;
+  }
+
+  bool upsertDNSBindingLease(RoutableResourceLease lease,
+                             RoutableResourceLeaseReport& response,
+                             Mothership *replyStream = nullptr)
   {
     response = {};
     if (validateDNSBindingLease(lease, response.failure) == false)
@@ -3607,6 +4165,12 @@ public:
       }
       if (existing.kind == RoutableResourceLeaseKind::dnsRecord && routableResourceDNSIdentityMatches(existing, lease) && routableResourceLeaseOwnersCompatible(existing.owner, lease.owner))
       {
+        RoutableResourceLease sameRevision = lease;
+        sameRevision.dnsIntentRevision = existing.dnsIntentRevision;
+        if (existing.dnsDeletePending == false && existing == sameRevision)
+        {
+          lease.dnsIntentRevision = existing.dnsIntentRevision;
+        }
         continue;
       }
       if (existing.kind == RoutableResourceLeaseKind::wormholeAddress && existing.registeredPrefixUUID == lease.registeredPrefixUUID && existing.address.equals(lease.address) && existing.owner == lease.owner)
@@ -3623,22 +4187,34 @@ public:
         return false;
       }
     }
-    if (applyDNSRecordLease(lease, false, response.failure) == false)
+    if (lease.dnsIntentRevision == 0)
     {
-      return false;
+      lease.dnsIntentRevision = mintDNSIntentRevision();
     }
-
     retained.push_back(addressLease);
     retained.push_back(lease);
     routableResourceLeaseRuntimeState = std::move(retained);
     noteRoutableResourceLeaseRuntimeStateChanged();
-    response.leases.push_back(addressLease);
-    response.leases.push_back(lease);
-    response.success = true;
+    const uint64_t controlID = beginDNSControl(replyStream,
+                                               MothershipTopic::upsertDNSBinding,
+                                               1,
+                                               replyStream == nullptr ? &response : nullptr);
+    String failure;
+    if (enqueueDNSRecordLease(routableResourceLeaseRuntimeState.back(), failure, controlID) == false)
+    {
+      finishDNSControl(controlID, lease, false, failure);
+      return false;
+    }
+    if (auto it = pendingDNSControls.find(controlID); it != pendingDNSControls.end())
+    {
+      it->second.inlineResponse = nullptr;
+    }
     return true;
   }
 
-  bool deleteDNSBindingLease(RoutableResourceLease request, RoutableResourceLeaseReport& response)
+  bool deleteDNSBindingLease(RoutableResourceLease request,
+                             RoutableResourceLeaseReport& response,
+                             Mothership *replyStream = nullptr)
   {
     response = {};
     request.kind = RoutableResourceLeaseKind::dnsRecord;
@@ -3675,72 +4251,76 @@ public:
       response.failure.assign("DNS binding is in use"_ctv);
       return false;
     }
-    if (applyDNSRecordLease(dnsLease, true, response.failure) == false)
+    for (RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
     {
-      return false;
-    }
-
-    for (auto it = routableResourceLeaseRuntimeState.begin(); it != routableResourceLeaseRuntimeState.end();)
-    {
-      if ((it->kind == RoutableResourceLeaseKind::dnsRecord && routableResourceDNSIdentityMatches(*it, dnsLease)) ||
-          (it->kind == RoutableResourceLeaseKind::wormholeAddress && routableResourceLeaseResourcesIntersect(*it, addressLease) && it->owner == addressLease.owner))
+      if (lease.kind == RoutableResourceLeaseKind::dnsRecord && lease == dnsLease)
       {
-        it = routableResourceLeaseRuntimeState.erase(it);
-        continue;
+        if (lease.dnsDeletePending == false)
+        {
+          lease.dnsDeletePending = true;
+          lease.dnsIntentRevision = mintDNSIntentRevision();
+        }
+        dnsLease = lease;
+        break;
       }
-      ++it;
     }
     noteRoutableResourceLeaseRuntimeStateChanged();
-    response.leases.push_back(dnsLease);
-    response.success = true;
+    const uint64_t controlID = beginDNSControl(replyStream,
+                                               MothershipTopic::deleteDNSBinding,
+                                               1,
+                                               replyStream == nullptr ? &response : nullptr);
+    String failure;
+    if (enqueueDNSRecordLease(dnsLease, failure, controlID) == false)
+    {
+      finishDNSControl(controlID, dnsLease, false, failure);
+      return false;
+    }
+    if (auto it = pendingDNSControls.find(controlID); it != pendingDNSControls.end())
+    {
+      it->second.inlineResponse = nullptr;
+    }
     return true;
   }
 
-  bool teardownDNSBindingLeases(RoutableResourceLeaseReport& response)
+  bool teardownDNSBindingLeases(RoutableResourceLeaseReport& response,
+                                Mothership *replyStream = nullptr)
   {
     response = {};
-    for (const RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
+    for (RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
     {
       if (lease.kind != RoutableResourceLeaseKind::dnsRecord)
       {
         continue;
       }
-      if (applyDNSRecordLease(lease, true, response.failure) == false)
+      if (lease.dnsDeletePending == false)
       {
-        return false;
+        lease.dnsDeletePending = true;
+        lease.dnsIntentRevision = mintDNSIntentRevision();
       }
       response.leases.push_back(lease);
     }
-
-    auto removeLease = [&](const RoutableResourceLease& lease) -> bool {
-      for (const RoutableResourceLease& dnsLease : response.leases)
-      {
-        RoutableResourceLease addressLease = dnsBindingAddressLease(dnsLease);
-        if ((lease.kind == RoutableResourceLeaseKind::dnsRecord && routableResourceDNSIdentityMatches(lease, dnsLease) && lease.owner == dnsLease.owner) ||
-            (lease.kind == RoutableResourceLeaseKind::wormholeAddress && lease.registeredPrefixUUID == addressLease.registeredPrefixUUID && lease.address.equals(addressLease.address) && lease.owner == addressLease.owner))
-        {
-          return true;
-        }
-      }
+    if (response.leases.empty())
+    {
+      response.success = true;
       return false;
-    };
-
-    for (auto it = routableResourceLeaseRuntimeState.begin(); it != routableResourceLeaseRuntimeState.end();)
+    }
+    const uint64_t controlID = beginDNSControl(replyStream,
+                                               MothershipTopic::teardownDNSBindings,
+                                               uint32_t(response.leases.size()),
+                                               replyStream == nullptr ? &response : nullptr);
+    noteRoutableResourceLeaseRuntimeStateChanged();
+    for (const RoutableResourceLease& lease : response.leases)
     {
-      if (removeLease(*it))
+      String failure;
+      if (enqueueDNSRecordLease(lease, failure, controlID) == false)
       {
-        it = routableResourceLeaseRuntimeState.erase(it);
-        continue;
+        finishDNSControl(controlID, lease, false, failure);
       }
-      ++it;
     }
-    if (response.leases.empty() == false)
+    if (auto it = pendingDNSControls.find(controlID); it != pendingDNSControls.end())
     {
-      noteRoutableResourceLeaseRuntimeStateChanged();
+      it->second.inlineResponse = nullptr;
     }
-
-    response.success = true;
-    response.failure.clear();
     return true;
   }
 
@@ -3824,6 +4404,7 @@ public:
   {
     uint32_t publicTlsChanged = releasePublicTlsCertificatesForDeployment(deploymentID);
     uint32_t changed = 0;
+    bool dnsChanged = false;
     for (RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
     {
       if (lease.owner.deploymentID == deploymentID && transferRoutableResourceLeaseToApplicationHead(lease))
@@ -3832,33 +4413,29 @@ public:
       }
     }
 
-    bool dnsDeleteFailed = false;
-    for (const RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
+    for (RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
     {
       if (lease.owner.deploymentID != deploymentID || lease.kind != RoutableResourceLeaseKind::dnsRecord)
       {
         continue;
       }
 
-      String failure = {};
-      if (applyDNSRecordLease(lease, true, failure) == false)
+      if (lease.dnsDeletePending == false)
       {
-        dnsDeleteFailed = true;
-        basics_log("dns delete failed failure=%s\n", failure.c_str());
+        lease.dnsDeletePending = true;
+        lease.dnsIntentRevision = mintDNSIntentRevision();
+        dnsChanged = true;
       }
-    }
-    if (dnsDeleteFailed)
-    {
-      if (changed > 0)
-      {
-        noteRoutableResourceLeaseRuntimeStateChanged();
-      }
-      return publicTlsChanged + changed;
     }
 
     for (auto it = routableResourceLeaseRuntimeState.begin(); it != routableResourceLeaseRuntimeState.end();)
     {
-      if (it->owner.deploymentID != deploymentID)
+      if (it->owner.deploymentID != deploymentID ||
+          it->kind == RoutableResourceLeaseKind::dnsRecord ||
+          (it->kind == RoutableResourceLeaseKind::wormholeAddress &&
+           std::any_of(routableResourceLeaseRuntimeState.begin(), routableResourceLeaseRuntimeState.end(), [&](const RoutableResourceLease& lease) {
+             return lease.kind == RoutableResourceLeaseKind::dnsRecord && lease.owner == it->owner && lease.dnsDeletePending;
+           })))
       {
         ++it;
         continue;
@@ -3867,10 +4444,11 @@ public:
       it = routableResourceLeaseRuntimeState.erase(it);
       changed += 1;
     }
-    if (changed > 0)
+    if (changed > 0 || dnsChanged)
     {
       noteRoutableResourceLeaseRuntimeStateChanged();
     }
+    reconcileAuthoritativeDNSState();
     return publicTlsChanged + changed;
   }
 
@@ -3914,6 +4492,101 @@ public:
     {
       upsertManagedMachineSchemaConfig(incomingSchema);
     }
+  }
+
+  ProdigyPendingAutonomousProvisioningOperation *findPendingAutonomousProvisioningOperation(
+      uint64_t deploymentID,
+      ApplicationLifetime lifetime)
+  {
+    for (ProdigyPendingAutonomousProvisioningOperation& operation :
+         masterAuthorityRuntimeState.pendingAutonomousProvisioningOperations)
+    {
+      if (operation.deploymentID == deploymentID &&
+          operation.applicationLifetime == uint8_t(lifetime))
+      {
+        return &operation;
+      }
+    }
+    return nullptr;
+  }
+
+  bool journalAutonomousProvisioningOperation(
+      uint64_t deploymentID,
+      ApplicationLifetime lifetime,
+      const String& machineSchema,
+      uint32_t count,
+      uint64_t& operationID)
+  {
+    operationID = 0;
+    if (deploymentID == 0 || machineSchema.empty() || count == 0 ||
+        masterAuthorityRuntimeState.nextPendingAddMachinesOperationID == 0 ||
+        masterAuthorityRuntimeState.nextPendingAddMachinesOperationID == UINT64_MAX)
+    {
+      return false;
+    }
+
+    const uint64_t previousGeneration = masterAuthorityRuntimeState.generation;
+    const uint64_t previousNextOperationID =
+        masterAuthorityRuntimeState.nextPendingAddMachinesOperationID;
+    const bool previousDurable = masterAuthorityRuntimeStateDurable;
+    const uint64_t previousDurableGeneration =
+        durableMasterAuthorityRuntimeStateGeneration;
+
+    ProdigyPendingAutonomousProvisioningOperation operation;
+    operation.operationID = previousNextOperationID;
+    operation.deploymentID = deploymentID;
+    operation.applicationLifetime = uint8_t(lifetime);
+    operation.machineSchema.assign(machineSchema);
+    operation.count = count;
+    masterAuthorityRuntimeState.nextPendingAddMachinesOperationID += 1;
+    masterAuthorityRuntimeState.pendingAutonomousProvisioningOperations.push_back(
+        std::move(operation));
+
+    if (commitMasterAuthorityStateChange() == false)
+    {
+      masterAuthorityRuntimeState.pendingAutonomousProvisioningOperations.pop_back();
+      masterAuthorityRuntimeState.nextPendingAddMachinesOperationID =
+          previousNextOperationID;
+      masterAuthorityRuntimeState.generation = previousGeneration;
+      masterAuthorityRuntimeStateDurable = previousDurable;
+      durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+      return false;
+    }
+
+    operationID = previousNextOperationID;
+    return true;
+  }
+
+  bool settleAutonomousProvisioningOperation(uint64_t operationID)
+  {
+    auto& operations =
+        masterAuthorityRuntimeState.pendingAutonomousProvisioningOperations;
+    for (auto it = operations.begin(); it != operations.end(); ++it)
+    {
+      if (it->operationID != operationID)
+      {
+        continue;
+      }
+
+      const uint64_t previousGeneration = masterAuthorityRuntimeState.generation;
+      const bool previousDurable = masterAuthorityRuntimeStateDurable;
+      const uint64_t previousDurableGeneration =
+          durableMasterAuthorityRuntimeStateGeneration;
+      ProdigyPendingAutonomousProvisioningOperation operation = std::move(*it);
+      const uint32_t index = uint32_t(it - operations.begin());
+      operations.erase(it);
+      if (commitMasterAuthorityStateChange())
+      {
+        return true;
+      }
+
+      operations.insert(operations.begin() + index, std::move(operation));
+      masterAuthorityRuntimeState.generation = previousGeneration;
+      masterAuthorityRuntimeStateDurable = previousDurable;
+      durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+      return false;
+    }
+    return true;
   }
 
   ProdigyPendingAddMachinesOperation *findPendingAddMachinesOperation(uint64_t operationID)
@@ -4060,7 +4733,16 @@ public:
     }
 
     bytell_hash_set<Machine *> providerMachines = {};
-    iaas->getMachines(nullptr, lookupScope, providerMachines);
+    if (brainConfig.runtimeEnvironment.kind == ProdigyEnvironmentKind::gcp)
+    {
+      failure.assign("gcp pending-machine refresh requires asynchronous inventory"_ctv);
+      return false;
+    }
+    iaas->getMachines(nullptr, lookupScope, providerMachines, failure);
+    if (failure.size() > 0)
+    {
+      return false;
+    }
 
     bool changed = false;
     for (ClusterMachine& machine : operation.plannedTopology.machines)
@@ -4412,6 +5094,13 @@ public:
     {
       return;
     }
+    if ((masterAuthorityRuntimeState.pendingElasticAddressAssignments.empty() == false ||
+         masterAuthorityRuntimeState.pendingElasticAddressReleases.empty() == false) &&
+        (masterAuthorityRuntimeStateDurable == false ||
+         durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation))
+    {
+      return;
+    }
 
     if (prodigyDebugDeployHeapEnabled())
     {
@@ -4429,9 +5118,16 @@ public:
     }
 
     String serialized;
-    ProdigyMasterAuthorityRuntimeState replicatedRuntimeState = masterAuthorityRuntimeState;
-    replicatedRuntimeState.updateSelf = {};
-    BitseryEngine::serialize(serialized, replicatedRuntimeState);
+    ProdigyMasterAuthorityStateTransition transition;
+    transition.runtimeState = masterAuthorityRuntimeState;
+    transition.runtimeState.updateSelf = {};
+    ownBrainConfig(brainConfig, transition.brainConfig);
+    BitseryEngine::serialize(serialized, transition);
+    String transitionDigest;
+    if (prodigyComputeSHA256Hex(serialized, transitionDigest) == false)
+    {
+      return;
+    }
 
     if (prodigyDebugDeployHeapEnabled())
     {
@@ -4447,6 +5143,12 @@ public:
                    (unsigned long long)heap.free);
       std::fflush(stderr);
     }
+    for (BrainView *peer : brains)
+    {
+      noteMasterAuthorityTransitionSentToPeer(peer,
+                                              transition.runtimeState,
+                                              transitionDigest);
+    }
     queueBrainReplication(BrainTopic::replicateMasterAuthorityState, serialized);
   }
 
@@ -4458,15 +5160,46 @@ public:
       masterAuthorityRuntimeState.generation += 1;
     }
 
+    if (persist)
+    {
+      masterAuthorityRuntimeStateDurable = false;
+      if (persistLocalRuntimeState() == false)
+      {
+        return;
+      }
+      masterAuthorityRuntimeStateDurable = true;
+      durableMasterAuthorityRuntimeStateGeneration =
+          masterAuthorityRuntimeState.generation;
+      captureDurableElasticAddressOperations();
+    }
+
     if (replicate)
     {
       queueMasterAuthorityRuntimeStateReplication();
     }
+  }
 
-    if (persist)
+  bool commitMasterAuthorityStateChange(bool advanceGeneration = true)
+  {
+    refreshMasterAuthorityRuntimeStateFromLiveFields();
+    if (advanceGeneration)
     {
-      persistLocalRuntimeState();
+      if (masterAuthorityRuntimeState.generation == UINT64_MAX)
+      {
+        return false;
+      }
+      masterAuthorityRuntimeState.generation += 1;
     }
+    masterAuthorityRuntimeStateDurable = false;
+    if (persistLocalRuntimeState() == false)
+    {
+      return false;
+    }
+    masterAuthorityRuntimeStateDurable = true;
+    durableMasterAuthorityRuntimeStateGeneration = masterAuthorityRuntimeState.generation;
+    captureDurableElasticAddressOperations();
+    queueMasterAuthorityRuntimeStateReplication();
+    return true;
   }
 
   bool pruneExpiredTaskExecutionRecords(int64_t nowMs)
@@ -4533,6 +5266,20 @@ public:
 
   void applyPersistentMasterAuthorityPackage(const ProdigyPersistentMasterAuthorityPackage& package)
   {
+    ProdigyMasterAuthorityRuntimeState restoredRuntimeState = package.runtimeState;
+    if (restoredRuntimeState.nextPendingElasticAddressOperationID == 0)
+    {
+      restoredRuntimeState.nextPendingElasticAddressOperationID = 1;
+    }
+    if (restoredRuntimeState.nextDNSIntentRevision == 0)
+    {
+      restoredRuntimeState.nextDNSIntentRevision = 1;
+    }
+    if (validatePendingElasticAddressOperations(restoredRuntimeState) == false ||
+        configurePendingElasticAddressReleaseFence(restoredRuntimeState) == false)
+    {
+      return;
+    }
     Vector<ProdigyManagedMachineSchema> previousSchemas = masterAuthorityRuntimeState.machineSchemas;
     tlsVaultFactoriesByApp = package.tlsVaultFactoriesByApp;
     apiCredentialSetsByApp = package.apiCredentialSetsByApp;
@@ -4542,14 +5289,26 @@ public:
     nextReservableApplicationID = (package.nextReservableApplicationID == 0) ? 1 : package.nextReservableApplicationID;
     deploymentPlans = package.deploymentPlans;
     failedDeployments = package.failedDeployments;
-    masterAuthorityRuntimeState = package.runtimeState;
+    masterAuthorityRuntimeState = std::move(restoredRuntimeState);
+    masterAuthorityRuntimeStateDurable = true;
+    durableMasterAuthorityRuntimeStateGeneration = masterAuthorityRuntimeState.generation;
+    captureDurableElasticAddressOperations();
     hasCompletedInitialMasterElection = masterAuthorityRuntimeState.hasCompletedInitialMasterElection;
     statefulWorkerTopologyUpgradeRuntimeState = masterAuthorityRuntimeState.statefulWorkerTopologyUpgradeOperations;
     deferredStatefulScaleIntentRuntimeState = masterAuthorityRuntimeState.deferredStatefulScaleIntents;
     routableResourceLeaseRuntimeState = masterAuthorityRuntimeState.routableResourceLeases;
+    appliedDNSRecordLeases.clear();
     if (masterAuthorityRuntimeState.nextPendingAddMachinesOperationID == 0)
     {
       masterAuthorityRuntimeState.nextPendingAddMachinesOperationID = 1;
+    }
+    if (masterAuthorityRuntimeState.nextPendingElasticAddressOperationID == 0)
+    {
+      masterAuthorityRuntimeState.nextPendingElasticAddressOperationID = 1;
+    }
+    if (masterAuthorityRuntimeState.nextDNSIntentRevision == 0)
+    {
+      masterAuthorityRuntimeState.nextDNSIntentRevision = 1;
     }
     nextMintedClientTlsGeneration = (masterAuthorityRuntimeState.nextMintedClientTlsGeneration == 0)
                                         ? 1
@@ -4561,7 +5320,13 @@ public:
     restorePersistentUpdateSelfState(masterAuthorityRuntimeState.updateSelf);
     restoreMothershipTunnelProviderDesiredStateFromMasterAuthority();
     syncManagedMachineSchemaConfigs(previousSchemas, masterAuthorityRuntimeState.machineSchemas);
-    (void)reconcileDNSRecordLeases();
+    (void)quarantinePendingElasticAddressReleasePrefixes(masterAuthorityRuntimeState);
+    reconcileAuthoritativeDNSState();
+    if (masterAuthorityRuntimeState.pendingElasticAddressAssignments.empty() &&
+        masterAuthorityRuntimeState.pendingElasticAddressReleases.empty() && iaas != nullptr)
+    {
+      (void)iaas->setElasticAddressReleaseFenceActive(false);
+    }
   }
 
   bool applyReplicatedMasterAuthorityRuntimeState(const ProdigyMasterAuthorityRuntimeState& incoming, bool persist = true)
@@ -4572,49 +5337,206 @@ public:
     {
       sanitizedIncoming.nextPendingAddMachinesOperationID = 1;
     }
+    if (sanitizedIncoming.nextPendingElasticAddressOperationID == 0 ||
+        validatePendingElasticAddressOperations(sanitizedIncoming) == false)
+    {
+      return false;
+    }
+    if (sanitizedIncoming.nextDNSIntentRevision == 0)
+    {
+      sanitizedIncoming.nextDNSIntentRevision = 1;
+    }
     if (sanitizedIncoming.nextTlsResumptionGeneration == 0)
     {
       sanitizedIncoming.nextTlsResumptionGeneration = 1;
     }
 
-    bool shouldApply = false;
-    if (sanitizedIncoming.generation > masterAuthorityRuntimeState.generation)
+    const bool shouldApply = sanitizedIncoming.generation > masterAuthorityRuntimeState.generation;
+
+    if (sanitizedIncoming.generation == masterAuthorityRuntimeState.generation &&
+        sanitizedIncoming != masterAuthorityRuntimeState)
     {
-      shouldApply = true;
+      return false;
     }
-    else if (sanitizedIncoming.generation == masterAuthorityRuntimeState.generation && sanitizedIncoming != masterAuthorityRuntimeState)
+    const bool currentHasPendingElasticOperations =
+        masterAuthorityRuntimeState.pendingElasticAddressAssignments.empty() == false ||
+        masterAuthorityRuntimeState.pendingElasticAddressReleases.empty() == false;
+    const bool incomingHasPendingElasticOperations =
+        sanitizedIncoming.pendingElasticAddressAssignments.empty() == false ||
+        sanitizedIncoming.pendingElasticAddressReleases.empty() == false;
+    const ProdigyMasterAuthorityRuntimeState& fenceState =
+        currentHasPendingElasticOperations && incomingHasPendingElasticOperations == false
+            ? masterAuthorityRuntimeState
+            : sanitizedIncoming;
+    if (configurePendingElasticAddressReleaseFence(fenceState) == false)
     {
-      shouldApply = true;
+      return false;
     }
 
+    if (shouldApply == false && sanitizedIncoming == masterAuthorityRuntimeState && persist &&
+        (masterAuthorityRuntimeStateDurable == false ||
+         durableMasterAuthorityRuntimeStateGeneration != sanitizedIncoming.generation))
+    {
+      masterAuthorityRuntimeStateDurable = persistLocalRuntimeState();
+      if (masterAuthorityRuntimeStateDurable)
+      {
+        durableMasterAuthorityRuntimeStateGeneration = sanitizedIncoming.generation;
+        captureDurableElasticAddressOperations();
+      }
+      return masterAuthorityRuntimeStateDurable;
+    }
+    if (shouldApply == false && sanitizedIncoming == masterAuthorityRuntimeState)
+    {
+      return persist == false ||
+             (masterAuthorityRuntimeStateDurable &&
+              durableMasterAuthorityRuntimeStateGeneration == sanitizedIncoming.generation);
+    }
     if (shouldApply == false)
     {
       return false;
     }
 
-    Vector<ProdigyManagedMachineSchema> previousSchemas = masterAuthorityRuntimeState.machineSchemas;
-    masterAuthorityRuntimeState = sanitizedIncoming;
-    if (masterAuthorityRuntimeState.hasCompletedInitialMasterElection)
+    ProdigyMasterAuthorityRuntimeState previousRuntimeState =
+        std::move(masterAuthorityRuntimeState);
+    const bool previousDurable = masterAuthorityRuntimeStateDurable;
+    const uint64_t previousDurableGeneration = durableMasterAuthorityRuntimeStateGeneration;
+    const bool previousCompletedInitialElection = hasCompletedInitialMasterElection;
+    const uint64_t previousNextMintedClientTlsGeneration = nextMintedClientTlsGeneration;
+    const uint64_t previousNextTlsResumptionGeneration = nextTlsResumptionGeneration;
+    ProdigyResumptionRegistry::SnapshotMap previousTlsResumptionSnapshots =
+        captureTlsResumptionSnapshotsByWormhole();
+    Vector<ProdigyManagedMachineSchema> previousSchemas = previousRuntimeState.machineSchemas;
+    masterAuthorityRuntimeState = std::move(sanitizedIncoming);
+    masterAuthorityRuntimeStateDurable = false;
+    hasCompletedInitialMasterElection = masterAuthorityRuntimeState.hasCompletedInitialMasterElection;
+    nextMintedClientTlsGeneration = masterAuthorityRuntimeState.nextMintedClientTlsGeneration;
+    nextTlsResumptionGeneration = masterAuthorityRuntimeState.nextTlsResumptionGeneration;
+    restoreTlsResumptionSnapshotsByWormhole(
+        masterAuthorityRuntimeState.tlsResumptionSnapshotsByWormhole,
+        true);
+
+    if (persist && persistLocalRuntimeState() == false)
     {
-      hasCompletedInitialMasterElection = true;
+      masterAuthorityRuntimeState = std::move(previousRuntimeState);
+      masterAuthorityRuntimeStateDurable = previousDurable;
+      durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+      hasCompletedInitialMasterElection = previousCompletedInitialElection;
+      nextMintedClientTlsGeneration = previousNextMintedClientTlsGeneration;
+      nextTlsResumptionGeneration = previousNextTlsResumptionGeneration;
+      restoreTlsResumptionSnapshotsByWormhole(previousTlsResumptionSnapshots, true);
+      (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
+      return false;
     }
+
     statefulWorkerTopologyUpgradeRuntimeState = masterAuthorityRuntimeState.statefulWorkerTopologyUpgradeOperations;
     deferredStatefulScaleIntentRuntimeState = masterAuthorityRuntimeState.deferredStatefulScaleIntents;
     routableResourceLeaseRuntimeState = masterAuthorityRuntimeState.routableResourceLeases;
-    nextMintedClientTlsGeneration = (sanitizedIncoming.nextMintedClientTlsGeneration == 0) ? 1 : sanitizedIncoming.nextMintedClientTlsGeneration;
-    nextTlsResumptionGeneration = sanitizedIncoming.nextTlsResumptionGeneration;
-    restoreTlsResumptionSnapshotsByWormhole(sanitizedIncoming.tlsResumptionSnapshotsByWormhole, true);
+    appliedDNSRecordLeases.clear();
     restoreMothershipTunnelProviderDesiredStateFromMasterAuthority();
     syncManagedMachineSchemaConfigs(previousSchemas, masterAuthorityRuntimeState.machineSchemas);
-    (void)reconcileDNSRecordLeases();
+    (void)quarantinePendingElasticAddressReleasePrefixes(masterAuthorityRuntimeState);
+    reconcileAuthoritativeDNSState();
 
     if (persist)
     {
-      persistLocalRuntimeState();
+      masterAuthorityRuntimeStateDurable = true;
+      durableMasterAuthorityRuntimeStateGeneration = masterAuthorityRuntimeState.generation;
+      captureDurableElasticAddressOperations();
+    }
+
+    if (masterAuthorityRuntimeState.pendingElasticAddressAssignments.empty() &&
+        masterAuthorityRuntimeState.pendingElasticAddressReleases.empty() && iaas != nullptr)
+    {
+      (void)iaas->setElasticAddressReleaseFenceActive(false);
     }
 
     onMasterAuthorityRuntimeStateApplied();
-    return true;
+    if (weAreMaster && (persist == false || masterAuthorityRuntimeStateDurable))
+    {
+      reconcilePendingElasticAddressAssignments();
+      reconcilePendingElasticAddressReleases();
+    }
+    return persist == false || masterAuthorityRuntimeStateDurable;
+  }
+
+  bool applyReplicatedMasterAuthorityTransition(
+      const ProdigyMasterAuthorityStateTransition& incoming,
+      bool persist = true)
+  {
+    const bool incomingHasPendingElasticOperations =
+        incoming.runtimeState.pendingElasticAddressAssignments.empty() == false ||
+        incoming.runtimeState.pendingElasticAddressReleases.empty() == false;
+    if (incoming.version != ProdigyMasterAuthorityStateTransition::currentVersion ||
+        validatePendingElasticAddressOperations(incoming.runtimeState, &incoming.brainConfig) == false ||
+        elasticAddressSagaFencesRuntimeEnvironment(incoming.brainConfig.runtimeEnvironment) ||
+        (brainConfig.clusterUUID != 0 && incomingHasPendingElasticOperations &&
+         incoming.brainConfig.runtimeEnvironment != brainConfig.runtimeEnvironment))
+    {
+      return false;
+    }
+
+    if (incoming.runtimeState.generation < masterAuthorityRuntimeState.generation)
+    {
+      return false;
+    }
+
+    String currentConfig;
+    String incomingConfig;
+    BitseryEngine::serialize(currentConfig, brainConfig);
+    BrainConfig ownedIncoming;
+    ownBrainConfig(incoming.brainConfig, ownedIncoming);
+    BitseryEngine::serialize(incomingConfig, ownedIncoming);
+    const bool configChanged = currentConfig.equals(incomingConfig) == false;
+    if (brainConfig.clusterUUID != 0 && ownedIncoming.clusterUUID == 0)
+    {
+      return false;
+    }
+    if (incoming.runtimeState.generation == masterAuthorityRuntimeState.generation &&
+        (incoming.runtimeState != masterAuthorityRuntimeState ||
+         configChanged))
+    {
+      return false;
+    }
+    String ownershipFailure;
+    if (claimLocalClusterOwnership(ownedIncoming.clusterUUID, &ownershipFailure) == false)
+    {
+      basics_log("replicateMasterAuthorityState reject clusterUUID=%llu reason=%s\n",
+                 (unsigned long long)ownedIncoming.clusterUUID,
+                 ownershipFailure.c_str());
+      return false;
+    }
+    if (incoming.runtimeState.generation == masterAuthorityRuntimeState.generation)
+    {
+      return applyReplicatedMasterAuthorityRuntimeState(incoming.runtimeState, persist);
+    }
+
+    BrainConfig previousConfig = std::move(brainConfig);
+    brainConfig = std::move(ownedIncoming);
+    if (applyReplicatedMasterAuthorityRuntimeState(incoming.runtimeState, persist))
+    {
+      if (configChanged)
+      {
+        refreshMachineFragmentAssignmentsIfPossible();
+        loadBrainConfigIf();
+      }
+      return true;
+    }
+    brainConfig = std::move(previousConfig);
+    (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
+    return false;
+  }
+
+  bool peerCanReplicateMasterAuthorityState(BrainView *peer)
+  {
+    if (peer == nullptr || peer->quarantined || peer->registrationFresh == false ||
+        peer->uuid == 0 || peer->boottimens == 0 || peer->isFixedFile == false ||
+        peer->fslot < 0 || peerSocketActive(peer) == false ||
+        peer->isMasterBrain == false)
+    {
+      return false;
+    }
+    return peer->transportTLSEnabled() == false ||
+           (peer->isTLSNegotiated() && peer->tlsPeerVerified && peer->tlsPeerUUID == peer->uuid);
   }
 
   virtual void onMasterAuthorityRuntimeStateApplied(void)
@@ -4753,6 +5675,7 @@ public:
 
       container->wormholes = plan.wormholes;
       container->whiteholes = plan.whiteholes;
+      container->networkAccess = plan.networkAccess;
     }
   }
 
@@ -4836,6 +5759,7 @@ public:
     container->addresses = plan.addresses;
     container->wormholes = plan.wormholes;
     container->whiteholes = plan.whiteholes;
+    container->networkAccess = plan.networkAccess;
     container->assignedGPUMemoryMBs = plan.assignedGPUMemoryMBs;
     container->assignedGPUDevices = plan.assignedGPUDevices;
     container->fragment = plan.fragment;
@@ -6977,6 +7901,11 @@ public:
     (void)reapPublicTlsCertbotProcesses(nowMs);
     for (PublicTlsCertificateState& certificate : masterAuthorityRuntimeState.publicTlsCertificates)
     {
+      if (certificate.releasePending)
+      {
+        (void)cleanupPublicTlsPendingDNS01Challenges(certificate);
+        continue;
+      }
       if (certificate.identity.certPem.size() > 0 && certificate.nextRenewAtMs > nowMs)
       {
         continue;
@@ -7224,11 +8153,452 @@ public:
     }
   }
 
+  static void machineLifecycleCompleted(
+      void *context,
+      ProdigyBrainMachineLifecycleCoordinator::Action action,
+      uint128_t uuid,
+      const String& cloudID,
+      const String& failure)
+  {
+    Brain& owner = *static_cast<Brain *>(context);
+    if (failure.empty() == false)
+    {
+      basics_log("provider machine lifecycle failed action=%u uuid=%llu cloudID=%.*s error=%.*s\n",
+                 unsigned(action),
+                 (unsigned long long)uuid,
+                 int(cloudID.size()),
+                 reinterpret_cast<const char *>(cloudID.data()),
+                 int(failure.size()),
+                 reinterpret_cast<const char *>(failure.data()));
+    }
+    if (action != ProdigyBrainMachineLifecycleCoordinator::Action::hardReboot)
+    {
+      return;
+    }
+
+    auto it = owner.machinesByUUID.find(uuid);
+    Machine *machine = it == owner.machinesByUUID.end() ? nullptr : it->second;
+    if (machine == nullptr || machine->cloudID != cloudID ||
+        machine->state != MachineState::hardRebooting)
+    {
+      return;
+    }
+
+    owner.cancelMachineHardRebootWatchdog(machine);
+    TimeoutPacket *timeout = new TimeoutPacket();
+    timeout->flags = uint64_t(BrainTimeoutFlags::hardRebootedMachine);
+    timeout->identifier = machine->uuid;
+    timeout->originator = machine;
+    timeout->dispatcher = &owner;
+    timeout->setTimeoutMs(prodigyBrainHardRebootWatchdogMs);
+    RingDispatcher::installMultiplexee(timeout, &owner);
+    Ring::queueTimeout(timeout);
+    machine->hardRebootWatchdog = timeout;
+
+    // let's also tell neuron and possibly brain to keep trying to reconnect?
+    // we likely have to recreate the socket here
+    if (owner.isActiveMaster())
+    {
+      // Keep retry budget for the reboot window, but recycle any active
+      // fixed-file slot through normal close completion before reopening.
+      owner.armMachineNeuronReconnect(machine, prodigyBrainHardRebootReconnectWindowMs);
+    }
+  }
+
+  bool elasticAddressReplyStreamIsCurrent(const PendingElasticAddressControlOperation& operation);
+  void sendRoutableSubnetRegistrationResponse(Mothership *stream,
+                                               const RoutableSubnetRegistration& response);
+  void sendRoutableSubnetUnregistrationResponse(Mothership *stream,
+                                                 const RoutableSubnetUnregistration& response);
+  void sendRoutableSubnetRegistrationResponse(const PendingElasticAddressControlOperation& operation,
+                                               const RoutableSubnetRegistration& response);
+  void sendRoutableSubnetUnregistrationResponse(const PendingElasticAddressControlOperation& operation,
+                                                 const RoutableSubnetUnregistration& response);
+  bool commitRoutableSubnetRegistryChange(void);
+  bool routableSubnetOperationPending(const String& name, uint128_t uuid = 0) const;
+  bool routablePrefixReleasePending(uint128_t uuid) const override;
+  bool validatePendingElasticAddressOperations(
+      const ProdigyMasterAuthorityRuntimeState& state,
+      const BrainConfig *candidateBrainConfig = nullptr) const;
+  void captureDurableElasticAddressOperations(void);
+  bool configurePendingElasticAddressReleaseFence(const ProdigyMasterAuthorityRuntimeState& state);
+  bool quarantinePendingElasticAddressReleasePrefixes(const ProdigyMasterAuthorityRuntimeState& state);
+  bool replicatedRuntimeStateCoversPendingElasticAddressOperations(const ProdigyMasterAuthorityRuntimeState& incoming) const;
+  void noteMasterAuthorityTransitionSentToPeer(BrainView *peer,
+                                               const ProdigyMasterAuthorityRuntimeState& state,
+                                               const String& transitionDigest);
+  void acknowledgeMasterAuthorityTransition(
+      BrainView *peer,
+      const ProdigyMasterAuthorityStateTransitionAck& acknowledgement);
+  void sendMasterAuthorityTransitionAcknowledgement(BrainView *peer,
+                                                     uint64_t generation,
+                                                     const String& transitionDigest);
+  bool pendingElasticAddressOperationHasMajority(uint64_t operationID, uint64_t transitionGeneration);
+  ProdigyPendingElasticAddressAssignment *findPendingElasticAddressAssignment(uint64_t operationID);
+  const ProdigyPendingElasticAddressAssignment *findPendingElasticAddressAssignment(uint64_t operationID) const;
+  ProdigyPendingElasticAddressRelease *findPendingElasticAddressRelease(uint64_t operationID);
+  const ProdigyPendingElasticAddressRelease *findPendingElasticAddressRelease(uint64_t operationID) const;
+  bool commitPendingElasticAddressStateChange(bool advanceGeneration = true);
+  void reconcilePendingElasticAddressAssignments(void);
+  void reconcilePendingElasticAddressReleases(void);
+  bool reserveElasticAddressControlOperationIDs(uint32_t count, uint64_t& firstOperationID);
+  bool nextElasticAddressControlOperationID(uint64_t& operationID);
+  uint32_t pendingElasticAddressLogicalOperationCount(void) const;
+  bool elasticAddressSagaFencesRuntimeEnvironment(const ProdigyRuntimeEnvironmentConfig& requested) const;
+  bool enqueueElasticAddressAssignment(Mothership *stream,
+                                       BrainIaaS& provider,
+                                       const RoutableSubnetRegistration& request,
+                                       uint128_t machineUUID,
+                                       const String& machineCloudID,
+                                       const IPPrefix& deliveryPrefix);
+  bool enqueueElasticAddressRelease(Mothership *stream,
+                                    BrainIaaS& provider,
+                                    const RoutableSubnetUnregistration& request,
+                                    const DistributableExternalSubnet& prefix);
+  void completeElasticAddressAssignment(PendingElasticAddressControlOperation& operation,
+                                        ProviderElasticAddressPlan&& plan,
+                                        ProviderElasticAddressAssignment&& assignment,
+                                        String&& failure);
+  void completeElasticAddressCompensation(PendingElasticAddressControlOperation& operation,
+                                          String&& failure);
+  void completeElasticAddressRelease(PendingElasticAddressControlOperation& operation,
+                                     String&& failure);
+  static void elasticAddressOperationCompleted(
+      void *context,
+      uint64_t operationID,
+      ProdigyBrainElasticAddressCoordinator::Action action,
+      ProviderElasticAddressPlan&& plan,
+      ProviderElasticAddressAssignment&& assignment,
+      String&& failure);
+
+  void handleRegisterRoutableSubnet(Mothership *stream, uint8_t *args);
+  void handleUnregisterRoutableSubnet(Mothership *stream, uint8_t *args);
+
+  static const ApiCredential *dnsOperationCredential(void *context,
+                                                     uint16_t applicationID,
+                                                     const String& name)
+  {
+    return static_cast<Brain *>(context)->findDNSCredential(applicationID, name);
+  }
+
+  bool deploymentDNSReady(uint64_t deploymentID) const
+  {
+    for (const RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
+    {
+      if (lease.kind == RoutableResourceLeaseKind::dnsRecord &&
+          lease.owner.deploymentID == deploymentID &&
+          (lease.dnsDeletePending || dnsRecordLeaseApplied(lease) == false))
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool dnsReconciliationPending(void) const
+  {
+    if (masterAuthorityRuntimeState.dnsControlPairingLeases.empty() == false)
+    {
+      return true;
+    }
+    for (const RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
+    {
+      if (lease.kind == RoutableResourceLeaseKind::dnsRecord &&
+          (lease.dnsDeletePending || dnsRecordLeaseApplied(lease) == false) &&
+          dnsRecordLeaseOperationPending(lease,
+                                         lease.dnsDeletePending ?
+                                             ProdigyBrainDNSOperationCoordinator::Action::remove :
+                                             ProdigyBrainDNSOperationCoordinator::Action::upsert) == false)
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void armDNSReconciliationRetry(void)
+  {
+    if (dnsReconcileRetryArmed || weAreMaster == false ||
+        RingDispatcher::dispatcher == nullptr || Ring::getRingFD() <= 0)
+    {
+      return;
+    }
+    if (dnsReconcileRetryInstalled == false)
+    {
+      dnsReconcileRetry.flags = uint64_t(BrainTimeoutFlags::dnsReconcileRetry);
+      dnsReconcileRetry.dispatcher = this;
+      RingDispatcher::installMultiplexee(&dnsReconcileRetry, this);
+      dnsReconcileRetryInstalled = true;
+    }
+    const uint32_t exponent = std::min<uint32_t>(dnsReconcileFailureCount, 6);
+    dnsReconcileRetry.setTimeoutMs(std::min<uint64_t>(uint64_t(1000) << exponent, 60'000));
+    dnsReconcileFailureCount += dnsReconcileFailureCount < UINT32_MAX ? 1 : 0;
+    dnsReconcileRetryArmed = true;
+    Ring::queueTimeout(&dnsReconcileRetry);
+  }
+
+  void resumeDNSReadyDeployments(void)
+  {
+    for (auto it = deploymentsWaitingForDNS.begin(); it != deploymentsWaitingForDNS.end();)
+    {
+      const uint64_t deploymentID = *it;
+      if (deploymentDNSReady(deploymentID) == false)
+      {
+        ++it;
+        continue;
+      }
+      auto deployment = deployments.find(deploymentID);
+      it = deploymentsWaitingForDNS.erase(it);
+      if (deployment != deployments.end() && deployment->second != nullptr)
+      {
+        spinApplication(deployment->second);
+      }
+    }
+  }
+
+  void completeDNSOperation(uint64_t owner,
+                            ProdigyBrainDNSOperationCoordinator::Action action,
+                            bool success,
+                            String&& failure)
+  {
+    auto pendingIt = pendingDNSOperations.find(owner);
+    if (pendingIt == pendingDNSOperations.end())
+    {
+      return;
+    }
+    PendingDNSOperation pending = std::move(pendingIt->second);
+    pendingDNSOperations.erase(pendingIt);
+    if (pending.action != action)
+    {
+      return;
+    }
+
+    if (pending.kind == PendingDNSOperationKind::challenge)
+    {
+      AcmeDNS01ChallengeResponse response;
+      response.success = success;
+      response.failure = std::move(failure);
+      response.recordName.assign(pending.record.name);
+      response.provider.assign(pending.record.provider);
+      response.zone.assign(pending.record.zone);
+      response.ttl = pending.record.ttl;
+      PublicTlsCertificateState *certificate = findPublicTlsCertificateStateByRuntimeKey(pending.certificateKey);
+      if (response.success && certificate == nullptr)
+      {
+        response.success = false;
+        response.failure.assign("ACME certificate state changed before DNS completion"_ctv);
+      }
+      if (response.success)
+      {
+        const bool changed = action == ProdigyBrainDNSOperationCoordinator::Action::cleanupTXT ?
+                                 forgetPublicTlsPendingDNS01Challenge(*certificate, pending.record) :
+                                 rememberPublicTlsPendingDNS01Challenge(*certificate, pending.record);
+        if (changed)
+        {
+          noteMasterAuthorityRuntimeStateChanged();
+        }
+        if (action == ProdigyBrainDNSOperationCoordinator::Action::cleanupTXT &&
+            certificate->releasePending && certificate->pendingDNS01Challenges.empty())
+        {
+          for (auto it = masterAuthorityRuntimeState.publicTlsCertificates.begin();
+               it != masterAuthorityRuntimeState.publicTlsCertificates.end(); ++it)
+          {
+            if (publicTlsCertificateRuntimeKey(*it).equals(pending.certificateKey))
+            {
+              masterAuthorityRuntimeState.publicTlsCertificates.erase(it);
+              noteMasterAuthorityRuntimeStateChanged();
+              break;
+            }
+          }
+        }
+      }
+      if (pending.inlineResponse != nullptr)
+      {
+        *pending.inlineResponse = response;
+      }
+      if (pending.stream != nullptr && activeMotherships.contains(pending.stream) &&
+          pending.stream->connectionIncarnation == pending.streamIncarnation)
+      {
+        String serializedResponse;
+        BitseryEngine::serialize(serializedResponse, response);
+        Message::construct(pending.stream->wBuffer, pending.topic, serializedResponse);
+        (void)flushActiveMothershipSendBuffer(pending.stream, "dns-operation-complete");
+      }
+      if (response.success == false && action == ProdigyBrainDNSOperationCoordinator::Action::cleanupTXT)
+      {
+        armDNSReconciliationRetry();
+      }
+      else if (response.success)
+      {
+        reconcileAuthoritativeDNSState();
+      }
+      return;
+    }
+
+    auto current = routableResourceLeaseRuntimeState.end();
+    for (auto it = routableResourceLeaseRuntimeState.begin(); it != routableResourceLeaseRuntimeState.end(); ++it)
+    {
+      if (*it == pending.lease)
+      {
+        current = it;
+        break;
+      }
+    }
+    const bool currentMatched = current != routableResourceLeaseRuntimeState.end();
+    bool terminalSuccess = success && currentMatched;
+    if (success && currentMatched == false)
+    {
+      failure.assign("DNS intent changed before operation completion"_ctv);
+    }
+    if (terminalSuccess)
+    {
+      if (action == ProdigyBrainDNSOperationCoordinator::Action::upsert && current->dnsDeletePending == false)
+      {
+        if (dnsRecordLeaseApplied(*current) == false)
+        {
+          RoutableResourceLease applied;
+          ownDNSRecordLease(applied, *current);
+          appliedDNSRecordLeases.push_back(std::move(applied));
+        }
+      }
+      else if (action == ProdigyBrainDNSOperationCoordinator::Action::remove && current->dnsDeletePending)
+      {
+        const RoutableResourceLease addressLease = dnsBindingAddressLease(*current);
+        const RoutableResourceLease deleted = *current;
+        for (auto applied = appliedDNSRecordLeases.begin(); applied != appliedDNSRecordLeases.end();)
+        {
+          if (applied->owner == deleted.owner && routableResourceDNSIdentityMatches(*applied, deleted))
+          {
+            applied = appliedDNSRecordLeases.erase(applied);
+          }
+          else
+          {
+            ++applied;
+          }
+        }
+        for (auto it = routableResourceLeaseRuntimeState.begin(); it != routableResourceLeaseRuntimeState.end();)
+        {
+          if ((it->kind == RoutableResourceLeaseKind::dnsRecord && *it == deleted) ||
+              (it->kind == RoutableResourceLeaseKind::wormholeAddress &&
+               routableResourceLeaseResourcesIntersect(*it, addressLease) && it->owner == addressLease.owner))
+          {
+            it = routableResourceLeaseRuntimeState.erase(it);
+          }
+          else
+          {
+            ++it;
+          }
+        }
+        noteRoutableResourceLeaseRuntimeStateChanged();
+      }
+      resumeDNSReadyDeployments();
+      reconcileAuthoritativeDNSState();
+    }
+
+    if (pending.controlID != 0)
+    {
+      finishDNSControl(pending.controlID, pending.lease, terminalSuccess, failure);
+    }
+    if (terminalSuccess == false)
+    {
+      basics_log("dns operation failed failure=%s\n", failure.c_str());
+      armDNSReconciliationRetry();
+    }
+    else
+    {
+      bool converged = true;
+      for (const RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
+      {
+        if (lease.kind == RoutableResourceLeaseKind::dnsRecord &&
+            (lease.dnsDeletePending || dnsRecordLeaseApplied(lease) == false))
+        {
+          converged = false;
+          break;
+        }
+      }
+      if (converged)
+      {
+        dnsReconcileFailureCount = 0;
+      }
+    }
+  }
+
+  static void dnsOperationCompleted(void *context,
+                                    ProdigyBrainDNSOperationCoordinator::Ticket,
+                                    ProdigyBrainDNSOperationCoordinator::Action action,
+                                    uint64_t owner,
+                                    bool success,
+                                    String&& failure)
+  {
+    static_cast<Brain *>(context)->completeDNSOperation(owner, action, success, std::move(failure));
+  }
+
+  bool queueMachineHardReboot(Machine *machine)
+  {
+    if (iaas == nullptr || machine == nullptr || machine->cloudID.empty())
+    {
+      basics_log("provider hard reboot rejected: machine identity unavailable\n");
+      return false;
+    }
+
+    const MachineState priorState = machine->state;
+    const uint32_t priorAttempts = machine->hardRebootAttempts;
+    const int64_t priorRebootMs = machine->lastHardRebootMs;
+    machine->state = MachineState::hardRebooting;
+    machine->hardRebootAttempts += 1;
+    machine->lastHardRebootMs = Time::now<TimeResolution::ms>();
+    if (machineLifecycle.enqueue(*iaas,
+                                 ProdigyBrainMachineLifecycleCoordinator::Action::hardReboot,
+                                 machine->uuid,
+                                 machine->cloudID))
+    {
+      return true;
+    }
+
+    machine->state = priorState;
+    machine->hardRebootAttempts = priorAttempts;
+    machine->lastHardRebootMs = priorRebootMs;
+    basics_log("provider hard reboot queue full uuid=%llu cloudID=%s\n",
+               (unsigned long long)machine->uuid,
+               machine->cloudID.c_str());
+    return false;
+  }
+
+  bool queueMachineDestroy(const Machine& machine)
+  {
+    if (iaas != nullptr && machine.cloudID.empty() == false &&
+        machineLifecycle.enqueue(*iaas,
+                                 ProdigyBrainMachineLifecycleCoordinator::Action::destroy,
+                                 machine.uuid,
+                                 machine.cloudID))
+    {
+      return true;
+    }
+    basics_log("provider machine destroy queue rejected uuid=%llu cloudID=%.*s\n",
+               (unsigned long long)machine.uuid,
+               int(machine.cloudID.size()),
+               reinterpret_cast<const char *>(machine.cloudID.data()));
+    return false;
+  }
+
   Brain()
   {
     mesh = new Mesh();
+    machineLifecycle.configureCompletion({this, machineLifecycleCompleted});
+    elasticAddressOperations.configureCompletion({this, elasticAddressOperationCompleted});
+    dnsOperations.configure({this, dnsOperationCredential},
+                            {this, dnsOperationCompleted});
     initializeApplicationIDReservationState();
     initializeApplicationServiceReservationState();
+  }
+
+  void configureDNSProviderRuntime(ProdigyDNSProviderRuntime requestedRuntime)
+  {
+    if (dnsProvider != nullptr)
+    {
+      dnsProvider->configureRuntime(requestedRuntime);
+    }
+    dnsOperations.configureDelay(requestedRuntime.delay);
   }
 
   uint128_t selfBrainUUID(void) const
@@ -8152,6 +9522,11 @@ public:
       {
         continue;
       }
+      if (deploymentDNSReady(head->plan.config.deploymentID()) == false)
+      {
+        deploymentsWaitingForDNS.insert(head->plan.config.deploymentID());
+        continue;
+      }
       head->recoverAfterReboot();
     }
   }
@@ -8422,7 +9797,13 @@ public:
           mothership->isFixedFile = true;
           mothership->isNonBlocking = true;
           Ring::publishSocketGeneration(mothership);
-          activeMotherships.insert(mothership);
+          if (activateMothershipConnection(mothership) == false)
+          {
+            delete mothership;
+            mothership = nullptr;
+            Ring::queueCloseRaw(fslot);
+            return;
+          }
           const int fixedFD = loggableSocketFD(mothership);
           std::fprintf(stderr, "prodigy mothership accept-adopt transport=unix source=cqe acceptedFslot=%d fixedFD=%d isFixed=%d path=%s\n",
                        fslot,
@@ -10566,10 +11947,6 @@ public:
     owned.acme.certbotPath.assign(source.acme.certbotPath);
     owned.acme.certbotVersion.assign(source.acme.certbotVersion);
     owned.acme.termsAgreed = source.acme.termsAgreed;
-    owned.reporter.to.assign(source.reporter.to);
-    owned.reporter.from.assign(source.reporter.from);
-    owned.reporter.smtp.assign(source.reporter.smtp);
-    owned.reporter.password.assign(source.reporter.password);
     owned.vmImageURI.assign(source.vmImageURI);
     owned.osUpdatesEnabled = source.osUpdatesEnabled;
     owned.osUpdatePolicies = source.osUpdatePolicies;
@@ -10708,7 +12085,10 @@ public:
 
   void loadBrainConfigIf(void)
   {
-    iaas->configureRuntimeEnvironment(brainConfig.runtimeEnvironment);
+    if (iaas != nullptr)
+    {
+      iaas->configureRuntimeEnvironment(brainConfig.runtimeEnvironment);
+    }
     for (Machine *machine : machines)
     {
       if (machine == nullptr)
@@ -10720,13 +12100,6 @@ public:
     }
 
     const bool haveDatacenterFragment = (brainConfig.datacenterFragment != 0);
-    if (haveDatacenterFragment)
-    {
-      batphone.setUsername(brainConfig.reporter.from);
-      batphone.setPassword(brainConfig.reporter.password);
-      batphone.setSMTP(brainConfig.reporter.smtp);
-    }
-
     for (Machine *machine : machines) // accounts for us
     {
       auto it = brainConfig.configBySlug.find(machine->slug);
@@ -12400,11 +13773,17 @@ public:
       }
     }
 
-    iaas->getMachines(coro, thisNeuron->metro, machines);
+    String inventoryFailure = {};
+    iaas->getMachines(coro, thisNeuron->metro, machines, inventoryFailure);
 
     if (suspendIndex < coro->nextSuspendIndex())
     {
       co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (inventoryFailure.size() > 0)
+    {
+      basics_log("machine inventory failed: %s\n", inventoryFailure.c_str());
+      co_return;
     }
 
     Vector<Machine *> duplicateSnapshots;
@@ -12715,7 +14094,7 @@ public:
     brain_saddrlen = sizeof(brain_saddr);
     Ring::queueAccept(&brainSocket, reinterpret_cast<struct sockaddr *>(&brain_saddr), &brain_saddrlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
 
-    CoroutineStack *coro = new CoroutineStack();
+    CoroutineStack *coro = &brainInventoryCoroutine;
 
     bool selfIsBrain = false;
     ClusterTopology topology = {};
@@ -12751,20 +14130,23 @@ public:
       {
         refreshLocalBrainPeerAddresses();
       }
-      delete coro;
     }
     else
     {
       uint32_t suspendIndex = coro->nextSuspendIndex();
 
-      iaas->getBrains(coro, thisNeuron->uuid, selfIsBrain, brains);
+      String inventoryFailure = {};
+      iaas->getBrains(coro, thisNeuron->uuid, selfIsBrain, brains, inventoryFailure);
 
       if (suspendIndex < coro->nextSuspendIndex())
       {
         co_await coro->suspendAtIndex(suspendIndex);
       }
-
-      delete coro;
+      if (inventoryFailure.size() > 0)
+      {
+        basics_log("brain inventory failed: %s\n", inventoryFailure.c_str());
+        co_return;
+      }
 
       nBrains = brains.size(); // every brain must be present and working for the cluster to initiate, but once it does it can run with fewer
       if (selfIsBrain)
@@ -13481,10 +14863,22 @@ protected:
 
 public:
 
+  void advanceMasterAuthorityEpoch(void)
+  {
+    masterAuthorityEpoch += 1;
+    if (masterAuthorityEpoch == 0)
+    {
+      masterAuthorityEpoch = 1;
+    }
+  }
+
   void forfeitMasterStatus(void)
   {
     basics_log("forfeitMasterStatus weAreMaster=%d\n", int(weAreMaster));
+    advanceMasterAuthorityEpoch();
     weAreMaster = false;
+    masterAuthorityReplicationByPeer.clear();
+    (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
     noMasterYet = true;
     reconcileMothershipTunnelProviderRuntimeState();
     mothershipUnixAcceptArmed = false;
@@ -13553,9 +14947,12 @@ public:
       return true;
     }
 
+    advanceMasterAuthorityEpoch();
+
     // Promotion must flip master ownership before listener arm so any immediate
     // close CQE races on mothership control-listener re-arm through closeHandler.
     weAreMaster = true;
+    masterAuthorityReplicationByPeer.clear();
     cancelAllBrainLivenessWaiters("self-elect");
 
     if (armMothershipUnixListener(replaceLiveMothershipListener) == false)
@@ -13615,15 +15012,13 @@ public:
 
     // Existing peer links and canonical connector ownership are sufficient here.
 
-    CoroutineStack *coro = new CoroutineStack();
+    CoroutineStack *coro = &brainInventoryCoroutine;
 
     uint32_t suspendIndex = coro->nextSuspendIndex();
 
     getMachines(coro);
 
     awaitSelfElectionMachineInventoryIfNeeded(coro, suspendIndex);
-
-    delete coro;
 
     // Re-arm neuron control-plane sockets after machine inventory is known.
     // This must run after getMachines() because followers may not have
@@ -13738,7 +15133,10 @@ public:
     // interrupted addMachines journaling can resume immediately on promotion.
     deploymentPlans.clear();
     resumePendingAddMachinesOperations();
-    (void)reconcileDNSRecordLeases();
+    reconcilePendingElasticAddressAssignments();
+    reconcilePendingElasticAddressReleases();
+    appliedDNSRecordLeases.clear();
+    reconcileAuthoritativeDNSState();
     if (ignited)
     {
       refreshMachineFragmentAssignmentsIfPossible();
@@ -14234,136 +15632,64 @@ public:
 
       String slug;
       const MachineConfig *machineConfig = nullptr;
+      uint32_t nMoreMachines = 0;
+      uint64_t provisioningOperationID = 0;
+      ProdigyPendingAutonomousProvisioningOperation *pendingOperation =
+          findPendingAutonomousProvisioningOperation(config.deploymentID(), lifetime);
 
-      if (selectScaleOutMachineConfig(brainConfig.configBySlug, config, nMore, slug, machineConfig) == false)
+      if (pendingOperation != nullptr)
       {
-        String message;
-        message.append("unable to select a machine config for additional capacity\n"_ctv);
-        message.snprintf_add<"Application: {itoa}\n"_ctv>(config.applicationID);
-        message.snprintf_add<"Deployment: {itoa}\n"_ctv>(config.deploymentID());
-        message.snprintf_add<"Lifetime: {itoa}\n"_ctv>(uint64_t(lifetime));
-        message.snprintf_add<"RequestedInstances: {itoa}\n"_ctv>(nMore);
-        if (applicationUsesSharedCPUs(config))
+        auto configIt = brainConfig.configBySlug.find(pendingOperation->machineSchema);
+        if (configIt == brainConfig.configBySlug.end() || pendingOperation->count == 0)
         {
-          message.snprintf_add<"PerInstanceSharedCPUMillis: {itoa}\n"_ctv>(applicationRequestedCPUMillis(config));
+          basics_log("requestMachines failure reason=pending-operation-machine-config-missing applicationID=%u deploymentID=%llu lifetime=%u operationID=%llu schema=%.*s\n",
+                     unsigned(config.applicationID),
+                     (unsigned long long)config.deploymentID(),
+                     unsigned(lifetime),
+                     (unsigned long long)pendingOperation->operationID,
+                     int(pendingOperation->machineSchema.size()),
+                     reinterpret_cast<const char *>(pendingOperation->machineSchema.data()));
+          co_return;
         }
-        else
-        {
-          message.snprintf_add<"PerInstanceCores: {itoa}\n"_ctv>(config.nLogicalCores);
-        }
-        message.snprintf_add<"PerInstanceMemoryMB: {itoa}\n"_ctv>(config.totalMemoryMB());
-        message.snprintf_add<"PerInstanceStorageMB: {itoa}\n"_ctv>(config.totalStorageMB());
-        batphone.sendEmail(brainConfig.reporter.from, brainConfig.reporter.to, "unable to select machines master! 🤖"_ctv, message);
+        slug.assign(pendingOperation->machineSchema);
+        machineConfig = &configIt->second;
+        nMoreMachines = pendingOperation->count;
+        provisioningOperationID = pendingOperation->operationID;
+      }
+      else if (selectScaleOutMachineConfig(brainConfig.configBySlug, config, nMore, slug, machineConfig) == false)
+      {
+        basics_log("requestMachines failure reason=no-matching-machine-config applicationID=%u deploymentID=%llu lifetime=%u requested=%u\n",
+                   unsigned(config.applicationID), (unsigned long long)config.deploymentID(),
+                   unsigned(lifetime), unsigned(nMore));
         co_return;
       }
 
-      auto divideAndRoundUp = [=](uint64_t numerator, uint64_t denominator) -> uint32_t {
-        return uint32_t((numerator + denominator - 1) / denominator);
-      };
-
-      uint16_t overcommitPermille = prodigySharedCPUOvercommitPermille(brainConfig.sharedCPUOvercommitPermille);
-      uint64_t requiredCPUUnits = applicationUsesSharedCPUs(config)
-                                      ? (uint64_t(nMore) * uint64_t(applicationRequestedCPUMillis(config)))
-                                      : (uint64_t(nMore) * uint64_t(config.nLogicalCores));
-      uint64_t machineCPUCapacity = applicationUsesSharedCPUs(config)
-                                        ? (uint64_t(machineConfig->nLogicalCores) * uint64_t(overcommitPermille))
-                                        : uint64_t(machineConfig->nLogicalCores);
-
-      uint32_t nByCores = divideAndRoundUp(requiredCPUUnits, machineCPUCapacity);
-      uint32_t nByMemory = divideAndRoundUp(uint64_t(nMore) * config.totalMemoryMB(), machineConfig->nMemoryMB);
-      uint32_t nByStorage = divideAndRoundUp(uint64_t(nMore) * config.totalStorageMB(), machineConfig->nStorageMB);
-
-      uint32_t nMoreMachines = nByCores;
-      if (nByMemory > nMoreMachines)
+      if (pendingOperation == nullptr)
       {
-        nMoreMachines = nByMemory;
-      }
-      if (nByStorage > nMoreMachines)
-      {
-        nMoreMachines = nByStorage;
-      }
-
-      // always email when creating more machines
-      String message;
-      message.append("we require more hardware to spin these additional instances:\n"_ctv);
-      message.snprintf_add<"Application: {itoa}\n"_ctv>(config.applicationID);
-      message.snprintf_add<"Deployment: {itoa}\n"_ctv>(config.deploymentID());
-
-      switch (lifetime)
-      {
-        case ApplicationLifetime::base:
-          {
-            message.append("Application Lifetime: base\n"_ctv);
-            break;
-          }
-        case ApplicationLifetime::surge:
-          {
-            message.append("Application Lifetime: surge\n"_ctv);
-            break;
-          }
-        case ApplicationLifetime::canary:
-          {
-            message.append("Application Lifetime: canary\n"_ctv);
-            break;
-          }
-      }
-
-      message.snprintf_add<"nInstances: {itoa}\n"_ctv>(nMore);
-      if (applicationUsesSharedCPUs(config))
-      {
-        message.snprintf_add<"Shared CPU per Instance (millis): {itoa}\n"_ctv>(applicationRequestedCPUMillis(config));
-        message.snprintf_add<"Shared CPU Overcommit Permille: {itoa}\n"_ctv>(unsigned(overcommitPermille));
-      }
-      else
-      {
-        message.snprintf_add<"Logical Cores per Instance: {itoa}\n"_ctv>(config.nLogicalCores);
-      }
-      message.snprintf_add<"Memory MB per Instance: {itoa}\n"_ctv>(config.totalMemoryMB());
-      message.snprintf_add<"Storage MB per Instance: {itoa}\n"_ctv>(config.totalStorageMB());
-      message.append("\n"_ctv);
-      message.append("spinning these machines:\n"_ctv);
-
-      switch (lifetime)
-      {
-        case ApplicationLifetime::base:
-        case ApplicationLifetime::canary:
-          {
-            message.append("Machine Lifetime: ondemand\n"_ctv);
-            break;
-          }
-        case ApplicationLifetime::surge:
-          {
-            message.append("Machine Lifetime: spot\n"_ctv);
-            break;
-          }
-      }
-
-      message.snprintf_add<"Slug: {}\n"_ctv>(slug);
-      message.snprintf_add<"nMachines: {itoa}\n"_ctv>(nMoreMachines);
-
-      switch (machineLifetime)
-      {
-        case MachineLifetime::owned:
-          {
-            batphone.sendEmail(brainConfig.reporter.from, brainConfig.reporter.to, "i am spinning Owned machines master! 🤖"_ctv, message);
-            break;
-          }
-        case MachineLifetime::reserved:
-          {
-            batphone.sendEmail(brainConfig.reporter.from, brainConfig.reporter.to, "i am spinning Reserved machines master! 🤖"_ctv, message);
-            break;
-          }
-        default:
-        case MachineLifetime::ondemand:
-          {
-            batphone.sendEmail(brainConfig.reporter.from, brainConfig.reporter.to, "i am spinning OnDemand machines master! 🤖"_ctv, message);
-            break;
-          }
-        case MachineLifetime::spot:
-          {
-            batphone.sendEmail(brainConfig.reporter.from, brainConfig.reporter.to, "i am spinning Spot machines master! 🤖"_ctv, message);
-            break;
-          }
+        auto divideAndRoundUp = [=](uint64_t numerator, uint64_t denominator) -> uint32_t {
+          return uint32_t((numerator + denominator - 1) / denominator);
+        };
+        uint16_t overcommitPermille = prodigySharedCPUOvercommitPermille(brainConfig.sharedCPUOvercommitPermille);
+        uint64_t requiredCPUUnits = applicationUsesSharedCPUs(config)
+                                        ? (uint64_t(nMore) * uint64_t(applicationRequestedCPUMillis(config)))
+                                        : (uint64_t(nMore) * uint64_t(config.nLogicalCores));
+        uint64_t machineCPUCapacity = applicationUsesSharedCPUs(config)
+                                          ? (uint64_t(machineConfig->nLogicalCores) * uint64_t(overcommitPermille))
+                                          : uint64_t(machineConfig->nLogicalCores);
+        uint32_t nByCores = divideAndRoundUp(requiredCPUUnits, machineCPUCapacity);
+        uint32_t nByMemory = divideAndRoundUp(uint64_t(nMore) * config.totalMemoryMB(), machineConfig->nMemoryMB);
+        uint32_t nByStorage = divideAndRoundUp(uint64_t(nMore) * config.totalStorageMB(), machineConfig->nStorageMB);
+        nMoreMachines = std::max(nByCores, std::max(nByMemory, nByStorage));
+        if (journalAutonomousProvisioningOperation(config.deploymentID(), lifetime,
+                                                   slug, nMoreMachines,
+                                                   provisioningOperationID) == false)
+        {
+          basics_log("requestMachines failure reason=provisioning-operation-persist-failed applicationID=%u deploymentID=%llu lifetime=%u requested=%u\n",
+                     unsigned(config.applicationID),
+                     (unsigned long long)config.deploymentID(),
+                     unsigned(lifetime), unsigned(nMoreMachines));
+          co_return;
+        }
       }
 
       CoroutineStack *coro = new CoroutineStack();
@@ -14371,8 +15697,10 @@ public:
       String error;
 
       uint32_t suspendIndex = coro->nextSuspendIndex();
+      const uint64_t machineCountBeforeProvisioning = machines.size();
 
       iaas->configureProvisioningClusterUUID(brainConfig.clusterUUID);
+      iaas->configureProvisioningOperationID(provisioningOperationID);
       iaas->spinMachines(coro, machineLifetime, *machineConfig, nMoreMachines, machines, error);
 
       if (suspendIndex < coro->nextSuspendIndex())
@@ -14382,6 +15710,23 @@ public:
 
       delete coro;
 
+      if (iaas->provisioningOperationSettled() == false)
+      {
+        co_return;
+      }
+      if (settleAutonomousProvisioningOperation(provisioningOperationID) == false)
+      {
+        basics_log("requestMachines failure reason=provisioning-operation-settlement-persist-failed applicationID=%u deploymentID=%llu lifetime=%u operationID=%llu\n",
+                   unsigned(config.applicationID),
+                   (unsigned long long)config.deploymentID(),
+                   unsigned(lifetime),
+                   (unsigned long long)provisioningOperationID);
+        co_return;
+      }
+      if (machines.size() <= machineCountBeforeProvisioning)
+      {
+        co_return;
+      }
       goto retry;
     }
   }
@@ -14407,7 +15752,7 @@ public:
     if (machine->state == MachineState::hardwareFailure)
     {
       // destroy it
-      iaas->destroyMachine(machine);
+      (void)queueMachineDestroy(*machine);
     }
 
     if (machine->fragment > 0)
@@ -14471,7 +15816,21 @@ public:
 
   void checkForSpotTerminations(void)
   {
-    CoroutineStack *coro = new CoroutineStack();
+    if (spotDecommissionCheckActive)
+    {
+      co_return;
+    }
+    spotDecommissionCheckActive = true;
+    struct ActiveCheck final
+    {
+      bool& active;
+      ~ActiveCheck()
+      {
+        active = false;
+      }
+    } activeCheck {spotDecommissionCheckActive};
+
+    CoroutineStack *coro = &spotDecommissionCheckCoroutine;
 
     Vector<String> decommissionedIDs;
 
@@ -14514,7 +15873,13 @@ public:
       }
     }
 
-    delete coro;
+    refreshAllDeploymentWormholeQuicCidState(true);
+    (void)advanceAllDeploymentTlsResumptionLifecycles(true);
+    const int64_t nowMs = Time::now<TimeResolution::ms>();
+    (void)advanceCertificateLifecycles(nowMs);
+    (void)pruneExpiredTaskExecutionRecords(nowMs);
+    spotDecomissionChecker.setTimeoutMs(prodigyBrainSpotDecommissionCheckIntervalMs);
+    Ring::queueTimeout(&spotDecomissionChecker);
   }
 
   // Initiate drain on a single machine by asking every deployment with
@@ -15023,7 +16388,7 @@ public:
           }
         case MachineState::decommissioning:
           {
-            iaas->destroyMachine(machine);
+            (void)queueMachineDestroy(*machine);
             break;
           }
         default:
@@ -15371,6 +16736,16 @@ public:
           delete packet;
           break;
         }
+      case BrainTimeoutFlags::dnsReconcileRetry:
+        {
+          dnsReconcileRetryArmed = false;
+          reconcileAuthoritativeDNSState();
+          if (dnsReconciliationPending())
+          {
+            armDNSReconciliationRetry();
+          }
+          break;
+        }
       case BrainTimeoutFlags::ignition:
         {
           ignited = true;
@@ -15395,11 +16770,9 @@ public:
 
           refreshMachineFragmentAssignmentsIfPossible();
 
-          // loop over each application and recover runtime from inventory, then reconcile
-          for (const auto& [applicationID, deployment] : deploymentsByApp)
-          {
-            deployment->recoverAfterReboot();
-          }
+          // Recover only deployments whose authoritative DNS intent has
+          // completed for the exact current lease snapshot.
+          recoverDeploymentsAfterNeuronState();
 
           armMachineUpdateTimerIfNeeded();
 
@@ -15852,22 +17225,7 @@ public:
 
           if (machine)
           {
-            machine->state = MachineState::hardRebooting;
-            machine->hardRebootAttempts += 1;
-            machine->lastHardRebootMs = Time::now<TimeResolution::ms>();
-
-            iaas->hardRebootMachine(machine->uuid);
-
-            cancelMachineHardRebootWatchdog(machine);
-            TimeoutPacket *timeout = new TimeoutPacket();
-            timeout->flags = uint64_t(BrainTimeoutFlags::hardRebootedMachine);
-            timeout->identifier = machine->uuid;
-            timeout->originator = machine;
-            timeout->dispatcher = this;
-            timeout->setTimeoutMs(prodigyBrainHardRebootWatchdogMs);
-            RingDispatcher::installMultiplexee(timeout, this);
-            Ring::queueTimeout(timeout);
-            machine->hardRebootWatchdog = timeout;
+            (void)queueMachineHardReboot(machine);
           }
 
           break;
@@ -15882,14 +17240,9 @@ public:
         }
       case BrainTimeoutFlags::spotDecomissionChecker:
         {
+          reconcilePendingElasticAddressAssignments();
+          reconcilePendingElasticAddressReleases();
           checkForSpotTerminations();
-          refreshAllDeploymentWormholeQuicCidState(true);
-          (void)advanceAllDeploymentTlsResumptionLifecycles(true);
-          const int64_t nowMs = Time::now<TimeResolution::ms>();
-          (void)advanceCertificateLifecycles(nowMs);
-          (void)pruneExpiredTaskExecutionRecords(nowMs);
-          spotDecomissionChecker.setTimeoutMs(prodigyBrainSpotDecommissionCheckIntervalMs);
-          Ring::queueTimeout(&spotDecomissionChecker);
           break;
         }
       default:
@@ -16467,6 +17820,7 @@ public:
 
     if (stream->wBuffer.size() == 0)
     {
+#if PRODIGY_DEBUG
       std::fprintf(stderr, "prodigy mothership send-skip reason=%s wbytes=0 active=%d stream=%p fd=%d fslot=%d\n",
                    (reason ? reason : "unknown"),
                    int(streamIsActive(stream)),
@@ -16474,11 +17828,13 @@ public:
                    stream->fd,
                    stream->fslot);
       std::fflush(stderr);
+#endif
       return true;
     }
 
     if (streamIsActive(stream) == false || Ring::socketIsClosing(stream))
     {
+#if PRODIGY_DEBUG
       std::fprintf(stderr, "prodigy mothership send-skip reason=%s wbytes=%zu active=%d closing=%d stream=%p fd=%d fslot=%d\n",
                    (reason ? reason : "unknown"),
                    size_t(stream->wBuffer.size()),
@@ -16488,9 +17844,11 @@ public:
                    stream->fd,
                    stream->fslot);
       std::fflush(stderr);
+#endif
       return false;
     }
 
+#if PRODIGY_DEBUG
     std::fprintf(stderr, "prodigy mothership send-queue reason=%s wbytes=%zu stream=%p fd=%d fslot=%d pendingSend=%d\n",
                  (reason ? reason : "unknown"),
                  size_t(stream->wBuffer.size()),
@@ -16499,7 +17857,9 @@ public:
                  stream->fslot,
                  int(stream->pendingSend));
     std::fflush(stderr);
+#endif
     Ring::queueSend(stream);
+#if PRODIGY_DEBUG
     std::fprintf(stderr, "prodigy mothership send-submit reason=%s pendingSend=%d pendingSendBytes=%u wbytes=%zu active=%d stream=%p fixedFD=%d fslot=%d\n",
                  (reason ? reason : "unknown"),
                  int(stream->pendingSend),
@@ -16510,6 +17870,7 @@ public:
                  loggableSocketFD(stream),
                  stream->fslot);
     std::fflush(stderr);
+#endif
     return true;
   }
 
@@ -16669,6 +18030,18 @@ public:
     }
 
     return nullptr;
+  }
+
+  bool activateMothershipConnection(Mothership *stream)
+  {
+    if (stream == nullptr || activeMotherships.contains(stream) ||
+        lastMothershipConnectionIncarnation == UINT64_MAX)
+    {
+      return false;
+    }
+    stream->connectionIncarnation = ++lastMothershipConnectionIncarnation;
+    activeMotherships.insert(stream);
+    return true;
   }
 
   void recvHandler(void *socket, int result) override
@@ -17848,37 +19221,12 @@ public:
       case MachineState::unresponsive:
         {
           // SSH was unable to connect; escalate to IaaS hard reboot.
-          machine->state = MachineState::hardRebooting;
-          machine->hardRebootAttempts += 1;
-          machine->lastHardRebootMs = Time::now<TimeResolution::ms>();
           basics_log("machine hard reboot escalation uuid=%llu private4=%u hardRebootAttempts=%u creationTimeMs=%lld\n",
                      (unsigned long long)machine->uuid,
                      unsigned(machine->private4),
-                     unsigned(machine->hardRebootAttempts),
+                     unsigned(machine->hardRebootAttempts + 1),
                      (long long)machine->creationTimeMs);
-
-          iaas->hardRebootMachine(machine->uuid);
-
-          cancelMachineHardRebootWatchdog(machine);
-          TimeoutPacket *timeout = new TimeoutPacket();
-          timeout->flags = uint64_t(BrainTimeoutFlags::hardRebootedMachine);
-          timeout->identifier = machine->uuid;
-          timeout->originator = machine;
-          timeout->dispatcher = this;
-          timeout->setTimeoutMs(prodigyBrainHardRebootWatchdogMs);
-          RingDispatcher::installMultiplexee(timeout, this);
-          Ring::queueTimeout(timeout);
-          machine->hardRebootWatchdog = timeout;
-
-          // let's also tell neuron and possibly brain to keep trying to reconnect?
-
-          // we likely have to recreate the socket here
-          if (isActiveMaster())
-          {
-            // Keep retry budget for the reboot window, but recycle any active
-            // fixed-file slot through normal close completion before reopening.
-            armMachineNeuronReconnect(machine, prodigyBrainHardRebootReconnectWindowMs);
-          }
+          (void)queueMachineHardReboot(machine);
 
           break;
         }
@@ -19114,10 +20462,6 @@ public:
 
           uint64_t before = bv->wBuffer.size();
 
-          String serializedBrainConfig;
-          BitseryEngine::serialize(serializedBrainConfig, brainConfig);
-          Message::construct(bv->wBuffer, BrainTopic::replicateBrainConfig, serializedBrainConfig);
-
           ClusterTopology authoritativeTopology = {};
           if (loadOrPersistAuthoritativeClusterTopology(authoritativeTopology))
           {
@@ -19187,9 +20531,19 @@ public:
           }
           {
             String serializedRuntimeState;
-            ProdigyMasterAuthorityRuntimeState replicatedRuntimeState = masterAuthorityRuntimeState;
-            replicatedRuntimeState.updateSelf = {};
-            BitseryEngine::serialize(serializedRuntimeState, replicatedRuntimeState);
+            ProdigyMasterAuthorityStateTransition transition;
+            transition.runtimeState = masterAuthorityRuntimeState;
+            transition.runtimeState.updateSelf = {};
+            ownBrainConfig(brainConfig, transition.brainConfig);
+            BitseryEngine::serialize(serializedRuntimeState, transition);
+            String transitionDigest;
+            if (prodigyComputeSHA256Hex(serializedRuntimeState, transitionDigest) == false)
+            {
+              break;
+            }
+            noteMasterAuthorityTransitionSentToPeer(bv,
+                                                    transition.runtimeState,
+                                                    transitionDigest);
             Message::construct(bv->wBuffer, BrainTopic::replicateMasterAuthorityState, serializedRuntimeState);
           }
           {
@@ -19672,41 +21026,9 @@ public:
         }
       case BrainTopic::replicateBrainConfig:
         {
-          // config{4}
-
-          String serialized;
-          Message::extractToStringView(args, serialized);
-
-          BrainConfig deserializedConfig = {};
-          if (BitseryEngine::deserializeSafe(serialized, deserializedConfig) == false)
-          {
-            break;
-          }
-
-          BrainConfig incomingConfig = {};
-          ownBrainConfig(deserializedConfig, incomingConfig);
-
-          String ownershipFailure = {};
-          if (claimLocalClusterOwnership(incomingConfig.clusterUUID, &ownershipFailure) == false)
-          {
-            basics_log("replicateBrainConfig reject clusterUUID=%llu reason=%s\n",
-                       (unsigned long long)incomingConfig.clusterUUID,
-                       ownershipFailure.c_str());
-            break;
-          }
-
-          brainConfig = incomingConfig;
-          refreshMachineFragmentAssignmentsIfPossible();
-
-          loadBrainConfigIf();
-          if (noMasterYet)
-          {
-            // Configure distributes state only; do not force master selection from mothership.
-            deriveMasterBrain();
-          }
-
-          persistLocalRuntimeState();
-
+          // Brain configuration is inseparable from its versioned master-authority
+          // state; reject the retired split payload instead of admitting a state
+          // that cannot be authenticated, persisted, and acknowledged atomically.
           break;
         }
       case BrainTopic::replicateClusterTopology:
@@ -19853,10 +21175,40 @@ public:
           String serialized;
           Message::extractToStringView(args, serialized);
 
-          ProdigyMasterAuthorityRuntimeState incoming = {};
-          if (BitseryEngine::deserializeSafe(serialized, incoming))
+          if (weAreMaster)
           {
-            (void)applyReplicatedMasterAuthorityRuntimeState(incoming, true);
+            ProdigyMasterAuthorityStateTransitionAck acknowledgement = {};
+            if (BitseryEngine::deserializeSafe(serialized, acknowledgement))
+            {
+              acknowledgeMasterAuthorityTransition(bv, acknowledgement);
+            }
+            break;
+          }
+
+          if (peerCanReplicateMasterAuthorityState(bv) == false)
+          {
+            break;
+          }
+
+          ProdigyMasterAuthorityStateTransition incoming = {};
+          if (BitseryEngine::deserializeSafe(serialized, incoming) &&
+              incoming.version == ProdigyMasterAuthorityStateTransition::currentVersion &&
+              validatePendingElasticAddressOperations(incoming.runtimeState,
+                                                      &incoming.brainConfig))
+          {
+            String transitionDigest;
+            const bool applied = applyReplicatedMasterAuthorityTransition(incoming, true);
+            if (applied &&
+                (incoming.runtimeState.pendingElasticAddressAssignments.empty() == false ||
+                 incoming.runtimeState.pendingElasticAddressReleases.empty() == false) &&
+                replicatedRuntimeStateCoversPendingElasticAddressOperations(incoming.runtimeState) &&
+                prodigyComputeSHA256Hex(serialized, transitionDigest))
+            {
+              sendMasterAuthorityTransitionAcknowledgement(
+                  bv,
+                  incoming.runtimeState.generation,
+                  transitionDigest);
+            }
           }
 
           break;
@@ -20649,7 +22001,7 @@ public:
         {
           if (destroyProviderMachines)
           {
-            iaas->destroyMachine(snapshot);
+            (void)queueMachineDestroy(*snapshot);
           }
 
           prodigyDestroyMachineSnapshot(snapshot);
@@ -21195,6 +22547,7 @@ public:
           std::fflush(stderr);
 
           iaas->configureProvisioningClusterUUID(brainConfig.clusterUUID);
+          iaas->configureProvisioningOperationID(pendingAddMachinesOperationID);
           uint32_t suspendIndex = coro->nextSuspendIndex();
 #if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
           uint64_t providerWaitStartNs = Time::now<TimeResolution::ns>();
@@ -21224,7 +22577,7 @@ public:
 
             for (Machine *snapshot : createdSnapshots)
             {
-              iaas->destroyMachine(snapshot);
+              (void)queueMachineDestroy(*snapshot);
               prodigyDestroyMachineSnapshot(snapshot);
             }
             break;
@@ -21688,7 +23041,7 @@ public:
           BrainConfig incomingConfig = {};
           ownBrainConfig(deserializedConfig, incomingConfig);
           uint16_t previousSharedCPUOvercommitPermille = brainConfig.sharedCPUOvercommitPermille;
-          std::fprintf(stderr, "prodigy mothership configure-request clusterUUID=%llu datacenter=%u autoscale=%u requiredBrains=%u nMachineConfigs=%u nSubnets=%u runtimeConfigured=%d reporterConfigured=%d vmImage=%d\n",
+          std::fprintf(stderr, "prodigy mothership configure-request clusterUUID=%llu datacenter=%u autoscale=%u requiredBrains=%u nMachineConfigs=%u nSubnets=%u runtimeConfigured=%d vmImage=%d\n",
                        (unsigned long long)incomingConfig.clusterUUID,
                        unsigned(incomingConfig.datacenterFragment),
                        unsigned(incomingConfig.autoscaleIntervalSeconds),
@@ -21696,7 +23049,6 @@ public:
                        uint32_t(incomingConfig.configBySlug.size()),
                        uint32_t(incomingConfig.distributableExternalSubnets.size()),
                        int(incomingConfig.runtimeEnvironment.configured()),
-                       int(incomingConfig.reporter.to.size() > 0 || incomingConfig.reporter.from.size() > 0 || incomingConfig.reporter.smtp.size() > 0 || incomingConfig.reporter.password.size() > 0),
                        int(incomingConfig.vmImageURI.size() > 0));
           std::fflush(stderr);
 
@@ -21711,6 +23063,20 @@ public:
             break;
           }
 
+          if (incomingConfig.runtimeEnvironment.configured() &&
+              elasticAddressSagaFencesRuntimeEnvironment(incomingConfig.runtimeEnvironment))
+          {
+            queueCloseIfActive(mothership, "configure-provider-fenced-by-elastic-saga");
+            break;
+          }
+
+          BrainConfig previousConfig;
+          ownBrainConfig(brainConfig, previousConfig);
+          ProdigyMasterAuthorityRuntimeState previousMasterAuthorityState =
+              masterAuthorityRuntimeState;
+          const bool previousMasterAuthorityDurable = masterAuthorityRuntimeStateDurable;
+          const uint64_t previousDurableMasterAuthorityGeneration =
+              durableMasterAuthorityRuntimeStateGeneration;
           if (incomingConfig.clusterUUID != 0)
           {
             brainConfig.clusterUUID = incomingConfig.clusterUUID;
@@ -21764,11 +23130,6 @@ public:
           if (incomingConfig.acme.configured())
           {
             brainConfig.acme = incomingConfig.acme;
-          }
-
-          if (incomingConfig.reporter.to.size() > 0 || incomingConfig.reporter.from.size() > 0 || incomingConfig.reporter.smtp.size() > 0 || incomingConfig.reporter.password.size() > 0)
-          {
-            brainConfig.reporter = incomingConfig.reporter;
           }
 
           if (incomingConfig.vmImageURI.size() > 0)
@@ -21838,20 +23199,30 @@ public:
             }
           }
 
-          String serializedBrainConfig;
-          BitseryEngine::serialize(serializedBrainConfig, brainConfig);
+          (void)quarantinePendingElasticAddressReleasePrefixes(masterAuthorityRuntimeState);
+          if (commitMasterAuthorityStateChange() == false)
+          {
+            brainConfig = std::move(previousConfig);
+            masterAuthorityRuntimeState = std::move(previousMasterAuthorityState);
+            masterAuthorityRuntimeStateDurable = previousMasterAuthorityDurable;
+            durableMasterAuthorityRuntimeStateGeneration =
+                previousDurableMasterAuthorityGeneration;
+            (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
+            queueCloseIfActive(mothership, "configure-master-authority-persist-failed");
+            break;
+          }
 
           loadBrainConfigIf();
           refreshMachineFragmentAssignmentsIfPossible();
           armMachineUpdateTimerIfNeeded();
 
-          queueBrainReplication(BrainTopic::replicateBrainConfig, serializedBrainConfig);
-          persistLocalRuntimeState();
-
           if (noMasterYet)
           {
             deriveMasterBrain();
           }
+
+          String serializedBrainConfig;
+          BitseryEngine::serialize(serializedBrainConfig, brainConfig);
 
           std::fprintf(stderr, "prodigy mothership configure-response clusterUUID=%llu datacenter=%u autoscale=%u nMachineConfigs=%u nSubnets=%u bytes=%zu noMasterYet=%d master=%d osUpdatesEnabled=%d osUpdatePolicies=%u maxOSDrains=%u cadenceMins=%u\n",
                        (unsigned long long)brainConfig.clusterUUID,
@@ -22106,310 +23477,12 @@ public:
         }
       case MothershipTopic::registerRoutableSubnet:
         {
-          String serializedRequest;
-          Message::extractToStringView(args, serializedRequest);
-
-          RoutableSubnetRegistration request = {};
-          RoutableSubnetRegistration response = {};
-          response.success = false;
-
-          if (BitseryEngine::deserializeSafe(serializedRequest, request) == false)
-          {
-            response.failure.assign("invalid subnet payload"_ctv);
-          }
-          else if (request.subnet.name.size() == 0)
-          {
-            response.failure.assign("name required"_ctv);
-          }
-          else if (externalSubnetUsageIsValid(request.subnet.usage) == false)
-          {
-            response.failure.assign("usage invalid"_ctv);
-          }
-          else if (routablePrefixKindIsValid(request.subnet.kind) == false)
-          {
-            response.failure.assign("kind invalid"_ctv);
-          }
-          else if (routableIngressScopeIsValid(request.subnet.ingressScope) == false)
-          {
-            response.failure.assign("ingressScope invalid"_ctv);
-          }
-          else if (request.subnet.ingressScope == RoutableIngressScope::switchboardFleet && request.subnet.machineUUID != 0)
-          {
-            response.failure.assign("switchboardFleet routable prefix must not set machineUUID"_ctv);
-          }
-          else if (request.subnet.ingressScope == RoutableIngressScope::switchboardFleet && environmentBGPEnabled() == false)
-          {
-            response.failure.assign("switchboardFleet routable prefix registration requires bgp-enabled environment"_ctv);
-          }
-          else if (request.subnet.routing != ExternalSubnetRouting::switchboardBGP)
-          {
-            response.failure.assign("routable prefix registration only supports BGP"_ctv);
-          }
-          else if (request.subnet.kind == RoutablePrefixKind::elastic && request.subnet.ingressScope != RoutableIngressScope::singleMachine)
-          {
-            response.failure.assign("elastic routable prefixes require singleMachine ingressScope"_ctv);
-          }
-          else if (request.subnet.kind == RoutablePrefixKind::elastic && elasticPrefixIntentIsValid(request.elasticIntent) == false)
-          {
-            response.failure.assign("elasticIntent invalid"_ctv);
-          }
-          else if (request.subnet.kind == RoutablePrefixKind::elastic && request.subnet.subnet.network.isNull() == false)
-          {
-            response.failure.assign("elastic routable prefixes must be provider allocated"_ctv);
-          }
-          else if (request.subnet.kind == RoutablePrefixKind::elastic && request.family != ExternalAddressFamily::ipv4 && request.family != ExternalAddressFamily::ipv6)
-          {
-            response.failure.assign("elastic routable prefix family invalid"_ctv);
-          }
-          else if (request.subnet.kind == RoutablePrefixKind::BGP && (request.requestedAddress.size() > 0 || request.subnet.providerPool.size() > 0))
-          {
-            response.failure.assign("BGP routable prefixes do not accept provider fields"_ctv);
-          }
-          else
-          {
-            if (request.subnet.kind == RoutablePrefixKind::elastic)
-            {
-              for (const DistributableExternalSubnet& existing : brainConfig.distributableExternalSubnets)
-              {
-                if ((request.subnet.uuid != 0 && existing.uuid == request.subnet.uuid) || existing.name.equals(request.subnet.name))
-                {
-                  if (existing.kind != RoutablePrefixKind::elastic || (request.subnet.uuid != 0 && existing.uuid != request.subnet.uuid))
-                  {
-                    response.failure.assign("routable prefix already exists with different configuration; unregister it first"_ctv);
-                  }
-                  else
-                  {
-                    request.subnet = existing;
-                    response.success = true;
-                    response.created = false;
-                  }
-                  break;
-                }
-              }
-            }
-
-            if (response.success == false && request.subnet.ingressScope == RoutableIngressScope::singleMachine)
-            {
-              Machine *owner = request.subnet.machineUUID == 0 ? nullptr : findMachineByUUID(request.subnet.machineUUID);
-              if (request.subnet.machineUUID == 0)
-              {
-                for (Machine *machine : machines)
-                {
-                  if (machine == nullptr || machine->uuid == 0)
-                  {
-                    continue;
-                  }
-                  if (owner != nullptr)
-                  {
-                    response.failure.assign("singleMachine routable prefix requires machineUUID when multiple machines exist"_ctv);
-                    break;
-                  }
-                  owner = machine;
-                }
-              }
-
-              if (response.failure.size() == 0 && owner == nullptr)
-              {
-                response.failure.assign("singleMachine routable prefix machineUUID is not registered"_ctv);
-              }
-              else if (response.failure.size() == 0)
-              {
-                request.subnet.machineUUID = owner->uuid;
-              }
-            }
-
-            if (request.subnet.kind == RoutablePrefixKind::elastic && response.success == false && response.failure.size() == 0)
-            {
-              if (iaas == nullptr)
-              {
-                response.failure.assign("elastic routable prefix requires active iaas runtime"_ctv);
-              }
-              else
-              {
-                Machine *targetMachine = findMachineByUUID(request.subnet.machineUUID);
-                if (targetMachine == nullptr || targetMachine->cloudID.size() == 0)
-                {
-                  response.failure.assign("elastic routable prefix requires a cloud-backed target machine"_ctv);
-                }
-                else if (neuronControlStreamActive(targetMachine) == false)
-                {
-                  response.failure.assign("target machine neuron control stream is not active"_ctv);
-                }
-                else if (iaas->assignProviderElasticAddress(targetMachine,
-                                                            request.family,
-                                                            request.elasticIntent,
-                                                            request.requestedAddress,
-                                                            request.subnet.providerPool,
-                                                            request.subnet.subnet,
-                                                            request.subnet.deliverySubnet,
-                                                            request.subnet.providerAllocationID,
-                                                            request.subnet.providerAssociationID,
-                                                            request.subnet.releaseOnRemove,
-                                                            response.failure) == false)
-                {
-                  request.subnet.subnet = {};
-                  request.subnet.deliverySubnet = {};
-                }
-              }
-            }
-
-            request.subnet.subnet.canonicalize();
-            request.subnet.deliverySubnet.canonicalize();
-
-            if (response.success == false && response.failure.size() == 0 && routableExternalSubnetHasSupportedBreadth(request.subnet) == false)
-            {
-              response.failure.assign("routable prefix CIDR is invalid"_ctv);
-            }
-
-            for (const DistributableExternalSubnet& existing : brainConfig.distributableExternalSubnets)
-            {
-              if (response.success || response.failure.size() > 0)
-              {
-                break;
-              }
-
-              if (existing.name.equals(request.subnet.name))
-              {
-                continue;
-              }
-
-              if (ipPrefixesOverlap(existing.subnet, request.subnet.subnet))
-              {
-                response.failure.snprintf<"routable prefix overlaps existing prefix '{}'"_ctv>(existing.name);
-                break;
-              }
-            }
-
-            bool replaced = false;
-            if (response.success == false && response.failure.size() == 0)
-            {
-              for (DistributableExternalSubnet& existing : brainConfig.distributableExternalSubnets)
-              {
-                if (existing.name.equals(request.subnet.name))
-                {
-                  if (request.subnet.uuid == 0)
-                  {
-                    request.subnet.uuid = existing.uuid;
-                  }
-
-                  existing = request.subnet;
-                  replaced = true;
-                  break;
-                }
-              }
-
-              if (replaced == false)
-              {
-                if (request.subnet.uuid == 0)
-                {
-                  request.subnet.uuid = Random::generateNumberWithNBits<128, uint128_t>();
-                }
-
-                brainConfig.distributableExternalSubnets.push_back(request.subnet);
-              }
-
-              refreshAllDeploymentRegisteredRoutablePrefixWormholes();
-              sendNeuronSwitchboardRoutableSubnets();
-              sendNeuronSwitchboardHostedIngressPrefixes();
-              sendNeuronSwitchboardOverlayRoutes();
-
-              String serializedBrainConfig;
-              BitseryEngine::serialize(serializedBrainConfig, brainConfig);
-              queueBrainReplication(BrainTopic::replicateBrainConfig, serializedBrainConfig);
-              persistLocalRuntimeState();
-              response.success = true;
-              response.created = !replaced;
-            }
-          }
-
-          response.subnet = request.subnet;
-          response.family = request.family;
-          response.elasticIntent = request.elasticIntent;
-          response.requestedAddress = request.requestedAddress;
-
-          String serializedResponse;
-          BitseryEngine::serialize(serializedResponse, response);
-          Message::construct(mothership->wBuffer, MothershipTopic::registerRoutableSubnet, serializedResponse);
+          handleRegisterRoutableSubnet(mothership, args);
           break;
         }
       case MothershipTopic::unregisterRoutableSubnet:
         {
-          String serializedRequest;
-          Message::extractToStringView(args, serializedRequest);
-
-          RoutableSubnetUnregistration request = {};
-          RoutableSubnetUnregistration response = {};
-          response.success = false;
-
-          if (BitseryEngine::deserializeSafe(serializedRequest, request) == false)
-          {
-            response.failure.assign("invalid unregister payload"_ctv);
-          }
-          else if (request.name.size() == 0)
-          {
-            response.failure.assign("name required"_ctv);
-          }
-          else
-          {
-            response.name = request.name;
-
-            bool removed = false;
-            for (auto it = brainConfig.distributableExternalSubnets.begin(); it != brainConfig.distributableExternalSubnets.end(); ++it)
-            {
-              if (it->name.equals(request.name))
-              {
-                if (routablePrefixHasOwnedResourceLease(it->uuid))
-                {
-                  response.failure.assign("routable prefix has owned resources"_ctv);
-                  break;
-                }
-                if (it->kind == RoutablePrefixKind::elastic)
-                {
-                  if (iaas == nullptr)
-                  {
-                    response.failure.assign("provider elastic prefix cleanup requires active iaas runtime"_ctv);
-                    break;
-                  }
-
-                  if (iaas->releaseProviderElasticAddress(*it, response.failure) == false)
-                  {
-                    break;
-                  }
-                }
-
-                brainConfig.distributableExternalSubnets.erase(it);
-                removed = true;
-                break;
-              }
-            }
-
-            if (removed)
-            {
-              sendNeuronSwitchboardRoutableSubnets();
-              sendNeuronSwitchboardHostedIngressPrefixes();
-              sendNeuronSwitchboardOverlayRoutes();
-
-              String serializedBrainConfig;
-              BitseryEngine::serialize(serializedBrainConfig, brainConfig);
-              queueBrainReplication(BrainTopic::replicateBrainConfig, serializedBrainConfig);
-              persistLocalRuntimeState();
-            }
-
-            if (response.failure.size() == 0)
-            {
-              response.success = true;
-              response.removed = removed;
-            }
-          }
-
-          if (response.name.size() == 0)
-          {
-            response.name = request.name;
-          }
-
-          String serializedResponse;
-          BitseryEngine::serialize(serializedResponse, response);
-          Message::construct(mothership->wBuffer, MothershipTopic::unregisterRoutableSubnet, serializedResponse);
+          handleUnregisterRoutableSubnet(mothership, args);
           break;
         }
       case MothershipTopic::pullRoutableSubnets:
@@ -22442,22 +23515,55 @@ public:
 
           RoutableResourceLeaseReport request = {};
           RoutableResourceLeaseReport response = {};
+          bool accepted = false;
           if (BitseryEngine::deserializeSafe(serializedRequest, request) == false || request.leases.size() != 1)
           {
             response.failure.assign("DNS binding request requires one lease"_ctv);
           }
           else if (MothershipTopic(message->topic) == MothershipTopic::upsertDNSBinding)
           {
-            (void)upsertDNSBindingLease(request.leases[0], response);
+            accepted = upsertDNSBindingLease(request.leases[0], response, mothership);
           }
           else
           {
-            (void)deleteDNSBindingLease(request.leases[0], response);
+            accepted = deleteDNSBindingLease(request.leases[0], response, mothership);
+          }
+
+          if (accepted == false || response.success)
+          {
+            String serializedResponse;
+            BitseryEngine::serialize(serializedResponse, response);
+            Message::construct(mothership->wBuffer, MothershipTopic(message->topic), serializedResponse);
+          }
+          break;
+        }
+      case MothershipTopic::manageDnsControlPairing:
+        {
+          String serializedRequest;
+          Message::extractToStringView(args, serializedRequest);
+          ProdigyDnsControlPairingOperation operation = {};
+          if (BitseryEngine::deserializeSafe(serializedRequest, operation) == false)
+          {
+            operation = {};
+            operation.failure.assign("invalid DNS control pairing operation"_ctv);
+          }
+          else
+          {
+            (void)manageDnsControlPairing(operation);
           }
 
           String serializedResponse;
-          BitseryEngine::serialize(serializedResponse, response);
-          Message::construct(mothership->wBuffer, MothershipTopic(message->topic), serializedResponse);
+          BitseryEngine::serialize(serializedResponse, operation);
+          Message::construct(mothership->wBuffer,
+                             MothershipTopic::manageDnsControlPairing,
+                             serializedResponse);
+          if (serializedResponse.reservedBytes() > 0)
+          {
+            OPENSSL_cleanse(serializedResponse.data(),
+                            serializedResponse.reservedBytes());
+          }
+          OPENSSL_cleanse(&operation.lease.secret,
+                          sizeof(operation.lease.secret));
           break;
         }
       case MothershipTopic::presentACMEDNS01Challenge:
@@ -22468,18 +23574,25 @@ public:
 
           AcmeDNS01ChallengeRequest request = {};
           AcmeDNS01ChallengeResponse response = {};
+          bool accepted = false;
           if (BitseryEngine::deserializeSafe(serializedRequest, request) == false)
           {
             response.failure.assign("invalid ACME DNS-01 request payload"_ctv);
           }
           else
           {
-            (void)applyACMEDNS01Challenge(request, MothershipTopic(message->topic) == MothershipTopic::cleanupACMEDNS01Challenge, response);
+            accepted = applyACMEDNS01Challenge(request,
+                                               MothershipTopic(message->topic) == MothershipTopic::cleanupACMEDNS01Challenge,
+                                               response,
+                                               mothership);
           }
 
-          String serializedResponse;
-          BitseryEngine::serialize(serializedResponse, response);
-          Message::construct(mothership->wBuffer, MothershipTopic(message->topic), serializedResponse);
+          if (accepted == false)
+          {
+            String serializedResponse;
+            BitseryEngine::serialize(serializedResponse, response);
+            Message::construct(mothership->wBuffer, MothershipTopic(message->topic), serializedResponse);
+          }
           break;
         }
       case MothershipTopic::importACMELineage:
@@ -22523,11 +23636,14 @@ public:
       case MothershipTopic::teardownDNSBindings:
         {
           RoutableResourceLeaseReport response = {};
-          (void)teardownDNSBindingLeases(response);
+          const bool accepted = teardownDNSBindingLeases(response, mothership);
 
-          String serializedResponse;
-          BitseryEngine::serialize(serializedResponse, response);
-          Message::construct(mothership->wBuffer, MothershipTopic::teardownDNSBindings, serializedResponse);
+          if (accepted == false)
+          {
+            String serializedResponse;
+            BitseryEngine::serialize(serializedResponse, response);
+            Message::construct(mothership->wBuffer, MothershipTopic::teardownDNSBindings, serializedResponse);
+          }
           break;
         }
       case MothershipTopic::pullClusterReport:
@@ -24286,7 +25402,15 @@ public:
 
           // The deploy CLI waits for the initial okay/invalidPlan frame before it starts
           // consuming streamed progress on the same topic.
-          spinApplication(deployment);
+          if (deploymentDNSReady(deployment->plan.config.deploymentID()))
+          {
+            spinApplication(deployment);
+          }
+          else
+          {
+            deploymentsWaitingForDNS.insert(deployment->plan.config.deploymentID());
+            pushSpinApplicationProgressToMothership(deployment, "waiting for authoritative DNS reconciliation"_ctv);
+          }
 
           break;
         }
@@ -24622,6 +25746,7 @@ public:
             container->addresses = plan.addresses; // directly assigned interface addresses; currently just container-network IPv6
             container->wormholes = plan.wormholes;
             container->whiteholes = plan.whiteholes;
+            container->networkAccess = plan.networkAccess;
             container->assignedGPUMemoryMBs = plan.assignedGPUMemoryMBs;
             container->assignedGPUDevices = plan.assignedGPUDevices;
             container->fragment = plan.fragment;
@@ -25176,4 +26301,5 @@ public:
   }
 };
 
+#include <prodigy/brain/routable.subnet.control.h>
 #include <prodigy/brain/deployments.h>

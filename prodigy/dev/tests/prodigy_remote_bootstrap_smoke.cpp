@@ -294,6 +294,20 @@ int main(void)
   {
     installedEBPFPath.append('/');
   }
+  installedEBPFPath.append("container.ingress.router.declared.ebpf.o"_ctv);
+  suite.expect(fileExists(installedEBPFPath), "smoke_remote_declared_container_ingress_ebpf_exists");
+  installedEBPFPath = plan.installPaths.installRoot;
+  if (installedEBPFPath[installedEBPFPath.size() - 1] != '/')
+  {
+    installedEBPFPath.append('/');
+  }
+  installedEBPFPath.append("container.egress.router.declared.ebpf.o"_ctv);
+  suite.expect(fileExists(installedEBPFPath), "smoke_remote_declared_container_egress_ebpf_exists");
+  installedEBPFPath = plan.installPaths.installRoot;
+  if (installedEBPFPath[installedEBPFPath.size() - 1] != '/')
+  {
+    installedEBPFPath.append('/');
+  }
   installedEBPFPath.append("tunnel_to_nic.ebpf.o"_ctv);
   suite.expect(fileExists(installedEBPFPath), "smoke_remote_tunnel_to_nic_ebpf_exists");
 

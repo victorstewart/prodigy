@@ -3,6 +3,7 @@
 #include <prodigy/brain/brain.h>
 #include <prodigy/bootstrap.config.h>
 #include <prodigy/dns.providers.h>
+#include <prodigy/host.control.network.h>
 #include <prodigy/netdev.detect.h>
 #include <prodigy/persistent.state.h>
 #include <prodigy/iaas/runtime/runtime.h>
@@ -953,13 +954,6 @@ public:
         size_t(snapshot.brainPeers.size()));
     prodigyDeriveBrainPeersFromSnapshot(snapshot.brainPeers, snapshot);
 
-    String failure;
-    if (persistentStateStore.saveBrainSnapshot(snapshot, &failure) == false)
-    {
-      basics_log("ProdigyBrain brain-snapshot persist failed: %s\n", failure.c_str());
-      return false;
-    }
-
     ProdigyPersistentBootState bootState = persistentBootState;
     bootState.bootstrapConfig = effectiveBootstrapConfig;
     bootState.bootstrapSshUser = brainConfig.bootstrapSshUser;
@@ -975,15 +969,24 @@ public:
                                        : persistentBootState.runtimeEnvironment;
     bootState.initialTopology = {};
 
-    if (persistentStateStore.saveBootState(bootState, &failure) == false)
+    String failure;
+    const ProdigyBrainSnapshotCommitResult result = prodigyCommitBrainSnapshot(
+        persistentStateStore,
+        std::move(snapshot),
+        std::move(bootState),
+        persistedBrainSnapshot,
+        persistentBootState,
+        havePersistedBrainSnapshot,
+        failure);
+    if (result == ProdigyBrainSnapshotCommitResult::snapshotFailed)
     {
-      basics_log("ProdigyBrain boot-state persist failed: %s\n", failure.c_str());
+      basics_log("ProdigyBrain brain-snapshot persist failed: %s\n", failure.c_str());
       return false;
     }
-
-    persistentBootState = bootState;
-    prodigyReplaceCachedBrainSnapshot(persistedBrainSnapshot, std::move(snapshot));
-    havePersistedBrainSnapshot = true;
+    if (result == ProdigyBrainSnapshotCommitResult::snapshotCommittedBootStateFailed)
+    {
+      basics_log("ProdigyBrain boot-state follow-up persist failed: %s\n", failure.c_str());
+    }
     prodigyRuntimeTrace(
         "prodigy persist brain-snapshot-end storedPeers=%zu bootPeers=%zu\n",
         size_t(persistedBrainSnapshot.brainPeers.size()),
@@ -1137,12 +1140,13 @@ public:
     (void)applyPersistedTransportTLSAuthority();
   }
 
-  void persistLocalRuntimeState(void) override
+  bool persistLocalRuntimeState(void) override
   {
     prodigyRuntimeTrace("prodigy persist local-runtime-begin\n");
     ProdigyPersistentBrainSnapshot snapshot = buildPersistentBrainSnapshot();
-    (void)persistBrainSnapshot(std::move(snapshot));
+    const bool persisted = persistBrainSnapshot(std::move(snapshot));
     prodigyRuntimeTrace("prodigy persist local-runtime-end\n");
+    return persisted;
   }
 
   bool prepareForBundleExec(String& failure) override
@@ -1158,7 +1162,7 @@ public:
     return true;
   }
 
-  ProdigyBrain()
+  explicit ProdigyBrain(ProdigyHostControlNetwork& hostControlNetwork)
   {
     if (havePersistedBrainSnapshot)
     {
@@ -1181,8 +1185,14 @@ public:
       prodigyOwnRuntimeEnvironmentConfig(persistentBootState.runtimeEnvironment, brainConfig.runtimeEnvironment);
     }
 
-    iaas = new RuntimeAwareBrainIaaS(&persistentStateStore, effectiveBootstrapConfig, persistentBootState);
+    iaas = new RuntimeAwareBrainIaaS(&persistentStateStore,
+                                     effectiveBootstrapConfig,
+                                     persistentBootState,
+                                     {.http = hostControlNetwork.http(), .delay = ProdigyHostDelayOperation::submission()});
+    (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
     dnsProvider = new ProdigyDefaultDNSProvider();
+    configureDNSProviderRuntime({.http = hostControlNetwork.http(),
+                                 .delay = ProdigyHostDelayOperation::submission()});
   }
 
   ~ProdigyBrain()
@@ -1217,9 +1227,12 @@ public:
 class ProdigyNeuron : public Neuron {
 public:
 
-  ProdigyNeuron()
+  explicit ProdigyNeuron(ProdigyHostControlNetwork& hostControlNetwork)
   {
-    iaas = new RuntimeAwareNeuronIaaS(&persistentStateStore, effectiveBootstrapConfig, persistentBootState);
+    iaas = new RuntimeAwareNeuronIaaS(&persistentStateStore,
+                                      effectiveBootstrapConfig,
+                                      persistentBootState,
+                                      {.http = hostControlNetwork.http(), .delay = ProdigyHostDelayOperation::submission()});
   }
 
   bool startOperatingSystemUpdate(const String& targetOSID, const String& targetOSVersionID, const String& updateCommand, String *failure = nullptr) override
@@ -1361,7 +1374,7 @@ int main(int argc, char *argv[])
 
   setenv("PRODIGY_MOTHERSHIP_SOCKET", effectiveBootstrapConfig.controlSocketPath.c_str(), 1);
 
-  Prodigy<ProdigyNeuron, ProdigyBrain> prodigy;
+  Prodigy<ProdigyNeuron, ProdigyBrain, ProdigyHostControlNetwork> prodigy;
   prodigy.prepare(argc, argv);
   prodigy.start();
   return EXIT_SUCCESS;

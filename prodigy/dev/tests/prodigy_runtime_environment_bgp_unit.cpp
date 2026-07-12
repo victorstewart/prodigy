@@ -38,10 +38,6 @@ int main(void)
 {
   TestSuite suite = {};
 
-  ProdigyBootstrapConfig bootstrap = {};
-  RuntimeAwareNeuronIaaS neuron(nullptr, bootstrap, ProdigyPersistentBootState {});
-  EthDevice eth = {};
-
   ProdigyRuntimeEnvironmentConfig overridden = {};
   overridden.bgp.specified = true;
   overridden.bgp.config.enabled = true;
@@ -49,13 +45,11 @@ int main(void)
   overridden.bgp.config.nextHop6 = IPAddress("2001:db8::1", true);
   overridden.bgp.config.peers.push_back(makeBGPPeer("169.254.1.1"_ctv, "10.0.0.21"_ctv, 64'512, "peer-md5-v4"_ctv, 2));
   overridden.bgp.config.peers.push_back(makeBGPPeer("2001:19f0:ffff::1"_ctv, "2001:db8::21"_ctv, 64'512, "peer-md5-v6"_ctv, 3));
-  neuron.configureRuntimeEnvironment(overridden);
-
   IPAddress private4 = {};
   (void)prodigyParseIPAddressText("10.0.0.21"_ctv, private4);
 
   NeuronBGPConfig resolved = {};
-  neuron.gatherBGPConfig(resolved, eth, private4);
+  suite.expect(prodigyResolveRuntimeEnvironmentBGPOverride(overridden, private4, resolved), "runtime_env_bgp_override_applied");
   suite.expect(resolved.enabled, "runtime_env_bgp_override_enabled");
   suite.expect(resolved.ourBGPID == private4.v4, "runtime_env_bgp_override_derives_bgp_id_from_private4");
   suite.expect(resolved.nextHop4.equals(IPAddress("10.0.0.1", false)), "runtime_env_bgp_override_nextHop4");
@@ -66,16 +60,14 @@ int main(void)
 
   ProdigyRuntimeEnvironmentConfig explicitDisabled = {};
   explicitDisabled.bgp.specified = true;
-  neuron.configureRuntimeEnvironment(explicitDisabled);
   resolved = {};
-  neuron.gatherBGPConfig(resolved, eth, private4);
+  suite.expect(prodigyResolveRuntimeEnvironmentBGPOverride(explicitDisabled, private4, resolved), "runtime_env_bgp_disabled_override_applied");
   suite.expect(resolved.enabled == false, "runtime_env_bgp_override_disabled");
   suite.expect(resolved.peers.empty(), "runtime_env_bgp_override_disabled_no_peers");
 
   ProdigyRuntimeEnvironmentConfig fallback = {};
-  neuron.configureRuntimeEnvironment(fallback);
   resolved = {};
-  neuron.gatherBGPConfig(resolved, eth, private4);
+  suite.expect(prodigyResolveRuntimeEnvironmentBGPOverride(fallback, private4, resolved) == false, "runtime_env_bgp_fallback_not_overridden");
   suite.expect(resolved.configured() == false, "runtime_env_bgp_falls_back_to_empty_without_override");
 
   return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

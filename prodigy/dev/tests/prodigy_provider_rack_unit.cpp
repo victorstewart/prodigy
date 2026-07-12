@@ -221,21 +221,6 @@ int main(void)
   }
 
   {
-    String response = {};
-    bool ok = AzureHttp::appendResponseBytes(response, reinterpret_cast<const uint8_t *>("token"), 5);
-    suite.expect(ok, "azure_http_append_response_bytes_succeeds");
-    suite.expect(response == "token"_ctv, "azure_http_append_response_bytes_writes_all_bytes");
-  }
-
-  {
-    uint8_t storage[4] = {};
-    String constrained(storage, sizeof(storage), Copy::no, 0);
-    bool ok = AzureHttp::appendResponseBytes(constrained, reinterpret_cast<const uint8_t *>("token"), 5);
-    suite.expect(!ok, "azure_http_append_response_bytes_fails_when_buffer_cannot_grow");
-    suite.expect(constrained.size() == 0, "azure_http_append_response_bytes_does_not_silently_truncate");
-  }
-
-  {
     simdjson::dom::parser parser;
     simdjson::dom::element doc = {};
     String failure = {};

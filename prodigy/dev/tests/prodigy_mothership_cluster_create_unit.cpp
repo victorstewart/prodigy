@@ -583,6 +583,7 @@ class FakeProvisionBrainIaaS final : public BrainIaaS {
 public:
 
   bool autoProvision = true;
+  bool deferSpin = false;
   uint32_t kindsMask = 2u;
   uint32_t spinCalls = 0;
   uint32_t destroyCalls = 0;
@@ -600,12 +601,15 @@ public:
 
   void spinMachines(CoroutineStack *coro, MachineLifetime lifetime, const MachineConfig& config, uint32_t count, bytell_hash_set<Machine *>& newMachines, String& error) override
   {
-    (void)coro;
     (void)lifetime;
     (void)config;
     (void)count;
 
     spinCalls += 1;
+    if (deferSpin)
+    {
+      co_await coro->suspend();
+    }
     if (progressSink != nullptr && progressToEmit.empty() == false)
     {
       progressSink->reportMachineProvisioningProgress(progressToEmit);
@@ -622,14 +626,14 @@ public:
     progressSink = sink;
   }
 
-  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines) override
+  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines, String& failure) override
   {
     (void)coro;
     (void)metro;
     (void)machines;
   }
 
-  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains) override
+  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains, String& failure) override
   {
     (void)coro;
     (void)selfUUID;
@@ -637,9 +641,11 @@ public:
     selfIsBrain = false;
   }
 
-  void hardRebootMachine(uint128_t uuid) override
+  void hardRebootMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
-    (void)uuid;
+    (void)coro;
+    (void)cloudID;
+    failure.clear();
   }
 
   void reportHardwareFailure(uint128_t uuid, const String& report) override
@@ -654,21 +660,26 @@ public:
     (void)decommissionedIDs;
   }
 
-  void destroyMachine(Machine *machine) override
+  void destroyMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
+    (void)coro;
+    failure.clear();
     destroyCalls += 1;
-    if (machine != nullptr)
+    if (cloudID.empty() == false)
     {
-      destroyedCloudIDs.push_back(machine->cloudID);
+      destroyedCloudIDs.push_back(cloudID);
     }
   }
 
-  bool ensureProdigyMachineTags(const String& clusterUUID, Machine *machine, String& error) override
+  void ensureProdigyMachineTags(CoroutineStack *coro,
+                                const String& clusterUUID,
+                                const String& cloudID,
+                                String& error) override
   {
+    (void)coro;
     error.clear();
     ensuredClusterUUIDs.push_back(clusterUUID);
-    ensuredCloudIDs.push_back(machine ? machine->cloudID : ""_ctv);
-    return true;
+    ensuredCloudIDs.push_back(cloudID);
   }
 
   uint32_t supportedMachineKindsMask() const override
@@ -798,7 +809,7 @@ int main(void)
     cloudMachine.cloud.cloudID = "i-tagged-seed"_ctv;
 
     String failure = {};
-    bool ok = prodigyEnsureCloudMachineTagged(iaas, 0x1234, cloudMachine, &failure);
+    bool ok = prodigyEnsureCloudMachineTaggedInline(iaas, 0x1234, cloudMachine, &failure);
     suite.expect(ok, "ensure_cloud_machine_tagged_ok");
     suite.expect(failure.size() == 0, "ensure_cloud_machine_tagged_no_failure");
     suite.expect(iaas.ensuredClusterUUIDs.size() == 1, "ensure_cloud_machine_tagged_calls_provider_once");
@@ -807,12 +818,12 @@ int main(void)
     suite.expect(iaas.ensuredClusterUUIDs[0].equals(renderClusterUUIDHex(0x1234)), "ensure_cloud_machine_tagged_expected_cluster_uuid");
 
     ClusterMachine ownedMachine = makeTopologyMachine("owned-brain"_ctv, "10.7.0.11"_ctv, true, ClusterMachineSource::adopted, ClusterMachineBacking::owned);
-    ok = prodigyEnsureCloudMachineTagged(iaas, 0x1234, ownedMachine, &failure);
+    ok = prodigyEnsureCloudMachineTaggedInline(iaas, 0x1234, ownedMachine, &failure);
     suite.expect(ok, "ensure_cloud_machine_tagged_skips_owned");
     suite.expect(iaas.ensuredClusterUUIDs.size() == 1, "ensure_cloud_machine_tagged_owned_no_extra_provider_call");
 
     failure.clear();
-    ok = prodigyEnsureCloudMachineTagged(iaas, 0, cloudMachine, &failure);
+    ok = prodigyEnsureCloudMachineTaggedInline(iaas, 0, cloudMachine, &failure);
     suite.expect(ok == false, "ensure_cloud_machine_tagged_requires_cluster_uuid");
     suite.expect(failure.equals("clusterUUID required for cloud machine tagging"_ctv), "ensure_cloud_machine_tagged_requires_cluster_uuid_reason");
   }
@@ -853,7 +864,7 @@ int main(void)
     ClusterMachine seedMachine = {};
     ProdigyTimingAttribution timingAttribution = {};
     String failure;
-    bool ok = mothershipProvisionCreatedSeedMachine(cluster, instruction, iaas, seedMachine, &progressSink, &timingAttribution, &failure);
+    bool ok = mothershipProvisionCreatedSeedMachineInline(cluster, instruction, iaas, seedMachine, &progressSink, &timingAttribution, &failure);
     suite.expect(ok, "seed_provision_ok");
     suite.expect(failure.size() == 0, "seed_provision_no_failure");
     suite.expect(iaas.spinCalls == 1, "seed_provision_spin_called");
@@ -894,9 +905,78 @@ int main(void)
 
     ClusterMachine seedMachine = {};
     String failure;
-    bool ok = mothershipProvisionCreatedSeedMachine(cluster, instruction, iaas, seedMachine, nullptr, nullptr, &failure);
+    bool ok = mothershipProvisionCreatedSeedMachineInline(cluster, instruction, iaas, seedMachine, nullptr, nullptr, &failure);
     suite.expect(!ok, "seed_provision_rejects_missing_auto_provision");
     suite.expect(failure.equals("current runtime environment does not support automatic machine provisioning"_ctv), "seed_provision_missing_auto_provision_failure");
+  }
+
+  {
+    MothershipProdigyCluster cluster = {};
+    cluster.bootstrapSshUser = "root"_ctv;
+    appendClusterMachineConfig(cluster, makeMachineConfig("deferred-brain"_ctv,
+                                                         MachineConfig::MachineKind::vm,
+                                                         4,
+                                                         16'384,
+                                                         131'072));
+    CreateMachinesInstruction instruction = {};
+    instruction.kind = MachineConfig::MachineKind::vm;
+    instruction.lifetime = MachineLifetime::ondemand;
+    instruction.backing = ClusterMachineBacking::cloud;
+    instruction.cloud.schema = "deferred-brain"_ctv;
+    instruction.cloud.providerMachineType = "c7i.large"_ctv;
+    instruction.isBrain = true;
+    FakeProvisionBrainIaaS iaas;
+    iaas.deferSpin = true;
+    iaas.snapshotsToReturn.push_back(
+        makeMachineSnapshot("deferred-brain"_ctv, "10.8.0.11"_ctv, "i-deferred"_ctv));
+    FakeProvisioningProgressSink progressSink;
+    CoroutineStack stack;
+    ClusterMachine seedMachine = {};
+    bool provisioned = false;
+    String failure;
+
+    mothershipProvisionCreatedSeedMachine(&stack,
+                                          cluster,
+                                          instruction,
+                                          iaas,
+                                          seedMachine,
+                                          provisioned,
+                                          &progressSink,
+                                          nullptr,
+                                          &failure);
+    suite.expect(stack.hasSuspendedCoroutines() && provisioned == false &&
+                     seedMachine.cloud.cloudID.empty() && iaas.progressSink == &progressSink,
+                 "seed_provision_deferred_helper_preserves_state_while_provider_waits");
+    stack.co_consume();
+    suite.expect(stack.hasSuspendedCoroutines() == false && provisioned && failure.empty() &&
+                     seedMachine.cloud.cloudID == "i-deferred"_ctv && iaas.progressSink == nullptr,
+                 "seed_provision_deferred_helper_projects_and_detaches_after_resume");
+  }
+
+  {
+    MothershipProdigyCluster cluster = {};
+    appendClusterMachineConfig(cluster, makeMachineConfig("mismatch"_ctv,
+                                                         MachineConfig::MachineKind::vm,
+                                                         4,
+                                                         16'384,
+                                                         131'072));
+    CreateMachinesInstruction instruction = {};
+    instruction.kind = MachineConfig::MachineKind::vm;
+    instruction.lifetime = MachineLifetime::ondemand;
+    instruction.backing = ClusterMachineBacking::cloud;
+    instruction.cloud.schema = "mismatch"_ctv;
+    FakeProvisionBrainIaaS iaas;
+    iaas.snapshotsToReturn.push_back(
+        makeMachineSnapshot("mismatch"_ctv, "10.8.0.12"_ctv, "i-one"_ctv));
+    iaas.snapshotsToReturn.push_back(
+        makeMachineSnapshot("mismatch"_ctv, "10.8.0.13"_ctv, "i-two"_ctv));
+    ClusterMachine seedMachine = {};
+    String failure;
+    suite.expect(mothershipProvisionCreatedSeedMachineInline(
+                     cluster, instruction, iaas, seedMachine, nullptr, nullptr, &failure) == false &&
+                     iaas.destroyCalls == 2 &&
+                     failure == "provider returned 2 created machines but 1 was requested"_ctv,
+                 "seed_provision_snapshot_count_mismatch_destroys_every_provider_machine");
   }
 
   {
@@ -2112,12 +2192,15 @@ int main(void)
     topology.machines.push_back(makeTopologyMachine("owned-created"_ctv, "10.6.0.13"_ctv, false, ClusterMachineSource::created, ClusterMachineBacking::owned));
 
     FakeProvisionBrainIaaS iaas;
+    CoroutineStack coro;
     String failure;
     failure.assign("stale"_ctv);
-    mothershipDestroyCreatedClusterMachines(iaas, topology);
+    mothershipDestroyCreatedClusterMachines(&coro, iaas, topology, failure);
+    coro.co_consume();
     suite.expect(iaas.destroyCalls == 1, "destroy_created_cluster_machines_only_destroys_unique_created_cloud");
     suite.expect(iaas.destroyedCloudIDs.size() == 1, "destroy_created_cluster_machines_tracks_one_id");
     suite.expect(iaas.destroyedCloudIDs[0].equals("i-created-a"_ctv), "destroy_created_cluster_machines_destroys_expected_cloud_id");
+    suite.expect(failure.empty(), "destroy_created_cluster_machines_clears_stale_failure");
   }
 
   if (originalPath.empty())

@@ -2,6 +2,7 @@
 
 #include <services/filesystem.h>
 #include <services/vault.h>
+#include <prodigy/json.h>
 
 static inline auto prodigyDefaultBootstrapSSHPrivateKeyPath(void)
 {
@@ -427,50 +428,4 @@ static inline void prodigyBuildBootstrapSSHCloudConfig(const String& configuredU
     config.append("  - sh -c 'mkdir -p /etc/ssh && cp /etc/prodigy-bootstrap-ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key && cp /etc/prodigy-bootstrap-ssh_host_ed25519_key.pub /etc/ssh/ssh_host_ed25519_key.pub && chown 0:0 /etc/ssh/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key.pub && chmod 600 /etc/ssh/ssh_host_ed25519_key && chmod 644 /etc/ssh/ssh_host_ed25519_key.pub && rm -f /etc/prodigy-bootstrap-ssh_host_ed25519_key /etc/prodigy-bootstrap-ssh_host_ed25519_key.pub'\n"_ctv);
   }
   config.append("  - sh -c 'systemctl restart sshd || systemctl restart ssh || service sshd restart || service ssh restart'\n"_ctv);
-}
-
-static inline void prodigyAppendEscapedJSONStringLiteral(String& output, const String& value)
-{
-  output.append('"');
-
-  for (uint64_t index = 0; index < value.size(); ++index)
-  {
-    uint8_t byte = value[index];
-
-    switch (byte)
-    {
-      case '\\':
-        {
-          output.append("\\\\"_ctv);
-          break;
-        }
-      case '"':
-        {
-          output.append("\\\""_ctv);
-          break;
-        }
-      case '\n':
-        {
-          output.append("\\n"_ctv);
-          break;
-        }
-      case '\r':
-        {
-          output.append("\\r"_ctv);
-          break;
-        }
-      case '\t':
-        {
-          output.append("\\t"_ctv);
-          break;
-        }
-      default:
-        {
-          output.append(byte);
-          break;
-        }
-    }
-  }
-
-  output.append('"');
 }

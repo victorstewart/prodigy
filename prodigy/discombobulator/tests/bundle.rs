@@ -9,8 +9,20 @@ use tar::Archive;
 use tempfile::TempDir;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
+fn app_container_blob(payload: &[u8]) -> Vec<u8> {
+    let mut blob = b"PRODIGY-DISCOMBOBULATOR-APP-CONTAINER\ncontract=prodigy-container-artifact\ncontract_version=1\n\n".to_vec();
+    blob.extend_from_slice(payload);
+    blob
+}
+
+fn tunnel_provider_blob(payload: &[u8]) -> Vec<u8> {
+    let mut blob = b"PRODIGY-DISCOMBOBULATOR-MOTHERSHIP-TUNNEL-PROVIDER\ncontract=prodigy-mothership-tunnel-provider\ncontract_version=1\ncontainer_kind=mothershipTunnelProvider\nrequires_standard_neuron_socket=false\nrequires_mothership_tunnel_gateway=true\nnetwork_policy=tcpEgressOnly\n\n".to_vec();
+    blob.extend_from_slice(payload);
+    blob
+}
+
 #[test]
-fn flat_bundle_packages_binary_tools_and_ebpf_objects() {
+fn flat_bundle_packages_binary_tools_ebpf_and_exact_container_artifacts() {
     let temp = TempDir::new().unwrap();
     let project = temp.path();
     let build_dir = project.join("build");
@@ -41,11 +53,34 @@ fn flat_bundle_packages_binary_tools_and_ebpf_objects() {
     let ebpf_object = build_dir.join("latency.ebpf.o");
     fs::write(&ebpf_object, b"fake-ebpf-object").unwrap();
 
+    let app_artifact = project.join("resolver.container.zst");
+    let app_artifact_bytes = app_container_blob(b"app-payload");
+    fs::write(&app_artifact, &app_artifact_bytes).unwrap();
+    fs::set_permissions(&app_artifact, fs::Permissions::from_mode(0o755)).unwrap();
+    let tunnel_artifact = build_dir.join("tunnel.container.zst");
+    let tunnel_artifact_bytes = tunnel_provider_blob(b"tunnel-payload");
+    fs::write(&tunnel_artifact, &tunnel_artifact_bytes).unwrap();
+    fs::write(
+        project.join("libresolver-neighbor.so"),
+        b"must-not-be-chased",
+    )
+    .unwrap();
+    let resolver_plan = project.join("resolver.deployment.plan.v1.json");
+    let resolver_plan_bytes = br#"{"config":{"applicationID":"${application:Resolver}"}}"#;
+    fs::write(&resolver_plan, resolver_plan_bytes).unwrap();
+
     let output = project.join("prodigy.bundle.tar.zst");
     run_checked(
         bundle_command(&binary, &build_dir, &output)
+            .current_dir(project)
             .arg("--tool-binary")
-            .arg(&tool),
+            .arg(&tool)
+            .arg("--container-artifact")
+            .arg("./resolver.container.zst")
+            .arg("--container-artifact")
+            .arg(&tunnel_artifact)
+            .arg("--container-plan")
+            .arg(&resolver_plan),
         "build flat bundle",
     );
 
@@ -55,6 +90,73 @@ fn flat_bundle_packages_binary_tools_and_ebpf_objects() {
     assert!(inspect_dir.join("lib").is_dir());
     assert!(inspect_dir.join("tools/helper-tool").is_file());
     assert!(inspect_dir.join("latency.ebpf.o").is_file());
+    assert_eq!(
+        fs::read(inspect_dir.join("containers/resolver.container.zst")).unwrap(),
+        app_artifact_bytes
+    );
+    assert_eq!(
+        fs::read(inspect_dir.join("containers/tunnel.container.zst")).unwrap(),
+        tunnel_artifact_bytes
+    );
+    assert_eq!(
+        fs::read(inspect_dir.join("containers/plans/resolver.deployment.plan.v1.json")).unwrap(),
+        resolver_plan_bytes
+    );
+    assert_eq!(
+        fs::metadata(inspect_dir.join("containers/resolver.container.zst"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+    assert_eq!(
+        fs::metadata(inspect_dir.join("containers/tunnel.container.zst"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+    assert_eq!(
+        fs::metadata(inspect_dir.join("containers/plans/resolver.deployment.plan.v1.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+    let mut container_entries = fs::read_dir(inspect_dir.join("containers"))
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.unwrap();
+            entry
+                .file_type()
+                .unwrap()
+                .is_file()
+                .then(|| entry.file_name())
+        })
+        .collect::<Vec<_>>();
+    container_entries.sort();
+    assert_eq!(
+        container_entries,
+        vec![
+            std::ffi::OsString::from("resolver.container.zst"),
+            std::ffi::OsString::from("tunnel.container.zst"),
+        ]
+    );
+    let plan_entries = fs::read_dir(inspect_dir.join("containers/plans"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        plan_entries,
+        vec![std::ffi::OsString::from("resolver.deployment.plan.v1.json")]
+    );
+    assert!(!inspect_dir
+        .join("containers/libresolver-neighbor.so")
+        .exists());
+    assert!(!inspect_dir.join("lib/libresolver-neighbor.so").exists());
     assert_ne!(
         fs::metadata(inspect_dir.join("hello"))
             .unwrap()
@@ -63,6 +165,133 @@ fn flat_bundle_packages_binary_tools_and_ebpf_objects() {
             & 0o111,
         0
     );
+}
+
+#[test]
+fn flat_bundle_rejects_invalid_container_artifact_inputs() {
+    let temp = TempDir::new().unwrap();
+    let project = temp.path();
+    let build_dir = project.join("build");
+    fs::create_dir_all(&build_dir).unwrap();
+    let binary = build_dir.join("prodigy");
+    fs::copy("/bin/true", &binary).unwrap();
+
+    let malformed = project.join("malformed.container.zst");
+    fs::write(&malformed, b"not-a-discombobulator-blob").unwrap();
+    let malformed_output = project.join("malformed.bundle.tar.zst");
+    let malformed_result = bundle_command(&binary, &build_dir, &malformed_output)
+        .arg("--container-artifact")
+        .arg(&malformed)
+        .output()
+        .unwrap();
+    assert!(!malformed_result.status.success());
+    assert!(String::from_utf8_lossy(&malformed_result.stderr)
+        .contains("not a supported Discombobulator-built blob"));
+    assert!(!malformed_output.exists());
+
+    let first_dir = project.join("first");
+    let second_dir = project.join("second");
+    fs::create_dir_all(&first_dir).unwrap();
+    fs::create_dir_all(&second_dir).unwrap();
+    let first = first_dir.join("duplicate.container.zst");
+    let second = second_dir.join("duplicate.container.zst");
+    fs::write(&first, app_container_blob(b"first")).unwrap();
+    fs::write(&second, app_container_blob(b"second")).unwrap();
+    let duplicate_output = project.join("duplicate.bundle.tar.zst");
+    let duplicate_result = bundle_command(&binary, &build_dir, &duplicate_output)
+        .arg("--container-artifact")
+        .arg(&first)
+        .arg("--container-artifact")
+        .arg(&second)
+        .output()
+        .unwrap();
+    assert!(!duplicate_result.status.success());
+    assert!(
+        String::from_utf8_lossy(&duplicate_result.stderr).contains("must have unique basenames")
+    );
+    assert!(!duplicate_output.exists());
+
+    let parent_relative = first_dir
+        .join("..")
+        .join("second")
+        .join("duplicate.container.zst");
+    let parent_relative_output = project.join("parent-relative.bundle.tar.zst");
+    run_checked(
+        bundle_command(&binary, &build_dir, &parent_relative_output)
+            .arg("--container-artifact")
+            .arg(parent_relative),
+        "accept parent-relative container artifact source",
+    );
+
+    let injection_output = project.join("injection.bundle.tar.zst");
+    let injection_result = bundle_command(&binary, &build_dir, &injection_output)
+        .current_dir(project)
+        .arg("--container-artifact")
+        .arg("..")
+        .output()
+        .unwrap();
+    assert!(!injection_result.status.success());
+    assert!(String::from_utf8_lossy(&injection_result.stderr)
+        .contains("must have a normal nonempty basename"));
+    assert!(!injection_output.exists());
+
+    let directory_output = project.join("directory.bundle.tar.zst");
+    let directory_result = bundle_command(&binary, &build_dir, &directory_output)
+        .arg("--container-artifact")
+        .arg(&first_dir)
+        .output()
+        .unwrap();
+    assert!(!directory_result.status.success());
+    assert!(String::from_utf8_lossy(&directory_result.stderr).contains("is not a regular file"));
+    assert!(!directory_output.exists());
+}
+
+#[test]
+fn flat_bundle_rejects_invalid_container_plan_inputs() {
+    let temp = TempDir::new().unwrap();
+    let project = temp.path();
+    let build_dir = project.join("build");
+    fs::create_dir_all(&build_dir).unwrap();
+    let binary = build_dir.join("prodigy");
+    fs::copy("/bin/true", &binary).unwrap();
+
+    let malformed = project.join("malformed.json");
+    fs::write(&malformed, b"not-json").unwrap();
+    let malformed_result = bundle_command(
+        &binary,
+        &build_dir,
+        &project.join("malformed.bundle.tar.zst"),
+    )
+    .arg("--container-plan")
+    .arg(&malformed)
+    .output()
+    .unwrap();
+    assert!(!malformed_result.status.success());
+    assert!(String::from_utf8_lossy(&malformed_result.stderr).contains("not valid JSON"));
+
+    let array = project.join("array.json");
+    fs::write(&array, b"[]").unwrap();
+    let array_result = bundle_command(&binary, &build_dir, &project.join("array.bundle.tar.zst"))
+        .arg("--container-plan")
+        .arg(&array)
+        .output()
+        .unwrap();
+    assert!(!array_result.status.success());
+    assert!(String::from_utf8_lossy(&array_result.stderr).contains("root must be an object"));
+
+    let oversized = project.join("oversized.json");
+    fs::write(&oversized, vec![b' '; 1024 * 1024 + 1]).unwrap();
+    let oversized_result = bundle_command(
+        &binary,
+        &build_dir,
+        &project.join("oversized.bundle.tar.zst"),
+    )
+    .arg("--container-plan")
+    .arg(&oversized)
+    .output()
+    .unwrap();
+    assert!(!oversized_result.status.success());
+    assert!(String::from_utf8_lossy(&oversized_result.stderr).contains("1048576-byte limit"));
 }
 
 #[test]
@@ -175,7 +404,9 @@ fn flat_bundle_fails_clearly_when_needed_library_cannot_be_resolved() {
     assert!(String::from_utf8_lossy(&ldd_output.stdout).contains("libcustom.so => not found"));
 
     let output = project.join("prodigy.bundle.tar.zst");
-    let failure = bundle_command(&binary, &build_dir, &output).output().unwrap();
+    let failure = bundle_command(&binary, &build_dir, &output)
+        .output()
+        .unwrap();
     assert!(!failure.status.success());
     let stderr = String::from_utf8_lossy(&failure.stderr);
     assert!(stderr.contains("libcustom.so"), "{stderr}");

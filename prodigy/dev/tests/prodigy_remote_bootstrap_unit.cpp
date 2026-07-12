@@ -506,6 +506,24 @@ public:
 int main(void)
 {
   TestSuite suite;
+
+  {
+    int fd = 41;
+    errno = 0;
+    suite.expect(
+        prodigyOpenNumericConnectedSocket("ssh.invalid.example"_ctv, 22, fd) == false,
+        "blocking_ssh_socket_rejects_hostname");
+    suite.expect(fd == -1, "blocking_ssh_socket_rejects_hostname_without_fd");
+    suite.expect(errno == EINVAL, "blocking_ssh_socket_rejects_hostname_reason");
+
+    fd = 42;
+    errno = 0;
+    suite.expect(
+        mothershipOpenNumericConnectedSocket("gateway.invalid.example"_ctv, 443, fd) == false,
+        "mothership_socket_rejects_hostname");
+    suite.expect(fd == -1, "mothership_socket_rejects_hostname_without_fd");
+    suite.expect(errno == EINVAL, "mothership_socket_rejects_hostname_reason");
+  }
   String failure;
 
   String resolvedBootstrapUser = {};

@@ -7070,7 +7070,7 @@ public:
     return false;
   }
 
-  static bool allocateWhiteholeSourcePort(Whitehole& whitehole, const RoutableResourceLeaseOwner *owner = nullptr)
+  static bool allocateWhiteholeSourcePort(Whitehole& whitehole)
   {
     if (whitehole.address.isNull())
     {
@@ -7080,7 +7080,7 @@ public:
     for (uint32_t port = 49'152; port <= 65'535; ++port)
     {
       uint16_t candidatePort = uint16_t(port);
-      if (whiteholeAddressPortAlreadyInUse(whitehole.address, candidatePort, owner))
+      if (whiteholeAddressPortAlreadyInUse(whitehole.address, candidatePort))
       {
         continue;
       }
@@ -7126,6 +7126,11 @@ public:
         lease.registeredPrefixUUID = subnet.uuid;
         break;
       }
+    }
+    if (lease.registeredPrefixUUID == 0 ||
+        thisBrain->routablePrefixReleasePending(lease.registeredPrefixUUID))
+    {
+      return false;
     }
     for (const RoutableResourceLease& existing : thisBrain->routableResourceLeaseRuntimeState)
     {
@@ -8374,20 +8379,7 @@ public:
       }
     }
 
-    String alert;
-    alert.snprintf_add<"Application: {itoa}\n"_ctv>(plan.config.applicationID);
-    alert.snprintf_add<"Deployment: {itoa}\n"_ctv>(plan.config.deploymentID());
-    alert.snprintf_add<"Container: {itoa}\n"_ctv>(container->uuid);
-    alert.snprintf_add<"Time(ms since epoch): {itoa}\n"_ctv>(approxTimeMs);
-    alert.snprintf_add<"Nth Crash: {itoa}\n"_ctv>(container->nCrashes);
-    alert.snprintf_add<"Signal: {itoa}\n"_ctv>(signal);
-    alert.snprintf_add<"Restarted: {itoa}\n"_ctv>(restarted);
-    alert.snprintf_add<"Canary: {itoa}\n"_ctv>(container->lifetime == ApplicationLifetime::canary);
     uint64_t reportBytes = (report.size() < 256) ? report.size() : 256;
-    String subReport = report.substr(0, reportBytes, Copy::no);
-    alert.snprintf_add<"Report: {}\n"_ctv>(subReport);
-
-    thisBrain->batphone.sendEmail(thisBrain->brainConfig.reporter.from, thisBrain->brainConfig.reporter.to, "Container Crashed!"_ctv, alert);
 
     bool failedBeforeDeployHealthy = false;
     if (container->deploymentID == plan.config.deploymentID())
@@ -8652,6 +8644,7 @@ public:
             container->addresses.emplace_back(container->meshAddress, uint8_t(128));
             container->wormholes = plan.wormholes;
             container->whiteholes = plan.whiteholes;
+            container->networkAccess = plan.networkAccess;
 
             RoutableResourceLeaseOwner whiteholeLeaseOwner = routableResourceLeaseOwner();
             for (Whitehole& whitehole : container->whiteholes)
@@ -8661,7 +8654,7 @@ public:
               whitehole.sourcePort = 0;
               whitehole.bindingNonce = 0;
 
-              if (resolveWhiteholeSourceAddressForScheduling(machine, whitehole, nullptr, container, &whiteholeLeaseOwner) == false || whitehole.hasAddress == false || allocateWhiteholeSourcePort(whitehole, &whiteholeLeaseOwner) == false || reserveWhiteholeAddressPortLease(whitehole, whiteholeLeaseOwner) == false)
+              if (resolveWhiteholeSourceAddressForScheduling(machine, whitehole, nullptr, container, &whiteholeLeaseOwner) == false || whitehole.hasAddress == false || allocateWhiteholeSourcePort(whitehole) == false || reserveWhiteholeAddressPortLease(whitehole, whiteholeLeaseOwner) == false)
               {
                 whitehole.hasAddress = false;
                 whitehole.address = {};

@@ -12,68 +12,96 @@
 #include <prodigy/iaas/vultr/vultr.h>
 #include <prodigy/persistent.state.h>
 
-static inline std::unique_ptr<BrainIaaS> prodigyCreateProviderBrainIaaS(const ProdigyRuntimeEnvironmentConfig& config)
+static inline std::unique_ptr<BrainIaaS> prodigyCreateProviderBrainIaaS(
+    const ProdigyRuntimeEnvironmentConfig& config,
+    ProdigyProviderServices services)
 {
+  std::unique_ptr<BrainIaaS> provider;
   switch (config.kind)
   {
     case ProdigyEnvironmentKind::dev:
       {
-        return std::make_unique<DevBrainIaaS>();
+        provider = std::make_unique<DevBrainIaaS>();
+        break;
       }
     case ProdigyEnvironmentKind::gcp:
       {
-        return std::make_unique<GcpBrainIaaS>();
+        provider = std::make_unique<GcpBrainIaaS>();
+        break;
       }
     case ProdigyEnvironmentKind::aws:
       {
-        return std::make_unique<AwsBrainIaaS>();
+        provider = std::make_unique<AwsBrainIaaS>();
+        break;
       }
     case ProdigyEnvironmentKind::azure:
       {
-        return std::make_unique<AzureBrainIaaS>();
+        provider = std::make_unique<AzureBrainIaaS>();
+        break;
       }
     case ProdigyEnvironmentKind::vultr:
       {
-        return std::make_unique<VultrBrainIaaS>();
+        provider = std::make_unique<VultrBrainIaaS>();
+        break;
       }
     case ProdigyEnvironmentKind::unknown:
     default:
       {
-        return nullptr;
+        break;
       }
   }
+
+  if (provider)
+  {
+    provider->configureProviderServices(services);
+  }
+  return provider;
 }
 
-static inline std::unique_ptr<NeuronIaaS> prodigyCreateProviderNeuronIaaS(const ProdigyRuntimeEnvironmentConfig& config)
+static inline std::unique_ptr<NeuronIaaS> prodigyCreateProviderNeuronIaaS(
+    const ProdigyRuntimeEnvironmentConfig& config,
+    ProdigyProviderServices services)
 {
+  std::unique_ptr<NeuronIaaS> provider;
   switch (config.kind)
   {
     case ProdigyEnvironmentKind::dev:
       {
-        return std::make_unique<DevNeuronIaaS>();
+        provider = std::make_unique<DevNeuronIaaS>();
+        break;
       }
     case ProdigyEnvironmentKind::gcp:
       {
-        return std::make_unique<GcpNeuronIaaS>();
+        provider = std::make_unique<GcpNeuronIaaS>();
+        break;
       }
     case ProdigyEnvironmentKind::aws:
       {
-        return std::make_unique<AwsNeuronIaaS>();
+        provider = std::make_unique<AwsNeuronIaaS>();
+        break;
       }
     case ProdigyEnvironmentKind::azure:
       {
-        return std::make_unique<AzureNeuronIaaS>();
+        provider = std::make_unique<AzureNeuronIaaS>();
+        break;
       }
     case ProdigyEnvironmentKind::vultr:
       {
-        return std::make_unique<VultrNeuronIaaS>();
+        provider = std::make_unique<VultrNeuronIaaS>();
+        break;
       }
     case ProdigyEnvironmentKind::unknown:
     default:
       {
-        return nullptr;
+        break;
       }
   }
+
+  if (provider)
+  {
+    provider->configureProviderServices(services);
+  }
+  return provider;
 }
 
 class RuntimeAwareBrainIaaS : public BrainIaaS {
@@ -81,14 +109,42 @@ private:
 
   ProdigyBootstrapConfig bootstrapConfig;
   ProdigyRuntimeEnvironmentConfig runtimeEnvironment;
+  ProdigyRuntimeEnvironmentConfig pendingRuntimeEnvironment;
   ProdigyPersistentBootState persistentBootState = {};
   ProdigyPersistentStateStore *stateStore = nullptr;
   BootstrapBrainIaaS bootstrapDelegate;
   std::unique_ptr<BrainIaaS> providerDelegate;
+  bool providerReconfigurationPending = false;
+  bool elasticAddressOperationBatchActive = false;
+  bool elasticAddressReleaseFenceActive = false;
 
   BrainIaaS *activeDelegate(void)
   {
     return providerDelegate ? providerDelegate.get() : static_cast<BrainIaaS *>(&bootstrapDelegate);
+  }
+
+  void applyRuntimeEnvironment(void)
+  {
+    providerDelegate = prodigyCreateProviderBrainIaaS(runtimeEnvironment, providerServices);
+    if (providerDelegate)
+    {
+      providerDelegate->configureRuntimeEnvironment(runtimeEnvironment);
+    }
+    providerReconfigurationPending = false;
+  }
+
+  void applyPendingRuntimeEnvironment(BrainIaaS *completedDelegate)
+  {
+    if (completedDelegate != nullptr && providerReconfigurationPending &&
+        elasticAddressOperationBatchActive == false && elasticAddressReleaseFenceActive == false &&
+        completedDelegate == providerDelegate.get() &&
+        completedDelegate->hasActiveControlOperations() == false)
+    {
+      prodigyOwnRuntimeEnvironmentConfig(pendingRuntimeEnvironment, runtimeEnvironment);
+      pendingRuntimeEnvironment = {};
+      applyRuntimeEnvironment();
+      persistBootState();
+    }
   }
 
   void persistBootState(void)
@@ -110,20 +166,20 @@ private:
 
 public:
 
-  RuntimeAwareBrainIaaS(ProdigyPersistentStateStore *store, const ProdigyBootstrapConfig& bootstrap, const ProdigyPersistentBootState& bootState)
+  RuntimeAwareBrainIaaS(ProdigyPersistentStateStore *store,
+                        const ProdigyBootstrapConfig& bootstrap,
+                        const ProdigyPersistentBootState& bootState,
+                        ProdigyProviderServices requestedProviderServices)
       : bootstrapConfig(bootstrap),
         stateStore(store),
         bootstrapDelegate(bootstrap)
   {
+    providerServices = requestedProviderServices;
     persistentBootState = bootState;
     prodigyOwnRuntimeEnvironmentConfig(bootState.runtimeEnvironment, runtimeEnvironment);
     prodigyStripManagedCloudBootstrapCredentials(runtimeEnvironment);
     prodigyApplyInternalRuntimeEnvironmentDefaults(runtimeEnvironment);
-    providerDelegate = prodigyCreateProviderBrainIaaS(runtimeEnvironment);
-    if (providerDelegate)
-    {
-      providerDelegate->configureRuntimeEnvironment(runtimeEnvironment);
-    }
+    applyRuntimeEnvironment();
     persistBootState();
   }
 
@@ -139,17 +195,60 @@ public:
     activeDelegate()->boot();
   }
 
+  bool beginElasticAddressOperationBatch(void) override
+  {
+    if (elasticAddressOperationBatchActive)
+    {
+      return false;
+    }
+    elasticAddressOperationBatchActive = true;
+    return true;
+  }
+
+  void endElasticAddressOperationBatch(void) override
+  {
+    if (elasticAddressOperationBatchActive == false)
+    {
+      return;
+    }
+    elasticAddressOperationBatchActive = false;
+    applyPendingRuntimeEnvironment(providerDelegate.get());
+  }
+
   void configureRuntimeEnvironment(const ProdigyRuntimeEnvironmentConfig& config) override
   {
-    prodigyOwnRuntimeEnvironmentConfig(config, runtimeEnvironment);
-    prodigyStripManagedCloudBootstrapCredentials(runtimeEnvironment);
-    prodigyApplyInternalRuntimeEnvironmentDefaults(runtimeEnvironment);
-    providerDelegate = prodigyCreateProviderBrainIaaS(runtimeEnvironment);
-    if (providerDelegate)
+    if (elasticAddressReleaseFenceActive)
     {
-      providerDelegate->configureRuntimeEnvironment(runtimeEnvironment);
+      return;
     }
+    ProdigyRuntimeEnvironmentConfig requestedEnvironment;
+    prodigyOwnRuntimeEnvironmentConfig(config, requestedEnvironment);
+    prodigyStripManagedCloudBootstrapCredentials(requestedEnvironment);
+    prodigyApplyInternalRuntimeEnvironmentDefaults(requestedEnvironment);
+    if (providerDelegate &&
+        (providerDelegate->hasActiveControlOperations() || elasticAddressOperationBatchActive))
+    {
+      prodigyOwnRuntimeEnvironmentConfig(requestedEnvironment, pendingRuntimeEnvironment);
+      providerReconfigurationPending = true;
+      return;
+    }
+    prodigyOwnRuntimeEnvironmentConfig(requestedEnvironment, runtimeEnvironment);
+    applyRuntimeEnvironment();
     persistBootState();
+  }
+
+  bool setElasticAddressReleaseFenceActive(bool active) override
+  {
+    if (active && providerDelegate == nullptr)
+    {
+      return false;
+    }
+    elasticAddressReleaseFenceActive = active;
+    if (active == false)
+    {
+      applyPendingRuntimeEnvironment(providerDelegate.get());
+    }
+    return true;
   }
 
   void spinMachines(CoroutineStack *coro, MachineLifetime lifetime, const MachineConfig& config, uint32_t count, bytell_hash_set<Machine *>& newMachines, String& error) override
@@ -182,19 +281,42 @@ public:
     activeDelegate()->configureProvisioningClusterUUID(clusterUUID);
   }
 
+  void configureProvisioningOperationID(uint64_t operationID) override
+  {
+    activeDelegate()->configureProvisioningOperationID(operationID);
+  }
+
+  bool provisioningOperationSettled(void) override
+  {
+    return activeDelegate()->provisioningOperationSettled();
+  }
+
   bool supportsIncrementalProvisioningCallbacks() const override
   {
     return providerDelegate ? providerDelegate->supportsIncrementalProvisioningCallbacks() : bootstrapDelegate.supportsIncrementalProvisioningCallbacks();
   }
 
-  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines) override
+  bool supportsTransactionalElasticAddresses(void) const override
   {
-    bootstrapDelegate.getMachines(coro, metro, machines);
+    return providerDelegate && providerDelegate->supportsTransactionalElasticAddresses();
   }
 
-  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains) override
+  bool validateProviderElasticAddressPlan(const ProviderElasticAddressPlan& plan,
+                                          const ProviderElasticAddressRequest& request,
+                                          uint128_t transactionNonce) const override
   {
-    bootstrapDelegate.getBrains(coro, selfUUID, selfIsBrain, brains);
+    return providerDelegate &&
+           providerDelegate->validateProviderElasticAddressPlan(plan, request, transactionNonce);
+  }
+
+  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines, String& failure) override
+  {
+    bootstrapDelegate.getMachines(coro, metro, machines, failure);
+  }
+
+  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains, String& failure) override
+  {
+    bootstrapDelegate.getBrains(coro, selfUUID, selfIsBrain, brains, failure);
   }
 
   bool resolveLocalBrainPeerAddress(IPAddress& address, String& addressText) const override
@@ -212,9 +334,9 @@ public:
     return providerDelegate ? providerDelegate->bgpEnabledForEnvironment() : false;
   }
 
-  bool inferMachineSchemaCpuCapability(const MachineConfig& config, MachineSchemaCpuCapability& capability, String& error) override
+  void inferMachineSchemaCpuCapability(CoroutineStack *coro, const MachineConfig& config, MachineSchemaCpuCapability& capability, String& error) override
   {
-    return activeDelegate()->inferMachineSchemaCpuCapability(config, capability, error);
+    activeDelegate()->inferMachineSchemaCpuCapability(coro, config, capability, error);
   }
 
   bool supportsAuthoritativeMachineSchemaCpuCapabilityInference(void) const override
@@ -222,14 +344,27 @@ public:
     return providerDelegate ? providerDelegate->supportsAuthoritativeMachineSchemaCpuCapabilityInference() : bootstrapDelegate.supportsAuthoritativeMachineSchemaCpuCapabilityInference();
   }
 
-  bool preflightClusterCreate(const BrainIaaSClusterCreatePreflight& preflight, String& error) override
+  void preflightClusterCreate(CoroutineStack *coro, const BrainIaaSClusterCreatePreflight& preflight, String& error) override
   {
-    return activeDelegate()->preflightClusterCreate(preflight, error);
+    activeDelegate()->preflightClusterCreate(coro, preflight, error);
   }
 
-  void hardRebootMachine(uint128_t uuid) override
+  void hardRebootMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
-    activeDelegate()->hardRebootMachine(uuid);
+    if (coro == nullptr)
+    {
+      failure.assign("provider hard reboot coroutine required"_ctv);
+      co_return;
+    }
+    BrainIaaS *delegate = activeDelegate();
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          delegate->hardRebootMachine(coro, cloudID, failure);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+
+    applyPendingRuntimeEnvironment(delegate);
   }
 
   void reportHardwareFailure(uint128_t uuid, const String& report) override
@@ -239,52 +374,162 @@ public:
 
   void checkForSpotTerminations(CoroutineStack *coro, Vector<String>& decommissionedIDs) override
   {
-    activeDelegate()->checkForSpotTerminations(coro, decommissionedIDs);
+    BrainIaaS *delegate = activeDelegate();
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          delegate->checkForSpotTerminations(coro, decommissionedIDs);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+
+    applyPendingRuntimeEnvironment(delegate);
   }
 
-  void destroyMachine(Machine *machine) override
+  void destroyMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
-    activeDelegate()->destroyMachine(machine);
+    if (coro == nullptr)
+    {
+      failure.assign("provider machine destroy coroutine required"_ctv);
+      co_return;
+    }
+    BrainIaaS *delegate = activeDelegate();
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          delegate->destroyMachine(coro, cloudID, failure);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+
+    applyPendingRuntimeEnvironment(delegate);
   }
 
-  bool destroyClusterMachines(const String& clusterUUID, uint32_t& destroyed, String& error) override
+  void destroyClusterMachines(CoroutineStack *coro, const String& clusterUUID, uint32_t& destroyed, String& error) override
   {
-    return activeDelegate()->destroyClusterMachines(clusterUUID, destroyed, error);
+    if (coro == nullptr)
+    {
+      destroyed = 0;
+      error.assign("provider cluster destroy coroutine required"_ctv);
+      co_return;
+    }
+    BrainIaaS *delegate = activeDelegate();
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          delegate->destroyClusterMachines(coro, clusterUUID, destroyed, error);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+
+    applyPendingRuntimeEnvironment(delegate);
   }
 
-  bool ensureProdigyMachineTags(const String& clusterUUID, Machine *machine, String& error) override
+  void ensureProdigyMachineTags(CoroutineStack *coro,
+                                const String& clusterUUID,
+                                const String& cloudID,
+                                String& error) override
   {
-    return activeDelegate()->ensureProdigyMachineTags(clusterUUID, machine, error);
+    if (coro == nullptr)
+    {
+      error.assign("provider machine tags coroutine required"_ctv);
+      co_return;
+    }
+    BrainIaaS *delegate = activeDelegate();
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          delegate->ensureProdigyMachineTags(coro, clusterUUID, cloudID, error);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+
+    applyPendingRuntimeEnvironment(delegate);
   }
 
-  bool assignProviderElasticAddress(Machine *machine,
-                                    ExternalAddressFamily family,
-                                    ElasticPrefixIntent intent,
-                                    const String& requestedAddress,
-                                    const String& providerPool,
-                                    IPPrefix& assignedPrefix,
-                                    IPPrefix& deliveryPrefix,
-                                    String& allocationID,
-                                    String& associationID,
-                                    bool& releaseOnRemove,
-                                    String& error) override
+  void prepareProviderElasticAddress(CoroutineStack *coro,
+                                     const ProviderElasticAddressRequest& request,
+                                     uint128_t transactionNonce,
+                                     ProviderElasticAddressPlan& plan,
+                                     String& error) override
   {
-    return activeDelegate()->assignProviderElasticAddress(machine,
-                                                          family,
-                                                          intent,
-                                                          requestedAddress,
-                                                          providerPool,
-                                                          assignedPrefix,
-                                                          deliveryPrefix,
-                                                          allocationID,
-                                                          associationID,
-                                                          releaseOnRemove,
-                                                          error);
+    if (coro == nullptr)
+    {
+      plan = {};
+      error.assign("provider elastic address prepare coroutine required"_ctv);
+      co_return;
+    }
+
+    BrainIaaS *delegate = activeDelegate();
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          delegate->prepareProviderElasticAddress(coro, request, transactionNonce, plan, error);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+
+    applyPendingRuntimeEnvironment(delegate);
   }
 
-  bool releaseProviderElasticAddress(const DistributableExternalSubnet& prefix, String& error) override
+  void applyProviderElasticAddress(CoroutineStack *coro,
+                                   const ProviderElasticAddressPlan& plan,
+                                   ProviderElasticAddressAssignment& assignment,
+                                   String& error) override
   {
-    return activeDelegate()->releaseProviderElasticAddress(prefix, error);
+    if (coro == nullptr)
+    {
+      assignment = {};
+      error.assign("provider elastic address apply coroutine required"_ctv);
+      co_return;
+    }
+
+    BrainIaaS *delegate = activeDelegate();
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          delegate->applyProviderElasticAddress(coro, plan, assignment, error);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+
+    applyPendingRuntimeEnvironment(delegate);
+  }
+
+  void compensateProviderElasticAddress(CoroutineStack *coro,
+                                        const ProviderElasticAddressPlan& plan,
+                                        String& error) override
+  {
+    if (coro == nullptr)
+    {
+      error.assign("provider elastic address compensation coroutine required"_ctv);
+      co_return;
+    }
+
+    BrainIaaS *delegate = activeDelegate();
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          delegate->compensateProviderElasticAddress(coro, plan, error);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+
+    applyPendingRuntimeEnvironment(delegate);
+  }
+
+  void releaseProviderElasticAddress(CoroutineStack *coro,
+                                     const ProviderElasticAddressRelease& release,
+                                     String& error) override
+  {
+    if (coro == nullptr)
+    {
+      error.assign("provider elastic address release coroutine required"_ctv);
+      co_return;
+    }
+
+    BrainIaaS *delegate = activeDelegate();
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          delegate->releaseProviderElasticAddress(coro, release, error);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+
+    applyPendingRuntimeEnvironment(delegate);
   }
 
   uint32_t supportedMachineKindsMask() const override
@@ -369,16 +614,20 @@ private:
 
 public:
 
-  RuntimeAwareNeuronIaaS(ProdigyPersistentStateStore *store, const ProdigyBootstrapConfig& bootstrap, const ProdigyPersistentBootState& bootState)
+  RuntimeAwareNeuronIaaS(ProdigyPersistentStateStore *store,
+                         const ProdigyBootstrapConfig& bootstrap,
+                         const ProdigyPersistentBootState& bootState,
+                         ProdigyProviderServices requestedProviderServices)
       : bootstrapConfig(bootstrap),
         stateStore(store),
         bootstrapDelegate(bootstrap)
   {
+    providerServices = requestedProviderServices;
     persistentBootState = bootState;
     prodigyOwnRuntimeEnvironmentConfig(bootState.runtimeEnvironment, runtimeEnvironment);
     prodigyStripManagedCloudBootstrapCredentials(runtimeEnvironment);
     prodigyApplyInternalRuntimeEnvironmentDefaults(runtimeEnvironment);
-    providerDelegate = prodigyCreateProviderNeuronIaaS(runtimeEnvironment);
+    providerDelegate = prodigyCreateProviderNeuronIaaS(runtimeEnvironment, providerServices);
     if (providerDelegate)
     {
       providerDelegate->configureRuntimeEnvironment(runtimeEnvironment);
@@ -398,7 +647,7 @@ public:
     prodigyOwnRuntimeEnvironmentConfig(config, runtimeEnvironment);
     prodigyStripManagedCloudBootstrapCredentials(runtimeEnvironment);
     prodigyApplyInternalRuntimeEnvironmentDefaults(runtimeEnvironment);
-    providerDelegate = prodigyCreateProviderNeuronIaaS(runtimeEnvironment);
+    providerDelegate = prodigyCreateProviderNeuronIaaS(runtimeEnvironment, providerServices);
     if (providerDelegate)
     {
       providerDelegate->configureRuntimeEnvironment(runtimeEnvironment);
@@ -406,9 +655,14 @@ public:
     persistBootState();
   }
 
-  void gatherSelfData(uint128_t& uuid, String& metro, bool& isBrain, EthDevice& eth, IPAddress& private4) override
+  void gatherSelfData(CoroutineStack *coro, uint128_t& uuid, String& metro, bool& isBrain, EthDevice& eth, IPAddress& private4) override
   {
-    activeDelegate()->gatherSelfData(uuid, metro, isBrain, eth, private4);
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          activeDelegate()->gatherSelfData(coro, uuid, metro, isBrain, eth, private4);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
     if (uint128_t persistentUUID = resolvePersistentLocalNodeUUID(); persistentUUID != 0)
     {
       uuid = persistentUUID;
@@ -431,8 +685,4 @@ public:
     activeDelegate()->setLocalContainerPrefixes(prefixes);
   }
 
-  void downloadContainerToPath(CoroutineStack *coro, uint64_t deploymentID, const String& path) override
-  {
-    activeDelegate()->downloadContainerToPath(coro, deploymentID, path);
-  }
 };

@@ -32,13 +32,18 @@
 // listen for SIGUSR1 for hardware failures
 // read the /run/hardwarefailure.txt file to get the error, send it through the provider support/escalation path, then poweroff machine,
 
-template <typename NeuronType, typename BrainType>
+template <typename NeuronType, typename BrainType, typename HostControlNetworkType>
 class Prodigy : public RingMultiplexer {
 private:
 
   TimeoutPacket shutdownTimer;
+  TimeoutPacket startupTimer;
 
+  std::unique_ptr<HostControlNetworkType> hostControlNetwork;
+  std::unique_ptr<CoroutineStack> startupCoroutine;
   NeuronType *neuron = nullptr;
+  int64_t dnsControlSessionDeadlineNs = 0;
+  constexpr static int64_t dnsControlSessionTimeoutNs = 30'000'000'000LL;
   // the only way master brain is relinquished, is either by choice when we 1) update the operating system or 2) update this program, or by force when 3) the machine fails
 
   static void exitTraceHandler(int status, void *)
@@ -62,32 +67,99 @@ private:
 
   void afterRing(void)
   {
-    neuron = new NeuronType();
-    thisNeuron = neuron;
+    // Enter the Ring dispatch loop before boot so migrated provider work can suspend safely.
+    startupTimer.setTimeoutUs(1);
+    startupTimer.dispatcher = nullptr;
+    startupTimer.originator = this;
+    Ring::queueTimeout(&startupTimer);
+  }
 
-    neuron->boot(); // all networking (if any) is sync for now, so we'd block
+  void finishRuntimeStartup(void)
+  {
     std::fprintf(stderr, "prodigy afterRing neuronIsBrain=%d private4=%u\n", int(neuron->isBrain), ntohl(neuron->private4.v4));
 
     if (neuron->isBrain)
     {
-      BrainType *brain = new BrainType();
+      BrainType *brain = new BrainType(*hostControlNetwork);
       thisBrain = brain;
 
       brain->getBrains();
     }
   }
 
+  void bootRuntime(void)
+  {
+    if (uint32_t suspendIndex = startupCoroutine->nextSuspendIndex(); startupCoroutine->didSuspend([&](void) -> void {
+          neuron->boot(startupCoroutine.get());
+        }))
+    {
+      co_await startupCoroutine->suspendAtIndex(suspendIndex);
+    }
+    finishRuntimeStartup();
+  }
+
+  void startRuntime(void)
+  {
+    if (hostControlNetwork == nullptr)
+    {
+      hostControlNetwork = std::make_unique<HostControlNetworkType>();
+    }
+    if (hostControlNetwork->ready() == false)
+    {
+      std::fprintf(stderr,
+                   "prodigy DNS control-service configuration failed: %s\n",
+                   hostControlNetwork->failure().size() > 0
+                       ? hostControlNetwork->failure().c_str()
+                       : "invalid DNS control bootstrap state");
+      std::abort();
+    }
+    if (hostControlNetwork->sessionReady() == false)
+    {
+      const int64_t nowNs = AegisStream::monotonicNowNs();
+      if (dnsControlSessionDeadlineNs == 0)
+      {
+        dnsControlSessionDeadlineNs = nowNs + dnsControlSessionTimeoutNs;
+      }
+      if (nowNs >= dnsControlSessionDeadlineNs)
+      {
+        std::fprintf(stderr,
+                     "prodigy DNS control service unavailable at the configured literal IPv6 endpoint\n");
+        std::abort();
+      }
+      startupTimer.clear();
+      startupTimer.setTimeoutMs(100);
+      startupTimer.dispatcher = nullptr;
+      startupTimer.originator = this;
+      Ring::queueTimeout(&startupTimer);
+      return;
+    }
+    dnsControlSessionDeadlineNs = 0;
+
+    neuron = new NeuronType(*hostControlNetwork);
+    thisNeuron = neuron;
+    startupCoroutine = std::make_unique<CoroutineStack>();
+    bootRuntime();
+  }
+
   void queueShutdown(void)
   {
     shutdownTimer.setTimeoutMs(1000);
-    shutdownTimer.dispatcher = this;
-    shutdownTimer.originator = this; // route back to this Prodigy instance
+    shutdownTimer.dispatcher = nullptr;
+    shutdownTimer.originator = this; // route back to this Prodigy instance through RingDispatcher
     Ring::queueTimeout(&shutdownTimer);
   }
 
   void timeoutHandler(TimeoutPacket *packet, int result)
   {
-    beginShutdown();
+    (void)result;
+    if (packet == &startupTimer)
+    {
+      startRuntime();
+    }
+    else if (packet == &shutdownTimer)
+    {
+      beginShutdown();
+    }
   }
 
   bool signalHandler(const struct signalfd_siginfo& sigInfo)
@@ -102,6 +174,10 @@ private:
         }
       case SIGUSR1:
         {
+          if (neuron == nullptr)
+          {
+            return true;
+          }
           neuron->hardwareFailureOccured();
           return false;
         }

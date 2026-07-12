@@ -1,6 +1,7 @@
 #pragma once
 
 #include <arpa/inet.h>
+#include <linux/capability.h>
 
 #include <cmath>
 #include <limits>
@@ -8,6 +9,85 @@
 #include <simdjson.h>
 
 #include <prodigy/types.h>
+#include <switchboard/common/constants.h>
+
+static constexpr uint32_t mothershipMaximumWhiteholes = MAX_WHITEHOLE_BINDINGS;
+
+static inline bool mothershipParseWhiteholeCount(
+    const simdjson::dom::element& value,
+    uint32_t& count,
+    String *failure = nullptr)
+{
+  if (failure)
+  {
+    failure->clear();
+  }
+  const simdjson::dom::element_type type = value.type();
+  if (type != simdjson::dom::element_type::UINT64 &&
+      type != simdjson::dom::element_type::INT64)
+  {
+    if (failure)
+    {
+      failure->assign("whiteholes.count requires a positive integer"_ctv);
+    }
+    return false;
+  }
+
+  uint64_t parsed = 0;
+  if (type == simdjson::dom::element_type::UINT64)
+  {
+    (void)value.get(parsed);
+  }
+  else
+  {
+    int64_t signedValue = 0;
+    if (value.get(signedValue) == simdjson::SUCCESS && signedValue > 0)
+    {
+      parsed = uint64_t(signedValue);
+    }
+  }
+  if (parsed == 0 || parsed > mothershipMaximumWhiteholes)
+  {
+    if (failure)
+    {
+      failure->snprintf<"whiteholes.count must be between 1 and {}"_ctv>(mothershipMaximumWhiteholes);
+    }
+    return false;
+  }
+
+  count = uint32_t(parsed);
+  return true;
+}
+
+static inline bool mothershipAppendWhiteholeDeclaration(
+    Vector<Whitehole>& whiteholes,
+    const Whitehole& declaration,
+    uint32_t count,
+    String *failure = nullptr)
+{
+  if (failure)
+  {
+    failure->clear();
+  }
+
+  uint64_t existing = whiteholes.size();
+  if (count == 0 || count > mothershipMaximumWhiteholes ||
+      existing > mothershipMaximumWhiteholes || count > mothershipMaximumWhiteholes - existing)
+  {
+    if (failure)
+    {
+      failure->snprintf<"whiteholes expands beyond the {} binding map capacity"_ctv>(mothershipMaximumWhiteholes);
+    }
+    return false;
+  }
+
+  whiteholes.reserve(existing + count);
+  for (uint32_t index = 0; index < count; ++index)
+  {
+    whiteholes.push_back(declaration);
+  }
+  return true;
+}
 
 static inline bool mothershipParseDeploymentPlanUseHostNetworkNamespace(
     const simdjson::dom::element& value,
@@ -33,6 +113,113 @@ static inline bool mothershipParseDeploymentPlanUseHostNetworkNamespace(
   (void)value.get(useHostNetworkNamespace);
   plan.useHostNetworkNamespace = useHostNetworkNamespace;
   return true;
+}
+
+static inline bool mothershipParseDeploymentPlanNetworkAccess(
+    const simdjson::dom::element& value,
+    DeploymentPlan& plan,
+    String *failure = nullptr)
+{
+  if (failure)
+  {
+    failure->clear();
+  }
+
+  if (value.type() != simdjson::dom::element_type::STRING)
+  {
+    if (failure)
+    {
+      failure->assign("networkAccess requires unrestricted or declaredOnly"_ctv);
+    }
+    return false;
+  }
+
+  auto raw = value.get_string();
+  if (raw.error())
+  {
+    return false;
+  }
+  String access;
+  access.assign(raw.value().data(), raw.value().size());
+  if (access.equal("unrestricted"_ctv))
+  {
+    plan.networkAccess = ContainerNetworkAccess::unrestricted;
+    return true;
+  }
+  if (access.equal("declaredOnly"_ctv))
+  {
+    plan.networkAccess = ContainerNetworkAccess::declaredOnly;
+    return true;
+  }
+  if (failure)
+  {
+    failure->assign("networkAccess requires unrestricted or declaredOnly"_ctv);
+  }
+  return false;
+}
+
+static inline bool mothershipValidateDeploymentPlanNetworkAccess(
+    const DeploymentPlan& plan,
+    String *failure = nullptr)
+{
+  if (failure)
+  {
+    failure->clear();
+  }
+  if (plan.networkAccess == ContainerNetworkAccess::unrestricted)
+  {
+    return true;
+  }
+  if (plan.networkAccess != ContainerNetworkAccess::declaredOnly)
+  {
+    if (failure)
+    {
+      failure->assign("networkAccess is invalid"_ctv);
+    }
+    return false;
+  }
+
+  const char *reason = nullptr;
+  if (plan.whiteholes.size() > mothershipMaximumWhiteholes)
+  {
+    reason = "declaredOnly networkAccess exceeds the whitehole binding map capacity";
+  }
+  else
+  {
+    for (const Whitehole& whitehole : plan.whiteholes)
+    {
+      if (whiteholeDeclarationValid(whitehole) == false)
+      {
+        reason = "declaredOnly networkAccess requires valid whitehole declarations";
+        break;
+      }
+    }
+  }
+  if (reason == nullptr && plan.useHostNetworkNamespace)
+  {
+    reason = "declaredOnly networkAccess forbids useHostNetworkNamespace";
+  }
+  else if (reason == nullptr && plan.wormholes.empty() == false)
+  {
+    reason = "declaredOnly networkAccess forbids wormholes";
+  }
+  else if (reason == nullptr && (plan.config.capabilities.contains(CAP_NET_RAW) ||
+           plan.config.capabilities.contains(CAP_NET_ADMIN) ||
+           plan.config.capabilities.contains(CAP_SYS_ADMIN) ||
+           plan.config.capabilities.contains(CAP_BPF)))
+  {
+    reason = "declaredOnly networkAccess forbids CAP_NET_RAW, CAP_NET_ADMIN, CAP_SYS_ADMIN, and CAP_BPF";
+  }
+
+  if (reason == nullptr)
+  {
+    return true;
+  }
+  if (failure)
+  {
+    failure->assign(reason);
+  }
+  return false;
 }
 
 static inline bool mothershipParseIPAddressLiteral(const char *text, IPAddress& address)
@@ -423,6 +610,19 @@ static inline bool mothershipValidateApplicationRuntimeRequirements(
       failure->snprintf<"{}.architecture is required and must be x86_64 or aarch64"_ctv>(contextPrefix);
     }
 
+    return false;
+  }
+
+  if (config.isolatedChildMemoryMB != 0 &&
+      (config.maxPids < 2 ||
+       config.maxPids - 1 > prodigyContainerRuntimeLimits.maxIsolatedChildCgroups))
+  {
+    if (failure)
+    {
+      failure->snprintf<"{}.isolatedChildMemoryMB requires maxPids between 2 and {}"_ctv>(
+          contextPrefix,
+          prodigyContainerRuntimeLimits.maxIsolatedChildCgroups + 1);
+    }
     return false;
   }
 
@@ -828,6 +1028,59 @@ static inline bool mothershipParseApplicationCPURequest(
 
   config.sharedCPUMillis = uint32_t(requestedMillis);
   config.nLogicalCores = prodigyRoundUpDivideU64(requestedMillis, prodigyCPUUnitsPerCore);
+  return true;
+}
+
+static inline bool mothershipParseApplicationMaxPids(
+    const simdjson::dom::element& value,
+    ApplicationConfig& config,
+    const String& context,
+    String *failure = nullptr)
+{
+  uint32_t parsed = 0;
+  if (mothershipParseJSONUInt32(value, parsed, false) == false ||
+      parsed > prodigyContainerRuntimeLimits.maxPids)
+  {
+    if (failure)
+    {
+      failure->snprintf<"{}.maxPids must be between 1 and {}"_ctv>(
+          context,
+          prodigyContainerRuntimeLimits.maxPids);
+    }
+    return false;
+  }
+
+  config.maxPids = parsed;
+  if (failure)
+  {
+    failure->clear();
+  }
+  return true;
+}
+
+static inline bool mothershipParseApplicationIsolatedChildMemoryMB(
+    const simdjson::dom::element& value,
+    ApplicationConfig& config,
+    const String& context,
+    String *failure = nullptr)
+{
+  uint32_t parsed = 0;
+  if (mothershipParseJSONUInt32(value, parsed, true) == false ||
+      parsed > prodigyContainerRuntimeLimits.maxIsolatedChildMemoryMB)
+  {
+    if (failure)
+    {
+      failure->snprintf<"{}.isolatedChildMemoryMB must be 0 or between 1 and {} with maxPids >= 2"_ctv>(
+          context,
+          prodigyContainerRuntimeLimits.maxIsolatedChildMemoryMB);
+    }
+    return false;
+  }
+  config.isolatedChildMemoryMB = parsed;
+  if (failure)
+  {
+    failure->clear();
+  }
   return true;
 }
 

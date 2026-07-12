@@ -255,7 +255,13 @@ mkdir -p {cargo_home} {rustup_home}\n\
 export CARGO_HOME={cargo_home}\n\
 export RUSTUP_HOME={rustup_home}\n\
 if [ ! -x {cargo_bin} ]; then\n\
-   curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable\n\
+   rustup_script=$(mktemp)\n\
+   trap 'rm -f \"$rustup_script\"' EXIT\n\
+   curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --max-redirs 3 --connect-timeout 10 --max-time 120 --max-filesize 2097152 --output \"$rustup_script\" https://sh.rustup.rs\n\
+   test \"$(wc -c < \"$rustup_script\")\" -le 2097152\n\
+   sh \"$rustup_script\" -s -- -y --profile minimal --default-toolchain stable\n\
+   rm -f \"$rustup_script\"\n\
+   trap - EXIT\n\
 fi\n\
 {cargo_bin} --version\n",
       cargo_home = shell_quote(cargo_home),

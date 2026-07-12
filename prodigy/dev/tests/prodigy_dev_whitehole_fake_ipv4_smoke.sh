@@ -281,22 +281,21 @@ then
    exit 1
 fi
 
-hosts_context="${tmpdir}/whitehole-hosts"
+target_context="${tmpdir}/whitehole-target"
 artifact_project_dir="${tmpdir}/whitehole-fake-artifact"
 discombobulator_file="${artifact_project_dir}/WhiteholeProbe.DiscombobuFile"
 container_blob="${tmpdir}/whitehole.container.zst"
-mkdir -p "${hosts_context}" "${artifact_project_dir}"
-cat > "${hosts_context}/hosts" <<EOF
-127.0.0.1 localhost
-${parent_edge_ip} whitehole-target.test
+mkdir -p "${target_context}" "${artifact_project_dir}"
+cat > "${target_context}/target-ip" <<EOF
+${parent_edge_ip}
 EOF
 
 cat > "${discombobulator_file}" <<EOF
 FROM scratch for ${target_arch}
 COPY {bin} ./$(basename "${WHITEHOLE_BIN}") /root/whitehole_probe_container
-COPY {hosts} ./hosts /etc/hosts
+COPY {target} ./target-ip /whitehole-target-ip
 SURVIVE /root/whitehole_probe_container
-SURVIVE /etc/hosts
+SURVIVE /whitehole-target-ip
 EOF
 prodigy_dev_write_common_prodigy_assets "${discombobulator_file}"
 cat >> "${discombobulator_file}" <<'EOF'
@@ -308,7 +307,7 @@ if ! prodigy_dev_run_discombobulator_build \
    "${discombobulator_file}" \
    "${container_blob}" \
    "bin=$(dirname "${WHITEHOLE_BIN}")" \
-   "hosts=${hosts_context}" \
+   "target=${target_context}" \
    "ebpf=$(dirname "${PRODIGY_BIN}")"
 then
    archive_workspace=1

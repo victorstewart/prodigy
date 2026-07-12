@@ -2119,6 +2119,28 @@ public:
   }
 };
 
+class ProdigyPersistentDnsControlPairingSecret {
+public:
+
+  uint128_t leaseID = 0;
+  uint64_t generation = 0;
+  uint128_t secret = 0;
+
+  void clear(void)
+  {
+    prodigyClearPersistentSecretBytes(
+        reinterpret_cast<uint8_t *>(&secret), sizeof(secret));
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyPersistentDnsControlPairingSecret& secret)
+{
+  serializer.value16b(secret.leaseID);
+  serializer.value8b(secret.generation);
+  serializer.value16b(secret.secret);
+}
+
 template <typename S>
 static void serialize(S&& serializer, ProdigyPersistentPendingAddMachinesOperationSecrets& secrets)
 {
@@ -2132,7 +2154,6 @@ public:
 
   String bootstrapSshPrivateKeyOpenSSH;
   String bootstrapSshHostPrivateKeyOpenSSH;
-  String reporterPassword;
   String dnsCredentialMaterial;
   bytell_hash_map<uint16_t, ProdigyPersistentApplicationTlsVaultFactorySecrets> tlsVaultFactorySecretsByApp;
   bytell_hash_map<uint16_t, ProdigyPersistentApplicationApiCredentialSetSecrets> apiCredentialSecretsByApp;
@@ -2141,17 +2162,17 @@ public:
   String transportTLSAuthorityClusterRootKeyPem;
   String mothershipTunnelGatewayServerKeyPem;
   Vector<ProdigyPersistentPendingAddMachinesOperationSecrets> pendingAddMachinesOperationSecrets;
+  Vector<ProdigyPersistentDnsControlPairingSecret> dnsControlPairingSecrets;
 
   bool empty(void) const
   {
-    return bootstrapSshPrivateKeyOpenSSH.size() == 0 && bootstrapSshHostPrivateKeyOpenSSH.size() == 0 && reporterPassword.size() == 0 && dnsCredentialMaterial.size() == 0 && tlsVaultFactorySecretsByApp.empty() && apiCredentialSecretsByApp.empty() && tlsResumptionEpochSecrets.empty() && publicTlsCertificateSecrets.empty() && transportTLSAuthorityClusterRootKeyPem.size() == 0 && mothershipTunnelGatewayServerKeyPem.size() == 0 && pendingAddMachinesOperationSecrets.empty();
+    return bootstrapSshPrivateKeyOpenSSH.size() == 0 && bootstrapSshHostPrivateKeyOpenSSH.size() == 0 && dnsCredentialMaterial.size() == 0 && tlsVaultFactorySecretsByApp.empty() && apiCredentialSecretsByApp.empty() && tlsResumptionEpochSecrets.empty() && publicTlsCertificateSecrets.empty() && transportTLSAuthorityClusterRootKeyPem.size() == 0 && mothershipTunnelGatewayServerKeyPem.size() == 0 && pendingAddMachinesOperationSecrets.empty() && dnsControlPairingSecrets.empty();
   }
 
   void clear(void)
   {
     prodigyClearPersistentSecretString(bootstrapSshPrivateKeyOpenSSH);
     prodigyClearPersistentSecretString(bootstrapSshHostPrivateKeyOpenSSH);
-    prodigyClearPersistentSecretString(reporterPassword);
     prodigyClearPersistentSecretString(dnsCredentialMaterial);
     prodigyClearPersistentSecretString(transportTLSAuthorityClusterRootKeyPem);
     prodigyClearPersistentSecretString(mothershipTunnelGatewayServerKeyPem);
@@ -2182,12 +2203,17 @@ public:
     {
       operationSecrets.clear();
     }
+    for (auto& pairingSecret : dnsControlPairingSecrets)
+    {
+      pairingSecret.clear();
+    }
 
     tlsVaultFactorySecretsByApp.clear();
     apiCredentialSecretsByApp.clear();
     tlsResumptionEpochSecrets.clear();
     publicTlsCertificateSecrets.clear();
     pendingAddMachinesOperationSecrets.clear();
+    dnsControlPairingSecrets.clear();
   }
 };
 
@@ -2196,7 +2222,6 @@ static void serialize(S&& serializer, ProdigyPersistentBrainSnapshotSecrets& sec
 {
   serializer.text1b(secrets.bootstrapSshPrivateKeyOpenSSH, UINT32_MAX);
   serializer.text1b(secrets.bootstrapSshHostPrivateKeyOpenSSH, UINT32_MAX);
-  serializer.text1b(secrets.reporterPassword, UINT32_MAX);
   serializer.text1b(secrets.dnsCredentialMaterial, UINT32_MAX);
   serializer.object(secrets.tlsVaultFactorySecretsByApp);
   serializer.object(secrets.apiCredentialSecretsByApp);
@@ -2205,6 +2230,7 @@ static void serialize(S&& serializer, ProdigyPersistentBrainSnapshotSecrets& sec
   serializer.text1b(secrets.transportTLSAuthorityClusterRootKeyPem, UINT32_MAX);
   serializer.text1b(secrets.mothershipTunnelGatewayServerKeyPem, UINT32_MAX);
   serializer.object(secrets.pendingAddMachinesOperationSecrets);
+  serializer.object(secrets.dnsControlPairingSecrets);
 }
 
 class ProdigyPersistentLocalBrainStateSecrets {
@@ -2264,11 +2290,9 @@ static inline void prodigyExtractPersistentBrainSnapshotSecrets(
 
   secrets.bootstrapSshPrivateKeyOpenSSH = publicSnapshot.brainConfig.bootstrapSshKeyPackage.privateKeyOpenSSH;
   secrets.bootstrapSshHostPrivateKeyOpenSSH = publicSnapshot.brainConfig.bootstrapSshHostKeyPackage.privateKeyOpenSSH;
-  secrets.reporterPassword = publicSnapshot.brainConfig.reporter.password;
   secrets.dnsCredentialMaterial = publicSnapshot.brainConfig.dnsCredential.material;
   prodigyClearPersistentSSHPrivateKey(publicSnapshot.brainConfig.bootstrapSshKeyPackage);
   prodigyClearPersistentSSHPrivateKey(publicSnapshot.brainConfig.bootstrapSshHostKeyPackage);
-  prodigyClearPersistentSecretString(publicSnapshot.brainConfig.reporter.password);
   prodigyClearPersistentSecretString(publicSnapshot.brainConfig.dnsCredential.material);
 
   for (auto& [applicationID, factory] : publicSnapshot.masterAuthority.tlsVaultFactoriesByApp)
@@ -2364,6 +2388,20 @@ static inline void prodigyExtractPersistentBrainSnapshotSecrets(
     prodigyClearPersistentSSHPrivateKey(operation.request.bootstrapSshKeyPackage);
     prodigyClearPersistentSSHPrivateKey(operation.request.bootstrapSshHostKeyPackage);
   }
+
+  for (auto& lease : publicSnapshot.masterAuthority.runtimeState.dnsControlPairingLeases)
+  {
+    if (lease.secret != 0)
+    {
+      ProdigyPersistentDnsControlPairingSecret pairingSecret = {};
+      pairingSecret.leaseID = lease.leaseID;
+      pairingSecret.generation = lease.generation;
+      pairingSecret.secret = lease.secret;
+      secrets.dnsControlPairingSecrets.push_back(pairingSecret);
+    }
+    prodigyClearPersistentSecretBytes(
+        reinterpret_cast<uint8_t *>(&lease.secret), sizeof(lease.secret));
+  }
 }
 
 static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
@@ -2378,7 +2416,6 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
 
   snapshot.brainConfig.bootstrapSshKeyPackage.privateKeyOpenSSH = secrets.bootstrapSshPrivateKeyOpenSSH;
   snapshot.brainConfig.bootstrapSshHostKeyPackage.privateKeyOpenSSH = secrets.bootstrapSshHostPrivateKeyOpenSSH;
-  snapshot.brainConfig.reporter.password = secrets.reporterPassword;
   snapshot.brainConfig.dnsCredential.material = secrets.dnsCredentialMaterial;
 
   for (const auto& [applicationID, factorySecrets] : secrets.tlsVaultFactorySecretsByApp)
@@ -2515,6 +2552,29 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
       {
         failure->snprintf<"persistent brain snapshot add-machines secrets missing operation {itoa}"_ctv>(
             operationSecrets.operationID);
+      }
+      return false;
+    }
+  }
+
+  for (const auto& pairingSecret : secrets.dnsControlPairingSecrets)
+  {
+    bool matched = false;
+    for (auto& lease : snapshot.masterAuthority.runtimeState.dnsControlPairingLeases)
+    {
+      if (lease.leaseID == pairingSecret.leaseID &&
+          lease.generation == pairingSecret.generation)
+      {
+        lease.secret = pairingSecret.secret;
+        matched = true;
+        break;
+      }
+    }
+    if (matched == false)
+    {
+      if (failure)
+      {
+        failure->assign("persistent brain snapshot DNS control pairing secret is orphaned"_ctv);
       }
       return false;
     }
@@ -3253,3 +3313,37 @@ public:
     return db.remove(brainColumnFamily, brainSnapshotKey, failure);
   }
 };
+
+enum class ProdigyBrainSnapshotCommitResult : uint8_t
+{
+  snapshotFailed,
+  snapshotCommittedBootStateFailed,
+  snapshotAndBootStateCommitted
+};
+
+static inline ProdigyBrainSnapshotCommitResult prodigyCommitBrainSnapshot(
+    ProdigyPersistentStateStore& store,
+    ProdigyPersistentBrainSnapshot snapshot,
+    ProdigyPersistentBootState bootState,
+    ProdigyPersistentBrainSnapshot& cachedSnapshot,
+    ProdigyPersistentBootState& cachedBootState,
+    bool& haveCachedSnapshot,
+    String& failure)
+{
+  failure.clear();
+  if (store.saveBrainSnapshot(snapshot, &failure) == false)
+  {
+    return ProdigyBrainSnapshotCommitResult::snapshotFailed;
+  }
+
+  prodigyReplaceCachedBrainSnapshot(cachedSnapshot, std::move(snapshot));
+  haveCachedSnapshot = true;
+
+  if (store.saveBootState(bootState, &failure) == false)
+  {
+    return ProdigyBrainSnapshotCommitResult::snapshotCommittedBootStateFailed;
+  }
+
+  cachedBootState = std::move(bootState);
+  return ProdigyBrainSnapshotCommitResult::snapshotAndBootStateCommitted;
+}

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <switchboard/common/local_container_subnet.h>
+
 __attribute__((__always_inline__)) static inline void bpf_memset(void *dest, __u32 val, __u32 len)
 {
   __u8 *ptr = dest;
@@ -105,15 +107,25 @@ __attribute__((__always_inline__)) static inline bool containerRequiresPublic6(v
   return (policy->requiresPublic6 != 0);
 }
 
-__attribute__((__always_inline__)) static inline bool containerEgressAllowlistOnly(void)
+__attribute__((__always_inline__)) static inline __u8 containerNetworkMode(void)
 {
   __u32 zeroidx = 0;
   struct container_network_policy *policy = bpf_map_lookup_elem(&ct_net_policy, &zeroidx);
   if (!policy)
   {
-    return false;
+    return CONTAINER_NETWORK_DENY;
   }
-  return (policy->egressAllowlistOnly != 0);
+  return policy->mode;
+}
+
+__attribute__((__always_inline__)) static inline bool containerNetworkAddressMatches(const __u8 address[16])
+{
+  __u32 zeroidx = 0;
+  struct container_network_policy *policy = bpf_map_lookup_elem(&ct_net_policy, &zeroidx);
+  struct local_container_subnet6 *subnet = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
+  return policy != NULL && subnet != NULL && policy->containerFragment != 0 &&
+         switchboardContainerIPv6TargetsLocalMachine(address, subnet) &&
+         address[15] == policy->containerFragment;
 }
 
 __attribute__((__always_inline__)) static inline bool containerEgressAllow4(__be32 daddr, __u8 proto, __be16 port)

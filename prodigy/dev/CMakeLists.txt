@@ -146,6 +146,7 @@ set(PRODIGY_DEPOFILES
    "${PRODIGY_DEPOFILES_DIR}/SG14.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/aegis.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/bitsery.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/cares.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/cppsort.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/gxhash.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/itoa.DepoFile"
@@ -419,6 +420,25 @@ set(DISCOMBOBULATOR_CARGO_LOCK "${PRODIGY_ROOT}/prodigy/discombobulator/Cargo.lo
 set(DISCOMBOBULATOR_CARGO_TARGET_DIR "${CMAKE_BINARY_DIR}/discombobulator-target")
 file(GLOB DISCOMBOBULATOR_SOURCE_FILES CONFIGURE_DEPENDS
    "${PRODIGY_ROOT}/prodigy/discombobulator/src/*.rs")
+set(PRODIGY_DNS_RESOLVER_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-dns-resolver.DiscombobuFile")
+set(PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-dns-resolver.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
+set(PRODIGY_DNS_RESOLVER_DEPLOYMENT_PLAN "${CMAKE_BINARY_DIR}/prodigy-dns-resolver.deployment.plan.v1.json")
+set(PRODIGY_DNS_RESOLVER_CONTROL_PLAN_TEMPLATE "${CMAKE_BINARY_DIR}/prodigy-dns-resolver.control.deployment.plan.v1.template.json")
+configure_file(
+   "${PRODIGY_ROOT}/prodigy/dns/DiscombobuFile.in"
+   "${PRODIGY_DNS_RESOLVER_DISCOMBOBUFILE}"
+   @ONLY
+)
+configure_file(
+   "${PRODIGY_ROOT}/prodigy/dns/prodigy-dns-resolver.deployment.plan.v1.json.in"
+   "${PRODIGY_DNS_RESOLVER_DEPLOYMENT_PLAN}"
+   @ONLY
+)
+configure_file(
+   "${PRODIGY_ROOT}/prodigy/dns/prodigy-dns-resolver.control.deployment.plan.v1.json.in"
+   "${PRODIGY_DNS_RESOLVER_CONTROL_PLAN_TEMPLATE}"
+   COPYONLY
+)
 set(PRODIGY_ACME_HOOK_SCRIPTS
    "${PRODIGY_ROOT}/prodigy/acme/acme-present-dns-01"
    "${PRODIGY_ROOT}/prodigy/acme/acme-cleanup-dns-01"
@@ -427,7 +447,12 @@ set(PRODIGY_ACME_HOOK_SCRIPTS
 install(PROGRAMS ${PRODIGY_ACME_HOOK_SCRIPTS} DESTINATION lib/prodigy)
 
 set(PRODIGY_MOTHERSHIP_TUNNEL_GATEWAY_SOURCE "${PRODIGY_ROOT}/prodigy/mothership/mothership.tunnel.gateway.cpp")
-set(PRODIGY_IAAS_AWS_SOURCE "${PRODIGY_ROOT}/prodigy/iaas/aws/aws.cpp")
+set(PRODIGY_IAAS_AWS_HTTP_SOURCES
+   "${PRODIGY_ROOT}/prodigy/iaas/aws/aws.http.cpp"
+   "${PRODIGY_ROOT}/prodigy/iaas/aws/aws.transport.cpp")
+set(PRODIGY_IAAS_AWS_SOURCE
+   "${PRODIGY_ROOT}/prodigy/iaas/aws/aws.cpp"
+   ${PRODIGY_IAAS_AWS_HTTP_SOURCES})
 set(PRODIGY_IAAS_AZURE_SOURCE "${PRODIGY_ROOT}/prodigy/iaas/azure/azure.cpp")
 set(PRODIGY_IAAS_GCP_SOURCE "${PRODIGY_ROOT}/prodigy/iaas/gcp/gcp.cpp")
 set(PRODIGY_IAAS_VULTR_SOURCE "${PRODIGY_ROOT}/prodigy/iaas/vultr/vultr.cpp")
@@ -436,6 +461,8 @@ set(PRODIGY_IAAS_PRICING_PROVIDER_SOURCES ${PRODIGY_IAAS_AWS_SOURCE} ${PRODIGY_I
 
 add_executable(prodigy ${PRODIGY_ROOT}/prodigy/prodigy.cpp ${PRODIGY_MOTHERSHIP_TUNNEL_GATEWAY_SOURCE} ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES})
 add_executable(mothership ${PRODIGY_ROOT}/prodigy/mothership/mothership.cpp ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES})
+add_executable(prodigy_dns_resolver ${PRODIGY_ROOT}/prodigy/dns/resolver.cpp)
+set_target_properties(prodigy_dns_resolver PROPERTIES OUTPUT_NAME prodigy-dns-resolver)
 add_executable(prodigy_mothership_tunnel_provider ${CMAKE_CURRENT_SOURCE_DIR}/tests/mothership_tunnel_provider_fixture.cpp)
 set_target_properties(prodigy_mothership_tunnel_provider PROPERTIES OUTPUT_NAME mothership-tunnel-provider)
 add_executable(prodigy_ready_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/ready_container.cpp)
@@ -474,6 +501,7 @@ add_executable(prodigy_mesh_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mesh_
 add_executable(prodigy_deployments_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_deployments_unit.cpp ${PRODIGY_IAAS_AWS_SOURCE})
 add_executable(prodigy_brain_config_ssh_replication_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_config_ssh_replication_unit.cpp)
 add_executable(prodigy_brain_replication_credentials_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_replication_credentials_unit.cpp)
+add_executable(prodigy_brain_spot_async_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_spot_async_unit.cpp)
 add_executable(prodigy_pairing_parser_adversarial_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_pairing_parser_adversarial_unit.cpp)
 add_executable(prodigy_bootstrap_config_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_bootstrap_config_unit.cpp)
 add_executable(prodigy_persistent_state_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_persistent_state_unit.cpp)
@@ -495,13 +523,34 @@ add_executable(prodigy_brain_reachability_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests
 add_executable(prodigy_brain_master_uuid_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_master_uuid_unit.cpp)
 add_executable(prodigy_brain_ipv6_topology_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_ipv6_topology_unit.cpp)
 add_executable(prodigy_private4_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_private4_unit.cpp)
+add_executable(prodigy_aws_http_unit
+   ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_aws_http_unit.cpp
+   ${PRODIGY_IAAS_AWS_SOURCE})
+add_executable(prodigy_host_async_task_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_host_async_task_unit.cpp)
+add_executable(prodigy_azure_http_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_azure_http_unit.cpp)
+add_executable(prodigy_vultr_http_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_vultr_http_unit.cpp)
 add_executable(prodigy_gcp_provider_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_gcp_provider_unit.cpp ${PRODIGY_IAAS_GCP_SOURCE})
+add_executable(prodigy_gcp_managed_template_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_gcp_managed_template_unit.cpp)
+add_executable(prodigy_gcp_provisioning_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_gcp_provisioning_unit.cpp)
+add_executable(prodigy_gcp_lifecycle_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_gcp_lifecycle_unit.cpp)
+add_executable(prodigy_gcp_labels_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_gcp_labels_unit.cpp)
+add_executable(prodigy_gcp_cluster_destroy_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_gcp_cluster_destroy_unit.cpp)
+add_executable(prodigy_gcp_elastic_address_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_gcp_elastic_address_unit.cpp)
+add_executable(prodigy_brain_machine_lifecycle_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_machine_lifecycle_unit.cpp)
+add_executable(prodigy_brain_elastic_address_operations_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_elastic_address_operations_unit.cpp)
+add_executable(prodigy_command_capture_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_command_capture_unit.cpp)
 add_executable(prodigy_mothership_pricing_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_pricing_unit.cpp ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES})
 add_executable(prodigy_provider_rack_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_provider_rack_unit.cpp ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES})
 add_executable(prodigy_provider_elastic_address_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_provider_elastic_address_unit.cpp ${PRODIGY_IAAS_PRICING_PROVIDER_SOURCES})
 add_executable(prodigy_machine_hardware_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_machine_hardware_unit.cpp)
 add_executable(prodigy_test_cluster_boot_json ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_test_cluster_boot_json.cpp)
 add_executable(prodigy_bundle_artifact_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_bundle_artifact_unit.cpp)
+add_executable(prodigy_dns_registry_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dns_registry_unit.cpp)
+add_executable(prodigy_dns_resolver_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dns_resolver_unit.cpp)
+add_executable(prodigy_dns_control_leases_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dns_control_leases_unit.cpp)
+add_executable(prodigy_host_http_operation_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_host_http_operation_unit.cpp)
+add_executable(prodigy_host_delay_operation_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_host_delay_operation_unit.cpp)
+add_executable(prodigy_mothership_host_runtime_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_host_runtime_unit.cpp)
 add_executable(prodigy_remote_bootstrap_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_remote_bootstrap_unit.cpp)
 add_executable(prodigy_remote_bootstrap_smoke ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_remote_bootstrap_smoke.cpp)
 add_executable(prodigy_mothership_cluster_registry_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cluster_registry_unit.cpp)
@@ -511,7 +560,7 @@ add_executable(prodigy_mothership_cluster_reconcile_unit ${CMAKE_CURRENT_SOURCE_
 add_executable(prodigy_mothership_cluster_remove_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cluster_remove_unit.cpp)
 add_executable(prodigy_mothership_cluster_create_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cluster_create_unit.cpp)
 add_executable(prodigy_mothership_addmachines_progress_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_addmachines_progress_unit.cpp)
-add_executable(prodigy_mothership_unix_connect_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_unix_connect_unit.cpp ${PRODIGY_MOTHERSHIP_TUNNEL_GATEWAY_SOURCE})
+add_executable(prodigy_mothership_unix_connect_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_unix_connect_unit.cpp ${PRODIGY_MOTHERSHIP_TUNNEL_GATEWAY_SOURCE} ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES})
 add_executable(prodigy_mothership_test_cluster_runner_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_test_cluster_runner_unit.cpp)
 add_executable(prodigy_mothership_provider_credential_registry_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_provider_credential_registry_unit.cpp)
 add_executable(prodigy_mothership_provider_machine_destroy_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_provider_machine_destroy_unit.cpp)
@@ -519,6 +568,7 @@ add_executable(prodigy_mothership_provider_machine_destroy_unit ${CMAKE_CURRENT_
 set(PRODIGY_ALL_BUILD_TARGETS
    prodigy
    mothership
+   prodigy_dns_resolver
    prodigy_ready_container
    ${PRODIGY_RUNTIME_CONTAINER_PROBE_TARGETS}
    prodigy_gpu_device_mount_smoke
@@ -530,6 +580,7 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_deployments_unit
    prodigy_brain_config_ssh_replication_unit
    prodigy_brain_replication_credentials_unit
+   prodigy_brain_spot_async_unit
    prodigy_pairing_parser_adversarial_unit
    prodigy_bootstrap_config_unit
    prodigy_persistent_state_unit
@@ -551,13 +602,31 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_brain_master_uuid_unit
    prodigy_brain_ipv6_topology_unit
    prodigy_private4_unit
+   prodigy_aws_http_unit
+   prodigy_azure_http_unit
+   prodigy_vultr_http_unit
    prodigy_gcp_provider_unit
+   prodigy_gcp_managed_template_unit
+   prodigy_gcp_provisioning_unit
+   prodigy_gcp_lifecycle_unit
+   prodigy_gcp_labels_unit
+   prodigy_gcp_cluster_destroy_unit
+   prodigy_gcp_elastic_address_unit
+   prodigy_brain_machine_lifecycle_unit
+   prodigy_brain_elastic_address_operations_unit
+   prodigy_command_capture_unit
    prodigy_mothership_pricing_unit
    prodigy_provider_rack_unit
    prodigy_provider_elastic_address_unit
    prodigy_machine_hardware_unit
    prodigy_test_cluster_boot_json
    prodigy_bundle_artifact_unit
+   prodigy_dns_registry_unit
+   prodigy_dns_resolver_unit
+   prodigy_dns_control_leases_unit
+   prodigy_host_http_operation_unit
+   prodigy_host_delay_operation_unit
+   prodigy_mothership_host_runtime_unit
    prodigy_remote_bootstrap_unit
    prodigy_remote_bootstrap_smoke
    prodigy_mothership_cluster_registry_unit
@@ -626,21 +695,31 @@ if (PRODIGY_ENABLE_FUZZ_TESTS)
    add_executable(prodigy_brain_topic_fuzz ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_topic_fuzz.cpp)
    add_executable(prodigy_neuron_topic_fuzz ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_neuron_topic_fuzz.cpp)
    add_executable(prodigy_container_topic_fuzz ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_container_topic_fuzz.cpp)
+   add_executable(prodigy_dns_wire_fuzz ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dns_wire_fuzz.cpp)
    list(APPEND PRODIGY_ALL_BUILD_TARGETS
       prodigy_pairing_parser_fuzz
       prodigy_mothership_topic_fuzz
       prodigy_brain_topic_fuzz
       prodigy_neuron_topic_fuzz
       prodigy_container_topic_fuzz
+      prodigy_dns_wire_fuzz
    )
 endif()
 
 foreach(prodigy_target IN LISTS PRODIGY_ALL_BUILD_TARGETS)
    target_include_directories(${prodigy_target} PRIVATE "${PRODIGY_ROOT}")
+endforeach()
+
+set(PRODIGY_COMMON_LINK_TARGETS ${PRODIGY_ALL_BUILD_TARGETS})
+list(REMOVE_ITEM PRODIGY_COMMON_LINK_TARGETS prodigy_dns_resolver prodigy_dns_resolver_unit)
+foreach(prodigy_target IN LISTS PRODIGY_COMMON_LINK_TARGETS)
    depos_link(${prodigy_target} PRIVATE ${PRODIGY_COMMON_DEPO_TARGETS})
 endforeach()
-depos_link(prodigy PRIVATE ${PRODIGY_COMMON_DEPO_TARGETS})
-depos_link(mothership PRIVATE ${PRODIGY_COMMON_DEPO_TARGETS})
+depos_link(prodigy_dns_resolver PRIVATE basics::basics)
+depos_link(prodigy_dns_resolver PRIVATE cares::cares)
+depos_link(prodigy_dns_resolver_unit PRIVATE basics::basics)
+depos_link(prodigy_dns_resolver_unit PRIVATE cares::cares)
+depos_link(mothership PRIVATE pthread)
 
 if (NOT TARGET Prodigy::SdkCppOpinionated)
    message(FATAL_ERROR "Prodigy dev requires Prodigy::SdkCppOpinionated for the SDK-owned neuron hub fixture coverage.")
@@ -690,6 +769,7 @@ if (PRODIGY_ENABLE_FUZZ_TESTS)
    target_compile_definitions(prodigy_brain_topic_fuzz PUBLIC PRODIGY_DEBUG=1)
    target_compile_definitions(prodigy_neuron_topic_fuzz PUBLIC PRODIGY_DEBUG=1)
    target_compile_definitions(prodigy_container_topic_fuzz PUBLIC PRODIGY_DEBUG=1)
+   target_compile_definitions(prodigy_dns_wire_fuzz PUBLIC PRODIGY_DEBUG=1)
 endif()
 
 target_compile_options(prodigy PUBLIC -O2) # -g -flto
@@ -698,6 +778,7 @@ if (NOT CMAKE_EXE_LINKER_FLAGS MATCHES "sanitize")
    target_link_options(prodigy_mothership_tunnel_provider PRIVATE -static)
 endif()
 target_compile_options(prodigy_ready_container PUBLIC -O2)
+target_compile_options(prodigy_dns_resolver PUBLIC -O2)
 target_compile_options(prodigy_task_probe_container PUBLIC -O2)
 target_compile_options(prodigy_pingpong_container PUBLIC -O2)
 target_compile_options(prodigy_pingpong_container_alt PUBLIC -O2)
@@ -719,6 +800,7 @@ target_compile_options(prodigy_mesh_unit PUBLIC -O2)
 target_compile_options(prodigy_deployments_unit PUBLIC -O2)
 target_compile_options(prodigy_brain_config_ssh_replication_unit PUBLIC -O2)
 target_compile_options(prodigy_brain_replication_credentials_unit PUBLIC -O2)
+target_compile_options(prodigy_brain_spot_async_unit PUBLIC -O2)
 target_compile_options(prodigy_pairing_parser_adversarial_unit PUBLIC -O2)
 target_compile_options(prodigy_bootstrap_config_unit PUBLIC -O2)
 target_compile_options(prodigy_persistent_state_unit PUBLIC -O2)
@@ -740,7 +822,19 @@ target_compile_options(prodigy_brain_reachability_unit PUBLIC -O2)
 target_compile_options(prodigy_brain_master_uuid_unit PUBLIC -O2)
 target_compile_options(prodigy_brain_ipv6_topology_unit PUBLIC -O2)
 target_compile_options(prodigy_private4_unit PUBLIC -O2)
+target_compile_options(prodigy_aws_http_unit PUBLIC -O2)
+target_compile_options(prodigy_azure_http_unit PUBLIC -O2)
+target_compile_options(prodigy_vultr_http_unit PUBLIC -O2)
 target_compile_options(prodigy_gcp_provider_unit PUBLIC -O0 -fno-lto)
+target_compile_options(prodigy_gcp_managed_template_unit PUBLIC -O2)
+target_compile_options(prodigy_gcp_provisioning_unit PUBLIC -O2)
+target_compile_options(prodigy_gcp_lifecycle_unit PUBLIC -O2)
+target_compile_options(prodigy_gcp_labels_unit PUBLIC -O2)
+target_compile_options(prodigy_gcp_cluster_destroy_unit PUBLIC -O2)
+target_compile_options(prodigy_gcp_elastic_address_unit PUBLIC -O2)
+target_compile_options(prodigy_brain_machine_lifecycle_unit PUBLIC -O2)
+target_compile_options(prodigy_brain_elastic_address_operations_unit PUBLIC -O2)
+target_compile_options(prodigy_command_capture_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_pricing_unit PUBLIC -O0 -fno-lto)
 target_compile_options(prodigy_provider_rack_unit PUBLIC -O0 -fno-lto)
 target_compile_options(prodigy_provider_elastic_address_unit PUBLIC -O0 -fno-lto)
@@ -748,6 +842,7 @@ target_compile_options(prodigy_machine_hardware_unit PUBLIC -O2)
 target_compile_options(prodigy_test_cluster_boot_json PUBLIC -O2)
 target_compile_options(prodigy_bundle_artifact_unit PUBLIC -O2)
 target_compile_options(prodigy_remote_bootstrap_unit PUBLIC -O2)
+target_compile_options(prodigy_mothership_host_runtime_unit PUBLIC -O2)
 target_compile_options(prodigy_remote_bootstrap_smoke PUBLIC -O2)
 target_compile_options(prodigy_mothership_cluster_registry_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_cluster_report_unit PUBLIC -O2)
@@ -770,7 +865,8 @@ if (PRODIGY_ENABLE_FUZZ_TESTS)
       prodigy_mothership_topic_fuzz
       prodigy_brain_topic_fuzz
       prodigy_neuron_topic_fuzz
-      prodigy_container_topic_fuzz)
+      prodigy_container_topic_fuzz
+      prodigy_dns_wire_fuzz)
       target_compile_options(${prodigy_fuzz_target} PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=${PRODIGY_FUZZ_SANITIZER})
       target_link_options(${prodigy_fuzz_target} PRIVATE -fsanitize=${PRODIGY_FUZZ_SANITIZER})
    endforeach()
@@ -828,12 +924,26 @@ add_custom_command(OUTPUT container.ingress.router.ebpf.o
 
 add_custom_target(container_ingress_router ALL DEPENDS container.ingress.router.ebpf.o)
 
+add_custom_command(OUTPUT container.ingress.router.declared.ebpf.o
+                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" ${PRODIGY_EBPF_COMPILE_FLAGS} -DPRODIGY_DECLARED_NETWORK_MAPS=1 -MMD -MF container.ingress.router.declared.ebpf.o.d -c ${PRODIGY_ROOT}/switchboard/kernel/container.ingress.router.ebpf.c -o container.ingress.router.declared.ebpf.o
+                   DEPENDS ${PRODIGY_ROOT}/switchboard/kernel/container.ingress.router.ebpf.c
+                   DEPFILE container.ingress.router.declared.ebpf.o.d)
+
+add_custom_target(container_ingress_declared_router ALL DEPENDS container.ingress.router.declared.ebpf.o)
+
 add_custom_command(OUTPUT container.egress.router.ebpf.o
                    COMMAND "${PRODIGY_CLANG_EXECUTABLE}" ${PRODIGY_EBPF_COMPILE_FLAGS} -MMD -MF container.egress.router.ebpf.o.d -c ${PRODIGY_ROOT}/switchboard/kernel/container.egress.router.ebpf.c -o container.egress.router.ebpf.o
                    DEPENDS ${PRODIGY_ROOT}/switchboard/kernel/container.egress.router.ebpf.c
                    DEPFILE container.egress.router.ebpf.o.d)
 
 add_custom_target(container_egress_router ALL DEPENDS container.egress.router.ebpf.o)
+
+add_custom_command(OUTPUT container.egress.router.declared.ebpf.o
+                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" ${PRODIGY_EBPF_COMPILE_FLAGS} -DPRODIGY_DECLARED_NETWORK_MAPS=1 -MMD -MF container.egress.router.declared.ebpf.o.d -c ${PRODIGY_ROOT}/switchboard/kernel/container.egress.router.ebpf.c -o container.egress.router.declared.ebpf.o
+                   DEPENDS ${PRODIGY_ROOT}/switchboard/kernel/container.egress.router.ebpf.c
+                   DEPFILE container.egress.router.declared.ebpf.o.d)
+
+add_custom_target(container_egress_declared_router ALL DEPENDS container.egress.router.declared.ebpf.o)
 
 add_dependencies(prodigy_container_overlay_sync_unit
    container_egress_router)
@@ -857,8 +967,31 @@ add_dependencies(prodigy
    host_ingress_router
    host_egress_router
    container_ingress_router
+   container_ingress_declared_router
    container_egress_router
+   container_egress_declared_router
    fake_ipv4_boundary_nat)
+
+add_custom_command(
+   OUTPUT "${PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT}"
+   COMMAND "${CMAKE_COMMAND}" -E env
+           CARGO_TARGET_DIR=${DISCOMBOBULATOR_CARGO_TARGET_DIR}
+           cargo run --quiet --manifest-path "${DISCOMBOBULATOR_MANIFEST}" --
+           build
+           --file "${PRODIGY_DNS_RESOLVER_DISCOMBOBUFILE}"
+           --context "resolver=$<TARGET_FILE_DIR:prodigy_dns_resolver>"
+           --output "${PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT}"
+           --kind app
+   DEPENDS prodigy_dns_resolver
+           "${PRODIGY_ROOT}/prodigy/dns/DiscombobuFile.in"
+           "${PRODIGY_DNS_RESOLVER_DISCOMBOBUFILE}"
+           "${DISCOMBOBULATOR_MANIFEST}"
+           "${DISCOMBOBULATOR_CARGO_LOCK}"
+           ${DISCOMBOBULATOR_SOURCE_FILES}
+   COMMENT "Building Prodigy DNS resolver app container"
+   VERBATIM
+)
+add_custom_target(prodigy_dns_resolver_container DEPENDS "${PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT}")
 
 add_custom_command(
    OUTPUT "${PRODIGY_BUNDLE_OUTPUT}"
@@ -881,6 +1014,9 @@ add_custom_command(
            --tool-binary "${PRODIGY_ROOT}/prodigy/acme/acme-present-dns-01"
            --tool-binary "${PRODIGY_ROOT}/prodigy/acme/acme-cleanup-dns-01"
            --tool-binary "${PRODIGY_ROOT}/prodigy/acme/acme-import-lineage"
+           --container-artifact "${PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT}"
+           --container-plan "${PRODIGY_DNS_RESOLVER_DEPLOYMENT_PLAN}"
+           --container-plan "${PRODIGY_DNS_RESOLVER_CONTROL_PLAN_TEMPLATE}"
    DEPENDS prodigy
            mothership
            balancer.ebpf.o
@@ -888,12 +1024,19 @@ add_custom_command(
            host.ingress.router.dev.ebpf.o
            host.egress.router.ebpf.o
            container.ingress.router.ebpf.o
+           container.ingress.router.declared.ebpf.o
            container.egress.router.ebpf.o
+           container.egress.router.declared.ebpf.o
            tunnel_to_nic.ebpf.o
            fake_ipv4_boundary_nat.ebpf.o
            "${DISCOMBOBULATOR_MANIFEST}"
            "${DISCOMBOBULATOR_CARGO_LOCK}"
            "${PRODIGY_CERTBOT_WHEELHOUSE_OUTPUT}"
+           "${PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT}"
+           "${PRODIGY_DNS_RESOLVER_DEPLOYMENT_PLAN}"
+           "${PRODIGY_DNS_RESOLVER_CONTROL_PLAN_TEMPLATE}"
+           "${PRODIGY_ROOT}/prodigy/dns/prodigy-dns-resolver.deployment.plan.v1.json.in"
+           "${PRODIGY_ROOT}/prodigy/dns/prodigy-dns-resolver.control.deployment.plan.v1.json.in"
            ${PRODIGY_ACME_HOOK_SCRIPTS}
            ${DISCOMBOBULATOR_SOURCE_FILES}
    COMMENT "Packaging ${PRODIGY_BUNDLE_OUTPUT}"
@@ -1362,6 +1505,87 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    )
    set_tests_properties(prodigy_container_overlay_sync_unit PROPERTIES SKIP_RETURN_CODE 77)
    add_test(
+      NAME prodigy_declared_network_policy_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_declared_network_policy_contract.cmake
+   )
+   add_test(
+      NAME prodigy_container_cgroup_bounds_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_container_cgroup_bounds_contract.cmake
+   )
+   add_test(
+      NAME prodigy_dns_resolver_artifact_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_dns_resolver_artifact_contract.cmake
+   )
+   add_test(
+      NAME prodigy_dns_control_service_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_dns_control_service_contract.cmake
+   )
+   add_test(
+      NAME prodigy_dead_smtp_reporter_hard_cut
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_dead_smtp_reporter_hard_cut.cmake
+   )
+   add_test(
+      NAME prodigy_host_control_network_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_host_control_network_contract.cmake
+   )
+   add_test(
+      NAME prodigy_mothership_host_inventory_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_mothership_host_inventory_contract.cmake
+   )
+   add_test(
+      NAME prodigy_gcp_validation_async_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_gcp_validation_async_contract.cmake
+   )
+   add_test(
+      NAME prodigy_gcp_managed_template_async_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_gcp_managed_template_async_contract.cmake
+   )
+   add_test(
+      NAME prodigy_gcp_provisioning_async_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_gcp_provisioning_async_contract.cmake
+   )
+   add_test(
+      NAME prodigy_host_delay_operation_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_host_delay_operation_contract.cmake
+   )
+   add_test(
+      NAME prodigy_gcp_spot_async_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_gcp_spot_async_contract.cmake
+   )
+   add_test(
+      NAME prodigy_brain_spot_async_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_brain_spot_async_unit
+   )
+   add_test(
+      NAME prodigy_gcp_neuron_startup_async_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_gcp_neuron_startup_async_contract.cmake
+   )
+   add_test(
+      NAME prodigy_gcp_pricing_ring_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_gcp_pricing_ring_contract.cmake
+   )
+   add_test(
+      NAME prodigy_dns_resolver_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_dns_resolver_unit
+   )
+   add_test(
+      NAME prodigy_dns_control_leases_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_dns_control_leases_unit
+   )
+   add_test(
+      NAME prodigy_host_http_operation_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_host_http_operation_unit
+   )
+   add_test(
+      NAME prodigy_host_delay_operation_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_host_delay_operation_unit
+   )
+   add_test(
+      NAME prodigy_mothership_host_runtime_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_host_runtime_unit
+   )
+   set_tests_properties(prodigy_mothership_host_runtime_unit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 15)
+   add_test(
       NAME prodigy_brain_overlay_hosted_ingress_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_brain_overlay_hosted_ingress_unit
    )
@@ -1390,8 +1614,92 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    )
 
    add_test(
+      NAME prodigy_aws_http_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_aws_http_unit
+   )
+   add_test(
+      NAME prodigy_host_async_task_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_host_async_task_unit
+   )
+   add_test(
+      NAME prodigy_aws_async_http_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_aws_async_http_contract.cmake
+   )
+   add_test(
+      NAME prodigy_azure_http_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_azure_http_unit
+   )
+   add_test(
+      NAME prodigy_azure_async_http_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_azure_async_http_contract.cmake
+   )
+   add_test(
+      NAME prodigy_vultr_http_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_vultr_http_unit
+   )
+   add_test(
+      NAME prodigy_vultr_async_http_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_vultr_async_http_contract.cmake
+   )
+   add_test(
       NAME prodigy_gcp_provider_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_gcp_provider_unit
+   )
+   add_test(
+      NAME prodigy_gcp_managed_template_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_gcp_managed_template_unit
+   )
+   add_test(
+      NAME prodigy_gcp_provisioning_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_gcp_provisioning_unit
+   )
+   add_test(
+      NAME prodigy_gcp_lifecycle_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_gcp_lifecycle_unit
+   )
+   add_test(
+      NAME prodigy_gcp_lifecycle_async_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_gcp_lifecycle_async_contract.cmake
+   )
+   add_test(
+      NAME prodigy_gcp_labels_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_gcp_labels_unit
+   )
+   add_test(
+      NAME prodigy_gcp_labels_async_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_gcp_labels_async_contract.cmake
+   )
+   add_test(
+      NAME prodigy_gcp_cluster_destroy_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_gcp_cluster_destroy_unit
+   )
+   add_test(
+      NAME prodigy_gcp_cluster_destroy_async_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_gcp_cluster_destroy_async_contract.cmake
+   )
+   add_test(
+      NAME prodigy_gcp_elastic_address_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_gcp_elastic_address_unit
+   )
+   add_test(
+      NAME prodigy_gcp_elastic_address_async_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_gcp_elastic_address_async_contract.cmake
+   )
+   add_test(
+      NAME prodigy_brain_machine_lifecycle_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_brain_machine_lifecycle_unit
+   )
+   add_test(
+      NAME prodigy_brain_elastic_address_operations_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_brain_elastic_address_operations_unit
+   )
+   add_test(
+      NAME prodigy_brain_elastic_address_async_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_brain_elastic_address_async_contract.cmake
+   )
+   add_test(
+      NAME prodigy_command_capture_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_command_capture_unit
    )
 
    add_test(
@@ -1417,6 +1725,11 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    add_test(
       NAME prodigy_bundle_artifact_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_bundle_artifact_unit
+   )
+
+   add_test(
+      NAME prodigy_dns_registry_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_dns_registry_unit
    )
 
    add_test(

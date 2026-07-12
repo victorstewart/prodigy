@@ -1746,6 +1746,50 @@ fn remote_fetch_uses_cached_imports_and_refreshes_explicitly() {
 }
 
 #[test]
+fn remote_fetch_rejects_oversized_declared_layer_before_download() {
+    let config =
+        br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#
+            .to_vec();
+    let config_digest = sha256_prefixed(&config);
+    let layer_digest = sha256_prefixed(b"layer must not be fetched");
+    let manifest_json = format!(
+        r#"{{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "config": {{
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "digest": "{config_digest}",
+    "size": {}
+  }},
+  "layers": [{{
+    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+    "digest": "{layer_digest}",
+    "size": 1073741825
+  }}]
+}}"#,
+        config.len()
+    )
+    .into_bytes();
+    let version = RegistryImageVersion {
+        manifest_digest: sha256_prefixed(&manifest_json),
+        manifest_json,
+        manifest_media_type: "application/vnd.oci.image.manifest.v1+json",
+        blobs: BTreeMap::from([(config_digest, config)]),
+    };
+    let registry = FakeRegistry::with_versions(BTreeMap::from([(1, version)]));
+    let project = tempfile::tempdir().unwrap();
+    add_named_remote(project.path(), "fixture", &registry.host());
+    let result = remote_fetch(project.path(), "fixture", "sample:latest", "x86_64");
+    assert!(!result.status.success());
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        error.contains("registry blob exceeds its declared byte limit"),
+        "{error}"
+    );
+    assert_eq!(registry.request_count(), 2, "oversized layer was requested");
+}
+
+#[test]
 fn remote_fetch_private_registry_uses_docker_config_basic_auth() {
     let registry = FakeRegistry::with_basic_auth("builder", "s3cret");
     let temp = tempfile::tempdir().unwrap();

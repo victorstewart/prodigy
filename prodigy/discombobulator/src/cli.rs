@@ -50,6 +50,14 @@ pub struct BundleFlatCommand {
     #[arg(long = "tool-binary")]
     pub tool_binary: Vec<PathBuf>,
 
+    /// Include an already-built Discombobulator container blob under containers/.
+    #[arg(long = "container-artifact", value_name = "PATH")]
+    pub container_artifact: Vec<PathBuf>,
+
+    /// Include a validated deployment-plan JSON object under containers/plans/.
+    #[arg(long = "container-plan", value_name = "PATH")]
+    pub container_plan: Vec<PathBuf>,
+
     #[arg(long = "library-search-dir")]
     pub library_search_dir: Vec<PathBuf>,
 }

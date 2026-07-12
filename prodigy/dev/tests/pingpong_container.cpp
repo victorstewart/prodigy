@@ -20,7 +20,6 @@
 #include <fstream>
 #include <limits>
 #include <memory>
-#include <netdb.h>
 #include <poll.h>
 #include <sstream>
 #include <string>

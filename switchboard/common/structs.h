@@ -32,6 +32,11 @@ struct switchboard_whitehole_binding {
   __u64 nonce;
 };
 
+struct switchboard_whitehole_reply {
+  struct switchboard_whitehole_binding binding;
+  __u64 expiresAtNs;
+};
+
 struct switchboard_wormhole_target_key {
   __u32 slot;
   __u8 container[5];

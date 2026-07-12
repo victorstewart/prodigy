@@ -340,6 +340,7 @@ static bool equalContainerParameters(const ContainerParameters& lhs, const Conta
       lhs.memoryMB != rhs.memoryMB ||
       lhs.storageMB != rhs.storageMB ||
       lhs.nLogicalCores != rhs.nLogicalCores ||
+      lhs.isolatedChildCgroups.size() != rhs.isolatedChildCgroups.size() ||
       lhs.neuronFD != rhs.neuronFD ||
       lhs.lowCPU != rhs.lowCPU ||
       lhs.highCPU != rhs.highCPU ||
@@ -358,6 +359,14 @@ static bool equalContainerParameters(const ContainerParameters& lhs, const Conta
       lhs.hasCredentialBundle != rhs.hasCredentialBundle)
   {
     return false;
+  }
+
+  for (uint32_t index = 0; index < lhs.isolatedChildCgroups.size(); index += 1)
+  {
+    if (lhs.isolatedChildCgroups[index] != rhs.isolatedChildCgroups[index])
+    {
+      return false;
+    }
   }
 
   for (uint32_t index = 0; index < lhs.flags.size(); index += 1)
@@ -557,6 +566,8 @@ static ContainerParameters makeContainerParameters(void)
   parameters.memoryMB = 1024;
   parameters.storageMB = 2048;
   parameters.nLogicalCores = 3;
+  parameters.isolatedChildCgroups.push_back(120);
+  parameters.isolatedChildCgroups.push_back(121);
   parameters.neuronFD = 5;
   parameters.lowCPU = 7;
   parameters.highCPU = 9;

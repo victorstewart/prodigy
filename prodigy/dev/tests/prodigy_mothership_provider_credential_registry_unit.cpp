@@ -369,11 +369,23 @@ int main(void)
     suite.expect(storedGcpExternalAccount.credentialPath.equals(gcpExternalAccount.credentialPath), "create_gcp_external_account_profile_path");
 
     ProdigyRuntimeEnvironmentConfig gcpRuntime = {};
+    gcpRuntime.kind = ProdigyEnvironmentKind::gcp;
     bool applyGcpRuntime = MothershipProviderCredentialRegistry::applyCredentialToRuntimeEnvironment(gcpGcloud, gcpRuntime, &failure);
     suite.expect(applyGcpRuntime, "apply_gcp_gcloud_runtime_environment");
-    suite.expect(gcpRuntime.providerCredentialMaterial.equals("gcloud-token"_ctv), "apply_gcp_gcloud_runtime_environment_token");
+    suite.expect(gcpRuntime.providerCredentialMaterial.empty(), "apply_gcp_gcloud_runtime_environment_defers_token");
     suite.expect(stringContains(gcpRuntime.gcp.bootstrapAccessTokenRefreshCommand, "gcloud auth print-access-token"), "apply_gcp_gcloud_runtime_environment_refresh_command");
     suite.expect(stringContains(gcpRuntime.gcp.bootstrapAccessTokenRefreshFailureHint, "gcloud auth login"), "apply_gcp_gcloud_runtime_environment_refresh_hint");
+
+    gcpRuntime.providerCredentialMaterial.assign("stale-token"_ctv);
+    ProdigyRuntimeEnvironmentConfig gcpRingRuntime = {};
+    bool prepareGcpRingRuntime = MothershipProviderCredentialRegistry::prepareGcpRingRuntimeEnvironment(gcpGcloud, gcpRuntime, gcpRingRuntime, &failure);
+    suite.expect(prepareGcpRingRuntime, "prepare_gcp_ring_runtime_environment");
+    suite.expect(gcpRingRuntime.providerCredentialMaterial.empty(), "prepare_gcp_ring_runtime_environment_defers_token");
+    suite.expect(stringContains(gcpRingRuntime.gcp.bootstrapAccessTokenRefreshCommand, "gcloud auth print-access-token"), "prepare_gcp_ring_runtime_environment_retains_async_refresh_command");
+    suite.expect(stringContains(gcpRingRuntime.gcp.bootstrapAccessTokenRefreshFailureHint, "gcloud auth login"), "prepare_gcp_ring_runtime_environment_retains_refresh_hint");
+    suite.expect(gcpRuntime.providerCredentialMaterial.equals("stale-token"_ctv), "prepare_gcp_ring_runtime_environment_source_material_unchanged");
+    suite.expect(stringContains(gcpRuntime.gcp.bootstrapAccessTokenRefreshCommand, "gcloud auth print-access-token"), "prepare_gcp_ring_runtime_environment_source_refresh_command_retained");
+    suite.expect(stringContains(gcpRuntime.gcp.bootstrapAccessTokenRefreshFailureHint, "gcloud auth login"), "prepare_gcp_ring_runtime_environment_source_refresh_hint_retained");
 
     ProdigyRuntimeEnvironmentConfig awsRuntime = {};
     bool applyAwsRuntime = MothershipProviderCredentialRegistry::applyCredentialToRuntimeEnvironment(storedAws, awsRuntime, &failure);
@@ -384,7 +396,7 @@ int main(void)
     ProdigyRuntimeEnvironmentConfig awsCliRuntime = {};
     bool applyAwsCliRuntime = MothershipProviderCredentialRegistry::applyCredentialToRuntimeEnvironment(storedAwsCli, awsCliRuntime, &failure);
     suite.expect(applyAwsCliRuntime, "apply_aws_cli_runtime_environment");
-    suite.expect(awsCliRuntime.providerCredentialMaterial.equals("{\"Version\":1,\"AccessKeyId\":\"ASIAEXAMPLE\",\"SecretAccessKey\":\"secret\",\"SessionToken\":\"session\",\"Expiration\":\"2026-03-22T10:00:00Z\"}"_ctv), "apply_aws_cli_runtime_environment_material");
+    suite.expect(awsCliRuntime.providerCredentialMaterial.empty(), "apply_aws_cli_runtime_environment_defers_material");
     suite.expect(stringContains(awsCliRuntime.aws.bootstrapCredentialRefreshCommand, "aws configure export-credentials --profile 'prodigy' --format process"), "apply_aws_cli_runtime_environment_refresh_command");
 
     MothershipProviderCredential azureCli = {};
@@ -396,7 +408,7 @@ int main(void)
     ProdigyRuntimeEnvironmentConfig azureCliRuntime = {};
     bool applyAzureCliRuntime = MothershipProviderCredentialRegistry::applyCredentialToRuntimeEnvironment(azureCli, azureCliRuntime, &failure);
     suite.expect(applyAzureCliRuntime, "apply_azure_cli_runtime_environment");
-    suite.expect(azureCliRuntime.providerCredentialMaterial.equals("azure-token"_ctv), "apply_azure_cli_runtime_environment_material");
+    suite.expect(azureCliRuntime.providerCredentialMaterial.empty(), "apply_azure_cli_runtime_environment_defers_material");
     suite.expect(stringContains(azureCliRuntime.azure.bootstrapAccessTokenRefreshCommand, fakeAzPath.c_str()), "apply_azure_cli_runtime_environment_refresh_command_uses_absolute_path");
     suite.expect(stringContains(azureCliRuntime.azure.bootstrapAccessTokenRefreshCommand, "account get-access-token"), "apply_azure_cli_runtime_environment_refresh_command");
     suite.expect(stringContains(azureCliRuntime.azure.bootstrapAccessTokenRefreshFailureHint, "az login"), "apply_azure_cli_runtime_environment_refresh_hint");
@@ -426,15 +438,44 @@ int main(void)
     ProdigyRuntimeEnvironmentConfig gcpImpersonationRuntime = {};
     bool applyGcpImpersonationRuntime = MothershipProviderCredentialRegistry::applyCredentialToRuntimeEnvironment(storedGcpImpersonation, gcpImpersonationRuntime, &failure);
     suite.expect(applyGcpImpersonationRuntime, "apply_gcp_impersonation_runtime_environment");
-    suite.expect(gcpImpersonationRuntime.providerCredentialMaterial.equals("impersonated-token"_ctv), "apply_gcp_impersonation_runtime_environment_material");
+    suite.expect(gcpImpersonationRuntime.providerCredentialMaterial.empty(), "apply_gcp_impersonation_runtime_environment_defers_material");
     suite.expect(stringContains(gcpImpersonationRuntime.gcp.bootstrapAccessTokenRefreshCommand, "--impersonate-service-account='bootstrap@example.iam.gserviceaccount.com'"), "apply_gcp_impersonation_runtime_environment_refresh_command");
 
     ProdigyRuntimeEnvironmentConfig gcpExternalRuntime = {};
     bool applyGcpExternalRuntime = MothershipProviderCredentialRegistry::applyCredentialToRuntimeEnvironment(storedGcpExternalAccount, gcpExternalRuntime, &failure);
     suite.expect(applyGcpExternalRuntime, "apply_gcp_external_runtime_environment");
-    suite.expect(gcpExternalRuntime.providerCredentialMaterial.equals("external-token"_ctv), "apply_gcp_external_runtime_environment_material");
+    suite.expect(gcpExternalRuntime.providerCredentialMaterial.empty(), "apply_gcp_external_runtime_environment_defers_material");
     suite.expect(stringContains(gcpExternalRuntime.gcp.bootstrapAccessTokenRefreshCommand, "GOOGLE_APPLICATION_CREDENTIALS='"), "apply_gcp_external_runtime_environment_refresh_env");
-    suite.expect(stringContains(gcpExternalRuntime.gcp.bootstrapAccessTokenRefreshCommand, "gcloud auth application-default print-access-token 2>&1"), "apply_gcp_external_runtime_environment_refresh_command");
+    suite.expect(stringContains(gcpExternalRuntime.gcp.bootstrapAccessTokenRefreshCommand, "gcloud auth application-default print-access-token"), "apply_gcp_external_runtime_environment_refresh_command");
+
+    suite.expect(writeExecutableScript(fakeGcloudPath,
+                                       "#!/usr/bin/env sh\n"
+                                       "sleep 60 &\n"
+                                       "wait\n"),
+                 "write_hung_fake_gcloud");
+    ProdigyRuntimeEnvironmentConfig deadlineSource = gcpRuntime;
+    deadlineSource.providerCredentialMaterial = "source-token"_ctv;
+    ProdigyRuntimeEnvironmentConfig deadlineRuntime = {};
+    auto deadlineStarted = ProdigyCommandCapture::Clock::now();
+    bool prepareBeforeDeadline = MothershipProviderCredentialRegistry::prepareGcpRingRuntimeEnvironment(
+        gcpGcloud,
+        deadlineSource,
+        deadlineRuntime,
+        &failure,
+        deadlineStarted + std::chrono::milliseconds(300));
+    suite.expect(prepareBeforeDeadline && failure.empty() &&
+                     ProdigyCommandCapture::Clock::now() - deadlineStarted < std::chrono::seconds(2),
+                 "prepare_gcp_ring_runtime_environment_never_executes_on_caller_thread");
+    suite.expect(deadlineRuntime.providerCredentialMaterial.empty() &&
+                     stringContains(deadlineRuntime.gcp.bootstrapAccessTokenRefreshCommand,
+                                    "gcloud auth print-access-token") &&
+                     stringContains(deadlineRuntime.gcp.bootstrapAccessTokenRefreshFailureHint,
+                                    "gcloud auth login"),
+                 "prepare_gcp_ring_runtime_environment_publishes_deferred_refresh_state");
+    suite.expect(deadlineSource.providerCredentialMaterial == "source-token"_ctv &&
+                     stringContains(deadlineSource.gcp.bootstrapAccessTokenRefreshCommand,
+                                    "gcloud auth print-access-token"),
+                 "prepare_gcp_ring_runtime_environment_deadline_leaves_source_unchanged");
 
     MothershipProviderCredential invalidNonGcpMode = {};
     invalidNonGcpMode.name = "aws-gcloud"_ctv;

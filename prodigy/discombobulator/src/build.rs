@@ -17,6 +17,7 @@ use metalor::runtime::{
 };
 use reqwest::blocking::Client as HttpClient;
 use reqwest::header::{ACCEPT, AUTHORIZATION, WWW_AUTHENTICATE};
+use reqwest::redirect::Policy as RedirectPolicy;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -26,10 +27,11 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Cursor, Read, Write};
+use std::net::IpAddr;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tar::Archive;
@@ -45,6 +47,15 @@ const LOCK_EXCLUSIVE: i32 = 2;
 const LOCK_UNLOCK: i32 = 8;
 const TEST_FAULT_ENV: &str = "DISCOMBOBULATOR_TEST_FAULT";
 const LOOPBACK_BTRFS_SETUP_LOCK_PATH: &str = "/tmp/discombobulator-loopback-btrfs.lock";
+const MAX_BUNDLE_CONTAINER_PLAN_BYTES: u64 = 1024 * 1024;
+const REGISTRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REGISTRY_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const REGISTRY_REDIRECT_LIMIT: usize = 5;
+const MAX_OCI_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_OCI_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_OCI_LAYER_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_REGISTRY_TOKEN_BYTES: u64 = 64 * 1024;
+const MAX_REGISTRY_ERROR_BYTES: u64 = 64 * 1024;
 
 struct MaterializedBase {
     root: PathBuf,
@@ -252,6 +263,8 @@ pub fn bundle_flat(command: BundleFlatCommand) -> Result<()> {
         false,
     )?;
     copy_bundle_ebpf_objects(stage_root, &command.build_dir, &command.ebpf)?;
+    copy_bundle_container_artifacts(stage_root, &command.container_artifact)?;
+    copy_bundle_container_plans(stage_root, &command.container_plan)?;
 
     if command.tool_binary.is_empty() == false {
         let tools_dir = stage_root.join("tools");
@@ -637,6 +650,181 @@ fn parse_contexts(raw_contexts: &[String]) -> Result<BTreeMap<String, PathBuf>> 
 fn bundle_entry_name(path: &Path) -> Result<&OsStr> {
     path.file_name()
         .with_context(|| format!("bundle path has no file name: {}", path.display()))
+}
+
+fn copy_bundle_container_artifacts(stage_root: &Path, artifacts: &[PathBuf]) -> Result<()> {
+    let mut names = BTreeSet::new();
+    let mut validated = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let name = bundle_container_artifact_name(artifact)?;
+        if names.insert(name.clone()) == false {
+            bail!(
+                "bundle container artifacts must have unique basenames: {}",
+                name.to_string_lossy()
+            );
+        }
+        let source = artifact.canonicalize().with_context(|| {
+            format!(
+                "failed to resolve bundle container artifact {}",
+                artifact.display()
+            )
+        })?;
+        if source.is_file() == false {
+            bail!(
+                "bundle container artifact path is not a regular file: {}",
+                artifact.display()
+            );
+        }
+
+        let mut prefix = Vec::new();
+        fs::File::open(&source)?
+            .take(
+                discombobulator_blob_header()
+                    .len()
+                    .max(mothership_tunnel_provider_blob_header().len()) as u64,
+            )
+            .read_to_end(&mut prefix)?;
+        if prefix.starts_with(discombobulator_blob_header()) == false
+            && prefix.starts_with(mothership_tunnel_provider_blob_header()) == false
+        {
+            bail!(
+                "bundle container artifact is not a supported Discombobulator-built blob: {}",
+                artifact.display()
+            );
+        }
+        validated.push((source, name));
+    }
+
+    if validated.is_empty() {
+        return Ok(());
+    }
+    let container_dir = stage_root.join("containers");
+    fs::create_dir_all(&container_dir)?;
+    for (source, name) in validated {
+        let destination = container_dir.join(&name);
+        if destination.parent() != Some(container_dir.as_path()) {
+            bail!(
+                "bundle container artifact destination escaped containers/: {}",
+                name.to_string_lossy()
+            );
+        }
+        fs::copy(&source, &destination).with_context(|| {
+            format!(
+                "failed to copy bundle container artifact {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o644))?;
+    }
+    Ok(())
+}
+
+fn copy_bundle_container_plans(stage_root: &Path, plans: &[PathBuf]) -> Result<()> {
+    let mut names = BTreeSet::new();
+    let mut validated = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let name = bundle_container_artifact_name(plan)?;
+        if Path::new(&name).extension() != Some(OsStr::new("json")) {
+            bail!(
+                "bundle container plan requires a .json basename: {}",
+                plan.display()
+            );
+        }
+        if names.insert(name.clone()) == false {
+            bail!(
+                "bundle container plans must have unique basenames: {}",
+                name.to_string_lossy()
+            );
+        }
+        let source = plan.canonicalize().with_context(|| {
+            format!("failed to resolve bundle container plan {}", plan.display())
+        })?;
+        if source.is_file() == false {
+            bail!(
+                "bundle container plan path is not a regular file: {}",
+                plan.display()
+            );
+        }
+        let file = fs::File::open(&source)?;
+        let size = file.metadata()?.len();
+        if size > MAX_BUNDLE_CONTAINER_PLAN_BYTES {
+            bail!(
+                "bundle container plan exceeds {}-byte limit: {}",
+                MAX_BUNDLE_CONTAINER_PLAN_BYTES,
+                plan.display()
+            );
+        }
+        let mut contents = Vec::with_capacity(size as usize);
+        file.take(MAX_BUNDLE_CONTAINER_PLAN_BYTES + 1)
+            .read_to_end(&mut contents)?;
+        if contents.len() as u64 > MAX_BUNDLE_CONTAINER_PLAN_BYTES {
+            bail!(
+                "bundle container plan exceeds {}-byte limit: {}",
+                MAX_BUNDLE_CONTAINER_PLAN_BYTES,
+                plan.display()
+            );
+        }
+        let document: serde_json::Value = serde_json::from_slice(&contents).with_context(|| {
+            format!(
+                "bundle container plan is not valid JSON: {}",
+                plan.display()
+            )
+        })?;
+        if document.is_object() == false {
+            bail!(
+                "bundle container plan root must be an object: {}",
+                plan.display()
+            );
+        }
+        validated.push((contents, name));
+    }
+
+    if validated.is_empty() {
+        return Ok(());
+    }
+    let plan_dir = stage_root.join("containers/plans");
+    fs::create_dir_all(&plan_dir)?;
+    for (contents, name) in validated {
+        let destination = plan_dir.join(&name);
+        if destination.parent() != Some(plan_dir.as_path()) {
+            bail!(
+                "bundle container plan destination escaped containers/plans/: {}",
+                name.to_string_lossy()
+            );
+        }
+        fs::write(&destination, contents).with_context(|| {
+            format!(
+                "failed to copy bundle container plan to {}",
+                destination.display()
+            )
+        })?;
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o644))?;
+    }
+    Ok(())
+}
+
+fn bundle_container_artifact_name(path: &Path) -> Result<OsString> {
+    let name = path.file_name().with_context(|| {
+        format!(
+            "bundle container artifact must have a normal nonempty basename: {}",
+            path.display()
+        )
+    })?;
+    let mut components = Path::new(name).components();
+    let Some(Component::Normal(normal)) = components.next() else {
+        bail!(
+            "bundle container artifact must have a normal nonempty basename: {}",
+            path.display()
+        );
+    };
+    if components.next().is_some() {
+        bail!(
+            "bundle container artifact basename must not contain a path: {}",
+            path.display()
+        );
+    }
+    Ok(normal.to_os_string())
 }
 
 fn install_bundle_executable(source: &Path, destination: &Path) -> Result<()> {
@@ -1456,7 +1644,12 @@ fn materialize_remote_base_root(
     fs::create_dir_all(&staged_rootfs)?;
 
     for layer in &resolved_image.layers {
-        let bytes = client.fetch_blob(&resolved_image.repository, &layer.digest)?;
+        let bytes = client.fetch_blob(
+            &resolved_image.repository,
+            &layer.digest,
+            layer.size,
+            MAX_OCI_LAYER_BYTES,
+        )?;
         unpack_oci_layer(&bytes, layer.media_type.as_deref(), &staged_rootfs)?;
         maybe_inject_test_fault("remote-layer-unpack");
     }
@@ -1543,6 +1736,7 @@ struct OciBlobDescriptor {
     #[serde(rename = "mediaType")]
     media_type: Option<String>,
     digest: String,
+    size: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1580,9 +1774,32 @@ struct RegistryHttpClient {
 
 impl RegistryHttpClient {
     fn new(remote: &RemoteRecord) -> Result<Self> {
+        let base_url = registry_base_url(&remote.registry_host);
+        validate_tooling_url(&reqwest::Url::parse(&base_url)?)?;
         Ok(Self {
-            client: HttpClient::builder().build()?,
-            base_url: registry_base_url(&remote.registry_host),
+            client: HttpClient::builder()
+                .connect_timeout(REGISTRY_CONNECT_TIMEOUT)
+                .timeout(REGISTRY_REQUEST_TIMEOUT)
+                .redirect(RedirectPolicy::custom(|attempt| {
+                    if attempt.previous().len() >= REGISTRY_REDIRECT_LIMIT {
+                        return attempt.error("registry redirect limit exceeded");
+                    }
+                    let target = attempt.url();
+                    if target.scheme() != "https" && is_loopback_http(target) == false {
+                        return attempt.error("registry redirect rejected insecure target");
+                    }
+                    if attempt
+                        .previous()
+                        .last()
+                        .is_some_and(|previous| previous.scheme() == "https")
+                        && target.scheme() != "https"
+                    {
+                        return attempt.error("registry redirect rejected HTTPS downgrade");
+                    }
+                    attempt.follow()
+                }))
+                .build()?,
+            base_url,
             basic_auth: load_registry_basic_auth(&remote.registry_host),
             bearer_token: RefCell::new(None),
         })
@@ -1597,20 +1814,52 @@ impl RegistryHttpClient {
                  application/vnd.oci.image.manifest.v1+json,\
                  application/vnd.docker.distribution.manifest.v2+json",
             ),
+            MAX_OCI_MANIFEST_BYTES,
         )?;
+        if response
+            .digest
+            .as_deref()
+            .is_some_and(|digest| sha256_prefixed(&response.bytes) != digest)
+        {
+            bail!("registry manifest digest verification failed");
+        }
         maybe_inject_test_fault("remote-manifest-fetch");
         Ok(response)
     }
 
-    fn fetch_blob(&self, repository: &str, digest: &str) -> Result<Vec<u8>> {
+    fn fetch_blob(
+        &self,
+        repository: &str,
+        digest: &str,
+        declared_size: Option<u64>,
+        maximum_bytes: u64,
+    ) -> Result<Vec<u8>> {
+        if declared_size.is_some_and(|size| size > maximum_bytes) {
+            bail!("registry blob exceeds its declared byte limit");
+        }
         let bytes = self
-            .get_bytes(&format!("/v2/{repository}/blobs/{digest}"), None)?
+            .get_bytes(
+                &format!("/v2/{repository}/blobs/{digest}"),
+                None,
+                maximum_bytes,
+            )?
             .bytes;
+        if declared_size.is_some_and(|size| size != bytes.len() as u64) {
+            bail!("registry blob size differs from its descriptor");
+        }
+        if sha256_prefixed(&bytes) != digest {
+            bail!("registry blob digest verification failed");
+        }
         maybe_inject_test_fault("remote-layer-download");
         Ok(bytes)
     }
 
-    fn get_bytes(&self, path: &str, accept: Option<&str>) -> Result<HttpBytesResponse> {
+    fn get_bytes(
+        &self,
+        path: &str,
+        accept: Option<&str>,
+        maximum_bytes: u64,
+    ) -> Result<HttpBytesResponse> {
         let url = format!("{}{}", self.base_url, path);
         let first = self.issue_request(&url, accept, self.bearer_token.borrow().as_deref())?;
         if first.status() == StatusCode::UNAUTHORIZED {
@@ -1625,20 +1874,20 @@ impl RegistryHttpClient {
             if scheme.eq_ignore_ascii_case("Basic") {
                 if self.basic_auth.is_some() {
                     bail!(
-                        "registry request to {url} failed: configured DOCKER_CONFIG basic auth was rejected"
+                        "registry request failed: configured DOCKER_CONFIG basic auth was rejected"
                     );
                 }
                 bail!(
-                    "registry request to {url} requires basic auth and no matching DOCKER_CONFIG credentials were found"
+                    "registry request requires basic auth and no matching DOCKER_CONFIG credentials were found"
                 );
             }
             let token = self.obtain_bearer_token(&challenge)?;
             self.bearer_token.replace(Some(token.clone()));
             let retry = self.issue_request(&url, accept, Some(&token))?;
-            return self.finish_response(retry, &url);
+            return self.finish_response(retry, maximum_bytes);
         }
 
-        self.finish_response(first, &url)
+        self.finish_response(first, maximum_bytes)
     }
 
     fn issue_request(
@@ -1657,15 +1906,13 @@ impl RegistryHttpClient {
         if let Some(token) = bearer_token {
             request = request.header(AUTHORIZATION, format!("Bearer {token}"));
         }
-        request
-            .send()
-            .with_context(|| format!("failed to fetch {url}"))
+        request.send().context("registry request failed")
     }
 
     fn finish_response(
         &self,
         response: reqwest::blocking::Response,
-        url: &str,
+        maximum_bytes: u64,
     ) -> Result<HttpBytesResponse> {
         let status = response.status();
         let digest = response
@@ -1673,32 +1920,32 @@ impl RegistryHttpClient {
             .get("Docker-Content-Digest")
             .and_then(|value| value.to_str().ok())
             .map(|value| value.to_string());
-        let bytes = response
-            .bytes()
-            .with_context(|| format!("failed to read registry response body from {url}"))?;
+        let bytes = read_bounded_response(
+            response,
+            if status.is_success() {
+                maximum_bytes
+            } else {
+                MAX_REGISTRY_ERROR_BYTES
+            },
+            "registry response",
+        )?;
         if status.is_success() == false {
-            bail!(
-                "registry request to {url} failed with {}: {}",
-                status,
-                String::from_utf8_lossy(&bytes)
-            );
+            bail!("registry request failed with {status}");
         }
-        Ok(HttpBytesResponse {
-            bytes: bytes.to_vec(),
-            digest,
-        })
+        Ok(HttpBytesResponse { bytes, digest })
     }
 
     fn obtain_bearer_token(&self, challenge: &str) -> Result<String> {
         let (scheme, parameters) = parse_www_authenticate(challenge)?;
         if scheme.eq_ignore_ascii_case("Bearer") == false {
-            bail!("unsupported registry auth challenge: {challenge}");
+            bail!("unsupported registry auth challenge");
         }
 
         let realm = parameters
             .get("realm")
             .context("registry auth challenge missing realm")?;
         let mut url = reqwest::Url::parse(realm)?;
+        validate_tooling_url(&url)?;
         {
             let mut query = url.query_pairs_mut();
             if let Some(service) = parameters.get("service") {
@@ -1717,15 +1964,17 @@ impl RegistryHttpClient {
             .send()
             .context("failed to request registry bearer token")?;
         let status = response.status();
-        let body = response
-            .bytes()
-            .context("failed to read registry token body")?;
+        let body = read_bounded_response(
+            response,
+            if status.is_success() {
+                MAX_REGISTRY_TOKEN_BYTES
+            } else {
+                MAX_REGISTRY_ERROR_BYTES
+            },
+            "registry token response",
+        )?;
         if status.is_success() == false {
-            bail!(
-                "registry token request failed with {}: {}",
-                status,
-                String::from_utf8_lossy(&body)
-            );
+            bail!("registry token request failed with {status}");
         }
         let value: serde_json::Value = serde_json::from_slice(&body)?;
         value
@@ -1735,6 +1984,47 @@ impl RegistryHttpClient {
             .map(|token| token.to_string())
             .context("registry token response missing token")
     }
+}
+
+fn is_loopback_http(url: &reqwest::Url) -> bool {
+    url.scheme() == "http"
+        && url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        })
+}
+
+fn validate_tooling_url(url: &reqwest::Url) -> Result<()> {
+    if url.scheme() == "https" || is_loopback_http(url) {
+        return Ok(());
+    }
+    bail!("registry tooling requires verified HTTPS outside loopback")
+}
+
+fn read_bounded_response(
+    mut response: reqwest::blocking::Response,
+    maximum_bytes: u64,
+    kind: &str,
+) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum_bytes)
+    {
+        bail!("{kind} exceeds its declared byte limit");
+    }
+    let mut bytes =
+        Vec::with_capacity(response.content_length().unwrap_or(0).min(maximum_bytes) as usize);
+    response
+        .by_ref()
+        .take(maximum_bytes + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read bounded {kind}"))?;
+    if bytes.len() as u64 > maximum_bytes {
+        bail!("{kind} exceeds its streamed byte limit");
+    }
+    Ok(bytes)
 }
 
 fn resolve_remote_image(
@@ -1800,7 +2090,12 @@ fn resolve_remote_manifest(
     arch: Architecture,
 ) -> Result<ResolvedRemoteImage> {
     let manifest: OciManifest = serde_json::from_slice(manifest_bytes)?;
-    let config_bytes = client.fetch_blob(repository, &manifest.config.digest)?;
+    let config_bytes = client.fetch_blob(
+        repository,
+        &manifest.config.digest,
+        manifest.config.size,
+        MAX_OCI_CONFIG_BYTES,
+    )?;
     let config: OciConfigBlob = serde_json::from_slice(&config_bytes)?;
     validate_remote_platform(config.os.as_deref(), config.architecture.as_deref(), arch)?;
     Ok(ResolvedRemoteImage {
@@ -1920,13 +2215,13 @@ fn load_registry_basic_auth(registry_host: &str) -> Option<(String, String)> {
 fn parse_www_authenticate(value: &str) -> Result<(String, BTreeMap<String, String>)> {
     let (scheme, rest) = value
         .split_once(' ')
-        .with_context(|| format!("invalid WWW-Authenticate header: {value}"))?;
+        .context("invalid WWW-Authenticate header")?;
     let mut parameters = BTreeMap::new();
     for raw_pair in rest.split(',') {
         let (key, raw_value) = raw_pair
             .trim()
             .split_once('=')
-            .with_context(|| format!("invalid WWW-Authenticate parameter: {raw_pair}"))?;
+            .context("invalid WWW-Authenticate parameter")?;
         parameters.insert(
             key.to_string(),
             raw_value.trim().trim_matches('"').to_string(),

@@ -1,0 +1,63 @@
+{
+   "config": {
+      "type": "ApplicationType::stateless",
+      "applicationID": 1,
+      "versionID": 1,
+      "architecture": "@PRODIGY_RESOLVED_TARGET_ARCH@",
+      "filesystemMB": 64,
+      "storageMB": 64,
+      "memoryMB": 256,
+      "nLogicalCores": 1,
+      "msTilHealthy": 10000,
+      "sTilHealthcheck": 15,
+      "sTilKillable": 30
+   },
+   "minimumSubscriberCapacity": 1024,
+   "isStateful": false,
+   "stateless": {
+      "nBase": 2,
+      "maxPerRackRatio": 0.5,
+      "maxPerMachineRatio": 0.5,
+      "moveableDuringCompaction": true
+   },
+   "wormholes": [],
+   "whiteholes": [
+      {
+         "transport": "quic",
+         "family": "ipv4",
+         "source": "hostPublicAddress",
+         "count": 2
+      },
+      {
+         "transport": "quic",
+         "family": "ipv6",
+         "source": "hostPublicAddress",
+         "count": 2
+      },
+      {
+         "transport": "tcp",
+         "family": "ipv4",
+         "source": "hostPublicAddress",
+         "count": 2
+      },
+      {
+         "transport": "tcp",
+         "family": "ipv6",
+         "source": "hostPublicAddress",
+         "count": 2
+      }
+   ],
+   "networkAccess": "declaredOnly",
+   "useHostNetworkNamespace": false,
+   "subscriptions": [],
+   "advertisements": [
+      {
+         "service": "MeshRegistry::DNS::resolver",
+         "startAt": "ContainerState::scheduled",
+         "stopAt": "ContainerState::destroying",
+         "port": 5353
+      }
+   ],
+   "moveConstructively": true,
+   "requiresDatacenterUniqueTag": false
+}

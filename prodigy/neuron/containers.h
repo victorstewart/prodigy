@@ -32,13 +32,16 @@
 #include <services/memfd.h>
 #include <prodigy/build.identity.h>
 #include <prodigy/container.contract.h>
+#include <prodigy/declared.network.policy.h>
 #include <prodigy/system.container.policy.h>
 #include <prodigy/wire.h>
 #include <prodigy/child.process.signal.h>
 
 #include <prodigy/neuron/container.storage.layout.h>
 #include <switchboard/overlay.route.h>
+#include <switchboard/kernel/structs.h>
 #include <switchboard/whitehole.route.h>
+#include <switchboard/container.tcp.flow.route.h>
 
 #define nReservedCores 2
 constexpr static int containerStartupFailureExitCode = 125;
@@ -725,6 +728,7 @@ public:
   int pidfd = -1;
   uint16_t lcores[256];
   int cgroup = -1;
+  Vector<int> isolatedChildCgroups;
   uint32_t userID = 0;
   bool killedOnPurpose = false;
   bool pendingKillAckToBrain = false;
@@ -812,6 +816,10 @@ public:
   ProdigyOverlayValueMirror<switchboard_overlay_prefix4_key, switchboard_overlay_hosted_ingress_route4> installedPeerHostedIngressRouteKeys4 = {};
   ProdigyOverlayValueMirror<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6> installedPeerHostedIngressRouteKeys6 = {};
   ProdigyOverlayValueMirror<portal_definition, switchboard_whitehole_binding> installedPeerWhiteholeBindingKeys = {};
+  bool syncDeclaredNetworkPairingPolicy(void)
+  {
+    return plan.networkAccess != ContainerNetworkAccess::declaredOnly || syncDeclaredNetworkPolicy();
+  }
 
 private:
 
@@ -1151,6 +1159,149 @@ public:
     syncPeerWhiteholeBindingsFrom(noWhiteholes);
   }
 
+  template <typename Key, StringType MapName>
+  static bool clearBPFMap(BPFProgram *program, MapName&& mapName)
+  {
+    if (program == nullptr)
+    {
+      return false;
+    }
+    bool ok = false;
+    program->openMap(mapName, [&](int mapFD) -> void {
+      if (mapFD < 0)
+      {
+        return;
+      }
+      ok = true;
+      Key current = {}, next = {};
+      int result = bpf_map_get_next_key(mapFD, nullptr, &next);
+      while (result == 0)
+      {
+        current = next;
+        if (bpf_map_delete_elem(mapFD, &current) != 0)
+        {
+          ok = false;
+        }
+        result = bpf_map_get_next_key(mapFD, &current, &next);
+      }
+    });
+    return ok;
+  }
+
+  template <typename Key, StringType MapName>
+  static bool populateBPFSet(BPFProgram *program, MapName&& mapName, const Vector<Key>& desired)
+  {
+    if (program == nullptr)
+    {
+      return false;
+    }
+    bool ok = false;
+    program->openMap(mapName, [&](int mapFD) -> void {
+      if (mapFD < 0)
+      {
+        return;
+      }
+      ok = true;
+      __u8 present = 1;
+      for (const Key& key : desired)
+      {
+        ok &= bpf_map_update_elem(mapFD, &key, &present, BPF_ANY) == 0;
+      }
+    });
+    return ok;
+  }
+
+  bool clearAuthorizedTCPFlows(void)
+  {
+    return clearBPFMap<flow_key>(peer_program, "ct_tcp_flows"_ctv);
+  }
+
+  void denyDeclaredNetwork(void)
+  {
+    container_network_policy denied = {};
+    if (peer_program)
+    {
+      peer_program->setArrayElement("ct_net_policy"_ctv, 0, denied);
+    }
+    if (primary_program)
+    {
+      primary_program->setArrayElement("ct_net_policy"_ctv, 0, denied);
+    }
+  }
+
+  bool syncDeclaredNetworkPolicy(void)
+  {
+    if (plan.networkAccess != ContainerNetworkAccess::declaredOnly)
+    {
+      return true;
+    }
+
+    Vector<container_service_peer> subscriptionTargets = {};
+    Vector<container_service_peer> advertisementSources = {};
+    if (declaredNetworkPairingsValid(plan))
+    {
+      for (const auto& [service, pairings] : plan.subscriptionPairings)
+      {
+        (void)service;
+        for (const SubscriptionPairing& pairing : pairings)
+        {
+          container_service_peer target = {};
+          std::memcpy(target.address, &pairing.address, sizeof(target.address));
+          target.port = htons(pairing.port);
+          subscriptionTargets.push_back(target);
+        }
+      }
+      for (const auto& [service, pairings] : plan.advertisementPairings)
+      {
+        uint16_t port = plan.advertisements[service].port;
+        for (const AdvertisementPairing& pairing : pairings)
+        {
+          container_service_peer source = {};
+          std::memcpy(source.address, &pairing.address, sizeof(source.address));
+          source.port = htons(port);
+          advertisementSources.push_back(source);
+        }
+      }
+    }
+
+    bool cleared = clearBPFMap<container_service_peer>(peer_program, "ct_sub_targets"_ctv) &&
+                   clearBPFMap<container_service_peer>(primary_program, "ct_adv_sources"_ctv) &&
+                   clearAuthorizedTCPFlows();
+    bool ok = cleared && declaredNetworkPairingsValid(plan) &&
+              populateBPFSet(peer_program, "ct_sub_targets"_ctv, subscriptionTargets) &&
+              populateBPFSet(primary_program, "ct_adv_sources"_ctv, advertisementSources);
+    if (ok == false)
+    {
+      (void)clearBPFMap<container_service_peer>(peer_program, "ct_sub_targets"_ctv);
+      (void)clearBPFMap<container_service_peer>(primary_program, "ct_adv_sources"_ctv);
+      (void)clearAuthorizedTCPFlows();
+      denyDeclaredNetwork();
+    }
+    return ok;
+  }
+
+  bool tcpFlowMapsShared(void) const
+  {
+    uint32_t peerMapID = 0, primaryMapID = 0;
+    auto readMapID = [](BPFProgram *program, uint32_t& mapID) -> void {
+      if (program == nullptr)
+      {
+        return;
+      }
+      program->openMap("ct_tcp_flows"_ctv, [&](int mapFD) -> void {
+        bpf_map_info info = {};
+        __u32 bytes = sizeof(info);
+        if (mapFD >= 0 && bpf_map_get_info_by_fd(mapFD, &info, &bytes) == 0)
+        {
+          mapID = info.id;
+        }
+      });
+    };
+    readMapID(peer_program, peerMapID);
+    readMapID(primary_program, primaryMapID);
+    return peerMapID != 0 && peerMapID == primaryMapID;
+  }
+
   uint32_t desiredInterContainerMTU(String *failureReport = nullptr) const
   {
     if (thisNeuron == nullptr)
@@ -1187,10 +1338,22 @@ public:
 
   bool buildContainerNetworkPolicy(struct container_network_policy& networkPolicy, String *failureReport = nullptr) const
   {
+    if (declaredNetworkAccessValid(plan) == false)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("invalid container networkAccess policy"_ctv);
+      }
+      return false;
+    }
     networkPolicy = {};
     networkPolicy.requiresPublic4 = (needsAnyExternalAddressFamily(plan, ExternalAddressFamily::ipv4) || systemEgressConstrained()) ? 1 : 0;
     networkPolicy.requiresPublic6 = needsAnyExternalAddressFamily(plan, ExternalAddressFamily::ipv6) ? 1 : 0;
-    networkPolicy.egressAllowlistOnly = systemEgressConstrained() ? 1 : 0;
+    networkPolicy.mode = plan.networkAccess == ContainerNetworkAccess::declaredOnly
+                             ? CONTAINER_NETWORK_DECLARED_ONLY
+                             : (systemEgressConstrained() ? CONTAINER_NETWORK_DESTINATION_ALLOWLIST
+                                                          : CONTAINER_NETWORK_UNRESTRICTED);
+    networkPolicy.containerFragment = plan.fragment;
     networkPolicy.interContainerMTU = desiredInterContainerMTU(failureReport);
     return !(thisNeuron && thisNeuron->configuredInterContainerMTU != 0 && networkPolicy.interContainerMTU == 0);
   }
@@ -1363,7 +1526,14 @@ public:
       return false;
     }
 
-    path.assign("/root/prodigy/container.egress.router.ebpf.o"_ctv);
+    if (plan.networkAccess == ContainerNetworkAccess::declaredOnly)
+    {
+      path.assign("/root/prodigy/container.egress.router.declared.ebpf.o"_ctv);
+    }
+    else
+    {
+      path.assign("/root/prodigy/container.egress.router.ebpf.o"_ctv);
+    }
     peer_program = netdevs.host.loadPreattachedProgram(prodigyContainerEgressNetkitAttachType(), path);
     if (peer_program)
     {
@@ -1386,11 +1556,36 @@ public:
       syncPeerWhiteholeBindings();
     }
 
-    path.assign("/root/prodigy/container.ingress.router.ebpf.o"_ctv);
+    if (plan.networkAccess == ContainerNetworkAccess::declaredOnly)
+    {
+      path.assign("/root/prodigy/container.ingress.router.declared.ebpf.o"_ctv);
+    }
+    else
+    {
+      path.assign("/root/prodigy/container.ingress.router.ebpf.o"_ctv);
+    }
     primary_program = netdevs.host.loadPreattachedProgram(prodigyContainerIngressNetkitAttachType(), path);
     if (primary_program)
     {
       primary_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
+    }
+
+    if (plan.networkAccess == ContainerNetworkAccess::declaredOnly &&
+        (tcpFlowMapsShared() == false || syncDeclaredNetworkPolicy() == false))
+    {
+      if (failureReport)
+      {
+        failureReport->assign("declared network state unavailable"_ctv);
+      }
+      if (peernetnsfd >= 0)
+      {
+        ::close(peernetnsfd);
+      }
+      if (hostnetnsfd >= 0)
+      {
+        ::close(hostnetnsfd);
+      }
+      return false;
     }
 
     bool synced = syncContainerDeviceMaps(this, nullptr, failureReport);
@@ -1552,6 +1747,20 @@ public:
                int(pid));
     installDatacenterMeshRoutes(peer, thisNeuron->lcsubnet6.dpfx);
 
+    struct container_network_policy networkPolicy = {};
+    if (buildContainerNetworkPolicy(networkPolicy, failureReport) == false)
+    {
+      if (peernetnsfd >= 0)
+      {
+        ::close(peernetnsfd);
+      }
+      if (hostnetnsfd >= 0)
+      {
+        ::close(hostnetnsfd);
+      }
+      return false;
+    }
+
     // add us to host map
     if (thisNeuron->ensureHostNetworkingReady(failureReport) == false)
     {
@@ -1596,7 +1805,14 @@ public:
       return false;
     }
 
-    path.assign("/root/prodigy/container.egress.router.ebpf.o"_ctv);
+    if (plan.networkAccess == ContainerNetworkAccess::declaredOnly)
+    {
+      path.assign("/root/prodigy/container.egress.router.declared.ebpf.o"_ctv);
+    }
+    else
+    {
+      path.assign("/root/prodigy/container.egress.router.ebpf.o"_ctv);
+    }
     peer_program = host.attachBPF(prodigyContainerEgressNetkitAttachType(), path, "ct_egress"_ctv,
                                   [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
                                     (void)switchboardReusePinnedWhiteholeReplyFlowMap(obj, thisNeuron->eth.ifidx, inner_map_fds);
@@ -1620,6 +1836,11 @@ public:
       return false;
     }
 
+    peer_program->setArrayElement("lc_subnet"_ctv, 0, thisNeuron->lcsubnet6);
+    peer_program->setArrayElement("mac_map"_ctv, 0, thisNeuron->eth.mac);
+    peer_program->setArrayElement("gw_mac_map"_ctv, 0, thisNeuron->eth.gateway_mac);
+    peer_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
+
     if (plan.config.applicationID == 11)
     {
       basics_log("setupNetwork stage=egress-attached uuid=%llu appID=%u\n",
@@ -1627,23 +1848,6 @@ public:
                  unsigned(plan.config.applicationID));
     }
 
-    struct container_network_policy networkPolicy = {};
-    if (buildContainerNetworkPolicy(networkPolicy, failureReport) == false)
-    {
-      if (peernetnsfd >= 0)
-      {
-        ::close(peernetnsfd);
-      }
-      if (hostnetnsfd >= 0)
-      {
-        ::close(hostnetnsfd);
-      }
-      return false;
-    }
-    peer_program->setArrayElement("lc_subnet"_ctv, 0, thisNeuron->lcsubnet6);
-    peer_program->setArrayElement("mac_map"_ctv, 0, thisNeuron->eth.mac);
-    peer_program->setArrayElement("gw_mac_map"_ctv, 0, thisNeuron->eth.gateway_mac);
-    peer_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
     if (syncSystemEgressAllowlist(failureReport) == false)
     {
       if (peernetnsfd >= 0)
@@ -1658,8 +1862,40 @@ public:
     }
     syncPeerWhiteholeBindings();
 
-    path.assign("/root/prodigy/container.ingress.router.ebpf.o"_ctv);
-    primary_program = host.attachBPF(prodigyContainerIngressNetkitAttachType(), path, "ct_ingress"_ctv);
+    if (plan.networkAccess == ContainerNetworkAccess::declaredOnly &&
+        switchboardPinContainerTCPFlowMap(peer_program, netdevs.host.ifidx) == false)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("failed to pin declared-network TCP flow state"_ctv);
+      }
+      if (peernetnsfd >= 0)
+      {
+        ::close(peernetnsfd);
+      }
+      if (hostnetnsfd >= 0)
+      {
+        ::close(hostnetnsfd);
+      }
+      return false;
+    }
+
+    if (plan.networkAccess == ContainerNetworkAccess::declaredOnly)
+    {
+      path.assign("/root/prodigy/container.ingress.router.declared.ebpf.o"_ctv);
+    }
+    else
+    {
+      path.assign("/root/prodigy/container.ingress.router.ebpf.o"_ctv);
+    }
+    bool tcpFlowMapReused = plan.networkAccess != ContainerNetworkAccess::declaredOnly;
+    primary_program = host.attachBPF(prodigyContainerIngressNetkitAttachType(), path, "ct_ingress"_ctv,
+                                     [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
+                                       if (plan.networkAccess == ContainerNetworkAccess::declaredOnly)
+                                       {
+                                         tcpFlowMapReused = switchboardReusePinnedContainerTCPFlowMap(obj, netdevs.host.ifidx, inner_map_fds);
+                                       }
+                                     });
     if (primary_program == nullptr)
     {
       if (failureReport)
@@ -1668,6 +1904,30 @@ public:
       }
       basics_log("setupNetwork failed uuid=%llu reason=attach-container-ingress-bpf path=%s\n",
                  (unsigned long long)plan.uuid, path.c_str());
+      if (plan.networkAccess == ContainerNetworkAccess::declaredOnly)
+      {
+        switchboardUnpinContainerTCPFlowMap(netdevs.host.ifidx);
+      }
+      if (peernetnsfd >= 0)
+      {
+        ::close(peernetnsfd);
+      }
+      if (hostnetnsfd >= 0)
+      {
+        ::close(hostnetnsfd);
+      }
+      return false;
+    }
+    primary_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
+
+    if (plan.networkAccess == ContainerNetworkAccess::declaredOnly &&
+        (tcpFlowMapReused == false || tcpFlowMapsShared() == false))
+    {
+      if (failureReport)
+      {
+        failureReport->assign("failed to share declared-network TCP flow state"_ctv);
+      }
+      switchboardUnpinContainerTCPFlowMap(netdevs.host.ifidx);
       if (peernetnsfd >= 0)
       {
         ::close(peernetnsfd);
@@ -1685,10 +1945,30 @@ public:
                  (unsigned long long)plan.uuid,
                  unsigned(plan.config.applicationID));
     }
-    primary_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
+    if (syncDeclaredNetworkPolicy() == false)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("failed to sync declared network pairings"_ctv);
+      }
+      switchboardUnpinContainerTCPFlowMap(netdevs.host.ifidx);
+      if (peernetnsfd >= 0)
+      {
+        ::close(peernetnsfd);
+      }
+      if (hostnetnsfd >= 0)
+      {
+        ::close(hostnetnsfd);
+      }
+      return false;
+    }
 
     if (syncContainerDeviceMaps(this, nullptr, failureReport) == false)
     {
+      if (plan.networkAccess == ContainerNetworkAccess::declaredOnly)
+      {
+        switchboardUnpinContainerTCPFlowMap(netdevs.host.ifidx);
+      }
       if (peernetnsfd >= 0)
       {
         ::close(peernetnsfd);
@@ -1740,6 +2020,10 @@ public:
 
     (void)syncContainerDeviceMaps(nullptr, this);
 
+    if (plan.networkAccess == ContainerNetworkAccess::declaredOnly)
+    {
+      switchboardUnpinContainerTCPFlowMap(netdevs.host.ifidx);
+    }
     if (peer_program)
     {
       netdevs.host.detachBPF(prodigyContainerEgressNetkitAttachType());
@@ -2643,7 +2927,9 @@ public:
 
   static bool debugCloseAllContainerExecDescriptorsExcept(int preservedFD0, int preservedFD1, String *failureReport = nullptr)
   {
-    return closeAllContainerExecDescriptorsExcept(preservedFD0, preservedFD1, failureReport);
+    const Vector<int32_t> additional;
+    return closeAllContainerExecDescriptorsExcept(
+        preservedFD0, preservedFD1, additional, failureReport);
   }
 
   static bool debugCleanupRejectedOrphanedContainerArtifacts(const String& containersRootPath, String *failureReport = nullptr)
@@ -3113,10 +3399,21 @@ private:
     return true;
   }
 
-  static bool closeAllContainerExecDescriptorsExcept(int preservedFD0, int preservedFD1, String *failureReport = nullptr)
+  static bool closeAllContainerExecDescriptorsExcept(
+      int preservedFD0,
+      int preservedFD1,
+      const Vector<int32_t>& additionalPreservedFDs,
+      String *failureReport = nullptr)
   {
-    int preservedFDs[2] = {preservedFD0, preservedFD1};
-    std::sort(std::begin(preservedFDs), std::end(preservedFDs));
+    Vector<int32_t> preservedFDs;
+    preservedFDs.reserve(additionalPreservedFDs.size() + 2);
+    preservedFDs.push_back(preservedFD0);
+    preservedFDs.push_back(preservedFD1);
+    for (int32_t fd : additionalPreservedFDs)
+    {
+      preservedFDs.push_back(fd);
+    }
+    std::sort(preservedFDs.begin(), preservedFDs.end());
 
     uint32_t nextFD = 3;
     for (int preservedFD : preservedFDs)
@@ -6354,7 +6651,7 @@ public:
     // page tables 3MB (for 32GB memory)
 
     // '+cpuset +cpu +io +memory +pids +misc' (hugetlb no longer used)
-    Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/cgroup.subtree_control"_ctv, "+cpuset +memory +pids"_ctv);
+    Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/cgroup.subtree_control"_ctv, "+cpuset +cpu +memory +pids"_ctv);
     basics_log("seed_root_cgroupv2_subtree_controllers wrote root subtree_control\n");
 
     int containersFD = Filesystem::createOpenDirectoryAt(-1, "/sys/fs/cgroup/containers.slice"_ctv);
@@ -6380,7 +6677,7 @@ public:
     }
     basics_log("seed_root_cgroupv2_subtree_controllers containersFD=%d\n", containersFD);
 
-    Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/containers.slice/cgroup.subtree_control"_ctv, "+cpuset +memory +pids"_ctv);
+    Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/containers.slice/cgroup.subtree_control"_ctv, "+cpuset +cpu +memory +pids"_ctv);
     Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/containers.slice/cgroup.max.depth"_ctv, "2"_ctv);
     basics_log("seed_root_cgroupv2_subtree_controllers wrote containers controls\n");
 
@@ -6511,8 +6808,23 @@ public:
   }
 
   // https://github.com/torvalds/linux/blob/master/Documentation/admin-guide/cgroup-v2.rst
-  static int create_cgroupv2(const Container *container)
+  static int create_cgroupv2(Container *container, String *failureReport = nullptr)
   {
+    if (failureReport)
+    {
+      failureReport->clear();
+    }
+    if (container->plan.config.isolatedChildMemoryMB != 0 &&
+        (container->plan.config.maxPids < 2 ||
+         container->plan.config.maxPids - 1 >
+             prodigyContainerRuntimeLimits.maxIsolatedChildCgroups))
+    {
+      if (failureReport)
+      {
+        failureReport->assign("invalid isolated-child cgroup bounds"_ctv);
+      }
+      return -1;
+    }
     String path;
     prodigyContainerCgroupSlicePath(container->name, path);
 
@@ -6534,8 +6846,30 @@ public:
       }
     }
 
-    Filesystem::openWriteAtClose(middirfd, "cgroup.max.descendants"_ctv, "1"_ctv);
-    Filesystem::openWriteAtClose(middirfd, "cgroup.max.depth"_ctv, "1"_ctv);
+    const uint32_t isolatedChildren = container->plan.config.isolatedChildMemoryMB == 0
+        ? 0
+        : container->plan.config.maxPids - 1;
+    auto requireCgroupSetting = [&](StringType auto&& name, StringType auto&& value) -> bool {
+      const int written = Filesystem::openWriteAtClose(middirfd, name, value);
+      if (written == int(value.size()))
+      {
+        return true;
+      }
+      if (failureReport)
+      {
+        failureReport->snprintf<"required container cgroup setting {}={} failed"_ctv>(
+            String(name), String(value));
+      }
+      return false;
+    };
+    String cgroupBound;
+    cgroupBound.assignItoa(1 + isolatedChildren);
+    if (requireCgroupSetting("cgroup.max.descendants"_ctv, cgroupBound) == false ||
+        requireCgroupSetting("cgroup.max.depth"_ctv, "1"_ctv) == false)
+    {
+      Filesystem::close(middirfd);
+      return -1;
+    }
 
     if (container->plan.usesSharedCPUs())
     {
@@ -6569,12 +6903,18 @@ public:
     Filesystem::openWriteAtClose(middirfd, "cpuset.cpus.partition"_ctv, "root"_ctv);
 
     String maxPids_string;
-    maxPids_string.assignItoa(prodigyContainerRuntimeLimits.maxPids);
-    Filesystem::openWriteAtClose(middirfd, "pids.max"_ctv, maxPids_string);
+    maxPids_string.assignItoa(container->plan.config.maxPids);
+    if (requireCgroupSetting("pids.max"_ctv, maxPids_string) == false)
+    {
+      Filesystem::close(middirfd);
+      return -1;
+    }
 
     path.snprintf<"{itoa}M"_ctv>(container->plan.memoryMB());
     Filesystem::openWriteAtClose(middirfd, "memory.low"_ctv, path);
     Filesystem::openWriteAtClose(middirfd, "memory.high"_ctv, path);
+    Filesystem::openWriteAtClose(middirfd, "memory.max"_ctv, path);
+    Filesystem::openWriteAtClose(middirfd, "memory.swap.max"_ctv, "0"_ctv);
 
     // Hugepages disabled; no hugetlb configuration
 
@@ -6597,6 +6937,58 @@ public:
     }
 
     Filesystem::openWriteAtClose(leafdirfd, "cgroup.freeze"_ctv, "1"_ctv);
+
+    if (isolatedChildren > 0)
+    {
+      const String controllers = "+cpu +memory +pids"_ctv;
+      if (Filesystem::openWriteAtClose(
+              middirfd, "cgroup.subtree_control"_ctv, controllers) != int(controllers.size()))
+      {
+        Filesystem::close(leafdirfd);
+        Filesystem::close(middirfd);
+        return -1;
+      }
+
+      container->isolatedChildCgroups.reserve(isolatedChildren);
+      String memoryHigh;
+      memoryHigh.snprintf<"{itoa}M"_ctv>(
+          (uint64_t(container->plan.config.isolatedChildMemoryMB) * 3) / 4);
+      String memoryMax;
+      memoryMax.snprintf<"{itoa}M"_ctv>(
+          container->plan.config.isolatedChildMemoryMB);
+      for (uint32_t index = 0; index < isolatedChildren; index += 1)
+      {
+        String childName;
+        childName.snprintf<"isolated.{itoa}"_ctv>(index);
+        const int child = Filesystem::createOpenDirectoryAt(middirfd, childName);
+        if (child < 0 ||
+            Filesystem::openWriteAtClose(child, "pids.max"_ctv, "1"_ctv) != 1 ||
+            Filesystem::openWriteAtClose(child, "memory.high"_ctv, memoryHigh) != int(memoryHigh.size()) ||
+            Filesystem::openWriteAtClose(child, "memory.max"_ctv, memoryMax) != int(memoryMax.size()) ||
+            Filesystem::openWriteAtClose(child, "memory.swap.max"_ctv, "0"_ctv) != 1 ||
+            Filesystem::openWriteAtClose(child, "cpu.max"_ctv, "100000 100000"_ctv) != 13 ||
+            fchownat(child,
+                     "cgroup.procs",
+                     container->userID,
+                     container->userID,
+                     0) != 0)
+        {
+          if (child >= 0)
+          {
+            Filesystem::close(child);
+          }
+          for (int fd : container->isolatedChildCgroups)
+          {
+            Filesystem::close(fd);
+          }
+          container->isolatedChildCgroups.clear();
+          Filesystem::close(leafdirfd);
+          Filesystem::close(middirfd);
+          return -1;
+        }
+        container->isolatedChildCgroups.push_back(child);
+      }
+    }
 
     // maybe the scheduler should read the cgroup's memory.stat to report on resource usage by containers.. instead of the applications doing it
 
@@ -7061,6 +7453,14 @@ public:
     {
       close(container->cgroup);
     }
+    for (int fd : container->isolatedChildCgroups)
+    {
+      if (fd >= 0)
+      {
+        close(fd);
+      }
+    }
+    container->isolatedChildCgroups.clear();
 
     // Best-effort external teardown (btrfs/cgroup shell calls) used to be skipped here.
     // Loop-backed storage leaves mounted filesystems and loop devices behind if we do nothing,
@@ -7157,9 +7557,20 @@ public:
     }
 
     // this must come after the name and cores assignments
-    container->cgroup = create_cgroupv2(container);
+    String cgroupFailure;
+    container->cgroup = create_cgroupv2(container, &cgroupFailure);
     if (container->cgroup < 0)
     {
+      if (container->plan.config.isolatedChildMemoryMB != 0 || cgroupFailure.size() > 0)
+      {
+        basics_log("createContainer rejected uuid=%llu reason=%s\n",
+                   (unsigned long long)container->plan.uuid,
+                   cgroupFailure.size() > 0 ? cgroupFailure.c_str() :
+                                              "isolated child cgroup creation failed");
+        cleanupContainerAfterFailedCreate(container);
+        container = nullptr;
+        return;
+      }
       basics_log("createContainer proceeding without cgroup uuid=%llu\n", (unsigned long long)container->plan.uuid);
     }
 
@@ -8685,6 +9096,17 @@ public:
       }
 
       int execParamsFD = -1;
+      Vector<int32_t> execIsolatedChildCgroups;
+      execIsolatedChildCgroups.reserve(container->isolatedChildCgroups.size());
+      for (int inheritedFD : container->isolatedChildCgroups)
+      {
+        int execFD = inheritedFD;
+        if (moveContainerExecDescriptorAboveMinimum(execFD, &execDescriptorFailure) == false)
+        {
+          failStartup("move isolated child cgroup fd failed", &execDescriptorFailure);
+        }
+        execIsolatedChildCgroups.push_back(execFD);
+      }
       if (exposeNeuronSocket)
       {
         ContainerParameters parameters;
@@ -8697,6 +9119,7 @@ public:
         parameters.memoryMB = container->plan.config.memoryMB;
         parameters.storageMB = container->plan.config.storageMB;
         parameters.nLogicalCores = uint16_t(applicationSharedCPUCoreHint(container->plan.config));
+        parameters.isolatedChildCgroups = execIsolatedChildCgroups;
         parameters.cpuMode = container->plan.config.cpuMode;
         parameters.requestedCPUMillis = applicationRequestedCPUMillis(container->plan.config);
         if (container->plan.usesIsolatedCPUs())
@@ -8868,7 +9291,11 @@ public:
         }
       }
 
-      if (closeAllContainerExecDescriptorsExcept(execNeuronFD, execParamsFD, &execDescriptorFailure) == false)
+      if (closeAllContainerExecDescriptorsExcept(
+              execNeuronFD,
+              execParamsFD,
+              execIsolatedChildCgroups,
+              &execDescriptorFailure) == false)
       {
         basics_log("startContainer failed to sanitize inherited exec fds uuid=%llu reason=%s\n",
                    (unsigned long long)container->plan.uuid,
@@ -9259,7 +9686,18 @@ public:
 
   static void killContainer(Container *container)
   {
-    if (container->cgroup >= 0)
+    if (container->plan.config.isolatedChildMemoryMB != 0)
+    {
+      String path;
+      prodigyContainerCgroupSlicePath(container->name, path);
+      const int slice = Filesystem::openDirectoryAt(-1, path);
+      if (slice >= 0)
+      {
+        Filesystem::openWriteAtClose(slice, "cgroup.kill"_ctv, "1"_ctv);
+        Filesystem::close(slice);
+      }
+    }
+    else if (container->cgroup >= 0)
     {
       Filesystem::openWriteAtClose(container->cgroup, "cgroup.kill"_ctv, "1"_ctv);
     }
@@ -9461,6 +9899,14 @@ public:
       close(container->cgroup);
       container->cgroup = -1;
     }
+    for (int fd : container->isolatedChildCgroups)
+    {
+      if (fd >= 0)
+      {
+        close(fd);
+      }
+    }
+    container->isolatedChildCgroups.clear();
 
     bool waitingForCloseEvent = false;
 
@@ -9545,6 +9991,18 @@ public:
 
     // destroy cgroup tree
     prodigyContainerCgroupSlicePath(container->name, path);
+    for (uint32_t index = 0;
+         index + 1 < container->plan.config.maxPids &&
+         container->plan.config.isolatedChildMemoryMB != 0;
+         index += 1)
+    {
+      String child;
+      child.snprintf<"{}/isolated.{itoa}"_ctv>(path, index);
+      rmdir(child.c_str());
+    }
+    String leaf;
+    leaf.snprintf<"{}/leaf"_ctv>(path);
+    rmdir(leaf.c_str());
     rmdir(path.c_str());
 
     std::fprintf(stderr, "destroyContainer cgroup-teardown-end uuid=%llu waitingForCloseEvent=%d\n",

@@ -8,6 +8,8 @@
 
 `opinionated/pairings.h` and `opinionated/aegis_stream.h` are the higher-level paired-service layer. They keep the transport-neutral Aegis contract in the SDK, but bind it onto the existing fast-path `TCPStream` substrate for C++ containers. This surface requires Basics and is installed through Prodigy's shipped `depos` depofile inventory.
 
+`opinionated/dns_wire.h` defines the bounded resolver-service resolve, cancel, and authenticated-session protocol. `opinionated/dns_client.h` is the thin `AsyncDnsClient` adapter: each valid named lookup retains one logical request and may replay its frame after an authenticated reconnect, while numeric literals complete locally. The application supplies only a send hook and a deadline-change hook, then forwards pairing selection, stream connection/loss, and decrypted service frames. The client has no resolver backend, cache, singleflight, c-ares channel, fallback, thread, or blocking wait.
+
 Installed-package boundary:
 
 - the standalone C++ package exports `Prodigy::SdkCpp` and `Prodigy::SdkCppOpinionated`

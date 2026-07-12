@@ -9,6 +9,16 @@
 class ProdigyDefaultDNSProvider final : public ProdigyDNSProvider {
 public:
 
+  void configureRuntime(ProdigyDNSProviderRuntime requestedRuntime) override
+  {
+    ProdigyDNSProvider::configureRuntime(requestedRuntime);
+    cloudflare.configureRuntime(requestedRuntime);
+    route53.configureRuntime(requestedRuntime);
+    gcp.configureRuntime(requestedRuntime);
+    azure.configureRuntime(requestedRuntime);
+    vultr.configureRuntime(requestedRuntime);
+  }
+
   bool supportsProvider(const String& provider) const override
   {
     return cloudflare.supportsProvider(provider) ||
@@ -18,48 +28,48 @@ public:
            vultr.supportsProvider(provider);
   }
 
-  bool upsert(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> upsert(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
   {
     ProdigyDNSProvider *provider = resolve(record.provider);
     if (provider == nullptr)
     {
       failure.assign("DNS provider is not configured"_ctv);
-      return false;
+      co_return false;
     }
-    return provider->upsert(record, credential, failure);
+    co_return co_await provider->upsert(coro, record, credential, failure);
   }
 
-  bool remove(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> remove(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
   {
     ProdigyDNSProvider *provider = resolve(record.provider);
     if (provider == nullptr)
     {
       failure.assign("DNS provider is not configured"_ctv);
-      return false;
+      co_return false;
     }
-    return provider->remove(record, credential, failure);
+    co_return co_await provider->remove(coro, record, credential, failure);
   }
 
-  bool presentTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> presentTXT(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
   {
     ProdigyDNSProvider *provider = resolve(record.provider);
     if (provider == nullptr)
     {
       failure.assign("DNS provider is not configured"_ctv);
-      return false;
+      co_return false;
     }
-    return provider->presentTXT(record, credential, failure);
+    co_return co_await provider->presentTXT(coro, record, credential, failure);
   }
 
-  bool cleanupTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> cleanupTXT(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
   {
     ProdigyDNSProvider *provider = resolve(record.provider);
     if (provider == nullptr)
     {
       failure.assign("DNS provider is not configured"_ctv);
-      return false;
+      co_return false;
     }
-    return provider->cleanupTXT(record, credential, failure);
+    co_return co_await provider->cleanupTXT(coro, record, credential, failure);
   }
 
 private:

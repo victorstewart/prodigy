@@ -1296,16 +1296,32 @@ static inline void prodigyRenderClusterUUIDTagValue(uint128_t clusterUUID, Strin
   value.assignItoh(clusterUUID);
 }
 
-static inline bool prodigyEnsureCloudMachineTagged(BrainIaaS& iaas, uint128_t clusterUUID, const ClusterMachine& clusterMachine, String *failure = nullptr)
+static inline void prodigyEnsureCloudMachineTagged(CoroutineStack *coro,
+                                                   BrainIaaS& iaas,
+                                                   uint128_t clusterUUID,
+                                                   const ClusterMachine& clusterMachine,
+                                                   bool& tagged,
+                                                   String *failure = nullptr)
 {
+  tagged = false;
   if (failure)
   {
     failure->clear();
   }
 
+  if (coro == nullptr)
+  {
+    if (failure)
+    {
+      failure->assign("cloud machine tagging coroutine required"_ctv);
+    }
+    co_return;
+  }
+
   if (clusterMachine.backing != ClusterMachineBacking::cloud)
   {
-    return true;
+    tagged = true;
+    co_return;
   }
 
   if (clusterMachine.cloud.cloudID.size() == 0)
@@ -1314,7 +1330,7 @@ static inline bool prodigyEnsureCloudMachineTagged(BrainIaaS& iaas, uint128_t cl
     {
       failure->assign("cloud machine missing cloudID"_ctv);
     }
-    return false;
+    co_return;
   }
 
   if (clusterUUID == 0)
@@ -1323,23 +1339,48 @@ static inline bool prodigyEnsureCloudMachineTagged(BrainIaaS& iaas, uint128_t cl
     {
       failure->assign("clusterUUID required for cloud machine tagging"_ctv);
     }
-    return false;
+    co_return;
   }
-
-  Machine machine = prodigyBuildMachineSnapshotFromClusterMachine(clusterMachine);
 
   String clusterUUIDTagValue = {};
   prodigyRenderClusterUUIDTagValue(clusterUUID, clusterUUIDTagValue);
 
   String tagFailure = {};
-  if (iaas.ensureProdigyMachineTags(clusterUUIDTagValue, &machine, tagFailure) == false)
+  if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+        iaas.ensureProdigyMachineTags(coro,
+                                      clusterUUIDTagValue,
+                                      clusterMachine.cloud.cloudID,
+                                      tagFailure);
+      }))
+  {
+    co_await coro->suspendAtIndex(suspendIndex);
+  }
+  if (tagFailure.empty() == false)
   {
     if (failure)
     {
-      *failure = tagFailure.size() > 0 ? tagFailure : "provider tag update failed"_ctv;
+      *failure = tagFailure;
     }
-    return false;
+    co_return;
   }
 
-  return true;
+  tagged = true;
+}
+
+// Precondition: the selected provider's tag implementation completes inline.
+static inline bool prodigyEnsureCloudMachineTaggedInline(BrainIaaS& iaas,
+                                                         uint128_t clusterUUID,
+                                                         const ClusterMachine& clusterMachine,
+                                                         String *failure = nullptr)
+{
+  CoroutineStack coro;
+  bool tagged = false;
+  prodigyEnsureCloudMachineTagged(&coro,
+                                  iaas,
+                                  clusterUUID,
+                                  clusterMachine,
+                                  tagged,
+                                  failure);
+  coro.co_consume();
+  return tagged;
 }

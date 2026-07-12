@@ -5,24 +5,14 @@
 
 #include <networking/ip.h>
 #include <services/prodigy.h>
+#include <switchboard/common/public.destination.h>
 
 constexpr static auto mothershipTunnelProviderMothershipSocketPath = "/run/prodigy/mothership.sock"_ctv;
 constexpr static auto mothershipTunnelProviderHostGatewaySocketPath = "/run/prodigy/mothership-tunnel-gateway.sock"_ctv;
 
 static inline bool prodigySystemEgressIPv4HostAddressIsDenied(uint32_t address)
 {
-  return isRFC1918Private4(htonl(address)) ||
-      (address >> 24) == 0 ||
-      (address >> 24) == 127 ||
-      (address >> 24) >= 224 ||
-      (address & 0xffff0000u) == 0xa9fe0000u ||
-      (address & 0xffc00000u) == 0x64400000u ||
-      (address & 0xffffff00u) == 0xc0000000u ||
-      (address & 0xffffff00u) == 0xc0000200u ||
-      (address & 0xffffff00u) == 0xc0586300u ||
-      (address & 0xfffe0000u) == 0xc6120000u ||
-      (address & 0xffffff00u) == 0xc6336400u ||
-      (address & 0xffffff00u) == 0xcb007100u;
+  return switchboardPublicDestinationIPv4(htonl(address)) == false;
 }
 
 static inline bool prodigySystemEgressIPv4Literal(const String& host, uint32_t& address)

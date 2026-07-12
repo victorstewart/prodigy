@@ -28,6 +28,242 @@ public:
   }
 };
 
+class ScriptedGcpPricingClient
+{
+public:
+
+  using Operation = ProdigyHostHttpOperation;
+  Operation::Callback callback;
+  Operation::Ticket ticket;
+  Vector<Operation::Request> requests;
+
+  static Operation::Ticket submit(void *context, Operation::Request&& request, Operation::Callback callback)
+  {
+    ScriptedGcpPricingClient& client = *static_cast<ScriptedGcpPricingClient *>(context);
+    client.ticket = {client.ticket.identifier + 1, 1};
+    client.callback = callback;
+    client.requests.push_back(std::move(request));
+    return client.ticket;
+  }
+
+  static bool cancel(void *, Operation::Ticket)
+  {
+    return true;
+  }
+
+  Operation::Submission submission(void)
+  {
+    return {this, submit, cancel};
+  }
+
+  void complete(const String& body,
+                MultiCurlClient::Status status = MultiCurlClient::Status::success,
+                long statusCode = 200)
+  {
+    Operation::Result result;
+    result.status = status;
+    result.statusCode = statusCode;
+    result.body.assign(body);
+    Operation::Callback completion = callback;
+    completion.function(completion.context, ticket, std::move(result));
+  }
+};
+
+static bool pricingRequestHasBearer(const MultiCurlClient::Request& request, const String& token)
+{
+  String expected;
+  expected.snprintf<"Bearer {}"_ctv>(token);
+  for (const MultiCurlClient::Header& header : request.headers)
+  {
+    if (header.name == "Authorization"_ctv && header.value == expected)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+static String paddedPricingPage(const String& nextPageToken)
+{
+  String page;
+  if (nextPageToken.empty())
+  {
+    page.assign("{}"_ctv);
+  }
+  else
+  {
+    page.append("{\"nextPageToken\":\""_ctv);
+    page.append(nextPageToken);
+    page.append("\"}"_ctv);
+  }
+  page.reserve(MothershipGcpPricingHttp::maximumResponseBytes);
+  const uint64_t padding = MothershipGcpPricingHttp::maximumResponseBytes - page.size();
+  std::memset(page.pend(), ' ', padding);
+  page.advance(padding);
+  return page;
+}
+
+static void testGcpPricingHttp(TestSuite& suite)
+{
+  const MultiCurlClient::TimePoint deadline = MultiCurlClient::Clock::now() + std::chrono::minutes(1);
+  ScriptedGcpPricingClient client;
+  CoroutineStack stack;
+  Vector<String> responses;
+  String failure;
+  MothershipGcpPricingHttp http(client.submission(), "pricing-token"_ctv, deadline);
+  http.fetchPages(&stack,
+                  "compute.googleapis.com"_ctv,
+                  "https://compute.googleapis.com/compute/v1/projects/p/zones/z/machineTypes"_ctv,
+                  responses,
+                  failure);
+  suite.expect(stack.hasSuspendedCoroutines() && client.requests.size() == 1,
+               "gcp_pricing_first_page_suspends");
+  if (client.requests.size() == 1)
+  {
+    const MultiCurlClient::Request& request = client.requests[0];
+    suite.expect(request.resolveHost == "compute.googleapis.com"_ctv &&
+                     request.authority == "compute.googleapis.com"_ctv &&
+                     request.originPolicy.requiredScheme == "https"_ctv &&
+                     request.originPolicy.requiredHost == "compute.googleapis.com"_ctv &&
+                     request.originPolicy.requiredAuthority == "compute.googleapis.com"_ctv &&
+                     request.originPolicy.requiredService == "443"_ctv &&
+                     request.originPolicy.requiredResolveHost == "compute.googleapis.com"_ctv,
+                 "gcp_pricing_compute_origin_pinned");
+    suite.expect(request.overallDeadline == deadline &&
+                     request.responseBytes == MothershipGcpPricingHttp::maximumResponseBytes &&
+                     pricingRequestHasBearer(request, "pricing-token"_ctv),
+                 "gcp_pricing_absolute_deadline_response_cap_and_token");
+  }
+  client.complete("{\"items\":[],\"nextPageToken\":\"next page\"}"_ctv);
+  suite.expect(stack.hasSuspendedCoroutines() && client.requests.size() == 2 &&
+                   client.requests[1].url ==
+                       "https://compute.googleapis.com/compute/v1/projects/p/zones/z/machineTypes?pageToken=next%20page"_ctv,
+               "gcp_pricing_paginates_with_encoded_token");
+  client.complete("{\"items\":[]}"_ctv);
+  suite.expect(stack.hasSuspendedCoroutines() == false && responses.size() == 2 && failure.empty(),
+               "gcp_pricing_pagination_completes");
+
+  ScriptedGcpPricingClient billingClient;
+  CoroutineStack billingStack;
+  MothershipGcpPricingHttp billingHttp(billingClient.submission(), "pricing-token"_ctv, deadline);
+  billingHttp.fetchPages(&billingStack,
+                         "cloudbilling.googleapis.com"_ctv,
+                         "https://cloudbilling.googleapis.com/v1/services/x/skus"_ctv,
+                         responses,
+                         failure);
+  suite.expect(billingClient.requests.size() == 1 &&
+                   billingClient.requests[0].originPolicy.requiredHost == "cloudbilling.googleapis.com"_ctv,
+               "gcp_pricing_billing_origin_pinned");
+  billingClient.complete("{}"_ctv);
+
+  ScriptedGcpPricingClient repeatedClient;
+  CoroutineStack repeatedStack;
+  MothershipGcpPricingHttp repeatedHttp(repeatedClient.submission(), "pricing-token"_ctv, deadline);
+  repeatedHttp.fetchPages(&repeatedStack,
+                          "compute.googleapis.com"_ctv,
+                          "https://compute.googleapis.com/list"_ctv,
+                          responses,
+                          failure);
+  repeatedClient.complete("{\"nextPageToken\":\"same\"}"_ctv);
+  repeatedClient.complete("{\"nextPageToken\":\"same\"}"_ctv);
+  suite.expect(repeatedClient.requests.size() == 2 &&
+                   failure == "GCP pricing page token repeated"_ctv,
+               "gcp_pricing_repeated_token_rejected");
+
+  ScriptedGcpPricingClient expiredClient;
+  CoroutineStack expiredStack;
+  MothershipGcpPricingHttp expiredHttp(expiredClient.submission(),
+                                       "pricing-token"_ctv,
+                                       MultiCurlClient::Clock::now() - std::chrono::seconds(1));
+  expiredHttp.fetchPages(&expiredStack,
+                         "compute.googleapis.com"_ctv,
+                         "https://compute.googleapis.com/list"_ctv,
+                         responses,
+                         failure);
+  suite.expect(expiredClient.requests.empty() &&
+                   failure == "GCP pricing survey deadline exceeded"_ctv,
+               "gcp_pricing_deadline_rejected_before_submission");
+
+  bytell_hash_set<String> seen;
+  seen.insert("seen"_ctv);
+  String oversizedToken;
+  for (uint32_t index = 0; index <= MothershipGcpPricingHttp::maximumPageTokenBytes; ++index)
+  {
+    oversizedToken.append('x');
+  }
+  suite.expect(MothershipGcpPricingHttp::pagePermitted(MothershipGcpPricingHttp::maximumPages,
+                                                       0,
+                                                       {},
+                                                       {}) == false &&
+                   MothershipGcpPricingHttp::pagePermitted(0,
+                                                           MothershipGcpPricingHttp::maximumTotalResponseBytes + 1,
+                                                           {},
+                                                           {}) == false &&
+                   MothershipGcpPricingHttp::pagePermitted(0, 0, oversizedToken, {}) == false &&
+                   MothershipGcpPricingHttp::pagePermitted(0, 0, "seen"_ctv, seen) == false,
+               "gcp_pricing_page_total_token_and_repeat_caps");
+
+  ScriptedGcpPricingClient aggregateClient;
+  CoroutineStack aggregateStack;
+  MothershipGcpPricingHttp aggregateHttp(aggregateClient.submission(), "pricing-token"_ctv, deadline);
+  Vector<String> computeResponses;
+  aggregateHttp.fetchPages(&aggregateStack,
+                           "compute.googleapis.com"_ctv,
+                           "https://compute.googleapis.com/list"_ctv,
+                           computeResponses,
+                           failure);
+  for (uint32_t pageIndex = 0; pageIndex < 4; ++pageIndex)
+  {
+    String nextPageToken;
+    if (pageIndex < 3)
+    {
+      nextPageToken.assign("compute-"_ctv);
+      nextPageToken.append(String(pageIndex + 1));
+    }
+    aggregateClient.complete(paddedPricingPage(nextPageToken));
+    if (failure.empty() == false || (pageIndex < 3 && aggregateStack.hasSuspendedCoroutines() == false))
+    {
+      basics_log("GCP pricing compute aggregate stopped page=%u failure=%s requests=%llu responses=%llu\n",
+                 pageIndex,
+                 failure.c_str(),
+                 (unsigned long long)aggregateClient.requests.size(),
+                 (unsigned long long)computeResponses.size());
+      break;
+    }
+  }
+  suite.expect(aggregateStack.hasSuspendedCoroutines() == false && computeResponses.size() == 4 &&
+                   failure.empty(),
+               "gcp_pricing_compute_pages_consume_shared_budget");
+
+  Vector<String> aggregateBillingResponses;
+  aggregateHttp.fetchPages(&aggregateStack,
+                           "cloudbilling.googleapis.com"_ctv,
+                           "https://cloudbilling.googleapis.com/list"_ctv,
+                           aggregateBillingResponses,
+                           failure);
+  for (uint32_t pageIndex = 0; pageIndex < 4; ++pageIndex)
+  {
+    String nextPageToken;
+    nextPageToken.assign("billing-"_ctv);
+    nextPageToken.append(String(pageIndex + 1));
+    aggregateClient.complete(paddedPricingPage(nextPageToken));
+    if (failure.empty() == false && pageIndex < 3)
+    {
+      basics_log("GCP pricing billing aggregate stopped page=%u failure=%s requests=%llu responses=%llu\n",
+                 pageIndex,
+                 failure.c_str(),
+                 (unsigned long long)aggregateClient.requests.size(),
+                 (unsigned long long)aggregateBillingResponses.size());
+      break;
+    }
+  }
+  suite.expect(aggregateClient.requests.size() == 8 &&
+                   aggregateBillingResponses.size() == 4 &&
+                   aggregateStack.hasSuspendedCoroutines() == false &&
+                   failure == "GCP pricing retained response limit exceeded"_ctv,
+               "gcp_pricing_exact_aggregate_cap_blocks_next_origin_request");
+}
+
 class ScopedEnvVar {
 private:
 
@@ -188,6 +424,8 @@ static bool parseJSON(const char *jsonText, String& storage, simdjson::dom::elem
 int main(void)
 {
   TestSuite suite = {};
+
+  testGcpPricingHttp(suite);
 
   {
     ProviderMachineOfferSurveyRequest request = {};

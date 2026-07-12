@@ -394,7 +394,7 @@ static bool wormholeEgressKeysEqual(const switchboard_wormhole_egress_key& lhs, 
 class NoopNeuronIaaS final : public NeuronIaaS {
 public:
 
-  void gatherSelfData(uint128_t& uuid, String& metro, bool& isBrain, EthDevice& eth, IPAddress& private4) override
+  void gatherSelfData(CoroutineStack *, uint128_t& uuid, String& metro, bool& isBrain, EthDevice& eth, IPAddress& private4) override
   {
     uuid = 0;
     metro.clear();
@@ -403,12 +403,6 @@ public:
     private4 = {};
   }
 
-  void downloadContainerToPath(CoroutineStack *coro, uint64_t deploymentID, const String& path) override
-  {
-    (void)coro;
-    (void)deploymentID;
-    (void)path;
-  }
 };
 
 class OverlayTestNeuron final : public Neuron {
@@ -730,7 +724,7 @@ static void testSystemEgressPolicyConstrainsIPv4(TestSuite& suite)
 
   container_network_policy policy = {};
   suite.expect(container.buildContainerNetworkPolicy(policy), "system_egress_policy_builds");
-  suite.expect(policy.egressAllowlistOnly == 1, "system_egress_policy_constrains_egress");
+  suite.expect(policy.mode == CONTAINER_NETWORK_DESTINATION_ALLOWLIST, "system_egress_policy_constrains_egress");
   suite.expect(policy.requiresPublic4 == 1, "system_egress_policy_requires_ipv4");
 
   thisNeuron = previousNeuron;
@@ -761,6 +755,7 @@ static void testContainerPeerEgressRouterDropsPacketsOverConfiguredMTU(TestSuite
   if (peerProgram.prog_fd >= 0)
   {
     container_network_policy networkPolicy = {};
+    networkPolicy.mode = CONTAINER_NETWORK_UNRESTRICTED;
     networkPolicy.interContainerMTU = 1280u;
     peerProgram.setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
 
@@ -815,7 +810,7 @@ static void testContainerPeerEgressRouterEnforcesSystemAllowlist(TestSuite& suit
   if (peerProgram.prog_fd >= 0)
   {
     container_network_policy networkPolicy = {};
-    networkPolicy.egressAllowlistOnly = 1;
+    networkPolicy.mode = CONTAINER_NETWORK_DESTINATION_ALLOWLIST;
     networkPolicy.interContainerMTU = 9000;
     peerProgram.setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
 
@@ -1167,6 +1162,7 @@ static void testContainerPeerEgressRouterEncapsulatesHostedIngress(TestSuite& su
   if (peerProgram.prog_fd >= 0)
   {
     container_network_policy networkPolicy = {};
+    networkPolicy.mode = CONTAINER_NETWORK_UNRESTRICTED;
     networkPolicy.requiresPublic4 = 1;
     networkPolicy.interContainerMTU = 9000;
     peerProgram.setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
@@ -1353,6 +1349,7 @@ static void testContainerPeerEgressRouterRewritesIPv4WormholeSource(TestSuite& s
   }
 
   container_network_policy networkPolicy = {};
+  networkPolicy.mode = CONTAINER_NETWORK_UNRESTRICTED;
   networkPolicy.requiresPublic4 = 1;
   networkPolicy.interContainerMTU = 9000;
   peerProgram.setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
@@ -1475,6 +1472,7 @@ static void testContainerPeerEgressRouterRoutesIPv6QuicHighSlotPortal(TestSuite&
   peerProgram.setArrayElement("lc_subnet"_ctv, 0, localSubnet);
 
   container_network_policy networkPolicy = {};
+  networkPolicy.mode = CONTAINER_NETWORK_UNRESTRICTED;
   networkPolicy.interContainerMTU = 9000u;
   peerProgram.setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
 

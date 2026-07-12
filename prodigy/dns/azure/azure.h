@@ -5,68 +5,72 @@
 class AzureDNSProvider : public ProdigyHTTPDNSProvider {
 public:
 
+  AzureDNSProvider()
+      : ProdigyHTTPDNSProvider("management.azure.com"_ctv)
+  {}
+
   bool supportsProvider(const String& provider) const override
   {
     return routableResourceDNSPartEquals(provider, "azure-dns"_ctv, false);
   }
 
-  bool upsert(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> upsert(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
   {
     String url = {};
     if (recordSetURL(record, credential, url, failure) == false)
     {
-      return false;
+      co_return false;
     }
     ProdigyDNSRecordPresence presence = {};
-    if (findRecord(record, credential, url, presence, failure) == false)
+    if (co_await findRecord(coro, record, credential, url, presence, failure) == false)
     {
-      return false;
+      co_return false;
     }
     if (presence == ProdigyDNSRecordPresence::exact)
     {
       failure.clear();
-      return true;
+      co_return true;
     }
     String value = {};
     if (prodigyDNSRecordSingleValue(record, value, failure) == false)
     {
-      return false;
+      co_return false;
     }
     Vector<String> values = {};
     values.push_back(value);
 
-    return putRecord(record, credential, url, values, failure);
+    co_return co_await putRecord(coro, record, credential, url, values, failure);
   }
 
-  bool remove(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> remove(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
   {
     String url = {};
     if (recordSetURL(record, credential, url, failure) == false)
     {
-      return false;
+      co_return false;
     }
     ProdigyDNSRecordPresence presence = {};
-    if (findRecord(record, credential, url, presence, failure) == false)
+    if (co_await findRecord(coro, record, credential, url, presence, failure) == false)
     {
-      return false;
+      co_return false;
     }
     if (presence == ProdigyDNSRecordPresence::missing)
     {
       failure.clear();
-      return true;
+      co_return true;
     }
 
-    return deleteRecord(record, credential, url, failure);
+    co_return co_await deleteRecord(coro, record, credential, url, failure);
   }
 
-  bool presentTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> presentTXT(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
   {
-    return changeTXT(false, record, credential, failure);
+    co_return co_await changeTXT(coro, false, record, credential, failure);
   }
 
-  bool cleanupTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> cleanupTXT(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
   {
-    return changeTXT(true, record, credential, failure);
+    co_return co_await changeTXT(coro, true, record, credential, failure);
   }
 
 private:
@@ -106,34 +110,34 @@ private:
     return true;
   }
 
-  bool changeTXT(bool removing, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
+  ProdigyHostTask<bool> changeTXT(CoroutineStack *coro, bool removing, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
   {
     String value = {};
     if (prodigyDNSRecordSingleTXTValue(record, value, failure) == false)
     {
-      return false;
+      co_return false;
     }
     String url = {};
     if (recordSetURL(record, credential, url, failure) == false)
     {
-      return false;
+      co_return false;
     }
     Vector<String> values = {};
     bool found = false;
-    if (loadRecord(record, credential, url, values, found, failure) == false)
+    if (co_await loadRecord(coro, record, credential, url, values, found, failure) == false)
     {
-      return false;
+      co_return false;
     }
     if (removing)
     {
       if (found == false || prodigyDNSRemoveProviderValue(record, values, value) == false)
       {
         failure.clear();
-        return true;
+        co_return true;
       }
       if (values.size() == 0)
       {
-        return deleteRecord(record, credential, url, failure);
+        co_return co_await deleteRecord(coro, record, credential, url, failure);
       }
     }
     else
@@ -141,97 +145,97 @@ private:
       if (prodigyDNSValuesContain(record, values, value))
       {
         failure.clear();
-        return true;
+        co_return true;
       }
       values.push_back(value);
     }
-    return putRecord(record, credential, url, values, failure);
+    co_return co_await putRecord(coro, record, credential, url, values, failure);
   }
 
-  bool putRecord(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, const String& url, const Vector<String>& values, String& failure)
+  ProdigyHostTask<bool> putRecord(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, const String& url, const Vector<String>& values, String& failure)
   {
     ProdigyDNSHTTPRequest request = {};
-    request.method.assign("PUT"_ctv);
+    request.method = MultiCurlClient::Method::put;
     request.url = url;
-    request.header("Content-Type: application/json");
-    if (prodigyDNSApplyBearerAuth(request, credential, failure) == false)
+    request.headers.push_back({"Content-Type"_ctv, "application/json"_ctv});
+    if (co_await prodigyDNSApplyBearerAuth(coro, request, credential, failure, runtime.operationDeadline) == false)
     {
-      return false;
+      co_return false;
     }
     prodigyDNSAppendAzureRecordSetJSON(request.body, record, values);
     String response = {};
     long httpCode = 0;
-    return acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "azure dns upsert failed");
+    co_return acceptHTTP(co_await sendHTTP(coro, request, response, httpCode, failure), httpCode, response, failure, "azure dns upsert failed");
   }
 
-  bool deleteRecord(const ProdigyDNSRecordBinding&, const ApiCredential& credential, const String& url, String& failure)
+  ProdigyHostTask<bool> deleteRecord(CoroutineStack *coro, const ProdigyDNSRecordBinding&, const ApiCredential& credential, const String& url, String& failure)
   {
     ProdigyDNSHTTPRequest request = {};
-    request.method.assign("DELETE"_ctv);
+    request.method = MultiCurlClient::Method::delete_;
     request.url = url;
-    if (prodigyDNSApplyBearerAuth(request, credential, failure) == false)
+    if (co_await prodigyDNSApplyBearerAuth(coro, request, credential, failure, runtime.operationDeadline) == false)
     {
-      return false;
+      co_return false;
     }
     String response = {};
     long httpCode = 0;
-    return acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "azure dns delete failed");
+    co_return acceptHTTP(co_await sendHTTP(coro, request, response, httpCode, failure), httpCode, response, failure, "azure dns delete failed");
   }
 
-  bool findRecord(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, const String& url, ProdigyDNSRecordPresence& presence, String& failure)
+  ProdigyHostTask<bool> findRecord(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, const String& url, ProdigyDNSRecordPresence& presence, String& failure)
   {
     presence = ProdigyDNSRecordPresence::missing;
     String recordValue = {};
     if (prodigyDNSRecordSingleValue(record, recordValue, failure) == false)
     {
-      return false;
+      co_return false;
     }
     Vector<String> values = {};
     bool found = false;
-    if (loadRecord(record, credential, url, values, found, failure) == false)
+    if (co_await loadRecord(coro, record, credential, url, values, found, failure) == false)
     {
-      return false;
+      co_return false;
     }
     if (found == false)
     {
       failure.clear();
-      return true;
+      co_return true;
     }
     if (values.size() != 1 || prodigyDNSProviderValueEquals(record, values[0], recordValue) == false)
     {
-      return prodigyDNSExistingRecordConflict(failure);
+      co_return prodigyDNSExistingRecordConflict(failure);
     }
     presence = ProdigyDNSRecordPresence::exact;
     failure.clear();
-    return true;
+    co_return true;
   }
 
-  bool loadRecord(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, const String& url, Vector<String>& values, bool& found, String& failure)
+  ProdigyHostTask<bool> loadRecord(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, const String& url, Vector<String>& values, bool& found, String& failure)
   {
     ProdigyDNSHTTPRequest request = {};
-    request.method.assign("GET"_ctv);
+    request.method = MultiCurlClient::Method::get;
     request.url = url;
-    if (prodigyDNSApplyBearerAuth(request, credential, failure) == false)
+    if (co_await prodigyDNSApplyBearerAuth(coro, request, credential, failure, runtime.operationDeadline) == false)
     {
-      return false;
+      co_return false;
     }
     String response = {};
     long httpCode = 0;
-    if (sendHTTP(request, response, httpCode, failure) == false)
+    if (co_await sendHTTP(coro, request, response, httpCode, failure) == false)
     {
-      return false;
+      co_return false;
     }
     if (httpCode == 404)
     {
       values.clear();
       found = false;
       failure.clear();
-      return true;
+      co_return true;
     }
     if (acceptHTTP(true, httpCode, response, failure, "azure dns get failed") == false)
     {
-      return false;
+      co_return false;
     }
-    return prodigyDNSCollectAzureRecordValues(response, record, values, found, failure);
+    co_return prodigyDNSCollectAzureRecordValues(response, record, values, found, failure);
   }
 };

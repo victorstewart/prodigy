@@ -983,8 +983,14 @@ int main(void)
       MothershipProdigyCluster malformedEndpointCluster = tunnelCluster;
       malformedEndpointCluster.mothershipConnectivity.tunnelProvider.dialEndpoint = "gateway.example.net"_ctv;
       tunnelConfigureOK = mothership.unitTestConfigureClusterSocket(malformedEndpointCluster, remoteCandidates, &failure);
-      suite.expect(tunnelConfigureOK, "tunnel_provider_configure_accepts_nonempty_endpoint_metadata");
-      suite.expect(mothership.unitTestConnectConfiguredSocket(failure) == false && failure.equal("tunnelProvider gateway endpoint invalid: endpoint must be host:port"_ctv), "tunnel_provider_connect_malformed_endpoint_fails_closed");
+      suite.expect(tunnelConfigureOK == false, "tunnel_provider_configure_rejects_malformed_endpoint");
+      suite.expect(failure.equal("endpoint must be host:port"_ctv), "tunnel_provider_configure_malformed_endpoint_failure_reason");
+
+      MothershipProdigyCluster mismatchedPortCluster = tunnelCluster;
+      mismatchedPortCluster.mothershipConnectivity.tunnelProvider.egress.port = 8443;
+      tunnelConfigureOK = mothership.unitTestConfigureClusterSocket(mismatchedPortCluster, remoteCandidates, &failure);
+      suite.expect(tunnelConfigureOK == false, "tunnel_provider_configure_rejects_mismatched_egress_port");
+      suite.expect(failure.equal("mothership tunnel-provider dial and egress endpoints disagree"_ctv), "tunnel_provider_configure_mismatched_egress_port_failure_reason");
 
       MothershipProdigyCluster malformedAuthCluster = tunnelCluster;
       malformedAuthCluster.mothershipConnectivity.tunnelProvider.clientAuth.clientKeyPem.assign("not-a-key"_ctv);
@@ -1183,9 +1189,9 @@ int main(void)
       MothershipTunnelProviderSpec& provider = gatewayCluster.mothershipConnectivity.tunnelProvider;
       provider.artifactSha256 = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv;
       provider.artifactBytes = 128;
-      provider.dialEndpoint.snprintf<"127.0.0.1:{itoa}"_ctv>(unsigned(gatewayListener.port));
+      provider.dialEndpoint.snprintf<"gateway.example.net:{itoa}"_ctv>(unsigned(gatewayListener.port));
       provider.egress.address4 = 0x01010101;
-      provider.egress.port = 443;
+      provider.egress.port = gatewayListener.port;
       MothershipTunnelGatewayAuth gatewayAuth = {};
       MothershipTunnelGatewayTLSContext gatewayTLS = {};
       bool gatewayTLSReady = mothershipGenerateTunnelGatewayAuth(provider.clientAuth, gatewayAuth, &gatewayFailure) && gatewayTLS.configure(gatewayAuth, &gatewayFailure);
@@ -1297,7 +1303,10 @@ int main(void)
             });
 
             MothershipSocket idleSocket = {};
-            bool idleConnected = idleSocket.configureCluster(gatewayCluster, &failure) && idleSocket.connect() == 0;
+            bool idleConfigured = idleSocket.configureCluster(gatewayCluster, &failure);
+            suite.expect(idleConfigured && idleSocket.unitTestTunnelGatewayAddress().equal("1.1.1.1"_ctv), "tunnel_gateway_idle_config_uses_declared_egress_literal");
+            idleSocket.unitTestOverrideTunnelGatewayAddress("127.0.0.1"_ctv);
+            bool idleConnected = idleConfigured && idleSocket.connect() == 0;
             suite.expect(idleConnected, "tunnel_gateway_idle_client_connects");
             if (idleConnected)
             {
@@ -1307,7 +1316,7 @@ int main(void)
             else
             {
               int unblockFD = -1;
-              if (mothershipOpenConnectedSocket("127.0.0.1"_ctv, gatewayListener.port, unblockFD))
+              if (mothershipOpenNumericConnectedSocket("127.0.0.1"_ctv, gatewayListener.port, unblockFD))
               {
                 ::close(unblockFD);
               }
@@ -1359,6 +1368,8 @@ int main(void)
 
         MothershipSocket tunnelSocket = {};
         bool configured = tunnelSocket.configureCluster(gatewayCluster, &failure);
+        suite.expect(configured && tunnelSocket.unitTestTunnelGatewayAddress().equal("1.1.1.1"_ctv), "tunnel_gateway_config_uses_declared_egress_literal");
+        tunnelSocket.unitTestOverrideTunnelGatewayAddress("127.0.0.1"_ctv);
         bool connected = configured && tunnelSocket.connect() == 0;
         suite.expect(connected, "tunnel_gateway_tls_client_connects_with_persisted_auth");
         bool echoed = false;
@@ -1373,7 +1384,7 @@ int main(void)
         {
           gatewayControlState.stopRequested.store(true);
           int unblockFD = -1;
-          if (mothershipOpenConnectedSocket("127.0.0.1"_ctv, gatewayListener.port, unblockFD))
+          if (mothershipOpenNumericConnectedSocket("127.0.0.1"_ctv, gatewayListener.port, unblockFD))
           {
             ::close(unblockFD);
           }

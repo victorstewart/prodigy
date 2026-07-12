@@ -29,6 +29,7 @@ public:
   Vector<String> destroyedCloudIDs;
   String destroyedClusterUUID;
   uint32_t destroyedClusterCount = 0;
+  String clusterDestroyFailure;
 
   void boot(void) override {}
   void spinMachines(CoroutineStack *coro, MachineLifetime lifetime, const MachineConfig& config, uint32_t count, bytell_hash_set<Machine *>& newMachines, String& error) override
@@ -40,22 +41,24 @@ public:
     (void)newMachines;
     error.clear();
   }
-  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines) override
+  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines, String& failure) override
   {
     (void)coro;
     (void)metro;
     (void)machines;
   }
-  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains) override
+  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains, String& failure) override
   {
     (void)coro;
     (void)selfUUID;
     (void)selfIsBrain;
     (void)brains;
   }
-  void hardRebootMachine(uint128_t uuid) override
+  void hardRebootMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
-    (void)uuid;
+    (void)coro;
+    (void)cloudID;
+    failure.clear();
   }
   void reportHardwareFailure(uint128_t uuid, const String& report) override
   {
@@ -67,20 +70,20 @@ public:
     (void)coro;
     (void)decommissionedIDs;
   }
-  void destroyMachine(Machine *machine) override
+  void destroyMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
-    if (machine != nullptr)
-    {
-      destroyedCloudIDs.push_back(machine->cloudID);
-    }
+    (void)coro;
+    failure.clear();
+    destroyedCloudIDs.push_back(cloudID);
   }
 
-  bool destroyClusterMachines(const String& clusterUUID, uint32_t& destroyed, String& error) override
+  void destroyClusterMachines(CoroutineStack *coro, const String& clusterUUID, uint32_t& destroyed, String& error) override
   {
+    (void)coro;
     destroyedClusterUUID = clusterUUID;
     destroyed = destroyedClusterCount;
-    error.clear();
-    return true;
+    error = clusterDestroyFailure;
+    co_return;
   }
 
   uint32_t supportedMachineKindsMask() const override
@@ -99,7 +102,7 @@ int main(void)
   cloudIDs.push_back("i-002"_ctv);
 
   String failure = {};
-  bool destroyed = mothershipDestroyProviderMachines(iaas, cloudIDs, &failure);
+  bool destroyed = mothershipDestroyProviderMachinesInline(iaas, cloudIDs, &failure);
   suite.expect(destroyed, "destroy_provider_machines_ok");
   suite.expect(failure.size() == 0, "destroy_provider_machines_no_failure");
   suite.expect(iaas.destroyedCloudIDs.size() == 2, "destroy_provider_machines_count");
@@ -109,21 +112,28 @@ int main(void)
   Vector<String> badCloudIDs = {};
   badCloudIDs.push_back(""_ctv);
   failure.clear();
-  bool rejected = mothershipDestroyProviderMachines(iaas, badCloudIDs, &failure);
+  bool rejected = mothershipDestroyProviderMachinesInline(iaas, badCloudIDs, &failure);
   suite.expect(rejected == false, "destroy_provider_machines_rejects_empty");
   suite.expect(failure == "cloudID required"_ctv, "destroy_provider_machines_rejects_empty_reason");
 
   iaas.destroyedClusterCount = 5;
   failure.clear();
   uint32_t destroyedClusterMachines = 0;
-  bool destroyedCluster = mothershipDestroyProviderClusterMachines(iaas, "0xabc123"_ctv, destroyedClusterMachines, &failure);
+  bool destroyedCluster = mothershipDestroyProviderClusterMachinesInline(iaas, "0xabc123"_ctv, destroyedClusterMachines, &failure);
   suite.expect(destroyedCluster, "destroy_provider_cluster_machines_ok");
   suite.expect(failure.size() == 0, "destroy_provider_cluster_machines_no_failure");
   suite.expect(iaas.destroyedClusterUUID == "0xabc123"_ctv, "destroy_provider_cluster_machines_uuid");
   suite.expect(destroyedClusterMachines == 5, "destroy_provider_cluster_machines_count");
 
+  iaas.clusterDestroyFailure.assign("provider cluster destroy failed"_ctv);
   failure.clear();
-  destroyedCluster = mothershipDestroyProviderClusterMachines(iaas, ""_ctv, destroyedClusterMachines, &failure);
+  destroyedCluster = mothershipDestroyProviderClusterMachinesInline(iaas, "0xabc123"_ctv, destroyedClusterMachines, &failure);
+  suite.expect(destroyedCluster == false, "destroy_provider_cluster_machines_propagates_failure");
+  suite.expect(failure == "provider cluster destroy failed"_ctv, "destroy_provider_cluster_machines_failure_reason");
+  iaas.clusterDestroyFailure.clear();
+
+  failure.clear();
+  destroyedCluster = mothershipDestroyProviderClusterMachinesInline(iaas, ""_ctv, destroyedClusterMachines, &failure);
   suite.expect(destroyedCluster == false, "destroy_provider_cluster_machines_rejects_empty");
   suite.expect(failure == "clusterUUID required"_ctv, "destroy_provider_cluster_machines_rejects_empty_reason");
 

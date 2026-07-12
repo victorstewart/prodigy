@@ -16,6 +16,7 @@ public:
   Vector<IPPrefix> addresses;
   Vector<Wormhole> wormholes;
   Vector<Whitehole> whiteholes;
+  ContainerNetworkAccess networkAccess = ContainerNetworkAccess::unrestricted;
   Vector<uint32_t> assignedGPUMemoryMBs;
   Vector<AssignedGPUDevice> assignedGPUDevices;
   uint8_t fragment;
@@ -483,6 +484,7 @@ public:
     plan.fragment = fragment;
     plan.wormholes = wormholes;
     plan.whiteholes = whiteholes;
+    plan.networkAccess = networkAccess;
     plan.useHostNetworkNamespace = dplan.useHostNetworkNamespace;
     plan.addresses = addresses;
     plan.assignedGPUMemoryMBs = assignedGPUMemoryMBs;

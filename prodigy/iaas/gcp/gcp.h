@@ -3,88 +3,110 @@
 #include <prodigy/iaas/iaas.h>
 #include <services/debug.h>
 #include <prodigy/iaas/bootstrap.ssh.h>
+#include <prodigy/iaas/gcp/gcp.cluster.destroy.h>
+#include <prodigy/iaas/gcp/gcp.elastic.address.h>
+#include <prodigy/iaas/gcp/gcp.labels.h>
+#include <prodigy/iaas/gcp/gcp.lifecycle.h>
+#include <prodigy/iaas/gcp/gcp.managed.template.h>
+#include <prodigy/iaas/gcp/gcp.provisioning.h>
 #include <prodigy/brain/base.h>
 #include <prodigy/cluster.machine.helpers.h>
+#include <prodigy/command.capture.h>
+#include <prodigy/host.http.operation.h>
 #include <prodigy/netdev.detect.h>
 #include <services/filesystem.h>
 #include <simdjson.h>
-#include <curl/curl.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <limits>
-#include <sys/wait.h>
 #include <unistd.h>
 
-class GcpHttp {
-public:
+constexpr static size_t gcpMetadataResponseBytes = 64 * 1024;
 
-  constexpr static long connectTimeoutMs = 3000L;
-  constexpr static long getTimeoutMs = 3000L;
-  constexpr static long sendTimeoutMs = 8000L;
+static inline MultiCurlClient::Request gcpMetadataRequest(
+    const String& path,
+    MultiCurlClient::TimePoint now = MultiCurlClient::Clock::now(),
+    MultiCurlClient::TimePoint operationDeadline = MultiCurlClient::TimePoint::max())
+{
+  MultiCurlClient::Request request = {};
+  request.url.assign("http://169.254.169.254"_ctv);
+  request.url.append(path);
+  request.resolveHost.assign("169.254.169.254"_ctv);
+  request.authority.assign("metadata.google.internal"_ctv);
+  request.httpPolicy = MultiCurlClient::HttpPolicy::requireHttp1;
+  request.family = AsyncDnsResolver::Family::ipv4;
+  request.requireTls = false;
+  request.connectTimeout = std::chrono::seconds(3);
+  const MultiCurlClient::TimePoint requestLimit = now + std::chrono::seconds(3);
+  request.overallDeadline = operationDeadline < requestLimit ? operationDeadline : requestLimit;
+  request.responseBytes = gcpMetadataResponseBytes;
+  request.headers.push_back({"Metadata-Flavor"_ctv, "Google"_ctv});
+  request.originPolicy.requiredScheme.assign("http"_ctv);
+  request.originPolicy.requiredHost.assign("169.254.169.254"_ctv);
+  request.originPolicy.requiredAuthority.assign("metadata.google.internal"_ctv);
+  request.originPolicy.requiredService.assign("80"_ctv);
+  request.originPolicy.requiredResolveHost.assign("169.254.169.254"_ctv);
+  return request;
+}
 
-  static bool ensureGlobalInit(void);
-  static void populateTransportFailure(CURLcode rc, const char *errorBuffer, String *transportFailure);
-  static bool get(const char *url, const struct curl_slist *headers, String& out, long *httpStatus = nullptr, String *transportFailure = nullptr);
-  static bool send(const char *method, const char *url, const struct curl_slist *headers, const String& body, String& out, long *httpStatus = nullptr, String *transportFailure = nullptr);
+static inline bool gcpSuccessfulResponse(const MultiCurlClient::Result& result)
+{
+  return result.status == MultiCurlClient::Status::success &&
+         result.statusCode >= 200 && result.statusCode < 300;
+}
 
-  class MultiRequest {
-  public:
-
-    CURL *easy = nullptr;
-    struct curl_slist *headers = nullptr;
-    void *context = nullptr;
-    String method = {};
-    String url = {};
-    String body = {};
-    String response = {};
-    String transportFailure = {};
-    long timeoutMs = sendTimeoutMs;
-    long httpStatus = 0;
-    CURLcode curlCode = CURLE_OK;
-    bool completed = false;
-    bool added = false;
-
-    void resetResult(void);
-    void clearTransport(void);
-    ~MultiRequest();
-  };
-
-  class MultiClient {
-  private:
-
-    CURLM *multi = nullptr;
-    Vector<MultiRequest *> completed = {};
-    uint32_t inFlight = 0;
-
-    static size_t writeResponse(char *ptr, size_t size, size_t nmemb, void *userdata);
-    void collectCompleted(void);
-
-  public:
-
-    bool init(void);
-    bool start(MultiRequest& request);
-    bool pump(int timeoutMs);
-    MultiRequest *popCompleted(void);
-    uint32_t pendingCount(void) const;
-    ~MultiClient();
-  };
-};
-
-class GcpNeuronIaaS : public NeuronIaaS {
-public:
-
-  void gatherSelfData(uint128_t& uuid, String& metro, bool& isBrain, EthDevice& eth, IPAddress& private4) override
+static inline void gcpHostRequest(ProdigyHostHttpOperation::Submission client,
+                              CoroutineStack *coro,
+                              MultiCurlClient::Request request,
+                              MultiCurlClient::Result& result,
+                              bool& success)
+{
+  success = false;
+  if (coro == nullptr || client.submit == nullptr || client.cancel == nullptr)
   {
-    // Runtime persistence owns the canonical brain UUID.
-    struct curl_slist *headers = nullptr;
-    headers = curl_slist_append(headers, "Metadata-Flavor: Google");
+    co_return;
+  }
 
-    uuid = 0;
+  ProdigyHostHttpOperation operation(client, *coro);
+  if (operation.submit(std::move(request)) == false)
+  {
+    co_return;
+  }
+  if (operation.mustSuspend())
+  {
+    co_await coro->suspend();
+  }
+  if (operation.hasResult() == false)
+  {
+    co_return;
+  }
+  result = operation.takeResult();
+  success = gcpSuccessfulResponse(result);
+}
 
-    String zone;
-    GcpHttp::get("http://metadata.google.internal/computeMetadata/v1/instance/zone", headers, zone);
-    // zone like: projects/123456/zones/us-central1-a -> metro = full zone (us-central1-a)
+static inline void gcpReadNeuronStartupMetro(ProdigyHostHttpOperation::Submission client,
+                                             CoroutineStack *coro,
+                                             String& metro)
+{
+  metro.clear();
+  if (coro == nullptr)
+  {
+    co_return;
+  }
+
+  MultiCurlClient::Result result = {};
+  bool success = false;
+  if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+        gcpHostRequest(client, coro, gcpMetadataRequest("/computeMetadata/v1/instance/zone"_ctv), result, success);
+      }))
+  {
+    co_await coro->suspendAtIndex(suspendIndex);
+  }
+  if (success)
+  {
+    String& zone = result.body;
+    // Zone metadata ends in the full metro name, for example us-central1-a.
     int64_t slash = -1;
     for (int64_t index = int64_t(zone.size()) - 1; index >= 0; --index)
     {
@@ -94,10 +116,34 @@ public:
         break;
       }
     }
-
     metro = (slash >= 0)
-                ? zone.substr(uint64_t(slash + 1), zone.size() - uint64_t(slash + 1), Copy::no)
-                : zone;
+                ? zone.substr(uint64_t(slash + 1), zone.size() - uint64_t(slash + 1), Copy::yes)
+                : std::move(zone);
+  }
+}
+
+class GcpNeuronIaaS : public NeuronIaaS {
+public:
+
+  void gatherSelfData(CoroutineStack *coro, uint128_t& uuid, String& metro, bool& isBrain, EthDevice& eth, IPAddress& private4) override
+  {
+    // Runtime persistence owns the canonical brain UUID.
+    uuid = 0;
+    if (providerServices.http)
+    {
+      if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+            gcpReadNeuronStartupMetro(providerServices.http, coro, metro);
+          }))
+      {
+        co_await coro->suspendAtIndex(suspendIndex);
+      }
+    }
+    else
+    {
+      metro.clear();
+    }
+    // Runtime-aware bootstrap state owns the brain role; provider metadata does not.
+    isBrain = false;
 
     // Network: use EthDevice to compute gateway and private IPv4
     String deviceName;
@@ -109,21 +155,13 @@ public:
     eth.setDevice(deviceName);
     private4.is6 = false;
     private4.v4 = eth.getPrivate4();
-
-    // Brain role via instance attribute "brain" == "true"
-    String brainAttr;
-    GcpHttp::get("http://metadata.google.internal/computeMetadata/v1/instance/attributes/brain", headers, brainAttr);
-    isBrain = (brainAttr.size() > 0 && (brainAttr[0] == '1' || brainAttr == "true"_ctv));
-
-    curl_slist_free_all(headers);
   }
 
-  void downloadContainerToPath(CoroutineStack *coro, uint64_t deploymentID, const String& path) override {}
 };
 
 uint32_t gcpHashRackIdentity(std::string_view s);
 bool gcpGetNestedElement(simdjson::dom::element root, std::initializer_list<std::string_view> path, simdjson::dom::element& value);
-bool gcpExtractZoneName(std::string_view zoneURL, String& zoneText);
+bool gcpExtractZoneName(const String& zoneURL, String& zoneText);
 uint32_t gcpExtractRackUUID(simdjson::dom::element inst, const String& zoneText);
 
 class GcpBrainIaaS : public BrainIaaS {
@@ -143,6 +181,17 @@ private:
   int64_t tokenExpiryMs {0};
   int64_t tokenResolvedAtMs {0};
   String lastAuthFailure;
+  bytell_hash_map<String, MachineSchemaCpuCapability> validationMachineCapabilities;
+  Vector<String> validationZoneCpuPlatforms;
+  bool spotTerminationCheckActive = false;
+  bool validationAuthReady = false;
+  bool validationZoneCpuPlatformsReady = false;
+  uint32_t inventoryOperations = 0;
+  uint32_t provisioningOperations = 0;
+  uint32_t lifecycleOperations = 0;
+  uint32_t labelOperations = 0;
+  uint32_t clusterDestroyOperations = 0;
+  uint32_t elasticOperations = 0;
 
   static void appendPercentEncoded(String& output, const String& value)
   {
@@ -307,6 +356,290 @@ private:
 
 public:
 
+  constexpr static size_t metadataResponseBytes = gcpMetadataResponseBytes;
+  constexpr static size_t spotPageResponseBytes = 4 * 1024 * 1024;
+  constexpr static size_t spotCheckMaxPages = 256;
+  constexpr static size_t spotCheckMaxResultsPerPage = 500;
+  constexpr static size_t spotCheckMaxDecommissionedIDs = spotCheckMaxPages * spotCheckMaxResultsPerPage;
+  constexpr static size_t spotPageTokenBytes = 2048;
+  constexpr static std::chrono::seconds spotCheckTimeout = std::chrono::seconds(15);
+  constexpr static size_t inventoryPageResponseBytes = 8 * 1024 * 1024;
+  constexpr static size_t inventoryMaxPages = 256;
+  constexpr static size_t inventoryMaxResultsPerPage = 500;
+  constexpr static size_t inventoryMaxInstances = inventoryMaxPages * inventoryMaxResultsPerPage;
+  constexpr static size_t inventoryPageTokenBytes = 2048;
+  constexpr static std::chrono::seconds inventoryTimeout = std::chrono::seconds(15);
+  constexpr static size_t validationResponseBytes = 1024 * 1024;
+
+  static MultiCurlClient::TimePoint requestDeadline(MultiCurlClient::TimePoint now,
+                                                    MultiCurlClient::TimePoint operationDeadline)
+  {
+    const MultiCurlClient::TimePoint requestLimit = now + std::chrono::seconds(3);
+    return operationDeadline < requestLimit ? operationDeadline : requestLimit;
+  }
+
+  static MultiCurlClient::Request validationRequest(const String& url,
+                                                    const String& host,
+                                                    const String& accessToken,
+                                                    MultiCurlClient::Method method,
+                                                    const String *body,
+                                                    MultiCurlClient::TimePoint now,
+                                                    MultiCurlClient::TimePoint operationDeadline)
+  {
+    MultiCurlClient::Request request = {};
+    request.url = url;
+    request.resolveHost = host;
+    request.authority = host;
+    request.method = method;
+    request.family = AsyncDnsResolver::Family::ipv4;
+    request.caSource = MultiCurlClient::CaSource::system;
+    request.connectTimeout = std::chrono::seconds(3);
+    MultiCurlClient::TimePoint requestLimit = now + (method == MultiCurlClient::Method::get ? std::chrono::seconds(3) : std::chrono::seconds(8));
+    request.overallDeadline = operationDeadline < requestLimit ? operationDeadline : requestLimit;
+    request.responseBytes = validationResponseBytes;
+    String authorization = {};
+    authorization.snprintf<"Bearer {}"_ctv>(accessToken);
+    request.headers.push_back({"Authorization"_ctv, std::move(authorization)});
+    if (body)
+    {
+      request.body = *body;
+      request.headers.push_back({"Content-Type"_ctv, "application/json"_ctv});
+    }
+    request.originPolicy.requiredScheme.assign("https"_ctv);
+    request.originPolicy.requiredHost = host;
+    request.originPolicy.requiredAuthority = host;
+    request.originPolicy.requiredService.assign("443"_ctv);
+    request.originPolicy.requiredResolveHost = host;
+    return request;
+  }
+
+  static MultiCurlClient::Request computeValidationRequest(const String& url,
+                                                           const String& accessToken,
+                                                           MultiCurlClient::TimePoint now,
+                                                           MultiCurlClient::TimePoint operationDeadline)
+  {
+    return validationRequest(url, "compute.googleapis.com"_ctv, accessToken,
+                             MultiCurlClient::Method::get, nullptr, now, operationDeadline);
+  }
+
+  static MultiCurlClient::Request iamValidationRequest(const String& url,
+                                                       const String& host,
+                                                       const String& accessToken,
+                                                       const String& body,
+                                                       MultiCurlClient::TimePoint now,
+                                                       MultiCurlClient::TimePoint operationDeadline)
+  {
+    return validationRequest(url, host, accessToken, MultiCurlClient::Method::post,
+                             &body, now, operationDeadline);
+  }
+
+  static bool canRequestSpotPage(size_t requestedPages,
+                                 size_t decommissionedIDs,
+                                 const String& pageToken,
+                                 const bytell_hash_set<String>& requestedPageTokens)
+  {
+    return requestedPages < spotCheckMaxPages &&
+           decommissionedIDs < spotCheckMaxDecommissionedIDs &&
+           pageToken.size() <= spotPageTokenBytes &&
+           requestedPageTokens.contains(pageToken) == false;
+  }
+
+  static MultiCurlClient::Request metadataRequest(const String& path,
+                                                  MultiCurlClient::TimePoint now = MultiCurlClient::Clock::now(),
+                                                  MultiCurlClient::TimePoint operationDeadline = MultiCurlClient::TimePoint::max())
+  {
+    return gcpMetadataRequest(path, now, operationDeadline);
+  }
+
+  static MultiCurlClient::Request spotInstancesRequest(const String& project,
+                                                       const String& instanceZone,
+                                                       const String& accessToken,
+                                                       const String& pageToken,
+                                                       MultiCurlClient::TimePoint now = MultiCurlClient::Clock::now(),
+                                                       MultiCurlClient::TimePoint operationDeadline = MultiCurlClient::TimePoint::max())
+  {
+    MultiCurlClient::Request request = {};
+    request.url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances?filter=labels.app%3Aprodigy&maxResults=500&fields=items(id,labels,scheduling(preemptible,provisioningModel),status),nextPageToken"_ctv>(project, instanceZone);
+    appendPageTokenQuery(request.url, pageToken);
+    request.resolveHost.assign("compute.googleapis.com"_ctv);
+    request.authority.assign("compute.googleapis.com"_ctv);
+    request.family = AsyncDnsResolver::Family::ipv4;
+    request.caSource = MultiCurlClient::CaSource::system;
+    request.connectTimeout = std::chrono::seconds(3);
+    request.overallDeadline = requestDeadline(now, operationDeadline);
+    request.responseBytes = spotPageResponseBytes;
+    String authorization = {};
+    authorization.snprintf<"Bearer {}"_ctv>(accessToken);
+    request.headers.push_back({"Authorization"_ctv, std::move(authorization)});
+    request.originPolicy.requiredScheme.assign("https"_ctv);
+    request.originPolicy.requiredHost.assign("compute.googleapis.com"_ctv);
+    request.originPolicy.requiredAuthority.assign("compute.googleapis.com"_ctv);
+    request.originPolicy.requiredService.assign("443"_ctv);
+    request.originPolicy.requiredResolveHost.assign("compute.googleapis.com"_ctv);
+    return request;
+  }
+
+  static MultiCurlClient::Request inventoryInstancesRequest(const String& project,
+                                                            const String& instanceZone,
+                                                            const String& accessToken,
+                                                            const String& pageToken,
+                                                            MultiCurlClient::TimePoint now = MultiCurlClient::Clock::now(),
+                                                            MultiCurlClient::TimePoint operationDeadline = MultiCurlClient::TimePoint::max())
+  {
+    MultiCurlClient::Request request = {};
+    request.url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances?filter=labels.app%3Aprodigy&maxResults=500&fields=items(id,creationTimestamp,labels,networkInterfaces(networkIP,ipv6Address,accessConfigs(natIP,externalIpv6)),zone,scheduling(preemptible,provisioningModel),reservationAffinity(consumeReservationType),resourceStatus(physicalHost,physicalHostTopology(cluster,block,subblock)),disks(boot,initializeParams(sourceImage),source)),nextPageToken"_ctv>(project, instanceZone);
+    appendPageTokenQuery(request.url, pageToken);
+    request.resolveHost.assign("compute.googleapis.com"_ctv);
+    request.authority.assign("compute.googleapis.com"_ctv);
+    request.family = AsyncDnsResolver::Family::ipv4;
+    request.caSource = MultiCurlClient::CaSource::system;
+    request.connectTimeout = std::chrono::seconds(3);
+    request.overallDeadline = requestDeadline(now, operationDeadline);
+    request.responseBytes = inventoryPageResponseBytes;
+    String authorization = {};
+    authorization.snprintf<"Bearer {}"_ctv>(accessToken);
+    request.headers.push_back({"Authorization"_ctv, std::move(authorization)});
+    request.originPolicy.requiredScheme.assign("https"_ctv);
+    request.originPolicy.requiredHost.assign("compute.googleapis.com"_ctv);
+    request.originPolicy.requiredAuthority.assign("compute.googleapis.com"_ctv);
+    request.originPolicy.requiredService.assign("443"_ctv);
+    request.originPolicy.requiredResolveHost.assign("compute.googleapis.com"_ctv);
+    return request;
+  }
+
+  static bool canRequestInventoryPage(size_t requestedPages,
+                                      size_t instances,
+                                      const String& pageToken,
+                                      const bytell_hash_set<String>& requestedPageTokens)
+  {
+    return requestedPages < inventoryMaxPages &&
+           instances < inventoryMaxInstances &&
+           pageToken.size() <= inventoryPageTokenBytes &&
+           requestedPageTokens.contains(pageToken) == false;
+  }
+
+  template <typename Visitor>
+  static void readInventoryPages(ProdigyHostHttpOperation::Submission client,
+                                 CoroutineStack *coro,
+                                 String project,
+                                 String instanceZone,
+                                 String accessToken,
+                                 MultiCurlClient::TimePoint deadline,
+                                 Visitor visitor,
+                                 String& failure)
+  {
+    failure.clear();
+    if (coro == nullptr || client.submit == nullptr || client.cancel == nullptr)
+    {
+      failure.assign("gcp inventory HTTP client unavailable"_ctv);
+      co_return;
+    }
+
+    String nextPageToken = {};
+    bytell_hash_set<String> requestedPageTokens = {};
+    size_t requestedPages = 0;
+    size_t instances = 0;
+    for (;;)
+    {
+      if (MultiCurlClient::Clock::now() >= deadline)
+      {
+        failure.assign("gcp inventory deadline exceeded"_ctv);
+        co_return;
+      }
+      if (requestedPages >= inventoryMaxPages || instances >= inventoryMaxInstances)
+      {
+        failure.assign("gcp inventory result limit exceeded"_ctv);
+        co_return;
+      }
+      if (nextPageToken.size() > inventoryPageTokenBytes)
+      {
+        failure.assign("gcp inventory page token too large"_ctv);
+        co_return;
+      }
+      if (requestedPageTokens.contains(nextPageToken))
+      {
+        failure.assign("gcp inventory repeated page token"_ctv);
+        co_return;
+      }
+      requestedPageTokens.insert(nextPageToken);
+      ++requestedPages;
+
+      MultiCurlClient::Result result = {};
+      bool requestSucceeded = false;
+      if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+            gcpHostRequest(client,
+                       coro,
+                       inventoryInstancesRequest(project, instanceZone, accessToken,
+                                                 nextPageToken, MultiCurlClient::Clock::now(), deadline),
+                       result,
+                       requestSucceeded);
+          }))
+      {
+        co_await coro->suspendAtIndex(suspendIndex);
+      }
+      if (requestSucceeded == false)
+      {
+        failure.assign("gcp inventory request failed"_ctv);
+        co_return;
+      }
+
+      simdjson::dom::parser parser;
+      simdjson::dom::element document;
+      if (parser.parse(result.body.c_str(), result.body.size()).get(document))
+      {
+        failure.assign("gcp inventory response parse failed"_ctv);
+        co_return;
+      }
+
+      simdjson::dom::element items = {};
+      simdjson::error_code itemsError = document["items"].get(items);
+      if (itemsError && itemsError != simdjson::NO_SUCH_FIELD)
+      {
+        failure.assign("gcp inventory items field invalid"_ctv);
+        co_return;
+      }
+      if (!itemsError)
+      {
+        if (items.is_array() == false)
+        {
+          failure.assign("gcp inventory items field invalid"_ctv);
+          co_return;
+        }
+        for (auto instance : items.get_array())
+        {
+          if (++instances > inventoryMaxInstances ||
+              (isProdigyInstance(instance) && visitor(instance) == false))
+          {
+            failure.assign("gcp inventory result limit exceeded"_ctv);
+            co_return;
+          }
+        }
+      }
+
+      String pageToken;
+      simdjson::error_code pageTokenError = prodigyJSONString(document["nextPageToken"], pageToken);
+      if (pageTokenError == simdjson::NO_SUCH_FIELD)
+      {
+        co_return;
+      }
+      if (pageTokenError)
+      {
+        failure.assign("gcp inventory page token invalid"_ctv);
+        co_return;
+      }
+      nextPageToken.assign(pageToken);
+      if (nextPageToken.size() == 0)
+      {
+        co_return;
+      }
+    }
+  }
+
+  static bool successfulResponse(const MultiCurlClient::Result& result)
+  {
+    return gcpSuccessfulResponse(result);
+  }
+
   static bool parseMachineArchitectureText(const String& text, MachineCpuArchitecture& architecture)
   {
     String lower = {};
@@ -397,7 +730,7 @@ private:
     base = std::move(filtered);
   }
 
-  bool ensureProjectZone()
+  bool resolveConfiguredProjectZone()
   {
     if (runtimeEnvironment.providerScope.size() > 0)
     {
@@ -481,40 +814,98 @@ private:
       trimTrailingAsciiWhitespace(zone);
     }
 
-    if (projectId.size() == 0 || zone.size() == 0)
+    return projectId.size() > 0 && zone.size() > 0;
+  }
+
+  static void assignMetadataZone(String metadataZone, String& output)
+  {
+    trimTrailingAsciiWhitespace(metadataZone);
+    int64_t slash = -1;
+    for (int64_t index = int64_t(metadataZone.size()) - 1; index >= 0; --index)
     {
-      struct curl_slist *mh = nullptr;
-      mh = curl_slist_append(mh, "Metadata-Flavor: Google");
-      if (projectId.size() == 0)
+      if (metadataZone[uint64_t(index)] == '/')
       {
-        GcpHttp::get("http://metadata.google.internal/computeMetadata/v1/project/project-id", mh, projectId);
-        trimTrailingAsciiWhitespace(projectId);
+        slash = index;
+        break;
       }
+    }
+    output = (slash >= 0)
+                 ? metadataZone.substr(uint64_t(slash + 1), metadataZone.size() - uint64_t(slash + 1), Copy::yes)
+                 : metadataZone;
+    trimTrailingAsciiWhitespace(output);
+  }
 
-      if (zone.size() == 0)
-      {
-        String metadataZone = {};
-        GcpHttp::get("http://metadata.google.internal/computeMetadata/v1/instance/zone", mh, metadataZone);
-        trimTrailingAsciiWhitespace(metadataZone);
-        int64_t slash = -1;
-        for (int64_t index = int64_t(metadataZone.size()) - 1; index >= 0; --index)
-        {
-          if (metadataZone[uint64_t(index)] == '/')
-          {
-            slash = index;
-            break;
-          }
-        }
+protected:
 
-        zone = (slash >= 0)
-                   ? metadataZone.substr(uint64_t(slash + 1), metadataZone.size() - uint64_t(slash + 1), Copy::yes)
-                   : metadataZone;
-        trimTrailingAsciiWhitespace(zone);
-      }
-      curl_slist_free_all(mh);
+  virtual ProdigyHostHttpOperation::Submission hostHttpSubmission(void)
+  {
+    return providerServices.http;
+  }
+
+  void hostRequest(CoroutineStack *coro, MultiCurlClient::Request request, MultiCurlClient::Result& result, bool& success)
+  {
+    ProdigyHostHttpOperation::Submission client = hostHttpSubmission();
+    if (client.submit == nullptr || client.cancel == nullptr)
+    {
+      success = false;
+      co_return;
+    }
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          gcpHostRequest(client, coro, std::move(request), result, success);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+  }
+
+  void ensureProjectZoneAsync(CoroutineStack *coro,
+                              bool& success,
+                              MultiCurlClient::TimePoint operationDeadline = MultiCurlClient::TimePoint::max())
+  {
+    success = resolveConfiguredProjectZone();
+    if (success)
+    {
+      co_return;
     }
 
-    return projectId.size() > 0 && zone.size() > 0;
+    if (projectId.size() == 0)
+    {
+      MultiCurlClient::Result result = {};
+      bool requestSucceeded = false;
+      if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+            hostRequest(coro, metadataRequest("/computeMetadata/v1/project/project-id"_ctv,
+                                          MultiCurlClient::Clock::now(),
+                                          operationDeadline), result, requestSucceeded);
+          }))
+      {
+        co_await coro->suspendAtIndex(suspendIndex);
+      }
+      if (requestSucceeded)
+      {
+        projectId = std::move(result.body);
+        trimTrailingAsciiWhitespace(projectId);
+      }
+    }
+
+    if (zone.size() == 0)
+    {
+      MultiCurlClient::Result result = {};
+      bool requestSucceeded = false;
+      if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+            hostRequest(coro, metadataRequest("/computeMetadata/v1/instance/zone"_ctv,
+                                          MultiCurlClient::Clock::now(),
+                                          operationDeadline), result, requestSucceeded);
+          }))
+      {
+        co_await coro->suspendAtIndex(suspendIndex);
+      }
+      if (requestSucceeded)
+      {
+        assignMetadataZone(std::move(result.body), zone);
+      }
+    }
+
+    success = projectId.size() > 0 && zone.size() > 0;
   }
 
   static void trimTrailingAsciiWhitespace(String& value)
@@ -531,69 +922,6 @@ private:
     }
   }
 
-  static bool runCommandCaptureOutput(const String& command, String& output, String *failure = nullptr)
-  {
-    output.clear();
-    if (failure)
-    {
-      failure->clear();
-    }
-
-    String ownedCommand = {};
-    ownedCommand.assign(command);
-    ownedCommand.addNullTerminator();
-
-    FILE *pipe = ::popen(ownedCommand.c_str(), "r");
-    if (pipe == nullptr)
-    {
-      if (failure)
-      {
-        failure->assign("failed to spawn command"_ctv);
-      }
-      return false;
-    }
-
-    char buffer[4096];
-    while (true)
-    {
-      size_t nRead = fread(buffer, 1, sizeof(buffer), pipe);
-      if (nRead > 0)
-      {
-        output.append(reinterpret_cast<const uint8_t *>(buffer), nRead);
-      }
-
-      if (nRead < sizeof(buffer))
-      {
-        break;
-      }
-    }
-
-    int status = ::pclose(pipe);
-    trimTrailingAsciiWhitespace(output);
-    if (status == 0)
-    {
-      return true;
-    }
-
-    if (failure)
-    {
-      if (output.size() > 0)
-      {
-        failure->assign(output);
-      }
-      else if (WIFEXITED(status))
-      {
-        failure->snprintf<"command exited with status {itoa}"_ctv>(uint32_t(WEXITSTATUS(status)));
-      }
-      else
-      {
-        failure->assign("command failed"_ctv);
-      }
-    }
-
-    return false;
-  }
-
   bool usesRefreshableBootstrapAccessToken() const
   {
     return runtimeEnvironment.gcp.bootstrapAccessTokenRefreshCommand.size() > 0;
@@ -605,9 +933,14 @@ private:
     tokenExpiryMs = 0;
     tokenResolvedAtMs = 0;
     lastAuthFailure.clear();
+    validationMachineCapabilities.clear();
+    validationZoneCpuPlatforms.clear();
+    validationAuthReady = false;
+    validationZoneCpuPlatformsReady = false;
   }
 
-  bool resolveRefreshableBootstrapAccessToken(String *failure = nullptr)
+  ProdigyHostTask<bool> resolveRefreshableBootstrapAccessToken(CoroutineStack *coro,
+                                                                String *failure = nullptr)
   {
     if (failure)
     {
@@ -617,7 +950,11 @@ private:
 
     String refreshedToken = {};
     String detail = {};
-    if (runCommandCaptureOutput(runtimeEnvironment.gcp.bootstrapAccessTokenRefreshCommand, refreshedToken, &detail) == false)
+    if (co_await ProdigyCommandCapture::run(coro,
+                                            runtimeEnvironment.gcp.bootstrapAccessTokenRefreshCommand,
+                                            refreshedToken,
+                                            providerServices.operationDeadline,
+                                            &detail) == false)
     {
       clearCachedProviderAccessToken();
       lastAuthFailure.assign("gcp bootstrap access token refresh failed"_ctv);
@@ -636,7 +973,7 @@ private:
       {
         failure->assign(lastAuthFailure);
       }
-      return false;
+      co_return false;
     }
 
     if (refreshedToken.size() == 0)
@@ -653,7 +990,7 @@ private:
       {
         failure->assign(lastAuthFailure);
       }
-      return false;
+      co_return false;
     }
 
     int64_t now = Time::now<TimeResolution::ms>();
@@ -665,13 +1002,14 @@ private:
     {
       failure->clear();
     }
-    return true;
+    co_return true;
   }
 
 protected:
 
-  bool ensureToken(String *failure = nullptr)
+  bool ensureTokenFastPath(bool& resolved, String *failure = nullptr)
   {
+    resolved = true;
     if (failure)
     {
       failure->clear();
@@ -694,7 +1032,8 @@ protected:
         return true;
       }
 
-      return resolveRefreshableBootstrapAccessToken(failure);
+      resolved = false;
+      return false;
     }
 
     if (runtimeEnvironment.providerCredentialMaterial.size() > 0)
@@ -710,22 +1049,17 @@ protected:
       return true;
     }
 
-    struct curl_slist *mh = nullptr;
-    mh = curl_slist_append(mh, "Metadata-Flavor: Google");
-    String resp;
-    if (!GcpHttp::get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token", mh, resp))
-    {
-      curl_slist_free_all(mh);
-      if (failure)
-      {
-        failure->assign("gcp metadata token fetch failed"_ctv);
-      }
-      return false;
-    }
-    curl_slist_free_all(mh);
+    resolved = false;
+    return false;
+  }
+
+  bool parseMetadataAccessToken(const String& response, String *failure = nullptr)
+  {
     simdjson::dom::parser parser;
-    simdjson::dom::element e;
-    if (parser.parse(resp.c_str(), resp.size()).get(e))
+    simdjson::dom::element document;
+    String responseText = {};
+    responseText.assign(response);
+    if (parser.parse(responseText.c_str(), responseText.size()).get(document))
     {
       if (failure)
       {
@@ -733,9 +1067,12 @@ protected:
       }
       return false;
     }
-    std::string_view at;
-    uint64_t exp;
-    if (e["access_token"].get(at) || e["expires_in"].get(exp))
+
+    String accessToken;
+    uint64_t expiresInSeconds = 0;
+    if (prodigyJSONString(document["access_token"], accessToken) != simdjson::SUCCESS ||
+        document["expires_in"].get(expiresInSeconds) || accessToken.empty() || expiresInSeconds <= 30 ||
+        expiresInSeconds > uint64_t(std::numeric_limits<int64_t>::max() / 1000))
     {
       if (failure)
       {
@@ -743,20 +1080,109 @@ protected:
       }
       return false;
     }
-    token.assign(at);
-    tokenResolvedAtMs = Time::now<TimeResolution::ms>();
-    tokenExpiryMs = Time::now<TimeResolution::ms>() + (int64_t)exp * 1000 - 30 * 1000;
+
+    const int64_t now = Time::now<TimeResolution::ms>();
+    const int64_t usableLifetimeMs = int64_t(expiresInSeconds) * 1000 - 30 * 1000;
+    if (now > std::numeric_limits<int64_t>::max() - usableLifetimeMs)
+    {
+      if (failure)
+      {
+        failure->assign("gcp metadata token expiry out of range"_ctv);
+      }
+      return false;
+    }
+
+    token.assign(accessToken);
+    tokenResolvedAtMs = now;
+    tokenExpiryMs = now + usableLifetimeMs;
     return true;
   }
 
-  bool ensureProviderAccessToken(String& failure)
+  void ensureTokenAsync(CoroutineStack *coro,
+                        bool& success,
+                        String *failure = nullptr,
+                        MultiCurlClient::TimePoint operationDeadline = MultiCurlClient::TimePoint::max())
   {
-    return ensureToken(&failure);
+    bool resolved = false;
+    success = ensureTokenFastPath(resolved, failure);
+    if (resolved)
+    {
+      co_return;
+    }
+
+    if (usesRefreshableBootstrapAccessToken())
+    {
+      success = co_await resolveRefreshableBootstrapAccessToken(coro, failure);
+      co_return;
+    }
+
+    MultiCurlClient::Result result = {};
+    bool requestSucceeded = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          hostRequest(coro,
+                  metadataRequest("/computeMetadata/v1/instance/service-accounts/default/token"_ctv,
+                                  MultiCurlClient::Clock::now(),
+                                  operationDeadline),
+                  result,
+                  requestSucceeded);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (requestSucceeded == false)
+    {
+      if (failure)
+      {
+        failure->assign("gcp metadata token fetch failed"_ctv);
+      }
+      co_return;
+    }
+    success = parseMetadataAccessToken(result.body, failure);
   }
 
-  void invalidateProviderAccessTokenCache()
+  template <typename Visitor>
+  void walkInventory(CoroutineStack *coro, Visitor visitor, String& failure)
   {
-    clearCachedProviderAccessToken();
+    failure.clear();
+    const MultiCurlClient::TimePoint deadline = MultiCurlClient::Clock::now() + inventoryTimeout;
+    bool projectZoneReady = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureProjectZoneAsync(coro, projectZoneReady, deadline);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (projectZoneReady == false)
+    {
+      failure.assign("gcp inventory project/zone unavailable"_ctv);
+      co_return;
+    }
+
+    bool tokenReady = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureTokenAsync(coro, tokenReady, nullptr, deadline);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (tokenReady == false)
+    {
+      failure.assign("gcp inventory token unavailable"_ctv);
+      co_return;
+    }
+
+    if (!providerServices.http)
+    {
+      failure.assign("gcp inventory HTTP client unavailable"_ctv);
+      co_return;
+    }
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          readInventoryPages(providerServices.http,
+                             coro, projectId, zone, token, deadline, visitor, failure);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
   }
 
 public:
@@ -767,10 +1193,7 @@ public:
     projectId.clear();
     zone.clear();
     region.clear();
-    token.clear();
-    tokenExpiryMs = 0;
-    tokenResolvedAtMs = 0;
-    lastAuthFailure.clear();
+    clearCachedProviderAccessToken();
   }
 
   void configureProvisioningProgressSink(BrainIaaSMachineProvisioningProgressSink *sink) override
@@ -792,6 +1215,13 @@ public:
     return true;
   }
 
+  bool hasActiveControlOperations(void) const override
+  {
+    return spotTerminationCheckActive || inventoryOperations > 0 ||
+           provisioningOperations > 0 || lifecycleOperations > 0 || labelOperations > 0 ||
+           clusterDestroyOperations > 0 || elasticOperations > 0;
+  }
+
   void configureBootstrapSSHAccess(const String& user, const Vault::SSHKeyPackage& keyPackage, const Vault::SSHKeyPackage& hostKeyPackage, const String& privateKeyPath) override
   {
     prodigyResolveBootstrapSSHUser(user, bootstrapSSHUser);
@@ -808,606 +1238,17 @@ public:
     }
   }
 
-  void buildAuthHeaders(struct curl_slist *& h)
-  {
-    h = curl_slist_append(h, "Content-Type: application/json");
-    String b;
-    b.snprintf<"Authorization: Bearer {}"_ctv>(token);
-    h = curl_slist_append(h, b.c_str());
-  }
-
-  class PendingMachineProvisioning {
-  public:
-
-    String instanceName = {};
-    String operationName = {};
-  };
-
-  class ConcurrentWaitCoordinator;
-
-  class ConcurrentWaitTask : public CoroutineStack {
-  public:
-
-    ConcurrentWaitCoordinator *coordinator = nullptr;
-    PendingMachineProvisioning pending = {};
-    String schema = {};
-    String providerMachineType = {};
-    MachineLifetime lifetime = MachineLifetime::spot;
-    bool operationComplete = false;
-    bool authRefreshPending = false;
-    bool sleeping = false;
-    int64_t wakeAtMs = 0;
-    bool requestPending = false;
-    bool done = false;
-    bool success = false;
-    bool provisioningReported = false;
-    bool lastMetadataReady = false;
-    bool lastSSHReady = false;
-    bool observedInstance = false;
-    String error = {};
-    Machine *machine = nullptr;
-    GcpHttp::MultiRequest request = {};
-
-    ~ConcurrentWaitTask()
-    {
-      if (machine != nullptr)
-      {
-        delete machine;
-        machine = nullptr;
-      }
-    }
-
-    void sleepForMs(uint32_t delayMs)
-    {
-      sleeping = true;
-      wakeAtMs = Time::now<TimeResolution::ms>() + int64_t(delayMs);
-    }
-
-    bool startRequest(const String& url)
-    {
-      request.clearTransport();
-      request.resetResult();
-      request.context = this;
-      request.method.assign("GET"_ctv);
-      request.url.assign(url);
-      request.timeoutMs = GcpHttp::getTimeoutMs;
-      if (authRefreshPending)
-      {
-        authRefreshPending = false;
-        String authFailure = {};
-        if (coordinator->owner->ensureProviderAccessToken(authFailure) == false)
-        {
-          error.assign(authFailure.size() > 0 ? authFailure : "gcp auth refresh failed"_ctv);
-          return false;
-        }
-      }
-      coordinator->owner->buildAuthHeaders(request.headers);
-      if (request.headers == nullptr)
-      {
-        error.assign("gcp auth headers missing"_ctv);
-        return false;
-      }
-
-      if (coordinator->http.start(request) == false)
-      {
-        error.assign("gcp concurrent request start failed"_ctv);
-        return false;
-      }
-
-      requestPending = true;
-      return true;
-    }
-
-    void execute(void)
-    {
-      int64_t deadlineMs = Time::now<TimeResolution::ms>() + int64_t(prodigyMachineProvisioningTimeoutMs);
-      String operationURL = {};
-      operationURL.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/operations/{}?fields=status,error,httpErrorMessage,statusMessage"_ctv>(
-          coordinator->owner->projectId,
-          coordinator->owner->zone,
-          pending.operationName);
-      String instanceURL = {};
-      instanceURL.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances/{}"_ctv>(
-          coordinator->owner->projectId,
-          coordinator->owner->zone,
-          pending.instanceName);
-
-      while (Time::now<TimeResolution::ms>() < deadlineMs)
-      {
-        MachineProvisioningProgress& progress = coordinator->owner->provisioningProgress.upsert(
-            schema,
-            providerMachineType,
-            pending.instanceName,
-            machine != nullptr ? machine->cloudID : String());
-
-        if (startRequest(instanceURL) == false)
-        {
-          progress.status = error;
-          progress.ready = false;
-          coordinator->owner->provisioningProgress.emitNow();
-          done = true;
-          success = false;
-          co_return;
-        }
-
-        co_await suspend();
-        if (requestPending)
-        {
-          error.assign("gcp concurrent wait resumed before request completion"_ctv);
-          progress.status = error;
-          progress.ready = false;
-          coordinator->owner->provisioningProgress.emitNow();
-          done = true;
-          success = false;
-          co_return;
-        }
-
-        if (request.curlCode == CURLE_OK && request.httpStatus >= 200 && request.httpStatus < 300)
-        {
-          simdjson::dom::parser parser;
-          simdjson::dom::element doc = {};
-          if (parser.parse(request.response.c_str(), request.response.size()).get(doc))
-          {
-            error.assign("gcp instance response parse failed"_ctv);
-            progress.status = error;
-            progress.ready = false;
-            coordinator->owner->provisioningProgress.emitNow();
-            done = true;
-            success = false;
-            co_return;
-          }
-
-          if (machine != nullptr)
-          {
-            delete machine;
-            machine = nullptr;
-          }
-          machine = coordinator->owner->buildMachineFromInstance(doc);
-          if (machine != nullptr)
-          {
-            observedInstance = true;
-            progress.cloud.cloudID = machine->cloudID;
-            prodigyPopulateMachineProvisioningProgressFromMachine(progress, *machine);
-          }
-
-          bool metadataReady = (machine != nullptr) && prodigyMachineProvisioningReady(*machine);
-          bool sshReady = metadataReady && (machine != nullptr) && prodigyMachineSSHSocketAcceptingConnections(*machine);
-#if PRODIGY_DEBUG
-          if ((metadataReady != lastMetadataReady) || (sshReady != lastSSHReady))
-          {
-            basics_log("gcp wait-task transition instance=%s cloudID=%s metadataReady=%d sshReady=%d observedInstance=%d public=%s private=%s operation=%s\n",
-                       pending.instanceName.c_str(),
-                       (machine != nullptr ? machine->cloudID.c_str() : ""),
-                       int(metadataReady),
-                       int(sshReady),
-                       int(observedInstance),
-                       (machine != nullptr ? machine->publicAddress.c_str() : ""),
-                       (machine != nullptr ? machine->privateAddress.c_str() : ""),
-                       pending.operationName.c_str());
-          }
-#endif
-          lastMetadataReady = metadataReady;
-          lastSSHReady = sshReady;
-          if (machine != nullptr && lastSSHReady)
-          {
-#if PRODIGY_DEBUG
-            basics_log("gcp incremental ready instance=%s cloudID=%s public=%s private4=%u schema=%s providerType=%s operation=%s\n",
-                       pending.instanceName.c_str(),
-                       machine->cloudID.c_str(),
-                       machine->publicAddress.c_str(),
-                       unsigned(machine->private4),
-                       schema.c_str(),
-                       providerMachineType.c_str(),
-                       pending.operationName.c_str());
-#endif
-            progress.status.assign("running"_ctv);
-            progress.ready = true;
-            if (provisioningReported == false)
-            {
-#if PRODIGY_DEBUG
-              basics_log("gcp wait-task provisioned-callback instance=%s cloudID=%s ssh=%s:%u private=%s operation=%s\n",
-                         pending.instanceName.c_str(),
-                         machine->cloudID.c_str(),
-                         machine->sshAddress.c_str(),
-                         unsigned(machine->sshPort),
-                         machine->privateAddress.c_str(),
-                         pending.operationName.c_str());
-#endif
-#if PRODIGY_DEBUG
-              uint64_t callbackStartNs = Time::now<TimeResolution::ns>();
-#endif
-              coordinator->owner->provisioningProgress.notifyMachineProvisioned(*machine);
-              provisioningReported = true;
-#if PRODIGY_DEBUG
-              uint64_t callbackTotalNs = (Time::now<TimeResolution::ns>() - callbackStartNs);
-              basics_log("gcp wait-task provisioned-callback-done instance=%s cloudID=%s operation=%s totalNs=%llu totalMs=%.3f\n",
-                         pending.instanceName.c_str(),
-                         machine->cloudID.c_str(),
-                         pending.operationName.c_str(),
-                         (unsigned long long)callbackTotalNs,
-                         double(callbackTotalNs) / 1.0e6);
-#endif
-            }
-            coordinator->owner->provisioningProgress.emitNow();
-            machine->lifetime = lifetime;
-            done = true;
-            success = true;
-            co_return;
-          }
-
-          if (lastMetadataReady)
-          {
-            progress.status.assign("waiting-for-ssh-ready"_ctv);
-          }
-          else
-          {
-            progress.status.assign("waiting-for-instance-addresses"_ctv);
-          }
-          progress.ready = false;
-          if (machine != nullptr)
-          {
-            delete machine;
-            machine = nullptr;
-          }
-          coordinator->owner->provisioningProgress.emitMaybe(Time::now<TimeResolution::ms>());
-          sleepForMs(prodigyMachineProvisioningPollSleepMs);
-          co_await suspend();
-          continue;
-        }
-
-        if (request.httpStatus != 404 && request.transportFailure.size() > 0)
-        {
-          if (request.httpStatus == 401 || request.httpStatus == 403)
-          {
-            coordinator->owner->invalidateProviderAccessTokenCache();
-            authRefreshPending = true;
-          }
-          progress.status = request.transportFailure;
-          progress.ready = false;
-          coordinator->owner->provisioningProgress.emitMaybe(Time::now<TimeResolution::ms>());
-        }
-
-        if (operationComplete == false)
-        {
-          if (startRequest(operationURL) == false)
-          {
-            progress.status = error;
-            progress.ready = false;
-            coordinator->owner->provisioningProgress.emitNow();
-            done = true;
-            success = false;
-            co_return;
-          }
-
-          co_await suspend();
-
-          if (request.curlCode == CURLE_OK && request.httpStatus >= 200 && request.httpStatus < 300)
-          {
-            simdjson::dom::parser parser;
-            simdjson::dom::element doc = {};
-            if (parser.parse(request.response.c_str(), request.response.size()).get(doc))
-            {
-              error.assign("gcp operation response parse failed"_ctv);
-              progress.status = error;
-              progress.ready = false;
-              coordinator->owner->provisioningProgress.emitNow();
-              done = true;
-              success = false;
-              co_return;
-            }
-
-            std::string_view status = {};
-            (void)doc["status"].get(status);
-            if (status == "DONE")
-            {
-              if (coordinator->owner->extractOperationFailure(doc, error))
-              {
-                progress.status = error;
-                progress.ready = false;
-                coordinator->owner->provisioningProgress.emitNow();
-                done = true;
-                success = false;
-                co_return;
-              }
-
-              operationComplete = true;
-              progress.status.assign("operation-complete"_ctv);
-              progress.ready = false;
-              coordinator->owner->provisioningProgress.emitMaybe(Time::now<TimeResolution::ms>());
-            }
-            else
-            {
-              progress.status.assign("waiting-for-create-operation"_ctv);
-              progress.ready = false;
-              coordinator->owner->provisioningProgress.emitMaybe(Time::now<TimeResolution::ms>());
-            }
-          }
-          else
-          {
-            String opFailure = {};
-            if (request.transportFailure.size() > 0)
-            {
-              opFailure = request.transportFailure;
-            }
-            else
-            {
-              (void)coordinator->owner->parseAPIErrorMessage(request.response, opFailure);
-            }
-
-            if (request.httpStatus == 404)
-            {
-              operationComplete = true;
-            }
-            else if (opFailure.size() > 0)
-            {
-              if (request.httpStatus == 401 || request.httpStatus == 403)
-              {
-                coordinator->owner->invalidateProviderAccessTokenCache();
-                authRefreshPending = true;
-              }
-              progress.status = opFailure;
-              progress.ready = false;
-              coordinator->owner->provisioningProgress.emitMaybe(Time::now<TimeResolution::ms>());
-            }
-          }
-        }
-
-        sleepForMs(prodigyMachineProvisioningPollSleepMs);
-        co_await suspend();
-      }
-
-      basics_log("gcp concurrent wait timeout instance=%s operation=%s observedInstance=%d metadataReady=%d sshReady=%d\n",
-                 pending.instanceName.c_str(),
-                 pending.operationName.c_str(),
-                 int(observedInstance),
-                 int(lastMetadataReady),
-                 int(lastSSHReady));
-      error.snprintf<"timed out waiting for gcp instance '{}'"_ctv>(pending.instanceName);
-      done = true;
-      success = false;
-    }
-  };
-
-  class ConcurrentWaitCoordinator {
-  public:
-
-    GcpBrainIaaS *owner = nullptr;
-    GcpHttp::MultiClient http = {};
-    Vector<ConcurrentWaitTask *> tasks = {};
-
-    explicit ConcurrentWaitCoordinator(GcpBrainIaaS *thisOwner)
-        : owner(thisOwner)
-    {
-    }
-
-    ~ConcurrentWaitCoordinator()
-    {
-      for (ConcurrentWaitTask *task : tasks)
-      {
-        delete task;
-      }
-      tasks.clear();
-    }
-
-    bool allDone(void) const
-    {
-      for (ConcurrentWaitTask *task : tasks)
-      {
-        if (task != nullptr && task->done == false)
-        {
-          return false;
-        }
-      }
-
-      return true;
-    }
-
-    bool anyRequestPending(void) const
-    {
-      for (ConcurrentWaitTask *task : tasks)
-      {
-        if (task != nullptr && task->done == false && task->requestPending)
-        {
-          return true;
-        }
-      }
-
-      return false;
-    }
-
-    static void resumeTaskOnce(ConcurrentWaitTask *task)
-    {
-      if (task == nullptr || task->hasSuspendedCoroutines() == false)
-      {
-        return;
-      }
-
-      task->runNextSuspended();
-    }
-
-    int64_t nextWakeAtMs(void) const
-    {
-      int64_t nextWake = 0;
-      for (ConcurrentWaitTask *task : tasks)
-      {
-        if (task == nullptr || task->done || task->sleeping == false)
-        {
-          continue;
-        }
-
-        if (nextWake == 0 || task->wakeAtMs < nextWake)
-        {
-          nextWake = task->wakeAtMs;
-        }
-      }
-
-      return nextWake;
-    }
-
-    void wakeReadySleepers(void)
-    {
-      int64_t nowMs = Time::now<TimeResolution::ms>();
-      for (ConcurrentWaitTask *task : tasks)
-      {
-        if (task == nullptr || task->done || task->sleeping == false || task->wakeAtMs > nowMs)
-        {
-          continue;
-        }
-
-        task->sleeping = false;
-        resumeTaskOnce(task);
-      }
-    }
-
-    bool nudgeDormantTasks(void)
-    {
-      bool nudged = false;
-      for (ConcurrentWaitTask *task : tasks)
-      {
-        if (task == nullptr || task->done || task->sleeping == true || task->requestPending)
-        {
-          continue;
-        }
-
-        resumeTaskOnce(task);
-        nudged = true;
-      }
-
-      return nudged;
-    }
-
-    bool run(const String& schema, const String& providerMachineType, MachineLifetime lifetime, const Vector<PendingMachineProvisioning>& pendingMachines, Vector<Machine *>& readyMachines, String& error)
-    {
-      error.clear();
-      readyMachines.clear();
-      uint32_t dormantNudges = 0;
-
-      for (const PendingMachineProvisioning& pending : pendingMachines)
-      {
-        ConcurrentWaitTask *task = new ConcurrentWaitTask();
-        task->coordinator = this;
-        task->pending = pending;
-        task->schema = schema;
-        task->providerMachineType = providerMachineType;
-        task->lifetime = lifetime;
-        tasks.push_back(task);
-        task->execute();
-      }
-
-      while (allDone() == false)
-      {
-        wakeReadySleepers();
-
-        while (GcpHttp::MultiRequest *completed = http.popCompleted())
-        {
-          ConcurrentWaitTask *task = reinterpret_cast<ConcurrentWaitTask *>(completed->context);
-          if (task != nullptr && task->done == false)
-          {
-            task->requestPending = false;
-#if PRODIGY_DEBUG
-            uint64_t resumeStartNs = Time::now<TimeResolution::ns>();
-            basics_log("gcp coordinator resume-begin instance=%s operation=%s tasks=%u nextWakeAtMs=%lld\n",
-                       task->pending.instanceName.c_str(),
-                       task->pending.operationName.c_str(),
-                       unsigned(tasks.size()),
-                       (long long)nextWakeAtMs());
-#endif
-            resumeTaskOnce(task);
-#if PRODIGY_DEBUG
-            uint64_t resumeTotalNs = (Time::now<TimeResolution::ns>() - resumeStartNs);
-            basics_log("gcp coordinator resume-done instance=%s operation=%s totalNs=%llu totalMs=%.3f done=%d success=%d requestPending=%d tasks=%u nextWakeAtMs=%lld\n",
-                       task->pending.instanceName.c_str(),
-                       task->pending.operationName.c_str(),
-                       (unsigned long long)resumeTotalNs,
-                       double(resumeTotalNs) / 1.0e6,
-                       int(task->done),
-                       int(task->success),
-                       int(task->requestPending),
-                       unsigned(tasks.size()),
-                       (long long)nextWakeAtMs());
-#endif
-          }
-        }
-
-        if (allDone())
-        {
-          break;
-        }
-
-        int64_t nowMs = Time::now<TimeResolution::ms>();
-        int64_t nextWakeMs = nextWakeAtMs();
-        bool requestPending = anyRequestPending();
-        int timeoutMs = 50;
-        if (nextWakeMs > nowMs)
-        {
-          int64_t delayMs = nextWakeMs - nowMs;
-          timeoutMs = int(delayMs > 50 ? 50 : delayMs);
-        }
-        else if (nextWakeMs == 0 && http.pendingCount() == 0 && requestPending == false)
-        {
-          if (nudgeDormantTasks())
-          {
-            dormantNudges += 1;
-            if (dormantNudges < 8)
-            {
-              continue;
-            }
-          }
-
-          error.assign("gcp concurrent wait stalled with no pending work"_ctv);
-          return false;
-        }
-        else
-        {
-          dormantNudges = 0;
-        }
-
-        if (http.pendingCount() > 0 || requestPending)
-        {
-          if (http.pump(timeoutMs) == false)
-          {
-            error.assign("gcp concurrent wait pump failed"_ctv);
-            return false;
-          }
-        }
-        else
-        {
-          usleep(useconds_t(timeoutMs) * 1000u);
-        }
-      }
-
-      for (ConcurrentWaitTask *task : tasks)
-      {
-        if (task == nullptr)
-        {
-          continue;
-        }
-
-        if (task->success == false)
-        {
-          error = task->error;
-          return false;
-        }
-
-        readyMachines.push_back(task->machine);
-        task->machine = nullptr;
-      }
-
-      return true;
-    }
-  };
-
-  static uint128_t hash_uuid(std::string_view s)
+  static uint128_t hash_uuid(const String& text)
   {
     uint128_t u = 0;
-    for (char c : s)
+    for (uint64_t index = 0; index < text.size(); ++index)
     {
-      u = (u * 131) + (uint8_t)c;
+      u = (u * 131) + text[index];
     }
     return u;
   }
 
-  static int64_t parseRFC3339Ms(std::string_view v)
+  static int64_t parseRFC3339Ms(const String& v)
   {
     if (v.size() < 19)
     {
@@ -1534,23 +1375,6 @@ public:
     return (int64_t(secs) - timezoneOffsetSeconds) * 1000LL + millis;
   }
 
-  static bool isHTTPMethodGET(const char *method)
-  {
-    return method != nullptr && method[0] == 'G' && method[1] == 'E' && method[2] == 'T' && method[3] == '\0';
-  }
-
-  static bool containsCString(const String& value, const char *needle)
-  {
-    if (needle == nullptr)
-    {
-      return false;
-    }
-
-    String text = {};
-    text.assign(value);
-    return strstr(text.c_str(), needle) != nullptr;
-  }
-
   static bool deriveRegionFromZone(const String& zoneText, String& regionText)
   {
     regionText.clear();
@@ -1564,148 +1388,7 @@ public:
     return regionText.size() > 0;
   }
 
-  bool ensureRegion(String& failure)
-  {
-    failure.clear();
-    if (ensureProjectZone() == false)
-    {
-      failure.assign("gcp project/zone missing"_ctv);
-      return false;
-    }
-
-    if (region.size() == 0 && deriveRegionFromZone(zone, region) == false)
-    {
-      failure.assign("gcp region derivation failed"_ctv);
-      return false;
-    }
-
-    return region.size() > 0;
-  }
-
-protected:
-
-  virtual bool sendElasticComputeRequest(const char *method, const String& url, const String *body, String& response, long *httpStatus, String& failure)
-  {
-    response.clear();
-    failure.clear();
-    if (!ensureProjectZone() || !ensureToken(&failure))
-    {
-      if (httpStatus)
-      {
-        *httpStatus = 0;
-      }
-      if (failure.size() == 0)
-      {
-        failure.assign("gcp auth failed"_ctv);
-      }
-      return false;
-    }
-
-    struct curl_slist *headers = nullptr;
-    buildAuthHeaders(headers);
-    String urlText = {};
-    urlText.assign(url);
-    bool ok = false;
-    if (isHTTPMethodGET(method) && body == nullptr)
-    {
-      ok = GcpHttp::get(urlText.c_str(), headers, response, httpStatus, &failure);
-    }
-    else
-    {
-      String payload = {};
-      if (body != nullptr)
-      {
-        payload.assign(*body);
-      }
-
-      ok = GcpHttp::send(method, urlText.c_str(), headers, payload, response, httpStatus, &failure);
-    }
-    curl_slist_free_all(headers);
-    if (ok == false && failure.size() == 0 && (!httpStatus || *httpStatus == 0))
-    {
-      failure.assign("gcp request transport failed"_ctv);
-    }
-    return ok;
-  }
-
 private:
-
-  bool resolveInstanceNameForCloudID(const String& cloudID, String& name)
-  {
-    name.clear();
-
-    if (!ensureProjectZone() || !ensureToken() || cloudID.size() == 0)
-    {
-      return false;
-    }
-
-    struct curl_slist *h = nullptr;
-    buildAuthHeaders(h);
-
-    String nextPageToken = {};
-    for (;;)
-    {
-      String url;
-      url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances?fields=items(name,id),nextPageToken"_ctv>(projectId, zone);
-      appendPageTokenQuery(url, nextPageToken);
-
-      String resp;
-      if (!GcpHttp::get(url.c_str(), h, resp))
-      {
-        break;
-      }
-
-      simdjson::dom::parser parser;
-      simdjson::dom::element doc;
-      if (parser.parse(resp.c_str(), resp.size()).get(doc))
-      {
-        break;
-      }
-
-      if (auto items = doc["items"]; items.is_array())
-      {
-        for (auto v : items.get_array())
-        {
-          std::string_view instanceID;
-          if (v["id"].get(instanceID))
-          {
-            continue;
-          }
-
-          if (cloudID == String(instanceID))
-          {
-            std::string_view instanceName;
-            if (!v["name"].get(instanceName))
-            {
-              name.assign(instanceName);
-            }
-
-            break;
-          }
-        }
-      }
-
-      if (name.size() > 0)
-      {
-        break;
-      }
-
-      std::string_view pageToken;
-      if (doc["nextPageToken"].get(pageToken))
-      {
-        break;
-      }
-
-      nextPageToken.assign(pageToken);
-      if (nextPageToken.size() == 0)
-      {
-        break;
-      }
-    }
-
-    curl_slist_free_all(h);
-    return name.size() > 0;
-  }
 
   static MachineLifetime deriveLifetimeFromInstance(simdjson::dom::element inst)
   {
@@ -1769,778 +1452,71 @@ private:
     return deriveLifetimeFromInstance(inst) == MachineLifetime::spot;
   }
 
-  static bool parseOperationName(const String& response, String& operationName, String *error = nullptr)
-  {
-    operationName.clear();
-    if (error)
-    {
-      error->clear();
-    }
+public:
 
+  static bool parseSpotTerminationPage(const String& response,
+                                       Vector<String>& decommissionedIDs,
+                                       String& nextPageToken,
+                                       size_t maximumDecommissionedIDs = spotCheckMaxDecommissionedIDs)
+  {
+    nextPageToken.clear();
     simdjson::dom::parser parser;
-    simdjson::dom::element doc;
+    simdjson::dom::element document;
     String responseText = {};
     responseText.assign(response);
-    if (parser.parse(responseText.c_str(), responseText.size()).get(doc))
+    if (parser.parse(responseText.c_str(), responseText.size()).get(document))
     {
-      if (error)
-      {
-        error->assign("gcp operation response parse failed"_ctv);
-      }
       return false;
     }
 
-    std::string_view name;
-    if (doc["name"].get(name))
+    if (auto items = document["items"]; items.is_array())
     {
-      if (error)
+      for (auto instance : items.get_array())
       {
-        error->assign("gcp operation response missing name"_ctv);
-      }
-      return false;
-    }
-
-    operationName.assign(name);
-    return true;
-  }
-
-  static bool extractOperationFailure(simdjson::dom::element operation, String& error)
-  {
-    error.clear();
-
-    if (auto nestedError = operation["error"]; nestedError.is_object())
-    {
-      if (auto errors = nestedError["errors"]; errors.is_array())
-      {
-        for (auto entry : errors.get_array())
+        if (isProdigyInstance(instance) == false || isSpotInstance(instance) == false)
         {
-          std::string_view message;
-          if (!entry["message"].get(message))
+          continue;
+        }
+
+        String status;
+        if (prodigyJSONString(instance["status"], status) != simdjson::SUCCESS ||
+            status != "TERMINATED"_ctv)
+        {
+          continue;
+        }
+
+        String id;
+        if (prodigyJSONString(instance["id"], id) == simdjson::SUCCESS)
+        {
+          if (decommissionedIDs.size() >= maximumDecommissionedIDs)
           {
-            error.assign(message);
-            return true;
+            return false;
           }
+          decommissionedIDs.emplace_back(String(id));
         }
       }
     }
 
-    std::string_view message;
-    if (!operation["httpErrorMessage"].get(message))
+    String pageToken;
+    if (prodigyJSONString(document["nextPageToken"], pageToken) == simdjson::SUCCESS)
     {
-      error.assign(message);
-      return true;
+      nextPageToken.assign(pageToken);
     }
-
-    if (!operation["statusMessage"].get(message))
-    {
-      error.assign(message);
-      return true;
-    }
-
-    return false;
-  }
-
-  bool waitForZoneOperation(const String& operationName, const String& schema, const String& providerMachineType, const String& providerName, String& error)
-  {
-    error.clear();
-
-    if (!ensureProjectZone() || !ensureToken(&error))
-    {
-      if (error.size() == 0)
-      {
-        error.assign("gcp auth failed"_ctv);
-      }
-      return false;
-    }
-
-    struct curl_slist *h = nullptr;
-    buildAuthHeaders(h);
-
-    String url;
-    url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/operations/{}?fields=status,error,httpErrorMessage,statusMessage"_ctv>(projectId, zone, operationName);
-
-    bool ok = false;
-    int64_t deadlineMs = Time::now<TimeResolution::ms>() + int64_t(prodigyMachineProvisioningTimeoutMs);
-    while (Time::now<TimeResolution::ms>() < deadlineMs)
-    {
-      long httpStatus = 0;
-      String response;
-      bool success = GcpHttp::get(url.c_str(), h, response, &httpStatus);
-      if (success == false)
-      {
-        if (parseAPIErrorMessage(response, error) == false)
-        {
-          error.snprintf<"gcp operation poll failed with HTTP {itoa}"_ctv>(uint32_t(httpStatus));
-        }
-        break;
-      }
-
-      simdjson::dom::parser parser;
-      simdjson::dom::element operation;
-      if (parser.parse(response.c_str(), response.size()).get(operation))
-      {
-        error.assign("gcp operation response parse failed"_ctv);
-        break;
-      }
-
-      std::string_view status;
-      if (operation["status"].get(status) == false && status == "DONE")
-      {
-        if (extractOperationFailure(operation, error))
-        {
-          MachineProvisioningProgress& progress = provisioningProgress.upsert(schema, providerMachineType, providerName, String());
-          progress.status = error;
-          progress.ready = false;
-          provisioningProgress.emitNow();
-          break;
-        }
-
-        MachineProvisioningProgress& progress = provisioningProgress.upsert(schema, providerMachineType, providerName, String());
-        progress.status.assign("operation-complete"_ctv);
-        progress.ready = false;
-        provisioningProgress.emitNow();
-        ok = true;
-        break;
-      }
-
-      MachineProvisioningProgress& progress = provisioningProgress.upsert(schema, providerMachineType, providerName, String());
-      progress.status.assign("waiting-for-create-operation"_ctv);
-      progress.ready = false;
-      provisioningProgress.emitMaybe(Time::now<TimeResolution::ms>());
-      usleep(useconds_t(prodigyMachineProvisioningPollSleepMs) * 1000u);
-    }
-
-    if (ok == false && error.size() == 0)
-    {
-      error.snprintf<"timed out waiting for gcp operation '{}'"_ctv>(operationName);
-    }
-
-    curl_slist_free_all(h);
-    return ok;
-  }
-
-  bool fetchInstanceByName(const String& instanceName, Machine *& machine, long *httpStatus = nullptr, String *error = nullptr)
-  {
-    machine = nullptr;
-    if (error)
-    {
-      error->clear();
-    }
-
-    String authFailure = {};
-    if (!ensureProjectZone() || !ensureToken(&authFailure))
-    {
-      if (error)
-      {
-        *error = authFailure.size() > 0 ? authFailure : "gcp auth failed"_ctv;
-      }
-      return false;
-    }
-
-    String url;
-    url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances/{}"_ctv>(projectId, zone, instanceName);
-
-    struct curl_slist *h = nullptr;
-    buildAuthHeaders(h);
-
-    String response;
-    long status = 0;
-    bool success = GcpHttp::get(url.c_str(), h, response, &status);
-    curl_slist_free_all(h);
-
-    if (httpStatus)
-    {
-      *httpStatus = status;
-    }
-
-    if (success == false)
-    {
-      if (error && status != 404)
-      {
-        if (parseAPIErrorMessage(response, *error) == false)
-        {
-          error->snprintf<"gcp instance fetch failed with HTTP {itoa}"_ctv>(uint32_t(status));
-        }
-      }
-      return false;
-    }
-
-    simdjson::dom::parser parser;
-    simdjson::dom::element instance;
-    if (parser.parse(response.c_str(), response.size()).get(instance))
-    {
-      if (error)
-      {
-        error->assign("gcp instance response parse failed"_ctv);
-      }
-      return false;
-    }
-
-    machine = buildMachineFromInstance(instance);
     return true;
   }
 
-  bool fetchInstanceDocument(const String& instanceName, const String& fields, String& response, simdjson::dom::parser& parser, simdjson::dom::element& instance, String& error)
-  {
-    error.clear();
-
-    if (!ensureProjectZone() || !ensureToken(&error))
-    {
-      if (error.size() == 0)
-      {
-        error.assign("gcp auth failed"_ctv);
-      }
-      return false;
-    }
-
-    String url;
-    if (fields.size() > 0)
-    {
-      url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances/{}?fields={}"_ctv>(projectId, zone, instanceName, fields);
-    }
-    else
-    {
-      url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances/{}"_ctv>(projectId, zone, instanceName);
-    }
-
-    struct curl_slist *h = nullptr;
-    buildAuthHeaders(h);
-
-    long httpStatus = 0;
-    bool success = GcpHttp::get(url.c_str(), h, response, &httpStatus);
-    curl_slist_free_all(h);
-
-    if (success == false)
-    {
-      if (parseAPIErrorMessage(response, error) == false)
-      {
-        error.snprintf<"gcp instance fetch failed with HTTP {itoa}"_ctv>(uint32_t(httpStatus));
-      }
-      return false;
-    }
-
-    if (parser.parse(response.c_str(), response.size()).get(instance))
-    {
-      error.assign("gcp instance response parse failed"_ctv);
-      return false;
-    }
-
-    return true;
-  }
-
-  bool fetchInstanceTemplate(const String& templateName, String& response, simdjson::dom::parser& parser, simdjson::dom::element& instanceTemplate, String& error)
-  {
-    error.clear();
-
-    if (!ensureProjectZone() || !ensureToken(&error))
-    {
-      if (error.size() == 0)
-      {
-        error.assign("gcp auth failed"_ctv);
-      }
-      return false;
-    }
-
-    String url;
-    url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/global/instanceTemplates/{}"_ctv>(projectId, templateName);
-
-    struct curl_slist *h = nullptr;
-    buildAuthHeaders(h);
-
-    long httpStatus = 0;
-    bool success = GcpHttp::get(url.c_str(), h, response, &httpStatus);
-    curl_slist_free_all(h);
-
-    if (success == false)
-    {
-      if (parseAPIErrorMessage(response, error) == false)
-      {
-        error.snprintf<"gcp instance template fetch failed with HTTP {itoa}"_ctv>(uint32_t(httpStatus));
-      }
-      return false;
-    }
-
-    if (parser.parse(response.c_str(), response.size()).get(instanceTemplate))
-    {
-      error.assign("gcp instance template response parse failed"_ctv);
-      return false;
-    }
-
-    return true;
-  }
-
-  bool instanceTemplateExists(const String& templateName, bool& exists, String& error)
-  {
-    exists = false;
-    error.clear();
-
-    if (templateName.size() == 0)
-    {
-      error.assign("gcp instance template name required"_ctv);
-      return false;
-    }
-
-    if (!ensureProjectZone() || !ensureToken(&error))
-    {
-      if (error.size() == 0)
-      {
-        error.assign("gcp auth failed"_ctv);
-      }
-      return false;
-    }
-
-    String url = {};
-    url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/global/instanceTemplates/{}"_ctv>(projectId, templateName);
-
-    struct curl_slist *h = nullptr;
-    buildAuthHeaders(h);
-
-    String response = {};
-    long httpStatus = 0;
-    bool success = GcpHttp::get(url.c_str(), h, response, &httpStatus);
-    curl_slist_free_all(h);
-
-    if (success)
-    {
-      exists = true;
-      return true;
-    }
-
-    if (httpStatus == 404 || containsCString(response, "notFound"))
-    {
-      exists = false;
-      return true;
-    }
-
-    if (parseAPIErrorMessage(response, error) == false)
-    {
-      error.snprintf<"gcp instance template probe failed with HTTP {itoa}"_ctv>(uint32_t(httpStatus));
-    }
-
-    return false;
-  }
-
-  bool deleteInstanceTemplateIfExists(const String& templateName, String& error)
-  {
-    error.clear();
-    bool exists = false;
-    if (instanceTemplateExists(templateName, exists, error) == false)
-    {
-      return false;
-    }
-
-    if (exists == false)
-    {
-      return true;
-    }
-
-    String url = {};
-    url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/global/instanceTemplates/{}"_ctv>(projectId, templateName);
-
-    String response = {};
-    String transportFailure = {};
-    long httpStatus = 0;
-    if (sendElasticComputeRequest("DELETE", url, nullptr, response, &httpStatus, transportFailure) == false)
-    {
-      if (httpStatus == 404 || containsCString(response, "notFound"))
-      {
-        return true;
-      }
-
-      if (parseAPIErrorMessage(response, error) == false)
-      {
-        error = transportFailure.size() > 0 ? transportFailure : "gcp instance template delete failed"_ctv;
-      }
-      return false;
-    }
-
-    String operationName = {};
-    if (parseOperationName(response, operationName, &error) == false)
-    {
-      return false;
-    }
-
-    return waitForGlobalOperation(operationName, error);
-  }
-
-  static bool appendTemplateBootDiskOverride(String& body, simdjson::dom::element instanceTemplate, const String& vmImageURI, uint32_t diskGb, String& error)
-  {
-    error.clear();
-
-    auto disks = instanceTemplate["properties"]["disks"].get_array();
-    if (disks.error())
-    {
-      error.assign("gcp instance template missing disks"_ctv);
-      return false;
-    }
-
-    uint32_t diskCount = 0;
-    bool foundBootDisk = false;
-    simdjson::dom::element bootDisk;
-    for (auto disk : disks)
-    {
-      diskCount += 1;
-
-      bool boot = false;
-      (void)disk["boot"].get(boot);
-      if (boot)
-      {
-        bootDisk = disk;
-        foundBootDisk = true;
-      }
-    }
-
-    if (diskCount != 1 || foundBootDisk == false)
-    {
-      error.assign("gcp spinMachines currently requires an instance template with exactly one boot disk"_ctv);
-      return false;
-    }
-
-    body.append(",\"disks\":[{\"boot\":true"_ctv);
-
-    bool autoDelete = true;
-    if (!bootDisk["autoDelete"].get(autoDelete))
-    {
-      body.append(",\"autoDelete\":"_ctv);
-      if (autoDelete)
-      {
-        body.append("true"_ctv);
-      }
-      else
-      {
-        body.append("false"_ctv);
-      }
-    }
-
-    std::string_view attachmentMode;
-    if (!bootDisk["mode"].get(attachmentMode))
-    {
-      body.append(",\"mode\":"_ctv);
-      appendEscapedJSONStringLiteral(body, attachmentMode);
-    }
-
-    std::string_view attachmentType;
-    if (!bootDisk["type"].get(attachmentType))
-    {
-      body.append(",\"type\":"_ctv);
-      appendEscapedJSONStringLiteral(body, attachmentType);
-    }
-
-    std::string_view deviceName;
-    if (!bootDisk["deviceName"].get(deviceName))
-    {
-      body.append(",\"deviceName\":"_ctv);
-      appendEscapedJSONStringLiteral(body, deviceName);
-    }
-
-    std::string_view interfaceName;
-    if (!bootDisk["interface"].get(interfaceName))
-    {
-      body.append(",\"interface\":"_ctv);
-      appendEscapedJSONStringLiteral(body, interfaceName);
-    }
-
-    body.append(",\"initializeParams\":{\"sourceImage\":"_ctv);
-    prodigyAppendEscapedJSONStringLiteral(body, vmImageURI);
-    body.snprintf_add<",\"diskSizeGb\":{itoa}"_ctv>(diskGb);
-
-    if (auto initializeParams = bootDisk["initializeParams"]; initializeParams.is_object())
-    {
-      std::string_view diskType;
-      if (!initializeParams["diskType"].get(diskType))
-      {
-        body.append(",\"diskType\":"_ctv);
-        appendEscapedJSONStringLiteral(body, diskType);
-      }
-    }
-
-    body.append("}}]"_ctv);
-    return true;
-  }
-
-  bool ensureInstanceLabel(const String& instanceName, const String& key, const String& value, String& error)
-  {
-    error.clear();
-
-    String response;
-    simdjson::dom::parser parser;
-    simdjson::dom::element instance;
-    if (fetchInstanceDocument(instanceName, "labelFingerprint,labels", response, parser, instance, error) == false)
-    {
-      return false;
-    }
-
-    std::string_view labelFingerprint;
-    if (instance["labelFingerprint"].get(labelFingerprint))
-    {
-      error.assign("gcp instance missing labelFingerprint"_ctv);
-      return false;
-    }
-
-    if (auto labels = instance["labels"]; labels.is_object())
-    {
-      String keyText = {};
-      keyText.assign(key);
-
-      std::string_view existingValue;
-      if (!labels[keyText.c_str()].get(existingValue) && existingValue == stringViewFor(value))
-      {
-        return true;
-      }
-    }
-
-    String body = {};
-    body.append("{\"labelFingerprint\":"_ctv);
-    appendEscapedJSONStringLiteral(body, labelFingerprint);
-    body.append(",\"labels\":{"_ctv);
-
-    bool first = true;
-    if (auto labels = instance["labels"]; labels.is_object())
-    {
-      for (auto field : labels.get_object())
-      {
-        std::string_view existingKey = field.key;
-        if (existingKey == stringViewFor(key))
-        {
-          continue;
-        }
-
-        std::string_view existingValue;
-        if (field.value.get(existingValue))
-        {
-          continue;
-        }
-
-        if (first == false)
-        {
-          body.append(","_ctv);
-        }
-
-        appendEscapedJSONStringLiteral(body, existingKey);
-        body.append(":"_ctv);
-        appendEscapedJSONStringLiteral(body, existingValue);
-        first = false;
-      }
-    }
-
-    if (first == false)
-    {
-      body.append(","_ctv);
-    }
-    prodigyAppendEscapedJSONStringLiteral(body, key);
-    body.append(":"_ctv);
-    prodigyAppendEscapedJSONStringLiteral(body, value);
-    body.append("}}"_ctv);
-
-    struct curl_slist *h = nullptr;
-    buildAuthHeaders(h);
-
-    String url;
-    url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances/{}/setLabels"_ctv>(projectId, zone, instanceName);
-
-    long httpStatus = 0;
-    String setLabelsResponse;
-    bool success = GcpHttp::send("POST", url.c_str(), h, body, setLabelsResponse, &httpStatus);
-    curl_slist_free_all(h);
-
-    if (success == false)
-    {
-      if (parseAPIErrorMessage(setLabelsResponse, error) == false)
-      {
-        error.snprintf<"gcp setLabels failed with HTTP {itoa}"_ctv>(uint32_t(httpStatus));
-      }
-      return false;
-    }
-
-    String operationName;
-    if (parseOperationName(setLabelsResponse, operationName, &error) == false)
-    {
-      return false;
-    }
-
-    return waitForZoneOperation(operationName, String(), String(), String(), error);
-  }
-
-  bool ensureInstanceMetadataItem(const String& instanceName, const String& key, const String& value, String& error)
-  {
-    error.clear();
-
-    String response;
-    simdjson::dom::parser parser;
-    simdjson::dom::element instance;
-    if (fetchInstanceDocument(instanceName, "metadata/fingerprint,metadata/items", response, parser, instance, error) == false)
-    {
-      return false;
-    }
-
-    std::string_view fingerprint;
-    if (instance["metadata"]["fingerprint"].get(fingerprint))
-    {
-      error.assign("gcp instance missing metadata fingerprint"_ctv);
-      return false;
-    }
-
-    if (auto items = instance["metadata"]["items"]; items.is_array())
-    {
-      for (auto item : items.get_array())
-      {
-        std::string_view existingKey;
-        if (item["key"].get(existingKey) || existingKey != stringViewFor(key))
-        {
-          continue;
-        }
-
-        std::string_view existingValue;
-        if (!item["value"].get(existingValue) && existingValue == stringViewFor(value))
-        {
-          return true;
-        }
-
-        break;
-      }
-    }
-
-    String body = {};
-    body.append("{\"fingerprint\":"_ctv);
-    appendEscapedJSONStringLiteral(body, fingerprint);
-    body.append(",\"items\":["_ctv);
-
-    bool first = true;
-    if (auto items = instance["metadata"]["items"]; items.is_array())
-    {
-      for (auto item : items.get_array())
-      {
-        std::string_view existingKey;
-        if (item["key"].get(existingKey))
-        {
-          continue;
-        }
-
-        if (existingKey == stringViewFor(key))
-        {
-          continue;
-        }
-
-        std::string_view existingValue = {};
-        (void)item["value"].get(existingValue);
-
-        if (first == false)
-        {
-          body.append(","_ctv);
-        }
-
-        body.append("{\"key\":"_ctv);
-        appendEscapedJSONStringLiteral(body, existingKey);
-        body.append(",\"value\":"_ctv);
-        appendEscapedJSONStringLiteral(body, existingValue);
-        body.append("}"_ctv);
-        first = false;
-      }
-    }
-
-    if (first == false)
-    {
-      body.append(","_ctv);
-    }
-
-    body.append("{\"key\":"_ctv);
-    prodigyAppendEscapedJSONStringLiteral(body, key);
-    body.append(",\"value\":"_ctv);
-    prodigyAppendEscapedJSONStringLiteral(body, value);
-    body.append("}]}"_ctv);
-
-    struct curl_slist *h = nullptr;
-    buildAuthHeaders(h);
-
-    String url;
-    url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances/{}/setMetadata"_ctv>(projectId, zone, instanceName);
-
-    long httpStatus = 0;
-    String setMetadataResponse;
-    bool success = GcpHttp::send("POST", url.c_str(), h, body, setMetadataResponse, &httpStatus);
-    curl_slist_free_all(h);
-
-    if (success == false)
-    {
-      if (parseAPIErrorMessage(setMetadataResponse, error) == false)
-      {
-        error.snprintf<"gcp setMetadata failed with HTTP {itoa}"_ctv>(uint32_t(httpStatus));
-      }
-      return false;
-    }
-
-    String operationName;
-    if (parseOperationName(setMetadataResponse, operationName, &error) == false)
-    {
-      return false;
-    }
-
-    return waitForZoneOperation(operationName, String(), String(), String(), error);
-  }
-
-  bool waitForInstanceByName(const String& instanceName, const String& schema, const String& providerMachineType, MachineLifetime lifetime, Machine *& machine, String& error)
-  {
-    machine = nullptr;
-    error.clear();
-
-    int64_t deadlineMs = Time::now<TimeResolution::ms>() + int64_t(prodigyMachineProvisioningTimeoutMs);
-    while (Time::now<TimeResolution::ms>() < deadlineMs)
-    {
-      long httpStatus = 0;
-      String fetchError;
-      Machine *candidate = nullptr;
-      if (fetchInstanceByName(instanceName, candidate, &httpStatus, &fetchError))
-      {
-        MachineProvisioningProgress& progress = provisioningProgress.upsert(schema, providerMachineType, instanceName, candidate ? candidate->cloudID : String());
-        if (candidate != nullptr)
-        {
-          prodigyPopulateMachineProvisioningProgressFromMachine(progress, *candidate);
-        }
-        if (candidate != nullptr && prodigyMachineProvisioningReady(*candidate))
-        {
-          progress.status.assign("running"_ctv);
-          progress.ready = true;
-          provisioningProgress.emitNow();
-          candidate->lifetime = lifetime;
-          machine = candidate;
-          return true;
-        }
-
-        progress.status.assign("waiting-for-instance-addresses"_ctv);
-        progress.ready = false;
-        if (candidate != nullptr)
-        {
-          delete candidate;
-        }
-      }
-      else if (httpStatus != 404 && fetchError.size() > 0)
-      {
-        MachineProvisioningProgress& progress = provisioningProgress.upsert(schema, providerMachineType, instanceName, String());
-        progress.status = fetchError;
-        progress.ready = false;
-        provisioningProgress.emitNow();
-        error = fetchError;
-        return false;
-      }
-
-      provisioningProgress.emitMaybe(Time::now<TimeResolution::ms>());
-      usleep(useconds_t(prodigyMachineProvisioningPollSleepMs) * 1000u);
-    }
-
-    error.snprintf<"timed out waiting for gcp instance '{}'"_ctv>(instanceName);
-    return false;
-  }
+private:
 
   Machine *buildMachineFromInstance(simdjson::dom::element inst)
   {
     Machine *m = new Machine();
-    std::string_view id = {};
-    (void)inst["id"].get(id);
+    String id;
+    (void)prodigyJSONString(inst["id"], id);
     m->cloudID.assign(id);
     m->uuid = hash_uuid(id);
     m->lifetime = deriveLifetimeFromInstance(inst);
-    std::string_view creationTimestamp;
-    if (!inst["creationTimestamp"].get(creationTimestamp))
+    String creationTimestamp;
+    if (prodigyJSONString(inst["creationTimestamp"], creationTimestamp) == simdjson::SUCCESS)
     {
       m->creationTimeMs = parseRFC3339Ms(creationTimestamp);
     }
@@ -2555,18 +1531,19 @@ private:
     {
       for (auto nic : nics.get_array())
       {
-        std::string_view nip;
-        if (!nic["networkIP"].get(nip))
+        String nip;
+        if (prodigyJSONString(nic["networkIP"], nip) == simdjson::SUCCESS)
         {
-          String privateText = String(nip);
+          String privateText = nip;
           m->privateAddress.assign(privateText);
           IPAddress p;
           inet_pton(AF_INET, privateText.c_str(), &p.v4);
           m->private4 = p.v4;
         }
 
-        std::string_view ipv6Address;
-        if (m->privateAddress.size() == 0 && !nic["ipv6Address"].get(ipv6Address))
+        String ipv6Address;
+        if (m->privateAddress.size() == 0 &&
+            prodigyJSONString(nic["ipv6Address"], ipv6Address) == simdjson::SUCCESS)
         {
           m->privateAddress.assign(ipv6Address);
         }
@@ -2575,16 +1552,17 @@ private:
         {
           for (auto access : accessConfigs.get_array())
           {
-            std::string_view natIP;
-            if (!access["natIP"].get(natIP))
+            String natIP;
+            if (prodigyJSONString(access["natIP"], natIP) == simdjson::SUCCESS)
             {
               m->publicAddress.assign(natIP);
               m->sshAddress.assign(natIP);
               break;
             }
 
-            std::string_view externalIpv6;
-            if (m->publicAddress.size() == 0 && !access["externalIpv6"].get(externalIpv6))
+            String externalIpv6;
+            if (m->publicAddress.size() == 0 &&
+                prodigyJSONString(access["externalIpv6"], externalIpv6) == simdjson::SUCCESS)
             {
               m->publicAddress.assign(externalIpv6);
               if (m->sshAddress.size() == 0)
@@ -2599,8 +1577,8 @@ private:
       }
     }
     String zoneText = {};
-    std::string_view zoneURL = {};
-    if (!inst["zone"].get(zoneURL))
+    String zoneURL;
+    if (prodigyJSONString(inst["zone"], zoneURL) == simdjson::SUCCESS)
     {
       (void)gcpExtractZoneName(zoneURL, zoneText);
     }
@@ -2639,16 +1617,16 @@ private:
         // Prefer initializeParams.sourceImage (template image) but fall back to source
         if (auto ip = d["initializeParams"]; ip.is_object())
         {
-          std::string_view img;
-          if (!ip["sourceImage"].get(img))
+          String img;
+          if (prodigyJSONString(ip["sourceImage"], img) == simdjson::SUCCESS)
           {
             m->currentImageURI.assign(img);
           }
         }
         if (m->currentImageURI.size() == 0)
         {
-          std::string_view src;
-          if (!d["source"].get(src))
+          String src;
+          if (prodigyJSONString(d["source"], src) == simdjson::SUCCESS)
           {
             m->currentImageURI.assign(src);
           }
@@ -2668,850 +1646,131 @@ private:
     return m;
   }
 
-  static bool extractInstanceNameFromUserURL(const String& userURL, String& instanceName)
+  static void assignValidationRequestFailure(const MultiCurlClient::Result& result, const char *fallback, String& error)
   {
-    instanceName.clear();
-    String needle = "instances/"_ctv;
-    uint64_t offset = findSubstring(userURL, needle);
-    if (offset == uint64_t(-1))
+    if (parseAPIErrorMessage(result.body, error))
     {
-      return false;
+      return;
     }
-
-    uint64_t start = offset + needle.size();
-    uint64_t end = userURL.size();
-    for (uint64_t index = start; index < userURL.size(); ++index)
+    if (result.status == MultiCurlClient::Status::deadlineExceeded)
     {
-      if (userURL[index] == '/' || userURL[index] == '?')
-      {
-        end = index;
-        break;
-      }
+      error.assign("gcp validation deadline exceeded"_ctv);
     }
-
-    if (end <= start)
+    else if (result.status == MultiCurlClient::Status::success)
     {
-      return false;
-    }
-
-    instanceName.assign(userURL.substr(start, end - start, Copy::yes));
-    return instanceName.size() > 0;
-  }
-
-  bool waitForElasticZoneOperation(const String& operationName, String& error)
-  {
-    error.clear();
-    if (operationName.size() == 0)
-    {
-      error.assign("gcp zone operation name missing"_ctv);
-      return false;
-    }
-
-    String url = {};
-    url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/operations/{}?fields=status,error,httpErrorMessage,statusMessage"_ctv>(
-        projectId,
-        zone,
-        operationName);
-
-    int64_t deadlineMs = Time::now<TimeResolution::ms>() + int64_t(prodigyMachineProvisioningTimeoutMs);
-    while (Time::now<TimeResolution::ms>() < deadlineMs)
-    {
-      String response = {};
-      String transportFailure = {};
-      long httpStatus = 0;
-      bool ok = sendElasticComputeRequest("GET", url, nullptr, response, &httpStatus, transportFailure);
-      if (ok == false)
-      {
-        if (parseAPIErrorMessage(response, error) == false)
-        {
-          error = transportFailure.size() > 0 ? transportFailure : "gcp zone operation poll failed"_ctv;
-        }
-        return false;
-      }
-
-      simdjson::dom::parser parser;
-      simdjson::dom::element operation = {};
-      if (parser.parse(response.c_str(), response.size()).get(operation))
-      {
-        error.assign("gcp zone operation response parse failed"_ctv);
-        return false;
-      }
-
-      std::string_view status = {};
-      if (!operation["status"].get(status) && status == "DONE")
-      {
-        if (extractOperationFailure(operation, error))
-        {
-          return false;
-        }
-
-        return true;
-      }
-
-      usleep(500 * 1000);
-    }
-
-    error.snprintf<"timed out waiting for gcp zone operation '{}'"_ctv>(operationName);
-    return false;
-  }
-
-  bool waitForElasticRegionOperation(const String& operationName, String& error)
-  {
-    error.clear();
-    if (operationName.size() == 0)
-    {
-      error.assign("gcp region operation name missing"_ctv);
-      return false;
-    }
-
-    String regionFailure = {};
-    if (ensureRegion(regionFailure) == false)
-    {
-      error.assign(regionFailure);
-      return false;
-    }
-
-    String url = {};
-    url.snprintf<"https://compute.googleapis.com/compute/beta/projects/{}/regions/{}/operations/{}?fields=status,error,httpErrorMessage,statusMessage"_ctv>(
-        projectId,
-        region,
-        operationName);
-
-    int64_t deadlineMs = Time::now<TimeResolution::ms>() + int64_t(prodigyMachineProvisioningTimeoutMs);
-    while (Time::now<TimeResolution::ms>() < deadlineMs)
-    {
-      String response = {};
-      String transportFailure = {};
-      long httpStatus = 0;
-      bool ok = sendElasticComputeRequest("GET", url, nullptr, response, &httpStatus, transportFailure);
-      if (ok == false)
-      {
-        if (parseAPIErrorMessage(response, error) == false)
-        {
-          error = transportFailure.size() > 0 ? transportFailure : "gcp region operation poll failed"_ctv;
-        }
-        return false;
-      }
-
-      simdjson::dom::parser parser;
-      simdjson::dom::element operation = {};
-      if (parser.parse(response.c_str(), response.size()).get(operation))
-      {
-        error.assign("gcp region operation response parse failed"_ctv);
-        return false;
-      }
-
-      std::string_view status = {};
-      if (!operation["status"].get(status) && status == "DONE")
-      {
-        if (extractOperationFailure(operation, error))
-        {
-          return false;
-        }
-
-        return true;
-      }
-
-      usleep(500 * 1000);
-    }
-
-    error.snprintf<"timed out waiting for gcp region operation '{}'"_ctv>(operationName);
-    return false;
-  }
-
-  bool waitForGlobalOperation(const String& operationName, String& error)
-  {
-    error.clear();
-    if (operationName.size() == 0)
-    {
-      error.assign("gcp global operation name missing"_ctv);
-      return false;
-    }
-
-    if (!ensureProjectZone() || !ensureToken(&error))
-    {
-      if (error.size() == 0)
-      {
-        error.assign("gcp auth failed"_ctv);
-      }
-      return false;
-    }
-
-    String url = {};
-    url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/global/operations/{}?fields=status,error,httpErrorMessage,statusMessage"_ctv>(
-        projectId,
-        operationName);
-
-    int64_t deadlineMs = Time::now<TimeResolution::ms>() + int64_t(prodigyMachineProvisioningTimeoutMs);
-    while (Time::now<TimeResolution::ms>() < deadlineMs)
-    {
-      String response = {};
-      String transportFailure = {};
-      long httpStatus = 0;
-      if (sendElasticComputeRequest("GET", url, nullptr, response, &httpStatus, transportFailure) == false)
-      {
-        if (parseAPIErrorMessage(response, error) == false)
-        {
-          error = transportFailure.size() > 0 ? transportFailure : "gcp global operation poll failed"_ctv;
-        }
-        return false;
-      }
-
-      simdjson::dom::parser parser;
-      simdjson::dom::element operation = {};
-      if (parser.parse(response.c_str(), response.size()).get(operation))
-      {
-        error.assign("gcp global operation response parse failed"_ctv);
-        return false;
-      }
-
-      std::string_view status = {};
-      if (!operation["status"].get(status) && status == "DONE")
-      {
-        if (extractOperationFailure(operation, error))
-        {
-          return false;
-        }
-
-        return true;
-      }
-
-      usleep(500 * 1000);
-    }
-
-    error.snprintf<"timed out waiting for gcp global operation '{}'"_ctv>(operationName);
-    return false;
-  }
-
-  bool fetchElasticInstanceNameForCloudID(const String& cloudID, String& name, String& failure)
-  {
-    name.clear();
-    failure.clear();
-    if (cloudID.size() == 0)
-    {
-      failure.assign("gcp instance cloudID required"_ctv);
-      return false;
-    }
-
-    String nextPageToken = {};
-    for (;;)
-    {
-      String url = {};
-      url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances?fields=items(name,id),nextPageToken"_ctv>(projectId, zone);
-      appendPageTokenQuery(url, nextPageToken);
-
-      String response = {};
-      String transportFailure = {};
-      long httpStatus = 0;
-      if (sendElasticComputeRequest("GET", url, nullptr, response, &httpStatus, transportFailure) == false)
-      {
-        if (parseAPIErrorMessage(response, failure) == false)
-        {
-          failure = transportFailure.size() > 0 ? transportFailure : "gcp instance listing failed"_ctv;
-        }
-        return false;
-      }
-
-      simdjson::dom::parser parser;
-      simdjson::dom::element doc = {};
-      if (parser.parse(response.c_str(), response.size()).get(doc))
-      {
-        failure.assign("gcp instance list response parse failed"_ctv);
-        return false;
-      }
-
-      if (auto items = doc["items"]; items.is_array())
-      {
-        for (auto item : items.get_array())
-        {
-          std::string_view instanceID = {};
-          if (item["id"].get(instanceID) || cloudID != String(instanceID))
-          {
-            continue;
-          }
-
-          std::string_view instanceName = {};
-          if (!item["name"].get(instanceName) && instanceName.size() > 0)
-          {
-            name.assign(instanceName);
-            return true;
-          }
-        }
-      }
-
-      std::string_view pageToken = {};
-      if (doc["nextPageToken"].get(pageToken))
-      {
-        break;
-      }
-
-      nextPageToken.assign(pageToken);
-      if (nextPageToken.size() == 0)
-      {
-        break;
-      }
-    }
-
-    failure.assign("gcp target instance not found"_ctv);
-    return false;
-  }
-
-  bool fetchElasticInstanceDocument(const String& instanceName, const String& fields, String& response, simdjson::dom::parser& parser, simdjson::dom::element& instance, String& error)
-  {
-    response.clear();
-    error.clear();
-    if (instanceName.size() == 0)
-    {
-      error.assign("gcp instanceName required"_ctv);
-      return false;
-    }
-
-    String url = {};
-    if (fields.size() > 0)
-    {
-      url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances/{}?fields={}"_ctv>(projectId, zone, instanceName, fields);
+      error.snprintf<"{} (HTTP {itoa})"_ctv>(String(fallback), uint32_t(result.statusCode));
     }
     else
     {
-      url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances/{}"_ctv>(projectId, zone, instanceName);
+      error.assign(fallback);
     }
-
-    String transportFailure = {};
-    long httpStatus = 0;
-    if (sendElasticComputeRequest("GET", url, nullptr, response, &httpStatus, transportFailure) == false)
-    {
-      if (parseAPIErrorMessage(response, error) == false)
-      {
-        error = transportFailure.size() > 0 ? transportFailure : "gcp instance fetch failed"_ctv;
-      }
-      return false;
-    }
-
-    if (parser.parse(response.c_str(), response.size()).get(instance))
-    {
-      error.assign("gcp instance response parse failed"_ctv);
-      return false;
-    }
-
-    return true;
   }
 
-  bool findElasticInterfaceForAddress(const String& instanceName, const String& addressText, String& nicName, String& accessConfigName, String& error)
+  void ensureValidationAuth(CoroutineStack *coro, MultiCurlClient::TimePoint deadline, String& error)
   {
-    nicName.clear();
-    accessConfigName.clear();
     error.clear();
-
-    String response = {};
-    simdjson::dom::parser parser;
-    simdjson::dom::element instance = {};
-    if (fetchElasticInstanceDocument(instanceName, "networkInterfaces(name,accessConfigs(name,natIP,externalIpv6))", response, parser, instance, error) == false)
+    if (validationAuthReady)
     {
-      return false;
+      co_return;
+    }
+    ProdigyHostHttpOperation::Submission client = hostHttpSubmission();
+    if (coro == nullptr || client.submit == nullptr || client.cancel == nullptr)
+    {
+      error.assign("gcp validation HTTP client unavailable"_ctv);
+      co_return;
+    }
+    if (MultiCurlClient::Clock::now() >= deadline)
+    {
+      error.assign("gcp validation deadline exceeded"_ctv);
+      co_return;
+    }
+    bool projectZoneReady = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureProjectZoneAsync(coro, projectZoneReady, deadline);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (projectZoneReady == false)
+    {
+      error.assign("gcp validation project/zone unavailable"_ctv);
+      co_return;
     }
 
-    if (auto nics = instance["networkInterfaces"]; nics.is_array())
+    bool tokenReady = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureTokenAsync(coro, tokenReady, &error, deadline);
+        }))
     {
-      for (auto nic : nics.get_array())
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (tokenReady == false)
+    {
+      if (error.size() == 0)
       {
-        std::string_view nicNameView = {};
-        (void)nic["name"].get(nicNameView);
-        if (auto accessConfigs = nic["accessConfigs"]; accessConfigs.is_array())
-        {
-          for (auto access : accessConfigs.get_array())
-          {
-            std::string_view natIP = {};
-            if (!access["natIP"].get(natIP) && natIP == stringViewFor(addressText))
-            {
-              nicName.assign(nicNameView);
-              std::string_view accessName = {};
-              if (!access["name"].get(accessName) && accessName.size() > 0)
-              {
-                accessConfigName.assign(accessName);
-              }
-              else
-              {
-                accessConfigName.assign("External NAT"_ctv);
-              }
-              return true;
-            }
-          }
-        }
+        error.assign("gcp validation token unavailable"_ctv);
       }
+      co_return;
     }
-
-    return false;
+    validationAuthReady = true;
   }
 
-  bool describeElasticTargetInterface(const String& instanceName, String& nicName, String& accessConfigName, String& existingPublicAddress, bool& hasAccessConfig, String& error)
+  void ensureValidationZoneCpuPlatforms(CoroutineStack *coro, MultiCurlClient::TimePoint deadline, String& error)
   {
-    nicName.clear();
-    accessConfigName.assign("External NAT"_ctv);
-    existingPublicAddress.clear();
-    hasAccessConfig = false;
-    error.clear();
-
-    String response = {};
-    simdjson::dom::parser parser;
-    simdjson::dom::element instance = {};
-    if (fetchElasticInstanceDocument(instanceName, "networkInterfaces(name,accessConfigs(name,natIP,externalIpv6))", response, parser, instance, error) == false)
+    if (validationZoneCpuPlatformsReady)
     {
-      return false;
-    }
-
-    auto nics = instance["networkInterfaces"].get_array();
-    if (nics.error())
-    {
-      error.assign("gcp instance missing networkInterfaces"_ctv);
-      return false;
-    }
-
-    for (auto nic : nics)
-    {
-      std::string_view nicNameView = {};
-      if (!nic["name"].get(nicNameView) && nicNameView.size() > 0)
-      {
-        nicName.assign(nicNameView);
-      }
-
-      if (auto accessConfigs = nic["accessConfigs"]; accessConfigs.is_array())
-      {
-        for (auto access : accessConfigs.get_array())
-        {
-          hasAccessConfig = true;
-          std::string_view accessName = {};
-          if (!access["name"].get(accessName) && accessName.size() > 0)
-          {
-            accessConfigName.assign(accessName);
-          }
-
-          std::string_view natIP = {};
-          if (!access["natIP"].get(natIP) && natIP.size() > 0)
-          {
-            existingPublicAddress.assign(natIP);
-          }
-          return true;
-        }
-      }
-
-      return true;
-    }
-
-    error.assign("gcp instance missing network interface name"_ctv);
-    return false;
-  }
-
-  bool deleteElasticAccessConfig(const String& instanceName, const String& nicName, const String& accessConfigName, String& error)
-  {
-    error.clear();
-    if (instanceName.size() == 0 || nicName.size() == 0 || accessConfigName.size() == 0)
-    {
-      return true;
+      co_return;
     }
 
     String url = {};
-    url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances/{}/deleteAccessConfig?networkInterface="_ctv>(
-        projectId,
-        zone,
-        instanceName);
-    appendPercentEncoded(url, nicName);
-    url.append("&accessConfig="_ctv);
-    appendPercentEncoded(url, accessConfigName);
-
-    String response = {};
-    String transportFailure = {};
-    long httpStatus = 0;
-    String emptyBody = {};
-    if (sendElasticComputeRequest("POST", url, &emptyBody, response, &httpStatus, transportFailure) == false)
+    url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}?fields=availableCpuPlatforms"_ctv>(projectId, zone);
+    MultiCurlClient::Result result = {};
+    bool success = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          hostRequest(coro, computeValidationRequest(url, token, MultiCurlClient::Clock::now(), deadline), result, success);
+        }))
     {
-      if (httpStatus == 404 || containsCString(response, "notFound") || containsCString(response, "was not found"))
-      {
-        error.clear();
-        return true;
-      }
-
-      if (parseAPIErrorMessage(response, error) == false)
-      {
-        error = transportFailure.size() > 0 ? transportFailure : "gcp deleteAccessConfig failed"_ctv;
-      }
-      return false;
+      co_await coro->suspendAtIndex(suspendIndex);
     }
-
-    String operationName = {};
-    if (parseOperationName(response, operationName, &error) == false)
+    if (success == false)
     {
-      return false;
-    }
-
-    return waitForElasticZoneOperation(operationName, error);
-  }
-
-  bool attachElasticAccessConfig(const String& instanceName, const String& nicName, const String& accessConfigName, const String& publicAddress, String& associationID, String& error)
-  {
-    associationID.clear();
-    error.clear();
-    if (instanceName.size() == 0 || nicName.size() == 0 || accessConfigName.size() == 0 || publicAddress.size() == 0)
-    {
-      error.assign("gcp attach elastic address requires instance, nic, access config, and address"_ctv);
-      return false;
-    }
-
-    String url = {};
-    url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances/{}/addAccessConfig?networkInterface="_ctv>(
-        projectId,
-        zone,
-        instanceName);
-    appendPercentEncoded(url, nicName);
-
-    String body = {};
-    body.append("{\"name\":"_ctv);
-    prodigyAppendEscapedJSONStringLiteral(body, accessConfigName);
-    body.append(",\"type\":\"ONE_TO_ONE_NAT\",\"natIP\":"_ctv);
-    prodigyAppendEscapedJSONStringLiteral(body, publicAddress);
-    body.append(",\"networkTier\":\"PREMIUM\""_ctv);
-    body.append("}"_ctv);
-
-    String response = {};
-    String transportFailure = {};
-    long httpStatus = 0;
-    if (sendElasticComputeRequest("POST", url, &body, response, &httpStatus, transportFailure) == false)
-    {
-      if (parseAPIErrorMessage(response, error) == false)
-      {
-        error = transportFailure.size() > 0 ? transportFailure : "gcp addAccessConfig failed"_ctv;
-      }
-      return false;
-    }
-
-    String operationName = {};
-    if (parseOperationName(response, operationName, &error) == false)
-    {
-      return false;
-    }
-
-    if (waitForElasticZoneOperation(operationName, error) == false)
-    {
-      return false;
-    }
-
-    associationID.snprintf<"{}|{}|{}"_ctv>(instanceName, nicName, accessConfigName);
-    return true;
-  }
-
-  static bool parseElasticAssociationID(const String& associationID, String& instanceName, String& nicName, String& accessConfigName)
-  {
-    instanceName.clear();
-    nicName.clear();
-    accessConfigName.clear();
-
-    int64_t first = -1;
-    for (uint64_t index = 0; index < associationID.size(); ++index)
-    {
-      if (associationID[index] == '|')
-      {
-        first = int64_t(index);
-        break;
-      }
-    }
-    if (first < 0)
-    {
-      return false;
-    }
-
-    int64_t second = -1;
-    for (uint64_t index = uint64_t(first + 1); index < associationID.size(); ++index)
-    {
-      if (associationID[index] == '|')
-      {
-        second = int64_t(index);
-        break;
-      }
-    }
-    if (second < 0)
-    {
-      return false;
-    }
-
-    instanceName.assign(associationID.substr(0, uint64_t(first), Copy::yes));
-    nicName.assign(associationID.substr(uint64_t(first + 1), uint64_t(second - first - 1), Copy::yes));
-    accessConfigName.assign(associationID.substr(uint64_t(second + 1), associationID.size() - uint64_t(second + 1), Copy::yes));
-    return instanceName.size() > 0 && nicName.size() > 0 && accessConfigName.size() > 0;
-  }
-
-  bool fetchElasticAddressByName(const String& addressName, String& publicAddress, String& userInstanceName, String& error)
-  {
-    publicAddress.clear();
-    userInstanceName.clear();
-    error.clear();
-    if (addressName.size() == 0)
-    {
-      error.assign("gcp address resource name required"_ctv);
-      return false;
-    }
-
-    String regionFailure = {};
-    if (ensureRegion(regionFailure) == false)
-    {
-      error.assign(regionFailure);
-      return false;
-    }
-
-    String url = {};
-    url.snprintf<"https://compute.googleapis.com/compute/beta/projects/{}/regions/{}/addresses/{}?fields=name,address,users"_ctv>(
-        projectId,
-        region,
-        addressName);
-
-    String response = {};
-    String transportFailure = {};
-    long httpStatus = 0;
-    if (sendElasticComputeRequest("GET", url, nullptr, response, &httpStatus, transportFailure) == false)
-    {
-      if (parseAPIErrorMessage(response, error) == false)
-      {
-        error = transportFailure.size() > 0 ? transportFailure : "gcp address fetch failed"_ctv;
-      }
-      return false;
+      assignValidationRequestFailure(result, "gcp zone cpu platform lookup failed", error);
+      co_return;
     }
 
     simdjson::dom::parser parser;
-    simdjson::dom::element doc = {};
-    if (parser.parse(response.c_str(), response.size()).get(doc))
+    simdjson::dom::element document = {};
+    if (parser.parse(result.body.c_str(), result.body.size()).get(document))
     {
-      error.assign("gcp address response parse failed"_ctv);
-      return false;
+      error.assign("gcp zone cpu platform response parse failed"_ctv);
+      co_return;
     }
-
-    std::string_view addressView = {};
-    if (doc["address"].get(addressView))
+    validationZoneCpuPlatforms.clear();
+    if (document["availableCpuPlatforms"].is_array())
     {
-      error.assign("gcp address resource missing address"_ctv);
-      return false;
-    }
-    publicAddress.assign(addressView);
-
-    if (auto users = doc["users"]; users.is_array())
-    {
-      for (auto user : users.get_array())
+      for (auto item : document["availableCpuPlatforms"].get_array())
       {
-        std::string_view userURL = {};
-        if (!user.get(userURL) && userURL.size() > 0)
+        String platform;
+        if (prodigyJSONString(item, platform) == simdjson::SUCCESS && platform.size() > 0)
         {
-          String userText = {};
-          userText.assign(userURL);
-          (void)extractInstanceNameFromUserURL(userText, userInstanceName);
-          break;
+          validationZoneCpuPlatforms.emplace_back(platform);
         }
       }
     }
-
-    return true;
+    validationZoneCpuPlatformsReady = true;
   }
 
-  bool findElasticAddressByPublicIP(const String& requestedAddress, String& addressName, String& publicAddress, String& userInstanceName, String& error)
+  void testIamPermissions(CoroutineStack *coro,
+                          const String& url,
+                          const String& host,
+                          const char *const *permissions,
+                          uint32_t count,
+                          const char *label,
+                          MultiCurlClient::TimePoint deadline,
+                          bool& success,
+                          String& error)
   {
-    addressName.clear();
-    publicAddress.clear();
-    userInstanceName.clear();
-    error.clear();
-
-    String regionFailure = {};
-    if (ensureRegion(regionFailure) == false)
-    {
-      error.assign(regionFailure);
-      return false;
-    }
-
-    String nextPageToken = {};
-    for (;;)
-    {
-      String url = {};
-      url.snprintf<"https://compute.googleapis.com/compute/beta/projects/{}/regions/{}/addresses?fields=items(name,address,users),nextPageToken"_ctv>(
-          projectId,
-          region);
-      appendPageTokenQuery(url, nextPageToken);
-
-      String response = {};
-      String transportFailure = {};
-      long httpStatus = 0;
-      if (sendElasticComputeRequest("GET", url, nullptr, response, &httpStatus, transportFailure) == false)
-      {
-        if (parseAPIErrorMessage(response, error) == false)
-        {
-          error = transportFailure.size() > 0 ? transportFailure : "gcp address listing failed"_ctv;
-        }
-        return false;
-      }
-
-      simdjson::dom::parser parser;
-      simdjson::dom::element doc = {};
-      if (parser.parse(response.c_str(), response.size()).get(doc))
-      {
-        error.assign("gcp address list response parse failed"_ctv);
-        return false;
-      }
-
-      if (auto items = doc["items"]; items.is_array())
-      {
-        for (auto item : items.get_array())
-        {
-          std::string_view addressView = {};
-          if (item["address"].get(addressView) || addressView != stringViewFor(requestedAddress))
-          {
-            continue;
-          }
-
-          std::string_view nameView = {};
-          if (item["name"].get(nameView))
-          {
-            error.assign("gcp address resource missing name"_ctv);
-            return false;
-          }
-
-          addressName.assign(nameView);
-          publicAddress.assign(addressView);
-          if (auto users = item["users"]; users.is_array())
-          {
-            for (auto user : users.get_array())
-            {
-              std::string_view userURL = {};
-              if (!user.get(userURL) && userURL.size() > 0)
-              {
-                String userText = {};
-                userText.assign(userURL);
-                (void)extractInstanceNameFromUserURL(userText, userInstanceName);
-                break;
-              }
-            }
-          }
-          return true;
-        }
-      }
-
-      std::string_view pageToken = {};
-      if (doc["nextPageToken"].get(pageToken))
-      {
-        break;
-      }
-
-      nextPageToken.assign(pageToken);
-      if (nextPageToken.size() == 0)
-      {
-        break;
-      }
-    }
-
-    error.snprintf<"gcp elastic address {} not found"_ctv>(requestedAddress);
-    return false;
-  }
-
-  bool allocateElasticAddress(const String& providerPool, String& addressName, String& publicAddress, String& error)
-  {
-    addressName.clear();
-    publicAddress.clear();
-    error.clear();
-
-    String regionFailure = {};
-    if (ensureRegion(regionFailure) == false)
-    {
-      error.assign(regionFailure);
-      return false;
-    }
-
-    addressName.snprintf<"ntg-eip-{itoa}"_ctv>(Random::generateNumberWithNBits<24, uint32_t>());
-
-    String url = {};
-    url.snprintf<"https://compute.googleapis.com/compute/beta/projects/{}/regions/{}/addresses"_ctv>(projectId, region);
-
-    String body = {};
-    body.append("{\"name\":"_ctv);
-    prodigyAppendEscapedJSONStringLiteral(body, addressName);
-    body.append(",\"addressType\":\"EXTERNAL\",\"networkTier\":\"PREMIUM\""_ctv);
-    if (providerPool.size() > 0)
-    {
-      body.append(",\"ipCollection\":"_ctv);
-      prodigyAppendEscapedJSONStringLiteral(body, providerPool);
-    }
-    body.append("}"_ctv);
-
-    String response = {};
-    String transportFailure = {};
-    long httpStatus = 0;
-    if (sendElasticComputeRequest("POST", url, &body, response, &httpStatus, transportFailure) == false)
-    {
-      if (parseAPIErrorMessage(response, error) == false)
-      {
-        error = transportFailure.size() > 0 ? transportFailure : "gcp address allocation failed"_ctv;
-      }
-      return false;
-    }
-
-    String operationName = {};
-    if (parseOperationName(response, operationName, &error) == false)
-    {
-      return false;
-    }
-
-    if (waitForElasticRegionOperation(operationName, error) == false)
-    {
-      return false;
-    }
-
-    String userInstanceName = {};
-    return fetchElasticAddressByName(addressName, publicAddress, userInstanceName, error);
-  }
-
-  bool releaseElasticAddressAllocation(const String& addressName, String& error)
-  {
-    error.clear();
-    if (addressName.size() == 0)
-    {
-      return true;
-    }
-
-    String regionFailure = {};
-    if (ensureRegion(regionFailure) == false)
-    {
-      error.assign(regionFailure);
-      return false;
-    }
-
-    String url = {};
-    url.snprintf<"https://compute.googleapis.com/compute/beta/projects/{}/regions/{}/addresses/{}"_ctv>(
-        projectId,
-        region,
-        addressName);
-
-    String response = {};
-    String transportFailure = {};
-    long httpStatus = 0;
-    String emptyBody = {};
-    if (sendElasticComputeRequest("DELETE", url, &emptyBody, response, &httpStatus, transportFailure) == false)
-    {
-      if (httpStatus == 404 || containsCString(response, "notFound") || containsCString(response, "was not found"))
-      {
-        error.clear();
-        return true;
-      }
-
-      if (parseAPIErrorMessage(response, error) == false)
-      {
-        error = transportFailure.size() > 0 ? transportFailure : "gcp address release failed"_ctv;
-      }
-      return false;
-    }
-
-    String operationName = {};
-    if (parseOperationName(response, operationName, &error) == false)
-    {
-      return false;
-    }
-
-    return waitForElasticRegionOperation(operationName, error);
-  }
-
-  bool testIamPermissions(const String& url, const char *const *permissions, uint32_t count, const char *label, String& error)
-  {
+    success = false;
     String body = {};
     body.append("{\"permissions\":["_ctv);
     for (uint32_t index = 0; index < count; ++index)
@@ -3526,24 +1785,26 @@ private:
     }
     body.append("]}"_ctv);
 
-    String response = {};
-    String transportFailure = {};
-    long httpStatus = 0;
-    if (sendElasticComputeRequest("POST", url, &body, response, &httpStatus, transportFailure) == false)
+    MultiCurlClient::Result result = {};
+    bool requestSucceeded = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          hostRequest(coro, iamValidationRequest(url, host, token, body, MultiCurlClient::Clock::now(), deadline), result, requestSucceeded);
+        }))
     {
-      if (parseAPIErrorMessage(response, error) == false)
-      {
-        error = transportFailure.size() > 0 ? transportFailure : "gcp iam permissions test failed"_ctv;
-      }
-      return false;
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (requestSucceeded == false)
+    {
+      assignValidationRequestFailure(result, "gcp iam permissions test failed", error);
+      co_return;
     }
 
     simdjson::dom::parser parser;
     simdjson::dom::element doc = {};
-    if (parser.parse(response.c_str(), response.size()).get(doc))
+    if (parser.parse(result.body.c_str(), result.body.size()).get(doc))
     {
       error.assign("gcp iam permissions response parse failed"_ctv);
-      return false;
+      co_return;
     }
 
     String missing = {};
@@ -3554,8 +1815,9 @@ private:
       {
         for (auto entry : returned.get_array())
         {
-          std::string_view text = {};
-          if (entry.get(text) == simdjson::SUCCESS && text == permissions[index])
+          String text;
+          if (prodigyJSONString(entry, text) == simdjson::SUCCESS &&
+              text.equal(permissions[index], strlen(permissions[index])))
           {
             found = true;
             break;
@@ -3580,11 +1842,11 @@ private:
     if (missing.size() > 0)
     {
       error = missing;
-      return false;
+      co_return;
     }
 
     error.clear();
-    return true;
+    success = true;
   }
 
 public:
@@ -3606,7 +1868,7 @@ public:
     return true;
   }
 
-  bool preflightClusterCreate(const BrainIaaSClusterCreatePreflight& preflight, String& error) override
+  void preflightClusterCreate(CoroutineStack *coro, const BrainIaaSClusterCreatePreflight& preflight, String& error) override
   {
     error.clear();
 
@@ -3623,22 +1885,34 @@ public:
     if (config == nullptr)
     {
       error.assign("gcp preflight requires a vm machine schema with vmImageURI and providerMachineType"_ctv);
-      return false;
+      co_return;
     }
 
     if (preflight.gcpServiceAccountEmail.size() == 0)
     {
       error.assign("gcp preflight requires gcp.serviceAccountEmail"_ctv);
-      return false;
+      co_return;
+    }
+    if (coro == nullptr)
+    {
+      error.assign("gcp preflight coroutine required"_ctv);
+      co_return;
     }
 
-    if (ensureProjectZone() == false || ensureToken(&error) == false)
+    MultiCurlClient::TimePoint deadline = providerServices.operationDeadline;
+    if (deadline == MultiCurlClient::TimePoint::max())
     {
-      if (error.size() == 0)
-      {
-        error.assign("gcp auth failed"_ctv);
-      }
-      return false;
+      deadline = MultiCurlClient::Clock::now() + std::chrono::seconds(30);
+    }
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureValidationAuth(coro, deadline, error);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (error.size() > 0)
+    {
+      co_return;
     }
 
     constexpr static const char *projectPermissions[] = {
@@ -3665,7 +1939,15 @@ public:
     String projectURL = {};
     projectURL.snprintf<"https://cloudresourcemanager.googleapis.com/v1/projects/{}:testIamPermissions"_ctv>(projectId);
     String projectError = {};
-    bool projectOK = testIamPermissions(projectURL, projectPermissions, uint32_t(sizeof(projectPermissions) / sizeof(projectPermissions[0])), "project", projectError);
+    bool projectOK = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          testIamPermissions(coro, projectURL, "cloudresourcemanager.googleapis.com"_ctv,
+                             projectPermissions, uint32_t(sizeof(projectPermissions) / sizeof(projectPermissions[0])),
+                             "project", deadline, projectOK, projectError);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
 
     constexpr static const char *serviceAccountPermissions[] = {"iam.serviceAccounts.actAs"};
     String serviceAccountURL = {};
@@ -3673,7 +1955,15 @@ public:
     appendPercentEncoded(serviceAccountURL, preflight.gcpServiceAccountEmail);
     serviceAccountURL.append(":testIamPermissions"_ctv);
     String serviceAccountError = {};
-    bool serviceAccountOK = testIamPermissions(serviceAccountURL, serviceAccountPermissions, uint32_t(sizeof(serviceAccountPermissions) / sizeof(serviceAccountPermissions[0])), "service account", serviceAccountError);
+    bool serviceAccountOK = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          testIamPermissions(coro, serviceAccountURL, "iam.googleapis.com"_ctv,
+                             serviceAccountPermissions, uint32_t(sizeof(serviceAccountPermissions) / sizeof(serviceAccountPermissions[0])),
+                             "service account", deadline, serviceAccountOK, serviceAccountError);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
 
     if (projectOK == false || serviceAccountOK == false)
     {
@@ -3690,31 +1980,49 @@ public:
         }
         error.append(serviceAccountError);
       }
-      return false;
+      co_return;
     }
 
     error.clear();
-    return true;
   }
 
-  bool inferMachineSchemaCpuCapability(const MachineConfig& config, MachineSchemaCpuCapability& capability, String& error) override
+  void inferMachineSchemaCpuCapability(CoroutineStack *coro, const MachineConfig& config, MachineSchemaCpuCapability& capability, String& error) override
   {
     capability = {};
     error.clear();
+    if (coro == nullptr)
+    {
+      error.assign("gcp schema cpu inference coroutine required"_ctv);
+      co_return;
+    }
 
     if (config.providerMachineType.size() == 0)
     {
       error.assign("gcp schema cpu inference requires providerMachineType"_ctv);
-      return false;
+      co_return;
     }
 
-    if (ensureProjectZone() == false || ensureToken(&error) == false)
+    auto cached = validationMachineCapabilities.find(config.providerMachineType);
+    if (cached != validationMachineCapabilities.end())
     {
-      if (error.size() == 0)
-      {
-        error.assign("gcp auth failed"_ctv);
-      }
-      return false;
+      capability = cached->second;
+      co_return;
+    }
+
+    MultiCurlClient::TimePoint deadline = providerServices.operationDeadline;
+    if (deadline == MultiCurlClient::TimePoint::max())
+    {
+      deadline = MultiCurlClient::Clock::now() + std::chrono::seconds(15);
+    }
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureValidationAuth(coro, deadline, error);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (error.size() > 0)
+    {
+      co_return;
     }
 
     String machineTypeUrl = {};
@@ -3723,94 +2031,74 @@ public:
         zone,
         config.providerMachineType);
 
-    String machineTypeResponse = {};
-    String transportFailure = {};
-    long httpStatus = 0;
-    if (sendElasticComputeRequest("GET", machineTypeUrl, nullptr, machineTypeResponse, &httpStatus, transportFailure) == false)
+    MultiCurlClient::Result machineTypeResult = {};
+    bool machineTypeSuccess = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          hostRequest(coro, computeValidationRequest(machineTypeUrl, token, MultiCurlClient::Clock::now(), deadline), machineTypeResult, machineTypeSuccess);
+        }))
     {
-      if (parseAPIErrorMessage(machineTypeResponse, error) == false)
-      {
-        error = transportFailure.size() > 0 ? transportFailure : "gcp machineTypes lookup failed"_ctv;
-      }
-      return false;
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (machineTypeSuccess == false)
+    {
+      assignValidationRequestFailure(machineTypeResult, "gcp machineTypes lookup failed", error);
+      co_return;
     }
 
     simdjson::dom::parser parser;
     simdjson::dom::element doc = {};
-    if (parser.parse(machineTypeResponse.c_str(), machineTypeResponse.size()).get(doc))
+    if (parser.parse(machineTypeResult.body.c_str(), machineTypeResult.body.size()).get(doc))
     {
       error.assign("gcp machineTypes response parse failed"_ctv);
-      return false;
+      co_return;
     }
 
     String architectureText = {};
-    std::string_view architectureView = {};
-    if (doc["architecture"].get(architectureView) == simdjson::SUCCESS)
+    String architectureView;
+    if (prodigyJSONString(doc["architecture"], architectureView) == simdjson::SUCCESS)
     {
       architectureText.assign(architectureView);
     }
-    if (resolveMachineArchitecture(config.providerMachineType, architectureText, capability.architecture) == false)
+    MachineSchemaCpuCapability inferred = {};
+    if (resolveMachineArchitecture(config.providerMachineType, architectureText, inferred.architecture) == false)
     {
       error.snprintf<"gcp machineTypes architecture '{}' unsupported for machineType '{}'"_ctv>(architectureText, config.providerMachineType);
-      return false;
+      co_return;
     }
 
-    String zoneUrl = {};
-    zoneUrl.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}?fields=availableCpuPlatforms"_ctv>(projectId, zone);
-
-    String zoneResponse = {};
-    transportFailure.clear();
-    httpStatus = 0;
-    if (sendElasticComputeRequest("GET", zoneUrl, nullptr, zoneResponse, &httpStatus, transportFailure) == false)
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureValidationZoneCpuPlatforms(coro, deadline, error);
+        }))
     {
-      if (parseAPIErrorMessage(zoneResponse, error) == false)
-      {
-        error = transportFailure.size() > 0 ? transportFailure : "gcp zone cpu platform lookup failed"_ctv;
-      }
-      return false;
+      co_await coro->suspendAtIndex(suspendIndex);
     }
-
-    simdjson::dom::parser zoneParser;
-    simdjson::dom::element zoneDoc = {};
-    if (zoneParser.parse(zoneResponse.c_str(), zoneResponse.size()).get(zoneDoc))
+    if (error.size() > 0)
     {
-      error.assign("gcp zone cpu platform response parse failed"_ctv);
-      return false;
+      co_return;
     }
 
     Vector<String> compatiblePlatforms = {};
-    if (zoneDoc["availableCpuPlatforms"].is_array())
+    for (const String& platform : validationZoneCpuPlatforms)
     {
-      for (auto item : zoneDoc["availableCpuPlatforms"].get_array())
+      if (gcpCpuPlatformMatchesArchitecture(platform, inferred.architecture))
       {
-        std::string_view platformView = {};
-        if (item.get(platformView) != simdjson::SUCCESS || platformView.size() == 0)
-        {
-          continue;
-        }
-
-        String platform = {};
-        platform.assign(platformView);
-        if (gcpCpuPlatformMatchesArchitecture(platform, capability.architecture) == false)
-        {
-          continue;
-        }
-
         compatiblePlatforms.push_back(platform);
       }
     }
 
     if (compatiblePlatforms.empty())
     {
-      capability.provenance = MachineSchemaCpuCapabilityProvenance::unavailable;
-      return true;
+      inferred.provenance = MachineSchemaCpuCapabilityProvenance::unavailable;
+      validationMachineCapabilities.insert_or_assign(config.providerMachineType, inferred);
+      capability = std::move(inferred);
+      co_return;
     }
 
     Vector<String> intersected = {};
     for (uint32_t index = 0; index < compatiblePlatforms.size(); ++index)
     {
       Vector<String> platformFeatures = {};
-      gcpAppendCpuPlatformIsaFeatures(capability.architecture, compatiblePlatforms[index], platformFeatures);
+      gcpAppendCpuPlatformIsaFeatures(inferred.architecture, compatiblePlatforms[index], platformFeatures);
       if (index == 0)
       {
         intersected = platformFeatures;
@@ -3823,120 +2111,64 @@ public:
 
     if (compatiblePlatforms.size() == 1)
     {
-      capability.cpuPlatform = compatiblePlatforms[0];
+      inferred.cpuPlatform = compatiblePlatforms[0];
     }
 
-    capability.isaFeatures = std::move(intersected);
-    capability.provenance = MachineSchemaCpuCapabilityProvenance::providerAuthoritative;
-    return true;
+    inferred.isaFeatures = std::move(intersected);
+    inferred.provenance = MachineSchemaCpuCapabilityProvenance::providerAuthoritative;
+    validationMachineCapabilities.insert_or_assign(config.providerMachineType, inferred);
+    capability = std::move(inferred);
   }
 
-  bool ensureManagedInstanceTemplate(const String& templateName,
-                                     const String& serviceAccountEmail,
-                                     const String& network,
-                                     const String& subnetwork,
-                                     const MachineConfig& config,
-                                     bool spot,
-                                     String& error)
+  void prepareManagedInstanceTemplates(CoroutineStack *coro,
+                                       const Vector<GcpManagedTemplateTransaction::Spec>& specs,
+                                       String& error)
   {
     error.clear();
-
-    if (templateName.size() == 0)
+    const MultiCurlClient::TimePoint deadline = providerServices.operationDeadline;
+    if (coro == nullptr || MultiCurlClient::Clock::now() >= deadline)
     {
-      error.assign("gcp managed instance template name required"_ctv);
-      return false;
+      error.assign("gcp managed template deadline exceeded"_ctv);
+      co_return;
     }
-
-    if (serviceAccountEmail.size() == 0)
+    bool identityReady = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureProjectZoneAsync(coro, identityReady, deadline);
+        }))
     {
-      error.assign("gcp managed instance template requires serviceAccountEmail"_ctv);
-      return false;
+      co_await coro->suspendAtIndex(suspendIndex);
     }
-
-    if (config.providerMachineType.size() == 0)
+    if (identityReady == false)
     {
-      error.assign("gcp managed instance template requires providerMachineType"_ctv);
-      return false;
+      error.assign("gcp managed template project/zone unavailable"_ctv);
+      co_return;
     }
-
-    if (config.vmImageURI.size() == 0)
+    bool tokenReady = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureTokenAsync(coro, tokenReady, &error, deadline);
+        }))
     {
-      error.assign("gcp managed instance template requires vmImageURI"_ctv);
-      return false;
+      co_await coro->suspendAtIndex(suspendIndex);
     }
-
-    if (!ensureProjectZone() || !ensureToken(&error))
+    if (tokenReady == false)
     {
-      if (error.size() == 0)
+      if (error.empty())
       {
-        error.assign("gcp auth failed"_ctv);
+        error.assign("gcp managed template token unavailable"_ctv);
       }
-      return false;
+      co_return;
     }
-
-    if (deleteInstanceTemplateIfExists(templateName, error) == false)
+    GcpManagedTemplateTransaction transaction(hostHttpSubmission(),
+                                              ProdigyHostDelayOperation::submission(),
+                                              projectId,
+                                              token,
+                                              deadline);
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          transaction.run(coro, specs, error);
+        }))
     {
-      return false;
+      co_await coro->suspendAtIndex(suspendIndex);
     }
-
-    String body = {};
-    body.append("{\"name\":"_ctv);
-    prodigyAppendEscapedJSONStringLiteral(body, templateName);
-    body.append(",\"properties\":{\"machineType\":"_ctv);
-    prodigyAppendEscapedJSONStringLiteral(body, config.providerMachineType);
-    if (config.cpu.cpuPlatform.size() > 0)
-    {
-      body.append(",\"minCpuPlatform\":"_ctv);
-      prodigyAppendEscapedJSONStringLiteral(body, config.cpu.cpuPlatform);
-    }
-
-    body.append(",\"labels\":{\"app\":\"prodigy\",\"brain\":\"false\"}"_ctv);
-    body.append(",\"tags\":{\"items\":[\"prodigy\"]}"_ctv);
-    body.append(",\"metadata\":{\"items\":[{\"key\":\"brain\",\"value\":\"false\"}]}"_ctv);
-    body.append(",\"serviceAccounts\":[{\"email\":"_ctv);
-    prodigyAppendEscapedJSONStringLiteral(body, serviceAccountEmail);
-    body.append(",\"scopes\":[\"https://www.googleapis.com/auth/cloud-platform\"]}]"_ctv);
-    body.append(",\"networkInterfaces\":[{\"network\":"_ctv);
-    prodigyAppendEscapedJSONStringLiteral(body, network);
-    if (subnetwork.size() > 0)
-    {
-      body.append(",\"subnetwork\":"_ctv);
-      prodigyAppendEscapedJSONStringLiteral(body, subnetwork);
-    }
-    body.append(",\"accessConfigs\":[{\"name\":\"External NAT\",\"type\":\"ONE_TO_ONE_NAT\"}]}]"_ctv);
-    body.append(",\"disks\":[{\"boot\":true,\"autoDelete\":true,\"type\":\"PERSISTENT\",\"initializeParams\":{\"sourceImage\":"_ctv);
-    prodigyAppendEscapedJSONStringLiteral(body, config.vmImageURI);
-    body.append(",\"diskSizeGb\":20}}]"_ctv);
-
-    if (spot)
-    {
-      body.append(",\"scheduling\":{\"provisioningModel\":\"SPOT\",\"instanceTerminationAction\":\"DELETE\",\"automaticRestart\":false}"_ctv);
-    }
-
-    body.append("}}"_ctv);
-
-    String url = {};
-    url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/global/instanceTemplates"_ctv>(projectId);
-
-    String response = {};
-    String transportFailure = {};
-    long httpStatus = 0;
-    if (sendElasticComputeRequest("POST", url, &body, response, &httpStatus, transportFailure) == false)
-    {
-      if (parseAPIErrorMessage(response, error) == false)
-      {
-        error = transportFailure.size() > 0 ? transportFailure : "gcp instance template create failed"_ctv;
-      }
-      return false;
-    }
-
-    String operationName = {};
-    if (parseOperationName(response, operationName, &error) == false)
-    {
-      return false;
-    }
-
-    return waitForGlobalOperation(operationName, error);
   }
 
   void spinMachines(CoroutineStack *coro, MachineLifetime lifetime, const MachineConfig& config, uint32_t count, bytell_hash_set<Machine *>& newMachines, String& error) override
@@ -3947,37 +2179,41 @@ public:
   void spinMachines(CoroutineStack *coro, MachineLifetime lifetime, const MachineConfig& config, uint32_t count, bool isBrain, bytell_hash_set<Machine *>& newMachines, String& error) override
   {
     provisioningProgress.reset();
+    error.clear();
+    if (coro == nullptr)
+    {
+      error.assign("gcp provisioning coroutine required"_ctv);
+      co_return;
+    }
     if (lifetime == MachineLifetime::owned)
     {
       error.assign("gcp auto provisioning does not support MachineLifetime::owned"_ctv);
-      return;
+      co_return;
     }
     if (config.kind != MachineConfig::MachineKind::vm)
     {
       error.assign("gcp auto provisioning only supports vm machine kinds"_ctv);
-      return;
+      co_return;
     }
-    (void)coro;
-    if (!ensureProjectZone() || !ensureToken(&error))
+    if (count == 0 || count > GcpMachineProvisioningTransaction::maximumMachines)
     {
-      if (error.size() == 0)
-      {
-        error.assign("gcp auth failed"_ctv);
-      }
-      return;
+      error.assign("gcp provisioning requires between 1 and 256 machines"_ctv);
+      co_return;
     }
-    if (config.vmImageURI.size() == 0)
+    if (config.vmImageURI.empty())
     {
       error.assign("vmImageURI missing"_ctv);
-      return;
+      co_return;
     }
-    if (config.providerMachineType.size() == 0)
+    if (config.providerMachineType.empty())
     {
       error.assign("providerMachineType missing"_ctv);
-      return;
+      co_return;
     }
-    const String& instanceTemplateName = (lifetime == MachineLifetime::spot) ? config.gcpInstanceTemplateSpot : config.gcpInstanceTemplate;
-    if (instanceTemplateName.size() == 0)
+    const String& instanceTemplateName =
+        lifetime == MachineLifetime::spot ? config.gcpInstanceTemplateSpot :
+                                            config.gcpInstanceTemplate;
+    if (instanceTemplateName.empty())
     {
       if (lifetime == MachineLifetime::spot)
       {
@@ -3987,514 +2223,529 @@ public:
       {
         error.assign("gcpInstanceTemplate missing"_ctv);
       }
-      return;
+      co_return;
     }
-    String base;
-    base.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances"_ctv>(projectId, zone);
-    String instanceTemplateResponse = {};
-    simdjson::dom::parser templateParser;
-    simdjson::dom::element instanceTemplate;
-    if (fetchInstanceTemplate(instanceTemplateName, instanceTemplateResponse, templateParser, instanceTemplate, error) == false)
+    const MultiCurlClient::TimePoint localDeadline =
+        MultiCurlClient::Clock::now() +
+        std::chrono::milliseconds(prodigyMachineProvisioningTimeoutMs);
+    const MultiCurlClient::TimePoint deadline =
+        providerServices.operationDeadline < localDeadline ?
+            providerServices.operationDeadline : localDeadline;
+    if (MultiCurlClient::Clock::now() >= deadline)
     {
-      return;
+      error.assign("gcp provisioning deadline exceeded"_ctv);
+      co_return;
     }
 
-    class PendingCreateSubmission {
-    public:
-
-      String instanceName = {};
-      GcpHttp::MultiRequest request = {};
-      bool processed = false;
-    };
-
-    Vector<PendingMachineProvisioning> pendingMachines = {};
-    Vector<Machine *> readyMachines = {};
-    Vector<PendingCreateSubmission> createRequests = {};
-    createRequests.reserve(count);
-    auto destroyPendingMachineByName = [&](const String& instanceName) -> void {
-      if (instanceName.size() == 0)
+    ++provisioningOperations;
+    struct ActiveProvisioning final
+    {
+      uint32_t& operations;
+      ~ActiveProvisioning()
       {
-        return;
+        --operations;
       }
+    } activeProvisioning {provisioningOperations};
 
-      basics_log("gcp spinMachines destroy-pending instance=%.*s\n",
-                 int(instanceName.size()),
-                 reinterpret_cast<const char *>(instanceName.data()));
+    bool identityReady = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureProjectZoneAsync(coro, identityReady, deadline);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (identityReady == false)
+    {
+      error.assign("gcp provisioning project/zone unavailable"_ctv);
+      co_return;
+    }
 
-      struct curl_slist *headers = nullptr;
-      buildAuthHeaders(headers);
-      String url = {};
-      url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances/{}"_ctv>(projectId, zone, instanceName);
-      String response = {};
-      long httpStatus = 0;
-      if (GcpHttp::send("DELETE", url.c_str(), headers, String(), response, &httpStatus))
+    bool tokenReady = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureTokenAsync(coro, tokenReady, &error, deadline);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (tokenReady == false)
+    {
+      if (error.empty())
       {
-        String operationName = {};
-        String deleteError = {};
-        if (parseOperationName(response, operationName, &deleteError))
-        {
-          basics_log("gcp spinMachines destroy-pending-accepted instance=%.*s operation=%s\n",
-                     int(instanceName.size()),
-                     reinterpret_cast<const char *>(instanceName.data()),
-                     operationName.c_str());
-          (void)waitForZoneOperation(operationName, String(), String(), String(), deleteError);
-        }
+        error.assign("gcp provisioning token unavailable"_ctv);
       }
-      curl_slist_free_all(headers);
-    };
-    auto cleanupProvisioningFailure = [&]() -> void {
-      basics_log("gcp spinMachines cleanup ready=%u pending=%u\n",
-                 uint32_t(readyMachines.size()),
-                 uint32_t(createRequests.size()));
+      co_return;
+    }
 
-      for (Machine *machine : readyMachines)
-      {
-        destroyMachine(machine);
-        delete machine;
-      }
-
-      readyMachines.clear();
-      for (const PendingCreateSubmission& submission : createRequests)
-      {
-        destroyPendingMachineByName(submission.instanceName);
-      }
-      createRequests.clear();
-      pendingMachines.clear();
-    };
-
-    auto processCreateCompletion = [&](PendingCreateSubmission& submission) -> void {
-      if (submission.processed)
-      {
-        return;
-      }
-      submission.processed = true;
-
-      if (submission.request.curlCode != CURLE_OK || submission.request.httpStatus < 200 || submission.request.httpStatus >= 300)
-      {
-        if (error.size() == 0)
-        {
-          if (parseAPIErrorMessage(submission.request.response, error) == false)
-          {
-            error.assign(submission.request.transportFailure.size() > 0 ? submission.request.transportFailure : "gcp instance create failed"_ctv);
-          }
-        }
-        return;
-      }
-
-      String operationName = {};
-      if (parseOperationName(submission.request.response, operationName, &error) == false)
-      {
-        return;
-      }
-
-      PendingMachineProvisioning& pending = pendingMachines.emplace_back();
-      pending.instanceName = submission.instanceName;
-      pending.operationName = std::move(operationName);
-#if PRODIGY_DEBUG
-      basics_log("gcp create accepted instance=%s operation=%s schema=%.*s providerType=%.*s\n",
-                 pending.instanceName.c_str(),
-                 pending.operationName.c_str(),
-                 int(config.slug.size()),
-                 reinterpret_cast<const char *>(config.slug.data()),
-                 int(config.providerMachineType.size()),
-                 reinterpret_cast<const char *>(config.providerMachineType.data()));
-#endif
-    };
-
-    auto drainCreateCompletions = [&](GcpHttp::MultiClient& createClient) -> void {
-      while (GcpHttp::MultiRequest *completed = createClient.popCompleted())
-      {
-        PendingCreateSubmission *submission = reinterpret_cast<PendingCreateSubmission *>(completed->context);
-        if (submission != nullptr)
-        {
-          processCreateCompletion(*submission);
-        }
-      }
-    };
-
-    GcpHttp::MultiClient createClient = {};
-    for (uint32_t i = 0; i < count; ++i)
+    Vector<GcpMachineProvisioningTransaction::Spec> specs;
+    specs.reserve(count);
+    bytell_hash_set<String> names;
+    names.reserve(count);
+    for (uint32_t index = 0; index < count; ++index)
     {
       String name;
-      name.snprintf<"ntg-{itoa}"_ctv>(Random::generateNumberWithNBits<24, uint32_t>());
-      MachineProvisioningProgress& progress = provisioningProgress.upsert(config.slug, config.providerMachineType, name, String());
+      for (uint32_t attempt = 0; attempt < 16; ++attempt)
+      {
+        String suffix;
+        suffix.assignItoh(Random::generateNumberWithNBits<64, uint64_t>());
+        name.assign("ntg-"_ctv);
+        name.append(suffix);
+        if (names.insert(name).second)
+        {
+          break;
+        }
+        name.clear();
+      }
+      if (name.empty())
+      {
+        error.assign("gcp provisioning could not generate distinct instance names"_ctv);
+        co_return;
+      }
+
+      GcpMachineProvisioningTransaction::Spec spec;
+      if (GcpMachineProvisioningTransaction::buildSpec(
+              name,
+              zone,
+              config.vmImageURI,
+              config.providerMachineType,
+              config.cpu.cpuPlatform,
+              config.nStorageMB,
+              isBrain,
+              provisioningClusterUUIDTagValue,
+              bootstrapSSHUser,
+              bootstrapSSHPublicKey,
+              bootstrapSSHHostKeyPackage,
+              spec,
+              error) == false)
+      {
+        co_return;
+      }
+      specs.push_back(std::move(spec));
+    }
+
+    for (const GcpMachineProvisioningTransaction::Spec& spec : specs)
+    {
+      MachineProvisioningProgress& progress = provisioningProgress.upsert(
+          config.slug, config.providerMachineType, spec.name, String());
       progress.status.assign("launch-submitted"_ctv);
       progress.ready = false;
-      provisioningProgress.emitMaybe(Time::now<TimeResolution::ms>());
-      String brainText = {};
-      if (isBrain)
-      {
-        brainText.assign("true"_ctv);
-      }
-      else
-      {
-        brainText.assign("false"_ctv);
-      }
-
-      String body;
-      uint32_t diskGb = (config.nStorageMB + 1023) / 1024;
-      if (diskGb == 0)
-      {
-        diskGb = 20;
-      }
-      body.append("{\"name\":"_ctv);
-      prodigyAppendEscapedJSONStringLiteral(body, name);
-      if (appendTemplateBootDiskOverride(body, instanceTemplate, config.vmImageURI, diskGb, error) == false)
-      {
-        break;
-      }
-      body.append(",\"machineType\":"_ctv);
-      String machineTypeURL = {};
-      machineTypeURL.snprintf<"zones/{}/machineTypes/{}"_ctv>(zone, config.providerMachineType);
-      prodigyAppendEscapedJSONStringLiteral(body, machineTypeURL);
-      if (config.cpu.cpuPlatform.size() > 0)
-      {
-        body.append(",\"minCpuPlatform\":"_ctv);
-        prodigyAppendEscapedJSONStringLiteral(body, config.cpu.cpuPlatform);
-      }
-      body.append(",\"labels\":{\"app\":\"prodigy\",\"brain\":"_ctv);
-      prodigyAppendEscapedJSONStringLiteral(body, brainText);
-      if (provisioningClusterUUIDTagValue.size() > 0)
-      {
-        body.append(",\"prodigy_cluster_uuid\":"_ctv);
-        prodigyAppendEscapedJSONStringLiteral(body, provisioningClusterUUIDTagValue);
-      }
-      body.append("},\"metadata\":{\"items\":[{\"key\":\"brain\",\"value\":"_ctv);
-      prodigyAppendEscapedJSONStringLiteral(body, brainText);
-      body.append("}"_ctv);
-      if (bootstrapSSHPublicKey.size() > 0)
-      {
-        String startupScript = {};
-        prodigyBuildBootstrapSSHUserData(bootstrapSSHUser, bootstrapSSHPublicKey, bootstrapSSHHostKeyPackage, startupScript);
-        body.append(",{\"key\":\"startup-script\",\"value\":"_ctv);
-        prodigyAppendEscapedJSONStringLiteral(body, startupScript);
-        body.append("}"_ctv);
-      }
-      body.append("]}}"_ctv);
-
-      String requestURL = {};
-      requestURL.snprintf<"{}?sourceInstanceTemplate=projects/{}/global/instanceTemplates/{}"_ctv>(base, projectId, instanceTemplateName);
-
-      PendingCreateSubmission& submission = createRequests.emplace_back();
-      submission.instanceName = name;
-      submission.request.resetResult();
-      submission.request.context = &submission;
-      submission.request.method.assign("POST"_ctv);
-      submission.request.url = requestURL;
-      submission.request.body = body;
-      submission.request.timeoutMs = GcpHttp::sendTimeoutMs;
-      buildAuthHeaders(submission.request.headers);
-      if (submission.request.headers == nullptr)
-      {
-        error.assign("gcp auth headers missing"_ctv);
-        break;
-      }
-
-      if (createClient.start(submission.request) == false)
-      {
-        error.assign("gcp create request start failed"_ctv);
-        break;
-      }
     }
+    provisioningProgress.emitNow();
 
-    while (error.size() == 0 && createClient.pendingCount() > 0)
-    {
-      if (createClient.pump(50) == false)
-      {
-        error.assign("gcp create request pump failed"_ctv);
-        break;
-      }
-
-      drainCreateCompletions(createClient);
-    }
-
-    if (error.size() == 0)
-    {
-      drainCreateCompletions(createClient);
-    }
-
-    if (error.size() == 0 && pendingMachines.size() != count)
-    {
-      error.snprintf<"gcp create returned {itoa} accepted machines but {itoa} were requested"_ctv>(
-          uint32_t(pendingMachines.size()),
-          count);
-    }
-
-    if (error.size() == 0 && pendingMachines.size() > 0)
-    {
-      ConcurrentWaitCoordinator coordinator(this);
-      (void)coordinator.run(
-          config.slug,
-          config.providerMachineType,
-          lifetime,
-          pendingMachines,
-          readyMachines,
-          error);
-    }
-
-    if (error.size() != 0)
-    {
-      basics_log("gcp spinMachines failure error=%s\n", error.c_str());
-      cleanupProvisioningFailure();
-      return;
-    }
-
-    for (Machine *machine : readyMachines)
-    {
-      newMachines.insert(machine);
-    }
-  }
-
-  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines) override
-  {
-    (void)coro;
-    (void)metro;
-    if (!ensureProjectZone() || !ensureToken())
-    {
-      return;
-    }
-    struct curl_slist *h = nullptr;
-    buildAuthHeaders(h);
-
-    String nextPageToken = {};
-    for (;;)
-    {
-      String url;
-      url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances?filter=labels.app%3Aprodigy"_ctv>(projectId, zone);
-      appendPageTokenQuery(url, nextPageToken);
-
-      String response;
-      if (GcpHttp::get(url.c_str(), h, response) == false)
-      {
-        break;
-      }
-
+    Vector<std::unique_ptr<Machine>> staged;
+    staged.resize(count);
+    auto ready = [&](uint32_t index, const String& response, String& detail) -> bool {
+      String responseText = response;
       simdjson::dom::parser parser;
-      simdjson::dom::element doc;
-      if (parser.parse(response.c_str(), response.size()).get(doc))
+      simdjson::dom::element instance;
+      if (parser.parse(responseText.c_str(), responseText.size()).get(instance))
       {
-        break;
+        detail.assign("gcp instance response parse failed"_ctv);
+        return false;
       }
-
-      if (auto items = doc["items"]; items.is_array())
+      std::unique_ptr<Machine> candidate(buildMachineFromInstance(instance));
+      if (candidate == nullptr || candidate->cloudID.empty())
       {
-        for (auto instance : items.get_array())
+        detail.assign("gcp instance response missing cloud id"_ctv);
+        return false;
+      }
+      candidate->lifetime = lifetime;
+      MachineProvisioningProgress& progress = provisioningProgress.upsert(
+          config.slug, config.providerMachineType, specs[index].name, candidate->cloudID);
+      prodigyPopulateMachineProvisioningProgressFromMachine(progress, *candidate);
+      if (prodigyMachineProvisioningReady(*candidate) == false)
+      {
+        progress.status.assign("waiting-for-instance-addresses"_ctv);
+        progress.ready = false;
+        provisioningProgress.emitMaybe(Time::now<TimeResolution::ms>());
+        return false;
+      }
+      progress.status.assign("running"_ctv);
+      progress.ready = true;
+      staged[index] = std::move(candidate);
+      return true;
+    };
+
+    GcpMachineProvisioningTransaction transaction(hostHttpSubmission(),
+                                                  ProdigyHostDelayOperation::submission(),
+                                                  projectId,
+                                                  zone,
+                                                  token,
+                                                  deadline);
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          transaction.run(coro, instanceTemplateName, specs, ready, error);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (error.empty() == false)
+    {
+      for (const GcpMachineProvisioningTransaction::Spec& spec : specs)
+      {
+        MachineProvisioningProgress& progress = provisioningProgress.upsert(
+            config.slug, config.providerMachineType, spec.name, String());
+        if (progress.ready == false)
         {
-          if (isProdigyInstance(instance) == false)
-          {
-            continue;
-          }
-
-          machines.insert(buildMachineFromInstance(instance));
+          progress.status = error;
         }
+        progress.ready = false;
       }
-
-      std::string_view pageToken;
-      if (doc["nextPageToken"].get(pageToken))
-      {
-        break;
-      }
-
-      nextPageToken.assign(pageToken);
-      if (nextPageToken.size() == 0)
-      {
-        break;
-      }
+      provisioningProgress.emitNow();
+      co_return;
     }
 
-    curl_slist_free_all(h);
+    for (std::unique_ptr<Machine>& machine : staged)
+    {
+      if (machine == nullptr)
+      {
+        error.assign("gcp provisioning completed without every machine snapshot"_ctv);
+        provisioningProgress.emitNow();
+        co_return;
+      }
+    }
+    for (std::unique_ptr<Machine>& machine : staged)
+    {
+      provisioningProgress.notifyMachineProvisioningAccepted(machine->cloudID);
+      provisioningProgress.notifyMachineProvisioned(*machine);
+      newMachines.insert(machine.release());
+    }
+    provisioningProgress.emitNow();
+  }
+  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines, String& failure) override
+  {
+    (void)metro;
+    failure.clear();
+    if (coro == nullptr)
+    {
+      failure.assign("gcp inventory coroutine required"_ctv);
+      co_return;
+    }
+
+    ++inventoryOperations;
+    struct ActiveInventory final
+    {
+      uint32_t& operations;
+      ~ActiveInventory()
+      {
+        --operations;
+      }
+    } activeInventory {inventoryOperations};
+    Vector<std::unique_ptr<Machine>> pendingMachines = {};
+    auto visit = [&](simdjson::dom::element instance) -> bool {
+      pendingMachines.emplace_back(buildMachineFromInstance(instance));
+      return true;
+    };
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          walkInventory(coro, visit, failure);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (failure.size() == 0)
+    {
+      for (std::unique_ptr<Machine>& machine : pendingMachines)
+      {
+        machines.insert(machine.release());
+      }
+    }
   }
 
-  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains) override
+  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains, String& failure) override
   {
     selfIsBrain = false;
-    (void)coro;
     (void)selfUUID;
-    if (!ensureProjectZone() || !ensureToken())
+    failure.clear();
+    if (coro == nullptr)
     {
-      return;
+      failure.assign("gcp inventory coroutine required"_ctv);
+      co_return;
     }
 
-    struct curl_slist *h = nullptr;
-    buildAuthHeaders(h);
-
-    String nextPageToken = {};
-    for (;;)
+    ++inventoryOperations;
+    struct ActiveInventory final
     {
-      String url;
-      url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances?filter=labels.app%3Aprodigy"_ctv>(projectId, zone);
-      appendPageTokenQuery(url, nextPageToken);
-
-      String response;
-      if (GcpHttp::get(url.c_str(), h, response) == false)
+      uint32_t& operations;
+      ~ActiveInventory()
       {
-        break;
+        --operations;
+      }
+    } activeInventory {inventoryOperations};
+    bool pendingSelfIsBrain = false;
+    Vector<std::unique_ptr<BrainView>> pendingBrains = {};
+    auto visit = [&](simdjson::dom::element instance) -> bool {
+      if (isBrainInstance(instance) == false)
+      {
+        return true;
       }
 
-      simdjson::dom::parser parser;
-      simdjson::dom::element doc;
-      if (parser.parse(response.c_str(), response.size()).get(doc))
+      String networkIP;
+      auto interfaces = instance["networkInterfaces"].get_array();
+      if (interfaces.error())
       {
-        break;
+        return true;
       }
-
-      if (auto items = doc["items"]; items.is_array())
+      for (auto interface : interfaces)
       {
-        for (auto instance : items.get_array())
+        if (prodigyJSONString(interface["networkIP"], networkIP) != simdjson::SUCCESS)
         {
-          if (isProdigyInstance(instance) == false || isBrainInstance(instance) == false)
-          {
-            continue;
-          }
-
-          std::string_view nip;
-          auto nics = instance["networkInterfaces"].get_array();
-          if (nics.error())
-          {
-            continue;
-          }
-
-          for (auto nic : nics)
-          {
-            if (nic["networkIP"].get(nip))
-            {
-              continue;
-            }
-
-            String privateText = String(nip);
-            uint32_t ip = 0;
-            if (inet_pton(AF_INET, privateText.c_str(), &ip) != 1)
-            {
-              continue;
-            }
-
-            if (thisNeuron != nullptr && ip == thisNeuron->private4.v4)
-            {
-              selfIsBrain = true;
-              continue;
-            }
-
-            BrainView *bv = new BrainView();
-            bv->private4 = ip;
-            bv->peerAddress.is6 = false;
-            bv->peerAddress.v4 = ip;
-            bv->peerAddressText.assign(privateText);
-            bv->connectTimeoutMs = BrainBase::controlPlaneConnectTimeoutMs();
-            bv->nDefaultAttemptsBudget = BrainBase::controlPlaneConnectAttemptsBudget();
-            brains.insert(bv);
-            break;
-          }
+          continue;
         }
-      }
 
-      std::string_view pageToken;
-      if (doc["nextPageToken"].get(pageToken))
-      {
-        break;
-      }
+        String privateText = networkIP;
+        uint32_t ip = 0;
+        if (inet_pton(AF_INET, privateText.c_str(), &ip) != 1)
+        {
+          continue;
+        }
+        if (thisNeuron != nullptr && ip == thisNeuron->private4.v4)
+        {
+          pendingSelfIsBrain = true;
+          return true;
+        }
 
-      nextPageToken.assign(pageToken);
-      if (nextPageToken.size() == 0)
+        std::unique_ptr<BrainView> brain = std::make_unique<BrainView>();
+        brain->private4 = ip;
+        brain->peerAddress.is6 = false;
+        brain->peerAddress.v4 = ip;
+        brain->peerAddressText.assign(privateText);
+        brain->connectTimeoutMs = BrainBase::controlPlaneConnectTimeoutMs();
+        brain->nDefaultAttemptsBudget = BrainBase::controlPlaneConnectAttemptsBudget();
+        pendingBrains.push_back(std::move(brain));
+        return true;
+      }
+      return true;
+    };
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          walkInventory(coro, visit, failure);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (failure.size() == 0)
+    {
+      selfIsBrain = pendingSelfIsBrain;
+      for (std::unique_ptr<BrainView>& brain : pendingBrains)
       {
-        break;
+        brains.insert(brain.release());
       }
     }
-
-    curl_slist_free_all(h);
   }
 
-  void hardRebootMachine(uint128_t uuid) override
+  void machineLifecycle(CoroutineStack *coro,
+                        GcpMachineLifecycleTransaction::Action action,
+                        const String& cloudID,
+                        String& failure)
   {
-    if (!ensureProjectZone() || !ensureToken())
+    failure.clear();
+    String targetCloudID;
+    targetCloudID.assign(cloudID);
+    if (coro == nullptr || targetCloudID.empty())
     {
-      return;
+      failure.assign("gcp machine lifecycle coroutine and cloudID required"_ctv);
+      co_return;
     }
-    // Find instance by matching hashed id -> uuid
-    String name;
-
-    struct curl_slist *h = nullptr;
-    buildAuthHeaders(h);
-
-    String nextPageToken = {};
-    for (;;)
+    const MultiCurlClient::TimePoint localDeadline =
+        MultiCurlClient::Clock::now() + std::chrono::minutes(3);
+    const MultiCurlClient::TimePoint deadline =
+        providerServices.operationDeadline < localDeadline ?
+            providerServices.operationDeadline : localDeadline;
+    if (MultiCurlClient::Clock::now() >= deadline)
     {
-      String url;
-      url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances?fields=items(name,id),nextPageToken"_ctv>(projectId, zone);
-      appendPageTokenQuery(url, nextPageToken);
-
-      String response;
-      if (GcpHttp::get(url.c_str(), h, response) == false)
-      {
-        break;
-      }
-
-      simdjson::dom::parser parser;
-      simdjson::dom::element doc;
-      if (parser.parse(response.c_str(), response.size()).get(doc))
-      {
-        break;
-      }
-
-      if (auto items = doc["items"]; items.is_array())
-      {
-        for (auto instance : items.get_array())
-        {
-          std::string_view id;
-          if (instance["id"].get(id))
-          {
-            continue;
-          }
-
-          if (hash_uuid(id) == uuid)
-          {
-            std::string_view nm;
-            if (!instance["name"].get(nm))
-            {
-              name.assign(nm);
-            }
-            break;
-          }
-        }
-      }
-
-      if (name.size() > 0)
-      {
-        break;
-      }
-
-      std::string_view pageToken;
-      if (doc["nextPageToken"].get(pageToken))
-      {
-        break;
-      }
-
-      nextPageToken.assign(pageToken);
-      if (nextPageToken.size() == 0)
-      {
-        break;
-      }
+      failure.assign("gcp machine lifecycle deadline exceeded"_ctv);
+      co_return;
     }
 
-    if (name.size() == 0)
+    ++lifecycleOperations;
+    struct ActiveLifecycle final
     {
-      curl_slist_free_all(h);
-      return;
-    }
-    // POST reset
-    String resetUrl;
-    resetUrl.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances/{}/reset"_ctv>(projectId, zone, name);
-    String out;
-    long httpStatus = 0;
-    if (GcpHttp::send("POST", resetUrl.c_str(), h, String(), out, &httpStatus))
-    {
-      String operationName;
-      String operationError;
-      if (parseOperationName(out, operationName, &operationError))
+      uint32_t& operations;
+      ~ActiveLifecycle()
       {
-        (void)waitForZoneOperation(operationName, String(), String(), String(), operationError);
+        --operations;
       }
+    } activeLifecycle {lifecycleOperations};
+
+    bool identityReady = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureProjectZoneAsync(coro, identityReady, deadline);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
     }
-    curl_slist_free_all(h);
+    if (identityReady == false)
+    {
+      failure.assign("gcp machine lifecycle project/zone unavailable"_ctv);
+      co_return;
+    }
+
+    bool tokenReady = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureTokenAsync(coro, tokenReady, &failure, deadline);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (tokenReady == false)
+    {
+      if (failure.empty())
+      {
+        failure.assign("gcp machine lifecycle token unavailable"_ctv);
+      }
+      co_return;
+    }
+
+    GcpMachineLifecycleTransaction transaction(hostHttpSubmission(),
+                                               ProdigyHostDelayOperation::submission(),
+                                               projectId,
+                                               zone,
+                                               token,
+                                               deadline);
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          transaction.run(coro, action, targetCloudID, failure);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+  }
+
+  void prepareElasticAddressOperation(CoroutineStack *coro,
+                                      MultiCurlClient::TimePoint deadline,
+                                      bool& ready,
+                                      String& failure)
+  {
+    ready = false;
+    bool identityReady = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureProjectZoneAsync(coro, identityReady, deadline);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (identityReady == false || (region.empty() && deriveRegionFromZone(zone, region) == false))
+    {
+      failure.assign("gcp elastic address project, zone, or region unavailable"_ctv);
+      co_return;
+    }
+
+    bool tokenReady = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureTokenAsync(coro, tokenReady, &failure, deadline);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (tokenReady == false)
+    {
+      if (failure.empty())
+      {
+        failure.assign("gcp elastic address token unavailable"_ctv);
+      }
+      co_return;
+    }
+    ready = true;
+  }
+
+  void ensureProdigyMachineTags(CoroutineStack *coro,
+                                const String& clusterUUID,
+                                const String& cloudID,
+                                String& failure) override
+  {
+    failure.clear();
+    String targetClusterUUID;
+    String targetCloudID;
+    targetClusterUUID.assign(clusterUUID);
+    targetCloudID.assign(cloudID);
+    if (coro == nullptr || targetClusterUUID.empty() || targetCloudID.empty())
+    {
+      failure.assign("gcp machine labels coroutine, clusterUUID, and cloudID required"_ctv);
+      co_return;
+    }
+    if (usesRefreshableBootstrapAccessToken())
+    {
+      failure.assign("gcp machine labels forbid executable credential refresh"_ctv);
+      co_return;
+    }
+    const MultiCurlClient::TimePoint localDeadline =
+        MultiCurlClient::Clock::now() + std::chrono::minutes(3);
+    const MultiCurlClient::TimePoint deadline =
+        providerServices.operationDeadline < localDeadline ?
+            providerServices.operationDeadline : localDeadline;
+    if (MultiCurlClient::Clock::now() >= deadline)
+    {
+      failure.assign("gcp machine labels deadline exceeded"_ctv);
+      co_return;
+    }
+
+    ++labelOperations;
+    struct ActiveLabels final
+    {
+      uint32_t& operations;
+      ~ActiveLabels()
+      {
+        --operations;
+      }
+    } activeLabels {labelOperations};
+
+    bool identityReady = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureProjectZoneAsync(coro, identityReady, deadline);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (identityReady == false)
+    {
+      failure.assign("gcp machine labels project/zone unavailable"_ctv);
+      co_return;
+    }
+
+    bool tokenReady = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureTokenAsync(coro, tokenReady, &failure, deadline);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (tokenReady == false)
+    {
+      if (failure.empty())
+      {
+        failure.assign("gcp machine labels token unavailable"_ctv);
+      }
+      co_return;
+    }
+
+    GcpInstanceLabelsTransaction transaction(hostHttpSubmission(),
+                                             ProdigyHostDelayOperation::submission(),
+                                             projectId,
+                                             zone,
+                                             token,
+                                             deadline);
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          transaction.run(coro, targetCloudID, targetClusterUUID, failure);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+  }
+
+  void hardRebootMachine(CoroutineStack *coro,
+                         const String& cloudID,
+                         String& failure) override
+  {
+    if (coro == nullptr)
+    {
+      failure.assign("gcp machine lifecycle coroutine required"_ctv);
+      co_return;
+    }
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          machineLifecycle(coro,
+                           GcpMachineLifecycleTransaction::Action::reset,
+                           cloudID,
+                           failure);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
   }
 
   void reportHardwareFailure(uint128_t uuid, const String& report) override
@@ -4505,572 +2756,418 @@ public:
 
   void checkForSpotTerminations(CoroutineStack *coro, Vector<String>& decommissionedIDs) override
   {
-    (void)coro;
-    if (!ensureProjectZone() || !ensureToken())
+    if (coro == nullptr || spotTerminationCheckActive)
     {
-      return;
+      co_return;
     }
-    struct curl_slist *h = nullptr;
-    buildAuthHeaders(h);
+
+    spotTerminationCheckActive = true;
+    struct ActiveCheck final
+    {
+      bool& active;
+      ~ActiveCheck()
+      {
+        active = false;
+      }
+    } activeCheck {spotTerminationCheckActive};
+
+    const MultiCurlClient::TimePoint checkDeadline = MultiCurlClient::Clock::now() + spotCheckTimeout;
+
+    bool projectZoneReady = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureProjectZoneAsync(coro, projectZoneReady, checkDeadline);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (projectZoneReady == false)
+    {
+      co_return;
+    }
+
+    bool tokenReady = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureTokenAsync(coro, tokenReady, nullptr, checkDeadline);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (tokenReady == false)
+    {
+      co_return;
+    }
 
     String nextPageToken = {};
-    for (;;)
+    bytell_hash_set<String> requestedPageTokens = {};
+    size_t requestedPages = 0;
+    while (MultiCurlClient::Clock::now() < checkDeadline &&
+           canRequestSpotPage(requestedPages,
+                              decommissionedIDs.size(),
+                              nextPageToken,
+                              requestedPageTokens))
     {
-      String url;
-      url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances?filter=labels.app%3Aprodigy"_ctv>(projectId, zone);
-      appendPageTokenQuery(url, nextPageToken);
+      requestedPageTokens.insert(nextPageToken);
+      ++requestedPages;
 
-      String response;
-      if (!GcpHttp::get(url.c_str(), h, response))
+      MultiCurlClient::Result result = {};
+      bool requestSucceeded = false;
+      if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+            hostRequest(coro,
+                    spotInstancesRequest(projectId,
+                                         zone,
+                                         token,
+                                         nextPageToken,
+                                         MultiCurlClient::Clock::now(),
+                                         checkDeadline),
+                    result,
+                    requestSucceeded);
+          }))
+      {
+        co_await coro->suspendAtIndex(suspendIndex);
+      }
+      if (requestSucceeded == false)
       {
         break;
       }
 
-      simdjson::dom::parser parser;
-      simdjson::dom::element doc;
-      if (parser.parse(response.c_str(), response.size()).get(doc))
+      String followingPageToken = {};
+      if (parseSpotTerminationPage(result.body, decommissionedIDs, followingPageToken) == false)
       {
         break;
       }
-
-      if (auto items = doc["items"]; items.is_array())
-      {
-        for (auto instance : items.get_array())
-        {
-          if (isProdigyInstance(instance) == false || isSpotInstance(instance) == false)
-          {
-            continue;
-          }
-
-          std::string_view status;
-          if (instance["status"].get(status))
-          {
-            continue;
-          }
-
-          if (status == "TERMINATED")
-          {
-            std::string_view id;
-            if (!instance["id"].get(id))
-            {
-              decommissionedIDs.emplace_back(String(id));
-            }
-          }
-        }
-      }
-
-      std::string_view pageToken;
-      if (doc["nextPageToken"].get(pageToken))
-      {
-        break;
-      }
-
-      nextPageToken.assign(pageToken);
-      if (nextPageToken.size() == 0)
+      nextPageToken = std::move(followingPageToken);
+      if (nextPageToken.size() == 0 ||
+          nextPageToken.size() > spotPageTokenBytes ||
+          requestedPageTokens.contains(nextPageToken))
       {
         break;
       }
     }
-
-    curl_slist_free_all(h);
   }
 
-  void destroyMachine(Machine *machine) override
+  void destroyMachine(CoroutineStack *coro,
+                      const String& cloudID,
+                      String& failure) override
   {
-    if (!ensureProjectZone() || !ensureToken() || machine == nullptr || machine->cloudID.size() == 0)
+    if (coro == nullptr)
     {
-      return;
+      failure.assign("gcp machine lifecycle coroutine required"_ctv);
+      co_return;
     }
-    String instanceName;
-    if (resolveInstanceNameForCloudID(machine->cloudID, instanceName) == false)
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          machineLifecycle(coro,
+                           GcpMachineLifecycleTransaction::Action::destroy,
+                           cloudID,
+                           failure);
+        }))
     {
-      return;
+      co_await coro->suspendAtIndex(suspendIndex);
     }
-    basics_log("gcp destroyMachine cloudID=%s instance=%s\n", machine->cloudID.c_str(), instanceName.c_str());
-    String url;
-    url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances/{}"_ctv>(projectId, zone, instanceName);
-    struct curl_slist *h = nullptr;
-    buildAuthHeaders(h);
-    String resp;
-    long httpStatus = 0;
-    if (GcpHttp::send("DELETE", url.c_str(), h, String(), resp, &httpStatus))
-    {
-      String operationName;
-      String error;
-      if (parseOperationName(resp, operationName, &error))
-      {
-        basics_log("gcp destroyMachine accepted cloudID=%s instance=%s operation=%s\n", machine->cloudID.c_str(), instanceName.c_str(), operationName.c_str());
-        (void)waitForZoneOperation(operationName, String(), String(), String(), error);
-      }
-    }
-    curl_slist_free_all(h);
   }
 
-  bool destroyClusterMachines(const String& clusterUUID, uint32_t& destroyed, String& error) override
+  void destroyClusterMachines(CoroutineStack *coro,
+                              const String& clusterUUID,
+                              uint32_t& destroyed,
+                              String& failure) override
   {
+    String targetClusterUUID;
+    targetClusterUUID.assign(clusterUUID);
     destroyed = 0;
-    error.clear();
-
-    if (!ensureProjectZone() || !ensureToken(&error))
+    failure.clear();
+    if (coro == nullptr || targetClusterUUID.empty())
     {
-      if (error.size() == 0)
-      {
-        error.assign("gcp auth failed"_ctv);
-      }
-      return false;
+      failure.assign("gcp cluster destroy coroutine and cluster UUID required"_ctv);
+      co_return;
+    }
+    const MultiCurlClient::TimePoint localDeadline =
+        MultiCurlClient::Clock::now() + std::chrono::minutes(10);
+    const MultiCurlClient::TimePoint deadline =
+        providerServices.operationDeadline < localDeadline ?
+            providerServices.operationDeadline : localDeadline;
+    if (MultiCurlClient::Clock::now() >= deadline)
+    {
+      failure.assign("gcp cluster destroy deadline exceeded"_ctv);
+      co_return;
     }
 
-    if (clusterUUID.size() == 0)
+    ++clusterDestroyOperations;
+    struct ActiveClusterDestroy final
     {
-      error.assign("gcp clusterUUID tag value required"_ctv);
-      return false;
+      uint32_t& operations;
+      ~ActiveClusterDestroy()
+      {
+        --operations;
+      }
+    } activeClusterDestroy {clusterDestroyOperations};
+
+    bool identityReady = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureProjectZoneAsync(coro, identityReady, deadline);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (identityReady == false)
+    {
+      failure.assign("gcp cluster destroy project/zone unavailable"_ctv);
+      co_return;
     }
 
-    Vector<String> instanceNames = {};
-    struct curl_slist *h = nullptr;
-    buildAuthHeaders(h);
-
-    String nextPageToken = {};
-    for (;;)
+    bool tokenReady = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          ensureTokenAsync(coro, tokenReady, &failure, deadline);
+        }))
     {
-      String url = {};
-      url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances?filter=labels.app%3Aprodigy"_ctv>(projectId, zone);
-      appendPageTokenQuery(url, nextPageToken);
-
-      String response = {};
-      if (GcpHttp::get(url.c_str(), h, response) == false)
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (tokenReady == false)
+    {
+      if (failure.empty())
       {
-        curl_slist_free_all(h);
-        if (parseAPIErrorMessage(response, error) == false && error.size() == 0)
-        {
-          error.assign("gcp list instances failed"_ctv);
-        }
-        return false;
+        failure.assign("gcp cluster destroy token unavailable"_ctv);
       }
-
-      simdjson::dom::parser parser;
-      simdjson::dom::element doc;
-      if (parser.parse(response.c_str(), response.size()).get(doc))
-      {
-        curl_slist_free_all(h);
-        error.assign("gcp instance list json parse failed"_ctv);
-        return false;
-      }
-
-      if (auto items = doc["items"]; items.is_array())
-      {
-        for (auto instance : items.get_array())
-        {
-          if (isProdigyInstance(instance) == false)
-          {
-            continue;
-          }
-
-          std::string_view clusterValue = {};
-          if (instance["labels"]["prodigy_cluster_uuid"].get(clusterValue) || clusterValue != stringViewFor(clusterUUID))
-          {
-            continue;
-          }
-
-          std::string_view instanceName = {};
-          if (!instance["name"].get(instanceName) && instanceName.size() > 0)
-          {
-            instanceNames.push_back(String(instanceName));
-          }
-        }
-      }
-
-      std::string_view pageToken = {};
-      if (doc["nextPageToken"].get(pageToken))
-      {
-        break;
-      }
-
-      nextPageToken.assign(pageToken);
-      if (nextPageToken.size() == 0)
-      {
-        break;
-      }
+      co_return;
     }
 
-    if (instanceNames.size() == 0)
+    GcpClusterDestroyTransaction transaction(hostHttpSubmission(),
+                                             ProdigyHostDelayOperation::submission(),
+                                             projectId,
+                                             zone,
+                                             token,
+                                             deadline);
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          transaction.run(coro, targetClusterUUID, destroyed, failure);
+        }))
     {
-      curl_slist_free_all(h);
-      return true;
+      co_await coro->suspendAtIndex(suspendIndex);
     }
-
-    destroyed = uint32_t(instanceNames.size());
-
-    Vector<String> operations = {};
-    for (const String& instanceName : instanceNames)
-    {
-      String url = {};
-      url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances/{}"_ctv>(projectId, zone, instanceName);
-
-      String response = {};
-      long httpStatus = 0;
-      if (GcpHttp::send("DELETE", url.c_str(), h, String(), response, &httpStatus) == false)
-      {
-        curl_slist_free_all(h);
-        if (parseAPIErrorMessage(response, error) == false)
-        {
-          error.snprintf<"gcp delete instance failed with HTTP {itoa}"_ctv>(uint32_t(httpStatus));
-        }
-        return false;
-      }
-
-      String operationName = {};
-      if (parseOperationName(response, operationName, &error) == false)
-      {
-        curl_slist_free_all(h);
-        return false;
-      }
-
-      operations.push_back(operationName);
-    }
-
-    curl_slist_free_all(h);
-
-    for (const String& operationName : operations)
-    {
-      if (waitForZoneOperation(operationName, String(), String(), String(), error) == false)
-      {
-        return false;
-      }
-    }
-
-    for (uint32_t attempt = 0; attempt < 30; ++attempt)
-    {
-      instanceNames.clear();
-      nextPageToken.clear();
-
-      struct curl_slist *pollHeaders = nullptr;
-      buildAuthHeaders(pollHeaders);
-
-      bool pollFailed = false;
-      for (;;)
-      {
-        String url = {};
-        url.snprintf<"https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances?filter=labels.app%3Aprodigy"_ctv>(projectId, zone);
-        appendPageTokenQuery(url, nextPageToken);
-
-        String response = {};
-        if (GcpHttp::get(url.c_str(), pollHeaders, response) == false)
-        {
-          pollFailed = true;
-          if (parseAPIErrorMessage(response, error) == false && error.size() == 0)
-          {
-            error.assign("gcp poll instances failed"_ctv);
-          }
-          break;
-        }
-
-        simdjson::dom::parser parser;
-        simdjson::dom::element doc;
-        if (parser.parse(response.c_str(), response.size()).get(doc))
-        {
-          pollFailed = true;
-          error.assign("gcp poll instance list json parse failed"_ctv);
-          break;
-        }
-
-        if (auto items = doc["items"]; items.is_array())
-        {
-          for (auto instance : items.get_array())
-          {
-            std::string_view clusterValue = {};
-            if (instance["labels"]["prodigy_cluster_uuid"].get(clusterValue) || clusterValue != stringViewFor(clusterUUID))
-            {
-              continue;
-            }
-
-            std::string_view instanceName = {};
-            if (!instance["name"].get(instanceName) && instanceName.size() > 0)
-            {
-              instanceNames.push_back(String(instanceName));
-            }
-          }
-        }
-
-        std::string_view pageToken = {};
-        if (doc["nextPageToken"].get(pageToken))
-        {
-          break;
-        }
-
-        nextPageToken.assign(pageToken);
-        if (nextPageToken.size() == 0)
-        {
-          break;
-        }
-      }
-
-      curl_slist_free_all(pollHeaders);
-
-      if (pollFailed)
-      {
-        return false;
-      }
-
-      if (instanceNames.size() == 0)
-      {
-        return true;
-      }
-
-      usleep(1000 * 1000);
-    }
-
-    error.assign("timed out waiting for gcp cluster machines to terminate"_ctv);
-    return false;
   }
 
-  bool ensureProdigyMachineTags(const String& clusterUUID, Machine *machine, String& error) override
+  void prepareProviderElasticAddress(CoroutineStack *coro,
+                                     const ProviderElasticAddressRequest& request,
+                                     uint128_t transactionNonce,
+                                     ProviderElasticAddressPlan& plan,
+                                     String& failure) override
   {
-    error.clear();
-
-    if (!ensureProjectZone() || !ensureToken(&error))
+    ProviderElasticAddressRequest owned;
+    owned.cloudID.assign(request.cloudID);
+    owned.family = request.family;
+    owned.intent = request.intent;
+    owned.requestedAddress.assign(request.requestedAddress);
+    owned.providerPool.assign(request.providerPool);
+    owned.deliveryPrefix = request.deliveryPrefix;
+    plan = {};
+    failure.clear();
+    if (coro == nullptr)
     {
-      if (error.size() == 0)
+      failure.assign("gcp elastic address assignment coroutine required"_ctv);
+      co_return;
+    }
+    const MultiCurlClient::TimePoint localDeadline =
+        MultiCurlClient::Clock::now() + GcpElasticAddressTransaction::maximumDuration;
+    const MultiCurlClient::TimePoint deadline =
+        providerServices.operationDeadline < localDeadline ?
+            providerServices.operationDeadline : localDeadline;
+    if (MultiCurlClient::Clock::now() >= deadline)
+    {
+      failure.assign("gcp elastic address assignment deadline exceeded"_ctv);
+      co_return;
+    }
+
+    ++elasticOperations;
+    struct ActiveElastic final
+    {
+      uint32_t& operations;
+      ~ActiveElastic()
       {
-        error.assign("gcp auth failed"_ctv);
+        --operations;
       }
-      return false;
-    }
+    } activeElastic {elasticOperations};
 
-    if (machine == nullptr || machine->cloudID.size() == 0)
+    bool ready = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          prepareElasticAddressOperation(coro, deadline, ready, failure);
+        }))
     {
-      error.assign("gcp machine cloudID required"_ctv);
-      return false;
+      co_await coro->suspendAtIndex(suspendIndex);
     }
-
-    if (clusterUUID.size() == 0)
+    if (ready == false)
     {
-      error.assign("gcp clusterUUID tag value required"_ctv);
-      return false;
+      co_return;
     }
 
-    String instanceName = {};
-    if (resolveInstanceNameForCloudID(machine->cloudID, instanceName) == false || instanceName.size() == 0)
+    GcpElasticAddressTransaction transaction(hostHttpSubmission(),
+                                             ProdigyHostDelayOperation::submission(),
+                                             projectId,
+                                             zone,
+                                             region,
+                                             token,
+                                             deadline,
+                                             transactionNonce);
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          transaction.prepare(coro, owned, plan, failure);
+        }))
     {
-      error.assign("gcp failed to resolve instance name from cloudID"_ctv);
-      return false;
+      co_await coro->suspendAtIndex(suspendIndex);
     }
-
-    if (ensureInstanceLabel(instanceName, "app"_ctv, "prodigy"_ctv, error) == false)
-    {
-      return false;
-    }
-
-    return ensureInstanceLabel(instanceName, "prodigy_cluster_uuid"_ctv, clusterUUID, error);
   }
 
-  bool assignProviderElasticAddress(Machine *machine,
-                                    ExternalAddressFamily family,
-                                    ElasticPrefixIntent intent,
-                                    const String& requestedAddress,
-                                    const String& providerPool,
-                                    IPPrefix& assignedPrefix,
-                                    IPPrefix& deliveryPrefix,
-                                    String& allocationID,
-                                    String& associationID,
-                                    bool& releaseOnRemove,
-                                    String& error) override
+  bool validateProviderElasticAddressPlan(const ProviderElasticAddressPlan& plan,
+                                          const ProviderElasticAddressRequest& request,
+                                          uint128_t transactionNonce) const override
   {
-    assignedPrefix = {};
-    deliveryPrefix = {};
-    allocationID.clear();
-    associationID.clear();
-    releaseOnRemove = false;
-    error.clear();
+    GcpElasticAddressPlanV1 decoded;
+    return GcpElasticAddressTransaction::decodePlan(plan, decoded, &projectId, &region, &zone) &&
+           GcpElasticAddressTransaction::planMatchesRequest(decoded, request, transactionNonce);
+  }
 
-    if (machine == nullptr || machine->cloudID.size() == 0)
+  void applyProviderElasticAddress(CoroutineStack *coro,
+                                   const ProviderElasticAddressPlan& plan,
+                                   ProviderElasticAddressAssignment& assignment,
+                                   String& failure) override
+  {
+    GcpElasticAddressPlanV1 decoded;
+    assignment = {};
+    failure.clear();
+    if (coro == nullptr ||
+        GcpElasticAddressTransaction::decodePlan(plan, decoded, &projectId, &region, &zone) == false)
     {
-      error.assign("gcp elastic address requires a cloud-backed target machine"_ctv);
-      return false;
+      failure.assign("gcp elastic address apply plan invalid"_ctv);
+      co_return;
+    }
+    const MultiCurlClient::TimePoint localDeadline =
+        MultiCurlClient::Clock::now() + GcpElasticAddressTransaction::maximumDuration;
+    const MultiCurlClient::TimePoint deadline = providerServices.operationDeadline < localDeadline ?
+                                                    providerServices.operationDeadline : localDeadline;
+    bool ready = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          prepareElasticAddressOperation(coro, deadline, ready, failure);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (ready == false)
+    {
+      co_return;
+    }
+    GcpElasticAddressTransaction transaction(hostHttpSubmission(),
+                                             ProdigyHostDelayOperation::submission(),
+                                             projectId, zone, region, token, deadline, decoded.nonce);
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          transaction.apply(coro, plan, assignment, failure);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+  }
+
+  void compensateProviderElasticAddress(CoroutineStack *coro,
+                                        const ProviderElasticAddressPlan& plan,
+                                        String& failure) override
+  {
+    GcpElasticAddressPlanV1 decoded;
+    failure.clear();
+    if (coro == nullptr ||
+        GcpElasticAddressTransaction::decodePlan(plan, decoded, &projectId, &region, &zone) == false)
+    {
+      failure.assign("gcp elastic address compensation plan invalid"_ctv);
+      co_return;
+    }
+    const MultiCurlClient::TimePoint localDeadline =
+        MultiCurlClient::Clock::now() + GcpElasticAddressTransaction::maximumDuration;
+    const MultiCurlClient::TimePoint deadline = providerServices.operationDeadline < localDeadline ?
+                                                    providerServices.operationDeadline : localDeadline;
+    bool ready = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          prepareElasticAddressOperation(coro, deadline, ready, failure);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    if (ready == false)
+    {
+      co_return;
+    }
+    GcpElasticAddressTransaction transaction(hostHttpSubmission(),
+                                             ProdigyHostDelayOperation::submission(),
+                                             projectId, zone, region, token, deadline, decoded.nonce);
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          transaction.compensate(coro, plan, failure);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+  }
+
+  void releaseProviderElasticAddress(CoroutineStack *coro,
+                                     const ProviderElasticAddressRelease& release,
+                                     String& failure) override
+  {
+    ProviderElasticAddressRelease owned;
+    owned.transactionNonce = release.transactionNonce;
+    owned.kind = release.kind;
+    owned.assignedPrefix = release.assignedPrefix;
+    owned.allocationID.assign(release.allocationID);
+    owned.associationID.assign(release.associationID);
+    owned.releaseOnRemove = release.releaseOnRemove;
+    failure.clear();
+    if (coro == nullptr)
+    {
+      failure.assign("gcp elastic address release coroutine required"_ctv);
+      co_return;
+    }
+    const MultiCurlClient::TimePoint localDeadline =
+        MultiCurlClient::Clock::now() + GcpElasticAddressTransaction::maximumDuration;
+    const MultiCurlClient::TimePoint deadline =
+        providerServices.operationDeadline < localDeadline ?
+            providerServices.operationDeadline : localDeadline;
+    if (MultiCurlClient::Clock::now() >= deadline)
+    {
+      failure.assign("gcp elastic address release deadline exceeded"_ctv);
+      co_return;
     }
 
-    if (family != ExternalAddressFamily::ipv4)
+    ++elasticOperations;
+    struct ActiveElastic final
     {
-      error.assign("gcp elastic addresses currently support only ipv4"_ctv);
-      return false;
-    }
-
-    if (elasticPrefixIntentIsValid(intent) == false)
-    {
-      error.assign("gcp elastic prefix intent invalid"_ctv);
-      return false;
-    }
-
-    if (intent == ElasticPrefixIntent::create && requestedAddress.size() > 0)
-    {
-      error.assign("gcp elastic create intent does not accept requestedAddress"_ctv);
-      return false;
-    }
-
-    if (intent == ElasticPrefixIntent::any && requestedAddress.size() == 0)
-    {
-      error.assign("gcp elastic any intent requires requestedAddress"_ctv);
-      return false;
-    }
-
-    String instanceName = {};
-    if (fetchElasticInstanceNameForCloudID(machine->cloudID, instanceName, error) == false)
-    {
-      return false;
-    }
-
-    String publicAddress = {};
-    String existingUserInstance = {};
-    bool useExisting = requestedAddress.size() > 0 && intent != ElasticPrefixIntent::create;
-    if (useExisting)
-    {
-      if (providerPool.size() > 0)
+      uint32_t& operations;
+      ~ActiveElastic()
       {
-        error.assign("gcp elastic any intent cannot combine requestedAddress with providerPool"_ctv);
-        return false;
+        --operations;
       }
+    } activeElastic {elasticOperations};
 
-      if (findElasticAddressByPublicIP(requestedAddress, allocationID, publicAddress, existingUserInstance, error) == false)
-      {
-        if (intent != ElasticPrefixIntent::anyOrCreate)
-        {
-          return false;
-        }
-
-        error.clear();
-        useExisting = false;
-      }
-
-      releaseOnRemove = false;
-    }
-    if (useExisting == false)
+    bool ready = false;
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          prepareElasticAddressOperation(coro, deadline, ready, failure);
+        }))
     {
-      if (allocateElasticAddress(providerPool, allocationID, publicAddress, error) == false)
-      {
-        return false;
-      }
-
-      releaseOnRemove = true;
+      co_await coro->suspendAtIndex(suspendIndex);
     }
-
-    bool attached = false;
-    auto cleanupOnFailure = [&]() -> void {
-      if (attached && associationID.size() > 0)
-      {
-        String cleanupInstance = {};
-        String cleanupNic = {};
-        String cleanupAccessConfig = {};
-        if (parseElasticAssociationID(associationID, cleanupInstance, cleanupNic, cleanupAccessConfig))
-        {
-          String detachFailure = {};
-          (void)deleteElasticAccessConfig(cleanupInstance, cleanupNic, cleanupAccessConfig, detachFailure);
-        }
-      }
-
-      if (releaseOnRemove && allocationID.size() > 0)
-      {
-        String releaseFailure = {};
-        (void)releaseElasticAddressAllocation(allocationID, releaseFailure);
-      }
-    };
-
-    if (existingUserInstance.size() > 0 && existingUserInstance.equals(instanceName) == false)
+    if (ready == false)
     {
-      String oldNic = {};
-      String oldAccessConfig = {};
-      String detachFailure = {};
-      if (findElasticInterfaceForAddress(existingUserInstance, publicAddress, oldNic, oldAccessConfig, detachFailure) && oldNic.size() > 0 && oldAccessConfig.size() > 0)
-      {
-        if (deleteElasticAccessConfig(existingUserInstance, oldNic, oldAccessConfig, error) == false)
-        {
-          cleanupOnFailure();
-          return false;
-        }
-      }
+      co_return;
     }
 
-    String nicName = {};
-    String accessConfigName = {};
-    String existingPublicAddress = {};
-    bool hasAccessConfig = false;
-    if (describeElasticTargetInterface(instanceName, nicName, accessConfigName, existingPublicAddress, hasAccessConfig, error) == false)
+    GcpElasticAddressTransaction transaction(hostHttpSubmission(),
+                                             ProdigyHostDelayOperation::submission(),
+                                             projectId,
+                                             zone,
+                                             region,
+                                             token,
+                                             deadline,
+                                             owned.transactionNonce);
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          transaction.release(coro, owned, failure);
+        }))
     {
-      cleanupOnFailure();
-      return false;
+      co_await coro->suspendAtIndex(suspendIndex);
     }
+  }
 
-    if (hasAccessConfig && existingPublicAddress.equals(publicAddress))
-    {
-      associationID.snprintf<"{}|{}|{}"_ctv>(instanceName, nicName, accessConfigName);
-      attached = true;
-    }
-    else
-    {
-      if (hasAccessConfig)
-      {
-        if (deleteElasticAccessConfig(instanceName, nicName, accessConfigName, error) == false)
-        {
-          cleanupOnFailure();
-          return false;
-        }
-      }
-
-      if (attachElasticAccessConfig(instanceName, nicName, accessConfigName, publicAddress, associationID, error) == false)
-      {
-        cleanupOnFailure();
-        return false;
-      }
-
-      attached = true;
-    }
-
-    IPAddress assignedAddress = {};
-    if (ClusterMachine::parseIPAddressLiteral(publicAddress, assignedAddress) == false)
-    {
-      error.assign("gcp elastic address parse failed"_ctv);
-      cleanupOnFailure();
-      return false;
-    }
-    assignedPrefix.network = assignedAddress;
-    assignedPrefix.cidr = assignedAddress.is6 ? 128 : 32;
-    (void)prodigyMachinePrivateAddressHostPrefix(*machine, family, deliveryPrefix);
-
+  bool supportsTransactionalElasticAddresses(void) const override
+  {
     return true;
   }
 
-  bool releaseProviderElasticAddress(const DistributableExternalSubnet& prefix, String& error) override
-  {
-    error.clear();
-    if (prefix.kind != RoutablePrefixKind::elastic)
-    {
-      return true;
-    }
-
-    if (prefix.providerAssociationID.size() > 0)
-    {
-      String instanceName = {};
-      String nicName = {};
-      String accessConfigName = {};
-      if (parseElasticAssociationID(prefix.providerAssociationID, instanceName, nicName, accessConfigName) == false)
-      {
-        error.assign("gcp elastic address associationID parse failed"_ctv);
-        return false;
-      }
-
-      if (deleteElasticAccessConfig(instanceName, nicName, accessConfigName, error) == false)
-      {
-        return false;
-      }
-    }
-
-    if (prefix.releaseOnRemove)
-    {
-      if (releaseElasticAddressAllocation(prefix.providerAllocationID, error) == false)
-      {
-        return false;
-      }
-    }
-
-    return true;
-  }
 };

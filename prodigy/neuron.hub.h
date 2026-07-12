@@ -89,6 +89,7 @@ private:
 
   static void writeNeuronStage(const char *stage)
   {
+#if PRODIGY_DEBUG
     if (stage == nullptr)
     {
       return;
@@ -100,6 +101,9 @@ private:
       (void)write(fd, stage, strlen(stage));
       (void)close(fd);
     }
+#else
+    (void)stage;
+#endif
   }
 
   template <typename T>
@@ -227,6 +231,7 @@ public:
       std::abort();
     }
 
+#if PRODIGY_DEBUG
     basics_log("NeuronHub::fillFromMainArgs loaded=1 neuronFD=%d lowCPU=%d highCPU=%d nWormholes=%u nWhiteholes=%u nAdvertises=%u nSubPairings=%u nAdvPairings=%u\n",
                parameters.neuronFD,
                parameters.lowCPU,
@@ -397,6 +402,7 @@ public:
     {
       (void)close(dumpFD);
     }
+#endif
 
     applyInitialCredentialBundleLocally();
     takeNeuronUnixPairHalf(parameters.neuronFD); // already open

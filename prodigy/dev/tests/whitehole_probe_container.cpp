@@ -18,9 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
-#include <netdb.h>
 #include <poll.h>
-#include <string>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -29,7 +27,7 @@
 #endif
 
 namespace {
-constexpr static const char *kTargetHost = "whitehole-target.test";
+constexpr static auto kTargetAddressPath = "/whitehole-target-ip"_ctv;
 constexpr static uint16_t kTargetPort = 32'101;
 constexpr static const char *kOpenPayload = "whitehole-open";
 constexpr static const char *kReplyPayload = "whitehole-ok";
@@ -69,35 +67,33 @@ bool waitReadable(int fd, int timeoutMs)
   return poll(&descriptor, 1, timeoutMs) > 0 && (descriptor.revents & POLLIN);
 }
 
-bool resolveIPv4Host(const char *hostname, struct in_addr& address, std::string& failure)
+bool loadTargetAddress(struct in_addr& address, String& failure)
 {
-  struct addrinfo hints = {};
-  hints.ai_family = AF_INET;
-  hints.ai_socktype = SOCK_DGRAM;
-
-  struct addrinfo *result = nullptr;
-  int rc = getaddrinfo(hostname, nullptr, &hints, &result);
-  if (rc != 0 || result == nullptr)
+  String text = {};
+  Filesystem::openReadAtClose(-1, kTargetAddressPath, text);
+  while (text.size() > 0 && (text[text.size() - 1] == '\n' || text[text.size() - 1] == '\r'))
   {
-    failure = "getaddrinfo_failed";
+    text.resize(text.size() - 1);
+  }
+
+  if (text.size() == 0 || inet_pton(AF_INET, text.c_str(), &address) != 1)
+  {
+    failure = "invalid_target_address";
     return false;
   }
 
-  const struct sockaddr_in *ipv4 = reinterpret_cast<const struct sockaddr_in *>(result->ai_addr);
-  address = ipv4->sin_addr;
-  freeaddrinfo(result);
   return true;
 }
 
-std::string renderIPv4(const struct in_addr& address)
+String renderIPv4(const struct in_addr& address)
 {
   char buffer[INET_ADDRSTRLEN] = {};
   if (inet_ntop(AF_INET, &address, buffer, sizeof(buffer)) == nullptr)
   {
-    return "invalid";
+    return String("invalid"_ctv);
   }
 
-  return buffer;
+  return String(buffer);
 }
 } // namespace
 
@@ -106,7 +102,7 @@ private:
 
   std::unique_ptr<NeuronHub> neuronHub;
 
-  bool runWhiteholeProbe(std::string& failure)
+  bool runWhiteholeProbe(String& failure)
   {
     if (!neuronHub)
     {
@@ -134,7 +130,7 @@ private:
     }
 
     struct in_addr targetAddress = {};
-    if (resolveIPv4Host(kTargetHost, targetAddress, failure) == false)
+    if (loadTargetAddress(targetAddress, failure) == false)
     {
       return false;
     }
@@ -168,7 +164,7 @@ private:
       return false;
     }
 
-    std::string whiteholeAddress = renderIPv4(*reinterpret_cast<const struct in_addr *>(&whitehole.address.v4));
+    String whiteholeAddress = renderIPv4(*reinterpret_cast<const struct in_addr *>(&whitehole.address.v4));
     appendTrace("probe.bind", whiteholeAddress.c_str());
     basics_log("probe.bind %s:%u\n", whiteholeAddress.c_str(), unsigned(whitehole.sourcePort));
 
@@ -225,7 +221,8 @@ private:
       return false;
     }
 
-    if (std::string_view(buffer, size_t(received)) != kReplyPayload)
+    if (size_t(received) != std::strlen(kReplyPayload) ||
+        memcmp(buffer, kReplyPayload, size_t(received)) != 0)
     {
       failure = "reply_payload_mismatch";
       appendTrace("probe.recv.bad_payload", failure.c_str());
@@ -288,7 +285,7 @@ public:
     neuronHub->fillFromMainArgs(argc, argv);
     neuronHub->afterRing();
 
-    std::string failure;
+    String failure;
     if (runWhiteholeProbe(failure) == false)
     {
       appendTrace("probe.fail", failure.c_str());

@@ -20,6 +20,7 @@
 #define MAX_WHITEHOLE_BINDINGS 8192
 // clang-format off
 #define WHITEHOLE_REPLY_LRU_SIZE 16384
+#define WHITEHOLE_REPLY_IDLE_NS (300ULL * 1000ULL * 1000ULL * 1000ULL)
 // clang-format on
 
 // packet_description flags:

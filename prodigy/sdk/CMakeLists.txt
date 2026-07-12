@@ -190,9 +190,29 @@ if (TARGET basics::basics)
          PRIVATE
             PRODIGY_SDK_FIXTURES_DIR="${CMAKE_CURRENT_LIST_DIR}/fixtures"
       )
+      add_executable(
+         prodigy_sdk_cpp_opinionated_dns
+         cpp/tests/opinionated_dns_client.cpp
+      )
+      target_link_libraries(
+         prodigy_sdk_cpp_opinionated_dns
+         PRIVATE
+            Prodigy::SdkCppOpinionated
+      )
       add_test(
          NAME prodigy_sdk_cpp_opinionated_smoke
          COMMAND prodigy_sdk_cpp_opinionated_smoke
+      )
+      add_test(
+         NAME prodigy_sdk_cpp_opinionated_dns
+         COMMAND prodigy_sdk_cpp_opinionated_dns
+      )
+      add_test(
+         NAME prodigy_sdk_cpp_opinionated_dns_contract
+         COMMAND
+            "${CMAKE_COMMAND}"
+            "-DPRODIGY_SDK_SOURCE_DIR=${CMAKE_CURRENT_LIST_DIR}"
+            -P "${CMAKE_CURRENT_LIST_DIR}/cpp/tests/assert_opinionated_dns_contract.cmake"
       )
       add_test(
          NAME prodigy_sdk_cpp_opinionated_example_smoke
@@ -270,6 +290,8 @@ install(FILES
 if (_PRODIGY_SDK_HAS_CPP_OPINIONATED)
    install(FILES
       "${CMAKE_CURRENT_LIST_DIR}/cpp/opinionated/aegis_stream.h"
+      "${CMAKE_CURRENT_LIST_DIR}/cpp/opinionated/dns_client.h"
+      "${CMAKE_CURRENT_LIST_DIR}/cpp/opinionated/dns_wire.h"
       "${CMAKE_CURRENT_LIST_DIR}/cpp/opinionated/pairings.h"
       DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/prodigy/opinionated"
    )

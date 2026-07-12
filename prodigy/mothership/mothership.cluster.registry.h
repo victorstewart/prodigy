@@ -738,6 +738,16 @@ private:
       }
     }
 
+    if (expectedTemplate.size() > 0 && expectedSpotTemplate.size() > 0 &&
+        expectedTemplate.equals(expectedSpotTemplate))
+    {
+      if (failure)
+      {
+        failure->assign("gcp standard and spot machineSchemas require distinct template names"_ctv);
+      }
+      return false;
+    }
+
     return true;
   }
 

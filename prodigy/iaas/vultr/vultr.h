@@ -1,17 +1,18 @@
 #pragma once
 
 #include <prodigy/iaas/iaas.h>
+#include <prodigy/iaas/vultr/vultr.http.h>
 #include <services/debug.h>
 #include <prodigy/iaas/bootstrap.ssh.h>
 #include <prodigy/brain/base.h>
 #include <prodigy/cluster.machine.helpers.h>
+#include <prodigy/json.h>
 #include <prodigy/netdev.detect.h>
 #include <networking/bgp.h>
 #include <services/base64.h>
 #include <services/filesystem.h>
 #include <services/random.h>
 #include <simdjson.h>
-#include <curl/curl.h>
 #include <cerrno>
 #include <cctype>
 #include <cstdio>
@@ -22,60 +23,6 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-class VultrHttp {
-public:
-
-  constexpr static long connectTimeoutMs = 3000L;
-  constexpr static long getTimeoutMs = 15'000L;
-  constexpr static long sendTimeoutMs = 20'000L;
-  constexpr static long createSendTimeoutMs = 8000L;
-
-  static bool ensureGlobalInit(void);
-  static bool get(const char *url, const struct curl_slist *headers, String& out, long *httpCode = nullptr);
-  static bool send(const char *method, const char *url, const struct curl_slist *headers, const String& body, String& out, long *httpCode = nullptr, long timeoutMs = sendTimeoutMs);
-
-  class MultiRequest {
-  public:
-
-    CURL *easy = nullptr;
-    struct curl_slist *headers = nullptr;
-    void *context = nullptr;
-    String method = {};
-    String url = {};
-    String body = {};
-    String response = {};
-    long timeoutMs = sendTimeoutMs;
-    long httpCode = 0;
-    CURLcode curlCode = CURLE_OK;
-    bool completed = false;
-    bool added = false;
-
-    void resetResult(void);
-    void clearTransport(void);
-    ~MultiRequest();
-  };
-
-  class MultiClient {
-  private:
-
-    CURLM *multi = nullptr;
-    Vector<MultiRequest *> completed = {};
-    uint32_t inFlight = 0;
-
-    static size_t writeResponse(char *ptr, size_t size, size_t nmemb, void *userdata);
-    void collectCompleted(void);
-
-  public:
-
-    bool init(void);
-    bool start(MultiRequest& request);
-    bool pump(int timeoutMs = 0);
-    MultiRequest *popCompleted(void);
-    uint32_t pendingCount(void) const;
-    ~MultiClient();
-  };
-};
-
 // Vultr instance creation is asynchronous on the provider side. Keep the local
 // poll cadence tight so we discover accepted creates and SSH readiness quickly
 // Reissue detail polls immediately after an observed state change, and only
@@ -85,20 +32,6 @@ constexpr static inline uint32_t vultrCreateRecoveryPollSleepMs = 500u;
 constexpr static inline uint32_t vultrCreateRecoveryMaxAttempts = 48u;
 constexpr static inline uint32_t vultrMachineProvisioningUnchangedPollSleepMs = 250u;
 constexpr static inline uint32_t vultrMachineProvisioningTimeoutMs = 600'000u;
-
-static inline struct curl_slist *vultr_auth_headers(const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment)
-{
-  if (runtimeEnvironment.providerCredentialMaterial.size() == 0)
-  {
-    return nullptr;
-  }
-  struct curl_slist *h = nullptr;
-  String auth;
-  auth.snprintf<"Authorization: Bearer {}"_ctv>(runtimeEnvironment.providerCredentialMaterial);
-  h = curl_slist_append(h, auth.c_str());
-  h = curl_slist_append(h, "Accept: application/json");
-  return h;
-}
 
 static inline uint32_t vultrHashRackIdentity(std::string_view s)
 {
@@ -331,6 +264,13 @@ static inline bool vultrParseAssignedIPv4(std::string_view value, uint32_t& out)
   return out != 0;
 }
 
+static inline bool vultrParseAssignedIPv4(const String& value, uint32_t& out)
+{
+  out = 0;
+  String text = value;
+  return inet_pton(AF_INET, text.c_str(), &out) == 1 && out != 0;
+}
+
 static inline bool vultrExtractPublicIPv6(simdjson::dom::element dev, String& publicAddress)
 {
   publicAddress.clear();
@@ -561,34 +501,20 @@ static inline bool vultrAppendURLEncodedQueryValue(String& output, const String&
     error->clear();
   }
 
-  CURL *curl = curl_easy_init();
-  if (curl == nullptr)
+  constexpr char hex[] = "0123456789ABCDEF";
+  for (uint8_t byte : value)
   {
-    if (error)
+    if ((byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
+        (byte >= '0' && byte <= '9') || byte == '-' || byte == '.' ||
+        byte == '_' || byte == '~')
     {
-      error->assign("vultr url encoder init failed"_ctv);
+      output.append(byte);
+      continue;
     }
-    return false;
+    output.append('%');
+    output.append(hex[byte >> 4]);
+    output.append(hex[byte & 0x0f]);
   }
-
-  String text = {};
-  text.assign(value);
-  text.addNullTerminator();
-
-  char *escaped = curl_easy_escape(curl, text.c_str(), int(value.size()));
-  if (escaped == nullptr)
-  {
-    curl_easy_cleanup(curl);
-    if (error)
-    {
-      error->assign("vultr url encoder escape failed"_ctv);
-    }
-    return false;
-  }
-
-  output.append(escaped);
-  curl_free(escaped);
-  curl_easy_cleanup(curl);
   return true;
 }
 
@@ -688,26 +614,31 @@ private:
     basics_log("%s\n", reason);
   }
 
-  bool fetchBGPAccount()
+  VultrHttpTransport transport(void) const
   {
-    struct curl_slist *h = vultr_auth_headers(runtimeEnvironment);
-    if (!h)
+    return {providerServices.http,
+            providerServices.delay,
+            providerServices.operationDeadline,
+            runtimeEnvironment.providerCredentialMaterial};
+  }
+
+  ProdigyHostTask<bool> fetchBGPAccount(CoroutineStack *coro)
+  {
+    VultrHttpTransport client = transport();
+    String url = "https://api.vultr.com/v2/account/bgp"_ctv;
+    MultiCurlClient::Result response = co_await client.send(
+        coro, client.request(MultiCurlClient::Method::get, url, nullptr,
+                             VultrHttpTransport::getTimeout));
+    if (VultrHttpTransport::succeeded(response) == false)
     {
-      return false;
-    }
-    String resp;
-    bool ok = VultrHttp::get("https://api.vultr.com/v2/account/bgp", h, resp);
-    curl_slist_free_all(h);
-    if (!ok)
-    {
-      return false;
+      co_return false;
     }
 
     simdjson::dom::parser parser;
     simdjson::dom::element doc;
-    if (parser.parse(resp.c_str(), resp.size()).get(doc))
+    if (parser.parse(response.body.c_str(), response.body.size()).get(doc))
     {
-      return false;
+      co_return false;
     }
     // The docs example shows {"enabled":true, "asn":20473, "pasword":"..."}
     // Be permissive: accept both "password" and the misspelled "pasword".
@@ -722,11 +653,11 @@ private:
     }
     if (!enabled || pw.size() == 0 || asnVal == 0)
     {
-      return false;
+      co_return false;
     }
     bgpMD5.assign(pw);
     remoteASN = (uint32_t)asnVal;
-    return true;
+    co_return true;
   }
 
 public:
@@ -736,7 +667,7 @@ public:
     prodigyOwnRuntimeEnvironmentConfig(config, runtimeEnvironment);
   }
 
-  void gatherSelfData(uint128_t& uuid, String& metro, bool& isBrain, EthDevice& eth, IPAddress& private4) override
+  void gatherSelfData(CoroutineStack *coro, uint128_t& uuid, String& metro, bool& isBrain, EthDevice& eth, IPAddress& private4) override
   {
     String deviceName;
     if (prodigyResolvePrimaryNetworkDevice(deviceName))
@@ -757,13 +688,17 @@ public:
       metro = runtimeEnvironment.providerScope;
     }
     isBrain = false; // Neuron IaaS side does not assert brain role
+    if (co_await fetchBGPAccount(coro) == false)
+    {
+      reportBGPUnhealthy("vultr: /v2/account/bgp disabled or fetch failed");
+    }
   }
 
   void gatherBGPConfig(NeuronBGPConfig& config, EthDevice& eth, const IPAddress& private4) override
   {
     config = {};
 
-    if (fetchBGPAccount() == false)
+    if (remoteASN == 0 || bgpMD5.empty())
     {
       reportBGPUnhealthy("vultr: /v2/account/bgp disabled or fetch failed");
       return;
@@ -800,12 +735,6 @@ public:
     config.peers.push_back(peer6);
   }
 
-  void downloadContainerToPath(CoroutineStack *coro, uint64_t deploymentID, const String& path) override
-  {
-    (void)coro;
-    (void)deploymentID;
-    (void)path;
-  }
 };
 
 class VultrBrainIaaS : public BrainIaaS {
@@ -873,19 +802,12 @@ private:
     return inet_pton(AF_INET, v.c_str(), &out) == 1;
   }
 
-  struct curl_slist *auth_headers()
+  VultrHttpTransport transport(void) const
   {
-    if (runtimeEnvironment.providerCredentialMaterial.size() == 0)
-    {
-      return nullptr;
-    }
-    struct curl_slist *h = nullptr;
-    String auth;
-    auth.snprintf<"Authorization: Bearer {}"_ctv>(runtimeEnvironment.providerCredentialMaterial);
-    h = curl_slist_append(h, auth.c_str());
-    h = curl_slist_append(h, "Content-Type: application/json");
-    h = curl_slist_append(h, "Accept: application/json");
-    return h;
+    return {providerServices.http,
+            providerServices.delay,
+            providerServices.operationDeadline,
+            runtimeEnvironment.providerCredentialMaterial};
   }
 
   class PendingMachineProvisioning {
@@ -897,7 +819,6 @@ private:
     bool managedVPCRequestedAtCreate = false;
   };
 
-  class ConcurrentWaitCoordinator;
 
 public:
 
@@ -942,466 +863,12 @@ public:
 
 private:
 
-  class ConcurrentWaitTask : public CoroutineStack {
-  public:
-
-    ConcurrentWaitCoordinator *coordinator = nullptr;
-    PendingMachineProvisioning pending = {};
-    String schema = {};
-    String providerMachineType = {};
-    MachineConfig::MachineKind kind = MachineConfig::MachineKind::vm;
-    const String *requiredVMVPCID = nullptr;
-    bool vpcAttachSubmitted = false;
-    bool sleeping = false;
-    int64_t wakeAtMs = 0;
-    bool done = false;
-    bool success = false;
-    String error = {};
-    Machine *machine = nullptr;
-    VultrHttp::MultiRequest detailRequest = {};
-
-    ~ConcurrentWaitTask()
-    {
-      if (machine != nullptr)
-      {
-        delete machine;
-        machine = nullptr;
-      }
-    }
-
-    void sleepForMs(uint32_t delayMs)
-    {
-      sleeping = true;
-      wakeAtMs = Time::now<TimeResolution::ms>() + int64_t(delayMs);
-    }
-
-    bool startDetailRequest(void)
-    {
-      detailRequest.clearTransport();
-      detailRequest.resetResult();
-      detailRequest.context = this;
-      detailRequest.method.assign("GET"_ctv);
-      detailRequest.url.snprintf<"https://api.vultr.com/v2/{}/{}"_ctv>(String(coordinator->owner->resourcePath(kind)), pending.createdID);
-      detailRequest.timeoutMs = VultrHttp::getTimeoutMs;
-      detailRequest.headers = coordinator->owner->auth_headers();
-      if (detailRequest.headers == nullptr)
-      {
-        error.assign("vultr api key missing"_ctv);
-        return false;
-      }
-
-      if (coordinator->http.start(detailRequest) == false)
-      {
-        error.assign("vultr detail request start failed"_ctv);
-        return false;
-      }
-
-      return true;
-    }
-
-    void execute(void)
-    {
-      bool waitingForVPCPrivateAddress = requiredVMVPCID != nullptr && requiredVMVPCID->size() > 0;
-      vpcAttachSubmitted = pending.managedVPCRequestedAtCreate;
-      int64_t deadlineMs = Time::now<TimeResolution::ms>() + int64_t(vultrMachineProvisioningTimeoutMs);
-      String lastStatus = {};
-      lastStatus.assign("launch-submitted"_ctv);
-      MachineProvisioningPollObservation previousObservation = {};
-      bool havePreviousObservation = false;
-
-      auto nextDelayMs = [&](MachineProvisioningPollPhase phase, std::string_view providerStatus) -> uint32_t {
-        MachineProvisioningPollObservation current = {};
-        current.phase = phase;
-        current.vpcAttachSubmitted = vpcAttachSubmitted;
-        current.providerStatus.assign(providerStatus);
-        uint32_t delayMs = nextMachineProvisioningPollDelayMs(havePreviousObservation ? &previousObservation : nullptr, current);
-        previousObservation = std::move(current);
-        havePreviousObservation = true;
-        return delayMs;
-      };
-
-      while (Time::now<TimeResolution::ms>() < deadlineMs)
-      {
-        if (startDetailRequest() == false)
-        {
-          done = true;
-          success = false;
-          co_return;
-        }
-
-        co_await suspend();
-
-        if (detailRequest.curlCode != CURLE_OK || detailRequest.httpCode < 200 || detailRequest.httpCode >= 300)
-        {
-          uint32_t delayMs = nextDelayMs(MachineProvisioningPollPhase::transportRetry, {});
-          if (delayMs > 0)
-          {
-            sleepForMs(delayMs);
-            co_await suspend();
-          }
-          continue;
-        }
-
-        simdjson::dom::parser parser;
-        simdjson::dom::element doc = {};
-        if (parser.parse(detailRequest.response.c_str(), detailRequest.response.size()).get(doc))
-        {
-          error.assign("vultr detail parse failed"_ctv);
-          done = true;
-          success = false;
-          co_return;
-        }
-
-        simdjson::dom::element dev = {};
-        if (coordinator->owner->extractResourceObject(doc, kind, dev) == false)
-        {
-          error.assign("vultr detail response missing resource object"_ctv);
-          done = true;
-          success = false;
-          co_return;
-        }
-
-        bool hasInternalVPCAddress = true;
-        std::string_view providerStatus = {};
-        (void)dev["status"].get(providerStatus);
-        if (waitingForVPCPrivateAddress)
-        {
-          String internalVPCAddress = {};
-          hasInternalVPCAddress = vultrExtractInternalIPv4(dev, internalVPCAddress);
-          if (hasInternalVPCAddress == false)
-          {
-            if (providerStatus == "active" && vpcAttachSubmitted == false)
-            {
-              if (coordinator->owner->attachMachineToVPC(pending.createdID, kind, *requiredVMVPCID, error) == false)
-              {
-                done = true;
-                success = false;
-                co_return;
-              }
-
-              vpcAttachSubmitted = true;
-            }
-          }
-        }
-
-        if (machine != nullptr)
-        {
-          delete machine;
-          machine = nullptr;
-        }
-
-        machine = coordinator->owner->buildMachineFromVultr(dev, kind);
-        MachineProvisioningProgress& progress = coordinator->owner->provisioningProgress.upsert(schema, providerMachineType, pending.createdID, pending.createdID);
-        if (machine != nullptr)
-        {
-          prodigyPopulateMachineProvisioningProgressFromMachine(progress, *machine);
-        }
-
-        if (waitingForVPCPrivateAddress && hasInternalVPCAddress == false && machine != nullptr)
-        {
-          hasInternalVPCAddress = coordinator->owner->populateMachineAttachedVPCIPv4(kind, *machine);
-          if (hasInternalVPCAddress)
-          {
-            prodigyPopulateMachineProvisioningProgressFromMachine(progress, *machine);
-          }
-        }
-
-        if (waitingForVPCPrivateAddress && hasInternalVPCAddress == false)
-        {
-          if (vpcAttachSubmitted)
-          {
-            lastStatus.assign("waiting-for-vpc-private-ip"_ctv);
-            progress.status.assign("waiting-for-vpc-private-ip"_ctv);
-          }
-          else
-          {
-            lastStatus.assign("waiting-for-active-before-vpc-attach"_ctv);
-            progress.status.assign("waiting-for-active-before-vpc-attach"_ctv);
-          }
-          progress.ready = false;
-          if (machine != nullptr)
-          {
-            delete machine;
-            machine = nullptr;
-          }
-          coordinator->owner->provisioningProgress.emitMaybe(Time::now<TimeResolution::ms>());
-          uint32_t delayMs = nextDelayMs(
-              vpcAttachSubmitted ? MachineProvisioningPollPhase::waitingForVPCPrivateIP
-                                 : MachineProvisioningPollPhase::waitingForActiveBeforeVPCAttach,
-              providerStatus);
-          if (delayMs > 0)
-          {
-            sleepForMs(delayMs);
-            co_await suspend();
-          }
-          continue;
-        }
-
-        if (machine != nullptr && machine->sshAddress.size() == 0)
-        {
-          lastStatus.assign("waiting-for-public-ssh-address"_ctv);
-          progress.status.assign("waiting-for-public-ssh-address"_ctv);
-          progress.ready = false;
-          delete machine;
-          machine = nullptr;
-          coordinator->owner->provisioningProgress.emitMaybe(Time::now<TimeResolution::ms>());
-          uint32_t delayMs = nextDelayMs(MachineProvisioningPollPhase::waitingForPublicSSHAddress, providerStatus);
-          if (delayMs > 0)
-          {
-            sleepForMs(delayMs);
-            co_await suspend();
-          }
-          continue;
-        }
-
-        bool machineAddressesReady = (machine != nullptr) && prodigyMachineProvisioningReady(*machine);
-        bool machineSSHReady = machineAddressesReady && prodigyMachineProvisioningSSHReady(*machine);
-        if (machineSSHReady)
-        {
-          lastStatus.assign("active"_ctv);
-          progress.status.assign("active"_ctv);
-          progress.ready = true;
-          coordinator->owner->provisioningProgress.notifyMachineProvisioned(*machine);
-          coordinator->owner->provisioningProgress.emitNow();
-          done = true;
-          success = true;
-          co_return;
-        }
-
-        if (machineAddressesReady == false)
-        {
-          lastStatus.assign("waiting-for-instance-addresses"_ctv);
-          progress.status.assign("waiting-for-instance-addresses"_ctv);
-        }
-        else
-        {
-          lastStatus.assign("waiting-for-ssh-accept"_ctv);
-          progress.status.assign("waiting-for-ssh-accept"_ctv);
-        }
-        progress.ready = false;
-        if (machine != nullptr)
-        {
-          delete machine;
-          machine = nullptr;
-        }
-        coordinator->owner->provisioningProgress.emitMaybe(Time::now<TimeResolution::ms>());
-        uint32_t delayMs = nextDelayMs(
-            machineAddressesReady ? MachineProvisioningPollPhase::waitingForSSHAccept
-                                  : MachineProvisioningPollPhase::waitingForInstanceAddresses,
-            providerStatus);
-        if (delayMs > 0)
-        {
-          sleepForMs(delayMs);
-          co_await suspend();
-        }
-      }
-
-      error.snprintf<"vultr machine provisioning timed out status={}"_ctv>(lastStatus);
-      done = true;
-      success = false;
-    }
-  };
-
-  class ConcurrentWaitCoordinator {
-  public:
-
-    VultrBrainIaaS *owner = nullptr;
-    VultrHttp::MultiClient http = {};
-    Vector<ConcurrentWaitTask *> tasks = {};
-
-    explicit ConcurrentWaitCoordinator(VultrBrainIaaS *thisOwner)
-        : owner(thisOwner)
-    {
-    }
-
-    ~ConcurrentWaitCoordinator()
-    {
-      for (ConcurrentWaitTask *task : tasks)
-      {
-        delete task;
-      }
-      tasks.clear();
-    }
-
-    bool allDone(void) const
-    {
-      for (ConcurrentWaitTask *task : tasks)
-      {
-        if (task != nullptr && task->done == false)
-        {
-          return false;
-        }
-      }
-
-      return true;
-    }
-
-    int64_t nextWakeAtMs(void) const
-    {
-      int64_t nextWake = 0;
-      for (ConcurrentWaitTask *task : tasks)
-      {
-        if (task == nullptr || task->done || task->sleeping == false)
-        {
-          continue;
-        }
-
-        if (nextWake == 0 || task->wakeAtMs < nextWake)
-        {
-          nextWake = task->wakeAtMs;
-        }
-      }
-
-      return nextWake;
-    }
-
-    static void resumeTaskOnce(ConcurrentWaitTask *task)
-    {
-      if (task == nullptr || task->hasSuspendedCoroutines() == false)
-      {
-        return;
-      }
-
-      task->runNextSuspended();
-    }
-
-    void wakeReadySleepers(void)
-    {
-      int64_t nowMs = Time::now<TimeResolution::ms>();
-      for (ConcurrentWaitTask *task : tasks)
-      {
-        if (task == nullptr || task->done || task->sleeping == false || task->wakeAtMs > nowMs)
-        {
-          continue;
-        }
-
-        task->sleeping = false;
-        resumeTaskOnce(task);
-      }
-    }
-
-    bool nudgeDormantTasks(void)
-    {
-      bool nudged = false;
-      for (ConcurrentWaitTask *task : tasks)
-      {
-        if (task == nullptr || task->done || task->sleeping || task->hasSuspendedCoroutines() == false)
-        {
-          continue;
-        }
-
-        resumeTaskOnce(task);
-        nudged = true;
-      }
-
-      return nudged;
-    }
-
-    bool run(const String& schema, const String& providerMachineType, MachineConfig::MachineKind kind, const Vector<PendingMachineProvisioning>& pendingMachines, const String *requiredVMVPCID, Vector<Machine *>& readyMachines, String& error)
-    {
-      error.clear();
-      readyMachines.clear();
-      uint32_t dormantNudges = 0;
-
-      for (const PendingMachineProvisioning& pending : pendingMachines)
-      {
-        ConcurrentWaitTask *task = new ConcurrentWaitTask();
-        task->coordinator = this;
-        task->pending = pending;
-        task->schema = schema;
-        task->providerMachineType = providerMachineType;
-        task->kind = kind;
-        task->requiredVMVPCID = requiredVMVPCID;
-        tasks.push_back(task);
-        task->execute();
-      }
-
-      while (allDone() == false)
-      {
-        wakeReadySleepers();
-
-        while (VultrHttp::MultiRequest *completed = http.popCompleted())
-        {
-          ConcurrentWaitTask *task = reinterpret_cast<ConcurrentWaitTask *>(completed->context);
-          if (task != nullptr && task->done == false)
-          {
-            resumeTaskOnce(task);
-          }
-        }
-
-        if (allDone())
-        {
-          break;
-        }
-
-        int64_t nowMs = Time::now<TimeResolution::ms>();
-        int64_t nextWakeMs = nextWakeAtMs();
-        int timeoutMs = 50;
-        if (nextWakeMs > nowMs)
-        {
-          int64_t delayMs = nextWakeMs - nowMs;
-          timeoutMs = int(delayMs > 50 ? 50 : delayMs);
-        }
-        else if (nextWakeMs == 0 && http.pendingCount() == 0)
-        {
-          if (nudgeDormantTasks())
-          {
-            dormantNudges += 1;
-            if (dormantNudges < 8)
-            {
-              continue;
-            }
-          }
-
-          error.assign("vultr concurrent wait stalled with no pending work"_ctv);
-          return false;
-        }
-        else
-        {
-          dormantNudges = 0;
-        }
-
-        if (http.pendingCount() > 0)
-        {
-          if (http.pump(timeoutMs) == false)
-          {
-            error.assign("vultr detail request pump failed"_ctv);
-            return false;
-          }
-        }
-        else
-        {
-          usleep(useconds_t(timeoutMs) * 1000u);
-        }
-      }
-
-      for (ConcurrentWaitTask *task : tasks)
-      {
-        if (task == nullptr)
-        {
-          continue;
-        }
-
-        if (task->success == false)
-        {
-          error = task->error;
-          return false;
-        }
-
-        if (task->machine != nullptr && task->pending.requestedStorageMB > 0 && task->machine->totalStorageMB == 0)
-        {
-          task->machine->totalStorageMB = task->pending.requestedStorageMB;
-        }
-
-        readyMachines.push_back(task->machine);
-        task->machine = nullptr;
-      }
-
-      return true;
-    }
-  };
-
-  bool lookupPlanMetadata(const String& planID, String& storageType, String& planType, String& cpuVendor, String& error)
+  ProdigyHostTask<bool> lookupPlanMetadata(CoroutineStack *coro,
+                                           const String& planID,
+                                           String& storageType,
+                                           String& planType,
+                                           String& cpuVendor,
+                                           String& error)
   {
     storageType.clear();
     planType.clear();
@@ -1411,60 +878,49 @@ private:
     if (planID.size() == 0)
     {
       error.assign("vultr plan id missing"_ctv);
-      return false;
+      co_return false;
     }
 
-    struct curl_slist *h = auth_headers();
-    if (!h)
-    {
-      error.assign("vultr api key missing"_ctv);
-      return false;
-    }
-
+    VultrHttpTransport client = transport();
     String cursor = {};
     for (uint32_t page = 0; page < 16; ++page)
     {
       String url = {};
       if (vultrBuildPlansLookupURL(cursor, url, &error) == false)
       {
-        curl_slist_free_all(h);
-        return false;
+        co_return false;
       }
 
-      String response = {};
-      long httpCode = 0;
-      bool ok = VultrHttp::get(url.c_str(), h, response, &httpCode);
-      if (ok == false || httpCode < 200 || httpCode >= 300)
+      MultiCurlClient::Result response = co_await client.send(
+          coro, client.request(MultiCurlClient::Method::get, url, nullptr,
+                               VultrHttpTransport::getTimeout));
+      if (VultrHttpTransport::succeeded(response) == false)
       {
-        curl_slist_free_all(h);
         error.assign("vultr plans lookup failed"_ctv);
-        return false;
+        co_return false;
       }
 
       simdjson::dom::parser parser;
       simdjson::dom::element doc = {};
       String padded = {};
-      padded.assign(response);
+      padded.assign(response.body);
       padded.need(simdjson::SIMDJSON_PADDING);
       if (parser.parse(padded.c_str(), padded.size()).get(doc))
       {
-        curl_slist_free_all(h);
         error.assign("vultr plans response parse failed"_ctv);
-        return false;
+        co_return false;
       }
 
       bool found = false;
       String nextCursor = {};
       if (vultrExtractPlanMetadata(doc, planID, storageType, planType, cpuVendor, found, nextCursor, &error) == false)
       {
-        curl_slist_free_all(h);
-        return false;
+        co_return false;
       }
 
       if (found)
       {
-        curl_slist_free_all(h);
-        return true;
+        co_return true;
       }
 
       if (nextCursor.size() == 0)
@@ -1475,9 +931,8 @@ private:
       cursor = std::move(nextCursor);
     }
 
-    curl_slist_free_all(h);
     error.snprintf<"vultr plan '{}' not found"_ctv>(planID);
-    return false;
+    co_return false;
   }
 
   static const char *resourcePath(MachineConfig::MachineKind kind)
@@ -1507,14 +962,14 @@ private:
     return false;
   }
 
-  static bool hasTag(simdjson::dom::element dev, std::string_view wantedTag)
+  static bool hasTag(simdjson::dom::element dev, const String& wantedTag)
   {
     if (auto tags = dev["tags"]; tags.is_array())
     {
       for (auto tag : tags.get_array())
       {
-        std::string_view value;
-        if (!tag.get(value) && value == wantedTag)
+        String value;
+        if (prodigyJSONString(tag, value) == simdjson::SUCCESS && value == wantedTag)
         {
           return true;
         }
@@ -1528,10 +983,13 @@ private:
   bool extract_ipv4_and_gateway(simdjson::dom::element dev, uint32_t& private4, uint32_t& gateway4)
   {
     // Common fields
-    std::string_view ip, gw;
-    if (!dev["internal_ip"].get(ip) && vultrParseAssignedIPv4(ip, private4))
+    String ip;
+    String gw;
+    if (prodigyJSONString(dev["internal_ip"], ip) == simdjson::SUCCESS &&
+        vultrParseAssignedIPv4(ip, private4))
     {
-      if (!dev["default_gateway"].get(gw) && vultrParseAssignedIPv4(gw, gateway4))
+      if (prodigyJSONString(dev["default_gateway"], gw) == simdjson::SUCCESS &&
+          vultrParseAssignedIPv4(gw, gateway4))
       {
         return true;
       }
@@ -1544,15 +1002,18 @@ private:
       {
         uint64_t fam = 0;
         bool isPriv = false;
-        std::string_view a, g;
+        String a;
+        String g;
         (void)v["address_family"].get(fam);
         (void)v["public"].get(isPriv);
         isPriv = !isPriv;
         if (fam == 4 && isPriv)
         {
-          if (!v["address"].get(a) && vultrParseAssignedIPv4(a, private4))
+          if (prodigyJSONString(v["address"], a) == simdjson::SUCCESS &&
+              vultrParseAssignedIPv4(a, private4))
           {
-            if (!v["gateway"].get(g) && vultrParseAssignedIPv4(g, gateway4))
+            if (prodigyJSONString(v["gateway"], g) == simdjson::SUCCESS &&
+                vultrParseAssignedIPv4(g, gateway4))
             {
               return true;
             }
@@ -1566,14 +1027,17 @@ private:
     {
       for (auto nic : nics.get_array())
       {
-        std::string_view a, g;
+        String a;
+        String g;
         uint64_t fam = 4;
         (void)nic["address_family"].get(fam);
         if (fam == 4)
         {
-          if (!nic["ip"].get(a) && vultrParseAssignedIPv4(a, private4))
+          if (prodigyJSONString(nic["ip"], a) == simdjson::SUCCESS &&
+              vultrParseAssignedIPv4(a, private4))
           {
-            if (!nic["gateway"].get(g) && vultrParseAssignedIPv4(g, gateway4))
+            if (prodigyJSONString(nic["gateway"], g) == simdjson::SUCCESS &&
+                vultrParseAssignedIPv4(g, gateway4))
             {
               return true;
             }
@@ -1720,22 +1184,25 @@ private:
     return m;
   }
 
-  bool fetchMachineDetail(const String& id, MachineConfig::MachineKind kind, String& response)
+  ProdigyHostTask<bool> fetchMachineDetail(CoroutineStack *coro,
+                                           const String& id,
+                                           MachineConfig::MachineKind kind,
+                                           String& response)
   {
-    struct curl_slist *h = auth_headers();
-    if (!h)
-    {
-      return false;
-    }
     String url;
     url.snprintf<"https://api.vultr.com/v2/{}/{}"_ctv>(String(resourcePath(kind)), id);
-    long httpCode = 0;
-    bool ok = VultrHttp::get(url.c_str(), h, response, &httpCode);
-    curl_slist_free_all(h);
-    return ok && httpCode >= 200 && httpCode < 300;
+    VultrHttpTransport client = transport();
+    MultiCurlClient::Result result = co_await client.send(
+        coro, client.request(MultiCurlClient::Method::get, url, nullptr,
+                             VultrHttpTransport::getTimeout));
+    response = std::move(result.body);
+    co_return VultrHttpTransport::succeeded(result);
   }
 
-  bool recoverCreatedMachineIDByLabel(const struct curl_slist *headers, MachineConfig::MachineKind kind, const String& label, String& createdID)
+  ProdigyHostTask<bool> recoverCreatedMachineIDByLabel(CoroutineStack *coro,
+                                                       MachineConfig::MachineKind kind,
+                                                       const String& label,
+                                                       String& createdID)
   {
     createdID.clear();
 
@@ -1744,25 +1211,33 @@ private:
     std::string_view wantedLabel(reinterpret_cast<const char *>(label.data()), size_t(label.size()));
     for (uint32_t attempt = 0; attempt < vultrCreateRecoveryMaxAttempts; ++attempt)
     {
-      String response = {};
-      long httpCode = 0;
-      if (VultrHttp::get(url.c_str(), headers, response, &httpCode) && httpCode >= 200 && httpCode < 300)
+      VultrHttpTransport client = transport();
+      MultiCurlClient::Result response = co_await client.send(
+          coro, client.request(MultiCurlClient::Method::get, url, nullptr,
+                               VultrHttpTransport::getTimeout));
+      if (VultrHttpTransport::succeeded(response))
       {
         simdjson::dom::parser parser;
         simdjson::dom::element doc = {};
-        if (parser.parse(response.c_str(), response.size()).get(doc) == simdjson::SUCCESS && vultrFindMachineIDByLabel(doc, kind, wantedLabel, createdID))
+        if (parser.parse(response.body.c_str(), response.body.size()).get(doc) == simdjson::SUCCESS && vultrFindMachineIDByLabel(doc, kind, wantedLabel, createdID))
         {
-          return true;
+          co_return true;
         }
       }
 
-      usleep(useconds_t(vultrCreateRecoveryPollSleepMs) * 1000u);
+      if (co_await client.wait(coro, std::chrono::milliseconds(vultrCreateRecoveryPollSleepMs)) == false)
+      {
+        co_return false;
+      }
     }
 
-    return false;
+    co_return false;
   }
 
-  bool ensureManagedMachineVPC(const String& region, String& vpcID, String& error)
+  ProdigyHostTask<bool> ensureManagedMachineVPC(CoroutineStack *coro,
+                                                const String& region,
+                                                String& vpcID,
+                                                String& error)
   {
     vpcID.clear();
     error.clear();
@@ -1770,14 +1245,7 @@ private:
     if (region.size() == 0)
     {
       error.assign("vultr managed vpc region missing"_ctv);
-      return false;
-    }
-
-    struct curl_slist *h = auth_headers();
-    if (!h)
-    {
-      error.assign("vultr api key missing"_ctv);
-      return false;
+      co_return false;
     }
 
     String description = {};
@@ -1843,26 +1311,25 @@ private:
       return true;
     };
 
-    String listResponse = {};
-    long httpCode = 0;
-    bool ok = VultrHttp::get("https://api.vultr.com/v2/vpcs?per_page=200", h, listResponse, &httpCode);
-    if (ok == false || httpCode < 200 || httpCode >= 300)
+    VultrHttpTransport client = transport();
+    String listURL = "https://api.vultr.com/v2/vpcs?per_page=200"_ctv;
+    MultiCurlClient::Result listResult = co_await client.send(
+        coro, client.request(MultiCurlClient::Method::get, listURL, nullptr,
+                             VultrHttpTransport::getTimeout));
+    if (VultrHttpTransport::succeeded(listResult) == false)
     {
-      curl_slist_free_all(h);
       error.assign("vultr vpc list failed"_ctv);
-      return false;
+      co_return false;
     }
 
-    if (extractExistingVPC(listResponse) == false)
+    if (extractExistingVPC(listResult.body) == false)
     {
-      curl_slist_free_all(h);
-      return false;
+      co_return false;
     }
 
     if (vpcID.size() > 0)
     {
-      curl_slist_free_all(h);
-      return true;
+      co_return true;
     }
 
     String body = {};
@@ -1876,57 +1343,53 @@ private:
     body.snprintf_add<"{itoa}"_ctv>(wantedPrefixLength);
     body.append("}"_ctv);
 
-    String createResponse = {};
-    httpCode = 0;
-    ok = VultrHttp::send("POST", "https://api.vultr.com/v2/vpcs", h, body, createResponse, &httpCode);
-    curl_slist_free_all(h);
-    if (ok == false || httpCode < 200 || httpCode >= 300)
+    String createURL = "https://api.vultr.com/v2/vpcs"_ctv;
+    MultiCurlClient::Result createResult = co_await client.send(
+        coro, client.request(MultiCurlClient::Method::post, createURL, &body));
+    if (VultrHttpTransport::succeeded(createResult) == false)
     {
-      error.snprintf<"vultr vpc create failed http={itoa} body={}"_ctv>(uint32_t(httpCode), createResponse);
-      return false;
+      error.snprintf<"vultr vpc create failed http={itoa} body={}"_ctv>(uint32_t(createResult.statusCode), createResult.body);
+      co_return false;
     }
 
     simdjson::dom::parser parser;
     simdjson::dom::element doc = {};
-    if (parser.parse(createResponse.c_str(), createResponse.size()).get(doc))
+    if (parser.parse(createResult.body.c_str(), createResult.body.size()).get(doc))
     {
       error.assign("vultr vpc create parse failed"_ctv);
-      return false;
+      co_return false;
     }
 
     simdjson::dom::element vpc = {};
     if (doc["vpc"].get(vpc) != simdjson::SUCCESS || vpc.is_null())
     {
       error.assign("vultr vpc create missing vpc object"_ctv);
-      return false;
+      co_return false;
     }
 
     std::string_view id = {};
     if (!vpc["id"].get(id) && id.size() > 0)
     {
       vpcID.assign(id);
-      return true;
+      co_return true;
     }
 
     error.assign("vultr vpc create missing id"_ctv);
-    return false;
+    co_return false;
   }
 
-  bool attachMachineToVPC(const String& id, MachineConfig::MachineKind kind, const String& vpcID, String& error)
+  ProdigyHostTask<bool> attachMachineToVPC(CoroutineStack *coro,
+                                           const String& id,
+                                           MachineConfig::MachineKind kind,
+                                           const String& vpcID,
+                                           String& error)
   {
     error.clear();
 
     if (id.size() == 0 || vpcID.size() == 0)
     {
       error.assign("vultr machine vpc attach requires machine id and vpc id"_ctv);
-      return false;
-    }
-
-    struct curl_slist *h = auth_headers();
-    if (!h)
-    {
-      error.assign("vultr api key missing"_ctv);
-      return false;
+      co_return false;
     }
 
     String body = {};
@@ -1945,32 +1408,34 @@ private:
       urls.push_back(fallbackURL);
     }
 
-    String response = {};
-    long httpCode = 0;
+    VultrHttpTransport client = transport();
+    MultiCurlClient::Result result = {};
     bool attached = false;
     for (String& url : urls)
     {
-      response.clear();
-      httpCode = 0;
-      bool ok = VultrHttp::send("POST", url.c_str(), h, body, response, &httpCode);
-      if (ok && httpCode >= 200 && httpCode < 300)
+      result = co_await client.send(
+          coro, client.request(MultiCurlClient::Method::post, url, &body));
+      if (VultrHttpTransport::succeeded(result))
       {
         attached = true;
         break;
       }
     }
 
-    curl_slist_free_all(h);
     if (attached == false)
     {
-      error.snprintf<"vultr machine vpc attach failed http={itoa} body={}"_ctv>(uint32_t(httpCode), response);
-      return false;
+      error.snprintf<"vultr machine vpc attach failed http={itoa} body={}"_ctv>(uint32_t(result.statusCode), result.body);
+      co_return false;
     }
 
-    return true;
+    co_return true;
   }
 
-  bool fetchAttachedVPCIPv4(const String& id, MachineConfig::MachineKind kind, String& privateAddress, String& error)
+  ProdigyHostTask<bool> fetchAttachedVPCIPv4(CoroutineStack *coro,
+                                             const String& id,
+                                             MachineConfig::MachineKind kind,
+                                             String& privateAddress,
+                                             String& error)
   {
     privateAddress.clear();
     error.clear();
@@ -1978,14 +1443,7 @@ private:
     if (id.size() == 0)
     {
       error.assign("vultr machine vpc lookup requires machine id"_ctv);
-      return false;
-    }
-
-    struct curl_slist *h = auth_headers();
-    if (!h)
-    {
-      error.assign("vultr api key missing"_ctv);
-      return false;
+      co_return false;
     }
 
     Vector<String> urls = {};
@@ -1999,51 +1457,54 @@ private:
       urls.push_back(fallbackURL);
     }
 
-    String response = {};
-    long httpCode = 0;
+    VultrHttpTransport client = transport();
+    MultiCurlClient::Result result = {};
     bool fetched = false;
     for (String& url : urls)
     {
-      response.clear();
-      httpCode = 0;
-      bool ok = VultrHttp::get(url.c_str(), h, response, &httpCode);
-      if (ok && httpCode >= 200 && httpCode < 300)
+      result = co_await client.send(
+          coro, client.request(MultiCurlClient::Method::get, url, nullptr,
+                               VultrHttpTransport::getTimeout));
+      if (VultrHttpTransport::succeeded(result))
       {
         fetched = true;
         break;
       }
     }
 
-    curl_slist_free_all(h);
     if (fetched == false)
     {
       error.assign("vultr machine vpc lookup failed"_ctv);
-      return false;
+      co_return false;
     }
 
     simdjson::dom::parser parser;
     simdjson::dom::element doc = {};
-    if (parser.parse(response.c_str(), response.size()).get(doc))
+    if (parser.parse(result.body.c_str(), result.body.size()).get(doc))
     {
       error.assign("vultr machine vpc lookup parse failed"_ctv);
-      return false;
+      co_return false;
     }
 
-    return vultrExtractAttachedVPCIPv4(doc, privateAddress);
+    co_return vultrExtractAttachedVPCIPv4(doc, privateAddress);
   }
 
-  bool populateMachineAttachedVPCIPv4(MachineConfig::MachineKind kind, Machine& machine)
+  ProdigyHostTask<bool> populateMachineAttachedVPCIPv4(CoroutineStack *coro,
+                                                       MachineConfig::MachineKind kind,
+                                                       Machine& machine)
   {
     if (vultrMachineKindUsesManagedVPC(kind) == false || machine.cloudID.size() == 0)
     {
-      return false;
+      co_return false;
     }
 
     String privateAddress = {};
     String failure = {};
-    if (fetchAttachedVPCIPv4(machine.cloudID, kind, privateAddress, failure) == false || privateAddress.size() == 0)
+    if (co_await fetchAttachedVPCIPv4(coro, machine.cloudID, kind,
+                                      privateAddress, failure) == false ||
+        privateAddress.size() == 0)
     {
-      return false;
+      co_return false;
     }
 
     machine.privateAddress = privateAddress;
@@ -2054,11 +1515,20 @@ private:
       machine.private4 = parsedPrivate4;
     }
     prodigyConfigureMachineNeuronEndpoint(machine, thisNeuron);
-    return true;
+    co_return true;
   }
 
-  bool waitForMachine(const String& id, const String& schema, const String& providerMachineType, MachineConfig::MachineKind kind, Machine *& machine, String& error, const String *requiredVMVPCID = nullptr, bool vpcRequestedAtCreate = false)
+  ProdigyHostTask<bool> waitForMachine(CoroutineStack *coro,
+                                      const String& id,
+                                      const String& schema,
+                                      const String& providerMachineType,
+                                      MachineConfig::MachineKind kind,
+                                      Machine *& machine,
+                                      String& error,
+                                      const String *requiredVMVPCID = nullptr,
+                                      bool vpcRequestedAtCreate = false)
   {
+    VultrHttpTransport client = transport();
     machine = nullptr;
     bool waitingForVPCPrivateAddress = requiredVMVPCID != nullptr && requiredVMVPCID->size() > 0;
     bool vpcAttachSubmitted = vpcRequestedAtCreate;
@@ -2082,12 +1552,15 @@ private:
     while (Time::now<TimeResolution::ms>() < deadlineMs)
     {
       String detailResponse;
-      if (fetchMachineDetail(id, kind, detailResponse) == false)
+      if (co_await fetchMachineDetail(coro, id, kind, detailResponse) == false)
       {
         uint32_t delayMs = nextDelayMs(MachineProvisioningPollPhase::transportRetry, {});
         if (delayMs > 0)
         {
-          usleep(useconds_t(delayMs) * 1000u);
+          if (co_await client.wait(coro, std::chrono::milliseconds(delayMs)) == false)
+          {
+            co_return false;
+          }
         }
         continue;
       }
@@ -2097,14 +1570,14 @@ private:
       if (parser.parse(detailResponse.c_str(), detailResponse.size()).get(doc))
       {
         error.assign("vultr detail parse failed"_ctv);
-        return false;
+        co_return false;
       }
 
       simdjson::dom::element dev = {};
       if (extractResourceObject(doc, kind, dev) == false)
       {
         error.assign("vultr detail response missing resource object"_ctv);
-        return false;
+        co_return false;
       }
 
       bool hasInternalVPCAddress = true;
@@ -2118,9 +1591,9 @@ private:
         {
           if (providerStatus == "active" && vpcAttachSubmitted == false)
           {
-            if (attachMachineToVPC(id, kind, *requiredVMVPCID, error) == false)
+            if (co_await attachMachineToVPC(coro, id, kind, *requiredVMVPCID, error) == false)
             {
-              return false;
+              co_return false;
             }
 
             vpcAttachSubmitted = true;
@@ -2136,7 +1609,7 @@ private:
       }
       if (waitingForVPCPrivateAddress && hasInternalVPCAddress == false && machine != nullptr)
       {
-        hasInternalVPCAddress = populateMachineAttachedVPCIPv4(kind, *machine);
+        hasInternalVPCAddress = co_await populateMachineAttachedVPCIPv4(coro, kind, *machine);
         if (hasInternalVPCAddress)
         {
           prodigyPopulateMachineProvisioningProgressFromMachine(progress, *machine);
@@ -2164,7 +1637,10 @@ private:
             providerStatus);
         if (delayMs > 0)
         {
-          usleep(useconds_t(delayMs) * 1000u);
+          if (co_await client.wait(coro, std::chrono::milliseconds(delayMs)) == false)
+          {
+            co_return false;
+          }
         }
         continue;
       }
@@ -2180,7 +1656,10 @@ private:
         uint32_t delayMs = nextDelayMs(MachineProvisioningPollPhase::waitingForPublicSSHAddress, providerStatus);
         if (delayMs > 0)
         {
-          usleep(useconds_t(delayMs) * 1000u);
+          if (co_await client.wait(coro, std::chrono::milliseconds(delayMs)) == false)
+          {
+            co_return false;
+          }
         }
         continue;
       }
@@ -2194,7 +1673,7 @@ private:
         progress.ready = true;
         provisioningProgress.notifyMachineProvisioned(*machine);
         provisioningProgress.emitNow();
-        return true;
+        co_return true;
       }
 
       if (machineAddressesReady == false)
@@ -2217,23 +1696,30 @@ private:
           providerStatus);
       if (delayMs > 0)
       {
-        usleep(useconds_t(delayMs) * 1000u);
+        if (co_await client.wait(coro, std::chrono::milliseconds(delayMs)) == false)
+        {
+          co_return false;
+        }
       }
     }
 
     error.snprintf<"vultr machine provisioning timed out status={}"_ctv>(lastStatus);
-    return false;
+    co_return false;
   }
 
-  bool ensureMachineTagsForKind(const String& cloudID, MachineConfig::MachineKind kind, const String& clusterUUID, String& error)
+  ProdigyHostTask<bool> ensureMachineTagsForKind(CoroutineStack *coro,
+                                                 const String& cloudID,
+                                                 MachineConfig::MachineKind kind,
+                                                 const String& clusterUUID,
+                                                 String& error)
   {
     error.clear();
 
     String detailResponse = {};
-    if (fetchMachineDetail(cloudID, kind, detailResponse) == false)
+    if (co_await fetchMachineDetail(coro, cloudID, kind, detailResponse) == false)
     {
       error.assign("vultr machine detail fetch failed"_ctv);
-      return false;
+      co_return false;
     }
 
     simdjson::dom::parser parser;
@@ -2241,14 +1727,14 @@ private:
     if (parser.parse(detailResponse.c_str(), detailResponse.size()).get(doc))
     {
       error.assign("vultr detail parse failed"_ctv);
-      return false;
+      co_return false;
     }
 
     simdjson::dom::element dev = {};
     if (extractResourceObject(doc, kind, dev) == false)
     {
       error.assign("vultr detail response missing resource object"_ctv);
-      return false;
+      co_return false;
     }
 
     String clusterTag = {};
@@ -2259,7 +1745,7 @@ private:
     bool hasClusterTag = hasTag(dev, clusterTagView);
     if (hasProdigyTag && hasClusterTag)
     {
-      return true;
+      co_return true;
     }
 
     String body = {};
@@ -2302,29 +1788,19 @@ private:
     prodigyAppendEscapedJSONStringLiteral(body, clusterTag);
     body.append("]}"_ctv);
 
-    struct curl_slist *h = auth_headers();
-    if (!h)
-    {
-      error.assign("vultr api key missing"_ctv);
-      return false;
-    }
-
-    h = curl_slist_append(h, "Content-Type: application/json");
-
     String url = {};
     url.snprintf<"https://api.vultr.com/v2/{}/{}"_ctv>(String(resourcePath(kind)), cloudID);
 
-    String response = {};
-    long httpCode = 0;
-    bool ok = VultrHttp::send("PATCH", url.c_str(), h, body, response, &httpCode);
-    curl_slist_free_all(h);
-    if (ok == false || httpCode < 200 || httpCode >= 300)
+    VultrHttpTransport client = transport();
+    MultiCurlClient::Result response = co_await client.send(
+        coro, client.request(MultiCurlClient::Method::patch, url, &body));
+    if (VultrHttpTransport::succeeded(response) == false)
     {
       error.assign("vultr tag update failed"_ctv);
-      return false;
+      co_return false;
     }
 
-    return true;
+    co_return true;
   }
 
   bool appendCreateImageFields(const MachineConfig& config, String& body, String& error)
@@ -2384,7 +1860,12 @@ private:
     return true;
   }
 
-  bool appendCreateStorageFields(const String& hostname, const MachineConfig& config, String& body, String& error, uint32_t *requestedStorageMB = nullptr)
+  ProdigyHostTask<bool> appendCreateStorageFields(CoroutineStack *coro,
+                                                  const String& hostname,
+                                                  const MachineConfig& config,
+                                                  String& body,
+                                                  String& error,
+                                                  uint32_t *requestedStorageMB = nullptr)
   {
     error.clear();
     if (requestedStorageMB)
@@ -2394,15 +1875,16 @@ private:
 
     if (config.kind != MachineConfig::MachineKind::vm || config.providerMachineType.size() == 0)
     {
-      return true;
+      co_return true;
     }
 
     String storageType = {};
     String planType = {};
     String cpuVendor = {};
-    if (lookupPlanMetadata(config.providerMachineType, storageType, planType, cpuVendor, error) == false)
+    if (co_await lookupPlanMetadata(coro, config.providerMachineType,
+                                    storageType, planType, cpuVendor, error) == false)
     {
-      return false;
+      co_return false;
     }
 
     if (storageType.equal("block_storage"_ctv))
@@ -2427,41 +1909,29 @@ private:
       body.append(",\"bootable\":true}]"_ctv);
     }
 
-    return true;
+    co_return true;
   }
 
-  bool destroyBootBlocksForMachineLabels(const Vector<String>& machineLabels, String& error)
+  ProdigyHostTask<bool> destroyBootBlocksForMachineLabels(CoroutineStack *coro,
+                                                          const Vector<String>& machineLabels,
+                                                          String& error)
   {
     error.clear();
 
     if (machineLabels.empty())
     {
-      return true;
+      co_return true;
     }
 
-    struct curl_slist *h = auth_headers();
-    if (!h)
-    {
-      error.assign("vultr api key missing"_ctv);
-      return false;
-    }
-
-    auto collectMatchingBlocks = [&](Vector<String>& deletableBlockIDs, bool& hasAttachedBlocks) -> bool {
+    auto collectMatchingBlocks = [&](const String& response,
+                                     Vector<String>& deletableBlockIDs,
+                                     bool& hasAttachedBlocks) -> bool {
       deletableBlockIDs.clear();
       hasAttachedBlocks = false;
 
-      String response = {};
-      long httpCode = 0;
-      bool ok = VultrHttp::get("https://api.vultr.com/v2/blocks?per_page=200", h, response, &httpCode);
-      if (ok == false || httpCode < 200 || httpCode >= 300)
-      {
-        error.assign("vultr block list failed"_ctv);
-        return false;
-      }
-
       simdjson::dom::parser parser;
       simdjson::dom::element doc = {};
-      if (parser.parse(response.c_str(), response.size()).get(doc))
+      if (parser.parse(reinterpret_cast<const char *>(response.data()), response.size()).get(doc))
       {
         error.assign("vultr block list parse failed"_ctv);
         return false;
@@ -2509,20 +1979,28 @@ private:
       return true;
     };
 
+    VultrHttpTransport client = transport();
+    String blocksURL = "https://api.vultr.com/v2/blocks?per_page=200"_ctv;
     for (uint32_t attempt = 0; attempt < 30; ++attempt)
     {
+      MultiCurlClient::Result listResult = co_await client.send(
+          coro, client.request(MultiCurlClient::Method::get, blocksURL, nullptr,
+                               VultrHttpTransport::getTimeout));
+      if (VultrHttpTransport::succeeded(listResult) == false)
+      {
+        error.assign("vultr block list failed"_ctv);
+        co_return false;
+      }
       Vector<String> blockIDs = {};
       bool hasAttachedBlocks = false;
-      if (collectMatchingBlocks(blockIDs, hasAttachedBlocks) == false)
+      if (collectMatchingBlocks(listResult.body, blockIDs, hasAttachedBlocks) == false)
       {
-        curl_slist_free_all(h);
-        return false;
+        co_return false;
       }
 
       if (hasAttachedBlocks == false && blockIDs.empty())
       {
-        curl_slist_free_all(h);
-        return true;
+        co_return true;
       }
 
       bool deletedAny = false;
@@ -2530,13 +2008,12 @@ private:
       {
         String url = {};
         url.snprintf<"https://api.vultr.com/v2/blocks/{}"_ctv>(blockID);
-        String response = {};
-        long httpCode = 0;
-        if (VultrHttp::send("DELETE", url.c_str(), h, String(), response, &httpCode) == false || httpCode < 200 || httpCode >= 300)
+        MultiCurlClient::Result response = co_await client.send(
+            coro, client.request(MultiCurlClient::Method::delete_, url));
+        if (VultrHttpTransport::succeeded(response) == false)
         {
           error.assign("vultr delete boot block failed"_ctv);
-          curl_slist_free_all(h);
-          return false;
+          co_return false;
         }
 
         deletedAny = true;
@@ -2544,13 +2021,15 @@ private:
 
       if (deletedAny == false || hasAttachedBlocks)
       {
-        usleep(2 * 1000 * 1000);
+        if (co_await client.wait(coro, std::chrono::seconds(2)) == false)
+        {
+          co_return false;
+        }
       }
     }
 
-    curl_slist_free_all(h);
     error.assign("timed out waiting for vultr boot blocks to delete"_ctv);
-    return false;
+    co_return false;
   }
 
 public:
@@ -2608,7 +2087,7 @@ public:
     return true;
   }
 
-  bool inferMachineSchemaCpuCapability(const MachineConfig& config, MachineSchemaCpuCapability& capability, String& error) override
+  void inferMachineSchemaCpuCapability(CoroutineStack *coro, const MachineConfig& config, MachineSchemaCpuCapability& capability, String& error) override
   {
     capability = {};
     error.clear();
@@ -2616,43 +2095,42 @@ public:
     if (config.providerMachineType.size() == 0)
     {
       error.assign("vultr schema cpu inference requires providerMachineType"_ctv);
-      return false;
+      co_return;
     }
 
     String storageType = {};
     String planType = {};
     String cpuVendor = {};
-    if (lookupPlanMetadata(config.providerMachineType, storageType, planType, cpuVendor, error) == false)
+    if (co_await lookupPlanMetadata(coro, config.providerMachineType,
+                                    storageType, planType, cpuVendor, error) == false)
     {
-      return false;
+      co_return;
     }
 
-    return vultrInferPlanCpuCapability(config.providerMachineType, planType, cpuVendor, capability, &error);
+    (void)vultrInferPlanCpuCapability(config.providerMachineType, planType, cpuVendor, capability, &error);
   }
 
   void spinMachines(CoroutineStack *coro, MachineLifetime lifetime, const MachineConfig& config, uint32_t count, bytell_hash_set<Machine *>& newMachines, String& error) override
   {
-    (void)coro;
     provisioningProgress.reset();
     if (lifetime == MachineLifetime::owned)
     {
       error.assign("vultr auto provisioning does not support MachineLifetime::owned"_ctv);
-      return;
+      co_return;
     }
-    struct curl_slist *h = auth_headers();
-    if (!h)
+    VultrHttpTransport client = transport();
+    if (coro == nullptr || client.available() == false)
     {
       error.assign("vultr api key missing"_ctv);
-      return;
+      co_return;
     }
 
     // Region and plan: assume Brain metro = VULTR region; fallback to configured provider scope if needed
     String region = thisNeuron && thisNeuron->metro.size() ? thisNeuron->metro : runtimeEnvironment.providerScope;
     if (region.size() == 0)
     {
-      curl_slist_free_all(h);
       error.assign("region/metro missing"_ctv);
-      return;
+      co_return;
     }
 
     String url = {};
@@ -2660,10 +2138,9 @@ public:
     String managedVPCID = {};
     if (vultrMachineKindUsesManagedVPC(config.kind))
     {
-      if (ensureManagedMachineVPC(region, managedVPCID, error) == false)
+      if (co_await ensureManagedMachineVPC(coro, region, managedVPCID, error) == false)
       {
-        curl_slist_free_all(h);
-        return;
+        co_return;
       }
     }
 
@@ -2679,167 +2156,36 @@ public:
     if (config.slug.size() == 0)
     {
       error.assign("vultr machine schema slug missing"_ctv);
-      curl_slist_free_all(h);
-      return;
+      co_return;
     }
 
     if (config.providerMachineType.size() == 0)
     {
       error.assign("vultr providerMachineType missing"_ctv);
-      curl_slist_free_all(h);
-      return;
+      co_return;
     }
 
-    class PendingCreateSubmission {
+    class PendingCreateSubmission
+    {
     public:
 
-      String hostname = {};
+      String hostname;
       uint32_t requestedStorageMB = 0;
       bool managedVPCRequestedAtCreate = false;
-      VultrHttp::MultiRequest request = {};
-      bool processed = false;
     };
 
-    Vector<PendingMachineProvisioning> pendingMachines = {};
-    Vector<Machine *> readyMachines = {};
-    Vector<PendingCreateSubmission> createRequests = {};
-    createRequests.reserve(count);
-
-    auto destroyPendingMachine = [&](const PendingMachineProvisioning& pending) -> void {
-      if (pending.createdID.size() == 0)
-      {
-        return;
-      }
-
-      String destroyURL = {};
-      destroyURL.snprintf<"https://api.vultr.com/v2/{}/{}"_ctv>(String(resourcePath(config.kind)), pending.createdID);
-      String destroyResponse = {};
-      (void)VultrHttp::send("DELETE", destroyURL.c_str(), h, String(), destroyResponse);
-    };
-
-    auto cleanupProvisioningFailure = [&]() -> void {
-      for (Machine *machine : readyMachines)
-      {
-        destroyMachine(machine);
-        delete machine;
-      }
-
-      readyMachines.clear();
-      for (const PendingMachineProvisioning& pending : pendingMachines)
-      {
-        destroyPendingMachine(pending);
-      }
-      pendingMachines.clear();
-    };
-
-    auto parseCreateResponse = [&](const String& response, MachineConfig::MachineKind kind, String& createdID, String& parseFailure) -> bool {
-      createdID.clear();
-      parseFailure.clear();
-
-      String responseText = {};
-      responseText.assign(response);
-      simdjson::dom::parser parser;
-      simdjson::dom::element doc = {};
-      if (parser.parse(responseText.c_str(), responseText.size()).get(doc))
-      {
-        parseFailure.assign("create parse failed"_ctv);
-        return false;
-      }
-
-      simdjson::dom::element dev = {};
-      if (extractResourceObject(doc, kind, dev) == false)
-      {
-        parseFailure.snprintf<"vultr create response missing resource object body={}"_ctv>(response);
-        return false;
-      }
-
-      std::string_view createdIDView = {};
-      if (dev["id"].get(createdIDView) != simdjson::SUCCESS || createdIDView.size() == 0)
-      {
-        parseFailure.snprintf<"vultr create response missing id body={}"_ctv>(response);
-        return false;
-      }
-
-      createdID.assign(createdIDView);
-      return true;
-    };
-
-    auto processCreateCompletion = [&](PendingCreateSubmission& submission) -> void {
-      if (submission.processed)
-      {
-        return;
-      }
-      submission.processed = true;
-
-      String createdID = {};
-      String createFailure = {};
-      bool ok = submission.request.curlCode == CURLE_OK && submission.request.httpCode >= 200 && submission.request.httpCode < 300;
-      if (ok)
-      {
-        (void)parseCreateResponse(submission.request.response, config.kind, createdID, createFailure);
-      }
-      else
-      {
-        createFailure.snprintf<"vultr create failed curl={itoa} http={itoa} body={}"_ctv>(
-            uint32_t(submission.request.curlCode),
-            uint32_t(submission.request.httpCode),
-            submission.request.response);
-      }
-
-      if (createdID.size() == 0 && recoverCreatedMachineIDByLabel(h, config.kind, submission.hostname, createdID))
-      {
-        basics_log("vultr create recovered label=%s cloudID=%s http=%ld\n", submission.hostname.c_str(), createdID.c_str(), submission.request.httpCode);
-        createFailure.clear();
-      }
-
-      if (createdID.size() == 0)
-      {
-        if (error.size() == 0)
-        {
-          error.assign(createFailure.size() > 0 ? createFailure : "vultr create failed"_ctv);
-        }
-        return;
-      }
-
-      MachineProvisioningProgress& progress = provisioningProgress.upsert(config.slug, config.providerMachineType, submission.hostname, createdID);
-      progress.status.assign("launch-submitted"_ctv);
-      progress.ready = false;
-      provisioningProgress.notifyMachineProvisioningAccepted(createdID);
-      provisioningProgress.emitMaybe(Time::now<TimeResolution::ms>());
-
-      PendingMachineProvisioning& pending = pendingMachines.emplace_back();
-      pending.hostname = submission.hostname;
-      pending.createdID = createdID;
-      pending.requestedStorageMB = submission.requestedStorageMB;
-      pending.managedVPCRequestedAtCreate = submission.managedVPCRequestedAtCreate;
-    };
-
-    auto drainCreateCompletions = [&](VultrHttp::MultiClient& createClient) -> void {
-      for (;;)
-      {
-        VultrHttp::MultiRequest *completed = createClient.popCompleted();
-        if (completed == nullptr)
-        {
-          break;
-        }
-
-        PendingCreateSubmission *submission = reinterpret_cast<PendingCreateSubmission *>(completed->context);
-        if (submission != nullptr)
-        {
-          processCreateCompletion(*submission);
-        }
-      }
-    };
-
-    VultrHttp::MultiClient createClient = {};
-    bool createSubmissionFailed = false;
+    Vector<PendingCreateSubmission> submissions;
+    Vector<MultiCurlClient::Request> requests;
+    submissions.reserve(count);
+    requests.reserve(count);
     for (uint32_t i = 0; i < count; ++i)
     {
-      int64_t nowMs = Time::now<TimeResolution::ms>();
       String hostname;
-      hostname.snprintf<"ntg-vultr-{}-{itoa}-{itoa}"_ctv>(config.slug, uint64_t(nowMs), uint64_t(i));
-      uint32_t requestedStorageMB = 0;
-      String body = {};
+      hostname.snprintf<"ntg-vultr-{}-{itoa}-{itoa}"_ctv>(
+          config.slug,
+          uint64_t(Time::now<TimeResolution::ms>()),
+          uint64_t(i));
+      String body;
       body.append("{\"region\":"_ctv);
       prodigyAppendEscapedJSONStringLiteral(body, region);
       body.append(",\"plan\":"_ctv);
@@ -2851,7 +2197,7 @@ public:
       body.append(",\"enable_ipv6\":true,\"tags\":[\"prodigy\""_ctv);
       if (provisioningClusterUUIDTagValue.size() > 0)
       {
-        String clusterTag = {};
+        String clusterTag;
         clusterTag.snprintf<"prodigy-cluster-{}"_ctv>(provisioningClusterUUIDTagValue);
         body.append(","_ctv);
         prodigyAppendEscapedJSONStringLiteral(body, clusterTag);
@@ -2859,19 +2205,24 @@ public:
       body.append("]"_ctv);
       if (appendCreateImageFields(config, body, error) == false)
       {
-        curl_slist_free_all(h);
-        return;
+        co_return;
       }
-      if (appendCreateStorageFields(hostname, config, body, error, &requestedStorageMB) == false)
+
+      PendingCreateSubmission& submission = submissions.emplace_back();
+      submission.hostname = std::move(hostname);
+      if (co_await appendCreateStorageFields(coro,
+                                             submission.hostname,
+                                             config,
+                                             body,
+                                             error,
+                                             &submission.requestedStorageMB) == false)
       {
-        curl_slist_free_all(h);
-        return;
+        co_return;
       }
-      bool managedVPCRequestedAtCreate = false;
       if (managedVPCID.size() > 0)
       {
         vultrAppendManagedVPCCreateFields(config.kind, managedVPCID, body);
-        managedVPCRequestedAtCreate = config.kind == MachineConfig::MachineKind::vm;
+        submission.managedVPCRequestedAtCreate = config.kind == MachineConfig::MachineKind::vm;
       }
       if (userData.size() > 0)
       {
@@ -2879,127 +2230,164 @@ public:
         prodigyAppendEscapedJSONStringLiteral(body, userData);
       }
       body.append("}"_ctv);
-
-      PendingCreateSubmission& submission = createRequests.emplace_back();
-      submission.hostname = std::move(hostname);
-      submission.requestedStorageMB = requestedStorageMB;
-      submission.managedVPCRequestedAtCreate = managedVPCRequestedAtCreate;
-      submission.request.context = &submission;
-      submission.request.method.assign("POST"_ctv);
-      submission.request.url.assign(url);
-      submission.request.body.assign(body);
-      submission.request.timeoutMs = VultrHttp::createSendTimeoutMs;
-      submission.request.headers = auth_headers();
-      if (submission.request.headers == nullptr)
-      {
-        error.assign("vultr api key missing"_ctv);
-        createSubmissionFailed = true;
-        break;
-      }
-
-      if (createClient.start(submission.request) == false)
-      {
-        error.assign("vultr create request start failed"_ctv);
-        createSubmissionFailed = true;
-        break;
-      }
-
-      drainCreateCompletions(createClient);
+      requests.push_back(client.request(MultiCurlClient::Method::post,
+                                        url,
+                                        &body,
+                                        VultrHttpTransport::createTimeout));
     }
 
-    drainCreateCompletions(createClient);
-    while (createClient.pendingCount() > 0)
-    {
-      if (createClient.pump(1000) == false)
+    Vector<MultiCurlClient::Result> results = co_await client.sendBatch(coro, std::move(requests));
+    Vector<PendingMachineProvisioning> pendingMachines;
+    Vector<Machine *> readyMachines;
+    auto parseCreateResponse = [&](const String& response, String& createdID, String& parseFailure) -> bool {
+      simdjson::dom::parser parser;
+      simdjson::dom::element doc = {};
+      if (parser.parse(reinterpret_cast<const char *>(response.data()), response.size()).get(doc))
       {
-        if (error.size() == 0)
-        {
-          error.assign("vultr create request pump failed"_ctv);
-        }
-        break;
+        parseFailure.assign("create parse failed"_ctv);
+        return false;
       }
-
-      drainCreateCompletions(createClient);
-    }
-
-    if (createSubmissionFailed)
-    {
-      drainCreateCompletions(createClient);
-    }
-
-    if (error.size() == 0)
-    {
-      if (pendingMachines.size() == 1)
+      simdjson::dom::element resource = {};
+      if (extractResourceObject(doc, config.kind, resource) == false)
       {
-        Machine *machine = nullptr;
-        if (waitForMachine(
-                pendingMachines[0].createdID,
-                config.slug,
-                config.providerMachineType,
-                config.kind,
-                machine,
-                error,
-                managedVPCID.size() > 0 ? &managedVPCID : nullptr,
-                pendingMachines[0].managedVPCRequestedAtCreate))
-        {
-          if (machine != nullptr && pendingMachines[0].requestedStorageMB > 0 && machine->totalStorageMB == 0)
-          {
-            machine->totalStorageMB = pendingMachines[0].requestedStorageMB;
-          }
+        parseFailure.snprintf<"vultr create response missing resource object body={}"_ctv>(response);
+        return false;
+      }
+      String id;
+      if (prodigyJSONString(resource["id"], id) != simdjson::SUCCESS || id.empty())
+      {
+        parseFailure.snprintf<"vultr create response missing id body={}"_ctv>(response);
+        return false;
+      }
+      createdID.assign(id);
+      return true;
+    };
 
-          readyMachines.push_back(machine);
-        }
+    for (uint32_t index = 0; index < submissions.size(); ++index)
+    {
+      PendingCreateSubmission& submission = submissions[index];
+      MultiCurlClient::Result result = index < results.size()
+                                           ? std::move(results[index])
+                                           : MultiCurlClient::Result {};
+      String createdID;
+      String createFailure;
+      if (VultrHttpTransport::succeeded(result))
+      {
+        (void)parseCreateResponse(result.body, createdID, createFailure);
       }
       else
       {
-        ConcurrentWaitCoordinator coordinator(this);
-        (void)coordinator.run(
-            config.slug,
-            config.providerMachineType,
-            config.kind,
-            pendingMachines,
-            managedVPCID.size() > 0 ? &managedVPCID : nullptr,
-            readyMachines,
-            error);
+        createFailure.snprintf<"vultr create failed http={itoa} body={}"_ctv>(
+            uint32_t(result.statusCode), result.body);
+      }
+
+      if (createdID.empty())
+      {
+        (void)(co_await recoverCreatedMachineIDByLabel(coro,
+                                                       config.kind,
+                                                       submission.hostname,
+                                                       createdID));
+      }
+      if (createdID.empty())
+      {
+        if (error.empty())
+        {
+          error.assign(createFailure.empty() ? "vultr create failed"_ctv : createFailure);
+        }
+        continue;
+      }
+
+      MachineProvisioningProgress& progress = provisioningProgress.upsert(
+          config.slug, config.providerMachineType, submission.hostname, createdID);
+      progress.status.assign("launch-submitted"_ctv);
+      progress.ready = false;
+      provisioningProgress.notifyMachineProvisioningAccepted(createdID);
+      provisioningProgress.emitMaybe(Time::now<TimeResolution::ms>());
+      PendingMachineProvisioning& pending = pendingMachines.emplace_back();
+      pending.hostname = submission.hostname;
+      pending.createdID = std::move(createdID);
+      pending.requestedStorageMB = submission.requestedStorageMB;
+      pending.managedVPCRequestedAtCreate = submission.managedVPCRequestedAtCreate;
+    }
+
+    if (error.empty())
+    {
+      for (PendingMachineProvisioning& pending : pendingMachines)
+      {
+        Machine *machine = nullptr;
+        if (co_await waitForMachine(coro,
+                                    pending.createdID,
+                                    config.slug,
+                                    config.providerMachineType,
+                                    config.kind,
+                                    machine,
+                                    error,
+                                    managedVPCID.empty() ? nullptr : &managedVPCID,
+                                    pending.managedVPCRequestedAtCreate) == false)
+        {
+          break;
+        }
+        if (machine && pending.requestedStorageMB > 0 && machine->totalStorageMB == 0)
+        {
+          machine->totalStorageMB = pending.requestedStorageMB;
+        }
+        readyMachines.push_back(machine);
       }
     }
 
-    if (error.size() != 0)
-    {
-      cleanupProvisioningFailure();
-    }
-
-    if (error.size() == 0)
+    if (error.empty() == false)
     {
       for (Machine *machine : readyMachines)
       {
-        newMachines.insert(machine);
+        delete machine;
       }
+      readyMachines.clear();
+      Vector<String> labels;
+      for (const PendingMachineProvisioning& pending : pendingMachines)
+      {
+        labels.push_back(pending.hostname);
+        String destroyURL;
+        destroyURL.snprintf<"https://api.vultr.com/v2/{}/{}"_ctv>(
+            String(resourcePath(config.kind)), pending.createdID);
+        (void)(co_await client.send(
+            coro, client.request(MultiCurlClient::Method::delete_, destroyURL)));
+      }
+      if (config.kind == MachineConfig::MachineKind::vm && labels.empty() == false)
+      {
+        String cleanupFailure;
+        (void)(co_await destroyBootBlocksForMachineLabels(coro, labels, cleanupFailure));
+      }
+      co_return;
     }
 
-    curl_slist_free_all(h);
+    for (Machine *machine : readyMachines)
+    {
+      newMachines.insert(machine);
+    }
   }
 
-  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines) override
+  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines, String& failure) override
   {
-    (void)coro;
-    struct curl_slist *h = auth_headers();
-    if (!h)
+    failure.clear();
+    VultrHttpTransport client = transport();
+    if (coro == nullptr || client.available() == false)
     {
-      return;
+      co_return;
     }
     for (MachineConfig::MachineKind kind : {MachineConfig::MachineKind::bareMetal, MachineConfig::MachineKind::vm})
     {
       String url = {};
       url.snprintf<"https://api.vultr.com/v2/{}?per_page=200"_ctv>(String(resourcePath(kind)));
-      String resp;
-      if (!VultrHttp::get(url.c_str(), h, resp))
+      MultiCurlClient::Result response = co_await client.send(
+          coro, client.request(MultiCurlClient::Method::get, url, nullptr,
+                               VultrHttpTransport::getTimeout));
+      if (VultrHttpTransport::succeeded(response) == false)
       {
         continue;
       }
       simdjson::dom::parser parser;
       simdjson::dom::element doc;
-      if (parser.parse(resp.c_str(), resp.size()).get(doc))
+      if (parser.parse(response.body.c_str(), response.body.size()).get(doc))
       {
         continue;
       }
@@ -3017,11 +2405,15 @@ public:
           continue;
         }
         Machine *m = buildMachineFromVultr(v, kind);
-        (void)populateMachineAttachedVPCIPv4(kind, *m);
+        if (m == nullptr)
+        {
+          continue;
+        }
+        (void)(co_await populateMachineAttachedVPCIPv4(coro, kind, *m));
         if (m && prodigyMachineProvisioningReady(*m) == false)
         {
           String detailResponse;
-          if (fetchMachineDetail(m->cloudID, kind, detailResponse))
+          if (co_await fetchMachineDetail(coro, m->cloudID, kind, detailResponse))
           {
             simdjson::dom::parser detailParser;
             simdjson::dom::element detailDoc;
@@ -3032,39 +2424,46 @@ public:
               {
                 delete m;
                 m = buildMachineFromVultr(detail, kind);
-                (void)populateMachineAttachedVPCIPv4(kind, *m);
+                if (m)
+                {
+                  (void)(co_await populateMachineAttachedVPCIPv4(coro, kind, *m));
+                }
               }
             }
           }
         }
-        machines.insert(m);
+        if (m)
+        {
+          machines.insert(m);
+        }
       }
     }
-    curl_slist_free_all(h);
   }
 
-  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains) override
+  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains, String& failure) override
   {
-    (void)coro;
-    struct curl_slist *h = auth_headers();
-    if (!h)
+    failure.clear();
+    VultrHttpTransport client = transport();
+    if (coro == nullptr || client.available() == false)
     {
       selfIsBrain = false;
-      return;
+      co_return;
     }
     selfIsBrain = false;
     for (MachineConfig::MachineKind kind : {MachineConfig::MachineKind::bareMetal, MachineConfig::MachineKind::vm})
     {
       String url = {};
       url.snprintf<"https://api.vultr.com/v2/{}?per_page=200"_ctv>(String(resourcePath(kind)));
-      String resp;
-      if (!VultrHttp::get(url.c_str(), h, resp))
+      MultiCurlClient::Result response = co_await client.send(
+          coro, client.request(MultiCurlClient::Method::get, url, nullptr,
+                               VultrHttpTransport::getTimeout));
+      if (VultrHttpTransport::succeeded(response) == false)
       {
         continue;
       }
       simdjson::dom::parser parser;
       simdjson::dom::element doc;
-      if (parser.parse(resp.c_str(), resp.size()).get(doc))
+      if (parser.parse(response.body.c_str(), response.body.size()).get(doc))
       {
         continue;
       }
@@ -3076,7 +2475,11 @@ public:
           continue;
         }
         Machine *machine = buildMachineFromVultr(v, kind);
-        (void)populateMachineAttachedVPCIPv4(kind, *machine);
+        if (machine == nullptr)
+        {
+          continue;
+        }
+        (void)(co_await populateMachineAttachedVPCIPv4(coro, kind, *machine));
         if (machine->uuid == selfUUID)
         {
           selfIsBrain = true;
@@ -3089,7 +2492,7 @@ public:
         if (prodigyResolveMachinePeerAddress(*machine, peerAddress, &peerAddressText) == false)
         {
           String detailResponse;
-          if (fetchMachineDetail(machine->cloudID, kind, detailResponse))
+          if (co_await fetchMachineDetail(coro, machine->cloudID, kind, detailResponse))
           {
             simdjson::dom::parser detailParser;
             simdjson::dom::element detailDoc;
@@ -3100,13 +2503,20 @@ public:
               {
                 delete machine;
                 machine = buildMachineFromVultr(detail, kind);
-                (void)populateMachineAttachedVPCIPv4(kind, *machine);
-                (void)prodigyResolveMachinePeerAddress(*machine, peerAddress, &peerAddressText);
+                if (machine)
+                {
+                  (void)(co_await populateMachineAttachedVPCIPv4(coro, kind, *machine));
+                  (void)prodigyResolveMachinePeerAddress(*machine, peerAddress, &peerAddressText);
+                }
               }
             }
           }
         }
 
+        if (machine == nullptr)
+        {
+          continue;
+        }
         BrainView *bv = new BrainView();
         bv->uuid = machine->uuid;
         bv->private4 = machine->private4;
@@ -3119,75 +2529,47 @@ public:
         delete machine;
       }
     }
-    curl_slist_free_all(h);
   }
 
-  void hardRebootMachine(uint128_t uuid) override
+  void hardRebootMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
-    struct curl_slist *h = auth_headers();
-    if (!h)
+    failure.clear();
+    if (cloudID.size() == 0)
     {
-      return;
+      failure.assign("vultr machine cloudID required"_ctv);
+      co_return;
+    }
+
+    VultrHttpTransport client = transport();
+    if (coro == nullptr || client.available() == false)
+    {
+      failure.assign("vultr auth failed"_ctv);
+      co_return;
     }
     for (MachineConfig::MachineKind kind : {MachineConfig::MachineKind::bareMetal, MachineConfig::MachineKind::vm})
     {
-      String listURL = {};
-      listURL.snprintf<"https://api.vultr.com/v2/{}?per_page=200"_ctv>(String(resourcePath(kind)));
-      String list;
-      if (!VultrHttp::get(listURL.c_str(), h, list))
-      {
-        continue;
-      }
-      simdjson::dom::parser parser;
-      simdjson::dom::element doc;
-      if (parser.parse(list.c_str(), list.size()).get(doc))
-      {
-        continue;
-      }
-      String target;
-      auto arr = getMachineArray(doc, kind);
-      for (auto v : arr)
-      {
-        std::string_view id;
-        if (!v["id"].get(id) && hash_uuid(id) == uuid)
-        {
-          target.assign(id);
-          break;
-        }
-      }
-      if (target.size() == 0)
+      String detail;
+      if (co_await fetchMachineDetail(coro, cloudID, kind, detail) == false)
       {
         continue;
       }
       String url;
-      url.snprintf<"https://api.vultr.com/v2/{}/{}/reboot"_ctv>(String(resourcePath(kind)), target);
-      String out;
-      VultrHttp::send("POST", url.c_str(), h, String(), out);
-      basics_log("vultr hardRebootMachine uuid=%llu kind=%s cloudID=%s\n",
-                 (unsigned long long)uuid,
-                 resourcePath(kind),
-                 target.c_str());
-      break;
+      url.snprintf<"https://api.vultr.com/v2/{}/{}/reboot"_ctv>(String(resourcePath(kind)), cloudID);
+      MultiCurlClient::Result result = co_await client.send(
+          coro, client.request(MultiCurlClient::Method::post, url));
+      if (VultrHttpTransport::succeeded(result) == false)
+      {
+        failure.assign("vultr reboot request failed"_ctv);
+      }
+      co_return;
     }
-    curl_slist_free_all(h);
+    failure.assign("vultr machine not found"_ctv);
   }
 
   void reportHardwareFailure(uint128_t uuid, const String& report) override
   {
-    struct curl_slist *h = auth_headers();
-    if (!h)
-    {
-      return;
-    }
-    String uuidHex = {};
-    uuidHex.assignItoh(uuid);
-    String subject;
-    subject.snprintf<"Hardware failure report for {}"_ctv>(uuidHex);
-    String body;
-    body.snprintf<"{\"subject\":\"{}\",\"description\":\"{}\"}"_ctv>(subject, report);
-    String out;
-    VultrHttp::send("POST", "https://api.vultr.com/v2/support/tickets", h, body, out);
-    curl_slist_free_all(h);
+    (void)uuid;
+    (void)report;
   }
 
   void checkForSpotTerminations(CoroutineStack *coro, Vector<String>& decommissionedIDs) override
@@ -3196,27 +2578,25 @@ public:
     (void)decommissionedIDs;
   }
 
-  void destroyMachine(Machine *machine) override
+  void destroyMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
-    if (!machine || machine->cloudID.size() == 0)
+    failure.clear();
+    if (cloudID.size() == 0)
     {
-      return;
+      failure.assign("vultr machine cloudID required"_ctv);
+      co_return;
     }
-    basics_log("vultr destroyMachine begin uuid=%llu cloudID=%s private4=%u isBrain=%d\n",
-               (unsigned long long)machine->uuid,
-               machine->cloudID.c_str(),
-               unsigned(machine->private4),
-               int(machine->isBrain));
-    struct curl_slist *h = auth_headers();
-    if (!h)
+    VultrHttpTransport client = transport();
+    if (coro == nullptr || client.available() == false)
     {
-      return;
+      failure.assign("vultr auth failed"_ctv);
+      co_return;
     }
     Vector<String> vmLabels = {};
     for (MachineConfig::MachineKind kind : {MachineConfig::MachineKind::bareMetal, MachineConfig::MachineKind::vm})
     {
       String detailResponse;
-      if (fetchMachineDetail(machine->cloudID, kind, detailResponse) == false)
+      if (co_await fetchMachineDetail(coro, cloudID, kind, detailResponse) == false)
       {
         continue;
       }
@@ -3238,200 +2618,204 @@ public:
         }
       }
       String url;
-      url.snprintf<"https://api.vultr.com/v2/{}/{}"_ctv>(String(resourcePath(kind)), machine->cloudID);
-      String out;
-      long httpCode = 0;
-      if (VultrHttp::send("DELETE", url.c_str(), h, String(), out, &httpCode) && httpCode >= 200 && httpCode < 300)
+      url.snprintf<"https://api.vultr.com/v2/{}/{}"_ctv>(String(resourcePath(kind)), cloudID);
+      MultiCurlClient::Result response = co_await client.send(
+          coro, client.request(MultiCurlClient::Method::delete_, url));
+      if (VultrHttpTransport::succeeded(response))
       {
-        basics_log("vultr destroyMachine delete ok uuid=%llu kind=%s cloudID=%s http=%ld\n",
-                   (unsigned long long)machine->uuid,
-                   resourcePath(kind),
-                   machine->cloudID.c_str(),
-                   httpCode);
-        curl_slist_free_all(h);
         if (vmLabels.empty() == false)
         {
           String blockFailure = {};
-          if (destroyBootBlocksForMachineLabels(vmLabels, blockFailure) == false)
+          if (co_await destroyBootBlocksForMachineLabels(coro, vmLabels, blockFailure) == false)
           {
-            basics_log("vultr delete boot block failed: %s\n", blockFailure.c_str());
+            failure = std::move(blockFailure);
           }
         }
-        return;
+        co_return;
       }
     }
-    basics_log("vultr destroyMachine miss uuid=%llu cloudID=%s\n",
-               (unsigned long long)machine->uuid,
-               machine->cloudID.c_str());
-    curl_slist_free_all(h);
+    failure.assign("vultr machine not found"_ctv);
   }
 
-  bool destroyClusterMachines(const String& clusterUUID, uint32_t& destroyed, String& error) override
+private:
+
+  ProdigyHostTask<bool> collectClusterMachines(CoroutineStack *coro,
+                                               MachineConfig::MachineKind kind,
+                                               const String& clusterTag,
+                                               Vector<String>& cloudIDs,
+                                               Vector<String> *labels,
+                                               String& error)
+  {
+    cloudIDs.clear();
+    if (labels)
+    {
+      labels->clear();
+    }
+    String url;
+    url.snprintf<"https://api.vultr.com/v2/{}?per_page=200"_ctv>(String(resourcePath(kind)));
+    VultrHttpTransport client = transport();
+    MultiCurlClient::Result response = co_await client.send(
+        coro, client.request(MultiCurlClient::Method::get, url, nullptr,
+                             VultrHttpTransport::getTimeout));
+    if (VultrHttpTransport::succeeded(response) == false)
+    {
+      error.assign("vultr list machines failed"_ctv);
+      co_return false;
+    }
+
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    if (parser.parse(response.body.c_str(), response.body.size()).get(doc))
+    {
+      error.assign("vultr machine list json parse failed"_ctv);
+      co_return false;
+    }
+    for (auto machine : getMachineArray(doc, kind))
+    {
+      if (hasTag(machine, "prodigy"_ctv) == false || hasTag(machine, clusterTag) == false)
+      {
+        continue;
+      }
+      String cloudID;
+      if (prodigyJSONString(machine["id"], cloudID) == simdjson::SUCCESS && cloudID.empty() == false)
+      {
+        cloudIDs.push_back(cloudID);
+      }
+      if (labels)
+      {
+        String label;
+        if (vultrExtractResourceLabel(machine, label))
+        {
+          labels->push_back(std::move(label));
+        }
+      }
+    }
+    co_return true;
+  }
+
+  ProdigyHostTask<bool> destroyClusterMachinesInline(CoroutineStack *coro,
+                                                      const String& clusterUUID,
+                                                      uint32_t& destroyed,
+                                                      String& error)
   {
     destroyed = 0;
     error.clear();
-
-    if (clusterUUID.size() == 0)
+    if (clusterUUID.empty())
     {
       error.assign("vultr clusterUUID tag value required"_ctv);
-      return false;
+      co_return false;
     }
 
-    struct curl_slist *h = auth_headers();
-    if (!h)
-    {
-      error.assign("vultr auth failed"_ctv);
-      return false;
-    }
-
-    String clusterTag = {};
+    String clusterTag;
     clusterTag.snprintf<"prodigy-cluster-{}"_ctv>(clusterUUID);
-    std::string_view clusterTagView(reinterpret_cast<const char *>(clusterTag.data()), size_t(clusterTag.size()));
-
-    Vector<String> vmCloudIDs = {};
-    Vector<String> vmLabels = {};
-    Vector<String> bareMetalCloudIDs = {};
-    auto collectCloudIDs = [&](MachineConfig::MachineKind kind, Vector<String>& cloudIDs, Vector<String> *machineLabels = nullptr) -> bool {
-      cloudIDs.clear();
-      if (machineLabels != nullptr)
-      {
-        machineLabels->clear();
-      }
-
-      String url = {};
-      url.snprintf<"https://api.vultr.com/v2/{}?per_page=200"_ctv>(String(resourcePath(kind)));
-
-      String response = {};
-      if (!VultrHttp::get(url.c_str(), h, response))
-      {
-        error.assign("vultr list machines failed"_ctv);
-        return false;
-      }
-
-      simdjson::dom::parser parser;
-      simdjson::dom::element doc;
-      if (parser.parse(response.c_str(), response.size()).get(doc))
-      {
-        error.assign("vultr machine list json parse failed"_ctv);
-        return false;
-      }
-
-      auto machines = getMachineArray(doc, kind);
-      for (auto machine : machines)
-      {
-        if (hasTag(machine, "prodigy") == false || hasTag(machine, clusterTagView) == false)
-        {
-          continue;
-        }
-
-        std::string_view cloudIDView = {};
-        if (!machine["id"].get(cloudIDView) && cloudIDView.size() > 0)
-        {
-          cloudIDs.push_back(String(cloudIDView));
-        }
-
-        if (machineLabels != nullptr)
-        {
-          String label = {};
-          if (vultrExtractResourceLabel(machine, label))
-          {
-            machineLabels->push_back(std::move(label));
-          }
-        }
-      }
-
-      return true;
-    };
-
-    if (collectCloudIDs(MachineConfig::MachineKind::vm, vmCloudIDs, &vmLabels) == false || collectCloudIDs(MachineConfig::MachineKind::bareMetal, bareMetalCloudIDs) == false)
+    Vector<String> vmCloudIDs;
+    Vector<String> vmLabels;
+    Vector<String> bareMetalCloudIDs;
+    if (co_await collectClusterMachines(coro, MachineConfig::MachineKind::vm,
+                                        clusterTag, vmCloudIDs, &vmLabels, error) == false ||
+        co_await collectClusterMachines(coro, MachineConfig::MachineKind::bareMetal,
+                                        clusterTag, bareMetalCloudIDs, nullptr, error) == false)
     {
-      curl_slist_free_all(h);
-      return false;
+      co_return false;
     }
-
-    if (vmCloudIDs.size() == 0 && bareMetalCloudIDs.size() == 0)
+    if (vmCloudIDs.empty() && bareMetalCloudIDs.empty())
     {
-      curl_slist_free_all(h);
-      return true;
+      co_return true;
     }
 
     destroyed = uint32_t(vmCloudIDs.size() + bareMetalCloudIDs.size());
-
-    auto destroyCloudIDs = [&](MachineConfig::MachineKind kind, const Vector<String>& cloudIDs) -> bool {
-      for (const String& cloudID : cloudIDs)
-      {
-        String url = {};
-        url.snprintf<"https://api.vultr.com/v2/{}/{}"_ctv>(String(resourcePath(kind)), cloudID);
-        String response = {};
-        long httpCode = 0;
-        if (VultrHttp::send("DELETE", url.c_str(), h, String(), response, &httpCode) == false || httpCode < 200 || httpCode >= 300)
-        {
-          error.assign("vultr delete machine failed"_ctv);
-          return false;
-        }
-      }
-
-      return true;
-    };
-
-    if (destroyCloudIDs(MachineConfig::MachineKind::vm, vmCloudIDs) == false || destroyCloudIDs(MachineConfig::MachineKind::bareMetal, bareMetalCloudIDs) == false)
+    VultrHttpTransport client = transport();
+    Vector<MultiCurlClient::Request> deletes;
+    for (const auto& group : {std::pair {MachineConfig::MachineKind::vm, &vmCloudIDs},
+                              std::pair {MachineConfig::MachineKind::bareMetal, &bareMetalCloudIDs}})
     {
-      curl_slist_free_all(h);
-      return false;
+      for (const String& cloudID : *group.second)
+      {
+        String url;
+        url.snprintf<"https://api.vultr.com/v2/{}/{}"_ctv>(
+            String(resourcePath(group.first)), cloudID);
+        deletes.push_back(client.request(MultiCurlClient::Method::delete_, url));
+      }
+    }
+    Vector<MultiCurlClient::Result> deleteResults = co_await client.sendBatch(coro, std::move(deletes));
+    if (deleteResults.size() != destroyed)
+    {
+      error.assign("vultr delete machine submission failed"_ctv);
+      co_return false;
+    }
+    for (const MultiCurlClient::Result& result : deleteResults)
+    {
+      if (VultrHttpTransport::succeeded(result) == false)
+      {
+        error.assign("vultr delete machine failed"_ctv);
+        co_return false;
+      }
     }
 
     for (uint32_t attempt = 0; attempt < 30; ++attempt)
     {
-      if (collectCloudIDs(MachineConfig::MachineKind::vm, vmCloudIDs) == false || collectCloudIDs(MachineConfig::MachineKind::bareMetal, bareMetalCloudIDs) == false)
+      if (co_await collectClusterMachines(coro, MachineConfig::MachineKind::vm,
+                                          clusterTag, vmCloudIDs, nullptr, error) == false ||
+          co_await collectClusterMachines(coro, MachineConfig::MachineKind::bareMetal,
+                                          clusterTag, bareMetalCloudIDs, nullptr, error) == false)
       {
-        curl_slist_free_all(h);
-        return false;
+        co_return false;
       }
-
-      if (vmCloudIDs.size() == 0 && bareMetalCloudIDs.size() == 0)
+      if (vmCloudIDs.empty() && bareMetalCloudIDs.empty())
       {
-        curl_slist_free_all(h);
-        if (vmLabels.empty() == false && destroyBootBlocksForMachineLabels(vmLabels, error) == false)
+        if (vmLabels.empty() == false &&
+            co_await destroyBootBlocksForMachineLabels(coro, vmLabels, error) == false)
         {
-          return false;
+          co_return false;
         }
-        return true;
+        co_return true;
       }
-
-      usleep(2 * 1000 * 1000);
+      if (co_await client.wait(coro, std::chrono::seconds(2)) == false)
+      {
+        co_return false;
+      }
     }
 
-    curl_slist_free_all(h);
     error.assign("timed out waiting for vultr cluster machines to terminate"_ctv);
-    return false;
+    co_return false;
   }
 
-  bool ensureProdigyMachineTags(const String& clusterUUID, Machine *machine, String& error) override
+public:
+
+  void destroyClusterMachines(CoroutineStack *coro, const String& clusterUUID, uint32_t& destroyed, String& error) override
+  {
+    (void)(co_await destroyClusterMachinesInline(coro, clusterUUID, destroyed, error));
+    co_return;
+  }
+
+  void ensureProdigyMachineTags(CoroutineStack *coro,
+                                const String& clusterUUID,
+                                const String& cloudID,
+                                String& error) override
   {
     error.clear();
 
-    if (machine == nullptr || machine->cloudID.size() == 0)
+    if (cloudID.size() == 0)
     {
       error.assign("vultr machine cloudID required"_ctv);
-      return false;
+      co_return;
     }
 
     if (clusterUUID.size() == 0)
     {
       error.assign("vultr clusterUUID tag value required"_ctv);
-      return false;
+      co_return;
     }
 
     for (MachineConfig::MachineKind kind : {MachineConfig::MachineKind::bareMetal, MachineConfig::MachineKind::vm})
     {
       String kindFailure = {};
-      if (ensureMachineTagsForKind(machine->cloudID, kind, clusterUUID, kindFailure))
+      if (co_await ensureMachineTagsForKind(coro, cloudID, kind, clusterUUID, kindFailure))
       {
-        return true;
+        co_return;
       }
     }
 
     error.assign("vultr failed to update machine tags"_ctv);
-    return false;
   }
 };

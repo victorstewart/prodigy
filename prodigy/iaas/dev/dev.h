@@ -29,8 +29,9 @@ public:
     // but deployments would've queued container scheduling that is only triggered by new machines coming online... so just don't try to schedule too much?
   }
 
-  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines) override
+  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines, String& failure) override
   {
+    failure.clear();
     uint32_t rackUUID = Crypto::insecureRandomNumber<uint32_t>();
     uint32_t gatewayPrivate4 = thisNeuron->gateway4.v4;
     if (gatewayPrivate4 == 0)
@@ -84,8 +85,9 @@ public:
   }
 
   // all 3 are brains
-  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains) override
+  void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains, String& failure) override
   {
+    failure.clear();
     uint32_t gatewayPrivate4 = thisNeuron->gateway4.v4;
     if (gatewayPrivate4 == 0)
     {
@@ -133,8 +135,11 @@ public:
     }
   }
 
-  void hardRebootMachine(uint128_t uuid) override
+  void hardRebootMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
+    (void)coro;
+    (void)cloudID;
+    failure.clear();
     // this doesn't apply because for cloud machines this occurs through the management BIOS
   }
 
@@ -149,8 +154,11 @@ public:
     (void)decommissionedIDs;
   }
 
-  void destroyMachine(Machine *machine) override
+  void destroyMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
   {
+    (void)coro;
+    (void)cloudID;
+    failure.clear();
     // we never do this obviously
   }
 };
@@ -158,7 +166,7 @@ public:
 class DevNeuronIaaS : public NeuronIaaS {
 public:
 
-  void gatherSelfData(uint128_t& uuid, String& metro, bool& isBrain, EthDevice& eth, IPAddress& private4) override
+  void gatherSelfData(CoroutineStack *, uint128_t& uuid, String& metro, bool& isBrain, EthDevice& eth, IPAddress& private4) override
   {
     metro.assign("dev"_ctv);
     private4.is6 = false;
@@ -214,10 +222,7 @@ public:
     }
   }
 
-  void downloadContainerToPath(CoroutineStack *coro, uint64_t deploymentID, const String& path) override
-  {
-    // maybe we just store these locally on disk, then copy them to the path provided?
-  }
+  // Container transfer is not a development cloud-provider responsibility.
 
   DevNeuronIaaS()
   {

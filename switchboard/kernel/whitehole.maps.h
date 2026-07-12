@@ -14,6 +14,6 @@ struct {
 struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __type(key, struct flow_key);
-  __type(value, struct switchboard_whitehole_binding);
+  __type(value, struct switchboard_whitehole_reply);
   __uint(max_entries, WHITEHOLE_REPLY_LRU_SIZE);
 } white_replies SEC(".maps");

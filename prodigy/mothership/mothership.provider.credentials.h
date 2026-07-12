@@ -2,16 +2,16 @@
 
 #include <cstdint>
 #include <cstdlib>
-#include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <unistd.h>
-#include <sys/wait.h>
 
 #include <networking/includes.h>
 #include <services/time.h>
 #include <types/types.containers.h>
 #include <databases/embedded/tidesdb.h>
 #include <prodigy/runtime.environment.h>
+#include <prodigy/command.capture.h>
 #include <prodigy/mothership/mothership.provider.credential.types.h>
 
 class MothershipProviderCredentialRegistry {
@@ -50,20 +50,6 @@ private:
     return value.size() > 0 && value[0] != '\0';
   }
 
-  static void trimTrailingAsciiWhitespace(String& value)
-  {
-    while (value.size() > 0)
-    {
-      uint8_t ch = value[value.size() - 1];
-      if (ch != ' ' && ch != '\n' && ch != '\r' && ch != '\t')
-      {
-        break;
-      }
-
-      value.resize(value.size() - 1);
-    }
-  }
-
   static void appendShellSingleQuoted(String& command, const String& value)
   {
     command.append('\'');
@@ -81,70 +67,10 @@ private:
     command.append('\'');
   }
 
-  static bool runCommandCaptureOutput(const String& command, String& output, String *failure)
-  {
-    output.clear();
-    if (failure)
-    {
-      failure->clear();
-    }
-
-    String ownedCommand = {};
-    ownedCommand.assign(command);
-    ownedCommand.addNullTerminator();
-
-    FILE *pipe = ::popen(ownedCommand.c_str(), "r");
-    if (pipe == nullptr)
-    {
-      if (failure)
-      {
-        failure->assign("failed to spawn command"_ctv);
-      }
-      return false;
-    }
-
-    char buffer[4096];
-    while (true)
-    {
-      size_t nRead = fread(buffer, 1, sizeof(buffer), pipe);
-      if (nRead > 0)
-      {
-        output.append(reinterpret_cast<const uint8_t *>(buffer), nRead);
-      }
-
-      if (nRead < sizeof(buffer))
-      {
-        break;
-      }
-    }
-
-    int status = ::pclose(pipe);
-    trimTrailingAsciiWhitespace(output);
-    if (status == 0)
-    {
-      return true;
-    }
-
-    if (failure)
-    {
-      if (output.size() > 0)
-      {
-        failure->assign(output);
-      }
-      else if (WIFEXITED(status))
-      {
-        failure->snprintf<"command exited with status {itoa}"_ctv>(uint32_t(WEXITSTATUS(status)));
-      }
-      else
-      {
-        failure->assign("command failed"_ctv);
-      }
-    }
-
-    return false;
-  }
-
-  static bool resolveGcpBootstrapAccessToken(const MothershipProviderCredential& credential, String& material, String *failure)
+  static bool resolveGcpBootstrapAccessToken(const MothershipProviderCredential& credential,
+                                             String& material,
+                                             String *failure,
+                                             ProdigyCommandCapture::Clock::time_point deadline)
   {
     material.clear();
     if (failure)
@@ -164,20 +90,8 @@ private:
       return true;
     }
 
-    if (runCommandCaptureOutput(command, material, failure) == false)
-    {
-      return false;
-    }
-
-    if (stringHasContent(material) == false)
-    {
-      if (failure)
-      {
-        failure->assign("gcp access token resolution returned empty output"_ctv);
-      }
-      return false;
-    }
-
+    (void)deadline;
+    // Executable credentials are resolved by the provider on its Ring.
     return true;
   }
 
@@ -252,23 +166,25 @@ private:
       String azPath = {};
       if (resolveExecutablePath("az", azPath))
       {
-        command.snprintf<"'{}' account get-access-token --resource-type arm --query accessToken -o tsv 2>&1"_ctv>(azPath);
+        appendShellSingleQuoted(command, azPath);
+        command.append(" account get-access-token --resource-type arm --query accessToken -o tsv"_ctv);
       }
       else if (const char *home = getenv("HOME"); home && home[0] != '\0')
       {
         azPath.snprintf<"{}/.local/azure-cli-venv/bin/az"_ctv>(String(home));
         if (::access(azPath.c_str(), X_OK) == 0)
         {
-          command.snprintf<"'{}' account get-access-token --resource-type arm --query accessToken -o tsv 2>&1"_ctv>(azPath);
+          appendShellSingleQuoted(command, azPath);
+          command.append(" account get-access-token --resource-type arm --query accessToken -o tsv"_ctv);
         }
         else
         {
-          command.assign("az account get-access-token --resource-type arm --query accessToken -o tsv 2>&1"_ctv);
+          command.assign("az account get-access-token --resource-type arm --query accessToken -o tsv"_ctv);
         }
       }
       else
       {
-        command.assign("az account get-access-token --resource-type arm --query accessToken -o tsv 2>&1"_ctv);
+        command.assign("az account get-access-token --resource-type arm --query accessToken -o tsv"_ctv);
       }
       return true;
     }
@@ -301,7 +217,7 @@ private:
         command.append(" --profile "_ctv);
         appendShellSingleQuoted(command, it->second);
       }
-      command.append(" --format process 2>&1"_ctv);
+      command.append(" --format process"_ctv);
       return true;
     }
 
@@ -317,7 +233,10 @@ private:
     return false;
   }
 
-  static bool resolveAzureBootstrapAccessToken(const MothershipProviderCredential& credential, String& material, String *failure)
+  static bool resolveAzureBootstrapAccessToken(const MothershipProviderCredential& credential,
+                                               String& material,
+                                               String *failure,
+                                               ProdigyCommandCapture::Clock::time_point deadline)
   {
     material.clear();
     if (failure)
@@ -337,24 +256,15 @@ private:
       return true;
     }
 
-    if (runCommandCaptureOutput(command, material, failure) == false)
-    {
-      return false;
-    }
-
-    if (stringHasContent(material) == false)
-    {
-      if (failure)
-      {
-        failure->assign("azure access token resolution returned empty output"_ctv);
-      }
-      return false;
-    }
-
+    (void)deadline;
+    // Executable credentials are resolved by the provider on its Ring.
     return true;
   }
 
-  static bool resolveAwsBootstrapCredentialMaterial(const MothershipProviderCredential& credential, String& material, String *failure)
+  static bool resolveAwsBootstrapCredentialMaterial(const MothershipProviderCredential& credential,
+                                                     String& material,
+                                                     String *failure,
+                                                     ProdigyCommandCapture::Clock::time_point deadline)
   {
     material.clear();
     if (failure)
@@ -374,20 +284,8 @@ private:
       return true;
     }
 
-    if (runCommandCaptureOutput(command, material, failure) == false)
-    {
-      return false;
-    }
-
-    if (stringHasContent(material) == false)
-    {
-      if (failure)
-      {
-        failure->assign("aws credential resolution returned empty output"_ctv);
-      }
-      return false;
-    }
-
+    (void)deadline;
+    // Executable credentials are resolved by the provider on its Ring.
     return true;
   }
 
@@ -407,21 +305,20 @@ private:
         }
       case MothershipProviderCredentialMode::gcloud:
         {
-          command.assign("gcloud auth print-access-token 2>&1"_ctv);
+          command.assign("gcloud auth print-access-token"_ctv);
           return true;
         }
       case MothershipProviderCredentialMode::gcloudImpersonation:
         {
           command.assign("gcloud auth print-access-token --impersonate-service-account="_ctv);
           appendShellSingleQuoted(command, credential.impersonateServiceAccount);
-          command.append(" 2>&1"_ctv);
           return true;
         }
       case MothershipProviderCredentialMode::externalAccountFile:
         {
           command.assign("GOOGLE_APPLICATION_CREDENTIALS="_ctv);
           appendShellSingleQuoted(command, credential.credentialPath);
-          command.append(" gcloud auth application-default print-access-token 2>&1"_ctv);
+          command.append(" gcloud auth application-default print-access-token"_ctv);
           return true;
         }
       case MothershipProviderCredentialMode::azureCli:
@@ -680,7 +577,11 @@ public:
   {
   }
 
-  static bool resolveCredentialMaterial(const MothershipProviderCredential& credential, String& material, String *failure = nullptr)
+  static bool resolveCredentialMaterial(
+      const MothershipProviderCredential& credential,
+      String& material,
+      String *failure = nullptr,
+      ProdigyCommandCapture::Clock::time_point deadline = ProdigyCommandCapture::Clock::time_point::max())
   {
     material.clear();
     if (failure)
@@ -715,7 +616,7 @@ public:
             }
             return false;
           }
-          return resolveGcpBootstrapAccessToken(credential, material, failure);
+          return resolveGcpBootstrapAccessToken(credential, material, failure, deadline);
         }
       case MothershipProviderCredentialMode::azureCli:
         {
@@ -727,7 +628,7 @@ public:
             }
             return false;
           }
-          return resolveAzureBootstrapAccessToken(credential, material, failure);
+          return resolveAzureBootstrapAccessToken(credential, material, failure, deadline);
         }
       case MothershipProviderCredentialMode::awsCli:
         {
@@ -739,7 +640,7 @@ public:
             }
             return false;
           }
-          return resolveAwsBootstrapCredentialMaterial(credential, material, failure);
+          return resolveAwsBootstrapCredentialMaterial(credential, material, failure, deadline);
         }
       case MothershipProviderCredentialMode::awsImds:
         {
@@ -762,7 +663,11 @@ public:
     return false;
   }
 
-  static bool applyCredentialToRuntimeEnvironment(const MothershipProviderCredential& credential, ProdigyRuntimeEnvironmentConfig& runtimeEnvironment, String *failure = nullptr)
+  static bool applyCredentialToRuntimeEnvironment(
+      const MothershipProviderCredential& credential,
+      ProdigyRuntimeEnvironmentConfig& runtimeEnvironment,
+      String *failure = nullptr,
+      ProdigyCommandCapture::Clock::time_point deadline = ProdigyCommandCapture::Clock::time_point::max())
   {
     runtimeEnvironment.providerCredentialMaterial.clear();
     runtimeEnvironment.aws.bootstrapCredentialRefreshCommand.clear();
@@ -776,7 +681,7 @@ public:
       failure->clear();
     }
 
-    if (resolveCredentialMaterial(credential, runtimeEnvironment.providerCredentialMaterial, failure) == false)
+    if (resolveCredentialMaterial(credential, runtimeEnvironment.providerCredentialMaterial, failure, deadline) == false)
     {
       return false;
     }
@@ -815,6 +720,29 @@ public:
       describeAwsBootstrapCredentialRefreshHint(credential, runtimeEnvironment.aws.bootstrapCredentialRefreshFailureHint);
     }
 
+    return true;
+  }
+
+  static bool prepareGcpRingRuntimeEnvironment(const MothershipProviderCredential& credential,
+                                               const ProdigyRuntimeEnvironmentConfig& source,
+                                               ProdigyRuntimeEnvironmentConfig& runtimeEnvironment,
+                                               String *failure = nullptr,
+                                               ProdigyCommandCapture::Clock::time_point deadline = ProdigyCommandCapture::Clock::time_point::max())
+  {
+    if (credential.provider != MothershipClusterProvider::gcp || source.kind != ProdigyEnvironmentKind::gcp)
+    {
+      if (failure)
+      {
+        failure->assign("GCP Ring runtime requires GCP credential and environment");
+      }
+      return false;
+    }
+
+    prodigyOwnRuntimeEnvironmentConfig(source, runtimeEnvironment);
+    if (applyCredentialToRuntimeEnvironment(credential, runtimeEnvironment, failure, deadline) == false)
+    {
+      return false;
+    }
     return true;
   }
 

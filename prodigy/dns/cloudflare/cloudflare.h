@@ -5,52 +5,56 @@
 class CloudflareDNSProvider : public ProdigyHTTPDNSProvider {
 public:
 
+  CloudflareDNSProvider()
+      : ProdigyHTTPDNSProvider("api.cloudflare.com"_ctv)
+  {}
+
   bool supportsProvider(const String& provider) const override
   {
     return routableResourceDNSPartEquals(provider, "cloudflare"_ctv, false);
   }
 
-  bool upsert(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> upsert(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
   {
     String id = {};
     ProdigyDNSRecordPresence presence = {};
-    if (findRecord(record, credential, presence, id, failure) == false)
+    if (co_await findRecord(coro, record, credential, presence, id, failure) == false)
     {
-      return false;
+      co_return false;
     }
     if (presence == ProdigyDNSRecordPresence::exact)
     {
       failure.clear();
-      return true;
+      co_return true;
     }
-    return create(record, credential, failure);
+    co_return co_await create(coro, record, credential, failure);
   }
 
-  bool remove(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> remove(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
   {
     String id = {};
     ProdigyDNSRecordPresence presence = {};
-    if (findRecord(record, credential, presence, id, failure) == false)
+    if (co_await findRecord(coro, record, credential, presence, id, failure) == false)
     {
-      return false;
+      co_return false;
     }
     if (presence == ProdigyDNSRecordPresence::missing)
     {
       failure.clear();
-      return true;
+      co_return true;
     }
 
-    return removeExact(record, credential, id, failure);
+    co_return co_await removeExact(coro, record, credential, id, failure);
   }
 
-  bool presentTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> presentTXT(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
   {
-    return changeTXT(false, record, credential, failure);
+    co_return co_await changeTXT(coro, false, record, credential, failure);
   }
 
-  bool cleanupTXT(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
+  ProdigyHostTask<bool> cleanupTXT(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure) override
   {
-    return changeTXT(true, record, credential, failure);
+    co_return co_await changeTXT(coro, true, record, credential, failure);
   }
 
 private:
@@ -75,89 +79,89 @@ private:
     return true;
   }
 
-  bool changeTXT(bool removing, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
+  ProdigyHostTask<bool> changeTXT(CoroutineStack *coro, bool removing, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
   {
     String ignored = {};
     if (prodigyDNSRecordSingleTXTValue(record, ignored, failure) == false)
     {
-      return false;
+      co_return false;
     }
     String id = {};
     ProdigyDNSRecordPresence presence = {};
-    if (findRecord(record, credential, presence, id, failure, true) == false)
+    if (co_await findRecord(coro, record, credential, presence, id, failure, true) == false)
     {
-      return false;
+      co_return false;
     }
     if (presence == ProdigyDNSRecordPresence::exact)
     {
-      return removing ? removeExact(record, credential, id, failure) : true;
+      co_return removing ? co_await removeExact(coro, record, credential, id, failure) : true;
     }
     if (removing)
     {
       failure.clear();
-      return true;
+      co_return true;
     }
-    return create(record, credential, failure);
+    co_return co_await create(coro, record, credential, failure);
   }
 
-  bool create(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
+  ProdigyHostTask<bool> create(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, String& failure)
   {
     ProdigyDNSHTTPRequest request = {};
-    request.method.assign("POST"_ctv);
+    request.method = MultiCurlClient::Method::post;
     if (cloudflareURL(record, {}, request.url, failure) == false)
     {
-      return false;
+      co_return false;
     }
-    request.header("Content-Type: application/json");
+    request.headers.push_back({"Content-Type"_ctv, "application/json"_ctv});
     request.bearer(credential.material);
     String name = cloudflareRecordName(record.name);
     if (prodigyDNSAppendRecordJSON(request.body, record, "content", &name, failure) == false)
     {
-      return false;
+      co_return false;
     }
     String response = {};
     long httpCode = 0;
-    return acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "cloudflare dns upsert failed");
+    co_return acceptHTTP(co_await sendHTTP(coro, request, response, httpCode, failure), httpCode, response, failure, "cloudflare dns upsert failed");
   }
 
-  bool removeExact(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, const String& id, String& failure)
+  ProdigyHostTask<bool> removeExact(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, const String& id, String& failure)
   {
     ProdigyDNSHTTPRequest request = {};
-    request.method.assign("DELETE"_ctv);
+    request.method = MultiCurlClient::Method::delete_;
     if (cloudflareURL(record, id, request.url, failure) == false)
     {
-      return false;
+      co_return false;
     }
     request.bearer(credential.material);
     String response = {};
     long httpCode = 0;
-    return acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "cloudflare dns delete failed");
+    co_return acceptHTTP(co_await sendHTTP(coro, request, response, httpCode, failure), httpCode, response, failure, "cloudflare dns delete failed");
   }
 
-  bool findRecord(const ProdigyDNSRecordBinding& record, const ApiCredential& credential, ProdigyDNSRecordPresence& presence, String& id, String& failure, bool exactOnly = false)
+  ProdigyHostTask<bool> findRecord(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, ProdigyDNSRecordPresence& presence, String& id, String& failure, bool exactOnly = false)
   {
     ProdigyDNSHTTPRequest request = {};
-    request.method.assign("GET"_ctv);
+    request.method = MultiCurlClient::Method::get;
     if (cloudflareURL(record, {}, request.url, failure) == false)
     {
-      return false;
+      co_return false;
     }
     String type = {};
     String name = {};
     String normalizedName = cloudflareRecordName(record.name);
     if (prodigyDNSEncodePathPart(record.type, type, failure) == false || prodigyDNSEncodePathPart(normalizedName, name, failure) == false)
     {
-      return false;
+      co_return false;
     }
     request.url.snprintf_add<"?type={}&name={}"_ctv>(type, name);
     request.bearer(credential.material);
     String response = {};
     long httpCode = 0;
-    if (acceptHTTP(sendHTTP(request, response, httpCode, failure), httpCode, response, failure, "cloudflare dns list failed") == false)
+    if (acceptHTTP(co_await sendHTTP(coro, request, response, httpCode, failure), httpCode, response, failure, "cloudflare dns list failed") == false)
     {
-      return false;
+      co_return false;
     }
-    return prodigyDNSFindJSONRecord(response, "result", record, normalizedName, "content", exactOnly, presence, id, failure);
+    co_return prodigyDNSFindJSONRecord(response, "result", record, normalizedName, "content", exactOnly, presence, id, failure);
   }
 
   static String cloudflareRecordName(const String& name)

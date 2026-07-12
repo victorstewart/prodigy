@@ -14,6 +14,7 @@
 #include <prodigy/container.contract.h>
 #include <prodigy/biphasal.key.h>
 #include <prodigy/server.state.h>
+#include <switchboard/common/constants.h>
 
 #ifndef PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
 #define PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION PRODIGY_DEBUG
@@ -491,6 +492,65 @@ public:
   uint64_t bindingNonce = 0;
 };
 
+static inline bool whiteholeDeclarationValid(const Whitehole& whitehole)
+{
+  return (whitehole.transport == ExternalAddressTransport::tcp || whitehole.transport == ExternalAddressTransport::quic) &&
+         (whitehole.family == ExternalAddressFamily::ipv4 || whitehole.family == ExternalAddressFamily::ipv6) &&
+         (whitehole.source == ExternalAddressSource::hostPublicAddress ||
+          whitehole.source == ExternalAddressSource::registeredRoutablePrefix);
+}
+
+static inline bool resolvedWhiteholesValid(const Vector<Whitehole>& whiteholes)
+{
+  if (whiteholes.empty() || whiteholes.size() > MAX_WHITEHOLE_BINDINGS)
+  {
+    return false;
+  }
+
+  class WhiteholeTupleKey {
+  public:
+
+    uint32_t address[4] = {};
+    uint32_t attributes = 0;
+
+    explicit WhiteholeTupleKey(const Whitehole& whitehole)
+    {
+      memcpy(address, whitehole.address.v6, sizeof(address));
+      attributes = uint32_t(whitehole.sourcePort) |
+                   (uint32_t(whitehole.transport) << 16) |
+                   (uint32_t(whitehole.address.is6) << 24);
+    }
+
+    uint64_t hash(void) const
+    {
+      return Hasher::hash<Hasher::SeedPolicy::thread_shared>(reinterpret_cast<const uint8_t *>(this), sizeof(*this));
+    }
+
+    bool equals(const WhiteholeTupleKey& other) const
+    {
+      return memcmp(address, other.address, sizeof(address)) == 0 && attributes == other.attributes;
+    }
+  };
+  static_assert(sizeof(WhiteholeTupleKey) == 20);
+
+  bytell_hash_set<WhiteholeTupleKey> tuples = {};
+  tuples.reserve(whiteholes.size());
+  for (const Whitehole& whitehole : whiteholes)
+  {
+    if (whiteholeDeclarationValid(whitehole) == false || whitehole.hasAddress == false ||
+        whitehole.address.isNull() || whitehole.sourcePort == 0 || whitehole.bindingNonce == 0 ||
+        whitehole.address.is6 != (whitehole.family == ExternalAddressFamily::ipv6))
+    {
+      return false;
+    }
+    if (tuples.emplace(WhiteholeTupleKey(whitehole)).second == false)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
 template <typename S>
 static void serialize(S&& serializer, Whitehole& need)
 {
@@ -539,6 +599,58 @@ static void serialize(S&& serializer, DistributableExternalSubnet& subnet)
   serializer.value1b(subnet.releaseOnRemove);
 }
 
+class ProdigyPendingElasticAddressRelease {
+public:
+
+  constexpr static uint8_t currentVersion = 1;
+
+  uint8_t version = currentVersion;
+  uint64_t operationID = 0;
+  uint64_t transitionGeneration = 0;
+  uint128_t transactionNonce = 0;
+  DistributableExternalSubnet prefix;
+  uint32_t attempts = 0;
+  int64_t nextAttemptMs = 0;
+  String lastFailure;
+
+  bool operator==(const ProdigyPendingElasticAddressRelease& other) const
+  {
+    return version == other.version && operationID == other.operationID &&
+           transitionGeneration == other.transitionGeneration &&
+           transactionNonce == other.transactionNonce &&
+           prefix.uuid == other.prefix.uuid && prefix.name.equals(other.prefix.name) &&
+           prefix.kind == other.prefix.kind && prefix.subnet.equals(other.prefix.subnet) &&
+           prefix.deliverySubnet.equals(other.prefix.deliverySubnet) &&
+           prefix.routing == other.prefix.routing && prefix.usage == other.prefix.usage &&
+           prefix.ingressScope == other.prefix.ingressScope &&
+           prefix.machineUUID == other.prefix.machineUUID &&
+           prefix.providerPool.equals(other.prefix.providerPool) &&
+           prefix.providerAllocationID.equals(other.prefix.providerAllocationID) &&
+           prefix.providerAssociationID.equals(other.prefix.providerAssociationID) &&
+           prefix.releaseOnRemove == other.prefix.releaseOnRemove &&
+           attempts == other.attempts && nextAttemptMs == other.nextAttemptMs &&
+           lastFailure.equals(other.lastFailure);
+  }
+
+  bool operator!=(const ProdigyPendingElasticAddressRelease& other) const
+  {
+    return (*this == other) == false;
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyPendingElasticAddressRelease& release)
+{
+  serializer.value1b(release.version);
+  serializer.value8b(release.operationID);
+  serializer.value8b(release.transitionGeneration);
+  serializer.value16b(release.transactionNonce);
+  serializer.object(release.prefix);
+  serializer.value4b(release.attempts);
+  serializer.value8b(release.nextAttemptMs);
+  serializer.text1b(release.lastFailure, UINT32_MAX);
+}
+
 class RoutableSubnetRegistration {
 public:
 
@@ -561,6 +673,84 @@ static void serialize(S&& serializer, RoutableSubnetRegistration& payload)
   serializer.value1b(payload.success);
   serializer.value1b(payload.created);
   serializer.text1b(payload.failure, UINT32_MAX);
+}
+
+class ProdigyPendingElasticAddressAssignment {
+public:
+
+  constexpr static uint8_t currentVersion = 1;
+
+  uint8_t version = currentVersion;
+  uint64_t operationID = 0;
+  uint64_t transitionGeneration = 0;
+  uint128_t transactionNonce = 0;
+  uint128_t machineUUID = 0;
+  String machineCloudID;
+  IPPrefix expectedDeliveryPrefix;
+  RoutableSubnetRegistration registration;
+  String providerPlan;
+  String providerPlanBindingDigest;
+  bool compensating = false;
+  uint32_t attempts = 0;
+  int64_t nextAttemptMs = 0;
+  String lastFailure;
+
+  bool operator==(const ProdigyPendingElasticAddressAssignment& other) const
+  {
+    return version == other.version && operationID == other.operationID &&
+           transitionGeneration == other.transitionGeneration &&
+           transactionNonce == other.transactionNonce && machineUUID == other.machineUUID &&
+           machineCloudID.equals(other.machineCloudID) &&
+           expectedDeliveryPrefix.equals(other.expectedDeliveryPrefix) &&
+           registration.subnet.uuid == other.registration.subnet.uuid &&
+           registration.subnet.name.equals(other.registration.subnet.name) &&
+           registration.subnet.kind == other.registration.subnet.kind &&
+           registration.subnet.subnet.equals(other.registration.subnet.subnet) &&
+           registration.subnet.deliverySubnet.equals(other.registration.subnet.deliverySubnet) &&
+           registration.subnet.routing == other.registration.subnet.routing &&
+           registration.subnet.usage == other.registration.subnet.usage &&
+           registration.subnet.ingressScope == other.registration.subnet.ingressScope &&
+           registration.subnet.machineUUID == other.registration.subnet.machineUUID &&
+           registration.subnet.providerPool.equals(other.registration.subnet.providerPool) &&
+           registration.subnet.providerAllocationID.equals(other.registration.subnet.providerAllocationID) &&
+           registration.subnet.providerAssociationID.equals(other.registration.subnet.providerAssociationID) &&
+           registration.subnet.releaseOnRemove == other.registration.subnet.releaseOnRemove &&
+           registration.family == other.registration.family &&
+           registration.elasticIntent == other.registration.elasticIntent &&
+           registration.requestedAddress.equals(other.registration.requestedAddress) &&
+           registration.success == other.registration.success &&
+           registration.created == other.registration.created &&
+           registration.failure.equals(other.registration.failure) &&
+           providerPlan.equals(other.providerPlan) &&
+           providerPlanBindingDigest.equals(other.providerPlanBindingDigest) &&
+           compensating == other.compensating &&
+           attempts == other.attempts && nextAttemptMs == other.nextAttemptMs &&
+           lastFailure.equals(other.lastFailure);
+  }
+
+  bool operator!=(const ProdigyPendingElasticAddressAssignment& other) const
+  {
+    return (*this == other) == false;
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyPendingElasticAddressAssignment& assignment)
+{
+  serializer.value1b(assignment.version);
+  serializer.value8b(assignment.operationID);
+  serializer.value8b(assignment.transitionGeneration);
+  serializer.value16b(assignment.transactionNonce);
+  serializer.value16b(assignment.machineUUID);
+  serializer.text1b(assignment.machineCloudID, UINT32_MAX);
+  serializer.object(assignment.expectedDeliveryPrefix);
+  serializer.object(assignment.registration);
+  serializer.text1b(assignment.providerPlan, UINT32_MAX);
+  serializer.text1b(assignment.providerPlanBindingDigest, UINT32_MAX);
+  serializer.value1b(assignment.compensating);
+  serializer.value4b(assignment.attempts);
+  serializer.value8b(assignment.nextAttemptMs);
+  serializer.text1b(assignment.lastFailure, UINT32_MAX);
 }
 
 class RoutableSubnetUnregistration {
@@ -1997,6 +2187,8 @@ class ProdigyContainerRuntimeLimits {
 public:
 
   uint32_t maxPids = 4096;
+  uint32_t maxIsolatedChildMemoryMB = 1024;
+  uint32_t maxIsolatedChildCgroups = 64;
   uint64_t maxCompressedBlobBytes = 4ULL * 1024ULL * 1024ULL * 1024ULL;
   uint64_t maxArtifactBytes = 4ULL * 1024ULL * 1024ULL * 1024ULL;
   uint64_t maxLaunchMetadataBytes = 64ULL * 1024ULL;
@@ -2790,14 +2982,6 @@ static void serialize(S&& serializer, ApiCredential& credential)
 class BrainConfig {
 public:
 
-  struct EmailReporter {
-
-    String to; // v@nametag.social
-    String from; // prodigy@nametag.social
-    String smtp; // smtp://smtp.gmail.com:587
-    String password; // generate app password on gmail
-  };
-
   bytell_hash_map<String, MachineConfig> configBySlug;
   uint128_t clusterUUID = 0;
   uint8_t datacenterFragment = 0;
@@ -2817,7 +3001,6 @@ public:
   ApiCredential dnsCredential;
   ProdigyACMEConfig acme;
 
-  EmailReporter reporter;
   // Generic VM image URI for cloud providers (e.g., GCP: projects/<p>/global/images/<image>)
   String vmImageURI;
   bool osUpdatesEnabled = false;
@@ -2826,15 +3009,6 @@ public:
   uint32_t machineUpdateCadenceMins = 15;
   ProdigyRuntimeEnvironmentConfig runtimeEnvironment;
 };
-
-template <typename S>
-static void serialize(S&& serializer, BrainConfig::EmailReporter& reporter)
-{
-  serializer.text1b(reporter.to, UINT32_MAX);
-  serializer.text1b(reporter.from, UINT32_MAX);
-  serializer.text1b(reporter.smtp, UINT32_MAX);
-  serializer.text1b(reporter.password, UINT32_MAX);
-}
 
 template <typename S>
 static void serialize(S&& serializer, BrainConfig& config)
@@ -2857,7 +3031,6 @@ static void serialize(S&& serializer, BrainConfig& config)
   serializer.text1b(config.dnsProvider, UINT32_MAX);
   serializer.object(config.dnsCredential);
   serializer.object(config.acme);
-  serializer.object(config.reporter);
   serializer.text1b(config.vmImageURI, UINT32_MAX);
   serializer.value1b(config.osUpdatesEnabled);
   serializer.container(config.osUpdatePolicies, UINT32_MAX);
@@ -3015,6 +3188,8 @@ public:
   }
 
   uint32_t nLogicalCores;
+  uint32_t maxPids = prodigyContainerRuntimeLimits.maxPids;
+  uint32_t isolatedChildMemoryMB = 0;
   ApplicationCPUMode cpuMode = ApplicationCPUMode::isolated;
   uint32_t sharedCPUMillis = 0;
   uint32_t msTilHealthy; // plus grace period
@@ -3104,6 +3279,8 @@ static void serialize(S&& serializer, ApplicationConfig& config)
   serializer.value4b(config.storageMB);
   serializer.value4b(config.memoryMB);
   serializer.value4b(config.nLogicalCores);
+  serializer.value4b(config.maxPids);
+  serializer.value4b(config.isolatedChildMemoryMB);
   serializer.value1b(config.cpuMode);
   serializer.value4b(config.sharedCPUMillis);
   serializer.value4b(config.msTilHealthy);
@@ -5824,6 +6001,7 @@ public:
   uint32_t failureCount = 0;
   String lastFailure;
   Vector<AcmeDNS01ChallengeState> pendingDNS01Challenges;
+  bool releasePending = false;
 };
 
 template <typename S>
@@ -5840,6 +6018,7 @@ static void serialize(S&& serializer, PublicTlsCertificateState& state)
   serializer.value4b(state.failureCount);
   serializer.text1b(state.lastFailure, UINT32_MAX);
   serializer.object(state.pendingDNS01Challenges);
+  serializer.value1b(state.releasePending);
 }
 
 static inline bool prodigyPublicTlsCertificateStatesEqual(const PublicTlsCertificateState& lhs, const PublicTlsCertificateState& rhs)
@@ -5854,7 +6033,8 @@ static inline bool prodigyPublicTlsCertificateStatesEqual(const PublicTlsCertifi
          lhs.lastSuccessMs == rhs.lastSuccessMs &&
          lhs.failureCount == rhs.failureCount &&
          lhs.lastFailure.equals(rhs.lastFailure) &&
-         prodigyACMEDNS01ChallengeStateVectorsEqual(lhs.pendingDNS01Challenges, rhs.pendingDNS01Challenges);
+         prodigyACMEDNS01ChallengeStateVectorsEqual(lhs.pendingDNS01Challenges, rhs.pendingDNS01Challenges) &&
+         lhs.releasePending == rhs.releasePending;
 }
 
 static inline bool prodigyCanonicalACMEDNSIdentifier(const String& identifier, String& canonical, String *failure = nullptr)
@@ -6540,6 +6720,38 @@ static void serialize(S&& serializer, ProdigyPendingAddMachinesOperation& operat
   serializer.text1b(operation.lastFailure, UINT32_MAX);
 }
 
+class ProdigyPendingAutonomousProvisioningOperation {
+public:
+
+  uint64_t operationID = 0;
+  uint64_t deploymentID = 0;
+  uint8_t applicationLifetime = 0;
+  String machineSchema;
+  uint32_t count = 0;
+
+  bool operator==(const ProdigyPendingAutonomousProvisioningOperation& other) const
+  {
+    return operationID == other.operationID && deploymentID == other.deploymentID &&
+           applicationLifetime == other.applicationLifetime &&
+           machineSchema.equals(other.machineSchema) && count == other.count;
+  }
+
+  bool operator!=(const ProdigyPendingAutonomousProvisioningOperation& other) const
+  {
+    return (*this == other) == false;
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyPendingAutonomousProvisioningOperation& operation)
+{
+  serializer.value8b(operation.operationID);
+  serializer.value8b(operation.deploymentID);
+  serializer.value1b(operation.applicationLifetime);
+  serializer.text1b(operation.machineSchema, UINT32_MAX);
+  serializer.value4b(operation.count);
+}
+
 enum class RoutableResourceLeaseKind : uint8_t {
   wormholeAddress = 0,
   whiteholeAddressPort = 1,
@@ -6583,10 +6795,12 @@ public:
   String dnsName;
   String dnsType;
   uint32_t dnsTTL = 0;
+  bool dnsDeletePending = false;
+  uint64_t dnsIntentRevision = 0;
 
   bool operator==(const RoutableResourceLease& other) const
   {
-    return kind == other.kind && owner == other.owner && registeredPrefixUUID == other.registeredPrefixUUID && address.equals(other.address) && sourcePort == other.sourcePort && dnsProvider.equals(other.dnsProvider) && dnsCredentialName.equals(other.dnsCredentialName) && dnsZone.equals(other.dnsZone) && dnsName.equals(other.dnsName) && dnsType.equals(other.dnsType) && dnsTTL == other.dnsTTL;
+    return kind == other.kind && owner == other.owner && registeredPrefixUUID == other.registeredPrefixUUID && address.equals(other.address) && sourcePort == other.sourcePort && dnsProvider.equals(other.dnsProvider) && dnsCredentialName.equals(other.dnsCredentialName) && dnsZone.equals(other.dnsZone) && dnsName.equals(other.dnsName) && dnsType.equals(other.dnsType) && dnsTTL == other.dnsTTL && dnsDeletePending == other.dnsDeletePending && dnsIntentRevision == other.dnsIntentRevision;
   }
 };
 
@@ -6604,6 +6818,8 @@ static void serialize(S&& serializer, RoutableResourceLease& lease)
   serializer.text1b(lease.dnsName, UINT32_MAX);
   serializer.text1b(lease.dnsType, UINT32_MAX);
   serializer.value4b(lease.dnsTTL);
+  serializer.value1b(lease.dnsDeletePending);
+  serializer.value8b(lease.dnsIntentRevision);
 }
 
 class RoutableResourceLeaseReport {
@@ -6694,6 +6910,80 @@ static inline bool routableResourceLeasesConflict(const RoutableResourceLease& l
   return routableResourceLeaseOwnersCompatible(lhs.owner, rhs.owner) == false && routableResourceLeaseResourcesIntersect(lhs, rhs);
 }
 
+enum class ProdigyDnsControlClientRole : uint8_t {
+  mothership = 1,
+  prodigy = 2
+};
+
+class ProdigyDnsControlPairingLease {
+public:
+
+  uint128_t leaseID = 0;
+  uint128_t secret = 0;
+  IPAddress clientAddress;
+  uint64_t generation = 0;
+  int64_t expiresAtMs = 0;
+  ProdigyDnsControlClientRole role = ProdigyDnsControlClientRole::prodigy;
+  bool desiredActive = true;
+  bool applied = false;
+
+  bool operator==(const ProdigyDnsControlPairingLease& other) const
+  {
+    return leaseID == other.leaseID && secret == other.secret &&
+           clientAddress.equals(other.clientAddress) &&
+           generation == other.generation &&
+           expiresAtMs == other.expiresAtMs && role == other.role &&
+           desiredActive == other.desiredActive && applied == other.applied;
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyDnsControlPairingLease& lease)
+{
+  serializer.value16b(lease.leaseID);
+  serializer.value16b(lease.secret);
+  serializer.object(lease.clientAddress);
+  serializer.value8b(lease.generation);
+  serializer.value8b(lease.expiresAtMs);
+  serializer.value1b(lease.role);
+  serializer.value1b(lease.desiredActive);
+  serializer.value1b(lease.applied);
+}
+
+enum class ProdigyDnsControlPairingAction : uint8_t {
+  mint = 1,
+  revoke = 2,
+  reconcile = 3
+};
+
+class ProdigyDnsControlPairingOperation {
+public:
+
+  ProdigyDnsControlPairingAction action = ProdigyDnsControlPairingAction::reconcile;
+  ProdigyDnsControlClientRole role = ProdigyDnsControlClientRole::prodigy;
+  IPAddress clientAddress;
+  int64_t lifetimeMs = 0;
+  uint128_t leaseID = 0;
+  uint64_t generation = 0;
+  ProdigyDnsControlPairingLease lease;
+  bool succeeded = false;
+  String failure;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyDnsControlPairingOperation& operation)
+{
+  serializer.value1b(operation.action);
+  serializer.value1b(operation.role);
+  serializer.object(operation.clientAddress);
+  serializer.value8b(operation.lifetimeMs);
+  serializer.value16b(operation.leaseID);
+  serializer.value8b(operation.generation);
+  serializer.object(operation.lease);
+  serializer.value1b(operation.succeeded);
+  serializer.text1b(operation.failure, 512);
+}
+
 class ProdigyMasterAuthorityRuntimeState {
 public:
 
@@ -6703,12 +6993,19 @@ public:
   uint64_t nextMintedClientTlsGeneration = 1;
   uint64_t nextTlsResumptionGeneration = 1;
   uint64_t nextPendingAddMachinesOperationID = 1;
+  uint64_t nextPendingElasticAddressOperationID = 1;
+  uint64_t nextDNSIntentRevision = 1;
+  uint64_t nextDnsControlPairingGeneration = 1;
   ProdigyResumptionRegistry::SnapshotMap tlsResumptionSnapshotsByWormhole;
   Vector<ProdigyPendingAddMachinesOperation> pendingAddMachinesOperations;
+  Vector<ProdigyPendingAutonomousProvisioningOperation> pendingAutonomousProvisioningOperations;
+  Vector<ProdigyPendingElasticAddressAssignment> pendingElasticAddressAssignments;
+  Vector<ProdigyPendingElasticAddressRelease> pendingElasticAddressReleases;
   Vector<ProdigyStatefulWorkerTopologyUpgradeOperation> statefulWorkerTopologyUpgradeOperations;
   Vector<ProdigyDeferredStatefulScaleIntent> deferredStatefulScaleIntents;
   Vector<ProdigyManagedMachineSchema> machineSchemas;
   Vector<RoutableResourceLease> routableResourceLeases;
+  Vector<ProdigyDnsControlPairingLease> dnsControlPairingLeases;
   Vector<PublicTlsCertificateState> publicTlsCertificates;
   Vector<PrivateTlsVaultLifecycleState> privateTlsVaultLifecycles;
   bytell_hash_map<uint64_t, TaskExecutionRecord> taskExecutions;
@@ -6717,7 +7014,12 @@ public:
 
   bool operator==(const ProdigyMasterAuthorityRuntimeState& other) const
   {
-    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf)
+    if (nextDnsControlPairingGeneration != other.nextDnsControlPairingGeneration ||
+        dnsControlPairingLeases.size() != other.dnsControlPairingLeases.size())
+    {
+      return false;
+    }
+    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf)
     {
       return false;
     }
@@ -6734,6 +7036,30 @@ public:
     for (uint32_t index = 0; index < pendingAddMachinesOperations.size(); ++index)
     {
       if (pendingAddMachinesOperations[index] != other.pendingAddMachinesOperations[index])
+      {
+        return false;
+      }
+    }
+
+    for (uint32_t index = 0; index < pendingAutonomousProvisioningOperations.size(); ++index)
+    {
+      if (pendingAutonomousProvisioningOperations[index] != other.pendingAutonomousProvisioningOperations[index])
+      {
+        return false;
+      }
+    }
+
+    for (uint32_t index = 0; index < pendingElasticAddressReleases.size(); ++index)
+    {
+      if (pendingElasticAddressReleases[index] != other.pendingElasticAddressReleases[index])
+      {
+        return false;
+      }
+    }
+
+    for (uint32_t index = 0; index < pendingElasticAddressAssignments.size(); ++index)
+    {
+      if ((pendingElasticAddressAssignments[index] == other.pendingElasticAddressAssignments[index]) == false)
       {
         return false;
       }
@@ -6766,6 +7092,14 @@ public:
     for (uint32_t index = 0; index < routableResourceLeases.size(); ++index)
     {
       if ((routableResourceLeases[index] == other.routableResourceLeases[index]) == false)
+      {
+        return false;
+      }
+    }
+
+    for (uint32_t index = 0; index < dnsControlPairingLeases.size(); ++index)
+    {
+      if ((dnsControlPairingLeases[index] == other.dnsControlPairingLeases[index]) == false)
       {
         return false;
       }
@@ -6814,17 +7148,42 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
   serializer.value8b(state.nextMintedClientTlsGeneration);
   serializer.value8b(state.nextTlsResumptionGeneration);
   serializer.value8b(state.nextPendingAddMachinesOperationID);
+  serializer.value8b(state.nextPendingElasticAddressOperationID);
+  serializer.value8b(state.nextDNSIntentRevision);
+  serializer.value8b(state.nextDnsControlPairingGeneration);
   serializer.object(state.tlsResumptionSnapshotsByWormhole);
   serializer.object(state.pendingAddMachinesOperations);
+  serializer.object(state.pendingAutonomousProvisioningOperations);
+  serializer.object(state.pendingElasticAddressAssignments);
+  serializer.object(state.pendingElasticAddressReleases);
   serializer.object(state.statefulWorkerTopologyUpgradeOperations);
   serializer.object(state.deferredStatefulScaleIntents);
   serializer.object(state.machineSchemas);
   serializer.object(state.routableResourceLeases);
+  serializer.object(state.dnsControlPairingLeases);
   serializer.object(state.publicTlsCertificates);
   serializer.object(state.privateTlsVaultLifecycles);
   serializer.object(state.taskExecutions);
   serializer.object(state.mothershipTunnelProviderDesiredState);
   serializer.object(state.updateSelf);
+}
+
+class ProdigyMasterAuthorityStateTransitionAck {
+public:
+
+  uint64_t generation = 0;
+  uint128_t peerUUID = 0;
+  int64_t peerBootNs = 0;
+  String transitionDigest;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyMasterAuthorityStateTransitionAck& ack)
+{
+  serializer.value8b(ack.generation);
+  serializer.value16b(ack.peerUUID);
+  serializer.value8b(ack.peerBootNs);
+  serializer.text1b(ack.transitionDigest, 64);
 }
 
 class ProdigyMetricSample {
@@ -7254,6 +7613,12 @@ public:
   uint32_t memoryMB = 0;
 };
 
+enum class ContainerNetworkAccess : uint8_t {
+
+  unrestricted = 0,
+  declaredOnly = 1
+};
+
 template <typename S>
 static void serialize(S&& serializer, AssignedGPUDevice& gpu)
 {
@@ -7279,6 +7644,7 @@ public:
   SystemContainerRuntimePlan system;
   Vector<Wormhole> wormholes;
   Vector<Whitehole> whiteholes;
+  ContainerNetworkAccess networkAccess = ContainerNetworkAccess::unrestricted;
   bool useHostNetworkNamespace = false;
   Vector<IPPrefix> addresses; // directly assigned interface addresses; currently just the container-network IPv6
   Vector<uint32_t> assignedGPUMemoryMBs; // exact whole-GPU slots assigned to this container for accounting/restore
@@ -7557,6 +7923,7 @@ static void serialize(S&& serializer, ContainerPlan& plan)
   serializer.object(plan.system);
   serializer.object(plan.wormholes);
   serializer.object(plan.whiteholes);
+  serializer.value1b(plan.networkAccess);
   serializer.value1b(plan.useHostNetworkNamespace);
   serializer.object(plan.addresses);
   serializer.object(plan.assignedGPUMemoryMBs);
@@ -7650,6 +8017,7 @@ public:
   Vector<WormholePublicTLSConfig> publicTLS;
 
   Vector<Whitehole> whiteholes;
+  ContainerNetworkAccess networkAccess = ContainerNetworkAccess::unrestricted;
 
   bool useHostNetworkNamespace = false;
 
@@ -7687,6 +8055,7 @@ static void serialize(S&& serializer, DeploymentPlan& plan)
   serializer.object(plan.publicTLS);
 
   serializer.object(plan.whiteholes);
+  serializer.value1b(plan.networkAccess);
 
   serializer.value1b(plan.useHostNetworkNamespace);
 
@@ -7975,6 +8344,7 @@ public:
   uint32_t memoryMB;
   uint32_t storageMB;
   uint16_t nLogicalCores;
+  Vector<int32_t> isolatedChildCgroups;
   ApplicationCPUMode cpuMode = ApplicationCPUMode::isolated;
   uint32_t requestedCPUMillis = 0;
 
@@ -8011,6 +8381,9 @@ static void serialize(S&& serializer, ContainerParameters& params)
   serializer.value4b(params.memoryMB);
   serializer.value4b(params.storageMB);
   serializer.value2b(params.nLogicalCores);
+  serializer.container(params.isolatedChildCgroups, 64, [](S& s, int32_t& fd) {
+    s.value4b(fd);
+  });
   serializer.value1b(params.cpuMode);
   serializer.value4b(params.requestedCPUMillis);
 
