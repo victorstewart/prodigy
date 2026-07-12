@@ -2697,7 +2697,7 @@ private:
             progress.cloud.cloudID = machine->cloudID;
             prodigyPopulateMachineProvisioningProgressFromMachine(progress, *machine);
           }
-          if (machine && provisioningState == "Succeeded" && prodigyMachineProvisioningReady(*machine))
+          if (machine && provisioningState == "Succeeded"_ctv && prodigyMachineProvisioningReady(*machine))
           {
             machine->lifetime = lifetime;
             pending.ready = true;
