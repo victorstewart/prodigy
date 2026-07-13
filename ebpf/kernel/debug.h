@@ -429,7 +429,7 @@ __attribute__((__always_inline__)) static inline void logXDP(struct xdp_md *ctx)
   logPacketShallow(eth, data_end);
 }
 
-__attribute__((__always_inline__)) static inline void logSKB(struct __sk_buff *skb)
+__attribute__((noinline)) static void logSKB(struct __sk_buff *skb)
 {
   struct ethhdr *eth = NULL;
   void *data_end = NULL;

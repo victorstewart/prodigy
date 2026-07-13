@@ -4,6 +4,7 @@
 #include <grp.h>
 #include <services/debug.h>
 #include <linux/sched.h> /* Definition of struct clone_args */
+#include <linux/magic.h>
 #include <sched.h> /* Definition of CLONE_* constants */
 #include <simdjson.h>
 #include <sys/syscall.h> /* Definition of SYS_* constants */
@@ -15,6 +16,7 @@
 #include <sys/mount.h>
 #include <sys/resource.h>
 #include <sys/statvfs.h>
+#include <sys/vfs.h>
 #include <seccomp.h>
 #include <sys/sysmacros.h>
 #include <spawn.h>
@@ -47,6 +49,8 @@
 #define nReservedCores 2
 constexpr static int containerStartupFailureExitCode = 125;
 constexpr static int containerExecInheritedFDMinimum = 64;
+constexpr static auto containerNeuronListenerFDEnvironment = "PRODIGY_NEURON_LISTENER_FD"_ctv;
+constexpr static auto containerRuntimeRootPath = "/run/prodigy/containers"_ctv;
 constexpr static int64_t failedContainerArtifactRetentionMs = 24LL * 60LL * 60LL * 1000LL;
 constexpr static int64_t failedContainerArtifactCleanupIntervalMs = 3LL * 60LL * 60LL * 1000LL;
 
@@ -762,6 +766,8 @@ public:
   MachineCpuArchitecture executeArchitecture = MachineCpuArchitecture::unknown;
   String storageRootPath;
   String storagePayloadPath;
+  String runtimePath;
+  String neuronListenerPath;
   Vector<StorageLoopDevice> storageLoopDevices;
 
   bool isSystemContainer(void) const
@@ -772,6 +778,17 @@ public:
   bool exposesNeuronSocket(void) const
   {
     return isSystemContainer() == false;
+  }
+
+  void assignNeuronListenerPath(void)
+  {
+    String runtimeName = {};
+    runtimeName.assignItoa(plan.uuid);
+    runtimePath.assign(containerRuntimeRootPath);
+    runtimePath.append("/"_ctv);
+    runtimePath.append(runtimeName);
+    neuronListenerPath.assign(runtimePath);
+    neuronListenerPath.append("/neuron.soc"_ctv);
   }
 
   bool systemEgressConstrained(void) const
@@ -2801,11 +2818,13 @@ private:
     for (const String& assignment : container->executeEnv)
     {
       bool foundEquals = false;
+      uint64_t equalsIndex = 0;
       for (uint64_t index = 0; index < assignment.size(); ++index)
       {
         if (assignment[index] == '=')
         {
           foundEquals = (index > 0);
+          equalsIndex = index;
           break;
         }
       }
@@ -2817,6 +2836,16 @@ private:
           failureReport->snprintf<"launch metadata execute_env entry {} must be KEY=VALUE"_ctv>(assignment);
         }
 
+        return false;
+      }
+
+      if (equalsIndex == containerNeuronListenerFDEnvironment.size() &&
+          memcmp(assignment.data(), containerNeuronListenerFDEnvironment.data(), equalsIndex) == 0)
+      {
+        if (failureReport)
+        {
+          failureReport->assign("launch metadata cannot override PRODIGY_NEURON_LISTENER_FD"_ctv);
+        }
         return false;
       }
     }
@@ -2908,6 +2937,16 @@ public:
   static bool debugCloseContainerChildPrivilegedFDs(Container *container, String *failureReport = nullptr)
   {
     return closeContainerChildPrivilegedFDs(container, failureReport);
+  }
+
+  static bool debugPrepareContainerNeuronListener(Container *container, int& listenerFD, String *failureReport = nullptr)
+  {
+    return prepareContainerNeuronListener(container, listenerFD, failureReport);
+  }
+
+  static void debugCleanupContainerNeuronListener(Container *container)
+  {
+    cleanupContainerNeuronListener(container);
   }
 
   static bool debugSetContainerNoNewPrivileges(Container *container, String *failureReport = nullptr)
@@ -3301,38 +3340,54 @@ private:
 
   static bool moveContainerExecDescriptorAboveMinimum(int& fd, String *failureReport = nullptr)
   {
-    if (fd < 0 || fd >= containerExecInheritedFDMinimum)
+    if (fd < 0)
     {
       return true;
     }
 
-    int movedFD = fcntl(fd, F_DUPFD, containerExecInheritedFDMinimum);
-    if (movedFD < 0)
+    if (fd < containerExecInheritedFDMinimum)
+    {
+      int movedFD = fcntl(fd, F_DUPFD, containerExecInheritedFDMinimum);
+      if (movedFD < 0)
+      {
+        if (failureReport)
+        {
+          failureReport->snprintf<"failed to duplicate inherited container exec fd {itoa} above {itoa}: {}"_ctv>(
+              uint32_t(fd),
+              uint32_t(containerExecInheritedFDMinimum),
+              String(strerror(errno)));
+        }
+        return false;
+      }
+
+      if (close(fd) != 0)
+      {
+        int closeErrno = errno;
+        close(movedFD);
+        if (failureReport)
+        {
+          failureReport->snprintf<"failed to close original inherited container exec fd {itoa}: {}"_ctv>(
+              uint32_t(fd),
+              String(strerror(closeErrno)));
+        }
+        return false;
+      }
+
+      fd = movedFD;
+    }
+
+    int descriptorFlags = fcntl(fd, F_GETFD);
+    if (descriptorFlags < 0 ||
+        ((descriptorFlags & FD_CLOEXEC) != 0 && fcntl(fd, F_SETFD, descriptorFlags & ~FD_CLOEXEC) != 0))
     {
       if (failureReport)
       {
-        failureReport->snprintf<"failed to duplicate inherited container exec fd {itoa} above {itoa}: {}"_ctv>(
+        failureReport->snprintf<"failed to clear close-on-exec for inherited container fd {itoa}: {}"_ctv>(
             uint32_t(fd),
-            uint32_t(containerExecInheritedFDMinimum),
             String(strerror(errno)));
       }
       return false;
     }
-
-    if (close(fd) != 0)
-    {
-      int closeErrno = errno;
-      close(movedFD);
-      if (failureReport)
-      {
-        failureReport->snprintf<"failed to close original inherited container exec fd {itoa}: {}"_ctv>(
-            uint32_t(fd),
-            String(strerror(closeErrno)));
-      }
-      return false;
-    }
-
-    fd = movedFD;
     return true;
   }
 
@@ -3789,7 +3844,7 @@ private:
     int artifactRootFD = Filesystem::openDirectoryAt(
         -1,
         artifactRootPath,
-        O_PATH | O_DIRECTORY | O_CLOEXEC,
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC,
         RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS);
     if (artifactRootFD < 0)
     {
@@ -5124,6 +5179,253 @@ private:
     return true;
   }
 
+  static bool openContainerRuntimeRoot(int& runtimeRootFD, String *failureReport = nullptr)
+  {
+    runtimeRootFD = -1;
+    int runFD = open("/run", O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (runFD < 0)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to open /run errno={}({})"_ctv>(errno, String(strerror(errno)));
+      }
+      return false;
+    }
+
+    struct statfs runtimeFS = {};
+    if (fstatfs(runFD, &runtimeFS) != 0)
+    {
+      int runtimeErrno = errno;
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to inspect /run filesystem errno={}({})"_ctv>(
+            runtimeErrno,
+            String(strerror(runtimeErrno)));
+      }
+      close(runFD);
+      errno = runtimeErrno;
+      return false;
+    }
+    if (runtimeFS.f_type != TMPFS_MAGIC)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"/run is not verified tmpfs type={}"_ctv>(uint64_t(runtimeFS.f_type));
+      }
+      close(runFD);
+      errno = EINVAL;
+      return false;
+    }
+
+    bool opened = openContainerDirectoryTreeAt(runFD, "prodigy/containers"_ctv, true, 0700, runtimeRootFD, failureReport);
+    close(runFD);
+    if (opened == false)
+    {
+      return false;
+    }
+
+    struct stat runtimeRootStat = {};
+    int runtimeRootStatResult = fstat(runtimeRootFD, &runtimeRootStat);
+    if (runtimeRootStatResult != 0 ||
+        S_ISDIR(runtimeRootStat.st_mode) == false ||
+        runtimeRootStat.st_uid != 0 ||
+        (runtimeRootStat.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+    {
+      int runtimeErrno = (runtimeRootStatResult != 0) ? errno : EPERM;
+      if (failureReport)
+      {
+        failureReport->snprintf<"container runtime root failed ownership/mode validation uid={} mode={} errno={}({})"_ctv>(
+            uint64_t(runtimeRootStat.st_uid),
+            uint64_t(runtimeRootStat.st_mode),
+            runtimeErrno,
+            String(strerror(runtimeErrno)));
+      }
+      close(runtimeRootFD);
+      runtimeRootFD = -1;
+      errno = (runtimeErrno != 0) ? runtimeErrno : EPERM;
+      return false;
+    }
+    return true;
+  }
+
+  static bool prepareContainerNeuronListener(Container *container, int& listenerFD, String *failureReport = nullptr)
+  {
+    listenerFD = -1;
+    if (container == nullptr || container->exposesNeuronSocket() == false)
+    {
+      return true;
+    }
+    container->assignNeuronListenerPath();
+
+    int runtimeRootFD = -1;
+    if (openContainerRuntimeRoot(runtimeRootFD, failureReport) == false)
+    {
+      return false;
+    }
+
+    String runtimeName = {};
+    runtimeName.assignItoa(container->plan.uuid);
+    if (mkdirat(runtimeRootFD, runtimeName.c_str(), 0700) != 0 && errno != EEXIST)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to create container runtime directory {} errno={}({})"_ctv>(
+            runtimeName,
+            errno,
+            String(strerror(errno)));
+      }
+      close(runtimeRootFD);
+      return false;
+    }
+
+    int containerRuntimeFD = Filesystem::openDirectoryAt(
+        runtimeRootFD,
+        runtimeName,
+        O_PATH | O_DIRECTORY | O_CLOEXEC,
+        secureContainerResolveFlags);
+    close(runtimeRootFD);
+    if (containerRuntimeFD < 0)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to securely open container runtime directory {} errno={}({})"_ctv>(
+            runtimeName,
+            errno,
+            String(strerror(errno)));
+      }
+      return false;
+    }
+
+    struct stat runtimeStat = {};
+    int runtimeStatResult = fstat(containerRuntimeFD, &runtimeStat);
+    if (runtimeStatResult != 0 || S_ISDIR(runtimeStat.st_mode) == false || runtimeStat.st_uid != 0)
+    {
+      int runtimeErrno = (runtimeStatResult != 0) ? errno : EPERM;
+      if (failureReport)
+      {
+        failureReport->snprintf<"container runtime directory {} failed ownership/type validation uid={} mode={} errno={}({})"_ctv>(
+            runtimeName,
+            uint64_t(runtimeStat.st_uid),
+            uint64_t(runtimeStat.st_mode),
+            runtimeErrno,
+            String(strerror(runtimeErrno)));
+      }
+      close(containerRuntimeFD);
+      errno = (runtimeErrno != 0) ? runtimeErrno : EPERM;
+      return false;
+    }
+
+    if (fchmodat(containerRuntimeFD, "", 0700, AT_EMPTY_PATH) != 0)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to secure container runtime directory {} errno={}({})"_ctv>(
+            runtimeName,
+            errno,
+            String(strerror(errno)));
+      }
+      close(containerRuntimeFD);
+      return false;
+    }
+
+    if (unlinkat(containerRuntimeFD, "neuron.soc", 0) != 0 && errno != ENOENT)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to remove stale neuron listener for {} errno={}({})"_ctv>(
+            runtimeName,
+            errno,
+            String(strerror(errno)));
+      }
+      close(containerRuntimeFD);
+      return false;
+    }
+
+    listenerFD = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (listenerFD < 0)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to create neuron listener for {} errno={}({})"_ctv>(
+            runtimeName,
+            errno,
+            String(strerror(errno)));
+      }
+      close(containerRuntimeFD);
+      return false;
+    }
+
+    struct sockaddr_un address = {};
+    address.sun_family = AF_UNIX;
+    if (container->neuronListenerPath.size() >= sizeof(address.sun_path))
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"neuron listener path is too long: {}"_ctv>(container->neuronListenerPath);
+      }
+      close(listenerFD);
+      listenerFD = -1;
+      close(containerRuntimeFD);
+      errno = ENAMETOOLONG;
+      return false;
+    }
+    memcpy(address.sun_path, container->neuronListenerPath.data(), container->neuronListenerPath.size());
+    socklen_t addressLength = socklen_t(offsetof(struct sockaddr_un, sun_path) + container->neuronListenerPath.size() + 1);
+    if (bind(listenerFD, reinterpret_cast<const struct sockaddr *>(&address), addressLength) != 0 ||
+        listen(listenerFD, SOMAXCONN) != 0)
+    {
+      int listenerErrno = errno;
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to bind/listen neuron endpoint {} errno={}({})"_ctv>(
+            container->neuronListenerPath,
+            listenerErrno,
+            String(strerror(listenerErrno)));
+      }
+      close(listenerFD);
+      listenerFD = -1;
+      (void)unlinkat(containerRuntimeFD, "neuron.soc", 0);
+      close(containerRuntimeFD);
+      errno = listenerErrno;
+      return false;
+    }
+
+    close(containerRuntimeFD);
+    return true;
+  }
+
+  static void cleanupContainerNeuronListener(Container *container)
+  {
+    if (container == nullptr || container->exposesNeuronSocket() == false)
+    {
+      return;
+    }
+    container->assignNeuronListenerPath();
+
+    int runtimeRootFD = -1;
+    if (openContainerRuntimeRoot(runtimeRootFD) == false)
+    {
+      return;
+    }
+
+    String runtimeName = {};
+    runtimeName.assignItoa(container->plan.uuid);
+    int containerRuntimeFD = Filesystem::openDirectoryAt(
+        runtimeRootFD,
+        runtimeName,
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+        secureContainerResolveFlags);
+    if (containerRuntimeFD >= 0)
+    {
+      (void)unlinkat(containerRuntimeFD, "neuron.soc", 0);
+      close(containerRuntimeFD);
+      (void)unlinkat(runtimeRootFD, runtimeName.c_str(), AT_REMOVEDIR);
+    }
+    close(runtimeRootFD);
+    container->runtimePath.clear();
+    container->neuronListenerPath.clear();
+  }
+
   static bool assignContainerDescriptorOwnership(int descriptor, uid_t userID, gid_t groupID, String *failureReport = nullptr)
   {
     if (descriptor < 0)
@@ -5661,7 +5963,7 @@ private:
     {
       return false;
     }
-    if (fchmod(etcFD, 0755) != 0)
+    if (fchmodat(etcFD, "", 0755, AT_EMPTY_PATH) != 0)
     {
       if (failureReport)
       {
@@ -6827,6 +7129,28 @@ public:
   }
 
   // https://github.com/torvalds/linux/blob/master/Documentation/admin-guide/cgroup-v2.rst
+  static bool removeContainerCgroupTree(const Container *container)
+  {
+    String path;
+    prodigyContainerCgroupSlicePath(container->name, path);
+    for (uint32_t index = 0;
+         index + 1 < container->plan.config.maxPids &&
+         container->plan.config.isolatedChildMemoryMB != 0;
+         index += 1)
+    {
+      String child;
+      child.snprintf<"{}/isolated.{itoa}"_ctv>(path, index);
+      if (rmdir(child.c_str()) != 0 && errno != ENOENT)
+      {
+        return false;
+      }
+    }
+    String leaf;
+    leaf.snprintf<"{}/leaf"_ctv>(path);
+    return (rmdir(leaf.c_str()) == 0 || errno == ENOENT) &&
+           (rmdir(path.c_str()) == 0 || errno == ENOENT);
+  }
+
   static int create_cgroupv2(Container *container, String *failureReport = nullptr)
   {
     if (failureReport)
@@ -6846,6 +7170,14 @@ public:
     }
     String path;
     prodigyContainerCgroupSlicePath(container->name, path);
+    if (removeContainerCgroupTree(container) == false)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("existing container cgroup is not empty"_ctv);
+      }
+      return -1;
+    }
 
     int middirfd = Filesystem::createOpenDirectoryAt(-1, path);
     if (middirfd < 0)
@@ -6955,12 +7287,17 @@ public:
       }
     }
 
-    Filesystem::openWriteAtClose(leafdirfd, "cgroup.freeze"_ctv, "1"_ctv);
+    Filesystem::openWriteAtClose(leafdirfd, "cgroup.freeze"_ctv, "0"_ctv);
 
     if (isolatedChildren > 0)
     {
       const String controllers = "+cpu +memory +pids"_ctv;
-      if (Filesystem::openWriteAtClose(
+      if (fchownat(middirfd,
+                   "cgroup.procs",
+                   container->executionHostID,
+                   container->executionHostID,
+                   0) != 0 ||
+          Filesystem::openWriteAtClose(
               middirfd, "cgroup.subtree_control"_ctv, controllers) != int(controllers.size()))
       {
         Filesystem::close(leafdirfd);
@@ -7480,6 +7817,9 @@ public:
       }
     }
     container->isolatedChildCgroups.clear();
+    // destroy cgroup tree
+    (void)removeContainerCgroupTree(container);
+    cleanupContainerNeuronListener(container);
 
     // Best-effort external teardown (btrfs/cgroup shell calls) used to be skipped here.
     // Loop-backed storage leaves mounted filesystems and loop devices behind if we do nothing,
@@ -8965,7 +9305,57 @@ public:
     }
     logStartStage("metadata-ready");
 
+    int parentSupplementaryGroupCount = getgroups(0, nullptr);
+    if (parentSupplementaryGroupCount < 0)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to inspect parent supplementary groups for container {itoa}: {}"_ctv>(
+            container->plan.uuid,
+            String(strerror(errno)));
+      }
+      return false;
+    }
+    if (parentSupplementaryGroupCount > 0)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"parent supplementary groups not cleared for container {itoa}: count={itoa}"_ctv>(
+            container->plan.uuid,
+            uint64_t(uint32_t(parentSupplementaryGroupCount)));
+      }
+      return false;
+    }
+    logStartStage("groups-empty");
+
     bool exposeNeuronSocket = container->exposesNeuronSocket();
+    int neuronListenerFD = -1;
+    struct NeuronListenerCleanup {
+      Container *container = nullptr;
+      int *listenerFD = nullptr;
+      bool released = false;
+
+      ~NeuronListenerCleanup()
+      {
+        if (listenerFD != nullptr && *listenerFD >= 0)
+        {
+          close(*listenerFD);
+          *listenerFD = -1;
+        }
+        if (released == false)
+        {
+          ContainerManager::cleanupContainerNeuronListener(container);
+        }
+      }
+    } neuronListenerCleanup;
+    neuronListenerCleanup.container = container;
+    neuronListenerCleanup.listenerFD = &neuronListenerFD;
+    if (prepareContainerNeuronListener(container, neuronListenerFD, failureReport) == false)
+    {
+      return false;
+    }
+    logStartStage(exposeNeuronSocket ? "listener-ready" : "listener-skipped");
+
     int socs[2] = {-1, -1};
     auto closeNeuronSocketPair = [&]() -> void {
       if (socs[0] >= 0)
@@ -9051,6 +9441,21 @@ public:
 
     if (container->cgroup >= 0)
     {
+      int cgroupEvents = openat(container->cgroup, "cgroup.events", O_RDONLY | O_CLOEXEC);
+      if (cgroupEvents < 0)
+      {
+        const int cgroupErrno = errno;
+        seccomp_release(containerSeccomp);
+        if (failureReport)
+        {
+          failureReport->snprintf<"container cgroup became unavailable for {itoa}: {}"_ctv>(container->plan.uuid, String(strerror(cgroupErrno)));
+        }
+        close(startupSync[0]);
+        close(startupSync[1]);
+        closeNeuronSocketPair();
+        return false;
+      }
+      close(cgroupEvents);
       args.flags |= CLONE_INTO_CGROUP;
       args.cgroup = uint64_t(container->cgroup);
     }
@@ -9116,9 +9521,9 @@ public:
         failStartup("close privileged fds failed", &privilegedFDCloseFailure);
       }
 
-      const uint8_t groupsCleared = 1;
-      if (setgroups(0, nullptr) != 0 || getgroups(0, nullptr) != 0 ||
-          write(startupSync[0], &groupsCleared, sizeof(groupsCleared)) != ssize_t(sizeof(groupsCleared)))
+      const uint8_t groupsEmpty = 1;
+      if (getgroups(0, nullptr) != 0 ||
+          write(startupSync[0], &groupsEmpty, sizeof(groupsEmpty)) != ssize_t(sizeof(groupsEmpty)))
       {
         String groupsFailure = {};
         groupsFailure.snprintf<"failed to clear supplementary groups errno={}({})"_ctv>(errno, String(strerror(errno)));
@@ -9227,6 +9632,7 @@ public:
       }
 
       int execNeuronFD = exposeNeuronSocket ? socs[1] : -1;
+      int execNeuronListenerFD = exposeNeuronSocket ? neuronListenerFD : -1;
       String execDescriptorFailure = {};
       if (exposeNeuronSocket && moveContainerExecDescriptorAboveMinimum(execNeuronFD, &execDescriptorFailure) == false)
       {
@@ -9234,6 +9640,13 @@ public:
                    (unsigned long long)container->plan.uuid,
                    execDescriptorFailure.c_str());
         failStartup("move neuron fd failed", &execDescriptorFailure);
+      }
+      if (exposeNeuronSocket && moveContainerExecDescriptorAboveMinimum(execNeuronListenerFD, &execDescriptorFailure) == false)
+      {
+        basics_log("startContainer failed to move inherited neuron listener fd uuid=%llu reason=%s\n",
+                   (unsigned long long)container->plan.uuid,
+                   execDescriptorFailure.c_str());
+        failStartup("move neuron listener fd failed", &execDescriptorFailure);
       }
 
       int execParamsFD = -1;
@@ -9250,6 +9663,15 @@ public:
       }
       if (exposeNeuronSocket)
       {
+        String listenerFDText = {};
+        listenerFDText.assignItoa(uint64_t(execNeuronListenerFD));
+        if (setenv("PRODIGY_NEURON_LISTENER_FD", listenerFDText.c_str(), 1) != 0)
+        {
+          String listenerEnvironmentFailure = {};
+          listenerEnvironmentFailure.snprintf<"errno={}({})"_ctv>(errno, String(strerror(errno)));
+          failStartup("set neuron listener fd environment failed", &listenerEnvironmentFailure);
+        }
+
         ContainerParameters parameters;
         parameters.uuid = container->plan.uuid;
         parameters.deploymentID = container->plan.config.deploymentID();
@@ -9365,6 +9787,7 @@ public:
       else
       {
         unsetenv("PRODIGY_PARAMS_FD");
+        unsetenv("PRODIGY_NEURON_LISTENER_FD");
       }
 
       // The parent process is launched under stdbuf in tests, which injects
@@ -9432,10 +9855,15 @@ public:
         }
       }
 
+      Vector<int32_t> execAdditionalPreservedFDs = execIsolatedChildCgroups;
+      if (execNeuronListenerFD >= 0)
+      {
+        execAdditionalPreservedFDs.push_back(execNeuronListenerFD);
+      }
       if (closeAllContainerExecDescriptorsExcept(
               execNeuronFD,
               execParamsFD,
-              execIsolatedChildCgroups,
+              execAdditionalPreservedFDs,
               &execDescriptorFailure) == false)
       {
         basics_log("startContainer failed to sanitize inherited exec fds uuid=%llu reason=%s\n",
@@ -9514,6 +9942,11 @@ public:
       if (socs[1] >= 0)
       {
         close(socs[1]);
+      }
+      if (neuronListenerFD >= 0)
+      {
+        close(neuronListenerFD);
+        neuronListenerFD = -1;
       }
       uint8_t groupsCleared = 0;
       if (read(startupSync[1], &groupsCleared, sizeof(groupsCleared)) != ssize_t(sizeof(groupsCleared)) || groupsCleared != 1)
@@ -9706,6 +10139,7 @@ public:
                              (container->isFixedFile && container->fslot >= 0 ? Ring::getFDFromFixedFileSlot(container->fslot) : container->fd));
       }
       logStartStage("complete");
+      neuronListenerCleanup.released = true;
       return true;
     }
 
@@ -10113,6 +10547,8 @@ public:
       }
     }
 
+    cleanupContainerNeuronListener(container);
+
     // destroy subvolume
     String containerSubvolumePath = {};
     containerSubvolumePath.assign("/containers/"_ctv);
@@ -10156,20 +10592,7 @@ public:
     std::fflush(stderr);
 
     // destroy cgroup tree
-    prodigyContainerCgroupSlicePath(container->name, path);
-    for (uint32_t index = 0;
-         index + 1 < container->plan.config.maxPids &&
-         container->plan.config.isolatedChildMemoryMB != 0;
-         index += 1)
-    {
-      String child;
-      child.snprintf<"{}/isolated.{itoa}"_ctv>(path, index);
-      rmdir(child.c_str());
-    }
-    String leaf;
-    leaf.snprintf<"{}/leaf"_ctv>(path);
-    rmdir(leaf.c_str());
-    rmdir(path.c_str());
+    (void)removeContainerCgroupTree(container);
 
     std::fprintf(stderr, "destroyContainer cgroup-teardown-end uuid=%llu waitingForCloseEvent=%d\n",
                  (unsigned long long)container->plan.uuid,

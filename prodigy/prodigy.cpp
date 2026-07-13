@@ -22,6 +22,7 @@
 #include <utility>
 #include <sys/stat.h>
 #include <sys/file.h>
+#include <sys/utsname.h>
 
 // Canonical Prodigy entrypoint. First boot is seeded by --boot-json or
 // --boot-json-path and all later boots come from the local TidesDB-backed
@@ -130,6 +131,28 @@ static bool prodigyEnforceDevHostNetnsIsolation(String& failure)
     failure.snprintf<"refusing dev run: current netns inode {itoa} matches host netns inode {itoa}"_ctv>(
         currentNetnsInode,
         expectedHostNetnsInode);
+    return false;
+  }
+
+  return true;
+}
+
+static bool prodigyEnforceSupportedKernel(String& failure)
+{
+  struct utsname kernel = {};
+  if (uname(&kernel) != 0)
+  {
+    failure.assign("failed to read Linux kernel version"_ctv);
+    return false;
+  }
+
+  errno = 0;
+  char *terminal = nullptr;
+  unsigned long major = std::strtoul(kernel.release, &terminal, 10);
+  if (errno != 0 || terminal == kernel.release || terminal == nullptr ||
+      (terminal[0] != '.' && terminal[0] != '\0') || major < 7)
+  {
+    failure.snprintf<"Prodigy requires Linux kernel 7.0 or newer; found {}"_ctv>(String(kernel.release));
     return false;
   }
 
@@ -1311,6 +1334,12 @@ int main(int argc, char *argv[])
   }
 
   String failure;
+  if (prodigyEnforceSupportedKernel(failure) == false)
+  {
+    std::fprintf(stderr, "%s\n", failure.c_str());
+    return EXIT_FAILURE;
+  }
+
   if (bootJSON.size() == 0 && bootJSONPath.size() > 0 && prodigyReadTextFile(bootJSONPath, bootJSON, failure) == false)
   {
     std::fprintf(stderr, "failed to load prodigy boot json file: %s\n", failure.c_str());
@@ -1370,6 +1399,25 @@ int main(int argc, char *argv[])
     (void)std::fputc('\n', stdout);
     (void)std::fflush(stdout);
     return EXIT_SUCCESS;
+  }
+
+  if (setgroups(0, nullptr) != 0)
+  {
+    std::fprintf(stderr, "failed to clear Prodigy supplementary groups: %s\n", std::strerror(errno));
+    return EXIT_FAILURE;
+  }
+  int supplementaryGroupCount = getgroups(0, nullptr);
+  if (supplementaryGroupCount != 0)
+  {
+    if (supplementaryGroupCount < 0)
+    {
+      std::fprintf(stderr, "failed to verify Prodigy supplementary groups: %s\n", std::strerror(errno));
+    }
+    else
+    {
+      std::fprintf(stderr, "failed to clear Prodigy supplementary groups: list remains nonempty\n");
+    }
+    return EXIT_FAILURE;
   }
 
   setenv("PRODIGY_MOTHERSHIP_SOCKET", effectiveBootstrapConfig.controlSocketPath.c_str(), 1);

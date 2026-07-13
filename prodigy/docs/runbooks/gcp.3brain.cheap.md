@@ -4,7 +4,7 @@ This runbook creates a cheap 3-machine / 3-brain Prodigy cluster on GCP, polls i
 
 Validated cheap shape: `e2-medium`
 Validated zone: `us-central1-a`
-Validated image family: Ubuntu 24.04 LTS
+Required image contract: Linux kernel 7.0 or newer
 Validated auth mode: local `gcloud` bootstrap auth, then attached service account for runtime auth
 
 Keep early test runs short. Instances, disks, static IPs, templates, and VPC resources can continue to bill depending on provider behavior.
@@ -16,6 +16,7 @@ Keep early test runs short. Instances, disks, static IPs, templates, and VPC res
 - Authenticated GCP project.
 - Runtime service account.
 - Bootstrap SSH private key.
+- Machine image that boots Linux kernel 7.0 or newer.
 - TCP Fast Open enabled on target hosts.
 
 ## Required GCP permissions

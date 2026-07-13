@@ -645,6 +645,31 @@ int main(void)
 {
   TestSuite suite;
 
+  if (std::getenv("PRODIGY_TEST_HOST_PUBLIC_WHITEHOLE_LEASE_ONLY") != nullptr)
+  {
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+    ApplicationDeployment deployment;
+    Whitehole whitehole = {};
+    whitehole.source = ExternalAddressSource::hostPublicAddress;
+    whitehole.hasAddress = true;
+    whitehole.address = IPAddress("198.18.0.10", false);
+    whitehole.sourcePort = 49'152;
+    whitehole.bindingNonce = 1;
+    RoutableResourceLeaseOwner owner = {};
+    owner.applicationID = 7801;
+    owner.deploymentID = 780'100'001;
+    owner.lineageID = owner.applicationID;
+    suite.expect(deployment.reserveWhiteholeAddressPortLease(whitehole, owner),
+                 "whitehole_host_public_reserves_address_port_without_registered_prefix");
+    suite.expect(brain.routableResourceLeaseRuntimeState.size() == 1 &&
+                     brain.routableResourceLeaseRuntimeState[0].registeredPrefixUUID == 0,
+                 "whitehole_host_public_lease_has_no_registered_prefix");
+    thisBrain = savedBrain;
+    return suite.failed == 0 ? 0 : 1;
+  }
+
   {
     IPPrefix all4("0.0.0.0", false, 0);
     IPPrefix host4("203.0.113.9", false, 32);
@@ -2373,6 +2398,9 @@ int main(void)
       suite.expect(
           etcStatResult == 0 && etcStat.st_uid == fixtureWritableUserID() && etcStat.st_gid == fixtureWritableGroupID(),
           "rootfs_host_mount_targets_prepare_sets_etc_ownership");
+      suite.expect(
+          etcStatResult == 0 && (etcStat.st_mode & 07777) == 0755,
+          "rootfs_host_mount_targets_prepare_sets_etc_mode");
       suite.expect(
           resolvStatResult == 0 && resolvStat.st_uid == fixtureWritableUserID() && resolvStat.st_gid == fixtureWritableGroupID(),
           "rootfs_host_mount_targets_prepare_sets_resolv_conf_ownership");
@@ -7223,6 +7251,21 @@ int main(void)
     brain.brainConfig.runtimeEnvironment.test.enableFakeIpv4Boundary = true;
     fit = ApplicationDeployment::nFitOnMachine(&deployment, &worker, 1);
     suite.expect(fit == 1, "nFitOnMachine_whitehole_host_public_accepts_explicit_fake_ipv4_boundary");
+
+    Whitehole resolvedHostPublicWhitehole = deployment.plan.whiteholes[0];
+    RoutableResourceLeaseOwner hostPublicOwner = {};
+    hostPublicOwner.applicationID = 7801;
+    hostPublicOwner.deploymentID = 780'100'001;
+    hostPublicOwner.lineageID = hostPublicOwner.applicationID;
+    suite.expect(ApplicationDeployment::resolveWhiteholeSourceAddressForScheduling(&worker, resolvedHostPublicWhitehole),
+                 "whitehole_host_public_resolves_fake_boundary_address");
+    suite.expect(ApplicationDeployment::allocateWhiteholeSourcePort(resolvedHostPublicWhitehole),
+                 "whitehole_host_public_allocates_source_port");
+    suite.expect(deployment.reserveWhiteholeAddressPortLease(resolvedHostPublicWhitehole, hostPublicOwner),
+                 "whitehole_host_public_reserves_address_port_without_registered_prefix");
+    suite.expect(brain.routableResourceLeaseRuntimeState.size() == 1 &&
+                     brain.routableResourceLeaseRuntimeState[0].registeredPrefixUUID == 0,
+                 "whitehole_host_public_lease_has_no_registered_prefix");
 
     thisBrain = savedBrain;
   }

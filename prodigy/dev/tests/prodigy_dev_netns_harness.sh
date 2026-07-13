@@ -2602,7 +2602,7 @@ prepare_dev_cgroup_root()
    rm -rf "${dev_cgroup_root}" >/dev/null 2>&1 || true
    mkdir -p "${dev_cgroup_root}"
 
-   printf '+cpuset +memory +pids\n' > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+   printf '+cpuset +cpu +memory +pids\n' > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
 
    cpus="$(cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || true)"
    if [[ -n "${cpus}" ]]
@@ -2610,14 +2610,18 @@ prepare_dev_cgroup_root()
       printf '%s\n' "${cpus}" > "${dev_cgroup_root}/cpuset.cpus" 2>/dev/null || true
    fi
 
-   printf '+cpuset +memory +pids\n' > "${dev_cgroup_root}/cgroup.subtree_control" 2>/dev/null || true
+   printf '+cpuset +cpu +memory +pids\n' > "${dev_cgroup_root}/cgroup.subtree_control" 2>/dev/null || true
 }
 
 cleanup_dev_cgroup_root()
 {
    if [[ -n "${dev_cgroup_root}" && -d "${dev_cgroup_root}" ]]
    then
-      find "${dev_cgroup_root}" -depth -type d -exec rmdir {} + >/dev/null 2>&1 || true
+      while IFS= read -r cgroup_path
+      do
+         printf '%s\n' '-cpuset -cpu -memory -pids' > "${cgroup_path}/cgroup.subtree_control" 2>/dev/null || true
+         rmdir "${cgroup_path}" >/dev/null 2>&1 || true
+      done < <(find "${dev_cgroup_root}" -depth -type d)
    fi
 }
 
@@ -4906,6 +4910,7 @@ reserve_application_id_for_plan()
    local reserve_json=""
    local reserve_log=""
    local reserve_rc=0
+   local requested_app_id=""
    local assigned_app_id=""
    local resolved_plan_json=""
    local reserve_attempts="${PRODIGY_DEV_RESERVE_ATTEMPTS:-8}"
@@ -4920,7 +4925,13 @@ reserve_application_id_for_plan()
       app_name="HarnessApp.${log_suffix}"
    fi
 
-   reserve_json="{\"applicationName\":\"${app_name}\"}"
+   requested_app_id="$(extract_application_id_from_plan_json "${plan_json}" || true)"
+   if [[ -n "${requested_app_id}" ]]
+   then
+      reserve_json="{\"applicationName\":\"${app_name}\",\"requestedApplicationID\":${requested_app_id}}"
+   else
+      reserve_json="{\"applicationName\":\"${app_name}\"}"
+   fi
    reserve_log="${tmpdir}/mothership.reserve.${log_suffix}.log"
 
    if ! [[ "${reserve_attempts}" =~ ^[0-9]+$ ]] || [[ "${reserve_attempts}" -le 0 ]]
@@ -5138,7 +5149,7 @@ reserve_service_ids_for_plan()
          do
             reserve_rc=0
             run_timeout_in_child_netns "${reserve_ns}" 6s 2s "${reserve_log}" \
-               "${mothership_bin}" reserveServiceID dev "${reserve_json}" || reserve_rc=$?
+               env PRODIGY_STATE_DB="${state_db_path}" PRODIGY_MOTHERSHIP_SOCKET="${mothership_socket_path}" "${mothership_bin}" reserveServiceID local "${reserve_json}" || reserve_rc=$?
 
             if rg -q "reserveServiceID success=1" "${reserve_log}"
             then
@@ -5202,6 +5213,10 @@ extract_application_name_for_reservation_from_plan_json()
 
    plan_app_id="$(extract_application_id_from_plan_json "${plan_json}" || true)"
    case "${plan_app_id}" in
+      1)
+         echo "DNS"
+         return 0
+         ;;
       2)
          echo "Pulse"
          return 0
@@ -6537,6 +6552,7 @@ run_brain()
       then
          cat "${dev_cgroup_root}/cpuset.cpus.effective" > "${brain_cgroup_path}/cpuset.cpus" 2>/dev/null || true
       fi
+      mkdir -p "${brain_cgroup_path}/runtime"
    fi
 
    "${launch_prefix[@]}" \
@@ -6549,6 +6565,7 @@ run_brain()
          if [[ -n "${brain_cgroup_path}" && -w "${brain_cgroup_path}/cgroup.procs" ]]
          then
             printf "%s\n" "$$" > "${brain_cgroup_path}/cgroup.procs" || true
+            export PRODIGY_DEV_BRAIN_CGROUP_PATH="${brain_cgroup_path}"
             unshare_args=(-C -m)
          fi
 
@@ -6565,8 +6582,14 @@ run_brain()
          mkdir -p /mnt/prodigy-shared-store-host
          mkdir -p /mnt/prodigy-control-root
          mkdir -p /root
+         if [[ -n \"\${PRODIGY_DEV_BRAIN_CGROUP_PATH:-}\" ]]
+         then
+            printf \"%s\\n\" \"\$\$\" > \"\${PRODIGY_DEV_BRAIN_CGROUP_PATH}/runtime/cgroup.procs\"
+            printf \"+cpuset +cpu +memory +pids\\n\" > \"\${PRODIGY_DEV_BRAIN_CGROUP_PATH}/cgroup.subtree_control\"
+         fi
          mount --make-rprivate /
-         mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null || true
+         umount /sys/fs/cgroup
+         mount -t cgroup2 -o nsdelegate cgroup2 /sys/fs/cgroup
          mount --bind \"\${fs_store}\" /mnt/prodigy-shared-store-host
          mount --bind \"\${control_socket_root}\" /mnt/prodigy-control-root
          mount --bind \"\${fs_root}/root\" /root

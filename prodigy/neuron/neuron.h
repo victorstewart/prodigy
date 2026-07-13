@@ -3568,8 +3568,14 @@ public:
                 installDatacenterMeshRoutes(eth, lcsubnet6.dpfx);
               }
 
-              path.snprintf<"/containers/{}/neuron.soc"_ctv>(container->name);
-              container->setSocketPath(path.c_str());
+              container->assignNeuronListenerPath();
+              if (container->neuronListenerPath.size() == 0)
+              {
+                String empty;
+                reportContainerFailed(container->plan.uuid, 0, 0, empty, false);
+                continue;
+              }
+              container->setSocketPath(container->neuronListenerPath.c_str());
               pushContainer(container);
               noteTaskAttemptRunning(container->plan);
               ContainerManager::queueContainerWaitid(container);
@@ -4972,11 +4978,13 @@ public:
       {
         // The initial container control path can start as a unix socketpair,
         // but once the process is live the stable reconnect endpoint is the
-        // container-local /neuron.soc listener. Reconnect through that
-        // addressful socket for both pair-backed and non-pair streams.
-        String path;
-        path.snprintf<"/containers/{}/neuron.soc"_ctv>(container->name);
-        container->setSocketPath(path.c_str());
+        // host-owned runtime listener passed through exec. Reconnect through
+        // that addressful socket for both pair-backed and non-pair streams.
+        if (container->neuronListenerPath.size() == 0)
+        {
+          return;
+        }
+        container->setSocketPath(container->neuronListenerPath.c_str());
         container->recreateSocket();
         Ring::installFDIntoFixedFileSlot(container);
         if (container->isFixedFile && container->fslot >= 0)

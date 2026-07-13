@@ -1,4 +1,5 @@
 #include <prodigy/prodigy.h>
+#include <prodigy/neuron.hub.h>
 #include <limits.h>
 #include <services/debug.h>
 #include <prodigy/brain/brain.h>
@@ -12988,6 +12989,7 @@ static void testNeuronCloseHandlerPaths(TestSuite& suite)
       Container container = {};
       container.plan.uuid = uint128_t(0xC061);
       container.name.assign("unit-close-reconnect"_ctv);
+      container.assignNeuronListenerPath();
       container.pid = getpid();
       container.fd = oldFD;
       container.isFixedFile = false;
@@ -13016,6 +13018,7 @@ static void testNeuronCloseHandlerPaths(TestSuite& suite)
       Container container = {};
       container.plan.uuid = uint128_t(0xC062);
       container.name.assign("unit-close-pair-reconnect"_ctv);
+      container.assignNeuronListenerPath();
       container.pid = getpid();
       container.setUnixPairHalf(oldFD);
       container.isFixedFile = false;
@@ -13028,7 +13031,7 @@ static void testNeuronCloseHandlerPaths(TestSuite& suite)
       suite.expect(container.isPair == false, "neuron_close_handler_container_pair_reconnect_replaces_pair_with_socket_path");
       suite.expect(container.isFixedFile, "neuron_close_handler_container_pair_reconnect_reinstalls_fixed_file");
       suite.expect(container.fslot >= 0, "neuron_close_handler_container_pair_reconnect_assigns_fixed_slot");
-      suite.expect(String(container.daddr<struct sockaddr_un>()->sun_path).equal("/containers/unit-close-pair-reconnect/neuron.soc"_ctv), "neuron_close_handler_container_pair_reconnect_targets_neuron_socket");
+      suite.expect(String(container.daddr<struct sockaddr_un>()->sun_path).equal("/run/prodigy/containers/49250/neuron.soc"_ctv), "neuron_close_handler_container_pair_reconnect_targets_neuron_socket");
       suite.expect(TestNeuron::containerStreamIsClosingForTest(&container) == false, "neuron_close_handler_container_pair_reconnect_keeps_socket_open");
 
       neuron.unregisterContainerForTest(container.plan.uuid);
@@ -19719,6 +19722,90 @@ static void testGetMachinesPreservesTopologyIPv6ControlAddressOverSparseSnapshot
   thisNeuron = previousNeuron;
 }
 
+static void testContainerNeuronListenerContract(TestSuite& suite)
+{
+  unsetenv("PRODIGY_NEURON_LISTENER_FD");
+  suite.expect(prodigyNeuronHubListenerFDFromEnvironment() == -1, "neuron_listener_env_missing_rejected");
+  setenv("PRODIGY_NEURON_LISTENER_FD", "1x", 1);
+  suite.expect(prodigyNeuronHubListenerFDFromEnvironment() == -1, "neuron_listener_env_trailing_bytes_rejected");
+  setenv("PRODIGY_NEURON_LISTENER_FD", "999999999999999999999999", 1);
+  suite.expect(prodigyNeuronHubListenerFDFromEnvironment() == -1, "neuron_listener_env_overflow_rejected");
+
+  int pairFDs[2] = {-1, -1};
+  suite.require(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pairFDs) == 0, "neuron_listener_socketpair_created");
+  suite.expect(prodigyNeuronHubValidateListenerFD(pairFDs[0]) == false, "neuron_listener_connected_socket_rejected");
+  close(pairFDs[0]);
+  close(pairFDs[1]);
+
+  int inetFD = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  suite.require(inetFD >= 0, "neuron_listener_inet_socket_created");
+  if (inetFD >= 0)
+  {
+    struct sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    suite.require(bind(inetFD, reinterpret_cast<const struct sockaddr *>(&address), sizeof(address)) == 0 && listen(inetFD, 1) == 0,
+                  "neuron_listener_inet_listening");
+    suite.expect(prodigyNeuronHubValidateListenerFD(inetFD) == false, "neuron_listener_wrong_domain_rejected");
+    close(inetFD);
+  }
+
+  Container container;
+  container.plan.uuid = 18'446'744'073'709'551'001ULL;
+  ContainerManager::debugCleanupContainerNeuronListener(&container);
+  int listenerFD = -1;
+  String failure;
+  suite.require(ContainerManager::debugPrepareContainerNeuronListener(&container, listenerFD, &failure),
+                "neuron_listener_runtime_prepare");
+  if (listenerFD >= 0)
+  {
+    suite.expect(prodigyNeuronHubValidateListenerFD(listenerFD), "neuron_listener_validated");
+    String fdText = {};
+    fdText.assignItoa(uint64_t(listenerFD));
+    setenv("PRODIGY_NEURON_LISTENER_FD", fdText.c_str(), 1);
+    suite.expect(prodigyNeuronHubListenerFDFromEnvironment() == listenerFD, "neuron_listener_env_adopted");
+
+    struct stat socketStat = {};
+    suite.expect(lstat(container.neuronListenerPath.c_str(), &socketStat) == 0 && S_ISSOCK(socketStat.st_mode),
+                 "neuron_listener_path_is_socket");
+
+    int clientFD = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un address = {};
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, container.neuronListenerPath.data(), container.neuronListenerPath.size());
+    socklen_t addressLength = socklen_t(offsetof(struct sockaddr_un, sun_path) + container.neuronListenerPath.size() + 1);
+    suite.require(clientFD >= 0 && connect(clientFD, reinterpret_cast<const struct sockaddr *>(&address), addressLength) == 0,
+                  "neuron_listener_host_reconnect");
+    int acceptedFD = accept4(listenerFD, nullptr, nullptr, SOCK_CLOEXEC);
+    suite.expect(acceptedFD >= 0, "neuron_listener_accepts_reconnect");
+    if (acceptedFD >= 0)
+    {
+      close(acceptedFD);
+    }
+    if (clientFD >= 0)
+    {
+      close(clientFD);
+    }
+    close(listenerFD);
+    listenerFD = -1;
+
+    suite.require(ContainerManager::debugPrepareContainerNeuronListener(&container, listenerFD, &failure),
+                  "neuron_listener_stale_path_replaced");
+    suite.expect(prodigyNeuronHubValidateListenerFD(listenerFD), "neuron_listener_replacement_validated");
+  }
+
+  if (listenerFD >= 0)
+  {
+    close(listenerFD);
+  }
+  String runtimePath = {};
+  runtimePath.assign(container.runtimePath);
+  ContainerManager::debugCleanupContainerNeuronListener(&container);
+  suite.expect(access(runtimePath.c_str(), F_OK) != 0, "neuron_listener_runtime_cleanup");
+  unsetenv("PRODIGY_NEURON_LISTENER_FD");
+}
+
 int main(void)
 {
   TestSuite suite;
@@ -19734,6 +19821,7 @@ int main(void)
     createdRing = true;
   }
 
+  testContainerNeuronListenerContract(suite);
   testReplicationAcceptanceRules(suite);
   testCredentialBundleBuildAndApply(suite);
   testTlsResumptionRotationAckCoverage(suite);

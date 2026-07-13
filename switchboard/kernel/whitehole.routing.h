@@ -43,9 +43,9 @@ __attribute__((__always_inline__)) static inline bool whitehole_binding_matches(
   return lhs->nonce == rhs->nonce && lhs->container.hasID == rhs->container.hasID && bpf_memcmp(lhs->container.value, rhs->container.value, sizeof(lhs->container.value)) == 0;
 }
 
-__attribute__((__always_inline__)) static inline bool whitehole_reply_binding_lookup(const struct flow_key *flow,
-                                                                                      const struct switchboard_whitehole_binding *current,
-                                                                                      struct switchboard_whitehole_binding *binding)
+__attribute__((noinline)) static bool whitehole_reply_binding_lookup(const struct flow_key *flow,
+                                                                      const struct switchboard_whitehole_binding *current,
+                                                                      struct switchboard_whitehole_binding *binding)
 {
   if (flow == NULL || current == NULL || binding == NULL)
   {

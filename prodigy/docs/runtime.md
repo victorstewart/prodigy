@@ -2,6 +2,8 @@
 
 This document captures the runtime startup contract, persistent - state behavior, local / test cluster notes, and runtime update workflow.
 
+Prodigy requires Linux kernel 7.0 or newer and fails closed before loading runtime state on older kernels.
+
                                                                                                                   ##Startup seed
 
                                                                                                                       On first boot,
@@ -128,7 +130,7 @@ Hosts that back `/containers` with Btrfs can use squota for per-container storag
 
 Requirements:
 
-- Linux kernel `>= 6.7`;
+- Linux kernel `>= 7.0`;
 - recent `btrfs - progs` with squota support;
 - `btrfs quota enable -s /containers` at bootstrap.
 

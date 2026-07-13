@@ -7127,8 +7127,8 @@ public:
         break;
       }
     }
-    if (lease.registeredPrefixUUID == 0 ||
-        thisBrain->routablePrefixReleasePending(lease.registeredPrefixUUID))
+    if (whitehole.source == ExternalAddressSource::registeredRoutablePrefix &&
+        (lease.registeredPrefixUUID == 0 || thisBrain->routablePrefixReleasePending(lease.registeredPrefixUUID)))
     {
       return false;
     }

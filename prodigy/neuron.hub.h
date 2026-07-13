@@ -9,6 +9,7 @@
 #include <prodigy/wire.h>
 #include <prodigy/ingress.validation.h>
 #include <prodigy/statistics.h>
+#include <limits>
 
 #pragma once
 
@@ -33,6 +34,61 @@ static inline bool prodigyNeuronHubCanQueueToNeuron(bool isClosing, bool isFixed
 static inline bool prodigyNeuronHubShouldFlushBufferedNeuronFrames(bool canQueueToNeuron, bool pendingSend, uint32_t bufferedBytes)
 {
   return canQueueToNeuron && pendingSend == false && bufferedBytes > 0;
+}
+
+static inline bool prodigyNeuronHubValidateListenerFD(int fd)
+{
+  if (fd < 0 || fcntl(fd, F_GETFD) < 0)
+  {
+    return false;
+  }
+
+  int domain = 0;
+  int type = 0;
+  int accepting = 0;
+  socklen_t optionLength = sizeof(int);
+  if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &optionLength) != 0 || optionLength != sizeof(int))
+  {
+    return false;
+  }
+  optionLength = sizeof(int);
+  if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &optionLength) != 0 || optionLength != sizeof(int))
+  {
+    return false;
+  }
+  optionLength = sizeof(int);
+  if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &optionLength) != 0 || optionLength != sizeof(int))
+  {
+    return false;
+  }
+  return domain == AF_UNIX && type == SOCK_STREAM && accepting == 1;
+}
+
+static inline int prodigyNeuronHubListenerFDFromEnvironment(void)
+{
+  const char *value = getenv("PRODIGY_NEURON_LISTENER_FD");
+  if (value == nullptr || *value == '\0')
+  {
+    return -1;
+  }
+
+  uint64_t parsed = 0;
+  for (const char *cursor = value; *cursor != '\0'; ++cursor)
+  {
+    if (*cursor < '0' || *cursor > '9')
+    {
+      return -1;
+    }
+    uint64_t digit = uint64_t(*cursor - '0');
+    if (parsed > (uint64_t(std::numeric_limits<int>::max()) - digit) / 10)
+    {
+      return -1;
+    }
+    parsed = parsed * 10 + digit;
+  }
+
+  int fd = int(parsed);
+  return prodigyNeuronHubValidateListenerFD(fd) ? fd : -1;
 }
 
 class NeuronHub : public RingMultiplexer {
@@ -920,11 +976,14 @@ public:
   {
     RingDispatcher::installMultiplexer(this);
 
-    soc.setSocketPath("/neuron.soc");
-    soc.saddr_storage = soc.daddr_storage;
-    soc.saddrLen = soc.daddrLen;
-    soc.recreateSocket();
-    soc.bindThenListen();
+    soc.fd = prodigyNeuronHubListenerFDFromEnvironment();
+    if (soc.fd < 0)
+    {
+      basics_log("NeuronHub missing or invalid PRODIGY_NEURON_LISTENER_FD\n");
+      std::abort();
+    }
+    soc.isPair = false;
+    soc.isFixedFile = false;
     neuron.rBuffer.reserve(8_KB);
     neuron.wBuffer.reserve(16_KB);
   }

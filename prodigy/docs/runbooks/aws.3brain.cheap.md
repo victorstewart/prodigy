@@ -14,7 +14,7 @@ Keep early test runs short. Public IPv4 addresses, disks, launch templates, and 
 - Local AWS CLI v2.
 - Authenticated AWS profile.
 - Bootstrap SSH private key.
-- Ubuntu 24.04 AMI ID for the target region.
+- AMI ID that boots Linux kernel 7.0 or newer in the target region.
 - TCP Fast Open enabled on target hosts.
 
 ## Required AWS permissions
@@ -62,7 +62,7 @@ aws sso login --profile "${AWS_PROFILE}"
 aws sts get-caller-identity --profile "${AWS_PROFILE}"
 ```
 
-To re-resolve the Ubuntu 24.04 AMI used by the runbook:
+Resolve an AMI that boots Linux kernel 7.0 or newer and set `AWS_AMI_ID` to that image. The Ubuntu 24.04 resolver below is retained only as a base-image discovery example; its stock kernel is unsupported until the image is upgraded:
 
 ```bash
 python - <<'PY_AWS_AMI'

@@ -17,7 +17,7 @@ set(
 )
 set(
   PRODIGY_BASICS_RELEASE_DEPOFILE_URL
-  "https://github.com/victorstewart/basics/releases/download/v0.4.0/basics.DepoFile"
+  "https://github.com/victorstewart/basics/releases/download/v0.4.1/basics.DepoFile"
   CACHE STRING
   "Published Basics detached DepoFile asset URL"
 )

@@ -27,7 +27,7 @@ cd prodigy
 
 Requirements:
 
-- Linux for runtime/container/networking work;
+- Linux kernel 7.0 or newer for runtime/container/networking work;
 - CMake;
 - a C++20-capable toolchain;
 - Rust and Cargo for Discombobulator;
