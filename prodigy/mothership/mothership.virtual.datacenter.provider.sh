@@ -48,6 +48,7 @@ run_machine()
    boot_json="$(<"${boot_path}")"
    local environment=(
       "PRODIGY_DEV_MODE=1"
+      "PRODIGY_DEV_TEST_OVERCOMMIT_CPUS=1"
       "PRODIGY_HOST_NETNS_INO=${host_netns_inode}"
       "PRODIGY_BOOTSTRAP_BRAIN_COUNT=${brain_count}"
       "PRODIGY_DEV_SHARED_TRANSPORT_TLS_DIR=/containers/store/prodigy-transport-tls"

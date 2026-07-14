@@ -538,6 +538,34 @@ int main(void)
   suite.expect(prodigyContainerReservedCoreCount(2) == 0, "small_cpuset_reserves_zero_container_cores_two_cpus");
   suite.expect(prodigyContainerReservedCoreCount(3) == nReservedCores, "larger_cpuset_keeps_default_reserved_cores");
 
+  const char *savedDevMode = getenv("PRODIGY_DEV_MODE");
+  const char *savedOvercommit = getenv("PRODIGY_DEV_TEST_OVERCOMMIT_CPUS");
+  String savedDevModeText;
+  String savedOvercommitText;
+  bool hadDevMode = savedDevMode != nullptr;
+  bool hadOvercommit = savedOvercommit != nullptr;
+  if (hadDevMode)
+  {
+    savedDevModeText.assign(savedDevMode);
+  }
+  if (hadOvercommit)
+  {
+    savedOvercommitText.assign(savedOvercommit);
+  }
+
+  unsetenv("PRODIGY_DEV_MODE");
+  unsetenv("PRODIGY_DEV_TEST_OVERCOMMIT_CPUS");
+  suite.expect(prodigyTestClusterOvercommitsCPUs() == false, "production_cpuset_partitions_remain_exclusive");
+  setenv("PRODIGY_DEV_TEST_OVERCOMMIT_CPUS", "1", 1);
+  suite.expect(prodigyTestClusterOvercommitsCPUs() == false, "cpu_overcommit_requires_dev_mode");
+  setenv("PRODIGY_DEV_MODE", "1", 1);
+  suite.expect(prodigyTestClusterOvercommitsCPUs(), "test_cluster_can_overcommit_host_cpus");
+  setenv("PRODIGY_DEV_TEST_OVERCOMMIT_CPUS", "true", 1);
+  suite.expect(prodigyTestClusterOvercommitsCPUs() == false, "cpu_overcommit_requires_exact_opt_in");
+
+  hadDevMode ? setenv("PRODIGY_DEV_MODE", savedDevModeText.c_str(), 1) : unsetenv("PRODIGY_DEV_MODE");
+  hadOvercommit ? setenv("PRODIGY_DEV_TEST_OVERCOMMIT_CPUS", savedOvercommitText.c_str(), 1) : unsetenv("PRODIGY_DEV_TEST_OVERCOMMIT_CPUS");
+
   suite.expect(runSeccompProbe(false, false, ProbeKind::ptraceTraceMe) == 0, "unfiltered_ptrace_traceme_succeeds");
   suite.expect(runSeccompProbe(true, false, ProbeKind::ptraceTraceMe) == 0, "default_filter_blocks_ptrace_traceme");
   suite.expect(runSeccompProbe(false, false, ProbeKind::unshareFiles) == 0, "unfiltered_unshare_files_succeeds");

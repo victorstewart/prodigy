@@ -59,6 +59,14 @@ static inline uint16_t prodigyContainerReservedCoreCount(uint32_t lcoreCount)
   return (lcoreCount > nReservedCores) ? uint16_t(nReservedCores) : uint16_t(0);
 }
 
+static inline bool prodigyTestClusterOvercommitsCPUs()
+{
+  const char *devMode = getenv("PRODIGY_DEV_MODE");
+  const char *overcommit = getenv("PRODIGY_DEV_TEST_OVERCOMMIT_CPUS");
+  return devMode && devMode[0] == '1' && devMode[1] == '\0' &&
+         overcommit && overcommit[0] == '1' && overcommit[1] == '\0';
+}
+
 static inline void prodigyBuildContainerStartupFlags(const ContainerPlan& plan, Vector<uint64_t>& flags)
 {
   flags.clear();
@@ -6957,7 +6965,10 @@ public:
     uint16_t firstContainerCore = (reservedCores < thisNeuron->lcoreCount) ? reservedCores : thisNeuron->lcoreCount - 1;
     cpusRange.snprintf<"{itoa}-{itoa}"_ctv>(firstContainerCore, endIdx);
     Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/containers.slice/cpuset.cpus"_ctv, cpusRange);
-    Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/containers.slice/cpuset.cpus.partition"_ctv, "isolated"_ctv);
+    if (prodigyTestClusterOvercommitsCPUs() == false)
+    {
+      Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/containers.slice/cpuset.cpus.partition"_ctv, "isolated"_ctv);
+    }
 #if PRODIGY_DEBUG
     basics_log("seed_root_cgroupv2_subtree_controllers complete range=%s lcoreCount=%u\n", cpusRange.c_str(), unsigned(thisNeuron->lcoreCount));
 #endif
@@ -7149,7 +7160,10 @@ public:
 
     // }
 
-    Filesystem::openWriteAtClose(middirfd, "cpuset.cpus.partition"_ctv, "root"_ctv);
+    if (prodigyTestClusterOvercommitsCPUs() == false)
+    {
+      Filesystem::openWriteAtClose(middirfd, "cpuset.cpus.partition"_ctv, "root"_ctv);
+    }
 
     String maxPids_string;
     maxPids_string.assignItoa(container->plan.config.maxPids);
