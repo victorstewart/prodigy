@@ -143,7 +143,7 @@ assert_link_budget()
 harness_pid="$!"
 
 if ! timeout 180s bash -lc '
-   while [[ ! -s "'"${manifest_path}"'" ]]
+   while [[ ! -s "'"${manifest_path}"'" ]] || ! grep -Fq "MOTHERSHIP_BOOTSTRAP success" "'"${harness_log}"'"
    do
       if ! kill -0 "'"${harness_pid}"'" >/dev/null 2>&1
       then
@@ -180,26 +180,27 @@ then
    fail "expected 3 brain pids in manifest, saw ${#brain_pids[@]}"
 fi
 
-parent_bridge_mtu="$(extract_link_mtu nsenter -t "${parent_pid}" -n ip -o link show dev prodigy-br0)"
-assert_link_mtu "${parent_bridge_mtu}" "parent_ns/prodigy-br0"
+parent_netns=(nsenter -t "${parent_pid}" -m -- ip netns exec "${parent_ns}")
+parent_bridge_mtu="$(extract_link_mtu "${parent_netns[@]}" ip -o link show dev vdcbr0)"
+assert_link_mtu "${parent_bridge_mtu}" "parent_ns/vdcbr0"
 
 for idx in 1 2 3
 do
-   parent_if_mtu="$(extract_link_mtu nsenter -t "${parent_pid}" -n ip -o link show dev "bp${idx}")"
-   assert_link_mtu "${parent_if_mtu}" "parent_ns/bp${idx}"
-   parent_if_gso="$(extract_link_detail_field gso_max_size nsenter -t "${parent_pid}" -n ip -details link show dev "bp${idx}")"
-   assert_link_budget "${parent_if_gso}" "gso_max_size" "parent_ns/bp${idx}"
-   parent_if_gso_segs="$(extract_link_detail_field gso_max_segs nsenter -t "${parent_pid}" -n ip -details link show dev "bp${idx}")"
+   parent_if_mtu="$(extract_link_mtu "${parent_netns[@]}" ip -o link show dev "vp${idx}")"
+   assert_link_mtu "${parent_if_mtu}" "parent_ns/vp${idx}"
+   parent_if_gso="$(extract_link_detail_field gso_max_size "${parent_netns[@]}" ip -details link show dev "vp${idx}")"
+   assert_link_budget "${parent_if_gso}" "gso_max_size" "parent_ns/vp${idx}"
+   parent_if_gso_segs="$(extract_link_detail_field gso_max_segs "${parent_netns[@]}" ip -details link show dev "vp${idx}")"
    if [[ "${parent_if_gso_segs}" != "1" ]]
    then
-      fail "parent_ns/bp${idx} gso_max_segs=${parent_if_gso_segs} expected=1"
+      fail "parent_ns/vp${idx} gso_max_segs=${parent_if_gso_segs} expected=1"
    fi
-   parent_if_gso_ipv4="$(extract_link_detail_field gso_ipv4_max_size nsenter -t "${parent_pid}" -n ip -details link show dev "bp${idx}")"
-   assert_link_budget "${parent_if_gso_ipv4}" "gso_ipv4_max_size" "parent_ns/bp${idx}"
-   parent_if_gro="$(extract_link_detail_field gro_max_size nsenter -t "${parent_pid}" -n ip -details link show dev "bp${idx}")"
-   assert_link_budget "${parent_if_gro}" "gro_max_size" "parent_ns/bp${idx}"
-   parent_if_gro_ipv4="$(extract_link_detail_field gro_ipv4_max_size nsenter -t "${parent_pid}" -n ip -details link show dev "bp${idx}")"
-   assert_link_budget "${parent_if_gro_ipv4}" "gro_ipv4_max_size" "parent_ns/bp${idx}"
+   parent_if_gso_ipv4="$(extract_link_detail_field gso_ipv4_max_size "${parent_netns[@]}" ip -details link show dev "vp${idx}")"
+   assert_link_budget "${parent_if_gso_ipv4}" "gso_ipv4_max_size" "parent_ns/vp${idx}"
+   parent_if_gro="$(extract_link_detail_field gro_max_size "${parent_netns[@]}" ip -details link show dev "vp${idx}")"
+   assert_link_budget "${parent_if_gro}" "gro_max_size" "parent_ns/vp${idx}"
+   parent_if_gro_ipv4="$(extract_link_detail_field gro_ipv4_max_size "${parent_netns[@]}" ip -details link show dev "vp${idx}")"
+   assert_link_budget "${parent_if_gro_ipv4}" "gro_ipv4_max_size" "parent_ns/vp${idx}"
 done
 
 for idx in 0 1 2

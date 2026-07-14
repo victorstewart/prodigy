@@ -2357,7 +2357,15 @@ private:
     String vpcID = {};
     String subnetID = {};
     String groupID = {};
-    if (co_await findDefaultVPC(coro, vpcID, failure) == false || co_await findBootstrapSubnet(coro, vpcID, subnetID, failure) == false || co_await findBootstrapSecurityGroup(coro, vpcID, groupID, failure) == false)
+    if (co_await findDefaultVPC(coro, vpcID, failure) == false)
+    {
+      co_return false;
+    }
+    if (co_await findBootstrapSubnet(coro, vpcID, subnetID, failure) == false)
+    {
+      co_return false;
+    }
+    if (co_await findBootstrapSecurityGroup(coro, vpcID, groupID, failure) == false)
     {
       co_return false;
     }

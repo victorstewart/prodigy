@@ -273,11 +273,7 @@ public:
 
   void prepare(int argc, char *argv[])
   {
-    int truncateFD = open("/whitehole_probe_trace.log", O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
-    if (truncateFD >= 0)
-    {
-      close(truncateFD);
-    }
+    appendTrace("probe.start");
 
     Ring::createRing(64, 128, 512, 128, -1, -1, 0);
 

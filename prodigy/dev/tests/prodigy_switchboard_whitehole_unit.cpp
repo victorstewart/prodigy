@@ -1958,6 +1958,10 @@ int main(void)
 
     if (ingressProgram.prog_fd >= 0)
     {
+      container_network_policy networkPolicy = {};
+      networkPolicy.mode = CONTAINER_NETWORK_UNRESTRICTED;
+      ingressProgram.setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
+
       uint8_t outerSrc[16] = {0xfd, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0b};
       uint8_t outerDst[16] = {0xfd, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0c};
       uint8_t innerSrc[16] = {};

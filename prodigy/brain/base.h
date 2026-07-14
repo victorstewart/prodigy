@@ -11,6 +11,7 @@
 #include <networking/message.h>
 #include <networking/ring.h>
 #include <prodigy/version.h>
+#include <prodigy/debug.h>
 #include <prodigy/iaas/iaas.h>
 #include <prodigy/neuron/base.h>
 #include <prodigy/containerstore.h>
@@ -160,7 +161,7 @@ public:
   {
     if (canQueueSend() == false)
     {
-      std::fprintf(stderr,
+      PRODIGY_DEBUG_LOG(
                    "prodigy debug brain registration-skip private4=%u connected=%d isFixed=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d closing=%d tls=%d negotiated=%d wbytes=%u\n",
                    private4,
                    int(connected),
@@ -173,7 +174,7 @@ public:
                    int(transportTLSEnabled()),
                    int(isTLSNegotiated()),
                    uint32_t(wBuffer.outstandingBytes()));
-      std::fflush(stderr);
+      PRODIGY_DEBUG_FLUSH();
       return;
     }
 
@@ -193,7 +194,7 @@ public:
     Message::finish(wBuffer, headerOffset);
 
     Ring::queueSend(this);
-    std::fprintf(stderr,
+    PRODIGY_DEBUG_LOG(
                  "prodigy debug brain registration-queued private4=%u connected=%d isFixed=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d tls=%d negotiated=%d sendBytes=%u queuedBytes=%llu wbytes=%u\n",
                  private4,
                  int(connected),
@@ -207,7 +208,7 @@ public:
                  unsigned(pendingSendBytes),
                  (unsigned long long)queuedSendOutstandingBytes(),
                  uint32_t(wBuffer.outstandingBytes()));
-    std::fflush(stderr);
+    PRODIGY_DEBUG_FLUSH();
   }
 
   void sendMasterMissing(void)
@@ -632,7 +633,7 @@ protected:
           machine->neuron.connectTimeoutMs,
           machine->neuron.nDefaultAttemptsBudget));
       machine->neuron.attemptConnect();
-      std::fprintf(stderr,
+      PRODIGY_DEBUG_LOG(
                    "prodigy debug neuron-control-connect-submit source=base-arm uuid=%llu private4=%u fd=%d fslot=%d pendingConnect=%d pendingSend=%d pendingRecv=%d daddrLen=%u\n",
                    (unsigned long long)machine->uuid,
                    unsigned(machine->private4),
@@ -642,7 +643,7 @@ protected:
                    int(machine->neuron.pendingSend),
                    int(machine->neuron.pendingRecv),
                    unsigned(machine->neuron.daddrLen));
-      std::fflush(stderr);
+      PRODIGY_DEBUG_FLUSH();
     }
   }
 
@@ -671,7 +672,7 @@ public:
 
   void finishMachineConfig(Machine *machine)
   {
-    std::fprintf(stderr, "prodigy machine finish-config begin machine=%p uuid=%llu private4=%u isBrain=%d isThisMachine=%d slug=%s fd=%d isFixed=%d fslot=%d\n",
+    PRODIGY_DEBUG_LOG( "prodigy machine finish-config begin machine=%p uuid=%llu private4=%u isBrain=%d isThisMachine=%d slug=%s fd=%d isFixed=%d fslot=%d\n",
                  machine,
                  (unsigned long long)(machine ? machine->uuid : 0),
                  unsigned(machine ? machine->private4 : 0),
@@ -681,7 +682,7 @@ public:
                  machine ? machine->neuron.fd : -1,
                  machine ? int(machine->neuron.isFixedFile) : 0,
                  machine ? machine->neuron.fslot : -1);
-    std::fflush(stderr);
+    PRODIGY_DEBUG_FLUSH();
 
     if (auto rackIt = racks.find(machine->rackUUID); rackIt != racks.end())
     {
@@ -753,38 +754,38 @@ public:
 
     // Register the Machine* as a multiplexee so timeouts that use
     // packet->originator = machine route back to this Brain
-    std::fprintf(stderr, "prodigy machine finish-config install-multiplexee machine=%p uuid=%llu private4=%u\n",
+    PRODIGY_DEBUG_LOG( "prodigy machine finish-config install-multiplexee machine=%p uuid=%llu private4=%u\n",
                  machine,
                  (unsigned long long)machine->uuid,
                  unsigned(machine->private4));
-    std::fflush(stderr);
+    PRODIGY_DEBUG_FLUSH();
     RingDispatcher::installMultiplexee(machine, this);
 
     if (canControlNeurons() == false)
     {
       // Architecture rule: only the active master owns neuron control sockets.
-      std::fprintf(stderr, "prodigy machine finish-config skip-control machine=%p uuid=%llu private4=%u\n",
+      PRODIGY_DEBUG_LOG( "prodigy machine finish-config skip-control machine=%p uuid=%llu private4=%u\n",
                    machine,
                    (unsigned long long)machine->uuid,
                    unsigned(machine->private4));
-      std::fflush(stderr);
+      PRODIGY_DEBUG_FLUSH();
       return;
     }
 
-    std::fprintf(stderr, "prodigy machine finish-config arm-control machine=%p uuid=%llu private4=%u\n",
+    PRODIGY_DEBUG_LOG( "prodigy machine finish-config arm-control machine=%p uuid=%llu private4=%u\n",
                  machine,
                  (unsigned long long)machine->uuid,
                  unsigned(machine->private4));
-    std::fflush(stderr);
+    PRODIGY_DEBUG_FLUSH();
     armMachineNeuronControl(machine);
-    std::fprintf(stderr, "prodigy machine finish-config done machine=%p uuid=%llu private4=%u fd=%d isFixed=%d fslot=%d\n",
+    PRODIGY_DEBUG_LOG( "prodigy machine finish-config done machine=%p uuid=%llu private4=%u fd=%d isFixed=%d fslot=%d\n",
                  machine,
                  (unsigned long long)machine->uuid,
                  unsigned(machine->private4),
                  machine->neuron.fd,
                  int(machine->neuron.isFixedFile),
                  machine->neuron.fslot);
-    std::fflush(stderr);
+    PRODIGY_DEBUG_FLUSH();
   }
 
   void spinMachines(CoroutineStack *coro, MachineLifetime lifetime, const MachineConfig& config, uint32_t count)

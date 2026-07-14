@@ -147,7 +147,6 @@ static void appendClusterMachineConfig(MothershipProdigyCluster& cluster, const 
 struct ControlServerState {
   std::atomic<bool> stopRequested = false;
   uint32_t acceptCount = 0;
-  bool sawConfigure = false;
   bool sawPullClusterReport = false;
   bool sawMeasureApplication = false;
   bool sawSpinApplication = false;
@@ -1137,92 +1136,6 @@ static bool handleDeployStep(
   return sendAll(clientFD, response, failure);
 }
 
-static bool handleConfigureTestClusterStep(
-    int clientFD,
-    ControlServerState& state,
-    const String& expectedControlSocketPath,
-    uint8_t expectedDatacenterFragment,
-    uint32_t expectedAutoscaleIntervalSeconds,
-    uint32_t expectedBrainCount,
-    const String& expectedMachineSchema,
-    MachineConfig::MachineKind expectedMachineKind,
-    uint32_t expectedLogicalCores,
-    uint32_t expectedMemoryMB,
-    uint32_t expectedStorageMB,
-    String& failure)
-{
-  String frame = {};
-  if (recvOneMessageFrame(clientFD, frame, failure) == false)
-  {
-    return false;
-  }
-
-  Message *message = reinterpret_cast<Message *>(const_cast<uint8_t *>(frame.data()));
-  if (MothershipTopic(message->topic) != MothershipTopic::configure)
-  {
-    failure.assign("unexpected topic for configureTestCluster request"_ctv);
-    return false;
-  }
-
-  state.sawConfigure = true;
-
-  uint8_t *args = message->args;
-  String serialized = {};
-  Message::extractToStringView(args, serialized);
-
-  BrainConfig config = {};
-  if (BitseryEngine::deserializeSafe(serialized, config) == false)
-  {
-    failure.assign("failed to deserialize configureTestCluster BrainConfig"_ctv);
-    return false;
-  }
-
-  if (config.datacenterFragment != expectedDatacenterFragment)
-  {
-    failure.assign("configureTestCluster datacenterFragment mismatch"_ctv);
-    return false;
-  }
-
-  if (config.autoscaleIntervalSeconds != expectedAutoscaleIntervalSeconds)
-  {
-    failure.assign("configureTestCluster autoscaleIntervalSeconds mismatch"_ctv);
-    return false;
-  }
-
-  if (config.requiredBrainCount != expectedBrainCount)
-  {
-    failure.assign("configureTestCluster requiredBrainCount mismatch"_ctv);
-    return false;
-  }
-
-  if (config.controlSocketPath.equals(expectedControlSocketPath) == false)
-  {
-    failure.assign("configureTestCluster controlSocketPath mismatch"_ctv);
-    return false;
-  }
-
-  auto it = config.configBySlug.find(expectedMachineSchema);
-  if (it == config.configBySlug.end())
-  {
-    failure.assign("configureTestCluster missing machineConfig schema"_ctv);
-    return false;
-  }
-
-  const MachineConfig& machineConfig = it->second;
-  if (machineConfig.kind != expectedMachineKind || machineConfig.nLogicalCores != expectedLogicalCores || machineConfig.nMemoryMB != expectedMemoryMB || machineConfig.nStorageMB != expectedStorageMB)
-  {
-    failure.assign("configureTestCluster machineConfig mismatch"_ctv);
-    return false;
-  }
-
-  String responseSerialized = {};
-  BrainConfig responseConfig = config;
-  BitseryEngine::serialize(responseSerialized, responseConfig);
-  String response = {};
-  Message::construct(response, MothershipTopic::configure, responseSerialized);
-  return sendAll(clientFD, response, failure);
-}
-
 int main(void)
 {
   TestSuite suite = {};
@@ -1344,117 +1257,6 @@ int main(void)
     server.stopRequested.store(true);
     serverThread.join();
     return EXIT_FAILURE;
-  }
-
-  ScopedUnixListener configureListener = {};
-  setupFailure.clear();
-  bool configureListenerReady = createUnixListener(configureListener, setupFailure);
-  suite.expect(configureListenerReady, "configure_test_cluster_unix_listener_created");
-  if (configureListenerReady == false)
-  {
-    if (setupFailure.size() > 0)
-    {
-      basics_log("configure test cluster listener setup failure: %s\n", setupFailure.c_str());
-    }
-
-    server.stopRequested.store(true);
-    serverThread.join();
-    return EXIT_FAILURE;
-  }
-
-  String configureWorkspaceRoot = {};
-  configureWorkspaceRoot.assign(dbRoot);
-  configureWorkspaceRoot.append("/w"_ctv);
-  std::filesystem::create_directories(std::filesystem::path(configureWorkspaceRoot.c_str()));
-
-  String configureSocketAlias = {};
-  configureSocketAlias.assign(configureWorkspaceRoot);
-  configureSocketAlias.append("/prodigy-mothership.sock"_ctv);
-  (void)::unlink(configureSocketAlias.c_str());
-  int configureSocketAliasStatus = ::symlink(configureListener.path.c_str(), configureSocketAlias.c_str());
-  suite.expect(configureSocketAliasStatus == 0, "configure_test_cluster_socket_alias_created");
-  if (configureSocketAliasStatus != 0)
-  {
-    basics_log("configure test cluster symlink failed: %s\n", std::strerror(errno));
-    server.stopRequested.store(true);
-    serverThread.join();
-    return EXIT_FAILURE;
-  }
-
-  ControlServerState configureServer = {};
-  std::thread configureServerThread([&]() {
-    auto closeClient = [](int clientFD) -> void {
-      if (clientFD >= 0)
-      {
-        (void)::shutdown(clientFD, SHUT_RDWR);
-        ::close(clientFD);
-      }
-    };
-
-    String stepFailure = {};
-    int clientFD = -1;
-    if (acceptNextClient(configureListener.fd, configureServer, clientFD) == false)
-    {
-      return;
-    }
-
-    if (handleConfigureTestClusterStep(
-            clientFD,
-            configureServer,
-            configureSocketAlias,
-            17,
-            9,
-            3,
-            "dev-baremetal"_ctv,
-            MachineConfig::MachineKind::bareMetal,
-            8,
-            16'384,
-            262'144,
-            stepFailure) == false)
-    {
-      configureServer.failure = stepFailure;
-      configureServer.stopRequested.store(true);
-      closeClient(clientFD);
-      return;
-    }
-
-    closeClient(clientFD);
-  });
-
-  String configureOutput = {};
-  int configureExitCode = -1;
-  bool ranConfigureTestCluster = runMothershipCommand(
-      binaryPath,
-      dbRoot,
-      {"configureTestCluster",
-       std::string(configureWorkspaceRoot.c_str()),
-       "3",
-       "3",
-       "private6",
-       "0",
-       "9000",
-       "17",
-       "9",
-       "dev-baremetal",
-       "bareMetal",
-       "8",
-       "16384",
-       "262144"},
-      configureOutput,
-      configureExitCode);
-  suite.expect(ranConfigureTestCluster, "run_configure_test_cluster_command");
-  suite.expect(configureExitCode == EXIT_SUCCESS, "configure_test_cluster_exit_success");
-  suite.expect(stringContains(configureOutput, "configureTestCluster success=1"), "configure_test_cluster_reports_success");
-
-  configureServer.stopRequested.store(true);
-  configureServerThread.join();
-
-  suite.expect(configureServer.failure.size() == 0, "configure_test_cluster_server_no_failure");
-  suite.expect(configureServer.acceptCount == 1, "configure_test_cluster_server_accept_count");
-  suite.expect(configureServer.sawConfigure, "configure_test_cluster_server_saw_configure");
-  if (configureServer.failure.size() > 0)
-  {
-    basics_log("configure test cluster server failure: %s\n", configureServer.failure.c_str());
   }
 
   String clusterReportOutput = {};
@@ -1780,22 +1582,50 @@ int main(void)
         deployExitCode == EXIT_SUCCESS,
         "deploy_smoke_handles_progress_and_finished_when_they_share_one_read");
 
-    ScopedUnixListener localHarnessListener = {};
+    ScopedUnixListener testClusterListener = {};
     setupFailure.clear();
-    bool localHarnessListenerReady = createUnixListener(localHarnessListener, setupFailure);
-    suite.expect(localHarnessListenerReady, "deploy_local_test_harness_unix_listener_created");
-    if (localHarnessListenerReady == false)
+    bool testClusterListenerReady = createUnixListener(testClusterListener, setupFailure);
+    suite.expect(testClusterListenerReady, "deploy_test_cluster_unix_listener_created");
+    if (testClusterListenerReady == false)
     {
       if (setupFailure.size() > 0)
       {
-        basics_log("deploy local test harness listener setup failure: %s\n", setupFailure.c_str());
+        basics_log("deploy test cluster listener setup failure: %s\n", setupFailure.c_str());
       }
 
       return EXIT_FAILURE;
     }
 
-    ControlServerState localHarnessServer = {};
-    std::thread localHarnessServerThread([&]() {
+    MothershipProdigyCluster testDeployCluster = {};
+    testDeployCluster.name = "cluster-deploy-test"_ctv;
+    testDeployCluster.deploymentMode = MothershipClusterDeploymentMode::test;
+    testDeployCluster.architecture = currentArchitecture;
+    testDeployCluster.nBrains = 1;
+    testDeployCluster.test.specified = true;
+    testDeployCluster.test.workspaceRoot.assign(dbRoot);
+    testDeployCluster.test.workspaceRoot.append("/deploy-test-cluster"_ctv);
+    testDeployCluster.test.machineCount = 1;
+    std::filesystem::create_directories(std::filesystem::path(testDeployCluster.test.workspaceRoot.c_str()));
+    String testControlPath = {};
+    testControlPath.assign(testDeployCluster.test.workspaceRoot);
+    testControlPath.append("/prodigy-mothership.sock"_ctv);
+    (void)::unlink(testControlPath.c_str());
+    suite.expect(::symlink(testClusterListener.path.c_str(), testControlPath.c_str()) == 0, "deploy_test_cluster_control_alias_created");
+    {
+      String failure = {};
+      MothershipClusterRegistry registry;
+      MothershipProdigyCluster createdCluster = {};
+      bool createdOK = registry.createCluster(testDeployCluster, &createdCluster, &failure);
+      suite.expect(createdOK, "deploy_test_cluster_record_created");
+      if (createdOK == false)
+      {
+        basics_log("deploy test cluster create failure: %s\n", failure.c_str());
+        return EXIT_FAILURE;
+      }
+    }
+
+    ControlServerState testClusterServer = {};
+    std::thread testClusterServerThread([&]() {
       auto closeClient = [](int clientFD) -> void {
         if (clientFD >= 0)
         {
@@ -1806,21 +1636,21 @@ int main(void)
 
       String stepFailure = {};
       int clientFD = -1;
-      if (acceptNextClient(localHarnessListener.fd, localHarnessServer, clientFD) == false)
+      if (acceptNextClient(testClusterListener.fd, testClusterServer, clientFD) == false)
       {
         return;
       }
 
       if (handleDeployStep(clientFD,
-                           localHarnessServer,
+                           testClusterServer,
                            deployBlobPath,
                            deployApplicationID,
                            currentArchitecture,
                            true,
                            stepFailure) == false)
       {
-        localHarnessServer.failure = stepFailure;
-        localHarnessServer.stopRequested.store(true);
+        testClusterServer.failure = stepFailure;
+        testClusterServer.stopRequested.store(true);
         closeClient(clientFD);
         return;
       }
@@ -1828,36 +1658,33 @@ int main(void)
       closeClient(clientFD);
     });
 
-    ScopedEnvVar localHarnessSocket("PRODIGY_MOTHERSHIP_SOCKET", localHarnessListener.path);
-    ScopedEnvVar localHarnessEnv("PRODIGY_MOTHERSHIP_TEST_HARNESS", "/tmp/fake-prodigy-test-harness.sh"_ctv);
-
-    String localHarnessDeployOutput = {};
-    int localHarnessDeployExitCode = -1;
-    bool ranLocalHarnessDeploy = runMothershipCommand(
+    String testClusterDeployOutput = {};
+    int testClusterDeployExitCode = -1;
+    bool ranTestClusterDeploy = runMothershipCommand(
         binaryPath,
         dbRoot,
-        {"deploy", "local", std::string(deployPlanJSON.c_str()), std::string(deployBlobPath.c_str())},
-        localHarnessDeployOutput,
-        localHarnessDeployExitCode);
-    suite.expect(ranLocalHarnessDeploy, "deploy_local_test_harness_runs_mothership_deploy");
-    suite.expect(localHarnessDeployExitCode == EXIT_SUCCESS, "deploy_local_test_harness_returns_after_initial_okay");
-    if (ranLocalHarnessDeploy == false || localHarnessDeployExitCode != EXIT_SUCCESS)
+        {"deploy", "cluster-deploy-test", std::string(deployPlanJSON.c_str()), std::string(deployBlobPath.c_str())},
+        testClusterDeployOutput,
+        testClusterDeployExitCode);
+    suite.expect(ranTestClusterDeploy, "deploy_test_cluster_runs_mothership_deploy");
+    suite.expect(testClusterDeployExitCode == EXIT_SUCCESS, "deploy_test_cluster_returns_after_initial_okay");
+    if (ranTestClusterDeploy == false || testClusterDeployExitCode != EXIT_SUCCESS)
     {
-      basics_log("deploy local test harness mothership output:\n%s\n", localHarnessDeployOutput.c_str());
+      basics_log("deploy test cluster mothership output:\n%s\n", testClusterDeployOutput.c_str());
     }
 
-    localHarnessServer.stopRequested.store(true);
-    localHarnessServerThread.join();
+    testClusterServer.stopRequested.store(true);
+    testClusterServerThread.join();
 
-    suite.expect(localHarnessServer.failure.size() == 0, "deploy_local_test_harness_server_no_failure");
-    suite.expect(localHarnessServer.acceptCount == 1, "deploy_local_test_harness_server_accept_count");
-    suite.expect(localHarnessServer.sawMeasureApplication, "deploy_local_test_harness_server_saw_measure_topic");
-    suite.expect(localHarnessServer.sawSpinApplication, "deploy_local_test_harness_server_saw_spin_topic");
-    suite.expect(localHarnessServer.deployApplicationID == deployApplicationID, "deploy_local_test_harness_application_id_matches");
-    suite.expect(localHarnessServer.deployBlobMatched, "deploy_local_test_harness_blob_matches_builder_output");
+    suite.expect(testClusterServer.failure.size() == 0, "deploy_test_cluster_server_no_failure");
+    suite.expect(testClusterServer.acceptCount == 1, "deploy_test_cluster_server_accept_count");
+    suite.expect(testClusterServer.sawMeasureApplication, "deploy_test_cluster_server_saw_measure_topic");
+    suite.expect(testClusterServer.sawSpinApplication, "deploy_test_cluster_server_saw_spin_topic");
+    suite.expect(testClusterServer.deployApplicationID == deployApplicationID, "deploy_test_cluster_application_id_matches");
+    suite.expect(testClusterServer.deployBlobMatched, "deploy_test_cluster_blob_matches_builder_output");
     suite.expect(
-        stringContains(localHarnessDeployOutput, "SpinApplicationResponseCode::okay"),
-        "deploy_local_test_harness_output_reports_initial_okay");
+        stringContains(testClusterDeployOutput, "SpinApplicationResponseCode::okay"),
+        "deploy_test_cluster_output_reports_initial_okay");
   }
   else
   {
@@ -1935,7 +1762,7 @@ int main(void)
   suite.expect(ranHelp, "run_help_command");
   suite.expect(helpExitCode == EXIT_SUCCESS, "help_exit_success");
   suite.expect(stringContains(helpOutput, "clusterReport [target: local|clusterName|clusterUUID]"), "help_includes_cluster_report");
-  suite.expect(stringContains(helpOutput, "configureTestCluster [workspaceRoot] [machineCount] [nBrains]"), "help_includes_configure_test_cluster");
+  suite.expect(stringMissing(helpOutput, "configureTestCluster"), "help_omits_configure_test_cluster_backdoor");
   suite.expect(stringContains(helpOutput, "setLocalClusterMembership [name|clusterUUID] [json]"), "help_includes_set_local_cluster_membership");
   suite.expect(stringContains(helpOutput, "setTestClusterMachineCount [name|clusterUUID] [json]"), "help_includes_set_test_cluster_machine_count");
   suite.expect(stringMissing(helpOutput, "allApplicationsReport"), "help_omits_legacy_alias");

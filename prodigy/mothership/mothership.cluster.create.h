@@ -268,8 +268,23 @@ static inline bool mothershipBuildClusterDNSCredential(const MothershipProdigyCl
   credential.provider.assign(mothershipClusterProviderName(cluster.dnsProvider));
   credential.generation = uint64_t(source->updatedAtMs > 0 ? source->updatedAtMs : source->createdAtMs);
   ProdigyRuntimeEnvironmentConfig credentialRuntime = {};
-  if (mothershipMapClusterProviderEnvironment(source->provider, credentialRuntime.kind) == false ||
-      MothershipProviderCredentialRegistry::applyCredentialToRuntimeEnvironment(
+  if (source->provider == MothershipClusterProvider::route53)
+  {
+    credentialRuntime.kind = ProdigyEnvironmentKind::aws;
+  }
+  else if (source->provider == MothershipClusterProvider::gcpCloudDNS)
+  {
+    credentialRuntime.kind = ProdigyEnvironmentKind::gcp;
+  }
+  else if (source->provider == MothershipClusterProvider::azureDNS)
+  {
+    credentialRuntime.kind = ProdigyEnvironmentKind::azure;
+  }
+  else if (source->provider == MothershipClusterProvider::vultrDNS)
+  {
+    credentialRuntime.kind = ProdigyEnvironmentKind::vultr;
+  }
+  if (MothershipProviderCredentialRegistry::applyCredentialToRuntimeEnvironment(
           *source, credentialRuntime, failure) == false)
   {
     return false;
@@ -321,6 +336,12 @@ static inline bool mothershipBuildClusterBrainConfig(const MothershipProdigyClus
   {
     MachineConfig machineConfig = {};
     mothershipBuildMachineConfigFromSchema(machineSchema, machineConfig);
+    if (cluster.deploymentMode == MothershipClusterDeploymentMode::test)
+    {
+      machineConfig.nLogicalCores = cluster.test.machineLogicalCores;
+      machineConfig.nMemoryMB = cluster.test.machineMemoryMB;
+      machineConfig.nStorageMB = cluster.test.machineStorageMB;
+    }
     config.configBySlug.insert_or_assign(machineSchema.schema, std::move(machineConfig));
   }
 
@@ -485,6 +506,22 @@ static inline bool mothershipSelectClusterSeedPlan(const MothershipProdigyCluste
     plan.createInstruction.region = managedSchema.region;
     plan.createInstruction.zone = managedSchema.zone;
   };
+
+  if (cluster.deploymentMode == MothershipClusterDeploymentMode::test)
+  {
+    plan.mode = MothershipClusterSeedMode::created;
+    plan.createInstruction = {};
+    plan.createInstruction.kind = cluster.machineSchemas.empty() ? MachineConfig::MachineKind::vm : cluster.machineSchemas[0].kind;
+    plan.createInstruction.lifetime = MachineLifetime::reserved;
+    plan.createInstruction.backing = ClusterMachineBacking::owned;
+    if (cluster.machineSchemas.empty() == false)
+    {
+      plan.createInstruction.cloud.schema = cluster.machineSchemas[0].schema;
+    }
+    plan.createInstruction.count = 1;
+    plan.createInstruction.isBrain = true;
+    return true;
+  }
 
   if (cluster.deploymentMode == MothershipClusterDeploymentMode::local)
   {
@@ -829,8 +866,6 @@ class MothershipClusterCreateHooks {
 public:
 
   virtual ~MothershipClusterCreateHooks() = default;
-  virtual bool startTestCluster(const MothershipProdigyCluster& cluster, String *failure = nullptr) = 0;
-  virtual bool stopTestCluster(const MothershipProdigyCluster& cluster, String *failure = nullptr) = 0;
   virtual bool prepareProviderBootstrapArtifacts(const MothershipProdigyCluster& cluster, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) = 0;
   virtual bool bootstrapLocalSeed(const ProdigyPersistentBootState& bootState, String *failure = nullptr) = 0;
   virtual bool createSeedMachine(const MothershipProdigyCluster& cluster, const CreateMachinesInstruction& instruction, ClusterMachine& seedMachine, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) = 0;
@@ -853,103 +888,6 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
   if (mothershipBuildClusterBrainConfig(cluster, credential, config, failure, dnsCredential) == false)
   {
     return false;
-  }
-
-  if (cluster.deploymentMode == MothershipClusterDeploymentMode::test)
-  {
-    bool started = false;
-    auto failWithCleanup = [&](const String& localFailure) -> bool {
-      if (failure)
-      {
-        failure->assign(localFailure);
-      }
-
-      if (started == false)
-      {
-        return false;
-      }
-
-      const char *keepFailedTestCluster = std::getenv("PRODIGY_MOTHERSHIP_KEEP_FAILED_TEST_CLUSTER");
-      if (keepFailedTestCluster != nullptr && (std::strcmp(keepFailedTestCluster, "1") == 0 || std::strcmp(keepFailedTestCluster, "true") == 0 || std::strcmp(keepFailedTestCluster, "TRUE") == 0 || std::strcmp(keepFailedTestCluster, "yes") == 0 || std::strcmp(keepFailedTestCluster, "YES") == 0 || std::strcmp(keepFailedTestCluster, "on") == 0 || std::strcmp(keepFailedTestCluster, "ON") == 0))
-      {
-        if (failure != nullptr)
-        {
-          failure->append(" | preserved failed test cluster workspace because PRODIGY_MOTHERSHIP_KEEP_FAILED_TEST_CLUSTER is set"_ctv);
-        }
-        return false;
-      }
-
-      String cleanupFailure = {};
-      if (hooks.stopTestCluster(cluster, &cleanupFailure) == false && cleanupFailure.size() > 0 && failure != nullptr)
-      {
-        failure->append(" | cleanup failure: "_ctv);
-        failure->append(cleanupFailure);
-      }
-
-      return false;
-    };
-
-    String localFailure = {};
-    if (hooks.startTestCluster(cluster, &localFailure) == false)
-    {
-      if (failure)
-      {
-        failure->assign(localFailure);
-      }
-      return false;
-    }
-
-    started = true;
-
-    if ((config.configBySlug.empty() == false) || config.runtimeEnvironment.configured())
-    {
-      if (hooks.configureSeedCluster(cluster, config, &localFailure) == false)
-      {
-        return failWithCleanup(localFailure);
-      }
-
-      cluster.environmentConfigured = config.runtimeEnvironment.configured();
-    }
-
-    ClusterTopology topology = {};
-    constexpr uint32_t topologyFetchAttempts = 600;
-    constexpr useconds_t topologyFetchRetrySleepUs = 100 * 1000;
-    uint32_t fetchedMachines = 0;
-    uint32_t fetchedBrains = 0;
-    uint32_t fetchedReadyMachines = 0;
-    bool topologyReady = false;
-    for (uint32_t attempt = 0; attempt < topologyFetchAttempts; attempt += 1)
-    {
-      if (hooks.fetchSeedTopology(cluster, topology, &localFailure) == false)
-      {
-        return failWithCleanup(localFailure);
-      }
-
-      fetchedMachines = topology.machines.size();
-      fetchedBrains = clusterTopologyBrainCount(topology);
-      fetchedReadyMachines = mothershipClusterTopologyMachinesWithReadyResources(topology);
-      if (mothershipTestClusterTopologyReady(topology, cluster.test.machineCount, cluster.nBrains))
-      {
-        topologyReady = true;
-        break;
-      }
-
-      usleep(topologyFetchRetrySleepUs);
-    }
-
-    if (topologyReady == false)
-    {
-      localFailure.snprintf<"test cluster topology mismatch after wait expectedMachines={itoa} gotMachines={itoa} expectedBrains={itoa} gotBrains={itoa} readyMachines={itoa}"_ctv>(
-          uint64_t(cluster.test.machineCount),
-          uint64_t(fetchedMachines),
-          uint64_t(cluster.nBrains),
-          uint64_t(fetchedBrains),
-          uint64_t(fetchedReadyMachines));
-      return failWithCleanup(localFailure);
-    }
-
-    cluster.topology = topology;
-    return true;
   }
 
   AddMachines bootstrapRequest = {};
@@ -1002,13 +940,19 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
       failure->assign(localFailure);
     }
 
-    if (destroyCreatedSeedOnFailure == false)
+    const char *keepFailedTestCluster = std::getenv("PRODIGY_MOTHERSHIP_KEEP_FAILED_TEST_CLUSTER");
+    if (destroyCreatedSeedOnFailure && cluster.deploymentMode == MothershipClusterDeploymentMode::test && keepFailedTestCluster != nullptr &&
+        (std::strcmp(keepFailedTestCluster, "1") == 0 || std::strcmp(keepFailedTestCluster, "true") == 0 || std::strcmp(keepFailedTestCluster, "TRUE") == 0 || std::strcmp(keepFailedTestCluster, "yes") == 0 || std::strcmp(keepFailedTestCluster, "YES") == 0 || std::strcmp(keepFailedTestCluster, "on") == 0 || std::strcmp(keepFailedTestCluster, "ON") == 0))
     {
+      if (failure)
+      {
+        failure->append(" | preserved failed test cluster workspace because PRODIGY_MOTHERSHIP_KEEP_FAILED_TEST_CLUSTER is set"_ctv);
+      }
       return false;
     }
 
-    String cleanupFailure;
-    if (hooks.destroyCreatedSeedMachine(cluster, seedPlan.seedMachine, &cleanupFailure) == false && cleanupFailure.size() > 0)
+    String cleanupFailure = {};
+    if (destroyCreatedSeedOnFailure && hooks.destroyCreatedSeedMachine(cluster, seedPlan.seedMachine, &cleanupFailure) == false && cleanupFailure.size() > 0)
     {
       if (failure)
       {
@@ -1044,11 +988,7 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
       ProdigyTimingAttribution stageTiming = {};
       if (hooks.createSeedMachine(cluster, seedPlan.createInstruction, seedPlan.seedMachine, &stageTiming, &localFailure) == false)
       {
-        if (failure)
-        {
-          failure->assign(localFailure);
-        }
-        return false;
+        return failWithCleanup(localFailure);
       }
 
       mothershipAccumulateClusterCreateTimingStage(timingSummary, &MothershipClusterCreateTimingSummary::createSeedMachine, stageTiming);
@@ -1114,8 +1054,29 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
 #if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
     uint64_t stageStartNs = Time::now<TimeResolution::ns>();
 #endif
-    if (hooks.fetchSeedTopology(cluster, currentTopology, &localFailure) == false)
+    bool fetched = false;
+    uint32_t attempts = cluster.deploymentMode == MothershipClusterDeploymentMode::test ? 600 : 1;
+    for (uint32_t attempt = 0; attempt < attempts; ++attempt)
     {
+      if (hooks.fetchSeedTopology(cluster, currentTopology, &localFailure) == false)
+      {
+        return failWithCleanup(localFailure);
+      }
+      if (cluster.deploymentMode != MothershipClusterDeploymentMode::test ||
+          mothershipTestClusterTopologyReady(currentTopology, cluster.test.machineCount, cluster.nBrains))
+      {
+        fetched = true;
+        break;
+      }
+      ::usleep(100'000);
+    }
+    if (fetched == false)
+    {
+      localFailure.snprintf<"test cluster topology did not become ready expectedMachines={itoa} gotMachines={itoa} expectedBrains={itoa} gotBrains={itoa}"_ctv>(
+          uint64_t(cluster.test.machineCount),
+          uint64_t(currentTopology.machines.size()),
+          uint64_t(cluster.nBrains),
+          uint64_t(clusterTopologyBrainCount(currentTopology)));
       return failWithCleanup(localFailure);
     }
 
@@ -1128,24 +1089,40 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
 
   cluster.topology = currentTopology;
 
-  AddMachines request = {};
-  if (mothershipBuildClusterAddMachinesRequest(cluster, currentTopology, request, failure) == false)
+  if (cluster.deploymentMode != MothershipClusterDeploymentMode::test)
   {
-    return false;
-  }
-
-  if (request.adoptedMachines.empty() == false || request.readyMachines.empty() == false || request.removedMachines.empty() == false)
-  {
-    ClusterTopology finalTopology = {};
-    String localFailure;
-    ProdigyTimingAttribution stageTiming = {};
-    if (hooks.applyAddMachines(cluster, request, finalTopology, &stageTiming, &localFailure) == false)
+    AddMachines request = {};
+    if (mothershipBuildClusterAddMachinesRequest(cluster, currentTopology, request, failure) == false)
     {
-      return failWithCleanup(localFailure);
+      return false;
     }
 
-    cluster.topology = finalTopology;
-    mothershipAccumulateClusterCreateTimingStage(timingSummary, &MothershipClusterCreateTimingSummary::applyAddMachines, stageTiming);
+    if (request.adoptedMachines.empty() == false || request.readyMachines.empty() == false || request.removedMachines.empty() == false)
+    {
+      ClusterTopology finalTopology = {};
+      String localFailure;
+      ProdigyTimingAttribution stageTiming = {};
+      if (hooks.applyAddMachines(cluster, request, finalTopology, &stageTiming, &localFailure) == false)
+      {
+        return failWithCleanup(localFailure);
+      }
+
+      cluster.topology = finalTopology;
+      mothershipAccumulateClusterCreateTimingStage(timingSummary, &MothershipClusterCreateTimingSummary::applyAddMachines, stageTiming);
+    }
+  }
+
+  if (cluster.deploymentMode == MothershipClusterDeploymentMode::test &&
+      mothershipTestClusterTopologyReady(cluster.topology, cluster.test.machineCount, cluster.nBrains) == false)
+  {
+    String localFailure = {};
+    localFailure.snprintf<"test cluster topology mismatch expectedMachines={itoa} gotMachines={itoa} expectedBrains={itoa} gotBrains={itoa} readyMachines={itoa}"_ctv>(
+        uint64_t(cluster.test.machineCount),
+        uint64_t(cluster.topology.machines.size()),
+        uint64_t(cluster.nBrains),
+        uint64_t(clusterTopologyBrainCount(cluster.topology)),
+        uint64_t(mothershipClusterTopologyMachinesWithReadyResources(cluster.topology)));
+    return failWithCleanup(localFailure);
   }
 
   if (deferProviderCredentialUntilAfterTopology)
@@ -1222,7 +1199,7 @@ static inline bool mothershipRestartTestClusterToDesiredShape(
   }
 
   String localFailure = {};
-  if (hooks.stopTestCluster(currentCluster, &localFailure) == false)
+  if (currentTopology.machines.empty() || hooks.destroyCreatedSeedMachine(currentCluster, currentTopology.machines[0], &localFailure) == false)
   {
     if (failure)
     {

@@ -927,6 +927,7 @@ fn concurrent_step_cache_race_runs_once_and_reuses_cached_step() {
     let server = HitServer::new();
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path();
+    let arch = current_build_architecture();
     let rootfs_context = project.join("rootctx");
     fs::create_dir_all(&rootfs_context).unwrap();
 
@@ -1006,7 +1007,7 @@ fn concurrent_step_cache_race_runs_once_and_reuses_cached_step() {
         Path::new("/tool/hit-runner"),
     );
 
-    let mut file_contents = String::from("FROM scratch for x86_64\n");
+    let mut file_contents = format!("FROM scratch for {arch}\n");
     for top_level in ["tool", "lib", "lib64", "usr"] {
         if rootfs_context.join(top_level).exists() {
             file_contents.push_str(&format!("COPY {{root}} ./{top_level} /{top_level}\n"));
@@ -1058,11 +1059,14 @@ fn concurrent_step_cache_race_runs_once_and_reuses_cached_step() {
         1,
         "expected one RUN execution on cache miss"
     );
-    assert!(project.join(".discombobulator/cache/steps/x86_64").exists());
+    assert!(project
+        .join(".discombobulator/cache/steps")
+        .join(arch)
+        .exists());
     let connection = open_registry(project);
     let rows = query_artifacts_by_kind(&connection, "base");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].arch, "x86_64");
+    assert_eq!(rows[0].arch, arch);
     assert!(Path::new(&rows[0].path).exists());
 }
 
@@ -2560,6 +2564,7 @@ fn live_x86_64_host_builds_arm64_ubuntu_with_real_qemu_run_steps() {
 fn run_exec_form_mutates_workspace_with_env_and_workdir() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path();
+    let arch = current_build_architecture();
     let rootfs_context = project.join("rootfs");
     fs::create_dir_all(&rootfs_context).unwrap();
 
@@ -2617,7 +2622,7 @@ fn run_exec_form_mutates_workspace_with_env_and_workdir() {
     copy_host_runtime_closure(&runner_binary, &rootfs_context, Path::new("/tool/runner"));
     assert!(rootfs_context.join("tool/runner").exists());
 
-    let mut file_contents = String::from("FROM scratch for x86_64\n");
+    let mut file_contents = format!("FROM scratch for {arch}\n");
     for top_level in ["tool", "lib", "lib64", "usr"] {
         if rootfs_context.join(top_level).exists() {
             file_contents.push_str(&format!("COPY {{root}} ./{top_level} /{top_level}\n"));
@@ -2664,6 +2669,7 @@ fn run_exec_form_mutates_workspace_with_env_and_workdir() {
 fn run_execution_does_not_touch_host_network_bpf_runtime_paths() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path();
+    let arch = current_build_architecture();
     let rootfs_context = project.join("rootfs");
     let source_context = project.join("srcctx");
     let helper_dir = project.join("helpers");
@@ -2719,7 +2725,7 @@ fn run_execution_does_not_touch_host_network_bpf_runtime_paths() {
     }
 
     let discombobulator_file = project.join("SafetyRun.DiscombobuFile");
-    let mut file_contents = String::from("FROM scratch for x86_64\n");
+    let mut file_contents = format!("FROM scratch for {arch}\n");
     for top_level in ["bin", "lib", "lib64", "usr"] {
         if rootfs_context.join(top_level).exists() {
             file_contents.push_str(&format!("COPY {{root}} ./{top_level} /{top_level}\n"));
@@ -2783,13 +2789,11 @@ fn run_execution_does_not_touch_host_network_bpf_runtime_paths() {
 fn run_missing_executable_fails_clearly() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path();
+    let arch = current_build_architecture();
     let discombobulator_file = project.join("MissingRun.DiscombobuFile");
     fs::write(
         &discombobulator_file,
-        r#"
-      FROM scratch for x86_64
-      RUN ["/does-not-exist"]
-      "#,
+        format!("FROM scratch for {arch}\nRUN [\"/does-not-exist\"]\n"),
     )
     .unwrap();
 
@@ -3062,6 +3066,7 @@ fn copy_rejects_fifo_socket_and_device_nodes() {
 fn late_step_change_reuses_cached_earlier_run_and_invalidates_downstream() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path();
+    let arch = current_build_architecture();
     let rootfs_context = project.join("rootfs");
     let source_context = project.join("srcctx");
     fs::create_dir_all(&rootfs_context).unwrap();
@@ -3172,7 +3177,7 @@ fn late_step_change_reuses_cached_earlier_run_and_invalidates_downstream() {
     copy_host_runtime_closure(&runner_binary, &rootfs_context, Path::new("/tool/runner"));
     fs::write(source_context.join("message.txt"), "one").unwrap();
 
-    let mut file_contents = String::from("FROM scratch for x86_64\n");
+    let mut file_contents = format!("FROM scratch for {arch}\n");
     for top_level in ["tool", "lib", "lib64", "usr"] {
         if rootfs_context.join(top_level).exists() {
             file_contents.push_str(&format!("COPY {{root}} ./{top_level} /{top_level}\n"));
@@ -3228,7 +3233,7 @@ fn late_step_change_reuses_cached_earlier_run_and_invalidates_downstream() {
     assert_eq!(early_second, early_first);
     assert_eq!(final_second, format!("{early_first}|two"));
 
-    let step_cache_root = project.join(".discombobulator/cache/steps/x86_64");
+    let step_cache_root = project.join(".discombobulator/cache/steps").join(arch);
     assert!(step_cache_root.exists());
     assert!(
         fs::read_dir(&step_cache_root).unwrap().count() >= 4,
@@ -3241,6 +3246,7 @@ fn late_step_change_reuses_cached_earlier_run_and_invalidates_downstream() {
 fn warm_and_late_step_rebuilds_are_materially_faster_than_cold_builds() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path();
+    let arch = current_build_architecture();
     let rootfs_context = project.join("rootfs");
     let source_context = project.join("srcctx");
     fs::create_dir_all(&rootfs_context).unwrap();
@@ -3356,7 +3362,7 @@ fn warm_and_late_step_rebuilds_are_materially_faster_than_cold_builds() {
     copy_host_runtime_closure(&runner_binary, &rootfs_context, Path::new("/tool/runner"));
     fs::write(source_context.join("message.txt"), "one").unwrap();
 
-    let mut file_contents = String::from("FROM scratch for x86_64\n");
+    let mut file_contents = format!("FROM scratch for {arch}\n");
     for top_level in ["tool", "lib", "lib64", "usr"] {
         if rootfs_context.join(top_level).exists() {
             file_contents.push_str(&format!("COPY {{root}} ./{top_level} /{top_level}\n"));
@@ -3364,7 +3370,7 @@ fn warm_and_late_step_rebuilds_are_materially_faster_than_cold_builds() {
     }
     file_contents.push_str("WORKDIR /workspace\n");
     file_contents
-        .push_str("RUN [\"/tool/runner\", \"stamp\", \"/workspace/early.txt\", \"250\"]\n");
+        .push_str("RUN [\"/tool/runner\", \"stamp\", \"/workspace/early.txt\", \"500\"]\n");
     file_contents.push_str("COPY {src} ./message.txt /workspace/message.txt\n");
     file_contents.push_str(
         "RUN [\"/tool/runner\", \"compose\", \"/workspace/early.txt\", \"/workspace/message.txt\", \"/workspace/final.txt\", \"250\"]\n",
@@ -3918,7 +3924,12 @@ generated = Path("/app/generated")
     )
     .unwrap();
     fs::write(python_context.join("data/message.txt"), "meteor\n").unwrap();
-    let python_runtime_survivor = python_stdlib.display().to_string();
+    let python_runtime_survivors = WalkDir::new(&python_stdlib)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .map(|entry| format!("SURVIVE {}\n", entry.unwrap().path().display()))
+        .collect::<String>();
     let python_file = project.join("PythonExample.DiscombobuFile");
     fs::write(
         &python_file,
@@ -3938,19 +3949,19 @@ RUN [\"{}\", \"/app/bin/prepare.py\"]
 SURVIVE /bin/sh
 SURVIVE {}
 SURVIVE {}
-SURVIVE {}
+{}
 SURVIVE /app/bin/*
 SURVIVE /app/config/*
 SURVIVE /app/data/*
 SURVIVE /app/generated/*
-SURVIVE /app/vendor/*
+SURVIVE /app/vendor/*/*
 SURVIVE /app/main.py
 EXECUTE [\"{}\", \"/app/main.py\"]
 ",
             python_binary.display(),
             shell_target.display(),
             python_binary.display(),
-            python_runtime_survivor,
+            python_runtime_survivors,
             python_binary.display()
         ),
     )
@@ -3971,7 +3982,9 @@ EXECUTE [\"{}\", \"/app/main.py\"]
         .exists());
     assert!(python_mount
         .artifact_root()
-        .join("rootfs/usr/lib/python3.14/encodings/__init__.py")
+        .join("rootfs")
+        .join(python_stdlib.strip_prefix("/").unwrap())
+        .join("encodings/__init__.py")
         .exists());
     assert!(python_mount
         .artifact_root()
@@ -3984,7 +3997,7 @@ EXECUTE [\"{}\", \"/app/main.py\"]
     );
 
     let typescript_context = project.join("typescriptctx");
-    let node_runtime = fs::canonicalize(&node_binary).unwrap_or_else(|_| node_binary.clone());
+    let node_runtime = node_binary.clone();
     fs::create_dir_all(typescript_context.join("src")).unwrap();
     fs::create_dir_all(typescript_context.join("bin")).unwrap();
     fs::create_dir_all(typescript_context.join("config")).unwrap();
@@ -4072,7 +4085,7 @@ import { stripTypeScriptTypes } from 'node:module';
 
 fs.mkdirSync('dist', { recursive: true });
 const source = fs.readFileSync('src/main.ts', 'utf8');
-const transformed = stripTypeScriptTypes(source, { mode: 'transform' });
+const transformed = stripTypeScriptTypes(source, { mode: 'strip' });
 fs.writeFileSync('dist/main.js', transformed);
         "#,
     )
@@ -4113,6 +4126,21 @@ fs.writeFileSync('dist/main.js', transformed);
     )
     .unwrap();
     fs::write(typescript_context.join("data/message.txt"), "asteroid\n").unwrap();
+    let typescript_runtime_survivors = WalkDir::new(typescript_context.join("node_modules"))
+        .follow_links(false)
+        .sort_by_file_name()
+        .min_depth(1)
+        .into_iter()
+        .map(|entry| {
+            let path = entry.unwrap().into_path();
+            format!(
+                "SURVIVE /app/node_modules/{}\n",
+                path.strip_prefix(typescript_context.join("node_modules"))
+                    .unwrap()
+                    .display()
+            )
+        })
+        .collect::<String>();
     let typescript_file = project.join("TypeScriptExample.DiscombobuFile");
     fs::write(
         &typescript_file,
@@ -4135,11 +4163,12 @@ SURVIVE /app/config/*
 SURVIVE /app/data/*
 SURVIVE /app/generated/*
 SURVIVE /app/dist/*
-SURVIVE /app/node_modules/*
+{}
 EXECUTE [\"{}\", \"/app/dist/main.js\"]
 ",
             shell_target.display(),
             node_runtime.display(),
+            typescript_runtime_survivors,
             node_runtime.display()
         ),
     )

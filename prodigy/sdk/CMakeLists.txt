@@ -66,15 +66,15 @@ if (PRODIGY_SDK_USE_DEPOS_BASICS
    AND NOT TARGET basics::basics
    AND COMMAND prodigy_resolve_basics_release_depofile)
    prodigy_resolve_basics_release_depofile(_PRODIGY_SDK_BASICS_DEPOFILE)
-   file(GLOB _PRODIGY_SDK_LOCAL_DEPOFILES CONFIGURE_DEPENDS "${PRODIGY_SDK_DEPOFILES_DIR}/*.DepoFile")
-   list(SORT _PRODIGY_SDK_LOCAL_DEPOFILES)
-   set(_PRODIGY_SDK_DEPOFILES "${_PRODIGY_SDK_BASICS_DEPOFILE}")
-   list(APPEND _PRODIGY_SDK_DEPOFILES ${_PRODIGY_SDK_LOCAL_DEPOFILES})
-   list(SORT _PRODIGY_SDK_DEPOFILES)
+   set(_PRODIGY_SDK_DEPOFILES
+      "${_PRODIGY_SDK_BASICS_DEPOFILE}"
+      "${PRODIGY_SDK_DEPOFILES_DIR}/aegis.DepoFile"
+      "${PRODIGY_SDK_DEPOFILES_DIR}/gxhash.DepoFile"
+      "${PRODIGY_SDK_DEPOFILES_DIR}/openssl.DepoFile"
+   )
    depos_depend(FILES ${_PRODIGY_SDK_DEPOFILES})
    _depos_ensure_registry_ready()
    unset(_PRODIGY_SDK_BASICS_DEPOFILE)
-   unset(_PRODIGY_SDK_LOCAL_DEPOFILES)
    unset(_PRODIGY_SDK_DEPOFILES)
 endif()
 

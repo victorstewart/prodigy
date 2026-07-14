@@ -6,10 +6,6 @@
 SEC("tcx/egress")
 int host_egress(struct __sk_buff *skb)
 {
-#if PRODIGY_DEBUG
-  logSKB(skb);
-#endif
-
   void *data_end = (void *)(long)skb->data_end;
   struct ethhdr *eth = (struct ethhdr *)(long)skb->data;
 

@@ -89,26 +89,18 @@ __attribute__((__always_inline__)) static inline bool redirectContainerFragment(
 {
   __u32 container_index = container_fragment;
 
-  struct packet *pkt = getPacket();
-  if (pkt)
-  {
-    pkt->containerID.value[4] = container_fragment;
-  }
-
   __u32 *primary_device_idx = bpf_map_lookup_elem(&ct_dev_map, &container_index);
   if (primary_device_idx == NULL)
   {
     return false;
   }
 
-  logPacketRedirectIfIdx(*primary_device_idx);
-
   if (is_ingress)
   {
-    return (setInstruction(bpf_redirect(*primary_device_idx, 0)) == TC_ACT_REDIRECT);
+    return (bpf_redirect(*primary_device_idx, 0) == TC_ACT_REDIRECT);
   }
 
-  return (setInstruction(bpf_redirect(*primary_device_idx, 0)) == TC_ACT_REDIRECT);
+  return (bpf_redirect(*primary_device_idx, 0) == TC_ACT_REDIRECT);
 }
 
 __attribute__((__always_inline__)) static inline bool setContainerIDFromDistributedIPv4(struct container_id *containerID, __be32 dst, const struct local_container_subnet6 *localcontainersubnet6)

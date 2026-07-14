@@ -7,7 +7,6 @@ file(READ "${PRODIGY_ROOT}/prodigy/mothership/mothership.cpp" MOTHERSHIP)
 file(READ "${PRODIGY_ROOT}/prodigy/mothership/mothership.provider.credentials.h" CREDENTIALS)
 file(READ "${PRODIGY_ROOT}/prodigy/iaas/gcp/gcp.h" GCP)
 file(READ "${PRODIGY_ROOT}/prodigy/brain/brain.h" BRAIN)
-file(READ "${PRODIGY_ROOT}/../basics/networking/ring.h" RING)
 
 string(FIND "${MOTHERSHIP}" "bool collectProviderMachineCloudIDs" INVENTORY_CONSUMER_START)
 string(FIND "${MOTHERSHIP}" "static bool resolveJSONArgument" INVENTORY_CONSUMER_END)
@@ -63,8 +62,8 @@ endif()
 foreach(REQUIRED IN ITEMS
    "prodigyOwnRuntimeEnvironmentConfig(source, runtimeEnvironment);"
    "applyCredentialToRuntimeEnvironment(credential, runtimeEnvironment, failure, deadline)"
-   "runtimeEnvironment.gcp.bootstrapAccessTokenRefreshCommand.reset();"
-   "runtimeEnvironment.gcp.bootstrapAccessTokenRefreshFailureHint.reset();"
+   "runtimeEnvironment.gcp.bootstrapAccessTokenRefreshCommand.clear();"
+   "runtimeEnvironment.gcp.bootstrapAccessTokenRefreshFailureHint.clear();"
    "buildGcpBootstrapAccessTokenRefreshCommand(credential, runtimeEnvironment.gcp.bootstrapAccessTokenRefreshCommand"
    "describeGcpBootstrapAccessTokenRefreshHint(credential, runtimeEnvironment.gcp.bootstrapAccessTokenRefreshFailureHint)")
    string(FIND "${CREDENTIALS}" "${REQUIRED}" OFFSET)
@@ -117,15 +116,5 @@ foreach(REQUIRED IN ITEMS
    string(FIND "${BRAIN}" "${REQUIRED}" OFFSET)
    if (OFFSET EQUAL -1)
       message(FATAL_ERROR "Brain inventory stack ownership missing: ${REQUIRED}")
-   endif()
-endforeach()
-
-foreach(REQUIRED IN ITEMS
-   "enum class RingProcessIntegration"
-   "isolatedWorker"
-   "const bool integrateProcess = requestedProcessIntegration == RingProcessIntegration::enabled")
-   string(FIND "${RING}" "${REQUIRED}" OFFSET)
-   if (OFFSET EQUAL -1)
-      message(FATAL_ERROR "Basics isolated Ring mode missing: ${REQUIRED}")
    endif()
 endforeach()

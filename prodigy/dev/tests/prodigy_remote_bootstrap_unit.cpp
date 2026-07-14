@@ -604,6 +604,7 @@ int main(void)
   if (sshd.ready() == false && sshd.failure.size() > 0)
   {
     basics_log("DETAIL: blocking_ssh_fixture_failure='%s'\n", sshd.failure.c_str());
+    std::fprintf(stderr, "DETAIL: blocking_ssh_fixture_failure='%s'\n", sshd.failure.c_str());
   }
   if (sshd.ready())
   {
@@ -710,7 +711,7 @@ int main(void)
   request.remoteProdigyPath.assign("/opt/prodigy-root"_ctv);
   request.controlSocketPath.assign("/run/prodigy/control.sock"_ctv);
   request.clusterUUID = 0x44014401;
-  request.architecture = MachineCpuArchitecture::x86_64;
+  request.architecture = nametagCurrentBuildMachineArchitecture();
 
   ClusterMachine target = {};
   target.source = ClusterMachineSource::created;

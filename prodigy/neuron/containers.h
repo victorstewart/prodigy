@@ -59,20 +59,6 @@ static inline uint16_t prodigyContainerReservedCoreCount(uint32_t lcoreCount)
   return (lcoreCount > nReservedCores) ? uint16_t(nReservedCores) : uint16_t(0);
 }
 
-static void prodigyAppendAttachTrace(String& line)
-{
-  int fd = ::open("/switchboard.attach.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
-  if (fd < 0)
-  {
-    return;
-  }
-
-  (void)line.addNullTerminator();
-  (void)::write(fd, line.data(), line.size());
-  (void)::write(fd, "\n", 1);
-  (void)::close(fd);
-}
-
 static inline void prodigyBuildContainerStartupFlags(const ContainerPlan& plan, Vector<uint64_t>& flags)
 {
   flags.clear();
@@ -955,8 +941,6 @@ private:
 
     bool ok = true;
     program->openMap("ct_dev_map"_ctv, [&](int mapFD) -> void {
-      bool traceHostIngress = (ownerUUID == 0);
-
       if (mapFD < 0)
       {
         basics_log("containerDeviceMap open failed owner=%llu includeNIC=%d\n",
@@ -974,38 +958,6 @@ private:
       __u32 mapInfoLen = sizeof(mapInfo);
       bool mapInfoAvailable = (bpf_map_get_info_by_fd(mapFD, &mapInfo, &mapInfoLen) == 0);
       uint32_t mapID = mapInfoAvailable ? uint32_t(mapInfo.id) : 0;
-
-      if (traceHostIngress)
-      {
-        String traceLine = {};
-        if (mapInfoAvailable)
-        {
-          traceLine.snprintf<"containerDeviceMap sync begin owner={} includeNIC={} map_fd={} map_id={} map_name={} containers={} extra={} excluded={} nic={}"_ctv>(
-              ownerUUID,
-              int(includeNIC),
-              mapFD,
-              uint32_t(mapInfo.id),
-              String(mapInfo.name),
-              uint64_t(thisNeuron->containers.size()),
-              uint64_t(extraContainer ? extraContainer->plan.uuid : 0),
-              uint64_t(excludedContainer ? excludedContainer->plan.uuid : 0),
-              nicIfidx);
-        }
-        else
-        {
-          traceLine.snprintf<"containerDeviceMap sync begin owner={} includeNIC={} map_fd={} map_info_errno={}({}) containers={} extra={} excluded={} nic={}"_ctv>(
-              ownerUUID,
-              int(includeNIC),
-              mapFD,
-              errno,
-              String(strerror(errno)),
-              uint64_t(thisNeuron->containers.size()),
-              uint64_t(extraContainer ? extraContainer->plan.uuid : 0),
-              uint64_t(excludedContainer ? excludedContainer->plan.uuid : 0),
-              nicIfidx);
-        }
-        prodigyAppendAttachTrace(traceLine);
-      }
 
       bool mirrorTrusted = mapInfoAvailable && mirror.valid && mirror.mapID == mapID;
       ContainerDeviceMapMirror nextMirror = {};
@@ -1031,17 +983,6 @@ private:
         if (mapEntryCurrent)
         {
           continue;
-        }
-
-        if (traceHostIngress && desiredIfidx != 0)
-        {
-          String traceLine = {};
-          traceLine.snprintf<"containerDeviceMap sync write owner={} fragment={} ifidx={} includeNIC={}"_ctv>(
-              ownerUUID,
-              fragment,
-              desiredIfidx,
-              int(includeNIC));
-          prodigyAppendAttachTrace(traceLine);
         }
 
         if (writeContainerDeviceMapEntry(mapFD, fragment, desiredIfidx, "ct_dev_map", ownerUUID, failureReport) == false)
@@ -1594,6 +1535,7 @@ public:
     primary_program = netdevs.host.loadPreattachedProgram(prodigyContainerIngressNetkitAttachType(), path);
     if (primary_program)
     {
+      primary_program->setArrayElement("lc_subnet"_ctv, 0, thisNeuron->lcsubnet6);
       primary_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
     }
 
@@ -1636,26 +1578,6 @@ public:
 
   bool setupNetwork(String *failureReport = nullptr)
   {
-    std::fprintf(stderr, "setupNetwork begin uuid=%llu appID=%u useHostNetns=%d dpfx=%u mpfx=%u.%u.%u neuron=%p pid=%d\n",
-                 (unsigned long long)plan.uuid,
-                 unsigned(plan.config.applicationID),
-                 int(plan.useHostNetworkNamespace),
-                 unsigned(thisNeuron->lcsubnet6.dpfx),
-                 unsigned(thisNeuron->lcsubnet6.mpfx[0]),
-                 unsigned(thisNeuron->lcsubnet6.mpfx[1]),
-                 unsigned(thisNeuron->lcsubnet6.mpfx[2]),
-                 static_cast<void *>(thisNeuron),
-                 int(pid));
-    std::fflush(stderr);
-
-    if (plan.config.applicationID == 11)
-    {
-      basics_log("setupNetwork stage=begin uuid=%llu appID=%u pid=%d\n",
-                 (unsigned long long)plan.uuid,
-                 unsigned(plan.config.applicationID),
-                 int(pid));
-    }
-
     int hostnetnsfd = Filesystem::openFileAt(-1, "/proc/self/ns/net"_ctv, O_RDONLY);
     if (hostnetnsfd < 0)
     {
@@ -1688,12 +1610,6 @@ public:
 
     netdevs.createPair(pid);
     netdevs.peer.moveSocketToNamespace(peernetnsfd, hostnetnsfd);
-    if (plan.config.applicationID == 11)
-    {
-      basics_log("setupNetwork stage=pair-created uuid=%llu appID=%u\n",
-                 (unsigned long long)plan.uuid,
-                 unsigned(plan.config.applicationID));
-    }
     if (bringContainerLoopbackUp(peernetnsfd, hostnetnsfd, plan.uuid, failureReport) == false)
     {
       if (peernetnsfd >= 0)
@@ -1730,6 +1646,18 @@ public:
     for (const IPPrefix& prefix : plan.addresses)
     {
       peer.addIP(prefix);
+
+      if (prefix.network.is6 && prefix.cidr == 128 &&
+          switchboardContainerDestinationIPv6(prefix.network.v6))
+      {
+        char addressText[INET6_ADDRSTRLEN] = {0};
+        if (inet_ntop(AF_INET6, prefix.network.v6, addressText, sizeof(addressText)))
+        {
+          String address;
+          address.assign(addressText);
+          host.addDirectRoute(address, 128, AF_INET6);
+        }
+      }
     }
 
     for (const Whitehole& whitehole : plan.whiteholes)
@@ -1763,15 +1691,6 @@ public:
 
     // Mesh subscriptions target datacenter-scoped container IPv6s (prefix11 + dpfx + machine + fragment).
     // Add datacenter-wide /96 routes so cross-machine container traffic is routable from this netns.
-    basics_log("setupNetwork fragment-check uuid=%llu appID=%u dpfx=%u mpfx=%u.%u.%u neuron=%p pid=%d\n",
-               (unsigned long long)plan.uuid,
-               unsigned(plan.config.applicationID),
-               unsigned(thisNeuron->lcsubnet6.dpfx),
-               unsigned(thisNeuron->lcsubnet6.mpfx[0]),
-               unsigned(thisNeuron->lcsubnet6.mpfx[1]),
-               unsigned(thisNeuron->lcsubnet6.mpfx[2]),
-               static_cast<void *>(thisNeuron),
-               int(pid));
     installDatacenterMeshRoutes(peer, thisNeuron->lcsubnet6.dpfx);
 
     struct container_network_policy networkPolicy = {};
@@ -1800,15 +1719,6 @@ public:
         ::close(hostnetnsfd);
       }
       return false;
-    }
-
-    if (plan.config.applicationID == 11)
-    {
-      basics_log("setupNetwork stage=host-ready uuid=%llu appID=%u hostIngress=%d hostEgress=%d\n",
-                 (unsigned long long)plan.uuid,
-                 unsigned(plan.config.applicationID),
-                 int(thisNeuron->tcx_ingress_program != nullptr),
-                 int(thisNeuron->tcx_egress_program != nullptr));
     }
 
     if (thisNeuron->tcx_ingress_program == nullptr || thisNeuron->tcx_egress_program == nullptr)
@@ -1867,13 +1777,6 @@ public:
     peer_program->setArrayElement("mac_map"_ctv, 0, thisNeuron->eth.mac);
     peer_program->setArrayElement("gw_mac_map"_ctv, 0, thisNeuron->eth.gateway_mac);
     peer_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
-
-    if (plan.config.applicationID == 11)
-    {
-      basics_log("setupNetwork stage=egress-attached uuid=%llu appID=%u\n",
-                 (unsigned long long)plan.uuid,
-                 unsigned(plan.config.applicationID));
-    }
 
     if (syncSystemEgressAllowlist(failureReport) == false)
     {
@@ -1945,6 +1848,7 @@ public:
       }
       return false;
     }
+    primary_program->setArrayElement("lc_subnet"_ctv, 0, thisNeuron->lcsubnet6);
     primary_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
 
     if (plan.networkAccess == ContainerNetworkAccess::declaredOnly &&
@@ -1966,12 +1870,6 @@ public:
       return false;
     }
 
-    if (plan.config.applicationID == 11)
-    {
-      basics_log("setupNetwork stage=ingress-attached uuid=%llu appID=%u\n",
-                 (unsigned long long)plan.uuid,
-                 unsigned(plan.config.applicationID));
-    }
     if (syncDeclaredNetworkPolicy() == false)
     {
       if (failureReport)
@@ -2007,22 +1905,8 @@ public:
       return false;
     }
 
-    if (plan.config.applicationID == 11)
-    {
-      basics_log("setupNetwork stage=device-maps-synced uuid=%llu appID=%u\n",
-                 (unsigned long long)plan.uuid,
-                 unsigned(plan.config.applicationID));
-    }
-
     syncPeerOverlayRoutingProgram();
     thisNeuron->syncContainerSwitchboardRuntime(this);
-
-    if (plan.config.applicationID == 11)
-    {
-      basics_log("setupNetwork stage=done uuid=%llu appID=%u\n",
-                 (unsigned long long)plan.uuid,
-                 unsigned(plan.config.applicationID));
-    }
 
     if (peernetnsfd >= 0)
     {
@@ -5210,7 +5094,7 @@ private:
     {
       if (failureReport)
       {
-        failureReport->snprintf<"/run is not verified tmpfs type={}"_ctv>(uint64_t(runtimeFS.f_type));
+        failureReport->snprintf<"/run is not verified tmpfs type={itoa}"_ctv>(uint64_t(runtimeFS.f_type));
       }
       close(runFD);
       errno = EINVAL;
@@ -6957,9 +6841,13 @@ public:
 
   static void seed_root_cgroupv2_subtree_controllers(void)
   {
+#if PRODIGY_DEBUG
     basics_log("seed_root_cgroupv2_subtree_controllers begin\n");
+#endif
     int rootFD = Filesystem::openDirectoryAt(-1, "/sys/fs/cgroup"_ctv);
+#if PRODIGY_DEBUG
     basics_log("seed_root_cgroupv2_subtree_controllers rootFD=%d\n", rootFD);
+#endif
 
     // leave the OS 8GB and take the rest
 
@@ -6973,7 +6861,9 @@ public:
 
     // '+cpuset +cpu +io +memory +pids +misc' (hugetlb no longer used)
     Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/cgroup.subtree_control"_ctv, "+cpuset +cpu +memory +pids"_ctv);
+#if PRODIGY_DEBUG
     basics_log("seed_root_cgroupv2_subtree_controllers wrote root subtree_control\n");
+#endif
 
     int containersFD = Filesystem::createOpenDirectoryAt(-1, "/sys/fs/cgroup/containers.slice"_ctv);
     if (containersFD < 0)
@@ -6996,11 +6886,15 @@ public:
         }
       }
     }
+#if PRODIGY_DEBUG
     basics_log("seed_root_cgroupv2_subtree_controllers containersFD=%d\n", containersFD);
+#endif
 
     Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/containers.slice/cgroup.subtree_control"_ctv, "+cpuset +cpu +memory +pids"_ctv);
     Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/containers.slice/cgroup.max.depth"_ctv, "2"_ctv);
+#if PRODIGY_DEBUG
     basics_log("seed_root_cgroupv2_subtree_controllers wrote containers controls\n");
+#endif
 
     String cpusEffective;
     Filesystem::openReadAtClose(-1, "/sys/fs/cgroup/cpuset.cpus.effective"_ctv, cpusEffective);
@@ -7013,7 +6907,9 @@ public:
       }
       cpusEffective.snprintf<"0-{itoa}"_ctv>(nCores - 1);
     }
+#if PRODIGY_DEBUG
     basics_log("seed_root_cgroupv2_subtree_controllers cpuset.cpus.effective=%s\n", cpusEffective.c_str());
+#endif
 
     // Parse effective CPUs in the form "0-7" or single values like "0"
     uint16_t startIdx = 0;
@@ -7062,7 +6958,9 @@ public:
     cpusRange.snprintf<"{itoa}-{itoa}"_ctv>(firstContainerCore, endIdx);
     Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/containers.slice/cpuset.cpus"_ctv, cpusRange);
     Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/containers.slice/cpuset.cpus.partition"_ctv, "isolated"_ctv);
+#if PRODIGY_DEBUG
     basics_log("seed_root_cgroupv2_subtree_controllers complete range=%s lcoreCount=%u\n", cpusRange.c_str(), unsigned(thisNeuron->lcoreCount));
+#endif
 
     if (containersFD >= 0)
     {
@@ -7841,26 +7739,25 @@ public:
     delete container;
   }
 
-  static void createContainer(ContainerPlan& plan, const String& compressedContainerPath, Container *& container)
+  static void createContainer(ContainerPlan& plan, const String& compressedContainerPath, Container *& container, String *failure = nullptr)
   {
     container = nullptr;
+    if (failure)
+    {
+      failure->clear();
+    }
     uint32_t userID = 0;
     uint32_t executionHostID = 0;
     if (prodigyDeriveContainerHostIDs(plan, userID, executionHostID) == false)
     {
+      if (failure)
+      {
+        failure->assign("invalid container user namespace mapping"_ctv);
+      }
       basics_log("createContainer rejected deploymentID=%llu appID=%u reason=invalid user namespace mapping\n",
                  (unsigned long long)plan.config.deploymentID(),
                  unsigned(plan.config.applicationID));
       return;
-    }
-
-    if (plan.config.applicationID == 11)
-    {
-      basics_log("createContainer stage=begin deploymentID=%llu appID=%u compressed=%.*s\n",
-                 (unsigned long long)plan.config.deploymentID(),
-                 unsigned(plan.config.applicationID),
-                 compressedContainerPath.size(),
-                 compressedContainerPath.data());
     }
 
     container = new Container();
@@ -7874,6 +7771,10 @@ public:
     {
       if (allocateCores(container) == false)
       {
+        if (failure)
+        {
+          failure->snprintf<"insufficient isolated cores: requested={itoa} available={itoa}"_ctv>(uint64_t(plan.logicalCores()), uint64_t(thisNeuron->lcoreCount));
+        }
         basics_log("createContainer rejected deploymentID=%llu appID=%u reason=insufficient isolated cores requested=%u lcoreCount=%u\n",
                    (unsigned long long)plan.config.deploymentID(),
                    unsigned(plan.config.applicationID),
@@ -7885,41 +7786,11 @@ public:
       }
     }
 
-    if (container->plan.addresses.size() > 0)
-    {
-      char private6Text[INET6_ADDRSTRLEN] = {0};
-      if (inet_ntop(AF_INET6, container->plan.addresses[0].network.v6, private6Text, sizeof(private6Text)) == nullptr)
-      {
-        strcpy(private6Text, "<invalid>");
-      }
-
-      basics_log(
-          "createContainer plan deploymentID=%llu appID=%u addresses=%u private6=%s/%u\n",
-          (unsigned long long)plan.config.deploymentID(),
-          unsigned(plan.config.applicationID),
-          unsigned(container->plan.addresses.size()),
-          private6Text,
-          unsigned(container->plan.addresses[0].cidr));
-    }
-    else
-    {
-      basics_log(
-          "createContainer plan deploymentID=%llu appID=%u addresses=0\n",
-          (unsigned long long)plan.config.deploymentID(),
-          unsigned(plan.config.applicationID));
-    }
-
     if (container->isSystemContainer() == false)
     {
       IPPrefix containerNetwork6 = thisNeuron->generateAddress(container_network_subnet6, plan.fragment, 128);
       addAddressIfMissing(container->plan.addresses, containerNetwork6);
     }
-    basics_log(
-        "createContainer networking needsExternal4=%d needsExternal6=%d directAddresses=%u\n",
-        int(needsAnyExternalAddressFamily(plan, ExternalAddressFamily::ipv4)),
-        int(needsAnyExternalAddressFamily(plan, ExternalAddressFamily::ipv6)),
-        unsigned(container->plan.addresses.size()));
-
     String rejectedArtifactJanitorFailure = {};
     if (cleanupRejectedOrphanedContainerArtifactsAtPath("/containers"_ctv, &rejectedArtifactJanitorFailure) == false && rejectedArtifactJanitorFailure.size() > 0)
     {
@@ -7934,6 +7805,10 @@ public:
     {
       if (container->plan.config.isolatedChildMemoryMB != 0 || cgroupFailure.size() > 0)
       {
+        if (failure)
+        {
+          failure->assign(cgroupFailure.size() > 0 ? cgroupFailure : "isolated child cgroup creation failed"_ctv);
+        }
         basics_log("createContainer rejected uuid=%llu reason=%s\n",
                    (unsigned long long)container->plan.uuid,
                    cgroupFailure.size() > 0 ? cgroupFailure.c_str() :
@@ -7942,7 +7817,6 @@ public:
         container = nullptr;
         return;
       }
-      basics_log("createContainer proceeding without cgroup uuid=%llu\n", (unsigned long long)container->plan.uuid);
     }
 
     struct DeploymentExtractionLock {
@@ -7978,6 +7852,10 @@ public:
     extractionLock.fd = open(extractionLockPath.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
     if (extractionLock.fd < 0)
     {
+      if (failure)
+      {
+        failure->snprintf<"failed to open container extraction lock: {}"_ctv>(String(strerror(errno)));
+      }
       basics_log("createContainer failed to open extraction lock path=%s errno=%d(%s)\n",
                  extractionLockPath.c_str(),
                  errno,
@@ -7989,6 +7867,10 @@ public:
 
     if (flock(extractionLock.fd, LOCK_EX) != 0)
     {
+      if (failure)
+      {
+        failure->snprintf<"failed to lock container extraction: {}"_ctv>(String(strerror(errno)));
+      }
       basics_log("createContainer failed to lock extraction path=%s errno=%d(%s)\n",
                  extractionLockPath.c_str(),
                  errno,
@@ -8005,6 +7887,10 @@ public:
     receiveScratchPath.append(container->name);
     if (createDirectoryTree(receiveScratchPath) == false)
     {
+      if (failure)
+      {
+        failure->snprintf<"failed to create container receive scratch: {}"_ctv>(String(strerror(errno)));
+      }
       basics_log("createContainer failed to create receive scratch path=%s errno=%d(%s)\n",
                  receiveScratchPath.c_str(),
                  errno,
@@ -8058,6 +7944,10 @@ public:
                             : prodigyOpenContainerBlobPayloadAfterContractHeader(compressedContainerPath, compressedPayloadFD, &contractFailure);
       if (contractOK == false)
       {
+        if (failure)
+        {
+          failure->assign(contractFailure);
+        }
         basics_log("createContainer rejected container blob contract: %s\n", contractFailure.c_str());
         restoreSigChld();
         cleanupContainerAfterFailedCreate(container);
@@ -8068,6 +7958,10 @@ public:
       int pipefd[2];
       if (pipe(pipefd) != 0)
       {
+        if (failure)
+        {
+          failure->snprintf<"failed to create container extraction pipe: {}"_ctv>(String(strerror(errno)));
+        }
         basics_log("createContainer pipe failed errno=%d(%s)\n", errno, strerror(errno));
         close(compressedPayloadFD);
         restoreSigChld();
@@ -8177,6 +8071,10 @@ public:
 
       if (zstd_ok == false || recv_ok == false)
       {
+        if (failure)
+        {
+          failure->snprintf<"container image extraction failed: zstd_status={itoa} btrfs_receive_status={itoa}"_ctv>(uint64_t(uint32_t(zstd_status)), uint64_t(uint32_t(recv_status)));
+        }
         basics_log("createContainer image extraction failed zstd_ok=%d recv_ok=%d\n", int(zstd_ok), int(recv_ok));
         cleanupContainerAfterFailedCreate(container);
         container = nullptr;
@@ -8193,6 +8091,10 @@ public:
             receivedSubvolumePath,
             &receiveScratchSelectionFailure) == false)
     {
+      if (failure)
+      {
+        failure->assign(receiveScratchSelectionFailure);
+      }
       basics_log("createContainer receive scratch selection failed deploymentID=%llu scratch=%s reason=%s\n",
                  (unsigned long long)plan.config.deploymentID(),
                  receiveScratchPath.c_str(),
@@ -8202,17 +8104,13 @@ public:
       return;
     }
 
-    if (plan.config.applicationID == 11)
-    {
-      basics_log("createContainer stage=received-artifact deploymentID=%llu appID=%u artifactRoot=%s\n",
-                 (unsigned long long)plan.config.deploymentID(),
-                 unsigned(plan.config.applicationID),
-                 receivedSubvolumePath.c_str());
-    }
-
     String artifactShapeFailure = {};
     if (validateContainerArtifactShape(receivedSubvolumePath, &artifactShapeFailure) == false)
     {
+      if (failure)
+      {
+        failure->assign(artifactShapeFailure);
+      }
       basics_log("createContainer artifact shape validation failed deploymentID=%llu artifactRoot=%s reason=%s\n",
                  (unsigned long long)plan.config.deploymentID(),
                  receivedSubvolumePath.c_str(),
@@ -8230,6 +8128,10 @@ public:
             maxContainerArtifactRegularFileBytes,
             &artifactLimitFailure) == false)
     {
+      if (failure)
+      {
+        failure->assign(artifactLimitFailure);
+      }
       basics_log("createContainer artifact resource limits failed deploymentID=%llu artifactRoot=%s reason=%s\n",
                  (unsigned long long)plan.config.deploymentID(),
                  receivedSubvolumePath.c_str(),
@@ -8242,6 +8144,10 @@ public:
     String artifactWritableFailure = {};
     if (setContainerArtifactSubvolumeWritable(receivedSubvolumePath, &artifactWritableFailure) == false)
     {
+      if (failure)
+      {
+        failure->assign(artifactWritableFailure);
+      }
       basics_log("createContainer failed to make received artifact writable deploymentID=%llu artifactRoot=%s reason=%s\n",
                  (unsigned long long)plan.config.deploymentID(),
                  receivedSubvolumePath.c_str(),
@@ -8254,6 +8160,10 @@ public:
     String pendingMarkerFailure = {};
     if (writeContainerCreatePendingMarker(receivedSubvolumePath, getpid(), &pendingMarkerFailure) == false)
     {
+      if (failure)
+      {
+        failure->assign(pendingMarkerFailure);
+      }
       basics_log("createContainer failed to create pending-create marker deploymentID=%llu artifactRoot=%s reason=%s\n",
                  (unsigned long long)plan.config.deploymentID(),
                  receivedSubvolumePath.c_str(),
@@ -8270,6 +8180,10 @@ public:
     String launchMetadataFailure = {};
     if (loadContainerLaunchMetadata(container, &launchMetadataFailure) == false)
     {
+      if (failure)
+      {
+        failure->assign(launchMetadataFailure);
+      }
       basics_log("createContainer launch metadata load failed uuid=%llu artifactRoot=%s reason=%s\n",
                  (unsigned long long)container->plan.uuid,
                  container->artifactRootPath.c_str(),
@@ -8279,21 +8193,14 @@ public:
       return;
     }
 
-    if (plan.config.applicationID == 11)
-    {
-      basics_log("createContainer stage=launch-metadata deploymentID=%llu appID=%u execute=%s cwd=%s env=%u args=%u\n",
-                 (unsigned long long)plan.config.deploymentID(),
-                 unsigned(plan.config.applicationID),
-                 container->executePath.c_str(),
-                 container->executeCwd.c_str(),
-                 unsigned(container->executeEnv.size()),
-                 unsigned(container->executeArgs.size()));
-    }
-
     int rootfd = -1;
     String rootfsFailure = {};
     if (openVerifiedContainerRootfs(container, rootfd, &rootfsFailure) == false)
     {
+      if (failure)
+      {
+        failure->assign(rootfsFailure.size() > 0 ? rootfsFailure : "container rootfs validation failed"_ctv);
+      }
       basics_log("createContainer rootfs missing uuid=%llu rootfs=%s errno=%d(%s)\n",
                  (unsigned long long)container->plan.uuid,
                  container->rootfsPath.c_str(),
@@ -8312,6 +8219,10 @@ public:
 
     if (assignContainerRootfsOwnership(rootfd, uid_t(container->userID), gid_t(container->userID), &rootfsFailure) == false)
     {
+      if (failure)
+      {
+        failure->assign(rootfsFailure);
+      }
       basics_log("createContainer rootfs chown failed uuid=%llu path=%s userID=%u reason=%s\n",
                  (unsigned long long)container->plan.uuid,
                  container->rootfsPath.c_str(),
@@ -8325,6 +8236,10 @@ public:
 
     if (validateContainerLaunchTargetsInRootfs(container, rootfd, &rootfsFailure) == false)
     {
+      if (failure)
+      {
+        failure->assign(rootfsFailure);
+      }
       basics_log("createContainer launch target validation failed uuid=%llu artifactRoot=%s reason=%s\n",
                  (unsigned long long)container->plan.uuid,
                  receivedSubvolumePath.c_str(),
@@ -8337,6 +8252,10 @@ public:
 
     if (prepareContainerRootFSMountTargets(container, rootfd, &rootfsFailure) == false)
     {
+      if (failure)
+      {
+        failure->assign(rootfsFailure);
+      }
       basics_log("createContainer mount target preparation failed uuid=%llu artifactRoot=%s reason=%s\n",
                  (unsigned long long)container->plan.uuid,
                  receivedSubvolumePath.c_str(),
@@ -8354,6 +8273,10 @@ public:
       String storageFailure;
       if (prepareContainerStorage(container, &storageFailure) == false)
       {
+        if (failure)
+        {
+          failure->assign(storageFailure.size() > 0 ? storageFailure : "container storage preparation failed"_ctv);
+        }
         basics_log("createContainer storage prepare failed uuid=%llu reason=%s\n",
                    (unsigned long long)container->plan.uuid,
                    (storageFailure.size() ? storageFailure.c_str() : "unknown"));
@@ -8374,6 +8297,10 @@ public:
             artifactMoveUsedSnapshotFallback,
             &artifactMoveFailure) == false)
     {
+      if (failure)
+      {
+        failure->assign(artifactMoveFailure);
+      }
       basics_log("createContainer subvolume move failed from %s to %s reason=%s\n",
                  receivedSubvolumePath.c_str(),
                  finalArtifactRootPath.c_str(),
@@ -8383,20 +8310,14 @@ public:
       return;
     }
 
-    if (plan.config.applicationID == 11)
-    {
-      basics_log("createContainer stage=artifact-moved deploymentID=%llu appID=%u finalArtifactRoot=%s\n",
-                 (unsigned long long)plan.config.deploymentID(),
-                 unsigned(plan.config.applicationID),
-                 finalArtifactRootPath.c_str());
-    }
-
+#if PRODIGY_DEBUG
     if (artifactMoveUsedSnapshotFallback)
     {
       basics_log("createContainer subvolume move used snapshot fallback from %s to %s\n",
                  receivedSubvolumePath.c_str(),
                  finalArtifactRootPath.c_str());
     }
+#endif
 
     receiveScratchCleanup.released = true;
     (void)eraseDirectoryTree(receiveScratchPath);
@@ -8404,25 +8325,6 @@ public:
     container->artifactRootPath.assign(finalArtifactRootPath);
     container->rootfsPath.assign(finalArtifactRootPath);
     container->rootfsPath.append("/rootfs"_ctv);
-
-    {
-      String containerRootPath;
-      containerRootPath.assign(container->rootfsPath);
-
-      struct stat rootStat {};
-      int rootStatResult = stat(containerRootPath.c_str(), &rootStat);
-      int rootStatErrno = errno;
-
-      basics_log("createContainer finalized uuid=%llu deploymentID=%llu artifactRoot=%s rootfs=%s stat=%d errno=%d(%s) receivedScratchArtifact=%s\n",
-                 (unsigned long long)container->plan.uuid,
-                 (unsigned long long)plan.config.deploymentID(),
-                 container->artifactRootPath.c_str(),
-                 containerRootPath.c_str(),
-                 rootStatResult,
-                 rootStatErrno,
-                 strerror(rootStatErrno),
-                 receivedSubvolumePath.c_str());
-    }
 
     return;
   }
@@ -9249,30 +9151,6 @@ public:
 
   static bool startContainer(Container *container, bool isRestart = false, String *failureReport = nullptr)
   {
-    std::fprintf(stderr, "startContainer begin uuid=%llu appID=%u useHostNetns=%d dpfx=%u mpfx=%u.%u.%u neuron=%p pid=%d\n",
-                 (unsigned long long)container->plan.uuid,
-                 unsigned(container->plan.config.applicationID),
-                 int(container->plan.useHostNetworkNamespace),
-                 unsigned(thisNeuron->lcsubnet6.dpfx),
-                 unsigned(thisNeuron->lcsubnet6.mpfx[0]),
-                 unsigned(thisNeuron->lcsubnet6.mpfx[1]),
-                 unsigned(thisNeuron->lcsubnet6.mpfx[2]),
-                 static_cast<void *>(thisNeuron),
-                 int(container->pid));
-    std::fflush(stderr);
-
-    auto logStartStage = [&](const char *stage) -> void {
-      std::fprintf(stderr,
-                   "startContainer stage=%s uuid=%llu appID=%u restart=%d pid=%d cgroup=%d\n",
-                   stage,
-                   (unsigned long long)container->plan.uuid,
-                   unsigned(container->plan.config.applicationID),
-                   int(isRestart),
-                   int(container->pid),
-                   container->cgroup);
-      std::fflush(stderr);
-    };
-
     ensureSigchldIsWaitable();
 
     if (container->artifactRootPath.size() == 0)
@@ -9286,7 +9164,6 @@ public:
       container->rootfsPath.assign(container->artifactRootPath);
       container->rootfsPath.append("/rootfs"_ctv);
     }
-    logStartStage("paths-ready");
 
     if (container->executePath.size() == 0 || container->executeArchitecture == MachineCpuArchitecture::unknown)
     {
@@ -9303,7 +9180,6 @@ public:
         return false;
       }
     }
-    logStartStage("metadata-ready");
 
     int parentSupplementaryGroupCount = getgroups(0, nullptr);
     if (parentSupplementaryGroupCount < 0)
@@ -9326,7 +9202,6 @@ public:
       }
       return false;
     }
-    logStartStage("groups-empty");
 
     bool exposeNeuronSocket = container->exposesNeuronSocket();
     int neuronListenerFD = -1;
@@ -9354,7 +9229,6 @@ public:
     {
       return false;
     }
-    logStartStage(exposeNeuronSocket ? "listener-ready" : "listener-skipped");
 
     int socs[2] = {-1, -1};
     auto closeNeuronSocketPair = [&]() -> void {
@@ -9378,7 +9252,6 @@ public:
       }
       return false;
     }
-    logStartStage(exposeNeuronSocket ? "socketpair-ready" : "socketpair-skipped");
 
     int startupSync[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, startupSync) != 0)
@@ -9390,7 +9263,6 @@ public:
       closeNeuronSocketPair();
       return false;
     }
-    logStartStage("pipe-ready");
 
     String seccompBuildFailure = {};
     scmp_filter_ctx containerSeccomp = buildContainerSyscallFilter(container, &seccompBuildFailure);
@@ -9413,7 +9285,6 @@ public:
       closeNeuronSocketPair();
       return false;
     }
-    logStartStage("seccomp-ready");
 
     struct StartupSyncPayload {
       uint8_t startSignal = 0;
@@ -9464,7 +9335,6 @@ public:
       args.cgroup = 0;
     }
 
-    logStartStage("clone-enter");
     container->pid = syscall(SYS_clone3, &args, sizeof(struct clone_args));
 
     if (container->pid < 0)
@@ -9480,7 +9350,6 @@ public:
       closeNeuronSocketPair();
       return false;
     }
-    logStartStage(container->pid == 0 ? "clone-child" : "clone-parent");
 
     if (container->pid == 0) // child
     {
@@ -9988,7 +9857,6 @@ public:
 
         return false;
       }
-      logStartStage("ids-mapped");
 
       if (exposeNeuronSocket)
       {
@@ -10002,7 +9870,6 @@ public:
 
       if (container->isSystemContainer() && container->systemEgressConstrained() == false)
       {
-        logStartStage("system-network-skipped");
       }
       else if (container->plan.useHostNetworkNamespace == false)
       {
@@ -10037,7 +9904,6 @@ public:
         // container-to-container probes and other mesh-targeted traffic.
         installDatacenterMeshRoutes(thisNeuron->eth, thisNeuron->lcsubnet6.dpfx);
       }
-      logStartStage("network-ready");
 
       if (container->plan.usesIsolatedCPUs())
       {
@@ -10068,7 +9934,6 @@ public:
       }
 
       thisNeuron->pushContainer(container);
-      logStartStage("pushed");
       if (exposeNeuronSocket)
       {
         appendContainerTrace(container,
@@ -10088,11 +9953,9 @@ public:
                              (unsigned long long)container->queuedSendOutstandingBytes());
       }
       queueContainerWaitid(container);
-      logStartStage("waitid-queued");
       if (exposeNeuronSocket)
       {
         seedDynamicData(container);
-        logStartStage("dynamic-seeded");
       }
 
       StartupSyncPayload startupPayload;
@@ -10108,7 +9971,6 @@ public:
         }
         return false;
       }
-      logStartStage("startup-written");
 
       String pendingMarkerFailure = {};
       if (clearContainerCreatePendingMarker(container->artifactRootPath, &pendingMarkerFailure) == false)
@@ -10123,7 +9985,6 @@ public:
       {
         Filesystem::openWriteAtClose(container->cgroup, "cgroup.freeze"_ctv, "0"_ctv);
       }
-      logStartStage("cgroup-thawed");
 
       if (exposeNeuronSocket)
       {
@@ -10138,7 +9999,6 @@ public:
                              container->fslot,
                              (container->isFixedFile && container->fslot >= 0 ? Ring::getFDFromFixedFileSlot(container->fslot) : container->fd));
       }
-      logStartStage("complete");
       neuronListenerCleanup.released = true;
       return true;
     }
@@ -10245,11 +10105,12 @@ public:
     }
 
     Container *container = nullptr;
-    createContainer(plan, compressedContainerPath, container);
+    String createFailure = {};
+    createContainer(plan, compressedContainerPath, container, &createFailure);
     if (container == nullptr)
     {
       String report = {};
-      report.assign("createContainer returned null"_ctv);
+      report.assign(createFailure.size() > 0 ? createFailure : "container creation failed"_ctv);
       reportSpinContainerFailure(plan, report);
       co_return;
     }
@@ -10352,9 +10213,6 @@ public:
     if (container->pendingKillAckToBrain && thisNeuron != nullptr)
     {
       thisNeuron->queueContainerKillAck(container->plan.uuid);
-      std::fprintf(stderr, "destroyContainer finalize-kill-ack uuid=%llu\n",
-                   (unsigned long long)container->plan.uuid);
-      std::fflush(stderr);
       container->pendingKillAckToBrain = false;
     }
 
@@ -10388,6 +10246,7 @@ public:
     container->pendingDestroy = true;
     String path;
 
+#if PRODIGY_DEBUG
     int processAlive = 0;
     if (container->pid > 0 && kill(container->pid, 0) == 0)
     {
@@ -10455,6 +10314,7 @@ public:
     logDestroyFilePreview("/bootstage.txt"_ctv, "bootstage");
     logDestroyFilePreview("/crashreport.txt"_ctv, "crashreport");
     logDestroyFilePreview("/readytrace.log"_ctv, "readytrace");
+#endif
 
     container->cleanupNetwork();
 
@@ -10474,9 +10334,11 @@ public:
       }
       else if (retainedBundlePath.size() > 0)
       {
+#if PRODIGY_DEBUG
         basics_log("destroyContainer failed-container artifacts retained uuid=%llu path=%s\n",
                    (unsigned long long)container->plan.uuid,
                    retainedBundlePath.c_str());
+#endif
       }
     }
 
@@ -10554,12 +10416,6 @@ public:
     containerSubvolumePath.assign("/containers/"_ctv);
     containerSubvolumePath.append(container->name);
 
-    std::fprintf(stderr, "destroyContainer subvolume-delete-begin uuid=%llu path=%s waitingForCloseEvent=%d\n",
-                 (unsigned long long)container->plan.uuid,
-                 containerSubvolumePath.c_str(),
-                 int(waitingForCloseEvent));
-    std::fflush(stderr);
-
     std::vector<char *> argv;
     argv.push_back((char *)"btrfs");
     argv.push_back((char *)"subvolume");
@@ -10578,35 +10434,15 @@ public:
                  destroyOutput.c_str());
     }
 
-    std::fprintf(stderr, "destroyContainer subvolume-delete-end uuid=%llu path=%s outputBytes=%u\n",
-                 (unsigned long long)container->plan.uuid,
-                 containerSubvolumePath.c_str(),
-                 unsigned(destroyOutput.size()));
-    std::fflush(stderr);
-
     teardownContainerStorage(container);
-
-    std::fprintf(stderr, "destroyContainer storage-teardown-end uuid=%llu waitingForCloseEvent=%d\n",
-                 (unsigned long long)container->plan.uuid,
-                 int(waitingForCloseEvent));
-    std::fflush(stderr);
 
     // destroy cgroup tree
     (void)removeContainerCgroupTree(container);
-
-    std::fprintf(stderr, "destroyContainer cgroup-teardown-end uuid=%llu waitingForCloseEvent=%d\n",
-                 (unsigned long long)container->plan.uuid,
-                 int(waitingForCloseEvent));
-    std::fflush(stderr);
 
     if (waitingForCloseEvent || container->waitidPending)
     {
       return;
     }
-
-    std::fprintf(stderr, "destroyContainer finalize-immediate uuid=%llu\n",
-                 (unsigned long long)container->plan.uuid);
-    std::fflush(stderr);
 
     finalizeContainerDestroyIfReady(container);
   }

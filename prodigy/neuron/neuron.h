@@ -35,10 +35,12 @@
 #include <ebpf/common/structs.h>
 
 #include <prodigy/neuron/base.h>
+#include <prodigy/debug.h>
 #include <prodigy/brain/base.h>
 #include <prodigy/brain/timing.knobs.h>
 #include <prodigy/neuron/bgp.runtime.h>
 #include <prodigy/neuron/containers.h>
+#include <prodigy/bundle.artifact.h>
 #include <prodigy/machine.hardware.h>
 #include <prodigy/netdev.detect.h>
 #include <prodigy/transport.tls.h>
@@ -113,6 +115,7 @@ protected:
   ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> installedBalancerOverlayRouteKeysLow8;
   ProdigyOverlayValueMirror<switchboard_overlay_prefix4_key, switchboard_overlay_hosted_ingress_route4> installedBalancerHostedIngressRouteKeys4;
   ProdigyOverlayValueMirror<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6> installedBalancerHostedIngressRouteKeys6;
+  ProdigyOverlayValueMirror<portal_definition, switchboard_whitehole_binding> installedIngressWhiteholeBindingKeys;
   ProdigyOverlayValueMirror<portal_definition, switchboard_whitehole_binding> installedEgressWhiteholeBindingKeys;
   bytell_hash_subvector<uint32_t, LocalWhiteholeBindingEntry> whiteholeBindingsByContainer;
   bytell_hash_subvector<uint64_t, CoroutineStack *> pendingContainerDownloads;
@@ -556,6 +559,12 @@ protected:
       }
     }
 
+    prodigySyncOverlayValueMap(tcx_ingress_program,
+                               "whiteholes"_ctv,
+                               installedIngressWhiteholeBindingKeys,
+                               desiredBindings,
+                               prodigyPortalDefinitionLess,
+                               switchboardWhiteholeBindingEquals);
     prodigySyncOverlayValueMap(tcx_egress_program,
                                "whiteholes"_ctv,
                                installedEgressWhiteholeBindingKeys,
@@ -619,7 +628,43 @@ protected:
 
     if (haveIngress == false)
     {
-      return false;
+      String executablePath = {};
+      if (prodigyResolveCurrentExecutablePath(executablePath) == false)
+      {
+        return false;
+      }
+
+      String executableDirectory = {};
+      prodigyDirname(executablePath, executableDirectory);
+      hostIngressPath.assign(executableDirectory);
+      hostEgressPath.assign(executableDirectory);
+      if (hostIngressPath.size() > 0 && hostIngressPath[hostIngressPath.size() - 1] != '/')
+      {
+        hostIngressPath.append('/');
+        hostEgressPath.append('/');
+      }
+      hostIngressPath.append("host.ingress.router.ebpf.o"_ctv);
+      hostEgressPath.append("host.egress.router.ebpf.o"_ctv);
+
+      bool defaultIngressReadable = prodigyFileReadable(hostIngressPath);
+      bool defaultEgressReadable = prodigyFileReadable(hostEgressPath);
+      if (defaultIngressReadable != defaultEgressReadable)
+      {
+        if (failureReport)
+        {
+          failureReport->assign("bundled host ingress and egress BPF objects must be present together"_ctv);
+        }
+        hostIngressPath.clear();
+        hostEgressPath.clear();
+        return false;
+      }
+      if (defaultIngressReadable == false)
+      {
+        hostIngressPath.clear();
+        hostEgressPath.clear();
+        return false;
+      }
+      return true;
     }
 
     hostIngressPath.assign(ingressEnv);
@@ -656,21 +701,21 @@ protected:
     if (ProdigyTransportTLSRuntime::extractPeerUUID(brain->ssl, peerUUID) == false)
     {
       basics_log("neuron transport tls missing brain peer uuid fd=%d fslot=%d\n", brain->fd, brain->fslot);
-      std::fprintf(stderr,
+      PRODIGY_DEBUG_LOG(
                    "neuron brain tls-verify missing-peer-uuid fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d\n",
                    brain->fd,
                    brain->fslot,
                    int(brain->pendingSend),
                    int(brain->pendingRecv),
                    int(brain->isTLSNegotiated()));
-      std::fflush(stderr);
+      PRODIGY_DEBUG_FLUSH();
       return false;
     }
 
     brain->tlsPeerUUID = peerUUID;
     brain->tlsPeerVerified = true;
     basics_log("neuron brain transport tls peer verified fd=%d fslot=%d\n", brain->fd, brain->fslot);
-    std::fprintf(stderr,
+    PRODIGY_DEBUG_LOG(
                  "neuron brain tls-verify ok peerUUID=%llu fd=%d fslot=%d pendingSend=%d pendingRecv=%d queued=%llu\n",
                  (unsigned long long)peerUUID,
                  brain->fd,
@@ -678,7 +723,7 @@ protected:
                  int(brain->pendingSend),
                  int(brain->pendingRecv),
                  (unsigned long long)brain->queuedSendOutstandingBytes());
-    std::fflush(stderr);
+    PRODIGY_DEBUG_FLUSH();
     (void)queueMachineHardwareProfileToBrainIfReady("transport-tls-peer-verified");
     return true;
   }
@@ -939,8 +984,8 @@ protected:
       deferredHardwareInventoryInFlight = true;
     }
 
-    std::fprintf(stderr, "neuron deferred hardware begin wakeFD=%d\n", deferredHardwareInventoryWake.fd);
-    std::fflush(stderr);
+    PRODIGY_DEBUG_LOG( "neuron deferred hardware begin wakeFD=%d\n", deferredHardwareInventoryWake.fd);
+    PRODIGY_DEBUG_FLUSH();
 
     std::thread([this]() mutable {
       DeferredHardwareInventoryResult result = {};
@@ -955,7 +1000,7 @@ protected:
         basics_log("Neuron deferred hardware inventory threw exception=unknown\n");
       }
 
-      std::fprintf(stderr, "neuron deferred hardware collected inventoryComplete=%d serializedBytes=%llu logicalCores=%u memoryMB=%u disks=%llu nics=%llu failure=%s\n",
+      PRODIGY_DEBUG_LOG( "neuron deferred hardware collected inventoryComplete=%d serializedBytes=%llu logicalCores=%u memoryMB=%u disks=%llu nics=%llu failure=%s\n",
                    int(result.hardware.inventoryComplete),
                    (unsigned long long)result.serializedHardwareProfile.size(),
                    result.hardware.cpu.logicalCores,
@@ -963,7 +1008,7 @@ protected:
                    (unsigned long long)result.hardware.disks.size(),
                    (unsigned long long)result.hardware.network.nics.size(),
                    result.hardware.inventoryFailure.c_str());
-      std::fflush(stderr);
+      PRODIGY_DEBUG_FLUSH();
 
       {
         std::lock_guard<std::mutex> lock(deferredHardwareInventoryMutex);
@@ -974,17 +1019,17 @@ protected:
       {
         uint64_t signal = 1;
         ssize_t wrote = ::write(deferredHardwareInventoryWake.fd, &signal, sizeof(signal));
-        std::fprintf(stderr, "neuron deferred hardware wake-signaled fd=%d wrote=%lld errno=%d(%s)\n",
+        PRODIGY_DEBUG_LOG( "neuron deferred hardware wake-signaled fd=%d wrote=%lld errno=%d(%s)\n",
                      deferredHardwareInventoryWake.fd,
                      (long long)wrote,
                      (wrote < 0 ? errno : 0),
                      (wrote < 0 ? strerror(errno) : "ok"));
-        std::fflush(stderr);
+        PRODIGY_DEBUG_FLUSH();
       }
       else
       {
-        std::fprintf(stderr, "neuron deferred hardware wake-skipped fd=%d\n", deferredHardwareInventoryWake.fd);
-        std::fflush(stderr);
+        PRODIGY_DEBUG_LOG( "neuron deferred hardware wake-skipped fd=%d\n", deferredHardwareInventoryWake.fd);
+        PRODIGY_DEBUG_FLUSH();
       }
     }).detach();
   }
@@ -1060,7 +1105,7 @@ protected:
         deferredInFlight = deferredHardwareInventoryInFlight;
       }
 
-      std::fprintf(stderr, "neuron machineHardwareProfile unavailable reason=%s deferredReady=%d deferredInFlight=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d\n",
+      PRODIGY_DEBUG_LOG( "neuron machineHardwareProfile unavailable reason=%s deferredReady=%d deferredInFlight=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d\n",
                    (reason != nullptr ? reason : ""),
                    int(deferredReadyPresent),
                    int(deferredInFlight),
@@ -1070,7 +1115,7 @@ protected:
                    int(brainPresent ? brain->pendingRecv : 0),
                    int(brainPresent ? brain->isTLSNegotiated() : 0),
                    int(brainPresent ? brain->tlsPeerVerified : 0));
-      std::fflush(stderr);
+      PRODIGY_DEBUG_FLUSH();
     }
 
 #if PRODIGY_DEBUG
@@ -1096,7 +1141,7 @@ protected:
   {
     bool brainPresentBeforeAdopt = (brain != nullptr);
     bool brainActiveBeforeAdopt = (brainPresentBeforeAdopt && streamIsActive(brain));
-    std::fprintf(stderr,
+    PRODIGY_DEBUG_LOG(
                  "neuron deferred hardware adopt-begin inventoryComplete=%d serializedBytes=%llu brainPresent=%d brainActive=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d\n",
                  int(result.hardware.inventoryComplete),
                  (unsigned long long)result.serializedHardwareProfile.size(),
@@ -1108,7 +1153,7 @@ protected:
                  int(brainPresentBeforeAdopt ? brain->pendingRecv : 0),
                  int(brainPresentBeforeAdopt ? brain->isTLSNegotiated() : 0),
                  int(brainPresentBeforeAdopt ? brain->tlsPeerVerified : 0));
-    std::fflush(stderr);
+    PRODIGY_DEBUG_FLUSH();
     basics_log("Neuron adopting deferred hardware inventory inventoryComplete=%d serializedBytes=%llu logicalCores=%u memoryMB=%u disks=%llu nics=%llu\n",
                int(result.hardware.inventoryComplete),
                (unsigned long long)result.serializedHardwareProfile.size(),
@@ -1127,7 +1172,7 @@ protected:
     bool brainPresent = (brain != nullptr);
     bool brainActive = (brainPresent && streamIsActive(brain));
     bool queuedHardwareProfile = queueMachineHardwareProfileToBrainIfReady("deferred-hardware-adopt");
-    std::fprintf(stderr,
+    PRODIGY_DEBUG_LOG(
                  "neuron deferred hardware adopt-end brainPresent=%d brainActive=%d queued=%d serializedBytes=%llu fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d\n",
                  int(brainPresent),
                  int(brainActive),
@@ -1139,7 +1184,7 @@ protected:
                  int(brainPresent ? brain->pendingRecv : 0),
                  int(brainPresent ? brain->isTLSNegotiated() : 0),
                  int(brainPresent ? brain->tlsPeerVerified : 0));
-    std::fflush(stderr);
+    PRODIGY_DEBUG_FLUSH();
 
 #if PRODIGY_DEBUG
     basics_log("Neuron deferred hardware inventory send brainPresent=%d brainActive=%d queued=%d serializedBytes=%llu fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d\n",
@@ -1169,7 +1214,7 @@ protected:
       if (deferredHardwareInventoryReady == std::nullopt)
       {
         bool completed = (deferredHardwareInventoryInFlight == false);
-        std::fprintf(stderr,
+        PRODIGY_DEBUG_LOG(
                      "neuron deferred hardware complete-skip readyPresent=%d inFlight=%d completed=%d serializedBytes=%llu brainPresent=%d brainActive=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d\n",
                      int(deferredReadyPresent),
                      int(deferredInFlight),
@@ -1183,7 +1228,7 @@ protected:
                      int(brain ? brain->pendingRecv : 0),
                      int(brain ? brain->isTLSNegotiated() : 0),
                      int(brain ? brain->tlsPeerVerified : 0));
-        std::fflush(stderr);
+        PRODIGY_DEBUG_FLUSH();
         return completed;
       }
 
@@ -1194,7 +1239,7 @@ protected:
 
     if (ready == std::nullopt)
     {
-      std::fprintf(stderr,
+      PRODIGY_DEBUG_LOG(
                    "neuron deferred hardware complete-nullopt readyPresent=%d inFlight=%d serializedBytes=%llu brainPresent=%d brainActive=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d\n",
                    int(deferredReadyPresent),
                    int(deferredInFlight),
@@ -1207,12 +1252,12 @@ protected:
                    int(brain ? brain->pendingRecv : 0),
                    int(brain ? brain->isTLSNegotiated() : 0),
                    int(brain ? brain->tlsPeerVerified : 0));
-      std::fflush(stderr);
+      PRODIGY_DEBUG_FLUSH();
       return true;
     }
 
     DeferredHardwareInventoryResult result = std::move(*ready);
-    std::fprintf(stderr,
+    PRODIGY_DEBUG_LOG(
                  "neuron deferred hardware complete-ready readyPresent=%d inFlight=%d inventoryComplete=%d serializedBytes=%llu brainPresent=%d brainActive=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d\n",
                  int(deferredReadyPresent),
                  int(deferredInFlight),
@@ -1226,15 +1271,15 @@ protected:
                  int(brain ? brain->pendingRecv : 0),
                  int(brain ? brain->isTLSNegotiated() : 0),
                  int(brain ? brain->tlsPeerVerified : 0));
-    std::fflush(stderr);
+    PRODIGY_DEBUG_FLUSH();
     if (deferredHardwareInventoryResultReadyForAdoption(result) == false)
     {
-      std::fprintf(stderr,
+      PRODIGY_DEBUG_LOG(
                    "neuron deferred hardware complete-retry inventoryComplete=%d serializedBytes=%llu failure=%s\n",
                    int(result.hardware.inventoryComplete),
                    (unsigned long long)result.serializedHardwareProfile.size(),
                    result.hardware.inventoryFailure.c_str());
-      std::fflush(stderr);
+      PRODIGY_DEBUG_FLUSH();
       basics_log("Neuron deferred hardware inventory retry inventoryComplete=%d serializedBytes=%llu logicalCores=%u memoryMB=%u disks=%llu nics=%llu failure=%s\n",
                  int(result.hardware.inventoryComplete),
                  (unsigned long long)result.serializedHardwareProfile.size(),
@@ -2124,7 +2169,7 @@ protected:
 
   // we don't run this until after the brain sends us our fragment and any container plans, because we use
   // haveFragments as a test of whether it was a spurious connection break or a neuron crash/update or machine crash/update
-  void setupNetworking(void)
+  void setupNetworking(String *failureReport = nullptr)
   {
     IPPrefix containerSubnet6 = generateAddress(container_network_subnet6, 0, 120);
     Vector<IPPrefix> localPrefixes;
@@ -2153,6 +2198,11 @@ protected:
         }
         else
         {
+          if (failureReport)
+          {
+            failureReport->snprintf<"failed to attach host egress router interface={} ifidx={itoa} errno={itoa}({})"_ctv>(
+                eth.name, uint32_t(eth.ifidx), uint32_t(errno), String(strerror(errno)));
+          }
           basics_log("setupNetworking failed to attach host egress path=%s ifidx=%d\n",
                      hostEgressPath.c_str(), eth.ifidx);
         }
@@ -2226,6 +2276,11 @@ protected:
           }
           else
           {
+            if (failureReport)
+            {
+              failureReport->snprintf<"failed to attach host ingress router interface={} ifidx={itoa} errno={itoa}({})"_ctv>(
+                  eth.name, uint32_t(eth.ifidx), uint32_t(errno), String(strerror(errno)));
+            }
             basics_log("setupNetworking failed to attach host ingress path=%s ifidx=%d\n",
                        hostIngressPath.c_str(), eth.ifidx);
           }
@@ -2261,11 +2316,21 @@ protected:
       switchboard->setLocalContainerSubnet(lcsubnet6);
     }
 
+    syncWhiteholeBindingsProgram();
     syncOverlayRoutingPrograms();
   }
 
   virtual bool ensureHostNetworkingReady(String *failureReport = nullptr) override
   {
+    if (writeProcSysctlValue("/proc/sys/net/ipv6/conf/all/forwarding", "1") == false)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("failed to enable IPv6 container routing"_ctv);
+      }
+      return false;
+    }
+
     if (tcx_ingress_program && tcx_egress_program)
     {
       return true;
@@ -2307,7 +2372,7 @@ protected:
       return false;
     }
 
-    setupNetworking();
+    setupNetworking(failureReport);
 
     if (hostRouterBPFEnabled == false)
     {
@@ -2316,7 +2381,7 @@ protected:
 
     if (tcx_ingress_program == nullptr || tcx_egress_program == nullptr)
     {
-      if (failureReport)
+      if (failureReport && failureReport->size() == 0)
       {
         failureReport->snprintf<"host networking programs unavailable ingress={} egress={}"_ctv>(
             String(tcx_ingress_program ? "ready" : "missing"),
@@ -2577,13 +2642,13 @@ public:
       osUpdateProcess.pollQueued = true;
     }
 
-    std::fprintf(stderr,
+    PRODIGY_DEBUG_LOG(
                  "neuron updateOS started targetOSID=%s targetOSVersionID=%s launcherPid=%lld pidfd=%d\n",
                  targetOSIDText.c_str(),
                  targetOSVersionIDText.c_str(),
                  (long long)pid,
                  osUpdateProcess.fd);
-    std::fflush(stderr);
+    PRODIGY_DEBUG_FLUSH();
     basics_log("neuron updateOS started targetOSID=%s targetOSVersionID=%s launcherPid=%lld pidfd=%d\n",
                targetOSIDText.c_str(),
                targetOSVersionIDText.c_str(),
@@ -2650,7 +2715,7 @@ public:
     deferredHardwareInventoryWake.fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (deferredHardwareInventoryWake.fd < 0)
     {
-      std::fprintf(stderr, "prodigy deferred hardware wake eventfd failed errno=%d(%s)\n", errno, strerror(errno));
+      PRODIGY_DEBUG_LOG( "prodigy deferred hardware wake eventfd failed errno=%d(%s)\n", errno, strerror(errno));
       std::abort();
     }
     deferredHardwareInventoryWake.setNonBlocking();
@@ -2788,7 +2853,7 @@ public:
       container->closeSocket();
     }
 
-    std::fprintf(stderr,
+    PRODIGY_DEBUG_LOG(
                  "neuron waitid debug uuid=%llu pid=%d code=%d status=%d killedOnPurpose=%d pendingDestroyBefore=%d destroyAfter=%d restart=%d deploymentID=%llu lifetime=%u\n",
                  (unsigned long long)containerUUID,
                  int(infop.si_pid),
@@ -2800,7 +2865,7 @@ public:
                  int(restart),
                  (unsigned long long)container->plan.config.deploymentID(),
                  unsigned(container->plan.lifetime));
-    std::fflush(stderr);
+    PRODIGY_DEBUG_FLUSH();
 
     basics_log("neuron waitid uuid=%llu pid=%d code=%d status=%d killedOnPurpose=%d restart=%d startupFailure=%d\n",
                (unsigned long long)containerUUID,
@@ -3066,7 +3131,7 @@ public:
                      (unsigned long long)container->plan.uuid,
                      (unsigned long long)container->plan.config.deploymentID(),
                      unsigned(container->plan.config.applicationID));
-          std::fprintf(stderr,
+          PRODIGY_DEBUG_LOG(
                        "neuron containerHealthy dispatch uuid=%llu deploymentID=%llu appID=%u thisBrain=%p canControl=%d brainPresent=%d brainActive=%d fd=%d fslot=%d pendingSend=%d pendingRecv=%d\n",
                        (unsigned long long)container->plan.uuid,
                        (unsigned long long)container->plan.config.deploymentID(),
@@ -3079,7 +3144,7 @@ public:
                        brain ? brain->fslot : -1,
                        int(brain ? brain->pendingSend : 0),
                        int(brain ? brain->pendingRecv : 0));
-          std::fflush(stderr);
+          PRODIGY_DEBUG_FLUSH();
 
           bool controllingBrainActive = (brain != nullptr && streamIsActive(brain));
           if (thisBrain != nullptr && (thisBrain->canControlNeurons() || controllingBrainActive == false))
@@ -3104,7 +3169,7 @@ public:
           {
             if (verboseNeuronSocketLogsEnabled())
             {
-              std::fprintf(stderr,
+              PRODIGY_DEBUG_LOG(
                            "neuron containerHealthy forward-begin uuid=%llu brain=%p active=%d pendingSend=%d pendingRecv=%d wbytes=%u queued=%llu fd=%d fslot=%d\n",
                            (unsigned long long)container->plan.uuid,
                            static_cast<void *>(brain),
@@ -3115,12 +3180,12 @@ public:
                            (unsigned long long)brain->queuedSendOutstandingBytes(),
                            brain->fd,
                            brain->fslot);
-              std::fflush(stderr);
+              PRODIGY_DEBUG_FLUSH();
             }
             Message::construct(brain->wBuffer, NeuronTopic::containerHealthy, container->plan.uuid);
             if (verboseNeuronSocketLogsEnabled())
             {
-              std::fprintf(stderr,
+              PRODIGY_DEBUG_LOG(
                            "neuron containerHealthy forward-constructed uuid=%llu pendingSend=%d wbytes=%u queued=%llu fd=%d fslot=%d\n",
                            (unsigned long long)container->plan.uuid,
                            int(brain->pendingSend),
@@ -3128,14 +3193,14 @@ public:
                            (unsigned long long)brain->queuedSendOutstandingBytes(),
                            brain->fd,
                            brain->fslot);
-              std::fflush(stderr);
+              PRODIGY_DEBUG_FLUSH();
             }
             if (controllingBrainActive)
             {
               Ring::queueSend(brain);
               if (verboseNeuronSocketLogsEnabled())
               {
-                std::fprintf(stderr,
+                PRODIGY_DEBUG_LOG(
                              "neuron containerHealthy forward-queued uuid=%llu pendingSend=%d pendingSendBytes=%u wbytes=%u queued=%llu fd=%d fslot=%d\n",
                              (unsigned long long)container->plan.uuid,
                              int(brain->pendingSend),
@@ -3144,12 +3209,12 @@ public:
                              (unsigned long long)brain->queuedSendOutstandingBytes(),
                              brain->fd,
                              brain->fslot);
-                std::fflush(stderr);
+                PRODIGY_DEBUG_FLUSH();
               }
             }
             else if (verboseNeuronSocketLogsEnabled())
             {
-              std::fprintf(stderr,
+              PRODIGY_DEBUG_LOG(
                            "neuron containerHealthy forward-buffered uuid=%llu pendingSend=%d wbytes=%u queued=%llu fd=%d fslot=%d\n",
                            (unsigned long long)container->plan.uuid,
                            int(brain->pendingSend),
@@ -3157,7 +3222,7 @@ public:
                            (unsigned long long)brain->queuedSendOutstandingBytes(),
                            brain->fd,
                            brain->fslot);
-              std::fflush(stderr);
+              PRODIGY_DEBUG_FLUSH();
             }
           }
 
@@ -3315,7 +3380,7 @@ public:
 
     if (alreadyPending == false)
     {
-      std::fprintf(stderr, "neuron downloadContainer request deploymentID=%llu brainPresent=%d brainActive=%d pendingCount=%llu pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d fd=%d fslot=%d\n",
+      PRODIGY_DEBUG_LOG( "neuron downloadContainer request deploymentID=%llu brainPresent=%d brainActive=%d pendingCount=%llu pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d fd=%d fslot=%d\n",
                    (unsigned long long)deploymentID,
                    int(brain != nullptr),
                    int(streamIsActive(brain)),
@@ -3326,7 +3391,7 @@ public:
                    int(brain ? brain->tlsPeerVerified : 0),
                    (brain ? brain->fd : -1),
                    (brain ? brain->fslot : -1));
-      std::fflush(stderr);
+      PRODIGY_DEBUG_FLUSH();
       Message::construct(brain->wBuffer, NeuronTopic::requestContainerBlob, deploymentID);
       if (streamIsActive(brain))
       {
@@ -3647,12 +3712,12 @@ public:
           String failure = {};
           if (startOperatingSystemUpdate(targetOSIDText, targetOSVersionIDText, updateCommandText, &failure) == false)
           {
-            std::fprintf(stderr,
+            PRODIGY_DEBUG_LOG(
                          "neuron updateOS failed targetOSID=%s targetOSVersionID=%s reason=%s\n",
                          targetOSIDText.c_str(),
                          targetOSVersionIDText.c_str(),
                          failure.c_str());
-            std::fflush(stderr);
+            PRODIGY_DEBUG_FLUSH();
             basics_log("neuron updateOS failed targetOSID=%s targetOSVersionID=%s reason=%s\n",
                        targetOSIDText.c_str(),
                        targetOSVersionIDText.c_str(),
@@ -3739,22 +3804,22 @@ public:
 
           String containerBlob;
           Message::extractToStringView(args, containerBlob);
-          std::fprintf(stderr, "neuron requestContainerBlob response deploymentID=%llu bytes=%u pendingWaiters=%llu\n",
+          PRODIGY_DEBUG_LOG( "neuron requestContainerBlob response deploymentID=%llu bytes=%u pendingWaiters=%llu\n",
                        (unsigned long long)deploymentID,
                        unsigned(containerBlob.size()),
                        (unsigned long long)(pendingContainerDownloads.contains(deploymentID) ? pendingContainerDownloads.countEntriesFor(deploymentID) : 0));
-          std::fflush(stderr);
+          PRODIGY_DEBUG_FLUSH();
 
           if (containerBlob.size() > 0)
           {
             String containerStoreFailure = {};
             if (ContainerStore::store(deploymentID, containerBlob, nullptr, nullptr, nullptr, nullptr, &containerStoreFailure) == false)
             {
-              std::fprintf(stderr,
+              PRODIGY_DEBUG_LOG(
                            "neuron requestContainerBlob store failed deploymentID=%llu reason=%s\n",
                            (unsigned long long)deploymentID,
                            (containerStoreFailure.size() > 0 ? containerStoreFailure.c_str() : "unknown"));
-              std::fflush(stderr);
+              PRODIGY_DEBUG_FLUSH();
             }
           }
 
@@ -3808,13 +3873,13 @@ public:
             basics_log("neuron spinContainer plan deserialize failed\n");
             break;
           }
-          std::fprintf(stderr, "neuron spinContainer deploymentID=%llu appID=%u replaceUUID=%llu blobBytes=%llu blobSHA=%s\n",
+          PRODIGY_DEBUG_LOG( "neuron spinContainer deploymentID=%llu appID=%u replaceUUID=%llu blobBytes=%llu blobSHA=%s\n",
                        (unsigned long long)plan.config.deploymentID(),
                        unsigned(plan.config.applicationID),
                        (unsigned long long)replaceContainerUUID,
                        (unsigned long long)plan.config.containerBlobBytes,
                        plan.config.containerBlobSHA256.c_str());
-          std::fflush(stderr);
+          PRODIGY_DEBUG_FLUSH();
 
           ContainerManager::spinContainer(plan, replaceContainerUUID, metricPolicy);
 
@@ -3897,12 +3962,12 @@ public:
           if (auto it = containers.find(containerUUID); it != containers.end())
           {
             Container *container = it->second;
-            std::fprintf(stderr,
+            PRODIGY_DEBUG_LOG(
                          "neuron changeContainerLifetime uuid=%llu deploymentID=%llu old=%u\n",
                          (unsigned long long)containerUUID,
                          (unsigned long long)container->plan.config.deploymentID(),
                          unsigned(container->plan.lifetime));
-            std::fflush(stderr);
+            PRODIGY_DEBUG_FLUSH();
             Message::extractArg<ArgumentNature::fixed>(args, container->plan.lifetime);
           }
 
@@ -3918,7 +3983,7 @@ public:
           if (auto it = containers.find(containerUUID); it != containers.end())
           {
             Container *container = it->second;
-            std::fprintf(stderr,
+            PRODIGY_DEBUG_LOG(
                          "neuron killContainer command uuid=%llu deploymentID=%llu lifetime=%u pendingDestroy=%d killedOnPurpose=%d pid=%d\n",
                          (unsigned long long)containerUUID,
                          (unsigned long long)container->plan.config.deploymentID(),
@@ -3926,7 +3991,7 @@ public:
                          int(container->pendingDestroy),
                          int(container->killedOnPurpose),
                          int(container->pid));
-            std::fflush(stderr);
+            PRODIGY_DEBUG_FLUSH();
             container->pendingKillAckToBrain = true;
             container->stop();
           }
@@ -4478,7 +4543,7 @@ public:
     {
       if constexpr (std::is_same_v<T, NeuronBrainControlStream>)
       {
-        std::fprintf(stderr,
+        PRODIGY_DEBUG_LOG(
                      "neuron brain recv-terminal result=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d fd=%d fslot=%d queued=%llu rbytes=%llu\n",
                      result,
                      int(stream->pendingSend),
@@ -4489,7 +4554,7 @@ public:
                      stream->fslot,
                      (unsigned long long)stream->queuedSendOutstandingBytes(),
                      (unsigned long long)stream->rBuffer.outstandingBytes());
-        std::fflush(stderr);
+        PRODIGY_DEBUG_FLUSH();
       }
       if constexpr (std::is_same_v<T, Container>)
       {
@@ -4666,7 +4731,7 @@ public:
     {
       if constexpr (std::is_same_v<T, NeuronBrainControlStream>)
       {
-        std::fprintf(stderr,
+        PRODIGY_DEBUG_LOG(
                      "neuron brain send-terminal result=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d fd=%d fslot=%d queued=%llu wbytes=%u\n",
                      result,
                      int(stream->pendingSend),
@@ -4677,7 +4742,7 @@ public:
                      stream->fslot,
                      (unsigned long long)stream->queuedSendOutstandingBytes(),
                      unsigned(stream->wBuffer.size()));
-        std::fflush(stderr);
+        PRODIGY_DEBUG_FLUSH();
       }
       stream->noteSendCompleted();
       // Do not replay partial frame tails after reconnect.
@@ -4777,12 +4842,12 @@ public:
                  static_cast<void *>(brain),
                  brain->fd,
                  brain->fslot);
-      std::fprintf(stderr, "neuron brain control accepted-live stream=%p fd=%d fslot=%d retained=%zu\n",
+      PRODIGY_DEBUG_LOG( "neuron brain control accepted-live stream=%p fd=%d fslot=%d retained=%zu\n",
                    static_cast<void *>(brain),
                    brain->fd,
                    brain->fslot,
                    size_t(closingBrainControls.size()));
-      std::fflush(stderr);
+      PRODIGY_DEBUG_FLUSH();
 
       if (ProdigyTransportTLSRuntime::configured() && beginAcceptedBrainTransportTLS(brain) == false)
       {
@@ -4813,7 +4878,7 @@ public:
       }
 
       bool queuedHardwareProfile = queueMachineHardwareProfileToBrainIfReady("brain-control-accept");
-      std::fprintf(stderr,
+      PRODIGY_DEBUG_LOG(
                    "neuron brain control queue-hardware reason=accept stream=%p fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d queuedHardware=%d wbytes=%u queued=%llu serializedHardware=%llu\n",
                    static_cast<void *>(brain),
                    brain->fd,
@@ -4826,7 +4891,7 @@ public:
                    unsigned(brain->wBuffer.size()),
                    (unsigned long long)brain->queuedSendOutstandingBytes(),
                    (unsigned long long)serializedHardwareProfile.size());
-      std::fflush(stderr);
+      PRODIGY_DEBUG_FLUSH();
       (void)appendHealthyContainerFrames(brain->wBuffer);
 
       if (streamIsActive(brain))
@@ -4876,7 +4941,7 @@ public:
                  result,
                  int(infop.si_code),
                  int(infop.si_status));
-      std::fprintf(stderr,
+      PRODIGY_DEBUG_LOG(
                    "neuron updateOS launcher-poll targetOSID=%s targetOSVersionID=%s launcherPid=%lld result=%d code=%d status=%d\n",
                    osUpdateProcess.targetOSID.c_str(),
                    osUpdateProcess.targetOSVersionID.c_str(),
@@ -4884,7 +4949,7 @@ public:
                    result,
                    int(infop.si_code),
                    int(infop.si_status));
-      std::fflush(stderr);
+      PRODIGY_DEBUG_FLUSH();
       clearOSUpdateProcess();
       return;
     }
@@ -4892,16 +4957,16 @@ public:
     if (socket == (void *)&deferredHardwareInventoryWake)
     {
       deferredHardwareInventoryWakePollQueued = false;
-      std::fprintf(stderr, "neuron deferred hardware wake result=%d fd=%d\n", result, deferredHardwareInventoryWake.fd);
-      std::fflush(stderr);
+      PRODIGY_DEBUG_LOG( "neuron deferred hardware wake result=%d fd=%d\n", result, deferredHardwareInventoryWake.fd);
+      PRODIGY_DEBUG_FLUSH();
       if (result != -ECANCELED)
       {
         drainDeferredHardwareInventoryWake();
         bool completed = completeDeferredHardwareInventoryIfReady();
-        std::fprintf(stderr, "neuron deferred hardware wake-drain-complete result=%d completed=%d\n",
+        PRODIGY_DEBUG_LOG( "neuron deferred hardware wake-drain-complete result=%d completed=%d\n",
                      result,
                      int(completed));
-        std::fflush(stderr);
+        PRODIGY_DEBUG_FLUSH();
         armDeferredHardwareInventoryWakePoll();
       }
       return;
@@ -4924,12 +4989,12 @@ public:
                  int(closingBrain->pendingRecv),
                  int(closingBrain->isTLSNegotiated()),
                  int(closingBrain->tlsPeerVerified));
-      std::fprintf(stderr, "neuron brain control close-live stream=%p fd=%d fslot=%d retained=%zu\n",
+      PRODIGY_DEBUG_LOG( "neuron brain control close-live stream=%p fd=%d fslot=%d retained=%zu\n",
                    static_cast<void *>(closingBrain),
                    closingBrain->fd,
                    closingBrain->fslot,
                    size_t(closingBrainControls.size()));
-      std::fflush(stderr);
+      PRODIGY_DEBUG_FLUSH();
 
       retireBrainControlStream(closingBrain, "close-live-drain");
       queueBrainAccept();

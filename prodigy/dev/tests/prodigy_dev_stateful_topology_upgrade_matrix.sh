@@ -49,24 +49,12 @@ target_arch="$(prodigy_dev_detect_target_arch)"
 
 tmpdir="$(mktemp -d)"
 export TMPDIR="${tmpdir}"
-containers_dir_created=0
-containers_mount_created=0
 failed_cases=0
 total_cases=0
 
 cleanup()
 {
    set +e
-
-   if [[ "${containers_mount_created}" -eq 1 ]]
-   then
-      umount /containers >/dev/null 2>&1 || true
-   fi
-
-   if [[ "${containers_dir_created}" -eq 1 ]]
-   then
-      rmdir /containers >/dev/null 2>&1 || true
-   fi
 
    if [[ "${failed_cases}" -ne 0 ]]
    then
@@ -76,36 +64,6 @@ cleanup()
    fi
 }
 trap cleanup EXIT
-
-if [[ ! -d /containers ]]
-then
-   mkdir -p /containers
-   containers_dir_created=1
-fi
-
-containers_fs_type="$(stat -f -c '%T' /containers 2>/dev/null || echo unknown)"
-if [[ "${containers_fs_type}" != "btrfs" ]]
-then
-   if awk '$2 == "/containers" { found = 1 } END { exit(found ? 0 : 1) }' /proc/self/mounts
-   then
-      echo "FAIL: /containers is mounted but not btrfs (found ${containers_fs_type})"
-      exit 1
-   fi
-
-   if ! prodigy_dev_containers_root_is_safely_overmountable /containers
-   then
-      echo "FAIL: /containers exists on non-btrfs fs and is not safely overmountable"
-      exit 1
-   fi
-
-   containers_loop_image="${tmpdir}/containers.loop.img"
-   truncate -s 2G "${containers_loop_image}"
-   mkfs.btrfs -f "${containers_loop_image}" >/dev/null
-   mount -o loop "${containers_loop_image}" /containers
-   containers_mount_created=1
-fi
-
-mkdir -p /containers/store /containers/storage
 
 next_version_id()
 {

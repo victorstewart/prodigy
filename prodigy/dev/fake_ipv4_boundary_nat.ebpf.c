@@ -97,23 +97,6 @@ struct
   __type(value, __u32);
 } nat4_cursor SEC(".maps");
 
-struct
-{
-  __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, 16);
-  __type(key, __u32);
-  __type(value, __u64);
-} nat4_stats SEC(".maps");
-
-static __always_inline void bump_nat4_stat(__u32 index)
-{
-  __u64 *slot = bpf_map_lookup_elem(&nat4_stats, &index);
-  if (slot)
-  {
-    __sync_fetch_and_add(slot, 1);
-  }
-}
-
 static __always_inline bool is_fake_ipv4(__be32 address)
 {
   __be32 subnet = bpf_htonl(DEV_FAKE_IPV4_SUBNET);
@@ -296,14 +279,10 @@ int fake_nat_eg(struct __sk_buff *skb)
     return TC_ACT_OK;
   }
 
-  bump_nat4_stat(0);
-
   if (!is_fake_ipv4(iph->saddr))
   {
     return TC_ACT_OK;
   }
-
-  bump_nat4_stat(1);
 
   if (is_boundary_transfer_ipv4(iph->daddr))
   {
@@ -324,14 +303,12 @@ int fake_nat_eg(struct __sk_buff *skb)
   {
     binding = *existing;
     binding.updated_ns = bpf_ktime_get_ns();
-    bump_nat4_stat(2);
   }
   else
   {
     __be16 selected_nat_port = 0;
     if (!pick_nat_port(proto, &selected_nat_port))
     {
-      bump_nat4_stat(14);
       return TC_ACT_OK;
     }
 
@@ -342,7 +319,6 @@ int fake_nat_eg(struct __sk_buff *skb)
     binding.remote_port = dst_port;
     binding.proto = proto;
     binding.updated_ns = bpf_ktime_get_ns();
-    bump_nat4_stat(3);
   }
 
   struct reverse4_key reverse_key = {};
@@ -357,7 +333,6 @@ int fake_nat_eg(struct __sk_buff *skb)
   int action = rewrite_ipv4_addr(skb, sizeof(struct ethhdr), l4_checksum_offset, update_l4_checksum, true, iph->saddr, translated_ip);
   if (action != TC_ACT_OK)
   {
-    bump_nat4_stat(4);
     return action;
   }
 
@@ -366,12 +341,10 @@ int fake_nat_eg(struct __sk_buff *skb)
     action = rewrite_l4_port(skb, l4_offset, l4_checksum_offset, update_l4_checksum, true, src_port, binding.nat_port);
     if (action != TC_ACT_OK)
     {
-      bump_nat4_stat(15);
       return action;
     }
   }
 
-  bump_nat4_stat(5);
   return TC_ACT_OK;
 }
 
@@ -391,15 +364,11 @@ int fake_nat_in(struct __sk_buff *skb)
     return TC_ACT_OK;
   }
 
-  bump_nat4_stat(7);
-
   __be32 translated_ip = bpf_htonl(DEV_BOUNDARY_TRANSLATED_IPV4);
   if (iph->daddr != translated_ip)
   {
     return TC_ACT_OK;
   }
-
-  bump_nat4_stat(8);
 
   struct reverse4_key reverse_key = {};
   reverse_key.nat_port = dst_port;
@@ -408,7 +377,6 @@ int fake_nat_in(struct __sk_buff *skb)
   struct nat4_binding *binding = bpf_map_lookup_elem(&nat4_reverse, &reverse_key);
   if (binding == NULL)
   {
-    bump_nat4_stat(9);
     return TC_ACT_OK;
   }
 
@@ -418,14 +386,12 @@ int fake_nat_in(struct __sk_buff *skb)
 
   if (binding->remote_ip != iph->saddr || binding->remote_port != src_port)
   {
-    bump_nat4_stat(12);
     return TC_ACT_OK;
   }
 
   int action = rewrite_ipv4_addr(skb, sizeof(struct ethhdr), l4_checksum_offset, update_l4_checksum, false, iph->daddr, binding->fake_ip);
   if (action != TC_ACT_OK)
   {
-    bump_nat4_stat(10);
     return action;
   }
 
@@ -434,12 +400,10 @@ int fake_nat_in(struct __sk_buff *skb)
     action = rewrite_l4_port(skb, l4_offset, l4_checksum_offset, update_l4_checksum, false, binding->nat_port, binding->fake_port);
     if (action != TC_ACT_OK)
     {
-      bump_nat4_stat(13);
       return action;
     }
   }
 
-  bump_nat4_stat(11);
   return TC_ACT_OK;
 }
 

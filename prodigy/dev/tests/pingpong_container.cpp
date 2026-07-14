@@ -21,6 +21,7 @@
 #include <limits>
 #include <memory>
 #include <poll.h>
+#include <sys/prctl.h>
 #include <sstream>
 #include <string>
 #include <sys/time.h>
@@ -47,6 +48,90 @@
 
 #ifndef PRODIGY_PINGPONG_CRASH_ON_START
 #define PRODIGY_PINGPONG_CRASH_ON_START 0
+#endif
+
+#ifndef PRODIGY_PINGPONG_REQUIRE_RUNTIME_ISOLATION
+#define PRODIGY_PINGPONG_REQUIRE_RUNTIME_ISOLATION 0
+#endif
+
+#if PRODIGY_PINGPONG_REQUIRE_RUNTIME_ISOLATION == 1
+static bool pingPongRuntimeIsolationReady(void)
+{
+  if (getuid() != 65'534 || geteuid() != 65'534 || getgid() != 65'534 || getegid() != 65'534 || getgroups(0, nullptr) != 0)
+  {
+    return false;
+  }
+
+  if (prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1)
+  {
+    return false;
+  }
+
+  std::ifstream status("/proc/self/status");
+  std::string line;
+  uint8_t emptyCapabilitySets = 0;
+  while (std::getline(status, line))
+  {
+    for (const char *name : {"CapInh:\t", "CapPrm:\t", "CapEff:\t", "CapAmb:\t"})
+    {
+      if (line.starts_with(name))
+      {
+        if (line.substr(std::strlen(name)).find_first_not_of('0') != std::string::npos)
+        {
+          return false;
+        }
+        ++emptyCapabilitySets;
+      }
+    }
+  }
+  if (emptyCapabilitySets != 4)
+  {
+    return false;
+  }
+
+  errno = 0;
+  int rootWrite = open("/prodigy-runtime-isolation-write-probe", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR);
+  if (rootWrite >= 0)
+  {
+    close(rootWrite);
+    unlink("/prodigy-runtime-isolation-write-probe");
+    return false;
+  }
+  if (errno != EROFS)
+  {
+    return false;
+  }
+
+  std::ifstream mountInfo("/proc/self/mountinfo");
+  bool readOnlyRoot = false;
+  while (std::getline(mountInfo, line))
+  {
+    std::istringstream fields(line);
+    std::string field;
+    std::string mountPoint;
+    std::string mountOptions;
+    for (uint8_t index = 0; index != 6 && fields >> field; ++index)
+    {
+      if (index == 4)
+      {
+        mountPoint = field;
+      }
+      else if (index == 5)
+      {
+        mountOptions = field;
+      }
+    }
+    if (mountPoint == "/storage" || mountPoint.starts_with("/storage/"))
+    {
+      return false;
+    }
+    if (mountPoint == "/" && (mountOptions == "ro" || mountOptions.starts_with("ro,")))
+    {
+      readOnlyRoot = true;
+    }
+  }
+  return readOnlyRoot;
+}
 #endif
 
 static uint64_t pingPongQueueWaitFineBucketMetricKey(void)
@@ -1274,6 +1359,14 @@ public:
 
   void prepare(int argc, char *argv[])
   {
+#if PRODIGY_PINGPONG_REQUIRE_RUNTIME_ISOLATION == 1
+    if (!pingPongRuntimeIsolationReady())
+    {
+      basics_log("PingPongContainer::prepare runtime isolation verification failed\n");
+      std::exit(EXIT_FAILURE);
+    }
+#endif
+
     if (const char *portEnv = getenv("PINGPONG_PORT"); portEnv && *portEnv)
     {
       long value = strtol(portEnv, nullptr, 10);

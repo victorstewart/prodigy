@@ -26,27 +26,19 @@ __attribute__((__always_inline__)) static inline int redirectToContainer(__be8 *
 {
   __u32 container_index = addr6[15]; // this effectively becomes little endian.. but as long as we submit ours in userspace in little endian also then it's fine
 
-  struct packet *pkt = getPacket();
-  if (pkt)
-  {
-    pkt->containerID.value[4] = container_index; // obviously we left the local subnet bytes 0 here
-  }
-
   __u32 *primary_device_idx = bpf_map_lookup_elem(&ct_dev_map, &container_index); // look up container's primary netkit device for this address
 
   if (primary_device_idx) // host-side primary netkit device for the destination container
   {
-    logPacketRedirectIfIdx(*primary_device_idx);
-
     if (is_ingress) // redirecting from host NIC into the host-side primary netkit hook
     {
-      return setInstruction(bpf_redirect(*primary_device_idx, 0));
+      return bpf_redirect(*primary_device_idx, 0);
     }
     else // redirecting from a container toward another container
     {
       // From container egress, forward toward the destination host-side primary
       // netkit device so the receiving container's primary hook owns ingress.
-      return setInstruction(bpf_redirect(*primary_device_idx, 0));
+      return bpf_redirect(*primary_device_idx, 0);
     }
   }
   // Fail closed when the destination fragment has no subscribed container device.
@@ -68,8 +60,6 @@ __attribute__((__always_inline__)) static inline bool isMulticast(__be8 *addr6)
 
 __attribute__((__always_inline__)) static inline int redirectL2ToNIC(struct __sk_buff *skb, struct ethhdr *eth)
 {
-  setCheckpoint("redirectToNIC: checkpoint 1");
-
   __u32 zeroidx = 0; // NIC is container 0, unused address
   __u32 *nic_idx = bpf_map_lookup_elem(&ct_dev_map, &zeroidx); // look up container's primary netkit device for this address
 
@@ -78,31 +68,22 @@ __attribute__((__always_inline__)) static inline int redirectL2ToNIC(struct __sk
     return NETKIT_DROP;
   }
 
-  setCheckpoint("redirectToNIC: checkpoint 2");
-
   if (from_us_to_gateway(eth) == false)
   {
     return NETKIT_DROP;
   }
-
-  setCheckpoint("redirectToNIC: checkpoint 3");
-  logSKB(skb);
 
   return bpf_redirect(*nic_idx, 0);
 }
 
 __attribute__((__always_inline__)) static inline int redirectL3ToNIC(struct __sk_buff *skb, __be16 protocol)
 {
-  setCheckpoint("redirectToNIC: checkpoint 1");
-
   __u32 zeroidx = 0; // NIC is container 0, unused address
   __u32 *nic_idx = bpf_map_lookup_elem(&ct_dev_map, &zeroidx);
   if (!nic_idx)
   {
     return NETKIT_DROP;
   }
-
-  setCheckpoint("redirectToNIC: checkpoint 2");
 
   void *data_end = (void *)(long)skb->data_end;
   struct ethhdr *eth = (struct ethhdr *)(long)skb->data;
@@ -121,9 +102,5 @@ __attribute__((__always_inline__)) static inline int redirectL3ToNIC(struct __sk
 
   eth->h_proto = protocol;
 
-  setCheckpoint("redirectToNIC: checkpoint 3");
-  logPacketRedirectIfIdx(*nic_idx);
-  logSKB(skb);
-
-  return setInstruction(bpf_redirect(*nic_idx, 0));
+  return bpf_redirect(*nic_idx, 0);
 }

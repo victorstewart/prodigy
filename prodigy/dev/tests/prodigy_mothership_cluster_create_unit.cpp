@@ -23,6 +23,7 @@ public:
     else
     {
       basics_log("FAIL: %s\n", name);
+      std::fprintf(stderr, "FAIL: %s\n", name);
       failed += 1;
     }
   }
@@ -42,17 +43,15 @@ public:
 };
 
 enum class ClusterCreateCall : uint8_t {
-  startTestCluster = 0,
-  stopTestCluster = 1,
-  prepareProviderBootstrapArtifacts = 2,
-  localBootstrap = 3,
-  createSeed = 4,
-  destroyCreatedSeed = 5,
-  remoteBootstrap = 6,
-  configure = 7,
-  fetchTopology = 8,
-  applyAddMachines = 9,
-  upsertMachineSchemas = 10
+  prepareProviderBootstrapArtifacts = 0,
+  localBootstrap = 1,
+  createSeed = 2,
+  destroyCreatedSeed = 3,
+  remoteBootstrap = 4,
+  configure = 5,
+  fetchTopology = 6,
+  applyAddMachines = 7,
+  upsertMachineSchemas = 8
 };
 
 static bool equalCallSequence(const Vector<ClusterCreateCall>& lhs, std::initializer_list<ClusterCreateCall> rhs)
@@ -278,8 +277,6 @@ static ClusterMachine makeTopologyMachine(
 class FakeClusterCreateHooks final : public MothershipClusterCreateHooks {
 public:
 
-  uint32_t startTestClusterCalls = 0;
-  uint32_t stopTestClusterCalls = 0;
   uint32_t prepareProviderBootstrapArtifactsCalls = 0;
   uint32_t localBootstrapCalls = 0;
   uint32_t createSeedCalls = 0;
@@ -314,46 +311,12 @@ public:
   ProdigyTimingAttribution addMachinesTiming = {};
   ProdigyTimingAttribution upsertMachineSchemasTiming = {};
   bool failBootstrapRemoteSeed = false;
-  bool failStartTestCluster = false;
   bool failConfigureSeedCluster = false;
   bool failFetchSeedTopology = false;
   bool failApplyAddMachines = false;
   bool failUpsertMachineSchemas = false;
   bool failDestroyCreatedSeed = false;
   bool failPrepareProviderBootstrapArtifacts = false;
-
-  bool startTestCluster(const MothershipProdigyCluster& cluster, String *failure = nullptr) override
-  {
-    (void)cluster;
-    startTestClusterCalls += 1;
-    callSequence.push_back(ClusterCreateCall::startTestCluster);
-    if (failStartTestCluster)
-    {
-      if (failure)
-      {
-        failure->assign("start test cluster failed"_ctv);
-      }
-      return false;
-    }
-
-    if (failure)
-    {
-      failure->clear();
-    }
-    return true;
-  }
-
-  bool stopTestCluster(const MothershipProdigyCluster& cluster, String *failure = nullptr) override
-  {
-    (void)cluster;
-    stopTestClusterCalls += 1;
-    callSequence.push_back(ClusterCreateCall::stopTestCluster);
-    if (failure)
-    {
-      failure->clear();
-    }
-    return true;
-  }
 
   bool prepareProviderBootstrapArtifacts(const MothershipProdigyCluster& cluster, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) override
   {
@@ -787,7 +750,12 @@ int main(void)
 
     BrainConfig config = {};
     String failure = {};
-    suite.expect(mothershipBuildClusterBrainConfig(cluster, nullptr, config, &failure, &dnsCredential), "cluster_dns_brain_config_builds");
+    const bool built = mothershipBuildClusterBrainConfig(cluster, nullptr, config, &failure, &dnsCredential);
+    if (built == false)
+    {
+      std::fprintf(stderr, "DETAIL: cluster_dns_brain_config_failure='%s'\n", failure.c_str());
+    }
+    suite.expect(built, "cluster_dns_brain_config_builds");
     suite.expect(config.dnsProvider.equal("gcp-cloud-dns"_ctv), "cluster_dns_brain_config_provider");
     suite.expect(config.dnsCredential.name.equal("gcp-dns"_ctv), "cluster_dns_brain_config_credential_name");
     suite.expect(config.dnsCredential.provider.equal("gcp-cloud-dns"_ctv), "cluster_dns_brain_config_credential_provider");
@@ -1095,7 +1063,6 @@ int main(void)
     cluster.test.machineCount = 3;
     cluster.test.brainBootstrapFamily = MothershipClusterTestBootstrapFamily::private6;
     cluster.test.interContainerMTU = 9000;
-    cluster.test.host.mode = MothershipClusterTestHostMode::local;
     cluster.controls.push_back(makeUnixControl("/run/prodigy/test-local.sock"_ctv));
     appendClusterMachineConfig(cluster, makeMachineConfig("bootstrap"_ctv, MachineConfig::MachineKind::bareMetal, 8, 16'384, 262'144));
     cluster.desiredEnvironment = ProdigyEnvironmentKind::dev;
@@ -1112,10 +1079,10 @@ int main(void)
     bool ok = mothershipStandUpCluster(cluster, nullptr, hooks, nullptr, &failure);
     suite.expect(ok, "create_test_flow_ok");
     suite.expect(failure.size() == 0, "create_test_flow_no_failure");
-    suite.expect(hooks.startTestClusterCalls == 1, "create_test_starts_runner");
-    suite.expect(hooks.stopTestClusterCalls == 0, "create_test_no_cleanup_on_success");
+    suite.expect(hooks.createSeedCalls == 1, "create_test_creates_provider_seed");
+    suite.expect(hooks.destroyCreatedSeedCalls == 0, "create_test_no_cleanup_on_success");
     suite.expect(hooks.localBootstrapCalls == 0, "create_test_no_local_seed_bootstrap");
-    suite.expect(hooks.remoteBootstrapCalls == 0, "create_test_no_remote_seed_bootstrap");
+    suite.expect(hooks.remoteBootstrapCalls == 1, "create_test_bootstraps_provider_seed");
     suite.expect(hooks.configureCalls == 1, "create_test_configures_cluster");
     suite.expect(hooks.fetchTopologyCalls == 1, "create_test_fetches_topology");
     suite.expect(hooks.addMachinesCalls == 0, "create_test_no_addmachines");
@@ -1125,7 +1092,8 @@ int main(void)
     suite.expect(hooks.lastConfig.machineReservedResources == prodigySmokeMachineReservedResources, "create_test_config_resource_reservation");
     suite.expect(hooks.lastConfig.runtimeEnvironment.test.enabled, "create_test_runtime_env_test_enabled");
     suite.expect(hooks.lastConfig.runtimeEnvironment.test.interContainerMTU == 9000, "create_test_runtime_env_inter_container_mtu");
-    suite.expect(equalCallSequence(hooks.callSequence, {ClusterCreateCall::startTestCluster,
+    suite.expect(equalCallSequence(hooks.callSequence, {ClusterCreateCall::createSeed,
+                                                        ClusterCreateCall::remoteBootstrap,
                                                         ClusterCreateCall::configure,
                                                         ClusterCreateCall::fetchTopology}),
                  "create_test_call_sequence");
@@ -1140,7 +1108,6 @@ int main(void)
     cluster.test.specified = true;
     cluster.test.workspaceRoot = "/tmp/test-topology-retry"_ctv;
     cluster.test.machineCount = 3;
-    cluster.test.host.mode = MothershipClusterTestHostMode::local;
     cluster.controls.push_back(makeUnixControl("/run/prodigy/test-topology-retry.sock"_ctv));
 
     FakeClusterCreateHooks hooks = {};
@@ -1160,11 +1127,12 @@ int main(void)
     suite.expect(failure.size() == 0, "create_test_topology_retry_no_failure");
     suite.expect(hooks.fetchTopologyCalls == 2, "create_test_topology_retry_fetches_until_ready");
     suite.expect(cluster.topology == finalTopology, "create_test_topology_retry_persists_final_topology");
-    suite.expect(hooks.callSequence.size() == 4, "create_test_topology_retry_call_count");
-    suite.expect(hooks.callSequence[0] == ClusterCreateCall::startTestCluster, "create_test_topology_retry_starts_runner_first");
-    suite.expect(hooks.callSequence[1] == ClusterCreateCall::configure, "create_test_topology_retry_configures_before_fetch");
-    suite.expect(hooks.callSequence[2] == ClusterCreateCall::fetchTopology, "create_test_topology_retry_first_fetch");
-    suite.expect(hooks.callSequence[3] == ClusterCreateCall::fetchTopology, "create_test_topology_retry_second_fetch");
+    suite.expect(hooks.callSequence.size() == 5, "create_test_topology_retry_call_count");
+    suite.expect(hooks.callSequence[0] == ClusterCreateCall::createSeed, "create_test_topology_retry_creates_provider_seed_first");
+    suite.expect(hooks.callSequence[1] == ClusterCreateCall::remoteBootstrap, "create_test_topology_retry_bootstraps_provider_seed");
+    suite.expect(hooks.callSequence[2] == ClusterCreateCall::configure, "create_test_topology_retry_configures_before_fetch");
+    suite.expect(hooks.callSequence[3] == ClusterCreateCall::fetchTopology, "create_test_topology_retry_first_fetch");
+    suite.expect(hooks.callSequence[4] == ClusterCreateCall::fetchTopology, "create_test_topology_retry_second_fetch");
   }
 
   {
@@ -1176,7 +1144,6 @@ int main(void)
     cluster.test.specified = true;
     cluster.test.workspaceRoot = "/tmp/test-resource-readiness-retry"_ctv;
     cluster.test.machineCount = 3;
-    cluster.test.host.mode = MothershipClusterTestHostMode::local;
     cluster.controls.push_back(makeUnixControl("/run/prodigy/test-resource-readiness-retry.sock"_ctv));
 
     FakeClusterCreateHooks hooks = {};
@@ -1209,11 +1176,12 @@ int main(void)
     suite.expect(failure.size() == 0, "create_test_resource_readiness_retry_no_failure");
     suite.expect(hooks.fetchTopologyCalls == 2, "create_test_resource_readiness_retry_fetches_until_ready");
     suite.expect(cluster.topology == readyTopology, "create_test_resource_readiness_retry_persists_ready_topology");
-    suite.expect(hooks.callSequence.size() == 4, "create_test_resource_readiness_retry_call_count");
-    suite.expect(hooks.callSequence[0] == ClusterCreateCall::startTestCluster, "create_test_resource_readiness_retry_starts_runner_first");
-    suite.expect(hooks.callSequence[1] == ClusterCreateCall::configure, "create_test_resource_readiness_retry_configures_before_fetch");
-    suite.expect(hooks.callSequence[2] == ClusterCreateCall::fetchTopology, "create_test_resource_readiness_retry_first_fetch");
-    suite.expect(hooks.callSequence[3] == ClusterCreateCall::fetchTopology, "create_test_resource_readiness_retry_second_fetch");
+    suite.expect(hooks.callSequence.size() == 5, "create_test_resource_readiness_retry_call_count");
+    suite.expect(hooks.callSequence[0] == ClusterCreateCall::createSeed, "create_test_resource_readiness_retry_creates_provider_seed_first");
+    suite.expect(hooks.callSequence[1] == ClusterCreateCall::remoteBootstrap, "create_test_resource_readiness_retry_bootstraps_provider_seed");
+    suite.expect(hooks.callSequence[2] == ClusterCreateCall::configure, "create_test_resource_readiness_retry_configures_before_fetch");
+    suite.expect(hooks.callSequence[3] == ClusterCreateCall::fetchTopology, "create_test_resource_readiness_retry_first_fetch");
+    suite.expect(hooks.callSequence[4] == ClusterCreateCall::fetchTopology, "create_test_resource_readiness_retry_second_fetch");
   }
 
   {
@@ -1225,7 +1193,6 @@ int main(void)
     cluster.test.specified = true;
     cluster.test.workspaceRoot = "/tmp/test-failure"_ctv;
     cluster.test.machineCount = 1;
-    cluster.test.host.mode = MothershipClusterTestHostMode::local;
     cluster.controls.push_back(makeUnixControl("/run/prodigy/test-failure.sock"_ctv));
 
     FakeClusterCreateHooks hooks = {};
@@ -1234,11 +1201,12 @@ int main(void)
     String failure = {};
     bool ok = mothershipStandUpCluster(cluster, nullptr, hooks, nullptr, &failure);
     suite.expect(ok == false, "create_test_failure_propagates");
-    suite.expect(hooks.startTestClusterCalls == 1, "create_test_failure_starts_runner");
-    suite.expect(hooks.stopTestClusterCalls == 1, "create_test_failure_cleans_runner");
-    suite.expect(equalCallSequence(hooks.callSequence, {ClusterCreateCall::startTestCluster,
+    suite.expect(hooks.createSeedCalls == 1, "create_test_failure_creates_provider_seed");
+    suite.expect(hooks.destroyCreatedSeedCalls == 1, "create_test_failure_cleans_provider_seed");
+    suite.expect(equalCallSequence(hooks.callSequence, {ClusterCreateCall::createSeed,
+                                                        ClusterCreateCall::remoteBootstrap,
                                                         ClusterCreateCall::configure,
-                                                        ClusterCreateCall::stopTestCluster}),
+                                                        ClusterCreateCall::destroyCreatedSeed}),
                  "create_test_failure_call_sequence");
   }
 
@@ -1251,7 +1219,6 @@ int main(void)
     currentCluster.test.specified = true;
     currentCluster.test.workspaceRoot = "/tmp/test-resize-current"_ctv;
     currentCluster.test.machineCount = 3;
-    currentCluster.test.host.mode = MothershipClusterTestHostMode::local;
     currentCluster.controls.push_back(makeUnixControl("/run/prodigy/test-resize.sock"_ctv));
 
     MothershipProdigyCluster desiredCluster = currentCluster;
@@ -1280,13 +1247,14 @@ int main(void)
     suite.expect(ok, "create_test_resize_restart_ok");
     suite.expect(failure.size() == 0, "create_test_resize_restart_no_failure");
     suite.expect(changed, "create_test_resize_restart_changed");
-    suite.expect(hooks.stopTestClusterCalls == 1, "create_test_resize_restart_stops_runner");
-    suite.expect(hooks.startTestClusterCalls == 1, "create_test_resize_restart_starts_runner");
+    suite.expect(hooks.destroyCreatedSeedCalls == 1, "create_test_resize_restart_destroys_provider_seed");
+    suite.expect(hooks.createSeedCalls == 1, "create_test_resize_restart_creates_provider_seed");
     suite.expect(hooks.configureCalls == 1, "create_test_resize_restart_configures_cluster");
     suite.expect(hooks.fetchTopologyCalls == 1, "create_test_resize_restart_fetches_topology");
     suite.expect(desiredCluster.topology == hooks.fetchedTopology, "create_test_resize_restart_persists_topology");
-    suite.expect(equalCallSequence(hooks.callSequence, {ClusterCreateCall::stopTestCluster,
-                                                        ClusterCreateCall::startTestCluster,
+    suite.expect(equalCallSequence(hooks.callSequence, {ClusterCreateCall::destroyCreatedSeed,
+                                                        ClusterCreateCall::createSeed,
+                                                        ClusterCreateCall::remoteBootstrap,
                                                         ClusterCreateCall::configure,
                                                         ClusterCreateCall::fetchTopology}),
                  "create_test_resize_restart_call_sequence");
@@ -1301,7 +1269,6 @@ int main(void)
     currentCluster.test.specified = true;
     currentCluster.test.workspaceRoot = "/tmp/test-resize-noop"_ctv;
     currentCluster.test.machineCount = 3;
-    currentCluster.test.host.mode = MothershipClusterTestHostMode::local;
 
     MothershipProdigyCluster desiredCluster = currentCluster;
 
@@ -1318,8 +1285,8 @@ int main(void)
     suite.expect(ok, "create_test_resize_noop_ok");
     suite.expect(failure.size() == 0, "create_test_resize_noop_no_failure");
     suite.expect(changed == false, "create_test_resize_noop_not_changed");
-    suite.expect(hooks.stopTestClusterCalls == 0, "create_test_resize_noop_does_not_stop_runner");
-    suite.expect(hooks.startTestClusterCalls == 0, "create_test_resize_noop_does_not_start_runner");
+    suite.expect(hooks.destroyCreatedSeedCalls == 0, "create_test_resize_noop_does_not_destroy_provider_seed");
+    suite.expect(hooks.createSeedCalls == 0, "create_test_resize_noop_does_not_create_provider_seed");
     suite.expect(desiredCluster.topology == currentTopology, "create_test_resize_noop_preserves_topology");
   }
 

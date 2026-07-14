@@ -7,7 +7,6 @@ READY_BIN="${3:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-HARNESS="${SCRIPT_DIR}/prodigy_dev_netns_harness.sh"
 DISCOMBOBULATOR_MANIFEST="${REPO_ROOT}/prodigy/discombobulator/Cargo.toml"
 EXPECTED_MTU=9000
 APPLICATION_ID=62021
@@ -31,7 +30,7 @@ then
    exit 77
 fi
 
-for path in "${PRODIGY_BIN}" "${MOTHERSHIP_BIN}" "${READY_BIN}" "${HARNESS}" "${DISCOMBOBULATOR_MANIFEST}"
+for path in "${PRODIGY_BIN}" "${MOTHERSHIP_BIN}" "${READY_BIN}" "${DISCOMBOBULATOR_MANIFEST}"
 do
    if [[ ! -e "${path}" ]]
    then
@@ -40,7 +39,7 @@ do
    fi
 done
 
-deps=(awk basename bpftool cargo cut find ip ls mkfs.btrfs mktemp mount nsenter python3 readlink rg sed stat timeout truncate umount uname)
+deps=(awk basename bpftool cargo cut find ip mktemp nsenter python3 readlink rg sed timeout uname)
 for cmd in "${deps[@]}"
 do
    if ! command -v "${cmd}" >/dev/null 2>&1
@@ -53,14 +52,9 @@ done
 PRODIGY_BIN="$(readlink -f "${PRODIGY_BIN}" 2>/dev/null || printf '%s' "${PRODIGY_BIN}")"
 MOTHERSHIP_BIN="$(readlink -f "${MOTHERSHIP_BIN}" 2>/dev/null || printf '%s' "${MOTHERSHIP_BIN}")"
 READY_BIN="$(readlink -f "${READY_BIN}" 2>/dev/null || printf '%s' "${READY_BIN}")"
-switchboard_balancer_ebpf="$(dirname "${PRODIGY_BIN}")/balancer.ebpf.o"
 if [[ ! -x "${READY_BIN}" ]]
 then
    fail "ready container binary is not executable: ${READY_BIN}"
-fi
-if [[ ! -e "${switchboard_balancer_ebpf}" ]]
-then
-   fail "required switchboard balancer eBPF is missing: ${switchboard_balancer_ebpf}"
 fi
 
 tmpdir="$(mktemp -d "${REPO_ROOT}/.run/prodigy-dev-container-netkit-mtu-unit.XXXXXX")"
@@ -76,9 +70,6 @@ cluster_name="test-netkit-mtu-$(date -u +%Y%m%d-%H%M%S)-$$"
 application_name="${cluster_name}.ready"
 cluster_created=0
 cluster_removed=0
-containers_dir_created=0
-containers_mount_created=0
-containers_loop_image=""
 keep_tmpdir=0
 
 capture_workspace()
@@ -201,16 +192,6 @@ cleanup()
       run_mothership removeCluster "${cluster_name}" >"${tmpdir}/remove_cluster.log" 2>&1 || true
    fi
 
-   if [[ "${containers_mount_created}" -eq 1 ]]
-   then
-      umount /containers >/dev/null 2>&1 || true
-   fi
-
-   if [[ "${containers_dir_created}" -eq 1 ]]
-   then
-      rmdir /containers >/dev/null 2>&1 || true
-   fi
-
    if [[ "${keep_tmpdir}" -eq 0 ]]
    then
       rm -rf "${tmpdir}"
@@ -224,9 +205,7 @@ run_mothership()
 {
    env \
       PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
-      PRODIGY_MOTHERSHIP_TEST_HARNESS="${HARNESS}" \
       PRODIGY_DEV_ALLOW_BPF_ATTACH="${PRODIGY_DEV_ALLOW_BPF_ATTACH}" \
-      PRODIGY_DEV_SWITCHBOARD_BALANCER_EBPF="${switchboard_balancer_ebpf}" \
       "${MOTHERSHIP_BIN}" "$@"
 }
 
@@ -490,62 +469,6 @@ detect_target_arch()
 
 target_arch="$(detect_target_arch)"
 
-if [[ ! -d /containers ]]
-then
-   mkdir -p /containers
-   containers_dir_created=1
-fi
-
-containers_fs_type="$(stat -f -c '%T' /containers 2>/dev/null || echo unknown)"
-if [[ "${containers_fs_type}" != "btrfs" ]]
-then
-   if awk '$2 == "/containers" { found = 1 } END { exit(found ? 0 : 1) }' /proc/self/mounts
-   then
-      fail "/containers is mounted but not btrfs (found ${containers_fs_type})"
-   fi
-
-   if [[ -n "$(ls -A /containers 2>/dev/null)" ]]
-   then
-      existing_entries_ok=1
-      while IFS= read -r existing_path
-      do
-         existing_name="$(basename "${existing_path}")"
-         case "${existing_name}" in
-            .prodigy-dev-fs-*)
-               ;;
-            store|storage)
-               if [[ -d "${existing_path}" && -z "$(ls -A "${existing_path}" 2>/dev/null)" ]]
-               then
-                  :
-               else
-                  existing_entries_ok=0
-                  break
-               fi
-               ;;
-            *)
-               existing_entries_ok=0
-               break
-               ;;
-         esac
-      done < <(find /containers -mindepth 1 -maxdepth 1 -print 2>/dev/null)
-
-      if [[ "${existing_entries_ok}" -ne 1 ]]
-      then
-         fail "/containers exists on non-btrfs fs and is not safely overmountable"
-      fi
-
-      rmdir /containers/store /containers/storage >/dev/null 2>&1 || true
-   fi
-
-   containers_loop_image="${tmpdir}/containers.loop.img"
-   truncate -s 2G "${containers_loop_image}"
-   mkfs.btrfs -f "${containers_loop_image}" >/dev/null
-   mount -o loop "${containers_loop_image}" /containers
-   containers_mount_created=1
-fi
-
-mkdir -p /containers/store /containers/storage
-
 cargo build --quiet --manifest-path "${DISCOMBOBULATOR_MANIFEST}"
 DISCOMBOBULATOR_BIN="${REPO_ROOT}/prodigy/discombobulator/target/debug/discombobulator"
 if [[ ! -x "${DISCOMBOBULATOR_BIN}" ]]
@@ -629,10 +552,7 @@ read -r -d '' create_request <<EOF || true
     "machineCount": 3,
     "brainBootstrapFamily": "ipv4",
     "enableFakeIpv4Boundary": false,
-    "interContainerMTU": ${EXPECTED_MTU},
-    "host": {
-      "mode": "local"
-    }
+    "interContainerMTU": ${EXPECTED_MTU}
   }
 }
 EOF

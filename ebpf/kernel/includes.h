@@ -3,7 +3,10 @@
 #include <linux/in.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
+#include <linux/icmpv6.h>
+#include <linux/tcp.h>
 #include <linux/types.h>
+#include <linux/udp.h>
 #include <linux/if_link.h>
 #include <linux/pkt_cls.h>
 
@@ -17,7 +20,3 @@
 #include <ebpf/common/structs.h>
 #include <ebpf/kernel/maps.h>
 #include <ebpf/kernel/services.h>
-
-#if PRODIGY_DEBUG
-#include <ebpf/kernel/debug.h>
-#endif

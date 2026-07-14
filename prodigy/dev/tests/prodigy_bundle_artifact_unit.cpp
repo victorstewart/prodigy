@@ -271,6 +271,10 @@ int main(void)
   suite.expect(stringContains(tarListing, "tools/lat_mem_rd"), "bundle_contains_lat_mem_rd_tool");
   suite.expect(stringContains(tarListing, "tools/bw_mem"), "bundle_contains_bw_mem_tool");
   suite.expect(stringContains(tarListing, "tools/speedtest"), "bundle_contains_speedtest_tool");
+  suite.expect(stringOccurrences(tarListing, "./tools/mothership\n"_ctv) == 1,
+               "bundle_contains_mothership_once");
+  suite.expect(stringContains(tarListing, "mothership.virtual.datacenter.provider.sh") == false,
+               "bundle_embeds_virtual_datacenter_provider_in_mothership");
   String resolverArtifactEntry = {};
   resolverArtifactEntry.assign("./containers/prodigy-dns-resolver."_ctv);
   resolverArtifactEntry.append(machineCpuArchitectureName(currentArchitecture));

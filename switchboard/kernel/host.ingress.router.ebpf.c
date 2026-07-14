@@ -17,23 +17,6 @@
 // Dev/test fake-boundary probes can inject IPv4 portal packets from inside the
 // ecosystem. Production external traffic should have already been normalized by
 // the boundary path, so host ingress must not pay these portal/CID lookups.
-struct
-{
-  __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, 16);
-  __type(key, __u32);
-  __type(value, __u64);
-} dev_host_stats SEC(".maps");
-
-__attribute__((__always_inline__)) static inline void bump_dev_host_route_stat(__u32 index)
-{
-  __u64 *slot = bpf_map_lookup_elem(&dev_host_stats, &index);
-  if (slot)
-  {
-    __sync_fetch_and_add(slot, 1);
-  }
-}
-
 #endif
 
 // the neuron attaches this program to the NIC
@@ -204,16 +187,10 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_whitehole_re
     if (lookup_whitehole_reply_binding_ipv6(eth, data_end, &replyBinding, &bound))
     {
       *handled = true;
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-      bump_dev_host_route_stat(9);
-#endif
       null_mac_addresses(eth);
       if (replyBinding.container.hasID && redirectContainerFragment(replyBinding.container.value[4], true))
       {
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-        bump_dev_host_route_stat(15);
-#endif
-        return setInstruction(TC_ACT_REDIRECT);
+        return TC_ACT_REDIRECT;
       }
 
       return TC_ACT_SHOT;
@@ -231,21 +208,12 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_whitehole_re
     if (lookup_whitehole_reply_binding_ipv4(eth, data_end, &replyBinding, &bound))
     {
       *handled = true;
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-      bump_dev_host_route_stat(2);
-#endif
       null_mac_addresses(eth);
       if (replyBinding.container.hasID && redirectContainerFragment(replyBinding.container.value[4], true))
       {
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-        bump_dev_host_route_stat(3);
-#endif
-        return setInstruction(TC_ACT_REDIRECT);
+        return TC_ACT_REDIRECT;
       }
 
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-      bump_dev_host_route_stat(7);
-#endif
       return TC_ACT_SHOT;
     }
     if (bound)
@@ -350,7 +318,7 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_ipv4_portal_
   null_mac_addresses(eth);
   if (redirectContainerFragment(containerID.value[4], true))
   {
-    return setInstruction(TC_ACT_REDIRECT);
+    return TC_ACT_REDIRECT;
   }
 
   return TC_ACT_SHOT;
@@ -448,7 +416,7 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_ipv6_portal_
   null_mac_addresses(eth);
   if (redirectContainerFragment(containerID.value[4], true))
   {
-    return setInstruction(TC_ACT_REDIRECT);
+    return TC_ACT_REDIRECT;
   }
 
   return TC_ACT_SHOT;
@@ -584,25 +552,15 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_plain_local_
   }
 
   *handled = true;
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-  bump_dev_host_route_stat(4);
-  bump_dev_host_route_stat(13);
-#endif
   // netkit_xmit() classifies skb->pkt_type for the destination peer before
   // the primary-attached BPF program runs. Normalize the host NIC Ethernet
   // header here so the receiving peer is PACKET_HOST, not OTHERHOST.
   null_mac_addresses(eth);
   if (redirectToContainer(daddr6, true) == TC_ACT_REDIRECT)
   {
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-    bump_dev_host_route_stat(5);
-#endif
-    return setInstruction(TC_ACT_REDIRECT);
+    return TC_ACT_REDIRECT;
   }
 
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-  bump_dev_host_route_stat(6);
-#endif
   // Container-subnet destinations must resolve to a host-side primary
   // netkit device for the destination container. If the boundary map is stale
   // or the container is gone, fail closed.
@@ -642,9 +600,6 @@ __attribute__((__always_inline__)) static inline bool should_fast_pass_native_ho
 
     if (lookup_whitehole_reply_binding_ipv4(eth, data_end, &replyBinding, &whiteholeBound) || whiteholeBound)
     {
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-      bump_dev_host_route_stat(1);
-#endif
       return false;
     }
 
@@ -673,9 +628,6 @@ __attribute__((__always_inline__)) static inline bool should_fast_pass_native_ho
 
     if (lookup_whitehole_reply_binding_ipv6(eth, data_end, &replyBinding, &whiteholeBound) || whiteholeBound)
     {
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-      bump_dev_host_route_stat(8);
-#endif
       return false;
     }
 
@@ -688,14 +640,6 @@ __attribute__((__always_inline__)) static inline bool should_fast_pass_native_ho
 SEC("tcx/ingress")
 int host_ingress(struct __sk_buff *skb)
 {
-#if PRODIGY_DEBUG
-  logSKB(skb);
-#endif
-
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-  bump_dev_host_route_stat(0);
-#endif
-
   void *data_end = (void *)(long)skb->data_end;
 
   struct ethhdr *eth = (struct ethhdr *)(long)skb->data;
@@ -742,11 +686,7 @@ int host_ingress(struct __sk_buff *skb)
 
   if (should_fast_pass_native_host_packet(eth, data_end))
   {
-    setCheckpoint("native-pass");
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-    bump_dev_host_route_stat(14);
-#endif
-    return setInstruction(TC_ACT_OK);
+    return TC_ACT_OK;
   }
 
   __u32 minimum_linear_bytes = switchboardHostIngressOverlayMinimumLinearBytes(eth->h_proto);
@@ -798,37 +738,16 @@ int host_ingress(struct __sk_buff *skb)
 
     if (localSubnetContainsDaddr(daddr6))
     {
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-      bump_dev_host_route_stat(4);
-      if (ipv6h->nexthdr == IPPROTO_IPIP)
-      {
-        bump_dev_host_route_stat(11);
-      }
-      else if (ipv6h->nexthdr == IPPROTO_IPV6)
-      {
-        bump_dev_host_route_stat(12);
-      }
-      else
-      {
-        bump_dev_host_route_stat(13);
-      }
-#endif
       // netkit_xmit() classifies skb->pkt_type for the destination peer before
       // the primary-attached BPF program runs. Normalize the host NIC Ethernet
       // header here so the receiving peer is PACKET_HOST, not OTHERHOST.
       null_mac_addresses(eth);
       if (redirectToContainer(daddr6, true) == TC_ACT_REDIRECT)
       {
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-        bump_dev_host_route_stat(5);
-#endif
-        return setInstruction(TC_ACT_REDIRECT);
+        return TC_ACT_REDIRECT;
       }
       else
       {
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-        bump_dev_host_route_stat(6);
-#endif
         // Container-subnet destinations must resolve to a host-side primary
         // netkit device for the destination container.
         // If the boundary map is stale or the container is gone, fail closed.
@@ -838,16 +757,10 @@ int host_ingress(struct __sk_buff *skb)
 
     if (lookup_whitehole_reply_binding_ipv6(eth, data_end, &replyBinding, &whiteholeBound))
     {
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-      bump_dev_host_route_stat(9);
-#endif
       null_mac_addresses(eth);
       if (replyBinding.container.hasID && redirectContainerFragment(replyBinding.container.value[4], true))
       {
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-        bump_dev_host_route_stat(15);
-#endif
-        return setInstruction(TC_ACT_REDIRECT);
+        return TC_ACT_REDIRECT;
       }
 
       return TC_ACT_SHOT;
@@ -856,8 +769,6 @@ int host_ingress(struct __sk_buff *skb)
     {
       return TC_ACT_SHOT;
     }
-
-    setCheckpoint("redirectToContainer");
 
     if (overlayRoutablePrefixesContainIPv6(ipv6h->daddr.s6_addr32))
     {
@@ -870,7 +781,7 @@ int host_ingress(struct __sk_buff *skb)
       null_mac_addresses(eth);
       if (redirectContainerFragment(containerID.value[4], true))
       {
-        return setInstruction(TC_ACT_REDIRECT);
+        return TC_ACT_REDIRECT;
       }
 
       return TC_ACT_SHOT;
@@ -895,21 +806,12 @@ int host_ingress(struct __sk_buff *skb)
 
     if (lookup_whitehole_reply_binding_ipv4(eth, data_end, &replyBinding, &whiteholeBound))
     {
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-      bump_dev_host_route_stat(2);
-#endif
       null_mac_addresses(eth);
       if (replyBinding.container.hasID && redirectContainerFragment(replyBinding.container.value[4], true))
       {
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-        bump_dev_host_route_stat(3);
-#endif
-        return setInstruction(TC_ACT_REDIRECT);
+        return TC_ACT_REDIRECT;
       }
 
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-      bump_dev_host_route_stat(7);
-#endif
       return TC_ACT_SHOT;
     }
     if (whiteholeBound)
@@ -930,16 +832,12 @@ int host_ingress(struct __sk_buff *skb)
       null_mac_addresses(eth);
       if (redirectContainerFragment(containerID.value[4], true))
       {
-        return setInstruction(TC_ACT_REDIRECT);
+        return TC_ACT_REDIRECT;
       }
 
       return TC_ACT_SHOT;
     }
   }
 
-  setCheckpoint("passing");
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-  bump_dev_host_route_stat(10);
-#endif
-  return setInstruction(TC_ACT_OK);
+  return TC_ACT_OK;
 }

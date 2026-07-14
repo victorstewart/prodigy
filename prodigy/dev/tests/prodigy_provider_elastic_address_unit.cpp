@@ -44,6 +44,18 @@ static bool stringContains(const String& haystack, const String& needle)
   return false;
 }
 
+static void runClusterCreatePreflight(BrainIaaS& iaas,
+                                      const BrainIaaSClusterCreatePreflight& preflight,
+                                      String& error)
+{
+  CoroutineStack coro = {};
+  iaas.preflightClusterCreate(&coro, preflight, error);
+  while (coro.hasSuspendedCoroutines())
+  {
+    coro.co_consume();
+  }
+}
+
 class FakeAwsElasticIaaS : public AwsBrainIaaS {
 public:
 
@@ -92,7 +104,17 @@ protected:
 
     if (suite)
     {
-      suite->expect(call.bodyContains.size() == 0 || stringContains(bodyText, call.bodyContains), "aws_body_matches");
+      const bool bodyMatches = call.bodyContains.size() == 0 || stringContains(bodyText, call.bodyContains);
+      if (bodyMatches == false)
+      {
+        String expectedText = {};
+        expectedText.assign(call.bodyContains);
+        std::fprintf(stderr,
+                     "AWS body mismatch: expected='%s' actual='%s'\n",
+                     expectedText.c_str(),
+                     bodyText.c_str());
+      }
+      suite->expect(bodyMatches, "aws_body_matches");
     }
 
     if (httpCode)
@@ -311,7 +333,7 @@ static void testAwsPreflightRequiresInstanceProfile(TestSuite& suite)
   preflight.configs.push_back(config);
 
   String error = {};
-  aws.preflightClusterCreate(nullptr, preflight, error);
+  runClusterCreatePreflight(aws, preflight, error);
   suite.expect(error.size() > 0, "aws_preflight_requires_instance_profile_rejected");
   suite.expect(stringContains(error, "instanceProfile"_ctv), "aws_preflight_requires_instance_profile_reason");
 }
@@ -345,7 +367,7 @@ static void testAwsPreflightChecksProfileAndDryRuns(TestSuite& suite)
 
   call = {};
   call.bodyContains = "Action=DescribeSubnets"_ctv;
-  call.response = "<DescribeSubnetsResponse><subnetSet><item><subnetId>subnet-1</subnetId><defaultForAz>true</defaultForAz></item></subnetSet></DescribeSubnetsResponse>"_ctv;
+  call.response = "<DescribeSubnetsResponse><subnetSet><item><subnetId>subnet-1</subnetId><availabilityZone>us-east-1a</availabilityZone><defaultForAz>true</defaultForAz></item></subnetSet></DescribeSubnetsResponse>"_ctv;
   aws.expected.push_back(call);
 
   call = {};
@@ -390,7 +412,7 @@ static void testAwsPreflightChecksProfileAndDryRuns(TestSuite& suite)
   preflight.configs.push_back(config);
 
   String error = {};
-  aws.preflightClusterCreate(nullptr, preflight, error);
+  runClusterCreatePreflight(aws, preflight, error);
   suite.expect(error.size() == 0, "aws_preflight_profile_and_dryruns_success");
   suite.expect(aws.nextExpectedIAM == aws.expectedIAM.size(), "aws_preflight_profile_and_dryruns_consumed_iam_calls");
   suite.expect(aws.nextExpected == aws.expected.size(), "aws_preflight_profile_and_dryruns_consumed_ec2_calls");
@@ -425,7 +447,7 @@ static void testAwsPreflightListsDryRunFailures(TestSuite& suite)
 
   call = {};
   call.bodyContains = "Action=DescribeSubnets"_ctv;
-  call.response = "<DescribeSubnetsResponse><subnetSet><item><subnetId>subnet-1</subnetId><defaultForAz>true</defaultForAz></item></subnetSet></DescribeSubnetsResponse>"_ctv;
+  call.response = "<DescribeSubnetsResponse><subnetSet><item><subnetId>subnet-1</subnetId><availabilityZone>us-east-1a</availabilityZone><defaultForAz>true</defaultForAz></item></subnetSet></DescribeSubnetsResponse>"_ctv;
   aws.expected.push_back(call);
 
   call = {};
@@ -470,7 +492,7 @@ static void testAwsPreflightListsDryRunFailures(TestSuite& suite)
   preflight.configs.push_back(config);
 
   String error = {};
-  aws.preflightClusterCreate(nullptr, preflight, error);
+  runClusterCreatePreflight(aws, preflight, error);
   suite.expect(error.size() > 0, "aws_preflight_dryrun_failures_rejected");
   suite.expect(stringContains(error, "AuthorizeSecurityGroupIngress(ssh)"_ctv), "aws_preflight_dryrun_failures_lists_ssh");
   suite.expect(stringContains(error, "AuthorizeSecurityGroupIngress(mesh)"_ctv), "aws_preflight_dryrun_failures_lists_mesh");
@@ -498,7 +520,7 @@ static void testGcpPreflightRequiresServiceAccount(TestSuite& suite)
   preflight.configs.push_back(config);
 
   String error = {};
-  gcp.preflightClusterCreate(nullptr, preflight, error);
+  runClusterCreatePreflight(gcp, preflight, error);
   suite.expect(error.size() > 0, "gcp_preflight_requires_service_account_rejected");
   suite.expect(stringContains(error, "serviceAccountEmail"_ctv), "gcp_preflight_requires_service_account_reason");
 }
@@ -521,7 +543,7 @@ static void testAzurePreflightRequiresManagedIdentity(TestSuite& suite)
   preflight.configs.push_back(config);
 
   String error = {};
-  azure.preflightClusterCreate(nullptr, preflight, error);
+  runClusterCreatePreflight(azure, preflight, error);
   suite.expect(error.size() > 0, "azure_preflight_requires_identity_rejected");
   suite.expect(stringContains(error, "managedIdentity"_ctv), "azure_preflight_requires_identity_reason");
 }
@@ -552,7 +574,7 @@ static void testAzurePreflightChecksPermissions(TestSuite& suite)
   preflight.configs.push_back(config);
 
   String error = {};
-  azure.preflightClusterCreate(nullptr, preflight, error);
+  runClusterCreatePreflight(azure, preflight, error);
   suite.expect(error.size() == 0, "azure_preflight_permissions_success");
   suite.expect(azure.nextExpected == azure.expected.size(), "azure_preflight_permissions_consumed_calls");
 }
@@ -583,7 +605,7 @@ static void testAzurePreflightHonorsNotActions(TestSuite& suite)
   preflight.configs.push_back(config);
 
   String error = {};
-  azure.preflightClusterCreate(nullptr, preflight, error);
+  runClusterCreatePreflight(azure, preflight, error);
   suite.expect(error.size() > 0, "azure_preflight_not_actions_rejected");
   suite.expect(stringContains(error, "roleAssignments/write"_ctv), "azure_preflight_not_actions_reason");
   suite.expect(azure.nextExpected == azure.expected.size(), "azure_preflight_not_actions_consumed_calls");
@@ -615,7 +637,7 @@ static void testAzurePreflightListsMissingPermissions(TestSuite& suite)
   preflight.configs.push_back(config);
 
   String error = {};
-  azure.preflightClusterCreate(nullptr, preflight, error);
+  runClusterCreatePreflight(azure, preflight, error);
   suite.expect(error.size() > 0, "azure_preflight_missing_permissions_rejected");
   suite.expect(stringContains(error, "Microsoft.Authorization/roleAssignments/write"_ctv), "azure_preflight_missing_permissions_lists_role_assignment_write");
   suite.expect(stringContains(error, "Microsoft.Compute/virtualMachines/write"_ctv), "azure_preflight_missing_permissions_lists_vm_write");

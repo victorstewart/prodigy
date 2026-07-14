@@ -19,6 +19,10 @@ public:
    void expect(bool condition, const char *name)
    {
       basics_log("%s: %s\n", condition ? "PASS" : "FAIL", name);
+      if (condition == false)
+      {
+         std::fprintf(stderr, "FAIL: %s\n", name);
+      }
       failed += condition ? 0 : 1;
    }
 };
@@ -27,7 +31,7 @@ class CommandRun final
 {
 public:
 
-   CoroutineStack stack;
+   CoroutineStack stack = {};
    bool complete = false;
    bool result = false;
 
@@ -164,6 +168,19 @@ static bool processGoneOrZombie(pid_t pid)
    return false;
 }
 
+static bool waitForProcessGoneOrZombie(pid_t pid)
+{
+   for (uint32_t attempt = 0; attempt < 250; ++attempt)
+   {
+      if (processGoneOrZombie(pid))
+      {
+         return true;
+      }
+      ::usleep(1000);
+   }
+   return processGoneOrZombie(pid);
+}
+
 int main(void)
 {
    TestSuite suite = {};
@@ -221,7 +238,7 @@ int main(void)
                        failure == "credential command deadline exceeded"_ctv &&
                        elapsed < std::chrono::seconds(2),
                    "command_capture_deadline_kills_hung_command");
-      suite.expect(processGoneOrZombie(descendant),
+      suite.expect(waitForProcessGoneOrZombie(descendant),
                    "command_capture_deadline_kills_descendant_process_group");
       ::unlink(pidPath);
    }
@@ -235,7 +252,7 @@ int main(void)
                     ProdigyCommandCapture::Clock::now() - leaderStarted < std::chrono::seconds(2),
                 "command_capture_reaps_successful_leader_without_waiting_for_descendant_pipe");
    pid_t successfulDescendant = pid_t(std::strtol(output.c_str(), nullptr, 10));
-   suite.expect(processGoneOrZombie(successfulDescendant),
+   suite.expect(waitForProcessGoneOrZombie(successfulDescendant),
                 "command_capture_success_kills_lingering_descendant_process_group");
 
    struct sigaction previousSigchld = {};

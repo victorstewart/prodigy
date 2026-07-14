@@ -1,6 +1,7 @@
 #include <services/crypto.h>
 #include <spawn.h>
 #include <prodigy/cluster.machine.helpers.h>
+#include <prodigy/netdev.detect.h>
 
 #pragma once
 
@@ -168,6 +169,12 @@ public:
 
   void gatherSelfData(CoroutineStack *, uint128_t& uuid, String& metro, bool& isBrain, EthDevice& eth, IPAddress& private4) override
   {
+    String deviceName;
+    if (prodigyResolvePrimaryNetworkDevice(deviceName))
+    {
+      eth.setDevice(deviceName);
+    }
+
     metro.assign("dev"_ctv);
     private4.is6 = false;
 

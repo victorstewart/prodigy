@@ -2832,10 +2832,8 @@ public:
 
   bool isProgress = false;
   Vector<MachineProvisioningProgress> provisioningProgress;
-#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
   bool hasTimingAttribution = false;
   ProdigyTimingAttribution timingAttribution;
-#endif
   String reachabilityProbeAddress;
   Vector<BrainReachabilityProbeResult> reachabilityResults;
   bool success = false;
@@ -2846,9 +2844,7 @@ public:
   bool operator==(const AddMachines& other) const
   {
     if (adoptedMachines.size() != other.adoptedMachines.size() || readyMachines.size() != other.readyMachines.size() || removedMachines.size() != other.removedMachines.size() || provisioningProgress.size() != other.provisioningProgress.size() || reachabilityResults.size() != other.reachabilityResults.size() || bootstrapSshUser.equals(other.bootstrapSshUser) == false || bootstrapSshKeyPackage != other.bootstrapSshKeyPackage || bootstrapSshHostKeyPackage != other.bootstrapSshHostKeyPackage || bootstrapSshPrivateKeyPath.equals(other.bootstrapSshPrivateKeyPath) == false || remoteProdigyPath.equals(other.remoteProdigyPath) == false || controlSocketPath.equals(other.controlSocketPath) == false || !(acme == other.acme) || clusterUUID != other.clusterUUID || architecture != other.architecture || isProgress != other.isProgress
-#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
         || hasTimingAttribution != other.hasTimingAttribution || timingAttribution != other.timingAttribution
-#endif
         || reachabilityProbeAddress.equals(other.reachabilityProbeAddress) == false || success != other.success || hasTopology != other.hasTopology || topology != other.topology || failure.equals(other.failure) == false)
     {
       return false;
@@ -2920,10 +2916,8 @@ static void serialize(S&& serializer, AddMachines& payload)
   serializer.object(payload.removedMachines);
   serializer.value1b(payload.isProgress);
   serializer.object(payload.provisioningProgress);
-#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
   serializer.value1b(payload.hasTimingAttribution);
   serializer.object(payload.timingAttribution);
-#endif
   serializer.text1b(payload.reachabilityProbeAddress, UINT32_MAX);
   serializer.object(payload.reachabilityResults);
   serializer.value1b(payload.success);
@@ -3045,10 +3039,8 @@ public:
   Vector<ProdigyManagedMachineSchemaPatch> patches;
   uint32_t upserted = 0;
   uint32_t created = 0;
-#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
   bool hasTimingAttribution = false;
   ProdigyTimingAttribution timingAttribution;
-#endif
   bool success = false;
   bool hasTopology = false;
   ClusterTopology topology;
@@ -3061,10 +3053,8 @@ static void serialize(S&& serializer, UpsertMachineSchemas& payload)
   serializer.object(payload.patches);
   serializer.value4b(payload.upserted);
   serializer.value4b(payload.created);
-#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
   serializer.value1b(payload.hasTimingAttribution);
   serializer.object(payload.timingAttribution);
-#endif
   serializer.value1b(payload.success);
   serializer.value1b(payload.hasTopology);
   serializer.object(payload.topology);
@@ -4687,10 +4677,10 @@ static inline void prodigyStringifyMachineHardwareProfile(const MachineHardwareP
       (void)prodigyReportRenderIPAddressLiteral(subnet.subnet.network, networkText);
       (void)prodigyReportRenderIPAddressLiteral(subnet.gateway, gatewayText);
       string.appendTabs(nTabs + 2);
-      string.snprintf_add<"subnet address={} network={}/{} gateway={} internetReachable={itoa}\n"_ctv>(
+      string.snprintf_add<"subnet address={} network={}/{itoa} gateway={} internetReachable={itoa}\n"_ctv>(
           addressText,
           networkText,
-          subnet.subnet.cidr,
+          uint32_t(subnet.subnet.cidr),
           gatewayText,
           subnet.internetReachable ? 1u : 0u);
     }
@@ -8123,38 +8113,8 @@ static void prodigySerializePersistentMapAsEntries(
 template <typename S>
 static void serialize(S&& serializer, ProdigyPersistentMasterAuthorityPackage& package)
 {
-  const char *persistTraceValue = std::getenv("PRODIGY_PERSIST_TRACE");
-  bool persistTrace = persistTraceValue != nullptr && persistTraceValue[0] != '\0' && persistTraceValue[0] != '0';
-
-  if (persistTrace)
-  {
-    std::fprintf(stderr, "prodigy persist package tlsVaultFactoriesByApp begin\n");
-    std::fflush(stderr);
-  }
   serializer.object(package.tlsVaultFactoriesByApp);
-  if (persistTrace)
-  {
-    std::fprintf(stderr, "prodigy persist package tlsVaultFactoriesByApp end\n");
-    std::fflush(stderr);
-  }
-
-  if (persistTrace)
-  {
-    std::fprintf(stderr, "prodigy persist package apiCredentialSetsByApp begin\n");
-    std::fflush(stderr);
-  }
   serializer.object(package.apiCredentialSetsByApp);
-  if (persistTrace)
-  {
-    std::fprintf(stderr, "prodigy persist package apiCredentialSetsByApp end\n");
-    std::fflush(stderr);
-  }
-
-  if (persistTrace)
-  {
-    std::fprintf(stderr, "prodigy persist package reservedApplicationIDsByName begin\n");
-    std::fflush(stderr);
-  }
   prodigySerializePersistentMapAsEntries(
       serializer,
       package.reservedApplicationIDsByName,
@@ -8167,17 +8127,6 @@ static void serialize(S&& serializer, ProdigyPersistentMasterAuthorityPackage& p
       [](const String& lhs, const String& rhs) -> bool {
         return prodigyPersistentStringComesBefore(lhs, rhs);
       });
-  if (persistTrace)
-  {
-    std::fprintf(stderr, "prodigy persist package reservedApplicationIDsByName end\n");
-    std::fflush(stderr);
-  }
-
-  if (persistTrace)
-  {
-    std::fprintf(stderr, "prodigy persist package reservedApplicationNamesByID begin\n");
-    std::fflush(stderr);
-  }
   prodigySerializePersistentMapAsEntries(
       serializer,
       package.reservedApplicationNamesByID,
@@ -8190,61 +8139,12 @@ static void serialize(S&& serializer, ProdigyPersistentMasterAuthorityPackage& p
       [](const uint16_t& lhs, const uint16_t& rhs) -> bool {
         return lhs < rhs;
       });
-  if (persistTrace)
-  {
-    std::fprintf(stderr, "prodigy persist package reservedApplicationNamesByID end\n");
-    std::fflush(stderr);
-  }
-
-  if (persistTrace)
-  {
-    std::fprintf(stderr, "prodigy persist package reservedApplicationServices begin\n");
-    std::fflush(stderr);
-  }
   serializer.object(package.reservedApplicationServices);
-  if (persistTrace)
-  {
-    std::fprintf(stderr, "prodigy persist package reservedApplicationServices end\n");
-    std::fflush(stderr);
-  }
 
   serializer.value2b(package.nextReservableApplicationID);
-
-  if (persistTrace)
-  {
-    std::fprintf(stderr, "prodigy persist package deploymentPlans begin\n");
-    std::fflush(stderr);
-  }
   serializer.object(package.deploymentPlans);
-  if (persistTrace)
-  {
-    std::fprintf(stderr, "prodigy persist package deploymentPlans end\n");
-    std::fflush(stderr);
-  }
-
-  if (persistTrace)
-  {
-    std::fprintf(stderr, "prodigy persist package failedDeployments begin\n");
-    std::fflush(stderr);
-  }
   serializer.object(package.failedDeployments);
-  if (persistTrace)
-  {
-    std::fprintf(stderr, "prodigy persist package failedDeployments end\n");
-    std::fflush(stderr);
-  }
-
-  if (persistTrace)
-  {
-    std::fprintf(stderr, "prodigy persist package runtimeState begin\n");
-    std::fflush(stderr);
-  }
   serializer.object(package.runtimeState);
-  if (persistTrace)
-  {
-    std::fprintf(stderr, "prodigy persist package runtimeState end\n");
-    std::fflush(stderr);
-  }
 }
 
 class ContainerParameters { // startup payload for container launch; stateful mesh and topology metadata use the full serializer path

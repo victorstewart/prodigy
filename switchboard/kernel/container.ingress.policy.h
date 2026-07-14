@@ -14,9 +14,18 @@ struct {
 
 __attribute__((__always_inline__)) static inline bool containerLearnOrAuthorizeInboundTCP(struct ipv6hdr *ip6h, struct tcphdr *tcp)
 {
-  if (containerNetworkAddressMatches(ip6h->daddr.s6_addr) == false ||
-      switchboardContainerDestinationIPv6(ip6h->saddr.s6_addr) == false)
+  if (containerNetworkAddressMatches(ip6h->daddr.s6_addr) == false)
   {
+#if PRODIGY_DEBUG
+    setCheckpoint("inboundDestinationMismatch");
+#endif
+    return false;
+  }
+  if (switchboardContainerDestinationIPv6(ip6h->saddr.s6_addr) == false)
+  {
+#if PRODIGY_DEBUG
+    setCheckpoint("inboundSourceMismatch");
+#endif
     return false;
   }
 
@@ -36,9 +45,26 @@ __attribute__((__always_inline__)) static inline bool containerLearnOrAuthorizeI
     source.port = tcp->dest;
     if (bpf_map_lookup_elem(&ct_adv_sources, &source) == NULL)
     {
+#if PRODIGY_DEBUG
+      setCheckpoint("inboundPairingMissing");
+#endif
       return false;
     }
-    return containerAuthorizeTCPFlow(&reverse);
+    if (containerAuthorizeTCPFlow(&reverse) == false)
+    {
+#if PRODIGY_DEBUG
+      setCheckpoint("inboundFlowInsertFailed");
+#endif
+      return false;
+    }
+    return true;
   }
-  return containerTCPFlowCurrent(&reverse, tcp->fin, tcp->rst);
+  if (containerTCPFlowCurrent(&reverse, tcp->fin, tcp->rst) == false)
+  {
+#if PRODIGY_DEBUG
+    setCheckpoint("inboundFlowMissing");
+#endif
+    return false;
+  }
+  return true;
 }

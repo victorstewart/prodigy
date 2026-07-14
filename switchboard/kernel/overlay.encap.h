@@ -241,7 +241,7 @@ __attribute__((__always_inline__)) static inline bool switchboardMaybeRouteHoste
   __u16 inner_packet_len = (__u16)(skb->len - sizeof(struct ethhdr));
   if (switchboardEncapSKBV6(skb, inner_packet_len, IPPROTO_IPIP, route) || switchboardEncapSKBV4(skb, inner_packet_len, IPPROTO_IPIP, route))
   {
-    *action = setInstruction(TC_ACT_OK);
+    *action = TC_ACT_OK;
     return true;
   }
 
@@ -279,7 +279,7 @@ __attribute__((__always_inline__)) static inline bool switchboardMaybeRouteHoste
   __u16 inner_packet_len = (__u16)(skb->len - sizeof(struct ethhdr));
   if (switchboardEncapSKBV6(skb, inner_packet_len, IPPROTO_IPV6, route) || switchboardEncapSKBV4(skb, inner_packet_len, IPPROTO_IPV6, route))
   {
-    *action = setInstruction(TC_ACT_OK);
+    *action = TC_ACT_OK;
     return true;
   }
 

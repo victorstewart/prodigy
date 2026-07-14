@@ -6,7 +6,6 @@ MOTHERSHIP_BIN="${2:-}"
 PINGPONG_BIN="${3:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HARNESS="${SCRIPT_DIR}/prodigy_dev_netns_harness.sh"
 source "${SCRIPT_DIR}/prodigy_dev_discombobulator_artifact_helpers.sh"
 SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 prodigy_dev_reexec_in_private_mount_namespace_once PRODIGY_DEV_STORAGE_MULTIDRIVE_RESIZE_SMOKE_MOUNT_NS_READY bash "${SCRIPT_SELF}" "$@"
@@ -23,7 +22,7 @@ then
    exit 77
 fi
 
-deps=(awk btrfs cargo mkfs.btrfs mkfs.ext4 mount umount stat zstd timeout ip nsenter python3 rg losetup)
+deps=(awk btrfs cargo mkfs.btrfs mount umount stat zstd timeout ip nsenter python3 rg)
 for cmd in "${deps[@]}"
 do
    if ! command -v "${cmd}" >/dev/null 2>&1
@@ -44,7 +43,6 @@ manifest_path="${workspace_root}/test-cluster-manifest.json"
 cluster_name="storage-multidrive-$(date -u +%Y%m%d-%H%M%S)"
 mothership_db_path="${tmpdir}/mothership-storage.tidesdb"
 keep_tmp="${PRODIGY_DEV_KEEP_TMP:-0}"
-allow_containers_overmount="${PRODIGY_DEV_ALLOW_CONTAINERS_OVERMOUNT:-0}"
 create_log="${tmpdir}/create_cluster.log"
 deploy_log="${tmpdir}/deploy.log"
 application_log="${tmpdir}/application_report.log"
@@ -53,17 +51,6 @@ remove_log="${tmpdir}/remove_cluster.log"
 btrfs_show_log="${tmpdir}/btrfs_filesystem_show.log"
 traffic_log="${tmpdir}/traffic.log"
 
-containers_dir_created=0
-containers_mount_created=0
-containers_loop_image=""
-storage_a_img="${tmpdir}/storage-a.img"
-storage_b_img="${tmpdir}/storage-b.img"
-storage_a_mount="/mnt/prodigy-storage-a"
-storage_b_mount="/mnt/prodigy-storage-b"
-storage_a_mounted=0
-storage_b_mounted=0
-storage_a_dir_created=0
-storage_b_dir_created=0
 cluster_created=0
 archive_workspace=0
 
@@ -74,45 +61,17 @@ cleanup()
    if [[ "${archive_workspace}" -eq 1 && -d "${workspace_root}" ]]
    then
       rm -rf "${tmpdir}/workspace-archive" >/dev/null 2>&1 || true
-      cp -a "${workspace_root}" "${tmpdir}/workspace-archive" >/dev/null 2>&1 || true
+      mkdir -p "${tmpdir}/workspace-archive"
+      find "${workspace_root}" -maxdepth 1 -type f \( -name '*.log' -o -name '*.json' -o -name '*.ready' -o -name '*.failure' \) \
+         -exec cp -a {} "${tmpdir}/workspace-archive/" \; >/dev/null 2>&1 || true
    fi
 
    if [[ "${cluster_created}" -eq 1 ]]
    then
-      env PRODIGY_MOTHERSHIP_TEST_HARNESS="${HARNESS}" \
+      env \
          PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
          "${MOTHERSHIP_BIN}" removeCluster "${cluster_name}" \
          >"${remove_log}" 2>&1 || true
-   fi
-
-   if [[ "${storage_a_mounted}" -eq 1 ]]
-   then
-      umount "${storage_a_mount}" >/dev/null 2>&1 || true
-   fi
-
-   if [[ "${storage_b_mounted}" -eq 1 ]]
-   then
-      umount "${storage_b_mount}" >/dev/null 2>&1 || true
-   fi
-
-   if [[ "${storage_a_dir_created}" -eq 1 ]]
-   then
-      rmdir "${storage_a_mount}" >/dev/null 2>&1 || true
-   fi
-
-   if [[ "${storage_b_dir_created}" -eq 1 ]]
-   then
-      rmdir "${storage_b_mount}" >/dev/null 2>&1 || true
-   fi
-
-   if [[ "${containers_mount_created}" -eq 1 ]]
-   then
-      umount /containers >/dev/null 2>&1 || true
-   fi
-
-   if [[ "${containers_dir_created}" -eq 1 ]]
-   then
-      rmdir /containers >/dev/null 2>&1 || true
    fi
 
    if [[ "${keep_tmp}" -eq 1 ]]
@@ -124,60 +83,7 @@ cleanup()
 }
 trap cleanup EXIT
 
-if [[ ! -d /containers ]]
-then
-   mkdir -p /containers
-   containers_dir_created=1
-fi
-
-containers_fs_type="$(stat -f -c '%T' /containers 2>/dev/null || echo unknown)"
-if [[ "${containers_fs_type}" != "btrfs" ]]
-then
-   if awk '$2 == "/containers" { found = 1 } END { exit(found ? 0 : 1) }' /proc/self/mounts
-   then
-      if [[ "${allow_containers_overmount}" != "1" ]]
-      then
-         echo "FAIL: /containers is mounted but not btrfs (found ${containers_fs_type})"
-         exit 1
-      fi
-   fi
-
-   if ! prodigy_dev_containers_root_is_safely_overmountable /containers
-   then
-      echo "FAIL: /containers exists on non-btrfs fs and is not safely overmountable"
-      exit 1
-   fi
-
-   containers_loop_image="${tmpdir}/containers.loop.img"
-   truncate -s 2G "${containers_loop_image}"
-   mkfs.btrfs -f "${containers_loop_image}" >/dev/null
-   mount -o loop "${containers_loop_image}" /containers
-   containers_mount_created=1
-fi
-
-mkdir -p /containers/store /containers/storage "${workspace_root}"
-
-if [[ ! -d "${storage_a_mount}" ]]
-then
-   mkdir -p "${storage_a_mount}"
-   storage_a_dir_created=1
-fi
-
-if [[ ! -d "${storage_b_mount}" ]]
-then
-   mkdir -p "${storage_b_mount}"
-   storage_b_dir_created=1
-fi
-
-truncate -s 1G "${storage_a_img}"
-truncate -s 1G "${storage_b_img}"
-mkfs.ext4 -F "${storage_a_img}" >/dev/null
-mkfs.ext4 -F "${storage_b_img}" >/dev/null
-mount -o loop "${storage_a_img}" "${storage_a_mount}"
-storage_a_mounted=1
-mount -o loop "${storage_b_img}" "${storage_b_mount}"
-storage_b_mounted=1
-export PRODIGY_DEV_CONTAINER_STORAGE_MOUNTS="${storage_a_mount}:${storage_b_mount}"
+mkdir -p "${workspace_root}"
 
 application_id=6
 version_id=$(( ($(date +%s%N) & 281474976710655) ))
@@ -203,16 +109,16 @@ read -r -d '' CREATE_REQUEST <<EOF || true
   "test": {
     "workspaceRoot": "${workspace_root}",
     "machineCount": 1,
+    "machineStorageMB": 8192,
+    "storageDeviceCount": 2,
+    "storageDeviceMB": 1024,
     "brainBootstrapFamily": "ipv4",
-    "enableFakeIpv4Boundary": false,
-    "host": {
-      "mode": "local"
-    }
+    "enableFakeIpv4Boundary": false
   }
 }
 EOF
 
-if ! env PRODIGY_MOTHERSHIP_TEST_HARNESS="${HARNESS}" \
+if ! env \
    PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
    "${MOTHERSHIP_BIN}" createCluster "${CREATE_REQUEST}" \
    >"${create_log}" 2>&1
@@ -239,24 +145,13 @@ then
    exit 1
 fi
 
-mapfile -t manifest_fields < <(python3 - "${manifest_path}" <<'PY'
+brain_pid="$(python3 - "${manifest_path}" <<'PY'
 import json, sys
 with open(sys.argv[1], "r", encoding="utf-8") as fh:
     manifest = json.load(fh)
-print(manifest["parentNamespace"])
-print(manifest.get("parentPid", 0))
 print(next((node.get("pid", 0) for node in manifest.get("nodes", []) if node.get("role") == "brain"), 0))
 PY
-)
-parent_ns="${manifest_fields[0]:-}"
-parent_pid="${manifest_fields[1]:-0}"
-brain_pid="${manifest_fields[2]:-0}"
-
-if [[ -z "${parent_ns}" ]]
-then
-   echo "FAIL: unable to parse parent namespace"
-   exit 1
-fi
+)"
 
 if ! [[ "${brain_pid}" =~ ^[0-9]+$ ]] || [[ "${brain_pid}" -le 0 ]] || ! kill -0 "${brain_pid}" >/dev/null 2>&1
 then
@@ -368,31 +263,16 @@ then
    exit 1
 fi
 
-parent_netns_exec=(ip netns exec "${parent_ns}")
-if ! "${parent_netns_exec[@]}" true >/dev/null 2>&1
+traffic_payload="$(printf 'ping\n%.0s' {1..80})"
+if ! env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+   "${MOTHERSHIP_BIN}" probeTestCluster "${cluster_name}" 10.0.0.10 19090 "${traffic_payload}" pong 10000 0 \
+   >"${traffic_log}" 2>&1
 then
-   if [[ "${parent_pid}" =~ ^[0-9]+$ ]] && [[ "${parent_pid}" -gt 0 ]] && kill -0 "${parent_pid}" >/dev/null 2>&1
-   then
-      parent_netns_exec=(nsenter -t "${parent_pid}" -n)
-   else
-      echo "FAIL: parent namespace is not reachable by name or pid"
-      exit 1
-   fi
+   archive_workspace=1
+   echo "FAIL: Mothership test-provider traffic probe failed"
+   sed -n '1,160p' "${traffic_log}" || true
+   exit 1
 fi
-
-"${parent_netns_exec[@]}" python3 - <<'PY' >"${traffic_log}" 2>&1
-import socket
-import time
-
-target = ("10.0.0.10", 19090)
-for _ in range(80):
-    with socket.create_connection(target, timeout=2.0) as sock:
-        sock.sendall(b"ping\n")
-        data = sock.recv(64)
-        if data != b"pong\n":
-            raise SystemExit(f"unexpected reply: {data!r}")
-    time.sleep(0.05)
-PY
 
 scaled=0
 for _ in $(seq 1 180)
@@ -428,19 +308,20 @@ then
    exit 1
 fi
 
-mapfile -t storage_a_files < <(find "${storage_a_mount}/.prodigy/container-storage" -maxdepth 1 -type f -name '*.btrfs.loop' | sort)
-mapfile -t storage_b_files < <(find "${storage_b_mount}/.prodigy/container-storage" -maxdepth 1 -type f -name '*.btrfs.loop' | sort)
+brain_mount_exec=(nsenter -t "${brain_pid}" -m --)
+mapfile -t storage_a_files < <("${brain_mount_exec[@]}" find /mnt/prodigy-storage/1/.prodigy/container-storage -maxdepth 1 -type f -name '*.btrfs.loop' | sort)
+mapfile -t storage_b_files < <("${brain_mount_exec[@]}" find /mnt/prodigy-storage/2/.prodigy/container-storage -maxdepth 1 -type f -name '*.btrfs.loop' | sort)
 
 if [[ "${#storage_a_files[@]}" -ne 1 || "${#storage_b_files[@]}" -ne 1 ]]
 then
    archive_workspace=1
    echo "FAIL: expected one loop backing file per mounted filesystem"
-   find "${storage_a_mount}" "${storage_b_mount}" -maxdepth 3 -printf '%p\n' | sort
+   "${brain_mount_exec[@]}" find /mnt/prodigy-storage -maxdepth 4 -printf '%p\n' | sort
    exit 1
 fi
 
-storage_a_size="$(stat -c '%s' "${storage_a_files[0]}")"
-storage_b_size="$(stat -c '%s' "${storage_b_files[0]}")"
+storage_a_size="$("${brain_mount_exec[@]}" stat -c '%s' "${storage_a_files[0]}")"
+storage_b_size="$("${brain_mount_exec[@]}" stat -c '%s' "${storage_b_files[0]}")"
 min_bytes=$((256 * 1024 * 1024))
 if [[ "${storage_a_size}" -lt "${min_bytes}" || "${storage_b_size}" -lt "${min_bytes}" ]]
 then
@@ -451,7 +332,6 @@ then
    exit 1
 fi
 
-brain_mount_exec=(nsenter -t "${brain_pid}" -m --)
 storage_root="$("${brain_mount_exec[@]}" sh -lc 'find /containers/storage -mindepth 1 -maxdepth 1 -type d | head -n 1' 2>/dev/null || true)"
 if [[ -z "${storage_root}" ]]
 then

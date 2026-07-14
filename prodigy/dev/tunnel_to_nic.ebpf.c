@@ -9,10 +9,6 @@
 SEC("tcx/ingress")
 int tunnel_to_nic(struct __sk_buff *skb)
 {
-#if PRODIGY_DEBUG
-  logSKB(skb);
-#endif
-
   void *data_end = (void *)(long)skb->data_end;
 
   struct ethhdr *eth = (struct ethhdr *)(long)skb->data;
@@ -37,7 +33,7 @@ int tunnel_to_nic(struct __sk_buff *skb)
     if (bpf_memcmp(ipv6h->daddr.s6_addr, dev_anycast6, 8) == 0)
     {
       redirectL2ToNIC(skb, eth);
-      return setInstruction(TC_ACT_REDIRECT);
+      return TC_ACT_REDIRECT;
     }
   }
   else if (eth->h_proto == BE_ETH_P_IP)
@@ -55,11 +51,9 @@ int tunnel_to_nic(struct __sk_buff *skb)
     if (iph->daddr == dev_anycast4)
     {
       redirectL2ToNIC(skb, eth);
-      return setInstruction(TC_ACT_REDIRECT);
+      return TC_ACT_REDIRECT;
     }
   }
 
-  setCheckpoint("passing");
-
-  return setInstruction(TC_ACT_OK);
+  return TC_ACT_OK;
 }

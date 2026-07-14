@@ -12,10 +12,10 @@
   "test": {
     "workspaceRoot": "/tmp/nametag-test-local-3brain",
     "machineCount": 3,
+    "machineLogicalCores": 8,
+    "machineMemoryMB": 16384,
+    "machineStorageMB": 262144,
     "brainBootstrapFamily": "ipv4",
-    "enableFakeIpv4Boundary": false,
-    "host": {
-      "mode": "local"
-    }
+    "enableFakeIpv4Boundary": false
   }
 }

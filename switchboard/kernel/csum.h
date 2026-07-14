@@ -94,7 +94,7 @@ __attribute__((__always_inline__)) static inline bool replace_l4_checksum_ipv6_a
 // path.
 #define SWITCHBOARD_WORMHOLE_CHECKSUM_HELPER_CHUNK_BYTES 512u
 
-__attribute__((__always_inline__)) static inline bool accumulate_packet_checksum_bytes(__u32 *csum, const void *value, __u16 byteCount, const void *data_end)
+__attribute__((__noinline__)) static bool accumulate_packet_checksum_bytes(__u32 *csum, const void *value, __u16 byteCount, const void *data_end)
 {
   __u16 boundedByteCount = byteCount;
   const __u8 *bytes = (const __u8 *)value;
@@ -103,7 +103,7 @@ __attribute__((__always_inline__)) static inline bool accumulate_packet_checksum
     return false;
   }
 
-#pragma unroll
+#pragma clang loop unroll(disable)
   for (int iteration = 0; iteration < (SWITCHBOARD_MAX_WORMHOLE_CHECKSUM_BYTES / SWITCHBOARD_WORMHOLE_CHECKSUM_HELPER_CHUNK_BYTES); iteration++)
   {
     const __u16 chunkOffset = (__u16)(iteration * SWITCHBOARD_WORMHOLE_CHECKSUM_HELPER_CHUNK_BYTES);

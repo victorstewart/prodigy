@@ -115,7 +115,7 @@ static void writeFailureDetail(const char *label, const String& text)
   (void)::write(STDERR_FILENO, "\n", 1);
 }
 
-static std::vector<std::string> extractSortedNonEmptyLines(const String& output)
+static std::vector<std::string> extractSortedPrintClustersLines(const String& output)
 {
   String text = {};
   text.assign(output);
@@ -123,9 +123,14 @@ static std::vector<std::string> extractSortedNonEmptyLines(const String& output)
   std::istringstream stream(text.c_str());
   std::vector<std::string> lines;
   std::string line;
+  bool printClustersOutput = false;
   while (std::getline(stream, line))
   {
-    if (line.empty())
+    if (printClustersOutput == false)
+    {
+      printClustersOutput = line.starts_with("printClusters ");
+    }
+    if (printClustersOutput == false || line.empty())
     {
       continue;
     }
@@ -656,7 +661,6 @@ int main(void)
   testCluster.test.specified = true;
   testCluster.test.workspaceRoot = testWorkspaceRoot;
   testCluster.test.machineCount = 3;
-  testCluster.test.host.mode = MothershipClusterTestHostMode::local;
   testCluster.test.brainBootstrapFamily = MothershipClusterTestBootstrapFamily::ipv4;
   testCluster.desiredEnvironment = ProdigyEnvironmentKind::dev;
   testCluster.lastRefreshMs = 77;
@@ -710,8 +714,8 @@ int main(void)
     return EXIT_FAILURE;
   }
 
-  auto firstLines = extractSortedNonEmptyLines(firstOutput);
-  auto secondLines = extractSortedNonEmptyLines(secondOutput);
+  auto firstLines = extractSortedPrintClustersLines(firstOutput);
+  auto secondLines = extractSortedPrintClustersLines(secondOutput);
   suite.expect(firstLines == secondLines, "print_clusters_output_stable_across_process_restart");
 
   suite.expect(stringContains(firstOutput, "printClusters success=1 count=2"), "first_print_clusters_count");
@@ -736,8 +740,6 @@ int main(void)
   String workspaceNeedle = {};
   workspaceNeedle.snprintf<"workspaceRoot={}"_ctv>(storedTest.test.workspaceRoot);
   suite.expect(stringContains(firstOutput, workspaceNeedle.c_str()), "first_output_contains_test_workspace");
-  suite.expect(stringContains(firstOutput, "test hostMode=local"), "first_output_contains_test_host_mode");
-
   suite.expect(stringContains(secondOutput, "name=restart-local"), "second_output_contains_local_name");
   suite.expect(stringContains(secondOutput, localUUIDHex.c_str()), "second_output_contains_local_uuid");
   suite.expect(stringContains(secondOutput, "name=restart-test"), "second_output_contains_test_name");

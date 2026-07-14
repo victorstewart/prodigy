@@ -25,35 +25,6 @@
 #define NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE 0
 #endif
 
-#if !PRODIGY_DEBUG
-// Keep balancer buildable when debug packet tracing maps/hooks are compiled out.
-struct packet {
-  bool balancer;
-  bool localDelivery;
-  struct container_id containerID;
-};
-
-__attribute__((__always_inline__)) static inline struct packet *getPacket(void)
-{
-  return NULL;
-}
-
-__attribute__((__always_inline__)) static inline void setCheckpoint(const char *reading)
-{
-  (void)reading;
-}
-
-__attribute__((__always_inline__)) static inline int setInstruction(int instruction)
-{
-  return instruction;
-}
-
-__attribute__((__always_inline__)) static inline void logXDP(struct xdp_md *xdp)
-{
-  (void)xdp;
-}
-#endif
-
 __attribute__((__always_inline__)) static inline bool containsContainerNetworkIPv6(const __u32 dstv6[4])
 {
   const __u8 *bytes = (const __u8 *)dstv6;
@@ -118,23 +89,6 @@ __attribute__((__always_inline__)) static inline struct switchboard_overlay_mach
 }
 
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-struct
-{
-  __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, 16);
-  __type(key, __u32);
-  __type(value, __u64);
-} dev_rt_stats SEC(".maps");
-
-__attribute__((__always_inline__)) static inline void bump_dev_fake_route_stat(__u32 index)
-{
-  __u64 *slot = bpf_map_lookup_elem(&dev_rt_stats, &index);
-  if (slot)
-  {
-    __sync_fetch_and_add(slot, 1);
-  }
-}
-
 __attribute__((__always_inline__)) static inline bool set_container_id_from_routable_ipv4(struct container_id *containerID, __be32 dst, const struct local_container_subnet6 *localcontainersubnet6)
 {
   const __u8 *dst_bytes = (const __u8 *)&dst;
@@ -325,22 +279,12 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
   if (!portal_meta && !is_ipv6 && localcontainersubnet6 && destination_is_owned_routable)
   {
     direct_fake_delivery = set_container_id_from_routable_ipv4(&containerID, pckt.flow.dst, localcontainersubnet6);
-    if (direct_fake_delivery)
-    {
-      bump_dev_fake_route_stat(0);
-    }
   }
   else if (!portal_meta && is_ipv6 && localcontainersubnet6 && destination_is_owned_routable)
   {
     direct_fake_delivery = set_container_id_from_routable_ipv6(&containerID, pckt.flow.dstv6, localcontainersubnet6);
-    if (direct_fake_delivery)
-    {
-      bump_dev_fake_route_stat(1);
-    }
   }
 #endif
-
-  setCheckpoint("process_packet: checkpoint 1"); // they're being passed right here... which means a problem with the ext_portals
 
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
   if (!portal_meta && !direct_fake_delivery && !whitehole_bound)
@@ -348,21 +292,8 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
   if (!portal_meta && !whitehole_bound)
 #endif
   {
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-    bump_dev_fake_route_stat(2);
-#endif
-    setCheckpoint("process_packet: !portal_meta");
     return XDP_PASS;
   }
-
-  struct packet *pkt = getPacket();
-
-  if (pkt)
-  {
-    pkt->balancer = true;
-  }
-
-  setCheckpoint("process_packet: checkpoint 2");
 
   struct quic_route_result quic_route = {};
 
@@ -376,8 +307,6 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
     }
     else if (portal_meta->flags & F_QUIC_PORTAL)
     {
-      setCheckpoint("process_packet: isQuic");
-
       parse_quic_route(&quic_route, portal_meta, data, data_end, is_ipv6, &pckt.flow);
       bpf_memcpy(&containerID, &quic_route.containerID, sizeof(struct container_id));
 
@@ -395,13 +324,10 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
       switchboardConnectionTableLookup(&containerID, &pckt);
     }
 
-    setCheckpoint("process_packet: checkpoint 3");
-
     if (containerID.hasID == false)
     {
       if (portal_meta == NULL)
       {
-        setInstruction(XDP_DROP);
         return XDP_DROP;
       }
 
@@ -409,18 +335,12 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
 
       if (containerID.hasID == false)
       {
-        setInstruction(XDP_DROP);
         return XDP_DROP;
       }
     }
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
   }
 #endif
-
-  if (pkt)
-  {
-    bpf_memcpy(&pkt->containerID, &containerID, sizeof(struct container_id));
-  }
 
 #if !NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
   struct local_container_subnet6 *localcontainersubnet6 = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
@@ -441,40 +361,24 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
       if (containerID.hasID)
       {
         target_found = switchboardLookupWormholeTargetPort(portal_meta->slot, &containerID, &target_port);
-        if (pkt)
-        {
-          bpf_memcpy(&pkt->containerID, &containerID, sizeof(struct container_id));
-        }
       }
     }
 
     if (target_found == false || switchboardRewriteWormholeIPv6Target(data, data_end, &pckt, &containerID, target_port) == false)
     {
-      setInstruction(XDP_DROP);
       return XDP_DROP;
     }
   }
 
-  setCheckpoint("process_packet: checkpoint 4");
-
   if (localcontainersubnet6)
   {
     bool localDelivery = (bpf_memcmp(containerID.value, localcontainersubnet6, 4) == 0);
-
-    if (pkt)
-    {
-      pkt->localDelivery = localDelivery;
-    }
-
-    setCheckpoint("process_packet: checkpoint 6");
 
     // Same-machine delivery does not need overlay encapsulation. Keep the
     // packet native and let host_ingress redirect it to the target
     // container using the already-selected destination prefix/address.
     if (localDelivery)
     {
-      setInstruction(XDP_PASS);
-      logXDP(xdp);
       return XDP_PASS;
     }
 
@@ -491,42 +395,17 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
 
     if (!overlayEncapped)
     {
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-      if (direct_fake_delivery)
-      {
-        bump_dev_fake_route_stat(3);
-      }
-#endif
-      setInstruction(XDP_DROP);
       return XDP_DROP;
     }
 
-    setCheckpoint("process_packet: checkpoint 7");
-
-    setCheckpoint("process_packet: checkpoint 8");
-
-    setInstruction(XDP_TX);
-#if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
-    if (direct_fake_delivery)
-    {
-      bump_dev_fake_route_stat(5);
-    }
-#endif
-    logXDP(xdp);
     return XDP_TX; // send encapsulated packet back out the interface to the router
   }
-
-  setCheckpoint("process_packet: end");
-
-  setInstruction(XDP_PASS);
   return XDP_PASS;
 }
 
 SEC("xdp")
 int bal_ingress(struct xdp_md *xdp)
 {
-  logXDP(xdp);
-
   void *data = (void *)(long)xdp->data;
   void *data_end = (void *)(long)xdp->data_end;
 

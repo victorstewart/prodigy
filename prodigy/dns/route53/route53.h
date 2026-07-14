@@ -372,9 +372,12 @@ private:
       const Vector<String>& values,
       String& failure)
   {
-    AwsHttpRequest::Target target;
+    AwsHttpRequest::Target target = {};
     target.authority.assign("route53.amazonaws.com"_ctv);
-    target.path.snprintf<"/2013-04-01/hostedzone/{}/rrset"_ctv>(zone);
+    target.path.reset();
+    target.path.assign("/2013-04-01/hostedzone/"_ctv);
+    target.path.append(zone);
+    target.path.append("/rrset"_ctv);
     target.region.assign(region);
     target.service.assign("route53"_ctv);
     String actionText = {};
@@ -443,9 +446,12 @@ private:
                                        String& response,
                                        String& failure)
   {
-    AwsHttpRequest::Target target;
+    AwsHttpRequest::Target target = {};
     target.authority.assign("route53.amazonaws.com"_ctv);
-    target.path.snprintf<"/2013-04-01/hostedzone/{}/rrset"_ctv>(zone);
+    target.path.reset();
+    target.path.assign("/2013-04-01/hostedzone/"_ctv);
+    target.path.append(zone);
+    target.path.append("/rrset"_ctv);
     target.query.push_back({"name"_ctv, record.name});
     target.query.push_back({"type"_ctv, record.type});
     target.query.push_back({"maxitems"_ctv, "1"_ctv});

@@ -414,7 +414,8 @@ private:
   bytell_hash_subset<uint32_t, switchboard_runtime::Whitehole *> whiteholesByContainer;
   Vector<uint32_t> portalSlots;
 
-  static void appendAttachLog(const char *message)
+#if PRODIGY_DEBUG
+  static void appendAttachLogImpl(const char *message)
   {
     if (message == nullptr)
     {
@@ -432,7 +433,7 @@ private:
     (void)close(fd);
   }
 
-  static void appendAttachLogf(const char *format, ...)
+  static void appendAttachLogfImpl(const char *format, ...)
   {
     if (format == nullptr)
     {
@@ -445,8 +446,17 @@ private:
     (void)vsnprintf(line, sizeof(line), format, args);
     va_end(args);
 
-    appendAttachLog(line);
+    appendAttachLogImpl(line);
   }
+#endif
+
+#if PRODIGY_DEBUG
+#define appendAttachLog(...) appendAttachLogImpl(__VA_ARGS__)
+#define appendAttachLogf(...) appendAttachLogfImpl(__VA_ARGS__)
+#else
+#define appendAttachLog(...) ((void)0)
+#define appendAttachLogf(...) ((void)0)
+#endif
 
   static __u32 kernelMapIDForFD(int fd)
   {
@@ -620,7 +630,8 @@ private:
     return true;
   }
 
-  static void appendCurrentXDPState(EthDevice& eth, StringType auto&& balancerObjectPath, const char *stage)
+#if PRODIGY_DEBUG
+  static void appendCurrentXDPStateImpl(EthDevice& eth, StringType auto&& balancerObjectPath, const char *stage)
   {
     __u32 drvProgID = 0;
     __u32 skbProgID = 0;
@@ -653,6 +664,10 @@ private:
         anyProgID,
         errno);
   }
+#define appendCurrentXDPState(...) appendCurrentXDPStateImpl(__VA_ARGS__)
+#else
+#define appendCurrentXDPState(...) ((void)0)
+#endif
 
   static void ensureBPFMemlockLimit(void)
   {
@@ -2211,7 +2226,6 @@ public:
   void setHostedIngressPrefixes(const Vector<IPPrefix>& desiredPrefixes)
   {
     hostedIngressPrefixes = desiredPrefixes;
-    basics_log("Switchboard setHostedIngressPrefixes count=%u\n", unsigned(hostedIngressPrefixes.size()));
     appendAttachLogf("Switchboard setHostedIngressPrefixes ifidx=%u count=%u",
                      eth.ifidx,
                      unsigned(hostedIngressPrefixes.size()));
@@ -2337,12 +2351,6 @@ public:
         return false;
       }
 
-      basics_log("Switchboard openWormhole portal-installed containerID=%u slot=%u port=%u proto=%u quic=%u\n",
-                 containerID,
-                 unsigned(portal->slot),
-                 unsigned(portal->port),
-                 unsigned(portal->proto),
-                 unsigned(portal->isQuic));
     }
 
     if (portal->isQuic && portal->hasQuicCidKeyState)
@@ -2429,10 +2437,6 @@ public:
       opened += openWormhole(containerID, wormhole) ? 1U : 0U;
     }
 
-    basics_log("Switchboard openWormholes containerID=%u requested=%u opened=%u\n",
-               containerID,
-               unsigned(wormholes.size()),
-               unsigned(opened));
     if (opened != uint32_t(wormholes.size()))
     {
       basics_log("Switchboard openWormholes failed containerID=%u requested=%u opened=%u ifidx=%u\n",
@@ -2506,3 +2510,7 @@ public:
     }
   }
 };
+
+#undef appendCurrentXDPState
+#undef appendAttachLogf
+#undef appendAttachLog

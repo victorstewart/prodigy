@@ -38,11 +38,6 @@ enum class MothershipClusterMachineSource : uint8_t {
   created = 1
 };
 
-enum class MothershipClusterTestHostMode : uint8_t {
-  local = 0,
-  ssh = 1
-};
-
 enum class MothershipClusterTestBootstrapFamily : uint8_t {
   ipv4 = 0,
   private6 = 1,
@@ -123,27 +118,17 @@ static void serialize(S&& serializer, MothershipProdigyClusterAzureConfig& confi
   serializer.text1b(config.managedIdentityResourceID, UINT32_MAX);
 }
 
-class MothershipProdigyClusterTestHost {
-public:
-
-  MothershipClusterTestHostMode mode = MothershipClusterTestHostMode::local;
-  ClusterMachineSSH ssh;
-};
-
-template <typename S>
-static void serialize(S&& serializer, MothershipProdigyClusterTestHost& host)
-{
-  serializer.value1b(host.mode);
-  serializer.object(host.ssh);
-}
-
 class MothershipProdigyClusterTestConfig {
 public:
 
   bool specified = false;
-  MothershipProdigyClusterTestHost host;
   String workspaceRoot;
   uint32_t machineCount = 0;
+  uint32_t machineLogicalCores = 8;
+  uint32_t machineMemoryMB = 16'384;
+  uint32_t machineStorageMB = 262'144;
+  uint32_t storageDeviceCount = 0;
+  uint32_t storageDeviceMB = 1'024;
   MothershipClusterTestBootstrapFamily brainBootstrapFamily = MothershipClusterTestBootstrapFamily::ipv4;
   bool enableFakeIpv4Boundary = false;
   uint32_t interContainerMTU = 0;
@@ -153,9 +138,13 @@ template <typename S>
 static void serialize(S&& serializer, MothershipProdigyClusterTestConfig& config)
 {
   serializer.value1b(config.specified);
-  serializer.object(config.host);
   serializer.text1b(config.workspaceRoot, UINT32_MAX);
   serializer.value4b(config.machineCount);
+  serializer.value4b(config.machineLogicalCores);
+  serializer.value4b(config.machineMemoryMB);
+  serializer.value4b(config.machineStorageMB);
+  serializer.value4b(config.storageDeviceCount);
+  serializer.value4b(config.storageDeviceMB);
   serializer.value1b(config.brainBootstrapFamily);
   serializer.value1b(config.enableFakeIpv4Boundary);
   serializer.value4b(config.interContainerMTU);
@@ -807,23 +796,6 @@ static inline const char *mothershipClusterMachineSourceName(MothershipClusterMa
     case MothershipClusterMachineSource::created:
       {
         return "created";
-      }
-  }
-
-  return "unknown";
-}
-
-static inline const char *mothershipClusterTestHostModeName(MothershipClusterTestHostMode mode)
-{
-  switch (mode)
-  {
-    case MothershipClusterTestHostMode::local:
-      {
-        return "local";
-      }
-    case MothershipClusterTestHostMode::ssh:
-      {
-        return "ssh";
       }
   }
 

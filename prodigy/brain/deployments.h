@@ -1,6 +1,7 @@
 #pragma once
 #include <arpa/inet.h>
 #include <services/debug.h>
+#include <prodigy/debug.h>
 #include <prodigy/brain/timing.knobs.h>
 #include <algorithm>
 #include <cstdio>
@@ -16,6 +17,7 @@ struct ProdigyDeployHeapMetrics {
   uint64_t free = 0;
 };
 
+#if PRODIGY_DEBUG
 static inline bool prodigyDebugDeployHeapEnabled(void)
 {
   static int enabled = []() -> int {
@@ -57,7 +59,7 @@ static inline void prodigyLogDeployHeapSnapshot(
   }
 
   const ProdigyDeployHeapMetrics heap = prodigyReadDeployHeapMetrics();
-  std::fprintf(stderr,
+  PRODIGY_DEBUG_LOG(
                "prodigy debug deploy-heap phase=%s deploymentID=%llu appID=%u toSchedule=%llu waiting=%llu containers=%llu shardGroups=%u nTargetBase=%u nDeployed=%u nHealthy=%u aux0=%llu aux1=%llu heapUsed=%llu heapMapped=%llu heapFree=%llu\n",
                (phase ? phase : "unknown"),
                (unsigned long long)deploymentID,
@@ -74,8 +76,13 @@ static inline void prodigyLogDeployHeapSnapshot(
                (unsigned long long)heap.used,
                (unsigned long long)heap.mapped,
                (unsigned long long)heap.free);
-  std::fflush(stderr);
+  PRODIGY_DEBUG_FLUSH();
 }
+#else
+#define prodigyDebugDeployHeapEnabled() false
+#define prodigyReadDeployHeapMetrics() ProdigyDeployHeapMetrics {}
+#define prodigyLogDeployHeapSnapshot(...) ((void)0)
+#endif
 
 static bool metricNameMatchesLiteral(const String& metricName, const char *literal)
 {
@@ -3770,7 +3777,7 @@ public:
     statefulWorkerTopologyUpgradeTargetEpoch = generateDistinctTopologyUpgradeEpoch(statefulWorkerTopologyUpgradeSourceEpoch);
 
 #if PRODIGY_DEBUG
-    std::fprintf(stderr, "stateful topology upgrade arm deploymentID=%llu cores=%u->%u workers=%u->%u sourceEpoch=%u targetEpoch=%u lockedGroups=%u\n",
+    PRODIGY_DEBUG_LOG( "stateful topology upgrade arm deploymentID=%llu cores=%u->%u workers=%u->%u sourceEpoch=%u targetEpoch=%u lockedGroups=%u\n",
                  (unsigned long long)plan.config.deploymentID(),
                  unsigned(plan.config.nLogicalCores),
                  unsigned(targetLogicalCores),
@@ -3779,7 +3786,7 @@ public:
                  unsigned(statefulWorkerTopologyUpgradeSourceEpoch),
                  unsigned(statefulWorkerTopologyUpgradeTargetEpoch),
                  unsigned(statefulWorkerTopologyLockedShardGroups.size()));
-    std::fflush(stderr);
+    PRODIGY_DEBUG_FLUSH();
 #endif
 
     for (ContainerView *container : containers)
@@ -4738,14 +4745,14 @@ private:
     statefulWorkerTopologyUpgradePhase = StatefulWorkerTopologyUpgradePhase::blueDraining;
     statefulWorkerTopologyUpgradePhaseChangedAtMs = Time::now<TimeResolution::ms>();
 #if PRODIGY_DEBUG
-    std::fprintf(stderr, "stateful topology cutover deploymentID=%llu sourceEpoch=%u targetEpoch=%u workers=%u->%u lockedGroups=%u\n",
+    PRODIGY_DEBUG_LOG( "stateful topology cutover deploymentID=%llu sourceEpoch=%u targetEpoch=%u workers=%u->%u lockedGroups=%u\n",
                  (unsigned long long)plan.config.deploymentID(),
                  unsigned(statefulWorkerTopologyUpgradeSourceEpoch),
                  unsigned(statefulWorkerTopologyUpgradeTargetEpoch),
                  unsigned(statefulWorkerTopologyUpgradeSourceWorkerCount),
                  unsigned(statefulWorkerTopologyUpgradeTargetWorkerCount),
                  unsigned(statefulWorkerTopologyLockedShardGroups.size()));
-    std::fflush(stderr);
+    PRODIGY_DEBUG_FLUSH();
 #endif
     autoscaleTrace("autoscale topologyCutover deploymentID=%llu sourceEpoch=%u targetEpoch=%u workers=%u->%u lockedGroups=%u\n",
                    (unsigned long long)plan.config.deploymentID(),
@@ -5008,7 +5015,7 @@ private:
 #if PRODIGY_DEBUG
     if (topic == NeuronTopic::spinContainer || topic == NeuronTopic::killContainer || active == false || closing)
     {
-      std::fprintf(stderr, "deployment queueSend topic=%u deploymentID=%llu machinePrivate4=%u active=%d closing=%d pendingSend=%d bytesBefore=%u bytesAfter=%u connected=%d fd=%d fslot=%d\n",
+      PRODIGY_DEBUG_LOG( "deployment queueSend topic=%u deploymentID=%llu machinePrivate4=%u active=%d closing=%d pendingSend=%d bytesBefore=%u bytesAfter=%u connected=%d fd=%d fslot=%d\n",
                    unsigned(topic),
                    (unsigned long long)plan.config.deploymentID(),
                    unsigned(machine->private4),
@@ -5020,7 +5027,7 @@ private:
                    int(machine->neuron.connected),
                    machine->neuron.fd,
                    machine->neuron.fslot);
-      std::fflush(stderr);
+      PRODIGY_DEBUG_FLUSH();
     }
 #endif
 
@@ -6192,7 +6199,7 @@ public:
   void recoverAfterReboot(void)
   {
 #if PRODIGY_DEBUG
-    std::fprintf(stderr,
+    PRODIGY_DEBUG_LOG(
                  "deployment recoverAfterReboot begin deploymentID=%llu appID=%u state=%u waiting=%llu toSchedule=%llu nDeployed=%u nTarget=%u nHealthy=%u suspended=%u\n",
                  (unsigned long long)plan.config.deploymentID(),
                  unsigned(plan.config.applicationID),
@@ -6203,7 +6210,7 @@ public:
                  unsigned(nTarget()),
                  unsigned(nHealthy()),
                  unsigned(nSuspended));
-    std::fflush(stderr);
+    PRODIGY_DEBUG_FLUSH();
 #endif
 
     if (state == DeploymentState::failed || state == DeploymentState::decommissioning)
@@ -6224,12 +6231,12 @@ public:
       }
 
 #if PRODIGY_DEBUG
-      std::fprintf(stderr,
+      PRODIGY_DEBUG_LOG(
                    "deployment recoverAfterReboot clear-stale-suspension deploymentID=%llu appID=%u suspended=%u\n",
                    (unsigned long long)plan.config.deploymentID(),
                    unsigned(plan.config.applicationID),
                    unsigned(nSuspended));
-      std::fflush(stderr);
+      PRODIGY_DEBUG_FLUSH();
 #endif
       nSuspended = 0;
     }
@@ -6237,13 +6244,13 @@ public:
     if (toSchedule.size() > 0)
     {
 #if PRODIGY_DEBUG
-      std::fprintf(stderr,
+      PRODIGY_DEBUG_LOG(
                    "deployment recoverAfterReboot reschedule-pending deploymentID=%llu appID=%u toSchedule=%llu waiting=%llu\n",
                    (unsigned long long)plan.config.deploymentID(),
                    unsigned(plan.config.applicationID),
                    (unsigned long long)toSchedule.size(),
                    (unsigned long long)waitingOnContainers.size());
-      std::fflush(stderr);
+      PRODIGY_DEBUG_FLUSH();
 #endif
       schedule(nullptr);
       return;
@@ -6344,7 +6351,7 @@ public:
     if (nDeployed() < nTarget())
     {
 #if PRODIGY_DEBUG
-      std::fprintf(stderr,
+      PRODIGY_DEBUG_LOG(
                    "deployment recoverAfterReboot underprovisioned deploymentID=%llu appID=%u nDeployed=%u nTarget=%u waiting=%llu hasHealthyMachines=%d\n",
                    (unsigned long long)plan.config.deploymentID(),
                    unsigned(plan.config.applicationID),
@@ -6352,7 +6359,7 @@ public:
                    unsigned(nTarget()),
                    (unsigned long long)waitingOnContainers.size(),
                    int(thisBrain->hasHealthyMachines()));
-      std::fflush(stderr);
+      PRODIGY_DEBUG_FLUSH();
 #endif
       // On master handoff, followers may still be reconnecting neuron control sockets.
       // Do not request additional machines until at least one machine is healthy.
@@ -6381,13 +6388,13 @@ public:
         state = DeploymentState::deploying;
         stateChangedAtMs = Time::now<TimeResolution::ms>();
 #if PRODIGY_DEBUG
-        std::fprintf(stderr,
+        PRODIGY_DEBUG_LOG(
                      "deployment recoverAfterReboot reschedule-underprovisioned deploymentID=%llu appID=%u toSchedule=%llu waiting=%llu\n",
                      (unsigned long long)plan.config.deploymentID(),
                      unsigned(plan.config.applicationID),
                      (unsigned long long)toSchedule.size(),
                      (unsigned long long)waitingOnContainers.size());
-        std::fflush(stderr);
+        PRODIGY_DEBUG_FLUSH();
 #endif
         schedule(nullptr);
       }
@@ -7933,7 +7940,7 @@ public:
       return;
     }
 
-    std::fprintf(stderr,
+    PRODIGY_DEBUG_LOG(
                  "deployment containerIsHealthy enter deploymentID=%llu appID=%u uuid=%llu stateBefore=%u waitingBefore=%llu nHealthy=%u/%u/%u\n",
                  (unsigned long long)plan.config.deploymentID(),
                  unsigned(plan.config.applicationID),
@@ -7943,7 +7950,7 @@ public:
                  unsigned(nHealthyBase),
                  unsigned(nHealthyCanary),
                  unsigned(nHealthySurge));
-    std::fflush(stderr);
+    PRODIGY_DEBUG_FLUSH();
 
     if (container->state == ContainerState::destroyed || container->state == ContainerState::destroying || container->state == ContainerState::aboutToDestroy)
     {
@@ -8025,7 +8032,7 @@ public:
       thisBrain->pushSpinApplicationProgressToMothership(this, message);
     }
 
-    std::fprintf(stderr,
+    PRODIGY_DEBUG_LOG(
                  "deployment containerIsHealthy exit deploymentID=%llu appID=%u uuid=%llu stateAfter=%u waitingAfter=%llu nHealthy=%u/%u/%u\n",
                  (unsigned long long)plan.config.deploymentID(),
                  unsigned(plan.config.applicationID),
@@ -8035,7 +8042,7 @@ public:
                  unsigned(nHealthyBase),
                  unsigned(nHealthyCanary),
                  unsigned(nHealthySurge));
-    std::fflush(stderr);
+    PRODIGY_DEBUG_FLUSH();
 
     if (plan.isStateful == false)
     {
@@ -8326,7 +8333,7 @@ public:
 
   void containerFailed(ContainerView *container, int64_t approxTimeMs, int signal, const String& report, bool restarted)
   {
-    std::fprintf(stderr,
+    PRODIGY_DEBUG_LOG(
                  "deployment containerFailed debug deploymentID=%llu appID=%u uuid=%llu containerDeploymentID=%llu state=%u lifetime=%u signal=%d restarted=%d containersBefore=%llu waitingBefore=%llu reportBytes=%u\n",
                  (unsigned long long)plan.config.deploymentID(),
                  unsigned(plan.config.applicationID),
@@ -8339,7 +8346,7 @@ public:
                  (unsigned long long)containers.size(),
                  (unsigned long long)waitingOnContainers.size(),
                  unsigned(report.size()));
-    std::fflush(stderr);
+    PRODIGY_DEBUG_FLUSH();
 
     if (containerUsesStatefulWorkerTopologyUpgradeTarget(container))
     {
@@ -8472,7 +8479,7 @@ public:
     if (plan.isStateful)
     {
 #if PRODIGY_DEBUG
-      std::fprintf(stderr, "schedule enter deploymentID=%llu waiter=%p toSchedule=%llu waitingOnContainers=%llu execution=%p\n",
+      PRODIGY_DEBUG_LOG( "schedule enter deploymentID=%llu waiter=%p toSchedule=%llu waitingOnContainers=%llu execution=%p\n",
                    (unsigned long long)plan.config.deploymentID(),
                    (void *)waiter,
                    (unsigned long long)toSchedule.size(),
@@ -8484,7 +8491,7 @@ public:
     if (schedulingStack.execution != nullptr)
     {
 #if PRODIGY_DEBUG
-      std::fprintf(stderr, "schedule deferred deploymentID=%llu waiter=%p toSchedule=%llu waitingOnContainers=%llu execution=%p\n",
+      PRODIGY_DEBUG_LOG( "schedule deferred deploymentID=%llu waiter=%p toSchedule=%llu waitingOnContainers=%llu execution=%p\n",
                    (unsigned long long)plan.config.deploymentID(),
                    (void *)waiter,
                    (unsigned long long)toSchedule.size(),
@@ -8700,7 +8707,7 @@ public:
             }
 
 #if PRODIGY_DEBUG
-            std::fprintf(stderr, "schedule spinContainer deploymentID=%llu appID=%u machinePrivate4=%u containerUUID=%llu replaceUUID=%llu state=%d waitingBefore=%llu\n",
+            PRODIGY_DEBUG_LOG( "schedule spinContainer deploymentID=%llu appID=%u machinePrivate4=%u containerUUID=%llu replaceUUID=%llu state=%d waitingBefore=%llu\n",
                          (unsigned long long)plan.config.deploymentID(),
                          unsigned(plan.config.applicationID),
                          (machine ? unsigned(machine->private4) : 0u),
@@ -8868,7 +8875,7 @@ public:
     if (waitingOnContainers.size() > 0)
     {
 #if PRODIGY_DEBUG
-      std::fprintf(stderr, "schedule waiting deploymentID=%llu waitingOnContainers=%llu\n",
+      PRODIGY_DEBUG_LOG( "schedule waiting deploymentID=%llu waitingOnContainers=%llu\n",
                    (unsigned long long)plan.config.deploymentID(),
                    (unsigned long long)waitingOnContainers.size());
 #endif
@@ -9719,7 +9726,7 @@ public:
     if (plan.isStateful)
     {
 #if PRODIGY_DEBUG
-      std::fprintf(stderr, "deploy post-architect deploymentID=%llu nDeployed=%u nTarget=%u toSchedule=%llu waitingOnContainers=%llu\n",
+      PRODIGY_DEBUG_LOG( "deploy post-architect deploymentID=%llu nDeployed=%u nTarget=%u toSchedule=%llu waitingOnContainers=%llu\n",
                    (unsigned long long)plan.config.deploymentID(),
                    unsigned(nDeployed()),
                    unsigned(nTarget()),
@@ -9748,7 +9755,7 @@ public:
     if (plan.isStateful)
     {
 #if PRODIGY_DEBUG
-      std::fprintf(stderr, "deploy post-schedule deploymentID=%llu state=%u toSchedule=%llu waitingOnContainers=%llu execution=%p\n",
+      PRODIGY_DEBUG_LOG( "deploy post-schedule deploymentID=%llu state=%u toSchedule=%llu waitingOnContainers=%llu execution=%p\n",
                    (unsigned long long)plan.config.deploymentID(),
                    unsigned(state),
                    (unsigned long long)toSchedule.size(),

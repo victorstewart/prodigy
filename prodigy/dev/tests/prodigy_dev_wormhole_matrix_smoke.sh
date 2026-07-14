@@ -6,7 +6,6 @@ MOTHERSHIP_BIN="${2:-}"
 WORMHOLE_PROBE_BIN="${3:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HARNESS="${SCRIPT_DIR}/prodigy_dev_netns_harness.sh"
 source "${SCRIPT_DIR}/prodigy_dev_discombobulator_artifact_helpers.sh"
 SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 prodigy_dev_reexec_in_private_mount_namespace_once PRODIGY_DEV_WORMHOLE_MATRIX_SMOKE_MOUNT_NS_READY bash "${SCRIPT_SELF}" "$@"
@@ -23,7 +22,7 @@ then
    exit 77
 fi
 
-deps=(awk btrfs cargo mkfs.btrfs mount umount stat zstd timeout ip nsenter python3 rg)
+deps=(awk btrfs cargo mount zstd timeout ip nsenter python3 rg)
 for cmd in "${deps[@]}"
 do
    if ! command -v "${cmd}" >/dev/null 2>&1
@@ -50,7 +49,6 @@ manifest_path="${workspace_root}/test-cluster-manifest.json"
 cluster_name="wormhole-matrix-$(date -u +%Y%m%d-%H%M%S)"
 mothership_db_path="${tmpdir}/mothership-wormhole-matrix.tidesdb"
 keep_tmp="${PRODIGY_DEV_KEEP_TMP:-0}"
-allow_containers_overmount="${PRODIGY_DEV_ALLOW_CONTAINERS_OVERMOUNT:-0}"
 create_log="${tmpdir}/create_cluster.log"
 register4_log="${tmpdir}/register_v4.log"
 register6_log="${tmpdir}/register_v6.log"
@@ -60,9 +58,6 @@ cluster_report_log="${tmpdir}/cluster_report.log"
 sender_log="${tmpdir}/sender.log"
 remove_log="${tmpdir}/remove_cluster.log"
 
-containers_dir_created=0
-containers_mount_created=0
-containers_loop_image=""
 cluster_created=0
 archive_workspace=0
 
@@ -78,20 +73,10 @@ cleanup()
 
    if [[ "${cluster_created}" -eq 1 ]]
    then
-      env PRODIGY_MOTHERSHIP_TEST_HARNESS="${HARNESS}" \
+      env \
          PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
          "${MOTHERSHIP_BIN}" removeCluster "${cluster_name}" \
          >"${remove_log}" 2>&1 || true
-   fi
-
-   if [[ "${containers_mount_created}" -eq 1 ]]
-   then
-      umount /containers >/dev/null 2>&1 || true
-   fi
-
-   if [[ "${containers_dir_created}" -eq 1 ]]
-   then
-      rmdir /containers >/dev/null 2>&1 || true
    fi
 
    if [[ "${keep_tmp}" -eq 1 ]]
@@ -103,38 +88,7 @@ cleanup()
 }
 trap cleanup EXIT
 
-if [[ ! -d /containers ]]
-then
-   mkdir -p /containers
-   containers_dir_created=1
-fi
-
-containers_fs_type="$(stat -f -c '%T' /containers 2>/dev/null || echo unknown)"
-if [[ "${containers_fs_type}" != "btrfs" ]]
-then
-   if awk '$2 == "/containers" { found = 1 } END { exit(found ? 0 : 1) }' /proc/self/mounts
-   then
-      if [[ "${allow_containers_overmount}" != "1" ]]
-      then
-         echo "FAIL: /containers is mounted but not btrfs (found ${containers_fs_type})"
-         exit 1
-      fi
-   fi
-
-   if ! prodigy_dev_containers_root_is_safely_overmountable /containers
-   then
-      echo "FAIL: /containers exists on non-btrfs fs and is not safely overmountable"
-      exit 1
-   fi
-
-   containers_loop_image="${tmpdir}/containers.loop.img"
-   truncate -s 2G "${containers_loop_image}"
-   mkfs.btrfs -f "${containers_loop_image}" >/dev/null
-   mount -o loop "${containers_loop_image}" /containers
-   containers_mount_created=1
-fi
-
-mkdir -p /containers/store /containers/storage "${workspace_root}"
+mkdir -p "${workspace_root}"
 
 application_id=6
 version_id=$(( ($(date +%s%N) & 281474976710655) ))
@@ -159,15 +113,12 @@ read -r -d '' CREATE_REQUEST <<EOF || true
     "workspaceRoot": "${workspace_root}",
     "machineCount": 1,
     "brainBootstrapFamily": "ipv4",
-    "enableFakeIpv4Boundary": true,
-    "host": {
-      "mode": "local"
-    }
+    "enableFakeIpv4Boundary": true
   }
 }
 EOF
 
-if ! env PRODIGY_MOTHERSHIP_TEST_HARNESS="${HARNESS}" \
+if ! env \
    PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
    "${MOTHERSHIP_BIN}" createCluster "${CREATE_REQUEST}" \
    >"${create_log}" 2>&1

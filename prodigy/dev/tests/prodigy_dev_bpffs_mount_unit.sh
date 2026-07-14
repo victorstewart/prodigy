@@ -23,7 +23,7 @@ then
    exit 77
 fi
 
-deps=(mktemp ps stat timeout)
+deps=(cut grep mktemp nsenter seq stat timeout)
 for cmd in "${deps[@]}"
 do
    if ! command -v "${cmd}" >/dev/null 2>&1
@@ -36,6 +36,7 @@ done
 tmpdir="$(mktemp -d "${REPO_ROOT}/.run/prodigy-dev-bpffs-mount-unit.XXXXXX")"
 workspace_root="${tmpdir}/workspace"
 manifest_path="${workspace_root}/test-cluster-manifest.json"
+harness_log="${tmpdir}/harness.log"
 harness_pid=""
 
 cleanup()
@@ -60,26 +61,27 @@ trap cleanup EXIT
    --manifest-path="${manifest_path}" \
    --machines=1 \
    --brains=1 \
-   >/dev/null 2>&1 &
+   >"${harness_log}" 2>&1 &
 harness_pid="$!"
-runner_pid="${harness_pid}"
 
-brain_pid=""
-timeout 30s bash -lc '
-   while true
+timeout 180s bash -lc '
+   while [[ ! -s "'"${manifest_path}"'" ]] || ! grep -Fq "MOTHERSHIP_BOOTSTRAP success" "'"${harness_log}"'"
    do
-      candidate="$(ps -eo pid=,ppid=,cmd= | awk -v parent="'"${runner_pid}"'" '\''$2 == parent && $0 ~ /--isolated/ { print $1; exit }'\'' )"
-      if [[ -n "${candidate}" ]]
-      then
-         printf "%s" "${candidate}"
-         exit 0
-      fi
+      kill -0 "'"${harness_pid}"'" >/dev/null 2>&1 || exit 1
       sleep 0.1
    done
-' >"${tmpdir}/brain.pid"
-brain_pid="$(cat "${tmpdir}/brain.pid")"
-
-fstype="$(nsenter -t "${brain_pid}" -m -- stat -f -c '%T' /sys/fs/bpf)"
+'
+fstype=""
+for _ in $(seq 1 300)
+do
+   brain_pid="$(grep -m1 -o '"pid":[0-9]*' "${manifest_path}" | cut -d: -f2)"
+   if [[ "${brain_pid}" =~ ^[1-9][0-9]*$ ]] && kill -0 "${brain_pid}" >/dev/null 2>&1
+   then
+      fstype="$(nsenter -t "${brain_pid}" -m -- stat -f -c '%T' /sys/fs/bpf 2>/dev/null || true)"
+      [[ "${fstype}" != "bpf_fs" ]] || break
+   fi
+   sleep 0.1
+done
 if [[ "${fstype}" != "bpf_fs" ]]
 then
    echo "FAIL: expected /sys/fs/bpf to be bpffs inside brain mount namespace, saw ${fstype}"

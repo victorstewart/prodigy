@@ -38,6 +38,21 @@ int main(void)
 {
   TestSuite suite = {};
 
+  prodigySetPrimaryNetworkDeviceOverride("lo");
+  DevNeuronIaaS devNeuron;
+  uint128_t uuid = 1;
+  String metro;
+  bool isBrain = false;
+  EthDevice eth;
+  IPAddress devPrivate4 = {};
+  devNeuron.gatherSelfData(nullptr, uuid, metro, isBrain, eth, devPrivate4);
+  suite.expect(eth.name == "lo"_ctv, "dev_neuron_uses_selected_network_device");
+  suite.expect(eth.ifidx == if_nametoindex("lo"), "dev_neuron_resolves_selected_network_device_index");
+  suite.expect(metro == "dev"_ctv, "dev_neuron_sets_metro");
+  suite.expect(uuid == 0, "dev_neuron_defers_uuid_to_runtime_persistence");
+  suite.expect(isBrain, "dev_neuron_preserves_dev_brain_default");
+  prodigySetPrimaryNetworkDeviceOverride("");
+
   ProdigyRuntimeEnvironmentConfig overridden = {};
   overridden.bgp.specified = true;
   overridden.bgp.config.enabled = true;

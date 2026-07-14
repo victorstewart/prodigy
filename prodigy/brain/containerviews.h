@@ -1,5 +1,7 @@
 #pragma once
 
+#include <prodigy/debug.h>
+
 class DeploymentWork;
 
 class ContainerView : public MeshNode, public Stream, public CoroutineStack, public SocketBase {
@@ -142,7 +144,7 @@ public:
 
     if (activate == false)
     {
-      std::fprintf(stderr,
+      PRODIGY_DEBUG_LOG(
                    "containerview subscriptionPairing uuid=%llu appID=%u service=%llu port=%u activate=%d state=%u runtimeReady=%d\n",
                    (unsigned long long)uuid,
                    unsigned(this->applicationID),
@@ -151,7 +153,7 @@ public:
                    int(activate),
                    unsigned(state),
                    int(runtimeReady));
-      std::fflush(stderr);
+      PRODIGY_DEBUG_FLUSH();
     }
 
     String payload;

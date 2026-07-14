@@ -79,6 +79,65 @@ foreach(_map_name IN ITEMS "ct_sub_targets" "ct_adv_sources" "ct_tcp_flows")
    endif()
 endforeach()
 
+file(READ "${PRODIGY_ROOT}/switchboard/kernel/container.egress.router.ebpf.c" _container_egress)
+file(READ "${PRODIGY_ROOT}/prodigy/neuron/containers.h" _containers)
+string(FIND "${_container_egress}" "if (localSubnetContainsDaddr(daddr6))" _local_route_action)
+string(FIND "${_containers}" "host.addDirectRoute(address, 128, AF_INET6);" _local_route_install)
+string(FIND "${_all}" "writeProcSysctlValue(\"/proc/sys/net/ipv6/conf/all/forwarding\", \"1\")" _local_route_forwarding)
+string(REGEX MATCHALL "primary_program->setArrayElement\\(\"lc_subnet\"_ctv, 0, thisNeuron->lcsubnet6\\);" _primary_subnet_sync "${_containers}")
+list(LENGTH _primary_subnet_sync _primary_subnet_sync_count)
+if(_local_route_action EQUAL -1 OR _local_route_install EQUAL -1 OR _local_route_forwarding EQUAL -1 OR
+   _primary_subnet_sync_count LESS 2)
+   message(FATAL_ERROR "same-machine L3 netkit traffic must use host /128 routing")
+endif()
+
+file(GLOB_RECURSE _ebpf_sources
+   "${PRODIGY_ROOT}/ebpf/*.c"
+   "${PRODIGY_ROOT}/ebpf/*.h"
+   "${PRODIGY_ROOT}/prodigy/dev/*.c"
+   "${PRODIGY_ROOT}/prodigy/dev/*.h"
+   "${PRODIGY_ROOT}/switchboard/kernel/*.c"
+   "${PRODIGY_ROOT}/switchboard/kernel/*.h")
+foreach(_source IN LISTS _ebpf_sources)
+   file(STRINGS "${_source}" _lines)
+   set(_previous "")
+   foreach(_line IN LISTS _lines)
+      if((_line MATCHES "setCheckpoint\\(" AND NOT _line MATCHES "void[ \t]+setCheckpoint") OR
+         (_line MATCHES "logSKB\\(" AND NOT _line MATCHES "void[ \t]+logSKB") OR
+         (_line MATCHES "logPacketRedirectIfIdx\\(" AND NOT _line MATCHES "void[ \t]+logPacketRedirectIfIdx") OR
+         (_line MATCHES "bumpPacketCounter\\(" AND NOT _line MATCHES "void[ \t]+bumpPacketCounter") OR
+         (_line MATCHES "setInstruction\\(" AND NOT _line MATCHES "int[ \t]+setInstruction"))
+         if(NOT _previous MATCHES "^[ \t]*#if[ \t]+PRODIGY_DEBUG[ \t]*$")
+            message(FATAL_ERROR "${_source}: eBPF diagnostics must be guarded by PRODIGY_DEBUG")
+         endif()
+      endif()
+      set(_previous "${_line}")
+   endforeach()
+endforeach()
+
+file(READ "${PRODIGY_ROOT}/prodigy/debug.h" _debug_logging)
+if(NOT _debug_logging MATCHES "#if PRODIGY_DEBUG[^#]*#define PRODIGY_DEBUG_LOG")
+   message(FATAL_ERROR "production diagnostics must be compiled out unless PRODIGY_DEBUG is enabled")
+endif()
+
+foreach(_source IN ITEMS
+   "${PRODIGY_ROOT}/prodigy/brain/base.h"
+   "${PRODIGY_ROOT}/prodigy/brain/brain.h"
+   "${PRODIGY_ROOT}/prodigy/brain/containerviews.h"
+   "${PRODIGY_ROOT}/prodigy/brain/deployments.h"
+   "${PRODIGY_ROOT}/prodigy/brain/mesh.h"
+   "${PRODIGY_ROOT}/prodigy/neuron/neuron.h")
+   file(READ "${_source}" _contents)
+   if(_contents MATCHES "std::fprintf\\(stderr" OR _contents MATCHES "std::fflush\\(stderr")
+      message(FATAL_ERROR "${_source}: production diagnostics must use the PRODIGY_DEBUG compile-time gate")
+   endif()
+endforeach()
+
+string(REGEX MATCH "applicationID[ \t]*==[ \t]*11" _application_specific_trace "${_containers}")
+if(_application_specific_trace)
+   message(FATAL_ERROR "container runtime retains application-specific debug tracing")
+endif()
+
 file(READ "${PRODIGY_ROOT}/prodigy/mothership/mothership.cpp" _mothership)
 file(READ "${PRODIGY_ROOT}/prodigy/mothership/mothership.deployment.plan.helpers.h" _deployment_helpers)
 foreach(_required IN ITEMS

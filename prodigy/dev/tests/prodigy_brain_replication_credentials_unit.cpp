@@ -1372,6 +1372,11 @@ public:
     return installedEgressWhiteholeBindingKeys.entries.size();
   }
 
+  uint32_t installedIngressWhiteholeBindingCountForTest(void) const
+  {
+    return installedIngressWhiteholeBindingKeys.entries.size();
+  }
+
   bool resolveOptionalHostRouterBPFPathsForTest(String& hostIngressPath, String& hostEgressPath, String *failureReport = nullptr) const
   {
     return resolveOptionalHostRouterBPFPaths(hostIngressPath, hostEgressPath, failureReport);
@@ -12516,11 +12521,13 @@ static void testNeuronWhiteholeBindingBookkeepingWithoutPrograms(TestSuite& suit
   neuron.openLocalWhiteholesForTest(0x01020304u, whiteholes);
 
   suite.expect(neuron.localWhiteholeBindingCountForContainerForTest(0x01020304u) == 1, "neuron_whitehole_bookkeeping_without_programs_keeps_only_valid_bindings");
+  suite.expect(neuron.installedIngressWhiteholeBindingCountForTest() == 1, "neuron_whitehole_bookkeeping_without_programs_tracks_ingress_keys");
   suite.expect(neuron.installedWhiteholeBindingCountForTest() == 1, "neuron_whitehole_bookkeeping_without_programs_tracks_installed_keys");
 
   neuron.closeLocalWhiteholesToContainerForTest(0x01020304u);
 
   suite.expect(neuron.localWhiteholeBindingCountForContainerForTest(0x01020304u) == 0, "neuron_whitehole_bookkeeping_without_programs_erases_container_bindings");
+  suite.expect(neuron.installedIngressWhiteholeBindingCountForTest() == 0, "neuron_whitehole_bookkeeping_without_programs_clears_ingress_keys");
   suite.expect(neuron.installedWhiteholeBindingCountForTest() == 0, "neuron_whitehole_bookkeeping_without_programs_clears_installed_keys");
 }
 
@@ -12566,8 +12573,10 @@ static void testNeuronResolveOptionalHostRouterBPFPaths(TestSuite& suite)
 
   unsetenv("PRODIGY_HOST_INGRESS_EBPF");
   unsetenv("PRODIGY_HOST_EGRESS_EBPF");
-  suite.expect(neuron.resolveOptionalHostRouterBPFPathsForTest(ingress, egress, &failure) == false, "neuron_optional_host_router_paths_unset_returns_false");
-  suite.expect(ingress.size() == 0 && egress.size() == 0, "neuron_optional_host_router_paths_unset_clears_outputs");
+  suite.expect(neuron.resolveOptionalHostRouterBPFPathsForTest(ingress, egress, &failure), "neuron_optional_host_router_paths_unset_uses_bundle");
+  suite.expect(std::strstr(ingress.c_str(), "/host.ingress.router.ebpf.o") != nullptr &&
+                   std::strstr(egress.c_str(), "/host.egress.router.ebpf.o") != nullptr,
+               "neuron_optional_host_router_paths_unset_resolves_bundle_objects");
   suite.expect(failure.size() == 0, "neuron_optional_host_router_paths_unset_keeps_failure_empty");
 
   setenv("PRODIGY_HOST_INGRESS_EBPF", "/tmp/host-ingress.o", 1);

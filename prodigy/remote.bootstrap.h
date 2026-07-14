@@ -32,6 +32,7 @@
 #include <networking/reconnector.h>
 
 #include <prodigy/brain/timing.knobs.h>
+#include <prodigy/bootstrap.peers.h>
 #include <prodigy/bundle.artifact.h>
 #include <prodigy/iaas/bootstrap.ssh.h>
 #include <prodigy/peer.address.helpers.h>
@@ -1466,42 +1467,6 @@ static inline bool prodigyResolveClusterMachineInternalSSHAddress(const ClusterM
   }
 
   return prodigyResolveClusterMachineSSHAddress(clusterMachine, sshAddress);
-}
-
-static inline void prodigyRenderClusterTopologyBootstrapPeers(const ClusterMachine& localMachine, const ClusterTopology& topology, Vector<ProdigyBootstrapConfig::BootstrapPeer>& peers)
-{
-  peers.clear();
-
-  ClusterTopology normalizedTopology = topology;
-  prodigyNormalizeClusterTopologyPeerAddresses(normalizedTopology);
-  for (const ClusterMachine& clusterMachine : normalizedTopology.machines)
-  {
-    if (clusterMachine.isBrain == false)
-    {
-      continue;
-    }
-
-    if (clusterMachine.sameIdentityAs(localMachine))
-    {
-      continue;
-    }
-
-    ProdigyBootstrapConfig::BootstrapPeer peer = {};
-    peer.isBrain = true;
-    Vector<ClusterMachinePeerAddress> candidates = {};
-    prodigyCollectClusterMachinePeerAddresses(clusterMachine, candidates);
-    for (const ClusterMachinePeerAddress& candidate : candidates)
-    {
-      if (candidate.address.size() > 0)
-      {
-        peer.addresses.push_back(candidate);
-      }
-    }
-
-    prodigyAppendUniqueBootstrapPeer(peers, peer);
-  }
-
-  std::sort(peers.begin(), peers.end(), prodigyBootstrapPeerComesBefore);
 }
 
 static inline bool prodigyRemoteBootstrapShouldAwaitControlSocket(const ClusterMachine& clusterMachine, const ProdigyPersistentBootState& bootState)

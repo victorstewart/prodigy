@@ -39,13 +39,13 @@ private:
 
       Operation *owner;
       CoroutineStack *stack;
-      String output;
-      String diagnostic;
-      String failure;
+      String output = {};
+      String diagnostic = {};
+      String failure = {};
       pid_t pid = -1;
       int descriptors[2] = {-1, -1};
       Ring::RawPollTicket polls[2] = {Ring::invalidRawPollTicket, Ring::invalidRawPollTicket};
-      TimeoutPacket deadline;
+      TimeoutPacket deadline = {};
       bool waitPending = false;
       bool deadlinePending = false;
       bool deadlineCancellationRequested = false;
@@ -206,6 +206,7 @@ private:
          if (owner != nullptr)
          {
             ownerCompleted();
+            return;
          }
          destroyIfDetached();
       }
@@ -410,7 +411,6 @@ private:
             (void)arm(channel);
          }
          finishIfReady();
-         destroyIfDetached();
       }
 
       void waitidHandler(void *waiter) override
@@ -423,7 +423,6 @@ private:
          (void)::kill(-pid, SIGKILL);
          pid = -1;
          finishIfReady();
-         destroyIfDetached();
       }
 
       void dispatchTimeout(TimeoutPacket *packet) override
@@ -438,7 +437,6 @@ private:
             fail("credential command deadline exceeded"_ctv);
          }
          finishIfReady();
-         destroyIfDetached();
       }
    };
 

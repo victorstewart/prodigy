@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <queue>
 
+#include <prodigy/debug.h>
+
 class Mesh {
 private:
 
@@ -700,7 +702,7 @@ private:
         int(eraseFromSubscriber),
         (unsigned long long)uint64_t(secret),
         (unsigned long long)uint64_t(secret >> 64));
-    std::fprintf(stderr,
+    PRODIGY_DEBUG_LOG(
                  "mesh destroyPairing reason=%s service=%llu advertiser=%p advertiserApp=%u subscriber=%p subscriberApp=%u port=%u notifyAdvertiser=%d notifySubscriber=%d eraseFromAdvertiser=%d eraseFromSubscriber=%d secretLo=%llu secretHi=%llu\n",
                  (reason ? reason : "unspecified"),
                  (unsigned long long)service,
@@ -715,7 +717,7 @@ private:
                  int(eraseFromSubscriber),
                  (unsigned long long)uint64_t(secret),
                  (unsigned long long)uint64_t(secret >> 64));
-    std::fflush(stderr);
+    PRODIGY_DEBUG_FLUSH();
   }
 
   void destroyPairing(const char *reason, MeshNode *advertiser, MeshNode *subscriber, uint64_t service, bool notifyAdvertiser, bool notifySubscriber, bool eraseFromAdvertiser, bool eraseFromSubscriber)
@@ -872,14 +874,14 @@ public:
               unsigned(pairing.advertiser->applicationID),
               (unsigned long long)uint64_t(secret),
               (unsigned long long)uint64_t(secret >> 64));
-          std::fprintf(stderr,
+          PRODIGY_DEBUG_LOG(
                        "mesh brokenHalfRecovery reason=advertiser-without-subscriber service=%llu advertiser=%p advertiserApp=%u secretLo=%llu secretHi=%llu\n",
                        (unsigned long long)pairing.service,
                        static_cast<void *>(pairing.advertiser),
                        unsigned(pairing.advertiser->applicationID),
                        (unsigned long long)uint64_t(secret),
                        (unsigned long long)uint64_t(secret >> 64));
-          std::fflush(stderr);
+          PRODIGY_DEBUG_FLUSH();
           pairing.advertiser->advertisementPairing(secret, pairing.subscriberAddress, pairing.service, pairing.advertiser->applicationID, false);
         }
 
@@ -893,7 +895,7 @@ public:
               unsigned(pairing.advertisingPort),
               (unsigned long long)uint64_t(secret),
               (unsigned long long)uint64_t(secret >> 64));
-          std::fprintf(stderr,
+          PRODIGY_DEBUG_LOG(
                        "mesh brokenHalfRecovery reason=subscriber-without-advertiser service=%llu subscriber=%p subscriberApp=%u port=%u secretLo=%llu secretHi=%llu\n",
                        (unsigned long long)pairing.service,
                        static_cast<void *>(pairing.subscriber),
@@ -901,7 +903,7 @@ public:
                        unsigned(pairing.advertisingPort),
                        (unsigned long long)uint64_t(secret),
                        (unsigned long long)uint64_t(secret >> 64));
-          std::fflush(stderr);
+          PRODIGY_DEBUG_FLUSH();
           pairing.subscriber->subscriptionPairing(secret, pairing.advertiserAddress, pairing.service, pairing.advertisingPort, pairing.subscriber->applicationID, false);
 
           // this won't work unless we seed every advertisers

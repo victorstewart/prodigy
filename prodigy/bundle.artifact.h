@@ -88,7 +88,8 @@ static inline void prodigyDirname(const String& path, String& parent)
 static inline bool prodigyRunLocalShellCommand(const String& command, String *failure = nullptr)
 {
   String commandText = {};
-  commandText.assign(command);
+  commandText.assign("bash -lc "_ctv);
+  prodigyAppendShellSingleQuoted(commandText, command);
   int rc = std::system(commandText.c_str());
   if (rc != 0)
   {

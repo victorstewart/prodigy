@@ -6,7 +6,6 @@ MOTHERSHIP_BIN="${2:-}"
 WHITEHOLE_BIN="${3:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HARNESS="${SCRIPT_DIR}/prodigy_dev_netns_harness.sh"
 source "${SCRIPT_DIR}/prodigy_dev_discombobulator_artifact_helpers.sh"
 SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 prodigy_dev_reexec_in_private_mount_namespace_once PRODIGY_DEV_WHITEHOLE_HOST_IPV4_SMOKE_MOUNT_NS_READY bash "${SCRIPT_SELF}" "$@"
@@ -23,7 +22,7 @@ then
    exit 77
 fi
 
-for path in "${PRODIGY_BIN}" "${MOTHERSHIP_BIN}" "${WHITEHOLE_BIN}" "${HARNESS}"
+for path in "${PRODIGY_BIN}" "${MOTHERSHIP_BIN}" "${WHITEHOLE_BIN}"
 do
    if [[ ! -e "${path}" ]]
    then
@@ -32,7 +31,7 @@ do
    fi
 done
 
-deps=(awk btrfs cargo mkfs.btrfs mount umount stat zstd timeout ip nsenter python3 rg)
+deps=(awk btrfs cargo mount zstd timeout ip nsenter python3 rg)
 for cmd in "${deps[@]}"
 do
    if ! command -v "${cmd}" >/dev/null 2>&1
@@ -57,7 +56,6 @@ tmpdir="$(mktemp -d)"
 workspace_root="${tmpdir}/workspace"
 manifest_path="${workspace_root}/test-cluster-manifest.json"
 keep_tmp="${PRODIGY_DEV_KEEP_TMP:-0}"
-allow_containers_overmount="${PRODIGY_DEV_ALLOW_CONTAINERS_OVERMOUNT:-0}"
 cluster_name="whitehole-host-ipv4-$(date -u +%Y%m%d-%H%M%S)"
 mothership_db_path="${tmpdir}/mothership-whitehole-host.tidesdb"
 create_log="${tmpdir}/create_cluster.log"
@@ -67,9 +65,6 @@ cluster_report_log="${tmpdir}/cluster_report.log"
 remove_log="${tmpdir}/remove_cluster.log"
 responder_log="${tmpdir}/whitehole_responder.log"
 
-containers_dir_created=0
-containers_mount_created=0
-containers_loop_image=""
 responder_pid=""
 cluster_created=0
 archive_workspace=0
@@ -92,20 +87,10 @@ cleanup()
 
    if [[ "${cluster_created}" -eq 1 ]]
    then
-      env PRODIGY_MOTHERSHIP_TEST_HARNESS="${HARNESS}" \
+      env \
          PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
          "${MOTHERSHIP_BIN}" removeCluster "${cluster_name}" \
          >"${remove_log}" 2>&1 || true
-   fi
-
-   if [[ "${containers_mount_created}" -eq 1 ]]
-   then
-      umount /containers >/dev/null 2>&1 || true
-   fi
-
-   if [[ "${containers_dir_created}" -eq 1 ]]
-   then
-      rmdir /containers >/dev/null 2>&1 || true
    fi
 
    if [[ "${keep_tmp}" -eq 1 ]]
@@ -117,38 +102,7 @@ cleanup()
 }
 trap cleanup EXIT
 
-if [[ ! -d /containers ]]
-then
-   mkdir -p /containers
-   containers_dir_created=1
-fi
-
-containers_fs_type="$(stat -f -c '%T' /containers 2>/dev/null || echo unknown)"
-if [[ "${containers_fs_type}" != "btrfs" ]]
-then
-   if awk '$2 == "/containers" { found = 1 } END { exit(found ? 0 : 1) }' /proc/self/mounts
-   then
-      if [[ "${allow_containers_overmount}" != "1" ]]
-      then
-         echo "FAIL: /containers is mounted but not btrfs (found ${containers_fs_type})"
-         exit 1
-      fi
-   fi
-
-   if ! prodigy_dev_containers_root_is_safely_overmountable /containers
-   then
-      echo "FAIL: /containers exists on non-btrfs fs and is not safely overmountable"
-      exit 1
-   fi
-
-   containers_loop_image="${tmpdir}/containers.loop.img"
-   truncate -s 2G "${containers_loop_image}"
-   mkfs.btrfs -f "${containers_loop_image}" >/dev/null
-   mount -o loop "${containers_loop_image}" /containers
-   containers_mount_created=1
-fi
-
-mkdir -p /containers/store /containers/storage "${workspace_root}"
+mkdir -p "${workspace_root}"
 
 application_id=6
 version_id=$(( ($(date +%s%N) & 281474976710655) ))
@@ -174,15 +128,12 @@ read -r -d '' CREATE_REQUEST <<EOF || true
     "workspaceRoot": "${workspace_root}",
     "machineCount": 1,
     "brainBootstrapFamily": "ipv4",
-    "enableFakeIpv4Boundary": true,
-    "host": {
-      "mode": "local"
-    }
+    "enableFakeIpv4Boundary": true
   }
 }
 EOF
 
-if ! env PRODIGY_MOTHERSHIP_TEST_HARNESS="${HARNESS}" \
+if ! env \
    PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
    "${MOTHERSHIP_BIN}" createCluster "${CREATE_REQUEST}" \
    >"${create_log}" 2>&1
@@ -393,6 +344,12 @@ then
    sed -n '1,240p' "${cluster_report_log}" || true
    sed -n '1,200p' "${application_log}" || true
    sed -n '1,200p' "${deploy_log}" || true
+   machine_pid="$(head -n 1 "${workspace_root}/virtual-datacenter.runtime" 2>/dev/null || true)"
+   if [[ "${machine_pid}" =~ ^[0-9]+$ ]]
+   then
+      trace_path="$(find "/proc/${machine_pid}/root/containers" -name whitehole_probe_trace.log -print -quit 2>/dev/null || true)"
+      [[ -z "${trace_path}" ]] || sed -n '1,160p' "${trace_path}" || true
+   fi
    exit 1
 fi
 

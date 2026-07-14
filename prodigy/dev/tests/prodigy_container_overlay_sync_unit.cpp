@@ -788,10 +788,6 @@ static void testContainerPeerEgressRouterDropsPacketsOverConfiguredMTU(TestSuite
     suite.expect(opts.retval == NETKIT_DROP,
                  "container_peer_egress_router_drop_over_mtu_returns_drop");
 
-    __u64 oversizeDrops = 0;
-    peerProgram.getArrayElement("ct_stats"_ctv, 1, oversizeDrops);
-    suite.expect(oversizeDrops == 1,
-                 "container_peer_egress_router_drop_over_mtu_bumps_stat");
   }
 
   peerProgram.close();
@@ -969,6 +965,10 @@ static void testContainerPeerEgressRouterRewritesCrossMachineWormholeReplyForOve
 
   if (peerProgram.prog_fd >= 0)
   {
+    container_network_policy networkPolicy = {};
+    networkPolicy.mode = CONTAINER_NETWORK_UNRESTRICTED;
+    peerProgram.setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
+
     local_container_subnet6 localSubnet = {};
     localSubnet.dpfx = 0x01;
     localSubnet.mpfx[0] = 0xf4;
@@ -1110,7 +1110,10 @@ static void testContainerPeerEgressRouterRewritesCrossMachineWormholeReplyForOve
         (void)inet_ntop(AF_INET6, inner6->daddr.s6_addr, innerDestText, sizeof(innerDestText));
         (void)inet_ntop(AF_INET6, expectedInnerDst, expectedDestText, sizeof(expectedDestText));
         std::fprintf(stderr,
-                     "container_peer_egress_router_cross_machine_wormhole_reply debug inner nexthdr=%u src=%s dst=%s expected_dst=%s udp_check=%u expected_check=%u\n",
+                     "container_peer_egress_router_cross_machine_wormhole_reply debug retval=%u output=%u expected_output=%zu inner nexthdr=%u src=%s dst=%s expected_dst=%s udp_check=%u expected_check=%u\n",
+                     opts.retval,
+                     opts.data_size_out,
+                     frame.size() + sizeof(struct ipv6hdr),
                      unsigned(inner6->nexthdr),
                      innerSourceText,
                      innerDestText,
@@ -1581,25 +1584,6 @@ static void testContainerPeerEgressRouterRoutesIPv6QuicHighSlotPortal(TestSuite&
 
   int runResult = bpf_prog_test_run_opts(peerProgram.prog_fd, &opts);
   expectNamed(runResult == 0, "test_run_succeeds");
-  if (runResult == 0 && (opts.retval != TC_ACT_REDIRECT || opts.data_size_out != frame.size() + sizeof(struct ipv6hdr)))
-  {
-    __u64 stats[8] = {};
-    for (uint32_t index = 0; index < 8; ++index)
-    {
-      peerProgram.getArrayElement("ct_stats"_ctv, index, stats[index]);
-    }
-    std::fprintf(stderr,
-                 "container_peer_egress_router_ipv6_quic_high_slot_portal debug retval=%u data_size_out=%u expected_size=%zu stats_enter=%llu stats_drop_mtu=%llu stats_ipv6=%llu stats_nic=%llu stats_local=%llu stats_portal_local=%llu\n",
-                 unsigned(opts.retval),
-                 unsigned(opts.data_size_out),
-                 frame.size() + sizeof(struct ipv6hdr),
-                 static_cast<unsigned long long>(stats[0]),
-                 static_cast<unsigned long long>(stats[1]),
-                 static_cast<unsigned long long>(stats[3]),
-                 static_cast<unsigned long long>(stats[4]),
-                 static_cast<unsigned long long>(stats[5]),
-                 static_cast<unsigned long long>(stats[7]));
-  }
   expectNamed(opts.retval == TC_ACT_REDIRECT, "redirects_to_nic");
   expectNamed(opts.data_size_out == frame.size() + sizeof(struct ipv6hdr), "adds_outer_ipv6_header");
 

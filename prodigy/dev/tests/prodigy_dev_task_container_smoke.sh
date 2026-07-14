@@ -18,7 +18,6 @@ then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HARNESS="${SCRIPT_DIR}/prodigy_dev_netns_harness.sh"
 source "${SCRIPT_DIR}/prodigy_dev_discombobulator_artifact_helpers.sh"
 SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 prodigy_dev_reexec_in_private_mount_namespace_once PRODIGY_DEV_TASK_CONTAINER_SMOKE_MOUNT_NS_READY bash "${SCRIPT_SELF}" "$@"
@@ -29,7 +28,7 @@ then
    exit 77
 fi
 
-for cmd in awk btrfs cargo mkfs.btrfs mount umount stat zstd timeout ip nsenter python3 rg
+for cmd in awk btrfs cargo mount zstd timeout ip nsenter python3 rg
 do
    if ! command -v "${cmd}" >/dev/null 2>&1
    then
@@ -49,10 +48,7 @@ manifest_path="${workspace_root}/test-cluster-manifest.json"
 cluster_name="task-container-$(date -u +%Y%m%d-%H%M%S)"
 mothership_db_path="${tmpdir}/mothership-task-container.tidesdb"
 keep_tmp="${PRODIGY_DEV_KEEP_TMP:-0}"
-allow_containers_overmount="${PRODIGY_DEV_ALLOW_CONTAINERS_OVERMOUNT:-0}"
 cluster_created=0
-containers_dir_created=0
-containers_mount_created=0
 
 fail()
 {
@@ -66,45 +62,23 @@ cleanup()
    set +e
    if [[ "${cluster_created}" -eq 1 ]]
    then
-      env PRODIGY_MOTHERSHIP_TEST_HARNESS="${HARNESS}" \
+      env \
          PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
          "${MOTHERSHIP_BIN}" removeCluster "${cluster_name}" \
          >"${tmpdir}/remove_cluster.log" 2>&1 || true
    fi
-   [[ "${containers_mount_created}" -eq 1 ]] && umount /containers >/dev/null 2>&1 || true
-   [[ "${containers_dir_created}" -eq 1 ]] && rmdir /containers >/dev/null 2>&1 || true
    [[ "${keep_tmp}" -eq 1 ]] && echo "KEEP_TMP: ${tmpdir}" || rm -rf "${tmpdir}"
 }
 trap cleanup EXIT
 
 run_mothership()
 {
-   env PRODIGY_MOTHERSHIP_TEST_HARNESS="${HARNESS}" \
+   env \
       PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
       "${MOTHERSHIP_BIN}" "$@"
 }
 
-if [[ ! -d /containers ]]
-then
-   mkdir -p /containers
-   containers_dir_created=1
-fi
-
-containers_fs_type="$(stat -f -c '%T' /containers 2>/dev/null || echo unknown)"
-if [[ "${containers_fs_type}" != "btrfs" ]]
-then
-   if awk '$2 == "/containers" { found = 1 } END { exit(found ? 0 : 1) }' /proc/self/mounts && [[ "${allow_containers_overmount}" != "1" ]]
-   then
-      fail "/containers is mounted but not btrfs (${containers_fs_type})"
-   fi
-   prodigy_dev_containers_root_is_safely_overmountable /containers || fail "/containers is not safely overmountable"
-   loop_image="${tmpdir}/containers.loop.img"
-   truncate -s 2G "${loop_image}"
-   mkfs.btrfs -f "${loop_image}" >/dev/null
-   mount -o loop "${loop_image}" /containers
-   containers_mount_created=1
-fi
-mkdir -p /containers/store /containers/storage "${workspace_root}"
+mkdir -p "${workspace_root}"
 
 create_request="$(cat <<EOF
 {
@@ -116,8 +90,7 @@ create_request="$(cat <<EOF
     "workspaceRoot": "${workspace_root}",
     "machineCount": 1,
     "brainBootstrapFamily": "ipv4",
-    "enableFakeIpv4Boundary": false,
-    "host": {"mode": "local"}
+    "enableFakeIpv4Boundary": false
   }
 }
 EOF

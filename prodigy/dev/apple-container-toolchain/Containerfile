@@ -1,0 +1,24 @@
+FROM nametag/archlinuxarm-cachy-prodigy-toolchain:20260624
+
+ARG GO_VERSION=1.26.5
+
+RUN pacman -Syu --noconfirm --needed go && \
+   go version | grep -F "go version go${GO_VERSION}" && \
+   pacman -Scc --noconfirm
+
+ARG CMAKE_VERSION=4.4.0
+ARG CMAKE_SHA256=e98bb53e0b00a8f672424517d34c05bb9b94fd1c888c89e0b81bc8df51d1a94b
+
+RUN set -eux; \
+   archive="cmake-${CMAKE_VERSION}-linux-aarch64.tar.gz"; \
+   curl --fail --location --proto '=https' --tlsv1.2 \
+      "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${archive}" \
+      --output "/tmp/${archive}"; \
+   printf '%s  %s\n' "${CMAKE_SHA256}" "/tmp/${archive}" | sha256sum --check -; \
+   mkdir -p "/opt/cmake-${CMAKE_VERSION}"; \
+   tar -xzf "/tmp/${archive}" --strip-components=1 -C "/opt/cmake-${CMAKE_VERSION}"; \
+   for tool in cmake ctest cpack ccmake; do \
+      ln -sfn "/opt/cmake-${CMAKE_VERSION}/bin/${tool}" "/usr/local/bin/${tool}"; \
+   done; \
+   rm "/tmp/${archive}"; \
+   cmake --version | grep -F "cmake version ${CMAKE_VERSION}"

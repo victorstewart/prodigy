@@ -435,9 +435,9 @@ int main(void)
 
   {
     uint32_t assignedIPv4 = 0;
-    suite.expect(vultrParseAssignedIPv4("45.76.166.5", assignedIPv4), "vultr_assigned_ipv4_accepts_real_address");
+    suite.expect(vultrParseAssignedIPv4(std::string_view("45.76.166.5"), assignedIPv4), "vultr_assigned_ipv4_accepts_real_address");
     suite.expect(assignedIPv4 != 0, "vultr_assigned_ipv4_value_nonzero");
-    suite.expect(vultrParseAssignedIPv4("0.0.0.0", assignedIPv4) == false, "vultr_assigned_ipv4_rejects_unspecified_address");
+    suite.expect(vultrParseAssignedIPv4(std::string_view("0.0.0.0"), assignedIPv4) == false, "vultr_assigned_ipv4_rejects_unspecified_address");
   }
 
   {

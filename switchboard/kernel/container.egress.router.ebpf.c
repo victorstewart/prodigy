@@ -13,38 +13,9 @@
 // preserve any wormhole source tuple first and then forward there; otherwise
 // forward toward the NIC.
 
-struct
-{
-  __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, 16);
-  __type(key, __u32);
-  __type(value, __u64);
-} ct_stats SEC(".maps");
-
-// ct_stats indexes:
-// 0 entered
-// 1 dropped_over_mtu
-// 2 dropped_public_ipv4
-// 3 saw_ipv6
-// 4 redirected_to_nic
-// 5 redirected_to_container
-// 6 dropped_multicast
-// 7 redirected_portal_to_container
-
-static __always_inline void bumpPacketCounter(__u32 index)
-{
-  __u64 *slot = bpf_map_lookup_elem(&ct_stats, &index);
-  if (slot)
-  {
-    __sync_fetch_and_add(slot, 1);
-  }
-}
-
 SEC("netkit/peer")
 int ct_egress(struct __sk_buff *skb)
 {
-  logSKB(skb);
-
   void *data = (void *)(long)skb->data;
   void *data_end = (void *)(long)skb->data_end;
   __be16 protocol = skb->protocol;
@@ -56,17 +27,11 @@ int ct_egress(struct __sk_buff *skb)
     l3_data = (void *)(eth + 1);
   }
 
-  bumpPacketCounter(0);
-
   __u32 interContainerMTU = containerInterContainerMTU();
   __u32 l3Offset = (__u32)((const __u8 *)l3_data - (const __u8 *)data);
   __u32 l3Length = ((__u32)skb->len > l3Offset) ? ((__u32)skb->len - l3Offset) : 0u;
   if (interContainerMTU != 0 && l3Length > interContainerMTU)
   {
-    bumpPacketCounter(1);
-#if PRODIGY_DEBUG
-    setCheckpoint("dropOversizeInterContainerMTU");
-#endif
     return NETKIT_DROP;
   }
 
@@ -137,14 +102,11 @@ int ct_egress(struct __sk_buff *skb)
 
   if (protocol == BE_ETH_P_IP && containerRequiresPublic4() == false)
   {
-    bumpPacketCounter(2);
     return NETKIT_DROP;
   }
 
   if (protocol == BE_ETH_P_IPV6)
   {
-    bumpPacketCounter(3);
-
     struct ipv6hdr *ipv6h = (struct ipv6hdr *)l3_data;
 
     if ((void *)(ipv6h + 1) > data_end)
@@ -184,19 +146,15 @@ int ct_egress(struct __sk_buff *skb)
 
     if (localSubnetContainsDaddr(daddr6))
     {
-      __u8 redirectDaddr6[16] = {};
-      bpf_memcpy(redirectDaddr6, daddr6, sizeof(redirectDaddr6));
-
-      setCheckpoint("redirectToContainer");
-      bumpPacketCounter(5);
-      // this redirects from the perspective of the host device's interface index namespace
-      return redirectToContainer(redirectDaddr6, false);
+      // Let the host's per-container /128 route deliver same-machine traffic.
+      // A direct bpf_redirect() to an L3 netkit strips its synthetic Ethernet
+      // placeholder before the target netkit transmit path and drops the skb.
+      return NETKIT_PASS;
     }
     // these will only be router solitication messages if we've
     // disabled multicast on the interface
     else if (isMulticast(daddr6))
     {
-      bumpPacketCounter(6);
       return NETKIT_DROP;
     }
 
@@ -244,17 +202,12 @@ int ct_egress(struct __sk_buff *skb)
       struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
       if (switchboardContainerIDTargetsLocalMachine(&containerID, localSubnet))
       {
-        setCheckpoint("redirectPortalToContainer");
-        bumpPacketCounter(7);
         return redirectContainerFragment(containerID.value[4], false) ? NETKIT_REDIRECT : NETKIT_DROP;
       }
     }
   }
 
-redirect_to_nic:
-  setCheckpoint("redirectToNIC");
-  bumpPacketCounter(4);
-
+redirect_to_nic: ;
   __u32 zeroidx = 0;
   __u32 *nic_idx = bpf_map_lookup_elem(&ct_dev_map, &zeroidx);
   if (!nic_idx)
@@ -285,8 +238,5 @@ redirect_to_nic:
     return NETKIT_DROP;
   }
 
-  setCheckpoint("redirectToNIC: checkpoint 3");
-  logPacketRedirectIfIdx(*nic_idx);
-  logSKB(skb);
-  return setInstruction(bpf_redirect(*nic_idx, 0));
+  return bpf_redirect(*nic_idx, 0);
 }

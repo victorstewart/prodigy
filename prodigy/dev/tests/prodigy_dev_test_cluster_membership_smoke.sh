@@ -54,7 +54,6 @@ cleanup()
    then
       env \
          PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
-         PRODIGY_MOTHERSHIP_TEST_HARNESS="${SCRIPT_DIR}/prodigy_dev_netns_harness.sh" \
          "${MOTHERSHIP_BIN}" removeCluster "${CLUSTER_NAME}" >/dev/null 2>&1 || true
    fi
    rm -rf "${WORKSPACE_ROOT}" "${mothership_db_path}"
@@ -65,7 +64,6 @@ run_mothership()
 {
    env \
       PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
-      PRODIGY_MOTHERSHIP_TEST_HARNESS="${SCRIPT_DIR}/prodigy_dev_netns_harness.sh" \
       "${MOTHERSHIP_BIN}" "$@"
 }
 
@@ -188,10 +186,7 @@ read -r -d '' CREATE_JSON <<EOF || true
     "workspaceRoot": "${WORKSPACE_ROOT}",
     "machineCount": 3,
     "brainBootstrapFamily": "ipv4",
-    "enableFakeIpv4Boundary": false,
-    "host": {
-      "mode": "local"
-    }
+    "enableFakeIpv4Boundary": false
   }
 }
 EOF

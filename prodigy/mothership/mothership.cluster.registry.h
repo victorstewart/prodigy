@@ -1248,6 +1248,23 @@ private:
       cluster.nBrains = 1;
     }
 
+    if (cluster.deploymentMode == MothershipClusterDeploymentMode::local || mothershipClusterUsesVirtualDatacenter(cluster))
+    {
+      MachineCpuArchitecture localArchitecture = nametagCurrentBuildMachineArchitecture();
+      if (cluster.architecture == MachineCpuArchitecture::unknown)
+      {
+        cluster.architecture = localArchitecture;
+      }
+      else if (cluster.architecture != localArchitecture)
+      {
+        if (failure)
+        {
+          failure->assign("local and test cluster architecture must match Mothership"_ctv);
+        }
+        return false;
+      }
+    }
+
     if (cluster.sharedCPUOvercommitPermille < prodigySharedCPUOvercommitMinPermille || cluster.sharedCPUOvercommitPermille > prodigySharedCPUOvercommitMaxPermille)
     {
       if (failure)
@@ -1257,7 +1274,7 @@ private:
       return false;
     }
 
-    if (mothershipClusterUsesTestRunner(cluster))
+    if (mothershipClusterUsesVirtualDatacenter(cluster))
     {
       if (cluster.test.specified == false)
       {
@@ -1340,6 +1357,19 @@ private:
         return false;
       }
 
+      if (cluster.test.machineLogicalCores == 0 || cluster.test.machineLogicalCores > mothershipTestClusterMachineLogicalCoresMax ||
+          cluster.test.machineMemoryMB == 0 || cluster.test.machineMemoryMB > mothershipTestClusterMachineMemoryMBMax ||
+          cluster.test.machineStorageMB == 0 || cluster.test.machineStorageMB > mothershipTestClusterMachineStorageMBMax ||
+          cluster.test.storageDeviceCount > mothershipTestClusterStorageDeviceCountMax ||
+          (cluster.test.storageDeviceCount > 0 && (cluster.test.storageDeviceMB == 0 || cluster.test.storageDeviceMB > mothershipTestClusterMachineStorageMBMax)))
+      {
+        if (failure)
+        {
+          failure->assign("test machine resources are outside supported bounds"_ctv);
+        }
+        return false;
+      }
+
       if (cluster.test.interContainerMTU != 0 && (cluster.test.interContainerMTU < prodigyRuntimeTestInterContainerMTUMin || cluster.test.interContainerMTU > prodigyRuntimeTestInterContainerMTUMax))
       {
         if (failure)
@@ -1358,71 +1388,7 @@ private:
         return false;
       }
 
-      if (cluster.test.host.mode == MothershipClusterTestHostMode::local)
-      {
-        if (cluster.test.host.ssh.address.size() > 0 || cluster.test.host.ssh.privateKeyPath.size() > 0 || cluster.test.host.ssh.hostPublicKeyOpenSSH.size() > 0 || cluster.test.host.ssh.user.size() > 0 || cluster.test.host.ssh.port != 22)
-        {
-          if (failure)
-          {
-            failure->assign("test.local host must not include ssh fields");
-          }
-          return false;
-        }
-
-        cluster.remoteProdigyPath.clear();
-      }
-      else if (cluster.test.host.mode == MothershipClusterTestHostMode::ssh)
-      {
-        if (cluster.test.host.ssh.address.size() == 0)
-        {
-          if (failure)
-          {
-            failure->assign("test.ssh host requires ssh.address");
-          }
-          return false;
-        }
-
-        if (cluster.test.host.ssh.port == 0)
-        {
-          cluster.test.host.ssh.port = 22;
-        }
-
-        if (cluster.test.host.ssh.user.size() == 0)
-        {
-          cluster.test.host.ssh.user.assign(defaultMothershipClusterSSHUser());
-        }
-
-        if (cluster.test.host.ssh.privateKeyPath.size() == 0)
-        {
-          if (failure)
-          {
-            failure->assign("test.ssh host requires ssh.privateKeyPath");
-          }
-          return false;
-        }
-
-        if (cluster.test.host.ssh.hostPublicKeyOpenSSH.size() == 0)
-        {
-          if (failure)
-          {
-            failure->assign("test.ssh host requires ssh.hostPublicKeyOpenSSH");
-          }
-          return false;
-        }
-
-        if (cluster.remoteProdigyPath.size() == 0)
-        {
-          cluster.remoteProdigyPath.assign(defaultMothershipRemoteProdigyPath());
-        }
-      }
-      else
-      {
-        if (failure)
-        {
-          failure->assign("test host mode invalid");
-        }
-        return false;
-      }
+      cluster.remoteProdigyPath.clear();
 
       if (cluster.controls.empty() == false)
       {
@@ -2095,7 +2061,7 @@ public:
       stored.clusterUUID = existingCluster.clusterUUID;
     }
 
-    if (hadExistingCluster && mothershipClusterUsesTestRunner(stored))
+    if (hadExistingCluster && mothershipClusterUsesVirtualDatacenter(stored))
     {
       stored.controls.clear();
     }

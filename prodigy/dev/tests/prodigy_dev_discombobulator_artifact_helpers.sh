@@ -47,41 +47,6 @@ prodigy_dev_ensure_discombobulator()
    echo "${PRODIGY_DEV_DISCOMBOBULATOR_BIN}"
 }
 
-prodigy_dev_containers_root_is_safely_overmountable()
-{
-   local containers_root="${1:-/containers}"
-   local existing_name=""
-
-   if [[ "${PRODIGY_DEV_PRIVATE_MOUNT_NS_READY:-0}" == "1" ]]
-   then
-      return 0
-   fi
-
-   if [[ ! -d "${containers_root}" ]]
-   then
-      return 0
-   fi
-
-   if [[ -z "$(ls -A "${containers_root}" 2>/dev/null)" ]]
-   then
-      return 0
-   fi
-
-   while IFS= read -r existing_path
-   do
-      existing_name="$(basename "${existing_path}")"
-      case "${existing_name}" in
-         .prodigy-dev-fs-*|store|storage)
-            ;;
-         *)
-            return 1
-            ;;
-      esac
-   done < <(find "${containers_root}" -mindepth 1 -maxdepth 1 -print 2>/dev/null)
-
-   return 0
-}
-
 prodigy_dev_reexec_in_private_mount_namespace_once()
 {
    local guard_name="$1"

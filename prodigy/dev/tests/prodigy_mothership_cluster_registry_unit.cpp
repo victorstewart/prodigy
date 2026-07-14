@@ -21,6 +21,7 @@ public:
     else
     {
       basics_log("FAIL: %s\n", name);
+      std::fprintf(stderr, "FAIL: %s\n", name);
       failed += 1;
     }
   }
@@ -136,14 +137,9 @@ static bool equalOSUpdatePolicies(const Vector<OperatingSystemUpdatePolicy>& lhs
   return true;
 }
 
-static bool equalTestHost(const MothershipProdigyClusterTestHost& lhs, const MothershipProdigyClusterTestHost& rhs)
-{
-  return lhs.mode == rhs.mode && lhs.ssh == rhs.ssh;
-}
-
 static bool equalTestConfig(const MothershipProdigyClusterTestConfig& lhs, const MothershipProdigyClusterTestConfig& rhs)
 {
-  return lhs.specified == rhs.specified && equalTestHost(lhs.host, rhs.host) && lhs.workspaceRoot.equals(rhs.workspaceRoot) && lhs.machineCount == rhs.machineCount && lhs.brainBootstrapFamily == rhs.brainBootstrapFamily && lhs.enableFakeIpv4Boundary == rhs.enableFakeIpv4Boundary && lhs.interContainerMTU == rhs.interContainerMTU;
+  return lhs.specified == rhs.specified && lhs.workspaceRoot.equals(rhs.workspaceRoot) && lhs.machineCount == rhs.machineCount && lhs.machineLogicalCores == rhs.machineLogicalCores && lhs.machineMemoryMB == rhs.machineMemoryMB && lhs.machineStorageMB == rhs.machineStorageMB && lhs.storageDeviceCount == rhs.storageDeviceCount && lhs.storageDeviceMB == rhs.storageDeviceMB && lhs.brainBootstrapFamily == rhs.brainBootstrapFamily && lhs.enableFakeIpv4Boundary == rhs.enableFakeIpv4Boundary && lhs.interContainerMTU == rhs.interContainerMTU;
 }
 
 static bool equalGcpConfig(const MothershipProdigyClusterGcpConfig& lhs, const MothershipProdigyClusterGcpConfig& rhs)
@@ -360,6 +356,7 @@ int main(void)
   local.lastRefreshFailure = "connection refused"_ctv;
 
   MothershipProdigyCluster storedLocal = local;
+  storedLocal.architecture = nametagCurrentBuildMachineArchitecture();
 
   MothershipProdigyCluster localAdopted = {};
   localAdopted.name = "local-homelab"_ctv;
@@ -429,6 +426,7 @@ int main(void)
   });
 
   MothershipProdigyCluster storedLocalAdopted = localAdopted;
+  storedLocalAdopted.architecture = nametagCurrentBuildMachineArchitecture();
   storedLocalAdopted.bootstrapSshUser = defaultMothershipClusterSSHUser();
   storedLocalAdopted.remoteProdigyPath = defaultMothershipRemoteProdigyPath();
   storedLocalAdopted.machines[0].ssh.port = 22;
@@ -657,9 +655,10 @@ int main(void)
   testLocal.deploymentMode = MothershipClusterDeploymentMode::test;
   testLocal.nBrains = 2;
   testLocal.test.specified = true;
-  testLocal.test.host.mode = MothershipClusterTestHostMode::local;
   testLocal.test.workspaceRoot = "/tmp/nametag-test-local"_ctv;
   testLocal.test.machineCount = 3;
+  testLocal.test.storageDeviceCount = 2;
+  testLocal.test.storageDeviceMB = 768;
   testLocal.test.brainBootstrapFamily = MothershipClusterTestBootstrapFamily::private6;
   testLocal.test.enableFakeIpv4Boundary = false;
   testLocal.sharedCPUOvercommitPermille = 1250;
@@ -668,30 +667,10 @@ int main(void)
   testLocal.desiredEnvironment = ProdigyEnvironmentKind::dev;
 
   MothershipProdigyCluster storedTestLocal = testLocal;
+  storedTestLocal.architecture = nametagCurrentBuildMachineArchitecture();
   storedTestLocal.includeLocalMachine = false;
   mothershipResolveTestClusterControlRecord(storedTestLocal.controls, storedTestLocal);
 
-  MothershipProdigyCluster testRemote = {};
-  testRemote.name = "test-remote"_ctv;
-  testRemote.deploymentMode = MothershipClusterDeploymentMode::test;
-  testRemote.nBrains = 3;
-  testRemote.remoteProdigyPath = "/root/prodigy"_ctv;
-  testRemote.test.specified = true;
-  testRemote.test.host.mode = MothershipClusterTestHostMode::ssh;
-  testRemote.test.host.ssh.address = "203.0.113.90"_ctv;
-  testRemote.test.host.ssh.port = 22;
-  testRemote.test.host.ssh.user = "root"_ctv;
-  testRemote.test.host.ssh.privateKeyPath = prodigyTestClientSSHPrivateKeyPath();
-  testRemote.test.host.ssh.hostPublicKeyOpenSSH = fixtureSSHDHostPublicKey();
-  testRemote.test.workspaceRoot = "/root/prodigy-test-remote"_ctv;
-  testRemote.test.machineCount = 4;
-  testRemote.test.brainBootstrapFamily = MothershipClusterTestBootstrapFamily::multihome6;
-  testRemote.test.enableFakeIpv4Boundary = false;
-  testRemote.desiredEnvironment = ProdigyEnvironmentKind::dev;
-
-  MothershipProdigyCluster storedTestRemote = testRemote;
-  storedTestRemote.includeLocalMachine = false;
-  mothershipResolveTestClusterControlRecord(storedTestRemote.controls, storedTestRemote);
 
   MothershipProdigyCluster invalidLocalProvider = local;
   invalidLocalProvider.name = "local-invalid"_ctv;
@@ -1020,16 +999,6 @@ int main(void)
     storedTestLocal.clusterUUID = createdCluster.clusterUUID;
     suite.expect(equalClusters(storedTestLocal, createdCluster), "create_test_local_normalized");
 
-    bool createTestRemote = registry.createCluster(testRemote, &createdCluster, &failure);
-    if (!createTestRemote)
-    {
-      basics_log("detail create_test_remote: %s\n", failure.c_str());
-    }
-    suite.expect(createTestRemote, "create_test_remote");
-    suite.expect(createdCluster.clusterUUID != 0, "create_test_remote_cluster_uuid_generated");
-    storedTestRemote.clusterUUID = createdCluster.clusterUUID;
-    suite.expect(equalClusters(storedTestRemote, createdCluster), "create_test_remote_normalized");
-
     MothershipProdigyCluster duplicateRemoteUUID = remoteCreated;
     duplicateRemoteUUID.name = "managed-aws-duplicate-uuid"_ctv;
     duplicateRemoteUUID.clusterUUID = storedRemoteCreated.clusterUUID;
@@ -1247,7 +1216,7 @@ int main(void)
       basics_log("detail list_clusters: %s\n", failure.c_str());
     }
     suite.expect(listClusters, "list_clusters");
-    suite.expect(clusters.size() == 10, "list_clusters_count");
+    suite.expect(clusters.size() == 9, "list_clusters_count");
   }
 
   {
@@ -1262,7 +1231,6 @@ int main(void)
     MothershipProdigyCluster loadedRemoteMixed = {};
     MothershipProdigyCluster loadedRemoteVultrBGP = {};
     MothershipProdigyCluster loadedTestLocal = {};
-    MothershipProdigyCluster loadedTestRemote = {};
 
     bool reopenGetLocal = registry.getCluster("local-alpha"_ctv, loadedLocal, &failure);
     if (!reopenGetLocal)
@@ -1320,13 +1288,6 @@ int main(void)
     }
     suite.expect(reopenGetTestLocal, "reopen_get_test_local");
 
-    bool reopenGetTestRemote = registry.getCluster("test-remote"_ctv, loadedTestRemote, &failure);
-    if (!reopenGetTestRemote)
-    {
-      basics_log("detail reopen_get_test_remote: %s\n", failure.c_str());
-    }
-    suite.expect(reopenGetTestRemote, "reopen_get_test_remote");
-
     MothershipProdigyCluster loadedRemoteCreatedByUUID = {};
     String remoteCreatedIdentity = {};
     remoteCreatedIdentity.assignItoh(storedRemoteCreated.clusterUUID);
@@ -1350,7 +1311,6 @@ int main(void)
     suite.expect(equalClusters(storedLocal, loadedLocal), "reopen_local_roundtrip");
     suite.expect(equalClusters(storedLocalAdopted, loadedLocalAdopted), "reopen_local_adopted_roundtrip");
     suite.expect(equalClusters(storedTestLocal, loadedTestLocal), "reopen_test_local_roundtrip");
-    suite.expect(equalClusters(storedTestRemote, loadedTestRemote), "reopen_test_remote_roundtrip");
     suite.expect(equalClusters(storedRemoteCreated, loadedRemoteCreated), "reopen_remote_created_roundtrip");
     suite.expect(equalClusters(storedRemoteCreated, loadedRemoteCreatedByUUID), "reopen_remote_created_uuid_roundtrip");
     suite.expect(equalClusters(storedRemoteAdopted, loadedRemoteAdopted), "reopen_remote_adopted_roundtrip");
@@ -1435,13 +1395,6 @@ int main(void)
       basics_log("detail remove_test_local: %s\n", failure.c_str());
     }
     suite.expect(removeTestLocal, "remove_test_local");
-
-    bool removeTestRemote = registry.removeCluster("test-remote"_ctv, &failure);
-    if (!removeTestRemote)
-    {
-      basics_log("detail remove_test_remote: %s\n", failure.c_str());
-    }
-    suite.expect(removeTestRemote, "remove_test_remote");
 
     MothershipProdigyCluster recreatedRemoteMixed = remoteMixed;
     recreatedRemoteMixed.name = "hybrid-azure-recreated"_ctv;

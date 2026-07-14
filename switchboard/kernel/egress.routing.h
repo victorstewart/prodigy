@@ -17,20 +17,17 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
 
   if (switchboardResolveIPv6SKBLayout(data, data_end, skb->protocol, &layout) == false)
   {
-    setBufferOnPacket((__u8 *)"wormhole:no_ip6", sizeof("wormhole:no_ip6") - 1);
     return false;
   }
 
   struct ipv6hdr *ip6h = (struct ipv6hdr *)((__u8 *)data + layout.l3Offset);
   if ((void *)(ip6h + 1) > data_end)
   {
-    setBufferOnPacket((__u8 *)"wormhole:no_ip6", sizeof("wormhole:no_ip6") - 1);
     return false;
   }
 
   if (switchboardWormholeSourceRewriteEligibleIPv6(ip6h->saddr.s6_addr, ip6h->daddr.s6_addr) == false)
   {
-    setBufferOnPacket((__u8 *)"wormhole:not_local", sizeof("wormhole:not_local") - 1);
     return false;
   }
 
@@ -47,7 +44,6 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
     struct udphdr *udph = (struct udphdr *)(ip6h + 1);
     if ((void *)(udph + 1) > data_end)
     {
-      setBufferOnPacket((__u8 *)"wormhole:no_udp", sizeof("wormhole:no_udp") - 1);
       return false;
     }
 
@@ -55,13 +51,11 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
     struct switchboard_wormhole_egress_binding *binding = bpf_map_lookup_elem(&wh_egress, &key);
     if (binding == NULL)
     {
-      setBufferOnPacket((__u8 *)"wormhole:udp_nomap", sizeof("wormhole:udp_nomap") - 1);
       return false;
     }
 
     if (binding->is_ipv6 == 0 || binding->proto != IPPROTO_UDP)
     {
-      setBufferOnPacket((__u8 *)"wormhole:udp_badbind", sizeof("wormhole:udp_badbind") - 1);
       return false;
     }
 
@@ -70,23 +64,19 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
 
     if (oldSourcePort != binding->port && bpf_skb_store_bytes(skb, layout.sourcePortOffset, &binding->port, sizeof(binding->port), rewriteFlags) != 0)
     {
-      setBufferOnPacket((__u8 *)"wormhole:udp_port_store", sizeof("wormhole:udp_port_store") - 1);
       return false;
     }
 
     if (bpf_skb_store_bytes(skb, layout.sourceAddressOffset, binding->addr6, sizeof(binding->addr6), rewriteFlags) != 0)
     {
-      setBufferOnPacket((__u8 *)"wormhole:udp_addr", sizeof("wormhole:udp_addr") - 1);
       return false;
     }
 
     if (store_recomputed_ipv6_transport_checksum_skb(skb, IPPROTO_UDP) == false)
     {
-      setBufferOnPacket((__u8 *)"wormhole:udp_recompute", sizeof("wormhole:udp_recompute") - 1);
       return false;
     }
 
-    setBufferOnPacket((__u8 *)"wormhole:udp_ok", sizeof("wormhole:udp_ok") - 1);
     return true;
   }
 
@@ -95,7 +85,6 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
     struct tcphdr *tcph = (struct tcphdr *)(ip6h + 1);
     if ((void *)(tcph + 1) > data_end)
     {
-      setBufferOnPacket((__u8 *)"wormhole:no_tcp", sizeof("wormhole:no_tcp") - 1);
       return false;
     }
 
@@ -103,13 +92,11 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
     struct switchboard_wormhole_egress_binding *binding = bpf_map_lookup_elem(&wh_egress, &key);
     if (binding == NULL)
     {
-      setBufferOnPacket((__u8 *)"wormhole:tcp_nomap", sizeof("wormhole:tcp_nomap") - 1);
       return false;
     }
 
     if (binding->is_ipv6 == 0 || binding->proto != IPPROTO_TCP)
     {
-      setBufferOnPacket((__u8 *)"wormhole:tcp_badbind", sizeof("wormhole:tcp_badbind") - 1);
       return false;
     }
 
@@ -118,27 +105,22 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
 
     if (oldSourcePort != binding->port && bpf_skb_store_bytes(skb, layout.sourcePortOffset, &binding->port, sizeof(binding->port), rewriteFlags) != 0)
     {
-      setBufferOnPacket((__u8 *)"wormhole:tcp_port_store", sizeof("wormhole:tcp_port_store") - 1);
       return false;
     }
 
     if (bpf_skb_store_bytes(skb, layout.sourceAddressOffset, binding->addr6, sizeof(binding->addr6), rewriteFlags) != 0)
     {
-      setBufferOnPacket((__u8 *)"wormhole:tcp_addr", sizeof("wormhole:tcp_addr") - 1);
       return false;
     }
 
     if (store_recomputed_ipv6_transport_checksum_skb(skb, IPPROTO_TCP) == false)
     {
-      setBufferOnPacket((__u8 *)"wormhole:tcp_recompute", sizeof("wormhole:tcp_recompute") - 1);
       return false;
     }
 
-    setBufferOnPacket((__u8 *)"wormhole:tcp_ok", sizeof("wormhole:tcp_ok") - 1);
     return true;
   }
 
-  setBufferOnPacket((__u8 *)"wormhole:proto_skip", sizeof("wormhole:proto_skip") - 1);
   return false;
 }
 
@@ -375,7 +357,7 @@ __attribute__((__always_inline__)) static inline int switchboardMaybeEncapOverla
   __u16 inner_packet_len = (__u16)(skb->len - sizeof(struct ethhdr));
   if (switchboardEncapSKBV6(skb, inner_packet_len, IPPROTO_IPIP, route) || switchboardEncapSKBV4(skb, inner_packet_len, IPPROTO_IPIP, route))
   {
-    return setInstruction(TC_ACT_OK);
+    return TC_ACT_OK;
   }
 
   return TC_ACT_SHOT;
@@ -386,7 +368,6 @@ __attribute__((__always_inline__)) static inline int switchboardMaybeEncapOverla
   struct ipv6hdr *ip6h = (struct ipv6hdr *)(eth + 1);
   if ((void *)(ip6h + 1) > data_end)
   {
-    setBufferOnPacket((__u8 *)"overlay6:no_ip6", sizeof("overlay6:no_ip6") - 1);
     return TC_ACT_SHOT;
   }
 
@@ -399,33 +380,27 @@ __attribute__((__always_inline__)) static inline int switchboardMaybeEncapOverla
   bool routable_overlay = overlayRoutablePrefixesContainIPv6(ip6h->daddr.s6_addr32);
   if (container_overlay == false && routable_overlay == false)
   {
-    setBufferOnPacket((__u8 *)"overlay6:skip", sizeof("overlay6:skip") - 1);
     return TC_ACT_OK;
   }
 
   struct switchboard_overlay_machine_route_key key = {};
   if (overlayRouteKeyFromIPv6(ip6h->daddr.s6_addr32, &key) == false)
   {
-    setBufferOnPacket((__u8 *)"overlay6:key_fail", sizeof("overlay6:key_fail") - 1);
     return TC_ACT_SHOT;
   }
 
   struct switchboard_overlay_machine_route *route = lookupOverlayMachineRouteFull(&key);
   if (route == NULL)
   {
-    setBufferOnPacket((__u8 *)"overlay6:no_route", sizeof("overlay6:no_route") - 1);
     return TC_ACT_SHOT;
   }
 
   __u16 inner_packet_len = (__u16)(skb->len - sizeof(struct ethhdr));
   if (switchboardEncapSKBV6(skb, inner_packet_len, IPPROTO_IPV6, route) || switchboardEncapSKBV4(skb, inner_packet_len, IPPROTO_IPV6, route))
   {
-    setCheckpoint("overlay6:encap_ok");
-    setBufferOnPacket((__u8 *)"overlay6:encap_ok", sizeof("overlay6:encap_ok") - 1);
-    return setInstruction(TC_ACT_OK);
+    return TC_ACT_OK;
   }
 
-  setBufferOnPacket((__u8 *)"overlay6:encap_fail", sizeof("overlay6:encap_fail") - 1);
   return TC_ACT_SHOT;
 }
 
@@ -488,5 +463,5 @@ __attribute__((__always_inline__)) static inline int switchboardRouteOutboundEth
     return switchboardMaybeEncapOverlayIPv6(skb, eth, data_end);
   }
 
-  return setInstruction(TC_ACT_OK);
+  return TC_ACT_OK;
 }

@@ -2,19 +2,41 @@
 
 #include <prodigy/mothership/mothership.cluster.types.h>
 
-static inline bool mothershipClusterUsesTestRunner(const MothershipProdigyCluster& cluster)
+constexpr static uint32_t mothershipTestClusterMachineLogicalCoresMax = 65'535;
+constexpr static uint32_t mothershipTestClusterMachineMemoryMBMax = 16'777'216;
+constexpr static uint32_t mothershipTestClusterMachineStorageMBMax = 1'048'576;
+constexpr static uint32_t mothershipTestClusterStorageDeviceCountMax = 16;
+
+static inline bool mothershipClusterUsesVirtualDatacenter(const MothershipProdigyCluster& cluster)
 {
   return cluster.deploymentMode == MothershipClusterDeploymentMode::test;
 }
 
-static inline bool mothershipClusterTestHostIsRemote(const MothershipProdigyCluster& cluster)
-{
-  return mothershipClusterUsesTestRunner(cluster) && cluster.test.host.mode == MothershipClusterTestHostMode::ssh;
-}
-
 static inline bool mothershipTestClusterWorkspaceRootValid(const String& workspaceRoot)
 {
-  return workspaceRoot.size() > 0 && workspaceRoot[0] == '/';
+  if (workspaceRoot.size() < 4 || workspaceRoot[0] != '/' || workspaceRoot[workspaceRoot.size() - 1] == '/')
+  {
+    return false;
+  }
+
+  bool nested = false;
+  uint32_t componentStart = 1;
+  for (uint32_t index = 1; index <= workspaceRoot.size(); ++index)
+  {
+    if (index < workspaceRoot.size() && workspaceRoot[index] != '/')
+    {
+      continue;
+    }
+    uint32_t size = index - componentStart;
+    if (size == 0 || (size == 1 && workspaceRoot[componentStart] == '.') ||
+        (size == 2 && workspaceRoot[componentStart] == '.' && workspaceRoot[componentStart + 1] == '.'))
+    {
+      return false;
+    }
+    nested = nested || componentStart > 1;
+    componentStart = index + 1;
+  }
+  return nested;
 }
 
 static inline void mothershipResolveTestClusterControlSocketPath(const MothershipProdigyCluster& cluster, String& path)
@@ -37,34 +59,24 @@ static inline void mothershipResolveTestClusterManifestPath(const MothershipProd
   path.append("test-cluster-manifest.json"_ctv);
 }
 
-static inline void mothershipResolveTestClusterRunnerPIDPath(const MothershipProdigyCluster& cluster, String& path)
+static inline void mothershipResolveVirtualDatacenterPIDPath(const MothershipProdigyCluster& cluster, String& path)
 {
   path.assign(cluster.test.workspaceRoot);
   if (path.size() > 0 && path[path.size() - 1] != '/')
   {
     path.append("/"_ctv);
   }
-  path.append("test-cluster-runner.pid"_ctv);
+  path.append("virtual-datacenter.pid"_ctv);
 }
 
-static inline void mothershipResolveTestClusterRunnerLogPath(const MothershipProdigyCluster& cluster, String& path)
+static inline void mothershipResolveVirtualDatacenterLogPath(const MothershipProdigyCluster& cluster, String& path)
 {
   path.assign(cluster.test.workspaceRoot);
   if (path.size() > 0 && path[path.size() - 1] != '/')
   {
     path.append("/"_ctv);
   }
-  path.append("test-cluster-runner.log"_ctv);
-}
-
-static inline void mothershipResolveTestClusterRunnerRemotePath(const MothershipProdigyCluster& cluster, String& path)
-{
-  path.assign(cluster.test.workspaceRoot);
-  if (path.size() > 0 && path[path.size() - 1] != '/')
-  {
-    path.append("/"_ctv);
-  }
-  path.append("prodigy_test_cluster_runner.sh"_ctv);
+  path.append("virtual-datacenter.log"_ctv);
 }
 
 static inline void mothershipResolveTestClusterControlRecord(Vector<MothershipProdigyClusterControl>& controls, const MothershipProdigyCluster& cluster)

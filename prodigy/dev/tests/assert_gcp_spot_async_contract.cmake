@@ -7,7 +7,7 @@ file(READ "${PRODIGY_ROOT}/prodigy/iaas/runtime/runtime.h" RUNTIME)
 file(READ "${PRODIGY_ROOT}/prodigy/brain/brain.h" BRAIN)
 
 string(FIND "${GCP}" "void checkForSpotTerminations(CoroutineStack *coro, Vector<String>& decommissionedIDs) override" CHECK_START)
-string(FIND "${GCP}" "void destroyMachine(Machine *machine) override" CHECK_END)
+string(FIND "${GCP}" "void destroyMachine(CoroutineStack *coro," CHECK_END)
 if (CHECK_START EQUAL -1 OR CHECK_END LESS CHECK_START)
    message(FATAL_ERROR "GCP spot-termination method boundaries not found")
 endif()

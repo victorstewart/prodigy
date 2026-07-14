@@ -16,6 +16,7 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -36,6 +37,7 @@
 #include <prodigy/mothership/mothership.addmachines.progress.h>
 #include <prodigy/mothership/mothership.cluster.reconcile.h>
 #include <prodigy/mothership/mothership.cluster.registry.h>
+#include <prodigy/mothership/mothership.virtual.datacenter.h>
 #include <prodigy/mothership/mothership.ssh.h>
 #include <prodigy/mothership/mothership.deployment.plan.helpers.h>
 #include <prodigy/mothership/mothership.gcp.managed.template.plan.h>
@@ -49,6 +51,8 @@
 #include <prodigy/mothership/mothership.ring.runtime.h>
 #include <prodigy/acme.certbot.h>
 #include <prodigy/types.h>
+
+#include "mothership.virtual.datacenter.provider.inc"
 
 // for now every time we create a new application or service we're going to have to recompile the mothership so that
 // it can read the enum values from enums.datacenter.h, but in the future we can do something else more flexible
@@ -558,23 +562,6 @@ static bool parseMothershipClusterControlKind(const String& value, MothershipClu
   if (value.equal("unixSocket"_ctv) || value.equal("unix"_ctv))
   {
     kind = MothershipClusterControlKind::unixSocket;
-    return true;
-  }
-
-  return false;
-}
-
-static bool parseMothershipClusterTestHostMode(const String& value, MothershipClusterTestHostMode& mode)
-{
-  if (value.equal("local"_ctv))
-  {
-    mode = MothershipClusterTestHostMode::local;
-    return true;
-  }
-
-  if (value.equal("ssh"_ctv))
-  {
-    mode = MothershipClusterTestHostMode::ssh;
     return true;
   }
 
@@ -2415,27 +2402,17 @@ static void printManagedCluster(const MothershipProdigyCluster& cluster)
   if (cluster.deploymentMode == MothershipClusterDeploymentMode::test && cluster.test.specified)
   {
     String workspaceRoot = cluster.test.workspaceRoot;
-    basics_log("    test hostMode=%s workspaceRoot=%s machineCount=%u brainBootstrapFamily=%s enableFakeIpv4Boundary=%d interContainerMTU=%u\n",
-               mothershipClusterTestHostModeName(cluster.test.host.mode),
+    basics_log("    test workspaceRoot=%s machineCount=%u machineLogicalCores=%u machineMemoryMB=%u machineStorageMB=%u storageDeviceCount=%u storageDeviceMB=%u brainBootstrapFamily=%s enableFakeIpv4Boundary=%d interContainerMTU=%u\n",
                workspaceRoot.c_str(),
                unsigned(cluster.test.machineCount),
+               unsigned(cluster.test.machineLogicalCores),
+               unsigned(cluster.test.machineMemoryMB),
+               unsigned(cluster.test.machineStorageMB),
+               unsigned(cluster.test.storageDeviceCount),
+               unsigned(cluster.test.storageDeviceMB),
                mothershipClusterTestBootstrapFamilyName(cluster.test.brainBootstrapFamily),
                int(cluster.test.enableFakeIpv4Boundary),
                unsigned(cluster.test.interContainerMTU));
-
-    if (cluster.test.host.mode == MothershipClusterTestHostMode::ssh)
-    {
-      String sshAddress = cluster.test.host.ssh.address;
-      String sshUser = cluster.test.host.ssh.user;
-      String sshPrivateKeyPath = cluster.test.host.ssh.privateKeyPath;
-      String remoteProdigyPath = cluster.remoteProdigyPath;
-      basics_log("    testHost ssh.address=%s ssh.port=%u ssh.user=%s ssh.privateKeyPath=%s remoteProdigyPath=%s\n",
-                 sshAddress.c_str(),
-                 unsigned(cluster.test.host.ssh.port),
-                 sshUser.c_str(),
-                 sshPrivateKeyPath.c_str(),
-                 remoteProdigyPath.c_str());
-    }
   }
 
   for (const MothershipProdigyClusterMachineSchema& managedSchema : cluster.machineSchemas)
@@ -3544,60 +3521,54 @@ static bool resolveLocalProdigyExecutablePath(String& localProdigyPath, String *
   return false;
 }
 
-static bool mothershipReadLocalFile(const String& path, String& output, String *failure = nullptr)
+static bool mothershipCreateVirtualDatacenterProviderFD(int& providerFD, String *failure = nullptr)
 {
-  output.clear();
-
-  if (path.size() == 0)
+  providerFD = ::memfd_create("mothership-vdc-provider", MFD_ALLOW_SEALING);
+  if (providerFD < 0)
   {
     if (failure)
     {
-      failure->assign("path required"_ctv);
+      failure->snprintf<"failed to create virtual datacenter provider image: {}"_ctv>(String(std::strerror(errno)));
     }
     return false;
   }
 
-  String pathText = {};
-  pathText.assign(path);
-  int fd = ::open(pathText.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0)
+  uint64_t offset = 0;
+  while (offset < sizeof(mothershipVirtualDatacenterProviderSource))
   {
-    if (failure)
+    ssize_t written = ::write(providerFD,
+                              mothershipVirtualDatacenterProviderSource + offset,
+                              sizeof(mothershipVirtualDatacenterProviderSource) - offset);
+    if (written < 0 && errno == EINTR)
     {
-      failure->snprintf<"failed to open local file {}: {}"_ctv>(path, String(std::strerror(errno)));
+      continue;
     }
-    return false;
-  }
-
-  char scratch[4096];
-  for (;;)
-  {
-    ssize_t bytes = ::read(fd, scratch, sizeof(scratch));
-    if (bytes == 0)
+    if (written <= 0)
     {
-      break;
-    }
-
-    if (bytes < 0)
-    {
-      if (errno == EINTR)
-      {
-        continue;
-      }
-
-      ::close(fd);
+      int saved = errno;
+      ::close(providerFD);
+      providerFD = -1;
       if (failure)
       {
-        failure->snprintf<"failed to read local file {}: {}"_ctv>(path, String(std::strerror(errno)));
+        failure->snprintf<"failed to write virtual datacenter provider image: {}"_ctv>(String(std::strerror(saved)));
       }
-      output.clear();
       return false;
     }
-
-    output.append(reinterpret_cast<uint8_t *>(scratch), uint64_t(bytes));
+    offset += uint64_t(written);
   }
 
-  ::close(fd);
+  if (::fcntl(providerFD, F_ADD_SEALS, F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE) != 0 ||
+      ::lseek(providerFD, 0, SEEK_SET) != 0)
+  {
+    int saved = errno;
+    ::close(providerFD);
+    providerFD = -1;
+    if (failure)
+    {
+      failure->snprintf<"failed to seal virtual datacenter provider image: {}"_ctv>(String(std::strerror(saved)));
+    }
+    return false;
+  }
   if (failure)
   {
     failure->clear();
@@ -3605,219 +3576,279 @@ static bool mothershipReadLocalFile(const String& path, String& output, String *
   return true;
 }
 
-static bool resolveLocalProdigyDevNetnsHarnessPath(String& harnessPath, String *failure = nullptr)
+static bool mothershipRunVirtualDatacenterProvider(Vector<String> arguments, String *failure = nullptr)
 {
-  harnessPath.clear();
-
-  if (const char *overridePath = getenv("PRODIGY_MOTHERSHIP_TEST_HARNESS"); overridePath && overridePath[0] != '\0')
+  int providerFD = -1;
+  if (mothershipCreateVirtualDatacenterProviderFD(providerFD, failure) == false)
   {
-    harnessPath.assign(overridePath);
-    if (::access(harnessPath.c_str(), R_OK) == 0)
-    {
-      if (failure)
-      {
-        failure->clear();
-      }
-      return true;
-    }
+    return false;
   }
 
-  String selfPath = {};
-  if (prodigyResolveCurrentExecutablePath(selfPath))
+  String providerPath = {};
+  providerPath.snprintf<"/proc/self/fd/{itoa}"_ctv>(uint64_t(providerFD));
+  Vector<char *> argv = {};
+  argv.reserve(arguments.size() + 3);
+  argv.push_back(const_cast<char *>("/bin/bash"));
+  argv.push_back(const_cast<char *>(providerPath.c_str()));
+  for (String& argument : arguments)
   {
-    String selfDirectory = {};
-    prodigyDirname(selfPath, selfDirectory);
-    String candidate = {};
-    candidate.snprintf<"{}/../prodigy/dev/tests/prodigy_dev_netns_harness.sh"_ctv>(selfDirectory);
-    if (::access(candidate.c_str(), R_OK) == 0)
+    argv.push_back(const_cast<char *>(argument.c_str()));
+  }
+  argv.push_back(nullptr);
+
+  pid_t pid = ::fork();
+  if (pid == 0)
+  {
+    ::execv("/bin/bash", argv.data());
+    _exit(127);
+  }
+  if (pid < 0)
+  {
+    ::close(providerFD);
+    if (failure)
     {
-      harnessPath = candidate;
-      if (failure)
-      {
-        failure->clear();
-      }
-      return true;
+      failure->snprintf<"failed to launch virtual datacenter provider: {}"_ctv>(String(std::strerror(errno)));
     }
+    return false;
+  }
+  ::close(providerFD);
+
+  int status = 0;
+  while (::waitpid(pid, &status, 0) < 0)
+  {
+    if (errno == EINTR)
+    {
+      continue;
+    }
+    if (failure)
+    {
+      failure->snprintf<"failed to wait for virtual datacenter provider: {}"_ctv>(String(std::strerror(errno)));
+    }
+    return false;
   }
 
-  harnessPath.assign("/root/prodigy/prodigy/dev/tests/prodigy_dev_netns_harness.sh"_ctv);
-  if (::access(harnessPath.c_str(), R_OK) == 0)
+  if (WIFEXITED(status) == false || WEXITSTATUS(status) != 0)
   {
     if (failure)
     {
-      failure->clear();
+      if (WIFSIGNALED(status))
+      {
+        failure->snprintf<"virtual datacenter provider terminated by signal={itoa}"_ctv>(uint64_t(WTERMSIG(status)));
+      }
+      else
+      {
+        failure->snprintf<"virtual datacenter provider failed status={itoa}"_ctv>(uint64_t(WEXITSTATUS(status)));
+      }
     }
-    return true;
+    return false;
   }
-
-  harnessPath.clear();
   if (failure)
   {
-    failure->assign("failed to locate prodigy dev netns harness"_ctv);
+    failure->clear();
+  }
+  return true;
+}
+
+static bool mothershipStartVirtualDatacenterProvider(const MothershipProdigyCluster& cluster, String *failure = nullptr)
+{
+  struct stat netns = {};
+  if (::stat("/proc/self/ns/net", &netns) != 0 || netns.st_ino == 0)
+  {
+    if (failure)
+    {
+      failure->snprintf<"failed to identify Mothership network namespace: {}"_ctv>(String(std::strerror(errno)));
+    }
+    return false;
+  }
+
+  uint32_t mtu = cluster.test.interContainerMTU > 0 ? cluster.test.interContainerMTU : prodigyRuntimeTestInterContainerMTUDefault;
+  String machineCount = {};
+  String brainCount = {};
+  String mtuText = {};
+  String fakeBoundary = {};
+  String netnsInode = {};
+  String machineLogicalCores = {};
+  String machineMemoryMB = {};
+  String machineStorageMB = {};
+  String storageDeviceCount = {};
+  String storageDeviceMB = {};
+  machineCount.assignItoa(cluster.test.machineCount);
+  brainCount.assignItoa(cluster.nBrains);
+  mtuText.assignItoa(mtu);
+  fakeBoundary.assignItoa(cluster.test.enableFakeIpv4Boundary ? 1 : 0);
+  netnsInode.assignItoa(netns.st_ino);
+  machineLogicalCores.assignItoa(cluster.test.machineLogicalCores);
+  machineMemoryMB.assignItoa(cluster.test.machineMemoryMB);
+  machineStorageMB.assignItoa(cluster.test.machineStorageMB);
+  storageDeviceCount.assignItoa(cluster.test.storageDeviceCount);
+  storageDeviceMB.assignItoa(cluster.test.storageDeviceMB);
+  Vector<String> arguments = {};
+  arguments.emplace_back("--launch"_ctv);
+  arguments.push_back(cluster.test.workspaceRoot);
+  arguments.push_back(std::move(machineCount));
+  arguments.push_back(std::move(brainCount));
+  arguments.push_back(std::move(mtuText));
+  arguments.push_back(std::move(fakeBoundary));
+  arguments.push_back(std::move(netnsInode));
+  arguments.push_back(std::move(machineLogicalCores));
+  arguments.push_back(std::move(machineMemoryMB));
+  arguments.push_back(std::move(machineStorageMB));
+  arguments.push_back(std::move(storageDeviceCount));
+  arguments.push_back(std::move(storageDeviceMB));
+  return mothershipRunVirtualDatacenterProvider(std::move(arguments), failure);
+}
+
+static bool mothershipStopVirtualDatacenterProvider(const MothershipProdigyCluster& cluster, String *failure = nullptr)
+{
+  Vector<String> arguments = {};
+  arguments.emplace_back("--stop"_ctv);
+  arguments.push_back(cluster.test.workspaceRoot);
+  return mothershipRunVirtualDatacenterProvider(std::move(arguments), failure);
+}
+
+static bool mothershipFaultVirtualDatacenterProvider(
+    const MothershipProdigyCluster& cluster,
+    const String& mode,
+    const String& machineIndices,
+    uint32_t durationMs,
+    uint32_t cycles,
+    uint32_t downMs,
+    uint32_t upMs,
+    String *failure = nullptr)
+{
+  Vector<String> arguments = {};
+  arguments.emplace_back("--fault"_ctv);
+  arguments.push_back(cluster.test.workspaceRoot);
+  arguments.push_back(mode);
+  arguments.push_back(machineIndices);
+  arguments.emplace_back();
+  arguments.back().assignItoa(durationMs);
+  arguments.emplace_back();
+  arguments.back().assignItoa(cycles);
+  arguments.emplace_back();
+  arguments.back().assignItoa(downMs);
+  arguments.emplace_back();
+  arguments.back().assignItoa(upMs);
+  return mothershipRunVirtualDatacenterProvider(std::move(arguments), failure);
+}
+
+static bool mothershipProbeVirtualDatacenterProvider(
+    const MothershipProdigyCluster& cluster,
+    const String& address,
+    uint16_t port,
+    const String& payload,
+    const String& expected,
+    uint32_t timeoutMs,
+    uint32_t sourceMachineIndex,
+    String *failure = nullptr)
+{
+  Vector<String> arguments = {};
+  arguments.emplace_back("--probe"_ctv);
+  arguments.push_back(cluster.test.workspaceRoot);
+  arguments.push_back(address);
+  arguments.emplace_back();
+  arguments.back().assignItoa(port);
+  arguments.push_back(payload);
+  arguments.push_back(expected);
+  arguments.emplace_back();
+  arguments.back().assignItoa(timeoutMs);
+  arguments.emplace_back();
+  arguments.back().assignItoa(sourceMachineIndex);
+  return mothershipRunVirtualDatacenterProvider(std::move(arguments), failure);
+}
+
+static bool mothershipParseUnsignedArgument(const char *text, uint64_t maximum, uint64_t& value)
+{
+  value = 0;
+  if (text == nullptr || text[0] == '\0')
+  {
+    return false;
+  }
+  errno = 0;
+  char *end = nullptr;
+  unsigned long long parsed = std::strtoull(text, &end, 10);
+  if (errno != 0 || end == text || *end != '\0' || parsed > maximum)
+  {
+    return false;
+  }
+  value = uint64_t(parsed);
+  return true;
+}
+
+static bool mothershipTestMachineIndicesValid(const String& text, uint32_t machineCount)
+{
+  if (text.size() == 0)
+  {
+    return false;
+  }
+  uint64_t value = 0;
+  bool hasDigit = false;
+  for (uint32_t index = 0; index <= text.size(); ++index)
+  {
+    if (index < text.size() && text[index] >= '0' && text[index] <= '9')
+    {
+      hasDigit = true;
+      uint64_t digit = uint64_t(text[index] - '0');
+      if (digit > machineCount || value > (uint64_t(machineCount) - digit) / 10)
+      {
+        return false;
+      }
+      value = (value * 10) + digit;
+      continue;
+    }
+    if ((index < text.size() && text[index] != ',') || hasDigit == false || value == 0 || value > machineCount)
+    {
+      return false;
+    }
+    value = 0;
+    hasDigit = false;
+  }
+  return true;
+}
+
+static bool mothershipWaitForVirtualDatacenterReady(const MothershipProdigyCluster& cluster, String *failure = nullptr, int timeoutMs = 180'000)
+{
+  String readyPath = {};
+  String pidPath = {};
+  String logPath = {};
+  mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, mothershipVirtualDatacenterReadyFilename, readyPath);
+  mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, mothershipVirtualDatacenterPIDFilename, pidPath);
+  mothershipResolveVirtualDatacenterLogPath(cluster, logPath);
+  int64_t deadline = Time::now<TimeResolution::ms>() + timeoutMs;
+
+  while (Time::now<TimeResolution::ms>() < deadline)
+  {
+    if (::access(readyPath.c_str(), R_OK) == 0 && ::access(pidPath.c_str(), R_OK) == 0)
+    {
+      if (failure)
+      {
+        failure->clear();
+      }
+      return true;
+    }
+    ::usleep(100'000);
+  }
+
+  if (failure)
+  {
+    failure->snprintf<"timed out waiting for virtual datacenter provider workspaceRoot={} logPath={}"_ctv>(cluster.test.workspaceRoot, logPath);
   }
   return false;
 }
 
-static void mothershipBuildTestClusterHostMachine(const MothershipProdigyCluster& cluster, MothershipProdigyClusterMachine& machine)
+static bool mothershipWaitForVirtualDatacenterRuntime(const MothershipProdigyCluster& cluster, String *failure = nullptr, int timeoutMs = 180'000)
 {
-  machine = {};
-  machine.isBrain = true;
-  machine.ssh = cluster.test.host.ssh;
-}
-
-static void mothershipAppendPersistentTestClusterHarnessCommand(const String& harnessPath, const String& prodigyPath, const MothershipProdigyCluster& cluster, String& command)
-{
-  String manifestPath = {};
-  mothershipResolveTestClusterManifestPath(cluster, manifestPath);
-
-  command.assign("bash "_ctv);
-  prodigyAppendShellSingleQuoted(command, harnessPath);
-  command.append(" "_ctv);
-  prodigyAppendShellSingleQuoted(command, prodigyPath);
-  command.append(" --runner-mode=persistent"_ctv);
-  command.append(" --workspace-root="_ctv);
-  prodigyAppendShellSingleQuoted(command, cluster.test.workspaceRoot);
-  command.append(" --manifest-path="_ctv);
-  prodigyAppendShellSingleQuoted(command, manifestPath);
-  String machineCountText = {};
-  machineCountText.snprintf<"{itoa}"_ctv>(uint64_t(cluster.test.machineCount));
-  String brainCountText = {};
-  brainCountText.snprintf<"{itoa}"_ctv>(uint64_t(cluster.nBrains));
-  command.append(" --machines="_ctv);
-  command.append(machineCountText);
-  command.append(" --brains="_ctv);
-  command.append(brainCountText);
-  command.append(" --brain-bootstrap-family="_ctv);
-  command.append(mothershipClusterTestBootstrapFamilyName(cluster.test.brainBootstrapFamily));
-  command.append(" --enable-fake-ipv4-boundary="_ctv);
-  if (cluster.test.enableFakeIpv4Boundary)
-  {
-    command.append("1"_ctv);
-  }
-  else
-  {
-    command.append("0"_ctv);
-  }
-  String interContainerMTUText = {};
-  interContainerMTUText.snprintf<"{itoa}"_ctv>(uint64_t(
-      cluster.test.interContainerMTU > 0
-          ? cluster.test.interContainerMTU
-          : prodigyRuntimeTestInterContainerMTUDefault));
-  command.append(" --inter-container-mtu="_ctv);
-  command.append(interContainerMTUText);
-}
-
-static void mothershipAppendPersistentTestClusterWorkspaceCleanup(const String& workspaceRoot, String& command)
-{
-  String sharedStorePath = {};
-  sharedStorePath.assign(workspaceRoot);
-  if (sharedStorePath.size() > 0 && sharedStorePath[sharedStorePath.size() - 1] != '/')
-  {
-    sharedStorePath.append("/"_ctv);
-  }
-  sharedStorePath.append("brain-shared-store"_ctv);
-
-  command.append("if [ -d "_ctv);
-  prodigyAppendShellSingleQuoted(command, sharedStorePath);
-  command.append(" ]; then "_ctv);
-  command.append("if command -v mountpoint >/dev/null 2>&1 && mountpoint -q "_ctv);
-  prodigyAppendShellSingleQuoted(command, sharedStorePath);
-  command.append("; then umount "_ctv);
-  prodigyAppendShellSingleQuoted(command, sharedStorePath);
-  command.append(" >/dev/null 2>&1 || umount -l "_ctv);
-  prodigyAppendShellSingleQuoted(command, sharedStorePath);
-  command.append(" >/dev/null 2>&1 || true; fi; fi; "_ctv);
-  command.append("rm -rf "_ctv);
-  prodigyAppendShellSingleQuoted(command, workspaceRoot);
-  command.append(" >/dev/null 2>&1 || true; "_ctv);
-}
-
-static void mothershipBuildPersistentTestClusterStartCommand(const String& harnessPath, const String& prodigyPath, const MothershipProdigyCluster& cluster, String& command)
-{
-  String workspaceParent = {};
-  prodigyDirname(cluster.test.workspaceRoot, workspaceParent);
-
-  String pidPath = {};
-  mothershipResolveTestClusterRunnerPIDPath(cluster, pidPath);
-  String logPath = {};
-  mothershipResolveTestClusterRunnerLogPath(cluster, logPath);
-
-  String runnerCommand = {};
-  mothershipAppendPersistentTestClusterHarnessCommand(harnessPath, prodigyPath, cluster, runnerCommand);
-
-  command.clear();
-  command.assign("set -euo pipefail; "_ctv);
-  if (workspaceParent.size() > 0)
-  {
-    command.append("mkdir -p "_ctv);
-    prodigyAppendShellSingleQuoted(command, workspaceParent);
-    command.append("; "_ctv);
-  }
-  mothershipAppendPersistentTestClusterWorkspaceCleanup(cluster.test.workspaceRoot, command);
-  command.append("mkdir -p "_ctv);
-  prodigyAppendShellSingleQuoted(command, cluster.test.workspaceRoot);
-  command.append("; setsid nohup env PRODIGY_DEV_KEEP_TMP=1 bash -lc "_ctv);
-  prodigyAppendShellSingleQuoted(command, runnerCommand);
-  command.append(" >"_ctv);
-  prodigyAppendShellSingleQuoted(command, logPath);
-  command.append(" 2>&1 < /dev/null & echo $! > "_ctv);
-  prodigyAppendShellSingleQuoted(command, pidPath);
-}
-
-static void mothershipBuildPersistentTestClusterStopCommand(const MothershipProdigyCluster& cluster, String& command)
-{
-  String pidPath = {};
-  mothershipResolveTestClusterRunnerPIDPath(cluster, pidPath);
-
-  command.assign("set +e; "_ctv);
-  command.append("if [ -f "_ctv);
-  prodigyAppendShellSingleQuoted(command, pidPath);
-  command.append(" ]; then "_ctv);
-  command.append("pid=$(cat "_ctv);
-  prodigyAppendShellSingleQuoted(command, pidPath);
-  command.append(" 2>/dev/null || true); "_ctv);
-  command.append("if [ -n \"$pid\" ]; then kill -TERM \"$pid\" >/dev/null 2>&1 || true; fi; "_ctv);
-  command.append("for _ in $(seq 1 150); do if [ -z \"$pid\" ] || ! kill -0 \"$pid\" >/dev/null 2>&1; then break; fi; sleep 0.2; done; "_ctv);
-  command.append("if [ -n \"$pid\" ] && kill -0 \"$pid\" >/dev/null 2>&1; then kill -KILL \"$pid\" >/dev/null 2>&1 || true; fi; "_ctv);
-  command.append("fi; "_ctv);
-  mothershipAppendPersistentTestClusterWorkspaceCleanup(cluster.test.workspaceRoot, command);
-}
-
-static int mothershipLocalTestClusterReadyTimeoutMs(void)
-{
-  constexpr int defaultTimeoutMs = 180'000;
-  const char *text = std::getenv("PRODIGY_MOTHERSHIP_LOCAL_TEST_CLUSTER_READY_TIMEOUT_MS");
-  if (text == nullptr || text[0] == '\0')
-  {
-    return defaultTimeoutMs;
-  }
-
-  errno = 0;
-  char *end = nullptr;
-  long parsed = std::strtol(text, &end, 10);
-  if (errno != 0 || end == text || *end != '\0' || parsed <= 0 || parsed > INT_MAX)
-  {
-    return defaultTimeoutMs;
-  }
-
-  return int(parsed);
-}
-
-static bool mothershipWaitForLocalTestClusterReady(const MothershipProdigyCluster& cluster, String *failure = nullptr, int timeoutMs = mothershipLocalTestClusterReadyTimeoutMs())
-{
-  String manifestPath = {};
-  mothershipResolveTestClusterManifestPath(cluster, manifestPath);
+  String runtimePath = {};
   String controlSocketPath = {};
-  mothershipResolveTestClusterControlSocketPath(cluster, controlSocketPath);
   String pidPath = {};
-  mothershipResolveTestClusterRunnerPIDPath(cluster, pidPath);
-  String logPath = {};
-  mothershipResolveTestClusterRunnerLogPath(cluster, logPath);
+  mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, mothershipVirtualDatacenterRuntimeFilename, runtimePath);
+  mothershipResolveTestClusterControlSocketPath(cluster, controlSocketPath);
+  mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, mothershipVirtualDatacenterPIDFilename, pidPath);
+  int64_t deadline = Time::now<TimeResolution::ms>() + timeoutMs;
 
-  int64_t deadlineMs = Time::now<TimeResolution::ms>() + timeoutMs;
-  for (;;)
+  while (Time::now<TimeResolution::ms>() < deadline)
   {
-    if (::access(manifestPath.c_str(), R_OK) == 0 && ::access(controlSocketPath.c_str(), F_OK) == 0)
+    if (::access(runtimePath.c_str(), R_OK) == 0 && ::access(controlSocketPath.c_str(), F_OK) == 0)
     {
       if (failure)
       {
@@ -3826,47 +3857,32 @@ static bool mothershipWaitForLocalTestClusterReady(const MothershipProdigyCluste
       return true;
     }
 
+    String pidText = {};
     if (::access(pidPath.c_str(), R_OK) == 0)
     {
-      String pidText = {};
       Filesystem::openReadAtClose(-1, pidPath, pidText);
-      if (pidText.size() > 0)
-      {
-        pidText.addNullTerminator();
-        long long runnerPID = std::atoll(pidText.c_str());
-        if (runnerPID > 0 && ::kill(pid_t(runnerPID), 0) != 0 && errno == ESRCH)
-        {
-          if (failure)
-          {
-            failure->snprintf<"local test cluster runner exited before ready workspaceRoot={} runnerPID={} runnerLogPath={} runnerLogPathExists={} manifestPathExists={} controlSocketPathExists={}"_ctv>(
-                cluster.test.workspaceRoot,
-                uint64_t(runnerPID),
-                logPath,
-                uint32_t(::access(logPath.c_str(), R_OK) == 0),
-                uint32_t(::access(manifestPath.c_str(), R_OK) == 0),
-                uint32_t(::access(controlSocketPath.c_str(), F_OK) == 0));
-          }
-          return false;
-        }
-      }
     }
-
-    if (Time::now<TimeResolution::ms>() >= deadlineMs)
+    if (pidText.size() > 0)
     {
-      if (failure)
+      pidText.addNullTerminator();
+      pid_t pid = pid_t(std::strtol(pidText.c_str(), nullptr, 10));
+      if (pid > 0 && ::kill(pid, 0) != 0 && errno == ESRCH)
       {
-        failure->snprintf<"timed out waiting for local test cluster manifest/socket in {} runnerPIDPath={} runnerPIDPathExists={} runnerLogPath={} runnerLogPathExists={}"_ctv>(
-            cluster.test.workspaceRoot,
-            pidPath,
-            uint32_t(::access(pidPath.c_str(), R_OK) == 0),
-            logPath,
-            uint32_t(::access(logPath.c_str(), R_OK) == 0));
+        if (failure)
+        {
+          failure->assign("virtual datacenter provider exited before Prodigy became ready"_ctv);
+        }
+        return false;
       }
-      return false;
     }
-
-    usleep(200'000);
+    ::usleep(100'000);
   }
+
+  if (failure)
+  {
+    failure->snprintf<"timed out waiting for virtual datacenter runtime workspaceRoot={} controlSocket={}"_ctv>(cluster.test.workspaceRoot, controlSocketPath);
+  }
+  return false;
 }
 
 static bool mothershipSnapshotLocalTestClusterFailureWorkspace(const MothershipProdigyCluster& cluster, String& snapshotPath, String *failure = nullptr)
@@ -3920,99 +3936,6 @@ static bool mothershipSnapshotLocalTestClusterFailureWorkspace(const MothershipP
     failure->clear();
   }
   return true;
-}
-
-static bool mothershipUploadRemoteTestHarness(LIBSSH2_SESSION *session, const MothershipProdigyCluster& cluster, String *failure = nullptr)
-{
-  String localHarnessPath = {};
-  if (resolveLocalProdigyDevNetnsHarnessPath(localHarnessPath, failure) == false)
-  {
-    return false;
-  }
-
-  String harnessContents = {};
-  if (mothershipReadLocalFile(localHarnessPath, harnessContents, failure) == false)
-  {
-    return false;
-  }
-
-  String remoteHarnessPath = {};
-  mothershipResolveTestClusterRunnerRemotePath(cluster, remoteHarnessPath);
-
-  String workspaceParent = {};
-  prodigyDirname(cluster.test.workspaceRoot, workspaceParent);
-
-  String command = {};
-  command.assign("set -euo pipefail; "_ctv);
-  if (workspaceParent.size() > 0)
-  {
-    command.append("mkdir -p "_ctv);
-    prodigyAppendShellSingleQuoted(command, workspaceParent);
-    command.append("; "_ctv);
-  }
-  command.append("mkdir -p "_ctv);
-  prodigyAppendShellSingleQuoted(command, cluster.test.workspaceRoot);
-  command.append("; cat > "_ctv);
-  prodigyAppendShellSingleQuoted(command, remoteHarnessPath);
-  command.append(" <<'__PRODIGY_TEST_CLUSTER_RUNNER__'\n"_ctv);
-  command.append(harnessContents);
-  if (harnessContents.size() == 0 || harnessContents[harnessContents.size() - 1] != '\n')
-  {
-    command.append("\n"_ctv);
-  }
-  command.append("__PRODIGY_TEST_CLUSTER_RUNNER__\nchmod 700 "_ctv);
-  prodigyAppendShellSingleQuoted(command, remoteHarnessPath);
-
-  return mothershipRunSSHCommand(session, command, failure);
-}
-
-static bool mothershipWaitForRemoteTestClusterReady(const MothershipProdigyCluster& cluster, String *failure = nullptr, int timeoutMs = 120'000)
-{
-  String manifestPath = {};
-  mothershipResolveTestClusterManifestPath(cluster, manifestPath);
-  String controlSocketPath = {};
-  mothershipResolveTestClusterControlSocketPath(cluster, controlSocketPath);
-
-  String command = {};
-  command.assign("test -S "_ctv);
-  prodigyAppendShellSingleQuoted(command, controlSocketPath);
-  command.append(" && test -s "_ctv);
-  prodigyAppendShellSingleQuoted(command, manifestPath);
-  command.append(" && printf READY"_ctv);
-
-  int64_t deadlineMs = Time::now<TimeResolution::ms>() + timeoutMs;
-  while (Time::now<TimeResolution::ms>() < deadlineMs)
-  {
-    MothershipProdigyClusterMachine remoteHost = {};
-    mothershipBuildTestClusterHostMachine(cluster, remoteHost);
-
-    LIBSSH2_SESSION *session = nullptr;
-    int fd = -1;
-    String connectFailure = {};
-    if (mothershipConnectSSHSession(remoteHost, session, fd, &connectFailure))
-    {
-      String output = {};
-      String waitFailure = {};
-      bool ready = mothershipRunSSHCommandCaptureOutput(session, fd, command, output, &waitFailure, 5000) && output.equal("READY"_ctv);
-      mothershipCloseSSHSession(session, fd);
-      if (ready)
-      {
-        if (failure)
-        {
-          failure->clear();
-        }
-        return true;
-      }
-    }
-
-    usleep(200'000);
-  }
-
-  if (failure)
-  {
-    failure->snprintf<"timed out waiting for remote test cluster manifest/socket in {}"_ctv>(cluster.test.workspaceRoot);
-  }
-  return false;
 }
 
 static bool bootstrapLocalProdigy(const ProdigyPersistentBootState& bootState, String *failure = nullptr)
@@ -4935,7 +4858,7 @@ public:
       return false;
     }
 
-    if (mothershipClusterIncludesLocalMachine(cluster) || (cluster.deploymentMode == MothershipClusterDeploymentMode::test && cluster.test.host.mode == MothershipClusterTestHostMode::local))
+    if (mothershipClusterIncludesLocalMachine(cluster) || cluster.deploymentMode == MothershipClusterDeploymentMode::test)
     {
       transportMode = TransportMode::localUnix;
       if (failure)
@@ -4946,19 +4869,6 @@ public:
     }
 
     transportMode = TransportMode::remoteSshUnix;
-
-    if (cluster.deploymentMode == MothershipClusterDeploymentMode::test)
-    {
-      MothershipProdigyClusterMachine candidate = {};
-      candidate.isBrain = true;
-      candidate.ssh = cluster.test.host.ssh;
-      remoteMachines.push_back(candidate);
-      if (failure)
-      {
-        failure->clear();
-      }
-      return true;
-    }
 
     auto appendCandidate = [&](const MothershipProdigyClusterMachine& machine) -> void {
       if (machine.ssh.address.size() == 0 || machine.ssh.privateKeyPath.size() == 0)
@@ -6669,7 +6579,7 @@ private:
     bool stopTestCluster(const MothershipProdigyCluster& cluster, String *failure = nullptr) override
     {
       String localFailure = {};
-      bool ok = mothership->stopTestClusterRunner(cluster, localFailure);
+      bool ok = mothership->stopVirtualDatacenter(cluster, localFailure);
       if (failure != nullptr)
       {
         *failure = localFailure;
@@ -6748,137 +6658,54 @@ private:
     return false;
   }
 
-  bool startTestClusterRunner(const MothershipProdigyCluster& cluster, String& failure)
+  bool startVirtualDatacenter(const MothershipProdigyCluster& cluster, String& failure)
   {
     failure.clear();
 
-    if (mothershipClusterUsesTestRunner(cluster) == false)
+    if (mothershipClusterUsesVirtualDatacenter(cluster) == false)
     {
       failure.assign("cluster is not a test cluster"_ctv);
       return false;
     }
 
-    if (cluster.test.host.mode == MothershipClusterTestHostMode::local)
-    {
-      String harnessPath = {};
-      if (resolveLocalProdigyDevNetnsHarnessPath(harnessPath, &failure) == false)
-      {
-        return false;
-      }
-
-      String localProdigyPath = {};
-      if (resolveLocalProdigyExecutablePath(localProdigyPath, &failure) == false)
-      {
-        return false;
-      }
-
-      String startCommand = {};
-      mothershipBuildPersistentTestClusterStartCommand(harnessPath, localProdigyPath, cluster, startCommand);
-      if (prodigyRunLocalShellCommand(startCommand, &failure) == false)
-      {
-        return false;
-      }
-
-      if (mothershipWaitForLocalTestClusterReady(cluster, &failure) == false)
-      {
-        String snapshotPath = {};
-        String snapshotFailure = {};
-        if (mothershipSnapshotLocalTestClusterFailureWorkspace(cluster, snapshotPath, &snapshotFailure))
-        {
-          failure.append(" preservedWorkspace="_ctv);
-          failure.append(snapshotPath);
-        }
-        else if (snapshotFailure.size() > 0)
-        {
-          failure.append(" snapshotFailure="_ctv);
-          failure.append(snapshotFailure);
-        }
-
-        String cleanupFailure = {};
-        (void)stopTestClusterRunner(cluster, cleanupFailure);
-        return false;
-      }
-
-      return true;
-    }
-
-    MothershipProdigyClusterMachine remoteHost = {};
-    mothershipBuildTestClusterHostMachine(cluster, remoteHost);
-
-    LIBSSH2_SESSION *session = nullptr;
-    int fd = -1;
-    if (mothershipConnectSSHSession(remoteHost, session, fd, &failure) == false)
+    if (mothershipStartVirtualDatacenterProvider(cluster, &failure) == false)
     {
       return false;
     }
 
-    bool ok = false;
-    do
+    if (mothershipWaitForVirtualDatacenterReady(cluster, &failure) == false)
     {
-      if (mothershipUploadRemoteTestHarness(session, cluster, &failure) == false)
+      String snapshotPath = {};
+      String snapshotFailure = {};
+      if (mothershipSnapshotLocalTestClusterFailureWorkspace(cluster, snapshotPath, &snapshotFailure))
       {
-        break;
+        failure.append(" preservedWorkspace="_ctv);
+        failure.append(snapshotPath);
+      }
+      else if (snapshotFailure.size() > 0)
+      {
+        failure.append(" snapshotFailure="_ctv);
+        failure.append(snapshotFailure);
       }
 
-      String remoteHarnessPath = {};
-      mothershipResolveTestClusterRunnerRemotePath(cluster, remoteHarnessPath);
-
-      String startCommand = {};
-      mothershipBuildPersistentTestClusterStartCommand(remoteHarnessPath, cluster.remoteProdigyPath, cluster, startCommand);
-      if (mothershipRunSSHCommand(session, startCommand, &failure) == false)
-      {
-        break;
-      }
-
-      ok = true;
-    } while (false);
-
-    mothershipCloseSSHSession(session, fd);
-    if (ok == false)
-    {
-      return false;
-    }
-
-    if (mothershipWaitForRemoteTestClusterReady(cluster, &failure) == false)
-    {
       String cleanupFailure = {};
-      (void)stopTestClusterRunner(cluster, cleanupFailure);
+      (void)stopVirtualDatacenter(cluster, cleanupFailure);
       return false;
     }
 
     return true;
   }
 
-  bool stopTestClusterRunner(const MothershipProdigyCluster& cluster, String& failure)
+  bool stopVirtualDatacenter(const MothershipProdigyCluster& cluster, String& failure)
   {
     failure.clear();
 
-    if (mothershipClusterUsesTestRunner(cluster) == false)
+    if (mothershipClusterUsesVirtualDatacenter(cluster) == false)
     {
       return true;
     }
 
-    String stopCommand = {};
-    mothershipBuildPersistentTestClusterStopCommand(cluster, stopCommand);
-
-    if (cluster.test.host.mode == MothershipClusterTestHostMode::local)
-    {
-      return prodigyRunLocalShellCommand(stopCommand, &failure);
-    }
-
-    MothershipProdigyClusterMachine remoteHost = {};
-    mothershipBuildTestClusterHostMachine(cluster, remoteHost);
-
-    LIBSSH2_SESSION *session = nullptr;
-    int fd = -1;
-    if (mothershipConnectSSHSession(remoteHost, session, fd, &failure) == false)
-    {
-      return false;
-    }
-
-    bool ok = mothershipRunSSHCommand(session, stopCommand, &failure);
-    mothershipCloseSSHSession(session, fd);
-    return ok;
+    return mothershipStopVirtualDatacenterProvider(cluster, &failure);
   }
 
   static bool resolveClusterUnixControlPath(const MothershipProdigyCluster& cluster, String& controlSocketPath, String *failure = nullptr)
@@ -7663,28 +7490,6 @@ private:
           tunnelProviderGatewayAuth(std::move(tunnelProviderGatewayAuth))
     {}
 
-    bool startTestCluster(const MothershipProdigyCluster& cluster, String *failure = nullptr) override
-    {
-      String localFailure = {};
-      bool ok = owner->startTestClusterRunner(cluster, localFailure);
-      if (failure)
-      {
-        *failure = localFailure;
-      }
-      return ok;
-    }
-
-    bool stopTestCluster(const MothershipProdigyCluster& cluster, String *failure = nullptr) override
-    {
-      String localFailure = {};
-      bool ok = owner->stopTestClusterRunner(cluster, localFailure);
-      if (failure)
-      {
-        *failure = localFailure;
-      }
-      return ok;
-    }
-
     bool prepareProviderBootstrapArtifacts(const MothershipProdigyCluster& cluster, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) override
     {
 #if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
@@ -7902,6 +7707,28 @@ private:
         failure->clear();
       }
 
+      if (cluster.deploymentMode == MothershipClusterDeploymentMode::test)
+      {
+        (void)instruction;
+        (void)timingAttribution;
+        ClusterTopology topology = {};
+        if (mothershipBuildVirtualDatacenterTopology(cluster, topology, failure) == false || topology.machines.empty())
+        {
+          return false;
+        }
+        String localFailure = {};
+        if (owner->startVirtualDatacenter(cluster, localFailure) == false)
+        {
+          if (failure)
+          {
+            failure->assign(localFailure);
+          }
+          return false;
+        }
+        seedMachine = topology.machines[0];
+        return true;
+      }
+
       MothershipProviderCredential credential = {};
       String localFailure;
       if (owner->validateClusterProviderCredentialReference(cluster, localFailure, &credential) == false)
@@ -8044,6 +7871,18 @@ private:
         failure->clear();
       }
 
+      if (cluster.deploymentMode == MothershipClusterDeploymentMode::test)
+      {
+        (void)seedMachine;
+        String localFailure = {};
+        bool stopped = owner->stopVirtualDatacenter(cluster, localFailure);
+        if (failure)
+        {
+          failure->assign(localFailure);
+        }
+        return stopped;
+      }
+
       if (seedMachine.source != ClusterMachineSource::created || seedMachine.backing != ClusterMachineBacking::cloud || seedMachine.cloud.cloudID.size() == 0)
       {
         return true;
@@ -8179,6 +8018,33 @@ private:
         (void)timingAttribution;
 #endif
       };
+
+      if (cluster.deploymentMode == MothershipClusterDeploymentMode::test)
+      {
+        (void)seedMachine;
+        (void)request;
+        (void)topology;
+        ClusterTopology virtualTopology = {};
+        if (mothershipBuildVirtualDatacenterTopology(cluster, virtualTopology, failure) == false)
+        {
+          finalizeTiming();
+          return false;
+        }
+
+        String localProdigyPath = {};
+        String bundlePath = {};
+        if (resolveLocalProdigyExecutablePath(localProdigyPath, failure) == false ||
+            prodigyResolveBundleArtifactInput(localProdigyPath, cluster.architecture, bundlePath, failure) == false ||
+            mothershipProvisionVirtualDatacenter(cluster, virtualTopology, runtimeEnvironment, bundlePath, failure) == false ||
+            mothershipWaitForVirtualDatacenterRuntime(cluster, failure) == false)
+        {
+          finalizeTiming();
+          return false;
+        }
+
+        finalizeTiming();
+        return true;
+      }
 
       if (seedMachine.backing == ClusterMachineBacking::cloud)
       {
@@ -9055,6 +8921,99 @@ private:
     printManagedCluster(desiredCluster);
   }
 
+  void runFaultTestCluster(int argc, char *argv[])
+  {
+    if (argc != 7)
+    {
+      basics_log("wrong number of arguments. ex: faultTestCluster [name|clusterUUID] [link|crash|flap] [machine indices csv] [durationMs] [cycles] [downMs] [upMs]\n");
+      exit(EXIT_FAILURE);
+    }
+
+    String identity = {};
+    identity.assign(argv[0]);
+    String failure = {};
+    MothershipProdigyCluster cluster = {};
+    if (loadClusterForScopedMutation("faultTestCluster", identity, cluster, failure) == false || cluster.deploymentMode != MothershipClusterDeploymentMode::test)
+    {
+      basics_log("faultTestCluster success=0 identity=%s failure=%s\n", identity.c_str(), failure.size() ? failure.c_str() : "faultTestCluster requires deploymentMode=test");
+      exit(EXIT_FAILURE);
+    }
+
+    String mode = {};
+    String machineIndices = {};
+    mode.assign(argv[1]);
+    machineIndices.assign(argv[2]);
+    uint64_t durationMs = 0;
+    uint64_t cycles = 0;
+    uint64_t downMs = 0;
+    uint64_t upMs = 0;
+    bool validMode = mode.equals("link"_ctv) || mode.equals("crash"_ctv) || mode.equals("flap"_ctv);
+    if (validMode == false || mothershipTestMachineIndicesValid(machineIndices, cluster.test.machineCount) == false ||
+        mothershipParseUnsignedArgument(argv[3], 3'600'000, durationMs) == false ||
+        mothershipParseUnsignedArgument(argv[4], 1'000, cycles) == false ||
+        mothershipParseUnsignedArgument(argv[5], 3'600'000, downMs) == false ||
+        mothershipParseUnsignedArgument(argv[6], 3'600'000, upMs) == false ||
+        (mode.equals("flap"_ctv) && (cycles == 0 || downMs == 0 || upMs == 0)) ||
+        (mode.equals("flap"_ctv) == false && cycles != 0))
+    {
+      basics_log("faultTestCluster success=0 identity=%s failure=invalid fault specification\n", identity.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    if (mothershipFaultVirtualDatacenterProvider(cluster, mode, machineIndices, uint32_t(durationMs), uint32_t(cycles), uint32_t(downMs), uint32_t(upMs), &failure) == false)
+    {
+      basics_log("faultTestCluster success=0 identity=%s failure=%s\n", identity.c_str(), failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    basics_log("faultTestCluster success=1 identity=%s mode=%s machineIndices=%s\n", identity.c_str(), mode.c_str(), machineIndices.c_str());
+  }
+
+  void runProbeTestCluster(int argc, char *argv[])
+  {
+    if (argc != 7)
+    {
+      basics_log("wrong number of arguments. ex: probeTestCluster [name|clusterUUID] [address] [port] [payload] [expected] [timeoutMs] [sourceMachineIndex: 0=datacenter]\n");
+      exit(EXIT_FAILURE);
+    }
+
+    String identity = {};
+    identity.assign(argv[0]);
+    String failure = {};
+    MothershipProdigyCluster cluster = {};
+    if (loadClusterForScopedMutation("probeTestCluster", identity, cluster, failure) == false || cluster.deploymentMode != MothershipClusterDeploymentMode::test)
+    {
+      basics_log("probeTestCluster success=0 identity=%s failure=%s\n", identity.c_str(), failure.size() ? failure.c_str() : "probeTestCluster requires deploymentMode=test");
+      exit(EXIT_FAILURE);
+    }
+
+    String address = {};
+    String payload = {};
+    String expected = {};
+    address.assign(argv[1]);
+    payload.assign(argv[3]);
+    expected.assign(argv[4]);
+    uint8_t addressBytes[16] = {};
+    bool validAddress = ::inet_pton(AF_INET, address.c_str(), addressBytes) == 1 || ::inet_pton(AF_INET6, address.c_str(), addressBytes) == 1;
+    uint64_t port = 0;
+    uint64_t timeoutMs = 0;
+    uint64_t sourceMachineIndex = 0;
+    if (validAddress == false || payload.size() > 4'096 || expected.size() > 4'096 ||
+        mothershipParseUnsignedArgument(argv[2], UINT16_MAX, port) == false || port == 0 ||
+        mothershipParseUnsignedArgument(argv[5], 60'000, timeoutMs) == false || timeoutMs == 0 ||
+        mothershipParseUnsignedArgument(argv[6], cluster.test.machineCount, sourceMachineIndex) == false)
+    {
+      basics_log("probeTestCluster success=0 identity=%s failure=invalid probe specification\n", identity.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    if (mothershipProbeVirtualDatacenterProvider(cluster, address, uint16_t(port), payload, expected, uint32_t(timeoutMs), uint32_t(sourceMachineIndex), &failure) == false)
+    {
+      basics_log("probeTestCluster success=0 identity=%s failure=%s\n", identity.c_str(), failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    basics_log("probeTestCluster success=1 identity=%s address=%s port=%u\n", identity.c_str(), address.c_str(), unsigned(port));
+  }
+
   bool loadRemoteClusterMutationTarget(const char *operationName, const char *identityArg, MothershipProdigyCluster& controlCluster, String& failure)
   {
     failure.clear();
@@ -9471,13 +9430,6 @@ private:
     }
 
     bool returnAfterInitialSpinOkay = (std::strcmp(argv[0], "dev") == 0);
-    if (returnAfterInitialSpinOkay == false && std::strcmp(argv[0], "local") == 0 && std::getenv("PRODIGY_MOTHERSHIP_TEST_HARNESS") != nullptr)
-    {
-      // Local unix control requests coming from the isolated test harness run
-      // readiness validation via explicit follow-up probes, so they should not
-      // block on the terminal spinApplication frame.
-      returnAfterInitialSpinOkay = true;
-    }
     if (returnAfterInitialSpinOkay == false && std::strcmp(argv[0], "local") != 0)
     {
       MothershipClusterRegistry clusterRegistry = openClusterRegistry();
@@ -9487,9 +9439,8 @@ private:
       clusterIdentity.setInvariant(argv[0]);
       if (clusterRegistry.getClusterByIdentity(clusterIdentity, targetCluster, &clusterLookupFailure))
       {
-        // Test clusters validate readiness via explicit follow-up probes on the
-        // same isolated harness. Do not block deploy on the terminal
-        // spinApplication frame there.
+        // Test clusters validate readiness via explicit follow-up probes. Do
+        // not block deploy on the terminal spinApplication frame there.
         if (targetCluster.deploymentMode == MothershipClusterDeploymentMode::test)
         {
           returnAfterInitialSpinOkay = true;
@@ -15026,6 +14977,56 @@ private:
 
             request.test.machineCount = uint32_t(value);
           }
+          else if (testKey.equal("machineLogicalCores"_ctv))
+          {
+            uint64_t value = 0;
+            if ((testField.value.type() != simdjson::dom::element_type::INT64 && testField.value.type() != simdjson::dom::element_type::UINT64) || testField.value.get(value) != simdjson::SUCCESS || value == 0 || value > mothershipTestClusterMachineLogicalCoresMax)
+            {
+              basics_log("createCluster.test.machineLogicalCores invalid\n");
+              exit(EXIT_FAILURE);
+            }
+            request.test.machineLogicalCores = uint32_t(value);
+          }
+          else if (testKey.equal("machineMemoryMB"_ctv))
+          {
+            uint64_t value = 0;
+            if ((testField.value.type() != simdjson::dom::element_type::INT64 && testField.value.type() != simdjson::dom::element_type::UINT64) || testField.value.get(value) != simdjson::SUCCESS || value == 0 || value > mothershipTestClusterMachineMemoryMBMax)
+            {
+              basics_log("createCluster.test.machineMemoryMB invalid\n");
+              exit(EXIT_FAILURE);
+            }
+            request.test.machineMemoryMB = uint32_t(value);
+          }
+          else if (testKey.equal("machineStorageMB"_ctv))
+          {
+            uint64_t value = 0;
+            if ((testField.value.type() != simdjson::dom::element_type::INT64 && testField.value.type() != simdjson::dom::element_type::UINT64) || testField.value.get(value) != simdjson::SUCCESS || value == 0 || value > mothershipTestClusterMachineStorageMBMax)
+            {
+              basics_log("createCluster.test.machineStorageMB invalid\n");
+              exit(EXIT_FAILURE);
+            }
+            request.test.machineStorageMB = uint32_t(value);
+          }
+          else if (testKey.equal("storageDeviceCount"_ctv))
+          {
+            uint64_t value = 0;
+            if ((testField.value.type() != simdjson::dom::element_type::INT64 && testField.value.type() != simdjson::dom::element_type::UINT64) || testField.value.get(value) != simdjson::SUCCESS || value > mothershipTestClusterStorageDeviceCountMax)
+            {
+              basics_log("createCluster.test.storageDeviceCount invalid\n");
+              exit(EXIT_FAILURE);
+            }
+            request.test.storageDeviceCount = uint32_t(value);
+          }
+          else if (testKey.equal("storageDeviceMB"_ctv))
+          {
+            uint64_t value = 0;
+            if ((testField.value.type() != simdjson::dom::element_type::INT64 && testField.value.type() != simdjson::dom::element_type::UINT64) || testField.value.get(value) != simdjson::SUCCESS || value == 0 || value > mothershipTestClusterMachineStorageMBMax)
+            {
+              basics_log("createCluster.test.storageDeviceMB invalid\n");
+              exit(EXIT_FAILURE);
+            }
+            request.test.storageDeviceMB = uint32_t(value);
+          }
           else if (testKey.equal("brainBootstrapFamily"_ctv))
           {
             if (testField.value.type() != simdjson::dom::element_type::STRING)
@@ -15069,49 +15070,6 @@ private:
             }
 
             request.test.interContainerMTU = uint32_t(value);
-          }
-          else if (testKey.equal("host"_ctv))
-          {
-            if (testField.value.type() != simdjson::dom::element_type::OBJECT)
-            {
-              basics_log("createCluster.test.host requires object\n");
-              exit(EXIT_FAILURE);
-            }
-
-            for (auto hostField : testField.value.get_object())
-            {
-              String hostKey;
-              hostKey.setInvariant(hostField.key.data(), hostField.key.size());
-
-              if (hostKey.equal("mode"_ctv))
-              {
-                if (hostField.value.type() != simdjson::dom::element_type::STRING)
-                {
-                  basics_log("createCluster.test.host.mode requires string\n");
-                  exit(EXIT_FAILURE);
-                }
-
-                String mode = {};
-                mode.setInvariant(hostField.value.get_c_str());
-                if (parseMothershipClusterTestHostMode(mode, request.test.host.mode) == false)
-                {
-                  basics_log("createCluster.test.host.mode invalid\n");
-                  exit(EXIT_FAILURE);
-                }
-              }
-              else if (hostKey.equal("ssh"_ctv))
-              {
-                if (parseClusterMachineSSHJSON(hostField.value, request.test.host.ssh, "createCluster.test.host.ssh") == false)
-                {
-                  exit(EXIT_FAILURE);
-                }
-              }
-              else
-              {
-                basics_log("createCluster.test.host invalid field\n");
-                exit(EXIT_FAILURE);
-              }
-            }
           }
           else
           {
@@ -15411,194 +15369,6 @@ private:
 #endif
     basics_log("createCluster success=1 created=1\n");
     printManagedCluster(stored);
-  }
-
-  void runConfigureTestCluster(int argc, char *argv[])
-  {
-    if (argc != 13)
-    {
-      basics_log("wrong number of arguments. ex: configureTestCluster [workspaceRoot] [machineCount] [nBrains] [brainBootstrapFamily] [enableFakeIpv4Boundary:0|1] [interContainerMTU] [datacenterFragment] [autoscaleIntervalSeconds] [schema] [kind] [nLogicalCores] [nMemoryMB] [nStorageMB]\n");
-      exit(EXIT_FAILURE);
-    }
-
-    auto parseUnsigned = [](const char *text, uint64_t maxValue, const char *fieldName) -> uint64_t {
-      if (text == nullptr || text[0] == '\0')
-      {
-        basics_log("configureTestCluster.%s required\n", fieldName);
-        exit(EXIT_FAILURE);
-      }
-
-      errno = 0;
-      char *end = nullptr;
-      unsigned long long value = std::strtoull(text, &end, 10);
-      if (errno != 0 || end == text || *end != '\0' || value > maxValue)
-      {
-        basics_log("configureTestCluster.%s invalid\n", fieldName);
-        exit(EXIT_FAILURE);
-      }
-
-      return uint64_t(value);
-    };
-
-    auto readDevEnvString = [](const char *name, String& value) {
-      const char *text = std::getenv(name);
-      if (text != nullptr && text[0] != '\0')
-      {
-        value.assign(text);
-      }
-    };
-
-    auto readDevEnvUnsigned = [](const char *name, uint64_t maxValue, uint32_t& value) {
-      const char *text = std::getenv(name);
-      if (text == nullptr || text[0] == '\0')
-      {
-        return;
-      }
-
-      errno = 0;
-      char *end = nullptr;
-      unsigned long long parsed = std::strtoull(text, &end, 10);
-      if (errno != 0 || end == text || *end != '\0' || parsed > maxValue)
-      {
-        basics_log("configureTestCluster.%s invalid\n", name);
-        exit(EXIT_FAILURE);
-      }
-
-      value = uint32_t(parsed);
-    };
-
-    String workspaceRoot;
-    workspaceRoot.assign(argv[0]);
-    uint32_t machineCount = uint32_t(parseUnsigned(argv[1], UINT32_MAX, "machineCount"));
-    uint32_t nBrains = uint32_t(parseUnsigned(argv[2], UINT32_MAX, "nBrains"));
-
-    String family;
-    family.assign(argv[3]);
-    MothershipClusterTestBootstrapFamily brainBootstrapFamily = MothershipClusterTestBootstrapFamily::ipv4;
-    if (parseMothershipClusterTestBootstrapFamily(family, brainBootstrapFamily) == false)
-    {
-      basics_log("configureTestCluster.brainBootstrapFamily invalid\n");
-      exit(EXIT_FAILURE);
-    }
-
-    uint64_t enableFakeIpv4BoundaryValue = parseUnsigned(argv[4], 1, "enableFakeIpv4Boundary");
-    uint32_t interContainerMTU = uint32_t(parseUnsigned(argv[5], UINT32_MAX, "interContainerMTU"));
-    uint8_t datacenterFragment = uint8_t(parseUnsigned(argv[6], UINT8_MAX, "datacenterFragment"));
-    uint32_t autoscaleIntervalSeconds = uint32_t(parseUnsigned(argv[7], 86'400, "autoscaleIntervalSeconds"));
-
-    String schema;
-    schema.assign(argv[8]);
-    if (schema.size() == 0)
-    {
-      basics_log("configureTestCluster.schema required\n");
-      exit(EXIT_FAILURE);
-    }
-
-    String kindText;
-    kindText.assign(argv[9]);
-    MachineConfig::MachineKind machineKind = MachineConfig::MachineKind::bareMetal;
-    if (parseMachineKind(kindText, machineKind) == false)
-    {
-      basics_log("configureTestCluster.kind invalid\n");
-      exit(EXIT_FAILURE);
-    }
-
-    MachineConfig machineConfig = {};
-    machineConfig.slug = schema;
-    machineConfig.kind = machineKind;
-    machineConfig.nLogicalCores = uint32_t(parseUnsigned(argv[10], UINT32_MAX, "nLogicalCores"));
-    machineConfig.nMemoryMB = uint32_t(parseUnsigned(argv[11], UINT32_MAX, "nMemoryMB"));
-    machineConfig.nStorageMB = uint32_t(parseUnsigned(argv[12], UINT32_MAX, "nStorageMB"));
-
-    MothershipProdigyCluster cluster = {};
-    cluster.name = "configure-test-cluster"_ctv;
-    cluster.deploymentMode = MothershipClusterDeploymentMode::test;
-    cluster.architecture = nametagCurrentBuildMachineArchitecture();
-    cluster.datacenterFragment = datacenterFragment;
-    cluster.autoscaleIntervalSeconds = autoscaleIntervalSeconds;
-    cluster.nBrains = nBrains;
-    cluster.test.specified = true;
-    cluster.test.host.mode = MothershipClusterTestHostMode::local;
-    cluster.test.workspaceRoot = workspaceRoot;
-    cluster.test.machineCount = machineCount;
-    cluster.test.brainBootstrapFamily = brainBootstrapFamily;
-    cluster.test.enableFakeIpv4Boundary = (enableFakeIpv4BoundaryValue != 0);
-    cluster.test.interContainerMTU = interContainerMTU;
-    OperatingSystemUpdatePolicy osUpdatePolicy = {};
-    uint32_t osUpdatesEnabled = cluster.osUpdatesEnabled ? 1u : 0u;
-    readDevEnvUnsigned("PRODIGY_DEV_CONFIGURE_OS_UPDATES_ENABLED", 1, osUpdatesEnabled);
-    cluster.osUpdatesEnabled = (osUpdatesEnabled != 0);
-    const char *policyJSON = std::getenv("PRODIGY_DEV_CONFIGURE_OS_UPDATE_POLICIES_JSON");
-    if (policyJSON != nullptr && policyJSON[0] != '\0')
-    {
-      if (parseOperatingSystemUpdatePolicyArrayJSONString(
-              policyJSON,
-              cluster.osUpdatePolicies,
-              "PRODIGY_DEV_CONFIGURE_OS_UPDATE_POLICIES_JSON") == false)
-      {
-        exit(EXIT_FAILURE);
-      }
-    }
-    else
-    {
-      readDevEnvString("PRODIGY_DEV_CONFIGURE_TARGET_OS_ID", osUpdatePolicy.osID);
-      readDevEnvString("PRODIGY_DEV_CONFIGURE_TARGET_OS_VERSION_ID", osUpdatePolicy.targetVersionID);
-      readDevEnvString("PRODIGY_DEV_CONFIGURE_OS_UPDATE_COMMAND", osUpdatePolicy.command);
-      uint32_t includeVMsInOSUpdates = osUpdatePolicy.includeVMs ? 1u : 0u;
-      readDevEnvUnsigned("PRODIGY_DEV_CONFIGURE_INCLUDE_VMS_IN_OS_UPDATES", 1, includeVMsInOSUpdates);
-      osUpdatePolicy.includeVMs = (includeVMsInOSUpdates != 0);
-      if (osUpdatePolicy.osID.size() > 0 || osUpdatePolicy.targetVersionID.size() > 0 || osUpdatePolicy.command.size() > 0)
-      {
-        cluster.osUpdatePolicies.push_back(osUpdatePolicy);
-      }
-    }
-    readDevEnvUnsigned("PRODIGY_DEV_CONFIGURE_MAX_OS_DRAINS", UINT32_MAX, cluster.maxOSDrains);
-    readDevEnvUnsigned("PRODIGY_DEV_CONFIGURE_MACHINE_UPDATE_CADENCE_MINS", UINT32_MAX, cluster.machineUpdateCadenceMins);
-    basics_log("configureTestCluster os enabled=%d policies=%u firstOSID=%s firstTargetVersionID=%s firstCommandBytes=%zu maxOSDrains=%u cadenceMins=%u\n",
-               int(cluster.osUpdatesEnabled),
-               unsigned(cluster.osUpdatePolicies.size()),
-               osUpdatePolicy.osID.c_str(),
-               osUpdatePolicy.targetVersionID.c_str(),
-               size_t(osUpdatePolicy.command.size()),
-               unsigned(cluster.maxOSDrains),
-               unsigned(cluster.machineUpdateCadenceMins));
-
-    String failure;
-    MothershipProdigyCluster normalizedCluster = {};
-    if (MothershipClusterRegistry::validateClusterForStorage(cluster, normalizedCluster, &failure) == false)
-    {
-      basics_log("configureTestCluster success=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
-      exit(EXIT_FAILURE);
-    }
-
-    BrainConfig config = {};
-    if (mothershipBuildClusterBrainConfig(normalizedCluster, nullptr, config, &failure) == false)
-    {
-      basics_log("configureTestCluster success=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
-      exit(EXIT_FAILURE);
-    }
-    basics_log("configureTestCluster brainconfig os enabled=%d policies=%u maxOSDrains=%u cadenceMins=%u\n",
-               int(config.osUpdatesEnabled),
-               unsigned(config.osUpdatePolicies.size()),
-               unsigned(config.maxOSDrains),
-               unsigned(config.machineUpdateCadenceMins));
-
-    config.configBySlug.insert_or_assign(schema, machineConfig);
-
-    ClusterCreateHooks hooks(this);
-    if (hooks.configureSeedCluster(normalizedCluster, config, &failure) == false)
-    {
-      basics_log("configureTestCluster success=0 failure=%s\n", (failure.size() ? failure.c_str() : ""));
-      exit(EXIT_FAILURE);
-    }
-
-    String clusterUUIDHex;
-    clusterUUIDHex.assignItoh(normalizedCluster.clusterUUID);
-    basics_log("configureTestCluster success=1 name=%s clusterUUID=%s datacenterFragment=%u machineSchema=%s\n",
-               normalizedCluster.name.c_str(),
-               clusterUUIDHex.c_str(),
-               unsigned(normalizedCluster.datacenterFragment),
-               schema.c_str());
   }
 
   void runPrintClusters(int argc, char *argv[])
@@ -17612,7 +17382,6 @@ public:
         {"acme-present-dns-01",             &Mothership::runACMEPresentDNS01ChallengeHook  },
         {"applicationReport",               &Mothership::runApplicationReport              },
         {"clusterReport",                   &Mothership::runClusterReport                  },
-        {"configureTestCluster",            &Mothership::runConfigureTestCluster           },
         {"createCluster",                   &Mothership::runCreateCluster                  },
         {"createProviderCredential",        &Mothership::runCreateProviderCredential       },
         {"deleteDNSBinding",                &Mothership::runDeleteDNSBinding               },
@@ -17622,8 +17391,10 @@ public:
         {"destroyProviderClusterMachines",  &Mothership::runDestroyProviderClusterMachines },
         {"destroyProviderMachines",         &Mothership::runDestroyProviderMachines        },
         {"estimateClusterHourlyCost",       &Mothership::runEstimateClusterHourlyCost      },
+        {"faultTestCluster",                &Mothership::runFaultTestCluster               },
         {"mintClientTlsIdentity",           &Mothership::runMintClientTlsIdentity          },
         {"printClusters",                   &Mothership::runPrintClusters                  },
+        {"probeTestCluster",                &Mothership::runProbeTestCluster               },
         {"pullDNSBindings",                 &Mothership::runPullDNSBindings                },
         {"pullProviderCredential",          &Mothership::runPullProviderCredential         },
         {"pullProviderCredentials",         &Mothership::runPullProviderCredentials        },
@@ -17684,7 +17455,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, configureTestCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, taskReport, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
+        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultTestCluster, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, taskReport, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }
@@ -17720,15 +17491,17 @@ int main(int argc, char *argv[])
     message.append("createCluster [json|-|@path]\n");
     message.append("\tcreates a managed Prodigy cluster record, assigns a clusterUUID, and uses providerCredentialName or an inline providerCredentialOverride secret block\n");
     message.append("\toptionally enables one cluster DNS provider and ACME with dnsProvider plus acme.accountEmail/acme.termsAgreed; see prodigy/docs/dns-providers.md\n");
-    message.append("\tfor persistent fake clusters, prefer deploymentMode=test instead of invoking prodigy_dev_netns_harness.sh directly\n");
-    message.append("configureTestCluster [workspaceRoot] [machineCount] [nBrains] [brainBootstrapFamily] [enableFakeIpv4Boundary:0|1] [interContainerMTU] [datacenterFragment] [autoscaleIntervalSeconds] [schema] [kind] [nLogicalCores] [nMemoryMB] [nStorageMB]\n");
-    message.append("\tvalidates a disposable test-cluster config, derives BrainConfig, and sends one configure request to the synthesized test control socket without persisting cluster state\n");
+    message.append("\tdeploymentMode=test creates a Mothership-managed virtual datacenter\n");
     message.append("printClusters\n");
     message.append("\tlists all managed Prodigy cluster records with their clusterUUIDs\n");
     message.append("setLocalClusterMembership [name|clusterUUID] [json]\n");
     message.append("\trequires deploymentMode=local and atomically replaces the stored local membership spec with exact json fields includeLocalMachine and machines before reconciling and persisting on live success\n");
     message.append("setTestClusterMachineCount [name|clusterUUID] [json]\n");
     message.append("\trequires deploymentMode=test and updates only test.machineCount through exact json field machineCount before restarting/reconciling and persisting on live success\n");
+    message.append("faultTestCluster [name|clusterUUID] [link|crash|flap] [machine indices csv] [durationMs] [cycles] [downMs] [upMs]\n");
+    message.append("\trequests a bounded virtual-datacenter machine fault through the Mothership-owned test provider\n");
+    message.append("probeTestCluster [name|clusterUUID] [address] [port] [payload] [expected] [timeoutMs] [sourceMachineIndex: 0=datacenter]\n");
+    message.append("\truns a bounded application traffic probe through the Mothership-owned test provider\n");
     message.append("upsertMachineSchemas [name|clusterUUID] [json object|array]\n");
     message.append("\tremote clusters only; creates or partially overwrites machine schema budget rows keyed by schema, then reconciles created capacity to match\n");
     message.append("deltaMachineBudget [name|clusterUUID] [json]\n");

@@ -244,13 +244,28 @@ static bool stringContains(const String& haystack, const char *needle)
 template <class Operation>
 static bool runDNSProviderOperation(Operation&& operation)
 {
-  CoroutineStack coroutine;
+  RingDispatcher dispatcher;
+  Ring::interfacer = &dispatcher;
+  Ring::lifecycler = &dispatcher;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  ScopedFreshRing ring = {};
+  CoroutineStack coroutine = {};
   bool complete = false;
   bool success = false;
   [&]() -> void {
     success = co_await operation(&coroutine);
     complete = true;
+    Ring::exit = true;
   }();
+  if (complete == false)
+  {
+    Ring::start();
+  }
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
   return complete && success;
 }
 
@@ -2377,6 +2392,7 @@ int main(void)
       Container container {};
       container.artifactRootPath.assign(artifactRoot.path);
       container.userID = uint32_t(fixtureWritableUserID());
+      container.executionHostID = uint32_t(fixtureWritableUserID());
 
       String failure = {};
       bool prepared = ContainerManager::debugPrepareContainerRootFSMountTargets(&container, &failure);
@@ -2446,14 +2462,18 @@ int main(void)
 
     if (pipeFDs[0] >= 0 && pipeFDs[1] >= 0)
     {
-      int movedFD = pipeFDs[1];
+      const int originalFD = pipeFDs[1];
+      const bool moveRequired = originalFD < containerExecInheritedFDMinimum;
+      int movedFD = originalFD;
       String failure = {};
       bool moved = ContainerManager::debugMoveContainerExecDescriptorAboveMinimum(movedFD, &failure);
-      suite.expect(moved, "container_exec_fd_move_rehomes_low_fd");
+      suite.expect(moved, "container_exec_fd_move_succeeds");
       suite.expect(failure.size() == 0, "container_exec_fd_move_success_clears_failure");
       suite.expect(movedFD >= containerExecInheritedFDMinimum, "container_exec_fd_move_places_fd_above_minimum");
       suite.expect(fcntl(movedFD, F_GETFD) >= 0, "container_exec_fd_move_preserves_rehomed_fd");
-      suite.expect(fcntl(pipeFDs[1], F_GETFD) < 0 && errno == EBADF, "container_exec_fd_move_closes_original_fd");
+      suite.expect(moveRequired == false || movedFD != originalFD, "container_exec_fd_move_rehomes_low_fd");
+      suite.expect(moveRequired == false || (fcntl(originalFD, F_GETFD) < 0 && errno == EBADF), "container_exec_fd_move_closes_original_low_fd");
+      suite.expect(moveRequired || movedFD == originalFD, "container_exec_fd_move_preserves_already_high_fd");
       close(pipeFDs[0]);
       close(movedFD);
     }
@@ -4669,6 +4689,7 @@ int main(void)
 
     Whitehole candidate = existing;
     candidate.transport = ExternalAddressTransport::quic;
+    candidate.source = ExternalAddressSource::hostPublicAddress;
     candidate.sourcePort = 0;
     candidate.bindingNonce = 0;
 
@@ -8591,7 +8612,7 @@ int main(void)
     suite.expect(deployment.statelessCompactionDonorIsQuiescent() == false, "statelessCompactionDonorIsQuiescent_compaction_wait_false");
     deployment.waitingOnCompactions = false;
 
-    CoroutineStack coro;
+    CoroutineStack coro = {};
     deployment.schedulingStack.execution = &coro;
     suite.expect(deployment.statelessCompactionDonorIsQuiescent() == false, "statelessCompactionDonorIsQuiescent_active_scheduler_false");
     deployment.schedulingStack.execution = nullptr;

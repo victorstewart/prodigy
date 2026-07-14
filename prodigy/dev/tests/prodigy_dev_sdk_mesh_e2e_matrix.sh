@@ -121,23 +121,10 @@ then
 fi
 
 tmpdir="$(mktemp -d)"
-containers_dir_created=0
-containers_mount_created=0
-containers_loop_image=""
 
 cleanup()
 {
    set +e
-
-   if [[ "${containers_mount_created}" -eq 1 ]]
-   then
-      umount /containers >/dev/null 2>&1 || true
-   fi
-
-   if [[ "${containers_dir_created}" -eq 1 ]]
-   then
-      rmdir /containers >/dev/null 2>&1 || true
-   fi
 
    if [[ "${keep_tmp}" == "1" ]]
    then
@@ -200,36 +187,6 @@ ensure_prodigy_bundle()
 }
 
 ensure_prodigy_bundle
-
-if [[ ! -d /containers ]]
-then
-   mkdir -p /containers
-   containers_dir_created=1
-fi
-
-containers_fs_type="$(stat -f -c '%T' /containers 2>/dev/null || echo unknown)"
-if [[ "${containers_fs_type}" != "btrfs" ]]
-then
-   if awk '$2 == "/containers" { found = 1 } END { exit(found ? 0 : 1) }' /proc/self/mounts
-   then
-      echo "FAIL: /containers is mounted but not btrfs (found ${containers_fs_type})"
-      exit 1
-   fi
-
-   if ! prodigy_dev_containers_root_is_safely_overmountable /containers
-   then
-      echo "FAIL: /containers exists on non-btrfs fs and is not safely overmountable"
-      exit 1
-   fi
-
-   containers_loop_image="${tmpdir}/containers.loop.img"
-   truncate -s 6G "${containers_loop_image}"
-   mkfs.btrfs -f "${containers_loop_image}" >/dev/null
-   mount -o loop "${containers_loop_image}" /containers
-   containers_mount_created=1
-fi
-
-mkdir -p /containers/store /containers/storage
 
 build_discombobulator_binary()
 {
@@ -1083,12 +1040,6 @@ run_language_suite()
             cp -a "${workspace_root}" "${archive_root}/workspace" >/dev/null 2>&1 || true
          fi
 
-         if [[ -d /containers ]]
-         then
-            find /containers -maxdepth 8 -type f \
-               \( -name "bootstage.txt" -o -name "crashreport.txt" -o -name "aegis.hash.log" -o -name "params.dump" -o -name "readytrace.log" -o -name "stdout.log" -o -name "stderr.log" \) \
-               -exec cp --parents -t "${archive_root}" {} + >/dev/null 2>&1 || true
-         fi
       }
 
       dump_language_runtime_context()
@@ -1125,23 +1076,12 @@ run_language_suite()
             fi
          done
 
-         if compgen -G "${workspace_root}/logs/brain*.stdout.log" >/dev/null
+         if compgen -G "${workspace_root}/logs/machine*.stdout.log" >/dev/null
          then
-            for brain_log in "${workspace_root}"/logs/brain*.stdout.log
+            for node_log in "${workspace_root}"/logs/machine*.stdout.log
             do
-               echo "brain log tail: ${brain_log}" >&2
-               tail -n 160 "${brain_log}" >&2 || true
-            done
-         fi
-
-         if [[ -d /containers ]]
-         then
-            find /containers -maxdepth 8 -type f \
-               \( -name "bootstage.txt" -o -name "crashreport.txt" -o -name "aegis.hash.log" -o -name "params.dump" -o -name "readytrace.log" -o -name "stdout.log" -o -name "stderr.log" \) \
-               -print 2>/dev/null | sort | while IFS= read -r artifact
-            do
-               echo "container artifact: ${artifact}" >&2
-               sed -n '1,160p' "${artifact}" >&2 || true
+               echo "node log tail: ${node_log}" >&2
+               tail -n 160 "${node_log}" >&2 || true
             done
          fi
       }
@@ -1152,7 +1092,7 @@ run_language_suite()
          archive_language_runtime_context
          if [[ "${cluster_created}" -eq 1 ]]
          then
-            env PRODIGY_MOTHERSHIP_TEST_HARNESS="${HARNESS}" \
+            env \
                PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
                "${MOTHERSHIP_BIN}" removeCluster "${cluster_name}" >/dev/null 2>&1 || true
          fi
@@ -1188,17 +1128,14 @@ run_language_suite()
     "workspaceRoot": "${workspace_root}",
     "machineCount": ${sdk_mesh_machine_count},
     "brainBootstrapFamily": "ipv4",
-    "enableFakeIpv4Boundary": ${sdk_mesh_enable_fake_ipv4_boundary},
-    "host": {
-      "mode": "local"
-    }
+    "enableFakeIpv4Boundary": ${sdk_mesh_enable_fake_ipv4_boundary}
   }
 }
 EOF
 
       echo "=== SDK_MESH_E2E ${language} cluster=${cluster_name} ==="
 
-      if ! env PRODIGY_MOTHERSHIP_TEST_HARNESS="${HARNESS}" \
+      if ! env \
          PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
          "${MOTHERSHIP_BIN}" createCluster "${create_request}" \
          >"${create_log}" 2>&1
