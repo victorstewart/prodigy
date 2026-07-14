@@ -43,6 +43,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
       MothershipTopic::cleanupACMEDNS01Challenge,
       MothershipTopic::importACMELineage,
       MothershipTopic::configureMothershipTunnelProvider,
+      MothershipTopic::pullContainerLogs,
   };
 
   std::vector<uint8_t> bytes(data, data + size);

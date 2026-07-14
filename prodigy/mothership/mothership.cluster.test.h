@@ -41,12 +41,11 @@ static inline bool mothershipTestClusterWorkspaceRootValid(const String& workspa
 
 static inline void mothershipResolveTestClusterControlSocketPath(const MothershipProdigyCluster& cluster, String& path)
 {
-  path.assign(cluster.test.workspaceRoot);
-  if (path.size() > 0 && path[path.size() - 1] != '/')
-  {
-    path.append("/"_ctv);
-  }
-  path.append("prodigy-mothership.sock"_ctv);
+  String clusterUUID = {};
+  clusterUUID.assignItoh(cluster.clusterUUID);
+  path.assign("/tmp/prodigy-vdc-"_ctv);
+  path.append(clusterUUID);
+  path.append("/mothership.sock"_ctv);
 }
 
 static inline void mothershipResolveTestClusterManifestPath(const MothershipProdigyCluster& cluster, String& path)

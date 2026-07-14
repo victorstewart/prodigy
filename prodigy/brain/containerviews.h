@@ -207,7 +207,10 @@ public:
 
   bool readyForSubscriptionPairingNotifications(void) const override
   {
-    return runtimeReady || (state == ContainerState::healthy && canProxySendToNeuron());
+    return canProxySendToNeuron() &&
+           (state == ContainerState::scheduled ||
+            state == ContainerState::healthy ||
+            state == ContainerState::crashedRestarting);
   }
 
   void clearStatefulTopologyCutoverBarrier(void)

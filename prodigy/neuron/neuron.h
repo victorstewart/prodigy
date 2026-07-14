@@ -1830,7 +1830,7 @@ protected:
           }
 
           if (container->plan.applyAdvertisementPairing(AdvertisementPairing(secret, address, service), activate) &&
-              container->syncDeclaredNetworkPairingPolicy() == false)
+              container->syncDeclaredNetworkPairingPolicy(activate == false) == false)
           {
             basics_log("neuron advertisementPairing network policy sync failed containerUUID=%llu\n",
                        (unsigned long long)container->plan.uuid);
@@ -1879,7 +1879,7 @@ protected:
           }
 
           if (container->plan.applySubscriptionPairing(SubscriptionPairing(secret, address, service, port), activate) &&
-              container->syncDeclaredNetworkPairingPolicy() == false)
+              container->syncDeclaredNetworkPairingPolicy(activate == false) == false)
           {
             basics_log("neuron subscriptionPairing network policy sync failed containerUUID=%llu\n",
                        (unsigned long long)container->plan.uuid);
@@ -3038,6 +3038,26 @@ public:
         }
       }
 
+      ContainerLogsOperation outputLogs = {};
+      outputLogs.applicationID = container->plan.config.applicationID;
+      outputLogs.containerUUID = containerUUID;
+      outputLogs.maximumBytes = 8192;
+      outputLogs.includeFailed = false;
+      if (ContainerManager::collectContainerLogs(outputLogs) && outputLogs.entries.size() == 1)
+      {
+        auto appendOutputLog = [&](StringType auto&& label, const String& output) {
+          if (output.size() > 0)
+          {
+            crashReport.append("\n"_ctv);
+            crashReport.append(label);
+            crashReport.append("\n"_ctv);
+            crashReport.append(output);
+          }
+        };
+        appendOutputLog("stderr:"_ctv, outputLogs.entries.front().standardError);
+        appendOutputLog("stdout:"_ctv, outputLogs.entries.front().standardOutput);
+      }
+
       uint64_t previewBytes = (crashReport.size() < 1024) ? crashReport.size() : 1024;
       String preview;
       preview.reserve(previewBytes + 1);
@@ -3795,6 +3815,26 @@ public:
 
           break;
         }
+      case NeuronTopic::pullContainerLogs:
+        {
+          String serialized = {};
+          Message::extractToStringView(args, serialized);
+          ContainerLogsOperation operation = {};
+          if (serialized.size() > containerLogsMaximumWireBytes ||
+              BitseryEngine::deserializeSafe(serialized, operation) == false || operation.requestID == 0)
+          {
+            break;
+          }
+          (void)ContainerManager::collectContainerLogs(operation);
+          String response = {};
+          BitseryEngine::serialize(response, operation);
+          if (brain != nullptr && streamIsActive(brain))
+          {
+            Message::construct(brain->wBuffer, NeuronTopic::pullContainerLogs, response);
+            Ring::queueSend(brain);
+          }
+          break;
+        }
       case NeuronTopic::requestContainerBlob:
         {
           // deploymentID(8) containerBlob{4}
@@ -4226,7 +4266,7 @@ public:
 
             if (changed)
             {
-              if (container->syncDeclaredNetworkPairingPolicy() == false)
+              if (container->syncDeclaredNetworkPairingPolicy(activate == false) == false)
               {
                 basics_log("neuron advertisementPairing network policy sync failed containerUUID=%llu\n",
                            (unsigned long long)containerUUID);
@@ -4322,7 +4362,7 @@ public:
 
             if (changed)
             {
-              if (container->syncDeclaredNetworkPairingPolicy() == false)
+              if (container->syncDeclaredNetworkPairingPolicy(activate == false) == false)
               {
                 basics_log("neuron subscriptionPairing network policy sync failed containerUUID=%llu\n",
                            (unsigned long long)containerUUID);

@@ -1089,6 +1089,43 @@ int main(void)
         ProdigyIngressValidation::validateNeuronPayloadForNeuron(message->topic, message->args, message->terminal()),
         "task_attempt_terminal_ack_valid_for_neuron");
 
+    ContainerLogsOperation logs = {};
+    logs.requestID = 71;
+    logs.applicationID = 16;
+    logs.maximumBytes = 4096;
+    logs.success = true;
+    ContainerLogEntry& logEntry = logs.entries.emplace_back();
+    logEntry.machineUUID = uint128_t(0x7111);
+    logEntry.containerUUID = uint128_t(0x7222);
+    logEntry.capturedAtMs = 7300;
+    logEntry.running = true;
+    logEntry.standardOutput.assign("stdout\n"_ctv);
+    logEntry.standardError.assign("stderr\n"_ctv);
+    encoded.clear();
+    BitseryEngine::serialize(encoded, logs);
+    ContainerLogsOperation decodedLogs = {};
+    suite.expect(
+        BitseryEngine::deserializeSafe(encoded, decodedLogs) &&
+            decodedLogs.requestID == logs.requestID && decodedLogs.applicationID == logs.applicationID &&
+            decodedLogs.entries.size() == 1 && decodedLogs.entries[0].machineUUID == logEntry.machineUUID &&
+            decodedLogs.entries[0].containerUUID == logEntry.containerUUID &&
+            decodedLogs.entries[0].standardOutput.equal(logEntry.standardOutput) &&
+            decodedLogs.entries[0].standardError.equal(logEntry.standardError),
+        "container_logs_operation_roundtrip_wire");
+    frame.clear();
+    Message::construct(frame, MothershipTopic::pullContainerLogs, encoded);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(
+        ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()),
+        "container_logs_operation_valid_for_mothership");
+    frame.clear();
+    Message::construct(frame, NeuronTopic::pullContainerLogs, encoded);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(
+        ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal()) &&
+            ProdigyIngressValidation::validateNeuronPayloadForNeuron(message->topic, message->args, message->terminal()),
+        "container_logs_operation_valid_bidirectionally_for_neuron");
+
     String taskResult;
     taskResult.assign("ok"_ctv);
     suite.expect(

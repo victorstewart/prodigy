@@ -43,7 +43,8 @@ enum class MothershipTopic : uint16_t {
   cleanupACMEDNS01Challenge,
   importACMELineage,
   configureMothershipTunnelProvider,
-  pullTaskReport
+  pullTaskReport,
+  pullContainerLogs
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -108,6 +109,8 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "configureMothershipTunnelProvider";
     case MothershipTopic::pullTaskReport:
       return "pullTaskReport";
+    case MothershipTopic::pullContainerLogs:
+      return "pullContainerLogs";
   }
 
   return "unknown";
@@ -177,7 +180,8 @@ enum class NeuronTopic : uint16_t {
   openSwitchboardWhiteholes,
   closeSwitchboardWhiteholesToContainer,
   taskAttemptTerminal,
-  taskAttemptTerminalAck
+  taskAttemptTerminalAck,
+  pullContainerLogs
 };
 
 enum class ContainerTopic : uint16_t {

@@ -266,6 +266,7 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
     case MothershipTopic::cleanupACMEDNS01Challenge:
     case MothershipTopic::importACMELineage:
     case MothershipTopic::configureMothershipTunnelProvider:
+    case MothershipTopic::pullContainerLogs:
       {
         return consumeVariable(cursor, terminal) && cursor == terminal;
       }
@@ -635,6 +636,7 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
         return (cursor == terminal);
       }
     case NeuronTopic::machineHardwareProfile:
+    case NeuronTopic::pullContainerLogs:
       {
         return consumeVariable(cursor, terminal) && cursor == terminal;
       }
@@ -987,6 +989,7 @@ static bool validateNeuronPayloadForNeuron(uint16_t rawTopic, uint8_t *args, uin
         return (cursor == terminal);
       }
     case NeuronTopic::configureRuntimeEnvironment:
+    case NeuronTopic::pullContainerLogs:
       {
         return consumeVariable(cursor, terminal) && cursor == terminal;
       }

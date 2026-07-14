@@ -1606,16 +1606,11 @@ int main(void)
     testDeployCluster.test.workspaceRoot.append("/deploy-test-cluster"_ctv);
     testDeployCluster.test.machineCount = 1;
     std::filesystem::create_directories(std::filesystem::path(testDeployCluster.test.workspaceRoot.c_str()));
-    String testControlPath = {};
-    testControlPath.assign(testDeployCluster.test.workspaceRoot);
-    testControlPath.append("/prodigy-mothership.sock"_ctv);
-    (void)::unlink(testControlPath.c_str());
-    suite.expect(::symlink(testClusterListener.path.c_str(), testControlPath.c_str()) == 0, "deploy_test_cluster_control_alias_created");
+    MothershipProdigyCluster createdTestDeployCluster = {};
     {
       String failure = {};
       MothershipClusterRegistry registry;
-      MothershipProdigyCluster createdCluster = {};
-      bool createdOK = registry.createCluster(testDeployCluster, &createdCluster, &failure);
+      bool createdOK = registry.createCluster(testDeployCluster, &createdTestDeployCluster, &failure);
       suite.expect(createdOK, "deploy_test_cluster_record_created");
       if (createdOK == false)
       {
@@ -1623,6 +1618,11 @@ int main(void)
         return EXIT_FAILURE;
       }
     }
+    String testControlPath = {};
+    mothershipResolveTestClusterControlSocketPath(createdTestDeployCluster, testControlPath);
+    std::filesystem::create_directories(std::filesystem::path(testControlPath.c_str()).parent_path());
+    (void)::unlink(testControlPath.c_str());
+    suite.expect(::symlink(testClusterListener.path.c_str(), testControlPath.c_str()) == 0, "deploy_test_cluster_control_alias_created");
 
     ControlServerState testClusterServer = {};
     std::thread testClusterServerThread([&]() {
@@ -1685,6 +1685,8 @@ int main(void)
     suite.expect(
         stringContains(testClusterDeployOutput, "SpinApplicationResponseCode::okay"),
         "deploy_test_cluster_output_reports_initial_okay");
+    (void)::unlink(testControlPath.c_str());
+    (void)::rmdir(std::filesystem::path(testControlPath.c_str()).parent_path().c_str());
   }
   else
   {

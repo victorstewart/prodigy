@@ -50,6 +50,7 @@ int main(void)
 
   MothershipProdigyCluster cluster = {};
   cluster.name = "virtual-datacenter-unit"_ctv;
+  cluster.clusterUUID = 0x1234;
   cluster.deploymentMode = MothershipClusterDeploymentMode::test;
   cluster.nBrains = 2;
   cluster.machineSchemas.push_back(MothershipProdigyClusterMachineSchema {});
@@ -61,6 +62,14 @@ int main(void)
   cluster.test.storageDeviceMB = 768;
   cluster.test.brainBootstrapFamily = MothershipClusterTestBootstrapFamily::multihome6;
   cluster.test.enableFakeIpv4Boundary = false;
+
+  String controlSocketPath = {};
+  mothershipResolveTestClusterControlSocketPath(cluster, controlSocketPath);
+  suite.expect(controlSocketPath.equals("/tmp/prodigy-vdc-0x1234/mothership.sock"_ctv), "control_socket_path_is_bounded_by_cluster_identity");
+  cluster.test.workspaceRoot = "/tmp/prodigy/a-deliberately-long-test-workspace-name-that-would-overflow-a-linux-unix-socket-path/vdc-unit"_ctv;
+  mothershipResolveTestClusterControlSocketPath(cluster, controlSocketPath);
+  suite.expect(controlSocketPath.equals("/tmp/prodigy-vdc-0x1234/mothership.sock"_ctv), "long_workspace_does_not_expand_control_socket_path");
+  cluster.test.workspaceRoot = "/tmp/prodigy/vdc-unit"_ctv;
 
   ClusterTopology topology = {};
   String failure = {};

@@ -71,6 +71,15 @@ public:
   }
 };
 
+class TestNeuron final : public NeuronBase {
+public:
+
+  void pushContainer(Container *) override {}
+  void popContainer(Container *) override {}
+  bool ensureHostNetworkingReady(String * = nullptr) override { return true; }
+  void downloadContainer(CoroutineStack *, uint64_t) override {}
+};
+
 class TestSuite {
 public:
 
@@ -111,7 +120,9 @@ public:
 
   bool readyForSubscriptionPairingNotifications(void) const override
   {
-    return runtimeReady || state == ContainerState::healthy;
+    return state == ContainerState::scheduled ||
+           state == ContainerState::healthy ||
+           state == ContainerState::crashedRestarting;
   }
 
   void advertisementPairing(uint128_t, uint128_t, uint64_t, uint16_t, bool activate) override
@@ -1272,11 +1283,11 @@ int main(void)
 
     deployment.containerIsRuntimeReady(&advertiser);
     suite.expect(advertiser.advertisementActivations == 1, "container_runtime_ready_advertiser_first_preinstalls_secret");
-    suite.expect(subscriber.subscriptionActivations == 0, "container_runtime_ready_advertiser_first_waits_for_subscriber");
+    suite.expect(subscriber.subscriptionActivations == 1, "container_runtime_ready_advertiser_first_connects_scheduled_subscriber");
 
     deployment.containerIsRuntimeReady(&subscriber);
     suite.expect(advertiser.advertisementActivations == 1, "container_runtime_ready_subscriber_second_does_not_reinstall_secret");
-    suite.expect(subscriber.subscriptionActivations == 1, "container_runtime_ready_subscriber_second_connects_after_secret_preinstall");
+    suite.expect(subscriber.subscriptionActivations == 2, "container_runtime_ready_subscriber_second_replays_subscription_idempotently");
 
     thisBrain = savedBrain;
   }
@@ -2852,6 +2863,81 @@ int main(void)
 
   {
     TemporaryDirectory artifactRoot;
+    suite.expect(artifactRoot.create(), "container_output_log_fixture_artifact_root_created");
+
+    if (artifactRoot.path.size() > 0)
+    {
+      std::filesystem::path artifactRootPath = filesystemPathFromString(artifactRoot.path);
+      std::filesystem::path rootfsPath = artifactRootPath / "rootfs";
+      suite.expect(createDirectoryFixture(artifactRootPath / ".prodigy-private"), "container_output_log_fixture_private_dir_created");
+      suite.expect(createDirectoryFixture(rootfsPath), "container_output_log_fixture_rootfs_dir_created");
+
+      Container container = {};
+      container.plan.uuid = uint128_t(0x7119);
+      container.plan.config.applicationID = 71;
+      container.artifactRootPath.assign(artifactRoot.path);
+      container.rootfsPath.assign(stringFromFilesystemPath(rootfsPath));
+
+      int stdoutFD = -1;
+      int stderrFD = -1;
+      String failure = {};
+      bool prepared = ContainerManager::debugPrepareContainerOutputLogs(
+          &container,
+          stdoutFD,
+          stderrFD,
+          &failure);
+      suite.expect(prepared, "container_output_log_prepare_succeeds");
+      suite.expect(failure.size() == 0, "container_output_log_prepare_clears_failure");
+
+      const char stdoutPayload[] = "stdout-before-read-only\n";
+      const char stderrPayload[] = "stderr-before-read-only\n";
+      bool wrote = prepared &&
+                   chmod((rootfsPath / "logs" / "stdout.log").c_str(), S_IRUSR) == 0 &&
+                   chmod((rootfsPath / "logs" / "stderr.log").c_str(), S_IRUSR) == 0 &&
+                   write(stdoutFD, stdoutPayload, sizeof(stdoutPayload) - 1) == ssize_t(sizeof(stdoutPayload) - 1) &&
+                   write(stderrFD, stderrPayload, sizeof(stderrPayload) - 1) == ssize_t(sizeof(stderrPayload) - 1);
+      suite.expect(wrote, "container_output_log_descriptors_remain_writable_after_permissions_lock");
+      if (stdoutFD >= 0)
+      {
+        close(stdoutFD);
+      }
+      if (stderrFD >= 0)
+      {
+        close(stderrFD);
+      }
+
+      String capturedStdout = {};
+      String capturedStderr = {};
+      suite.expect(
+          readFileFixture(rootfsPath / "logs" / "stdout.log", capturedStdout) && capturedStdout.equal(stdoutPayload, sizeof(stdoutPayload) - 1),
+          "container_output_log_captures_stdout");
+      suite.expect(
+          readFileFixture(rootfsPath / "logs" / "stderr.log", capturedStderr) && capturedStderr.equal(stderrPayload, sizeof(stderrPayload) - 1),
+          "container_output_log_captures_stderr");
+
+      TestNeuron logNeuron = {};
+      NeuronBase *previousNeuron = thisNeuron;
+      thisNeuron = &logNeuron;
+      logNeuron.containers.insert_or_assign(container.plan.uuid, &container);
+      ContainerLogsOperation logs = {};
+      logs.applicationID = container.plan.config.applicationID;
+      logs.maximumBytes = 1024;
+      logs.includeFailed = false;
+      bool collected = ContainerManager::collectContainerLogs(logs);
+      thisNeuron = previousNeuron;
+      suite.expect(
+          collected && logs.success && logs.entries.size() == 1 && logs.entries[0].running &&
+              logs.entries[0].containerUUID == container.plan.uuid &&
+              logs.entries[0].standardOutput.equal(stdoutPayload, sizeof(stdoutPayload) - 1) &&
+              logs.entries[0].standardError.equal(stderrPayload, sizeof(stderrPayload) - 1),
+          "container_output_logs_available_while_running");
+      (void)chmod((rootfsPath / "logs" / "stdout.log").c_str(), S_IRUSR | S_IWUSR);
+      (void)chmod((rootfsPath / "logs" / "stderr.log").c_str(), S_IRUSR | S_IWUSR);
+    }
+  }
+
+  {
+    TemporaryDirectory artifactRoot;
     TemporaryDirectory retentionRoot;
     suite.expect(artifactRoot.create(), "failed_container_retention_fixture_artifact_root_created");
     suite.expect(retentionRoot.create(), "failed_container_retention_fixture_retention_root_created");
@@ -2885,13 +2971,14 @@ int main(void)
       info.si_status = SIGSEGV;
       info.si_pid = container.pid;
 
+      const int64_t failureTimeMs = Time::now<TimeResolution::ms>();
       String retainedBundlePath = {};
       String failure = {};
       bool preserved = ContainerManager::debugPreserveFailedContainerArtifactsAtPath(
           retentionRoot.path,
           &container,
           info,
-          1'710'000'000'000LL,
+          failureTimeMs,
           SIGSEGV,
           &retainedBundlePath,
           &failure);
@@ -2914,6 +3001,22 @@ int main(void)
       suite.expect(std::filesystem::exists(retainedPath / "launch.metadata"), "failed_container_retention_copies_launch_metadata");
       suite.expect(std::filesystem::exists(retainedPath / "logs" / "stdout.log"), "failed_container_retention_copies_stdout");
       suite.expect(std::filesystem::exists(retainedPath / "logs" / "stderr.log"), "failed_container_retention_copies_stderr");
+
+      TestNeuron logNeuron = {};
+      NeuronBase *previousNeuron = thisNeuron;
+      thisNeuron = &logNeuron;
+      ContainerLogsOperation logs = {};
+      logs.applicationID = container.plan.config.applicationID;
+      logs.maximumBytes = 1024;
+      logs.includeRunning = false;
+      bool collected = ContainerManager::debugCollectContainerLogsAtPath(logs, retentionRoot.path);
+      thisNeuron = previousNeuron;
+      suite.expect(
+          collected && logs.success && logs.entries.size() == 1 && logs.entries[0].running == false &&
+              logs.entries[0].capturedAtMs == failureTimeMs &&
+              logs.entries[0].standardOutput.equal("stdout-line\n"_ctv) &&
+              logs.entries[0].standardError.equal("stderr-line\n"_ctv),
+          "failed_container_retention_logs_are_retrievable");
     }
   }
 

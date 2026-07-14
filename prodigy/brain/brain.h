@@ -1018,11 +1018,24 @@ public:
     RoutableResourceLeaseReport *inlineResponse = nullptr;
     uint32_t outstanding = 0;
   };
+  class PendingContainerLogs
+  {
+  public:
+
+    Mothership *stream = nullptr;
+    uint64_t streamIncarnation = 0;
+    int64_t deadlineMs = 0;
+    uint32_t maximumBytesPerNeuron = 0;
+    ContainerLogsOperation operation;
+    bytell_hash_set<uint128_t> outstandingMachines;
+  };
   bytell_hash_map<uint64_t, PendingDNSOperation> pendingDNSOperations;
   bytell_hash_map<uint64_t, PendingDNSControl> pendingDNSControls;
+  bytell_hash_map<uint64_t, PendingContainerLogs> pendingContainerLogs;
   Vector<RoutableResourceLease> appliedDNSRecordLeases;
   bytell_hash_set<uint64_t> deploymentsWaitingForDNS;
   uint64_t nextDNSOperationOwner = 1;
+  uint64_t nextContainerLogRequestID = 1;
   bytell_hash_map<uint64_t, PendingElasticAddressControlOperation> pendingElasticAddressControlOperations;
   bytell_hash_map<BrainView *, MasterAuthorityReplicationPeerState> masterAuthorityReplicationByPeer;
   CoroutineStack brainInventoryCoroutine;
@@ -1894,6 +1907,213 @@ public:
       (void)flushActiveMothershipSendBuffer(control.stream, "dns-control-complete");
     }
     pendingDNSControls.erase(controlIt);
+  }
+
+  uint64_t mintContainerLogRequestID(void)
+  {
+    uint64_t identifier = nextContainerLogRequestID++;
+    if (identifier == 0)
+    {
+      identifier = nextContainerLogRequestID++;
+    }
+    return identifier;
+  }
+
+  static uint64_t containerLogBytes(const ContainerLogsOperation& operation)
+  {
+    uint64_t bytes = 0;
+    for (const ContainerLogEntry& entry : operation.entries)
+    {
+      bytes += entry.standardOutput.size() + entry.standardError.size();
+    }
+    return bytes;
+  }
+
+  static void appendContainerLogFailure(PendingContainerLogs& pending, uint128_t machineUUID, const String& failure)
+  {
+    if (pending.operation.failure.size() > 0)
+    {
+      pending.operation.failure.append("; "_ctv);
+    }
+    String machine = {};
+    machine.assignItoh(machineUUID);
+    pending.operation.failure.snprintf_add<"machine {}: {}"_ctv>(machine, failure);
+  }
+
+  void finishContainerLogRequest(uint64_t requestID)
+  {
+    auto pendingIt = pendingContainerLogs.find(requestID);
+    if (pendingIt == pendingContainerLogs.end())
+    {
+      return;
+    }
+    PendingContainerLogs& pending = pendingIt->second;
+    pending.operation.success = pending.operation.failure.size() == 0;
+    if (pending.stream != nullptr && activeMotherships.contains(pending.stream) &&
+        pending.stream->connectionIncarnation == pending.streamIncarnation)
+    {
+      String serialized = {};
+      BitseryEngine::serialize(serialized, pending.operation);
+      Message::construct(pending.stream->wBuffer, MothershipTopic::pullContainerLogs, serialized);
+      (void)flushActiveMothershipSendBuffer(pending.stream, "container-logs-complete");
+    }
+    pendingContainerLogs.erase(pendingIt);
+  }
+
+  void beginContainerLogRequest(Mothership *stream, ContainerLogsOperation operation)
+  {
+    bool requestShapeValid = operation.requestID == 0 && operation.success == false &&
+                             operation.failure.size() == 0 && operation.entries.empty();
+    operation.success = false;
+    operation.truncated = false;
+    operation.failure.clear();
+    operation.entries.clear();
+    if (stream == nullptr)
+    {
+      return;
+    }
+    if (requestShapeValid == false || operation.applicationID == 0 || operation.maximumBytes < 1024 ||
+        operation.maximumBytes > containerLogsMaximumBytes ||
+        (operation.includeRunning == false && operation.includeFailed == false))
+    {
+      operation.failure.assign("container log request is invalid"_ctv);
+      String serialized = {};
+      BitseryEngine::serialize(serialized, operation);
+      Message::construct(stream->wBuffer, MothershipTopic::pullContainerLogs, serialized);
+      return;
+    }
+
+    Vector<Machine *> targets = {};
+    for (Machine *machine : machines)
+    {
+      if (machine != nullptr && streamIsActive(&machine->neuron))
+      {
+        targets.push_back(machine);
+      }
+    }
+    if (targets.empty())
+    {
+      operation.failure.assign("no connected neurons are available"_ctv);
+      String serialized = {};
+      BitseryEngine::serialize(serialized, operation);
+      Message::construct(stream->wBuffer, MothershipTopic::pullContainerLogs, serialized);
+      return;
+    }
+
+    operation.requestID = mintContainerLogRequestID();
+    PendingContainerLogs pending = {};
+    pending.stream = stream;
+    pending.streamIncarnation = stream->connectionIncarnation;
+    pending.deadlineMs = Time::now<TimeResolution::ms>() + 15'000;
+    pending.maximumBytesPerNeuron = operation.maximumBytes / uint32_t(targets.size());
+    pending.operation = operation;
+    for (Machine *machine : targets)
+    {
+      pending.outstandingMachines.insert(machine->uuid);
+    }
+    pendingContainerLogs.insert_or_assign(operation.requestID, std::move(pending));
+
+    operation.maximumBytes /= uint32_t(targets.size());
+    String serialized = {};
+    BitseryEngine::serialize(serialized, operation);
+    for (Machine *machine : targets)
+    {
+      machine->queueSend(NeuronTopic::pullContainerLogs, serialized);
+    }
+  }
+
+  void noteContainerLogResponse(NeuronView *neuron, ContainerLogsOperation& response)
+  {
+    auto pendingIt = pendingContainerLogs.find(response.requestID);
+    if (pendingIt == pendingContainerLogs.end() || neuron == nullptr || neuron->machine == nullptr)
+    {
+      return;
+    }
+    PendingContainerLogs& pending = pendingIt->second;
+    uint128_t machineUUID = neuron->machine->uuid;
+    if (pending.outstandingMachines.contains(machineUUID) == false)
+    {
+      return;
+    }
+    pending.outstandingMachines.erase(machineUUID);
+
+    bool entriesValid = true;
+    for (const ContainerLogEntry& entry : response.entries)
+    {
+      entriesValid &= (response.containerUUID == 0 || entry.containerUUID == response.containerUUID) &&
+                      ((entry.running && pending.operation.includeRunning) ||
+                       (entry.running == false && pending.operation.includeFailed));
+    }
+    if (response.applicationID != pending.operation.applicationID ||
+        response.containerUUID != pending.operation.containerUUID ||
+        response.maximumBytes != pending.maximumBytesPerNeuron ||
+        response.includeRunning != pending.operation.includeRunning ||
+        response.includeFailed != pending.operation.includeFailed ||
+        entriesValid == false ||
+        containerLogBytes(response) > pending.maximumBytesPerNeuron)
+    {
+      appendContainerLogFailure(pending, machineUUID, "invalid container log response"_ctv);
+    }
+    else
+    {
+      pending.operation.truncated |= response.truncated;
+      if (response.success == false)
+      {
+        String failure = response.failure.size() ? response.failure : String("container log read failed"_ctv);
+        appendContainerLogFailure(pending, machineUUID, failure);
+      }
+      for (ContainerLogEntry& entry : response.entries)
+      {
+        if (pending.operation.entries.size() >= containerLogsMaximumEntries)
+        {
+          pending.operation.truncated = true;
+          break;
+        }
+        entry.machineUUID = machineUUID;
+        pending.operation.entries.push_back(std::move(entry));
+      }
+    }
+    if (pending.outstandingMachines.empty())
+    {
+      finishContainerLogRequest(response.requestID);
+    }
+  }
+
+  void expireContainerLogRequests(void)
+  {
+    const int64_t nowMs = Time::now<TimeResolution::ms>();
+    Vector<uint64_t> expired = {};
+    for (auto& [requestID, pending] : pendingContainerLogs)
+    {
+      if (pending.deadlineMs <= nowMs)
+      {
+        for (uint128_t machineUUID : pending.outstandingMachines)
+        {
+          appendContainerLogFailure(pending, machineUUID, "container log request timed out"_ctv);
+        }
+        pending.outstandingMachines.clear();
+        expired.push_back(requestID);
+      }
+    }
+    for (uint64_t requestID : expired)
+    {
+      finishContainerLogRequest(requestID);
+    }
+  }
+
+  void clearContainerLogRequestsForStream(Mothership *stream)
+  {
+    for (auto it = pendingContainerLogs.begin(); it != pendingContainerLogs.end();)
+    {
+      if (it->second.stream == stream)
+      {
+        it = pendingContainerLogs.erase(it);
+      }
+      else
+      {
+        ++it;
+      }
+    }
   }
 
   bool enqueueDNSRecordLease(const RoutableResourceLease& lease,
@@ -11366,6 +11586,7 @@ public:
       Mothership *activeMothership = static_cast<Mothership *>(socket);
       basics_log("mothership stream closed weAreMaster=%d\n", int(weAreMaster));
       clearSpinApplicationMothershipsForStream(activeMothership);
+      clearContainerLogRequestsForStream(activeMothership);
       activeMotherships.erase(activeMothership);
       if (mothership == activeMothership)
       {
@@ -11385,6 +11606,7 @@ public:
                  int(weAreMaster),
                  size_t(closingMotherships.size()));
       clearSpinApplicationMothershipsForStream(closingStream);
+      clearContainerLogRequestsForStream(closingStream);
       RingDispatcher::eraseMultiplexee(closingStream);
       closingMotherships.erase(closingStream);
       delete closingStream;
@@ -16646,6 +16868,7 @@ public:
       case BrainTimeoutFlags::brainPeerHeartbeat:
         {
           runBrainPeerHeartbeatTick();
+          expireContainerLogRequests();
           brainPeerHeartbeatTicker.setTimeoutMs(brainPeerHeartbeatIntervalMs);
           Ring::queueTimeout(&brainPeerHeartbeatTicker);
           break;
@@ -17463,6 +17686,7 @@ public:
     }
 
     clearSpinApplicationMothershipsForStream(stream);
+    clearContainerLogRequestsForStream(stream);
     closingMotherships.erase(stream);
 
     activeMotherships.erase(stream);
@@ -24048,6 +24272,23 @@ public:
           Message::construct(mothership->wBuffer, MothershipTopic::pullTaskReport, found, serializedRecord);
           break;
         }
+      case MothershipTopic::pullContainerLogs:
+        {
+          String serialized = {};
+          Message::extractToStringView(args, serialized);
+          ContainerLogsOperation operation = {};
+          if (serialized.size() > containerLogsMaximumWireBytes ||
+              BitseryEngine::deserializeSafe(serialized, operation) == false)
+          {
+            operation.failure.assign("container log request payload is invalid"_ctv);
+            serialized.clear();
+            BitseryEngine::serialize(serialized, operation);
+            Message::construct(mothership->wBuffer, MothershipTopic::pullContainerLogs, serialized);
+            break;
+          }
+          beginContainerLogRequest(mothership, std::move(operation));
+          break;
+        }
       case MothershipTopic::updateProdigy:
         {
           // bundleBlob{4}
@@ -25432,6 +25673,18 @@ public:
           promoteMachineToHealthyIfReady(machine);
           refreshNeuronControlHandshakeWatchdog(neuron, "machine-hardware");
 
+          break;
+        }
+      case NeuronTopic::pullContainerLogs:
+        {
+          String serialized = {};
+          Message::extractToStringView(args, serialized);
+          ContainerLogsOperation operation = {};
+          if (serialized.size() <= containerLogsMaximumWireBytes &&
+              BitseryEngine::deserializeSafe(serialized, operation))
+          {
+            noteContainerLogResponse(neuron, operation);
+          }
           break;
         }
       case NeuronTopic::stateUpload:

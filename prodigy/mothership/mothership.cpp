@@ -3682,6 +3682,8 @@ static bool mothershipStartVirtualDatacenterProvider(const MothershipProdigyClus
   machineStorageMB.assignItoa(cluster.test.machineStorageMB);
   storageDeviceCount.assignItoa(cluster.test.storageDeviceCount);
   storageDeviceMB.assignItoa(cluster.test.storageDeviceMB);
+  String controlSocketPath = {};
+  mothershipResolveTestClusterControlSocketPath(cluster, controlSocketPath);
   Vector<String> arguments = {};
   arguments.emplace_back("--launch"_ctv);
   arguments.push_back(cluster.test.workspaceRoot);
@@ -3695,6 +3697,7 @@ static bool mothershipStartVirtualDatacenterProvider(const MothershipProdigyClus
   arguments.push_back(std::move(machineStorageMB));
   arguments.push_back(std::move(storageDeviceCount));
   arguments.push_back(std::move(storageDeviceMB));
+  arguments.push_back(std::move(controlSocketPath));
   return mothershipRunVirtualDatacenterProvider(std::move(arguments), failure);
 }
 
@@ -3703,6 +3706,8 @@ static bool mothershipStopVirtualDatacenterProvider(const MothershipProdigyClust
   Vector<String> arguments = {};
   arguments.emplace_back("--stop"_ctv);
   arguments.push_back(cluster.test.workspaceRoot);
+  arguments.emplace_back();
+  mothershipResolveTestClusterControlSocketPath(cluster, arguments.back());
   return mothershipRunVirtualDatacenterProvider(std::move(arguments), failure);
 }
 
@@ -12660,6 +12665,116 @@ private:
                unsigned(record.hasFinalAttempt ? record.finalAttempt.termination.result.size() : 0u));
   }
 
+  void runContainerLogs(int argc, char *argv[])
+  {
+    if (argc < 2)
+    {
+      basics_log("too few arguments. ex: containerLogs [target: local|clusterName|clusterUUID] [application name] [maximum bytes]\n");
+      exit(EXIT_FAILURE);
+    }
+    if (configureControlTarget(argv[0]) == false)
+    {
+      exit(EXIT_FAILURE);
+    }
+
+    String name = {};
+    name.setInvariant(argv[1]);
+    uint16_t applicationID = 0;
+    ApplicationIDReserveRequest request = {};
+    request.applicationName = name;
+    request.createIfMissing = false;
+    ApplicationIDReserveResponse response = {};
+    if (socket.requestApplicationID(request, response) && response.success && response.applicationID != 0)
+    {
+      applicationID = response.applicationID;
+    }
+    else if (auto it = MeshRegistry::applicationIDMappings.find(name); it != MeshRegistry::applicationIDMappings.end())
+    {
+      applicationID = it->second;
+    }
+    else
+    {
+      basics_log("application name does not exist in reserved application registry\n");
+      exit(EXIT_FAILURE);
+    }
+
+    uint32_t maximumBytes = containerLogsDefaultMaximumBytes;
+    if (argc > 2)
+    {
+      char *end = nullptr;
+      errno = 0;
+      unsigned long parsed = std::strtoul(argv[2], &end, 10);
+      if (end == argv[2] || *end != '\0' || errno != 0 || parsed < 1024 || parsed > containerLogsMaximumBytes)
+      {
+        basics_log("containerLogs maximum bytes must be between 1024 and %u\n", containerLogsMaximumBytes);
+        exit(EXIT_FAILURE);
+      }
+      maximumBytes = uint32_t(parsed);
+    }
+
+    ContainerLogsOperation operation = {};
+    operation.applicationID = applicationID;
+    operation.maximumBytes = maximumBytes;
+    String serialized = {};
+    BitseryEngine::serialize(serialized, operation);
+    if (socket.ensureConnected() == false)
+    {
+      exit(EXIT_FAILURE);
+    }
+    Message::construct(socket.wBuffer, MothershipTopic::pullContainerLogs, serialized);
+    if (socket.send() == false)
+    {
+      exit(EXIT_FAILURE);
+    }
+    Message *message = socket.recvExpectedTopic(MothershipTopic::pullContainerLogs);
+    if (message == nullptr || MothershipTopic(message->topic) != MothershipTopic::pullContainerLogs)
+    {
+      basics_log("containerLogs failed: unexpected response\n");
+      exit(EXIT_FAILURE);
+    }
+    uint8_t *args = message->args;
+    Message::extractToStringView(args, serialized);
+    if (serialized.size() > containerLogsMaximumWireBytes ||
+        BitseryEngine::deserializeSafe(serialized, operation) == false)
+    {
+      basics_log("containerLogs failed: invalid response\n");
+      exit(EXIT_FAILURE);
+    }
+
+    for (const ContainerLogEntry& entry : operation.entries)
+    {
+      String machine = {};
+      String container = {};
+      machine.assignItoh(entry.machineUUID);
+      container.assignItoh(entry.containerUUID);
+      basics_log("container=%s machine=%s state=%s capturedAtMs=%lld truncated=%u\nstdout:\n",
+                 container.c_str(),
+                 machine.c_str(),
+                 entry.running ? "running" : "failed",
+                 (long long)entry.capturedAtMs,
+                 unsigned(entry.truncated));
+      if (entry.standardOutput.size() > 0)
+      {
+        std::fwrite(entry.standardOutput.data(), 1, entry.standardOutput.size(), stdout);
+      }
+      basics_log("\nstderr:\n");
+      if (entry.standardError.size() > 0)
+      {
+        std::fwrite(entry.standardError.data(), 1, entry.standardError.size(), stdout);
+      }
+      basics_log("\n");
+    }
+    if (operation.truncated)
+    {
+      basics_log("containerLogs truncated=1 maximumBytes=%u\n", operation.maximumBytes);
+    }
+    if (operation.success == false)
+    {
+      basics_log("containerLogs failed: %s\n", operation.failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+  }
+
   bool parseProviderCredentialJSON(simdjson::dom::element doc, MothershipProviderCredential& request, const char *context, bool requireName)
   {
     if (doc.type() != simdjson::dom::element_type::OBJECT)
@@ -17382,6 +17497,7 @@ public:
         {"acme-present-dns-01",             &Mothership::runACMEPresentDNS01ChallengeHook  },
         {"applicationReport",               &Mothership::runApplicationReport              },
         {"clusterReport",                   &Mothership::runClusterReport                  },
+        {"containerLogs",                   &Mothership::runContainerLogs                  },
         {"createCluster",                   &Mothership::runCreateCluster                  },
         {"createProviderCredential",        &Mothership::runCreateProviderCredential       },
         {"deleteDNSBinding",                &Mothership::runDeleteDNSBinding               },
@@ -17455,7 +17571,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultTestCluster, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, taskReport, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
+        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultTestCluster, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, taskReport, containerLogs, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }
@@ -17513,6 +17629,8 @@ int main(int argc, char *argv[])
     message.append("clusterReport [target: local|clusterName|clusterUUID]\n");
     message.append("\tfetches the current cluster-wide machine and application status report from the master brain\n");
     message.append("\tfor stored cluster targets, it also refreshes the cached authoritative topology and refresh metadata in the local cluster registry\n");
+    message.append("containerLogs [target: local|clusterName|clusterUUID] [application name] [maximum bytes]\n");
+    message.append("\tfetches bounded current stdout/stderr and 24-hour retained failure logs through the master Brain and Neurons\n");
     message.append("deploy [target: local|clusterName|clusterUUID] [deployment plan json] [path to container blob]\n");
     message.append("\tdeploys an application on the cluster\n");
     message.append("applicationReport [target: local|clusterName|clusterUUID] [application name]\n");

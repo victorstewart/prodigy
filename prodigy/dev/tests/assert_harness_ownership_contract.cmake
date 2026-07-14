@@ -4,8 +4,10 @@ endif()
 
 set(_harness "${PRODIGY_ROOT}/prodigy/dev/tests/prodigy_dev_netns_harness.sh")
 set(_launcher "${PRODIGY_ROOT}/prodigy/dev/tests/prodigy_dev_test_cluster.sh")
+set(_provider "${PRODIGY_ROOT}/prodigy/mothership/mothership.virtual.datacenter.provider.sh")
 file(READ "${_harness}" _source)
 file(READ "${_launcher}" _launcher_source)
+file(READ "${_provider}" _provider_source)
 
 foreach(_forbidden IN ITEMS
    "configureTestCluster"
@@ -24,11 +26,22 @@ foreach(_forbidden IN ITEMS
    "attach_dev_switchboard_balancer"
    "bpftool map update"
    "bpftool map delete"
+   "rootfs/logs/stdout.log"
+   "rootfs/logs/stderr.log"
    "container exec"
    "container run")
    string(FIND "${_source}" "${_forbidden}" _position)
    if(NOT _position EQUAL -1)
       message(FATAL_ERROR "Prodigy harness assumes a runtime-owned responsibility: ${_forbidden}")
+   endif()
+endforeach()
+
+foreach(_required IN ITEMS
+   "\${machine_root}/var/log/prodigy"
+   "mount --bind \"\${machine_root}/var/log/prodigy\" /var/log/prodigy")
+   string(FIND "${_provider_source}" "${_required}" _position)
+   if(_position EQUAL -1)
+      message(FATAL_ERROR "virtual datacenter machines must isolate Prodigy logs: ${_required}")
    endif()
 endforeach()
 
@@ -77,7 +90,8 @@ foreach(_required IN ITEMS
    "\${mothership_bin}\" reserveServiceID"
    "\${mothership_bin}\" deploy"
    "\${mothership_bin}\" clusterReport"
-   "\${mothership_bin}\" applicationReport")
+   "\${mothership_bin}\" applicationReport"
+   "\${mothership_bin}\" containerLogs")
    string(FIND "${_source}" "${_required}" _position)
    if(_position EQUAL -1)
       message(FATAL_ERROR "Prodigy harness Mothership-only control contract missing: ${_required}")

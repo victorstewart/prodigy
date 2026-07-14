@@ -25,8 +25,9 @@ run_machine()
    local brain_count="${10}"
    local fake_ingress="${11}"
 
-   mkdir -p /mnt/prodigy-vdc-workspace /containers /root /sys/fs/cgroup /sys/fs/bpf
+   mkdir -p /mnt/prodigy-vdc-workspace /containers /root /sys/fs/cgroup /sys/fs/bpf /var/log/prodigy "${machine_root}/var/log/prodigy"
    mount --bind "${workspace}" /mnt/prodigy-vdc-workspace
+   mount --bind "${machine_root}/var/log/prodigy" /var/log/prodigy
    mount --bind "${machine_root}/root" /root
    mount --bind "${containers_root}" /containers
    mkdir -p "${workspace}" /containers/store
@@ -82,6 +83,11 @@ valid_workspace()
    local canonical
    canonical="$(realpath -m -- "$1")" || return 1
    [[ "${canonical}" == "$1" && "$1" == /*/* && "$1" != */ ]]
+}
+
+valid_control_socket_path()
+{
+   [[ "$1" =~ ^/tmp/prodigy-vdc-0x[0-9a-fA-F]{1,32}/mothership\.sock$ ]]
 }
 
 resolve_cgroup_scope()
@@ -373,15 +379,16 @@ probe_datacenter()
 
 stop_datacenter()
 {
-   [[ "$#" -eq 1 && "${EUID}" -eq 0 ]] || return 2
+   [[ "$#" -eq 2 && "${EUID}" -eq 0 ]] || return 2
    local workspace="$1"
+   local control_socket_path="$2"
    command -v find >/dev/null
    command -v flock >/dev/null
    command -v ip >/dev/null
    command -v realpath >/dev/null
    command -v seq >/dev/null
    command -v tr >/dev/null
-   valid_workspace "${workspace}" || return 2
+   valid_workspace "${workspace}" && valid_control_socket_path "${control_socket_path}" || return 2
    local pid_path="${workspace}/virtual-datacenter.pid"
    local provider_pid=""
    [[ ! -r "${pid_path}" ]] || provider_pid="$(<"${pid_path}")"
@@ -410,19 +417,22 @@ stop_datacenter()
       ip link del "vdh${provider_pid: -8}" >/dev/null 2>&1 || true
    fi
    restore_cgroup_scope_if_idle
+   rm -f -- "${control_socket_path}"
+   rmdir -- "${control_socket_path%/*}" 2>/dev/null || true
    rm -rf -- "${workspace}"
 }
 
 launch_datacenter()
 {
-   [[ "$#" -eq 11 && "${EUID}" -eq 0 ]] || return 2
+   [[ "$#" -eq 12 && "${EUID}" -eq 0 ]] || return 2
    local workspace="$1"
-   valid_workspace "${workspace}" || return 2
+   local control_socket_path="${12}"
+   valid_workspace "${workspace}" && valid_control_socket_path "${control_socket_path}" || return 2
    command -v nohup >/dev/null
    command -v realpath >/dev/null
    command -v setsid >/dev/null
    command -v tr >/dev/null
-   stop_datacenter "${workspace}"
+   stop_datacenter "${workspace}" "${control_socket_path}"
    mkdir -p "${workspace%/*}" "${workspace}"
    setsid nohup bash "$0" --serve "$@" > "${workspace}/virtual-datacenter.log" 2>&1 < /dev/null &
 }
@@ -471,9 +481,9 @@ then
    exec unshare --mount --propagation private -- bash "$0" --serve "$@"
 fi
 
-if [[ "$#" -ne 11 || "${EUID}" -ne 0 ]]
+if [[ "$#" -ne 12 || "${EUID}" -ne 0 ]]
 then
-   echo "virtual datacenter provider requires workspace, machine count, brain count, MTU, fake-boundary flag, host netns inode, machine resources, and storage devices as root" >&2
+   echo "virtual datacenter provider requires workspace, machine count, brain count, MTU, fake-boundary flag, host netns inode, machine resources, storage devices, and control socket as root" >&2
    exit 2
 fi
 
@@ -488,6 +498,7 @@ machine_memory_mb="$8"
 machine_storage_mb="$9"
 storage_device_count="${10}"
 storage_device_mb="${11}"
+control_socket_path="${12}"
 
 if ! valid_workspace "${workspace}" ||
    ! [[ "${machine_count}" =~ ^[0-9]+$ ]] || [[ "${machine_count}" -lt 1 || "${machine_count}" -gt 128 ]] ||
@@ -499,13 +510,14 @@ if ! valid_workspace "${workspace}" ||
    ! [[ "${machine_memory_mb}" =~ ^[0-9]+$ ]] || [[ "${machine_memory_mb}" -lt 1 || "${machine_memory_mb}" -gt 16777216 ]] ||
    ! [[ "${machine_storage_mb}" =~ ^[0-9]+$ ]] || [[ "${machine_storage_mb}" -lt 1 || "${machine_storage_mb}" -gt 1048576 ]] ||
    ! [[ "${storage_device_count}" =~ ^[0-9]+$ ]] || [[ "${storage_device_count}" -gt 16 ]] ||
-   ! [[ "${storage_device_mb}" =~ ^[0-9]+$ ]] || [[ "${storage_device_mb}" -lt 1 || "${storage_device_mb}" -gt 1048576 ]]
+   ! [[ "${storage_device_mb}" =~ ^[0-9]+$ ]] || [[ "${storage_device_mb}" -lt 1 || "${storage_device_mb}" -gt 1048576 ]] ||
+   ! valid_control_socket_path "${control_socket_path}"
 then
    echo "invalid virtual datacenter provider arguments" >&2
    exit 2
 fi
 
-required=(btrfs find flock ip mkfs.btrfs mount mountpoint mv realpath rm seq setsid stat tr truncate umount unshare xargs)
+required=(btrfs find flock install ip mkfs.btrfs mount mountpoint mv realpath rm rmdir seq setsid stat tr truncate umount unshare xargs)
 [[ "${storage_device_count}" -eq 0 ]] || required+=(mkfs.ext4)
 if [[ "${fake_boundary}" == "1" ]]
 then
@@ -541,7 +553,6 @@ runtime_path="${workspace}/virtual-datacenter.runtime"
 pid_path="${workspace}/virtual-datacenter.pid"
 failure_path="${workspace}/virtual-datacenter.failure"
 manifest_path="${workspace}/test-cluster-manifest.json"
-control_socket_path="${workspace}/prodigy-mothership.sock"
 boundary_lock="/run/prodigy-virtual-datacenter.boundary.lock"
 boundary_bpffs="${workspace}/boundary-bpffs"
 host_edge="vdh${pid: -8}"
@@ -621,6 +632,8 @@ cleanup()
    find "${cgroup_root}" -depth -type d -exec rmdir {} \; >/dev/null 2>&1 || true
    restore_cgroup_scope_if_idle
    rm -f "${ready_path}" "${runtime_path}" >/dev/null 2>&1 || true
+   rm -f -- "${control_socket_path}" >/dev/null 2>&1 || true
+   rmdir -- "${control_socket_path%/*}" >/dev/null 2>&1 || true
    exit "${status}"
 }
 
@@ -639,6 +652,7 @@ trap 'exit 129' HUP
 trap 'exit 143' TERM
 
 mkdir -p "${workspace}/boot" "${filesystem_root}"
+install -d -m 0700 "${control_socket_path%/*}"
 rm -f "${provisioned_path}" "${ready_path}" "${runtime_path}" "${failure_path}" "${manifest_path}" "${control_socket_path}"
 filesystem_size_bytes=$(( (machine_storage_mb * machine_count + 4096) * 1048576 ))
 machine_memory_bytes=$(( machine_memory_mb * 1048576 ))

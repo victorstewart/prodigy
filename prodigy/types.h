@@ -4203,6 +4203,67 @@ static void serialize(S&& serializer, FailureReport& freport)
   serializer.value1b(freport.wasCanary);
 }
 
+constexpr static uint32_t containerLogsDefaultMaximumBytes = 64U * 1024U;
+constexpr static uint32_t containerLogsMaximumBytes = 1024U * 1024U;
+constexpr static uint32_t containerLogsMaximumEntries = 64;
+constexpr static uint32_t containerLogsMaximumWireBytes = containerLogsMaximumBytes + 16U * 1024U;
+
+class ContainerLogEntry {
+public:
+
+  uint128_t machineUUID = 0;
+  uint128_t containerUUID = 0;
+  int64_t capturedAtMs = 0;
+  bool running = false;
+  bool truncated = false;
+  String standardOutput;
+  String standardError;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ContainerLogEntry& entry)
+{
+  serializer.value16b(entry.machineUUID);
+  serializer.value16b(entry.containerUUID);
+  serializer.value8b(entry.capturedAtMs);
+  serializer.value1b(entry.running);
+  serializer.value1b(entry.truncated);
+  serializer.text1b(entry.standardOutput, containerLogsMaximumBytes);
+  serializer.text1b(entry.standardError, containerLogsMaximumBytes);
+}
+
+class ContainerLogsOperation {
+public:
+
+  uint64_t requestID = 0;
+  uint16_t applicationID = 0;
+  uint128_t containerUUID = 0;
+  uint32_t maximumBytes = containerLogsDefaultMaximumBytes;
+  bool includeRunning = true;
+  bool includeFailed = true;
+  bool success = false;
+  bool truncated = false;
+  String failure;
+  Vector<ContainerLogEntry> entries;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ContainerLogsOperation& operation)
+{
+  serializer.value8b(operation.requestID);
+  serializer.value2b(operation.applicationID);
+  serializer.value16b(operation.containerUUID);
+  serializer.value4b(operation.maximumBytes);
+  serializer.value1b(operation.includeRunning);
+  serializer.value1b(operation.includeFailed);
+  serializer.value1b(operation.success);
+  serializer.value1b(operation.truncated);
+  serializer.text1b(operation.failure, 4096);
+  serializer.container(operation.entries, containerLogsMaximumEntries, [](S& serializer, ContainerLogEntry& entry) {
+    serializer.object(entry);
+  });
+}
+
 class ScalerState {
 public:
 

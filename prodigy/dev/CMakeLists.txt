@@ -1168,6 +1168,8 @@ add_custom_command(
 add_custom_target(prodigy_bundle_sha256 DEPENDS "${PRODIGY_BUNDLE_SHA256_OUTPUT}")
 add_dependencies(prodigy_bundle prodigy_bundle_sha256)
 add_dependencies(prodigy_bundle_artifact_unit prodigy_bundle prodigy_bundle_sha256)
+add_dependencies(prodigy_pingpong_container_artifact prodigy_bundle)
+add_dependencies(prodigy_pingpong_isolation_container_artifact prodigy_bundle)
 add_dependencies(prodigy_mothership_unix_connect_unit prodigy_mothership_tunnel_provider)
 add_dependencies(prodigy_mothership_cluster_report_unit mothership)
 add_dependencies(prodigy_mothership_restart_persistence_unit mothership prodigy_bundle prodigy_bundle_sha256)
@@ -1472,6 +1474,7 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    set_tests_properties(prodigy_discombobulator_build_smoke PROPERTIES TIMEOUT 1800)
    set(_prodigy_optional_skip_test_candidates
       prodigy_dev_pingpong_deploy_smoke
+      prodigy_dev_runtime_isolation_smoke
       prodigy_dev_whitehole_fake_ipv4_smoke
       prodigy_dev_whitehole_host_ipv4_smoke
       prodigy_dev_autoscale_metrics_smoke
@@ -1517,6 +1520,7 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       prodigy_dev_master_failure_matrix_full
       prodigy_dev_master_upgrade_sim
       prodigy_dev_pingpong_deploy_smoke
+      prodigy_dev_runtime_isolation_smoke
       prodigy_dev_sdk_mesh_e2e_matrix_smoke
       prodigy_dev_whitehole_fake_ipv4_smoke
       prodigy_dev_whitehole_host_ipv4_smoke

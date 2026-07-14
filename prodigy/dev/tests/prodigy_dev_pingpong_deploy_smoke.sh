@@ -5,8 +5,8 @@ prodigy_bin="${1:-}"
 mothership_bin="${2:-}"
 container_artifact="${3:-}"
 mode="${4:-standard}"
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "${script_dir}/../../.." && pwd)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+repo_root="$(cd "${script_dir}/../../.." && pwd -P)"
 harness="${script_dir}/prodigy_dev_netns_harness.sh"
 
 if [[ ! -x "${prodigy_bin}" || ! -x "${mothership_bin}" || ! -r "${container_artifact}" ]]
@@ -43,9 +43,22 @@ case "$(uname -m)" in
    *) echo "SKIP: unsupported architecture" >&2; exit 77 ;;
 esac
 
+bundle_artifact="$(dirname "${prodigy_bin}")/prodigy.${architecture}.bundle.tar.zst"
+bundle_sha256="${bundle_artifact}.sha256"
+if [[ ! -r "${bundle_artifact}" || ! -r "${bundle_sha256}" ]]
+then
+   echo "error: current Prodigy bundle and checksum must be built beside ${prodigy_bin}" >&2
+   exit 2
+fi
+
 mkdir -p "${repo_root}/.run"
 work_root="$(mktemp -d "${repo_root}/.run/pingpong-deploy.XXXXXX")"
 trap 'rm -rf "${work_root}"' EXIT
+bundle_home="${work_root}/share/prodigy"
+mkdir -p "${bundle_home}"
+ln "${bundle_artifact}" "${bundle_home}/prodigy.${architecture}.bundle.tar.zst"
+ln "${bundle_sha256}" "${bundle_home}/prodigy.${architecture}.bundle.tar.zst.sha256"
+export XDG_DATA_HOME="${work_root}/share"
 plan="${work_root}/pingpong.plan.json"
 jq -n \
    --arg architecture "${architecture}" \

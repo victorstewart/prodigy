@@ -21,8 +21,8 @@ fi
    exit 77
 }
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "${script_dir}/../../.." && pwd)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+repo_root="$(cd "${script_dir}/../../.." && pwd -P)"
 mkdir -p "${repo_root}/.run"
 
 runner_mode=oneshot
@@ -325,6 +325,13 @@ application_report()
    local application="$1"
    local output="$2"
    timeout 8s "${mothership_bin}" applicationReport "${cluster_name}" "${application}" >"${output}" 2>&1
+}
+
+container_logs()
+{
+   local application="$1"
+   local output="$2"
+   timeout 25s "${mothership_bin}" containerLogs "${cluster_name}" "${application}" >"${output}" 2>&1
 }
 
 report_healthy_count()
@@ -745,7 +752,22 @@ wait_application_report()
    return 1
 }
 
-wait_application_report || fail "application report constraints were not satisfied"
+if wait_application_report
+then
+   if [[ -n "${deploy_report_application}" ]]
+   then
+      container_logs "${deploy_report_application}" "${tmpdir}/container-logs.log" || fail "Mothership could not read container logs through the production control path"
+      rg -q '^container=.* state=(running|failed) ' "${tmpdir}/container-logs.log" || fail "Mothership returned no container log entries"
+      echo "MOTHERSHIP_CONTAINER_LOGS success application=${deploy_report_application}"
+   fi
+else
+   if [[ -n "${deploy_report_application}" ]]
+   then
+      container_logs "${deploy_report_application}" "${tmpdir}/container-logs.log" || true
+      sed -n '1,260p' "${tmpdir}/container-logs.log" >&2 || true
+   fi
+   fail "application report constraints were not satisfied"
+fi
 
 if [[ "${deploy_ping_port}" -gt 0 && "${deploy_skip_probe}" == 0 && "${PRODIGY_DEV_DEPLOY_SKIP_FINAL_PING:-0}" != 1 && "${deploy_ping_after_fault}" == 0 ]]
 then

@@ -856,9 +856,9 @@ public:
   ProdigyOverlayValueMirror<switchboard_overlay_prefix4_key, switchboard_overlay_hosted_ingress_route4> installedPeerHostedIngressRouteKeys4 = {};
   ProdigyOverlayValueMirror<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6> installedPeerHostedIngressRouteKeys6 = {};
   ProdigyOverlayValueMirror<portal_definition, switchboard_whitehole_binding> installedPeerWhiteholeBindingKeys = {};
-  bool syncDeclaredNetworkPairingPolicy(void)
+  bool syncDeclaredNetworkPairingPolicy(bool invalidateAuthorizedFlows)
   {
-    return plan.networkAccess != ContainerNetworkAccess::declaredOnly || syncDeclaredNetworkPolicy();
+    return plan.networkAccess != ContainerNetworkAccess::declaredOnly || syncDeclaredNetworkPolicy(invalidateAuthorizedFlows);
   }
 
 private:
@@ -1184,7 +1184,7 @@ public:
   }
 
   template <typename Key, StringType MapName>
-  static bool populateBPFSet(BPFProgram *program, MapName&& mapName, const Vector<Key>& desired)
+  static bool syncBPFSet(BPFProgram *program, MapName&& mapName, const Vector<Key>& desired)
   {
     if (program == nullptr)
     {
@@ -1197,10 +1197,33 @@ public:
         return;
       }
       ok = true;
+      Vector<Key> installed = {};
+      Key current = {}, next = {};
+      int result = bpf_map_get_next_key(mapFD, nullptr, &next);
+      while (result == 0)
+      {
+        installed.push_back(next);
+        current = next;
+        result = bpf_map_get_next_key(mapFD, &current, &next);
+      }
+      ok &= result == -ENOENT || errno == ENOENT;
+
       __u8 present = 1;
       for (const Key& key : desired)
       {
         ok &= bpf_map_update_elem(mapFD, &key, &present, BPF_ANY) == 0;
+      }
+      for (const Key& key : installed)
+      {
+        bool retained = false;
+        for (const Key& candidate : desired)
+        {
+          retained |= std::memcmp(&key, &candidate, sizeof(Key)) == 0;
+        }
+        if (retained == false)
+        {
+          ok &= bpf_map_delete_elem(mapFD, &key) == 0;
+        }
       }
     });
     return ok;
@@ -1224,7 +1247,7 @@ public:
     }
   }
 
-  bool syncDeclaredNetworkPolicy(void)
+  bool syncDeclaredNetworkPolicy(bool invalidateAuthorizedFlows = true)
   {
     if (plan.networkAccess != ContainerNetworkAccess::declaredOnly)
     {
@@ -1259,12 +1282,10 @@ public:
       }
     }
 
-    bool cleared = clearBPFMap<container_service_peer>(peer_program, "ct_sub_targets"_ctv) &&
-                   clearBPFMap<container_service_peer>(primary_program, "ct_adv_sources"_ctv) &&
-                   clearAuthorizedTCPFlows();
-    bool ok = cleared && declaredNetworkPairingsValid(plan) &&
-              populateBPFSet(peer_program, "ct_sub_targets"_ctv, subscriptionTargets) &&
-              populateBPFSet(primary_program, "ct_adv_sources"_ctv, advertisementSources);
+    bool ok = (invalidateAuthorizedFlows == false || clearAuthorizedTCPFlows()) &&
+              declaredNetworkPairingsValid(plan) &&
+              syncBPFSet(peer_program, "ct_sub_targets"_ctv, subscriptionTargets) &&
+              syncBPFSet(primary_program, "ct_adv_sources"_ctv, advertisementSources);
     if (ok == false)
     {
       (void)clearBPFMap<container_service_peer>(peer_program, "ct_sub_targets"_ctv);
@@ -2839,6 +2860,111 @@ public:
     return cleanupExpiredFailedContainerArtifactsWithDefaultRoot(nowMs, failureReport);
   }
 
+  static bool collectContainerLogs(ContainerLogsOperation& operation)
+  {
+    return collectContainerLogsAtPath(operation, failedContainerArtifactRootPath());
+  }
+
+#if PRODIGY_DEBUG
+  static bool debugCollectContainerLogsAtPath(ContainerLogsOperation& operation, const String& retentionRootPath)
+  {
+    return collectContainerLogsAtPath(operation, retentionRootPath);
+  }
+#endif
+
+private:
+
+  static bool collectContainerLogsAtPath(ContainerLogsOperation& operation, const String& retentionRootPath)
+  {
+    operation.success = false;
+    operation.truncated = false;
+    operation.failure.clear();
+    operation.entries.clear();
+    if (thisNeuron == nullptr || operation.applicationID == 0 || operation.maximumBytes == 0 ||
+        operation.maximumBytes > containerLogsMaximumBytes ||
+        (operation.includeRunning == false && operation.includeFailed == false))
+    {
+      operation.failure.assign("container log request is invalid"_ctv);
+      return false;
+    }
+
+    Vector<Container *> running = {};
+    if (operation.includeRunning)
+    {
+      for (const auto& [uuid, container] : thisNeuron->containers)
+      {
+        (void)uuid;
+        if (container != nullptr && container->plan.config.applicationID == operation.applicationID &&
+            (operation.containerUUID == 0 || operation.containerUUID == container->plan.uuid) &&
+            container->rootfsPath.size() > 0 && container->pendingDestroy == false)
+        {
+          running.push_back(container);
+        }
+      }
+    }
+
+    Vector<RetainedContainerLog> retained = {};
+    if (operation.includeFailed && collectRetainedContainerLogs(retentionRootPath, operation, retained, &operation.failure) == false)
+    {
+      return false;
+    }
+
+    uint64_t availableEntries = running.size() + retained.size();
+    uint64_t selectedEntries = std::min<uint64_t>(availableEntries, containerLogsMaximumEntries);
+    operation.truncated = availableEntries > selectedEntries;
+    uint32_t remainingBytes = operation.maximumBytes;
+    uint32_t remainingEntries = uint32_t(selectedEntries);
+    auto entryBudget = [&]() -> uint32_t {
+      return remainingEntries == 0 ? 0 : remainingBytes / remainingEntries;
+    };
+
+    for (Container *container : running)
+    {
+      if (operation.entries.size() >= selectedEntries)
+      {
+        break;
+      }
+      uint32_t budget = entryBudget();
+      ContainerLogEntry& entry = operation.entries.emplace_back();
+      entry.containerUUID = container->plan.uuid;
+      entry.capturedAtMs = Time::now<TimeResolution::ms>();
+      entry.running = true;
+      if (readRunningContainerLogs(container, budget, entry, &operation.failure) == false)
+      {
+        operation.entries.pop_back();
+        return false;
+      }
+      remainingBytes -= uint32_t(entry.standardOutput.size() + entry.standardError.size());
+      remainingEntries -= 1;
+      operation.truncated |= entry.truncated;
+    }
+
+    for (const RetainedContainerLog& retainedLog : retained)
+    {
+      if (operation.entries.size() >= selectedEntries)
+      {
+        break;
+      }
+      uint32_t budget = entryBudget();
+      ContainerLogEntry& entry = operation.entries.emplace_back();
+      entry.containerUUID = retainedLog.containerUUID;
+      entry.capturedAtMs = retainedLog.failureTimeMs;
+      if (readRetainedContainerLogs(retentionRootPath, retainedLog, budget, entry, &operation.failure) == false)
+      {
+        operation.entries.pop_back();
+        return false;
+      }
+      remainingBytes -= uint32_t(entry.standardOutput.size() + entry.standardError.size());
+      remainingEntries -= 1;
+      operation.truncated |= entry.truncated;
+    }
+
+    operation.success = true;
+    return true;
+  }
+
+public:
+
 #if PRODIGY_DEBUG
   static bool debugCleanupFailedCreateArtifactRoot(Container *container, String *failureReport = nullptr)
   {
@@ -2980,6 +3106,11 @@ public:
         maxEntries,
         maxArtifactRegularFileBytes,
         failureReport);
+  }
+
+  static bool debugPrepareContainerOutputLogs(Container *container, int& stdoutFD, int& stderrFD, String *failureReport = nullptr)
+  {
+    return prepareContainerOutputLogs(container, stdoutFD, stderrFD, failureReport);
   }
 
   static bool debugSelectReceivedContainerArtifactFromScratch(
@@ -4016,6 +4147,288 @@ private:
   static String failedContainerArtifactRootPath(void)
   {
     return "/var/log/prodigy/failed-containers"_ctv;
+  }
+
+  class RetainedContainerLog {
+  public:
+
+    uint16_t applicationID = 0;
+    uint128_t containerUUID = 0;
+    int64_t failureTimeMs = 0;
+  };
+
+  static bool parseDecimal128(const char *text, uint128_t& value)
+  {
+    value = 0;
+    if (text == nullptr || *text == '\0')
+    {
+      return false;
+    }
+    constexpr uint128_t maximum = ~uint128_t(0);
+    for (const char *cursor = text; *cursor != '\0'; ++cursor)
+    {
+      if (*cursor < '0' || *cursor > '9')
+      {
+        return false;
+      }
+      uint8_t digit = uint8_t(*cursor - '0');
+      if (value > (maximum - digit) / 10)
+      {
+        return false;
+      }
+      value = value * 10 + digit;
+    }
+    return true;
+  }
+
+  static bool readContainerLogAt(
+      int rootFD,
+      const String& relativePath,
+      uint32_t maximumBytes,
+      String& output,
+      bool& truncated,
+      String *failureReport)
+  {
+    output.clear();
+    int32_t slash = relativePath.rfindChar('/');
+    String parentPath = {};
+    String filename = {};
+    if (slash >= 0)
+    {
+      parentPath.assign(relativePath.data(), uint64_t(slash));
+      filename.assign(relativePath.data() + slash + 1, relativePath.size() - uint64_t(slash + 1));
+    }
+    else
+    {
+      filename.assign(relativePath);
+    }
+    if (validateContainerRelativePathComponent(filename, relativePath, failureReport) == false)
+    {
+      return false;
+    }
+
+    int parentFD = -1;
+    if (parentPath.size() > 0)
+    {
+      String openFailure = {};
+      if (openContainerDirectoryTreeAt(rootFD, parentPath, false, 0, parentFD, &openFailure) == false)
+      {
+        if (errno == ENOENT)
+        {
+          return true;
+        }
+        if (failureReport)
+        {
+          *failureReport = std::move(openFailure);
+        }
+        return false;
+      }
+    }
+    else if ((parentFD = dup(rootFD)) < 0)
+    {
+      return false;
+    }
+
+    int fd = Filesystem::openFileAt(parentFD, filename, O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0, secureContainerResolveFlags);
+    int openErrno = errno;
+    close(parentFD);
+    if (fd < 0)
+    {
+      if (openErrno == ENOENT)
+      {
+        return true;
+      }
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to open container log {} errno={}({})"_ctv>(relativePath, openErrno, String(strerror(openErrno)));
+      }
+      return false;
+    }
+
+    struct stat metadata = {};
+    if (fstat(fd, &metadata) != 0 || S_ISREG(metadata.st_mode) == 0 || metadata.st_size < 0)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"container log {} is not a readable regular file"_ctv>(relativePath);
+      }
+      close(fd);
+      return false;
+    }
+
+    uint64_t fileBytes = uint64_t(metadata.st_size);
+    uint64_t readBytes = std::min<uint64_t>(fileBytes, maximumBytes);
+    truncated |= readBytes < fileBytes;
+    if (readBytes > 0)
+    {
+      if (lseek(fd, off_t(fileBytes - readBytes), SEEK_SET) < 0)
+      {
+        if (failureReport)
+        {
+          failureReport->snprintf<"failed to seek container log {} errno={}({})"_ctv>(relativePath, errno, String(strerror(errno)));
+        }
+        close(fd);
+        return false;
+      }
+      output.reserve(readBytes);
+      char buffer[4096];
+      while (readBytes > 0)
+      {
+        ssize_t received = read(fd, buffer, std::min<uint64_t>(sizeof(buffer), readBytes));
+        if (received <= 0)
+        {
+          if (received < 0 && errno == EINTR)
+          {
+            continue;
+          }
+          if (failureReport)
+          {
+            failureReport->snprintf<"failed to read container log {} errno={}({})"_ctv>(relativePath, errno, String(strerror(errno)));
+          }
+          close(fd);
+          return false;
+        }
+        output.append(buffer, uint64_t(received));
+        readBytes -= uint64_t(received);
+      }
+    }
+    close(fd);
+    return true;
+  }
+
+  static bool readContainerOutputLogsAt(int rootFD, uint32_t maximumBytes, ContainerLogEntry& entry, String *failureReport)
+  {
+    uint32_t stdoutBytes = maximumBytes / 2;
+    uint32_t stderrBytes = maximumBytes - stdoutBytes;
+    return readContainerLogAt(rootFD, "logs/stdout.log"_ctv, stdoutBytes, entry.standardOutput, entry.truncated, failureReport) &&
+           readContainerLogAt(rootFD, "logs/stderr.log"_ctv, stderrBytes, entry.standardError, entry.truncated, failureReport);
+  }
+
+  static bool readRunningContainerLogs(Container *container, uint32_t maximumBytes, ContainerLogEntry& entry, String *failureReport)
+  {
+    int rootFD = -1;
+    if (openVerifiedContainerRootfs(container, rootFD, failureReport) == false)
+    {
+      return false;
+    }
+    bool read = readContainerOutputLogsAt(rootFD, maximumBytes, entry, failureReport);
+    close(rootFD);
+    return read;
+  }
+
+  static bool forEachDirectoryName(int directoryFD, auto&& visitor, String *failureReport)
+  {
+    int duplicate = dup(directoryFD);
+    if (duplicate < 0)
+    {
+      return false;
+    }
+    DIR *directory = fdopendir(duplicate);
+    if (directory == nullptr)
+    {
+      close(duplicate);
+      return false;
+    }
+    errno = 0;
+    while (dirent *entry = readdir(directory))
+    {
+      if (entry->d_name[0] == '.' && (entry->d_name[1] == '\0' || (entry->d_name[1] == '.' && entry->d_name[2] == '\0')))
+      {
+        continue;
+      }
+      visitor(entry->d_name);
+      errno = 0;
+    }
+    int iterationErrno = errno;
+    closedir(directory);
+    if (iterationErrno != 0 && failureReport)
+    {
+      failureReport->snprintf<"failed to enumerate retained container logs errno={}({})"_ctv>(iterationErrno, String(strerror(iterationErrno)));
+    }
+    return iterationErrno == 0;
+  }
+
+  static bool collectRetainedContainerLogs(
+      const String& rootPath,
+      const ContainerLogsOperation& operation,
+      Vector<RetainedContainerLog>& retained,
+      String *failureReport)
+  {
+    int rootFD = Filesystem::openDirectoryAt(
+        -1, rootPath, O_RDONLY | O_DIRECTORY | O_CLOEXEC, RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS);
+    if (rootFD < 0)
+    {
+      return errno == ENOENT;
+    }
+    String applicationID = {};
+    applicationID.assignItoa(operation.applicationID);
+    int applicationFD = Filesystem::openDirectoryAt(rootFD, applicationID, O_RDONLY | O_DIRECTORY | O_CLOEXEC, secureContainerResolveFlags);
+    close(rootFD);
+    if (applicationFD < 0)
+    {
+      return errno == ENOENT;
+    }
+
+    bool ok = true;
+    const int64_t nowMs = Time::now<TimeResolution::ms>();
+    const int64_t oldestFailureTimeMs = nowMs - failedContainerArtifactRetentionMs;
+    ok &= forEachDirectoryName(applicationFD, [&](const char *containerName) {
+      uint128_t containerUUID = 0;
+      if (parseDecimal128(containerName, containerUUID) == false ||
+          (operation.containerUUID != 0 && operation.containerUUID != containerUUID))
+      {
+        return;
+      }
+      String containerComponent = {};
+      containerComponent.assign(containerName);
+      int containerFD = Filesystem::openDirectoryAt(applicationFD, containerComponent, O_RDONLY | O_DIRECTORY | O_CLOEXEC, secureContainerResolveFlags);
+      if (containerFD < 0)
+      {
+        ok = false;
+        return;
+      }
+      ok &= forEachDirectoryName(containerFD, [&](const char *failureTimeName) {
+        uint128_t failureTime = 0;
+        if (parseDecimal128(failureTimeName, failureTime) && failureTime <= uint128_t(INT64_MAX) &&
+            int64_t(failureTime) >= oldestFailureTimeMs && int64_t(failureTime) <= nowMs)
+        {
+          retained.push_back({operation.applicationID, containerUUID, int64_t(failureTime)});
+        }
+      }, failureReport);
+      close(containerFD);
+    }, failureReport);
+    close(applicationFD);
+    std::sort(retained.begin(), retained.end(), [](const RetainedContainerLog& lhs, const RetainedContainerLog& rhs) {
+      return lhs.failureTimeMs > rhs.failureTimeMs;
+    });
+    return ok;
+  }
+
+  static bool readRetainedContainerLogs(
+      const String& rootPath,
+      const RetainedContainerLog& retained,
+      uint32_t maximumBytes,
+      ContainerLogEntry& entry,
+      String *failureReport)
+  {
+    int rootFD = Filesystem::openDirectoryAt(
+        -1, rootPath, O_RDONLY | O_DIRECTORY | O_CLOEXEC, RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS);
+    if (rootFD < 0)
+    {
+      return false;
+    }
+    String relative = {};
+    relative.snprintf<"{itoa}/{itoa}/{itoa}"_ctv>(retained.applicationID, retained.containerUUID, retained.failureTimeMs);
+    int bundleFD = -1;
+    bool opened = openContainerDirectoryTreeAt(rootFD, relative, false, 0, bundleFD, failureReport);
+    close(rootFD);
+    if (opened == false)
+    {
+      return false;
+    }
+    bool read = readContainerOutputLogsAt(bundleFD, maximumBytes, entry, failureReport);
+    close(bundleFD);
+    return read;
   }
 
   static int failedContainerTerminalSignal(const siginfo_t& infop)
@@ -5439,6 +5852,59 @@ private:
     if (fileFD >= 0)
     {
       close(fileFD);
+    }
+    return opened;
+  }
+
+  static bool prepareContainerOutputLogs(Container *container, int& stdoutFD, int& stderrFD, String *failureReport = nullptr)
+  {
+    stdoutFD = -1;
+    stderrFD = -1;
+    int rootfd = -1;
+    if (openVerifiedContainerRootfs(container, rootfd, failureReport) == false)
+    {
+      return false;
+    }
+
+    auto openLog = [&](const String& path, int& fd) -> bool {
+      if (openContainerFileAtNoSymlinks(rootfd, path, true, S_IRUSR | S_IWUSR, fd, failureReport) == false)
+      {
+        return false;
+      }
+
+      struct stat statbuf = {};
+      if (fstat(fd, &statbuf) != 0 || S_ISREG(statbuf.st_mode) == 0 || ftruncate(fd, 0) != 0)
+      {
+        if (failureReport)
+        {
+          failureReport->snprintf<"container output log {} is not a writable regular file errno={}({})"_ctv>(
+              path,
+              errno,
+              String(strerror(errno)));
+        }
+        close(fd);
+        fd = -1;
+        return false;
+      }
+
+      return true;
+    };
+
+    bool opened = openLog("logs/stdout.log"_ctv, stdoutFD) &&
+                  openLog("logs/stderr.log"_ctv, stderrFD);
+    close(rootfd);
+    if (opened == false)
+    {
+      if (stdoutFD >= 0)
+      {
+        close(stdoutFD);
+        stdoutFD = -1;
+      }
+      if (stderrFD >= 0)
+      {
+        close(stderrFD);
+        stderrFD = -1;
+      }
     }
     return opened;
   }
@@ -9247,6 +9713,30 @@ public:
       return false;
     }
 
+    int containerOutputLogFDs[2] = {-1, -1};
+    struct ContainerOutputLogCleanup {
+      int *fds = nullptr;
+
+      ~ContainerOutputLogCleanup()
+      {
+        if (fds == nullptr)
+        {
+          return;
+        }
+        for (uint8_t index = 0; index < 2; ++index)
+        {
+          if (fds[index] >= 0)
+          {
+            close(fds[index]);
+          }
+        }
+      }
+    } containerOutputLogCleanup {containerOutputLogFDs};
+    if (prepareContainerOutputLogs(container, containerOutputLogFDs[0], containerOutputLogFDs[1], failureReport) == false)
+    {
+      return false;
+    }
+
     bool exposeNeuronSocket = container->exposesNeuronSocket();
     int neuronListenerFD = -1;
     struct NeuronListenerCleanup {
@@ -9768,6 +10258,18 @@ public:
         }
       }
 
+      if (dup2(containerOutputLogFDs[0], STDOUT_FILENO) < 0 ||
+          dup2(containerOutputLogFDs[1], STDERR_FILENO) < 0)
+      {
+        String redirectFailure = {};
+        redirectFailure.snprintf<"errno={}({})"_ctv>(errno, String(strerror(errno)));
+        failStartup("redirect container output failed", &redirectFailure);
+      }
+      close(containerOutputLogFDs[0]);
+      close(containerOutputLogFDs[1]);
+      containerOutputLogFDs[0] = -1;
+      containerOutputLogFDs[1] = -1;
+
       Vector<int32_t> execAdditionalPreservedFDs = execIsolatedChildCgroups;
       if (execNeuronListenerFD >= 0)
       {
@@ -9784,21 +10286,6 @@ public:
                    execDescriptorFailure.c_str());
         failStartup("sanitize exec fds failed", &execDescriptorFailure);
       }
-
-      mkdir("/logs", S_IRWXU);
-      auto redirectLogFD = [](const char *path, int targetFD) {
-        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR);
-        if (fd >= 0)
-        {
-          dup2(fd, targetFD);
-          if (fd != targetFD)
-          {
-            close(fd);
-          }
-        }
-      };
-      redirectLogFD("/logs/stdout.log", STDOUT_FILENO);
-      redirectLogFD("/logs/stderr.log", STDERR_FILENO);
 
       extern char **environ;
       Vector<char *> args;

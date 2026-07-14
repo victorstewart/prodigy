@@ -81,6 +81,12 @@ endforeach()
 
 file(READ "${PRODIGY_ROOT}/switchboard/kernel/container.egress.router.ebpf.c" _container_egress)
 file(READ "${PRODIGY_ROOT}/prodigy/neuron/containers.h" _containers)
+file(READ "${PRODIGY_ROOT}/prodigy/neuron/neuron.h" _neuron)
+if(NOT _containers MATCHES "syncDeclaredNetworkPairingPolicy\\(bool invalidateAuthorizedFlows\\)" OR
+   NOT _containers MATCHES "invalidateAuthorizedFlows == false \\|\\| clearAuthorizedTCPFlows\\(\\)" OR
+   NOT _neuron MATCHES "syncDeclaredNetworkPairingPolicy\\(activate == false\\)")
+   message(FATAL_ERROR "declared-network pairing refresh must preserve flows on activation and revoke them on deactivation")
+endif()
 string(FIND "${_container_egress}" "if (localSubnetContainsDaddr(daddr6))" _local_route_action)
 string(FIND "${_containers}" "host.addDirectRoute(address, 128, AF_INET6);" _local_route_install)
 string(FIND "${_all}" "writeProcSysctlValue(\"/proc/sys/net/ipv6/conf/all/forwarding\", \"1\")" _local_route_forwarding)
