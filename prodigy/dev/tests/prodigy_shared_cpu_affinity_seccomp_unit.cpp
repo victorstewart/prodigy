@@ -534,6 +534,25 @@ int main(void)
 {
   TestSuite suite;
 
+  ApplicationConfig sharedCPUConfig {};
+  sharedCPUConfig.cpuMode = ApplicationCPUMode::shared;
+  sharedCPUConfig.nLogicalCores = 2;
+  sharedCPUConfig.sharedCPUMillis = 1'250;
+  String cpuMax;
+  suite.expect(prodigySharedCPUQuotaText(sharedCPUConfig, cpuMax), "shared_cpu_quota_formats");
+  suite.expect(cpuMax == "1250000 1000000"_ctv, "shared_cpu_quota_preserves_fractional_request");
+
+  sharedCPUConfig.sharedCPUMillis = 0;
+  suite.expect(prodigySharedCPUQuotaText(sharedCPUConfig, cpuMax), "shared_cpu_quota_falls_back_to_core_hint");
+  suite.expect(cpuMax == "2000000 1000000"_ctv, "shared_cpu_quota_core_hint_value");
+
+  sharedCPUConfig.nLogicalCores = 0;
+  suite.expect(prodigySharedCPUQuotaText(sharedCPUConfig, cpuMax) == false, "shared_cpu_quota_rejects_zero_request");
+
+  sharedCPUConfig.cpuMode = ApplicationCPUMode::isolated;
+  sharedCPUConfig.nLogicalCores = 2;
+  suite.expect(prodigySharedCPUQuotaText(sharedCPUConfig, cpuMax) == false, "isolated_cpu_has_no_shared_quota");
+
   suite.expect(prodigyContainerReservedCoreCount(1) == 0, "small_cpuset_reserves_zero_container_cores_one_cpu");
   suite.expect(prodigyContainerReservedCoreCount(2) == 0, "small_cpuset_reserves_zero_container_cores_two_cpus");
   suite.expect(prodigyContainerReservedCoreCount(3) == nReservedCores, "larger_cpuset_keeps_default_reserved_cores");

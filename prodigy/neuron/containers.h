@@ -67,6 +67,25 @@ static inline bool prodigyTestClusterOvercommitsCPUs()
          overcommit && overcommit[0] == '1' && overcommit[1] == '\0';
 }
 
+constexpr static uint64_t prodigySharedCPUQuotaPeriodUS = 1'000'000;
+
+static inline bool prodigySharedCPUQuotaText(const ApplicationConfig& config, String& value)
+{
+  if (applicationUsesSharedCPUs(config) == false)
+  {
+    return false;
+  }
+
+  uint64_t requestedMillis = applicationRequestedCPUMillis(config);
+  if (requestedMillis == 0)
+  {
+    return false;
+  }
+
+  value.snprintf<"{itoa} {itoa}"_ctv>(requestedMillis * 1'000, prodigySharedCPUQuotaPeriodUS);
+  return true;
+}
+
 static inline void prodigyBuildContainerStartupFlags(const ContainerPlan& plan, Vector<uint64_t>& flags)
 {
   flags.clear();
@@ -7143,6 +7162,17 @@ public:
     }
     Filesystem::openWriteAtClose(middirfd, "cpuset.cpus"_ctv, path);
 
+    if (container->plan.usesSharedCPUs())
+    {
+      String cpuMax;
+      if (prodigySharedCPUQuotaText(container->plan.config, cpuMax) == false ||
+          requireCgroupSetting("cpu.max"_ctv, cpuMax) == false)
+      {
+        Filesystem::close(middirfd);
+        return -1;
+      }
+    }
+
     // it seems that CPU pinning is unnecessary when we isolate like this, because essentially processes will never be scrambled
     // we could pin, just to be sure, but that would force us to provide CPU core numbers into the main function of each application
     // and then change those pins when we need to defrag processes x cores.
@@ -7160,7 +7190,7 @@ public:
 
     // }
 
-    if (prodigyTestClusterOvercommitsCPUs() == false)
+    if (container->plan.usesIsolatedCPUs() && prodigyTestClusterOvercommitsCPUs() == false)
     {
       Filesystem::openWriteAtClose(middirfd, "cpuset.cpus.partition"_ctv, "root"_ctv);
     }

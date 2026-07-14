@@ -6,6 +6,7 @@ foreach(REQUIRED IN ITEMS
    "requireCgroupSetting(\"cgroup.max.descendants\"_ctv, cgroupBound)"
    "requireCgroupSetting(\"cgroup.max.depth\"_ctv, \"1\"_ctv)"
    "requireCgroupSetting(\"pids.max\"_ctv, maxPids_string)"
+   "requireCgroupSetting(\"cpu.max\"_ctv, cpuMax)"
    "container->cgroup = create_cgroupv2(container, &cgroupFailure)"
    "container->plan.config.isolatedChildMemoryMB != 0 || cgroupFailure.size() > 0")
    string(FIND "${CONTAINERS}" "${REQUIRED}" POSITION)
@@ -22,11 +23,14 @@ foreach(REQUIRED IN ITEMS
    endif()
 endforeach()
 
-string(REGEX MATCHALL "if \\(prodigyTestClusterOvercommitsCPUs\\(\\) == false\\)" CPUSET_PARTITION_GUARDS "${CONTAINERS}")
-list(LENGTH CPUSET_PARTITION_GUARDS CPUSET_PARTITION_GUARD_COUNT)
-if(NOT CPUSET_PARTITION_GUARD_COUNT EQUAL 2)
-   message(FATAL_ERROR "both cpuset partition roots must be guarded by the test-cluster overcommit opt-in")
-endif()
+foreach(REQUIRED IN ITEMS
+   "if (prodigyTestClusterOvercommitsCPUs() == false)"
+   "if (container->plan.usesIsolatedCPUs() && prodigyTestClusterOvercommitsCPUs() == false)")
+   string(FIND "${CONTAINERS}" "${REQUIRED}" POSITION)
+   if(POSITION EQUAL -1)
+      message(FATAL_ERROR "cpuset partition roots must preserve production isolation and shared CPU semantics: missing ${REQUIRED}")
+   endif()
+endforeach()
 
 string(FIND "${VIRTUAL_DATACENTER_PROVIDER}" "PRODIGY_DEV_TEST_OVERCOMMIT_CPUS=1" POSITION)
 if(POSITION EQUAL -1)

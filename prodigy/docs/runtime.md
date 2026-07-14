@@ -149,7 +149,7 @@ Vertical scalers are stateful-only and scale up only. Brain clamps per-instance 
 
 Prodigy applies a hard seccomp deny floor for kernel-control and host-observation syscalls such as `bpf`, `ptrace`, `process_vm_*`, `process_madvise`, `kcmp`, `pidfd_*`, mount or namespace mutation, module loading, keyring mutation, kernel log access, host time control, accounting, quota control, and related host-control operations.
 
-Shared CPU mode also denies `sched_setaffinity` so workloads cannot self-pin. Review the deny floor when upgrading the supported Linux syscall surface.
+Shared CPU mode gives each container the machine's non-reserved cpuset, enforces its requested fractional CPU bandwidth with `cpu.max`, and denies `sched_setaffinity` so workloads cannot self-pin. Isolated CPU mode instead uses disjoint cpuset partition roots. Review the deny floor when upgrading the supported Linux syscall surface.
 
 ## Mothership tunnel-provider runtime
 
