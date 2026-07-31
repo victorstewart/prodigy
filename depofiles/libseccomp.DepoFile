@@ -2,6 +2,7 @@ NAME libseccomp
 VERSION 2.5.5
 SYSTEM_LIBS ALLOW
 SOURCE URL https://github.com/seccomp/libseccomp/releases/download/v2.5.5/libseccomp-2.5.5.tar.gz
+SHA256 248a2c8a4d9b9858aa6baf52712c34afefcf9c9e94b76dce02c1c9aa25fb3375
 BUILD_SYSTEM AUTOCONF
 AUTOCONF_CONFIGURE env GPERF=/usr/bin/true ./configure --prefix="${DEPO_PREFIX}" --libdir="${DEPO_PREFIX}/lib" --disable-shared --enable-static
 TARGET libseccomp::libseccomp STATIC lib/libseccomp.a INTERFACE include

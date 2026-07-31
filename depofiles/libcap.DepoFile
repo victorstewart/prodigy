@@ -2,6 +2,7 @@ NAME libcap
 VERSION 2.76
 SYSTEM_LIBS ALLOW
 SOURCE URL https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/libcap-2.76.tar.xz
+SHA256 629da4ab29900d0f7fcc36227073743119925fd711c99a1689bbf5c9b40c8e6f
 BUILD_SYSTEM AUTOCONF
 AUTOCONF_SKIP_CONFIGURE
 AUTOCONF_INSTALL make -C libcap -j$(nproc) DYNAMIC=no SHARED=no PTHREADS=no CROSS_COMPILE= BUILD_CC=clang BUILD_CFLAGS=-O2 BUILD_CPPFLAGS= COPTS= LDFLAGS= prefix="${DEPO_PREFIX}" lib=lib DESTDIR= install-static-cap
