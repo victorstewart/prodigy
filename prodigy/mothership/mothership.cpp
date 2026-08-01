@@ -4728,7 +4728,11 @@ private:
     size_t sent = 0;
     while (sent < len)
     {
-      ssize_t rc = ::send(transportFD, buffer + sent, len - sent, 0);
+      int flags = 0;
+#ifdef MSG_NOSIGNAL
+      flags |= MSG_NOSIGNAL;
+#endif
+      ssize_t rc = ::send(transportFD, buffer + sent, len - sent, flags);
       if (rc <= 0)
       {
         return false;
@@ -4771,6 +4775,14 @@ public:
   void unitTestOverrideTunnelGatewayAddress(const String& address)
   {
     tunnelGatewayAddress = address;
+  }
+
+  void unitTestAdoptLocalTransportFD(int fd)
+  {
+    disconnect();
+    transportMode = TransportMode::localUnix;
+    targetLabel.assign("unit-test"_ctv);
+    transportFD = fd;
   }
 #endif
 

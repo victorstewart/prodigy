@@ -923,6 +923,44 @@ int main(void)
   }
 
   {
+    int pair[2] = {-1, -1};
+    bool pairReady = ::socketpair(
+        AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0;
+    suite.expect(pairReady, "unix_control_broken_peer_fixture_created");
+    if (pairReady)
+    {
+      ::close(pair[1]);
+      pair[1] = -1;
+      pid_t child = ::fork();
+      if (child == 0)
+      {
+        struct sigaction action = {};
+        action.sa_handler = SIG_DFL;
+        ::sigemptyset(&action.sa_mask);
+        (void)::sigaction(SIGPIPE, &action, nullptr);
+        sigset_t signals = {};
+        ::sigemptyset(&signals);
+        ::sigaddset(&signals, SIGPIPE);
+        (void)::sigprocmask(SIG_UNBLOCK, &signals, nullptr);
+        MothershipSocket socket = {};
+        socket.unitTestAdoptLocalTransportFD(pair[0]);
+        Message::construct(
+            socket.wBuffer, MothershipTopic::pullClusterReport);
+        errno = 0;
+        bool sent = socket.send();
+        _exit(sent == false && errno == EPIPE ? EXIT_SUCCESS : EXIT_FAILURE);
+      }
+      ::close(pair[0]);
+      pair[0] = -1;
+      int status = 0;
+      bool waited = child > 0 && ::waitpid(child, &status, 0) == child;
+      suite.expect(
+          waited && WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS,
+          "unix_control_broken_peer_send_returns_epipe_without_sigpipe");
+    }
+  }
+
+  {
     MothershipProdigyCluster remoteCluster = {};
     remoteCluster.name = "remote-candidate-test"_ctv;
     remoteCluster.deploymentMode = MothershipClusterDeploymentMode::remote;
