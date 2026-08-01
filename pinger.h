@@ -1,4 +1,12 @@
+#include <networking/includes.h>
+#include <networking/socket.h>
+#include <networking/stream.h>
+#include <networking/msg.h>
+#include <networking/message.h>
 #include <networking/icmp.h>
+#include <prodigy/machine.pinger.timer.h>
+#include <services/debug.h>
+#include <services/time.h>
 
 #pragma once
 
@@ -42,10 +50,19 @@ private:
   Pool<ICMPMessage, true> pool {256};
   bytell_hash_map<uint32_t, Pingee *> pingeesByPrivate4;
 
-  PingSubscriber *subscriber;
-  uint32_t src;
+  PingSubscriber *subscriber = nullptr;
+  uint32_t src = 0;
+  MachinePingerTimer timer;
 
-  TimeoutPacket timer;
+  static void timerTick(void *context)
+  {
+    static_cast<MachinePinger *>(context)->sendPings();
+  }
+
+  static void timerFailure(void *context, int result)
+  {
+    static_cast<MachinePinger *>(context)->timerFailed(result);
+  }
 
   uint16_t calculate_checksum(const uint8_t *data, size_t length)
   {
@@ -70,16 +87,28 @@ private:
 
   Pingee *createPingee(MachineBase *machine)
   {
+    if (auto it = pingeesByPrivate4.find(machine->private4); it != pingeesByPrivate4.end())
+    {
+      Pingee *pingee = it->second;
+      pingee->machine = machine;
+      pingee->nOutstanding = 0;
+      pingee->untilMs = 0;
+      pingee->nRemaining = 0;
+      pingee->finiteCount = false;
+      pingee->nextMs = 0;
+      return pingee;
+    }
+
     Pingee *pingee = new Pingee();
     pingee->machine = machine;
     pingee->finiteCount = false;
     pingee->nRemaining = 0;
     pingee->nextMs = 0;
-    pingeesByPrivate4.insert_or_assign(machine->private4, pingee);
+    pingeesByPrivate4.emplace(machine->private4, pingee);
 
     if (pingeesByPrivate4.size() == 1)
     {
-      Ring::queueTimeoutMultishot(&timer);
+      timer.start();
     }
 
     return pingee;
@@ -87,12 +116,13 @@ private:
 
 public:
 
-  MachinePinger() = default;
+  MachinePinger()
+      : timer(this, timerTick, timerFailure, ping_interval_ms)
+  {}
 
   ~MachinePinger()
   {
     RingDispatcher::eraseMultiplexee(this);
-    Ring::queueCancelTimeout(&timer);
 
     if (isFixedFile && fslot >= 0 && Ring::getRingFD() > 0)
     {
@@ -161,12 +191,10 @@ public:
     pool.relinquish(message);
   }
 
-  void receivePing(uint8_t *payload)
+  void receivePing(uint32_t source)
   {
-    // read the source address on the ip header
-    struct iphdr *ip_hdr = (struct iphdr *)payload;
-
-    auto it = pingeesByPrivate4.find(ip_hdr->saddr);
+    // Match the source address read from the IP header.
+    auto it = pingeesByPrivate4.find(source);
 
     if (it != pingeesByPrivate4.end())
     {
@@ -175,14 +203,16 @@ public:
 
       if (pingee->indefinitely() == false)
       {
-        subscriber->machinePingable(pingee->machine);
-
+        MachineBase *machine = pingee->machine;
         delete pingee;
         pingeesByPrivate4.erase(it);
         if (pingeesByPrivate4.size() == 0)
         {
-          Ring::queueCancelTimeout(&timer);
+          timer.stop();
         }
+
+        PingSubscriber *recipient = subscriber;
+        recipient->machinePingable(machine);
       }
     }
   }
@@ -190,6 +220,7 @@ public:
   void sendPings(void)
   {
     int64_t nowMs = Time::now<TimeResolution::ms>();
+    Vector<MachineBase *> unpingable;
 
     for (auto it = pingeesByPrivate4.begin(); it != pingeesByPrivate4.end();)
     {
@@ -200,7 +231,7 @@ public:
       {
         if (pingee->nOutstanding > 0)
         {
-          subscriber->machineUnpingable(pingee->machine);
+          unpingable.push_back(pingee->machine);
         }
 
         erase = true;
@@ -213,7 +244,7 @@ public:
           {
             if (pingee->nOutstanding > 0)
             {
-              subscriber->machineUnpingable(pingee->machine);
+              unpingable.push_back(pingee->machine);
             }
 
             erase = true;
@@ -243,7 +274,34 @@ public:
 
     if (pingeesByPrivate4.size() == 0)
     {
-      Ring::queueCancelTimeout(&timer);
+      timer.stop();
+    }
+
+    PingSubscriber *recipient = subscriber;
+    for (MachineBase *machine : unpingable)
+    {
+      recipient->machineUnpingable(machine);
+    }
+  }
+
+  void timerFailed(int result)
+  {
+    basics_log("MachinePinger multishot timer failed result=%d\n", result);
+
+    Vector<MachineBase *> unpingable;
+    unpingable.reserve(pingeesByPrivate4.size());
+    for (const auto& [private4, pingee] : pingeesByPrivate4)
+    {
+      (void)private4;
+      unpingable.push_back(pingee->machine);
+      delete pingee;
+    }
+    pingeesByPrivate4.clear();
+
+    PingSubscriber *recipient = subscriber;
+    for (MachineBase *machine : unpingable)
+    {
+      recipient->machineUnpingable(machine);
     }
   }
 
@@ -286,7 +344,7 @@ public:
 
       if (pingeesByPrivate4.size() == 0)
       {
-        Ring::queueCancelTimeout(&timer);
+        timer.stop();
       }
     }
   }
@@ -301,16 +359,17 @@ public:
     bgid = Ring::createBufferRing(sizeof(struct io_uring_recvmsg_out) + sizeof(struct iphdr) + sizeof(struct icmphdr), 256);
     Ring::queueRecvmsgMultishot(this);
 
-    timer.originator = this;
-    timer.setTimeoutMs(ping_interval_ms);
   }
 
   void recvmsgMultishotHandler(void *socket, struct io_uring_recvmsg_out *package, int result, bool mustRefresh)
   {
+    uint32_t source = 0;
+    bool received = false;
     if (result > 0 && package)
     {
       uint8_t *payload = reinterpret_cast<uint8_t *>(io_uring_recvmsg_payload(package, &msgh));
-      receivePing(payload);
+      source = reinterpret_cast<struct iphdr *>(payload)->saddr;
+      received = true;
     }
 
     if (package)
@@ -321,6 +380,10 @@ public:
     {
       Ring::queueRecvmsgMultishot(this);
     }
+    if (received)
+    {
+      receivePing(source);
+    }
   }
 
   void sendmsgHandler(void *socket, struct msghdr *msg, int result)
@@ -328,8 +391,4 @@ public:
     pingSent(msg, result);
   }
 
-  void timeoutMultishotHandler(TimeoutPacket *packet, int result)
-  {
-    sendPings();
-  }
 };

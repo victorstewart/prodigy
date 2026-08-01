@@ -544,6 +544,7 @@ add_executable(prodigy_transport_tls_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prod
 add_executable(prodigy_cluster_topology_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cluster_topology_unit.cpp)
 add_executable(prodigy_neuron_hub_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_neuron_hub_unit.cpp)
 add_executable(prodigy_ring_recvmsg_multishot_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_ring_recvmsg_multishot_unit.cpp)
+add_executable(prodigy_machine_pinger_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_machine_pinger_unit.cpp)
 add_executable(prodigy_switchboard_routable_prefix_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_switchboard_routable_prefix_unit.cpp)
 add_executable(prodigy_switchboard_balancer_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_switchboard_balancer_unit.cpp)
 add_executable(prodigy_container_storage_layout_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_container_storage_layout_unit.cpp)
@@ -627,6 +628,7 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_cluster_topology_unit
    prodigy_neuron_hub_unit
    prodigy_ring_recvmsg_multishot_unit
+   prodigy_machine_pinger_unit
    prodigy_switchboard_routable_prefix_unit
    prodigy_switchboard_balancer_unit
    prodigy_container_storage_layout_unit
@@ -814,6 +816,7 @@ target_compile_definitions(prodigy_sdk_cpp_unit PUBLIC PRODIGY_DEBUG=1 PRODIGY_S
 target_compile_definitions(prodigy_mesh_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_deployments_unit PUBLIC PRODIGY_DEBUG=1 PRODIGY_ACME_HOOKS_DIR="${PRODIGY_ROOT}/prodigy/acme")
 target_compile_definitions(prodigy_ring_recvmsg_multishot_unit PUBLIC PRODIGY_DEBUG=1)
+target_compile_definitions(prodigy_machine_pinger_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_brain_config_ssh_replication_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_brain_replication_credentials_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_pairing_parser_adversarial_unit PUBLIC PRODIGY_DEBUG=1)
@@ -866,6 +869,7 @@ target_compile_options(prodigy_transport_tls_unit PUBLIC -O2)
 target_compile_options(prodigy_cluster_topology_unit PUBLIC -O2)
 target_compile_options(prodigy_neuron_hub_unit PUBLIC -O2)
 target_compile_options(prodigy_ring_recvmsg_multishot_unit PUBLIC -O2)
+target_compile_options(prodigy_machine_pinger_unit PUBLIC -O2)
 target_compile_options(prodigy_switchboard_routable_prefix_unit PUBLIC -O2)
 target_compile_options(prodigy_switchboard_balancer_unit PUBLIC -O2)
 target_compile_options(prodigy_container_storage_layout_unit PUBLIC -O2)
@@ -1596,6 +1600,11 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    add_test(
       NAME prodigy_ring_recvmsg_multishot_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_ring_recvmsg_multishot_unit
+   )
+
+   add_test(
+      NAME prodigy_machine_pinger_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_machine_pinger_unit
    )
 
    add_test(
