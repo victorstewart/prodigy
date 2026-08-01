@@ -534,6 +534,65 @@ int main(void)
 {
   TestSuite suite;
 
+  ProdigyLinuxCPUList cpus = {};
+  String formattedCPUs = {};
+  suite.expect(
+      prodigyParseLinuxCPUList(String("0-3,8-11\n"_ctv), cpus) &&
+          cpus.count == 8 && cpus.maxPlusOne == 12 && cpus.contains[0] &&
+          cpus.contains[3] && cpus.contains[8] && cpus.contains[11] &&
+          cpus.contains[4] == 0 &&
+          prodigyFormatLinuxCPUList(cpus, formattedCPUs) &&
+          formattedCPUs == "0-3,8-11"_ctv,
+      "linux_cpulist_preserves_sparse_ranges");
+  suite.expect(
+      prodigyParseLinuxCPUList(String("8"_ctv), cpus) && cpus.count == 1 &&
+          cpus.maxPlusOne == 9 && cpus.contains[8] && cpus.contains[0] == 0,
+      "linux_cpulist_single_cpu_does_not_invent_lower_cpus");
+  suite.expect(
+      prodigyParseLinuxCPUList(String("0-3,3-4"_ctv), cpus) == false &&
+          prodigyParseLinuxCPUList(String("4-2"_ctv), cpus) == false &&
+          prodigyParseLinuxCPUList(String("0,256"_ctv), cpus) == false &&
+          prodigyParseLinuxCPUList(String("0,"_ctv), cpus) == false,
+      "linux_cpulist_rejects_overlap_reversal_overflow_and_trailing_separator");
+
+  suite.expect(
+      prodigyCgroupWriteComplete(4, 4) &&
+          prodigyCgroupWriteComplete(3, 4) == false &&
+          prodigyCgroupWriteComplete(-1, 4) == false,
+      "cgroup_setting_requires_complete_successful_write");
+  suite.expect(
+      prodigyCgroupEventsFrozen(String("populated 1\nfrozen 1\n"_ctv)) &&
+          prodigyCgroupEventsFrozen(String("populated 1\nfrozen 0\n"_ctv)) == false &&
+          prodigyCgroupEventsFrozen(String("notfrozen 1\n"_ctv)) == false,
+      "cgroup_freeze_completion_requires_exact_kernel_event");
+  suite.expect(
+      ContainerManager::freezeRunningContainer(-1) == false &&
+          ContainerManager::unfreezeRunningContainer(-1) == false,
+      "cgroup_freeze_operations_reject_invalid_descriptor");
+
+  ContainerPlan missingRootPlan = {};
+  Container *missingRootContainer = nullptr;
+  String missingRootFailure = {};
+  NeuronBase *savedNeuron = thisNeuron;
+  thisNeuron = nullptr;
+  ContainerManager::createContainer(
+      missingRootPlan,
+      String("/unused"_ctv),
+      missingRootContainer,
+      &missingRootFailure);
+  thisNeuron = savedNeuron;
+  suite.expect(
+      missingRootContainer == nullptr && missingRootFailure.size() > 0,
+      "container_creation_requires_ready_root_cgroup");
+
+  Container missingCgroup = {};
+  String missingCgroupFailure = {};
+  suite.expect(
+      ContainerManager::startContainer(
+          &missingCgroup, false, &missingCgroupFailure) == false &&
+          missingCgroupFailure == "container cgroup is unavailable"_ctv,
+      "container_start_rejects_missing_mandatory_cgroup");
+
   ApplicationConfig sharedCPUConfig {};
   sharedCPUConfig.cpuMode = ApplicationCPUMode::shared;
   sharedCPUConfig.nLogicalCores = 2;

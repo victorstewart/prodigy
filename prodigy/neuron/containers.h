@@ -25,6 +25,7 @@
 #include <sys/file.h>
 #include <arpa/inet.h>
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstring>
 #include <filesystem>
@@ -58,6 +59,171 @@ constexpr static int64_t failedContainerArtifactCleanupIntervalMs = 3LL * 60LL *
 static inline uint16_t prodigyContainerReservedCoreCount(uint32_t lcoreCount)
 {
   return (lcoreCount > nReservedCores) ? uint16_t(nReservedCores) : uint16_t(0);
+}
+
+struct ProdigyLinuxCPUList {
+  std::array<uint8_t, 256> contains = {};
+  uint16_t count = 0;
+  uint16_t maxPlusOne = 0;
+};
+
+static inline bool prodigyParseLinuxCPUList(
+    const String& input,
+    ProdigyLinuxCPUList& parsed)
+{
+  parsed = {};
+  uint64_t begin = 0;
+  uint64_t end = input.size();
+  while (begin < end &&
+         std::isspace(static_cast<unsigned char>(input[begin])))
+  {
+    begin += 1;
+  }
+  while (end > begin &&
+         std::isspace(static_cast<unsigned char>(input[end - 1])))
+  {
+    end -= 1;
+  }
+  if (begin == end)
+  {
+    return false;
+  }
+
+  uint64_t cursor = begin;
+  int32_t previousEnd = -1;
+  auto parseCPU = [&](uint16_t& cpu) -> bool {
+    if (cursor >= end ||
+        std::isdigit(static_cast<unsigned char>(input[cursor])) == 0)
+    {
+      return false;
+    }
+    uint32_t value = 0;
+    do
+    {
+      value = (value * 10) + uint32_t(input[cursor] - '0');
+      if (value > 255)
+      {
+        return false;
+      }
+      cursor += 1;
+    } while (cursor < end &&
+             std::isdigit(static_cast<unsigned char>(input[cursor])));
+    cpu = uint16_t(value);
+    return true;
+  };
+
+  while (cursor < end)
+  {
+    uint16_t first = 0;
+    uint16_t last = 0;
+    if (parseCPU(first) == false)
+    {
+      return false;
+    }
+    last = first;
+    if (cursor < end && input[cursor] == '-')
+    {
+      cursor += 1;
+      if (parseCPU(last) == false || last < first)
+      {
+        return false;
+      }
+    }
+    if (int32_t(first) <= previousEnd)
+    {
+      return false;
+    }
+    for (uint16_t cpu = first;; cpu += 1)
+    {
+      parsed.contains[cpu] = 1;
+      parsed.count += 1;
+      if (cpu == last)
+      {
+        break;
+      }
+    }
+    parsed.maxPlusOne = uint16_t(last + 1);
+    previousEnd = last;
+    if (cursor == end)
+    {
+      break;
+    }
+    if (input[cursor] != ',')
+    {
+      return false;
+    }
+    cursor += 1;
+    if (cursor == end)
+    {
+      return false;
+    }
+  }
+  return parsed.count != 0;
+}
+
+static inline bool prodigyFormatLinuxCPUList(
+    const ProdigyLinuxCPUList& cpus,
+    String& output)
+{
+  output.clear();
+  for (uint16_t first = 0; first < 256;)
+  {
+    if (cpus.contains[first] == 0)
+    {
+      first += 1;
+      continue;
+    }
+    uint16_t last = first;
+    while (last < 255 && cpus.contains[last + 1])
+    {
+      last += 1;
+    }
+    if (output.size())
+    {
+      output.append(',');
+    }
+    String number = {};
+    number.assignItoa(first);
+    output.append(number);
+    if (last != first)
+    {
+      output.append('-');
+      number.assignItoa(last);
+      output.append(number);
+    }
+    if (last == 255)
+    {
+      break;
+    }
+    first = uint16_t(last + 1);
+  }
+  return output.size() != 0;
+}
+
+static inline bool prodigyCgroupWriteComplete(int written, uint64_t expected)
+{
+  return written >= 0 && uint64_t(written) == expected;
+}
+
+static inline bool prodigyCgroupEventsFrozen(const String& events)
+{
+  constexpr char frozen[] = "frozen 1";
+  constexpr uint64_t frozenSize = sizeof(frozen) - 1;
+  uint64_t lineStart = 0;
+  for (uint64_t cursor = 0; cursor <= events.size(); ++cursor)
+  {
+    if (cursor < events.size() && events[cursor] != '\n')
+    {
+      continue;
+    }
+    if (cursor - lineStart == frozenSize &&
+        memcmp(events.data() + lineStart, frozen, frozenSize) == 0)
+    {
+      return true;
+    }
+    lineStart = cursor + 1;
+  }
+  return false;
 }
 
 static inline bool prodigyTestClusterOvercommitsCPUs()
@@ -2036,6 +2202,7 @@ private:
 
   int slicefd;
   static inline bool rootCgroupSeeded = false;
+  static inline ProdigyLinuxCPUList containerCPUSet = {};
 
   static void reportSpinContainerFailure(const ContainerPlan& plan, const String& report)
   {
@@ -7333,7 +7500,7 @@ public:
     }
   }
 
-  static void seed_root_cgroupv2_subtree_controllers(void)
+  static bool seed_root_cgroupv2_subtree_controllers(String *failureReport = nullptr)
   {
 #if PRODIGY_DEBUG
     basics_log("seed_root_cgroupv2_subtree_controllers begin\n");
@@ -7342,6 +7509,30 @@ public:
 #if PRODIGY_DEBUG
     basics_log("seed_root_cgroupv2_subtree_controllers rootFD=%d\n", rootFD);
 #endif
+
+    if (rootFD < 0)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("failed to open root cgroup"_ctv);
+      }
+      return false;
+    }
+
+    auto requireCgroupSetting = [&](int directoryFD, StringType auto&& name, StringType auto&& value) -> bool {
+      if (prodigyCgroupWriteComplete(
+              Filesystem::openWriteAtClose(directoryFD, name, value),
+              value.size()))
+      {
+        return true;
+      }
+      if (failureReport)
+      {
+        failureReport->snprintf<"required root cgroup setting {}={} failed"_ctv>(
+            String(name), String(value));
+      }
+      return false;
+    };
 
     // leave the OS 8GB and take the rest
 
@@ -7354,7 +7545,14 @@ public:
     // page tables 3MB (for 32GB memory)
 
     // '+cpuset +cpu +io +memory +pids +misc' (hugetlb no longer used)
-    Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/cgroup.subtree_control"_ctv, "+cpuset +cpu +memory +pids"_ctv);
+    if (requireCgroupSetting(
+            rootFD,
+            "cgroup.subtree_control"_ctv,
+            "+cpuset +cpu +memory +pids"_ctv) == false)
+    {
+      close(rootFD);
+      return false;
+    }
 #if PRODIGY_DEBUG
     basics_log("seed_root_cgroupv2_subtree_controllers wrote root subtree_control\n");
 #endif
@@ -7380,93 +7578,144 @@ public:
         }
       }
     }
+    if (containersFD < 0)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("failed to open containers cgroup"_ctv);
+      }
+      close(rootFD);
+      return false;
+    }
 #if PRODIGY_DEBUG
     basics_log("seed_root_cgroupv2_subtree_controllers containersFD=%d\n", containersFD);
 #endif
 
-    Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/containers.slice/cgroup.subtree_control"_ctv, "+cpuset +cpu +memory +pids"_ctv);
-    Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/containers.slice/cgroup.max.depth"_ctv, "2"_ctv);
+    if (requireCgroupSetting(
+            containersFD,
+            "cgroup.subtree_control"_ctv,
+            "+cpuset +cpu +memory +pids"_ctv) == false ||
+        requireCgroupSetting(
+            containersFD,
+            "cgroup.max.depth"_ctv,
+            "2"_ctv) == false)
+    {
+      close(containersFD);
+      close(rootFD);
+      return false;
+    }
 #if PRODIGY_DEBUG
     basics_log("seed_root_cgroupv2_subtree_controllers wrote containers controls\n");
 #endif
 
     String cpusEffective;
-    Filesystem::openReadAtClose(-1, "/sys/fs/cgroup/cpuset.cpus.effective"_ctv, cpusEffective);
+    Filesystem::openReadAtClose(rootFD, "cpuset.cpus.effective"_ctv, cpusEffective);
     if (cpusEffective.size() == 0)
     {
-      long nCores = sysconf(_SC_NPROCESSORS_ONLN);
-      if (nCores < 1)
+      if (failureReport)
       {
-        nCores = 1;
+        failureReport->assign("root effective CPU set is unavailable"_ctv);
       }
-      cpusEffective.snprintf<"0-{itoa}"_ctv>(nCores - 1);
+      close(containersFD);
+      close(rootFD);
+      return false;
     }
 #if PRODIGY_DEBUG
     basics_log("seed_root_cgroupv2_subtree_controllers cpuset.cpus.effective=%s\n", cpusEffective.c_str());
 #endif
 
-    // Parse effective CPUs in the form "0-7" or single values like "0"
-    uint16_t startIdx = 0;
-    uint16_t endIdx = 0;
+    // Parse Linux's canonical comma-separated singleton and range form without
+    // inventing CPUs between sparse ranges.
+    ProdigyLinuxCPUList effectiveCPUs = {};
+    if (prodigyParseLinuxCPUList(cpusEffective, effectiveCPUs) == false)
     {
-      const char *s = cpusEffective.c_str();
-      const char *dash = strchr(s, '-');
-      if (dash)
+      if (failureReport)
       {
-        startIdx = (uint16_t)atoi(s);
-        endIdx = (uint16_t)atoi(dash + 1);
+        failureReport->assign("root effective CPU set is malformed or exceeds 256 CPUs"_ctv);
       }
-      else
-      {
-        startIdx = (uint16_t)atoi(s);
-        endIdx = startIdx;
-      }
-
-      if (endIdx < startIdx)
-      {
-        endIdx = startIdx;
-      }
-
-      if (endIdx > 255)
-      {
-        endIdx = 255;
-      }
+      close(containersFD);
+      close(rootFD);
+      return false;
     }
 
-    thisNeuron->lcoreCount = endIdx + 1; // CPUs are 0-indexed
-    uint16_t reservedCores = prodigyContainerReservedCoreCount(thisNeuron->lcoreCount);
-    // Initialize all cores as available (0)
-    for (uint16_t i = 0; i < 256; ++i)
+    const uint16_t reservedCores =
+        prodigyContainerReservedCoreCount(effectiveCPUs.count);
+    ProdigyLinuxCPUList availableCPUs = {};
+    uint16_t reserved = 0;
+    for (uint16_t cpu = 0; cpu < effectiveCPUs.maxPlusOne; ++cpu)
     {
-      thisNeuron->lcores[i] = 0;
-    }
-    // Reserve the first nReservedCores for the OS by marking them non-zero (unavailable)
-    for (uint16_t i = 0; i < reservedCores && i < thisNeuron->lcoreCount; ++i)
-    {
-      thisNeuron->lcores[i] = 0xFFFF;
+      if (effectiveCPUs.contains[cpu] == 0)
+      {
+        continue;
+      }
+      // Reserve the first nReservedCores for the OS by leaving them unavailable.
+      if (reserved < reservedCores)
+      {
+        reserved += 1;
+        continue;
+      }
+      availableCPUs.contains[cpu] = 1;
+      availableCPUs.count += 1;
+      availableCPUs.maxPlusOne = uint16_t(cpu + 1);
     }
 
-    // Remove OS-reserved cores from the containers slice: set e.g. "2-<end>"
+    // Remove OS-reserved cores from the containers slice.
     String cpusRange;
-    uint16_t firstContainerCore = (reservedCores < thisNeuron->lcoreCount) ? reservedCores : thisNeuron->lcoreCount - 1;
-    cpusRange.snprintf<"{itoa}-{itoa}"_ctv>(firstContainerCore, endIdx);
-    Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/containers.slice/cpuset.cpus"_ctv, cpusRange);
-    if (prodigyTestClusterOvercommitsCPUs() == false)
+    if (prodigyFormatLinuxCPUList(availableCPUs, cpusRange) == false ||
+        requireCgroupSetting(containersFD, "cpuset.cpus"_ctv, cpusRange) == false ||
+        (prodigyTestClusterOvercommitsCPUs() == false &&
+         requireCgroupSetting(
+             containersFD,
+             "cpuset.cpus.partition"_ctv,
+             "isolated"_ctv) == false))
     {
-      Filesystem::openWriteAtClose(-1, "/sys/fs/cgroup/containers.slice/cpuset.cpus.partition"_ctv, "isolated"_ctv);
+      if (failureReport && failureReport->size() == 0)
+      {
+        failureReport->assign("no CPUs remain after reserving host cores"_ctv);
+      }
+      close(containersFD);
+      close(rootFD);
+      return false;
+    }
+
+    thisNeuron->lcoreCount = effectiveCPUs.maxPlusOne;
+    containerCPUSet = availableCPUs;
+    // Initialize all cores as unavailable, then expose only the effective,
+    // non-reserved CPUs as available to the container scheduler.
+    for (uint16_t cpu = 0; cpu < 256; ++cpu)
+    {
+      thisNeuron->lcores[cpu] =
+          containerCPUSet.contains[cpu] ? 0 : 0xFFFF;
     }
 #if PRODIGY_DEBUG
     basics_log("seed_root_cgroupv2_subtree_controllers complete range=%s lcoreCount=%u\n", cpusRange.c_str(), unsigned(thisNeuron->lcoreCount));
 #endif
 
-    if (containersFD >= 0)
+    close(containersFD);
+    close(rootFD);
+    return true;
+  }
+
+  static bool ensureRootCgroupReady(String *failureReport = nullptr)
+  {
+    if (rootCgroupSeeded)
     {
-      close(containersFD);
+      return true;
     }
-    if (rootFD >= 0)
+    if (thisNeuron == nullptr)
     {
-      close(rootFD);
+      if (failureReport)
+      {
+        failureReport->assign("root cgroup initialization requires a Neuron"_ctv);
+      }
+      return false;
     }
+    if (seed_root_cgroupv2_subtree_controllers(failureReport) == false)
+    {
+      return false;
+    }
+    rootCgroupSeeded = true;
+    return true;
   }
 
   static int mount2(StringType auto&& source, StringType auto&& target, uint64_t flags, int pid = -1)
@@ -7597,7 +7846,7 @@ public:
         : container->plan.config.maxPids - 1;
     auto requireCgroupSetting = [&](StringType auto&& name, StringType auto&& value) -> bool {
       const int written = Filesystem::openWriteAtClose(middirfd, name, value);
-      if (written == int(value.size()))
+      if (prodigyCgroupWriteComplete(written, value.size()))
       {
         return true;
       }
@@ -7619,15 +7868,25 @@ public:
 
     if (container->plan.usesSharedCPUs())
     {
-      uint16_t reservedCores = prodigyContainerReservedCoreCount(thisNeuron->lcoreCount);
-      uint16_t firstContainerCore = (reservedCores < thisNeuron->lcoreCount) ? reservedCores : (thisNeuron->lcoreCount - 1);
-      path.snprintf<"{itoa}-{itoa}"_ctv>(firstContainerCore, uint16_t(thisNeuron->lcoreCount - 1));
+      if (prodigyFormatLinuxCPUList(containerCPUSet, path) == false)
+      {
+        if (failureReport)
+        {
+          failureReport->assign("container CPU set is unavailable"_ctv);
+        }
+        Filesystem::close(middirfd);
+        return -1;
+      }
     }
     else
     {
       path.snprintf<"{itoa}-{itoa}"_ctv>(container->lcores[0], container->lcores[container->plan.logicalCores() - 1]);
     }
-    Filesystem::openWriteAtClose(middirfd, "cpuset.cpus"_ctv, path);
+    if (requireCgroupSetting("cpuset.cpus"_ctv, path) == false)
+    {
+      Filesystem::close(middirfd);
+      return -1;
+    }
 
     if (container->plan.usesSharedCPUs())
     {
@@ -7659,7 +7918,11 @@ public:
 
     if (container->plan.usesIsolatedCPUs() && prodigyTestClusterOvercommitsCPUs() == false)
     {
-      Filesystem::openWriteAtClose(middirfd, "cpuset.cpus.partition"_ctv, "root"_ctv);
+      if (requireCgroupSetting("cpuset.cpus.partition"_ctv, "root"_ctv) == false)
+      {
+        Filesystem::close(middirfd);
+        return -1;
+      }
     }
 
     String maxPids_string;
@@ -7671,10 +7934,14 @@ public:
     }
 
     path.snprintf<"{itoa}M"_ctv>(container->plan.memoryMB());
-    Filesystem::openWriteAtClose(middirfd, "memory.low"_ctv, path);
-    Filesystem::openWriteAtClose(middirfd, "memory.high"_ctv, path);
-    Filesystem::openWriteAtClose(middirfd, "memory.max"_ctv, path);
-    Filesystem::openWriteAtClose(middirfd, "memory.swap.max"_ctv, "0"_ctv);
+    if (requireCgroupSetting("memory.low"_ctv, path) == false ||
+        requireCgroupSetting("memory.high"_ctv, path) == false ||
+        requireCgroupSetting("memory.max"_ctv, path) == false ||
+        requireCgroupSetting("memory.swap.max"_ctv, "0"_ctv) == false)
+    {
+      Filesystem::close(middirfd);
+      return -1;
+    }
 
     // Hugepages disabled; no hugetlb configuration
 
@@ -7696,7 +7963,20 @@ public:
       }
     }
 
-    Filesystem::openWriteAtClose(leafdirfd, "cgroup.freeze"_ctv, "0"_ctv);
+    if (prodigyCgroupWriteComplete(
+            Filesystem::openWriteAtClose(
+                leafdirfd, "cgroup.freeze"_ctv, "0"_ctv),
+            1) == false)
+    {
+      if (failureReport)
+      {
+        failureReport->assign(
+            "required container cgroup setting cgroup.freeze=0 failed"_ctv);
+      }
+      Filesystem::close(leafdirfd);
+      Filesystem::close(middirfd);
+      return -1;
+    }
 
     if (isolatedChildren > 0)
     {
@@ -7762,25 +8042,38 @@ public:
     return leafdirfd;
   }
 
-  static void freezeRunningContainer(int fd)
+  static bool freezeRunningContainer(int fd)
   {
-    Filesystem::openWriteAtClose(fd, "cgroup.freeze"_ctv, "1"_ctv);
-
-    String workingString;
-    workingString.reserve(1);
-    workingString.resize(1);
-
-    // wait for it to be frozen
-    do
+    if (fd < 0 ||
+        prodigyCgroupWriteComplete(
+            Filesystem::openWriteAtClose(fd, "cgroup.freeze"_ctv, "1"_ctv),
+            1) == false)
     {
-      usleep(10); // wait 10 microseconds
-      read(fd, workingString.data(), 1);
-    } while (workingString != "1"_ctv);
+      return false;
+    }
+
+    // Wait for the kernel's cgroup.events completion signal, but never let a
+    // wedged cgroup stall the Neuron event loop forever.
+    for (uint32_t attempt = 0; attempt < 1'000; attempt += 1)
+    {
+      String events = {};
+      Filesystem::openReadAtClose(fd, "cgroup.events"_ctv, events);
+      if (prodigyCgroupEventsFrozen(events))
+      {
+        return true;
+      }
+      usleep(1'000);
+    }
+    (void)Filesystem::openWriteAtClose(fd, "cgroup.freeze"_ctv, "0"_ctv);
+    return false;
   }
 
-  static void unfreezeRunningContainer(int fd)
+  static bool unfreezeRunningContainer(int fd)
   {
-    Filesystem::openWriteAtClose(fd, "cgroup.freeze"_ctv, "0"_ctv);
+    return fd >= 0 &&
+           prodigyCgroupWriteComplete(
+               Filesystem::openWriteAtClose(fd, "cgroup.freeze"_ctv, "0"_ctv),
+               1);
   }
 
   static bool findAvailableCoreSpan(Container *container)
@@ -8214,9 +8507,10 @@ public:
       close(container->pidfd);
       container->pidfd = -1;
     }
-    if (container->cgroup > 0)
+    if (container->cgroup >= 0)
     {
       close(container->cgroup);
+      container->cgroup = -1;
     }
     for (int fd : container->isolatedChildCgroups)
     {
@@ -8264,6 +8558,10 @@ public:
         failure->assign(
             "host network namespace or requested capability is not approved"_ctv);
       }
+      return;
+    }
+    if (ensureRootCgroupReady(failure) == false)
+    {
       return;
     }
     uint32_t userID = 0;
@@ -8323,20 +8621,19 @@ public:
     container->cgroup = create_cgroupv2(container, &cgroupFailure);
     if (container->cgroup < 0)
     {
-      if (container->plan.config.isolatedChildMemoryMB != 0 || cgroupFailure.size() > 0)
+      if (failure)
       {
-        if (failure)
-        {
-          failure->assign(cgroupFailure.size() > 0 ? cgroupFailure : "isolated child cgroup creation failed"_ctv);
-        }
-        basics_log("createContainer rejected uuid=%llu reason=%s\n",
-                   (unsigned long long)container->plan.uuid,
-                   cgroupFailure.size() > 0 ? cgroupFailure.c_str() :
-                                              "isolated child cgroup creation failed");
-        cleanupContainerAfterFailedCreate(container);
-        container = nullptr;
-        return;
+        failure->assign(cgroupFailure.size() > 0
+                            ? cgroupFailure
+                            : "container cgroup creation failed"_ctv);
       }
+      basics_log("createContainer rejected uuid=%llu reason=%s\n",
+                 (unsigned long long)container->plan.uuid,
+                 cgroupFailure.size() > 0 ? cgroupFailure.c_str() :
+                                            "container cgroup creation failed");
+      cleanupContainerAfterFailedCreate(container);
+      container = nullptr;
+      return;
     }
 
     struct DeploymentExtractionLock {
@@ -9671,12 +9968,28 @@ public:
 
   static bool startContainer(Container *container, bool isRestart = false, String *failureReport = nullptr)
   {
-    if (container == nullptr || approveCapabilities(container->plan) == false)
+    if (container == nullptr)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("container is unavailable"_ctv);
+      }
+      return false;
+    }
+    if (approveCapabilities(container->plan) == false)
     {
       if (failureReport)
       {
         failureReport->assign(
             "host network namespace or requested capability is not approved"_ctv);
+      }
+      return false;
+    }
+    if (container->cgroup < 0)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("container cgroup is unavailable"_ctv);
       }
       return false;
     }
@@ -10570,10 +10883,15 @@ public:
       co_return;
     }
 
-    if (rootCgroupSeeded == false)
+    String cgroupFailure = {};
+    if (ensureRootCgroupReady(&cgroupFailure) == false)
     {
-      seed_root_cgroupv2_subtree_controllers();
-      rootCgroupSeeded = true;
+      if (cgroupFailure.size() == 0)
+      {
+        cgroupFailure.assign("root cgroup initialization failed"_ctv);
+      }
+      reportSpinContainerFailure(plan, cgroupFailure);
+      co_return;
     }
 
     if (replaceContainerUUID > 0)
@@ -10906,7 +11224,7 @@ public:
       close(container->pidfd);
       container->pidfd = -1;
     }
-    if (container->cgroup > 0)
+    if (container->cgroup >= 0)
     {
       close(container->cgroup);
       container->cgroup = -1;

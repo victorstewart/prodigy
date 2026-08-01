@@ -7,8 +7,7 @@ foreach(REQUIRED IN ITEMS
    "requireCgroupSetting(\"cgroup.max.depth\"_ctv, \"1\"_ctv)"
    "requireCgroupSetting(\"pids.max\"_ctv, maxPids_string)"
    "requireCgroupSetting(\"cpu.max\"_ctv, cpuMax)"
-   "container->cgroup = create_cgroupv2(container, &cgroupFailure)"
-   "container->plan.config.isolatedChildMemoryMB != 0 || cgroupFailure.size() > 0")
+   "container->cgroup = create_cgroupv2(container, &cgroupFailure)")
    string(FIND "${CONTAINERS}" "${REQUIRED}" POSITION)
    if(POSITION EQUAL -1)
       message(FATAL_ERROR "container cgroup bounds must fail closed: missing ${REQUIRED}")
@@ -24,7 +23,7 @@ foreach(REQUIRED IN ITEMS
 endforeach()
 
 foreach(REQUIRED IN ITEMS
-   "if (prodigyTestClusterOvercommitsCPUs() == false)"
+   "(prodigyTestClusterOvercommitsCPUs() == false &&"
    "if (container->plan.usesIsolatedCPUs() && prodigyTestClusterOvercommitsCPUs() == false)")
    string(FIND "${CONTAINERS}" "${REQUIRED}" POSITION)
    if(POSITION EQUAL -1)
