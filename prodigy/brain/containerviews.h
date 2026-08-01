@@ -35,6 +35,13 @@ public:
   CredentialBundle credentialBundle;
   CredentialBundle pendingCredentialBundle;
   String credentialRefreshFailure;
+  String wormholeRuntimeRevision;
+  String wormholeRuntimeDesired;
+  bytell_hash_set<uint32_t> wormholeRuntimePendingMachines;
+  bytell_hash_set<uint32_t> wormholeRuntimeFailedMachines;
+  String wormholeRuntimeFailure;
+  TimeoutPacket *wormholeRuntimeAckDeadline = nullptr;
+  bool wormholeRuntimeFailureSuppressedReady = false;
   bool statefulTopologyCutoverReady = false;
   uint32_t statefulTopologyCutoverSourceEpoch = 0;
   uint32_t statefulTopologyCutoverTargetEpoch = 0;

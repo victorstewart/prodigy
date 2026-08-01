@@ -989,6 +989,13 @@ add_custom_command(OUTPUT container.ingress.router.ebpf.o
 
 add_custom_target(container_ingress_router ALL DEPENDS container.ingress.router.ebpf.o)
 
+add_custom_command(OUTPUT container.ingress.router.wormhole-full.ebpf.o
+                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" ${PRODIGY_EBPF_COMPILE_FLAGS} -DWORMHOLE_FLOW_MAX_ENTRIES=1 -DWORMHOLE_PENDING_FLOW_MAX_ENTRIES=8 -MMD -MF container.ingress.router.wormhole-full.ebpf.o.d -c ${PRODIGY_ROOT}/switchboard/kernel/container.ingress.router.ebpf.c -o container.ingress.router.wormhole-full.ebpf.o
+                   DEPENDS ${PRODIGY_ROOT}/switchboard/kernel/container.ingress.router.ebpf.c
+                   DEPFILE container.ingress.router.wormhole-full.ebpf.o.d)
+
+add_custom_target(container_ingress_wormhole_full_router DEPENDS container.ingress.router.wormhole-full.ebpf.o)
+
 add_custom_command(OUTPUT container.ingress.router.declared.ebpf.o
                    COMMAND "${PRODIGY_CLANG_EXECUTABLE}" ${PRODIGY_EBPF_COMPILE_FLAGS} -DPRODIGY_DECLARED_NETWORK_MAPS=1 -MMD -MF container.ingress.router.declared.ebpf.o.d -c ${PRODIGY_ROOT}/switchboard/kernel/container.ingress.router.ebpf.c -o container.ingress.router.declared.ebpf.o
                    DEPENDS ${PRODIGY_ROOT}/switchboard/kernel/container.ingress.router.ebpf.c
@@ -1011,9 +1018,13 @@ add_custom_command(OUTPUT container.egress.router.declared.ebpf.o
 add_custom_target(container_egress_declared_router ALL DEPENDS container.egress.router.declared.ebpf.o)
 
 add_dependencies(prodigy_container_overlay_sync_unit
-   container_egress_router)
+   container_egress_router
+   container_ingress_router
+   host_ingress_router)
 
 add_dependencies(prodigy_switchboard_whitehole_unit
+   container_ingress_router
+   container_ingress_wormhole_full_router
    host_ingress_router
    host_ingress_router_dev
    host_egress_router)

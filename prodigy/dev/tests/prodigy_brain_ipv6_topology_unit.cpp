@@ -2176,7 +2176,7 @@ int main(void)
     suite.expect(config.machineRoutes.size() == 1, "build_overlay_routing_config_builds_gateway_peer_route");
     if (config.machineRoutes.size() == 1)
     {
-      suite.expect(config.machineRoutes[0].nextHop.equals(IPAddress("fd00:30::1", true)), "build_overlay_routing_config_uses_gateway_next_hop");
+      suite.expect(config.machineRoutes[0].nextHop.equals(IPAddress("fd00:40::20", true)), "build_overlay_routing_config_preserves_remote_transport_target_across_gateway");
       suite.expect(config.machineRoutes[0].useGatewayMAC, "build_overlay_routing_config_marks_gateway_mac_route");
       suite.expect(config.machineRoutes[0].nextHopMAC.size() == 0, "build_overlay_routing_config_keeps_gateway_mac_route_unbound");
     }

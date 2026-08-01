@@ -4,7 +4,7 @@ Prodigy's packet path is designed to keep same-machine routing at zero additiona
 
 | Path | Same machine | Cross machine |
 |---|---:|---:|
-| Public ingress to container | +0 L3 bytes | +40 L3 bytes |
+| Public ingress to container | +0 L3 bytes | +52 L3 bytes |
 | Private container-to-container over IPv6 | +0 L3 bytes | +40 L3 bytes |
 | Private container-to-container over IPv4 | +0 L3 bytes | +20 L3 bytes |
 | Container egress to internet | +0 L3 bytes | Provider path dependent |
@@ -42,7 +42,7 @@ Provider networks can add their own encapsulation or MTU constraints. Those prov
 
 ## Tuning formulas
 
-- Cross-machine public ingress over Prodigy's IPv6 underlay requires `external_packet_l3_bytes + 40`.
+- Cross-machine public ingress over Prodigy's IPv6 underlay requires `external_packet_l3_bytes + 52`.
 - Private container traffic over the IPv6 overlay requires `inner_container_l3_bytes + 40`.
 - Private container traffic over the IPv4 overlay requires `inner_container_l3_bytes + 20`.
 - If sizing at Ethernet-frame level instead of L3 MTU, add `14` bytes for the Linux-visible Ethernet header, then add VLAN and FCS bytes separately.
@@ -50,7 +50,7 @@ Provider networks can add their own encapsulation or MTU constraints. Those prov
 Worked examples:
 
 - `interContainerMTU = 9000` with IPv6 overlay requires at least `9040` bytes of underlay L3 MTU, or `9054` Ethernet-frame bytes before VLAN/FCS.
-- A `1500`-byte internet packet sent across cross-machine public ingress requires at least `1540` bytes of underlay L3 MTU.
+- A public wormhole requires at least `1552` bytes of underlay L3 MTU. Admission rejects the wormhole on a smaller host, and the balancer enforces the paired `1500`-byte external L3 contract before remote encapsulation.
 
 Current caveat: the `interContainerMTU` gate runs before route classification in the container egress program. Public internet egress still has to fit the configured L3 limit even though the public path itself adds `0` bytes.
 

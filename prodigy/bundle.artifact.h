@@ -236,6 +236,24 @@ static inline bool prodigyComputeSHA256Hex(const String& payload, String& digest
   return prodigyComputeSHA256Hex(reinterpret_cast<const uint8_t *>(payload.data()), payload.size(), digest, failure);
 }
 
+static inline bool prodigyComputeWormholeDesiredStateRevision(uint32_t containerID,
+                                                              const String& desired,
+                                                              String& revision,
+                                                              String *failure = nullptr)
+{
+  uint8_t framedID[4] = {
+      uint8_t(containerID >> 24),
+      uint8_t(containerID >> 16),
+      uint8_t(containerID >> 8),
+      uint8_t(containerID),
+  };
+  String payload = {};
+  payload.reserve(sizeof(framedID) + desired.size());
+  payload.append(framedID, sizeof(framedID));
+  payload.append(desired);
+  return prodigyComputeSHA256Hex(payload, revision, failure);
+}
+
 static inline void prodigyTrimTrailingASCIIWhitespace(String& text)
 {
   while (text.size() > 0)

@@ -5,6 +5,7 @@
 #include <switchboard/common/checksum.h>
 #include <switchboard/common/public.destination.h>
 #include <switchboard/kernel/container.ingress.policy.h>
+#include <switchboard/kernel/wormhole.flow.h>
 
 // This program is attached as BPF_NETKIT_PRIMARY on the host-side primary
 // endpoint. Upstream netkit runs the program attached to the transmitting
@@ -85,6 +86,34 @@ int ct_ingress(struct __sk_buff *skb)
         }
       }
     }
+  }
+
+  bool publicWormholeIngress = skb->mark == SWITCHBOARD_WORMHOLE_SKB_MARK;
+  if (publicWormholeIngress)
+  {
+    skb->mark = 0;
+  }
+  if (protocol == BE_ETH_P_IPV6)
+  {
+    struct ipv6hdr *ip6h = (struct ipv6hdr *)l3_data;
+    if ((void *)(ip6h + 1) > data_end ||
+        switchboardClassifyWormholeIngressIPv6(ip6h, data_end, publicWormholeIngress) == false)
+    {
+      return NETKIT_DROP;
+    }
+  }
+  else if (protocol == BE_ETH_P_IP)
+  {
+    struct iphdr *iph = (struct iphdr *)l3_data;
+    if ((void *)(iph + 1) > data_end ||
+        switchboardClassifyWormholeIngressIPv4(iph, data_end, publicWormholeIngress) == false)
+    {
+      return NETKIT_DROP;
+    }
+  }
+  else if (publicWormholeIngress)
+  {
+    return NETKIT_DROP;
   }
 
   __u8 networkMode = containerNetworkMode();

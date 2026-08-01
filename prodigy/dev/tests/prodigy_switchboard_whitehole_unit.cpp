@@ -22,8 +22,9 @@
 #include <vector>
 #include <arpa/inet.h>
 #include <linux/bpf.h>
-#include <linux/ip.h>
+#include <linux/if_link.h>
 #include <netinet/icmp6.h>
+#include <netinet/ip.h>
 #include <linux/pkt_cls.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
@@ -105,6 +106,47 @@ static bool updateProgramMapElement(BPFProgram& program, StringType auto&& mapNa
   return updated;
 }
 
+template <typename Key, typename Value>
+static bool lookupProgramMapElement(BPFProgram& program, StringType auto&& mapName, const Key& key, Value& value)
+{
+  bool found = false;
+  program.openMap(mapName, [&](int mapFD) -> void {
+    found = mapFD >= 0 && bpf_map_lookup_elem(mapFD, &key, &value) == 0;
+  });
+  return found;
+}
+
+static bool installOverlayIngressPeerIPv4(BPFProgram& program, __be32 source, __be32 destination)
+{
+  switchboard_overlay_ingress_peer4_key key = {
+      .source = source,
+      .destination = destination,
+  };
+  __u8 present = 1;
+  return updateProgramMapElement(program, "ovl_peer4"_ctv, key, present);
+}
+
+static bool installOverlayIngressPeerIPv6(BPFProgram& program, const uint8_t source[16], const uint8_t destination[16])
+{
+  switchboard_overlay_ingress_peer6_key key = {};
+  std::memcpy(key.source, source, sizeof(key.source));
+  std::memcpy(key.destination, destination, sizeof(key.destination));
+  __u8 present = 1;
+  return updateProgramMapElement(program, "ovl_peer6"_ctv, key, present);
+}
+
+template <typename Key>
+static void clearProgramMap(BPFProgram& program, StringType auto&& mapName)
+{
+  program.openMap(mapName, [&](int mapFD) -> void {
+    Key key = {};
+    while (mapFD >= 0 && bpf_map_get_next_key(mapFD, nullptr, &key) == 0)
+    {
+      (void)bpf_map_delete_elem(mapFD, &key);
+    }
+  });
+}
+
 static void parseIPv6Bytes(const char *text, uint8_t out[16])
 {
   if (inet_pton(AF_INET6, text, out) != 1)
@@ -112,6 +154,17 @@ static void parseIPv6Bytes(const char *text, uint8_t out[16])
     std::fprintf(stderr, "unable to parse IPv6 address: %s\n", text);
     std::abort();
   }
+}
+
+static in_addr parseIPv4Address(const char *text)
+{
+  in_addr address = {};
+  if (inet_pton(AF_INET, text, &address) != 1)
+  {
+    std::fprintf(stderr, "unable to parse IPv4 address: %s\n", text);
+    std::abort();
+  }
+  return address;
 }
 
 static void makeContainerIPv6(uint8_t address[16],
@@ -377,132 +430,6 @@ static uint16_t checksumIPv6Transport(const uint8_t src[16],
   return foldChecksum(sum);
 }
 
-static uint32_t checksumBytesChunkedSum(const void *data, size_t size, size_t chunkBytes)
-{
-  const uint8_t *bytes = static_cast<const uint8_t *>(data);
-  uint32_t sum = 0;
-  size_t offset = 0;
-  size_t remaining = size;
-
-  auto accumulate = [&](const void *chunkData, size_t chunkSize) -> void {
-    const uint8_t *chunkBytesData = static_cast<const uint8_t *>(chunkData);
-    for (size_t index = 0; index + 1 < chunkSize; index += 2)
-    {
-      sum += static_cast<uint32_t>(chunkBytesData[index] << 8 | chunkBytesData[index + 1]);
-    }
-
-    if (chunkSize & 1U)
-    {
-      sum += static_cast<uint32_t>(chunkBytesData[chunkSize - 1] << 8);
-    }
-  };
-
-  while (remaining >= chunkBytes)
-  {
-    accumulate(bytes + offset, chunkBytes);
-    offset += chunkBytes;
-    remaining -= chunkBytes;
-  }
-
-  if (remaining & 64U)
-  {
-    accumulate(bytes + offset, 64);
-    offset += 64;
-    remaining -= 64;
-  }
-
-  if (remaining & 32U)
-  {
-    accumulate(bytes + offset, 32);
-    offset += 32;
-    remaining -= 32;
-  }
-
-  if (remaining & 16U)
-  {
-    accumulate(bytes + offset, 16);
-    offset += 16;
-    remaining -= 16;
-  }
-
-  if (remaining & 8U)
-  {
-    accumulate(bytes + offset, 8);
-    offset += 8;
-    remaining -= 8;
-  }
-
-  if (remaining & 4U)
-  {
-    accumulate(bytes + offset, 4);
-    offset += 4;
-    remaining -= 4;
-  }
-
-  if (remaining > 0)
-  {
-    uint8_t tailWord[4] = {};
-    std::memcpy(tailWord, bytes + offset, remaining);
-    accumulate(tailWord, sizeof(tailWord));
-  }
-
-  return sum;
-}
-
-static uint16_t checksumBytesChunked(const void *data, size_t size, size_t chunkBytes)
-{
-  return foldChecksum(checksumBytesChunkedSum(data, size, chunkBytes));
-}
-
-static uint16_t checksumIPv6TransportChunked(const uint8_t src[16],
-                                             const uint8_t dst[16],
-                                             uint8_t nextHeader,
-                                             const void *transport,
-                                             size_t transportSize,
-                                             size_t checksumByteOffset,
-                                             size_t chunkBytes)
-{
-  const uint8_t *segmentBytes = static_cast<const uint8_t *>(transport);
-  uint32_t sum = 0;
-  uint8_t lengthBytes[4] = {
-      static_cast<uint8_t>((transportSize >> 24) & 0xffU),
-      static_cast<uint8_t>((transportSize >> 16) & 0xffU),
-      static_cast<uint8_t>((transportSize >> 8) & 0xffU),
-      static_cast<uint8_t>(transportSize & 0xffU)};
-  uint8_t nextHeaderBytes[4] = {0, 0, 0, nextHeader};
-  size_t suffixOffset = checksumByteOffset + sizeof(uint16_t);
-
-  auto accumulate = [&](const void *data, size_t size) -> void {
-    const uint8_t *bytes = static_cast<const uint8_t *>(data);
-    for (size_t index = 0; index + 1 < size; index += 2)
-    {
-      sum += static_cast<uint32_t>(bytes[index] << 8 | bytes[index + 1]);
-    }
-
-    if (size & 1U)
-    {
-      sum += static_cast<uint32_t>(bytes[size - 1] << 8);
-    }
-  };
-
-  accumulate(src, 16);
-  accumulate(dst, 16);
-  accumulate(lengthBytes, sizeof(lengthBytes));
-  accumulate(nextHeaderBytes, sizeof(nextHeaderBytes));
-
-  if (checksumByteOffset > 0)
-  {
-    sum += checksumBytesChunkedSum(segmentBytes, checksumByteOffset, chunkBytes);
-  }
-
-  if (transportSize > suffixOffset)
-  {
-    sum += checksumBytesChunkedSum(segmentBytes + suffixOffset, transportSize - suffixOffset, chunkBytes);
-  }
-
-  return foldChecksum(sum);
-}
-
 static uint16_t replaceChecksumIPv6AddressIncremental(uint16_t checksum, const uint8_t oldValue[16], const uint8_t newValue[16])
 {
   uint16_t updated = checksum;
@@ -518,10 +445,11 @@ static std::vector<uint8_t> makeIPv4L4EthernetFrame(const struct in_addr& source
                                                     const struct in_addr& destination,
                                                     uint8_t proto,
                                                     uint16_t sourcePort,
-                                                    uint16_t destinationPort)
+                                                    uint16_t destinationPort,
+                                                    size_t payloadBytes = 0)
 {
   const size_t l4Size = (proto == IPPROTO_TCP) ? sizeof(struct tcphdr) : sizeof(struct udphdr);
-  std::vector<uint8_t> frame(sizeof(struct ethhdr) + sizeof(struct iphdr) + l4Size);
+  std::vector<uint8_t> frame(sizeof(struct ethhdr) + sizeof(struct iphdr) + l4Size + payloadBytes);
   std::memset(frame.data(), 0, frame.size());
 
   struct ethhdr *eth = reinterpret_cast<struct ethhdr *>(frame.data());
@@ -549,7 +477,7 @@ static std::vector<uint8_t> makeIPv4L4EthernetFrame(const struct in_addr& source
     struct udphdr *udp = reinterpret_cast<struct udphdr *>(ip4 + 1);
     udp->source = htons(sourcePort);
     udp->dest = htons(destinationPort);
-    udp->len = htons(sizeof(struct udphdr));
+    udp->len = htons(static_cast<uint16_t>(sizeof(struct udphdr) + payloadBytes));
   }
 
   return frame;
@@ -578,10 +506,11 @@ static std::vector<uint8_t> makeIPv6L4EthernetFrame(const uint8_t source[16],
                                                     const uint8_t destination[16],
                                                     uint8_t proto,
                                                     uint16_t sourcePort,
-                                                    uint16_t destinationPort)
+                                                    uint16_t destinationPort,
+                                                    size_t payloadBytes = 0)
 {
   const size_t l4Size = (proto == IPPROTO_TCP) ? sizeof(struct tcphdr) : sizeof(struct udphdr);
-  std::vector<uint8_t> frame(sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + l4Size);
+  std::vector<uint8_t> frame(sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + l4Size + payloadBytes);
   std::memset(frame.data(), 0, frame.size());
 
   struct ethhdr *eth = reinterpret_cast<struct ethhdr *>(frame.data());
@@ -591,7 +520,7 @@ static std::vector<uint8_t> makeIPv6L4EthernetFrame(const uint8_t source[16],
   ip6->version = 6;
   ip6->nexthdr = proto;
   ip6->hop_limit = 64;
-  ip6->payload_len = htons(l4Size);
+  ip6->payload_len = htons(l4Size + payloadBytes);
   std::memcpy(ip6->saddr.s6_addr, source, sizeof(ip6->saddr.s6_addr));
   std::memcpy(ip6->daddr.s6_addr, destination, sizeof(ip6->daddr.s6_addr));
 
@@ -602,17 +531,47 @@ static std::vector<uint8_t> makeIPv6L4EthernetFrame(const uint8_t source[16],
     tcp->dest = htons(destinationPort);
     tcp->doff = 5;
     tcp->syn = 1;
-    tcp->check = checksumIPv6Transport(ip6->saddr.s6_addr, ip6->daddr.s6_addr, IPPROTO_TCP, tcp, sizeof(*tcp));
+    tcp->check = checksumIPv6Transport(ip6->saddr.s6_addr, ip6->daddr.s6_addr, IPPROTO_TCP, tcp, sizeof(*tcp) + payloadBytes);
   }
   else
   {
     struct udphdr *udp = reinterpret_cast<struct udphdr *>(ip6 + 1);
     udp->source = htons(sourcePort);
     udp->dest = htons(destinationPort);
-    udp->len = htons(sizeof(struct udphdr));
-    udp->check = checksumIPv6Transport(ip6->saddr.s6_addr, ip6->daddr.s6_addr, IPPROTO_UDP, udp, sizeof(*udp));
+    udp->len = htons(sizeof(struct udphdr) + payloadBytes);
+    udp->check = checksumIPv6Transport(ip6->saddr.s6_addr, ip6->daddr.s6_addr, IPPROTO_UDP, udp, sizeof(*udp) + payloadBytes);
   }
 
+  return frame;
+}
+
+static std::vector<uint8_t> makeWormholeIPv6OverlayFrame(const std::vector<uint8_t>& inner,
+                                                         const uint8_t container[5])
+{
+  const size_t added = sizeof(struct ipv6hdr) + sizeof(struct switchboard_wormhole_overlay_header);
+  std::vector<uint8_t> frame(inner.size() + added);
+  std::memset(frame.data(), 0, frame.size());
+  std::memcpy(frame.data(), inner.data(), sizeof(struct ethhdr));
+  std::memcpy(frame.data() + sizeof(struct ethhdr) + added,
+              inner.data() + sizeof(struct ethhdr),
+              inner.size() - sizeof(struct ethhdr));
+
+  struct ethhdr *eth = reinterpret_cast<struct ethhdr *>(frame.data());
+  eth->h_proto = htons(ETH_P_IPV6);
+  struct ipv6hdr *outer = reinterpret_cast<struct ipv6hdr *>(eth + 1);
+  outer->version = 6;
+  outer->nexthdr = IPPROTO_GRE;
+  outer->hop_limit = 64;
+  outer->payload_len = htons(static_cast<uint16_t>(sizeof(struct switchboard_wormhole_overlay_header) + inner.size() - sizeof(struct ethhdr)));
+  parseIPv6Bytes("fd00:10::a", outer->saddr.s6_addr);
+  parseIPv6Bytes("fd00:10::b", outer->daddr.s6_addr);
+
+  container_id selected = {};
+  selected.hasID = true;
+  std::memcpy(selected.value, container, sizeof(selected.value));
+  switchboard_wormhole_overlay_header *provenance = reinterpret_cast<switchboard_wormhole_overlay_header *>(outer + 1);
+  const struct ethhdr *innerEth = reinterpret_cast<const struct ethhdr *>(inner.data());
+  switchboardBuildWormholeOverlayHeader(provenance, &selected, innerEth->h_proto == htons(ETH_P_IPV6));
   return frame;
 }
 
@@ -708,6 +667,38 @@ static bool installSingleContainerPortalRing(BPFProgram& program, uint32_t slot,
   return ringFilled && outerUpdated;
 }
 
+static bool installWormholeExposure(BPFProgram& program,
+                                    const portal_definition& portal,
+                                    bool ipv6,
+                                    const uint8_t container[5],
+                                    __be16 targetPort,
+                                    __u64 ownerGeneration)
+{
+  switchboard_wormhole_egress_binding binding = {};
+  binding.port = portal.port;
+  binding.proto = portal.proto;
+  binding.owner_generation = ownerGeneration;
+
+  if (ipv6)
+  {
+    std::memcpy(binding.addr6, portal.addr6, sizeof(binding.addr6));
+    binding.is_ipv6 = 1;
+
+    switchboard_wormhole_egress_key key = {};
+    std::memcpy(key.container, container, sizeof(key.container));
+    key.port = targetPort;
+    key.proto = portal.proto;
+    return updateProgramMapElement(program, "wh_egress"_ctv, key, binding);
+  }
+
+  binding.addr4 = portal.addr4;
+  switchboard_wormhole_egress4_key key = {};
+  key.addr = portal.addr4;
+  key.port = targetPort;
+  key.proto = portal.proto;
+  return updateProgramMapElement(program, "wh_egress4"_ctv, key, binding);
+}
+
 static void exerciseHostIngressGenericPortal(TestSuite& suite, bool ipv6, uint8_t proto)
 {
   String ingressObjectPath = {};
@@ -794,6 +785,10 @@ static void exerciseHostIngressGenericPortal(TestSuite& suite, bool ipv6, uint8_
                ipv6
                    ? (proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv6_tcp_portal_installs_target_port" : "switchboard_host_ingress_ipv6_udp_portal_installs_target_port")
                    : (proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv4_tcp_portal_installs_target_port" : "switchboard_host_ingress_ipv4_udp_portal_installs_target_port"));
+  suite.expect(installWormholeExposure(ingressProgram, portal, ipv6, containerID, targetPort, meta.slot + 1u),
+               ipv6
+                   ? (proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv6_tcp_portal_installs_exposure" : "switchboard_host_ingress_ipv6_udp_portal_installs_exposure")
+                   : (proto == IPPROTO_TCP ? "switchboard_host_ingress_ipv4_tcp_portal_installs_exposure" : "switchboard_host_ingress_ipv4_udp_portal_installs_exposure"));
 
   std::vector<uint8_t> frame = ipv6
                                    ? makeIPv6L4EthernetFrame(client6, external6, proto, 49'152, externalPortHost)
@@ -914,6 +909,8 @@ static void exerciseHostIngressIPv6TCPPortalBrowserSizedPayload(TestSuite& suite
   std::memcpy(targetKey.container, containerID, sizeof(targetKey.container));
   uint16_t targetPort = htons(8444);
   expectNamed(updateProgramMapElement(ingressProgram, "wh_targets"_ctv, targetKey, targetPort), "installs_target_port");
+  expectNamed(installWormholeExposure(ingressProgram, portal, true, containerID, targetPort, meta.slot + 1u),
+              "installs_exposure");
 
   std::vector<uint8_t> frame = makeIPv6TCPPortalFrameWithOptionsAndPayload(
       client6,
@@ -1157,11 +1154,15 @@ static void exerciseHostIngressHostedIngressRoute(TestSuite& suite, bool ipv6, u
   ingressProgram.close();
 }
 
-static void exerciseHostIngressRemotePortalRoute(TestSuite& suite, bool ipv6, uint8_t proto)
+static void exerciseHostIngressRemotePortalRoute(TestSuite& suite, bool ipv6, uint8_t proto, bool ipv6Underlay)
 {
-  const char *label = ipv6
-                          ? (proto == IPPROTO_TCP ? "switchboard_host_ingress_remote_portal_ipv6_tcp" : "switchboard_host_ingress_remote_portal_ipv6_udp")
-                          : (proto == IPPROTO_TCP ? "switchboard_host_ingress_remote_portal_ipv4_tcp" : "switchboard_host_ingress_remote_portal_ipv4_udp");
+  char label[128] = {};
+  std::snprintf(label,
+                sizeof(label),
+                "switchboard_host_ingress_remote_portal_ipv%u_%s_ipv%u_underlay",
+                ipv6 ? 6u : 4u,
+                proto == IPPROTO_TCP ? "tcp" : "udp",
+                ipv6Underlay ? 6u : 4u);
   auto expectNamed = [&](bool condition, const char *suffix) -> void {
     char name[256] = {};
     std::snprintf(name, sizeof(name), "%s_%s", label, suffix);
@@ -1229,12 +1230,26 @@ static void exerciseHostIngressRemotePortalRoute(TestSuite& suite, bool ipv6, ui
 
   expectNamed(updateProgramMapElement(ingressProgram, "ext_portals"_ctv, portal, meta),
               "installs_portal");
+  switchboard_wormhole_target_key targetKey = {};
+  targetKey.slot = meta.slot;
+  std::memcpy(targetKey.container, remoteContainerID, sizeof(targetKey.container));
+  __be16 targetPort = htons(proto == IPPROTO_TCP ? 18'443 : 18'444);
+  expectNamed(updateProgramMapElement(ingressProgram, "wh_targets"_ctv, targetKey, targetPort),
+              "installs_selected_target_binding");
 
   switchboard_overlay_machine_route route = {};
-  route.family = SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6;
+  route.family = ipv6Underlay ? SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6 : SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV4;
   route.use_gateway_mac = 1;
-  parseIPv6Bytes("fd00:10::a", route.source6);
-  parseIPv6Bytes("fd00:10::b", route.next_hop6);
+  if (ipv6Underlay)
+  {
+    parseIPv6Bytes("fd00:10::a", route.source6);
+    parseIPv6Bytes("fd00:10::b", route.next_hop6);
+  }
+  else
+  {
+    route.source4 = parseIPv4Address("192.0.2.10").s_addr;
+    route.next_hop4 = parseIPv4Address("192.0.2.11").s_addr;
+  }
   switchboard_overlay_machine_route_key routeKey = switchboardMakeOverlayMachineRouteKey(remoteMachineFragment);
   expectNamed(updateProgramMapElement(ingressProgram, "ovl_mach_full"_ctv, routeKey, route),
               "sets_machine_route");
@@ -1242,7 +1257,8 @@ static void exerciseHostIngressRemotePortalRoute(TestSuite& suite, bool ipv6, ui
   std::vector<uint8_t> frame = ipv6
                                    ? makeIPv6L4EthernetFrame(client6, external6, proto, 49'152, externalPortHost)
                                    : makeIPv4L4EthernetFrame(client4, external4, proto, 49'152, externalPortHost);
-  std::vector<uint8_t> output(frame.size() + sizeof(struct ipv6hdr) + 64u);
+  size_t outerBytes = ipv6Underlay ? sizeof(struct ipv6hdr) : sizeof(struct iphdr);
+  std::vector<uint8_t> output(frame.size() + outerBytes + sizeof(struct switchboard_wormhole_overlay_header) + 64u);
   LIBBPF_OPTS(bpf_test_run_opts, opts,
               .data_in = frame.data(),
               .data_out = output.data(),
@@ -1253,38 +1269,151 @@ static void exerciseHostIngressRemotePortalRoute(TestSuite& suite, bool ipv6, ui
   int runResult = bpf_prog_test_run_opts(ingressProgram.prog_fd, &opts);
   expectNamed(runResult == 0, "test_run_succeeds");
   expectNamed(opts.retval == TC_ACT_OK, "returns_ok_after_overlay_encap");
-  expectNamed(opts.data_size_out == frame.size() + sizeof(struct ipv6hdr), "adds_outer_ipv6_header");
+  expectNamed(opts.data_size_out == frame.size() + outerBytes + sizeof(struct switchboard_wormhole_overlay_header), "adds_exact_underlay_and_provenance_headers");
 
-  if (runResult == 0 && opts.data_size_out >= frame.size() + sizeof(struct ipv6hdr))
+  if (runResult == 0 && opts.data_size_out >= frame.size() + outerBytes + sizeof(struct switchboard_wormhole_overlay_header))
   {
     const struct ethhdr *outEth = reinterpret_cast<const struct ethhdr *>(output.data());
-    const struct ipv6hdr *outer6 = reinterpret_cast<const struct ipv6hdr *>(output.data() + sizeof(struct ethhdr));
-    uint8_t expectedOuterSrc[16] = {};
-    uint8_t expectedOuterDst[16] = {};
-    parseIPv6Bytes("fd00:10::a", expectedOuterSrc);
-    parseIPv6Bytes("fd00:10::b", expectedOuterDst);
-
-    expectNamed(outEth->h_proto == htons(ETH_P_IPV6), "sets_outer_ipv6_ethertype");
-    expectNamed(outer6->nexthdr == (ipv6 ? IPPROTO_IPV6 : IPPROTO_IPIP), "sets_outer_next_header");
-    expectNamed(std::memcmp(outer6->saddr.s6_addr, expectedOuterSrc, sizeof(expectedOuterSrc)) == 0,
-                "sets_outer_source");
-    expectNamed(std::memcmp(outer6->daddr.s6_addr, expectedOuterDst, sizeof(expectedOuterDst)) == 0,
-                "sets_outer_destination");
+    const struct switchboard_wormhole_overlay_header *provenance = nullptr;
+    if (ipv6Underlay)
+    {
+      const struct ipv6hdr *outer6 = reinterpret_cast<const struct ipv6hdr *>(outEth + 1);
+      uint8_t expectedOuterSrc[16] = {};
+      uint8_t expectedOuterDst[16] = {};
+      parseIPv6Bytes("fd00:10::a", expectedOuterSrc);
+      parseIPv6Bytes("fd00:10::b", expectedOuterDst);
+      expectNamed(outEth->h_proto == htons(ETH_P_IPV6), "sets_outer_ipv6_ethertype");
+      expectNamed(outer6->nexthdr == IPPROTO_GRE, "sets_keyed_gre_outer_protocol");
+      expectNamed(std::memcmp(outer6->saddr.s6_addr, expectedOuterSrc, sizeof(expectedOuterSrc)) == 0,
+                  "sets_outer_source");
+      expectNamed(std::memcmp(outer6->daddr.s6_addr, expectedOuterDst, sizeof(expectedOuterDst)) == 0,
+                  "sets_outer_destination");
+      provenance = reinterpret_cast<const struct switchboard_wormhole_overlay_header *>(outer6 + 1);
+    }
+    else
+    {
+      const struct iphdr *outer4 = reinterpret_cast<const struct iphdr *>(outEth + 1);
+      expectNamed(outEth->h_proto == htons(ETH_P_IP), "sets_outer_ipv4_ethertype");
+      expectNamed(outer4->protocol == IPPROTO_GRE, "sets_keyed_gre_outer_protocol");
+      expectNamed(outer4->saddr == route.source4, "sets_outer_source");
+      expectNamed(outer4->daddr == route.next_hop4, "sets_outer_destination");
+      provenance = reinterpret_cast<const struct switchboard_wormhole_overlay_header *>(outer4 + 1);
+    }
+    expectNamed(switchboardWormholeOverlayHeaderValid(provenance), "writes_valid_provenance_header");
+    expectNamed(provenance->reserved == 0, "omits_host_local_portal_slot");
+    expectNamed(std::memcmp(provenance->container, remoteContainerID, sizeof(remoteContainerID)) == 0,
+                "preserves_selected_container");
 
     if (ipv6)
     {
-      const struct ipv6hdr *inner6 = outer6 + 1;
+      const struct ipv6hdr *inner6 = reinterpret_cast<const struct ipv6hdr *>(provenance + 1);
       expectNamed(std::memcmp(inner6->daddr.s6_addr, external6, sizeof(external6)) == 0,
                   "preserves_inner_destination");
       expectNamed(inner6->nexthdr == proto, "preserves_inner_protocol");
     }
     else
     {
-      const struct iphdr *inner4 = reinterpret_cast<const struct iphdr *>(outer6 + 1);
+      const struct iphdr *inner4 = reinterpret_cast<const struct iphdr *>(provenance + 1);
       expectNamed(inner4->daddr == external4.s_addr, "preserves_inner_destination");
       expectNamed(inner4->protocol == proto, "preserves_inner_protocol");
     }
   }
+
+  auto runRemoteBoundary = [&](size_t l3Bytes, uint32_t expectedAction, const char *suffix) -> void {
+    const size_t ipBytes = ipv6 ? sizeof(struct ipv6hdr) : sizeof(struct iphdr);
+    const size_t transportBytes = proto == IPPROTO_TCP ? sizeof(struct tcphdr) : sizeof(struct udphdr);
+    const size_t payloadBytes = l3Bytes - ipBytes - transportBytes;
+    std::vector<uint8_t> boundaryFrame = ipv6
+                                             ? makeIPv6L4EthernetFrame(client6, external6, proto, 49'153, externalPortHost, payloadBytes)
+                                             : makeIPv4L4EthernetFrame(client4, external4, proto, 49'153, externalPortHost, payloadBytes);
+    std::vector<uint8_t> boundaryOutput(boundaryFrame.size() + outerBytes + sizeof(struct switchboard_wormhole_overlay_header) + 64u);
+    LIBBPF_OPTS(bpf_test_run_opts, boundaryOpts,
+                .data_in = boundaryFrame.data(),
+                .data_out = boundaryOutput.data(),
+                .data_size_in = static_cast<__u32>(boundaryFrame.size()),
+                .data_size_out = static_cast<__u32>(boundaryOutput.size()),
+                .repeat = 1, );
+    int boundaryResult = bpf_prog_test_run_opts(ingressProgram.prog_fd, &boundaryOpts);
+    char resultName[256] = {};
+    std::snprintf(resultName, sizeof(resultName), "%s_test_run_succeeds", suffix);
+    expectNamed(boundaryResult == 0, resultName);
+    char actionName[256] = {};
+    std::snprintf(actionName, sizeof(actionName), "%s_action_matches", suffix);
+    expectNamed(boundaryOpts.retval == expectedAction, actionName);
+  };
+  runRemoteBoundary(WORMHOLE_PUBLIC_INGRESS_L3_MTU,
+                    TC_ACT_OK,
+                    "accepts_exact_1500_byte_host_remote_encap_boundary");
+  runRemoteBoundary(WORMHOLE_PUBLIC_INGRESS_L3_MTU + 1u,
+                    TC_ACT_SHOT,
+                    "rejects_host_remote_encap_above_supported_boundary");
+
+  String targetObjectPath = {};
+  targetObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+  targetObjectPath.append("/host.ingress.router.dev.ebpf.o"_ctv);
+  BPFProgram targetProgram = {};
+  expectNamed(targetProgram.load(targetObjectPath, "host_ingress"_ctv), "target_loads_program");
+  if (runResult == 0 && targetProgram.prog_fd >= 0)
+  {
+    local_container_subnet6 targetSubnet = {};
+    targetSubnet.dpfx = remoteContainerID[0];
+    std::memcpy(targetSubnet.mpfx, remoteContainerID + 1, sizeof(targetSubnet.mpfx));
+    targetProgram.setArrayElement("lc_subnet"_ctv, 0, targetSubnet);
+    uint32_t targetIfidx = 97;
+    targetProgram.setArrayElement("ct_dev_map"_ctv, remoteContainerID[4], targetIfidx);
+    expectNamed(ipv6Underlay
+                    ? installOverlayIngressPeerIPv6(targetProgram, route.source6, route.next_hop6)
+                    : installOverlayIngressPeerIPv4(targetProgram, route.source4, route.next_hop4),
+                "target_authorizes_exact_overlay_peer");
+    expectNamed(updateProgramMapElement(targetProgram, "ext_portals"_ctv, portal, meta), "target_installs_portal");
+    expectNamed(updateProgramMapElement(targetProgram, "wh_targets"_ctv, targetKey, targetPort), "target_installs_selected_binding");
+    expectNamed(installWormholeExposure(targetProgram, portal, ipv6, remoteContainerID, targetPort, meta.slot + 1u),
+                "target_installs_exposure");
+
+    std::vector<uint8_t> targetOutput(output.size());
+    LIBBPF_OPTS(bpf_test_run_opts, targetOpts,
+                .data_in = output.data(),
+                .data_out = targetOutput.data(),
+                .data_size_in = opts.data_size_out,
+                .data_size_out = static_cast<__u32>(targetOutput.size()),
+                .repeat = 1, );
+    int targetRunResult = bpf_prog_test_run_opts(targetProgram.prog_fd, &targetOpts);
+    expectNamed(targetRunResult == 0, "target_test_run_succeeds");
+    expectNamed(targetOpts.retval == TC_ACT_REDIRECT, "target_redirects_exact_selected_container_without_ring");
+    expectNamed(targetOpts.data_size_out == frame.size(), "target_strips_underlay_and_provenance");
+    if (targetRunResult == 0 && targetOpts.data_size_out >= sizeof(struct ethhdr) + (ipv6 ? sizeof(struct ipv6hdr) : sizeof(struct iphdr)))
+    {
+      const struct ethhdr *targetEth = reinterpret_cast<const struct ethhdr *>(targetOutput.data());
+      if (ipv6)
+      {
+        uint8_t canonical[16] = {};
+        makeContainerIPv6(canonical,
+                          remoteContainerID[0],
+                          remoteContainerID[1],
+                          remoteContainerID[2],
+                          remoteContainerID[3],
+                          remoteContainerID[4]);
+        const struct ipv6hdr *target6 = reinterpret_cast<const struct ipv6hdr *>(targetEth + 1);
+        const __be16 deliveredPort = proto == IPPROTO_TCP
+                                         ? reinterpret_cast<const struct tcphdr *>(target6 + 1)->dest
+                                         : reinterpret_cast<const struct udphdr *>(target6 + 1)->dest;
+        expectNamed(targetEth->h_proto == htons(ETH_P_IPV6), "target_restores_ipv6_ethertype");
+        expectNamed(std::memcmp(target6->daddr.s6_addr, canonical, sizeof(canonical)) == 0, "target_delivers_canonical_private6_destination");
+        expectNamed(deliveredPort == targetPort, "target_delivers_selected_container_port");
+      }
+      else
+      {
+        const struct iphdr *target4 = reinterpret_cast<const struct iphdr *>(targetEth + 1);
+        const __be16 deliveredPort = proto == IPPROTO_TCP
+                                         ? reinterpret_cast<const struct tcphdr *>(target4 + 1)->dest
+                                         : reinterpret_cast<const struct udphdr *>(target4 + 1)->dest;
+        expectNamed(targetEth->h_proto == htons(ETH_P_IP), "target_restores_ipv4_ethertype");
+        expectNamed(target4->daddr == external4.s_addr, "target_preserves_ipv4_external_destination");
+        expectNamed(deliveredPort == targetPort, "target_delivers_selected_container_port");
+      }
+    }
+  }
+  targetProgram.close();
 
   ingressProgram.close();
 }
@@ -1359,6 +1488,12 @@ static void exerciseBalancerRemotePortalRoutesWithOverlay(TestSuite& suite)
   uint8_t remoteContainerID[5] = {0x01, 0x16, 0x25, 0x5b, 0x4e};
   expectNamed(installSingleContainerPortalRing(balancerProgram, meta.slot, remoteContainerID),
               "installs_remote_target_ring");
+  switchboard_wormhole_target_key targetKey = {};
+  targetKey.slot = meta.slot;
+  std::memcpy(targetKey.container, remoteContainerID, sizeof(targetKey.container));
+  __be16 targetPort = htons(8443);
+  expectNamed(updateProgramMapElement(balancerProgram, "wh_targets"_ctv, targetKey, targetPort),
+              "installs_selected_target_binding");
 
   switchboard_overlay_machine_route route = {};
   route.family = SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6;
@@ -1370,7 +1505,7 @@ static void exerciseBalancerRemotePortalRoutesWithOverlay(TestSuite& suite)
               "sets_machine_route");
 
   std::vector<uint8_t> frame = makeIPv4L4EthernetFrame(client4, external4, IPPROTO_TCP, 49'152, 443);
-  std::vector<uint8_t> output(frame.size() + sizeof(struct ipv6hdr) + 64u);
+  std::vector<uint8_t> output(frame.size() + sizeof(struct ipv6hdr) + sizeof(struct switchboard_wormhole_overlay_header) + 64u);
   LIBBPF_OPTS(bpf_test_run_opts, opts,
               .data_in = frame.data(),
               .data_out = output.data(),
@@ -1381,29 +1516,767 @@ static void exerciseBalancerRemotePortalRoutesWithOverlay(TestSuite& suite)
   int runResult = bpf_prog_test_run_opts(balancerProgram.prog_fd, &opts);
   expectNamed(runResult == 0, "test_run_succeeds");
   expectNamed(opts.retval == XDP_TX, "routes_remote_portal_to_overlay");
-  expectNamed(opts.data_size_out == frame.size() + sizeof(struct ipv6hdr), "adds_outer_ipv6_header");
+  expectNamed(opts.data_size_out == frame.size() + sizeof(struct ipv6hdr) + sizeof(struct switchboard_wormhole_overlay_header), "adds_outer_ipv6_and_provenance_headers");
 
-  if (runResult == 0 && opts.data_size_out >= frame.size() + sizeof(struct ipv6hdr))
+  if (runResult == 0 && opts.data_size_out >= frame.size() + sizeof(struct ipv6hdr) + sizeof(struct switchboard_wormhole_overlay_header))
   {
     const struct ethhdr *outEth = reinterpret_cast<const struct ethhdr *>(output.data());
     const struct ipv6hdr *outer6 = reinterpret_cast<const struct ipv6hdr *>(output.data() + sizeof(struct ethhdr));
-    const struct iphdr *inner4 = reinterpret_cast<const struct iphdr *>(outer6 + 1);
+    const struct switchboard_wormhole_overlay_header *provenance = reinterpret_cast<const struct switchboard_wormhole_overlay_header *>(outer6 + 1);
+    const struct iphdr *inner4 = reinterpret_cast<const struct iphdr *>(provenance + 1);
     uint8_t expectedOuterSrc[16] = {};
     uint8_t expectedOuterDst[16] = {};
     parseIPv6Bytes("fd00:10::a", expectedOuterSrc);
     parseIPv6Bytes("fd00:10::b", expectedOuterDst);
 
     expectNamed(outEth->h_proto == htons(ETH_P_IPV6), "sets_outer_ipv6_ethertype");
-    expectNamed(outer6->nexthdr == IPPROTO_IPIP, "sets_outer_next_header");
+    expectNamed(outer6->nexthdr == IPPROTO_GRE, "sets_keyed_gre_outer_protocol");
     expectNamed(std::memcmp(outer6->saddr.s6_addr, expectedOuterSrc, sizeof(expectedOuterSrc)) == 0,
                 "sets_outer_source");
     expectNamed(std::memcmp(outer6->daddr.s6_addr, expectedOuterDst, sizeof(expectedOuterDst)) == 0,
                 "sets_outer_destination");
+    expectNamed(switchboardWormholeOverlayHeaderValid(provenance), "writes_valid_provenance_header");
+    expectNamed(provenance->protocol == htons(ETH_P_IP), "preserves_ipv4_inner_protocol_identity");
+    expectNamed(provenance->reserved == 0, "omits_host_local_portal_slot");
+    expectNamed(std::memcmp(provenance->container, remoteContainerID, sizeof(remoteContainerID)) == 0,
+                "preserves_selected_container");
     expectNamed(inner4->daddr == external4.s_addr, "preserves_external_destination");
     expectNamed(inner4->protocol == IPPROTO_TCP, "preserves_protocol");
   }
 
+  auto runBoundary = [&](size_t l3Bytes, uint32_t expectedAction, const char *suffix) -> void {
+    size_t payloadBytes = l3Bytes - sizeof(struct iphdr) - sizeof(struct tcphdr);
+    std::vector<uint8_t> boundaryFrame = makeIPv4L4EthernetFrame(client4, external4, IPPROTO_TCP, 49'153, 443, payloadBytes);
+    std::vector<uint8_t> boundaryOutput(boundaryFrame.size() + switchboardPacketBudgetExternalIngressRemoteDeliveryAddedBytes() + 64u);
+    LIBBPF_OPTS(bpf_test_run_opts, boundaryOpts,
+                .data_in = boundaryFrame.data(),
+                .data_out = boundaryOutput.data(),
+                .data_size_in = static_cast<__u32>(boundaryFrame.size()),
+                .data_size_out = static_cast<__u32>(boundaryOutput.size()),
+                .repeat = 1, );
+    int boundaryResult = bpf_prog_test_run_opts(balancerProgram.prog_fd, &boundaryOpts);
+    char resultName[256] = {};
+    std::snprintf(resultName, sizeof(resultName), "%s_test_run_succeeds", suffix);
+    expectNamed(boundaryResult == 0, resultName);
+    char actionName[256] = {};
+    std::snprintf(actionName, sizeof(actionName), "%s_action_matches", suffix);
+    expectNamed(boundaryOpts.retval == expectedAction, actionName);
+  };
+  runBoundary(WORMHOLE_PUBLIC_INGRESS_L3_MTU, XDP_TX, "accepts_exact_1500_byte_public_l3_boundary");
+  runBoundary(WORMHOLE_PUBLIC_INGRESS_L3_MTU + 1u, XDP_DROP, "rejects_public_l3_above_supported_boundary");
+
   balancerProgram.close();
+}
+
+static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
+{
+  const char *label = "switchboard_wormhole_shared_flow_ownership";
+  auto expectNamed = [&](bool condition, const char *suffix) -> void {
+    char name[256] = {};
+    std::snprintf(name, sizeof(name), "%s_%s", label, suffix);
+    suite.expect(condition, name);
+  };
+
+  String hostPath = {};
+  hostPath.assign(PRODIGY_TEST_BINARY_DIR);
+  hostPath.append("/host.ingress.router.ebpf.o"_ctv);
+  String ingressPath = {};
+  ingressPath.assign(PRODIGY_TEST_BINARY_DIR);
+  ingressPath.append("/container.ingress.router.ebpf.o"_ctv);
+  String egressPath = {};
+  egressPath.assign(PRODIGY_TEST_BINARY_DIR);
+  egressPath.append("/container.egress.router.ebpf.o"_ctv);
+
+  BPFProgram host = {};
+  expectNamed(host.load(hostPath, "host_ingress"_ctv), "loads_host_ingress");
+  if (host.prog_fd < 0)
+  {
+    return;
+  }
+
+  uint32_t testIfindex = uint32_t(::getpid()) ^ 0x57484f4cu;
+  String establishedPinPath = {};
+  String pendingPinPath = {};
+  switchboardWormholeFlowPinPath(establishedPinPath, testIfindex);
+  switchboardWormholePendingFlowPinPath(pendingPinPath, testIfindex);
+  (void)unlink(establishedPinPath.c_str());
+  (void)unlink(pendingPinPath.c_str());
+  expectNamed(switchboardPinWormholeFlowMaps(&host, testIfindex), "pins_host_flow_maps");
+
+  bool ingressReused = false;
+  BPFProgram ingress = {};
+  bool ingressLoaded = ingress.load(ingressPath,
+                                    "ct_ingress"_ctv,
+                                    [&](struct bpf_object *obj, Vector<int>& innerMapFDs) -> void {
+                                      ingressReused = switchboardReusePinnedWormholeFlowMaps(obj, testIfindex, innerMapFDs);
+                                    });
+  expectNamed(ingressLoaded && ingressReused, "loads_container_ingress_with_shared_flow_map");
+
+  bool egressReused = false;
+  BPFProgram egress = {};
+  bool egressLoaded = egress.load(egressPath,
+                                  "ct_egress"_ctv,
+                                  [&](struct bpf_object *obj, Vector<int>& innerMapFDs) -> void {
+                                    egressReused = switchboardReusePinnedWormholeFlowMaps(obj, testIfindex, innerMapFDs);
+                                  });
+  expectNamed(egressLoaded && egressReused, "loads_container_egress_with_shared_flow_map");
+  if (ingress.prog_fd < 0 || egress.prog_fd < 0)
+  {
+    (void)unlink(establishedPinPath.c_str());
+    (void)unlink(pendingPinPath.c_str());
+    host.close();
+    ingress.close();
+    egress.close();
+    return;
+  }
+
+  uint32_t hostMapID = programMapID(host, "wh_flows"_ctv);
+  uint32_t hostPendingMapID = programMapID(host, "wh_pending"_ctv);
+  expectNamed(hostMapID != 0 && programMapID(ingress, "wh_flows"_ctv) == hostMapID && programMapID(egress, "wh_flows"_ctv) == hostMapID &&
+                  hostPendingMapID != 0 && programMapID(ingress, "wh_pending"_ctv) == hostPendingMapID && programMapID(egress, "wh_pending"_ctv) == hostPendingMapID,
+              "shares_pending_and_established_maps_across_all_three_programs");
+  bool establishedMapContract = false;
+  bool pendingMapContract = false;
+  host.openMap("wh_flows"_ctv, [&](int mapFD) -> void {
+    establishedMapContract = switchboardWormholeEstablishedFlowMapCompatibleFD(mapFD);
+  });
+  host.openMap("wh_pending"_ctv, [&](int mapFD) -> void {
+    pendingMapContract = switchboardWormholePendingFlowMapCompatibleFD(mapFD);
+  });
+  expectNamed(establishedMapContract && pendingMapContract,
+              "uses_bounded_lru_pending_and_non_evicting_established_map_contracts");
+
+  const uint8_t selected[5] = {0x01, 0x16, 0x25, 0x5b, 0x4e};
+  local_container_subnet6 subnet = {};
+  subnet.dpfx = selected[0];
+  std::memcpy(subnet.mpfx, selected + 1, sizeof(subnet.mpfx));
+  host.setArrayElement("lc_subnet"_ctv, 0, subnet);
+  ingress.setArrayElement("lc_subnet"_ctv, 0, subnet);
+  egress.setArrayElement("lc_subnet"_ctv, 0, subnet);
+  uint32_t containerIfindex = 97;
+  host.setArrayElement("ct_dev_map"_ctv, selected[4], containerIfindex);
+
+  container_network_policy policy = {};
+  policy.mode = CONTAINER_NETWORK_UNRESTRICTED;
+  policy.containerFragment = selected[4];
+  policy.interContainerMTU = 9000;
+  policy.requiresPublic4 = 1;
+  ingress.setArrayElement("ct_net_policy"_ctv, 0, policy);
+  egress.setArrayElement("ct_net_policy"_ctv, 0, policy);
+  uint32_t nicIfindex = 77;
+  egress.setArrayElement("ct_dev_map"_ctv, 0, nicIfindex);
+  mac sourceMAC = {{0x02, 0x42, 0xac, 0x11, 0x00, 0x0a}};
+  mac gatewayMAC = {{0x02, 0x42, 0xac, 0x11, 0x00, 0x01}};
+  egress.setArrayElement("mac_map"_ctv, 0, sourceMAC);
+  egress.setArrayElement("gw_mac_map"_ctv, 0, gatewayMAC);
+
+  uint8_t client[16] = {};
+  uint8_t external[16] = {};
+  uint8_t external2[16] = {};
+  uint8_t server[16] = {};
+  parseIPv6Bytes("2001:db8:200::99", client);
+  parseIPv6Bytes("2001:db8:100::44", external);
+  parseIPv6Bytes("2001:db8:100::45", external2);
+  makeContainerIPv6(server, selected[0], selected[1], selected[2], selected[3], selected[4]);
+
+  auto installPortal = [&](const uint8_t address[16], uint16_t externalPort, uint16_t targetPort, uint32_t slot, uint8_t protocol = IPPROTO_UDP) -> switchboard_wormhole_egress_binding {
+    portal_definition portal = {};
+    std::memcpy(portal.addr6, address, sizeof(portal.addr6));
+    portal.port = htons(externalPort);
+    portal.proto = protocol;
+    portal_meta meta = {};
+    meta.slot = slot;
+    expectNamed(updateProgramMapElement(host, "ext_portals"_ctv, portal, meta), "installs_portal");
+    switchboard_wormhole_target_key target = {};
+    target.slot = slot;
+    std::memcpy(target.container, selected, sizeof(target.container));
+    __be16 translatedPort = htons(targetPort);
+    expectNamed(updateProgramMapElement(host, "wh_targets"_ctv, target, translatedPort), "installs_exact_portal_target");
+
+    switchboard_wormhole_egress_key exposure = {};
+    std::memcpy(exposure.container, selected, sizeof(exposure.container));
+    exposure.port = translatedPort;
+    exposure.proto = protocol;
+    switchboard_wormhole_egress_binding binding = {};
+    std::memcpy(binding.addr6, address, sizeof(binding.addr6));
+    binding.port = portal.port;
+    binding.proto = portal.proto;
+    binding.is_ipv6 = 1;
+    binding.owner_generation = slot + 1u;
+    expectNamed(updateProgramMapElement(host, "wh_egress"_ctv, exposure, binding), "installs_host_exposure");
+    expectNamed(updateProgramMapElement(ingress, "wh_egress"_ctv, exposure, binding), "installs_ingress_exposure");
+    expectNamed(updateProgramMapElement(egress, "wh_egress"_ctv, exposure, binding), "installs_egress_exposure");
+    return binding;
+  };
+
+  switchboard_wormhole_egress_binding binding = installPortal(external, 443, 8443, 41);
+  switchboard_wormhole_egress_binding binding2 = installPortal(external2, 4443, 9443, 42);
+  std::vector<uint8_t> publicInner = makeIPv6L4EthernetFrame(client, external, IPPROTO_UDP, 49'152, 443);
+  std::vector<uint8_t> publicOverlay = makeWormholeIPv6OverlayFrame(publicInner, selected);
+  std::vector<uint8_t> privateIngress = makeIPv6L4EthernetFrame(client, server, IPPROTO_UDP, 49'152, 8443);
+  std::vector<uint8_t> reply = makeIPv6L4EthernetFrame(server, client, IPPROTO_UDP, 8443, 49'152);
+
+  auto makeReplyKey = [&](uint16_t sourcePort) -> flow_key {
+    flow_key key = {};
+    std::memcpy(key.srcv6, server, sizeof(key.srcv6));
+    std::memcpy(key.dstv6, client, sizeof(key.dstv6));
+    key.port16[0] = htons(sourcePort);
+    key.port16[1] = htons(49'152);
+    key.proto = IPPROTO_UDP;
+    return key;
+  };
+  flow_key replyKey = makeReplyKey(8443);
+  flow_key replyKey2 = makeReplyKey(9443);
+
+  auto runHost = [&](const std::vector<uint8_t>& frame, std::vector<uint8_t>& output) -> uint32_t {
+    output.resize(frame.size());
+    LIBBPF_OPTS(bpf_test_run_opts, opts,
+                .data_in = frame.data(),
+                .data_out = output.data(),
+                .data_size_in = static_cast<__u32>(frame.size()),
+                .data_size_out = static_cast<__u32>(output.size()),
+                .repeat = 1, );
+    if (bpf_prog_test_run_opts(host.prog_fd, &opts) != 0)
+    {
+      return UINT32_MAX;
+    }
+    output.resize(opts.data_size_out);
+    return opts.retval;
+  };
+  auto runNetkit = [&](BPFProgram& program, const std::vector<uint8_t>& frame, uint32_t mark, std::vector<uint8_t>& output) -> uint32_t {
+    output.resize(frame.size() + 64u);
+    struct __sk_buff context = {};
+    context.mark = mark;
+    LIBBPF_OPTS(bpf_test_run_opts, opts,
+                .data_in = frame.data(),
+                .data_out = output.data(),
+                .data_size_in = static_cast<__u32>(frame.size()),
+                .data_size_out = static_cast<__u32>(output.size()),
+                .ctx_in = &context,
+                .ctx_size_in = sizeof(context),
+                .repeat = 1, );
+    if (bpf_prog_test_run_opts(program.prog_fd, &opts) != 0)
+    {
+      return UINT32_MAX;
+    }
+    output.resize(opts.data_size_out);
+    return opts.retval;
+  };
+  auto clearWormholeFlows = [&]() -> void {
+    clearProgramMap<switchboard_wormhole_flow_key>(host, "wh_pending"_ctv);
+    clearProgramMap<switchboard_wormhole_flow_key>(host, "wh_flows"_ctv);
+  };
+  switchboard_wormhole_flow_key ownerKey = switchboardWormholeFlowMapKey(&replyKey, binding.owner_generation);
+  switchboard_wormhole_flow_key ownerKey2 = switchboardWormholeFlowMapKey(&replyKey2, binding2.owner_generation);
+
+  std::vector<uint8_t> hostOutput = {};
+  std::vector<uint8_t> packetOutput = {};
+  clearWormholeFlows();
+  expectNamed(runHost(publicOverlay, hostOutput) == TC_ACT_SHOT,
+              "rejects_forged_provenance_from_unauthorized_overlay_peer");
+  switchboard_wormhole_flow unauthorized = {};
+  expectNamed(lookupProgramMapElement(host, "wh_pending"_ctv, ownerKey, unauthorized) == false,
+              "unauthorized_provenance_cannot_claim_reverse_tuple");
+  uint8_t overlaySource[16] = {};
+  uint8_t overlayDestination[16] = {};
+  parseIPv6Bytes("fd00:10::a", overlaySource);
+  parseIPv6Bytes("fd00:10::b", overlayDestination);
+  expectNamed(installOverlayIngressPeerIPv6(host, overlaySource, overlayDestination),
+              "authorizes_exact_overlay_peer_pair");
+  expectNamed(runHost(publicOverlay, hostOutput) == TC_ACT_REDIRECT, "public_first_is_admitted");
+  switchboard_wormhole_flow firstPublic = {};
+  expectNamed(lookupProgramMapElement(host, "wh_pending"_ctv, ownerKey, firstPublic) &&
+                  firstPublic.disposition == SWITCHBOARD_WORMHOLE_FLOW_PUBLIC &&
+                  firstPublic.phase == SWITCHBOARD_WORMHOLE_FLOW_PENDING,
+              "public_first_claims_pending_reverse_tuple");
+  expectNamed(runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_PASS,
+              "same_public_binding_refreshes_through_container_ingress");
+  switchboard_wormhole_flow refreshed = {};
+  expectNamed(lookupProgramMapElement(host, "wh_pending"_ctv, ownerKey, refreshed) &&
+                  refreshed.phase == SWITCHBOARD_WORMHOLE_FLOW_PENDING &&
+                  refreshed.expiresAtNs == firstPublic.expiresAtNs,
+              "inbound_only_traffic_cannot_extend_pending_owner");
+  expectNamed(runNetkit(ingress, privateIngress, 0, packetOutput) == NETKIT_DROP,
+              "public_first_rejects_aliasing_private_flow");
+
+  clearWormholeFlows();
+  expectNamed(runNetkit(ingress, privateIngress, 0, packetOutput) == NETKIT_PASS,
+              "private_first_is_admitted");
+  switchboard_wormhole_flow firstPrivate = {};
+  expectNamed(lookupProgramMapElement(host, "wh_pending"_ctv, ownerKey, firstPrivate) && firstPrivate.disposition == SWITCHBOARD_WORMHOLE_FLOW_PRIVATE,
+              "private_first_claims_exact_reverse_tuple");
+  expectNamed(runHost(publicOverlay, hostOutput) == TC_ACT_SHOT,
+              "private_first_rejects_aliasing_public_flow");
+
+  clearWormholeFlows();
+  std::vector<uint8_t> publicInner2 = makeIPv6L4EthernetFrame(client, external2, IPPROTO_UDP, 49'152, 4443);
+  std::vector<uint8_t> publicOverlay2 = makeWormholeIPv6OverlayFrame(publicInner2, selected);
+  expectNamed(runHost(publicOverlay, hostOutput) == TC_ACT_REDIRECT && runHost(publicOverlay2, packetOutput) == TC_ACT_REDIRECT,
+              "distinct_portals_with_distinct_targets_are_admitted");
+  switchboard_wormhole_flow distinct1 = {};
+  switchboard_wormhole_flow distinct2 = {};
+  expectNamed(lookupProgramMapElement(host, "wh_pending"_ctv, ownerKey, distinct1) &&
+                  lookupProgramMapElement(host, "wh_pending"_ctv, ownerKey2, distinct2) &&
+                  std::memcmp(&distinct1.binding, &binding, sizeof(binding)) == 0 &&
+                  std::memcmp(&distinct2.binding, &binding2, sizeof(binding2)) == 0,
+              "distinct_portals_preserve_exact_reverse_bindings");
+
+  uint8_t externalTCP[16] = {};
+  parseIPv6Bytes("2001:db8:100::46", externalTCP);
+  switchboard_wormhole_egress_binding tcpBinding = installPortal(externalTCP, 443, 10'443, 44, IPPROTO_TCP);
+  std::vector<uint8_t> publicTCPInner = makeIPv6L4EthernetFrame(client, externalTCP, IPPROTO_TCP, 49'155, 443);
+  std::vector<uint8_t> publicTCPOverlay = makeWormholeIPv6OverlayFrame(publicTCPInner, selected);
+  std::vector<uint8_t> tcpReply = makeIPv6L4EthernetFrame(server, client, IPPROTO_TCP, 10'443, 49'155);
+  struct tcphdr *tcpReplyHeader = reinterpret_cast<struct tcphdr *>(tcpReply.data() + sizeof(struct ethhdr) + sizeof(struct ipv6hdr));
+  tcpReplyHeader->ack = 1;
+  flow_key tcpReplyKey = {};
+  std::memcpy(tcpReplyKey.srcv6, server, sizeof(tcpReplyKey.srcv6));
+  std::memcpy(tcpReplyKey.dstv6, client, sizeof(tcpReplyKey.dstv6));
+  tcpReplyKey.port16[0] = htons(10'443);
+  tcpReplyKey.port16[1] = htons(49'155);
+  tcpReplyKey.proto = IPPROTO_TCP;
+  switchboard_wormhole_flow_key tcpOwnerKey = switchboardWormholeFlowMapKey(&tcpReplyKey, tcpBinding.owner_generation);
+
+  clearWormholeFlows();
+  expectNamed(runHost(publicTCPOverlay, hostOutput) == TC_ACT_REDIRECT &&
+                  runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_PASS,
+              "tcp_first_direction_is_admitted");
+  switchboard_wormhole_flow pendingTCP = {};
+  expectNamed(lookupProgramMapElement(host, "wh_pending"_ctv, tcpOwnerKey, pendingTCP) &&
+                  pendingTCP.phase == SWITCHBOARD_WORMHOLE_FLOW_PENDING &&
+                  std::memcmp(&pendingTCP.binding, &tcpBinding, sizeof(tcpBinding)) == 0,
+              "tcp_first_direction_uses_pending_owner");
+  expectNamed(runHost(publicTCPOverlay, hostOutput) == TC_ACT_REDIRECT,
+              "tcp_retransmit_is_admitted");
+  switchboard_wormhole_flow retransmittedTCP = {};
+  expectNamed(lookupProgramMapElement(host, "wh_pending"_ctv, tcpOwnerKey, retransmittedTCP) &&
+                  retransmittedTCP.expiresAtNs == pendingTCP.expiresAtNs,
+              "tcp_retransmit_cannot_extend_pending_deadline");
+  expectNamed(runNetkit(egress, tcpReply, 0, packetOutput) == TC_ACT_REDIRECT,
+              "tcp_syn_ack_is_admitted");
+  switchboard_wormhole_flow reverseSeenTCP = {};
+  expectNamed(lookupProgramMapElement(host, "wh_pending"_ctv, tcpOwnerKey, reverseSeenTCP) &&
+                  reverseSeenTCP.phase == SWITCHBOARD_WORMHOLE_FLOW_REVERSE_SEEN &&
+                  lookupProgramMapElement(host, "wh_flows"_ctv, tcpOwnerKey, reverseSeenTCP) == false,
+              "tcp_syn_ack_remains_pending_until_client_ack");
+  std::vector<uint8_t> wrongTCPInner = publicTCPInner;
+  struct ipv6hdr *wrongTCPIPv6 = reinterpret_cast<struct ipv6hdr *>(wrongTCPInner.data() + sizeof(struct ethhdr));
+  struct tcphdr *wrongTCPHeader = reinterpret_cast<struct tcphdr *>(wrongTCPIPv6 + 1);
+  wrongTCPHeader->syn = 0;
+  wrongTCPHeader->ack = 1;
+  wrongTCPHeader->ack_seq = htonl(2);
+  wrongTCPHeader->check = 0;
+  wrongTCPHeader->check = checksumIPv6Transport(wrongTCPIPv6->saddr.s6_addr,
+                                                wrongTCPIPv6->daddr.s6_addr,
+                                                IPPROTO_TCP,
+                                                wrongTCPHeader,
+                                                sizeof(*wrongTCPHeader));
+  std::vector<uint8_t> wrongTCPOverlay = makeWormholeIPv6OverlayFrame(wrongTCPInner, selected);
+  expectNamed(runHost(wrongTCPOverlay, hostOutput) == TC_ACT_REDIRECT &&
+                  runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_DROP &&
+                  lookupProgramMapElement(host, "wh_flows"_ctv, tcpOwnerKey, reverseSeenTCP) == false,
+              "tcp_wrong_client_ack_cannot_promote_or_pass_pending_owner");
+  struct tcphdr *tcpClientHeader = reinterpret_cast<struct tcphdr *>(publicTCPInner.data() + sizeof(struct ethhdr) + sizeof(struct ipv6hdr));
+  tcpClientHeader->syn = 0;
+  tcpClientHeader->ack = 1;
+  tcpClientHeader->ack_seq = htonl(1);
+  tcpClientHeader->check = 0;
+  tcpClientHeader->check = checksumIPv6Transport(reinterpret_cast<struct ipv6hdr *>(publicTCPInner.data() + sizeof(struct ethhdr))->saddr.s6_addr,
+                                                 reinterpret_cast<struct ipv6hdr *>(publicTCPInner.data() + sizeof(struct ethhdr))->daddr.s6_addr,
+                                                 IPPROTO_TCP,
+                                                 tcpClientHeader,
+                                                 sizeof(*tcpClientHeader));
+  publicTCPOverlay = makeWormholeIPv6OverlayFrame(publicTCPInner, selected);
+  expectNamed(runHost(publicTCPOverlay, hostOutput) == TC_ACT_REDIRECT &&
+                  runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_PASS,
+              "tcp_client_ack_promotes_owner");
+  switchboard_wormhole_flow establishedTCP = {};
+  expectNamed(lookupProgramMapElement(host, "wh_flows"_ctv, tcpOwnerKey, establishedTCP) &&
+                  establishedTCP.phase == SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED &&
+                  establishedTCP.expiresAtNs > pendingTCP.expiresAtNs &&
+                  lookupProgramMapElement(host, "wh_pending"_ctv, tcpOwnerKey, reverseSeenTCP) == false,
+              "tcp_client_ack_moves_owner_to_established_map");
+
+  tcpClientHeader->fin = 1;
+  tcpClientHeader->check = 0;
+  tcpClientHeader->check = checksumIPv6Transport(reinterpret_cast<struct ipv6hdr *>(publicTCPInner.data() + sizeof(struct ethhdr))->saddr.s6_addr,
+                                                 reinterpret_cast<struct ipv6hdr *>(publicTCPInner.data() + sizeof(struct ethhdr))->daddr.s6_addr,
+                                                 IPPROTO_TCP,
+                                                 tcpClientHeader,
+                                                 sizeof(*tcpClientHeader));
+  publicTCPOverlay = makeWormholeIPv6OverlayFrame(publicTCPInner, selected);
+  expectNamed(runHost(publicTCPOverlay, hostOutput) == TC_ACT_REDIRECT &&
+                  runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_PASS,
+              "tcp_fin_is_admitted_for_established_owner");
+  switchboard_wormhole_flow closingTCP = {};
+  expectNamed(lookupProgramMapElement(host, "wh_flows"_ctv, tcpOwnerKey, closingTCP) &&
+                  closingTCP.phase == SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED_CLOSING &&
+                  closingTCP.expiresAtNs < establishedTCP.expiresAtNs,
+              "tcp_fin_latches_short_owner_retirement");
+
+  tcpClientHeader->fin = 0;
+  tcpClientHeader->check = 0;
+  tcpClientHeader->check = checksumIPv6Transport(reinterpret_cast<struct ipv6hdr *>(publicTCPInner.data() + sizeof(struct ethhdr))->saddr.s6_addr,
+                                                 reinterpret_cast<struct ipv6hdr *>(publicTCPInner.data() + sizeof(struct ethhdr))->daddr.s6_addr,
+                                                 IPPROTO_TCP,
+                                                 tcpClientHeader,
+                                                 sizeof(*tcpClientHeader));
+  publicTCPOverlay = makeWormholeIPv6OverlayFrame(publicTCPInner, selected);
+  expectNamed(runHost(publicTCPOverlay, hostOutput) == TC_ACT_REDIRECT &&
+                  runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_PASS,
+              "tcp_post_fin_packet_remains_admitted_during_retirement");
+  switchboard_wormhole_flow retiringTCP = {};
+  expectNamed(lookupProgramMapElement(host, "wh_flows"_ctv, tcpOwnerKey, retiringTCP) &&
+                  retiringTCP.phase == SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED_CLOSING &&
+                  retiringTCP.expiresAtNs == closingTCP.expiresAtNs,
+              "tcp_post_fin_packet_cannot_reextend_latched_retirement");
+
+  clearWormholeFlows();
+  expectNamed(runNetkit(egress, reply, 0, packetOutput) == NETKIT_DROP,
+              "missing_reply_owner_fails_closed");
+  switchboard_wormhole_flow expired = {};
+  expired.binding = binding;
+  expired.disposition = SWITCHBOARD_WORMHOLE_FLOW_PUBLIC;
+  expired.phase = SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED;
+  expired.expiresAtNs = 1;
+  expectNamed(updateProgramMapElement(host, "wh_flows"_ctv, ownerKey, expired), "seeds_expired_reply_owner");
+  expectNamed(runNetkit(egress, reply, 0, packetOutput) == NETKIT_DROP,
+              "expired_reply_owner_fails_closed");
+  expectNamed(runHost(publicOverlay, hostOutput) == TC_ACT_SHOT,
+              "expired_owner_blocks_packet_side_resurrection");
+  switchboard_wormhole_flow stillExpired = {};
+  expectNamed(lookupProgramMapElement(host, "wh_flows"_ctv, ownerKey, stillExpired) &&
+                  std::memcmp(&stillExpired, &expired, sizeof(expired)) == 0,
+              "expired_owner_remains_unchanged_until_gc");
+  SwitchboardWormholeFlowGCCursor expiryCursor = {};
+  uint32_t expiryDeleted = 0;
+  expectNamed(switchboardCleanupExpiredWormholeFlows(&host, 2, expiryCursor, &expiryDeleted) && expiryDeleted == 0 &&
+                  lookupProgramMapElement(host, "wh_flows"_ctv, ownerKey, stillExpired),
+              "gc_retains_logically_expired_owner_during_execution_grace");
+  expiryCursor = {};
+  expectNamed(switchboardCleanupExpiredWormholeFlows(&host,
+                                                     WORMHOLE_FLOW_RECLAIM_GRACE_NS + 2,
+                                                     expiryCursor,
+                                                     &expiryDeleted) &&
+                  expiryDeleted == 1,
+              "gc_releases_expired_owner_after_execution_grace");
+  expectNamed(runHost(publicOverlay, hostOutput) == TC_ACT_REDIRECT,
+              "identical_public_ingress_claims_tuple_only_after_gc");
+  expectNamed(runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_PASS,
+              "validates_relearned_public_owner_at_socket_boundary");
+  expectNamed(runNetkit(egress, reply, 0, packetOutput) == TC_ACT_REDIRECT,
+              "public_reply_redirects_after_exact_owner_lookup");
+  if (packetOutput.size() >= sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + sizeof(struct udphdr))
+  {
+    const struct ipv6hdr *rewritten6 = reinterpret_cast<const struct ipv6hdr *>(packetOutput.data() + sizeof(struct ethhdr));
+    const struct udphdr *rewrittenUDP = reinterpret_cast<const struct udphdr *>(rewritten6 + 1);
+    expectNamed(std::memcmp(rewritten6->saddr.s6_addr, external, sizeof(external)) == 0 && rewrittenUDP->source == htons(443),
+                "public_reply_restores_exact_external_source_tuple");
+  }
+  switchboard_wormhole_flow refreshedOwner = {};
+  expectNamed(lookupProgramMapElement(host, "wh_pending"_ctv, ownerKey, refreshedOwner) &&
+                  refreshedOwner.phase == SWITCHBOARD_WORMHOLE_FLOW_REVERSE_SEEN &&
+                  refreshedOwner.expiresAtNs > firstPublic.expiresAtNs,
+              "udp_reverse_reply_refreshes_pending_owner");
+
+  clearWormholeFlows();
+  switchboard_wormhole_flow expiredPending = {};
+  expiredPending.binding = binding;
+  std::memcpy(expiredPending.container, selected, sizeof(selected));
+  expiredPending.disposition = SWITCHBOARD_WORMHOLE_FLOW_PUBLIC;
+  expiredPending.phase = SWITCHBOARD_WORMHOLE_FLOW_PENDING;
+  expiredPending.expiresAtNs = 1;
+  expectNamed(updateProgramMapElement(host, "wh_pending"_ctv, ownerKey, expiredPending),
+              "seeds_expired_pending_owner");
+  expectNamed(runHost(publicOverlay, hostOutput) == TC_ACT_SHOT,
+              "expired_pending_owner_blocks_packet_side_replacement");
+  switchboard_wormhole_flow retainedPending = {};
+  expectNamed(lookupProgramMapElement(host, "wh_pending"_ctv, ownerKey, retainedPending) &&
+                  std::memcmp(&retainedPending, &expiredPending, sizeof(expiredPending)) == 0,
+              "expired_pending_owner_remains_unchanged_until_gc");
+  SwitchboardWormholeFlowGCCursor pendingExpiryCursor = {};
+  uint32_t pendingExpiryDeleted = 0;
+  expectNamed(switchboardCleanupExpiredWormholeFlows(&host, 2, pendingExpiryCursor, &pendingExpiryDeleted) &&
+                  pendingExpiryDeleted == 0 &&
+                  lookupProgramMapElement(host, "wh_pending"_ctv, ownerKey, retainedPending),
+              "gc_retains_logically_expired_pending_owner_during_execution_grace");
+  pendingExpiryCursor = {};
+  expectNamed(switchboardCleanupExpiredWormholeFlows(&host,
+                                                     WORMHOLE_FLOW_RECLAIM_GRACE_NS + 2,
+                                                     pendingExpiryCursor,
+                                                     &pendingExpiryDeleted) &&
+                  pendingExpiryDeleted == 1 &&
+                  lookupProgramMapElement(host, "wh_pending"_ctv, ownerKey, retainedPending) == false,
+              "gc_releases_expired_pending_owner_after_execution_grace");
+  expectNamed(runHost(publicOverlay, hostOutput) == TC_ACT_REDIRECT &&
+                  lookupProgramMapElement(host, "wh_pending"_ctv, ownerKey, retainedPending) &&
+                  retainedPending.expiresAtNs > expiredPending.expiresAtNs,
+              "identical_public_ingress_reclaims_pending_tuple_only_after_gc");
+
+  clearWormholeFlows();
+  switchboard_wormhole_flow staleOwner = {};
+  staleOwner.binding = binding;
+  std::memcpy(staleOwner.container, selected, sizeof(selected));
+  staleOwner.disposition = SWITCHBOARD_WORMHOLE_FLOW_PUBLIC;
+  staleOwner.phase = SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED;
+  staleOwner.expiresAtNs = UINT64_MAX;
+  expectNamed(updateProgramMapElement(host, "wh_flows"_ctv, ownerKey, staleOwner),
+              "seeds_previous_generation_owner");
+  switchboard_wormhole_egress_key exposure = {};
+  std::memcpy(exposure.container, selected, sizeof(exposure.container));
+  exposure.port = htons(8443);
+  exposure.proto = IPPROTO_UDP;
+  switchboard_wormhole_egress_binding replacementBinding = binding;
+  ++replacementBinding.owner_generation;
+  expectNamed(updateProgramMapElement(host, "wh_egress"_ctv, exposure, replacementBinding) &&
+                  updateProgramMapElement(ingress, "wh_egress"_ctv, exposure, replacementBinding) &&
+                  updateProgramMapElement(egress, "wh_egress"_ctv, exposure, replacementBinding),
+              "reopens_same_tuple_with_new_owner_generation");
+  switchboard_wormhole_flow_key replacementOwnerKey =
+      switchboardWormholeFlowMapKey(&replyKey, replacementBinding.owner_generation);
+  switchboard_wormhole_flow replacementOwner = {};
+  expectNamed(runHost(publicOverlay, hostOutput) == TC_ACT_REDIRECT &&
+                  lookupProgramMapElement(host, "wh_pending"_ctv, replacementOwnerKey, replacementOwner) &&
+                  lookupProgramMapElement(host, "wh_flows"_ctv, ownerKey, staleOwner),
+              "new_generation_claims_same_tuple_without_deleting_old_owner");
+  expectNamed(updateProgramMapElement(host, "wh_egress"_ctv, exposure, binding) &&
+                  updateProgramMapElement(ingress, "wh_egress"_ctv, exposure, binding) &&
+                  updateProgramMapElement(egress, "wh_egress"_ctv, exposure, binding),
+              "restores_original_test_binding");
+  clearWormholeFlows();
+
+  struct in_addr client4 = parseIPv4Address("203.0.113.99");
+  struct in_addr external4 = parseIPv4Address("198.18.0.1");
+  portal_definition portal4 = {};
+  portal4.addr4 = external4.s_addr;
+  portal4.port = htons(443);
+  portal4.proto = IPPROTO_UDP;
+  portal_meta meta4 = {};
+  meta4.slot = 43;
+  expectNamed(updateProgramMapElement(host, "ext_portals"_ctv, portal4, meta4),
+              "installs_ipv4_portal");
+  switchboard_wormhole_target_key target4 = {};
+  target4.slot = meta4.slot;
+  std::memcpy(target4.container, selected, sizeof(target4.container));
+  expectNamed(updateProgramMapElement(host, "wh_targets"_ctv, target4, htons(8443)),
+              "installs_ipv4_exact_portal_target");
+  uint8_t replica2[5] = {selected[0], selected[1], selected[2], selected[3], uint8_t(selected[4] + 1)};
+  switchboard_wormhole_target_key target4Replica2 = {};
+  target4Replica2.slot = meta4.slot;
+  std::memcpy(target4Replica2.container, replica2, sizeof(target4Replica2.container));
+  uint32_t replica2Ifindex = containerIfindex + 1;
+  host.setArrayElement("ct_dev_map"_ctv, replica2[4], replica2Ifindex);
+  expectNamed(updateProgramMapElement(host, "wh_targets"_ctv, target4Replica2, htons(8443)),
+              "installs_ipv4_second_replica_target");
+  switchboard_wormhole_egress4_key exposure4 = {};
+  exposure4.addr = external4.s_addr;
+  exposure4.port = htons(8443);
+  exposure4.proto = IPPROTO_UDP;
+  switchboard_wormhole_egress_binding binding4 = {};
+  binding4.addr4 = external4.s_addr;
+  binding4.port = portal4.port;
+  binding4.proto = portal4.proto;
+  binding4.owner_generation = 44;
+  expectNamed(updateProgramMapElement(host, "wh_egress4"_ctv, exposure4, binding4) &&
+                  updateProgramMapElement(ingress, "wh_egress4"_ctv, exposure4, binding4) &&
+                  updateProgramMapElement(egress, "wh_egress4"_ctv, exposure4, binding4),
+              "installs_ipv4_shared_exposure_binding");
+
+  std::vector<uint8_t> publicInner4 = makeIPv4L4EthernetFrame(client4, external4, IPPROTO_UDP, 49'154, 443);
+  std::vector<uint8_t> publicOverlay4 = makeWormholeIPv6OverlayFrame(publicInner4, selected);
+  std::vector<uint8_t> publicOverlay4Replica2 = makeWormholeIPv6OverlayFrame(publicInner4, replica2);
+  std::vector<uint8_t> privateIngress4 = makeIPv4L4EthernetFrame(client4, external4, IPPROTO_UDP, 49'154, 8443);
+  std::vector<uint8_t> reply4 = makeIPv4L4EthernetFrame(external4, client4, IPPROTO_UDP, 8443, 49'154);
+  std::vector<uint8_t> firstFragment4 = privateIngress4;
+  reinterpret_cast<struct iphdr *>(firstFragment4.data() + sizeof(struct ethhdr))->frag_off = htons(IP_MF);
+  std::vector<uint8_t> laterFragment4 = privateIngress4;
+  reinterpret_cast<struct iphdr *>(laterFragment4.data() + sizeof(struct ethhdr))->frag_off = htons(1);
+  expectNamed(runNetkit(ingress, firstFragment4, 0, packetOutput) == NETKIT_DROP &&
+                  runNetkit(ingress, firstFragment4, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_DROP,
+              "ipv4_mf_fragment_drops_at_private_and_public_ingress_boundaries");
+  expectNamed(runNetkit(ingress, laterFragment4, 0, packetOutput) == NETKIT_DROP &&
+                  runNetkit(ingress, laterFragment4, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_DROP,
+              "ipv4_nonzero_offset_fragment_drops_at_private_and_public_ingress_boundaries");
+  expectNamed(runNetkit(egress, firstFragment4, 0, packetOutput) == NETKIT_DROP &&
+                  runNetkit(egress, laterFragment4, 0, packetOutput) == NETKIT_DROP,
+              "ipv4_fragments_drop_before_wormhole_reply_fallthrough");
+  std::vector<uint8_t> icmp4 = makeIPv4ICMPEthernetFrame(client4, external4);
+  expectNamed(runNetkit(ingress, icmp4, 0, packetOutput) == NETKIT_PASS &&
+                  runNetkit(ingress, icmp4, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_DROP,
+              "ipv4_non_l4_traffic_preserves_ordinary_path_but_rejects_public_wormhole_mark");
+  std::vector<uint8_t> icmp6 = makeIPv6L4EthernetFrame(client, server, IPPROTO_UDP, 49'154, 8443);
+  reinterpret_cast<struct ipv6hdr *>(icmp6.data() + sizeof(struct ethhdr))->nexthdr = IPPROTO_ICMPV6;
+  expectNamed(runNetkit(ingress, icmp6, 0, packetOutput) == NETKIT_PASS &&
+                  runNetkit(ingress, icmp6, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_DROP,
+              "ipv6_non_l4_traffic_preserves_ordinary_path_but_rejects_public_wormhole_mark");
+  flow_key replyKey4 = {};
+  replyKey4.src = external4.s_addr;
+  replyKey4.dst = client4.s_addr;
+  replyKey4.port16[0] = htons(8443);
+  replyKey4.port16[1] = htons(49'154);
+  replyKey4.proto = IPPROTO_UDP;
+  switchboard_wormhole_flow_key ownerKey4 = switchboardWormholeFlowMapKey(&replyKey4, binding4.owner_generation);
+
+  clearWormholeFlows();
+  expectNamed(runHost(publicOverlay4, hostOutput) == TC_ACT_REDIRECT &&
+                  runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_PASS,
+              "ipv4_public_first_is_admitted_across_shared_map");
+  switchboard_wormhole_flow public4 = {};
+  expectNamed(lookupProgramMapElement(host, "wh_pending"_ctv, ownerKey4, public4) &&
+                  public4.disposition == SWITCHBOARD_WORMHOLE_FLOW_PUBLIC &&
+                  runNetkit(ingress, privateIngress4, 0, packetOutput) == NETKIT_DROP,
+              "ipv4_public_first_rejects_aliasing_private_flow");
+  expectNamed(runHost(publicOverlay4Replica2, packetOutput) == TC_ACT_SHOT,
+              "ipv4_first_replica_owner_rejects_second_replica_alias");
+
+  clearWormholeFlows();
+  expectNamed(runHost(publicOverlay4Replica2, hostOutput) == TC_ACT_REDIRECT &&
+                  runHost(publicOverlay4, packetOutput) == TC_ACT_SHOT,
+              "ipv4_second_replica_owner_rejects_first_replica_alias");
+
+  clearWormholeFlows();
+  expectNamed(runNetkit(ingress, privateIngress4, 0, packetOutput) == NETKIT_PASS &&
+                  runHost(publicOverlay4, hostOutput) == TC_ACT_SHOT,
+              "ipv4_private_first_rejects_aliasing_public_flow");
+
+  clearWormholeFlows();
+  expectNamed(runHost(publicOverlay4, hostOutput) == TC_ACT_REDIRECT &&
+                  runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_PASS,
+              "ipv4_public_reply_establishes_first_replica_owner");
+  policy.containerFragment = replica2[4];
+  egress.setArrayElement("ct_net_policy"_ctv, 0, policy);
+  expectNamed(runNetkit(egress, reply4, 0, packetOutput) == NETKIT_DROP,
+              "ipv4_second_replica_cannot_consume_first_replica_owner");
+  policy.containerFragment = selected[4];
+  egress.setArrayElement("ct_net_policy"_ctv, 0, policy);
+  expectNamed(runNetkit(egress, reply4, 0, packetOutput) == TC_ACT_REDIRECT,
+              "ipv4_public_reply_uses_exact_reverse_owner");
+  if (packetOutput.size() >= sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr))
+  {
+    const struct iphdr *rewritten4 = reinterpret_cast<const struct iphdr *>(packetOutput.data() + sizeof(struct ethhdr));
+    const struct udphdr *rewrittenUDP4 = reinterpret_cast<const struct udphdr *>(rewritten4 + 1);
+    expectNamed(rewritten4->saddr == external4.s_addr && rewrittenUDP4->source == htons(443),
+                "ipv4_public_reply_restores_exact_external_source_tuple");
+  }
+
+  clearWormholeFlows();
+  switchboard_wormhole_flow live = expired;
+  live.expiresAtNs = UINT64_MAX;
+  expectNamed(updateProgramMapElement(host, "wh_flows"_ctv, ownerKey, expired) &&
+                  updateProgramMapElement(host, "wh_flows"_ctv, ownerKey2, live),
+              "seeds_gc_expired_and_live_owners");
+  SwitchboardWormholeFlowGCCursor gcCursor = {};
+  uint32_t deleted = 0;
+  expectNamed(switchboardCleanupExpiredWormholeFlows(&host,
+                                                     WORMHOLE_FLOW_RECLAIM_GRACE_NS + 2,
+                                                     gcCursor,
+                                                     &deleted) &&
+                  deleted == 1,
+              "gc_deletes_only_expired_owner");
+  switchboard_wormhole_flow remaining = {};
+  expectNamed(lookupProgramMapElement(host, "wh_flows"_ctv, ownerKey, remaining) == false &&
+                  lookupProgramMapElement(host, "wh_flows"_ctv, ownerKey2, remaining),
+              "gc_preserves_live_owner");
+
+  clearWormholeFlows();
+  (void)unlink(establishedPinPath.c_str());
+  (void)unlink(pendingPinPath.c_str());
+  host.close();
+  ingress.close();
+  egress.close();
+}
+
+static void exerciseWormholeTCPPromotionMapFull(TestSuite& suite)
+{
+  String objectPath = {};
+  objectPath.assign(PRODIGY_TEST_BINARY_DIR);
+  objectPath.append("/container.ingress.router.wormhole-full.ebpf.o"_ctv);
+  BPFProgram ingress = {};
+  suite.expect(ingress.load(objectPath, "ct_ingress"_ctv),
+               "switchboard_wormhole_tcp_map_full_loads_bounded_program");
+  if (ingress.prog_fd < 0)
+  {
+    return;
+  }
+
+  const uint8_t container[5] = {0x01, 0x16, 0x25, 0x5b, 0x4e};
+  local_container_subnet6 subnet = {};
+  subnet.dpfx = container[0];
+  std::memcpy(subnet.mpfx, container + 1, sizeof(subnet.mpfx));
+  ingress.setArrayElement("lc_subnet"_ctv, 0, subnet);
+  container_network_policy policy = {};
+  policy.mode = CONTAINER_NETWORK_UNRESTRICTED;
+  policy.containerFragment = container[4];
+  ingress.setArrayElement("ct_net_policy"_ctv, 0, policy);
+
+  uint8_t client[16] = {};
+  uint8_t server[16] = {};
+  parseIPv6Bytes("2001:db8:200::99", client);
+  makeContainerIPv6(server, container[0], container[1], container[2], container[3], container[4]);
+  switchboard_wormhole_egress_key exposure = {};
+  std::memcpy(exposure.container, container, sizeof(exposure.container));
+  exposure.port = htons(10'443);
+  exposure.proto = IPPROTO_TCP;
+  switchboard_wormhole_egress_binding binding = {};
+  parseIPv6Bytes("2001:db8:100::46", reinterpret_cast<uint8_t *>(binding.addr6));
+  binding.port = htons(443);
+  binding.proto = IPPROTO_TCP;
+  binding.is_ipv6 = 1;
+  binding.owner_generation = 77;
+  suite.expect(updateProgramMapElement(ingress, "wh_egress"_ctv, exposure, binding),
+               "switchboard_wormhole_tcp_map_full_installs_binding");
+
+  flow_key reply = {};
+  std::memcpy(reply.srcv6, server, sizeof(reply.srcv6));
+  std::memcpy(reply.dstv6, client, sizeof(reply.dstv6));
+  reply.port16[0] = htons(10'443);
+  reply.port16[1] = htons(49'155);
+  reply.proto = IPPROTO_TCP;
+  switchboard_wormhole_flow_key ownerKey = switchboardWormholeFlowMapKey(&reply, binding.owner_generation);
+  switchboard_wormhole_flow pending = {};
+  pending.binding = binding;
+  std::memcpy(pending.container, container, sizeof(pending.container));
+  pending.disposition = SWITCHBOARD_WORMHOLE_FLOW_PUBLIC;
+  pending.phase = SWITCHBOARD_WORMHOLE_FLOW_REVERSE_SEEN;
+  pending.expectedAck = htonl(1);
+  pending.expiresAtNs = UINT64_MAX;
+  suite.expect(updateProgramMapElement(ingress, "wh_pending"_ctv, ownerKey, pending),
+               "switchboard_wormhole_tcp_map_full_seeds_pending_handshake");
+
+  switchboard_wormhole_flow_key fillerKey = ownerKey;
+  fillerKey.owner_generation = 78;
+  switchboard_wormhole_flow filler = pending;
+  filler.phase = SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED;
+  suite.expect(updateProgramMapElement(ingress, "wh_flows"_ctv, fillerKey, filler),
+               "switchboard_wormhole_tcp_map_full_fills_established_map");
+
+  std::vector<uint8_t> frame = makeIPv6L4EthernetFrame(client, server, IPPROTO_TCP, 49'155, 10'443);
+  struct ipv6hdr *ip6 = reinterpret_cast<struct ipv6hdr *>(frame.data() + sizeof(struct ethhdr));
+  struct tcphdr *tcp = reinterpret_cast<struct tcphdr *>(ip6 + 1);
+  tcp->syn = 0;
+  tcp->ack = 1;
+  tcp->ack_seq = htonl(1);
+  tcp->check = 0;
+  tcp->check = checksumIPv6Transport(ip6->saddr.s6_addr, ip6->daddr.s6_addr, IPPROTO_TCP, tcp, sizeof(*tcp));
+
+  std::vector<uint8_t> output(frame.size() + 64u);
+  struct __sk_buff context = {};
+  context.mark = SWITCHBOARD_WORMHOLE_SKB_MARK;
+  LIBBPF_OPTS(bpf_test_run_opts, opts,
+              .data_in = frame.data(),
+              .data_out = output.data(),
+              .data_size_in = static_cast<__u32>(frame.size()),
+              .data_size_out = static_cast<__u32>(output.size()),
+              .ctx_in = &context,
+              .ctx_size_in = sizeof(context),
+              .repeat = 1, );
+  switchboard_wormhole_flow retained = {};
+  suite.expect(bpf_prog_test_run_opts(ingress.prog_fd, &opts) == 0 && opts.retval == NETKIT_DROP,
+               "switchboard_wormhole_tcp_map_full_drops_ack_when_promotion_cannot_commit");
+  suite.expect(lookupProgramMapElement(ingress, "wh_pending"_ctv, ownerKey, retained) &&
+                   lookupProgramMapElement(ingress, "wh_flows"_ctv, ownerKey, retained) == false,
+               "switchboard_wormhole_tcp_map_full_preserves_pending_without_false_establishment");
+  ingress.close();
 }
 
 static void exerciseBalancerOwnedRoutableMissPassesToKernel(TestSuite& suite)
@@ -1627,6 +2500,8 @@ int main(void)
       });
       suite.expect(targetUpdated,
                    "switchboard_host_ingress_ipv4_quic_portal_installs_target_port");
+      suite.expect(installWormholeExposure(ingressProgram, portal, false, cidContainer, targetPort, meta.slot + 1u),
+                   "switchboard_host_ingress_ipv4_quic_portal_installs_exposure");
 
       struct
       {
@@ -1752,6 +2627,8 @@ int main(void)
       });
       suite.expect(targetUpdated,
                    "switchboard_host_ingress_decapped_ipv4_quic_portal_installs_target_port");
+      suite.expect(installWormholeExposure(ingressProgram, portal, false, cidContainer, targetPort, meta.slot + 1u),
+                   "switchboard_host_ingress_decapped_ipv4_quic_portal_installs_exposure");
 
       struct
       {
@@ -1770,6 +2647,8 @@ int main(void)
 
       uint8_t outerSrc[16] = {0xfd, 0x00, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a};
       uint8_t outerDst[16] = {0xfd, 0x00, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0b};
+      suite.expect(installOverlayIngressPeerIPv6(ingressProgram, outerSrc, outerDst),
+                   "switchboard_host_ingress_decapped_ipv4_quic_portal_authorizes_exact_overlay_peer");
       std::vector<uint8_t> frame = makeUDPv4QuicInIPv6EthernetFrame(outerSrc,
                                                                     outerDst,
                                                                     clientAddress,
@@ -1837,6 +2716,8 @@ int main(void)
       uint8_t innerDst[16] = {};
       makeContainerIPv6(innerSrc, 0x01, 0x16, 0x25, 0x5b, 0x09);
       makeContainerIPv6(innerDst, 0x01, localSubnet.mpfx[0], localSubnet.mpfx[1], localSubnet.mpfx[2], 0x7e);
+      suite.expect(installOverlayIngressPeerIPv6(ingressProgram, outerSrc, outerDst),
+                   "switchboard_host_ingress_overlay_local_delivery_authorizes_exact_overlay_peer");
 
       std::vector<uint8_t> frame = makeIPv6InIPv6EthernetFrame(outerSrc, outerDst, innerSrc, innerDst);
       std::vector<uint8_t> output(frame.size());
@@ -1880,12 +2761,14 @@ int main(void)
   exerciseHostIngressHostedIngressRoute(suite, false, IPPROTO_TCP);
   exerciseHostIngressHostedIngressRoute(suite, true, IPPROTO_UDP);
   exerciseHostIngressHostedIngressRoute(suite, true, IPPROTO_TCP);
-  exerciseHostIngressRemotePortalRoute(suite, false, IPPROTO_UDP);
-  exerciseHostIngressRemotePortalRoute(suite, false, IPPROTO_TCP);
-  exerciseHostIngressRemotePortalRoute(suite, true, IPPROTO_UDP);
-  exerciseHostIngressRemotePortalRoute(suite, true, IPPROTO_TCP);
+  exerciseHostIngressRemotePortalRoute(suite, false, IPPROTO_UDP, false);
+  exerciseHostIngressRemotePortalRoute(suite, false, IPPROTO_TCP, true);
+  exerciseHostIngressRemotePortalRoute(suite, true, IPPROTO_UDP, false);
+  exerciseHostIngressRemotePortalRoute(suite, true, IPPROTO_TCP, true);
   exerciseBalancerOwnedRoutableMissPassesToKernel(suite);
   exerciseBalancerRemotePortalRoutesWithOverlay(suite);
+  exerciseWormholeSharedFlowOwnership(suite);
+  exerciseWormholeTCPPromotionMapFull(suite);
   exerciseHostIngressPlainLocalIPv6(suite, IPPROTO_UDP);
   exerciseHostIngressPlainLocalIPv6(suite, IPPROTO_TCP);
   {
@@ -1913,6 +2796,8 @@ int main(void)
       uint8_t outerDst[16] = {0xfd, 0x00, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0b};
       uint8_t innerSrc[16] = {0xfd, 0xf8, 0xd9, 0x4c, 0x7c, 0x33, 0xe2, 0x6e, 0xca, 0x4b, 0xf5, 0x01, 0xac, 0xbe, 0xa0, 0xd2};
       uint8_t innerDst[16] = {0xfd, 0xf8, 0xd9, 0x4c, 0x7c, 0x33, 0xe2, 0x6e, 0xca, 0x4b, 0xf5, 0x01, 0x52, 0xdf, 0x39, 0x4e};
+      suite.expect(installOverlayIngressPeerIPv6(ingressProgram, outerSrc, outerDst),
+                   "switchboard_host_ingress_overlay_local_delivery_live_packet_authorizes_exact_overlay_peer");
 
       std::vector<uint8_t> frame = makeICMPv6InIPv6EthernetFrame(outerSrc, outerDst, innerSrc, innerDst);
       std::vector<uint8_t> output(frame.size());
@@ -2002,10 +2887,6 @@ int main(void)
 
   suite.expect((switchboardPacketRewriteStoreFlags() & BPF_F_RECOMPUTE_CSUM) != 0, "switchboard_packet_rewrite_store_flags_recompute_checksum");
   suite.expect((switchboardPacketRewriteStoreFlags() & BPF_F_INVALIDATE_HASH) != 0, "switchboard_packet_rewrite_store_flags_invalidate_hash");
-  suite.expect((switchboardPacketRewriteManualChecksumDataStoreFlags() & BPF_F_RECOMPUTE_CSUM) != 0, "switchboard_packet_rewrite_manual_checksum_data_store_flags_recompute_checksum");
-  suite.expect((switchboardPacketRewriteManualChecksumDataStoreFlags() & BPF_F_INVALIDATE_HASH) != 0, "switchboard_packet_rewrite_manual_checksum_data_store_flags_invalidate_hash");
-  suite.expect((switchboardPacketRewriteManualChecksumStoreFlags() & BPF_F_RECOMPUTE_CSUM) == 0, "switchboard_packet_rewrite_manual_checksum_checksum_store_flags_skip_incremental_checksum");
-  suite.expect((switchboardPacketRewriteManualChecksumStoreFlags() & BPF_F_INVALIDATE_HASH) != 0, "switchboard_packet_rewrite_manual_checksum_checksum_store_flags_invalidate_hash");
   suite.expect((switchboardAdjustRoomPreserveOffloadFlags() & BPF_F_ADJ_ROOM_NO_CSUM_RESET) != 0, "switchboard_adjust_room_preserves_checksum_offload");
   suite.expect((switchboardAdjustRoomPreserveOffloadFlags() & BPF_F_ADJ_ROOM_FIXED_GSO) != 0, "switchboard_adjust_room_preserves_gso");
   suite.expect((switchboardOverlayEncapAdjustRoomFlagsIPv6() & BPF_F_ADJ_ROOM_ENCAP_L3_IPV6) != 0, "switchboard_overlay_encap_ipv6_sets_l3_flag");
@@ -2014,132 +2895,6 @@ int main(void)
   suite.expect((switchboardOverlayEncapAdjustRoomFlagsIPv4() & BPF_F_ADJ_ROOM_ENCAP_L3_IPV4) != 0, "switchboard_overlay_encap_ipv4_sets_l3_flag");
   suite.expect((switchboardOverlayEncapAdjustRoomFlagsIPv4() & BPF_F_ADJ_ROOM_NO_CSUM_RESET) != 0, "switchboard_overlay_encap_ipv4_preserves_checksum_offload");
   suite.expect((switchboardOverlayEncapAdjustRoomFlagsIPv4() & BPF_F_ADJ_ROOM_FIXED_GSO) == 0, "switchboard_overlay_encap_ipv4_clears_gso");
-  suite.expect(switchboardManualChecksumMaxBytes() == 4096u, "switchboard_manual_checksum_max_bytes_covers_browser_tls_portal_budget");
-  suite.expect(switchboardManualChecksumSKBChunkBytes() == 128u, "switchboard_manual_checksum_skb_chunk_bytes_is_verifier_safe");
-  suite.expect((switchboardManualChecksumSKBChunkBytes() & 3u) == 0u, "switchboard_manual_checksum_skb_chunk_bytes_is_word_aligned");
-  suite.expect(switchboardManualChecksumSKBChunkBytes() <= 128u, "switchboard_manual_checksum_skb_chunk_bytes_leaves_stack_headroom");
-
-  {
-    uint8_t src[16] = {0xfd, 0xf8, 0xd9, 0x4c, 0x7c, 0x33, 0xe2, 0x6e, 0xca, 0x4b, 0xf5, 0x01, 0x8e, 0xdc, 0x41, 0x3a};
-    uint8_t dst[16] = {0xfd, 0xf8, 0xd9, 0x4c, 0x7c, 0x33, 0xe2, 0x6e, 0xca, 0x4b, 0xf5, 0x01, 0xda, 0x7b, 0xae, 0x2c};
-    std::vector<uint8_t> payload(2043u - sizeof(struct udphdr));
-
-    for (size_t index = 0; index < payload.size(); index += 1)
-    {
-      payload[index] = static_cast<uint8_t>((index * 29u + 17u) & 0xffu);
-    }
-
-    struct udphdr udp = {};
-    udp.source = htons(443);
-    udp.dest = htons(35'644);
-    udp.len = htons(static_cast<uint16_t>(sizeof(struct udphdr) + payload.size()));
-
-    std::vector<uint8_t> segment(sizeof(struct udphdr) + payload.size());
-    std::memcpy(segment.data(), &udp, sizeof(udp));
-    std::memcpy(segment.data() + sizeof(udp), payload.data(), payload.size());
-
-    uint16_t expectedChecksum = compute_ipv6_transport_checksum_portable(
-        src,
-        dst,
-        IPPROTO_UDP,
-        segment.data(),
-        segment.size(),
-        __builtin_offsetof(struct udphdr, check));
-    uint16_t emulatedSKBChunkedChecksum = htons(checksumIPv6TransportChunked(
-        src,
-        dst,
-        IPPROTO_UDP,
-        segment.data(),
-        segment.size(),
-        __builtin_offsetof(struct udphdr, check),
-        switchboardManualChecksumSKBChunkBytes()));
-
-    suite.expect(segment.size() == 2043u, "switchboard_wormhole_skb_chunked_checksum_application_reply_segment_size_matches_capture");
-    suite.expect(checksumBytesChunked(segment.data(), segment.size(), switchboardManualChecksumSKBChunkBytes()) == checksumBytes(segment.data(), segment.size()), "switchboard_wormhole_skb_chunked_checksum_matches_full_checksum_for_application_reply_size");
-    suite.expect(emulatedSKBChunkedChecksum == expectedChecksum, "switchboard_wormhole_skb_chunked_transport_checksum_matches_application_reply_capture");
-  }
-
-  {
-    uint8_t src[16] = {0xfd, 0xf8, 0xd9, 0x4c, 0x7c, 0x33, 0xe2, 0x6e, 0xca, 0x4b, 0xf5, 0x01, 0xf2, 0x66, 0xe5, 0xd9};
-    uint8_t dst[16] = {0xfd, 0xf8, 0xd9, 0x4c, 0x7c, 0x33, 0xe2, 0x6e, 0xca, 0x4b, 0xf5, 0x01, 0x6e, 0x1f, 0xdd, 0x55};
-    std::vector<uint8_t> payload(2050u - sizeof(struct udphdr));
-
-    for (size_t index = 0; index < payload.size(); index += 1)
-    {
-      payload[index] = static_cast<uint8_t>((index * 37u + 11u) & 0xffu);
-    }
-
-    struct udphdr udp = {};
-    udp.source = htons(443);
-    udp.dest = htons(34'267);
-    udp.len = htons(static_cast<uint16_t>(sizeof(struct udphdr) + payload.size()));
-
-    std::vector<uint8_t> segment(sizeof(struct udphdr) + payload.size());
-    std::memcpy(segment.data(), &udp, sizeof(udp));
-    std::memcpy(segment.data() + sizeof(udp), payload.data(), payload.size());
-
-    uint16_t expectedChecksum = compute_ipv6_transport_checksum_portable(
-        src,
-        dst,
-        IPPROTO_UDP,
-        segment.data(),
-        segment.size(),
-        __builtin_offsetof(struct udphdr, check));
-    uint16_t emulatedSKBChunkedChecksum = htons(checksumIPv6TransportChunked(
-        src,
-        dst,
-        IPPROTO_UDP,
-        segment.data(),
-        segment.size(),
-        __builtin_offsetof(struct udphdr, check),
-        switchboardManualChecksumSKBChunkBytes()));
-
-    suite.expect(segment.size() == 2050u, "switchboard_wormhole_skb_chunked_checksum_current_live_segment_size_matches_capture");
-    suite.expect(segment.size() <= switchboardManualChecksumMaxBytes(), "switchboard_wormhole_skb_chunked_checksum_current_live_segment_fits_checksum_budget");
-    suite.expect(checksumBytesChunked(segment.data(), segment.size(), switchboardManualChecksumSKBChunkBytes()) == checksumBytes(segment.data(), segment.size()), "switchboard_wormhole_skb_chunked_checksum_matches_full_checksum_for_current_live_size");
-    suite.expect(emulatedSKBChunkedChecksum == expectedChecksum, "switchboard_wormhole_skb_chunked_transport_checksum_matches_current_live_capture");
-  }
-
-  {
-    uint8_t src[16] = {0xfd, 0xf8, 0xd9, 0x4c, 0x7c, 0x33, 0xe2, 0x6e, 0xca, 0x4b, 0xf5, 0x01, 0x69, 0x06, 0x98, 0xb8};
-    uint8_t dst[16] = {0xfd, 0xf8, 0xd9, 0x4c, 0x7c, 0x33, 0xe2, 0x6e, 0xca, 0x4b, 0xf5, 0x01, 0x69, 0x06, 0x98, 0x73};
-    std::vector<uint8_t> payload(2049u - sizeof(struct udphdr));
-
-    for (size_t index = 0; index < payload.size(); index += 1)
-    {
-      payload[index] = static_cast<uint8_t>((index * 41u + 23u) & 0xffu);
-    }
-
-    struct udphdr udp = {};
-    udp.source = htons(8443);
-    udp.dest = htons(33'543);
-    udp.len = htons(static_cast<uint16_t>(sizeof(struct udphdr) + payload.size()));
-
-    std::vector<uint8_t> segment(sizeof(struct udphdr) + payload.size());
-    std::memcpy(segment.data(), &udp, sizeof(udp));
-    std::memcpy(segment.data() + sizeof(udp), payload.data(), payload.size());
-
-    uint16_t expectedChecksum = compute_ipv6_transport_checksum_portable(
-        src,
-        dst,
-        IPPROTO_UDP,
-        segment.data(),
-        segment.size(),
-        __builtin_offsetof(struct udphdr, check));
-    uint16_t emulatedSKBChunkedChecksum = htons(checksumIPv6TransportChunked(
-        src,
-        dst,
-        IPPROTO_UDP,
-        segment.data(),
-        segment.size(),
-        __builtin_offsetof(struct udphdr, check),
-        switchboardManualChecksumSKBChunkBytes()));
-
-    suite.expect(segment.size() == 2049u, "switchboard_wormhole_skb_chunked_checksum_same_machine_public_reply_segment_size_matches_capture");
-    suite.expect(segment.size() <= switchboardManualChecksumMaxBytes(), "switchboard_wormhole_skb_chunked_checksum_same_machine_public_reply_fits_checksum_budget");
-    suite.expect(checksumBytesChunked(segment.data(), segment.size(), switchboardManualChecksumSKBChunkBytes()) == checksumBytes(segment.data(), segment.size()), "switchboard_wormhole_skb_chunked_checksum_matches_full_checksum_for_same_machine_public_reply_size");
-    suite.expect(emulatedSKBChunkedChecksum == expectedChecksum, "switchboard_wormhole_skb_chunked_transport_checksum_matches_same_machine_public_reply_capture");
-  }
 
   {
     uint8_t wormholeSource[16] = {};
@@ -2364,11 +3119,13 @@ int main(void)
     udp.source = htons(51'515);
     udp.dest = htons(443);
     udp.len = htons(sizeof(udp) + sizeof(payload));
-    udp.check = htons(0x6267);
+    udp.check = 0;
 
     uint8_t rewrittenSegment[sizeof(udp) + sizeof(payload)] = {};
     memcpy(rewrittenSegment, &udp, sizeof(udp));
     memcpy(rewrittenSegment + sizeof(udp), payload, sizeof(payload));
+    reinterpret_cast<struct udphdr *>(rewrittenSegment)->check =
+        htons(checksumIPv6Transport(src, dst, IPPROTO_UDP, rewrittenSegment, sizeof(rewrittenSegment)));
     reinterpret_cast<struct udphdr *>(rewrittenSegment)->dest = htons(8443);
 
     uint8_t expectedSegment[sizeof(rewrittenSegment)] = {};
@@ -2380,16 +3137,7 @@ int main(void)
     incremental.check = replace_l4_checksum_portable(incremental.check, dst, rewrittenDst, sizeof(rewrittenDst));
     incremental.check = replace_l4_checksum_word16(incremental.check, htons(443), htons(8443));
 
-    uint16_t recomputed = compute_ipv6_transport_checksum_portable(
-        src,
-        rewrittenDst,
-        IPPROTO_UDP,
-        rewrittenSegment,
-        sizeof(rewrittenSegment),
-        __builtin_offsetof(struct udphdr, check));
-
-    suite.expect(incremental.check != expectedChecksum, "switchboard_wormhole_udp_partial_checksum_incremental_rewrite_fails");
-    suite.expect(recomputed == expectedChecksum, "switchboard_wormhole_udp_partial_checksum_full_recompute_matches");
+    suite.expect(incremental.check == expectedChecksum, "switchboard_wormhole_udp_incremental_rewrite_matches_expected_checksum");
   }
 
   {
@@ -2405,10 +3153,12 @@ int main(void)
     tcp.doff = sizeof(tcp) / 4;
     tcp.syn = 1;
     tcp.window = htons(8192);
-    tcp.check = htons(0x4a31);
+    tcp.check = 0;
 
     uint8_t rewrittenSegment[sizeof(tcp)] = {};
     memcpy(rewrittenSegment, &tcp, sizeof(tcp));
+    reinterpret_cast<struct tcphdr *>(rewrittenSegment)->check =
+        htons(checksumIPv6Transport(src, dst, IPPROTO_TCP, rewrittenSegment, sizeof(rewrittenSegment)));
     reinterpret_cast<struct tcphdr *>(rewrittenSegment)->source = htons(443);
 
     uint8_t expectedSegment[sizeof(rewrittenSegment)] = {};
@@ -2420,16 +3170,7 @@ int main(void)
     incremental.check = replace_l4_checksum_portable(incremental.check, src, rewrittenSrc, sizeof(rewrittenSrc));
     incremental.check = replace_l4_checksum_word16(incremental.check, htons(8443), htons(443));
 
-    uint16_t recomputed = compute_ipv6_transport_checksum_portable(
-        rewrittenSrc,
-        dst,
-        IPPROTO_TCP,
-        rewrittenSegment,
-        sizeof(rewrittenSegment),
-        __builtin_offsetof(struct tcphdr, check));
-
-    suite.expect(incremental.check != expectedChecksum, "switchboard_wormhole_tcp_partial_checksum_incremental_rewrite_fails");
-    suite.expect(recomputed == expectedChecksum, "switchboard_wormhole_tcp_partial_checksum_full_recompute_matches");
+    suite.expect(incremental.check == expectedChecksum, "switchboard_wormhole_tcp_incremental_rewrite_matches_expected_checksum");
   }
 
   {
@@ -2470,16 +3211,10 @@ int main(void)
         expectedSegment.data(),
         expectedSegment.size()));
 
-    uint16_t recomputed = compute_ipv6_transport_checksum_portable(
-        src,
-        rewrittenDst,
-        IPPROTO_UDP,
-        rewrittenSegment.data(),
-        rewrittenSegment.size(),
-        __builtin_offsetof(struct udphdr, check));
-
-    suite.expect(recomputed == expectedChecksum, "switchboard_wormhole_udp_quic_portal_full_recompute_matches_expected_checksum");
-    suite.expect(recomputed != reinterpret_cast<const struct udphdr *>(originalSegment.data())->check, "switchboard_wormhole_udp_quic_portal_full_recompute_changes_checksum");
+    struct udphdr incremental = *reinterpret_cast<const struct udphdr *>(originalSegment.data());
+    incremental.check = replace_l4_checksum_portable(incremental.check, dst, rewrittenDst, sizeof(rewrittenDst));
+    incremental.check = replace_l4_checksum_word16(incremental.check, htons(443), htons(8443));
+    suite.expect(incremental.check == expectedChecksum, "switchboard_wormhole_udp_quic_portal_incremental_rewrite_matches_expected_checksum");
   }
 
   {
@@ -2497,11 +3232,13 @@ int main(void)
     udp.source = htons(8443);
     udp.dest = htons(42'264);
     udp.len = htons(sizeof(udp) + payload.size());
-    udp.check = htons(0x8e00);
+    udp.check = 0;
 
     std::array<uint8_t, sizeof(udp) + payload.size()> rewrittenSegment = {};
     memcpy(rewrittenSegment.data(), &udp, sizeof(udp));
     memcpy(rewrittenSegment.data() + sizeof(udp), payload.data(), payload.size());
+    reinterpret_cast<struct udphdr *>(rewrittenSegment.data())->check = htons(checksumIPv6Transport(
+        src, dst, IPPROTO_UDP, rewrittenSegment.data(), rewrittenSegment.size()));
     reinterpret_cast<struct udphdr *>(rewrittenSegment.data())->source = htons(443);
 
     std::array<uint8_t, rewrittenSegment.size()> expectedSegment = rewrittenSegment;
@@ -2513,21 +3250,12 @@ int main(void)
         expectedSegment.data(),
         expectedSegment.size()));
 
-    struct udphdr incremental = udp;
+    struct udphdr incremental = *reinterpret_cast<const struct udphdr *>(rewrittenSegment.data());
     incremental.check = replace_l4_checksum_portable(incremental.check, src, rewrittenSrc, sizeof(rewrittenSrc));
     incremental.check = replace_l4_checksum_word16(incremental.check, htons(8443), htons(443));
 
-    uint16_t recomputed = compute_ipv6_transport_checksum_portable(
-        rewrittenSrc,
-        dst,
-        IPPROTO_UDP,
-        rewrittenSegment.data(),
-        rewrittenSegment.size(),
-        __builtin_offsetof(struct udphdr, check));
-
     suite.expect(rewrittenSegment.size() == 2045u, "switchboard_wormhole_udp_quic_source_rewrite_segment_size_matches_live_path");
-    suite.expect(incremental.check != expectedChecksum, "switchboard_wormhole_udp_quic_source_incremental_rewrite_fails");
-    suite.expect(recomputed == expectedChecksum, "switchboard_wormhole_udp_quic_source_full_recompute_matches_expected_checksum");
+    suite.expect(incremental.check == expectedChecksum, "switchboard_wormhole_udp_quic_source_incremental_rewrite_matches_expected_checksum");
   }
 
   {
@@ -2545,11 +3273,13 @@ int main(void)
     udp.source = htons(8443);
     udp.dest = htons(35'644);
     udp.len = htons(sizeof(udp) + payload.size());
-    udp.check = htons(0x4b37);
+    udp.check = 0;
 
     std::array<uint8_t, sizeof(udp) + payload.size()> rewrittenSegment = {};
     memcpy(rewrittenSegment.data(), &udp, sizeof(udp));
     memcpy(rewrittenSegment.data() + sizeof(udp), payload.data(), payload.size());
+    reinterpret_cast<struct udphdr *>(rewrittenSegment.data())->check = htons(checksumIPv6Transport(
+        src, dst, IPPROTO_UDP, rewrittenSegment.data(), rewrittenSegment.size()));
     reinterpret_cast<struct udphdr *>(rewrittenSegment.data())->source = htons(443);
 
     std::array<uint8_t, rewrittenSegment.size()> expectedSegment = rewrittenSegment;
@@ -2561,21 +3291,12 @@ int main(void)
         expectedSegment.data(),
         expectedSegment.size()));
 
-    struct udphdr incremental = udp;
+    struct udphdr incremental = *reinterpret_cast<const struct udphdr *>(rewrittenSegment.data());
     incremental.check = replace_l4_checksum_portable(incremental.check, src, rewrittenSrc, sizeof(rewrittenSrc));
     incremental.check = replace_l4_checksum_word16(incremental.check, htons(8443), htons(443));
 
-    uint16_t recomputed = compute_ipv6_transport_checksum_portable(
-        rewrittenSrc,
-        dst,
-        IPPROTO_UDP,
-        rewrittenSegment.data(),
-        rewrittenSegment.size(),
-        __builtin_offsetof(struct udphdr, check));
-
     suite.expect(rewrittenSegment.size() == 2043u, "switchboard_wormhole_udp_quic_source_rewrite_application_reply_segment_size_matches_capture");
-    suite.expect(incremental.check != expectedChecksum, "switchboard_wormhole_udp_quic_source_incremental_rewrite_fails_on_application_reply_capture");
-    suite.expect(recomputed == expectedChecksum, "switchboard_wormhole_udp_quic_source_full_recompute_matches_application_reply_capture");
+    suite.expect(incremental.check == expectedChecksum, "switchboard_wormhole_udp_quic_source_incremental_rewrite_matches_application_reply_capture");
   }
 
   {
@@ -2593,11 +3314,13 @@ int main(void)
     udp.source = htons(8443);
     udp.dest = htons(52'262);
     udp.len = htons(sizeof(udp) + payload.size());
-    udp.check = htons(0xa67c);
+    udp.check = 0;
 
     std::array<uint8_t, sizeof(udp) + payload.size()> rewrittenSegment = {};
     memcpy(rewrittenSegment.data(), &udp, sizeof(udp));
     memcpy(rewrittenSegment.data() + sizeof(udp), payload.data(), payload.size());
+    reinterpret_cast<struct udphdr *>(rewrittenSegment.data())->check = htons(checksumIPv6Transport(
+        src, dst, IPPROTO_UDP, rewrittenSegment.data(), rewrittenSegment.size()));
     reinterpret_cast<struct udphdr *>(rewrittenSegment.data())->source = htons(443);
 
     std::array<uint8_t, rewrittenSegment.size()> expectedSegment = rewrittenSegment;
@@ -2609,21 +3332,12 @@ int main(void)
         expectedSegment.data(),
         expectedSegment.size()));
 
-    struct udphdr incremental = udp;
+    struct udphdr incremental = *reinterpret_cast<const struct udphdr *>(rewrittenSegment.data());
     incremental.check = replace_l4_checksum_portable(incremental.check, src, rewrittenSrc, sizeof(rewrittenSrc));
     incremental.check = replace_l4_checksum_word16(incremental.check, htons(8443), htons(443));
 
-    uint16_t recomputed = compute_ipv6_transport_checksum_portable(
-        rewrittenSrc,
-        dst,
-        IPPROTO_UDP,
-        rewrittenSegment.data(),
-        rewrittenSegment.size(),
-        __builtin_offsetof(struct udphdr, check));
-
     suite.expect(rewrittenSegment.size() == 2050u, "switchboard_wormhole_udp_quic_source_rewrite_current_live_segment_size_matches_capture");
-    suite.expect(incremental.check != expectedChecksum, "switchboard_wormhole_udp_quic_source_incremental_rewrite_fails_at_current_live_size");
-    suite.expect(recomputed == expectedChecksum, "switchboard_wormhole_udp_quic_source_full_recompute_matches_expected_checksum_at_current_live_size");
+    suite.expect(incremental.check == expectedChecksum, "switchboard_wormhole_udp_quic_source_incremental_rewrite_matches_expected_checksum_at_current_live_size");
   }
 
   {
@@ -2641,11 +3355,13 @@ int main(void)
     udp.source = htons(8443);
     udp.dest = htons(33'543);
     udp.len = htons(sizeof(udp) + payload.size());
-    udp.check = htons(0xf5b6);
+    udp.check = 0;
 
     std::array<uint8_t, sizeof(udp) + payload.size()> rewrittenSegment = {};
     memcpy(rewrittenSegment.data(), &udp, sizeof(udp));
     memcpy(rewrittenSegment.data() + sizeof(udp), payload.data(), payload.size());
+    reinterpret_cast<struct udphdr *>(rewrittenSegment.data())->check = htons(checksumIPv6Transport(
+        src, dst, IPPROTO_UDP, rewrittenSegment.data(), rewrittenSegment.size()));
     reinterpret_cast<struct udphdr *>(rewrittenSegment.data())->source = htons(443);
 
     std::array<uint8_t, rewrittenSegment.size()> expectedSegment = rewrittenSegment;
@@ -2657,29 +3373,19 @@ int main(void)
         expectedSegment.data(),
         expectedSegment.size()));
 
-    struct udphdr incremental = udp;
+    struct udphdr incremental = *reinterpret_cast<const struct udphdr *>(rewrittenSegment.data());
     incremental.check = replace_l4_checksum_portable(incremental.check, src, rewrittenSrc, sizeof(rewrittenSrc));
     incremental.check = replace_l4_checksum_word16(incremental.check, htons(8443), htons(443));
 
-    uint16_t recomputed = compute_ipv6_transport_checksum_portable(
-        rewrittenSrc,
-        dst,
-        IPPROTO_UDP,
-        rewrittenSegment.data(),
-        rewrittenSegment.size(),
-        __builtin_offsetof(struct udphdr, check));
-
     suite.expect(rewrittenSegment.size() == 2049u, "switchboard_wormhole_udp_quic_source_rewrite_same_machine_public_reply_segment_size_matches_capture");
-    suite.expect(rewrittenSegment.size() <= switchboardManualChecksumMaxBytes(), "switchboard_wormhole_udp_quic_source_rewrite_same_machine_public_reply_fits_checksum_budget");
-    suite.expect(incremental.check != expectedChecksum, "switchboard_wormhole_udp_quic_source_incremental_rewrite_fails_at_same_machine_public_reply_size");
-    suite.expect(recomputed == expectedChecksum, "switchboard_wormhole_udp_quic_source_full_recompute_matches_same_machine_public_reply_capture");
+    suite.expect(incremental.check == expectedChecksum, "switchboard_wormhole_udp_quic_source_incremental_rewrite_matches_same_machine_public_reply_capture");
   }
 
   {
     uint8_t src[16] = {0x20, 0x01, 0x0d, 0xb8, 0x02, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x21};
     uint8_t dst[16] = {0x20, 0x01, 0x0d, 0xb8, 0x02, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x45};
     uint8_t rewrittenDst[16] = {0xfd, 0xf8, 0xd9, 0x4c, 0x7c, 0x33, 0xe2, 0x6e, 0xca, 0x4b, 0xf5, 0x01, 0x01, 0xa5, 0x77, 0x62};
-    std::array<uint8_t, 1527> payload = {};
+    std::array<uint8_t, 8192> payload = {};
 
     for (size_t index = 0; index < payload.size(); ++index)
     {
@@ -2694,6 +3400,8 @@ int main(void)
     std::array<uint8_t, sizeof(udp) + payload.size()> rewrittenSegment = {};
     memcpy(rewrittenSegment.data(), &udp, sizeof(udp));
     memcpy(rewrittenSegment.data() + sizeof(udp), payload.data(), payload.size());
+    reinterpret_cast<struct udphdr *>(rewrittenSegment.data())->check = htons(checksumIPv6Transport(
+        src, dst, IPPROTO_UDP, rewrittenSegment.data(), rewrittenSegment.size()));
     reinterpret_cast<struct udphdr *>(rewrittenSegment.data())->dest = htons(8443);
 
     std::array<uint8_t, rewrittenSegment.size()> expectedSegment = rewrittenSegment;
@@ -2705,16 +3413,11 @@ int main(void)
         expectedSegment.data(),
         expectedSegment.size()));
 
-    uint16_t recomputed = compute_ipv6_transport_checksum_portable(
-        src,
-        rewrittenDst,
-        IPPROTO_UDP,
-        rewrittenSegment.data(),
-        rewrittenSegment.size(),
-        __builtin_offsetof(struct udphdr, check));
-
-    suite.expect(rewrittenSegment.size() == 1535u, "switchboard_wormhole_udp_full_recompute_boundary_segment_size");
-    suite.expect(recomputed == expectedChecksum, "switchboard_wormhole_udp_full_recompute_matches_expected_checksum_at_boundary");
+    struct udphdr incremental = *reinterpret_cast<const struct udphdr *>(rewrittenSegment.data());
+    incremental.check = replace_l4_checksum_portable(incremental.check, dst, rewrittenDst, sizeof(rewrittenDst));
+    incremental.check = replace_l4_checksum_word16(incremental.check, htons(443), htons(8443));
+    suite.expect(rewrittenSegment.size() > 4096u, "switchboard_wormhole_udp_incremental_rewrite_covers_jumbo_segment");
+    suite.expect(incremental.check == expectedChecksum, "switchboard_wormhole_udp_jumbo_incremental_rewrite_matches_expected_checksum");
   }
 
   return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

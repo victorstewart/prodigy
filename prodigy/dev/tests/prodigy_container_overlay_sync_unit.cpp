@@ -97,6 +97,15 @@ static bool updateProgramMapElement(BPFProgram& program, StringType auto&& mapNa
   return updated;
 }
 
+static bool programHasMap(BPFProgram& program, StringType auto&& mapName)
+{
+  bool found = false;
+  program.openMap(mapName, [&](int mapFD) -> void {
+    found = mapFD >= 0;
+  });
+  return found;
+}
+
 static switchboard_wormhole_egress_key makeWormholeEgressKey(uint8_t datacenterPrefix,
                                                              uint32_t containerKey,
                                                              uint16_t containerPort,
@@ -155,6 +164,50 @@ static void parseIPv6Bytes(const char *text, uint8_t out[16])
     std::fprintf(stderr, "unable to parse ipv6 test address: %s\n", text);
     std::abort();
   }
+}
+
+static __u16 checksumIPv6Transport(const uint8_t source[16],
+                                   const uint8_t destination[16],
+                                   uint8_t protocol,
+                                   const void *segment,
+                                   size_t segmentBytes,
+                                   size_t checksumOffset)
+{
+  uint64_t sum = 0;
+  auto accumulate = [&](const void *value, size_t bytes, size_t zeroOffset = SIZE_MAX) -> void {
+    const uint8_t *data = static_cast<const uint8_t *>(value);
+    for (size_t offset = 0; offset < bytes; offset += 2)
+    {
+      if (offset == zeroOffset)
+      {
+        continue;
+      }
+      sum += uint64_t(data[offset]) << 8;
+      if (offset + 1 < bytes)
+      {
+        sum += data[offset + 1];
+      }
+    }
+  };
+
+  accumulate(source, 16);
+  accumulate(destination, 16);
+  const uint8_t length[4] = {
+      uint8_t(segmentBytes >> 24),
+      uint8_t(segmentBytes >> 16),
+      uint8_t(segmentBytes >> 8),
+      uint8_t(segmentBytes)};
+  const uint8_t nextHeader[4] = {0, 0, 0, protocol};
+  accumulate(length, sizeof(length));
+  accumulate(nextHeader, sizeof(nextHeader));
+  accumulate(segment, segmentBytes, checksumOffset);
+
+  while (sum >> 16)
+  {
+    sum = (sum & 0xffffu) + (sum >> 16);
+  }
+  __u16 checksum = __u16(~sum);
+  return htons(checksum == 0 ? 0xffffu : checksum);
 }
 
 static in_addr parseIPv4Address(const char *text)
@@ -273,7 +326,7 @@ static Vector<uint8_t> makeIPv6L4FrameWithPayload(const char *srcIPv6,
     tcph->doff = 5;
     tcph->syn = 1;
     std::memcpy(tcph + 1, payload.data(), payload.size());
-    tcph->check = compute_ipv6_transport_checksum_portable(
+    tcph->check = checksumIPv6Transport(
         ip6h->saddr.s6_addr,
         ip6h->daddr.s6_addr,
         IPPROTO_TCP,
@@ -289,7 +342,7 @@ static Vector<uint8_t> makeIPv6L4FrameWithPayload(const char *srcIPv6,
     udph->len = htons(static_cast<uint16_t>(sizeof(struct udphdr) + payload.size()));
     std::memcpy(udph + 1, payload.data(), payload.size());
 
-    udph->check = compute_ipv6_transport_checksum_portable(
+    udph->check = checksumIPv6Transport(
         ip6h->saddr.s6_addr,
         ip6h->daddr.s6_addr,
         IPPROTO_UDP,
@@ -357,7 +410,7 @@ static Vector<uint8_t> makeIPv6QuicLongHeaderFrame(const char *srcIPv6,
   std::memcpy(quic->dst_cid, cid.id, cid.id_len);
   *(reinterpret_cast<uint8_t *>(quic + 1)) = 0;
 
-  udph->check = compute_ipv6_transport_checksum_portable(
+  udph->check = checksumIPv6Transport(
       ip6h->saddr.s6_addr,
       ip6h->daddr.s6_addr,
       IPPROTO_UDP,
@@ -450,6 +503,12 @@ public:
     syncOverlayRoutingPrograms();
   }
 
+  void forgetIngressOverlayMirrorsForTest(void)
+  {
+    installedIngressOverlayPeers4 = {};
+    installedIngressOverlayPeers6 = {};
+  }
+
   void registerContainerForTest(Container *container)
   {
     containers.insert_or_assign(container->plan.uuid, container);
@@ -515,17 +574,49 @@ static void testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntri
   String objectPath = {};
   objectPath.assign(PRODIGY_TEST_BINARY_DIR);
   objectPath.append("/container.egress.router.ebpf.o"_ctv);
+  String ingressObjectPath = {};
+  ingressObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+  ingressObjectPath.append("/host.ingress.router.ebpf.o"_ctv);
 
   BPFProgram peerProgram = {};
+  BPFProgram ingressProgram = {};
   Container container = {};
   container.plan.uuid = 0x8801;
   container.peer_program = &peerProgram;
   neuron.registerContainerForTest(&container);
 
-  if (suite.require(peerProgram.load(objectPath, "ct_egress"_ctv), "container_peer_overlay_sync_loads_egress_router"))
+  bool peerLoaded = suite.require(peerProgram.load(objectPath, "ct_egress"_ctv),
+                                  "container_peer_overlay_sync_loads_egress_router");
+  bool ingressLoaded = suite.require(ingressProgram.load(ingressObjectPath, "host_ingress"_ctv),
+                                     "container_peer_overlay_sync_loads_host_ingress_router");
+  if (peerLoaded && ingressLoaded)
   {
+    neuron.tcx_ingress_program = &ingressProgram;
     neuron.seedOverlayRoutingConfigForTest(config);
     neuron.syncOverlayRoutingProgramsForTest();
+
+    suite.expect(programHasMap(ingressProgram, "ovl_peer4"_ctv) && programHasMap(ingressProgram, "ovl_peer6"_ctv),
+                 "container_peer_overlay_sync_materializes_peer_auth_maps_only_on_host_ingress");
+    suite.expect(programHasMap(peerProgram, "ovl_peer4"_ctv) == false && programHasMap(peerProgram, "ovl_peer6"_ctv) == false,
+                 "container_peer_overlay_sync_omits_peer_auth_maps_from_container_egress");
+
+    switchboard_overlay_ingress_peer4_key peer4 = {
+        .source = route1.nextHop.v4,
+        .destination = route1.sourceAddress.v4,
+    };
+    switchboard_overlay_ingress_peer6_key retainedPeer6 = {};
+    std::memcpy(retainedPeer6.source, route2.nextHop.v6, sizeof(retainedPeer6.source));
+    std::memcpy(retainedPeer6.destination, route2.sourceAddress.v6, sizeof(retainedPeer6.destination));
+    switchboard_overlay_ingress_peer6_key stalePeer6 = {};
+    std::memcpy(stalePeer6.source, route3.nextHop.v6, sizeof(stalePeer6.source));
+    std::memcpy(stalePeer6.destination, route3.sourceAddress.v6, sizeof(stalePeer6.destination));
+    __u8 peerPresent = 0;
+    suite.expect(lookupProgramMapElement(ingressProgram, "ovl_peer4"_ctv, peer4, peerPresent) && peerPresent == 1,
+                 "container_peer_overlay_sync_installs_exact_ipv4_peer_pair");
+    peerPresent = 0;
+    suite.expect(lookupProgramMapElement(ingressProgram, "ovl_peer6"_ctv, retainedPeer6, peerPresent) && peerPresent == 1 &&
+                     lookupProgramMapElement(ingressProgram, "ovl_peer6"_ctv, stalePeer6, peerPresent),
+                 "container_peer_overlay_sync_installs_exact_ipv6_peer_pairs");
 
     switchboard_overlay_config overlayConfig = {};
     peerProgram.getArrayElement("ovl_config"_ctv, 0, overlayConfig);
@@ -589,6 +680,30 @@ static void testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntri
     suite.expect(hostedIngressValue6.machine_fragment == hostedIngress6.machineFragment,
                  "container_peer_overlay_sync_preserves_ipv6_hosted_ingress_machine_fragment");
 
+    switchboard_overlay_ingress_peer6_key restartStalePeer6 = {};
+    parseIPv6Bytes("2001:db8::de", restartStalePeer6.source);
+    parseIPv6Bytes("2001:db8::ad", restartStalePeer6.destination);
+    peerPresent = 1;
+    suite.expect(updateProgramMapElement(ingressProgram, "ovl_peer6"_ctv, restartStalePeer6, peerPresent),
+                 "container_peer_overlay_sync_seeds_actual_stale_peer_outside_mirror");
+    neuron.forgetIngressOverlayMirrorsForTest();
+    neuron.syncOverlayRoutingProgramsForTest();
+    suite.expect(lookupProgramMapElement(ingressProgram, "ovl_peer6"_ctv, restartStalePeer6, peerPresent) == false &&
+                     lookupProgramMapElement(ingressProgram, "ovl_peer6"_ctv, retainedPeer6, peerPresent),
+                 "container_peer_overlay_sync_reconciles_actual_map_after_mirror_restart");
+
+    SwitchboardOverlayRoutingConfig retained = config;
+    retained.machineRoutes.clear();
+    retained.machineRoutes.push_back(route1);
+    retained.machineRoutes.push_back(route2);
+    neuron.seedOverlayRoutingConfigForTest(retained);
+    neuron.syncOverlayRoutingProgramsForTest();
+    peerPresent = 0;
+    suite.expect(lookupProgramMapElement(ingressProgram, "ovl_peer6"_ctv, retainedPeer6, peerPresent) && peerPresent == 1,
+                 "container_peer_overlay_sync_retains_current_peer_pair");
+    suite.expect(lookupProgramMapElement(ingressProgram, "ovl_peer6"_ctv, stalePeer6, peerPresent) == false,
+                 "container_peer_overlay_sync_removes_stale_peer_pair");
+
     SwitchboardOverlayRoutingConfig disabled = {};
     neuron.seedOverlayRoutingConfigForTest(disabled);
     neuron.syncOverlayRoutingProgramsForTest();
@@ -624,8 +739,13 @@ static void testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntri
                                          hostedIngressKey6,
                                          hostedIngressValue6) == false,
                  "container_peer_overlay_sync_removes_ipv6_hosted_ingress_route_map_entries");
+    suite.expect(lookupProgramMapElement(ingressProgram, "ovl_peer4"_ctv, peer4, peerPresent) == false &&
+                     lookupProgramMapElement(ingressProgram, "ovl_peer6"_ctv, retainedPeer6, peerPresent) == false,
+                 "container_peer_overlay_sync_removes_disabled_peer_pairs");
   }
 
+  neuron.tcx_ingress_program = nullptr;
+  ingressProgram.close();
   peerProgram.close();
   container.peer_program = nullptr;
   neuron.unregisterContainerForTest(container.plan.uuid);
@@ -637,15 +757,24 @@ static void testContainerPeerRuntimeSyncPopulatesAndClearsWormholeEgressBindings
   String objectPath = {};
   objectPath.assign(PRODIGY_TEST_BINARY_DIR);
   objectPath.append("/container.egress.router.ebpf.o"_ctv);
+  String primaryObjectPath = {};
+  primaryObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+  primaryObjectPath.append("/container.ingress.router.ebpf.o"_ctv);
 
   BPFProgram peerProgram = {};
-  if (suite.require(peerProgram.load(objectPath, "ct_egress"_ctv), "container_peer_runtime_sync_loads_egress_router"))
+  BPFProgram primaryProgram = {};
+  bool peerLoaded = suite.require(peerProgram.load(objectPath, "ct_egress"_ctv),
+                                  "container_peer_runtime_sync_loads_egress_router");
+  bool primaryLoaded = suite.require(primaryProgram.load(primaryObjectPath, "ct_ingress"_ctv),
+                                     "container_peer_runtime_sync_loads_ingress_router");
+  if (peerLoaded && primaryLoaded)
   {
     SwitchboardWormholeEgressBindingEntry stale = {};
     stale.key = makeWormholeEgressKey(0xca, 0x01020305u, 9443, IPPROTO_UDP);
     suite.require(switchboardBuildWormholeEgressBinding(IPAddress("2001:db8:100::dead", true),
                                                         9443,
                                                         IPPROTO_UDP,
+                                                        1,
                                                         stale.binding),
                   "container_peer_runtime_sync_builds_stale_binding");
 
@@ -665,6 +794,7 @@ static void testContainerPeerRuntimeSyncPopulatesAndClearsWormholeEgressBindings
     suite.require(switchboardBuildWormholeEgressBinding(IPAddress("2001:db8:100::a", true),
                                                         443,
                                                         IPPROTO_UDP,
+                                                        2,
                                                         desired.binding),
                   "container_peer_runtime_sync_builds_desired_binding");
 
@@ -704,8 +834,35 @@ static void testContainerPeerRuntimeSyncPopulatesAndClearsWormholeEgressBindings
                                          desired.key,
                                          loadedBinding) == false,
                  "container_peer_runtime_sync_clears_removed_bindings");
+
+    SwitchboardWormholeEgress4BindingEntry desired4 = {};
+    desired4.key = makeWormholeEgress4Key("198.18.0.1", 8443, IPPROTO_UDP);
+    suite.require(switchboardBuildWormholeEgressBinding(IPAddress("198.18.0.1", false),
+                                                        443,
+                                                        IPPROTO_UDP,
+                                                        3,
+                                                        desired4.binding),
+                  "container_peer_runtime_sync_builds_desired_ipv4_binding");
+    Vector<SwitchboardWormholeEgress4BindingEntry> desiredBindings4 = {};
+    desiredBindings4.push_back(desired4);
+    switchboardSyncWormholeEgress4BindingsForProgram(&primaryProgram,
+                                                     desiredBindings4,
+                                                     0,
+                                                     "unit-container-ingress-sync");
+    loadedBinding = {};
+    suite.expect(lookupProgramMapElement(primaryProgram, "wh_egress4"_ctv, desired4.key, loadedBinding) &&
+                     loadedBinding.addr4 == desired4.binding.addr4 && loadedBinding.port == desired4.binding.port,
+                 "container_peer_runtime_sync_populates_ipv4_ingress_binding");
+    desiredBindings4.clear();
+    switchboardSyncWormholeEgress4BindingsForProgram(&primaryProgram,
+                                                     desiredBindings4,
+                                                     0,
+                                                     "unit-container-ingress-clear");
+    suite.expect(lookupProgramMapElement(primaryProgram, "wh_egress4"_ctv, desired4.key, loadedBinding) == false,
+                 "container_peer_runtime_sync_removes_ipv4_ingress_binding");
   }
 
+  primaryProgram.close();
   peerProgram.close();
 }
 
@@ -874,6 +1031,7 @@ static void testWormholeEgressBindingReconcilePreservesDesiredKeysDuringStaleRem
   suite.require(switchboardBuildWormholeEgressBinding(IPAddress("2001:db8:100::a", true),
                                                       443,
                                                       IPPROTO_UDP,
+                                                      4,
                                                       desired.binding),
                 "wormhole_egress_reconcile_builds_desired_binding");
 
@@ -882,6 +1040,7 @@ static void testWormholeEgressBindingReconcilePreservesDesiredKeysDuringStaleRem
   suite.require(switchboardBuildWormholeEgressBinding(IPAddress("2001:db8:100::b", true),
                                                       9443,
                                                       IPPROTO_UDP,
+                                                      5,
                                                       stale.binding),
                 "wormhole_egress_reconcile_builds_stale_binding");
 
@@ -967,6 +1126,7 @@ static void testContainerPeerEgressRouterRewritesCrossMachineWormholeReplyForOve
   {
     container_network_policy networkPolicy = {};
     networkPolicy.mode = CONTAINER_NETWORK_UNRESTRICTED;
+    networkPolicy.containerFragment = 0xee;
     peerProgram.setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
 
     local_container_subnet6 localSubnet = {};
@@ -1016,6 +1176,7 @@ static void testContainerPeerEgressRouterRewritesCrossMachineWormholeReplyForOve
     binding.port = htons(443);
     binding.proto = IPPROTO_UDP;
     binding.is_ipv6 = 1;
+    binding.owner_generation = 1;
     suite.expect(updateProgramMapElement(peerProgram, "wh_egress"_ctv, bindingKey, binding),
                  "container_peer_egress_router_cross_machine_wormhole_reply_sets_binding");
 
@@ -1033,6 +1194,39 @@ static void testContainerPeerEgressRouterRewritesCrossMachineWormholeReplyForOve
         47'156,
         payload,
         true);
+    Vector<uint8_t> missingStateOutput = {};
+    missingStateOutput.resize(frame.size());
+    LIBBPF_OPTS(bpf_test_run_opts, missingStateOpts,
+                .data_in = frame.data(),
+                .data_out = missingStateOutput.data(),
+                .data_size_in = static_cast<__u32>(frame.size()),
+                .data_size_out = static_cast<__u32>(missingStateOutput.size()),
+                .repeat = 1, );
+    suite.expect(bpf_prog_test_run_opts(peerProgram.prog_fd, &missingStateOpts) == 0,
+                 "container_peer_egress_router_cross_machine_wormhole_reply_missing_state_test_run_succeeds");
+    suite.expect(missingStateOpts.retval == NETKIT_DROP,
+                 "container_peer_egress_router_cross_machine_wormhole_reply_missing_state_fails_closed");
+
+    const struct ipv6hdr *reply6 = reinterpret_cast<const struct ipv6hdr *>(frame.data() + sizeof(struct ethhdr));
+    const struct udphdr *replyUDP = reinterpret_cast<const struct udphdr *>(reply6 + 1);
+    flow_key replyKey = {};
+    std::memcpy(replyKey.srcv6, reply6->saddr.s6_addr32, sizeof(replyKey.srcv6));
+    std::memcpy(replyKey.dstv6, reply6->daddr.s6_addr32, sizeof(replyKey.dstv6));
+    replyKey.port16[0] = replyUDP->source;
+    replyKey.port16[1] = replyUDP->dest;
+    replyKey.proto = IPPROTO_UDP;
+    switchboard_wormhole_flow flow = {};
+    flow.binding = binding;
+    flow.container[0] = localSubnet.dpfx;
+    std::memcpy(flow.container + 1, localSubnet.mpfx, sizeof(localSubnet.mpfx));
+    flow.container[4] = networkPolicy.containerFragment;
+    flow.disposition = SWITCHBOARD_WORMHOLE_FLOW_PUBLIC;
+    flow.phase = SWITCHBOARD_WORMHOLE_FLOW_REVERSE_SEEN;
+    flow.expiresAtNs = UINT64_MAX;
+    switchboard_wormhole_flow_key ownerKey = switchboardWormholeFlowMapKey(&replyKey, binding.owner_generation);
+    suite.expect(updateProgramMapElement(peerProgram, "wh_pending"_ctv, ownerKey, flow),
+                 "container_peer_egress_router_cross_machine_wormhole_reply_sets_exact_reverse_flow");
+
     Vector<uint8_t> output = {};
     output.resize(frame.size() + sizeof(struct ipv6hdr) + 64u);
 
@@ -1092,7 +1286,7 @@ static void testContainerPeerEgressRouterRewritesCrossMachineWormholeReplyForOve
       }
       bool innerDestinationMatches = (std::memcmp(inner6->daddr.s6_addr, expectedInnerDst, sizeof(expectedInnerDst)) == 0);
       const struct udphdr *udph = reinterpret_cast<const struct udphdr *>(inner6 + 1);
-      __u16 expectedChecksum = compute_ipv6_transport_checksum_portable(
+      __u16 expectedChecksum = checksumIPv6Transport(
           inner6->saddr.s6_addr,
           inner6->daddr.s6_addr,
           IPPROTO_UDP,
@@ -1354,8 +1548,15 @@ static void testContainerPeerEgressRouterRewritesIPv4WormholeSource(TestSuite& s
   container_network_policy networkPolicy = {};
   networkPolicy.mode = CONTAINER_NETWORK_UNRESTRICTED;
   networkPolicy.requiresPublic4 = 1;
+  networkPolicy.containerFragment = 0x4e;
   networkPolicy.interContainerMTU = 9000;
   peerProgram.setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
+  local_container_subnet6 localSubnet = {};
+  localSubnet.dpfx = 0x01;
+  localSubnet.mpfx[0] = 0x16;
+  localSubnet.mpfx[1] = 0x25;
+  localSubnet.mpfx[2] = 0x5b;
+  peerProgram.setArrayElement("lc_subnet"_ctv, 0, localSubnet);
 
   __u32 nicIfidx = 77;
   peerProgram.setArrayElement("ct_dev_map"_ctv, 0, nicIfidx);
@@ -1384,8 +1585,29 @@ static void testContainerPeerEgressRouterRewritesIPv4WormholeSource(TestSuite& s
   binding.port = htons(443);
   binding.proto = proto;
   binding.is_ipv6 = 0;
+  binding.owner_generation = 1;
   expectNamed(updateProgramMapElement(peerProgram, "wh_egress4"_ctv, bindingKey, binding),
               "sets_ipv4_binding");
+  flow_key replyKey = {};
+  replyKey.src = bindingKey.addr;
+  replyKey.dst = parseIPv4Address("10.0.0.1").s_addr;
+  replyKey.port16[0] = bindingKey.port;
+  replyKey.port16[1] = htons(49'152);
+  replyKey.proto = proto;
+  switchboard_wormhole_flow owner = {};
+  owner.binding = binding;
+  owner.container[0] = localSubnet.dpfx;
+  std::memcpy(owner.container + 1, localSubnet.mpfx, sizeof(localSubnet.mpfx));
+  owner.container[4] = networkPolicy.containerFragment;
+  owner.disposition = SWITCHBOARD_WORMHOLE_FLOW_PUBLIC;
+  owner.phase = proto == IPPROTO_TCP ? SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED : SWITCHBOARD_WORMHOLE_FLOW_REVERSE_SEEN;
+  owner.expiresAtNs = UINT64_MAX;
+  switchboard_wormhole_flow_key ownerKey = switchboardWormholeFlowMapKey(&replyKey, binding.owner_generation);
+  bool ownerInstalled = proto == IPPROTO_TCP
+                            ? updateProgramMapElement(peerProgram, "wh_flows"_ctv, ownerKey, owner)
+                            : updateProgramMapElement(peerProgram, "wh_pending"_ctv, ownerKey, owner);
+  expectNamed(ownerInstalled,
+              "sets_exact_ipv4_reverse_owner");
 
   Vector<uint8_t> payload = {};
   payload.resize(32);
@@ -1573,7 +1795,7 @@ static void testContainerPeerEgressRouterRoutesIPv6QuicHighSlotPortal(TestSuite&
       cid,
       true);
   Vector<uint8_t> output = {};
-  output.resize(frame.size() + sizeof(struct ipv6hdr) + 64u);
+  output.resize(frame.size() + sizeof(struct ipv6hdr) + sizeof(struct switchboard_wormhole_overlay_header) + 64u);
 
   LIBBPF_OPTS(bpf_test_run_opts, opts,
               .data_in = frame.data(),
@@ -1585,9 +1807,9 @@ static void testContainerPeerEgressRouterRoutesIPv6QuicHighSlotPortal(TestSuite&
   int runResult = bpf_prog_test_run_opts(peerProgram.prog_fd, &opts);
   expectNamed(runResult == 0, "test_run_succeeds");
   expectNamed(opts.retval == TC_ACT_REDIRECT, "redirects_to_nic");
-  expectNamed(opts.data_size_out == frame.size() + sizeof(struct ipv6hdr), "adds_outer_ipv6_header");
+  expectNamed(opts.data_size_out == frame.size() + sizeof(struct ipv6hdr) + sizeof(struct switchboard_wormhole_overlay_header), "adds_outer_ipv6_and_provenance_headers");
 
-  if (runResult == 0 && opts.data_size_out >= (sizeof(struct ethhdr) + (2u * sizeof(struct ipv6hdr)) + sizeof(struct udphdr) + sizeof(struct quic_long_header)))
+  if (runResult == 0 && opts.data_size_out >= (sizeof(struct ethhdr) + (2u * sizeof(struct ipv6hdr)) + sizeof(struct switchboard_wormhole_overlay_header) + sizeof(struct udphdr) + sizeof(struct quic_long_header)))
   {
     const uint8_t expectedGatewayMAC[6] = {0x02, 0x42, 0xac, 0x11, 0x00, 0x01};
     const uint8_t expectedLocalMAC[6] = {0x02, 0x42, 0xac, 0x11, 0x00, 0x0a};
@@ -1598,7 +1820,7 @@ static void testContainerPeerEgressRouterRoutesIPv6QuicHighSlotPortal(TestSuite&
     parseIPv6Bytes("fd00:10::c", expectedOuterSrc);
     parseIPv6Bytes("fd00:10::d", expectedOuterDst);
     parseIPv6Bytes("fdf8:d94c:7c33:e26e:ca4b:f501:fbde:ab7e", expectedInnerSrc);
-    parseIPv6Bytes("fdf8:d94c:7c33:e26e:ca4b:f501:ad8c:51b9", expectedInnerDst);
+    parseIPv6Bytes("2602:fac0:0:12ab:34cd::1", expectedInnerDst);
 
     const struct ethhdr *eth = reinterpret_cast<const struct ethhdr *>(output.data());
     expectNamed(eth->h_proto == bpf_htons(ETH_P_IPV6), "sets_outer_ethertype");
@@ -1608,16 +1830,21 @@ static void testContainerPeerEgressRouterRoutesIPv6QuicHighSlotPortal(TestSuite&
                 "sets_gateway_mac");
 
     const struct ipv6hdr *outer6 = reinterpret_cast<const struct ipv6hdr *>(output.data() + sizeof(struct ethhdr));
-    expectNamed(outer6->nexthdr == IPPROTO_IPV6, "wraps_inner_ipv6");
+    expectNamed(outer6->nexthdr == IPPROTO_GRE, "wraps_inner_ipv6_with_keyed_gre");
     expectNamed(std::memcmp(outer6->saddr.s6_addr, expectedOuterSrc, sizeof(expectedOuterSrc)) == 0,
                 "sets_outer_source");
     expectNamed(std::memcmp(outer6->daddr.s6_addr, expectedOuterDst, sizeof(expectedOuterDst)) == 0,
                 "sets_outer_destination");
 
-    const struct ipv6hdr *inner6 = reinterpret_cast<const struct ipv6hdr *>(outer6 + 1);
+    const struct switchboard_wormhole_overlay_header *provenance = reinterpret_cast<const struct switchboard_wormhole_overlay_header *>(outer6 + 1);
+    expectNamed(switchboardWormholeOverlayHeaderValid(provenance), "writes_valid_provenance_header");
+    expectNamed(provenance->reserved == 0, "omits_host_local_portal_slot");
+    expectNamed(std::memcmp(provenance->container, appContainerID, sizeof(appContainerID)) == 0,
+                "preserves_quic_selected_container");
+    const struct ipv6hdr *inner6 = reinterpret_cast<const struct ipv6hdr *>(provenance + 1);
     const struct udphdr *udph = reinterpret_cast<const struct udphdr *>(inner6 + 1);
     const struct quic_long_header *quic = reinterpret_cast<const struct quic_long_header *>(udph + 1);
-    __u16 expectedChecksum = compute_ipv6_transport_checksum_portable(
+    __u16 expectedChecksum = checksumIPv6Transport(
         inner6->saddr.s6_addr,
         inner6->daddr.s6_addr,
         IPPROTO_UDP,
@@ -1629,9 +1856,9 @@ static void testContainerPeerEgressRouterRoutesIPv6QuicHighSlotPortal(TestSuite&
     expectNamed(std::memcmp(inner6->saddr.s6_addr, expectedInnerSrc, sizeof(expectedInnerSrc)) == 0,
                 "preserves_probe_source");
     expectNamed(std::memcmp(inner6->daddr.s6_addr, expectedInnerDst, sizeof(expectedInnerDst)) == 0,
-                "rewrites_destination_to_app_container");
+                "preserves_external_destination_until_target_host");
     expectNamed(ntohs(udph->source) == 41'252, "preserves_source_port");
-    expectNamed(ntohs(udph->dest) == 8443, "rewrites_destination_port");
+    expectNamed(ntohs(udph->dest) == 443, "preserves_external_port_until_target_host");
     expectNamed(udph->check == expectedChecksum, "recomputes_udp_checksum");
     expectNamed((quic->flags & QUIC_V1_PACKET_TYPE_MASK) == QUIC_V1_HANDSHAKE,
                 "preserves_handshake_packet_type");

@@ -3,6 +3,7 @@
 
 #include <switchboard/common/local_container_subnet.h>
 #include <switchboard/overlay.route.h>
+#include <switchboard/whitehole.route.h>
 
 #include <arpa/inet.h>
 #include <cstdio>
@@ -90,24 +91,23 @@ int main(void)
   suite.expect(switchboardBuildOverlayMachineRouteValue(route4, value4), "switchboard_overlay_route_value_ipv4_builds");
   suite.expect(value4.family == SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV4, "switchboard_overlay_route_value_ipv4_family");
   suite.expect(value4.use_gateway_mac == 1, "switchboard_overlay_route_value_ipv4_gateway_mac_flag");
-  suite.expect(value4.next_hop4 == route4.nextHop.v4, "switchboard_overlay_route_value_ipv4_next_hop");
+  suite.expect(value4.next_hop4 == route4.nextHop.v4, "switchboard_overlay_route_value_ipv4_preserves_routed_target_with_gateway_mac");
   suite.expect(value4.source4 == route4.sourceAddress.v4, "switchboard_overlay_route_value_ipv4_source");
 
   SwitchboardOverlayMachineRoute route6 = {};
   route6.machineFragment = 0x010203u;
   route6.nextHop = IPAddress("2001:db8::44", true);
   route6.sourceAddress = IPAddress("2001:db8::10", true);
-  route6.useGatewayMAC = false;
-  route6.nextHopMAC = "fa:6d:18:7d:9f:5e"_ctv;
+  route6.useGatewayMAC = true;
 
   switchboard_overlay_machine_route value6 = {};
   suite.expect(switchboardBuildOverlayMachineRouteValue(route6, value6), "switchboard_overlay_route_value_ipv6_builds");
   suite.expect(value6.family == SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6, "switchboard_overlay_route_value_ipv6_family");
-  suite.expect(value6.use_gateway_mac == 0, "switchboard_overlay_route_value_ipv6_direct_mac_flag");
-  suite.expect(std::memcmp(value6.next_hop6, route6.nextHop.v6, sizeof(value6.next_hop6)) == 0, "switchboard_overlay_route_value_ipv6_next_hop");
+  suite.expect(value6.use_gateway_mac == 1, "switchboard_overlay_route_value_ipv6_gateway_mac_flag");
+  suite.expect(std::memcmp(value6.next_hop6, route6.nextHop.v6, sizeof(value6.next_hop6)) == 0, "switchboard_overlay_route_value_ipv6_preserves_routed_target_with_gateway_mac");
   suite.expect(std::memcmp(value6.source6, route6.sourceAddress.v6, sizeof(value6.source6)) == 0, "switchboard_overlay_route_value_ipv6_source");
-  const uint8_t expectedMAC[6] = {0xfa, 0x6d, 0x18, 0x7d, 0x9f, 0x5e};
-  suite.expect(std::memcmp(value6.next_hop_mac, expectedMAC, sizeof(expectedMAC)) == 0, "switchboard_overlay_route_value_ipv6_direct_mac");
+  const uint8_t zeroMAC[6] = {};
+  suite.expect(std::memcmp(value6.next_hop_mac, zeroMAC, sizeof(zeroMAC)) == 0, "switchboard_overlay_route_value_ipv6_gateway_mac_unbound");
 
   SwitchboardOverlayMachineRoute mixed = route6;
   mixed.sourceAddress = IPAddress("198.51.100.10", false);
@@ -118,6 +118,7 @@ int main(void)
   suite.expect(switchboardBuildOverlayMachineRouteValue(missing, value6) == false, "switchboard_overlay_route_value_rejects_zero_fragment");
 
   SwitchboardOverlayMachineRoute invalidMac = route6;
+  invalidMac.useGatewayMAC = false;
   invalidMac.nextHopMAC = "not-a-mac"_ctv;
   suite.expect(switchboardBuildOverlayMachineRouteValue(invalidMac, value6) == false, "switchboard_overlay_route_value_rejects_invalid_direct_mac");
 
@@ -204,7 +205,18 @@ int main(void)
   suite.expect(switchboardPacketBudgetIPv4HeaderBytes() == 20u, "switchboard_packet_budget_ipv4_header_bytes");
   suite.expect(switchboardPacketBudgetIPv6HeaderBytes() == 40u, "switchboard_packet_budget_ipv6_header_bytes");
   suite.expect(switchboardPacketBudgetExternalIngressLocalDeliveryAddedBytes() == 0u, "switchboard_packet_budget_external_ingress_local_adds_no_bytes");
-  suite.expect(switchboardPacketBudgetExternalIngressRemoteDeliveryAddedBytes() == switchboardPacketBudgetIPv6HeaderBytes(), "switchboard_packet_budget_external_ingress_remote_adds_outer_ipv6_header");
+  suite.expect(switchboardPacketBudgetWormholeOverlayHeaderBytes() == 12u, "switchboard_wormhole_overlay_header_is_standard_keyed_sequenced_gre_size");
+  suite.expect(switchboardPacketBudgetExternalIngressRemoteDeliveryAddedBytes() == switchboardPacketBudgetIPv6HeaderBytes() + switchboardPacketBudgetWormholeOverlayHeaderBytes(), "switchboard_packet_budget_external_ingress_remote_adds_outer_ipv6_and_provenance_headers");
+  suite.expect(switchboardPacketBudgetExternalIngressRequiredUnderlayMTU() == 1552u, "switchboard_packet_budget_external_ingress_remote_requires_1552_underlay");
+  suite.expect(switchboardPacketBudgetExternalIngressUnderlayMTUValid(1551u) == false, "switchboard_packet_budget_external_ingress_remote_rejects_underlay_below_boundary");
+  suite.expect(switchboardPacketBudgetExternalIngressUnderlayMTUValid(1552u), "switchboard_packet_budget_external_ingress_remote_accepts_exact_underlay_boundary");
+  suite.expect(switchboardPacketBudgetRemoteInnerMTU(1552u, true) == 1500u, "switchboard_packet_budget_external_ingress_remote_derives_supported_inner_mtu");
+  suite.expect(switchboardWormholeInitialFlowLifetimeNs(IPPROTO_TCP) == WORMHOLE_FLOW_EMBRYONIC_NS, "switchboard_wormhole_flow_tcp_starts_with_short_embryonic_lifetime");
+  suite.expect(switchboardWormholeInitialFlowLifetimeNs(IPPROTO_UDP) == WORMHOLE_FLOW_EMBRYONIC_NS, "switchboard_wormhole_flow_udp_starts_with_short_embryonic_lifetime");
+  suite.expect(WORMHOLE_FLOW_RECLAIM_GRACE_NS == 1000ULL * 1000ULL * 1000ULL, "switchboard_wormhole_flow_gc_waits_full_bpf_execution_grace");
+  suite.expect(switchboardWormholeFlowLifetimeNs(IPPROTO_TCP, false) == WORMHOLE_FLOW_TCP_ESTABLISHED_NS, "switchboard_wormhole_flow_tcp_established_uses_five_day_lifetime");
+  suite.expect(switchboardWormholeFlowLifetimeNs(IPPROTO_UDP, false) == WORMHOLE_FLOW_UDP_IDLE_NS, "switchboard_wormhole_flow_udp_uses_five_minute_lifetime");
+  suite.expect(switchboardWormholeFlowLifetimeNs(IPPROTO_TCP, true) == WORMHOLE_FLOW_CLOSE_NS, "switchboard_wormhole_flow_tcp_close_uses_short_retirement");
   suite.expect(switchboardPacketBudgetPrivateOverlayIPv4AddedBytes() == switchboardPacketBudgetIPv4HeaderBytes(), "switchboard_packet_budget_private_overlay_ipv4_adds_outer_ipv4_header");
   suite.expect(switchboardPacketBudgetPrivateOverlayIPv6AddedBytes() == switchboardPacketBudgetIPv6HeaderBytes(), "switchboard_packet_budget_private_overlay_ipv6_adds_outer_ipv6_header");
   suite.expect(switchboardPacketBudgetContainerInternetEgressAddedBytes() == 0u, "switchboard_packet_budget_container_internet_egress_adds_no_bytes");
@@ -224,6 +236,11 @@ int main(void)
   suite.expect(switchboardHostIngressOverlayMinimumLinearBytes(htons(ETH_P_IPV6), IPPROTO_IPV6, IPPROTO_ICMPV6) == 94u, "switchboard_host_ingress_overlay_non_transport_frame_keeps_exact_l3_budget");
   suite.expect(switchboardHostIngressOverlayMinimumLinearBytes(0, IPPROTO_IPV6, IPPROTO_TCP) == 0u, "switchboard_host_ingress_overlay_rejects_non_ip_outer_frame");
   suite.expect(switchboardHostIngressOverlayMinimumLinearBytes(htons(ETH_P_IPV6), IPPROTO_TCP, IPPROTO_TCP) == 0u, "switchboard_host_ingress_overlay_rejects_non_ip_inner_frame");
+  suite.expect(switchboardHostIngressWormholeOverlayMinimumLinearBytes(htons(ETH_P_IP), htons(ETH_P_IP), IPPROTO_TCP) == 86u, "switchboard_wormhole_overlay_ipv4_underlay_ipv4_tcp_minimum_frame");
+  suite.expect(switchboardHostIngressWormholeOverlayMinimumLinearBytes(htons(ETH_P_IP), htons(ETH_P_IPV6), IPPROTO_UDP) == 94u, "switchboard_wormhole_overlay_ipv4_underlay_ipv6_udp_minimum_frame");
+  suite.expect(switchboardHostIngressWormholeOverlayMinimumLinearBytes(htons(ETH_P_IPV6), htons(ETH_P_IP), IPPROTO_UDP) == 94u, "switchboard_wormhole_overlay_ipv6_underlay_ipv4_udp_minimum_frame");
+  suite.expect(switchboardHostIngressWormholeOverlayMinimumLinearBytes(htons(ETH_P_IPV6), htons(ETH_P_IPV6), IPPROTO_TCP) == 126u, "switchboard_wormhole_overlay_ipv6_underlay_ipv6_tcp_minimum_frame");
+  suite.expect(switchboardHostIngressWormholeOverlayMinimumLinearBytes(0, htons(ETH_P_IPV6), IPPROTO_TCP) == 0u, "switchboard_wormhole_overlay_rejects_invalid_underlay");
   suite.expect(switchboardHostIngressEffectiveProtocol(htons(ETH_P_IP), htons(ETH_P_IPV6), false) == (__be16)htons(ETH_P_IP), "switchboard_host_ingress_protocol_keeps_wire_ethertype_without_decap");
   suite.expect(switchboardHostIngressEffectiveProtocol(htons(ETH_P_IP), htons(ETH_P_IPV6), true) == (__be16)htons(ETH_P_IPV6), "switchboard_host_ingress_protocol_uses_inner_ipv6_after_ipv4_decap");
   suite.expect(switchboardHostIngressEffectiveProtocol(htons(ETH_P_IPV6), htons(ETH_P_IP), true) == (__be16)htons(ETH_P_IP), "switchboard_host_ingress_protocol_uses_inner_ipv4_after_ipv6_decap");
@@ -246,6 +263,99 @@ int main(void)
   remoteContainerID.hasID = true;
 
   container_id unresolvedContainerID = {};
+
+  switchboard_wormhole_overlay_header wormhole6 = {};
+  switchboardBuildWormholeOverlayHeader(&wormhole6, &localContainerID, true);
+  suite.expect(switchboardWormholeOverlayHeaderValid(&wormhole6), "switchboard_wormhole_overlay_ipv6_header_validates");
+  suite.expect(wormhole6.flags == htons(SWITCHBOARD_WORMHOLE_GRE_FLAGS), "switchboard_wormhole_overlay_uses_keyed_sequenced_gre_flags");
+  suite.expect(wormhole6.protocol == htons(ETH_P_IPV6), "switchboard_wormhole_overlay_preserves_ipv6_inner_protocol");
+  suite.expect(wormhole6.reserved == 0, "switchboard_wormhole_overlay_omits_host_local_portal_slot");
+  container_id restoredContainerID = {};
+  suite.expect(switchboardWormholeOverlayContainerID(&wormhole6, &restoredContainerID), "switchboard_wormhole_overlay_restores_container_identity");
+  suite.expect(std::memcmp(restoredContainerID.value, localContainerID.value, sizeof(localContainerID.value)) == 0, "switchboard_wormhole_overlay_container_identity_is_exact");
+
+  switchboard_wormhole_overlay_header wormhole4 = {};
+  switchboardBuildWormholeOverlayHeader(&wormhole4, &remoteContainerID, false);
+  suite.expect(switchboardWormholeOverlayHeaderValid(&wormhole4), "switchboard_wormhole_overlay_ipv4_header_validates");
+  suite.expect(wormhole4.protocol == htons(ETH_P_IP), "switchboard_wormhole_overlay_preserves_ipv4_inner_protocol");
+  wormhole4.version += 1u;
+  suite.expect(switchboardWormholeOverlayHeaderValid(&wormhole4) == false, "switchboard_wormhole_overlay_rejects_unknown_version");
+  wormhole4.reserved = 1;
+  suite.expect(switchboardWormholeOverlayHeaderValid(&wormhole4) == false, "switchboard_wormhole_overlay_rejects_nonzero_reserved_identity");
+
+  Vector<Wormhole> wormholes = {};
+  Wormhole first = {};
+  first.containerPort = 8443;
+  first.layer4 = IPPROTO_TCP;
+  wormholes.push_back(first);
+  Wormhole distinctPort = first;
+  distinctPort.containerPort = 9443;
+  wormholes.push_back(distinctPort);
+  Wormhole distinctProtocol = first;
+  distinctProtocol.layer4 = IPPROTO_UDP;
+  wormholes.push_back(distinctProtocol);
+  suite.expect(wormholeTargetBindingsUnique(wormholes), "wormhole_admission_allows_distinct_target_port_or_protocol");
+  wormholes.push_back(first);
+  suite.expect(wormholeTargetBindingsUnique(wormholes) == false, "wormhole_admission_rejects_ambiguous_duplicate_target_binding");
+
+  suite.expect(switchboardPortalCountWithinCapacity(MAX_PORTALS), "switchboard_portal_capacity_accepts_exact_limit");
+  suite.expect(switchboardPortalCountWithinCapacity(uint64_t(MAX_PORTALS) + 1u) == false, "switchboard_portal_capacity_rejects_first_overflow");
+
+  Vector<Wormhole> currentFleet = {};
+  currentFleet.push_back(distinctPort);
+  currentFleet.push_back(first);
+  Vector<Wormhole> replayedFleet = {};
+  replayedFleet.push_back(distinctPort);
+  replayedFleet.push_back(first);
+  String currentFleetBytes = switchboardSerializeWormholeFleet(currentFleet);
+  String replayedFleetBytes = switchboardSerializeWormholeFleet(replayedFleet);
+  suite.expect(currentFleetBytes.equals(replayedFleetBytes),
+               "switchboard_wormhole_fleet_replay_has_stable_exact_desired_bytes");
+  replayedFleet[1].externalPort += 1;
+  suite.expect(currentFleetBytes.equals(switchboardSerializeWormholeFleet(replayedFleet)) == false,
+               "switchboard_wormhole_fleet_desired_bytes_detect_changed_definition");
+
+  Vector<Wormhole> previousWormholes = {};
+  Wormhole previousWormhole = {};
+  previousWormhole.containerPort = 7443;
+  previousWormholes.push_back(previousWormhole);
+  Vector<Wormhole> desiredWormholes = {};
+  Wormhole desiredFirst = {};
+  desiredFirst.containerPort = 8443;
+  desiredWormholes.push_back(desiredFirst);
+  Wormhole desiredSecond = {};
+  desiredSecond.containerPort = 9443;
+  desiredWormholes.push_back(desiredSecond);
+
+  Vector<Wormhole> activeWormholes = previousWormholes;
+  bool failRollback = false;
+  auto closeWormholes = [&]() -> void { activeWormholes.clear(); };
+  auto openWormhole = [&](const Wormhole& wormhole) -> bool {
+    if (wormhole.containerPort == desiredSecond.containerPort ||
+        (failRollback && wormhole.containerPort == previousWormhole.containerPort))
+    {
+      return false;
+    }
+    activeWormholes.push_back(wormhole);
+    return true;
+  };
+
+  SwitchboardWormholeOperationStatus rollbackStatus = switchboardReplaceWormholesTransaction(previousWormholes,
+                                                                                              desiredWormholes,
+                                                                                              openWormhole,
+                                                                                              closeWormholes);
+  suite.expect(rollbackStatus == SwitchboardWormholeOperationStatus::rejected &&
+                   activeWormholes.size() == 1 && activeWormholes[0].containerPort == previousWormhole.containerPort,
+               "switchboard_wormhole_transaction_restores_exact_previous_fleet_after_partial_failure");
+
+  activeWormholes = previousWormholes;
+  failRollback = true;
+  rollbackStatus = switchboardReplaceWormholesTransaction(previousWormholes,
+                                                           desiredWormholes,
+                                                           openWormhole,
+                                                           closeWormholes);
+  suite.expect(rollbackStatus == SwitchboardWormholeOperationStatus::rollbackFailed && activeWormholes.empty(),
+               "switchboard_wormhole_transaction_reports_and_clears_failed_rollback");
 
   suite.expect(switchboardContainerIDTargetsLocalMachine(&localContainerID, &localSubnet), "switchboard_container_id_detects_local_machine_delivery");
   suite.expect(switchboardContainerIDTargetsRemoteMachine(&localContainerID, &localSubnet) == false, "switchboard_container_id_local_delivery_is_not_remote");

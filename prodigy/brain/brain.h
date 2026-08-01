@@ -94,7 +94,8 @@ enum class BrainTimeoutFlags : uint64_t {
   postIgnitionRecovery,
   spotDecomissionChecker,
   dnsReconcileRetry,
-  machineRetirementRecheck
+  machineRetirementRecheck,
+  wormholeRuntimeAckDeadline
 };
 
 static inline bool brainAddCertificateSubjectAltNames(X509 *cert, const Vector<String>& dnsSans, const Vector<IPAddress>& ipSans)
@@ -441,22 +442,21 @@ inline bool BrainBase::buildSwitchboardOverlayRoutingConfig(Machine *machine, Sw
           continue;
         }
 
-        IPAddress nextHop = {};
-        nextHop = transportAddress;
+        IPAddress layer2NextHop = transportAddress;
         if (remoteCandidate.gateway.size() > 0)
         {
-          if (ClusterMachine::parseIPAddressLiteral(remoteCandidate.gateway, nextHop) == false || nextHop.is6 == false)
+          if (ClusterMachine::parseIPAddressLiteral(remoteCandidate.gateway, layer2NextHop) == false || layer2NextHop.is6 == false)
           {
             continue;
           }
         }
 
         IPAddress sourceAddress = {};
-        if (const MachineNicHardwareProfile *localNextHopNic = prodigyFindMachineNicContainingAddress(*machine, nextHop);
+        if (const MachineNicHardwareProfile *localNextHopNic = prodigyFindMachineNicContainingAddress(*machine, layer2NextHop);
             localNextHopNic != nullptr)
         {
           const MachineNicSubnetHardwareProfile *localNextHopSubnet = nullptr;
-          localNextHopNic = prodigyFindMachineNicContainingAddress(*machine, nextHop, &localNextHopSubnet);
+          localNextHopNic = prodigyFindMachineNicContainingAddress(*machine, layer2NextHop, &localNextHopSubnet);
           if (localNextHopSubnet == nullptr || localNextHopSubnet->address.is6 == false)
           {
             continue;
@@ -471,7 +471,7 @@ inline bool BrainBase::buildSwitchboardOverlayRoutingConfig(Machine *machine, Sw
 
         SwitchboardOverlayMachineRoute route = {};
         route.machineFragment = candidate->fragment;
-        route.nextHop = nextHop;
+        route.nextHop = transportAddress;
         route.sourceAddress = sourceAddress;
 
         const MachineNicSubnetHardwareProfile *localDirectSubnet = nullptr;
@@ -588,6 +588,43 @@ inline void BrainBase::sendNeuronSwitchboardOverlayRoutes(void)
   }
 }
 
+static inline bool prodigyPrepareSwitchboardWormholeOperation(uint32_t containerID,
+                                                              const Vector<Wormhole>& wormholes,
+                                                              SwitchboardWormholeOperation& operation)
+{
+  operation = {};
+  operation.containerID = containerID;
+  BitseryEngine::serialize(operation.desired, wormholes);
+  return operation.desired.size() <= SwitchboardWormholeOperation::maximumDesiredBytes &&
+         prodigyComputeWormholeDesiredStateRevision(containerID, operation.desired, operation.revision);
+}
+
+static inline bool prodigyWormholeRuntimeTargetMachine(const Machine *machine)
+{
+  return machine != nullptr && machine->fragment != 0 &&
+         machine->state != MachineState::hardwareFailure &&
+         machine->state != MachineState::decommissioning;
+}
+
+static inline void prodigyQueueSwitchboardWormholeOperation(Machine *machine,
+                                                            const SwitchboardWormholeOperation& operation)
+{
+  String serialized = {};
+  SwitchboardWormholeOperation wire = operation;
+  BitseryEngine::serialize(serialized, wire);
+  Message::construct(machine->neuron.wBuffer, NeuronTopic::openSwitchboardWormholes, serialized);
+}
+
+static inline void prodigyCancelWormholeRuntimeAckDeadline(ContainerView *container)
+{
+  if (container != nullptr && container->wormholeRuntimeAckDeadline != nullptr)
+  {
+    container->wormholeRuntimeAckDeadline->flags = uint64_t(BrainTimeoutFlags::canceled);
+    Ring::queueCancelTimeout(container->wormholeRuntimeAckDeadline);
+    container->wormholeRuntimeAckDeadline = nullptr;
+  }
+}
+
 inline void BrainBase::sendNeuronSwitchboardStateSync(Machine *machine)
 {
   if (neuronControlStreamActive(machine) == false)
@@ -624,7 +661,7 @@ inline void BrainBase::sendNeuronSwitchboardStateSync(Machine *machine)
   for (const auto& [uuid, container] : containers)
   {
     (void)uuid;
-    if (container == nullptr || container->wormholes.empty())
+    if (container == nullptr || container->machine == nullptr)
     {
       continue;
     }
@@ -634,13 +671,36 @@ inline void BrainBase::sendNeuronSwitchboardStateSync(Machine *machine)
       continue;
     }
 
-    String serializedWormholes = {};
-    BitseryEngine::serialize(serializedWormholes, container->wormholes);
-    Message::construct(
-        machine->neuron.wBuffer,
-        NeuronTopic::openSwitchboardWormholes,
-        container->generateContainerID(),
-        serializedWormholes);
+    SwitchboardWormholeOperation operation = {};
+    if (container->wormholeRuntimeRevision.size() == 64)
+    {
+      operation.containerID = container->generateContainerID();
+      operation.revision = container->wormholeRuntimeRevision;
+      operation.desired = container->wormholeRuntimeDesired;
+    }
+    else if (prodigyPrepareSwitchboardWormholeOperation(container->generateContainerID(), container->wormholes, operation) == false)
+    {
+      continue;
+    }
+    else
+    {
+      container->wormholeRuntimeRevision = operation.revision;
+      container->wormholeRuntimeDesired = operation.desired;
+    }
+
+    if (prodigyWormholeRuntimeTargetMachine(machine))
+    {
+      container->wormholeRuntimePendingMachines.insert(machine->fragment);
+      container->wormholeRuntimeFailedMachines.erase(machine->fragment);
+      if (container->runtimeReady)
+      {
+        container->runtimeReady = false;
+        container->wormholeRuntimeFailureSuppressedReady = true;
+      }
+      armWormholeRuntimeAckDeadline(container);
+      replicateContainerRuntimeStateToFollowers(container);
+    }
+    prodigyQueueSwitchboardWormholeOperation(machine, operation);
   }
 
   for (const auto& [uuid, container] : containers)
@@ -683,7 +743,7 @@ inline void BrainBase::sendNeuronSwitchboardStateSync(Machine *machine)
 
 inline void BrainBase::sendNeuronOpenSwitchboardWormholes(ContainerView *container, const Vector<Wormhole>& wormholes)
 {
-  if (container == nullptr || wormholes.empty())
+  if (container == nullptr || container->machine == nullptr)
   {
     return;
   }
@@ -698,8 +758,41 @@ inline void BrainBase::sendNeuronOpenSwitchboardWormholes(ContainerView *contain
     }
   }
 
-  String serializedWormholes = {};
-  BitseryEngine::serialize(serializedWormholes, wormholes);
+  SwitchboardWormholeOperation operation = {};
+  if (prodigyPrepareSwitchboardWormholeOperation(container->generateContainerID(), wormholes, operation) == false)
+  {
+    basics_log("brain failed to prepare switchboard wormhole operation containerID=%u\n", container->generateContainerID());
+    return;
+  }
+
+  container->wormholeRuntimeRevision = operation.revision;
+  container->wormholeRuntimeDesired = operation.desired;
+  prodigyCancelWormholeRuntimeAckDeadline(container);
+  container->wormholeRuntimePendingMachines.clear();
+  container->wormholeRuntimeFailedMachines.clear();
+  container->wormholeRuntimeFailure.clear();
+  for (Machine *machine : machines)
+  {
+    if (prodigyWormholeRuntimeTargetMachine(machine))
+    {
+      container->wormholeRuntimePendingMachines.insert(machine->fragment);
+    }
+  }
+  if (container->wormholeRuntimePendingMachines.empty() == false)
+  {
+    if (container->runtimeReady)
+    {
+      container->runtimeReady = false;
+      container->wormholeRuntimeFailureSuppressedReady = true;
+    }
+  }
+  else if (container->wormholeRuntimeFailureSuppressedReady)
+  {
+    container->runtimeReady = true;
+    container->wormholeRuntimeFailureSuppressedReady = false;
+  }
+  armWormholeRuntimeAckDeadline(container);
+  replicateContainerRuntimeStateToFollowers(container);
 
   for (Machine *machine : machines)
   {
@@ -713,11 +806,7 @@ inline void BrainBase::sendNeuronOpenSwitchboardWormholes(ContainerView *contain
       sendNeuronSwitchboardHostedIngressPrefixes(machine);
     }
 
-    Message::construct(
-        machine->neuron.wBuffer,
-        NeuronTopic::openSwitchboardWormholes,
-        container->generateContainerID(),
-        serializedWormholes);
+    prodigyQueueSwitchboardWormholeOperation(machine, operation);
     Ring::queueSend(&machine->neuron);
   }
 }
@@ -962,6 +1051,7 @@ public:
   constexpr static int64_t certificateLifecycleMaxRetryDelayMs = 60 * 60 * 1000;
   constexpr static int64_t certificateLifecycleMaxJitterMs = 15 * 60 * 1000;
   constexpr static int64_t credentialDeltaAckTimeoutMs = 5 * 60 * 1000;
+  constexpr static uint64_t wormholeRuntimeAckTimeoutMs = 30'000;
   constexpr static int64_t publicTlsCertbotTimeoutMs = 60 * 60 * 1000;
   constexpr static int64_t mothershipTunnelProviderBaseRetryDelayMs = 5 * 1000;
   constexpr static int64_t mothershipTunnelProviderMaxRetryDelayMs = 5 * 60 * 1000;
@@ -5973,19 +6063,98 @@ public:
     }
   }
 
-  bool applyReplicatedContainerRuntimeStateNow(const BrainReplicatedContainerRuntimeState& state)
+  bool replicatedWormholeRuntimeStateValid(const BrainReplicatedContainerRuntimeState& state,
+                                            const Machine *machine) const
+  {
+    auto fragmentsValid = [](const Vector<uint32_t>& fragments) -> bool {
+      uint32_t previous = 0;
+      for (uint32_t fragment : fragments)
+      {
+        if (fragment == 0 || fragment <= previous)
+        {
+          return false;
+        }
+        previous = fragment;
+      }
+      return true;
+    };
+
+    if (fragmentsValid(state.wormholeRuntimePendingMachines) == false ||
+        fragmentsValid(state.wormholeRuntimeFailedMachines) == false)
+    {
+      return false;
+    }
+    uint32_t pendingIndex = 0;
+    uint32_t failedIndex = 0;
+    while (pendingIndex < state.wormholeRuntimePendingMachines.size() &&
+           failedIndex < state.wormholeRuntimeFailedMachines.size())
+    {
+      uint32_t pending = state.wormholeRuntimePendingMachines[pendingIndex];
+      uint32_t failed = state.wormholeRuntimeFailedMachines[failedIndex];
+      if (pending == failed)
+      {
+        return false;
+      }
+      pendingIndex += pending < failed ? 1u : 0u;
+      failedIndex += failed < pending ? 1u : 0u;
+    }
+
+    bool unresolved = state.wormholeRuntimePendingMachines.empty() == false ||
+                      state.wormholeRuntimeFailedMachines.empty() == false;
+    if (state.wormholeRuntimeRevision.empty())
+    {
+      return state.wormholeRuntimeDesired.empty() && unresolved == false &&
+             state.wormholeRuntimeFailure.empty() &&
+             state.wormholeRuntimeFailureSuppressedReady == false;
+    }
+    if (machine == nullptr || machine->fragment == 0 || state.plan.fragment == 0 ||
+        state.wormholeRuntimeDesired.size() > SwitchboardWormholeOperation::maximumDesiredBytes ||
+        prodigyIsSHA256HexDigest(state.wormholeRuntimeRevision) == false ||
+        (state.plan.runtimeReady &&
+         (unresolved || state.wormholeRuntimeFailureSuppressedReady || state.wormholeRuntimeFailure.empty() == false)) ||
+        (unresolved == false &&
+         (state.wormholeRuntimeFailureSuppressedReady || state.wormholeRuntimeFailure.empty() == false)))
+    {
+      return false;
+    }
+
+    uint32_t containerID = 0;
+    uint8_t *containerBytes = reinterpret_cast<uint8_t *>(&containerID);
+    std::memcpy(containerBytes, &machine->fragment, 3);
+    std::memcpy(containerBytes + 3, &state.plan.fragment, 1);
+    String expectedRevision = {};
+    Vector<Wormhole> desired = {};
+    return prodigyComputeWormholeDesiredStateRevision(containerID,
+                                                       state.wormholeRuntimeDesired,
+                                                       expectedRevision) &&
+           expectedRevision.equals(state.wormholeRuntimeRevision) &&
+           BitseryEngine::deserializeSafe(state.wormholeRuntimeDesired, desired) &&
+           wormholeTargetBindingsUnique(desired);
+  }
+
+  enum class ReplicatedContainerRuntimeStateApplyResult : uint8_t {
+    applied,
+    deferred,
+    rejected,
+  };
+
+  ReplicatedContainerRuntimeStateApplyResult applyReplicatedContainerRuntimeStateNow(const BrainReplicatedContainerRuntimeState& state)
   {
     uint64_t deploymentID = state.plan.config.deploymentID();
     auto deploymentIt = deployments.find(deploymentID);
     if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
     {
-      return false;
+      return ReplicatedContainerRuntimeStateApplyResult::deferred;
     }
 
     Machine *machine = findMachineForReplicatedContainerRuntimeState(state);
     if (machine == nullptr)
     {
-      return false;
+      return ReplicatedContainerRuntimeStateApplyResult::deferred;
+    }
+    if (replicatedWormholeRuntimeStateValid(state, machine) == false)
+    {
+      return ReplicatedContainerRuntimeStateApplyResult::rejected;
     }
 
     ApplicationDeployment *deployment = deploymentIt->second;
@@ -6001,6 +6170,7 @@ public:
       created = true;
     }
 
+    prodigyCancelWormholeRuntimeAckDeadline(container);
     detachContainerRuntimeState(container);
 
     bool uploadedRuntimeReady = state.plan.runtimeReady;
@@ -6010,6 +6180,20 @@ public:
     container->runtime_nLogicalCores = state.runtimeLogicalCores;
     container->runtime_memoryMB = state.runtimeMemoryMB;
     container->runtime_storageMB = state.runtimeStorageMB;
+    container->wormholeRuntimeRevision = state.wormholeRuntimeRevision;
+    container->wormholeRuntimeDesired = state.wormholeRuntimeDesired;
+    container->wormholeRuntimePendingMachines.clear();
+    container->wormholeRuntimeFailedMachines.clear();
+    for (uint32_t fragment : state.wormholeRuntimePendingMachines)
+    {
+      container->wormholeRuntimePendingMachines.insert(fragment);
+    }
+    for (uint32_t fragment : state.wormholeRuntimeFailedMachines)
+    {
+      container->wormholeRuntimeFailedMachines.insert(fragment);
+    }
+    container->wormholeRuntimeFailure = state.wormholeRuntimeFailure;
+    container->wormholeRuntimeFailureSuppressedReady = state.wormholeRuntimeFailureSuppressedReady;
 
     containers.insert_or_assign(container->uuid, container);
     machine->upsertContainerIndexEntry(container->deploymentID, container);
@@ -6022,6 +6206,10 @@ public:
     if (uploadedRuntimeReady)
     {
       deployment->containerIsRuntimeReady(container);
+    }
+    if (weAreMaster)
+    {
+      armWormholeRuntimeAckDeadline(container);
     }
 
     if (weAreMaster)
@@ -6037,7 +6225,7 @@ public:
                int(container->runtimeReady),
                int(created),
                int(weAreMaster));
-    return true;
+    return ReplicatedContainerRuntimeStateApplyResult::applied;
   }
 
   void applyPendingReplicatedContainerRuntimeStates(uint64_t deploymentID)
@@ -6053,7 +6241,7 @@ public:
 
     for (const BrainReplicatedContainerRuntimeState& state : pending)
     {
-      if (applyReplicatedContainerRuntimeStateNow(state) == false)
+      if (applyReplicatedContainerRuntimeStateNow(state) == ReplicatedContainerRuntimeStateApplyResult::deferred)
       {
         pendingReplicatedContainerRuntimeStates[state.plan.config.deploymentID()].push_back(state);
       }
@@ -6062,13 +6250,16 @@ public:
 
   void applyReplicatedContainerRuntimeState(const BrainReplicatedContainerRuntimeState& state)
   {
-    if (applyReplicatedContainerRuntimeStateNow(state))
+    ReplicatedContainerRuntimeStateApplyResult result = applyReplicatedContainerRuntimeStateNow(state);
+    if (result == ReplicatedContainerRuntimeStateApplyResult::applied)
     {
       persistLocalRuntimeState();
       return;
     }
-
-    pendingReplicatedContainerRuntimeStates[state.plan.config.deploymentID()].push_back(state);
+    if (result == ReplicatedContainerRuntimeStateApplyResult::deferred)
+    {
+      pendingReplicatedContainerRuntimeStates[state.plan.config.deploymentID()].push_back(state);
+    }
   }
 
   bool captureReplicatedContainerRuntimeState(ContainerView *container, BrainReplicatedContainerRuntimeState& state)
@@ -6094,10 +6285,26 @@ public:
     state.runtimeLogicalCores = container->runtime_nLogicalCores;
     state.runtimeMemoryMB = container->runtime_memoryMB;
     state.runtimeStorageMB = container->runtime_storageMB;
+    state.wormholeRuntimeRevision = container->wormholeRuntimeRevision;
+    state.wormholeRuntimeDesired = container->wormholeRuntimeDesired;
+    state.wormholeRuntimePendingMachines.reserve(container->wormholeRuntimePendingMachines.size());
+    state.wormholeRuntimeFailedMachines.reserve(container->wormholeRuntimeFailedMachines.size());
+    for (uint32_t fragment : container->wormholeRuntimePendingMachines)
+    {
+      state.wormholeRuntimePendingMachines.push_back(fragment);
+    }
+    for (uint32_t fragment : container->wormholeRuntimeFailedMachines)
+    {
+      state.wormholeRuntimeFailedMachines.push_back(fragment);
+    }
+    std::sort(state.wormholeRuntimePendingMachines.begin(), state.wormholeRuntimePendingMachines.end());
+    std::sort(state.wormholeRuntimeFailedMachines.begin(), state.wormholeRuntimeFailedMachines.end());
+    state.wormholeRuntimeFailure = container->wormholeRuntimeFailure;
+    state.wormholeRuntimeFailureSuppressedReady = container->wormholeRuntimeFailureSuppressedReady;
     return true;
   }
 
-  void replicateContainerRuntimeStateToFollowers(ContainerView *container)
+  void replicateContainerRuntimeStateToFollowers(ContainerView *container) override
   {
     if (weAreMaster == false)
     {
@@ -15298,6 +15505,15 @@ public:
         return;
       }
 
+      if (container->wormholeRuntimePendingMachines.empty() == false ||
+          container->wormholeRuntimeFailedMachines.empty() == false)
+      {
+        container->runtimeReady = false;
+        container->wormholeRuntimeFailureSuppressedReady = true;
+        replicateContainerRuntimeStateToFollowers(container);
+        return;
+      }
+
       if (auto deploymentIt = deployments.find(container->deploymentID); deploymentIt != deployments.end() && deploymentIt->second != nullptr)
       {
         deploymentIt->second->containerIsRuntimeReady(container);
@@ -16493,6 +16709,11 @@ public:
     basics_log("forfeitMasterStatus weAreMaster=%d\n", int(weAreMaster));
     advanceMasterAuthorityEpoch();
     weAreMaster = false;
+    for (const auto& [uuid, container] : containers)
+    {
+      (void)uuid;
+      prodigyCancelWormholeRuntimeAckDeadline(container);
+    }
     masterAuthorityReplicationByPeer.clear();
     (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
     noMasterYet = true;
@@ -19228,6 +19449,101 @@ public:
     machine->osUpdateCommandWatchdog = timeout;
   }
 
+  void armWormholeRuntimeAckDeadline(ContainerView *container) override
+  {
+    if (weAreMaster == false || container == nullptr)
+    {
+      return;
+    }
+    if (container->wormholeRuntimePendingMachines.empty())
+    {
+      prodigyCancelWormholeRuntimeAckDeadline(container);
+      return;
+    }
+    if (container->wormholeRuntimeAckDeadline != nullptr)
+    {
+      return;
+    }
+
+    TimeoutPacket *timeout = new TimeoutPacket();
+    timeout->flags = uint64_t(BrainTimeoutFlags::wormholeRuntimeAckDeadline);
+    timeout->identifier = container->uuid;
+    timeout->dispatcher = this;
+    timeout->setTimeoutMs(wormholeRuntimeAckTimeoutMs);
+    RingDispatcher::installMultiplexee(timeout, this);
+    Ring::queueTimeout(timeout);
+    container->wormholeRuntimeAckDeadline = timeout;
+  }
+
+  void failWormholeRuntimeAckDeadline(ContainerView *container)
+  {
+    if (weAreMaster == false || container == nullptr || container->wormholeRuntimePendingMachines.empty())
+    {
+      return;
+    }
+    for (uint32_t machineFragment : container->wormholeRuntimePendingMachines)
+    {
+      container->wormholeRuntimeFailedMachines.insert(machineFragment);
+      basics_log("brain wormhole runtime acknowledgement timeout containerID=%u machineFragment=%u\n",
+                 container->generateContainerID(),
+                 machineFragment);
+    }
+    container->wormholeRuntimeFailure.assign("wormhole routing acknowledgement timed out"_ctv);
+    container->wormholeRuntimePendingMachines.clear();
+    replicateContainerRuntimeStateToFollowers(container);
+  }
+
+  void restoreWormholeRuntimeReadiness(ContainerView *container)
+  {
+    if (container == nullptr || container->wormholeRuntimeFailureSuppressedReady == false)
+    {
+      return;
+    }
+    container->wormholeRuntimeFailureSuppressedReady = false;
+    if (auto deployment = deployments.find(container->deploymentID);
+        deployment != deployments.end() && deployment->second != nullptr)
+    {
+      deployment->second->containerIsRuntimeReady(container);
+    }
+    else
+    {
+      container->runtimeReady = true;
+    }
+  }
+
+  void retireWormholeRuntimeMachine(Machine *machine)
+  {
+    if (weAreMaster == false || machine == nullptr || machine->fragment == 0)
+    {
+      return;
+    }
+
+    for (const auto& [uuid, container] : containers)
+    {
+      (void)uuid;
+      if (container == nullptr)
+      {
+        continue;
+      }
+      bool changed = container->wormholeRuntimePendingMachines.erase(machine->fragment) > 0;
+      changed = container->wormholeRuntimeFailedMachines.erase(machine->fragment) > 0 || changed;
+      if (changed == false)
+      {
+        continue;
+      }
+      if (container->wormholeRuntimePendingMachines.empty() && container->wormholeRuntimeFailedMachines.empty())
+      {
+        container->wormholeRuntimeFailure.clear();
+        if (container->wormholeRuntimeFailureSuppressedReady)
+        {
+          restoreWormholeRuntimeReadiness(container);
+        }
+      }
+      armWormholeRuntimeAckDeadline(container);
+      replicateContainerRuntimeStateToFollowers(container);
+    }
+  }
+
   void failOSUpdateCommandDeadline(Machine *machine)
   {
     if (machine == nullptr || machines.contains(machine) == false)
@@ -19282,6 +19598,20 @@ public:
         {
           machineRetirementRecheckArmed = false;
           reapRetiringMachines();
+          break;
+        }
+      case BrainTimeoutFlags::wormholeRuntimeAckDeadline:
+        {
+          auto containerIt = containers.find(packet->identifier);
+          if (containerIt != containers.end() && containerIt->second != nullptr &&
+              containerIt->second->wormholeRuntimeAckDeadline == packet)
+          {
+            ContainerView *container = containerIt->second;
+            container->wormholeRuntimeAckDeadline = nullptr;
+            failWormholeRuntimeAckDeadline(container);
+          }
+          RingDispatcher::eraseMultiplexee(packet);
+          delete packet;
           break;
         }
       case BrainTimeoutFlags::ignition:
@@ -21265,6 +21595,10 @@ public:
                (long long)machine->creationTimeMs,
                (long long)machine->lastUpdatedOSMs);
     machine->state = newState;
+    if (prodigyWormholeRuntimeTargetMachine(machine) == false)
+    {
+      retireWormholeRuntimeMachine(machine);
+    }
 
     switch (newState)
     {
@@ -27650,6 +27984,12 @@ public:
             }
           }
 
+          if (wormholeTargetBindingsUnique(deployment->plan.wormholes) == false)
+          {
+            rejectInvalidPlan("invalid plan: wormholes require unique containerPort and layer4 targets"_ctv);
+            return;
+          }
+
           for (const Wormhole& wormhole : deployment->plan.wormholes)
           {
             if (wormhole.source != ExternalAddressSource::distributableSubnet && wormhole.source != ExternalAddressSource::registeredRoutablePrefix)
@@ -28520,6 +28860,76 @@ public:
           uint128_t containerUUID = 0;
           Message::extractArg<ArgumentNature::fixed>(args, containerUUID);
           noteLocalContainerRuntimeReady(containerUUID);
+          break;
+        }
+      case NeuronTopic::openSwitchboardWormholes:
+        {
+          String serialized = {};
+          Message::extractToStringView(args, serialized);
+          SwitchboardWormholeOperation operation = {};
+          if (BitseryEngine::deserializeSafe(serialized, operation) == false ||
+              operation.containerID == 0 || prodigyIsSHA256HexDigest(operation.revision) == false ||
+              operation.desired.empty() == false ||
+              (operation.status != SwitchboardWormholeOperationStatus::applied &&
+               operation.status != SwitchboardWormholeOperationStatus::rejected &&
+               operation.status != SwitchboardWormholeOperationStatus::rollbackFailed))
+          {
+            break;
+          }
+          for (const auto& [uuid, container] : containers)
+          {
+            (void)uuid;
+            if (container == nullptr || container->machine == nullptr ||
+                container->generateContainerID() != operation.containerID ||
+                container->wormholeRuntimeRevision.equals(operation.revision) == false)
+            {
+              continue;
+            }
+
+            uint32_t machineFragment = neuron->machine ? neuron->machine->fragment : 0;
+            bool pending = container->wormholeRuntimePendingMachines.erase(machineFragment) > 0;
+            bool failed = container->wormholeRuntimeFailedMachines.contains(machineFragment);
+            if (machineFragment == 0 || (pending == false && failed == false))
+            {
+              break;
+            }
+
+            if (operation.status == SwitchboardWormholeOperationStatus::applied)
+            {
+              container->wormholeRuntimeFailedMachines.erase(machineFragment);
+            }
+            else if (failed == false)
+            {
+              container->wormholeRuntimeFailedMachines.insert(machineFragment);
+              if (operation.status == SwitchboardWormholeOperationStatus::rollbackFailed)
+              {
+                container->wormholeRuntimeFailure.snprintf<"wormhole routing rollback failed on machine fragment {itoa}"_ctv>(machineFragment);
+                basics_log("brain wormhole runtime rollback failed containerID=%u machineFragment=%u\n",
+                           operation.containerID,
+                           machineFragment);
+              }
+              else
+              {
+                container->wormholeRuntimeFailure.snprintf<"wormhole routing failed on machine fragment {itoa}"_ctv>(machineFragment);
+                basics_log("brain wormhole runtime not ready containerID=%u machineFragment=%u\n",
+                           operation.containerID,
+                           machineFragment);
+              }
+            }
+
+            if (container->wormholeRuntimePendingMachines.empty() &&
+                container->wormholeRuntimeFailedMachines.empty())
+            {
+              container->wormholeRuntimeFailure.clear();
+              if (container->wormholeRuntimeFailureSuppressedReady)
+              {
+                restoreWormholeRuntimeReadiness(container);
+              }
+            }
+            armWormholeRuntimeAckDeadline(container);
+            replicateContainerRuntimeStateToFollowers(container);
+            break;
+          }
           break;
         }
       case NeuronTopic::containerStatistics:

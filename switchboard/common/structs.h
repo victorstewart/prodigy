@@ -1,7 +1,10 @@
 #pragma once
 
+#include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/types.h>
+
+#include <switchboard/common/constants.h>
 
 enum {
   SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV4 = 4,
@@ -12,6 +15,7 @@ enum {
   SWITCHBOARD_IP_PROTOCOL_IPIP = 4,
   SWITCHBOARD_IP_PROTOCOL_TCP = 6,
   SWITCHBOARD_IP_PROTOCOL_UDP = 17,
+  SWITCHBOARD_IP_PROTOCOL_GRE = 47,
   SWITCHBOARD_IP_PROTOCOL_IPV6 = 41,
 };
 
@@ -67,10 +71,76 @@ struct switchboard_wormhole_egress_binding {
     __be32 addr4;
     __be32 addr6[4];
   };
+  __u64 owner_generation;
   __u16 port;
   __u8 proto;
   __u8 is_ipv6;
 };
+
+enum {
+  SWITCHBOARD_WORMHOLE_FLOW_PRIVATE = 1,
+  SWITCHBOARD_WORMHOLE_FLOW_PUBLIC = 2,
+};
+
+enum {
+  SWITCHBOARD_WORMHOLE_FLOW_PENDING = 1,
+  SWITCHBOARD_WORMHOLE_FLOW_REVERSE_SEEN = 2,
+  SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED = 3,
+  SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED_CLOSING = 4,
+};
+
+struct switchboard_wormhole_flow {
+  struct switchboard_wormhole_egress_binding binding;
+  __u8 container[5];
+  __u8 disposition;
+  __u16 reserved;
+  union {
+    struct {
+      __u32 phase;
+      __be32 expectedAck;
+    };
+    __u64 transition;
+  };
+  __u64 expiresAtNs;
+};
+
+static inline __u64 switchboardWormholeFlowTransition(__u32 phase, __be32 expectedAck)
+{
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  return ((__u64)(__u32)expectedAck << 32) | (__u64)phase;
+#else
+  return ((__u64)phase << 32) | (__u64)(__u32)expectedAck;
+#endif
+}
+
+static inline __u32 switchboardWormholeFlowTransitionPhase(__u64 transition)
+{
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  return (__u32)transition;
+#else
+  return (__u32)(transition >> 32);
+#endif
+}
+
+static inline __be32 switchboardWormholeFlowTransitionExpectedAck(__u64 transition)
+{
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  return (__be32)(transition >> 32);
+#else
+  return (__be32)transition;
+#endif
+}
+
+// Public ingress keeps its original tuple until target-host DNAT. This compact
+// keyed-GRE header carries only the routing identity that ordinary IP-in-IP
+// lacks; it is removed before the packet reaches the container socket.
+struct switchboard_wormhole_overlay_header {
+  __be16 flags;
+  __be16 protocol;
+  __u8 container[5];
+  __u8 version;
+  __be16 reserved;
+} __attribute__((packed));
 
 struct switchboard_owned_routable_prefix4_key {
   __u32 prefixlen;
@@ -114,6 +184,16 @@ struct switchboard_overlay_machine_route {
   __u8 source6[16];
 };
 
+struct switchboard_overlay_ingress_peer4_key {
+  __be32 source;
+  __be32 destination;
+};
+
+struct switchboard_overlay_ingress_peer6_key {
+  __u8 source[16];
+  __u8 destination[16];
+};
+
 struct switchboard_overlay_config {
   __u8 container_network_enabled;
   __u8 reserved[3];
@@ -126,6 +206,60 @@ static inline __be16 switchboardHostToBE16(__u16 host)
 #else
   return (__be16)host;
 #endif
+}
+
+static inline __u16 switchboardBE16ToHost(__be16 network)
+{
+  return (__u16)switchboardHostToBE16((__u16)network);
+}
+
+static inline void switchboardBuildWormholeOverlayHeader(struct switchboard_wormhole_overlay_header *header,
+                                                         const struct container_id *containerID,
+                                                         bool innerIPv6)
+{
+  if (header == 0)
+  {
+    return;
+  }
+
+  __builtin_memset(header, 0, sizeof(*header));
+  if (containerID == 0 || containerID->hasID == false)
+  {
+    return;
+  }
+
+  header->flags = switchboardHostToBE16(SWITCHBOARD_WORMHOLE_GRE_FLAGS);
+  header->protocol = switchboardHostToBE16(innerIPv6 ? ETH_P_IPV6 : ETH_P_IP);
+  __builtin_memcpy(header->container, containerID->value, sizeof(header->container));
+  header->version = SWITCHBOARD_WORMHOLE_OVERLAY_VERSION;
+}
+
+static inline bool switchboardWormholeOverlayHeaderValid(const struct switchboard_wormhole_overlay_header *header)
+{
+  if (header == 0 ||
+      header->flags != switchboardHostToBE16(SWITCHBOARD_WORMHOLE_GRE_FLAGS) ||
+      header->version != SWITCHBOARD_WORMHOLE_OVERLAY_VERSION ||
+      header->reserved != 0 ||
+      (header->protocol != switchboardHostToBE16(ETH_P_IPV6) && header->protocol != switchboardHostToBE16(ETH_P_IP)))
+  {
+    return false;
+  }
+
+  return header->container[0] != 0 && header->container[4] != 0;
+}
+
+static inline bool switchboardWormholeOverlayContainerID(const struct switchboard_wormhole_overlay_header *header,
+                                                         struct container_id *containerID)
+{
+  if (containerID == 0 || switchboardWormholeOverlayHeaderValid(header) == false)
+  {
+    return false;
+  }
+
+  __builtin_memset(containerID, 0, sizeof(*containerID));
+  __builtin_memcpy(containerID->value, header->container, sizeof(containerID->value));
+  containerID->hasID = true;
+  return true;
 }
 
 static inline __u32 switchboardPacketBudgetEthernetHeaderBytes(void)
@@ -143,10 +277,31 @@ static inline __u32 switchboardPacketBudgetIPv6HeaderBytes(void)
   return 40u;
 }
 
+static inline __u32 switchboardPacketBudgetWormholeOverlayHeaderBytes(void)
+{
+  return (__u32)sizeof(struct switchboard_wormhole_overlay_header);
+}
+
+static inline __u64 switchboardWormholeFlowLifetimeNs(__u8 protocol, bool closing)
+{
+  if (protocol == SWITCHBOARD_IP_PROTOCOL_TCP)
+  {
+    return closing ? WORMHOLE_FLOW_CLOSE_NS : WORMHOLE_FLOW_TCP_ESTABLISHED_NS;
+  }
+
+  return WORMHOLE_FLOW_UDP_IDLE_NS;
+}
+
+static inline __u64 switchboardWormholeInitialFlowLifetimeNs(__u8 protocol)
+{
+  (void)protocol;
+  return WORMHOLE_FLOW_EMBRYONIC_NS;
+}
+
 // These helpers describe the L3 bytes Prodigy adds on top of the original
 // packet for the maintained paths. Same-machine delivery and public egress
-// rewrite tuples in place, while cross-machine delivery adds one outer IP
-// header on the datacenter underlay.
+// rewrite tuples in place, while cross-machine delivery adds its outer IP and
+// wormhole-provenance headers on the datacenter underlay.
 static inline __u32 switchboardPacketBudgetExternalIngressLocalDeliveryAddedBytes(void)
 {
   return 0u;
@@ -154,7 +309,17 @@ static inline __u32 switchboardPacketBudgetExternalIngressLocalDeliveryAddedByte
 
 static inline __u32 switchboardPacketBudgetExternalIngressRemoteDeliveryAddedBytes(void)
 {
-  return switchboardPacketBudgetIPv6HeaderBytes();
+  return switchboardPacketBudgetIPv6HeaderBytes() + switchboardPacketBudgetWormholeOverlayHeaderBytes();
+}
+
+static inline __u32 switchboardPacketBudgetExternalIngressRequiredUnderlayMTU(void)
+{
+  return WORMHOLE_PUBLIC_INGRESS_L3_MTU + switchboardPacketBudgetExternalIngressRemoteDeliveryAddedBytes();
+}
+
+static inline bool switchboardPacketBudgetExternalIngressUnderlayMTUValid(__u32 underlayMTU)
+{
+  return underlayMTU >= switchboardPacketBudgetExternalIngressRequiredUnderlayMTU();
 }
 
 static inline __u32 switchboardPacketBudgetPrivateOverlayIPv4AddedBytes(void)
@@ -170,6 +335,14 @@ static inline __u32 switchboardPacketBudgetPrivateOverlayIPv6AddedBytes(void)
 static inline __u32 switchboardPacketBudgetContainerInternetEgressAddedBytes(void)
 {
   return 0u;
+}
+
+static inline __u32 switchboardPacketBudgetRemoteInnerMTU(__u32 underlayMTU, bool wormhole)
+{
+  __u32 overhead = wormhole
+                       ? switchboardPacketBudgetExternalIngressRemoteDeliveryAddedBytes()
+                       : switchboardPacketBudgetPrivateOverlayIPv6AddedBytes();
+  return underlayMTU > overhead ? underlayMTU - overhead : 0u;
 }
 
 static inline __u32 switchboardPacketBudgetTransportHeaderBytes(__u8 protocol)
@@ -220,6 +393,23 @@ static inline __u32 switchboardHostIngressOverlayMinimumLinearBytes(__be16 wire_
   }
 
   return switchboardPacketBudgetEthernetHeaderBytes() + outer_header_bytes + inner_header_bytes + switchboardPacketBudgetTransportHeaderBytes(transport_protocol);
+}
+
+static inline __u32 switchboardHostIngressWormholeOverlayMinimumLinearBytes(__be16 wire_protocol,
+                                                                            __be16 inner_protocol,
+                                                                            __u8 transport_protocol)
+{
+  __u32 outer = wire_protocol == switchboardHostToBE16(ETH_P_IPV6)
+                    ? switchboardPacketBudgetIPv6HeaderBytes()
+                    : (wire_protocol == switchboardHostToBE16(ETH_P_IP) ? switchboardPacketBudgetIPv4HeaderBytes() : 0u);
+  __u32 inner = inner_protocol == switchboardHostToBE16(ETH_P_IPV6)
+                    ? switchboardPacketBudgetIPv6HeaderBytes()
+                    : (inner_protocol == switchboardHostToBE16(ETH_P_IP) ? switchboardPacketBudgetIPv4HeaderBytes() : 0u);
+  __u32 transport = switchboardPacketBudgetTransportHeaderBytes(transport_protocol);
+  return outer == 0u || inner == 0u || transport == 0u
+             ? 0u
+             : switchboardPacketBudgetEthernetHeaderBytes() + outer +
+                   switchboardPacketBudgetWormholeOverlayHeaderBytes() + inner + transport;
 }
 
 static inline __be16 switchboardHostIngressEffectiveProtocol(__be16 wire_protocol, __be16 skb_protocol, bool decapped)

@@ -3,6 +3,7 @@
 #include <switchboard/common/constants.h>
 #include <switchboard/common/local_container_subnet.h>
 #include <switchboard/kernel/jhash.h>
+#include <switchboard/kernel/l4.ports.h>
 #include <switchboard/kernel/services.h>
 #include <switchboard/kernel/layer4.h>
 #include <switchboard/kernel/csum.h>
@@ -15,6 +16,30 @@ enum {
   SWITCHBOARD_PORTAL_TARGET_RESOLVED = 1,
   SWITCHBOARD_PORTAL_TARGET_DROP = -1,
 };
+
+__attribute__((__always_inline__)) static inline bool switchboardPacketPortalDefinition(const struct packet_description *packet,
+                                                                                         bool isIPv6,
+                                                                                         struct portal_definition *portal)
+{
+  if (packet == NULL || portal == NULL || packet->flow.port16[1] == 0 ||
+      (packet->flow.proto != IPPROTO_TCP && packet->flow.proto != IPPROTO_UDP))
+  {
+    return false;
+  }
+
+  bpf_memset(portal, 0, sizeof(*portal));
+  if (isIPv6)
+  {
+    bpf_memcpy(portal->addr6, packet->flow.dstv6, sizeof(portal->addr6));
+  }
+  else
+  {
+    portal->addr4 = packet->flow.dst;
+  }
+  portal->port = packet->flow.port16[1];
+  portal->proto = packet->flow.proto;
+  return true;
+}
 
 __attribute__((__always_inline__)) static inline __u32 switchboardPacketHash(struct packet_description *pckt, bool hash16Bytes)
 {
@@ -184,23 +209,10 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
       return false;
     }
 
-    if (udph->dest != targetPort)
-    {
-      udph->dest = targetPort;
-    }
-
-    if (recompute_ipv6_transport_checksum_in_packet(
-            &udph->check,
-            udph,
-            transportBytes,
-            __builtin_offsetof(struct udphdr, check),
-            ip6h->saddr.s6_addr32,
-            (__be32 *)newAddr6,
-            IPPROTO_UDP,
-            data_end) == false)
-    {
-      return false;
-    }
+    __be16 oldPort = udph->dest;
+    udph->check = replace_l4_checksum(udph->check, ip6h->daddr.s6_addr, newAddr6, sizeof(newAddr6));
+    udph->check = replace_l4_checksum(udph->check, &oldPort, &targetPort, sizeof(targetPort));
+    udph->dest = targetPort;
   }
   else if (pckt->flow.proto == IPPROTO_TCP)
   {
@@ -210,23 +222,10 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
       return false;
     }
 
-    if (tcph->dest != targetPort)
-    {
-      tcph->dest = targetPort;
-    }
-
-    if (recompute_ipv6_transport_checksum_in_packet(
-            &tcph->check,
-            tcph,
-            transportBytes,
-            __builtin_offsetof(struct tcphdr, check),
-            ip6h->saddr.s6_addr32,
-            (__be32 *)newAddr6,
-            IPPROTO_TCP,
-            data_end) == false)
-    {
-      return false;
-    }
+    __be16 oldPort = tcph->dest;
+    tcph->check = replace_l4_checksum(tcph->check, ip6h->daddr.s6_addr, newAddr6, sizeof(newAddr6));
+    tcph->check = replace_l4_checksum(tcph->check, &oldPort, &targetPort, sizeof(targetPort));
+    tcph->dest = targetPort;
   }
   else
   {
@@ -264,7 +263,6 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
     return false;
   }
 
-  const __u64 rewriteFlags = switchboardPacketRewriteManualChecksumDataStoreFlags();
   __be16 oldTargetPort = pckt->flow.port16[1];
 
   if (pckt->flow.proto != IPPROTO_UDP && pckt->flow.proto != IPPROTO_TCP)
@@ -272,17 +270,28 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
     return false;
   }
 
-  if (oldTargetPort != targetPort && bpf_skb_store_bytes(skb, layout.destPortOffset, &targetPort, sizeof(targetPort), rewriteFlags) != 0)
+  __u32 checksumOffset = layout.transportOffset + (pckt->flow.proto == IPPROTO_UDP
+                                                        ? __builtin_offsetof(struct udphdr, check)
+                                                        : __builtin_offsetof(struct tcphdr, check));
+  struct ipv6hdr *ip6h = (struct ipv6hdr *)((__u8 *)data + layout.l3Offset);
+  if ((void *)(ip6h + 1) > data_end ||
+      replace_l4_checksum_ipv6_address_skb(skb,
+                                           checksumOffset,
+                                           pckt->flow.dstv6,
+                                           newAddr6) == false ||
+      (oldTargetPort != targetPort &&
+       replace_l4_checksum_word16_skb(skb, checksumOffset, oldTargetPort, targetPort, 0) != 0))
   {
     return false;
   }
 
-  if (bpf_skb_store_bytes(skb, layout.destAddressOffset, newAddr6, sizeof(newAddr6), rewriteFlags) != 0)
+  const __u64 tupleStoreFlags = switchboardPacketRewriteStoreFlags();
+  if (oldTargetPort != targetPort && bpf_skb_store_bytes(skb, layout.destPortOffset, &targetPort, sizeof(targetPort), tupleStoreFlags) != 0)
   {
     return false;
   }
 
-  if (store_recomputed_ipv6_transport_checksum_skb(skb, pckt->flow.proto) == false)
+  if (bpf_skb_store_bytes(skb, layout.destAddressOffset, newAddr6, sizeof(newAddr6), tupleStoreFlags) != 0)
   {
     return false;
   }
@@ -311,7 +320,7 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
   }
 
   struct iphdr *iph = (struct iphdr *)(eth + 1);
-  if ((void *)(iph + 1) > data_end || iph->ihl != 5)
+  if (switchboard_unfragmented_ipv4(iph, data_end) == false)
   {
     return false;
   }

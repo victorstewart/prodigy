@@ -98,6 +98,7 @@ public:
   uint32_t systemContainerLoadCalls = 0;
   uint32_t mothershipTunnelRuntimeStartCalls = 0;
   uint32_t mothershipTunnelRuntimeStopCalls = 0;
+  uint32_t wormholeRuntimeAckDeadlineArmCalls = 0;
   bool mothershipTunnelRuntimeStartSucceeds = false;
   String lastStoredSystemContainerSha256 = {};
   uint64_t lastStoredSystemContainerBytes = 0;
@@ -110,6 +111,14 @@ public:
   void armMachineNeuronControl(Machine *machine) override
   {
     (void)machine;
+  }
+
+  void armWormholeRuntimeAckDeadline(ContainerView *container) override
+  {
+    if (weAreMaster && container != nullptr && container->wormholeRuntimePendingMachines.empty() == false)
+    {
+      wormholeRuntimeAckDeadlineArmCalls += 1;
+    }
   }
 
   void pushSpinApplicationProgressToMothership(ApplicationDeployment *deployment, const String& message) override
@@ -2452,6 +2461,44 @@ static Message *buildNeuronMessage(String& buffer, NeuronTopic topic, Args&&...a
   buffer.clear();
   Message::construct(buffer, topic, std::forward<Args>(args)...);
   return reinterpret_cast<Message *>(buffer.data());
+}
+
+static bool decodeSwitchboardWormholeOperation(Message *message,
+                                               SwitchboardWormholeOperation& operation,
+                                               Vector<Wormhole>& wormholes)
+{
+  String serialized = {};
+  uint8_t *args = message->args;
+  Message::extractToStringView(args, serialized);
+  return BitseryEngine::deserializeSafe(serialized, operation) &&
+         BitseryEngine::deserializeSafe(operation.desired, wormholes);
+}
+
+static Message *buildNeuronSwitchboardWormholeOperation(String& buffer,
+                                                        uint32_t containerID,
+                                                        const Vector<Wormhole>& wormholes)
+{
+  SwitchboardWormholeOperation operation = {};
+  operation.containerID = containerID;
+  BitseryEngine::serialize(operation.desired, wormholes);
+  (void)prodigyComputeWormholeDesiredStateRevision(containerID, operation.desired, operation.revision);
+  String serialized = {};
+  BitseryEngine::serialize(serialized, operation);
+  return buildNeuronMessage(buffer, NeuronTopic::openSwitchboardWormholes, serialized);
+}
+
+static Message *buildNeuronSwitchboardWormholeAcknowledgement(String& buffer,
+                                                              uint32_t containerID,
+                                                              const String& revision,
+                                                              SwitchboardWormholeOperationStatus status)
+{
+  SwitchboardWormholeOperation operation = {};
+  operation.containerID = containerID;
+  operation.revision = revision;
+  operation.status = status;
+  String serialized = {};
+  BitseryEngine::serialize(serialized, operation);
+  return buildNeuronMessage(buffer, NeuronTopic::openSwitchboardWormholes, serialized);
 }
 
 static Message *buildNeuronContainerPackedMessage(String& buffer, NeuronTopic topic, uint128_t containerUUID, const String& payload)
@@ -7445,8 +7492,24 @@ static void testSwitchboardStateSyncReplaysWhiteholes(TestSuite& suite)
   brain.sendNeuronSwitchboardStateSync(&workerMachine);
 
   bool workerSawOpenWhiteholes = false;
+  uint32_t messageIndex = 0;
+  uint32_t resetIndex = UINT32_MAX;
+  uint32_t emptyWormholeIndex = UINT32_MAX;
   forEachMessageInBuffer(workerMachine.neuron.wBuffer, [&](Message *queued) {
-    if (NeuronTopic(queued->topic) == NeuronTopic::openSwitchboardWhiteholes)
+    if (NeuronTopic(queued->topic) == NeuronTopic::resetSwitchboardState)
+    {
+      resetIndex = messageIndex;
+    }
+    else if (NeuronTopic(queued->topic) == NeuronTopic::openSwitchboardWormholes)
+    {
+      SwitchboardWormholeOperation operation = {};
+      Vector<Wormhole> decoded = {};
+      if (decodeSwitchboardWormholeOperation(queued, operation, decoded) && decoded.empty())
+      {
+        emptyWormholeIndex = messageIndex;
+      }
+    }
+    else if (NeuronTopic(queued->topic) == NeuronTopic::openSwitchboardWhiteholes)
     {
       uint8_t *args = queued->args;
       uint8_t *terminal = queued->terminal();
@@ -7469,9 +7532,12 @@ static void testSwitchboardStateSyncReplaysWhiteholes(TestSuite& suite)
         }
       }
     }
+    ++messageIndex;
   });
 
   suite.expect(workerSawOpenWhiteholes, "switchboard_state_sync_replays_whiteholes_to_container_machine");
+  suite.expect(resetIndex < emptyWormholeIndex,
+               "switchboard_state_sync_resets_stale_exposures_before_empty_authoritative_replay");
 }
 
 static void testQuicWormholeStateRefreshReplaysToNeuronsFollowersAndContainers(TestSuite& suite)
@@ -7546,15 +7612,11 @@ static void testQuicWormholeStateRefreshReplaysToNeuronsFollowersAndContainers(T
   forEachMessageInBuffer(machine.neuron.wBuffer, [&](Message *queued) {
     if (NeuronTopic(queued->topic) == NeuronTopic::openSwitchboardWormholes)
     {
-      uint8_t *args = queued->args;
-      uint32_t containerID = 0;
-      Message::extractArg<ArgumentNature::fixed>(args, containerID);
-
-      String serialized = {};
-      Message::extractToStringView(args, serialized);
-
+      SwitchboardWormholeOperation operation = {};
       Vector<Wormhole> decoded = {};
-      if (containerID == container.generateContainerID() && BitseryEngine::deserializeSafe(serialized, decoded) && decoded.size() == 1 && equalSerializedObjects(decoded[0], deployment.plan.wormholes[0]))
+      if (decodeSwitchboardWormholeOperation(queued, operation, decoded) &&
+          operation.containerID == container.generateContainerID() && decoded.size() == 1 &&
+          equalSerializedObjects(decoded[0], deployment.plan.wormholes[0]))
       {
         sawNeuronOpen = true;
       }
@@ -8088,15 +8150,11 @@ static void testRegisteredRoutablePrefixRefreshReplaysToNeuronsFollowersAndConta
   forEachMessageInBuffer(machine.neuron.wBuffer, [&](Message *queued) {
     if (NeuronTopic(queued->topic) == NeuronTopic::openSwitchboardWormholes)
     {
-      uint8_t *args = queued->args;
-      uint32_t containerID = 0;
-      Message::extractArg<ArgumentNature::fixed>(args, containerID);
-
-      String serialized = {};
-      Message::extractToStringView(args, serialized);
-
+      SwitchboardWormholeOperation operation = {};
       Vector<Wormhole> decoded = {};
-      if (containerID == container.generateContainerID() && BitseryEngine::deserializeSafe(serialized, decoded) && decoded.size() == 1 && equalSerializedObjects(decoded[0], deployment.plan.wormholes[0]))
+      if (decodeSwitchboardWormholeOperation(queued, operation, decoded) &&
+          operation.containerID == container.generateContainerID() && decoded.size() == 1 &&
+          equalSerializedObjects(decoded[0], deployment.plan.wormholes[0]))
       {
         sawNeuronOpen = true;
       }
@@ -8252,14 +8310,11 @@ static void testRegisteredRoutablePrefixWormholesRefreshHostedIngressBeforeOpen(
           openIndex = messageIndex;
         }
 
-        uint8_t *args = queued->args;
-        uint32_t containerID = 0;
-        Message::extractArg<ArgumentNature::fixed>(args, containerID);
-
-        String serialized = {};
-        Message::extractToStringView(args, serialized);
+        SwitchboardWormholeOperation operation = {};
         Vector<Wormhole> decoded = {};
-        if (containerID == container.generateContainerID() && BitseryEngine::deserializeSafe(serialized, decoded) && decoded.size() == 1 && equalSerializedObjects(decoded[0], wormholes[0]))
+        if (decodeSwitchboardWormholeOperation(queued, operation, decoded) &&
+            operation.containerID == container.generateContainerID() && decoded.size() == 1 &&
+            equalSerializedObjects(decoded[0], wormholes[0]))
         {
           openMatchesContainer = true;
         }
@@ -8287,6 +8342,178 @@ static void testRegisteredRoutablePrefixWormholesRefreshHostedIngressBeforeOpen(
 
   assertSwitchboardOpenState(host, true);
   assertSwitchboardOpenState(remote, false);
+}
+
+static void testSwitchboardWormholeFleetAcknowledgementTransaction(TestSuite& suite)
+{
+  TestBrain brain = {};
+  NoopBrainIaaS iaas;
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+
+  Machine active = {};
+  active.uuid = uint128_t(0xA110);
+  active.fragment = 0x110u;
+  active.state = MachineState::healthy;
+  active.neuron.machine = &active;
+  active.neuron.connected = true;
+  active.neuron.isFixedFile = true;
+  active.neuron.fslot = 12;
+  active.neuron.pendingSend = true;
+  brain.machines.insert(&active);
+
+  Machine disconnected = {};
+  disconnected.uuid = uint128_t(0xA220);
+  disconnected.fragment = 0x220u;
+  disconnected.state = MachineState::healthy;
+  disconnected.neuron.machine = &disconnected;
+  brain.machines.insert(&disconnected);
+
+  ContainerView container = {};
+  container.uuid = uint128_t(0xC0A110);
+  container.machine = &active;
+  container.fragment = 7;
+  container.state = ContainerState::healthy;
+  container.runtimeReady = true;
+  brain.containers.insert_or_assign(container.uuid, &container);
+
+  Vector<Wormhole> empty = {};
+  brain.sendNeuronOpenSwitchboardWormholes(&container, empty);
+  suite.expect(container.wormholeRuntimeRevision.size() == 64,
+               "wormhole_fleet_transaction_hashes_empty_desired_state");
+  suite.expect(container.wormholeRuntimePendingMachines.contains(active.fragment) &&
+                   container.wormholeRuntimePendingMachines.contains(disconnected.fragment),
+               "wormhole_fleet_transaction_tracks_connected_and_disconnected_live_machines");
+  suite.expect(container.runtimeReady == false && container.wormholeRuntimeFailureSuppressedReady,
+               "wormhole_fleet_transaction_suppresses_readiness_until_all_acks");
+  suite.expect(disconnected.neuron.wBuffer.empty(),
+               "wormhole_fleet_transaction_defers_disconnected_machine_delivery");
+
+  bool sawEmptyOperation = false;
+  forEachMessageInBuffer(active.neuron.wBuffer, [&](Message *queued) {
+    if (NeuronTopic(queued->topic) != NeuronTopic::openSwitchboardWormholes)
+    {
+      return;
+    }
+    SwitchboardWormholeOperation operation = {};
+    Vector<Wormhole> decoded = {};
+    String expectedRevision = {};
+    sawEmptyOperation = decodeSwitchboardWormholeOperation(queued, operation, decoded) && decoded.empty() &&
+                        operation.status == SwitchboardWormholeOperationStatus::request &&
+                        prodigyComputeWormholeDesiredStateRevision(operation.containerID, operation.desired, expectedRevision) &&
+                        expectedRevision.equals(operation.revision);
+  });
+  suite.expect(sawEmptyOperation, "wormhole_fleet_transaction_sends_digest_bound_empty_operation");
+
+  String inbound = {};
+  brain.neuronHandler(&active.neuron,
+                      buildNeuronSwitchboardWormholeAcknowledgement(inbound,
+                                                                    container.generateContainerID(),
+                                                                    container.wormholeRuntimeRevision,
+                                                                    SwitchboardWormholeOperationStatus::applied));
+  suite.expect(container.wormholeRuntimePendingMachines.size() == 1 &&
+                   container.wormholeRuntimePendingMachines.contains(disconnected.fragment) &&
+                   container.runtimeReady == false,
+               "wormhole_fleet_transaction_waits_for_every_machine");
+
+  String staleRevision = {};
+  for (uint32_t index = 0; index < 64; ++index)
+  {
+    staleRevision.append('0');
+  }
+  brain.neuronHandler(&disconnected.neuron,
+                      buildNeuronSwitchboardWormholeAcknowledgement(inbound,
+                                                                    container.generateContainerID(),
+                                                                    staleRevision,
+                                                                    SwitchboardWormholeOperationStatus::applied));
+  suite.expect(container.wormholeRuntimePendingMachines.contains(disconnected.fragment),
+               "wormhole_fleet_transaction_ignores_stale_ack_digest");
+
+  brain.neuronHandler(&disconnected.neuron,
+                      buildNeuronSwitchboardWormholeAcknowledgement(inbound,
+                                                                    container.generateContainerID(),
+                                                                    container.wormholeRuntimeRevision,
+                                                                    SwitchboardWormholeOperationStatus::rollbackFailed));
+  suite.expect(container.wormholeRuntimePendingMachines.empty() &&
+                   container.wormholeRuntimeFailedMachines.contains(disconnected.fragment) &&
+                   container.runtimeReady == false && container.wormholeRuntimeFailure.empty() == false,
+               "wormhole_fleet_transaction_surfaces_rollback_failure_fail_closed");
+
+  brain.sendNeuronOpenSwitchboardWormholes(&container, empty);
+  brain.neuronHandler(&active.neuron,
+                      buildNeuronSwitchboardWormholeAcknowledgement(inbound,
+                                                                    container.generateContainerID(),
+                                                                    container.wormholeRuntimeRevision,
+                                                                    SwitchboardWormholeOperationStatus::applied));
+  brain.neuronHandler(&disconnected.neuron,
+                      buildNeuronSwitchboardWormholeAcknowledgement(inbound,
+                                                                    container.generateContainerID(),
+                                                                    container.wormholeRuntimeRevision,
+                                                                    SwitchboardWormholeOperationStatus::applied));
+  suite.expect(container.wormholeRuntimePendingMachines.empty() &&
+                   container.wormholeRuntimeFailedMachines.empty() && container.runtimeReady,
+               "wormhole_fleet_transaction_restores_readiness_after_exact_all_machine_acks");
+  brain.neuronHandler(&disconnected.neuron,
+                      buildNeuronSwitchboardWormholeAcknowledgement(inbound,
+                                                                    container.generateContainerID(),
+                                                                    container.wormholeRuntimeRevision,
+                                                                    SwitchboardWormholeOperationStatus::applied));
+  suite.expect(container.runtimeReady && container.wormholeRuntimePendingMachines.empty(),
+               "wormhole_fleet_transaction_duplicate_current_ack_is_idempotent");
+
+  brain.sendNeuronOpenSwitchboardWormholes(&container, empty);
+  brain.failWormholeRuntimeAckDeadline(&container);
+  suite.expect(container.wormholeRuntimePendingMachines.empty() &&
+                   container.wormholeRuntimeFailedMachines.contains(active.fragment) &&
+                   container.wormholeRuntimeFailedMachines.contains(disconnected.fragment) &&
+                   container.runtimeReady == false,
+               "wormhole_fleet_transaction_missing_ack_deadline_fails_every_pending_machine");
+  disconnected.state = MachineState::hardwareFailure;
+  brain.retireWormholeRuntimeMachine(&disconnected);
+  suite.expect(container.wormholeRuntimeFailedMachines.size() == 1 &&
+                   container.wormholeRuntimeFailedMachines.contains(active.fragment) && container.runtimeReady == false,
+               "wormhole_fleet_transaction_retires_failed_machine_from_ack_gate");
+  active.state = MachineState::decommissioning;
+  brain.retireWormholeRuntimeMachine(&active);
+  suite.expect(container.wormholeRuntimeFailedMachines.empty() && container.runtimeReady &&
+                   container.wormholeRuntimeFailureSuppressedReady == false,
+               "wormhole_fleet_transaction_restores_readiness_after_last_ineligible_machine_retires");
+  active.state = MachineState::healthy;
+  disconnected.state = MachineState::healthy;
+
+  container.runtimeReady = false;
+  container.wormholeRuntimeFailureSuppressedReady = false;
+  brain.sendNeuronOpenSwitchboardWormholes(&container, empty);
+  brain.neuronHandler(&active.neuron,
+                      buildNeuronSwitchboardWormholeAcknowledgement(inbound,
+                                                                    container.generateContainerID(),
+                                                                    container.wormholeRuntimeRevision,
+                                                                    SwitchboardWormholeOperationStatus::applied));
+  brain.neuronHandler(&disconnected.neuron,
+                      buildNeuronSwitchboardWormholeAcknowledgement(inbound,
+                                                                    container.generateContainerID(),
+                                                                    container.wormholeRuntimeRevision,
+                                                                    SwitchboardWormholeOperationStatus::applied));
+  suite.expect(container.wormholeRuntimePendingMachines.empty() &&
+                   container.wormholeRuntimeFailedMachines.empty() && container.runtimeReady == false,
+               "wormhole_fleet_transaction_does_not_override_unrelated_not_ready_state");
+
+  brain.sendNeuronOpenSwitchboardWormholes(&container, empty);
+  brain.noteLocalContainerRuntimeReady(container.uuid);
+  suite.expect(container.runtimeReady == false && container.wormholeRuntimeFailureSuppressedReady,
+               "wormhole_fleet_transaction_latches_runtime_ready_while_acknowledgements_are_pending");
+  brain.neuronHandler(&active.neuron,
+                      buildNeuronSwitchboardWormholeAcknowledgement(inbound,
+                                                                    container.generateContainerID(),
+                                                                    container.wormholeRuntimeRevision,
+                                                                    SwitchboardWormholeOperationStatus::applied));
+  brain.neuronHandler(&disconnected.neuron,
+                      buildNeuronSwitchboardWormholeAcknowledgement(inbound,
+                                                                    container.generateContainerID(),
+                                                                    container.wormholeRuntimeRevision,
+                                                                    SwitchboardWormholeOperationStatus::applied));
+  suite.expect(container.runtimeReady && container.wormholeRuntimeFailureSuppressedReady == false,
+               "wormhole_fleet_transaction_promotes_latched_runtime_ready_after_exact_all_machine_acks");
 }
 
 static void testApplyReplicatedDeploymentPlanLiveStateUpdatesTrackedContainers(TestSuite& suite)
@@ -15275,13 +15502,10 @@ static void testNeuronOpenSwitchboardWormholesSyncsOwningRuntime(TestSuite& suit
       Vector<Wormhole> wormholes = {};
       wormholes.push_back(wormhole);
 
-      String wormholePayload = {};
-      BitseryEngine::serialize(wormholePayload, wormholes);
-
       uint32_t containerID = fixture.brain.neuron.generateLocalContainerIDForTest(fixture.container.plan.fragment);
 
       String inbound = {};
-      buildNeuronMessage(inbound, NeuronTopic::openSwitchboardWormholes, containerID, wormholePayload);
+      buildNeuronSwitchboardWormholeOperation(inbound, containerID, wormholes);
       suite.require(
           seedBrainInboundForTest(suite, fixture.brain.neuron, "neuron_open_switchboard_wormholes_local_owner", inbound),
           "neuron_open_switchboard_wormholes_local_owner_seeds_inbound");
@@ -15326,13 +15550,10 @@ static void testNeuronOpenSwitchboardWormholesSyncsOwningRuntime(TestSuite& suit
       Vector<Wormhole> wormholes = {};
       wormholes.push_back(wormhole);
 
-      String wormholePayload = {};
-      BitseryEngine::serialize(wormholePayload, wormholes);
-
       uint32_t remoteContainerID = fixture.brain.neuron.generateLocalContainerIDForTest(uint8_t(0x57));
 
       String inbound = {};
-      buildNeuronMessage(inbound, NeuronTopic::openSwitchboardWormholes, remoteContainerID, wormholePayload);
+      buildNeuronSwitchboardWormholeOperation(inbound, remoteContainerID, wormholes);
       suite.require(
           seedBrainInboundForTest(suite, fixture.brain.neuron, "neuron_open_switchboard_wormholes_remote_owner", inbound),
           "neuron_open_switchboard_wormholes_remote_owner_seeds_inbound");
@@ -16417,7 +16638,7 @@ static void testBrainReplicatedContainerRuntimeStateRestoresTakeoverView(TestSui
   TestBrain brain = {};
   NoopBrainIaaS iaas = {};
   brain.iaas = &iaas;
-  brain.weAreMaster = true;
+  brain.weAreMaster = false;
   brain.ignited = true;
   brain.brainConfig.datacenterFragment = 1;
 
@@ -16442,6 +16663,18 @@ static void testBrainReplicatedContainerRuntimeStateRestoresTakeoverView(TestSui
   brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
   brain.neurons.insert(&machine.neuron);
 
+  Machine offline = {};
+  offline.uuid = uint128_t(0x5217);
+  offline.private4 = 0x0A00003B;
+  offline.state = MachineState::healthy;
+  offline.runtimeReady = true;
+  offline.fragment = 0x1245;
+  offline.rack = &rack;
+  offline.neuron.machine = &offline;
+  brain.machines.insert(&offline);
+  brain.machinesByUUID.insert_or_assign(offline.uuid, &offline);
+  brain.neurons.insert(&offline.neuron);
+
   ApplicationDeployment deployment = {};
   deployment.plan = makeDeploymentPlan(62'023, 1);
   deployment.plan.stateless.nBase = 1;
@@ -16457,7 +16690,7 @@ static void testBrainReplicatedContainerRuntimeStateRestoresTakeoverView(TestSui
   seed.machine = &machine;
   seed.lifetime = ApplicationLifetime::base;
   seed.state = ContainerState::healthy;
-  seed.runtimeReady = true;
+  seed.runtimeReady = false;
   seed.fragment = 9;
   seed.createdAtMs = 123'461;
   seed.runtime_nLogicalCores = 2;
@@ -16471,6 +16704,36 @@ static void testBrainReplicatedContainerRuntimeStateRestoresTakeoverView(TestSui
   runtimeState.runtimeLogicalCores = seed.runtime_nLogicalCores;
   runtimeState.runtimeMemoryMB = seed.runtime_memoryMB;
   runtimeState.runtimeStorageMB = seed.runtime_storageMB;
+  Vector<Wormhole> desiredWormholes = {};
+  BitseryEngine::serialize(runtimeState.wormholeRuntimeDesired, desiredWormholes);
+  suite.expect(prodigyComputeWormholeDesiredStateRevision(seed.generateContainerID(),
+                                                          runtimeState.wormholeRuntimeDesired,
+                                                          runtimeState.wormholeRuntimeRevision),
+               "brain_replicated_runtime_state_builds_wormhole_revision");
+  runtimeState.wormholeRuntimePendingMachines.push_back(machine.fragment);
+  runtimeState.wormholeRuntimeFailedMachines.push_back(offline.fragment);
+  runtimeState.wormholeRuntimeFailure.assign("offline wormhole runtime"_ctv);
+  runtimeState.wormholeRuntimeFailureSuppressedReady = true;
+
+  BrainReplicatedContainerRuntimeState invalidRuntimeState = runtimeState;
+  invalidRuntimeState.wormholeRuntimeRevision[0] = invalidRuntimeState.wormholeRuntimeRevision[0] == '0' ? '1' : '0';
+  suite.expect(brain.replicatedWormholeRuntimeStateValid(invalidRuntimeState, &machine) == false,
+               "brain_replicated_runtime_state_rejects_mismatched_wormhole_digest");
+  brain.applyReplicatedContainerRuntimeState(invalidRuntimeState);
+  suite.expect(brain.pendingReplicatedContainerRuntimeStates.empty(),
+               "brain_replicated_runtime_state_discards_invalid_state_instead_of_deferring_it");
+  invalidRuntimeState = runtimeState;
+  invalidRuntimeState.wormholeRuntimeDesired.assign("not a serialized wormhole fleet"_ctv);
+  suite.require(prodigyComputeWormholeDesiredStateRevision(seed.generateContainerID(),
+                                                            invalidRuntimeState.wormholeRuntimeDesired,
+                                                            invalidRuntimeState.wormholeRuntimeRevision),
+                "brain_replicated_runtime_state_builds_malformed_desired_digest");
+  suite.expect(brain.replicatedWormholeRuntimeStateValid(invalidRuntimeState, &machine) == false,
+               "brain_replicated_runtime_state_rejects_malformed_wormhole_desired_state");
+  invalidRuntimeState = runtimeState;
+  invalidRuntimeState.wormholeRuntimeDesired.resize(SwitchboardWormholeOperation::maximumDesiredBytes + 1u);
+  suite.expect(brain.replicatedWormholeRuntimeStateValid(invalidRuntimeState, &machine) == false,
+               "brain_replicated_runtime_state_rejects_oversized_wormhole_desired_state");
 
   String serialized = {};
   BitseryEngine::serialize(serialized, runtimeState);
@@ -16485,11 +16748,69 @@ static void testBrainReplicatedContainerRuntimeStateRestoresTakeoverView(TestSui
   suite.expect(restored != nullptr, "brain_replicated_runtime_state_restores_container");
   suite.expect(restored != nullptr && restored->machine == &machine, "brain_replicated_runtime_state_restores_machine");
   suite.expect(restored != nullptr && restored->state == ContainerState::healthy, "brain_replicated_runtime_state_restores_healthy_state");
-  suite.expect(restored != nullptr && restored->runtimeReady == true, "brain_replicated_runtime_state_restores_runtime_ready");
+  suite.expect(restored != nullptr && restored->runtimeReady == false &&
+                   restored->wormholeRuntimeRevision.equals(runtimeState.wormholeRuntimeRevision) &&
+                   restored->wormholeRuntimeDesired.equals(runtimeState.wormholeRuntimeDesired),
+               "brain_replicated_runtime_state_restores_exact_wormhole_transaction");
+  suite.expect(restored != nullptr &&
+                   restored->wormholeRuntimePendingMachines.contains(machine.fragment) &&
+                   restored->wormholeRuntimeFailedMachines.contains(offline.fragment) &&
+                   restored->wormholeRuntimeFailureSuppressedReady &&
+                   brain.wormholeRuntimeAckDeadlineArmCalls == 0,
+               "brain_replicated_runtime_state_keeps_follower_timeout_local_and_disarmed");
   suite.expect(deployment.containers.contains(restored), "brain_replicated_runtime_state_indexes_deployment");
   suite.expect(machine.containersByDeploymentID.contains(deployment.plan.config.deploymentID()), "brain_replicated_runtime_state_indexes_machine");
   suite.expect(deployment.nDeployedBase == 1, "brain_replicated_runtime_state_rebuilds_deployed_count");
   suite.expect(deployment.nHealthyBase == 1, "brain_replicated_runtime_state_rebuilds_healthy_count");
+
+  if (restored != nullptr)
+  {
+    brain.weAreMaster = true;
+    brain.sendNeuronSwitchboardStateSync(&machine);
+    bool replayedExactDesired = false;
+    forEachMessageInBuffer(machine.neuron.wBuffer, [&](Message *queued) {
+      if (NeuronTopic(queued->topic) != NeuronTopic::openSwitchboardWormholes)
+      {
+        return;
+      }
+      SwitchboardWormholeOperation operation = {};
+      Vector<Wormhole> decoded = {};
+      replayedExactDesired = decodeSwitchboardWormholeOperation(queued, operation, decoded) &&
+                             operation.revision.equals(runtimeState.wormholeRuntimeRevision) &&
+                             operation.desired.equals(runtimeState.wormholeRuntimeDesired) && decoded.empty();
+    });
+    suite.expect(replayedExactDesired && brain.wormholeRuntimeAckDeadlineArmCalls > 0,
+                 "brain_replicated_runtime_state_master_replays_exact_desired_and_rearms_deadline");
+
+    String acknowledgement = {};
+    brain.neuronHandler(&machine.neuron,
+                        buildNeuronSwitchboardWormholeAcknowledgement(acknowledgement,
+                                                                      restored->generateContainerID(),
+                                                                      restored->wormholeRuntimeRevision,
+                                                                      SwitchboardWormholeOperationStatus::applied));
+    suite.expect(restored->wormholeRuntimePendingMachines.empty() &&
+                     restored->wormholeRuntimeFailedMachines.contains(offline.fragment) &&
+                     restored->runtimeReady == false,
+                 "brain_replicated_runtime_state_preserves_offline_failure_after_partial_takeover_heal");
+
+    offline.neuron.connected = true;
+    offline.neuron.isFixedFile = true;
+    offline.neuron.fslot = 42;
+    offline.neuron.pendingSend = true;
+    brain.sendNeuronSwitchboardStateSync(&offline);
+    suite.expect(restored->wormholeRuntimePendingMachines.contains(offline.fragment) &&
+                     restored->wormholeRuntimeFailedMachines.contains(offline.fragment) == false,
+                 "brain_replicated_runtime_state_retries_only_reconnected_failed_machine");
+    brain.neuronHandler(&offline.neuron,
+                        buildNeuronSwitchboardWormholeAcknowledgement(acknowledgement,
+                                                                      restored->generateContainerID(),
+                                                                      restored->wormholeRuntimeRevision,
+                                                                      SwitchboardWormholeOperationStatus::applied));
+    suite.expect(restored->wormholeRuntimePendingMachines.empty() &&
+                     restored->wormholeRuntimeFailedMachines.empty() && restored->runtimeReady &&
+                     restored->wormholeRuntimeFailureSuppressedReady == false,
+                 "brain_replicated_runtime_state_full_takeover_heal_restores_suppressed_readiness");
+  }
 
   if (restored != nullptr)
   {
@@ -16502,8 +16823,11 @@ static void testBrainReplicatedContainerRuntimeStateRestoresTakeoverView(TestSui
   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
   brain.deployments.erase(deployment.plan.config.deploymentID());
   brain.neurons.erase(&machine.neuron);
+  brain.neurons.erase(&offline.neuron);
   brain.machinesByUUID.erase(machine.uuid);
+  brain.machinesByUUID.erase(offline.uuid);
   brain.machines.erase(&machine);
+  brain.machines.erase(&offline);
   thisBrain = previousBrain;
 }
 
@@ -19895,6 +20219,7 @@ int main(void)
   testWormholeAddressLeaseReleaseAndUpgradeTransfer(suite);
   testRegisteredRoutablePrefixRefreshReplaysToNeuronsFollowersAndContainers(suite);
   testRegisteredRoutablePrefixWormholesRefreshHostedIngressBeforeOpen(suite);
+  testSwitchboardWormholeFleetAcknowledgementTransaction(suite);
   testApplyReplicatedDeploymentPlanLiveStateUpdatesTrackedContainers(suite);
   testApplyReplicatedDeploymentPlanCleansTlsResumptionState(suite);
   testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(suite);

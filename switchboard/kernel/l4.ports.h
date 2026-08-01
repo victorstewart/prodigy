@@ -7,6 +7,12 @@ struct switchboard_l4_ports {
   bool udpChecksumPresent;
 };
 
+__attribute__((__always_inline__)) static inline bool switchboard_unfragmented_ipv4(const struct iphdr *iph, void *data_end)
+{
+  return iph != NULL && (void *)(iph + 1) <= data_end && iph->ihl == 5 &&
+         (bpf_ntohs(iph->frag_off) & 0x3fffu) == 0;
+}
+
 __attribute__((__always_inline__)) static inline bool switchboard_parse_l4_ports(void *l4, void *data_end, __u8 proto, __u32 l4Offset, struct switchboard_l4_ports *ports)
 {
   if (ports == NULL)

@@ -8,8 +8,40 @@
 #include <switchboard/kernel/overlay.encap.h>
 #include <switchboard/kernel/overlay.routing.h>
 #include <switchboard/kernel/whitehole.routing.h>
+#include <switchboard/kernel/wormhole.flow.h>
 
-__attribute__((__always_inline__)) static inline bool switchboardRewriteWormholeSourceIPv6SKB(struct __sk_buff *skb)
+__attribute__((__always_inline__)) static inline bool switchboardRewriteWormholeIPv6SourceTupleSKB(
+    struct __sk_buff *skb,
+    const struct switchboard_ipv6_skb_layout *layout,
+    const struct ipv6hdr *ip6h,
+    const struct switchboard_wormhole_egress_binding *binding,
+    __u32 checksumOffset,
+    __be16 oldSourcePort)
+{
+  __be32 oldAddress[4] = {};
+  bpf_memcpy(oldAddress, ip6h->saddr.s6_addr32, sizeof(oldAddress));
+  if (bpf_memcmp(oldAddress, binding->addr6, sizeof(oldAddress)) != 0 &&
+      replace_l4_checksum_ipv6_address_skb(skb, checksumOffset, oldAddress, binding->addr6) == false)
+  {
+    return false;
+  }
+  if (oldSourcePort != binding->port &&
+      replace_l4_checksum_word16_skb(skb, checksumOffset, oldSourcePort, binding->port, 0) != 0)
+  {
+    return false;
+  }
+
+  const __u64 rewriteFlags = switchboardPacketRewriteStoreFlags();
+  if (oldSourcePort != binding->port &&
+      bpf_skb_store_bytes(skb, layout->sourcePortOffset, &binding->port, sizeof(binding->port), rewriteFlags) != 0)
+  {
+    return false;
+  }
+  return bpf_memcmp(oldAddress, binding->addr6, sizeof(oldAddress)) == 0 ||
+         bpf_skb_store_bytes(skb, layout->sourceAddressOffset, binding->addr6, sizeof(binding->addr6), rewriteFlags) == 0;
+}
+
+__attribute__((__always_inline__)) static inline int switchboardRewriteWormholeSourceIPv6SKB(struct __sk_buff *skb)
 {
   void *data = (void *)(long)skb->data;
   void *data_end = (void *)(long)skb->data_end;
@@ -17,67 +49,42 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
 
   if (switchboardResolveIPv6SKBLayout(data, data_end, skb->protocol, &layout) == false)
   {
-    return false;
+    return SWITCHBOARD_WORMHOLE_REPLY_NONE;
   }
 
   struct ipv6hdr *ip6h = (struct ipv6hdr *)((__u8 *)data + layout.l3Offset);
   if ((void *)(ip6h + 1) > data_end)
   {
-    return false;
+    return SWITCHBOARD_WORMHOLE_REPLY_NONE;
   }
 
-  if (switchboardWormholeSourceRewriteEligibleIPv6(ip6h->saddr.s6_addr, ip6h->daddr.s6_addr) == false)
+  struct switchboard_wormhole_egress_binding binding = {};
+  int disposition = switchboardWormholeReplyDispositionIPv6(ip6h, data_end, &binding);
+  if (disposition != SWITCHBOARD_WORMHOLE_REPLY_PUBLIC)
   {
-    return false;
+    return disposition;
   }
-
-  struct switchboard_wormhole_egress_key key;
-  // This hash key is 10 bytes with padding. The peer-program lookup must zero
-  // the full object before populating fields or the map lookup can miss even
-  // when the visible container/port/proto fields match the installed entry.
-  bpf_memset(&key, 0, sizeof(key));
-  key.proto = ip6h->nexthdr;
-  bpf_memcpy(key.container, ip6h->saddr.s6_addr + 11, sizeof(key.container));
 
   if (ip6h->nexthdr == IPPROTO_UDP)
   {
     struct udphdr *udph = (struct udphdr *)(ip6h + 1);
     if ((void *)(udph + 1) > data_end)
     {
-      return false;
+      return SWITCHBOARD_WORMHOLE_REPLY_DROP;
     }
 
-    key.port = udph->source;
-    struct switchboard_wormhole_egress_binding *binding = bpf_map_lookup_elem(&wh_egress, &key);
-    if (binding == NULL)
-    {
-      return false;
-    }
-
-    if (binding->is_ipv6 == 0 || binding->proto != IPPROTO_UDP)
-    {
-      return false;
-    }
-
-    const __u64 rewriteFlags = switchboardPacketRewriteManualChecksumDataStoreFlags();
     __be16 oldSourcePort = udph->source;
-
-    if (oldSourcePort != binding->port && bpf_skb_store_bytes(skb, layout.sourcePortOffset, &binding->port, sizeof(binding->port), rewriteFlags) != 0)
+    if (switchboardRewriteWormholeIPv6SourceTupleSKB(skb,
+                                                     &layout,
+                                                     ip6h,
+                                                     &binding,
+                                                     layout.transportOffset + __builtin_offsetof(struct udphdr, check),
+                                                     oldSourcePort) == false)
     {
-      return false;
+      return SWITCHBOARD_WORMHOLE_REPLY_DROP;
     }
 
-    if (bpf_skb_store_bytes(skb, layout.sourceAddressOffset, binding->addr6, sizeof(binding->addr6), rewriteFlags) != 0)
-    {
-      return false;
-    }
-
-    if (store_recomputed_ipv6_transport_checksum_skb(skb, IPPROTO_UDP) == false)
-    {
-      return false;
-    }
-
-    return true;
+    return SWITCHBOARD_WORMHOLE_REPLY_PUBLIC;
   }
 
   if (ip6h->nexthdr == IPPROTO_TCP)
@@ -85,53 +92,34 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
     struct tcphdr *tcph = (struct tcphdr *)(ip6h + 1);
     if ((void *)(tcph + 1) > data_end)
     {
-      return false;
+      return SWITCHBOARD_WORMHOLE_REPLY_DROP;
     }
 
-    key.port = tcph->source;
-    struct switchboard_wormhole_egress_binding *binding = bpf_map_lookup_elem(&wh_egress, &key);
-    if (binding == NULL)
-    {
-      return false;
-    }
-
-    if (binding->is_ipv6 == 0 || binding->proto != IPPROTO_TCP)
-    {
-      return false;
-    }
-
-    const __u64 rewriteFlags = switchboardPacketRewriteManualChecksumDataStoreFlags();
     __be16 oldSourcePort = tcph->source;
-
-    if (oldSourcePort != binding->port && bpf_skb_store_bytes(skb, layout.sourcePortOffset, &binding->port, sizeof(binding->port), rewriteFlags) != 0)
+    if (switchboardRewriteWormholeIPv6SourceTupleSKB(skb,
+                                                     &layout,
+                                                     ip6h,
+                                                     &binding,
+                                                     layout.transportOffset + __builtin_offsetof(struct tcphdr, check),
+                                                     oldSourcePort) == false)
     {
-      return false;
+      return SWITCHBOARD_WORMHOLE_REPLY_DROP;
     }
 
-    if (bpf_skb_store_bytes(skb, layout.sourceAddressOffset, binding->addr6, sizeof(binding->addr6), rewriteFlags) != 0)
-    {
-      return false;
-    }
-
-    if (store_recomputed_ipv6_transport_checksum_skb(skb, IPPROTO_TCP) == false)
-    {
-      return false;
-    }
-
-    return true;
+    return SWITCHBOARD_WORMHOLE_REPLY_PUBLIC;
   }
 
-  return false;
+  return SWITCHBOARD_WORMHOLE_REPLY_DROP;
 }
 
-__attribute__((__always_inline__)) static inline bool switchboardRewriteWormholeSourceIPv4SKB(struct __sk_buff *skb)
+__attribute__((__always_inline__)) static inline int switchboardRewriteWormholeSourceIPv4SKB(struct __sk_buff *skb)
 {
   void *data = (void *)(long)skb->data;
   void *data_end = (void *)(long)skb->data_end;
 
   if (data == NULL || data_end == NULL || skb->protocol != bpf_htons(ETH_P_IP))
   {
-    return false;
+    return SWITCHBOARD_WORMHOLE_REPLY_NONE;
   }
 
   struct ethhdr *eth = (struct ethhdr *)data;
@@ -142,45 +130,33 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
   }
 
   struct iphdr *iph = (struct iphdr *)((__u8 *)data + l3Offset);
-  if ((void *)(iph + 1) > data_end || iph->ihl != 5)
+  if (switchboard_unfragmented_ipv4(iph, data_end) == false)
   {
-    return false;
+    return SWITCHBOARD_WORMHOLE_REPLY_DROP;
   }
 
   __u8 proto = iph->protocol;
   if (proto != IPPROTO_UDP && proto != IPPROTO_TCP)
   {
-    return false;
+    return SWITCHBOARD_WORMHOLE_REPLY_NONE;
+  }
+
+  struct switchboard_wormhole_egress_binding binding = {};
+  int disposition = switchboardWormholeReplyDispositionIPv4(iph, data_end, &binding);
+  if (disposition != SWITCHBOARD_WORMHOLE_REPLY_PUBLIC)
+  {
+    return disposition;
   }
 
   __u32 l4Offset = l3Offset + sizeof(struct iphdr);
   struct switchboard_l4_ports l4 = {};
   if (switchboard_parse_l4_ports((__u8 *)data + l4Offset, data_end, proto, l4Offset, &l4) == false)
   {
-    return false;
+    return SWITCHBOARD_WORMHOLE_REPLY_DROP;
   }
 
-  struct switchboard_wormhole_egress4_key key;
-  bpf_memset(&key, 0, sizeof(key));
-  key.addr = iph->saddr;
-  key.port = l4.source;
-  key.proto = proto;
-
-  struct switchboard_wormhole_egress_binding *binding = bpf_map_lookup_elem(&wh_egress4, &key);
-  if (binding == NULL)
-  {
-    return false;
-  }
-
-  __u8 bindingIsIPv6 = binding->is_ipv6;
-  __u8 bindingProto = binding->proto;
-  __be32 bindingAddress = binding->addr4;
-  __be16 bindingPort = binding->port;
-
-  if (bindingIsIPv6 != 0 || bindingProto != proto)
-  {
-    return false;
-  }
+  __be32 bindingAddress = binding.addr4;
+  __be16 bindingPort = binding.port;
 
   const __u64 rewriteFlags = switchboardPacketRewriteStoreFlags();
   __be32 oldSourceAddress = iph->saddr;
@@ -199,7 +175,7 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
                             sizeof(bindingAddress),
                             rewriteFlags) != 0)
     {
-      return false;
+      return SWITCHBOARD_WORMHOLE_REPLY_DROP;
     }
 
     if (proto == IPPROTO_TCP || l4.udpChecksumPresent)
@@ -210,7 +186,7 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
                                          bindingAddress,
                                          BPF_F_PSEUDO_HDR) != 0)
       {
-        return false;
+        return SWITCHBOARD_WORMHOLE_REPLY_DROP;
       }
     }
   }
@@ -223,7 +199,7 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
                             sizeof(bindingPort),
                             rewriteFlags) != 0)
     {
-      return false;
+      return SWITCHBOARD_WORMHOLE_REPLY_DROP;
     }
 
     if (proto == IPPROTO_TCP || l4.udpChecksumPresent)
@@ -234,12 +210,12 @@ __attribute__((__always_inline__)) static inline bool switchboardRewriteWormhole
                                          bindingPort,
                                          0) != 0)
       {
-        return false;
+        return SWITCHBOARD_WORMHOLE_REPLY_DROP;
       }
     }
   }
 
-  return true;
+  return SWITCHBOARD_WORMHOLE_REPLY_PUBLIC;
 }
 
 __attribute__((__always_inline__)) static inline int switchboardMaybeLearnWhiteholeIPv4(struct ethhdr *eth, void *data_end)
@@ -413,7 +389,11 @@ __attribute__((__always_inline__)) static inline int switchboardRouteOutboundEth
 
   if (eth->h_proto == BE_ETH_P_IP)
   {
-    (void)switchboardRewriteWormholeSourceIPv4SKB(skb);
+    if (skb->mark != SWITCHBOARD_WORMHOLE_REPLY_VALIDATED_SKB_MARK &&
+        switchboardRewriteWormholeSourceIPv4SKB(skb) == SWITCHBOARD_WORMHOLE_REPLY_DROP)
+    {
+      return TC_ACT_SHOT;
+    }
 
     data_end = (void *)(long)skb->data_end;
     eth = (struct ethhdr *)(long)skb->data;
@@ -439,7 +419,11 @@ __attribute__((__always_inline__)) static inline int switchboardRouteOutboundEth
 
   if (eth->h_proto == BE_ETH_P_IPV6)
   {
-    (void)switchboardRewriteWormholeSourceIPv6SKB(skb);
+    if (skb->mark != SWITCHBOARD_WORMHOLE_REPLY_VALIDATED_SKB_MARK &&
+        switchboardRewriteWormholeSourceIPv6SKB(skb) == SWITCHBOARD_WORMHOLE_REPLY_DROP)
+    {
+      return TC_ACT_SHOT;
+    }
 
     data_end = (void *)(long)skb->data_end;
     eth = (struct ethhdr *)(long)skb->data;

@@ -13,6 +13,7 @@
 #include <net/if.h>
 #include <net/route.h>
 #include <sys/resource.h>
+#include <sys/random.h>
 #include <unistd.h>
 #include <stdarg.h>
 
@@ -29,6 +30,7 @@
 #include <ebpf/common/structs.h>
 
 #include <prodigy/quic.cid.generator.h>
+#include <prodigy/bundle.artifact.h>
 #include <prodigy/neuron/base.h>
 #include <prodigy/neuron/containers.h>
 #include <prodigy/netdev.detect.h>
@@ -113,12 +115,43 @@ public:
   switchboard_wormhole_egress_binding binding = {};
 };
 
+static inline bool switchboardGenerateWormholeOwnerGeneration(uint64_t& generation)
+{
+  do
+  {
+    uint8_t *output = reinterpret_cast<uint8_t *>(&generation);
+    size_t remaining = sizeof(generation);
+    while (remaining > 0)
+    {
+      ssize_t bytes = getrandom(output, remaining, 0);
+      if (bytes < 0)
+      {
+        if (errno == EINTR)
+        {
+          continue;
+        }
+        generation = 0;
+        return false;
+      }
+      if (bytes == 0)
+      {
+        generation = 0;
+        return false;
+      }
+      output += bytes;
+      remaining -= size_t(bytes);
+    }
+  } while (generation == 0);
+  return true;
+}
+
 static inline bool switchboardBuildWormholeEgressBinding(const IPAddress& externalAddress,
                                                          uint16_t externalPort,
                                                          uint8_t proto,
+                                                         uint64_t ownerGeneration,
                                                          switchboard_wormhole_egress_binding& binding)
 {
-  if (externalPort == 0 || proto == 0)
+  if (externalPort == 0 || proto == 0 || ownerGeneration == 0)
   {
     binding = {};
     return false;
@@ -128,6 +161,7 @@ static inline bool switchboardBuildWormholeEgressBinding(const IPAddress& extern
   binding.port = htons(externalPort);
   binding.proto = proto;
   binding.is_ipv6 = externalAddress.is6 ? 1 : 0;
+  binding.owner_generation = ownerGeneration;
   std::memcpy(binding.addr6, externalAddress.v6, sizeof(binding.addr6));
   return true;
 }
@@ -351,6 +385,8 @@ public:
   uint8_t proto;
   ServiceUserCapacity userCapacity;
   uint32_t weight = 1;
+  uint64_t ownerGeneration = 0;
+  ::Wormhole definition = {};
   SwitchboardPortal *portal;
 
   uint64_t hash(void) const
@@ -396,9 +432,7 @@ private:
 
   EthDevice& eth;
   BPFProgram *bpf_router = nullptr;
-#if NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE
   BPFProgram *host_ingress = nullptr;
-#endif
   BPFProgram *host_egress = nullptr;
   struct local_container_subnet6 subnet = {};
 
@@ -411,6 +445,7 @@ private:
 
   bytell_hash_set<SwitchboardPortal *> portals;
   bytell_hash_subset<uint32_t, switchboard_runtime::Wormhole *> wormholesByContainer;
+  bytell_hash_map<uint32_t, String> wormholeRevisionByContainer;
   bytell_hash_subset<uint32_t, switchboard_runtime::Whitehole *> whiteholesByContainer;
   Vector<uint32_t> portalSlots;
 
@@ -937,6 +972,7 @@ private:
         if (buildWormholeEgressKey(wormhole->containerID, wormhole->port, wormhole->proto, desired.key) == false || switchboardBuildWormholeEgressBinding(wormhole->portal->address,
                                                                                                                                                           wormhole->portal->port,
                                                                                                                                                           wormhole->proto,
+                                                                                                                                                          wormhole->ownerGeneration,
                                                                                                                                                           desired.binding) == false)
         {
           continue;
@@ -952,6 +988,7 @@ private:
             switchboardBuildWormholeEgressBinding(wormhole->portal->address,
                                                   wormhole->portal->port,
                                                   wormhole->proto,
+                                                  wormhole->ownerGeneration,
                                                   desired4.binding))
         {
           desiredBindings4.push_back(desired4);
@@ -1080,6 +1117,7 @@ private:
     if (switchboardBuildWormholeEgressBinding(wormholeSwitchboardAddress(requestedWormhole),
                                               requestedWormhole.externalPort,
                                               requestedWormhole.layer4,
+                                              wormhole->ownerGeneration,
                                               binding) == false)
     {
       return false;
@@ -1999,7 +2037,6 @@ private:
   // the selected final destination must not depend on that entry point.
   void syncHostIngressPortalRouting(void)
   {
-#if NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE
     if (host_ingress == nullptr)
     {
       return;
@@ -2043,7 +2080,6 @@ private:
     }
 
     (void)syncPortalTargetBindingsForProgram(host_ingress, "host-ingress-sync");
-#endif
   }
 
   void syncAllPeerProgramRuntimeRouting(void)
@@ -2051,6 +2087,25 @@ private:
     forEachActivePeerProgram([&](BPFProgram *program) -> void {
       syncPeerProgramRuntimeRouting(program);
     });
+  }
+
+  void syncAllContainerProgramRuntimeState(void)
+  {
+    if (thisNeuron == nullptr)
+    {
+      return;
+    }
+
+    for (const auto& [uuid, container] : thisNeuron->containers)
+    {
+      (void)uuid;
+      if (container == nullptr || container->plan.useHostNetworkNamespace || container->netdevs.areActive() == false ||
+          container->peer_program == nullptr || container->primary_program == nullptr)
+      {
+        continue;
+      }
+      syncContainerProgramRuntimeState(container->peer_program, container->primary_program);
+    }
   }
 
   void closeWormhole(switchboard_runtime::Wormhole *wormhole)
@@ -2086,7 +2141,7 @@ private:
       generateRingForPortal(portal);
     }
 
-    syncAllPeerProgramRuntimeRouting();
+    syncAllContainerProgramRuntimeState();
     syncHostIngressPortalRouting();
     delete wormhole;
   }
@@ -2148,17 +2203,25 @@ public:
 
   void setHostIngressRouter(BPFProgram *program)
   {
-#if NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE
     host_ingress = program;
     syncHostIngressPortalRouting();
-#else
-    (void)program;
-#endif
   }
 
-  void syncPeerProgramRuntimeState(BPFProgram *program)
+  void syncContainerProgramRuntimeState(BPFProgram *peerProgram, BPFProgram *primaryProgram)
   {
-    syncPeerProgramRuntimeRouting(program);
+    syncPeerProgramRuntimeRouting(peerProgram);
+
+    Vector<SwitchboardWormholeEgressBindingEntry> desiredBindings = {};
+    Vector<SwitchboardWormholeEgress4BindingEntry> desiredBindings4 = {};
+    collectWormholeEgressBindingEntries(desiredBindings, desiredBindings4);
+    switchboardSyncWormholeEgressBindingsForProgram(primaryProgram,
+                                                    desiredBindings,
+                                                    eth.ifidx,
+                                                    "container-ingress-sync");
+    switchboardSyncWormholeEgress4BindingsForProgram(primaryProgram,
+                                                     desiredBindings4,
+                                                     eth.ifidx,
+                                                     "container-ingress-sync");
   }
 
   BPFProgram *boundaryRouterProgram(void)
@@ -2236,6 +2299,7 @@ public:
 
   void closeWormholesToContainer(uint32_t containerID)
   {
+    wormholeRevisionByContainer.erase(containerID);
     if (auto it = wormholesByContainer.find(containerID); it != wormholesByContainer.end())
     {
       Vector<switchboard_runtime::Wormhole *> closingWormholes;
@@ -2273,6 +2337,35 @@ public:
 
   bool openWormhole(uint32_t containerID, const Wormhole& requestedWormhole)
   {
+    if (switchboardPacketBudgetExternalIngressUnderlayMTUValid(eth.mtu) == false)
+    {
+      basics_log("Switchboard openWormhole underlay mtu too small ifidx=%u mtu=%u required=%u containerID=%u\n",
+                 eth.ifidx,
+                 unsigned(eth.mtu),
+                 unsigned(switchboardPacketBudgetExternalIngressRequiredUnderlayMTU()),
+                 containerID);
+      return false;
+    }
+
+    if (auto existing = wormholesByContainer.find(containerID); existing != wormholesByContainer.end())
+    {
+      for (const switchboard_runtime::Wormhole *wormhole : existing->second)
+      {
+        if (wormhole != nullptr && wormhole->port == requestedWormhole.containerPort &&
+            wormhole->proto == requestedWormhole.layer4)
+        {
+          return false;
+        }
+      }
+    }
+
+    uint64_t ownerGeneration = 0;
+    if (switchboardGenerateWormholeOwnerGeneration(ownerGeneration) == false)
+    {
+      basics_log("Switchboard openWormhole owner generation failed containerID=%u errno=%d\n", containerID, errno);
+      return false;
+    }
+
     if (ensureBoundaryRouterConfigured() == false)
     {
       basics_log("Switchboard openWormhole boundary-router-unavailable containerID=%u port=%u proto=%u\n",
@@ -2299,6 +2392,14 @@ public:
     }
     else
     {
+      if (portalSlots.empty() || switchboardPortalCountWithinCapacity(portals.size() + 1) == false)
+      {
+        basics_log("Switchboard openWormhole portal capacity exhausted containerID=%u ifidx=%u capacity=%u\n",
+                   containerID,
+                   eth.ifidx,
+                   unsigned(MAX_PORTALS));
+        return false;
+      }
       bool prefixAnnounced = false;
       for (const IPPrefix& prefix : announcingPrefixes)
       {
@@ -2364,6 +2465,8 @@ public:
     wormhole->proto = requestedWormhole.layer4;
     wormhole->userCapacity = requestedWormhole.userCapacity;
     wormhole->weight = serviceUserCapacityPlanningWeight(requestedWormhole.userCapacity);
+    wormhole->ownerGeneration = ownerGeneration;
+    wormhole->definition = requestedWormhole;
     wormhole->portal = portal;
 
     if (installWormholeTargetBinding(portal, wormhole, requestedWormhole) == false)
@@ -2418,7 +2521,7 @@ public:
     return true;
   }
 
-  void openWormholes(uint32_t containerID, const Vector<Wormhole>& wormholes)
+  SwitchboardWormholeOperationStatus openWormholes(uint32_t containerID, const Vector<Wormhole>& wormholes)
   {
     appendAttachLogf("Switchboard openWormholes begin ifidx=%u containerID=%u requested=%u announcing=%u dpfx=%u",
                      eth.ifidx,
@@ -2426,30 +2529,77 @@ public:
                      unsigned(wormholes.size()),
                      unsigned(announcingPrefixes.size()),
                      unsigned(subnet.dpfx));
-    if (wormholesByContainer.contains(containerID))
+    if (wormholeTargetBindingsUnique(wormholes) == false)
     {
-      closeWormholesToContainer(containerID);
-    }
-
-    uint32_t opened = 0;
-    for (const Wormhole& wormhole : wormholes)
-    {
-      opened += openWormhole(containerID, wormhole) ? 1U : 0U;
-    }
-
-    if (opened != uint32_t(wormholes.size()))
-    {
-      basics_log("Switchboard openWormholes failed containerID=%u requested=%u opened=%u ifidx=%u\n",
+      basics_log("Switchboard openWormholes rejected duplicate target containerID=%u ifidx=%u\n",
                  containerID,
-                 unsigned(wormholes.size()),
-                 unsigned(opened),
                  eth.ifidx);
+      return SwitchboardWormholeOperationStatus::rejected;
     }
+    String desiredBytes = switchboardSerializeWormholeFleet(wormholes);
+    String desiredRevision = {};
+    if (prodigyComputeWormholeDesiredStateRevision(containerID, desiredBytes, desiredRevision) == false)
+    {
+      basics_log("Switchboard openWormholes failed desired-state digest containerID=%u ifidx=%u\n", containerID, eth.ifidx);
+      return SwitchboardWormholeOperationStatus::rejected;
+    }
+    if (auto applied = wormholeRevisionByContainer.find(containerID);
+        applied != wormholeRevisionByContainer.end() && applied->second.equals(desiredRevision))
+    {
+      return SwitchboardWormholeOperationStatus::applied;
+    }
+    Vector<Wormhole> previous = {};
+    String previousRevision = {};
+    if (auto applied = wormholeRevisionByContainer.find(containerID); applied != wormholeRevisionByContainer.end())
+    {
+      previousRevision = applied->second;
+    }
+    if (auto existing = wormholesByContainer.find(containerID); existing != wormholesByContainer.end())
+    {
+      previous.reserve(existing->second.size());
+      for (const switchboard_runtime::Wormhole *wormhole : existing->second)
+      {
+        if (wormhole != nullptr)
+        {
+          previous.push_back(wormhole->definition);
+        }
+      }
+    }
+    SwitchboardWormholeOperationStatus status = switchboardReplaceWormholesTransaction(
+        previous,
+        wormholes,
+        [&](const Wormhole& wormhole) -> bool { return openWormhole(containerID, wormhole); },
+        [&]() -> void { closeWormholesToContainer(containerID); });
+    if (status != SwitchboardWormholeOperationStatus::applied)
+    {
+      if (status == SwitchboardWormholeOperationStatus::rejected)
+      {
+        if (previousRevision.empty())
+        {
+          String previousBytes = switchboardSerializeWormholeFleet(previous);
+          (void)prodigyComputeWormholeDesiredStateRevision(containerID, previousBytes, previousRevision);
+        }
+        if (previousRevision.empty() == false)
+        {
+          wormholeRevisionByContainer.insert_or_assign(containerID, std::move(previousRevision));
+        }
+      }
+      if (status == SwitchboardWormholeOperationStatus::rollbackFailed)
+      {
+        basics_log("Switchboard openWormholes rollback failed containerID=%u previous=%u ifidx=%u\n",
+                   containerID, unsigned(previous.size()), eth.ifidx);
+      }
+      basics_log("Switchboard openWormholes transaction rolled back containerID=%u requested=%u ifidx=%u\n",
+                 containerID, unsigned(wormholes.size()), eth.ifidx);
+      return status;
+    }
+    wormholeRevisionByContainer.insert_or_assign(containerID, std::move(desiredRevision));
     appendAttachLogf("Switchboard openWormholes done ifidx=%u containerID=%u requested=%u opened=%u",
                      eth.ifidx,
                      containerID,
                      unsigned(wormholes.size()),
-                     unsigned(opened));
+                     unsigned(wormholes.size()));
+    return SwitchboardWormholeOperationStatus::applied;
   }
 
   bool openWhitehole(uint32_t containerID, const Whitehole& whitehole)

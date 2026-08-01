@@ -175,7 +175,7 @@ __attribute__((__always_inline__)) static inline int process_l3_headers(struct p
     }
 
     // ihl contains len of ipv4 header in 32bit words
-    if (iph->ihl != 5)
+    if (switchboard_unfragmented_ipv4(iph, data_end) == false)
     {
       return XDP_DROP; // drop ipv4 headers that contain ip options
     }
@@ -346,9 +346,9 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
   struct local_container_subnet6 *localcontainersubnet6 = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
 #endif
 
-  if (portal_meta != NULL && is_ipv6)
+  __u16 target_port = 0;
+  if (portal_meta != NULL)
   {
-    __u16 target_port = 0;
     bool target_found = switchboardLookupWormholeTargetPort(portal_meta->slot, &containerID, &target_port);
 
     if (target_found == false &&
@@ -364,7 +364,7 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
       }
     }
 
-    if (target_found == false || switchboardRewriteWormholeIPv6Target(data, data_end, &pckt, &containerID, target_port) == false)
+    if (target_found == false)
     {
       return XDP_DROP;
     }
@@ -374,19 +374,32 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
   {
     bool localDelivery = (bpf_memcmp(containerID.value, localcontainersubnet6, 4) == 0);
 
-    // Same-machine delivery does not need overlay encapsulation. Keep the
-    // packet native and let host_ingress redirect it to the target
-    // container using the already-selected destination prefix/address.
     if (localDelivery)
     {
+      if (portal_meta != NULL &&
+          encap_wormhole_v6(xdp, true, localcontainersubnet6, &containerID, packet_len, is_ipv6) == false)
+      {
+        return XDP_DROP;
+      }
       return XDP_PASS;
+    }
+
+    // Public portals support an ordinary 1500-byte external L3 path. The
+    // userspace admission boundary requires another 52 bytes on every host
+    // before a wormhole can open; enforce the paired inner bound before the
+    // worst-case IPv6-underlay encapsulation.
+    if (portal_meta != NULL && packet_len > WORMHOLE_PUBLIC_INGRESS_L3_MTU)
+    {
+      return XDP_DROP;
     }
 
     struct switchboard_overlay_machine_route *overlayRoute = balancerLookupOverlayMachineRouteForContainer(&containerID);
     bool overlayEncapped = false;
     if (overlayRoute != NULL)
     {
-      overlayEncapped = encap_v6_route(xdp, overlayRoute, packet_len, is_ipv6);
+      overlayEncapped = portal_meta == NULL
+                            ? encap_v6_route(xdp, overlayRoute, packet_len, is_ipv6)
+                            : encap_wormhole_route(xdp, overlayRoute, &containerID, packet_len, is_ipv6);
     }
     else if (portal_meta == NULL)
     {

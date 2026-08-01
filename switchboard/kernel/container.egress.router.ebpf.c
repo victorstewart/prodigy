@@ -40,14 +40,49 @@ int ct_egress(struct __sk_buff *skb)
   {
     return NETKIT_DROP;
   }
-  if (networkMode == CONTAINER_NETWORK_DESTINATION_ALLOWLIST)
+
+  // Public-ingress wormhole replies can target either another local
+  // container or a remote destination. Authenticate and preserve their
+  // external source tuple at this per-container hook, where the exact owner
+  // identity is available, before any host-wide routing step.
+  skb->mark = 0;
+  int wormholeReply = SWITCHBOARD_WORMHOLE_REPLY_NONE;
+  if (protocol == BE_ETH_P_IP)
+  {
+    wormholeReply = switchboardRewriteWormholeSourceIPv4SKB(skb);
+  }
+  else if (protocol == BE_ETH_P_IPV6)
+  {
+    wormholeReply = switchboardRewriteWormholeSourceIPv6SKB(skb);
+  }
+  if (wormholeReply == SWITCHBOARD_WORMHOLE_REPLY_DROP)
+  {
+    return NETKIT_DROP;
+  }
+  if (wormholeReply != SWITCHBOARD_WORMHOLE_REPLY_NONE)
+  {
+    skb->mark = SWITCHBOARD_WORMHOLE_REPLY_VALIDATED_SKB_MARK;
+  }
+
+  // A public rewrite can invalidate packet pointers. Re-establish the view
+  // before applying egress policy or routing the authenticated reply.
+  data = (void *)(long)skb->data;
+  data_end = (void *)(long)skb->data_end;
+  l3_data = data;
+  eth = (struct ethhdr *)data;
+  if ((void *)(eth + 1) <= data_end && eth->h_proto == protocol)
+  {
+    l3_data = (void *)(eth + 1);
+  }
+
+  if (networkMode == CONTAINER_NETWORK_DESTINATION_ALLOWLIST && wormholeReply == SWITCHBOARD_WORMHOLE_REPLY_NONE)
   {
     __u8 proto = 0;
     __be16 port = 0;
     if (protocol == BE_ETH_P_IP)
     {
       struct iphdr *iph = (struct iphdr *)l3_data;
-      if ((void *)(iph + 1) > data_end || iph->ihl != 5)
+      if (switchboard_unfragmented_ipv4(iph, data_end) == false)
       {
         return NETKIT_DROP;
       }
@@ -66,12 +101,12 @@ int ct_egress(struct __sk_buff *skb)
     }
     return NETKIT_DROP;
   }
-  if (networkMode == CONTAINER_NETWORK_DECLARED_ONLY)
+  if (networkMode == CONTAINER_NETWORK_DECLARED_ONLY && wormholeReply == SWITCHBOARD_WORMHOLE_REPLY_NONE)
   {
     if (protocol == BE_ETH_P_IP)
     {
       struct iphdr *iph = (struct iphdr *)l3_data;
-      if ((void *)(iph + 1) > data_end || iph->ihl != 5 ||
+      if (switchboard_unfragmented_ipv4(iph, data_end) == false ||
           containerWhiteholePublicEgressIPv4(iph, data_end) == false)
       {
         return NETKIT_DROP;
@@ -100,7 +135,7 @@ int ct_egress(struct __sk_buff *skb)
     }
   }
 
-  if (protocol == BE_ETH_P_IP && containerRequiresPublic4() == false)
+  if (protocol == BE_ETH_P_IP && wormholeReply == SWITCHBOARD_WORMHOLE_REPLY_NONE && containerRequiresPublic4() == false)
   {
     return NETKIT_DROP;
   }
@@ -116,39 +151,12 @@ int ct_egress(struct __sk_buff *skb)
 
     __be8 *daddr6 = ipv6h->daddr.s6_addr;
 
-    // Public-ingress wormhole replies can target either another local
-    // container or a remote-machine container before the return path leaves
-    // this container egress hook. Preserve the external source tuple here so
-    // both direct local delivery and redirect-to-NIC paths keep the public
-    // reply identity instead of leaking the internal container source tuple.
-    (void)switchboardRewriteWormholeSourceIPv6SKB(skb);
-
-    // bpf_skb_store_bytes() inside the wormhole rewrite helper invalidates all
-    // previously derived packet pointers. Refresh the SKB view before reading
-    // the destination subnet or parsing L4.
-    data = (void *)(long)skb->data;
-    data_end = (void *)(long)skb->data_end;
-    l3_data = data;
-    eth = (struct ethhdr *)data;
-
-    if ((void *)(eth + 1) <= data_end && eth->h_proto == protocol)
-    {
-      l3_data = (void *)(eth + 1);
-    }
-
-    ipv6h = (struct ipv6hdr *)l3_data;
-    if ((void *)(ipv6h + 1) > data_end)
-    {
-      return NETKIT_DROP;
-    }
-
-    daddr6 = ipv6h->daddr.s6_addr;
-
     if (localSubnetContainsDaddr(daddr6))
     {
       // Let the host's per-container /128 route deliver same-machine traffic.
       // A direct bpf_redirect() to an L3 netkit strips its synthetic Ethernet
       // placeholder before the target netkit transmit path and drops the skb.
+      skb->mark = 0;
       return NETKIT_PASS;
     }
     // these will only be router solitication messages if we've
@@ -193,7 +201,7 @@ int ct_egress(struct __sk_buff *skb)
     if (portalTarget == SWITCHBOARD_PORTAL_TARGET_RESOLVED)
     {
       __u16 targetPort = 0;
-      if (switchboardLookupWormholeTargetPort(portalMeta->slot, &containerID, &targetPort) == false || switchboardRewriteWormholeIPv6TargetSKB(skb, &pckt, &containerID, targetPort) == false)
+      if (portalMeta == NULL || switchboardLookupWormholeTargetPort(portalMeta->slot, &containerID, &targetPort) == false)
       {
         return NETKIT_DROP;
       }
@@ -202,8 +210,37 @@ int ct_egress(struct __sk_buff *skb)
       struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
       if (switchboardContainerIDTargetsLocalMachine(&containerID, localSubnet))
       {
+        struct portal_definition portal = {};
+        if (switchboardPacketPortalDefinition(&pckt, true, &portal) == false ||
+            switchboardLearnPublicWormholeFlowIPv6(&pckt, &containerID, targetPort, &portal) == false ||
+            switchboardRewriteWormholeIPv6TargetSKB(skb, &pckt, &containerID, targetPort) == false)
+        {
+          return NETKIT_DROP;
+        }
+        skb->mark = SWITCHBOARD_WORMHOLE_SKB_MARK;
         return redirectContainerFragment(containerID.value[4], false) ? NETKIT_REDIRECT : NETKIT_DROP;
       }
+
+      __u32 machineFragment = ((__u32)containerID.value[1] << 16) |
+                              ((__u32)containerID.value[2] << 8) |
+                              (__u32)containerID.value[3];
+      struct switchboard_overlay_machine_route *route = lookupOverlayMachineRouteByFragment(machineFragment);
+      if (skb->len <= sizeof(struct ethhdr) || skb->len - sizeof(struct ethhdr) > 0xffffu)
+      {
+        return NETKIT_DROP;
+      }
+      __u16 innerBytes = (__u16)(skb->len - sizeof(struct ethhdr));
+      if (route == NULL || switchboardEncapWormholeSKB(skb,
+                                                       innerBytes,
+                                                       IPPROTO_IPV6,
+                                                       route,
+                                                       &containerID) == false)
+      {
+        return NETKIT_DROP;
+      }
+
+      __u32 *nic = bpf_map_lookup_elem(&ct_dev_map, &zeroidx);
+      return nic != NULL ? bpf_redirect(*nic, 0) : NETKIT_DROP;
     }
   }
 

@@ -17,6 +17,23 @@ struct flow_key {
   __u8 proto;
 };
 
+struct switchboard_wormhole_flow_key {
+  struct flow_key flow;
+  __u64 owner_generation;
+};
+
+static inline struct switchboard_wormhole_flow_key switchboardWormholeFlowMapKey(const struct flow_key *flow,
+                                                                                  __u64 owner_generation)
+{
+  struct switchboard_wormhole_flow_key key = {};
+  if (flow != 0)
+  {
+    key.flow = *flow;
+  }
+  key.owner_generation = owner_generation;
+  return key;
+}
+
 // client's packet metadata
 struct packet_description {
   struct flow_key flow;

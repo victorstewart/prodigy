@@ -4,10 +4,11 @@
 #include <switchboard/kernel/overlay.routing.h>
 #include <switchboard/kernel/services.h>
 
-__attribute__((__always_inline__)) static inline bool switchboardEncapSKBV6(struct __sk_buff *skb,
-                                                                            __u16 inner_packet_len,
-                                                                            __u8 inner_proto,
-                                                                            const struct switchboard_overlay_machine_route *route)
+__attribute__((__always_inline__)) static inline bool switchboardEncapSKBV6Internal(struct __sk_buff *skb,
+                                                                                    __u16 inner_packet_len,
+                                                                                    __u8 inner_proto,
+                                                                                    const struct switchboard_overlay_machine_route *route,
+                                                                                    const struct switchboard_wormhole_overlay_header *wormhole)
 {
   if (route == NULL || route->family != SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6)
   {
@@ -53,7 +54,8 @@ __attribute__((__always_inline__)) static inline bool switchboardEncapSKBV6(stru
     return false;
   }
 
-  if (bpf_skb_adjust_room(skb, (__s32)sizeof(struct ipv6hdr), BPF_ADJ_ROOM_NET, switchboardOverlayEncapAdjustRoomFlagsIPv6()))
+  __u32 provenanceBytes = wormhole == NULL ? 0u : sizeof(*wormhole);
+  if (bpf_skb_adjust_room(skb, (__s32)(sizeof(struct ipv6hdr) + provenanceBytes), BPF_ADJ_ROOM_NET, switchboardOverlayEncapAdjustRoomFlagsIPv6()))
   {
     return false;
   }
@@ -69,7 +71,7 @@ __attribute__((__always_inline__)) static inline bool switchboardEncapSKBV6(stru
 
   if (inner_proto == IPPROTO_IPV6)
   {
-    struct ipv6hdr *restoredInner6 = (struct ipv6hdr *)(ip6h + 1);
+    struct ipv6hdr *restoredInner6 = (void *)((__u8 *)(ip6h + 1) + provenanceBytes);
     if ((void *)(restoredInner6 + 1) > data_end)
     {
       return false;
@@ -79,7 +81,7 @@ __attribute__((__always_inline__)) static inline bool switchboardEncapSKBV6(stru
   }
   else
   {
-    struct iphdr *restoredInner4 = (struct iphdr *)(ip6h + 1);
+    struct iphdr *restoredInner4 = (void *)((__u8 *)(ip6h + 1) + provenanceBytes);
     if ((void *)(restoredInner4 + 1) > data_end)
     {
       return false;
@@ -92,11 +94,21 @@ __attribute__((__always_inline__)) static inline bool switchboardEncapSKBV6(stru
   ip6h->priority = 0;
   ip6h->version = 6;
   bpf_memset(ip6h->flow_lbl, 0, sizeof(ip6h->flow_lbl));
-  ip6h->payload_len = bpf_htons(inner_packet_len);
-  ip6h->nexthdr = inner_proto;
+  ip6h->payload_len = bpf_htons((__u16)(inner_packet_len + provenanceBytes));
+  ip6h->nexthdr = wormhole == NULL ? inner_proto : IPPROTO_GRE;
   ip6h->hop_limit = 64;
   bpf_memcpy(ip6h->saddr.s6_addr, route->source6, sizeof(route->source6));
   bpf_memcpy(ip6h->daddr.s6_addr, route->next_hop6, sizeof(route->next_hop6));
+
+  if (wormhole != NULL)
+  {
+    struct switchboard_wormhole_overlay_header *installed = (void *)(ip6h + 1);
+    if ((void *)(installed + 1) > data_end)
+    {
+      return false;
+    }
+    bpf_memcpy(installed, wormhole, sizeof(*installed));
+  }
 
   if (route->use_gateway_mac != 0)
   {
@@ -106,10 +118,19 @@ __attribute__((__always_inline__)) static inline bool switchboardEncapSKBV6(stru
   return from_us_to_overlay_next_hop(eth, route->next_hop_mac);
 }
 
-__attribute__((__always_inline__)) static inline bool switchboardEncapSKBV4(struct __sk_buff *skb,
+__attribute__((__always_inline__)) static inline bool switchboardEncapSKBV6(struct __sk_buff *skb,
                                                                             __u16 inner_packet_len,
                                                                             __u8 inner_proto,
                                                                             const struct switchboard_overlay_machine_route *route)
+{
+  return switchboardEncapSKBV6Internal(skb, inner_packet_len, inner_proto, route, NULL);
+}
+
+__attribute__((__always_inline__)) static inline bool switchboardEncapSKBV4Internal(struct __sk_buff *skb,
+                                                                                    __u16 inner_packet_len,
+                                                                                    __u8 inner_proto,
+                                                                                    const struct switchboard_overlay_machine_route *route,
+                                                                                    const struct switchboard_wormhole_overlay_header *wormhole)
 {
   if (route == NULL || route->family != SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV4)
   {
@@ -151,7 +172,8 @@ __attribute__((__always_inline__)) static inline bool switchboardEncapSKBV4(stru
     return false;
   }
 
-  if (bpf_skb_adjust_room(skb, (__s32)sizeof(struct iphdr), BPF_ADJ_ROOM_NET, switchboardOverlayEncapAdjustRoomFlagsIPv4()))
+  __u32 provenanceBytes = wormhole == NULL ? 0u : sizeof(*wormhole);
+  if (bpf_skb_adjust_room(skb, (__s32)(sizeof(struct iphdr) + provenanceBytes), BPF_ADJ_ROOM_NET, switchboardOverlayEncapAdjustRoomFlagsIPv4()))
   {
     return false;
   }
@@ -167,7 +189,7 @@ __attribute__((__always_inline__)) static inline bool switchboardEncapSKBV4(stru
 
   if (inner_proto == IPPROTO_IPV6)
   {
-    struct ipv6hdr *restoredInner6 = (struct ipv6hdr *)(iph + 1);
+    struct ipv6hdr *restoredInner6 = (void *)((__u8 *)(iph + 1) + provenanceBytes);
     if ((void *)(restoredInner6 + 1) > data_end)
     {
       return false;
@@ -177,7 +199,7 @@ __attribute__((__always_inline__)) static inline bool switchboardEncapSKBV4(stru
   }
   else
   {
-    struct iphdr *restoredInner4 = (struct iphdr *)(iph + 1);
+    struct iphdr *restoredInner4 = (void *)((__u8 *)(iph + 1) + provenanceBytes);
     if ((void *)(restoredInner4 + 1) > data_end)
     {
       return false;
@@ -190,14 +212,24 @@ __attribute__((__always_inline__)) static inline bool switchboardEncapSKBV4(stru
   iph->version = 4;
   iph->ihl = 5;
   iph->tos = 0;
-  iph->tot_len = bpf_htons(inner_packet_len + sizeof(struct iphdr));
+  iph->tot_len = bpf_htons((__u16)(inner_packet_len + sizeof(struct iphdr) + provenanceBytes));
   iph->id = 0;
   iph->frag_off = 0;
   iph->ttl = 64;
-  iph->protocol = inner_proto;
+  iph->protocol = wormhole == NULL ? inner_proto : IPPROTO_GRE;
   iph->check = 0;
   iph->saddr = route->source4;
   iph->daddr = route->next_hop4;
+
+  if (wormhole != NULL)
+  {
+    struct switchboard_wormhole_overlay_header *installed = (void *)(iph + 1);
+    if ((void *)(installed + 1) > data_end)
+    {
+      return false;
+    }
+    bpf_memcpy(installed, wormhole, sizeof(*installed));
+  }
 
   __u64 csum = 0;
   ipv4_csum_inline(iph, &csum);
@@ -209,6 +241,41 @@ __attribute__((__always_inline__)) static inline bool switchboardEncapSKBV4(stru
   }
 
   return from_us_to_overlay_next_hop(eth, route->next_hop_mac);
+}
+
+__attribute__((__always_inline__)) static inline bool switchboardEncapSKBV4(struct __sk_buff *skb,
+                                                                            __u16 inner_packet_len,
+                                                                            __u8 inner_proto,
+                                                                            const struct switchboard_overlay_machine_route *route)
+{
+  return switchboardEncapSKBV4Internal(skb, inner_packet_len, inner_proto, route, NULL);
+}
+
+__attribute__((__always_inline__)) static inline bool switchboardEncapWormholeSKB(struct __sk_buff *skb,
+                                                                                  __u16 inner_packet_len,
+                                                                                  __u8 inner_proto,
+                                                                                  const struct switchboard_overlay_machine_route *route,
+                                                                                  const struct container_id *containerID)
+{
+  struct switchboard_wormhole_overlay_header wormhole = {};
+  switchboardBuildWormholeOverlayHeader(&wormhole, containerID, inner_proto == IPPROTO_IPV6);
+  if (switchboardWormholeOverlayHeaderValid(&wormhole) == false)
+  {
+    return false;
+  }
+  if (route == NULL)
+  {
+    return false;
+  }
+  if (route->family == SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6)
+  {
+    return switchboardEncapSKBV6Internal(skb, inner_packet_len, inner_proto, route, &wormhole);
+  }
+  if (route->family == SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV4)
+  {
+    return switchboardEncapSKBV4Internal(skb, inner_packet_len, inner_proto, route, &wormhole);
+  }
+  return false;
 }
 
 __attribute__((__always_inline__)) static inline bool switchboardMaybeRouteHostedIngressIPv4(struct __sk_buff *skb, struct ethhdr *eth, void *data_end, int *action)

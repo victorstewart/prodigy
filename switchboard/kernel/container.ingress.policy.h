@@ -12,7 +12,7 @@ struct {
   __uint(max_entries, CONTAINER_SERVICE_PAIRINGS_MAP_ENTRIES);
 } ct_adv_sources SEC(".maps");
 
-__attribute__((__always_inline__)) static inline bool containerLearnOrAuthorizeInboundTCP(struct ipv6hdr *ip6h, struct tcphdr *tcp)
+__attribute__((noinline)) static bool containerLearnOrAuthorizeInboundTCP(struct ipv6hdr *ip6h, struct tcphdr *tcp)
 {
   if (containerNetworkAddressMatches(ip6h->daddr.s6_addr) == false)
   {

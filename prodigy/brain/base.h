@@ -519,6 +519,14 @@ public:
   {
     (void)containerUUID;
   }
+  virtual void armWormholeRuntimeAckDeadline(ContainerView *container)
+  {
+    (void)container;
+  }
+  virtual void replicateContainerRuntimeStateToFollowers(ContainerView *container)
+  {
+    (void)container;
+  }
   virtual uint32_t nextTaskAttemptNumber(const DeploymentPlan& plan)
   {
     (void)plan;

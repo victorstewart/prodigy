@@ -9,14 +9,16 @@
 #include <switchboard/kernel/structs.h>
 #include <switchboard/kernel/layer4.h>
 #include <switchboard/kernel/overlay.encap.h>
+#include <switchboard/kernel/overlay.ingress.auth.h>
 #include <switchboard/kernel/overlay.routing.h>
 #include <switchboard/kernel/portal.routing.h>
 #include <switchboard/kernel/whitehole.routing.h>
+#include <switchboard/kernel/wormhole.flow.h>
 
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE
 // Dev/test fake-boundary probes can inject IPv4 portal packets from inside the
-// ecosystem. Production external traffic should have already been normalized by
-// the boundary path, so host ingress must not pay these portal/CID lookups.
+// ecosystem. Production host ingress also owns portal state because a selected
+// wormhole may arrive over another machine's overlay.
 #endif
 
 // the neuron attaches this program to the NIC
@@ -96,7 +98,7 @@ __attribute__((__always_inline__)) static inline bool lookup_whitehole_reply_bin
 
 __attribute__((__always_inline__)) static inline bool overlay_inner_ipv4_matches_declared_endpoint(struct iphdr *inner4, void *data_end)
 {
-  if ((void *)(inner4 + 1) > data_end || inner4->ihl != 5)
+  if (switchboard_unfragmented_ipv4(inner4, data_end) == false)
   {
     return false;
   }
@@ -218,6 +220,34 @@ __attribute__((__always_inline__)) static inline bool overlay_minimum_linear_byt
     return true;
   }
 
+  void *data = (void *)(long)skb->data;
+  void *data_end = (void *)(long)skb->data_end;
+  struct ethhdr *eth = data;
+  __u32 zero = 0;
+  struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&lc_subnet, &zero);
+  if ((void *)(eth + 1) > data_end)
+  {
+    return false;
+  }
+  if (wire_protocol == BE_ETH_P_IPV6)
+  {
+    struct ipv6hdr *outer6 = (void *)(eth + 1);
+    if ((void *)(outer6 + 1) > data_end ||
+        overlayIngressPeerAuthorizedIPv6(skb, outer6->saddr.s6_addr, outer6->daddr.s6_addr, localSubnet) == false)
+    {
+      return false;
+    }
+  }
+  else
+  {
+    struct iphdr *outer4 = (void *)(eth + 1);
+    if ((void *)(outer4 + 1) > data_end ||
+        overlayIngressPeerAuthorizedIPv4(outer4->saddr, outer4->daddr) == false)
+    {
+      return false;
+    }
+  }
+
   __u8 version_ihl = 0;
   if (bpf_skb_load_bytes(skb, sizeof(struct ethhdr), &version_ihl, sizeof(version_ihl)) != 0 ||
       (wire_protocol == BE_ETH_P_IP ? version_ihl != 0x45u : (version_ihl >> 4) != 6u))
@@ -300,9 +330,118 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_whitehole_re
   return TC_ACT_OK;
 }
 
-__attribute__((__always_inline__)) static inline int maybe_redirect_ipv4_portal_packet(struct __sk_buff *skb, struct ethhdr *eth, void *data_end, bool *handled)
+__attribute__((__always_inline__)) static inline bool switchboardParsePortalPacket(struct __sk_buff *skb,
+                                                                                    struct ethhdr *eth,
+                                                                                    void *data_end,
+                                                                                    bool isIPv6,
+                                                                                    struct packet_description *packet)
 {
-  if (handled == NULL)
+  if (skb == NULL || eth == NULL || packet == NULL || (void *)(eth + 1) > data_end)
+  {
+    return false;
+  }
+
+  bpf_memset(packet, 0, sizeof(*packet));
+  if (isIPv6)
+  {
+    struct ipv6hdr *ip6h = (void *)(eth + 1);
+    if (eth->h_proto != BE_ETH_P_IPV6 || (void *)(ip6h + 1) > data_end)
+    {
+      return false;
+    }
+    packet->flow.proto = ip6h->nexthdr;
+    bpf_memcpy(packet->flow.srcv6, ip6h->saddr.s6_addr32, sizeof(packet->flow.srcv6));
+    bpf_memcpy(packet->flow.dstv6, ip6h->daddr.s6_addr32, sizeof(packet->flow.dstv6));
+  }
+  else
+  {
+    struct iphdr *iph = (void *)(eth + 1);
+    if (eth->h_proto != BE_ETH_P_IP || switchboard_unfragmented_ipv4(iph, data_end) == false)
+    {
+      return false;
+    }
+    packet->flow.proto = iph->protocol;
+    packet->flow.src = iph->saddr;
+    packet->flow.dst = iph->daddr;
+  }
+
+  if (packet->flow.proto == IPPROTO_TCP)
+  {
+    return parse_tcp((void *)(long)skb->data, data_end, isIPv6, packet);
+  }
+  if (packet->flow.proto == IPPROTO_UDP)
+  {
+    return parse_udp((void *)(long)skb->data, data_end, isIPv6, packet);
+  }
+  return false;
+}
+
+__attribute__((__always_inline__)) static inline int switchboardRouteSelectedWormhole(struct __sk_buff *skb,
+                                                                                       const struct container_id *containerID,
+                                                                                       bool isIPv6)
+{
+  if (skb == NULL || containerID == NULL || containerID->hasID == false)
+  {
+    return TC_ACT_SHOT;
+  }
+  __u32 machineFragment = ((__u32)containerID->value[1] << 16) |
+                          ((__u32)containerID->value[2] << 8) |
+                          (__u32)containerID->value[3];
+  struct switchboard_overlay_machine_route *route = lookupOverlayMachineRouteByFragment(machineFragment);
+  if (skb->len <= sizeof(struct ethhdr) || skb->len - sizeof(struct ethhdr) > 0xffffu)
+  {
+    return TC_ACT_SHOT;
+  }
+  __u16 innerBytes = (__u16)(skb->len - sizeof(struct ethhdr));
+  return innerBytes <= WORMHOLE_PUBLIC_INGRESS_L3_MTU && route != NULL &&
+                 switchboardEncapWormholeSKB(skb,
+                                             innerBytes,
+                                             isIPv6 ? IPPROTO_IPV6 : IPPROTO_IPIP,
+                                             route,
+                                             containerID)
+             ? TC_ACT_OK
+             : TC_ACT_SHOT;
+}
+
+__attribute__((__always_inline__)) static inline bool switchboardLearnAndRewriteLocalWormholeIPv6(struct __sk_buff *skb,
+                                                                                                   struct packet_description *packet,
+                                                                                                   const struct container_id *containerID,
+                                                                                                   __be16 targetPort)
+{
+  struct portal_definition portal = {};
+  if (switchboardPacketPortalDefinition(packet, true, &portal) == false ||
+      switchboardLearnPublicWormholeFlowIPv6(packet, containerID, targetPort, &portal) == false ||
+      switchboardRewriteWormholeIPv6TargetSKB(skb, packet, containerID, targetPort) == false)
+  {
+    return false;
+  }
+  skb->mark = SWITCHBOARD_WORMHOLE_SKB_MARK;
+  return true;
+}
+
+__attribute__((__always_inline__)) static inline bool switchboardLearnAndRewriteLocalWormholeIPv4(struct __sk_buff *skb,
+                                                                                                   struct packet_description *packet,
+                                                                                                   const struct container_id *containerID,
+                                                                                                   __be16 targetPort)
+{
+  struct portal_definition portal = {};
+  if (switchboardPacketPortalDefinition(packet, false, &portal) == false ||
+      switchboardLearnPublicWormholeFlowIPv4(packet, containerID, targetPort, &portal) == false ||
+      switchboardRewriteWormholeIPv4TargetSKB(skb, packet, targetPort) == false)
+  {
+    return false;
+  }
+  skb->mark = SWITCHBOARD_WORMHOLE_SKB_MARK;
+  return true;
+}
+
+__attribute__((__always_inline__)) static inline int maybe_redirect_ipv4_portal_packet(struct __sk_buff *skb,
+                                                                                       struct ethhdr *eth,
+                                                                                       void *data_end,
+                                                                                       struct packet_description *packet,
+                                                                                       bool *handled)
+{
+  if (packet == NULL || handled == NULL)
   {
     return TC_ACT_OK;
   }
@@ -314,32 +453,7 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_ipv4_portal_
     return TC_ACT_OK;
   }
 
-  struct iphdr *iph = (struct iphdr *)(eth + 1);
-  if ((void *)(iph + 1) > data_end || iph->ihl != 5)
-  {
-    return TC_ACT_OK;
-  }
-
-  struct packet_description pckt = {};
-  pckt.flow.proto = iph->protocol;
-  pckt.flow.src = iph->saddr;
-  pckt.flow.dst = iph->daddr;
-
-  if (iph->protocol == IPPROTO_TCP)
-  {
-    if (parse_tcp((void *)(long)skb->data, data_end, false, &pckt) == false)
-    {
-      return TC_ACT_OK;
-    }
-  }
-  else if (iph->protocol == IPPROTO_UDP)
-  {
-    if (parse_udp((void *)(long)skb->data, data_end, false, &pckt) == false)
-    {
-      return TC_ACT_OK;
-    }
-  }
-  else
+  if (switchboardParsePortalPacket(skb, eth, data_end, false, packet) == false)
   {
     return TC_ACT_OK;
   }
@@ -349,7 +463,7 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_ipv4_portal_
   int resolved = switchboardResolveExternalPortalTarget((void *)(long)skb->data,
                                                         data_end,
                                                         false,
-                                                        &pckt,
+                                                        packet,
                                                         &containerID,
                                                         &portalMeta);
   if (resolved == SWITCHBOARD_PORTAL_TARGET_NONE)
@@ -367,17 +481,12 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_ipv4_portal_
   struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
   if (switchboardContainerIDTargetsLocalMachine(&containerID, localSubnet) == false)
   {
-    int overlayAction = TC_ACT_OK;
-    if (switchboardMaybeRouteHostedIngressIPv4(skb, eth, data_end, &overlayAction))
-    {
-      return overlayAction;
-    }
-
-    return TC_ACT_SHOT;
+    return switchboardRouteSelectedWormhole(skb, &containerID, false);
   }
 
   __u16 targetPort = 0;
-  if (switchboardLookupWormholeTargetPort(portalMeta->slot, &containerID, &targetPort) == false || switchboardRewriteWormholeIPv4TargetSKB(skb, &pckt, targetPort) == false)
+  if (switchboardLookupWormholeTargetPort(portalMeta->slot, &containerID, &targetPort) == false ||
+      switchboardLearnAndRewriteLocalWormholeIPv4(skb, packet, &containerID, targetPort) == false)
   {
     return TC_ACT_SHOT;
   }
@@ -398,9 +507,13 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_ipv4_portal_
   return TC_ACT_SHOT;
 }
 
-__attribute__((__always_inline__)) static inline int maybe_redirect_ipv6_portal_packet(struct __sk_buff *skb, struct ethhdr *eth, void *data_end, bool *handled)
+__attribute__((__always_inline__)) static inline int maybe_redirect_ipv6_portal_packet(struct __sk_buff *skb,
+                                                                                       struct ethhdr *eth,
+                                                                                       void *data_end,
+                                                                                       struct packet_description *packet,
+                                                                                       bool *handled)
 {
-  if (handled == NULL)
+  if (packet == NULL || handled == NULL)
   {
     return TC_ACT_OK;
   }
@@ -412,32 +525,7 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_ipv6_portal_
     return TC_ACT_OK;
   }
 
-  struct ipv6hdr *ip6h = (struct ipv6hdr *)(eth + 1);
-  if ((void *)(ip6h + 1) > data_end)
-  {
-    return TC_ACT_OK;
-  }
-
-  struct packet_description pckt = {};
-  pckt.flow.proto = ip6h->nexthdr;
-  bpf_memcpy(pckt.flow.srcv6, ip6h->saddr.s6_addr32, sizeof(pckt.flow.srcv6));
-  bpf_memcpy(pckt.flow.dstv6, ip6h->daddr.s6_addr32, sizeof(pckt.flow.dstv6));
-
-  if (ip6h->nexthdr == IPPROTO_TCP)
-  {
-    if (parse_tcp((void *)(long)skb->data, data_end, true, &pckt) == false)
-    {
-      return TC_ACT_OK;
-    }
-  }
-  else if (ip6h->nexthdr == IPPROTO_UDP)
-  {
-    if (parse_udp((void *)(long)skb->data, data_end, true, &pckt) == false)
-    {
-      return TC_ACT_OK;
-    }
-  }
-  else
+  if (switchboardParsePortalPacket(skb, eth, data_end, true, packet) == false)
   {
     return TC_ACT_OK;
   }
@@ -447,7 +535,7 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_ipv6_portal_
   int resolved = switchboardResolveExternalPortalTarget((void *)(long)skb->data,
                                                         data_end,
                                                         true,
-                                                        &pckt,
+                                                        packet,
                                                         &containerID,
                                                         &portalMeta);
   if (resolved == SWITCHBOARD_PORTAL_TARGET_NONE)
@@ -465,17 +553,12 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_ipv6_portal_
   struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
   if (switchboardContainerIDTargetsLocalMachine(&containerID, localSubnet) == false)
   {
-    int overlayAction = TC_ACT_OK;
-    if (switchboardMaybeRouteHostedIngressIPv6(skb, eth, data_end, &overlayAction))
-    {
-      return overlayAction;
-    }
-
-    return TC_ACT_SHOT;
+    return switchboardRouteSelectedWormhole(skb, &containerID, true);
   }
 
   __u16 targetPort = 0;
-  if (switchboardLookupWormholeTargetPort(portalMeta->slot, &containerID, &targetPort) == false || switchboardRewriteWormholeIPv6TargetSKB(skb, &pckt, &containerID, targetPort) == false)
+  if (switchboardLookupWormholeTargetPort(portalMeta->slot, &containerID, &targetPort) == false ||
+      switchboardLearnAndRewriteLocalWormholeIPv6(skb, packet, &containerID, targetPort) == false)
   {
     return TC_ACT_SHOT;
   }
@@ -494,6 +577,200 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_ipv6_portal_
   }
 
   return TC_ACT_SHOT;
+}
+
+__attribute__((__always_inline__)) static inline int switchboardRedirectSelectedWormhole(struct __sk_buff *skb,
+                                                                                          const struct container_id *containerID,
+                                                                                          bool isIPv6,
+                                                                                          struct packet_description *packet)
+{
+  if (skb == NULL || containerID == NULL || containerID->hasID == false || packet == NULL)
+  {
+    return TC_ACT_SHOT;
+  }
+
+  void *data = (void *)(long)skb->data;
+  void *data_end = (void *)(long)skb->data_end;
+  struct ethhdr *eth = data;
+  struct portal_definition portal = {};
+  if (switchboardParsePortalPacket(skb, eth, data_end, isIPv6, packet) == false ||
+      switchboardPacketPortalDefinition(packet, isIPv6, &portal) == false)
+  {
+    return TC_ACT_SHOT;
+  }
+
+  struct portal_meta *meta = bpf_map_lookup_elem(&ext_portals, &portal);
+  __be16 targetPort = 0;
+  // The unchanged inner destination tuple is the canonical portal identity.
+  // Resolve its target-machine-local slot here; slot allocation order is not
+  // a cluster-wide wire contract.
+  if (meta == NULL ||
+      switchboardLookupWormholeTargetPort(meta->slot, containerID, &targetPort) == false)
+  {
+    return TC_ACT_SHOT;
+  }
+
+  bool rewritten = isIPv6
+                       ? switchboardLearnAndRewriteLocalWormholeIPv6(skb, packet, containerID, targetPort)
+                       : switchboardLearnAndRewriteLocalWormholeIPv4(skb, packet, containerID, targetPort);
+  if (rewritten == false)
+  {
+    return TC_ACT_SHOT;
+  }
+
+  data_end = (void *)(long)skb->data_end;
+  eth = (void *)(long)skb->data;
+  if ((void *)(eth + 1) > data_end)
+  {
+    return TC_ACT_SHOT;
+  }
+  null_mac_addresses(eth);
+  return redirectContainerFragment(containerID->value[4], true) ? TC_ACT_REDIRECT : TC_ACT_SHOT;
+}
+
+__attribute__((__always_inline__)) static inline int maybe_redirect_wormhole_overlay_packet(struct __sk_buff *skb,
+                                                                                             struct packet_description *packet,
+                                                                                             bool *handled)
+{
+  if (skb == NULL || packet == NULL || handled == NULL)
+  {
+    return TC_ACT_OK;
+  }
+  *handled = false;
+
+  __be16 wireProtocol = 0;
+  if (bpf_skb_load_bytes(skb, __builtin_offsetof(struct ethhdr, h_proto), &wireProtocol, sizeof(wireProtocol)) != 0)
+  {
+    return TC_ACT_OK;
+  }
+
+  __u32 outerBytes = 0;
+  __u32 outerProtocolOffset = 0;
+  if (wireProtocol == BE_ETH_P_IPV6)
+  {
+    outerBytes = sizeof(struct ipv6hdr);
+    outerProtocolOffset = sizeof(struct ethhdr) + __builtin_offsetof(struct ipv6hdr, nexthdr);
+  }
+  else if (wireProtocol == BE_ETH_P_IP)
+  {
+    outerBytes = sizeof(struct iphdr);
+    outerProtocolOffset = sizeof(struct ethhdr) + __builtin_offsetof(struct iphdr, protocol);
+  }
+  else
+  {
+    return TC_ACT_OK;
+  }
+
+  __u8 outerProtocol = 0;
+  __u8 outerVersion = 0;
+  if (bpf_skb_load_bytes(skb, sizeof(struct ethhdr), &outerVersion, sizeof(outerVersion)) != 0 ||
+      bpf_skb_load_bytes(skb, outerProtocolOffset, &outerProtocol, sizeof(outerProtocol)) != 0)
+  {
+    return TC_ACT_OK;
+  }
+  if (outerProtocol != IPPROTO_GRE)
+  {
+    return TC_ACT_OK;
+  }
+  *handled = true;
+  if (wireProtocol == BE_ETH_P_IPV6 ? (outerVersion >> 4) != 6u : outerVersion != 0x45u)
+  {
+    return TC_ACT_SHOT;
+  }
+
+  struct switchboard_wormhole_overlay_header wormhole = {};
+  __u32 wormholeOffset = sizeof(struct ethhdr) + outerBytes;
+  if (bpf_skb_load_bytes(skb, wormholeOffset, &wormhole, sizeof(wormhole)) != 0 ||
+      wormhole.flags != switchboardHostToBE16(SWITCHBOARD_WORMHOLE_GRE_FLAGS))
+  {
+    return TC_ACT_SHOT;
+  }
+  if (switchboardWormholeOverlayHeaderValid(&wormhole) == false)
+  {
+    return TC_ACT_SHOT;
+  }
+
+  void *data = (void *)(long)skb->data;
+  void *data_end = (void *)(long)skb->data_end;
+  struct ethhdr *outerEth = data;
+  __u32 zero = 0;
+  struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&lc_subnet, &zero);
+  if ((void *)(outerEth + 1) > data_end)
+  {
+    return TC_ACT_SHOT;
+  }
+  if (wireProtocol == BE_ETH_P_IPV6)
+  {
+    struct ipv6hdr *outer6 = (void *)(outerEth + 1);
+    if ((void *)(outer6 + 1) > data_end ||
+        overlayIngressPeerAuthorizedIPv6(skb, outer6->saddr.s6_addr, outer6->daddr.s6_addr, localSubnet) == false)
+    {
+      return TC_ACT_SHOT;
+    }
+  }
+  else
+  {
+    struct iphdr *outer4 = (void *)(outerEth + 1);
+    if ((void *)(outer4 + 1) > data_end ||
+        overlayIngressPeerAuthorizedIPv4(outer4->saddr, outer4->daddr) == false)
+    {
+      return TC_ACT_SHOT;
+    }
+  }
+
+  __u32 innerOffset = wormholeOffset + sizeof(wormhole);
+  __u8 version = 0;
+  if (bpf_skb_load_bytes(skb, innerOffset, &version, sizeof(version)) != 0 ||
+      (wormhole.protocol == BE_ETH_P_IPV6 ? (version >> 4) != 6u : version != 0x45u))
+  {
+    return TC_ACT_SHOT;
+  }
+
+  __u32 transportProtocolOffset = innerOffset + (wormhole.protocol == BE_ETH_P_IPV6
+                                                      ? __builtin_offsetof(struct ipv6hdr, nexthdr)
+                                                      : __builtin_offsetof(struct iphdr, protocol));
+  __u8 transportProtocol = 0;
+  if (bpf_skb_load_bytes(skb, transportProtocolOffset, &transportProtocol, sizeof(transportProtocol)) != 0 ||
+      (transportProtocol != IPPROTO_TCP && transportProtocol != IPPROTO_UDP))
+  {
+    return TC_ACT_SHOT;
+  }
+  __u32 minimumBytes = switchboardHostIngressWormholeOverlayMinimumLinearBytes(wireProtocol,
+                                                                               wormhole.protocol,
+                                                                               transportProtocol);
+  if (minimumBytes == 0u || bpf_skb_pull_data(skb, minimumBytes) != 0)
+  {
+    return TC_ACT_SHOT;
+  }
+
+  struct container_id containerID = {};
+  if (switchboardWormholeOverlayContainerID(&wormhole, &containerID) == false ||
+      switchboardContainerIDTargetsLocalMachine(&containerID, localSubnet) == false)
+  {
+    return TC_ACT_SHOT;
+  }
+
+  __u64 decapFlags = switchboardAdjustRoomPreserveOffloadFlags() |
+                     (wormhole.protocol == BE_ETH_P_IPV6 ? BPF_F_ADJ_ROOM_DECAP_L3_IPV6 : BPF_F_ADJ_ROOM_DECAP_L3_IPV4);
+  if (bpf_skb_adjust_room(skb,
+                          -(__s32)(outerBytes + sizeof(wormhole)),
+                          BPF_ADJ_ROOM_MAC,
+                          decapFlags) != 0)
+  {
+    return TC_ACT_SHOT;
+  }
+
+  data_end = (void *)(long)skb->data_end;
+  struct ethhdr *eth = (void *)(long)skb->data;
+  if ((void *)(eth + 1) > data_end || skb->protocol != wormhole.protocol)
+  {
+    return TC_ACT_SHOT;
+  }
+  eth->h_proto = wormhole.protocol;
+  return switchboardRedirectSelectedWormhole(skb,
+                                              &containerID,
+                                              wormhole.protocol == BE_ETH_P_IPV6,
+                                              packet);
 }
 
 __attribute__((__always_inline__)) static inline bool maybe_decap_overlay_packet(struct __sk_buff *skb)
@@ -723,6 +1000,8 @@ int host_ingress(struct __sk_buff *skb)
     return TC_ACT_SHOT;
   }
 
+  struct packet_description portalPacket = {};
+
   bool handledWhiteholeReply = false;
   int whiteholeReplyAction = maybe_redirect_whitehole_reply(eth, data_end, &handledWhiteholeReply);
   if (handledWhiteholeReply)
@@ -730,15 +1009,22 @@ int host_ingress(struct __sk_buff *skb)
     return whiteholeReplyAction;
   }
 
+  bool handledWormholeOverlay = false;
+  int wormholeOverlayAction = maybe_redirect_wormhole_overlay_packet(skb, &portalPacket, &handledWormholeOverlay);
+  if (handledWormholeOverlay)
+  {
+    return wormholeOverlayAction;
+  }
+
   bool handledIPv4Portal = false;
-  int ipv4PortalAction = maybe_redirect_ipv4_portal_packet(skb, eth, data_end, &handledIPv4Portal);
+  int ipv4PortalAction = maybe_redirect_ipv4_portal_packet(skb, eth, data_end, &portalPacket, &handledIPv4Portal);
   if (handledIPv4Portal)
   {
     return ipv4PortalAction;
   }
 
   bool handledIPv6Portal = false;
-  int ipv6PortalAction = maybe_redirect_ipv6_portal_packet(skb, eth, data_end, &handledIPv6Portal);
+  int ipv6PortalAction = maybe_redirect_ipv6_portal_packet(skb, eth, data_end, &portalPacket, &handledIPv6Portal);
   if (handledIPv6Portal)
   {
     return ipv6PortalAction;
@@ -812,7 +1098,11 @@ int host_ingress(struct __sk_buff *skb)
     if (decapped)
     {
       bool handledDecappedIPv6Portal = false;
-      int decappedIPv6PortalAction = maybe_redirect_ipv6_portal_packet(skb, eth, data_end, &handledDecappedIPv6Portal);
+      int decappedIPv6PortalAction = maybe_redirect_ipv6_portal_packet(skb,
+                                                                       eth,
+                                                                       data_end,
+                                                                       &portalPacket,
+                                                                       &handledDecappedIPv6Portal);
       if (handledDecappedIPv6Portal)
       {
         return decappedIPv6PortalAction;
@@ -883,7 +1173,11 @@ int host_ingress(struct __sk_buff *skb)
     }
 
     bool handledDecappedIPv4Portal = false;
-    int decappedIPv4PortalAction = maybe_redirect_ipv4_portal_packet(skb, eth, data_end, &handledDecappedIPv4Portal);
+    int decappedIPv4PortalAction = maybe_redirect_ipv4_portal_packet(skb,
+                                                                     eth,
+                                                                     data_end,
+                                                                     &portalPacket,
+                                                                     &handledDecappedIPv4Portal);
     if (handledDecappedIPv4Portal)
     {
       return decappedIPv4PortalAction;

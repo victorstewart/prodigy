@@ -9,23 +9,6 @@
 
 #include <bpf/bpf_endian.h>
 
-// Public wormhole rewrites must tolerate browser/TLS first-flight packets and
-// QUIC replies that exceed a single MTU after GRO/GSO coalescing. Keep the
-// verifier-visible walk bounded, but leave enough room for observed 2052-byte
-// TCP portal segments instead of pinning the ceiling to one captured packet.
-#define SWITCHBOARD_MAX_WORMHOLE_CHECKSUM_BYTES 4096u
-#define SWITCHBOARD_WORMHOLE_SKB_CHECKSUM_CHUNK_BYTES 128u
-
-__attribute__((__always_inline__)) static inline __u32 switchboardManualChecksumMaxBytes(void)
-{
-  return SWITCHBOARD_MAX_WORMHOLE_CHECKSUM_BYTES;
-}
-
-__attribute__((__always_inline__)) static inline __u32 switchboardManualChecksumSKBChunkBytes(void)
-{
-  return SWITCHBOARD_WORMHOLE_SKB_CHECKSUM_CHUNK_BYTES;
-}
-
 struct switchboard_ipv6_skb_layout {
   __u64 l3Offset;
   __u64 transportOffset;
@@ -84,23 +67,6 @@ __attribute__((__always_inline__)) static inline __u64 switchboardPacketRewriteS
   return BPF_F_RECOMPUTE_CSUM | BPF_F_INVALIDATE_HASH;
 }
 
-__attribute__((__always_inline__)) static inline __u64 switchboardPacketRewriteManualChecksumStoreFlags(void)
-{
-  // When a path recomputes the full transport checksum from the mutated
-  // packet bytes, keep the final checksum-word store from layering helper
-  // incremental checksum updates on top of the full recompute.
-  return BPF_F_INVALIDATE_HASH;
-}
-
-__attribute__((__always_inline__)) static inline __u64 switchboardPacketRewriteManualChecksumDataStoreFlags(void)
-{
-  // Large UDP_SEGMENT / GRO packets can survive the full checksum rewrite only
-  // if the intermediate tuple-byte stores still keep skb checksum/GSO
-  // metadata coherent. Only the final checksum-word write should skip helper
-  // incremental checksum updates.
-  return switchboardPacketRewriteStoreFlags();
-}
-
 __attribute__((__always_inline__)) static inline __u64 switchboardAdjustRoomPreserveOffloadFlags(void)
 {
   // Non-encap grow/shrink paths still need to preserve both checksum and GSO
@@ -155,57 +121,6 @@ __attribute__((__always_inline__)) static inline __u64 checksum_word_accumulate_
 __attribute__((__always_inline__)) static inline __u16 checksum_word_sum_network_order(const void *value, __u32 byteCount)
 {
   return fold_l4_checksum_sum16(checksum_word_accumulate_network_order(value, byteCount));
-}
-
-__attribute__((__always_inline__)) static inline __u16 checksum_word_sum_network_order_zeroed_word16(const void *value, __u32 byteCount, __u32 zeroWordByteOffset)
-{
-  const __u8 *bytes = (const __u8 *)value;
-  __u64 sum = 0;
-
-#pragma clang loop unroll(disable)
-  for (__u32 index = 0; index < byteCount; index += 2)
-  {
-    if (index == zeroWordByteOffset)
-    {
-      continue;
-    }
-
-    __u8 low = 0;
-    if (index + 1 < byteCount)
-    {
-      low = bytes[index + 1];
-    }
-
-    sum += (((__u64)bytes[index]) << 8) | ((__u64)low);
-  }
-
-  return fold_l4_checksum_sum16(sum);
-}
-
-__attribute__((__always_inline__)) static inline __u16 compute_ipv6_transport_checksum_portable(
-    const void *srcv6,
-    const void *dstv6,
-    __u8 nextHeader,
-    const void *segment,
-    __u32 segmentSize,
-    __u32 checksumByteOffset)
-{
-  __u8 lengthBytes[4] = {
-      (__u8)((segmentSize >> 24) & 0xffu),
-      (__u8)((segmentSize >> 16) & 0xffu),
-      (__u8)((segmentSize >> 8) & 0xffu),
-      (__u8)(segmentSize & 0xffu)};
-  __u8 nextHeaderBytes[4] = {0, 0, 0, nextHeader};
-
-  __u64 csum = 0;
-  csum += checksum_word_accumulate_network_order(srcv6, 16);
-  csum += checksum_word_accumulate_network_order(dstv6, 16);
-  csum += checksum_word_accumulate_network_order(lengthBytes, sizeof(lengthBytes));
-  csum += checksum_word_accumulate_network_order(nextHeaderBytes, sizeof(nextHeaderBytes));
-  csum += checksum_word_sum_network_order_zeroed_word16(segment, segmentSize, checksumByteOffset);
-
-  __u16 folded = fold_l4_checksum_sum16(csum);
-  return normalize_l4_checksum_word16(bpf_htons((__u16)(~folded & 0xffffu)));
 }
 
 __attribute__((__always_inline__)) static inline __u16 replace_l4_checksum_portable(__u16 checksum, const void *old_value, const void *new_value, __u32 size)

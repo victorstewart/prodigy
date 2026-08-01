@@ -677,6 +677,10 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
         }
         return (cursor == terminal);
       }
+    case NeuronTopic::openSwitchboardWormholes:
+      {
+        return consumeVariable(cursor, terminal) && cursor == terminal;
+      }
     case NeuronTopic::containerStatistics:
       {
         uint64_t deploymentID = 0;
@@ -1004,11 +1008,6 @@ static bool validateNeuronPayloadForNeuron(uint16_t rawTopic, uint8_t *args, uin
       }
     case NeuronTopic::openSwitchboardWormholes:
       {
-        uint32_t containerID = 0;
-        if (extractFixed(cursor, terminal, containerID) == false)
-        {
-          return false;
-        }
         return consumeVariable(cursor, terminal) && cursor == terminal;
       }
     case NeuronTopic::refreshContainerWormholes:

@@ -5331,6 +5331,47 @@ static void serialize(S&& serializer, Wormhole& wormhole)
   serializer.object(wormhole.quicCidKeyState);
 }
 
+enum class SwitchboardWormholeOperationStatus : uint8_t {
+  request = 0,
+  applied,
+  rejected,
+  rollbackFailed,
+};
+
+struct SwitchboardWormholeOperation {
+  constexpr static uint32_t maximumDesiredBytes = 1024u * 1024u;
+
+  uint32_t containerID = 0;
+  SwitchboardWormholeOperationStatus status = SwitchboardWormholeOperationStatus::request;
+  String revision;
+  String desired;
+};
+
+template <typename S>
+static void serialize(S&& serializer, SwitchboardWormholeOperation& operation)
+{
+  serializer.value4b(operation.containerID);
+  serializer.value1b(operation.status);
+  serializer.text1b(operation.revision, 64);
+  serializer.text1b(operation.desired, SwitchboardWormholeOperation::maximumDesiredBytes);
+}
+
+static inline bool wormholeTargetBindingsUnique(const Vector<Wormhole>& wormholes)
+{
+  for (uint32_t index = 0; index < wormholes.size(); ++index)
+  {
+    for (uint32_t other = index + 1; other < wormholes.size(); ++other)
+    {
+      if (wormholes[index].containerPort == wormholes[other].containerPort &&
+          wormholes[index].layer4 == wormholes[other].layer4)
+      {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 static inline bool wormholeDNSRecordType(const Wormhole& wormhole, String& type, String *failure = nullptr)
 {
   type = wormhole.dns.type;
@@ -7992,6 +8033,12 @@ public:
   uint16_t runtimeLogicalCores = 0;
   uint32_t runtimeMemoryMB = 0;
   uint32_t runtimeStorageMB = 0;
+  String wormholeRuntimeRevision;
+  String wormholeRuntimeDesired;
+  Vector<uint32_t> wormholeRuntimePendingMachines;
+  Vector<uint32_t> wormholeRuntimeFailedMachines;
+  String wormholeRuntimeFailure;
+  bool wormholeRuntimeFailureSuppressedReady = false;
 };
 
 template <typename S>
@@ -8003,6 +8050,12 @@ static void serialize(S&& serializer, BrainReplicatedContainerRuntimeState& stat
   serializer.value2b(state.runtimeLogicalCores);
   serializer.value4b(state.runtimeMemoryMB);
   serializer.value4b(state.runtimeStorageMB);
+  serializer.text1b(state.wormholeRuntimeRevision, 64);
+  serializer.text1b(state.wormholeRuntimeDesired, SwitchboardWormholeOperation::maximumDesiredBytes);
+  serializer.object(state.wormholeRuntimePendingMachines);
+  serializer.object(state.wormholeRuntimeFailedMachines);
+  serializer.text1b(state.wormholeRuntimeFailure, 4096);
+  serializer.value1b(state.wormholeRuntimeFailureSuppressedReady);
 }
 
 class DeploymentPlan {

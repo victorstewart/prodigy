@@ -422,6 +422,7 @@ static void prodigySyncOverlayPresenceMap(BPFProgram *program,
   }
 
   bool mapInfoAvailable = false;
+  bool converged = false;
   uint32_t mapID = 0;
   program->openMap(mapName, [&](int map_fd) -> void {
     if (map_fd < 0)
@@ -434,20 +435,48 @@ static void prodigySyncOverlayPresenceMap(BPFProgram *program,
     __u32 mapInfoLen = sizeof(mapInfo);
     mapInfoAvailable = (bpf_map_get_info_by_fd(map_fd, &mapInfo, &mapInfoLen) == 0);
     mapID = mapInfoAvailable ? uint32_t(mapInfo.id) : 0;
+    if (mapInfoAvailable == false)
+    {
+      basics_log("Prodigy overlay presence map info failed map=%s errno=%d\n", mapName.c_str(), errno);
+      return;
+    }
 
     const bool mirrorTrusted = mapInfoAvailable && installed.mapID != 0 && installed.mapID == mapID;
-    const bool mapRecreated = mapInfoAvailable && installed.mapID != 0 && installed.mapID != mapID;
+    Vector<Key> actualKeys = {};
+    if (mirrorTrusted == false)
+    {
+      Key current = {};
+      Key next = {};
+      bool haveCurrent = false;
+      int nextResult = 0;
+      while ((nextResult = bpf_map_get_next_key(map_fd, haveCurrent ? &current : nullptr, &next)) == 0)
+      {
+        actualKeys.push_back(next);
+        current = next;
+        haveCurrent = true;
+      }
+      if (errno != ENOENT)
+      {
+        basics_log("Prodigy overlay presence enumerate failed map=%s errno=%d\n", mapName.c_str(), errno);
+        return;
+      }
+      std::sort(actualKeys.begin(), actualKeys.end(), less);
+    }
+
+    const Vector<Key>& actual = mirrorTrusted ? installed.keys : actualKeys;
+    bool operationsSucceeded = true;
     __u8 present = 1;
-    auto installedIt = installed.keys.begin();
+    auto installedIt = actual.begin();
     auto desiredIt = desiredKeys.begin();
 
-    while (installedIt != installed.keys.end() || desiredIt != desiredKeys.end())
+    while (installedIt != actual.end() || desiredIt != desiredKeys.end())
     {
-      if (installedIt == installed.keys.end())
+      if (installedIt == actual.end())
       {
         if (bpf_map_update_elem(map_fd, &(*desiredIt), &present, BPF_ANY) != 0)
         {
           basics_log("Prodigy overlay presence update failed map=%s errno=%d\n", mapName.c_str(), errno);
+          operationsSucceeded = false;
         }
         ++desiredIt;
         continue;
@@ -455,9 +484,10 @@ static void prodigySyncOverlayPresenceMap(BPFProgram *program,
 
       if (desiredIt == desiredKeys.end())
       {
-        if (mapRecreated == false && bpf_map_delete_elem(map_fd, &(*installedIt)) != 0)
+        if (bpf_map_delete_elem(map_fd, &(*installedIt)) != 0 && errno != ENOENT)
         {
           basics_log("Prodigy overlay presence delete failed map=%s errno=%d\n", mapName.c_str(), errno);
+          operationsSucceeded = false;
         }
         ++installedIt;
         continue;
@@ -465,9 +495,10 @@ static void prodigySyncOverlayPresenceMap(BPFProgram *program,
 
       if (less(*installedIt, *desiredIt))
       {
-        if (mapRecreated == false && bpf_map_delete_elem(map_fd, &(*installedIt)) != 0)
+        if (bpf_map_delete_elem(map_fd, &(*installedIt)) != 0 && errno != ENOENT)
         {
           basics_log("Prodigy overlay presence delete failed map=%s errno=%d\n", mapName.c_str(), errno);
+          operationsSucceeded = false;
         }
         ++installedIt;
         continue;
@@ -478,6 +509,7 @@ static void prodigySyncOverlayPresenceMap(BPFProgram *program,
         if (bpf_map_update_elem(map_fd, &(*desiredIt), &present, BPF_ANY) != 0)
         {
           basics_log("Prodigy overlay presence update failed map=%s errno=%d\n", mapName.c_str(), errno);
+          operationsSucceeded = false;
         }
         ++desiredIt;
         continue;
@@ -486,14 +518,24 @@ static void prodigySyncOverlayPresenceMap(BPFProgram *program,
       if (mirrorTrusted == false && bpf_map_update_elem(map_fd, &(*desiredIt), &present, BPF_ANY) != 0)
       {
         basics_log("Prodigy overlay presence update failed map=%s errno=%d\n", mapName.c_str(), errno);
+        operationsSucceeded = false;
       }
       ++installedIt;
       ++desiredIt;
     }
+    converged = operationsSucceeded;
   });
 
-  installed.keys = desiredKeys;
-  installed.mapID = mapInfoAvailable ? mapID : 0;
+  if (mapInfoAvailable && converged)
+  {
+    installed.keys = desiredKeys;
+    installed.mapID = mapID;
+  }
+  else
+  {
+    installed.keys.clear();
+    installed.mapID = 0;
+  }
 }
 
 template <typename Key, typename Value, StringType MapName, typename Less, typename ValueEquals>
@@ -639,6 +681,55 @@ static void prodigyBuildOverlayDesiredHostedIngressRoutes(const SwitchboardOverl
                                                           Vector<std::pair<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6>>& desiredRoutes6)
 {
   switchboardBuildOverlayHostedIngressRouteEntries(config.hostedIngressRoutes, desiredRoutes4, desiredRoutes6);
+}
+
+static bool prodigyOverlayIngressPeer4KeyLess(const switchboard_overlay_ingress_peer4_key& lhs,
+                                              const switchboard_overlay_ingress_peer4_key& rhs)
+{
+  if (lhs.source != rhs.source)
+  {
+    return lhs.source < rhs.source;
+  }
+  return lhs.destination < rhs.destination;
+}
+
+static bool prodigyOverlayIngressPeer6KeyLess(const switchboard_overlay_ingress_peer6_key& lhs,
+                                              const switchboard_overlay_ingress_peer6_key& rhs)
+{
+  int sourceOrder = std::memcmp(lhs.source, rhs.source, sizeof(lhs.source));
+  return sourceOrder != 0 ? sourceOrder < 0 : std::memcmp(lhs.destination, rhs.destination, sizeof(lhs.destination)) < 0;
+}
+
+static void prodigySyncOverlayIngressPeers(BPFProgram *program,
+                                           const SwitchboardOverlayRoutingConfig& config,
+                                           ProdigyOverlayPresenceMirror<switchboard_overlay_ingress_peer4_key>& installed4,
+                                           ProdigyOverlayPresenceMirror<switchboard_overlay_ingress_peer6_key>& installed6)
+{
+  Vector<switchboard_overlay_ingress_peer4_key> peers4 = {};
+  Vector<switchboard_overlay_ingress_peer6_key> peers6 = {};
+  for (const SwitchboardOverlayMachineRoute& route : config.machineRoutes)
+  {
+    switchboard_overlay_machine_route value = {};
+    if (switchboardBuildOverlayMachineRouteValue(route, value) == false)
+    {
+      continue;
+    }
+
+    if (value.family == SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV4)
+    {
+      peers4.push_back({.source = value.next_hop4, .destination = value.source4});
+    }
+    else if (value.family == SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6)
+    {
+      switchboard_overlay_ingress_peer6_key key = {};
+      std::memcpy(key.source, value.next_hop6, sizeof(key.source));
+      std::memcpy(key.destination, value.source6, sizeof(key.destination));
+      peers6.push_back(key);
+    }
+  }
+
+  prodigySyncOverlayPresenceMap(program, "ovl_peer4"_ctv, installed4, peers4, prodigyOverlayIngressPeer4KeyLess);
+  prodigySyncOverlayPresenceMap(program, "ovl_peer6"_ctv, installed6, peers6, prodigyOverlayIngressPeer6KeyLess);
 }
 
 static void prodigySyncOverlayEgressRoutingProgram(BPFProgram *program,
@@ -1483,6 +1574,14 @@ public:
     return peerMapID != 0 && peerMapID == primaryMapID;
   }
 
+  bool wormholeFlowMapsShared(void) const
+  {
+    return plan.wormholes.empty() ||
+           (thisNeuron != nullptr &&
+           switchboardProgramUsesPinnedWormholeFlowMaps(peer_program, thisNeuron->eth.ifidx) &&
+           switchboardProgramUsesPinnedWormholeFlowMaps(primary_program, thisNeuron->eth.ifidx));
+  }
+
   uint32_t desiredInterContainerMTU(String *failureReport = nullptr) const
   {
     if (thisNeuron == nullptr)
@@ -1492,29 +1591,29 @@ public:
 
     const uint32_t configuredMTU = thisNeuron->configuredInterContainerMTU;
     const uint32_t hostMTU = thisNeuron->eth.mtu;
-    if (configuredMTU == 0)
+    const bool hasWormholes = plan.wormholes.empty() == false;
+    const uint32_t safeMTU = switchboardPacketBudgetRemoteInnerMTU(hostMTU, hasWormholes);
+    if ((hasWormholes && switchboardPacketBudgetExternalIngressUnderlayMTUValid(hostMTU) == false) ||
+        (configuredMTU != 0 && configuredMTU > safeMTU))
     {
-      return hostMTU;
-    }
-
-    if (hostMTU != 0 && hostMTU < configuredMTU)
-    {
-      basics_log("container netkit mtu mismatch uuid=%llu configured=%u hostMTU=%u hostIfidx=%u\n",
+      basics_log("container netkit mtu budget mismatch uuid=%llu configured=%u hostMTU=%u safeMTU=%u wormholes=%d hostIfidx=%u\n",
                  (unsigned long long)plan.uuid,
                  unsigned(configuredMTU),
                  unsigned(hostMTU),
+                 unsigned(safeMTU),
+                 int(hasWormholes),
                  unsigned(thisNeuron->eth.ifidx));
       if (failureReport && failureReport->size() == 0)
       {
-        failureReport->snprintf<"configured inter-container mtu {itoa} exceeds host mtu {itoa} for container {itoa}"_ctv>(
+        failureReport->snprintf<"inter-container mtu {itoa} exceeds safe underlay budget {itoa} for container {itoa}"_ctv>(
             uint64_t(configuredMTU),
-            uint64_t(hostMTU),
+            uint64_t(safeMTU),
             plan.uuid);
       }
       return 0;
     }
 
-    return configuredMTU;
+    return configuredMTU != 0 ? configuredMTU : safeMTU;
   }
 
   bool buildContainerNetworkPolicy(struct container_network_policy& networkPolicy, String *failureReport = nullptr) const
@@ -1536,7 +1635,7 @@ public:
                                                           : CONTAINER_NETWORK_UNRESTRICTED);
     networkPolicy.containerFragment = plan.fragment;
     networkPolicy.interContainerMTU = desiredInterContainerMTU(failureReport);
-    return !(thisNeuron && thisNeuron->configuredInterContainerMTU != 0 && networkPolicy.interContainerMTU == 0);
+    return networkPolicy.interContainerMTU != 0;
   }
 
   bool applyHostMTUToNetkitPair(String *failureReport = nullptr)
@@ -1544,7 +1643,7 @@ public:
     uint32_t desiredMTU = desiredInterContainerMTU(failureReport);
     if (desiredMTU == 0)
     {
-      return !(thisNeuron && thisNeuron->configuredInterContainerMTU != 0);
+      return false;
     }
 
     // Keep the runtime-created container netkit pair on the same packet
@@ -1750,6 +1849,23 @@ public:
     {
       primary_program->setArrayElement("lc_subnet"_ctv, 0, thisNeuron->lcsubnet6);
       primary_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
+    }
+
+    if (peer_program == nullptr || primary_program == nullptr || wormholeFlowMapsShared() == false)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("container wormhole flow state unavailable"_ctv);
+      }
+      if (peernetnsfd >= 0)
+      {
+        ::close(peernetnsfd);
+      }
+      if (hostnetnsfd >= 0)
+      {
+        ::close(hostnetnsfd);
+      }
+      return false;
     }
 
     if (plan.networkAccess == ContainerNetworkAccess::declaredOnly &&
@@ -1966,9 +2082,17 @@ public:
     peer_program = host.attachBPF(prodigyContainerEgressNetkitAttachType(), path, "ct_egress"_ctv,
                                   [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
                                     (void)switchboardReusePinnedWhiteholeReplyFlowMap(obj, thisNeuron->eth.ifidx, inner_map_fds);
+                                    (void)switchboardReusePinnedWormholeFlowMaps(obj, thisNeuron->eth.ifidx, inner_map_fds);
                                   });
-    if (peer_program == nullptr)
+    if (peer_program == nullptr ||
+        (plan.wormholes.empty() == false &&
+         switchboardProgramUsesPinnedWormholeFlowMaps(peer_program, thisNeuron->eth.ifidx) == false))
     {
+      if (peer_program)
+      {
+        host.detachBPF(prodigyContainerEgressNetkitAttachType());
+        peer_program = nullptr;
+      }
       if (failureReport)
       {
         failureReport->snprintf<"failed to attach container egress bpf for container {itoa} path={}"_ctv>(plan.uuid, path);
@@ -2034,13 +2158,21 @@ public:
     bool tcpFlowMapReused = plan.networkAccess != ContainerNetworkAccess::declaredOnly;
     primary_program = host.attachBPF(prodigyContainerIngressNetkitAttachType(), path, "ct_ingress"_ctv,
                                      [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
+                                       (void)switchboardReusePinnedWormholeFlowMaps(obj, thisNeuron->eth.ifidx, inner_map_fds);
                                        if (plan.networkAccess == ContainerNetworkAccess::declaredOnly)
                                        {
                                          tcpFlowMapReused = switchboardReusePinnedContainerTCPFlowMap(obj, netdevs.host.ifidx, inner_map_fds);
                                        }
                                      });
-    if (primary_program == nullptr)
+    if (primary_program == nullptr ||
+        (plan.wormholes.empty() == false &&
+         switchboardProgramUsesPinnedWormholeFlowMaps(primary_program, thisNeuron->eth.ifidx) == false))
     {
+      if (primary_program)
+      {
+        host.detachBPF(prodigyContainerIngressNetkitAttachType());
+        primary_program = nullptr;
+      }
       if (failureReport)
       {
         failureReport->snprintf<"failed to attach container ingress bpf for container {itoa} path={}"_ctv>(plan.uuid, path);

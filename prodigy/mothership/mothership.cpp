@@ -11941,6 +11941,12 @@ private:
         exit(EXIT_FAILURE);
       }
 
+      if (wormholeTargetBindingsUnique(plan.wormholes) == false)
+      {
+        basics_log("wormholes require unique containerPort and layer4 targets\n");
+        exit(EXIT_FAILURE);
+      }
+
       for (uint32_t index = 0; index < plan.wormholes.size(); index += 1)
       {
         const Wormhole& wormhole = plan.wormholes[index];

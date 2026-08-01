@@ -13,5 +13,10 @@ int host_egress(struct __sk_buff *skb)
   {
     return TC_ACT_SHOT;
   }
-  return switchboardRouteOutboundEthFrame(skb, eth, data_end);
+  int result = switchboardRouteOutboundEthFrame(skb, eth, data_end);
+  if (skb->mark == SWITCHBOARD_WORMHOLE_REPLY_VALIDATED_SKB_MARK)
+  {
+    skb->mark = 0;
+  }
+  return result;
 }

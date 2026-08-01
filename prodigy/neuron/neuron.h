@@ -103,6 +103,8 @@ protected:
   ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> installedIngressOverlayRouteKeysLow8;
   ProdigyOverlayValueMirror<switchboard_overlay_prefix4_key, switchboard_overlay_hosted_ingress_route4> installedIngressHostedIngressRouteKeys4;
   ProdigyOverlayValueMirror<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6> installedIngressHostedIngressRouteKeys6;
+  ProdigyOverlayPresenceMirror<switchboard_overlay_ingress_peer4_key> installedIngressOverlayPeers4;
+  ProdigyOverlayPresenceMirror<switchboard_overlay_ingress_peer6_key> installedIngressOverlayPeers6;
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix4_key> installedEgressOverlayPrefixes4;
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix6_key> installedEgressOverlayPrefixes6;
   ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> installedOverlayRouteKeysFull;
@@ -129,6 +131,81 @@ protected:
   uint32_t brainControlKeepaliveSeconds = 15;
   TimeoutPacket metricsTick;
   bool metricsTickQueued = false;
+  class WormholeFlowGC final : public TimeoutDispatcher {
+    class PinnedMap {
+    public:
+      uint32_t ifindex = 0;
+
+      template <typename Name, typename Callback>
+      void openMap(Name&& name, Callback&& callback)
+      {
+        String path = {};
+        if (name.equal("wh_flows"_ctv))
+        {
+          switchboardWormholeFlowPinPath(path, ifindex);
+        }
+        else if (name.equal("wh_pending"_ctv))
+        {
+          switchboardWormholePendingFlowPinPath(path, ifindex);
+        }
+        else
+        {
+          callback(-1);
+          return;
+        }
+        int mapFD = bpf_obj_get(path.c_str());
+        callback(mapFD);
+        if (mapFD >= 0)
+        {
+          ::close(mapFD);
+        }
+      }
+    } map;
+
+    TimeoutPacket tick;
+    SwitchboardWormholeFlowGCCursor cursor;
+    bool stopping = false;
+
+    void arm(void)
+    {
+      tick.clear();
+      tick.dispatcher = this;
+      tick.setTimeoutMs(WORMHOLE_FLOW_GC_INTERVAL_MS);
+      Ring::queueTimeout(&tick);
+    }
+
+  public:
+    explicit WormholeFlowGC(uint32_t ifindex)
+    {
+      map.ifindex = ifindex;
+      arm();
+    }
+
+    void stop(void)
+    {
+      if (stopping == false)
+      {
+        stopping = true;
+        Ring::queueCancelTimeout(&tick);
+      }
+    }
+
+    void dispatchTimeout(TimeoutPacket *packet) override
+    {
+      if (packet != &tick)
+      {
+        return;
+      }
+      if (stopping)
+      {
+        delete this;
+        return;
+      }
+      (void)switchboardCleanupExpiredWormholeFlows(&map, monotonicNowNs(), cursor);
+      arm();
+    }
+  };
+  WormholeFlowGC *wormholeFlowGC = nullptr;
   TimeoutPacket failedContainerArtifactGCTick;
   bool failedContainerArtifactGCTickQueued = false;
   MachineHardwareProfile hardwareProfile;
@@ -549,6 +626,10 @@ protected:
                                            installedIngressOverlayRouteKeysLow8,
                                            installedIngressHostedIngressRouteKeys4,
                                            installedIngressHostedIngressRouteKeys6);
+    prodigySyncOverlayIngressPeers(tcx_ingress_program,
+                                   overlayRoutingConfig,
+                                   installedIngressOverlayPeers4,
+                                   installedIngressOverlayPeers6);
 
     prodigySyncOverlayEgressRoutingProgram(tcx_egress_program,
                                            overlayRoutingConfig,
@@ -908,6 +989,14 @@ protected:
     }
 
     armMetricsTick(cadenceMs);
+  }
+
+  void ensureWormholeFlowGCTickQueued(void)
+  {
+    if (wormholeFlowGC == nullptr && tcx_egress_program != nullptr && eth.ifidx != 0)
+    {
+      wormholeFlowGC = new WormholeFlowGC(uint32_t(eth.ifidx));
+    }
   }
 
   void armFailedContainerArtifactGCTick(void)
@@ -2128,7 +2217,7 @@ protected:
 
   void refreshContainerSwitchboardWormholes(Container *container) override
   {
-    if (container == nullptr || container->plan.wormholes.empty())
+    if (container == nullptr)
     {
       return;
     }
@@ -2137,7 +2226,13 @@ protected:
     uint32_t containerID = generateLocalContainerID(container->plan.fragment);
 
     activeSwitchboard->setLocalContainerSubnet(lcsubnet6);
-    activeSwitchboard->openWormholes(containerID, container->plan.wormholes);
+    SwitchboardWormholeOperationStatus status = activeSwitchboard->openWormholes(containerID, container->plan.wormholes);
+    if (status != SwitchboardWormholeOperationStatus::applied)
+    {
+      basics_log("neuron wormhole refresh failed containerID=%u count=%u\n",
+                 containerID,
+                 unsigned(container->plan.wormholes.size()));
+    }
     syncSwitchboardBalancerOverlayRoutingProgram();
 
     // Wormhole refresh must also converge the target container's live peer
@@ -2163,12 +2258,13 @@ protected:
 
   void syncContainerSwitchboardRuntime(Container *container) override
   {
-    if (switchboard == nullptr || container == nullptr || container->plan.useHostNetworkNamespace || container->peer_program == nullptr)
+    if (switchboard == nullptr || container == nullptr || container->plan.useHostNetworkNamespace ||
+        container->peer_program == nullptr || container->primary_program == nullptr)
     {
       return;
     }
 
-    switchboard->syncPeerProgramRuntimeState(container->peer_program);
+    switchboard->syncContainerProgramRuntimeState(container->peer_program, container->primary_program);
   }
 
   NeuronBGPRuntime *ensureBGP(void)
@@ -2206,9 +2302,41 @@ protected:
     }
     else if (hostRouterBPFEnabled)
     {
-      if ((tcx_egress_program = eth.loadPreattachedProgram(BPF_TCX_EGRESS, hostEgressPath)) == nullptr)
+      bool reuseWormholeFlowMaps = switchboardPinnedWormholeFlowMapsCompatible(eth.ifidx);
+      tcx_egress_program = eth.loadPreattachedProgram(BPF_TCX_EGRESS, hostEgressPath);
+      if (tcx_egress_program)
       {
-        tcx_egress_program = eth.attachBPF(BPF_TCX_EGRESS, hostEgressPath, "host_egress"_ctv);
+        if (switchboardProgramHasCompatibleWormholeFlowMaps(tcx_egress_program) == false ||
+            (reuseWormholeFlowMaps &&
+             switchboardProgramUsesPinnedWormholeFlowMaps(tcx_egress_program, eth.ifidx) == false))
+        {
+          basics_log("setupNetworking detaching stale host egress without authoritative wormhole flow maps path=%s ifidx=%d\n",
+                     hostEgressPath.c_str(), eth.ifidx);
+          eth.detachBPF(BPF_TCX_EGRESS);
+          tcx_egress_program = nullptr;
+        }
+      }
+
+      if (tcx_egress_program == nullptr)
+      {
+        bool mapsReused = reuseWormholeFlowMaps == false;
+        tcx_egress_program = eth.attachBPF(BPF_TCX_EGRESS, hostEgressPath, "host_egress"_ctv,
+                                           [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
+                                             if (reuseWormholeFlowMaps)
+                                             {
+                                               mapsReused = switchboardReusePinnedWormholeFlowMaps(obj, eth.ifidx, inner_map_fds);
+                                             }
+                                           });
+        if (tcx_egress_program &&
+            (mapsReused == false ||
+             (reuseWormholeFlowMaps &&
+              switchboardProgramUsesPinnedWormholeFlowMaps(tcx_egress_program, eth.ifidx) == false)))
+        {
+          basics_log("setupNetworking detaching host egress that failed authoritative wormhole map reuse path=%s ifidx=%d\n",
+                     hostEgressPath.c_str(), eth.ifidx);
+          eth.detachBPF(BPF_TCX_EGRESS);
+          tcx_egress_program = nullptr;
+        }
         if (tcx_egress_program)
         {
           basics_log("setupNetworking attached host egress path=%s ifidx=%d\n",
@@ -2232,17 +2360,24 @@ protected:
       }
 
       bool whiteholeReplyFlowPinned = false;
+      bool wormholeFlowPinned = false;
       if (tcx_egress_program)
       {
         whiteholeReplyFlowPinned = switchboardPinWhiteholeReplyFlowMap(tcx_egress_program, eth.ifidx);
+        wormholeFlowPinned = switchboardPinWormholeFlowMaps(tcx_egress_program, eth.ifidx);
         if (whiteholeReplyFlowPinned == false)
         {
           basics_log("setupNetworking failed to pin host whitehole reply flow map ifidx=%d\n",
                      eth.ifidx);
         }
+        if (wormholeFlowPinned == false)
+        {
+          basics_log("setupNetworking failed to pin host wormhole flow map ifidx=%d\n",
+                     eth.ifidx);
+        }
       }
 
-      if (whiteholeReplyFlowPinned == false)
+      if (whiteholeReplyFlowPinned == false || wormholeFlowPinned == false)
       {
         basics_log("setupNetworking skipping host ingress attach because shared flow map pinning failed ifidx=%d\n",
                    eth.ifidx);
@@ -2250,22 +2385,21 @@ protected:
       else
       {
         tcx_ingress_program = eth.loadPreattachedProgram(BPF_TCX_INGRESS, hostIngressPath);
-#if NAMETAG_PRODIGY_DEV_FAKE_IPV4_ROUTE
         if (tcx_ingress_program)
         {
           bool hasPortalMaps = false;
           tcx_ingress_program->openMap("ext_portals"_ctv, [&](int mapFD) -> void {
             hasPortalMaps = mapFD >= 0;
           });
-          if (hasPortalMaps == false)
+          if (hasPortalMaps == false ||
+              switchboardProgramUsesPinnedWormholeFlowMaps(tcx_ingress_program, eth.ifidx) == false)
           {
-            basics_log("setupNetworking detaching stale host ingress without portal maps path=%s ifidx=%d\n",
+            basics_log("setupNetworking detaching stale host ingress with incompatible maps path=%s ifidx=%d\n",
                        hostIngressPath.c_str(), eth.ifidx);
             eth.detachBPF(BPF_TCX_INGRESS);
             tcx_ingress_program = nullptr;
           }
         }
-#endif
 
         if (tcx_ingress_program)
         {
@@ -2285,7 +2419,16 @@ protected:
           tcx_ingress_program = eth.attachBPF(BPF_TCX_INGRESS, hostIngressPath, "host_ingress"_ctv,
                                               [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
                                                 (void)switchboardReusePinnedWhiteholeReplyFlowMap(obj, eth.ifidx, inner_map_fds);
+                                                (void)switchboardReusePinnedWormholeFlowMaps(obj, eth.ifidx, inner_map_fds);
                                               });
+          if (tcx_ingress_program &&
+              switchboardProgramUsesPinnedWormholeFlowMaps(tcx_ingress_program, eth.ifidx) == false)
+          {
+            basics_log("setupNetworking detaching host ingress without shared wormhole flow map path=%s ifidx=%d\n",
+                       hostIngressPath.c_str(), eth.ifidx);
+            eth.detachBPF(BPF_TCX_INGRESS);
+            tcx_ingress_program = nullptr;
+          }
           if (tcx_ingress_program)
           {
             basics_log("setupNetworking attached host ingress path=%s ifidx=%d\n",
@@ -2322,6 +2465,8 @@ protected:
       tcx_egress_program->setArrayElement("mac_map"_ctv, 0, eth.mac);
       tcx_egress_program->setArrayElement("gw_mac_map"_ctv, 0, eth.gateway_mac);
       (void)switchboardPinWhiteholeReplyFlowMap(tcx_egress_program, eth.ifidx);
+      (void)switchboardPinWormholeFlowMaps(tcx_egress_program, eth.ifidx);
+      ensureWormholeFlowGCTickQueued();
     }
 
     iaas->setLocalContainerPrefixes(localPrefixes);
@@ -2421,6 +2566,16 @@ public:
   NeuronBrainControlStream *brain = nullptr;
   bytell_hash_set<NeuronBrainControlStream *> closingBrainControls;
   OSUpdateProcess osUpdateProcess;
+
+  ~Neuron()
+  {
+    if (wormholeFlowGC)
+    {
+      WormholeFlowGC *gc = wormholeFlowGC;
+      wormholeFlowGC = nullptr;
+      gc->stop();
+    }
+  }
 
   static int64_t registrationBootTimeMs(void)
   {
@@ -4110,30 +4265,47 @@ public:
         }
       case NeuronTopic::openSwitchboardWormholes:
         {
-          uint32_t containerID = 0;
-          Message::extractArg<ArgumentNature::fixed>(args, containerID);
-
           String serialized;
           Message::extractToStringView(args, serialized);
-
+          SwitchboardWormholeOperation operation = {};
           Vector<Wormhole> wormholes = {};
-          if (BitseryEngine::deserializeSafe(serialized, wormholes) == false)
+          String expectedRevision = {};
+          bool valid = BitseryEngine::deserializeSafe(serialized, operation) &&
+                       operation.status == SwitchboardWormholeOperationStatus::request &&
+                       operation.containerID != 0 && operation.revision.size() == 64 &&
+                       operation.desired.size() <= SwitchboardWormholeOperation::maximumDesiredBytes &&
+                       prodigyComputeWormholeDesiredStateRevision(operation.containerID, operation.desired, expectedRevision) &&
+                       expectedRevision.equals(operation.revision) &&
+                       BitseryEngine::deserializeSafe(operation.desired, wormholes);
+          if (valid == false)
           {
             basics_log("neuron openSwitchboardWormholes deserialize failed\n");
-            break;
           }
-
-          ensureSwitchboard()->setLocalContainerSubnet(lcsubnet6);
-          basics_log("neuron openSwitchboardWormholes containerID=%u count=%u\n", containerID, unsigned(wormholes.size()));
-          ensureSwitchboard()->openWormholes(containerID, wormholes);
-          syncSwitchboardBalancerOverlayRoutingProgram();
-
-          // The open topic must converge the live local peer runtime immediately
-          // for the owning container, otherwise first in-cluster packets can race
-          // ahead of the peer-program map update and miss the wormhole binding.
-          if (Container *container = findTrackedContainerByLocalID(containerID); container != nullptr)
+          else
           {
-            syncContainerSwitchboardRuntime(container);
+            ensureSwitchboard()->setLocalContainerSubnet(lcsubnet6);
+            operation.status = ensureSwitchboard()->openWormholes(operation.containerID, wormholes);
+            syncSwitchboardBalancerOverlayRoutingProgram();
+
+            // The open topic must converge the live local peer runtime immediately
+            // for the owning container, otherwise first in-cluster packets can race
+            // ahead of the peer-program map update and miss the wormhole binding.
+            if (Container *container = findTrackedContainerByLocalID(operation.containerID); container != nullptr)
+            {
+              syncContainerSwitchboardRuntime(container);
+            }
+          }
+          if (valid == false)
+          {
+            operation.status = SwitchboardWormholeOperationStatus::rejected;
+          }
+          if (streamIsActive(brain))
+          {
+            operation.desired.clear();
+            String response = {};
+            BitseryEngine::serialize(response, operation);
+            Message::construct(brain->wBuffer, NeuronTopic::openSwitchboardWormholes, response);
+            Ring::queueSend(brain);
           }
           break;
         }
@@ -4178,6 +4350,10 @@ public:
 
           ensureSwitchboard()->setLocalContainerSubnet(lcsubnet6);
           ensureSwitchboard()->closeWormholesToContainer(containerID);
+          if (Container *container = findTrackedContainerByLocalID(containerID); container != nullptr)
+          {
+            syncContainerSwitchboardRuntime(container);
+          }
           break;
         }
       case NeuronTopic::openSwitchboardWhiteholes:
