@@ -99,8 +99,10 @@ private:
   bool ringLive = false;
   bool listenerInstalled = false;
   bool listenerMultiplexed = false;
+  bool listenerAcceptPending = false;
   bool neuronInstalled = false;
   bool neuronMultiplexed = false;
+  int pendingAcceptedNeuronSlot = -1;
   bool pendingResourceDeltaValid = false;
   uint16_t pendingResourceDeltaCores = 0;
   uint32_t pendingResourceDeltaMemoryMB = 0;
@@ -181,6 +183,17 @@ private:
     return true;
   }
 
+  void queueNeuronAcceptIfNeeded(void)
+  {
+    if (ringLive == false || listenerInstalled == false || listenerAcceptPending || pendingAcceptedNeuronSlot >= 0)
+    {
+      return;
+    }
+
+    Ring::queueAccept(&soc);
+    listenerAcceptPending = true;
+  }
+
   void installListenerIfReady(void)
   {
     if (ringLive == false)
@@ -200,7 +213,25 @@ private:
       listenerMultiplexed = true;
     }
 
-    Ring::queueAccept(&soc);
+    queueNeuronAcceptIfNeeded();
+  }
+
+  void activateAcceptedNeuron(int fslot)
+  {
+    neuron.fslot = fslot;
+    neuron.isFixedFile = true;
+    neuronInstalled = true;
+    if (neuronMultiplexed == false)
+    {
+      RingDispatcher::installMultiplexee(&neuron, this);
+      neuronMultiplexed = true;
+    }
+    Ring::queueRecv(&neuron);
+
+    if (neuron.wBuffer.size() > 0)
+    {
+      queueSendToNeuron();
+    }
   }
 
   void installNeuronIfReady(void)
@@ -910,26 +941,66 @@ public:
 
   void acceptHandler(void *socket, int fslot)
   {
+    if (socket != static_cast<void *>(&soc))
+    {
+      if (fslot >= 0)
+      {
+        Ring::queueCloseRaw(fslot);
+      }
+      return;
+    }
+
+    listenerAcceptPending = false;
     if (fslot >= 0)
     {
-      neuron.fslot = fslot;
-      neuron.isFixedFile = true;
-      neuronInstalled = true;
-      if (neuronMultiplexed == false)
+      if (Ring::socketIsClosing(&neuron))
       {
-        RingDispatcher::installMultiplexee(&neuron, this);
-        neuronMultiplexed = true;
+        if (pendingAcceptedNeuronSlot >= 0)
+        {
+          Ring::queueCloseRaw(fslot);
+        }
+        else
+        {
+          pendingAcceptedNeuronSlot = fslot;
+        }
+        return;
       }
-      Ring::queueRecv(&neuron);
 
-      if (neuron.wBuffer.size() > 0)
+      if (neuron.isFixedFile && neuron.fslot >= 0)
       {
-        queueSendToNeuron();
+        Ring::queueCloseRaw(fslot);
+        return;
       }
+
+      activateAcceptedNeuron(fslot);
     }
     else
     {
-      Ring::queueAccept(&soc);
+      queueNeuronAcceptIfNeeded();
+    }
+  }
+
+  void closeHandler(void *socket) override
+  {
+    if (socket != static_cast<void *>(&neuron))
+    {
+      return;
+    }
+
+    neuron.reset();
+    neuron.fslot = -1;
+    neuron.isFixedFile = false;
+    neuronInstalled = false;
+
+    if (pendingAcceptedNeuronSlot >= 0)
+    {
+      const int fslot = pendingAcceptedNeuronSlot;
+      pendingAcceptedNeuronSlot = -1;
+      activateAcceptedNeuron(fslot);
+    }
+    else
+    {
+      queueNeuronAcceptIfNeeded();
     }
   }
 
@@ -954,7 +1025,6 @@ public:
     {
       if (neuron.fslot >= 0)
       {
-        Ring::queueCancelAll(&neuron);
         Ring::queueClose(&neuron);
       }
     }
@@ -965,10 +1035,8 @@ public:
       std::abort();
     }
 
-    neuron.reset();
-    neuron.fslot = -1;
-    neuron.isFixedFile = false;
     neuronInstalled = false;
+    queueNeuronAcceptIfNeeded();
   }
 
   NeuronHub(NeuronHubDispatch *_target)

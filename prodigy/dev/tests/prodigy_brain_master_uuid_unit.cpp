@@ -1745,13 +1745,13 @@ int main(void)
 
     int peerFD = -1;
     bool installed = installBrainPeerSocket(brain, *peer, peerFD);
-    suite.expect(installed, "brain_accept_handler_known_peer_replacement_advances_generation_installs_fixture");
+    suite.expect(installed, "brain_accept_handler_known_peer_replacement_waits_for_retirement_installs_fixture");
 
     RingDispatcher::installMultiplexee(&brain.brainSocket, &brain);
     int listenerPair[2] = {-1, -1};
     suite.expect(
         ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, listenerPair) == 0,
-        "brain_accept_handler_known_peer_replacement_advances_generation_creates_listener_pair");
+        "brain_accept_handler_known_peer_replacement_waits_for_retirement_creates_listener_pair");
     if (listenerPair[0] >= 0)
     {
       brain.brainSocket.fd = listenerPair[0];
@@ -1763,7 +1763,7 @@ int main(void)
     int acceptedPair[2] = {-1, -1};
     suite.expect(
         ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, acceptedPair) == 0,
-        "brain_accept_handler_known_peer_replacement_advances_generation_creates_accepted_pair");
+        "brain_accept_handler_known_peer_replacement_waits_for_retirement_creates_accepted_pair");
     if (acceptedPair[0] >= 0)
     {
       acceptedFD = acceptedPair[0];
@@ -1788,14 +1788,15 @@ int main(void)
       brain.brain_saddrlen = sizeof(struct sockaddr_in);
 
       acceptedSlot = Ring::adoptProcessFDIntoFixedFileSlot(acceptedFD, false);
-      suite.expect(acceptedSlot >= 0, "brain_accept_handler_known_peer_replacement_advances_generation_adopts_fixed_slot");
+      suite.expect(acceptedSlot >= 0, "brain_accept_handler_known_peer_replacement_waits_for_retirement_adopts_fixed_slot");
       if (acceptedSlot >= 0)
       {
         brain.testAcceptHandler(&brain.brainSocket, acceptedSlot);
 
-        suite.expect(peer->ioGeneration != closeGeneration, "brain_accept_handler_known_peer_replacement_advances_generation_bumps_generation_past_queued_close");
-        suite.expect(peer->connected, "brain_accept_handler_known_peer_replacement_advances_generation_marks_connected");
-        suite.expect(peer->currentStreamAccepted, "brain_accept_handler_known_peer_replacement_advances_generation_marks_accepted_stream");
+        suite.expect(peer->ioGeneration == closeGeneration, "brain_accept_handler_known_peer_replacement_waits_for_retirement_keeps_closing_generation");
+        suite.expect(peer->connected == false, "brain_accept_handler_known_peer_replacement_waits_for_retirement_keeps_peer_disconnected");
+        suite.expect(peer->fslot < 0, "brain_accept_handler_known_peer_replacement_waits_for_retirement_does_not_reuse_identity");
+        suite.expect(brain.pendingAcceptedBrainSlots.contains(peer) && brain.pendingAcceptedBrainSlots[peer] == acceptedSlot, "brain_accept_handler_known_peer_replacement_waits_for_retirement_stages_accepted_slot");
       }
     }
 
@@ -1961,20 +1962,20 @@ int main(void)
       if (acceptedSlot >= 0)
       {
         brain.testAcceptHandler(&brain.brainSocket, acceptedSlot);
-        peer->registrationFresh = true;
-
-        const int replacementFslot = peer->fslot;
-        const uint32_t replacementEpoch = peer->transportEpoch;
+        const uint32_t closingEpoch = peer->transportEpoch;
+        suite.expect(brain.pendingAcceptedBrainSlots.contains(peer) && peer->fslot < 0, "brain_close_handler_stale_accepted_close_after_reaccept_stages_replacement_until_close");
 
         brain.testCloseHandler(peer);
 
+        const int replacementFslot = peer->fslot;
         suite.expect(peer->connected, "brain_close_handler_stale_accepted_close_after_reaccept_keeps_replacement_connected");
         suite.expect(peer->currentStreamAccepted, "brain_close_handler_stale_accepted_close_after_reaccept_keeps_replacement_accepted");
-        suite.expect(peer->registrationFresh, "brain_close_handler_stale_accepted_close_after_reaccept_keeps_replacement_registration_fresh");
-        suite.expect(peer->fslot == replacementFslot, "brain_close_handler_stale_accepted_close_after_reaccept_preserves_replacement_slot");
-        suite.expect(peer->transportEpoch == replacementEpoch, "brain_close_handler_stale_accepted_close_after_reaccept_preserves_transport_epoch");
+        suite.expect(peer->registrationFresh == false, "brain_close_handler_stale_accepted_close_after_reaccept_requires_fresh_registration");
+        suite.expect(replacementFslot == acceptedSlot, "brain_close_handler_stale_accepted_close_after_reaccept_activates_staged_slot");
+        suite.expect(peer->transportEpoch != closingEpoch, "brain_close_handler_stale_accepted_close_after_reaccept_advances_transport_epoch");
         suite.expect(peer->confirmedMissingTransportEpoch == 0, "brain_close_handler_stale_accepted_close_after_reaccept_clears_confirmed_missing_epoch_on_reaccept");
         suite.expect(brain.testHasBrainWaiter(peer) == false, "brain_close_handler_stale_accepted_close_after_reaccept_does_not_rearm_waiter");
+        suite.expect(brain.pendingAcceptedBrainSlots.contains(peer) == false, "brain_close_handler_stale_accepted_close_after_reaccept_consumes_staged_slot");
       }
     }
 

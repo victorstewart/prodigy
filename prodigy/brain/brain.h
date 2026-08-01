@@ -1044,6 +1044,7 @@ public:
   bytell_hash_map<BrainView *, TimeoutPacket *> brainReconnectWaiters;
   bytell_hash_map<BrainView *, TimeoutPacket *> brainLivenessWaiters;
   bytell_hash_map<BrainView *, TimeoutPacket *> brainHandshakeWaiters;
+  bytell_hash_map<BrainView *, int> pendingAcceptedBrainSlots;
   bytell_hash_map<NeuronView *, TimeoutPacket *> neuronReconnectWaiters;
   bytell_hash_map<NeuronView *, TimeoutPacket *> neuronHandshakeWaiters;
   Vector<Machine *> operatingSystemUpdateOrder;
@@ -9689,6 +9690,90 @@ public:
     PRODIGY_DEBUG_FLUSH();
   }
 
+  bool activateAcceptedBrainPeer(BrainView *brain, int fslot)
+  {
+    if (brain == nullptr || fslot < 0)
+    {
+      return false;
+    }
+
+    cancelBrainMissingWaiter(brain, "accept-known");
+    cancelBrainReconnectWaiter(brain, "accept-known");
+
+    const uint64_t priorGeneration = brain->ioGeneration;
+
+    // Accepted reconnects must not inherit buffered plaintext/ciphertext
+    // or stale peer-verification state from the prior stream generation.
+    // Keep the broader BrainView identity/runtime intact and scrub only
+    // the transport buffers that can block fresh registration parsing.
+    brain->ProdigyTransportTLSStream::reset();
+    brain->fslot = fslot;
+    brain->isFixedFile = true;
+    brain->isNonBlocking = true;
+    brain->currentStreamAccepted = true;
+    brain->registrationFresh = false;
+    brain->noteTransportActivated();
+    PRODIGY_DEBUG_LOG(
+                 "prodigy debug brain accept-known private4=%u fd=%d fslot=%d updateState=%u oldConnected=%d oldQuarantined=%d generation=%llu priorGeneration=%llu transportEpoch=%u\n",
+                 brain->private4,
+                 brain->fd,
+                 brain->fslot,
+                 unsigned(updateSelfState),
+                 int(brain->connected),
+                 int(brain->quarantined),
+                 (unsigned long long)brain->ioGeneration,
+                 (unsigned long long)priorGeneration,
+                 unsigned(brain->transportEpoch));
+    PRODIGY_DEBUG_FLUSH();
+    queueAcceptedBrainPeerSocketOptions(brain);
+    if (ProdigyTransportTLSRuntime::configured() && brain->beginTransportTLS(true) == false)
+    {
+      queueBrainCloseIfActive(brain, "accept-known-tls-begin-fail");
+      return false;
+    }
+
+    if (brain->quarantined)
+    {
+      brainFound(brain);
+    }
+    brain->connected = true;
+    if (updateSelfState == UpdateSelfState::waitingForFollowerReboots)
+    {
+      uint128_t peerKey = updateSelfPeerTrackingKey(brain);
+      if (peerKey != 0 && updateSelfFollowerBootNsByPeerKey.contains(peerKey))
+      {
+        updateSelfFollowerReconnectedPeerKeys.insert(peerKey);
+      }
+    }
+
+    brain->sendRegistration(boottimens, version, getExistingMasterUUID());
+    queueLocalPeerAddressCandidates(brain);
+    queueUpdateSelfBundleToPeer(brain);
+    queueUpdateSelfTransitionToPeer(brain);
+    queueUpdateSelfRelinquishToPeer(brain);
+
+    // they will send us a registration too
+    Ring::queueRecv(brain);
+    PRODIGY_DEBUG_LOG(
+                 "prodigy debug brain recv-armed private4=%u fd=%d fslot=%d pendingRecv=%d pendingSend=%d tls=%d negotiated=%d queuedBytes=%llu\n",
+                 brain->private4,
+                 brain->fd,
+                 brain->fslot,
+                 int(brain->pendingRecv),
+                 int(brain->pendingSend),
+                 int(brain->transportTLSEnabled()),
+                 int(brain->isTLSNegotiated()),
+                 (unsigned long long)brain->queuedSendOutstandingBytes());
+    PRODIGY_DEBUG_FLUSH();
+
+    // This is the first post-accept opportunity to arm the server-side
+    // TLS receive. Submit now so a rebooted brain does not wait for an
+    // unrelated later CQE before it can consume the peer's ClientHello.
+    Ring::submitPending();
+    refreshBrainPeerHandshakeWatchdog(brain, "accept-known");
+    return true;
+  }
+
   void acceptHandler(void *socket, int fslot) override
   {
     if (socket == (void *)&brainSocket)
@@ -9745,7 +9830,6 @@ public:
                              fslot);
                 PRODIGY_DEBUG_FLUSH();
               }
-              abandonSocketGeneration(brain);
             }
             else
             {
@@ -9760,95 +9844,33 @@ public:
             }
           }
 
-          // possible it's already completed and is in the CQE queue, so this is the only
-          // safe cancellation path before the stale completion drains.
           cancelBrainMissingWaiter(brain, "accept-known");
           cancelBrainReconnectWaiter(brain, "accept-known");
 
-          if (rawStreamIsActive(brain))
+          if (rawStreamIsActive(brain) || Ring::socketIsClosing(brain))
           {
-            abandonSocketGeneration(brain);
-          }
-
-          // A prior queueClose() can already have a tracked close CQE in flight for
-          // this BrainView identity. Advance to a fresh transport generation before
-          // adopting the replacement accepted slot so that stale close completions
-          // from the old generation cannot dispatch against the new stream.
-          const uint8_t priorGeneration = brain->ioGeneration;
-          brain->bumpIoGeneration();
-
-          // Accepted reconnects must not inherit buffered plaintext/ciphertext
-          // or stale peer-verification state from the prior stream generation.
-          // Keep the broader BrainView identity/runtime intact and scrub only
-          // the transport buffers that can block fresh registration parsing.
-          brain->ProdigyTransportTLSStream::reset();
-          brain->fslot = fslot;
-          brain->isFixedFile = true;
-          brain->isNonBlocking = true;
-          brain->currentStreamAccepted = true;
-          brain->registrationFresh = false;
-          brain->noteTransportActivated();
-          Ring::publishSocketGeneration(brain);
-          PRODIGY_DEBUG_LOG(
-                       "prodigy debug brain accept-known private4=%u fd=%d fslot=%d updateState=%u oldConnected=%d oldQuarantined=%d generation=%u priorGeneration=%u transportEpoch=%u\n",
-                       brain->private4,
-                       brain->fd,
-                       brain->fslot,
-                       unsigned(updateSelfState),
-                       int(brain->connected),
-                       int(brain->quarantined),
-                       unsigned(brain->ioGeneration),
-                       unsigned(priorGeneration),
-                       unsigned(brain->transportEpoch));
-          PRODIGY_DEBUG_FLUSH();
-          queueAcceptedBrainPeerSocketOptions(brain);
-          if (ProdigyTransportTLSRuntime::configured() && brain->beginTransportTLS(true) == false)
-          {
-            queueBrainCloseIfActive(brain, "accept-known-tls-begin-fail");
-            brain_saddrlen = sizeof(brain_saddr);
-            Ring::queueAccept(&brainSocket, reinterpret_cast<struct sockaddr *>(&brain_saddr), &brain_saddrlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
-            return;
-          }
-
-          if (brain->quarantined)
-          {
-            brainFound(brain);
-          }
-          brain->connected = true;
-          if (updateSelfState == UpdateSelfState::waitingForFollowerReboots)
-          {
-            uint128_t peerKey = updateSelfPeerTrackingKey(brain);
-            if (peerKey != 0 && updateSelfFollowerBootNsByPeerKey.contains(peerKey))
+            // A BrainView identity cannot own the accepted replacement until
+            // Ring has retired the old close and every older operation/timeout.
+            // Keep the accepted slot idle and activate it from closeHandler.
+            if (pendingAcceptedBrainSlots.contains(brain))
             {
-              updateSelfFollowerReconnectedPeerKeys.insert(peerKey);
+              Ring::queueCloseRaw(fslot);
+            }
+            else
+            {
+              pendingAcceptedBrainSlots.insert_or_assign(brain, fslot);
+              brain->connected = false;
+              if (Ring::socketIsClosing(brain) == false)
+              {
+                brain->noteCloseQueuedForCurrentTransport();
+                Ring::queueClose(brain);
+              }
             }
           }
-
-          brain->sendRegistration(boottimens, version, getExistingMasterUUID());
-          queueLocalPeerAddressCandidates(brain);
-          queueUpdateSelfBundleToPeer(brain);
-          queueUpdateSelfTransitionToPeer(brain);
-          queueUpdateSelfRelinquishToPeer(brain);
-
-          // they will send us a registration too
-          Ring::queueRecv(brain);
-          PRODIGY_DEBUG_LOG(
-                       "prodigy debug brain recv-armed private4=%u fd=%d fslot=%d pendingRecv=%d pendingSend=%d tls=%d negotiated=%d queuedBytes=%llu\n",
-                       brain->private4,
-                       brain->fd,
-                       brain->fslot,
-                       int(brain->pendingRecv),
-                       int(brain->pendingSend),
-                       int(brain->transportTLSEnabled()),
-                       int(brain->isTLSNegotiated()),
-                       (unsigned long long)brain->queuedSendOutstandingBytes());
-          PRODIGY_DEBUG_FLUSH();
-
-          // This is the first post-accept opportunity to arm the server-side
-          // TLS receive. Submit now so a rebooted brain does not wait for an
-          // unrelated later CQE before it can consume the peer's ClientHello.
-          Ring::submitPending();
-          refreshBrainPeerHandshakeWatchdog(brain, "accept-known");
+          else
+          {
+            (void)activateAcceptedBrainPeer(brain, fslot);
+          }
         }
         else
         {
@@ -9888,7 +9910,6 @@ public:
           mothership->fslot = fslot;
           mothership->isFixedFile = true;
           mothership->isNonBlocking = true;
-          Ring::publishSocketGeneration(mothership);
           if (activateMothershipConnection(mothership) == false)
           {
             delete mothership;
@@ -11351,6 +11372,18 @@ public:
                    (unsigned long long)brain->rBuffer.outstandingBytes(),
                    (unsigned long long)updateSelfPeerKey);
       PRODIGY_DEBUG_FLUSH();
+      if (auto pending = pendingAcceptedBrainSlots.find(brain); pending != pendingAcceptedBrainSlots.end())
+      {
+        const int acceptedSlot = pending->second;
+        pendingAcceptedBrainSlots.erase(pending);
+        brain->processedCloseTransportEpoch = brain->transportEpoch;
+        brain->queuedCloseTransportEpoch = 0;
+        brain->confirmedMissingTransportEpoch = 0;
+        brain->connected = false;
+        brain->cancelPendingConnect();
+        (void)activateAcceptedBrainPeer(brain, acceptedSlot);
+        co_return;
+      }
       const bool closeConfirmedMissing = (brain->confirmedMissingTransportEpoch != 0 && brain->confirmedMissingTransportEpoch == brain->transportEpoch);
       const bool closeTargetHasInstalledTransport = (brain->isFixedFile
                                                          ? (brain->fslot >= 0)

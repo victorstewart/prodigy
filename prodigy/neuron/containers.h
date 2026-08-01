@@ -927,6 +927,7 @@ public:
   bool killedOnPurpose = false;
   bool pendingKillAckToBrain = false;
   bool pendingDestroy = false;
+  bool restartAfterClose = false;
   bool waitidPending = false;
   bool destroyCloseCompleted = false;
   bool failedArtifactsPreserved = false;

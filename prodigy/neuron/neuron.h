@@ -480,6 +480,24 @@ protected:
     Ring::queueClose(stream);
   }
 
+  bool retireContainerControlBeforeRestart(Container *container)
+  {
+    if (Ring::socketIsClosing(container))
+    {
+      container->restartAfterClose = true;
+      return true;
+    }
+    if (rawStreamIsActive(container))
+    {
+      container->restartAfterClose = true;
+      Ring::queueClose(container);
+      return true;
+    }
+
+    container->reset();
+    return false;
+  }
+
   virtual bool beginAcceptedBrainTransportTLS(NeuronBrainControlStream *stream)
   {
     return stream->beginTransportTLS(true);
@@ -2821,32 +2839,7 @@ public:
     bool restart = (destroyAfterWait == false);
     if (restart)
     {
-      if (container->isFixedFile && container->fslot >= 0 && Ring::socketIsClosing(container) == false)
-      {
-        Ring::queueCancelAll(container);
-        Ring::queueCloseRaw(container->fslot);
-      }
-      else if (container->isFixedFile == false && container->fd >= 0)
-      {
-        close(container->fd);
-      }
-
-      if (container->pendingSend)
-      {
-        container->noteSendCompleted();
-      }
-      container->pendingSend = false;
-      container->pendingRecv = false;
-      container->pendingSendBytes = 0;
-      container->pendingSendUserData = 0;
-      container->pendingRecvUserData = 0;
-      container->pendingConnectUserData = 0;
-      container->pendingTCPFastOpenUserData = 0;
-      container->rBuffer.clear();
-      container->wBuffer.clear();
-      container->fslot = -1;
-      container->isFixedFile = false;
-      container->bumpIoGeneration();
+      (void)retireContainerControlBeforeRestart(container);
     }
     else
     {
@@ -3082,7 +3075,10 @@ public:
 
       if (restart)
       {
-        ContainerManager::restartContainer(container);
+        if (container->restartAfterClose == false)
+        {
+          ContainerManager::restartContainer(container);
+        }
       }
       else
       {
@@ -4868,7 +4864,6 @@ public:
       brain->fslot = fslot;
       brain->isFixedFile = true;
       brain->isNonBlocking = true;
-      Ring::publishSocketGeneration(brain);
       Ring::queueSetSockOptRaw(brain, SOL_TCP, TCP_CONGESTION, "dctcp", socklen_t(strlen("dctcp")), "neuron accepted brain control congestion");
       Ring::queueSetSockOptInt(brain, SOL_SOCKET, SO_KEEPALIVE, 1, "neuron accepted brain control keepalive");
       Ring::queueSetSockOptInt(brain, SOL_TCP, TCP_KEEPIDLE, int(std::max<uint32_t>(brainControlKeepaliveSeconds, 1u)), "neuron accepted brain control keepidle");
@@ -5062,6 +5057,14 @@ public:
       {
         container->destroyCloseCompleted = true;
         ContainerManager::finalizeContainerDestroyIfReady(container);
+        return;
+      }
+
+      if (container->restartAfterClose)
+      {
+        container->restartAfterClose = false;
+        container->reset();
+        ContainerManager::restartContainer(container);
         return;
       }
 

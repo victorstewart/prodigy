@@ -76,7 +76,6 @@ public:
       {
          wBuffer.reserve(initialWriteBufferBytes);
       }
-      Ring::publishSocketGeneration(this);
    }
 
    void clearForPool(void)
