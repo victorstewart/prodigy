@@ -28,6 +28,19 @@ int main(void)
   suite.expect(machine.containerFragmentAvailable(prodigyMothershipTunnelProviderRuntimeFragment) == false, "fragment_reserved_is_unavailable");
   suite.expect(machine.containerFragmentAvailable(used) == false, "fragment_used_is_unavailable");
   suite.expect(machine.containerFragmentAvailable(available), "fragment_unused_is_available");
+  suite.expect(Machine::maxSchedulableContainers == 254, "fragment_capacity_matches_usable_address_cardinality");
+
+  machine.usedContainerFragments.clear();
+  constexpr uint8_t finalFragment = 253;
+  for (uint32_t fragment = 1; fragment <= UINT8_MAX; ++fragment)
+  {
+    if (fragment != finalFragment && fragment != prodigyMothershipTunnelProviderRuntimeFragment)
+    {
+      machine.usedContainerFragments.insert(fragment);
+    }
+  }
+  suite.expect(machine.getContainerFragment() == finalFragment, "fragment_allocator_finds_only_remaining_fragment");
+  suite.expect(machine.getContainerFragment() == 0, "fragment_allocator_fails_promptly_when_exhausted");
 
   ContainerPlan forged = {};
   Container *container = reinterpret_cast<Container *>(uintptr_t(1));

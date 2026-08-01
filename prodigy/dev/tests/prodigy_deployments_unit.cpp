@@ -7550,7 +7550,9 @@ int main(void)
     machine.storageMB_available = 10'000'000;
 
     Vector<ContainerView *> seededContainers;
-    for (uint32_t index = 0; index < 255; ++index)
+    for (uint32_t index = 0;
+         index < Machine::maxSchedulableContainers - 1;
+         ++index)
     {
       ContainerView *container = new ContainerView();
       container->deploymentID = deployment.plan.config.deploymentID();
@@ -7591,7 +7593,7 @@ int main(void)
     machine.storageMB_available = 10'000'000;
 
     Machine::Claim claim {};
-    claim.nFit = 255;
+    claim.nFit = Machine::maxSchedulableContainers - 1;
     machine.claims.push_back(claim);
 
     uint32_t fit = ApplicationDeployment::nFitOnMachine(&deployment, &machine, 10);
@@ -8275,7 +8277,9 @@ int main(void)
     machine.storageMB_available = 10'000'000;
 
     Vector<ContainerView *> seededContainers;
-    for (uint32_t index = 0; index < 255; ++index)
+    for (uint32_t index = 0;
+         index < Machine::maxSchedulableContainers - 1;
+         ++index)
     {
       ContainerView *container = new ContainerView();
       container->deploymentID = deployment.plan.config.deploymentID();

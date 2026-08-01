@@ -201,7 +201,7 @@ public:
   bytell_hash_subvector<uint64_t, ContainerView *> containersByDeploymentID;
 
   // Machine-local networking addresses containers by an 8-bit fragment.
-  constexpr static uint32_t maxSchedulableContainers = 256u;
+  constexpr static uint32_t maxSchedulableContainers = 254u;
 
   uint32_t indexedContainerCount(void)
   {
@@ -341,17 +341,19 @@ public:
 
   uint8_t getContainerFragment(void)
   {
-    uint8_t fragment = 0;
-
-    do
+    uint8_t fragment = Random::generateNumberWithNBits<8, uint8_t>();
+    for (uint32_t checked = 0; checked < 256; ++checked, ++fragment)
     {
-      fragment = Random::generateNumberWithNBits<8, uint8_t>();
+      if (containerFragmentAvailable(fragment) == false)
+      {
+        continue;
+      }
 
-    } while (containerFragmentAvailable(fragment) == false);
+      usedContainerFragments.insert(fragment);
+      return fragment;
+    }
 
-    usedContainerFragments.insert(fragment);
-
-    return fragment;
+    return 0;
   }
 
   void relinquishContainerFragment(uint8_t fragment)
