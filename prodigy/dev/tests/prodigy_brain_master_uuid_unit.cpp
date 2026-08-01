@@ -2067,6 +2067,49 @@ int main(void)
     NoopBrainIaaS provider = {};
     TestBrain brain = {};
     brain.iaas = &provider;
+    brain.weAreMaster = true;
+
+    constexpr uint32_t fragment = 0x5151u;
+    Machine machine = {};
+    machine.uuid = uint128_t(0x5151);
+    machine.fragment = fragment;
+    machine.state = MachineState::decommissioning;
+    machine.neuron.machine = &machine;
+    brain.machines.insert(&machine);
+    brain.usedMachineFragments.insert(fragment);
+
+    ContainerView pending = {};
+    pending.uuid = uint128_t(0x515101);
+    pending.runtimeReady = false;
+    pending.wormholeRuntimeFailureSuppressedReady = true;
+    pending.wormholeRuntimePendingMachines.insert(fragment);
+    pending.wormholeRuntimeFailure.assign("pending retired machine"_ctv);
+    ContainerView failed = {};
+    failed.uuid = uint128_t(0x515102);
+    failed.runtimeReady = false;
+    failed.wormholeRuntimeFailureSuppressedReady = true;
+    failed.wormholeRuntimeFailedMachines.insert(fragment);
+    failed.wormholeRuntimeFailure.assign("failed retired machine"_ctv);
+    brain.containers.insert_or_assign(pending.uuid, &pending);
+    brain.containers.insert_or_assign(failed.uuid, &failed);
+
+    brain.quarantineMachineAlias(&machine);
+    suite.expect(machine.fragment == 0 && brain.usedMachineFragments.contains(fragment) == false,
+                 "machine_retirement_wormhole_cleanup_releases_fragment_after_cleanup");
+    suite.expect(pending.wormholeRuntimePendingMachines.empty() &&
+                     failed.wormholeRuntimeFailedMachines.empty() &&
+                     pending.runtimeReady && failed.runtimeReady &&
+                     pending.wormholeRuntimeFailure.empty() && failed.wormholeRuntimeFailure.empty(),
+                 "machine_retirement_wormhole_cleanup_removes_retired_fragment_from_ack_gate");
+
+    RingDispatcher::eraseMultiplexee(&machine.neuron);
+    brain.containers.clear();
+  }
+
+  {
+    NoopBrainIaaS provider = {};
+    TestBrain brain = {};
+    brain.iaas = &provider;
     brain.enableMachineRetirementAuthority();
     RingExitDeadline deadline(2000);
     ScopedRing scopedRing = {};

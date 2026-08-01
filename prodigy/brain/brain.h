@@ -18517,6 +18517,7 @@ public:
   void quarantineMachineAlias(Machine *machine)
   {
     NeuronView *neuron = &machine->neuron;
+    retireWormholeRuntimeMachine(machine);
     cancelMachineSoftWatchdog(machine);
     cancelMachineHardRebootWatchdog(machine);
     cancelOSUpdateCommandWatchdog(machine);
