@@ -10964,5 +10964,48 @@ int main(void)
     suite.expect(public6("fdf8:d94c:7c33:e26e:ca4b:f500::1") == false, "public_destination_classifier_rejects_container_prefix");
   }
 
+  {
+    DeploymentPlan deployment = {};
+    String failure = {};
+    suite.expect(
+        Brain::validateApplicationContainerPrivileges(deployment, failure),
+        "brain_privilege_admission_accepts_unprivileged_application");
+
+    deployment.useHostNetworkNamespace = true;
+    suite.expect(
+        Brain::validateApplicationContainerPrivileges(deployment, failure) == false &&
+            failure.size() > 0,
+        "brain_privilege_admission_rejects_application_host_network_namespace");
+    deployment.useHostNetworkNamespace = false;
+
+    deployment.config.capabilities.insert(CAP_NET_BIND_SERVICE);
+    deployment.config.capabilities.insert(CAP_IPC_LOCK);
+    suite.expect(
+        Brain::validateApplicationContainerPrivileges(deployment, failure),
+        "brain_privilege_admission_accepts_low_risk_capabilities");
+
+    ContainerPlan runtime = {};
+    runtime.config.capabilities = deployment.config.capabilities;
+    suite.expect(
+        ContainerManager::approveCapabilities(runtime),
+        "neuron_privilege_admission_accepts_low_risk_capabilities");
+    runtime.useHostNetworkNamespace = true;
+    suite.expect(
+        ContainerManager::approveCapabilities(runtime) == false,
+        "neuron_privilege_admission_rejects_application_host_network_namespace");
+    runtime.useHostNetworkNamespace = false;
+    runtime.config.capabilities.insert(CAP_BPF);
+    deployment.config.capabilities.insert(CAP_BPF);
+    suite.expect(
+        Brain::validateApplicationContainerPrivileges(deployment, failure) == false &&
+            ContainerManager::approveCapabilities(runtime) == false,
+        "brain_and_neuron_privilege_admission_reject_unsupported_capability");
+
+    runtime.system.kind = SystemContainerKind::mothershipTunnelProvider;
+    suite.expect(
+        ContainerManager::approveCapabilities(runtime),
+        "neuron_privilege_admission_preserves_system_container_policy_boundary");
+  }
+
   return (suite.failed == 0) ? 0 : 1;
 }

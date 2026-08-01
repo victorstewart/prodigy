@@ -33,6 +33,7 @@
 
 #include <ebpf/common/structs.h>
 #include <services/memfd.h>
+#include <prodigy/application.container.privileges.h>
 #include <prodigy/build.identity.h>
 #include <prodigy/container.contract.h>
 #include <prodigy/declared.network.policy.h>
@@ -8256,6 +8257,15 @@ public:
     {
       failure->clear();
     }
+    if (approveCapabilities(plan) == false)
+    {
+      if (failure)
+      {
+        failure->assign(
+            "host network namespace or requested capability is not approved"_ctv);
+      }
+      return;
+    }
     uint32_t userID = 0;
     uint32_t executionHostID = 0;
     if (prodigyDeriveContainerHostIDs(plan, userID, executionHostID) == false)
@@ -9661,6 +9671,15 @@ public:
 
   static bool startContainer(Container *container, bool isRestart = false, String *failureReport = nullptr)
   {
+    if (container == nullptr || approveCapabilities(container->plan) == false)
+    {
+      if (failureReport)
+      {
+        failureReport->assign(
+            "host network namespace or requested capability is not approved"_ctv);
+      }
+      return false;
+    }
     ensureSigchldIsWaitable();
 
     if (container->artifactRootPath.size() == 0)
@@ -10980,24 +10999,11 @@ public:
 
   // approve in master before distributing
   // in the future we can provide a way to dynamically update the allowed capabilities, but these should rarely change
-  static bool approveCapabilities(ContainerPlan& plan)
+  static bool approveCapabilities(const ContainerPlan& plan)
   {
-    for (int capability : plan.config.capabilities)
-    {
-      switch (capability)
-      {
-        case CAP_NET_BIND_SERVICE: // ports below 1024
-        case CAP_IPC_LOCK: // allocate hugepages
-          {
-            continue;
-          }
-        default:
-          {
-            return false;
-          }
-      }
-    }
-
-    return true;
+    return plan.isSystemContainer() ||
+           prodigyApplicationContainerPrivilegesAllowed(
+               plan.useHostNetworkNamespace,
+               plan.config);
   }
 };

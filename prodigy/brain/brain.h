@@ -31,6 +31,7 @@ static inline cppsort::verge_adapter<cppsort::ska_sorter> sorter;
 #include <networking/reconnector.h>
 
 #include <prodigy/bootstrap.config.h>
+#include <prodigy/application.container.privileges.h>
 #include <prodigy/bundle.artifact.h>
 #include <prodigy/acme.certbot.h>
 #include <prodigy/brain.reachability.h>
@@ -6471,6 +6472,22 @@ public:
     }
 
     return true;
+  }
+
+  static bool validateApplicationContainerPrivileges(
+      const DeploymentPlan& plan,
+      String& failure)
+  {
+    failure.clear();
+    if (prodigyApplicationContainerPrivilegesAllowed(
+            plan.useHostNetworkNamespace,
+            plan.config))
+    {
+      return true;
+    }
+    failure.assign(
+        "invalid plan: host network namespace or requested capability is not approved for applications"_ctv);
+    return false;
   }
 
   static bool computeTaskExecutionFingerprint(const DeploymentPlan& plan, String& fingerprint, String *failure = nullptr)
@@ -25095,6 +25112,12 @@ public:
           if (validateTaskDeploymentPlan(deployment->plan, taskPlanFailure) == false)
           {
             rejectInvalidPlan(taskPlanFailure);
+            return;
+          }
+          String privilegeFailure = {};
+          if (validateApplicationContainerPrivileges(deployment->plan, privilegeFailure) == false)
+          {
+            rejectInvalidPlan(privilegeFailure);
             return;
           }
 
