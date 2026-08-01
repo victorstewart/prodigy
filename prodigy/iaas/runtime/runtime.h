@@ -117,6 +117,7 @@ private:
   bool providerReconfigurationPending = false;
   bool elasticAddressOperationBatchActive = false;
   bool elasticAddressReleaseFenceActive = false;
+  bool providerReconfigurationFenceActive = false;
 
   BrainIaaS *activeDelegate(void)
   {
@@ -137,6 +138,7 @@ private:
   {
     if (completedDelegate != nullptr && providerReconfigurationPending &&
         elasticAddressOperationBatchActive == false && elasticAddressReleaseFenceActive == false &&
+        providerReconfigurationFenceActive == false &&
         completedDelegate == providerDelegate.get() &&
         completedDelegate->hasActiveControlOperations() == false)
     {
@@ -217,7 +219,7 @@ public:
 
   void configureRuntimeEnvironment(const ProdigyRuntimeEnvironmentConfig& config) override
   {
-    if (elasticAddressReleaseFenceActive)
+    if (elasticAddressReleaseFenceActive || providerReconfigurationFenceActive)
     {
       return;
     }
@@ -244,6 +246,16 @@ public:
       return false;
     }
     elasticAddressReleaseFenceActive = active;
+    if (active == false)
+    {
+      applyPendingRuntimeEnvironment(providerDelegate.get());
+    }
+    return true;
+  }
+
+  bool setProviderReconfigurationFenceActive(bool active) override
+  {
+    providerReconfigurationFenceActive = active;
     if (active == false)
     {
       applyPendingRuntimeEnvironment(providerDelegate.get());

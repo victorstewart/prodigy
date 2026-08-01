@@ -1190,7 +1190,11 @@ public:
     if (havePersistedBrainSnapshot)
     {
       brainConfig = persistedBrainSnapshot.brainConfig;
-      applyPersistentMasterAuthorityPackage(persistedBrainSnapshot.masterAuthority);
+      if (applyPersistentMasterAuthorityPackage(persistedBrainSnapshot.masterAuthority) == false)
+      {
+        basics_log("prodigy startup rejected invalid persistent master-authority state\n");
+        _exit(EXIT_FAILURE);
+      }
       metrics.importSamples(persistedBrainSnapshot.metricSamples);
     }
 
@@ -1213,6 +1217,7 @@ public:
                                      persistentBootState,
                                      {.http = hostControlNetwork.http(), .delay = ProdigyHostDelayOperation::submission()});
     (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
+    (void)configureMachineRetirementProviderFence(masterAuthorityRuntimeState);
     dnsProvider = new ProdigyDefaultDNSProvider();
     configureDNSProviderRuntime({.http = hostControlNetwork.http(),
                                  .delay = ProdigyHostDelayOperation::submission()});

@@ -6807,6 +6807,53 @@ static void serialize(S&& serializer, ProdigyPendingAutonomousProvisioningOperat
   serializer.value4b(operation.count);
 }
 
+class ProdigyPendingMachineRetirement {
+public:
+
+  uint64_t retirementID = 0;
+  uint64_t topologyVersion = 0;
+  ClusterMachine machine;
+  bool evacuationComplete = false;
+  bool destroyRequired = false;
+  bool destroySucceeded = false;
+
+  bool operator==(const ProdigyPendingMachineRetirement& other) const
+  {
+    return retirementID == other.retirementID && topologyVersion == other.topologyVersion &&
+           machine == other.machine &&
+           evacuationComplete == other.evacuationComplete &&
+           destroyRequired == other.destroyRequired &&
+           destroySucceeded == other.destroySucceeded;
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyPendingMachineRetirement& retirement)
+{
+  serializer.value8b(retirement.retirementID);
+  serializer.value8b(retirement.topologyVersion);
+  serializer.object(retirement.machine);
+  serializer.value1b(retirement.evacuationComplete);
+  serializer.value1b(retirement.destroyRequired);
+  serializer.value1b(retirement.destroySucceeded);
+}
+
+class ProdigyMachineRetirementJournal {
+public:
+
+  constexpr static uint8_t currentVersion = 1;
+
+  uint8_t version = currentVersion;
+  Vector<ProdigyPendingMachineRetirement> retirements;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyMachineRetirementJournal& journal)
+{
+  serializer.value1b(journal.version);
+  serializer.object(journal.retirements);
+}
+
 enum class RoutableResourceLeaseKind : uint8_t {
   wormholeAddress = 0,
   whiteholeAddressPort = 1,

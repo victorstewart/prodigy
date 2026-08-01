@@ -329,7 +329,8 @@ inline bool Brain::configurePendingElasticAddressReleaseFence(
   {
     return true;
   }
-  if (state.pendingElasticAddressAssignments.empty() && state.pendingElasticAddressReleases.empty())
+  if (state.pendingElasticAddressAssignments.empty() &&
+      state.pendingElasticAddressReleases.empty())
   {
     return iaas->setElasticAddressReleaseFenceActive(false);
   }
@@ -389,7 +390,9 @@ inline void Brain::noteMasterAuthorityTransitionSentToPeer(
     const ProdigyMasterAuthorityRuntimeState& state,
     const String& transitionDigest)
 {
-  if (state.pendingElasticAddressAssignments.empty() && state.pendingElasticAddressReleases.empty())
+  if (state.pendingElasticAddressAssignments.empty() &&
+      state.pendingElasticAddressReleases.empty() &&
+      machineRetirementJournalPresent(state) == false)
   {
     masterAuthorityReplicationByPeer.erase(peer);
     return;
@@ -493,6 +496,8 @@ inline void Brain::acknowledgeMasterAuthorityTransition(
     const ProdigyMasterAuthorityStateTransitionAck& acknowledgement)
 {
   if (peer == nullptr || peer->quarantined || peer->registrationFresh == false ||
+      (machineRetirementJournalPresent(masterAuthorityRuntimeState) &&
+       peer->version < machineRetirementJournalMinimumPeerVersion) ||
       peer->uuid == 0 || peer->boottimens == 0 || peerSocketActive(peer) == false ||
       (peer->transportTLSEnabled() &&
        (peer->isTLSNegotiated() == false || peer->tlsPeerVerified == false ||
@@ -512,10 +517,8 @@ inline void Brain::acknowledgeMasterAuthorityTransition(
     masterAuthorityReplicationByPeer.erase(trackingIt);
     return;
   }
-  auto sentIt = tracking.sentElasticOperationIDsByGeneration.find(acknowledgement.generation);
   auto digestIt = tracking.sentTransitionDigestsByGeneration.find(acknowledgement.generation);
-  if (sentIt == tracking.sentElasticOperationIDsByGeneration.end() ||
-      digestIt == tracking.sentTransitionDigestsByGeneration.end() ||
+  if (digestIt == tracking.sentTransitionDigestsByGeneration.end() ||
       acknowledgement.transitionDigest.size() != 64 ||
       digestIt->second.equals(acknowledgement.transitionDigest) == false)
   {
@@ -523,14 +526,19 @@ inline void Brain::acknowledgeMasterAuthorityTransition(
   }
   tracking.acknowledgedGeneration = std::max(tracking.acknowledgedGeneration,
                                              acknowledgement.generation);
-  for (uint64_t operationID : sentIt->second)
+  auto sentIt = tracking.sentElasticOperationIDsByGeneration.find(acknowledgement.generation);
+  if (sentIt != tracking.sentElasticOperationIDsByGeneration.end())
   {
-    tracking.acknowledgedElasticOperationIDs.insert(operationID);
+    for (uint64_t operationID : sentIt->second)
+    {
+      tracking.acknowledgedElasticOperationIDs.insert(operationID);
+    }
+    tracking.sentElasticOperationIDsByGeneration.erase(sentIt);
   }
-  tracking.sentElasticOperationIDsByGeneration.erase(sentIt);
   tracking.sentTransitionDigestsByGeneration.erase(digestIt);
   reconcilePendingElasticAddressAssignments();
   reconcilePendingElasticAddressReleases();
+  reapRetiringMachines();
 }
 
 inline void Brain::sendMasterAuthorityTransitionAcknowledgement(

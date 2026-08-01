@@ -1,4 +1,5 @@
 #include <limits.h>
+#include <algorithm>
 #include <cerrno>
 #include <cctype>
 #include <cpp-sort/adapters/verge_adapter.h>
@@ -14,6 +15,7 @@
 #include <openssl/x509v3.h>
 #include <openssl/x509_vfy.h>
 #include <signal.h>
+#include <sys/eventfd.h>
 #include <sys/wait.h>
 
 static inline cppsort::verge_adapter<cppsort::ska_sorter> sorter;
@@ -91,7 +93,8 @@ enum class BrainTimeoutFlags : uint64_t {
   performHardReboot,
   postIgnitionRecovery,
   spotDecomissionChecker,
-  dnsReconcileRetry
+  dnsReconcileRetry,
+  machineRetirementRecheck
 };
 
 static inline bool brainAddCertificateSubjectAltNames(X509 *cert, const Vector<String>& dnsSans, const Vector<IPAddress>& ipSans)
@@ -1050,6 +1053,46 @@ public:
   Vector<Machine *> operatingSystemUpdateOrder;
 
   bytell_hash_set<NeuronView *> neurons;
+  class MachineRetirement
+  {
+  public:
+
+    Machine *machine = nullptr;
+    uint64_t identityID = 0;
+    bool closeQueued = false;
+    bool ringCloseObserved = false;
+    bytell_hash_set<uint64_t> deploymentQuiescenceIDs;
+  };
+  class RetiredMachineIdentity
+  {
+  public:
+
+    uint64_t id = 0;
+    uint64_t topologyVersion = 0;
+    ClusterMachine machine;
+    bool topologyAbsent = false;
+    bool providerAbsent = false;
+    uint64_t topologyObservationEpoch = 0;
+    uint64_t providerObservationEpoch = 0;
+    bool evacuationComplete = false;
+    bool evacuationObserved = false;
+    bool authoritySettled = false;
+    bool destroyRequired = false;
+    bool destroyQueued = false;
+    bool destroySucceeded = false;
+    uint32_t destroyFailureCount = 0;
+    int64_t nextDestroyAttemptMs = 0;
+    uint64_t destroyAuthorityEpoch = 0;
+  };
+  bytell_hash_map<NeuronView *, MachineRetirement> retiringMachinesByNeuron;
+  bytell_hash_map<MachineSSH *, uint64_t> retiringMachineSSHs;
+  bytell_hash_map<uint64_t, RetiredMachineIdentity> retiredMachineIdentities;
+  uint64_t nextRetiredMachineIdentityID = 1;
+  constexpr static uint64_t machineRetirementJournalExecutionID = 0;
+  constexpr static uint64_t machineRetirementJournalVersionID = 0x4d52544a0001ULL;
+  constexpr static uint64_t machineRetirementJournalMinimumPeerVersion = 5;
+  TimeoutPacket machineRetirementRecheck;
+  bool machineRetirementRecheckArmed = false;
 
   // just create a new ssh instance each time we need it... simplies everything for now.. unless we intended to use it regularly
   bytell_hash_set<MachineSSH *> sshs;
@@ -5293,6 +5336,11 @@ public:
     bool changed = false;
     for (auto it = masterAuthorityRuntimeState.taskExecutions.begin(); it != masterAuthorityRuntimeState.taskExecutions.end();)
     {
+      if (it->first == machineRetirementJournalExecutionID && machineRetirementJournalCarrier(it->second))
+      {
+        ++it;
+        continue;
+      }
       if (it->second.expired(nowMs))
       {
         it = masterAuthorityRuntimeState.taskExecutions.erase(it);
@@ -5345,9 +5393,15 @@ public:
     package.runtimeState.updateSelf = capturePersistentUpdateSelfState();
   }
 
-  void applyPersistentMasterAuthorityPackage(const ProdigyPersistentMasterAuthorityPackage& package)
+  bool applyPersistentMasterAuthorityPackage(const ProdigyPersistentMasterAuthorityPackage& package)
   {
     ProdigyMasterAuthorityRuntimeState restoredRuntimeState = package.runtimeState;
+    ProdigyMachineRetirementJournal retirementJournal = {};
+    if (decodeMachineRetirementJournal(restoredRuntimeState, retirementJournal) == false)
+    {
+      basics_log("persistent master-authority state rejected: invalid machine-retirement journal\n");
+      return false;
+    }
     if (restoredRuntimeState.nextPendingElasticAddressOperationID == 0)
     {
       restoredRuntimeState.nextPendingElasticAddressOperationID = 1;
@@ -5357,9 +5411,10 @@ public:
       restoredRuntimeState.nextDNSIntentRevision = 1;
     }
     if (validatePendingElasticAddressOperations(restoredRuntimeState) == false ||
-        configurePendingElasticAddressReleaseFence(restoredRuntimeState) == false)
+        configurePendingElasticAddressReleaseFence(restoredRuntimeState) == false ||
+        configureMachineRetirementProviderFence(restoredRuntimeState) == false)
     {
-      return;
+      return false;
     }
     Vector<ProdigyManagedMachineSchema> previousSchemas = masterAuthorityRuntimeState.machineSchemas;
     tlsVaultFactoriesByApp = package.tlsVaultFactoriesByApp;
@@ -5371,6 +5426,11 @@ public:
     deploymentPlans = package.deploymentPlans;
     failedDeployments = package.failedDeployments;
     masterAuthorityRuntimeState = std::move(restoredRuntimeState);
+    if (restoreRetiredMachineIdentitiesFromRuntimeState() == false)
+    {
+      basics_log("persistent master-authority state rejected after apply: invalid machine-retirement journal\n");
+      return false;
+    }
     masterAuthorityRuntimeStateDurable = true;
     durableMasterAuthorityRuntimeStateGeneration = masterAuthorityRuntimeState.generation;
     captureDurableElasticAddressOperations();
@@ -5408,12 +5468,20 @@ public:
     {
       (void)iaas->setElasticAddressReleaseFenceActive(false);
     }
+    reconcileRetiredMachineLocalAliases();
+    reapRetiringMachines();
+    return true;
   }
 
   bool applyReplicatedMasterAuthorityRuntimeState(const ProdigyMasterAuthorityRuntimeState& incoming, bool persist = true)
   {
     ProdigyMasterAuthorityRuntimeState sanitizedIncoming = incoming;
     sanitizedIncoming.updateSelf = {};
+    ProdigyMachineRetirementJournal retirementJournal = {};
+    if (decodeMachineRetirementJournal(sanitizedIncoming, retirementJournal) == false)
+    {
+      return false;
+    }
     if (sanitizedIncoming.nextPendingAddMachinesOperationID == 0)
     {
       sanitizedIncoming.nextPendingAddMachinesOperationID = 1;
@@ -5476,6 +5544,11 @@ public:
     {
       return false;
     }
+    if (machineRetirementJournalPresent(sanitizedIncoming) &&
+        configureMachineRetirementProviderFence(sanitizedIncoming) == false)
+    {
+      return false;
+    }
 
     ProdigyMasterAuthorityRuntimeState previousRuntimeState =
         std::move(masterAuthorityRuntimeState);
@@ -5489,6 +5562,15 @@ public:
     Vector<ProdigyManagedMachineSchema> previousSchemas = previousRuntimeState.machineSchemas;
     masterAuthorityRuntimeState = std::move(sanitizedIncoming);
     masterAuthorityRuntimeStateDurable = false;
+    if (restoreRetiredMachineIdentitiesFromRuntimeState() == false)
+    {
+      masterAuthorityRuntimeState = std::move(previousRuntimeState);
+      masterAuthorityRuntimeStateDurable = previousDurable;
+      durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+      (void)restoreRetiredMachineIdentitiesFromRuntimeState();
+      (void)configureMachineRetirementProviderFence(masterAuthorityRuntimeState);
+      return false;
+    }
     hasCompletedInitialMasterElection = masterAuthorityRuntimeState.hasCompletedInitialMasterElection;
     nextMintedClientTlsGeneration = masterAuthorityRuntimeState.nextMintedClientTlsGeneration;
     nextTlsResumptionGeneration = masterAuthorityRuntimeState.nextTlsResumptionGeneration;
@@ -5506,6 +5588,8 @@ public:
       nextTlsResumptionGeneration = previousNextTlsResumptionGeneration;
       restoreTlsResumptionSnapshotsByWormhole(previousTlsResumptionSnapshots, true);
       (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
+      (void)configureMachineRetirementProviderFence(masterAuthorityRuntimeState);
+      (void)restoreRetiredMachineIdentitiesFromRuntimeState();
       return false;
     }
 
@@ -5532,6 +5616,9 @@ public:
     }
 
     onMasterAuthorityRuntimeStateApplied();
+    (void)configureMachineRetirementProviderFence(masterAuthorityRuntimeState);
+    reconcileRetiredMachineLocalAliases();
+    reapRetiringMachines();
     if (weAreMaster && (persist == false || masterAuthorityRuntimeStateDurable))
     {
       reconcilePendingElasticAddressAssignments();
@@ -8250,6 +8337,113 @@ public:
     }
   }
 
+  RetiredMachineIdentity *retiredMachineIdentityForProvider(
+      uint128_t uuid,
+      const String& cloudID)
+  {
+    for (auto& [identityID, retirement] : retiredMachineIdentities)
+    {
+      (void)identityID;
+      if (retirement.authoritySettled == false &&
+          retirement.machine.uuid == uuid &&
+          retirement.machine.cloud.cloudID.equals(cloudID))
+      {
+        return &retirement;
+      }
+    }
+    return nullptr;
+  }
+
+  static int64_t machineRetirementDestroyRetryDelayMs(uint32_t failureCount)
+  {
+    const uint32_t exponent = std::min<uint32_t>(failureCount > 0 ? failureCount - 1 : 0, 6);
+    return std::min<int64_t>(int64_t(1000) << exponent, 60'000);
+  }
+
+  void deferRetiredMachineDestroy(RetiredMachineIdentity& retirement)
+  {
+    retirement.destroyQueued = false;
+    retirement.destroyAuthorityEpoch = 0;
+    if (retirement.destroyFailureCount < UINT32_MAX)
+    {
+      retirement.destroyFailureCount += 1;
+    }
+    retirement.nextDestroyAttemptMs = Time::now<TimeResolution::ms>() +
+                                      machineRetirementDestroyRetryDelayMs(retirement.destroyFailureCount);
+    armMachineRetirementRecheck();
+  }
+
+  void completeRetiredMachineDestroy(
+      uint128_t uuid,
+      const String& cloudID,
+      const String& failure)
+  {
+    RetiredMachineIdentity *retirement = retiredMachineIdentityForProvider(uuid, cloudID);
+    if (retirement == nullptr)
+    {
+      return;
+    }
+    const uint64_t authorityEpoch = retirement->destroyAuthorityEpoch;
+    retirement->destroyQueued = false;
+    retirement->destroyAuthorityEpoch = 0;
+    if (isActiveMaster() == false || authorityEpoch == 0 || authorityEpoch != masterAuthorityEpoch)
+    {
+      return;
+    }
+    if (failure.empty() == false)
+    {
+      deferRetiredMachineDestroy(*retirement);
+      return;
+    }
+
+    retirement->destroySucceeded = true;
+    if (commitMachineRetirementJournal() == false)
+    {
+      retirement->destroySucceeded = false;
+      basics_log("provider machine destroy completion persist failed uuid=%llu cloudID=%.*s\n",
+                 (unsigned long long)uuid,
+                 int(cloudID.size()),
+                 reinterpret_cast<const char *>(cloudID.data()));
+      deferRetiredMachineDestroy(*retirement);
+      return;
+    }
+    retirement->destroyFailureCount = 0;
+    retirement->nextDestroyAttemptMs = 0;
+    armMachineRetirementRecheck();
+  }
+
+  bool driveRetiredMachineDestroy(RetiredMachineIdentity& retirement)
+  {
+    if (isActiveMaster() == false || machineRetirementJournalHasDurableQuorum() == false ||
+        iaas == nullptr || retirement.evacuationComplete == false ||
+        retirement.topologyAbsent == false ||
+        retirement.topologyObservationEpoch != masterAuthorityEpoch ||
+        machineRetirementIdentityHasObjects(retirement.id) ||
+        retirement.destroyRequired == false ||
+        retirement.destroySucceeded || retirement.providerAbsent || retirement.destroyQueued ||
+        retirement.machine.cloud.cloudID.empty() ||
+        Time::now<TimeResolution::ms>() < retirement.nextDestroyAttemptMs)
+    {
+      return false;
+    }
+
+    retirement.destroyQueued = true;
+    retirement.destroyAuthorityEpoch = masterAuthorityEpoch;
+    if (machineLifecycle.enqueue(*iaas,
+                                 ProdigyBrainMachineLifecycleCoordinator::Action::destroy,
+                                 retirement.machine.uuid,
+                                 retirement.machine.cloud.cloudID))
+    {
+      return true;
+    }
+    basics_log("provider machine destroy queue rejected uuid=%llu cloudID=%.*s\n",
+               (unsigned long long)retirement.machine.uuid,
+               int(retirement.machine.cloud.cloudID.size()),
+               reinterpret_cast<const char *>(retirement.machine.cloud.cloudID.data()));
+    deferRetiredMachineDestroy(retirement);
+    return false;
+  }
+
   static void machineLifecycleCompleted(
       void *context,
       ProdigyBrainMachineLifecycleCoordinator::Action action,
@@ -8267,6 +8461,11 @@ public:
                  reinterpret_cast<const char *>(cloudID.data()),
                  int(failure.size()),
                  reinterpret_cast<const char *>(failure.data()));
+    }
+    if (action == ProdigyBrainMachineLifecycleCoordinator::Action::destroy)
+    {
+      owner.completeRetiredMachineDestroy(uuid, cloudID, failure);
+      return;
     }
     if (action != ProdigyBrainMachineLifecycleCoordinator::Action::hardReboot)
     {
@@ -9547,6 +9746,28 @@ public:
       return false;
     }
 
+    auto carrier = masterAuthorityRuntimeState.taskExecutions.find(
+        machineRetirementJournalExecutionID);
+    if (carrier != masterAuthorityRuntimeState.taskExecutions.end() &&
+        machineRetirementJournalCarrier(carrier->second))
+    {
+      if (peer->version < machineRetirementJournalMinimumPeerVersion)
+      {
+        return false;
+      }
+      for (const auto& [identityID, retirement] : retiredMachineIdentities)
+      {
+        (void)identityID;
+        if (retirement.machine.isBrain && retirement.machine.uuid != 0 &&
+            peer->uuid == retirement.machine.uuid &&
+            (retirement.machine.creationTimeMs == 0 || peer->creationTimeMs == 0 ||
+             retirement.machine.creationTimeMs == peer->creationTimeMs))
+        {
+          return false;
+        }
+      }
+    }
+
     if (thisNeuron != nullptr)
     {
       if (peer->private4 != 0 && peer->private4 == thisNeuron->private4.v4)
@@ -10262,6 +10483,12 @@ public:
     {
       MachineSSH *ssh = static_cast<MachineSSH *>(socket);
       ssh->cancelPendingConnect();
+      if (retiringMachineSSHs.contains(ssh))
+      {
+        ssh->reconnectAfterClose = false;
+        (void)queueMachineRetirementSSHClose(ssh);
+        return;
+      }
 
       if (result == 0) // connected to brain
       {
@@ -11545,6 +11772,10 @@ public:
             "close-inbound");
       }
     }
+    else if (retiringMachinesByNeuron.contains(static_cast<NeuronView *>(socket)))
+    {
+      completeMachineDecommission(static_cast<NeuronView *>(socket));
+    }
     else if (neurons.contains(static_cast<NeuronView *>(socket)))
     {
       NeuronView *neuron = static_cast<NeuronView *>(socket);
@@ -11664,6 +11895,18 @@ public:
         queueMothershipUnixAcceptIfNeeded();
       }
     }
+    else if (auto retiringSSH = retiringMachineSSHs.find(static_cast<MachineSSH *>(socket));
+             retiringSSH != retiringMachineSSHs.end())
+    {
+      MachineSSH *ssh = retiringSSH->first;
+      retiringMachineSSHs.erase(retiringSSH);
+      ssh->cancelPendingConnect();
+      ssh->cancelSuspended();
+      sshs.erase(ssh);
+      RingDispatcher::eraseMultiplexee(ssh);
+      delete ssh;
+      reapRetiringMachines();
+    }
     else if (sshs.contains(static_cast<MachineSSH *>(socket)))
     {
       MachineSSH *ssh = static_cast<MachineSSH *>(socket);
@@ -11696,6 +11939,13 @@ public:
   void pollHandler(void *socket, int result) override
   {
     MachineSSH *ssh = static_cast<MachineSSH *>(socket);
+
+    if (retiringMachineSSHs.contains(ssh))
+    {
+      ssh->reconnectAfterClose = false;
+      (void)queueMachineRetirementSSHClose(ssh);
+      return;
+    }
 
     if (result & (POLLHUP | POLLERR))
     {
@@ -12750,6 +13000,1101 @@ public:
     return nullptr;
   }
 
+  static bool retiredClusterMachineHasStableIdentity(const ClusterMachine& machine)
+  {
+    return machine.uuid != 0 ||
+           (machine.cloudPresent() && machine.cloud.cloudID.empty() == false);
+  }
+
+  static bool retiredMachineIdentitiesMatch(
+      const ClusterMachine& lhs,
+      const ClusterMachine& rhs)
+  {
+    const bool uuidComparable = lhs.uuid != 0 && rhs.uuid != 0;
+    const bool cloudComparable = lhs.cloud.cloudID.empty() == false &&
+                                 rhs.cloud.cloudID.empty() == false;
+    const bool incarnationConflict =
+        (lhs.creationTimeMs != 0 && rhs.creationTimeMs != 0 &&
+         lhs.creationTimeMs != rhs.creationTimeMs) ||
+        (lhs.ssh.hostPublicKeyOpenSSH.empty() == false &&
+         rhs.ssh.hostPublicKeyOpenSSH.empty() == false &&
+         lhs.ssh.hostPublicKeyOpenSSH.equals(rhs.ssh.hostPublicKeyOpenSSH) == false);
+    if ((uuidComparable && lhs.uuid != rhs.uuid) ||
+        (cloudComparable && lhs.cloud.cloudID.equals(rhs.cloud.cloudID) == false) ||
+        incarnationConflict)
+    {
+      return false;
+    }
+    if (uuidComparable || cloudComparable)
+    {
+      return true;
+    }
+    const bool lhsStable = retiredClusterMachineHasStableIdentity(lhs);
+    const bool rhsStable = retiredClusterMachineHasStableIdentity(rhs);
+    if (lhsStable && rhsStable)
+    {
+      return false;
+    }
+    if (lhs.sameIdentityAs(rhs) == false)
+    {
+      return false;
+    }
+    if (lhsStable != rhsStable)
+    {
+      const bool creationMatches = lhs.creationTimeMs != 0 &&
+                                   lhs.creationTimeMs == rhs.creationTimeMs;
+      const bool hostKeyMatches = lhs.ssh.hostPublicKeyOpenSSH.empty() == false &&
+                                  lhs.ssh.hostPublicKeyOpenSSH.equals(rhs.ssh.hostPublicKeyOpenSSH);
+      return creationMatches || hostKeyMatches;
+    }
+    return true;
+  }
+
+  static bool retiredMachineIdentitiesConflict(
+      const ClusterMachine& lhs,
+      const ClusterMachine& rhs)
+  {
+    const bool stableIdentityOverlaps =
+        (lhs.uuid != 0 && rhs.uuid != 0 && lhs.uuid == rhs.uuid) ||
+        (lhs.cloud.cloudID.empty() == false && rhs.cloud.cloudID.empty() == false &&
+         lhs.cloud.cloudID.equals(rhs.cloud.cloudID));
+    const bool incarnationConflict =
+        (lhs.creationTimeMs != 0 && rhs.creationTimeMs != 0 &&
+         lhs.creationTimeMs != rhs.creationTimeMs) ||
+        (lhs.ssh.hostPublicKeyOpenSSH.empty() == false &&
+         rhs.ssh.hostPublicKeyOpenSSH.empty() == false &&
+         lhs.ssh.hostPublicKeyOpenSSH.equals(rhs.ssh.hostPublicKeyOpenSSH) == false);
+    return stableIdentityOverlaps &&
+           (incarnationConflict ||
+            (lhs.uuid != 0 && rhs.uuid != 0 && lhs.uuid != rhs.uuid) ||
+            (lhs.cloud.cloudID.empty() == false && rhs.cloud.cloudID.empty() == false &&
+             lhs.cloud.cloudID.equals(rhs.cloud.cloudID) == false));
+  }
+
+  static ClusterMachine retiredMachineIdentity(const Machine& candidate)
+  {
+    ClusterMachine identity = {};
+    identity.source = ClusterMachineSource(candidate.topologySource);
+    identity.lifetime = candidate.lifetime;
+    identity.isBrain = candidate.isBrain;
+    identity.uuid = candidate.uuid;
+    identity.rackUUID = candidate.rackUUID;
+    identity.creationTimeMs = candidate.creationTimeMs;
+    if (candidate.cloudID.empty() == false)
+    {
+      identity.hasCloud = true;
+      identity.backing = ClusterMachineBacking::cloud;
+      identity.cloud.cloudID = candidate.cloudID;
+    }
+    identity.ssh.address = candidate.sshAddress;
+    identity.ssh.port = candidate.sshPort;
+    identity.ssh.user = candidate.sshUser;
+    identity.ssh.privateKeyPath = candidate.sshPrivateKeyPath;
+    identity.ssh.hostPublicKeyOpenSSH = candidate.sshHostPublicKeyOpenSSH;
+    prodigyAppendUniqueClusterMachineAddress(identity.addresses.privateAddresses, candidate.privateAddress);
+    prodigyAppendUniqueClusterMachineAddress(identity.addresses.publicAddresses, candidate.publicAddress);
+    prodigyCollectMachinePeerAddresses(candidate, identity.peerAddresses);
+    return identity;
+  }
+
+  static bool retiredMachineIdentitiesMatch(
+      const ClusterMachine& retirement,
+      const Machine& candidate)
+  {
+    return retiredMachineIdentitiesMatch(retirement, retiredMachineIdentity(candidate));
+  }
+
+  static bool mergeRetiredMachineIdentity(
+      RetiredMachineIdentity& retirement,
+      const ClusterMachine& candidateIdentity)
+  {
+    ClusterMachine& identity = retirement.machine;
+    IPAddress existingAddress = {};
+    const bool identityPresent = retiredClusterMachineHasStableIdentity(identity) ||
+                                 identity.resolvePeerAddress(existingAddress) ||
+                                 identity.ssh.address.empty() == false;
+    if (identityPresent && retiredMachineIdentitiesMatch(identity, candidateIdentity) == false)
+    {
+      return false;
+    }
+    identity.source = candidateIdentity.source;
+    identity.lifetime = candidateIdentity.lifetime;
+    identity.isBrain = identity.isBrain || candidateIdentity.isBrain;
+    if (identity.uuid == 0)
+    {
+      identity.uuid = candidateIdentity.uuid;
+    }
+    if (identity.cloud.cloudID.empty() && candidateIdentity.cloud.cloudID.empty() == false)
+    {
+      identity.hasCloud = true;
+      identity.backing = ClusterMachineBacking::cloud;
+      identity.cloud.cloudID = candidateIdentity.cloud.cloudID;
+    }
+    identity.rackUUID = identity.rackUUID == 0 ? candidateIdentity.rackUUID : identity.rackUUID;
+    identity.creationTimeMs = identity.creationTimeMs == 0 ? candidateIdentity.creationTimeMs : identity.creationTimeMs;
+    if (identity.ssh.address.size() == 0)
+    {
+      identity.ssh = candidateIdentity.ssh;
+    }
+    for (const ClusterMachineAddress& address : candidateIdentity.addresses.privateAddresses)
+    {
+      prodigyAppendUniqueClusterMachineAddress(identity.addresses.privateAddresses, address.address, address.cidr, address.gateway);
+    }
+    for (const ClusterMachineAddress& address : candidateIdentity.addresses.publicAddresses)
+    {
+      prodigyAppendUniqueClusterMachineAddress(identity.addresses.publicAddresses, address.address, address.cidr, address.gateway);
+    }
+    for (const ClusterMachinePeerAddress& address : candidateIdentity.peerAddresses)
+    {
+      prodigyAppendUniqueClusterMachinePeerAddress(identity.peerAddresses, address);
+    }
+    return true;
+  }
+
+  static bool mergeRetiredMachineIdentity(RetiredMachineIdentity& retirement, const Machine& candidate)
+  {
+    return mergeRetiredMachineIdentity(retirement, retiredMachineIdentity(candidate));
+  }
+
+  static bool machineRetirementJournalCarrier(const TaskExecutionRecord& record)
+  {
+    return record.executionID == machineRetirementJournalExecutionID &&
+           record.applicationID == 0 &&
+           record.versionID == machineRetirementJournalVersionID &&
+           record.terminal() && record.expiresAtMs == 0;
+  }
+
+  static bool machineRetirementJournalPresent(
+      const ProdigyMasterAuthorityRuntimeState& state)
+  {
+    auto carrier = state.taskExecutions.find(machineRetirementJournalExecutionID);
+    return carrier != state.taskExecutions.end() &&
+           machineRetirementJournalCarrier(carrier->second);
+  }
+
+  bool configureMachineRetirementProviderFence(
+      const ProdigyMasterAuthorityRuntimeState& state)
+  {
+    return iaas == nullptr || iaas->setProviderReconfigurationFenceActive(
+                                  machineRetirementJournalPresent(state));
+  }
+
+  bool machineRetirementPeersSupportJournal(void) const
+  {
+    if (nBrains <= 1)
+    {
+      return true;
+    }
+    bytell_hash_set<uint128_t> capablePeers;
+    for (const BrainView *brain : brains)
+    {
+      if (brain == nullptr || brain->quarantined || brain->registrationFresh == false ||
+          brain->uuid == 0 || brain->boottimens == 0 ||
+          brain->version < machineRetirementJournalMinimumPeerVersion)
+      {
+        return false;
+      }
+      capablePeers.insert(brain->uuid);
+    }
+    return capablePeers.size() + 1 >= nBrains;
+  }
+
+  bool machineRetirementJournalHasDurableQuorum(void) const
+  {
+    if (machineRetirementJournalPresent(masterAuthorityRuntimeState) == false ||
+        masterAuthorityRuntimeStateDurable == false ||
+        durableMasterAuthorityRuntimeStateGeneration < masterAuthorityRuntimeState.generation)
+    {
+      return false;
+    }
+    if (nBrains <= 1)
+    {
+      return true;
+    }
+
+    const uint32_t required = uint32_t(nBrains / 2) + 1;
+    const uint128_t localUUID = selfBrainUUID();
+    if (localUUID == 0)
+    {
+      return false;
+    }
+    uint32_t durable = 1;
+    bytell_hash_set<uint128_t> counted {localUUID};
+    for (BrainView *peer : brains)
+    {
+      if (peer == nullptr || peer->quarantined || peer->registrationFresh == false ||
+          peer->version < machineRetirementJournalMinimumPeerVersion ||
+          peer->uuid == 0 || peer->boottimens == 0 || peerSocketActive(peer) == false ||
+          (peer->transportTLSEnabled() &&
+           (peer->isTLSNegotiated() == false || peer->tlsPeerVerified == false ||
+            peer->tlsPeerUUID != peer->uuid)))
+      {
+        continue;
+      }
+      auto tracking = masterAuthorityReplicationByPeer.find(peer);
+      if (tracking != masterAuthorityReplicationByPeer.end() &&
+          tracking->second.uuid == peer->uuid &&
+          tracking->second.bootNs == peer->boottimens &&
+          tracking->second.acknowledgedGeneration >= masterAuthorityRuntimeState.generation &&
+          counted.insert(peer->uuid).second && ++durable >= required)
+      {
+        return true;
+      }
+    }
+    return durable >= required;
+  }
+
+  BrainView *brainPeerForTopologyMember(const ClusterMachine& member) const
+  {
+    BrainView *peer = member.uuid == 0 ? nullptr : findBrainViewByUUID(member.uuid);
+    if (peer == nullptr && member.uuid == 0 && member.creationTimeMs != 0)
+    {
+      Vector<ClusterMachinePeerAddress> addresses;
+      resolveClusterMachinePeerAddresses(member, addresses);
+      peer = findBrainViewByPeerAddresses(addresses);
+    }
+    if (peer == nullptr ||
+        (member.creationTimeMs != 0 && peer->creationTimeMs != 0 &&
+         member.creationTimeMs != peer->creationTimeMs))
+    {
+      return nullptr;
+    }
+    return peer;
+  }
+
+  bool applyPostRetirementBrainMembership(const ClusterTopology& topology)
+  {
+    bool retiresBrain = false;
+    for (const auto& [identityID, retirement] : retiredMachineIdentities)
+    {
+      (void)identityID;
+      retiresBrain = retiresBrain ||
+                     (retirement.authoritySettled == false && retirement.machine.isBrain);
+    }
+    if (retiresBrain == false)
+    {
+      return true;
+    }
+
+    const uint32_t survivingBrains = clusterTopologyBrainCount(topology);
+    if (survivingBrains == 0 || survivingBrains > UINT8_MAX)
+    {
+      return false;
+    }
+    nBrains = uint8_t(survivingBrains);
+    if (clusterTopologyAuthorizesThisBrain(topology) == false && weAreMaster)
+    {
+      forfeitMasterStatus();
+    }
+    for (const auto& [identityID, retirement] : retiredMachineIdentities)
+    {
+      (void)identityID;
+      if (retirement.authoritySettled || retirement.machine.isBrain == false)
+      {
+        continue;
+      }
+      if (BrainView *peer = brainPeerForTopologyMember(retirement.machine); peer != nullptr)
+      {
+        peer->quarantined = true;
+        peer->isMasterBrain = false;
+        peer->reconnectAfterClose = false;
+      }
+    }
+    return true;
+  }
+
+  bool machineRetirementJournalHasAllSurvivorDurability(void) const
+  {
+    if (machineRetirementJournalHasDurableQuorum() == false)
+    {
+      return false;
+    }
+    if (nBrains <= 1)
+    {
+      return true;
+    }
+
+    uint64_t requiredTopologyVersion = 0;
+    for (const auto& [identityID, retirement] : retiredMachineIdentities)
+    {
+      (void)identityID;
+      if (retirement.authoritySettled == false)
+      {
+        requiredTopologyVersion = std::max(requiredTopologyVersion, retirement.topologyVersion);
+      }
+    }
+    ClusterTopology topology = {};
+    if (requiredTopologyVersion == 0 ||
+        loadAuthoritativeClusterTopology(topology) == false ||
+        topology.version < requiredTopologyVersion)
+    {
+      return false;
+    }
+
+    bool includesSelf = false;
+    uint32_t survivingBrains = 0;
+    bytell_hash_set<BrainView *> counted;
+    for (const ClusterMachine& member : topology.machines)
+    {
+      if (member.isBrain == false)
+      {
+        continue;
+      }
+      survivingBrains += 1;
+      if (clusterMachineMatchesThisBrain(member))
+      {
+        includesSelf = true;
+        continue;
+      }
+      BrainView *peer = brainPeerForTopologyMember(member);
+      if (peer == nullptr || counted.insert(peer).second == false || peer->quarantined ||
+          peer->registrationFresh == false ||
+          peer->version < machineRetirementJournalMinimumPeerVersion ||
+          peer->uuid == 0 || peer->boottimens == 0 || peerSocketActive(peer) == false ||
+          (peer->transportTLSEnabled() &&
+           (peer->isTLSNegotiated() == false || peer->tlsPeerVerified == false ||
+            peer->tlsPeerUUID != peer->uuid)))
+      {
+        return false;
+      }
+      auto tracking = masterAuthorityReplicationByPeer.find(peer);
+      if (tracking == masterAuthorityReplicationByPeer.end() ||
+          tracking->second.uuid != peer->uuid ||
+          tracking->second.bootNs != peer->boottimens ||
+          tracking->second.acknowledgedGeneration < masterAuthorityRuntimeState.generation)
+      {
+        return false;
+      }
+    }
+    return includesSelf && survivingBrains == nBrains;
+  }
+
+  bool decodeMachineRetirementJournal(
+      const ProdigyMasterAuthorityRuntimeState& state,
+      ProdigyMachineRetirementJournal& journal) const
+  {
+    journal = {};
+    auto carrier = state.taskExecutions.find(machineRetirementJournalExecutionID);
+    if (carrier == state.taskExecutions.end())
+    {
+      return true;
+    }
+    if (machineRetirementJournalCarrier(carrier->second) == false)
+    {
+      return false;
+    }
+    if (BitseryEngine::deserializeSafe(carrier->second.fingerprint, journal) == false ||
+        journal.version != ProdigyMachineRetirementJournal::currentVersion)
+    {
+      return false;
+    }
+
+    bytell_hash_set<uint64_t> retirementIDs;
+    for (uint32_t index = 0; index < journal.retirements.size(); ++index)
+    {
+      const ProdigyPendingMachineRetirement& retirement = journal.retirements[index];
+      if (retirement.retirementID == 0 || retirement.retirementID == UINT64_MAX ||
+          retirementIDs.insert(retirement.retirementID).second == false)
+      {
+        return false;
+      }
+      if ((retirement.evacuationComplete || retirement.destroySucceeded) &&
+          retirement.topologyVersion == 0)
+      {
+        return false;
+      }
+      for (uint32_t otherIndex = 0; otherIndex < index; ++otherIndex)
+      {
+        if (retiredMachineIdentitiesConflict(
+                retirement.machine,
+                journal.retirements[otherIndex].machine) ||
+            retiredMachineIdentitiesMatch(
+                retirement.machine,
+                journal.retirements[otherIndex].machine))
+        {
+          return false;
+        }
+      }
+      IPAddress address = {};
+      if (retirement.machine.uuid == 0 &&
+          (retirement.machine.cloudPresent() == false || retirement.machine.cloud.cloudID.empty()) &&
+          retirement.machine.resolvePeerAddress(address) == false &&
+          retirement.machine.ssh.address.empty())
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool writeMachineRetirementJournalCarrier(void)
+  {
+    auto existing = masterAuthorityRuntimeState.taskExecutions.find(machineRetirementJournalExecutionID);
+    if (existing != masterAuthorityRuntimeState.taskExecutions.end() &&
+        machineRetirementJournalCarrier(existing->second) == false)
+    {
+      return false;
+    }
+    const bool hasAuthoritativeRetirement = std::any_of(
+        retiredMachineIdentities.begin(),
+        retiredMachineIdentities.end(),
+        [](const auto& retirement) -> bool {
+          return retirement.second.authoritySettled == false;
+        });
+    if (hasAuthoritativeRetirement == false)
+    {
+      if (existing != masterAuthorityRuntimeState.taskExecutions.end())
+      {
+        masterAuthorityRuntimeState.taskExecutions.erase(existing);
+      }
+      return true;
+    }
+
+    ProdigyMachineRetirementJournal journal = {};
+    journal.retirements.reserve(retiredMachineIdentities.size());
+    for (const auto& [identityID, retirement] : retiredMachineIdentities)
+    {
+      if (retirement.authoritySettled)
+      {
+        continue;
+      }
+      ProdigyPendingMachineRetirement persisted = {};
+      persisted.retirementID = identityID;
+      persisted.topologyVersion = retirement.topologyVersion;
+      persisted.machine = retirement.machine;
+      persisted.evacuationComplete = retirement.evacuationComplete;
+      persisted.destroyRequired = retirement.destroyRequired;
+      persisted.destroySucceeded = retirement.destroySucceeded;
+      journal.retirements.push_back(std::move(persisted));
+    }
+    std::sort(journal.retirements.begin(), journal.retirements.end(), [](const auto& lhs, const auto& rhs) -> bool {
+      return lhs.retirementID < rhs.retirementID;
+    });
+
+    TaskExecutionRecord carrier = {};
+    carrier.executionID = machineRetirementJournalExecutionID;
+    carrier.applicationID = 0;
+    carrier.versionID = machineRetirementJournalVersionID;
+    carrier.state = TaskExecutionState::cancelled;
+    carrier.acceptedAtMs = Time::now<TimeResolution::ms>();
+    carrier.updatedAtMs = carrier.acceptedAtMs;
+    carrier.completedAtMs = carrier.acceptedAtMs;
+    carrier.expiresAtMs = 0;
+    BitseryEngine::serialize(carrier.fingerprint, journal);
+    masterAuthorityRuntimeState.taskExecutions.insert_or_assign(
+        machineRetirementJournalExecutionID,
+        std::move(carrier));
+    ProdigyMachineRetirementJournal validated = {};
+    return decodeMachineRetirementJournal(masterAuthorityRuntimeState, validated);
+  }
+
+  bool commitMachineRetirementJournal(void)
+  {
+    auto previousCarrier = masterAuthorityRuntimeState.taskExecutions.find(machineRetirementJournalExecutionID);
+    const bool hadPreviousCarrier = previousCarrier != masterAuthorityRuntimeState.taskExecutions.end();
+    if (isActiveMaster() == false ||
+        (hadPreviousCarrier == false && machineRetirementPeersSupportJournal() == false))
+    {
+      return false;
+    }
+    TaskExecutionRecord previousRecord = hadPreviousCarrier ? previousCarrier->second : TaskExecutionRecord {};
+    const uint64_t previousGeneration = masterAuthorityRuntimeState.generation;
+    const bool previousDurable = masterAuthorityRuntimeStateDurable;
+    const uint64_t previousDurableGeneration = durableMasterAuthorityRuntimeStateGeneration;
+
+    const bool wroteCarrier = writeMachineRetirementJournalCarrier();
+    const bool carrierPresent = machineRetirementJournalPresent(masterAuthorityRuntimeState);
+    if (wroteCarrier &&
+        (carrierPresent == false || configureMachineRetirementProviderFence(masterAuthorityRuntimeState)) &&
+        commitMasterAuthorityStateChange())
+    {
+      (void)configureMachineRetirementProviderFence(masterAuthorityRuntimeState);
+      return true;
+    }
+
+    if (hadPreviousCarrier)
+    {
+      masterAuthorityRuntimeState.taskExecutions.insert_or_assign(
+          machineRetirementJournalExecutionID,
+          std::move(previousRecord));
+    }
+    else
+    {
+      masterAuthorityRuntimeState.taskExecutions.erase(machineRetirementJournalExecutionID);
+    }
+    masterAuthorityRuntimeState.generation = previousGeneration;
+    masterAuthorityRuntimeStateDurable = previousDurable;
+    durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+    (void)configureMachineRetirementProviderFence(masterAuthorityRuntimeState);
+    return false;
+  }
+
+  bool restoreRetiredMachineIdentitiesFromRuntimeState(void)
+  {
+    ProdigyMachineRetirementJournal journal = {};
+    if (decodeMachineRetirementJournal(masterAuthorityRuntimeState, journal) == false)
+    {
+      return false;
+    }
+
+    bytell_hash_map<uint64_t, RetiredMachineIdentity> restored;
+    uint64_t nextIdentityID = 1;
+    for (const ProdigyPendingMachineRetirement& persisted : journal.retirements)
+    {
+      RetiredMachineIdentity retirement = {};
+      retirement.id = persisted.retirementID;
+      retirement.topologyVersion = persisted.topologyVersion;
+      retirement.machine = persisted.machine;
+      retirement.evacuationComplete = persisted.evacuationComplete;
+      retirement.destroyRequired = persisted.destroyRequired;
+      retirement.destroySucceeded = persisted.destroySucceeded;
+      retirement.providerAbsent = retirement.machine.cloud.cloudID.empty();
+      restored.emplace(retirement.id, std::move(retirement));
+      nextIdentityID = std::max<uint64_t>(nextIdentityID, persisted.retirementID + 1);
+    }
+    bytell_hash_set<uint64_t> usedIdentityIDs;
+    for (const auto& [identityID, retirement] : restored)
+    {
+      (void)retirement;
+      usedIdentityIDs.insert(identityID);
+    }
+    for (const auto& [identityID, retirement] : retiredMachineIdentities)
+    {
+      (void)retirement;
+      usedIdentityIDs.insert(identityID);
+    }
+    bytell_hash_map<uint64_t, uint64_t> rekeyedIdentityIDs;
+    uint64_t nextLocalIdentityID = UINT64_MAX - 1;
+    for (const auto& [identityID, current] : retiredMachineIdentities)
+    {
+      auto incoming = std::find_if(
+          restored.begin(),
+          restored.end(),
+          [&](const auto& candidate) -> bool {
+            return retiredMachineIdentitiesMatch(candidate.second.machine, current.machine);
+          });
+      if (incoming != restored.end())
+      {
+        if (mergeRetiredMachineIdentity(incoming->second, current.machine) == false)
+        {
+          return false;
+        }
+        if (current.authoritySettled == false && identityID == incoming->first)
+        {
+          incoming->second.topologyAbsent = current.topologyAbsent;
+          incoming->second.providerAbsent = incoming->second.providerAbsent || current.providerAbsent;
+          incoming->second.topologyObservationEpoch = current.topologyObservationEpoch;
+          incoming->second.providerObservationEpoch = current.providerObservationEpoch;
+          incoming->second.evacuationComplete = incoming->second.evacuationComplete || current.evacuationComplete;
+          incoming->second.evacuationObserved = incoming->second.evacuationObserved || current.evacuationObserved;
+          incoming->second.destroyQueued = current.destroyQueued;
+          incoming->second.destroyFailureCount = current.destroyFailureCount;
+          incoming->second.nextDestroyAttemptMs = current.nextDestroyAttemptMs;
+          incoming->second.destroyAuthorityEpoch = current.destroyAuthorityEpoch;
+        }
+        else
+        {
+          incoming->second.evacuationObserved = incoming->second.evacuationObserved || current.evacuationObserved;
+        }
+        if (identityID != incoming->first)
+        {
+          rekeyedIdentityIDs.insert_or_assign(identityID, incoming->first);
+        }
+        continue;
+      }
+      if (machineRetirementIdentityHasObjects(identityID) == false)
+      {
+        continue;
+      }
+      RetiredMachineIdentity local = current;
+      local.authoritySettled = true;
+      local.destroyQueued = false;
+      local.destroyAuthorityEpoch = 0;
+      uint64_t localIdentityID = identityID;
+      if (restored.contains(localIdentityID))
+      {
+        while (nextLocalIdentityID > 0 && usedIdentityIDs.contains(nextLocalIdentityID))
+        {
+          nextLocalIdentityID -= 1;
+        }
+        if (nextLocalIdentityID == 0)
+        {
+          return false;
+        }
+        localIdentityID = nextLocalIdentityID;
+        usedIdentityIDs.insert(localIdentityID);
+        nextLocalIdentityID -= 1;
+        rekeyedIdentityIDs.insert_or_assign(identityID, localIdentityID);
+      }
+      local.id = localIdentityID;
+      restored.emplace(localIdentityID, std::move(local));
+    }
+    for (auto& [neuron, retirement] : retiringMachinesByNeuron)
+    {
+      (void)neuron;
+      if (auto rekeyed = rekeyedIdentityIDs.find(retirement.identityID);
+          rekeyed != rekeyedIdentityIDs.end())
+      {
+        retirement.identityID = rekeyed->second;
+      }
+    }
+    for (auto& [ssh, identityID] : retiringMachineSSHs)
+    {
+      (void)ssh;
+      if (auto rekeyed = rekeyedIdentityIDs.find(identityID);
+          rekeyed != rekeyedIdentityIDs.end())
+      {
+        identityID = rekeyed->second;
+      }
+    }
+    retiredMachineIdentities = std::move(restored);
+    nextRetiredMachineIdentityID = nextIdentityID == 0 ? 1 : nextIdentityID;
+    return true;
+  }
+
+  uint64_t retiredMachineIdentityID(const Machine& candidate) const
+  {
+    for (const auto& [identityID, retirement] : retiredMachineIdentities)
+    {
+      if (retiredMachineIdentitiesMatch(retirement.machine, candidate))
+      {
+        return identityID;
+      }
+    }
+    return 0;
+  }
+
+  bool journalMachineRetirement(
+      const Vector<Machine *>& aliases,
+      bool destroyRequired,
+      uint64_t& identityID)
+  {
+    identityID = 0;
+    if (isActiveMaster() == false || aliases.empty())
+    {
+      return false;
+    }
+
+    bytell_hash_map<uint64_t, RetiredMachineIdentity> previousRetirements = retiredMachineIdentities;
+    const uint64_t previousNextIdentityID = nextRetiredMachineIdentityID;
+    RetiredMachineIdentity merged = {};
+    Vector<ClusterMachine> pendingAliases;
+    for (Machine *alias : aliases)
+    {
+      if (alias != nullptr)
+      {
+        pendingAliases.push_back(retiredMachineIdentity(*alias));
+      }
+    }
+    if (pendingAliases.empty())
+    {
+      return false;
+    }
+    merged.machine = std::move(pendingAliases.back());
+    pendingAliases.pop_back();
+    while (pendingAliases.empty() == false)
+    {
+      bool joined = false;
+      for (auto alias = pendingAliases.begin(); alias != pendingAliases.end(); ++alias)
+      {
+        if (retiredMachineIdentitiesConflict(merged.machine, *alias))
+        {
+          return false;
+        }
+        if (retiredMachineIdentitiesMatch(merged.machine, *alias) &&
+            mergeRetiredMachineIdentity(merged, *alias))
+        {
+          pendingAliases.erase(alias);
+          joined = true;
+          break;
+        }
+      }
+      if (joined == false)
+      {
+        return false;
+      }
+    }
+
+    Vector<uint64_t> matchedIDs;
+    bool matched = false;
+    bool evacuationComplete = true;
+    bool hadRequiredDestroy = false;
+    bool requiredDestroysSucceeded = true;
+    for (const auto& [candidateID, candidate] : retiredMachineIdentities)
+    {
+      if (candidate.authoritySettled)
+      {
+        continue;
+      }
+      if (retiredMachineIdentitiesConflict(merged.machine, candidate.machine))
+      {
+        return false;
+      }
+      if (retiredMachineIdentitiesMatch(merged.machine, candidate.machine) == false)
+      {
+        continue;
+      }
+      if (mergeRetiredMachineIdentity(merged, candidate.machine) == false)
+      {
+        return false;
+      }
+      matched = true;
+      matchedIDs.push_back(candidateID);
+      identityID = identityID == 0 ? candidateID : std::min(identityID, candidateID);
+      evacuationComplete = evacuationComplete && candidate.evacuationComplete;
+      merged.destroyRequired = merged.destroyRequired || candidate.destroyRequired;
+      merged.topologyVersion = std::max(merged.topologyVersion, candidate.topologyVersion);
+      if (candidate.destroyRequired)
+      {
+        hadRequiredDestroy = true;
+        requiredDestroysSucceeded = requiredDestroysSucceeded && candidate.destroySucceeded;
+      }
+      merged.destroyQueued = merged.destroyQueued || candidate.destroyQueued;
+      merged.destroyFailureCount = std::max(merged.destroyFailureCount, candidate.destroyFailureCount);
+      merged.nextDestroyAttemptMs = std::max(merged.nextDestroyAttemptMs, candidate.nextDestroyAttemptMs);
+      if (candidate.destroyQueued)
+      {
+        merged.destroyAuthorityEpoch = candidate.destroyAuthorityEpoch;
+      }
+    }
+
+    if (matched == false)
+    {
+      while (nextRetiredMachineIdentityID != 0 &&
+             nextRetiredMachineIdentityID != UINT64_MAX &&
+             retiredMachineIdentities.contains(nextRetiredMachineIdentityID))
+      {
+        nextRetiredMachineIdentityID += 1;
+      }
+      if (nextRetiredMachineIdentityID == 0 || nextRetiredMachineIdentityID == UINT64_MAX)
+      {
+        return false;
+      }
+      identityID = nextRetiredMachineIdentityID++;
+    }
+    for (uint64_t matchedID : matchedIDs)
+    {
+      retiredMachineIdentities.erase(matchedID);
+    }
+    merged.id = identityID;
+    merged.evacuationComplete = matched && evacuationComplete;
+    merged.destroyRequired = merged.destroyRequired ||
+                             (destroyRequired && merged.machine.cloud.cloudID.empty() == false);
+    merged.destroySucceeded = hadRequiredDestroy && requiredDestroysSucceeded;
+    merged.providerAbsent = merged.machine.cloud.cloudID.empty();
+    retiredMachineIdentities.insert_or_assign(identityID, std::move(merged));
+    if (commitMachineRetirementJournal())
+    {
+      return true;
+    }
+
+    retiredMachineIdentities = std::move(previousRetirements);
+    nextRetiredMachineIdentityID = previousNextIdentityID;
+    identityID = 0;
+    return false;
+  }
+
+  bool machineIdentityIsRetiring(const Machine& candidate) const
+  {
+    return retiredMachineIdentityID(candidate) != 0;
+  }
+
+  bool clusterMachineIdentityIsRetiring(const ClusterMachine& candidate) const
+  {
+    for (const auto& [identityID, retirement] : retiredMachineIdentities)
+    {
+      (void)identityID;
+      if (retiredMachineIdentitiesMatch(candidate, retirement.machine))
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void observeRetiredMachineProviderInventory(const bytell_hash_set<Machine *>& snapshots)
+  {
+    for (auto& [identityID, retirement] : retiredMachineIdentities)
+    {
+      (void)identityID;
+      if (retirement.authoritySettled)
+      {
+        continue;
+      }
+      bool present = false;
+      for (Machine *snapshot : snapshots)
+      {
+        if (snapshot != nullptr &&
+            retiredMachineIdentitiesMatch(retirement.machine, *snapshot))
+        {
+          present = true;
+          break;
+        }
+      }
+      retirement.providerAbsent = present == false;
+      retirement.providerObservationEpoch = masterAuthorityEpoch;
+    }
+  }
+
+  bool applyReplicatedMachineRetirementTopology(
+      const ProdigyMasterAuthorityRuntimeState& state)
+  {
+    ProdigyMachineRetirementJournal journal = {};
+    if (decodeMachineRetirementJournal(state, journal) == false)
+    {
+      return false;
+    }
+    uint64_t requiredVersion = 0;
+    for (const ProdigyPendingMachineRetirement& retirement : journal.retirements)
+    {
+      requiredVersion = std::max(requiredVersion, retirement.topologyVersion);
+    }
+    if (requiredVersion == 0)
+    {
+      return true;
+    }
+
+    ClusterTopology topology = {};
+    if (loadAuthoritativeClusterTopology(topology) == false)
+    {
+      return false;
+    }
+    const uint32_t before = uint32_t(topology.machines.size());
+    topology.machines.erase(
+        std::remove_if(topology.machines.begin(), topology.machines.end(), [&](const ClusterMachine& machine) -> bool {
+          for (const ProdigyPendingMachineRetirement& retirement : journal.retirements)
+          {
+            if (retirement.topologyVersion != 0 &&
+                retiredMachineIdentitiesMatch(machine, retirement.machine))
+            {
+              return true;
+            }
+          }
+          return false;
+        }),
+        topology.machines.end());
+    const bool changed = before != topology.machines.size() || topology.version < requiredVersion;
+    topology.version = std::max(topology.version, requiredVersion);
+    if (changed && persistAuthoritativeClusterTopology(topology) == false)
+    {
+      return false;
+    }
+    return applyPostRetirementBrainMembership(topology);
+  }
+
+  void reconcileRetiredMachineAuthoritativeTopology(void)
+  {
+    if (std::none_of(retiredMachineIdentities.begin(),
+                     retiredMachineIdentities.end(),
+                     [](const auto& retirement) -> bool {
+                       return retirement.second.authoritySettled == false;
+                     }))
+    {
+      return;
+    }
+
+    ClusterTopology topology = {};
+    if (loadAuthoritativeClusterTopology(topology) == false)
+    {
+      return;
+    }
+
+    bytell_hash_set<uint64_t> present;
+    for (const ClusterMachine& machine : topology.machines)
+    {
+      for (auto& [identityID, retirement] : retiredMachineIdentities)
+      {
+        if (retirement.authoritySettled == false &&
+            retiredMachineIdentitiesMatch(machine, retirement.machine))
+        {
+          present.insert(identityID);
+          (void)mergeRetiredMachineIdentity(retirement, machine);
+          retirement.destroyRequired = retirement.destroyRequired ||
+                                       machine.cloud.cloudID.empty() == false;
+        }
+      }
+    }
+    for (auto& [identityID, retirement] : retiredMachineIdentities)
+    {
+      if (retirement.authoritySettled)
+      {
+        continue;
+      }
+      retirement.topologyAbsent = present.contains(identityID) == false;
+      retirement.topologyObservationEpoch = masterAuthorityEpoch;
+    }
+    if (isActiveMaster() == false || machineRetirementJournalHasDurableQuorum() == false)
+    {
+      return;
+    }
+    if (present.empty() == false)
+    {
+      if (topology.version == UINT64_MAX)
+      {
+        return;
+      }
+      topology.machines.erase(
+          std::remove_if(topology.machines.begin(), topology.machines.end(), [&](const ClusterMachine& machine) -> bool {
+            for (const auto& [identityID, retirement] : retiredMachineIdentities)
+            {
+              (void)identityID;
+              if (retirement.authoritySettled == false &&
+                  retiredMachineIdentitiesMatch(machine, retirement.machine))
+              {
+                return true;
+              }
+            }
+            return false;
+          }),
+          topology.machines.end());
+      bool retiresBrain = false;
+      for (const auto& [identityID, retirement] : retiredMachineIdentities)
+      {
+        (void)identityID;
+        retiresBrain = retiresBrain ||
+                       (retirement.authoritySettled == false && retirement.machine.isBrain);
+      }
+      if (retiresBrain && clusterTopologyBrainCount(topology) == 0)
+      {
+        return;
+      }
+      topology.version += 1;
+      if (persistAuthoritativeClusterTopology(topology) == false)
+      {
+        return;
+      }
+    }
+    else if (topology.version == 0)
+    {
+      topology.version = 1;
+      if (persistAuthoritativeClusterTopology(topology) == false)
+      {
+        return;
+      }
+    }
+    if (applyPostRetirementBrainMembership(topology) == false || isActiveMaster() == false)
+    {
+      return;
+    }
+
+    Vector<uint64_t> phased;
+    for (auto& [identityID, retirement] : retiredMachineIdentities)
+    {
+      if (retirement.authoritySettled)
+      {
+        continue;
+      }
+      retirement.topologyAbsent = true;
+      retirement.topologyObservationEpoch = masterAuthorityEpoch;
+      if (retirement.topologyVersion == 0)
+      {
+        retirement.topologyVersion = topology.version;
+        phased.push_back(identityID);
+      }
+    }
+    if (phased.empty())
+    {
+      return;
+    }
+    if (nBrains > 1)
+    {
+      String serializedTopology = {};
+      BitseryEngine::serialize(serializedTopology, topology);
+      queueBrainReplication(BrainTopic::replicateClusterTopology, serializedTopology);
+    }
+    if (commitMachineRetirementJournal() == false)
+    {
+      for (uint64_t identityID : phased)
+      {
+        retiredMachineIdentities[identityID].topologyVersion = 0;
+      }
+    }
+  }
+
+  bool machineRetirementIdentityHasMachineObject(uint64_t identityID) const
+  {
+    for (const auto& [neuron, retirement] : retiringMachinesByNeuron)
+    {
+      (void)neuron;
+      if (retirement.identityID == identityID)
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool machineRetirementIdentityHasObjects(uint64_t identityID) const
+  {
+    if (machineRetirementIdentityHasMachineObject(identityID))
+    {
+      return true;
+    }
+    for (const auto& [ssh, sshIdentityID] : retiringMachineSSHs)
+    {
+      (void)ssh;
+      if (sshIdentityID == identityID)
+      {
+        return true;
+      }
+    }
+    auto identity = retiredMachineIdentities.find(identityID);
+    if (identity != retiredMachineIdentities.end())
+    {
+      bytell_hash_set<Machine *> candidates;
+      collectMachineRetirementCandidates(candidates);
+      for (Machine *candidate : candidates)
+      {
+        if (candidate != nullptr &&
+            (retiredMachineIdentitiesMatch(identity->second.machine, *candidate) ||
+             retiredMachineIdentitiesConflict(
+                 identity->second.machine,
+                 retiredMachineIdentity(*candidate))))
+        {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  void settleRetiredMachineIdentities(void)
+  {
+    if (isActiveMaster() == false || machineRetirementJournalHasAllSurvivorDurability() == false)
+    {
+      return;
+    }
+    bytell_hash_map<uint64_t, RetiredMachineIdentity> previousRetirements = retiredMachineIdentities;
+    bool changed = false;
+    for (auto retirement = retiredMachineIdentities.begin(); retirement != retiredMachineIdentities.end();)
+    {
+      if (retirement->second.authoritySettled)
+      {
+        ++retirement;
+        continue;
+      }
+      const bool providerSettled = retirement->second.machine.cloud.cloudID.empty() ||
+                                   (retirement->second.providerAbsent &&
+                                    retirement->second.providerObservationEpoch == masterAuthorityEpoch) ||
+                                   (retirement->second.destroyRequired && retirement->second.destroySucceeded);
+      if (retirement->second.evacuationComplete && retirement->second.topologyAbsent &&
+          retirement->second.topologyObservationEpoch == masterAuthorityEpoch && providerSettled &&
+          machineRetirementIdentityHasObjects(retirement->first) == false)
+      {
+        retirement = retiredMachineIdentities.erase(retirement);
+        changed = true;
+      }
+      else
+      {
+        ++retirement;
+      }
+    }
+    if (changed && commitMachineRetirementJournal() == false)
+    {
+      retiredMachineIdentities = std::move(previousRetirements);
+    }
+  }
+
   Machine *findMachineByUUID(uint128_t uuid) const
   {
     if (uuid == 0)
@@ -13603,6 +14948,78 @@ public:
     return resolveClusterMachinePeerAddress(machine, peerAddress, peerAddressText) && localBrainAddressMatches(peerAddress);
   }
 
+  bool clusterBrainIdentityMatchesThisBrain(const ClusterMachine& machine) const
+  {
+    const uint128_t localUUID = selfBrainUUID();
+    if (machine.uuid != 0 && localUUID != 0)
+    {
+      return machine.uuid == localUUID;
+    }
+    if (Machine *local = findMachineByUUID(localUUID); local != nullptr)
+    {
+      return retiredMachineIdentitiesMatch(machine, *local);
+    }
+    return clusterMachineMatchesThisBrain(machine);
+  }
+
+  bool clusterTopologyAuthorizesThisBrain(const ClusterTopology& topology) const
+  {
+    bool definesBrainMembership = false;
+    for (const ClusterMachine& machine : topology.machines)
+    {
+      if (machine.isBrain == false)
+      {
+        continue;
+      }
+      definesBrainMembership = true;
+      if (clusterBrainIdentityMatchesThisBrain(machine))
+      {
+        return true;
+      }
+    }
+    return definesBrainMembership == false;
+  }
+
+  bool localBrainEligibleForMasterElection(void) const
+  {
+    ClusterTopology topology = {};
+    const ClusterMachine *localMembership = nullptr;
+    bool definesBrainMembership = false;
+    if (loadAuthoritativeClusterTopology(topology) && topology.machines.empty() == false)
+    {
+      for (const ClusterMachine& machine : topology.machines)
+      {
+        if (machine.isBrain == false)
+        {
+          continue;
+        }
+        definesBrainMembership = true;
+        if (clusterBrainIdentityMatchesThisBrain(machine))
+        {
+          localMembership = &machine;
+          break;
+        }
+      }
+      if (definesBrainMembership && localMembership == nullptr)
+      {
+        return false;
+      }
+    }
+
+    for (const auto& [identityID, retirement] : retiredMachineIdentities)
+    {
+      (void)identityID;
+      if (retirement.machine.isBrain &&
+          (localMembership != nullptr
+               ? retiredMachineIdentitiesMatch(retirement.machine, *localMembership)
+               : clusterBrainIdentityMatchesThisBrain(retirement.machine)))
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
   bool probeCandidateBrainReachability(const ClusterTopology& currentTopology, const ClusterMachine& candidate, AddMachines& response) const
   {
     response.reachabilityProbeAddress.clear();
@@ -13656,6 +15073,13 @@ public:
 
     for (const ClusterMachine& clusterMachine : topology.machines)
     {
+      // A terminal Machine remains alive only as a Ring/lifetime quarantine.
+      // Never let stale topology allocate and connect a second live incarnation.
+      if (clusterMachineIdentityIsRetiring(clusterMachine))
+      {
+        continue;
+      }
+
       uint32_t resolvedPrivate4 = 0;
       (void)resolveClusterMachinePrivate4(clusterMachine, resolvedPrivate4);
       IPAddress resolvedPeerAddress = {};
@@ -13900,16 +15324,66 @@ public:
     }
 
     String inventoryFailure = {};
-    iaas->getMachines(coro, thisNeuron->metro, machines, inventoryFailure);
+    bytell_hash_set<Machine *> inventorySnapshots;
+    iaas->getMachines(coro, thisNeuron->metro, inventorySnapshots, inventoryFailure);
 
     if (suspendIndex < coro->nextSuspendIndex())
     {
       co_await coro->suspendAtIndex(suspendIndex);
     }
+
+    for (const auto& [neuron, retirement] : retiringMachinesByNeuron)
+    {
+      (void)neuron;
+      Machine *retiringMachine = retirement.machine;
+      machines.erase(retiringMachine);
+      knownMachines.erase(retiringMachine);
+      if (retiringMachine != nullptr && retiringMachine->uuid != 0)
+      {
+        auto known = knownByUUID.find(retiringMachine->uuid);
+        if (known != knownByUUID.end() && known->second == retiringMachine)
+        {
+          knownByUUID.erase(known);
+        }
+      }
+    }
+
     if (inventoryFailure.size() > 0)
     {
+      for (Machine *snapshot : inventorySnapshots)
+      {
+        prodigyDestroyMachineSnapshot(snapshot);
+      }
       basics_log("machine inventory failed: %s\n", inventoryFailure.c_str());
       co_return;
+    }
+
+    observeRetiredMachineProviderInventory(inventorySnapshots);
+
+    for (Machine *snapshot : inventorySnapshots)
+    {
+      const uint64_t identityID = snapshot == nullptr ? 0 : retiredMachineIdentityID(*snapshot);
+      if (identityID != 0)
+      {
+        auto retirement = retiredMachineIdentities.find(identityID);
+        if (retirement != retiredMachineIdentities.end() &&
+            retirement->second.evacuationComplete == false &&
+            machineRetirementIdentityHasMachineObject(identityID) == false)
+        {
+          Vector<ApplicationDeployment *> graph;
+          collectDeploymentGraph(graph);
+          captureMachineRetirement(snapshot, identityID, graph);
+          quarantineMachineAlias(snapshot);
+        }
+        else
+        {
+          prodigyDestroyMachineSnapshot(snapshot);
+        }
+      }
+      else
+      {
+        machines.insert(snapshot);
+      }
     }
 
     Vector<Machine *> duplicateSnapshots;
@@ -13939,11 +15413,7 @@ public:
         {
           Rack *previousRack = machine->rack;
           previousRack->machines.erase(machine);
-          if (previousRack->machines.empty())
-          {
-            racks.erase(previousRack->uuid);
-            delete previousRack;
-          }
+          deleteRackIfUnused(previousRack);
         }
 
         Rack *rack = nullptr;
@@ -14037,7 +15507,17 @@ public:
       {
         if (auto known = knownByUUID.find(candidate->uuid); known != knownByUUID.end())
         {
-          canonical = known->second;
+          if (retiredMachineIdentitiesMatch(
+                  retiredMachineIdentity(*known->second),
+                  *candidate))
+          {
+            canonical = known->second;
+          }
+          else
+          {
+            duplicateSnapshots.push_back(candidate);
+            continue;
+          }
         }
       }
 
@@ -14045,7 +15525,10 @@ public:
       {
         for (Machine *knownMachine : knownMachines)
         {
-          if (knownMachine != nullptr && prodigyMachinesShareIdentity(*knownMachine, *candidate))
+          if (knownMachine != nullptr &&
+              retiredMachineIdentitiesMatch(
+                  retiredMachineIdentity(*knownMachine),
+                  *candidate))
           {
             canonical = knownMachine;
             break;
@@ -14134,6 +15617,8 @@ public:
     spotDecomissionChecker.dispatcher = this;
     RingDispatcher::installMultiplexee(&spotDecomissionChecker, this);
     Ring::queueTimeout(&spotDecomissionChecker);
+
+    reapRetiringMachines();
 
     // if the last master brain failed...
     // after the ignition timeout we would autodetect that we can't connect to the neuron of the previous master brain,
@@ -14292,7 +15777,7 @@ public:
     }
     // Multi-brain bootstrap self-elects from brain registrations; only the elected master
     // should arm mothership listening.
-    if (nBrains == 1)
+    if (selfIsBrain && nBrains == 1)
     {
       basics_log("getBrains elect-self reason=single-brain-bootstrap\n");
       selfElectAsMaster("getBrains:single-brain-bootstrap"); // we are it
@@ -14969,6 +16454,11 @@ public:
 
 protected:
 
+  virtual int createMachineRetirementFenceFD(void)
+  {
+    return eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+  }
+
   virtual bool installNeuronControlSocketFromBrain(NeuronView *neuron)
   {
     return installNeuronControlSocket(neuron);
@@ -15068,6 +16558,15 @@ public:
   bool selfElectAsMaster(const char *reason = "unspecified", bool replaceLiveMothershipListener = false)
   {
     basics_log("selfElectAsMaster begin weAreMaster=%d reason=%s\n", int(weAreMaster), reason);
+    if (localBrainEligibleForMasterElection() == false)
+    {
+      basics_log("selfElectAsMaster rejected reason=local-brain-not-in-authoritative-topology request=%s\n", reason);
+      if (weAreMaster)
+      {
+        forfeitMasterStatus();
+      }
+      return false;
+    }
     if (weAreMaster)
     {
       return true;
@@ -15280,7 +16779,7 @@ public:
 
   void electBrainToMaster(BrainView *brain)
   {
-    if (brain == nullptr)
+    if (peerEligibleForClusterQuorum(brain) == false)
     {
       return;
     }
@@ -15343,6 +16842,15 @@ public:
 
     // it's possible we were master.. then lost connectivity.. then reconnected... only to discover that a master was voted in..
     // in that case we need to just recognize that as master..
+
+    if (localBrainEligibleForMasterElection() == false)
+    {
+      if (weAreMaster)
+      {
+        forfeitMasterStatus();
+      }
+      return;
+    }
 
     if (noMasterYet)
     {
@@ -15686,6 +17194,8 @@ public:
 
   void requestMachines(MachineTicket *ticket, ApplicationDeployment *deployment, ApplicationLifetime lifetime, uint32_t nMore) override
   {
+    ticket->deployment = deployment;
+    ticket->lifetime = lifetime;
     const ApplicationConfig& config = deployment->plan.config;
 
   retry: // there will be new MachineState::deploying machines now
@@ -15857,87 +17367,1022 @@ public:
     }
   }
 
-  void decommissionMachine(Machine *machine)
+  void deleteRackIfUnused(Rack *rack)
   {
-    basics_log("decommissionMachine uuid=%llu private4=%u state=%u isBrain=%d cloudID=%s containers=%llu\n",
-               (unsigned long long)(machine ? machine->uuid : 0),
-               unsigned(machine ? machine->private4 : 0u),
-               unsigned(machine ? machine->state : MachineState::unknown),
-               int(machine ? machine->isBrain : false),
-               (machine ? machine->cloudID.c_str() : ""),
-               (unsigned long long)(machine ? machine->containersByDeploymentID.size() : 0u));
+    if (rack == nullptr || rack->machines.empty() == false)
+    {
+      return;
+    }
 
+    for (const auto& [neuron, retirement] : retiringMachinesByNeuron)
+    {
+      (void)neuron;
+      if (retirement.machine != nullptr && retirement.machine->rack == rack)
+      {
+        return;
+      }
+    }
+
+    auto it = racks.find(rack->uuid);
+    if (it == racks.end() || it->second != rack)
+    {
+      return;
+    }
+
+    racks.erase(it);
+    delete rack;
+  }
+
+  void collectDeploymentGraph(Vector<ApplicationDeployment *>& graph) const
+  {
+    bytell_hash_set<ApplicationDeployment *> discovered;
+    auto append = [&](ApplicationDeployment *deployment) -> void {
+      if (deployment != nullptr && discovered.insert(deployment).second)
+      {
+        graph.push_back(deployment);
+      }
+    };
+
+    for (const auto& [deploymentID, deployment] : deployments)
+    {
+      (void)deploymentID;
+      append(deployment);
+    }
+    for (const auto& [applicationID, deployment] : deploymentsByApp)
+    {
+      (void)applicationID;
+      append(deployment);
+    }
+
+    for (uint32_t index = 0; index < graph.size(); ++index)
+    {
+      append(graph[index]->previous);
+      append(graph[index]->next);
+    }
+  }
+
+  static bool deploymentIsActive(const ApplicationDeployment *deployment)
+  {
+    return deployment != nullptr && (deployment->nSuspended > 0 || deployment->schedulingStack.execution != nullptr || deployment->canaryStack != nullptr);
+  }
+
+  void releaseObservedDeploymentQuiescence(MachineRetirement& retirement, const Vector<ApplicationDeployment *>& graph)
+  {
+    Vector<uint64_t> released;
+    for (uint64_t deploymentID : retirement.deploymentQuiescenceIDs)
+    {
+      bool active = false;
+      for (ApplicationDeployment *deployment : graph)
+      {
+        if (deployment->plan.config.deploymentID() == deploymentID && deploymentIsActive(deployment))
+        {
+          active = true;
+          break;
+        }
+      }
+      if (active == false)
+      {
+        released.push_back(deploymentID);
+      }
+    }
+    for (uint64_t deploymentID : released)
+    {
+      retirement.deploymentQuiescenceIDs.erase(deploymentID);
+    }
+  }
+
+  static bool containerReferencesMachine(const ContainerView *container, const Machine *machine)
+  {
+    return container != nullptr && container->machine == machine;
+  }
+
+  bool deploymentReferencesMachine(ApplicationDeployment *deployment, Machine *machine) const
+  {
+    if (auto placement = deployment->countPerMachine.find(machine);
+        placement != deployment->countPerMachine.end() && placement->second > 0)
+    {
+      return true;
+    }
+    bytell_hash_set<ContainerView *> deploymentContainers;
+    for (ContainerView *container : deployment->containers)
+    {
+      deploymentContainers.insert(container);
+    }
+    for (const auto& [container, state] : deployment->waitingOnContainers)
+    {
+      (void)state;
+      deploymentContainers.insert(container);
+    }
+    for (const auto& [shardGroup, shardContainers] : deployment->containersByShardGroup)
+    {
+      (void)shardGroup;
+      for (ContainerView *container : shardContainers)
+      {
+        deploymentContainers.insert(container);
+      }
+    }
+    for (const auto& [shardGroup, master] : deployment->masterForShardGroup)
+    {
+      (void)shardGroup;
+      deploymentContainers.insert(master);
+    }
+
+    Vector<DeploymentWork *> pendingWork;
+    for (ContainerView *container : deploymentContainers)
+    {
+      if (containerReferencesMachine(container, machine))
+      {
+        return true;
+      }
+      if (container != nullptr && container->plannedWork != nullptr)
+      {
+        pendingWork.push_back(container->plannedWork);
+      }
+    }
+    for (DeploymentWork *work : deployment->toSchedule)
+    {
+      pendingWork.push_back(work);
+    }
+    pendingWork.push_back(deployment->currentlyExecutingWork);
+
+    bytell_hash_set<DeploymentWork *> visited;
+    while (pendingWork.empty() == false)
+    {
+      DeploymentWork *work = pendingWork.back();
+      pendingWork.pop_back();
+      if (work == nullptr || visited.insert(work).second == false)
+      {
+        continue;
+      }
+
+      WorkBase *base = work->getBase();
+      if (base->machine == machine || containerReferencesMachine(base->container, machine) || containerReferencesMachine(base->oldContainer, machine))
+      {
+        return true;
+      }
+      pendingWork.push_back(base->prev);
+      pendingWork.push_back(base->next);
+    }
+    return false;
+  }
+
+  bool machineRetirementCanComplete(Machine *machine, const Vector<ApplicationDeployment *>& graph) const
+  {
+    if (machine == nullptr || machine->claims.empty() == false || machine->containersByDeploymentID.size() > 0 || machine->neuron.hasSuspendedCoroutines())
+    {
+      return false;
+    }
+    if (machines.contains(machine) || neurons.contains(&machine->neuron) || machine->brain != nullptr || machine->neuron.machine != nullptr)
+    {
+      return false;
+    }
+    for (const auto& [uuid, indexedMachine] : machinesByUUID)
+    {
+      (void)uuid;
+      if (indexedMachine == machine)
+      {
+        return false;
+      }
+    }
+    for (Machine *ordered : operatingSystemUpdateOrder)
+    {
+      if (ordered == machine)
+      {
+        return false;
+      }
+    }
+    for (MachineSSH *ssh : sshs)
+    {
+      if (ssh != nullptr && ssh->machine == machine)
+      {
+        return false;
+      }
+    }
+    for (BrainView *brain : brains)
+    {
+      if (brain != nullptr && brain->machine == machine)
+      {
+        return false;
+      }
+    }
+    for (const auto& [containerUUID, container] : containers)
+    {
+      (void)containerUUID;
+      if (containerReferencesMachine(container, machine))
+      {
+        return false;
+      }
+    }
+    for (ApplicationDeployment *deployment : graph)
+    {
+      if (deploymentReferencesMachine(deployment, machine))
+      {
+        return false;
+      }
+    }
+    return machine->rack == nullptr || machine->rack->machines.contains(machine) == false;
+  }
+
+  bool deploymentUsesRackForShardGroup(ApplicationDeployment *deployment, Rack *rack, uint32_t shardGroup) const
+  {
+    if (deployment == nullptr || rack == nullptr)
+    {
+      return false;
+    }
+    for (ContainerView *container : deployment->containersByShardGroup[shardGroup])
+    {
+      if (container != nullptr && container->machine != nullptr && container->machine->rack == rack)
+      {
+        return true;
+      }
+    }
+
+    auto machineClaimsPlacement = [&](Machine *machine) -> bool {
+      if (machine == nullptr || machine->rack != rack)
+      {
+        return false;
+      }
+      for (const Machine::Claim& claim : machine->claims)
+      {
+        if (claim.ticket == nullptr || claim.ticket->deployment != deployment)
+        {
+          continue;
+        }
+        for (uint32_t claimedShardGroup : claim.shardGroups)
+        {
+          if (claimedShardGroup == shardGroup)
+          {
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+
+    for (Machine *machine : machines)
+    {
+      if (machineClaimsPlacement(machine))
+      {
+        return true;
+      }
+    }
+    for (const auto& [neuron, retirement] : retiringMachinesByNeuron)
+    {
+      (void)neuron;
+      if (machineClaimsPlacement(retirement.machine))
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static void restoreClaimedMachineResources(Machine *machine, const Machine::Claim& claim)
+  {
+    const uint32_t isolated = claim.reservedIsolatedLogicalCoresTotal ? claim.reservedIsolatedLogicalCoresTotal : (claim.reservedIsolatedLogicalCoresPerInstance * claim.nFit);
+    const uint32_t shared = claim.reservedSharedCPUMillisTotal ? claim.reservedSharedCPUMillisTotal : (claim.reservedSharedCPUMillisPerInstance * claim.nFit);
+    const uint32_t memory = claim.reservedMemoryMBTotal ? claim.reservedMemoryMBTotal : (claim.reservedMemoryMBPerInstance * claim.nFit);
+    const uint32_t storage = claim.reservedStorageMBTotal ? claim.reservedStorageMBTotal : (claim.reservedStorageMBPerInstance * claim.nFit);
+
+    machine->isolatedLogicalCoresCommitted = isolated >= machine->isolatedLogicalCoresCommitted ? 0 : (machine->isolatedLogicalCoresCommitted - isolated);
+    machine->sharedCPUMillisCommitted = shared >= machine->sharedCPUMillisCommitted ? 0 : (machine->sharedCPUMillisCommitted - shared);
+    machine->memoryMB_available = int32_t(std::min<int64_t>(INT32_MAX, int64_t(machine->memoryMB_available) + int64_t(memory)));
+    machine->storageMB_available = int32_t(std::min<int64_t>(INT32_MAX, int64_t(machine->storageMB_available) + int64_t(storage)));
+    prodigyRecomputeMachineCPUAvailability(machine, prodigyActiveSharedCPUOvercommitPermille());
+    prodigyReleaseWholeGPUSlots(machine, claim.reservedGPUMemoryMBs, &claim.reservedGPUDevices);
+  }
+
+  void resolveRetiringMachineClaims(Machine *machine)
+  {
+    bytell_hash_map<MachineTicket *, uint32_t> lostClaims;
+    Vector<std::pair<ApplicationDeployment *, uint32_t>> restoredPlacements;
+
+    for (const Machine::Claim& claim : machine->claims)
+    {
+      MachineTicket *ticket = claim.ticket;
+      ApplicationDeployment *deployment = ticket == nullptr ? nullptr : ticket->deployment;
+      restoreClaimedMachineResources(machine, claim);
+      if (deployment != nullptr)
+      {
+        auto decrement = [](auto& counts, auto key, uint32_t count) -> void {
+          auto it = counts.find(key);
+          if (it == counts.end())
+          {
+            return;
+          }
+          if (it->second <= count)
+          {
+            counts.erase(it);
+          }
+          else
+          {
+            it->second -= count;
+          }
+        };
+        decrement(deployment->countPerMachine, machine, claim.nFit);
+        decrement(deployment->countPerRack, machine->rack, claim.nFit);
+
+        for (uint32_t index = 0; index < claim.shardGroups.size(); ++index)
+        {
+          ticket->shardGroups.push_back(claim.shardGroups[index]);
+          ticket->placementTopologyEpochs.push_back(index < claim.placementTopologyEpochs.size() ? claim.placementTopologyEpochs[index] : 0);
+          restoredPlacements.emplace_back(deployment, claim.shardGroups[index]);
+        }
+      }
+      if (ticket != nullptr && claim.nFit > 0)
+      {
+        lostClaims[ticket] += claim.nFit;
+      }
+    }
+    machine->claims.clear();
+
+    for (const auto& [deployment, shardGroup] : restoredPlacements)
+    {
+      if (deploymentUsesRackForShardGroup(deployment, machine->rack, shardGroup) == false)
+      {
+        deployment->racksByShardGroup[shardGroup].erase(machine->rack);
+      }
+    }
+    for (const auto& [ticket, count] : lostClaims)
+    {
+      if (ticket->deployment != nullptr && ticket->coro != nullptr)
+      {
+        requestMachines(ticket, ticket->deployment, ticket->lifetime, count);
+      }
+      else
+      {
+        basics_log("decommissionMachine failure uuid=%llu reason=lost-claim-owner count=%u\n",
+                   (unsigned long long)machine->uuid,
+                   unsigned(count));
+      }
+    }
+  }
+
+  void armMachineRetirementRecheck(void)
+  {
+    if (machineRetirementRecheckArmed ||
+        (retiringMachinesByNeuron.empty() && retiringMachineSSHs.empty() &&
+         retiredMachineIdentities.empty()))
+    {
+      return;
+    }
+    if (RingDispatcher::dispatcher == nullptr || Ring::getRingFD() <= 0)
+    {
+      return;
+    }
+    machineRetirementRecheckArmed = true;
+    machineRetirementRecheck.dispatcher = this;
+    machineRetirementRecheck.flags = uint64_t(BrainTimeoutFlags::machineRetirementRecheck);
+    machineRetirementRecheck.setTimeoutMs(1000);
+    Ring::queueTimeout(&machineRetirementRecheck);
+  }
+
+  bool queueMachineRetirementClose(NeuronView *neuron, MachineRetirement& retirement)
+  {
+    if (retirement.closeQueued || retirement.ringCloseObserved)
+    {
+      return true;
+    }
+    if (Ring::socketIsClosing(neuron))
+    {
+      retirement.closeQueued = true;
+      return true;
+    }
+
+    int fenceFD = -1;
+    if (rawStreamIsActive(neuron) == false)
+    {
+      fenceFD = createMachineRetirementFenceFD();
+      if (fenceFD < 0)
+      {
+        const int failure = errno;
+        basics_log("decommissionMachine failure uuid=%llu private4=%u reason=retirement-fence errno=%d error=%s\n",
+                   (unsigned long long)retirement.machine->uuid,
+                   unsigned(retirement.machine->private4),
+                   failure,
+                   strerror(failure));
+        return false;
+      }
+      neuron->isFixedFile = false;
+      neuron->fd = fenceFD;
+    }
+
+    Ring::queueClose(neuron);
+    retirement.closeQueued = true;
+    return true;
+  }
+
+  bool queueMachineRetirementSSHClose(MachineSSH *ssh)
+  {
+    if (ssh == nullptr || Ring::socketIsClosing(ssh))
+    {
+      return true;
+    }
+    if (rawStreamIsActive(ssh) == false)
+    {
+      int fenceFD = createMachineRetirementFenceFD();
+      if (fenceFD < 0)
+      {
+        const int failure = errno;
+        basics_log("machine SSH retirement fence failed errno=%d error=%s\n",
+                   failure,
+                   strerror(failure));
+        return false;
+      }
+      ssh->isFixedFile = false;
+      ssh->fd = fenceFD;
+    }
+    Ring::queueClose(ssh);
+    return true;
+  }
+
+  void quarantineMachineSSHs(uint64_t identityID, const ClusterMachine& identity)
+  {
+    for (MachineSSH *ssh : sshs)
+    {
+      if (ssh == nullptr || ssh->machine == nullptr ||
+          retiredMachineIdentitiesMatch(identity, *ssh->machine) == false)
+      {
+        continue;
+      }
+      retiringMachineSSHs.insert_or_assign(ssh, identityID);
+      ssh->reconnectAfterClose = false;
+      ssh->cancelPendingConnect();
+      ssh->cancelSuspended();
+      ssh->machine = nullptr;
+      (void)queueMachineRetirementSSHClose(ssh);
+    }
+  }
+
+  void reconcileRetiredMachineLocalAliases(void)
+  {
+    bytell_hash_set<Machine *> candidates;
+    collectMachineRetirementCandidates(candidates);
+    Vector<ApplicationDeployment *> graph;
+    collectDeploymentGraph(graph);
+    for (auto& [identityID, identity] : retiredMachineIdentities)
+    {
+      quarantineMachineSSHs(identityID, identity.machine);
+      for (Machine *candidate : candidates)
+      {
+        if (candidate == nullptr ||
+            retiredMachineIdentitiesMatch(identity.machine, *candidate) == false ||
+            retiringMachinesByNeuron.contains(&candidate->neuron))
+        {
+          continue;
+        }
+        captureMachineRetirement(candidate, identityID, graph);
+        quarantineMachineAlias(candidate);
+        identity.evacuationObserved = true;
+      }
+    }
+  }
+
+  bool machineRetirementEvacuationReady(
+      uint64_t identityID,
+      const Vector<ApplicationDeployment *>& graph)
+  {
+    auto identity = retiredMachineIdentities.find(identityID);
+    if (identity == retiredMachineIdentities.end() ||
+        identity->second.evacuationObserved == false ||
+        identity->second.topologyAbsent == false ||
+        identity->second.topologyObservationEpoch != masterAuthorityEpoch ||
+        brainInventoryCoroutine.hasSuspendedCoroutines())
+    {
+      return false;
+    }
+    for (const auto& [ssh, sshIdentityID] : retiringMachineSSHs)
+    {
+      (void)ssh;
+      if (sshIdentityID == identityID)
+      {
+        return false;
+      }
+    }
+
+    bool sawMachine = false;
+    for (auto& [neuron, retirement] : retiringMachinesByNeuron)
+    {
+      if (retirement.identityID != identityID)
+      {
+        continue;
+      }
+      sawMachine = true;
+      releaseObservedDeploymentQuiescence(retirement, graph);
+      if (retirement.deploymentQuiescenceIDs.empty() == false ||
+          retirement.ringCloseObserved == false ||
+          machineRetirementCanComplete(retirement.machine, graph) == false)
+      {
+        return false;
+      }
+    }
+    return sawMachine;
+  }
+
+  void authorizeCompletedMachineRetirements(
+      const Vector<ApplicationDeployment *>& graph)
+  {
+    if (isActiveMaster() == false || machineRetirementJournalHasDurableQuorum() == false)
+    {
+      return;
+    }
+    Vector<uint64_t> authorized;
+    for (auto& [identityID, retirement] : retiredMachineIdentities)
+    {
+      if (retirement.authoritySettled == false &&
+          retirement.evacuationComplete == false &&
+          machineRetirementEvacuationReady(identityID, graph))
+      {
+        retirement.evacuationComplete = true;
+        authorized.push_back(identityID);
+      }
+    }
+    if (authorized.empty() == false && commitMachineRetirementJournal() == false)
+    {
+      for (uint64_t identityID : authorized)
+      {
+        if (auto retirement = retiredMachineIdentities.find(identityID);
+            retirement != retiredMachineIdentities.end())
+        {
+          retirement->second.evacuationComplete = false;
+        }
+      }
+    }
+  }
+
+  bool rackCanBeDeletedAfterRetirement(Rack *rack, const Vector<ApplicationDeployment *>& graph) const
+  {
+    if (rack == nullptr || rack->machines.empty() == false)
+    {
+      return false;
+    }
+    bytell_hash_set<Machine *> candidates;
+    collectMachineRetirementCandidates(candidates);
+    for (Machine *machine : candidates)
+    {
+      if (machine != nullptr && machine->rack == rack)
+      {
+        return false;
+      }
+    }
+    for (ApplicationDeployment *deployment : graph)
+    {
+      if (deploymentIsActive(deployment) &&
+          (deployment->countPerRack.contains(rack) ||
+           std::any_of(deployment->racksByShardGroup.begin(),
+                       deployment->racksByShardGroup.end(),
+                       [rack](const auto& placement) {
+                         return placement.second.contains(rack);
+                       })))
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void eraseRetiredRackPlacement(Rack *rack, const Vector<ApplicationDeployment *>& graph)
+  {
+    for (ApplicationDeployment *deployment : graph)
+    {
+      deployment->countPerRack.erase(rack);
+      for (auto& [shardGroup, placedRacks] : deployment->racksByShardGroup)
+      {
+        (void)shardGroup;
+        placedRacks.erase(rack);
+      }
+    }
+  }
+
+  void eraseRetiredMachinePlacement(Machine *machine, const Vector<ApplicationDeployment *>& graph)
+  {
+    for (ApplicationDeployment *deployment : graph)
+    {
+      auto placement = deployment->countPerMachine.find(machine);
+      if (placement != deployment->countPerMachine.end() && placement->second == 0)
+      {
+        deployment->countPerMachine.erase(placement);
+      }
+    }
+  }
+
+  void reapRetiringMachines(void)
+  {
+    reconcileRetiredMachineAuthoritativeTopology();
+    const bool authoritative = isActiveMaster() &&
+                               machineRetirementJournalHasDurableQuorum();
+    if (isActiveMaster() == false || authoritative)
+    {
+      reconcileRetiredMachineLocalAliases();
+    }
+    if (authoritative)
+    {
+      for (auto& [neuron, retirement] : retiringMachinesByNeuron)
+      {
+        (void)neuron;
+        auto identity = retiredMachineIdentities.find(retirement.identityID);
+        if (identity == retiredMachineIdentities.end() || identity->second.authoritySettled)
+        {
+          continue;
+        }
+        resolveRetiringMachineClaims(retirement.machine);
+        evacuateFailedMachineContainers(retirement.machine);
+      }
+    }
+    for (auto& [neuron, retirement] : retiringMachinesByNeuron)
+    {
+      (void)queueMachineRetirementClose(neuron, retirement);
+    }
+    for (const auto& [ssh, identityID] : retiringMachineSSHs)
+    {
+      (void)identityID;
+      (void)queueMachineRetirementSSHClose(ssh);
+    }
+    Vector<ApplicationDeployment *> graph;
+    collectDeploymentGraph(graph);
+    for (auto& [neuron, retirement] : retiringMachinesByNeuron)
+    {
+      (void)neuron;
+      releaseObservedDeploymentQuiescence(retirement, graph);
+    }
+    authorizeCompletedMachineRetirements(graph);
+
+    Vector<NeuronView *> candidates;
+    for (auto& [neuron, retirement] : retiringMachinesByNeuron)
+    {
+      auto identity = retiredMachineIdentities.find(retirement.identityID);
+      if (identity != retiredMachineIdentities.end() &&
+          (authoritative || identity->second.authoritySettled) &&
+          identity->second.evacuationComplete &&
+          brainInventoryCoroutine.hasSuspendedCoroutines() == false &&
+          retirement.deploymentQuiescenceIDs.empty() && retirement.ringCloseObserved &&
+          std::none_of(retiringMachineSSHs.begin(), retiringMachineSSHs.end(), [&](const auto& ssh) -> bool {
+            return ssh.second == retirement.identityID;
+          }) &&
+          machineRetirementCanComplete(retirement.machine, graph))
+      {
+        candidates.push_back(neuron);
+      }
+    }
+
+    for (NeuronView *neuron : candidates)
+    {
+      auto it = retiringMachinesByNeuron.find(neuron);
+      if (it == retiringMachinesByNeuron.end())
+      {
+        continue;
+      }
+
+      Machine *machine = it->second.machine;
+      Rack *rack = machine->rack;
+      eraseRetiredMachinePlacement(machine, graph);
+      retiringMachinesByNeuron.erase(it);
+      RingDispatcher::eraseMultiplexee(neuron);
+      machine->rack = nullptr;
+      delete machine;
+
+      if (rack != nullptr && rackCanBeDeletedAfterRetirement(rack, graph))
+      {
+        auto rackIt = racks.find(rack->uuid);
+        if (rackIt != racks.end() && rackIt->second == rack)
+        {
+          eraseRetiredRackPlacement(rack, graph);
+          racks.erase(rackIt);
+          delete rack;
+        }
+      }
+    }
+
+    for (auto& [identityID, retirement] : retiredMachineIdentities)
+    {
+      (void)identityID;
+      if (retirement.authoritySettled == false)
+      {
+        (void)driveRetiredMachineDestroy(retirement);
+      }
+    }
+
+    settleRetiredMachineIdentities();
+    for (auto retirement = retiredMachineIdentities.begin(); retirement != retiredMachineIdentities.end();)
+    {
+      if (retirement->second.authoritySettled &&
+          machineRetirementIdentityHasObjects(retirement->first) == false)
+      {
+        retirement = retiredMachineIdentities.erase(retirement);
+      }
+      else
+      {
+        ++retirement;
+      }
+    }
+    if (retiringMachinesByNeuron.empty() == false || retiringMachineSSHs.empty() == false ||
+        retiredMachineIdentities.empty() == false)
+    {
+      armMachineRetirementRecheck();
+    }
+  }
+
+  void completeMachineDecommission(NeuronView *neuron)
+  {
+    auto it = retiringMachinesByNeuron.find(neuron);
+    if (it == retiringMachinesByNeuron.end())
+    {
+      return;
+    }
+    it->second.closeQueued = true;
+    it->second.ringCloseObserved = true;
+    reapRetiringMachines();
+  }
+
+  void collectMachineRetirementCandidates(bytell_hash_set<Machine *>& candidates) const
+  {
+    auto append = [&](Machine *candidate) -> void {
+      if (candidate != nullptr)
+      {
+        candidates.insert(candidate);
+      }
+    };
+    for (Machine *candidate : machines)
+    {
+      append(candidate);
+    }
+    for (const auto& [uuid, candidate] : machinesByUUID)
+    {
+      (void)uuid;
+      append(candidate);
+    }
+    for (NeuronView *neuron : neurons)
+    {
+      append(neuron == nullptr ? nullptr : neuron->machine);
+    }
+    for (Machine *candidate : operatingSystemUpdateOrder)
+    {
+      append(candidate);
+    }
+    for (const auto& [rackUUID, rack] : racks)
+    {
+      (void)rackUUID;
+      if (rack != nullptr)
+      {
+        for (Machine *candidate : rack->machines)
+        {
+          append(candidate);
+        }
+      }
+    }
+    for (MachineSSH *ssh : sshs)
+    {
+      append(ssh == nullptr ? nullptr : ssh->machine);
+    }
+    for (BrainView *brain : brains)
+    {
+      append(brain == nullptr ? nullptr : brain->machine);
+    }
+    for (const auto& [neuron, retirement] : retiringMachinesByNeuron)
+    {
+      (void)neuron;
+      append(retirement.machine);
+    }
+    for (const auto& [containerUUID, container] : containers)
+    {
+      (void)containerUUID;
+      append(container == nullptr ? nullptr : container->machine);
+    }
+
+    Vector<ApplicationDeployment *> graph;
+    collectDeploymentGraph(graph);
+    for (ApplicationDeployment *deployment : graph)
+    {
+      for (const auto& [candidate, count] : deployment->countPerMachine)
+      {
+        (void)count;
+        append(candidate);
+      }
+      bytell_hash_set<DeploymentWork *> work;
+      auto appendContainer = [&](ContainerView *container) -> void {
+        if (container != nullptr)
+        {
+          append(container->machine);
+          if (container->plannedWork != nullptr)
+          {
+            work.insert(container->plannedWork);
+          }
+        }
+      };
+      for (ContainerView *container : deployment->containers)
+      {
+        appendContainer(container);
+      }
+      for (const auto& [container, state] : deployment->waitingOnContainers)
+      {
+        (void)state;
+        appendContainer(container);
+      }
+      for (const auto& [shardGroup, shardContainers] : deployment->containersByShardGroup)
+      {
+        (void)shardGroup;
+        for (ContainerView *container : shardContainers)
+        {
+          appendContainer(container);
+        }
+      }
+      for (DeploymentWork *pending : deployment->toSchedule)
+      {
+        work.insert(pending);
+      }
+      work.insert(deployment->currentlyExecutingWork);
+      while (work.empty() == false)
+      {
+        DeploymentWork *pending = *work.begin();
+        work.erase(pending);
+        if (pending == nullptr)
+        {
+          continue;
+        }
+        WorkBase *base = pending->getBase();
+        append(base->machine);
+        appendContainer(base->container);
+        appendContainer(base->oldContainer);
+        work.insert(base->prev);
+        work.insert(base->next);
+      }
+    }
+  }
+
+  bool collectMachineRetirementAliases(Machine *machine, Vector<Machine *>& aliases) const
+  {
+    bytell_hash_set<Machine *> candidates;
+    collectMachineRetirementCandidates(candidates);
+    candidates.insert(machine);
+
+    RetiredMachineIdentity identity = {};
+    if (mergeRetiredMachineIdentity(identity, *machine) == false)
+    {
+      return false;
+    }
+    bytell_hash_set<Machine *> selected;
+    selected.insert(machine);
+    aliases.push_back(machine);
+    bool added = true;
+    while (added)
+    {
+      added = false;
+      for (Machine *candidate : candidates)
+      {
+        if (selected.contains(candidate))
+        {
+          continue;
+        }
+        ClusterMachine candidateIdentity = retiredMachineIdentity(*candidate);
+        if (retiredMachineIdentitiesConflict(identity.machine, candidateIdentity))
+        {
+          return false;
+        }
+        if (retiredMachineIdentitiesMatch(identity.machine, candidateIdentity) &&
+            mergeRetiredMachineIdentity(identity, *candidate))
+        {
+          selected.insert(candidate);
+          aliases.push_back(candidate);
+          added = true;
+        }
+      }
+    }
+    return true;
+  }
+
+  void captureMachineRetirement(
+      Machine *machine,
+      uint64_t identityID,
+      const Vector<ApplicationDeployment *>& graph)
+  {
+    NeuronView *neuron = &machine->neuron;
+    auto existing = retiringMachinesByNeuron.find(neuron);
+    if (existing == retiringMachinesByNeuron.end())
+    {
+      MachineRetirement retirement = {};
+      retirement.machine = machine;
+      retirement.identityID = identityID;
+      retirement.closeQueued = Ring::socketIsClosing(neuron);
+      existing = retiringMachinesByNeuron.emplace(neuron, std::move(retirement)).first;
+    }
+    MachineRetirement& retirement = existing->second;
+    retirement.identityID = identityID;
+    for (ApplicationDeployment *deployment : graph)
+    {
+      if (deploymentIsActive(deployment))
+      {
+        retirement.deploymentQuiescenceIDs.insert(deployment->plan.config.deploymentID());
+      }
+    }
+    for (const Machine::Claim& claim : machine->claims)
+    {
+      if (claim.ticket != nullptr && claim.ticket->deployment != nullptr)
+      {
+        retirement.deploymentQuiescenceIDs.insert(
+            claim.ticket->deployment->plan.config.deploymentID());
+      }
+    }
+    for (const auto& [deploymentID, indexedContainers] : machine->containersByDeploymentID)
+    {
+      (void)indexedContainers;
+      retirement.deploymentQuiescenceIDs.insert(deploymentID);
+    }
+    RetiredMachineIdentity& identity = retiredMachineIdentities[identityID];
+    (void)mergeRetiredMachineIdentity(identity, *machine);
+    identity.destroyRequired = identity.destroyRequired || machine->cloudID.empty() == false;
+    identity.evacuationObserved = true;
+  }
+
+  void quarantineMachineAlias(Machine *machine)
+  {
+    NeuronView *neuron = &machine->neuron;
     cancelMachineSoftWatchdog(machine);
     cancelMachineHardRebootWatchdog(machine);
     cancelOSUpdateCommandWatchdog(machine);
-
-    evacuateFailedMachineContainers(machine);
-
-    // if we need another machine, the deployments will request it
-
-    if (machine->state == MachineState::hardwareFailure)
-    {
-      // destroy it
-      (void)queueMachineDestroy(*machine);
-    }
-
     if (machine->fragment > 0)
     {
       relinquishMachineFragment(machine);
     }
+    cancelNeuronReconnectWaiter(neuron, "decommission-machine");
+    cancelNeuronControlHandshakeWatchdog(neuron, "decommission-machine");
+    disarmNeuronControlReconnect(neuron);
+    neuron->reconnectAfterClose = false;
+    neuron->connected = false;
+    neuron->cancelSuspended();
 
     machines.erase(machine);
-    machinesByUUID.erase(machine->uuid);
-    neurons.erase(&machine->neuron);
-    cancelNeuronReconnectWaiter(&machine->neuron, "decommission-machine");
-
-    for (MachineSSH *ssh : sshs)
+    for (auto indexed = machinesByUUID.begin(); indexed != machinesByUUID.end();)
     {
-      if (ssh && ssh->machine == machine)
-      {
-        ssh->machine = nullptr;
-      }
+      indexed = indexed->second == machine ? machinesByUUID.erase(indexed) : std::next(indexed);
     }
-
-    if (machine->brain)
+    neurons.erase(neuron);
+    operatingSystemUpdateOrder.erase(
+        std::remove(operatingSystemUpdateOrder.begin(), operatingSystemUpdateOrder.end(), machine),
+        operatingSystemUpdateOrder.end());
+    for (BrainView *brain : brains)
     {
-      machine->brain->machine = nullptr;
+      if (brain != nullptr && brain->machine == machine)
+      {
+        brain->machine = nullptr;
+      }
     }
     machine->brain = nullptr;
-    machine->neuron.machine = nullptr;
+    neuron->machine = nullptr;
+    if (machine->rack != nullptr)
+    {
+      machine->rack->machines.erase(machine);
+    }
 
-    RingDispatcher::eraseMultiplexee(&machine->neuron);
+    RingDispatcher::installMultiplexee(neuron, this);
     // Remove the Machine* mapping used for timeout originator routing
     RingDispatcher::eraseMultiplexee(machine);
+  }
 
-    /// we have to close the socket.
-    /// This object is deleted immediately, so close by raw slot/fd instead of
-    /// pointer-based queueClose() callback dispatch.
-    if (machine->neuron.isFixedFile)
+  void decommissionMachine(Machine *machine)
+  {
+    if (machine == nullptr)
     {
-      if (machine->neuron.fslot >= 0)
-      {
-        Ring::queueCloseRaw(machine->neuron.fslot);
-        machine->neuron.fslot = -1;
-      }
-    }
-    else if (machine->neuron.fd >= 0)
-    {
-      machine->neuron.close();
-      machine->neuron.fd = -1;
-    }
-    machine->neuron.isFixedFile = false;
-
-    Rack *rack = machine->rack;
-    rack->machines.erase(machine);
-
-    if (rack->machines.size() == 0) // destroy rack too
-    {
-      racks.erase(rack->uuid);
-      delete rack;
+      return;
     }
 
-    delete machine;
+    if (machineIdentityIsRetiring(*machine))
+    {
+      reapRetiringMachines();
+      return;
+    }
+
+    Vector<Machine *> aliases;
+    if (collectMachineRetirementAliases(machine, aliases) == false)
+    {
+      basics_log("decommissionMachine rejected uuid=%llu cloudID=%s reason=conflicting-identity\n",
+                 (unsigned long long)machine->uuid,
+                 machine->cloudID.c_str());
+      return;
+    }
+    bool destroyRequired = false;
+    for (Machine *alias : aliases)
+    {
+      destroyRequired = destroyRequired || alias->cloudID.empty() == false;
+    }
+    uint64_t identityID = 0;
+    if (journalMachineRetirement(aliases, destroyRequired, identityID) == false)
+    {
+      basics_log("decommissionMachine rejected uuid=%llu cloudID=%s reason=retirement-journal\n",
+                 (unsigned long long)machine->uuid,
+                 machine->cloudID.c_str());
+      return;
+    }
+    PRODIGY_DEBUG_LOG(
+                 "decommissionMachine uuid=%llu private4=%u state=%u isBrain=%d cloudID=%s aliases=%llu\n",
+                 (unsigned long long)machine->uuid,
+                 unsigned(machine->private4),
+                 unsigned(machine->state),
+                 int(machine->isBrain),
+                 machine->cloudID.c_str(),
+                 (unsigned long long)aliases.size());
+    PRODIGY_DEBUG_FLUSH();
+    reapRetiringMachines();
+    armMachineRetirementRecheck();
   }
 
   void checkForSpotTerminations(void)
@@ -16034,55 +18479,16 @@ public:
       return;
     }
 
-    basics_log("evacuateFailedMachineContainers missingPrivate4=%u trackedContainers=%llu\n",
-               machine->private4,
-               (unsigned long long)containers.size());
-
-    // Containers may still reference an equivalent Machine object through an older
-    // snapshot. Drain every machine object that still resolves to the same machine
-    // identity so failover does not strand deployment bins on duplicate objects.
-    bytell_hash_set<Machine *> drainTargets;
-    drainTargets.insert(machine);
-
-    for (const auto& [containerUUID, container] : containers)
+    // Every same-identity alias is quarantined separately before this exact drain.
+    for (const auto& [deploymentID, containersOnMachine] : machine->containersByDeploymentID)
     {
-      (void)containerUUID;
-      if (container && container->machine && prodigyMachinesShareIdentity(*container->machine, *machine))
+      (void)containersOnMachine;
+      if (auto it = deployments.find(deploymentID); it != deployments.end() && it->second)
       {
-        drainTargets.insert(container->machine);
+        it->second->drainMachine(machine, true);
       }
     }
-
-    basics_log("evacuateFailedMachineContainers missingPrivate4=%u drainTargets=%llu\n",
-               machine->private4,
-               (unsigned long long)drainTargets.size());
-
-    for (Machine *target : drainTargets)
-    {
-      if (target == nullptr || target->containersByDeploymentID.size() == 0)
-      {
-        if (target)
-        {
-          basics_log("evacuateFailedMachineContainers targetPrivate4=%u deploymentBins=0\n", target->private4);
-        }
-        continue;
-      }
-
-      basics_log("evacuateFailedMachineContainers targetPrivate4=%u deploymentBins=%llu\n",
-                 target->private4,
-                 (unsigned long long)target->containersByDeploymentID.size());
-
-      for (const auto& [deploymentID, containersOnMachine] : target->containersByDeploymentID)
-      {
-        (void)containersOnMachine;
-        if (auto it = deployments.find(deploymentID); it != deployments.end() && it->second)
-        {
-          it->second->drainMachine(target, true);
-        }
-      }
-
-      target->containersByDeploymentID.clear();
-    }
+    machine->containersByDeploymentID.clear();
   }
 
   void retryScheduledContainerWaitersAfterNeuronClose(Machine *machine)
@@ -16872,6 +19278,12 @@ public:
           }
           break;
         }
+      case BrainTimeoutFlags::machineRetirementRecheck:
+        {
+          machineRetirementRecheckArmed = false;
+          reapRetiringMachines();
+          break;
+        }
       case BrainTimeoutFlags::ignition:
         {
           ignited = true;
@@ -17328,7 +19740,12 @@ public:
         }
       case BrainTimeoutFlags::transitionStuck:
         {
-          Machine *machine = (Machine *)packet->originator;
+          Machine *machine = nullptr;
+          Machine *candidate = (Machine *)packet->originator;
+          if (machines.contains(candidate))
+          {
+            machine = candidate;
+          }
           RingDispatcher::eraseMultiplexee(packet);
           delete packet;
 
@@ -17346,7 +19763,12 @@ public:
         }
       case BrainTimeoutFlags::performHardReboot:
         {
-          Machine *machine = (Machine *)packet->originator;
+          Machine *machine = nullptr;
+          Machine *candidate = (Machine *)packet->originator;
+          if (machines.contains(candidate))
+          {
+            machine = candidate;
+          }
           RingDispatcher::eraseMultiplexee(packet);
           delete packet;
 
@@ -19476,7 +21898,7 @@ public:
     return false;
   }
 
-  bool peerSocketActive(BrainView *bv)
+  bool peerSocketActive(BrainView *bv) const
   {
     if (bv == nullptr)
     {
@@ -21116,7 +23538,7 @@ public:
               if (BrainView *peer = findBrainViewByUpdateSelfPeerKey(designatedMasterPeerKey); peer != nullptr)
               {
                 designatedMasterKnown = true;
-                if (peer->quarantined == false)
+                if (peerEligibleForClusterQuorum(peer))
                 {
                   electBrainToMaster(peer);
                   electedDesignatedMaster = true;
@@ -21327,7 +23749,9 @@ public:
             const bool applied = applyReplicatedMasterAuthorityTransition(incoming, true);
             if (applied &&
                 (incoming.runtimeState.pendingElasticAddressAssignments.empty() == false ||
-                 incoming.runtimeState.pendingElasticAddressReleases.empty() == false) &&
+                 incoming.runtimeState.pendingElasticAddressReleases.empty() == false ||
+                 machineRetirementJournalPresent(incoming.runtimeState)) &&
+                applyReplicatedMachineRetirementTopology(incoming.runtimeState) &&
                 replicatedRuntimeStateCoversPendingElasticAddressOperations(incoming.runtimeState) &&
                 prodigyComputeSHA256Hex(serialized, transitionDigest))
             {
@@ -24302,7 +26726,9 @@ public:
           bool found = false;
           String serializedRecord = {};
           const int64_t nowMs = Time::now<TimeResolution::ms>();
-          auto recordIt = masterAuthorityRuntimeState.taskExecutions.find(deploymentID);
+          auto recordIt = deploymentID == machineRetirementJournalExecutionID
+                              ? masterAuthorityRuntimeState.taskExecutions.end()
+                              : masterAuthorityRuntimeState.taskExecutions.find(deploymentID);
           if (recordIt != masterAuthorityRuntimeState.taskExecutions.end())
           {
             if (recordIt->second.expired(nowMs))
@@ -25396,6 +27822,11 @@ public:
             }
 
             const uint64_t executionID = fingerprintPlan.config.deploymentID();
+            if (executionID == machineRetirementJournalExecutionID)
+            {
+              rejectInvalidPlan("invalid plan: deploymentID is reserved"_ctv);
+              return;
+            }
             const int64_t nowMs = Time::now<TimeResolution::ms>();
             auto existingTaskIt = masterAuthorityRuntimeState.taskExecutions.find(executionID);
             if (existingTaskIt != masterAuthorityRuntimeState.taskExecutions.end() && existingTaskIt->second.expired(nowMs))

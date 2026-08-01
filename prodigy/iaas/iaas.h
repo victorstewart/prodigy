@@ -424,6 +424,11 @@ public:
     (void)active;
     return true;
   }
+  virtual bool setProviderReconfigurationFenceActive(bool active)
+  {
+    (void)active;
+    return true;
+  }
   virtual void checkForSpotTerminations(CoroutineStack *coro, Vector<String>& decommissionedIDs) = 0;
   virtual void destroyMachine(CoroutineStack *coro, const String& cloudID, String& failure) = 0;
   virtual void destroyClusterMachines(CoroutineStack *coro, const String& clusterUUID, uint32_t& destroyed, String& error)

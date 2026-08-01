@@ -1300,7 +1300,9 @@ public:
 class MachineTicket {
 public:
 
-  CoroutineStack *coro;
+  CoroutineStack *coro = nullptr;
+  ApplicationDeployment *deployment = nullptr;
+  ApplicationLifetime lifetime = ApplicationLifetime::base;
   uint32_t nMore = 0; // nMore instances
   Vector<uint32_t> shardGroups; // at the beginning this is used the feed shard group into claims... then when consuming this is filled with shard group to schedule on that machine now
   Vector<uint32_t> placementTopologyEpochs;
@@ -2158,6 +2160,8 @@ private:
   {
     MachineTicket *ticket = new MachineTicket();
     ticket->coro = coro;
+    ticket->deployment = this;
+    ticket->lifetime = lifetime;
     ticket->nMore = nMore;
     ticketSpecializer(ticket);
 
@@ -7859,7 +7863,34 @@ public:
 
     if (containersToRedeploy.size() > 0)
     {
-      CoroutineStack *coro = new CoroutineStack();
+      class DrainStack final : public CoroutineStack
+      {
+        uint32_t consumers = 0;
+        bool finished = false;
+
+      public:
+
+        void co_consume(void) override
+        {
+          consumers += 1;
+          CoroutineStack::co_consume();
+          consumers -= 1;
+          if (finished && consumers == 0)
+          {
+            delete this;
+          }
+        }
+
+        void finish(void)
+        {
+          finished = true;
+          if (consumers == 0)
+          {
+            delete this;
+          }
+        }
+      };
+      DrainStack *coro = new DrainStack();
 
       bool setCanaryClockAfter = false;
 
@@ -7890,7 +7921,7 @@ public:
         setCanaryTimeout();
       }
 
-      delete coro;
+      coro->finish();
 
       schedule(nullptr);
     }

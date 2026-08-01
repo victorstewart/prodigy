@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <csignal>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -115,6 +116,28 @@ public:
   bool overrideSelfElectionManagedSchemaReconcile = false;
   bool forcedSelfElectionManagedSchemaReconcile = true;
   String forcedSelfElectionManagedSchemaReconcileFailure = {};
+  bool exitRingAfterMachineRetirement = false;
+  uint32_t machineRetirementCloseCallbacks = 0;
+  uint32_t machineRetirementFenceFailuresRemaining = 0;
+  uint32_t machineRetirementFenceCreateCalls = 0;
+  bool overrideRetirementTopology = false;
+  bool failRetirementTopologyPersist = false;
+  uint32_t retirementTopologyPersistCalls = 0;
+  ClusterTopology retirementTopology = {};
+  bool failRuntimeStatePersist = false;
+
+  void enableMachineRetirementAuthority(void)
+  {
+    weAreMaster = true;
+    nBrains = 1;
+    overrideRetirementTopology = true;
+    retirementTopology.version = 1;
+  }
+
+  void testReapRetiringMachines(void)
+  {
+    reapRetiringMachines();
+  }
 
   bool testActiveBrainRegistrationsReadyForMasterElection(void)
   {
@@ -141,6 +164,11 @@ public:
     abandonSocketGeneration(peer);
   }
 
+  void testAbandonNeuronSocketGeneration(NeuronView *neuron)
+  {
+    abandonSocketGeneration(neuron);
+  }
+
   void testArmOutboundPeerReconnect(BrainView *peer, bool forceConnectorOwnership = false)
   {
     armOutboundPeerReconnect(peer, forceConnectorOwnership);
@@ -164,6 +192,11 @@ public:
   bool testSelfElectAsMaster(const char *reason = "unit-test", bool replaceLiveMothershipListener = false)
   {
     return selfElectAsMaster(reason, replaceLiveMothershipListener);
+  }
+
+  bool testLocalBrainEligibleForMasterElection(void) const
+  {
+    return localBrainEligibleForMasterElection();
   }
 
   void testSpinApplication(ApplicationDeployment *deployment)
@@ -234,6 +267,33 @@ public:
   void testCloseHandler(void *socket)
   {
     closeHandler(socket);
+  }
+
+  int createMachineRetirementFenceFD(void) override
+  {
+    machineRetirementFenceCreateCalls += 1;
+    if (machineRetirementFenceFailuresRemaining > 0)
+    {
+      machineRetirementFenceFailuresRemaining -= 1;
+      errno = EMFILE;
+      return -1;
+    }
+    return Brain::createMachineRetirementFenceFD();
+  }
+
+  void closeHandler(void *socket) override
+  {
+    const bool completingMachineRetirement =
+        retiringMachinesByNeuron.contains(static_cast<NeuronView *>(socket));
+    Brain::closeHandler(socket);
+    if (completingMachineRetirement)
+    {
+      ++machineRetirementCloseCallbacks;
+      if (exitRingAfterMachineRetirement)
+      {
+        Ring::exit = true;
+      }
+    }
   }
 
   void testRecvHandler(void *socket, int result)
@@ -469,7 +529,7 @@ public:
   bool persistLocalRuntimeState(void) override
   {
     persistCalls += 1;
-    return true;
+    return failRuntimeStatePersist == false;
   }
 
   void checkMetroReachabilityForMasterFailover(bool& connectedMajority, bool& reachableSwitchMajority) override
@@ -486,6 +546,31 @@ public:
   }
 
 protected:
+
+  bool loadAuthoritativeClusterTopology(ClusterTopology& topology) const override
+  {
+    if (overrideRetirementTopology)
+    {
+      topology = retirementTopology;
+      return true;
+    }
+    return Brain::loadAuthoritativeClusterTopology(topology);
+  }
+
+  bool persistAuthoritativeClusterTopology(const ClusterTopology& topology) override
+  {
+    if (overrideRetirementTopology)
+    {
+      retirementTopologyPersistCalls += 1;
+      if (failRetirementTopologyPersist)
+      {
+        return false;
+      }
+      retirementTopology = topology;
+      return true;
+    }
+    return Brain::persistAuthoritativeClusterTopology(topology);
+  }
 
   void armMachineNeuronControl(Machine *machine) override
   {
@@ -611,6 +696,35 @@ public:
   }
 };
 
+class TrackingBrainIaaS final : public NoopBrainIaaS {
+public:
+
+  bool providerFenceActive = false;
+  bool rejectProviderFence = false;
+  Vector<bool> providerFenceTransitions;
+  uint32_t destroyCalls = 0;
+  String destroyedCloudID;
+
+  bool setProviderReconfigurationFenceActive(bool active) override
+  {
+    providerFenceTransitions.push_back(active);
+    if (rejectProviderFence)
+    {
+      return false;
+    }
+    providerFenceActive = active;
+    return true;
+  }
+
+  void destroyMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
+  {
+    (void)coro;
+    destroyCalls += 1;
+    destroyedCloudID.assign(cloudID);
+    failure.clear();
+  }
+};
+
 static void suspendAndPopulateMachines(CoroutineStack& coro, bytell_hash_set<Machine *>& machines, Machine *machine, bool *resumed)
 {
   co_await coro.suspend();
@@ -666,6 +780,67 @@ static BrainView *makePeer(uint128_t uuid, int64_t boottimens, uint32_t private4
   return peer;
 }
 
+static ClusterMachine makeRetirementIdentity(
+    uint128_t uuid,
+    const char *cloudID = nullptr,
+    const char *address = nullptr,
+    int64_t creationTimeMs = 1)
+{
+  ClusterMachine identity = {};
+  identity.uuid = uuid;
+  identity.creationTimeMs = creationTimeMs;
+  if (cloudID != nullptr)
+  {
+    identity.hasCloud = true;
+    identity.backing = ClusterMachineBacking::cloud;
+    identity.cloud.cloudID.assign(cloudID);
+  }
+  if (address != nullptr)
+  {
+    identity.ssh.address.assign(address);
+    prodigyAppendUniqueClusterMachineAddress(identity.addresses.privateAddresses, address, 24);
+  }
+  return identity;
+}
+
+static bool installRetirementCarrier(
+    TestBrain& brain,
+    uint64_t retirementID,
+    const ClusterMachine& identity,
+    uint64_t topologyVersion = 0,
+    bool evacuationComplete = false,
+    bool destroyRequired = false,
+    bool destroySucceeded = false)
+{
+  TestBrain::RetiredMachineIdentity retirement = {};
+  retirement.id = retirementID;
+  retirement.topologyVersion = topologyVersion;
+  retirement.machine = identity;
+  retirement.evacuationComplete = evacuationComplete;
+  retirement.destroyRequired = destroyRequired;
+  retirement.destroySucceeded = destroySucceeded;
+  retirement.providerAbsent = identity.cloud.cloudID.empty();
+  brain.retiredMachineIdentities.insert_or_assign(retirementID, std::move(retirement));
+  brain.nextRetiredMachineIdentityID = retirementID + 1;
+  return brain.writeMachineRetirementJournalCarrier();
+}
+
+static void makePeerDurablyActive(
+    TestBrain& brain,
+    BrainView *peer,
+    uint64_t generation,
+    int fslot)
+{
+  peer->connected = true;
+  peer->isFixedFile = true;
+  peer->fslot = fslot;
+  TestBrain::MasterAuthorityReplicationPeerState& tracking =
+      brain.masterAuthorityReplicationByPeer[peer];
+  tracking.uuid = peer->uuid;
+  tracking.bootNs = peer->boottimens;
+  tracking.acknowledgedGeneration = generation;
+}
+
 class ScopedRing final {
 public:
 
@@ -685,6 +860,33 @@ public:
     if (created)
     {
       Ring::shutdownForExec();
+    }
+  }
+};
+
+class RingExitDeadline final : public TimeoutDispatcher {
+public:
+
+  TimeoutPacket packet = {};
+  bool fired = false;
+
+  explicit RingExitDeadline(int64_t timeoutMs)
+  {
+    packet.dispatcher = this;
+    packet.setTimeoutMs(timeoutMs);
+  }
+
+  void arm(void)
+  {
+    Ring::queueTimeout(&packet);
+  }
+
+  void dispatchTimeout(TimeoutPacket *completed) override
+  {
+    if (completed == &packet)
+    {
+      fired = true;
+      Ring::exit = true;
     }
   }
 };
@@ -1142,6 +1344,1178 @@ int main(void)
     }
   };
 
+  enum class MachineRetirementTransport : uint8_t {
+    fixedFile,
+    directFD,
+    alreadyClosing,
+    descriptorlessOlderGeneration
+  };
+
+  auto testMachineRetirement = [&](MachineRetirementTransport transport, const char *transportName, uint32_t rackUUID) -> void {
+    auto expect = [&](bool condition, const char *property) -> void {
+      char name[192] = {};
+      std::snprintf(name, sizeof(name), "machine_decommission_%s_%s", transportName, property);
+      suite.expect(condition, name);
+    };
+
+    NoopBrainIaaS provider = {};
+    TestBrain brain = {};
+    brain.iaas = &provider;
+    brain.enableMachineRetirementAuthority();
+    RingExitDeadline deadline(2000);
+    ScopedRing scopedRing = {};
+    NeuronView *retiredNeuron = nullptr;
+    int peerFD = -1;
+    Rack *rack = new Rack();
+    rack->uuid = rackUUID;
+    Machine *machine = new Machine();
+    machine->uuid = uint128_t(rackUUID);
+    machine->private4 = rackUUID;
+    machine->state = MachineState::decommissioning;
+    machine->rackUUID = rackUUID;
+    machine->rack = rack;
+    machine->neuron.machine = machine;
+    machine->neuron.connected = true;
+    machine->neuron.reconnectAfterClose = true;
+
+    bool installed = false;
+    if (transport == MachineRetirementTransport::directFD)
+    {
+      int sv[2] = {-1, -1};
+      installed = (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) == 0);
+      if (installed)
+      {
+        machine->neuron.fd = sv[0];
+        peerFD = sv[1];
+        RingDispatcher::installMultiplexee(&machine->neuron, &brain);
+      }
+    }
+    else
+    {
+      installed = installNeuronSocket(brain, *machine, peerFD);
+    }
+    expect(installed, "installs_fixture");
+    if (installed == false)
+    {
+      delete machine;
+      delete rack;
+      return;
+    }
+
+    rack->machines.insert(machine);
+    brain.racks.insert_or_assign(rackUUID, rack);
+    brain.machines.insert(machine);
+    brain.machinesByUUID.insert_or_assign(machine->uuid, machine);
+    brain.neurons.insert(&machine->neuron);
+    brain.operatingSystemUpdateOrder.push_back(machine);
+
+    if (transport == MachineRetirementTransport::alreadyClosing)
+    {
+      Ring::queueClose(&machine->neuron);
+    }
+    else if (transport == MachineRetirementTransport::descriptorlessOlderGeneration)
+    {
+      Ring::queuePoll(&machine->neuron, POLLIN);
+      brain.testAbandonNeuronSocketGeneration(&machine->neuron);
+      expect(machine->neuron.isFixedFile == false && machine->neuron.fd < 0,
+             "starts_descriptorless_with_older_operation");
+    }
+
+    const uint64_t generationBeforeDecommission = machine->neuron.ioGeneration;
+    brain.decommissionMachine(machine);
+    retiredNeuron = &machine->neuron;
+
+    expect(brain.retiringMachinesByNeuron.contains(retiredNeuron), "retains_machine_until_close_callback");
+    expect(brain.machines.contains(machine) == false, "removes_live_machine_index");
+    expect(brain.machinesByUUID.contains(machine->uuid) == false, "removes_uuid_index");
+    expect(brain.neurons.contains(retiredNeuron) == false, "removes_live_neuron_index");
+    expect(brain.operatingSystemUpdateOrder.empty(), "removes_os_update_index");
+    expect(rack->machines.empty(), "removes_live_rack_membership");
+    expect(brain.racks.contains(rackUUID), "retains_empty_rack_with_machine");
+    expect(retiredNeuron->machine == nullptr && retiredNeuron->connected == false,
+           "severs_machine_backlink_and_connection");
+    expect(retiredNeuron->reconnectAfterClose == false && retiredNeuron->connectAttemptPending() == false,
+           "disarms_reconnect");
+    expect(Ring::socketIsClosing(retiredNeuron), "queues_identity_close_retirement");
+    expect((transport == MachineRetirementTransport::alreadyClosing)
+               ? retiredNeuron->ioGeneration == generationBeforeDecommission
+               : retiredNeuron->ioGeneration != generationBeforeDecommission,
+           "queues_close_exactly_when_needed");
+
+    const uint64_t retirementGeneration = retiredNeuron->ioGeneration;
+    brain.decommissionMachine(machine);
+    expect(brain.retiringMachinesByNeuron.size() == 1 && retiredNeuron->ioGeneration == retirementGeneration,
+           "logical_removal_is_idempotent");
+
+    deadline.arm();
+    brain.exitRingAfterMachineRetirement = true;
+    Ring::exit = false;
+    Ring::start();
+    Ring::exit = false;
+    brain.exitRingAfterMachineRetirement = false;
+    expect(deadline.fired == false, "retires_before_deadline");
+    expect(brain.machineRetirementCloseCallbacks == 1, "dispatches_one_close_callback");
+    expect(brain.retiringMachinesByNeuron.empty(), "close_callback_deletes_machine_once");
+    expect(brain.racks.empty(), "close_callback_deletes_empty_rack");
+    if (brain.retiringMachinesByNeuron.empty() == false)
+    {
+      Ring::shutdownForExec();
+      scopedRing.created = false;
+      brain.testCloseHandler(retiredNeuron);
+    }
+
+    if (peerFD >= 0)
+    {
+      ::close(peerFD);
+    }
+  };
+
+  testMachineRetirement(MachineRetirementTransport::fixedFile, "fixed_file", 91);
+  testMachineRetirement(MachineRetirementTransport::directFD, "direct_fd", 92);
+  testMachineRetirement(MachineRetirementTransport::alreadyClosing, "already_closing", 93);
+  testMachineRetirement(MachineRetirementTransport::descriptorlessOlderGeneration,
+                        "descriptorless_older_generation", 94);
+
+  {
+    TestBrain brain = {};
+    const ClusterMachine identity = makeRetirementIdentity(
+        uint128_t(0x5101), nullptr, "10.0.0.51", 100);
+    suite.expect(installRetirementCarrier(brain, 1, identity),
+                 "machine_retirement_identity_reuse_installs_carrier");
+
+    Machine reincarnation = {};
+    reincarnation.privateAddress = "10.0.0.51"_ctv;
+    reincarnation.sshAddress = "10.0.0.51"_ctv;
+    reincarnation.creationTimeMs = 200;
+    suite.expect(brain.retiredMachineIdentityID(reincarnation) == 0,
+                 "machine_retirement_identity_reuse_rejects_address_only_reincarnation");
+  }
+
+  {
+    TestBrain source = {};
+    const ClusterMachine identity = makeRetirementIdentity(
+        uint128_t(0x5201), nullptr, "10.0.0.52", 100);
+    suite.expect(installRetirementCarrier(source, 1, identity),
+                 "machine_retirement_follower_restore_installs_carrier");
+    source.masterAuthorityRuntimeState.generation = 5;
+
+    TrackingBrainIaaS provider = {};
+    TestBrain follower = {};
+    follower.iaas = &provider;
+    follower.machineRetirementFenceFailuresRemaining = 4;
+    Machine *alias = new Machine();
+    alias->uuid = identity.uuid;
+    alias->creationTimeMs = identity.creationTimeMs;
+    alias->privateAddress = "10.0.0.52"_ctv;
+    alias->sshAddress = "10.0.0.52"_ctv;
+    alias->neuron.machine = alias;
+    follower.machines.insert(alias);
+    follower.machinesByUUID.insert_or_assign(alias->uuid, alias);
+    follower.neurons.insert(&alias->neuron);
+
+    const bool applied = follower.applyReplicatedMasterAuthorityRuntimeState(
+        source.masterAuthorityRuntimeState, false);
+    suite.expect(applied && follower.weAreMaster == false,
+                 "machine_retirement_follower_restore_applies_before_election");
+    suite.expect(follower.machines.empty() && follower.machinesByUUID.empty() &&
+                     follower.neurons.empty(),
+                 "machine_retirement_follower_restore_quarantines_live_indexes");
+    suite.expect(follower.retiringMachinesByNeuron.contains(&alias->neuron) &&
+                     provider.providerFenceActive,
+                 "machine_retirement_follower_restore_retains_alias_and_provider_fence");
+
+    follower.retiringMachinesByNeuron.clear();
+    follower.retiredMachineIdentities.clear();
+    RingDispatcher::eraseMultiplexee(&alias->neuron);
+    delete alias;
+  }
+
+  {
+    TestBrain source = {};
+    const ClusterMachine identity = makeRetirementIdentity(
+        uint128_t(0x5231), nullptr, "10.0.2.31", 100);
+    suite.expect(installRetirementCarrier(source, 1, identity, 1, true),
+                 "machine_retirement_follower_clear_installs_completed_carrier");
+    source.masterAuthorityRuntimeState.generation = 5;
+
+    TrackingBrainIaaS provider = {};
+    TestBrain follower = {};
+    follower.iaas = &provider;
+    follower.machineRetirementFenceFailuresRemaining = 10;
+    Machine *alias = new Machine();
+    alias->uuid = identity.uuid;
+    alias->creationTimeMs = identity.creationTimeMs;
+    alias->privateAddress = "10.0.2.31"_ctv;
+    alias->sshAddress = "10.0.2.31"_ctv;
+    alias->neuron.machine = alias;
+    follower.machines.insert(alias);
+    follower.machinesByUUID.insert_or_assign(alias->uuid, alias);
+    follower.neurons.insert(&alias->neuron);
+    suite.expect(follower.applyReplicatedMasterAuthorityRuntimeState(
+                     source.masterAuthorityRuntimeState, true),
+                 "machine_retirement_follower_clear_restores_completed_carrier");
+
+    ProdigyMasterAuthorityRuntimeState cleared = source.masterAuthorityRuntimeState;
+    cleared.taskExecutions.erase(TestBrain::machineRetirementJournalExecutionID);
+    cleared.generation += 1;
+    suite.expect(follower.applyReplicatedMasterAuthorityRuntimeState(cleared, true),
+                 "machine_retirement_follower_clear_applies_authoritative_empty_state");
+    suite.expect(follower.retiredMachineIdentities.size() == 1 &&
+                     follower.retiredMachineIdentities.begin()->second.authoritySettled &&
+                     follower.retiringMachinesByNeuron.contains(&alias->neuron),
+                 "machine_retirement_follower_clear_preserves_local_tombstone_until_ring_cleanup");
+
+    const ClusterMachine unrelatedIdentity = makeRetirementIdentity(
+        uint128_t(0x5232), nullptr, "10.0.2.32", 200);
+    TestBrain collidingSource = {};
+    suite.expect(installRetirementCarrier(collidingSource, 1, unrelatedIdentity, 2, true),
+                 "machine_retirement_follower_clear_installs_reused_id_carrier");
+    collidingSource.masterAuthorityRuntimeState.generation = cleared.generation + 1;
+    suite.expect(follower.applyReplicatedMasterAuthorityRuntimeState(
+                     collidingSource.masterAuthorityRuntimeState, true),
+                 "machine_retirement_follower_clear_applies_reused_id_carrier");
+    const uint64_t remappedIdentityID =
+        follower.retiringMachinesByNeuron[&alias->neuron].identityID;
+    suite.expect(remappedIdentityID != 1 &&
+                     follower.retiredMachineIdentities.contains(1) &&
+                     follower.retiredMachineIdentities.contains(remappedIdentityID) &&
+                     follower.retiredMachineIdentities[remappedIdentityID].authoritySettled,
+                 "machine_retirement_follower_clear_remaps_unrelated_reused_id");
+
+    TestBrain rejoinedSource = {};
+    suite.expect(installRetirementCarrier(rejoinedSource, 1, unrelatedIdentity, 2, true) &&
+                     installRetirementCarrier(rejoinedSource, 2, identity, 2, true),
+                 "machine_retirement_follower_clear_installs_same_identity_new_id_carrier");
+    rejoinedSource.masterAuthorityRuntimeState.generation =
+        collidingSource.masterAuthorityRuntimeState.generation + 1;
+    suite.expect(follower.applyReplicatedMasterAuthorityRuntimeState(
+                     rejoinedSource.masterAuthorityRuntimeState, true),
+                 "machine_retirement_follower_clear_applies_same_identity_new_id_carrier");
+    suite.expect(follower.retiringMachinesByNeuron[&alias->neuron].identityID == 2 &&
+                     follower.retiredMachineIdentities.size() == 2 &&
+                     follower.retiredMachineIdentities.contains(1) &&
+                     follower.retiredMachineIdentities.contains(2) &&
+                     follower.retiredMachineIdentities[2].authoritySettled == false,
+                 "machine_retirement_follower_clear_coalesces_same_identity_onto_authoritative_id");
+
+    ProdigyMasterAuthorityRuntimeState rejoinedCleared =
+        rejoinedSource.masterAuthorityRuntimeState;
+    rejoinedCleared.taskExecutions.erase(TestBrain::machineRetirementJournalExecutionID);
+    rejoinedCleared.generation += 1;
+    suite.expect(follower.applyReplicatedMasterAuthorityRuntimeState(rejoinedCleared, true) &&
+                     follower.retiredMachineIdentities.size() == 1 &&
+                     follower.retiredMachineIdentities.contains(2) &&
+                     follower.retiredMachineIdentities[2].authoritySettled,
+                 "machine_retirement_follower_clear_releases_rejoined_authority_to_local_cleanup");
+
+    follower.retiringMachinesByNeuron[&alias->neuron].closeQueued = true;
+    follower.retiringMachinesByNeuron[&alias->neuron].ringCloseObserved = true;
+    follower.testReapRetiringMachines();
+    suite.expect(follower.retiringMachinesByNeuron.empty() &&
+                     follower.retiredMachineIdentities.empty() &&
+                     provider.providerFenceActive == false,
+                 "machine_retirement_follower_clear_reaps_local_alias_then_releases_tombstone");
+  }
+
+  {
+    ClusterMachine retiredSelf = makeRetirementIdentity(
+        thisNeuron->uuid, nullptr, "10.0.0.10", 100);
+    retiredSelf.isBrain = true;
+    ClusterMachine survivor = makeRetirementIdentity(
+        uint128_t(0x5242), nullptr, "10.0.2.42", 200);
+    survivor.isBrain = true;
+
+    TestBrain source = {};
+    suite.expect(installRetirementCarrier(source, 1, retiredSelf, 7, true),
+                 "machine_retirement_retired_self_restart_installs_carrier");
+    source.masterAuthorityRuntimeState.generation = 8;
+
+    TrackingBrainIaaS provider = {};
+    TestBrain retiredRestart = {};
+    retiredRestart.iaas = &provider;
+    retiredRestart.overrideRetirementTopology = true;
+    retiredRestart.retirementTopology.version = 7;
+    retiredRestart.retirementTopology.machines = {survivor};
+    suite.expect(retiredRestart.applyReplicatedMasterAuthorityRuntimeState(
+                     source.masterAuthorityRuntimeState, true),
+                 "machine_retirement_retired_self_restart_restores_carrier");
+
+    retiredRestart.weAreMaster = true;
+    retiredRestart.noMasterYet = false;
+    suite.expect(retiredRestart.applyReplicatedMachineRetirementTopology(
+                     retiredRestart.masterAuthorityRuntimeState) &&
+                     retiredRestart.weAreMaster == false && retiredRestart.noMasterYet,
+                 "machine_retirement_retired_self_restart_forfeits_removed_master");
+    suite.expect(retiredRestart.testSelfElectAsMaster("retired-self") == false &&
+                     retiredRestart.weAreMaster == false,
+                 "machine_retirement_retired_self_restart_rejects_self_election_with_carrier");
+    retiredRestart.testDeriveMasterBrain();
+    suite.expect(retiredRestart.weAreMaster == false,
+                 "machine_retirement_retired_self_restart_rejects_failover_with_carrier");
+
+    TestBrain clearedRestart = {};
+    clearedRestart.iaas = &provider;
+    clearedRestart.nBrains = 1;
+    clearedRestart.overrideRetirementTopology = true;
+    clearedRestart.retirementTopology = retiredRestart.retirementTopology;
+    suite.expect(clearedRestart.testSelfElectAsMaster("retired-self-cleared") == false &&
+                     clearedRestart.weAreMaster == false,
+                 "machine_retirement_retired_self_restart_rejects_self_election_after_carrier_clear");
+    clearedRestart.testDeriveMasterBrain();
+    suite.expect(clearedRestart.weAreMaster == false,
+                 "machine_retirement_retired_self_restart_rejects_failover_after_carrier_clear");
+
+    ClusterMachine previousIncarnation = makeRetirementIdentity(
+        uint128_t(0x5243), nullptr, "10.0.0.10", 50);
+    previousIncarnation.isBrain = true;
+    TestBrain previousSource = {};
+    suite.expect(installRetirementCarrier(previousSource, 1, previousIncarnation),
+                 "machine_retirement_retired_self_restart_installs_reused_address_carrier");
+    previousSource.masterAuthorityRuntimeState.generation = 9;
+
+    ClusterMachine replacement = makeRetirementIdentity(
+        thisNeuron->uuid, nullptr, "10.0.0.10", 300);
+    replacement.isBrain = true;
+    TestBrain replacementRestart = {};
+    replacementRestart.iaas = &provider;
+    replacementRestart.overrideRetirementTopology = true;
+    replacementRestart.retirementTopology.version = 8;
+    replacementRestart.retirementTopology.machines = {replacement};
+    suite.expect(replacementRestart.applyReplicatedMasterAuthorityRuntimeState(
+                     previousSource.masterAuthorityRuntimeState, true) &&
+                     replacementRestart.testLocalBrainEligibleForMasterElection(),
+                 "machine_retirement_retired_self_restart_allows_new_uuid_on_reused_address");
+  }
+
+  withUniqueMothershipSocket("machine_retirement_follower_promotion_socket", [&] {
+    TestBrain source = {};
+    const ClusterMachine identity = makeRetirementIdentity(
+        uint128_t(0x5251), nullptr, "10.0.2.51", 100);
+    suite.expect(installRetirementCarrier(source, 1, identity),
+                 "machine_retirement_follower_promotion_installs_carrier");
+    source.masterAuthorityRuntimeState.generation = 5;
+
+    TrackingBrainIaaS provider = {};
+    TestBrain follower = {};
+    follower.iaas = &provider;
+    follower.nBrains = 3;
+    follower.boottimens = 525;
+    follower.version = 5;
+    follower.overrideRetirementTopology = true;
+    follower.retirementTopology.version = 1;
+    follower.retirementTopology.machines.push_back(identity);
+    follower.machineRetirementFenceFailuresRemaining = 20;
+    follower.overrideArmMachineNeuronControl = true;
+    follower.overrideSelfElectionManagedSchemaReconcile = true;
+
+    Machine *alias = new Machine();
+    alias->uuid = identity.uuid;
+    alias->creationTimeMs = identity.creationTimeMs;
+    alias->privateAddress = "10.0.2.51"_ctv;
+    alias->sshAddress = "10.0.2.51"_ctv;
+    alias->neuron.machine = alias;
+    alias->neuron.reconnectAfterClose = true;
+    follower.machines.insert(alias);
+    follower.machinesByUUID.insert_or_assign(alias->uuid, alias);
+    follower.neurons.insert(&alias->neuron);
+
+    suite.expect(follower.applyReplicatedMasterAuthorityRuntimeState(
+                     source.masterAuthorityRuntimeState, true),
+                 "machine_retirement_follower_promotion_restores_durable_carrier");
+    suite.expect(follower.retiringMachinesByNeuron.contains(&alias->neuron) &&
+                     follower.retirementTopology.machines.size() == 1,
+                 "machine_retirement_follower_promotion_quarantines_available_alias");
+    suite.expect(follower.testSelfElectAsMaster("machine-retirement-test"),
+                 "machine_retirement_follower_promotion_promotes_with_carrier");
+    suite.expect(follower.retiringMachinesByNeuron.contains(&alias->neuron) &&
+                     follower.retirementTopology.machines.size() == 1 &&
+                     follower.retirementTopologyPersistCalls == 0 &&
+                     provider.destroyCalls == 0,
+                 "machine_retirement_follower_promotion_blocks_destructive_phase_before_ack");
+    suite.expect(follower.machines.contains(alias) == false &&
+                     follower.neurons.contains(&alias->neuron) == false &&
+                     alias->neuron.reconnectAfterClose == false &&
+                     alias->neuron.connectAttemptPending() == false &&
+                     follower.armMachineNeuronControlCalls == 0,
+                 "machine_retirement_follower_promotion_never_rearms_retired_alias_control");
+
+    follower.retiringMachinesByNeuron.clear();
+    follower.retiredMachineIdentities.clear();
+    RingDispatcher::eraseMultiplexee(&alias->neuron);
+    delete alias;
+  });
+
+  {
+    TestBrain source = {};
+    const ClusterMachine identity = makeRetirementIdentity(
+        uint128_t(0x5301), nullptr, "10.0.0.53", 100);
+    suite.expect(installRetirementCarrier(source, 1, identity, 4),
+                 "machine_retirement_topology_ack_installs_carrier");
+    source.masterAuthorityRuntimeState.generation = 9;
+
+    TrackingBrainIaaS provider = {};
+    TestBrain follower = {};
+    follower.iaas = &provider;
+    follower.boottimens = 530;
+    follower.overrideRetirementTopology = true;
+    follower.retirementTopology.version = 3;
+    follower.retirementTopology.machines.push_back(identity);
+    follower.failRetirementTopologyPersist = true;
+
+    ScopedRing scopedRing = {};
+    BrainView *master = makePeer(uint128_t(0x5302), 53);
+    master->version = 5;
+    master->isMasterBrain = true;
+    master->connected = true;
+    follower.brains.insert(master);
+    int peerFD = -1;
+    suite.expect(installBrainPeerSocket(follower, *master, peerFD),
+                 "machine_retirement_topology_ack_installs_peer_transport");
+
+    ProdigyMasterAuthorityStateTransition transition = {};
+    transition.runtimeState = source.masterAuthorityRuntimeState;
+    transition.brainConfig = follower.brainConfig;
+    String serializedTransition = {};
+    BitseryEngine::serialize(serializedTransition, transition);
+    String messageBuffer = {};
+    Message *message = buildBrainMessage(
+        messageBuffer,
+        BrainTopic::replicateMasterAuthorityState,
+        serializedTransition);
+
+    follower.testBrainHandler(master, message);
+    suite.expect(master->wBuffer.outstandingBytes() == 0 &&
+                     follower.retirementTopology.machines.size() == 1,
+                 "machine_retirement_topology_ack_withholds_ack_when_persist_fails");
+
+    follower.failRetirementTopologyPersist = false;
+    follower.testBrainHandler(master, message);
+    Vector<uint16_t> topics = {};
+    countQueuedTopics(master->wBuffer, topics);
+    String transitionDigest = {};
+    suite.expect(follower.replicatedRuntimeStateCoversPendingElasticAddressOperations(
+                     transition.runtimeState),
+                 "machine_retirement_topology_ack_retains_exact_durable_runtime_state");
+    suite.expect(prodigyComputeSHA256Hex(serializedTransition, transitionDigest) &&
+                     transitionDigest.size() == 64 && follower.peerSocketActive(master),
+                 "machine_retirement_topology_ack_retains_valid_peer_and_digest");
+    suite.expect(std::find(topics.begin(), topics.end(),
+                           uint16_t(BrainTopic::replicateMasterAuthorityState)) != topics.end(),
+                 "machine_retirement_topology_ack_retries_equal_generation_and_acks");
+    suite.expect(follower.retirementTopology.machines.empty() &&
+                     follower.retirementTopology.version == 4,
+                 "machine_retirement_topology_ack_persists_removal_before_ack");
+
+    Ring::shutdownForExec();
+    scopedRing.created = false;
+    if (peerFD >= 0)
+    {
+      ::close(peerFD);
+    }
+    follower.brains.erase(master);
+    delete master;
+  }
+
+  {
+    TrackingBrainIaaS provider = {};
+    TestBrain brain = {};
+    brain.iaas = &provider;
+    brain.weAreMaster = true;
+    brain.nBrains = 3;
+    BrainView *oldPeer = makePeer(uint128_t(0x5401), 54);
+    BrainView *currentPeer = makePeer(uint128_t(0x5402), 55);
+    oldPeer->version = 4;
+    currentPeer->version = 5;
+    brain.brains.insert(oldPeer);
+    brain.brains.insert(currentPeer);
+
+    Machine machine = {};
+    machine.uuid = uint128_t(0x5403);
+    machine.creationTimeMs = 100;
+    Vector<Machine *> aliases {&machine};
+    uint64_t identityID = 0;
+    suite.expect(brain.journalMachineRetirement(aliases, false, identityID) == false &&
+                     brain.retiredMachineIdentities.empty(),
+                 "machine_retirement_rolling_upgrade_v4_blocks_initial_admission");
+
+    oldPeer->version = 5;
+    brain.failRuntimeStatePersist = true;
+    suite.expect(brain.journalMachineRetirement(aliases, false, identityID) == false &&
+                     provider.providerFenceActive == false &&
+                     provider.providerFenceTransitions.size() == 2 &&
+                     provider.providerFenceTransitions[0] &&
+                     provider.providerFenceTransitions[1] == false,
+                 "machine_retirement_provider_fence_rolls_back_failed_admission");
+
+    brain.failRuntimeStatePersist = false;
+    suite.expect(brain.journalMachineRetirement(aliases, false, identityID) &&
+                     identityID != 0 && provider.providerFenceActive,
+                 "machine_retirement_rolling_upgrade_all_v5_admits_carrier");
+    oldPeer->version = 4;
+    suite.expect(brain.peerEligibleForClusterQuorum(oldPeer) == false,
+                 "machine_retirement_rolling_upgrade_excludes_v4_peer_with_carrier");
+
+    brain.retiredMachineIdentities[identityID].topologyVersion = 1;
+    suite.expect(brain.commitMachineRetirementJournal(),
+                 "machine_retirement_rolling_upgrade_existing_carrier_advances_with_peer_unavailable");
+    makePeerDurablyActive(
+        brain,
+        currentPeer,
+        brain.masterAuthorityRuntimeState.generation,
+        54);
+    suite.expect(brain.machineRetirementJournalHasDurableQuorum(),
+                 "machine_retirement_rolling_upgrade_v5_two_of_three_reaches_durable_quorum");
+
+    currentPeer->connected = false;
+    currentPeer->isFixedFile = false;
+    currentPeer->fslot = -1;
+    brain.brains.clear();
+    delete oldPeer;
+    delete currentPeer;
+  }
+
+  {
+    TrackingBrainIaaS provider = {};
+    TestBrain brain = {};
+    brain.iaas = &provider;
+    brain.weAreMaster = true;
+    brain.nBrains = 1;
+    Machine uuidOnly = {};
+    Machine cloudOnly = {};
+    Machine bridge = {};
+    uuidOnly.uuid = uint128_t(0x5451);
+    uuidOnly.creationTimeMs = 100;
+    cloudOnly.cloudID = "cloud-machine-5451"_ctv;
+    cloudOnly.creationTimeMs = 100;
+    bridge.uuid = uuidOnly.uuid;
+    bridge.cloudID = cloudOnly.cloudID;
+    bridge.creationTimeMs = 100;
+    uint64_t uuidID = 0;
+    uint64_t cloudID = 0;
+    uint64_t bridgeID = 0;
+    suite.expect(brain.journalMachineRetirement({&uuidOnly}, false, uuidID) &&
+                     brain.journalMachineRetirement({&cloudOnly}, false, cloudID) &&
+                     uuidID != cloudID,
+                 "machine_retirement_journal_bridge_starts_disjoint_partial_identities");
+    suite.expect(brain.journalMachineRetirement({&bridge}, false, bridgeID) &&
+                     brain.retiredMachineIdentities.size() == 1 &&
+                     bridgeID == std::min(uuidID, cloudID) &&
+                     brain.retiredMachineIdentities.begin()->second.machine.uuid == uuidOnly.uuid &&
+                     brain.retiredMachineIdentities.begin()->second.machine.cloud.cloudID.equals(cloudOnly.cloudID),
+                 "machine_retirement_journal_bridge_coalesces_transitive_partial_identities");
+  }
+
+  {
+    TrackingBrainIaaS provider = {};
+    TestBrain brain = {};
+    brain.iaas = &provider;
+    brain.weAreMaster = true;
+    brain.nBrains = 1;
+    Machine machine = {};
+    machine.uuid = uint128_t(0x5461);
+    machine.cloudID = "cloud-machine-5461"_ctv;
+    machine.creationTimeMs = 100;
+    uint64_t identityID = 0;
+    suite.expect(brain.journalMachineRetirement({&machine}, false, identityID),
+                 "machine_retirement_destroy_escalation_installs_nonrequired_identity");
+    brain.retiredMachineIdentities[identityID].topologyVersion = 1;
+    brain.retiredMachineIdentities[identityID].destroySucceeded = true;
+    uint64_t escalatedID = 0;
+    suite.expect(brain.journalMachineRetirement({&machine}, true, escalatedID) &&
+                     escalatedID == identityID &&
+                     brain.retiredMachineIdentities[identityID].destroyRequired &&
+                     brain.retiredMachineIdentities[identityID].destroySucceeded == false,
+                 "machine_retirement_destroy_escalation_resets_prior_success");
+  }
+
+  {
+    TrackingBrainIaaS sourceProvider = {};
+    TestBrain source = {};
+    source.iaas = &sourceProvider;
+    source.weAreMaster = true;
+    source.nBrains = 1;
+    Machine machine = {};
+    machine.uuid = uint128_t(0x5501);
+    machine.cloudID = "cloud-machine-55"_ctv;
+    machine.creationTimeMs = 100;
+    Vector<Machine *> aliases {&machine};
+    uint64_t identityID = 0;
+    suite.expect(source.journalMachineRetirement(aliases, true, identityID),
+                 "machine_retirement_crash_before_evacuation_persists_initial_journal");
+
+    ProdigyPersistentMasterAuthorityPackage package = {};
+    package.runtimeState = source.masterAuthorityRuntimeState;
+    TrackingBrainIaaS restoredProvider = {};
+    TestBrain restored = {};
+    restored.iaas = &restoredProvider;
+    restored.enableMachineRetirementAuthority();
+    suite.expect(restored.applyPersistentMasterAuthorityPackage(package),
+                 "machine_retirement_crash_before_evacuation_restores_journal");
+    suite.expect(restored.retiredMachineIdentities.size() == 1 &&
+                     restored.retiredMachineIdentities.begin()->second.evacuationComplete == false &&
+                     restored.retiredMachineIdentities.begin()->second.evacuationObserved == false,
+                 "machine_retirement_crash_before_evacuation_remains_pending_without_alias");
+    suite.expect(restoredProvider.destroyCalls == 0 &&
+                     TestBrain::machineRetirementJournalPresent(restored.masterAuthorityRuntimeState),
+                 "machine_retirement_crash_before_evacuation_blocks_provider_destroy_and_clear");
+  }
+
+  {
+    TrackingBrainIaaS provider = {};
+    TestBrain brain = {};
+    brain.iaas = &provider;
+    brain.weAreMaster = true;
+    brain.nBrains = 1;
+    const ClusterMachine identity = makeRetirementIdentity(
+        uint128_t(0x5601), "cloud-machine-56", "10.0.0.56", 100);
+    suite.expect(installRetirementCarrier(brain, 1, identity, 1, true, true),
+                 "machine_retirement_provider_completion_installs_carrier");
+    brain.masterAuthorityRuntimeState.generation = 3;
+    brain.masterAuthorityRuntimeStateDurable = true;
+    brain.durableMasterAuthorityRuntimeStateGeneration = 3;
+    auto& retirement = brain.retiredMachineIdentities[1];
+    retirement.destroyQueued = true;
+    retirement.destroyAuthorityEpoch = brain.masterAuthorityEpoch;
+
+    brain.completeRetiredMachineDestroy(
+        identity.uuid, "wrong-cloud"_ctv, String {});
+    suite.expect(retirement.destroyQueued && retirement.destroySucceeded == false,
+                 "machine_retirement_provider_completion_rejects_nonexact_identity");
+    brain.completeRetiredMachineDestroy(
+        identity.uuid, String {}, String {});
+    brain.completeRetiredMachineDestroy(
+        uint128_t(0), identity.cloud.cloudID, String {});
+    suite.expect(retirement.destroyQueued && retirement.destroySucceeded == false,
+                 "machine_retirement_provider_completion_rejects_missing_identity_fields");
+    brain.completeRetiredMachineDestroy(
+        identity.uuid, identity.cloud.cloudID, String {});
+    suite.expect(retirement.destroyQueued == false && retirement.destroySucceeded,
+                 "machine_retirement_provider_completion_accepts_exact_identity_once");
+  }
+
+  {
+    TrackingBrainIaaS provider = {};
+    TestBrain brain = {};
+    brain.iaas = &provider;
+    brain.weAreMaster = true;
+    brain.nBrains = 3;
+    ClusterMachine identity = makeRetirementIdentity(
+        uint128_t(0x5701), nullptr, "10.0.0.57", 100);
+    identity.isBrain = true;
+    suite.expect(installRetirementCarrier(brain, 1, identity, 7, true),
+                 "machine_retirement_final_clear_installs_topology_carrier");
+    brain.masterAuthorityRuntimeState.generation = 20;
+    brain.masterAuthorityRuntimeStateDurable = true;
+    brain.durableMasterAuthorityRuntimeStateGeneration = 20;
+    suite.expect(brain.configureMachineRetirementProviderFence(
+                     brain.masterAuthorityRuntimeState) && provider.providerFenceActive,
+                 "machine_retirement_final_clear_activates_provider_fence");
+    auto& retirement = brain.retiredMachineIdentities[1];
+    retirement.topologyAbsent = true;
+    retirement.topologyObservationEpoch = brain.masterAuthorityEpoch;
+
+    ScopedRing scopedRing = {};
+    BrainView *retiredPeer = makePeer(identity.uuid, 57);
+    BrainView *survivor = makePeer(uint128_t(0x5702), 58);
+    retiredPeer->version = 5;
+    retiredPeer->creationTimeMs = identity.creationTimeMs;
+    survivor->version = 5;
+    brain.brains.insert(retiredPeer);
+    brain.brains.insert(survivor);
+
+    ClusterMachine local = makeRetirementIdentity(thisNeuron->uuid, nullptr, "10.0.0.10", 0);
+    ClusterMachine survivingPeer = makeRetirementIdentity(survivor->uuid, nullptr, "10.0.0.58", 0);
+    local.isBrain = true;
+    survivingPeer.isBrain = true;
+    brain.overrideRetirementTopology = true;
+    brain.retirementTopology.version = 6;
+    brain.retirementTopology.machines = {local, identity, survivingPeer};
+    suite.expect(brain.applyReplicatedMachineRetirementTopology(
+                     brain.masterAuthorityRuntimeState) &&
+                     brain.nBrains == 2 && retiredPeer->quarantined &&
+                     brain.retirementTopology.machines.size() == 2,
+                 "machine_retirement_final_clear_derives_three_to_two_membership_from_topology");
+
+    int survivorFD = -1;
+    suite.expect(installBrainPeerSocket(brain, *survivor, survivorFD),
+                 "machine_retirement_final_clear_installs_survivor_transport");
+
+    brain.settleRetiredMachineIdentities();
+    suite.expect(brain.retiredMachineIdentities.size() == 1 &&
+                     TestBrain::machineRetirementJournalPresent(brain.masterAuthorityRuntimeState),
+                 "machine_retirement_final_clear_disconnected_surviving_member_blocks_clear");
+
+    makePeerDurablyActive(brain, survivor, 20, survivor->fslot);
+    brain.settleRetiredMachineIdentities();
+    suite.expect(brain.retiredMachineIdentities.empty() &&
+                     TestBrain::machineRetirementJournalPresent(brain.masterAuthorityRuntimeState) == false &&
+                     provider.providerFenceActive == false,
+                 "machine_retirement_final_clear_excludes_retired_brain_after_survivor_ack");
+
+    Ring::shutdownForExec();
+    scopedRing.created = false;
+    if (survivorFD >= 0)
+    {
+      ::close(survivorFD);
+    }
+    brain.brains.clear();
+    delete retiredPeer;
+    delete survivor;
+  }
+
+  {
+    NoopBrainIaaS provider = {};
+    TestBrain brain = {};
+    brain.iaas = &provider;
+    brain.enableMachineRetirementAuthority();
+    RingExitDeadline deadline(2000);
+    ScopedRing scopedRing = {};
+    Rack *rack = new Rack();
+    rack->uuid = 95;
+    Machine *machine = new Machine();
+    machine->uuid = uint128_t(95);
+    machine->state = MachineState::decommissioning;
+    machine->rack = rack;
+    machine->rackUUID = rack->uuid;
+    machine->neuron.machine = machine;
+    rack->machines.insert(machine);
+    brain.racks.insert_or_assign(rack->uuid, rack);
+    brain.machines.insert(machine);
+    brain.machinesByUUID.insert_or_assign(machine->uuid, machine);
+    brain.neurons.insert(&machine->neuron);
+    brain.machineRetirementFenceFailuresRemaining = 1;
+
+    brain.decommissionMachine(machine);
+    suite.expect(brain.machines.contains(machine) == false && brain.retiringMachinesByNeuron.contains(&machine->neuron),
+                 "machine_decommission_fence_failure_quarantines_logically");
+    suite.expect(Ring::socketIsClosing(&machine->neuron) == false && brain.machineRetirementFenceCreateCalls == 1,
+                 "machine_decommission_fence_failure_defers_physical_close");
+
+    ApplicationDeployment unrelatedDeployment = {};
+    unrelatedDeployment.plan = makeDeploymentPlan(6089, 1);
+    unrelatedDeployment.nSuspended = 1;
+    brain.deployments.insert_or_assign(unrelatedDeployment.plan.config.deploymentID(), &unrelatedDeployment);
+
+    brain.testReapRetiringMachines();
+    suite.expect(Ring::socketIsClosing(&machine->neuron) && brain.machineRetirementFenceCreateCalls == 2,
+                 "machine_decommission_fence_failure_retries_close");
+
+    deadline.arm();
+    brain.exitRingAfterMachineRetirement = true;
+    Ring::exit = false;
+    Ring::start();
+    Ring::exit = false;
+    suite.expect(deadline.fired == false && brain.retiringMachinesByNeuron.empty() && brain.racks.empty(),
+                 "machine_decommission_fence_retry_ignores_later_unrelated_suspension");
+    brain.deployments.clear();
+  }
+
+  {
+    NoopBrainIaaS provider = {};
+    TestBrain brain = {};
+    brain.iaas = &provider;
+    brain.enableMachineRetirementAuthority();
+    RingExitDeadline deadline(2000);
+    ScopedRing scopedRing = {};
+    Rack *rack = new Rack();
+    rack->uuid = 96;
+    brain.racks.insert_or_assign(rack->uuid, rack);
+
+    auto addMachine = [&](uint128_t uuid) -> Machine * {
+      Machine *machine = new Machine();
+      machine->uuid = uuid;
+      machine->state = MachineState::decommissioning;
+      machine->rack = rack;
+      machine->rackUUID = rack->uuid;
+      machine->neuron.machine = machine;
+      rack->machines.insert(machine);
+      brain.machines.insert(machine);
+      brain.machinesByUUID.insert_or_assign(uuid, machine);
+      brain.neurons.insert(&machine->neuron);
+      return machine;
+    };
+
+    Machine *first = addMachine(uint128_t(961));
+    Machine *second = addMachine(uint128_t(962));
+    brain.decommissionMachine(first);
+    deadline.arm();
+    brain.exitRingAfterMachineRetirement = true;
+    Ring::exit = false;
+    Ring::start();
+    Ring::exit = false;
+    suite.expect(deadline.fired == false && brain.retiringMachinesByNeuron.empty() && brain.racks.contains(rack->uuid) && rack->machines.contains(second),
+                 "machine_decommission_shared_rack_survives_first_retirement");
+
+    brain.decommissionMachine(second);
+    Ring::exit = false;
+    Ring::start();
+    Ring::exit = false;
+    suite.expect(brain.retiringMachinesByNeuron.empty() && brain.racks.empty(),
+                 "machine_decommission_shared_rack_reaped_after_last_machine");
+  }
+
+  {
+    BrainBase *savedBrain = thisBrain;
+    NoopBrainIaaS provider = {};
+    TestBrain brain = {};
+    brain.iaas = &provider;
+    brain.enableMachineRetirementAuthority();
+    thisBrain = &brain;
+    RingExitDeadline deadline(2000);
+    ScopedRing scopedRing = {};
+
+    DeploymentPlan plan = makeDeploymentPlan(6090, 1);
+    plan.config.type = ApplicationType::stateful;
+    plan.config.minGPUs = 1;
+    plan.config.gpuMemoryGB = 8;
+    plan.isStateful = true;
+    plan.canaryCount = 0;
+    ApplicationDeployment *deployment = new ApplicationDeployment();
+    deployment->plan = plan;
+    deployment->nShardGroups = 1;
+    brain.deployments.insert_or_assign(plan.config.deploymentID(), deployment);
+
+    Rack *retiringRack = new Rack();
+    retiringRack->uuid = 97;
+    Machine *retiring = new Machine();
+    retiring->uuid = uint128_t(9701);
+    retiring->state = MachineState::decommissioning;
+    retiring->lifetime = MachineLifetime::ondemand;
+    retiring->rack = retiringRack;
+    retiring->rackUUID = retiringRack->uuid;
+    retiring->neuron.machine = retiring;
+    retiring->ownedLogicalCores = 8;
+    retiring->isolatedLogicalCoresCommitted = 1;
+    retiring->memoryMB_available = 4096 - int32_t(plan.config.totalMemoryMB());
+    retiring->storageMB_available = 4096 - int32_t(plan.config.totalStorageMB());
+    MachineGpuHardwareProfile retiringGPU = {};
+    retiringGPU.vendor = "nvidia"_ctv;
+    retiringGPU.model = "A10"_ctv;
+    retiringGPU.busAddress = "0000:17:00.0"_ctv;
+    retiringGPU.memoryMB = 16 * 1024u;
+    retiring->hardware.gpus.push_back(retiringGPU);
+    retiring->resetAvailableGPUMemoryMBsFromHardware();
+    retiring->availableGPUMemoryMBs.clear();
+    retiring->availableGPUHardwareIndexes.clear();
+    prodigyRecomputeMachineCPUAvailability(retiring, prodigyActiveSharedCPUOvercommitPermille());
+    retiringRack->machines.insert(retiring);
+    brain.racks.insert_or_assign(retiringRack->uuid, retiringRack);
+    brain.machines.insert(retiring);
+    brain.machinesByUUID.insert_or_assign(retiring->uuid, retiring);
+    brain.neurons.insert(&retiring->neuron);
+
+    Rack *replacementRack = new Rack();
+    replacementRack->uuid = 98;
+    Machine *replacement = new Machine();
+    replacement->uuid = uint128_t(9801);
+    replacement->state = MachineState::deploying;
+    replacement->lifetime = MachineLifetime::ondemand;
+    replacement->rack = replacementRack;
+    replacement->rackUUID = replacementRack->uuid;
+    replacement->ownedLogicalCores = 8;
+    replacement->memoryMB_available = 4096;
+    replacement->storageMB_available = 4096;
+    MachineGpuHardwareProfile replacementGPU = {};
+    replacementGPU.vendor = "nvidia"_ctv;
+    replacementGPU.model = "A16"_ctv;
+    replacementGPU.busAddress = "0000:65:00.0"_ctv;
+    replacementGPU.memoryMB = 16 * 1024u;
+    replacement->hardware.gpus.push_back(replacementGPU);
+    replacement->resetAvailableGPUMemoryMBsFromHardware();
+    prodigyRecomputeMachineCPUAvailability(replacement, prodigyActiveSharedCPUOvercommitPermille());
+    replacementRack->machines.insert(replacement);
+    brain.racks.insert_or_assign(replacementRack->uuid, replacementRack);
+    brain.machines.insert(replacement);
+    brain.machinesByUUID.insert_or_assign(replacement->uuid, replacement);
+
+    CoroutineStack ticketCoroutine;
+    MachineTicket *ticket = new MachineTicket();
+    ticket->coro = &ticketCoroutine;
+    ticket->deployment = deployment;
+    ticket->lifetime = ApplicationLifetime::base;
+    ticket->nMore = 1;
+    Machine::Claim claim = {};
+    claim.ticket = ticket;
+    claim.nFit = 1;
+    claim.shardGroups.push_back(7);
+    claim.placementTopologyEpochs.push_back(0);
+    claim.reservedIsolatedLogicalCoresTotal = 1;
+    claim.reservedMemoryMBTotal = plan.config.totalMemoryMB();
+    claim.reservedStorageMBTotal = plan.config.totalStorageMB();
+    claim.reservedGPUMemoryMBs.push_back(retiringGPU.memoryMB);
+    claim.reservedGPUDevices.push_back(prodigyAssignedGPUDeviceFromHardware(retiringGPU));
+    retiring->claims.push_back(std::move(claim));
+    deployment->countPerMachine[retiring] = 1;
+    deployment->countPerRack[retiringRack] = 1;
+    deployment->racksByShardGroup[7].insert(retiringRack);
+
+    brain.decommissionMachine(retiring);
+    suite.expect(retiring->claims.empty() && retiring->isolatedLogicalCoresCommitted == 0 && retiring->nLogicalCores_available == 8 && retiring->memoryMB_available == 4096 && retiring->storageMB_available == 4096 && retiring->availableGPUMemoryMBs.size() == 1 && retiring->availableGPUHardwareIndexes.size() == 1 && retiring->availableGPUHardwareIndexes[0] == 0,
+                 "machine_decommission_claim_restores_exact_retiring_resources");
+    suite.expect(deployment->countPerMachine.contains(retiring) == false && deployment->countPerRack.contains(retiringRack) == false && deployment->racksByShardGroup[7].contains(retiringRack) == false,
+                 "machine_decommission_claim_removes_retiring_placement");
+    suite.expect(replacement->claims.size() == 1 && replacement->claims[0].ticket == ticket && replacement->claims[0].nFit == 1 && replacement->claims[0].shardGroups.size() == 1 && replacement->claims[0].shardGroups[0] == 7 && replacement->claims[0].reservedGPUDevices.size() == 1 && replacement->claims[0].reservedGPUDevices[0].busAddress == replacementGPU.busAddress && replacement->availableGPUHardwareIndexes.empty() && ticket->shardGroups.empty(),
+                 "machine_decommission_claim_reassigns_exact_ticket_and_shard");
+    suite.expect(deployment->countPerMachine.getIf(replacement) == 1 && deployment->countPerRack.getIf(replacementRack) == 1 && deployment->racksByShardGroup[7].contains(replacementRack),
+                 "machine_decommission_claim_rebuilds_replacement_placement");
+
+    deadline.arm();
+    brain.exitRingAfterMachineRetirement = true;
+    Ring::exit = false;
+    Ring::start();
+    Ring::exit = false;
+    suite.expect(deadline.fired == false && brain.retiringMachinesByNeuron.empty() && brain.racks.contains(97) == false,
+                 "machine_decommission_claim_reaps_only_retiring_machine");
+
+    replacement->claims.clear();
+    deployment->countPerMachine.clear();
+    deployment->countPerRack.clear();
+    deployment->racksByShardGroup.clear();
+    brain.deployments.clear();
+    brain.machines.erase(replacement);
+    brain.machinesByUUID.erase(replacement->uuid);
+    replacementRack->machines.erase(replacement);
+    brain.racks.erase(replacementRack->uuid);
+    delete ticket;
+    delete replacement;
+    delete replacementRack;
+    delete deployment;
+    thisBrain = savedBrain;
+  }
+
+  {
+    BrainBase *savedBrain = thisBrain;
+    NoopBrainIaaS provider = {};
+    TestBrain brain = {};
+    Mesh mesh = {};
+    brain.iaas = &provider;
+    brain.enableMachineRetirementAuthority();
+    brain.mesh = &mesh;
+    thisBrain = &brain;
+    RingExitDeadline deadline(2000);
+    ScopedRing scopedRing = {};
+
+    DeploymentPlan plan = makeDeploymentPlan(6091, 1);
+    plan.canaryCount = 0;
+    ApplicationDeployment *deployment = new ApplicationDeployment();
+    deployment->plan = plan;
+    deployment->state = DeploymentState::running;
+    deployment->nTargetBase = 1;
+    deployment->nDeployedBase = 1;
+    deployment->nHealthyBase = 1;
+    brain.deployments.insert_or_assign(plan.config.deploymentID(), deployment);
+
+    Rack *retiringRack = new Rack();
+    retiringRack->uuid = 99;
+    Machine *retiring = new Machine();
+    retiring->uuid = uint128_t(9901);
+    retiring->private4 = 99;
+    retiring->state = MachineState::hardwareFailure;
+    retiring->lifetime = MachineLifetime::ondemand;
+    retiring->rack = retiringRack;
+    retiring->rackUUID = retiringRack->uuid;
+    retiring->neuron.machine = retiring;
+    retiring->neuron.connected = true;
+    retiring->ownedLogicalCores = 4;
+    retiring->memoryMB_available = 4096;
+    retiring->storageMB_available = 4096;
+    prodigyRecomputeMachineCPUAvailability(retiring, prodigyActiveSharedCPUOvercommitPermille());
+    prodigyDebitMachineScalarResources(retiring, plan.config, 1);
+    retiringRack->machines.insert(retiring);
+    brain.racks.insert_or_assign(retiringRack->uuid, retiringRack);
+    brain.machines.insert(retiring);
+    brain.machinesByUUID.insert_or_assign(retiring->uuid, retiring);
+    brain.neurons.insert(&retiring->neuron);
+    int retiringPeerFD = -1;
+    suite.expect(installNeuronSocket(brain, *retiring, retiringPeerFD),
+                 "machine_decommission_suspended_drain_installs_retiring_transport");
+
+    Rack *replacementRack = new Rack();
+    replacementRack->uuid = 100;
+    Machine *replacement = new Machine();
+    replacement->uuid = uint128_t(10001);
+    replacement->private4 = 100;
+    replacement->state = MachineState::deploying;
+    replacement->lifetime = MachineLifetime::ondemand;
+    replacement->rack = replacementRack;
+    replacement->rackUUID = replacementRack->uuid;
+    replacement->fragment = 2;
+    replacement->neuron.machine = replacement;
+    replacement->neuron.connected = true;
+    replacement->ownedLogicalCores = 4;
+    replacement->memoryMB_available = 4096;
+    replacement->storageMB_available = 4096;
+    prodigyRecomputeMachineCPUAvailability(replacement, prodigyActiveSharedCPUOvercommitPermille());
+    replacementRack->machines.insert(replacement);
+    brain.racks.insert_or_assign(replacementRack->uuid, replacementRack);
+    brain.machines.insert(replacement);
+    brain.machinesByUUID.insert_or_assign(replacement->uuid, replacement);
+    brain.neurons.insert(&replacement->neuron);
+    int replacementPeerFD = -1;
+    suite.expect(installNeuronSocket(brain, *replacement, replacementPeerFD),
+                 "machine_decommission_suspended_drain_installs_replacement_transport");
+
+    ContainerView *container = new ContainerView();
+    container->uuid = uint128_t(609101);
+    container->applicationID = plan.config.applicationID;
+    container->deploymentID = plan.config.deploymentID();
+    container->lifetime = ApplicationLifetime::base;
+    container->state = ContainerState::healthy;
+    container->machine = retiring;
+    container->fragment = 1;
+    deployment->containers.insert(container);
+    deployment->countPerMachine[retiring] = 1;
+    deployment->countPerRack[retiringRack] = 1;
+    retiring->upsertContainerIndexEntry(container->deploymentID, container);
+    brain.containers.insert_or_assign(container->uuid, container);
+
+    brain.decommissionMachine(retiring);
+    suite.expect(deployment->nSuspended > 0 && replacement->claims.size() == 1,
+                 "machine_decommission_suspended_drain_waits_on_replacement_claim");
+
+    deadline.arm();
+    brain.exitRingAfterMachineRetirement = true;
+    Ring::exit = false;
+    Ring::start();
+    Ring::exit = false;
+    suite.expect(deadline.fired == false && brain.retiringMachinesByNeuron.contains(&retiring->neuron) && brain.retiringMachinesByNeuron[&retiring->neuron].ringCloseObserved,
+                 "machine_decommission_suspended_drain_close_keeps_machine_quarantined");
+    suite.expect(brain.racks.contains(99) && deployment->nSuspended > 0,
+                 "machine_decommission_suspended_drain_keeps_rack_and_frame_alive");
+
+    replacement->state = MachineState::healthy;
+    replacement->runtimeReady = true;
+    brain.resumeMachineClaimsIfSchedulingReady(replacement);
+    ContainerView *replacementContainer = nullptr;
+    for (ContainerView *candidate : deployment->containers)
+    {
+      if (candidate != nullptr && candidate->machine == replacement)
+      {
+        replacementContainer = candidate;
+        break;
+      }
+    }
+    suite.expect(replacementContainer != nullptr && replacementContainer->state == ContainerState::scheduled && deployment->nSuspended > 0,
+                 "machine_decommission_suspended_drain_resumes_onto_replacement");
+    if (replacementContainer != nullptr)
+    {
+      deployment->containerIsHealthy(replacementContainer);
+    }
+    suite.expect(deployment->nSuspended == 0 && deployment->schedulingStack.execution == nullptr,
+                 "machine_decommission_suspended_drain_reaches_quiescence");
+
+    brain.testReapRetiringMachines();
+    suite.expect(brain.retiringMachinesByNeuron.empty() && brain.racks.contains(99) == false &&
+                     brain.racks.contains(100) && deployment->countPerMachine.size() == 1 &&
+                     deployment->countPerMachine.getIf(replacement) == 1,
+                 "machine_decommission_suspended_drain_reaps_after_exact_quiescence");
+
+    RingExitDeadline flushDeadline(20);
+    flushDeadline.arm();
+    Ring::exit = false;
+    Ring::start();
+    Ring::exit = false;
+    if (replacementContainer != nullptr)
+    {
+      deployment->destructContainer(replacementContainer);
+      deployment->containerDestroyed(replacementContainer);
+    }
+    cleanupNeuronSocket(replacement->neuron, replacementPeerFD);
+    if (retiringPeerFD >= 0)
+    {
+      ::close(retiringPeerFD);
+    }
+    brain.deployments.clear();
+    brain.machines.erase(replacement);
+    brain.machinesByUUID.erase(replacement->uuid);
+    brain.neurons.erase(&replacement->neuron);
+    replacementRack->machines.erase(replacement);
+    brain.racks.erase(replacementRack->uuid);
+    delete replacement;
+    delete replacementRack;
+    delete deployment;
+    thisBrain = savedBrain;
+  }
+
+  {
+    SuspendedGetMachinesBrainIaaS provider = {};
+    TestBrain brain = {};
+    brain.iaas = &provider;
+    brain.enableMachineRetirementAuthority();
+    brain.overrideArmMachineNeuronControl = true;
+    RingExitDeadline deadline(2000);
+    ScopedRing scopedRing = {};
+
+    Rack *rack = new Rack();
+    rack->uuid = 101;
+    Machine *machine = new Machine();
+    machine->uuid = uint128_t(10101);
+    machine->private4 = 101;
+    machine->cloudID = "retiring-inventory-machine"_ctv;
+    machine->state = MachineState::decommissioning;
+    machine->rack = rack;
+    machine->rackUUID = rack->uuid;
+    machine->neuron.machine = machine;
+    machine->neuron.connected = true;
+    rack->machines.insert(machine);
+    brain.racks.insert_or_assign(rack->uuid, rack);
+    brain.machines.insert(machine);
+    brain.machinesByUUID.insert_or_assign(machine->uuid, machine);
+    brain.neurons.insert(&machine->neuron);
+    int peerFD = -1;
+    suite.expect(installNeuronSocket(brain, *machine, peerFD),
+                 "machine_decommission_inventory_resume_installs_transport");
+
+    Machine *providerSnapshot = new Machine();
+    providerSnapshot->uuid = machine->uuid;
+    providerSnapshot->private4 = machine->private4;
+    providerSnapshot->cloudID = machine->cloudID;
+    providerSnapshot->rackUUID = rack->uuid;
+    providerSnapshot->neuron.machine = providerSnapshot;
+    provider.machineToPublish = providerSnapshot;
+
+    brain.getMachines(&brain.brainInventoryCoroutine);
+    suite.expect(brain.brainInventoryCoroutine.hasSuspendedCoroutines(),
+                 "machine_decommission_inventory_resume_suspends_with_machine_snapshot");
+    brain.decommissionMachine(machine);
+    deadline.arm();
+    brain.exitRingAfterMachineRetirement = true;
+    Ring::exit = false;
+    Ring::start();
+    Ring::exit = false;
+    suite.expect(deadline.fired == false && brain.retiringMachinesByNeuron.contains(&machine->neuron),
+                 "machine_decommission_inventory_resume_blocks_reap_during_inventory");
+
+    ClusterTopology staleTopology = {};
+    ClusterMachine staleMachine = {};
+    staleMachine.source = ClusterMachineSource::adopted;
+    staleMachine.backing = ClusterMachineBacking::owned;
+    staleMachine.kind = MachineConfig::MachineKind::vm;
+    staleMachine.lifetime = MachineLifetime::owned;
+    staleMachine.uuid = machine->uuid;
+    staleMachine.rackUUID = rack->uuid;
+    staleMachine.ssh.address = "10.0.0.101"_ctv;
+    staleMachine.ssh.user = "root"_ctv;
+    prodigyAppendUniqueClusterMachineAddress(staleMachine.addresses.privateAddresses, "10.0.0.101"_ctv, 24);
+    staleTopology.machines.push_back(staleMachine);
+    suite.expect(brain.testRestoreMachinesFromClusterTopology(staleTopology) == false && brain.armMachineNeuronControlCalls == 0 && brain.machines.empty() && brain.machinesByUUID.empty(),
+                 "machine_decommission_inventory_resume_rejects_topology_before_registration");
+
+    brain.brainInventoryCoroutine.co_consume();
+    suite.expect(provider.resumedAfterSuspend && brain.brainInventoryCoroutine.hasSuspendedCoroutines() == false,
+                 "machine_decommission_inventory_resume_completes_inventory_frame");
+    suite.expect(brain.machines.empty() && brain.machinesByUUID.contains(uint128_t(10101)) == false,
+                 "machine_decommission_inventory_resume_rejects_terminal_identity_snapshot");
+
+    brain.testReapRetiringMachines();
+    suite.expect(brain.retiringMachinesByNeuron.empty() && brain.racks.empty(),
+                 "machine_decommission_inventory_resume_reaps_after_inventory_quiescence");
+    if (peerFD >= 0)
+    {
+      ::close(peerFD);
+    }
+  }
+
   {
     ScopedRing scopedRing = {};
 
@@ -1277,6 +2651,8 @@ int main(void)
           NeuronTopic::registration,
           int64_t(1'700'000'000'004),
           "linux-6.10.1"_ctv,
+          "arch"_ctv,
+          "rolling"_ctv,
           false);
       brain.testNeuronHandler(&machine.neuron, message);
 
