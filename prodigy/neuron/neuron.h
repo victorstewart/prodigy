@@ -5164,6 +5164,10 @@ public:
     {
       failedContainerArtifactGCTickQueued = false;
     }
+    else if (packet == &containerNetworkCleanupTick)
+    {
+      containerNetworkCleanupTickQueued = false;
+    }
 
     if (result == -ECANCELED)
     {
@@ -5172,6 +5176,10 @@ public:
         return;
       }
       if (packet == &failedContainerArtifactGCTick)
+      {
+        return;
+      }
+      if (packet == &containerNetworkCleanupTick)
       {
         return;
       }
@@ -5215,6 +5223,11 @@ public:
           }
 
           ensureMetricsTickQueued();
+          break;
+        }
+      case NeuronTimeoutFlags::networkCleanup:
+        {
+          ContainerManager::retryQuarantinedContainerNetworks();
           break;
         }
       case NeuronTimeoutFlags::logGC:

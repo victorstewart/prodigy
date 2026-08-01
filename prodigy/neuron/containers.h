@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <arpa/inet.h>
+#include <net/if.h>
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -931,6 +932,14 @@ public:
   bool waitidPending = false;
   bool destroyCloseCompleted = false;
   bool failedArtifactsPreserved = false;
+  bool deviceMapReserved = false;
+  bool networkCleanupPending = false;
+  bool networkCleanupComplete = false;
+  bool networkQuarantineRetained = false;
+  bool networkDeviceObserveOnly = false;
+  uint8_t networkCleanupAttempts = 0;
+  uint32_t deviceMapIfidx = 0;
+  uint32_t networkDeviceRetirementIfidx = 0;
   bool deleteStorageOnCleanUp = true;
   bool storageUsesLoopFilesystem = false;
   ResourceDeltaMode resourceDeltaMode = ResourceDeltaMode::none;
@@ -1016,7 +1025,6 @@ public:
 
   BPFProgram *peer_program = nullptr;
   BPFProgram *primary_program = nullptr;
-  ContainerDeviceMapMirror peerDeviceMapMirror;
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix4_key> installedPeerOverlayPrefixes4 = {};
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix6_key> installedPeerOverlayPrefixes6 = {};
   ProdigyOverlayValueMirror<switchboard_overlay_machine_route_key, switchboard_overlay_machine_route> installedPeerOverlayRouteKeysFull = {};
@@ -1031,216 +1039,205 @@ public:
 
 private:
 
-  class ContainerDeviceMapSnapshot {
+  class ContainerDeviceMapTargetState {
   public:
 
-    uint32_t ifidxByFragment[256] = {};
+    int mapFD = -1;
+    uint64_t mapID = 0;
   };
 
-  static void addContainerToDeviceMapSnapshot(ContainerDeviceMapSnapshot& snapshot, Container *container, Container *excludedContainer)
+  static bool readContainerDeviceMapEntry(void *context, uint32_t fragment, uint32_t& ifidx)
   {
-    if (container == nullptr || container == excludedContainer || container->plan.useHostNetworkNamespace || container->netdevs.areActive() == false)
-    {
-      return;
-    }
-
-    snapshot.ifidxByFragment[container->plan.fragment] = container->netdevs.host.ifidx;
+    int mapFD = int(reinterpret_cast<intptr_t>(context));
+    return mapFD >= 0 && bpf_map_lookup_elem(mapFD, &fragment, &ifidx) == 0;
   }
 
-  static ContainerDeviceMapSnapshot buildContainerDeviceMapSnapshot(Container *extraContainer = nullptr, Container *excludedContainer = nullptr)
+  static bool writeContainerDeviceMapEntry(void *context, uint32_t fragment, uint32_t ifidx)
   {
-    ContainerDeviceMapSnapshot snapshot = {};
-    if (thisNeuron == nullptr)
-    {
-      return snapshot;
-    }
-
-    for (const auto& [uuid, container] : thisNeuron->containers)
-    {
-      addContainerToDeviceMapSnapshot(snapshot, container, excludedContainer);
-    }
-
-    addContainerToDeviceMapSnapshot(snapshot, extraContainer, excludedContainer);
-    return snapshot;
+    int mapFD = int(reinterpret_cast<intptr_t>(context));
+    return mapFD >= 0 && bpf_map_update_elem(mapFD, &fragment, &ifidx, BPF_ANY) == 0;
   }
 
-  static bool writeContainerDeviceMapEntry(int mapFD, uint32_t fragment, uint32_t ifidx, const char *scope, uint64_t ownerUUID, String *failureReport = nullptr)
+  static bool openContainerDeviceMap(BPFProgram *program, ContainerDeviceMapTargetState& state)
   {
-    if (mapFD < 0)
+    if (program == nullptr)
     {
-      basics_log("containerDeviceMap missing scope=%s owner=%llu fragment=%u ifidx=%u\n",
-                 (scope ? scope : "unknown"),
-                 (unsigned long long)ownerUUID,
-                 unsigned(fragment),
-                 unsigned(ifidx));
-      if (failureReport && failureReport->size() == 0)
-      {
-        failureReport->assign("container device map missing"_ctv);
-      }
       return false;
     }
 
-    if (bpf_map_update_elem(mapFD, &fragment, &ifidx, BPF_ANY) != 0)
-    {
-      basics_log("containerDeviceMap update failed scope=%s owner=%llu fragment=%u ifidx=%u errno=%d(%s)\n",
-                 (scope ? scope : "unknown"),
-                 (unsigned long long)ownerUUID,
-                 unsigned(fragment),
-                 unsigned(ifidx),
-                 errno,
-                 strerror(errno));
-      if (failureReport && failureReport->size() == 0)
-      {
-        failureReport->assign("container device map update failed"_ctv);
-      }
-      return false;
-    }
-
-    uint32_t readback = 0;
-    if (bpf_map_lookup_elem(mapFD, &fragment, &readback) != 0 || readback != ifidx)
-    {
-      int lookupErrno = errno;
-      basics_log("containerDeviceMap readback failed scope=%s owner=%llu fragment=%u wrote=%u read=%u errno=%d(%s)\n",
-                 (scope ? scope : "unknown"),
-                 (unsigned long long)ownerUUID,
-                 unsigned(fragment),
-                 unsigned(ifidx),
-                 unsigned(readback),
-                 lookupErrno,
-                 strerror(lookupErrno));
-      if (failureReport && failureReport->size() == 0)
-      {
-        failureReport->assign("container device map readback failed"_ctv);
-      }
-      return false;
-    }
-
-    return true;
-  }
-
-  static bool syncContainerDeviceMapForProgram(
-      BPFProgram *program,
-      uint64_t ownerUUID,
-      uint32_t nicIfidx,
-      bool includeNIC,
-      const ContainerDeviceMapSnapshot& snapshot,
-      ContainerDeviceMapMirror& mirror,
-      Container *extraContainer = nullptr,
-      Container *excludedContainer = nullptr,
-      String *failureReport = nullptr)
-  {
-    if (program == nullptr || thisNeuron == nullptr)
-    {
-      return true;
-    }
-
-    bool ok = true;
+    bool appended = false;
     program->openMap("ct_dev_map"_ctv, [&](int mapFD) -> void {
-      if (mapFD < 0)
+      struct bpf_map_info mapInfo = {};
+      __u32 mapInfoLen = sizeof(mapInfo);
+      if (mapFD < 0 || bpf_map_get_info_by_fd(mapFD, &mapInfo, &mapInfoLen) != 0 || mapInfo.id == 0)
       {
-        basics_log("containerDeviceMap open failed owner=%llu includeNIC=%d\n",
-                   (unsigned long long)ownerUUID,
-                   int(includeNIC));
-        if (failureReport && failureReport->size() == 0)
-        {
-          failureReport->assign("container device map open failed"_ctv);
-        }
-        ok = false;
         return;
       }
 
-      struct bpf_map_info mapInfo = {};
-      __u32 mapInfoLen = sizeof(mapInfo);
-      bool mapInfoAvailable = (bpf_map_get_info_by_fd(mapFD, &mapInfo, &mapInfoLen) == 0);
-      uint32_t mapID = mapInfoAvailable ? uint32_t(mapInfo.id) : 0;
+      state.mapFD = mapFD;
+      state.mapID = mapInfo.id;
+      appended = true;
+    });
+    return appended;
+  }
 
-      bool mirrorTrusted = mapInfoAvailable && mirror.valid && mirror.mapID == mapID;
-      ContainerDeviceMapMirror nextMirror = {};
-      nextMirror.valid = mapInfoAvailable;
-      nextMirror.mapID = mapID;
+  static ProdigyContainerDeviceMapCoordinator::MapTarget containerDeviceMapTarget(
+      const ContainerDeviceMapTargetState& state)
+  {
+    return {state.mapID,
+            0,
+            0,
+            reinterpret_cast<void *>(intptr_t(state.mapFD)),
+            readContainerDeviceMapEntry,
+            writeContainerDeviceMapEntry};
+  }
 
-      for (uint32_t fragment = 0; fragment < 256; fragment += 1)
+  static void appendContainerDeviceMapMutation(
+      const ContainerDeviceMapTargetState& state,
+      uint32_t fragment,
+      uint32_t ifidx,
+      std::vector<ProdigyContainerDeviceMapCoordinator::MapTarget>& targets)
+  {
+    auto target = containerDeviceMapTarget(state);
+    target.fragment = fragment;
+    target.desired = ifidx;
+    targets.push_back(target);
+  }
+
+  static bool buildContainerDeviceMapTargets(
+      Container *subject,
+      bool retiring,
+      const std::array<ProdigyContainerDeviceMapCoordinator::Reservation, 256>& reservations,
+      std::vector<ProdigyContainerDeviceMapCoordinator::MapTarget>& targets)
+  {
+    uint32_t subjectIfidx = reservations[subject->plan.fragment].ifindex;
+    ContainerDeviceMapTargetState host = {};
+    if (openContainerDeviceMap(thisNeuron->tcx_ingress_program, host) == false)
+    {
+      return false;
+    }
+    targets.reserve(retiring ? reservations.size() + 1 : 3 * reservations.size());
+    if (retiring)
+    {
+      appendContainerDeviceMapMutation(host, subject->plan.fragment, 0, targets);
+    }
+
+    bool foundSubject = false;
+    for (uint32_t fragment = 1; fragment < reservations.size(); ++fragment)
+    {
+      const auto& reservation = reservations[fragment];
+      if (reservation.active() == false || reservation.retiring || (retiring && reservation.context == subject))
       {
-        uint32_t desiredIfidx = snapshot.ifidxByFragment[fragment];
-        if (includeNIC && fragment == 0 && desiredIfidx == 0)
-        {
-          desiredIfidx = nicIfidx;
-        }
-
-        nextMirror.ifidxByFragment[fragment] = desiredIfidx;
-        bool mapEntryCurrent = mirrorTrusted && mirror.ifidxByFragment[fragment] == desiredIfidx;
-        if (mapEntryCurrent && ownerUUID == 0 && desiredIfidx != 0)
-        {
-          uint32_t readback = 0;
-          mapEntryCurrent = (bpf_map_lookup_elem(mapFD, &fragment, &readback) == 0 && readback == desiredIfidx);
-        }
-
-        if (mapEntryCurrent)
-        {
-          continue;
-        }
-
-        if (writeContainerDeviceMapEntry(mapFD, fragment, desiredIfidx, "ct_dev_map", ownerUUID, failureReport) == false)
-        {
-          ok = false;
-        }
+        continue;
+      }
+      Container *registered = static_cast<Container *>(reservation.context);
+      if (registered == nullptr || registered->plan.uuid != reservation.owner ||
+          registered->plan.fragment != fragment || registered->netdevs.host.ifidx != reservation.ifindex)
+      {
+        return false;
       }
 
-      if (ok && mapInfoAvailable)
+      ContainerDeviceMapTargetState peer = {};
+      if (openContainerDeviceMap(registered->peer_program, peer) == false)
       {
-        mirror = nextMirror;
+        return false;
+      }
+
+      if (registered == subject)
+      {
+        foundSubject = true;
+        if (retiring == false)
+        {
+          ProdigyContainerDeviceMapCoordinator::appendAuthoritativeMap(
+              containerDeviceMapTarget(peer), reservations, thisNeuron->eth.ifidx, targets);
+        }
       }
       else
       {
-        mirror.valid = false;
-        mirror.mapID = 0;
+        appendContainerDeviceMapMutation(peer,
+                                         subject->plan.fragment,
+                                         retiring ? 0 : subjectIfidx,
+                                         targets);
       }
-    });
-
-    return ok;
+    }
+    if (retiring == false)
+    {
+      if (foundSubject == false)
+      {
+        return false;
+      }
+      ProdigyContainerDeviceMapCoordinator::appendAuthoritativeMap(
+          containerDeviceMapTarget(host), reservations, 0, targets);
+    }
+    return true;
   }
 
-  static bool syncContainerDeviceMaps(Container *extraContainer = nullptr, Container *excludedContainer = nullptr, String *failureReport = nullptr)
+  static bool syncContainerDeviceMaps(Container *container, bool retiring, String *failureReport = nullptr)
   {
-    if (thisNeuron == nullptr)
+    if (thisNeuron == nullptr || container == nullptr || container->plan.useHostNetworkNamespace)
+    {
+      return true;
+    }
+    if (container->netdevs.areActive() == false && (retiring == false || container->deviceMapReserved == false))
     {
       return true;
     }
 
-    bool ok = true;
-    const ContainerDeviceMapSnapshot snapshot = buildContainerDeviceMapSnapshot(extraContainer, excludedContainer);
+    uint32_t ifidx = container->deviceMapReserved ? container->deviceMapIfidx : container->netdevs.host.ifidx;
 
-    if (thisNeuron->tcx_ingress_program)
-    {
-      ok = syncContainerDeviceMapForProgram(thisNeuron->tcx_ingress_program, 0, 0, false, snapshot, thisNeuron->hostIngressDeviceMapMirror, extraContainer, excludedContainer, failureReport) && ok;
-    }
-
-    auto syncEgressProgram = [&](Container *container) -> void {
-      if (container == nullptr || container == excludedContainer || container->plan.useHostNetworkNamespace || container->netdevs.areActive() == false || container->peer_program == nullptr)
-      {
-        return;
-      }
-
-      ok = syncContainerDeviceMapForProgram(container->peer_program,
-                                            container->plan.uuid,
-                                            thisNeuron->eth.ifidx,
-                                            true,
-                                            snapshot,
-                                            container->peerDeviceMapMirror,
-                                            extraContainer,
-                                            excludedContainer,
-                                            failureReport) &&
-           ok;
+    auto prepare = [&](std::vector<ProdigyContainerDeviceMapCoordinator::MapTarget>& targets,
+                       const std::array<ProdigyContainerDeviceMapCoordinator::Reservation, 256>& reservations) -> bool {
+      return buildContainerDeviceMapTargets(container, retiring, reservations, targets);
     };
-
-    for (const auto& [uuid, container] : thisNeuron->containers)
+    using Outcome = ProdigyContainerDeviceMapCoordinator::Outcome;
+    Outcome outcome = retiring
+        ? thisNeuron->containerDeviceMaps.retireDevice(container->plan.uuid,
+                                                       container->plan.fragment,
+                                                       ifidx,
+                                                       container,
+                                                       prepare)
+        : thisNeuron->containerDeviceMaps.registerDevice(container->plan.uuid,
+                                                         container->plan.fragment,
+                                                         ifidx,
+                                                         container,
+                                                         prepare);
+    auto reservation = thisNeuron->containerDeviceMaps.reservation(container->plan.fragment);
+    container->deviceMapReserved = reservation.owner == container->plan.uuid &&
+                                   reservation.ifindex == ifidx &&
+                                   reservation.context == container;
+    if (container->deviceMapReserved)
     {
-      syncEgressProgram(container);
+      container->deviceMapIfidx = ifidx;
+    }
+    container->networkCleanupPending = outcome == Outcome::quarantined || (retiring && outcome != Outcome::committed);
+    if (outcome == Outcome::committed)
+    {
+      if (retiring == false)
+      {
+        container->networkCleanupComplete = false;
+        container->networkCleanupAttempts = 0;
+      }
+      return true;
     }
 
-    syncEgressProgram(extraContainer);
-
-    return ok;
+    basics_log("container device map transaction failed uuid=%llu fragment=%u ifidx=%u retiring=%d quarantined=%d\n",
+               (unsigned long long)container->plan.uuid,
+               unsigned(container->plan.fragment),
+               unsigned(ifidx),
+               int(retiring),
+               int(outcome == Outcome::quarantined));
+    if (failureReport && failureReport->size() == 0)
+    {
+      if (outcome == Outcome::quarantined)
+      {
+        failureReport->assign("container device map rollback unverified"_ctv);
+      }
+      else
+      {
+        failureReport->assign("container device map transaction failed"_ctv);
+      }
+    }
+    return false;
   }
 
 public:
@@ -1773,7 +1770,7 @@ public:
       return false;
     }
 
-    bool synced = syncContainerDeviceMaps(this, nullptr, failureReport);
+    bool synced = syncContainerDeviceMaps(this, false, failureReport);
     if (synced)
     {
       syncPeerOverlayRoutingProgram();
@@ -2104,7 +2101,7 @@ public:
       return false;
     }
 
-    if (syncContainerDeviceMaps(this, nullptr, failureReport) == false)
+    if (syncContainerDeviceMaps(this, false, failureReport) == false)
     {
       if (plan.networkAccess == ContainerNetworkAccess::declaredOnly)
       {
@@ -2135,38 +2132,158 @@ public:
     return true;
   }
 
-  void cleanupNetwork(void)
+  static bool containerBPFDetached(NetDevice& device, BPFProgram *&program, enum bpf_attach_type attachType)
   {
+    if (program)
+    {
+      device.detachBPF(attachType);
+      program = nullptr;
+    }
+    if (device.ifidx == 0)
+    {
+      return true;
+    }
+
+    __u32 programID = 0;
+    struct bpf_prog_query_opts options = {};
+    options.sz = sizeof(options);
+    options.prog_ids = &programID;
+    options.prog_cnt = 1;
+    return bpf_prog_query_opts(device.ifidx, attachType, &options) == 0 && options.prog_cnt == 0;
+  }
+
+  bool destroyContainerNetDevicePair(void)
+  {
+    if (netdevs.areActive() == false)
+    {
+      return true;
+    }
+
+    using IfindexState = ProdigyContainerDeviceMapCoordinator::IfindexState;
+    uint32_t hostIfidx = networkDeviceRetirementIfidx ? networkDeviceRetirementIfidx : netdevs.host.ifidx;
+    networkDeviceRetirementIfidx = hostIfidx;
+    auto queryName = [&](uint32_t& observedIfindex) -> IfindexState {
+      errno = 0;
+      observedIfindex = if_nametoindex(netdevs.host.name.c_str());
+      if (observedIfindex != 0)
+      {
+        return IfindexState::present;
+      }
+      return errno == ENODEV || errno == ENXIO ? IfindexState::absent : IfindexState::unknown;
+    };
+    auto queryIfindex = [](uint32_t ifindex) -> IfindexState {
+      char name[IF_NAMESIZE] = {};
+      errno = 0;
+      if (if_indextoname(ifindex, name) != nullptr)
+      {
+        return IfindexState::present;
+      }
+      return errno == ENODEV || errno == ENXIO
+                 ? IfindexState::absent
+                 : IfindexState::unknown;
+    };
+    auto decide = [&]() -> ProdigyContainerDeviceMapCoordinator::RetirementAction {
+      uint32_t nameIfindex = 0;
+      IfindexState nameState = queryName(nameIfindex);
+      IfindexState indexState = queryIfindex(hostIfidx);
+      return ProdigyContainerDeviceMapCoordinator::retirementAction(
+          networkDeviceObserveOnly, hostIfidx, nameIfindex, nameState, indexState);
+    };
+
+    auto action = decide();
+    if (action == ProdigyContainerDeviceMapCoordinator::RetirementAction::destroy)
+    {
+      // Once deletion is issued, retries only observe: both the name and ifindex can be ABA-reused.
+      networkDeviceObserveOnly = true;
+      netdevs.destroyPair();
+      action = decide();
+    }
+    else if (action == ProdigyContainerDeviceMapCoordinator::RetirementAction::observe)
+    {
+      networkDeviceObserveOnly = true;
+    }
+    if (action != ProdigyContainerDeviceMapCoordinator::RetirementAction::complete)
+    {
+      return false;
+    }
+    netdevs.host.ifidx = 0;
+    netdevs.peer.ifidx = 0;
+    netdevs.host.name.clear();
+    netdevs.peer.name.clear();
+    return true;
+  }
+
+  bool cleanupNetwork(void)
+  {
+    if (networkCleanupComplete)
+    {
+      return true;
+    }
     if (plan.useHostNetworkNamespace)
     {
       for (const IPPrefix& prefix : plan.addresses)
       {
         removeAddressFromDevice(thisNeuron->eth, prefix);
       }
+      networkCleanupComplete = true;
+      return true;
     }
 
-    (void)syncContainerDeviceMaps(nullptr, this);
+    if (deviceMapReserved && syncContainerDeviceMaps(this, true) == false)
+    {
+      networkCleanupPending = true;
+      networkCleanupAttempts = ProdigyContainerDeviceMapCoordinator::nextRecoveryAttempt(networkCleanupAttempts);
+      return false;
+    }
 
     if (plan.networkAccess == ContainerNetworkAccess::declaredOnly)
     {
       switchboardUnpinContainerTCPFlowMap(netdevs.host.ifidx);
     }
-    if (peer_program)
+    bool detached = containerBPFDetached(netdevs.host, peer_program, prodigyContainerEgressNetkitAttachType());
+    detached = containerBPFDetached(netdevs.host, primary_program, prodigyContainerIngressNetkitAttachType()) && detached;
+    if (detached == false)
     {
-      netdevs.host.detachBPF(prodigyContainerEgressNetkitAttachType());
-      peer_program = nullptr;
+      basics_log("container network BPF detach unverified uuid=%llu fragment=%u ifidx=%u\n",
+                 (unsigned long long)plan.uuid,
+                 unsigned(plan.fragment),
+                 unsigned(netdevs.host.ifidx));
     }
-    if (primary_program)
+    uint32_t retiredIfidx = deviceMapReserved
+                                ? deviceMapIfidx
+                                : (networkDeviceRetirementIfidx ? networkDeviceRetirementIfidx : netdevs.host.ifidx);
+    if (destroyContainerNetDevicePair() == false)
     {
-      netdevs.host.detachBPF(prodigyContainerIngressNetkitAttachType());
-      primary_program = nullptr;
+      basics_log("container netdevice retirement unverified uuid=%llu fragment=%u ifidx=%u\n",
+                 (unsigned long long)plan.uuid,
+                 unsigned(plan.fragment),
+                 unsigned(retiredIfidx));
+      if (deviceMapReserved)
+      {
+        thisNeuron->containerDeviceMaps.noteCleanupFailure(plan.uuid, plan.fragment, retiredIfidx, this);
+      }
+      networkCleanupPending = true;
+      networkCleanupAttempts = ProdigyContainerDeviceMapCoordinator::nextRecoveryAttempt(networkCleanupAttempts);
+      return false;
     }
-    if (netdevs.areActive())
+    if (deviceMapReserved &&
+        thisNeuron->containerDeviceMaps.completeRetirement(plan.uuid, plan.fragment, retiredIfidx, this) == false)
     {
-      netdevs.destroyPair();
-      netdevs.host.name.clear();
-      netdevs.peer.name.clear();
+      basics_log("container device map reservation release failed uuid=%llu fragment=%u ifidx=%u\n",
+                 (unsigned long long)plan.uuid,
+                 unsigned(plan.fragment),
+                 unsigned(retiredIfidx));
+      networkCleanupPending = true;
+      networkCleanupAttempts = ProdigyContainerDeviceMapCoordinator::nextRecoveryAttempt(networkCleanupAttempts);
+      return false;
     }
+    deviceMapReserved = false;
+    deviceMapIfidx = 0;
+    networkDeviceObserveOnly = false;
+    networkDeviceRetirementIfidx = 0;
+    networkCleanupPending = false;
+    networkCleanupComplete = true;
+    return true;
   }
 };
 
@@ -8467,6 +8584,54 @@ public:
     return deleteContainerArtifactTree(artifactRootPath, failureReport);
   }
 
+  static void queueQuarantinedContainerNetworkRetry(void)
+  {
+    if (thisNeuron == nullptr || thisNeuron->containerNetworkCleanupTickQueued)
+    {
+      return;
+    }
+    uint64_t retryDelayMs = ProdigyContainerDeviceMapCoordinator::slowRecoveryDelayMs;
+    bool retained = false;
+    for (const auto& [uuid, container] : thisNeuron->quarantinedContainerNetworks)
+    {
+      if (container)
+      {
+        retained = true;
+        retryDelayMs = std::min(retryDelayMs,
+                                ProdigyContainerDeviceMapCoordinator::recoveryDelayMs(container->networkCleanupAttempts));
+      }
+    }
+    if (retained == false)
+    {
+      return;
+    }
+
+    thisNeuron->containerNetworkCleanupTick.clear();
+    thisNeuron->containerNetworkCleanupTick.flags = uint64_t(NeuronTimeoutFlags::networkCleanup);
+    thisNeuron->containerNetworkCleanupTick.originator = thisNeuron;
+    thisNeuron->containerNetworkCleanupTick.setTimeoutMs(retryDelayMs);
+    Ring::queueTimeout(&thisNeuron->containerNetworkCleanupTick);
+    thisNeuron->containerNetworkCleanupTickQueued = true;
+  }
+
+  static void retainQuarantinedContainerNetwork(Container *container)
+  {
+    if (container == nullptr || thisNeuron == nullptr || container->networkQuarantineRetained)
+    {
+      return;
+    }
+    auto existing = thisNeuron->quarantinedContainerNetworks.find(container->plan.uuid);
+    if (existing != thisNeuron->quarantinedContainerNetworks.end() && existing->second != container)
+    {
+      basics_log("container network quarantine identity collision uuid=%llu\n",
+                 (unsigned long long)container->plan.uuid);
+      std::abort();
+    }
+    thisNeuron->quarantinedContainerNetworks.insert_or_assign(container->plan.uuid, container);
+    container->networkQuarantineRetained = true;
+    queueQuarantinedContainerNetworkRetry();
+  }
+
   static void cleanupContainerAfterFailedCreate(Container *container)
   {
     if (container == nullptr)
@@ -8493,12 +8658,16 @@ public:
       }
     }
 
+    if (container->netdevs.areActive() || container->deviceMapReserved)
+    {
+      (void)container->cleanupNetwork();
+    }
+
     if (thisNeuron != nullptr)
     {
       auto it = thisNeuron->containers.find(container->plan.uuid);
       if (it != thisNeuron->containers.end() && it->second == container)
       {
-        container->cleanupNetwork();
         thisNeuron->popContainer(container);
       }
     }
@@ -8542,7 +8711,14 @@ public:
     }
 
     ContainerRegistry::pop(container);
-    delete container;
+    if (container->networkCleanupPending)
+    {
+      retainQuarantinedContainerNetwork(container);
+    }
+    else
+    {
+      delete container;
+    }
   }
 
   static void createContainer(ContainerPlan& plan, const String& compressedContainerPath, Container *& container, String *failure = nullptr)
@@ -9948,6 +10124,39 @@ private:
 
 public:
 
+  static void retryQuarantinedContainerNetworks(void)
+  {
+    if (thisNeuron == nullptr)
+    {
+      return;
+    }
+
+    Vector<Container *> retry;
+    for (const auto& [uuid, container] : thisNeuron->quarantinedContainerNetworks)
+    {
+      if (container)
+      {
+        retry.push_back(container);
+      }
+    }
+
+    for (Container *container : retry)
+    {
+      if (container->cleanupNetwork() == false)
+      {
+        continue;
+      }
+      auto retained = thisNeuron->quarantinedContainerNetworks.find(container->plan.uuid);
+      if (retained != thisNeuron->quarantinedContainerNetworks.end() && retained->second == container)
+      {
+        thisNeuron->quarantinedContainerNetworks.erase(retained);
+        container->networkQuarantineRetained = false;
+        delete container;
+      }
+    }
+    queueQuarantinedContainerNetworkRetry();
+  }
+
   static void queueContainerWaitid(Container *container)
   {
     container->waitidPending = true;
@@ -9977,6 +10186,11 @@ public:
       }
       return false;
     }
+    container->networkCleanupComplete = false;
+    container->networkCleanupPending = false;
+    container->networkDeviceObserveOnly = false;
+    container->networkDeviceRetirementIfidx = 0;
+    container->networkCleanupAttempts = 0;
     if (approveCapabilities(container->plan) == false)
     {
       if (failureReport)
@@ -11047,7 +11261,11 @@ public:
     }
     container->pid = -1;
 
-    container->cleanupNetwork();
+    if (container->cleanupNetwork() == false)
+    {
+      destroyContainer(container);
+      return;
+    }
 
     String failureReport;
     if (thisNeuron != nullptr && container->plan.whiteholes.empty() == false)
@@ -11074,7 +11292,7 @@ public:
 
   static void finalizeContainerDestroy(Container *container)
   {
-    if (container == nullptr || container->pendingDestroy == false)
+    if (container == nullptr || container->pendingDestroy == false || container->networkQuarantineRetained)
     {
       return;
     }
@@ -11087,7 +11305,14 @@ public:
 
     ContainerRegistry::pop(container);
     thisNeuron->popContainer(container);
-    delete container;
+    if (container->networkCleanupPending)
+    {
+      retainQuarantinedContainerNetwork(container);
+    }
+    else
+    {
+      delete container;
+    }
   }
 
   static void finalizeContainerDestroyIfReady(Container *container)
@@ -11185,7 +11410,7 @@ public:
     logDestroyFilePreview("/readytrace.log"_ctv, "readytrace");
 #endif
 
-    container->cleanupNetwork();
+    (void)container->cleanupNetwork();
 
     if (container->killedOnPurpose == false && container->failedArtifactsPreserved == false && container->infop.si_pid > 0)
     {

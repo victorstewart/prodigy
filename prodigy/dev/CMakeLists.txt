@@ -550,6 +550,7 @@ add_executable(prodigy_switchboard_balancer_unit ${CMAKE_CURRENT_SOURCE_DIR}/tes
 add_executable(prodigy_container_storage_layout_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_container_storage_layout_unit.cpp)
 add_executable(prodigy_switchboard_overlay_route_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_switchboard_overlay_route_unit.cpp)
 add_executable(prodigy_container_overlay_sync_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_container_overlay_sync_unit.cpp)
+add_executable(prodigy_container_device_map_transaction_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_container_device_map_transaction_unit.cpp)
 add_executable(prodigy_brain_overlay_hosted_ingress_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_overlay_hosted_ingress_unit.cpp)
 add_executable(prodigy_switchboard_whitehole_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_switchboard_whitehole_unit.cpp)
 add_executable(prodigy_quic_cid_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_quic_cid_unit.cpp)
@@ -634,6 +635,7 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_container_storage_layout_unit
    prodigy_switchboard_overlay_route_unit
    prodigy_container_overlay_sync_unit
+   prodigy_container_device_map_transaction_unit
    prodigy_brain_overlay_hosted_ingress_unit
    prodigy_switchboard_whitehole_unit
    prodigy_quic_cid_unit
@@ -875,6 +877,7 @@ target_compile_options(prodigy_switchboard_balancer_unit PUBLIC -O2)
 target_compile_options(prodigy_container_storage_layout_unit PUBLIC -O2)
 target_compile_options(prodigy_switchboard_overlay_route_unit PUBLIC -O2)
 target_compile_options(prodigy_container_overlay_sync_unit PUBLIC -O2)
+target_compile_options(prodigy_container_device_map_transaction_unit PUBLIC -O2)
 target_compile_options(prodigy_brain_overlay_hosted_ingress_unit PUBLIC -O2)
 target_compile_options(prodigy_switchboard_whitehole_unit PUBLIC -O2)
 target_compile_options(prodigy_quic_cid_unit PUBLIC -O2)
@@ -1634,6 +1637,10 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_container_overlay_sync_unit
    )
    set_tests_properties(prodigy_container_overlay_sync_unit PROPERTIES SKIP_RETURN_CODE 77)
+   add_test(
+      NAME prodigy_container_device_map_transaction_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_container_device_map_transaction_unit
+   )
    add_test(
       NAME prodigy_declared_network_policy_contract
       COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_declared_network_policy_contract.cmake

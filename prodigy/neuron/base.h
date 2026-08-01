@@ -1,4 +1,5 @@
 #include <prodigy/containerstore.h>
+#include <prodigy/container.device.map.h>
 #include <prodigy/iaas/iaas.h>
 #include <prodigy/machine.hardware.types.h>
 #include <prodigy/runtime.environment.h>
@@ -17,21 +18,14 @@ enum class NeuronTimeoutFlags : uint64_t {
   restartContainer,
   metricsTick,
   walSync,
-  resourceDeltaGrace
+  resourceDeltaGrace,
+  networkCleanup
 };
 
 class Container;
 class ContainerPlan;
 class TaskTermination;
 class SwitchboardOverlayRoutingConfig;
-
-class ContainerDeviceMapMirror {
-public:
-
-  bool valid = false;
-  uint32_t mapID = 0;
-  uint32_t ifidxByFragment[256] = {};
-};
 
 class NeuronBase {
 public:
@@ -47,6 +41,7 @@ public:
   double perCoreUtil[256] = {0.0}; // rolling avg per-core utilization estimate
   double nodeLoad[16] = {0.0}; // rolling avg per-node load
   bytell_hash_map<uint128_t, Container *> containers;
+  bytell_hash_map<uint128_t, Container *> quarantinedContainerNetworks;
   bytell_hash_map<pid_t, Container *> containerByPid;
   bytell_hash_set<uint128_t> statefulCrashed; // waiting on word from the brain what to do with the data
 
@@ -55,7 +50,9 @@ public:
   bool configuredFakeIpv4Boundary = false;
   BPFProgram *tcx_ingress_program = nullptr;
   BPFProgram *tcx_egress_program = nullptr;
-  ContainerDeviceMapMirror hostIngressDeviceMapMirror;
+  ProdigyContainerDeviceMapCoordinator containerDeviceMaps;
+  TimeoutPacket containerNetworkCleanupTick;
+  bool containerNetworkCleanupTickQueued = false;
   struct local_container_subnet6 lcsubnet6;
 
   String metro;
