@@ -915,6 +915,31 @@ int main(int argc, char **argv)
   suite.expect(pumpTransportBytes(server, client), "pump_server_payload_over_tls");
   suite.expect(streamBufferEquals(client.rBuffer, serverPayload), "client_receives_server_payload_plaintext");
 
+  suite.expect(configureTransportRuntimeForNode(clientUUID, rootCertPem, rootKeyPem, clientCertPem, clientKeyPem, &failure), "reconfigure_transport_runtime_client_reconnect");
+  suite.expect(failure.size() == 0, "reconfigure_transport_runtime_client_reconnect_clears_failure");
+  client.reset();
+  suite.expect(client.ssl == nullptr && client.transportTLSEnabled() == false, "reset_transport_tls_client_destroys_retired_session");
+  suite.expect(client.beginTransportTLS(false), "begin_transport_tls_client_reconnect");
+
+  suite.expect(configureTransportRuntimeForNode(serverUUID, rootCertPem, rootKeyPem, serverCertPem, serverKeyPem, &failure), "reconfigure_transport_runtime_server_reconnect");
+  suite.expect(failure.size() == 0, "reconfigure_transport_runtime_server_reconnect_clears_failure");
+  server.reset();
+  suite.expect(server.ssl == nullptr && server.transportTLSEnabled() == false, "reset_transport_tls_server_destroys_retired_session");
+  suite.expect(server.beginTransportTLS(true), "begin_transport_tls_server_reconnect");
+
+  suite.expect(completeTransportHandshake(client, server), "complete_transport_tls_reconnect_handshake");
+  suite.expect(client.isTLSNegotiated(), "client_transport_tls_reconnect_negotiated");
+  suite.expect(server.isTLSNegotiated(), "server_transport_tls_reconnect_negotiated");
+  suite.expect(ProdigyTransportTLSRuntime::extractPeerUUID(client.ssl, clientPeerUUID), "client_extracts_peer_uuid_after_reconnect");
+  suite.expect(clientPeerUUID == serverUUID, "client_extracts_server_uuid_after_reconnect");
+  suite.expect(ProdigyTransportTLSRuntime::extractPeerUUID(server.ssl, serverPeerUUID), "server_extracts_peer_uuid_after_reconnect");
+  suite.expect(serverPeerUUID == clientUUID, "server_extracts_client_uuid_after_reconnect");
+
+  String reconnectPayload = "brain reconnect tls payload"_ctv;
+  client.wBuffer.append(reconnectPayload);
+  suite.expect(pumpTransportBytes(client, server), "pump_client_reconnect_payload_over_tls");
+  suite.expect(streamBufferEquals(server.rBuffer, reconnectPayload), "server_receives_client_reconnect_payload_plaintext");
+
   suite.expect(configureTransportRuntimeForNode(clientUUID, rootCertPem, rootKeyPem, clientCertPem, clientKeyPem, &failure), "reconfigure_transport_runtime_client_prequeued");
   suite.expect(failure.size() == 0, "reconfigure_transport_runtime_client_prequeued_clears_failure");
   ProdigyTransportTLSStream prequeuedClient = {};

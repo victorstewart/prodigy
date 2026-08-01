@@ -609,6 +609,7 @@ public:
       }
     }
 
+#if PRODIGY_DEBUG
     std::fprintf(stderr,
                  "prodigy debug transport-tls-begin-ok stream=%p server=%d fd=%d fslot=%d ctx=%p\n",
                  static_cast<void *>(this),
@@ -617,6 +618,7 @@ public:
                  fslot,
                  static_cast<void *>(ProdigyTransportTLSRuntime::context()));
     std::fflush(stderr);
+#endif
     return true;
   }
 
@@ -812,10 +814,7 @@ public:
     {
       wBuffer.reserve(wBufferCapacity);
     }
-    if (ssl)
-    {
-      resetTLS();
-    }
+    destroyTLS();
 
     tlsEnabled = false;
     tlsPeerVerified = false;
