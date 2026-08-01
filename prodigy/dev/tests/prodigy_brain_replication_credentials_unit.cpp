@@ -16760,8 +16760,8 @@ static void testBrainReplicatedContainerRuntimeStateRestoresTakeoverView(TestSui
                "brain_replicated_runtime_state_keeps_follower_timeout_local_and_disarmed");
   suite.expect(deployment.containers.contains(restored), "brain_replicated_runtime_state_indexes_deployment");
   suite.expect(machine.containersByDeploymentID.contains(deployment.plan.config.deploymentID()), "brain_replicated_runtime_state_indexes_machine");
-  suite.expect(deployment.nDeployedBase == 1, "brain_replicated_runtime_state_rebuilds_deployed_count");
-  suite.expect(deployment.nHealthyBase == 1, "brain_replicated_runtime_state_rebuilds_healthy_count");
+  suite.expect(deployment.nDeployedBase == 0, "brain_replicated_runtime_state_follower_defers_deployed_counter_recovery");
+  suite.expect(deployment.nHealthyBase == 0, "brain_replicated_runtime_state_follower_defers_healthy_counter_recovery");
 
   if (restored != nullptr)
   {
