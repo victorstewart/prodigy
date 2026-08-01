@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include <prodigy/child.process.signal.h>
 #include <prodigy/types.h>
 
 class ProdigyCertbotPaths {
@@ -568,6 +569,15 @@ static inline bool prodigySpawnArgv(const Vector<String>& argv, const Vector<Str
     if (failure)
     {
       failure->assign("process argv is empty"_ctv);
+    }
+    return false;
+  }
+
+  if (prodigyEnsureSigchldDefaultWaitable() == false)
+  {
+    if (failure)
+    {
+      failure->assign("failed to establish waitable child-process ownership"_ctv);
     }
     return false;
   }

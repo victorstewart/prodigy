@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <filesystem>
+#include <signal.h>
 #include <string_view>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -4297,6 +4298,23 @@ int main(void)
     suite.expect(childHasEnv("PRODIGY_ONLY=1"_ctv), "certbot_child_env_keeps_override");
     suite.expect(childHasEnvPrefix("AWS_SECRET_ACCESS_KEY="_ctv) == false, "certbot_child_env_drops_parent_secret");
     unsetenv("AWS_SECRET_ACCESS_KEY");
+
+    struct sigaction originalSigchld = {};
+    struct sigaction noChildWait = {};
+    sigemptyset(&noChildWait.sa_mask);
+    noChildWait.sa_handler = SIG_DFL;
+    noChildWait.sa_flags = SA_NOCLDWAIT;
+    bool sigchldConfigured = sigaction(SIGCHLD, &noChildWait, &originalSigchld) == 0;
+    Vector<String> waitableArgv = {};
+    waitableArgv.push_back("/bin/true"_ctv);
+    int waitableStatus = -1;
+    String waitableFailure = {};
+    suite.expect(sigchldConfigured && prodigyRunBlockingArgv(waitableArgv, {}, &waitableStatus, &waitableFailure) && waitableStatus == 0,
+                 "certbot_child_restores_waitable_sigchld_policy");
+    if (sigchldConfigured)
+    {
+      sigaction(SIGCHLD, &originalSigchld, nullptr);
+    }
 
     String recordName = {};
     suite.expect(prodigyACMEDNS01RecordName("*.example.com"_ctv, recordName, &failure) && recordName.equal("_acme-challenge.example.com."_ctv), "acme_dns01_record_name_canonicalizes_wildcard");
