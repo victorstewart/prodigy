@@ -5603,6 +5603,40 @@ int main(void)
   }
 
   {
+    ScopedRing scopedRing = {};
+
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    brain.localBrainPeerAddress = IPAddress("127.0.0.1", false);
+    brain.localBrainPeerAddressText = "127.0.0.1"_ctv;
+    brain.localBrainPeerAddresses.push_back(
+        ClusterMachinePeerAddress {"127.0.0.1"_ctv, 8});
+
+    BrainView peer = {};
+    peer.private4 = IPAddress("127.0.0.2", false).v4;
+    peer.peerAddresses.push_back(
+        ClusterMachinePeerAddress {"127.0.0.2"_ctv, 8});
+    peer.weConnectToIt = true;
+
+    brain.testArmOutboundPeerReconnect(&peer);
+
+    suite.expect(peer.daddrLen > 0, "arm_outbound_peer_reconnect_addressful_configures_destination");
+    suite.expect(peer.isFixedFile && peer.fslot >= 0, "arm_outbound_peer_reconnect_addressful_installs_socket");
+    suite.expect(peer.connectAttemptPending(), "arm_outbound_peer_reconnect_addressful_arms_connect");
+
+    if (peer.isFixedFile)
+    {
+      Ring::uninstallFromFixedFileSlot(&peer);
+    }
+    else if (peer.fd >= 0)
+    {
+      ::close(peer.fd);
+    }
+    peer.fd = -1;
+    peer.isFixedFile = false;
+  }
+
+  {
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
 

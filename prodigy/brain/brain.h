@@ -10562,7 +10562,6 @@ public:
     }
 
     brain->reset();
-    brain->recreateSocket();
     configureBrainPeerConnectAddress(brain);
 
     if (persistentReconnect)
@@ -19547,7 +19546,6 @@ public:
     if (reconnectArmedByClose == false)
     {
       bv->currentStreamAccepted = false;
-      bv->recreateSocket();
       configureBrainPeerConnectAddress(bv);
       if (installBrainPeerSocket(bv))
       {
