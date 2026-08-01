@@ -1,9 +1,13 @@
 #pragma once
 
 #include <limits.h>
+#if PRODIGY_DEBUG
+#include <execinfo.h>
+#endif
 
 #include <networking/includes.h>
 #include <services/prodigy.h>
+#include <prodigy/debug.h>
 #include <prodigy/types.h>
 
 #include <prodigy/child.process.signal.h>
@@ -44,6 +48,7 @@ private:
   NeuronType *neuron = nullptr;
   // the only way master brain is relinquished, is either by choice when we 1) update the operating system or 2) update this program, or by force when 3) the machine fails
 
+#if PRODIGY_DEBUG
   static void exitTraceHandler(int status, void *)
   {
     void *frames[32];
@@ -55,6 +60,7 @@ private:
     }
     std::fflush(stderr);
   }
+#endif
 
   void beforeRing(void)
   {
@@ -74,7 +80,7 @@ private:
 
   void finishRuntimeStartup(void)
   {
-    std::fprintf(stderr, "prodigy afterRing neuronIsBrain=%d private4=%u\n", int(neuron->isBrain), ntohl(neuron->private4.v4));
+    PRODIGY_DEBUG_LOG("prodigy afterRing neuronIsBrain=%d private4=%u\n", int(neuron->isBrain), ntohl(neuron->private4.v4));
 
     if (neuron->isBrain)
     {
@@ -175,10 +181,12 @@ public:
     {
       Guardian::crashReportPath.assign(crashReportPath);
     }
+#if PRODIGY_DEBUG
     if (const char *exitTrace = std::getenv("PRODIGY_EXIT_TRACE"); exitTrace && exitTrace[0] == '1')
     {
       (void)on_exit(exitTraceHandler, nullptr);
     }
+#endif
 
     uint32_t sqeCount = 128;
     uint32_t cqeCount = 128;
