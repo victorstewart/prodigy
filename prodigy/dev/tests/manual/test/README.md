@@ -15,8 +15,8 @@ Mothership to create the cluster, schedule work, report state, inject declared
 faults, and remove the cluster. It never provisions the virtual datacenter or
 installs Prodigy directly.
 
-From macOS, enter through `prodigy_dev_test_cluster.sh`; it creates the Linux
-guest from the approved Apple Container base image before invoking the harness.
+From macOS, enter through `prodigy_dev_test_cluster.sh`; it selects or creates
+the approved reusable Apple Container instance before invoking the harness.
 Apple Containers is already the VM boundary, so there is no nested guest. On an
 ordinary Linux workstation, use a QEMU guest with KVM hardware acceleration and
 an immutable base plus per-run overlay; never use TCG. A dedicated sacrificial
@@ -25,8 +25,8 @@ Native compilation and unit tests do not require this launcher.
 
 Mothership removes the test cluster on harness exit. Required reports and
 failure logs are first preserved under the host-mounted `.run/` root. The
-Darwin launcher then stops and deletes the Apple Container writable instance on
-success, failure, or interruption while retaining the base image, kernel,
+Darwin launcher then stops the thin Apple Container instance on success,
+failure, or interruption while retaining that instance, the base image, kernel,
 dependency caches, and valid build outputs. A Linux VM runner likewise deletes
 the per-run overlay after the in-guest command returns; that outer VM lifecycle
 intentionally remains outside the harness.

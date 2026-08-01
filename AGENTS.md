@@ -101,8 +101,10 @@ all provider-created processes, namespaces, links, mounts, cgroups, and storage
 on every harness exit. Keep immutable OCI/qcow2 bases, the pinned kernel,
 host-mounted caches, and still-valid build outputs. Reuse one guest only within
 one serial test batch. After preserving required evidence under `.run/`, the
-Darwin launcher must stop and delete the Apple Container and its writable layer
-even after failure or interruption. A Linux VM's external creator must destroy
+Darwin launcher must stop the selected reusable Apple Container even after
+failure or interruption; its pinned image, kernel, caches, and thin per-project
+instance remain available for the next compatible run. A Linux VM's external
+creator must destroy
 its QEMU process and per-run overlay after the in-guest launcher returns; do not
 make the harness call a hypervisor or power off its containing host. Native
 disposable CI must verify the same provider-resource cleanup before reuse.
