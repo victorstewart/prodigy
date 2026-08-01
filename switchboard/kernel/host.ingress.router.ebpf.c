@@ -94,7 +94,7 @@ __attribute__((__always_inline__)) static inline bool lookup_whitehole_reply_bin
   return whitehole_reply_binding_lookup(&flow, &current, binding);
 }
 
-__attribute__((__always_inline__)) static inline bool overlay_inner_ipv4_matches_external_portal(struct iphdr *inner4, void *data_end)
+__attribute__((__always_inline__)) static inline bool overlay_inner_ipv4_matches_declared_endpoint(struct iphdr *inner4, void *data_end)
 {
   if ((void *)(inner4 + 1) > data_end || inner4->ihl != 5)
   {
@@ -111,10 +111,16 @@ __attribute__((__always_inline__)) static inline bool overlay_inner_ipv4_matches
   portal.addr4 = inner4->daddr;
   portal.port = l4.dest;
   portal.proto = inner4->protocol;
-  return bpf_map_lookup_elem(&ext_portals, &portal) != NULL;
+  if (bpf_map_lookup_elem(&ext_portals, &portal) != NULL)
+  {
+    return true;
+  }
+
+  struct switchboard_whitehole_binding binding = {};
+  return whitehole_binding_lookup(portal.proto, false, &portal.addr4, portal.port, &binding);
 }
 
-__attribute__((__always_inline__)) static inline bool overlay_inner_ipv6_matches_external_portal(struct ipv6hdr *inner6, void *data_end)
+__attribute__((__always_inline__)) static inline bool overlay_inner_ipv6_matches_declared_endpoint(struct ipv6hdr *inner6, void *data_end)
 {
   if ((void *)(inner6 + 1) > data_end)
   {
@@ -131,7 +137,13 @@ __attribute__((__always_inline__)) static inline bool overlay_inner_ipv6_matches
   bpf_memcpy(portal.addr6, inner6->daddr.s6_addr32, sizeof(portal.addr6));
   portal.port = l4.dest;
   portal.proto = inner6->nexthdr;
-  return bpf_map_lookup_elem(&ext_portals, &portal) != NULL;
+  if (bpf_map_lookup_elem(&ext_portals, &portal) != NULL)
+  {
+    return true;
+  }
+
+  struct switchboard_whitehole_binding binding = {};
+  return whitehole_binding_lookup(portal.proto, true, portal.addr6, portal.port, &binding);
 }
 
 __attribute__((__always_inline__)) static inline bool overlay_inner_targets_local(__u8 inner_proto, void *inner_l3, void *data_end)
@@ -149,7 +161,7 @@ __attribute__((__always_inline__)) static inline bool overlay_inner_targets_loca
       return true;
     }
 
-    return overlay_inner_ipv4_matches_external_portal(inner4, data_end);
+    return overlay_inner_ipv4_matches_declared_endpoint(inner4, data_end);
   }
 
   if (inner_proto == IPPROTO_IPV6)
@@ -165,10 +177,72 @@ __attribute__((__always_inline__)) static inline bool overlay_inner_targets_loca
       return true;
     }
 
-    return overlay_inner_ipv6_matches_external_portal(inner6, data_end);
+    return overlay_inner_ipv6_matches_declared_endpoint(inner6, data_end);
   }
 
   return false;
+}
+
+__attribute__((__always_inline__)) static inline bool overlay_minimum_linear_bytes(struct __sk_buff *skb, __be16 wire_protocol, __u32 *minimum_bytes)
+{
+  if (skb == NULL || minimum_bytes == NULL)
+  {
+    return false;
+  }
+
+  *minimum_bytes = 0u;
+  __u32 outer_header_bytes = 0u;
+  __u32 outer_protocol_offset = 0u;
+  if (wire_protocol == BE_ETH_P_IPV6)
+  {
+    outer_header_bytes = sizeof(struct ipv6hdr);
+    outer_protocol_offset = sizeof(struct ethhdr) + __builtin_offsetof(struct ipv6hdr, nexthdr);
+  }
+  else if (wire_protocol == BE_ETH_P_IP)
+  {
+    outer_header_bytes = sizeof(struct iphdr);
+    outer_protocol_offset = sizeof(struct ethhdr) + __builtin_offsetof(struct iphdr, protocol);
+  }
+  else
+  {
+    return true;
+  }
+
+  __u8 inner_protocol = 0;
+  if (bpf_skb_load_bytes(skb, outer_protocol_offset, &inner_protocol, sizeof(inner_protocol)) != 0)
+  {
+    return false;
+  }
+  if (inner_protocol != IPPROTO_IPIP && inner_protocol != IPPROTO_IPV6)
+  {
+    return true;
+  }
+
+  __u8 version_ihl = 0;
+  if (bpf_skb_load_bytes(skb, sizeof(struct ethhdr), &version_ihl, sizeof(version_ihl)) != 0 ||
+      (wire_protocol == BE_ETH_P_IP ? version_ihl != 0x45u : (version_ihl >> 4) != 6u))
+  {
+    return false;
+  }
+
+  const __u32 inner_offset = sizeof(struct ethhdr) + outer_header_bytes;
+  if (bpf_skb_load_bytes(skb, inner_offset, &version_ihl, sizeof(version_ihl)) != 0 ||
+      (inner_protocol == IPPROTO_IPIP ? version_ihl != 0x45u : (version_ihl >> 4) != 6u))
+  {
+    return false;
+  }
+
+  const __u32 transport_protocol_offset = inner_offset + (inner_protocol == IPPROTO_IPIP
+                                                               ? __builtin_offsetof(struct iphdr, protocol)
+                                                               : __builtin_offsetof(struct ipv6hdr, nexthdr));
+  __u8 transport_protocol = 0;
+  if (bpf_skb_load_bytes(skb, transport_protocol_offset, &transport_protocol, sizeof(transport_protocol)) != 0)
+  {
+    return false;
+  }
+
+  *minimum_bytes = switchboardHostIngressOverlayMinimumLinearBytes(wire_protocol, inner_protocol, transport_protocol);
+  return *minimum_bytes != 0u;
 }
 
 __attribute__((__always_inline__)) static inline int maybe_redirect_whitehole_reply(struct ethhdr *eth, void *data_end, bool *handled)
@@ -689,8 +763,9 @@ int host_ingress(struct __sk_buff *skb)
     return TC_ACT_OK;
   }
 
-  __u32 minimum_linear_bytes = switchboardHostIngressOverlayMinimumLinearBytes(eth->h_proto);
-  if (minimum_linear_bytes != 0u && bpf_skb_pull_data(skb, minimum_linear_bytes) != 0)
+  __u32 minimum_linear_bytes = 0u;
+  if (overlay_minimum_linear_bytes(skb, eth->h_proto, &minimum_linear_bytes) == false ||
+      (minimum_linear_bytes != 0u && bpf_skb_pull_data(skb, minimum_linear_bytes) != 0))
   {
     return TC_ACT_SHOT;
   }
@@ -702,7 +777,7 @@ int host_ingress(struct __sk_buff *skb)
     return TC_ACT_SHOT;
   }
 
-  bool decapped = maybe_decap_overlay_packet(skb);
+  bool decapped = minimum_linear_bytes != 0u && maybe_decap_overlay_packet(skb);
 
   // maybe_decap_overlay_packet() can call bpf_skb_adjust_room(), which invalidates
   // all previously derived packet pointers regardless of whether we ended up
@@ -732,6 +807,16 @@ int host_ingress(struct __sk_buff *skb)
     if ((void *)(ipv6h + 1) > data_end)
     {
       return TC_ACT_SHOT;
+    }
+
+    if (decapped)
+    {
+      bool handledDecappedIPv6Portal = false;
+      int decappedIPv6PortalAction = maybe_redirect_ipv6_portal_packet(skb, eth, data_end, &handledDecappedIPv6Portal);
+      if (handledDecappedIPv6Portal)
+      {
+        return decappedIPv6PortalAction;
+      }
     }
 
     __be8 *daddr6 = ipv6h->daddr.s6_addr;

@@ -1626,6 +1626,10 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_switchboard_overlay_route_unit
    )
    add_test(
+      NAME prodigy_host_ingress_overlay_contract
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_host_ingress_overlay_contract.cmake
+   )
+   add_test(
       NAME prodigy_container_overlay_sync_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_container_overlay_sync_unit
    )

@@ -8,6 +8,13 @@ enum {
   SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6 = 6,
 };
 
+enum {
+  SWITCHBOARD_IP_PROTOCOL_IPIP = 4,
+  SWITCHBOARD_IP_PROTOCOL_TCP = 6,
+  SWITCHBOARD_IP_PROTOCOL_UDP = 17,
+  SWITCHBOARD_IP_PROTOCOL_IPV6 = 41,
+};
+
 struct portal_definition {
   union {
     __be32 addr4;
@@ -165,9 +172,19 @@ static inline __u32 switchboardPacketBudgetContainerInternetEgressAddedBytes(voi
   return 0u;
 }
 
-static inline __u32 switchboardPacketBudgetMinTransportHeaderBytes(void)
+static inline __u32 switchboardPacketBudgetTransportHeaderBytes(__u8 protocol)
 {
-  return 20u;
+  if (protocol == SWITCHBOARD_IP_PROTOCOL_TCP)
+  {
+    return 20u;
+  }
+
+  if (protocol == SWITCHBOARD_IP_PROTOCOL_UDP)
+  {
+    return 8u;
+  }
+
+  return 0u;
 }
 
 static inline __u32 switchboardNetkitIngressL3Offset(bool has_host_ethernet)
@@ -175,19 +192,34 @@ static inline __u32 switchboardNetkitIngressL3Offset(bool has_host_ethernet)
   return has_host_ethernet ? switchboardPacketBudgetEthernetHeaderBytes() : 0u;
 }
 
-static inline __u32 switchboardHostIngressOverlayMinimumLinearBytes(__be16 wire_protocol)
+static inline __u32 switchboardHostIngressOverlayMinimumLinearBytes(__be16 wire_protocol, __u8 inner_protocol, __u8 transport_protocol)
 {
+  __u32 outer_header_bytes = 0u;
   if (wire_protocol == switchboardHostToBE16(ETH_P_IPV6))
   {
-    return switchboardPacketBudgetEthernetHeaderBytes() + switchboardPacketBudgetPrivateOverlayIPv6AddedBytes() + switchboardPacketBudgetIPv6HeaderBytes();
+    outer_header_bytes = switchboardPacketBudgetPrivateOverlayIPv6AddedBytes();
   }
-
-  if (wire_protocol == switchboardHostToBE16(ETH_P_IP))
+  else if (wire_protocol == switchboardHostToBE16(ETH_P_IP))
   {
-    return switchboardPacketBudgetEthernetHeaderBytes() + switchboardPacketBudgetPrivateOverlayIPv4AddedBytes() + switchboardPacketBudgetIPv6HeaderBytes();
+    outer_header_bytes = switchboardPacketBudgetPrivateOverlayIPv4AddedBytes();
   }
 
-  return 0u;
+  __u32 inner_header_bytes = 0u;
+  if (inner_protocol == SWITCHBOARD_IP_PROTOCOL_IPV6)
+  {
+    inner_header_bytes = switchboardPacketBudgetIPv6HeaderBytes();
+  }
+  else if (inner_protocol == SWITCHBOARD_IP_PROTOCOL_IPIP)
+  {
+    inner_header_bytes = switchboardPacketBudgetIPv4HeaderBytes();
+  }
+
+  if (outer_header_bytes == 0u || inner_header_bytes == 0u)
+  {
+    return 0u;
+  }
+
+  return switchboardPacketBudgetEthernetHeaderBytes() + outer_header_bytes + inner_header_bytes + switchboardPacketBudgetTransportHeaderBytes(transport_protocol);
 }
 
 static inline __be16 switchboardHostIngressEffectiveProtocol(__be16 wire_protocol, __be16 skb_protocol, bool decapped)

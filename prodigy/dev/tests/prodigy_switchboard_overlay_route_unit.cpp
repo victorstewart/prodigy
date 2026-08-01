@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <netinet/udp.h>
 
 class TestSuite {
 public:
@@ -207,14 +208,22 @@ int main(void)
   suite.expect(switchboardPacketBudgetPrivateOverlayIPv4AddedBytes() == switchboardPacketBudgetIPv4HeaderBytes(), "switchboard_packet_budget_private_overlay_ipv4_adds_outer_ipv4_header");
   suite.expect(switchboardPacketBudgetPrivateOverlayIPv6AddedBytes() == switchboardPacketBudgetIPv6HeaderBytes(), "switchboard_packet_budget_private_overlay_ipv6_adds_outer_ipv6_header");
   suite.expect(switchboardPacketBudgetContainerInternetEgressAddedBytes() == 0u, "switchboard_packet_budget_container_internet_egress_adds_no_bytes");
-  suite.expect(switchboardPacketBudgetMinTransportHeaderBytes() == 20u, "switchboard_packet_budget_min_transport_header_bytes_covers_base_tcp_header");
+  suite.expect(switchboardPacketBudgetTransportHeaderBytes(IPPROTO_TCP) == sizeof(struct tcphdr), "switchboard_packet_budget_tcp_header_bytes");
+  suite.expect(switchboardPacketBudgetTransportHeaderBytes(IPPROTO_UDP) == sizeof(struct udphdr), "switchboard_packet_budget_udp_header_bytes");
+  suite.expect(switchboardPacketBudgetTransportHeaderBytes(IPPROTO_ICMP) == 0u, "switchboard_packet_budget_unsupported_transport_adds_no_bytes");
   suite.expect(switchboardNetkitIngressL3Offset(true) == (__u32)sizeof(struct ethhdr), "switchboard_netkit_ingress_l3_offset_preserves_host_ethernet_placeholder");
   suite.expect(switchboardNetkitIngressL3Offset(false) == 0u, "switchboard_netkit_ingress_l3_offset_is_zero_without_host_ethernet");
-  suite.expect(switchboardHostIngressOverlayMinimumLinearBytes(htons(ETH_P_IPV6)) == switchboardPacketBudgetEthernetHeaderBytes() + switchboardPacketBudgetPrivateOverlayIPv6AddedBytes() + switchboardPacketBudgetIPv6HeaderBytes(), "switchboard_host_ingress_overlay_pull_bytes_ipv6_cover_decapped_inner_l3");
-  suite.expect(switchboardHostIngressOverlayMinimumLinearBytes(htons(ETH_P_IP)) == switchboardPacketBudgetEthernetHeaderBytes() + switchboardPacketBudgetPrivateOverlayIPv4AddedBytes() + switchboardPacketBudgetIPv6HeaderBytes(), "switchboard_host_ingress_overlay_pull_bytes_ipv4_cover_decapped_inner_l3");
-  suite.expect(switchboardHostIngressOverlayMinimumLinearBytes(htons(ETH_P_IPV6)) == 94u, "switchboard_host_ingress_overlay_pull_bytes_ipv6_matches_inner_l3_budget");
-  suite.expect(switchboardHostIngressOverlayMinimumLinearBytes(htons(ETH_P_IP)) == 74u, "switchboard_host_ingress_overlay_pull_bytes_ipv4_matches_inner_l3_budget");
-  suite.expect(switchboardHostIngressOverlayMinimumLinearBytes(0) == 0u, "switchboard_host_ingress_overlay_pull_bytes_ignore_non_ip");
+  suite.expect(switchboardHostIngressOverlayMinimumLinearBytes(htons(ETH_P_IP), IPPROTO_IPIP, IPPROTO_TCP) == 74u, "switchboard_host_ingress_overlay_ipv4_in_ipv4_tcp_minimum_frame");
+  suite.expect(switchboardHostIngressOverlayMinimumLinearBytes(htons(ETH_P_IP), IPPROTO_IPIP, IPPROTO_UDP) == 62u, "switchboard_host_ingress_overlay_ipv4_in_ipv4_udp_minimum_frame");
+  suite.expect(switchboardHostIngressOverlayMinimumLinearBytes(htons(ETH_P_IP), IPPROTO_IPV6, IPPROTO_TCP) == 94u, "switchboard_host_ingress_overlay_ipv6_in_ipv4_tcp_minimum_frame");
+  suite.expect(switchboardHostIngressOverlayMinimumLinearBytes(htons(ETH_P_IP), IPPROTO_IPV6, IPPROTO_UDP) == 82u, "switchboard_host_ingress_overlay_ipv6_in_ipv4_udp_minimum_frame");
+  suite.expect(switchboardHostIngressOverlayMinimumLinearBytes(htons(ETH_P_IPV6), IPPROTO_IPIP, IPPROTO_TCP) == 94u, "switchboard_host_ingress_overlay_ipv4_in_ipv6_tcp_minimum_frame");
+  suite.expect(switchboardHostIngressOverlayMinimumLinearBytes(htons(ETH_P_IPV6), IPPROTO_IPIP, IPPROTO_UDP) == 82u, "switchboard_host_ingress_overlay_ipv4_in_ipv6_udp_minimum_frame");
+  suite.expect(switchboardHostIngressOverlayMinimumLinearBytes(htons(ETH_P_IPV6), IPPROTO_IPV6, IPPROTO_TCP) == 114u, "switchboard_host_ingress_overlay_ipv6_in_ipv6_tcp_minimum_frame");
+  suite.expect(switchboardHostIngressOverlayMinimumLinearBytes(htons(ETH_P_IPV6), IPPROTO_IPV6, IPPROTO_UDP) == 102u, "switchboard_host_ingress_overlay_ipv6_in_ipv6_udp_minimum_frame");
+  suite.expect(switchboardHostIngressOverlayMinimumLinearBytes(htons(ETH_P_IPV6), IPPROTO_IPV6, IPPROTO_ICMPV6) == 94u, "switchboard_host_ingress_overlay_non_transport_frame_keeps_exact_l3_budget");
+  suite.expect(switchboardHostIngressOverlayMinimumLinearBytes(0, IPPROTO_IPV6, IPPROTO_TCP) == 0u, "switchboard_host_ingress_overlay_rejects_non_ip_outer_frame");
+  suite.expect(switchboardHostIngressOverlayMinimumLinearBytes(htons(ETH_P_IPV6), IPPROTO_TCP, IPPROTO_TCP) == 0u, "switchboard_host_ingress_overlay_rejects_non_ip_inner_frame");
   suite.expect(switchboardHostIngressEffectiveProtocol(htons(ETH_P_IP), htons(ETH_P_IPV6), false) == (__be16)htons(ETH_P_IP), "switchboard_host_ingress_protocol_keeps_wire_ethertype_without_decap");
   suite.expect(switchboardHostIngressEffectiveProtocol(htons(ETH_P_IP), htons(ETH_P_IPV6), true) == (__be16)htons(ETH_P_IPV6), "switchboard_host_ingress_protocol_uses_inner_ipv6_after_ipv4_decap");
   suite.expect(switchboardHostIngressEffectiveProtocol(htons(ETH_P_IPV6), htons(ETH_P_IP), true) == (__be16)htons(ETH_P_IP), "switchboard_host_ingress_protocol_uses_inner_ipv4_after_ipv6_decap");
