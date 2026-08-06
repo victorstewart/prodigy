@@ -1023,6 +1023,8 @@ add_dependencies(prodigy_container_overlay_sync_unit
    host_ingress_router)
 
 add_dependencies(prodigy_switchboard_whitehole_unit
+   balancer_router
+   container_egress_router
    container_ingress_router
    container_ingress_wormhole_full_router
    host_ingress_router
@@ -1753,9 +1755,9 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    )
    add_test(
       NAME prodigy_switchboard_whitehole_unit
-      COMMAND ${CMAKE_BINARY_DIR}/prodigy_switchboard_whitehole_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_switchboard_whitehole_isolated_unit.sh ${CMAKE_BINARY_DIR}/prodigy_switchboard_whitehole_unit
    )
-   set_tests_properties(prodigy_switchboard_whitehole_unit PROPERTIES SKIP_RETURN_CODE 77)
+   set_tests_properties(prodigy_switchboard_whitehole_unit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
    add_test(
       NAME prodigy_host_egress_bpf_load_smoke
       COMMAND
