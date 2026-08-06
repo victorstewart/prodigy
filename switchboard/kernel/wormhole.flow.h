@@ -537,22 +537,22 @@ __attribute__((noinline)) static bool switchboardClassifyWormholeIngressIPv4(str
                                                acknowledgedSequence);
   }
 
-  bool claimed = switchboardClaimWormholeFlow(&reply,
-                                              configured,
-                                              container,
-                                              SWITCHBOARD_WORMHOLE_FLOW_PRIVATE,
-                                              iph->protocol);
-  if (claimed && iph->protocol == IPPROTO_TCP && acknowledgesSyn)
+  if (iph->protocol == IPPROTO_TCP && acknowledgesSyn)
   {
-    int promotion = switchboardPromoteTCPWormholeFlow(&reply,
-                                                      configured,
-                                                      container,
-                                                      SWITCHBOARD_WORMHOLE_FLOW_PRIVATE,
-                                                      acknowledgedSequence,
-                                                      closing || reset);
-    return promotion == SWITCHBOARD_WORMHOLE_PROMOTION_ESTABLISHED;
+    return switchboardAuthorizeWormholeIngress(&reply,
+                                               configured,
+                                               container,
+                                               SWITCHBOARD_WORMHOLE_FLOW_PRIVATE,
+                                               iph->protocol,
+                                               closing || reset,
+                                               acknowledgesSyn,
+                                               acknowledgedSequence);
   }
-  return claimed;
+  return switchboardClaimWormholeFlow(&reply,
+                                      configured,
+                                      container,
+                                      SWITCHBOARD_WORMHOLE_FLOW_PRIVATE,
+                                      iph->protocol);
 }
 
 __attribute__((noinline)) static bool switchboardClassifyWormholeIngressIPv6(struct ipv6hdr *ip6h,
@@ -632,22 +632,22 @@ __attribute__((noinline)) static bool switchboardClassifyWormholeIngressIPv6(str
                                                acknowledgedSequence);
   }
 
-  bool claimed = switchboardClaimWormholeFlow(&reply,
-                                              configured,
-                                              container,
-                                              SWITCHBOARD_WORMHOLE_FLOW_PRIVATE,
-                                              ip6h->nexthdr);
-  if (claimed && ip6h->nexthdr == IPPROTO_TCP && acknowledgesSyn)
+  if (ip6h->nexthdr == IPPROTO_TCP && acknowledgesSyn)
   {
-    int promotion = switchboardPromoteTCPWormholeFlow(&reply,
-                                                      configured,
-                                                      container,
-                                                      SWITCHBOARD_WORMHOLE_FLOW_PRIVATE,
-                                                      acknowledgedSequence,
-                                                      closing || reset);
-    return promotion == SWITCHBOARD_WORMHOLE_PROMOTION_ESTABLISHED;
+    return switchboardAuthorizeWormholeIngress(&reply,
+                                               configured,
+                                               container,
+                                               SWITCHBOARD_WORMHOLE_FLOW_PRIVATE,
+                                               ip6h->nexthdr,
+                                               closing || reset,
+                                               acknowledgesSyn,
+                                               acknowledgedSequence);
   }
-  return claimed;
+  return switchboardClaimWormholeFlow(&reply,
+                                      configured,
+                                      container,
+                                      SWITCHBOARD_WORMHOLE_FLOW_PRIVATE,
+                                      ip6h->nexthdr);
 }
 
 __attribute__((__always_inline__)) static inline int switchboardResolveWormholeReplyOwnership(struct switchboard_wormhole_flow *established,

@@ -1922,6 +1922,52 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
                   mixedFamilyReverse.phase == SWITCHBOARD_WORMHOLE_FLOW_REVERSE_SEEN,
               "private_ipv6_syn_ack_advances_exact_owner");
 
+  std::vector<uint8_t> mixedFamilyAck = makeIPv6L4EthernetFrame(peer, server, IPPROTO_TCP, 49'156, 8444);
+  struct ipv6hdr *mixedFamilyAckIPv6 = reinterpret_cast<struct ipv6hdr *>(mixedFamilyAck.data() + sizeof(struct ethhdr));
+  struct tcphdr *mixedFamilyAckTCP = reinterpret_cast<struct tcphdr *>(mixedFamilyAckIPv6 + 1);
+  mixedFamilyAckTCP->syn = 0;
+  mixedFamilyAckTCP->ack = 1;
+  mixedFamilyAckTCP->ack_seq = htonl(2);
+  mixedFamilyAckTCP->check = 0;
+  mixedFamilyAckTCP->check = checksumIPv6Transport(mixedFamilyAckIPv6->saddr.s6_addr,
+                                                  mixedFamilyAckIPv6->daddr.s6_addr,
+                                                  IPPROTO_TCP,
+                                                  mixedFamilyAckTCP,
+                                                  sizeof(*mixedFamilyAckTCP));
+  expectNamed(runNetkit(ingress, mixedFamilyAck, 0, packetOutput) == NETKIT_DROP &&
+                  lookupProgramMapElement(host, "wh_flows"_ctv, mixedFamilyOwnerKey, mixedFamilyReverse) == false,
+              "private_ipv6_wrong_ack_cannot_promote_owner");
+
+  mixedFamilyAckTCP->ack_seq = htonl(1);
+  mixedFamilyAckTCP->check = 0;
+  mixedFamilyAckTCP->check = checksumIPv6Transport(mixedFamilyAckIPv6->saddr.s6_addr,
+                                                  mixedFamilyAckIPv6->daddr.s6_addr,
+                                                  IPPROTO_TCP,
+                                                  mixedFamilyAckTCP,
+                                                  sizeof(*mixedFamilyAckTCP));
+  expectNamed(runNetkit(ingress, mixedFamilyAck, 0, packetOutput) == NETKIT_PASS,
+              "private_ipv6_correct_ack_promotes_owner");
+  switchboard_wormhole_flow mixedFamilyEstablished = {};
+  expectNamed(lookupProgramMapElement(host, "wh_flows"_ctv, mixedFamilyOwnerKey, mixedFamilyEstablished) &&
+                  mixedFamilyEstablished.phase == SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED &&
+                  lookupProgramMapElement(host, "wh_pending"_ctv, mixedFamilyOwnerKey, mixedFamilyReverse) == false,
+              "private_ipv6_ack_moves_owner_to_established_map");
+
+  std::vector<uint8_t> mixedFamilyPayload = makeIPv6L4EthernetFrame(peer, server, IPPROTO_TCP, 49'156, 8444, 1551);
+  struct ipv6hdr *mixedFamilyPayloadIPv6 = reinterpret_cast<struct ipv6hdr *>(mixedFamilyPayload.data() + sizeof(struct ethhdr));
+  struct tcphdr *mixedFamilyPayloadTCP = reinterpret_cast<struct tcphdr *>(mixedFamilyPayloadIPv6 + 1);
+  mixedFamilyPayloadTCP->syn = 0;
+  mixedFamilyPayloadTCP->ack = 1;
+  mixedFamilyPayloadTCP->ack_seq = htonl(1);
+  mixedFamilyPayloadTCP->check = 0;
+  mixedFamilyPayloadTCP->check = checksumIPv6Transport(mixedFamilyPayloadIPv6->saddr.s6_addr,
+                                                      mixedFamilyPayloadIPv6->daddr.s6_addr,
+                                                      IPPROTO_TCP,
+                                                      mixedFamilyPayloadTCP,
+                                                      sizeof(*mixedFamilyPayloadTCP) + 1551);
+  expectNamed(runNetkit(ingress, mixedFamilyPayload, 0, packetOutput) == NETKIT_PASS,
+              "private_ipv6_established_ack_payload_is_admitted");
+
   clearWormholeFlows();
   switchboard_wormhole_flow invalidMixedFamilyPublic = {};
   invalidMixedFamilyPublic.binding = mixedFamilyBinding;
@@ -2269,6 +2315,65 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
   expectNamed(runNetkit(ingress, privateIngress4, 0, packetOutput) == NETKIT_PASS &&
                   runHost(publicOverlay4, hostOutput) == TC_ACT_SHOT,
               "ipv4_private_first_rejects_aliasing_public_flow");
+
+  switchboard_wormhole_egress4_key tcpExposure4 = exposure4;
+  tcpExposure4.port = htons(8444);
+  tcpExposure4.proto = IPPROTO_TCP;
+  switchboard_wormhole_egress_binding tcpBinding4 = binding4;
+  tcpBinding4.port = htons(444);
+  tcpBinding4.proto = IPPROTO_TCP;
+  tcpBinding4.owner_generation = 45;
+  expectNamed(updateProgramMapElement(host, "wh_egress4"_ctv, tcpExposure4, tcpBinding4) &&
+                  updateProgramMapElement(ingress, "wh_egress4"_ctv, tcpExposure4, tcpBinding4) &&
+                  updateProgramMapElement(egress, "wh_egress4"_ctv, tcpExposure4, tcpBinding4),
+              "installs_ipv4_tcp_shared_exposure_binding");
+
+  std::vector<uint8_t> privateTCP4 = makeIPv4L4EthernetFrame(client4, external4, IPPROTO_TCP, 49'157, 8444);
+  std::vector<uint8_t> privateTCPReply4 = makeIPv4L4EthernetFrame(external4, client4, IPPROTO_TCP, 8444, 49'157);
+  struct tcphdr *privateTCPReplyHeader4 = reinterpret_cast<struct tcphdr *>(privateTCPReply4.data() + sizeof(struct ethhdr) + sizeof(struct iphdr));
+  privateTCPReplyHeader4->ack = 1;
+  privateTCPReplyHeader4->ack_seq = htonl(1);
+  flow_key privateTCPReplyKey4 = {};
+  privateTCPReplyKey4.src = external4.s_addr;
+  privateTCPReplyKey4.dst = client4.s_addr;
+  privateTCPReplyKey4.port16[0] = htons(8444);
+  privateTCPReplyKey4.port16[1] = htons(49'157);
+  privateTCPReplyKey4.proto = IPPROTO_TCP;
+  switchboard_wormhole_flow_key privateTCPOwnerKey4 =
+      switchboardWormholeFlowMapKey(&privateTCPReplyKey4, tcpBinding4.owner_generation);
+
+  clearWormholeFlows();
+  expectNamed(runNetkit(ingress, privateTCP4, 0, packetOutput) == NETKIT_PASS,
+              "private_ipv4_syn_is_admitted");
+  switchboard_wormhole_flow privateTCPPending4 = {};
+  expectNamed(lookupProgramMapElement(host, "wh_pending"_ctv, privateTCPOwnerKey4, privateTCPPending4) &&
+                  privateTCPPending4.phase == SWITCHBOARD_WORMHOLE_FLOW_PENDING &&
+                  runNetkit(egress, privateTCPReply4, 0, packetOutput) == NETKIT_PASS,
+              "private_ipv4_syn_ack_advances_owner");
+
+  std::vector<uint8_t> privateTCPAck4 = makeIPv4L4EthernetFrame(client4, external4, IPPROTO_TCP, 49'157, 8444);
+  struct tcphdr *privateTCPAckHeader4 = reinterpret_cast<struct tcphdr *>(privateTCPAck4.data() + sizeof(struct ethhdr) + sizeof(struct iphdr));
+  privateTCPAckHeader4->syn = 0;
+  privateTCPAckHeader4->ack = 1;
+  privateTCPAckHeader4->ack_seq = htonl(2);
+  expectNamed(runNetkit(ingress, privateTCPAck4, 0, packetOutput) == NETKIT_DROP,
+              "private_ipv4_wrong_ack_cannot_promote_owner");
+  privateTCPAckHeader4->ack_seq = htonl(1);
+  expectNamed(runNetkit(ingress, privateTCPAck4, 0, packetOutput) == NETKIT_PASS,
+              "private_ipv4_correct_ack_promotes_owner");
+  switchboard_wormhole_flow privateTCPEstablished4 = {};
+  expectNamed(lookupProgramMapElement(host, "wh_flows"_ctv, privateTCPOwnerKey4, privateTCPEstablished4) &&
+                  privateTCPEstablished4.phase == SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED &&
+                  lookupProgramMapElement(host, "wh_pending"_ctv, privateTCPOwnerKey4, privateTCPPending4) == false,
+              "private_ipv4_ack_moves_owner_to_established_map");
+
+  std::vector<uint8_t> privateTCPPayload4 = makeIPv4L4EthernetFrame(client4, external4, IPPROTO_TCP, 49'157, 8444, 1551);
+  struct tcphdr *privateTCPPayloadHeader4 = reinterpret_cast<struct tcphdr *>(privateTCPPayload4.data() + sizeof(struct ethhdr) + sizeof(struct iphdr));
+  privateTCPPayloadHeader4->syn = 0;
+  privateTCPPayloadHeader4->ack = 1;
+  privateTCPPayloadHeader4->ack_seq = htonl(1);
+  expectNamed(runNetkit(ingress, privateTCPPayload4, 0, packetOutput) == NETKIT_PASS,
+              "private_ipv4_established_ack_payload_is_admitted");
 
   clearWormholeFlows();
   expectNamed(runHost(publicOverlay4, hostOutput) == TC_ACT_REDIRECT &&
