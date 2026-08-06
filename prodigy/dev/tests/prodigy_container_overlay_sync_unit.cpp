@@ -1059,8 +1059,8 @@ static void testContainerPeerEgressRouterEnforcesSystemAllowlist(TestSuite& suit
 
     suite.expect(runFrame(makeIPv4L4FrameWithPayload("198.51.100.10", "93.184.216.34", IPPROTO_UDP, 49'152, 443, payload),
                           "container_peer_egress_router_system_allowlist_ipv4_allowed_runs",
-                          nullptr) == TC_ACT_REDIRECT,
-                 "container_peer_egress_router_system_allowlist_ipv4_allowed_redirects");
+                          nullptr) == NETKIT_PASS,
+                 "container_peer_egress_router_system_allowlist_ipv4_allowed_passes_to_host");
     suite.expect(runFrame(makeIPv4L4FrameWithPayload("198.51.100.10", "93.184.216.34", IPPROTO_UDP, 49'152, 53, payload),
                           "container_peer_egress_router_system_allowlist_dns_denied_runs",
                           nullptr) == NETKIT_DROP,
@@ -1073,6 +1073,90 @@ static void testContainerPeerEgressRouterEnforcesSystemAllowlist(TestSuite& suit
                           "container_peer_egress_router_system_allowlist_ipv6_runs",
                           nullptr) == NETKIT_DROP,
                  "container_peer_egress_router_system_allowlist_ipv6_drops");
+  }
+
+  peerProgram.close();
+}
+
+static void testContainerPeerEgressRouterPassesRemoteOverlayThroughHost(TestSuite& suite)
+{
+  String objectPath = {};
+  objectPath.assign(PRODIGY_TEST_BINARY_DIR);
+  objectPath.append("/container.egress.router.ebpf.o"_ctv);
+
+  BPFProgram peerProgram = {};
+  suite.expect(peerProgram.load(objectPath, "ct_egress"_ctv),
+               "container_peer_egress_router_remote_overlay_loads_program");
+
+  if (peerProgram.prog_fd >= 0)
+  {
+    container_network_policy networkPolicy = {};
+    networkPolicy.mode = CONTAINER_NETWORK_UNRESTRICTED;
+    networkPolicy.interContainerMTU = 9000;
+    peerProgram.setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
+
+    local_container_subnet6 localSubnet = {};
+    localSubnet.dpfx = 0x01;
+    localSubnet.mpfx[0] = 0xf4;
+    localSubnet.mpfx[1] = 0x54;
+    localSubnet.mpfx[2] = 0xa6;
+    peerProgram.setArrayElement("lc_subnet"_ctv, 0, localSubnet);
+
+    switchboard_overlay_config overlayConfig = {};
+    overlayConfig.container_network_enabled = 1;
+    peerProgram.setArrayElement("ovl_config"_ctv, 0, overlayConfig);
+
+    switchboard_overlay_machine_route route = {};
+    route.family = SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6;
+    route.use_gateway_mac = 1;
+    parseIPv6Bytes("fd00:10::a", route.source6);
+    parseIPv6Bytes("fd00:10::b", route.next_hop6);
+    switchboard_overlay_machine_route_key routeKey = switchboardMakeOverlayMachineRouteKey(0xe1607cu);
+    suite.expect(updateProgramMapElement(peerProgram, "ovl_mach_full"_ctv, routeKey, route),
+                 "container_peer_egress_router_remote_overlay_sets_route");
+
+    mac localMAC = {};
+    localMAC.mac[5] = 0x0a;
+    peerProgram.setArrayElement("mac_map"_ctv, 0, localMAC);
+
+    mac gatewayMAC = {};
+    gatewayMAC.mac[5] = 0x01;
+    peerProgram.setArrayElement("gw_mac_map"_ctv, 0, gatewayMAC);
+
+    Vector<uint8_t> frame = makeIPv6UDPFrame(
+        "fdf8:d94c:7c33:e26e:ca4b:f501:f454:a6ee",
+        "fdf8:d94c:7c33:e26e:ca4b:f501:e160:7c7b",
+        8443,
+        47'156,
+        true);
+    Vector<uint8_t> output = {};
+    output.resize(frame.size() + sizeof(struct ipv6hdr) + 64u);
+    LIBBPF_OPTS(bpf_test_run_opts, opts,
+                .data_in = frame.data(),
+                .data_out = output.data(),
+                .data_size_in = static_cast<__u32>(frame.size()),
+                .data_size_out = static_cast<__u32>(output.size()),
+                .repeat = 1, );
+
+    int runResult = bpf_prog_test_run_opts(peerProgram.prog_fd, &opts);
+    suite.expect(runResult == 0, "container_peer_egress_router_remote_overlay_test_run_succeeds");
+    suite.expect(opts.retval == NETKIT_PASS,
+                 "container_peer_egress_router_remote_overlay_passes_to_host");
+    suite.expect(opts.data_size_out == frame.size() + sizeof(struct ipv6hdr),
+                 "container_peer_egress_router_remote_overlay_adds_outer_ipv6_header");
+
+    if (runResult == 0 && opts.data_size_out >= sizeof(struct ethhdr) + sizeof(struct ipv6hdr))
+    {
+      uint8_t expectedSource[16] = {};
+      uint8_t expectedDestination[16] = {};
+      parseIPv6Bytes("fd00:10::a", expectedSource);
+      parseIPv6Bytes("fd00:10::b", expectedDestination);
+      const struct ipv6hdr *outer6 = reinterpret_cast<const struct ipv6hdr *>(output.data() + sizeof(struct ethhdr));
+      suite.expect(outer6->nexthdr == IPPROTO_IPV6 &&
+                       std::memcmp(outer6->saddr.s6_addr, expectedSource, sizeof(expectedSource)) == 0 &&
+                       std::memcmp(outer6->daddr.s6_addr, expectedDestination, sizeof(expectedDestination)) == 0,
+                   "container_peer_egress_router_remote_overlay_preserves_outer_route");
+    }
   }
 
   peerProgram.close();
@@ -1293,8 +1377,8 @@ static void testContainerPeerEgressRouterRewritesCrossMachineWormholeReplyForOve
 
     int runResult = bpf_prog_test_run_opts(peerProgram.prog_fd, &opts);
     suite.expect(runResult == 0, "container_peer_egress_router_cross_machine_wormhole_reply_test_run_succeeds");
-    suite.expect(opts.retval == TC_ACT_REDIRECT,
-                 "container_peer_egress_router_cross_machine_wormhole_reply_redirects_to_nic");
+    suite.expect(opts.retval == NETKIT_PASS,
+                 "container_peer_egress_router_cross_machine_wormhole_reply_passes_to_host");
     suite.expect(opts.data_size_out == frame.size() + sizeof(struct ipv6hdr),
                  "container_peer_egress_router_cross_machine_wormhole_reply_adds_outer_ipv6_header");
 
@@ -1488,7 +1572,7 @@ static void testContainerPeerEgressRouterEncapsulatesHostedIngress(TestSuite& su
 
     int runResult = bpf_prog_test_run_opts(peerProgram.prog_fd, &opts);
     expectNamed(runResult == 0, "test_run_succeeds");
-    expectNamed(opts.retval == TC_ACT_REDIRECT, "redirects_to_nic");
+    expectNamed(opts.retval == NETKIT_PASS, "passes_to_host");
     expectNamed(opts.data_size_out == frame.size() + sizeof(struct ipv6hdr), "adds_outer_ipv6_header");
 
     const size_t innerHeaderSize = ipv6 ? sizeof(struct ipv6hdr) : sizeof(struct iphdr);
@@ -1689,7 +1773,7 @@ static void testContainerPeerEgressRouterRewritesIPv4WormholeSource(TestSuite& s
 
   int runResult = bpf_prog_test_run_opts(peerProgram.prog_fd, &opts);
   expectNamed(runResult == 0, "test_run_succeeds");
-  expectNamed(opts.retval == TC_ACT_REDIRECT, "redirects_to_nic");
+  expectNamed(opts.retval == NETKIT_PASS, "passes_to_host");
   expectNamed(opts.data_size_out == frame.size(), "keeps_packet_size");
 
   if (runResult == 0 && opts.data_size_out >= sizeof(struct ethhdr) + sizeof(struct iphdr))
@@ -1860,7 +1944,7 @@ static void testContainerPeerEgressRouterRoutesIPv6QuicHighSlotPortal(TestSuite&
 
   int runResult = bpf_prog_test_run_opts(peerProgram.prog_fd, &opts);
   expectNamed(runResult == 0, "test_run_succeeds");
-  expectNamed(opts.retval == TC_ACT_REDIRECT, "redirects_to_nic");
+  expectNamed(opts.retval == NETKIT_PASS, "passes_to_host");
   expectNamed(opts.data_size_out == frame.size() + sizeof(struct ipv6hdr) + sizeof(struct switchboard_wormhole_overlay_header), "adds_outer_ipv6_and_provenance_headers");
 
   if (runResult == 0 && opts.data_size_out >= (sizeof(struct ethhdr) + (2u * sizeof(struct ipv6hdr)) + sizeof(struct switchboard_wormhole_overlay_header) + sizeof(struct udphdr) + sizeof(struct quic_long_header)))
@@ -1940,6 +2024,7 @@ int main(void)
   testContainerPeerEgressRouterLoadsAfterWormholeSourceRewrite(suite);
   testContainerPeerEgressRouterDropsPacketsOverConfiguredMTU(suite);
   testContainerPeerEgressRouterEnforcesSystemAllowlist(suite);
+  testContainerPeerEgressRouterPassesRemoteOverlayThroughHost(suite);
   testWormholeEgressBindingReconcilePreservesDesiredKeysDuringStaleRemoval(suite);
   testWormholeRewriteLayoutResolvesEthernetAndL3Frames(suite);
   testContainerPeerEgressRouterRewritesCrossMachineWormholeReplyForOverlay(suite);

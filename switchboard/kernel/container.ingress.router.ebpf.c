@@ -89,10 +89,8 @@ int ct_ingress(struct __sk_buff *skb)
   }
 
   bool publicWormholeIngress = skb->mark == SWITCHBOARD_WORMHOLE_SKB_MARK;
-  if (publicWormholeIngress)
-  {
-    skb->mark = 0;
-  }
+  skb->mark = 0;
+  skb->priority = 0;
   if (protocol == BE_ETH_P_IPV6)
   {
     struct ipv6hdr *ip6h = (struct ipv6hdr *)l3_data;

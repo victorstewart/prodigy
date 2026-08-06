@@ -1983,7 +1983,7 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
   expectNamed(lookupProgramMapElement(host, "wh_pending"_ctv, tcpOwnerKey, retransmittedTCP) &&
                   retransmittedTCP.expiresAtNs == pendingTCP.expiresAtNs,
               "tcp_retransmit_cannot_extend_pending_deadline");
-  expectNamed(runNetkit(egress, tcpReply, 0, packetOutput) == TC_ACT_REDIRECT,
+  expectNamed(runNetkit(egress, tcpReply, 0, packetOutput) == NETKIT_PASS,
               "tcp_syn_ack_is_admitted");
   switchboard_wormhole_flow reverseSeenTCP = {};
   expectNamed(lookupProgramMapElement(host, "wh_pending"_ctv, tcpOwnerKey, reverseSeenTCP) &&
@@ -2095,8 +2095,8 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
               "identical_public_ingress_claims_tuple_only_after_gc");
   expectNamed(runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_PASS,
               "validates_relearned_public_owner_at_socket_boundary");
-  expectNamed(runNetkit(egress, reply, 0, packetOutput) == TC_ACT_REDIRECT,
-              "public_reply_redirects_after_exact_owner_lookup");
+  expectNamed(runNetkit(egress, reply, 0, packetOutput) == NETKIT_PASS,
+              "public_reply_passes_to_host_after_exact_owner_lookup");
   if (packetOutput.size() >= sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + sizeof(struct udphdr))
   {
     const struct ipv6hdr *rewritten6 = reinterpret_cast<const struct ipv6hdr *>(packetOutput.data() + sizeof(struct ethhdr));
@@ -2280,7 +2280,7 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
               "ipv4_second_replica_cannot_consume_first_replica_owner");
   policy.containerFragment = selected[4];
   egress.setArrayElement("ct_net_policy"_ctv, 0, policy);
-  expectNamed(runNetkit(egress, reply4, 0, packetOutput) == TC_ACT_REDIRECT,
+  expectNamed(runNetkit(egress, reply4, 0, packetOutput) == NETKIT_PASS,
               "ipv4_public_reply_uses_exact_reverse_owner");
   if (packetOutput.size() >= sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr))
   {

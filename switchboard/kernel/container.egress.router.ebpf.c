@@ -46,6 +46,7 @@ int ct_egress(struct __sk_buff *skb)
   // external source tuple at this per-container hook, where the exact owner
   // identity is available, before any host-wide routing step.
   skb->mark = 0;
+  skb->priority = 0;
   int wormholeReply = SWITCHBOARD_WORMHOLE_REPLY_NONE;
   if (protocol == BE_ETH_P_IP)
   {
@@ -97,7 +98,7 @@ int ct_egress(struct __sk_buff *skb)
       {
         return NETKIT_DROP;
       }
-      goto redirect_to_nic;
+      goto forward_to_host;
     }
     return NETKIT_DROP;
   }
@@ -111,7 +112,7 @@ int ct_egress(struct __sk_buff *skb)
       {
         return NETKIT_DROP;
       }
-      goto redirect_to_nic;
+      goto forward_to_host;
     }
     if (protocol == BE_ETH_P_IPV6)
     {
@@ -122,7 +123,7 @@ int ct_egress(struct __sk_buff *skb)
       }
       if (containerWhiteholePublicEgressIPv6(ip6h, data_end))
       {
-        goto redirect_to_nic;
+        goto forward_to_host;
       }
       if (containerDeclaredInternalEgressIPv6(ip6h, data_end) == false)
       {
@@ -187,7 +188,7 @@ int ct_egress(struct __sk_buff *skb)
     }
     else
     {
-      goto redirect_to_nic;
+      goto forward_to_host;
     }
 
     struct container_id containerID = {};
@@ -238,20 +239,11 @@ int ct_egress(struct __sk_buff *skb)
       {
         return NETKIT_DROP;
       }
-
-      __u32 *nic = bpf_map_lookup_elem(&ct_dev_map, &zeroidx);
-      return nic != NULL ? bpf_redirect(*nic, 0) : NETKIT_DROP;
+      return NETKIT_PASS;
     }
   }
 
-redirect_to_nic: ;
-  __u32 zeroidx = 0;
-  __u32 *nic_idx = bpf_map_lookup_elem(&ct_dev_map, &zeroidx);
-  if (!nic_idx)
-  {
-    return NETKIT_DROP;
-  }
-
+forward_to_host: ;
   data_end = (void *)(long)skb->data_end;
   eth = (struct ethhdr *)(long)skb->data;
   if ((void *)(eth + 1) > data_end)
@@ -275,5 +267,9 @@ redirect_to_nic: ;
     return NETKIT_DROP;
   }
 
-  return bpf_redirect(*nic_idx, 0);
+  // L3 netkit packets carry only a synthetic Ethernet placeholder, so a
+  // direct bpf_redirect() to a MAC device is rejected by skb_do_redirect().
+  // PASS lets netkit remove that placeholder and gives the packet to the host
+  // stack, which routes it through the existing host-egress program.
+  return NETKIT_PASS;
 }
