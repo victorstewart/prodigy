@@ -760,14 +760,20 @@ static void testContainerPeerRuntimeSyncPopulatesAndClearsWormholeEgressBindings
   String primaryObjectPath = {};
   primaryObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
   primaryObjectPath.append("/container.ingress.router.ebpf.o"_ctv);
+  String hostIngressObjectPath = {};
+  hostIngressObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+  hostIngressObjectPath.append("/host.ingress.router.ebpf.o"_ctv);
 
   BPFProgram peerProgram = {};
   BPFProgram primaryProgram = {};
+  BPFProgram hostIngressProgram = {};
   bool peerLoaded = suite.require(peerProgram.load(objectPath, "ct_egress"_ctv),
                                   "container_peer_runtime_sync_loads_egress_router");
   bool primaryLoaded = suite.require(primaryProgram.load(primaryObjectPath, "ct_ingress"_ctv),
                                      "container_peer_runtime_sync_loads_ingress_router");
-  if (peerLoaded && primaryLoaded)
+  bool hostIngressLoaded = suite.require(hostIngressProgram.load(hostIngressObjectPath, "host_ingress"_ctv),
+                                         "container_peer_runtime_sync_loads_host_ingress_router");
+  if (peerLoaded && primaryLoaded && hostIngressLoaded)
   {
     SwitchboardWormholeEgressBindingEntry stale = {};
     stale.key = makeWormholeEgressKey(0xca, 0x01020305u, 9443, IPPROTO_UDP);
@@ -853,15 +859,41 @@ static void testContainerPeerRuntimeSyncPopulatesAndClearsWormholeEgressBindings
     suite.expect(lookupProgramMapElement(primaryProgram, "wh_egress4"_ctv, desired4.key, loadedBinding) &&
                      loadedBinding.addr4 == desired4.binding.addr4 && loadedBinding.port == desired4.binding.port,
                  "container_peer_runtime_sync_populates_ipv4_ingress_binding");
+    switchboardSyncWormholeEgressBindingsForProgram(&hostIngressProgram,
+                                                    desiredBindings,
+                                                    0,
+                                                    "unit-host-ingress-seed");
+    switchboardSyncWormholeEgress4BindingsForProgram(&hostIngressProgram,
+                                                     desiredBindings4,
+                                                     0,
+                                                     "unit-host-ingress-seed");
+    loadedBinding = {};
+    suite.expect(lookupProgramMapElement(hostIngressProgram, "wh_egress"_ctv, desired.key, loadedBinding) &&
+                     loadedBinding.is_ipv6 == desired.binding.is_ipv6 && loadedBinding.port == desired.binding.port,
+                 "container_peer_runtime_sync_seeds_ipv6_host_ingress_binding");
+    loadedBinding = {};
+    suite.expect(lookupProgramMapElement(hostIngressProgram, "wh_egress4"_ctv, desired4.key, loadedBinding) &&
+                     loadedBinding.addr4 == desired4.binding.addr4 && loadedBinding.port == desired4.binding.port,
+                 "container_peer_runtime_sync_seeds_ipv4_host_ingress_binding");
     desiredBindings4.clear();
     switchboardSyncWormholeEgress4BindingsForProgram(&primaryProgram,
                                                      desiredBindings4,
                                                      0,
                                                      "unit-container-ingress-clear");
+
+    EthDevice hostIngressEth = {};
+    Switchboard hostIngressSwitchboard(hostIngressEth);
+    hostIngressSwitchboard.setHostIngressRouter(&hostIngressProgram);
     suite.expect(lookupProgramMapElement(primaryProgram, "wh_egress4"_ctv, desired4.key, loadedBinding) == false,
                  "container_peer_runtime_sync_removes_ipv4_ingress_binding");
+    suite.expect(lookupProgramMapElement(hostIngressProgram, "wh_egress"_ctv, desired.key, loadedBinding) == false,
+                 "container_peer_runtime_sync_production_replay_removes_ipv6_host_ingress_binding");
+    suite.expect(lookupProgramMapElement(hostIngressProgram, "wh_egress4"_ctv, desired4.key, loadedBinding) == false,
+                 "container_peer_runtime_sync_production_replay_removes_ipv4_host_ingress_binding");
+    hostIngressSwitchboard.setHostIngressRouter(nullptr);
   }
 
+  hostIngressProgram.close();
   primaryProgram.close();
   peerProgram.close();
 }

@@ -2080,6 +2080,12 @@ private:
     }
 
     (void)syncPortalTargetBindingsForProgram(host_ingress, "host-ingress-sync");
+
+    Vector<SwitchboardWormholeEgressBindingEntry> desiredBindings = {};
+    Vector<SwitchboardWormholeEgress4BindingEntry> desiredBindings4 = {};
+    collectWormholeEgressBindingEntries(desiredBindings, desiredBindings4);
+    switchboardSyncWormholeEgressBindingsForProgram(host_ingress, desiredBindings, eth.ifidx, "host-ingress-sync");
+    switchboardSyncWormholeEgress4BindingsForProgram(host_ingress, desiredBindings4, eth.ifidx, "host-ingress-sync");
   }
 
   void syncAllPeerProgramRuntimeRouting(void)
