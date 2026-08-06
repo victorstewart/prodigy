@@ -57,6 +57,12 @@ case "$(uname -s)" in
          | unique
          | if length == 1 then .[0] else empty end
       ' <<< "${inspection}")" || fail "selected Apple Container has no unique default-network IPv4 address"
+      apple_route_mtu="$(jq -er '
+         [.[0].status.networks[] | select(.network == "default") | .mtu]
+         | unique
+         | if length == 1 and (.[0] | type) == "number" and (.[0] | floor) == .[0] and .[0] >= 576
+           then ([.[0], 1500] | min) else empty end
+      ' <<< "${inspection}")" || fail "selected Apple Container has no valid default-network MTU"
       apple_route_destination=198.18.0.0
       apple_route_mask=255.255.0.0
       apple_route_prefix=198.18.0.0/16
@@ -90,6 +96,17 @@ case "$(uname -s)" in
             | last as $mount
             | if $mount == null then empty else $mount.destination + $path[($mount.source | length):] end
          ' <<< "${inspection}"
+      }
+
+      route_metric_mtu()
+      {
+         awk '$1 == "recvpipe" {
+            for (column = 1; column <= NF; column += 1)
+               if ($column == "mtu" && getline > 0) {
+                  print $column
+                  exit
+               }
+         }'
       }
 
       command=()
@@ -163,27 +180,32 @@ case "$(uname -s)" in
       route_destination="$(awk '$1 == "destination:" { print $2; exit }' <<< "${route_state}")"
       route_mask="$(awk '$1 == "mask:" { print $2; exit }' <<< "${route_state}")"
       route_gateway="$(awk '$1 == "gateway:" { print $2; exit }' <<< "${route_state}")"
+      route_mtu="$(route_metric_mtu <<< "${route_state}")"
       if [[ "${route_destination}" == "${apple_route_destination}" && "${route_mask}" == "${apple_route_mask}" ]]
       then
          [[ "${route_gateway}" == "${apple_guest_ipv4}" ]] ||
             fail "${apple_route_prefix} already uses a different gateway: ${route_gateway:-unknown}"
+         [[ "${route_mtu}" == "${apple_route_mtu}" ]] ||
+            fail "${apple_route_prefix} already uses a different MTU: ${route_mtu:-unknown}"
       else
          [[ -z "${route_destination}" || "${route_destination}" == default ]] ||
             fail "${apple_route_probe} already uses a non-default route through ${route_gateway:-an unknown gateway}"
-         /usr/bin/sudo /sbin/route -n add -net "${apple_route_prefix}" "${apple_guest_ipv4}"
+         /usr/bin/sudo /sbin/route -n add -net "${apple_route_prefix}" "${apple_guest_ipv4}" -mtu "${apple_route_mtu}"
          apple_route_owned=1
          route_state="$(/sbin/route -n get "${apple_route_probe}")"
          route_destination="$(awk '$1 == "destination:" { print $2; exit }' <<< "${route_state}")"
          route_mask="$(awk '$1 == "mask:" { print $2; exit }' <<< "${route_state}")"
          route_gateway="$(awk '$1 == "gateway:" { print $2; exit }' <<< "${route_state}")"
+         route_mtu="$(route_metric_mtu <<< "${route_state}")"
          [[ "${route_destination}" == "${apple_route_destination}" &&
             "${route_mask}" == "${apple_route_mask}" &&
-            "${route_gateway}" == "${apple_guest_ipv4}" ]] || fail "failed to verify the Apple Container host route"
+            "${route_gateway}" == "${apple_guest_ipv4}" &&
+            "${route_mtu}" == "${apple_route_mtu}" ]] || fail "failed to verify the Apple Container host route"
       fi
       verify_no_more_specific_apple_routes
       if [[ "${launcher_mode}" == apple-route-owner ]]
       then
-         echo "APPLE_ROUTE_OWNER: guest=${container_name} gateway=${apple_guest_ipv4} prefix=${apple_route_prefix}"
+         echo "APPLE_ROUTE_OWNER: guest=${container_name} gateway=${apple_guest_ipv4} prefix=${apple_route_prefix} mtu=${apple_route_mtu}"
          while true
          do
             sleep 1

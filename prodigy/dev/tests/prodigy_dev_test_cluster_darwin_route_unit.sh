@@ -38,17 +38,20 @@ sed \
    "${source_launcher}" > "${subject}"
 
 jq -n '{name:"nametag-prodigy",labels:{"dev.prodigy.bpf-authorized":"guest-only"},environment:{PRODIGY_DEV_ALLOW_BPF_ATTACH:"1",PRODIGY_BPF_AUTHORIZATION:"guest-only"}}' > "${instance}"
-jq -n --arg source "${fixture_repo}" '[{configuration:{platform:{os:"linux"},capAdd:["ALL"],mounts:[{source:$source,destination:"/root/prodigy"}]},status:{networks:[{network:"default",ipv4Address:"192.168.64.4/24"}]}}]' > "${inspection}"
+jq -n --arg source "${fixture_repo}" '[{configuration:{platform:{os:"linux"},capAdd:["ALL"],mounts:[{source:$source,destination:"/root/prodigy"}]},status:{networks:[{network:"default",ipv4Address:"192.168.64.4/24",mtu:1280}]}}]' > "${inspection}"
 
 cat > "${mock_bin}/mock" <<'EOF'
 #!/usr/bin/env bash
 tool="${0##*/}"
 exact_route()
 {
+   local mtu="${1:-1280}"
    printf '%s\n' \
       'destination: 198.18.0.0' \
       '       mask: 255.255.0.0' \
-      '    gateway: 192.168.64.4'
+      '    gateway: 192.168.64.4' \
+      ' recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire' \
+      "        0         0         0         0         0         0     ${mtu}         0"
 }
 
 case "${tool}" in
@@ -98,12 +101,15 @@ case "${tool}" in
             elif [[ "${ROUTE_SCENARIO}" == exact-conflict ]]
             then
                printf '%s\n' 'destination: 198.18.0.0' '       mask: 255.255.0.0' '    gateway: 192.168.64.99'
+            elif [[ "${ROUTE_SCENARIO}" == exact-mtu-conflict ]]
+            then
+               exact_route 1500
             else
                printf '%s\n' 'destination: default' '    gateway: 192.168.64.1'
             fi
             ;;
          add)
-            [[ "$*" == "-n add -net 198.18.0.0/16 192.168.64.4" ]] || exit 65
+            [[ "$*" == "-n add -net 198.18.0.0/16 192.168.64.4 -mtu 1280" ]] || exit 65
             : > "${ROUTE_STATE_FILE}"
             ;;
          delete)
@@ -118,6 +124,7 @@ case "${tool}" in
       case "${ROUTE_SCENARIO}" in
          exact) echo "198.18.0/16 192.168.64.4" ;;
          exact-conflict) echo "198.18.0/16 192.168.64.99" ;;
+         exact-mtu-conflict) echo "198.18.0/16 192.168.64.4" ;;
          more-specific-host) echo "198.18.0.3 192.168.64.4" ;;
          more-specific-range) echo "198.18.128/17 192.168.64.4" ;;
          *) [[ ! -e "${ROUTE_STATE_FILE}" ]] || echo "198.18.0/16 192.168.64.4" ;;
@@ -182,6 +189,10 @@ expect 37 'launcher ensure,netstat,route get,route add,route get,netstat,contain
 run_case exact-conflict
 expect 1 'launcher ensure,netstat,route get,launcher stop'
 grep -Fq 'already uses a different gateway: 192.168.64.99' "${output}" || fail "missing exact-route conflict diagnostic"
+
+run_case exact-mtu-conflict
+expect 1 'launcher ensure,netstat,route get,launcher stop'
+grep -Fq 'already uses a different MTU: 1500' "${output}" || fail "missing exact-route MTU conflict diagnostic"
 
 run_case more-specific-host
 expect 1 'launcher ensure,netstat,launcher stop'

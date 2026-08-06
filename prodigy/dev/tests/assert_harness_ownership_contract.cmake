@@ -93,7 +93,7 @@ foreach(_required IN ITEMS
    "container exec"
    [["${launcher}" ensure "${instance}"]]
    [["${launcher}" stop "${instance}"]]
-   [[/usr/bin/sudo /sbin/route -n add -net "${apple_route_prefix}" "${apple_guest_ipv4}"]]
+   [[/usr/bin/sudo /sbin/route -n add -net "${apple_route_prefix}" "${apple_guest_ipv4}" -mtu "${apple_route_mtu}"]]
    [[/usr/bin/sudo /sbin/route -n delete -net "${apple_route_prefix}" "${apple_guest_ipv4}"]]
    "PRODIGY_DEV_TEST_BOUNDARY=apple-container"
    "prodigy-disposable-linux-v1")
@@ -104,7 +104,7 @@ foreach(_required IN ITEMS
 endforeach()
 
 string(FIND "${_launcher_source}" "   Darwin)" _darwin_branch)
-string(FIND "${_launcher_source}" "/usr/bin/sudo /sbin/route -n add -net \"\${apple_route_prefix}\" \"\${apple_guest_ipv4}\"" _darwin_route_add)
+string(FIND "${_launcher_source}" "/usr/bin/sudo /sbin/route -n add -net \"\${apple_route_prefix}\" \"\${apple_guest_ipv4}\" -mtu \"\${apple_route_mtu}\"" _darwin_route_add)
 string(FIND "${_launcher_source}" "/usr/bin/sudo /sbin/route -n delete -net \"\${apple_route_prefix}\" \"\${apple_guest_ipv4}\"" _darwin_route_delete)
 string(FIND "${_launcher_source}" "trap cleanup_apple_container EXIT" _darwin_cleanup_trap)
 string(FIND "${_launcher_source}" "\"\${launcher}\" stop \"\${instance}\"" _darwin_container_stop)
