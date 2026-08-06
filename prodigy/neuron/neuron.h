@@ -2322,6 +2322,7 @@ protected:
         bool mapsReused = reuseWormholeFlowMaps == false;
         tcx_egress_program = eth.attachBPF(BPF_TCX_EGRESS, hostEgressPath, "host_egress"_ctv,
                                            [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
+                                             switchboardConfigureDevelopmentWhiteholeMapAllocation(obj);
                                              if (reuseWormholeFlowMaps)
                                              {
                                                mapsReused = switchboardReusePinnedWormholeFlowMaps(obj, eth.ifidx, inner_map_fds);
@@ -2418,6 +2419,7 @@ protected:
           // load and setup tcx ingress program
           tcx_ingress_program = eth.attachBPF(BPF_TCX_INGRESS, hostIngressPath, "host_ingress"_ctv,
                                               [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
+                                                switchboardConfigureDevelopmentWhiteholeMapAllocation(obj);
                                                 (void)switchboardReusePinnedWhiteholeReplyFlowMap(obj, eth.ifidx, inner_map_fds);
                                                 (void)switchboardReusePinnedWormholeFlowMaps(obj, eth.ifidx, inner_map_fds);
                                               });

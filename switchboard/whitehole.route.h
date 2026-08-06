@@ -4,6 +4,7 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <array>
 #include <mutex>
@@ -17,6 +18,29 @@
 #include <switchboard/common/constants.h>
 #include <switchboard/common/structs.h>
 #include <switchboard/kernel/structs.h>
+
+static constexpr uint32_t switchboardDevelopmentWhiteholeMapEntries = 4096;
+
+static inline void switchboardConfigureDevelopmentWhiteholeMapAllocation(struct bpf_object *object)
+{
+  const char *devMode = std::getenv("PRODIGY_DEV_MODE");
+  if (object == nullptr || devMode == nullptr || std::strcmp(devMode, "1") != 0)
+  {
+    return;
+  }
+
+  static constexpr std::array<const char *, 3> mapNames = {"wh_targets", "wh_egress", "wh_egress4"};
+  for (const char *mapName : mapNames)
+  {
+    struct bpf_map *map = bpf_object__find_map_by_name(object, mapName);
+    if (map &&
+        (bpf_map__set_max_entries(map, switchboardDevelopmentWhiteholeMapEntries) != 0 ||
+         bpf_map__set_map_flags(map, bpf_map__map_flags(map) | BPF_F_NO_PREALLOC) != 0))
+    {
+      basics_log("Switchboard failed to configure bounded sparse development map name=%s errno=%d\n", mapName, errno);
+    }
+  }
+}
 
 static constexpr bool switchboardPortalCountWithinCapacity(uint64_t count)
 {

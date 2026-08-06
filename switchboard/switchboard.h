@@ -1638,6 +1638,7 @@ private:
 
         BPFProgram *program = eth.attachXDP(balancerObjectPath, "bal_ingress"_ctv, flags,
                                             [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
+                                              switchboardConfigureDevelopmentWhiteholeMapAllocation(obj);
                                               int inner_map_fd = bpf_map_create(BPF_MAP_TYPE_ARRAY, nullptr, sizeof(__u32), sizeof(container_id), RING_SIZE, nullptr);
                                               if (inner_map_fd < 0)
                                               {

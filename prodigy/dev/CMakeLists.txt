@@ -1759,6 +1759,10 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    )
    set_tests_properties(prodigy_switchboard_whitehole_unit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
    add_test(
+      NAME prodigy_switchboard_development_map_allocation_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_switchboard_whitehole_unit --development-map-allocation-only
+   )
+   add_test(
       NAME prodigy_host_egress_bpf_load_smoke
       COMMAND
          bash

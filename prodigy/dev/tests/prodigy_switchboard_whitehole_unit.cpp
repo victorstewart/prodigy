@@ -73,6 +73,66 @@ static uint32_t programMapID(BPFProgram& program, StringType auto&& mapName)
   return id;
 }
 
+static bool objectWhiteholeMapsUseAllocation(struct bpf_object *object, bool sparse, uint32_t maxEntries)
+{
+  static constexpr std::array<const char *, 3> mapNames = {"wh_targets", "wh_egress", "wh_egress4"};
+  for (const char *mapName : mapNames)
+  {
+    struct bpf_map *map = object ? bpf_object__find_map_by_name(object, mapName) : nullptr;
+    if (map == nullptr ||
+        ((bpf_map__map_flags(map) & BPF_F_NO_PREALLOC) != 0) != sparse ||
+        bpf_map__max_entries(map) != maxEntries)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void verifyDevelopmentWhiteholeMapAllocation(TestSuite& suite)
+{
+  String objectPath = {};
+  objectPath.assign(PRODIGY_TEST_BINARY_DIR);
+  objectPath.append("/host.ingress.router.ebpf.o"_ctv);
+
+  const char *savedDevMode = std::getenv("PRODIGY_DEV_MODE");
+  String savedDevModeText = {};
+  if (savedDevMode)
+  {
+    savedDevModeText.assign(savedDevMode);
+  }
+
+  ::unsetenv("PRODIGY_DEV_MODE");
+  struct bpf_object *productionObject = bpf_object__open_file(objectPath.c_str(), nullptr);
+  if (libbpf_get_error(productionObject))
+  {
+    productionObject = nullptr;
+  }
+  switchboardConfigureDevelopmentWhiteholeMapAllocation(productionObject);
+  suite.expect(objectWhiteholeMapsUseAllocation(productionObject, false, MAX_PORTALS * 256),
+               "switchboard_production_whitehole_maps_retain_capacity_and_preallocation");
+  if (productionObject)
+  {
+    bpf_object__close(productionObject);
+  }
+
+  ::setenv("PRODIGY_DEV_MODE", "1", 1);
+  struct bpf_object *developmentObject = bpf_object__open_file(objectPath.c_str(), nullptr);
+  if (libbpf_get_error(developmentObject))
+  {
+    developmentObject = nullptr;
+  }
+  switchboardConfigureDevelopmentWhiteholeMapAllocation(developmentObject);
+  suite.expect(objectWhiteholeMapsUseAllocation(developmentObject, true, switchboardDevelopmentWhiteholeMapEntries),
+               "switchboard_development_whitehole_maps_use_bounded_sparse_allocation");
+  if (developmentObject)
+  {
+    bpf_object__close(developmentObject);
+  }
+
+  savedDevMode ? ::setenv("PRODIGY_DEV_MODE", savedDevModeText.c_str(), 1) : ::unsetenv("PRODIGY_DEV_MODE");
+}
+
 static IPPrefix makePrefix(const char *cidr)
 {
   const char *slash = std::strrchr(cidr, '/');
@@ -2404,8 +2464,15 @@ static void exerciseBalancerOwnedRoutableMissPassesToKernel(TestSuite& suite)
   balancerProgram.close();
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+  if (argc == 2 && std::strcmp(argv[1], "--development-map-allocation-only") == 0)
+  {
+    TestSuite suite = {};
+    verifyDevelopmentWhiteholeMapAllocation(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
+
   if (const char *allow = std::getenv("PRODIGY_DEV_ALLOW_BPF_ATTACH"); allow == nullptr || std::strcmp(allow, "1") != 0)
   {
     std::fprintf(stderr, "SKIP: switchboard whitehole unit loads BPF programs; set PRODIGY_DEV_ALLOW_BPF_ATTACH=1 only inside an authorized isolated VM\n");
@@ -2413,6 +2480,7 @@ int main(void)
   }
 
   TestSuite suite = {};
+  verifyDevelopmentWhiteholeMapAllocation(suite);
 
   Whitehole whitehole = {};
   whitehole.transport = ExternalAddressTransport::quic;

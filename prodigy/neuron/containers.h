@@ -2087,6 +2087,7 @@ public:
     }
     peer_program = host.attachBPF(prodigyContainerEgressNetkitAttachType(), path, "ct_egress"_ctv,
                                   [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
+                                    switchboardConfigureDevelopmentWhiteholeMapAllocation(obj);
                                     (void)switchboardReusePinnedWhiteholeReplyFlowMap(obj, thisNeuron->eth.ifidx, inner_map_fds);
                                     (void)switchboardReusePinnedWormholeFlowMaps(obj, thisNeuron->eth.ifidx, inner_map_fds);
                                   });
@@ -2164,6 +2165,7 @@ public:
     bool tcpFlowMapReused = plan.networkAccess != ContainerNetworkAccess::declaredOnly;
     primary_program = host.attachBPF(prodigyContainerIngressNetkitAttachType(), path, "ct_ingress"_ctv,
                                      [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
+                                       switchboardConfigureDevelopmentWhiteholeMapAllocation(obj);
                                        (void)switchboardReusePinnedWormholeFlowMaps(obj, thisNeuron->eth.ifidx, inner_map_fds);
                                        if (plan.networkAccess == ContainerNetworkAccess::declaredOnly)
                                        {
