@@ -822,6 +822,34 @@ start_machine()
    machine_pids[$((index - 1))]="$!"
 }
 
+reset_machine_cgroup()
+{
+   local index="$1"
+   local machine_cgroup="${cgroup_root}/machine${index}"
+   [[ "${index}" =~ ^[0-9]+$ && "${index}" -ge 1 && "${index}" -le "${machine_count}" ]]
+   [[ "${machine_cgroup}" == "${cgroup_root}"/machine* && -w "${machine_cgroup}/cgroup.kill" ]]
+
+   printf '1\n' > "${machine_cgroup}/cgroup.kill"
+   local child=""
+   for _ in $(seq 1 100)
+   do
+      find "${machine_cgroup}" -mindepth 1 -depth -type d -exec rmdir {} \; >/dev/null 2>&1 || true
+      child="$(find "${machine_cgroup}" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+      if [[ -z "${child}" && ! -s "${machine_cgroup}/cgroup.procs" ]]
+      then
+         local enabled=" $(<"${machine_cgroup}/cgroup.subtree_control") "
+         local controller=""
+         for controller in cpuset cpu memory pids
+         do
+            [[ "${enabled}" != *" ${controller} "* ]] || printf -- '-%s\n' "${controller}" > "${machine_cgroup}/cgroup.subtree_control"
+         done
+         return 0
+      fi
+      sleep 0.02
+   done
+   return 1
+}
+
 for index in $(seq 1 "${machine_count}")
 do
    start_machine "${index}"
@@ -869,6 +897,7 @@ do
          then
             continue
          fi
+         reset_machine_cgroup "${index}"
          start_machine "${index}"
          publish_runtime
       fi

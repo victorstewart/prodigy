@@ -35,3 +35,22 @@ string(FIND "${VIRTUAL_DATACENTER_PROVIDER}" "PRODIGY_DEV_TEST_OVERCOMMIT_CPUS=1
 if(POSITION EQUAL -1)
    message(FATAL_ERROR "virtual datacenter provider must opt fake machines into test-only CPU overcommit")
 endif()
+
+foreach(REQUIRED IN ITEMS
+   [[printf '1\n' > "${machine_cgroup}/cgroup.kill"]]
+   [[find "${machine_cgroup}" -mindepth 1 -depth -type d -exec rmdir {} \;]]
+   [[child="$(find "${machine_cgroup}" -mindepth 1 -maxdepth 1 -type d -print -quit)"]]
+   [=[if [[ -z "${child}" && ! -s "${machine_cgroup}/cgroup.procs" ]]]=]
+   [[for controller in cpuset cpu memory pids]]
+   [[printf -- '-%s\n' "${controller}" > "${machine_cgroup}/cgroup.subtree_control"]])
+   string(FIND "${VIRTUAL_DATACENTER_PROVIDER}" "${REQUIRED}" POSITION)
+   if(POSITION EQUAL -1)
+      message(FATAL_ERROR "fake-machine restart must fully reset its cgroup: missing ${REQUIRED}")
+   endif()
+endforeach()
+
+string(FIND "${VIRTUAL_DATACENTER_PROVIDER}" [[         reset_machine_cgroup "${index}"]] RESET_POSITION)
+string(FIND "${VIRTUAL_DATACENTER_PROVIDER}" [[         start_machine "${index}"]] RESTART_POSITION REVERSE)
+if(RESET_POSITION EQUAL -1 OR RESTART_POSITION EQUAL -1 OR RESET_POSITION GREATER RESTART_POSITION)
+   message(FATAL_ERROR "fake-machine restart must reset its cgroup before starting the replacement process")
+endif()
