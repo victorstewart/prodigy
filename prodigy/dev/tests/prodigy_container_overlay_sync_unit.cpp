@@ -904,6 +904,7 @@ static void testSystemEgressPolicyConstrainsIPv4(TestSuite& suite)
   NeuronBase *previousNeuron = thisNeuron;
   thisNeuron = &neuron;
   neuron.private4 = IPAddress("10.8.0.44", false);
+  neuron.eth.mtu = 9040;
 
   Container container = {};
   container.plan.system.kind = SystemContainerKind::mothershipTunnelProvider;
@@ -915,6 +916,27 @@ static void testSystemEgressPolicyConstrainsIPv4(TestSuite& suite)
   suite.expect(container.buildContainerNetworkPolicy(policy), "system_egress_policy_builds");
   suite.expect(policy.mode == CONTAINER_NETWORK_DESTINATION_ALLOWLIST, "system_egress_policy_constrains_egress");
   suite.expect(policy.requiresPublic4 == 1, "system_egress_policy_requires_ipv4");
+
+  thisNeuron = previousNeuron;
+}
+
+static void testContainerNetworkPolicySeparatesPrivateAndWormholePacketBudgets(TestSuite& suite)
+{
+  OverlayTestNeuron neuron = {};
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &neuron;
+  neuron.eth.mtu = 9040;
+  neuron.configuredInterContainerMTU = 9000;
+
+  Container container = {};
+  container.plan.uuid = 0x9000;
+  container.plan.wormholes.push_back(Wormhole {});
+
+  container_network_policy policy = {};
+  suite.expect(container.buildContainerNetworkPolicy(policy),
+               "container_network_policy_accepts_9000_private_mtu_on_9040_underlay_with_wormhole");
+  suite.expect(policy.interContainerMTU == 9000,
+               "container_network_policy_keeps_private_mtu_independent_of_wormhole_provenance_overhead");
 
   thisNeuron = previousNeuron;
 }
@@ -1914,6 +1936,7 @@ int main(void)
   testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntries(suite);
   testContainerPeerRuntimeSyncPopulatesAndClearsWormholeEgressBindings(suite);
   testSystemEgressPolicyConstrainsIPv4(suite);
+  testContainerNetworkPolicySeparatesPrivateAndWormholePacketBudgets(suite);
   testContainerPeerEgressRouterLoadsAfterWormholeSourceRewrite(suite);
   testContainerPeerEgressRouterDropsPacketsOverConfiguredMTU(suite);
   testContainerPeerEgressRouterEnforcesSystemAllowlist(suite);

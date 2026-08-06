@@ -1598,9 +1598,25 @@ public:
     const uint32_t configuredMTU = thisNeuron->configuredInterContainerMTU;
     const uint32_t hostMTU = thisNeuron->eth.mtu;
     const bool hasWormholes = plan.wormholes.empty() == false;
-    const uint32_t safeMTU = switchboardPacketBudgetRemoteInnerMTU(hostMTU, hasWormholes);
-    if ((hasWormholes && switchboardPacketBudgetExternalIngressUnderlayMTUValid(hostMTU) == false) ||
-        (configuredMTU != 0 && configuredMTU > safeMTU))
+    const uint32_t safeMTU = switchboardPacketBudgetRemoteInnerMTU(hostMTU, false);
+    if (hasWormholes && switchboardPacketBudgetExternalIngressUnderlayMTUValid(hostMTU) == false)
+    {
+      basics_log("container wormhole mtu budget mismatch uuid=%llu hostMTU=%u required=%u hostIfidx=%u\n",
+                 (unsigned long long)plan.uuid,
+                 unsigned(hostMTU),
+                 unsigned(switchboardPacketBudgetExternalIngressRequiredUnderlayMTU()),
+                 unsigned(thisNeuron->eth.ifidx));
+      if (failureReport && failureReport->size() == 0)
+      {
+        failureReport->snprintf<"host mtu {itoa} is below wormhole underlay minimum {itoa} for container {itoa}"_ctv>(
+            uint64_t(hostMTU),
+            uint64_t(switchboardPacketBudgetExternalIngressRequiredUnderlayMTU()),
+            plan.uuid);
+      }
+      return 0;
+    }
+
+    if (configuredMTU != 0 && configuredMTU > safeMTU)
     {
       basics_log("container netkit mtu budget mismatch uuid=%llu configured=%u hostMTU=%u safeMTU=%u wormholes=%d hostIfidx=%u\n",
                  (unsigned long long)plan.uuid,
