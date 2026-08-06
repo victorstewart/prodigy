@@ -997,6 +997,7 @@ int main(void)
     suite.expect(createTestLocal, "create_test_local");
     suite.expect(createdCluster.clusterUUID != 0, "create_test_local_cluster_uuid_generated");
     storedTestLocal.clusterUUID = createdCluster.clusterUUID;
+    mothershipResolveTestClusterControlRecord(storedTestLocal.controls, storedTestLocal);
     suite.expect(equalClusters(storedTestLocal, createdCluster), "create_test_local_normalized");
 
     MothershipProdigyCluster duplicateRemoteUUID = remoteCreated;
