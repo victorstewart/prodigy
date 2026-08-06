@@ -539,6 +539,7 @@ fi
 
 pid="$$"
 underlay_mtu=$((inter_container_mtu + 40))
+public_ingress_mtu=1500
 parent_ns="pvd-p-${pid}"
 filesystem_root="/mnt/prodigy-vdc-${pid}"
 filesystem_image="${workspace}/virtual-datacenter.btrfs"
@@ -772,14 +773,14 @@ then
    ip -6 addr add fd00:31::1/126 dev "${host_edge}"
    ip link set "${host_edge}" up
    ip route replace 10.0.0.0/24 via 172.31.0.2 dev "${host_edge}"
-   # This synthetic public boundary belongs only to deploymentMode=test; production clusters never execute this provider.
-   ip route replace 198.18.0.0/16 via 172.31.0.2 dev "${host_edge}"
+   # This synthetic 1500-byte public boundary belongs only to deploymentMode=test; production clusters never execute this provider.
+   ip route replace 198.18.0.0/16 via 172.31.0.2 dev "${host_edge}" mtu "${public_ingress_mtu}"
    ip netns exec "${parent_ns}" ip link set "${parent_edge}" up
    ip netns exec "${parent_ns}" ip addr add 172.31.0.2/30 dev "${parent_edge}"
    ip netns exec "${parent_ns}" ip -6 addr add fd00:31::2/126 dev "${parent_edge}"
    ip netns exec "${parent_ns}" ip route replace default via 172.31.0.1 dev "${parent_edge}"
    ip netns exec "${parent_ns}" ip -6 route replace default via fd00:31::1 dev "${parent_edge}"
-   ip netns exec "${parent_ns}" ip route replace 198.18.0.0/16 via 10.0.0.10 dev vdcbr0 src 10.0.0.1
+   ip netns exec "${parent_ns}" ip route replace 198.18.0.0/16 via 10.0.0.10 dev vdcbr0 src 10.0.0.1 mtu "${public_ingress_mtu}"
    ip netns exec "${parent_ns}" ip -6 route replace 2602:fac0:0:12ab:34cd::/88 via fd00:10::a dev vdcbr0
    ip netns exec "${parent_ns}" sysctl -q -w net.ipv4.ip_forward=1
    ip netns exec "${parent_ns}" sysctl -q -w net.ipv6.conf.all.forwarding=1

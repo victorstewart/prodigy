@@ -76,7 +76,9 @@ foreach(_required IN ITEMS
 endforeach()
 
 foreach(_required IN ITEMS
-   "ip route replace 198.18.0.0/16 via 172.31.0.2 dev \"\${host_edge}\""
+   "public_ingress_mtu=1500"
+   "ip route replace 198.18.0.0/16 via 172.31.0.2 dev \"\${host_edge}\" mtu \"\${public_ingress_mtu}\""
+   "ip netns exec \"\${parent_ns}\" ip route replace 198.18.0.0/16 via 10.0.0.10 dev vdcbr0 src 10.0.0.1 mtu \"\${public_ingress_mtu}\""
    "ip route del 198.18.0.0/16 via 172.31.0.2 dev \"\${host_edge}\""
    "iptables -t nat -A POSTROUTING ! -s 172.31.0.0/30 -d 198.18.0.0/16 -o \"\${host_edge}\" -j SNAT --to-source 172.31.0.1"
    "iptables -t nat -D POSTROUTING ! -s 172.31.0.0/30 -d 198.18.0.0/16 -o \"\${host_edge}\" -j SNAT --to-source 172.31.0.1")
