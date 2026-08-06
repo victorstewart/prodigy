@@ -7694,7 +7694,7 @@ public:
     {
       if (epoch.generation == snapshot->generation)
       {
-        if (epoch.role != TlsResumptionKeyRole::issueAndAccept || epoch.issueUntilMs != issueUntilMs)
+        if (epoch.role != TlsResumptionKeyRole::issueAndAccept)
         {
           epoch.role = TlsResumptionKeyRole::issueAndAccept;
           epoch.issueUntilMs = issueUntilMs;

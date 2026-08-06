@@ -4410,6 +4410,12 @@ static void testTlsResumptionRotationAckCoverage(TestSuite& suite)
   TlsResumptionSnapshot *promoted = currentSnapshot();
   suite.expect(promoted != nullptr && promoted->keyRing.size() == 1 && promoted->keyRing[0].role == TlsResumptionKeyRole::issueAndAccept, "resumption_rotation_promoted_issue_epoch");
   suite.expect(promoted != nullptr && promoted->keyRing[0].issueUntilMs > 1'700'000'100'600, "resumption_rotation_sets_issue_until");
+  const int64_t promotedIssueUntilMs = promoted != nullptr ? promoted->keyRing[0].issueUntilMs : 0;
+  const uint32_t promotionPersistCalls = brain.persistCalls;
+  suite.expect(brain.advanceTlsResumptionLifecycleForDeployment(plan, 1'700'000'100'700, false, false) == 0, "resumption_rotation_repeated_ack_does_not_repromote");
+  promoted = currentSnapshot();
+  suite.expect(promoted != nullptr && promoted->keyRing[0].issueUntilMs == promotedIssueUntilMs, "resumption_rotation_repeated_ack_does_not_slide_issue_until");
+  suite.expect(brain.persistCalls == promotionPersistCalls, "resumption_rotation_repeated_ack_does_not_persist");
   suite.expect(
       promoted != nullptr &&
           brain.pushTlsResumptionUpdateToLiveContainers(plan, promoted, nullptr, promoted->generation, "unit-test"_ctv) == 4,
@@ -20142,6 +20148,11 @@ static void testContainerNeuronListenerContract(TestSuite& suite)
 int main(void)
 {
   TestSuite suite;
+  if (std::getenv("PRODIGY_TEST_TLS_RESUMPTION_ACK_STABILITY") != nullptr)
+  {
+    testTlsResumptionRotationAckCoverage(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
   if (std::getenv("PRODIGY_TEST_AUTONOMOUS_PROVISIONING_JOURNAL") != nullptr)
   {
     testAutonomousProvisioningJournalReplaysAmbiguousLaunchAfterRestart(suite);
