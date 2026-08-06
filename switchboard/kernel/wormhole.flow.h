@@ -801,7 +801,7 @@ __attribute__((__always_inline__)) static inline int switchboardWormholeReplyDis
   {
     return SWITCHBOARD_WORMHOLE_REPLY_NONE;
   }
-  if (configured->owner_generation == 0 || configured->is_ipv6 == 0 || configured->proto != ip6h->nexthdr)
+  if (configured->owner_generation == 0 || configured->proto != ip6h->nexthdr)
   {
     return SWITCHBOARD_WORMHOLE_REPLY_DROP;
   }
@@ -809,6 +809,12 @@ __attribute__((__always_inline__)) static inline int switchboardWormholeReplyDis
   struct switchboard_wormhole_flow *established = bpf_map_lookup_elem(&wh_flows, &ownerKey);
   struct switchboard_wormhole_flow *pending = established == NULL ? bpf_map_lookup_elem(&wh_pending, &ownerKey) : NULL;
   const __u8 *container = ip6h->saddr.s6_addr + 11;
+  // The portal address family constrains public source rewriting, not private IPv6 mesh ownership.
+  struct switchboard_wormhole_flow *owner = established == NULL ? pending : established;
+  if (configured->is_ipv6 == 0 && owner != NULL && owner->disposition == SWITCHBOARD_WORMHOLE_FLOW_PUBLIC)
+  {
+    return SWITCHBOARD_WORMHOLE_REPLY_DROP;
+  }
   return switchboardResolveWormholeReplyOwnership(established,
                                                   pending,
                                                   configured,

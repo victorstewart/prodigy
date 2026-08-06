@@ -1673,10 +1673,12 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
   uint8_t client[16] = {};
   uint8_t external[16] = {};
   uint8_t external2[16] = {};
+  uint8_t peer[16] = {};
   uint8_t server[16] = {};
   parseIPv6Bytes("2001:db8:200::99", client);
   parseIPv6Bytes("2001:db8:100::44", external);
   parseIPv6Bytes("2001:db8:100::45", external2);
+  makeContainerIPv6(peer, selected[0], selected[1], selected[2], selected[3], uint8_t(selected[4] + 1));
   makeContainerIPv6(server, selected[0], selected[1], selected[2], selected[3], selected[4]);
 
   auto installPortal = [&](const uint8_t address[16], uint16_t externalPort, uint16_t targetPort, uint32_t slot, uint8_t protocol = IPPROTO_UDP) -> switchboard_wormhole_egress_binding {
@@ -1807,6 +1809,75 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
               "private_first_claims_exact_reverse_tuple");
   expectNamed(runHost(publicOverlay, hostOutput) == TC_ACT_SHOT,
               "private_first_rejects_aliasing_public_flow");
+
+  switchboard_wormhole_egress_key mixedFamilyExposure = {};
+  std::memcpy(mixedFamilyExposure.container, selected, sizeof(mixedFamilyExposure.container));
+  mixedFamilyExposure.port = htons(8444);
+  mixedFamilyExposure.proto = IPPROTO_TCP;
+  switchboard_wormhole_egress_binding mixedFamilyBinding = {};
+  mixedFamilyBinding.addr4 = parseIPv4Address("198.18.0.1").s_addr;
+  mixedFamilyBinding.owner_generation = 46;
+  mixedFamilyBinding.port = htons(444);
+  mixedFamilyBinding.proto = IPPROTO_TCP;
+  expectNamed(updateProgramMapElement(host, "wh_egress"_ctv, mixedFamilyExposure, mixedFamilyBinding) &&
+                  updateProgramMapElement(ingress, "wh_egress"_ctv, mixedFamilyExposure, mixedFamilyBinding) &&
+                  updateProgramMapElement(egress, "wh_egress"_ctv, mixedFamilyExposure, mixedFamilyBinding),
+              "installs_ipv4_public_binding_for_ipv6_private_service");
+
+  std::vector<uint8_t> mixedFamilyIngress = makeIPv6L4EthernetFrame(peer, server, IPPROTO_TCP, 49'156, 8444);
+  std::vector<uint8_t> mixedFamilyReply = makeIPv6L4EthernetFrame(server, peer, IPPROTO_TCP, 8444, 49'156);
+  struct tcphdr *mixedFamilyReplyTCP = reinterpret_cast<struct tcphdr *>(mixedFamilyReply.data() + sizeof(struct ethhdr) + sizeof(struct ipv6hdr));
+  mixedFamilyReplyTCP->ack = 1;
+  mixedFamilyReplyTCP->ack_seq = htonl(1);
+  mixedFamilyReplyTCP->check = 0;
+  mixedFamilyReplyTCP->check = checksumIPv6Transport(server,
+                                                     peer,
+                                                     IPPROTO_TCP,
+                                                     mixedFamilyReplyTCP,
+                                                     sizeof(*mixedFamilyReplyTCP));
+  flow_key mixedFamilyReplyKey = {};
+  std::memcpy(mixedFamilyReplyKey.srcv6, server, sizeof(mixedFamilyReplyKey.srcv6));
+  std::memcpy(mixedFamilyReplyKey.dstv6, peer, sizeof(mixedFamilyReplyKey.dstv6));
+  mixedFamilyReplyKey.port16[0] = htons(8444);
+  mixedFamilyReplyKey.port16[1] = htons(49'156);
+  mixedFamilyReplyKey.proto = IPPROTO_TCP;
+  switchboard_wormhole_flow_key mixedFamilyOwnerKey =
+      switchboardWormholeFlowMapKey(&mixedFamilyReplyKey, mixedFamilyBinding.owner_generation);
+
+  clearWormholeFlows();
+  expectNamed(runNetkit(ingress, mixedFamilyIngress, 0, packetOutput) == NETKIT_PASS,
+              "ipv4_public_binding_admits_private_ipv6_syn");
+  switchboard_wormhole_flow mixedFamilyPrivate = {};
+  expectNamed(lookupProgramMapElement(host, "wh_pending"_ctv, mixedFamilyOwnerKey, mixedFamilyPrivate) &&
+                  mixedFamilyPrivate.disposition == SWITCHBOARD_WORMHOLE_FLOW_PRIVATE &&
+                  mixedFamilyPrivate.phase == SWITCHBOARD_WORMHOLE_FLOW_PENDING,
+              "ipv4_public_binding_records_private_ipv6_owner");
+  expectNamed(runNetkit(egress, mixedFamilyReply, 0, packetOutput) == NETKIT_PASS &&
+                  packetOutput.size() == mixedFamilyReply.size() &&
+                  std::memcmp(packetOutput.data(), mixedFamilyReply.data(), mixedFamilyReply.size()) == 0,
+              "ipv4_public_binding_preserves_private_ipv6_syn_ack");
+  switchboard_wormhole_flow mixedFamilyReverse = {};
+  expectNamed(lookupProgramMapElement(host, "wh_pending"_ctv, mixedFamilyOwnerKey, mixedFamilyReverse) &&
+                  mixedFamilyReverse.disposition == SWITCHBOARD_WORMHOLE_FLOW_PRIVATE &&
+                  mixedFamilyReverse.phase == SWITCHBOARD_WORMHOLE_FLOW_REVERSE_SEEN,
+              "private_ipv6_syn_ack_advances_exact_owner");
+
+  clearWormholeFlows();
+  switchboard_wormhole_flow invalidMixedFamilyPublic = {};
+  invalidMixedFamilyPublic.binding = mixedFamilyBinding;
+  std::memcpy(invalidMixedFamilyPublic.container, selected, sizeof(invalidMixedFamilyPublic.container));
+  invalidMixedFamilyPublic.disposition = SWITCHBOARD_WORMHOLE_FLOW_PUBLIC;
+  invalidMixedFamilyPublic.phase = SWITCHBOARD_WORMHOLE_FLOW_PENDING;
+  invalidMixedFamilyPublic.expiresAtNs = UINT64_MAX;
+  expectNamed(updateProgramMapElement(host, "wh_pending"_ctv, mixedFamilyOwnerKey, invalidMixedFamilyPublic),
+              "seeds_ipv4_backed_public_ipv6_owner");
+  expectNamed(runNetkit(egress, mixedFamilyReply, 0, packetOutput) == NETKIT_DROP,
+              "ipv4_binding_cannot_rewrite_public_ipv6_reply");
+  switchboard_wormhole_flow unchangedMixedFamilyPublic = {};
+  expectNamed(lookupProgramMapElement(host, "wh_pending"_ctv, mixedFamilyOwnerKey, unchangedMixedFamilyPublic) &&
+                  unchangedMixedFamilyPublic.transition == invalidMixedFamilyPublic.transition &&
+                  unchangedMixedFamilyPublic.expiresAtNs == invalidMixedFamilyPublic.expiresAtNs,
+              "rejected_public_family_mismatch_preserves_owner_state");
 
   clearWormholeFlows();
   std::vector<uint8_t> publicInner2 = makeIPv6L4EthernetFrame(client, external2, IPPROTO_UDP, 49'152, 4443);
