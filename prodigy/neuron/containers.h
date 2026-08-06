@@ -1959,7 +1959,7 @@ public:
       return false;
     }
 
-    netdevs.createPair(pid);
+    netdevs.createPair(pid, NETKIT_SCRUB_NONE, NETKIT_SCRUB_NONE);
     netdevs.peer.moveSocketToNamespace(peernetnsfd, hostnetnsfd);
     if (bringContainerLoopbackUp(peernetnsfd, hostnetnsfd, plan.uuid, failureReport) == false)
     {

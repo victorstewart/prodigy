@@ -147,13 +147,34 @@ dump_failure_context()
       sed -n '1,200p' "${workspace_dump_root}/mothership.deploy.log" >&2 || true
    fi
 
-   if compgen -G "${workspace_dump_root}/logs/brain*.stdout.log" >/dev/null
+   local dump_manifest="${workspace_dump_root}/test-cluster-manifest.json"
+   if [[ -f "${dump_manifest}" ]]
    then
-      for brain_log in "${workspace_dump_root}"/logs/brain*.stdout.log
+      while IFS= read -r brain_log
       do
+         [[ -f "${brain_log}" ]] || continue
          echo "brain log tail: ${brain_log}" >&2
          tail -n 80 "${brain_log}" >&2 || true
-      done
+      done < <(python3 - "${dump_manifest}" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    manifest = json.load(fh)
+
+workspace_root = manifest.get("workspaceRoot")
+manifest_root = os.path.realpath(workspace_root) if workspace_root else None
+dump_root = os.path.dirname(os.path.realpath(sys.argv[1]))
+for node in manifest.get("nodes", []):
+    path = node.get("stdoutLog")
+    if path:
+        candidate = os.path.realpath(path)
+        if manifest_root and os.path.commonpath((manifest_root, candidate)) == manifest_root:
+            path = os.path.join(dump_root, os.path.relpath(candidate, manifest_root))
+        print(path)
+PY
+      )
    fi
 }
 
@@ -254,6 +275,34 @@ extract_link_detail_field()
    ' < <("$@")
 }
 
+extract_netkit_scrub_modes()
+{
+   awk '
+      {
+         for (i = 1; i <= NF; i += 1)
+         {
+            if ($i == "scrub" && (i + 1) <= NF)
+            {
+               if (i > 1 && $(i - 1) == "peer")
+               {
+                  peer = $(i + 1)
+               }
+               else
+               {
+                  primary = $(i + 1)
+               }
+            }
+         }
+      }
+      END {
+         if (primary != "" && peer != "")
+         {
+            print primary ":" peer
+         }
+      }
+   ' < <("$@")
+}
+
 find_runtime_netkit_if()
 {
    local target_pid="$1"
@@ -312,6 +361,17 @@ assert_link_budget_segments()
    if [[ "${observed_value}" != "${expected_value}" ]]
    then
       fail "${label} ${field}=${observed_value} expected=${expected_value}"
+   fi
+}
+
+assert_netkit_scrub_modes()
+{
+   local observed_modes="$1"
+   local label="$2"
+
+   if [[ "${observed_modes}" != "none:none" ]]
+   then
+      fail "${label} scrub modes=${observed_modes} expected=none:none"
    fi
 }
 
@@ -650,20 +710,53 @@ then
    fail "deployed MTU regression container never became healthy"
 fi
 
-spin_match="$(rg -n "spinContainer start ok .* appID=${APPLICATION_ID}.* pid=" "${workspace_root}"/logs/brain*.stdout.log | tail -n 1 || true)"
-if [[ -z "${spin_match}" ]]
+runtime_match="$(python3 - "${manifest_path}" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    manifest = json.load(fh)
+
+matches = []
+for node in manifest.get("nodes", []):
+    parent = node.get("pid")
+    if not parent:
+        continue
+    children = set()
+    try:
+        tasks = os.listdir(f"/proc/{parent}/task")
+    except OSError:
+        continue
+    for task in tasks:
+        try:
+            with open(f"/proc/{parent}/task/{task}/children", "r", encoding="ascii") as child_file:
+                children.update(child_file.read().split())
+        except OSError:
+            continue
+    for child in children:
+        try:
+            executable = os.path.basename(os.readlink(f"/proc/{child}/exe"))
+        except OSError:
+            continue
+        if executable == "ready_container":
+            matches.append((node["index"], int(child)))
+
+if matches:
+    print(*max(matches, key=lambda match: match[1]))
+PY
+)"
+if [[ -z "${runtime_match}" ]]
 then
-   fail "unable to locate deployed container start log for appID=${APPLICATION_ID}"
+   fail "unable to locate deployed container process for appID=${APPLICATION_ID}"
 fi
 
-brain_log="${spin_match%%:*}"
-container_pid="$(printf '%s\n' "${spin_match}" | sed -n 's/.* pid=\([0-9][0-9]*\).*/\1/p' | tail -n 1)"
-brain_index="$(basename "${brain_log}" | sed -n 's/^brain\([0-9][0-9]*\)\..*/\1/p')"
+read -r brain_index container_pid <<< "${runtime_match}"
 
 if [[ -z "${container_pid}" || -z "${brain_index}" ]]
 then
-   echo "spin match: ${spin_match}" >&2
-   fail "unable to parse deployment host details from log line"
+   echo "runtime match: ${runtime_match}" >&2
+   fail "unable to parse deployed container process details"
 fi
 
 brain_pid="$(python3 - "${manifest_path}" "${brain_index}" <<'PY'
@@ -713,6 +806,8 @@ container_netkit_gso_segs="$(extract_link_detail_field gso_max_segs nsenter -t "
 container_netkit_gro="$(extract_link_detail_field gro_max_size nsenter -t "${container_pid}" -n ip -details link show dev "${container_netkit_if}")"
 container_netkit_gso_ipv4="$(extract_link_detail_field gso_ipv4_max_size nsenter -t "${container_pid}" -n ip -details link show dev "${container_netkit_if}")"
 container_netkit_gro_ipv4="$(extract_link_detail_field gro_ipv4_max_size nsenter -t "${container_pid}" -n ip -details link show dev "${container_netkit_if}")"
+host_netkit_scrub_modes="$(extract_netkit_scrub_modes nsenter -t "${brain_pid}" -n ip -details link show dev "${host_netkit_if}")"
+container_netkit_scrub_modes="$(extract_netkit_scrub_modes nsenter -t "${container_pid}" -n ip -details link show dev "${container_netkit_if}")"
 egress_prog_id="$(find_netkit_prog_id "${brain_pid}" "${host_netkit_if}" "ct_egress")"
 
 if [[ -z "${egress_prog_id}" ]]
@@ -732,7 +827,7 @@ then
    fail "unable to read ct_net_policy for program ${egress_prog_id}"
 fi
 
-echo "observed host mtu=${host_netkit_mtu} host_gso=${host_netkit_gso} host_gso_segs=${host_netkit_gso_segs} host_gro=${host_netkit_gro} host_gso_ipv4=${host_netkit_gso_ipv4} host_gro_ipv4=${host_netkit_gro_ipv4} container mtu=${container_netkit_mtu} container_gso=${container_netkit_gso} container_gso_segs=${container_netkit_gso_segs} container_gro=${container_netkit_gro} container_gso_ipv4=${container_netkit_gso_ipv4} container_gro_ipv4=${container_netkit_gro_ipv4} policy interContainerMTU=${policy_mtu} brain=${brain_index} host_if=${host_netkit_if} container_if=${container_netkit_if} prog_id=${egress_prog_id} policy_map=${policy_map_id}"
+echo "observed host mtu=${host_netkit_mtu} host_gso=${host_netkit_gso} host_gso_segs=${host_netkit_gso_segs} host_gro=${host_netkit_gro} host_gso_ipv4=${host_netkit_gso_ipv4} host_gro_ipv4=${host_netkit_gro_ipv4} scrub=${host_netkit_scrub_modes} container mtu=${container_netkit_mtu} container_gso=${container_netkit_gso} container_gso_segs=${container_netkit_gso_segs} container_gro=${container_netkit_gro} container_gso_ipv4=${container_netkit_gso_ipv4} container_gro_ipv4=${container_netkit_gro_ipv4} scrub=${container_netkit_scrub_modes} policy interContainerMTU=${policy_mtu} brain=${brain_index} host_if=${host_netkit_if} container_if=${container_netkit_if} prog_id=${egress_prog_id} policy_map=${policy_map_id}"
 
 assert_link_mtu "${host_netkit_mtu}" "brain${brain_index}/${host_netkit_if}"
 assert_link_mtu "${container_netkit_mtu}" "container/${container_netkit_if}"
@@ -746,6 +841,8 @@ assert_link_budget_segments "${container_netkit_gso_segs}" "gso_max_segs" "1" "c
 assert_link_budget "${container_netkit_gro}" "gro_max_size" "container/${container_netkit_if}"
 assert_link_budget "${container_netkit_gso_ipv4}" "gso_ipv4_max_size" "container/${container_netkit_if}"
 assert_link_budget "${container_netkit_gro_ipv4}" "gro_ipv4_max_size" "container/${container_netkit_if}"
+assert_netkit_scrub_modes "${host_netkit_scrub_modes}" "brain${brain_index}/${host_netkit_if}"
+assert_netkit_scrub_modes "${container_netkit_scrub_modes}" "container/${container_netkit_if}"
 assert_policy_mtu "${policy_mtu}" "brain${brain_index}/${host_netkit_if}"
 
 if ! run_mothership removeCluster "${cluster_name}" >"${tmpdir}/remove_cluster.log" 2>&1
