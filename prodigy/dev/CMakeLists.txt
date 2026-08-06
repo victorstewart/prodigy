@@ -1665,6 +1665,11 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND bash -n ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_test_cluster.sh
    )
    add_test(
+      NAME prodigy_test_cluster_darwin_route_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_test_cluster_darwin_route_unit.sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_test_cluster.sh
+   )
+   set_tests_properties(prodigy_test_cluster_darwin_route_unit PROPERTIES TIMEOUT 15)
+   add_test(
       NAME prodigy_dependency_materialization_contract
       COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_dependency_materialization_contract.cmake
    )

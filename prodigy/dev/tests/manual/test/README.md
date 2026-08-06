@@ -37,6 +37,18 @@ prodigy/dev/tests/prodigy_dev_test_cluster.sh \
   --mothership-bin=.run/release/mothership
 ```
 
+For a retained test deployment created by a separate command in the Apple
+guest, start the route owner on macOS before deploying and leave it running:
+
+```bash
+prodigy/dev/tests/prodigy_dev_test_cluster.sh --hold-apple-route
+```
+
+The owner keeps the approved Apple Container and its synthetic `/16` host route
+alive until interrupted. On exit it deletes only a route it added, then stops
+the guest. It fails closed when the synthetic prefix already contains a
+more-specific route or its exact route points at another gateway.
+
 ## Example
 
 Edit the workspace/name fields if needed, then create the cluster:
