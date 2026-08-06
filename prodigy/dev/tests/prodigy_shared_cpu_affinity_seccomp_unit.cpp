@@ -530,6 +530,52 @@ static int runChildPrivilegedFDCloseProbe(void)
   return WEXITSTATUS(status);
 }
 
+static int runContainerEnvironmentSanitizationProbe(void)
+{
+  pid_t pid = fork();
+  if (pid < 0)
+  {
+    return 200;
+  }
+
+  if (pid == 0)
+  {
+    if (setenv("PRODIGY_TEST_INHERITED_SECRET", "must-not-survive", 1) != 0)
+    {
+      _exit(101);
+    }
+    if (prodigyClearInheritedContainerEnvironment() == false)
+    {
+      _exit(102);
+    }
+    if (getenv("PRODIGY_TEST_INHERITED_SECRET") != nullptr)
+    {
+      _exit(103);
+    }
+    if (setenv("PRODIGY_TEST_DECLARED", "allowed", 1) != 0)
+    {
+      _exit(104);
+    }
+    const char *declared = getenv("PRODIGY_TEST_DECLARED");
+    if (declared == nullptr || std::strcmp(declared, "allowed") != 0)
+    {
+      _exit(105);
+    }
+    _exit(0);
+  }
+
+  int status = 0;
+  if (waitpid(pid, &status, 0) != pid)
+  {
+    return 201;
+  }
+  if (WIFEXITED(status) == false)
+  {
+    return 202;
+  }
+  return WEXITSTATUS(status);
+}
+
 int main(void)
 {
   TestSuite suite;
@@ -657,6 +703,7 @@ int main(void)
   suite.expect(runPrebuiltSeccompProbe(false, ProbeKind::ptraceTraceMe) == 0, "prebuilt_filter_blocks_ptrace_after_multithreaded_fork");
   suite.expect(runPrebuiltSeccompProbe(true, ProbeKind::schedSetAffinity) == 0, "prebuilt_shared_cpu_filter_blocks_sched_setaffinity_after_multithreaded_fork");
   suite.expect(runChildPrivilegedFDCloseProbe() == 0, "child_security_hardening_closes_inherited_privileged_fds");
+  suite.expect(runContainerEnvironmentSanitizationProbe() == 0, "container_exec_environment_excludes_parent_process_state");
   suite.expect(runPostMountExecutionSecurityPolicyProbe() == 0, "post_mount_security_policy_sets_no_new_privs_drops_caps_and_loads_seccomp");
 
   return suite.failed == 0 ? 0 : 1;

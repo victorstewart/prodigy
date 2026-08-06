@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -56,6 +57,11 @@ constexpr static auto containerNeuronListenerFDEnvironment = "PRODIGY_NEURON_LIS
 constexpr static auto containerRuntimeRootPath = "/run/prodigy/containers"_ctv;
 constexpr static int64_t failedContainerArtifactRetentionMs = 24LL * 60LL * 60LL * 1000LL;
 constexpr static int64_t failedContainerArtifactCleanupIntervalMs = 3LL * 60LL * 60LL * 1000LL;
+
+static inline bool prodigyClearInheritedContainerEnvironment(void)
+{
+  return clearenv() == 0;
+}
 
 static inline uint16_t prodigyContainerReservedCoreCount(uint32_t lcoreCount)
 {
@@ -10713,6 +10719,11 @@ public:
         failStartup("chdir failed", &chdirFailure);
       }
 
+      if (prodigyClearInheritedContainerEnvironment() == false)
+      {
+        failStartup("clear inherited environment failed");
+      }
+
       int execNeuronFD = exposeNeuronSocket ? socs[1] : -1;
       int execNeuronListenerFD = exposeNeuronSocket ? neuronListenerFD : -1;
       String execDescriptorFailure = {};
@@ -10872,9 +10883,8 @@ public:
         unsetenv("PRODIGY_NEURON_LISTENER_FD");
       }
 
-      // The parent process is launched under stdbuf in tests, which injects
-      // LD_PRELOAD for line-buffering. That path does not exist in container
-      // root filesystems and can destabilize startup.
+      // Keep test-only stdbuf variables explicitly denied if a future
+      // pre-exec step admits them after the allowlist boundary above.
       unsetenv("LD_PRELOAD");
       unsetenv("_STDBUF_I");
       unsetenv("_STDBUF_O");
