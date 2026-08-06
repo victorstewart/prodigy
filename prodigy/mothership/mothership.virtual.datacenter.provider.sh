@@ -599,7 +599,9 @@ cleanup()
 
    iptables -D FORWARD -i "${host_edge}" ! -o "${host_edge}" -j ACCEPT >/dev/null 2>&1 || true
    iptables -D FORWARD ! -i "${host_edge}" -o "${host_edge}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true
+   iptables -t nat -D POSTROUTING ! -s 172.31.0.0/30 -d 198.18.0.0/16 -o "${host_edge}" -j SNAT --to-source 172.31.0.1 >/dev/null 2>&1 || true
    iptables -t nat -D POSTROUTING -s 172.31.0.2/32 ! -o "${host_edge}" -j MASQUERADE >/dev/null 2>&1 || true
+   ip route del 198.18.0.0/16 via 172.31.0.2 dev "${host_edge}" >/dev/null 2>&1 || true
    ip route del 10.0.0.0/24 via 172.31.0.2 dev "${host_edge}" >/dev/null 2>&1 || true
    ip6tables -D FORWARD -i "${host_edge}" ! -o "${host_edge}" -j ACCEPT >/dev/null 2>&1 || true
    ip6tables -D FORWARD ! -i "${host_edge}" -o "${host_edge}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true
@@ -770,6 +772,8 @@ then
    ip -6 addr add fd00:31::1/126 dev "${host_edge}"
    ip link set "${host_edge}" up
    ip route replace 10.0.0.0/24 via 172.31.0.2 dev "${host_edge}"
+   # This synthetic public boundary belongs only to deploymentMode=test; production clusters never execute this provider.
+   ip route replace 198.18.0.0/16 via 172.31.0.2 dev "${host_edge}"
    ip netns exec "${parent_ns}" ip link set "${parent_edge}" up
    ip netns exec "${parent_ns}" ip addr add 172.31.0.2/30 dev "${parent_edge}"
    ip netns exec "${parent_ns}" ip -6 addr add fd00:31::2/126 dev "${parent_edge}"
@@ -785,6 +789,7 @@ then
    host_ipv6_forward="$(sysctl -n net.ipv6.conf.all.forwarding)"
    sysctl -q -w net.ipv4.ip_forward=1
    sysctl -q -w net.ipv6.conf.all.forwarding=1
+   iptables -t nat -A POSTROUTING ! -s 172.31.0.0/30 -d 198.18.0.0/16 -o "${host_edge}" -j SNAT --to-source 172.31.0.1
    iptables -t nat -A POSTROUTING -s 172.31.0.2/32 ! -o "${host_edge}" -j MASQUERADE
    iptables -A FORWARD -i "${host_edge}" ! -o "${host_edge}" -j ACCEPT
    iptables -A FORWARD ! -i "${host_edge}" -o "${host_edge}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
