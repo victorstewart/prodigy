@@ -89,10 +89,12 @@ if(NOT _containers MATCHES "syncDeclaredNetworkPairingPolicy\\(bool invalidateAu
 endif()
 string(FIND "${_container_egress}" "if (localSubnetContainsDaddr(daddr6))" _local_route_action)
 string(FIND "${_containers}" "host.addDirectRoute(address, 128, AF_INET6);" _local_route_install)
+string(FIND "${_all}" "writeProcSysctlValue(\"/proc/sys/net/ipv4/ip_forward\", \"1\")" _public_ingress_forwarding)
 string(FIND "${_all}" "writeProcSysctlValue(\"/proc/sys/net/ipv6/conf/all/forwarding\", \"1\")" _local_route_forwarding)
 string(REGEX MATCHALL "primary_program->setArrayElement\\(\"lc_subnet\"_ctv, 0, thisNeuron->lcsubnet6\\);" _primary_subnet_sync "${_containers}")
 list(LENGTH _primary_subnet_sync _primary_subnet_sync_count)
-if(_local_route_action EQUAL -1 OR _local_route_install EQUAL -1 OR _local_route_forwarding EQUAL -1 OR
+if(_local_route_action EQUAL -1 OR _local_route_install EQUAL -1 OR _public_ingress_forwarding EQUAL -1 OR
+   _local_route_forwarding EQUAL -1 OR
    _primary_subnet_sync_count LESS 2)
    message(FATAL_ERROR "same-machine L3 netkit traffic must use host /128 routing")
 endif()

@@ -2485,6 +2485,15 @@ protected:
 
   virtual bool ensureHostNetworkingReady(String *failureReport = nullptr) override
   {
+    if (writeProcSysctlValue("/proc/sys/net/ipv4/ip_forward", "1") == false)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("failed to enable IPv4 container routing"_ctv);
+      }
+      return false;
+    }
+
     if (writeProcSysctlValue("/proc/sys/net/ipv6/conf/all/forwarding", "1") == false)
     {
       if (failureReport)
