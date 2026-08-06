@@ -2022,6 +2022,10 @@ int main(void)
     localPrivate4.address.assign("10.0.0.10"_ctv);
     localPrivate4.cidr = 24;
     local.peerAddresses.push_back(localPrivate4);
+    ClusterMachinePeerAddress localPublic6 = {};
+    localPublic6.address.assign("2602:fac0:0:12ab:34cd::10"_ctv);
+    localPublic6.cidr = 64;
+    local.peerAddresses.push_back(localPublic6);
     local.hardware.inventoryComplete = true;
     local.hardware.cpu.logicalCores = 4;
     local.hardware.memory.totalMB = 4096;
@@ -2034,6 +2038,10 @@ int main(void)
     remotePrivate4.address.assign("10.0.0.20"_ctv);
     remotePrivate4.cidr = 24;
     remote.peerAddresses.push_back(remotePrivate4);
+    ClusterMachinePeerAddress remotePublic6 = {};
+    remotePublic6.address.assign("2602:fac0:0:12ab:34cd::20"_ctv);
+    remotePublic6.cidr = 64;
+    remote.peerAddresses.push_back(remotePublic6);
     remote.hardware.inventoryComplete = true;
     remote.hardware.cpu.logicalCores = 4;
     remote.hardware.memory.totalMB = 4096;

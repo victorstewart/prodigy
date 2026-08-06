@@ -432,6 +432,9 @@ inline bool BrainBase::buildSwitchboardOverlayRoutingConfig(Machine *machine, Sw
 
     Vector<ClusterMachinePeerAddress> remoteCandidates = {};
     prodigyCollectMachineOverlayRouteAddresses(*candidate, remoteCandidates);
+    std::stable_sort(remoteCandidates.begin(), remoteCandidates.end(), [](const ClusterMachinePeerAddress& lhs, const ClusterMachinePeerAddress& rhs) -> bool {
+      return prodigyClusterMachinePeerAddressIsPrivate(lhs) && prodigyClusterMachinePeerAddressIsPrivate(rhs) == false;
+    });
 
     auto appendIPv6Route = [&]() -> bool {
       for (const ClusterMachinePeerAddress& remoteCandidate : remoteCandidates)
