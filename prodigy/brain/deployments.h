@@ -6687,7 +6687,12 @@ public:
         assignNext(dwork, cwork);
         assignPrev(cwork, dwork);
 
-        toSchedule.push_back(dwork);
+        if (plan.isStateful)
+          toSchedule.push_back(dwork);
+        else
+          toSchedule.insert(std::find_if(
+              toSchedule.begin(), toSchedule.end(), [](DeploymentWork *work)
+              { return work->getBase()->lifecycle == LifecycleOp::construct; }), dwork);
         toSchedule.push_back(cwork);
       }
     }

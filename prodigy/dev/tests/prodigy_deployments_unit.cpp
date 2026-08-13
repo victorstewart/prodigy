@@ -8666,6 +8666,31 @@ int main(void)
 
   {
     ApplicationDeployment deployment;
+    deployment.plan.moveConstructively = false;
+    DeploymentWork cworkA, cworkB, dworkA, dworkB;
+    cworkA.emplace<StatelessWork>();
+    cworkB.emplace<StatelessWork>();
+    dworkA.emplace<StatelessWork>();
+    dworkB.emplace<StatelessWork>();
+    std::get<StatelessWork>(cworkA).lifecycle = LifecycleOp::construct;
+    std::get<StatelessWork>(cworkB).lifecycle = LifecycleOp::construct;
+    std::get<StatelessWork>(dworkA).lifecycle = LifecycleOp::destruct;
+    std::get<StatelessWork>(dworkB).lifecycle = LifecycleOp::destruct;
+
+    deployment.scheduleConstructionDestruction(&cworkA, &dworkA);
+    deployment.scheduleConstructionDestruction(&cworkB, &dworkB);
+
+    suite.expect(deployment.toSchedule.size() == 4,
+                 "scheduleConstructionDestruction_destructive_drain_count");
+    suite.expect(deployment.toSchedule[0] == &dworkA &&
+                     deployment.toSchedule[1] == &dworkB &&
+                     deployment.toSchedule[2] == &cworkA &&
+                     deployment.toSchedule[3] == &cworkB,
+                 "scheduleConstructionDestruction_destructive_drains_before_constructing");
+  }
+
+  {
+    ApplicationDeployment deployment;
     deployment.plan.moveConstructively = true;
 
     DeploymentWork cwork;
