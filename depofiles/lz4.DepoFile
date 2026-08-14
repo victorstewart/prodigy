@@ -1,3 +1,5 @@
+# Copyright 2026 Victor Stewart
+# SPDX-License-Identifier: Apache-2.0
 NAME lz4
 VERSION 1.10.0
 SYSTEM_LIBS ALLOW
