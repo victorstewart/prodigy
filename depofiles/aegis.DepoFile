@@ -1,5 +1,3 @@
-# Copyright 2026 Victor Stewart
-# SPDX-License-Identifier: Apache-2.0
 NAME aegis
 VERSION 0.10.1
 SOURCE URL https://github.com/aegis-aead/libaegis/archive/refs/tags/0.10.1.tar.gz
