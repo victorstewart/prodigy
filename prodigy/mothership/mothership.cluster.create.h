@@ -352,6 +352,14 @@ static inline bool mothershipBuildClusterBrainConfig(const MothershipProdigyClus
   config.bootstrapSshHostKeyPackage = cluster.bootstrapSshHostKeyPackage;
   config.bootstrapSshPrivateKeyPath = cluster.bootstrapSshPrivateKeyPath;
   config.remoteProdigyPath = cluster.remoteProdigyPath;
+  if (cluster.deploymentMode == MothershipClusterDeploymentMode::test && config.remoteProdigyPath.size() == 0)
+  {
+    // Test clusters intentionally do not persist an operator-selected remote
+    // install path, but the virtual datacenter installs the approved bundle at
+    // the same canonical root used by managed machines. Runtime helpers such
+    // as the ACME hooks still need that installed tools directory.
+    config.remoteProdigyPath.assign(defaultMothershipRemoteProdigyPath());
+  }
   config.osUpdatesEnabled = cluster.osUpdatesEnabled;
   config.osUpdatePolicies = cluster.osUpdatePolicies;
   config.maxOSDrains = cluster.maxOSDrains > 0 ? cluster.maxOSDrains : 1;

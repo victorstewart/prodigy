@@ -729,6 +729,20 @@ int main(void)
 
   {
     MothershipProdigyCluster cluster = {};
+    cluster.name = "test-runtime-install-root"_ctv;
+    cluster.clusterUUID = 0xD500;
+    cluster.deploymentMode = MothershipClusterDeploymentMode::test;
+    cluster.controls.push_back(makeUnixControl("/tmp/prodigy-vdc-0xd500/mothership.sock"_ctv));
+
+    BrainConfig config = {};
+    String failure = {};
+    const bool built = mothershipBuildClusterBrainConfig(cluster, nullptr, config, &failure);
+    suite.expect(built, "test_cluster_brain_config_builds");
+    suite.expect(config.remoteProdigyPath.equal(String(defaultMothershipRemoteProdigyPath())), "test_cluster_brain_config_uses_installed_bundle_root");
+  }
+
+  {
+    MothershipProdigyCluster cluster = {};
     cluster.name = "dns-enabled"_ctv;
     cluster.clusterUUID = 0xD501;
     cluster.deploymentMode = MothershipClusterDeploymentMode::local;
