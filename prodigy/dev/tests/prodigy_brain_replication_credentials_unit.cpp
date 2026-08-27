@@ -9716,6 +9716,45 @@ static void testCertificateLifecycleSchedulers(TestSuite& suite)
 
   {
     TestBrain brain;
+    brain.weAreMaster = true;
+    PublicTlsCertificateState certificate = {};
+    certificate.spec.applicationID = 60'016;
+    certificate.spec.deploymentID = 12;
+    certificate.spec.wormholeName = "api"_ctv;
+    certificate.spec.identityName = "api-public"_ctv;
+    certificate.certbotCertName = "app60016-api-public"_ctv;
+    certificate.lastAttemptMs = 1'700'000'000'000;
+    certificate.lastSuccessMs = certificate.lastAttemptMs;
+    brain.masterAuthorityRuntimeState.publicTlsCertificates.push_back(certificate);
+
+    const String key = TestBrain::publicTlsCertificateRuntimeKey(
+        brain.masterAuthorityRuntimeState.publicTlsCertificates[0]);
+    const pid_t child = fork();
+    if (child == 0)
+    {
+      _exit(EXIT_SUCCESS);
+    }
+    if (suite.require(child > 0, "public_tls_scheduler_successful_reap_forks_child"))
+    {
+      brain.publicTlsCertbotJobs.insert_or_assign(
+          key,
+          PublicTlsCertbotJob {child, certificate.lastAttemptMs, -1});
+      uint32_t reaped = 0;
+      for (uint32_t attempt = 0; attempt < 100 && reaped == 0; ++attempt)
+      {
+        reaped = brain.reapPublicTlsCertbotProcesses(certificate.lastAttemptMs);
+        if (reaped == 0)
+        {
+          usleep(1000);
+        }
+      }
+      suite.expect(reaped == 1 && brain.publicTlsCertbotJobs.empty(), "public_tls_scheduler_successful_reap_clears_process_state");
+      suite.expect(brain.persistCalls == 0, "public_tls_scheduler_successful_reap_skips_unchanged_snapshot");
+    }
+  }
+
+  {
+    TestBrain brain;
     brain.brainConfig.acme.accountEmail = "ops@example.com"_ctv;
     brain.brainConfig.acme.termsAgreed = true;
     installACMEZoneDNSCredential(brain, 60'014, "prod-dns"_ctv, "example.com"_ctv);

@@ -8370,6 +8370,7 @@ public:
       }
 
       PublicTlsCertificateState *certificate = findPublicTlsCertificateStateByRuntimeKey(it->first);
+      bool certificateChanged = false;
       if (certificate != nullptr)
       {
         if (failure.size() == 0 && result < 0)
@@ -8394,13 +8395,18 @@ public:
         if (failure.size() > 0)
         {
           noteCertificateFailure(certificate->failureCount, certificate->lastFailure, failure);
+          certificateChanged = true;
         }
         (void)cleanupPublicTlsPendingDNS01Challenges(*certificate);
       }
       releasePublicTlsCertbotLock(job);
       it = publicTlsCertbotJobs.erase(it);
       reaped += 1;
-      if (certificate != nullptr)
+      // Successful lineage import and exact DNS cleanup persist their own
+      // durable changes. Reaping the now-empty process record is otherwise a
+      // runtime-only operation, so do not copy and serialize the full master
+      // snapshot again unless the reaper recorded a terminal failure.
+      if (certificateChanged)
       {
         noteMasterAuthorityRuntimeStateChanged();
       }
