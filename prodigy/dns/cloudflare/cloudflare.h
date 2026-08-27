@@ -121,7 +121,7 @@ private:
     }
     String response = {};
     long httpCode = 0;
-    co_return acceptHTTP(co_await sendHTTP(coro, request, response, httpCode, failure), httpCode, response, failure, "cloudflare dns upsert failed");
+    co_return acceptCloudflareResponse(co_await sendHTTP(coro, request, response, httpCode, failure), httpCode, response, failure, "cloudflare dns upsert failed");
   }
 
   ProdigyHostTask<bool> removeExact(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, const String& id, String& failure)
@@ -135,7 +135,7 @@ private:
     request.bearer(credential.material);
     String response = {};
     long httpCode = 0;
-    co_return acceptHTTP(co_await sendHTTP(coro, request, response, httpCode, failure), httpCode, response, failure, "cloudflare dns delete failed");
+    co_return acceptCloudflareResponse(co_await sendHTTP(coro, request, response, httpCode, failure), httpCode, response, failure, "cloudflare dns delete failed");
   }
 
   ProdigyHostTask<bool> findRecord(CoroutineStack *coro, const ProdigyDNSRecordBinding& record, const ApiCredential& credential, ProdigyDNSRecordPresence& presence, String& id, String& failure, bool exactOnly = false)
@@ -172,5 +172,34 @@ private:
       value.resize(value.size() - 1);
     }
     return value;
+  }
+
+  bool acceptCloudflareResponse(bool transportSuccess,
+                                long httpCode,
+                                const String& response,
+                                String& failure,
+                                const char *context)
+  {
+    if (acceptHTTP(transportSuccess, httpCode, response, failure, context) == false)
+    {
+      return false;
+    }
+
+    String json = {};
+    json.assign(response);
+    json.need(simdjson::SIMDJSON_PADDING);
+    simdjson::dom::parser parser;
+    simdjson::dom::element document;
+    bool success = false;
+    if (parser.parse(json.data(), json.size()).get(document) ||
+        document["success"].get(success) != simdjson::SUCCESS ||
+        success == false)
+    {
+      failure.assign(context);
+      failure.append(": response missing success=true"_ctv);
+      return false;
+    }
+    failure.clear();
+    return true;
   }
 };

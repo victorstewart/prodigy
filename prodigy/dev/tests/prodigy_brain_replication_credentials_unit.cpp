@@ -9655,6 +9655,7 @@ static void testCertificateLifecycleSchedulers(TestSuite& suite)
 
     TestBrain brain;
     TestDNSProvider dns;
+    brain.weAreMaster = true;
     brain.dnsProvider = &dns;
     brain.brainConfig.clusterUUID = uint128_t(0xAC03);
     brain.brainConfig.controlSocketPath = "/run/prodigy/control.sock"_ctv;
@@ -11680,6 +11681,7 @@ static void testACMEDNS01ChallengeTopicsUsePublicTlsState(TestSuite& suite)
   brain.brainConfig.clusterUUID = uint128_t(0xAC702);
   brain.dnsProvider = &dns;
   brain.brainConfig.dnsProvider = "cloudflare"_ctv;
+  brain.activeMotherships.insert(&mothership);
 
   ApplicationApiCredentialSet set = {};
   set.applicationID = 702;
@@ -11761,6 +11763,9 @@ static void testACMEDNS01ChallengeTopicsUsePublicTlsState(TestSuite& suite)
   suite.expect(dns.activeTXT.size() == 1 && dns.activeTXT[0].values[0].equal("token-1"_ctv), "mothership_acme_present_dns01_tracks_first_txt_value");
   suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].pendingDNS01Challenges.size() == 1, "mothership_acme_present_dns01_records_pending_value");
   suite.expect(brain.routableResourceLeaseRuntimeState.empty(), "mothership_acme_present_dns01_does_not_create_routable_lease");
+  brain.reconcileAuthoritativeDNSState();
+  suite.expect(dns.cleanupTXTCalls == 0 && dns.activeTXT.size() == 1, "mothership_acme_unrelated_dns_reconcile_preserves_active_value");
+  suite.expect(brain.publicTlsDNS01CleanupIntents.empty(), "mothership_acme_present_dns01_does_not_request_cleanup");
 
   request.validation = "token-2"_ctv;
   response = {};
@@ -11768,27 +11773,46 @@ static void testACMEDNS01ChallengeTopicsUsePublicTlsState(TestSuite& suite)
   suite.expect(response.success, "mothership_acme_present_dns01_second_value_success");
   suite.expect(dns.activeTXT.size() == 2, "mothership_acme_present_dns01_preserves_simultaneous_values");
   suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].pendingDNS01Challenges.size() == 2, "mothership_acme_present_dns01_records_second_pending_value");
+  suite.expect(brain.publicTlsDNS01CleanupIntents.empty(), "mothership_acme_multi_san_present_leaves_no_cleanup_intents");
 
   request.validation = "token-1"_ctv;
+  dns.failRemove = true;
   response = {};
   suite.expect(sendChallenge(MothershipTopic::cleanupACMEDNS01Challenge, response), "mothership_acme_cleanup_dns01_deserializes_response");
-  suite.expect(response.success, "mothership_acme_cleanup_dns01_success");
-  suite.expect(dns.cleanupTXTCalls == 1 && dns.cleanedTXT.size() == 1 && dns.cleanedTXT[0].name.equal("_acme-challenge.example.com."_ctv), "mothership_acme_cleanup_dns01_removes_exact_name");
+  suite.expect(response.success == false, "mothership_acme_cleanup_dns01_reports_provider_failure");
+  suite.expect(dns.cleanupTXTCalls == 1 && dns.activeTXT.size() == 2, "mothership_acme_cleanup_dns01_failure_preserves_active_values");
+  suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].pendingDNS01Challenges.size() == 2, "mothership_acme_cleanup_dns01_failure_preserves_pending_value");
+  suite.expect(brain.publicTlsDNS01CleanupIntents.size() == 1, "mothership_acme_cleanup_dns01_failure_retains_cleanup_intent");
+
+  dns.failRemove = false;
+  brain.reconcileAuthoritativeDNSState();
+  suite.expect(dns.cleanupTXTCalls == 2 && dns.cleanedTXT.back().name.equal("_acme-challenge.example.com."_ctv), "mothership_acme_cleanup_dns01_retry_removes_exact_name");
   suite.expect(dns.activeTXT.size() == 1 && dns.activeTXT[0].values[0].equal("token-2"_ctv), "mothership_acme_cleanup_dns01_preserves_other_value");
   suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].pendingDNS01Challenges.size() == 1 && brain.masterAuthorityRuntimeState.publicTlsCertificates[0].pendingDNS01Challenges[0].validation.equal("token-2"_ctv), "mothership_acme_cleanup_dns01_forgets_only_exact_value");
+  suite.expect(brain.publicTlsDNS01CleanupIntents.empty(), "mothership_acme_cleanup_dns01_forgets_exact_cleanup_intent");
   suite.expect(brain.routableResourceLeaseRuntimeState.empty(), "mothership_acme_cleanup_dns01_does_not_create_routable_lease");
+
+  brain.cleanupOrphanedPublicTlsDNS01ChallengesAfterMasterElection();
+  suite.expect(dns.cleanupTXTCalls == 3 && dns.activeTXT.empty(), "mothership_acme_master_recovery_cleans_orphaned_value");
+  suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates[0].pendingDNS01Challenges.empty(), "mothership_acme_master_recovery_forgets_orphaned_value");
+  suite.expect(brain.publicTlsDNS01CleanupIntents.empty(), "mothership_acme_master_recovery_converges_cleanup_intents");
+
+  request.validation = "token-3"_ctv;
+  response = {};
+  suite.expect(sendChallenge(MothershipTopic::presentACMEDNS01Challenge, response) && response.success, "mothership_acme_release_setup_present_succeeds");
+  suite.expect(dns.activeTXT.size() == 1 && dns.activeTXT[0].values[0].equal("token-3"_ctv), "mothership_acme_release_setup_tracks_value");
 
   brain.apiCredentialSetsByApp[set.applicationID].credentials[0].metadata.insert_or_assign("dnsZones"_ctv, "example.net"_ctv);
   response = {};
   suite.expect(sendChallenge(MothershipTopic::presentACMEDNS01Challenge, response), "mothership_acme_present_dns01_rejects_out_of_scope_credential_response");
   suite.expect(response.success == false && response.failure.equal("ACME DNS credential does not cover challenge zone"_ctv), "mothership_acme_present_dns01_rejects_out_of_scope_credential");
-  suite.expect(dns.presentTXTCalls == 2, "mothership_acme_present_dns01_out_of_scope_skips_provider");
+  suite.expect(dns.presentTXTCalls == 3, "mothership_acme_present_dns01_out_of_scope_skips_provider");
 
   request.identifier = "evil.example.net"_ctv;
   response = {};
   suite.expect(sendChallenge(MothershipTopic::presentACMEDNS01Challenge, response), "mothership_acme_present_dns01_rejects_wrong_domain_response");
   suite.expect(response.success == false && response.failure.equal("ACME identifier is not in certificate domains"_ctv), "mothership_acme_present_dns01_rejects_wrong_domain");
-  suite.expect(dns.presentTXTCalls == 2, "mothership_acme_present_dns01_wrong_domain_skips_provider");
+  suite.expect(dns.presentTXTCalls == 3, "mothership_acme_present_dns01_wrong_domain_skips_provider");
 
   brain.apiCredentialSetsByApp[set.applicationID].credentials[0].metadata.insert_or_assign("dnsZones"_ctv, "example.com"_ctv);
   request.identifier = "*.example.com"_ctv;
@@ -11796,10 +11820,10 @@ static void testACMEDNS01ChallengeTopicsUsePublicTlsState(TestSuite& suite)
   response = {};
   suite.expect(sendChallenge(MothershipTopic::presentACMEDNS01Challenge, response), "mothership_acme_present_dns01_rejects_wrong_cluster_response");
   suite.expect(response.success == false && response.failure.equal("ACME hook cluster UUID mismatch"_ctv), "mothership_acme_present_dns01_rejects_wrong_cluster");
-  suite.expect(dns.presentTXTCalls == 2, "mothership_acme_present_dns01_wrong_cluster_skips_provider");
+  suite.expect(dns.presentTXTCalls == 3, "mothership_acme_present_dns01_wrong_cluster_skips_provider");
   request.clusterUUID = brain.brainConfig.clusterUUID;
   suite.expect(brain.releasePublicTlsCertificatesForDeployment(certificate.spec.deploymentID) == 1, "mothership_acme_release_removes_certificate_state");
-  suite.expect(dns.cleanupTXTCalls == 2 && dns.cleanedTXT.back().values[0].equal("token-2"_ctv), "mothership_acme_release_cleans_pending_txt_value");
+  suite.expect(dns.cleanupTXTCalls == 4 && dns.cleanedTXT.back().values[0].equal("token-3"_ctv), "mothership_acme_release_cleans_pending_txt_value");
   suite.expect(dns.activeTXT.empty(), "mothership_acme_release_leaves_no_active_txt_values");
 }
 
@@ -20163,6 +20187,26 @@ int main(void)
   {
     Ring::createRing(8, 8, 32, 32, -1, -1, 0);
     createdRing = true;
+  }
+  if (std::getenv("PRODIGY_TEST_ACME_DNS01_LIFECYCLE") != nullptr)
+  {
+    testACMEDNS01ChallengeTopicsUsePublicTlsState(suite);
+    dprintf(STDERR_FILENO, "%s: prodigy_brain_acme_dns01_lifecycle failed=%d\n", suite.failed == 0 ? "PASS" : "FAIL", suite.failed);
+    if (createdRing)
+    {
+      Ring::shutdownForExec();
+    }
+    return suite.failed == 0 ? 0 : 1;
+  }
+  if (std::getenv("PRODIGY_TEST_CERTIFICATE_LIFECYCLE_SCHEDULERS") != nullptr)
+  {
+    testCertificateLifecycleSchedulers(suite);
+    dprintf(STDERR_FILENO, "%s: prodigy_brain_certificate_lifecycle_schedulers failed=%d\n", suite.failed == 0 ? "PASS" : "FAIL", suite.failed);
+    if (createdRing)
+    {
+      Ring::shutdownForExec();
+    }
+    return suite.failed == 0 ? 0 : 1;
   }
 
   testContainerNeuronListenerContract(suite);

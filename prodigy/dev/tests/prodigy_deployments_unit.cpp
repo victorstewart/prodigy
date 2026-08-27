@@ -808,6 +808,13 @@ int main(void)
     suite.expect(cloudflare.requests.size() == 2 && stringContains(cloudflare.requests[1].body, "\"content\":\"203.0.113.10\""), "dns_provider_cloudflare_create_body_targets_address");
     suite.expect(cloudflare.requests.size() == 2 && stringContains(cloudflare.requests[1].body, "\"name\":\"api.example.com\""), "dns_provider_cloudflare_create_body_omits_trailing_dot");
 
+    RecordingCloudflareDNSProvider cloudflareCreateRejected = {};
+    cloudflareCreateRejected.responses.push_back("{\"result\":[]}"_ctv);
+    cloudflareCreateRejected.responses.push_back("{\"success\":false}"_ctv);
+    suite.expect(testDNSUpsert(cloudflareCreateRejected, record, credential, failure) == false &&
+                     failure.equal("cloudflare dns upsert failed: response missing success=true"_ctv),
+                 "dns_provider_cloudflare_create_rejects_unsuccessful_2xx_envelope");
+
     RecordingCloudflareDNSProvider cloudflareConflict = {};
     cloudflareConflict.responses.push_back("{\"result\":[{\"id\":\"rec-2\",\"type\":\"A\",\"name\":\"api.example.com\",\"content\":\"203.0.113.11\"}]}"_ctv);
     suite.expect(testDNSUpsert(cloudflareConflict, record, credential, failure) == false, "dns_provider_cloudflare_rejects_existing_different_record");
@@ -816,10 +823,17 @@ int main(void)
 
     RecordingCloudflareDNSProvider cloudflareDelete = {};
     cloudflareDelete.responses.push_back("{\"result\":[{\"id\":\"rec-1\",\"type\":\"A\",\"name\":\"api.example.com.\",\"content\":\"203.0.113.10\"}]}"_ctv);
-    cloudflareDelete.responses.push_back("{}"_ctv);
+    cloudflareDelete.responses.push_back("{\"success\":true}"_ctv);
     suite.expect(testDNSRemove(cloudflareDelete, record, credential, failure), "dns_provider_cloudflare_delete_succeeds");
     suite.expect(cloudflareDelete.requests.size() == 2 && cloudflareDelete.requests[1].method.equal("DELETE"_ctv), "dns_provider_cloudflare_delete_uses_record_id");
     suite.expect(cloudflareDelete.requests.size() == 2 && stringContains(cloudflareDelete.requests[1].url, "/rec-1"), "dns_provider_cloudflare_delete_url_contains_record_id");
+
+    RecordingCloudflareDNSProvider cloudflareDeleteRejected = {};
+    cloudflareDeleteRejected.responses.push_back("{\"result\":[{\"id\":\"rec-1\",\"type\":\"A\",\"name\":\"api.example.com.\",\"content\":\"203.0.113.10\"}]}"_ctv);
+    cloudflareDeleteRejected.responses.push_back("{\"success\":false}"_ctv);
+    suite.expect(testDNSRemove(cloudflareDeleteRejected, record, credential, failure) == false &&
+                     failure.equal("cloudflare dns delete failed: response missing success=true"_ctv),
+                 "dns_provider_cloudflare_delete_rejects_unsuccessful_2xx_envelope");
 
     RecordingRoute53DNSProvider route53 = {};
     record.provider = "route53"_ctv;
@@ -915,7 +929,7 @@ int main(void)
 
     RecordingCloudflareDNSProvider cloudflareTXTCleanup = {};
     cloudflareTXTCleanup.responses.push_back("{\"result\":[{\"id\":\"old\",\"type\":\"TXT\",\"name\":\"_acme-challenge.api.example.com.\",\"content\":\"old-token\"},{\"id\":\"new\",\"type\":\"TXT\",\"name\":\"_acme-challenge.api.example.com.\",\"content\":\"token-1\"}]}"_ctv);
-    cloudflareTXTCleanup.responses.push_back("{}"_ctv);
+    cloudflareTXTCleanup.responses.push_back("{\"success\":true}"_ctv);
     suite.expect(testDNSCleanupTXT(cloudflareTXTCleanup, txt, credential, failure), "dns_provider_cloudflare_cleanup_txt_removes_exact_value");
     suite.expect(cloudflareTXTCleanup.requests.size() == 2 && stringContains(cloudflareTXTCleanup.requests[1].url, "/new"), "dns_provider_cloudflare_cleanup_txt_uses_exact_record_id");
 

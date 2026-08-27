@@ -1207,6 +1207,15 @@ public:
   bytell_hash_map<uint16_t, ApplicationApiCredentialSet> apiCredentialSetsByApp;
   bytell_hash_map<uint64_t, BrainTlsResumptionDeploymentState> tlsResumptionStateByDeployment;
   bytell_hash_map<String, PublicTlsCertbotJob> publicTlsCertbotJobs;
+  class PublicTlsDNS01CleanupIntent
+  {
+  public:
+
+    String certificateKey;
+    AcmeDNS01ChallengeState challenge;
+  };
+  Vector<PublicTlsDNS01CleanupIntent> publicTlsDNS01CleanupIntents;
+  uint32_t publicTlsDNS01CleanupDispatchDepth = 0;
   bytell_hash_map<String, uint16_t> reservedApplicationIDsByName;
   bytell_hash_map<uint16_t, String> reservedApplicationNamesByID;
   bytell_hash_map<String, ApplicationServiceIdentity> reservedApplicationServicesByNameKey;
@@ -3107,6 +3116,133 @@ public:
     return false;
   }
 
+  bool publicTlsDNS01CleanupIntentPending(const String& certificateKey,
+                                          const AcmeDNS01ChallengeState& challenge) const
+  {
+    for (const PublicTlsDNS01CleanupIntent& intent : publicTlsDNS01CleanupIntents)
+    {
+      if (intent.certificateKey.equals(certificateKey) &&
+          prodigyACMEDNS01ChallengeStatesEqual(intent.challenge, challenge))
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool publicTlsDNS01CleanupIntentPendingForCertificate(const String& certificateKey) const
+  {
+    for (const PublicTlsDNS01CleanupIntent& intent : publicTlsDNS01CleanupIntents)
+    {
+      if (intent.certificateKey.equals(certificateKey))
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool rememberPublicTlsDNS01CleanupIntent(const String& certificateKey,
+                                           const AcmeDNS01ChallengeState& challenge)
+  {
+    if (publicTlsDNS01CleanupIntentPending(certificateKey, challenge))
+    {
+      return false;
+    }
+    PublicTlsDNS01CleanupIntent intent;
+    intent.certificateKey.assign(certificateKey);
+    intent.challenge = challenge;
+    publicTlsDNS01CleanupIntents.push_back(std::move(intent));
+    return true;
+  }
+
+  bool forgetPublicTlsDNS01CleanupIntent(const String& certificateKey,
+                                         const AcmeDNS01ChallengeState& challenge)
+  {
+    for (auto it = publicTlsDNS01CleanupIntents.begin(); it != publicTlsDNS01CleanupIntents.end(); ++it)
+    {
+      if (it->certificateKey.equals(certificateKey) &&
+          prodigyACMEDNS01ChallengeStatesEqual(it->challenge, challenge))
+      {
+        publicTlsDNS01CleanupIntents.erase(it);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool publicTlsDNS01CleanupOperationPending(const String& certificateKey,
+                                             const AcmeDNS01ChallengeState& challenge) const
+  {
+    for (const auto& [owner, pending] : pendingDNSOperations)
+    {
+      (void)owner;
+      if (pending.kind == PendingDNSOperationKind::challenge &&
+          pending.action == ProdigyBrainDNSOperationCoordinator::Action::cleanupTXT &&
+          pending.certificateKey.equals(certificateKey) &&
+          prodigyACMEDNS01ChallengeStatesEqual(acmeDNS01ChallengeStateFromRecord(pending.record), challenge))
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool reconcilePublicTlsDNS01CleanupIntents(void)
+  {
+    if (weAreMaster == false)
+    {
+      return false;
+    }
+    for (const PublicTlsDNS01CleanupIntent& intent : publicTlsDNS01CleanupIntents)
+    {
+      if (publicTlsDNS01CleanupOperationPending(intent.certificateKey, intent.challenge))
+      {
+        continue;
+      }
+      PublicTlsCertificateState *certificate = findPublicTlsCertificateStateByRuntimeKey(intent.certificateKey);
+      if (certificate == nullptr)
+      {
+        armDNSReconciliationRetry();
+        return false;
+      }
+
+      ProdigyDNSRecordBinding record = acmeDNS01ChallengeRecordFromState(intent.challenge);
+      const ApiCredential *credential = findDNSCredential(certificate->spec.applicationID, intent.challenge.credentialName);
+      ProdigyDNSProvider *provider = credential == nullptr ||
+                                             routableResourceDNSPartEquals(credential->provider, intent.challenge.provider, false) == false ?
+                                         nullptr :
+                                         resolveDNSProvider(intent.challenge.provider);
+      if (provider == nullptr || dnsOperations.canEnqueue() == false)
+      {
+        armDNSReconciliationRetry();
+        return false;
+      }
+      const uint64_t owner = mintDNSOperationOwner();
+      PendingDNSOperation pending;
+      pending.kind = PendingDNSOperationKind::challenge;
+      pending.action = ProdigyBrainDNSOperationCoordinator::Action::cleanupTXT;
+      ownDNSRecordBinding(pending.record, record);
+      pending.certificateKey.assign(intent.certificateKey);
+      pendingDNSOperations.insert_or_assign(owner, std::move(pending));
+      if (!dnsOperations.enqueue(*provider,
+                                ProdigyBrainDNSOperationCoordinator::Action::cleanupTXT,
+                                record,
+                                certificate->spec.applicationID,
+                                credential->generation,
+                                owner))
+      {
+        pendingDNSOperations.erase(owner);
+        armDNSReconciliationRetry();
+        return false;
+      }
+      // Completion re-enters reconciliation. Submitting one operation at a
+      // time also keeps synchronous test providers from invalidating this walk.
+      return true;
+    }
+    return false;
+  }
+
   bool cleanupPublicTlsPendingDNS01Challenges(PublicTlsCertificateState& certificate)
   {
     if (weAreMaster == false)
@@ -3116,55 +3252,26 @@ public:
     const String certificateKey = publicTlsCertificateRuntimeKey(certificate);
     for (const AcmeDNS01ChallengeState& challenge : certificate.pendingDNS01Challenges)
     {
-      ProdigyDNSRecordBinding record = acmeDNS01ChallengeRecordFromState(challenge);
-      bool alreadyPending = false;
-      for (const auto& [owner, pending] : pendingDNSOperations)
-      {
-        (void)owner;
-        alreadyPending = pending.kind == PendingDNSOperationKind::challenge &&
-                         pending.action == ProdigyBrainDNSOperationCoordinator::Action::cleanupTXT &&
-                         pending.certificateKey.equals(certificateKey) &&
-                         prodigyACMEDNS01ChallengeStatesEqual(acmeDNS01ChallengeStateFromRecord(pending.record), challenge);
-        if (alreadyPending)
-        {
-          break;
-        }
-      }
-      if (alreadyPending)
-      {
-        continue;
-      }
+      (void)rememberPublicTlsDNS01CleanupIntent(certificateKey, challenge);
+    }
+    publicTlsDNS01CleanupDispatchDepth += 1;
+    const bool submitted = reconcilePublicTlsDNS01CleanupIntents();
+    publicTlsDNS01CleanupDispatchDepth -= 1;
+    return submitted;
+  }
 
-      const ApiCredential *credential = findDNSCredential(certificate.spec.applicationID, challenge.credentialName);
-      ProdigyDNSProvider *provider = credential == nullptr ||
-                                             routableResourceDNSPartEquals(credential->provider, challenge.provider, false) == false ?
-                                         nullptr :
-                                         resolveDNSProvider(challenge.provider);
-      if (provider == nullptr || dnsOperations.canEnqueue() == false)
+  void cleanupOrphanedPublicTlsDNS01ChallengesAfterMasterElection(void)
+  {
+    publicTlsDNS01CleanupIntents.clear();
+    for (const PublicTlsCertificateState& certificate : masterAuthorityRuntimeState.publicTlsCertificates)
+    {
+      const String certificateKey = publicTlsCertificateRuntimeKey(certificate);
+      for (const AcmeDNS01ChallengeState& challenge : certificate.pendingDNS01Challenges)
       {
-        armDNSReconciliationRetry();
-        break;
-      }
-      const uint64_t owner = mintDNSOperationOwner();
-      PendingDNSOperation pending;
-      pending.kind = PendingDNSOperationKind::challenge;
-      pending.action = ProdigyBrainDNSOperationCoordinator::Action::cleanupTXT;
-      ownDNSRecordBinding(pending.record, record);
-      pending.certificateKey.assign(certificateKey);
-      pendingDNSOperations.insert_or_assign(owner, std::move(pending));
-      if (!dnsOperations.enqueue(*provider,
-                                ProdigyBrainDNSOperationCoordinator::Action::cleanupTXT,
-                                record,
-                                certificate.spec.applicationID,
-                                credential->generation,
-                                owner))
-      {
-        pendingDNSOperations.erase(owner);
-        armDNSReconciliationRetry();
-        break;
+        (void)rememberPublicTlsDNS01CleanupIntent(certificateKey, challenge);
       }
     }
-    return false;
+    (void)reconcilePublicTlsDNS01CleanupIntents();
   }
 
   PublicTlsCertificateState *findPublicTlsCertificateStateByRuntimeKey(const String& key)
@@ -3217,6 +3324,8 @@ public:
     {
       if (certificate.releasePending == false &&
           certificate.spec.deploymentID != spec.deploymentID &&
+          certificate.pendingDNS01Challenges.empty() &&
+          publicTlsDNS01CleanupIntentPendingForCertificate(publicTlsCertificateRuntimeKey(certificate)) == false &&
           publicTlsCertbotJobs.find(publicTlsCertificateRuntimeKey(certificate)) == publicTlsCertbotJobs.end() &&
           publicTlsCertificateTransferCompatible(certificate, spec))
       {
@@ -3478,6 +3587,8 @@ public:
   {
     auto appIt = deploymentsByApp.find(certificate.spec.applicationID);
     if (appIt == deploymentsByApp.end() || appIt->second == nullptr || appIt->second->plan.config.deploymentID() == certificate.spec.deploymentID ||
+        certificate.pendingDNS01Challenges.empty() == false ||
+        publicTlsDNS01CleanupIntentPendingForCertificate(publicTlsCertificateRuntimeKey(certificate)) ||
         publicTlsCertbotJobs.find(publicTlsCertificateRuntimeKey(certificate)) != publicTlsCertbotJobs.end())
     {
       return false;
@@ -3499,7 +3610,6 @@ public:
       {
         return false;
       }
-      (void)cleanupPublicTlsPendingDNS01Challenges(certificate);
       certificate.spec = spec;
       certificate.certbotCertName = certName;
       certificate.releasePending = false;
@@ -3619,12 +3729,17 @@ public:
     pending.action = cleanup ? ProdigyBrainDNSOperationCoordinator::Action::cleanupTXT :
                                ProdigyBrainDNSOperationCoordinator::Action::presentTXT;
     ownDNSRecordBinding(pending.record, record);
-    pending.certificateKey.assign(publicTlsCertificateRuntimeKey(*certificate));
+    const String certificateKey = publicTlsCertificateRuntimeKey(*certificate);
+    pending.certificateKey.assign(certificateKey);
     pending.stream = replyStream;
     pending.streamIncarnation = replyStream == nullptr ? 0 : replyStream->connectionIncarnation;
     pending.topic = cleanup ? MothershipTopic::cleanupACMEDNS01Challenge :
                               MothershipTopic::presentACMEDNS01Challenge;
     pending.inlineResponse = replyStream == nullptr ? &response : nullptr;
+    if (cleanup)
+    {
+      (void)rememberPublicTlsDNS01CleanupIntent(certificateKey, acmeDNS01ChallengeStateFromRecord(record));
+    }
     pendingDNSOperations.insert_or_assign(owner, std::move(pending));
     const uint64_t propagationDelayUs = cleanup ? 0 : uint64_t(acmeDNSPropagationDelayMs(record, *credential)) * 1000;
     if (!dnsOperations.enqueue(*provider,
@@ -3638,6 +3753,10 @@ public:
     {
       pendingDNSOperations.erase(owner);
       response.failure.assign("ACME DNS operation queue is full"_ctv);
+      if (cleanup)
+      {
+        armDNSReconciliationRetry();
+      }
       return false;
     }
     if (auto it = pendingDNSOperations.find(owner); it != pendingDNSOperations.end())
@@ -3914,10 +4033,7 @@ public:
   void reconcileAuthoritativeDNSState(void)
   {
     (void)reconcileDNSRecordLeases();
-    for (PublicTlsCertificateState& certificate : masterAuthorityRuntimeState.publicTlsCertificates)
-    {
-      (void)cleanupPublicTlsPendingDNS01Challenges(certificate);
-    }
+    (void)reconcilePublicTlsDNS01CleanupIntents();
   }
 
   bool resolveDeploymentWormholeDNSBinding(const DeploymentPlan& plan, Wormhole& wormhole, String& failure) const
@@ -8815,6 +8931,13 @@ public:
         return true;
       }
     }
+    for (const PublicTlsDNS01CleanupIntent& intent : publicTlsDNS01CleanupIntents)
+    {
+      if (publicTlsDNS01CleanupOperationPending(intent.certificateKey, intent.challenge) == false)
+      {
+        return true;
+      }
+    }
     return false;
   }
 
@@ -8892,15 +9015,24 @@ public:
       }
       if (response.success)
       {
-        const bool changed = action == ProdigyBrainDNSOperationCoordinator::Action::cleanupTXT ?
-                                 forgetPublicTlsPendingDNS01Challenge(*certificate, pending.record) :
-                                 rememberPublicTlsPendingDNS01Challenge(*certificate, pending.record);
+        const AcmeDNS01ChallengeState challenge = acmeDNS01ChallengeStateFromRecord(pending.record);
+        bool changed = false;
+        if (action == ProdigyBrainDNSOperationCoordinator::Action::cleanupTXT)
+        {
+          changed = forgetPublicTlsPendingDNS01Challenge(*certificate, pending.record);
+          (void)forgetPublicTlsDNS01CleanupIntent(pending.certificateKey, challenge);
+        }
+        else
+        {
+          changed = rememberPublicTlsPendingDNS01Challenge(*certificate, pending.record);
+        }
         if (changed)
         {
           noteMasterAuthorityRuntimeStateChanged();
         }
         if (action == ProdigyBrainDNSOperationCoordinator::Action::cleanupTXT &&
-            certificate->releasePending && certificate->pendingDNS01Challenges.empty())
+            certificate->releasePending && certificate->pendingDNS01Challenges.empty() &&
+            publicTlsDNS01CleanupDispatchDepth == 0)
         {
           for (auto it = masterAuthorityRuntimeState.publicTlsCertificates.begin();
                it != masterAuthorityRuntimeState.publicTlsCertificates.end(); ++it)
@@ -16712,6 +16844,18 @@ public:
     basics_log("forfeitMasterStatus weAreMaster=%d\n", int(weAreMaster));
     advanceMasterAuthorityEpoch();
     weAreMaster = false;
+    Vector<String> publicTlsJobKeys;
+    publicTlsJobKeys.reserve(publicTlsCertbotJobs.size());
+    for (const auto& [key, job] : publicTlsCertbotJobs)
+    {
+      (void)job;
+      publicTlsJobKeys.push_back(key);
+    }
+    for (const String& key : publicTlsJobKeys)
+    {
+      cancelPublicTlsCertbotProcess(key);
+    }
+    publicTlsDNS01CleanupIntents.clear();
     for (const auto& [uuid, container] : containers)
     {
       (void)uuid;
@@ -16985,7 +17129,8 @@ public:
     reconcilePendingElasticAddressAssignments();
     reconcilePendingElasticAddressReleases();
     appliedDNSRecordLeases.clear();
-    reconcileAuthoritativeDNSState();
+    cleanupOrphanedPublicTlsDNS01ChallengesAfterMasterElection();
+    (void)reconcileDNSRecordLeases();
     if (ignited)
     {
       refreshMachineFragmentAssignmentsIfPossible();
