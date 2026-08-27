@@ -101,6 +101,48 @@ public:
 
 using Portal = SwitchboardPortal;
 
+static inline bool switchboardAssignDeterministicPortalSlots(
+    Vector<SwitchboardPortal *>& ordered,
+    Vector<uint32_t>& freeSlots)
+{
+  std::sort(ordered.begin(), ordered.end(), [](const SwitchboardPortal *lhs, const SwitchboardPortal *rhs) {
+    int addressOrder = std::memcmp(lhs->address.v6, rhs->address.v6, sizeof(lhs->address.v6));
+    if (addressOrder != 0)
+    {
+      return addressOrder < 0;
+    }
+    if (lhs->address.is6 != rhs->address.is6)
+    {
+      return lhs->address.is6 < rhs->address.is6;
+    }
+    if (lhs->port != rhs->port)
+    {
+      return lhs->port < rhs->port;
+    }
+    if (lhs->proto != rhs->proto)
+    {
+      return lhs->proto < rhs->proto;
+    }
+    return lhs->isQuic < rhs->isQuic;
+  });
+
+  bool changed = false;
+  for (uint32_t index = 0; index < ordered.size(); ++index)
+  {
+    const uint32_t slot = uint32_t(MAX_PORTALS - 1u - index);
+    changed = changed || ordered[index]->slot != slot;
+    ordered[index]->slot = slot;
+  }
+
+  freeSlots.clear();
+  freeSlots.reserve(MAX_PORTALS - ordered.size());
+  for (uint32_t slot = 0; slot < MAX_PORTALS - ordered.size(); ++slot)
+  {
+    freeSlots.push_back(slot);
+  }
+  return changed;
+}
+
 class SwitchboardWormholeEgressBindingEntry {
 public:
 
@@ -448,6 +490,22 @@ private:
   bytell_hash_map<uint32_t, String> wormholeRevisionByContainer;
   bytell_hash_subset<uint32_t, switchboard_runtime::Whitehole *> whiteholesByContainer;
   Vector<uint32_t> portalSlots;
+
+  // Portal slots cross the machine boundary in overlay packets.  They must
+  // therefore depend on the portal set, not on each node's replay order.
+  bool assignDeterministicPortalSlots(void)
+  {
+    Vector<SwitchboardPortal *> ordered = {};
+    ordered.reserve(portals.size());
+    for (SwitchboardPortal *portal : portals)
+    {
+      if (portal != nullptr)
+      {
+        ordered.push_back(portal);
+      }
+    }
+    return switchboardAssignDeterministicPortalSlots(ordered, portalSlots);
+  }
 
 #if PRODIGY_DEBUG
   static void appendAttachLogImpl(const char *message)
@@ -2135,13 +2193,17 @@ private:
       }
 
       clearPortalQuicCidDecryptState(portal->slot);
-      portalSlots.push_back(portal->slot);
       portals.erase(portal);
       forEachActivePeerProgram([&](BPFProgram *program) -> void {
         removePortalDefinitionForProgram(program, portal);
         clearPortalQuicCidDecryptStateForProgram(program, portal->slot);
       });
       delete portal;
+      if (assignDeterministicPortalSlots())
+      {
+        syncPeerProgramRuntimeRouting(bpf_router);
+        syncAllPeerProgramRuntimeRouting();
+      }
     }
     else
     {
@@ -2437,6 +2499,7 @@ public:
       applyPortalQuicCidStateFromWormhole(portal, requestedWormhole);
 
       portals.insert(portal);
+      (void)assignDeterministicPortalSlots();
       createdPortal = true;
 
       if (syncPortalDefinitionForProgram(bpf_router, portal) == false)
@@ -2454,8 +2517,10 @@ public:
                          unsigned(portal->port),
                          unsigned(portal->proto));
         portals.erase(portal);
-        portalSlots.push_back(portal->slot);
         delete portal;
+        (void)assignDeterministicPortalSlots();
+        syncPeerProgramRuntimeRouting(bpf_router);
+        syncAllPeerProgramRuntimeRouting();
         return false;
       }
 
@@ -2495,8 +2560,10 @@ public:
       {
         removePortalDefinitionForProgram(bpf_router, portal);
         portals.erase(portal);
-        portalSlots.push_back(portal->slot);
         delete portal;
+        (void)assignDeterministicPortalSlots();
+        syncPeerProgramRuntimeRouting(bpf_router);
+        syncAllPeerProgramRuntimeRouting();
       }
       delete wormhole;
       return false;
@@ -2523,6 +2590,10 @@ public:
       return false;
     }
 
+    if (createdPortal)
+    {
+      syncPeerProgramRuntimeRouting(bpf_router);
+    }
     syncHostIngressPortalRouting();
     syncAllPeerProgramRuntimeRouting();
     return true;

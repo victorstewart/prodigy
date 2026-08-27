@@ -2007,6 +2007,47 @@ static void testContainerPeerEgressRouterRoutesIPv6QuicHighSlotPortal(TestSuite&
   peerProgram.close();
 }
 
+static void testPortalSlotsAreStableAcrossReplayOrder(TestSuite& suite)
+{
+  std::array<SwitchboardPortal, 4> forward = {};
+  std::array<SwitchboardPortal, 4> reverse = {};
+  const char *addresses[4] = {"198.18.0.1", "198.18.0.1", "198.18.0.2", "198.18.0.2"};
+  const uint8_t protocols[4] = {IPPROTO_UDP, IPPROTO_TCP, IPPROTO_TCP, IPPROTO_UDP};
+  for (uint32_t index = 0; index < forward.size(); ++index)
+  {
+    forward[index].address = IPAddress(addresses[index], false);
+    forward[index].port = 443;
+    forward[index].proto = protocols[index];
+    forward[index].isQuic = protocols[index] == IPPROTO_UDP;
+    forward[index].slot = index;
+    reverse[index] = forward[index];
+    reverse[index].slot = uint32_t(100 + index);
+  }
+
+  Vector<SwitchboardPortal *> forwardOrder = {};
+  Vector<SwitchboardPortal *> reverseOrder = {};
+  for (uint32_t index = 0; index < forward.size(); ++index)
+  {
+    forwardOrder.push_back(&forward[index]);
+    reverseOrder.push_back(&reverse[reverse.size() - 1u - index]);
+  }
+  Vector<uint32_t> forwardFree = {};
+  Vector<uint32_t> reverseFree = {};
+  suite.expect(switchboardAssignDeterministicPortalSlots(forwardOrder, forwardFree),
+               "portal_slot_replay_forward_assigns_canonical_slots");
+  suite.expect(switchboardAssignDeterministicPortalSlots(reverseOrder, reverseFree),
+               "portal_slot_replay_reverse_assigns_canonical_slots");
+  for (uint32_t index = 0; index < forward.size(); ++index)
+  {
+    suite.expect(forward[index].slot == reverse[index].slot,
+                 "portal_slot_replay_order_does_not_change_slot");
+  }
+  suite.expect(forwardFree.size() == MAX_PORTALS - forward.size() &&
+                   reverseFree.size() == forwardFree.size() &&
+                   forwardFree.back() == reverseFree.back(),
+               "portal_slot_replay_preserves_identical_free_pool");
+}
+
 int main(void)
 {
   if (const char *allow = std::getenv("PRODIGY_DEV_ALLOW_BPF_ATTACH"); allow == nullptr || std::strcmp(allow, "1") != 0)
@@ -2035,6 +2076,7 @@ int main(void)
   testContainerPeerEgressRouterRewritesIPv4WormholeSource(suite, IPPROTO_UDP);
   testContainerPeerEgressRouterRewritesIPv4WormholeSource(suite, IPPROTO_TCP);
   testContainerPeerEgressRouterRoutesIPv6QuicHighSlotPortal(suite);
+  testPortalSlotsAreStableAcrossReplayOrder(suite);
 
   return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
