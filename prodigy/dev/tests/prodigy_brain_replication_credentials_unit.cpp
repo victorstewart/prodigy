@@ -9942,6 +9942,9 @@ static void testCertificateLifecycleSchedulers(TestSuite& suite)
     }
     suite.expect(reaped == 1, "public_tls_scheduler_fake_certbot_reaps");
     suite.expect(certificate.lastFailure.equal("certbot completed without importing lineage"_ctv), "public_tls_scheduler_fake_certbot_requires_recovery_import");
+    certificate.identity.certPem = "stale-certificate-from-prior-deployment"_ctv;
+    certificate.identity.keyPem = "stale-key-from-prior-deployment"_ctv;
+    certificate.nextRenewAtMs = nowMs + 86'400'000;
     suite.expect(brain.advancePublicTlsCertificateLifecycles(nowMs, paths) == 0, "public_tls_scheduler_fake_certbot_recovers_lineage");
     suite.expect(certificate.identity.certPem.equals(certPem) && certificate.identity.keyPem.equals(keyPem), "public_tls_scheduler_fake_certbot_imports_identity");
 

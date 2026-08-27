@@ -8416,16 +8416,16 @@ public:
         (void)cleanupPublicTlsPendingDNS01Challenges(certificate);
         continue;
       }
-      if (certificate.identity.certPem.size() > 0 && certificate.nextRenewAtMs > nowMs)
-      {
-        continue;
-      }
       String key = publicTlsCertificateRuntimeKey(certificate);
       if (publicTlsCertbotJobs.find(key) != publicTlsCertbotJobs.end())
       {
         continue;
       }
       if (certificate.lastAttemptMs > certificate.lastSuccessMs && recoverPublicTlsCertificateLineage(certificate, paths))
+      {
+        continue;
+      }
+      if (certificate.identity.certPem.size() > 0 && certificate.nextRenewAtMs > nowMs)
       {
         continue;
       }
