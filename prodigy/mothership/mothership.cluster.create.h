@@ -1191,7 +1191,8 @@ static inline bool mothershipRestartTestClusterToDesiredShape(
     const ClusterTopology& currentTopology,
     MothershipClusterCreateHooks& hooks,
     bool& changed,
-    String *failure = nullptr)
+    String *failure = nullptr,
+    const MothershipProviderCredential *dnsCredential = nullptr)
 {
   changed = false;
   if (failure)
@@ -1216,7 +1217,7 @@ static inline bool mothershipRestartTestClusterToDesiredShape(
     return false;
   }
 
-  if (mothershipStandUpCluster(desiredCluster, nullptr, hooks, nullptr, &localFailure) == false)
+  if (mothershipStandUpCluster(desiredCluster, nullptr, hooks, nullptr, &localFailure, dnsCredential) == false)
   {
     if (failure)
     {

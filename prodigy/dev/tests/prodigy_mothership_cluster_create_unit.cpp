@@ -1241,6 +1241,14 @@ int main(void)
     desiredCluster.test.machineCount = 4;
     appendClusterMachineConfig(desiredCluster, makeMachineConfig("bootstrap"_ctv, MachineConfig::MachineKind::bareMetal, 8, 16'384, 262'144));
     desiredCluster.desiredEnvironment = ProdigyEnvironmentKind::dev;
+    desiredCluster.dnsProvider = MothershipClusterProvider::cloudflare;
+    desiredCluster.dnsProviderCredentialName = "test-resize-dns"_ctv;
+
+    MothershipProviderCredential dnsCredential = {};
+    dnsCredential.name = desiredCluster.dnsProviderCredentialName;
+    dnsCredential.provider = desiredCluster.dnsProvider;
+    dnsCredential.material = "cloudflare-dns-secret"_ctv;
+    dnsCredential.allowPropagateToProdigy = true;
 
     ClusterTopology currentTopology = {};
     currentTopology.version = 9;
@@ -1257,7 +1265,7 @@ int main(void)
 
     bool changed = false;
     String failure = {};
-    bool ok = mothershipRestartTestClusterToDesiredShape(currentCluster, desiredCluster, currentTopology, hooks, changed, &failure);
+    bool ok = mothershipRestartTestClusterToDesiredShape(currentCluster, desiredCluster, currentTopology, hooks, changed, &failure, &dnsCredential);
     suite.expect(ok, "create_test_resize_restart_ok");
     suite.expect(failure.size() == 0, "create_test_resize_restart_no_failure");
     suite.expect(changed, "create_test_resize_restart_changed");
@@ -1265,6 +1273,9 @@ int main(void)
     suite.expect(hooks.createSeedCalls == 1, "create_test_resize_restart_creates_provider_seed");
     suite.expect(hooks.configureCalls == 1, "create_test_resize_restart_configures_cluster");
     suite.expect(hooks.fetchTopologyCalls == 1, "create_test_resize_restart_fetches_topology");
+    suite.expect(hooks.lastConfig.dnsProvider == "cloudflare"_ctv, "create_test_resize_restart_preserves_dns_provider");
+    suite.expect(hooks.lastConfig.dnsCredential.name == desiredCluster.dnsProviderCredentialName, "create_test_resize_restart_preserves_dns_credential_name");
+    suite.expect(hooks.lastConfig.dnsCredential.material == dnsCredential.material, "create_test_resize_restart_preserves_dns_credential_material");
     suite.expect(desiredCluster.topology == hooks.fetchedTopology, "create_test_resize_restart_persists_topology");
     suite.expect(equalCallSequence(hooks.callSequence, {ClusterCreateCall::destroyCreatedSeed,
                                                         ClusterCreateCall::createSeed,

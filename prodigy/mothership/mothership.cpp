@@ -6937,8 +6937,19 @@ private:
 
     if (desiredCluster.deploymentMode == MothershipClusterDeploymentMode::test)
     {
+      MothershipProviderCredential dnsCredential = {};
+      MothershipProviderCredential *dnsCredentialPtr = nullptr;
+      if (validateClusterDNSProviderCredentialReference(desiredCluster, failure, &dnsCredential) == false)
+      {
+        return false;
+      }
+      if (desiredCluster.dnsProvider != MothershipClusterProvider::unknown)
+      {
+        dnsCredentialPtr = &dnsCredential;
+      }
+
       ClusterCreateHooks hooks(this);
-      if (mothershipRestartTestClusterToDesiredShape(controlCluster, desiredCluster, currentState.topology, hooks, changed, &failure) == false)
+      if (mothershipRestartTestClusterToDesiredShape(controlCluster, desiredCluster, currentState.topology, hooks, changed, &failure, dnsCredentialPtr) == false)
       {
         return false;
       }
