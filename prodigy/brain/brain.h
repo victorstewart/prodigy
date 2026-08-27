@@ -2855,7 +2855,35 @@ public:
     return true;
   }
 
-  static bool x509ChainTrustedBySystem(X509 *leafCert, const String& chainPem, String& failure)
+  static bool x509LoadSystemTrustStore(X509_STORE *store, const char *trustBundleOverride = nullptr)
+  {
+    if (store == nullptr)
+    {
+      return false;
+    }
+    if (trustBundleOverride != nullptr)
+    {
+      return X509_STORE_load_locations(store, trustBundleOverride, nullptr) == 1;
+    }
+
+    static constexpr const char *runtimeTrustBundles[] = {
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+        "/etc/ssl/cert.pem",
+    };
+    bool loaded = false;
+    for (const char *path : runtimeTrustBundles)
+    {
+      if (::access(path, R_OK) == 0 && X509_STORE_load_locations(store, path, nullptr) == 1)
+      {
+        loaded = true;
+      }
+    }
+    return loaded || X509_STORE_set_default_paths(store) == 1;
+  }
+
+  static bool x509ChainTrustedBySystem(X509 *leafCert, const String& chainPem, String& failure, const char *trustBundleOverride = nullptr)
   {
     Vector<X509 *> chain = {};
     if (x509PEMCertificates(chainPem, chain, failure) == false)
@@ -2867,7 +2895,7 @@ public:
     X509_STORE *store = X509_STORE_new();
     X509_STORE_CTX *ctx = X509_STORE_CTX_new();
     bool ok = leafCert != nullptr && untrusted != nullptr && store != nullptr && ctx != nullptr &&
-              X509_STORE_set_default_paths(store) == 1;
+              x509LoadSystemTrustStore(store, trustBundleOverride);
     for (X509 *cert : chain)
     {
       ok = ok && sk_X509_push(untrusted, cert) != 0;

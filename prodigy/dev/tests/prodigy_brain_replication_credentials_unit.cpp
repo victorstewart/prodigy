@@ -3524,7 +3524,7 @@ static bool certificateHasIpSan(const String& certPem, const IPAddress& expected
   return found;
 }
 
-static bool generateACMELineage(const std::filesystem::path& path, const Vector<String>& domains, String& certPem, String& keyPem, const Vector<IPAddress> *ipSans = nullptr, bool enableServerAuth = true, String *chainPem = nullptr)
+static bool generateACMELineage(const std::filesystem::path& path, const Vector<String>& domains, String& certPem, String& keyPem, const Vector<IPAddress> *ipSans = nullptr, bool enableServerAuth = true, String *chainPem = nullptr, String *rootPem = nullptr)
 {
   String failure = {};
   ApplicationTlsVaultFactory factory = {};
@@ -3562,6 +3562,10 @@ static bool generateACMELineage(const std::filesystem::path& path, const Vector<
     if (chainPem)
     {
       *chainPem = chain;
+    }
+    if (rootPem)
+    {
+      *rootPem = factory.rootCertPem;
     }
     String fullchain = certPem;
     fullchain.append(chain);
@@ -11848,9 +11852,20 @@ static void testACMELineageImportValidatesAndDistributesPublicTls(TestSuite& sui
   std::string lineagePath = lineageDir.string();
   String certPem = {};
   String keyPem = {};
-  if (suite.require(generateACMELineage(lineageDir, domains, certPem, keyPem), "mothership_acme_import_generates_lineage") == false)
+  String chainPem = {};
+  String rootPem = {};
+  if (suite.require(generateACMELineage(lineageDir, domains, certPem, keyPem, nullptr, true, &chainPem, &rootPem), "mothership_acme_import_generates_lineage") == false)
   {
     return;
+  }
+  std::filesystem::path trustBundle = temp.path / "runtime-system-ca-bundle.pem";
+  X509 *trustedLeaf = VaultPem::x509FromPem(certPem);
+  String trustFailure = {};
+  suite.expect(writeTextFile(trustBundle, toStdString(rootPem)), "mothership_acme_import_writes_runtime_trust_bundle");
+  suite.expect(trustedLeaf != nullptr && TestBrain::x509ChainTrustedBySystem(trustedLeaf, chainPem, trustFailure, trustBundle.c_str()), "mothership_acme_import_loads_runtime_system_trust_bundle");
+  if (trustedLeaf)
+  {
+    X509_free(trustedLeaf);
   }
 
   TestBrain brain;
