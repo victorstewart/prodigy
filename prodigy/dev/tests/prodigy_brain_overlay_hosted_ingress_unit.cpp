@@ -220,6 +220,10 @@ int main(void)
   Machine remote = {};
   remote.uuid = uint128_t(0x9442);
   remote.fragment = 0x42;
+  ClusterMachinePeerAddress recoveredContainer6 = {};
+  recoveredContainer6.address.assign("fdf8:d94c:7c33:e26e:ca4b:f501:0:a00"_ctv);
+  recoveredContainer6.cidr = 120;
+  remote.peerAddresses.push_back(recoveredContainer6);
   ClusterMachinePeerAddress remotePrivate6 = {};
   remotePrivate6.address.assign("fd00:10::20"_ctv);
   remotePrivate6.cidr = 64;
@@ -265,6 +269,8 @@ int main(void)
     suite.expect(config.machineRoutes[0].machineFragment == remote.fragment, "build_overlay_routing_config_preserves_peer_machine_fragment");
     suite.expect(config.machineRoutes[0].useGatewayMAC == false, "build_overlay_routing_config_direct_peer_route_uses_mac");
     suite.expect(config.machineRoutes[0].nextHopMAC == "fa:6d:18:7d:9f:5e"_ctv, "build_overlay_routing_config_preserves_peer_machine_mac");
+    suite.expect(config.machineRoutes[0].nextHop.equals(IPAddress("fd00:10::20", true)), "build_overlay_routing_config_prefers_direct_underlay_after_recovery");
+    suite.expect(config.machineRoutes[0].sourceAddress.equals(IPAddress("fd00:10::10", true)), "build_overlay_routing_config_preserves_direct_underlay_source_after_recovery");
   }
 
   suite.expect(containsHostedIngressRoute(config.hostedIngressRoutes, "2001:db8:100::c/128", remote.fragment),

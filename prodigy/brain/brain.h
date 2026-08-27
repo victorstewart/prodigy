@@ -432,7 +432,22 @@ inline bool BrainBase::buildSwitchboardOverlayRoutingConfig(Machine *machine, Sw
 
     Vector<ClusterMachinePeerAddress> remoteCandidates = {};
     prodigyCollectMachineOverlayRouteAddresses(*candidate, remoteCandidates);
-    std::stable_sort(remoteCandidates.begin(), remoteCandidates.end(), [](const ClusterMachinePeerAddress& lhs, const ClusterMachinePeerAddress& rhs) -> bool {
+    auto isDirectPeerRoute = [&](const ClusterMachinePeerAddress& peer) -> bool {
+      IPAddress address = {};
+      const MachineNicSubnetHardwareProfile *localSubnet = nullptr;
+      return peer.gateway.size() == 0 &&
+             ClusterMachine::parseIPAddressLiteral(peer.address, address) && address.is6 &&
+             prodigyFindMachineNicContainingAddress(*machine, address, &localSubnet) != nullptr &&
+             localSubnet != nullptr && localSubnet->address.is6 &&
+             prodigyFindMachineNicByAssignedAddress(*candidate, address) != nullptr;
+    };
+    std::stable_sort(remoteCandidates.begin(), remoteCandidates.end(), [&](const ClusterMachinePeerAddress& lhs, const ClusterMachinePeerAddress& rhs) -> bool {
+      bool lhsDirect = isDirectPeerRoute(lhs);
+      bool rhsDirect = isDirectPeerRoute(rhs);
+      if (lhsDirect != rhsDirect)
+      {
+        return lhsDirect;
+      }
       return prodigyClusterMachinePeerAddressIsPrivate(lhs) && prodigyClusterMachinePeerAddressIsPrivate(rhs) == false;
     });
 
