@@ -8351,7 +8351,8 @@ public:
     uint32_t reaped = 0;
     for (auto it = publicTlsCertbotJobs.begin(); it != publicTlsCertbotJobs.end();)
     {
-      PublicTlsCertbotJob& job = it->second;
+      const String certificateKey = it->first;
+      PublicTlsCertbotJob job = it->second;
       int status = 0;
       pid_t result = waitpid(job.pid, &status, WNOHANG);
       int waitErrno = result < 0 ? errno : 0;
@@ -8369,7 +8370,15 @@ public:
         failure.assign("certbot process timed out"_ctv);
       }
 
-      PublicTlsCertificateState *certificate = findPublicTlsCertificateStateByRuntimeKey(it->first);
+      // Remove the runtime job before cleanup can dispatch a synchronous DNS
+      // completion.  That completion may re-enter certificate reconciliation;
+      // leaving the current hash-map iterator live across it makes the erase
+      // below depend on an iterator that the nested reconciliation can
+      // invalidate.
+      it = publicTlsCertbotJobs.erase(it);
+      releasePublicTlsCertbotLock(job);
+
+      PublicTlsCertificateState *certificate = findPublicTlsCertificateStateByRuntimeKey(certificateKey);
       bool certificateChanged = false;
       if (certificate != nullptr)
       {
@@ -8399,8 +8408,6 @@ public:
         }
         (void)cleanupPublicTlsPendingDNS01Challenges(*certificate);
       }
-      releasePublicTlsCertbotLock(job);
-      it = publicTlsCertbotJobs.erase(it);
       reaped += 1;
       // Successful lineage import and exact DNS cleanup persist their own
       // durable changes. Reaping the now-empty process record is otherwise a
