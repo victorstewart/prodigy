@@ -9880,6 +9880,204 @@ static void testCertificateLifecycleSchedulers(TestSuite& suite)
     suite.expect(brain.publicTlsCertbotJobs.empty(), "public_tls_scheduler_recovery_leaves_no_child_pid");
   }
 
+  // Certbot's deploy hook imports and persists the lineage before its child is
+  // reaped.  Reaping that successful child must remain a runtime-only action:
+  // a second master-state transition would serialize the just-imported PEM
+  // payloads again at their largest transient-memory point.
+  {
+    ScopedTempDir temp;
+    if (suite.require(temp.valid(), "public_tls_scheduler_import_reap_temp_dir") == false)
+    {
+      return;
+    }
+
+    TestBrain brain;
+    brain.weAreMaster = true;
+    brain.brainConfig.clusterUUID = uint128_t(0xAC18);
+
+    DeploymentPlan plan = makeDeploymentPlan(60'018, 14);
+    Vector<String> domains = {};
+    domains.push_back("api.example.com"_ctv);
+    domains.push_back("*.example.com"_ctv);
+    const char *certName = "app60018-api";
+    std::filesystem::path lineageDir = temp.path / "live" / certName;
+    std::filesystem::create_directories(lineageDir);
+    String certPem = {};
+    String keyPem = {};
+    suite.expect(generateACMELineage(lineageDir, domains, certPem, keyPem), "public_tls_scheduler_import_reap_writes_two_san_lineage");
+
+    PublicTlsCertificateState certificate = {};
+    certificate.spec.applicationID = plan.config.applicationID;
+    certificate.spec.deploymentID = plan.config.deploymentID();
+    certificate.spec.wormholeName = "api"_ctv;
+    certificate.spec.identityName = "api-public"_ctv;
+    certificate.spec.domains = domains;
+    certificate.spec.issuer = "letsencrypt"_ctv;
+    certificate.spec.keyType = "ecdsa"_ctv;
+    certificate.spec.staging = true;
+    certificate.certbotCertName = certName;
+    std::string lineagePath = lineageDir.string();
+    certificate.lineagePath.assign(lineagePath.data(), lineagePath.size());
+    brain.masterAuthorityRuntimeState.publicTlsCertificates.push_back(certificate);
+
+    AcmeLineageImportRequest request = {};
+    request.clusterUUID = brain.brainConfig.clusterUUID;
+    request.applicationID = plan.config.applicationID;
+    request.deploymentID = plan.config.deploymentID();
+    request.wormholeName = "api"_ctv;
+    request.certName = certName;
+    request.lineagePath.assign(lineagePath.data(), lineagePath.size());
+    request.renewedDomains = domains;
+    AcmeLineageImportResponse response = {};
+    suite.expect(brain.importACMELineage(request, response) && response.success, "public_tls_scheduler_import_reap_imports_lineage");
+
+    PublicTlsCertificateState& stored = brain.masterAuthorityRuntimeState.publicTlsCertificates[0];
+    const uint32_t persistCallsAfterImport = brain.persistCalls;
+    const uint64_t generationAfterImport = stored.identity.generation;
+    const int64_t renewAtAfterImport = stored.nextRenewAtMs;
+    const uint64_t runtimeGenerationAfterImport = brain.masterAuthorityRuntimeState.generation;
+    suite.expect(stored.identity.certPem.equals(certPem) && stored.identity.keyPem.equals(keyPem) && stored.identity.dnsSans.size() == 2, "public_tls_scheduler_import_reap_keeps_imported_two_san_identity");
+
+    const pid_t child = fork();
+    if (child == 0)
+    {
+      _exit(EXIT_SUCCESS);
+    }
+    if (suite.require(child > 0, "public_tls_scheduler_import_reap_forks_successful_certbot"))
+    {
+      brain.publicTlsCertbotJobs.insert_or_assign(TestBrain::publicTlsCertificateRuntimeKey(stored), PublicTlsCertbotJob {child, stored.lastAttemptMs, -1});
+      uint32_t reaped = 0;
+      for (uint32_t attempt = 0; attempt < 100 && reaped == 0; ++attempt)
+      {
+        reaped = brain.reapPublicTlsCertbotProcesses(Time::now<TimeResolution::ms>());
+        if (reaped == 0)
+        {
+          usleep(1000);
+        }
+      }
+      suite.expect(reaped == 1 && brain.publicTlsCertbotJobs.empty(), "public_tls_scheduler_import_reap_reaps_successful_certbot");
+      suite.expect(brain.persistCalls == persistCallsAfterImport && brain.masterAuthorityRuntimeState.generation == runtimeGenerationAfterImport, "public_tls_scheduler_import_reap_skips_second_persisted_replicated_transition");
+      suite.expect(stored.identity.generation == generationAfterImport && stored.nextRenewAtMs == renewAtAfterImport, "public_tls_scheduler_import_reap_preserves_imported_generation_and_renewal");
+    }
+  }
+
+  // This is the restart shape left by a Brain that persisted the Certbot
+  // attempt but died before recognizing its deploy-hook import.  The lineage
+  // remains the recovery authority; the scheduler must import it exactly once
+  // rather than launch another Certbot process.
+  {
+    ScopedTempDir temp;
+    if (suite.require(temp.valid(), "public_tls_scheduler_restart_recovery_temp_dir") == false)
+    {
+      return;
+    }
+
+    TestBrain brain;
+    brain.weAreMaster = true;
+    brain.brainConfig.clusterUUID = uint128_t(0xAC19);
+    DeploymentPlan plan = makeDeploymentPlan(60'019, 15);
+    WormholePublicTLSConfig publicTLS = {};
+    publicTLS.wormholeName = "api"_ctv;
+    publicTLS.identityName = "api-public"_ctv;
+    publicTLS.domains.push_back("api.example.com"_ctv);
+    publicTLS.domains.push_back("*.example.com"_ctv);
+    plan.publicTLS.push_back(publicTLS);
+    Vector<String> domains = {};
+    domains.push_back("api.example.com"_ctv);
+    domains.push_back("*.example.com"_ctv);
+    const char *certName = "app60019-api";
+    std::filesystem::path configDir = temp.path / "config";
+    std::filesystem::path lineageDir = configDir / "live" / certName;
+    std::filesystem::create_directories(lineageDir);
+    String certPem = {};
+    String keyPem = {};
+    suite.expect(generateACMELineage(lineageDir, domains, certPem, keyPem), "public_tls_scheduler_restart_recovery_writes_two_san_lineage");
+
+    PublicTlsCertificateState certificate = {};
+    certificate.spec.applicationID = plan.config.applicationID;
+    certificate.spec.deploymentID = plan.config.deploymentID();
+    certificate.spec.wormholeName = "api"_ctv;
+    certificate.spec.identityName = "api-public"_ctv;
+    certificate.spec.domains = domains;
+    certificate.spec.issuer = "letsencrypt"_ctv;
+    certificate.spec.keyType = "ecdsa"_ctv;
+    certificate.spec.staging = true;
+    certificate.certbotCertName = certName;
+    std::string lineagePath = lineageDir.string();
+    certificate.lineagePath.assign(lineagePath.data(), lineagePath.size());
+    certificate.lastAttemptMs = 1;
+    certificate.lastSuccessMs = 0;
+    brain.masterAuthorityRuntimeState.publicTlsCertificates.push_back(certificate);
+
+    Machine machine = {};
+    machine.uuid = uint128_t(0xAC1901);
+    machine.neuron.isFixedFile = true;
+    machine.neuron.fslot = 11;
+    machine.neuron.connected = true;
+    ContainerView container = {};
+    container.uuid = uint128_t(0xAC1902);
+    container.machine = &machine;
+    container.deploymentID = plan.config.deploymentID();
+    container.state = ContainerState::healthy;
+    ApplicationDeployment deployment = {};
+    deployment.plan = plan;
+    deployment.containers.insert(&container);
+    brain.deployments.insert_or_assign(plan.config.deploymentID(), &deployment);
+
+    ProdigyCertbotPaths paths = {};
+    paths.certbotPath = "/bin/false"_ctv;
+    std::string configPath = configDir.string();
+    paths.configDir.assign(configPath.data(), configPath.size());
+    suite.expect(brain.advancePublicTlsCertificateLifecycles(Time::now<TimeResolution::ms>(), paths) == 0, "public_tls_scheduler_restart_recovery_imports_without_spawn");
+    PublicTlsCertificateState& stored = brain.masterAuthorityRuntimeState.publicTlsCertificates[0];
+    const uint64_t recoveredGeneration = stored.identity.generation;
+    const uint32_t persistCallsAfterRecovery = brain.persistCalls;
+    suite.expect(stored.identity.certPem.equals(certPem) && stored.identity.keyPem.equals(keyPem) && stored.lastSuccessMs >= stored.lastAttemptMs && stored.failureCount == 0, "public_tls_scheduler_restart_recovery_records_imported_lineage_once");
+    suite.expect(brain.publicTlsCertbotJobs.empty(), "public_tls_scheduler_restart_recovery_spawns_no_certbot");
+    uint128_t refreshedContainer = 0;
+    CredentialDelta delta = {};
+    suite.expect(extractQueuedCredentialDelta(machine, refreshedContainer, delta) && refreshedContainer == container.uuid && delta.bundleGeneration == recoveredGeneration && delta.updatedTls.size() == 1 && delta.updatedTls[0].generation == recoveredGeneration, "public_tls_scheduler_restart_recovery_delivers_recovered_credential_generation");
+    suite.expect(brain.advancePublicTlsCertificateLifecycles(Time::now<TimeResolution::ms>(), paths) == 0 && brain.persistCalls == persistCallsAfterRecovery && stored.identity.generation == recoveredGeneration, "public_tls_scheduler_restart_recovery_does_not_reimport_or_spawn");
+
+    // Keep the queued deployment heap-owned because deploy() may retain
+    // coroutine/timer state.  A pending DNS lease holds it in waitingToDeploy;
+    // after that lease clears and the neuron is ready, the ordinary DNS resume
+    // owner starts the successor without any ACME-specific transition.
+    BrainBase *previousBrain = thisBrain;
+    thisBrain = &brain;
+    brain.ignited = true;
+    ApplicationDeployment *successor = new ApplicationDeployment();
+    successor->plan = makeDeploymentPlan(plan.config.applicationID, 16);
+    successor->plan.canaryCount = 0;
+    successor->plan.stateless.nBase = 1;
+    successor->plan.minimumSubscriberCapacity = 0;
+    successor->state = DeploymentState::waitingToDeploy;
+    brain.deployments.insert_or_assign(successor->plan.config.deploymentID(), successor);
+    RoutableResourceLease pendingDNSLease = {};
+    pendingDNSLease.kind = RoutableResourceLeaseKind::dnsRecord;
+    pendingDNSLease.owner.deploymentID = successor->plan.config.deploymentID();
+    pendingDNSLease.dnsDeletePending = true;
+    brain.routableResourceLeaseRuntimeState.push_back(pendingDNSLease);
+    brain.deploymentsWaitingForDNS.insert(successor->plan.config.deploymentID());
+    brain.resumeDNSReadyDeployments();
+    suite.expect(successor->state == DeploymentState::waitingToDeploy && brain.deploymentsWaitingForDNS.contains(successor->plan.config.deploymentID()), "public_tls_scheduler_restart_recovery_queued_successor_waits_for_dns");
+    brain.routableResourceLeaseRuntimeState.clear();
+    machine.state = MachineState::healthy;
+    machine.runtimeReady = true;
+    machine.neuron.machine = &machine;
+    brain.machines.insert(&machine);
+    brain.neurons.insert(&machine.neuron);
+    brain.resumeDNSReadyDeployments();
+    suite.expect(successor->state == DeploymentState::deploying && brain.deploymentsWaitingForDNS.contains(successor->plan.config.deploymentID()) == false, "public_tls_scheduler_restart_recovery_queued_successor_progresses_after_dns_neuron_ready");
+    brain.deploymentsByApp.erase(successor->plan.config.applicationID);
+    brain.deployments.erase(successor->plan.config.deploymentID());
+    brain.machines.erase(&machine);
+    brain.neurons.erase(&machine.neuron);
+    delete successor;
+    thisBrain = previousBrain;
+    brain.deployments.erase(deployment.plan.config.deploymentID());
+  }
+
   {
     ScopedTempDir temp;
     if (suite.require(temp.valid(), "public_tls_scheduler_fake_certbot_temp_dir") == false)
