@@ -7684,6 +7684,57 @@ int main(void)
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
     brain.weAreMaster = true;
+    NeuronBase *savedLocalNeuron = thisNeuron;
+    thisNeuron = nullptr;
+
+    Machine machine = {};
+    machine.privateAddress.assign("10.0.0.226"_ctv);
+    machine.private4 = IPAddress("10.0.0.226", false).v4;
+    machine.neuron.machine = &machine;
+    machine.neuron.connected = false;
+    machine.neuron.reconnectAfterClose = true;
+    machine.neuron.connectTimeoutMs = 250;
+    machine.neuron.nDefaultAttemptsBudget = 4;
+    machine.neuron.setIPVersion(AF_INET);
+    brain.neurons.insert(&machine.neuron);
+
+    int retiredFD = -1;
+    bool installed = installNeuronSocket(brain, machine, retiredFD);
+    suite.expect(installed, "brain_neuron_reconnect_timeout_inert_generation_installs_retired_fixture");
+    if (installed)
+    {
+      brain.testCloseHandler(&machine.neuron);
+      TimeoutPacket *waiter = brain.testGetNeuronReconnectWaiter(&machine.neuron);
+      suite.expect(waiter != nullptr, "brain_neuron_reconnect_timeout_inert_generation_arms_waiter");
+
+      int inertFD = -1;
+      suite.expect(installNeuronSocket(brain, machine, inertFD), "brain_neuron_reconnect_timeout_inert_generation_installs_crossed_generation");
+      suite.expect(machine.neuron.connected == false && machine.neuron.pendingConnect == false,
+                   "brain_neuron_reconnect_timeout_inert_generation_models_failed_connect_before_close_cqe");
+
+      if (waiter != nullptr)
+      {
+        brain.testDispatchTimeout(waiter);
+      }
+      suite.expect(machine.neuron.pendingConnect,
+                   "brain_neuron_reconnect_timeout_inert_generation_retires_stale_socket_and_reconnects");
+
+      cleanupNeuronSocket(machine.neuron, inertFD);
+      if (retiredFD >= 0)
+      {
+        ::close(retiredFD);
+      }
+    }
+
+    thisNeuron = savedLocalNeuron;
+  }
+
+  {
+    ScopedRing scopedRing = {};
+
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    brain.weAreMaster = true;
 
     Machine machine = {};
     machine.private4 = IPAddress("10.0.0.20", false).v4;

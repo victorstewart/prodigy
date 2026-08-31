@@ -11411,6 +11411,24 @@ public:
       return;
     }
 
+    // A close CQE and an older reconnect timeout can cross: the timeout may
+    // observe the next failed socket generation after its connect CQE cleared
+    // pendingConnect but before its close CQE retires the fixed-file slot. That
+    // socket is not a live connection and must not consume the only durable
+    // reconnect waiter.
+    const bool inertDisconnectedGeneration =
+        rawStreamIsActive(neuron) &&
+        neuron->connected == false &&
+        neuron->connectAttemptPending() == false &&
+        neuron->pendingSend == false &&
+        neuron->pendingRecv == false &&
+        neuron->isTLSNegotiated() == false &&
+        neuron->tlsPeerVerified == false;
+    if (inertDisconnectedGeneration && Ring::socketIsClosing(neuron) == false)
+    {
+      abandonSocketGeneration(neuron);
+    }
+
     if (rawStreamIsActive(neuron) || neuron->connectAttemptPending())
     {
       basics_log("neuron reconnect skipped active private4=%u reason=%s active=%d closing=%d pendingConnect=%d\n",
