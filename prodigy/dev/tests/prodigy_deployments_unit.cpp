@@ -10966,6 +10966,23 @@ int main(void)
                  "declared_network_runtime_validation_reports_invalid_service_pairing");
     plan.subscriptionPairings.map[resolverService][0].port = 5353;
 
+    constexpr uint64_t hotClientsPrefix = MeshRegistry::Hot::clients;
+    const uint64_t hotClientsShard = MeshServices::constrainPrefixToGroup(hotClientsPrefix, 0);
+    const uint64_t unrelatedHotShard = MeshServices::constrainPrefixToGroup(MeshRegistry::Hot::siblings, 0);
+    plan.subscriptionPairings.clear();
+    plan.advertisementPairings.clear();
+    plan.advertisements.clear();
+    plan.subscriptions.clear();
+    plan.subscriptions.emplace(hotClientsPrefix,
+                               Subscription(hotClientsPrefix, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::any));
+    plan.subscriptionPairings.insert(hotClientsShard, SubscriptionPairing(11, 22, hotClientsShard, 5353));
+    suite.expect(declaredNetworkAccessValid(plan), "declared_network_runtime_validation_accepts_concrete_shard_for_declared_prefix");
+    plan.subscriptionPairings.clear();
+    plan.subscriptionPairings.insert(unrelatedHotShard, SubscriptionPairing(11, 22, unrelatedHotShard, 5353));
+    suite.expect(declaredNetworkAccessValid(plan) == false,
+                 "declared_network_runtime_validation_rejects_concrete_shard_outside_declared_prefix");
+    plan.subscriptionPairings.clear();
+
     plan.system.kind = SystemContainerKind::mothershipTunnelProvider;
     suite.expect(declaredNetworkAccessValid(plan) == false, "declared_network_runtime_validation_rejects_system_mode");
 

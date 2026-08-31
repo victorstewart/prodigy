@@ -9,7 +9,20 @@ static inline bool declaredNetworkPairingsValid(const ContainerPlan& plan)
   uint64_t subscriptionCount = 0;
   for (const auto& [service, pairings] : plan.subscriptionPairings.map)
   {
-    if (plan.subscriptions.contains(service) == false)
+    bool declaredSubscription = plan.subscriptions.contains(service);
+    if (declaredSubscription == false)
+    {
+      for (const auto& [declaredService, subscription] : plan.subscriptions)
+      {
+        (void)subscription;
+        if (MeshServices::isPrefix(declaredService) && MeshRegistry::prefixContains(declaredService, service))
+        {
+          declaredSubscription = true;
+          break;
+        }
+      }
+    }
+    if (declaredSubscription == false)
     {
       return false;
     }
