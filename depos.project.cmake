@@ -55,6 +55,13 @@ set(
   "Pinned mimalloc package version expected in the published Basics release DepoFile"
   FORCE
 )
+set(
+  PRODIGY_BASICS_MIMALLOC_MODE
+  "AUTO"
+  CACHE STRING
+  "Basics allocator integration: AUTO selects NONE for sanitizer builds and OBJECT otherwise; OBJECT or NONE force that mode"
+)
+set_property(CACHE PRODIGY_BASICS_MIMALLOC_MODE PROPERTY STRINGS AUTO OBJECT NONE)
 
 if (NOT DEFINED PRODIGY_BASICS_LOCAL_REPO_DIR OR "${PRODIGY_BASICS_LOCAL_REPO_DIR}" STREQUAL "")
   set(
@@ -102,6 +109,17 @@ function(_prodigy_sanitizers_enabled out_var)
 endfunction()
 
 function(_prodigy_resolve_basics_mimalloc_mode out_var)
+  string(TOUPPER "${PRODIGY_BASICS_MIMALLOC_MODE}" _prodigy_requested_mimalloc_mode)
+  if (NOT _prodigy_requested_mimalloc_mode MATCHES "^(AUTO|OBJECT|NONE)$")
+    message(
+      FATAL_ERROR
+      "PRODIGY_BASICS_MIMALLOC_MODE must be AUTO, OBJECT, or NONE, not '${PRODIGY_BASICS_MIMALLOC_MODE}'."
+    )
+  endif()
+  if (NOT _prodigy_requested_mimalloc_mode STREQUAL "AUTO")
+    set(${out_var} "${_prodigy_requested_mimalloc_mode}" PARENT_SCOPE)
+    return()
+  endif()
   _prodigy_sanitizers_enabled(_prodigy_has_sanitizers)
   if (_prodigy_has_sanitizers)
     set(${out_var} "NONE" PARENT_SCOPE)
