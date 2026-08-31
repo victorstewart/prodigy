@@ -7639,6 +7639,8 @@ int main(void)
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
     brain.weAreMaster = true;
+    NeuronBase *savedLocalNeuron = thisNeuron;
+    thisNeuron = nullptr;
 
     Machine machine = {};
     machine.privateAddress.assign("10.0.0.19"_ctv);
@@ -7672,6 +7674,8 @@ int main(void)
 
       cleanupNeuronSocket(machine.neuron, peerFD);
     }
+
+    thisNeuron = savedLocalNeuron;
   }
 
   {
