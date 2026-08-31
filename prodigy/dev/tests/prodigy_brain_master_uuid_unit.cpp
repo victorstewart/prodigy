@@ -7641,6 +7641,44 @@ int main(void)
     brain.weAreMaster = true;
 
     Machine machine = {};
+    machine.privateAddress.assign("10.0.0.19"_ctv);
+    machine.private4 = IPAddress("10.0.0.19", false).v4;
+    machine.neuron.machine = &machine;
+    machine.neuron.connected = false;
+    machine.neuron.reconnectAfterClose = false;
+    machine.neuron.connectTimeoutMs = 250;
+    machine.neuron.nDefaultAttemptsBudget = 4;
+    machine.neuron.setIPVersion(AF_INET);
+    brain.neurons.insert(&machine.neuron);
+
+    int peerFD = -1;
+    bool installed = installNeuronSocket(brain, machine, peerFD);
+    suite.expect(installed, "brain_close_handler_expired_master_neuron_installs_fixture");
+    if (installed)
+    {
+      brain.testCloseHandler(&machine.neuron);
+
+      suite.expect(machine.neuron.reconnectAfterClose, "brain_close_handler_expired_master_neuron_restores_persistent_reconnect");
+      TimeoutPacket *waiter = brain.testGetNeuronReconnectWaiter(&machine.neuron);
+      suite.expect(waiter != nullptr, "brain_close_handler_expired_master_neuron_arms_reconnect_waiter");
+      if (waiter != nullptr)
+      {
+        brain.testDispatchTimeout(waiter);
+      }
+      suite.expect(machine.neuron.pendingConnect, "brain_close_handler_expired_master_neuron_rearms_connect_after_waiter");
+
+      cleanupNeuronSocket(machine.neuron, peerFD);
+    }
+  }
+
+  {
+    ScopedRing scopedRing = {};
+
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    brain.weAreMaster = true;
+
+    Machine machine = {};
     machine.private4 = IPAddress("10.0.0.20", false).v4;
     machine.neuron.machine = &machine;
     machine.neuron.connected = true;

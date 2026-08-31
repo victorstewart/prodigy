@@ -12222,8 +12222,12 @@ public:
 
       retryScheduledContainerWaitersAfterNeuronClose(neuron->machine);
 
-      if (weAreMaster && neuron->shouldReconnect())
+      if (weAreMaster)
       {
+        // Neuron control is a persistent master-owned channel. Exhausting one
+        // finite connect window marks the machine missing, but must not strand
+        // that machine after the close CQE retires the failed socket.
+        neuron->reconnectAfterClose = true;
         // A reconnect is a fresh transport generation. If stale send/TLS state
         // survives the prior socket, queueSend() can stay wedged behind a dead
         // pendingSend flag and the first post-reconnect registration/control
