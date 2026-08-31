@@ -7656,6 +7656,9 @@ int main(void)
     suite.expect(installed, "brain_close_handler_expired_master_neuron_installs_fixture");
     if (installed)
     {
+      // Model the close CQE having retired the expired socket before Brain
+      // receives its close callback.
+      cleanupNeuronSocket(machine.neuron, peerFD);
       brain.testCloseHandler(&machine.neuron);
 
       suite.expect(machine.neuron.reconnectAfterClose, "brain_close_handler_expired_master_neuron_restores_persistent_reconnect");
