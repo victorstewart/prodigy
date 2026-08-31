@@ -10943,6 +10943,13 @@ int main(void)
     plan.fragment = 7;
     plan.whiteholes = whiteholes;
     suite.expect(declaredNetworkAccessValid(plan), "declared_network_runtime_validation_accepts_application_plan");
+    suite.expect(declaredNetworkAccessFailure(plan) == nullptr,
+                 "declared_network_runtime_validation_reports_no_failure_for_valid_plan");
+
+    plan.fragment = 0;
+    suite.expect(std::strcmp(declaredNetworkAccessFailure(plan), "invalid container declaredOnly zero fragment") == 0,
+                 "declared_network_runtime_validation_reports_zero_fragment");
+    plan.fragment = 7;
 
     constexpr uint64_t resolverService = 0x0100000000000042ULL;
     plan.whiteholes.clear();
@@ -10955,6 +10962,8 @@ int main(void)
     suite.expect(declaredNetworkAccessValid(plan), "declared_network_runtime_validation_accepts_exact_service_pairings");
     plan.subscriptionPairings.map[resolverService][0].port = 0;
     suite.expect(declaredNetworkAccessValid(plan) == false, "declared_network_runtime_validation_rejects_zero_subscription_port");
+    suite.expect(std::strcmp(declaredNetworkAccessFailure(plan), "invalid container declaredOnly service pairings") == 0,
+                 "declared_network_runtime_validation_reports_invalid_service_pairing");
     plan.subscriptionPairings.map[resolverService][0].port = 5353;
 
     plan.system.kind = SystemContainerKind::mothershipTunnelProvider;

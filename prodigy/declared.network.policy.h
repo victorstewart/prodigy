@@ -51,18 +51,51 @@ static inline bool declaredNetworkPairingsValid(const ContainerPlan& plan)
   return true;
 }
 
-static inline bool declaredNetworkAccessValid(const ContainerPlan& plan)
+static inline const char *declaredNetworkAccessFailure(const ContainerPlan& plan)
 {
   if (plan.networkAccess == ContainerNetworkAccess::unrestricted)
   {
-    return true;
+    return nullptr;
   }
-  return plan.networkAccess == ContainerNetworkAccess::declaredOnly &&
-         (plan.whiteholes.empty() || resolvedWhiteholesValid(plan.whiteholes)) &&
-         declaredNetworkPairingsValid(plan) && plan.fragment != 0 && plan.wormholes.empty() &&
-         plan.useHostNetworkNamespace == false && plan.isSystemContainer() == false &&
-         plan.config.capabilities.contains(CAP_NET_RAW) == false &&
-         plan.config.capabilities.contains(CAP_NET_ADMIN) == false &&
-         plan.config.capabilities.contains(CAP_SYS_ADMIN) == false &&
-         plan.config.capabilities.contains(CAP_BPF) == false;
+  if (plan.networkAccess != ContainerNetworkAccess::declaredOnly)
+  {
+    return "invalid container networkAccess mode";
+  }
+  if (plan.whiteholes.empty() == false && resolvedWhiteholesValid(plan.whiteholes) == false)
+  {
+    return "invalid container declaredOnly whiteholes";
+  }
+  if (declaredNetworkPairingsValid(plan) == false)
+  {
+    return "invalid container declaredOnly service pairings";
+  }
+  if (plan.fragment == 0)
+  {
+    return "invalid container declaredOnly zero fragment";
+  }
+  if (plan.wormholes.empty() == false)
+  {
+    return "invalid container declaredOnly wormholes";
+  }
+  if (plan.useHostNetworkNamespace)
+  {
+    return "invalid container declaredOnly host network namespace";
+  }
+  if (plan.isSystemContainer())
+  {
+    return "invalid container declaredOnly system container";
+  }
+  if (plan.config.capabilities.contains(CAP_NET_RAW) ||
+      plan.config.capabilities.contains(CAP_NET_ADMIN) ||
+      plan.config.capabilities.contains(CAP_SYS_ADMIN) ||
+      plan.config.capabilities.contains(CAP_BPF))
+  {
+    return "invalid container declaredOnly capability";
+  }
+  return nullptr;
+}
+
+static inline bool declaredNetworkAccessValid(const ContainerPlan& plan)
+{
+  return declaredNetworkAccessFailure(plan) == nullptr;
 }

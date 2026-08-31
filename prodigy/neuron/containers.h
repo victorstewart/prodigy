@@ -1640,11 +1640,12 @@ public:
 
   bool buildContainerNetworkPolicy(struct container_network_policy& networkPolicy, String *failureReport = nullptr) const
   {
-    if (declaredNetworkAccessValid(plan) == false)
+    const char *networkAccessFailure = declaredNetworkAccessFailure(plan);
+    if (networkAccessFailure != nullptr)
     {
       if (failureReport)
       {
-        failureReport->assign("invalid container networkAccess policy"_ctv);
+        failureReport->assign(networkAccessFailure);
       }
       return false;
     }
