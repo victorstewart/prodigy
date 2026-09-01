@@ -275,7 +275,7 @@ static bool equalMetricSamples(const Vector<ProdigyMetricSample>& lhs, const Vec
 
 static bool equalMasterAuthorityPackages(const ProdigyPersistentMasterAuthorityPackage& lhs, const ProdigyPersistentMasterAuthorityPackage& rhs)
 {
-  if (equalMapBySerializedValue(lhs.tlsVaultFactoriesByApp, rhs.tlsVaultFactoriesByApp) == false || equalMapBySerializedValue(lhs.apiCredentialSetsByApp, rhs.apiCredentialSetsByApp) == false || lhs.reservedApplicationIDsByName.size() != rhs.reservedApplicationIDsByName.size() || lhs.reservedApplicationNamesByID.size() != rhs.reservedApplicationNamesByID.size() || lhs.reservedApplicationServices.size() != rhs.reservedApplicationServices.size() || lhs.nextReservableApplicationID != rhs.nextReservableApplicationID || equalMapBySerializedValue(lhs.deploymentPlans, rhs.deploymentPlans) == false || lhs.failedDeployments.size() != rhs.failedDeployments.size() || lhs.runtimeState != rhs.runtimeState)
+  if (equalMapBySerializedValue(lhs.tlsVaultFactoriesByApp, rhs.tlsVaultFactoriesByApp) == false || equalMapBySerializedValue(lhs.apiCredentialSetsByApp, rhs.apiCredentialSetsByApp) == false || lhs.reservedApplicationIDsByName.size() != rhs.reservedApplicationIDsByName.size() || lhs.reservedApplicationNamesByID.size() != rhs.reservedApplicationNamesByID.size() || lhs.reservedApplicationServices.size() != rhs.reservedApplicationServices.size() || lhs.nextReservableApplicationID != rhs.nextReservableApplicationID || equalMapBySerializedValue(lhs.deploymentPlans, rhs.deploymentPlans) == false || equalMapBySerializedValue(lhs.failedDeployments, rhs.failedDeployments) == false || lhs.runtimeState != rhs.runtimeState)
   {
     return false;
   }
@@ -306,16 +306,21 @@ static bool equalMasterAuthorityPackages(const ProdigyPersistentMasterAuthorityP
     }
   }
 
-  for (const auto& [deploymentID, failure] : lhs.failedDeployments)
-  {
-    auto it = rhs.failedDeployments.find(deploymentID);
-    if (it == rhs.failedDeployments.end() || it->second.equals(failure) == false)
-    {
-      return false;
-    }
-  }
-
   return true;
+}
+
+static FailedDeploymentRecord reasonOnlyFailedDeployment(const String& reason)
+{
+  FailedDeploymentRecord record = {};
+  record.reason = reason;
+  return record;
+}
+
+static FailedDeploymentRecord reasonOnlyFailedDeployment(const char *reason)
+{
+  FailedDeploymentRecord record = {};
+  record.reason.assign(reason);
+  return record;
 }
 
 static bool equalBrainSnapshots(const ProdigyPersistentBrainSnapshot& lhs, const ProdigyPersistentBrainSnapshot& rhs)
@@ -466,6 +471,65 @@ static void testPersistentMapDirectionalSerialization(TestSuite& suite)
   suite.expect(persistentMapProbeContains(existing, "sentinel", 99), "persistent_map_directional_failed_reader_preserves_value");
 }
 
+static void testFailedDeploymentRecordCompatibilityAndRoundtrip(TestSuite& suite)
+{
+  String legacyReason = {};
+  legacyReason.assign("legacy healthcheck timeout"_ctv);
+  String legacyBytes = {};
+  String mutableLegacyReason = legacyReason;
+  BitseryEngine::serialize(legacyBytes, mutableLegacyReason);
+
+  FailedDeploymentRecord reasonOnly = reasonOnlyFailedDeployment(legacyReason);
+  String reasonOnlyBytes = {};
+  BitseryEngine::serialize(reasonOnlyBytes, reasonOnly);
+  suite.expect(reasonOnlyBytes.equals(legacyBytes), "failed_deployment_reason_only_preserves_legacy_string_encoding");
+
+  FailedDeploymentRecord decodedLegacy = {};
+  suite.expect(BitseryEngine::deserializeSafe(legacyBytes, decodedLegacy), "failed_deployment_legacy_string_decodes");
+  suite.expect(decodedLegacy.reason.equals(legacyReason) && decodedLegacy.hasTerminalReport == false, "failed_deployment_legacy_string_restores_reason_only");
+
+  FailedDeploymentRecord structured = {};
+  structured.reason.assign("canaries failed"_ctv);
+  structured.applicationID = 77;
+  structured.deploymentID = 0x4d000009;
+  structured.failedAtMs = 1'700'000'000'123;
+  structured.hasTerminalReport = true;
+  structured.terminalReport.versionID = 9;
+  structured.terminalReport.state = DeploymentState::failed;
+  structured.terminalReport.stateSinceMs = structured.failedAtMs;
+  structured.terminalReport.nCrashes = 1;
+  FailureReport failure = {};
+  failure.containerUUID = uint128_t(0x7711);
+  failure.report.assign("exited with code 1"_ctv);
+  failure.approxTimeMs = structured.failedAtMs;
+  failure.nthCrash = 1;
+  failure.signal = 0;
+  failure.restarted = false;
+  failure.wasCanary = true;
+  structured.terminalReport.failureReports.push_back(failure);
+
+  String structuredBytes = {};
+  BitseryEngine::serialize(structuredBytes, structured);
+  FailedDeploymentRecord decodedStructured = {};
+  suite.expect(BitseryEngine::deserializeSafe(structuredBytes, decodedStructured), "failed_deployment_structured_record_decodes");
+  suite.expect(
+      decodedStructured.hasTerminalReport && decodedStructured.applicationID == structured.applicationID && decodedStructured.deploymentID == structured.deploymentID && decodedStructured.failedAtMs == structured.failedAtMs && decodedStructured.reason.equals(structured.reason),
+      "failed_deployment_structured_record_restores_identity");
+  suite.expect(
+      decodedStructured.terminalReport.state == DeploymentState::failed && decodedStructured.terminalReport.nCrashes == 1 && decodedStructured.terminalReport.failureReports.size() == 1 && decodedStructured.terminalReport.failureReports[0].restarted == false && decodedStructured.terminalReport.failureReports[0].wasCanary,
+      "failed_deployment_structured_record_restores_terminal_failure_fields");
+
+  String malformedTaggedValue = {};
+  constexpr static char structuredPrefix[] = "PRODIGY_FAILED_DEPLOYMENT_REPORT_V1\0";
+  malformedTaggedValue.append(structuredPrefix, sizeof(structuredPrefix) - 1);
+  malformedTaggedValue.append("malformed"_ctv);
+  String malformedBytes = {};
+  BitseryEngine::serialize(malformedBytes, malformedTaggedValue);
+  FailedDeploymentRecord malformedDecoded = {};
+  suite.expect(BitseryEngine::deserializeSafe(malformedBytes, malformedDecoded), "failed_deployment_malformed_tag_keeps_snapshot_decodable");
+  suite.expect(malformedDecoded.hasTerminalReport == false && malformedDecoded.reason.equals(malformedTaggedValue), "failed_deployment_malformed_tag_falls_back_to_reason_only");
+}
+
 static void testPersistentBrainSnapshotLargeMetricSampleRoundtrip(TestSuite& suite)
 {
   ProdigyPersistentBrainSnapshot snapshot = {};
@@ -571,6 +635,7 @@ int main(void)
 {
   TestSuite suite;
   testPersistentMapDirectionalSerialization(suite);
+  testFailedDeploymentRecordCompatibilityAndRoundtrip(suite);
   testPersistentBrainSnapshotLargeMetricSampleRoundtrip(suite);
 
   char scratch[] = "/tmp/nametag-prodigy-persistent-state-XXXXXX";
@@ -1006,7 +1071,26 @@ int main(void)
   storedSnapshot.masterAuthority.reservedApplicationServices.push_back(storedSiblingService);
   storedSnapshot.masterAuthority.nextReservableApplicationID = uint16_t(applicationID + 1);
   storedSnapshot.masterAuthority.deploymentPlans.insert_or_assign(storedPlan.config.deploymentID(), storedPlan);
-  storedSnapshot.masterAuthority.failedDeployments.insert_or_assign(storedPlan.config.deploymentID(), "healthcheck timeout"_ctv);
+  FailedDeploymentRecord storedFailure = {};
+  storedFailure.reason.assign("healthcheck timeout"_ctv);
+  storedFailure.applicationID = applicationID;
+  storedFailure.deploymentID = storedPlan.config.deploymentID();
+  storedFailure.failedAtMs = 1'700'000'000'321;
+  storedFailure.hasTerminalReport = true;
+  storedFailure.terminalReport.versionID = storedPlan.config.versionID;
+  storedFailure.terminalReport.state = DeploymentState::failed;
+  storedFailure.terminalReport.stateSinceMs = storedFailure.failedAtMs;
+  storedFailure.terminalReport.nCrashes = 1;
+  FailureReport storedContainerFailure = {};
+  storedContainerFailure.containerUUID = uint128_t(0x991122);
+  storedContainerFailure.report.assign("canary exited with code 1"_ctv);
+  storedContainerFailure.approxTimeMs = storedFailure.failedAtMs;
+  storedContainerFailure.nthCrash = 1;
+  storedContainerFailure.signal = 0;
+  storedContainerFailure.restarted = false;
+  storedContainerFailure.wasCanary = true;
+  storedFailure.terminalReport.failureReports.push_back(storedContainerFailure);
+  storedSnapshot.masterAuthority.failedDeployments.insert_or_assign(storedPlan.config.deploymentID(), storedFailure);
   storedSnapshot.masterAuthority.runtimeState.generation = 19;
   storedSnapshot.masterAuthority.runtimeState.hasCompletedInitialMasterElection = true;
   storedSnapshot.masterAuthority.runtimeState.nextMintedClientTlsGeneration = 123;
@@ -1354,7 +1438,7 @@ int main(void)
     replacementPlan.config.applicationID = uint16_t(applicationID + 1);
     replacementPlan.config.versionID += 1;
     expectedReplacementSnapshot.masterAuthority.deploymentPlans.insert_or_assign(replacementPlan.config.deploymentID(), replacementPlan);
-    expectedReplacementSnapshot.masterAuthority.failedDeployments.insert_or_assign(replacementPlan.config.deploymentID(), "replacement failure"_ctv);
+    expectedReplacementSnapshot.masterAuthority.failedDeployments.insert_or_assign(replacementPlan.config.deploymentID(), reasonOnlyFailedDeployment("replacement failure"));
     expectedReplacementSnapshot.masterAuthority.runtimeState.generation += 1;
     expectedReplacementSnapshot.metricSamples.clear();
     expectedReplacementSnapshot.metricSamples.push_back(metricB);
@@ -1614,7 +1698,7 @@ int main(void)
             replacementPlan);
         replacementSnapshot.masterAuthority.failedDeployments.insert_or_assign(
             replacementPlan.config.deploymentID(),
-            replacementFailure);
+            reasonOnlyFailedDeployment(replacementFailure));
       }
 
       replacementSnapshot.metricSamples.push_back((round % 2) == 0 ? metricA : metricB);

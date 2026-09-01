@@ -8135,6 +8135,106 @@ static void serialize(S&& serializer, DeploymentPlan& plan)
   serializer.object(plan.apiCredentialPolicy);
 }
 
+template <typename T>
+struct ProdigyPersistentSerializerIsWriter : std::false_type {
+};
+
+template <typename OutputAdapter, typename Context>
+struct ProdigyPersistentSerializerIsWriter<bitsery::Serializer<OutputAdapter, Context>> : std::true_type {
+};
+
+class FailedDeploymentRecordPayload {
+public:
+
+  String reason;
+  uint16_t applicationID = 0;
+  uint64_t deploymentID = 0;
+  int64_t failedAtMs = 0;
+  DeploymentStatusReport terminalReport;
+};
+
+template <typename S>
+static void serialize(S&& serializer, FailedDeploymentRecordPayload& record)
+{
+  serializer.text1b(record.reason, UINT32_MAX);
+  serializer.value2b(record.applicationID);
+  serializer.value8b(record.deploymentID);
+  serializer.value8b(record.failedAtMs);
+  serializer.object(record.terminalReport);
+}
+
+class FailedDeploymentRecord {
+public:
+
+  String reason;
+  uint16_t applicationID = 0;
+  uint64_t deploymentID = 0;
+  int64_t failedAtMs = 0;
+  bool hasTerminalReport = false;
+  DeploymentStatusReport terminalReport;
+};
+
+template <typename S>
+static void serialize(S&& serializer, FailedDeploymentRecord& record)
+{
+  // Keep reason-only records byte-compatible with the former String map value.
+  // Structured records remain one text1b value so existing snapshots can still
+  // be decoded, while old binaries retain the opaque value instead of rejecting
+  // the entire master-authority package.
+  constexpr static char structuredPrefix[] = "PRODIGY_FAILED_DEPLOYMENT_REPORT_V1\0";
+  constexpr static uint64_t structuredPrefixBytes = sizeof(structuredPrefix) - 1;
+  using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
+
+  String encoded = {};
+  if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
+  {
+    if (record.hasTerminalReport)
+    {
+      FailedDeploymentRecordPayload payload = {};
+      payload.reason = record.reason;
+      payload.applicationID = record.applicationID;
+      payload.deploymentID = record.deploymentID;
+      payload.failedAtMs = record.failedAtMs;
+      payload.terminalReport = record.terminalReport;
+
+      String serializedPayload = {};
+      BitseryEngine::serialize(serializedPayload, payload);
+      encoded.append(structuredPrefix, structuredPrefixBytes);
+      encoded.append(serializedPayload);
+    }
+    else
+    {
+      encoded = record.reason;
+    }
+  }
+
+  serializer.text1b(encoded, UINT32_MAX);
+
+  if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+  {
+    record = {};
+    if (encoded.size() >= structuredPrefixBytes && memcmp(encoded.data(), structuredPrefix, structuredPrefixBytes) == 0)
+    {
+      String serializedPayload = encoded.substr(structuredPrefixBytes, encoded.size() - structuredPrefixBytes, Copy::no);
+      FailedDeploymentRecordPayload payload = {};
+      if (BitseryEngine::deserializeSafe(serializedPayload, payload))
+      {
+        record.reason = std::move(payload.reason);
+        record.applicationID = payload.applicationID;
+        record.deploymentID = payload.deploymentID;
+        record.failedAtMs = payload.failedAtMs;
+        record.hasTerminalReport = true;
+        record.terminalReport = std::move(payload.terminalReport);
+        return;
+      }
+    }
+
+    // A legacy or malformed tagged entry remains available as its original
+    // reason text; one damaged terminal report cannot invalidate the snapshot.
+    record.reason = std::move(encoded);
+  }
+}
+
 class ProdigyPersistentMasterAuthorityPackage {
 public:
 
@@ -8145,7 +8245,7 @@ public:
   Vector<ApplicationServiceIdentity> reservedApplicationServices;
   uint16_t nextReservableApplicationID = 1;
   bytell_hash_map<uint64_t, DeploymentPlan> deploymentPlans;
-  bytell_hash_map<uint64_t, String> failedDeployments;
+  bytell_hash_map<uint64_t, FailedDeploymentRecord> failedDeployments;
   ProdigyMasterAuthorityRuntimeState runtimeState;
 };
 
@@ -8163,14 +8263,6 @@ public:
 
   const Key *key = nullptr;
   const Value *value = nullptr;
-};
-
-template <typename T>
-struct ProdigyPersistentSerializerIsWriter : std::false_type {
-};
-
-template <typename OutputAdapter, typename Context>
-struct ProdigyPersistentSerializerIsWriter<bitsery::Serializer<OutputAdapter, Context>> : std::true_type {
 };
 
 static inline bool prodigyPersistentStringComesBefore(const String& lhs, const String& rhs)

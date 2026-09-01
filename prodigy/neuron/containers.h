@@ -1029,6 +1029,7 @@ public:
   bool waitidPending = false;
   bool destroyCloseCompleted = false;
   bool failedArtifactsPreserved = false;
+  int64_t failedArtifactsObservedAtMs = 0;
   bool deviceMapReserved = false;
   bool networkCleanupPending = false;
   bool networkCleanupComplete = false;
@@ -4833,7 +4834,8 @@ private:
       ok &= forEachDirectoryName(containerFD, [&](const char *failureTimeName) {
         uint128_t failureTime = 0;
         if (parseDecimal128(failureTimeName, failureTime) && failureTime <= uint128_t(INT64_MAX) &&
-            int64_t(failureTime) >= oldestFailureTimeMs && int64_t(failureTime) <= nowMs)
+            int64_t(failureTime) >= oldestFailureTimeMs && int64_t(failureTime) <= nowMs &&
+            failedContainerArtifactBundleIsCompleteAt(containerFD, failureTimeName))
         {
           retained.push_back({operation.applicationID, containerUUID, int64_t(failureTime)});
         }
@@ -4887,6 +4889,40 @@ private:
     }
 
     return infop.si_code;
+  }
+
+  static bool failedContainerArtifactBundleIsCompleteAt(int containerFD, const char *failureTimeName)
+  {
+    String failureTimeComponent = {};
+    failureTimeComponent.assign(failureTimeName);
+    int bundleFD = Filesystem::openDirectoryAt(
+        containerFD,
+        failureTimeComponent,
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+        secureContainerResolveFlags);
+    if (bundleFD < 0)
+    {
+      return false;
+    }
+
+    int markerFD = Filesystem::openFileAt(
+        bundleFD,
+        "complete"_ctv,
+        O_RDONLY | O_CLOEXEC | O_NOFOLLOW,
+        0,
+        secureContainerResolveFlags);
+    close(bundleFD);
+    if (markerFD < 0)
+    {
+      return false;
+    }
+
+    constexpr char expected[] = "complete\n";
+    char contents[sizeof(expected)] = {};
+    ssize_t bytesRead = ::read(markerFD, contents, sizeof(contents));
+    close(markerFD);
+    return bytesRead == ssize_t(sizeof(expected) - 1) &&
+           memcmp(contents, expected, sizeof(expected) - 1) == 0;
   }
 
   static bool ensureDirectoryTree(const std::filesystem::path& directoryPath, String *failureReport = nullptr)
@@ -5000,14 +5036,30 @@ private:
 
     bool ok = true;
     int writeErrno = 0;
-    if (contents.size() > 0)
+    uint64_t totalWritten = 0;
+    while (totalWritten < contents.size())
     {
-      ssize_t wrote = ::write(fd, reinterpret_cast<const char *>(contents.data()), contents.size());
-      ok = (wrote == ssize_t(contents.size()));
-      if (ok == false)
+      ssize_t wrote = ::write(
+          fd,
+          reinterpret_cast<const char *>(contents.data()) + totalWritten,
+          contents.size() - totalWritten);
+      if (wrote < 0 && errno == EINTR)
       {
-        writeErrno = errno;
+        continue;
       }
+      if (wrote <= 0)
+      {
+        writeErrno = (wrote == 0) ? EIO : errno;
+        ok = false;
+        break;
+      }
+      totalWritten += uint64_t(wrote);
+    }
+
+    if (ok && ::fsync(fd) != 0)
+    {
+      writeErrno = errno;
+      ok = false;
     }
 
     if (::close(fd) != 0 && writeErrno == 0)
@@ -5029,6 +5081,50 @@ private:
       return false;
     }
 
+    return true;
+  }
+
+  static bool completeFailedContainerArtifactBundle(
+      const std::filesystem::path& bundlePath,
+      String *failureReport = nullptr)
+  {
+    std::filesystem::path temporaryMarkerPath = bundlePath / ".complete.tmp";
+    if (writeFailureArtifactTextFile(temporaryMarkerPath, String("complete\n"), failureReport) == false)
+    {
+      return false;
+    }
+
+    std::error_code renameError = {};
+    std::filesystem::rename(temporaryMarkerPath, bundlePath / "complete", renameError);
+    if (renameError)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to publish failure artifact completion marker {} reason={}"_ctv>(
+            prodigyStringFromFilesystemPath(bundlePath),
+            String(renameError.message().c_str()));
+      }
+      return false;
+    }
+
+    int bundleFD = ::open(bundlePath.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (bundleFD < 0 || ::fsync(bundleFD) != 0)
+    {
+      int syncErrno = errno;
+      if (bundleFD >= 0)
+      {
+        close(bundleFD);
+      }
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to sync failure artifact bundle {} errno={}({})"_ctv>(
+            prodigyStringFromFilesystemPath(bundlePath),
+            syncErrno,
+            String(strerror(syncErrno)));
+      }
+      return false;
+    }
+    close(bundleFD);
     return true;
   }
 
@@ -5119,6 +5215,11 @@ private:
       }
     }
 
+    if (completeFailedContainerArtifactBundle(bundlePath, failureReport) == false)
+    {
+      return false;
+    }
+
     if (retainedBundlePath)
     {
       retainedBundlePath->assign(prodigyStringFromFilesystemPath(bundlePath));
@@ -5162,12 +5263,17 @@ private:
       return false;
     }
 
+    if (container->failedArtifactsObservedAtMs <= 0)
+    {
+      container->failedArtifactsObservedAtMs = failureTimeMs;
+    }
+
     String localRetainedBundlePath = {};
     bool preserved = preserveFailedContainerArtifactsAtPath(
         retentionRootPath,
         container,
         container->infop,
-        failureTimeMs,
+        container->failedArtifactsObservedAtMs,
         failedContainerTerminalSignal(container->infop),
         &localRetainedBundlePath,
         failureReport);
@@ -11448,6 +11554,11 @@ public:
                  (unsigned long long)container->plan.uuid,
                  failureReport.c_str());
       destroyContainer(container);
+    }
+    else
+    {
+      container->failedArtifactsPreserved = false;
+      container->failedArtifactsObservedAtMs = 0;
     }
   }
 

@@ -3178,7 +3178,13 @@ private:
       preserveContainerImage = true;
     }
 
-    thisBrain->deploymentFailed(this, plan.config.deploymentID(), "canaries failed"_ctv, preserveContainerImage);
+    thisBrain->deploymentFailed(
+        this,
+        plan.config.applicationID,
+        plan.config.deploymentID(),
+        "canaries failed"_ctv,
+        generateReport(),
+        preserveContainerImage);
     thisBrain->spinApplicationFin(this);
 
     if (auto it = thisBrain->deployments.find(plan.config.deploymentID()); it != thisBrain->deployments.end())
@@ -8485,7 +8491,12 @@ public:
       }
       if (failedBeforeDeployHealthy)
       {
-        thisBrain->deploymentFailed(this, plan.config.deploymentID(), report.size() ? report : String("container failed before becoming healthy"_ctv));
+        thisBrain->deploymentFailed(
+            this,
+            plan.config.applicationID,
+            plan.config.deploymentID(),
+            report.size() ? report : String("container failed before becoming healthy"_ctv),
+            generateReport());
         return;
       }
     }

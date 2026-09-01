@@ -450,7 +450,7 @@ public:
 
   // these will be culled once every 10 minutes
   TimeoutPacket failedDeploymentCleaner;
-  bytell_hash_map<uint64_t, String> failedDeployments;
+  bytell_hash_map<uint64_t, FailedDeploymentRecord> failedDeployments;
 
   bytell_hash_set<uint32_t> usedMachineFragments;
 
@@ -657,11 +657,24 @@ protected:
 
 public:
 
-  void deploymentFailed(ApplicationDeployment *deployment, uint64_t deploymentID, StringType auto&& reason, bool preserveContainerImage = false)
+  void deploymentFailed(
+      ApplicationDeployment *deployment,
+      uint16_t applicationID,
+      uint64_t deploymentID,
+      StringType auto&& reason,
+      DeploymentStatusReport terminalReport,
+      bool preserveContainerImage = false)
   {
     spinApplicationFailed(deployment, reason);
 
-    failedDeployments.insert_or_assign(deploymentID, reason);
+    FailedDeploymentRecord failed = {};
+    failed.reason.assign(reason);
+    failed.applicationID = applicationID;
+    failed.deploymentID = deploymentID;
+    failed.failedAtMs = Time::now<TimeResolution::ms>();
+    failed.hasTerminalReport = true;
+    failed.terminalReport = std::move(terminalReport);
+    failedDeployments.insert_or_assign(deploymentID, std::move(failed));
     if (preserveContainerImage == false)
     {
       releaseRoutableResourceLeasesForDeployment(deploymentID);

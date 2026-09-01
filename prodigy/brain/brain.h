@@ -27239,6 +27239,26 @@ public:
 
               } while (workingDeployment);
             }
+            else
+            {
+              const FailedDeploymentRecord *newestFailure = nullptr;
+              for (const auto& [deploymentID, failed] : failedDeployments)
+              {
+                (void)deploymentID;
+                if (failed.hasTerminalReport == false || failed.applicationID != applicationID)
+                {
+                  continue;
+                }
+                if (newestFailure == nullptr || failed.failedAtMs > newestFailure->failedAtMs)
+                {
+                  newestFailure = &failed;
+                }
+              }
+              if (newestFailure)
+              {
+                report.deploymentReports.push_back(newestFailure->terminalReport);
+              }
+            }
 
             String serializedReport;
             BitseryEngine::serialize(serializedReport, report);

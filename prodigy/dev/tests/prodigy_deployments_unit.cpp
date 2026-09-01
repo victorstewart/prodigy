@@ -3016,6 +3016,7 @@ int main(void)
       suite.expect(std::filesystem::exists(retainedPath / "launch.metadata"), "failed_container_retention_copies_launch_metadata");
       suite.expect(std::filesystem::exists(retainedPath / "logs" / "stdout.log"), "failed_container_retention_copies_stdout");
       suite.expect(std::filesystem::exists(retainedPath / "logs" / "stderr.log"), "failed_container_retention_copies_stderr");
+      suite.expect(std::filesystem::exists(retainedPath / "complete"), "failed_container_retention_publishes_completion_marker_last");
 
       TestNeuron logNeuron = {};
       NeuronBase *previousNeuron = thisNeuron;
@@ -3156,6 +3157,112 @@ int main(void)
       suite.expect(iteratorError.value() == 0, "failed_container_retention_if_needed_bundle_count_iteration_succeeds");
       suite.expect(bundleCount == 1, "failed_container_retention_if_needed_only_one_bundle_written");
       suite.expect(std::filesystem::exists(filesystemPathFromString(firstRetainedBundlePath) / "metadata.txt"), "failed_container_retention_if_needed_first_bundle_writes_metadata");
+      suite.expect(std::filesystem::exists(filesystemPathFromString(firstRetainedBundlePath) / "complete"), "failed_container_retention_if_needed_first_bundle_is_complete");
+    }
+  }
+
+  {
+    TemporaryDirectory artifactRoot;
+    TemporaryDirectory retentionRoot;
+    suite.expect(artifactRoot.create(), "failed_container_retention_retry_fixture_artifact_root_created");
+    suite.expect(retentionRoot.create(), "failed_container_retention_retry_fixture_retention_root_created");
+
+    if (artifactRoot.path.size() > 0 && retentionRoot.path.size() > 0)
+    {
+      std::filesystem::path artifactRootPath = filesystemPathFromString(artifactRoot.path);
+      std::filesystem::path rootfsPath = artifactRootPath / "rootfs";
+      suite.expect(createDirectoryFixture(rootfsPath / "logs"), "failed_container_retention_retry_fixture_logs_dir_created");
+      suite.expect(writeFileFixture(rootfsPath / "params.dump", "params-before-delete\n"), "failed_container_retention_retry_fixture_params_written");
+      suite.expect(writeFileFixture(rootfsPath / "logs" / "stdout.log", "retry-stdout\n"), "failed_container_retention_retry_fixture_stdout_written");
+      suite.expect(writeFileFixture(rootfsPath / "logs" / "stderr.log", "retry-stderr\n"), "failed_container_retention_retry_fixture_stderr_written");
+
+      Container container = {};
+      container.plan.uuid = uint128_t(0x9123);
+      container.plan.config.applicationID = 99;
+      container.name.assign("18170712990884937031"_ctv);
+      container.pid = 6161;
+      container.artifactRootPath.assign(artifactRoot.path);
+      container.rootfsPath.assign(stringFromFilesystemPath(rootfsPath));
+      container.infop.si_pid = container.pid;
+      container.infop.si_code = CLD_EXITED;
+      container.infop.si_status = 1;
+
+      const int64_t firstObservedAtMs = Time::now<TimeResolution::ms>();
+      const int64_t retryObservedAtMs = firstObservedAtMs + 1'000;
+      String firstObservedAtText = {};
+      firstObservedAtText.assignItoa(uint64_t(firstObservedAtMs));
+      String retryObservedAtText = {};
+      retryObservedAtText.assignItoa(uint64_t(retryObservedAtMs));
+      std::filesystem::path retainedPath = filesystemPathFromString(retentionRoot.path) /
+          "99" / "18170712990884937031" / firstObservedAtText.c_str();
+      suite.expect(createDirectoryFixture(retainedPath), "failed_container_retention_retry_fixture_partial_bundle_created");
+      suite.expect(writeFileFixture(retainedPath / "logs", "blocks-log-directory\n"), "failed_container_retention_retry_fixture_copy_blocker_written");
+
+      String retainedBundlePath = {};
+      String failure = {};
+      bool firstPreserved = ContainerManager::debugPreserveFailedContainerArtifactsIfNeededAtPath(
+          retentionRoot.path,
+          &container,
+          firstObservedAtMs,
+          &retainedBundlePath,
+          &failure);
+      suite.expect(firstPreserved == false, "failed_container_retention_retry_first_copy_fails");
+      suite.expect(container.failedArtifactsPreserved == false, "failed_container_retention_retry_partial_bundle_not_marked_preserved");
+      suite.expect(container.failedArtifactsObservedAtMs == firstObservedAtMs, "failed_container_retention_retry_first_observed_timestamp_recorded");
+      suite.expect(std::filesystem::exists(retainedPath / "metadata.txt"), "failed_container_retention_retry_partial_metadata_remains_retryable");
+      suite.expect(std::filesystem::exists(retainedPath / "complete") == false, "failed_container_retention_retry_partial_bundle_not_published");
+
+      TestNeuron logNeuron = {};
+      NeuronBase *previousNeuron = thisNeuron;
+      thisNeuron = &logNeuron;
+      ContainerLogsOperation incompleteLogs = {};
+      incompleteLogs.applicationID = container.plan.config.applicationID;
+      incompleteLogs.maximumBytes = 1024;
+      incompleteLogs.includeRunning = false;
+      incompleteLogs.includeFailed = true;
+      bool incompleteCollected = ContainerManager::debugCollectContainerLogsAtPath(incompleteLogs, retentionRoot.path);
+      suite.expect(incompleteCollected, "failed_container_retention_retry_partial_bundle_collection_succeeds");
+      suite.expect(incompleteLogs.success, "failed_container_retention_retry_partial_bundle_collection_reports_success");
+      suite.expect(incompleteLogs.entries.empty(), "failed_container_retention_retry_partial_bundle_hidden_from_log_reports");
+
+      std::error_code removeBlockerError = {};
+      std::filesystem::remove(retainedPath / "logs", removeBlockerError);
+      suite.expect(removeBlockerError.value() == 0, "failed_container_retention_retry_fixture_copy_blocker_removed");
+      failure.clear();
+      retainedBundlePath.clear();
+      bool retryPreserved = ContainerManager::debugPreserveFailedContainerArtifactsIfNeededAtPath(
+          retentionRoot.path,
+          &container,
+          retryObservedAtMs,
+          &retainedBundlePath,
+          &failure);
+      suite.expect(retryPreserved, "failed_container_retention_retry_completes");
+      suite.expect(failure.size() == 0, "failed_container_retention_retry_success_clears_failure");
+      suite.expect(container.failedArtifactsPreserved, "failed_container_retention_retry_sets_preserved_only_after_completion");
+      suite.expect(filesystemPathFromString(retainedBundlePath) == retainedPath, "failed_container_retention_retry_reuses_first_timestamp_bundle");
+      suite.expect(std::filesystem::exists(retainedPath / "params.dump"), "failed_container_retention_retry_preserves_params_before_rootfs_delete");
+      suite.expect(std::filesystem::exists(retainedPath / "logs" / "stdout.log"), "failed_container_retention_retry_preserves_stdout_before_rootfs_delete");
+      suite.expect(std::filesystem::exists(retainedPath / "logs" / "stderr.log"), "failed_container_retention_retry_preserves_stderr_before_rootfs_delete");
+      suite.expect(std::filesystem::exists(retainedPath / "complete"), "failed_container_retention_retry_publishes_terminal_bundle");
+      suite.expect(
+          std::filesystem::exists(filesystemPathFromString(retentionRoot.path) / "99" / "18170712990884937031" / retryObservedAtText.c_str()) == false,
+          "failed_container_retention_retry_does_not_create_duplicate_timestamp_bundle");
+
+      ContainerLogsOperation completedLogs = {};
+      completedLogs.applicationID = container.plan.config.applicationID;
+      completedLogs.maximumBytes = 1024;
+      completedLogs.includeRunning = false;
+      completedLogs.includeFailed = true;
+      bool completedCollected = ContainerManager::debugCollectContainerLogsAtPath(completedLogs, retentionRoot.path);
+      thisNeuron = previousNeuron;
+      suite.expect(completedCollected, "failed_container_retention_retry_terminal_bundle_collection_succeeds");
+      suite.expect(completedLogs.success, "failed_container_retention_retry_terminal_bundle_collection_reports_success");
+      suite.expect(
+          completedLogs.entries.size() == 1 &&
+              completedLogs.entries[0].capturedAtMs == firstObservedAtMs &&
+              completedLogs.entries[0].standardOutput.equal("retry-stdout\n"_ctv) &&
+              completedLogs.entries[0].standardError.equal("retry-stderr\n"_ctv),
+          "failed_container_retention_retry_terminal_bundle_visible_to_log_reports");
     }
   }
 

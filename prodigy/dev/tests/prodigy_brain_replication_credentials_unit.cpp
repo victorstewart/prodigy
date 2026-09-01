@@ -2455,6 +2455,28 @@ static bool pullClusterStatusReportForTest(TestBrain& brain, ClusterStatusReport
   return BitseryEngine::deserializeSafe(serializedReport, report);
 }
 
+static bool pullApplicationStatusReportForTest(TestBrain& brain, uint16_t applicationID, ApplicationStatusReport& report)
+{
+  Mothership mothership;
+  String buffer;
+  brain.mothershipHandler(&mothership, buildMothershipMessage(buffer, MothershipTopic::pullApplicationReport, applicationID));
+
+  if (mothership.wBuffer.size() < sizeof(Message))
+  {
+    return false;
+  }
+  Message *response = reinterpret_cast<Message *>(mothership.wBuffer.data());
+  if (MothershipTopic(response->topic) != MothershipTopic::pullApplicationReport)
+  {
+    return false;
+  }
+
+  String serializedReport = {};
+  uint8_t *responseArgs = response->args;
+  Message::extractToStringView(responseArgs, serializedReport);
+  return BitseryEngine::deserializeSafe(serializedReport, report);
+}
+
 template <typename... Args>
 static Message *buildNeuronMessage(String& buffer, NeuronTopic topic, Args&&...args)
 {
@@ -2575,6 +2597,13 @@ static bool equalSerializedObjects(const T& lhs, const T& rhs)
   BitseryEngine::serialize(serializedLhs, mutableLhs);
   BitseryEngine::serialize(serializedRhs, mutableRhs);
   return serializedLhs.equals(serializedRhs);
+}
+
+static FailedDeploymentRecord reasonOnlyFailedDeploymentForTest(const char *reason)
+{
+  FailedDeploymentRecord record = {};
+  record.reason.assign(reason);
+  return record;
 }
 
 static IPPrefix makePrefix(const char *cidr)
@@ -8988,7 +9017,7 @@ static void testPersistentMasterAuthorityPackageRestore(TestSuite& suite)
   source.tlsResumptionStateByDeployment[plan.config.deploymentID()].wormholes[resumptionWormholeName].snapshot = resumptionSnapshot;
   source.nextTlsResumptionGeneration = 45;
   source.deploymentPlans.insert_or_assign(plan.config.deploymentID(), plan);
-  source.failedDeployments.insert_or_assign(plan.config.deploymentID(), "bundle-missing"_ctv);
+  source.failedDeployments.insert_or_assign(plan.config.deploymentID(), reasonOnlyFailedDeploymentForTest("bundle-missing"));
   source.nextMintedClientTlsGeneration = 77;
   source.masterAuthorityRuntimeState.generation = 5;
   suite.expect(generateTransportAuthority(source.masterAuthorityRuntimeState.transportTLSAuthority, failure), "restore_package_generate_transport_authority");
@@ -9038,7 +9067,7 @@ static void testPersistentMasterAuthorityPackageRestore(TestSuite& suite)
   suite.expect(restoredNameIt != restored.reservedApplicationNamesByID.end() && restoredNameIt->second.equal(appName), "restore_package_restores_application_name_reservation");
   suite.expect(restored.nextReservableApplicationID == source.nextReservableApplicationID, "restore_package_restores_next_application_id");
   suite.expect(restoredPlanIt != restored.deploymentPlans.end() && equalSerializedObjects(restoredPlanIt->second, plan), "restore_package_restores_deployment_plan");
-  suite.expect(restoredFailureIt != restored.failedDeployments.end() && restoredFailureIt->second.equal("bundle-missing"_ctv), "restore_package_restores_failed_deployment");
+  suite.expect(restoredFailureIt != restored.failedDeployments.end() && restoredFailureIt->second.reason.equal("bundle-missing"_ctv), "restore_package_restores_failed_deployment");
   suite.expect(restored.masterAuthorityRuntimeState == source.masterAuthorityRuntimeState, "restore_package_restores_master_runtime_state");
   suite.expect(restored.hasCompletedInitialMasterElection, "restore_package_restores_initial_master_election_completion");
   suite.expect(restored.nextMintedClientTlsGeneration == source.nextMintedClientTlsGeneration, "restore_package_restores_client_tls_generation");
@@ -17382,6 +17411,81 @@ static void testBrainNeuronStateUploadHealthyContainerClearsWaiters(TestSuite& s
   thisBrain = previousBrain;
 }
 
+static void testCanaryRollbackPersistsTerminalApplicationReport(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+  TestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+
+  BrainBase *previousBrain = thisBrain;
+  thisBrain = &brain;
+
+  ApplicationDeployment *deployment = new ApplicationDeployment();
+  deployment->plan = makeDeploymentPlan(62'050, 17);
+  deployment->plan.canaryCount = 1;
+  deployment->plan.stateless.nBase = 1;
+  deployment->state = DeploymentState::failed;
+  deployment->stateChangedAtMs = 1'700'000'000'017;
+  deployment->nTargetCanary = 1;
+  deployment->nDeployedCanary = 1;
+  deployment->nCrashes = 1;
+
+  FailureReport failure = {};
+  failure.containerUUID = uint128_t(0x5501);
+  failure.report.assign("exited with code 1"_ctv);
+  failure.approxTimeMs = 1'700'000'000'016;
+  failure.nthCrash = 1;
+  failure.signal = 0;
+  failure.restarted = false;
+  failure.wasCanary = true;
+  deployment->failureReports.push_back(failure);
+
+  const uint16_t applicationID = deployment->plan.config.applicationID;
+  const uint64_t deploymentID = deployment->plan.config.deploymentID();
+  String applicationName = {};
+  applicationName.assign("CanaryTerminalReport"_ctv);
+  brain.reserveApplicationIDMapping(applicationName, applicationID);
+  brain.deployments.insert_or_assign(deploymentID, deployment);
+  brain.deploymentsByApp.insert_or_assign(applicationID, deployment);
+
+  deployment->debugRollbackForTest();
+
+  auto failureIt = brain.failedDeployments.find(deploymentID);
+  suite.expect(brain.deploymentsByApp.contains(applicationID) == false, "canary_terminal_report_rollback_removes_live_application");
+  suite.expect(
+      failureIt != brain.failedDeployments.end() && failureIt->second.hasTerminalReport && failureIt->second.applicationID == applicationID && failureIt->second.terminalReport.state == DeploymentState::failed,
+      "canary_terminal_report_rollback_persists_failed_status");
+  suite.expect(
+      failureIt != brain.failedDeployments.end() && failureIt->second.terminalReport.failureReports.size() == 1 && failureIt->second.terminalReport.failureReports[0].restarted == false && failureIt->second.terminalReport.failureReports[0].wasCanary,
+      "canary_terminal_report_rollback_persists_failure_flags");
+
+  ApplicationStatusReport liveReport = {};
+  suite.expect(pullApplicationStatusReportForTest(brain, applicationID, liveReport), "canary_terminal_report_application_report_decodes_after_rollback");
+  suite.expect(
+      liveReport.applicationID == applicationID && liveReport.applicationName.equals(applicationName) && liveReport.deploymentReports.size() == 1 && liveReport.deploymentReports[0].state == DeploymentState::failed && liveReport.deploymentReports[0].nCrashes == 1,
+      "canary_terminal_report_application_report_restores_failed_deployment");
+  suite.expect(
+      liveReport.deploymentReports.size() == 1 && liveReport.deploymentReports[0].failureReports.size() == 1 && liveReport.deploymentReports[0].failureReports[0].restarted == false && liveReport.deploymentReports[0].failureReports[0].wasCanary,
+      "canary_terminal_report_application_report_restores_failure_flags");
+
+  ProdigyPersistentMasterAuthorityPackage package = {};
+  brain.capturePersistentMasterAuthorityPackage(package);
+  TestBrain restored = {};
+  restored.iaas = &iaas;
+  suite.expect(restored.applyPersistentMasterAuthorityPackage(package), "canary_terminal_report_restore_package_applies");
+  thisBrain = &restored;
+
+  ApplicationStatusReport restartedReport = {};
+  suite.expect(pullApplicationStatusReportForTest(restored, applicationID, restartedReport), "canary_terminal_report_application_report_decodes_after_restore");
+  suite.expect(
+      restartedReport.deploymentReports.size() == 1 && restartedReport.deploymentReports[0].state == DeploymentState::failed && restartedReport.deploymentReports[0].failureReports.size() == 1 && restartedReport.deploymentReports[0].failureReports[0].restarted == false && restartedReport.deploymentReports[0].failureReports[0].wasCanary,
+      "canary_terminal_report_application_report_survives_restore");
+
+  thisBrain = previousBrain;
+}
+
 static void testDeployingContainerFailureFailsDeployment(TestSuite& suite)
 {
   ScopedRing scopedRing = {};
@@ -17433,6 +17537,10 @@ static void testDeployingContainerFailureFailsDeployment(TestSuite& suite)
   suite.expect(deployment.waitingOnContainers.empty(), "deploying_container_failure_clears_waiters");
   suite.expect(brain.containers.contains(uint128_t(0x5491)) == false, "deploying_container_failure_removes_container");
   suite.expect(brain.failedDeployments.contains(deployment.plan.config.deploymentID()), "deploying_container_failure_records_failed_deployment");
+  auto failedIt = brain.failedDeployments.find(deployment.plan.config.deploymentID());
+  suite.expect(
+      failedIt != brain.failedDeployments.end() && failedIt->second.hasTerminalReport && failedIt->second.terminalReport.state == DeploymentState::failed && failedIt->second.terminalReport.failureReports.size() == 1 && failedIt->second.terminalReport.failureReports[0].wasCanary == false && failedIt->second.terminalReport.failureReports[0].restarted == false,
+      "deploying_container_failure_records_terminal_report");
 
   brain.failedDeployments.erase(deployment.plan.config.deploymentID());
   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
@@ -20633,6 +20741,7 @@ int main(void)
   testBrainNeuronHandlerHealthyReplacementPointerClearsEquivalentWaiter(suite);
   testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(suite);
   testBrainNeuronStateUploadHealthyContainerClearsWaiters(suite);
+  testCanaryRollbackPersistsTerminalApplicationReport(suite);
   testDeployingContainerFailureFailsDeployment(suite);
   testBrainNeuronStateUploadRestoresOnlyActiveMeshServices(suite);
   testBrainNeuronStateUploadRuntimeReadyFalseClearsStatefulTopologyBarrier(suite);

@@ -3045,6 +3045,14 @@ public:
                            int(nonRestartableStartupFailure));
 
     int64_t failureTimeMs = Time::now<TimeResolution::ms>();
+    if (killedOnPurpose == false)
+    {
+      if (container->failedArtifactsObservedAtMs <= 0)
+      {
+        container->failedArtifactsObservedAtMs = failureTimeMs;
+      }
+      failureTimeMs = container->failedArtifactsObservedAtMs;
+    }
 
     if (container->plan.config.type == ApplicationType::task)
     {
