@@ -388,6 +388,28 @@ private:
     return storeBlobAtPath(finalPath, containerBlob, actualDigest, actualBytes, expectedDigest, expectedBytes, failureReport);
   }
 
+  static bool containsAtPath(uint64_t deploymentID, const String& path)
+  {
+    if (contents.contains(deploymentID))
+    {
+      if (prodigyFileReadable(path))
+      {
+        return true;
+      }
+
+      contents.erase(deploymentID);
+      return false;
+    }
+
+    if (prodigyFileReadable(path))
+    {
+      contents.insert(deploymentID);
+      return true;
+    }
+
+    return false;
+  }
+
   static String pathForSystemArtifactWithinRoot(const String& storeRoot, const String& sha256)
   {
     String path = {};
@@ -500,6 +522,16 @@ public:
         actualBytes,
         failureReport);
   }
+
+  static bool debugContainsAtRoot(const String& storeRoot, uint64_t deploymentID)
+  {
+    return containsAtPath(deploymentID, pathForContainerImageWithinRoot(storeRoot, deploymentID));
+  }
+
+  static bool debugCacheContains(uint64_t deploymentID)
+  {
+    return contents.contains(deploymentID);
+  }
 #endif
 
   static void get(uint64_t deploymentID, String& containerBlob)
@@ -583,18 +615,7 @@ public:
 
   static bool contains(uint64_t deploymentID)
   {
-    if (contents.contains(deploymentID))
-    {
-      return true;
-    }
-
-    if (Filesystem::fileExists(pathForContainerImage(deploymentID)))
-    {
-      contents.insert(deploymentID);
-      return true;
-    }
-
-    return false;
+    return containsAtPath(deploymentID, pathForContainerImage(deploymentID));
   }
 
   static String systemPathForArtifact(const String& sha256, const String *storeRoot = nullptr)

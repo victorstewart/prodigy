@@ -16560,6 +16560,36 @@ static void testNeuronHandlerStoresRequestedContainerBlob(TestSuite& suite)
   suite.expect(ContainerStore::contains(deploymentID) == false, "neuron_request_container_blob_skips_empty_payload");
 }
 
+static void testContainerStoreEvictsExternallyRemovedCachedImage(TestSuite& suite)
+{
+  char scratch[] = "/tmp/prodigy-container-store-cache-XXXXXX";
+  char *scratchPath = ::mkdtemp(scratch);
+  suite.expect(scratchPath != nullptr, "container_store_stale_cache_create_root");
+  if (scratchPath == nullptr)
+  {
+    return;
+  }
+
+  String storeRoot = {};
+  storeRoot.assign(scratchPath);
+  const uint64_t deploymentID = 0x6201200000000101ull;
+  String imagePath = ContainerStore::debugPathForContainerImageAtRoot(storeRoot, deploymentID);
+  String containerBlob = prodigyDiscombobulatorBlobHeaderText();
+  containerBlob.append("stale-cache-container-blob"_ctv);
+  String storeFailure = {};
+
+  suite.expect(
+      ContainerStore::debugStoreAtRoot(storeRoot, deploymentID, containerBlob, nullptr, nullptr, nullptr, nullptr, &storeFailure),
+      "container_store_stale_cache_store_fixture");
+  suite.expect(ContainerStore::debugContainsAtRoot(storeRoot, deploymentID), "container_store_stale_cache_seed");
+  suite.expect(ContainerStore::debugCacheContains(deploymentID), "container_store_stale_cache_seeded_in_memory");
+  suite.expect(::unlink(imagePath.c_str()) == 0, "container_store_stale_cache_external_remove");
+  suite.expect(ContainerStore::debugContainsAtRoot(storeRoot, deploymentID) == false, "container_store_stale_cache_rechecks_readability");
+  suite.expect(ContainerStore::debugCacheContains(deploymentID) == false, "container_store_stale_cache_evicts_id");
+
+  (void)::rmdir(scratchPath);
+}
+
 static void testNeuronSpinContainerRejectReportsFailure(TestSuite& suite)
 {
   TestNeuron neuron = {};
@@ -20730,6 +20760,7 @@ int main(void)
   testNeuronContainerHandlerMarksMasterLocalContainerHealthyWithActiveBrainStream(suite);
   testNeuronContainerHandlerForwardsStatisticsToBrain(suite);
   testNeuronHandlerStoresRequestedContainerBlob(suite);
+  testContainerStoreEvictsExternallyRemovedCachedImage(suite);
   testNeuronSpinContainerRejectReportsFailure(suite);
   testNeuronStateUploadSkipsExistingLiveContainer(suite);
   testNeuronHandlerKillContainerStopsContainerAndEchoesBrain(suite);

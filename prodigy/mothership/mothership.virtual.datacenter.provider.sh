@@ -16,7 +16,7 @@ run_machine()
    local workspace="$1"
    local machine_root="$2"
    local containers_root="$3"
-   local shared_store="$4"
+   local shared_transport_tls="$4"
    local storage_root="$5"
    local storage_device_count="$6"
    local child_ns="$7"
@@ -30,9 +30,9 @@ run_machine()
    mount --bind "${machine_root}/var/log/prodigy" /var/log/prodigy
    mount --bind "${machine_root}/root" /root
    mount --bind "${containers_root}" /containers
-   mkdir -p "${workspace}" /containers/store
+   mkdir -p "${workspace}" /containers/store "${shared_transport_tls}" /containers/store/prodigy-transport-tls
    mount --bind /mnt/prodigy-vdc-workspace "${workspace}"
-   mount --bind "${shared_store}" /containers/store
+   mount --bind "${shared_transport_tls}" /containers/store/prodigy-transport-tls
 
    local storage_mounts=""
    local device=""
@@ -547,7 +547,7 @@ cgroup_scope=""
 cgroup_control=""
 cgroup_lock=""
 cgroup_root=""
-shared_store="${filesystem_root}/shared-store"
+shared_transport_tls="${filesystem_root}/shared-transport-tls"
 provisioned_path="${workspace}/virtual-datacenter.provisioned"
 ready_path="${workspace}/virtual-datacenter.ready"
 runtime_path="${workspace}/virtual-datacenter.runtime"
@@ -663,7 +663,7 @@ machine_storage_bytes=$(( machine_storage_mb * 1048576 ))
 truncate -s "${filesystem_size_bytes}" "${filesystem_image}"
 mkfs.btrfs -f "${filesystem_image}" >/dev/null
 mount -o loop "${filesystem_image}" "${filesystem_root}"
-mkdir -p "${shared_store}" "${filesystem_root}/machines"
+mkdir -p "${shared_transport_tls}" "${filesystem_root}/machines"
 btrfs quota enable "${filesystem_root}"
 
 prepare_cgroup_scope
@@ -818,7 +818,7 @@ start_machine()
    [[ -x "${machine_root}/root/prodigy/prodigy" && -r "${boot_path}" ]]
 
    setsid bash "$0" --enter-machine \
-      "${machine_cgroup}" "${workspace}" "${machine_root}" "${containers_root}" "${shared_store}" "${storage_root}" "${storage_device_count}" "${child_ns}" "${boot_path}" "${host_netns_inode}" "${brain_count}" "${fake_ingress}" \
+      "${machine_cgroup}" "${workspace}" "${machine_root}" "${containers_root}" "${shared_transport_tls}" "${storage_root}" "${storage_device_count}" "${child_ns}" "${boot_path}" "${host_netns_inode}" "${brain_count}" "${fake_ingress}" \
       >> "${log_path}" 2>&1 &
    machine_pids[$((index - 1))]="$!"
 }

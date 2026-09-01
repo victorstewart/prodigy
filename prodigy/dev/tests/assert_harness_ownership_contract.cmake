@@ -76,6 +76,25 @@ foreach(_required IN ITEMS
 endforeach()
 
 foreach(_required IN ITEMS
+   "mount --bind \"\${containers_root}\" /containers"
+   "shared_transport_tls=\"\${filesystem_root}/shared-transport-tls\""
+   "mount --bind \"\${shared_transport_tls}\" /containers/store/prodigy-transport-tls"
+   "PRODIGY_DEV_SHARED_TRANSPORT_TLS_DIR=/containers/store/prodigy-transport-tls")
+   string(FIND "${_provider_source}" "${_required}" _position)
+   if(_position EQUAL -1)
+      message(FATAL_ERROR "virtual datacenter machine-local container-store contract missing: ${_required}")
+   endif()
+endforeach()
+
+file(STRINGS "${_provider}" _provider_lines)
+foreach(_provider_line IN LISTS _provider_lines)
+   string(STRIP "${_provider_line}" _provider_line)
+   if(_provider_line MATCHES "^mount --bind .+ /containers/store$")
+      message(FATAL_ERROR "virtual datacenter must not bind over the machine-local /containers/store")
+   endif()
+endforeach()
+
+foreach(_required IN ITEMS
    "public_ingress_mtu=1500"
    "ip route replace 198.18.0.0/16 via 172.31.0.2 dev \"\${host_edge}\" mtu \"\${public_ingress_mtu}\""
    "ip netns exec \"\${parent_ns}\" ip route replace 198.18.0.0/16 via 10.0.0.10 dev vdcbr0 src 10.0.0.1 mtu \"\${public_ingress_mtu}\""
