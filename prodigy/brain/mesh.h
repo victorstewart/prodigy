@@ -964,16 +964,55 @@ public:
       }
       rebuildSomeHeaps(service);
     }
+
+    // Pair only after every recovered half has been installed. Replaying the
+    // registered subscriptions is idempotent for complete persisted pairings
+    // and repairs only subscriptions whose prior advertiser disappeared.
+    struct RecoveredSubscription
+    {
+      uint64_t service = 0;
+      MeshNode *subscriber = nullptr;
+      SubscriptionNature nature = SubscriptionNature::none;
+    };
+    Vector<RecoveredSubscription> recoveredSubscriptions;
+    for (const auto& [service, subscribers] : anySubscribers)
+    {
+      for (MeshNode *subscriber : subscribers)
+      {
+        recoveredSubscriptions.push_back(RecoveredSubscription {service, subscriber, SubscriptionNature::any});
+      }
+    }
+    for (const auto& [service, subscribers] : someSubscribers)
+    {
+      for (MeshNode *subscriber : subscribers)
+      {
+        recoveredSubscriptions.push_back(RecoveredSubscription {service, subscriber, SubscriptionNature::exclusiveSome});
+      }
+    }
+    for (const auto& [service, subscribers] : allSubscribers)
+    {
+      for (MeshNode *subscriber : subscribers)
+      {
+        recoveredSubscriptions.push_back(RecoveredSubscription {service, subscriber, SubscriptionNature::all});
+      }
+    }
+    for (const RecoveredSubscription& recovered : recoveredSubscriptions)
+    {
+      subscribe(recovered.service, recovered.subscriber, recovered.nature, true);
+    }
   }
 
-  void logSubscription(MeshNode *subscriber, uint64_t service, SubscriptionNature nature)
+  void logSubscription(MeshNode *subscriber, uint64_t service, SubscriptionNature nature, bool deferPairing = false)
   {
     switch (nature)
     {
       case SubscriptionNature::any:
         {
           anySubscribers.insert(service, subscriber);
-          pairUnpairedAnySubscribers(service);
+          if (deferPairing == false)
+          {
+            pairUnpairedAnySubscribers(service);
+          }
           break;
         }
       case SubscriptionNature::exclusiveSome:
@@ -991,6 +1030,10 @@ public:
           }
           pushSomeEntry(service, subscriber, cnt);
           enforceSomeHeapBudget(service);
+          if (deferPairing)
+          {
+            break;
+          }
           uint64_t matchedService = 0;
           MeshNode *bestAdvertiser = nullptr;
           if (pickBestAnyAdvertiser(service, subscriber, matchedService, bestAdvertiser))
@@ -1003,6 +1046,11 @@ public:
         {
           allSubscribers.insert(service, subscriber);
 
+          if (deferPairing)
+          {
+            break;
+          }
+
           forEachAdvertiserForSubscription(service, [&](uint64_t matchedService, MeshNode *advertiser) -> void {
             createPairing(advertiser, subscriber, matchedService, true /* notifyAdvertiser */, true /* notifySubscriber */);
           });
@@ -1013,7 +1061,7 @@ public:
     }
   }
 
-  void logAdvertisement(MeshNode *advertiser, uint64_t service)
+  void logAdvertisement(MeshNode *advertiser, uint64_t service, bool deferPairing = false)
   {
     if (advertising.hasEntryFor(service, advertiser))
     {
@@ -1022,6 +1070,10 @@ public:
 
     advertising.insert(service, advertiser);
     noteAnyCapacity(service, advertiser);
+    if (deferPairing)
+    {
+      return;
+    }
     pairUnpairedAnySubscribers(service);
 
     if (MeshServices::isShard(service))

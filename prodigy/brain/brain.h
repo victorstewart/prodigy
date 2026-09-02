@@ -1082,6 +1082,12 @@ public:
 
   // master brain
   bool ignited = false;
+  // A promoted brain must first rebuild the complete live Neuron inventory.
+  // Scheduling from a partial upload creates replacement UUIDs which become
+  // duplicate runtimes when the remaining Neurons report their live copies.
+  bool recoveringPersistedNeuronInventory = false;
+  bool persistedMachineInventoryEnumerated = false;
+  bool recoveredNeuronPairingsUnified = false;
 
   TimeoutPacket osUpdateTimer;
   bool osUpdateTimerInstalled = false;
@@ -6197,12 +6203,17 @@ public:
     {
       for (const auto& [service, subscription] : container->subscriptions)
       {
-        mesh->logSubscription(container, subscription.service, subscription.nature);
+        mesh->logSubscription(container,
+                              subscription.service,
+                              subscription.nature,
+                              recoveringPersistedNeuronInventory);
       }
 
       for (const auto& [service, advertisement] : container->advertisements)
       {
-        mesh->logAdvertisement(container, advertisement.service);
+        mesh->logAdvertisement(container,
+                               advertisement.service,
+                               recoveringPersistedNeuronInventory);
         container->advertisingOnPorts.insert(advertisement.port);
       }
 
@@ -10220,9 +10231,83 @@ public:
     return false;
   }
 
+  bool finalizePersistedNeuronInventoryRecovery(void)
+  {
+    if (recoveringPersistedNeuronInventory == false)
+    {
+      return true;
+    }
+
+    if (persistedMachineInventoryEnumerated == false)
+    {
+      return false;
+    }
+
+    bool haveMachineInventory = false;
+    for (Machine *machine : machines)
+    {
+      if (machine == nullptr)
+      {
+        continue;
+      }
+      haveMachineInventory = true;
+
+      // These terminal states are already authoritative inventory facts and
+      // cannot contribute a live container upload to the recovered mesh.
+      if (machine->state == MachineState::hardwareFailure ||
+          machine->state == MachineState::decommissioning)
+      {
+        continue;
+      }
+
+      if (machine->runtimeReady == false)
+      {
+        return false;
+      }
+    }
+
+    if (haveMachineInventory == false)
+    {
+      return false;
+    }
+
+    if (mesh == nullptr)
+    {
+      return false;
+    }
+
+    if (recoveredNeuronPairingsUnified == false)
+    {
+      mesh->unifyPairingHalves();
+      recoveredNeuronPairingsUnified = true;
+    }
+
+    // State sync marks recovered wormholes pending on every live Switchboard.
+    // Keep scheduling stopped until those exact desired-state revisions have
+    // been acknowledged; a rejected or timed-out route must remain fail closed.
+    for (const auto& [uuid, container] : containers)
+    {
+      (void)uuid;
+      if (container == nullptr ||
+          (container->state != ContainerState::healthy &&
+           container->state != ContainerState::crashedRestarting))
+      {
+        continue;
+      }
+      if (container->wormholeRuntimePendingMachines.empty() == false ||
+          container->wormholeRuntimeFailedMachines.empty() == false)
+      {
+        return false;
+      }
+    }
+    recoveringPersistedNeuronInventory = false;
+    return true;
+  }
+
   void recoverDeploymentsAfterNeuronState(void)
   {
-    if (weAreMaster == false || ignited == false)
+    if (weAreMaster == false || ignited == false ||
+        finalizePersistedNeuronInventoryRecovery() == false)
     {
       return;
     }
@@ -17039,6 +17124,13 @@ public:
     reconcileMothershipTunnelProviderRuntimeState();
     noteMasterAuthorityRuntimeStateChanged();
 
+    if (deploymentPlans.empty() == false)
+    {
+      recoveringPersistedNeuronInventory = true;
+      persistedMachineInventoryEnumerated = false;
+      recoveredNeuronPairingsUnified = false;
+    }
+
     // Materialize durable deployment ownership before machine inventory can
     // resume Neuron control. A Neuron may upload its live containers as soon as
     // that control stream is active; without the deployment index those
@@ -17124,6 +17216,7 @@ public:
     getMachines(coro);
 
     awaitSelfElectionMachineInventoryIfNeeded(coro, suspendIndex);
+    persistedMachineInventoryEnumerated = true;
 
     // Re-arm neuron control-plane sockets after machine inventory is known.
     // This must run after getMachines() because followers may not have
@@ -28932,7 +29025,10 @@ public:
             {
               if (serviceBlueprintActiveAtContainerState(subscription, uploadedState))
               {
-                mesh->logSubscription(container, subscription.service, subscription.nature);
+                mesh->logSubscription(container,
+                                      subscription.service,
+                                      subscription.nature,
+                                      recoveringPersistedNeuronInventory);
               }
             }
 
@@ -28940,7 +29036,9 @@ public:
             {
               if (serviceBlueprintActiveAtContainerState(advertisement, uploadedState))
               {
-                mesh->logAdvertisement(container, advertisement.service);
+                mesh->logAdvertisement(container,
+                                       advertisement.service,
+                                       recoveringPersistedNeuronInventory);
               }
               container->advertisingOnPorts.insert(advertisement.port);
             }
@@ -29188,6 +29286,10 @@ public:
             }
             armWormholeRuntimeAckDeadline(container);
             replicateContainerRuntimeStateToFollowers(container);
+            if (recoveringPersistedNeuronInventory)
+            {
+              recoverDeploymentsAfterNeuronState();
+            }
             break;
           }
           break;

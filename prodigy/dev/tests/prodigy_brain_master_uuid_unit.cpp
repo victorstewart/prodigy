@@ -316,6 +316,35 @@ public:
     neuronHandler(neuron, message);
   }
 
+  void testRecoverDeploymentsAfterNeuronState(void)
+  {
+    recoverDeploymentsAfterNeuronState();
+  }
+
+  bool testRecoveringPersistedNeuronInventory(void) const
+  {
+    return recoveringPersistedNeuronInventory;
+  }
+
+  bool testFinalizePersistedNeuronInventoryRecovery(void)
+  {
+    return finalizePersistedNeuronInventoryRecovery();
+  }
+
+  bool testFinalizePersistedNeuronInventoryRecoveryWithoutMesh(void)
+  {
+    Mesh *savedMesh = mesh;
+    mesh = nullptr;
+    bool finalized = finalizePersistedNeuronInventoryRecovery();
+    mesh = savedMesh;
+    return finalized;
+  }
+
+  uint128_t testPairingSecretFor(MeshNode *advertiser, MeshNode *subscriber, uint64_t service)
+  {
+    return mesh->pairingSecretFor(advertiser, subscriber, service);
+  }
+
   void testDispatchTimeout(TimeoutPacket *packet)
   {
     dispatchTimeout(packet);
@@ -6447,9 +6476,23 @@ int main(void)
     seed.createdAtMs = 123'465;
     seed.wormholes = plan.wormholes;
 
+    constexpr uint64_t recoveredService = 61'005'001;
+    const uint128_t recoveredPairingSecret = uint128_t(0x6100504);
     iaas.brain = &brain;
     iaas.machine = &machine;
     iaas.plan = seed.generatePlan(plan);
+    iaas.plan.subscriptions.insert_or_assign(
+        recoveredService,
+        Subscription(recoveredService, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::any));
+    iaas.plan.advertisements.insert_or_assign(
+        recoveredService,
+        Advertisement(recoveredService, ContainerState::scheduled, ContainerState::destroying, 8443));
+    iaas.plan.subscriptionPairings.insert(
+        recoveredService,
+        SubscriptionPairing(recoveredPairingSecret, seed.pairingAddress(), recoveredService, 8443));
+    iaas.plan.advertisementPairings.insert(
+        recoveredService,
+        AdvertisementPairing(recoveredPairingSecret, seed.pairingAddress(), recoveredService));
 
     brain.testSelfElectAsMaster("unit-test-restart-reconstruction");
 
@@ -6465,6 +6508,46 @@ int main(void)
                  "self_elect_restart_reconstruction_preserves_healthy_container");
     suite.expect(deployment != nullptr && deployment->nHealthy() == 1,
                  "self_elect_restart_reconstruction_counts_healthy_container_once");
+    suite.expect(brain.testRecoveringPersistedNeuronInventory(),
+                 "self_elect_restart_reconstruction_gates_scheduling_until_ignition");
+
+    brain.ignited = true;
+    machine.runtimeReady = false;
+    brain.testRecoverDeploymentsAfterNeuronState();
+    suite.expect(brain.testRecoveringPersistedNeuronInventory(),
+                 "self_elect_restart_reconstruction_keeps_gate_during_partial_inventory");
+    suite.expect(deployment != nullptr && deployment->containers.size() == 1 && deployment->nHealthy() == 1,
+                 "self_elect_restart_reconstruction_partial_inventory_schedules_no_duplicate");
+
+    machine.runtimeReady = true;
+    suite.expect(brain.testFinalizePersistedNeuronInventoryRecoveryWithoutMesh() == false &&
+                     brain.testRecoveringPersistedNeuronInventory(),
+                 "self_elect_restart_reconstruction_fails_closed_without_mesh");
+    if (restored != nullptr)
+    {
+      restored->wormholeRuntimePendingMachines.insert(machine.fragment);
+    }
+    suite.expect(brain.testFinalizePersistedNeuronInventoryRecovery() == false &&
+                     brain.testRecoveringPersistedNeuronInventory(),
+                 "self_elect_restart_reconstruction_keeps_gate_until_routes_converge");
+    if (restored != nullptr)
+    {
+      restored->wormholeRuntimePendingMachines.clear();
+    }
+    suite.expect(brain.testFinalizePersistedNeuronInventoryRecovery(),
+                 "self_elect_restart_reconstruction_finalizes_authoritative_inventory");
+    suite.expect(brain.testRecoveringPersistedNeuronInventory() == false,
+                 "self_elect_restart_reconstruction_releases_gate_after_authoritative_inventory");
+    suite.expect(deployment != nullptr && deployment->containers.size() == 1,
+                 "self_elect_restart_reconstruction_keeps_single_runtime_after_reconcile");
+    suite.expect(deployment != nullptr && deployment->nHealthy() == 1,
+                 "self_elect_restart_reconstruction_keeps_single_healthy_count_after_reconcile");
+    suite.expect(restored != nullptr &&
+                     brain.testPairingSecretFor(restored, restored, recoveredService) == recoveredPairingSecret,
+                 "self_elect_restart_reconstruction_unifies_subscription_pairing_once");
+    suite.expect(brain.testFinalizePersistedNeuronInventoryRecovery() && restored != nullptr &&
+                     brain.testPairingSecretFor(restored, restored, recoveredService) == recoveredPairingSecret,
+                 "self_elect_restart_reconstruction_keeps_subscription_pairing_stable");
 
     SwitchboardWormholeOperation operation = {};
     Vector<Wormhole> reconstructed = {};

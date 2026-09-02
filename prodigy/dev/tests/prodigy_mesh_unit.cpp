@@ -544,9 +544,13 @@ static void testUnifyPairingHalvesPaths(TestSuite& suite)
   configureSubscription(subscriber, meshService, SubscriptionNature::any);
   configureSubscription(subscriberOnlyHalf, meshService, SubscriptionNature::any);
 
-  mesh.logAdvertisement(&advertiser, meshService);
-  mesh.logSubscription(&subscriber, meshService, SubscriptionNature::any);
-  mesh.logSubscription(&subscriberOnlyHalf, meshService, SubscriptionNature::any);
+  mesh.logAdvertisement(&advertiser, meshService, true);
+  mesh.logSubscription(&subscriber, meshService, SubscriptionNature::any, true);
+  mesh.logSubscription(&subscriberOnlyHalf, meshService, SubscriptionNature::any, true);
+
+  suite.expect(advertiser.advertisingTo.countEntriesFor(meshService) == 0 &&
+                   subscriber.subscribedTo.countEntriesFor(meshService) == 0,
+               "mesh_inventory_recovery_defers_dynamic_pairing_until_persisted_halves_arrive");
 
   uint128_t goodSecret = 111;
   mesh.logAdvertisementPairing(goodSecret, &advertiser, AdvertisementPairing(goodSecret, subscriber.meshAddress, meshService));
