@@ -212,7 +212,8 @@ int main(void)
   suite.expect(switchboardPacketBudgetExternalIngressUnderlayMTUValid(1552u), "switchboard_packet_budget_external_ingress_remote_accepts_exact_underlay_boundary");
   suite.expect(switchboardPacketBudgetRemoteInnerMTU(1552u, true) == 1500u, "switchboard_packet_budget_external_ingress_remote_derives_supported_inner_mtu");
   suite.expect(switchboardWormholeInitialFlowLifetimeNs(IPPROTO_TCP) == WORMHOLE_FLOW_EMBRYONIC_NS, "switchboard_wormhole_flow_tcp_starts_with_short_embryonic_lifetime");
-  suite.expect(switchboardWormholeInitialFlowLifetimeNs(IPPROTO_UDP) == WORMHOLE_FLOW_EMBRYONIC_NS, "switchboard_wormhole_flow_udp_starts_with_short_embryonic_lifetime");
+  suite.expect(switchboardWormholeInitialFlowLifetimeNs(IPPROTO_UDP) == WORMHOLE_FLOW_UDP_IDLE_NS, "switchboard_wormhole_flow_udp_starts_with_idle_lifetime");
+  suite.expect(switchboardWormholeInitialFlowLifetimeNs(IPPROTO_UDP) > WORMHOLE_FLOW_EMBRYONIC_NS, "switchboard_wormhole_flow_udp_survives_embryonic_rollout_gap");
   suite.expect(WORMHOLE_FLOW_RECLAIM_GRACE_NS == 1000ULL * 1000ULL * 1000ULL, "switchboard_wormhole_flow_gc_waits_full_bpf_execution_grace");
   suite.expect(switchboardWormholeFlowLifetimeNs(IPPROTO_TCP, false) == WORMHOLE_FLOW_TCP_ESTABLISHED_NS, "switchboard_wormhole_flow_tcp_established_uses_five_day_lifetime");
   suite.expect(switchboardWormholeFlowLifetimeNs(IPPROTO_UDP, false) == WORMHOLE_FLOW_UDP_IDLE_NS, "switchboard_wormhole_flow_udp_uses_five_minute_lifetime");

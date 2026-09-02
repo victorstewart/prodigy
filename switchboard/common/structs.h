@@ -294,8 +294,9 @@ static inline __u64 switchboardWormholeFlowLifetimeNs(__u8 protocol, bool closin
 
 static inline __u64 switchboardWormholeInitialFlowLifetimeNs(__u8 protocol)
 {
-  (void)protocol;
-  return WORMHOLE_FLOW_EMBRYONIC_NS;
+  return protocol == SWITCHBOARD_IP_PROTOCOL_UDP
+             ? WORMHOLE_FLOW_UDP_IDLE_NS
+             : WORMHOLE_FLOW_EMBRYONIC_NS;
 }
 
 // These helpers describe the L3 bytes Prodigy adds on top of the original
