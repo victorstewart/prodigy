@@ -1001,6 +1001,48 @@ static bool deserializeAdvertisementPairingPayload(
          reader.done();
 }
 
+// Brain recovery may need to re-notify a live container even when the Neuron's
+// durable plan already contains this pairing.  Keep that control-only bit off
+// the Container wire payload; Neuron consumes it before forwarding.
+static bool serializeAdvertisementPairingControlPayload(
+    String& output,
+    uint128_t secret,
+    uint128_t address,
+    uint64_t service,
+    uint16_t applicationID,
+    bool activate,
+    bool replayRuntime)
+{
+  serializeAdvertisementPairingPayload(output, secret, address, service, applicationID, activate);
+  Writer writer(output);
+  writer.boolean(replayRuntime);
+  return true;
+}
+
+static bool deserializeAdvertisementPairingControlPayload(
+    const uint8_t *input,
+    uint64_t inputSize,
+    uint128_t& secret,
+    uint128_t& address,
+    uint64_t& service,
+    uint16_t& applicationID,
+    bool& activate,
+    bool& replayRuntime)
+{
+  Reader reader(input, inputSize);
+  if (reader.u128(secret) == false ||
+      reader.u128(address) == false ||
+      reader.u64(service) == false ||
+      reader.u16(applicationID) == false ||
+      reader.boolean(activate) == false)
+  {
+    return false;
+  }
+
+  replayRuntime = false;
+  return (reader.done() || (reader.boolean(replayRuntime) && reader.done()));
+}
+
 static bool serializeSubscriptionPairingPayload(
     String& output,
     uint128_t secret,
@@ -1039,6 +1081,48 @@ static bool deserializeSubscriptionPairingPayload(
          reader.u16(applicationID) &&
          reader.boolean(activate) &&
          reader.done();
+}
+
+static bool serializeSubscriptionPairingControlPayload(
+    String& output,
+    uint128_t secret,
+    uint128_t address,
+    uint64_t service,
+    uint16_t port,
+    uint16_t applicationID,
+    bool activate,
+    bool replayRuntime)
+{
+  serializeSubscriptionPairingPayload(output, secret, address, service, port, applicationID, activate);
+  Writer writer(output);
+  writer.boolean(replayRuntime);
+  return true;
+}
+
+static bool deserializeSubscriptionPairingControlPayload(
+    const uint8_t *input,
+    uint64_t inputSize,
+    uint128_t& secret,
+    uint128_t& address,
+    uint64_t& service,
+    uint16_t& port,
+    uint16_t& applicationID,
+    bool& activate,
+    bool& replayRuntime)
+{
+  Reader reader(input, inputSize);
+  if (reader.u128(secret) == false ||
+      reader.u128(address) == false ||
+      reader.u64(service) == false ||
+      reader.u16(port) == false ||
+      reader.u16(applicationID) == false ||
+      reader.boolean(activate) == false)
+  {
+    return false;
+  }
+
+  replayRuntime = false;
+  return (reader.done() || (reader.boolean(replayRuntime) && reader.done()));
 }
 
 static bool deserializeCredentialDeltaFramePayload(const uint8_t *input, uint64_t inputSize, CredentialDelta& delta)

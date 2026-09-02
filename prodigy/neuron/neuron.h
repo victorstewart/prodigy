@@ -1924,14 +1924,16 @@ protected:
           uint64_t service = 0;
           uint16_t applicationID = 0;
           bool activate = false;
-          if (ProdigyWire::deserializeAdvertisementPairingPayload(
+          bool replayRuntime = false;
+          if (ProdigyWire::deserializeAdvertisementPairingControlPayload(
                   payload.data(),
                   payload.size(),
                   secret,
                   address,
                   service,
                   applicationID,
-                  activate) == false)
+                  activate,
+                  replayRuntime) == false)
           {
             continue;
           }
@@ -1972,7 +1974,8 @@ protected:
           uint16_t port = 0;
           uint16_t applicationID = 0;
           bool activate = false;
-          if (ProdigyWire::deserializeSubscriptionPairingPayload(
+          bool replayRuntime = false;
+          if (ProdigyWire::deserializeSubscriptionPairingControlPayload(
                   payload.data(),
                   payload.size(),
                   secret,
@@ -1980,7 +1983,8 @@ protected:
                   service,
                   port,
                   applicationID,
-                  activate) == false)
+                  activate,
+                  replayRuntime) == false)
           {
             continue;
           }
@@ -4423,14 +4427,16 @@ public:
           uint64_t service = 0;
           uint16_t applicationID = 0;
           bool activate = false;
-          if (ProdigyWire::deserializeAdvertisementPairingPayload(
+          bool replayRuntime = false;
+          if (ProdigyWire::deserializeAdvertisementPairingControlPayload(
                   args,
                   uint64_t(terminal - args),
                   secret,
                   address,
                   service,
                   applicationID,
-                  activate) == false)
+                  activate,
+                  replayRuntime) == false)
           {
             basics_log("neuron advertisementPairing malformed payload containerUUID=%llu payloadBytes=%u\n",
                        (unsigned long long)containerUUID,
@@ -4455,9 +4461,9 @@ public:
                        unsigned(payloadBytes),
                        int(streamIsActive(container)));
 
-            if (changed)
+            if (changed || replayRuntime)
             {
-              if (container->syncDeclaredNetworkPairingPolicy(activate == false) == false)
+              if (changed && container->syncDeclaredNetworkPairingPolicy(activate == false) == false)
               {
                 basics_log("neuron advertisementPairing network policy sync failed containerUUID=%llu\n",
                            (unsigned long long)containerUUID);
@@ -4518,7 +4524,8 @@ public:
           uint16_t port = 0;
           uint16_t applicationID = 0;
           bool activate = false;
-          if (ProdigyWire::deserializeSubscriptionPairingPayload(
+          bool replayRuntime = false;
+          if (ProdigyWire::deserializeSubscriptionPairingControlPayload(
                   args,
                   uint64_t(terminal - args),
                   secret,
@@ -4526,7 +4533,8 @@ public:
                   service,
                   port,
                   applicationID,
-                  activate) == false)
+                  activate,
+                  replayRuntime) == false)
           {
             basics_log("neuron subscriptionPairing malformed payload containerUUID=%llu payloadBytes=%u\n",
                        (unsigned long long)containerUUID,
@@ -4551,9 +4559,9 @@ public:
                        unsigned(payloadBytes),
                        int(streamIsActive(container)));
 
-            if (changed)
+            if (changed || replayRuntime)
             {
-              if (container->syncDeclaredNetworkPairingPolicy(activate == false) == false)
+              if (changed && container->syncDeclaredNetworkPairingPolicy(activate == false) == false)
               {
                 basics_log("neuron subscriptionPairing network policy sync failed containerUUID=%llu\n",
                            (unsigned long long)containerUUID);

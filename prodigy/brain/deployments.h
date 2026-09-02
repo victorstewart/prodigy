@@ -6370,8 +6370,8 @@ public:
 
       if (container->state == ContainerState::scheduled || container->state == ContainerState::healthy)
       {
-        container->replayActivePairingsToSelf();
-        container->replayActivePairingsToPeers();
+        container->replayActivePairingsToSelf(true);
+        container->replayActivePairingsToPeers(true);
       }
     }
 

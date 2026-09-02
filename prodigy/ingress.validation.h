@@ -235,6 +235,35 @@ static bool consumeContainerPairingPayload(uint8_t *& cursor, uint8_t *terminal,
   return true;
 }
 
+static bool consumeNeuronPairingControlPayload(uint8_t *& cursor, uint8_t *terminal, bool includesPort)
+{
+  uint128_t secret = 0;
+  uint128_t address = 0;
+  uint64_t service = 0;
+  uint16_t applicationID = 0;
+  bool activate = false;
+  bool replayRuntime = false;
+  bool ok = false;
+
+  if (includesPort)
+  {
+    uint16_t port = 0;
+    ok = ProdigyWire::deserializeSubscriptionPairingControlPayload(
+        cursor, uint64_t(terminal - cursor), secret, address, service, port, applicationID, activate, replayRuntime);
+  }
+  else
+  {
+    ok = ProdigyWire::deserializeAdvertisementPairingControlPayload(
+        cursor, uint64_t(terminal - cursor), secret, address, service, applicationID, activate, replayRuntime);
+  }
+
+  if (ok)
+  {
+    cursor = terminal;
+  }
+  return ok;
+}
+
 static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t *terminal)
 {
   if (args == nullptr || terminal == nullptr || args > terminal)
@@ -977,7 +1006,7 @@ static bool validateNeuronPayloadForNeuron(uint16_t rawTopic, uint8_t *args, uin
         {
           return false;
         }
-        return consumeContainerPairingPayload(cursor, terminal, false);
+        return consumeNeuronPairingControlPayload(cursor, terminal, false);
       }
     case NeuronTopic::subscriptionPairing:
       {
@@ -986,7 +1015,7 @@ static bool validateNeuronPayloadForNeuron(uint16_t rawTopic, uint8_t *args, uin
         {
           return false;
         }
-        return consumeContainerPairingPayload(cursor, terminal, true);
+        return consumeNeuronPairingControlPayload(cursor, terminal, true);
       }
     case NeuronTopic::resetSwitchboardState:
       {

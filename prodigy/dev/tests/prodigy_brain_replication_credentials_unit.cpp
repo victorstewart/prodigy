@@ -15287,6 +15287,59 @@ static void testNeuronRecvDispatchesPairingAndCredentialMessages(TestSuite& suit
         }
       });
       suite.expect(frames == 1, "neuron_recv_subscription_active_emits_container_frame");
+
+      fixture.container.wBuffer.clear();
+      fixture.container.pendingSend = false;
+
+      String duplicateInbound = {};
+      buildNeuronContainerPackedMessage(
+          duplicateInbound,
+          NeuronTopic::subscriptionPairing,
+          fixture.container.plan.uuid,
+          subscriptionPayload);
+      suite.require(
+          seedBrainInboundForTest(suite, fixture.brain.neuron, "neuron_recv_subscription_duplicate", duplicateInbound),
+          "neuron_recv_subscription_duplicate_seeds_inbound");
+      recvAndDispatchBrainForTest(fixture.brain.neuron, int(duplicateInbound.size()));
+      suite.expect(
+          fixture.container.pendingSend == false && fixture.container.wBuffer.size() == 0,
+          "neuron_recv_subscription_duplicate_suppresses_runtime_notification");
+
+      String replayPayload = {};
+      suite.expect(
+          ProdigyWire::serializeSubscriptionPairingControlPayload(
+              replayPayload,
+              uint128_t(0x4401),
+              uint128_t(0x5502),
+              uint64_t(0x6603),
+              uint16_t(7443),
+              uint16_t(77),
+              true,
+              true),
+          "neuron_recv_subscription_recovery_replay_serializes_payload");
+      String replayInbound = {};
+      buildNeuronContainerPackedMessage(
+          replayInbound,
+          NeuronTopic::subscriptionPairing,
+          fixture.container.plan.uuid,
+          replayPayload);
+      suite.require(
+          seedBrainInboundForTest(suite, fixture.brain.neuron, "neuron_recv_subscription_recovery_replay", replayInbound),
+          "neuron_recv_subscription_recovery_replay_seeds_inbound");
+      recvAndDispatchBrainForTest(fixture.brain.neuron, int(replayInbound.size()));
+
+      uint32_t replayFrames = 0;
+      forEachMessageInBuffer(fixture.container.wBuffer, [&](Message *frame) {
+        if (ContainerTopic(frame->topic) == ContainerTopic::subscriptionPairing)
+        {
+          replayFrames += 1;
+        }
+      });
+      suite.expect(fixture.container.pendingSend, "neuron_recv_subscription_recovery_replay_queues_container_send");
+      suite.expect(replayFrames == 1, "neuron_recv_subscription_recovery_replay_emits_container_frame");
+      suite.expect(
+          fixture.container.plan.subscriptionPairings.find(uint64_t(0x6603))->second.size() == 1,
+          "neuron_recv_subscription_recovery_replay_keeps_single_durable_pairing");
     }
   }
 

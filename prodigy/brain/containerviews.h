@@ -142,6 +142,20 @@ public:
     }
   }
 
+  void replayAdvertisementPairing(uint128_t secret, uint128_t address, uint64_t service, uint16_t applicationID)
+  {
+    if (suppressStartupPairingNotifications)
+    {
+      return;
+    }
+
+    String payload;
+    if (ProdigyWire::serializeAdvertisementPairingControlPayload(payload, secret, address, service, applicationID, true, true))
+    {
+      proxySendPairingPayload(NeuronTopic::advertisementPairing, payload);
+    }
+  }
+
   void subscriptionPairing(uint128_t secret, uint128_t address, uint64_t service, uint16_t port, uint16_t applicationID, bool activate) override
   {
     if (suppressStartupPairingNotifications)
@@ -165,6 +179,20 @@ public:
 
     String payload;
     if (ProdigyWire::serializeSubscriptionPairingPayload(payload, secret, address, service, port, applicationID, activate))
+    {
+      proxySendPairingPayload(NeuronTopic::subscriptionPairing, payload);
+    }
+  }
+
+  void replaySubscriptionPairing(uint128_t secret, uint128_t address, uint64_t service, uint16_t port, uint16_t applicationID)
+  {
+    if (suppressStartupPairingNotifications)
+    {
+      return;
+    }
+
+    String payload;
+    if (ProdigyWire::serializeSubscriptionPairingControlPayload(payload, secret, address, service, port, applicationID, true, true))
     {
       proxySendPairingPayload(NeuronTopic::subscriptionPairing, payload);
     }
@@ -289,7 +317,7 @@ public:
     }
   }
 
-  void replayActivePairingsToSelf(void)
+  void replayActivePairingsToSelf(bool replayRuntime = false)
   {
     if (runtimeReady == false || thisBrain == nullptr || thisBrain->mesh == nullptr)
     {
@@ -318,7 +346,14 @@ public:
           continue;
         }
 
-        subscriptionPairing(secret, advertiser->pairingAddress(), service, advertisementIt->second.port, advertiser->applicationID, true);
+        if (replayRuntime)
+        {
+          replaySubscriptionPairing(secret, advertiser->pairingAddress(), service, advertisementIt->second.port, advertiser->applicationID);
+        }
+        else
+        {
+          subscriptionPairing(secret, advertiser->pairingAddress(), service, advertisementIt->second.port, advertiser->applicationID, true);
+        }
       }
     }
 
@@ -344,12 +379,19 @@ public:
           continue;
         }
 
-        advertisementPairing(secret, subscriber->pairingAddress(), service, subscriber->applicationID, true);
+        if (replayRuntime)
+        {
+          replayAdvertisementPairing(secret, subscriber->pairingAddress(), service, subscriber->applicationID);
+        }
+        else
+        {
+          advertisementPairing(secret, subscriber->pairingAddress(), service, subscriber->applicationID, true);
+        }
       }
     }
   }
 
-  void replayActivePairingsToPeers(void)
+  void replayActivePairingsToPeers(bool replayRuntime = false)
   {
     if (runtimeReady == false || thisBrain == nullptr || thisBrain->mesh == nullptr)
     {
@@ -378,7 +420,14 @@ public:
           continue;
         }
 
-        subscriber->subscriptionPairing(secret, pairingAddress(), service, advertisementIt->second.port, applicationID, true);
+        if (replayRuntime)
+        {
+          subscriber->replaySubscriptionPairing(secret, pairingAddress(), service, advertisementIt->second.port, applicationID);
+        }
+        else
+        {
+          subscriber->subscriptionPairing(secret, pairingAddress(), service, advertisementIt->second.port, applicationID, true);
+        }
       }
     }
   }
