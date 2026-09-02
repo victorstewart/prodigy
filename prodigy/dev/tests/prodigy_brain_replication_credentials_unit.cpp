@@ -17544,6 +17544,14 @@ static void testDeployingContainerFailureFailsDeployment(TestSuite& suite)
   deployment.state = DeploymentState::deploying;
   deployment.nTargetBase = 1;
   deployment.nDeployedBase = 1;
+  const uint64_t deploymentID = deployment.plan.config.deploymentID();
+  String containerBlob = prodigyDiscombobulatorBlobHeaderText();
+  containerBlob.append("failed-deployment-restart-container-blob"_ctv);
+  ContainerStore::destroy(deploymentID);
+  String storeFailure = {};
+  suite.expect(
+      ContainerStore::store(deploymentID, containerBlob, nullptr, nullptr, nullptr, nullptr, &storeFailure),
+      "deploying_container_failure_seeds_container_image");
   brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
   brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
 
@@ -17571,6 +17579,69 @@ static void testDeployingContainerFailureFailsDeployment(TestSuite& suite)
   suite.expect(
       failedIt != brain.failedDeployments.end() && failedIt->second.hasTerminalReport && failedIt->second.terminalReport.state == DeploymentState::failed && failedIt->second.terminalReport.failureReports.size() == 1 && failedIt->second.terminalReport.failureReports[0].wasCanary == false && failedIt->second.terminalReport.failureReports[0].restarted == false,
       "deploying_container_failure_records_terminal_report");
+  suite.expect(ContainerStore::contains(deploymentID), "deploying_container_failure_retains_container_image");
+  suite.expect(
+      brain.failedDeploymentCleanerArmed && brain.failedDeploymentCleaner.dispatcher != nullptr,
+      "deploying_container_failure_arms_bounded_cleanup");
+
+  ProdigyPersistentMasterAuthorityPackage package = {};
+  brain.capturePersistentMasterAuthorityPackage(package);
+  TestBrain restored = {};
+  restored.iaas = &iaas;
+  suite.expect(restored.applyPersistentMasterAuthorityPackage(package), "deploying_container_failure_restart_package_applies");
+  suite.expect(restored.deploymentPlans.contains(deploymentID), "deploying_container_failure_restart_restores_deployment_plan");
+  suite.expect(restored.failedDeployments.contains(deploymentID), "deploying_container_failure_restart_restores_terminal_failure");
+  String restoredBlob = {};
+  ContainerStore::get(deploymentID, restoredBlob);
+  suite.expect(restoredBlob.equals(containerBlob), "deploying_container_failure_restart_restores_container_image");
+
+  TestBrain sameIDRetry = {};
+  sameIDRetry.iaas = &iaas;
+  suite.expect(sameIDRetry.applyPersistentMasterAuthorityPackage(package), "deploying_container_failure_same_id_retry_package_applies");
+  ApplicationDeployment activeRetry = {};
+  activeRetry.plan = deployment.plan;
+  activeRetry.state = DeploymentState::running;
+  sameIDRetry.deployments.insert_or_assign(deploymentID, &activeRetry);
+  int64_t cleanupAtMs = sameIDRetry.failedDeployments[deploymentID].failedAtMs + prodigyBrainFailedDeploymentCleanerIntervalMs;
+  suite.expect(sameIDRetry.expireFailedDeployments(cleanupAtMs) == 1, "deploying_container_failure_same_id_retry_expires_stale_failure");
+  suite.expect(sameIDRetry.deploymentPlans.contains(deploymentID), "deploying_container_failure_same_id_retry_preserves_active_plan");
+  suite.expect(ContainerStore::contains(deploymentID), "deploying_container_failure_same_id_retry_preserves_active_image");
+  sameIDRetry.deployments.erase(deploymentID);
+
+  restored.failedDeployments[deploymentID].failedAtMs =
+      Time::now<TimeResolution::ms>() - int64_t(prodigyBrainFailedDeploymentCleanerIntervalMs);
+  restored.restoreFailedDeploymentCleaner();
+  suite.expect(
+      restored.failedDeploymentCleanerArmed && restored.failedDeploymentCleaner.dispatcher != nullptr,
+      "deploying_container_failure_restart_rearms_bounded_cleanup");
+  restored.failedDeploymentCleaner.dispatcher->dispatchTimeout(&restored.failedDeploymentCleaner);
+  suite.expect(restored.failedDeployments.contains(deploymentID) == false, "deploying_container_failure_retention_culls_failure_record");
+  suite.expect(restored.deploymentPlans.contains(deploymentID) == false, "deploying_container_failure_retention_culls_persisted_plan");
+  suite.expect(ContainerStore::contains(deploymentID) == false, "deploying_container_failure_retention_culls_container_image");
+
+  ApplicationDeployment *expiredLiveDeployment = new ApplicationDeployment();
+  expiredLiveDeployment->plan = makeDeploymentPlan(62'048, 1);
+  expiredLiveDeployment->state = DeploymentState::failed;
+  const uint64_t expiredLiveDeploymentID = expiredLiveDeployment->plan.config.deploymentID();
+  FailedDeploymentRecord expiredLiveFailure = {};
+  expiredLiveFailure.deploymentID = expiredLiveDeploymentID;
+  expiredLiveFailure.applicationID = expiredLiveDeployment->plan.config.applicationID;
+  expiredLiveFailure.failedAtMs = Time::now<TimeResolution::ms>() - int64_t(prodigyBrainFailedDeploymentCleanerIntervalMs);
+  restored.failedDeployments.insert_or_assign(expiredLiveDeploymentID, expiredLiveFailure);
+  restored.deploymentPlans.insert_or_assign(expiredLiveDeploymentID, expiredLiveDeployment->plan);
+  restored.deployments.insert_or_assign(expiredLiveDeploymentID, expiredLiveDeployment);
+  restored.deploymentsByApp.insert_or_assign(expiredLiveDeployment->plan.config.applicationID, expiredLiveDeployment);
+  suite.expect(
+      ContainerStore::store(expiredLiveDeploymentID, containerBlob, nullptr, nullptr, nullptr, nullptr, &storeFailure),
+      "deploying_container_failure_retention_seeds_live_failed_image");
+  thisBrain = &restored;
+  suite.expect(
+      restored.expireFailedDeployments(Time::now<TimeResolution::ms>()) == 1,
+      "deploying_container_failure_retention_retires_live_failed_deployment");
+  suite.expect(restored.deployments.contains(expiredLiveDeploymentID) == false, "deploying_container_failure_retention_removes_live_failed_deployment");
+  suite.expect(restored.deploymentsByApp.contains(expiredLiveFailure.applicationID) == false, "deploying_container_failure_retention_removes_live_failed_application");
+  suite.expect(ContainerStore::contains(expiredLiveDeploymentID) == false, "deploying_container_failure_retention_removes_live_failed_image");
+  thisBrain = &brain;
 
   brain.failedDeployments.erase(deployment.plan.config.deploymentID());
   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
@@ -20573,6 +20644,11 @@ int main(void)
   if (std::getenv("PRODIGY_TEST_AUTONOMOUS_PROVISIONING_JOURNAL") != nullptr)
   {
     testAutonomousProvisioningJournalReplaysAmbiguousLaunchAfterRestart(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
+  if (std::getenv("PRODIGY_TEST_FAILED_DEPLOYMENT_RESTART") != nullptr)
+  {
+    testDeployingContainerFailureFailsDeployment(suite);
     return suite.failed == 0 ? 0 : 1;
   }
   bool createdRing = false;

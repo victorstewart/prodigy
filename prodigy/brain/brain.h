@@ -17038,6 +17038,40 @@ public:
     hasCompletedInitialMasterElection = true;
     reconcileMothershipTunnelProviderRuntimeState();
     noteMasterAuthorityRuntimeStateChanged();
+
+    // Materialize durable deployment ownership before machine inventory can
+    // resume Neuron control. A Neuron may upload its live containers as soon as
+    // that control stream is active; without the deployment index those
+    // containers are discarded and the following Switchboard state sync has
+    // no wormholes to reconstruct.
+    for (const auto& [deploymentID, plan] : deploymentPlans)
+    {
+      ApplicationDeployment *deployment = new ApplicationDeployment(); // as neurons register and upload their state, these deployments will be populated
+      deployment->plan = plan;
+      deployment->restorePersistedStatefulWorkerTopologyUpgradeOperation();
+      deployment->restorePersistedDeferredStatefulScaleIntent();
+
+      deployments.insert_or_assign(plan.config.deploymentID(), deployment);
+
+      if (auto it = deploymentsByApp.find(plan.config.applicationID); it != deploymentsByApp.end())
+      {
+        ApplicationDeployment *other = it->second;
+
+        if (other->plan.config.versionID < deployment->plan.config.versionID)
+        {
+          // replace
+          deploymentsByApp.insert_or_assign(plan.config.applicationID, deployment);
+          deployment->previous = other;
+          other->next = deployment;
+        }
+      }
+      else
+      {
+        deploymentsByApp.insert_or_assign(plan.config.applicationID, deployment);
+      }
+    }
+    deploymentPlans.clear();
+
     refreshAllDeploymentWormholeQuicCidState(false);
     basics_log("selfElectAsMaster complete\n");
 
@@ -17172,37 +17206,16 @@ public:
       }
     }
 
-    for (const auto& [deploymentID, plan] : deploymentPlans)
+    // Replicated container state can also be waiting on machine inventory.
+    // Retry it after both durable deployments and their machines exist.
+    for (const auto& [deploymentID, deployment] : deployments)
     {
-      ApplicationDeployment *deployment = new ApplicationDeployment(); // as neurons register and upload their state, these deployments will be populated
-      deployment->plan = plan;
-      deployment->restorePersistedStatefulWorkerTopologyUpgradeOperation();
-      deployment->restorePersistedDeferredStatefulScaleIntent();
-
-      deployments.insert_or_assign(plan.config.deploymentID(), deployment);
-
-      if (auto it = deploymentsByApp.find(plan.config.applicationID); it != deploymentsByApp.end())
-      {
-        ApplicationDeployment *other = it->second;
-
-        if (other->plan.config.versionID < deployment->plan.config.versionID)
-        {
-          // replace
-          deploymentsByApp.insert_or_assign(plan.config.applicationID, deployment);
-          deployment->previous = other;
-          other->next = deployment;
-        }
-      }
-      else
-      {
-        deploymentsByApp.insert_or_assign(plan.config.applicationID, deployment);
-      }
-      applyPendingReplicatedContainerRuntimeStates(plan.config.deploymentID());
+      (void)deployment;
+      applyPendingReplicatedContainerRuntimeStates(deploymentID);
     }
 
     // Deployment recovery still waits for healthy machine state transitions, but
     // interrupted addMachines journaling can resume immediately on promotion.
-    deploymentPlans.clear();
     resumePendingAddMachinesOperations();
     reconcilePendingElasticAddressAssignments();
     reconcilePendingElasticAddressReleases();

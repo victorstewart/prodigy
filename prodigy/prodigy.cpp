@@ -1195,6 +1195,7 @@ public:
         basics_log("prodigy startup rejected invalid persistent master-authority state\n");
         _exit(EXIT_FAILURE);
       }
+      restoreFailedDeploymentCleaner();
       metrics.importSamples(persistedBrainSnapshot.metricSamples);
     }
 

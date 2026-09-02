@@ -29,6 +29,23 @@ class MachineTicket;
 class Mesh;
 class Wormhole;
 
+class BrainFailedDeploymentCleanerDispatcher final : public TimeoutDispatcher {
+public:
+
+  using Callback = void (*)(void *, TimeoutPacket *);
+
+  void *context = nullptr;
+  Callback callback = nullptr;
+
+  void dispatchTimeout(TimeoutPacket *packet) override
+  {
+    if (callback)
+    {
+      callback(context, packet);
+    }
+  }
+};
+
 class BrainView : public RingInterface, public ProdigyTransportTLSStream, public CoroutineStack, public Reconnector {
 public:
 
@@ -448,8 +465,10 @@ public:
     return released;
   }
 
-  // these will be culled once every 10 minutes
+  // Terminal failures remain recoverable for one bounded retention window.
   TimeoutPacket failedDeploymentCleaner;
+  BrainFailedDeploymentCleanerDispatcher failedDeploymentCleanerDispatcher;
+  bool failedDeploymentCleanerArmed = false;
   bytell_hash_map<uint64_t, FailedDeploymentRecord> failedDeployments;
 
   bytell_hash_set<uint32_t> usedMachineFragments;
@@ -657,13 +676,69 @@ protected:
 
 public:
 
+  uint32_t expireFailedDeployments(int64_t nowMs);
+
+  void armFailedDeploymentCleaner(int64_t nowMs = Time::now<TimeResolution::ms>())
+  {
+    if (failedDeployments.empty())
+    {
+      return;
+    }
+
+    int64_t nextDelayMs = prodigyBrainFailedDeploymentCleanerIntervalMs;
+    for (const auto& [deploymentID, failed] : failedDeployments)
+    {
+      (void)deploymentID;
+      if (failed.failedAtMs <= 0)
+      {
+        nextDelayMs = 1;
+        break;
+      }
+
+      int64_t elapsedMs = nowMs - failed.failedAtMs;
+      int64_t remainingMs = int64_t(prodigyBrainFailedDeploymentCleanerIntervalMs) - elapsedMs;
+      if (remainingMs <= 0)
+      {
+        nextDelayMs = 1;
+        break;
+      }
+      nextDelayMs = std::min(nextDelayMs, remainingMs);
+    }
+
+    failedDeploymentCleanerDispatcher.context = this;
+    failedDeploymentCleanerDispatcher.callback = [](void *context, TimeoutPacket *packet) {
+      BrainBase *brain = static_cast<BrainBase *>(context);
+      brain->failedDeploymentCleanerArmed = false;
+      brain->expireFailedDeployments(Time::now<TimeResolution::ms>());
+      brain->armFailedDeploymentCleaner();
+      (void)packet;
+    };
+    failedDeploymentCleaner.dispatcher = &failedDeploymentCleanerDispatcher;
+    failedDeploymentCleaner.setTimeoutMs(uint64_t(nextDelayMs));
+
+    if (failedDeploymentCleanerArmed)
+    {
+      Ring::queueUpdateTimeout(&failedDeploymentCleaner);
+    }
+    else
+    {
+      failedDeploymentCleanerArmed = true;
+      Ring::queueTimeout(&failedDeploymentCleaner);
+    }
+  }
+
+  void restoreFailedDeploymentCleaner(void)
+  {
+    armFailedDeploymentCleaner();
+  }
+
   void deploymentFailed(
       ApplicationDeployment *deployment,
       uint16_t applicationID,
       uint64_t deploymentID,
       StringType auto&& reason,
       DeploymentStatusReport terminalReport,
-      bool preserveContainerImage = false)
+      bool preserveRoutableResourceLeases = false)
   {
     spinApplicationFailed(deployment, reason);
 
@@ -675,20 +750,18 @@ public:
     failed.hasTerminalReport = true;
     failed.terminalReport = std::move(terminalReport);
     failedDeployments.insert_or_assign(deploymentID, std::move(failed));
-    if (preserveContainerImage == false)
+    if (preserveRoutableResourceLeases == false)
     {
       releaseRoutableResourceLeasesForDeployment(deploymentID);
     }
     persistLocalRuntimeState();
 
-    failedDeploymentCleaner.setTimeoutMs(prodigyBrainFailedDeploymentCleanerIntervalMs); // 90 seconds
-    Ring::queueUpdateTimeout(&failedDeploymentCleaner);
+    armFailedDeploymentCleaner();
 
-    if (preserveContainerImage == false)
-    {
-      ContainerStore::destroy(deploymentID);
-      queueBrainReplication(BrainTopic::cullDeployment, deploymentID);
-    }
+    // The deployment plan and terminal failure are both persisted above so a
+    // restarted brain can reconcile the deployment. Keep the matching image
+    // on every brain as well; culling it here leaves the persisted plan unable
+    // to recover after a brain restart.
   }
 
   void finishMachineConfig(Machine *machine)

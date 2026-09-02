@@ -3171,11 +3171,11 @@ private:
 
   void rollback(void) // if canaries fail... we rollback
   {
-    bool preserveContainerImage = false;
+    bool preserveRoutableResourceLeases = false;
     if (previous && previous->plan.config.deploymentID() == plan.config.deploymentID())
     {
-      // Vertical respins keep the same deployment identity; preserve shared container image state.
-      preserveContainerImage = true;
+      // Vertical respins keep the same deployment identity and its routable resource leases.
+      preserveRoutableResourceLeases = true;
     }
 
     thisBrain->deploymentFailed(
@@ -3184,7 +3184,7 @@ private:
         plan.config.deploymentID(),
         "canaries failed"_ctv,
         generateReport(),
-        preserveContainerImage);
+        preserveRoutableResourceLeases);
     thisBrain->spinApplicationFin(this);
 
     if (auto it = thisBrain->deployments.find(plan.config.deploymentID()); it != thisBrain->deployments.end())
@@ -6066,6 +6066,25 @@ private:
   }
 
 public:
+
+  ~ApplicationDeployment()
+  {
+    if (thisBrain == nullptr)
+    {
+      return;
+    }
+
+    if (auto deploymentIt = thisBrain->deployments.find(plan.config.deploymentID());
+        deploymentIt != thisBrain->deployments.end() && deploymentIt->second == this)
+    {
+      thisBrain->deployments.erase(deploymentIt);
+    }
+    if (auto appIt = thisBrain->deploymentsByApp.find(plan.config.applicationID);
+        appIt != thisBrain->deploymentsByApp.end() && appIt->second == this)
+    {
+      thisBrain->deploymentsByApp.erase(appIt);
+    }
+  }
 
   bool statelessCompactionDonorIsQuiescent(void) const
   {
@@ -10042,4 +10061,84 @@ public:
 
     return report;
   }
+
+  void retireFailedDeploymentAfterRetention(void)
+  {
+    if (state != DeploymentState::failed)
+    {
+      return;
+    }
+
+    thisBrain->spinApplicationFin(this);
+    if (next)
+    {
+      if (previous)
+      {
+        previous->next = next;
+      }
+      next->previous = previous;
+      next->deploy();
+    }
+    else if (previous)
+    {
+      thisBrain->deploymentsByApp.insert_or_assign(plan.config.applicationID, previous);
+      previous->next = nullptr;
+      if (previous->state != DeploymentState::running)
+      {
+        previous->setDeploymentRunning();
+      }
+    }
+    else if (auto appIt = thisBrain->deploymentsByApp.find(plan.config.applicationID);
+             appIt != thisBrain->deploymentsByApp.end() && appIt->second == this)
+    {
+      thisBrain->deploymentsByApp.erase(appIt);
+    }
+
+    previous = nullptr;
+    next = nullptr;
+  }
 };
+
+inline uint32_t BrainBase::expireFailedDeployments(int64_t nowMs)
+{
+  Vector<uint64_t> expiredDeploymentIDs = {};
+  for (const auto& [deploymentID, failed] : failedDeployments)
+  {
+    if (failed.failedAtMs <= 0 ||
+        nowMs - failed.failedAtMs >= int64_t(prodigyBrainFailedDeploymentCleanerIntervalMs))
+    {
+      expiredDeploymentIDs.push_back(deploymentID);
+    }
+  }
+
+  for (uint64_t deploymentID : expiredDeploymentIDs)
+  {
+    auto deploymentIt = deployments.find(deploymentID);
+    if (deploymentIt != deployments.end() && deploymentIt->second != nullptr)
+    {
+      ApplicationDeployment *deployment = deploymentIt->second;
+      if (deployment->state != DeploymentState::failed)
+      {
+        // A same-ID retry now owns this plan and image. Its deploy path normally
+        // removes the stale failure record; fail closed if cleanup races it.
+        failedDeployments.erase(deploymentID);
+        continue;
+      }
+
+      deployment->retireFailedDeploymentAfterRetention();
+      delete deployment;
+    }
+
+    failedDeployments.erase(deploymentID);
+    deploymentPlans.erase(deploymentID);
+    releaseRoutableResourceLeasesForDeployment(deploymentID);
+    ContainerStore::destroy(deploymentID);
+    queueBrainReplication(BrainTopic::cullDeployment, deploymentID);
+  }
+
+  if (expiredDeploymentIDs.empty() == false)
+  {
+    persistLocalRuntimeState();
+  }
+  return uint32_t(expiredDeploymentIDs.size());
+}

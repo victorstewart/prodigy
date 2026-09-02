@@ -765,6 +765,46 @@ public:
   }
 };
 
+class StateUploadingGetMachinesBrainIaaS final : public NoopBrainIaaS {
+public:
+
+  TestBrain *brain = nullptr;
+  Machine *machine = nullptr;
+  ContainerPlan plan = {};
+  bool deploymentPresentAtUpload = false;
+  bool uploaded = false;
+
+  void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines, String& failure) override
+  {
+    (void)coro;
+    (void)metro;
+    failure.clear();
+    if (brain == nullptr || machine == nullptr)
+    {
+      return;
+    }
+
+    machines.insert(machine);
+    deploymentPresentAtUpload = brain->deployments.contains(plan.config.deploymentID());
+
+    String upload = {};
+    uint32_t headerOffset = Message::appendHeader(upload, NeuronTopic::stateUpload);
+    struct local_container_subnet6 fragment = {};
+    fragment.dpfx = brain->brainConfig.datacenterFragment;
+    fragment.mpfx[0] = static_cast<uint8_t>((machine->fragment >> 16) & 0xFF);
+    fragment.mpfx[1] = static_cast<uint8_t>((machine->fragment >> 8) & 0xFF);
+    fragment.mpfx[2] = static_cast<uint8_t>(machine->fragment & 0xFF);
+    Message::appendAlignedBuffer<Alignment::one>(upload, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
+    String serializedPlan = {};
+    BitseryEngine::serialize(serializedPlan, plan);
+    Message::appendValue(upload, serializedPlan);
+    Message::finish(upload, headerOffset);
+
+    brain->testNeuronHandler(&machine->neuron, reinterpret_cast<Message *>(upload.data()));
+    uploaded = true;
+  }
+};
+
 static BrainView *makePeer(uint128_t uuid, int64_t boottimens, uint32_t private4 = 0, const char *peerAddressText = nullptr)
 {
   BrainView *peer = new BrainView();
@@ -6358,6 +6398,109 @@ int main(void)
 
     brain.deployments.clear();
     brain.deploymentsByApp.clear();
+  });
+
+  withUniqueMothershipSocket("self_elect_as_master_materializes_deployments_before_neuron_inventory_socket_dir_created", [&] {
+    TestBrain brain = {};
+    StateUploadingGetMachinesBrainIaaS iaas = {};
+    brain.iaas = &iaas;
+    brain.brainConfig.datacenterFragment = 1;
+    BrainBase *previousBrain = thisBrain;
+    thisBrain = &brain;
+
+    DeploymentPlan plan = makeDeploymentPlan(61'005, 1);
+    Wormhole wormhole = {};
+    wormhole.name.assign("public"_ctv);
+    wormhole.externalAddress = IPAddress("2602:fac0:0:12ab:34cd::1", true);
+    wormhole.externalPort = 443;
+    wormhole.containerPort = 8443;
+    wormhole.layer4 = IPPROTO_TCP;
+    wormhole.source = ExternalAddressSource::registeredRoutablePrefix;
+    wormhole.routablePrefixUUID = uint128_t(0x6100501);
+    plan.wormholes.push_back(wormhole);
+    brain.deploymentPlans.insert_or_assign(plan.config.deploymentID(), plan);
+
+    Rack rack = {};
+    rack.uuid = 61'005;
+    Machine machine = {};
+    machine.uuid = uint128_t(0x6100502);
+    machine.private4 = IPAddress("10.0.0.45", false).v4;
+    machine.fragment = 0x1234;
+    machine.state = MachineState::healthy;
+    machine.runtimeReady = true;
+    machine.rack = &rack;
+    machine.rackUUID = rack.uuid;
+    machine.neuron.machine = &machine;
+    rack.machines.insert(&machine);
+    brain.racks.insert_or_assign(rack.uuid, &rack);
+    brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+
+    ContainerView seed = {};
+    seed.uuid = uint128_t(0x6100503);
+    seed.deploymentID = plan.config.deploymentID();
+    seed.applicationID = plan.config.applicationID;
+    seed.machine = &machine;
+    seed.lifetime = ApplicationLifetime::base;
+    seed.state = ContainerState::healthy;
+    seed.runtimeReady = true;
+    seed.fragment = 7;
+    seed.createdAtMs = 123'465;
+    seed.wormholes = plan.wormholes;
+
+    iaas.brain = &brain;
+    iaas.machine = &machine;
+    iaas.plan = seed.generatePlan(plan);
+
+    brain.testSelfElectAsMaster("unit-test-restart-reconstruction");
+
+    suite.expect(iaas.uploaded, "self_elect_restart_reconstruction_receives_neuron_state_during_inventory");
+    suite.expect(iaas.deploymentPresentAtUpload, "self_elect_restart_reconstruction_materializes_persisted_deployment_before_upload");
+    auto deploymentIt = brain.deployments.find(plan.config.deploymentID());
+    ApplicationDeployment *deployment = deploymentIt != brain.deployments.end() ? deploymentIt->second : nullptr;
+    auto containerIt = brain.containers.find(seed.uuid);
+    ContainerView *restored = containerIt != brain.containers.end() ? containerIt->second : nullptr;
+    suite.expect(deployment != nullptr && deployment->containers.size() == 1,
+                 "self_elect_restart_reconstruction_restores_single_current_container");
+    suite.expect(restored != nullptr && restored->state == ContainerState::healthy,
+                 "self_elect_restart_reconstruction_preserves_healthy_container");
+    suite.expect(deployment != nullptr && deployment->nHealthy() == 1,
+                 "self_elect_restart_reconstruction_counts_healthy_container_once");
+
+    SwitchboardWormholeOperation operation = {};
+    Vector<Wormhole> reconstructed = {};
+    bool prepared = restored != nullptr &&
+                    prodigyPrepareSwitchboardWormholeOperation(restored->generateContainerID(), restored->wormholes, operation) &&
+                    BitseryEngine::deserializeSafe(operation.desired, reconstructed);
+    suite.expect(prepared && reconstructed.size() == 1 &&
+                     reconstructed[0].source == ExternalAddressSource::registeredRoutablePrefix &&
+                     reconstructed[0].externalAddress.equals(wormhole.externalAddress),
+                 "self_elect_restart_reconstruction_rebuilds_registered_prefix_wormhole");
+
+    if (restored != nullptr)
+    {
+      machine.removeContainerIndexEntry(restored->deploymentID, restored);
+      brain.containers.erase(restored->uuid);
+      if (deployment != nullptr)
+      {
+        deployment->containers.erase(restored);
+      }
+      delete restored;
+    }
+    brain.deployments.clear();
+    brain.deploymentsByApp.clear();
+    delete deployment;
+    brain.neurons.erase(&machine.neuron);
+    brain.machines.erase(&machine);
+    brain.machinesByUUID.erase(machine.uuid);
+    brain.racks.erase(rack.uuid);
+    rack.machines.erase(&machine);
+    if (machine.neuron.fd >= 0)
+    {
+      ::close(machine.neuron.fd);
+      machine.neuron.fd = -1;
+    }
+    brain.iaas = nullptr;
+    thisBrain = previousBrain;
   });
 
   withUniqueMothershipSocket("spin_application_queues_new_deployment_behind_unstarted_baseline_socket_dir_created", [&] {
