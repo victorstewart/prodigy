@@ -6433,6 +6433,23 @@ public:
         stateChangedAtMs = recoveryStateChangedBeforePromotion;
       }
     }
+
+    // A persisted plan is materialized with state=none before Neurons restore
+    // its runtime inventory. If that inventory already satisfies the complete
+    // healthy target, restore the lifecycle state too; otherwise a subsequent
+    // version is mistaken for a rapid-fire request behind an unstarted plan and
+    // remains waitingToDeploy forever.
+    if (state == DeploymentState::none &&
+        nTarget() > 0 &&
+        nDeployed() >= nTarget() &&
+        nHealthy() >= nTarget())
+    {
+      setDeploymentRunning();
+      if (isDecommissioning())
+      {
+        rollForward();
+      }
+    }
   }
 
   uint32_t brainEchos = 0; // we wait until both brains echo that they have the deployment blob when one is required

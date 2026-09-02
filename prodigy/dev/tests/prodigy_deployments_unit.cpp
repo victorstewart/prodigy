@@ -8948,6 +8948,37 @@ int main(void)
   }
 
   {
+    ApplicationDeployment deployment;
+    ScopedFreshRing ring;
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+
+    seedCommonPlan(deployment, false);
+    deployment.plan.config.type = ApplicationType::stateless;
+    deployment.plan.stateless.nBase = 1;
+    deployment.state = DeploymentState::none;
+
+    Machine machine = {};
+    machine.state = MachineState::healthy;
+
+    ContainerView healthy = {};
+    healthy.machine = &machine;
+    healthy.lifetime = ApplicationLifetime::base;
+    healthy.state = ContainerState::healthy;
+    deployment.containers.insert(&healthy);
+
+    deployment.recoverAfterReboot();
+
+    suite.expect(deployment.nTarget() == 1 && deployment.nDeployed() == 1 && deployment.nHealthy() == 1,
+                 "recoverAfterReboot_complete_persisted_runtime_rebuilds_satisfied_target");
+    suite.expect(deployment.state == DeploymentState::running,
+                 "recoverAfterReboot_complete_persisted_runtime_restores_running_state");
+
+    thisBrain = savedBrain;
+  }
+
+  {
     ScopedFreshRing ring;
     TestBrain brain;
     BrainBase *savedBrain = thisBrain;
