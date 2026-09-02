@@ -28892,6 +28892,7 @@ public:
           uint8_t *terminal = message->terminal();
           bool malformedStateUpload = false;
           bytell_hash_set<uint128_t> reportedMachineContainerUUIDs = {};
+          bytell_hash_set<uint32_t> reportedMachineContainerFragments = {};
 #if PRODIGY_DEBUG
           const uint64_t indexedBefore = neuron->machine ? neuron->machine->containersByDeploymentID.size() : 0u;
 #endif
@@ -28913,6 +28914,14 @@ public:
             }
 
             reportedMachineContainerUUIDs.insert(plan.uuid);
+            if (plan.fragment == 0 ||
+                (plan.fragment != prodigyMothershipTunnelProviderRuntimeFragment &&
+                 reportedMachineContainerFragments.contains(plan.fragment)))
+            {
+              malformedStateUpload = true;
+              break;
+            }
+            reportedMachineContainerFragments.insert(plan.fragment);
             if (handleUploadedMothershipTunnelProviderContainer(neuron, plan))
             {
               continue;
@@ -29103,6 +29112,15 @@ public:
               Ring::queueClose(neuron);
             }
             break;
+          }
+
+          neuron->machine->usedContainerFragments.clear();
+          for (uint32_t containerFragment : reportedMachineContainerFragments)
+          {
+            if (containerFragment != prodigyMothershipTunnelProviderRuntimeFragment)
+            {
+              neuron->machine->usedContainerFragments.insert(containerFragment);
+            }
           }
 
           Vector<ContainerView *> staleMachineContainerPointers;

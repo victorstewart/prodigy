@@ -1961,6 +1961,25 @@ public:
       return false;
     }
 
+    const uint32_t existingHostIfidx = if_nametoindex(netdevs.host.name.c_str());
+    if (existingHostIfidx != 0)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"container netkit host name {} already exists at ifindex {itoa} for container {itoa}"_ctv>(
+            netdevs.host.name,
+            uint64_t(existingHostIfidx),
+            plan.uuid);
+      }
+      basics_log("setupNetwork failed uuid=%llu reason=netkit-name-collision host=%s ifidx=%u\n",
+                 (unsigned long long)plan.uuid,
+                 netdevs.host.name.c_str(),
+                 unsigned(existingHostIfidx));
+      ::close(peernetnsfd);
+      ::close(hostnetnsfd);
+      return false;
+    }
+
     netdevs.createPair(pid, NETKIT_SCRUB_NONE, NETKIT_SCRUB_NONE);
     netdevs.peer.moveSocketToNamespace(peernetnsfd, hostnetnsfd);
     if (bringContainerLoopbackUp(peernetnsfd, hostnetnsfd, plan.uuid, failureReport) == false)
@@ -1976,6 +1995,27 @@ public:
       return false;
     }
     netdevs.getInfo();
+    netdevs.peer.getInfo();
+
+    if (netdevs.host.ifidx == 0 || netdevs.peer.ifidx == 0)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to create container netkit pair {} / {} for container {itoa}"_ctv>(
+            netdevs.host.name,
+            netdevs.peer.name,
+            plan.uuid);
+      }
+      basics_log("setupNetwork failed uuid=%llu reason=netkit-pair-validation host=%s hostIfidx=%u peer=%s peerIfidx=%u\n",
+                 (unsigned long long)plan.uuid,
+                 netdevs.host.name.c_str(),
+                 unsigned(netdevs.host.ifidx),
+                 netdevs.peer.name.c_str(),
+                 unsigned(netdevs.peer.ifidx));
+      ::close(peernetnsfd);
+      ::close(hostnetnsfd);
+      return false;
+    }
 
     auto& host = netdevs.host;
     auto& peer = netdevs.peer;

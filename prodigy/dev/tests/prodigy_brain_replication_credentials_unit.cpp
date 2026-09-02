@@ -17325,6 +17325,7 @@ static void testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(Test
   machine.state = MachineState::healthy;
   machine.rack = &rack;
   machine.neuron.machine = &machine;
+  machine.usedContainerFragments.insert(9);
   brain.machines.insert(&machine);
   brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
   brain.neurons.insert(&machine.neuron);
@@ -17376,6 +17377,8 @@ static void testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(Test
   brain.neuronHandler(&machine.neuron, message);
 
   suite.expect(machine.runtimeReady == true, "brain_neuron_state_upload_marks_machine_runtime_ready");
+  suite.expect(machine.containerFragmentAvailable(9), "brain_neuron_state_upload_releases_unreported_container_fragment");
+  suite.expect(machine.containerFragmentAvailable(livePlan.fragment) == false, "brain_neuron_state_upload_reserves_reported_container_fragment");
   auto liveIt = brain.containers.find(livePlan.uuid);
   suite.expect(liveIt != brain.containers.end(), "brain_neuron_state_upload_tracks_reported_container");
   suite.expect(brain.containers.find(staleUUID) == brain.containers.end(), "brain_neuron_state_upload_removes_stale_canonical_container");
