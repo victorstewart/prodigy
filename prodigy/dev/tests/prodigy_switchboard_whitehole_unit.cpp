@@ -1858,6 +1858,17 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
                   refreshed.phase == SWITCHBOARD_WORMHOLE_FLOW_PENDING &&
                   refreshed.expiresAtNs == firstPublic.expiresAtNs,
               "inbound_only_traffic_cannot_extend_pending_owner");
+
+  std::vector<uint8_t> alreadyPublicReply = makeIPv6L4EthernetFrame(external, client, IPPROTO_UDP, 8443, 49'152);
+  expectNamed(runNetkit(egress, alreadyPublicReply, 0, packetOutput) == NETKIT_PASS,
+              "public_address_reply_resolves_canonical_flow_owner");
+  if (packetOutput.size() >= sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + sizeof(struct udphdr))
+  {
+    const struct ipv6hdr *rewritten6 = reinterpret_cast<const struct ipv6hdr *>(packetOutput.data() + sizeof(struct ethhdr));
+    const struct udphdr *rewrittenUDP = reinterpret_cast<const struct udphdr *>(rewritten6 + 1);
+    expectNamed(std::memcmp(rewritten6->saddr.s6_addr, external, sizeof(external)) == 0 && rewrittenUDP->source == htons(443),
+                "public_address_reply_restores_advertised_source_port");
+  }
   expectNamed(runNetkit(ingress, privateIngress, 0, packetOutput) == NETKIT_DROP,
               "public_first_rejects_aliasing_private_flow");
 

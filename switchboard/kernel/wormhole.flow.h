@@ -784,17 +784,25 @@ __attribute__((__always_inline__)) static inline int switchboardWormholeReplyDis
     destPort = udp->dest;
   }
 
-  struct flow_key reply = {};
-  bpf_memcpy(reply.srcv6, ip6h->saddr.s6_addr32, sizeof(reply.srcv6));
-  bpf_memcpy(reply.dstv6, ip6h->daddr.s6_addr32, sizeof(reply.dstv6));
-  reply.port16[0] = sourcePort;
-  reply.port16[1] = destPort;
-  reply.proto = ip6h->nexthdr;
-
   struct switchboard_wormhole_egress_key exposed = {};
-  if (switchboardWormholeExposureKeyIPv6(ip6h->saddr.s6_addr, sourcePort, ip6h->nexthdr, &exposed) == false)
+  __u8 container[5] = {};
+  bool canonicalContainerSource = switchboardWormholeExposureKeyIPv6(ip6h->saddr.s6_addr,
+                                                                      sourcePort,
+                                                                      ip6h->nexthdr,
+                                                                      &exposed);
+  if (canonicalContainerSource)
   {
-    return SWITCHBOARD_WORMHOLE_REPLY_NONE;
+    bpf_memcpy(container, exposed.container, sizeof(container));
+  }
+  else
+  {
+    if (switchboardCurrentContainerID(container) == false)
+    {
+      return SWITCHBOARD_WORMHOLE_REPLY_NONE;
+    }
+    bpf_memcpy(exposed.container, container, sizeof(exposed.container));
+    exposed.port = sourcePort;
+    exposed.proto = ip6h->nexthdr;
   }
   struct switchboard_wormhole_egress_binding *configured = bpf_map_lookup_elem(&wh_egress, &exposed);
   if (configured == NULL)
@@ -805,10 +813,35 @@ __attribute__((__always_inline__)) static inline int switchboardWormholeReplyDis
   {
     return SWITCHBOARD_WORMHOLE_REPLY_DROP;
   }
+  if (canonicalContainerSource == false &&
+      (configured->is_ipv6 == 0 || bpf_memcmp(configured->addr6, ip6h->saddr.s6_addr, sizeof(configured->addr6)) != 0))
+  {
+    return SWITCHBOARD_WORMHOLE_REPLY_NONE;
+  }
+
+  struct flow_key reply = {};
+  if (canonicalContainerSource)
+  {
+    bpf_memcpy(reply.srcv6, ip6h->saddr.s6_addr32, sizeof(reply.srcv6));
+  }
+  else
+  {
+    struct container_id containerID = {};
+    containerID.hasID = true;
+    bpf_memcpy(containerID.value, container, sizeof(containerID.value));
+    if (switchboardBuildContainerNetworkIPv6((__u8 *)reply.srcv6, &containerID) == false)
+    {
+      return SWITCHBOARD_WORMHOLE_REPLY_DROP;
+    }
+  }
+  bpf_memcpy(reply.dstv6, ip6h->daddr.s6_addr32, sizeof(reply.dstv6));
+  reply.port16[0] = sourcePort;
+  reply.port16[1] = destPort;
+  reply.proto = ip6h->nexthdr;
+
   struct switchboard_wormhole_flow_key ownerKey = switchboardWormholeFlowMapKey(&reply, configured->owner_generation);
   struct switchboard_wormhole_flow *established = bpf_map_lookup_elem(&wh_flows, &ownerKey);
   struct switchboard_wormhole_flow *pending = established == NULL ? bpf_map_lookup_elem(&wh_pending, &ownerKey) : NULL;
-  const __u8 *container = ip6h->saddr.s6_addr + 11;
   // The portal address family constrains public source rewriting, not private IPv6 mesh ownership.
   struct switchboard_wormhole_flow *owner = established == NULL ? pending : established;
   if (configured->is_ipv6 == 0 && owner != NULL && owner->disposition == SWITCHBOARD_WORMHOLE_FLOW_PUBLIC)
