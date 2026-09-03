@@ -9756,9 +9756,82 @@ public:
   // This is only entered after the Brain has durably accepted a narrowly
   // version-scoped cancellation.  Unlike a normal roll-forward, the unhealthy
   // non-serving target is fully gone before its waiting successor starts.
+  bool operatorCancellationTransitionIsSafe(void) const
+  {
+    if (state != DeploymentState::deploying || waitingOnCompactions ||
+        canaryStack != nullptr || currentlyExecutingWork != nullptr ||
+        toSchedule.empty() == false || schedulingStack.waiters.empty() == false)
+    {
+      return false;
+    }
+    if ((schedulingStack.execution != nullptr &&
+         (waitingOnContainers.empty() || nSuspended != 1)) ||
+        (schedulingStack.execution == nullptr &&
+         (waitingOnContainers.empty() == false || nSuspended != 0)))
+    {
+      return false;
+    }
+    for (const auto& [container, waitState] : waitingOnContainers)
+    {
+      if (container == nullptr || containers.contains(container) == false ||
+          waitState != ContainerState::healthy ||
+          container->deploymentID != plan.config.deploymentID() ||
+          container->state == ContainerState::healthy ||
+          container->state == ContainerState::aboutToDestroy ||
+          container->state == ContainerState::destroying ||
+          container->state == ContainerState::destroyed)
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool operatorCancellationDestructionIsInFlight(void) const
+  {
+    if (state != DeploymentState::failed || containers.empty() == false ||
+        waitingOnContainers.empty() || waitingOnCompactions ||
+        canaryStack != nullptr || currentlyExecutingWork != nullptr ||
+        toSchedule.empty() == false || schedulingStack.waiters.empty() == false)
+    {
+      return false;
+    }
+    if ((schedulingStack.execution != nullptr && nSuspended != 1) ||
+        (schedulingStack.execution == nullptr && nSuspended != 0))
+    {
+      return false;
+    }
+    for (const auto& [container, waitState] : waitingOnContainers)
+    {
+      if (container == nullptr || waitState != ContainerState::destroyed ||
+          container->deploymentID != plan.config.deploymentID() ||
+          container->machine == nullptr ||
+          (container->state != ContainerState::aboutToDestroy &&
+           container->state != ContainerState::destroying))
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void reissueOperatorCancellationDestruction(void)
+  {
+    if (operatorCancellationDestructionIsInFlight() == false)
+    {
+      return;
+    }
+    for (const auto& [container, waitState] : waitingOnContainers)
+    {
+      (void)waitState;
+      queueSend(container->machine, NeuronTopic::killContainer, container->uuid);
+    }
+  }
+
   void cancelUnhealthyStatelessForSuccessor(void)
   {
-    if (plan.isStateful || plan.config.type == ApplicationType::task || next == nullptr)
+    if (plan.isStateful || plan.config.type == ApplicationType::task || next == nullptr ||
+        operatorCancellationTransitionIsSafe() == false)
     {
       return;
     }
@@ -9767,6 +9840,16 @@ public:
     stateChangedAtMs = Time::now<TimeResolution::ms>();
     Ring::queueCancelTimeout(&autoscaleTimer);
     Ring::queueCancelTimeout(&canaryTimer);
+
+    // The acceptance predicate proves that this is the sole suspension: a
+    // normally deploying container waiting for its first health acknowledgement.
+    // Cancellation supersedes that wait so its scheduling coroutine can retire
+    // before destruction work is queued.
+    waitingOnContainers.clear();
+    if (schedulingStack.execution)
+    {
+      consumeSchedulingExecution();
+    }
 
     if (containers.empty() == false)
     {

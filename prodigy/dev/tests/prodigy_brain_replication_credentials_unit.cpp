@@ -20783,6 +20783,46 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
   brain.deploymentPlans.insert_or_assign(activeDeploymentID, active->plan);
   brain.deploymentPlans.insert_or_assign(successorDeploymentID, successor->plan);
 
+  ContainerView pendingHealth = {};
+  pendingHealth.deploymentID = activeDeploymentID;
+  pendingHealth.state = ContainerState::scheduled;
+  active->containers.insert(&pendingHealth);
+  active->waitingOnContainers.insert_or_assign(&pendingHealth, ContainerState::healthy);
+  CoroutineStack pendingScheduler = {};
+  active->schedulingStack.execution = &pendingScheduler;
+  active->nSuspended = 1;
+  suite.expect(active->operatorCancellationTransitionIsSafe(),
+               "operator_cancellation_allows_exact_pending_health_transition");
+  active->waitingOnContainers[&pendingHealth] = ContainerState::destroyed;
+  suite.expect(active->operatorCancellationTransitionIsSafe() == false,
+               "operator_cancellation_rejects_destruction_waiter");
+  active->waitingOnContainers[&pendingHealth] = ContainerState::healthy;
+  active->canaryStack = &pendingScheduler;
+  suite.expect(active->operatorCancellationTransitionIsSafe() == false,
+               "operator_cancellation_rejects_canary_coroutine");
+  active->canaryStack = nullptr;
+  active->waitingOnCompactions = true;
+  suite.expect(active->operatorCancellationTransitionIsSafe() == false,
+               "operator_cancellation_rejects_compaction_suspension");
+  active->waitingOnCompactions = false;
+  active->waitingOnContainers.clear();
+  active->containers.erase(&pendingHealth);
+  active->schedulingStack.execution = nullptr;
+  active->nSuspended = 0;
+
+  pendingHealth.state = ContainerState::destroying;
+  Machine pendingHealthMachine = {};
+  pendingHealth.machine = &pendingHealthMachine;
+  active->state = DeploymentState::failed;
+  active->waitingOnContainers.insert_or_assign(&pendingHealth, ContainerState::destroyed);
+  suite.expect(active->operatorCancellationDestructionIsInFlight(),
+               "operator_cancellation_recognizes_exact_destruction_waiter");
+  active->waitingOnContainers[&pendingHealth] = ContainerState::healthy;
+  suite.expect(active->operatorCancellationDestructionIsInFlight() == false,
+               "operator_cancellation_rejects_non_destruction_recovery_waiter");
+  active->waitingOnContainers.clear();
+  active->state = DeploymentState::deploying;
+
   CancelDeploymentRequest request = {};
   request.applicationName = applicationName;
   request.applicationID = applicationID;

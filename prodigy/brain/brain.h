@@ -26489,9 +26489,13 @@ public:
         continue;
       }
       ApplicationDeployment *deployment = deploymentIt->second;
-      if (deployment->toSchedule.empty() && deployment->waitingOnContainers.empty())
+      if (deployment->operatorCancellationTransitionIsSafe())
       {
         deployment->cancelUnhealthyStatelessForSuccessor();
+      }
+      else if (deployment->operatorCancellationDestructionIsInFlight())
+      {
+        deployment->reissueOperatorCancellationDestruction();
       }
     }
   }
@@ -29024,7 +29028,7 @@ public:
           ApplicationDeployment *successor = successorIt->second;
           const DeploymentPlan& activePlan = deployment->plan;
           const bool activeTransitioning =
-              deployment->state == DeploymentState::canaries || deployment->state == DeploymentState::deploying;
+              deployment->state == DeploymentState::deploying;
           const bool unsafeActivePlan =
               activePlan.config.applicationID != request.applicationID ||
               activePlan.config.versionID != request.activeVersionID ||
@@ -29034,9 +29038,11 @@ public:
               activePlan.useHostNetworkNamespace || activePlan.hasTlsIssuancePolicy || activePlan.hasApiCredentialPolicy;
           if (unsafeActivePlan || activeTransitioning == false || deployment->nHealthy() != 0 ||
               deployment->next != successor || successor->previous != deployment ||
+              successor->plan.config.applicationID != request.applicationID ||
+              successor->plan.config.versionID != request.successorVersionID ||
               successor->plan.config.type == ApplicationType::task || successor->plan.isStateful ||
               successor->state != DeploymentState::waitingToDeploy || successor->containers.empty() == false ||
-              deployment->toSchedule.empty() == false || deployment->waitingOnContainers.empty() == false ||
+              deployment->operatorCancellationTransitionIsSafe() == false ||
               deploymentHasRoutableResourceLease(cancelledID))
           {
             reject("cancelDeployment safety precondition failed");
@@ -29907,12 +29913,24 @@ public:
                          (unsigned long long)deployment->containers.size());
             PRODIGY_DEBUG_FLUSH();
             uint64_t destroyedDeploymentID = container->deploymentID;
+            uint64_t destructionOwnerDeploymentID = deployment->plan.config.deploymentID();
             deployment->containerDestroyed(container);
-            PRODIGY_DEBUG_LOG( "brain killContainerAck destroy-done uuid=%llu deploymentID=%llu waitingAfter=%llu containersAfter=%llu\n",
+            uint64_t waitingAfter = 0;
+            uint64_t containersAfter = 0;
+            bool destructionOwnerPresent = false;
+            if (auto afterIt = deployments.find(destructionOwnerDeploymentID);
+                afterIt != deployments.end() && afterIt->second != nullptr)
+            {
+              destructionOwnerPresent = true;
+              waitingAfter = afterIt->second->waitingOnContainers.size();
+              containersAfter = afterIt->second->containers.size();
+            }
+            PRODIGY_DEBUG_LOG( "brain killContainerAck destroy-done uuid=%llu deploymentID=%llu ownerPresent=%u waitingAfter=%llu containersAfter=%llu\n",
                          (unsigned long long)containerUUID,
                          (unsigned long long)destroyedDeploymentID,
-                         (unsigned long long)deployment->waitingOnContainers.size(),
-                         (unsigned long long)deployment->containers.size());
+                         unsigned(destructionOwnerPresent),
+                         (unsigned long long)waitingAfter,
+                         (unsigned long long)containersAfter);
             PRODIGY_DEBUG_FLUSH();
 
             isMachineDrained(machine);
