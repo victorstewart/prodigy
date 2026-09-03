@@ -519,6 +519,42 @@ static void testFailedDeploymentRecordCompatibilityAndRoundtrip(TestSuite& suite
       decodedStructured.terminalReport.state == DeploymentState::failed && decodedStructured.terminalReport.nCrashes == 1 && decodedStructured.terminalReport.failureReports.size() == 1 && decodedStructured.terminalReport.failureReports[0].restarted == false && decodedStructured.terminalReport.failureReports[0].wasCanary,
       "failed_deployment_structured_record_restores_terminal_failure_fields");
 
+  FailedDeploymentRecord cancellation = structured;
+  cancellation.deploymentID = (uint64_t(cancellation.applicationID) << 48) | 17;
+  cancellation.hasOperatorCancellation = true;
+  cancellation.operationID.assign("123e4567-e89b-42d3-a456-426614174000"_ctv);
+  cancellation.successorDeploymentID = (uint64_t(cancellation.applicationID) << 48) | 18;
+  cancellation.cancellationPhase = CancelDeploymentPhase::successorStarted;
+  cancellation.cancellationGeneration = 41;
+  cancellation.cancellationCompletedAtMs = 0;
+  String cancellationBytes = {};
+  BitseryEngine::serialize(cancellationBytes, cancellation);
+  FailedDeploymentRecord decodedCancellation = {};
+  suite.expect(BitseryEngine::deserializeSafe(cancellationBytes, decodedCancellation),
+               "failed_deployment_operator_cancellation_decodes");
+  suite.expect(decodedCancellation.hasOperatorCancellation &&
+                   decodedCancellation.operationID.equals(cancellation.operationID) &&
+                   decodedCancellation.deploymentID == cancellation.deploymentID &&
+                   decodedCancellation.successorDeploymentID == cancellation.successorDeploymentID &&
+                   decodedCancellation.cancellationPhase == cancellation.cancellationPhase &&
+                   decodedCancellation.cancellationGeneration == cancellation.cancellationGeneration,
+               "failed_deployment_operator_cancellation_restores_durable_fields");
+
+  String truncatedCancellation = cancellationBytes;
+  truncatedCancellation.trim(1);
+  FailedDeploymentRecord truncatedDecoded = {};
+  suite.expect(BitseryEngine::deserializeSafe(truncatedCancellation, truncatedDecoded) == false,
+               "failed_deployment_operator_cancellation_rejects_truncation");
+
+  cancellation.operationID.assign("123E4567-e89b-42d3-a456-426614174000"_ctv);
+  String nonCanonicalCancellationBytes = {};
+  BitseryEngine::serialize(nonCanonicalCancellationBytes, cancellation);
+  FailedDeploymentRecord nonCanonicalDecoded = {};
+  suite.expect(BitseryEngine::deserializeSafe(nonCanonicalCancellationBytes, nonCanonicalDecoded),
+               "failed_deployment_operator_cancellation_invalid_uuid_keeps_snapshot_decodable");
+  suite.expect(nonCanonicalDecoded.hasOperatorCancellation == false,
+               "failed_deployment_operator_cancellation_rejects_noncanonical_uuid");
+
   String malformedTaggedValue = {};
   constexpr static char structuredPrefix[] = "PRODIGY_FAILED_DEPLOYMENT_REPORT_V1\0";
   malformedTaggedValue.append(structuredPrefix, sizeof(structuredPrefix) - 1);

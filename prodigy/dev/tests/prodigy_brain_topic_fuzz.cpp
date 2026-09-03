@@ -41,6 +41,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
       BrainTopic::replicateContainerRuntimeReady,
       BrainTopic::replicateContainerRuntimeState,
       BrainTopic::replicateSystemContainerArtifact,
+      BrainTopic::replicateDeploymentCancellation,
+      BrainTopic::acknowledgeDeploymentCancellation,
   };
 
   std::vector<uint8_t> bytes(data, data + size);

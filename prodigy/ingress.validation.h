@@ -326,6 +326,10 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
         }
         return (cursor == terminal);
       }
+    case MothershipTopic::cancelDeployment:
+      {
+        return consumeVariable(cursor, terminal) && cursor == terminal;
+      }
     case MothershipTopic::pullTaskReport:
       {
         uint64_t deploymentID = 0;
@@ -593,6 +597,8 @@ static bool validateBrainPayload(uint16_t rawTopic, uint8_t *args, uint8_t *term
     case BrainTopic::replicateApplicationServiceReservation:
     case BrainTopic::replicateTlsVaultFactory:
     case BrainTopic::replicateApiCredentialSet:
+    case BrainTopic::replicateDeploymentCancellation:
+    case BrainTopic::acknowledgeDeploymentCancellation:
       {
         if (consumeVariable(cursor, terminal) == false)
         {

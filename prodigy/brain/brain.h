@@ -10312,6 +10312,8 @@ public:
       return;
     }
 
+    resumeOperatorCancellations();
+
     for (const auto& [applicationID, head] : deploymentsByApp)
     {
       (void)applicationID;
@@ -17138,6 +17140,16 @@ public:
     // no wormholes to reconstruct.
     for (const auto& [deploymentID, plan] : deploymentPlans)
     {
+      if (auto failedIt = failedDeployments.find(deploymentID);
+          failedIt != failedDeployments.end() &&
+          failedIt->second.hasOperatorCancellation &&
+          failedIt->second.cancellationPhase == CancelDeploymentPhase::completed)
+      {
+        // The completed tombstone is authoritative over the retained plan.
+        // Keep the image until tombstone GC, but never rematerialize the
+        // cancelled deployment after election or restart.
+        continue;
+      }
       ApplicationDeployment *deployment = new ApplicationDeployment(); // as neurons register and upload their state, these deployments will be populated
       deployment->plan = plan;
       deployment->restorePersistedStatefulWorkerTopologyUpgradeOperation();
@@ -23582,11 +23594,23 @@ public:
             Message::extractToStringView(args, serializedPlan);
 
             DeploymentPlan plan;
-            BitseryEngine::deserialize(serializedPlan, plan);
+            if (BitseryEngine::deserializeSafe(serializedPlan, plan) == false)
+            {
+              break;
+            }
 
-            deploymentPlans.insert_or_assign(plan.config.deploymentID(), plan);
+            const uint64_t deploymentID = plan.config.deploymentID();
+            if (auto failedIt = failedDeployments.find(deploymentID);
+                failedIt != failedDeployments.end() && failedIt->second.hasOperatorCancellation)
+            {
+              // A late deployment frame must not recreate a version whose
+              // durable operator-cancellation tombstone has already arrived.
+              break;
+            }
+
+            deploymentPlans.insert_or_assign(deploymentID, plan);
             applyReplicatedDeploymentPlanLiveState(plan);
-            applyPendingReplicatedContainerRuntimeStates(plan.config.deploymentID());
+            applyPendingReplicatedContainerRuntimeStates(deploymentID);
 
             String containerBlob;
             Message::extractToStringView(args, containerBlob);
@@ -23595,7 +23619,7 @@ public:
             {
               String storeFailure = {};
               if (ContainerStore::store(
-                      plan.config.deploymentID(),
+                      deploymentID,
                       containerBlob,
                       nullptr,
                       nullptr,
@@ -24429,6 +24453,102 @@ public:
             }
           }
 
+          break;
+        }
+      case BrainTopic::replicateDeploymentCancellation:
+        {
+          String serialized = {};
+          Message::extractToStringView(args, serialized);
+          if (weAreMaster || peerCanReplicateMasterAuthorityState(bv) == false)
+          {
+            break;
+          }
+
+          FailedDeploymentRecord incoming = {};
+          if (BitseryEngine::deserializeSafe(serialized, incoming) == false ||
+              incoming.hasOperatorCancellation == false ||
+              prodigyCanonicalOperationUUID(incoming.operationID) == false ||
+              incoming.applicationID == 0 || incoming.deploymentID == 0 ||
+              incoming.successorDeploymentID == 0 ||
+              uint16_t(incoming.deploymentID >> 48) != incoming.applicationID ||
+              uint16_t(incoming.successorDeploymentID >> 48) != incoming.applicationID ||
+              incoming.deploymentID == incoming.successorDeploymentID ||
+              incoming.cancellationGeneration == 0)
+          {
+            break;
+          }
+
+          auto existingIt = failedDeployments.find(incoming.deploymentID);
+          if (existingIt != failedDeployments.end())
+          {
+            const FailedDeploymentRecord& existing = existingIt->second;
+            if (existing.hasOperatorCancellation == false ||
+                existing.operationID.equals(incoming.operationID) == false ||
+                existing.successorDeploymentID != incoming.successorDeploymentID ||
+                existing.cancellationGeneration > incoming.cancellationGeneration ||
+                (existing.cancellationGeneration == incoming.cancellationGeneration &&
+                 uint8_t(existing.cancellationPhase) > uint8_t(incoming.cancellationPhase)))
+            {
+              break;
+            }
+          }
+
+          const bool hadExisting = existingIt != failedDeployments.end();
+          FailedDeploymentRecord previous = {};
+          if (hadExisting)
+          {
+            previous = existingIt->second;
+          }
+          failedDeployments.insert_or_assign(incoming.deploymentID, incoming);
+          if (persistLocalRuntimeState() == false)
+          {
+            if (hadExisting)
+            {
+              failedDeployments.insert_or_assign(incoming.deploymentID, std::move(previous));
+            }
+            else
+            {
+              failedDeployments.erase(incoming.deploymentID);
+            }
+            break;
+          }
+          armFailedDeploymentCleaner();
+
+          DeploymentCancellationAcknowledgement acknowledgement = {};
+          acknowledgement.operationID = incoming.operationID;
+          acknowledgement.durableGeneration = incoming.cancellationGeneration;
+          acknowledgement.peerUUID = thisNeuron ? thisNeuron->uuid : uint128_t(0);
+          acknowledgement.peerBootNs = boottimens;
+          String serializedAcknowledgement = {};
+          BitseryEngine::serialize(serializedAcknowledgement, acknowledgement);
+          Message::construct(bv->wBuffer, BrainTopic::acknowledgeDeploymentCancellation,
+                             serializedAcknowledgement);
+          Ring::queueSend(bv);
+          break;
+        }
+      case BrainTopic::acknowledgeDeploymentCancellation:
+        {
+          if (weAreMaster == false || bv == nullptr)
+          {
+            break;
+          }
+          String serialized = {};
+          Message::extractToStringView(args, serialized);
+          DeploymentCancellationAcknowledgement acknowledgement = {};
+          if (BitseryEngine::deserializeSafe(serialized, acknowledgement) == false ||
+              prodigyCanonicalOperationUUID(acknowledgement.operationID) == false ||
+              acknowledgement.durableGeneration == 0 ||
+              acknowledgement.peerUUID != bv->uuid ||
+              acknowledgement.peerBootNs != bv->boottimens)
+          {
+            break;
+          }
+          PRODIGY_DEBUG_LOG(
+              "prodigy operator-cancel ack operationID=%s generation=%llu peerPrivate4=%u\n",
+              acknowledgement.operationID.c_str(),
+              (unsigned long long)acknowledgement.durableGeneration,
+              unsigned(bv->private4));
+          PRODIGY_DEBUG_FLUSH();
           break;
         }
       default:
@@ -26211,6 +26331,167 @@ public:
       else
       {
         *capturedResponse = std::move(response);
+      }
+    }
+  }
+
+  bool persistAndReplicateOperatorCancellation(FailedDeploymentRecord& record)
+  {
+    if (masterAuthorityRuntimeState.generation == UINT64_MAX)
+    {
+      return false;
+    }
+    const uint64_t previousGeneration = record.cancellationGeneration;
+    const uint64_t previousAuthorityGeneration = masterAuthorityRuntimeState.generation;
+    record.cancellationGeneration = previousAuthorityGeneration + 1;
+    if (commitMasterAuthorityStateChange() == false)
+    {
+      record.cancellationGeneration = previousGeneration;
+      masterAuthorityRuntimeState.generation = previousAuthorityGeneration;
+      return false;
+    }
+
+    String serialized = {};
+    BitseryEngine::serialize(serialized, record);
+    queueBrainReplication(BrainTopic::replicateDeploymentCancellation, serialized);
+    return true;
+  }
+
+  bool deploymentHasRoutableResourceLease(uint64_t deploymentID) const
+  {
+    for (const RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
+    {
+      if (lease.owner.deploymentID == deploymentID)
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void finishOperatorCancellationAfterContainers(uint64_t deploymentID)
+  {
+    auto failedIt = failedDeployments.find(deploymentID);
+    if (failedIt == failedDeployments.end() || failedIt->second.hasOperatorCancellation == false)
+    {
+      return;
+    }
+    FailedDeploymentRecord& record = failedIt->second;
+    const bool alreadyCompleted = record.cancellationPhase == CancelDeploymentPhase::completed;
+
+    ApplicationDeployment *deployment = nullptr;
+    if (auto deploymentIt = deployments.find(deploymentID); deploymentIt != deployments.end())
+    {
+      deployment = deploymentIt->second;
+    }
+    ApplicationDeployment *successor = nullptr;
+    if (auto successorIt = deployments.find(record.successorDeploymentID); successorIt != deployments.end())
+    {
+      successor = successorIt->second;
+    }
+    if (successor == nullptr || (deployment != nullptr && deployment->containers.empty() == false))
+    {
+      return;
+    }
+
+    if (uint8_t(record.cancellationPhase) < uint8_t(CancelDeploymentPhase::containersTerminated))
+    {
+      const CancelDeploymentPhase previousPhase = record.cancellationPhase;
+      record.cancellationPhase = CancelDeploymentPhase::containersTerminated;
+      if (persistAndReplicateOperatorCancellation(record) == false)
+      {
+        record.cancellationPhase = previousPhase;
+        return;
+      }
+    }
+    if (uint8_t(record.cancellationPhase) < uint8_t(CancelDeploymentPhase::successorStarted))
+    {
+      const CancelDeploymentPhase previousPhase = record.cancellationPhase;
+      record.cancellationPhase = CancelDeploymentPhase::successorStarted;
+      if (persistAndReplicateOperatorCancellation(record) == false)
+      {
+        record.cancellationPhase = previousPhase;
+        return;
+      }
+    }
+
+    if (deployment != nullptr)
+    {
+      ApplicationDeployment *previous = deployment->previous;
+      if (previous != nullptr)
+      {
+        previous->next = successor;
+      }
+      successor->previous = previous;
+      deployment->previous = nullptr;
+      deployment->next = nullptr;
+      if (auto deploymentIt = deployments.find(deploymentID);
+          deploymentIt != deployments.end() && deploymentIt->second == deployment)
+      {
+        deployments.erase(deploymentIt);
+      }
+      delete deployment;
+    }
+
+    if (successor->state == DeploymentState::waitingToDeploy || successor->state == DeploymentState::none)
+    {
+      successor->deploy();
+    }
+    if (alreadyCompleted)
+    {
+      return;
+    }
+    const CancelDeploymentPhase previousPhase = record.cancellationPhase;
+    record.cancellationPhase = CancelDeploymentPhase::completed;
+    record.cancellationCompletedAtMs = Time::now<TimeResolution::ms>();
+    if (persistAndReplicateOperatorCancellation(record) == false)
+    {
+      record.cancellationPhase = previousPhase;
+      record.cancellationCompletedAtMs = 0;
+    }
+  }
+
+  void operatorCancellationContainersTerminated(ApplicationDeployment *deployment) override
+  {
+    if (deployment == nullptr)
+    {
+      return;
+    }
+    finishOperatorCancellationAfterContainers(deployment->plan.config.deploymentID());
+  }
+
+  void resumeOperatorCancellations(void)
+  {
+    if (weAreMaster == false)
+    {
+      return;
+    }
+    Vector<uint64_t> deploymentIDs = {};
+    for (const auto& [deploymentID, record] : failedDeployments)
+    {
+      if (record.hasOperatorCancellation)
+      {
+        deploymentIDs.push_back(deploymentID);
+      }
+    }
+    for (uint64_t deploymentID : deploymentIDs)
+    {
+      auto failedIt = failedDeployments.find(deploymentID);
+      if (failedIt == failedDeployments.end() || failedIt->second.hasOperatorCancellation == false)
+      {
+        continue;
+      }
+      auto deploymentIt = deployments.find(deploymentID);
+      if (deploymentIt == deployments.end() || deploymentIt->second == nullptr ||
+          (deploymentIt->second->containers.empty() && deploymentIt->second->waitingOnContainers.empty()))
+      {
+        finishOperatorCancellationAfterContainers(deploymentID);
+        continue;
+      }
+      ApplicationDeployment *deployment = deploymentIt->second;
+      if (deployment->toSchedule.empty() && deployment->waitingOnContainers.empty())
+      {
+        deployment->cancelUnhealthyStatelessForSuccessor();
       }
     }
   }
@@ -28648,6 +28929,151 @@ public:
             pushSpinApplicationProgressToMothership(deployment, "waiting for authoritative DNS reconciliation"_ctv);
           }
 
+          break;
+        }
+      case MothershipTopic::cancelDeployment:
+        {
+          String serializedRequest = {};
+          Message::extractToStringView(args, serializedRequest);
+          CancelDeploymentRequest request = {};
+          CancelDeploymentResponse response = {};
+
+          auto reject = [&](const char *reason) {
+            response.success = false;
+            response.result = CancelDeploymentResult::rejected;
+            response.failure.assign(reason);
+            String serializedResponse = {};
+            BitseryEngine::serialize(serializedResponse, response);
+            Message::construct(mothership->wBuffer, MothershipTopic::cancelDeployment, serializedResponse);
+          };
+
+          constexpr uint64_t maximumVersionID = (uint64_t(1) << 48) - 1;
+          if (args != message->terminal() || BitseryEngine::deserializeSafe(serializedRequest, request) == false ||
+              request.applicationID == 0 || request.activeVersionID == 0 || request.successorVersionID == 0 ||
+              request.activeVersionID > maximumVersionID || request.successorVersionID > maximumVersionID ||
+              request.activeVersionID == request.successorVersionID || request.applicationName.empty() ||
+              request.reason.empty() || prodigyCanonicalOperationUUID(request.operationID) == false)
+          {
+            reject("invalid cancelDeployment request");
+            break;
+          }
+          response.operationID = request.operationID;
+          response.applicationID = request.applicationID;
+          response.activeVersionID = request.activeVersionID;
+          response.successorVersionID = request.successorVersionID;
+          auto nameIt = reservedApplicationNamesByID.find(request.applicationID);
+          if (nameIt == reservedApplicationNamesByID.end() || nameIt->second.equals(request.applicationName) == false)
+          {
+            reject("cancelDeployment application identity is not reserved");
+            break;
+          }
+          const uint64_t cancelledID = (uint64_t(request.applicationID) << 48) | request.activeVersionID;
+          const uint64_t successorID = (uint64_t(request.applicationID) << 48) | request.successorVersionID;
+          response.cancelledDeploymentID = cancelledID;
+          response.successorDeploymentID = successorID;
+
+          bool operationCollision = false;
+          for (const auto& [otherDeploymentID, failed] : failedDeployments)
+          {
+            if (failed.hasOperatorCancellation && failed.operationID.equals(request.operationID) &&
+                otherDeploymentID != cancelledID)
+            {
+              operationCollision = true;
+              break;
+            }
+          }
+          if (operationCollision)
+          {
+            reject("cancelDeployment operationID already owns another deployment");
+            break;
+          }
+
+          if (auto failedIt = failedDeployments.find(cancelledID); failedIt != failedDeployments.end())
+          {
+            FailedDeploymentRecord& failed = failedIt->second;
+            if (failed.hasOperatorCancellation == false || failed.operationID.equals(request.operationID) == false ||
+                failed.successorDeploymentID != successorID)
+            {
+              reject("cancelDeployment conflicts with existing terminal record");
+              break;
+            }
+            response.success = true;
+            response.phase = failed.cancellationPhase;
+            response.durableGeneration = failed.cancellationGeneration;
+            response.result = (failed.cancellationPhase == CancelDeploymentPhase::completed)
+                                ? CancelDeploymentResult::completed
+                                : CancelDeploymentResult::alreadyAccepted;
+            String serializedResponse = {};
+            BitseryEngine::serialize(serializedResponse, response);
+            Message::construct(mothership->wBuffer, MothershipTopic::cancelDeployment, serializedResponse);
+            break;
+          }
+
+          auto cancelledIt = deployments.find(cancelledID);
+          auto successorIt = deployments.find(successorID);
+          auto headIt = deploymentsByApp.find(request.applicationID);
+          if (cancelledIt == deployments.end() || cancelledIt->second == nullptr ||
+              successorIt == deployments.end() || successorIt->second == nullptr ||
+              headIt == deploymentsByApp.end() || headIt->second != successorIt->second)
+          {
+            reject("cancelDeployment exact active/successor head is not live");
+            break;
+          }
+
+          ApplicationDeployment *deployment = cancelledIt->second;
+          ApplicationDeployment *successor = successorIt->second;
+          const DeploymentPlan& activePlan = deployment->plan;
+          const bool activeTransitioning =
+              deployment->state == DeploymentState::canaries || deployment->state == DeploymentState::deploying;
+          const bool unsafeActivePlan =
+              activePlan.config.applicationID != request.applicationID ||
+              activePlan.config.versionID != request.activeVersionID ||
+              activePlan.config.type == ApplicationType::task || activePlan.isStateful ||
+              activePlan.wormholes.empty() == false || activePlan.publicTLS.empty() == false ||
+              activePlan.whiteholes.empty() == false || activePlan.advertisements.empty() == false ||
+              activePlan.useHostNetworkNamespace || activePlan.hasTlsIssuancePolicy || activePlan.hasApiCredentialPolicy;
+          if (unsafeActivePlan || activeTransitioning == false || deployment->nHealthy() != 0 ||
+              deployment->next != successor || successor->previous != deployment ||
+              successor->plan.config.type == ApplicationType::task || successor->plan.isStateful ||
+              successor->state != DeploymentState::waitingToDeploy || successor->containers.empty() == false ||
+              deployment->toSchedule.empty() == false || deployment->waitingOnContainers.empty() == false ||
+              deploymentHasRoutableResourceLease(cancelledID))
+          {
+            reject("cancelDeployment safety precondition failed");
+            break;
+          }
+
+          FailedDeploymentRecord failed = {};
+          failed.reason = request.reason;
+          failed.applicationID = request.applicationID;
+          failed.deploymentID = cancelledID;
+          failed.failedAtMs = Time::now<TimeResolution::ms>();
+          failed.hasTerminalReport = true;
+          failed.terminalReport = deployment->generateReport();
+          failed.terminalReport.state = DeploymentState::failed;
+          failed.hasOperatorCancellation = true;
+          failed.operationID = request.operationID;
+          failed.successorDeploymentID = successorID;
+          failed.cancellationPhase = CancelDeploymentPhase::accepted;
+          auto [failedIt, inserted] = failedDeployments.insert_or_assign(cancelledID, std::move(failed));
+          (void)inserted;
+          if (persistAndReplicateOperatorCancellation(failedIt->second) == false)
+          {
+            failedDeployments.erase(cancelledID);
+            reject("cancelDeployment durable acceptance failed");
+            break;
+          }
+          armFailedDeploymentCleaner();
+          spinApplicationFailed(deployment, "operator cancellation accepted"_ctv);
+          deployment->cancelUnhealthyStatelessForSuccessor();
+
+          response.success = true;
+          response.result = CancelDeploymentResult::accepted;
+          response.phase = failedIt->second.cancellationPhase;
+          response.durableGeneration = failedIt->second.cancellationGeneration;
+          String serializedResponse = {};
+          BitseryEngine::serialize(serializedResponse, response);
+          Message::construct(mothership->wBuffer, MothershipTopic::cancelDeployment, serializedResponse);
           break;
         }
       // this is very dangerous so we might not even want this code to be active

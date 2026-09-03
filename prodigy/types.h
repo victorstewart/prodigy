@@ -27,6 +27,84 @@ public:
   String failure; // string failure response
 };
 
+// This is deliberately not an application-wide destroy request.  The exact
+// application/version/successor triple is the authority for a recovery action.
+class CancelDeploymentRequest {
+public:
+  String applicationName;
+  uint16_t applicationID = 0;
+  uint64_t activeVersionID = 0;
+  uint64_t successorVersionID = 0;
+  String operationID;
+  String reason;
+};
+
+template <typename S>
+static void serialize(S&& serializer, CancelDeploymentRequest& request)
+{
+  serializer.text1b(request.applicationName, 128);
+  serializer.value2b(request.applicationID);
+  serializer.value8b(request.activeVersionID);
+  serializer.value8b(request.successorVersionID);
+  serializer.text1b(request.operationID, 36);
+  serializer.text1b(request.reason, 512);
+}
+
+class CancelDeploymentResponse : public MothershipResponse {
+public:
+  CancelDeploymentResult result = CancelDeploymentResult::rejected;
+  CancelDeploymentPhase phase = CancelDeploymentPhase::none;
+  String operationID;
+  uint16_t applicationID = 0;
+  uint64_t activeVersionID = 0;
+  uint64_t successorVersionID = 0;
+  uint64_t cancelledDeploymentID = 0;
+  uint64_t successorDeploymentID = 0;
+  uint64_t durableGeneration = 0;
+};
+
+template <typename S>
+static void serialize(S&& serializer, CancelDeploymentResponse& response)
+{
+  serializer.value1b(response.success);
+  serializer.text1b(response.failure, UINT32_MAX);
+  uint8_t result = uint8_t(response.result);
+  serializer.value1b(result);
+  response.result = CancelDeploymentResult(result);
+  uint8_t phase = uint8_t(response.phase);
+  serializer.value1b(phase);
+  response.phase = CancelDeploymentPhase(phase);
+  serializer.text1b(response.operationID, 36);
+  serializer.value2b(response.applicationID);
+  serializer.value8b(response.activeVersionID);
+  serializer.value8b(response.successorVersionID);
+  serializer.value8b(response.cancelledDeploymentID);
+  serializer.value8b(response.successorDeploymentID);
+  serializer.value8b(response.durableGeneration);
+}
+
+static inline bool prodigyCanonicalOperationUUID(const String& value)
+{
+  if (value.size() != 36)
+  {
+    return false;
+  }
+  for (uint32_t index = 0; index < value.size(); ++index)
+  {
+    const char c = value[index];
+    if (index == 8 || index == 13 || index == 18 || index == 23)
+    {
+      if (c != '-') return false;
+      continue;
+    }
+    if ((c < '0' || c > '9') && (c < 'a' || c > 'f'))
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
 template <typename S>
 static void serialize(S&& serializer, MothershipResponse& response)
 {
@@ -8163,6 +8241,29 @@ static void serialize(S&& serializer, FailedDeploymentRecordPayload& record)
   serializer.object(record.terminalReport);
 }
 
+class FailedDeploymentOperatorCancellationPayload {
+public:
+  FailedDeploymentRecordPayload failure;
+  String operationID;
+  uint64_t successorDeploymentID = 0;
+  CancelDeploymentPhase phase = CancelDeploymentPhase::none;
+  uint64_t durableGeneration = 0;
+  int64_t completedAtMs = 0;
+};
+
+template <typename S>
+static void serialize(S&& serializer, FailedDeploymentOperatorCancellationPayload& record)
+{
+  serializer.object(record.failure);
+  serializer.text1b(record.operationID, 36);
+  serializer.value8b(record.successorDeploymentID);
+  uint8_t phase = uint8_t(record.phase);
+  serializer.value1b(phase);
+  record.phase = CancelDeploymentPhase(phase);
+  serializer.value8b(record.durableGeneration);
+  serializer.value8b(record.completedAtMs);
+}
+
 class FailedDeploymentRecord {
 public:
 
@@ -8172,7 +8273,30 @@ public:
   int64_t failedAtMs = 0;
   bool hasTerminalReport = false;
   DeploymentStatusReport terminalReport;
+  bool hasOperatorCancellation = false;
+  String operationID;
+  uint64_t successorDeploymentID = 0;
+  CancelDeploymentPhase cancellationPhase = CancelDeploymentPhase::none;
+  uint64_t cancellationGeneration = 0;
+  int64_t cancellationCompletedAtMs = 0;
 };
+
+class DeploymentCancellationAcknowledgement {
+public:
+  String operationID;
+  uint64_t durableGeneration = 0;
+  uint128_t peerUUID = 0;
+  int64_t peerBootNs = 0;
+};
+
+template <typename S>
+static void serialize(S&& serializer, DeploymentCancellationAcknowledgement& acknowledgement)
+{
+  serializer.text1b(acknowledgement.operationID, 36);
+  serializer.value8b(acknowledgement.durableGeneration);
+  serializer.value16b(acknowledgement.peerUUID);
+  serializer.value8b(acknowledgement.peerBootNs);
+}
 
 template <typename S>
 static void serialize(S&& serializer, FailedDeploymentRecord& record)
@@ -8183,12 +8307,33 @@ static void serialize(S&& serializer, FailedDeploymentRecord& record)
   // the entire master-authority package.
   constexpr static char structuredPrefix[] = "PRODIGY_FAILED_DEPLOYMENT_REPORT_V1\0";
   constexpr static uint64_t structuredPrefixBytes = sizeof(structuredPrefix) - 1;
+  constexpr static char cancellationPrefix[] = "PRODIGY_OPERATOR_CANCEL_V1\0";
+  constexpr static uint64_t cancellationPrefixBytes = sizeof(cancellationPrefix) - 1;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
 
   String encoded = {};
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
-    if (record.hasTerminalReport)
+    if (record.hasOperatorCancellation)
+    {
+      FailedDeploymentOperatorCancellationPayload payload = {};
+      payload.failure.reason = record.reason;
+      payload.failure.applicationID = record.applicationID;
+      payload.failure.deploymentID = record.deploymentID;
+      payload.failure.failedAtMs = record.failedAtMs;
+      payload.failure.terminalReport = record.terminalReport;
+      payload.operationID = record.operationID;
+      payload.successorDeploymentID = record.successorDeploymentID;
+      payload.phase = record.cancellationPhase;
+      payload.durableGeneration = record.cancellationGeneration;
+      payload.completedAtMs = record.cancellationCompletedAtMs;
+
+      String serializedPayload = {};
+      BitseryEngine::serialize(serializedPayload, payload);
+      encoded.append(cancellationPrefix, cancellationPrefixBytes);
+      encoded.append(serializedPayload);
+    }
+    else if (record.hasTerminalReport)
     {
       FailedDeploymentRecordPayload payload = {};
       payload.reason = record.reason;
@@ -8213,6 +8358,36 @@ static void serialize(S&& serializer, FailedDeploymentRecord& record)
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
   {
     record = {};
+    if (encoded.size() >= cancellationPrefixBytes && memcmp(encoded.data(), cancellationPrefix, cancellationPrefixBytes) == 0)
+    {
+      String serializedPayload = encoded.substr(cancellationPrefixBytes, encoded.size() - cancellationPrefixBytes, Copy::no);
+      FailedDeploymentOperatorCancellationPayload payload = {};
+      if (BitseryEngine::deserializeSafe(serializedPayload, payload) &&
+          prodigyCanonicalOperationUUID(payload.operationID) &&
+          payload.failure.applicationID != 0 && payload.failure.deploymentID != 0 &&
+          payload.successorDeploymentID != 0 &&
+          uint16_t(payload.failure.deploymentID >> 48) == payload.failure.applicationID &&
+          uint16_t(payload.successorDeploymentID >> 48) == payload.failure.applicationID &&
+          payload.failure.deploymentID != payload.successorDeploymentID &&
+          payload.durableGeneration != 0 &&
+          uint8_t(payload.phase) >= uint8_t(CancelDeploymentPhase::accepted) &&
+          uint8_t(payload.phase) <= uint8_t(CancelDeploymentPhase::completed))
+      {
+        record.reason = std::move(payload.failure.reason);
+        record.applicationID = payload.failure.applicationID;
+        record.deploymentID = payload.failure.deploymentID;
+        record.failedAtMs = payload.failure.failedAtMs;
+        record.hasTerminalReport = true;
+        record.terminalReport = std::move(payload.failure.terminalReport);
+        record.hasOperatorCancellation = true;
+        record.operationID = std::move(payload.operationID);
+        record.successorDeploymentID = payload.successorDeploymentID;
+        record.cancellationPhase = payload.phase;
+        record.cancellationGeneration = payload.durableGeneration;
+        record.cancellationCompletedAtMs = payload.completedAtMs;
+        return;
+      }
+    }
     if (encoded.size() >= structuredPrefixBytes && memcmp(encoded.data(), structuredPrefix, structuredPrefixBytes) == 0)
     {
       String serializedPayload = encoded.substr(structuredPrefixBytes, encoded.size() - structuredPrefixBytes, Copy::no);

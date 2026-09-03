@@ -15699,6 +15699,136 @@ private:
     }
   }
 
+  void runCancelDeployment(int argc, char *argv[])
+  {
+    if (argc < 2)
+    {
+      basics_log("too few arguments. ex: cancelDeployment [target: local|clusterName|clusterUUID] [json]\n");
+      exit(EXIT_FAILURE);
+    }
+    if (!configureControlTarget(argv[0]))
+    {
+      exit(EXIT_FAILURE);
+    }
+
+    String json;
+    json.append(argv[1]);
+    json.need(simdjson::SIMDJSON_PADDING);
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    CancelDeploymentRequest request = {};
+    bool sawApplicationName = false;
+    bool sawApplicationID = false;
+    bool sawActiveVersionID = false;
+    bool sawSuccessorVersionID = false;
+    bool sawOperationID = false;
+    bool sawReason = false;
+    if (parser.parse(json.data(), json.size()).get(doc))
+    {
+      basics_log("invalid json for cancelDeployment\n");
+      exit(EXIT_FAILURE);
+    }
+    for (auto field : doc.get_object())
+    {
+      String key;
+      key.setInvariant(field.key.data(), field.key.size());
+      if (key.equal("applicationName"_ctv) || key.equal("operationID"_ctv) || key.equal("reason"_ctv))
+      {
+        if (field.value.type() != simdjson::dom::element_type::STRING)
+        {
+          basics_log("cancelDeployment.%s requires string\n", key.c_str());
+          exit(EXIT_FAILURE);
+        }
+        bool *seen = key.equal("applicationName"_ctv) ? &sawApplicationName
+                     : key.equal("operationID"_ctv) ? &sawOperationID
+                                                      : &sawReason;
+        if (*seen)
+        {
+          basics_log("cancelDeployment duplicate field %s\n", key.c_str());
+          exit(EXIT_FAILURE);
+        }
+        *seen = true;
+        if (key.equal("applicationName"_ctv)) request.applicationName.assign(field.value.get_c_str());
+        else if (key.equal("operationID"_ctv)) request.operationID.assign(field.value.get_c_str());
+        else request.reason.assign(field.value.get_c_str());
+      }
+      else if (key.equal("applicationID"_ctv) || key.equal("activeVersionID"_ctv) || key.equal("successorVersionID"_ctv))
+      {
+        uint64_t value = 0;
+        if ((field.value.type() != simdjson::dom::element_type::INT64 &&
+             field.value.type() != simdjson::dom::element_type::UINT64) ||
+            field.value.get(value) != simdjson::SUCCESS || value == 0)
+        {
+          basics_log("cancelDeployment.%s requires positive integer\n", key.c_str());
+          exit(EXIT_FAILURE);
+        }
+        bool *seen = key.equal("applicationID"_ctv) ? &sawApplicationID
+                     : key.equal("activeVersionID"_ctv) ? &sawActiveVersionID
+                                                          : &sawSuccessorVersionID;
+        if (*seen)
+        {
+          basics_log("cancelDeployment duplicate field %s\n", key.c_str());
+          exit(EXIT_FAILURE);
+        }
+        *seen = true;
+        if (key.equal("applicationID"_ctv))
+        {
+          if (value > UINT16_MAX) { basics_log("cancelDeployment.applicationID invalid\n"); exit(EXIT_FAILURE); }
+          request.applicationID = uint16_t(value);
+        }
+        else if (key.equal("activeVersionID"_ctv)) request.activeVersionID = value;
+        else request.successorVersionID = value;
+      }
+      else
+      {
+        basics_log("cancelDeployment invalid field\n");
+        exit(EXIT_FAILURE);
+      }
+    }
+    if (!sawApplicationName || !sawApplicationID || !sawActiveVersionID || !sawSuccessorVersionID ||
+        !sawOperationID || !sawReason || request.applicationName.size() == 0 || request.applicationName.size() > 128 || request.applicationID == 0 ||
+        request.activeVersionID == 0 || request.successorVersionID == 0 ||
+        prodigyCanonicalOperationUUID(request.operationID) == false ||
+        request.reason.size() == 0 || request.reason.size() > 512)
+    {
+      basics_log("cancelDeployment requires applicationName, applicationID, activeVersionID, successorVersionID, canonical operationID, and bounded reason\n");
+      exit(EXIT_FAILURE);
+    }
+    String serializedRequest = {};
+    BitseryEngine::serialize(serializedRequest, request);
+    Message::construct(socket.wBuffer, MothershipTopic::cancelDeployment, serializedRequest);
+    if (socket.send() == false)
+    {
+      exit(EXIT_FAILURE);
+    }
+    Message *message = socket.recvExpectedTopic(MothershipTopic::cancelDeployment, 4096);
+    if (message == nullptr)
+    {
+      String failure = socket.ioFailureDetail();
+      basics_log("cancelDeployment success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    String serializedResponse = {};
+    uint8_t *args = message->args;
+    Message::extractToStringView(args, serializedResponse);
+    CancelDeploymentResponse response = {};
+    if (args != message->terminal() || BitseryEngine::deserializeSafe(serializedResponse, response) == false)
+    {
+      basics_log("cancelDeployment success=0 failure=invalid response payload\n");
+      exit(EXIT_FAILURE);
+    }
+    basics_log("cancelDeployment success=%d result=%s phase=%s operationID=%s appID=%u activeVersionID=%llu successorVersionID=%llu cancelledDeploymentID=%llu successorDeploymentID=%llu durableGeneration=%llu failure=%s\n",
+               int(response.success), prodigyCancelDeploymentResultName(response.result),
+               prodigyCancelDeploymentPhaseName(response.phase),
+               response.operationID.c_str(), unsigned(response.applicationID),
+               (unsigned long long)response.activeVersionID,
+               (unsigned long long)response.successorVersionID,
+               (unsigned long long)response.cancelledDeploymentID,
+               (unsigned long long)response.successorDeploymentID,
+               (unsigned long long)response.durableGeneration, response.failure.c_str());
+    if (response.success == false) exit(EXIT_FAILURE);
+  }
+
   void runReserveApplicationID(int argc, char *argv[])
   {
     if (argc < 2)
@@ -17525,6 +17655,7 @@ public:
         {"acme-import-lineage",             &Mothership::runACMELineageImportHook          },
         {"acme-present-dns-01",             &Mothership::runACMEPresentDNS01ChallengeHook  },
         {"applicationReport",               &Mothership::runApplicationReport              },
+        {"cancelDeployment",                &Mothership::runCancelDeployment               },
         {"clusterReport",                   &Mothership::runClusterReport                  },
         {"containerLogs",                   &Mothership::runContainerLogs                  },
         {"createCluster",                   &Mothership::runCreateCluster                  },
@@ -17600,7 +17731,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultTestCluster, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, taskReport, containerLogs, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
+        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultTestCluster, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, taskReport, containerLogs, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }

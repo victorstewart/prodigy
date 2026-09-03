@@ -8288,6 +8288,11 @@ public:
     completeStatefulWorkerTopologyUpgradeIfReady();
 
     delete container;
+
+    if (state == DeploymentState::failed && containers.empty() && waitingOnContainers.empty())
+    {
+      thisBrain->operatorCancellationContainersTerminated(this);
+    }
   }
 
   void taskAttemptContainerDone(ContainerView *container)
@@ -9748,6 +9753,53 @@ public:
     next->deploy();
   }
 
+  // This is only entered after the Brain has durably accepted a narrowly
+  // version-scoped cancellation.  Unlike a normal roll-forward, the unhealthy
+  // non-serving target is fully gone before its waiting successor starts.
+  void cancelUnhealthyStatelessForSuccessor(void)
+  {
+    if (plan.isStateful || plan.config.type == ApplicationType::task || next == nullptr)
+    {
+      return;
+    }
+
+    state = DeploymentState::failed;
+    stateChangedAtMs = Time::now<TimeResolution::ms>();
+    Ring::queueCancelTimeout(&autoscaleTimer);
+    Ring::queueCancelTimeout(&canaryTimer);
+
+    if (containers.empty() == false)
+    {
+      Vector<ContainerView *> currentContainers;
+      currentContainers.reserve(containers.size());
+      for (ContainerView *container : containers)
+      {
+        currentContainers.push_back(container);
+      }
+      for (ContainerView *container : currentContainers)
+      {
+        if (container == nullptr || containers.contains(container) == false ||
+            container->state == ContainerState::destroyed ||
+            container->state == ContainerState::destroying ||
+            container->state == ContainerState::aboutToDestroy)
+        {
+          continue;
+        }
+        scheduleStatelessDestruction(container);
+      }
+
+      if (toSchedule.empty() == false)
+      {
+        schedule(nullptr);
+      }
+    }
+
+    if (containers.empty() && waitingOnContainers.empty())
+    {
+      thisBrain->operatorCancellationContainersTerminated(this);
+    }
+  }
+
   void deploy(void)
   {
     if (plan.isStateful)
@@ -10121,8 +10173,24 @@ inline uint32_t BrainBase::expireFailedDeployments(int64_t nowMs)
   Vector<uint64_t> expiredDeploymentIDs = {};
   for (const auto& [deploymentID, failed] : failedDeployments)
   {
-    if (failed.failedAtMs <= 0 ||
-        nowMs - failed.failedAtMs >= int64_t(prodigyBrainFailedDeploymentCleanerIntervalMs))
+    if (failed.hasOperatorCancellation && failed.cancellationPhase != CancelDeploymentPhase::completed)
+    {
+      continue;
+    }
+    const int64_t retentionMs = failed.hasOperatorCancellation
+                                    ? prodigyOperatorCancellationTombstoneRetentionMs
+                                    : int64_t(prodigyBrainFailedDeploymentCleanerIntervalMs);
+    const int64_t retainedAtMs = failed.hasOperatorCancellation
+                                     ? failed.cancellationCompletedAtMs
+                                     : failed.failedAtMs;
+    if (failed.hasOperatorCancellation && deployments.contains(deploymentID))
+    {
+      // A follower may retain a stale live view until it takes authority and
+      // reconciles the completed cancellation. Never discard the tombstone or
+      // its artifact while that live deployment object still exists.
+      continue;
+    }
+    if (retainedAtMs <= 0 || nowMs - retainedAtMs >= retentionMs)
     {
       expiredDeploymentIDs.push_back(deploymentID);
     }
@@ -10134,6 +10202,13 @@ inline uint32_t BrainBase::expireFailedDeployments(int64_t nowMs)
     if (deploymentIt != deployments.end() && deploymentIt->second != nullptr)
     {
       ApplicationDeployment *deployment = deploymentIt->second;
+      if (failedDeployments[deploymentID].hasOperatorCancellation)
+      {
+        // The cancelled deployment is unlinked before completion. A same-ID
+        // retry is not allowed to inherit or retire its durable tombstone.
+        failedDeployments.erase(deploymentID);
+        continue;
+      }
       if (deployment->state != DeploymentState::failed)
       {
         // A same-ID retry now owns this plan and image. Its deploy path normally

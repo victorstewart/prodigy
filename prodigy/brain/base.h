@@ -29,9 +29,11 @@ class MachineTicket;
 class Mesh;
 class Wormhole;
 
+constexpr inline int64_t prodigyOperatorCancellationTombstoneRetentionMs =
+    24LL * 60LL * 60LL * 1000LL;
+
 class BrainFailedDeploymentCleanerDispatcher final : public TimeoutDispatcher {
 public:
-
   using Callback = void (*)(void *, TimeoutPacket *);
 
   void *context = nullptr;
@@ -517,6 +519,10 @@ public:
   virtual void pushSpinApplicationProgressToMothership(ApplicationDeployment *deployment, const String& message) = 0;
   virtual void spinApplicationFailed(ApplicationDeployment *deployment, const String& message) = 0;
   virtual void spinApplicationFin(ApplicationDeployment *deployment) = 0;
+  virtual void operatorCancellationContainersTerminated(ApplicationDeployment *deployment)
+  {
+    (void)deployment;
+  }
   virtual bool persistLocalRuntimeState(void)
   {
     return true;
@@ -689,14 +695,24 @@ public:
     for (const auto& [deploymentID, failed] : failedDeployments)
     {
       (void)deploymentID;
-      if (failed.failedAtMs <= 0)
+      if (failed.hasOperatorCancellation && failed.cancellationPhase != CancelDeploymentPhase::completed)
+      {
+        continue;
+      }
+      const int64_t retentionMs = failed.hasOperatorCancellation
+                                      ? prodigyOperatorCancellationTombstoneRetentionMs
+                                      : int64_t(prodigyBrainFailedDeploymentCleanerIntervalMs);
+      const int64_t retainedAtMs = failed.hasOperatorCancellation
+                                       ? failed.cancellationCompletedAtMs
+                                       : failed.failedAtMs;
+      if (retainedAtMs <= 0)
       {
         nextDelayMs = 1;
         break;
       }
 
-      int64_t elapsedMs = nowMs - failed.failedAtMs;
-      int64_t remainingMs = int64_t(prodigyBrainFailedDeploymentCleanerIntervalMs) - elapsedMs;
+      int64_t elapsedMs = nowMs - retainedAtMs;
+      int64_t remainingMs = retentionMs - elapsedMs;
       if (remainingMs <= 0)
       {
         nextDelayMs = 1;

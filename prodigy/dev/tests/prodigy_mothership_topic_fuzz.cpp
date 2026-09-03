@@ -31,6 +31,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
       MothershipTopic::unregisterRoutableSubnet,
       MothershipTopic::spinApplication,
       MothershipTopic::destroyApplication,
+      MothershipTopic::cancelDeployment,
       MothershipTopic::pullApplicationReport,
       MothershipTopic::pullClusterReport,
       MothershipTopic::pullRoutableSubnets,

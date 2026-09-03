@@ -44,7 +44,10 @@ enum class MothershipTopic : uint16_t {
   importACMELineage,
   configureMothershipTunnelProvider,
   pullTaskReport,
-  pullContainerLogs
+  pullContainerLogs,
+  // Version-scoped recovery for a non-serving stateless rollout head.  Keep
+  // this appended: MothershipTopic is a wire enum.
+  cancelDeployment
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -111,6 +114,8 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "pullTaskReport";
     case MothershipTopic::pullContainerLogs:
       return "pullContainerLogs";
+    case MothershipTopic::cancelDeployment:
+      return "cancelDeployment";
   }
 
   return "unknown";
@@ -142,7 +147,10 @@ enum class BrainTopic : uint16_t {
   replicateContainerHealthy,
   replicateContainerRuntimeReady,
   replicateContainerRuntimeState,
-  replicateSystemContainerArtifact
+  replicateSystemContainerArtifact,
+  // Append-only durable operator-cancellation replication and acknowledgement.
+  replicateDeploymentCancellation,
+  acknowledgeDeploymentCancellation
 };
 
 enum class NeuronTopic : uint16_t {
@@ -269,6 +277,46 @@ enum class SpinApplicationResponseCode : uint8_t {
   failed,
   finished
 };
+
+enum class CancelDeploymentResult : uint8_t {
+  rejected = 0,
+  accepted = 1,
+  alreadyAccepted = 2,
+  completed = 3
+};
+
+enum class CancelDeploymentPhase : uint8_t {
+  none = 0,
+  accepted = 1,
+  containersTerminated = 2,
+  successorStarted = 3,
+  completed = 4
+};
+
+constexpr static const char *prodigyCancelDeploymentResultName(CancelDeploymentResult result)
+{
+  switch (result)
+  {
+    case CancelDeploymentResult::rejected: return "rejected";
+    case CancelDeploymentResult::accepted: return "accepted";
+    case CancelDeploymentResult::alreadyAccepted: return "alreadyAccepted";
+    case CancelDeploymentResult::completed: return "completed";
+  }
+  return "rejected";
+}
+
+constexpr static const char *prodigyCancelDeploymentPhaseName(CancelDeploymentPhase phase)
+{
+  switch (phase)
+  {
+    case CancelDeploymentPhase::none: return "none";
+    case CancelDeploymentPhase::accepted: return "accepted";
+    case CancelDeploymentPhase::containersTerminated: return "containersTerminated";
+    case CancelDeploymentPhase::successorStarted: return "successorStarted";
+    case CancelDeploymentPhase::completed: return "completed";
+  }
+  return "none";
+}
 
 enum class ContainerState : uint8_t {
   none = 0,

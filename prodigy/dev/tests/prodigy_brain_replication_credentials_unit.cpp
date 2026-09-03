@@ -17697,6 +17697,33 @@ static void testDeployingContainerFailureFailsDeployment(TestSuite& suite)
   suite.expect(restored.deployments.contains(expiredLiveDeploymentID) == false, "deploying_container_failure_retention_removes_live_failed_deployment");
   suite.expect(restored.deploymentsByApp.contains(expiredLiveFailure.applicationID) == false, "deploying_container_failure_retention_removes_live_failed_application");
   suite.expect(ContainerStore::contains(expiredLiveDeploymentID) == false, "deploying_container_failure_retention_removes_live_failed_image");
+
+  FailedDeploymentRecord incompleteCancellation = {};
+  incompleteCancellation.applicationID = 63'010;
+  incompleteCancellation.deploymentID = (uint64_t(incompleteCancellation.applicationID) << 48) | 11;
+  incompleteCancellation.failedAtMs = Time::now<TimeResolution::ms>() -
+                                      2 * int64_t(prodigyOperatorCancellationTombstoneRetentionMs);
+  incompleteCancellation.hasOperatorCancellation = true;
+  incompleteCancellation.operationID.assign("123e4567-e89b-42d3-a456-426614174000"_ctv);
+  incompleteCancellation.successorDeploymentID =
+      (uint64_t(incompleteCancellation.applicationID) << 48) | 12;
+  incompleteCancellation.cancellationPhase = CancelDeploymentPhase::containersTerminated;
+  incompleteCancellation.cancellationGeneration = 17;
+  restored.failedDeployments.insert_or_assign(incompleteCancellation.deploymentID,
+                                               incompleteCancellation);
+  suite.expect(restored.expireFailedDeployments(Time::now<TimeResolution::ms>()) == 0,
+               "operator_cancellation_incomplete_never_expires");
+  suite.expect(restored.failedDeployments.contains(incompleteCancellation.deploymentID),
+               "operator_cancellation_incomplete_tombstone_retained");
+
+  restored.failedDeployments[incompleteCancellation.deploymentID].cancellationPhase =
+      CancelDeploymentPhase::completed;
+  restored.failedDeployments[incompleteCancellation.deploymentID].cancellationCompletedAtMs =
+      Time::now<TimeResolution::ms>() - prodigyOperatorCancellationTombstoneRetentionMs;
+  suite.expect(restored.expireFailedDeployments(Time::now<TimeResolution::ms>()) == 1,
+               "operator_cancellation_completed_expires_after_tombstone_retention");
+  suite.expect(restored.failedDeployments.contains(incompleteCancellation.deploymentID) == false,
+               "operator_cancellation_completed_tombstone_removed");
   thisBrain = &brain;
 
   brain.failedDeployments.erase(deployment.plan.config.deploymentID());
@@ -20689,6 +20716,218 @@ static void testContainerNeuronListenerContract(TestSuite& suite)
   unsetenv("PRODIGY_NEURON_LISTENER_FD");
 }
 
+static bool issueCancelDeploymentForTest(TestBrain& brain,
+                                         Mothership& mothership,
+                                         const CancelDeploymentRequest& request,
+                                         CancelDeploymentResponse& response)
+{
+  mothership.wBuffer.clear();
+  CancelDeploymentRequest mutableRequest = request;
+  String serializedRequest = {};
+  BitseryEngine::serialize(serializedRequest, mutableRequest);
+  String messageBuffer = {};
+  brain.mothershipHandler(
+      &mothership,
+      buildMothershipMessage(messageBuffer, MothershipTopic::cancelDeployment, serializedRequest));
+  if (mothership.wBuffer.size() < sizeof(Message))
+  {
+    return false;
+  }
+  Message *message = reinterpret_cast<Message *>(mothership.wBuffer.data());
+  if (MothershipTopic(message->topic) != MothershipTopic::cancelDeployment)
+  {
+    return false;
+  }
+  String serializedResponse = {};
+  uint8_t *args = message->args;
+  Message::extractToStringView(args, serializedResponse);
+  return args == message->terminal() &&
+         BitseryEngine::deserializeSafe(serializedResponse, response);
+}
+
+static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
+{
+  TestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+
+  BrainBase *previousBrain = thisBrain;
+  thisBrain = &brain;
+
+  constexpr uint16_t applicationID = 63'111;
+  constexpr uint64_t activeVersionID = 111;
+  constexpr uint64_t successorVersionID = 112;
+  const uint64_t activeDeploymentID = (uint64_t(applicationID) << 48) | activeVersionID;
+  const uint64_t successorDeploymentID = (uint64_t(applicationID) << 48) | successorVersionID;
+  String applicationName = "operator-cancel-test"_ctv;
+  brain.reservedApplicationIDsByName.insert_or_assign(applicationName, applicationID);
+  brain.reservedApplicationNamesByID.insert_or_assign(applicationID, applicationName);
+
+  ApplicationDeployment *active = new ApplicationDeployment();
+  ApplicationDeployment *successor = new ApplicationDeployment();
+  active->plan = makeDeploymentPlan(applicationID, activeVersionID);
+  active->plan.stateless.nBase = 0;
+  active->plan.canaryCount = 0;
+  active->state = DeploymentState::deploying;
+  successor->plan = makeDeploymentPlan(applicationID, successorVersionID);
+  successor->plan.stateless.nBase = 0;
+  successor->plan.canaryCount = 0;
+  successor->state = DeploymentState::waitingToDeploy;
+  active->next = successor;
+  successor->previous = active;
+  brain.deployments.insert_or_assign(activeDeploymentID, active);
+  brain.deployments.insert_or_assign(successorDeploymentID, successor);
+  brain.deploymentsByApp.insert_or_assign(applicationID, successor);
+  brain.deploymentPlans.insert_or_assign(activeDeploymentID, active->plan);
+  brain.deploymentPlans.insert_or_assign(successorDeploymentID, successor->plan);
+
+  CancelDeploymentRequest request = {};
+  request.applicationName = applicationName;
+  request.applicationID = applicationID;
+  request.activeVersionID = activeVersionID;
+  request.successorVersionID = successorVersionID;
+  request.operationID.assign("123e4567-e89b-42d3-a456-426614174000"_ctv);
+  request.reason.assign("bounded test repair"_ctv);
+
+  Mothership mothership = {};
+  CancelDeploymentResponse response = {};
+  suite.expect(issueCancelDeploymentForTest(brain, mothership, request, response),
+               "operator_cancellation_response_decodes");
+  suite.expect(response.success && response.result == CancelDeploymentResult::accepted,
+               "operator_cancellation_accepts_exact_unhealthy_chain");
+  suite.expect(response.cancelledDeploymentID == activeDeploymentID &&
+                   response.successorDeploymentID == successorDeploymentID,
+               "operator_cancellation_response_derives_exact_deployments");
+  auto failedIt = brain.failedDeployments.find(activeDeploymentID);
+  suite.expect(failedIt != brain.failedDeployments.end() &&
+                   failedIt->second.hasOperatorCancellation &&
+                   failedIt->second.cancellationPhase == CancelDeploymentPhase::completed &&
+                   failedIt->second.cancellationGeneration > 0,
+               "operator_cancellation_completes_durable_phases");
+  suite.expect(brain.deployments.contains(activeDeploymentID) == false &&
+                   brain.deploymentsByApp[applicationID] == successor,
+               "operator_cancellation_relinks_exact_successor_once");
+
+  CancelDeploymentResponse retryResponse = {};
+  suite.expect(issueCancelDeploymentForTest(brain, mothership, request, retryResponse),
+               "operator_cancellation_retry_response_decodes");
+  suite.expect(retryResponse.success && retryResponse.result == CancelDeploymentResult::completed &&
+                   retryResponse.durableGeneration == failedIt->second.cancellationGeneration,
+               "operator_cancellation_retry_is_idempotent");
+
+  CancelDeploymentRequest conflict = request;
+  conflict.operationID.assign("123e4567-e89b-42d3-a456-426614174001"_ctv);
+  CancelDeploymentResponse conflictResponse = {};
+  suite.expect(issueCancelDeploymentForTest(brain, mothership, conflict, conflictResponse),
+               "operator_cancellation_conflict_response_decodes");
+  suite.expect(conflictResponse.success == false &&
+                   conflictResponse.result == CancelDeploymentResult::rejected,
+               "operator_cancellation_rejects_conflicting_operation");
+
+  TestBrain follower = {};
+  follower.iaas = &iaas;
+  BrainView masterPeer = {};
+  authorizeMasterPeerForTest(follower, masterPeer, 41, uint128_t(0xabc1), 701);
+  FailedDeploymentRecord replicatedRecord = failedIt->second;
+  String serializedRecord = {};
+  BitseryEngine::serialize(serializedRecord, replicatedRecord);
+  String replicationBuffer = {};
+  follower.brainHandler(
+      &masterPeer,
+      buildBrainMessage(replicationBuffer, BrainTopic::replicateDeploymentCancellation,
+                        serializedRecord));
+  suite.expect(follower.failedDeployments.contains(activeDeploymentID) &&
+                   follower.failedDeployments[activeDeploymentID].cancellationPhase ==
+                       CancelDeploymentPhase::completed,
+               "operator_cancellation_replication_applies_completed_tombstone");
+
+  FailedDeploymentRecord staleRecord = replicatedRecord;
+  staleRecord.cancellationPhase = CancelDeploymentPhase::accepted;
+  staleRecord.cancellationGeneration -= 1;
+  serializedRecord.clear();
+  BitseryEngine::serialize(serializedRecord, staleRecord);
+  follower.brainHandler(
+      &masterPeer,
+      buildBrainMessage(replicationBuffer, BrainTopic::replicateDeploymentCancellation,
+                        serializedRecord));
+  suite.expect(follower.failedDeployments[activeDeploymentID].cancellationPhase ==
+                       CancelDeploymentPhase::completed &&
+                   follower.failedDeployments[activeDeploymentID].cancellationGeneration ==
+                       replicatedRecord.cancellationGeneration,
+               "operator_cancellation_replication_suppresses_stale_phase");
+
+  TestBrain recovering = {};
+  recovering.iaas = &iaas;
+  recovering.weAreMaster = true;
+  recovering.noMasterYet = false;
+  ApplicationDeployment *recoveringActive = new ApplicationDeployment();
+  ApplicationDeployment *recoveringSuccessor = new ApplicationDeployment();
+  recoveringActive->plan = makeDeploymentPlan(applicationID, activeVersionID);
+  recoveringActive->plan.stateless.nBase = 0;
+  recoveringActive->plan.canaryCount = 0;
+  recoveringActive->state = DeploymentState::failed;
+  recoveringSuccessor->plan = makeDeploymentPlan(applicationID, successorVersionID);
+  recoveringSuccessor->plan.stateless.nBase = 0;
+  recoveringSuccessor->plan.canaryCount = 0;
+  recoveringSuccessor->state = DeploymentState::waitingToDeploy;
+  recoveringActive->next = recoveringSuccessor;
+  recoveringSuccessor->previous = recoveringActive;
+  recovering.deployments.insert_or_assign(activeDeploymentID, recoveringActive);
+  recovering.deployments.insert_or_assign(successorDeploymentID, recoveringSuccessor);
+  recovering.deploymentsByApp.insert_or_assign(applicationID, recoveringSuccessor);
+  FailedDeploymentRecord acceptedRecord = replicatedRecord;
+  acceptedRecord.cancellationPhase = CancelDeploymentPhase::accepted;
+  acceptedRecord.cancellationCompletedAtMs = 0;
+  recovering.failedDeployments.insert_or_assign(activeDeploymentID, acceptedRecord);
+  thisBrain = &recovering;
+  recovering.resumeOperatorCancellations();
+  suite.expect(recovering.failedDeployments[activeDeploymentID].cancellationPhase ==
+                       CancelDeploymentPhase::completed &&
+                   recovering.deployments.contains(activeDeploymentID) == false &&
+                   recovering.deploymentsByApp[applicationID] == recoveringSuccessor,
+               "operator_cancellation_restart_resumes_forward_exactly_once");
+  recovering.failedDeployments.erase(activeDeploymentID);
+  recovering.deploymentsByApp.erase(applicationID);
+  recovering.deployments.erase(successorDeploymentID);
+  delete recoveringSuccessor;
+
+  ApplicationDeployment *completedActive = new ApplicationDeployment();
+  ApplicationDeployment *completedSuccessor = new ApplicationDeployment();
+  completedActive->plan = makeDeploymentPlan(applicationID, activeVersionID);
+  completedActive->plan.stateless.nBase = 0;
+  completedActive->plan.canaryCount = 0;
+  completedActive->state = DeploymentState::failed;
+  completedSuccessor->plan = makeDeploymentPlan(applicationID, successorVersionID);
+  completedSuccessor->plan.stateless.nBase = 0;
+  completedSuccessor->plan.canaryCount = 0;
+  completedSuccessor->state = DeploymentState::waitingToDeploy;
+  completedActive->next = completedSuccessor;
+  completedSuccessor->previous = completedActive;
+  recovering.deployments.insert_or_assign(activeDeploymentID, completedActive);
+  recovering.deployments.insert_or_assign(successorDeploymentID, completedSuccessor);
+  recovering.deploymentsByApp.insert_or_assign(applicationID, completedSuccessor);
+  recovering.failedDeployments.insert_or_assign(activeDeploymentID, replicatedRecord);
+  recovering.resumeOperatorCancellations();
+  suite.expect(recovering.deployments.contains(activeDeploymentID) == false &&
+                   recovering.deploymentsByApp[applicationID] == completedSuccessor,
+               "operator_cancellation_completed_follower_takeover_removes_stale_active");
+  recovering.failedDeployments.erase(activeDeploymentID);
+  recovering.deploymentsByApp.erase(applicationID);
+  recovering.deployments.erase(successorDeploymentID);
+  delete completedSuccessor;
+  thisBrain = &brain;
+
+  brain.failedDeployments.erase(activeDeploymentID);
+  brain.deploymentPlans.erase(activeDeploymentID);
+  brain.deploymentPlans.erase(successorDeploymentID);
+  brain.deploymentsByApp.erase(applicationID);
+  brain.deployments.erase(successorDeploymentID);
+  delete successor;
+  thisBrain = previousBrain;
+}
+
 int main(void)
 {
   TestSuite suite;
@@ -20712,6 +20951,15 @@ int main(void)
   {
     Ring::createRing(8, 8, 32, 32, -1, -1, 0);
     createdRing = true;
+  }
+  if (std::getenv("PRODIGY_TEST_OPERATOR_CANCELLATION_ONLY") != nullptr)
+  {
+    testBoundedOperatorDeploymentCancellation(suite);
+    if (createdRing)
+    {
+      Ring::shutdownForExec();
+    }
+    return suite.failed == 0 ? 0 : 1;
   }
   if (std::getenv("PRODIGY_TEST_ACME_DNS01_LIFECYCLE") != nullptr)
   {
@@ -20906,6 +21154,7 @@ int main(void)
   testBrainNeuronStateUploadHealthyContainerClearsWaiters(suite);
   testCanaryRollbackPersistsTerminalApplicationReport(suite);
   testDeployingContainerFailureFailsDeployment(suite);
+  testBoundedOperatorDeploymentCancellation(suite);
   testBrainNeuronStateUploadRestoresOnlyActiveMeshServices(suite);
   testBrainNeuronStateUploadRuntimeReadyFalseClearsStatefulTopologyBarrier(suite);
   testBrainNeuronStateUploadRequiresMatchingAssignedFragmentForMachineRuntimeReady(suite);
