@@ -15796,6 +15796,12 @@ private:
     }
     String serializedRequest = {};
     BitseryEngine::serialize(serializedRequest, request);
+    if (socket.ensureConnected() == false)
+    {
+      String failure = socket.connectFailureDetail();
+      basics_log("cancelDeployment success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
     Message::construct(socket.wBuffer, MothershipTopic::cancelDeployment, serializedRequest);
     if (socket.send() == false)
     {
