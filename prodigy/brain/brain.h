@@ -10321,6 +10321,22 @@ public:
       {
         continue;
       }
+      bool heldByOperatorCancellation = false;
+      for (const auto& [failedDeploymentID, failed] : failedDeployments)
+      {
+        (void)failedDeploymentID;
+        if (failed.hasOperatorCancellation &&
+            failed.cancellationPhase != CancelDeploymentPhase::completed &&
+            failed.successorDeploymentID == head->plan.config.deploymentID())
+        {
+          heldByOperatorCancellation = true;
+          break;
+        }
+      }
+      if (heldByOperatorCancellation)
+      {
+        continue;
+      }
       if (deploymentDNSReady(head->plan.config.deploymentID()) == false)
       {
         deploymentsWaitingForDNS.insert(head->plan.config.deploymentID());
@@ -24482,6 +24498,23 @@ public:
           if (existingIt != failedDeployments.end())
           {
             const FailedDeploymentRecord& existing = existingIt->second;
+            const bool sameCancellation =
+                existing.hasOperatorCancellation &&
+                existing.operationID.equals(incoming.operationID) &&
+                existing.successorDeploymentID == incoming.successorDeploymentID;
+            if (sameCancellation && existing.cancellationGeneration > incoming.cancellationGeneration &&
+                existing.cancellationPhase == CancelDeploymentPhase::completed &&
+                incoming.cancellationPhase == CancelDeploymentPhase::accepted)
+            {
+              publishOperatorCancellationDevMarker(existing, "reached", "stale-replication-suppressed");
+            }
+            else if (sameCancellation &&
+                     existing.cancellationGeneration == incoming.cancellationGeneration &&
+                     existing.cancellationPhase == CancelDeploymentPhase::completed &&
+                     incoming.cancellationPhase == CancelDeploymentPhase::completed)
+            {
+              publishOperatorCancellationDevMarker(existing, "reached", "duplicate-completed-replication");
+            }
             if (existing.hasOperatorCancellation == false ||
                 existing.operationID.equals(incoming.operationID) == false ||
                 existing.successorDeploymentID != incoming.successorDeploymentID ||
@@ -26369,6 +26402,213 @@ public:
     return false;
   }
 
+  static const char *operatorCancellationDevPhaseName(CancelDeploymentPhase phase)
+  {
+    switch (phase)
+    {
+      case CancelDeploymentPhase::accepted: return "accepted";
+      case CancelDeploymentPhase::containersTerminated: return "containers-terminated";
+      case CancelDeploymentPhase::successorStarted: return "successor-started";
+      case CancelDeploymentPhase::completed: return "completed";
+      case CancelDeploymentPhase::none: break;
+    }
+    return nullptr;
+  }
+
+  bool operatorCancellationDevTestRoot(char (&root)[PATH_MAX]) const
+  {
+    root[0] = '\0';
+    if (BrainBase::controlPlaneDevModeEnabled() == false)
+    {
+      return false;
+    }
+
+    constexpr static char requiredRoot[] =
+        "/mnt/prodigy-vdc-workspace/cancel-deployment-test";
+    const char *configuredRoot = std::getenv("PRODIGY_DEV_CANCEL_TEST_DIR");
+    if (configuredRoot == nullptr || std::strcmp(configuredRoot, requiredRoot) != 0)
+    {
+      return false;
+    }
+
+    struct stat rootStat = {};
+    if (::lstat(configuredRoot, &rootStat) != 0 || S_ISDIR(rootStat.st_mode) == false ||
+        S_ISLNK(rootStat.st_mode))
+    {
+      return false;
+    }
+
+    std::memcpy(root, requiredRoot, sizeof(requiredRoot));
+    return true;
+  }
+
+  bool operatorCancellationDevPath(char (&path)[PATH_MAX],
+                                   const FailedDeploymentRecord& record,
+                                   const char *kind,
+                                   const char *detail = nullptr) const
+  {
+    char root[PATH_MAX] = {};
+    if (operatorCancellationDevTestRoot(root) == false || kind == nullptr ||
+        prodigyCanonicalOperationUUID(record.operationID) == false)
+    {
+      return false;
+    }
+
+    const int operationIDBytes = int(record.operationID.size());
+    const int written = detail
+                            ? std::snprintf(path, sizeof(path), "%s/%.*s.%s.%s", root,
+                                            operationIDBytes, record.operationID.data(), kind, detail)
+                            : std::snprintf(path, sizeof(path), "%s/%.*s.%s", root,
+                                            operationIDBytes, record.operationID.data(), kind);
+    return written > 0 && size_t(written) < sizeof(path);
+  }
+
+  bool operatorCancellationDevRegularFileExists(const char *path) const
+  {
+    struct stat fileStat = {};
+    return path != nullptr && ::lstat(path, &fileStat) == 0 &&
+           S_ISREG(fileStat.st_mode) && S_ISLNK(fileStat.st_mode) == false;
+  }
+
+  void publishOperatorCancellationDevMarker(const FailedDeploymentRecord& record,
+                                            const char *kind,
+                                            const char *detail = nullptr) const
+  {
+    char markerPath[PATH_MAX] = {};
+    if (operatorCancellationDevPath(markerPath, record, kind, detail) == false)
+    {
+      return;
+    }
+
+    char temporaryPath[PATH_MAX] = {};
+    const int temporaryLength = std::snprintf(
+        temporaryPath, sizeof(temporaryPath), "%s.tmp.%ld.%llu", markerPath,
+        long(::getpid()), (unsigned long long)record.cancellationGeneration);
+    if (temporaryLength <= 0 || size_t(temporaryLength) >= sizeof(temporaryPath))
+    {
+      return;
+    }
+
+    const int markerFD = ::open(temporaryPath,
+                                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                                S_IRUSR | S_IWUSR);
+    if (markerFD < 0)
+    {
+      return;
+    }
+
+    char payload[128] = {};
+    const int payloadLength = std::snprintf(
+        payload, sizeof(payload), "generation=%llu\nphase=%u\n",
+        (unsigned long long)record.cancellationGeneration,
+        unsigned(record.cancellationPhase));
+    bool complete = payloadLength > 0 && size_t(payloadLength) < sizeof(payload);
+    if (complete)
+    {
+      ssize_t offset = 0;
+      while (offset < payloadLength)
+      {
+        const ssize_t written = ::write(markerFD, payload + offset,
+                                        size_t(payloadLength - offset));
+        if (written <= 0)
+        {
+          complete = false;
+          break;
+        }
+        offset += written;
+      }
+    }
+    if (complete)
+    {
+      complete = (::fsync(markerFD) == 0);
+    }
+    ::close(markerFD);
+
+    if (complete)
+    {
+      // link(2) publishes without replacing an earlier marker from another
+      // Brain generation; either result is sufficient evidence for the test.
+      if (::link(temporaryPath, markerPath) == 0 || errno == EEXIST)
+      {
+        char root[PATH_MAX] = {};
+        if (operatorCancellationDevTestRoot(root))
+        {
+          const int rootFD = ::open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+          if (rootFD >= 0)
+          {
+            (void)::fsync(rootFD);
+            ::close(rootFD);
+          }
+        }
+      }
+    }
+    (void)::unlink(temporaryPath);
+  }
+
+  bool consumeOperatorCancellationDevControl(const FailedDeploymentRecord& record,
+                                             const char *action) const
+  {
+    char controlPath[PATH_MAX] = {};
+    if (operatorCancellationDevPath(controlPath, record, action) == false ||
+        operatorCancellationDevRegularFileExists(controlPath) == false)
+    {
+      return false;
+    }
+
+    char claimPath[PATH_MAX] = {};
+    const int claimLength = std::snprintf(claimPath, sizeof(claimPath), "%s.claimed",
+                                          controlPath);
+    if (claimLength <= 0 || size_t(claimLength) >= sizeof(claimPath) ||
+        ::mkdir(claimPath, S_IRWXU) != 0)
+    {
+      return false;
+    }
+
+    (void)::unlink(controlPath);
+    publishOperatorCancellationDevMarker(record, "reached", action);
+    return true;
+  }
+
+  bool operatorCancellationDevCrashBarrier(const FailedDeploymentRecord& record) const
+  {
+    const char *phaseName = operatorCancellationDevPhaseName(record.cancellationPhase);
+    if (phaseName == nullptr)
+    {
+      return false;
+    }
+
+    char pausePath[PATH_MAX] = {};
+    char releasePath[PATH_MAX] = {};
+    const bool paused = operatorCancellationDevPath(pausePath, record, "pause", phaseName) &&
+                        operatorCancellationDevPath(releasePath, record, "release", phaseName) &&
+                        operatorCancellationDevRegularFileExists(pausePath) &&
+                        operatorCancellationDevRegularFileExists(releasePath) == false;
+    publishOperatorCancellationDevMarker(record, paused ? "paused" : "reached", phaseName);
+    return paused;
+  }
+
+  void injectOperatorCancellationDevReplicationReorder(FailedDeploymentRecord& record)
+  {
+    if (record.cancellationPhase != CancelDeploymentPhase::completed ||
+        record.cancellationGeneration == 0 ||
+        consumeOperatorCancellationDevControl(record, "inject-replication-reorder") == false)
+    {
+      return;
+    }
+
+    FailedDeploymentRecord stale = record;
+    stale.cancellationPhase = CancelDeploymentPhase::accepted;
+    stale.cancellationGeneration -= 1;
+    stale.cancellationCompletedAtMs = 0;
+    String serialized = {};
+    BitseryEngine::serialize(serialized, stale);
+    queueBrainReplication(BrainTopic::replicateDeploymentCancellation, serialized);
+
+    serialized.clear();
+    BitseryEngine::serialize(serialized, record);
+    queueBrainReplication(BrainTopic::replicateDeploymentCancellation, serialized);
+  }
+
   void finishOperatorCancellationAfterContainers(uint64_t deploymentID)
   {
     auto failedIt = failedDeployments.find(deploymentID);
@@ -26378,6 +26618,12 @@ public:
     }
     FailedDeploymentRecord& record = failedIt->second;
     const bool alreadyCompleted = record.cancellationPhase == CancelDeploymentPhase::completed;
+
+    if (record.cancellationPhase != CancelDeploymentPhase::none &&
+        operatorCancellationDevCrashBarrier(record))
+    {
+      return;
+    }
 
     ApplicationDeployment *deployment = nullptr;
     if (auto deploymentIt = deployments.find(deploymentID); deploymentIt != deployments.end())
@@ -26389,9 +26635,26 @@ public:
     {
       successor = successorIt->second;
     }
-    if (successor == nullptr || (deployment != nullptr && deployment->containers.empty() == false))
+    if (successor == nullptr ||
+        (deployment != nullptr &&
+         (deployment->containers.empty() == false ||
+          deployment->waitingOnContainers.empty() == false)))
     {
       return;
+    }
+
+    if (record.cancellationPhase == CancelDeploymentPhase::accepted)
+    {
+      if (consumeOperatorCancellationDevControl(record, "drop-kill-ack"))
+      {
+        return;
+      }
+      char holdPath[PATH_MAX] = {};
+      if (operatorCancellationDevPath(holdPath, record, "hold-after-drop-kill-ack") &&
+          operatorCancellationDevRegularFileExists(holdPath))
+      {
+        return;
+      }
     }
 
     if (uint8_t(record.cancellationPhase) < uint8_t(CancelDeploymentPhase::containersTerminated))
@@ -26403,6 +26666,10 @@ public:
         record.cancellationPhase = previousPhase;
         return;
       }
+      if (operatorCancellationDevCrashBarrier(record))
+      {
+        return;
+      }
     }
     if (uint8_t(record.cancellationPhase) < uint8_t(CancelDeploymentPhase::successorStarted))
     {
@@ -26411,6 +26678,10 @@ public:
       if (persistAndReplicateOperatorCancellation(record) == false)
       {
         record.cancellationPhase = previousPhase;
+        return;
+      }
+      if (operatorCancellationDevCrashBarrier(record))
+      {
         return;
       }
     }
@@ -26448,7 +26719,10 @@ public:
     {
       record.cancellationPhase = previousPhase;
       record.cancellationCompletedAtMs = 0;
+      return;
     }
+    injectOperatorCancellationDevReplicationReorder(record);
+    (void)operatorCancellationDevCrashBarrier(record);
   }
 
   void operatorCancellationContainersTerminated(ApplicationDeployment *deployment) override
@@ -26458,6 +26732,20 @@ public:
       return;
     }
     finishOperatorCancellationAfterContainers(deployment->plan.config.deploymentID());
+  }
+
+  void operatorCancellationDestructionReissued(ApplicationDeployment *deployment,
+                                               ContainerView *container) override
+  {
+    if (deployment == nullptr || container == nullptr)
+    {
+      return;
+    }
+    auto failedIt = failedDeployments.find(deployment->plan.config.deploymentID());
+    if (failedIt != failedDeployments.end() && failedIt->second.hasOperatorCancellation)
+    {
+      publishOperatorCancellationDevMarker(failedIt->second, "reached", "kill-reissued");
+    }
   }
 
   void resumeOperatorCancellations(void)
@@ -26489,6 +26777,10 @@ public:
         continue;
       }
       ApplicationDeployment *deployment = deploymentIt->second;
+      if (failedIt->second.cancellationPhase == CancelDeploymentPhase::accepted)
+      {
+        (void)deployment->recoverAcceptedOperatorCancellationTransition();
+      }
       if (deployment->operatorCancellationTransitionIsSafe())
       {
         deployment->cancelUnhealthyStatelessForSuccessor();
@@ -29001,6 +29293,11 @@ public:
               reject("cancelDeployment conflicts with existing terminal record");
               break;
             }
+            if (failed.cancellationPhase != CancelDeploymentPhase::completed)
+            {
+              recoverDeploymentsAfterNeuronState();
+              resumeOperatorCancellations();
+            }
             response.success = true;
             response.phase = failed.cancellationPhase;
             response.durableGeneration = failed.cancellationGeneration;
@@ -29069,14 +29366,24 @@ public:
             reject("cancelDeployment durable acceptance failed");
             break;
           }
+          const bool cancellationDevPaused =
+              operatorCancellationDevCrashBarrier(failedIt->second);
           armFailedDeploymentCleaner();
-          spinApplicationFailed(deployment, "operator cancellation accepted"_ctv);
-          deployment->cancelUnhealthyStatelessForSuccessor();
+          if (cancellationDevPaused == false)
+          {
+            spinApplicationFailed(deployment, "operator cancellation accepted"_ctv);
+            deployment->cancelUnhealthyStatelessForSuccessor();
+          }
 
           response.success = true;
           response.result = CancelDeploymentResult::accepted;
           response.phase = failedIt->second.cancellationPhase;
           response.durableGeneration = failedIt->second.cancellationGeneration;
+          if (consumeOperatorCancellationDevControl(failedIt->second, "drop-response"))
+          {
+            queueCloseIfActive(mothership, "cancel-deployment-dev-drop-response");
+            break;
+          }
           String serializedResponse = {};
           BitseryEngine::serialize(serializedResponse, response);
           Message::construct(mothership->wBuffer, MothershipTopic::cancelDeployment, serializedResponse);
@@ -29881,9 +30188,37 @@ public:
 
           // if a canary failed and we rolled back a deployment to previous, it's possible
           // we would've issued canary kills and then destroyed the deployment before we get a reply
+          ContainerView *container = nullptr;
           if (auto it = containers.find(containerUUID); it != containers.end())
           {
-            ContainerView *container = it->second;
+            container = it->second;
+          }
+          else
+          {
+            for (const auto& [deploymentID, deployment] : deployments)
+            {
+              (void)deploymentID;
+              if (deployment == nullptr)
+              {
+                continue;
+              }
+              for (const auto& [waitingContainer, waitState] : deployment->waitingOnContainers)
+              {
+                if (waitingContainer != nullptr && waitState == ContainerState::destroyed &&
+                    waitingContainer->uuid == containerUUID)
+                {
+                  container = waitingContainer;
+                  break;
+                }
+              }
+              if (container != nullptr)
+              {
+                break;
+              }
+            }
+          }
+          if (container != nullptr)
+          {
 
             Machine *machine = container->machine;
 

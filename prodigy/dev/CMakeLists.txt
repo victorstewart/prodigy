@@ -433,6 +433,8 @@ set(PRODIGY_PINGPONG_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-pingpong.Discom
 set(PRODIGY_PINGPONG_CONTAINER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-pingpong.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
 set(PRODIGY_PINGPONG_ISOLATION_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-pingpong-isolation.DiscombobuFile")
 set(PRODIGY_PINGPONG_ISOLATION_CONTAINER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-pingpong-isolation.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
+set(PRODIGY_PINGPONG_UNREADY_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-pingpong-unready.DiscombobuFile")
+set(PRODIGY_PINGPONG_UNREADY_CONTAINER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-pingpong-unready.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
 configure_file(
    "${PRODIGY_ROOT}/prodigy/dns/DiscombobuFile.in"
    "${PRODIGY_DNS_RESOLVER_DISCOMBOBUFILE}"
@@ -448,6 +450,12 @@ set(PRODIGY_PINGPONG_PROBE_BINARY prodigy_pingpong_container_isolation)
 configure_file(
    "${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong.DiscombobuFile.in"
    "${PRODIGY_PINGPONG_ISOLATION_DISCOMBOBUFILE}"
+   @ONLY
+)
+set(PRODIGY_PINGPONG_PROBE_BINARY prodigy_pingpong_container_unready)
+configure_file(
+   "${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong.DiscombobuFile.in"
+   "${PRODIGY_PINGPONG_UNREADY_DISCOMBOBUFILE}"
    @ONLY
 )
 configure_file(
@@ -501,6 +509,7 @@ add_executable(prodigy_ready_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/ready_c
 add_executable(prodigy_task_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/task_probe_container.cpp)
 add_executable(prodigy_pingpong_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
 add_executable(prodigy_pingpong_container_isolation ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
+add_executable(prodigy_pingpong_container_unready ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
 add_executable(prodigy_pingpong_container_alt ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
 add_executable(prodigy_pingpong_container_noport ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
 add_executable(prodigy_pingpong_container_crash ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
@@ -515,6 +524,7 @@ set(
    prodigy_task_probe_container
    prodigy_pingpong_container
    prodigy_pingpong_container_isolation
+   prodigy_pingpong_container_unready
    prodigy_pingpong_container_alt
    prodigy_pingpong_container_noport
    prodigy_pingpong_container_crash
@@ -805,6 +815,7 @@ target_compile_definitions(prodigy_mothership_restart_persistence_unit PUBLIC PR
 target_compile_definitions(prodigy_mothership_unix_connect_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
 target_compile_definitions(prodigy_pingpong_container PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_pingpong_container_isolation PUBLIC PRODIGY_DEBUG=1 PRODIGY_PINGPONG_REQUIRE_RUNTIME_ISOLATION=1)
+target_compile_definitions(prodigy_pingpong_container_unready PUBLIC PRODIGY_DEBUG=1 PRODIGY_PINGPONG_REQUIRE_RUNTIME_ISOLATION=1 PRODIGY_PINGPONG_SUPPRESS_READY=1 PRODIGY_PINGPONG_IGNORE_SHUTDOWN=1)
 target_compile_definitions(prodigy_pingpong_container_alt PUBLIC PRODIGY_DEBUG=1 PRODIGY_PINGPONG_DEFAULT_PORT=19091)
 target_compile_definitions(prodigy_pingpong_container_noport PUBLIC PRODIGY_DEBUG=1 PRODIGY_PINGPONG_DISABLE_SERVER=1)
 target_compile_definitions(prodigy_pingpong_container_crash PUBLIC PRODIGY_DEBUG=1 PRODIGY_PINGPONG_CRASH_ON_START=1)
@@ -843,6 +854,7 @@ target_compile_options(prodigy_dns_resolver PUBLIC -O2)
 target_compile_options(prodigy_task_probe_container PUBLIC -O2)
 target_compile_options(prodigy_pingpong_container PUBLIC -O2)
 target_compile_options(prodigy_pingpong_container_isolation PUBLIC -O2)
+target_compile_options(prodigy_pingpong_container_unready PUBLIC -O2)
 target_compile_options(prodigy_pingpong_container_alt PUBLIC -O2)
 target_compile_options(prodigy_pingpong_container_noport PUBLIC -O2)
 target_compile_options(prodigy_pingpong_container_crash PUBLIC -O2)
@@ -1125,6 +1137,30 @@ add_custom_command(
 add_custom_target(prodigy_pingpong_isolation_container_artifact ALL DEPENDS "${PRODIGY_PINGPONG_ISOLATION_CONTAINER_ARTIFACT}")
 
 add_custom_command(
+   OUTPUT "${PRODIGY_PINGPONG_UNREADY_CONTAINER_ARTIFACT}"
+   COMMAND "${CMAKE_COMMAND}" -E env
+           CARGO_TARGET_DIR=${DISCOMBOBULATOR_CARGO_TARGET_DIR}
+           cargo run --quiet --manifest-path "${DISCOMBOBULATOR_MANIFEST}" --
+           build
+           --file "${PRODIGY_PINGPONG_UNREADY_DISCOMBOBUFILE}"
+           --context "probe=$<TARGET_FILE_DIR:prodigy_pingpong_container_unready>"
+           --context "ebpf=${CMAKE_BINARY_DIR}"
+           --output "${PRODIGY_PINGPONG_UNREADY_CONTAINER_ARTIFACT}"
+           --kind app
+   DEPENDS prodigy_pingpong_container_unready
+           container_egress_router
+           container_ingress_router
+           "${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong.DiscombobuFile.in"
+           "${PRODIGY_PINGPONG_UNREADY_DISCOMBOBUFILE}"
+           "${DISCOMBOBULATOR_MANIFEST}"
+           "${DISCOMBOBULATOR_CARGO_LOCK}"
+           ${DISCOMBOBULATOR_SOURCE_FILES}
+   COMMENT "Building Prodigy deliberately-unready ping-pong app container"
+   VERBATIM
+)
+add_custom_target(prodigy_pingpong_unready_container_artifact ALL DEPENDS "${PRODIGY_PINGPONG_UNREADY_CONTAINER_ARTIFACT}")
+
+add_custom_command(
    OUTPUT "${PRODIGY_BUNDLE_OUTPUT}"
    COMMAND "${CMAKE_COMMAND}" -E env
            CARGO_TARGET_DIR=${DISCOMBOBULATOR_CARGO_TARGET_DIR}
@@ -1191,6 +1227,7 @@ add_dependencies(prodigy_bundle prodigy_bundle_sha256)
 add_dependencies(prodigy_bundle_artifact_unit prodigy_bundle prodigy_bundle_sha256)
 add_dependencies(prodigy_pingpong_container_artifact prodigy_bundle)
 add_dependencies(prodigy_pingpong_isolation_container_artifact prodigy_bundle)
+add_dependencies(prodigy_pingpong_unready_container_artifact prodigy_bundle)
 add_dependencies(prodigy_mothership_unix_connect_unit prodigy_mothership_tunnel_provider)
 add_dependencies(prodigy_mothership_cluster_report_unit mothership)
 add_dependencies(prodigy_mothership_restart_persistence_unit mothership prodigy_bundle prodigy_bundle_sha256)
@@ -1313,6 +1350,12 @@ if (PROJECT_ENABLE_TESTS)
       NAME prodigy_dev_pingpong_deploy_smoke
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_pingpong_deploy_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${PRODIGY_PINGPONG_CONTAINER_ARTIFACT}
    )
+
+   add_test(
+      NAME prodigy_dev_cancel_deployment_integration
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_cancel_deployment_integration.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${PRODIGY_PINGPONG_ISOLATION_CONTAINER_ARTIFACT} ${PRODIGY_PINGPONG_UNREADY_CONTAINER_ARTIFACT}
+   )
+   set_tests_properties(prodigy_dev_cancel_deployment_integration PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800 RUN_SERIAL TRUE)
 
    add_test(
       NAME prodigy_dev_runtime_isolation_smoke
@@ -1495,6 +1538,7 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    set_tests_properties(prodigy_discombobulator_build_smoke PROPERTIES TIMEOUT 1800)
    set(_prodigy_optional_skip_test_candidates
       prodigy_dev_pingpong_deploy_smoke
+      prodigy_dev_cancel_deployment_integration
       prodigy_dev_runtime_isolation_smoke
       prodigy_dev_whitehole_fake_ipv4_smoke
       prodigy_dev_whitehole_host_ipv4_smoke
@@ -1541,6 +1585,7 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       prodigy_dev_master_failure_matrix_full
       prodigy_dev_master_upgrade_sim
       prodigy_dev_pingpong_deploy_smoke
+      prodigy_dev_cancel_deployment_integration
       prodigy_dev_runtime_isolation_smoke
       prodigy_dev_sdk_mesh_e2e_matrix_smoke
       prodigy_dev_whitehole_fake_ipv4_smoke

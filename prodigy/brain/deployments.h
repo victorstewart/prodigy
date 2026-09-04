@@ -9787,6 +9787,34 @@ public:
     return true;
   }
 
+  bool recoverAcceptedOperatorCancellationTransition(void)
+  {
+    if (state != DeploymentState::none || plan.isStateful ||
+        plan.config.type == ApplicationType::task || next == nullptr ||
+        containers.empty() || waitingOnContainers.empty() == false ||
+        waitingOnCompactions || canaryStack != nullptr ||
+        currentlyExecutingWork != nullptr || toSchedule.empty() == false ||
+        schedulingStack.execution != nullptr ||
+        schedulingStack.waiters.empty() == false || nSuspended != 0)
+    {
+      return false;
+    }
+    for (ContainerView *container : containers)
+    {
+      if (container == nullptr || container->deploymentID != plan.config.deploymentID() ||
+          container->machine == nullptr || container->state == ContainerState::healthy ||
+          container->state == ContainerState::aboutToDestroy ||
+          container->state == ContainerState::destroying ||
+          container->state == ContainerState::destroyed)
+      {
+        return false;
+      }
+    }
+    state = DeploymentState::deploying;
+    stateChangedAtMs = Time::now<TimeResolution::ms>();
+    return true;
+  }
+
   bool operatorCancellationDestructionIsInFlight(void) const
   {
     if (state != DeploymentState::failed || containers.empty() == false ||
@@ -9825,6 +9853,7 @@ public:
     {
       (void)waitState;
       queueSend(container->machine, NeuronTopic::killContainer, container->uuid);
+      thisBrain->operatorCancellationDestructionReissued(this, container);
     }
   }
 

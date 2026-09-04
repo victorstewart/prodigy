@@ -54,6 +54,14 @@
 #define PRODIGY_PINGPONG_REQUIRE_RUNTIME_ISOLATION 0
 #endif
 
+#ifndef PRODIGY_PINGPONG_SUPPRESS_READY
+#define PRODIGY_PINGPONG_SUPPRESS_READY 0
+#endif
+
+#ifndef PRODIGY_PINGPONG_IGNORE_SHUTDOWN
+#define PRODIGY_PINGPONG_IGNORE_SHUTDOWN 0
+#endif
+
 #if PRODIGY_PINGPONG_REQUIRE_RUNTIME_ISOLATION == 1
 static bool pingPongRuntimeIsolationReady(void)
 {
@@ -1250,6 +1258,9 @@ private:
 
   void signalReadyAndSeedMetricOnce(void)
   {
+#if PRODIGY_PINGPONG_SUPPRESS_READY == 1
+    return;
+#endif
     if (neuronHub == nullptr)
     {
       return;
@@ -1297,6 +1308,9 @@ public:
 
   void beginShutdown(void) override
   {
+#if PRODIGY_PINGPONG_IGNORE_SHUTDOWN == 1
+    return;
+#endif
     running.store(false);
     server.stop();
   }

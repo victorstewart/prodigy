@@ -523,6 +523,12 @@ public:
   {
     (void)deployment;
   }
+  virtual void operatorCancellationDestructionReissued(ApplicationDeployment *deployment,
+                                                       ContainerView *container)
+  {
+    (void)deployment;
+    (void)container;
+  }
   virtual bool persistLocalRuntimeState(void)
   {
     return true;

@@ -4229,11 +4229,7 @@ public:
           }
           else if (brain)
           {
-            Message::construct(brain->wBuffer, NeuronTopic::killContainer, containerUUID);
-            if (streamIsActive(brain))
-            {
-              Ring::queueSend(brain);
-            }
+            queueContainerKillAck(containerUUID);
           }
 
           break;

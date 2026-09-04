@@ -56,6 +56,10 @@ run_machine()
       "PRODIGY_CRASH_REPORT_PATH=/root/prodigy-crashreport.txt"
       "PRODIGY_STATE_DB=/containers/prodigy.state"
    )
+   if [[ "${PRODIGY_DEV_CANCEL_TEST_DIR:-}" == "/mnt/prodigy-vdc-workspace/cancel-deployment-test" ]]
+   then
+      environment+=("PRODIGY_DEV_CANCEL_TEST_DIR=/mnt/prodigy-vdc-workspace/cancel-deployment-test")
+   fi
    [[ -z "${storage_mounts}" ]] || environment+=("PRODIGY_DEV_CONTAINER_STORAGE_MOUNTS=${storage_mounts}")
    if [[ -n "${fake_ingress}" ]]
    then
