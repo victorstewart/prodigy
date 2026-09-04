@@ -28072,12 +28072,26 @@ public:
           Message::extractToStringView(args, newBundle);
 
           MothershipResponse response = {};
-          int written = Filesystem::openWriteAtClose(-1, prodigyStagedBundlePath(), newBundle);
-          if (written < 0 || uint64_t(written) != newBundle.size())
+          // The current bundle transition protocol reaches Brain peers only.
+          // Reject before staging: otherwise a one-Brain cluster reports
+          // success while its worker Neurons retain their previous binary.
+          for (Machine *machine : machines)
           {
-            response.failure.snprintf<"failed to stage update bundle bytes={itoa} expected={itoa}"_ctv>(
-                int64_t(written),
-                uint64_t(newBundle.size()));
+            if (machine != nullptr && machine->isBrain == false)
+            {
+              response.failure.assign("worker-only machine bundle updates are unsupported; refusing a partial cluster upgrade"_ctv);
+              break;
+            }
+          }
+          if (response.failure.empty())
+          {
+            int written = Filesystem::openWriteAtClose(-1, prodigyStagedBundlePath(), newBundle);
+            if (written < 0 || uint64_t(written) != newBundle.size())
+            {
+              response.failure.snprintf<"failed to stage update bundle bytes={itoa} expected={itoa}"_ctv>(
+                  int64_t(written),
+                  uint64_t(newBundle.size()));
+            }
           }
 
           uint32_t expectedPeerEchos = 0;

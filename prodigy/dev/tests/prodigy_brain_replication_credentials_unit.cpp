@@ -8964,6 +8964,50 @@ static void testUpdateProdigyRespondsBeforeSingleBrainTransition(TestSuite& suit
   restoreStagedBundle();
 }
 
+static void testUpdateProdigyRejectsUnsupportedWorkerTopology(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+  TestBrain brain = {};
+  brain.nBrains = 1;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  Machine worker = {};
+  worker.uuid = 0x7711;
+  worker.isBrain = false;
+  brain.machines.insert(&worker);
+  Mothership mothership = {};
+  mothership.isFixedFile = true;
+  mothership.fslot = 42;
+  brain.mothership = &mothership;
+  brain.activeMotherships.insert(&mothership);
+
+  String previous;
+  String path = prodigyStagedBundlePath();
+  const bool existed = prodigyFileReadable(path);
+  if (existed) Filesystem::openReadAtClose(-1, path, previous);
+  String buffer;
+  String bundle = "must-not-stage-partial-upgrade"_ctv;
+  brain.mothershipHandler(&mothership,
+      buildMothershipMessage(buffer, MothershipTopic::updateProdigy, bundle));
+  auto *message = reinterpret_cast<Message *>(mothership.wBuffer.data());
+  uint8_t *args = message->args;
+  String serialized;
+  Message::extractToStringView(args, serialized);
+  MothershipResponse response;
+  suite.expect(BitseryEngine::deserializeSafe(serialized, response) && !response.success,
+               "update_prodigy_workers_reject_partial_rollout");
+  suite.expect(!brain.updateSelfTransitionAfterMothershipAck && brain.transitionToNewBundleCalls == 0,
+               "update_prodigy_workers_do_not_transition_master");
+  String after;
+  if (prodigyFileReadable(path)) Filesystem::openReadAtClose(-1, path, after);
+  suite.expect(prodigyFileReadable(path) == existed && after == previous,
+               "update_prodigy_workers_preserve_staged_rollback_bundle");
+  if (existed) Filesystem::openWriteAtClose(-1, path, previous);
+  else ::unlink(path.c_str());
+  brain.activeMotherships.erase(&mothership);
+  brain.machines.erase(&worker);
+}
+
 static void testPersistentMasterAuthorityPackageRestore(TestSuite& suite)
 {
   TestBrain source;
@@ -20982,6 +21026,12 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
 int main(void)
 {
   TestSuite suite;
+  if (std::getenv("PRODIGY_TEST_BUNDLE_UPDATE_ONLY") != nullptr)
+  {
+    testUpdateProdigyRespondsBeforeSingleBrainTransition(suite);
+    testUpdateProdigyRejectsUnsupportedWorkerTopology(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
   if (std::getenv("PRODIGY_TEST_TLS_RESUMPTION_ACK_STABILITY") != nullptr)
   {
     testTlsResumptionRotationAckCoverage(suite);
@@ -21107,6 +21157,7 @@ int main(void)
   testMaybeRelinquishMasterSelectsLowestPeerKey(suite);
   testUpdateSelfFinalRelinquishPersistsDesignatedHandoff(suite);
   testUpdateProdigyRespondsBeforeSingleBrainTransition(suite);
+  testUpdateProdigyRejectsUnsupportedWorkerTopology(suite);
   testPersistentMasterAuthorityPackageRestore(suite);
   testResumePendingAddMachinesOperations(suite);
   testResumePendingAddMachinesRefreshesProvisionalCreatedMachine(suite);
