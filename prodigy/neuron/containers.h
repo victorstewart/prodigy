@@ -1741,6 +1741,14 @@ public:
   {
     killedOnPurpose = true;
 
+    // A Brain may safely reissue killContainer after a lost acknowledgement.
+    // Keep the original deadline and ownership rather than leaking timers and
+    // indefinitely extending an uncooperative process's lifetime.
+    if (killSwitch != nullptr)
+    {
+      return;
+    }
+
     killSwitch = new TimeoutPacket();
     killSwitch->setTimeoutMs(plan.stopTimeoutSeconds() * 1000);
 
@@ -1754,6 +1762,11 @@ public:
 
   void stop(void)
   {
+    if (killedOnPurpose)
+    {
+      return;
+    }
+
     // there's no advantage sending it a signal... which is a dumb 1 dimensional kill signal
     // since the signal will get handled through the same event loop as socket messages. so
     // we might as well just send a complex message

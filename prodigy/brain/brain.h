@@ -95,7 +95,8 @@ enum class BrainTimeoutFlags : uint64_t {
   spotDecomissionChecker,
   dnsReconcileRetry,
   machineRetirementRecheck,
-  wormholeRuntimeAckDeadline
+  wormholeRuntimeAckDeadline,
+  operatorCancellationContinuation
 };
 
 static inline bool brainAddCertificateSubjectAltNames(X509 *cert, const Vector<String>& dnsSans, const Vector<IPAddress>& ipSans)
@@ -1104,6 +1105,9 @@ public:
   TimeoutPacket dnsReconcileRetry;
   bool dnsReconcileRetryInstalled = false;
   bool dnsReconcileRetryArmed = false;
+  TimeoutPacket operatorCancellationContinuation;
+  bool operatorCancellationContinuationInstalled = false;
+  bool operatorCancellationContinuationArmed = false;
   uint32_t dnsReconcileFailureCount = 0;
   enum class PendingDNSOperationKind : uint8_t
   {
@@ -19975,6 +19979,12 @@ public:
           delete packet;
           break;
         }
+      case BrainTimeoutFlags::operatorCancellationContinuation:
+        {
+          operatorCancellationContinuationArmed = false;
+          resumeOperatorCancellations();
+          break;
+        }
       case BrainTimeoutFlags::ignition:
         {
           ignited = true;
@@ -26725,13 +26735,40 @@ public:
     (void)operatorCancellationDevCrashBarrier(record);
   }
 
+  void armOperatorCancellationContinuation(void)
+  {
+    if (operatorCancellationContinuationArmed || weAreMaster == false ||
+        RingDispatcher::dispatcher == nullptr || Ring::getRingFD() <= 0)
+    {
+      return;
+    }
+    if (operatorCancellationContinuationInstalled == false)
+    {
+      operatorCancellationContinuation.flags =
+          uint64_t(BrainTimeoutFlags::operatorCancellationContinuation);
+      operatorCancellationContinuation.dispatcher = this;
+      RingDispatcher::installMultiplexee(&operatorCancellationContinuation, this);
+      operatorCancellationContinuationInstalled = true;
+    }
+
+    // A Neuron kill acknowledgement is dispatched from the cancelled
+    // deployment's own scheduling callback.  Deleting that deployment and
+    // starting its successor inline can strand a Brain-side ContainerView
+    // before the spinContainer frame reaches Neuron.  Resume on the next Ring
+    // turn, after the acknowledgement callback and scheduling coroutine have
+    // both unwound.
+    operatorCancellationContinuation.setTimeoutMs(1);
+    operatorCancellationContinuationArmed = true;
+    Ring::queueTimeout(&operatorCancellationContinuation);
+  }
+
   void operatorCancellationContainersTerminated(ApplicationDeployment *deployment) override
   {
     if (deployment == nullptr)
     {
       return;
     }
-    finishOperatorCancellationAfterContainers(deployment->plan.config.deploymentID());
+    armOperatorCancellationContinuation();
   }
 
   void operatorCancellationDestructionReissued(ApplicationDeployment *deployment,

@@ -16776,6 +16776,12 @@ static void testNeuronHandlerKillContainerStopsContainerAndEchoesBrain(TestSuite
   String buffer = {};
   Message *message = buildNeuronMessage(buffer, NeuronTopic::killContainer, container->plan.uuid);
   neuron.neuronHandler(message);
+  TimeoutPacket *firstKillSwitch = container->killSwitch;
+
+  String duplicateBuffer = {};
+  Message *duplicate = buildNeuronMessage(
+      duplicateBuffer, NeuronTopic::killContainer, container->plan.uuid);
+  neuron.neuronHandler(duplicate);
 
   uint32_t stopFrames = 0;
   forEachMessageInBuffer(container->wBuffer, [&](Message *frame) {
@@ -16800,6 +16806,8 @@ static void testNeuronHandlerKillContainerStopsContainerAndEchoesBrain(TestSuite
 
   suite.expect(stopFrames == 1, "neuron_kill_container_queues_stop_frame");
   suite.expect(container->killSwitch != nullptr, "neuron_kill_container_arms_kill_switch");
+  suite.expect(container->killSwitch == firstKillSwitch,
+               "neuron_kill_container_duplicate_preserves_original_deadline");
   suite.expect(container->pendingKillAckToBrain, "neuron_kill_container_marks_pending_brain_ack");
   suite.expect(echoFrames == 0, "neuron_kill_container_defers_brain_ack_until_destroy");
   suite.expect(echoedContainerUUID == 0, "neuron_kill_container_no_immediate_brain_ack_uuid");
@@ -20840,6 +20848,9 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
   suite.expect(response.cancelledDeploymentID == activeDeploymentID &&
                    response.successorDeploymentID == successorDeploymentID,
                "operator_cancellation_response_derives_exact_deployments");
+  // Production continues from the Neuron acknowledgement on the next Ring
+  // turn. Drive that deferred owner explicitly in this synchronous fixture.
+  brain.resumeOperatorCancellations();
   auto failedIt = brain.failedDeployments.find(activeDeploymentID);
   suite.expect(failedIt != brain.failedDeployments.end() &&
                    failedIt->second.hasOperatorCancellation &&

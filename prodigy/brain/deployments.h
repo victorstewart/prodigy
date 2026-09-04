@@ -4988,6 +4988,10 @@ private:
 
   bool isDecommissioning(void) const // it's possible the new deployment has to wait for this to complete work... and it won't be marked as decomissioning until after that?
   {
+    if (operatorCancellationOwnsTransition)
+    {
+      return false;
+    }
     if (next)
     {
       switch (next->state)
@@ -7502,6 +7506,9 @@ public:
 
   ApplicationDeployment *previous = nullptr;
   ApplicationDeployment *next = nullptr;
+  // A durable operator cancellation, not normal roll-forward, owns unlinking
+  // this deployment and starting its specifically named successor.
+  bool operatorCancellationOwnsTransition = false;
 
   bytell_hash_map<uint32_t, ContainerView *> masterForShardGroup; // only for stateful + !allMasters
 
@@ -9812,6 +9819,7 @@ public:
     }
     state = DeploymentState::deploying;
     stateChangedAtMs = Time::now<TimeResolution::ms>();
+    operatorCancellationOwnsTransition = true;
     return true;
   }
 
@@ -9865,6 +9873,7 @@ public:
       return;
     }
 
+    operatorCancellationOwnsTransition = true;
     state = DeploymentState::failed;
     stateChangedAtMs = Time::now<TimeResolution::ms>();
     Ring::queueCancelTimeout(&autoscaleTimer);

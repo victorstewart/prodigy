@@ -78,7 +78,7 @@ bundle_sha256="${bundle}.sha256"
 
 if [[ -z "${scenario}" ]]
 then
-   for scenario_name in accepted containersTerminated successorStarted completed
+   for scenario_name in noRestart accepted containersTerminated successorStarted completed
    do
       "${BASH_SOURCE[0]}" "${prodigy_bin}" "${mothership_bin}" \
          "${container_artifact}" "${unready_container_artifact}" "${scenario_name}"
@@ -87,7 +87,7 @@ then
    exit 0
 fi
 case "${scenario}" in
-   accepted|containersTerminated|successorStarted|completed) ;;
+   noRestart|accepted|containersTerminated|successorStarted|completed) ;;
    *) fail "unknown cancellation integration scenario: ${scenario}" ;;
 esac
 
@@ -261,11 +261,13 @@ write_plan()
    local application_id="$2"
    local version_id="$3"
    local healthy_delay_ms="$4"
+   local killable_seconds="${5:-90}"
    jq -n \
       --arg architecture "${architecture}" \
       --argjson applicationID "${application_id}" \
       --argjson versionID "${version_id}" \
-      --argjson healthyDelayMs "${healthy_delay_ms}" '
+      --argjson healthyDelayMs "${healthy_delay_ms}" \
+      --argjson killableSeconds "${killable_seconds}" '
       {
          config:{
             type:"ApplicationType::stateless",
@@ -280,7 +282,7 @@ write_plan()
             nLogicalCores:1,
             msTilHealthy:$healthyDelayMs,
             sTilHealthcheck:60,
-            sTilKillable:90
+            sTilKillable:$killableSeconds
          },
          useHostNetworkNamespace:false,
          minimumSubscriberCapacity:1024,
@@ -370,7 +372,8 @@ wait_successor_complete()
    do
       if application_report "${application_name}" "${output}" &&
          deployment_field_equals "${output}" "${successor_version}" nHealthy 1 &&
-         deployment_field_equals "${output}" "${successor_version}" nDeployed 1
+         deployment_field_equals "${output}" "${successor_version}" nDeployed 1 &&
+         deployment_field_equals "${output}" "${successor_version}" state DeploymentState::running
       then
          return 0
       fi
@@ -406,7 +409,9 @@ run_scenario()
 
    local active_plan="${task_root}/${phase}.active.plan.json"
    local successor_plan="${task_root}/${phase}.successor.plan.json"
-   write_plan "${active_plan}" "${application_id}" "${active_version}" 30000
+   # The unready fixture deliberately ignores graceful stop. Keep the real
+   # Neuron hard-kill/ack path while bounding every fault-injection scenario.
+   write_plan "${active_plan}" "${application_id}" "${active_version}" 30000 1
    write_plan "${successor_plan}" "${application_id}" "${successor_version}" 1000
 
    run_mothership deploy "${cluster_name}" "$(jq -c . "${active_plan}")" "${unready_container_artifact}" \
@@ -432,11 +437,14 @@ run_scenario()
    wait_exact_chain "${application_name}" "${active_version}" "${successor_version}" \
       "${scenario_dir}/chain.report.log" || fail "${phase}: exact active/successor chain was not observed"
 
+   local control_root="${workspace}/cancel-deployment-test"
    local phase_token="${phase}"
    [[ "${phase_token}" != containersTerminated ]] || phase_token=containers-terminated
    [[ "${phase_token}" != successorStarted ]] || phase_token=successor-started
-   local control_root="${workspace}/cancel-deployment-test"
-   : >"${control_root}/${operation_id}.pause.${phase_token}"
+   if [[ "${phase}" != noRestart ]]
+   then
+      : >"${control_root}/${operation_id}.pause.${phase_token}"
+   fi
    if [[ "${phase}" == accepted ]]
    then
       : >"${control_root}/${operation_id}.drop-response"
@@ -477,32 +485,35 @@ run_scenario()
       [[ "${first_status}" -eq 0 ]] || fail "${phase}: cancellation request failed"
    fi
 
-   local paused_marker="${control_root}/${operation_id}.paused.${phase_token}"
-   wait_marker "${paused_marker}" || fail "${phase}: durable phase was not held at its crash barrier"
-   if [[ "${phase}" == completed ]]
+   if [[ "${phase}" != noRestart ]]
    then
-      wait_marker "${control_root}/${operation_id}.reached.inject-replication-reorder" ||
-         fail "completed: stale and duplicate replication injection was not consumed"
-      wait_marker "${control_root}/${operation_id}.reached.stale-replication-suppressed" ||
-         fail "completed: a follower did not suppress the injected stale accepted phase"
-      wait_marker "${control_root}/${operation_id}.reached.duplicate-completed-replication" ||
-         fail "completed: a follower did not receive the duplicate completed phase"
-   fi
-   local paused_cancel="${scenario_dir}/cancel-paused.log"
-   run_mothership cancelDeployment "${cluster_name}" "${cancel_request}" >"${paused_cancel}" 2>&1 ||
-      fail "${phase}: idempotent query failed while the phase barrier was held"
-   rg -q "phase=${phase}" "${paused_cancel}" ||
-      fail "${phase}: durable phase advanced while its barrier was held"
-   if [[ "${phase}" == accepted ]]
-   then
-      : >"${control_root}/${operation_id}.release.${phase_token}"
-      wait_marker "${control_root}/${operation_id}.reached.drop-kill-ack" ||
-         fail "accepted: first kill acknowledgement was not deliberately dropped"
-      crash_current_master "accepted-phase"
-      rm -f "${control_root}/${operation_id}.hold-after-drop-kill-ack"
-   else
-      crash_current_master "${phase}-phase"
-      : >"${control_root}/${operation_id}.release.${phase_token}"
+      local paused_marker="${control_root}/${operation_id}.paused.${phase_token}"
+      wait_marker "${paused_marker}" || fail "${phase}: durable phase was not held at its crash barrier"
+      if [[ "${phase}" == completed ]]
+      then
+         wait_marker "${control_root}/${operation_id}.reached.inject-replication-reorder" ||
+            fail "completed: stale and duplicate replication injection was not consumed"
+         wait_marker "${control_root}/${operation_id}.reached.stale-replication-suppressed" ||
+            fail "completed: a follower did not suppress the injected stale accepted phase"
+         wait_marker "${control_root}/${operation_id}.reached.duplicate-completed-replication" ||
+            fail "completed: a follower did not receive the duplicate completed phase"
+      fi
+      local paused_cancel="${scenario_dir}/cancel-paused.log"
+      run_mothership cancelDeployment "${cluster_name}" "${cancel_request}" >"${paused_cancel}" 2>&1 ||
+         fail "${phase}: idempotent query failed while the phase barrier was held"
+      rg -q "phase=${phase}" "${paused_cancel}" ||
+         fail "${phase}: durable phase advanced while its barrier was held"
+      if [[ "${phase}" == accepted ]]
+      then
+         : >"${control_root}/${operation_id}.release.${phase_token}"
+         wait_marker "${control_root}/${operation_id}.reached.drop-kill-ack" ||
+            fail "accepted: first kill acknowledgement was not deliberately dropped"
+         crash_current_master "accepted-phase"
+         rm -f "${control_root}/${operation_id}.hold-after-drop-kill-ack"
+      else
+         crash_current_master "${phase}-phase"
+         : >"${control_root}/${operation_id}.release.${phase_token}"
+      fi
    fi
 
    local final_cancel="${scenario_dir}/cancel-completed-retry.log"
@@ -533,6 +544,7 @@ run_scenario()
 }
 
 case "${scenario}" in
+   noRestart) run_scenario noRestart 4100 ;;
    accepted) run_scenario accepted 4101 ;;
    containersTerminated) run_scenario containersTerminated 4102 ;;
    successorStarted) run_scenario successorStarted 4103 ;;
