@@ -1026,6 +1026,9 @@ public:
   bool pendingKillAckToBrain = false;
   bool pendingDestroy = false;
   bool restartAfterClose = false;
+  TimeoutPacket *restartTimer = nullptr;
+  int64_t lastRestartFailureMs = 0;
+  uint32_t restartFailureStreak = 0;
   bool waitidPending = false;
   bool destroyCloseCompleted = false;
   bool failedArtifactsPreserved = false;
@@ -3303,6 +3306,58 @@ private:
   }
 
 public:
+
+  static String boundedFailureReport(const siginfo_t& infop, int terminalSignal, const String& report, const String& standardError)
+  {
+    // The Brain stores at most 256 report bytes. Keep the termination identity,
+    // beginning of the report, and the end of stderr (where crash PCs land).
+    String bounded = {};
+    bounded.snprintf<"termination=si_code {itoa} si_status {itoa} signal {itoa}\nreport-head:\n"_ctv>(
+        int(infop.si_code), int(infop.si_status), terminalSignal);
+    constexpr uint64_t maximumWireReportBytes = 256;
+    constexpr uint64_t stderrTailBytes = 112;
+    constexpr uint64_t stderrLabelBytes = 14;
+    uint64_t remainingAfterHeader = maximumWireReportBytes > bounded.size()
+                                        ? maximumWireReportBytes - bounded.size()
+                                        : 0;
+    uint64_t headBudget = remainingAfterHeader > stderrLabelBytes + stderrTailBytes
+                              ? remainingAfterHeader - stderrLabelBytes - stderrTailBytes
+                              : 0;
+    uint64_t headBytes = std::min<uint64_t>(report.size(), headBudget);
+    bounded.append(report.substr(0, headBytes, Copy::no));
+    bounded.append("\nstderr-tail:\n"_ctv);
+    uint64_t tailBudget = maximumWireReportBytes > bounded.size()
+                              ? maximumWireReportBytes - bounded.size()
+                              : 0;
+    uint64_t tailBytes = std::min<uint64_t>(
+        standardError.size(), std::min<uint64_t>(stderrTailBytes, tailBudget));
+    if (tailBytes > 0)
+    {
+      bounded.append(standardError.substr(standardError.size() - tailBytes, tailBytes, Copy::no));
+    }
+    if (bounded.size() > maximumWireReportBytes)
+    {
+      bounded.assign(bounded.substr(0, maximumWireReportBytes, Copy::yes));
+    }
+    return bounded;
+  }
+
+  static uint32_t failedContainerRestartDelayMs(
+      uint32_t priorStreak,
+      int64_t lastFailureMs,
+      int64_t failureTimeMs,
+      uint32_t& nextStreak)
+  {
+    constexpr int64_t resetAfterMs = 10 * 60 * 1000;
+    constexpr uint32_t maximumDelayMs = 30 * 1000;
+    if (lastFailureMs <= 0 || failureTimeMs - lastFailureMs >= resetAfterMs)
+    {
+      priorStreak = 0;
+    }
+    nextStreak = priorStreak + 1;
+    uint32_t exponent = std::min<uint32_t>(nextStreak - 1, 5);
+    return std::min<uint32_t>(1000U << exponent, maximumDelayMs);
+  }
 
   static int terminalSignalForFailedContainer(const siginfo_t& infop)
   {
@@ -8946,6 +9001,11 @@ public:
     {
       Ring::queueCancelTimeout(container->resourceDeltaTimer);
       container->resourceDeltaTimer = nullptr;
+    }
+    if (container->restartTimer)
+    {
+      Ring::queueCancelTimeout(container->restartTimer);
+      container->restartTimer = nullptr;
     }
     container->resourceDeltaMode = Container::ResourceDeltaMode::none;
 

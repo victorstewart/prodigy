@@ -575,6 +575,34 @@ protected:
     return false;
   }
 
+  void scheduleFailedContainerRestart(Container *container, int64_t failureTimeMs)
+  {
+    if (container == nullptr || container->pendingDestroy || container->restartTimer != nullptr)
+    {
+      return;
+    }
+
+    uint32_t nextStreak = 0;
+    uint32_t delayMs = ContainerManager::failedContainerRestartDelayMs(
+        container->restartFailureStreak,
+        container->lastRestartFailureMs,
+        failureTimeMs,
+        nextStreak);
+    container->lastRestartFailureMs = failureTimeMs;
+    container->restartFailureStreak = nextStreak;
+    TimeoutPacket *timer = new TimeoutPacket();
+    timer->identifier = container->plan.uuid;
+    timer->flags = uint64_t(NeuronTimeoutFlags::restartContainer);
+    timer->originator = this;
+    timer->setTimeoutMs(delayMs);
+    container->restartTimer = timer;
+    basics_log("neuron scheduling failed container restart uuid=%llu streak=%u delayMs=%u\n",
+               (unsigned long long)container->plan.uuid,
+               container->restartFailureStreak,
+               delayMs);
+    Ring::queueTimeout(timer);
+  }
+
   virtual bool beginAcceptedBrainTransportTLS(NeuronBrainControlStream *stream)
   {
     return stream->beginTransportTLS(true);
@@ -3214,20 +3242,13 @@ public:
       outputLogs.containerUUID = containerUUID;
       outputLogs.maximumBytes = 8192;
       outputLogs.includeFailed = false;
+      String stderrTail = {};
       if (ContainerManager::collectContainerLogs(outputLogs) && outputLogs.entries.size() == 1)
       {
-        auto appendOutputLog = [&](StringType auto&& label, const String& output) {
-          if (output.size() > 0)
-          {
-            crashReport.append("\n"_ctv);
-            crashReport.append(label);
-            crashReport.append("\n"_ctv);
-            crashReport.append(output);
-          }
-        };
-        appendOutputLog("stderr:"_ctv, outputLogs.entries.front().standardError);
-        appendOutputLog("stdout:"_ctv, outputLogs.entries.front().standardOutput);
+        stderrTail.assign(outputLogs.entries.front().standardError);
       }
+
+      crashReport = ContainerManager::boundedFailureReport(infop, terminalSignal, crashReport, stderrTail);
 
       uint64_t previewBytes = (crashReport.size() < 1024) ? crashReport.size() : 1024;
       String preview;
@@ -3253,10 +3274,7 @@ public:
 
       if (restart)
       {
-        if (container->restartAfterClose == false)
-        {
-          ContainerManager::restartContainer(container);
-        }
+        scheduleFailedContainerRestart(container, failureTimeMs);
       }
       else
       {
@@ -5267,7 +5285,10 @@ public:
       {
         container->restartAfterClose = false;
         container->reset();
-        ContainerManager::restartContainer(container);
+        if (container->restartTimer == nullptr)
+        {
+          ContainerManager::restartContainer(container);
+        }
         return;
       }
 
@@ -5397,6 +5418,13 @@ public:
           }
         }
       }
+      else if (NeuronTimeoutFlags(packet->flags) == NeuronTimeoutFlags::restartContainer)
+      {
+        if (auto it = containers.find(packet->identifier); it != containers.end() && it->second->restartTimer == packet)
+        {
+          it->second->restartTimer = nullptr;
+        }
+      }
 
       delete packet;
       return;
@@ -5415,6 +5443,29 @@ public:
 
           delete packet;
 
+          break;
+        }
+      case NeuronTimeoutFlags::restartContainer:
+        {
+          if (auto it = containers.find(packet->identifier); it != containers.end())
+          {
+            Container *container = it->second;
+            if (container->restartTimer == packet)
+            {
+              container->restartTimer = nullptr;
+              if (container->pendingDestroy == false && container->killedOnPurpose == false)
+              {
+                // The failed process can outlive its control-stream close CQE.
+                // Reuse the existing retirement owner so a delayed restart
+                // never overlaps the old fixed-file/control-socket lifetime.
+                if (retireContainerControlBeforeRestart(container) == false)
+                {
+                  ContainerManager::restartContainer(container);
+                }
+              }
+            }
+          }
+          delete packet;
           break;
         }
       case NeuronTimeoutFlags::metricsTick:

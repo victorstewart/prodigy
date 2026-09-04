@@ -672,6 +672,37 @@ int main(void)
 {
   TestSuite suite;
 
+  {
+    siginfo_t termination = {};
+    termination.si_code = CLD_DUMPED;
+    termination.si_status = SIGSEGV;
+    String report =
+        "crash-report-head-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
+    String standardError =
+        "stderr-prefix-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-PC=0xfeedface"_ctv;
+    String summary = ContainerManager::boundedFailureReport(termination, SIGSEGV, report, standardError);
+    std::string_view summaryView(reinterpret_cast<const char *>(summary.data()), summary.size());
+    suite.expect(summary.size() <= 256, "failure_summary_stays_within_brain_wire_limit");
+    suite.expect(summaryView.find("termination=si_code") != std::string_view::npos,
+                 "failure_summary_retains_termination_identity");
+    suite.expect(summaryView.find("crash-report-head") != std::string_view::npos,
+                 "failure_summary_retains_report_head");
+    suite.expect(summaryView.find("PC=0xfeedface") != std::string_view::npos,
+                 "failure_summary_retains_stderr_tail");
+  }
+
+  {
+    uint32_t streak = 0;
+    suite.expect(ContainerManager::failedContainerRestartDelayMs(0, 0, 1, streak) == 1000 && streak == 1,
+                 "restart_backoff_starts_at_one_second");
+    suite.expect(ContainerManager::failedContainerRestartDelayMs(1, 1, 2, streak) == 2000 && streak == 2,
+                 "restart_backoff_doubles_within_failure_window");
+    suite.expect(ContainerManager::failedContainerRestartDelayMs(7, 1, 2, streak) == 30000 && streak == 8,
+                 "restart_backoff_caps_at_thirty_seconds");
+    suite.expect(ContainerManager::failedContainerRestartDelayMs(7, 1, 600001, streak) == 1000 && streak == 1,
+                 "restart_backoff_resets_after_ten_crash_free_minutes");
+  }
+
   if (std::getenv("PRODIGY_TEST_HOST_PUBLIC_WHITEHOLE_LEASE_ONLY") != nullptr)
   {
     TestBrain brain;
