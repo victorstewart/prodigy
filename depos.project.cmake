@@ -50,9 +50,9 @@ set(
 )
 set(
   PRODIGY_BASICS_MIMALLOC_DEPENDENCY_VERSION
-  "3.3.2"
+  "3.5.1"
   CACHE STRING
-  "Pinned mimalloc package version expected in the published Basics release DepoFile"
+  "Pinned mimalloc package version used by the derived Prodigy Basics variant"
   FORCE
 )
 set(
@@ -214,6 +214,24 @@ function(_prodigy_patch_basics_depofile_for_dependency_versions out_var source_d
     string(REPLACE
       "${_prodigy_existing_bitsery_depends_line}"
       "${_prodigy_bitsery_depends_line}"
+      _prodigy_basics_depofile_contents
+      "${_prodigy_basics_depofile_contents}"
+    )
+    set(_prodigy_patched TRUE)
+  endif()
+
+  set(_prodigy_mimalloc_depends_line "DEPENDS mimalloc VERSION ${PRODIGY_BASICS_MIMALLOC_DEPENDENCY_VERSION}")
+  string(REGEX MATCH "DEPENDS mimalloc VERSION [^\n]+" _prodigy_existing_mimalloc_depends_line "${_prodigy_basics_depofile_contents}")
+  if ("${_prodigy_existing_mimalloc_depends_line}" STREQUAL "")
+    message(
+      FATAL_ERROR
+      "Published Basics release DepoFile at ${source_depofile} no longer exposes the expected mimalloc dependency line."
+    )
+  endif()
+  if (NOT "${_prodigy_existing_mimalloc_depends_line}" STREQUAL "${_prodigy_mimalloc_depends_line}")
+    string(REPLACE
+      "${_prodigy_existing_mimalloc_depends_line}"
+      "${_prodigy_mimalloc_depends_line}"
       _prodigy_basics_depofile_contents
       "${_prodigy_basics_depofile_contents}"
     )
