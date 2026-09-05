@@ -112,6 +112,12 @@ public:
   MothershipTunnelGatewayAuth lastMothershipTunnelProviderGatewayAuth = {};
   uint128_t nextMothershipTunnelProviderContainerUUID = 0x77070001;
   uint128_t lastStoppedMothershipTunnelProviderContainerUUID = 0;
+  bool allowLocalStateRefreshBeforeIgnition = false;
+
+  bool localNeuronStateRefreshMayBypassIgnition(const Machine *machine, bool haveData) const override
+  {
+    return allowLocalStateRefreshBeforeIgnition && haveData == false && machine != nullptr && machine->isThisMachine;
+  }
 
   void armMachineNeuronControl(Machine *machine) override
   {
@@ -8960,6 +8966,11 @@ static void testUpdateProdigyRespondsBeforeSingleBrainTransition(TestSuite& suit
   brain.nBrains = 1;
   brain.weAreMaster = true;
   brain.noMasterYet = false;
+  Machine local = {};
+  local.uuid = 0x7701;
+  local.isThisMachine = true;
+  local.isBrain = true;
+  brain.machines.insert(&local);
 
   Mothership mothership = {};
   mothership.isFixedFile = true;
@@ -8979,6 +8990,8 @@ static void testUpdateProdigyRespondsBeforeSingleBrainTransition(TestSuite& suit
   MothershipResponse response = {};
   suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response), "update_prodigy_response_deserializes");
   suite.expect(response.success, "update_prodigy_response_success");
+  suite.expect(brain.updateSelfLocalMachineUUID == local.uuid,
+               "update_prodigy_single_brain_persists_local_handoff_before_success");
   suite.expect(brain.updateSelfTransitionAfterMothershipAck, "update_prodigy_single_brain_defers_transition_until_ack");
   suite.expect(brain.transitionToNewBundleCalls == 0, "update_prodigy_single_brain_no_transition_before_ack_send");
 
@@ -8989,6 +9002,7 @@ static void testUpdateProdigyRespondsBeforeSingleBrainTransition(TestSuite& suit
   suite.expect(brain.transitionToNewBundleCalls == 1, "update_prodigy_single_brain_transitions_after_ack_send");
 
   brain.activeMotherships.erase(&mothership);
+  brain.machines.erase(&local);
   restoreStagedBundle();
 }
 
@@ -9033,14 +9047,36 @@ static void testUpdateProdigyDefersSuccessUntilWorkersRestore(TestSuite& suite)
 static void testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(TestSuite& suite)
 {
   TestBrain brain = {};
+  Machine local = {};
   Machine first = {};
   Machine second = {};
+  local.uuid = 0x8810;
+  local.isThisMachine = true;
   first.uuid = 0x8811;
   second.uuid = 0x8812;
+  local.neuron.machine = &local;
   first.neuron.machine = &first;
   second.neuron.machine = &second;
+  brain.machines.insert(&local);
   brain.machines.insert(&first);
   brain.machines.insert(&second);
+
+  ApplicationDeployment deployment = {};
+  deployment.plan = makeDeploymentPlan(62'021, 7);
+  deployment.state = DeploymentState::running;
+  brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+  ContainerView localContainer = {};
+  localContainer.uuid = uint128_t(0x88100001);
+  localContainer.deploymentID = deployment.plan.config.deploymentID();
+  localContainer.applicationID = deployment.plan.config.applicationID;
+  localContainer.machine = &local;
+  localContainer.fragment = 17;
+  localContainer.lifetime = ApplicationLifetime::base;
+  localContainer.state = ContainerState::healthy;
+  localContainer.runtimeReady = true;
+  localContainer.createdAtMs = 12345;
+  deployment.containers.insert(&localContainer);
+  local.upsertContainerIndexEntry(localContainer.deploymentID, &localContainer);
   const String digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
   brain.updateSelfWorkerExpectedBundleSHA256 = digest;
   brain.updateSelfWorkerMachineUUIDs.insert(first.uuid);
@@ -9057,6 +9093,11 @@ static void testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(TestSuite&
   brain.noteWorkerBundleStaged(&second.neuron, true, digest, String());
   const uint64_t transitionsAfterStage = (first.neuron.wBuffer.empty() ? 0 : 1) + (second.neuron.wBuffer.empty() ? 0 : 1);
   suite.expect(transitionsAfterStage == 1, "worker_upgrade_transitions_exactly_one_worker_after_all_stage_acks");
+  suite.expect(uint32_t(first.inBinaryUpdate) + uint32_t(second.inBinaryUpdate) == 1,
+               "worker_upgrade_marks_expected_exec_before_control_close");
+  Machine *transitioningWorker = first.inBinaryUpdate ? &first : &second;
+  suite.expect(brain.neuronCloseRequiresScheduledWaiterRetry(transitioningWorker) == false,
+               "worker_upgrade_control_close_does_not_reschedule_live_containers");
 
   ProdigyPersistentUpdateSelfState snapshot = brain.capturePersistentUpdateSelfState();
   TestBrain restored = {};
@@ -9065,6 +9106,18 @@ static void testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(TestSuite&
                    restored.updateSelfWorkerStagedMachineUUIDs.size() == 2 &&
                    restored.updateSelfWorkerStateUploadedMachineUUIDs.empty(),
                "worker_upgrade_persists_incomplete_operation_for_resume");
+  suite.expect(restored.workerBundleUpgradeTransitionPending(
+                   first.neuron.wBuffer.empty() ? &second : &first),
+               "worker_upgrade_restart_preserves_expected_exec_fence");
+  transitioningWorker->inBinaryUpdate = false;
+  suite.expect(restored.neuronCloseRequiresScheduledWaiterRetry(transitioningWorker) == false,
+               "worker_upgrade_restart_control_close_keeps_live_ownership");
+  restored.updateSelfWorkerTransitionIssuedMachineUUIDs.clear();
+  restored.recoveringPersistedNeuronInventory = true;
+  suite.expect(restored.neuronCloseRequiresScheduledWaiterRetry(transitioningWorker) == false,
+               "worker_upgrade_master_exec_inventory_recovery_suppresses_reschedule");
+  restored.recoveringPersistedNeuronInventory = false;
+  transitioningWorker->inBinaryUpdate = true;
 
   // Registration is the digest proof; a state upload before it cannot advance
   // the rollout. Then recovery of one worker unlocks only the next worker.
@@ -9075,6 +9128,55 @@ static void testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(TestSuite&
   suite.expect(brain.updateSelfWorkerStateUploadedMachineUUIDs.contains(first.uuid) &&
                    brain.updateSelfWorkerStateUploadedMachineUUIDs.contains(second.uuid) == false,
                "worker_upgrade_marks_only_digest_verified_state_upload_complete");
+
+  Mothership mothership = {};
+  mothership.isFixedFile = false;
+  mothership.fd = 43;
+  ScopedRing scopedRing = {};
+  brain.activeMotherships.insert(&mothership);
+  brain.updateSelfWorkerMothership = &mothership;
+  brain.noteWorkerRegistration(&second.neuron, digest);
+  brain.noteWorkerStateUpload(&second.neuron);
+  suite.expect(brain.updateSelfWorkerStateUploadedMachineUUIDs.size() == 2,
+               "worker_upgrade_completes_only_after_every_state_upload");
+  suite.expect(transitioningWorker->inBinaryUpdate,
+               "worker_upgrade_keeps_close_fence_through_state_re_adoption");
+  suite.expect(mothership.pendingSend && mothership.wBuffer.empty() == false,
+               "worker_upgrade_queues_terminal_mothership_success");
+  suite.expect(brain.updateSelfTransitionAfterMothershipAck && brain.transitionToNewBundleCalls == 0,
+               "worker_upgrade_waits_for_terminal_success_send_before_master_transition");
+  suite.expect(brain.updateSelfLocalMachineUUID == local.uuid &&
+                   brain.updateSelfLocalBundleRegistered == false &&
+                   brain.updateSelfLocalContainerBootstraps.size() == 1,
+               "worker_upgrade_persists_local_container_handoff_before_success");
+
+  ProdigyPersistentUpdateSelfState localSnapshot = brain.capturePersistentUpdateSelfState();
+  TestBrain localRestored = {};
+  localRestored.restorePersistentUpdateSelfState(localSnapshot);
+  suite.expect(localRestored.updateSelfLocalMachineUUID == local.uuid &&
+                   localRestored.updateSelfLocalContainerBootstraps == brain.updateSelfLocalContainerBootstraps,
+               "worker_upgrade_restores_exact_local_container_handoff");
+  suite.expect(localRestored.noteLocalBundleRegistration(&local, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv) == false &&
+                   localRestored.updateSelfLocalBundleRegistered == false,
+               "worker_upgrade_rejects_wrong_local_post_exec_digest");
+  suite.expect(localRestored.noteLocalBundleRegistration(&local, digest),
+               "worker_upgrade_accepts_intended_local_post_exec_digest");
+  bytell_hash_set<uint128_t> incompleteInventory = {};
+  suite.expect(localRestored.localBundleInventoryMatches(&local, incompleteInventory) == false,
+               "worker_upgrade_rejects_partial_local_inventory");
+  bytell_hash_set<uint128_t> completeInventory = {};
+  completeInventory.insert(localContainer.uuid);
+  suite.expect(localRestored.localBundleInventoryMatches(&local, completeInventory),
+               "worker_upgrade_accepts_exact_local_inventory");
+  localRestored.completeLocalBundleExecRecovery();
+  suite.expect(localRestored.capturePersistentUpdateSelfState().active() == false,
+               "worker_upgrade_clears_transaction_only_after_local_restore");
+
+  brain.activeMotherships.erase(&mothership);
+  local.removeContainerIndexEntry(localContainer.deploymentID, &localContainer);
+  deployment.containers.erase(&localContainer);
+  brain.deployments.erase(deployment.plan.config.deploymentID());
+  brain.machines.erase(&local);
   brain.machines.erase(&first);
   brain.machines.erase(&second);
 }
@@ -16828,6 +16930,7 @@ static void testNeuronSpinContainerRejectReportsFailure(TestSuite& suite)
 static void testNeuronStateUploadSkipsExistingLiveContainer(TestSuite& suite)
 {
   TestNeuron neuron = {};
+  neuron.seedBrainStreamForTest(false);
   neuron.seedLocalContainerSubnetForTest(7, 0x123456);
 
   Container *container = new Container();
@@ -16873,6 +16976,30 @@ static void testNeuronStateUploadSkipsExistingLiveContainer(TestSuite& suite)
   suite.expect(container->pid == 4242, "neuron_state_upload_existing_live_container_keeps_pid");
   suite.expect(container->neuronScalingDimensionsMask == 0x5a5a, "neuron_state_upload_existing_live_container_refreshes_metric_mask");
   suite.expect(container->neuronMetricsCadenceMs == 250, "neuron_state_upload_existing_live_container_refreshes_metric_cadence");
+
+  uint32_t stateUploadAcknowledgements = 0;
+  uint128_t acknowledgedContainerUUID = 0;
+  forEachMessageInBuffer(neuron.brainOutboundForTest(), [&](Message *frame) {
+    if (NeuronTopic(frame->topic) != NeuronTopic::stateUpload)
+    {
+      return;
+    }
+    uint8_t *args = frame->args;
+    local_container_subnet6 acknowledgedFragment = {};
+    Message::extractBytes<Alignment::one>(args, reinterpret_cast<uint8_t *>(&acknowledgedFragment), sizeof(acknowledgedFragment));
+    String serializedPlan = {};
+    Message::extractToStringView(args, serializedPlan);
+    ContainerPlan acknowledgedPlan = {};
+    if (BitseryEngine::deserializeSafe(serializedPlan, acknowledgedPlan))
+    {
+      acknowledgedContainerUUID = acknowledgedPlan.uuid;
+    }
+    stateUploadAcknowledgements += 1;
+  });
+  suite.expect(stateUploadAcknowledgements == 1,
+               "neuron_state_upload_replies_with_actual_runtime_inventory");
+  suite.expect(acknowledgedContainerUUID == container->plan.uuid,
+               "neuron_state_upload_acknowledges_preserved_container_identity");
 
   neuron.containerByPid.erase(container->pid);
   neuron.containers.erase(container->plan.uuid);
@@ -19994,6 +20121,107 @@ static void testBrainNeuronRegistrationKeepsHealthyRuntimeReadyWithoutRefresh(Te
   brain.machines.erase(&machine);
 }
 
+static void testBrainNeuronRegistrationRefreshesWorkerAfterBundleTransition(TestSuite& suite)
+{
+  TestBrain brain = {};
+  brain.ignited = false;
+  brain.brainConfig.datacenterFragment = 1;
+
+  Machine machine = {};
+  machine.uuid = uint128_t(0x5217);
+  machine.state = MachineState::healthy;
+  machine.fragment = 0x1238;
+  machine.runtimeReady = true;
+  machine.reportedDatacenterFragment = 1;
+  machine.reportedFragment = 0x1238;
+  machine.neuron.machine = &machine;
+  machine.hardware.inventoryComplete = true;
+  machine.hardware.cpu.logicalCores = 2;
+  machine.hardware.memory.totalMB = 4096;
+  brain.machines.insert(&machine);
+  brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+  brain.neurons.insert(&machine.neuron);
+
+  const String digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
+  brain.updateSelfWorkerExpectedBundleSHA256 = digest;
+  brain.updateSelfWorkerMachineUUIDs.insert(machine.uuid);
+  brain.updateSelfWorkerStagedMachineUUIDs.insert(machine.uuid);
+  brain.updateSelfWorkerTransitionIssuedMachineUUIDs.insert(machine.uuid);
+
+  String buffer = {};
+  Message *message = buildNeuronMessage(
+      buffer,
+      NeuronTopic::registration,
+      int64_t(1'700'000'000'017),
+      "linux-6.10.0"_ctv,
+      "ubuntu"_ctv,
+      "24.04"_ctv,
+      true,
+      digest);
+  brain.neuronHandler(&machine.neuron, message);
+
+  uint32_t stateUploads = 0;
+  forEachMessageInBuffer(machine.neuron.wBuffer, [&](Message *queued) {
+    if (NeuronTopic(queued->topic) == NeuronTopic::stateUpload)
+    {
+      stateUploads += 1;
+    }
+  });
+
+  suite.expect(brain.updateSelfWorkerRebootedMachineUUIDs.contains(machine.uuid),
+               "worker_upgrade_registration_attests_intended_bundle");
+  suite.expect(stateUploads == 1,
+               "worker_upgrade_registration_requests_authoritative_state_refresh");
+  suite.expect(machine.runtimeReady == false,
+               "worker_upgrade_registration_waits_for_state_upload_acknowledgement");
+
+  brain.neurons.erase(&machine.neuron);
+  brain.machinesByUUID.erase(machine.uuid);
+  brain.machines.erase(&machine);
+}
+
+static void testPersistedLocalBrainRefreshBypassesIgnition(TestSuite& suite)
+{
+  TestBrain brain = {};
+  brain.ignited = false;
+  brain.brainConfig.datacenterFragment = 1;
+  brain.allowLocalStateRefreshBeforeIgnition = true;
+
+  Machine machine = {};
+  machine.uuid = uint128_t(0x5218);
+  machine.isThisMachine = true;
+  machine.fragment = 0x1239;
+  machine.neuron.machine = &machine;
+  brain.machines.insert(&machine);
+  brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+  brain.neurons.insert(&machine.neuron);
+
+  String buffer = {};
+  Message *message = buildNeuronMessage(
+      buffer,
+      NeuronTopic::registration,
+      int64_t(1'700'000'000'018),
+      "linux-6.10.0"_ctv,
+      "ubuntu"_ctv,
+      "24.04"_ctv,
+      false);
+  brain.neuronHandler(&machine.neuron, message);
+
+  uint32_t stateUploads = 0;
+  forEachMessageInBuffer(machine.neuron.wBuffer, [&](Message *queued) {
+    if (NeuronTopic(queued->topic) == NeuronTopic::stateUpload)
+    {
+      stateUploads += 1;
+    }
+  });
+  suite.expect(stateUploads == 1,
+               "persisted_local_brain_replays_authoritative_state_before_ignition");
+
+  brain.neurons.erase(&machine.neuron);
+  brain.machinesByUUID.erase(machine.uuid);
+  brain.machines.erase(&machine);
+}
+
 static void testBrainNeuronHandlerReportsHardwareFailureAndDecommissionsMachine(TestSuite& suite)
 {
   TestBrain brain = {};
@@ -21446,6 +21674,8 @@ int main(void)
   testBrainNeuronHandlerOwnsRegistrationKernelString(suite);
   testBrainNeuronRegistrationQueuesStateRefreshForRebootRecovery(suite);
   testBrainNeuronRegistrationKeepsHealthyRuntimeReadyWithoutRefresh(suite);
+  testBrainNeuronRegistrationRefreshesWorkerAfterBundleTransition(suite);
+  testPersistedLocalBrainRefreshBypassesIgnition(suite);
   testBrainNeuronHandlerReportsHardwareFailureAndDecommissionsMachine(suite);
   testBrainMachineStateMissingEscalatesWhenSshBudgetExhausted(suite);
   testBrainSoftEscalationTimeoutPromotesMachineToHardReboot(suite);

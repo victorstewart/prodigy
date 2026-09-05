@@ -787,6 +787,8 @@ static bool prodigyClaimPersistentLocalClusterOwnership(uint128_t clusterUUID, S
 }
 
 class ProdigyBrain : public Brain {
+  ProdigyHostControlNetwork& hostControlNetwork;
+
 public:
 
   MothershipTunnelGatewayRuntime mothershipTunnelGateway;
@@ -1185,7 +1187,18 @@ public:
     return true;
   }
 
+  bool quiesceProcessForBundleExec(void) override
+  {
+    return hostControlNetwork.shutdown();
+  }
+
+  bool localNeuronStateRefreshMayBypassIgnition(const Machine *machine, bool haveData) const override
+  {
+    return havePersistedBrainSnapshot && haveData == false && machine != nullptr && machine->isThisMachine;
+  }
+
   explicit ProdigyBrain(ProdigyHostControlNetwork& hostControlNetwork)
+      : hostControlNetwork(hostControlNetwork)
   {
     if (havePersistedBrainSnapshot)
     {
@@ -1254,14 +1267,22 @@ public:
 };
 
 class ProdigyNeuron : public Neuron {
+  ProdigyHostControlNetwork& hostControlNetwork;
+
 public:
 
   explicit ProdigyNeuron(ProdigyHostControlNetwork& hostControlNetwork)
+      : hostControlNetwork(hostControlNetwork)
   {
     iaas = new RuntimeAwareNeuronIaaS(&persistentStateStore,
                                       effectiveBootstrapConfig,
                                       persistentBootState,
                                       {.http = hostControlNetwork.http(), .delay = ProdigyHostDelayOperation::submission()});
+  }
+
+  bool quiesceProcessForBundleExec(void) override
+  {
+    return hostControlNetwork.shutdown();
   }
 
   bool startOperatingSystemUpdate(const String& targetOSID, const String& targetOSVersionID, const String& updateCommand, String *failure = nullptr) override

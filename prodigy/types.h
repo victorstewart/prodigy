@@ -6828,15 +6828,23 @@ public:
   Vector<uint128_t> workerTransitionIssuedMachineUUIDs;
   Vector<uint128_t> workerRebootedMachineUUIDs;
   Vector<uint128_t> workerStateUploadedMachineUUIDs;
+  // The master Brain and its local Neuron exec in the same process. Preserve
+  // the already-authoritative state-upload payload until the replacement
+  // binary has proved its digest and the local Neuron has re-adopted every
+  // live container. Serialized payloads keep this transaction owner
+  // independent of the later ContainerPlan type declaration.
+  uint128_t localMachineUUID = 0;
+  bool localBundleRegistered = false;
+  Vector<String> localContainerBootstraps;
 
   bool active(void) const
   {
-    return state != 0 || expectedEchos != 0 || bundleEchos != 0 || relinquishEchos != 0 || plannedMasterPeerKey != 0 || pendingDesignatedMasterPeerKey != 0 || useStagedBundleOnly || bundleBlob.size() > 0 || bundleEchoPeerKeys.empty() == false || relinquishEchoPeerKeys.empty() == false || followerBootNsByPeerKey.empty() == false || followerRebootedPeerKeys.empty() == false || workerExpectedBundleSHA256.size() > 0 || workerFailure.size() > 0 || workerMachineUUIDs.empty() == false || workerStagedMachineUUIDs.empty() == false || workerTransitionIssuedMachineUUIDs.empty() == false || workerRebootedMachineUUIDs.empty() == false || workerStateUploadedMachineUUIDs.empty() == false;
+    return state != 0 || expectedEchos != 0 || bundleEchos != 0 || relinquishEchos != 0 || plannedMasterPeerKey != 0 || pendingDesignatedMasterPeerKey != 0 || useStagedBundleOnly || bundleBlob.size() > 0 || bundleEchoPeerKeys.empty() == false || relinquishEchoPeerKeys.empty() == false || followerBootNsByPeerKey.empty() == false || followerRebootedPeerKeys.empty() == false || workerExpectedBundleSHA256.size() > 0 || workerFailure.size() > 0 || workerMachineUUIDs.empty() == false || workerStagedMachineUUIDs.empty() == false || workerTransitionIssuedMachineUUIDs.empty() == false || workerRebootedMachineUUIDs.empty() == false || workerStateUploadedMachineUUIDs.empty() == false || localMachineUUID != 0 || localBundleRegistered || localContainerBootstraps.empty() == false;
   }
 
   bool operator==(const ProdigyPersistentUpdateSelfState& other) const
   {
-    return state == other.state && expectedEchos == other.expectedEchos && bundleEchos == other.bundleEchos && relinquishEchos == other.relinquishEchos && plannedMasterPeerKey == other.plannedMasterPeerKey && pendingDesignatedMasterPeerKey == other.pendingDesignatedMasterPeerKey && useStagedBundleOnly == other.useStagedBundleOnly && bundleBlob.equals(other.bundleBlob) && bundleEchoPeerKeys == other.bundleEchoPeerKeys && relinquishEchoPeerKeys == other.relinquishEchoPeerKeys && followerBootNsByPeerKey == other.followerBootNsByPeerKey && followerRebootedPeerKeys == other.followerRebootedPeerKeys && workerExpectedBundleSHA256.equals(other.workerExpectedBundleSHA256) && workerFailure.equals(other.workerFailure) && workerMachineUUIDs == other.workerMachineUUIDs && workerStagedMachineUUIDs == other.workerStagedMachineUUIDs && workerTransitionIssuedMachineUUIDs == other.workerTransitionIssuedMachineUUIDs && workerRebootedMachineUUIDs == other.workerRebootedMachineUUIDs && workerStateUploadedMachineUUIDs == other.workerStateUploadedMachineUUIDs;
+    return state == other.state && expectedEchos == other.expectedEchos && bundleEchos == other.bundleEchos && relinquishEchos == other.relinquishEchos && plannedMasterPeerKey == other.plannedMasterPeerKey && pendingDesignatedMasterPeerKey == other.pendingDesignatedMasterPeerKey && useStagedBundleOnly == other.useStagedBundleOnly && bundleBlob.equals(other.bundleBlob) && bundleEchoPeerKeys == other.bundleEchoPeerKeys && relinquishEchoPeerKeys == other.relinquishEchoPeerKeys && followerBootNsByPeerKey == other.followerBootNsByPeerKey && followerRebootedPeerKeys == other.followerRebootedPeerKeys && workerExpectedBundleSHA256.equals(other.workerExpectedBundleSHA256) && workerFailure.equals(other.workerFailure) && workerMachineUUIDs == other.workerMachineUUIDs && workerStagedMachineUUIDs == other.workerStagedMachineUUIDs && workerTransitionIssuedMachineUUIDs == other.workerTransitionIssuedMachineUUIDs && workerRebootedMachineUUIDs == other.workerRebootedMachineUUIDs && workerStateUploadedMachineUUIDs == other.workerStateUploadedMachineUUIDs && localMachineUUID == other.localMachineUUID && localBundleRegistered == other.localBundleRegistered && localContainerBootstraps == other.localContainerBootstraps;
   }
 
   bool operator!=(const ProdigyPersistentUpdateSelfState& other) const
@@ -6867,6 +6875,9 @@ static void serialize(S&& serializer, ProdigyPersistentUpdateSelfState& state)
   serializer.object(state.workerTransitionIssuedMachineUUIDs);
   serializer.object(state.workerRebootedMachineUUIDs);
   serializer.object(state.workerStateUploadedMachineUUIDs);
+  serializer.value16b(state.localMachineUUID);
+  serializer.value1b(state.localBundleRegistered);
+  serializer.object(state.localContainerBootstraps);
 }
 
 class ProdigyPendingAddMachinesOperation {

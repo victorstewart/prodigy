@@ -1056,6 +1056,8 @@ public:
   uint128_t pendingDesignatedMasterPeerKey = 0;
   bool updateSelfUseStagedBundleOnly = false;
   bool updateSelfTransitionAfterMothershipAck = false;
+  TimeoutPacket bundleExecRetryTick;
+  bool bundleExecRetryTickQueued = false;
   String updateSelfBundleBlob;
   bytell_hash_set<uint128_t> updateSelfBundleIssuedPeerKeys;
   bytell_hash_set<uint128_t> updateSelfBundleEchoPeerKeys;
@@ -1073,6 +1075,9 @@ public:
   bytell_hash_set<uint128_t> updateSelfWorkerTransitionIssuedMachineUUIDs;
   bytell_hash_set<uint128_t> updateSelfWorkerRebootedMachineUUIDs;
   bytell_hash_set<uint128_t> updateSelfWorkerStateUploadedMachineUUIDs;
+  uint128_t updateSelfLocalMachineUUID = 0;
+  bool updateSelfLocalBundleRegistered = false;
+  Vector<String> updateSelfLocalContainerBootstraps;
   constexpr static int64_t connectFailureLogIntervalMs = prodigyBrainConnectFailureLogIntervalMs;
   constexpr static int64_t certificateLifecycleBaseRetryDelayMs = 5 * 60 * 1000;
   constexpr static int64_t certificateLifecycleMaxRetryDelayMs = 60 * 60 * 1000;
@@ -1800,6 +1805,9 @@ public:
     for (uint128_t uuid : updateSelfWorkerTransitionIssuedMachineUUIDs) state.workerTransitionIssuedMachineUUIDs.push_back(uuid);
     for (uint128_t uuid : updateSelfWorkerRebootedMachineUUIDs) state.workerRebootedMachineUUIDs.push_back(uuid);
     for (uint128_t uuid : updateSelfWorkerStateUploadedMachineUUIDs) state.workerStateUploadedMachineUUIDs.push_back(uuid);
+    state.localMachineUUID = updateSelfLocalMachineUUID;
+    state.localBundleRegistered = updateSelfLocalBundleRegistered;
+    state.localContainerBootstraps = updateSelfLocalContainerBootstraps;
 
     std::sort(state.bundleEchoPeerKeys.begin(), state.bundleEchoPeerKeys.end());
     std::sort(state.relinquishEchoPeerKeys.begin(), state.relinquishEchoPeerKeys.end());
@@ -1867,6 +1875,9 @@ public:
     for (uint128_t uuid : state.workerTransitionIssuedMachineUUIDs) updateSelfWorkerTransitionIssuedMachineUUIDs.insert(uuid);
     for (uint128_t uuid : state.workerRebootedMachineUUIDs) updateSelfWorkerRebootedMachineUUIDs.insert(uuid);
     for (uint128_t uuid : state.workerStateUploadedMachineUUIDs) updateSelfWorkerStateUploadedMachineUUIDs.insert(uuid);
+    updateSelfLocalMachineUUID = state.localMachineUUID;
+    updateSelfLocalBundleRegistered = state.localBundleRegistered;
+    updateSelfLocalContainerBootstraps = state.localContainerBootstraps;
   }
 
   ProdigyResumptionRegistry::SnapshotMap captureTlsResumptionSnapshotsByWormhole(void) const
@@ -10886,7 +10897,10 @@ public:
         if (neuron->machine)
         {
           neuron->machine->neuronConnectFailStreak = 0;
-          neuron->machine->inBinaryUpdate = false;
+          if (workerBundleUpgradeTransitionPending(neuron->machine) == false)
+          {
+            neuron->machine->inBinaryUpdate = false;
+          }
         }
 
         uint64_t pendingBytes = neuron->wBuffer.outstandingBytes();
@@ -12372,7 +12386,10 @@ public:
       PRODIGY_DEBUG_FLUSH();
       neuron->cancelPendingConnect();
 
-      retryScheduledContainerWaitersAfterNeuronClose(neuron->machine);
+      if (neuronCloseRequiresScheduledWaiterRetry(neuron->machine))
+      {
+        retryScheduledContainerWaitersAfterNeuronClose(neuron->machine);
+      }
 
       if (weAreMaster)
       {
@@ -12513,6 +12530,48 @@ public:
     }
   }
 
+  bool collectNeuronStateUploadBootstraps(Machine *machine, Vector<String>& serializedBootstraps)
+  {
+    serializedBootstraps.clear();
+    if (machine == nullptr)
+    {
+      return false;
+    }
+
+    for (const auto& [deploymentID, containers] : machine->containersByDeploymentID)
+    {
+      auto deploymentIt = deployments.find(deploymentID);
+      if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
+      {
+        return false;
+      }
+
+      ApplicationDeployment *deployment = deploymentIt->second;
+      for (ContainerView *container : containers)
+      {
+        if (container == nullptr)
+        {
+          return false;
+        }
+        ApplicationConfig replayConfig = deployment->resourceConfigForContainer(container);
+        ContainerPlan planToReplay = container->generatePlan(deployment->plan, deployment->nShardGroups, &replayConfig);
+        if (planToReplay.isStateful)
+        {
+          prodigyPopulateDefaultStatefulTopology(planToReplay.statefulTopology, planToReplay.shardGroup, planToReplay.config);
+        }
+        applyCredentialsToContainerPlan(deployment->plan, *container, planToReplay);
+
+        NeuronContainerBootstrap bootstrap = {};
+        bootstrap.plan = std::move(planToReplay);
+        bootstrap.metricPolicy = deriveNeuronMetricPolicyForDeployment(deployment->plan);
+        String serializedBootstrap = {};
+        BitseryEngine::serialize(serializedBootstrap, bootstrap);
+        serializedBootstraps.push_back(std::move(serializedBootstrap));
+      }
+    }
+    return true;
+  }
+
   void queueNeuronStateUploadForMachine(Machine *machine)
   {
     if (machine == nullptr || brainConfig.datacenterFragment == 0 || machine->fragment == 0)
@@ -12534,32 +12593,25 @@ public:
 
     Message::appendAlignedBuffer<Alignment::one>(machine->neuron.wBuffer, reinterpret_cast<uint8_t *>(&fragment), sizeof(struct local_container_subnet6));
 
-    for (const auto& [deploymentID, containers] : machine->containersByDeploymentID)
+    Vector<String> liveBootstraps = {};
+    const Vector<String> *bootstraps = nullptr;
+    if (machine->uuid == updateSelfLocalMachineUUID && updateSelfLocalMachineUUID != 0)
     {
-      auto deploymentIt = deployments.find(deploymentID);
-      if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
-      {
-        continue;
-      }
+      bootstraps = &updateSelfLocalContainerBootstraps;
+    }
+    else if (collectNeuronStateUploadBootstraps(machine, liveBootstraps))
+    {
+      bootstraps = &liveBootstraps;
+    }
 
-      ApplicationDeployment *deployment = deploymentIt->second;
-      for (ContainerView *container : containers)
-      {
-        ApplicationConfig replayConfig = deployment->resourceConfigForContainer(container);
-        ContainerPlan planToReplay = container->generatePlan(deployment->plan, deployment->nShardGroups, &replayConfig);
-        if (planToReplay.isStateful)
-        {
-          prodigyPopulateDefaultStatefulTopology(planToReplay.statefulTopology, planToReplay.shardGroup, planToReplay.config);
-        }
-        applyCredentialsToContainerPlan(deployment->plan, *container, planToReplay);
-
-        NeuronContainerBootstrap bootstrap = {};
-        bootstrap.plan = std::move(planToReplay);
-        bootstrap.metricPolicy = deriveNeuronMetricPolicyForDeployment(deployment->plan);
-        String serializedBootstrap = {};
-        BitseryEngine::serialize(serializedBootstrap, bootstrap);
-        Message::appendValue(machine->neuron.wBuffer, serializedBootstrap);
-      }
+    if (bootstraps == nullptr)
+    {
+      machine->neuron.wBuffer.resize(headerOffset);
+      return;
+    }
+    for (const String& serializedBootstrap : *bootstraps)
+    {
+      Message::appendValue(machine->neuron.wBuffer, serializedBootstrap);
     }
 
     Message::finish(machine->neuron.wBuffer, headerOffset);
@@ -19127,6 +19179,16 @@ public:
     }
   }
 
+  bool neuronCloseRequiresScheduledWaiterRetry(const Machine *machine) const
+  {
+    // An exec deliberately closes the Neuron control stream while its
+    // container processes remain alive. Retrying stateless scheduler waiters
+    // here would create replacements before authoritative state re-adoption.
+    return machine != nullptr && recoveringPersistedNeuronInventory == false &&
+           machine->inBinaryUpdate == false &&
+           workerBundleUpgradeTransitionPending(machine) == false;
+  }
+
   uint32_t normalizedMaxOSDrains(void) const
   {
     return brainConfig.maxOSDrains > 0 ? brainConfig.maxOSDrains : 1;
@@ -20535,6 +20597,12 @@ public:
     // boundary here. Never dereference a cancelled packet.
     if (result == -ECANCELED)
     {
+      return;
+    }
+    if (packet == &bundleExecRetryTick)
+    {
+      bundleExecRetryTickQueued = false;
+      transitionToNewBundle();
       return;
     }
     if (packet != nullptr && packet->dispatcher)
@@ -22011,7 +22079,10 @@ public:
       case MachineState::healthy:
         {
           // clear transient flags and counters when returning to healthy
-          machine->inBinaryUpdate = false;
+          if (workerBundleUpgradeTransitionPending(machine) == false)
+          {
+            machine->inBinaryUpdate = false;
+          }
           machine->neuronConnectFailStreak = 0;
           machine->brainConnectFailStreak = 0;
           cancelMachineSoftWatchdog(machine);
@@ -22389,7 +22460,7 @@ public:
           }
 
           // If we transitioned here during a binary update, give it space (state will be neuronRebooting)
-          if (machine->inBinaryUpdate)
+          if (machine->inBinaryUpdate || workerBundleUpgradeTransitionPending(machine))
           {
             machine->state = MachineState::neuronRebooting;
             break;
@@ -22549,8 +22620,32 @@ public:
     }
   }
 
+  virtual bool quiesceProcessForBundleExec(void)
+  {
+    return true;
+  }
+
+  void queueBundleExecRetry(void)
+  {
+    if (bundleExecRetryTickQueued)
+    {
+      return;
+    }
+    bundleExecRetryTick.clear();
+    bundleExecRetryTick.originator = this;
+    bundleExecRetryTick.setTimeoutMs(10);
+    Ring::queueTimeout(&bundleExecRetryTick);
+    bundleExecRetryTickQueued = true;
+  }
+
   virtual void transitionToNewBundle(void)
   {
+    if (quiesceProcessForBundleExec() == false)
+    {
+      queueBundleExecRetry();
+      return;
+    }
+
     // should we serialize and save all the container data?
     String failure = {};
     String stagedBundlePath = prodigyStagedBundlePath();
@@ -23245,12 +23340,131 @@ public:
       if (updateSelfWorkerRebootedMachineUUIDs.contains(machine->uuid) == false &&
           updateSelfWorkerTransitionIssuedMachineUUIDs.insert(machine->uuid).second)
       {
+        // The ensuing control-stream close is an expected exec, not a host
+        // failure. Keep the Brain's exact container/storage/network ownership
+        // indexed until the replacement Neuron uploads its live inventory.
+        machine->inBinaryUpdate = true;
         noteMasterAuthorityRuntimeStateChanged();
         Message::construct(machine->neuron.wBuffer, NeuronTopic::transitionToNewBundle, uint8_t(1));
         if (neuronControlStreamActive(machine)) Ring::queueSend(&machine->neuron);
       }
       return;
     }
+  }
+
+  bool prepareLocalBundleExecRecovery(void)
+  {
+    Machine *localMachine = nullptr;
+    for (Machine *machine : machines)
+    {
+      if (machine == nullptr || machine->isThisMachine == false)
+      {
+        continue;
+      }
+      if (localMachine != nullptr)
+      {
+        updateSelfWorkerFailure.assign("multiple local machines while preparing bundle exec"_ctv);
+        return false;
+      }
+      localMachine = machine;
+    }
+    if (localMachine == nullptr)
+    {
+      updateSelfWorkerFailure.assign("local machine missing while preparing bundle exec"_ctv);
+      return false;
+    }
+
+    Vector<String> bootstraps = {};
+    if (collectNeuronStateUploadBootstraps(localMachine, bootstraps) == false)
+    {
+      updateSelfWorkerFailure.assign("local container ownership could not be captured for bundle exec"_ctv);
+      return false;
+    }
+
+    updateSelfLocalMachineUUID = localMachine->uuid;
+    updateSelfLocalBundleRegistered = false;
+    updateSelfLocalContainerBootstraps = std::move(bootstraps);
+    updateSelfWorkerFailure.clear();
+    if (commitMasterAuthorityStateChange() == false)
+    {
+      updateSelfWorkerFailure.assign("local bundle-exec recovery state could not be persisted"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  bool noteLocalBundleRegistration(
+      const Machine *machine,
+      const String& installedDigest)
+  {
+    if (machine == nullptr || updateSelfLocalMachineUUID == 0 ||
+        machine->uuid != updateSelfLocalMachineUUID)
+    {
+      return false;
+    }
+    if (updateSelfWorkerExpectedBundleSHA256.empty() ||
+        installedDigest.equals(updateSelfWorkerExpectedBundleSHA256) == false)
+    {
+      if (updateSelfWorkerFailure != "local post-exec bundle digest mismatch"_ctv)
+      {
+        updateSelfWorkerFailure.assign("local post-exec bundle digest mismatch"_ctv);
+        noteMasterAuthorityRuntimeStateChanged();
+      }
+      return false;
+    }
+    if (updateSelfLocalBundleRegistered == false)
+    {
+      updateSelfLocalBundleRegistered = true;
+      updateSelfWorkerFailure.clear();
+      noteMasterAuthorityRuntimeStateChanged();
+    }
+    return true;
+  }
+
+  bool localBundleInventoryMatches(
+      const Machine *machine,
+      const bytell_hash_set<uint128_t>& reportedContainerUUIDs) const
+  {
+    if (machine == nullptr || machine->uuid != updateSelfLocalMachineUUID ||
+        updateSelfLocalBundleRegistered == false)
+    {
+      return false;
+    }
+    // The local Neuron may also own lifecycle infrastructure (for example the
+    // Mothership tunnel provider) that is not part of application deployment
+    // replay. Require every captured application identity without rejecting
+    // those independently owned live runtimes.
+    if (reportedContainerUUIDs.size() < updateSelfLocalContainerBootstraps.size())
+    {
+      return false;
+    }
+    for (const String& serializedBootstrap : updateSelfLocalContainerBootstraps)
+    {
+      NeuronContainerBootstrap bootstrap = {};
+      if (BitseryEngine::deserializeSafe(serializedBootstrap, bootstrap) == false ||
+          reportedContainerUUIDs.contains(bootstrap.plan.uuid) == false)
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void completeLocalBundleExecRecovery(void)
+  {
+    resetUpdateSelfState();
+    updateSelfTransitionAfterMothershipAck = false;
+    updateSelfWorkerExpectedBundleSHA256.clear();
+    updateSelfWorkerFailure.clear();
+    updateSelfWorkerMachineUUIDs.clear();
+    updateSelfWorkerStagedMachineUUIDs.clear();
+    updateSelfWorkerTransitionIssuedMachineUUIDs.clear();
+    updateSelfWorkerRebootedMachineUUIDs.clear();
+    updateSelfWorkerStateUploadedMachineUUIDs.clear();
+    updateSelfLocalMachineUUID = 0;
+    updateSelfLocalBundleRegistered = false;
+    updateSelfLocalContainerBootstraps.clear();
+    noteMasterAuthorityRuntimeStateChanged();
   }
 
   void completeWorkerBundleUpgradeIfReady(void)
@@ -23262,12 +23476,19 @@ public:
       return;
     }
 
+    if (prepareLocalBundleExecRecovery() == false)
+    {
+      noteMasterAuthorityRuntimeStateChanged();
+      return;
+    }
+
     MothershipResponse response = {};
     response.success = true;
     String serializedResponse = {};
     BitseryEngine::serialize(serializedResponse, response);
     Message::construct(updateSelfWorkerMothership->wBuffer, MothershipTopic::updateProdigy, serializedResponse);
     updateSelfTransitionAfterMothershipAck = true;
+    Ring::queueSend(updateSelfWorkerMothership);
     updateSelfWorkerMothership = nullptr;
     beginUpdateSelfBundle(0);
   }
@@ -23325,6 +23546,29 @@ public:
     {
       noteMasterAuthorityRuntimeStateChanged();
     }
+  }
+
+  bool workerBundleUpgradeRequiresStateRefresh(const Machine *machine) const
+  {
+    return machine != nullptr &&
+           updateSelfWorkerMachineUUIDs.contains(machine->uuid) &&
+           updateSelfWorkerRebootedMachineUUIDs.contains(machine->uuid) &&
+           updateSelfWorkerStateUploadedMachineUUIDs.contains(machine->uuid) == false;
+  }
+
+  bool workerBundleUpgradeTransitionPending(const Machine *machine) const
+  {
+    return machine != nullptr &&
+           updateSelfWorkerMachineUUIDs.contains(machine->uuid) &&
+           updateSelfWorkerTransitionIssuedMachineUUIDs.contains(machine->uuid) &&
+           updateSelfWorkerStateUploadedMachineUUIDs.contains(machine->uuid) == false;
+  }
+
+  virtual bool localNeuronStateRefreshMayBypassIgnition(const Machine *machine, bool haveData) const
+  {
+    (void)machine;
+    (void)haveData;
+    return false;
   }
 
   void noteWorkerStateUpload(NeuronView *neuron)
@@ -28331,6 +28575,24 @@ public:
                 noteMasterAuthorityRuntimeStateChanged();
                 completeWorkerBundleUpgradeIfReady();
               }
+              else
+              {
+                if (updateSelfLocalMachineUUID != 0 &&
+                    updateSelfWorkerExpectedBundleSHA256.equals(expectedWorkerDigest) == false)
+                {
+                  response.success = false;
+                  response.failure.assign("another local bundle upgrade is incomplete"_ctv);
+                }
+                else
+                {
+                  updateSelfWorkerExpectedBundleSHA256 = expectedWorkerDigest;
+                  if (updateSelfLocalMachineUUID == 0 && prepareLocalBundleExecRecovery() == false)
+                  {
+                    response.success = false;
+                    response.failure = updateSelfWorkerFailure;
+                  }
+                }
+              }
             }
           }
 
@@ -29720,7 +29982,7 @@ public:
           uint8_t *args = message->args;
 
           Machine *machine = neuron->machine;
-          const bool needsStateRefresh = machineNeedsNeuronStateRefresh(machine);
+          bool needsStateRefresh = machineNeedsNeuronStateRefresh(machine);
 
           Message::extractArg<ArgumentNature::fixed>(args, machine->lastUpdatedOSMs);
           Message::extractToString(args, machine->kernel);
@@ -29741,10 +30003,21 @@ public:
             Message::extractToStringView(args, installedBundleDigest);
           }
           noteWorkerRegistration(neuron, installedBundleDigest);
+          // A digest-matching post-exec registration proves the intended
+          // bundle is running, but the fresh Neuron still needs the brain's
+          // authoritative container/network/storage replay. Completion is
+          // credited only after the corresponding state-upload acknowledgement.
+          const bool workerBundleRefresh = workerBundleUpgradeRequiresStateRefresh(machine);
+          const bool localBundleRefresh = noteLocalBundleRegistration(machine, installedBundleDigest);
+          const bool localBrainRefresh = localBundleRefresh || localNeuronStateRefreshMayBypassIgnition(machine, haveData);
+          needsStateRefresh = needsStateRefresh || workerBundleRefresh;
 
           if (haveData == false || needsStateRefresh) // either 1) first time the neuron is connecting or 2) neuron crashed or 3) neuron was updated or 4) OS updated
           {
-            if (ignited)
+            // A bundle transition is an already-authorized lifecycle operation.
+            // Do not deadlock its post-exec attestation behind the delayed
+            // cluster ignition timer when this existing worker has a fragment.
+            if (ignited || workerBundleRefresh || localBrainRefresh)
             {
               if (brainConfig.datacenterFragment == 0)
               {
@@ -30220,6 +30493,10 @@ public:
           sendNeuronSwitchboardStateSync(neuron->machine);
           recoverDeploymentsAfterNeuronState();
           noteWorkerStateUpload(neuron);
+          if (localBundleInventoryMatches(neuron->machine, reportedMachineContainerUUIDs))
+          {
+            completeLocalBundleExecRecovery();
+          }
 
           break;
         }

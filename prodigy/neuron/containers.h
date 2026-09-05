@@ -260,6 +260,66 @@ static inline bool prodigySharedCPUQuotaText(const ApplicationConfig& config, St
   return true;
 }
 
+static inline bool prodigyResolveRestoredLogicalCores(
+    const String& configured,
+    const String& effective,
+    uint16_t requested,
+    uint16_t *logicalCores,
+    uint64_t logicalCoreCapacity)
+{
+  if (requested == 0 || logicalCores == nullptr || requested > logicalCoreCapacity)
+  {
+    return false;
+  }
+
+  ProdigyLinuxCPUList parsed = {};
+  if ((prodigyParseLinuxCPUList(configured, parsed) == false || parsed.count < requested) &&
+      (prodigyParseLinuxCPUList(effective, parsed) == false || parsed.count < requested))
+  {
+    return false;
+  }
+
+  uint16_t assigned = 0;
+  for (uint16_t cpu = 0; cpu < parsed.contains.size() && assigned < requested; ++cpu)
+  {
+    if (parsed.contains[cpu])
+    {
+      logicalCores[assigned++] = cpu;
+    }
+  }
+  return assigned == requested;
+}
+
+static inline bool prodigyParseFirstCgroupPID(const String& input, pid_t& pid)
+{
+  uint64_t value = 0;
+  bool haveDigit = false;
+  for (uint64_t index = 0; index < input.size(); ++index)
+  {
+    const char character = input.data()[index];
+    if (character == '\n')
+    {
+      break;
+    }
+    if (character < '0' || character > '9')
+    {
+      return false;
+    }
+    haveDigit = true;
+    value = value * 10 + uint64_t(character - '0');
+    if (value > uint64_t(std::numeric_limits<pid_t>::max()))
+    {
+      return false;
+    }
+  }
+  if (haveDigit == false || value == 0)
+  {
+    return false;
+  }
+  pid = pid_t(value);
+  return true;
+}
+
 static inline void prodigyBuildContainerStartupFlags(const ContainerPlan& plan, Vector<uint64_t>& flags)
 {
   flags.clear();
@@ -11528,7 +11588,9 @@ public:
     return false;
   }
 
-  static void spinContainer(ContainerPlan plan, uint128_t replaceContainerUUID, const NeuronContainerMetricPolicy& metricPolicy) // copy this into here in case we suspend
+  // Coroutine arguments must own every value used after suspension. Callers
+  // commonly supply a handler-local or temporary metric policy.
+  static void spinContainer(ContainerPlan plan, uint128_t replaceContainerUUID, NeuronContainerMetricPolicy metricPolicy)
   {
     bool skipLaunch = false;
     String taskGateFailure = {};

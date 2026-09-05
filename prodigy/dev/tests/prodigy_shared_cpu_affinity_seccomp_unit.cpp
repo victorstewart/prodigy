@@ -2,6 +2,11 @@
 #include <services/debug.h>
 #include <prodigy/neuron/containers.h>
 
+static_assert(std::is_same_v<
+              decltype(&ContainerManager::spinContainer),
+              void (*)(ContainerPlan, uint128_t, NeuronContainerMetricPolicy)>,
+              "suspending container launch must own its metric policy");
+
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -33,6 +38,19 @@ public:
     }
   }
 };
+
+static void testRestoredCgroupPIDParsing(TestSuite& suite)
+{
+  pid_t pid = -1;
+  suite.expect(prodigyParseFirstCgroupPID(String("662176\n"), pid) && pid == 662176,
+               "restored_cgroup_pid_trims_newline");
+  suite.expect(prodigyParseFirstCgroupPID(String("42\n43\n"), pid) && pid == 42,
+               "restored_cgroup_pid_uses_first_process");
+  suite.expect(!prodigyParseFirstCgroupPID(String("12x\n"), pid),
+               "restored_cgroup_pid_rejects_malformed");
+  suite.expect(!prodigyParseFirstCgroupPID(String("99999999999999999999\n"), pid),
+               "restored_cgroup_pid_rejects_overflow");
+}
 
 static int firstAllowedCPU(void)
 {
@@ -579,6 +597,7 @@ static int runContainerEnvironmentSanitizationProbe(void)
 int main(void)
 {
   TestSuite suite;
+  testRestoredCgroupPIDParsing(suite);
 
   ProdigyLinuxCPUList cpus = {};
   String formattedCPUs = {};
@@ -600,6 +619,24 @@ int main(void)
           prodigyParseLinuxCPUList(String("0,256"_ctv), cpus) == false &&
           prodigyParseLinuxCPUList(String("0,"_ctv), cpus) == false,
       "linux_cpulist_rejects_overlap_reversal_overflow_and_trailing_separator");
+  std::array<uint16_t, 4> restoredLogicalCores = {};
+  suite.expect(
+      prodigyResolveRestoredLogicalCores(
+          String(),
+          String("4-7"_ctv),
+          2,
+          restoredLogicalCores.data(),
+          restoredLogicalCores.size()) &&
+          restoredLogicalCores[0] == 4 && restoredLogicalCores[1] == 5,
+      "restore_cpulist_uses_effective_assignment_when_configured_list_is_empty");
+  suite.expect(
+      prodigyResolveRestoredLogicalCores(
+          String(),
+          String(),
+          2,
+          restoredLogicalCores.data(),
+          restoredLogicalCores.size()) == false,
+      "restore_cpulist_rejects_missing_configured_and_effective_assignments");
 
   suite.expect(
       prodigyCgroupWriteComplete(4, 4) &&

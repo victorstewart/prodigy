@@ -131,6 +131,8 @@ protected:
   uint32_t brainControlKeepaliveSeconds = 15;
   TimeoutPacket metricsTick;
   bool metricsTickQueued = false;
+  TimeoutPacket bundleExecRetryTick;
+  bool bundleExecRetryTickQueued = false;
   class WormholeFlowGC final : public TimeoutDispatcher {
     class PinnedMap {
     public:
@@ -3635,11 +3637,52 @@ public:
     }
   }
 
+  // A container-download waiter is embedded in the suspended spinContainer
+  // coroutine frame. Resuming its sole continuation may complete and destroy
+  // that frame, so the wake path must not read the waiter again afterward.
+  static void resumeContainerDownloadWaiter(CoroutineStack *waiter)
+  {
+    if (waiter == nullptr || waiter->suspended.empty())
+    {
+      return;
+    }
+    coroutine_handle<> continuation = waiter->suspended.back();
+    waiter->suspended.pop_back();
+    continuation.resume();
+  }
+
   // Keep live container processes and their mounts intact.  The replacement
   // Neuron re-registers and stateUpload re-adopts them before scheduling any
   // new work; this is deliberately an exec, not a Neuron restart/teardown.
-  [[noreturn]] void transitionToNewBundle(void)
+  virtual bool quiesceProcessForBundleExec(void)
   {
+    return true;
+  }
+
+  void queueBundleExecRetry(void)
+  {
+    if (bundleExecRetryTickQueued)
+    {
+      return;
+    }
+    bundleExecRetryTick.clear();
+    bundleExecRetryTick.originator = this;
+    bundleExecRetryTick.setTimeoutMs(10);
+    Ring::queueTimeout(&bundleExecRetryTick);
+    bundleExecRetryTickQueued = true;
+  }
+
+  virtual void transitionToNewBundle(void)
+  {
+    // Host-control HTTP and DNS own raw-fd polls. Their asynchronous shutdown
+    // callbacks are the lifetime barrier required by Ring::shutdownForExec().
+    // Retry from this Neuron-owned timer after cancellation CQEs are dispatched.
+    if (quiesceProcessForBundleExec() == false)
+    {
+      queueBundleExecRetry();
+      return;
+    }
+
     String failure = {};
     if (prodigyInstallBundleToRoot(prodigyStagedBundlePath(), "/root/prodigy"_ctv, &failure) == false)
     {
@@ -3673,6 +3716,45 @@ public:
     }
     execl(binaryPath.c_str(), binaryPath.c_str(), (char *)NULL);
     _exit(EXIT_FAILURE);
+  }
+
+  // Bundle payloads are release-sized and their digest/install temporaries have
+  // non-trivial lifetimes. Keep this path off neuronHandler's bounded dispatch
+  // stack: the integrated live rollout reproduced a guard-page SIGSEGV while
+  // processing updateBundle inline, while this isolated frame transitioned the
+  // same worker cleanly.
+  [[gnu::noinline]] void handleBundleUpdateMessage(Message *message)
+  {
+    uint8_t *args = message->args;
+    String bundle = {};
+    String expectedDigest = {};
+    Message::extractToStringView(args, bundle);
+    Message::extractToStringView(args, expectedDigest);
+    String actualDigest = {};
+    String failure = {};
+    const int written = Filesystem::openWriteAtClose(-1, prodigyStagedBundlePath(), bundle);
+    if (written < 0 || uint64_t(written) != bundle.size() ||
+        prodigyFileMatchesExpectedSHA256Hex(prodigyStagedBundlePath(), expectedDigest, actualDigest, &failure) == false)
+    {
+      basics_log("neuron updateBundle rejected bytes=%llu reason=%s\n", (unsigned long long)bundle.size(), failure.c_str());
+      if (brain != nullptr)
+      {
+        Message::construct(brain->wBuffer, NeuronTopic::updateBundle, false, actualDigest, failure);
+        if (streamIsActive(brain))
+        {
+          Ring::queueSend(brain);
+        }
+      }
+      return;
+    }
+    if (brain != nullptr)
+    {
+      Message::construct(brain->wBuffer, NeuronTopic::updateBundle, true, actualDigest, String());
+      if (streamIsActive(brain))
+      {
+        Ring::queueSend(brain);
+      }
+    }
   }
 
   void neuronHandler(Message *message)
@@ -3773,9 +3855,13 @@ public:
                        unsigned(lcsubnet6.mpfx[2]));
           }
 
-          bool malformedStateUpload = false;
-          while (args < terminal) // it's possible that some of these containers died right?
-          {
+          // Container re-adoption carries several large domain values. Keep
+          // them in a separate non-inlined frame so the bounded control
+          // dispatcher does not reserve that storage for every Neuron topic.
+          auto applyStateUploadPlans = [this, &args, terminal]() __attribute__((noinline)) -> bool {
+            bool malformedStateUpload = false;
+            while (args < terminal) // it's possible that some of these containers died right?
+            {
             String buffer;
             Message::extractToStringView(args, buffer);
             if (buffer.data() > terminal || buffer.size() > uint64_t(terminal - buffer.data()))
@@ -3836,28 +3922,41 @@ public:
 
             container->cgroup = Filesystem::openDirectoryAt(-1, path);
 
-            path.snprintf<"/sys/fs/cgroup/containers.slice/{}.slice/cpuset.cpus"_ctv>(container->name);
-            Filesystem::openReadAtClose(-1, path, output);
-
             memset(container->lcores, 0, sizeof(container->lcores));
             if (applicationUsesIsolatedCPUs(container->plan.config))
             {
-              // {itoa}-{itoa}
-              uint16_t lowCore = output.toNumber<uint16_t>(uint64_t(0), output.findChar('-', 1));
-
-              for (uint16_t index = 0; index < container->plan.config.nLogicalCores; ++index)
+              String configuredCPUs = {};
+              String effectiveCPUs = {};
+              path.snprintf<"/sys/fs/cgroup/containers.slice/{}.slice/cpuset.cpus"_ctv>(container->name);
+              Filesystem::openReadAtClose(-1, path, configuredCPUs);
+              path.snprintf<"/sys/fs/cgroup/containers.slice/{}.slice/cpuset.cpus.effective"_ctv>(container->name);
+              Filesystem::openReadAtClose(-1, path, effectiveCPUs);
+              if (prodigyResolveRestoredLogicalCores(
+                      configuredCPUs,
+                      effectiveCPUs,
+                      container->plan.config.nLogicalCores,
+                      container->lcores,
+                      std::size(container->lcores)) == false)
               {
-                container->lcores[index] = lowCore + index;
+                basics_log("restoreContainer cpuset recovery failed uuid=%llu configured=%s effective=%s requested=%u\n",
+                           (unsigned long long)container->plan.uuid,
+                           configuredCPUs.c_str(),
+                           effectiveCPUs.c_str(),
+                           unsigned(container->plan.config.nLogicalCores));
+                delete container;
+                malformedStateUpload = true;
+                break;
               }
             }
 
             Filesystem::openReadAtClose(container->cgroup, "cgroup.procs"_ctv, output);
 
-            if (output.size() > 0)
+            pid_t restoredPID = -1;
+            if (prodigyParseFirstCgroupPID(output, restoredPID))
             {
               // in the future if we ever need to run multiple processes inside a container,
               // then we'd need to check /proc/{pid}/status and line NSpid: 12345 1 to get the pid mapping to select pid 1
-              container->pid = output.toNumber<pid_t>();
+              container->pid = restoredPID;
               container->pidfd = syscall(SYS_pidfd_open, container->pid, 0);
 
               if (container->plan.useHostNetworkNamespace == false)
@@ -3950,7 +4049,10 @@ public:
                 reportContainerFailed(restoredUUID, 0, 0, empty, restarted);
               }
             }
-          }
+            }
+            return malformedStateUpload == false;
+          };
+          const bool malformedStateUpload = applyStateUploadPlans() == false;
 
           if (malformedStateUpload)
           {
@@ -3970,35 +4072,7 @@ public:
         }
       case NeuronTopic::updateBundle:
         {
-          String bundle = {};
-          String expectedDigest = {};
-          Message::extractToStringView(args, bundle);
-          Message::extractToStringView(args, expectedDigest);
-          String actualDigest = {};
-          String failure = {};
-          const int written = Filesystem::openWriteAtClose(-1, prodigyStagedBundlePath(), bundle);
-          if (written < 0 || uint64_t(written) != bundle.size() ||
-              prodigyFileMatchesExpectedSHA256Hex(prodigyStagedBundlePath(), expectedDigest, actualDigest, &failure) == false)
-          {
-            basics_log("neuron updateBundle rejected bytes=%llu reason=%s\n", (unsigned long long)bundle.size(), failure.c_str());
-            if (brain != nullptr)
-            {
-              Message::construct(brain->wBuffer, NeuronTopic::updateBundle, false, actualDigest, failure);
-              if (streamIsActive(brain))
-              {
-                Ring::queueSend(brain);
-              }
-            }
-            break;
-          }
-          if (brain != nullptr)
-          {
-            Message::construct(brain->wBuffer, NeuronTopic::updateBundle, true, actualDigest, String());
-            if (streamIsActive(brain))
-            {
-              Ring::queueSend(brain);
-            }
-          }
+          handleBundleUpdateMessage(message);
           break;
         }
       case NeuronTopic::transitionToNewBundle:
@@ -4177,7 +4251,7 @@ public:
               }
 
               resumed.emplace(coro);
-              coro->co_consume();
+              resumeContainerDownloadWaiter(coro);
             }
           }
 
@@ -5505,6 +5579,16 @@ public:
   {
     if (packet == nullptr)
     {
+      return;
+    }
+
+    if (packet == &bundleExecRetryTick)
+    {
+      bundleExecRetryTickQueued = false;
+      if (result != -ECANCELED)
+      {
+        transitionToNewBundle();
+      }
       return;
     }
 
