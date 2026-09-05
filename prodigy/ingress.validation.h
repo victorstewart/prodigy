@@ -668,7 +668,10 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
         {
           return false;
         }
-        return (cursor == terminal);
+        // New Neurons attest the installed bundle on registration. Accept the
+        // legacy frame without an attestation so mixed-version recovery can
+        // still establish control before an upgrade is requested.
+        return cursor == terminal || (consumeVariable(cursor, terminal) && cursor == terminal);
       }
     case NeuronTopic::machineHardwareProfile:
     case NeuronTopic::pullContainerLogs:
@@ -828,8 +831,10 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
       }
     case NeuronTopic::updateBundle:
       {
-        // A worker only reports a bundle stage by the zero-length echo.
-        return (cursor == terminal);
+        bool success = false;
+        return extractFixed(cursor, terminal, success) &&
+               consumeVariable(cursor, terminal) &&
+               consumeVariable(cursor, terminal) && cursor == terminal;
       }
     case NeuronTopic::transitionToNewBundle:
       {

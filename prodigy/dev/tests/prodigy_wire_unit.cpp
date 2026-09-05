@@ -1109,6 +1109,25 @@ int main(void)
         ProdigyIngressValidation::validateNeuronPayloadForNeuron(message->topic, message->args, message->terminal()),
         "task_attempt_terminal_ack_valid_for_neuron");
 
+    frame.clear();
+    Message::construct(frame, NeuronTopic::registration, int64_t(101), "kernel"_ctv, "os"_ctv, "version"_ctv, true, "0123456789abcdef"_ctv);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(
+        ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal()),
+        "neuron_registration_with_installed_bundle_digest_valid_for_brain");
+    frame.clear();
+    Message::construct(frame, NeuronTopic::updateBundle, true, "0123456789abcdef"_ctv, ""_ctv);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(
+        ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal()),
+        "neuron_bundle_stage_digest_ack_valid_for_brain");
+    frame.clear();
+    Message::construct(frame, NeuronTopic::updateBundle, "bundle"_ctv, "0123456789abcdef"_ctv);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(
+        ProdigyIngressValidation::validateNeuronPayloadForNeuron(message->topic, message->args, message->terminal()),
+        "neuron_bundle_stage_request_valid_for_neuron");
+
     ContainerLogsOperation logs = {};
     logs.requestID = 71;
     logs.applicationID = 16;
