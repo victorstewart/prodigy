@@ -785,6 +785,19 @@ then
    ip netns exec "${parent_ns}" ip route replace default via 172.31.0.1 dev "${parent_edge}"
    ip netns exec "${parent_ns}" ip -6 route replace default via fd00:31::1 dev "${parent_edge}"
    ip netns exec "${parent_ns}" ip route replace 198.18.0.0/16 via 10.0.0.10 dev vdcbr0 src 10.0.0.1 mtu "${public_ingress_mtu}"
+   # Development host-public IPv4 leases encode the selected machine in the
+   # low address byte.  Reply-flow state is learned by that machine's egress
+   # program and is intentionally not replicated, so return traffic must go
+   # back through the same machine rather than through the Brain catch-all.
+   # Keep the /16 route for other synthetic routable-prefix traffic, while
+   # installing more-specific routes for every machine-owned host-public IP.
+   for index in $(seq 1 "${machine_count}")
+   do
+      host_octet=$((9 + index))
+      ip netns exec "${parent_ns}" ip route replace \
+         "198.18.0.${host_octet}/32" via "10.0.0.${host_octet}" dev vdcbr0 \
+         src 10.0.0.1 mtu "${public_ingress_mtu}"
+   done
    ip netns exec "${parent_ns}" ip -6 route replace 2602:fac0:0:12ab:34cd::/88 via fd00:10::a dev vdcbr0
    ip netns exec "${parent_ns}" sysctl -q -w net.ipv4.ip_forward=1
    ip netns exec "${parent_ns}" sysctl -q -w net.ipv6.conf.all.forwarding=1

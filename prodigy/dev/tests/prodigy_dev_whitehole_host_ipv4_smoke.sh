@@ -135,7 +135,7 @@ read -r -d '' CREATE_REQUEST <<EOF || true
   ],
   "test": {
     "workspaceRoot": "${workspace_root}",
-    "machineCount": 1,
+    "machineCount": 2,
     "brainBootstrapFamily": "ipv4",
     "enableFakeIpv4Boundary": true
   }
@@ -261,9 +261,9 @@ cat > "${plan_json}" <<EOF
   "minimumSubscriberCapacity": 1024,
   "isStateful": false,
   "stateless": {
-    "nBase": 1,
+    "nBase": 2,
     "maxPerRackRatio": 1.0,
-    "maxPerMachineRatio": 1.0,
+    "maxPerMachineRatio": 0.5,
     "moveableDuringCompaction": true
   },
   "whiteholes": [
@@ -300,17 +300,18 @@ with open(log_path, "w", encoding="utf-8") as log:
       listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
       listener.bind((bind_ip, target_port))
-      listener.listen(1)
+      listener.listen(2)
       listener.settimeout(30.0)
       log.write(f"ready tcp bind={bind_ip}:{target_port}\n")
       log.flush()
-      connection, addr = listener.accept()
-      with connection:
-         payload = connection.recv(2048)
-         log.write(f"recv addr={addr[0]}:{addr[1]} payload={payload.decode(errors='replace')}\n")
-         log.flush()
-         connection.sendall(b"whitehole-ok")
-      log.write("sent tcp reply\n")
+      for _ in range(2):
+         connection, addr = listener.accept()
+         with connection:
+            payload = connection.recv(2048)
+            log.write(f"recv addr={addr[0]}:{addr[1]} payload={payload.decode(errors='replace')}\n")
+            log.flush()
+            connection.sendall(b"whitehole-ok")
+      log.write("sent tcp reply count=2\n")
       log.flush()
       raise SystemExit(0)
 
@@ -321,13 +322,17 @@ with open(log_path, "w", encoding="utf-8") as log:
    legit.settimeout(30.0)
    log.write(f"ready bind={bind_ip}:{target_port} spoof={bind_ip}:{spoof_port}\n")
    log.flush()
-   payload, addr = legit.recvfrom(2048)
-   log.write(f"recv addr={addr[0]}:{addr[1]} payload={payload.decode(errors='replace')}\n")
-   log.flush()
-   legit.sendto(b"whitehole-ok", addr)
+   peers = []
+   for _ in range(2):
+      payload, addr = legit.recvfrom(2048)
+      peers.append(addr)
+      log.write(f"recv addr={addr[0]}:{addr[1]} payload={payload.decode(errors='replace')}\n")
+      log.flush()
+      legit.sendto(b"whitehole-ok", addr)
    time.sleep(0.2)
-   spoof.sendto(b"whitehole-spoof", addr)
-   log.write("sent legit+spoof\n")
+   for addr in peers:
+      spoof.sendto(b"whitehole-spoof", addr)
+   log.write("sent legit+spoof count=2\n")
    log.flush()
 PY
 responder_pid=$!
@@ -349,7 +354,7 @@ do
       "${MOTHERSHIP_BIN}" applicationReport "${cluster_name}" Nametag \
       >"${application_log}" 2>&1
    then
-      if rg -q '^[[:space:]]*nHealthy:[[:space:]]*1$' "${application_log}"
+      if rg -q '^[[:space:]]*nHealthy:[[:space:]]*2$' "${application_log}"
       then
          healthy=1
          break
@@ -387,12 +392,13 @@ responder_pid=""
 
 if [[ "${whitehole_transport}" == tcp ]]
 then
-   responder_completion='sent tcp reply'
+   responder_completion='sent tcp reply count=2'
 else
-   responder_completion='sent legit\+spoof'
+   responder_completion='sent legit\+spoof count=2'
 fi
 
-if ! rg -q "${responder_completion}" "${responder_log}"
+if ! rg -q "${responder_completion}" "${responder_log}" ||
+   [[ "$(rg -c '^recv addr=' "${responder_log}")" -ne 2 ]]
 then
    archive_workspace=1
    echo "FAIL: responder did not complete the legit+spoof sequence"
