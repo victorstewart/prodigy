@@ -60,6 +60,10 @@ fail()
 cleanup()
 {
    set +e
+   if [[ "${keep_tmp}" -eq 1 && -d "${workspace_root}" ]]
+   then
+      cp -a "${workspace_root}" "${tmpdir}/workspace-evidence"
+   fi
    if [[ "${cluster_created}" -eq 1 ]]
    then
       env \
@@ -193,6 +197,8 @@ wait_report()
       fi
       sleep 0.25
    done
+   run_mothership applicationReport "${cluster_name}" "${app_name}" >"${tmpdir}/application-report-${label}.log" 2>&1 || true
+   run_mothership clusterReport "${cluster_name}" >"${tmpdir}/cluster-report-${label}.log" 2>&1 || true
    fail "taskReport ${label} did not reach ${state} with ${extra}" "${log}"
 }
 
@@ -224,27 +230,27 @@ write_plan "${retry_plan}" 62012 "${retry_version}" untilSucceeded
 write_plan "${exhausted_plan}" 62013 "${exhausted_version}" untilSucceeded
 
 deploy_task success "${success_plan}" "${success_blob}"
-wait_report success "${success_name}" "${success_version}" succeeded 'attempt=1 .* started=1 .* succeeded=1 .* failed=0 .* resultBytes=[1-9]'
+wait_report success "${success_name}" "${success_version}" succeeded 'attempt=1.*started=1.*succeeded=1.*failed=0.*resultBytes=[1-9]'
 
 deploy_task duplicate-success "${success_plan}" "${success_blob}"
-wait_report duplicate-success "${success_name}" "${success_version}" succeeded 'attempt=1 .* started=1 .* succeeded=1 .* failed=0'
+wait_report duplicate-success "${success_name}" "${success_version}" succeeded 'attempt=1.*started=1.*succeeded=1.*failed=0'
 
 deploy_task failure "${failure_plan}" "${failure_blob}"
-wait_report failure "${failure_name}" "${failure_version}" failed 'attempt=1 .* started=1 .* succeeded=0 .* failed=1 .* resultBytes=[1-9]'
+wait_report failure "${failure_name}" "${failure_version}" failed 'attempt=1.*started=1.*succeeded=0.*failed=1.*resultBytes=[1-9]'
 
 deploy_task duplicate-failure "${failure_plan}" "${failure_blob}"
-wait_report duplicate-failure "${failure_name}" "${failure_version}" failed 'attempt=1 .* started=1 .* succeeded=0 .* failed=1 .* resultBytes=[1-9]'
+wait_report duplicate-failure "${failure_name}" "${failure_version}" failed 'attempt=1.*started=1.*succeeded=0.*failed=1.*resultBytes=[1-9]'
 
 deploy_task retry "${retry_plan}" "${retry_blob}"
-wait_report retry "${retry_name}" "${retry_version}" succeeded 'attempt=2 .* started=2 .* succeeded=1 .* failed=1 .* resultBytes=[1-9]'
+wait_report retry "${retry_name}" "${retry_version}" succeeded 'attempt=2.*started=2.*succeeded=1.*failed=1.*resultBytes=[1-9]'
 
 deploy_task duplicate-retry "${retry_plan}" "${retry_blob}"
-wait_report duplicate-retry "${retry_name}" "${retry_version}" succeeded 'attempt=2 .* started=2 .* succeeded=1 .* failed=1 .* resultBytes=[1-9]'
+wait_report duplicate-retry "${retry_name}" "${retry_version}" succeeded 'attempt=2.*started=2.*succeeded=1.*failed=1.*resultBytes=[1-9]'
 
 deploy_task exhausted "${exhausted_plan}" "${exhausted_blob}"
-wait_report exhausted "${exhausted_name}" "${exhausted_version}" failed 'attempt=3 .* started=3 .* succeeded=0 .* failed=3 .* resultBytes=[1-9]'
+wait_report exhausted "${exhausted_name}" "${exhausted_version}" failed 'attempt=3.*started=3.*succeeded=0.*failed=3.*resultBytes=[1-9]'
 
 deploy_task duplicate-exhausted "${exhausted_plan}" "${exhausted_blob}"
-wait_report duplicate-exhausted "${exhausted_name}" "${exhausted_version}" failed 'attempt=3 .* started=3 .* succeeded=0 .* failed=3 .* resultBytes=[1-9]'
+wait_report duplicate-exhausted "${exhausted_name}" "${exhausted_version}" failed 'attempt=3.*started=3.*succeeded=0.*failed=3.*resultBytes=[1-9]'
 
 echo "PASS: task container smoke success=${success_version} failure=${failure_version} retry=${retry_version} exhausted=${exhausted_version}"

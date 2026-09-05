@@ -264,7 +264,12 @@ protected:
       path.assign(root);
       return path;
     }
-    return "/var/lib/prodigy/task-attempts"_ctv;
+    // Construct an owning String. Returning the compile-time view directly
+    // retains its terminator in this String implementation, so a later path
+    // append is placed after NUL and atomic persistence targets the directory.
+    String path = {};
+    path.assign("/var/lib/prodigy/task-attempts"_ctv);
+    return path;
   }
 
   static String taskAttemptJournalPath(uint64_t deploymentID, uint32_t attemptNumber)
@@ -3033,6 +3038,11 @@ public:
       containerUUID = container->plan.uuid;
       pendingDestroyBeforeWait = container->pendingDestroy;
       container->waitidPending = false;
+      if (container->pidfd > 0)
+      {
+        close(container->pidfd);
+        container->pidfd = -1;
+      }
       container->disableKillSwitch();
       killedOnPurpose = container->killedOnPurpose;
 

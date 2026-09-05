@@ -24895,10 +24895,9 @@ public:
     if (recordIt->second.state == TaskExecutionState::retrying)
     {
       pushSpinApplicationProgressToMothership(deployment, "task attempt failed; retrying"_ctv);
-      deployment->state = DeploymentState::deploying;
-      deployment->stateChangedAtMs = nowMs;
-      deployment->architect(nullptr, false, false, false);
-      deployment->schedule(nullptr);
+      // Re-enter the deployment's canonical target/placement/scheduling
+      // lifecycle after the completed attempt releases its placement counts.
+      deployment->deploy();
       return;
     }
 

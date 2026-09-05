@@ -13672,6 +13672,9 @@ static void testNeuronCloseHandlerPaths(TestSuite& suite)
     container->plan.uuid = uint128_t(0xC063);
     container->name.assign("unit-close-waitid-order"_ctv);
     container->pid = getpid();
+    int queuedPidfd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    suite.expect(queuedPidfd >= 0, "neuron_close_handler_pending_destroy_opens_waitid_owned_pidfd");
+    container->pidfd = queuedPidfd;
     container->pendingDestroy = true;
     container->waitidPending = true;
     container->infop.si_pid = container->pid;
@@ -13684,8 +13687,12 @@ static void testNeuronCloseHandlerPaths(TestSuite& suite)
     suite.expect(neuron.popContainerCallsForTest == 0, "neuron_close_handler_pending_destroy_waits_for_waitid_before_finalize");
     suite.expect(container->destroyCloseCompleted, "neuron_close_handler_pending_destroy_records_close_completion");
     suite.expect(container->waitidPending, "neuron_close_handler_pending_destroy_keeps_waitid_pending");
+    suite.expect(fcntl(queuedPidfd, F_GETFD) >= 0, "neuron_close_handler_pending_destroy_preserves_waitid_owned_pidfd");
 
     neuron.waitContainerForTest(container);
+
+    errno = 0;
+    suite.expect(fcntl(queuedPidfd, F_GETFD) == -1 && errno == EBADF, "neuron_waitid_completion_releases_waitid_owned_pidfd");
 
     uint32_t containerFailedFrames = 0;
     forEachMessageInBuffer(neuron.brainOutboundForTest(), [&](Message *message) {
@@ -21155,6 +21162,15 @@ int main(void)
   {
     Ring::createRing(8, 8, 32, 32, -1, -1, 0);
     createdRing = true;
+  }
+  if (std::getenv("PRODIGY_TEST_TASK_LIFECYCLE_ONLY") != nullptr)
+  {
+    testNeuronCloseHandlerPaths(suite);
+    if (createdRing)
+    {
+      Ring::shutdownForExec();
+    }
+    return suite.failed == 0 ? 0 : 1;
   }
   if (std::getenv("PRODIGY_TEST_OPERATOR_CANCELLATION_ONLY") != nullptr)
   {

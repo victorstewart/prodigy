@@ -8329,6 +8329,21 @@ public:
       return;
     }
 
+    if (container->machine != nullptr)
+    {
+      uint32_t& machineCount = countPerMachine[container->machine];
+      if (machineCount > 0)
+      {
+        machineCount -= 1;
+      }
+
+      uint32_t& rackCount = countPerRack[container->machine->rack];
+      if (rackCount > 0)
+      {
+        rackCount -= 1;
+      }
+    }
+
     switch (container->lifetime)
     {
       case ApplicationLifetime::canary:

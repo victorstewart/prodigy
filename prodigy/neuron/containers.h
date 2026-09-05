@@ -11892,9 +11892,11 @@ public:
     }
     container->resourceDeltaMode = Container::ResourceDeltaMode::none;
 
-    // reclaim resources
-
-    if (container->pidfd > 0)
+    // reclaim resources. A queued IORING_OP_WAITID owns the pidfd until its
+    // completion is dispatched. Task containers commonly close their control
+    // socket just before exiting; teardown must not invalidate that in-flight
+    // wait or the task will remain reported as running forever.
+    if (container->pidfd > 0 && container->waitidPending == false)
     {
       close(container->pidfd);
       container->pidfd = -1;
