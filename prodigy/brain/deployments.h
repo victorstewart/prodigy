@@ -3291,6 +3291,17 @@ private:
       delete retiredSchedulingExecution;
       retiredSchedulingExecution = nullptr;
     }
+
+    // A cancelled deployment can be unlinked only after the scheduler frame
+    // which consumed this callback has retired.  Notify Brain at that point;
+    // the callback itself may still be using this deployment.
+    if (operatorCancellationOwnsTransition &&
+        containers.empty() && waitingOnContainers.empty() &&
+        schedulingStack.execution == nullptr && retiredSchedulingExecution == nullptr &&
+        consumingSchedulingExecution == false)
+    {
+      thisBrain->operatorCancellationContainersTerminated(this);
+    }
   }
 
   void completeCompactionTicketWork(CompactionTicket *ticket)
@@ -9009,6 +9020,14 @@ public:
       delete coro;
     }
 
+    if (operatorCancellationOwnsTransition &&
+        containers.empty() && waitingOnContainers.empty() &&
+        schedulingStack.execution == nullptr && retiredSchedulingExecution == nullptr &&
+        consumingSchedulingExecution == false)
+    {
+      thisBrain->operatorCancellationContainersTerminated(this);
+    }
+
     if (state == DeploymentState::deploying)
     {
       if (plan.config.type != ApplicationType::task && nDeployed() < nTarget())
@@ -9858,6 +9877,19 @@ public:
       }
     }
     return true;
+  }
+
+  // Container acknowledgement is not a lifetime boundary for the deployment:
+  // its scheduler can still be unwinding or have a deferred continuation.
+  // Brain must retain the deployment until every such owner has retired.
+  bool operatorCancellationFinalizationIsQuiescent(void) const
+  {
+    return containers.empty() && waitingOnContainers.empty() &&
+           waitingOnCompactions == false && canaryStack == nullptr &&
+           currentlyExecutingWork == nullptr && toSchedule.empty() &&
+           schedulingStack.execution == nullptr && retiredSchedulingExecution == nullptr &&
+           schedulingStack.waiters.empty() && nSuspended == 0 &&
+           consumingSchedulingExecution == false;
   }
 
   bool lifecycleIsUnmaterialized(void) const

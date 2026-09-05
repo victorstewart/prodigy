@@ -1133,9 +1133,39 @@ public:
   ProdigyOverlayValueMirror<switchboard_overlay_prefix4_key, switchboard_overlay_hosted_ingress_route4> installedPeerHostedIngressRouteKeys4 = {};
   ProdigyOverlayValueMirror<switchboard_overlay_prefix6_key, switchboard_overlay_hosted_ingress_route6> installedPeerHostedIngressRouteKeys6 = {};
   ProdigyOverlayValueMirror<portal_definition, switchboard_whitehole_binding> installedPeerWhiteholeBindingKeys = {};
-  bool syncDeclaredNetworkPairingPolicy(bool invalidateAuthorizedFlows)
+  bool syncDeclaredNetworkPairingPolicy(bool invalidateAuthorizedFlows,
+                                        uint128_t revokedPeerAddress,
+                                        uint16_t revokedServicePort,
+                                        bool revokedAdvertisement)
   {
-    return plan.networkAccess != ContainerNetworkAccess::declaredOnly || syncDeclaredNetworkPolicy(invalidateAuthorizedFlows);
+    if (plan.networkAccess != ContainerNetworkAccess::declaredOnly)
+    {
+      return true;
+    }
+    if (syncDeclaredNetworkPolicy(false) == false)
+    {
+      return false;
+    }
+    if (invalidateAuthorizedFlows == false)
+    {
+      return true;
+    }
+    return revokedPeerAddress != 0 && revokedServicePort != 0 &&
+           revokeAuthorizedTCPFlows(revokedPeerAddress, revokedServicePort, revokedAdvertisement);
+  }
+
+  static bool authorizedTCPFlowMatchesRevokedPairing(const flow_key& flow,
+                                                      uint128_t peerAddress,
+                                                      uint16_t servicePort,
+                                                      bool advertisement)
+  {
+    if (peerAddress == 0 || servicePort == 0 ||
+        std::memcmp(flow.dstv6, &peerAddress, sizeof(peerAddress)) != 0)
+    {
+      return false;
+    }
+    const __be16 networkServicePort = htons(servicePort);
+    return flow.port16[advertisement ? 0 : 1] == networkServicePort;
   }
 
 private:
@@ -1498,6 +1528,40 @@ public:
   bool clearAuthorizedTCPFlows(void)
   {
     return clearBPFMap<flow_key>(peer_program, "ct_tcp_flows"_ctv);
+  }
+
+  bool revokeAuthorizedTCPFlows(uint128_t peerAddress, uint16_t servicePort, bool advertisement)
+  {
+    if (peer_program == nullptr)
+    {
+      return false;
+    }
+    bool ok = false;
+    peer_program->openMap("ct_tcp_flows"_ctv, [&](int mapFD) -> void {
+      if (mapFD < 0)
+      {
+        return;
+      }
+      ok = true;
+      Vector<flow_key> revoked = {};
+      flow_key current = {}, next = {};
+      int result = bpf_map_get_next_key(mapFD, nullptr, &next);
+      while (result == 0)
+      {
+        if (authorizedTCPFlowMatchesRevokedPairing(next, peerAddress, servicePort, advertisement))
+        {
+          revoked.push_back(next);
+        }
+        current = next;
+        result = bpf_map_get_next_key(mapFD, &current, &next);
+      }
+      ok &= result == -ENOENT || errno == ENOENT;
+      for (const flow_key& flow : revoked)
+      {
+        ok &= bpf_map_delete_elem(mapFD, &flow) == 0;
+      }
+    });
+    return ok;
   }
 
   void denyDeclaredNetwork(void)

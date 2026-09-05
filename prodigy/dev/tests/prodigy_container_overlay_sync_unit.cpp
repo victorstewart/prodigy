@@ -2048,6 +2048,70 @@ static void testPortalSlotsAreStableAcrossReplayOrder(TestSuite& suite)
                "portal_slot_replay_preserves_identical_free_pool");
 }
 
+static void testDeclaredNetworkPairingRevocationPreservesUnrelatedFlows(TestSuite& suite)
+{
+  String objectPath = {};
+  objectPath.assign(PRODIGY_TEST_BINARY_DIR);
+  objectPath.append("/container.egress.router.declared.ebpf.o"_ctv);
+
+  BPFProgram peerProgram = {};
+  if (suite.require(peerProgram.load(objectPath, "ct_egress"_ctv),
+                    "declared_pairing_revocation_loads_declared_egress_router") == false)
+  {
+    return;
+  }
+
+  Container container = {};
+  container.peer_program = &peerProgram;
+  uint128_t revokedPeer = 0;
+  uint128_t retainedPeer = 0;
+  parseIPv6Bytes("fdf8:d94c:7c33:e26e:ca4b:f501:0:cf3", reinterpret_cast<uint8_t *>(&revokedPeer));
+  parseIPv6Bytes("fdf8:d94c:7c33:e26e:ca4b:f501:0:bd7", reinterpret_cast<uint8_t *>(&retainedPeer));
+
+  auto makeFlow = [](uint128_t peer, uint16_t sourcePort, uint16_t destinationPort) -> flow_key {
+    flow_key flow = {};
+    std::memcpy(flow.dstv6, &peer, sizeof(peer));
+    flow.port16[0] = htons(sourcePort);
+    flow.port16[1] = htons(destinationPort);
+    flow.proto = IPPROTO_TCP;
+    return flow;
+  };
+
+  const flow_key revokedAdvertisement = makeFlow(revokedPeer, 43105, 37376);
+  const flow_key retainedAdvertisementPeer = makeFlow(retainedPeer, 43105, 37377);
+  const flow_key retainedAdvertisementService = makeFlow(revokedPeer, 43106, 37378);
+  const flow_key revokedSubscription = makeFlow(revokedPeer, 37379, 43107);
+  const container_tcp_flow state = {.expiresAtNs = UINT64_MAX};
+  suite.require(updateProgramMapElement(peerProgram, "ct_tcp_flows"_ctv, revokedAdvertisement, state) &&
+                    updateProgramMapElement(peerProgram, "ct_tcp_flows"_ctv, retainedAdvertisementPeer, state) &&
+                    updateProgramMapElement(peerProgram, "ct_tcp_flows"_ctv, retainedAdvertisementService, state) &&
+                    updateProgramMapElement(peerProgram, "ct_tcp_flows"_ctv, revokedSubscription, state),
+                "declared_pairing_revocation_seeds_independent_flows");
+
+  suite.expect(container.revokeAuthorizedTCPFlows(revokedPeer, 43105, true),
+               "declared_pairing_revocation_removes_advertisement_tuple");
+  container_tcp_flow loaded = {};
+  suite.expect(lookupProgramMapElement(peerProgram, "ct_tcp_flows"_ctv, revokedAdvertisement, loaded) == false,
+               "declared_pairing_revocation_drops_removed_advertisement_flow");
+  suite.expect(lookupProgramMapElement(peerProgram, "ct_tcp_flows"_ctv, retainedAdvertisementPeer, loaded),
+               "declared_pairing_revocation_preserves_other_peer");
+  suite.expect(lookupProgramMapElement(peerProgram, "ct_tcp_flows"_ctv, retainedAdvertisementService, loaded),
+               "declared_pairing_revocation_preserves_other_service");
+  suite.expect(lookupProgramMapElement(peerProgram, "ct_tcp_flows"_ctv, revokedSubscription, loaded),
+               "declared_pairing_revocation_preserves_opposite_direction");
+
+  suite.expect(container.revokeAuthorizedTCPFlows(revokedPeer, 43107, false),
+               "declared_pairing_revocation_removes_subscription_tuple");
+  suite.expect(lookupProgramMapElement(peerProgram, "ct_tcp_flows"_ctv, revokedSubscription, loaded) == false,
+               "declared_pairing_revocation_drops_removed_subscription_flow");
+  suite.expect(lookupProgramMapElement(peerProgram, "ct_tcp_flows"_ctv, retainedAdvertisementPeer, loaded) &&
+                   lookupProgramMapElement(peerProgram, "ct_tcp_flows"_ctv, retainedAdvertisementService, loaded),
+               "declared_pairing_revocation_keeps_unrelated_flows_after_both_roles");
+
+  container.peer_program = nullptr;
+  peerProgram.close();
+}
+
 int main(void)
 {
   if (const char *allow = std::getenv("PRODIGY_DEV_ALLOW_BPF_ATTACH"); allow == nullptr || std::strcmp(allow, "1") != 0)
@@ -2077,6 +2141,7 @@ int main(void)
   testContainerPeerEgressRouterRewritesIPv4WormholeSource(suite, IPPROTO_TCP);
   testContainerPeerEgressRouterRoutesIPv6QuicHighSlotPortal(suite);
   testPortalSlotsAreStableAcrossReplayOrder(suite);
+  testDeclaredNetworkPairingRevocationPreservesUnrelatedFlows(suite);
 
   return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

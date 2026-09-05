@@ -1966,8 +1966,14 @@ protected:
             continue;
           }
 
+          uint16_t advertisedPort = 0;
+          if (auto advertisement = container->plan.advertisements.find(service);
+              advertisement != container->plan.advertisements.end())
+          {
+            advertisedPort = advertisement->second.port;
+          }
           if (container->plan.applyAdvertisementPairing(AdvertisementPairing(secret, address, service), activate) &&
-              container->syncDeclaredNetworkPairingPolicy(activate == false) == false)
+              container->syncDeclaredNetworkPairingPolicy(activate == false, address, advertisedPort, true) == false)
           {
             basics_log("neuron advertisementPairing network policy sync failed containerUUID=%llu\n",
                        (unsigned long long)container->plan.uuid);
@@ -2018,7 +2024,7 @@ protected:
           }
 
           if (container->plan.applySubscriptionPairing(SubscriptionPairing(secret, address, service, port), activate) &&
-              container->syncDeclaredNetworkPairingPolicy(activate == false) == false)
+              container->syncDeclaredNetworkPairingPolicy(activate == false, address, port, false) == false)
           {
             basics_log("neuron subscriptionPairing network policy sync failed containerUUID=%llu\n",
                        (unsigned long long)container->plan.uuid);
@@ -4488,6 +4494,12 @@ public:
               break;
             }
 
+            uint16_t advertisedPort = 0;
+            if (auto advertisement = container->plan.advertisements.find(service);
+                advertisement != container->plan.advertisements.end())
+            {
+              advertisedPort = advertisement->second.port;
+            }
             bool changed = container->plan.applyAdvertisementPairing(AdvertisementPairing(secret, address, service), activate);
             basics_log("neuron advertisementPairing apply containerUUID=%llu payloadBytes=%u streamActive=%d\n",
                        (unsigned long long)containerUUID,
@@ -4496,7 +4508,8 @@ public:
 
             if (changed || replayRuntime)
             {
-              if (changed && container->syncDeclaredNetworkPairingPolicy(activate == false) == false)
+              if (changed &&
+                  container->syncDeclaredNetworkPairingPolicy(activate == false, address, advertisedPort, true) == false)
               {
                 basics_log("neuron advertisementPairing network policy sync failed containerUUID=%llu\n",
                            (unsigned long long)containerUUID);
@@ -4594,7 +4607,7 @@ public:
 
             if (changed || replayRuntime)
             {
-              if (changed && container->syncDeclaredNetworkPairingPolicy(activate == false) == false)
+              if (changed && container->syncDeclaredNetworkPairingPolicy(activate == false, address, port, false) == false)
               {
                 basics_log("neuron subscriptionPairing network policy sync failed containerUUID=%llu\n",
                            (unsigned long long)containerUUID);

@@ -11202,6 +11202,31 @@ int main(void)
   }
 
   {
+    const uint128_t revokedPeer = (uint128_t(0x1122334455667788ULL) << 64) | uint128_t(0x99aabbccddeeff00ULL);
+    const uint128_t retainedPeer = (uint128_t(0x1020304050607080ULL) << 64) | uint128_t(0x90a0b0c0d0e0f000ULL);
+    constexpr uint16_t servicePort = 43105;
+    flow_key advertisedFlow = {};
+    std::memcpy(advertisedFlow.dstv6, &revokedPeer, sizeof(revokedPeer));
+    advertisedFlow.port16[0] = htons(servicePort);
+    advertisedFlow.port16[1] = htons(37376);
+    advertisedFlow.proto = IPPROTO_TCP;
+    suite.expect(Container::authorizedTCPFlowMatchesRevokedPairing(advertisedFlow, revokedPeer, servicePort, true),
+                 "declared_network_revocation_matches_advertiser_flow_for_removed_peer");
+    suite.expect(Container::authorizedTCPFlowMatchesRevokedPairing(advertisedFlow, retainedPeer, servicePort, true) == false,
+                 "declared_network_revocation_preserves_unrelated_peer_flow");
+    suite.expect(Container::authorizedTCPFlowMatchesRevokedPairing(advertisedFlow, revokedPeer, servicePort + 1, true) == false,
+                 "declared_network_revocation_preserves_other_advertised_service_flow");
+
+    flow_key subscribedFlow = advertisedFlow;
+    subscribedFlow.port16[0] = htons(37376);
+    subscribedFlow.port16[1] = htons(servicePort);
+    suite.expect(Container::authorizedTCPFlowMatchesRevokedPairing(subscribedFlow, revokedPeer, servicePort, false),
+                 "declared_network_revocation_matches_subscriber_flow_for_removed_peer");
+    suite.expect(Container::authorizedTCPFlowMatchesRevokedPairing(subscribedFlow, revokedPeer, servicePort, true) == false,
+                 "declared_network_revocation_keeps_pairing_direction_distinct");
+  }
+
+  {
     DeploymentPlan deployment = {};
     String failure = {};
     suite.expect(
