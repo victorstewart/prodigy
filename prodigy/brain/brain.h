@@ -20502,7 +20502,15 @@ public:
 
   void timeoutHandler(TimeoutPacket *packet, int result) override
   {
-    if (packet->dispatcher)
+    // A timeout removal completes the original request with -ECANCELED. Some
+    // deployment timers are embedded in an owner that may be retired once its
+    // cancellation is queued, so the packet address is no longer a lifetime
+    // boundary here. Never dereference a cancelled packet.
+    if (result == -ECANCELED)
+    {
+      return;
+    }
+    if (packet != nullptr && packet->dispatcher)
     {
       packet->dispatcher->dispatchTimeout(packet);
     }

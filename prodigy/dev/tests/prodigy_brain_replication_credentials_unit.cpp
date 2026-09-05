@@ -70,6 +70,11 @@ static std::string testName(const char *prefix, const char *suffix)
 class TestBrain : public Brain {
 public:
 
+  void timeoutHandlerForTest(TimeoutPacket *packet, int result)
+  {
+    timeoutHandler(packet, result);
+  }
+
   static void completeDNSDelay(void *, TimeoutPacket *packet)
   {
     packet->dispatcher->dispatchTimeout(packet);
@@ -323,6 +328,29 @@ public:
     return nullptr;
   }
 };
+
+class CountingTimeoutDispatcher final : public TimeoutDispatcher {
+public:
+  uint32_t calls = 0;
+
+  void dispatchTimeout(TimeoutPacket *) override
+  {
+    calls += 1;
+  }
+};
+
+void testBrainTimeoutCancellationDoesNotDereferenceRetiredPacket(TestSuite& suite)
+{
+  TestBrain brain;
+  brain.timeoutHandlerForTest(reinterpret_cast<TimeoutPacket *>(uintptr_t(0xe31)), -ECANCELED);
+
+  CountingTimeoutDispatcher dispatcher;
+  TimeoutPacket live;
+  live.dispatcher = &dispatcher;
+  brain.timeoutHandlerForTest(&live, -ETIME);
+  suite.expect(dispatcher.calls == 1,
+               "brain_timeout_dispatches_live_timer_but_not_cancelled_retired_packet");
+}
 
 class TestDNSProvider final : public ProdigyDNSProvider {
 public:
@@ -21093,6 +21121,12 @@ int main(void)
   {
     testNeuronHandlerKillContainerStopsContainerAndEchoesBrain(suite);
     testNeuronHandlerKillContainerCancelsPendingRestart(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "brain-timeout-cancellation") == 0)
+  {
+    testBrainTimeoutCancellationDoesNotDereferenceRetiredPacket(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (std::getenv("PRODIGY_TEST_BUNDLE_UPDATE_ONLY") != nullptr)
