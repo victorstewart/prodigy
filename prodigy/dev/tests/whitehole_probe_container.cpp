@@ -123,9 +123,11 @@ private:
       return false;
     }
 
-    if (whitehole.sourcePort == 0 || whitehole.transport != ExternalAddressTransport::quic)
+    if (whitehole.sourcePort == 0 ||
+        (whitehole.transport != ExternalAddressTransport::quic &&
+         whitehole.transport != ExternalAddressTransport::tcp))
     {
-      failure = "whitehole_requires_udp_source_port";
+      failure = "whitehole_requires_supported_source_port";
       return false;
     }
 
@@ -135,7 +137,8 @@ private:
       return false;
     }
 
-    int socketFD = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    const bool isTCP = whitehole.transport == ExternalAddressTransport::tcp;
+    int socketFD = socket(AF_INET, (isTCP ? SOCK_STREAM : SOCK_DGRAM) | SOCK_CLOEXEC, 0);
     if (socketFD < 0)
     {
       failure = "socket_failed";
@@ -172,6 +175,57 @@ private:
     target.sin_family = AF_INET;
     target.sin_port = htons(kTargetPort);
     target.sin_addr = targetAddress;
+
+    if (isTCP)
+    {
+      appendTrace("probe.connect.begin", renderIPv4(targetAddress).c_str());
+      if (connect(socketFD, reinterpret_cast<const struct sockaddr *>(&target), sizeof(target)) != 0)
+      {
+        failure = "connect_failed";
+        appendTrace("probe.connect.fail", strerror(errno));
+        close(socketFD);
+        return false;
+      }
+
+      ssize_t sent = send(socketFD, kOpenPayload, std::strlen(kOpenPayload), MSG_NOSIGNAL);
+      if (sent != static_cast<ssize_t>(std::strlen(kOpenPayload)))
+      {
+        failure = "send_failed";
+        appendTrace("probe.send.fail", strerror(errno));
+        close(socketFD);
+        return false;
+      }
+
+      if (waitReadable(socketFD, kReplyTimeoutMs) == false)
+      {
+        failure = "reply_timeout";
+        appendTrace("probe.recv.timeout");
+        close(socketFD);
+        return false;
+      }
+
+      char buffer[256] = {};
+      ssize_t received = recv(socketFD, buffer, sizeof(buffer), 0);
+      if (received <= 0)
+      {
+        failure = "recv_failed";
+        appendTrace("probe.recv.fail", strerror(errno));
+        close(socketFD);
+        return false;
+      }
+      if (size_t(received) != std::strlen(kReplyPayload) ||
+          memcmp(buffer, kReplyPayload, size_t(received)) != 0)
+      {
+        failure = "reply_payload_mismatch";
+        appendTrace("probe.recv.bad_payload", failure.c_str());
+        close(socketFD);
+        return false;
+      }
+
+      appendTrace("probe.recv.ok");
+      close(socketFD);
+      return true;
+    }
 
     appendTrace("probe.send.begin", renderIPv4(targetAddress).c_str());
     ssize_t sent = sendto(socketFD,

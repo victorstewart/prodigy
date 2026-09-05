@@ -203,9 +203,18 @@ static bool resolveMachineWhiteholeInternetSourceAddressForDeployment(const Mach
   {
     if (machine->private4 != 0)
     {
-      address = {};
-      address.is6 = false;
-      address.v4 = machine->private4;
+      uint64_t offset = uint64_t(ntohl(machine->private4) & 0xffffu);
+      if (offset == 0)
+      {
+        offset = 1;
+      }
+      if (routablePrefixAddressAtOffset(
+              thisBrain->brainConfig.runtimeEnvironment.test.fakePublicSubnet4,
+              offset,
+              address) == false)
+      {
+        return false;
+      }
       if (addressText)
       {
         (void)ClusterMachine::renderIPAddressLiteral(address, *addressText);

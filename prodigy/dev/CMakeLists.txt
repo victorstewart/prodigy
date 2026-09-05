@@ -1385,6 +1385,12 @@ if (PROJECT_ENABLE_TESTS)
    set_tests_properties(prodigy_dev_whitehole_host_ipv4_smoke PROPERTIES SKIP_RETURN_CODE 77)
 
    add_test(
+      NAME prodigy_dev_whitehole_host_ipv4_tcp_smoke
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_DEV_WHITEHOLE_TRANSPORT=tcp bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_whitehole_host_ipv4_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_whitehole_probe_container
+   )
+   set_tests_properties(prodigy_dev_whitehole_host_ipv4_tcp_smoke PROPERTIES SKIP_RETURN_CODE 77)
+
+   add_test(
       NAME prodigy_dev_autoscale_metrics_smoke
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_autoscale_metrics_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container
    )
@@ -1542,6 +1548,7 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       prodigy_dev_runtime_isolation_smoke
       prodigy_dev_whitehole_fake_ipv4_smoke
       prodigy_dev_whitehole_host_ipv4_smoke
+      prodigy_dev_whitehole_host_ipv4_tcp_smoke
       prodigy_dev_autoscale_metrics_smoke
       prodigy_dev_storage_multidrive_resize_smoke
       prodigy_dev_autoscale_ingress_composite_smoke
@@ -1590,6 +1597,7 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       prodigy_dev_sdk_mesh_e2e_matrix_smoke
       prodigy_dev_whitehole_fake_ipv4_smoke
       prodigy_dev_whitehole_host_ipv4_smoke
+      prodigy_dev_whitehole_host_ipv4_tcp_smoke
       prodigy_dev_autoscale_metrics_smoke
       prodigy_dev_storage_multidrive_resize_smoke
       prodigy_dev_autoscale_ingress_composite_smoke

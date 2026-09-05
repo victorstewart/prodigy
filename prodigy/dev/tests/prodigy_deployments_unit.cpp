@@ -7543,6 +7543,7 @@ int main(void)
 
     deployment.plan.whiteholes[0].family = ExternalAddressFamily::ipv4;
     brain.brainConfig.runtimeEnvironment.test.enableFakeIpv4Boundary = true;
+    prodigyApplyInternalRuntimeEnvironmentDefaults(brain.brainConfig.runtimeEnvironment);
     fit = ApplicationDeployment::nFitOnMachine(&deployment, &worker, 1);
     suite.expect(fit == 1, "nFitOnMachine_whitehole_host_public_accepts_explicit_fake_ipv4_boundary");
 
@@ -7553,6 +7554,8 @@ int main(void)
     hostPublicOwner.lineageID = hostPublicOwner.applicationID;
     suite.expect(ApplicationDeployment::resolveWhiteholeSourceAddressForScheduling(&worker, resolvedHostPublicWhitehole),
                  "whitehole_host_public_resolves_fake_boundary_address");
+    suite.expect(resolvedHostPublicWhitehole.address.equals(IPAddress("198.18.0.10", false)),
+                 "whitehole_host_public_uses_fake_boundary_subnet_not_private_address");
     suite.expect(ApplicationDeployment::allocateWhiteholeSourcePort(resolvedHostPublicWhitehole),
                  "whitehole_host_public_allocates_source_port");
     suite.expect(deployment.reserveWhiteholeAddressPortLease(resolvedHostPublicWhitehole, hostPublicOwner),

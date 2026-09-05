@@ -4,6 +4,7 @@ set -euo pipefail
 PRODIGY_BIN="${1:-}"
 MOTHERSHIP_BIN="${2:-}"
 WHITEHOLE_BIN="${3:-}"
+whitehole_transport="${PRODIGY_DEV_WHITEHOLE_TRANSPORT:-quic}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/prodigy_dev_discombobulator_artifact_helpers.sh"
@@ -46,6 +47,14 @@ then
    echo "SKIP: whitehole host IPv4 smoke requires fake IPv4 boundary BPF attach; set PRODIGY_DEV_ALLOW_BPF_ATTACH=1 only inside an authorized isolated VM"
    exit 77
 fi
+
+case "${whitehole_transport}" in
+   quic|tcp) ;;
+   *)
+      echo "FAIL: PRODIGY_DEV_WHITEHOLE_TRANSPORT must be quic or tcp"
+      exit 2
+      ;;
+esac
 
 PRODIGY_BIN="$(readlink -f "${PRODIGY_BIN}" 2>/dev/null || printf '%s' "${PRODIGY_BIN}")"
 MOTHERSHIP_BIN="$(readlink -f "${MOTHERSHIP_BIN}" 2>/dev/null || printf '%s' "${MOTHERSHIP_BIN}")"
@@ -259,7 +268,7 @@ cat > "${plan_json}" <<EOF
   },
   "whiteholes": [
     {
-      "transport": "quic",
+      "transport": "${whitehole_transport}",
       "family": "ipv4",
       "source": "hostPublicAddress"
     }
@@ -273,6 +282,7 @@ nsenter -t "${parent_pid}" -n \
    env WHITEHOLE_TARGET_IP="${parent_edge_ip}" \
    WHITEHOLE_TARGET_PORT=32101 \
    WHITEHOLE_SPOOF_PORT=32102 \
+   WHITEHOLE_TRANSPORT="${whitehole_transport}" \
    WHITEHOLE_RESPONDER_LOG="${responder_log}" \
    python3 - <<'PY' &
 import os
@@ -282,9 +292,28 @@ import time
 bind_ip = os.environ["WHITEHOLE_TARGET_IP"]
 target_port = int(os.environ["WHITEHOLE_TARGET_PORT"])
 spoof_port = int(os.environ["WHITEHOLE_SPOOF_PORT"])
+transport = os.environ["WHITEHOLE_TRANSPORT"]
 log_path = os.environ["WHITEHOLE_RESPONDER_LOG"]
 
 with open(log_path, "w", encoding="utf-8") as log:
+   if transport == "tcp":
+      listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+      listener.bind((bind_ip, target_port))
+      listener.listen(1)
+      listener.settimeout(30.0)
+      log.write(f"ready tcp bind={bind_ip}:{target_port}\n")
+      log.flush()
+      connection, addr = listener.accept()
+      with connection:
+         payload = connection.recv(2048)
+         log.write(f"recv addr={addr[0]}:{addr[1]} payload={payload.decode(errors='replace')}\n")
+         log.flush()
+         connection.sendall(b"whitehole-ok")
+      log.write("sent tcp reply\n")
+      log.flush()
+      raise SystemExit(0)
+
    legit = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
    spoof = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
    legit.bind((bind_ip, target_port))
@@ -356,7 +385,14 @@ fi
 wait "${responder_pid}"
 responder_pid=""
 
-if ! rg -q 'sent legit\+spoof' "${responder_log}"
+if [[ "${whitehole_transport}" == tcp ]]
+then
+   responder_completion='sent tcp reply'
+else
+   responder_completion='sent legit\+spoof'
+fi
+
+if ! rg -q "${responder_completion}" "${responder_log}"
 then
    archive_workspace=1
    echo "FAIL: responder did not complete the legit+spoof sequence"
@@ -393,4 +429,4 @@ if not isinstance(ip, ipaddress.IPv4Address) or not ip.is_private:
     raise SystemExit(1)
 PY
 
-echo "PASS: whitehole host-source IPv4 smoke bound=${bound_ip}"
+echo "PASS: whitehole host-source IPv4 smoke transport=${whitehole_transport} bound=${bound_ip}"
