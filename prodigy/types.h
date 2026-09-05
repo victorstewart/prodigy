@@ -3656,14 +3656,14 @@ static void serialize(S&& serializer, TaskExecutionRecord& record)
 
 static inline bool taskExecutionStateTransitionAllowed(TaskExecutionState from, TaskExecutionState to)
 {
-  if (from == to)
-  {
-    return true;
-  }
-
   if (taskExecutionTerminal(from))
   {
     return false;
+  }
+
+  if (from == to)
+  {
+    return true;
   }
 
   switch (from)
