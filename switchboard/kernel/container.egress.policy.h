@@ -67,5 +67,18 @@ __attribute__((__always_inline__)) static inline bool containerDeclaredInternalE
     return bpf_map_lookup_elem(&ct_sub_targets, &target) != NULL &&
            containerAuthorizeTCPFlow(&flow);
   }
-  return containerTCPFlowCurrent(&flow, tcp->fin, tcp->rst);
+  if (containerTCPFlowCurrent(&flow, tcp->fin, tcp->rst))
+  {
+    return true;
+  }
+
+  // The kernel TCP socket can remain established longer than the bounded BPF
+  // flow entry. Re-authorize a non-SYN packet only while the exact declared
+  // subscription still exists; otherwise a healthy idle service connection
+  // becomes a permanent black hole after CONTAINER_TCP_FLOW_IDLE_NS.
+  struct container_service_peer target = {};
+  bpf_memcpy(target.address, ip6h->daddr.s6_addr, sizeof(target.address));
+  target.port = tcp->dest;
+  return tcp->rst == 0 && bpf_map_lookup_elem(&ct_sub_targets, &target) != NULL &&
+         containerAuthorizeTCPFlow(&flow);
 }

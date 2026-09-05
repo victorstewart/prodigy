@@ -97,6 +97,16 @@ static bool updateProgramMapElement(BPFProgram& program, StringType auto&& mapNa
   return updated;
 }
 
+template <typename Key>
+static bool deleteProgramMapElement(BPFProgram& program, StringType auto&& mapName, const Key& key)
+{
+  bool removed = false;
+  program.openMap(mapName, [&](int mapFD) -> void {
+    removed = mapFD >= 0 && bpf_map_delete_elem(mapFD, &key) == 0;
+  });
+  return removed;
+}
+
 static bool programHasMap(BPFProgram& program, StringType auto&& mapName)
 {
   bool found = false;
@@ -2048,6 +2058,130 @@ static void testPortalSlotsAreStableAcrossReplayOrder(TestSuite& suite)
                "portal_slot_replay_preserves_identical_free_pool");
 }
 
+static void testDeclaredNetworkIdleTCPFlowReauthorization(TestSuite& suite)
+{
+  String egressPath = {};
+  egressPath.assign(PRODIGY_TEST_BINARY_DIR);
+  egressPath.append("/container.egress.router.declared.ebpf.o"_ctv);
+  String ingressPath = {};
+  ingressPath.assign(PRODIGY_TEST_BINARY_DIR);
+  ingressPath.append("/container.ingress.router.declared.ebpf.o"_ctv);
+
+  BPFProgram egress = {};
+  BPFProgram ingress = {};
+  const bool loaded =
+      suite.require(egress.load(egressPath, "ct_egress"_ctv),
+                    "declared_idle_flow_loads_egress_router") &&
+      suite.require(ingress.load(ingressPath, "ct_ingress"_ctv),
+                    "declared_idle_flow_loads_ingress_router");
+  if (loaded == false)
+  {
+    ingress.close();
+    egress.close();
+    return;
+  }
+
+  container_network_policy egressPolicy = {};
+  egressPolicy.mode = CONTAINER_NETWORK_DECLARED_ONLY;
+  egressPolicy.interContainerMTU = 9000;
+  egressPolicy.containerFragment = 0x01;
+  container_network_policy ingressPolicy = egressPolicy;
+  ingressPolicy.containerFragment = 0x02;
+  egress.setArrayElement("ct_net_policy"_ctv, 0, egressPolicy);
+  ingress.setArrayElement("ct_net_policy"_ctv, 0, ingressPolicy);
+
+  local_container_subnet6 localSubnet = {};
+  localSubnet.dpfx = 0x01;
+  localSubnet.mpfx[2] = 0x0a;
+  egress.setArrayElement("lc_subnet"_ctv, 0, localSubnet);
+  ingress.setArrayElement("lc_subnet"_ctv, 0, localSubnet);
+
+  constexpr const char *sourceAddress = "fdf8:d94c:7c33:e26e:ca4b:f501:0:a01";
+  constexpr const char *targetAddress = "fdf8:d94c:7c33:e26e:ca4b:f501:0:a02";
+  constexpr uint16_t sourcePort = 57716;
+  constexpr uint16_t targetPort = 43105;
+
+  container_service_peer subscription = {};
+  parseIPv6Bytes(targetAddress, subscription.address);
+  subscription.port = htons(targetPort);
+  container_service_peer advertisement = {};
+  parseIPv6Bytes(sourceAddress, advertisement.address);
+  advertisement.port = htons(targetPort);
+  const __u8 present = 1;
+  suite.require(updateProgramMapElement(egress, "ct_sub_targets"_ctv, subscription, present) &&
+                    updateProgramMapElement(ingress, "ct_adv_sources"_ctv, advertisement, present),
+                "declared_idle_flow_seeds_current_pairing");
+
+  flow_key forward = {};
+  parseIPv6Bytes(sourceAddress, reinterpret_cast<uint8_t *>(forward.srcv6));
+  parseIPv6Bytes(targetAddress, reinterpret_cast<uint8_t *>(forward.dstv6));
+  forward.port16[0] = htons(sourcePort);
+  forward.port16[1] = htons(targetPort);
+  forward.proto = IPPROTO_TCP;
+  flow_key reverse = {};
+  std::memcpy(reverse.srcv6, forward.dstv6, sizeof(reverse.srcv6));
+  std::memcpy(reverse.dstv6, forward.srcv6, sizeof(reverse.dstv6));
+  reverse.port16[0] = forward.port16[1];
+  reverse.port16[1] = forward.port16[0];
+  reverse.proto = forward.proto;
+  const container_tcp_flow expired = {.expiresAtNs = 1};
+  suite.require(updateProgramMapElement(egress, "ct_tcp_flows"_ctv, forward, expired) &&
+                    updateProgramMapElement(ingress, "ct_tcp_flows"_ctv, reverse, expired),
+                "declared_idle_flow_seeds_expired_bidirectional_state");
+
+  Vector<uint8_t> payload = {};
+  payload.push_back(0x5a);
+  Vector<uint8_t> frame = makeIPv6L4FrameWithPayload(
+      sourceAddress, targetAddress, IPPROTO_TCP, sourcePort, targetPort, payload, true);
+  struct ipv6hdr *ip6h = reinterpret_cast<struct ipv6hdr *>(frame.data() + sizeof(struct ethhdr));
+  struct tcphdr *tcp = reinterpret_cast<struct tcphdr *>(ip6h + 1);
+  tcp->syn = 0;
+  tcp->ack = 1;
+  tcp->check = 0;
+  tcp->check = checksumIPv6Transport(
+      ip6h->saddr.s6_addr, ip6h->daddr.s6_addr, IPPROTO_TCP, tcp,
+      sizeof(struct tcphdr) + payload.size(), __builtin_offsetof(struct tcphdr, check));
+
+  auto run = [&](BPFProgram& program, const char *name) -> int {
+    Vector<uint8_t> output = {};
+    output.resize(frame.size() + 64u);
+    LIBBPF_OPTS(bpf_test_run_opts, opts,
+                .data_in = frame.data(),
+                .data_out = output.data(),
+                .data_size_in = static_cast<__u32>(frame.size()),
+                .data_size_out = static_cast<__u32>(output.size()),
+                .repeat = 1, );
+    const int result = bpf_prog_test_run_opts(program.prog_fd, &opts);
+    suite.expect(result == 0, name);
+    return result == 0 ? int(opts.retval) : -1;
+  };
+
+  suite.expect(run(egress, "declared_idle_flow_egress_reauthorization_runs") == NETKIT_PASS,
+               "declared_idle_flow_egress_reauthorizes_current_pairing");
+  suite.expect(run(ingress, "declared_idle_flow_ingress_reauthorization_runs") == NETKIT_PASS,
+               "declared_idle_flow_ingress_reauthorizes_current_pairing");
+  container_tcp_flow refreshed = {};
+  suite.expect(lookupProgramMapElement(egress, "ct_tcp_flows"_ctv, forward, refreshed) &&
+                   refreshed.expiresAtNs > expired.expiresAtNs,
+               "declared_idle_flow_egress_refreshes_expiry");
+  suite.expect(lookupProgramMapElement(ingress, "ct_tcp_flows"_ctv, reverse, refreshed) &&
+                   refreshed.expiresAtNs > expired.expiresAtNs,
+               "declared_idle_flow_ingress_refreshes_expiry");
+
+  suite.require(deleteProgramMapElement(egress, "ct_sub_targets"_ctv, subscription) &&
+                    deleteProgramMapElement(ingress, "ct_adv_sources"_ctv, advertisement) &&
+                    updateProgramMapElement(egress, "ct_tcp_flows"_ctv, forward, expired) &&
+                    updateProgramMapElement(ingress, "ct_tcp_flows"_ctv, reverse, expired),
+                "declared_idle_flow_revokes_pairing_and_reexpires_state");
+  suite.expect(run(egress, "declared_idle_flow_revoked_egress_runs") == NETKIT_DROP,
+               "declared_idle_flow_revoked_egress_fails_closed");
+  suite.expect(run(ingress, "declared_idle_flow_revoked_ingress_runs") == NETKIT_DROP,
+               "declared_idle_flow_revoked_ingress_fails_closed");
+
+  ingress.close();
+  egress.close();
+}
+
 static void testDeclaredNetworkPairingRevocationPreservesUnrelatedFlows(TestSuite& suite)
 {
   String objectPath = {};
@@ -2141,6 +2275,7 @@ int main(void)
   testContainerPeerEgressRouterRewritesIPv4WormholeSource(suite, IPPROTO_TCP);
   testContainerPeerEgressRouterRoutesIPv6QuicHighSlotPortal(suite);
   testPortalSlotsAreStableAcrossReplayOrder(suite);
+  testDeclaredNetworkIdleTCPFlowReauthorization(suite);
   testDeclaredNetworkPairingRevocationPreservesUnrelatedFlows(suite);
 
   return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

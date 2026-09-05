@@ -59,7 +59,19 @@ __attribute__((noinline)) static bool containerLearnOrAuthorizeInboundTCP(struct
     }
     return true;
   }
-  if (containerTCPFlowCurrent(&reverse, tcp->fin, tcp->rst) == false)
+  if (containerTCPFlowCurrent(&reverse, tcp->fin, tcp->rst))
+  {
+    return true;
+  }
+
+  // Match the egress policy's idle-flow recovery. The exact advertiser tuple
+  // remains the authority, so removing a declared pairing still prevents a
+  // stale kernel TCP connection from recreating its flow state.
+  struct container_service_peer source = {};
+  bpf_memcpy(source.address, ip6h->saddr.s6_addr, sizeof(source.address));
+  source.port = tcp->dest;
+  if (tcp->rst || bpf_map_lookup_elem(&ct_adv_sources, &source) == NULL ||
+      containerAuthorizeTCPFlow(&reverse) == false)
   {
 #if PRODIGY_DEBUG
     setCheckpoint("inboundFlowMissing");
