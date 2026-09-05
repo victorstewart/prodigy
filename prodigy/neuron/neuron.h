@@ -4225,7 +4225,26 @@ public:
                          int(container->pid));
             PRODIGY_DEBUG_FLUSH();
             container->pendingKillAckToBrain = true;
-            container->stop();
+            // A container between restart attempts has no process that can
+            // consume the cooperative stop frame.  Waiting for its normal
+            // sTilKillable deadline would strand deployment destruction (and
+            // an accepted operator cancellation) for the full application
+            // shutdown timeout.  Cancel the pending restart and retire the
+            // already-stopped container through the normal destruction owner.
+            if (container->restartTimer != nullptr || container->pid <= 0)
+            {
+              if (container->restartTimer != nullptr)
+              {
+                Ring::queueCancelTimeout(container->restartTimer);
+                container->restartTimer = nullptr;
+              }
+              container->killedOnPurpose = true;
+              ContainerManager::destroyContainer(container);
+            }
+            else
+            {
+              container->stop();
+            }
           }
           else if (brain)
           {

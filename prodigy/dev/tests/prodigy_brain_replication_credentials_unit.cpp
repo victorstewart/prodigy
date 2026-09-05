@@ -16812,6 +16812,7 @@ static void testNeuronHandlerKillContainerStopsContainerAndEchoesBrain(TestSuite
   container->plan.uuid = uint128_t(0x5103);
   container->plan.config.applicationID = 62'012;
   container->plan.config.versionID = 11;
+  container->pid = 4242;
   neuron.containers.insert_or_assign(container->plan.uuid, container);
 
   NeuronBase *previousNeuron = thisNeuron;
@@ -16859,6 +16860,53 @@ static void testNeuronHandlerKillContainerStopsContainerAndEchoesBrain(TestSuite
   thisNeuron = previousNeuron;
   neuron.containers.erase(container->plan.uuid);
   delete container;
+}
+
+static void testNeuronHandlerKillContainerCancelsPendingRestart(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+
+  TestNeuron neuron = {};
+  neuron.seedBrainStreamForTest(false);
+
+  Container *container = new Container();
+  container->plan.uuid = uint128_t(0x5104);
+  container->plan.config.applicationID = 62'012;
+  container->plan.config.versionID = 12;
+  container->pid = -1;
+  container->restartTimer = new TimeoutPacket();
+  container->restartTimer->identifier = container->plan.uuid;
+  container->restartTimer->flags = uint64_t(NeuronTimeoutFlags::restartContainer);
+  container->restartTimer->originator = &neuron;
+  container->restartTimer->setTimeoutMs(30'000);
+  Ring::queueTimeout(container->restartTimer);
+  neuron.containers.insert_or_assign(container->plan.uuid, container);
+
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &neuron;
+
+  String buffer = {};
+  Message *message = buildNeuronMessage(buffer, NeuronTopic::killContainer, container->plan.uuid);
+  neuron.neuronHandler(message);
+
+  uint32_t echoFrames = 0;
+  uint128_t echoedContainerUUID = 0;
+  forEachMessageInBuffer(neuron.brainOutboundForTest(), [&](Message *frame) {
+    if (NeuronTopic(frame->topic) != NeuronTopic::killContainer)
+    {
+      return;
+    }
+    uint8_t *args = frame->args;
+    Message::extractArg<ArgumentNature::fixed>(args, echoedContainerUUID);
+    echoFrames += 1;
+  });
+
+  suite.expect(neuron.containers.contains(uint128_t(0x5104)) == false,
+               "neuron_kill_container_pending_restart_retires_container");
+  suite.expect(echoFrames == 1 && echoedContainerUUID == uint128_t(0x5104),
+               "neuron_kill_container_pending_restart_acknowledges_immediately");
+
+  thisNeuron = previousNeuron;
 }
 
 static void testBrainNeuronHandlerMarksContainerHealthyOnceAndClearsWaiters(TestSuite& suite)
@@ -21026,6 +21074,14 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
 int main(void)
 {
   TestSuite suite;
+
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "neuron-kill-pending-restart") == 0)
+  {
+    testNeuronHandlerKillContainerStopsContainerAndEchoesBrain(suite);
+    testNeuronHandlerKillContainerCancelsPendingRestart(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (std::getenv("PRODIGY_TEST_BUNDLE_UPDATE_ONLY") != nullptr)
   {
     testUpdateProdigyRespondsBeforeSingleBrainTransition(suite);
@@ -21246,6 +21302,7 @@ int main(void)
   testNeuronSpinContainerRejectReportsFailure(suite);
   testNeuronStateUploadSkipsExistingLiveContainer(suite);
   testNeuronHandlerKillContainerStopsContainerAndEchoesBrain(suite);
+  testNeuronHandlerKillContainerCancelsPendingRestart(suite);
   testBrainNeuronHandlerMarksContainerHealthyOnceAndClearsWaiters(suite);
   testBrainReplicatedContainerHealthyMarksContainerHealthyOnMaster(suite);
   testBrainContainerHealthyReplicatesRuntimeStateToFollowers(suite);
