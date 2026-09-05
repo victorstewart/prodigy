@@ -24650,7 +24650,12 @@ public:
         case DeploymentState::waitingToDeploy:
 
           {
-            if (previous->previous == nullptr)
+            // A recovered deployment can still be state=none while Neuron
+            // inventory is being materialized.  It is safe to collapse only
+            // a deployment that never acquired runtime or scheduler state;
+            // otherwise deleting its metadata orphans the live container.
+            if (previous->previous == nullptr ||
+                previous->lifecycleIsUnmaterialized() == false)
             {
               previous->next = deployment;
               deployment->previous = previous;
@@ -26645,11 +26650,13 @@ public:
     {
       successor = successorIt->second;
     }
-    if (successor == nullptr ||
-        (deployment != nullptr &&
-         (deployment->containers.empty() == false ||
-          deployment->waitingOnContainers.empty() == false)))
+    if (successor == nullptr)
     {
+      return;
+    }
+    if (deployment != nullptr && deployment->operatorCancellationIsQuiescent() == false)
+    {
+      armOperatorCancellationContinuation();
       return;
     }
 

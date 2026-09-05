@@ -20940,10 +20940,22 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
   suite.expect(response.cancelledDeploymentID == activeDeploymentID &&
                    response.successorDeploymentID == successorDeploymentID,
                "operator_cancellation_response_derives_exact_deployments");
+  CoroutineStack deferredScheduler = {};
+  active->schedulingStack.execution = &deferredScheduler;
+  active->nSuspended = 1;
+  brain.resumeOperatorCancellations();
+  auto failedIt = brain.failedDeployments.find(activeDeploymentID);
+  suite.expect(failedIt != brain.failedDeployments.end() &&
+                   failedIt->second.cancellationPhase != CancelDeploymentPhase::completed &&
+                   brain.deployments.contains(activeDeploymentID) &&
+                   successor->state == DeploymentState::waitingToDeploy,
+               "operator_cancellation_waits_for_scheduler_quiescence");
+  active->schedulingStack.execution = nullptr;
+  active->nSuspended = 0;
   // Production continues from the Neuron acknowledgement on the next Ring
   // turn. Drive that deferred owner explicitly in this synchronous fixture.
   brain.resumeOperatorCancellations();
-  auto failedIt = brain.failedDeployments.find(activeDeploymentID);
+  failedIt = brain.failedDeployments.find(activeDeploymentID);
   suite.expect(failedIt != brain.failedDeployments.end() &&
                    failedIt->second.hasOperatorCancellation &&
                    failedIt->second.cancellationPhase == CancelDeploymentPhase::completed &&

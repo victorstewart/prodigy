@@ -6619,6 +6619,52 @@ int main(void)
     delete baseline;
   });
 
+  withUniqueMothershipSocket("spin_application_preserves_materialized_middle_deployment_socket_dir_created", [&] {
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+
+    DeploymentPlan baselinePlan = makeDeploymentPlan(61'013, 1);
+    DeploymentPlan middlePlan = makeDeploymentPlan(61'013, 2);
+    DeploymentPlan nextPlan = makeDeploymentPlan(61'013, 3);
+
+    ApplicationDeployment *baseline = new ApplicationDeployment();
+    baseline->plan = baselinePlan;
+    baseline->state = DeploymentState::running;
+    ApplicationDeployment *middle = new ApplicationDeployment();
+    middle->plan = middlePlan;
+    middle->state = DeploymentState::none;
+    ApplicationDeployment *next = new ApplicationDeployment();
+    next->plan = nextPlan;
+
+    ContainerView materialized = {};
+    materialized.deploymentID = middlePlan.config.deploymentID();
+    materialized.state = ContainerState::healthy;
+    middle->containers.insert(&materialized);
+    baseline->next = middle;
+    middle->previous = baseline;
+    brain.deployments.insert_or_assign(baselinePlan.config.deploymentID(), baseline);
+    brain.deployments.insert_or_assign(middlePlan.config.deploymentID(), middle);
+    brain.deploymentsByApp.insert_or_assign(middlePlan.config.applicationID, middle);
+
+    brain.testSpinApplication(next);
+
+    suite.expect(brain.deployments.contains(middlePlan.config.deploymentID()),
+                 "spin_application_preserves_materialized_middle_index");
+    suite.expect(middle->containers.contains(&materialized),
+                 "spin_application_preserves_materialized_middle_container_owner");
+    suite.expect(middle->next == next && next->previous == middle,
+                 "spin_application_queues_next_behind_materialized_middle");
+    suite.expect(next->state == DeploymentState::waitingToDeploy,
+                 "spin_application_waits_for_materialized_middle_lifecycle");
+
+    middle->containers.clear();
+    brain.deployments.clear();
+    brain.deploymentsByApp.clear();
+    delete next;
+    delete middle;
+    delete baseline;
+  });
+
   {
     ScopedRing scopedRing = {};
 
