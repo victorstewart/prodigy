@@ -3369,6 +3369,10 @@ static void serialize(S&& serializer, ApplicationConfig& config)
 
 constexpr static int64_t prodigyTaskExecutionRecordRetentionMs = 24LL * 60LL * 60LL * 1000LL;
 constexpr static uint32_t prodigyTaskResultMaxBytes = 64u * 1024u;
+// Evidence tasks may retry after a transient worker failure, but their
+// Mothership-owned execution record must reach a terminal state without
+// repeatedly re-running a completed or permanently failing fixture.
+constexpr static uint32_t prodigyTaskUntilSucceededMaximumAttempts = 3u;
 
 constexpr static const char *prodigyTaskExecutionPolicyName(TaskExecutionPolicy policy)
 {
@@ -3704,7 +3708,9 @@ static inline bool taskExecutionTransition(TaskExecutionRecord& record, TaskExec
   return true;
 }
 
-static inline TaskExecutionState taskExecutionStateForAttemptTermination(TaskExecutionPolicy policy, const TaskTermination& termination)
+static inline TaskExecutionState taskExecutionStateForAttemptTermination(TaskExecutionPolicy policy,
+                                                                          const TaskTermination& termination,
+                                                                          uint32_t attemptNumber)
 {
   if (termination.succeeded())
   {
@@ -3718,7 +3724,7 @@ static inline TaskExecutionState taskExecutionStateForAttemptTermination(TaskExe
   {
     return TaskExecutionState::lost;
   }
-  if (policy == TaskExecutionPolicy::untilSucceeded)
+  if (policy == TaskExecutionPolicy::untilSucceeded && attemptNumber < prodigyTaskUntilSucceededMaximumAttempts)
   {
     return TaskExecutionState::retrying;
   }
@@ -3749,7 +3755,7 @@ static inline bool taskExecutionCommitAttempt(TaskExecutionRecord& record, const
     return false;
   }
 
-  TaskExecutionState next = taskExecutionStateForAttemptTermination(record.policy, attempt.termination);
+  TaskExecutionState next = taskExecutionStateForAttemptTermination(record.policy, attempt.termination, attempt.attemptNumber);
   if (taskExecutionTransition(record, next, nowMs, failure) == false)
   {
     return false;

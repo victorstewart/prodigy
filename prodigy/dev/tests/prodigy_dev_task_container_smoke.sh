@@ -226,7 +226,13 @@ wait_report duplicate-success "${success_name}" "${success_version}" succeeded '
 deploy_task failure "${failure_plan}" "${failure_blob}"
 wait_report failure "${failure_name}" "${failure_version}" failed 'attempt=1 .* started=1 .* succeeded=0 .* failed=1 .* resultBytes=[1-9]'
 
+deploy_task duplicate-failure "${failure_plan}" "${failure_blob}"
+wait_report duplicate-failure "${failure_name}" "${failure_version}" failed 'attempt=1 .* started=1 .* succeeded=0 .* failed=1 .* resultBytes=[1-9]'
+
 deploy_task retry "${retry_plan}" "${retry_blob}"
 wait_report retry "${retry_name}" "${retry_version}" succeeded 'attempt=2 .* started=2 .* succeeded=1 .* failed=1 .* resultBytes=[1-9]'
+
+deploy_task duplicate-retry "${retry_plan}" "${retry_blob}"
+wait_report duplicate-retry "${retry_name}" "${retry_version}" succeeded 'attempt=2 .* started=2 .* succeeded=1 .* failed=1 .* resultBytes=[1-9]'
 
 echo "PASS: task container smoke success=${success_version} failure=${failure_version} retry=${retry_version}"

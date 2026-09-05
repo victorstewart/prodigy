@@ -1046,6 +1046,26 @@ int main(void)
             retry.hasFinalAttempt,
         "task_until_success_success_finishes_logical_execution");
 
+    TaskExecutionRecord exhausted = {};
+    exhausted.policy = TaskExecutionPolicy::untilSucceeded;
+    exhausted.state = TaskExecutionState::running;
+    exhausted.currentAttemptNumber = prodigyTaskUntilSucceededMaximumAttempts - 1u;
+    TaskAttemptRecord finalFailure = failed;
+    finalFailure.attemptNumber = prodigyTaskUntilSucceededMaximumAttempts;
+    suite.expect(taskExecutionCommitAttempt(exhausted, finalFailure, 3500),
+                 "task_until_success_final_allowed_failure_commits");
+    suite.expect(exhausted.state == TaskExecutionState::failed &&
+                    exhausted.attemptsFailed == 1 &&
+                    exhausted.hasFinalAttempt &&
+                    exhausted.completedAtMs == 3500 &&
+                    exhausted.expiresAtMs == 3500 + prodigyTaskExecutionRecordRetentionMs,
+                 "task_until_success_exhaustion_is_terminal_and_retained");
+    TaskExecutionRecord exhaustedTerminal = exhausted;
+    TaskAttemptRecord forbiddenRetry = finalFailure;
+    forbiddenRetry.attemptNumber += 1;
+    suite.expect(taskExecutionCommitAttempt(exhausted, forbiddenRetry, 3600) == false && exhausted == exhaustedTerminal,
+                 "task_until_success_terminal_execution_rejects_fixture_mutating_retry");
+
     String encoded;
     BitseryEngine::serialize(encoded, retry);
     TaskExecutionRecord decoded = {};
