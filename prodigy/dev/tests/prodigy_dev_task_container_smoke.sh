@@ -157,7 +157,7 @@ write_plan()
     "memoryMB": 256,
     "nLogicalCores": 1,
     "msTilHealthy": 1,
-    "sTilHealthcheck": 0,
+    "sTilHealthcheck": 1,
     "sTilKillable": 30
   },
   "minimumSubscriberCapacity": 1,
