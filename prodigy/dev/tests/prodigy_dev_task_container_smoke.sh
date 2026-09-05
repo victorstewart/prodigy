@@ -156,7 +156,7 @@ write_plan()
     "storageMB": 64,
     "memoryMB": 256,
     "nLogicalCores": 1,
-    "msTilHealthy": 0,
+    "msTilHealthy": 1,
     "sTilHealthcheck": 0,
     "sTilKillable": 30
   },
