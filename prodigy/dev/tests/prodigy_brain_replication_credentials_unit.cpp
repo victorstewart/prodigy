@@ -8992,7 +8992,7 @@ static void testUpdateProdigyRespondsBeforeSingleBrainTransition(TestSuite& suit
   restoreStagedBundle();
 }
 
-static void testUpdateProdigyRejectsUnsupportedWorkerTopology(TestSuite& suite)
+static void testUpdateProdigyDefersSuccessUntilWorkersRestore(TestSuite& suite)
 {
   ScopedRing scopedRing = {};
   TestBrain brain = {};
@@ -9017,23 +9017,66 @@ static void testUpdateProdigyRejectsUnsupportedWorkerTopology(TestSuite& suite)
   String bundle = "must-not-stage-partial-upgrade"_ctv;
   brain.mothershipHandler(&mothership,
       buildMothershipMessage(buffer, MothershipTopic::updateProdigy, bundle));
-  auto *message = reinterpret_cast<Message *>(mothership.wBuffer.data());
-  uint8_t *args = message->args;
-  String serialized;
-  Message::extractToStringView(args, serialized);
-  MothershipResponse response;
-  suite.expect(BitseryEngine::deserializeSafe(serialized, response) && !response.success,
-               "update_prodigy_workers_reject_partial_rollout");
+  suite.expect(mothership.wBuffer.size() == 0,
+               "update_prodigy_workers_defer_success_until_restored");
   suite.expect(!brain.updateSelfTransitionAfterMothershipAck && brain.transitionToNewBundleCalls == 0,
                "update_prodigy_workers_do_not_transition_master");
-  String after;
-  if (prodigyFileReadable(path)) Filesystem::openReadAtClose(-1, path, after);
-  suite.expect(prodigyFileReadable(path) == existed && after == previous,
-               "update_prodigy_workers_preserve_staged_rollback_bundle");
+  suite.expect(brain.updateSelfWorkerMachineUUIDs.contains(worker.uuid) &&
+                   brain.updateSelfWorkerExpectedBundleSHA256.size() == 64,
+               "update_prodigy_workers_persist_expected_digest");
   if (existed) Filesystem::openWriteAtClose(-1, path, previous);
   else ::unlink(path.c_str());
   brain.activeMotherships.erase(&mothership);
   brain.machines.erase(&worker);
+}
+
+static void testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(TestSuite& suite)
+{
+  TestBrain brain = {};
+  Machine first = {};
+  Machine second = {};
+  first.uuid = 0x8811;
+  second.uuid = 0x8812;
+  first.neuron.machine = &first;
+  second.neuron.machine = &second;
+  brain.machines.insert(&first);
+  brain.machines.insert(&second);
+  const String digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
+  brain.updateSelfWorkerExpectedBundleSHA256 = digest;
+  brain.updateSelfWorkerMachineUUIDs.insert(first.uuid);
+  brain.updateSelfWorkerMachineUUIDs.insert(second.uuid);
+
+  brain.noteWorkerBundleStaged(&first.neuron, false, digest, "disk full"_ctv);
+  suite.expect(brain.updateSelfWorkerStagedMachineUUIDs.empty() && brain.updateSelfWorkerFailure.equal("disk full"_ctv),
+               "worker_upgrade_rejects_failed_stage_ack");
+  brain.noteWorkerBundleStaged(&first.neuron, true, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv, String());
+  suite.expect(brain.updateSelfWorkerStagedMachineUUIDs.empty(), "worker_upgrade_rejects_wrong_stage_digest");
+  brain.noteWorkerBundleStaged(&first.neuron, true, digest, String());
+  suite.expect(brain.updateSelfWorkerStagedMachineUUIDs.size() == 1 && first.neuron.wBuffer.empty(),
+               "worker_upgrade_waits_for_all_stage_acks");
+  brain.noteWorkerBundleStaged(&second.neuron, true, digest, String());
+  const uint64_t transitionsAfterStage = (first.neuron.wBuffer.empty() ? 0 : 1) + (second.neuron.wBuffer.empty() ? 0 : 1);
+  suite.expect(transitionsAfterStage == 1, "worker_upgrade_transitions_exactly_one_worker_after_all_stage_acks");
+
+  ProdigyPersistentUpdateSelfState snapshot = brain.capturePersistentUpdateSelfState();
+  TestBrain restored = {};
+  restored.restorePersistentUpdateSelfState(snapshot);
+  suite.expect(restored.updateSelfWorkerExpectedBundleSHA256.equals(digest) &&
+                   restored.updateSelfWorkerStagedMachineUUIDs.size() == 2 &&
+                   restored.updateSelfWorkerStateUploadedMachineUUIDs.empty(),
+               "worker_upgrade_persists_incomplete_operation_for_resume");
+
+  // Registration is the digest proof; a state upload before it cannot advance
+  // the rollout. Then recovery of one worker unlocks only the next worker.
+  brain.noteWorkerStateUpload(&first.neuron);
+  suite.expect(brain.updateSelfWorkerStateUploadedMachineUUIDs.empty(), "worker_upgrade_requires_digest_registration_before_state_upload");
+  brain.noteWorkerRegistration(&first.neuron, digest);
+  brain.noteWorkerStateUpload(&first.neuron);
+  suite.expect(brain.updateSelfWorkerStateUploadedMachineUUIDs.contains(first.uuid) &&
+                   brain.updateSelfWorkerStateUploadedMachineUUIDs.contains(second.uuid) == false,
+               "worker_upgrade_marks_only_digest_verified_state_upload_complete");
+  brain.machines.erase(&first);
+  brain.machines.erase(&second);
 }
 
 static void testPersistentMasterAuthorityPackageRestore(TestSuite& suite)
@@ -21139,7 +21182,8 @@ int main(void)
   if (std::getenv("PRODIGY_TEST_BUNDLE_UPDATE_ONLY") != nullptr)
   {
     testUpdateProdigyRespondsBeforeSingleBrainTransition(suite);
-    testUpdateProdigyRejectsUnsupportedWorkerTopology(suite);
+    testUpdateProdigyDefersSuccessUntilWorkersRestore(suite);
+    testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(suite);
     return suite.failed == 0 ? 0 : 1;
   }
   if (std::getenv("PRODIGY_TEST_TLS_RESUMPTION_ACK_STABILITY") != nullptr)
@@ -21276,7 +21320,8 @@ int main(void)
   testMaybeRelinquishMasterSelectsLowestPeerKey(suite);
   testUpdateSelfFinalRelinquishPersistsDesignatedHandoff(suite);
   testUpdateProdigyRespondsBeforeSingleBrainTransition(suite);
-  testUpdateProdigyRejectsUnsupportedWorkerTopology(suite);
+  testUpdateProdigyDefersSuccessUntilWorkersRestore(suite);
+  testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(suite);
   testPersistentMasterAuthorityPackageRestore(suite);
   testResumePendingAddMachinesOperations(suite);
   testResumePendingAddMachinesRefreshesProvisionalCreatedMachine(suite);

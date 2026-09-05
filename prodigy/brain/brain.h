@@ -1065,6 +1065,14 @@ public:
   bytell_hash_set<uint128_t> updateSelfFollowerRebootedPeerKeys;
   bytell_hash_set<uint128_t> updateSelfTransitionIssuedPeerKeys;
   bytell_hash_set<uint128_t> updateSelfRelinquishIssuedPeerKeys;
+  String updateSelfWorkerExpectedBundleSHA256;
+  String updateSelfWorkerFailure;
+  Mothership *updateSelfWorkerMothership = nullptr; // request stream; intentionally not persisted
+  bytell_hash_set<uint128_t> updateSelfWorkerMachineUUIDs;
+  bytell_hash_set<uint128_t> updateSelfWorkerStagedMachineUUIDs;
+  bytell_hash_set<uint128_t> updateSelfWorkerTransitionIssuedMachineUUIDs;
+  bytell_hash_set<uint128_t> updateSelfWorkerRebootedMachineUUIDs;
+  bytell_hash_set<uint128_t> updateSelfWorkerStateUploadedMachineUUIDs;
   constexpr static int64_t connectFailureLogIntervalMs = prodigyBrainConnectFailureLogIntervalMs;
   constexpr static int64_t certificateLifecycleBaseRetryDelayMs = 5 * 60 * 1000;
   constexpr static int64_t certificateLifecycleMaxRetryDelayMs = 60 * 60 * 1000;
@@ -1785,6 +1793,13 @@ public:
     {
       state.followerRebootedPeerKeys.push_back(peerKey);
     }
+    state.workerExpectedBundleSHA256 = updateSelfWorkerExpectedBundleSHA256;
+    state.workerFailure = updateSelfWorkerFailure;
+    for (uint128_t uuid : updateSelfWorkerMachineUUIDs) state.workerMachineUUIDs.push_back(uuid);
+    for (uint128_t uuid : updateSelfWorkerStagedMachineUUIDs) state.workerStagedMachineUUIDs.push_back(uuid);
+    for (uint128_t uuid : updateSelfWorkerTransitionIssuedMachineUUIDs) state.workerTransitionIssuedMachineUUIDs.push_back(uuid);
+    for (uint128_t uuid : updateSelfWorkerRebootedMachineUUIDs) state.workerRebootedMachineUUIDs.push_back(uuid);
+    for (uint128_t uuid : updateSelfWorkerStateUploadedMachineUUIDs) state.workerStateUploadedMachineUUIDs.push_back(uuid);
 
     std::sort(state.bundleEchoPeerKeys.begin(), state.bundleEchoPeerKeys.end());
     std::sort(state.relinquishEchoPeerKeys.begin(), state.relinquishEchoPeerKeys.end());
@@ -1840,6 +1855,18 @@ public:
     {
       updateSelfFollowerRebootedPeerKeys.insert(peerKey);
     }
+    updateSelfWorkerExpectedBundleSHA256 = state.workerExpectedBundleSHA256;
+    updateSelfWorkerFailure = state.workerFailure;
+    updateSelfWorkerMachineUUIDs.clear();
+    updateSelfWorkerStagedMachineUUIDs.clear();
+    updateSelfWorkerTransitionIssuedMachineUUIDs.clear();
+    updateSelfWorkerRebootedMachineUUIDs.clear();
+    updateSelfWorkerStateUploadedMachineUUIDs.clear();
+    for (uint128_t uuid : state.workerMachineUUIDs) updateSelfWorkerMachineUUIDs.insert(uuid);
+    for (uint128_t uuid : state.workerStagedMachineUUIDs) updateSelfWorkerStagedMachineUUIDs.insert(uuid);
+    for (uint128_t uuid : state.workerTransitionIssuedMachineUUIDs) updateSelfWorkerTransitionIssuedMachineUUIDs.insert(uuid);
+    for (uint128_t uuid : state.workerRebootedMachineUUIDs) updateSelfWorkerRebootedMachineUUIDs.insert(uuid);
+    for (uint128_t uuid : state.workerStateUploadedMachineUUIDs) updateSelfWorkerStateUploadedMachineUUIDs.insert(uuid);
   }
 
   ProdigyResumptionRegistry::SnapshotMap captureTlsResumptionSnapshotsByWormhole(void) const
@@ -23197,6 +23224,132 @@ public:
     maybeTransitionFollowersForUpdateSelf();
   }
 
+  void queueWorkerBundleTransitionIfReady(void)
+  {
+    if (updateSelfWorkerMachineUUIDs.empty() ||
+        updateSelfWorkerStagedMachineUUIDs.size() != updateSelfWorkerMachineUUIDs.size())
+    {
+      return;
+    }
+
+    // Exactly one worker may be between its transition command and the
+    // post-exec registration/state upload.  Iterating machines makes the
+    // order deterministic for a given authoritative topology.
+    for (Machine *machine : machines)
+    {
+      if (machine == nullptr || updateSelfWorkerMachineUUIDs.contains(machine->uuid) == false ||
+          updateSelfWorkerStateUploadedMachineUUIDs.contains(machine->uuid))
+      {
+        continue;
+      }
+      if (updateSelfWorkerRebootedMachineUUIDs.contains(machine->uuid) == false &&
+          updateSelfWorkerTransitionIssuedMachineUUIDs.insert(machine->uuid).second)
+      {
+        noteMasterAuthorityRuntimeStateChanged();
+        Message::construct(machine->neuron.wBuffer, NeuronTopic::transitionToNewBundle, uint8_t(1));
+        if (neuronControlStreamActive(machine)) Ring::queueSend(&machine->neuron);
+      }
+      return;
+    }
+  }
+
+  void completeWorkerBundleUpgradeIfReady(void)
+  {
+    if (updateSelfWorkerMachineUUIDs.empty() ||
+        updateSelfWorkerStateUploadedMachineUUIDs.size() != updateSelfWorkerMachineUUIDs.size() ||
+        updateSelfWorkerMothership == nullptr || streamIsActive(updateSelfWorkerMothership) == false)
+    {
+      return;
+    }
+
+    MothershipResponse response = {};
+    response.success = true;
+    String serializedResponse = {};
+    BitseryEngine::serialize(serializedResponse, response);
+    Message::construct(updateSelfWorkerMothership->wBuffer, MothershipTopic::updateProdigy, serializedResponse);
+    updateSelfTransitionAfterMothershipAck = true;
+    updateSelfWorkerMothership = nullptr;
+    beginUpdateSelfBundle(0);
+  }
+
+  void noteWorkerBundleStaged(NeuronView *neuron, bool success, const String& digest, const String& failure)
+  {
+    if (neuron == nullptr || neuron->machine == nullptr || neuron->machine->uuid == 0 ||
+        updateSelfWorkerMachineUUIDs.contains(neuron->machine->uuid) == false)
+    {
+      return;
+    }
+    if (success == false || digest.equals(updateSelfWorkerExpectedBundleSHA256) == false)
+    {
+      updateSelfWorkerFailure = failure;
+      if (updateSelfWorkerFailure.empty()) updateSelfWorkerFailure.assign("worker staging acknowledgement digest mismatch"_ctv);
+      noteMasterAuthorityRuntimeStateChanged();
+      return;
+    }
+    if (updateSelfWorkerStagedMachineUUIDs.insert(neuron->machine->uuid).second)
+    {
+      updateSelfWorkerFailure.clear();
+      noteMasterAuthorityRuntimeStateChanged();
+    }
+    queueWorkerBundleTransitionIfReady();
+  }
+
+  void noteWorkerRegistration(NeuronView *neuron, const String& installedDigest)
+  {
+    if (neuron == nullptr || neuron->machine == nullptr ||
+        updateSelfWorkerMachineUUIDs.contains(neuron->machine->uuid) == false)
+    {
+      return;
+    }
+    if (updateSelfWorkerStagedMachineUUIDs.contains(neuron->machine->uuid) == false)
+    {
+      // A master restart can occur before the staging acknowledgement is
+      // received. Replaying the byte-identical durable payload is idempotent.
+      if (updateSelfBundleBlob.size() > 0)
+      {
+        Message::construct(neuron->wBuffer, NeuronTopic::updateBundle, updateSelfBundleBlob, updateSelfWorkerExpectedBundleSHA256);
+        if (streamIsActive(neuron)) Ring::queueSend(neuron);
+      }
+      return;
+    }
+    if (installedDigest.equals(updateSelfWorkerExpectedBundleSHA256) == false)
+    {
+      if (updateSelfWorkerTransitionIssuedMachineUUIDs.erase(neuron->machine->uuid))
+      {
+        noteMasterAuthorityRuntimeStateChanged();
+        queueWorkerBundleTransitionIfReady();
+      }
+      return;
+    }
+    if (updateSelfWorkerRebootedMachineUUIDs.insert(neuron->machine->uuid).second)
+    {
+      noteMasterAuthorityRuntimeStateChanged();
+    }
+  }
+
+  void noteWorkerStateUpload(NeuronView *neuron)
+  {
+    if (neuron == nullptr || neuron->machine == nullptr || neuron->machine->uuid == 0 ||
+        updateSelfWorkerMachineUUIDs.contains(neuron->machine->uuid) == false)
+    {
+      return;
+    }
+    if (updateSelfWorkerRebootedMachineUUIDs.contains(neuron->machine->uuid) == false)
+    {
+      return;
+    }
+    updateSelfWorkerStateUploadedMachineUUIDs.insert(neuron->machine->uuid);
+    // A non-empty target set is the durable completion criterion.  Do not
+    // clear it early: recovery replays outstanding staged workers after a
+    // master restart and reports remain visibly incomplete until all upload.
+    const bool allWorkersRestored =
+        updateSelfWorkerMachineUUIDs.empty() == false &&
+        updateSelfWorkerStateUploadedMachineUUIDs.size() == updateSelfWorkerMachineUUIDs.size();
+    noteMasterAuthorityRuntimeStateChanged();
+    if (allWorkersRestored) completeWorkerBundleUpgradeIfReady();
+    else queueWorkerBundleTransitionIfReady();
+  }
+
   void onUpdateSelfRelinquishEcho(BrainView *bv)
   {
     if (updateSelfState != UpdateSelfState::waitingForRelinquishEchos)
@@ -28089,17 +28242,6 @@ public:
           Message::extractToStringView(args, newBundle);
 
           MothershipResponse response = {};
-          // The current bundle transition protocol reaches Brain peers only.
-          // Reject before staging: otherwise a one-Brain cluster reports
-          // success while its worker Neurons retain their previous binary.
-          for (Machine *machine : machines)
-          {
-            if (machine != nullptr && machine->isBrain == false)
-            {
-              response.failure.assign("worker-only machine bundle updates are unsupported; refusing a partial cluster upgrade"_ctv);
-              break;
-            }
-          }
           if (response.failure.empty())
           {
             int written = Filesystem::openWriteAtClose(-1, prodigyStagedBundlePath(), newBundle);
@@ -28112,9 +28254,16 @@ public:
           }
 
           uint32_t expectedPeerEchos = 0;
+          bool waitingForWorkers = false;
           if (response.failure.size() == 0)
           {
-            response.success = true;
+            String expectedWorkerDigest = {};
+            String digestFailure = {};
+            if (prodigyComputeFileSHA256Hex(prodigyStagedBundlePath(), expectedWorkerDigest, &digestFailure) == false)
+            {
+              response.failure = digestFailure;
+            }
+            response.success = response.failure.empty();
 
             // Persist payload for retries in distributed mode by default.
             // The staged fast path is only safe when every brain shares one writable
@@ -28136,8 +28285,61 @@ public:
                 expectedPeerEchos += 1;
               }
             }
+            if (response.success)
+            {
+              bytell_hash_set<uint128_t> requestedWorkers = {};
+              for (Machine *machine : machines)
+              {
+                if (machine != nullptr && machine->isBrain == false && machine->uuid != 0)
+                {
+                  requestedWorkers.insert(machine->uuid);
+                }
+              }
+              waitingForWorkers = requestedWorkers.empty() == false;
+              if (waitingForWorkers)
+              {
+                // A same-digest command is a durable resume, not a second
+                // rollout. A different digest cannot overwrite a partial one.
+                if (updateSelfWorkerMachineUUIDs.empty() == false &&
+                    updateSelfWorkerStateUploadedMachineUUIDs.size() != updateSelfWorkerMachineUUIDs.size() &&
+                    updateSelfWorkerExpectedBundleSHA256.equals(expectedWorkerDigest) == false)
+                {
+                  response.success = false;
+                  response.failure.assign("another worker bundle upgrade is incomplete"_ctv);
+                  waitingForWorkers = false;
+                }
+                else if (updateSelfWorkerExpectedBundleSHA256.equals(expectedWorkerDigest) == false ||
+                         updateSelfWorkerMachineUUIDs.empty())
+                {
+                  updateSelfWorkerExpectedBundleSHA256 = expectedWorkerDigest;
+                  updateSelfWorkerFailure.clear();
+                  updateSelfWorkerMachineUUIDs = std::move(requestedWorkers);
+                  updateSelfWorkerStagedMachineUUIDs.clear();
+                  updateSelfWorkerTransitionIssuedMachineUUIDs.clear();
+                  updateSelfWorkerRebootedMachineUUIDs.clear();
+                  updateSelfWorkerStateUploadedMachineUUIDs.clear();
+                }
+                updateSelfBundleBlob.assign(newBundle);
+                updateSelfWorkerMothership = mothership;
+                for (Machine *machine : machines)
+                {
+                  if (machine == nullptr || updateSelfWorkerMachineUUIDs.contains(machine->uuid) == false ||
+                      updateSelfWorkerStagedMachineUUIDs.contains(machine->uuid)) continue;
+                  Message::construct(machine->neuron.wBuffer, NeuronTopic::updateBundle, updateSelfBundleBlob, expectedWorkerDigest);
+                  if (neuronControlStreamActive(machine)) Ring::queueSend(&machine->neuron);
+                }
+                noteMasterAuthorityRuntimeStateChanged();
+                completeWorkerBundleUpgradeIfReady();
+              }
+            }
           }
 
+          if (waitingForWorkers)
+          {
+            // Deliberately defer the response: success means every worker has
+            // registered the requested installed digest and uploaded live state.
+            break;
+          }
           String serializedResponse = {};
           BitseryEngine::serialize(serializedResponse, response);
           Message::construct(mothership->wBuffer, MothershipTopic::updateProdigy, serializedResponse);
@@ -29533,6 +29735,12 @@ public:
 
           bool haveData;
           Message::extractArg<ArgumentNature::fixed>(args, haveData);
+          String installedBundleDigest = {};
+          if (args < message->terminal())
+          {
+            Message::extractToStringView(args, installedBundleDigest);
+          }
+          noteWorkerRegistration(neuron, installedBundleDigest);
 
           if (haveData == false || needsStateRefresh) // either 1) first time the neuron is connecting or 2) neuron crashed or 3) neuron was updated or 4) OS updated
           {
@@ -29670,6 +29878,17 @@ public:
           {
             noteContainerLogResponse(neuron, operation);
           }
+          break;
+        }
+      case NeuronTopic::updateBundle:
+        {
+          bool success = false;
+          String digest = {};
+          String failure = {};
+          Message::extractArg<ArgumentNature::fixed>(args, success);
+          Message::extractToStringView(args, digest);
+          Message::extractToStringView(args, failure);
+          if (args == terminal) noteWorkerBundleStaged(neuron, success, digest, failure);
           break;
         }
       case NeuronTopic::stateUpload:
@@ -30000,6 +30219,7 @@ public:
           resumeMachineClaimsIfSchedulingReady(neuron->machine);
           sendNeuronSwitchboardStateSync(neuron->machine);
           recoverDeploymentsAfterNeuronState();
+          noteWorkerStateUpload(neuron);
 
           break;
         }

@@ -1187,7 +1187,14 @@ protected:
 
   void appendInitialBrainControlFrames(String& outbound)
   {
-    Message::construct(outbound, NeuronTopic::registration, bootTimeMs, kernel, osID, osVersionID, haveFragments());
+    String installedDigest = {};
+    String installedPath = {};
+    String digestFailure = {};
+    prodigyResolveInstalledBundlePathForRoot("/root/prodigy"_ctv, installedPath);
+    (void)prodigyComputeFileSHA256Hex(installedPath, installedDigest, &digestFailure);
+    // The master uses this attestation together with the following stateUpload
+    // before it advances the next worker.
+    Message::construct(outbound, NeuronTopic::registration, bootTimeMs, kernel, osID, osVersionID, haveFragments(), installedDigest);
   }
 
   uint32_t appendHealthyContainerFrames(String& outbound)
@@ -3919,6 +3926,49 @@ public:
             queueNeuronStateUpload();
           }
 
+          break;
+        }
+      case NeuronTopic::updateBundle:
+        {
+          String bundle = {};
+          String expectedDigest = {};
+          Message::extractToStringView(args, bundle);
+          Message::extractToStringView(args, expectedDigest);
+          String actualDigest = {};
+          String failure = {};
+          const int written = Filesystem::openWriteAtClose(-1, prodigyStagedBundlePath(), bundle);
+          if (written < 0 || uint64_t(written) != bundle.size() ||
+              prodigyFileMatchesExpectedSHA256Hex(prodigyStagedBundlePath(), expectedDigest, actualDigest, &failure) == false)
+          {
+            basics_log("neuron updateBundle rejected bytes=%llu reason=%s\n", (unsigned long long)bundle.size(), failure.c_str());
+            if (brain != nullptr)
+            {
+              Message::construct(brain->wBuffer, NeuronTopic::updateBundle, false, actualDigest, failure);
+              if (streamIsActive(brain))
+              {
+                Ring::queueSend(brain);
+              }
+            }
+            break;
+          }
+          if (brain != nullptr)
+          {
+            Message::construct(brain->wBuffer, NeuronTopic::updateBundle, true, actualDigest, String());
+            if (streamIsActive(brain))
+            {
+              Ring::queueSend(brain);
+            }
+          }
+          break;
+        }
+      case NeuronTopic::transitionToNewBundle:
+        {
+          uint8_t marker = 0;
+          Message::extractArg<ArgumentNature::fixed>(args, marker);
+          if (marker == 1)
+          {
+            transitionToNewBundle();
+          }
           break;
         }
       case NeuronTopic::updateOS:
