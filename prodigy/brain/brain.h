@@ -1108,6 +1108,11 @@ public:
   TimeoutPacket operatorCancellationContinuation;
   bool operatorCancellationContinuationInstalled = false;
   bool operatorCancellationContinuationArmed = false;
+  // A cancelled deployment can still own deferred Ring coroutine callbacks
+  // after its final container acknowledgement.  Retain that rare operator-
+  // cancelled owner for the Brain lifetime instead of freeing it underneath
+  // callbacks which may resume on a later Ring turn.
+  Vector<ApplicationDeployment *> operatorCancellationRetiredDeployments;
   uint32_t dnsReconcileFailureCount = 0;
   enum class PendingDNSOperationKind : uint8_t
   {
@@ -26650,13 +26655,11 @@ public:
     {
       successor = successorIt->second;
     }
-    if (successor == nullptr)
+    if (successor == nullptr ||
+        (deployment != nullptr &&
+         (deployment->containers.empty() == false ||
+          deployment->waitingOnContainers.empty() == false)))
     {
-      return;
-    }
-    if (deployment != nullptr && deployment->operatorCancellationIsQuiescent() == false)
-    {
-      armOperatorCancellationContinuation();
       return;
     }
 
@@ -26718,7 +26721,7 @@ public:
       {
         deployments.erase(deploymentIt);
       }
-      delete deployment;
+      operatorCancellationRetiredDeployments.push_back(deployment);
     }
 
     if (successor->state == DeploymentState::waitingToDeploy || successor->state == DeploymentState::none)

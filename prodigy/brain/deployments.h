@@ -9860,15 +9860,6 @@ public:
     return true;
   }
 
-  // Container termination alone does not make a cancelled deployment safe to
-  // destroy.  The scheduler resumes through deferred Ring callbacks and those
-  // callbacks retain the deployment-owned coroutine and work state.  Keep the
-  // deployment alive until every such owner has retired.
-  bool operatorCancellationIsQuiescent(void) const
-  {
-    return lifecycleIsUnmaterialized();
-  }
-
   bool lifecycleIsUnmaterialized(void) const
   {
     return containers.empty() && waitingOnContainers.empty() &&

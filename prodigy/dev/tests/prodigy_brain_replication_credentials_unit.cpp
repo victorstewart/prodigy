@@ -20946,10 +20946,12 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
   brain.resumeOperatorCancellations();
   auto failedIt = brain.failedDeployments.find(activeDeploymentID);
   suite.expect(failedIt != brain.failedDeployments.end() &&
-                   failedIt->second.cancellationPhase != CancelDeploymentPhase::completed &&
-                   brain.deployments.contains(activeDeploymentID) &&
-                   successor->state == DeploymentState::waitingToDeploy,
-               "operator_cancellation_waits_for_scheduler_quiescence");
+                   failedIt->second.cancellationPhase == CancelDeploymentPhase::completed &&
+                   brain.deployments.contains(activeDeploymentID) == false &&
+                   brain.operatorCancellationRetiredDeployments.size() == 1 &&
+                   brain.operatorCancellationRetiredDeployments.front() == active &&
+                   successor->state != DeploymentState::waitingToDeploy,
+               "operator_cancellation_retains_deferred_scheduler_owner");
   active->schedulingStack.execution = nullptr;
   active->nSuspended = 0;
   // Production continues from the Neuron acknowledgement on the next Ring
@@ -21079,6 +21081,8 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
   brain.deploymentPlans.erase(successorDeploymentID);
   brain.deploymentsByApp.erase(applicationID);
   brain.deployments.erase(successorDeploymentID);
+  brain.operatorCancellationRetiredDeployments.clear();
+  delete active;
   delete successor;
   thisBrain = previousBrain;
 }
