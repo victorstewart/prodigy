@@ -199,23 +199,29 @@ wait_report()
 success_blob="$(build_artifact task-success 'ENV PRODIGY_TASK_PROBE_RESULT=task-success-result')"
 failure_blob="$(build_artifact task-failure $'ENV PRODIGY_TASK_PROBE_RESULT=task-failure-result\nENV PRODIGY_TASK_PROBE_EXIT_CODE=7')"
 retry_blob="$(build_artifact task-retry 'ENV PRODIGY_TASK_PROBE_SUCCEED_ON_ATTEMPT=2')"
+exhausted_blob="$(build_artifact task-exhausted $'ENV PRODIGY_TASK_PROBE_RESULT=task-exhausted-result\nENV PRODIGY_TASK_PROBE_EXIT_CODE=9')"
 
 success_name="task-success-${cluster_name}"
 failure_name="task-failure-${cluster_name}"
 retry_name="task-retry-${cluster_name}"
+exhausted_name="task-exhausted-${cluster_name}"
 reserve_app "${success_name}" 62010
 reserve_app "${failure_name}" 62011
 reserve_app "${retry_name}" 62012
+reserve_app "${exhausted_name}" 62013
 
 success_version="$(new_version)"
 failure_version="$(new_version)"
 retry_version="$(new_version)"
+exhausted_version="$(new_version)"
 success_plan="${tmpdir}/success.plan.json"
 failure_plan="${tmpdir}/failure.plan.json"
 retry_plan="${tmpdir}/retry.plan.json"
+exhausted_plan="${tmpdir}/exhausted.plan.json"
 write_plan "${success_plan}" 62010 "${success_version}" runOnce
 write_plan "${failure_plan}" 62011 "${failure_version}" runOnce
 write_plan "${retry_plan}" 62012 "${retry_version}" untilSucceeded
+write_plan "${exhausted_plan}" 62013 "${exhausted_version}" untilSucceeded
 
 deploy_task success "${success_plan}" "${success_blob}"
 wait_report success "${success_name}" "${success_version}" succeeded 'attempt=1 .* started=1 .* succeeded=1 .* failed=0 .* resultBytes=[1-9]'
@@ -235,4 +241,10 @@ wait_report retry "${retry_name}" "${retry_version}" succeeded 'attempt=2 .* sta
 deploy_task duplicate-retry "${retry_plan}" "${retry_blob}"
 wait_report duplicate-retry "${retry_name}" "${retry_version}" succeeded 'attempt=2 .* started=2 .* succeeded=1 .* failed=1 .* resultBytes=[1-9]'
 
-echo "PASS: task container smoke success=${success_version} failure=${failure_version} retry=${retry_version}"
+deploy_task exhausted "${exhausted_plan}" "${exhausted_blob}"
+wait_report exhausted "${exhausted_name}" "${exhausted_version}" failed 'attempt=3 .* started=3 .* succeeded=0 .* failed=3 .* resultBytes=[1-9]'
+
+deploy_task duplicate-exhausted "${exhausted_plan}" "${exhausted_blob}"
+wait_report duplicate-exhausted "${exhausted_name}" "${exhausted_version}" failed 'attempt=3 .* started=3 .* succeeded=0 .* failed=3 .* resultBytes=[1-9]'
+
+echo "PASS: task container smoke success=${success_version} failure=${failure_version} retry=${retry_version} exhausted=${exhausted_version}"
