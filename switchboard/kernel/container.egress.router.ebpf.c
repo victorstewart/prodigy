@@ -136,9 +136,76 @@ int ct_egress(struct __sk_buff *skb)
     }
   }
 
-  if (protocol == BE_ETH_P_IP && wormholeReply == SWITCHBOARD_WORMHOLE_REPLY_NONE && containerRequiresPublic4() == false)
+  if (protocol == BE_ETH_P_IP)
   {
-    return NETKIT_DROP;
+    struct iphdr *iph = (struct iphdr *)l3_data;
+    if (switchboard_unfragmented_ipv4(iph, data_end) == false)
+    {
+      return NETKIT_DROP;
+    }
+
+    if (wormholeReply == SWITCHBOARD_WORMHOLE_REPLY_NONE)
+    {
+      struct packet_description pckt = {};
+      pckt.flow.proto = iph->protocol;
+      pckt.flow.src = iph->saddr;
+      pckt.flow.dst = iph->daddr;
+      if (pckt.flow.proto == IPPROTO_TCP)
+      {
+        if (parse_tcp(data, data_end, false, &pckt) == false)
+        {
+          return NETKIT_DROP;
+        }
+      }
+      else if (pckt.flow.proto == IPPROTO_UDP)
+      {
+        if (parse_udp(data, data_end, false, &pckt) == false)
+        {
+          return NETKIT_DROP;
+        }
+      }
+      else
+      {
+        goto forward_to_host;
+      }
+
+      struct container_id containerID = {};
+      struct portal_meta *portalMeta = NULL;
+      int portalTarget = switchboardResolveExternalPortalTarget(data, data_end, false, &pckt, &containerID, &portalMeta);
+      if (portalTarget == SWITCHBOARD_PORTAL_TARGET_DROP)
+      {
+        return NETKIT_DROP;
+      }
+
+      if (portalTarget == SWITCHBOARD_PORTAL_TARGET_RESOLVED)
+      {
+        __u16 targetPort = 0;
+        if (portalMeta == NULL || switchboardLookupWormholeTargetPort(portalMeta->slot, &containerID, &targetPort) == false)
+        {
+          return NETKIT_DROP;
+        }
+
+        __u32 zeroidx = 0;
+        struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
+        if (switchboardContainerIDTargetsLocalMachine(&containerID, localSubnet))
+        {
+          struct portal_definition portal = {};
+          if (switchboardPacketPortalDefinition(&pckt, false, &portal) == false ||
+              switchboardLearnPublicWormholeFlowIPv4(&pckt, &containerID, targetPort, &portal) == false ||
+              switchboardRewriteWormholeIPv4TargetSKB(skb, &pckt, targetPort) == false)
+          {
+            return NETKIT_DROP;
+          }
+          skb->mark = SWITCHBOARD_WORMHOLE_SKB_MARK;
+          return redirectContainerFragment(containerID.value[4], false) ? NETKIT_REDIRECT : NETKIT_DROP;
+        }
+      }
+    }
+
+    if (wormholeReply == SWITCHBOARD_WORMHOLE_REPLY_NONE && containerRequiresPublic4() == false)
+    {
+      return NETKIT_DROP;
+    }
   }
 
   if (protocol == BE_ETH_P_IPV6)
