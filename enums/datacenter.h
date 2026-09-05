@@ -189,7 +189,11 @@ enum class NeuronTopic : uint16_t {
   closeSwitchboardWhiteholesToContainer,
   taskAttemptTerminal,
   taskAttemptTerminalAck,
-  pullContainerLogs
+  pullContainerLogs,
+  // Brain -> Neuron bundle staging command; Neuron echoes only after the
+  // exact requested digest has been staged.
+  updateBundle,
+  transitionToNewBundle
 };
 
 enum class ContainerTopic : uint16_t {

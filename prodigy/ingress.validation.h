@@ -826,6 +826,15 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
       {
         return (cursor == terminal);
       }
+    case NeuronTopic::updateBundle:
+      {
+        // A worker only reports a bundle stage by the zero-length echo.
+        return (cursor == terminal);
+      }
+    case NeuronTopic::transitionToNewBundle:
+      {
+        return false;
+      }
     default:
       {
         return false;
@@ -1004,6 +1013,19 @@ static bool validateNeuronPayloadForNeuron(uint16_t rawTopic, uint8_t *args, uin
           return false;
         }
         return (cursor == terminal);
+      }
+    case NeuronTopic::updateBundle:
+      {
+        if (cursor == terminal)
+        {
+          return true; // staging acknowledgement
+        }
+        return consumeVariable(cursor, terminal) && consumeVariable(cursor, terminal) && cursor == terminal;
+      }
+    case NeuronTopic::transitionToNewBundle:
+      {
+        uint8_t marker = 0;
+        return extractFixed(cursor, terminal, marker) && cursor == terminal;
       }
     case NeuronTopic::advertisementPairing:
       {

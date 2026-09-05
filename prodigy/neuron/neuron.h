@@ -3635,6 +3635,46 @@ public:
     }
   }
 
+  // Keep live container processes and their mounts intact.  The replacement
+  // Neuron re-registers and stateUpload re-adopts them before scheduling any
+  // new work; this is deliberately an exec, not a Neuron restart/teardown.
+  [[noreturn]] void transitionToNewBundle(void)
+  {
+    String failure = {};
+    if (prodigyInstallBundleToRoot(prodigyStagedBundlePath(), "/root/prodigy"_ctv, &failure) == false)
+    {
+      basics_log("neuron transitionToNewBundle install failed: %s\n", failure.c_str());
+      _exit(EXIT_FAILURE);
+    }
+
+    ProdigyInstallRootPaths paths = {};
+    prodigyBuildInstallRootPaths("/root/prodigy"_ctv, paths);
+    String libraryDirectory = {};
+    libraryDirectory.assign(paths.libraryDirectory);
+    (void)setenv("LD_LIBRARY_PATH", libraryDirectory.c_str(), 1);
+    Ring::shutdownForExec();
+
+    long maxFD = sysconf(_SC_OPEN_MAX);
+    if (maxFD < 0)
+    {
+      maxFD = 4096;
+    }
+    for (int fd = 3; fd < maxFD; ++fd)
+    {
+      close(fd);
+    }
+
+    String binaryPath = {};
+    binaryPath.assign(paths.binaryPath);
+    Vector<char *> argv = {};
+    if (BrainBase::buildLaunchArgumentsForExec(binaryPath, argv))
+    {
+      execv(binaryPath.c_str(), argv.data());
+    }
+    execl(binaryPath.c_str(), binaryPath.c_str(), (char *)NULL);
+    _exit(EXIT_FAILURE);
+  }
+
   void neuronHandler(Message *message)
   {
     uint8_t *args = message->args;
