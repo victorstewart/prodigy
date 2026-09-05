@@ -2357,7 +2357,9 @@ int main(void)
           &failure);
       suite.expect(valid == false, "artifact_resource_limits_reject_rootfs_bytes_above_filesystem_limit");
       suite.expect(
-          stringContains(failure, "rootfs regular-file bytes exceed filesystemMB"),
+          stringContains(
+              failure,
+              "artifact rootfs regular-file bytes exceed filesystemMB: 2097152 > 1048576"),
           "artifact_resource_limits_report_rootfs_bytes_above_filesystem_limit");
     }
   }
@@ -2393,7 +2395,9 @@ int main(void)
           &failure);
       suite.expect(valid == false, "artifact_resource_limits_reject_total_artifact_bytes_above_global_limit");
       suite.expect(
-          stringContains(failure, "artifact regular-file bytes exceed maximum"),
+          stringContains(
+              failure,
+              "artifact regular-file bytes exceed maximum: 2097152 > 1048576"),
           "artifact_resource_limits_report_total_artifact_bytes_above_global_limit");
     }
   }

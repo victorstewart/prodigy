@@ -4386,7 +4386,7 @@ private:
           {
             if (failureReport)
             {
-              failureReport->snprintf<"artifact regular-file bytes exceed maximum: {} > {}"_ctv>(
+              failureReport->snprintf<"artifact regular-file bytes exceed maximum: {itoa} > {itoa}"_ctv>(
                   totalRegularFileBytes,
                   maxArtifactRegularFileBytes);
             }
@@ -4400,7 +4400,7 @@ private:
             {
               if (failureReport)
               {
-                failureReport->snprintf<"artifact rootfs regular-file bytes exceed filesystemMB: {} > {}"_ctv>(
+                failureReport->snprintf<"artifact rootfs regular-file bytes exceed filesystemMB: {itoa} > {itoa}"_ctv>(
                     rootfsRegularFileBytes,
                     maxRootfsRegularFileBytes);
               }
