@@ -5562,6 +5562,7 @@ int main(void)
     suite.expect(container && container->state == ContainerState::scheduled, "stateful_worker_topology_upgrade_green_schedule_schedules_container_immediately");
     suite.expect(container && container->advertisements.find(roles.client) == container->advertisements.end(), "stateful_worker_topology_upgrade_green_schedule_suppresses_client_advertisement");
     suite.expect(container && container->advertisements.find(roles.sibling) != container->advertisements.end(), "stateful_worker_topology_upgrade_green_schedule_preserves_sibling_advertisement");
+    suite.expect(container && container->advertisingOnPorts.size() == container->advertisements.size(), "stateful_worker_topology_upgrade_green_schedule_reserves_each_advertisement_port");
     suite.expect(container && container->subscriptions.find(roles.sibling) != container->subscriptions.end(), "stateful_worker_topology_upgrade_green_schedule_preserves_sibling_subscription");
     suite.expect(container && container->advertisements.find(roles.topologyBridge) == container->advertisements.end(), "stateful_worker_topology_upgrade_green_schedule_does_not_advertise_bridge_on_target");
     suite.expect(container && container->subscriptions.find(roles.topologyBridge) != container->subscriptions.end(), "stateful_worker_topology_upgrade_green_schedule_subscribes_bridge_on_target");

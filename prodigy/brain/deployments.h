@@ -8637,6 +8637,7 @@ public:
           Advertisement advertisement(service, startAt, stopAt, port);
           advertisement.userCapacity = userCapacity;
           container->advertisements.emplace(service, advertisement);
+          container->advertisingOnPorts.insert(port);
 
           if (startAt == ContainerState::scheduled)
           {
