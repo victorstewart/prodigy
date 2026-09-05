@@ -160,7 +160,7 @@ write_plan()
     "sTilHealthcheck": 1,
     "sTilKillable": 30
   },
-  "minimumSubscriberCapacity": 1,
+  "minimumSubscriberCapacity": 1024,
   "isStateful": false,
   "requiresDatacenterUniqueTag": false
 }
