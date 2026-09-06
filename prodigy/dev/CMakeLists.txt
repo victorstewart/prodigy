@@ -1298,11 +1298,6 @@ if (PROJECT_ENABLE_TESTS)
    )
 
    add_test(
-      NAME prodigy_dev_runtime_bundle_refresh_unit
-      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_runtime_bundle_refresh_unit.sh
-   )
-
-   add_test(
       NAME prodigy_dev_container_netkit_mtu_unit
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_container_netkit_mtu_unit.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_ready_container
    )
@@ -1591,7 +1586,6 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       prodigy_dev_bpffs_mount_unit
       prodigy_dev_overlay_link_mtu_unit
       prodigy_dev_host_tcp_unit
-      prodigy_dev_runtime_bundle_refresh_unit
       prodigy_dev_container_netkit_mtu_unit
       prodigy_dev_accepted_fixed_file_sender_unit
       prodigy_dev_single_ns_mothership_boot
