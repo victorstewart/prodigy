@@ -13,6 +13,20 @@ file(READ "${_provider}" _provider_source)
 file(READ "${_mothership}" _mothership_source)
 file(READ "${_mothership_cluster_test}" _mothership_cluster_test_source)
 
+file(READ "${PRODIGY_ROOT}/tools/evaluation/session.py" _evaluation_source)
+foreach(_forbidden IN ITEMS "ip netns" "bpftool" "iptables" "mkfs" "mount --" "container exec" "unshare" "os.kill" "tar --zstd")
+   string(FIND "${_evaluation_source}" "${_forbidden}" _position)
+   if(NOT _position EQUAL -1)
+      message(FATAL_ERROR "evaluation client assumes infrastructure ownership: ${_forbidden}")
+   endif()
+endforeach()
+foreach(_required IN ITEMS [[client.command("createCluster"]] [[client.command("removeCluster"]] [[client.command("reserveApplicationID"]] [[self.command("deploy"]])
+   string(FIND "${_evaluation_source}" "${_required}" _position)
+   if(_position EQUAL -1)
+      message(FATAL_ERROR "evaluation must use Mothership's ordinary lifecycle operations: ${_required}")
+   endif()
+endforeach()
+
 foreach(_forbidden IN ITEMS
    "configureTestCluster"
    "ip netns"

@@ -73,7 +73,7 @@ case "${tool}" in
    launcher)
       echo "launcher ${1:-}" >> "${EVENT_LOG}"
       case "${1:-}" in
-         ensure) exit 0 ;;
+         ensure|verify) exit 0 ;;
          stop) exit "${LAUNCHER_STOP_STATUS:-0}" ;;
          *) exit 64 ;;
       esac
@@ -148,6 +148,7 @@ base_env=(
    "INSPECTION_FILE=${inspection}"
    "EVENT_LOG=${event_log}"
    "ROUTE_STATE_FILE=${route_state_file}"
+   "TMPDIR=${work_root}/"
 )
 status=0
 
@@ -205,6 +206,28 @@ grep -Fq '198.18.128/17 via 192.168.64.4' "${output}" || fail "missing subnet-ro
 run_case post-add-wrong-prefix
 expect 1 'launcher ensure,netstat,route get,route add,route get,route delete,launcher stop'
 grep -Fq 'failed to verify the Apple Container host route' "${output}" || fail "missing post-add verification diagnostic"
+
+# Read-only evaluation commands must neither start nor stop the shared guest,
+# and only the foreground session may own the temporary route.
+: > "${event_log}"
+rm -f "${route_state_file}"
+env "${base_env[@]}" ROUTE_SCENARIO=default "${subject}" --evaluation-command "${fixture_repo}" status > "${output}" 2>&1
+status=$?
+expect 0 'launcher verify,container exec'
+
+: > "${event_log}"
+env "${base_env[@]}" ROUTE_SCENARIO=default "${subject}" --evaluation-session "${fixture_repo}" > "${output}" 2>&1
+status=$?
+expect 0 'launcher ensure,netstat,route get,route add,route get,netstat,container exec,container exec,route delete,launcher stop'
+[[ ! -e "${route_state_file}" ]] || fail "evaluation route survived cleanup"
+[[ ! -e "${work_root}/prodigy-evaluation-${UID}-nametag-prodigy.lock" ]] || fail "evaluation host lock survived cleanup"
+
+cp "${instance}" "${instance}.valid"
+jq 'del(.environment.PRODIGY_BPF_AUTHORIZATION)' "${instance}.valid" > "${instance}"
+run_case default
+expect 1 ''
+grep -Fq 'does not carry standing guest-only BPF authorization' "${output}" || fail "missing authorization preflight diagnostic"
+mv "${instance}.valid" "${instance}"
 
 : > "${event_log}"
 rm -f "${route_state_file}"

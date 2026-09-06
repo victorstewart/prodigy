@@ -1,0 +1,45 @@
+{
+  "config": {
+    "type": "ApplicationType::stateless",
+    "applicationID": "${application:HelloProdigy}",
+    "versionID": 2,
+    "filesystemMB": 64,
+    "storageMB": 64,
+    "memoryMB": 128,
+    "nLogicalCores": 1,
+    "msTilHealthy": 10000,
+    "sTilHealthcheck": 15,
+    "sTilKillable": 30
+  },
+  "minimumSubscriberCapacity": 1024,
+  "isStateful": false,
+  "stateless": {
+    "nBase": 1,
+    "maxPerRackRatio": 1.0,
+    "maxPerMachineRatio": 1.0,
+    "moveableDuringCompaction": true
+  },
+  "useHostNetworkNamespace": false,
+  "wormholes": [
+    {
+      "name": "hello-prodigy-http",
+      "source": "registeredRoutablePrefix",
+      "routablePrefixUUID": "${routablePrefix:hello-prodigy-public-ipv4}",
+      "externalPort": 8080,
+      "containerPort": 8080,
+      "layer4": "TCP",
+      "isQuic": false
+    }
+  ],
+  "subscriptions": [],
+  "advertisements": [
+    {
+      "service": "${service:HelloProdigy/http}",
+      "startAt": "ContainerState::scheduled",
+      "stopAt": "ContainerState::destroying",
+      "port": 8080
+    }
+  ],
+  "moveConstructively": true,
+  "requiresDatacenterUniqueTag": false
+}

@@ -57,8 +57,10 @@ Those concerns live in the Prodigy runtime, the workload protocol, and the appli
 AWS uses a strict bootstrap/runtime split. Local `mothership` may use an `awsCli` provider credential to create the seed capacity, but created AWS brains must run with an EC2 instance profile so they can later create and destroy machines through IMDS credentials. Configure exactly one runtime profile on the cluster:
 
 ```json
-"aws": {
-  "instanceProfileName": "prodigy-controller-profile"
+{
+  "aws": {
+    "instanceProfileName": "prodigy-controller-profile"
+  }
 }
 ```
 

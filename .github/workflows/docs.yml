@@ -1,0 +1,21 @@
+name: Documentation
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check documentation and evaluation boundaries
+        run: |
+          python3 tools/verify-docs.py
+          python3 -m unittest discover -s tools/evaluation/tests
+          bash -n try-prodigy tools/build-evaluation.sh tools/package-evaluation.sh prodigy/dev/tests/prodigy_dev_test_cluster.sh
+          bash prodigy/dev/tests/prodigy_dev_test_cluster_darwin_route_unit.sh prodigy/dev/tests/prodigy_dev_test_cluster.sh
+          cmake -DPRODIGY_ROOT="$PWD" -P prodigy/dev/tests/assert_harness_ownership_contract.cmake

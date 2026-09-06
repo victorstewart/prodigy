@@ -1,0 +1,7 @@
+FROM scratch for @PRODIGY_RESOLVED_TARGET_ARCH@
+COPY {bin} ./@HELLO_PRODIGY_BINARY@ /app/hello-prodigy
+COPY {ebpf} ./container.egress.router.ebpf.o /root/prodigy/container.egress.router.ebpf.o
+COPY {ebpf} ./container.ingress.router.ebpf.o /root/prodigy/container.ingress.router.ebpf.o
+SURVIVE /app/hello-prodigy
+SURVIVE /root/prodigy
+EXECUTE ["/app/hello-prodigy"]

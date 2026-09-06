@@ -1233,6 +1233,9 @@ add_dependencies(prodigy_mothership_cluster_report_unit mothership)
 add_dependencies(prodigy_mothership_restart_persistence_unit mothership prodigy_bundle prodigy_bundle_sha256)
 add_dependencies(prodigy_remote_bootstrap_smoke prodigy_bundle)
 
+# The public evaluation ships real Discombobulator-built workloads.
+add_subdirectory("${PRODIGY_ROOT}/examples/hello-prodigy" "${CMAKE_BINARY_DIR}/examples/hello-prodigy")
+
 
 
 
@@ -1262,6 +1265,12 @@ endif()
 
 if (PROJECT_ENABLE_TESTS)
    include(CTest)
+
+   add_test(
+      NAME prodigy_mothership_json_argument_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_json_argument_unit.sh ${CMAKE_BINARY_DIR}/mothership
+   )
+   set_tests_properties(prodigy_mothership_json_argument_unit PROPERTIES TIMEOUT 60)
 
    add_test(
       NAME prodigy_dev_hostns_fail_closed

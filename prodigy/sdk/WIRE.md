@@ -77,7 +77,8 @@ Bootstrap pairing rules:
 
 Current writer boundary:
 
-- startup data, including `wormholes` and `whiteholes`, is serialized as `PRDPAR01`
+- The compact stateless startup path is serialized as `PRDPAR01`.
+- The current [runtime startup writer](../neuron/containers.h) uses the full Bitsery serializer when wormholes, whiteholes, or full stateful topology are present. The public C++ SDK’s `PRDPAR01` reader does not accept that payload. The [HTTP evaluation example](../../examples/hello-prodigy/README.md) uses the existing native runtime hub for this path; these formats must not be treated as interchangeable.
 
 Compatibility note:
 

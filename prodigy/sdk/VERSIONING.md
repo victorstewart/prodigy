@@ -2,7 +2,7 @@
 
 This file defines the explicit versioning policy for the native SDK wire format and the checked-in fixture corpus.
 
-The machine-readable source of truth is [`versioning.json`](/root/prodigy/prodigy/sdk/versioning.json).
+The machine-readable source of truth is [`versioning.json`](versioning.json).
 
 ## Version Axes
 
@@ -37,7 +37,7 @@ The machine-readable source of truth is [`versioning.json`](/root/prodigy/prodig
 
 ## Enforcement
 
-- [`fixtures/generate.ts`](/root/prodigy/prodigy/sdk/fixtures/generate.ts) reads `versioning.json` and writes those values into `fixtures/manifest.json`.
-- [`compatibility_matrix.sh`](/root/prodigy/prodigy/sdk/compatibility_matrix.sh) checks that `versioning.json` and `fixtures/manifest.json` agree before running language tests.
-- [`compatibility_matrix.sh`](/root/prodigy/prodigy/sdk/compatibility_matrix.sh) also checks that `sdkVersion`, `wireSeries`, and `wireProtocolVersion` stay aligned across the language SDK manifests, public constants, and checked-in READMEs.
+- [`fixtures/generate.ts`](fixtures/generate.ts) reads `versioning.json` and writes those values into `fixtures/manifest.json`.
+- [`compatibility_matrix.sh`](compatibility_matrix.sh) checks that `versioning.json` and `fixtures/manifest.json` agree before running language tests.
+- [`compatibility_matrix.sh`](compatibility_matrix.sh) also checks that `sdkVersion`, `wireSeries`, and `wireProtocolVersion` stay aligned across the language SDK manifests, public constants, and checked-in READMEs.
 - The version metadata is checked into git, so any version change is visible in review.
