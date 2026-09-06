@@ -2674,24 +2674,8 @@ static void exerciseBalancerOwnedRoutableMissPassesToKernel(TestSuite& suite)
   balancerProgram.close();
 }
 
-int main(int argc, char **argv)
+static void verifyWhiteholeBindingValue(TestSuite& suite)
 {
-  if (argc == 2 && std::strcmp(argv[1], "--development-map-allocation-only") == 0)
-  {
-    TestSuite suite = {};
-    verifyDevelopmentWhiteholeMapAllocation(suite);
-    return suite.failed == 0 ? 0 : 1;
-  }
-
-  if (const char *allow = std::getenv("PRODIGY_DEV_ALLOW_BPF_ATTACH"); allow == nullptr || std::strcmp(allow, "1") != 0)
-  {
-    std::fprintf(stderr, "SKIP: switchboard whitehole unit loads BPF programs; set PRODIGY_DEV_ALLOW_BPF_ATTACH=1 only inside an authorized isolated VM\n");
-    return 77;
-  }
-
-  TestSuite suite = {};
-  verifyDevelopmentWhiteholeMapAllocation(suite);
-
   Whitehole whitehole = {};
   whitehole.transport = ExternalAddressTransport::quic;
   whitehole.family = ExternalAddressFamily::ipv6;
@@ -2718,7 +2702,35 @@ int main(int argc, char **argv)
   suite.expect(value.nonce == whitehole.bindingNonce, "switchboard_whitehole_binding_preserves_nonce");
   suite.expect(value.container.hasID, "switchboard_whitehole_binding_sets_container_has_id");
   suite.expect(value.container.value[0] == subnet.dpfx, "switchboard_whitehole_binding_sets_datacenter_prefix");
-  suite.expect(value.container.value[1] == 0x04 && value.container.value[2] == 0x03 && value.container.value[3] == 0x02 && value.container.value[4] == 0x01, "switchboard_whitehole_binding_sets_container_suffix");
+  suite.expect(value.container.value[1] == 0x02 && value.container.value[2] == 0x03 && value.container.value[3] == 0x04 && value.container.value[4] == 0x01, "switchboard_whitehole_binding_sets_container_suffix");
+}
+
+int main(int argc, char **argv)
+{
+  if (argc == 2 && std::strcmp(argv[1], "--development-map-allocation-only") == 0)
+  {
+    TestSuite suite = {};
+    verifyDevelopmentWhiteholeMapAllocation(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--binding-value-only") == 0)
+  {
+    TestSuite suite = {};
+    verifyWhiteholeBindingValue(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
+
+  if (const char *allow = std::getenv("PRODIGY_DEV_ALLOW_BPF_ATTACH"); allow == nullptr || std::strcmp(allow, "1") != 0)
+  {
+    std::fprintf(stderr, "SKIP: switchboard whitehole unit loads BPF programs; set PRODIGY_DEV_ALLOW_BPF_ATTACH=1 only inside an authorized isolated VM\n");
+    return 77;
+  }
+
+  TestSuite suite = {};
+  verifyDevelopmentWhiteholeMapAllocation(suite);
+
+  verifyWhiteholeBindingValue(suite);
 
   String pinPath = {};
   switchboardWhiteholeReplyFlowPinPath(pinPath, 17);

@@ -137,13 +137,12 @@ static inline bool switchboardBuildWhiteholeBindingValue(uint32_t containerID, c
     return false;
   }
 
-  const uint8_t *raw = reinterpret_cast<const uint8_t *>(&containerID);
   binding.container.hasID = true;
   binding.container.value[0] = subnet.dpfx;
-  binding.container.value[1] = raw[0];
-  binding.container.value[2] = raw[1];
-  binding.container.value[3] = raw[2];
-  binding.container.value[4] = raw[3];
+  binding.container.value[1] = uint8_t((containerID >> 16) & 0xffu);
+  binding.container.value[2] = uint8_t((containerID >> 8) & 0xffu);
+  binding.container.value[3] = uint8_t(containerID & 0xffu);
+  binding.container.value[4] = uint8_t((containerID >> 24) & 0xffu);
   binding.nonce = nonce;
   return true;
 }

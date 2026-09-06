@@ -1463,9 +1463,9 @@ public:
       return 0;
     }
 
-    uint32_t containerID = uint32_t(thisNeuron->lcsubnet6.mpfx[0]);
+    uint32_t containerID = uint32_t(thisNeuron->lcsubnet6.mpfx[2]);
     containerID |= uint32_t(thisNeuron->lcsubnet6.mpfx[1]) << 8;
-    containerID |= uint32_t(thisNeuron->lcsubnet6.mpfx[2]) << 16;
+    containerID |= uint32_t(thisNeuron->lcsubnet6.mpfx[0]) << 16;
     containerID |= uint32_t(plan.fragment) << 24;
     return containerID;
   }
