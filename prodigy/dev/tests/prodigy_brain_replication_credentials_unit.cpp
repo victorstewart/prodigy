@@ -13281,6 +13281,20 @@ static void testNeuronWhiteholeBindingBookkeepingWithoutPrograms(TestSuite& suit
   valid.sourcePort = 5353;
   valid.bindingNonce = 0x12345678u;
 
+  portal_definition localKey = {};
+  switchboard_whitehole_binding localBinding = {};
+  suite.expect(switchboardBuildWhiteholeBinding(
+                   valid,
+                   neuron.generateLocalContainerIDForTest(0x04),
+                   subnet,
+                   localKey,
+                   localBinding) &&
+                   localBinding.container.value[1] == subnet.mpfx[0] &&
+                   localBinding.container.value[2] == subnet.mpfx[1] &&
+                   localBinding.container.value[3] == subnet.mpfx[2] &&
+                   localBinding.container.value[4] == 0x04,
+               "neuron_generated_whitehole_container_id_targets_its_local_machine");
+
   Whitehole invalid = valid;
   invalid.sourcePort = 0;
 

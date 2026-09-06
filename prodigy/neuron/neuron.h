@@ -2253,9 +2253,9 @@ protected:
 
   uint32_t generateLocalContainerID(uint8_t fragment) const
   {
-    uint32_t containerID = uint32_t(lcsubnet6.mpfx[2]);
+    uint32_t containerID = uint32_t(lcsubnet6.mpfx[0]);
     containerID |= uint32_t(lcsubnet6.mpfx[1]) << 8;
-    containerID |= uint32_t(lcsubnet6.mpfx[0]) << 16;
+    containerID |= uint32_t(lcsubnet6.mpfx[2]) << 16;
     containerID |= uint32_t(fragment) << 24;
     return containerID;
   }
