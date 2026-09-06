@@ -15,11 +15,32 @@ usage()
 {
    echo "usage: $0 /path/to/prodigy [Mothership test-cluster options]" >&2
    echo "       $0 --hold-apple-route" >&2
+   echo "       $0 --evaluation-session /path/to/bundle" >&2
+   echo "       $0 --evaluation-command /path/to/bundle status|update" >&2
+   echo "       $0 --check-boundary (inside the Linux guest)" >&2
    exit 2
 }
 
 launcher_mode=test-cluster
-if [[ "${1:-}" == --hold-apple-route ]]
+evaluation_bundle=
+evaluation_action=start
+if [[ "${1:-}" == --check-boundary ]]; then
+   [[ $# -eq 1 && "$(uname -s)" == Linux ]] || fail "--check-boundary requires the approved Linux guest"
+   launcher_mode=check-boundary
+elif [[ "${1:-}" == --evaluation-session || "${1:-}" == --evaluation-command ]]
+then
+   launcher_mode="${1#--}"
+   evaluation_bundle="${2:-}"
+   [[ -d "${evaluation_bundle}" ]] || usage
+   evaluation_bundle="$(cd "${evaluation_bundle}" && pwd -P)"
+   shift 2
+   if [[ "${launcher_mode}" == evaluation-command ]]; then
+      evaluation_action="${1:-}"
+      [[ "${evaluation_action}" == status || "${evaluation_action}" == update ]] || usage
+      shift
+   fi
+   [[ $# -eq 0 ]] || usage
+elif [[ "${1:-}" == --hold-apple-route ]]
 then
    launcher_mode=apple-route-owner
    shift
@@ -40,18 +61,62 @@ case "$(uname -s)" in
       instance="${PRODIGY_APPLE_CONTAINER_INSTANCE:-${HOME}/Library/Application Support/apple-linux-dev/instances/nametag-prodigy.json}"
       [[ -x "${launcher}" ]] || fail "Apple Linux Dev launcher is unavailable: ${launcher}"
       [[ -f "${instance}" ]] || fail "Apple Linux Dev instance is unavailable: ${instance}"
-      "${launcher}" ensure "${instance}"
-      container_name="$(jq -er .name "${instance}")"
-
-      inspection="$(container inspect "${container_name}")"
-      [[ "$(jq -r '.[0].configuration.platform.os' <<< "${inspection}")" == linux ]] || fail "selected Apple Container is not Linux"
-      jq -e '.[0].configuration.capAdd | index("ALL") != null' <<< "${inspection}" >/dev/null ||
-         fail "selected Apple Container lacks the capabilities required by the virtual-datacenter provider"
       [[ "$(jq -er '.labels["dev.prodigy.bpf-authorized"]' "${instance}")" == guest-only &&
          "$(jq -er '.environment.PRODIGY_DEV_ALLOW_BPF_ATTACH' "${instance}")" == 1 &&
          "$(jq -er '.environment.PRODIGY_BPF_AUTHORIZATION' "${instance}")" == guest-only ]] ||
          fail "selected Apple Container instance does not carry standing guest-only BPF authorization"
 
+      container_name="$(jq -er .name "${instance}")"
+      evaluation_host_lock=
+      if [[ "${launcher_mode}" == evaluation-session ]]; then
+         evaluation_host_lock="${TMPDIR:-/tmp}/prodigy-evaluation-${UID}-${container_name}.lock"
+         mkdir "${evaluation_host_lock}" 2>/dev/null || fail "another evaluation owns ${container_name}; stop its foreground terminal first (lock: ${evaluation_host_lock})"
+         printf '%s\n' "$$" > "${evaluation_host_lock}/pid"
+         trap 'rm -f "${evaluation_host_lock}/pid"; rmdir "${evaluation_host_lock}"' EXIT
+      fi
+      if [[ "${launcher_mode}" == evaluation-command ]]; then
+         "${launcher}" verify "${instance}"
+      else
+         "${launcher}" ensure "${instance}"
+      fi
+      container_name="$(jq -er .name "${instance}")"
+
+      apple_route_owned=0
+      guest_evaluation_bundle=
+      cleanup_apple_container()
+      {
+         status=$?
+         trap - EXIT HUP INT TERM
+         if [[ "${launcher_mode}" == evaluation-session && -n "${guest_evaluation_bundle}" ]]; then
+            container exec --user 0 "${container_name}" python3 \
+               "${guest_evaluation_bundle}/tools/evaluation/session.py" "${guest_evaluation_bundle}" stop || status=1
+         fi
+         if [[ "${apple_route_owned}" == 1 ]] &&
+            ! /usr/bin/sudo /sbin/route -n delete -net "${apple_route_prefix}" "${apple_guest_ipv4}" >/dev/null
+         then
+            [[ "${status}" -ne 0 ]] || status=1
+         fi
+         if ! "${launcher}" stop "${instance}"
+         then
+            [[ "${status}" -ne 0 ]] || status=1
+         fi
+         if [[ -n "${evaluation_host_lock}" ]]; then
+            rm -f "${evaluation_host_lock}/pid"
+            rmdir "${evaluation_host_lock}" || status=1
+         fi
+         exit "${status}"
+      }
+      if [[ "${launcher_mode}" != evaluation-command ]]; then
+         trap cleanup_apple_container EXIT
+         trap 'exit 129' HUP
+         trap 'exit 130' INT
+         trap 'exit 143' TERM
+      fi
+
+      inspection="$(container inspect "${container_name}")"
+      [[ "$(jq -r '.[0].configuration.platform.os' <<< "${inspection}")" == linux ]] || fail "selected Apple Container is not Linux"
+      jq -e '.[0].configuration.capAdd | index("ALL") != null' <<< "${inspection}" >/dev/null ||
+         fail "selected Apple Container lacks the capabilities required by the virtual-datacenter provider"
       apple_guest_ipv4="$(jq -er '
          [.[0].status.networks[] | select(.network == "default") | .ipv4Address | split("/")[0]]
          | unique
@@ -98,6 +163,14 @@ case "$(uname -s)" in
          ' <<< "${inspection}"
       }
 
+      if [[ "${launcher_mode}" == evaluation-* ]]; then
+         guest_evaluation_bundle="$(translate_path "${evaluation_bundle}")" || fail "evaluation bundle is not mounted in ${container_name}"
+         if [[ "${launcher_mode}" == evaluation-command ]]; then
+            exec container exec --user 0 "${container_name}" python3 \
+               "${guest_evaluation_bundle}/tools/evaluation/session.py" "${guest_evaluation_bundle}" "${evaluation_action}"
+         fi
+      fi
+
       route_metric_mtu()
       {
          awk '$1 == "recvpipe" {
@@ -110,6 +183,15 @@ case "$(uname -s)" in
       }
 
       command=()
+      if [[ "${launcher_mode}" == evaluation-session ]]; then
+         command=(container exec --user 0
+            --env "PRODIGY_DEV_TEST_BOUNDARY=apple-container"
+            --env "PRODIGY_DEV_APPLE_CONTAINER_ID=${container_name}"
+            --env "PRODIGY_DEV_ALLOW_BPF_ATTACH=1"
+            --env "PRODIGY_BPF_AUTHORIZATION=guest-only"
+            "${container_name}" bash "${guest_evaluation_bundle}/prodigy/dev/tests/prodigy_dev_test_cluster.sh"
+            --evaluation-session "${guest_evaluation_bundle}")
+      fi
       if [[ "${launcher_mode}" == test-cluster ]]
       then
          guest_repo="$(translate_path "${repo_root}")" || fail "Prodigy repository is not mounted in ${container_name}"
@@ -154,26 +236,6 @@ case "$(uname -s)" in
          )
          [[ "${#translated[@]}" -eq 0 ]] || command+=("${translated[@]}")
       fi
-      cleanup_apple_container()
-      {
-         status=$?
-         trap - EXIT HUP INT TERM
-         if [[ "${apple_route_owned}" == 1 ]] &&
-            ! /usr/bin/sudo /sbin/route -n delete -net "${apple_route_prefix}" "${apple_guest_ipv4}" >/dev/null
-         then
-            [[ "${status}" -ne 0 ]] || status=1
-         fi
-         if ! "${launcher}" stop "${instance}"
-         then
-            [[ "${status}" -ne 0 ]] || status=1
-         fi
-         exit "${status}"
-      }
-      trap cleanup_apple_container EXIT
-      trap 'exit 129' HUP
-      trap 'exit 130' INT
-      trap 'exit 143' TERM
-
       # Darwin alone owns the temporary route into the Apple guest; Linux and production paths never touch the macOS route table.
       verify_no_more_specific_apple_routes
       route_state="$(/sbin/route -n get "${apple_route_probe}" 2>/dev/null || true)"
@@ -214,7 +276,7 @@ case "$(uname -s)" in
       "${command[@]}"
       ;;
    Linux)
-      [[ "${launcher_mode}" == test-cluster ]] || fail "--hold-apple-route requires macOS"
+      [[ "${launcher_mode}" != apple-route-owner ]] || fail "--hold-apple-route requires macOS"
       boundary="${PRODIGY_DEV_TEST_BOUNDARY:-}"
       if [[ "${boundary}" == apple-container ]]
       then
@@ -233,6 +295,13 @@ case "$(uname -s)" in
 
       kernel_major="$(uname -r | sed 's/[^0-9].*//')"
       [[ "${kernel_major}" =~ ^[0-9]+$ && "${kernel_major}" -ge 7 ]] || fail "Prodigy test clusters require Linux 7.0 or newer"
+      if [[ "${launcher_mode}" == check-boundary ]]; then
+         [[ "${EUID}" -eq 0 ]] || fail "building app artifacts requires root inside the approved Linux guest"
+         exit 0
+      fi
+      if [[ "${launcher_mode}" == evaluation-* ]]; then
+         exec python3 "${evaluation_bundle}/tools/evaluation/session.py" "${evaluation_bundle}" "${evaluation_action}"
+      fi
       exec "${harness}" "$@"
       ;;
    *)

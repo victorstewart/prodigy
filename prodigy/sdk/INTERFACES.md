@@ -205,7 +205,7 @@ Startup state rules:
 
 Current scope note:
 
-- startup payloads with `wormholes` or `whiteholes` use the packed startup blob
+- Startup payloads with `wormholes`, `whiteholes`, or full stateful topology currently use the runtime’s full serializer, rather than the public SDK’s compact startup format. See the [writer compatibility boundary](WIRE.md#containerparameters).
 
 Compatibility note:
 

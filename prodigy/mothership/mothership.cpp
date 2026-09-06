@@ -9453,7 +9453,22 @@ private:
 
     if (argc < 3)
     {
-      basics_log("too few arguments provided to deploy. ex: deploy [target: local|clusterName|clusterUUID] [deployment plan json] [path to container blob]\n");
+      basics_log("too few arguments provided to deploy. ex: deploy [target: local|clusterName|clusterUUID] [json|-|@path] [path to container blob]\n");
+      exit(EXIT_FAILURE);
+    }
+
+    String json;
+    if (resolveJSONArgument("deploy", argv[1], json) == false)
+    {
+      exit(EXIT_FAILURE);
+    }
+    json.need(simdjson::SIMDJSON_PADDING);
+
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    if (parser.parse(json.data(), json.size()).get(doc))
+    {
+      basics_log("invalid deployment plan json\n");
       exit(EXIT_FAILURE);
     }
 
@@ -9482,18 +9497,6 @@ private:
     }
 
     DeploymentPlan plan {};
-
-    String json;
-    json.append(argv[1]);
-    json.need(simdjson::SIMDJSON_PADDING);
-
-    simdjson::dom::parser parser;
-    simdjson::dom::element doc;
-    if (parser.parse(json.data(), json.size()).get(doc))
-    {
-      basics_log("invalid deployment plan json\n");
-      exit(EXIT_FAILURE);
-    }
 
     bool sawSubnet = false;
     debugLog("json_parsed");
@@ -13392,6 +13395,7 @@ private:
 
   static bool resolveJSONArgument(const char *operation, const char *arg, String& json)
   {
+    static constexpr uint64_t maxJSONArgumentBytes = 4 * 1024 * 1024;
     json.clear();
     if (arg == nullptr)
     {
@@ -13407,6 +13411,11 @@ private:
         ssize_t n = ::read(STDIN_FILENO, buffer, sizeof(buffer));
         if (n > 0)
         {
+          if (json.size() > maxJSONArgumentBytes - uint64_t(n))
+          {
+            basics_log("%s json input exceeds %llu bytes\n", operation, (unsigned long long)maxJSONArgumentBytes);
+            return false;
+          }
           json.append(buffer, uint64_t(n));
           continue;
         }
@@ -13430,16 +13439,26 @@ private:
         basics_log("%s @path is empty\n", operation);
         return false;
       }
-      Filesystem::openReadAtClose(-1, String(arg + 1), json);
+      Filesystem::openReadAtClose(-1, String(arg + 1), json, maxJSONArgumentBytes + 1);
       if (json.size() == 0)
       {
         basics_log("%s failed to read json file\n", operation);
+        return false;
+      }
+      if (json.size() > maxJSONArgumentBytes)
+      {
+        basics_log("%s json input exceeds %llu bytes\n", operation, (unsigned long long)maxJSONArgumentBytes);
         return false;
       }
       return true;
     }
 
     json.append(arg);
+    if (json.size() > maxJSONArgumentBytes)
+    {
+      basics_log("%s json input exceeds %llu bytes\n", operation, (unsigned long long)maxJSONArgumentBytes);
+      return false;
+    }
     return true;
   }
 
@@ -15839,19 +15858,15 @@ private:
   {
     if (argc < 2)
     {
-      basics_log("too few arguments. ex: reserveApplicationID [target: local|clusterName|clusterUUID] [json]\n");
+      basics_log("too few arguments. ex: reserveApplicationID [target: local|clusterName|clusterUUID] [json|-|@path]\n");
       exit(EXIT_FAILURE);
     }
 
-    if (!configureControlTarget(argv[0]))
+    String json;
+    if (resolveJSONArgument("reserveApplicationID", argv[1], json) == false)
     {
       exit(EXIT_FAILURE);
     }
-
-    ApplicationIDReserveRequest request;
-
-    String json;
-    json.append(argv[1]);
     json.need(simdjson::SIMDJSON_PADDING);
 
     simdjson::dom::parser parser;
@@ -15861,6 +15876,13 @@ private:
       basics_log("invalid json for reserveApplicationID\n");
       exit(EXIT_FAILURE);
     }
+
+    if (!configureControlTarget(argv[0]))
+    {
+      exit(EXIT_FAILURE);
+    }
+
+    ApplicationIDReserveRequest request;
 
     for (auto field : doc.get_object())
     {
@@ -15936,7 +15958,22 @@ private:
   {
     if (argc < 2)
     {
-      basics_log("too few arguments. ex: reserveServiceID [target: dev|prod|local|clusterName|clusterUUID] [json]\n");
+      basics_log("too few arguments. ex: reserveServiceID [target: dev|prod|local|clusterName|clusterUUID] [json|-|@path]\n");
+      exit(EXIT_FAILURE);
+    }
+
+    String json;
+    if (resolveJSONArgument("reserveServiceID", argv[1], json) == false)
+    {
+      exit(EXIT_FAILURE);
+    }
+    json.need(simdjson::SIMDJSON_PADDING);
+
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    if (parser.parse(json.data(), json.size()).get(doc))
+    {
+      basics_log("invalid json for reserveServiceID\n");
       exit(EXIT_FAILURE);
     }
 
@@ -15947,18 +15984,6 @@ private:
 
     ApplicationServiceReserveRequest request = {};
     request.createIfMissing = true;
-
-    String json;
-    json.append(argv[1]);
-    json.need(simdjson::SIMDJSON_PADDING);
-
-    simdjson::dom::parser parser;
-    simdjson::dom::element doc;
-    if (parser.parse(json.data(), json.size()).get(doc))
-    {
-      basics_log("invalid json for reserveServiceID\n");
-      exit(EXIT_FAILURE);
-    }
 
     for (auto field : doc.get_object())
     {
@@ -17797,7 +17822,7 @@ int main(int argc, char *argv[])
     message.append("\tfor stored cluster targets, it also refreshes the cached authoritative topology and refresh metadata in the local cluster registry\n");
     message.append("containerLogs [target: local|clusterName|clusterUUID] [application name] [maximum bytes]\n");
     message.append("\tfetches bounded current stdout/stderr and 24-hour retained failure logs through the master Brain and Neurons\n");
-    message.append("deploy [target: local|clusterName|clusterUUID] [deployment plan json] [path to container blob]\n");
+    message.append("deploy [target: local|clusterName|clusterUUID] [json|-|@path] [path to container blob]\n");
     message.append("\tdeploys an application on the cluster\n");
     message.append("applicationReport [target: local|clusterName|clusterUUID] [application name]\n");
     message.append("\tfetches the state of each deployment of the application\n");
@@ -17806,9 +17831,9 @@ int main(int argc, char *argv[])
     message.append("\tfetches a retained task execution report\n");
     message.append("updateProdigy [target: local|clusterName|clusterUUID] [path to prodigy binary or bundle]\n");
     message.append("\tpushes the exact prodigy bundle this mothership build was compiled to approve, and rejects any other bundle before dispatch\n");
-    message.append("reserveApplicationID [target: local|clusterName|clusterUUID] [json]\n");
+    message.append("reserveApplicationID [target: local|clusterName|clusterUUID] [json|-|@path]\n");
     message.append("\treserves and returns an applicationID for an application name\n");
-    message.append("reserveServiceID [target: dev|prod|local|clusterName|clusterUUID] [json]\n");
+    message.append("reserveServiceID [target: dev|prod|local|clusterName|clusterUUID] [json|-|@path]\n");
     message.append("\treserves and returns a serviceID for a reserved application service name\n");
     message.append("registerRoutableSubnet [target: local|clusterName|clusterUUID] [json]\n");
     message.append("\tregisters or updates a routable prefix; BGP json.prefix may be CIDR or bare IP; elastic requires json.family and json.elasticIntent any|create|anyOrCreate; json.usage must be wormholes, whiteholes, or both; singleMachine may omit machineUUID only in a one-machine cluster\n");

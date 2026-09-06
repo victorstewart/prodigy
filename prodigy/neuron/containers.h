@@ -10888,6 +10888,11 @@ public:
           report.append(": "_ctv);
           report.append(*detail);
         }
+        // A failure before pivot_root may also prevent writing crashreport.txt.
+        // Preserve the stage through the already-open workload stderr log.
+        const int failureLogFD = containerOutputLogFDs[1] >= 0 ? containerOutputLogFDs[1] : STDERR_FILENO;
+        (void)write(failureLogFD, report.data(), report.size());
+        (void)write(failureLogFD, "\n", 1);
         if (insideContainerRoot)
         {
           Filesystem::openWriteAtClose(-1, "/crashreport.txt"_ctv, report);

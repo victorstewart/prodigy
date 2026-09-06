@@ -1,82 +1,61 @@
-# Discombobulator
+# Build container artifacts with Discombobulator
 
-Discombobulator implements Prodigy's container runtime and app-container artifact contract.
+Discombobulator is Prodigy's container builder and artifact-contract implementation. A deployment accepts a Discombobulator-built app-container blob, not an arbitrary rootfs, launch metadata file, Btrfs payload, or compressed archive.
 
-Prodigy does not treat arbitrary launch metadata, Btrfs receive payloads, rootfs trees, or compressed blobs as valid deployment inputs. Application containers must be built by Discombobulator for the supported versioned app-container contract.
+## Build the tool
 
-## Source
-
-```text
-prodigy/discombobulator/
-```
-
-Repository path:
-
-```text
-https://github.com/victorstewart/prodigy/tree/main/prodigy/discombobulator
-```
-
-## Build
+From the repository root:
 
 ```bash
 cargo build --release --manifest-path prodigy/discombobulator/Cargo.toml
 ```
 
-The normal Prodigy build should also build Discombobulator automatically.
+The source is under [`prodigy/discombobulator/`](../discombobulator/) and on [GitHub](https://github.com/victorstewart/prodigy/tree/main/prodigy/discombobulator). The normal Prodigy build is intended to build the tool too; see [Build Prodigy](build.md) for the current status of that entrypoint.
 
-## Artifact rule
+## Build an application artifact
 
-A valid app-container blob must start with the supported versioned Discombobulator contract header before the zstd payload.
+Set the build description, named context, and output to real paths. The CLI owns this shape:
 
-Runtime-facing paths should fail closed when an app artifact cannot prove it was produced by Discombobulator for the supported contract. `mothership` should reject deployment blobs whose header, digest, or size is unsupported or mismatched. Prodigy/Neuron should verify and skip the header before zstd/Btrfs receive.
+```bash
+BUILD_FILE="$PWD/Prodigyfile"
+APP_CONTEXT="$PWD/app"
+ARTIFACT="$PWD/out/my-app.container.zst"
+discombobulator build \
+  --file "$BUILD_FILE" \
+  --context "app=$APP_CONTEXT" \
+  --output "$ARTIFACT" \
+  --kind app
+```
 
-Tests may construct malformed artifacts to prove rejection behavior. Successful runtime and deployment tests should use Discombobulator-built artifacts.
+`--file` and `--context` must point to a real Discombobulator build description and build context. This page deliberately does not invent one: use a checked-in workload example or your project's build description. The resulting blob is the input to `mothership deploy` together with a deployment plan. The artifact contract fails closed when its header, digest, or size is unsupported or mismatched.
 
-## Flat runtime bundles
+## Deployment handoff
 
-`bundle flat` can carry already-built Discombobulator container blobs alongside the main runtime binary:
+The application plan and artifact are separate inputs. `mothership deploy` accepts inline JSON, standard input, or `@path`, so a plan file can be passed directly:
+
+```bash
+CLUSTER_NAME=example-test
+PLAN_FILE="$PWD/plan.json"
+mothership deploy "$CLUSTER_NAME" "@$PLAN_FILE" "$ARTIFACT"
+```
+
+`createCluster` uses the same JSON-input convention.
+
+## Bundle a runtime
+
+`bundle flat` packages an already-built Prodigy binary, its build directory, optional eBPF/tool binaries, and already-built container artifacts:
 
 ```bash
 discombobulator bundle flat \
   --binary ./prodigy \
   --build-dir ./build \
-  --container-artifact ./artifacts/dns-resolver.container.zst \
-  --container-artifact ./artifacts/another.container.zst \
-  --container-plan ./plans/dns-resolver.deployment.plan.v1.json \
+  --container-artifact ./artifacts/example.container.zst \
+  --container-plan ./plans/example.deployment.plan.json \
   --output ./prodigy.bundle.tar.zst
 ```
 
-Each `--container-artifact` is resolved to an explicitly named regular file with a supported Discombobulator container contract header, so ordinary `./` and `../` source paths work. Every artifact must have a normal nonempty basename, and destination basenames must be unique. Accepted blobs are confined to `containers/<basename>`, copied byte-for-byte, and normalized to mode `0644`; they are data artifacts, so the bundler neither marks them executable nor scans them for runtime libraries.
+Every included artifact must already have the supported Discombobulator header. Plans must be JSON objects no larger than 1 MiB. The bundle copies artifacts to `containers/` and plans to `containers/plans/`; it does not deploy them. Flat bundles currently require Linux.
 
-Each `--container-plan` must be a regular `.json` file no larger than 1 MiB whose root is an object. Validated plans are copied byte-for-byte to `containers/plans/<basename>` with mode `0644`.
+## Tooling network boundary
 
-Relative to the installed Prodigy root, the bundle exposes the built-in DNS resolver at:
-
-- `containers/prodigy-dns-resolver.<arch>.container.zst`
-- `containers/plans/prodigy-dns-resolver.deployment.plan.v1.json`
-
-The bundle packages these files but does not deploy them automatically. An operator deploys the service through the normal Mothership path:
-
-```bash
-mothership deploy "$TARGET" "$(cat containers/plans/prodigy-dns-resolver.deployment.plan.v1.json)" "containers/prodigy-dns-resolver.${ARCH}.container.zst"
-```
-
-## Host HTTP boundary
-
-Discombobulator runs on an operator/build host before a target cluster and its DNS service need
-exist. Its OCI registry client is therefore an explicit blocking tooling exception, not a network
-stack available to deployed applications or containers. Registry HTTPS uses WebPKI verification,
-a 10-second connect deadline, a 15-minute whole-request deadline, at most five redirects with no
-HTTPS downgrade, and bounded manifest, config, layer, token, and error bodies. Plain HTTP is
-accepted only for a loopback registry used by local tests. Downloaded OCI manifests and blobs are
-verified against their declared SHA-256 digests before use, and diagnostics never print registry
-credentials, bearer tokens, or response bodies.
-
-The non-Linux portable builder may download the rustup installer only when its cached Cargo binary
-is absent. That HTTPS-only download has explicit connect/overall deadlines, three redirects, and a
-2-MiB cap; it is written to a temporary file and size-checked before execution. Neither tooling
-exception changes Prodigy application DNS, service-mesh, or container networking policy.
-
-## Relationship to Prodigy
-
-Discombobulator is the container-runtime side of the architecture. The rest of Prodigy remains responsible for machine lifecycle, cluster formation, runtime state, provider control, placement, routing, health, credentials, and application deployment flow.
+Discombobulator runs on the operator/build host. Its OCI client is a bounded tooling exception: HTTPS with WebPKI verification, timeouts, redirect limits, size bounds, and SHA-256 verification of declared OCI content. Plain HTTP is only accepted for a loopback test registry. This does not grant deployed containers a separate DNS or network policy.

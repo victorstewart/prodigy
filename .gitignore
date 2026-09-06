@@ -1,7 +1,11 @@
 /.depos/
 /.depos.cmake
 /.discombobulator/
-/.github/
+/.github/*
+!/.github/workflows/
+/.github/workflows/*
+!/.github/workflows/docs.yml
+!/.github/repository-description.txt
 /.run/
 /.experiments/
 /.tasks/

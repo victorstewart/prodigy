@@ -13,7 +13,6 @@
       "storageMB": 64,
       "memoryMB": 128,
       "nLogicalCores": 1,
-      "nThreads": 1,
       "msTilHealthy": 10000,
       "sTilHealthcheck": 15,
       "sTilKillable": 30

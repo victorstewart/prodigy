@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+action="${1:-start}"
+if [[ "${action}" == --help || "${action}" == -h ]]; then
+   printf '%s\n' 'Usage: ./try-prodigy [status|update]' \
+      'Start a foreground evaluation; use status/update in another terminal.' \
+      'Press Ctrl-C in the first terminal to remove the demo. The Mac launcher also stops its guest.' \
+      'Requires a verified evaluation bundle and the documented Linux guest environment.' \
+      'From a source checkout, set PRODIGY_EVALUATION_BUNDLE to an unpacked bundle.'
+   exit 0
+fi
+[[ $# -le 1 && "${action}" =~ ^(start|status|update)$ ]] || {
+   echo 'Use ./try-prodigy --help for supported commands.' >&2; exit 2;
+}
+bundle="${PRODIGY_EVALUATION_BUNDLE:-${root}}"
+[[ -f "${bundle}/evaluation.json" ]] || {
+   echo 'No evaluation bundle found. Download and extract a release candidate, then run its ./try-prodigy.' >&2
+   echo 'Contributors: tools/build-evaluation.sh, then tools/package-evaluation.sh. See prodigy/docs/start/install.md.' >&2
+   exit 1
+}
+bundle="$(cd "${bundle}" && pwd -P)"
+command -v python3 >/dev/null || { echo 'Python 3 is required; see the installation guide.' >&2; exit 1; }
+python3 "${root}/tools/evaluation/verify.py" "${bundle}"
+launcher="${root}/prodigy/dev/tests/prodigy_dev_test_cluster.sh"
+if [[ "${action}" == start ]]; then
+   exec bash "${launcher}" --evaluation-session "${bundle}"
+fi
+exec bash "${launcher}" --evaluation-command "${bundle}" "${action}"
