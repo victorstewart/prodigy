@@ -679,9 +679,8 @@ protected:
     syncContainerOverlayRoutingPrograms();
   }
 
-  void syncWhiteholeBindingsProgram(void)
+  void collectWhiteholeBindings(Vector<std::pair<portal_definition, switchboard_whitehole_binding>>& desiredBindings)
   {
-    Vector<std::pair<portal_definition, switchboard_whitehole_binding>> desiredBindings = {};
     desiredBindings.reserve(whiteholeBindingsByContainer.size());
 
     for (const auto& [containerID, bindings] : whiteholeBindingsByContainer)
@@ -692,6 +691,27 @@ protected:
         desiredBindings.emplace_back(binding.key, binding.value);
       }
     }
+  }
+
+  void syncTrackedContainerPeerWhiteholeBindings(void)
+  {
+    Vector<std::pair<portal_definition, switchboard_whitehole_binding>> desiredBindings = {};
+    collectWhiteholeBindings(desiredBindings);
+
+    for (const auto& [uuid, container] : containers)
+    {
+      (void)uuid;
+      if (container != nullptr && container->pendingDestroy == false)
+      {
+        container->syncPeerWhiteholeBindingEntries(desiredBindings);
+      }
+    }
+  }
+
+  void syncWhiteholeBindingsProgram(void)
+  {
+    Vector<std::pair<portal_definition, switchboard_whitehole_binding>> desiredBindings = {};
+    collectWhiteholeBindings(desiredBindings);
 
     prodigySyncOverlayValueMap(tcx_ingress_program,
                                "whiteholes"_ctv,
@@ -723,22 +743,14 @@ protected:
     }
 
     syncWhiteholeBindingsProgram();
-
-    if (Container *container = findTrackedContainerByLocalID(containerID))
-    {
-      container->syncPeerWhiteholeBindingsFrom(whiteholes);
-    }
+    syncTrackedContainerPeerWhiteholeBindings();
   }
 
   void closeLocalWhiteholesToContainer(uint32_t containerID)
   {
-    if (Container *container = findTrackedContainerByLocalID(containerID))
-    {
-      container->clearPeerWhiteholeBindings();
-    }
-
     whiteholeBindingsByContainer.erase(containerID);
     syncWhiteholeBindingsProgram();
+    syncTrackedContainerPeerWhiteholeBindings();
   }
 
   bool resolveOptionalHostRouterBPFPaths(String& hostIngressPath, String& hostEgressPath, String *failureReport = nullptr) const
@@ -5712,6 +5724,7 @@ public:
     containers.insert_or_assign(container->plan.uuid, container);
     containerByPid.insert_or_assign(container->pid, container);
     RingDispatcher::installMultiplexee(container, this);
+    syncTrackedContainerPeerWhiteholeBindings();
 
     if (container->exposesNeuronSocket() == false)
     {

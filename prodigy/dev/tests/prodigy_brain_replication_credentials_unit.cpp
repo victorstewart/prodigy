@@ -1420,6 +1420,13 @@ public:
     return installedIngressWhiteholeBindingKeys.entries.size();
   }
 
+  uint32_t aggregateWhiteholeBindingCountForTest(void)
+  {
+    Vector<std::pair<portal_definition, switchboard_whitehole_binding>> bindings = {};
+    collectWhiteholeBindings(bindings);
+    return bindings.size();
+  }
+
   bool resolveOptionalHostRouterBPFPathsForTest(String& hostIngressPath, String& hostEgressPath, String *failureReport = nullptr) const
   {
     return resolveOptionalHostRouterBPFPaths(hostIngressPath, hostEgressPath, failureReport);
@@ -13281,10 +13288,33 @@ static void testNeuronWhiteholeBindingBookkeepingWithoutPrograms(TestSuite& suit
   suite.expect(neuron.localWhiteholeBindingCountForContainerForTest(0x01020304u) == 1, "neuron_whitehole_bookkeeping_without_programs_keeps_only_valid_bindings");
   suite.expect(neuron.installedIngressWhiteholeBindingCountForTest() == 1, "neuron_whitehole_bookkeeping_without_programs_tracks_ingress_keys");
   suite.expect(neuron.installedWhiteholeBindingCountForTest() == 1, "neuron_whitehole_bookkeeping_without_programs_tracks_installed_keys");
+  suite.expect(neuron.aggregateWhiteholeBindingCountForTest() == 1,
+               "neuron_whitehole_bookkeeping_without_programs_exposes_owner_binding_to_all_peer_programs");
+
+  Whitehole secondValid = valid;
+  secondValid.address = IPAddress("2001:db8::45", true);
+  secondValid.sourcePort = 5354;
+  Vector<Whitehole> secondWhiteholes = {};
+  secondWhiteholes.push_back(secondValid);
+  neuron.openLocalWhiteholesForTest(0x01020305u, secondWhiteholes);
+
+  suite.expect(neuron.localWhiteholeBindingCountForContainerForTest(0x01020305u) == 1,
+               "neuron_whitehole_bookkeeping_tracks_second_container_binding");
+  suite.expect(neuron.installedIngressWhiteholeBindingCountForTest() == 2 &&
+                  neuron.installedWhiteholeBindingCountForTest() == 2 &&
+                  neuron.aggregateWhiteholeBindingCountForTest() == 2,
+               "neuron_whitehole_bookkeeping_keeps_aggregate_bindings_for_distinct_client_and_server_peer_programs");
 
   neuron.closeLocalWhiteholesToContainerForTest(0x01020304u);
 
   suite.expect(neuron.localWhiteholeBindingCountForContainerForTest(0x01020304u) == 0, "neuron_whitehole_bookkeeping_without_programs_erases_container_bindings");
+  suite.expect(neuron.installedIngressWhiteholeBindingCountForTest() == 1 &&
+                  neuron.installedWhiteholeBindingCountForTest() == 1 &&
+                  neuron.aggregateWhiteholeBindingCountForTest() == 1,
+               "neuron_whitehole_bookkeeping_close_removes_only_retired_client_from_all_peer_programs");
+
+  neuron.closeLocalWhiteholesToContainerForTest(0x01020305u);
+
   suite.expect(neuron.installedIngressWhiteholeBindingCountForTest() == 0, "neuron_whitehole_bookkeeping_without_programs_clears_ingress_keys");
   suite.expect(neuron.installedWhiteholeBindingCountForTest() == 0, "neuron_whitehole_bookkeeping_without_programs_clears_installed_keys");
 }

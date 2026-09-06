@@ -2278,6 +2278,17 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
                   updateProgramMapElement(egress, "wh_targets"_ctv, target4, htons(8443)),
               "same_worker_ipv4_public_portal_installs_client_egress_route");
   egress.setArrayElement("ct_dev_map"_ctv, selected[4], containerIfindex);
+  egress.setArrayElement("ct_dev_map"_ctv, replica2[4], replica2Ifindex);
+  portal_definition clientWhitehole4 = {};
+  clientWhitehole4.addr4 = client4.s_addr;
+  clientWhitehole4.port = htons(49'154);
+  clientWhitehole4.proto = IPPROTO_UDP;
+  switchboard_whitehole_binding clientWhiteholeBinding = {};
+  clientWhiteholeBinding.container.hasID = true;
+  std::memcpy(clientWhiteholeBinding.container.value, replica2, sizeof(replica2));
+  clientWhiteholeBinding.nonce = 1;
+  expectNamed(updateProgramMapElement(egress, "whiteholes"_ctv, clientWhitehole4, clientWhiteholeBinding),
+              "same_worker_ipv4_installs_client_whitehole_binding");
   container_network_policy localClientPolicy = policy;
   localClientPolicy.containerFragment = replica2[4];
   egress.setArrayElement("ct_net_policy"_ctv, 0, localClientPolicy);
@@ -2306,14 +2317,51 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
               "same_worker_ipv4_public_request_claims_shared_reply_owner");
   egress.setArrayElement("ct_net_policy"_ctv, 0, policy);
   std::vector<uint8_t> sameWorkerReply4 = makeIPv4L4EthernetFrame(external4, client4, IPPROTO_UDP, 8443, 49'154);
-  expectNamed(runNetkit(egress, sameWorkerReply4, 0, packetOutput) == NETKIT_PASS,
-              "same_worker_ipv4_public_reply_is_authenticated_and_passed");
+  expectNamed(runNetkit(egress, sameWorkerReply4, 0, packetOutput) == NETKIT_REDIRECT,
+              "same_worker_ipv4_public_reply_is_authenticated_and_redirected_to_client");
   if (packetOutput.size() >= sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr))
   {
     const struct iphdr *rewritten4 = reinterpret_cast<const struct iphdr *>(packetOutput.data() + sizeof(struct ethhdr));
     const struct udphdr *rewrittenUDP = reinterpret_cast<const struct udphdr *>(rewritten4 + 1);
-    expectNamed(rewritten4->saddr == external4.s_addr && rewrittenUDP->source == htons(443),
-                "same_worker_ipv4_public_reply_restores_advertised_source_tuple");
+    expectNamed(rewritten4->saddr == external4.s_addr && rewrittenUDP->source == htons(443) &&
+                    rewritten4->daddr == client4.s_addr && rewrittenUDP->dest == htons(49'154),
+                "same_worker_ipv4_public_reply_restores_advertised_source_and_client_destination");
+  }
+
+  portal_definition clientWhitehole6 = {};
+  std::memcpy(clientWhitehole6.addr6, client, sizeof(clientWhitehole6.addr6));
+  clientWhitehole6.port = htons(49'154);
+  clientWhitehole6.proto = IPPROTO_UDP;
+  portal_definition portal6 = {};
+  std::memcpy(portal6.addr6, external, sizeof(portal6.addr6));
+  portal6.port = htons(443);
+  portal6.proto = IPPROTO_UDP;
+  portal_meta meta6 = {};
+  meta6.slot = 41;
+  switchboard_wormhole_target_key target6 = {};
+  target6.slot = meta6.slot;
+  std::memcpy(target6.container, selected, sizeof(target6.container));
+  expectNamed(updateProgramMapElement(egress, "whiteholes"_ctv, clientWhitehole6, clientWhiteholeBinding) &&
+                  updateProgramMapElement(egress, "ext_portals"_ctv, portal6, meta6) &&
+                  installSingleContainerPortalRing(egress, meta6.slot, selected) &&
+                  updateProgramMapElement(egress, "wh_targets"_ctv, target6, htons(8443)),
+              "same_worker_ipv6_installs_client_whitehole_binding");
+  egress.setArrayElement("ct_net_policy"_ctv, 0, localClientPolicy);
+  std::vector<uint8_t> sameWorkerRequest6 = makeIPv6L4EthernetFrame(client, external, IPPROTO_UDP, 49'154, 443);
+  clearWormholeFlows();
+  expectNamed(runNetkit(egress, sameWorkerRequest6, 0, packetOutput) == NETKIT_REDIRECT,
+              "same_worker_ipv6_public_request_redirects_to_selected_container");
+  egress.setArrayElement("ct_net_policy"_ctv, 0, policy);
+  std::vector<uint8_t> sameWorkerReply6 = makeIPv6L4EthernetFrame(external, client, IPPROTO_UDP, 8443, 49'154);
+  expectNamed(runNetkit(egress, sameWorkerReply6, 0, packetOutput) == NETKIT_REDIRECT,
+              "same_worker_ipv6_public_reply_is_authenticated_and_redirected_to_client");
+  if (packetOutput.size() >= sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + sizeof(struct udphdr))
+  {
+    const struct ipv6hdr *rewritten6 = reinterpret_cast<const struct ipv6hdr *>(packetOutput.data() + sizeof(struct ethhdr));
+    const struct udphdr *rewrittenUDP = reinterpret_cast<const struct udphdr *>(rewritten6 + 1);
+    expectNamed(std::memcmp(rewritten6->saddr.s6_addr, external, sizeof(external)) == 0 && rewrittenUDP->source == htons(443) &&
+                    std::memcmp(rewritten6->daddr.s6_addr, client, sizeof(client)) == 0 && rewrittenUDP->dest == htons(49'154),
+                "same_worker_ipv6_public_reply_restores_advertised_source_and_client_destination");
   }
 
   std::vector<uint8_t> publicInner4 = makeIPv4L4EthernetFrame(client4, external4, IPPROTO_UDP, 49'154, 443);

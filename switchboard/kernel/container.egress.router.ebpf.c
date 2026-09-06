@@ -76,6 +76,52 @@ int ct_egress(struct __sk_buff *skb)
     l3_data = (void *)(eth + 1);
   }
 
+  // A reply is authenticated against the selected server's exact public
+  // wormhole flow before reaching this point.  Its destination is the
+  // originating whitehole tuple, whose binding is the authoritative client
+  // container owner.  Keep a local reply on the netkit path instead of
+  // handing it to host routing (which cannot return it to the client netkit).
+  if (wormholeReply == SWITCHBOARD_WORMHOLE_REPLY_PUBLIC)
+  {
+    struct switchboard_whitehole_binding clientBinding = {};
+    struct switchboard_l4_ports l4 = {};
+    __u32 zeroidx = 0;
+    struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
+    bool localClient = false;
+
+    if (protocol == BE_ETH_P_IP)
+    {
+      struct iphdr *iph = (struct iphdr *)l3_data;
+      if (switchboard_unfragmented_ipv4(iph, data_end) == false ||
+          switchboard_parse_l4_ports((void *)(iph + 1), data_end, iph->protocol,
+                                     l3Offset + sizeof(struct iphdr), &l4) == false)
+      {
+        return NETKIT_DROP;
+      }
+      localClient = whitehole_binding_lookup(iph->protocol, false, &iph->daddr, l4.dest, &clientBinding) &&
+                    clientBinding.container.hasID &&
+                    switchboardContainerIDTargetsLocalMachine(&clientBinding.container, localSubnet);
+    }
+    else if (protocol == BE_ETH_P_IPV6)
+    {
+      struct ipv6hdr *ip6h = (struct ipv6hdr *)l3_data;
+      if ((void *)(ip6h + 1) > data_end ||
+          switchboard_parse_l4_ports((void *)(ip6h + 1), data_end, ip6h->nexthdr,
+                                     l3Offset + sizeof(struct ipv6hdr), &l4) == false)
+      {
+        return NETKIT_DROP;
+      }
+      localClient = whitehole_binding_lookup(ip6h->nexthdr, true, ip6h->daddr.s6_addr, l4.dest, &clientBinding) &&
+                    clientBinding.container.hasID &&
+                    switchboardContainerIDTargetsLocalMachine(&clientBinding.container, localSubnet);
+    }
+
+    if (localClient)
+    {
+      return redirectContainerFragment(clientBinding.container.value[4], false) ? NETKIT_REDIRECT : NETKIT_DROP;
+    }
+  }
+
   if (networkMode == CONTAINER_NETWORK_DESTINATION_ALLOWLIST && wormholeReply == SWITCHBOARD_WORMHOLE_REPLY_NONE)
   {
     __u8 proto = 0;

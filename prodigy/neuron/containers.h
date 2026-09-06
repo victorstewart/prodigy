@@ -1491,6 +1491,15 @@ public:
       }
     }
 
+    syncPeerWhiteholeBindingEntries(desiredBindings);
+  }
+
+  // The Neuron owns the complete local whitehole binding set.  A container
+  // peer must receive that set as well as its own entries so a co-located
+  // server can return an authenticated reply to another container's
+  // whitehole.
+  void syncPeerWhiteholeBindingEntries(Vector<std::pair<portal_definition, switchboard_whitehole_binding>>& desiredBindings)
+  {
     prodigySyncOverlayValueMap(peer_program,
                                "whiteholes"_ctv,
                                installedPeerWhiteholeBindingKeys,
