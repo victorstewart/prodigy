@@ -29,7 +29,7 @@ The candidate currently requires a source build and a supported Linux guest; App
 
 ## Why Prodigy
 
-<p align="center"><picture><source media="(prefers-color-scheme: dark) and (max-width: 480px)" srcset="assets/readme/flow-mobile-dark.svg"><source media="(max-width: 480px)" srcset="assets/readme/flow-mobile-light.svg"><source media="(prefers-color-scheme: dark)" srcset="assets/readme/flow-dark.svg"><img src="assets/readme/flow-light.svg" alt="Your application connects through Prodigy to your machines or cloud capacity." width="680"></picture></p>
+<p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/readme/flow-mobile-dark.svg"><img src="assets/readme/flow-mobile-light.svg" alt="Your application connects through Prodigy to your machines or cloud capacity." width="340"></picture></p>
 
 <picture><source media="(prefers-color-scheme: dark)" srcset="assets/readme/machines-dark.svg"><img src="assets/readme/machines-light.svg" alt="" width="22" height="22" align="absmiddle"></picture>&nbsp; **Manage the machines and the applications.**<br>Provision capacity, place workloads, and manage their lifecycle through one system—across machines you own and infrastructure-provider adapters.
 
