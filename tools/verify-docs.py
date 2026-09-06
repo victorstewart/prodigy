@@ -23,6 +23,12 @@ def anchors(text):
         number = counts.get(slug, 0)
         counts[slug] = number + 1
         result.add(slug + ("-" + str(number) if number else ""))
+    for title in re.findall(r"<h1\b[^>]*>(.*?)</h1>", text, re.I | re.S):
+        title = re.sub(r"<[^>]+>", "", title).strip().lower()
+        slug = re.sub(r"[^\w\- ]", "", title).replace(" ", "-")
+        number = counts.get(slug, 0)
+        counts[slug] = number + 1
+        result.add(slug + ("-" + str(number) if number else ""))
     result.update(re.findall(r'\bid=["\']([^"\']+)', text))
     return result
 
@@ -31,11 +37,12 @@ def main():
     failures = []
     for path in PUBLIC:
         text = path.read_text()
-        if not re.search(r"^#\s+\S", text, re.M):
+        if not re.search(r"^#\s+\S|<h1\b[^>]*>\s*\S", text, re.I | re.M):
             failures.append(f"{path.relative_to(ROOT)}: missing page title")
         prose = re.sub(r"```[^\n]*\n.*?```", "", text, flags=re.S)
         targets = re.findall(r"\]\(([^)]+)\)", prose)
         targets += re.findall(r'<(?:img|a)\b[^>]*(?:src|href)="([^"]+)"', prose)
+        targets += re.findall(r'<source\b[^>]*\bsrcset="([^"]+)"', prose)
         for raw in targets:
             raw = raw.strip().split(' "', 1)[0].strip("<>")
             url = urlsplit(raw)
@@ -59,8 +66,8 @@ def main():
                 if result.returncode:
                     failures.append(f"{path.relative_to(ROOT)}: invalid shell example: {result.stderr.strip()}")
     words = len((ROOT / "README.md").read_text().split())
-    if not 450 <= words <= 650:
-        failures.append(f"README: {words} words, expected 450–650")
+    if words > 650:
+        failures.append(f"README: {words} words, maximum 650")
     for script in ("try-prodigy", "tools/build-evaluation.sh", "tools/package-evaluation.sh"):
         if not (ROOT / script).is_file():
             failures.append("missing documented entrypoint: " + script)

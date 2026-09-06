@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="184" viewBox="0 0 760 184"><g transform="translate(20 8)"><g fill="none" stroke="#a34400" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <g transform="translate(35 54) scale(1.7)"><rect x="3" y="3" width="26" height="26" rx="4"/><path d="m12 11-5 5 5 5m8-10 5 5-5 5m-3-12-2 14"/></g>
+          <rect x="257" y="57" width="54" height="54" rx="7"/>
+          <path d="M277 95V73h8a6 6 0 0 1 0 12h-8"/>
+          <path d="M111 84h111m-7-6 7 6-7 6M334 84h67M401 40v88M401 40h43m-7-6 7 6-7 6M401 128h43m-7-6 7 6-7 6"/>
+          <g transform="translate(465 13) scale(1.7)"><rect x="3" y="3" width="26" height="10" rx="3"/><rect x="3" y="19" width="26" height="10" rx="3"/><path d="M8 8h1m4 0h1m6 0h4M8 24h1m4 0h1m6 0h4"/></g>
+          <g transform="translate(465 101) scale(1.7)"><path d="M8 26a6 6 0 0 1-1-12 9 9 0 0 1 17-3 7.5 7.5 0 0 1 0 15Z"/></g>
+        </g>
+        <g fill="#1f2328" font-family="system-ui,-apple-system,Segoe UI,sans-serif" font-size="18">
+          <text x="62" y="144" text-anchor="middle">Your application</text>
+          <text x="284" y="144" text-anchor="middle">Prodigy</text>
+          <text x="543" y="47">Your machines</text>
+          <text x="543" y="135">Cloud capacity</text>
+        </g></g></svg>

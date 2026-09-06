@@ -18,6 +18,7 @@ while pending:
     text = re.sub(r"```[^\n]*\n.*?```", "", page.read_text(), flags=re.S)
     links = re.findall(r"\]\(([^)]+)\)", text)
     links += re.findall(r'<(?:img|a)\b[^>]*(?:src|href)="([^"]+)"', text)
+    links += re.findall(r'<source\b[^>]*\bsrcset="([^"]+)"', text)
     for link in links:
         url = urlsplit(link.strip().split(' "', 1)[0].strip("<>"))
         if url.scheme or not url.path or link.startswith("//"):

@@ -1,66 +1,52 @@
+<h1 align="center"><img src="assets/prodigy-logo.avif" alt="" width="136"><br>Prodigy</h1>
+
+<p align="center"><strong>Your applications. Your machines. One orchestrator.</strong><br>Provision machines, deploy applications, and manage their lifecycle together.</p>
+
 <p align="center">
-  <img src="assets/prodigy-logo.avif" alt="Prodigy" width="180">
+<a href="prodigy/docs/start/first-service.md"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/readme/try-dark.svg"><img src="assets/readme/try-light.svg" alt="Try Prodigy →" width="166" height="42" align="absmiddle"></picture></a>
+&nbsp; <a href="prodigy/docs/README.md">Documentation</a>&nbsp;·&nbsp;<a href="examples/hello-prodigy/">Examples</a>
 </p>
 
-# Prodigy
+<p align="center">Early-stage software for evaluation. Runtime integration required; OCI images need adaptation.</p>
 
-**Your applications. Your machines. One orchestrator.**
+<p align="center"><img src="assets/try-prodigy.gif" alt="Real evaluation: start the HTTP service, inspect it, deploy v2, and remove the cluster." width="100%"></p>
 
-Prodigy brings machine provisioning, application deployment, routing, and lifecycle management into one system.
-
-Run your first service, inspect it, and deploy an update. Then explore running your applications on machines you own or cloud infrastructure.
-
-**[Try Prodigy →](prodigy/docs/start/first-service.md)** · [Documentation](prodigy/docs/README.md) · [Example source](examples/hello-prodigy/)
-
-Early-stage, open-source software for evaluation. Every application integrates with Prodigy's runtime protocol through an SDK or a direct implementation; existing OCI images require adaptation. The example includes that integration so you can explore the system before writing application code.
+<p align="center"><strong>Run → inspect → update → remove</strong><br><a href="prodigy/docs/start/first-service-transcript.md">Watch the walkthrough · Read the transcript</a></p>
 
 ## Run your first service
 
-The evaluation bundle contains a small HTTP application, two application versions, and matching runtime tools. It runs a disposable one-machine cluster without cloud credentials or application compilation.
+The example brings a real HTTP application, two versions, and matching runtime tools. Explore a disposable one-machine cluster without a cloud account or writing application code.
 
-[Install the evaluation bundle](prodigy/docs/start/install.md), open its directory, and run:
+[Prepare the evaluation bundle](prodigy/docs/start/install.md), open its directory, and run:
 
 ```bash
 ./try-prodigy
 ```
 
-Keep that terminal open. The launcher creates the cluster, deploys the example, waits for a real HTTP response, and prints the service URL. In another terminal in the same directory:
+Keep it running. In another terminal, use `./try-prodigy status` to inspect the service and `./try-prodigy update` to change its response from **v1** to **v2**. Press **Ctrl-C in the first terminal** to remove the cluster; on macOS, the launcher also stops its guest.
 
-```bash
-./try-prodigy status
-./try-prodigy update
-```
-
-The application changes its response from `hello from Prodigy v1` to `hello from Prodigy v2`. Press **Ctrl-C in the first terminal** to remove the demo. On macOS, the launcher also stops its guest. The [complete tutorial](prodigy/docs/start/first-service.md) explains each step and the underlying Mothership commands.
-
-**Requirements:** a prepared Linux environment with kernel 7.0 or newer; Apple Silicon Macs use the approved Apple Containers environment. Python 3 and the platform prerequisites are listed in the installation guide. These are evaluation candidates; [current status](prodigy/docs/start/status.md) records what has been verified and whether a downloadable release is available.
-
-<img src="assets/try-prodigy.gif" alt="Recorded evaluation: start, inspect, update, request, and remove the HTTP service" width="720">
-
-[Text transcript and recording details](prodigy/docs/start/first-service-transcript.md).
+The candidate currently requires a source build and a supported Linux guest; Apple Silicon uses Apple Containers. [Requirements and availability](prodigy/docs/start/install.md) · [Complete tutorial](prodigy/docs/start/first-service.md).
 
 ## Why Prodigy
 
-**Manage machines alongside applications.** Machine provisioning, bootstrap, application placement, and capacity lifecycle share a control model. You can describe machines you own or capacity obtained through infrastructure-provider adapters.
+<p align="center"><picture><source media="(prefers-color-scheme: dark) and (max-width: 480px)" srcset="assets/readme/flow-mobile-dark.svg"><source media="(max-width: 480px)" srcset="assets/readme/flow-mobile-light.svg"><source media="(prefers-color-scheme: dark)" srcset="assets/readme/flow-dark.svg"><img src="assets/readme/flow-light.svg" alt="Your application connects through Prodigy to your machines or cloud capacity." width="680"></picture></p>
 
-**Give workloads useful runtime information.** The application protocol delivers startup configuration, topology, resource changes, credentials, and lifecycle events. Applications report readiness after they can serve requests. SDKs provide implementations in C, C++, Rust, Go, Python, and TypeScript.
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/readme/machines-dark.svg"><img src="assets/readme/machines-light.svg" alt="" width="22" height="22" align="absmiddle"></picture>&nbsp; **Manage the machines and the applications.**<br>Provision capacity, place workloads, and manage their lifecycle through one system—across machines you own and infrastructure-provider adapters.
 
-**Coordinate placement, networking, and lifecycle.** Prodigy connects the decisions about where an application runs with how traffic reaches it and how its instances start, change, and stop. The [architecture guide](prodigy/docs/understand/architecture.md) explains the components when you need that detail.
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/readme/runtime-dark.svg"><img src="assets/readme/runtime-light.svg" alt="" width="22" height="22" align="absmiddle"></picture>&nbsp; **Give applications the context they need.**<br>Deliver configuration, topology, credentials, and resource changes directly to workloads. The included example already implements the required runtime integration.
 
-This integration requires application participation. The [Kubernetes and Nomad comparison](prodigy/docs/understand/comparison.md) explains that tradeoff alongside ecosystem maturity and workload compatibility.
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/readme/lifecycle-dark.svg"><img src="assets/readme/lifecycle-light.svg" alt="" width="22" height="22" align="absmiddle"></picture>&nbsp; **Keep deployment and traffic in step.**<br>Coordinate where instances run, how requests reach them, and when they start, update, and stop.
 
-## Take the next step
+[How Prodigy works](prodigy/docs/understand/architecture.md) · [Compare with Kubernetes and Nomad](prodigy/docs/understand/comparison.md)
 
-| You want to… | Go here |
-|---|---|
-| Bring your own application | [Build your first application](prodigy/docs/build-applications/first-application.md) |
-| Use machines you already own | [Private infrastructure](prodigy/docs/run-clusters/private-machines.md) |
-| Have Prodigy provision cloud capacity | [Cloud deployment](prodigy/docs/run-clusters/cloud.md) |
+## Make it yours
 
-The example's source, artifact recipe, and deployment plans are included so you can trace a running service back to its inputs. Operational guides cover inspection, updates, credentials, networking, and removal; detailed schemas and protocol contracts stay in reference documentation.
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/readme/application-dark.svg"><img src="assets/readme/application-light.svg" alt="" width="22" height="22" align="absmiddle"></picture>&nbsp; **[Build an application →](prodigy/docs/build-applications/first-application.md)**<br>Start with the example source, then integrate your own workload.
 
-## Project and documentation
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/readme/machines-dark.svg"><img src="assets/readme/machines-light.svg" alt="" width="22" height="22" align="absmiddle"></picture>&nbsp; **[Use your machines →](prodigy/docs/run-clusters/private-machines.md)**<br>Bring hardware you operate into the cluster.
 
-Start with the [documentation index](prodigy/docs/README.md) or [current capabilities and limits](prodigy/docs/start/status.md). For source builds and contributions, read [Contributing](CONTRIBUTING.md). Questions and bug reports go through [Support](SUPPORT.md); vulnerability reports follow [Security](SECURITY.md).
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/readme/cloud-dark.svg"><img src="assets/readme/cloud-light.svg" alt="" width="22" height="22" align="absmiddle"></picture>&nbsp; **[Create cloud capacity →](prodigy/docs/run-clusters/cloud.md)**<br>Provision machines through Prodigy's infrastructure-provider adapters.
 
-Prodigy is licensed under [Apache-2.0](LICENSE).
+---
+
+[Current status](prodigy/docs/start/status.md) · [Contributing](CONTRIBUTING.md) · [Support](SUPPORT.md) · [Security](SECURITY.md) · [Apache-2.0](LICENSE)
