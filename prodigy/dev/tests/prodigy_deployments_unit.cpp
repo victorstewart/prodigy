@@ -2394,10 +2394,18 @@ int main(void)
           1ULL * 1024ULL * 1024ULL,
           &failure);
       suite.expect(valid == false, "artifact_resource_limits_reject_total_artifact_bytes_above_global_limit");
+      // Traversal may visit launch metadata before the large file. Validate
+      // the reported total without assuming a filesystem directory order.
+      unsigned long long reportedBytes = 0;
+      unsigned long long reportedLimit = 0;
+      const uint64_t metadataBytes = std::filesystem::file_size(
+          artifactRootPath / ".prodigy-private" / "launch.metadata");
       suite.expect(
-          stringContains(
-              failure,
-              "artifact regular-file bytes exceed maximum: 2097152 > 1048576"),
+          std::sscanf(failure.c_str(), "artifact regular-file bytes exceed maximum: %llu > %llu",
+                      &reportedBytes, &reportedLimit) == 2 &&
+              (reportedBytes == 2ULL * 1024ULL * 1024ULL ||
+               reportedBytes == 2ULL * 1024ULL * 1024ULL + metadataBytes) &&
+              reportedLimit == 1ULL * 1024ULL * 1024ULL,
           "artifact_resource_limits_report_total_artifact_bytes_above_global_limit");
     }
   }

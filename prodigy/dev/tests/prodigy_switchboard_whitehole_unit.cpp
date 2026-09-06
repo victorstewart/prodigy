@@ -2364,6 +2364,9 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
                 "same_worker_ipv6_public_reply_restores_advertised_source_and_client_destination");
   }
 
+  // The following cases exercise a remote client. Do not retain the local
+  // client bindings from the preceding same-worker hairpin fixtures.
+  clearProgramMap<portal_definition>(egress, "whiteholes"_ctv);
   std::vector<uint8_t> publicInner4 = makeIPv4L4EthernetFrame(client4, external4, IPPROTO_UDP, 49'154, 443);
   std::vector<uint8_t> publicOverlay4 = makeWormholeIPv6OverlayFrame(publicInner4, selected);
   std::vector<uint8_t> publicOverlay4Replica2 = makeWormholeIPv6OverlayFrame(publicInner4, replica2);
