@@ -1726,6 +1726,10 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    )
    set_tests_properties(prodigy_test_cluster_darwin_route_unit PROPERTIES TIMEOUT 15)
    add_test(
+      NAME prodigy_virtual_datacenter_bounded_log_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_virtual_datacenter_bounded_log_unit.sh ${PRODIGY_ROOT}/prodigy/mothership/mothership.virtual.datacenter.provider.sh
+   )
+   add_test(
       NAME prodigy_dependency_materialization_contract
       COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_dependency_materialization_contract.cmake
    )

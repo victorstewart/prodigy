@@ -82,6 +82,78 @@ run_machine()
    ' _ /root/prodigy/prodigy --isolated --netdev=bond0 "--boot-json=${boot_json}"
 }
 
+bounded_machine_log()
+{
+   [[ "$#" -eq 4 ]]
+   local log_path="$1"
+   local segments="$2"
+   local segment_bytes="$3"
+   local first_bytes="$4"
+   [[ "${log_path}" == /*/* && "${segments}" =~ ^[1-9][0-9]*$ && "${segments}" -le 8 &&
+      "${segment_bytes}" =~ ^[1-9][0-9]*$ && "${segment_bytes}" -le 1073741824 &&
+      "${first_bytes}" =~ ^[1-9][0-9]*$ && "${first_bytes}" -le "${segment_bytes}" ]]
+   [[ -d "${log_path%/*}" && ! -L "${log_path}" ]]
+   exec python3 -c '
+import os
+import sys
+
+path = sys.argv[1]
+segments = int(sys.argv[2])
+segment_bytes = int(sys.argv[3])
+first_bytes = int(sys.argv[4])
+first_path = path + ".first"
+
+def rotate():
+    oldest = f"{path}.{segments}"
+    try:
+        os.unlink(oldest)
+    except FileNotFoundError:
+        pass
+    for index in range(segments - 1, 0, -1):
+        source = f"{path}.{index}"
+        try:
+            os.replace(source, f"{path}.{index + 1}")
+        except FileNotFoundError:
+            pass
+    try:
+        os.replace(path, f"{path}.1")
+    except FileNotFoundError:
+        pass
+
+first_size = os.path.getsize(first_path) if os.path.exists(first_path) else 0
+current_size = os.path.getsize(path) if os.path.exists(path) else 0
+output = open(path, "ab", buffering=0)
+first = open(first_path, "ab", buffering=0) if first_size < first_bytes else None
+try:
+    while True:
+        chunk = sys.stdin.buffer.read(1024 * 1024)
+        if not chunk:
+            break
+        if first is not None:
+            prefix = chunk[:max(0, first_bytes - first_size)]
+            first.write(prefix)
+            first_size += len(prefix)
+            if first_size >= first_bytes:
+                first.close()
+                first = None
+        offset = 0
+        while offset < len(chunk):
+            if current_size >= segment_bytes:
+                output.close()
+                rotate()
+                output = open(path, "ab", buffering=0)
+                current_size = 0
+            part = chunk[offset:offset + segment_bytes - current_size]
+            output.write(part)
+            current_size += len(part)
+            offset += len(part)
+finally:
+    output.close()
+    if first is not None:
+        first.close()
+' "${log_path}" "${segments}" "${segment_bytes}" "${first_bytes}"
+}
+
 valid_workspace()
 {
    local canonical
@@ -442,6 +514,10 @@ launch_datacenter()
 }
 
 case "${1:-}" in
+   --bounded-log)
+      shift
+      bounded_machine_log "$@"
+      ;;
    --enter-machine)
       shift
       enter_machine "$@"
@@ -521,7 +597,7 @@ then
    exit 2
 fi
 
-required=(btrfs find flock install ip mkfs.btrfs mount mountpoint mv realpath rm rmdir seq setsid stat tr truncate umount unshare xargs)
+required=(btrfs find flock install ip mkfs.btrfs mount mountpoint mv python3 realpath rm rmdir seq setsid stat tr truncate umount unshare xargs)
 [[ "${storage_device_count}" -eq 0 ]] || required+=(mkfs.ext4)
 if [[ "${fake_boundary}" == "1" ]]
 then
@@ -836,7 +912,7 @@ start_machine()
 
    setsid bash "$0" --enter-machine \
       "${machine_cgroup}" "${workspace}" "${machine_root}" "${containers_root}" "${shared_transport_tls}" "${storage_root}" "${storage_device_count}" "${child_ns}" "${boot_path}" "${host_netns_inode}" "${brain_count}" "${fake_ingress}" \
-      >> "${log_path}" 2>&1 &
+      > >(bash "$0" --bounded-log "${log_path}" 2 67108864 4194304) 2>&1 &
    machine_pids[$((index - 1))]="$!"
 }
 
