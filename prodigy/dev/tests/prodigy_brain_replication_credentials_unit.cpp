@@ -1400,6 +1400,11 @@ public:
     closeLocalWhiteholesToContainer(containerID);
   }
 
+  void syncWhiteholeBindingsForContainerPeerForTest(Container *container)
+  {
+    syncWhiteholeBindingsForContainerPeer(container);
+  }
+
   uint32_t localWhiteholeBindingCountForContainerForTest(uint32_t containerID)
   {
     if (auto it = whiteholeBindingsByContainer.find(containerID); it != whiteholeBindingsByContainer.end())
@@ -13305,6 +13310,11 @@ static void testNeuronWhiteholeBindingBookkeepingWithoutPrograms(TestSuite& suit
                   neuron.aggregateWhiteholeBindingCountForTest() == 2,
                "neuron_whitehole_bookkeeping_keeps_aggregate_bindings_for_distinct_client_and_server_peer_programs");
 
+  Container newlyAttachedPeer = {};
+  neuron.syncWhiteholeBindingsForContainerPeerForTest(&newlyAttachedPeer);
+  suite.expect(newlyAttachedPeer.installedPeerWhiteholeBindingKeys.entries.size() == 2,
+               "neuron_new_peer_initialization_uses_complete_local_whitehole_binding_set");
+
   neuron.closeLocalWhiteholesToContainerForTest(0x01020304u);
 
   suite.expect(neuron.localWhiteholeBindingCountForContainerForTest(0x01020304u) == 0, "neuron_whitehole_bookkeeping_without_programs_erases_container_bindings");
@@ -21435,6 +21445,12 @@ int main(void)
       only != nullptr && strcmp(only, "brain-timeout-cancellation") == 0)
   {
     testBrainTimeoutCancellationDoesNotDereferenceRetiredPacket(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "neuron-whitehole-peer-initialization") == 0)
+  {
+    testNeuronWhiteholeBindingBookkeepingWithoutPrograms(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (std::getenv("PRODIGY_TEST_BUNDLE_UPDATE_ONLY") != nullptr)

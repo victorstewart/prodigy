@@ -160,6 +160,11 @@ public:
     (void)fragment;
   }
 
+  virtual void syncWhiteholeBindingsForContainerPeer(Container *container)
+  {
+    (void)container;
+  }
+
   virtual void syncContainerSwitchboardRuntime(Container *container)
   {
     (void)container;

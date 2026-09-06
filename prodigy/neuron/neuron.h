@@ -2320,6 +2320,18 @@ protected:
     closeLocalWhiteholesToContainer(generateLocalContainerID(fragment));
   }
 
+  void syncWhiteholeBindingsForContainerPeer(Container *container) override
+  {
+    if (container == nullptr || container->pendingDestroy)
+    {
+      return;
+    }
+
+    Vector<std::pair<portal_definition, switchboard_whitehole_binding>> desiredBindings = {};
+    collectWhiteholeBindings(desiredBindings);
+    container->syncPeerWhiteholeBindingEntries(desiredBindings);
+  }
+
   void syncContainerSwitchboardRuntime(Container *container) override
   {
     if (switchboard == nullptr || container == nullptr || container->plan.useHostNetworkNamespace ||

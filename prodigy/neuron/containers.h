@@ -2006,7 +2006,7 @@ public:
         }
         return false;
       }
-      syncPeerWhiteholeBindings();
+      thisNeuron->syncWhiteholeBindingsForContainerPeer(this);
     }
 
     if (plan.networkAccess == ContainerNetworkAccess::declaredOnly)
@@ -2341,7 +2341,7 @@ public:
       }
       return false;
     }
-    syncPeerWhiteholeBindings();
+    thisNeuron->syncWhiteholeBindingsForContainerPeer(this);
 
     if (plan.networkAccess == ContainerNetworkAccess::declaredOnly &&
         switchboardPinContainerTCPFlowMap(peer_program, netdevs.host.ifidx) == false)
