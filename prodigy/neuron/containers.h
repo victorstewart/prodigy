@@ -2185,6 +2185,33 @@ public:
     host.bringUp();
     peer.bringUp();
 
+    // L3 netkit host peers intentionally have no IPv4 address. Linux source
+    // validation rejects every forwarded IPv4 packet from an addressless
+    // interface when rp_filter is nonzero, even in loose mode, before the
+    // host egress switchboard can validate and route it. The per-container
+    // egress program already owns source/port authorization, so disable only
+    // this netkit peer's inherited reverse-path filter.
+    path.assign("/proc/sys/net/ipv4/conf/"_ctv);
+    path.append(host.name);
+    path.append("/rp_filter"_ctv);
+    if (writeProcSysctlValue(path.c_str(), "0") == false)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to disable IPv4 reverse-path filtering on container netkit {} for container {itoa}"_ctv>(
+            host.name,
+            plan.uuid);
+      }
+      basics_log("setupNetwork failed uuid=%llu reason=netkit-ipv4-rp-filter path=%s errno=%d(%s)\n",
+                 (unsigned long long)plan.uuid,
+                 path.c_str(),
+                 errno,
+                 strerror(errno));
+      ::close(peernetnsfd);
+      ::close(hostnetnsfd);
+      return false;
+    }
+
     for (const IPPrefix& prefix : plan.addresses)
     {
       peer.addIP(prefix);
