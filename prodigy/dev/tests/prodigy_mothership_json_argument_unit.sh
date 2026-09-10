@@ -81,5 +81,49 @@ help="$(${mothership_bin} help)"
 [[ "${help}" == *'deploy [target: local|clusterName|clusterUUID] [json|-|@path] [path to container blob]'* ]]
 [[ "${help}" == *'reserveApplicationID [target: local|clusterName|clusterUUID] [json|-|@path]'* ]]
 [[ "${help}" == *'reserveServiceID [target: dev|prod|local|clusterName|clusterUUID] [json|-|@path]'* ]]
+[[ "${help}" == *'upsertApiCredentialSet [target: local|clusterName|clusterUUID] [json|-|@path]'* ]]
+
+# This command validates its JSON before it opens a control socket.  The local
+# target is intentionally unavailable in this input-contract test; each valid
+# source must therefore reach the same non-secret control-target failure.
+api_request='{"applicationID":15,"upsertCredentials":[{"name":"input-contract","provider":"test","material":"not-a-secret"}]}'
+api_file="${workdir}/api-request.json"
+printf '%s\n' "${api_request}" >"${api_file}"
+index=0
+for source in "${api_request}" - "@${api_file}"; do
+   index=$((index + 1))
+   output="${workdir}/api-${index}.log"
+   if [[ "${source}" == - ]]; then
+      printf '%s\n' "${api_request}" | PRODIGY_MOTHERSHIP_TIDESDB_PATH="${workdir}/api.tidesdb" \
+         "${mothership_bin}" upsertApiCredentialSet local - >"${output}" 2>&1 && exit 1
+   else
+      PRODIGY_MOTHERSHIP_TIDESDB_PATH="${workdir}/api.tidesdb" \
+         "${mothership_bin}" upsertApiCredentialSet local "${source}" >"${output}" 2>&1 && exit 1
+   fi
+   ! rg -q 'not-a-secret|invalid json for upsertApiCredentialSet|json input exceeds' "${output}"
+   rg -q '^failed to configure local control target:' "${output}"
+done
+
+for source in - "@${invalid_file}"; do
+   output="${workdir}/api-invalid-$(basename "${source}" | tr '@/' '__').log"
+   if [[ "${source}" == - ]]; then
+      printf '{\n' | PRODIGY_MOTHERSHIP_TIDESDB_PATH="${workdir}/api-invalid.tidesdb" \
+         "${mothership_bin}" upsertApiCredentialSet local - >"${output}" 2>&1 && exit 1
+   else
+      PRODIGY_MOTHERSHIP_TIDESDB_PATH="${workdir}/api-invalid.tidesdb" \
+         "${mothership_bin}" upsertApiCredentialSet local "${source}" >"${output}" 2>&1 && exit 1
+   fi
+   rg -qx 'invalid json for upsertApiCredentialSet' "${output}"
+done
+
+oversize_file="${workdir}/api-oversize.json"
+truncate -s $((4 * 1024 * 1024 + 1)) "${oversize_file}"
+if PRODIGY_MOTHERSHIP_TIDESDB_PATH="${workdir}/api-oversize.tidesdb" \
+   "${mothership_bin}" upsertApiCredentialSet local "@${oversize_file}" >"${workdir}/api-oversize.log" 2>&1
+then
+   echo "oversize API credential JSON unexpectedly succeeded" >&2
+   exit 1
+fi
+rg -qx 'upsertApiCredentialSet json input exceeds 4194304 bytes' "${workdir}/api-oversize.log"
 
 echo "PASS: mothership JSON arguments accept inline, stdin, and @file sources and reject invalid paths"

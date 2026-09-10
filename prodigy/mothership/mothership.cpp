@@ -17095,12 +17095,7 @@ private:
   {
     if (argc < 2)
     {
-      basics_log("too few arguments. ex: upsertApiCredentialSet [target: local|clusterName|clusterUUID] [json]\n");
-      exit(EXIT_FAILURE);
-    }
-
-    if (!configureControlTarget(argv[0]))
-    {
+      basics_log("too few arguments. ex: upsertApiCredentialSet [target: local|clusterName|clusterUUID] [json|-|@path]\n");
       exit(EXIT_FAILURE);
     }
 
@@ -17108,7 +17103,10 @@ private:
     request.reason.assign("manual"_ctv);
 
     String json;
-    json.append(argv[1]);
+    if (resolveJSONArgument("upsertApiCredentialSet", argv[1], json) == false)
+    {
+      exit(EXIT_FAILURE);
+    }
     json.need(simdjson::SIMDJSON_PADDING);
 
     simdjson::dom::parser parser;
@@ -17116,6 +17114,11 @@ private:
     if (parser.parse(json.data(), json.size()).get(doc))
     {
       basics_log("invalid json for upsertApiCredentialSet\n");
+      exit(EXIT_FAILURE);
+    }
+
+    if (!configureControlTarget(argv[0]))
+    {
       exit(EXIT_FAILURE);
     }
 
@@ -17851,7 +17854,7 @@ int main(int argc, char *argv[])
     message.append("\tlists live DNS binding leases\n");
     message.append("upsertTlsVaultFactory [target: local|clusterName|clusterUUID] [json]\n");
     message.append("\tcreates/updates an application TLS vault factory\n");
-    message.append("upsertApiCredentialSet [target: local|clusterName|clusterUUID] [json]\n");
+    message.append("upsertApiCredentialSet [target: local|clusterName|clusterUUID] [json|-|@path]\n");
     message.append("\tcreates/updates API credential set for an application\n");
     message.append("mintClientTlsIdentity [target: local|clusterName|clusterUUID] [json]\n");
     message.append("\tmints a client TLS identity from an existing application vault factory\n");
