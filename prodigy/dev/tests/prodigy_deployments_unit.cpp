@@ -668,9 +668,140 @@ static bool seedSchedulableMachine(TestBrain& brain, Rack& rack, Machine& machin
   return machine.neuron.connected;
 }
 
+static void testRequiredStorageMount(TestSuite& suite)
+{
+  // Exercise the production mount decision without invoking mount, namespaces,
+  // or any host-global filesystem path from this ordinary unit test.
+  String source = "/unit/storage/source"_ctv;
+  String target = "/unit/rootfs/storage"_ctv;
+  auto check = [&](int mappingPID, int initialError, int bindError, int remountError,
+                   bool expected, unsigned expectedBindCalls) {
+    unsigned mountCalls = 0;
+    unsigned bindCalls = 0;
+    String failure;
+    bool mounted = ContainerManager::mountRequiredContainerStorage(
+        source, target, mappingPID,
+        [&](const String& actualSource, const String& actualTarget, uint64_t attributes, int actualPID) {
+          ++mountCalls;
+          suite.expect(actualSource == source && actualTarget == target && actualPID == mappingPID &&
+                         attributes == (MOUNT_ATTR_NOSUID | (mappingPID > 0 ? MOUNT_ATTR_IDMAP : 0)),
+                       "storage_mount_uses_exact_source_target_and_mapping");
+          errno = initialError;
+          return initialError == 0 ? 0 : -1;
+        },
+        [&](const char *actualSource, const char *actualTarget, unsigned long flags) {
+          ++bindCalls;
+          suite.expect(std::string_view(actualTarget) == target.c_str() &&
+                         (bindCalls == 1
+                            ? actualSource != nullptr && std::string_view(actualSource) == source.c_str() &&
+                                flags == (MS_BIND | MS_REC)
+                            : actualSource == nullptr && flags == (MS_BIND | MS_REMOUNT | MS_NOSUID)),
+                       "storage_mount_compatibility_bind_preserves_source_and_nosuid");
+          errno = bindCalls == 1 ? bindError : remountError;
+          return errno == 0 ? 0 : -1;
+        }, &failure);
+    suite.expect(mounted == expected, "storage_mount_must_not_accept_container_local_fallback");
+    suite.expect(mountCalls == 1 && bindCalls == expectedBindCalls, "storage_mount_bounded_compatibility_calls");
+    suite.expect(expected ? failure.size() == 0 : failure.size() > 0,
+                 "storage_mount_reports_required_storage_failure");
+    if (expected == false)
+    {
+      suite.expect(errno == (bindCalls == 2 ? remountError : bindCalls == 1 ? bindError : initialError),
+                   "storage_mount_preserves_actual_failure_errno");
+    }
+  };
+  check(-1, 0, 0, 0, true, 0);
+  check(123, 0, 0, 0, true, 0);
+  check(123, EPERM, 0, 0, false, 0);
+  check(-1, EACCES, 0, 0, false, 0);
+  for (int compatibilityError : {EPERM, EOPNOTSUPP, EINVAL})
+  {
+    check(-1, compatibilityError, 0, 0, true, 2);
+  }
+  check(-1, EINVAL, EACCES, 0, false, 1);
+  check(-1, EINVAL, 0, EROFS, false, 2);
+}
+
+static void testStorageParentTraversal(TestSuite& suite)
+{
+  TemporaryDirectory fixture;
+  suite.expect(fixture.create(), "storage_parent_fixture_created");
+  if (fixture.path.size() == 0) return;
+  int root = open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  suite.expect(root >= 0, "storage_parent_fixture_opened");
+  if (root < 0) return;
+  suite.expect(fchmod(root, 0711) == 0, "storage_parent_fixture_models_traversable_containers_root");
+  String failure;
+  suite.expect(ContainerManager::prepareContainerStorageParentAt(root, &failure), "storage_parent_prepared");
+  struct stat parent = {};
+  suite.expect(fstatat(root, "storage", &parent, AT_SYMLINK_NOFOLLOW) == 0 &&
+               (parent.st_mode & 0777) == 0711 && parent.st_uid == geteuid(),
+               "storage_parent_owner_only_listing_mapped_uid_traversal");
+  suite.expect(mkdirat(root, "storage/123", 0700) == 0, "storage_parent_private_child_created");
+  if (geteuid() == 0)
+  {
+    constexpr uid_t mappedUID = 15728400;
+    suite.expect(fchownat(root, "storage/123", mappedUID, mappedUID, AT_SYMLINK_NOFOLLOW) == 0,
+                 "storage_parent_private_child_owned_by_mapped_uid");
+    pid_t child = fork();
+    suite.expect(child >= 0, "storage_parent_mapped_uid_child_forked");
+    if (child == 0)
+    {
+      if (setgroups(0, nullptr) != 0 || setresgid(mappedUID, mappedUID, mappedUID) != 0 ||
+          setresuid(mappedUID, mappedUID, mappedUID) != 0) _exit(2);
+      int own = openat(root, "storage/123", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      if (own < 0) _exit(3);
+      close(own);
+      int listing = openat(root, "storage", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      if (listing >= 0) { close(listing); _exit(4); }
+      _exit(errno == EACCES ? 0 : 5);
+    }
+    if (child > 0)
+    {
+      int status = 0;
+      suite.expect(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                   "storage_parent_real_mapped_uid_can_traverse_but_not_list");
+    }
+  }
+  suite.expect(fchmodat(root, "storage", 0700, 0) == 0 &&
+               ContainerManager::prepareContainerStorageParentAt(root, &failure) &&
+               fstatat(root, "storage", &parent, AT_SYMLINK_NOFOLLOW) == 0 && (parent.st_mode & 0777) == 0711,
+               "storage_parent_existing_private_parent_is_repaired");
+  struct stat childMetadata = {};
+  suite.expect(fstatat(root, "storage/123", &childMetadata, AT_SYMLINK_NOFOLLOW) == 0 &&
+               (childMetadata.st_mode & 0777) == 0700,
+               "storage_parent_repair_preserves_private_child_mode");
+  close(root);
+
+  TemporaryDirectory symlinkFixture;
+  suite.expect(symlinkFixture.create(), "storage_parent_symlink_fixture_created");
+  if (symlinkFixture.path.size() > 0)
+  {
+    int symlinkRoot = open(symlinkFixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    suite.expect(symlinkRoot >= 0 && symlinkat(fixture.path.c_str(), symlinkRoot, "storage") == 0,
+                 "storage_parent_symlink_fixture_prepared");
+    if (symlinkRoot >= 0)
+    {
+      suite.expect(ContainerManager::prepareContainerStorageParentAt(symlinkRoot, &failure) == false,
+                   "storage_parent_symlink_rejected");
+      struct stat unchanged = {};
+      suite.expect(stat(fixture.path.c_str(), &unchanged) == 0 && (unchanged.st_mode & 0777) == 0711,
+                   "storage_parent_symlink_target_not_modified");
+      close(symlinkRoot);
+    }
+  }
+}
+
 int main(void)
 {
   TestSuite suite;
+  testStorageParentTraversal(suite);
+  testRequiredStorageMount(suite);
+  if (getenv("PRODIGY_TEST_STORAGE_PARENT_ONLY") != nullptr)
+  {
+    dprintf(STDOUT_FILENO, "storage_owner_focused failed=%d\n", suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
 
   {
     siginfo_t termination = {};

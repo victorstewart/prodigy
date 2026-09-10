@@ -7899,6 +7899,44 @@ public:
     return true;
   }
 
+  static bool prepareContainerStorageParentAt(int containersFD, String *failureReport = nullptr)
+  {
+    // The child enters its user namespace before mounting /storage. Its mapped
+    // UID needs traversal through this shared parent, but must not list another
+    // container's storage. Each container directory remains private and owned
+    // by its own execution UID.
+    if (mkdirat(containersFD, "storage", 0711) != 0 && errno != EEXIST)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("failed to create container storage parent"_ctv);
+      }
+      return false;
+    }
+    int storageFD = openat(containersFD, "storage", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (storageFD < 0)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("failed to open container storage parent without symlinks"_ctv);
+      }
+      return false;
+    }
+    struct stat metadata = {};
+    bool ready = fstat(storageFD, &metadata) == 0 && metadata.st_uid == geteuid() &&
+                 fchmod(storageFD, 0711) == 0;
+    close(storageFD);
+    if (ready == false && failureReport)
+    {
+      failureReport->assign("container storage parent is not owned or cannot be made traversable"_ctv);
+    }
+    else if (ready && failureReport)
+    {
+      failureReport->clear();
+    }
+    return ready;
+  }
+
   static bool prepareContainerStorage(Container *container, String *failureReport = nullptr)
   {
     if (container == nullptr || container->plan.config.storageMB == 0)
@@ -7910,6 +7948,22 @@ public:
     container->storagePayloadPath.assign(container->storageRootPath);
     container->storageUsesLoopFilesystem = false;
     container->storageLoopDevices.clear();
+
+    int containersFD = open("/containers", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (containersFD < 0)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("failed to open container storage owner"_ctv);
+      }
+      return false;
+    }
+    bool parentReady = prepareContainerStorageParentAt(containersFD, failureReport);
+    close(containersFD);
+    if (parentReady == false)
+    {
+      return false;
+    }
 
     Vector<ProdigyContainerStorageDevicePlan> devicePlans;
     if (collectEligibleStorageDevicePlans(container->name, container->plan.config.storageMB, devicePlans) == false)
@@ -7923,7 +7977,6 @@ public:
 
     if (devicePlans.size() == 0)
     {
-      Filesystem::createDirectoryAt(-1, "/containers/storage"_ctv);
       Filesystem::createDirectoryAt(-1, container->storageRootPath);
       if (chown(container->storageRootPath.c_str(), uid_t(container->executionHostID), gid_t(container->executionHostID)) != 0)
       {
@@ -10020,6 +10073,41 @@ public:
     return true;
   }
 
+  template <typename MountOperation, typename BindOperation>
+  static bool mountRequiredContainerStorage(String& source, String& target, int idMapPID,
+                                           MountOperation&& mountOperation, BindOperation&& bindOperation,
+                                           String *failureReport = nullptr)
+  {
+    const bool useIDMapMounts = idMapPID > 0;
+    int result = mountOperation(source, target,
+                                MOUNT_ATTR_NOSUID | (useIDMapMounts ? MOUNT_ATTR_IDMAP : 0), idMapPID);
+    int mountError = result == 0 ? 0 : errno;
+    if (result != 0 && useIDMapMounts == false &&
+        (mountError == EPERM || mountError == EOPNOTSUPP || mountError == EINVAL))
+    {
+      result = bindOperation(source.c_str(), target.c_str(), MS_BIND | MS_REC);
+      if (result == 0)
+      {
+        result = bindOperation(nullptr, target.c_str(), MS_BIND | MS_REMOUNT | MS_NOSUID);
+      }
+      mountError = result == 0 ? 0 : errno;
+    }
+    if (result == 0)
+    {
+      if (failureReport) failureReport->clear();
+      return true;
+    }
+    if (failureReport)
+    {
+      failureReport->snprintf<"required storage mount failed source={} target={} errno={itoa}({})"_ctv>(
+          source, target, mountError, String(strerror(mountError)));
+    }
+    errno = mountError;
+    // Never let an application write persistent state into its disposable
+    // rootfs when the declared storage owner could not be mounted.
+    return false;
+  }
+
   static bool mountRootFSInCurrentNamespace(Container *container, bool isRestart, int idMapPID, String *failureReport = nullptr)
   {
     (void)isRestart;
@@ -10181,49 +10269,25 @@ public:
       }
       path2.assign(containerRoot);
       path2.append("/storage"_ctv);
-      int storageMountResult = 0;
-      int storageMountErrno = 0;
-
-      auto bindMountStorageFallback = [&]() -> bool {
-        if (mount(path.c_str(), path2.c_str(), NULL, MS_BIND | MS_REC, NULL) != 0)
-        {
-          return false;
-        }
-
-        if (mount(NULL, path2.c_str(), NULL, MS_BIND | MS_REMOUNT | MS_NOSUID, NULL) != 0)
-        {
-          return false;
-        }
-
-        return true;
-      };
-
-      if (useIDMapMounts)
+      String storageMountFailure;
+      if (mountRequiredContainerStorage(
+              path, path2, useIDMapMounts ? idMapPID : -1,
+              [](String& source, String& target, uint64_t attributes, int mappingPID) {
+                return mount2(source, target, attributes, mappingPID);
+              },
+              [](const char *source, const char *target, unsigned long flags) {
+                return mount(source, target, nullptr, flags, nullptr);
+              }, &storageMountFailure) == false)
       {
-        storageMountResult = mount2(path, path2, MOUNT_ATTR_IDMAP | MOUNT_ATTR_NOSUID, idMapPID);
-      }
-      else
-      {
-        storageMountResult = mount2(path, path2, MOUNT_ATTR_NOSUID);
-        storageMountErrno = errno;
-        if (storageMountResult != 0 && (storageMountErrno == EPERM || storageMountErrno == EOPNOTSUPP || storageMountErrno == EINVAL))
-        {
-          if (bindMountStorageFallback())
-          {
-            storageMountResult = 0;
-          }
-        }
-      }
-
-      if (storageMountResult != 0)
-      {
-        basics_log("mountRootFS storage mount failed uuid=%llu source=%s target=%s idmap=%d errno=%d(%s); using container-local /storage fallback\n",
+        const int storageMountError = errno;
+        basics_log("mountRootFS storage mount failed uuid=%llu source=%s target=%s idmap=%d errno=%d(%s)\n",
                    (unsigned long long)container->plan.uuid,
                    path.c_str(),
                    path2.c_str(),
                    int(useIDMapMounts),
-                   errno,
-                   strerror(errno));
+                   storageMountError,
+                   strerror(storageMountError));
+        return fail("mount required storage", storageMountError, &storageMountFailure);
       }
     }
 
