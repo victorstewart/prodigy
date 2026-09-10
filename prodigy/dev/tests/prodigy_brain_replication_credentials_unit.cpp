@@ -2894,6 +2894,50 @@ static void testSpinApplicationInvalidPlanUsesSingleTopicFrame(TestSuite& suite)
   suite.expect(invalidPlanReason == "invalid plan: applicationID not reserved"_ctv, "spin_application_invalid_plan_includes_reason");
 }
 
+static void testSpinApplicationRejectsDuplicateNonTaskDeploymentIDWithoutMutation(TestSuite& suite)
+{
+  StreamingTestBrain brain = {};
+
+  DeploymentPlan originalPlan = {};
+  seedStatefulDeployRequestPlan(originalPlan, 62'015);
+  ApplicationDeployment original = {};
+  original.plan = originalPlan;
+  original.state = DeploymentState::deploying;
+  const uint64_t deploymentID = originalPlan.config.deploymentID();
+  brain.deployments.insert_or_assign(deploymentID, &original);
+  brain.deploymentsByApp.insert_or_assign(originalPlan.config.applicationID, &original);
+  brain.deploymentPlans.insert_or_assign(deploymentID, originalPlan);
+
+  DeploymentPlan changedPlan = originalPlan;
+  changedPlan.config.memoryMB = 128;
+  DeploymentPlan typeChangedPlan = originalPlan;
+  typeChangedPlan.isStateful = false;
+  typeChangedPlan.config.type = ApplicationType::task;
+  typeChangedPlan.canaryCount = 0;
+  suite.expect(brain.deploymentIDAdmissionAllowed(changedPlan) == false, "spin_application_changed_plan_duplicate_deployment_id_rejected");
+  suite.expect(brain.deploymentIDAdmissionAllowed(originalPlan) == false, "spin_application_exact_duplicate_deployment_id_rejected");
+  suite.expect(brain.deploymentIDAdmissionAllowed(typeChangedPlan) == false, "spin_application_type_change_duplicate_deployment_id_rejected");
+  suite.expect(brain.deployments.find(deploymentID)->second == &original, "spin_application_duplicate_deployment_id_preserves_deployment_pointer");
+  suite.expect(brain.deploymentsByApp.find(originalPlan.config.applicationID)->second == &original, "spin_application_duplicate_deployment_id_preserves_application_pointer");
+  suite.expect(brain.deploymentPlans.find(deploymentID)->second.config.memoryMB == originalPlan.config.memoryMB, "spin_application_duplicate_deployment_id_preserves_plan");
+
+  DeploymentPlan successorPlan = originalPlan;
+  successorPlan.config.versionID += 1;
+  suite.expect(brain.deploymentIDAdmissionAllowed(successorPlan), "spin_application_unique_successor_is_accepted");
+
+  brain.deployments.erase(deploymentID);
+  brain.deploymentsByApp.erase(originalPlan.config.applicationID);
+  suite.expect(brain.deploymentIDAdmissionAllowed(originalPlan) == false, "spin_application_persisted_only_duplicate_deployment_id_rejected");
+  brain.deploymentPlans.erase(deploymentID);
+
+  StreamingTestBrain taskBrain = {};
+  TaskExecutionRecord taskRecord = {};
+  taskRecord.executionID = typeChangedPlan.config.deploymentID();
+  taskBrain.masterAuthorityRuntimeState.taskExecutions.insert_or_assign(taskRecord.executionID, taskRecord);
+  suite.expect(taskBrain.deploymentIDAdmissionAllowed(typeChangedPlan), "spin_application_task_duplicate_uses_existing_task_identity");
+  suite.expect(taskBrain.deploymentIDAdmissionAllowed(originalPlan) == false, "spin_application_task_record_rejects_non_task_plan");
+}
+
 static void testSpinApplicationProgressAppendsAfterOkayFrame(TestSuite& suite)
 {
   StreamingTestBrain brain;
@@ -21489,6 +21533,13 @@ int main(void)
     testDeployingContainerFailureFailsDeployment(suite);
     return suite.failed == 0 ? 0 : 1;
   }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "spin-application-duplicate-id") == 0)
+  {
+    testSpinApplicationRejectsDuplicateNonTaskDeploymentIDWithoutMutation(suite);
+    dprintf(STDERR_FILENO, "%s: prodigy_spin_application_duplicate_id failed=%d\n", suite.failed == 0 ? "PASS" : "FAIL", suite.failed);
+    return suite.failed == 0 ? 0 : 1;
+  }
   bool createdRing = false;
   if (Ring::getRingFD() <= 0)
   {
@@ -21560,6 +21611,7 @@ int main(void)
   testMothershipConfigureLowersSharedCPUOvercommitWithoutMovingClaims(suite);
   testReplicateMasterAuthorityRejectsClusterTakeover(suite);
   testSpinApplicationInvalidPlanUsesSingleTopicFrame(suite);
+  testSpinApplicationRejectsDuplicateNonTaskDeploymentIDWithoutMutation(suite);
   testSpinApplicationProgressAppendsAfterOkayFrame(suite);
   testSpinApplicationProgressAcceptsDirectFdMothership(suite);
   testSpinApplicationProgressStaysOnOriginalDeployStream(suite);

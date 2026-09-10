@@ -6984,6 +6984,30 @@ public:
     return true;
   }
 
+  bool deploymentIDAdmissionAllowed(const DeploymentPlan& plan) const
+  {
+    const uint64_t deploymentID = plan.config.deploymentID();
+    const auto liveDeployment = deployments.find(deploymentID);
+    const auto persistedPlan = deploymentPlans.find(deploymentID);
+    const auto taskExecution = masterAuthorityRuntimeState.taskExecutions.find(deploymentID);
+    const bool deploymentIDOccupied =
+        liveDeployment != deployments.end() ||
+        persistedPlan != deploymentPlans.end() ||
+        taskExecution != masterAuthorityRuntimeState.taskExecutions.end();
+    bool existingTaskOwnsDeploymentID = taskExecution != masterAuthorityRuntimeState.taskExecutions.end();
+    if (liveDeployment != deployments.end() &&
+        (liveDeployment->second == nullptr || liveDeployment->second->plan.config.type != ApplicationType::task))
+    {
+      existingTaskOwnsDeploymentID = false;
+    }
+    if (persistedPlan != deploymentPlans.end() && persistedPlan->second.config.type != ApplicationType::task)
+    {
+      existingTaskOwnsDeploymentID = false;
+    }
+    return deploymentIDOccupied == false ||
+           (plan.config.type == ApplicationType::task && existingTaskOwnsDeploymentID);
+  }
+
   static bool validateApplicationContainerPrivileges(
       const DeploymentPlan& plan,
       String& failure)
@@ -29379,6 +29403,16 @@ public:
           if (deployment->plan.isStateful && deployment->plan.canaryCount > 0)
           {
             rejectInvalidPlan("invalid plan: stateful canaries are not supported; use stateful blue-green topology rollout"_ctv);
+            return;
+          }
+
+          // A deployment ID is the durable identity of its plan, container
+          // image, storage ownership, and replication state.  Tasks retain
+          // their existing fingerprinted idempotency record; every other
+          // collision must be rejected before any admission mutation.
+          if (deploymentIDAdmissionAllowed(deployment->plan) == false)
+          {
+            rejectInvalidPlan("invalid plan: deploymentID already exists"_ctv);
             return;
           }
 
