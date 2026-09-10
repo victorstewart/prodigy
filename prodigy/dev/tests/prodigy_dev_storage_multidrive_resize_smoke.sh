@@ -4,6 +4,15 @@ set -euo pipefail
 PRODIGY_BIN="${1:-}"
 MOTHERSHIP_BIN="${2:-}"
 PINGPONG_BIN="${3:-}"
+test_mode="${4:-resize}"
+storage_devices="${5:-2}"
+case "${test_mode}" in
+   resize) host_network=true ;;
+   mount-only) host_network=false ;;
+   *) echo "error: expected resize or mount-only mode" >&2; exit 2 ;;
+esac
+[[ "${storage_devices}" == 0 || "${storage_devices}" == 2 ]] || { echo "error: expected zero or two storage devices" >&2; exit 2; }
+[[ "${test_mode}" != resize || "${storage_devices}" == 2 ]] || { echo "error: resize requires two storage devices" >&2; exit 2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/prodigy_dev_discombobulator_artifact_helpers.sh"
@@ -12,7 +21,7 @@ prodigy_dev_reexec_in_private_mount_namespace_once PRODIGY_DEV_STORAGE_MULTIDRIV
 
 if [[ -z "${PRODIGY_BIN}" || -z "${MOTHERSHIP_BIN}" || -z "${PINGPONG_BIN}" ]]
 then
-   echo "usage: $0 /path/to/prodigy /path/to/mothership /path/to/prodigy_pingpong_container"
+   echo "usage: $0 /path/to/prodigy /path/to/mothership /path/to/prodigy_pingpong_container [resize|mount-only] [0|2 storage devices]"
    exit 2
 fi
 
@@ -110,7 +119,7 @@ read -r -d '' CREATE_REQUEST <<EOF || true
     "workspaceRoot": "${workspace_root}",
     "machineCount": 1,
     "machineStorageMB": 8192,
-    "storageDeviceCount": 2,
+    "storageDeviceCount": ${storage_devices},
     "storageDeviceMB": 1024,
     "brainBootstrapFamily": "ipv4",
     "enableFakeIpv4Boundary": false
@@ -201,7 +210,7 @@ cat > "${plan_json}" <<EOF
     "sTilHealthcheck": 3,
     "sTilKillable": 30
   },
-  "useHostNetworkNamespace": true,
+  "useHostNetworkNamespace": ${host_network},
   "minimumSubscriberCapacity": 1024,
   "isStateful": false,
   "stateless": {
@@ -261,6 +270,65 @@ then
    echo "FAIL: storage deployment never became healthy"
    sed -n '1,240p' "${application_log}" || true
    exit 1
+fi
+
+# A host-side storage filesystem alone does not prove the application mounted
+# it. A failed bind used to leave a healthy process writing into its rootfs.
+# Observe the exact Mothership-owned child and compare its live /storage inode
+# with the declared payload, without entering or mutating the container.
+if ! python3 - "${brain_pid}" "${PINGPONG_BIN}" "${storage_devices}" >"${tmpdir}/container-storage-mount.json" <<'PY'
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+brain = pathlib.Path('/proc') / sys.argv[1]
+children = (brain / 'task' / sys.argv[1] / 'children').read_text().split()
+matches = []
+for pid in children:
+    process = pathlib.Path('/proc') / pid
+    try:
+        if (process / 'exe').readlink().name == 'pingpong_container':
+            matches.append(process)
+    except (FileNotFoundError, ProcessLookupError):
+        pass
+assert len(matches) == 1, f'expected one owned pingpong child, found {len(matches)}'
+process = matches[0]
+mountinfo = (process / 'mountinfo').read_text()
+mounts = [line for line in mountinfo.splitlines() if line.split()[4] == '/storage']
+assert len(mounts) == 1, 'application lacks its required /storage mount'
+assert ' - btrfs ' in mounts[0], 'application storage is not the declared Btrfs payload'
+uuid = re.search(r'/containers\.slice/([0-9]+)\.slice/leaf(?:\n|$)',
+                 (process / 'cgroup').read_text())
+assert uuid, 'owned container cgroup identity missing'
+expected = brain / 'root/containers/storage' / uuid[1]
+if int(sys.argv[3]) != 0:
+    expected = expected / 'data'
+observed = process / 'root/storage'
+expected_stat, observed_stat = expected.stat(), observed.stat()
+assert (expected_stat.st_dev, expected_stat.st_ino) == (observed_stat.st_dev, observed_stat.st_ino), \
+       'application /storage does not match its owner payload'
+def digest(path):
+    with pathlib.Path(path).open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+assert digest(process / 'exe') == digest(sys.argv[2]), 'unexpected running application bytes'
+print(json.dumps({'passed': True, 'pid': int(process.name), 'containerUUID': uuid[1],
+                  'storageDeviceCount': int(sys.argv[3]),
+                  'device': observed_stat.st_dev, 'inode': observed_stat.st_ino,
+                  'mountinfo': mounts[0], 'applicationSHA256': digest(sys.argv[2])}, indent=2))
+PY
+then
+   archive_workspace=1
+   echo "FAIL: application did not mount its declared persistent storage"
+   exit 1
+fi
+
+if [[ "${test_mode}" == mount-only ]]
+then
+   archive_workspace=1
+   echo "PASS: isolated application mounted exact persistent storage payload"
+   exit 0
 fi
 
 traffic_payload="$(printf 'ping\n%.0s' {1..80})"
