@@ -75,6 +75,23 @@ cleanup()
 
    if [[ "${archive_workspace}" -eq 1 && -d "${workspace_root}" ]]
    then
+      env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+         timeout 15s "${MOTHERSHIP_BIN}" clusterReport "${cluster_name}" >"${tmpdir}/precleanup-cluster.log" 2>&1
+      env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+         timeout 15s "${MOTHERSHIP_BIN}" containerLogs "${cluster_name}" Nametag 65536 >"${tmpdir}/precleanup-containers.log" 2>&1
+      local runtime_logs=() index relative
+      for index in $(seq 1 "${machine_count}")
+      do
+         for relative in "${index}/var/log/prodigy" "${index}/root/prodigy-crashreport.txt"
+         do
+            [[ ! -e "${workspace_root}/machines/${relative}" ]] || runtime_logs+=("${relative}")
+         done
+      done
+      if [[ "${#runtime_logs[@]}" -gt 0 ]]
+      then
+         tar --sparse -cf "${tmpdir}/precleanup-runtime-logs.tar" -C "${workspace_root}/machines" -- "${runtime_logs[@]}"
+         chmod 0600 "${tmpdir}/precleanup-runtime-logs.tar"
+      fi
       rm -rf "${tmpdir}/workspace-archive" >/dev/null 2>&1 || true
       mkdir -p "${tmpdir}/workspace-archive"
       find "${workspace_root}" -maxdepth 1 -type f \( -name '*.log' -o -name '*.json' -o -name '*.ready' -o -name '*.failure' \) \
@@ -298,13 +315,32 @@ then
 fi
 
 healthy=0
+report_version_ready()
+{
+   python3 - "$1" "$2" "$3" <<'PY'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+wanted, count = int(sys.argv[2]), int(sys.argv[3])
+for block in re.split(r'(?m)^\s*versionID:\s*', text)[1:]:
+    if int(block.splitlines()[0]) != wanted:
+        continue
+    def field(name):
+        match = re.search(r'(?m)^\s*' + name + r':\s*(\S+)', block)
+        return match[1] if match else None
+    ready = field('state') == 'DeploymentState::running' and all(
+        field(name) == str(count) for name in ('nTarget', 'nDeployed', 'nHealthy')) and field('nCrashes') == '0'
+    sys.exit(0 if ready else 1)
+sys.exit(1)
+PY
+}
+
 for _ in $(seq 1 120)
 do
    if env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
       "${MOTHERSHIP_BIN}" applicationReport "${cluster_name}" Nametag \
       >"${application_log}" 2>&1
    then
-      if rg -q "^[[:space:]]*nHealthy:[[:space:]]*${expected_healthy}$" "${application_log}"
+      if report_version_ready "${application_log}" "${version_id}" "${expected_healthy}"
       then
          healthy=1
          break
@@ -412,6 +448,23 @@ PY
       sleep 0.5
    done
    [[ "${upgraded}" == 1 ]] || { echo "FAIL: exact worker-preserving bundle upgrade was not observed" >&2; exit 1; }
+   recovered=0
+   for attempt in $(seq 1 240)
+   do
+      if env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+         timeout 8s "${MOTHERSHIP_BIN}" applicationReport "${cluster_name}" Nametag >"${tmpdir}/upgrade-recovery-report.log" 2>&1
+      then
+         printf 'attempt=%s\n' "${attempt}" >> "${tmpdir}/upgrade-recovery-samples.log"
+         cat "${tmpdir}/upgrade-recovery-report.log" >> "${tmpdir}/upgrade-recovery-samples.log"
+         if report_version_ready "${tmpdir}/upgrade-recovery-report.log" "${version_id}" 3
+         then
+            recovered=1
+            break
+         fi
+      fi
+      sleep 0.5
+   done
+   [[ "${recovered}" == 1 ]] || { echo "FAIL: original deployment control-plane recovery not observed; no successor submitted" >&2; exit 1; }
    # A second Discombobulator artifact reads the data before signaling healthy;
    # the harness never seeds or modifies a live container's storage.
    sed 's/PINGPONG_STORAGE_HANDOFF_MODE=seed/PINGPONG_STORAGE_HANDOFF_MODE=verify/' \
@@ -434,8 +487,7 @@ PY
    do
       if env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
          "${MOTHERSHIP_BIN}" applicationReport "${cluster_name}" Nametag >"${tmpdir}/verify-report.log" 2>&1 &&
-         rg -q "versionID: $((version_id + 1))$" "${tmpdir}/verify-report.log" &&
-         rg -q '^[[:space:]]*nHealthy:[[:space:]]*3$' "${tmpdir}/verify-report.log"
+         report_version_ready "${tmpdir}/verify-report.log" "$((version_id + 1))" 3
       then
          healthy=1
          break

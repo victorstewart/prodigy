@@ -6586,6 +6586,172 @@ int main(void)
     thisBrain = previousBrain;
   });
 
+  withUniqueMothershipSocket("recover_deployments_walks_empty_successor_to_ready_owner_socket_dir_created", [&] {
+    ScopedRing scopedRing = {};
+    NoopBrainIaaS provider = {};
+    TestBrain brain = {};
+    brain.iaas = &provider;
+    brain.weAreMaster = true;
+    brain.ignited = true;
+    Mesh mesh = {};
+    brain.mesh = &mesh;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+
+    Rack rack = {};
+    rack.uuid = 61'020;
+    Machine machine = {};
+    machine.uuid = uint128_t(0x6102001);
+    machine.private4 = IPAddress("10.0.0.120", false).v4;
+    machine.rack = &rack;
+    machine.rackUUID = rack.uuid;
+    machine.fragment = 1;
+    machine.state = MachineState::healthy;
+    machine.ownedLogicalCores = 4;
+    machine.memoryMB_available = 4096;
+    machine.storageMB_available = 4096;
+    prodigyRecomputeMachineCPUAvailability(&machine, prodigyActiveSharedCPUOvercommitPermille());
+    rack.machines.insert(&machine);
+    brain.racks.insert_or_assign(rack.uuid, &rack);
+    brain.machines.insert(&machine);
+
+    DeploymentPlan oldPlan = makeDeploymentPlan(61'020, 1);
+    oldPlan.config.type = ApplicationType::stateful;
+    oldPlan.isStateful = true;
+    oldPlan.canaryCount = 0;
+    DeploymentPlan successorPlan = makeDeploymentPlan(61'020, 2);
+    successorPlan.config.type = ApplicationType::stateful;
+    successorPlan.isStateful = true;
+    successorPlan.canaryCount = 0;
+    ApplicationDeployment *old = new ApplicationDeployment();
+    old->plan = oldPlan;
+    old->state = DeploymentState::none;
+    ApplicationDeployment *successor = new ApplicationDeployment();
+    successor->plan = successorPlan;
+    successor->state = DeploymentState::waitingToDeploy;
+    old->next = successor;
+    successor->previous = old;
+
+    ContainerView restored[3] = {};
+    for (uint32_t i = 0; i < 3; ++i)
+    {
+      restored[i].uuid = uint128_t(0x6102010 + i);
+      restored[i].applicationID = oldPlan.config.applicationID;
+      restored[i].deploymentID = oldPlan.config.deploymentID();
+      restored[i].machine = &machine;
+      restored[i].lifetime = ApplicationLifetime::base;
+      restored[i].isStateful = true;
+      restored[i].shardGroup = 0;
+      restored[i].state = ContainerState::healthy;
+      old->containers.insert(&restored[i]);
+    }
+    brain.deployments.insert_or_assign(oldPlan.config.deploymentID(), old);
+    brain.deployments.insert_or_assign(successorPlan.config.deploymentID(), successor);
+    brain.deploymentsByApp.insert_or_assign(oldPlan.config.applicationID, successor);
+
+    brain.testRecoverDeploymentsAfterNeuronState();
+
+    suite.expect(old->state == DeploymentState::decommissioning,
+                 "recover_deployments_ready_owner_restores_then_rolls_forward_once");
+    suite.expect(successor->state == DeploymentState::deploying,
+                 "recover_deployments_ready_owner_advances_waiting_successor");
+    suite.expect(old->nDeployed() == 3 && old->nHealthy() == 3,
+                 "recover_deployments_ready_owner_keeps_recovered_healthy_inventory");
+
+    old->containers.clear();
+    brain.deployments.clear();
+    brain.deploymentsByApp.clear();
+    brain.machines.erase(&machine);
+    brain.racks.erase(rack.uuid);
+    rack.machines.erase(&machine);
+    delete successor;
+    delete old;
+    thisBrain = savedBrain;
+  });
+
+  withUniqueMothershipSocket("recover_deployments_keeps_empty_successor_waiting_when_owner_underprovisioned_socket_dir_created", [&] {
+    ScopedRing scopedRing = {};
+    NoopBrainIaaS provider = {};
+    TestBrain brain = {};
+    brain.iaas = &provider;
+    brain.weAreMaster = true;
+    brain.ignited = true;
+    Mesh mesh = {};
+    brain.mesh = &mesh;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+
+    Rack rack = {};
+    rack.uuid = 61'021;
+    Machine machine = {};
+    machine.uuid = uint128_t(0x6102101);
+    machine.private4 = IPAddress("10.0.0.121", false).v4;
+    machine.rack = &rack;
+    machine.rackUUID = rack.uuid;
+    machine.fragment = 1;
+    machine.state = MachineState::healthy;
+    machine.ownedLogicalCores = 4;
+    machine.memoryMB_available = 4096;
+    machine.storageMB_available = 4096;
+    prodigyRecomputeMachineCPUAvailability(&machine, prodigyActiveSharedCPUOvercommitPermille());
+    rack.machines.insert(&machine);
+    brain.racks.insert_or_assign(rack.uuid, &rack);
+    brain.machines.insert(&machine);
+
+    DeploymentPlan oldPlan = makeDeploymentPlan(61'021, 1);
+    oldPlan.config.type = ApplicationType::stateful;
+    oldPlan.isStateful = true;
+    oldPlan.canaryCount = 0;
+    DeploymentPlan successorPlan = makeDeploymentPlan(61'021, 2);
+    successorPlan.config.type = ApplicationType::stateful;
+    successorPlan.isStateful = true;
+    successorPlan.canaryCount = 0;
+    ApplicationDeployment *old = new ApplicationDeployment();
+    old->plan = oldPlan;
+    old->state = DeploymentState::none;
+    ApplicationDeployment *successor = new ApplicationDeployment();
+    successor->plan = successorPlan;
+    successor->state = DeploymentState::waitingToDeploy;
+    old->next = successor;
+    successor->previous = old;
+
+    ContainerView restored[3] = {};
+    for (uint32_t i = 0; i < 3; ++i)
+    {
+      restored[i].uuid = uint128_t(0x6102110 + i);
+      restored[i].applicationID = oldPlan.config.applicationID;
+      restored[i].deploymentID = oldPlan.config.deploymentID();
+      restored[i].machine = &machine;
+      restored[i].lifetime = ApplicationLifetime::base;
+      restored[i].isStateful = true;
+      restored[i].shardGroup = 0;
+      restored[i].state = (i < 2 ? ContainerState::healthy : ContainerState::scheduled);
+      old->containers.insert(&restored[i]);
+    }
+    brain.deployments.insert_or_assign(oldPlan.config.deploymentID(), old);
+    brain.deployments.insert_or_assign(successorPlan.config.deploymentID(), successor);
+    brain.deploymentsByApp.insert_or_assign(oldPlan.config.applicationID, successor);
+
+    brain.testRecoverDeploymentsAfterNeuronState();
+
+    suite.expect(successor->state == DeploymentState::waitingToDeploy &&
+                     successor->containers.empty() && successor->waitingOnContainers.empty() &&
+                     successor->toSchedule.empty(),
+                 "recover_deployments_underprovisioned_owner_never_schedules_empty_successor");
+    suite.expect(old->nTarget() == 3 && old->nDeployed() == 3 && old->nHealthy() == 2,
+                 "recover_deployments_underprovisioned_owner_rebuilds_stateful_inventory");
+
+    old->containers.clear();
+    brain.deployments.clear();
+    brain.deploymentsByApp.clear();
+    brain.machines.erase(&machine);
+    brain.racks.erase(rack.uuid);
+    rack.machines.erase(&machine);
+    delete successor;
+    delete old;
+    thisBrain = savedBrain;
+  });
+
   withUniqueMothershipSocket("spin_application_queues_new_deployment_behind_unstarted_baseline_socket_dir_created", [&] {
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();

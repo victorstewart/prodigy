@@ -10380,12 +10380,22 @@ public:
 
     resumeOperatorCancellations();
 
-    for (const auto& [applicationID, head] : deploymentsByApp)
+    for (const auto& [applicationID, indexedHead] : deploymentsByApp)
     {
       (void)applicationID;
+      ApplicationDeployment *head = indexedHead;
       if (head == nullptr)
       {
         continue;
+      }
+      // A queued successor becomes the application index head before the
+      // predecessor has recovered.  Consume only empty queued successors and
+      // recover the first materialized predecessor exactly once; its existing
+      // roll-forward path owns successor activation and lifetime changes.
+      while (head->previous != nullptr && head->lifecycleIsUnmaterialized() &&
+             (head->state == DeploymentState::none || head->state == DeploymentState::waitingToDeploy))
+      {
+        head = head->previous;
       }
       bool heldByOperatorCancellation = false;
       for (const auto& [failedDeploymentID, failed] : failedDeployments)
