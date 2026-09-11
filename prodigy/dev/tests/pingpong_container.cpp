@@ -1390,7 +1390,31 @@ public:
     if (seed && mkdir("/storage/kvdb", 0700) != 0) return fail("mkdir", errno);
     int fd = open("/storage/kvdb/handoff-sparse", O_RDWR | O_CLOEXEC | O_NOFOLLOW |
                                                     (seed ? O_CREAT | O_EXCL : 0), 0600);
-    if (fd < 0) return fail("open", errno);
+    if (fd < 0)
+    {
+      const int openError = errno;
+      for (const char *path : {"/", "/storage", "/storage/kvdb", "/storage/kvdb/handoff-sparse"})
+      {
+        struct stat metadata = {};
+        const int result = lstat(path, &metadata);
+        const int pathError = result == 0 ? 0 : errno;
+        std::fprintf(stderr, "storage-handoff-fixture path=%s result=%d errno=%d uid=%u gid=%u mode=%o dev=%llu inode=%llu\n",
+                     path, result, pathError, unsigned(metadata.st_uid), unsigned(metadata.st_gid),
+                     unsigned(metadata.st_mode), (unsigned long long)metadata.st_dev,
+                     (unsigned long long)metadata.st_ino);
+      }
+      for (const char *path : {"/proc/self/uid_map", "/proc/self/gid_map"})
+      {
+        char mapping[1024] = {};
+        const int mappingFD = open(path, O_RDONLY | O_CLOEXEC);
+        const ssize_t bytes = mappingFD >= 0 ? read(mappingFD, mapping, sizeof(mapping) - 1) : -1;
+        const int mappingError = bytes >= 0 ? 0 : errno;
+        if (mappingFD >= 0) close(mappingFD);
+        std::fprintf(stderr, "storage-handoff-fixture mapping=%s bytes=%lld errno=%d value=%s\n",
+                     path, (long long)bytes, mappingError, mapping);
+      }
+      return fail("open", openError);
+    }
     auto failFile = [&](const char *reason, int error = 0) {
       close(fd);
       return fail(reason, error);
