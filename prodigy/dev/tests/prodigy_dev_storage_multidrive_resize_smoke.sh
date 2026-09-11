@@ -612,7 +612,26 @@ PY
          "${MOTHERSHIP_BIN}" faultTestCluster "${cluster_name}" link 2 "${fault_duration_ms}" 0 0 0 >"${tmpdir}/bootstrap-fault.log" 2>&1 &
       fault_pid=$!
       owned_background_pids+=("${fault_pid}")
-      env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+      # The provider owns the parent netns. Read its authoritative runtime
+      # identity and verify vp2 is actually DOWN before starting the update.
+      fault_down=0
+      for attempt in $(seq 1 120)
+      do
+         provider_pid="$(<"${workspace_root}/virtual-datacenter.pid" 2>/dev/null || true)"
+         runtime_identity="$(<"${workspace_root}/virtual-datacenter.identity" 2>/dev/null || true)"
+         if [[ "${provider_pid}" =~ ^[0-9]+$ && "${runtime_identity}" =~ ^[0-9]+$ ]] &&
+            kill -0 "${fault_pid}" >/dev/null 2>&1 && kill -0 "${provider_pid}" >/dev/null 2>&1 &&
+            nsenter -t "${provider_pid}" -m -- ip netns exec "pvd-p-${runtime_identity}" ip -o link show vp2 >"${tmpdir}/bootstrap-fault-link-${attempt}.log" 2>&1 &&
+            rg -q 'state DOWN' "${tmpdir}/bootstrap-fault-link-${attempt}.log"
+         then
+            printf 'attempt=%s providerPid=%s runtimeIdentity=%s vp2=DOWN\n' "${attempt}" "${provider_pid}" "${runtime_identity}" >>"${tmpdir}/bootstrap-fault-observation.log"
+            fault_down=1
+            break
+         fi
+         sleep 0.5
+      done
+      [[ "${fault_down}" == 1 ]] || { echo "FAIL: Mothership link fault did not make provider parent-netns vp2 DOWN" >&2; exit 1; }
+      timeout 120s env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
          "${MOTHERSHIP_BIN}" updateProdigy "${cluster_name}" "${interrupted_bundle}" >"${tmpdir}/bootstrap-interrupted-update.log" 2>&1 &
       interrupted_update_pid=$!
       owned_background_pids+=("${interrupted_update_pid}")
@@ -622,9 +641,10 @@ PY
          if kill -0 "${fault_pid}" >/dev/null 2>&1 &&
             kill -0 "${interrupted_update_pid}" >/dev/null 2>&1 &&
             env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
-               timeout 8s "${MOTHERSHIP_BIN}" clusterReport "${cluster_name}" >"${tmpdir}/bootstrap-pending-cluster-${attempt}.log" 2>&1
+               timeout 8s "${MOTHERSHIP_BIN}" clusterReport "${cluster_name}" >"${tmpdir}/bootstrap-pending-cluster-${attempt}.log" 2>&1 &&
+            rg -q "stagedBundleSHA256=${interrupted_bundle_sha}" "${tmpdir}/bootstrap-pending-cluster-${attempt}.log"
          then
-            printf 'attempt=%s updatePid=%s state=deferred clusterReport=observed\n' "${attempt}" "${interrupted_update_pid}" >>"${tmpdir}/bootstrap-pending.log"
+            printf 'attempt=%s updatePid=%s state=deferred stagedBundleSHA256=${interrupted_bundle_sha}\n' "${attempt}" "${interrupted_update_pid}" >>"${tmpdir}/bootstrap-pending.log"
             pending=1
             break
          fi
