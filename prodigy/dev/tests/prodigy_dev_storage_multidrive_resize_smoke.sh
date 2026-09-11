@@ -6,13 +6,17 @@ MOTHERSHIP_BIN="${2:-}"
 PINGPONG_BIN="${3:-}"
 test_mode="${4:-resize}"
 storage_devices="${5:-2}"
+upgrade_bundle="${6:-}"
 case "${test_mode}" in
    resize) host_network=true ;;
    mount-only) host_network=false ;;
-   *) echo "error: expected resize or mount-only mode" >&2; exit 2 ;;
+   legacy-handoff) host_network=false ;;
+   *) echo "error: expected resize, mount-only or legacy-handoff mode" >&2; exit 2 ;;
 esac
 [[ "${storage_devices}" == 0 || "${storage_devices}" == 2 ]] || { echo "error: expected zero or two storage devices" >&2; exit 2; }
 [[ "${test_mode}" != resize || "${storage_devices}" == 2 ]] || { echo "error: resize requires two storage devices" >&2; exit 2; }
+[[ "${test_mode}" != legacy-handoff || ( "${storage_devices}" == 0 && -s "${upgrade_bundle}" ) ]] || { echo "error: legacy handoff requires zero devices and an exact upgrade bundle" >&2; exit 2; }
+[[ "${test_mode}" != legacy-handoff || "${PRODIGY_STORAGE_HANDOFF_EXPECTED_RUNTIME_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || { echo "error: legacy handoff requires the sealed successor runtime hash" >&2; exit 2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/prodigy_dev_discombobulator_artifact_helpers.sh"
@@ -65,6 +69,8 @@ archive_workspace=0
 
 cleanup()
 {
+   local status=$?
+   trap - EXIT
    set +e
 
    if [[ "${archive_workspace}" -eq 1 && -d "${workspace_root}" ]]
@@ -77,10 +83,15 @@ cleanup()
 
    if [[ "${cluster_created}" -eq 1 ]]
    then
-      env \
+      if ! env \
          PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
          "${MOTHERSHIP_BIN}" removeCluster "${cluster_name}" \
-         >"${remove_log}" 2>&1 || true
+         >"${remove_log}" 2>&1
+      then
+         echo "FAIL: Mothership removal failed; owned state retained" >&2
+         status=1
+         keep_tmp=1
+      fi
    fi
 
    if [[ "${keep_tmp}" -eq 1 ]]
@@ -89,6 +100,7 @@ cleanup()
    else
       rm -rf "${tmpdir}"
    fi
+   exit "${status}"
 }
 trap cleanup EXIT
 
@@ -101,13 +113,26 @@ then
    version_id=1
 fi
 deployment_id=$(( (application_id << 48) | version_id ))
+machine_count=1
+application_type=stateless
+is_stateful=false
+expected_healthy=1
+handoff_id=""
+if [[ "${test_mode}" == legacy-handoff ]]
+then
+   machine_count=3
+   expected_healthy=3
+   application_type=stateful
+   is_stateful=true
+   handoff_id="$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+fi
 
 read -r -d '' CREATE_REQUEST <<EOF || true
 {
   "name": "${cluster_name}",
   "deploymentMode": "test",
   "autoscaleIntervalSeconds": 3,
-  "nBrains": 1,
+  "nBrains": ${machine_count},
   "machineSchemas": [
     {
       "schema": "bootstrap",
@@ -117,7 +142,7 @@ read -r -d '' CREATE_REQUEST <<EOF || true
   ],
   "test": {
     "workspaceRoot": "${workspace_root}",
-    "machineCount": 1,
+    "machineCount": ${machine_count},
     "machineStorageMB": 8192,
     "storageDeviceCount": ${storage_devices},
     "storageDeviceMB": 1024,
@@ -178,6 +203,10 @@ COPY {bin} ./$(basename "${PINGPONG_BIN}") /root/pingpong_container
 SURVIVE /root/pingpong_container
 EOF
 prodigy_dev_write_common_prodigy_assets "${discombobulator_file}"
+if [[ "${test_mode}" == legacy-handoff ]]
+then
+   printf 'ENV PINGPONG_STORAGE_HANDOFF_MODE=seed\nENV PINGPONG_STORAGE_HANDOFF_ID=%s\n' "${handoff_id}" >> "${discombobulator_file}"
+fi
 cat >> "${discombobulator_file}" <<'EOF'
 EXECUTE ["/root/pingpong_container"]
 EOF
@@ -198,7 +227,7 @@ plan_json="${tmpdir}/storage.plan.json"
 cat > "${plan_json}" <<EOF
 {
   "config": {
-    "type": "ApplicationType::stateless",
+    "type": "ApplicationType::${application_type}",
     "applicationID": ${application_id},
     "versionID": ${version_id},
     "architecture": "${target_arch}",
@@ -212,7 +241,13 @@ cat > "${plan_json}" <<EOF
   },
   "useHostNetworkNamespace": ${host_network},
   "minimumSubscriberCapacity": 1024,
-  "isStateful": false,
+  "isStateful": ${is_stateful},
+  "stateful": {
+    "clientPrefix": 601, "siblingPrefix": 602, "cousinPrefix": 603,
+    "seedingPrefix": 604, "shardingPrefix": 605,
+    "allowUpdateInPlace": true, "seedingAlways": false,
+    "neverShard": true, "allMasters": false
+  },
   "stateless": {
     "nBase": 1,
     "maxPerRackRatio": 1.0,
@@ -254,7 +289,7 @@ do
       "${MOTHERSHIP_BIN}" applicationReport "${cluster_name}" Nametag \
       >"${application_log}" 2>&1
    then
-      if rg -q '^[[:space:]]*nHealthy:[[:space:]]*1$' "${application_log}"
+      if rg -q "^[[:space:]]*nHealthy:[[:space:]]*${expected_healthy}$" "${application_log}"
       then
          healthy=1
          break
@@ -270,6 +305,117 @@ then
    echo "FAIL: storage deployment never became healthy"
    sed -n '1,240p' "${application_log}" || true
    exit 1
+fi
+
+if [[ "${test_mode}" == legacy-handoff ]]
+then
+   archive_workspace=1
+   observe_handoff()
+   {
+      python3 - "${manifest_path}" "${PINGPONG_BIN}" "${handoff_id}" "$1" "${tmpdir}" "${PRODIGY_STORAGE_HANDOFF_EXPECTED_RUNTIME_SHA256}" <<'PY'
+import hashlib, json, pathlib, re, sys
+manifest, executable, identity, phase, output, runtime_hash = sys.argv[1:]
+root = pathlib.Path(output)
+nodes = json.loads(pathlib.Path(manifest).read_text())['nodes']
+expected_binary = hashlib.sha256(pathlib.Path(executable).read_bytes()).hexdigest()
+before = json.loads((root / 'handoff-before.json').read_text()) if phase != 'before' else None
+records = []
+for node in nodes:
+    parent = pathlib.Path('/proc') / str(node['pid'])
+    if phase != 'before':
+        assert hashlib.sha256((parent / 'exe').read_bytes()).hexdigest() == runtime_hash, 'machine has wrong runtime bytes'
+    children = (parent / 'task' / str(node['pid']) / 'children').read_text().split()
+    for pid in children:
+        child = pathlib.Path('/proc') / pid
+        try:
+            if (child / 'exe').readlink().name != 'pingpong_container':
+                continue
+        except FileNotFoundError:
+            continue
+        assert hashlib.sha256((child / 'exe').read_bytes()).hexdigest() == expected_binary
+        uuid = re.search(r'/containers\.slice/([0-9]+)\.slice/leaf(?:\n|$)', (child / 'cgroup').read_text())[1]
+        live = child / 'root/storage'
+        metadata = live.stat()
+        file = live / 'kvdb/handoff-sparse'
+        with file.open('rb') as stream:
+            assert stream.read(32) == identity.encode()
+            stream.seek(1 << 40); middle = stream.read(1)
+            stream.seek((1 << 41) - 1); assert stream.read(1) == b'Z'
+        assert file.stat().st_size == 1 << 41
+        assert middle == (b'A' if phase == 'after' else b'M')
+        original = parent / 'root/containers' / uuid / 'rootfs/storage'
+        if phase in ('before', 'upgraded'):
+            assert (original.stat().st_dev, original.stat().st_ino) == (metadata.st_dev, metadata.st_ino)
+        else:
+            target = parent / 'root/containers/storage' / uuid
+            assert (target.stat().st_dev, target.stat().st_ino) == (metadata.st_dev, metadata.st_ino)
+            assert file.stat().st_uid == metadata.st_uid
+            assert any(line.split()[4] == '/storage' for line in (child / 'mountinfo').read_text().splitlines())
+        records.append(dict(machineIndex=node['index'], parentPID=node['pid'], pid=int(pid), uuid=uuid,
+                            device=metadata.st_dev, inode=metadata.st_ino, uid=metadata.st_uid,
+                            applicationSHA256=expected_binary))
+assert len(records) == 3, f'expected three real fixture replicas, got {len(records)}'
+if phase == 'upgraded':
+    assert sorted((r['pid'], r['uuid'], r['device'], r['inode']) for r in records) == \
+           sorted((r['pid'], r['uuid'], r['device'], r['inode']) for r in before), 'bundle upgrade changed live app/storage owners'
+if phase == 'after':
+    assert not ({r['pid'] for r in before} & {r['pid'] for r in records})
+    for old in before:
+        node = next(n for n in nodes if n['index'] == old['machineIndex'])
+        owner = pathlib.Path('/proc') / str(node['pid']) / 'root/containers'
+        source = owner / old['uuid'] / 'rootfs/storage'
+        assert (source.stat().st_dev, source.stat().st_ino) == (old['device'], old['inode'])
+        with (source / 'kvdb/handoff-sparse').open('rb') as stream:
+            assert stream.read(32) == identity.encode()
+            stream.seek(1 << 40); assert stream.read(1) == b'M', 'rollback source was modified'
+        receipts = list((owner / '.storage-handoffs').glob(old['uuid'] + '-*/capture.txt'))
+        assert len(receipts) == 1
+        receipt = receipts[0].read_text()
+        assert 'method=reflink-always\n' in receipt and 'sourceRetained=true\n' in receipt
+        assert 'sourceInode=' + str(old['inode']) + '\n' in receipt
+        (root / ('capture-' + old['uuid'] + '.txt')).write_text(receipt)
+(root / ('handoff-' + phase + '.json')).write_text(json.dumps(records, indent=2) + '\n')
+print('HANDOFF_OBSERVATION_PASS', phase, 'replicas=3')
+PY
+   }
+   observe_handoff before
+   env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+      "${MOTHERSHIP_BIN}" updateProdigy "${cluster_name}" "${upgrade_bundle}" >"${tmpdir}/upgrade.log" 2>&1
+   observe_handoff upgraded
+   # A second Discombobulator artifact reads the data before signaling healthy;
+   # the harness never seeds or modifies a live container's storage.
+   sed 's/PINGPONG_STORAGE_HANDOFF_MODE=seed/PINGPONG_STORAGE_HANDOFF_MODE=verify/' \
+      "${discombobulator_file}" > "${artifact_project_dir}/Verify.DiscombobuFile"
+   prodigy_dev_run_discombobulator_build "${artifact_project_dir}" "${artifact_project_dir}/Verify.DiscombobuFile" \
+      "${tmpdir}/verify.container.zst" "bin=$(dirname "${PINGPONG_BIN}")" "ebpf=$(dirname "${PRODIGY_BIN}")"
+   python3 - "${plan_json}" "${tmpdir}/verify.plan.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as stream:
+    plan = json.load(stream)
+plan['config']['versionID'] += 1
+with open(sys.argv[2], 'w') as stream:
+    json.dump(plan, stream)
+PY
+   env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+      "${MOTHERSHIP_BIN}" deploy "${cluster_name}" "$(cat "${tmpdir}/verify.plan.json")" \
+      "${tmpdir}/verify.container.zst" >"${tmpdir}/verify-deploy.log" 2>&1
+   healthy=0
+   for _ in $(seq 1 120)
+   do
+      if env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+         "${MOTHERSHIP_BIN}" applicationReport "${cluster_name}" Nametag >"${tmpdir}/verify-report.log" 2>&1 &&
+         rg -q "versionID: $((version_id + 1))$" "${tmpdir}/verify-report.log" &&
+         rg -q '^[[:space:]]*nHealthy:[[:space:]]*3$' "${tmpdir}/verify-report.log"
+      then
+         healthy=1
+         break
+      fi
+      sleep 0.5
+   done
+   [[ "${healthy}" == 1 ]] || { echo "FAIL: successor did not become healthy" >&2; exit 1; }
+   observe_handoff after
+   echo "PASS: worker-preserving bundle upgrade and lifecycle-quiesced legacy storage handoff with logical readback"
+   exit 0
 fi
 
 # A host-side storage filesystem alone does not prove the application mounted

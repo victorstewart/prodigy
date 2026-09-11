@@ -3334,11 +3334,11 @@ public:
     }
     else if (resumeAfterShutdown)
     {
-      if (destroyAfterWait)
-      {
-        ContainerManager::destroyContainer(container);
-      }
+      // The replacement coroutine owns quiesced storage capture before resource
+      // teardown can unmount storage or delete the original artifact root.
+      container->resumeAfterShutdown = nullptr;
       resumeAfterShutdown->co_consume();
+      return; // The resumed owner may already have destroyed this container.
     }
     else if (destroyAfterWait)
     {
@@ -4318,11 +4318,8 @@ public:
           PRODIGY_DEBUG_FLUSH();
 
           ContainerManager::spinContainer(plan, replaceContainerUUID, metricPolicy);
-
-          if (replaceContainerUUID > 0)
-          {
-            Message::construct(brain->wBuffer, NeuronTopic::killContainer, replaceContainerUUID);
-          }
+          // Replacement is asynchronous and can reject before stopping the old
+          // owner. Its destruction finalizer, not dispatch, acknowledges removal.
 
           break;
         }

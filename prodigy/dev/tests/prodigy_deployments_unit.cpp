@@ -75,8 +75,12 @@ public:
 class TestNeuron final : public NeuronBase {
 public:
 
+  uint32_t killAckCount = 0;
+  uint32_t poppedCount = 0;
+  uint128_t lastKillAck = 0;
   void pushContainer(Container *) override {}
-  void popContainer(Container *) override {}
+  void popContainer(Container *) override { ++poppedCount; }
+  void queueContainerKillAck(uint128_t uuid) override { ++killAckCount; lastKillAck = uuid; }
   bool ensureHostNetworkingReady(String * = nullptr) override { return true; }
   void downloadContainer(CoroutineStack *, uint64_t) override {}
 };
@@ -472,10 +476,10 @@ public:
 
   String path = {};
 
-  bool create(void)
+  bool create(const char *parent = "/tmp")
   {
-    char scratch[] = "/tmp/prodigy-deployments-unit-XXXXXX";
-    char *created = ::mkdtemp(scratch);
+    std::string scratch = std::string(parent) + "/prodigy-deployments-unit-XXXXXX";
+    char *created = ::mkdtemp(scratch.data());
     if (created == nullptr)
     {
       return false;
@@ -795,6 +799,94 @@ static void testStorageParentTraversal(TestSuite& suite)
 int main(void)
 {
   TestSuite suite;
+  if (getenv("PRODIGY_TEST_STORAGE_REPLACEMENT_ONLY") != nullptr)
+  {
+    // Pure admission/finalization state plus mkdtemp-owned file moves. No Ring,
+    // stop/destroy/create, host runtime paths, mounts or cgroup writes.
+    Container predecessor;
+    ContainerPlan successor;
+    predecessor.plan.uuid = 11;
+    successor.uuid = 12;
+    predecessor.plan.config.applicationID = 6;
+    successor.config.applicationID = 6;
+    predecessor.pid = 123;
+    predecessor.waitidPending = true;
+    predecessor.plan.config.type = ApplicationType::stateful;
+    String failure;
+    auto ready = [&] { return ContainerManager::replacementPredecessorReady(&predecessor, successor, &failure); };
+    suite.expect(ready(), "replacement_live_predecessor_admitted");
+    suite.expect(!ContainerManager::replacementPredecessorReady(nullptr, successor, &failure),
+                 "replacement_missing_predecessor_cannot_launch_empty_successor");
+    predecessor.killedOnPurpose = true;
+    predecessor.waitidPending = false;
+    suite.expect(!ready() && predecessor.resumeAfterShutdown == nullptr && !predecessor.pendingKillAckToBrain,
+                 "replacement_completed_exit_rejected_without_wait_or_ack");
+    predecessor.waitidPending = true;
+    suite.expect(!ready(), "replacement_already_stopping_owner_not_taken_over");
+    predecessor.killedOnPurpose = false;
+    CoroutineStack occupied;
+    predecessor.resumeAfterShutdown = &occupied;
+    suite.expect(!ready() && predecessor.resumeAfterShutdown == &occupied, "replacement_existing_wait_owner_preserved");
+    predecessor.resumeAfterShutdown = nullptr;
+    successor.config.applicationID = 1;
+    suite.expect(!ready(), "replacement_foreign_application_rejected");
+    successor.config.applicationID = predecessor.plan.config.applicationID;
+    suite.expect(ready(), "replacement_unmodified_live_owner_still_admissible");
+
+    // Exercise the actual finalizer with storage auto-destruction disabled and
+    // an in-memory Neuron transport. Neither stop() nor destroyContainer() runs.
+    NeuronBase *savedNeuron = thisNeuron;
+    bool savedAutoDestroy = ContainerStore::autoDestroy;
+    ContainerStore::autoDestroy = false;
+    TestNeuron neuron;
+    thisNeuron = &neuron;
+    Container *retiring = new Container();
+    retiring->plan.uuid = 15;
+    ContainerRegistry::retain(retiring->plan.config.deploymentID());
+    retiring->pendingKillAckToBrain = true;
+    ContainerManager::finalizeContainerDestroyIfReady(retiring);
+    suite.expect(neuron.killAckCount == 0, "replacement_no_ack_before_destroy");
+    retiring->pendingDestroy = true;
+    retiring->waitidPending = true;
+    retiring->destroyCloseCompleted = true;
+    ContainerManager::finalizeContainerDestroyIfReady(retiring);
+    suite.expect(neuron.killAckCount == 0, "replacement_no_ack_before_exit");
+    retiring->waitidPending = false;
+    retiring->destroyCloseCompleted = false;
+    ContainerManager::finalizeContainerDestroyIfReady(retiring);
+    suite.expect(neuron.killAckCount == 0, "replacement_no_ack_before_close");
+    retiring->destroyCloseCompleted = true;
+    ContainerManager::finalizeContainerDestroyIfReady(retiring);
+    suite.expect(neuron.killAckCount == 1 && neuron.lastKillAck == 15 && neuron.poppedCount == 1,
+                 "replacement_exactly_one_ack_at_actual_finalization");
+    thisNeuron = savedNeuron;
+    ContainerStore::autoDestroy = savedAutoDestroy;
+
+    TemporaryDirectory fixture;
+    suite.expect(fixture.create(".run"), "replacement_move_fixture_created");
+    if (fixture.path.size() == 0) return EXIT_FAILURE;
+    auto root = std::filesystem::canonical(filesystemPathFromString(fixture.path));
+    auto first = root / "first";
+    auto second = root / "second";
+    suite.expect(writeFileFixture(first, "first-value") && writeFileFixture(second, "second-value"),
+                 "replacement_move_sources_created");
+    using Paths = std::vector<std::pair<std::filesystem::path, std::filesystem::path>>;
+    suite.expect(!ContainerManager::renameStorageArtifactPaths({}, &failure), "replacement_no_storage_not_success");
+    suite.expect(!ContainerManager::renameStorageArtifactPaths(Paths{{first, second}}, &failure) &&
+                 std::filesystem::exists(first) && std::filesystem::exists(second), "replacement_existing_target_not_overwritten");
+    // The second rename fails only after the first succeeds. Rollback must put
+    // the first source back, not report a partial set as complete.
+    suite.expect(!ContainerManager::renameStorageArtifactPaths(
+                     Paths{{first, root / "first-moved"}, {second, root / "missing-parent/second"}}, &failure) &&
+                 std::filesystem::exists(first) && std::filesystem::exists(second) &&
+                 !std::filesystem::exists(root / "first-moved"), "replacement_partial_move_restores_original_paths");
+    suite.expect(ContainerManager::renameStorageArtifactPaths(
+                     Paths{{first, root / "first-moved"}, {second, root / "second-moved"}}, &failure) &&
+                 !std::filesystem::exists(first) && !std::filesystem::exists(second),
+                 "replacement_retry_moves_complete_set_after_failure");
+    dprintf(STDOUT_FILENO, "storage_replacement_focused failed=%d\n", suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (getenv("PRODIGY_TEST_STORAGE_HANDOFF_ONLY") != nullptr)
   {
     // No Ring, namespaces or absolute runtime roots: the only destructive
@@ -837,6 +929,111 @@ int main(void)
                  std::filesystem::exists(ordinaryArtifact) == false,
                  "handoff_empty_mountpoint_ordinary_cleanup_preserved");
     dprintf(STDOUT_FILENO, "storage_handoff_focused failed=%d\n", suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (getenv("PRODIGY_TEST_STORAGE_REFLINK_ONLY") != nullptr)
+  {
+    // Ordinary file operations only, rooted in this worktree's .run. No Ring,
+    // runtime roots, mounts, BPF, namespace or cgroup operations are invoked.
+    TemporaryDirectory fixture;
+    suite.expect(fixture.create(".run"), "reflink_fixture_created");
+    if (fixture.path.size() == 0) return EXIT_FAILURE;
+    auto root = std::filesystem::canonical(filesystemPathFromString(fixture.path));
+    auto source = root / "source";
+    auto sparse = source / "sparse";
+    suite.expect(writeFileFixture(source / "small", "known-source-data"), "reflink_source_created");
+    constexpr off_t sparseSize = off_t(2) * 1024 * 1024 * 1024 * 1024;
+    int file = open(sparse.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    suite.expect(file >= 0, "reflink_sparse_file_created");
+    if (file < 0) return EXIT_FAILURE;
+    suite.expect(ftruncate(file, sparseSize) == 0 && pwrite(file, "a", 1, 0) == 1 &&
+                 pwrite(file, "m", 1, sparseSize / 2) == 1 && pwrite(file, "z", 1, sparseSize - 1) == 1 &&
+                 fsync(file) == 0, "reflink_sparse_fixture_three_distant_values");
+    close(file);
+    auto cgroup = root / "fixture-events";
+    suite.expect(writeFileFixture(cgroup / "cgroup.events", "populated 0\nfrozen 0\n"), "reflink_event_fixture_created");
+    Container predecessor;
+    predecessor.pid = 123;
+    predecessor.infop.si_pid = 123;
+    predecessor.killedOnPurpose = true;
+    predecessor.plan.uuid = 11;
+    predecessor.cgroup = open(cgroup.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ContainerPlan successor;
+    successor.uuid = 12;
+    successor.fragment = 23;
+    successor.config.runAsID = 1000;
+    uint32_t mappedBase = 0, mappedID = 0;
+    suite.expect(prodigyDeriveContainerHostIDs(successor, mappedBase, mappedID), "reflink_successor_mapping_valid");
+    struct stat identity = {};
+    suite.expect(stat(source.c_str(), &identity) == 0, "reflink_source_identity_observed");
+    String sourcePath, handoffRoot, staged, failure;
+    sourcePath.assign(source.c_str());
+    handoffRoot.assign((root / "handoffs").c_str());
+    auto stage = [&] {
+      return ContainerManager::stageQuiescedLegacyStorage(&predecessor, successor, sourcePath, identity,
+                                                         staged, &failure, handoffRoot);
+    };
+    predecessor.waitidPending = true;
+    suite.expect(!stage() && !std::filesystem::exists(root / "handoffs"), "reflink_live_wait_cannot_capture");
+    predecessor.waitidPending = false;
+    suite.expect(writeFileFixture(cgroup / "cgroup.events", "populated 1\nfrozen 0\n"), "reflink_populated_fixture");
+    suite.expect(!stage() && !std::filesystem::exists(root / "handoffs"), "reflink_live_cgroup_cannot_capture");
+    suite.expect(writeFileFixture(cgroup / "cgroup.events", "populated 0\nfrozen 0\n"), "reflink_empty_fixture_restored");
+    ++identity.st_ino;
+    suite.expect(!stage(), "reflink_changed_source_identity_rejected");
+    --identity.st_ino;
+    bool copied = stage();
+    suite.expect(copied, "reflink_quiesced_sparse_clone_succeeds");
+    if (copied)
+    {
+      auto target = filesystemPathFromString(staged) / "sparse";
+      struct stat copiedStat = {}, originalStat = {};
+      suite.expect(stat(target.c_str(), &copiedStat) == 0 && stat(sparse.c_str(), &originalStat) == 0 &&
+                   copiedStat.st_size == sparseSize && copiedStat.st_blocks * 512 < 1024 * 1024 &&
+                   copiedStat.st_uid == mappedID && copiedStat.st_gid == mappedID &&
+                   originalStat.st_uid == identity.st_uid,
+                   "reflink_sparse_size_allocation_and_distinct_mapped_ownership");
+      int targetDirectory = open(filesystemPathFromString(staged).c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      pid_t reader = fork();
+      if (reader == 0)
+      {
+        if (setgroups(0, nullptr) != 0 || setresgid(mappedID, mappedID, mappedID) != 0 ||
+            setresuid(mappedID, mappedID, mappedID) != 0) _exit(2);
+        int copiedFile = openat(targetDirectory, "sparse", O_RDWR | O_CLOEXEC);
+        char first = 0, middle = 0, last = 0;
+        if (copiedFile < 0 || pread(copiedFile, &first, 1, 0) != 1 ||
+            pread(copiedFile, &middle, 1, sparseSize / 2) != 1 || pread(copiedFile, &last, 1, sparseSize - 1) != 1 ||
+            first != 'a' || middle != 'm' || last != 'z' || pwrite(copiedFile, "x", 1, sparseSize / 2) != 1) _exit(3);
+        close(copiedFile);
+        _exit(0);
+      }
+      int status = 0;
+      suite.expect(reader > 0 && waitpid(reader, &status, 0) == reader && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                   "reflink_actual_mapped_uid_reads_and_writes_distant_sparse_data");
+      close(targetDirectory);
+      file = open(sparse.c_str(), O_RDONLY | O_CLOEXEC);
+      char middle = 0;
+      suite.expect(file >= 0 && pread(file, &middle, 1, sparseSize / 2) == 1 && middle == 'm',
+                   "reflink_successor_write_preserves_original_rollback_bytes");
+      if (file >= 0) close(file);
+      suite.expect(!stage(), "reflink_retry_does_not_overwrite_existing_capture");
+    }
+    // Cross-filesystem reflink rejection must remain a failure, with the full
+    // sparse original intact. It must not degrade to a dense fallback copy.
+    TemporaryDirectory unsupported;
+    suite.expect(unsupported.create(), "reflink_unsupported_destination_fixture_created");
+    if (unsupported.path.size() > 0)
+    {
+      handoffRoot.assign(unsupported.path);
+      successor.uuid = 13;
+      suite.expect(!stage(), "reflink_unsupported_backend_does_not_dense_copy");
+      struct stat original = {};
+      suite.expect(stat(sparse.c_str(), &original) == 0 && original.st_size == sparseSize &&
+                   original.st_blocks * 512 < 1024 * 1024, "reflink_failure_preserves_sparse_original");
+    }
+    close(predecessor.cgroup);
+    predecessor.cgroup = -1;
+    dprintf(STDOUT_FILENO, "storage_reflink_focused failed=%d\n", suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   testStorageParentTraversal(suite);

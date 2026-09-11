@@ -8171,7 +8171,61 @@ public:
     }
   }
 
-  static void renameContainerStorageArtifacts(uint128_t oldUUID, uint128_t newUUID)
+  static bool renameStorageArtifactPaths(
+      const std::vector<std::pair<std::filesystem::path, std::filesystem::path>>& paths,
+      String *failureReport = nullptr)
+  {
+    auto fail = [&](const char *message) {
+      if (failureReport) failureReport->assign(message);
+      return false;
+    };
+    if (paths.empty()) return fail("predecessor external storage is missing");
+    // Resolve the whole set first. Never replace a successor's existing data,
+    // even when that destination happens to be an empty directory.
+    for (const auto& [source, target] : paths)
+    {
+      struct stat metadata = {};
+      if (source == target || lstat(source.c_str(), &metadata) != 0 ||
+          (!S_ISDIR(metadata.st_mode) && !S_ISREG(metadata.st_mode)))
+        return fail("storage move source is missing or unsupported");
+      if (lstat(target.c_str(), &metadata) == 0 || errno != ENOENT)
+        return fail("storage move destination already exists or is uncertain");
+    }
+    auto syncParent = [](const std::filesystem::path& path) {
+      int fd = open(path.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      bool synced = fd >= 0 && fsync(fd) == 0;
+      if (fd >= 0) close(fd);
+      return synced;
+    };
+    size_t moved = 0;
+    bool complete = true;
+    for (const auto& [source, target] : paths)
+    {
+      if (renameat2(AT_FDCWD, source.c_str(), AT_FDCWD, target.c_str(), RENAME_NOREPLACE) != 0)
+      {
+        complete = false;
+        break;
+      }
+      ++moved;
+      if (!syncParent(source) || !syncParent(target))
+      {
+        complete = false;
+        break;
+      }
+    }
+    if (complete) return true;
+    bool restored = true;
+    while (moved > 0)
+    {
+      const auto& [source, target] = paths[--moved];
+      if (renameat2(AT_FDCWD, target.c_str(), AT_FDCWD, source.c_str(), RENAME_NOREPLACE) != 0 ||
+          !syncParent(source) || !syncParent(target)) restored = false;
+    }
+    return fail(restored ? "storage move failed; original paths restored" :
+                          "storage move and rollback failed; retained paths require recovery");
+  }
+
+  static bool renameContainerStorageArtifacts(uint128_t oldUUID, uint128_t newUUID, String *failureReport = nullptr)
   {
     String oldName;
     String newName;
@@ -8182,10 +8236,9 @@ public:
     String newRootPath;
     prodigyContainerStorageRootPathForName(oldName, oldRootPath);
     prodigyContainerStorageRootPathForName(newName, newRootPath);
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> paths;
     if (pathExists(oldRootPath))
-    {
-      (void)rename(oldRootPath.c_str(), newRootPath.c_str());
-    }
+      paths.emplace_back(prodigyFilesystemPathFromString(oldRootPath), prodigyFilesystemPathFromString(newRootPath));
 
     Vector<String> configuredMountPaths;
     collectConfiguredContainerStorageMountPaths(configuredMountPaths);
@@ -8197,9 +8250,10 @@ public:
       prodigyContainerStorageBackingFilePathForMount(mountPath, newName, newBackingPath);
       if (pathExists(oldBackingPath))
       {
-        (void)rename(oldBackingPath.c_str(), newBackingPath.c_str());
+        paths.emplace_back(prodigyFilesystemPathFromString(oldBackingPath), prodigyFilesystemPathFromString(newBackingPath));
       }
     }
+    return renameStorageArtifactPaths(paths, failureReport);
   }
 
   static bool seed_root_cgroupv2_subtree_controllers(String *failureReport = nullptr)
@@ -9181,6 +9235,142 @@ public:
     }
     bool empty = std::filesystem::is_empty(root / "storage", error);
     return error || empty == false;
+  }
+
+  static bool replacementPredecessorReady(const Container *predecessor, const ContainerPlan& successor,
+                                          String *failureReport = nullptr)
+  {
+    if (predecessor == nullptr || predecessor->pid <= 0 || !predecessor->waitidPending ||
+        predecessor->killedOnPurpose || predecessor->resumeAfterShutdown != nullptr ||
+        predecessor->plan.uuid == successor.uuid ||
+        predecessor->plan.config.applicationID != successor.config.applicationID ||
+        predecessor->plan.config.type == ApplicationType::task)
+    {
+      if (failureReport) failureReport->assign("replacement requires the identified live predecessor with an unclaimed exit wait"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  // Called only after the lifecycle wait has observed the predecessor exit.
+  // A reflink is mandatory: HSE files can be multi-terabyte sparse files while
+  // consuming only kilobytes. Never silently fall back to a dense copy.
+  static bool stageQuiescedLegacyStorage(
+      Container *predecessor,
+      const ContainerPlan& successor,
+      const String& sourcePath,
+      const struct stat& sourceIdentity,
+      String& stagedPayload,
+      String *failureReport = nullptr,
+      const String& handoffRoot = "/containers/.storage-handoffs"_ctv)
+  {
+    auto fail = [&](const char *message) {
+      if (failureReport) failureReport->assign(message);
+      return false;
+    };
+    if (predecessor == nullptr || predecessor->waitidPending ||
+        predecessor->infop.si_pid != predecessor->pid ||
+        predecessor->infop.si_pid <= 0 || predecessor->killedOnPurpose == false ||
+        predecessor->cgroup < 0)
+    {
+      return fail("legacy storage handoff requires an observed lifecycle exit");
+    }
+    String events;
+    Filesystem::openReadAtClose(predecessor->cgroup, "cgroup.events"_ctv, events);
+    if (std::string_view(reinterpret_cast<const char *>(events.data()), events.size()).find("populated 0\n") == std::string_view::npos)
+    {
+      return fail("legacy storage handoff requires an empty predecessor cgroup");
+    }
+    struct stat current = {};
+    String source = sourcePath;
+    if (lstat(source.c_str(), &current) != 0 || S_ISDIR(current.st_mode) == false ||
+        current.st_dev != sourceIdentity.st_dev || current.st_ino != sourceIdentity.st_ino)
+    {
+      return fail("legacy storage source identity changed after lifecycle exit");
+    }
+    uint32_t userID = 0, executionID = 0;
+    if (prodigyDeriveContainerHostIDs(successor, userID, executionID) == false)
+    {
+      return fail("legacy storage successor identity is invalid");
+    }
+    String owner;
+    owner.snprintf<"{}/{itoa}-{itoa}"_ctv>(handoffRoot, predecessor->plan.uuid, successor.uuid);
+    String payload;
+    payload.snprintf<"{}/payload"_ctv>(owner);
+    if (ensureDirectoryTree(prodigyFilesystemPathFromString(handoffRoot), failureReport) == false ||
+        mkdir(owner.c_str(), 0700) != 0)
+    {
+      return fail("legacy storage handoff owner already exists or cannot be created");
+    }
+
+    // Reject ambiguous entries before invoking the existing host command owner.
+    // Only the dead predecessor's single-identity regular-file tree is imported.
+    const auto sourceRoot = prodigyFilesystemPathFromString(source);
+    std::vector<std::filesystem::path> entries = {sourceRoot};
+    std::error_code error;
+    for (std::filesystem::recursive_directory_iterator it(sourceRoot, error), end; it != end && !error; it.increment(error))
+    {
+      if (it.depth() > 32 || entries.size() >= 100'000)
+        return fail("legacy storage tree exceeds the bounded handoff contract");
+      entries.push_back(it->path());
+    }
+    if (error) return fail("legacy storage source tree could not be enumerated");
+    for (const auto& entry : entries)
+    {
+      struct stat metadata = {};
+      if (lstat(entry.c_str(), &metadata) != 0 ||
+          (!S_ISREG(metadata.st_mode) && !S_ISDIR(metadata.st_mode)) ||
+          (metadata.st_mode & 07000) != 0 ||
+          metadata.st_uid != sourceIdentity.st_uid || metadata.st_gid != sourceIdentity.st_gid ||
+          metadata.st_dev != sourceIdentity.st_dev)
+        return fail("legacy storage contains an unsupported owner, mount or entry");
+    }
+    std::vector<char *> argv = {
+        (char *)"timeout", (char *)"--signal=TERM", (char *)"--kill-after=5s", (char *)"120s",
+        (char *)"cp", (char *)"--archive", (char *)"--reflink=always", (char *)"--no-target-directory",
+        (char *)"--", (char *)source.c_str(), (char *)payload.c_str(), nullptr};
+    if (runExternalCommand("legacy_storage_reflink", "timeout", argv, nullptr, failureReport) == false)
+      return false;
+
+    uint64_t files = 0, logicalBytes = 0;
+    // Children are checked and synced before their containing directories.
+    for (auto it = entries.rbegin(); it != entries.rend(); ++it)
+    {
+      auto relative = it->lexically_relative(sourceRoot);
+      auto destination = prodigyFilesystemPathFromString(payload) / relative;
+      struct stat original = {}, copied = {};
+      if (lstat(it->c_str(), &original) != 0 || lstat(destination.c_str(), &copied) != 0 ||
+          (original.st_mode & 07777) != (copied.st_mode & 07777) ||
+          (original.st_mode & S_IFMT) != (copied.st_mode & S_IFMT) ||
+          (S_ISREG(original.st_mode) && original.st_size != copied.st_size))
+        return fail("legacy storage clone metadata does not match its source");
+      int descriptor = open(destination.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW |
+                                                (S_ISDIR(copied.st_mode) ? O_DIRECTORY : 0));
+      if (descriptor < 0) return fail("legacy storage clone could not be opened for verification");
+      bool ready = fchown(descriptor, executionID, executionID) == 0 &&
+                   fchmod(descriptor, original.st_mode & 0777) == 0 && fsync(descriptor) == 0;
+      close(descriptor);
+      if (!ready) return fail("legacy storage clone ownership or durability failed");
+      if (S_ISREG(original.st_mode)) { ++files; logicalBytes += uint64_t(original.st_size); }
+    }
+    String receipt;
+    receipt.snprintf<"sourceUUID={itoa}\nsuccessorUUID={itoa}\nsourcePID={itoa}\nsourceDevice={itoa}\nsourceInode={itoa}\nsourceUID={itoa}\ntargetUID={itoa}\nfiles={itoa}\nlogicalBytes={itoa}\nterminationCode={itoa}\nterminationStatus={itoa}\nmethod=reflink-always\nsourceRetained=true\nlogicalReadback=pending\n"_ctv>(
+        predecessor->plan.uuid, successor.uuid, uint64_t(predecessor->pid),
+        uint64_t(sourceIdentity.st_dev), uint64_t(sourceIdentity.st_ino),
+        uint64_t(sourceIdentity.st_uid), uint64_t(executionID), files, logicalBytes,
+        uint64_t(predecessor->infop.si_code), uint64_t(predecessor->infop.si_status));
+    if (writeFailureArtifactTextFile(prodigyFilesystemPathFromString(owner) / "capture.txt", receipt, failureReport) == false)
+      return false;
+    bool durable = true;
+    for (String directory : {owner, handoffRoot})
+    {
+      int ownerFD = open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+      durable = ownerFD >= 0 && fsync(ownerFD) == 0 && durable;
+      if (ownerFD >= 0) close(ownerFD);
+    }
+    if (!durable) return fail("legacy storage capture directory sync failed");
+    stagedPayload.assign(payload);
+    return true;
   }
 
   static bool cleanupFailedCreateArtifactRoot(Container *container, String *failureReport = nullptr)
@@ -11757,30 +11947,6 @@ public:
       co_return;
     }
 
-    if (replaceContainerUUID > 0)
-    {
-      if (auto it = thisNeuron->containers.find(replaceContainerUUID); it != thisNeuron->containers.end())
-      {
-        // updating in place
-        CoroutineStack *coro = new CoroutineStack();
-
-        Container *old = it->second;
-        const bool hasStorage = old->plan.config.storageMB > 0;
-        old->deleteStorageOnCleanUp = false;
-        old->resumeAfterShutdown = coro;
-        old->stop();
-
-        co_await coro->suspend();
-
-        delete coro;
-
-        if (hasStorage)
-        {
-          renameContainerStorageArtifacts(replaceContainerUUID, plan.uuid);
-        }
-      }
-    }
-
     uint64_t deploymentID = plan.config.deploymentID();
     bool systemContainer = plan.isSystemContainer();
     String compressedContainerPath = systemContainer
@@ -11835,6 +12001,91 @@ public:
       ContainerRegistry::retain(deploymentID);
     }
 
+    // Verify the intended artifact before stopping any predecessor. A missing
+    // or rejected successor must never retire the application's data owner.
+    String stagedLegacyPayload;
+    if (replaceContainerUUID > 0)
+    {
+      auto it = thisNeuron->containers.find(replaceContainerUUID);
+      String replacementFailure;
+      if (!replacementPredecessorReady(it == thisNeuron->containers.end() ? nullptr : it->second,
+                                       plan, &replacementFailure))
+      {
+        reportSpinContainerFailure(plan, replacementFailure);
+        co_return;
+      }
+      {
+        Container *old = it->second;
+        const bool hasStorage = old->plan.config.storageMB > 0;
+        String legacySource;
+        struct stat legacyIdentity = {};
+        if (hasStorage)
+        {
+          String originalRoot;
+          originalRoot.snprintf<"/containers/{}/rootfs/storage"_ctv>(old->name);
+          String liveRoot;
+          liveRoot.snprintf<"/proc/{itoa}/root/storage"_ctv>(uint64_t(old->pid));
+          struct stat live = {}, original = {};
+          if (stat(liveRoot.c_str(), &live) != 0 || lstat(originalRoot.c_str(), &original) != 0)
+          {
+            reportSpinContainerFailure(plan, "cannot identify predecessor storage before replacement"_ctv);
+            co_return;
+          }
+          if (live.st_dev == original.st_dev && live.st_ino == original.st_ino)
+          {
+            std::error_code error;
+            bool empty = std::filesystem::is_empty(prodigyFilesystemPathFromString(originalRoot), error);
+            if (error || !S_ISDIR(original.st_mode))
+            {
+              reportSpinContainerFailure(plan, "predecessor legacy storage cannot be inspected"_ctv);
+              co_return;
+            }
+            if (!empty)
+            {
+              String successorName;
+              successorName.assignItoa(plan.uuid);
+              Vector<ProdigyContainerStorageDevicePlan> devices;
+              if (plan.config.storageMB == 0 || old->plan.config.isolatedChildMemoryMB != 0 ||
+                  collectEligibleStorageDevicePlans(successorName, plan.config.storageMB, devices) == false || !devices.empty())
+              {
+                reportSpinContainerFailure(plan, "legacy storage handoff requires the existing no-device backend"_ctv);
+                co_return;
+              }
+              legacySource.assign(originalRoot);
+              legacyIdentity = original;
+            }
+          }
+        }
+        CoroutineStack *coro = new CoroutineStack();
+        old->deleteStorageOnCleanUp = false;
+        old->resumeAfterShutdown = coro;
+        old->stop();
+        co_await coro->suspend();
+        delete coro;
+
+        String handoffFailure;
+        bool staged = legacySource.size() == 0 ||
+                      stageQuiescedLegacyStorage(old, plan, legacySource, legacyIdentity, stagedLegacyPayload, &handoffFailure);
+        // waitid now leaves retirement to this owner, after the quiesced capture.
+        // Legacy rootfs-local data remains retained even when capture fails.
+        old->pendingKillAckToBrain = true;
+        destroyContainer(old);
+        if (!staged)
+        {
+          reportSpinContainerFailure(plan, handoffFailure);
+          co_return;
+        }
+        if (hasStorage && legacySource.size() == 0)
+        {
+          if (!renameContainerStorageArtifacts(replaceContainerUUID, plan.uuid, &handoffFailure))
+          {
+            reportSpinContainerFailure(plan, handoffFailure);
+            co_return;
+          }
+        }
+      }
+    }
+
     Container *container = nullptr;
     String createFailure = {};
     createContainer(plan, compressedContainerPath, container, &createFailure);
@@ -11844,6 +12095,30 @@ public:
       report.assign(createFailure.size() > 0 ? createFailure : "container creation failed"_ctv);
       reportSpinContainerFailure(plan, report);
       co_return;
+    }
+
+    if (stagedLegacyPayload.size() > 0)
+    {
+      std::error_code error;
+      const auto target = prodigyFilesystemPathFromString(container->storagePayloadPath);
+      bool empty = std::filesystem::is_empty(target, error);
+      if (error || !empty || container->storageUsesLoopFilesystem ||
+          rename(stagedLegacyPayload.c_str(), container->storagePayloadPath.c_str()) != 0)
+      {
+        cleanupContainerAfterFailedCreate(container);
+        reportSpinContainerFailure(plan, "legacy storage publication failed; original rootfs and staged capture retained"_ctv);
+        co_return;
+      }
+      int parent = open(target.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+      bool durable = parent >= 0 && fsync(parent) == 0;
+      if (parent >= 0) close(parent);
+      if (!durable)
+      {
+        container->deleteStorageOnCleanUp = false;
+        cleanupContainerAfterFailedCreate(container);
+        reportSpinContainerFailure(plan, "legacy storage publication sync failed; original and new storage retained"_ctv);
+        co_return;
+      }
     }
 
     container->neuronScalingDimensionsMask = metricPolicy.scalingDimensionsMask;
