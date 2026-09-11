@@ -300,11 +300,120 @@ static void testContainerRestartWaitsForControlRetirement(TestSuite& suite)
   ::close(sockets[1]);
 }
 
+static void testRetainedNonChildPidfdLiveness(TestSuite& suite)
+{
+  int childPIDPipe[2] = {-1, -1};
+  suite.expect(::pipe2(childPIDPipe, O_CLOEXEC) == 0, "retained_pidfd_creates_pid_pipe");
+  if (childPIDPipe[0] < 0)
+  {
+    return;
+  }
+
+  pid_t helper = ::fork();
+  suite.expect(helper >= 0, "retained_pidfd_forks_helper");
+  if (helper == 0)
+  {
+    ::close(childPIDPipe[0]);
+    pid_t retained = ::fork();
+    if (retained == 0)
+    {
+      ::sleep(1);
+      _exit(37);
+    }
+    (void)::write(childPIDPipe[1], &retained, sizeof(retained));
+    _exit(retained > 0 ? 0 : 1);
+  }
+  ::close(childPIDPipe[1]);
+  pid_t retained = -1;
+  const ssize_t received = ::read(childPIDPipe[0], &retained, sizeof(retained));
+  ::close(childPIDPipe[0]);
+  int helperStatus = 0;
+  if (helper > 0)
+  {
+    (void)::waitpid(helper, &helperStatus, 0);
+  }
+  suite.expect(received == ssize_t(sizeof(retained)) && retained > 0 && WIFEXITED(helperStatus), "retained_pidfd_receives_nonchild_pid");
+  if (retained <= 0)
+  {
+    return;
+  }
+
+  int pidfd = int(::syscall(SYS_pidfd_open, retained, 0));
+  suite.expect(pidfd >= 0, "retained_pidfd_opens_nonchild_pidfd");
+  if (pidfd < 0)
+  {
+    return;
+  }
+  siginfo_t unavailable = {};
+  suite.expect(::waitid(static_cast<idtype_t>(P_PIDFD), id_t(pidfd), &unavailable, WEXITED | WNOHANG) < 0 && errno == ECHILD, "retained_pidfd_nonchild_waitid_is_echild");
+
+  struct pollfd poller = {.fd = pidfd, .events = POLLIN, .revents = 0};
+  suite.expect(::poll(&poller, 1, 0) == 0, "retained_pidfd_is_pending_while_process_lives");
+  poller.revents = 0;
+  suite.expect(::poll(&poller, 1, 5000) == 1 && (poller.revents & POLLIN), "retained_pidfd_signals_exit");
+
+  Container observed = {};
+  observed.pid = retained;
+  observed.pidfd = pidfd;
+  observed.waitidPending = true;
+  observed.nonChildPidfdLiveness = true;
+  observed.nonChildPidfdTicket = 77;
+  suite.expect(ContainerManager::completeNonChildPidfdPoll(&observed, uint64_t(retained), 77, POLLIN), "retained_pidfd_marks_exit_without_waitid");
+  suite.expect(observed.waitidPending && observed.pidfdExitStatusUnknown && observed.infop.si_pid == retained && observed.infop.si_code == 0 && observed.infop.si_status == 0, "retained_pidfd_exit_status_remains_unknown");
+  int cancellationPidfd = ::dup(observed.pidfd);
+  ::close(observed.pidfd);
+
+  Container cancelled = {};
+  cancelled.pid = retained;
+  cancelled.pidfd = cancellationPidfd;
+  cancelled.waitidPending = true;
+  cancelled.nonChildPidfdLiveness = true;
+  cancelled.nonChildPidfdTicket = 78;
+  int invalidPidfd = ::dup(cancelled.pidfd);
+  suite.expect(ContainerManager::completeNonChildPidfdPoll(&cancelled, uint64_t(retained), 78, -ECANCELED) == false, "retained_pidfd_cancellation_is_not_exit");
+  suite.expect(cancelled.waitidPending == false && cancelled.nonChildPidfdTicket == Ring::invalidRawPollTicket && cancelled.pidfd == -1, "retained_pidfd_cancellation_releases_after_terminal_callback");
+
+  Container invalidReadiness = {};
+  invalidReadiness.pid = retained;
+  invalidReadiness.pidfd = invalidPidfd;
+  invalidReadiness.waitidPending = true;
+  invalidReadiness.nonChildPidfdLiveness = true;
+  invalidReadiness.nonChildPidfdTicket = 79;
+  suite.expect(ContainerManager::completeNonChildPidfdPoll(&invalidReadiness, uint64_t(retained), 79, POLLERR) == false, "retained_pidfd_nonreadiness_is_not_exit");
+  suite.expect(invalidReadiness.waitidPending && invalidReadiness.nonChildPidfdLiveness && invalidReadiness.nonChildPidfdTicket == Ring::invalidRawPollTicket && invalidReadiness.pidfdExitStatusUnknown == false, "retained_pidfd_nonreadiness_retains_owner");
+  ::close(invalidPidfd);
+
+  pid_t directChild = ::fork();
+  suite.expect(directChild >= 0, "retained_pidfd_forks_direct_child");
+  if (directChild == 0)
+  {
+    _exit(19);
+  }
+  if (directChild > 0)
+  {
+    int directPidfd = int(::syscall(SYS_pidfd_open, directChild, 0));
+    suite.expect(directPidfd >= 0, "retained_pidfd_opens_direct_child_pidfd");
+    if (directPidfd >= 0)
+    {
+      siginfo_t observedChild = {};
+      suite.expect(::waitid(static_cast<idtype_t>(P_PIDFD), id_t(directPidfd), &observedChild, WEXITED | WNOWAIT) == 0 && observedChild.si_pid == directChild, "retained_pidfd_direct_child_is_waitable");
+      siginfo_t reapedChild = {};
+      suite.expect(::waitid(static_cast<idtype_t>(P_PIDFD), id_t(directPidfd), &reapedChild, WEXITED) == 0 && reapedChild.si_code == CLD_EXITED && reapedChild.si_status == 19, "retained_pidfd_direct_child_reaps_with_status");
+      ::close(directPidfd);
+    }
+    else
+    {
+      (void)::waitpid(directChild, nullptr, 0);
+    }
+  }
+}
+
 int main(void)
 {
   TestSuite suite = {};
-  ScopedRing ring = {};
+  testRetainedNonChildPidfdLiveness(suite);
 
+  ScopedRing ring = {};
   testNeuronHubCanQueueToNeuron(suite);
   testNeuronHubFlushesBufferedFramesWhenNeuronBecomesSendable(suite);
   testNeuronHubRetainsBuffersUntilCloseRetirement(suite);

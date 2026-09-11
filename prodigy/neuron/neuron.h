@@ -3036,22 +3036,10 @@ public:
   void rawFDPollHandler(void *owner, uint64_t generation, uint64_t ticket, int result) override
   {
     Container *container = reinterpret_cast<Container *>(owner);
-    if (container == nullptr || container->nonChildPidfdLiveness == false ||
-        container->nonChildPidfdTicket != ticket || generation != uint64_t(container->pid))
+    if (ContainerManager::completeNonChildPidfdPoll(container, generation, ticket, result) == false)
     {
       return;
     }
-    container->nonChildPidfdTicket = 0;
-    if (result < 0)
-    {
-      // Cancellation is terminal ownership acknowledgement, not an exit.
-      container->waitidPending = false;
-      return;
-    }
-    container->infop = {};
-    container->infop.si_pid = container->pid;
-    container->infop.si_code = CLD_EXITED;
-    container->infop.si_status = 0;
     waitidHandler(container);
   }
 
@@ -3087,12 +3075,14 @@ public:
 
     Container *container = reinterpret_cast<Container *>(waiter);
     siginfo_t infop = container->infop;
-    bool nonRestartableStartupFailure = (infop.si_code == CLD_EXITED && infop.si_status == containerStartupFailureExitCode);
+    bool pidfdExitStatusUnknown = container->pidfdExitStatusUnknown;
+    bool nonRestartableStartupFailure = (pidfdExitStatusUnknown == false && infop.si_code == CLD_EXITED && infop.si_status == containerStartupFailureExitCode);
     String containerName = container->name;
     {
       containerUUID = container->plan.uuid;
       pendingDestroyBeforeWait = container->pendingDestroy;
       container->waitidPending = false;
+      container->pidfdExitStatusUnknown = false;
       if (container->pidfd > 0)
       {
         close(container->pidfd);
@@ -3174,6 +3164,11 @@ public:
         termination.exitCode = infop.si_status;
         termination.summary.assign("startup failed before exec"_ctv);
       }
+      else if (pidfdExitStatusUnknown)
+      {
+        termination.kind = TaskTerminationKind::lost;
+        termination.summary.assign("retained process exited; exit status unavailable"_ctv);
+      }
       else if (infop.si_code == CLD_EXITED)
       {
         termination.kind = TaskTerminationKind::exited;
@@ -3225,7 +3220,11 @@ public:
                    retainedBundlePath.c_str());
       }
 
-      if (infop.si_code != CLD_EXITED) // child DID NOT exit via exit()... but by some crash
+      if (pidfdExitStatusUnknown)
+      {
+        crashReport.assign("retained process exited; exit status unavailable"_ctv);
+      }
+      else if (infop.si_code != CLD_EXITED) // child DID NOT exit via exit()... but by some crash
       {
 
         // for stack traces
@@ -4004,7 +4003,31 @@ public:
               // then we'd need to check /proc/{pid}/status and line NSpid: 12345 1 to get the pid mapping to select pid 1
               container->pid = restoredPID;
               container->pidfd = syscall(SYS_pidfd_open, container->pid, 0);
-              container->nonChildPidfdLiveness = (container->pidfd >= 0);
+              container->nonChildPidfdLiveness = false;
+              if (container->pidfd >= 0)
+              {
+                // A self-upgrade can retain a direct child. Preserve normal
+                // waitid reaping there; only an adopted process reports ECHILD.
+                siginfo_t waitability = {};
+                int waitabilityResult = -1;
+                do
+                {
+                  waitabilityResult = ::waitid(static_cast<idtype_t>(3), id_t(container->pidfd), &waitability, WEXITED | WNOHANG | WNOWAIT);
+                } while (waitabilityResult < 0 && errno == EINTR);
+                if (waitabilityResult < 0 && errno == ECHILD)
+                {
+                  container->nonChildPidfdLiveness = true;
+                }
+                else if (waitabilityResult < 0)
+                {
+                  container->retainedPidfdWaitabilityFailed = true;
+                  basics_log("restoreContainer retained pidfd waitability probe failed uuid=%llu pid=%d pidfd=%d errno=%d; retaining lifecycle owner\n",
+                             (unsigned long long)container->plan.uuid,
+                             int(container->pid),
+                             container->pidfd,
+                             errno);
+                }
+              }
 
               if (container->plan.useHostNetworkNamespace == false)
               {

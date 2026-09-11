@@ -1091,7 +1091,9 @@ public:
   uint32_t restartFailureStreak = 0;
   bool waitidPending = false;
   bool nonChildPidfdLiveness = false;
-  uint64_t nonChildPidfdTicket = 0;
+  Ring::RawPollTicket nonChildPidfdTicket = Ring::invalidRawPollTicket;
+  bool pidfdExitStatusUnknown = false;
+  bool retainedPidfdWaitabilityFailed = false;
   bool destroyCloseCompleted = false;
   bool failedArtifactsPreserved = false;
   int64_t failedArtifactsObservedAtMs = 0;
@@ -11013,12 +11015,30 @@ public:
   {
     container->waitidPending = true;
     container->destroyCloseCompleted = false;
+    if (container->retainedPidfdWaitabilityFailed)
+    {
+      basics_log("queueContainerWaitid retained pidfd waitability is unavailable uuid=%llu pid=%d pidfd=%d; retaining lifecycle owner\n",
+                 (unsigned long long)container->plan.uuid,
+                 int(container->pid),
+                 container->pidfd);
+      return;
+    }
 #ifdef __linux__
     if (container->pidfd >= 0)
     {
       if (container->nonChildPidfdLiveness)
       {
         container->nonChildPidfdTicket = Ring::queueRawFDPoll(container, uint64_t(container->pid), container->pidfd, POLLIN);
+        if (container->nonChildPidfdTicket == Ring::invalidRawPollTicket)
+        {
+          basics_log("queueContainerWaitid could not queue retained pidfd poll uuid=%llu pid=%d pidfd=%d\n",
+                     (unsigned long long)container->plan.uuid,
+                     int(container->pid),
+                     container->pidfd);
+          // Keep waitidPending set so teardown cannot free a Container whose
+          // retained process has not received a terminal liveness result.
+          return;
+        }
         return;
       }
       Ring::queueWaitid(container, static_cast<idtype_t>(3), id_t(container->pidfd));
@@ -11026,6 +11046,53 @@ public:
     }
 #endif
     Ring::queueWaitid(container, P_PID, id_t(container->pid));
+  }
+
+  // A retained container is not our child, so pidfd readiness proves only that
+  // it exited. The poll CQE is the sole lifetime acknowledgement: destruction
+  // must keep both the Container and pidfd alive until this transition runs.
+  static bool completeNonChildPidfdPoll(Container *container,
+                                        uint64_t generation,
+                                        Ring::RawPollTicket ticket,
+                                        int result)
+  {
+    if (container == nullptr || container->nonChildPidfdLiveness == false ||
+        container->nonChildPidfdTicket != ticket || generation != uint64_t(container->pid))
+    {
+      return false;
+    }
+
+    container->nonChildPidfdTicket = Ring::invalidRawPollTicket;
+    if (result == -ECANCELED)
+    {
+      container->nonChildPidfdLiveness = false;
+      container->waitidPending = false;
+      if (container->pidfd >= 0)
+      {
+        close(container->pidfd);
+        container->pidfd = -1;
+      }
+      finalizeContainerDestroyIfReady(container);
+      return false;
+    }
+
+    if (result < 0 || (result & POLLIN) == 0)
+    {
+      basics_log("retained pidfd poll did not report POLLIN uuid=%llu pid=%d pidfd=%d result=%d; retaining process ownership\n",
+                 (unsigned long long)container->plan.uuid,
+                 int(container->pid),
+                 container->pidfd,
+                 result);
+      // Keep waitidPending set. Releasing this Container would drop the only
+      // liveness owner for an app whose process may still be running.
+      return false;
+    }
+
+    container->nonChildPidfdLiveness = false;
+    container->pidfdExitStatusUnknown = true;
+    container->infop = {};
+    container->infop.si_pid = container->pid;
+    return true;
   }
 
   static bool adjustRunningContainerResources(Container *container, uint16_t targetCores, uint32_t targetMemoryMB, uint32_t targetStorageMB, String *failureReport = nullptr)
@@ -12436,6 +12503,22 @@ public:
       container->resourceDeltaTimer = nullptr;
     }
     container->resourceDeltaMode = Container::ResourceDeltaMode::none;
+
+    if (container->nonChildPidfdLiveness &&
+        container->nonChildPidfdTicket != Ring::invalidRawPollTicket)
+    {
+      // The raw poll keeps a Container pointer. Its original CQE is the only
+      // terminal acknowledgement, including when cancellation wins.
+      if (Ring::cancelRawFDPoll(container->nonChildPidfdTicket) == false)
+      {
+        basics_log("destroyContainer could not cancel retained pidfd poll uuid=%llu pid=%d ticket=%llu\n",
+                   (unsigned long long)container->plan.uuid,
+                   int(container->pid),
+                   (unsigned long long)container->nonChildPidfdTicket);
+        // Leave waitidPending intact so this owner cannot be freed. The raw
+        // CQE may already be queued and remains the only safe terminal path.
+      }
+    }
 
     // reclaim resources. A queued IORING_OP_WAITID owns the pidfd until its
     // completion is dispatched. Task containers commonly close their control
