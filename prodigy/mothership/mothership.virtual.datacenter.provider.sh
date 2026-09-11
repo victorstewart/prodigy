@@ -3,13 +3,20 @@ set -Eeuo pipefail
 
 enter_machine()
 {
-   [[ "$#" -eq 12 ]]
+   [[ "$#" -eq 12 || "$#" -eq 13 ]]
    local machine_cgroup="$1"
    shift
-   printf '%s\n' "$$" > "${machine_cgroup}/cgroup.procs"
+   if [[ "$#" -eq 12 ]]
+   then
+      local retained_cgroup_fd="$1"
+      shift
+      [[ "${retained_cgroup_fd}" =~ ^[0-9]+$ && -r "/proc/self/fd/${retained_cgroup_fd}" && -w "${machine_cgroup}/prodigy-runtime/cgroup.procs" ]] || exit 2
+      printf "%s\n" "$$" > "${machine_cgroup}/prodigy-runtime/cgroup.procs"
+      exec nsenter --cgroup="/proc/self/fd/${retained_cgroup_fd}" -- unshare --mount --propagation private -- bash "$0" --run-machine "$@"
+   fi
+   printf "%s\n" "$$" > "${machine_cgroup}/cgroup.procs"
    exec unshare --cgroup --mount --propagation private -- bash "$0" --run-machine "$@"
 }
-
 run_machine()
 {
    [[ "$#" -eq 11 ]]
@@ -994,8 +1001,13 @@ start_machine()
    [[ "${fake_boundary}" != "1" ]] || fake_ingress="/root/prodigy/host.ingress.router.dev.ebpf.o"
    [[ -x "${machine_root}/root/prodigy/prodigy" && -r "${boot_path}" ]]
 
-   setsid bash "$0" --enter-machine \
-      "${machine_cgroup}" "${workspace}" "${machine_root}" "${containers_root}" "${shared_transport_tls}" "${storage_root}" "${storage_device_count}" "${child_ns}" "${boot_path}" "${host_netns_inode}" "${brain_count}" "${fake_ingress}" \
+   local -a enter_arguments=( "${machine_cgroup}" )
+   if [[ "${index}" -eq "${recovering_machine}" && -n "${PRODIGY_VDC_RECOVERY_CGROUP_FD:-}" ]]
+   then
+      enter_arguments+=( "${PRODIGY_VDC_RECOVERY_CGROUP_FD}" )
+   fi
+   enter_arguments+=( "${workspace}" "${machine_root}" "${containers_root}" "${shared_transport_tls}" "${storage_root}" "${storage_device_count}" "${child_ns}" "${boot_path}" "${host_netns_inode}" "${brain_count}" "${fake_ingress}" )
+   setsid bash "$0" --enter-machine "${enter_arguments[@]}" \
       > >(bash "$0" --bounded-log "${log_path}" 2 67108864 4194304) 2>&1 &
    machine_pids[$((index - 1))]="$!"
 }
