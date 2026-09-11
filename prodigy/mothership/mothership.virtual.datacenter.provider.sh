@@ -1014,9 +1014,20 @@ else
    old_provider_cgroup="$(cut -d: -f3 "/proc/${old_provider_pid}/cgroup")"
    [[ "${old_provider_cgroup}" == */prodigy-vdc-${runtime_identity}/provider ]] || failed 1 "$LINENO"
    cgroup_root="/sys/fs/cgroup${old_provider_cgroup%/provider}"
-   [[ -d "${filesystem_root}" && -r "${runtime_path}" && -d "${cgroup_root}" && -w "${cgroup_root}/provider/cgroup.procs" ]] || failed 1 "$LINENO"
+   cgroup_scope="${cgroup_root%/prodigy-vdc-${runtime_identity}}"
+   cgroup_control="${cgroup_scope}/prodigy-vdc-control"
+   cgroup_lock="/run/prodigy-vdc-cgroup-$(stat -Lc %i "${cgroup_scope}").lock"
+   [[ -d "${filesystem_root}" && -r "${runtime_path}" && -d "${cgroup_root}" && -d "${cgroup_scope}" && -d "${cgroup_control}" && -w "${cgroup_root}/provider/cgroup.procs" ]] || failed 1 "$LINENO"
    mapfile -t machine_pids < "${runtime_path}"
    [[ "${#machine_pids[@]}" -eq "${machine_count}" ]] || failed 1 "$LINENO"
+   if [[ -r "${workspace}/virtual-datacenter.forwarding" ]]
+   then
+      read -r host_ipv4_forward host_ipv6_forward < "${workspace}/virtual-datacenter.forwarding"
+      [[ "${host_ipv4_forward}" =~ ^[01]$ && "${host_ipv6_forward}" =~ ^[01]$ ]] || failed 1 "$LINENO"
+   else
+      # Legacy providers have no observable baseline; cleanup deliberately leaves it unchanged.
+      host_ipv4_forward=""; host_ipv6_forward=""
+   fi
    for index in $(seq 1 "${machine_count}")
    do
       child_names+=("pvd-m${index}-${runtime_identity}")
