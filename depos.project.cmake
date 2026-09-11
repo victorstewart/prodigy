@@ -11,19 +11,19 @@ set(
 )
 set(
   PRODIGY_BASICS_RELEASE_VERSION
-  "0.4.6"
+  "0.4.7"
   CACHE STRING
   "Pinned Basics release version consumed through the published detached DepoFile asset"
 )
 set(
   PRODIGY_BASICS_RELEASE_DEPOFILE_URL
-  "https://github.com/victorstewart/basics/releases/download/v0.4.6/basics.DepoFile"
+  "https://github.com/victorstewart/basics/releases/download/v0.4.7/basics.DepoFile"
   CACHE STRING
   "Published Basics detached DepoFile asset URL"
 )
 set(
   PRODIGY_BASICS_RELEASE_DEPOFILE_SHA256
-  "acebdfe1106af71c51009d7a13c33241b76fa8e6aa63d1807e8718603e91db3a"
+  "00e68dfe3a6f24334b58af641a4173f3d02c5bbd6ba5198bfbe9a2deffb01ff8"
   CACHE STRING
   "SHA256 for the published Basics detached DepoFile asset"
 )
