@@ -1373,18 +1373,18 @@ public:
 
   bool prepareStorageHandoffFixture()
   {
+    auto fail = [](const char *reason) { std::fprintf(stderr, "storage-handoff-fixture invariant=%s errno=%d\\n", reason, errno); std::fflush(stderr); return false; };
     const char *mode = getenv("PINGPONG_STORAGE_HANDOFF_MODE");
     if (mode == nullptr) return true;
     const char *identity = getenv("PINGPONG_STORAGE_HANDOFF_ID");
-    if (identity == nullptr || strlen(identity) != 32 ||
-        strspn(identity, "0123456789abcdef") != 32) return false;
+    if (identity == nullptr || strlen(identity) != 32 || strspn(identity, "0123456789abcdef") != 32) return fail("identity");
     const bool seed = strcmp(mode, "seed") == 0;
-    if (!seed && strcmp(mode, "verify") != 0) return false;
+    if (!seed && strcmp(mode, "verify") != 0) return fail("mode");
     constexpr off_t size = off_t(2) * 1024 * 1024 * 1024 * 1024;
-    if (seed && mkdir("/storage/kvdb", 0700) != 0) return false;
+    if (seed && mkdir("/storage/kvdb", 0700) != 0) return fail("mkdir");
     int fd = open("/storage/kvdb/handoff-sparse", O_RDWR | O_CLOEXEC | O_NOFOLLOW |
                                                     (seed ? O_CREAT | O_EXCL : 0), 0600);
-    if (fd < 0) return false;
+    if (fd < 0) return fail("open");
     bool ready = true;
     if (seed)
     {
@@ -1400,7 +1400,8 @@ public:
               memcmp(observed, identity, 32) == 0 && pread(fd, &middle, 1, size / 2) == 1 && middle == 'M' &&
               pread(fd, &last, 1, size - 1) == 1 && last == 'Z' && pwrite(fd, "A", 1, size / 2) == 1;
     }
-    ready = fsync(fd) == 0 && ready;
+    if (fsync(fd) != 0) ready = false;
+    if (!ready) { close(fd); return fail("content-size-owner-marker"); }
     close(fd);
     int directory = open("/storage/kvdb", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     ready = directory >= 0 && fsync(directory) == 0 && ready;

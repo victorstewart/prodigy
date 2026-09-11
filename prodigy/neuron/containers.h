@@ -12039,6 +12039,13 @@ public:
           }
           if (live.st_dev == original.st_dev && live.st_ino == original.st_ino)
           {
+#if PRODIGY_DEBUG
+            appendContainerTrace(old, "legacy-selection replacement=%llu successor=%llu storageMB=%u dev=%llu inode=%llu rootDev=%llu rootInode=%llu\n",
+                                 (unsigned long long)replaceContainerUUID, (unsigned long long)plan.uuid,
+                                 unsigned(plan.config.storageMB), (unsigned long long)live.st_dev,
+                                 (unsigned long long)live.st_ino, (unsigned long long)original.st_dev,
+                                 (unsigned long long)original.st_ino);
+#endif
             std::error_code error;
             bool empty = std::filesystem::is_empty(prodigyFilesystemPathFromString(originalRoot), error);
             if (error || !S_ISDIR(original.st_mode))
@@ -12072,6 +12079,11 @@ public:
         String handoffFailure;
         bool staged = legacySource.size() == 0 ||
                       stageQuiescedLegacyStorage(old, plan, legacySource, legacyIdentity, stagedLegacyPayload, &handoffFailure);
+#if PRODIGY_DEBUG
+        appendContainerTrace(old, "legacy-stage replacement=%llu successor=%llu sourceSelected=%d staged=%d payloadPresent=%d reason=%s\n",
+                             (unsigned long long)replaceContainerUUID, (unsigned long long)plan.uuid,
+                             int(legacySource.size() > 0), int(staged), int(stagedLegacyPayload.size() > 0), handoffFailure.c_str());
+#endif
         // waitid now leaves retirement to this owner, after the quiesced capture.
         // Legacy rootfs-local data remains retained even when capture fails.
         old->pendingKillAckToBrain = true;
@@ -12081,7 +12093,7 @@ public:
           reportSpinContainerFailure(plan, handoffFailure);
           co_return;
         }
-        if (hasStorage && legacySource.size() == 0)
+      if (hasStorage && legacySource.size() == 0)
         {
           if (!renameContainerStorageArtifacts(replaceContainerUUID, plan.uuid, &handoffFailure))
           {
@@ -12115,6 +12127,11 @@ public:
         reportSpinContainerFailure(plan, "legacy storage publication failed; original rootfs and staged capture retained"_ctv);
         co_return;
       }
+#if PRODIGY_DEBUG
+      appendContainerTrace(container, "legacy-publication replacement=%llu successor=%llu storageMB=%u target=%s published=1\n",
+                           (unsigned long long)replaceContainerUUID, (unsigned long long)plan.uuid,
+                           unsigned(plan.config.storageMB), container->storagePayloadPath.c_str());
+#endif
       int parent = open(target.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
       bool durable = parent >= 0 && fsync(parent) == 0;
       if (parent >= 0) close(parent);
