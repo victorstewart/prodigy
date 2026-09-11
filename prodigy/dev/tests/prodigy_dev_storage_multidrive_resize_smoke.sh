@@ -20,6 +20,8 @@ is_handoff=0
 [[ "${is_handoff}" == 0 || ( "${storage_devices}" == 0 && -s "${upgrade_bundle}" ) ]] || { echo "error: legacy handoff requires zero devices and an exact upgrade bundle" >&2; exit 2; }
 [[ "${is_handoff}" == 0 || "${PRODIGY_STORAGE_HANDOFF_EXPECTED_RUNTIME_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || { echo "error: legacy handoff requires the sealed successor runtime hash" >&2; exit 2; }
 if [[ "${test_mode}" == provider-handoff ]]; then
+   old_bundle_sha="${PRODIGY_STORAGE_HANDOFF_EXPECTED_OLD_BUNDLE_SHA256:-}"
+   [[ "${old_bundle_sha}" =~ ^[0-9a-f]{64}$ ]] || { echo "error: provider-handoff requires sealed old bundle SHA" >&2; exit 2; }
    create_mothership_bin="${PRODIGY_STORAGE_HANDOFF_CREATE_MOTHERSHIP_BIN:-}"
    [[ -x "${create_mothership_bin}" ]] || { echo "error: provider-handoff requires executable sealed predecessor Mothership" >&2; exit 2; }
 fi
@@ -486,7 +488,7 @@ then
    observe_handoff()
    {
       python3 - "${manifest_path}" "${PINGPONG_BIN}" "${handoff_id}" "$1" "${tmpdir}" "${PRODIGY_STORAGE_HANDOFF_EXPECTED_RUNTIME_SHA256}" "${test_mode}" <<'PY'
-import hashlib, json, pathlib, re, sys, os
+import hashlib, json, pathlib, re, sys
 manifest, executable, identity, phase, output, runtime_hash, mode = sys.argv[1:]
 root = pathlib.Path(output)
 nodes = json.loads(pathlib.Path(manifest).read_text())['nodes']
@@ -495,7 +497,7 @@ before = json.loads((root / 'handoff-before.json').read_text()) if phase != 'bef
 records = []
 for node in nodes:
     parent = pathlib.Path('/proc') / str(node['pid'])
-    if phase != 'before':
+    if phase not in ('before', 'provider-step'):
         assert hashlib.sha256((parent / 'exe').read_bytes()).hexdigest() == runtime_hash, 'machine has wrong runtime bytes'
     children = []
     if mode == 'provider-handoff':
@@ -522,7 +524,7 @@ for node in nodes:
         assert file.stat().st_size == 1 << 41
         assert middle == (b'A' if phase == 'after' else b'M')
         original = parent / 'root/containers' / uuid / 'rootfs/storage'
-        if phase in ('before', 'upgraded', 'recovered'):
+        if phase in ('before', 'upgraded', 'recovered', 'provider-step'):
             assert (original.stat().st_dev, original.stat().st_ino) == (metadata.st_dev, metadata.st_ino)
         else:
             target = parent / 'root/containers/storage' / uuid
@@ -536,8 +538,8 @@ for node in nodes:
                             cgroup=(child / 'cgroup').read_text(),
                             applicationSHA256=expected_binary))
 assert len(records) == 3, f'expected three real fixture replicas, got {len(records)}'
-if phase in ('upgraded', 'recovered'):
-assert sorted((r['pid'], r['starttime'], r['uuid'], r['device'], r['inode'], r['networkNamespace'], r['cgroup']) for r in records) == \
+if phase in ('upgraded', 'recovered', 'provider-step'):
+    assert sorted((r['pid'], r['starttime'], r['uuid'], r['device'], r['inode'], r['networkNamespace'], r['cgroup']) for r in records) == \
            sorted((r['pid'], r['starttime'], r['uuid'], r['device'], r['inode'], r['networkNamespace'], r['cgroup']) for r in before), 'bundle upgrade changed live app/storage/network owners'
 if phase == 'after':
     assert not ({r['pid'] for r in before} & {r['pid'] for r in records})
@@ -561,13 +563,13 @@ PY
    }
    observe_handoff before
    if [[ "${test_mode}" == provider-handoff ]]; then
-      old_bundle_sha="${PRODIGY_STORAGE_HANDOFF_EXPECTED_OLD_BUNDLE_SHA256:-}"
-      [[ "${old_bundle_sha}" =~ ^[0-9a-f]{64}$ ]] || { echo "error: provider-handoff requires sealed old bundle SHA" >&2; exit 2; }
       for machine_index in 2 3 4 1; do
          env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
             "${MOTHERSHIP_BIN}" recoverTestClusterBundle "${cluster_name}" "${upgrade_bundle}" "${machine_index}" "${old_bundle_sha}" >>"${tmpdir}/upgrade.log" 2>&1
          env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
             "${MOTHERSHIP_BIN}" recoverTestClusterBundle "${cluster_name}" "${upgrade_bundle}" "${machine_index}" "${old_bundle_sha}" >>"${tmpdir}/upgrade.log" 2>&1
+         observe_handoff provider-step
+         cp "${tmpdir}/handoff-provider-step.json" "${tmpdir}/handoff-provider-machine-${machine_index}.json"
       done
    else
       env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \

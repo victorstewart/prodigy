@@ -38,6 +38,7 @@
 #include <prodigy/mothership/mothership.cluster.reconcile.h>
 #include <prodigy/mothership/mothership.cluster.registry.h>
 #include <prodigy/mothership/mothership.virtual.datacenter.h>
+#include <prodigy/mothership/mothership.virtual.datacenter.recovery.h>
 #include <prodigy/mothership/mothership.ssh.h>
 #include <prodigy/mothership/mothership.deployment.plan.helpers.h>
 #include <prodigy/mothership/mothership.gcp.managed.template.plan.h>
@@ -3646,6 +3647,312 @@ static bool mothershipRunVirtualDatacenterProvider(Vector<String> arguments, Str
   {
     failure->clear();
   }
+  return true;
+}
+
+static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyCluster& cluster,
+    const String& bundlePath, const String& successorSHA, uint32_t machineIndex,
+    const String& expectedOldSHA, String *failure)
+{
+  auto reject = [&](const char *message) { if (failure) failure->assign(message); return false; };
+  String lockPath = {};
+  mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, "virtual-datacenter.recovery.lock", lockPath);
+  struct CloseFD { int fd = -1; ~CloseFD() { if (fd >= 0) ::close(fd); } } lock;
+  lock.fd = ::open(lockPath.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+  if (lock.fd < 0 || ::flock(lock.fd, LOCK_EX | LOCK_NB) != 0) return reject("another provider recovery owns the workspace");
+
+  String recoveryRoot = {}, directory = {}, directoryName = {};
+  mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, "virtual-datacenter.recovery", recoveryRoot);
+  if (::mkdir(recoveryRoot.c_str(), 0700) != 0 && errno != EEXIST) return reject("cannot create provider recovery owner");
+  directoryName.snprintf<"machine{itoa}-{}-{}"_ctv>(uint64_t(machineIndex), expectedOldSHA, successorSHA);
+  mothershipVirtualDatacenterPath(recoveryRoot, directoryName.c_str(), directory);
+  String activePath = {}, active = {};
+  mothershipVirtualDatacenterPath(recoveryRoot, "active", activePath);
+  if (::access(activePath.c_str(), F_OK) == 0)
+  {
+    if (mothershipVDCRead(activePath, active) == false) return reject("unreadable provider recovery intent");
+    if (active.equals(directoryName) == false)
+    {
+      if (active.empty() || std::strchr(active.c_str(), '/') != nullptr) return reject("invalid provider recovery intent path");
+      String priorDirectory = {};
+      mothershipVirtualDatacenterPath(recoveryRoot, active.c_str(), priorDirectory);
+      MothershipVDCBundleRecovery prior = {};
+      if (mothershipVDCReadRecovery(priorDirectory, prior) == false || prior.phase != MothershipVDCRecoveryPhase::complete)
+        return reject("another provider recovery is incomplete");
+    }
+  }
+  if (::mkdir(directory.c_str(), 0700) != 0 && errno != EEXIST) return reject("cannot create provider recovery operation");
+  String operationPath = {}, stagedRoot = {}, installedRoot = {}, previousRoot = {}, runtimePath = {}, pidPath = {};
+  mothershipVirtualDatacenterPath(directory, "operation", operationPath);
+  mothershipVirtualDatacenterPath(directory, "staged-root", stagedRoot);
+  mothershipVirtualDatacenterPath(directory, "previous-root", previousRoot);
+  installedRoot.snprintf<"{}/machines/{itoa}/root/prodigy"_ctv>(cluster.test.workspaceRoot, uint64_t(machineIndex));
+  mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, mothershipVirtualDatacenterRuntimeFilename, runtimePath);
+  mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, mothershipVirtualDatacenterPIDFilename, pidPath);
+  MothershipVDCBundleRecovery operation = {};
+  auto fileDigest = [&](const String& root, const char *filename, String& digest) {
+    String path = {}; mothershipVirtualDatacenterPath(root, filename, path);
+    return prodigyComputeFileSHA256Hex(path, digest, failure);
+  };
+  auto executableMatches = [&](const MothershipVDCProcessIdentity& process, const String& digest) {
+    String path = {}, observed = {};
+    path.snprintf<"/proc/{itoa}/exe"_ctv>(process.pid);
+    return mothershipVDCProcessMatches(process) && prodigyComputeFileSHA256Hex(path, observed, failure) && observed.equals(digest);
+  };
+  auto save = [&]() { return mothershipVDCWriteRecovery(directory, operation, failure); };
+  if (::access(operationPath.c_str(), F_OK) == 0)
+  {
+    if (mothershipVDCReadRecovery(directory, operation) == false || operation.clusterUUID != cluster.clusterUUID ||
+        operation.machineIndex != machineIndex || operation.expectedOldBundle.equals(expectedOldSHA) == false ||
+        operation.successorBundle.equals(successorSHA) == false) return reject("provider recovery operation identity mismatch");
+  }
+  else
+  {
+    operation.clusterUUID = cluster.clusterUUID;
+    do { operation.operationID = Random::generateNumberWithNBits<128, uint128_t>(); } while (operation.operationID == 0);
+    operation.machineIndex = machineIndex;
+    operation.expectedOldBundle = expectedOldSHA;
+    operation.successorBundle = successorSHA;
+    uint64_t supervisorPID = 0;
+    if (mothershipVDCReadNumber(pidPath, supervisorPID) == false || mothershipVDCReadProcess(supervisorPID, operation.supervisor) == false)
+      return reject("retained provider process identity unavailable");
+    String identityPath = {};
+    mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, "virtual-datacenter.identity", identityPath);
+    operation.runtimeIdentity = supervisorPID;
+    if (::access(identityPath.c_str(), F_OK) == 0 && mothershipVDCReadNumber(identityPath, operation.runtimeIdentity) == false)
+      return reject("retained provider runtime identity is invalid");
+    Vector<String> arguments = {};
+    if (mothershipVDCReadArguments(supervisorPID, arguments) == false ||
+        mothershipVDCProviderArguments(arguments, cluster.test.workspaceRoot, operation.runtimeIdentity, operation.providerArguments) == false)
+      return reject("retained provider command does not own this workspace");
+    uint64_t count = 0, brains = 0;
+    if (mothershipVDCParseUnsigned(operation.providerArguments[1].c_str(), operation.providerArguments[1].c_str() + operation.providerArguments[1].size(), count) == false ||
+        mothershipVDCParseUnsigned(operation.providerArguments[2].c_str(), operation.providerArguments[2].c_str() + operation.providerArguments[2].size(), brains) == false ||
+        count != cluster.test.machineCount || brains != cluster.nBrains) return reject("retained provider topology differs from Mothership");
+    String runtime = {};
+    if (mothershipVDCRead(runtimePath, runtime) == false) return reject("retained worker inventory unavailable");
+    const char *cursor = runtime.c_str(), *terminal = cursor + runtime.size();
+    for (uint32_t index = 1; index <= count; ++index)
+    {
+      const char *end = cursor;
+      while (end != terminal && *end != '\n') ++end;
+      uint64_t worker = 0;
+      if (end == terminal || mothershipVDCParseUnsigned(cursor, end, worker) == false || worker < 2) return reject("retained worker inventory is malformed");
+      if (index == machineIndex && mothershipVDCReadProcess(worker, operation.worker) == false) return reject("selected worker identity unavailable");
+      cursor = end + 1;
+    }
+    if (cursor != terminal) return reject("retained worker inventory has unexpected entries");
+    String installedDigest = {}, expectedCgroupSuffix = {};
+    expectedCgroupSuffix.snprintf<"/prodigy-vdc-{itoa}/provider\n"_ctv>(operation.runtimeIdentity);
+    if (mothershipVDCReadProcessFile(supervisorPID, "cgroup", operation.providerCgroup) == false ||
+        operation.providerCgroup.size() < expectedCgroupSuffix.size() ||
+        std::memcmp(operation.providerCgroup.data() + operation.providerCgroup.size() - expectedCgroupSuffix.size(),
+                    expectedCgroupSuffix.data(), expectedCgroupSuffix.size()) != 0 ||
+        mothershipVDCReadProcessFile(operation.worker.pid, "cgroup", operation.workerCgroup) == false)
+      return reject("retained provider cgroup identity mismatch");
+    String expectedWorker = {};
+    expectedWorker.assign(operation.providerCgroup.data(), operation.providerCgroup.size() - 9); // provider\n
+    String leaf = {}; leaf.snprintf<"machine{itoa}/prodigy-runtime\n"_ctv>(uint64_t(machineIndex));
+    expectedWorker.append(leaf);
+    if (operation.workerCgroup.equals(expectedWorker) == false || operation.worker.networkNamespace == operation.supervisor.networkNamespace)
+      return reject("selected worker does not own the expected isolated machine cgroup");
+    if (fileDigest(installedRoot, "prodigy.bundle.tar.zst", installedDigest) == false || installedDigest.equals(expectedOldSHA) == false ||
+        fileDigest(installedRoot, "prodigy", operation.oldExecutable) == false || executableMatches(operation.worker, operation.oldExecutable) == false)
+      return reject("selected worker installed bundle or executable differs from expected old artifact");
+    // The existing installer validates/extracts the approved Discombobulator
+    // artifact into this operation's private staging root before any signal.
+    if (prodigyInstallBundleToRoot(bundlePath, stagedRoot, failure) == false ||
+        fileDigest(stagedRoot, "prodigy", operation.successorExecutable) == false || save() == false) return false;
+  }
+  if (mothershipVDCDurableWrite(recoveryRoot, "active", directoryName, failure) == false) return false;
+  String selected = {}; selected.assignItoa(machineIndex);
+  if (mothershipVDCDurableWrite(directory, "selected-machine", selected, failure) == false) return false;
+
+  // Ordinary errors before the irreversible handoff leave the original owner
+  // running. A process crash keeps its durable phase for an explicit retry.
+  struct PrecommitRollback {
+    MothershipVDCBundleRecovery& operation;
+    ~PrecommitRollback() {
+      if (operation.phase < MothershipVDCRecoveryPhase::committed) {
+        if (operation.adopter.pid > 1) (void)mothershipVDCSignal(operation.adopter, SIGKILL);
+        char state = 0;
+        if (mothershipVDCProcessMatches(operation.supervisor, &state) && (state == 'T' || state == 't'))
+          (void)mothershipVDCSignal(operation.supervisor, SIGCONT);
+      }
+    }
+  } rollback {operation};
+  auto waitStopped = [&](const MothershipVDCProcessIdentity& process) {
+    for (unsigned i = 0; i < 100; ++i) {
+      char state = 0;
+      if (mothershipVDCProcessMatches(process, &state) == false) return false;
+      if (state == 'T' || state == 't') return true;
+      ::usleep(10000);
+    }
+    return false;
+  };
+  if (operation.phase < MothershipVDCRecoveryPhase::committed)
+  {
+    if (mothershipVDCSignal(operation.supervisor, SIGSTOP) == false || waitStopped(operation.supervisor) == false)
+      return reject("cannot freeze the exact retained provider");
+    operation.phase = MothershipVDCRecoveryPhase::frozen;
+    if (save() == false) return false;
+    String currentCgroup = {};
+    if (mothershipVDCReadProcessFile(operation.supervisor.pid, "cgroup", currentCgroup) == false || currentCgroup.equals(operation.providerCgroup) == false ||
+        executableMatches(operation.worker, operation.oldExecutable) == false)
+      return reject("retained process identity changed before provider handoff");
+    String readyPath = {}; mothershipVirtualDatacenterPath(directory, "ready", readyPath);
+    auto readReady = [&]() {
+      String receipt = {};
+      if (mothershipVDCRead(readyPath, receipt, 256) == false) return false;
+      unsigned long long pid = 0, start = 0, mount = 0, runtime = 0; char extra = 0;
+      if (std::sscanf(receipt.c_str(), "%llu %llu %llu %llu %c", &pid, &start, &mount, &runtime, &extra) != 4 || runtime != operation.runtimeIdentity ||
+          mount != operation.supervisor.mountNamespace) return false;
+      MothershipVDCProcessIdentity observed = {};
+      Vector<String> args = {};
+      if (mothershipVDCReadProcess(pid, observed) == false || observed.startTime != start || observed.mountNamespace != mount ||
+          observed.networkNamespace != operation.supervisor.networkNamespace || mothershipVDCReadArguments(pid, args) == false ||
+          args.size() != 17 || args[2].equals("--serve-adopt"_ctv) == false || args[4].equals(directory) == false) return false;
+      operation.adopter = observed;
+      return true;
+    };
+    if (readReady() == false)
+    {
+      int providerFD = -1;
+      if (mothershipCreateVirtualDatacenterProviderFD(providerFD, failure) == false) return false;
+      CloseFD image {providerFD}, mount, retainedCgroup;
+      String mountPath = {}; mountPath.snprintf<"/proc/{itoa}/ns/mnt"_ctv>(operation.supervisor.pid);
+      mount.fd = ::open(mountPath.c_str(), O_RDONLY | O_CLOEXEC);
+      if (mount.fd < 0 || mothershipVDCProcessMatches(operation.supervisor) == false) return reject("retained provider mount namespace unavailable");
+      String cgroupNamespacePath = {};
+      cgroupNamespacePath.snprintf<"/proc/{itoa}/ns/cgroup"_ctv>(operation.worker.pid);
+      // Preserve the original cgroup namespace root while the new process joins
+      // the existing runtime leaf. Creating a namespace from that leaf would
+      // hide sibling container cgroups; joining the internal parent is EBUSY.
+      retainedCgroup.fd = ::open(cgroupNamespacePath.c_str(), O_RDONLY);
+      struct stat cgroupNamespace = {};
+      if (retainedCgroup.fd < 0 || ::fstat(retainedCgroup.fd, &cgroupNamespace) != 0 ||
+          uint64_t(cgroupNamespace.st_ino) != operation.worker.cgroupNamespace || mothershipVDCProcessMatches(operation.worker) == false)
+        return reject("selected worker cgroup namespace identity changed");
+      String retainedCgroupFD = {}; retainedCgroupFD.assignItoa(retainedCgroup.fd);
+      String providerPath = {}, runtime = {}, logPath = {};
+      providerPath.snprintf<"/proc/self/fd/{itoa}"_ctv>(uint64_t(providerFD));
+      runtime.assignItoa(operation.runtimeIdentity);
+      mothershipVirtualDatacenterPath(directory, "provider.log", logPath);
+      Vector<char *> argv = {};
+      argv.push_back(const_cast<char *>("/bin/bash")); argv.push_back(const_cast<char *>(providerPath.c_str()));
+      argv.push_back(const_cast<char *>("--serve-adopt")); argv.push_back(const_cast<char *>(runtime.c_str())); argv.push_back(const_cast<char *>(directory.c_str()));
+      for (String& argument : operation.providerArguments) argv.push_back(const_cast<char *>(argument.c_str()));
+      argv.push_back(nullptr);
+      pid_t child = ::fork();
+      if (child == 0)
+      {
+        if (::setsid() < 0 || ::setns(mount.fd, CLONE_NEWNS) != 0 ||
+            ::setenv("PRODIGY_VDC_RECOVERY_CGROUP_FD", retainedCgroupFD.c_str(), 1) != 0) _exit(125);
+        int log = ::open(logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+        int input = ::open("/dev/null", O_RDONLY);
+        if (log < 0 || input < 0 || ::dup2(log, STDOUT_FILENO) < 0 || ::dup2(log, STDERR_FILENO) < 0 || ::dup2(input, STDIN_FILENO) < 0) _exit(125);
+        ::execv("/bin/bash", argv.data()); _exit(127);
+      }
+      if (child < 0) return reject("cannot launch retained provider adopter");
+      bool ready = false;
+      for (unsigned attempt = 0; attempt < 200; ++attempt) {
+        if (readReady()) { ready = true; break; }
+        int status = 0; if (::waitpid(child, &status, WNOHANG) == child) break;
+        ::usleep(50000);
+      }
+      if (ready == false) {
+        MothershipVDCProcessIdentity pending = {};
+        if (mothershipVDCReadProcess(child, pending)) (void)mothershipVDCSignal(pending, SIGKILL);
+        return reject("retained provider adopter did not become ready");
+      }
+    }
+    operation.phase = MothershipVDCRecoveryPhase::ready;
+    if (save() == false || mothershipVDCProcessMatches(operation.supervisor) == false || mothershipVDCProcessMatches(operation.adopter) == false) return false;
+    operation.phase = MothershipVDCRecoveryPhase::committed;
+    if (save() == false) { operation.phase = MothershipVDCRecoveryPhase::ready; return false; }
+  }
+  if (mothershipVDCProcessMatches(operation.adopter) == false) return reject("committed provider owner is unavailable; retained resources remain held");
+  if (mothershipVDCProcessMatches(operation.supervisor) && mothershipVDCSignal(operation.supervisor, SIGKILL) == false)
+    return reject("cannot retire the exact frozen provider");
+  if (mothershipVDCDurableWrite(directory, "commit", directoryName, failure) == false) return false;
+  bool owns = false;
+  for (unsigned i = 0; i < 100; ++i) {
+    uint64_t pid = 0;
+    if (mothershipVDCReadNumber(pidPath, pid) && pid == operation.adopter.pid) { owns = true; break; }
+    ::usleep(50000);
+  }
+  if (owns == false) return reject("committed provider has not published ownership");
+
+  if (operation.phase == MothershipVDCRecoveryPhase::committed)
+  {
+    if (mothershipVDCSignal(operation.worker, SIGSTOP) == false || waitStopped(operation.worker) == false ||
+        executableMatches(operation.worker, operation.oldExecutable) == false) return reject("selected worker changed before replacement; recovery remains held");
+    operation.phase = MothershipVDCRecoveryPhase::workerStopped;
+    if (save() == false) return false;
+  }
+  if (operation.phase == MothershipVDCRecoveryPhase::workerStopped)
+  {
+    if (mothershipVDCProcessMatches(operation.worker) && mothershipVDCSignal(operation.worker, SIGKILL) == false)
+      return reject("cannot stop exact selected worker; recovery remains held");
+    for (unsigned i = 0; i < 100 && mothershipVDCProcessMatches(operation.worker); ++i) ::usleep(10000);
+    if (mothershipVDCProcessMatches(operation.worker)) return reject("selected worker has not exited");
+    operation.phase = MothershipVDCRecoveryPhase::workerKilled;
+    if (save() == false) return false;
+  }
+  if (operation.phase == MothershipVDCRecoveryPhase::workerKilled)
+  {
+    String installed = {}, previous = {}, staged = {};
+    bool rootExists = ::access(installedRoot.c_str(), F_OK) == 0;
+    bool previousExists = ::access(previousRoot.c_str(), F_OK) == 0;
+    if (rootExists && fileDigest(installedRoot, "prodigy.bundle.tar.zst", installed) == false) return false;
+    if (previousExists && (fileDigest(previousRoot, "prodigy.bundle.tar.zst", previous) == false || previous.equals(expectedOldSHA) == false))
+      return reject("recovery previous runtime identity mismatch");
+    if (installed.equals(successorSHA) == false)
+    {
+      if (fileDigest(stagedRoot, "prodigy.bundle.tar.zst", staged) == false || staged.equals(successorSHA) == false ||
+          (rootExists && (installed.equals(expectedOldSHA) == false || previousExists))) return reject("recovery runtime swap identity mismatch");
+      if (rootExists && ::rename(installedRoot.c_str(), previousRoot.c_str()) != 0) return reject("cannot retain previous runtime root");
+      if (::rename(stagedRoot.c_str(), installedRoot.c_str()) != 0) return reject("cannot install approved recovery runtime root");
+    }
+    else if (previousExists == false) return reject("successor runtime has no retained predecessor root");
+    // Both source and target rename directories must be durable before launch.
+    String machineRoot = {}; machineRoot.snprintf<"{}/machines/{itoa}/root"_ctv>(cluster.test.workspaceRoot, uint64_t(machineIndex));
+    if (mothershipVDCDurableWrite(machineRoot, ".recovery-owner", directoryName, failure) == false ||
+        mothershipVDCDurableWrite(directory, "root-installed", directoryName, failure) == false) return false;
+    operation.phase = MothershipVDCRecoveryPhase::rootInstalled;
+    if (save() == false) return false;
+  }
+  if (operation.phase == MothershipVDCRecoveryPhase::rootInstalled)
+  {
+    operation.phase = MothershipVDCRecoveryPhase::launchRequested;
+    if (save() == false) return false;
+  }
+  if (operation.phase == MothershipVDCRecoveryPhase::launchRequested)
+  {
+    if (mothershipVDCDurableWrite(directory, "launch", directoryName, failure) == false) return false;
+    String replacedPath = {}; mothershipVirtualDatacenterPath(directory, "replaced", replacedPath);
+    bool replaced = false;
+    for (unsigned attempt = 0; attempt < 300; ++attempt)
+    {
+      String receipt = {}, cgroup = {};
+      unsigned long long pid = 0, start = 0, net = 0; char extra = 0;
+      MothershipVDCProcessIdentity observed = {};
+      if (mothershipVDCRead(replacedPath, receipt, 256) &&
+          std::sscanf(receipt.c_str(), "%llu %llu %llu %c", &pid, &start, &net, &extra) == 3 && pid != operation.worker.pid &&
+          mothershipVDCReadProcess(pid, observed) && observed.startTime == start && observed.networkNamespace == operation.worker.networkNamespace &&
+          observed.cgroupNamespace == operation.worker.cgroupNamespace &&
+          executableMatches(observed, operation.successorExecutable) && mothershipVDCReadProcessFile(pid, "cgroup", cgroup) && cgroup.equals(operation.workerCgroup))
+      { operation.replacement = observed; replaced = true; break; }
+      ::usleep(50000);
+    }
+    if (replaced == false) return reject("replacement runtime was not observed; provider retains selected machine without cgroup reset");
+    operation.phase = MothershipVDCRecoveryPhase::replaced;
+    if (save() == false) return false;
+  }
+  if (executableMatches(operation.replacement, operation.successorExecutable) == false) return reject("replacement runtime identity no longer matches completed recovery");
+  operation.phase = MothershipVDCRecoveryPhase::complete;
+  if (save() == false || mothershipVDCDurableWrite(directory, "complete", directoryName, failure) == false) return false;
+  if (failure) failure->clear();
   return true;
 }
 
@@ -8994,6 +9301,41 @@ private:
       exit(EXIT_FAILURE);
     }
     basics_log("faultTestCluster success=1 identity=%s mode=%s machineIndices=%s\n", identity.c_str(), mode.c_str(), machineIndices.c_str());
+  }
+
+  void runRecoverTestClusterBundle(int argc, char *argv[])
+  {
+    if (argc != 4)
+    {
+      basics_log("recoverTestClusterBundle expects [name|clusterUUID] [approved bundle] [machine index] [expected installed bundle SHA256]\n");
+      exit(EXIT_FAILURE);
+    }
+    String identity = {}; identity.assign(argv[0]);
+    String input = {}; input.assign(argv[1]);
+    String oldSHA = {}; oldSHA.assign(argv[3]);
+    String failure = {};
+    MothershipProdigyCluster cluster = {};
+    uint64_t index = 0;
+    if (loadClusterForScopedMutation("recoverTestClusterBundle", identity, cluster, failure) == false ||
+        cluster.deploymentMode != MothershipClusterDeploymentMode::test ||
+        mothershipParseUnsignedArgument(argv[2], cluster.test.machineCount, index) == false || index == 0 ||
+        prodigyIsSHA256HexDigest(oldSHA) == false)
+    {
+      basics_log("recoverTestClusterBundle accepted=0 failure=%s\n", failure.empty() ? "invalid test-provider recovery request" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    MachineCpuArchitecture architecture = MachineCpuArchitecture::unknown;
+    String bundle = {}, successorSHA = {};
+    if (resolveProdigyBundleTargetArchitecture(argv[0], architecture, &failure) == false ||
+        prodigyResolveBundleArtifactInput(input, architecture, bundle, &failure) == false ||
+        prodigyApproveBundleArtifact(bundle, successorSHA, &failure) == false || successorSHA.equals(oldSHA) ||
+        mothershipRecoverVirtualDatacenterBundle(cluster, bundle, successorSHA, uint32_t(index), oldSHA, &failure) == false)
+    {
+      basics_log("recoverTestClusterBundle accepted=0 failure=%s\n", failure.empty() ? "recovery identity validation failed" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    basics_log("recoverTestClusterBundle accepted=1 phase=workerReplaced machineIndex=%u successorSHA256=%s applicationHealthAttested=0\n",
+               unsigned(index), successorSHA.c_str());
   }
 
   void runProbeTestCluster(int argc, char *argv[])
@@ -17849,6 +18191,7 @@ public:
         {"pullRoutableResourceLeases",      &Mothership::runPullRoutableResourceLeases     },
         {"pullRoutableSubnets",             &Mothership::runPullRoutableSubnets            },
         {"recommendClusterForApplications", &Mothership::runRecommendClusterForApplications},
+        {"recoverTestClusterBundle",        &Mothership::runRecoverTestClusterBundle       },
         {"recoverMaterializedStatefulDeployment", &Mothership::runRecoverMaterializedStatefulDeployment },
         {"registerRoutableSubnet",          &Mothership::runRegisterRoutableSubnet         },
         {"removeCluster",                   &Mothership::runRemoveCluster                  },
@@ -17904,7 +18247,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultTestCluster, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverMaterializedStatefulDeployment, taskReport, containerLogs, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
+        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultTestCluster, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, taskReport, containerLogs, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }
@@ -17947,6 +18290,8 @@ int main(int argc, char *argv[])
     message.append("\trequires deploymentMode=local and atomically replaces the stored local membership spec with exact json fields includeLocalMachine and machines before reconciling and persisting on live success\n");
     message.append("setTestClusterMachineCount [name|clusterUUID] [json]\n");
     message.append("\trequires deploymentMode=test and updates only test.machineCount through exact json field machineCount before restarting/reconciling and persisting on live success\n");
+    message.append("recoverTestClusterBundle [name|clusterUUID] [approved bundle] [machineIndex] [expected installed bundle SHA256]\n");
+    message.append("\tadopts an exact retained test-provider owner and replaces one worker while preserving descendant cgroups; application health must be observed separately\n");
     message.append("faultTestCluster [name|clusterUUID] [link|crash|flap] [machine indices csv] [durationMs] [cycles] [downMs] [upMs]\n");
     message.append("\trequests a bounded virtual-datacenter machine fault through the Mothership-owned test provider\n");
     message.append("probeTestCluster [name|clusterUUID] [address] [port] [payload] [expected] [timeoutMs] [sourceMachineIndex: 0=datacenter]\n");
