@@ -123,6 +123,9 @@ int main(void)
   recovery.expectedOldBundle.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
   recovery.successorBundle.assign("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv);
   recovery.providerArguments[0] = cluster.test.workspaceRoot;
+  recovery.expectedIncompleteWorkerBundle = recovery.expectedOldBundle;
+  recovery.previousBootSHA256 = recovery.expectedOldBundle;
+  recovery.successorBootSHA256 = recovery.successorBundle;
   char recoveryDirectory[] = "./vdc-recovery-unit.XXXXXX";
   const bool directoryCreated = ::mkdtemp(recoveryDirectory) != nullptr;
   suite.expect(directoryCreated, "recovery_creates_scoped_test_directory");
@@ -138,13 +141,44 @@ int main(void)
                  mothershipVDCSameProcess(restored.worker, recovery.worker) &&
                  mothershipVDCSameProcess(restored.adopter, recovery.adopter) &&
                  restored.expectedOldBundle == recovery.expectedOldBundle && restored.successorBundle == recovery.successorBundle &&
+                 restored.expectedIncompleteWorkerBundle == recovery.expectedIncompleteWorkerBundle &&
+                 restored.previousBootSHA256 == recovery.previousBootSHA256 && restored.successorBootSHA256 == recovery.successorBootSHA256 &&
                  restored.providerArguments[0] == cluster.test.workspaceRoot, "recovery_preserves_distinct_runtime_and_process_identity");
-    recovery.version = 2;
+    recovery.version = 3;
     suite.expect(mothershipVDCWriteRecovery(directory, recovery, &failure) && mothershipVDCReadRecovery(directory, restored) == false,
                  "recovery_rejects_unknown_journal_version");
     String path = {}; mothershipVirtualDatacenterPath(directory, "operation", path);
     ::unlink(path.c_str()); ::rmdir(recoveryDirectory);
   }
+
+  ProdigyPersistentBootState retainedBoot = {};
+  retainedBoot.bootstrapConfig.nodeRole = ProdigyBootstrapNodeRole::brain;
+  retainedBoot.bootstrapConfig.controlSocketPath = controlSocketPath;
+  retainedBoot.bootstrapSshPrivateKeyPath = "/root/.ssh/retained-private-key"_ctv;
+  retainedBoot.initialTopology = topology;
+  String originalBoot = {}, successorBoot = {};
+  renderProdigyPersistentBootStateJSON(retainedBoot, originalBoot);
+  recovery.machineIndex = 1;
+  recovery.providerArguments[11] = controlSocketPath;
+  suite.expect(mothershipVDCPrepareSupersessionBoot(originalBoot, recovery, successorBoot, &failure),
+               "recovery_prepares_bound_bootstrap_receipt");
+  ProdigyPersistentBootState successorState = {};
+  suite.expect(parseProdigyPersistentBootStateJSON(successorBoot, successorState, &failure) &&
+               successorState.bootstrapBundleSupersession.operationID == recovery.operationID &&
+               successorState.bootstrapBundleSupersession.clusterUUID == recovery.clusterUUID &&
+               successorState.bootstrapBundleSupersession.expectedIncompleteWorkerBundleSHA256 == recovery.expectedIncompleteWorkerBundle &&
+               successorState.bootstrapBundleSupersession.successorBundleSHA256 == recovery.successorBundle &&
+               successorState.bootstrapBundleSupersession.targetControlSocketPath == controlSocketPath &&
+               successorState.bootstrapSshPrivateKeyPath == retainedBoot.bootstrapSshPrivateKeyPath &&
+               successorState.initialTopology.machines.size() == retainedBoot.initialTopology.machines.size(),
+               "recovery_receipt_preserves_retained_boot_configuration");
+  recovery.machineIndex = 2;
+  suite.expect(mothershipVDCPrepareSupersessionBoot(originalBoot, recovery, successorBoot, &failure) == false,
+               "recovery_rejects_bootstrap_receipt_for_worker");
+  recovery.machineIndex = 1;
+  recovery.providerArguments[11] = "/tmp/another-cluster.sock"_ctv;
+  suite.expect(mothershipVDCPrepareSupersessionBoot(originalBoot, recovery, successorBoot, &failure) == false,
+               "recovery_rejects_bootstrap_control_identity_mismatch");
 
   // Signal only this test's own child. A stale start-time must not affect it.
   pid_t child = ::fork();

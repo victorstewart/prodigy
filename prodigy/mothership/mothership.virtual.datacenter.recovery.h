@@ -35,7 +35,7 @@ static void serialize(S&& serializer, MothershipVDCProcessIdentity& identity)
 
 class MothershipVDCBundleRecovery {
 public:
-  uint8_t version = 1;
+  uint8_t version = 2;
   uint128_t clusterUUID = 0;
   uint128_t operationID = 0;
   uint64_t runtimeIdentity = 0;
@@ -43,6 +43,7 @@ public:
   MothershipVDCRecoveryPhase phase = MothershipVDCRecoveryPhase::accepted;
   MothershipVDCProcessIdentity supervisor, worker, adopter, replacement;
   String expectedOldBundle, successorBundle, oldExecutable, successorExecutable;
+  String expectedIncompleteWorkerBundle, previousBootSHA256, successorBootSHA256;
   String providerCgroup, workerCgroup;
   String providerArguments[12];
 };
@@ -64,6 +65,9 @@ static void serialize(S&& serializer, MothershipVDCBundleRecovery& operation)
   serializer.text1b(operation.successorBundle, 64);
   serializer.text1b(operation.oldExecutable, 64);
   serializer.text1b(operation.successorExecutable, 64);
+  serializer.text1b(operation.expectedIncompleteWorkerBundle, 64);
+  serializer.text1b(operation.previousBootSHA256, 64);
+  serializer.text1b(operation.successorBootSHA256, 64);
   serializer.text1b(operation.providerCgroup, 4096);
   serializer.text1b(operation.workerCgroup, 4096);
   for (String& argument : operation.providerArguments) serializer.text1b(argument, 4096);
@@ -215,9 +219,37 @@ static inline bool mothershipVDCReadRecovery(const String& directory, Mothership
   String path = {}, serialized = {};
   mothershipVirtualDatacenterPath(directory, "operation", path);
   return mothershipVDCRead(path, serialized) && BitseryEngine::deserializeSafe(serialized, operation) &&
-         operation.version == 1 && operation.clusterUUID != 0 && operation.operationID != 0 &&
+         operation.version == 2 && operation.clusterUUID != 0 && operation.operationID != 0 &&
          operation.runtimeIdentity > 1 && operation.machineIndex > 0 &&
          operation.phase <= MothershipVDCRecoveryPhase::complete;
+}
+
+// Prepare through the boot-state owner before stopping anything. The caller
+// installs these exact bytes only after the selected Brain is stopped.
+static inline bool mothershipVDCPrepareSupersessionBoot(const String& original,
+    const MothershipVDCBundleRecovery& operation, String& successor, String *failure)
+{
+  ProdigyPersistentBootState boot = {};
+  if (operation.machineIndex != 1 || operation.operationID == 0 || operation.clusterUUID == 0 ||
+      prodigyIsSHA256HexDigest(operation.expectedIncompleteWorkerBundle) == false ||
+      prodigyIsSHA256HexDigest(operation.successorBundle) == false ||
+      operation.expectedIncompleteWorkerBundle.equals(operation.successorBundle) ||
+      parseProdigyPersistentBootStateJSON(original, boot, failure) == false ||
+      boot.bootstrapConfig.nodeRole != ProdigyBootstrapNodeRole::brain ||
+      boot.bootstrapConfig.controlSocketPath.empty() ||
+      boot.bootstrapConfig.controlSocketPath.equals(operation.providerArguments[11]) == false)
+  {
+    if (failure) failure->assign("bootstrap supersession does not target the retained Brain boot identity"_ctv);
+    return false;
+  }
+  auto& receipt = boot.bootstrapBundleSupersession;
+  receipt.operationID = operation.operationID;
+  receipt.clusterUUID = operation.clusterUUID;
+  receipt.expectedIncompleteWorkerBundleSHA256 = operation.expectedIncompleteWorkerBundle;
+  receipt.successorBundleSHA256 = operation.successorBundle;
+  receipt.targetControlSocketPath = boot.bootstrapConfig.controlSocketPath;
+  renderProdigyPersistentBootStateJSON(boot, successor);
+  return true;
 }
 
 static inline bool mothershipVDCReadProcessFile(uint64_t pid, const char *name, String& result)

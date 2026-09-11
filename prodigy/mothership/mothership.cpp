@@ -3653,9 +3653,12 @@ static bool mothershipRunVirtualDatacenterProvider(Vector<String> arguments, Str
 
 static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyCluster& cluster,
     const String& bundlePath, const String& successorSHA, uint32_t machineIndex,
-    const String& expectedOldSHA, String *failure)
+    const String& expectedOldSHA, const String& expectedIncompleteWorkerSHA, String *failure)
 {
   auto reject = [&](const char *message) { if (failure) failure->assign(message); return false; };
+  if (expectedIncompleteWorkerSHA.empty() == false && (machineIndex != 1 || cluster.nBrains != 1 ||
+      prodigyIsSHA256HexDigest(expectedIncompleteWorkerSHA) == false || expectedIncompleteWorkerSHA.equals(successorSHA)))
+    return reject("incomplete bundle supersession requires the sole Brain and a distinct expected pending digest");
   String lockPath = {};
   mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, "virtual-datacenter.recovery.lock", lockPath);
   struct CloseFD { int fd = -1; ~CloseFD() { if (fd >= 0) ::close(fd); } } lock;
@@ -3691,6 +3694,10 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
   mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, mothershipVirtualDatacenterRuntimeFilename, runtimePath);
   mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, mothershipVirtualDatacenterPIDFilename, pidPath);
   MothershipVDCBundleRecovery operation = {};
+  String bootDirectory = {}, bootPath = {};
+  mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, "boot", bootDirectory);
+  String bootName = {}; bootName.snprintf<"{itoa}.json"_ctv>(uint64_t(machineIndex));
+  mothershipVirtualDatacenterPath(bootDirectory, bootName.c_str(), bootPath);
   auto fileDigest = [&](const String& root, const char *filename, String& digest) {
     String path = {}; mothershipVirtualDatacenterPath(root, filename, path);
     return prodigyComputeFileSHA256Hex(path, digest, failure);
@@ -3705,6 +3712,7 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
   {
     if (mothershipVDCReadRecovery(directory, operation) == false || operation.clusterUUID != cluster.clusterUUID ||
         operation.machineIndex != machineIndex || operation.expectedOldBundle.equals(expectedOldSHA) == false ||
+        operation.expectedIncompleteWorkerBundle.equals(expectedIncompleteWorkerSHA) == false ||
         operation.successorBundle.equals(successorSHA) == false) return reject("provider recovery operation identity mismatch");
   }
   else
@@ -3714,6 +3722,7 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
     operation.machineIndex = machineIndex;
     operation.expectedOldBundle = expectedOldSHA;
     operation.successorBundle = successorSHA;
+    operation.expectedIncompleteWorkerBundle = expectedIncompleteWorkerSHA;
     uint64_t supervisorPID = 0;
     if (mothershipVDCReadNumber(pidPath, supervisorPID) == false || mothershipVDCReadProcess(supervisorPID, operation.supervisor) == false)
       return reject("retained provider process identity unavailable");
@@ -3763,7 +3772,18 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
     // The existing installer validates/extracts the approved Discombobulator
     // artifact into this operation's private staging root before any signal.
     if (prodigyInstallBundleToRoot(bundlePath, stagedRoot, failure) == false ||
-        fileDigest(stagedRoot, "prodigy", operation.successorExecutable) == false || save() == false) return false;
+        fileDigest(stagedRoot, "prodigy", operation.successorExecutable) == false) return false;
+    if (expectedIncompleteWorkerSHA.empty() == false)
+    {
+      String originalBoot = {}, successorBoot = {};
+      if (mothershipVDCRead(bootPath, originalBoot) == false ||
+          mothershipVDCPrepareSupersessionBoot(originalBoot, operation, successorBoot, failure) == false ||
+          prodigyComputeSHA256Hex(originalBoot, operation.previousBootSHA256, failure) == false ||
+          prodigyComputeSHA256Hex(successorBoot, operation.successorBootSHA256, failure) == false ||
+          mothershipVDCDurableWrite(directory, "previous-boot.json", originalBoot, failure) == false ||
+          mothershipVDCDurableWrite(directory, "successor-boot.json", successorBoot, failure) == false) return false;
+    }
+    if (save() == false) return false;
   }
   if (mothershipVDCDurableWrite(recoveryRoot, "active", directoryName, failure) == false) return false;
   String selected = {}; selected.assignItoa(machineIndex);
@@ -3801,6 +3821,12 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
     if (mothershipVDCReadProcessFile(operation.supervisor.pid, "cgroup", currentCgroup) == false || currentCgroup.equals(operation.providerCgroup) == false ||
         executableMatches(operation.worker, operation.oldExecutable) == false)
       return reject("retained process identity changed before provider handoff");
+    if (expectedIncompleteWorkerSHA.empty() == false)
+    {
+      String observedBootSHA = {};
+      if (prodigyComputeFileSHA256Hex(bootPath, observedBootSHA, failure) == false || observedBootSHA.equals(operation.previousBootSHA256) == false)
+        return reject("retained Brain boot identity changed before provider handoff");
+    }
     String readyPath = {}; mothershipVirtualDatacenterPath(directory, "ready", readyPath);
     auto readReady = [&]() {
       String receipt = {};
@@ -3925,11 +3951,32 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
   }
   if (operation.phase == MothershipVDCRecoveryPhase::rootInstalled)
   {
+    if (expectedIncompleteWorkerSHA.empty() == false)
+    {
+      String currentSHA = {}, stagedBoot = {}, stagedSHA = {}, stagedPath = {};
+      mothershipVirtualDatacenterPath(directory, "successor-boot.json", stagedPath);
+      if (prodigyComputeFileSHA256Hex(bootPath, currentSHA, failure) == false ||
+          mothershipVDCRead(stagedPath, stagedBoot) == false ||
+          prodigyComputeSHA256Hex(stagedBoot, stagedSHA, failure) == false || stagedSHA.equals(operation.successorBootSHA256) == false)
+        return reject("prepared Brain bootstrap receipt identity mismatch");
+      if (currentSHA.equals(operation.successorBootSHA256) == false)
+      {
+        if (currentSHA.equals(operation.previousBootSHA256) == false)
+          return reject("retained Brain boot changed while recovery was held");
+        if (mothershipVDCDurableWrite(bootDirectory, bootName.c_str(), stagedBoot, failure) == false) return false;
+      }
+    }
     operation.phase = MothershipVDCRecoveryPhase::launchRequested;
     if (save() == false) return false;
   }
   if (operation.phase == MothershipVDCRecoveryPhase::launchRequested)
   {
+    if (expectedIncompleteWorkerSHA.empty() == false)
+    {
+      String observedBootSHA = {};
+      if (prodigyComputeFileSHA256Hex(bootPath, observedBootSHA, failure) == false || observedBootSHA.equals(operation.successorBootSHA256) == false)
+        return reject("prepared Brain bootstrap receipt changed before launch");
+    }
     if (mothershipVDCDurableWrite(directory, "launch", directoryName, failure) == false) return false;
     String replacedPath = {}; mothershipVirtualDatacenterPath(directory, "replaced", replacedPath);
     bool replaced = false;
@@ -9306,21 +9353,23 @@ private:
 
   void runRecoverTestClusterBundle(int argc, char *argv[])
   {
-    if (argc != 4)
+    if (argc != 4 && argc != 5)
     {
-      basics_log("recoverTestClusterBundle expects [name|clusterUUID] [approved bundle] [machine index] [expected installed bundle SHA256]\n");
+      basics_log("recoverTestClusterBundle expects [name|clusterUUID] [approved bundle] [machine index] [expected installed bundle SHA256] [optional expected incomplete worker bundle SHA256 for sole Brain]\n");
       exit(EXIT_FAILURE);
     }
     String identity = {}; identity.assign(argv[0]);
     String input = {}; input.assign(argv[1]);
     String oldSHA = {}; oldSHA.assign(argv[3]);
+    String incompleteWorkerSHA = {}; if (argc == 5) incompleteWorkerSHA.assign(argv[4]);
     String failure = {};
     MothershipProdigyCluster cluster = {};
     uint64_t index = 0;
     if (loadClusterForScopedMutation("recoverTestClusterBundle", identity, cluster, failure) == false ||
         cluster.deploymentMode != MothershipClusterDeploymentMode::test ||
         mothershipParseUnsignedArgument(argv[2], cluster.test.machineCount, index) == false || index == 0 ||
-        prodigyIsSHA256HexDigest(oldSHA) == false)
+        prodigyIsSHA256HexDigest(oldSHA) == false ||
+        (argc == 5 && (prodigyIsSHA256HexDigest(incompleteWorkerSHA) == false || index != 1 || cluster.nBrains != 1)))
     {
       basics_log("recoverTestClusterBundle accepted=0 failure=%s\n", failure.empty() ? "invalid test-provider recovery request" : failure.c_str());
       exit(EXIT_FAILURE);
@@ -9330,7 +9379,7 @@ private:
     if (resolveProdigyBundleTargetArchitecture(argv[0], architecture, &failure) == false ||
         prodigyResolveBundleArtifactInput(input, architecture, bundle, &failure) == false ||
         prodigyApproveBundleArtifact(bundle, successorSHA, &failure) == false || successorSHA.equals(oldSHA) ||
-        mothershipRecoverVirtualDatacenterBundle(cluster, bundle, successorSHA, uint32_t(index), oldSHA, &failure) == false)
+        mothershipRecoverVirtualDatacenterBundle(cluster, bundle, successorSHA, uint32_t(index), oldSHA, incompleteWorkerSHA, &failure) == false)
     {
       basics_log("recoverTestClusterBundle accepted=0 failure=%s\n", failure.empty() ? "recovery identity validation failed" : failure.c_str());
       exit(EXIT_FAILURE);
@@ -18297,7 +18346,7 @@ int main(int argc, char *argv[])
     message.append("\trequires deploymentMode=local and atomically replaces the stored local membership spec with exact json fields includeLocalMachine and machines before reconciling and persisting on live success\n");
     message.append("setTestClusterMachineCount [name|clusterUUID] [json]\n");
     message.append("\trequires deploymentMode=test and updates only test.machineCount through exact json field machineCount before restarting/reconciling and persisting on live success\n");
-    message.append("recoverTestClusterBundle [name|clusterUUID] [approved bundle] [machineIndex] [expected installed bundle SHA256]\n");
+    message.append("recoverTestClusterBundle [name|clusterUUID] [approved bundle] [machineIndex] [expected installed bundle SHA256] [optional expected incomplete worker bundle SHA256 for sole Brain]\n");
     message.append("\tadopts an exact retained test-provider owner and replaces one worker while preserving descendant cgroups; application health must be observed separately\n");
     message.append("faultTestCluster [name|clusterUUID] [link|crash|flap] [machine indices csv] [durationMs] [cycles] [downMs] [upMs]\n");
     message.append("\trequests a bounded virtual-datacenter machine fault through the Mothership-owned test provider\n");
