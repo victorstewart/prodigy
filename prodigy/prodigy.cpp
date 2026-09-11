@@ -1235,6 +1235,15 @@ public:
     dnsProvider = new ProdigyDefaultDNSProvider();
     configureDNSProviderRuntime({.http = hostControlNetwork.http(),
                                  .delay = ProdigyHostDelayOperation::submission()});
+
+    const bool bootstrapSupersessionSingleBrain =
+        havePersistedBrainSnapshot && clusterTopologyBrainCount(persistedBrainSnapshot.topology) == 1;
+    String bootstrapSupersessionFailure = {};
+    if (consumeBootstrapBundleSupersessionReceipt(persistentBootState, bootstrapSupersessionSingleBrain, &bootstrapSupersessionFailure) == false)
+    {
+      basics_log("prodigy startup rejected bootstrap bundle supersession: %s\n", bootstrapSupersessionFailure.c_str());
+      _exit(EXIT_FAILURE);
+    }
   }
 
   ~ProdigyBrain()

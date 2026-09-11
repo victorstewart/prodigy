@@ -18,6 +18,53 @@
 #include <services/base64.h>
 #include <services/random.h>
 
+class ProdigyBootstrapBundleSupersessionReceipt {
+public:
+
+  // Input-only boot receipt. Mothership supplies it on replacement startup;
+  // accepted state is committed through the existing brain snapshot.
+  uint128_t operationID = 0;
+  uint128_t clusterUUID = 0;
+  String expectedIncompleteWorkerBundleSHA256;
+  String successorBundleSHA256;
+  String targetControlSocketPath;
+
+  bool present(void) const { return operationID != 0; }
+};
+
+static inline bool prodigyParseCanonicalHex128(const String& text, uint128_t& result)
+{
+  if (text.size() < 3 || text[0] != '0' || text[1] != 'x' || text.size() > 34) return false;
+  uint128_t value = 0;
+  for (uint64_t i = 2; i < text.size(); i += 1)
+  {
+    const char c = text[i];
+    uint8_t digit = 0;
+    if (c >= '0' && c <= '9') digit = uint8_t(c - '0');
+    else if (c >= 'a' && c <= 'f') digit = uint8_t(c - 'a' + 10);
+    else return false;
+    value = (value << 4) | digit;
+  }
+  if (value == 0) return false;
+  String canonical = {};
+  canonical.assignItoh(value);
+  if (canonical.equals(text) == false) return false;
+  result = value;
+  return true;
+}
+
+static inline bool prodigySHA256HexIsCanonical(const String& value)
+{
+  if (value.size() != 64) return false;
+  for (uint64_t i = 0; i < value.size(); i += 1)
+  {
+    const char c = value[i];
+    if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) continue;
+    return false;
+  }
+  return true;
+}
+
 class ProdigyPersistentBootState {
 public:
 
@@ -28,6 +75,7 @@ public:
   String bootstrapSshPrivateKeyPath;
   ProdigyRuntimeEnvironmentConfig runtimeEnvironment;
   ClusterTopology initialTopology; // boot-only authoritative topology for first start before any brain snapshot exists
+  ProdigyBootstrapBundleSupersessionReceipt bootstrapBundleSupersession; // input-only; excluded from binary boot persistence
 
   bool operator==(const ProdigyPersistentBootState& other) const
   {
@@ -1208,6 +1256,49 @@ static inline bool parseProdigyRuntimeEnvironmentConfigJSONElement(simdjson::dom
   return true;
 }
 
+static inline bool parseProdigyBootstrapBundleSupersessionReceiptJSONElement(
+    simdjson::dom::element value,
+    ProdigyBootstrapBundleSupersessionReceipt& receipt,
+    String *failure = nullptr)
+{
+  if (value.type() != simdjson::dom::element_type::OBJECT)
+  {
+    if (failure) failure->assign("bootstrapBundleSupersession requires object"_ctv);
+    return false;
+  }
+  String operationID = {}, clusterUUID = {};
+  bool sawOperationID = false, sawClusterUUID = false, sawExpected = false, sawSuccessor = false, sawSocket = false;
+  ProdigyBootstrapBundleSupersessionReceipt parsed = {};
+  for (auto field : value.get_object())
+  {
+    String key = {}; key.setInvariant(field.key.data(), field.key.size());
+    if (field.value.type() != simdjson::dom::element_type::STRING)
+    {
+      if (failure) failure->assign("bootstrapBundleSupersession fields require strings"_ctv);
+      return false;
+    }
+    String text = {}; text.assign(field.value.get_c_str());
+    if (key == "operationID"_ctv) { operationID = std::move(text); sawOperationID = true; }
+    else if (key == "clusterUUID"_ctv) { clusterUUID = std::move(text); sawClusterUUID = true; }
+    else if (key == "expectedIncompleteWorkerBundleSHA256"_ctv) { parsed.expectedIncompleteWorkerBundleSHA256 = std::move(text); sawExpected = true; }
+    else if (key == "successorBundleSHA256"_ctv) { parsed.successorBundleSHA256 = std::move(text); sawSuccessor = true; }
+    else if (key == "targetControlSocketPath"_ctv) { parsed.targetControlSocketPath = std::move(text); sawSocket = true; }
+    else { if (failure) failure->assign("invalid bootstrapBundleSupersession field"_ctv); return false; }
+  }
+  if (!(sawOperationID && sawClusterUUID && sawExpected && sawSuccessor && sawSocket) ||
+      prodigyParseCanonicalHex128(operationID, parsed.operationID) == false ||
+      prodigyParseCanonicalHex128(clusterUUID, parsed.clusterUUID) == false ||
+      prodigySHA256HexIsCanonical(parsed.expectedIncompleteWorkerBundleSHA256) == false ||
+      prodigySHA256HexIsCanonical(parsed.successorBundleSHA256) == false ||
+      parsed.targetControlSocketPath.empty())
+  {
+    if (failure) failure->assign("invalid bootstrapBundleSupersession receipt"_ctv);
+    return false;
+  }
+  receipt = std::move(parsed);
+  return true;
+}
+
 static inline bool parseProdigyPersistentBootStateJSON(const String& json, ProdigyPersistentBootState& state, String *failure = nullptr)
 {
   simdjson::dom::parser parser;
@@ -1343,6 +1434,13 @@ static inline bool parseProdigyPersistentBootStateJSON(const String& json, Prodi
     else if (key == "runtimeEnvironment"_ctv)
     {
       if (parseProdigyRuntimeEnvironmentConfigJSONElement(field.value, parsed.runtimeEnvironment, failure) == false)
+      {
+        return false;
+      }
+    }
+    else if (key == "bootstrapBundleSupersession"_ctv)
+    {
+      if (parseProdigyBootstrapBundleSupersessionReceiptJSONElement(field.value, parsed.bootstrapBundleSupersession, failure) == false)
       {
         return false;
       }
@@ -1741,6 +1839,20 @@ static inline void renderProdigyPersistentBootStateJSON(const ProdigyPersistentB
       json.append("}"_ctv);
     }
 
+    json.append("}"_ctv);
+  }
+
+  if (state.bootstrapBundleSupersession.present())
+  {
+    const ProdigyBootstrapBundleSupersessionReceipt& receipt = state.bootstrapBundleSupersession;
+    String operationID = {}, clusterUUID = {};
+    operationID.assignItoh(receipt.operationID);
+    clusterUUID.assignItoh(receipt.clusterUUID);
+    json.append(",\"bootstrapBundleSupersession\":{\"operationID\":"_ctv); appendEscapedJSONString(json, operationID);
+    json.append(",\"clusterUUID\":"_ctv); appendEscapedJSONString(json, clusterUUID);
+    json.append(",\"expectedIncompleteWorkerBundleSHA256\":"_ctv); appendEscapedJSONString(json, receipt.expectedIncompleteWorkerBundleSHA256);
+    json.append(",\"successorBundleSHA256\":"_ctv); appendEscapedJSONString(json, receipt.successorBundleSHA256);
+    json.append(",\"targetControlSocketPath\":"_ctv); appendEscapedJSONString(json, receipt.targetControlSocketPath);
     json.append("}"_ctv);
   }
 

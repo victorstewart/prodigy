@@ -22841,6 +22841,84 @@ public:
     updateSelfRelinquishIssuedPeerKeys.clear();
   }
 
+  bool consumeBootstrapBundleSupersessionReceipt(
+      const ProdigyPersistentBootState& bootState,
+      bool singleBrainTopologyConfirmed,
+      String *failure = nullptr,
+      const String *installedBundleOverride = nullptr)
+  {
+    if (failure) failure->clear();
+    const ProdigyBootstrapBundleSupersessionReceipt& receipt = bootState.bootstrapBundleSupersession;
+    if (receipt.present() == false) return true;
+
+    // This narrow recovery is only a one-Brain test-cluster bootstrap. The
+    // control socket and persisted cluster UUID bind the Mothership receipt to
+    // this restored authority, rather than to an ambient replacement process.
+    if (bootState.bootstrapConfig.nodeRole != ProdigyBootstrapNodeRole::brain ||
+        receipt.targetControlSocketPath.equals(bootState.bootstrapConfig.controlSocketPath) == false ||
+        brainConfig.clusterUUID == 0 || brainConfig.clusterUUID != receipt.clusterUUID ||
+        singleBrainTopologyConfirmed == false)
+    {
+      if (failure) failure->assign("bootstrap bundle supersession receipt does not target this single-brain authority"_ctv);
+      return false;
+    }
+
+    String installedBundle = {};
+    if (installedBundleOverride != nullptr)
+    {
+      installedBundle = *installedBundleOverride;
+    }
+    else
+    {
+      String installedPath = {};
+      prodigyResolveInstalledBundlePathForRoot("/root/prodigy"_ctv, installedPath);
+      if (prodigyFileReadable(installedPath) == false)
+      {
+        if (failure) failure->assign("bootstrap bundle supersession installed successor bundle is unavailable"_ctv);
+        return false;
+      }
+      Filesystem::openReadAtClose(-1, installedPath, installedBundle);
+    }
+    String actualDigest = {}, digestFailure = {};
+    if (prodigyComputeSHA256Hex(installedBundle, actualDigest, &digestFailure) == false ||
+        actualDigest.equals(receipt.successorBundleSHA256) == false)
+    {
+      if (failure) failure->assign("bootstrap bundle supersession successor payload digest mismatch"_ctv);
+      return false;
+    }
+
+    // The prior process may have completed before a replacement launch. Its
+    // retained receipt must not open a second operation on a clean authority.
+    if (updateSelfWorkerMachineUUIDs.empty() && updateSelfWorkerExpectedBundleSHA256.empty()) return true;
+
+    // Retrying an already durable replacement is intentionally a no-op.
+    if (updateSelfWorkerMachineUUIDs.empty() == false &&
+        updateSelfWorkerExpectedBundleSHA256.equals(receipt.successorBundleSHA256) &&
+        updateSelfBundleBlob.equals(installedBundle)) return true;
+
+    if (updateSelfWorkerMachineUUIDs.empty() ||
+        updateSelfWorkerStateUploadedMachineUUIDs.size() == updateSelfWorkerMachineUUIDs.size() ||
+        updateSelfWorkerExpectedBundleSHA256.equals(receipt.expectedIncompleteWorkerBundleSHA256) == false)
+    {
+      if (failure) failure->assign("bootstrap bundle supersession expected incomplete update does not match"_ctv);
+      return false;
+    }
+
+    updateSelfBundleBlob = installedBundle;
+    updateSelfWorkerExpectedBundleSHA256 = receipt.successorBundleSHA256;
+    updateSelfWorkerFailure.clear();
+    updateSelfWorkerStagedMachineUUIDs.clear();
+    updateSelfWorkerTransitionIssuedMachineUUIDs.clear();
+    updateSelfWorkerRebootedMachineUUIDs.clear();
+    updateSelfWorkerStateUploadedMachineUUIDs.clear();
+    if (commitMasterAuthorityStateChange() == false)
+    {
+      if (failure) failure->assign("bootstrap bundle supersession state could not be persisted"_ctv);
+      return false;
+    }
+    return true;
+  }
+
   bool devSharedStagedBundleEnabled(void) const
   {
     if (const char *sharedStageEnv = getenv("PRODIGY_DEV_SHARED_STAGE_BUNDLE");

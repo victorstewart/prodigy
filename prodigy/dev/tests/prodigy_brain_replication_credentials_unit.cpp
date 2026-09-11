@@ -9190,6 +9190,108 @@ static void testUpdateProdigyRejectsDifferentDigestWithoutMutation(TestSuite& su
   else ::unlink(path.c_str());
 }
 
+static void testBootstrapBundleSupersessionReceipt(TestSuite& suite)
+{
+  TestBrain brain = {};
+  Machine worker = {};
+  Machine secondWorker = {};
+  worker.uuid = 0x9011;
+  secondWorker.uuid = 0x9012;
+  worker.neuron.machine = &worker;
+  secondWorker.neuron.machine = &secondWorker;
+  worker.neuron.isFixedFile = true;
+  worker.neuron.fslot = 4;
+  worker.neuron.connected = true;
+  brain.machines.insert(&worker);
+  brain.machines.insert(&secondWorker);
+  brain.brainConfig.clusterUUID = 0x77112233;
+
+  const String oldBundle = "bootstrap-old-bundle"_ctv;
+  const String successorBundle = "bootstrap-successor-bundle"_ctv;
+  String oldDigest = {}, successorDigest = {}, failure = {};
+  suite.expect(prodigyComputeSHA256Hex(oldBundle, oldDigest, &failure) &&
+                   prodigyComputeSHA256Hex(successorBundle, successorDigest, &failure),
+               "bootstrap_supersession_computes_bundle_digests");
+
+  ProdigyPersistentBootState boot = {};
+  boot.bootstrapConfig.nodeRole = ProdigyBootstrapNodeRole::brain;
+  boot.bootstrapConfig.controlSocketPath.assign("/run/prodigy/control.sock"_ctv);
+  ProdigyBootstrapBundleSupersessionReceipt& receipt = boot.bootstrapBundleSupersession;
+  receipt.operationID = 0x8811;
+  receipt.clusterUUID = brain.brainConfig.clusterUUID;
+  receipt.expectedIncompleteWorkerBundleSHA256 = oldDigest;
+  receipt.successorBundleSHA256 = successorDigest;
+  receipt.targetControlSocketPath = boot.bootstrapConfig.controlSocketPath;
+
+  brain.updateSelfWorkerExpectedBundleSHA256 = oldDigest;
+  brain.updateSelfBundleBlob = oldBundle;
+  brain.updateSelfWorkerFailure.assign("old failure"_ctv);
+  brain.updateSelfWorkerMachineUUIDs.insert(worker.uuid);
+  brain.updateSelfWorkerMachineUUIDs.insert(secondWorker.uuid);
+  brain.updateSelfWorkerStagedMachineUUIDs.insert(worker.uuid);
+  brain.updateSelfWorkerStagedMachineUUIDs.insert(secondWorker.uuid);
+  brain.updateSelfWorkerTransitionIssuedMachineUUIDs.insert(worker.uuid);
+  brain.updateSelfWorkerRebootedMachineUUIDs.insert(worker.uuid);
+  brain.updateSelfWorkerStateUploadedMachineUUIDs.insert(worker.uuid);
+  brain.updateSelfWorkerStateUploadedMachineUUIDs.clear(); // incomplete old operation
+
+  String legacy = {}, withReceipt = {};
+  ProdigyPersistentBootState legacyBoot = boot;
+  legacyBoot.bootstrapBundleSupersession = {};
+  BitseryEngine::serialize(legacy, legacyBoot);
+  BitseryEngine::serialize(withReceipt, boot);
+  suite.expect(legacy == withReceipt, "bootstrap_supersession_preserves_legacy_boot_binary_codec");
+  String renderedBoot = {}, parseFailure = {};
+  ProdigyPersistentBootState parsedBoot = {};
+  renderProdigyPersistentBootStateJSON(boot, renderedBoot);
+  suite.expect(parseProdigyPersistentBootStateJSON(renderedBoot, parsedBoot, &parseFailure) &&
+                   parsedBoot.bootstrapBundleSupersession.operationID == receipt.operationID &&
+                   parsedBoot.bootstrapBundleSupersession.clusterUUID == receipt.clusterUUID &&
+                   parsedBoot.bootstrapBundleSupersession.successorBundleSHA256.equals(successorDigest),
+               "bootstrap_supersession_boot_json_round_trips_typed_receipt");
+
+  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, &failure, &successorBundle),
+               "bootstrap_supersession_accepts_exact_incomplete_update");
+  suite.expect(brain.persistCalls == 1 && brain.lastPersistedMasterAuthorityState.updateSelf.workerExpectedBundleSHA256.equals(successorDigest),
+               "bootstrap_supersession_persists_successor_before_registration");
+  suite.expect(brain.updateSelfWorkerExpectedBundleSHA256.equals(successorDigest) &&
+                   brain.updateSelfBundleBlob.equals(successorBundle) &&
+                   brain.updateSelfWorkerMachineUUIDs.size() == 2 &&
+                   brain.updateSelfWorkerStagedMachineUUIDs.empty() &&
+                   brain.updateSelfWorkerTransitionIssuedMachineUUIDs.empty() &&
+                   brain.updateSelfWorkerRebootedMachineUUIDs.empty() &&
+                   brain.updateSelfWorkerStateUploadedMachineUUIDs.empty() &&
+                   brain.updateSelfWorkerFailure.empty(),
+               "bootstrap_supersession_resets_only_unproven_worker_acks");
+
+  brain.noteWorkerRegistration(&worker.neuron, successorDigest);
+  brain.noteWorkerStateUpload(&worker.neuron);
+  suite.expect(brain.updateSelfWorkerRebootedMachineUUIDs.empty() &&
+                   brain.updateSelfWorkerStateUploadedMachineUUIDs.empty() &&
+                   worker.neuron.wBuffer.empty() == false,
+               "bootstrap_supersession_requires_real_stage_and_registration_acks");
+
+  const uint32_t persistedAfterReplacement = brain.persistCalls;
+  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, &failure, &successorBundle) && brain.persistCalls == persistedAfterReplacement,
+               "bootstrap_supersession_same_tuple_retry_is_noop");
+
+  ProdigyPersistentUpdateSelfState beforeConflict = brain.capturePersistentUpdateSelfState();
+  boot.bootstrapBundleSupersession.successorBundleSHA256.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
+  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, &failure, &successorBundle) == false &&
+                   equalSerializedObjects(beforeConflict, brain.capturePersistentUpdateSelfState()),
+               "bootstrap_supersession_rejects_conflicting_tuple_without_mutation");
+  boot.bootstrapBundleSupersession.successorBundleSHA256 = successorDigest;
+  TestBrain noTargetBrain = {};
+  noTargetBrain.brainConfig.clusterUUID = brain.brainConfig.clusterUUID;
+  noTargetBrain.updateSelfWorkerExpectedBundleSHA256 = oldDigest;
+  const ProdigyPersistentUpdateSelfState noTargetBefore = noTargetBrain.capturePersistentUpdateSelfState();
+  suite.expect(noTargetBrain.consumeBootstrapBundleSupersessionReceipt(boot, true, &failure, &successorBundle) == false &&
+                   equalSerializedObjects(noTargetBefore, noTargetBrain.capturePersistentUpdateSelfState()),
+               "bootstrap_supersession_rejects_empty_target_without_mutation");
+  brain.machines.erase(&worker);
+  brain.machines.erase(&secondWorker);
+}
+
 static void testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(TestSuite& suite)
 {
   TestBrain brain = {};
@@ -21748,6 +21850,7 @@ int main(void)
     testUpdateProdigyRespondsBeforeSingleBrainTransition(suite);
     testUpdateProdigyDefersSuccessUntilWorkersRestore(suite);
     testUpdateProdigyRejectsDifferentDigestWithoutMutation(suite);
+    testBootstrapBundleSupersessionReceipt(suite);
     testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(suite);
     return suite.failed == 0 ? 0 : 1;
   }
