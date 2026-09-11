@@ -1084,6 +1084,13 @@ printf '%s\n' "${machine_pids[@]}" > "${runtime_path}.${pid}.tmp"
 mv -f "${runtime_path}.${pid}.tmp" "${runtime_path}"
 }
 
+recovery_hold()
+{
+   recovery_failed=1
+   printf "%s\n" "$1" > "${adopted_operation_dir}/failure.${pid}.tmp" 2>/dev/null || true
+   mv -f "${adopted_operation_dir}/failure.${pid}.tmp" "${adopted_operation_dir}/failure" 2>/dev/null || true
+}
+
 publish_runtime
 
 while true
@@ -1102,14 +1109,40 @@ do
          then
             wait "${machine_pid}" >/dev/null 2>&1 || true
             recovery_launch_started=1
-            start_machine "${index}"
-            publish_runtime
+            if ! start_machine "${index}"
+            then
+               recovery_hold "selected-worker-start-failed"
+               continue
+            fi
+            if ! publish_runtime
+            then
+               recovery_hold "selected-worker-publish-failed"
+               continue
+            fi
             replacement_pid="${machine_pids[$((index - 1))]}"
-            replacement_start="$(awk '{print $22}' "/proc/${replacement_pid}/stat")"
-            replacement_netns="$(stat -Lc %i "/proc/${replacement_pid}/ns/net")"
+            expected_netns="$(stat -Lc %i "/var/run/netns/${child_names[$((index - 1))]}" 2>/dev/null || true)"
+            replacement_start=""
+            replacement_netns=""
+            for _ in $(seq 1 100)
+            do
+               if [[ -r "/proc/${replacement_pid}/stat" && -e "/proc/${replacement_pid}/ns/net" ]]
+               then
+                  replacement_start="$(awk '{print $22}' "/proc/${replacement_pid}/stat" 2>/dev/null || true)"
+                  replacement_netns="$(stat -Lc %i "/proc/${replacement_pid}/ns/net" 2>/dev/null || true)"
+                  [[ -n "${replacement_start}" && -n "${expected_netns}" && "${replacement_netns}" == "${expected_netns}" ]] && break
+               fi
+               sleep 0.05
+            done
+            if [[ -z "${replacement_start}" || -z "${expected_netns}" || "${replacement_netns}" != "${expected_netns}" ]]
+            then
+               recovery_hold "selected-worker-not-ready"
+               continue
+            fi
             replacement_path="${adopted_operation_dir}/replaced"
-            printf "%s %s %s\n" "${replacement_pid}" "${replacement_start}" "${replacement_netns}" > "${replacement_path}.${pid}.tmp"
-            mv -f "${replacement_path}.${pid}.tmp" "${replacement_path}"
+            if ! printf "%s %s %s\n" "${replacement_pid}" "${replacement_start}" "${replacement_netns}" > "${replacement_path}.${pid}.tmp" || ! mv -f "${replacement_path}.${pid}.tmp" "${replacement_path}"
+            then
+               recovery_hold "selected-worker-receipt-failed"
+            fi
          fi
          continue
       fi
