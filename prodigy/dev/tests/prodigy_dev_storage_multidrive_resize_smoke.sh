@@ -172,7 +172,8 @@ expected_healthy=1
 handoff_id=""
 if [[ "${test_mode}" == legacy-handoff ]]
 then
-   machine_count=3
+   # Match the retained release topology: one controller and three workers.
+   machine_count=4
    expected_healthy=3
    application_type=stateful
    is_stateful=true
@@ -184,7 +185,7 @@ read -r -d '' CREATE_REQUEST <<EOF || true
   "name": "${cluster_name}",
   "deploymentMode": "test",
   "autoscaleIntervalSeconds": 3,
-  "nBrains": ${machine_count},
+  "nBrains": 1,
   "machineSchemas": [
     {
       "schema": "bootstrap",
