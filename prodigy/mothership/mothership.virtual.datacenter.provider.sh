@@ -74,7 +74,7 @@ run_machine()
       mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
       umount /sys/fs/cgroup >/dev/null 2>&1 || true
       mount -t cgroup2 -o nsdelegate cgroup2 /sys/fs/cgroup
-      mkdir /sys/fs/cgroup/prodigy-runtime
+      mkdir -p /sys/fs/cgroup/prodigy-runtime
       printf "%s\n" "$$" > /sys/fs/cgroup/prodigy-runtime/cgroup.procs
       umount /sys/fs/bpf >/dev/null 2>&1 || true
       mount -t bpf bpf /sys/fs/bpf
@@ -684,6 +684,8 @@ cleaned=0
 adoption_committed=0
 recovering_machine=0
 recovery_operation_id=""
+recovery_launch_started=0
+recovery_failed=0
 identity_path="${workspace}/virtual-datacenter.identity"
 
 atomic_write()
@@ -932,6 +934,7 @@ then
 
    host_ipv4_forward="$(sysctl -n net.ipv4.ip_forward)"
    host_ipv6_forward="$(sysctl -n net.ipv6.conf.all.forwarding)"
+   atomic_write "${workspace}/virtual-datacenter.forwarding" "${host_ipv4_forward} ${host_ipv6_forward}\n"
    sysctl -q -w net.ipv4.ip_forward=1
    sysctl -q -w net.ipv6.conf.all.forwarding=1
    iptables -t nat -A POSTROUTING ! -s 172.31.0.0/30 -d 198.18.0.0/16 -o "${host_edge}" -j SNAT --to-source 172.31.0.1
@@ -1006,9 +1009,12 @@ then
 else
    # Retained cgroup membership and the runtime receipt are the adoption source
    # of truth: application processes may have been reparented after worker exit.
-   resolve_cgroup_scope
-   cgroup_root="${cgroup_scope}/prodigy-vdc-${runtime_identity}"
-   [[ -d "${filesystem_root}" && -r "${runtime_path}" && -d "${cgroup_root}" ]] || failed 1 "$LINENO"
+   old_provider_pid="$(<"${pid_path}")"
+   [[ "${old_provider_pid}" =~ ^[0-9]+$ && -r "/proc/${old_provider_pid}/cgroup" ]] || failed 1 "$LINENO"
+   old_provider_cgroup="$(cut -d: -f3 "/proc/${old_provider_pid}/cgroup")"
+   [[ "${old_provider_cgroup}" == */prodigy-vdc-${runtime_identity}/provider ]] || failed 1 "$LINENO"
+   cgroup_root="/sys/fs/cgroup${old_provider_cgroup%/provider}"
+   [[ -d "${filesystem_root}" && -r "${runtime_path}" && -d "${cgroup_root}" && -w "${cgroup_root}/provider/cgroup.procs" ]] || failed 1 "$LINENO"
    mapfile -t machine_pids < "${runtime_path}"
    [[ "${#machine_pids[@]}" -eq "${machine_count}" ]] || failed 1 "$LINENO"
    for index in $(seq 1 "${machine_count}")
@@ -1046,6 +1052,8 @@ then
    # The committed adopter becomes the real provider process in the retained
    # provider cgroup. This is intentionally after the precommit receipt.
    printf "%s\n" "${pid}" > "${cgroup_root}/provider/cgroup.procs"
+   atomic_write "${pid_path}" "${pid}\n"
+   atomic_write "${identity_path}" "${runtime_identity}\n"
    adoption_committed=1
 fi
 
@@ -1090,9 +1098,10 @@ do
          if [[ -r "${adopted_operation_dir}/complete" && "$(<"${adopted_operation_dir}/complete")" == "${recovery_operation_id}" ]]
          then
             recovering_machine=0
-         elif [[ -r "${adopted_operation_dir}/launch" && "$(<"${adopted_operation_dir}/launch")" == "${recovery_operation_id}" ]] && ! kill -0 "${machine_pid}" >/dev/null 2>&1
+         elif [[ "${recovery_launch_started}" -eq 0 && -r "${adopted_operation_dir}/launch" && "$(<"${adopted_operation_dir}/launch")" == "${recovery_operation_id}" ]] && ! kill -0 "${machine_pid}" >/dev/null 2>&1
          then
             wait "${machine_pid}" >/dev/null 2>&1 || true
+            recovery_launch_started=1
             start_machine "${index}"
             publish_runtime
             replacement_pid="${machine_pids[$((index - 1))]}"
