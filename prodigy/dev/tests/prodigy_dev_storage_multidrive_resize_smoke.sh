@@ -19,6 +19,10 @@ is_handoff=0
 [[ "${test_mode}" != resize || "${storage_devices}" == 2 ]] || { echo "error: resize requires two storage devices" >&2; exit 2; }
 [[ "${is_handoff}" == 0 || ( "${storage_devices}" == 0 && -s "${upgrade_bundle}" ) ]] || { echo "error: legacy handoff requires zero devices and an exact upgrade bundle" >&2; exit 2; }
 [[ "${is_handoff}" == 0 || "${PRODIGY_STORAGE_HANDOFF_EXPECTED_RUNTIME_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || { echo "error: legacy handoff requires the sealed successor runtime hash" >&2; exit 2; }
+if [[ "${test_mode}" == provider-handoff ]]; then
+   create_mothership_bin="${PRODIGY_STORAGE_HANDOFF_CREATE_MOTHERSHIP_BIN:-}"
+   [[ -x "${create_mothership_bin}" ]] || { echo "error: provider-handoff requires executable sealed predecessor Mothership" >&2; exit 2; }
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/prodigy_dev_discombobulator_artifact_helpers.sh"
@@ -217,9 +221,10 @@ read -r -d '' CREATE_REQUEST <<EOF || true
 }
 EOF
 
+create_mothership_bin="${create_mothership_bin:-${MOTHERSHIP_BIN}}"
 if ! env \
    PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
-   "${MOTHERSHIP_BIN}" createCluster "${CREATE_REQUEST}" \
+   "${create_mothership_bin}" createCluster "${CREATE_REQUEST}" \
    >"${create_log}" 2>&1
 then
    echo "FAIL: createCluster test cluster failed"
