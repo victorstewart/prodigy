@@ -10,11 +10,11 @@ upgrade_bundle="${6:-}"
 case "${test_mode}" in
    resize) host_network=true ;;
    mount-only) host_network=false ;;
-   legacy-handoff|legacy-recovery) host_network=false ;;
-   *) echo "error: expected resize, mount-only, legacy-handoff or legacy-recovery mode" >&2; exit 2 ;;
+   legacy-handoff|legacy-recovery|provider-handoff) host_network=false ;;
+   *) echo "error: expected resize, mount-only, legacy-handoff, legacy-recovery or provider-handoff mode" >&2; exit 2 ;;
 esac
 is_handoff=0
-[[ "${test_mode}" != legacy-handoff && "${test_mode}" != legacy-recovery ]] || is_handoff=1
+[[ "${test_mode}" != legacy-handoff && "${test_mode}" != legacy-recovery && "${test_mode}" != provider-handoff ]] || is_handoff=1
 [[ "${storage_devices}" == 0 || "${storage_devices}" == 2 ]] || { echo "error: expected zero or two storage devices" >&2; exit 2; }
 [[ "${test_mode}" != resize || "${storage_devices}" == 2 ]] || { echo "error: resize requires two storage devices" >&2; exit 2; }
 [[ "${is_handoff}" == 0 || ( "${storage_devices}" == 0 && -s "${upgrade_bundle}" ) ]] || { echo "error: legacy handoff requires zero devices and an exact upgrade bundle" >&2; exit 2; }
@@ -27,7 +27,7 @@ prodigy_dev_reexec_in_private_mount_namespace_once PRODIGY_DEV_STORAGE_MULTIDRIV
 
 if [[ -z "${PRODIGY_BIN}" || -z "${MOTHERSHIP_BIN}" || -z "${PINGPONG_BIN}" ]]
 then
-   echo "usage: $0 /path/to/prodigy /path/to/mothership /path/to/prodigy_pingpong_container [resize|mount-only|legacy-handoff|legacy-recovery] [0|2 storage devices] [upgrade bundle]"
+   echo "usage: $0 /path/to/prodigy /path/to/mothership /path/to/prodigy_pingpong_container [resize|mount-only|legacy-handoff|legacy-recovery|provider-handoff] [0|2 storage devices] [upgrade bundle]"
    exit 2
 fi
 
@@ -408,7 +408,12 @@ probe = "import socket; s=socket.socket(socket.AF_INET6,socket.SOCK_STREAM); s.s
 deadline = time.monotonic() + 60
 last = ''
 while time.monotonic() < deadline:
-    children = (parent / 'task' / str(node['pid']) / 'children').read_text().split()
+    if os.environ.get('PRODIGY_STORAGE_HANDOFF_MODE') == 'provider-handoff':
+        children = []
+        for leaf in (parent / 'root/sys/fs/cgroup/containers.slice').glob('*.slice/leaf/cgroup.procs'):
+            children.extend(leaf.read_text().split())
+    else:
+        children = (parent / 'task' / str(node['pid']) / 'children').read_text().split()
     for pid in children:
         child = pathlib.Path('/proc') / pid
         try:
@@ -478,10 +483,11 @@ fi
 if [[ "${is_handoff}" == 1 ]]
 then
    archive_workspace=1
+   [[ "${test_mode}" == provider-handoff ]] && export PRODIGY_STORAGE_HANDOFF_MODE=provider-handoff
    observe_handoff()
    {
       python3 - "${manifest_path}" "${PINGPONG_BIN}" "${handoff_id}" "$1" "${tmpdir}" "${PRODIGY_STORAGE_HANDOFF_EXPECTED_RUNTIME_SHA256}" <<'PY'
-import hashlib, json, pathlib, re, sys
+import hashlib, json, pathlib, re, sys, os
 manifest, executable, identity, phase, output, runtime_hash = sys.argv[1:]
 root = pathlib.Path(output)
 nodes = json.loads(pathlib.Path(manifest).read_text())['nodes']
@@ -519,7 +525,8 @@ for node in nodes:
             assert (target.stat().st_dev, target.stat().st_ino) == (metadata.st_dev, metadata.st_ino)
             assert file.stat().st_uid == metadata.st_uid
             assert any(line.split()[4] == '/storage' for line in (child / 'mountinfo').read_text().splitlines())
-        records.append(dict(machineIndex=node['index'], parentPID=node['pid'], pid=int(pid), uuid=uuid,
+        starttime = (child / 'stat').read_text().split(') ',1)[1].split()[19]
+        records.append(dict(machineIndex=node['index'], parentPID=node['pid'], pid=int(pid), starttime=starttime, uuid=uuid,
                             device=metadata.st_dev, inode=metadata.st_ino, uid=metadata.st_uid,
                             networkNamespace=str((child / 'ns/net').readlink()),
                             cgroup=(child / 'cgroup').read_text(),
@@ -549,8 +556,19 @@ print('HANDOFF_OBSERVATION_PASS', phase, 'replicas=3')
 PY
    }
    observe_handoff before
-   env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
-      "${MOTHERSHIP_BIN}" updateProdigy "${cluster_name}" "${upgrade_bundle}" >"${tmpdir}/upgrade.log" 2>&1
+   if [[ "${test_mode}" == provider-handoff ]]; then
+      old_bundle_sha="${PRODIGY_STORAGE_HANDOFF_EXPECTED_OLD_RUNTIME_SHA256:-}"
+      [[ "${old_bundle_sha}" =~ ^[0-9a-f]{64}$ ]] || { echo "error: provider-handoff requires sealed old bundle SHA" >&2; exit 2; }
+      for machine_index in 2 3 4 1; do
+         env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+            "${MOTHERSHIP_BIN}" recoverTestClusterBundle "${cluster_name}" "${upgrade_bundle}" "${machine_index}" "${old_bundle_sha}" >>"${tmpdir}/upgrade.log" 2>&1
+         env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+            "${MOTHERSHIP_BIN}" recoverTestClusterBundle "${cluster_name}" "${upgrade_bundle}" "${machine_index}" "${old_bundle_sha}" >>"${tmpdir}/upgrade.log" 2>&1
+      done
+   else
+      env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+         "${MOTHERSHIP_BIN}" updateProdigy "${cluster_name}" "${upgrade_bundle}" >"${tmpdir}/upgrade.log" 2>&1
+   fi
    # updateProdigy acknowledges staging before every worker has completed its
    # exec handoff. Wait for observed exact bytes, not a staged=1 response.
    upgraded=0
