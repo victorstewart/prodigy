@@ -524,7 +524,7 @@ for node in nodes:
             assert (target.stat().st_dev, target.stat().st_ino) == (metadata.st_dev, metadata.st_ino)
             assert file.stat().st_uid == metadata.st_uid
             assert any(line.split()[4] == '/storage' for line in (child / 'mountinfo').read_text().splitlines())
-        starttime = (child / 'stat').read_text().split(') ',1)[1].split()[19]
+        starttime = (child / 'stat').read_text().rsplit(') ',1)[1].split()[19]
         records.append(dict(machineIndex=node['index'], parentPID=node['pid'], pid=int(pid), starttime=starttime, uuid=uuid,
                             device=metadata.st_dev, inode=metadata.st_ino, uid=metadata.st_uid,
                             networkNamespace=str((child / 'ns/net').readlink()),
@@ -556,7 +556,7 @@ PY
    }
    observe_handoff before
    if [[ "${test_mode}" == provider-handoff ]]; then
-      old_bundle_sha="${PRODIGY_STORAGE_HANDOFF_EXPECTED_OLD_RUNTIME_SHA256:-}"
+      old_bundle_sha="${PRODIGY_STORAGE_HANDOFF_EXPECTED_OLD_BUNDLE_SHA256:-}"
       [[ "${old_bundle_sha}" =~ ^[0-9a-f]{64}$ ]] || { echo "error: provider-handoff requires sealed old bundle SHA" >&2; exit 2; }
       for machine_index in 2 3 4 1; do
          env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
