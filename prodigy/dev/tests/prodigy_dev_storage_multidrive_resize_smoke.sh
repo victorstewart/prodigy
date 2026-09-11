@@ -10,20 +10,29 @@ upgrade_bundle="${6:-}"
 case "${test_mode}" in
    resize) host_network=true ;;
    mount-only) host_network=false ;;
-   legacy-handoff|legacy-recovery|provider-handoff) host_network=false ;;
-   *) echo "error: expected resize, mount-only, legacy-handoff, legacy-recovery or provider-handoff mode" >&2; exit 2 ;;
+   legacy-handoff|legacy-recovery|provider-handoff|bootstrap-supersession) host_network=false ;;
+   *) echo "error: expected resize, mount-only, legacy-handoff, legacy-recovery, provider-handoff or bootstrap-supersession mode" >&2; exit 2 ;;
 esac
 is_handoff=0
-[[ "${test_mode}" != legacy-handoff && "${test_mode}" != legacy-recovery && "${test_mode}" != provider-handoff ]] || is_handoff=1
+[[ "${test_mode}" != legacy-handoff && "${test_mode}" != legacy-recovery && "${test_mode}" != provider-handoff && "${test_mode}" != bootstrap-supersession ]] || is_handoff=1
 [[ "${storage_devices}" == 0 || "${storage_devices}" == 2 ]] || { echo "error: expected zero or two storage devices" >&2; exit 2; }
 [[ "${test_mode}" != resize || "${storage_devices}" == 2 ]] || { echo "error: resize requires two storage devices" >&2; exit 2; }
 [[ "${is_handoff}" == 0 || ( "${storage_devices}" == 0 && -s "${upgrade_bundle}" ) ]] || { echo "error: legacy handoff requires zero devices and an exact upgrade bundle" >&2; exit 2; }
 [[ "${is_handoff}" == 0 || "${PRODIGY_STORAGE_HANDOFF_EXPECTED_RUNTIME_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || { echo "error: legacy handoff requires the sealed successor runtime hash" >&2; exit 2; }
-if [[ "${test_mode}" == provider-handoff ]]; then
+if [[ "${test_mode}" == provider-handoff || "${test_mode}" == bootstrap-supersession ]]; then
    old_bundle_sha="${PRODIGY_STORAGE_HANDOFF_EXPECTED_OLD_BUNDLE_SHA256:-}"
-   [[ "${old_bundle_sha}" =~ ^[0-9a-f]{64}$ ]] || { echo "error: provider-handoff requires sealed old bundle SHA" >&2; exit 2; }
+   [[ "${old_bundle_sha}" =~ ^[0-9a-f]{64}$ ]] || { echo "error: handoff mode requires sealed old bundle SHA" >&2; exit 2; }
    create_mothership_bin="${PRODIGY_STORAGE_HANDOFF_CREATE_MOTHERSHIP_BIN:-}"
-   [[ -x "${create_mothership_bin}" ]] || { echo "error: provider-handoff requires executable sealed predecessor Mothership" >&2; exit 2; }
+   [[ -x "${create_mothership_bin}" ]] || { echo "error: handoff mode requires executable sealed predecessor Mothership" >&2; exit 2; }
+fi
+if [[ "${test_mode}" == bootstrap-supersession ]]; then
+   interrupted_bundle="${PRODIGY_STORAGE_HANDOFF_INTERRUPTED_BUNDLE:-}"
+   interrupted_bundle_sha="${PRODIGY_STORAGE_HANDOFF_EXPECTED_INTERRUPTED_BUNDLE_SHA256:-}"
+   command -v sha256sum >/dev/null 2>&1 || { echo "error: bootstrap-supersession requires sha256sum" >&2; exit 2; }
+   [[ -s "${interrupted_bundle}" && "${interrupted_bundle_sha}" =~ ^[0-9a-f]{64}$ ]] || { echo "error: bootstrap-supersession requires sealed interrupted bundle path and SHA" >&2; exit 2; }
+   [[ "$(sha256sum "${interrupted_bundle}" | awk '{print $1}')" == "${interrupted_bundle_sha}" ]] || { echo "error: interrupted bundle bytes do not match sealed SHA" >&2; exit 2; }
+   fault_duration_ms="${PRODIGY_STORAGE_HANDOFF_FAULT_DURATION_MS:-90000}"
+   [[ "${fault_duration_ms}" =~ ^[0-9]+$ && "${fault_duration_ms}" -ge 60000 && "${fault_duration_ms}" -le 90000 ]] || { echo "error: bootstrap-supersession fault duration must be 60000..90000ms" >&2; exit 2; }
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -74,6 +83,7 @@ traffic_log="${tmpdir}/traffic.log"
 
 cluster_created=0
 archive_workspace=0
+owned_background_pids=()
 
 cleanup()
 {
@@ -157,6 +167,12 @@ for node in json.loads(manifest.read_text()).get('nodes', []):
         except OSError: pass
 PY_PROCESS_IDENTITY
    fi
+
+   for background_pid in "${owned_background_pids[@]}"
+   do
+      kill "${background_pid}" >/dev/null 2>&1 || true
+      wait "${background_pid}" >/dev/null 2>&1 || true
+   done
 
    if [[ "${cluster_created}" -eq 1 ]]
    then
@@ -399,7 +415,7 @@ python3 - "${plan_json}" "${test_mode}" <<'PY'
 import json, sys
 with open(sys.argv[1]) as stream:
     plan = json.load(stream)
-if sys.argv[2] in ('legacy-handoff', 'legacy-recovery', 'provider-handoff'):
+if sys.argv[2] in ('legacy-handoff', 'legacy-recovery', 'provider-handoff', 'bootstrap-supersession'):
     plan.pop('stateless')
     plan['verticalScalers'] = []
 else:
@@ -517,7 +533,7 @@ for node in nodes:
     if phase not in ('before', 'provider-step'):
         assert hashlib.sha256((parent / 'exe').read_bytes()).hexdigest() == runtime_hash, 'machine has wrong runtime bytes'
     children = []
-    if mode == 'provider-handoff':
+    if mode in ('provider-handoff', 'bootstrap-supersession'):
         for leaf in (parent / 'root/sys/fs/cgroup/containers.slice').glob('*.slice/leaf/cgroup.procs'):
             children.extend(leaf.read_text().split())
     else:
@@ -588,6 +604,41 @@ PY
          observe_handoff provider-step
          cp "${tmpdir}/handoff-provider-step.json" "${tmpdir}/handoff-provider-machine-${machine_index}.json"
       done
+   elif [[ "${test_mode}" == bootstrap-supersession ]]; then
+      # Keep one existing worker disconnected while the ordinary update owner
+      # persists a real incomplete three-worker operation. Both actions remain
+      # Mothership requests; this fixture owns only their bounded CLI children.
+      env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+         "${MOTHERSHIP_BIN}" faultTestCluster "${cluster_name}" link 2 "${fault_duration_ms}" 0 0 0 >"${tmpdir}/bootstrap-fault.log" 2>&1 &
+      fault_pid=$!
+      owned_background_pids+=("${fault_pid}")
+      env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+         "${MOTHERSHIP_BIN}" updateProdigy "${cluster_name}" "${interrupted_bundle}" >"${tmpdir}/bootstrap-interrupted-update.log" 2>&1 &
+      interrupted_update_pid=$!
+      owned_background_pids+=("${interrupted_update_pid}")
+      pending=0
+      for attempt in $(seq 1 120)
+      do
+         if kill -0 "${fault_pid}" >/dev/null 2>&1 &&
+            kill -0 "${interrupted_update_pid}" >/dev/null 2>&1 &&
+            env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+               timeout 8s "${MOTHERSHIP_BIN}" clusterReport "${cluster_name}" >"${tmpdir}/bootstrap-pending-cluster-${attempt}.log" 2>&1
+         then
+            printf 'attempt=%s updatePid=%s state=deferred clusterReport=observed\n' "${attempt}" "${interrupted_update_pid}" >>"${tmpdir}/bootstrap-pending.log"
+            pending=1
+            break
+         fi
+         sleep 0.5
+      done
+      [[ "${pending}" == 1 ]] || { echo "FAIL: interrupted ordinary update was not observably deferred while link fault was active" >&2; exit 1; }
+      env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+         "${MOTHERSHIP_BIN}" recoverTestClusterBundle "${cluster_name}" "${upgrade_bundle}" 1 "${old_bundle_sha}" "${interrupted_bundle_sha}" >>"${tmpdir}/bootstrap-recover.log" 2>&1
+      # The replacement Brain owns completion of the original update request;
+      # the CLI may exit on its old control stream, so preserve its receipt and
+      # assert the actual post-recovery worker and storage observations below.
+      wait "${fault_pid}" || true
+      wait "${interrupted_update_pid}" || true
+      owned_background_pids=()
    else
       env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
          "${MOTHERSHIP_BIN}" updateProdigy "${cluster_name}" "${upgrade_bundle}" >"${tmpdir}/upgrade.log" 2>&1
