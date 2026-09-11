@@ -9700,7 +9700,7 @@ int main(void)
     suite.expect(replacement != nullptr, "planStatefulUpdateInPlace_creates_replacement");
     suite.expect(replacement && replacement->machine == &machine, "planStatefulUpdateInPlace_replacement_machine");
     suite.expect(replacement && replacement->shardGroup == oldContainer.shardGroup, "planStatefulUpdateInPlace_preserves_shard_group");
-    suite.expect(oldContainer.state == ContainerState::aboutToDestroy, "planStatefulUpdateInPlace_marks_old_about_to_destroy");
+    suite.expect(oldContainer.state == ContainerState::planned, "planStatefulUpdateInPlace_preserves_old_state_until_execution");
     suite.expect(oldContainer.plannedWork == work, "planStatefulUpdateInPlace_marks_old_plannedWork");
     suite.expect(replacement && replacement->plannedWork == work, "planStatefulUpdateInPlace_marks_new_plannedWork");
 
@@ -11074,6 +11074,7 @@ int main(void)
       old->nDeployedBase = 3;
       old->nHealthyBase = 2;
 
+      const uint64_t oldDeploymentID = old->plan.config.deploymentID();
       ContainerView *oldCohort[3] = {new ContainerView(), new ContainerView(), new ContainerView()};
       Machine *cohortMachines[] = {&machineA, &machineB, &machineC};
       for (uint32_t index = 0; index < 3; ++index)
@@ -11086,34 +11087,90 @@ int main(void)
         oldCohort[index]->isStateful = true;
         oldCohort[index]->shardGroup = 0;
         oldCohort[index]->state = index == 0 ? ContainerState::scheduled : ContainerState::healthy;
+        oldCohort[index]->fragment = cohortMachines[index]->getContainerFragment();
+        oldCohort[index]->runtime_nLogicalCores = old->plan.config.nLogicalCores;
+        oldCohort[index]->runtime_memoryMB = old->plan.config.totalMemoryMB();
+        oldCohort[index]->runtime_storageMB = old->plan.config.totalStorageMB();
+        old->countPerMachine[cohortMachines[index]] = 1;
+        old->countPerRack[cohortMachines[index]->rack] = 1;
+        old->containersByShardGroup.insert(0, oldCohort[index]);
+        prodigyDebitMachineScalarResources(cohortMachines[index], old->plan.config, 1);
         old->containers.insert(oldCohort[index]);
+        cohortMachines[index]->upsertContainerIndexEntry(oldCohort[index]->deploymentID, oldCohort[index]);
+        brain.containers.insert_or_assign(oldCohort[index]->uuid, oldCohort[index]);
       }
       brain.deployments.insert_or_assign(old->plan.config.deploymentID(), old);
       brain.deployments.insert_or_assign(current.plan.config.deploymentID(), &current);
       brain.deploymentsByApp.insert_or_assign(current.plan.config.applicationID, &current);
 
+      uint32_t availableMemoryBefore[3] = {};
+      for (uint32_t index = 0; index < 3; ++index)
+      {
+        availableMemoryBefore[index] = cohortMachines[index]->memoryMB_available;
+      }
       current.deploy();
       suite.expect(current.waitingOnContainers.size() == 1,
                    "materialized_stateful_recovery_architect_starts_one_unhealthy_replacement");
       suite.expect(oldCohort[0]->state == ContainerState::destroying,
                    "materialized_stateful_recovery_architect_replaces_unhealthy_predecessor_first");
-      suite.expect(oldCohort[1]->state == ContainerState::aboutToDestroy && oldCohort[2]->state == ContainerState::aboutToDestroy &&
+      suite.expect(old->containers.size() == 2 && old->containers.contains(oldCohort[0]) == false,
+                   "materialized_stateful_recovery_retires_replaced_predecessor_before_kill_ack");
+      suite.expect(oldCohort[0]->machine->containersByDeploymentID.contains(oldCohort[0]->deploymentID) == false ||
+                       oldCohort[0]->machine->containersByDeploymentID[oldCohort[0]->deploymentID].contains(oldCohort[0]) == false,
+                   "materialized_stateful_recovery_retires_replaced_predecessor_machine_index_before_kill_ack");
+      suite.expect(brain.containers.contains(oldCohort[0]->uuid),
+                   "materialized_stateful_recovery_keeps_replaced_predecessor_for_kill_ack");
+      suite.expect(oldCohort[1]->state == ContainerState::healthy && oldCohort[2]->state == ContainerState::healthy &&
                        oldCohort[1]->plannedWork != nullptr && oldCohort[2]->plannedWork != nullptr,
                    "materialized_stateful_recovery_architect_plans_healthy_predecessors_without_executing_them");
 
       ContainerView *firstReplacement = current.waitingOnContainers.begin()->first;
+      suite.expect(firstReplacement->fragment != oldCohort[0]->fragment,
+                   "materialized_stateful_recovery_reserves_old_fragment_until_successor_allocated");
+      suite.expect(old->nDeployed() == 2 && old->nHealthy() == 2 && old->countPerMachine[cohortMachines[0]] == 0,
+                   "materialized_stateful_recovery_unhealthy_retirement_preserves_remaining_health_counts");
+      const uint128_t firstOldUUID = oldCohort[0]->uuid;
+      old->containerDestroyed(oldCohort[0]); // same owner invoked by the real kill ack
+      oldCohort[0] = nullptr;
+      suite.expect(brain.containers.contains(firstOldUUID) == false,
+                   "materialized_stateful_recovery_kill_ack_deletes_retired_global_view");
       current.containerIsHealthy(firstReplacement);
       suite.expect(current.waitingOnContainers.size() == 1,
                    "materialized_stateful_recovery_waits_for_each_successor_before_next_update");
       suite.expect((oldCohort[1]->state == ContainerState::destroying) != (oldCohort[2]->state == ContainerState::destroying) &&
-                       (oldCohort[1]->state == ContainerState::aboutToDestroy || oldCohort[2]->state == ContainerState::aboutToDestroy),
+                       (oldCohort[1]->state == ContainerState::healthy || oldCohort[2]->state == ContainerState::healthy),
                    "materialized_stateful_recovery_releases_exactly_one_healthy_predecessor_after_ack");
 
       ContainerView *secondReplacement = current.waitingOnContainers.begin()->first;
+      suite.expect(old->containers.size() == 1 && old->nDeployed() == 1 && old->nHealthy() == 1,
+                   "materialized_stateful_recovery_two_retirements_leave_one_live_predecessor");
+      for (ContainerView *remaining : old->containers)
+      {
+        suite.expect(remaining->runtime_nLogicalCores == old->plan.config.nLogicalCores &&
+                         remaining->runtime_memoryMB == old->plan.config.totalMemoryMB() &&
+                         remaining->runtime_storageMB == old->plan.config.totalStorageMB(),
+                     "materialized_stateful_recovery_predecessor_report_has_live_runtime_values");
+      }
+      const uint32_t secondOldIndex = oldCohort[1]->state == ContainerState::destroying ? 1 : 2;
+      const uint32_t thirdOldIndex = secondOldIndex == 1 ? 2 : 1;
+      old->containerDestroyed(oldCohort[secondOldIndex]);
+      oldCohort[secondOldIndex] = nullptr;
       current.containerIsHealthy(secondReplacement);
       suite.expect(current.waitingOnContainers.size() == 1,
                    "materialized_stateful_recovery_serializes_third_replacement_after_second_ack");
       ContainerView *thirdReplacement = current.waitingOnContainers.begin()->first;
+      suite.expect(old->containers.empty() && old->nDeployed() == 0 && old->nHealthy() == 0 &&
+                       old->containersByShardGroup.size() == 0,
+                   "materialized_stateful_recovery_final_retirement_clears_predecessor_inventory");
+      old->containerDestroyed(oldCohort[thirdOldIndex]);
+      oldCohort[thirdOldIndex] = nullptr;
+      for (uint32_t index = 0; index < 3; ++index)
+      {
+        suite.expect(cohortMachines[index]->memoryMB_available == availableMemoryBefore[index] &&
+                         old->countPerMachine[cohortMachines[index]] == 0 &&
+                         old->countPerRack[cohortMachines[index]->rack] == 0,
+                     "materialized_stateful_recovery_retirement_balances_placement_resources");
+      }
       current.containerIsHealthy(thirdReplacement);
       suite.expect(current.nHealthy() == 3,
                    "materialized_stateful_recovery_counts_all_three_actual_successors_healthy");
@@ -11126,7 +11183,7 @@ int main(void)
         brain.containers.erase(container->uuid);
       }
       current.containers.clear();
-      brain.deployments.erase(old->plan.config.deploymentID());
+      brain.deployments.erase(oldDeploymentID);
       brain.deployments.erase(current.plan.config.deploymentID());
       brain.deploymentsByApp.erase(current.plan.config.applicationID);
     }

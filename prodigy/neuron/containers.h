@@ -6791,13 +6791,35 @@ public:
   template <typename... Args>
   static void appendContainerTrace(Container *container, const char *format, Args... args)
   {
-    if (container == nullptr || format == nullptr || container->rootfsPath.size() == 0)
+#if !PRODIGY_DEBUG
+    (void)container;
+    (void)format;
+    (void)sizeof...(args);
+    return;
+#else
+    if (container == nullptr || format == nullptr)
     {
       return;
     }
 
     String tracePath = {};
-    tracePath.assign(container->rootfsPath);
+    if (container->rootfsPath.size() > 0)
+    {
+      tracePath.assign(container->rootfsPath);
+    }
+    else if (container->artifactRootPath.size() > 0)
+    {
+      tracePath.assign(container->artifactRootPath);
+      tracePath.append("/rootfs"_ctv);
+    }
+    else if (container->name.size() > 0)
+    {
+      tracePath.snprintf<"/containers/{}/rootfs"_ctv>(container->name);
+    }
+    else
+    {
+      return;
+    }
     tracePath.append("/neuron.hosttrace.log"_ctv);
 
     int fd = open(tracePath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -6808,6 +6830,7 @@ public:
 
     (void)dprintf(fd, format, args...);
     (void)close(fd);
+#endif
   }
 
 private:
@@ -12023,6 +12046,11 @@ public:
       {
         Container *old = it->second;
         const bool hasStorage = old->plan.config.storageMB > 0;
+#if PRODIGY_DEBUG
+        appendContainerTrace(old, "legacy-pre-stop replacement=%llu successor=%llu oldStorageMB=%u successorStorageMB=%u hasStorage=%d\n",
+                             (unsigned long long)replaceContainerUUID, (unsigned long long)plan.uuid,
+                             unsigned(old->plan.config.storageMB), unsigned(plan.config.storageMB), int(hasStorage));
+#endif
         String legacySource;
         struct stat legacyIdentity = {};
         if (hasStorage)
@@ -12032,7 +12060,15 @@ public:
           String liveRoot;
           liveRoot.snprintf<"/proc/{itoa}/root/storage"_ctv>(uint64_t(old->pid));
           struct stat live = {}, original = {};
-          if (stat(liveRoot.c_str(), &live) != 0 || lstat(originalRoot.c_str(), &original) != 0)
+          const int liveResult = stat(liveRoot.c_str(), &live);
+          const int originalResult = lstat(originalRoot.c_str(), &original);
+#if PRODIGY_DEBUG
+          appendContainerTrace(old, "legacy-root-compare replacement=%llu liveResult=%d originalResult=%d liveDev=%llu liveInode=%llu originalDev=%llu originalInode=%llu\n",
+                               (unsigned long long)replaceContainerUUID, liveResult, originalResult,
+                               (unsigned long long)live.st_dev, (unsigned long long)live.st_ino,
+                               (unsigned long long)original.st_dev, (unsigned long long)original.st_ino);
+#endif
+          if (liveResult != 0 || originalResult != 0)
           {
             reportSpinContainerFailure(plan, "cannot identify predecessor storage before replacement"_ctv);
             co_return;

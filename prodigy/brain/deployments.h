@@ -6629,7 +6629,8 @@ public:
 
     container->plannedWork = work;
 
-    oldContainer->state = ContainerState::aboutToDestroy;
+    // plannedWork reserves the predecessor. Keep its actual health visible
+    // until this serial replacement reaches execution.
     oldContainer->plannedWork = work;
 
     return work;
@@ -8253,6 +8254,22 @@ public:
     commitStatefulWorkerTopologyUpgradeCutover();
   }
 
+  ApplicationDeployment *containerDeploymentOwner(ContainerView *container)
+  {
+    if (container->deploymentID != plan.config.deploymentID())
+    {
+      if (previous && previous->plan.config.deploymentID() == container->deploymentID && previous->containers.contains(container))
+      {
+        return previous;
+      }
+      if (auto deploymentIt = thisBrain->deployments.find(container->deploymentID); deploymentIt != thisBrain->deployments.end() && deploymentIt->second)
+      {
+        return deploymentIt->second;
+      }
+    }
+    return this;
+  }
+
   void destructContainer(ContainerView *container, bool cancelWork = true)
   {
     if (cancelWork && container->plannedWork)
@@ -8358,7 +8375,7 @@ public:
     }
   }
 
-  void taskAttemptContainerDone(ContainerView *container)
+  void releaseContainerPlacementCounts(ContainerView *container)
   {
     if (container == nullptr)
     {
@@ -8407,7 +8424,16 @@ public:
           break;
         }
     }
+  }
 
+  void taskAttemptContainerDone(ContainerView *container)
+  {
+    if (container == nullptr)
+    {
+      return;
+    }
+
+    releaseContainerPlacementCounts(container);
     destructContainer(container);
     containerDestroyed(container);
   }
@@ -8803,8 +8829,6 @@ public:
             if (work.lifecycle == LifecycleOp::updateInPlace)
             {
               replacingContainer = work.oldContainer;
-              replacingContainer->state = ContainerState::destroying;
-              handleContainerStateChange(replacingContainer, false);
             }
 
             ContainerView *container = work.container;
@@ -8871,6 +8895,17 @@ public:
             if (replacingContainer)
             {
               replaceContainerUUID = replacingContainer->uuid;
+
+              // Allocate the successor fragment before releasing its predecessor.
+              // Retirement removes owner indexes; the real kill ack alone deletes
+              // the global view after Neuron has captured the stopped process data.
+              ApplicationDeployment *destructionOwner = containerDeploymentOwner(replacingContainer);
+              destructionOwner->releaseContainerPlacementCounts(replacingContainer);
+              if (replacingContainer->state == ContainerState::healthy)
+              {
+                replacingContainer->state = ContainerState::aboutToDestroy;
+              }
+              destructionOwner->destructContainer(replacingContainer, false);
             }
 
 #if PRODIGY_DEBUG
@@ -8917,18 +8952,7 @@ public:
               cancelDeploymentWork(container->plannedWork);
             }
 
-            ApplicationDeployment *destructionOwner = this;
-            if (container->deploymentID != plan.config.deploymentID())
-            {
-              if (previous && previous->plan.config.deploymentID() == container->deploymentID && previous->containers.contains(container))
-              {
-                destructionOwner = previous;
-              }
-              else if (auto deploymentIt = thisBrain->deployments.find(container->deploymentID); deploymentIt != thisBrain->deployments.end() && deploymentIt->second)
-              {
-                destructionOwner = deploymentIt->second;
-              }
-            }
+            ApplicationDeployment *destructionOwner = containerDeploymentOwner(container);
 
             container->destructionWaiterDeploymentID = plan.config.deploymentID();
             destructionOwner->destructContainer(container, false);
