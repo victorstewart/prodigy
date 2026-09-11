@@ -246,6 +246,33 @@ then
    exit 1
 fi
 
+if [[ "${test_mode}" == legacy-handoff ]]
+then
+   # Use the same healthy/runtime-ready report predicates as the netns harness.
+   # A manifest lists launched nodes before their asynchronous inventory arrives.
+   machines_ready=0
+   for _ in $(seq 1 120)
+   do
+      if env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+         timeout 8s "${MOTHERSHIP_BIN}" clusterReport "${cluster_name}" >"${cluster_report_log}" 2>&1
+      then
+         healthy_count="$(rg -c '^[[:space:]]*Machine: state=healthy ' "${cluster_report_log}" || true)"
+         ready_count="$(rg -c '^[[:space:]]*lifecycle controlPlaneReachable=1 runtimeReady=1 ' "${cluster_report_log}" || true)"
+         if [[ "${healthy_count:-0}" -eq "${machine_count}" && "${ready_count:-0}" -eq "${machine_count}" ]]
+         then
+            machines_ready=1
+            break
+         fi
+      fi
+      sleep 0.5
+   done
+   [[ "${machines_ready}" == 1 ]] || {
+      archive_workspace=1
+      echo "FAIL: declared worker inventory did not become ready before initial deployment" >&2
+      exit 1
+   }
+fi
+
 artifact_project_dir="${tmpdir}/storage-artifact"
 discombobulator_file="${artifact_project_dir}/PingPongStorage.DiscombobuFile"
 container_blob="${tmpdir}/storage.container.zst"
