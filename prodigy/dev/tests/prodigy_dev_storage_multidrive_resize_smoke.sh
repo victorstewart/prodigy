@@ -368,11 +368,13 @@ for node in nodes:
             assert any(line.split()[4] == '/storage' for line in (child / 'mountinfo').read_text().splitlines())
         records.append(dict(machineIndex=node['index'], parentPID=node['pid'], pid=int(pid), uuid=uuid,
                             device=metadata.st_dev, inode=metadata.st_ino, uid=metadata.st_uid,
+                            networkNamespace=str((child / 'ns/net').readlink()),
+                            cgroup=(child / 'cgroup').read_text(),
                             applicationSHA256=expected_binary))
 assert len(records) == 3, f'expected three real fixture replicas, got {len(records)}'
 if phase == 'upgraded':
-    assert sorted((r['pid'], r['uuid'], r['device'], r['inode']) for r in records) == \
-           sorted((r['pid'], r['uuid'], r['device'], r['inode']) for r in before), 'bundle upgrade changed live app/storage owners'
+    assert sorted((r['pid'], r['uuid'], r['device'], r['inode'], r['networkNamespace'], r['cgroup']) for r in records) == \
+           sorted((r['pid'], r['uuid'], r['device'], r['inode'], r['networkNamespace'], r['cgroup']) for r in before), 'bundle upgrade changed live app/storage/network owners'
 if phase == 'after':
     assert not ({r['pid'] for r in before} & {r['pid'] for r in records})
     for old in before:
@@ -396,7 +398,20 @@ PY
    observe_handoff before
    env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
       "${MOTHERSHIP_BIN}" updateProdigy "${cluster_name}" "${upgrade_bundle}" >"${tmpdir}/upgrade.log" 2>&1
-   observe_handoff upgraded
+   # updateProdigy acknowledges staging before every worker has completed its
+   # exec handoff. Wait for observed exact bytes, not a staged=1 response.
+   upgraded=0
+   for attempt in $(seq 1 240)
+   do
+      printf 'attempt=%s\n' "${attempt}" >> "${tmpdir}/upgrade-observer.log"
+      if observe_handoff upgraded >> "${tmpdir}/upgrade-observer.log" 2>&1
+      then
+         upgraded=1
+         break
+      fi
+      sleep 0.5
+   done
+   [[ "${upgraded}" == 1 ]] || { echo "FAIL: exact worker-preserving bundle upgrade was not observed" >&2; exit 1; }
    # A second Discombobulator artifact reads the data before signaling healthy;
    # the harness never seeds or modifies a live container's storage.
    sed 's/PINGPONG_STORAGE_HANDOFF_MODE=seed/PINGPONG_STORAGE_HANDOFF_MODE=verify/' \

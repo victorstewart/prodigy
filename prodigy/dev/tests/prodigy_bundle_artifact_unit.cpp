@@ -180,8 +180,19 @@ static bool commandOutput(const String& command, String& output)
   return pclose(pipe) == 0;
 }
 
-int main(void)
+int main(int argc, char *argv[])
 {
+  // Read-only preflight through the same owner used by updateProdigy. This
+  // branch neither creates fixtures nor contacts or configures a cluster.
+  if (argc == 3 && strcmp(argv[1], "--approve") == 0)
+  {
+    String path, digest, failure;
+    path.assign(argv[2]);
+    bool approved = prodigyApproveBundleArtifact(path, digest, &failure);
+    dprintf(STDOUT_FILENO, "bundle_approval passed=%d sha256=%s failure=%s\n",
+            int(approved), digest.c_str(), failure.c_str());
+    return approved ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   TestSuite suite;
 
   String prodigyBinaryPath = PRODIGY_TEST_BINARY_DIR "/prodigy";
