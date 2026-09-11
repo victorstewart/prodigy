@@ -28605,6 +28605,34 @@ public:
           Message::extractToStringView(args, newBundle);
 
           MothershipResponse response = {};
+          String expectedWorkerDigest = {};
+          String digestFailure = {};
+          if (prodigyComputeSHA256Hex(newBundle, expectedWorkerDigest, &digestFailure) == false)
+          {
+            response.failure = digestFailure;
+          }
+
+          bytell_hash_set<uint128_t> requestedWorkers = {};
+          if (response.failure.empty())
+          {
+            for (Machine *machine : machines)
+            {
+              if (machine != nullptr && machine->isBrain == false && machine->uuid != 0)
+              {
+                requestedWorkers.insert(machine->uuid);
+              }
+            }
+            // A different digest must be rejected before staging or touching the
+            // durable incomplete operation. Otherwise a failed request can
+            // overwrite the resumable bundle and still be sent to workers.
+            if (requestedWorkers.empty() == false &&
+                updateSelfWorkerMachineUUIDs.empty() == false &&
+                updateSelfWorkerStateUploadedMachineUUIDs.size() != updateSelfWorkerMachineUUIDs.size() &&
+                updateSelfWorkerExpectedBundleSHA256.equals(expectedWorkerDigest) == false)
+            {
+              response.failure.assign("another worker bundle upgrade is incomplete"_ctv);
+            }
+          }
           if (response.failure.empty())
           {
             int written = Filesystem::openWriteAtClose(-1, prodigyStagedBundlePath(), newBundle);
@@ -28618,15 +28646,9 @@ public:
 
           uint32_t expectedPeerEchos = 0;
           bool waitingForWorkers = false;
-          if (response.failure.size() == 0)
+          if (response.failure.empty())
           {
-            String expectedWorkerDigest = {};
-            String digestFailure = {};
-            if (prodigyComputeFileSHA256Hex(prodigyStagedBundlePath(), expectedWorkerDigest, &digestFailure) == false)
-            {
-              response.failure = digestFailure;
-            }
-            response.success = response.failure.empty();
+            response.success = true;
 
             // Persist payload for retries in distributed mode by default.
             // The staged fast path is only safe when every brain shares one writable
@@ -28650,28 +28672,12 @@ public:
             }
             if (response.success)
             {
-              bytell_hash_set<uint128_t> requestedWorkers = {};
-              for (Machine *machine : machines)
-              {
-                if (machine != nullptr && machine->isBrain == false && machine->uuid != 0)
-                {
-                  requestedWorkers.insert(machine->uuid);
-                }
-              }
               waitingForWorkers = requestedWorkers.empty() == false;
               if (waitingForWorkers)
               {
                 // A same-digest command is a durable resume, not a second
                 // rollout. A different digest cannot overwrite a partial one.
-                if (updateSelfWorkerMachineUUIDs.empty() == false &&
-                    updateSelfWorkerStateUploadedMachineUUIDs.size() != updateSelfWorkerMachineUUIDs.size() &&
-                    updateSelfWorkerExpectedBundleSHA256.equals(expectedWorkerDigest) == false)
-                {
-                  response.success = false;
-                  response.failure.assign("another worker bundle upgrade is incomplete"_ctv);
-                  waitingForWorkers = false;
-                }
-                else if (updateSelfWorkerExpectedBundleSHA256.equals(expectedWorkerDigest) == false ||
+                if (updateSelfWorkerExpectedBundleSHA256.equals(expectedWorkerDigest) == false ||
                          updateSelfWorkerMachineUUIDs.empty())
                 {
                   updateSelfWorkerExpectedBundleSHA256 = expectedWorkerDigest;

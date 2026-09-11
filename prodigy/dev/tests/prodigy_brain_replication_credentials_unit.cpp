@@ -9100,6 +9100,96 @@ static void testUpdateProdigyDefersSuccessUntilWorkersRestore(TestSuite& suite)
   brain.machines.erase(&worker);
 }
 
+static void testUpdateProdigyRejectsDifferentDigestWithoutMutation(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+  TestBrain brain = {};
+  brain.nBrains = 1;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+
+  Machine worker = {};
+  worker.uuid = 0x7712;
+  worker.isBrain = false;
+  worker.neuron.machine = &worker;
+  worker.neuron.isFixedFile = true;
+  worker.neuron.fslot = 7;
+  worker.neuron.connected = true;
+  brain.machines.insert(&worker);
+
+  Machine pendingWorker = {};
+  pendingWorker.uuid = 0x7713;
+  pendingWorker.isBrain = false;
+  pendingWorker.neuron.machine = &pendingWorker;
+  pendingWorker.neuron.isFixedFile = true;
+  pendingWorker.neuron.fslot = 8;
+  pendingWorker.neuron.connected = true;
+  brain.machines.insert(&pendingWorker);
+
+  const String oldBundle = "existing-partial-bundle"_ctv;
+  const String rejectedBundle = "rejected-successor-bundle"_ctv;
+  String oldDigest = {};
+  String digestFailure = {};
+  suite.expect(prodigyComputeSHA256Hex(oldBundle, oldDigest, &digestFailure),
+               "update_prodigy_rejection_computes_existing_digest");
+
+  String path = prodigyStagedBundlePath();
+  String previous = {};
+  const bool existed = prodigyFileReadable(path);
+  if (existed) Filesystem::openReadAtClose(-1, path, previous);
+  Filesystem::openWriteAtClose(-1, path, oldBundle);
+
+  brain.updateSelfWorkerExpectedBundleSHA256 = oldDigest;
+  brain.updateSelfBundleBlob = oldBundle;
+  brain.updateSelfWorkerMachineUUIDs.insert(worker.uuid);
+  brain.updateSelfWorkerMachineUUIDs.insert(pendingWorker.uuid);
+  brain.updateSelfWorkerStagedMachineUUIDs.insert(worker.uuid);
+  brain.updateSelfWorkerTransitionIssuedMachineUUIDs.insert(worker.uuid);
+
+  Mothership priorMothership = {};
+  brain.updateSelfWorkerMothership = &priorMothership;
+  const ProdigyPersistentUpdateSelfState before = brain.capturePersistentUpdateSelfState();
+  String queuedBefore = worker.neuron.wBuffer;
+  String pendingQueuedBefore = pendingWorker.neuron.wBuffer;
+
+  Mothership mothership = {};
+  mothership.isFixedFile = true;
+  mothership.fslot = 42;
+  brain.mothership = &mothership;
+  brain.activeMotherships.insert(&mothership);
+  String request = {};
+  brain.mothershipHandler(&mothership,
+      buildMothershipMessage(request, MothershipTopic::updateProdigy, rejectedBundle));
+
+  String stagedAfter = {};
+  Filesystem::openReadAtClose(-1, path, stagedAfter);
+  suite.expect(stagedAfter == oldBundle,
+               "update_prodigy_rejection_preserves_staged_bundle");
+  suite.expect(equalSerializedObjects(before, brain.capturePersistentUpdateSelfState()),
+               "update_prodigy_rejection_preserves_durable_worker_operation");
+  suite.expect(brain.updateSelfWorkerMothership == &priorMothership,
+               "update_prodigy_rejection_preserves_pending_mothership");
+  suite.expect(worker.neuron.wBuffer == queuedBefore &&
+                   pendingWorker.neuron.wBuffer == pendingQueuedBefore,
+               "update_prodigy_rejection_queues_no_worker_messages");
+
+  Message *responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
+  String serializedResponse = {};
+  uint8_t *responseArgs = responseMessage->args;
+  Message::extractToStringView(responseArgs, serializedResponse);
+  MothershipResponse response = {};
+  suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response) &&
+                   response.success == false &&
+                   response.failure == "another worker bundle upgrade is incomplete"_ctv,
+               "update_prodigy_rejection_reports_incomplete_upgrade");
+
+  brain.activeMotherships.erase(&mothership);
+  brain.machines.erase(&worker);
+  brain.machines.erase(&pendingWorker);
+  if (existed) Filesystem::openWriteAtClose(-1, path, previous);
+  else ::unlink(path.c_str());
+}
+
 static void testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(TestSuite& suite)
 {
   TestBrain brain = {};
@@ -21657,6 +21747,7 @@ int main(void)
   {
     testUpdateProdigyRespondsBeforeSingleBrainTransition(suite);
     testUpdateProdigyDefersSuccessUntilWorkersRestore(suite);
+    testUpdateProdigyRejectsDifferentDigestWithoutMutation(suite);
     testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(suite);
     return suite.failed == 0 ? 0 : 1;
   }
@@ -21804,6 +21895,7 @@ int main(void)
   testUpdateSelfFinalRelinquishPersistsDesignatedHandoff(suite);
   testUpdateProdigyRespondsBeforeSingleBrainTransition(suite);
   testUpdateProdigyDefersSuccessUntilWorkersRestore(suite);
+  testUpdateProdigyRejectsDifferentDigestWithoutMutation(suite);
   testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(suite);
   testPersistentMasterAuthorityPackageRestore(suite);
   testResumePendingAddMachinesOperations(suite);
