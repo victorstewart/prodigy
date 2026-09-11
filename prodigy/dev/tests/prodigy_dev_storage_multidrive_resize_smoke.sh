@@ -83,6 +83,8 @@ cleanup()
 
    if [[ "${archive_workspace}" -eq 1 && -d "${workspace_root}" ]]
    then
+      rm -rf "${tmpdir}/workspace-archive" >/dev/null 2>&1 || true
+      mkdir -p "${tmpdir}/workspace-archive"
       env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
          timeout 15s "${MOTHERSHIP_BIN}" clusterReport "${cluster_name}" >"${tmpdir}/precleanup-cluster.log" 2>&1
       env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
@@ -135,10 +137,25 @@ except (OSError, ValueError, KeyError) as error:
     observations.append(dict(error=str(error)))
 (output / 'precleanup-storage-traces.json').write_text(json.dumps(observations, indent=2) + '\n')
 PY_STORAGE_TRACES
-      rm -rf "${tmpdir}/workspace-archive" >/dev/null 2>&1 || true
-      mkdir -p "${tmpdir}/workspace-archive"
       find "${workspace_root}" -maxdepth 1 -type f \( -name '*.log' -o -name '*.json' -o -name '*.ready' -o -name '*.failure' \) \
          -exec cp -a {} "${tmpdir}/workspace-archive/" \; >/dev/null 2>&1 || true
+      find "${workspace_root}/virtual-datacenter.recovery" -maxdepth 2 -type f \( -name operation -o -name ready -o -name commit -o -name launch -o -name replaced -o -name complete -o -name failure -o -name provider.log -o -name selected-machine -o -name root-installed \) -size -8M \
+         -exec cp --parents {} "${tmpdir}/workspace-archive/" \; >/dev/null 2>&1 || true
+      python3 - "${manifest_path}" "${tmpdir}/process-identity" <<'PY_PROCESS_IDENTITY'
+import json, pathlib, sys
+manifest, out = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]); out.mkdir(parents=True, exist_ok=True)
+for node in json.loads(manifest.read_text()).get('nodes', []):
+    parent = pathlib.Path('/proc') / str(node['pid']); pids = {str(node['pid'])}
+    try:
+        for leaf in (parent / 'root/sys/fs/cgroup/containers.slice').glob('*.slice/leaf/cgroup.procs'):
+            pids.update(leaf.read_text().split())
+    except OSError: pass
+    for pid in pids:
+        proc = pathlib.Path('/proc') / pid
+        try:
+            (out / (pid + '.json')).write_text(json.dumps({'pid': int(pid), 'node': node.get('index'), 'exe': str((proc/'exe').readlink()), 'status': (proc/'status').read_text()[:16384], 'cgroup': (proc/'cgroup').read_text()[:8192]}, indent=2) + '\n')
+        except OSError: pass
+PY_PROCESS_IDENTITY
    fi
 
    if [[ "${cluster_created}" -eq 1 ]]
