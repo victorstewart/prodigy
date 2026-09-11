@@ -4021,7 +4021,7 @@ public:
                 else if (waitabilityResult < 0)
                 {
                   container->retainedPidfdWaitabilityFailed = true;
-                  basics_log("restoreContainer retained pidfd waitability probe failed uuid=%llu pid=%d pidfd=%d errno=%d; retaining lifecycle owner\n",
+                  std::fprintf(stderr, "restoreContainer retained pidfd waitability probe failed uuid=%llu pid=%d pidfd=%d errno=%d; retaining lifecycle owner\n",
                              (unsigned long long)container->plan.uuid,
                              int(container->pid),
                              container->pidfd,

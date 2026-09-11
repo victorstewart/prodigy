@@ -11017,7 +11017,7 @@ public:
     container->destroyCloseCompleted = false;
     if (container->retainedPidfdWaitabilityFailed)
     {
-      basics_log("queueContainerWaitid retained pidfd waitability is unavailable uuid=%llu pid=%d pidfd=%d; retaining lifecycle owner\n",
+      std::fprintf(stderr, "queueContainerWaitid retained pidfd waitability is unavailable uuid=%llu pid=%d pidfd=%d; retaining lifecycle owner\n",
                  (unsigned long long)container->plan.uuid,
                  int(container->pid),
                  container->pidfd);
@@ -11031,7 +11031,7 @@ public:
         container->nonChildPidfdTicket = Ring::queueRawFDPoll(container, uint64_t(container->pid), container->pidfd, POLLIN);
         if (container->nonChildPidfdTicket == Ring::invalidRawPollTicket)
         {
-          basics_log("queueContainerWaitid could not queue retained pidfd poll uuid=%llu pid=%d pidfd=%d\n",
+          std::fprintf(stderr, "queueContainerWaitid could not queue retained pidfd poll uuid=%llu pid=%d pidfd=%d\n",
                      (unsigned long long)container->plan.uuid,
                      int(container->pid),
                      container->pidfd);
@@ -11078,7 +11078,7 @@ public:
 
     if (result < 0 || (result & POLLIN) == 0)
     {
-      basics_log("retained pidfd poll did not report POLLIN uuid=%llu pid=%d pidfd=%d result=%d; retaining process ownership\n",
+      std::fprintf(stderr, "retained pidfd poll did not report POLLIN uuid=%llu pid=%d pidfd=%d result=%d; retaining process ownership\n",
                  (unsigned long long)container->plan.uuid,
                  int(container->pid),
                  container->pidfd,
@@ -12511,7 +12511,7 @@ public:
       // terminal acknowledgement, including when cancellation wins.
       if (Ring::cancelRawFDPoll(container->nonChildPidfdTicket) == false)
       {
-        basics_log("destroyContainer could not cancel retained pidfd poll uuid=%llu pid=%d ticket=%llu\n",
+        std::fprintf(stderr, "destroyContainer could not cancel retained pidfd poll uuid=%llu pid=%d ticket=%llu\n",
                    (unsigned long long)container->plan.uuid,
                    int(container->pid),
                    (unsigned long long)container->nonChildPidfdTicket);
