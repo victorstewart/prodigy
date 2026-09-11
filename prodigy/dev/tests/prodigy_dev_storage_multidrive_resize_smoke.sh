@@ -272,6 +272,21 @@ cat > "${plan_json}" <<EOF
 }
 EOF
 
+# The typed plan admits exactly one topology owner. The handoff workload must
+# also stay at fixed resources rather than trigger the resize scenario.
+python3 - "${plan_json}" "${test_mode}" <<'PY'
+import json, sys
+with open(sys.argv[1]) as stream:
+    plan = json.load(stream)
+if sys.argv[2] == 'legacy-handoff':
+    plan.pop('stateless')
+    plan['verticalScalers'] = []
+else:
+    plan.pop('stateful')
+with open(sys.argv[1], 'w') as stream:
+    json.dump(plan, stream)
+PY
+
 if ! env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
    "${MOTHERSHIP_BIN}" deploy "${cluster_name}" "$(cat "${plan_json}")" "${container_blob}" \
    >"${deploy_log}" 2>&1
