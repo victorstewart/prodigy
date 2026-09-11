@@ -375,7 +375,7 @@ python3 - "${plan_json}" "${test_mode}" <<'PY'
 import json, sys
 with open(sys.argv[1]) as stream:
     plan = json.load(stream)
-if sys.argv[2] in ('legacy-handoff', 'legacy-recovery'):
+if sys.argv[2] in ('legacy-handoff', 'legacy-recovery', 'provider-handoff'):
     plan.pop('stateless')
     plan['verticalScalers'] = []
 else:
@@ -408,12 +408,7 @@ probe = "import socket; s=socket.socket(socket.AF_INET6,socket.SOCK_STREAM); s.s
 deadline = time.monotonic() + 60
 last = ''
 while time.monotonic() < deadline:
-    if os.environ.get('PRODIGY_STORAGE_HANDOFF_MODE') == 'provider-handoff':
-        children = []
-        for leaf in (parent / 'root/sys/fs/cgroup/containers.slice').glob('*.slice/leaf/cgroup.procs'):
-            children.extend(leaf.read_text().split())
-    else:
-        children = (parent / 'task' / str(node['pid']) / 'children').read_text().split()
+    children = (parent / 'task' / str(node['pid']) / 'children').read_text().split()
     for pid in children:
         child = pathlib.Path('/proc') / pid
         try:
@@ -483,12 +478,11 @@ fi
 if [[ "${is_handoff}" == 1 ]]
 then
    archive_workspace=1
-   [[ "${test_mode}" == provider-handoff ]] && export PRODIGY_STORAGE_HANDOFF_MODE=provider-handoff
    observe_handoff()
    {
-      python3 - "${manifest_path}" "${PINGPONG_BIN}" "${handoff_id}" "$1" "${tmpdir}" "${PRODIGY_STORAGE_HANDOFF_EXPECTED_RUNTIME_SHA256}" <<'PY'
+      python3 - "${manifest_path}" "${PINGPONG_BIN}" "${handoff_id}" "$1" "${tmpdir}" "${PRODIGY_STORAGE_HANDOFF_EXPECTED_RUNTIME_SHA256}" "${test_mode}" <<'PY'
 import hashlib, json, pathlib, re, sys, os
-manifest, executable, identity, phase, output, runtime_hash = sys.argv[1:]
+manifest, executable, identity, phase, output, runtime_hash, mode = sys.argv[1:]
 root = pathlib.Path(output)
 nodes = json.loads(pathlib.Path(manifest).read_text())['nodes']
 expected_binary = hashlib.sha256(pathlib.Path(executable).read_bytes()).hexdigest()
@@ -498,7 +492,12 @@ for node in nodes:
     parent = pathlib.Path('/proc') / str(node['pid'])
     if phase != 'before':
         assert hashlib.sha256((parent / 'exe').read_bytes()).hexdigest() == runtime_hash, 'machine has wrong runtime bytes'
-    children = (parent / 'task' / str(node['pid']) / 'children').read_text().split()
+    children = []
+    if mode == 'provider-handoff':
+        for leaf in (parent / 'root/sys/fs/cgroup/containers.slice').glob('*.slice/leaf/cgroup.procs'):
+            children.extend(leaf.read_text().split())
+    else:
+        children = (parent / 'task' / str(node['pid']) / 'children').read_text().split()
     for pid in children:
         child = pathlib.Path('/proc') / pid
         try:
@@ -533,8 +532,8 @@ for node in nodes:
                             applicationSHA256=expected_binary))
 assert len(records) == 3, f'expected three real fixture replicas, got {len(records)}'
 if phase in ('upgraded', 'recovered'):
-    assert sorted((r['pid'], r['uuid'], r['device'], r['inode'], r['networkNamespace'], r['cgroup']) for r in records) == \
-           sorted((r['pid'], r['uuid'], r['device'], r['inode'], r['networkNamespace'], r['cgroup']) for r in before), 'bundle upgrade changed live app/storage/network owners'
+assert sorted((r['pid'], r['starttime'], r['uuid'], r['device'], r['inode'], r['networkNamespace'], r['cgroup']) for r in records) == \
+           sorted((r['pid'], r['starttime'], r['uuid'], r['device'], r['inode'], r['networkNamespace'], r['cgroup']) for r in before), 'bundle upgrade changed live app/storage/network owners'
 if phase == 'after':
     assert not ({r['pid'] for r in before} & {r['pid'] for r in records})
     for old in before:
