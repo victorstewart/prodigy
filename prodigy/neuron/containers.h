@@ -9154,9 +9154,46 @@ public:
     return true;
   }
 
+  static bool retainsRootfsLocalStorageForHandoff(const Container *container, const String& containersRoot = "/containers"_ctv)
+  {
+    if (container == nullptr || container->plan.config.storageMB == 0 || container->deleteStorageOnCleanUp)
+    {
+      return false;
+    }
+    const auto artifact = container->artifactRootPath.size() > 0
+                              ? prodigyFilesystemPathFromString(container->artifactRootPath)
+                              : prodigyFilesystemPathFromString(containersRoot) / prodigyFilesystemPathFromString(container->name);
+    // Re-adopted running containers may not yet have reconstructed path fields.
+    std::filesystem::path root = container->rootfsPath.size() > 0
+                                     ? prodigyFilesystemPathFromString(container->rootfsPath)
+                                     : artifact / "rootfs";
+    std::error_code error;
+    auto status = std::filesystem::symlink_status(root / "storage", error);
+    if (error == std::errc::no_such_file_or_directory ||
+        (error.value() == 0 && std::filesystem::exists(status) == false))
+    {
+      return false;
+    }
+    // An uncertain or non-directory owner cannot be discarded as empty.
+    if (error || std::filesystem::is_directory(status) == false)
+    {
+      return true;
+    }
+    bool empty = std::filesystem::is_empty(root / "storage", error);
+    return error || empty == false;
+  }
+
   static bool cleanupFailedCreateArtifactRoot(Container *container, String *failureReport = nullptr)
   {
     if (container == nullptr || container->artifactRootPath.size() == 0)
+    {
+      return true;
+    }
+
+    // A replacement's storage may still be inside its original rootfs (older
+    // runtimes could silently miss /storage). Keep the whole original owner,
+    // not just the separately prepared backend, until handoff is verified.
+    if (retainsRootfsLocalStorageForHandoff(container))
     {
       return true;
     }
@@ -12137,7 +12174,14 @@ public:
 
     String destroyOutput = {};
     String destroyFailure = {};
-    if (runExternalCommand("btrfs_container_subvolume_delete", "btrfs", argv, &destroyOutput, &destroyFailure) == false)
+    const bool retainStorageRootfs = retainsRootfsLocalStorageForHandoff(container);
+    if (retainStorageRootfs)
+    {
+      basics_log("destroyContainer retains legacy storage rootfs uuid=%llu path=%s for handoff recovery\n",
+                 (unsigned long long)container->plan.uuid, containerSubvolumePath.c_str());
+    }
+    if (retainStorageRootfs == false &&
+        runExternalCommand("btrfs_container_subvolume_delete", "btrfs", argv, &destroyOutput, &destroyFailure) == false)
     {
       basics_log("destroyContainer subvolume delete failed uuid=%llu path=%s reason=%s output=%s\n",
                  (unsigned long long)container->plan.uuid,

@@ -795,6 +795,50 @@ static void testStorageParentTraversal(TestSuite& suite)
 int main(void)
 {
   TestSuite suite;
+  if (getenv("PRODIGY_TEST_STORAGE_HANDOFF_ONLY") != nullptr)
+  {
+    // No Ring, namespaces or absolute runtime roots: the only destructive
+    // path exercised here receives this mkdtemp-owned fixture.
+    TemporaryDirectory fixture;
+    suite.expect(fixture.create(), "handoff_fixture_created");
+    if (fixture.path.size() == 0) return EXIT_FAILURE;
+    auto artifact = filesystemPathFromString(fixture.path) / "predecessor";
+    auto database = artifact / "rootfs/storage/kvdb/data";
+    suite.expect(writeFileFixture(database, "durable-predecessor-value"), "handoff_legacy_data_created");
+    Container predecessor;
+    predecessor.plan.config.storageMB = 64;
+    predecessor.deleteStorageOnCleanUp = false;
+    predecessor.artifactRootPath.assign(artifact.c_str());
+    predecessor.rootfsPath.assign((artifact / "rootfs").c_str());
+    String failure;
+    suite.expect(ContainerManager::cleanupFailedCreateArtifactRoot(&predecessor, &failure),
+                 "handoff_failed_create_retention_is_successful");
+    suite.expect(std::filesystem::exists(database), "handoff_original_rootfs_data_survives_failed_successor");
+    suite.expect(predecessor.artifactRootPath.size() > 0 && predecessor.rootfsPath.size() > 0,
+                 "handoff_original_paths_remain_available_for_recovery");
+    suite.expect(ContainerManager::retainsRootfsLocalStorageForHandoff(&predecessor),
+                 "handoff_shared_destroy_and_failed_create_predicate_retains_legacy_data");
+    Container adopted;
+    adopted.name.assign("predecessor");
+    adopted.plan.config.storageMB = 64;
+    adopted.deleteStorageOnCleanUp = false;
+    suite.expect(ContainerManager::retainsRootfsLocalStorageForHandoff(&adopted, fixture.path),
+                 "handoff_re_adopted_empty_path_fields_resolve_original_owner");
+    Container ordinary;
+    auto ordinaryArtifact = filesystemPathFromString(fixture.path) / "ordinary";
+    std::filesystem::create_directories(ordinaryArtifact / "rootfs/storage");
+    ordinary.plan.config.storageMB = 64;
+    ordinary.deleteStorageOnCleanUp = false;
+    ordinary.artifactRootPath.assign(ordinaryArtifact.c_str());
+    ordinary.rootfsPath.assign((ordinaryArtifact / "rootfs").c_str());
+    suite.expect(ContainerManager::retainsRootfsLocalStorageForHandoff(&ordinary) == false,
+                 "handoff_empty_mountpoint_does_not_retain_ordinary_artifact_forever");
+    suite.expect(ContainerManager::cleanupFailedCreateArtifactRoot(&ordinary, &failure) &&
+                 std::filesystem::exists(ordinaryArtifact) == false,
+                 "handoff_empty_mountpoint_ordinary_cleanup_preserved");
+    dprintf(STDOUT_FILENO, "storage_handoff_focused failed=%d\n", suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   testStorageParentTraversal(suite);
   testRequiredStorageMount(suite);
   if (getenv("PRODIGY_TEST_STORAGE_PARENT_ONLY") != nullptr)
