@@ -1021,7 +1021,14 @@ public:
     int reusePort = 1;
     (void)setsockopt(listener.fd, SOL_SOCKET, SO_REUSEPORT, &reusePort, sizeof(reusePort));
 #endif
-    listener.setSaddr(ipv6Listener ? "::"_ctv : "0.0.0.0"_ctv, port);
+    if (ipv6Listener)
+    {
+      listener.setSaddr("::"_ctv, port);
+    }
+    else
+    {
+      listener.setSaddr("0.0.0.0"_ctv, port);
+    }
     listener.bindThenListen();
 
     Ring::installFDIntoFixedFileSlot(&listener);
