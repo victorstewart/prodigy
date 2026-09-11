@@ -430,7 +430,7 @@ for node in nodes:
         assert file.stat().st_size == 1 << 41
         assert middle == (b'A' if phase == 'after' else b'M')
         original = parent / 'root/containers' / uuid / 'rootfs/storage'
-        if phase in ('before', 'upgraded'):
+        if phase in ('before', 'upgraded', 'recovered'):
             assert (original.stat().st_dev, original.stat().st_ino) == (metadata.st_dev, metadata.st_ino)
         else:
             target = parent / 'root/containers/storage' / uuid
@@ -443,7 +443,7 @@ for node in nodes:
                             cgroup=(child / 'cgroup').read_text(),
                             applicationSHA256=expected_binary))
 assert len(records) == 3, f'expected three real fixture replicas, got {len(records)}'
-if phase == 'upgraded':
+if phase in ('upgraded', 'recovered'):
     assert sorted((r['pid'], r['uuid'], r['device'], r['inode'], r['networkNamespace'], r['cgroup']) for r in records) == \
            sorted((r['pid'], r['uuid'], r['device'], r['inode'], r['networkNamespace'], r['cgroup']) for r in before), 'bundle upgrade changed live app/storage/network owners'
 if phase == 'after':
@@ -500,6 +500,12 @@ PY
       sleep 0.5
    done
    [[ "${recovered}" == 1 ]] || { echo "FAIL: original deployment control-plane recovery not observed; no successor submitted" >&2; exit 1; }
+   # Readiness counters alone can conceal fresh replicas created after exec.
+   # Re-observe the original owners after recovery settles, before any update.
+   observe_handoff recovered || {
+      echo "FAIL: controller recovery replaced original application/storage owners; no successor submitted" >&2
+      exit 1
+   }
    # A second Discombobulator artifact reads the data before signaling healthy;
    # the harness never seeds or modifies a live container's storage.
    sed 's/PINGPONG_STORAGE_HANDOFF_MODE=seed/PINGPONG_STORAGE_HANDOFF_MODE=verify/' \
