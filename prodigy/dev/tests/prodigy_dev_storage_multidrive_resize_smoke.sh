@@ -301,7 +301,7 @@ then
    if [[ "${test_mode}" == legacy-recovery ]]
    then
       # A fixture readiness failure leaves two real data owners running unready.
-      printf 'ENV PINGPONG_STORAGE_HANDOFF_READY_MACHINE=2\n' >> "${discombobulator_file}"
+      printf 'ENV PINGPONG_STORAGE_HANDOFF_WAIT_FOR_TRAFFIC=1\n' >> "${discombobulator_file}"
    fi
 fi
 cat >> "${discombobulator_file}" <<'EOF'
@@ -392,6 +392,41 @@ then
    echo "FAIL: storage deployment failed"
    sed -n '1,200p' "${deploy_log}" || true
    exit 1
+fi
+
+if [[ "${test_mode}" == legacy-recovery ]]
+then
+   # Reuse the fixture's ordinary ping/pong readiness path on exactly one owned
+   # process. All replicas have seeded real data before accepting traffic.
+   python3 - "${manifest_path}" "${PINGPONG_BIN}" >"${tmpdir}/seed-readiness-probe.log" 2>&1 <<'PY_SEED_TRAFFIC'
+import hashlib, json, pathlib, subprocess, sys, time
+manifest, binary = map(pathlib.Path, sys.argv[1:])
+node = next(node for node in json.loads(manifest.read_text())['nodes'] if node['index'] == 2)
+parent = pathlib.Path('/proc') / str(node['pid'])
+expected = hashlib.sha256(binary.read_bytes()).hexdigest()
+probe = "import socket; s=socket.socket(socket.AF_INET6,socket.SOCK_STREAM); s.settimeout(2); s.connect(('::1',19090)); s.sendall(b'ping\\n'); data=b''\nwhile not data.endswith(b'\\n'): data += s.recv(32)\nassert data == b'pong\\n',data\nprint('pong')"
+deadline = time.monotonic() + 60
+last = ''
+while time.monotonic() < deadline:
+    children = (parent / 'task' / str(node['pid']) / 'children').read_text().split()
+    for pid in children:
+        child = pathlib.Path('/proc') / pid
+        try:
+            if (child / 'exe').readlink().name != 'pingpong_container':
+                continue
+            assert hashlib.sha256((child / 'exe').read_bytes()).hexdigest() == expected
+            assert (child / 'ns/net').readlink() != (parent / 'ns/net').readlink()
+            result = subprocess.run(['nsenter', '--net=' + str(child / 'ns/net'), sys.executable, '-c', probe],
+                                    capture_output=True, text=True, timeout=3)
+            if result.returncode == 0:
+                print('SEED_TRAFFIC_READY machineIndex=2 pid=' + pid + ' response=' + result.stdout.strip())
+                sys.exit(0)
+            last = result.stderr[-1000:]
+        except (FileNotFoundError, ProcessLookupError, subprocess.TimeoutExpired) as error:
+            last = str(error)
+    time.sleep(0.5)
+raise RuntimeError('owned seed replica did not serve its readiness probe: ' + last)
+PY_SEED_TRAFFIC
 fi
 
 healthy=0
