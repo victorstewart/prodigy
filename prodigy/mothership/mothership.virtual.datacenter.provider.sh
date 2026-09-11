@@ -1112,6 +1112,7 @@ fi
 
 publish_runtime()
 {
+   local index host_octet role public6
 {
    printf '{"workspaceRoot":"%s","manifestPath":"%s","controlSocketPath":"%s","parentNamespace":"%s","parentPid":%s,"machineCount":%s,"brainCount":%s,"machineLogicalCores":%s,"machineMemoryMB":%s,"machineStorageMB":%s,"storageDeviceCount":%s,"storageDeviceMB":%s,"interContainerMTU":%s,"leaderIndex":0,"leaderNamespace":"","nodes":[' \
       "${workspace}" "${manifest_path}" "${control_socket_path}" "${parent_ns}" "${pid}" "${machine_count}" "${brain_count}" "${machine_logical_cores}" "${machine_memory_mb}" "${machine_storage_mb}" "${storage_device_count}" "${storage_device_mb}" "${inter_container_mtu}"

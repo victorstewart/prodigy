@@ -6,6 +6,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 class TestSuite {
 public:
@@ -39,9 +40,75 @@ static bool containsAddress(const Vector<ClusterMachineAddress>& addresses, cons
   return false;
 }
 
+static void testPublicationPreservesSelectedMachine(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  suite.expect(root != std::string::npos, "publication_fixture_locates_provider_owner");
+  if (root == std::string::npos) return;
+  sourcePath.resize(root);
+  sourcePath += "/mothership/mothership.virtual.datacenter.provider.sh";
+  String source = {};
+  if (mothershipVDCRead(String(sourcePath.c_str()), source, 1024 * 1024) == false)
+  { suite.expect(false, "publication_fixture_reads_provider_owner"); return; }
+  std::string text(reinterpret_cast<const char *>(source.data()), source.size());
+  size_t begin = text.find("publish_runtime()\n{\n");
+  size_t end = text.find("\nrecovery_hold()\n", begin);
+  if (begin == std::string::npos || end == std::string::npos)
+  { suite.expect(false, "publication_fixture_extracts_existing_owner"); return; }
+  // Execute only the real publication function against plain fixture files.
+  // No provider launch, mount, network or service action belongs in this unit.
+  std::string script = "set -euo pipefail\n" + text.substr(begin, end - begin) + R"TEST(
+workspace=fixture
+manifest_path="$PWD/manifest.json"
+runtime_path="$PWD/runtime"
+control_socket_path=/tmp/fixture.sock
+parent_ns=fixture-parent
+pid=1234
+machine_count=4
+brain_count=1
+machine_logical_cores=8
+machine_memory_mb=16384
+machine_storage_mb=8192
+storage_device_count=0
+storage_device_mb=1024
+inter_container_mtu=9000
+fake_boundary=0
+child_names=(one two three four)
+machine_pids=(101 202 303 404)
+index=2
+publish_runtime
+[[ "$index" == 2 && "${machine_pids[$((index - 1))]}" == 202 ]]
+[[ "$(wc -l < "$runtime_path")" == 4 ]]
+)TEST";
+  char temporary[] = "./vdc-publication-unit.XXXXXX";
+  if (::mkdtemp(temporary) == nullptr)
+  { suite.expect(false, "publication_fixture_creates_owned_directory"); return; }
+  String scriptPath = {};
+  mothershipVirtualDatacenterPath(String(temporary), "probe.sh", scriptPath);
+  String failure = {};
+  bool written = mothershipVirtualDatacenterWriteFile(scriptPath, String(script.c_str()), 0600, &failure);
+  pid_t child = written ? ::fork() : -1;
+  if (child == 0)
+  {
+    if (::chdir(temporary) != 0) _exit(125);
+    ::execl("/bin/bash", "bash", "probe.sh", static_cast<char *>(nullptr));
+    _exit(127);
+  }
+  int status = 0;
+  pid_t waited = -1;
+  if (child > 0) do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  suite.expect(written && waited == child && child > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+               "publication_preserves_selected_machine_and_replacement_pid");
+  for (const char *name : {"probe.sh", "manifest.json", "runtime"})
+  { String path = {}; mothershipVirtualDatacenterPath(String(temporary), name, path); ::unlink(path.c_str()); }
+  ::rmdir(temporary);
+}
+
 int main(void)
 {
   TestSuite suite;
+  testPublicationPreservesSelectedMachine(suite);
 
   suite.expect(mothershipTestClusterWorkspaceRootValid("/tmp/vdc"_ctv), "workspace_accepts_nested_absolute_path");
   suite.expect(mothershipTestClusterWorkspaceRootValid("/tmp/space dir/vdc"_ctv), "workspace_accepts_spaces");
