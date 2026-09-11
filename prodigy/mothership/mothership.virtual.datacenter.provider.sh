@@ -251,7 +251,15 @@ prepare_cgroup_scope()
 
 restore_cgroup_scope_if_idle()
 {
-   resolve_cgroup_scope || return 0
+   if [[ -n "${1:-}" ]]
+   then
+      cgroup_scope="$1"
+      [[ "${cgroup_scope}" == /sys/fs/cgroup/* && -d "${cgroup_scope}" ]] || return 1
+      cgroup_control="${cgroup_scope}/prodigy-vdc-control"
+      cgroup_lock="/run/prodigy-vdc-cgroup-$(stat -Lc %i "${cgroup_scope}").lock"
+   else
+      resolve_cgroup_scope || return 0
+   fi
    (
       exec {cgroup_restore_lock_fd}>"${cgroup_lock}"
       flock "${cgroup_restore_lock_fd}"
@@ -285,10 +293,15 @@ provider_process()
    local candidate="$1"
    local workspace="$2"
    [[ "${candidate}" =~ ^[0-9]+$ && "${candidate}" -gt 1 && -r "/proc/${candidate}/cmdline" ]] || return 1
-   local command_line
-   command_line="$(tr '\0' ' ' < "/proc/${candidate}/cmdline")"
-   [[ "${command_line}" =~ bash[[:space:]]+/proc/self/fd/[0-9]+[[:space:]]+--serve(-adopt)?[[:space:]] ]] &&
-      [[ "${command_line}" == *" ${workspace} "* ]]
+   local -a arguments=()
+   mapfile -d '' -t arguments < "/proc/${candidate}/cmdline" || return 1
+   [[ "${arguments[0]:-}" == bash || "${arguments[0]:-}" == /bin/bash ]] || return 1
+   [[ "${arguments[1]:-}" =~ ^/proc/self/fd/[0-9]+$ ]] || return 1
+   case "${arguments[2]:-}" in
+      --serve) [[ "${#arguments[@]}" -eq 15 && "${arguments[3]}" == "${workspace}" ]] ;;
+      --serve-adopt) [[ "${#arguments[@]}" -eq 17 && "${arguments[3]}" =~ ^[0-9]+$ && "${arguments[5]}" == "${workspace}" && "${arguments[4]}" == "${workspace}/virtual-datacenter.recovery/"* ]] ;;
+      *) return 1 ;;
+   esac
 }
 
 runtime_identity_for_workspace()
@@ -483,8 +496,26 @@ stop_datacenter()
    command -v tr >/dev/null
    valid_workspace "${workspace}" && valid_control_socket_path "${control_socket_path}" || return 2
    local pid_path="${workspace}/virtual-datacenter.pid"
-   local provider_pid=""
+   local provider_pid="" runtime_identity="" retained_cgroup_root="" retained_scope=""
    [[ ! -r "${pid_path}" ]] || provider_pid="$(<"${pid_path}")"
+   if [[ "${provider_pid}" =~ ^[0-9]+$ && "${provider_pid}" -gt 1 ]]
+   then
+      runtime_identity="$(runtime_identity_for_workspace "${workspace}" "${provider_pid}")" || return 1
+      if provider_process "${provider_pid}" "${workspace}"
+      then
+         local provider_cgroup="$(cut -d: -f3 "/proc/${provider_pid}/cgroup")"
+         [[ "${provider_cgroup}" == */prodigy-vdc-${runtime_identity}/provider ]] || return 1
+         retained_cgroup_root="/sys/fs/cgroup${provider_cgroup%/provider}"
+      elif [[ -r "${workspace}/virtual-datacenter.cgroup" ]]
+      then
+         retained_cgroup_root="$(<"${workspace}/virtual-datacenter.cgroup")"
+      else
+         echo "cannot resolve retained provider cgroup owner" >&2
+         return 1
+      fi
+      [[ "${retained_cgroup_root}" == /sys/fs/cgroup/*/prodigy-vdc-${runtime_identity} && "$(realpath -m -- "${retained_cgroup_root}")" == "${retained_cgroup_root}" ]] || return 1
+      retained_scope="${retained_cgroup_root%/prodigy-vdc-${runtime_identity}}"
+   fi
    if provider_process "${provider_pid}" "${workspace}"
    then
       kill -TERM -- "-${provider_pid}"
@@ -497,10 +528,7 @@ stop_datacenter()
    fi
    if [[ "${provider_pid}" =~ ^[0-9]+$ && "${provider_pid}" -gt 1 ]]
    then
-      resolve_cgroup_scope
-      local runtime_identity=""
-      runtime_identity="$(runtime_identity_for_workspace "${workspace}" "${provider_pid}")" || return 1
-      local cgroup_root="${cgroup_scope}/prodigy-vdc-${runtime_identity}"
+      local cgroup_root="${retained_cgroup_root}"
       [[ ! -w "${cgroup_root}/cgroup.kill" ]] || printf '1\n' > "${cgroup_root}/cgroup.kill"
       for _ in $(seq 1 50)
       do
@@ -511,7 +539,7 @@ stop_datacenter()
       [[ ! -d "${cgroup_root}" ]]
       ip link del "vdh${runtime_identity: -8}" >/dev/null 2>&1 || true
    fi
-   restore_cgroup_scope_if_idle
+   [[ -z "${retained_scope}" ]] || restore_cgroup_scope_if_idle "${retained_scope}"
    rm -f -- "${control_socket_path}"
    rmdir -- "${control_socket_path%/*}" 2>/dev/null || true
    rm -rf -- "${workspace}"
@@ -880,6 +908,7 @@ done
 
 atomic_write "${pid_path}" "${pid}\n"
 atomic_write "${identity_path}" "${runtime_identity}\n"
+atomic_write "${workspace}/virtual-datacenter.cgroup" "${cgroup_root}\n"
 atomic_write "${ready_path}" "parentNamespace=${parent_ns} machineCount=${machine_count} nBrains=${brain_count} logicalCores=${machine_logical_cores} memoryMB=${machine_memory_mb} storageMB=${machine_storage_mb} storageDeviceCount=${storage_device_count} storageDeviceMB=${storage_device_mb}\n"
 while [[ ! -r "${provisioned_path}" ]]
 do
@@ -1065,6 +1094,7 @@ then
    printf "%s\n" "${pid}" > "${cgroup_root}/provider/cgroup.procs"
    atomic_write "${pid_path}" "${pid}\n"
    atomic_write "${identity_path}" "${runtime_identity}\n"
+atomic_write "${workspace}/virtual-datacenter.cgroup" "${cgroup_root}\n"
    adoption_committed=1
 fi
 
