@@ -149,7 +149,7 @@ except (OSError, ValueError, KeyError) as error:
 PY_STORAGE_TRACES
       find "${workspace_root}" -maxdepth 1 -type f \( -name '*.log' -o -name '*.json' -o -name '*.ready' -o -name '*.failure' \) \
          -exec cp -a {} "${tmpdir}/workspace-archive/" \; >/dev/null 2>&1 || true
-      find "${workspace_root}/virtual-datacenter.recovery" -maxdepth 2 -type f \( -name operation -o -name ready -o -name commit -o -name launch -o -name replaced -o -name complete -o -name failure -o -name provider.log -o -name selected-machine -o -name root-installed \) -size -8M \
+      find "${workspace_root}/virtual-datacenter.recovery" -maxdepth 2 -type f \( -name operation -o -name ready -o -name commit -o -name launch -o -name replaced -o -name complete -o -name failure -o -name provider.log -o -name selected-machine -o -name root-installed -o -name previous-boot.json -o -name successor-boot.json \) -size -8M \
          -exec cp --parents {} "${tmpdir}/workspace-archive/" \; >/dev/null 2>&1 || true
       python3 - "${manifest_path}" "${tmpdir}/process-identity" <<'PY_PROCESS_IDENTITY'
 import json, pathlib, sys
@@ -617,8 +617,14 @@ PY
       fault_down=0
       for attempt in $(seq 1 120)
       do
-         provider_pid="$(<"${workspace_root}/virtual-datacenter.pid" 2>/dev/null || true)"
-         runtime_identity="$(<"${workspace_root}/virtual-datacenter.identity" 2>/dev/null || true)"
+         provider_pid="$(cat "${workspace_root}/virtual-datacenter.pid" 2>/dev/null || true)"
+         # The sealed predecessor predates the identity file; its resource
+         # namespace is named by the original provider PID.
+         runtime_identity="${provider_pid}"
+         if [[ -e "${workspace_root}/virtual-datacenter.identity" ]]
+         then
+            runtime_identity="$(cat "${workspace_root}/virtual-datacenter.identity" 2>/dev/null || true)"
+         fi
          if [[ "${provider_pid}" =~ ^[0-9]+$ && "${runtime_identity}" =~ ^[0-9]+$ ]] &&
             kill -0 "${fault_pid}" >/dev/null 2>&1 && kill -0 "${provider_pid}" >/dev/null 2>&1 &&
             nsenter -t "${provider_pid}" -m -- ip netns exec "pvd-p-${runtime_identity}" ip -o link show vp2 >"${tmpdir}/bootstrap-fault-link-${attempt}.log" 2>&1 &&
@@ -644,7 +650,7 @@ PY
                timeout 8s "${MOTHERSHIP_BIN}" clusterReport "${cluster_name}" >"${tmpdir}/bootstrap-pending-cluster-${attempt}.log" 2>&1 &&
             rg -q "stagedBundleSHA256=${interrupted_bundle_sha}" "${tmpdir}/bootstrap-pending-cluster-${attempt}.log"
          then
-            printf 'attempt=%s updatePid=%s state=deferred stagedBundleSHA256=${interrupted_bundle_sha}\n' "${attempt}" "${interrupted_update_pid}" >>"${tmpdir}/bootstrap-pending.log"
+            printf 'attempt=%s updatePid=%s state=deferred stagedBundleSHA256=%s\n' "${attempt}" "${interrupted_update_pid}" "${interrupted_bundle_sha}" >>"${tmpdir}/bootstrap-pending.log"
             pending=1
             break
          fi
