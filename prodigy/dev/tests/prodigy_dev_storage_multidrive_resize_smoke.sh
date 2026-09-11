@@ -92,7 +92,7 @@ cleanup()
          tar --sparse -cf "${tmpdir}/precleanup-runtime-logs.tar" -C "${workspace_root}/machines" -- "${runtime_logs[@]}"
          # Archive (without mutating) lifecycle-owned handoff receipts and
          # per-container failure output before Mothership cleanup.
-         mapfile -t handoff_receipts < <(find "${workspace_root}/machines" -path '*/containers/.storage-handoffs/*' -type f -print 2>/dev/null || true)
+         mapfile -t handoff_receipts < <(find "${workspace_root}/machines" -path '*/containers/.storage-handoffs/*/capture.txt' -type f -print 2>/dev/null || true)
          if [[ "${#handoff_receipts[@]}" -gt 0 ]]
          then
             tar --sparse -rf "${tmpdir}/precleanup-runtime-logs.tar" -C / -- "${handoff_receipts[@]}"

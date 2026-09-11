@@ -9088,6 +9088,14 @@ public:
           nHealthy(),
           uint64_t(onlyMeasure),
           uint64_t(previous != nullptr));
+#if PRODIGY_DEBUG
+      PRODIGY_DEBUG_LOG("architect stateful head=%llu previous=%llu isStateful=%d allowUpdateInPlace=%d shards=%u target=%u deployed=%u healthy=%u previousContainers=%u\n",
+                        (unsigned long long)plan.config.deploymentID(),
+                        (unsigned long long)(previous ? previous->plan.config.deploymentID() : 0),
+                        int(plan.isStateful), int(plan.stateful.allowUpdateInPlace),
+                        unsigned(nShardGroups), unsigned(nTarget()), unsigned(nDeployed()),
+                        unsigned(nHealthy()), unsigned(previous ? previous->containers.size() : 0));
+#endif
     }
 
     Vector<uint32_t> shardsForCreation; // only stateful
