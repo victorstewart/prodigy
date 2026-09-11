@@ -667,9 +667,107 @@ static bool generateApplicationTlsFactory(ApplicationTlsVaultFactory& factory, S
   return ok;
 }
 
+class LegacyRuntimeStateWire {
+public:
+  ProdigyMasterAuthorityRuntimeState state;
+};
+
+template <typename S>
+static void serialize(S&& serializer, LegacyRuntimeStateWire& wire)
+{
+  ProdigyMasterAuthorityRuntimeState& state = wire.state;
+  serializer.value8b(state.generation);
+  serializer.value1b(state.hasCompletedInitialMasterElection);
+  serializer.object(state.transportTLSAuthority);
+  serializer.value8b(state.nextMintedClientTlsGeneration);
+  serializer.value8b(state.nextTlsResumptionGeneration);
+  serializer.value8b(state.nextPendingAddMachinesOperationID);
+  serializer.value8b(state.nextPendingElasticAddressOperationID);
+  serializer.value8b(state.nextDNSIntentRevision);
+  serializer.object(state.tlsResumptionSnapshotsByWormhole);
+  serializer.object(state.pendingAddMachinesOperations);
+  serializer.object(state.pendingAutonomousProvisioningOperations);
+  serializer.object(state.pendingElasticAddressAssignments);
+  serializer.object(state.pendingElasticAddressReleases);
+  serializer.object(state.statefulWorkerTopologyUpgradeOperations);
+  serializer.object(state.deferredStatefulScaleIntents);
+  serializer.object(state.machineSchemas);
+  serializer.object(state.routableResourceLeases);
+  serializer.object(state.publicTlsCertificates);
+  serializer.object(state.privateTlsVaultLifecycles);
+  serializer.object(state.taskExecutions);
+  serializer.object(state.mothershipTunnelProviderDesiredState);
+  serializer.object(state.updateSelf);
+}
+
+static void testMasterAuthorityRuntimeStateRecoveryCodec(TestSuite& suite)
+{
+  LegacyRuntimeStateWire legacy = {};
+  legacy.state.generation = 19;
+  legacy.state.hasCompletedInitialMasterElection = true;
+  legacy.state.nextMintedClientTlsGeneration = 31;
+  ProdigyDeferredStatefulScaleIntent nested = {};
+  nested.deploymentID = 0x7101000000000001ULL;
+  nested.applicationID = 0x7101;
+  nested.targetShardGroups = 2;
+  nested.targetLogicalCores = 4;
+  nested.targetMemoryMB = 1024;
+  nested.targetStorageMB = 128;
+  nested.updatedAtMs = 123456;
+  legacy.state.deferredStatefulScaleIntents.push_back(nested);
+
+  String legacyBytes = {};
+  BitseryEngine::serialize(legacyBytes, legacy);
+  ProdigyMasterAuthorityRuntimeState legacyDecoded = {};
+  suite.expect(BitseryEngine::deserializeSafe(legacyBytes, legacyDecoded) &&
+                   legacyDecoded.generation == 19 &&
+                   legacyDecoded.deferredStatefulScaleIntents.size() == 1 &&
+                   legacyDecoded.deferredStatefulScaleIntents[0].deploymentID == nested.deploymentID &&
+                   legacyDecoded.materializedStatefulRecoveryOperations.empty(),
+               "master_authority_runtime_state_reads_populated_legacy_nested_record");
+
+  ProdigyMasterAuthorityRuntimeState emptyCurrent = legacy.state;
+  String emptyCurrentBytes = {};
+  BitseryEngine::serialize(emptyCurrentBytes, emptyCurrent);
+  suite.expect(emptyCurrentBytes.equals(legacyBytes),
+               "master_authority_runtime_state_empty_recovery_encoding_is_exact_legacy");
+
+  ProdigyMasterAuthorityRuntimeState versioned = legacy.state;
+  ProdigyMaterializedStatefulRecoveryOperation operation = {};
+  operation.operationID.assign("00000000-0000-4000-8000-000000000001"_ctv);
+  operation.activeDeploymentID = 0x7101000000000001ULL;
+  operation.successorDeploymentID = 0x7101000000000002ULL;
+  operation.successorBlobSHA256.assign("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv);
+  operation.accepted = true;
+  operation.started = true;
+  operation.completed = true;
+  operation.updatedAtMs = 123457;
+  versioned.materializedStatefulRecoveryOperations.push_back(operation);
+  String versionedBytes = {};
+  BitseryEngine::serialize(versionedBytes, versioned);
+  ProdigyMasterAuthorityRuntimeState versionedDecoded = {};
+  suite.expect(BitseryEngine::deserializeSafe(versionedBytes, versionedDecoded) &&
+                   versionedDecoded == versioned,
+               "master_authority_runtime_state_roundtrips_versioned_recovery_operations");
+
+  String truncated = versionedBytes;
+  truncated.resize(8);
+  ProdigyMasterAuthorityRuntimeState malformed = {};
+  suite.expect(BitseryEngine::deserializeSafe(truncated, malformed) == false,
+               "master_authority_runtime_state_rejects_truncated_version_marker");
+
+  String unknownVersion = versionedBytes;
+  uint64_t unsupportedVersion = 2;
+  memcpy(unknownVersion.data() + sizeof(uint64_t), &unsupportedVersion, sizeof(unsupportedVersion));
+  malformed = {};
+  suite.expect(BitseryEngine::deserializeSafe(unknownVersion, malformed) == false,
+               "master_authority_runtime_state_rejects_unknown_version_marker");
+}
+
 int main(void)
 {
   TestSuite suite;
+  testMasterAuthorityRuntimeStateRecoveryCodec(suite);
   testPersistentMapDirectionalSerialization(suite);
   testFailedDeploymentRecordCompatibilityAndRoundtrip(suite);
   testPersistentBrainSnapshotLargeMetricSampleRoundtrip(suite);
