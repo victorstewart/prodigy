@@ -551,19 +551,36 @@ PY
    env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
       "${MOTHERSHIP_BIN}" deploy "${cluster_name}" "$(cat "${tmpdir}/verify.plan.json")" \
       "${tmpdir}/verify.container.zst" >"${tmpdir}/verify-deploy.log" 2>&1
+   # Each replacement waits for actual predecessor exit, then actual health.
+   # Budget every serial stop grace; a fixed one-minute loop cuts off replica 3.
+   handoff_wait_seconds="$(python3 - "${plan_json}" "${expected_healthy}" <<'PY_HANDOFF_WAIT'
+import json, sys
+with open(sys.argv[1]) as stream:
+    config = json.load(stream)['config']
+per_replica = config['sTilKillable'] + (config['msTilHealthy'] + 999) // 1000 + config['sTilHealthcheck']
+print(int(sys.argv[2]) * per_replica + 30)
+PY_HANDOFF_WAIT
+)"
    healthy=0
-   for _ in $(seq 1 120)
+   handoff_started=${SECONDS}
+   handoff_deadline=$((handoff_started + handoff_wait_seconds))
+   attempt=0
+   while (( SECONDS < handoff_deadline ))
    do
+      attempt=$((attempt + 1))
       if env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
-         "${MOTHERSHIP_BIN}" applicationReport "${cluster_name}" Nametag >"${tmpdir}/verify-report.log" 2>&1 &&
+         timeout 8s "${MOTHERSHIP_BIN}" applicationReport "${cluster_name}" Nametag >"${tmpdir}/verify-report.log" 2>&1 &&
          report_version_ready "${tmpdir}/verify-report.log" "$((version_id + 1))" 3
       then
          healthy=1
-         break
       fi
+      printf 'attempt=%s elapsedSeconds=%s budgetSeconds=%s\n' \
+         "${attempt}" "$((SECONDS - handoff_started))" "${handoff_wait_seconds}" >>"${tmpdir}/verify-report-samples.log"
+      cat "${tmpdir}/verify-report.log" >>"${tmpdir}/verify-report-samples.log"
+      [[ "${healthy}" != 1 ]] || break
       sleep 0.5
    done
-   [[ "${healthy}" == 1 ]] || { echo "FAIL: successor did not become healthy" >&2; exit 1; }
+   [[ "${healthy}" == 1 ]] || { echo "FAIL: successor did not become healthy within ${handoff_wait_seconds}s serial handoff budget" >&2; exit 1; }
    observe_handoff after
    echo "PASS: worker-preserving bundle upgrade and lifecycle-quiesced legacy storage handoff with logical readback"
    exit 0
