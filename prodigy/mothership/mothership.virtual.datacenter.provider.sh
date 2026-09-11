@@ -287,8 +287,21 @@ provider_process()
    [[ "${candidate}" =~ ^[0-9]+$ && "${candidate}" -gt 1 && -r "/proc/${candidate}/cmdline" ]] || return 1
    local command_line
    command_line="$(tr '\0' ' ' < "/proc/${candidate}/cmdline")"
-   [[ "${command_line}" =~ bash[[:space:]]+/proc/self/fd/[0-9]+[[:space:]]+--serve[[:space:]] ]] &&
-      [[ "${command_line}" == *" --serve ${workspace} "* ]]
+   [[ "${command_line}" =~ bash[[:space:]]+/proc/self/fd/[0-9]+[[:space:]]+--serve(-adopt)?[[:space:]] ]] &&
+      [[ "${command_line}" == *" ${workspace} "* ]]
+}
+
+runtime_identity_for_workspace()
+{
+   local workspace="$1" actual_pid="$2" identity_path="${workspace}/virtual-datacenter.identity" identity=""
+   if [[ -r "${identity_path}" ]]
+   then
+      identity="$(<"${identity_path}")"
+      [[ "${identity}" =~ ^[0-9]+$ && "${identity}" -gt 1 ]] || return 1
+      printf "%s\n" "${identity}"
+   else
+      printf "%s\n" "${actual_pid}"
+   fi
 }
 
 sleep_milliseconds()
@@ -338,7 +351,9 @@ fault_datacenter()
    provider_process "${provider_pid}" "${workspace}" || return 1
    command -v ip >/dev/null
    command -v nsenter >/dev/null
-   local parent_ns="pvd-p-${provider_pid}"
+   local runtime_identity=""
+   runtime_identity="$(runtime_identity_for_workspace "${workspace}" "${provider_pid}")" || return 1
+   local parent_ns="pvd-p-${runtime_identity}"
    local -a parent_netns=(nsenter -t "${provider_pid}" -m -- ip netns exec "${parent_ns}")
    local -a machine_pids=()
    mapfile -t machine_pids < "${runtime_path}"
@@ -433,13 +448,15 @@ probe_datacenter()
    command -v ip >/dev/null
    command -v nsenter >/dev/null
    command -v timeout >/dev/null
-   local namespace="pvd-p-${provider_pid}"
+   local runtime_identity=""
+   runtime_identity="$(runtime_identity_for_workspace "${workspace}" "${provider_pid}")" || return 1
+   local namespace="pvd-p-${runtime_identity}"
    if [[ "${source_index}" != "0" ]]
    then
       local -a machine_pids=()
       mapfile -t machine_pids < "${workspace}/virtual-datacenter.runtime"
       [[ "${source_index}" =~ ^[0-9]+$ && "${source_index}" -ge 1 && "${source_index}" -le "${#machine_pids[@]}" ]] || return 2
-      namespace="pvd-m${source_index}-${provider_pid}"
+      namespace="pvd-m${source_index}-${runtime_identity}"
    fi
    local timeout_seconds=""
    printf -v timeout_seconds '%d.%03d' "$((timeout_ms / 1000))" "$((timeout_ms % 1000))"
@@ -481,7 +498,9 @@ stop_datacenter()
    if [[ "${provider_pid}" =~ ^[0-9]+$ && "${provider_pid}" -gt 1 ]]
    then
       resolve_cgroup_scope
-      local cgroup_root="${cgroup_scope}/prodigy-vdc-${provider_pid}"
+      local runtime_identity=""
+      runtime_identity="$(runtime_identity_for_workspace "${workspace}" "${provider_pid}")" || return 1
+      local cgroup_root="${cgroup_scope}/prodigy-vdc-${runtime_identity}"
       [[ ! -w "${cgroup_root}/cgroup.kill" ]] || printf '1\n' > "${cgroup_root}/cgroup.kill"
       for _ in $(seq 1 50)
       do
@@ -490,7 +509,7 @@ stop_datacenter()
          sleep 0.02
       done
       [[ ! -d "${cgroup_root}" ]]
-      ip link del "vdh${provider_pid: -8}" >/dev/null 2>&1 || true
+      ip link del "vdh${runtime_identity: -8}" >/dev/null 2>&1 || true
    fi
    restore_cgroup_scope_if_idle
    rm -f -- "${control_socket_path}"
@@ -513,6 +532,9 @@ launch_datacenter()
    setsid nohup bash "$0" --serve "$@" > "${workspace}/virtual-datacenter.log" 2>&1 < /dev/null &
 }
 
+adopted_mode=0
+adopted_runtime_identity=""
+adopted_operation_dir=""
 case "${1:-}" in
    --bounded-log)
       shift
@@ -546,6 +568,13 @@ case "${1:-}" in
       probe_datacenter "$@"
       exit
       ;;
+   --serve-adopt)
+      [[ "$#" -eq 15 ]] || { echo "serve-adopt requires runtime identity, operation directory, and original provider arguments" >&2; exit 2; }
+      adopted_mode=1
+      adopted_runtime_identity="$2"
+      adopted_operation_dir="$3"
+      shift 3
+      ;;
    --serve)
       shift
       ;;
@@ -555,7 +584,7 @@ case "${1:-}" in
       ;;
 esac
 
-if [[ "${PRODIGY_VDC_MOUNT_NAMESPACE_READY:-0}" != "1" ]]
+if [[ "${adopted_mode}" -eq 0 && "${PRODIGY_VDC_MOUNT_NAMESPACE_READY:-0}" != "1" ]]
 then
    export PRODIGY_VDC_MOUNT_NAMESPACE_READY=1
    exec unshare --mount --propagation private -- bash "$0" --serve "$@"
@@ -618,10 +647,18 @@ then
 fi
 
 pid="$$"
+runtime_identity="${pid}"
+if [[ "${adopted_mode}" -eq 1 ]]
+then
+   [[ "${adopted_runtime_identity}" =~ ^[0-9]+$ && "${adopted_runtime_identity}" -gt 1 && -d "${adopted_operation_dir}" ]] || {
+      echo "invalid adopted provider identity" >&2; exit 2;
+   }
+   runtime_identity="${adopted_runtime_identity}"
+fi
 underlay_mtu=$((inter_container_mtu + 40))
 public_ingress_mtu=1500
-parent_ns="pvd-p-${pid}"
-filesystem_root="/mnt/prodigy-vdc-${pid}"
+parent_ns="pvd-p-${runtime_identity}"
+filesystem_root="/mnt/prodigy-vdc-${runtime_identity}"
 filesystem_image="${workspace}/virtual-datacenter.btrfs"
 cgroup_scope=""
 cgroup_control=""
@@ -636,14 +673,18 @@ failure_path="${workspace}/virtual-datacenter.failure"
 manifest_path="${workspace}/test-cluster-manifest.json"
 boundary_lock="/run/prodigy-virtual-datacenter.boundary.lock"
 boundary_bpffs="${workspace}/boundary-bpffs"
-host_edge="vdh${pid: -8}"
-parent_edge="vdp${pid: -8}"
+host_edge="vdh${runtime_identity: -8}"
+parent_edge="vdp${runtime_identity: -8}"
 child_names=()
 machine_pids=()
 storage_mounts=()
 host_ipv4_forward=""
 host_ipv6_forward=""
 cleaned=0
+adoption_committed=0
+recovering_machine=0
+recovery_operation_id=""
+identity_path="${workspace}/virtual-datacenter.identity"
 
 atomic_write()
 {
@@ -663,6 +704,13 @@ cleanup()
    fi
    cleaned=1
    trap - ERR EXIT HUP INT TERM
+   # Before C++ commits the matching operation receipt, this process has only
+   # observed retained resources. Leaving must return sole ownership to the
+   # frozen original supervisor without touching its roots, cgroups, or links.
+   if [[ "${adopted_mode}" -eq 1 && "${adoption_committed}" -eq 0 ]]
+   then
+      exit "${status}"
+   fi
    set +e
 
    for machine_pid in "${machine_pids[@]}"
@@ -734,6 +782,8 @@ trap 'exit 130' INT
 trap 'exit 129' HUP
 trap 'exit 143' TERM
 
+if [[ "${adopted_mode}" -eq 0 ]]
+then
 mkdir -p "${workspace}/boot" "${filesystem_root}"
 install -d -m 0700 "${control_socket_path%/*}"
 rm -f "${provisioned_path}" "${ready_path}" "${runtime_path}" "${failure_path}" "${manifest_path}" "${control_socket_path}"
@@ -747,7 +797,7 @@ mkdir -p "${shared_transport_tls}" "${filesystem_root}/machines"
 btrfs quota enable "${filesystem_root}"
 
 prepare_cgroup_scope
-cgroup_root="${cgroup_scope}/prodigy-vdc-${pid}"
+cgroup_root="${cgroup_scope}/prodigy-vdc-${runtime_identity}"
 mkdir -p "${cgroup_root}/provider"
 for controller in cpuset cpu memory pids
 do
@@ -827,6 +877,7 @@ do
 done
 
 atomic_write "${pid_path}" "${pid}\n"
+atomic_write "${identity_path}" "${runtime_identity}\n"
 atomic_write "${ready_path}" "parentNamespace=${parent_ns} machineCount=${machine_count} nBrains=${brain_count} logicalCores=${machine_logical_cores} memoryMB=${machine_memory_mb} storageMB=${machine_storage_mb} storageDeviceCount=${storage_device_count} storageDeviceMB=${storage_device_mb}\n"
 while [[ ! -r "${provisioned_path}" ]]
 do
@@ -895,6 +946,7 @@ then
    ip netns exec "${parent_ns}" tc filter replace dev "${parent_edge}" egress bpf da pinned "${boundary_bpffs}/programs/fake_nat_eg"
    ip netns exec "${parent_ns}" tc filter replace dev "${parent_edge}" ingress bpf da pinned "${boundary_bpffs}/programs/fake_nat_in"
 fi
+fi
 
 start_machine()
 {
@@ -944,11 +996,58 @@ reset_machine_cgroup()
    return 1
 }
 
-for index in $(seq 1 "${machine_count}")
-do
-   start_machine "${index}"
-   sleep 0.25
-done
+if [[ "${adopted_mode}" -eq 0 ]]
+then
+   for index in $(seq 1 "${machine_count}")
+   do
+      start_machine "${index}"
+      sleep 0.25
+   done
+else
+   # Retained cgroup membership and the runtime receipt are the adoption source
+   # of truth: application processes may have been reparented after worker exit.
+   resolve_cgroup_scope
+   cgroup_root="${cgroup_scope}/prodigy-vdc-${runtime_identity}"
+   [[ -d "${filesystem_root}" && -r "${runtime_path}" && -d "${cgroup_root}" ]] || failed 1 "$LINENO"
+   mapfile -t machine_pids < "${runtime_path}"
+   [[ "${#machine_pids[@]}" -eq "${machine_count}" ]] || failed 1 "$LINENO"
+   for index in $(seq 1 "${machine_count}")
+   do
+      child_names+=("pvd-m${index}-${runtime_identity}")
+      [[ -d "${cgroup_root}/machine${index}" && -d "${filesystem_root}/machines/${index}" ]] || failed 1 "$LINENO"
+      for device in $(seq 1 "${storage_device_count}")
+      do
+         storage_mounts+=("${filesystem_root}/storage/${index}/${device}")
+      done
+   done
+fi
+
+if [[ "${adopted_mode}" -eq 1 ]]
+then
+   selected_path="${adopted_operation_dir}/selected-machine"
+   [[ -r "${selected_path}" ]] || failed 1 "$LINENO"
+   recovering_machine="$(<"${selected_path}")"
+   [[ "${recovering_machine}" =~ ^[1-9][0-9]*$ && "${recovering_machine}" -le "${machine_count}" ]] || failed 1 "$LINENO"
+   # Ready is written before PID/manifest publication and before any worker or
+   # root mutation. C++ binds all four values to its durable operation record.
+   start_time="$(awk '{print $22}' /proc/$$/stat)"
+   mount_namespace="$(stat -Lc %i /proc/$$/ns/mnt)"
+   ready_path_for_operation="${adopted_operation_dir}/ready"
+   ready_temporary="${ready_path_for_operation}.${pid}.tmp"
+   printf "%s %s %s %s\n" "${pid}" "${start_time}" "${mount_namespace}" "${runtime_identity}" > "${ready_temporary}"
+   mv -f "${ready_temporary}" "${ready_path_for_operation}"
+   commit_path="${adopted_operation_dir}/commit"
+   operation_id="${adopted_operation_dir##*/}"
+   recovery_operation_id="${operation_id}"
+   while [[ ! -r "${commit_path}" || "$(<"${commit_path}")" != "${operation_id}" ]]
+   do
+      sleep 0.05
+   done
+   # The committed adopter becomes the real provider process in the retained
+   # provider cgroup. This is intentionally after the precommit receipt.
+   printf "%s\n" "${pid}" > "${cgroup_root}/provider/cgroup.procs"
+   adoption_committed=1
+fi
 
 publish_runtime()
 {
@@ -984,6 +1083,27 @@ do
    for index in $(seq 1 "${machine_count}")
    do
       machine_pid="${machine_pids[$((index - 1))]}"
+      if [[ "${index}" -eq "${recovering_machine}" ]]
+      then
+         # A selected recovery is C++-owned. Never cgroup-kill it or let the
+         # ordinary supervisor race the staged root swap.
+         if [[ -r "${adopted_operation_dir}/complete" && "$(<"${adopted_operation_dir}/complete")" == "${recovery_operation_id}" ]]
+         then
+            recovering_machine=0
+         elif [[ -r "${adopted_operation_dir}/launch" && "$(<"${adopted_operation_dir}/launch")" == "${recovery_operation_id}" ]] && ! kill -0 "${machine_pid}" >/dev/null 2>&1
+         then
+            wait "${machine_pid}" >/dev/null 2>&1 || true
+            start_machine "${index}"
+            publish_runtime
+            replacement_pid="${machine_pids[$((index - 1))]}"
+            replacement_start="$(awk '{print $22}' "/proc/${replacement_pid}/stat")"
+            replacement_netns="$(stat -Lc %i "/proc/${replacement_pid}/ns/net")"
+            replacement_path="${adopted_operation_dir}/replaced"
+            printf "%s %s %s\n" "${replacement_pid}" "${replacement_start}" "${replacement_netns}" > "${replacement_path}.${pid}.tmp"
+            mv -f "${replacement_path}.${pid}.tmp" "${replacement_path}"
+         fi
+         continue
+      fi
       if ! kill -0 "${machine_pid}" >/dev/null 2>&1
       then
          wait "${machine_pid}" >/dev/null 2>&1 || true
