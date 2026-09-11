@@ -47,7 +47,8 @@ enum class MothershipTopic : uint16_t {
   pullContainerLogs,
   // Version-scoped recovery for a non-serving stateless rollout head.  Keep
   // this appended: MothershipTopic is a wire enum.
-  cancelDeployment
+  cancelDeployment,
+  recoverMaterializedStatefulDeployment
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -116,6 +117,8 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "pullContainerLogs";
     case MothershipTopic::cancelDeployment:
       return "cancelDeployment";
+    case MothershipTopic::recoverMaterializedStatefulDeployment:
+      return "recoverMaterializedStatefulDeployment";
   }
 
   return "unknown";

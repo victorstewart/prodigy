@@ -3243,6 +3243,8 @@ private:
 
   void setDeploymentRunning(void)
   {
+    materializedStatefulRecoveryOwnsTransition = false;
+    materializedStatefulRecoveryHealthFailed = false;
     state = DeploymentState::running;
     stateChangedAtMs = Time::now<TimeResolution::ms>();
     if (plan.config.type == ApplicationType::task)
@@ -3276,6 +3278,12 @@ private:
 
   void consumeSchedulingExecution(void)
   {
+    // Every continuation source, including duplicate health and equivalent
+    // waiter reconciliation, must respect a failed recovery health barrier.
+    if (materializedStatefulRecoveryOwnsTransition && materializedStatefulRecoveryHealthFailed)
+    {
+      return;
+    }
     CoroutineStack *execution = schedulingStack.execution;
     if (execution == nullptr)
     {
@@ -3348,6 +3356,25 @@ private:
   {
     if (auto it = waitingOnContainers.find(container); it != waitingOnContainers.end())
     {
+      if (materializedStatefulRecoveryOwnsTransition &&
+          it->second == ContainerState::healthy &&
+          (container->state == ContainerState::destroying ||
+           container->state == ContainerState::destroyed))
+      {
+        // A dead replacement cannot authorize taking down another predecessor.
+        // Remove the pointer before destruction, but leave the scheduler paused.
+        materializedStatefulRecoveryHealthFailed = true;
+        waitingOnContainers.erase(it);
+        return;
+      }
+      if (materializedStatefulRecoveryHealthFailed)
+      {
+        if (container->state == ContainerState::destroyed)
+        {
+          waitingOnContainers.erase(it);
+        }
+        return;
+      }
       switch (it->second)
       {
         case ContainerState::healthy: // waiting for container to be healthy
@@ -6247,68 +6274,8 @@ public:
     }
   }
 
-  // Compatibility hook for reboot recovery flows invoked by Brain timeout paths.
-  // Reconcile pending work and close target deficits after master/brain recovery.
-  void recoverAfterReboot(void)
+  void rebuildRecoveredContainerCounts(void)
   {
-#if PRODIGY_DEBUG
-    PRODIGY_DEBUG_LOG(
-                 "deployment recoverAfterReboot begin deploymentID=%llu appID=%u state=%u waiting=%llu toSchedule=%llu nDeployed=%u nTarget=%u nHealthy=%u suspended=%u\n",
-                 (unsigned long long)plan.config.deploymentID(),
-                 unsigned(plan.config.applicationID),
-                 unsigned(state),
-                 (unsigned long long)waitingOnContainers.size(),
-                 (unsigned long long)toSchedule.size(),
-                 unsigned(nDeployed()),
-                 unsigned(nTarget()),
-                 unsigned(nHealthy()),
-                 unsigned(nSuspended));
-    PRODIGY_DEBUG_FLUSH();
-#endif
-
-    if (state == DeploymentState::failed || state == DeploymentState::decommissioning)
-    {
-      return;
-    }
-    if (plan.config.type == ApplicationType::task)
-    {
-      return;
-    }
-
-    bool activeLocalTransition = (state == DeploymentState::deploying || state == DeploymentState::canaries || waitingOnCompactions || waitingOnContainers.size() > 0 || schedulingStack.execution != nullptr || canaryStack != nullptr);
-    if (nSuspended > 0)
-    {
-      if (activeLocalTransition)
-      {
-        return;
-      }
-
-#if PRODIGY_DEBUG
-      PRODIGY_DEBUG_LOG(
-                   "deployment recoverAfterReboot clear-stale-suspension deploymentID=%llu appID=%u suspended=%u\n",
-                   (unsigned long long)plan.config.deploymentID(),
-                   unsigned(plan.config.applicationID),
-                   unsigned(nSuspended));
-      PRODIGY_DEBUG_FLUSH();
-#endif
-      nSuspended = 0;
-    }
-
-    if (toSchedule.size() > 0)
-    {
-#if PRODIGY_DEBUG
-      PRODIGY_DEBUG_LOG(
-                   "deployment recoverAfterReboot reschedule-pending deploymentID=%llu appID=%u toSchedule=%llu waiting=%llu\n",
-                   (unsigned long long)plan.config.deploymentID(),
-                   unsigned(plan.config.applicationID),
-                   (unsigned long long)toSchedule.size(),
-                   (unsigned long long)waitingOnContainers.size());
-      PRODIGY_DEBUG_FLUSH();
-#endif
-      schedule(nullptr);
-      return;
-    }
-
     // Rebuild deployed/healthy counters from recovered runtime state so
     // takeover replay can close deficits even after stale planning counters.
     uint32_t actualDeployedCanary = 0;
@@ -6377,6 +6344,70 @@ public:
     nHealthyCanary = actualHealthyCanary;
     nHealthyBase = actualHealthyBase;
     nHealthySurge = actualHealthySurge;
+  }
+
+  // Reconcile pending work and close target deficits after master/brain recovery.
+  void recoverAfterReboot(void)
+  {
+#if PRODIGY_DEBUG
+    PRODIGY_DEBUG_LOG(
+                 "deployment recoverAfterReboot begin deploymentID=%llu appID=%u state=%u waiting=%llu toSchedule=%llu nDeployed=%u nTarget=%u nHealthy=%u suspended=%u\n",
+                 (unsigned long long)plan.config.deploymentID(),
+                 unsigned(plan.config.applicationID),
+                 unsigned(state),
+                 (unsigned long long)waitingOnContainers.size(),
+                 (unsigned long long)toSchedule.size(),
+                 unsigned(nDeployed()),
+                 unsigned(nTarget()),
+                 unsigned(nHealthy()),
+                 unsigned(nSuspended));
+    PRODIGY_DEBUG_FLUSH();
+#endif
+
+    if (state == DeploymentState::failed || state == DeploymentState::decommissioning)
+    {
+      return;
+    }
+    if (plan.config.type == ApplicationType::task)
+    {
+      return;
+    }
+
+    bool activeLocalTransition = (state == DeploymentState::deploying || state == DeploymentState::canaries || waitingOnCompactions || waitingOnContainers.size() > 0 || schedulingStack.execution != nullptr || canaryStack != nullptr);
+    if (nSuspended > 0)
+    {
+      if (activeLocalTransition)
+      {
+        return;
+      }
+
+#if PRODIGY_DEBUG
+      PRODIGY_DEBUG_LOG(
+                   "deployment recoverAfterReboot clear-stale-suspension deploymentID=%llu appID=%u suspended=%u\n",
+                   (unsigned long long)plan.config.deploymentID(),
+                   unsigned(plan.config.applicationID),
+                   unsigned(nSuspended));
+      PRODIGY_DEBUG_FLUSH();
+#endif
+      nSuspended = 0;
+    }
+
+    if (toSchedule.size() > 0)
+    {
+#if PRODIGY_DEBUG
+      PRODIGY_DEBUG_LOG(
+                   "deployment recoverAfterReboot reschedule-pending deploymentID=%llu appID=%u toSchedule=%llu waiting=%llu\n",
+                   (unsigned long long)plan.config.deploymentID(),
+                   unsigned(plan.config.applicationID),
+                   (unsigned long long)toSchedule.size(),
+                   (unsigned long long)waitingOnContainers.size());
+      PRODIGY_DEBUG_FLUSH();
+#endif
+      schedule(nullptr);
+      return;
+    }
+
+    rebuildRecoveredContainerCounts();
 
     if (nTarget() == 0)
     {
@@ -7529,6 +7560,9 @@ public:
   // A durable operator cancellation, not normal roll-forward, owns unlinking
   // this deployment and starting its specifically named successor.
   bool operatorCancellationOwnsTransition = false;
+  // Restored by Brain from the durable, version-scoped recovery acceptance.
+  bool materializedStatefulRecoveryOwnsTransition = false;
+  bool materializedStatefulRecoveryHealthFailed = false;
 
   bytell_hash_map<uint32_t, ContainerView *> masterForShardGroup; // only for stateful + !allMasters
 
@@ -8081,12 +8115,9 @@ public:
       return;
     }
 
+    // Publish the acknowledged health before callbacks can resume a scheduler
+    // and evaluate the complete healthy target.
     container->state = ContainerState::healthy;
-    handleContainerStateChange(container, true);
-    clearEquivalentHealthyWaiters(container);
-    container->replayActivePairingsToSelf();
-    container->replayActivePairingsToPeers();
-
     switch (container->lifetime)
     {
       case ApplicationLifetime::canary:
@@ -8105,6 +8136,11 @@ public:
           break;
         }
     }
+
+    handleContainerStateChange(container, true);
+    clearEquivalentHealthyWaiters(container);
+    container->replayActivePairingsToSelf();
+    container->replayActivePairingsToPeers();
 
 #if PRODIGY_DEBUG
     basics_log("deployment containerIsHealthy applied deploymentID=%llu appID=%u uuid=%llu machinePrivate4=%u waitingOnContainers=%llu nHealthy=%u/%u/%u nDeployed=%u/%u/%u\n",
@@ -9046,7 +9082,10 @@ public:
 
     if (state == DeploymentState::deploying)
     {
-      if (plan.config.type != ApplicationType::task && nDeployed() < nTarget())
+      if (plan.config.type != ApplicationType::task &&
+          (nDeployed() < nTarget() ||
+           (materializedStatefulRecoveryOwnsTransition &&
+            (materializedStatefulRecoveryHealthFailed || nHealthy() < nTarget()))))
       {
         co_return;
       }
@@ -9088,6 +9127,25 @@ public:
           nHealthy(),
           uint64_t(onlyMeasure),
           uint64_t(previous != nullptr));
+    }
+
+    if (materializedStatefulRecoveryOwnsTransition)
+    {
+      if (materializedStatefulRecoveryHealthFailed || previous == nullptr)
+      {
+        co_return;
+      }
+      // Recovery is allowed only through the retained-storage in-place owner.
+      // Capacity or control loss must not fall through to destructive relocation.
+      for (ContainerView *container : previous->containers)
+      {
+        if (container == nullptr || container->machine == nullptr ||
+            BrainBase::neuronControlStreamActive(container->machine) == false ||
+            nFitOnMachine(this, container->machine, 1) == 0)
+        {
+          co_return;
+        }
+      }
     }
 
     Vector<uint32_t> shardsForCreation; // only stateful
@@ -9149,49 +9207,62 @@ public:
       {
         if (plan.stateful.allowUpdateInPlace) // even if moveConstructively were true, this would override that for any that can be done in place
         {
-          for (auto it = containersToDestroy.begin(); it != containersToDestroy.end();)
+          // Planning changes container state, so select the unhealthy cohort
+          // first and erase it before selecting healthy predecessors. Execution
+          // still uses the existing serial update-in-place health wait.
+          const uint32_t passes = materializedStatefulRecoveryOwnsTransition ? 2 : 1;
+          for (uint32_t pass = 0; pass < passes; ++pass)
           {
-            ContainerView *container = *it;
-
-            Machine *machine = container->machine;
-            if (BrainBase::neuronControlStreamActive(machine) == false)
+            for (auto it = containersToDestroy.begin(); it != containersToDestroy.end();)
             {
-              it++;
-              continue;
-            }
-
-            if (nFitOnMachine(this, machine, 1) > 0)
-            {
-              MachineResourcesDelta& deltas = deltasByMachine[machine];
-              prodigyApplyPlannedMachineScalarDelta(deltas, previous->plan.config, -1);
-              prodigyAppendGPUMemoryMBs(deltas.gpuMemoryMBs, container->assignedGPUMemoryMBs);
-              prodigyAppendAssignedGPUDevices(deltas.gpuDevices, container->assignedGPUDevices);
-
-              if (onlyMeasure)
+              ContainerView *container = *it;
+              if (materializedStatefulRecoveryOwnsTransition &&
+                  (container->state == ContainerState::healthy) != (pass == 1))
               {
-                logInitialMachineResources(machine);
+                ++it;
+                continue;
               }
-              // these may temporarily go negative but it doesn't matter
-              prodigyDebitMachineScalarResources(machine, plan.config, 1);
 
-              nDeployedBase += 1;
+              Machine *machine = container->machine;
+              if (BrainBase::neuronControlStreamActive(machine) == false)
+              {
+                it++;
+                continue;
+              }
 
-              // we don't need to change countPerMachine, countPerRack or racksByShardGroup because they remain the same with an in-place update
+              if (nFitOnMachine(this, machine, 1) > 0)
+              {
+                MachineResourcesDelta& deltas = deltasByMachine[machine];
+                prodigyApplyPlannedMachineScalarDelta(deltas, previous->plan.config, -1);
+                prodigyAppendGPUMemoryMBs(deltas.gpuMemoryMBs, container->assignedGPUMemoryMBs);
+                prodigyAppendAssignedGPUDevices(deltas.gpuDevices, container->assignedGPUDevices);
 
-              shardsForCreation.erase(std::find(shardsForCreation.begin(), shardsForCreation.end(), container->shardGroup));
+                if (onlyMeasure)
+                {
+                  logInitialMachineResources(machine);
+                }
+                // these may temporarily go negative but it doesn't matter
+                prodigyDebitMachineScalarResources(machine, plan.config, 1);
 
-              Vector<uint32_t> assignedGPUMemoryMBs = {};
-              Vector<AssignedGPUDevice> assignedGPUDevices = {};
-              bool assignedGPUs = prodigyTakeAssignedGPUsForScheduling(machine, nullptr, &deltas, plan.config, assignedGPUMemoryMBs, assignedGPUDevices);
-              assert(assignedGPUs && "stateful update in place must reserve GPUs");
-              scheduleStatefulUpdateInPlace(container, std::move(assignedGPUMemoryMBs), std::move(assignedGPUDevices));
+                nDeployedBase += 1;
 
-              it = containersToDestroy.erase(it);
+                // we don't need to change countPerMachine, countPerRack or racksByShardGroup because they remain the same with an in-place update
 
-              continue;
+                shardsForCreation.erase(std::find(shardsForCreation.begin(), shardsForCreation.end(), container->shardGroup));
+
+                Vector<uint32_t> assignedGPUMemoryMBs = {};
+                Vector<AssignedGPUDevice> assignedGPUDevices = {};
+                bool assignedGPUs = prodigyTakeAssignedGPUsForScheduling(machine, nullptr, &deltas, plan.config, assignedGPUMemoryMBs, assignedGPUDevices);
+                assert(assignedGPUs && "stateful update in place must reserve GPUs");
+                scheduleStatefulUpdateInPlace(container, std::move(assignedGPUMemoryMBs), std::move(assignedGPUDevices));
+
+                it = containersToDestroy.erase(it);
+
+                continue;
+              }
+
+              it++;
             }
-
-            it++;
           }
         }
       }
@@ -9792,6 +9863,134 @@ public:
 
     // free this deployment object
     delete this;
+  }
+
+  void resumeMaterializedStatefulRecovery(void)
+  {
+    if (materializedStatefulRecoveryOwnsTransition == false ||
+        materializedStatefulRecoveryHealthFailed || previous == nullptr ||
+        plan.isStateful == false || previous->plan.isStateful == false ||
+        previous->previous != nullptr || previous->next != this || next != nullptr ||
+        (state != DeploymentState::none && state != DeploymentState::waitingToDeploy &&
+         state != DeploymentState::deploying) ||
+        waitingOnCompactions || canaryStack != nullptr || currentlyExecutingWork != nullptr ||
+        schedulingStack.execution != nullptr || retiredSchedulingExecution != nullptr ||
+        consumingSchedulingExecution || schedulingStack.waiters.empty() == false ||
+        toSchedule.empty() == false || waitingOnContainers.empty() == false || nSuspended != 0 ||
+        previous->waitingOnCompactions || previous->canaryStack != nullptr ||
+        previous->currentlyExecutingWork != nullptr || previous->schedulingStack.execution != nullptr ||
+        previous->retiredSchedulingExecution != nullptr || previous->consumingSchedulingExecution ||
+        previous->schedulingStack.waiters.empty() == false || previous->toSchedule.empty() == false ||
+        previous->waitingOnContainers.empty() == false || previous->nSuspended != 0)
+    {
+      return;
+    }
+
+    // A partial handoff may resume only once every already-started replacement
+    // is healthy. Missing, dying, or overlapping runtime owners stay held.
+    if (containers.size() + previous->containers.size() != 3)
+    {
+      return;
+    }
+    uint32_t healthy = 0;
+    for (ApplicationDeployment *owner : {previous, this})
+    {
+      for (ContainerView *container : owner->containers)
+      {
+        if (container == nullptr || container->machine == nullptr ||
+            container->deploymentID != owner->plan.config.deploymentID() ||
+            container->isStateful == false || container->shardGroup != 0 ||
+            container->lifetime != ApplicationLifetime::base || container->plannedWork != nullptr ||
+            (container->state != ContainerState::healthy &&
+             (owner == this || (container->state != ContainerState::scheduled &&
+                                container->state != ContainerState::crashedRestarting))))
+        {
+          return;
+        }
+        healthy += container->state == ContainerState::healthy;
+      }
+    }
+    if (healthy == 0)
+    {
+      return;
+    }
+    previous->rebuildRecoveredContainerCounts();
+    previous->calculateTargets();
+    rebuildRecoveredContainerCounts();
+    calculateTargets();
+
+    if (containers.empty())
+    {
+      // Persisted queued plans can be reconstructed as NONE. The durable
+      // acceptance identifies this exact unmaterialized successor.
+      state = DeploymentState::waitingToDeploy;
+      if (previous->recoveredMaterializedStatefulRollForwardIsSafe())
+      {
+        previous->rollForward();
+      }
+      else if (previous->state == DeploymentState::none &&
+               previous->nHealthy() == previous->nTarget())
+      {
+        previous->recoverAfterReboot();
+      }
+      return;
+    }
+
+    previous->beginDecommissioningForRollForward();
+    // Reuse normal inventory reconstruction and scheduling. Its recovery flag
+    // forbids relocating retained storage or moving beyond unhealthy replicas.
+    recoverAfterReboot();
+  }
+
+  bool recoveredMaterializedStatefulRollForwardIsSafe(void)
+  {
+    if (plan.isStateful == false || plan.config.type != ApplicationType::stateful ||
+        state != DeploymentState::none || previous != nullptr || next == nullptr ||
+        waitingOnCompactions || canaryStack != nullptr || currentlyExecutingWork != nullptr ||
+        schedulingStack.execution != nullptr || retiredSchedulingExecution != nullptr ||
+        consumingSchedulingExecution || schedulingStack.waiters.empty() == false ||
+        toSchedule.empty() == false || waitingOnContainers.empty() == false || nSuspended != 0 ||
+        nShardGroups != 1 || nTarget() != 3 || nDeployed() != nTarget() ||
+        containers.size() != nTarget() || nHealthy() == 0 || nHealthy() >= nTarget())
+    {
+      return false;
+    }
+    if (next->previous != this || next->next != nullptr ||
+        next->plan.isStateful == false || next->plan.config.type != ApplicationType::stateful ||
+        next->plan.config.applicationID != plan.config.applicationID ||
+        next->plan.stateful.allowUpdateInPlace == false || next->plan.canaryCount != 0 ||
+        next->plan.config.nLogicalCores != plan.config.nLogicalCores ||
+        next->plan.config.totalStorageMB() != plan.config.totalStorageMB() ||
+        next->plan.stateful.clientPrefix != plan.stateful.clientPrefix ||
+        next->plan.stateful.siblingPrefix != plan.stateful.siblingPrefix ||
+        next->plan.stateful.cousinPrefix != plan.stateful.cousinPrefix ||
+        next->plan.stateful.seedingPrefix != plan.stateful.seedingPrefix ||
+        next->plan.stateful.shardingPrefix != plan.stateful.shardingPrefix ||
+        next->plan.stateful.seedingAlways != plan.stateful.seedingAlways ||
+        next->plan.stateful.allMasters != plan.stateful.allMasters ||
+        next->state != DeploymentState::waitingToDeploy || next->lifecycleIsUnmaterialized() == false)
+    {
+      return false;
+    }
+    uint32_t healthy = 0;
+    bytell_hash_set<Machine *> sourceMachines;
+    for (ContainerView *container : containers)
+    {
+      if (container == nullptr || container->machine == nullptr ||
+          container->deploymentID != plan.config.deploymentID() || container->isStateful == false ||
+          container->shardGroup != 0 || container->lifetime != ApplicationLifetime::base ||
+          container->plannedWork != nullptr ||
+          (container->state != ContainerState::healthy && container->state != ContainerState::scheduled &&
+           container->state != ContainerState::crashedRestarting) ||
+          BrainBase::neuronControlStreamActive(container->machine) == false ||
+          sourceMachines.insert(container->machine).second == false ||
+          nFitOnMachine(next, container->machine, 1) == 0)
+      {
+        return false;
+      }
+      healthy += container->state == ContainerState::healthy;
+    }
+    return healthy == nHealthy();
   }
 
   void rollForward(void)

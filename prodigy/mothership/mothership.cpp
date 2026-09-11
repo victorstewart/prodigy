@@ -15806,7 +15806,9 @@ private:
     }
     if (!sawApplicationName || !sawApplicationID || !sawActiveVersionID || !sawSuccessorVersionID ||
         !sawOperationID || !sawReason || request.applicationName.size() == 0 || request.applicationName.size() > 128 || request.applicationID == 0 ||
-        request.activeVersionID == 0 || request.successorVersionID == 0 ||
+        request.activeVersionID == 0 || request.activeVersionID >= (uint64_t(1) << 48) ||
+        request.successorVersionID >= (uint64_t(1) << 48) ||
+        request.successorVersionID <= request.activeVersionID ||
         prodigyCanonicalOperationUUID(request.operationID) == false ||
         request.reason.size() == 0 || request.reason.size() > 512)
     {
@@ -15849,6 +15851,142 @@ private:
                (unsigned long long)response.activeVersionID,
                (unsigned long long)response.successorVersionID,
                (unsigned long long)response.cancelledDeploymentID,
+               (unsigned long long)response.successorDeploymentID,
+               (unsigned long long)response.durableGeneration, response.failure.c_str());
+    if (response.success == false) exit(EXIT_FAILURE);
+  }
+
+  void runRecoverMaterializedStatefulDeployment(int argc, char *argv[])
+  {
+    if (argc < 2)
+    {
+      basics_log("too few arguments. ex: recoverMaterializedStatefulDeployment [target: local|clusterName|clusterUUID] [json]\n");
+      exit(EXIT_FAILURE);
+    }
+    String json;
+    json.append(argv[1]);
+    json.need(simdjson::SIMDJSON_PADDING);
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc;
+    RecoverMaterializedStatefulDeployment request = {};
+    bool sawApplicationName = false;
+    bool sawApplicationID = false;
+    bool sawActiveVersionID = false;
+    bool sawSuccessorVersionID = false;
+    bool sawOperationID = false;
+    bool sawSuccessorBlobSHA256 = false;
+    if (parser.parse(json.data(), json.size()).get(doc))
+    {
+      basics_log("invalid json for recoverMaterializedStatefulDeployment\n");
+      exit(EXIT_FAILURE);
+    }
+    for (auto field : doc.get_object())
+    {
+      String key;
+      key.setInvariant(field.key.data(), field.key.size());
+      if (key.equal("applicationName"_ctv) || key.equal("operationID"_ctv) || key.equal("successorBlobSHA256"_ctv))
+      {
+        if (field.value.type() != simdjson::dom::element_type::STRING)
+        {
+          basics_log("recoverMaterializedStatefulDeployment.%s requires string\n", key.c_str());
+          exit(EXIT_FAILURE);
+        }
+        bool *seen = key.equal("applicationName"_ctv) ? &sawApplicationName
+                     : key.equal("operationID"_ctv) ? &sawOperationID
+                                                      : &sawSuccessorBlobSHA256;
+        if (*seen)
+        {
+          basics_log("recoverMaterializedStatefulDeployment duplicate field %s\n", key.c_str());
+          exit(EXIT_FAILURE);
+        }
+        *seen = true;
+        if (key.equal("applicationName"_ctv)) request.applicationName.assign(field.value.get_c_str());
+        else if (key.equal("operationID"_ctv)) request.operationID.assign(field.value.get_c_str());
+        else request.successorBlobSHA256.assign(field.value.get_c_str());
+      }
+      else if (key.equal("applicationID"_ctv) || key.equal("activeVersionID"_ctv) || key.equal("successorVersionID"_ctv))
+      {
+        uint64_t value = 0;
+        if ((field.value.type() != simdjson::dom::element_type::INT64 &&
+             field.value.type() != simdjson::dom::element_type::UINT64) ||
+            field.value.get(value) != simdjson::SUCCESS || value == 0)
+        {
+          basics_log("recoverMaterializedStatefulDeployment.%s requires positive integer\n", key.c_str());
+          exit(EXIT_FAILURE);
+        }
+        bool *seen = key.equal("applicationID"_ctv) ? &sawApplicationID
+                     : key.equal("activeVersionID"_ctv) ? &sawActiveVersionID
+                                                          : &sawSuccessorVersionID;
+        if (*seen)
+        {
+          basics_log("recoverMaterializedStatefulDeployment duplicate field %s\n", key.c_str());
+          exit(EXIT_FAILURE);
+        }
+        *seen = true;
+        if (key.equal("applicationID"_ctv))
+        {
+          if (value > UINT16_MAX) { basics_log("recoverMaterializedStatefulDeployment.applicationID invalid\n"); exit(EXIT_FAILURE); }
+          request.applicationID = uint16_t(value);
+        }
+        else if (key.equal("activeVersionID"_ctv)) request.activeVersionID = value;
+        else request.successorVersionID = value;
+      }
+      else
+      {
+        basics_log("recoverMaterializedStatefulDeployment invalid field\n");
+        exit(EXIT_FAILURE);
+      }
+    }
+    if (!sawApplicationName || !sawApplicationID || !sawActiveVersionID || !sawSuccessorVersionID ||
+        !sawOperationID || !sawSuccessorBlobSHA256 || request.applicationName.size() == 0 || request.applicationName.size() > 128 || request.applicationID == 0 ||
+        request.activeVersionID == 0 || request.activeVersionID >= (uint64_t(1) << 48) ||
+        request.successorVersionID >= (uint64_t(1) << 48) ||
+        request.successorVersionID <= request.activeVersionID ||
+        prodigyCanonicalOperationUUID(request.operationID) == false ||
+        prodigyIsSHA256HexDigest(request.successorBlobSHA256) == false)
+    {
+      basics_log("recoverMaterializedStatefulDeployment requires applicationName, applicationID, activeVersionID, successorVersionID, canonical operationID, and bounded successorBlobSHA256\n");
+      exit(EXIT_FAILURE);
+    }
+    if (!configureControlTarget(argv[0]))
+    {
+      exit(EXIT_FAILURE);
+    }
+    String serializedRequest = {};
+    BitseryEngine::serialize(serializedRequest, request);
+    if (socket.ensureConnected() == false)
+    {
+      String failure = socket.connectFailureDetail();
+      basics_log("recoverMaterializedStatefulDeployment success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    Message::construct(socket.wBuffer, MothershipTopic::recoverMaterializedStatefulDeployment, serializedRequest);
+    if (socket.send() == false)
+    {
+      exit(EXIT_FAILURE);
+    }
+    Message *message = socket.recvExpectedTopic(MothershipTopic::recoverMaterializedStatefulDeployment, 4096);
+    if (message == nullptr)
+    {
+      String failure = socket.ioFailureDetail();
+      basics_log("recoverMaterializedStatefulDeployment success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    String serializedResponse = {};
+    uint8_t *args = message->args;
+    Message::extractToStringView(args, serializedResponse);
+    RecoverMaterializedStatefulDeployment response = {};
+    if (args != message->terminal() || BitseryEngine::deserializeSafe(serializedResponse, response) == false)
+    {
+      basics_log("recoverMaterializedStatefulDeployment success=0 failure=invalid response payload\n");
+      exit(EXIT_FAILURE);
+    }
+    basics_log("recoverMaterializedStatefulDeployment accepted=%d completion=applicationReport operationID=%s appID=%u activeVersionID=%llu successorVersionID=%llu activeDeploymentID=%llu successorDeploymentID=%llu durableGeneration=%llu failure=%s\n",
+               int(response.success), response.operationID.c_str(),
+               unsigned(response.applicationID),
+               (unsigned long long)response.activeVersionID,
+               (unsigned long long)response.successorVersionID,
+               (unsigned long long)response.activeDeploymentID,
                (unsigned long long)response.successorDeploymentID,
                (unsigned long long)response.durableGeneration, response.failure.c_str());
     if (response.success == false) exit(EXIT_FAILURE);
@@ -17711,6 +17849,7 @@ public:
         {"pullRoutableResourceLeases",      &Mothership::runPullRoutableResourceLeases     },
         {"pullRoutableSubnets",             &Mothership::runPullRoutableSubnets            },
         {"recommendClusterForApplications", &Mothership::runRecommendClusterForApplications},
+        {"recoverMaterializedStatefulDeployment", &Mothership::runRecoverMaterializedStatefulDeployment },
         {"registerRoutableSubnet",          &Mothership::runRegisterRoutableSubnet         },
         {"removeCluster",                   &Mothership::runRemoveCluster                  },
         {"removeProviderCredential",        &Mothership::runRemoveProviderCredential       },
@@ -17765,7 +17904,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultTestCluster, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, taskReport, containerLogs, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
+        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultTestCluster, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverMaterializedStatefulDeployment, taskReport, containerLogs, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }

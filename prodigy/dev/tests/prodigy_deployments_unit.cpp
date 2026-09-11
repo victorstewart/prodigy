@@ -11011,6 +11011,178 @@ int main(void)
       suite.expect(brain.failureCount == 0, "deploy_stateful_initial_schedule_does_not_fail_healthy_fixture");
     }
 
+    {
+      ApplicationDeployment recovered = {};
+      ApplicationDeployment successor = {};
+      seedCommonPlan(recovered, true);
+      recovered.plan = deployment.plan;
+      recovered.plan.stateful.allowUpdateInPlace = true;
+      recovered.plan.config.versionID = 91;
+      successor.plan = recovered.plan;
+      successor.plan.config.versionID = 92;
+      successor.state = DeploymentState::waitingToDeploy;
+      recovered.state = DeploymentState::none;
+      recovered.next = &successor;
+      successor.previous = &recovered;
+      recovered.nShardGroups = 1;
+      recovered.nTargetBase = 3;
+      recovered.nDeployedBase = 3;
+      recovered.nHealthyBase = 1;
+
+      ContainerView cohort[3] = {};
+      Machine *cohortMachines[] = {&machineA, &machineB, &machineC};
+      for (uint32_t index = 0; index < 3; ++index)
+      {
+        cohort[index].uuid = uint128_t(0x19051920 + index);
+        cohort[index].deploymentID = recovered.plan.config.deploymentID();
+        cohort[index].applicationID = recovered.plan.config.applicationID;
+        cohort[index].machine = cohortMachines[index];
+        cohort[index].lifetime = ApplicationLifetime::base;
+        cohort[index].isStateful = true;
+        cohort[index].shardGroup = 0;
+        cohort[index].state = index == 0 ? ContainerState::healthy : ContainerState::scheduled;
+        recovered.containers.insert(&cohort[index]);
+      }
+
+      suite.expect(recovered.recoveredMaterializedStatefulRollForwardIsSafe(),
+                   "materialized_stateful_recovery_accepts_quiescent_none_single_cohort_one_healthy");
+      recovered.state = DeploymentState::deploying;
+      suite.expect(recovered.recoveredMaterializedStatefulRollForwardIsSafe() == false,
+                   "materialized_stateful_recovery_rejects_active_deploying_cohort");
+    }
+
+    if (machinesReady)
+    {
+      // Exercise the architect against real live control streams: the scheduled
+      // predecessor goes first and each health acknowledgment releases one update.
+      ApplicationDeployment *old = new ApplicationDeployment();
+      ApplicationDeployment current = {};
+      seedCommonPlan(*old, true);
+      old->plan = deployment.plan;
+      old->plan.config.applicationID += 1;
+      old->plan.config.versionID = 111;
+      old->plan.stateful.allowUpdateInPlace = true;
+      current.plan = old->plan;
+      current.plan.config.versionID = 112;
+      old->state = DeploymentState::none;
+      current.state = DeploymentState::deploying;
+      old->next = &current;
+      current.previous = old;
+      current.materializedStatefulRecoveryOwnsTransition = true;
+      old->nShardGroups = 1;
+      old->nTargetBase = 3;
+      old->nDeployedBase = 3;
+      old->nHealthyBase = 2;
+
+      ContainerView *oldCohort[3] = {new ContainerView(), new ContainerView(), new ContainerView()};
+      Machine *cohortMachines[] = {&machineA, &machineB, &machineC};
+      for (uint32_t index = 0; index < 3; ++index)
+      {
+        oldCohort[index]->uuid = uint128_t(0x19051940 + index);
+        oldCohort[index]->deploymentID = old->plan.config.deploymentID();
+        oldCohort[index]->applicationID = old->plan.config.applicationID;
+        oldCohort[index]->machine = cohortMachines[index];
+        oldCohort[index]->lifetime = ApplicationLifetime::base;
+        oldCohort[index]->isStateful = true;
+        oldCohort[index]->shardGroup = 0;
+        oldCohort[index]->state = index == 0 ? ContainerState::scheduled : ContainerState::healthy;
+        old->containers.insert(oldCohort[index]);
+      }
+      brain.deployments.insert_or_assign(old->plan.config.deploymentID(), old);
+      brain.deployments.insert_or_assign(current.plan.config.deploymentID(), &current);
+      brain.deploymentsByApp.insert_or_assign(current.plan.config.applicationID, &current);
+
+      current.deploy();
+      suite.expect(current.waitingOnContainers.size() == 1,
+                   "materialized_stateful_recovery_architect_starts_one_unhealthy_replacement");
+      suite.expect(oldCohort[0]->state == ContainerState::destroying,
+                   "materialized_stateful_recovery_architect_replaces_unhealthy_predecessor_first");
+      suite.expect(oldCohort[1]->state == ContainerState::aboutToDestroy && oldCohort[2]->state == ContainerState::aboutToDestroy &&
+                       oldCohort[1]->plannedWork != nullptr && oldCohort[2]->plannedWork != nullptr,
+                   "materialized_stateful_recovery_architect_plans_healthy_predecessors_without_executing_them");
+
+      ContainerView *firstReplacement = current.waitingOnContainers.begin()->first;
+      current.containerIsHealthy(firstReplacement);
+      suite.expect(current.waitingOnContainers.size() == 1,
+                   "materialized_stateful_recovery_waits_for_each_successor_before_next_update");
+      suite.expect((oldCohort[1]->state == ContainerState::destroying) != (oldCohort[2]->state == ContainerState::destroying) &&
+                       (oldCohort[1]->state == ContainerState::aboutToDestroy || oldCohort[2]->state == ContainerState::aboutToDestroy),
+                   "materialized_stateful_recovery_releases_exactly_one_healthy_predecessor_after_ack");
+
+      ContainerView *secondReplacement = current.waitingOnContainers.begin()->first;
+      current.containerIsHealthy(secondReplacement);
+      suite.expect(current.waitingOnContainers.size() == 1,
+                   "materialized_stateful_recovery_serializes_third_replacement_after_second_ack");
+      ContainerView *thirdReplacement = current.waitingOnContainers.begin()->first;
+      current.containerIsHealthy(thirdReplacement);
+      suite.expect(current.nHealthy() == 3,
+                   "materialized_stateful_recovery_counts_all_three_actual_successors_healthy");
+      suite.expect(current.state == DeploymentState::running && current.materializedStatefulRecoveryOwnsTransition == false,
+                   "materialized_stateful_recovery_completes_only_after_all_successors_healthy");
+
+      for (ContainerView *container : current.containers)
+      {
+        container->machine->removeContainerIndexEntry(container->deploymentID, container);
+        brain.containers.erase(container->uuid);
+      }
+      current.containers.clear();
+      brain.deployments.erase(old->plan.config.deploymentID());
+      brain.deployments.erase(current.plan.config.deploymentID());
+      brain.deploymentsByApp.erase(current.plan.config.applicationID);
+    }
+
+    if (machinesReady)
+    {
+      ApplicationDeployment *old = new ApplicationDeployment();
+      ApplicationDeployment *current = new ApplicationDeployment();
+      seedCommonPlan(*old, true);
+      old->plan = deployment.plan;
+      old->plan.config.applicationID += 2;
+      old->plan.config.versionID = 121;
+      old->plan.stateful.allowUpdateInPlace = true;
+      current->plan = old->plan;
+      current->plan.config.versionID = 122;
+      old->state = DeploymentState::none;
+      current->state = DeploymentState::deploying;
+      old->next = current;
+      current->previous = old;
+      current->materializedStatefulRecoveryOwnsTransition = true;
+      ContainerView *oldCohort[2] = {new ContainerView(), new ContainerView()};
+      Machine *oldMachines[] = {&machineA, &machineB};
+      for (uint32_t index = 0; index < 2; ++index)
+      {
+        oldCohort[index]->uuid = uint128_t(0x19051960 + index);
+        oldCohort[index]->deploymentID = old->plan.config.deploymentID();
+        oldCohort[index]->applicationID = old->plan.config.applicationID;
+        oldCohort[index]->machine = oldMachines[index];
+        oldCohort[index]->lifetime = ApplicationLifetime::base;
+        oldCohort[index]->isStateful = true;
+        oldCohort[index]->shardGroup = 0;
+        oldCohort[index]->state = ContainerState::healthy;
+        old->containers.insert(oldCohort[index]);
+      }
+      ContainerView *newContainer = new ContainerView();
+      newContainer->uuid = uint128_t(0x19051962);
+      newContainer->deploymentID = current->plan.config.deploymentID();
+      newContainer->applicationID = current->plan.config.applicationID;
+      newContainer->machine = &machineC;
+      newContainer->lifetime = ApplicationLifetime::base;
+      newContainer->isStateful = true;
+      newContainer->shardGroup = 0;
+      newContainer->state = ContainerState::scheduled;
+      current->containers.insert(newContainer);
+      brain.deployments.insert_or_assign(old->plan.config.deploymentID(), old);
+      brain.deployments.insert_or_assign(current->plan.config.deploymentID(), current);
+      brain.deploymentsByApp.insert_or_assign(current->plan.config.applicationID, current);
+      current->resumeMaterializedStatefulRecovery();
+      suite.expect(old->state == DeploymentState::none && current->toSchedule.empty() && current->waitingOnContainers.empty(),
+                   "materialized_stateful_recovery_partial_scheduled_successor_is_held");
+      newContainer->state = ContainerState::healthy;
+      current->resumeMaterializedStatefulRecovery();
+      suite.expect(old->state != DeploymentState::none,
+                   "materialized_stateful_recovery_partial_healthy_successor_admits_remaining_in_place_work");
+    }
+
     brain.deployments.erase(deployment.plan.config.deploymentID());
     rackA.machines.erase(&machineA);
     rackB.machines.erase(&machineB);
@@ -11652,6 +11824,76 @@ int main(void)
     suite.expect(
         ContainerManager::approveCapabilities(runtime),
         "neuron_privilege_admission_preserves_system_container_policy_boundary");
+  }
+
+  {
+    ScopedFreshRing ring;
+    TestBrain brain = {};
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+
+    ApplicationDeployment deployment = {};
+    seedCommonPlan(deployment, true);
+    deployment.plan.config.type = ApplicationType::stateful;
+    deployment.plan.canaryCount = 0;
+    deployment.state = DeploymentState::deploying;
+    deployment.materializedStatefulRecoveryOwnsTransition = true;
+    deployment.nTargetBase = 3;
+    deployment.nDeployedBase = 3;
+    deployment.nHealthyBase = 2;
+
+    ContainerView replacement = {};
+    replacement.uuid = uint128_t(0x7a1101);
+    replacement.deploymentID = deployment.plan.config.deploymentID();
+    replacement.applicationID = deployment.plan.config.applicationID;
+    replacement.lifetime = ApplicationLifetime::base;
+    replacement.isStateful = true;
+    replacement.shardGroup = 0;
+    replacement.state = ContainerState::destroying;
+    deployment.containers.insert(&replacement);
+    deployment.waitingOnContainers.insert_or_assign(&replacement, ContainerState::healthy);
+
+    deployment.handleContainerStateChange(&replacement, false);
+    suite.expect(deployment.materializedStatefulRecoveryHealthFailed,
+                 "materialized_stateful_recovery_destroying_replacement_marks_health_failure");
+    suite.expect(deployment.waitingOnContainers.empty(),
+                 "materialized_stateful_recovery_destroying_replacement_does_not_authorize_waiter");
+    deployment.schedule(nullptr);
+    suite.expect(deployment.state == DeploymentState::deploying && brain.finCount == 0,
+                 "materialized_stateful_recovery_destroying_replacement_cannot_finalize");
+
+    replacement.state = ContainerState::destroyed;
+    deployment.waitingOnContainers.insert_or_assign(&replacement, ContainerState::healthy);
+    deployment.handleContainerStateChange(&replacement, false);
+    suite.expect(deployment.materializedStatefulRecoveryHealthFailed &&
+                     deployment.waitingOnContainers.empty() &&
+                     brain.finCount == 0,
+                 "materialized_stateful_recovery_destroyed_replacement_cannot_resume");
+
+    thisBrain = savedBrain;
+  }
+
+  {
+    ScopedFreshRing ring;
+    TestBrain brain = {};
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+
+    ApplicationDeployment deployment = {};
+    seedCommonPlan(deployment, true);
+    deployment.plan.config.type = ApplicationType::stateful;
+    deployment.plan.canaryCount = 0;
+    deployment.state = DeploymentState::deploying;
+    deployment.materializedStatefulRecoveryOwnsTransition = true;
+    deployment.nTargetBase = 3;
+    deployment.nDeployedBase = 3;
+    deployment.nHealthyBase = 3;
+
+    deployment.schedule(nullptr);
+    suite.expect(deployment.state == DeploymentState::running && brain.finCount == 1,
+                 "materialized_stateful_recovery_all_three_healthy_allows_completion");
+
+    thisBrain = savedBrain;
   }
 
   return (suite.failed == 0) ? 0 : 1;

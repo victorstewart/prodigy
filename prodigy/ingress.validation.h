@@ -327,6 +327,7 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
         return (cursor == terminal);
       }
     case MothershipTopic::cancelDeployment:
+    case MothershipTopic::recoverMaterializedStatefulDeployment:
       {
         return consumeVariable(cursor, terminal) && cursor == terminal;
       }

@@ -10380,6 +10380,70 @@ public:
 
     resumeOperatorCancellations();
 
+    // Hold accepted heads until exact inventory and real replacement health
+    // permit their existing deployment owner to resume the retained handoff.
+    Vector<String> completedRecoveryOperations;
+    for (auto& operation : masterAuthorityRuntimeState.materializedStatefulRecoveryOperations)
+    {
+      if (operation.accepted == false || operation.started == false || operation.completed)
+      {
+        continue;
+      }
+      auto successor = deployments.find(operation.successorDeploymentID);
+      if (successor == deployments.end() || successor->second == nullptr ||
+          successor->second->plan.config.containerBlobSHA256.equals(operation.successorBlobSHA256) == false ||
+          deploymentDNSReady(operation.successorDeploymentID) == false)
+      {
+        continue;
+      }
+      ApplicationDeployment *head = successor->second;
+      auto indexed = deploymentsByApp.find(head->plan.config.applicationID);
+      if (indexed == deploymentsByApp.end() || indexed->second != head)
+      {
+        continue;
+      }
+      auto active = deployments.find(operation.activeDeploymentID);
+      if (active == deployments.end())
+      {
+        // A completed rollout may have culled its predecessor before restart.
+        // Restore only a fully healthy three-replica successor in that case.
+        if (head->previous == nullptr && head->containers.size() == 3 &&
+            std::all_of(head->containers.begin(), head->containers.end(), [](ContainerView *container) {
+              return container && container->state == ContainerState::healthy && container->shardGroup == 0;
+            }))
+        {
+          head->recoverAfterReboot();
+        }
+        if (head->previous == nullptr && head->state == DeploymentState::running)
+        {
+          operation.completed = true;
+          completedRecoveryOperations.push_back(operation.operationID);
+        }
+        continue;
+      }
+      if (active->second == nullptr || active->second->next != head || head->previous != active->second ||
+          deploymentDNSReady(operation.activeDeploymentID) == false)
+      {
+        continue;
+      }
+      head->materializedStatefulRecoveryOwnsTransition = true;
+      head->resumeMaterializedStatefulRecovery();
+    }
+
+    if (completedRecoveryOperations.empty() == false && commitMasterAuthorityStateChange() == false)
+    {
+      for (auto& operation : masterAuthorityRuntimeState.materializedStatefulRecoveryOperations)
+      {
+        for (const String& operationID : completedRecoveryOperations)
+        {
+          if (operation.operationID.equals(operationID))
+          {
+            operation.completed = false;
+          }
+        }
+      }
+    }
+
     for (const auto& [applicationID, head] : deploymentsByApp)
     {
       (void)applicationID;
@@ -10401,6 +10465,21 @@ public:
       }
       if (heldByOperatorCancellation)
       {
+        continue;
+      }
+      bool heldByMaterializedStatefulRecovery = false;
+      for (const auto& operation : masterAuthorityRuntimeState.materializedStatefulRecoveryOperations)
+      {
+        if (operation.accepted && operation.completed == false &&
+            operation.successorDeploymentID == head->plan.config.deploymentID())
+        {
+          heldByMaterializedStatefulRecovery = true;
+          break;
+        }
+      }
+      if (heldByMaterializedStatefulRecovery)
+      {
+        // Only the dedicated recovery owner may resume this incomplete head.
         continue;
       }
       if (deploymentDNSReady(head->plan.config.deploymentID()) == false)
@@ -15881,6 +15960,7 @@ public:
                      (unsigned long long)deployment->waitingOnContainers.size(),
                      unsigned(container->state));
         PRODIGY_DEBUG_FLUSH();
+        const bool recoveringStatefulDeployment = deployment->materializedStatefulRecoveryOwnsTransition;
         deployment->containerIsHealthy(container);
         (void)advanceTlsResumptionLifecycleForDeployment(deployment->plan, Time::now<TimeResolution::ms>(), false);
         replicateContainerRuntimeStateToFollowers(container);
@@ -15892,6 +15972,10 @@ public:
                      (unsigned long long)deployment->waitingOnContainers.size(),
                      unsigned(container->state));
         PRODIGY_DEBUG_FLUSH();
+        if (recoveringStatefulDeployment)
+        {
+          recoverDeploymentsAfterNeuronState();
+        }
       }
       else
       {
@@ -29791,6 +29875,119 @@ public:
             pushSpinApplicationProgressToMothership(deployment, "waiting for authoritative DNS reconciliation"_ctv);
           }
 
+          break;
+        }
+      case MothershipTopic::recoverMaterializedStatefulDeployment:
+        {
+          String serializedRequest = {};
+          Message::extractToStringView(args, serializedRequest);
+          RecoverMaterializedStatefulDeployment request = {};
+          RecoverMaterializedStatefulDeployment response = {};
+          auto reply = [&]() {
+            String payload = {};
+            BitseryEngine::serialize(payload, response);
+            Message::construct(mothership->wBuffer, MothershipTopic::recoverMaterializedStatefulDeployment, payload);
+          };
+          auto reject = [&](const char *failure) {
+            response.success = false;
+            response.failure.assign(failure);
+            reply();
+          };
+          constexpr uint64_t maximumVersionID = (uint64_t(1) << 48) - 1;
+          if (args != message->terminal() || BitseryEngine::deserializeSafe(serializedRequest, request) == false ||
+              request.applicationID == 0 || request.applicationName.empty() || request.activeVersionID == 0 ||
+              request.activeVersionID > maximumVersionID || request.successorVersionID > maximumVersionID ||
+              request.successorVersionID <= request.activeVersionID ||
+              prodigyIsSHA256HexDigest(request.successorBlobSHA256) == false ||
+              prodigyCanonicalOperationUUID(request.operationID) == false)
+          {
+            reject("invalid materialized stateful recovery request");
+            break;
+          }
+          response = request;
+          response.success = false;
+          response.failure.clear();
+          response.durableGeneration = 0;
+          const uint64_t activeID = (uint64_t(request.applicationID) << 48) | request.activeVersionID;
+          const uint64_t successorID = (uint64_t(request.applicationID) << 48) | request.successorVersionID;
+          response.activeDeploymentID = activeID;
+          response.successorDeploymentID = successorID;
+          auto name = reservedApplicationNamesByID.find(request.applicationID);
+          if (weAreMaster == false || ignited == false ||
+              name == reservedApplicationNamesByID.end() || name->second.equals(request.applicationName) == false)
+          {
+            reject("materialized stateful recovery authority or application identity is not ready");
+            break;
+          }
+
+          // Retry identity is durable; lifecycle state changes after acceptance.
+          bool existingOperation = false;
+          for (const auto& operation : masterAuthorityRuntimeState.materializedStatefulRecoveryOperations)
+          {
+            if (operation.operationID.equals(request.operationID))
+            {
+              existingOperation = true;
+              if (operation.accepted && operation.activeDeploymentID == activeID &&
+                  operation.successorDeploymentID == successorID &&
+                  operation.successorBlobSHA256.equals(request.successorBlobSHA256))
+              {
+                recoverDeploymentsAfterNeuronState();
+                response.success = true;
+                response.durableGeneration = masterAuthorityRuntimeState.generation;
+                reply();
+              }
+              else
+              {
+                reject("materialized stateful recovery operation collision");
+              }
+              break;
+            }
+            if (operation.activeDeploymentID == activeID || operation.successorDeploymentID == successorID)
+            {
+              existingOperation = true;
+              reject("materialized stateful recovery already owned by another operation");
+              break;
+            }
+          }
+          if (existingOperation)
+          {
+            break;
+          }
+          auto active = deployments.find(activeID);
+          auto successor = deployments.find(successorID);
+          auto head = deploymentsByApp.find(request.applicationID);
+          if (finalizePersistedNeuronInventoryRecovery() == false ||
+              active == deployments.end() || successor == deployments.end() ||
+              active->second == nullptr || successor->second == nullptr ||
+              head == deploymentsByApp.end() || head->second != successor->second ||
+              deploymentDNSReady(activeID) == false || deploymentDNSReady(successorID) == false ||
+              active->second->next != successor->second || successor->second->previous != active->second ||
+              successor->second->plan.config.containerBlobSHA256.equals(request.successorBlobSHA256) == false ||
+              active->second->recoveredMaterializedStatefulRollForwardIsSafe() == false)
+          {
+            reject("materialized stateful recovery safety precondition failed");
+            break;
+          }
+          ProdigyMaterializedStatefulRecoveryOperation operation = {};
+          operation.operationID = request.operationID;
+          operation.activeDeploymentID = activeID;
+          operation.successorDeploymentID = successorID;
+          operation.successorBlobSHA256 = request.successorBlobSHA256;
+          operation.accepted = true;
+          operation.started = true;
+          operation.updatedAtMs = Time::now<TimeResolution::ms>();
+          masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.push_back(std::move(operation));
+          if (commitMasterAuthorityStateChange() == false)
+          {
+            masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.pop_back();
+            reject("materialized stateful recovery durable acceptance failed");
+            break;
+          }
+          successor->second->materializedStatefulRecoveryOwnsTransition = true;
+          successor->second->resumeMaterializedStatefulRecovery();
+          response.success = true;
+          response.durableGeneration = masterAuthorityRuntimeState.generation;
+          reply();
           break;
         }
       case MothershipTopic::cancelDeployment:

@@ -83,6 +83,36 @@ static void serialize(S&& serializer, CancelDeploymentResponse& response)
   serializer.value8b(response.durableGeneration);
 }
 
+class RecoverMaterializedStatefulDeployment {
+public:
+  String applicationName;
+  uint16_t applicationID = 0;
+  uint64_t activeVersionID = 0;
+  uint64_t successorVersionID = 0;
+  String operationID;
+  String successorBlobSHA256;
+  bool success = false;
+  String failure;
+  uint64_t activeDeploymentID = 0;
+  uint64_t successorDeploymentID = 0;
+  uint64_t durableGeneration = 0;
+};
+template <typename S>
+static void serialize(S&& serializer, RecoverMaterializedStatefulDeployment& payload)
+{
+  serializer.text1b(payload.applicationName, 128);
+  serializer.value2b(payload.applicationID);
+  serializer.value8b(payload.activeVersionID);
+  serializer.value8b(payload.successorVersionID);
+  serializer.text1b(payload.operationID, 36);
+  serializer.text1b(payload.successorBlobSHA256, 128);
+  serializer.value1b(payload.success);
+  serializer.text1b(payload.failure, UINT32_MAX);
+  serializer.value8b(payload.activeDeploymentID);
+  serializer.value8b(payload.successorDeploymentID);
+  serializer.value8b(payload.durableGeneration);
+}
+
 static inline bool prodigyCanonicalOperationUUID(const String& value)
 {
   if (value.size() != 36)
@@ -7164,6 +7194,38 @@ static inline bool routableResourceLeasesConflict(const RoutableResourceLease& l
   return routableResourceLeaseOwnersCompatible(lhs.owner, rhs.owner) == false && routableResourceLeaseResourcesIntersect(lhs, rhs);
 }
 
+class ProdigyMaterializedStatefulRecoveryOperation {
+public:
+  String operationID;
+  uint64_t activeDeploymentID = 0;
+  uint64_t successorDeploymentID = 0;
+  String successorBlobSHA256;
+  bool accepted = false;
+  bool started = false;
+  bool completed = false;
+  int64_t updatedAtMs = 0;
+};
+template <typename S>
+static void serialize(S&& serializer, ProdigyMaterializedStatefulRecoveryOperation& operation)
+{
+  serializer.text1b(operation.operationID, 36);
+  serializer.value8b(operation.activeDeploymentID);
+  serializer.value8b(operation.successorDeploymentID);
+  serializer.text1b(operation.successorBlobSHA256, 128);
+  serializer.value1b(operation.accepted);
+  serializer.value1b(operation.started);
+  serializer.value1b(operation.completed);
+  serializer.value8b(operation.updatedAtMs);
+}
+
+template <typename T>
+struct ProdigyPersistentSerializerIsWriter : std::false_type {
+};
+
+template <typename OutputAdapter, typename Context>
+struct ProdigyPersistentSerializerIsWriter<bitsery::Serializer<OutputAdapter, Context>> : std::true_type {
+};
+
 class ProdigyMasterAuthorityRuntimeState {
 public:
 
@@ -7182,6 +7244,7 @@ public:
   Vector<ProdigyPendingElasticAddressRelease> pendingElasticAddressReleases;
   Vector<ProdigyStatefulWorkerTopologyUpgradeOperation> statefulWorkerTopologyUpgradeOperations;
   Vector<ProdigyDeferredStatefulScaleIntent> deferredStatefulScaleIntents;
+  Vector<ProdigyMaterializedStatefulRecoveryOperation> materializedStatefulRecoveryOperations;
   Vector<ProdigyManagedMachineSchema> machineSchemas;
   Vector<RoutableResourceLease> routableResourceLeases;
   Vector<PublicTlsCertificateState> publicTlsCertificates;
@@ -7192,7 +7255,7 @@ public:
 
   bool operator==(const ProdigyMasterAuthorityRuntimeState& other) const
   {
-    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf)
+    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf)
     {
       return false;
     }
@@ -7254,6 +7317,12 @@ public:
       }
     }
 
+    for (uint32_t index = 0; index < materializedStatefulRecoveryOperations.size(); ++index)
+    {
+      const auto& a = materializedStatefulRecoveryOperations[index]; const auto& b = other.materializedStatefulRecoveryOperations[index];
+      if (a.operationID.equals(b.operationID) == false || a.activeDeploymentID != b.activeDeploymentID || a.successorDeploymentID != b.successorDeploymentID || a.successorBlobSHA256.equals(b.successorBlobSHA256) == false || a.accepted != b.accepted || a.started != b.started || a.completed != b.completed || a.updatedAtMs != b.updatedAtMs) return false;
+    }
+
     for (uint32_t index = 0; index < machineSchemas.size(); ++index)
     {
       if (machineSchemas[index] != other.machineSchemas[index])
@@ -7307,7 +7376,40 @@ public:
 template <typename S>
 static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
 {
-  serializer.value8b(state.generation);
+  constexpr uint64_t versionMarker = UINT64_MAX;
+  constexpr uint64_t explicitVersion = 1;
+  using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
+  bool hasMaterializedStatefulRecoveryOperations = false;
+
+  if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
+  {
+    hasMaterializedStatefulRecoveryOperations = state.materializedStatefulRecoveryOperations.empty() == false;
+    if (hasMaterializedStatefulRecoveryOperations)
+    {
+      uint64_t marker = versionMarker;
+      serializer.value8b(marker);
+      uint64_t version = explicitVersion;
+      serializer.value8b(version);
+    }
+    serializer.value8b(state.generation);
+  }
+  else
+  {
+    serializer.value8b(state.generation);
+    if (state.generation == versionMarker)
+    {
+      uint64_t version = 0;
+      serializer.value8b(version);
+      serializer.value8b(state.generation);
+      if (version != explicitVersion || state.generation == versionMarker)
+      {
+        serializer.adapter().error(bitsery::ReaderError::InvalidData);
+        return;
+      }
+      hasMaterializedStatefulRecoveryOperations = true;
+    }
+  }
+
   serializer.value1b(state.hasCompletedInitialMasterElection);
   serializer.object(state.transportTLSAuthority);
   serializer.value8b(state.nextMintedClientTlsGeneration);
@@ -7322,6 +7424,14 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
   serializer.object(state.pendingElasticAddressReleases);
   serializer.object(state.statefulWorkerTopologyUpgradeOperations);
   serializer.object(state.deferredStatefulScaleIntents);
+  if (hasMaterializedStatefulRecoveryOperations)
+  {
+    serializer.object(state.materializedStatefulRecoveryOperations);
+  }
+  else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+  {
+    state.materializedStatefulRecoveryOperations.clear();
+  }
   serializer.object(state.machineSchemas);
   serializer.object(state.routableResourceLeases);
   serializer.object(state.publicTlsCertificates);
@@ -8245,14 +8355,6 @@ static void serialize(S&& serializer, DeploymentPlan& plan)
   serializer.value1b(plan.hasApiCredentialPolicy);
   serializer.object(plan.apiCredentialPolicy);
 }
-
-template <typename T>
-struct ProdigyPersistentSerializerIsWriter : std::false_type {
-};
-
-template <typename OutputAdapter, typename Context>
-struct ProdigyPersistentSerializerIsWriter<bitsery::Serializer<OutputAdapter, Context>> : std::true_type {
-};
 
 class FailedDeploymentRecordPayload {
 public:

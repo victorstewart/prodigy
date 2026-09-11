@@ -21220,25 +21220,26 @@ static void testContainerNeuronListenerContract(TestSuite& suite)
   unsetenv("PRODIGY_NEURON_LISTENER_FD");
 }
 
-static bool issueCancelDeploymentForTest(TestBrain& brain,
+template <MothershipTopic topic, typename Request, typename Response>
+static bool issueDeploymentLifecycleOperationForTest(TestBrain& brain,
                                          Mothership& mothership,
-                                         const CancelDeploymentRequest& request,
-                                         CancelDeploymentResponse& response)
+                                         const Request& request,
+                                         Response& response)
 {
   mothership.wBuffer.clear();
-  CancelDeploymentRequest mutableRequest = request;
+  Request mutableRequest = request;
   String serializedRequest = {};
   BitseryEngine::serialize(serializedRequest, mutableRequest);
   String messageBuffer = {};
   brain.mothershipHandler(
       &mothership,
-      buildMothershipMessage(messageBuffer, MothershipTopic::cancelDeployment, serializedRequest));
+      buildMothershipMessage(messageBuffer, topic, serializedRequest));
   if (mothership.wBuffer.size() < sizeof(Message))
   {
     return false;
   }
   Message *message = reinterpret_cast<Message *>(mothership.wBuffer.data());
-  if (MothershipTopic(message->topic) != MothershipTopic::cancelDeployment)
+  if (MothershipTopic(message->topic) != topic)
   {
     return false;
   }
@@ -21247,6 +21248,138 @@ static bool issueCancelDeploymentForTest(TestBrain& brain,
   Message::extractToStringView(args, serializedResponse);
   return args == message->terminal() &&
          BitseryEngine::deserializeSafe(serializedResponse, response);
+}
+
+
+static void testMaterializedStatefulRecoveryAdmission(TestSuite& suite)
+{
+  TestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.ignited = true;
+  BrainBase *savedBrain = thisBrain;
+  thisBrain = &brain;
+  constexpr uint16_t applicationID = 63112;
+  String name = "materialized-recovery-test"_ctv;
+  brain.reservedApplicationIDsByName.insert_or_assign(name, applicationID);
+  brain.reservedApplicationNamesByID.insert_or_assign(applicationID, name);
+  auto *active = new ApplicationDeployment();
+  auto *successor = new ApplicationDeployment();
+  active->plan = makeDeploymentPlan(applicationID, 201);
+  active->plan.config.type = ApplicationType::stateful;
+  active->plan.isStateful = true;
+  active->plan.canaryCount = 0;
+  active->plan.config.nLogicalCores = 1;
+  active->plan.config.memoryMB = 64;
+  active->plan.config.storageMB = 256;
+  active->plan.stateful.allowUpdateInPlace = true;
+  active->state = DeploymentState::none;
+  active->nShardGroups = 1;
+  active->nTargetBase = active->nDeployedBase = 3;
+  active->nHealthyBase = 1;
+  successor->plan = active->plan;
+  successor->plan.config.versionID = 202;
+  successor->plan.config.containerBlobSHA256.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
+  successor->state = DeploymentState::waitingToDeploy;
+  active->next = successor;
+  successor->previous = active;
+  const uint64_t activeID = active->plan.config.deploymentID();
+  const uint64_t successorID = successor->plan.config.deploymentID();
+  brain.deployments.insert_or_assign(activeID, active);
+  brain.deployments.insert_or_assign(successorID, successor);
+  brain.deploymentsByApp.insert_or_assign(applicationID, successor);
+  Machine machines[3] = {};
+  ContainerView containers[3] = {};
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    Machine& machine = machines[index];
+    machine.uuid = 0x7b1000 + index;
+    machine.state = MachineState::healthy;
+    machine.runtimeReady = true;
+    machine.ownedLogicalCores = 4;
+    machine.memoryMB_available = 4096;
+    machine.storageMB_available = 4096;
+    prodigyRecomputeMachineCPUAvailability(&machine, prodigyActiveSharedCPUOvercommitPermille());
+    machine.neuron.isFixedFile = true;
+    machine.neuron.fslot = 100 + index;
+    machine.neuron.connected = true;
+    ContainerView& container = containers[index];
+    container.uuid = 0x7b2000 + index;
+    container.deploymentID = activeID;
+    container.applicationID = applicationID;
+    container.isStateful = true;
+    container.lifetime = ApplicationLifetime::base;
+    container.shardGroup = 0;
+    container.machine = &machine;
+    container.state = index == 0 ? ContainerState::healthy : ContainerState::scheduled;
+    active->containers.insert(&container);
+  }
+  suite.expect(active->recoveredMaterializedStatefulRollForwardIsSafe(),
+               "materialized_recovery_request_fixture_is_admissible");
+  RecoverMaterializedStatefulDeployment request = {};
+  request.applicationName = name;
+  request.applicationID = applicationID;
+  request.activeVersionID = 201;
+  request.successorVersionID = 202;
+  request.operationID.assign("123e4567-e89b-42d3-a456-426614174010"_ctv);
+  request.successorBlobSHA256 = successor->plan.config.containerBlobSHA256;
+  Mothership mothership = {};
+  auto issue = [&](RecoverMaterializedStatefulDeployment input) {
+    RecoverMaterializedStatefulDeployment response = {};
+    suite.expect(issueDeploymentLifecycleOperationForTest<MothershipTopic::recoverMaterializedStatefulDeployment>(
+                     brain, mothership, input, response), "materialized_recovery_response_decodes");
+    return response;
+  };
+  auto malformed = request;
+  malformed.successorBlobSHA256.assign("bad"_ctv);
+  suite.expect(issue(malformed).success == false, "materialized_recovery_rejects_bad_digest");
+  malformed = request;
+  malformed.successorVersionID = uint64_t(1) << 48;
+  suite.expect(issue(malformed).success == false, "materialized_recovery_rejects_version_overflow");
+  brain.persistSucceeds = false;
+  auto failed = issue(request);
+  suite.expect(failed.success == false && brain.persistCalls > 0 &&
+                   brain.masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.empty() &&
+                   successor->toSchedule.empty() && successor->containers.empty() &&
+                   active->state == DeploymentState::none,
+               "materialized_recovery_failed_persist_cannot_schedule_or_accept");
+
+  ProdigyMaterializedStatefulRecoveryOperation operation = {};
+  operation.operationID = request.operationID;
+  operation.activeDeploymentID = activeID;
+  operation.successorDeploymentID = successorID;
+  operation.successorBlobSHA256 = request.successorBlobSHA256;
+  operation.accepted = operation.started = true;
+  brain.masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.push_back(operation);
+  active->state = DeploymentState::decommissioning;
+  successor->state = DeploymentState::deploying;
+  // An overlapping incomplete inventory must be held, including on exact retries.
+  ContainerView pending = {};
+  pending.uuid = 0x7b3000;
+  pending.deploymentID = successorID;
+  pending.isStateful = true;
+  pending.state = ContainerState::scheduled;
+  successor->containers.insert(&pending);
+  const auto accepted = issue(request);
+  suite.expect(accepted.success && successor->toSchedule.empty() &&
+                   successor->state == DeploymentState::deploying &&
+                   brain.masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.size() == 1,
+               "materialized_recovery_retry_is_idempotent_and_holds_incomplete_successor");
+  auto conflict = request;
+  conflict.operationID.assign("123e4567-e89b-42d3-a456-426614174011"_ctv);
+  suite.expect(issue(conflict).success == false &&
+                   brain.masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.size() == 1,
+               "materialized_recovery_rejects_conflicting_operation");
+  active->containers.clear();
+  successor->containers.clear();
+  brain.deployments.clear();
+  brain.deploymentsByApp.clear();
+  active->next = nullptr;
+  successor->previous = nullptr;
+  delete successor;
+  delete active;
+  thisBrain = savedBrain;
 }
 
 static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
@@ -21337,7 +21470,7 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
 
   Mothership mothership = {};
   CancelDeploymentResponse response = {};
-  suite.expect(issueCancelDeploymentForTest(brain, mothership, request, response),
+  suite.expect(issueDeploymentLifecycleOperationForTest<MothershipTopic::cancelDeployment>(brain, mothership, request, response),
                "operator_cancellation_response_decodes");
   suite.expect(response.success && response.result == CancelDeploymentResult::accepted,
                "operator_cancellation_accepts_exact_unhealthy_chain");
@@ -21371,7 +21504,7 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
                "operator_cancellation_relinks_exact_successor_once");
 
   CancelDeploymentResponse retryResponse = {};
-  suite.expect(issueCancelDeploymentForTest(brain, mothership, request, retryResponse),
+  suite.expect(issueDeploymentLifecycleOperationForTest<MothershipTopic::cancelDeployment>(brain, mothership, request, retryResponse),
                "operator_cancellation_retry_response_decodes");
   suite.expect(retryResponse.success && retryResponse.result == CancelDeploymentResult::completed &&
                    retryResponse.durableGeneration == failedIt->second.cancellationGeneration,
@@ -21380,7 +21513,7 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
   CancelDeploymentRequest conflict = request;
   conflict.operationID.assign("123e4567-e89b-42d3-a456-426614174001"_ctv);
   CancelDeploymentResponse conflictResponse = {};
-  suite.expect(issueCancelDeploymentForTest(brain, mothership, conflict, conflictResponse),
+  suite.expect(issueDeploymentLifecycleOperationForTest<MothershipTopic::cancelDeployment>(brain, mothership, conflict, conflictResponse),
                "operator_cancellation_conflict_response_decodes");
   suite.expect(conflictResponse.success == false &&
                    conflictResponse.result == CancelDeploymentResult::rejected,
@@ -21558,6 +21691,7 @@ int main(void)
   if (std::getenv("PRODIGY_TEST_OPERATOR_CANCELLATION_ONLY") != nullptr)
   {
     testBoundedOperatorDeploymentCancellation(suite);
+    testMaterializedStatefulRecoveryAdmission(suite);
     if (createdRing)
     {
       Ring::shutdownForExec();
@@ -21762,6 +21896,7 @@ int main(void)
   testCanaryRollbackPersistsTerminalApplicationReport(suite);
   testDeployingContainerFailureFailsDeployment(suite);
   testBoundedOperatorDeploymentCancellation(suite);
+  testMaterializedStatefulRecoveryAdmission(suite);
   testBrainNeuronStateUploadRestoresOnlyActiveMeshServices(suite);
   testBrainNeuronStateUploadRuntimeReadyFalseClearsStatefulTopologyBarrier(suite);
   testBrainNeuronStateUploadRequiresMatchingAssignedFragmentForMachineRuntimeReady(suite);
