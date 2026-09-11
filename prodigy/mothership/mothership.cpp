@@ -14,6 +14,7 @@
 #include <openssl/ssl.h>
 #include <simdjson.h>
 #include <signal.h>
+#include <string_view>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
@@ -18191,8 +18192,8 @@ public:
         {"pullRoutableResourceLeases",      &Mothership::runPullRoutableResourceLeases     },
         {"pullRoutableSubnets",             &Mothership::runPullRoutableSubnets            },
         {"recommendClusterForApplications", &Mothership::runRecommendClusterForApplications},
-        {"recoverTestClusterBundle",        &Mothership::runRecoverTestClusterBundle       },
         {"recoverMaterializedStatefulDeployment", &Mothership::runRecoverMaterializedStatefulDeployment },
+        {"recoverTestClusterBundle",        &Mothership::runRecoverTestClusterBundle       },
         {"registerRoutableSubnet",          &Mothership::runRegisterRoutableSubnet         },
         {"removeCluster",                   &Mothership::runRemoveCluster                  },
         {"removeProviderCredential",        &Mothership::runRemoveProviderCredential       },
@@ -18209,6 +18210,12 @@ public:
         {"upsertMachineSchemas",            &Mothership::runUpsertMachineSchemas           },
         {"upsertTlsVaultFactory",           &Mothership::runUpsertTlsVaultFactory          },
     };
+
+    static_assert([] {
+      for (size_t index = 1; index < std::size(commands); ++index)
+        if (std::string_view(commands[index - 1].name) >= std::string_view(commands[index].name)) return false;
+      return true;
+    }(), "Mothership command dispatch requires strictly sorted names");
 
     const char *operationText = argv[0];
 
