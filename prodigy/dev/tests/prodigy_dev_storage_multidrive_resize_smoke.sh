@@ -10,13 +10,15 @@ upgrade_bundle="${6:-}"
 case "${test_mode}" in
    resize) host_network=true ;;
    mount-only) host_network=false ;;
-   legacy-handoff) host_network=false ;;
-   *) echo "error: expected resize, mount-only or legacy-handoff mode" >&2; exit 2 ;;
+   legacy-handoff|legacy-recovery) host_network=false ;;
+   *) echo "error: expected resize, mount-only, legacy-handoff or legacy-recovery mode" >&2; exit 2 ;;
 esac
+is_handoff=0
+[[ "${test_mode}" != legacy-handoff && "${test_mode}" != legacy-recovery ]] || is_handoff=1
 [[ "${storage_devices}" == 0 || "${storage_devices}" == 2 ]] || { echo "error: expected zero or two storage devices" >&2; exit 2; }
 [[ "${test_mode}" != resize || "${storage_devices}" == 2 ]] || { echo "error: resize requires two storage devices" >&2; exit 2; }
-[[ "${test_mode}" != legacy-handoff || ( "${storage_devices}" == 0 && -s "${upgrade_bundle}" ) ]] || { echo "error: legacy handoff requires zero devices and an exact upgrade bundle" >&2; exit 2; }
-[[ "${test_mode}" != legacy-handoff || "${PRODIGY_STORAGE_HANDOFF_EXPECTED_RUNTIME_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || { echo "error: legacy handoff requires the sealed successor runtime hash" >&2; exit 2; }
+[[ "${is_handoff}" == 0 || ( "${storage_devices}" == 0 && -s "${upgrade_bundle}" ) ]] || { echo "error: legacy handoff requires zero devices and an exact upgrade bundle" >&2; exit 2; }
+[[ "${is_handoff}" == 0 || "${PRODIGY_STORAGE_HANDOFF_EXPECTED_RUNTIME_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || { echo "error: legacy handoff requires the sealed successor runtime hash" >&2; exit 2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/prodigy_dev_discombobulator_artifact_helpers.sh"
@@ -25,7 +27,7 @@ prodigy_dev_reexec_in_private_mount_namespace_once PRODIGY_DEV_STORAGE_MULTIDRIV
 
 if [[ -z "${PRODIGY_BIN}" || -z "${MOTHERSHIP_BIN}" || -z "${PINGPONG_BIN}" ]]
 then
-   echo "usage: $0 /path/to/prodigy /path/to/mothership /path/to/prodigy_pingpong_container [resize|mount-only] [0|2 storage devices]"
+   echo "usage: $0 /path/to/prodigy /path/to/mothership /path/to/prodigy_pingpong_container [resize|mount-only|legacy-handoff|legacy-recovery] [0|2 storage devices] [upgrade bundle]"
    exit 2
 fi
 
@@ -169,12 +171,22 @@ machine_count=1
 application_type=stateless
 is_stateful=false
 expected_healthy=1
+initial_healthy=1
+initial_state=running
+recovered_state=running
 handoff_id=""
-if [[ "${test_mode}" == legacy-handoff ]]
+if [[ "${is_handoff}" == 1 ]]
 then
    # Match the retained release topology: one controller and three workers.
    machine_count=4
    expected_healthy=3
+   initial_healthy=3
+   if [[ "${test_mode}" == legacy-recovery ]]
+   then
+      initial_healthy=1
+      initial_state=deploying
+      recovered_state=none
+   fi
    application_type=stateful
    is_stateful=true
    handoff_id="$(tr -d '-' < /proc/sys/kernel/random/uuid)"
@@ -246,7 +258,7 @@ then
    exit 1
 fi
 
-if [[ "${test_mode}" == legacy-handoff ]]
+if [[ "${is_handoff}" == 1 ]]
 then
    # Use the same healthy/runtime-ready report predicates as the netns harness.
    # A manifest lists launched nodes before their asynchronous inventory arrives.
@@ -283,9 +295,14 @@ COPY {bin} ./$(basename "${PINGPONG_BIN}") /root/pingpong_container
 SURVIVE /root/pingpong_container
 EOF
 prodigy_dev_write_common_prodigy_assets "${discombobulator_file}"
-if [[ "${test_mode}" == legacy-handoff ]]
+if [[ "${is_handoff}" == 1 ]]
 then
    printf 'ENV PINGPONG_STORAGE_HANDOFF_MODE=seed\nENV PINGPONG_STORAGE_HANDOFF_ID=%s\n' "${handoff_id}" >> "${discombobulator_file}"
+   if [[ "${test_mode}" == legacy-recovery ]]
+   then
+      # A fixture readiness failure leaves two real data owners running unready.
+      printf 'ENV PINGPONG_STORAGE_HANDOFF_READY_MACHINE=2\n' >> "${discombobulator_file}"
+   fi
 fi
 cat >> "${discombobulator_file}" <<'EOF'
 EXECUTE ["/root/pingpong_container"]
@@ -358,7 +375,7 @@ python3 - "${plan_json}" "${test_mode}" <<'PY'
 import json, sys
 with open(sys.argv[1]) as stream:
     plan = json.load(stream)
-if sys.argv[2] == 'legacy-handoff':
+if sys.argv[2] in ('legacy-handoff', 'legacy-recovery'):
     plan.pop('stateless')
     plan['verticalScalers'] = []
 else:
@@ -380,18 +397,20 @@ fi
 healthy=0
 report_version_ready()
 {
-   python3 - "$1" "$2" "$3" <<'PY'
+   python3 - "$1" "$2" "$3" "${4:-$3}" "${5:-running}" <<'PY'
 import pathlib, re, sys
 text = pathlib.Path(sys.argv[1]).read_text()
-wanted, count = int(sys.argv[2]), int(sys.argv[3])
+wanted, count, healthy = map(int, sys.argv[2:5])
+state = sys.argv[5]
 for block in re.split(r'(?m)^\s*versionID:\s*', text)[1:]:
     if int(block.splitlines()[0]) != wanted:
         continue
     def field(name):
         match = re.search(r'(?m)^\s*' + name + r':\s*(\S+)', block)
         return match[1] if match else None
-    ready = field('state') == 'DeploymentState::running' and all(
-        field(name) == str(count) for name in ('nTarget', 'nDeployed', 'nHealthy')) and field('nCrashes') == '0'
+    ready = (field('state') == 'DeploymentState::' + state and field('nDeployed') == str(count)
+             and field('nHealthy') == str(healthy) and field('nCrashes') == '0'
+             and (state == 'waitingToDeploy' or field('nTarget') == str(count)))
     sys.exit(0 if ready else 1)
 sys.exit(1)
 PY
@@ -403,7 +422,7 @@ do
       "${MOTHERSHIP_BIN}" applicationReport "${cluster_name}" Nametag \
       >"${application_log}" 2>&1
    then
-      if report_version_ready "${application_log}" "${version_id}" "${expected_healthy}"
+      if report_version_ready "${application_log}" "${version_id}" "${expected_healthy}" "${initial_healthy}" "${initial_state}"
       then
          healthy=1
          break
@@ -421,7 +440,7 @@ then
    exit 1
 fi
 
-if [[ "${test_mode}" == legacy-handoff ]]
+if [[ "${is_handoff}" == 1 ]]
 then
    archive_workspace=1
    observe_handoff()
@@ -519,7 +538,7 @@ PY
       then
          printf 'attempt=%s\n' "${attempt}" >> "${tmpdir}/upgrade-recovery-samples.log"
          cat "${tmpdir}/upgrade-recovery-report.log" >> "${tmpdir}/upgrade-recovery-samples.log"
-         if report_version_ready "${tmpdir}/upgrade-recovery-report.log" "${version_id}" 3
+         if report_version_ready "${tmpdir}/upgrade-recovery-report.log" "${version_id}" 3 "${initial_healthy}" "${recovered_state}"
          then
             recovered=1
             break
@@ -551,6 +570,53 @@ PY
    env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
       "${MOTHERSHIP_BIN}" deploy "${cluster_name}" "$(cat "${tmpdir}/verify.plan.json")" \
       "${tmpdir}/verify.container.zst" >"${tmpdir}/verify-deploy.log" 2>&1
+   if [[ "${test_mode}" == legacy-recovery ]]
+   then
+      queued=0
+      for _ in $(seq 1 120)
+      do
+         if env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+            timeout 8s "${MOTHERSHIP_BIN}" applicationReport "${cluster_name}" Nametag >"${tmpdir}/recovery-admission-report.log" 2>&1 &&
+            report_version_ready "${tmpdir}/recovery-admission-report.log" "${version_id}" 3 1 none &&
+            report_version_ready "${tmpdir}/recovery-admission-report.log" "$((version_id + 1))" 0 0 waitingToDeploy
+         then
+            queued=1
+            break
+         fi
+         sleep 0.5
+      done
+      [[ "${queued}" == 1 ]] || { echo "FAIL: exact retained 3/1 predecessor and empty waiting successor not observed" >&2; exit 1; }
+      python3 - "${version_id}" "${tmpdir}/verify.container.zst" "${tmpdir}/recovery-request.json" <<'PY_RECOVERY_REQUEST'
+import hashlib, json, pathlib, sys, uuid
+version, blob, output = sys.argv[1:]
+request = dict(applicationName='Nametag', applicationID=6, activeVersionID=int(version),
+               successorVersionID=int(version) + 1, operationID=str(uuid.uuid4()),
+               successorBlobSHA256=hashlib.sha256(pathlib.Path(blob).read_bytes()).hexdigest())
+pathlib.Path(output).write_text(json.dumps(request) + '\n')
+PY_RECOVERY_REQUEST
+      for admission in initial retry
+      do
+         env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+            timeout 15s "${MOTHERSHIP_BIN}" recoverMaterializedStatefulDeployment "${cluster_name}" \
+            "$(cat "${tmpdir}/recovery-request.json")" >"${tmpdir}/recovery-${admission}.log" 2>&1
+         python3 - "${tmpdir}/recovery-request.json" "${tmpdir}/recovery-${admission}.log" <<'PY_RECOVERY_ACCEPTED'
+import json, pathlib, re, sys
+request = json.loads(pathlib.Path(sys.argv[1]).read_text())
+text = pathlib.Path(sys.argv[2]).read_text()
+line = next((line for line in text.splitlines() if line.startswith('recoverMaterializedStatefulDeployment accepted=')), '')
+fields = dict(re.findall(r'(\w+)=([^\s]*)', line))
+assert fields.get('accepted') == '1' and fields.get('failure') == '', line
+assert fields.get('operationID') == request['operationID'], line
+assert int(fields['appID']) == request['applicationID']
+for name in ('activeVersionID', 'successorVersionID'):
+    assert int(fields[name]) == request[name]
+    deployment = name.replace('VersionID', 'DeploymentID')
+    assert int(fields[deployment]) == ((request['applicationID'] << 48) | request[name])
+assert int(fields['durableGeneration']) > 0, line
+print('RECOVERY_API_ACCEPTED', pathlib.Path(sys.argv[2]).name, request['operationID'])
+PY_RECOVERY_ACCEPTED
+      done
+   fi
    # Each replacement waits for actual predecessor exit, then actual health.
    # Budget every serial stop grace; a fixed one-minute loop cuts off replica 3.
    handoff_wait_seconds="$(python3 - "${plan_json}" "${expected_healthy}" <<'PY_HANDOFF_WAIT'
@@ -582,7 +648,12 @@ PY_HANDOFF_WAIT
    done
    [[ "${healthy}" == 1 ]] || { echo "FAIL: successor did not become healthy within ${handoff_wait_seconds}s serial handoff budget" >&2; exit 1; }
    observe_handoff after
-   echo "PASS: worker-preserving bundle upgrade and lifecycle-quiesced legacy storage handoff with logical readback"
+   if [[ "${test_mode}" == legacy-recovery ]]
+   then
+      echo "PASS: durably admitted retained 3/1 recovery, idempotent retry and three-replica logical readback"
+   else
+      echo "PASS: worker-preserving bundle upgrade and lifecycle-quiesced legacy storage handoff with logical readback"
+   fi
    exit 0
 fi
 

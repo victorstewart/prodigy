@@ -167,6 +167,7 @@ private:
   NeuronHub *metricsSink = nullptr;
   uint64_t requestMetricKey = 0;
   bool readyReassertedOnTraffic = false;
+  bool suppressApplicationReady = false;
 
 #if PRODIGY_PINGPONG_REQUIRE_GOOGLE_EGRESS == 1
   bool googleProbeComplete = false;
@@ -891,7 +892,7 @@ private:
       return;
     }
 
-    if (readyReassertedOnTraffic == false)
+    if (suppressApplicationReady == false && readyReassertedOnTraffic == false)
     {
       readyReassertedOnTraffic = true;
       metricsSink->signalReady();
@@ -1000,10 +1001,11 @@ public:
     port = value;
   }
 
-  void setMetricsSink(NeuronHub *sink, uint64_t metricKey)
+  void setMetricsSink(NeuronHub *sink, uint64_t metricKey, bool suppressReady)
   {
     metricsSink = sink;
     requestMetricKey = metricKey;
+    suppressApplicationReady = suppressReady;
   }
 
   void start()
@@ -1148,6 +1150,8 @@ private:
   uint32_t periodicMetricIntervalMs = 0;
   bool periodicMetricTickQueued = false;
   bool readySignaled = false;
+  bool runtimeReadySignaled = false;
+  bool storageHandoffSeedReadyWithheld = false;
   bool topologyCutoverBarrierPublished = false;
   uint16_t currentLogicalCores = 1;
   uint32_t currentMemoryMB = 0;
@@ -1265,14 +1269,18 @@ private:
     {
       return;
     }
-    if (readySignaled)
+    if (runtimeReadySignaled == false)
+    {
+      runtimeReadySignaled = true;
+      neuronHub->signalRuntimeReady();
+    }
+    if (storageHandoffSeedReadyWithheld || readySignaled)
     {
       return;
     }
 
     readySignaled = true;
     neuronHub->signalReady();
-    neuronHub->signalRuntimeReady();
 
     publishMetricSample();
 
@@ -1455,6 +1463,61 @@ public:
     int syncError = errno;
     close(directory);
     if (syncResult != 0) return fail("directory-sync", syncError);
+
+    if (seed)
+    {
+      const char *selectedMachine = getenv("PINGPONG_STORAGE_HANDOFF_READY_MACHINE");
+      if (selectedMachine)
+      {
+        if (*selectedMachine == '\0') return fail("ready-machine-format");
+        for (const char *cursor = selectedMachine; *cursor; ++cursor)
+        {
+          if (*cursor < '0' || *cursor > '9') return fail("ready-machine-format");
+        }
+        errno = 0;
+        char *terminal = nullptr;
+        unsigned long selectedIndex = strtoul(selectedMachine, &terminal, 10);
+        if (errno != 0 || terminal == selectedMachine || *terminal != '\0' || selectedIndex == 0 || selectedIndex > UINT32_MAX)
+          return fail("ready-machine-index", errno);
+
+        std::ifstream cgroups("/proc/self/cgroup");
+        if (cgroups.good() == false) return fail("ready-machine-cgroup", errno);
+        std::string line;
+        unsigned long currentIndex = 0;
+        bool foundFixtureCgroup = false;
+        while (std::getline(cgroups, line))
+        {
+          if (line.starts_with("0::/") == false) continue;
+          // The cgroup namespace may expose the fixture scope prefix.
+          const size_t machineBegin = line.rfind("/machine");
+          if (machineBegin == std::string::npos) continue;
+          const size_t digitsBegin = machineBegin + strlen("/machine");
+          const size_t suffixBegin = line.find("/containers.slice/", digitsBegin);
+          if (suffixBegin == std::string::npos || suffixBegin == digitsBegin || suffixBegin + strlen("/containers.slice/") >= line.size())
+            continue;
+          for (size_t index = digitsBegin; index < suffixBegin; ++index)
+          {
+            if (line[index] < '0' || line[index] > '9') return fail("ready-machine-cgroup");
+          }
+          errno = 0;
+          std::string indexText = line.substr(digitsBegin, suffixBegin - digitsBegin);
+          char *indexTerminal = nullptr;
+          currentIndex = strtoul(indexText.c_str(), &indexTerminal, 10);
+          if (errno != 0 || indexTerminal == indexText.c_str() || *indexTerminal != '\0' || currentIndex == 0 || currentIndex > UINT32_MAX)
+            return fail("ready-machine-cgroup", errno);
+          foundFixtureCgroup = true;
+          break;
+        }
+        if (foundFixtureCgroup == false) return fail("ready-machine-cgroup");
+
+        storageHandoffSeedReadyWithheld = (currentIndex != selectedIndex);
+        if (storageHandoffSeedReadyWithheld)
+        {
+          basics_log("storage-handoff-fixture readiness withheld selectedMachine=%lu currentMachine=%lu\n", selectedIndex, currentIndex);
+        }
+      }
+    }
+
     std::fprintf(stderr, "storage-handoff-fixture mode=%s uid=%u logicalBytes=%llu passed=1\n",
                  mode, unsigned(getuid()), (unsigned long long)size);
     std::fflush(stderr);
@@ -1520,7 +1583,7 @@ public:
       }
 
       requestMetricKey = ProdigyMetrics::metricKeyForName(metricName);
-      server.setMetricsSink(neuronHub.get(), requestMetricKey);
+      server.setMetricsSink(neuronHub.get(), requestMetricKey, storageHandoffSeedReadyWithheld);
     }
 
 #if PRODIGY_PINGPONG_REQUIRE_GOOGLE_EGRESS == 1
