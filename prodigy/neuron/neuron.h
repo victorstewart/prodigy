@@ -3033,6 +3033,28 @@ public:
     }
   }
 
+  void rawFDPollHandler(void *owner, uint64_t generation, uint64_t ticket, int result) override
+  {
+    Container *container = reinterpret_cast<Container *>(owner);
+    if (container == nullptr || container->nonChildPidfdLiveness == false ||
+        container->nonChildPidfdTicket != ticket || generation != uint64_t(container->pid))
+    {
+      return;
+    }
+    container->nonChildPidfdTicket = 0;
+    if (result < 0)
+    {
+      // Cancellation is terminal ownership acknowledgement, not an exit.
+      container->waitidPending = false;
+      return;
+    }
+    container->infop = {};
+    container->infop.si_pid = container->pid;
+    container->infop.si_code = CLD_EXITED;
+    container->infop.si_status = 0;
+    waitidHandler(container);
+  }
+
   void waitidHandler(void *waiter) override
   {
     // typedef struct {
@@ -3982,6 +4004,7 @@ public:
               // then we'd need to check /proc/{pid}/status and line NSpid: 12345 1 to get the pid mapping to select pid 1
               container->pid = restoredPID;
               container->pidfd = syscall(SYS_pidfd_open, container->pid, 0);
+              container->nonChildPidfdLiveness = (container->pidfd >= 0);
 
               if (container->plan.useHostNetworkNamespace == false)
               {

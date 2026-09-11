@@ -1090,6 +1090,8 @@ public:
   int64_t lastRestartFailureMs = 0;
   uint32_t restartFailureStreak = 0;
   bool waitidPending = false;
+  bool nonChildPidfdLiveness = false;
+  uint64_t nonChildPidfdTicket = 0;
   bool destroyCloseCompleted = false;
   bool failedArtifactsPreserved = false;
   int64_t failedArtifactsObservedAtMs = 0;
@@ -11014,6 +11016,11 @@ public:
 #ifdef __linux__
     if (container->pidfd >= 0)
     {
+      if (container->nonChildPidfdLiveness)
+      {
+        container->nonChildPidfdTicket = Ring::queueRawFDPoll(container, uint64_t(container->pid), container->pidfd, POLLIN);
+        return;
+      }
       Ring::queueWaitid(container, static_cast<idtype_t>(3), id_t(container->pidfd));
       return;
     }
