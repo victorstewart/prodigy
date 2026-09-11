@@ -90,15 +90,43 @@ cleanup()
       if [[ "${#runtime_logs[@]}" -gt 0 ]]
       then
          tar --sparse -cf "${tmpdir}/precleanup-runtime-logs.tar" -C "${workspace_root}/machines" -- "${runtime_logs[@]}"
-         # Archive (without mutating) lifecycle-owned handoff receipts and
-         # per-container failure output before Mothership cleanup.
-         mapfile -t handoff_receipts < <(find "${workspace_root}/machines" -path '*/containers/.storage-handoffs/*/capture.txt' -type f -print 2>/dev/null || true)
-         if [[ "${#handoff_receipts[@]}" -gt 0 ]]
-         then
-            tar --sparse -rf "${tmpdir}/precleanup-runtime-logs.tar" -C / -- "${handoff_receipts[@]}"
-         fi
          chmod 0600 "${tmpdir}/precleanup-runtime-logs.tar"
       fi
+      # Read the running node's mounted owner before Mothership removes it.
+      # Keep receipts and existing diagnostic logs, never sparse database payloads.
+      python3 - "${manifest_path}" "${tmpdir}" <<'PY_STORAGE_TRACES'
+import json, pathlib, stat, sys, tarfile
+manifest, output = map(pathlib.Path, sys.argv[1:])
+observations = []
+archive = output / 'precleanup-storage-traces.tar'
+try:
+    nodes = json.loads(manifest.read_text())['nodes']
+    with tarfile.open(archive, 'w') as tar:
+        archive.chmod(0o600)
+        for node in nodes:
+            owner = pathlib.Path('/proc') / str(int(node['pid'])) / 'root/containers'
+            record = dict(machineIndex=node['index'], pid=node['pid'], owner=str(owner), files=[], errors=[])
+            observations.append(record)
+            if not owner.is_dir():
+                record['errors'].append('live container owner unavailable')
+                continue
+            candidates = list(owner.glob('.storage-handoffs/*/capture.txt'))
+            candidates += list(owner.glob('*/rootfs/neuron.hosttrace.log'))
+            for path in candidates:
+                try:
+                    metadata = path.lstat()
+                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 8 * 1024 * 1024:
+                        record['errors'].append(str(path.relative_to(owner)) + ': not a bounded regular diagnostic file')
+                        continue
+                    relative = str(path.relative_to(owner))
+                    tar.add(path, arcname=str(node['index']) + '/containers/' + relative, recursive=False)
+                    record['files'].append(dict(path=relative, bytes=metadata.st_size))
+                except OSError as error:
+                    record['errors'].append(str(error))
+except (OSError, ValueError, KeyError) as error:
+    observations.append(dict(error=str(error)))
+(output / 'precleanup-storage-traces.json').write_text(json.dumps(observations, indent=2) + '\n')
+PY_STORAGE_TRACES
       rm -rf "${tmpdir}/workspace-archive" >/dev/null 2>&1 || true
       mkdir -p "${tmpdir}/workspace-archive"
       find "${workspace_root}" -maxdepth 1 -type f \( -name '*.log' -o -name '*.json' -o -name '*.ready' -o -name '*.failure' \) \

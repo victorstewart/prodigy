@@ -1373,43 +1373,68 @@ public:
 
   bool prepareStorageHandoffFixture()
   {
-    auto fail = [](const char *reason) { std::fprintf(stderr, "storage-handoff-fixture invariant=%s errno=%d\\n", reason, errno); std::fflush(stderr); return false; };
+    auto fail = [](const char *reason, int error = 0) {
+      std::fprintf(stderr, "storage-handoff-fixture invariant=%s errno=%d(%s) uid=%u\n",
+                   reason, error, strerror(error), unsigned(getuid()));
+      std::fflush(stderr);
+      return false;
+    };
     const char *mode = getenv("PINGPONG_STORAGE_HANDOFF_MODE");
     if (mode == nullptr) return true;
     const char *identity = getenv("PINGPONG_STORAGE_HANDOFF_ID");
-    if (identity == nullptr || strlen(identity) != 32 || strspn(identity, "0123456789abcdef") != 32) return fail("identity");
+    if (identity == nullptr || strlen(identity) != 32 || strspn(identity, "0123456789abcdef") != 32)
+      return fail("identity");
     const bool seed = strcmp(mode, "seed") == 0;
     if (!seed && strcmp(mode, "verify") != 0) return fail("mode");
     constexpr off_t size = off_t(2) * 1024 * 1024 * 1024 * 1024;
-    if (seed && mkdir("/storage/kvdb", 0700) != 0) return fail("mkdir");
+    if (seed && mkdir("/storage/kvdb", 0700) != 0) return fail("mkdir", errno);
     int fd = open("/storage/kvdb/handoff-sparse", O_RDWR | O_CLOEXEC | O_NOFOLLOW |
                                                     (seed ? O_CREAT | O_EXCL : 0), 0600);
-    if (fd < 0) return fail("open");
-    bool ready = true;
+    if (fd < 0) return fail("open", errno);
+    auto failFile = [&](const char *reason, int error = 0) {
+      close(fd);
+      return fail(reason, error);
+    };
     if (seed)
     {
-      ready = ftruncate(fd, size) == 0 && pwrite(fd, identity, 32, 0) == 32 &&
-              pwrite(fd, "M", 1, size / 2) == 1 && pwrite(fd, "Z", 1, size - 1) == 1;
+      if (ftruncate(fd, size) != 0) return failFile("seed-size", errno);
+      if (pwrite(fd, identity, 32, 0) != 32) return failFile("seed-identity-write", errno);
+      if (pwrite(fd, "M", 1, size / 2) != 1) return failFile("seed-middle-write", errno);
+      if (pwrite(fd, "Z", 1, size - 1) != 1) return failFile("seed-last-write", errno);
     }
     else
     {
       char observed[32] = {}, middle = 0, last = 0;
       struct stat metadata = {};
-      ready = fstat(fd, &metadata) == 0 && metadata.st_size == size && metadata.st_uid == getuid() &&
-              metadata.st_blocks * 512 < 1024 * 1024 && pread(fd, observed, 32, 0) == 32 &&
-              memcmp(observed, identity, 32) == 0 && pread(fd, &middle, 1, size / 2) == 1 && middle == 'M' &&
-              pread(fd, &last, 1, size - 1) == 1 && last == 'Z' && pwrite(fd, "A", 1, size / 2) == 1;
+      if (fstat(fd, &metadata) != 0) return failFile("stat", errno);
+      std::fprintf(stderr, "storage-handoff-fixture observed dev=%llu inode=%llu uid=%u expectedUID=%u size=%llu blocks=%llu\n",
+                   (unsigned long long)metadata.st_dev, (unsigned long long)metadata.st_ino,
+                   unsigned(metadata.st_uid), unsigned(getuid()),
+                   (unsigned long long)metadata.st_size, (unsigned long long)metadata.st_blocks);
+      std::fflush(stderr);
+      if (metadata.st_size != size) return failFile("size");
+      if (metadata.st_uid != getuid()) return failFile("owner");
+      if (metadata.st_blocks * 512 >= 1024 * 1024) return failFile("sparse-allocation");
+      if (pread(fd, observed, 32, 0) != 32) return failFile("identity-read", errno);
+      if (memcmp(observed, identity, 32) != 0) return failFile("identity-marker");
+      if (pread(fd, &middle, 1, size / 2) != 1) return failFile("middle-read", errno);
+      if (middle != 'M') return failFile("middle-marker");
+      if (pread(fd, &last, 1, size - 1) != 1) return failFile("last-read", errno);
+      if (last != 'Z') return failFile("last-marker");
+      if (pwrite(fd, "A", 1, size / 2) != 1) return failFile("replacement-write", errno);
     }
-    if (fsync(fd) != 0) ready = false;
-    if (!ready) { close(fd); return fail("content-size-owner-marker"); }
+    if (fsync(fd) != 0) return failFile("file-sync", errno);
     close(fd);
     int directory = open("/storage/kvdb", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    ready = directory >= 0 && fsync(directory) == 0 && ready;
-    if (directory >= 0) close(directory);
-    basics_log("storage-handoff-fixture mode=%s id=%s uid=%u logicalBytes=%llu passed=%d\n",
-               mode, identity, unsigned(getuid()), (unsigned long long)size, int(ready));
-    fflush(stdout);
-    return ready;
+    if (directory < 0) return fail("directory-open", errno);
+    int syncResult = fsync(directory);
+    int syncError = errno;
+    close(directory);
+    if (syncResult != 0) return fail("directory-sync", syncError);
+    std::fprintf(stderr, "storage-handoff-fixture mode=%s uid=%u logicalBytes=%llu passed=1\n",
+                 mode, unsigned(getuid()), (unsigned long long)size);
+    std::fflush(stderr);
+    return true;
   }
 
   void prepare(int argc, char *argv[])
