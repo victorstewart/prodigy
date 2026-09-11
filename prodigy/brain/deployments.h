@@ -9154,13 +9154,24 @@ public:
             ContainerView *container = *it;
 
             Machine *machine = container->machine;
-            if (BrainBase::neuronControlStreamActive(machine) == false)
+            const bool controlActive = BrainBase::neuronControlStreamActive(machine);
+            const uint32_t fit = controlActive ? nFitOnMachine(this, machine, 1) : 0;
+#if PRODIGY_DEBUG
+            PRODIGY_DEBUG_LOG("stateful inplace candidate deploymentID=%llu head=%llu previous=%llu oldContainer=%llu host=%u controlActive=%d runtimeReady=%d nFit=%u\n",
+                              (unsigned long long)plan.config.deploymentID(),
+                              (unsigned long long)plan.config.deploymentID(),
+                              (unsigned long long)(previous ? previous->plan.config.deploymentID() : 0),
+                              (unsigned long long)container->uuid,
+                              machine ? unsigned(machine->private4) : 0u,
+                              int(controlActive), machine ? int(machine->runtimeReady) : 0, unsigned(fit));
+#endif
+            if (controlActive == false)
             {
-              it++;
-              continue;
+                it++;
+                continue;
             }
 
-            if (nFitOnMachine(this, machine, 1) > 0)
+            if (fit > 0)
             {
               MachineResourcesDelta& deltas = deltasByMachine[machine];
               prodigyApplyPlannedMachineScalarDelta(deltas, previous->plan.config, -1);

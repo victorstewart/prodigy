@@ -11924,6 +11924,12 @@ public:
   // commonly supply a handler-local or temporary metric policy.
   static void spinContainer(ContainerPlan plan, uint128_t replaceContainerUUID, NeuronContainerMetricPolicy metricPolicy)
   {
+#if PRODIGY_DEBUG
+    PRODIGY_DEBUG_LOG("executeWork spinContainer deploymentID=%llu containerUUID=%llu replaceUUID=%llu lifecycle=construct-or-updateInPlace\n",
+                      (unsigned long long)plan.config.deploymentID(),
+                      (unsigned long long)plan.uuid,
+                      (unsigned long long)replaceContainerUUID);
+#endif
     bool skipLaunch = false;
     String taskGateFailure = {};
     if (thisNeuron != nullptr && thisNeuron->prepareTaskAttemptLaunch(plan, skipLaunch, &taskGateFailure) == false)
