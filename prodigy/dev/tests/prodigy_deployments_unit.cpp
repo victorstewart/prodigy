@@ -942,6 +942,10 @@ int main(void)
     auto source = root / "source";
     auto sparse = source / "sparse";
     suite.expect(writeFileFixture(source / "small", "known-source-data"), "reflink_source_created");
+    suite.expect(writeFileFixture(source / "kvdb/data", "private-hse-state") &&
+                 chmod((source / "kvdb").c_str(), 0700) == 0 &&
+                 chmod((source / "kvdb/data").c_str(), 0600) == 0,
+                 "reflink_private_database_fixture_created");
     constexpr off_t sparseSize = off_t(2) * 1024 * 1024 * 1024 * 1024;
     int file = open(sparse.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     suite.expect(file >= 0, "reflink_sparse_file_created");
@@ -999,6 +1003,11 @@ int main(void)
       {
         if (setgroups(0, nullptr) != 0 || setresgid(mappedID, mappedID, mappedID) != 0 ||
             setresuid(mappedID, mappedID, mappedID) != 0) _exit(2);
+        int privateFile = openat(targetDirectory, "kvdb/data", O_RDWR | O_CLOEXEC);
+        char privateData[17] = {};
+        if (privateFile < 0 || read(privateFile, privateData, 17) != 17 ||
+            memcmp(privateData, "private-hse-state", 17) != 0) _exit(4);
+        close(privateFile);
         int copiedFile = openat(targetDirectory, "sparse", O_RDWR | O_CLOEXEC);
         char first = 0, middle = 0, last = 0;
         if (copiedFile < 0 || pread(copiedFile, &first, 1, 0) != 1 ||

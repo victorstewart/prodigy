@@ -9279,7 +9279,8 @@ public:
     return true;
   }
 
-  // Called only after the lifecycle wait has observed the predecessor exit.
+  // Shared by legacy rootfs-local and direct no-device storage. Called only
+  // after the lifecycle wait has observed the predecessor exit.
   // A reflink is mandatory: HSE files can be multi-terabyte sparse files while
   // consuming only kilobytes. Never silently fall back to a dense copy.
   static bool stageQuiescedLegacyStorage(
@@ -12176,6 +12177,33 @@ public:
               }
               legacySource.assign(originalRoot);
               legacyIdentity = original;
+            }
+          }
+          else if (!old->storageUsesLoopFilesystem)
+          {
+            // A direct backend also contains predecessor-owned descendants.
+            // Renaming it and chowning only its root cannot transfer a private
+            // database directory to the successor's different execution ID.
+            String directRoot;
+            prodigyContainerStorageRootPathForName(old->name, directRoot);
+            struct stat direct = {};
+            if (lstat(directRoot.c_str(), &direct) == 0 &&
+                S_ISDIR(direct.st_mode) && direct.st_dev == live.st_dev && direct.st_ino == live.st_ino)
+            {
+              String successorName;
+              successorName.assignItoa(plan.uuid);
+              Vector<ProdigyContainerStorageDevicePlan> devices;
+              if (plan.config.storageMB == 0 || old->plan.config.isolatedChildMemoryMB != 0 ||
+                  collectEligibleStorageDevicePlans(successorName, plan.config.storageMB, devices) == false || !devices.empty())
+              {
+                reportSpinContainerFailure(plan, "direct storage handoff requires the existing no-device backend"_ctv);
+                co_return;
+              }
+              // Select even an empty live directory: the predecessor can write
+              // its first entry before stop. Capture only after it is quiescent.
+              // The original remains available throughout successor creation.
+              legacySource.assign(directRoot);
+              legacyIdentity = direct;
             }
           }
         }
