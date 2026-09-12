@@ -577,11 +577,15 @@ container_log_receipt_until()
    IFS='|' read -r -a receipt_parts <<< "${specification}"
    application="${receipt_parts[0]:-}"
    [[ "${application}" =~ ^[0-9]+$ && "${#receipt_parts[@]}" -gt 1 ]] || return 1
+   # containerLogs resolves a registered name. Keep the explicit ID fence,
+   # then use the same name resolved by the immediately preceding deployment.
+   [[ -n "${resolved_application}" && -r "${resolved_plan}" &&
+      "$(jq -r '.config.applicationID' "${resolved_plan}")" == "${application}" ]] || return 1
 
    for attempt in $(seq 1 "${attempts}")
    do
       output="${tmpdir}/container-receipt-${label}-${application}-${attempt}.log"
-      if container_logs "${application}" "${output}"
+      if container_logs "${resolved_application}" "${output}"
       then
          while IFS= read -r receipt_line
          do
