@@ -3667,7 +3667,20 @@ static bool mothershipVDCReadApplicationIdentities(const MothershipVDCProcessIde
   String root = {};
   root.snprintf<"/proc/{itoa}/root/sys/fs/cgroup/containers.slice"_ctv>(runtime.pid);
   DIR *directory = ::opendir(root.c_str());
-  if (directory == nullptr) { if (failure) failure->assign("local application cgroup inventory unavailable"_ctv); return false; }
+  if (directory == nullptr)
+  {
+    // A machine that has never hosted an application has no containers.slice.
+    // Require the retained cgroup filesystem itself before accepting zero apps.
+    if (errno == ENOENT)
+    {
+      String cgroupRoot = {};
+      cgroupRoot.snprintf<"/proc/{itoa}/root/sys/fs/cgroup"_ctv>(runtime.pid);
+      struct stat metadata = {};
+      if (::stat(cgroupRoot.c_str(), &metadata) == 0 && S_ISDIR(metadata.st_mode) && mothershipVDCProcessMatches(runtime)) return true;
+    }
+    if (failure) failure->assign("local application cgroup inventory unavailable"_ctv);
+    return false;
+  }
   bool okay = true;
   while (dirent *entry = ::readdir(directory))
   {

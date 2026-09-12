@@ -218,6 +218,13 @@ if [[ "${is_handoff}" == 1 ]]
 then
    # Match the retained release topology: one controller and three workers.
    machine_count=4
+   if [[ "$test_mode" == bootstrap-supersession ]]
+   then
+      # Three replicas on three machines force one live application onto the
+      # sole Brain. Four machines can place every replica on the workers and
+      # would leave the local checkpoint preservation gate unexercised.
+      machine_count=3
+   fi
    expected_healthy=3
    initial_healthy=3
    if [[ "${test_mode}" == legacy-recovery || "${test_mode}" == legacy-recovery-zero ]]
@@ -575,6 +582,9 @@ for node in nodes:
                             cgroup=(child / 'cgroup').read_text(),
                             applicationSHA256=expected_binary))
 assert len(records) == 3, f'expected three real fixture replicas, got {len(records)}'
+if mode == 'bootstrap-supersession' and phase == 'before':
+    assert any(r['machineIndex'] == 1 for r in records), 'checkpoint fixture must include a Brain-local application'
+
 if phase in ('upgraded', 'recovered', 'provider-step'):
     assert sorted((r['pid'], r['starttime'], r['uuid'], r['device'], r['inode'], r['networkNamespace'], r['cgroup']) for r in records) == \
            sorted((r['pid'], r['starttime'], r['uuid'], r['device'], r['inode'], r['networkNamespace'], r['cgroup']) for r in before), 'bundle upgrade changed live app/storage/network owners'
@@ -610,7 +620,7 @@ PY
       done
    elif [[ "${test_mode}" == bootstrap-supersession ]]; then
       # Keep one existing worker disconnected while the ordinary update owner
-      # persists a real incomplete three-worker operation. Both actions remain
+      # persists a real incomplete worker operation. Both actions remain
       # Mothership requests; this fixture owns only their bounded CLI children.
       env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
          "${MOTHERSHIP_BIN}" faultTestCluster "${cluster_name}" link 2 "${fault_duration_ms}" 0 0 0 >"${tmpdir}/bootstrap-fault.log" 2>&1 &
