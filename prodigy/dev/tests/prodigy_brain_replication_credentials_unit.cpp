@@ -9447,13 +9447,17 @@ static void testBootstrapBundleSupersessionReceipt(TestSuite& suite)
   brain.updateSelfWorkerExpectedBundleSHA256 = laterDigest;
   brain.updateSelfWorkerStateUploadedMachineUUIDs.insert(worker.uuid);
   brain.updateSelfWorkerStateUploadedMachineUUIDs.insert(secondWorker.uuid);
+  brain.updateSelfLocalMachineFragment = 0;
+  brain.usedMachineFragments.erase(checkpoint.machineFragment);
   const auto beforeLegacyMigration = brain.capturePersistentUpdateSelfState();
   const auto legacyPersistCalls = brain.persistCalls;
   suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID,
                                                                &failure, &laterBundle) &&
                    equalSerializedObjects(beforeLegacyMigration, brain.capturePersistentUpdateSelfState()) &&
-                   brain.persistCalls == legacyPersistCalls,
-               "bootstrap_receipt_legacy_runtime_later_installed_durable_update_consumes_stale_input");
+                   brain.persistCalls == legacyPersistCalls &&
+                   brain.updateSelfLocalMachineFragment == checkpoint.machineFragment &&
+                   brain.usedMachineFragments.contains(checkpoint.machineFragment),
+               "bootstrap_receipt_legacy_runtime_later_installed_update_rehydrates_local_fragment_without_reimport");
   brain.updateSelfWorkerStateUploadedMachineUUIDs.erase(secondWorker.uuid);
   brain.updateSelfWorkerStateUploadedMachineUUIDs.insert(secondWorker.uuid + 99);
   suite.expect(!brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID,

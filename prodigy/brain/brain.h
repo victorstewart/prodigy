@@ -23043,6 +23043,13 @@ public:
         return false;
       }
       // Do not import an old receipt's plans or replace a later update's state.
+      // Its local handoff still needs the same validated machine prefix before
+      // registration replays the later update's captured container inventory.
+      if (laterInstalledUpdate)
+      {
+        updateSelfLocalMachineFragment = checkpoint.machineFragment;
+        usedMachineFragments.insert(checkpoint.machineFragment);
+      }
       return true;
     }
 
