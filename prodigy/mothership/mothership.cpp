@@ -3844,13 +3844,22 @@ static bool mothershipVDCCaptureLocalCheckpoint(MothershipVDCBundleRecovery& ope
       ProdigyPersistentStateStore state(copy);
       ProdigyPersistentLocalBrainState local = {};
       ProdigyPersistentBrainSnapshot snapshot = {};
-      if (state.loadLocalBrainState(local, &childFailure) && state.loadBrainSnapshot(snapshot, &childFailure) &&
-          local.ownerClusterUUID == operation.clusterUUID && local.uuid != 0 &&
-          snapshot.brainConfig.clusterUUID == operation.clusterUUID &&
-          snapshot.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256 == operation.expectedIncompleteWorkerBundle &&
-          snapshot.masterAuthority.runtimeState.updateSelf.workerMachineUUIDs.empty() == false &&
-          snapshot.masterAuthority.runtimeState.updateSelf.workerStateUploadedMachineUUIDs.size() !=
-              snapshot.masterAuthority.runtimeState.updateSelf.workerMachineUUIDs.size())
+      bool stateMatches = state.loadLocalBrainState(local, &childFailure) && state.loadBrainSnapshot(snapshot, &childFailure);
+      if (stateMatches)
+      {
+        if (local.ownerClusterUUID != operation.clusterUUID)
+          childFailure.assign("checkpoint local state owner cluster mismatch"_ctv);
+        else if (local.uuid == 0)
+          childFailure.assign("checkpoint local state has no machine identity"_ctv);
+        else if (snapshot.brainConfig.clusterUUID != operation.clusterUUID)
+          childFailure.assign("checkpoint snapshot cluster mismatch"_ctv);
+        else if (snapshot.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256 != operation.expectedIncompleteWorkerBundle)
+          childFailure.assign("checkpoint pending worker bundle mismatch"_ctv);
+        else if (snapshot.masterAuthority.runtimeState.updateSelf.workerMachineUUIDs.empty())
+          childFailure.assign("checkpoint has no pending worker cohort"_ctv);
+        stateMatches = childFailure.empty();
+      }
+      if (stateMatches)
       {
         context.datacenterFragment = snapshot.brainConfig.datacenterFragment;
         String netPath = {};
@@ -3870,7 +3879,7 @@ static bool mothershipVDCCaptureLocalCheckpoint(MothershipVDCBundleRecovery& ope
         if (network >= 0) ::close(network);
       }
       state.close();
-      if (okay == false && childFailure.empty()) childFailure.assign("checkpoint authority, pending update, or namespace mismatch"_ctv);
+      if (okay == false && childFailure.empty()) childFailure.assign("checkpoint exact runtime network namespace is unavailable"_ctv);
     }
     if (okay == false) (void)mothershipVDCDurableWrite(directory, "checkpoint-failure", childFailure, nullptr);
     _exit(okay ? 0 : 1);
@@ -3930,6 +3939,7 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
   directoryName.snprintf<"machine{itoa}-{}-{}"_ctv>(uint64_t(machineIndex), expectedOldSHA, successorSHA);
   mothershipVirtualDatacenterPath(recoveryRoot, directoryName.c_str(), directory);
   String activePath = {}, active = {};
+  MothershipVDCProcessIdentity refusedWorker = {}, refusedSupervisor = {};
   mothershipVirtualDatacenterPath(recoveryRoot, "active", activePath);
   if (::access(activePath.c_str(), F_OK) == 0)
   {
@@ -3940,8 +3950,49 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
       String priorDirectory = {};
       mothershipVirtualDatacenterPath(recoveryRoot, active.c_str(), priorDirectory);
       MothershipVDCBundleRecovery prior = {};
-      if (mothershipVDCReadRecovery(priorDirectory, prior) == false || prior.phase != MothershipVDCRecoveryPhase::complete)
-        return reject("another provider recovery is incomplete");
+      if (mothershipVDCReadRecovery(priorDirectory, prior) == false) return reject("another provider recovery is incomplete");
+      if (prior.phase != MothershipVDCRecoveryPhase::complete)
+      {
+        // A refused precommit sole-Brain replacement leaves its journal for
+        // diagnosis. A corrected artifact may replace that pointer only while
+        // the recorded original owners and boot bytes are still intact.
+        char supervisorState = 0, workerState = 0;
+        uint64_t supervisorPID = 0, runtimeIdentity = 0;
+        String pidPath = {}, runtimeIdentityPath = {}, installedRoot = {}, installedBundlePath = {}, bootDirectory = {}, bootName = {}, bootPath = {};
+        mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, mothershipVirtualDatacenterPIDFilename, pidPath);
+        mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, "virtual-datacenter.identity", runtimeIdentityPath);
+        installedRoot.snprintf<"{}/machines/{itoa}/root/prodigy"_ctv>(cluster.test.workspaceRoot, uint64_t(machineIndex));
+        mothershipVirtualDatacenterPath(installedRoot, "prodigy.bundle.tar.zst", installedBundlePath);
+        mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, "boot", bootDirectory);
+        bootName.snprintf<"{itoa}.json"_ctv>(uint64_t(machineIndex));
+        mothershipVirtualDatacenterPath(bootDirectory, bootName.c_str(), bootPath);
+        bool retryableRefusal = expectedIncompleteWorkerSHA.empty() == false &&
+            (prior.phase == MothershipVDCRecoveryPhase::accepted || prior.phase == MothershipVDCRecoveryPhase::frozen) &&
+            prior.clusterUUID == cluster.clusterUUID && prior.machineIndex == machineIndex &&
+            prior.expectedOldBundle.equals(expectedOldSHA) &&
+            prior.expectedIncompleteWorkerBundle.equals(expectedIncompleteWorkerSHA) &&
+            prior.successorBundle.equals(successorSHA) == false && prior.adopter.pid <= 1 && prior.replacement.pid <= 1 &&
+            mothershipVDCReadNumber(pidPath, supervisorPID) && supervisorPID == prior.supervisor.pid &&
+            mothershipVDCProcessMatches(prior.supervisor, &supervisorState) && supervisorState != 'T' && supervisorState != 't' &&
+            mothershipVDCProcessMatches(prior.worker, &workerState) && workerState != 'T' && workerState != 't';
+        if (retryableRefusal)
+        {
+          runtimeIdentity = supervisorPID;
+          if (::access(runtimeIdentityPath.c_str(), F_OK) == 0 && mothershipVDCReadNumber(runtimeIdentityPath, runtimeIdentity) == false)
+            retryableRefusal = false;
+          String installedDigest = {}, executablePath = {}, executableDigest = {}, bootDigest = {};
+          executablePath.snprintf<"/proc/{itoa}/exe"_ctv>(prior.worker.pid);
+          retryableRefusal = retryableRefusal && runtimeIdentity == prior.runtimeIdentity &&
+              prodigyIsSHA256HexDigest(prior.previousBootSHA256) && prodigyIsSHA256HexDigest(prior.oldExecutable) &&
+              prodigyComputeFileSHA256Hex(installedBundlePath, installedDigest, failure) && installedDigest.equals(expectedOldSHA) &&
+              prodigyComputeFileSHA256Hex(executablePath, executableDigest, failure) && executableDigest.equals(prior.oldExecutable) &&
+              prodigyComputeFileSHA256Hex(bootPath, bootDigest, failure) && bootDigest.equals(prior.previousBootSHA256);
+        }
+        if (retryableRefusal == false)
+          return reject("another provider recovery is incomplete");
+        refusedWorker = prior.worker;
+        refusedSupervisor = prior.supervisor;
+      }
     }
   }
   if (::mkdir(directory.c_str(), 0700) != 0 && errno != EEXIST) return reject("cannot create provider recovery operation");
@@ -4044,6 +4095,11 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
     }
     if (save() == false) return false;
   }
+  if (refusedWorker.pid > 1 &&
+      (operation.phase != MothershipVDCRecoveryPhase::accepted ||
+       mothershipVDCSameProcess(operation.worker, refusedWorker) == false ||
+       mothershipVDCSameProcess(operation.supervisor, refusedSupervisor) == false))
+    return reject("corrected recovery artifact no longer targets the refused original owners");
   if (mothershipVDCDurableWrite(recoveryRoot, "active", directoryName, failure) == false) return false;
   String selected = {}; selected.assignItoa(machineIndex);
   if (mothershipVDCDurableWrite(directory, "selected-machine", selected, failure) == false) return false;

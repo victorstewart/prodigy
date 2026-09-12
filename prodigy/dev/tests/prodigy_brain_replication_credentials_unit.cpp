@@ -9391,6 +9391,18 @@ static void testBootstrapBundleSupersessionReceipt(TestSuite& suite)
   suite.expect(noTargetBrain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID, &failure, &successorBundle) == false &&
                    equalSerializedObjects(noTargetBefore, noTargetBrain.capturePersistentUpdateSelfState()),
                "bootstrap_supersession_rejects_empty_target_without_mutation");
+  // Worker stateUpload completes only the worker stage. The sole Brain may
+  // still be running the old bundle after its Mothership stream disappears.
+  brain.restorePersistentUpdateSelfState(beforeMissingCheckpoint);
+  brain.updateSelfWorkerStateUploadedMachineUUIDs.insert(worker.uuid);
+  brain.updateSelfWorkerStateUploadedMachineUUIDs.insert(secondWorker.uuid);
+  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID, &failure, &successorBundle) &&
+                   brain.updateSelfWorkerExpectedBundleSHA256.equals(successorDigest) &&
+                   brain.updateSelfWorkerStateUploadedMachineUUIDs.empty() &&
+                   brain.updateSelfLocalMachineUUID == checkpoint.machineUUID &&
+                   brain.updateSelfLocalContainerBootstraps.size() == checkpoint.plans.size(),
+               "bootstrap_supersession_accepts_uploaded_workers_before_local_brain_transition");
+
   brain.machines.erase(&restoredLocalMachine);
   brain.machines.erase(&worker);
   brain.machines.erase(&secondWorker);

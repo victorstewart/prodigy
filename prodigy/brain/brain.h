@@ -23041,8 +23041,9 @@ public:
       usedMachineFragments.insert(checkpoint.machineFragment);
       return true;
     }
+    // Uploaded workers do not prove that the local Brain transition completed.
+    // A matching nonempty operation remains pending until local inventory clears it.
     if (updateSelfWorkerMachineUUIDs.empty() ||
-        updateSelfWorkerStateUploadedMachineUUIDs.size() == updateSelfWorkerMachineUUIDs.size() ||
         updateSelfWorkerExpectedBundleSHA256.equals(receipt.expectedIncompleteWorkerBundleSHA256) == false)
     {
       if (failure) failure->assign("bootstrap bundle supersession expected incomplete update does not match"_ctv);
