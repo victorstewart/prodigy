@@ -529,6 +529,49 @@ static void testAllStatefulStartupSequencePairsEveryReplica(TestSuite& suite)
   suite.expect(replicaC.advertisingTo.countEntriesFor(meshService) == 2, "mesh_all_startup_sequence_c_advertises_to_two_peers");
 }
 
+static void testStopAllInvalidatesBootingPairingHalves(TestSuite& suite)
+{
+  Mesh subscriberRetirement;
+  TestMeshNode advertiser;
+  TestMeshNode subscriber;
+  initNode(advertiser, 91, 0x91);
+  initNode(subscriber, 92, 0x92);
+  configureAdvertisement(advertiser, meshService, meshPort);
+  configureSubscription(subscriber, meshService, SubscriptionNature::any);
+  subscriberRetirement.logAdvertisement(&advertiser, meshService, true);
+  subscriberRetirement.logSubscription(&subscriber, meshService, SubscriptionNature::any, true);
+  subscriberRetirement.logAdvertisementPairing(901, &advertiser, AdvertisementPairing(901, subscriber.meshAddress, meshService));
+  subscriberRetirement.logSubscriptionPairing(901, &subscriber, SubscriptionPairing(901, advertiser.meshAddress, meshService, meshPort));
+  subscriberRetirement.stopAllSubscriptions(&subscriber);
+  subscriberRetirement.unifyPairingHalves();
+  suite.expect(subscriberRetirement.pairingSecretFor(&advertiser, &subscriber, meshService) == 0, "mesh_stopAllSubscriptions_invalidates_booting_complete_half");
+  suite.expect(advertiser.advertisementDeactivateCalls == 1, "mesh_stopAllSubscriptions_repairs_surviving_advertiser_half");
+  suite.expect(advertiser.advertisingTo.countEntriesFor(meshService) == 0 && subscriber.subscribedTo.countEntriesFor(meshService) == 0, "mesh_stopAllSubscriptions_removes_retired_node_global_adjacency");
+  TestMeshNode replacementSubscriber;
+  initNode(replacementSubscriber, 95, 0x95);
+  configureSubscription(replacementSubscriber, meshService, SubscriptionNature::any);
+  subscriberRetirement.logSubscription(&replacementSubscriber, meshService, SubscriptionNature::any);
+  suite.expect(replacementSubscriber.subscriptionActivateCalls == 1 && advertiser.advertisingTo.countEntriesFor(meshService) == 1, "mesh_stopAllSubscriptions_replacement_subscriber_pairs_with_live_advertiser");
+  suite.expect(subscriber.subscriptionActivateCalls == 0 && subscriber.subscribedTo.countEntriesFor(meshService) == 0, "mesh_stopAllSubscriptions_replacement_does_not_notify_retired_subscriber");
+
+  Mesh advertiserRetirement;
+  TestMeshNode advertiser2;
+  TestMeshNode subscriber2;
+  initNode(advertiser2, 93, 0x93);
+  initNode(subscriber2, 94, 0x94);
+  configureAdvertisement(advertiser2, meshService, meshPort);
+  configureSubscription(subscriber2, meshService, SubscriptionNature::any);
+  advertiserRetirement.logAdvertisement(&advertiser2, meshService, true);
+  advertiserRetirement.logSubscription(&subscriber2, meshService, SubscriptionNature::any, true);
+  advertiserRetirement.logAdvertisementPairing(902, &advertiser2, AdvertisementPairing(902, subscriber2.meshAddress, meshService));
+  advertiserRetirement.logSubscriptionPairing(902, &subscriber2, SubscriptionPairing(902, advertiser2.meshAddress, meshService, meshPort));
+  advertiserRetirement.stopAllAdvertisments(&advertiser2);
+  advertiserRetirement.unifyPairingHalves();
+  suite.expect(advertiserRetirement.pairingSecretFor(&advertiser2, &subscriber2, meshService) == 0, "mesh_stopAllAdvertisments_invalidates_booting_complete_half");
+  suite.expect(subscriber2.subscriptionDeactivateCalls == 1, "mesh_stopAllAdvertisments_repairs_surviving_subscriber_half");
+  suite.expect(advertiser2.advertisingTo.countEntriesFor(meshService) == 0 && subscriber2.subscribedTo.countEntriesFor(meshService) == 0, "mesh_stopAllAdvertisments_removes_retired_node_global_adjacency");
+}
+
 static void testUnifyPairingHalvesPaths(TestSuite& suite)
 {
   Mesh mesh;
@@ -705,6 +748,7 @@ int main(void)
   testAllSubscriptionSkipsSelfPairing(suite);
   testAllStatefulStartupSequencePairsEveryReplica(suite);
   testUnifyPairingHalvesPaths(suite);
+  testStopAllInvalidatesBootingPairingHalves(suite);
   testMeshRandomWalkSmoke(suite);
 
   if (suite.failed > 0)

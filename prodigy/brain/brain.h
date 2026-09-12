@@ -31088,6 +31088,10 @@ public:
               containers.erase(stale->uuid);
             }
 
+            // State-upload inventory is authoritative: remove both active mesh
+            // edges and pending recovery halves before this MeshNode is freed.
+            mesh->stopAllSubscriptions(stale);
+            mesh->stopAllAdvertisments(stale);
             delete stale;
           }
 

@@ -1353,6 +1353,14 @@ public:
   // never notifies the subscriber, because this is only called when we purposely destroy a container
   void stopAllSubscriptions(MeshNode *subscriber)
   {
+    for (auto& [secret, pairing] : bootingPairings)
+    {
+      (void)secret;
+      if (pairing.subscriber == subscriber)
+      {
+        pairing.subscriber = nullptr;
+      }
+    }
     for (const auto& [service, subscription] : subscriber->subscriptions)
     {
       stopSubscription(service, subscriber, subscription.nature, false);
@@ -1448,6 +1456,14 @@ public:
 
   void stopAllAdvertisments(MeshNode *advertiser) // either machine died or container was destroyed
   {
+    for (auto& [secret, pairing] : bootingPairings)
+    {
+      (void)secret;
+      if (pairing.advertiser == advertiser)
+      {
+        pairing.advertiser = nullptr;
+      }
+    }
     for (const auto& [service, advertisement] : advertiser->advertisements)
     {
       stopAdvertisement(service, advertiser, false);
