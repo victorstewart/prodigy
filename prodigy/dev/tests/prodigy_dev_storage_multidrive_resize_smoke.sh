@@ -567,17 +567,30 @@ for node in nodes:
             stream.seek((1 << 41) - 1); assert stream.read(1) == b'Z'
         assert file.stat().st_size == 1 << 41
         assert middle == (b'A' if phase == 'after' else b'M')
-        original = parent / 'root/containers' / uuid / 'rootfs/storage'
+        owner = parent / 'root/containers'
+        storage_relative = pathlib.Path('storage') / uuid
+        if phase == 'before':
+            # Current runtimes use the canonical storage owner. The sealed
+            # legacy runtime keeps it under the container rootfs instead.
+            candidates = [storage_relative, pathlib.Path(uuid) / 'rootfs/storage']
+            matches = [p for p in candidates if (owner / p).exists()
+                       and ((owner / p).stat().st_dev, (owner / p).stat().st_ino)
+                           == (metadata.st_dev, metadata.st_ino)]
+            assert matches, 'live storage does not match a known owner'
+            storage_relative = matches[0]
+        elif phase in ('upgraded', 'recovered', 'provider-step'):
+            storage_relative = pathlib.Path(next(r['storageRelativePath'] for r in before if r['uuid'] == uuid))
         if phase in ('before', 'upgraded', 'recovered', 'provider-step'):
+            original = owner / storage_relative
             assert (original.stat().st_dev, original.stat().st_ino) == (metadata.st_dev, metadata.st_ino)
         else:
-            target = parent / 'root/containers/storage' / uuid
+            target = owner / storage_relative
             assert (target.stat().st_dev, target.stat().st_ino) == (metadata.st_dev, metadata.st_ino)
             assert file.stat().st_uid == metadata.st_uid
             assert any(line.split()[4] == '/storage' for line in (child / 'mountinfo').read_text().splitlines())
         starttime = (child / 'stat').read_text().rsplit(') ',1)[1].split()[19]
         records.append(dict(machineIndex=node['index'], parentPID=node['pid'], pid=int(pid), starttime=starttime, uuid=uuid,
-                            device=metadata.st_dev, inode=metadata.st_ino, uid=metadata.st_uid,
+                            device=metadata.st_dev, inode=metadata.st_ino, uid=metadata.st_uid, storageRelativePath=str(storage_relative),
                             networkNamespace=str((child / 'ns/net').readlink()),
                             cgroup=(child / 'cgroup').read_text(),
                             applicationSHA256=expected_binary))
@@ -593,7 +606,7 @@ if phase == 'after':
     for old in before:
         node = next(n for n in nodes if n['index'] == old['machineIndex'])
         owner = pathlib.Path('/proc') / str(node['pid']) / 'root/containers'
-        source = owner / old['uuid'] / 'rootfs/storage'
+        source = owner / old['storageRelativePath']
         assert (source.stat().st_dev, source.stat().st_ino) == (old['device'], old['inode'])
         with (source / 'kvdb/handoff-sparse').open('rb') as stream:
             assert stream.read(32) == identity.encode()
