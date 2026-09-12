@@ -183,6 +183,13 @@ public:
   virtual void ensureDeferredHardwareInventoryProgress(void)
   {
   }
+
+  // A base-only Neuron implementation cannot prove that its live containers
+  // have no control operations.  Block bundle exec until it has none.
+  virtual bool quiesceContainerControlSocketsForBundleExec(void)
+  {
+    return containers.empty();
+  }
 };
 
 inline NeuronBase *thisNeuron = nullptr;

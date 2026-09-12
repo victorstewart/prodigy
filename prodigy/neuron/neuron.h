@@ -3707,13 +3707,9 @@ public:
     return true;
   }
 
-  void beginBundleExecQuiesce(void)
+  bool quiesceContainerControlSocketsForBundleExec(void) override
   {
     bundleExecQuiescing = true;
-  }
-
-  bool quiesceContainerControlSocketsForBundleExec(void)
-  {
     bool drained = true;
     for (const auto& [uuid, container] : containers)
     {
@@ -3756,7 +3752,6 @@ public:
 
   virtual void transitionToNewBundle(void)
   {
-    beginBundleExecQuiesce();
     // Host-control HTTP and DNS own raw-fd polls. Their asynchronous shutdown
     // callbacks are the lifetime barrier required by Ring::shutdownForExec().
     // Retry from this Neuron-owned timer after cancellation CQEs are dispatched.

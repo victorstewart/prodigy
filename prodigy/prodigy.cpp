@@ -1189,9 +1189,11 @@ public:
 
   bool quiesceProcessForBundleExec(void) override
   {
+    const bool containerControlsQuiesced = thisNeuron == nullptr ||
+                                         thisNeuron->quiesceContainerControlSocketsForBundleExec();
     const bool retainedPidfdsQuiesced = ContainerManager::quiesceRetainedNonChildPidfdPollsForBundleExec();
     const bool hostControlQuiesced = hostControlNetwork.shutdown();
-    return retainedPidfdsQuiesced && hostControlQuiesced;
+    return containerControlsQuiesced && retainedPidfdsQuiesced && hostControlQuiesced;
   }
 
   bool localNeuronStateRefreshMayBypassIgnition(const Machine *machine, bool haveData) const override

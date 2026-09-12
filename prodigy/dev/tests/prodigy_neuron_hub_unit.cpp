@@ -386,7 +386,6 @@ static void testContainerControlExecQuiesce(TestSuite& suite)
   runtime.testCloseHandler(&retained);
   suite.expect(runtime.testRawStreamIsActive(&retained) && retained.pendingConnectUserData != 0,
                "container_control_exec_quiesce_normal_close_rearms_connect");
-  const int reconnectFD = retained.fd;
   runtime.closeCompletions = 0;
 
   Container draining = {};
@@ -399,10 +398,16 @@ static void testContainerControlExecQuiesce(TestSuite& suite)
   suite.expect(runtime.testRawStreamIsActive(&draining) && draining.pendingRecv,
                "container_control_exec_quiesce_arms_real_control_recv");
 
-  runtime.beginBundleExecQuiesce();
+  NeuronBase *bundleExecNeuron = &runtime;
+  suite.expect(bundleExecNeuron->quiesceContainerControlSocketsForBundleExec() == false,
+               "container_control_exec_quiesce_base_dispatch_starts_latch_and_waits_for_close_cqe");
+  const int closingFD = retained.fd;
+  const uint64_t closingConnectUserData = retained.pendingConnectUserData;
+  const bool closing = Ring::socketIsClosing(&retained);
   runtime.testConnectHandler(&retained, -ECONNREFUSED);
-  suite.expect(Ring::socketIsClosing(&retained) == false && retained.fd == reconnectFD,
-               "container_control_exec_quiesce_blocks_connect_failure_rearm");
+  suite.expect(closing && Ring::socketIsClosing(&retained) && retained.fd == closingFD &&
+                   retained.pendingConnectUserData == closingConnectUserData,
+               "container_control_exec_quiesce_blocks_connect_failure_rearm_after_close_queued");
 
   suite.expect(runtime.quiesceContainerControlSocketsForBundleExec() == false,
                "container_control_exec_quiesce_waits_for_control_close_cqe");
