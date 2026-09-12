@@ -722,7 +722,33 @@ PY_HANDOFF_WAIT
    observe_handoff after
    }
 
-   observe_handoff before
+   if [[ "${test_mode}" == initial-health-zero ]]
+   then
+      # nDeployed is a scheduler admission count. Reuse the exact owner observer
+      # as the materialization barrier; it writes handoff-before.json only after
+      # the three sealed processes and their seeded storage are verified.
+      observe_deadline=$((SECONDS + 60))
+      observe_attempt=0
+      : > "${tmpdir}/initial-replica-observe-attempts.log"
+      while (( SECONDS < observe_deadline ))
+      do
+         observe_attempt=$((observe_attempt + 1))
+         if observe_handoff before >> "${tmpdir}/initial-replica-observe-attempts.log" 2>&1
+         then
+            break
+         fi
+         printf 'attempt=%s elapsedSeconds=%s\n' "${observe_attempt}" "$((SECONDS + 60 - observe_deadline))" \
+            >> "${tmpdir}/initial-replica-observe-attempts.log"
+         sleep 0.5
+      done
+      [[ -s "${tmpdir}/handoff-before.json" ]] || {
+         echo "FAIL: initial-health-zero fixture replicas were not materialized within 60s" >&2
+         tail -80 "${tmpdir}/initial-replica-observe-attempts.log" >&2 || true
+         exit 1
+      }
+   else
+      observe_handoff before
+   fi
    if [[ "${test_mode}" == initial-health-zero ]]
    then
       run_successor_handoff deploying
