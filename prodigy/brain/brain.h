@@ -1076,6 +1076,8 @@ public:
   bytell_hash_set<uint128_t> updateSelfWorkerRebootedMachineUUIDs;
   bytell_hash_set<uint128_t> updateSelfWorkerStateUploadedMachineUUIDs;
   uint128_t updateSelfLocalMachineUUID = 0;
+  // The receipt is durable; this is rehydrated before local Neuron registration.
+  uint32_t updateSelfLocalMachineFragment = 0;
   bool updateSelfLocalBundleRegistered = false;
   Vector<String> updateSelfLocalContainerBootstraps;
   constexpr static int64_t connectFailureLogIntervalMs = prodigyBrainConnectFailureLogIntervalMs;
@@ -12782,6 +12784,11 @@ public:
         continue;
       }
 
+      if (restorePendingLocalMachineFragment(machine) == false)
+      {
+        continue;
+      }
+
       if (machine->fragment == 0)
       {
         assignMachineFragment(machine);
@@ -12795,9 +12802,53 @@ public:
     }
   }
 
+  bool restorePendingLocalMachineFragment(Machine *machine)
+  {
+    if (machine == nullptr || updateSelfLocalMachineUUID == 0 ||
+        machine->uuid != updateSelfLocalMachineUUID || updateSelfLocalMachineFragment == 0)
+    {
+      return true;
+    }
+
+    const uint32_t expectedFragment = updateSelfLocalMachineFragment;
+    if (machine->fragment != 0 && machine->fragment != expectedFragment)
+    {
+      updateSelfWorkerFailure.assign("bootstrap recovery local machine fragment conflicts with checkpoint"_ctv);
+      noteMasterAuthorityRuntimeStateChanged();
+      return false;
+    }
+    for (Machine *other : machines)
+    {
+      if (other != nullptr && other != machine && other->fragment == expectedFragment)
+      {
+        updateSelfWorkerFailure.assign("bootstrap recovery local machine fragment is already assigned"_ctv);
+        noteMasterAuthorityRuntimeStateChanged();
+        return false;
+      }
+    }
+
+    if (machine->fragment == expectedFragment)
+    {
+      return true;
+    }
+
+    machine->fragment = expectedFragment;
+    usedMachineFragments.insert(expectedFragment);
+    machine->reportedDatacenterFragment = 0;
+    machine->reportedFragment = 0;
+    machine->runtimeReady = false;
+    return true;
+  }
+
   void assignMachineFragment(Machine *machine)
   {
     if (machine == nullptr || brainConfig.datacenterFragment == 0)
+    {
+      return;
+    }
+    // Configuration and ignition also call this owner directly, before the
+    // periodic refresh or registration paths necessarily run.
+    if (restorePendingLocalMachineFragment(machine) == false)
     {
       return;
     }
@@ -22918,23 +22969,6 @@ public:
       return false;
     }
 
-    // The prior process may have completed before a replacement launch. Its
-    // retained receipt must not open a second operation on a clean authority.
-    if (updateSelfWorkerMachineUUIDs.empty() && updateSelfWorkerExpectedBundleSHA256.empty()) return true;
-
-    // Retrying an already durable replacement is intentionally a no-op.
-    if (updateSelfWorkerMachineUUIDs.empty() == false &&
-        updateSelfWorkerExpectedBundleSHA256.equals(receipt.successorBundleSHA256) &&
-        updateSelfBundleBlob.equals(installedBundle)) return true;
-
-    if (updateSelfWorkerMachineUUIDs.empty() ||
-        updateSelfWorkerStateUploadedMachineUUIDs.size() == updateSelfWorkerMachineUUIDs.size() ||
-        updateSelfWorkerExpectedBundleSHA256.equals(receipt.expectedIncompleteWorkerBundleSHA256) == false)
-    {
-      if (failure) failure->assign("bootstrap bundle supersession expected incomplete update does not match"_ctv);
-      return false;
-    }
-
     // A forced sole-Brain replacement has no surviving local Neuron owner.
     // Consume its exact authenticated stateUpload before any scheduling or
     // worker transition; startup parameters cannot reconstruct mutable plans.
@@ -22974,6 +23008,47 @@ public:
       if (failure) failure->assign("bootstrap recovery checkpoint machine differs from sole Brain authority"_ctv);
       return false;
     }
+    if (updateSelfLocalMachineUUID != 0 && updateSelfLocalMachineUUID != checkpoint.machineUUID)
+    {
+      if (failure) failure->assign("bootstrap recovery checkpoint conflicts with durable local machine authority"_ctv);
+      return false;
+    }
+    for (Machine *machine : machines)
+    {
+      if (machine != nullptr && machine->uuid != checkpoint.machineUUID &&
+          machine->fragment == checkpoint.machineFragment)
+      {
+        if (failure) failure->assign("bootstrap recovery checkpoint machine fragment is already assigned"_ctv);
+        return false;
+      }
+    }
+
+    // Decode before the durable-successor return: the receipt remains the
+    // authoritative source of the local network fragment until registration.
+    // A completed, clean receipt remains spent and cannot reopen an operation.
+    if (updateSelfWorkerMachineUUIDs.empty() && updateSelfWorkerExpectedBundleSHA256.empty()) return true;
+
+    if (updateSelfWorkerMachineUUIDs.empty() == false &&
+        updateSelfWorkerExpectedBundleSHA256.equals(receipt.successorBundleSHA256) &&
+        updateSelfBundleBlob.equals(installedBundle))
+    {
+      if (updateSelfLocalMachineUUID != checkpoint.machineUUID)
+      {
+        if (failure) failure->assign("bootstrap recovery successor has no matching durable local identity"_ctv);
+        return false;
+      }
+      updateSelfLocalMachineFragment = checkpoint.machineFragment;
+      usedMachineFragments.insert(checkpoint.machineFragment);
+      return true;
+    }
+    if (updateSelfWorkerMachineUUIDs.empty() ||
+        updateSelfWorkerStateUploadedMachineUUIDs.size() == updateSelfWorkerMachineUUIDs.size() ||
+        updateSelfWorkerExpectedBundleSHA256.equals(receipt.expectedIncompleteWorkerBundleSHA256) == false)
+    {
+      if (failure) failure->assign("bootstrap bundle supersession expected incomplete update does not match"_ctv);
+      return false;
+    }
+
     Vector<String> bootstraps = {};
     bytell_hash_set<uint128_t> checkpointUUIDs = {};
     bytell_hash_set<uint8_t> checkpointFragments = {};
@@ -23019,6 +23094,8 @@ public:
       if (failure) failure->assign("bootstrap bundle supersession state could not be persisted"_ctv);
       return false;
     }
+    updateSelfLocalMachineFragment = checkpoint.machineFragment;
+    usedMachineFragments.insert(checkpoint.machineFragment);
     return true;
   }
 
@@ -23682,6 +23759,7 @@ public:
     }
 
     updateSelfLocalMachineUUID = localMachine->uuid;
+    updateSelfLocalMachineFragment = 0;
     updateSelfLocalBundleRegistered = false;
     updateSelfLocalContainerBootstraps = std::move(bootstraps);
     updateSelfWorkerFailure.clear();
@@ -23763,6 +23841,7 @@ public:
     updateSelfWorkerRebootedMachineUUIDs.clear();
     updateSelfWorkerStateUploadedMachineUUIDs.clear();
     updateSelfLocalMachineUUID = 0;
+    updateSelfLocalMachineFragment = 0;
     updateSelfLocalBundleRegistered = false;
     updateSelfLocalContainerBootstraps.clear();
     noteMasterAuthorityRuntimeStateChanged();
@@ -30465,8 +30544,12 @@ public:
           // credited only after the corresponding state-upload acknowledgement.
           const bool workerBundleRefresh = workerBundleUpgradeRequiresStateRefresh(machine);
           const bool localBundleRefresh = noteLocalBundleRegistration(machine, installedBundleDigest);
+          if (restorePendingLocalMachineFragment(machine) == false)
+          {
+            break;
+          }
           const bool localBrainRefresh = localBundleRefresh || localNeuronStateRefreshMayBypassIgnition(machine, haveData);
-          needsStateRefresh = needsStateRefresh || workerBundleRefresh;
+          needsStateRefresh = needsStateRefresh || workerBundleRefresh || machineNeedsNeuronStateRefresh(machine);
 
           if (haveData == false || needsStateRefresh) // either 1) first time the neuron is connecting or 2) neuron crashed or 3) neuron was updated or 4) OS updated
           {

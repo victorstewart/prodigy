@@ -9288,6 +9288,11 @@ static void testBootstrapBundleSupersessionReceipt(TestSuite& suite)
   suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID + 1, &failure, &successorBundle) == false &&
                    equalSerializedObjects(beforeMissingCheckpoint, brain.capturePersistentUpdateSelfState()),
                "bootstrap_supersession_rejects_mismatched_local_cluster_before_mutation");
+  brain.updateSelfLocalMachineUUID = local.uuid + 3;
+  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID, &failure, &successorBundle) == false &&
+                   brain.updateSelfLocalMachineUUID == local.uuid + 3,
+               "bootstrap_supersession_rejects_checkpoint_conflicting_with_durable_local_machine");
+  brain.updateSelfLocalMachineUUID = 0;
   brain.authoritativeTopology.machines.front().uuid = local.uuid + 2;
   suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID, &failure, &successorBundle) == false,
                "bootstrap_supersession_rejects_mismatched_nonzero_topology_uuid");
@@ -9296,6 +9301,9 @@ static void testBootstrapBundleSupersessionReceipt(TestSuite& suite)
                "bootstrap_supersession_accepts_zero_topology_uuid_with_exact_local_authority");
   suite.expect(brain.persistCalls == 1 && brain.lastPersistedMasterAuthorityState.updateSelf.workerExpectedBundleSHA256.equals(successorDigest),
                "bootstrap_supersession_persists_successor_before_registration");
+  suite.expect(brain.updateSelfLocalMachineFragment == checkpoint.machineFragment &&
+                   brain.usedMachineFragments.contains(checkpoint.machineFragment),
+               "bootstrap_supersession_reserves_checkpoint_machine_fragment_before_registration");
   NeuronContainerBootstrap restoredLocal = {};
   suite.expect(brain.lastPersistedMasterAuthorityState.updateSelf.localMachineUUID == local.uuid &&
                    brain.lastPersistedMasterAuthorityState.updateSelf.localContainerBootstraps.size() == 1 &&
@@ -9304,6 +9312,36 @@ static void testBootstrapBundleSupersessionReceipt(TestSuite& suite)
                "bootstrap_supersession_persists_exact_live_local_plan_before_registration");
   Machine restoredLocalMachine = {};
   restoredLocalMachine.uuid = local.uuid;
+  restoredLocalMachine.runtimeReady = true;
+  brain.machines.insert(&restoredLocalMachine);
+  brain.assignMachineFragment(&restoredLocalMachine);
+  suite.expect(restoredLocalMachine.fragment == checkpoint.machineFragment &&
+                   brain.usedMachineFragments.contains(checkpoint.machineFragment) &&
+                   restoredLocalMachine.runtimeReady == false,
+               "bootstrap_supersession_direct_assignment_preserves_checkpoint_machine_fragment");
+  restoredLocalMachine.reportedDatacenterFragment = brain.brainConfig.datacenterFragment;
+  restoredLocalMachine.reportedFragment = checkpoint.machineFragment;
+  restoredLocalMachine.runtimeReady = true;
+  suite.expect(brain.restorePendingLocalMachineFragment(&restoredLocalMachine) &&
+                   restoredLocalMachine.reportedDatacenterFragment == brain.brainConfig.datacenterFragment &&
+                   restoredLocalMachine.reportedFragment == checkpoint.machineFragment &&
+                   restoredLocalMachine.runtimeReady,
+               "bootstrap_supersession_preserves_confirmed_local_fragment_on_periodic_refresh");
+  Machine conflictingLocalMachine = {};
+  conflictingLocalMachine.uuid = local.uuid;
+  conflictingLocalMachine.fragment = checkpoint.machineFragment + 1;
+  suite.expect(brain.restorePendingLocalMachineFragment(&conflictingLocalMachine) == false &&
+                   conflictingLocalMachine.fragment == checkpoint.machineFragment + 1,
+               "bootstrap_supersession_rejects_conflicting_local_machine_fragment");
+  restoredLocalMachine.fragment = 0;
+  worker.fragment = checkpoint.machineFragment;
+  Machine collidingLocalMachine = {};
+  collidingLocalMachine.uuid = local.uuid;
+  suite.expect(brain.restorePendingLocalMachineFragment(&collidingLocalMachine) == false &&
+                   collidingLocalMachine.fragment == 0,
+               "bootstrap_supersession_rejects_checkpoint_fragment_owned_by_another_machine");
+  worker.fragment = 0;
+  brain.updateSelfWorkerFailure.clear();
   brain.updateSelfLocalBundleRegistered = true;
   bytell_hash_set<uint128_t> localUUIDs = {};
   localUUIDs.insert(localPlan.uuid);
@@ -9329,8 +9367,16 @@ static void testBootstrapBundleSupersessionReceipt(TestSuite& suite)
                "bootstrap_supersession_requires_real_stage_and_registration_acks");
 
   const uint32_t persistedAfterReplacement = brain.persistCalls;
-  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID, &failure, &successorBundle) && brain.persistCalls == persistedAfterReplacement,
-               "bootstrap_supersession_same_tuple_retry_is_noop");
+  brain.updateSelfLocalMachineUUID = 0;
+  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID, &failure, &successorBundle) == false &&
+                   brain.updateSelfLocalMachineUUID == 0 && brain.persistCalls == persistedAfterReplacement,
+               "bootstrap_supersession_retry_requires_durable_local_identity");
+  brain.updateSelfLocalMachineUUID = local.uuid;
+  brain.updateSelfLocalMachineFragment = 0; // fresh Brain process: receipt must rehydrate it.
+  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID, &failure, &successorBundle) &&
+                   brain.persistCalls == persistedAfterReplacement &&
+                   brain.updateSelfLocalMachineFragment == checkpoint.machineFragment,
+               "bootstrap_supersession_same_tuple_retry_rehydrates_local_fragment_without_reimport");
 
   ProdigyPersistentUpdateSelfState beforeConflict = brain.capturePersistentUpdateSelfState();
   boot.bootstrapBundleSupersession.successorBundleSHA256.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
@@ -9345,6 +9391,7 @@ static void testBootstrapBundleSupersessionReceipt(TestSuite& suite)
   suite.expect(noTargetBrain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID, &failure, &successorBundle) == false &&
                    equalSerializedObjects(noTargetBefore, noTargetBrain.capturePersistentUpdateSelfState()),
                "bootstrap_supersession_rejects_empty_target_without_mutation");
+  brain.machines.erase(&restoredLocalMachine);
   brain.machines.erase(&worker);
   brain.machines.erase(&secondWorker);
 }
