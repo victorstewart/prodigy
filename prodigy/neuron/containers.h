@@ -1052,6 +1052,12 @@ static bool prodigyDeriveContainerHostIDs(const ContainerPlan& plan, uint32_t& u
 class Container : public UnixStream, public WaitableProcess {
 public:
 
+  // SocketBase is virtual through UnixSocket, so Container as the most-derived
+  // owner must initialize the control-stream socket family for reconnect.
+  Container()
+      : SocketBase(AF_UNIX, SOCK_STREAM, 0, false)
+  {}
+
   class StorageLoopDevice {
   public:
 

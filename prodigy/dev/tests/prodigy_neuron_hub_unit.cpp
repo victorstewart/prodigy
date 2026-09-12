@@ -309,6 +309,32 @@ static void testContainerRestartWaitsForControlRetirement(TestSuite& suite)
   ::close(sockets[1]);
 }
 
+static void testContainerUnixSocketRecreate(TestSuite& suite)
+{
+  Container container = {};
+  suite.expect(container.fd == -1,
+               "container_default_does_not_eagerly_allocate_control_socket");
+
+  container.setSocketPath("/tmp/prodigy-neuron-hub-unit.sock");
+  container.recreateSocket();
+  int actualDomain = AF_UNSPEC;
+  int actualType = 0;
+  socklen_t actualDomainLength = sizeof(actualDomain);
+  socklen_t actualTypeLength = sizeof(actualType);
+  const bool validUnixStream = container.fd >= 0 &&
+                               ::getsockopt(container.fd, SOL_SOCKET, SO_DOMAIN, &actualDomain, &actualDomainLength) == 0 &&
+                               actualDomainLength == sizeof(actualDomain) && actualDomain == AF_UNIX &&
+                               ::getsockopt(container.fd, SOL_SOCKET, SO_TYPE, &actualType, &actualTypeLength) == 0 &&
+                               actualTypeLength == sizeof(actualType) && actualType == SOCK_STREAM;
+  suite.expect(validUnixStream,
+               "container_recreate_socket_opens_unix_stream_after_control_close");
+  if (container.fd >= 0)
+  {
+    ::close(container.fd);
+    container.fd = -1;
+  }
+}
+
 static void testRetainedNonChildPidfdExecQuiesce(TestSuite& suite)
 {
   TestNeuronControlRuntime runtime = {};
@@ -506,6 +532,7 @@ static void testRetainedNonChildPidfdLiveness(TestSuite& suite)
 int main(void)
 {
   TestSuite suite = {};
+  testContainerUnixSocketRecreate(suite);
   testRetainedNonChildPidfdLiveness(suite);
 
   ScopedRing ring = {};
