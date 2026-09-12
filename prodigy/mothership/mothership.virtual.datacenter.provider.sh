@@ -507,7 +507,17 @@ probe_datacenter()
       [[ -n "$4" ]] || exit 0
       response=""
       IFS= read -r response <&3
-      [[ "${response}" == "$4" ]]
+      if [[ "$4" == contains:* ]]
+      then
+         required="${4#contains:}"
+         IFS="|" read -r -a tokens <<< "${required}"
+         for token in "${tokens[@]}"
+         do
+            [[ -n "${token}" && "${response}" == *"${token}"* ]] || exit 1
+         done
+      else
+         [[ "${response}" == "$4" ]]
+      fi
    ' _ "${address}" "${port}" "${payload}" "${expected}"
 }
 
