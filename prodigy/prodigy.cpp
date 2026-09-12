@@ -1189,7 +1189,9 @@ public:
 
   bool quiesceProcessForBundleExec(void) override
   {
-    return hostControlNetwork.shutdown();
+    const bool retainedPidfdsQuiesced = ContainerManager::quiesceRetainedNonChildPidfdPollsForBundleExec();
+    const bool hostControlQuiesced = hostControlNetwork.shutdown();
+    return retainedPidfdsQuiesced && hostControlQuiesced;
   }
 
   bool localNeuronStateRefreshMayBypassIgnition(const Machine *machine, bool haveData) const override
@@ -1330,7 +1332,9 @@ public:
 
   bool quiesceProcessForBundleExec(void) override
   {
-    return hostControlNetwork.shutdown();
+    const bool retainedPidfdsQuiesced = ContainerManager::quiesceRetainedNonChildPidfdPollsForBundleExec();
+    const bool hostControlQuiesced = hostControlNetwork.shutdown();
+    return retainedPidfdsQuiesced && hostControlQuiesced;
   }
 
   bool startOperatingSystemUpdate(const String& targetOSID, const String& targetOSVersionID, const String& updateCommand, String *failure = nullptr) override

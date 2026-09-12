@@ -1092,6 +1092,7 @@ public:
   bool waitidPending = false;
   bool nonChildPidfdLiveness = false;
   Ring::RawPollTicket nonChildPidfdTicket = Ring::invalidRawPollTicket;
+  bool nonChildPidfdCancellationRequested = false;
   bool pidfdExitStatusUnknown = false;
   bool retainedPidfdWaitabilityFailed = false;
   bool destroyCloseCompleted = false;
@@ -11012,6 +11013,45 @@ public:
     queueQuarantinedContainerNetworkRetry();
   }
 
+  // A process retained across replacement of its Neuron is not its child.
+  // Cancel its pidfd poll before this Neuron itself execs, then let the
+  // original terminal CQE release the old poll ownership. The replacement
+  // Neuron will reopen and re-arm the pidfd after stateUpload.
+  static bool quiesceRetainedNonChildPidfdPollsForBundleExec(void)
+  {
+    if (thisNeuron == nullptr)
+    {
+      return true;
+    }
+
+    bool drained = true;
+    for (const auto& [uuid, container] : thisNeuron->containers)
+    {
+      (void)uuid;
+      if (container == nullptr || container->nonChildPidfdLiveness == false ||
+          container->nonChildPidfdTicket == Ring::invalidRawPollTicket)
+      {
+        continue;
+      }
+
+      drained = false;
+      if (container->nonChildPidfdCancellationRequested)
+      {
+        continue;
+      }
+
+      container->nonChildPidfdCancellationRequested = true;
+      if (Ring::cancelRawFDPoll(container->nonChildPidfdTicket) == false)
+      {
+        basics_log("bundle exec retained pidfd poll cancellation pending uuid=%llu pid=%d ticket=%llu\n",
+                   (unsigned long long)container->plan.uuid,
+                   int(container->pid),
+                   (unsigned long long)container->nonChildPidfdTicket);
+      }
+    }
+    return drained;
+  }
+
   static void queueContainerWaitid(Container *container)
   {
     container->waitidPending = true;
@@ -11029,6 +11069,7 @@ public:
     {
       if (container->nonChildPidfdLiveness)
       {
+        container->nonChildPidfdCancellationRequested = false;
         container->nonChildPidfdTicket = Ring::queueRawFDPoll(container, uint64_t(container->pid), container->pidfd, POLLIN);
         if (container->nonChildPidfdTicket == Ring::invalidRawPollTicket)
         {
@@ -11064,6 +11105,7 @@ public:
     }
 
     container->nonChildPidfdTicket = Ring::invalidRawPollTicket;
+    container->nonChildPidfdCancellationRequested = false;
     if (result == -ECANCELED)
     {
       container->nonChildPidfdLiveness = false;

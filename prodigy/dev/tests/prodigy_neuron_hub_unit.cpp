@@ -46,6 +46,15 @@ public:
 class TestNeuronControlRuntime final : public Neuron {
 public:
 
+  uint32_t rawPollCompletions = 0;
+
+  void rawFDPollHandler(void *owner, uint64_t generation, uint64_t ticket, int result) override
+  {
+    Neuron::rawFDPollHandler(owner, generation, ticket, result);
+    rawPollCompletions += 1;
+    Ring::exit = true;
+  }
+
   void pushContainer(Container *container) override
   {
     (void)container;
@@ -300,6 +309,92 @@ static void testContainerRestartWaitsForControlRetirement(TestSuite& suite)
   ::close(sockets[1]);
 }
 
+static void testRetainedNonChildPidfdExecQuiesce(TestSuite& suite)
+{
+  TestNeuronControlRuntime runtime = {};
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &runtime;
+
+  Container retained = {};
+  retained.plan.uuid = 991;
+  int retainedPidfd[2] = {-1, -1};
+  suite.expect(::pipe2(retainedPidfd, O_CLOEXEC) == 0,
+               "retained_pidfd_exec_quiesce_creates_liveness_pipe");
+  if (retainedPidfd[0] < 0)
+  {
+    thisNeuron = previousNeuron;
+    return;
+  }
+
+  retained.pid = 9911;
+  retained.pidfd = retainedPidfd[0];
+  retained.waitidPending = true;
+  retained.nonChildPidfdLiveness = true;
+  runtime.containers.insert_or_assign(retained.plan.uuid, &retained);
+
+  RingInterface *previousInterfacer = Ring::interfacer;
+  Ring::interfacer = &runtime;
+  retained.nonChildPidfdTicket = Ring::queueRawFDPoll(
+      &retained, uint64_t(retained.pid), retained.pidfd, POLLIN);
+  suite.expect(retained.nonChildPidfdTicket != Ring::invalidRawPollTicket,
+               "retained_pidfd_exec_quiesce_arms_real_raw_poll");
+  const Ring::RawPollTicket firstTicket = retained.nonChildPidfdTicket;
+  if (retained.nonChildPidfdTicket == Ring::invalidRawPollTicket)
+  {
+    Ring::interfacer = previousInterfacer;
+    runtime.containers.erase(retained.plan.uuid);
+    ::close(retainedPidfd[0]);
+    ::close(retainedPidfd[1]);
+    thisNeuron = previousNeuron;
+    return;
+  }
+
+  Container directChild = {};
+  directChild.plan.uuid = 992;
+  directChild.pid = 9912;
+  directChild.waitidPending = true;
+  directChild.nonChildPidfdLiveness = false;
+  directChild.nonChildPidfdTicket = Ring::invalidRawPollTicket;
+  runtime.containers.insert_or_assign(directChild.plan.uuid, &directChild);
+
+  suite.expect(ContainerManager::quiesceRetainedNonChildPidfdPollsForBundleExec() == false,
+               "retained_pidfd_exec_quiesce_waits_for_terminal_cqe");
+  suite.expect(retained.nonChildPidfdCancellationRequested && retained.nonChildPidfdTicket == firstTicket &&
+                   runtime.containers.find(retained.plan.uuid) != runtime.containers.end(),
+               "retained_pidfd_exec_quiesce_preserves_live_container_owner");
+  suite.expect(directChild.waitidPending && directChild.nonChildPidfdTicket == Ring::invalidRawPollTicket,
+               "retained_pidfd_exec_quiesce_leaves_direct_child_waitid_untouched");
+
+  Ring::exit = false;
+  Ring::start();
+  Ring::exit = false;
+  suite.expect(runtime.rawPollCompletions == 1,
+               "retained_pidfd_exec_quiesce_dispatches_real_cancel_terminal_cqe");
+  suite.expect(retained.nonChildPidfdLiveness == false && retained.waitidPending == false &&
+                   retained.pid == 9911 && runtime.containers.find(retained.plan.uuid) != runtime.containers.end(),
+               "retained_pidfd_exec_quiesce_cancel_preserves_live_process_plan_and_owner");
+  suite.expect(ContainerManager::quiesceRetainedNonChildPidfdPollsForBundleExec(),
+               "retained_pidfd_exec_quiesce_completes_after_terminal_cqe");
+
+  retained.nonChildPidfdLiveness = true;
+  retained.waitidPending = true;
+  retained.nonChildPidfdTicket = 92;
+  retained.nonChildPidfdCancellationRequested = false;
+  suite.expect(ContainerManager::quiesceRetainedNonChildPidfdPollsForBundleExec() == false &&
+                   retained.nonChildPidfdCancellationRequested,
+               "retained_pidfd_exec_quiesce_fences_ticket_rearmed_during_retry");
+  suite.expect(ContainerManager::completeNonChildPidfdPoll(&retained, uint64_t(retained.pid), firstTicket, -ECANCELED) == false &&
+                   retained.nonChildPidfdTicket == 92 && retained.nonChildPidfdLiveness,
+               "retained_pidfd_exec_quiesce_ignores_stale_cancel_completion_after_rearm");
+  (void)ContainerManager::completeNonChildPidfdPoll(&retained, uint64_t(retained.pid), 92, -ECANCELED);
+
+  runtime.containers.erase(retained.plan.uuid);
+  runtime.containers.erase(directChild.plan.uuid);
+  Ring::interfacer = previousInterfacer;
+  ::close(retainedPidfd[1]);
+  thisNeuron = previousNeuron;
+}
+
 static void testRetainedNonChildPidfdLiveness(TestSuite& suite)
 {
   int childPIDPipe[2] = {-1, -1};
@@ -414,6 +509,7 @@ int main(void)
   testRetainedNonChildPidfdLiveness(suite);
 
   ScopedRing ring = {};
+  testRetainedNonChildPidfdExecQuiesce(suite);
   testNeuronHubCanQueueToNeuron(suite);
   testNeuronHubFlushesBufferedFramesWhenNeuronBecomesSendable(suite);
   testNeuronHubRetainsBuffersUntilCloseRetirement(suite);
