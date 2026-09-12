@@ -20228,6 +20228,13 @@ public:
 
   void dispatchTimeout(TimeoutPacket *packet) override
   {
+    if (packet == &bundleExecRetryTick)
+    {
+      bundleExecRetryTickQueued = false;
+      transitionToNewBundle();
+      return;
+    }
+
     switch (BrainTimeoutFlags(packet->flags))
     {
       case BrainTimeoutFlags::canceled:
@@ -20799,8 +20806,7 @@ public:
     }
     if (packet == &bundleExecRetryTick)
     {
-      bundleExecRetryTickQueued = false;
-      transitionToNewBundle();
+      dispatchTimeout(packet);
       return;
     }
     if (packet != nullptr && packet->dispatcher)
@@ -22831,6 +22837,7 @@ public:
     }
     bundleExecRetryTick.clear();
     bundleExecRetryTick.originator = this;
+    bundleExecRetryTick.dispatcher = this;
     bundleExecRetryTick.setTimeoutMs(10);
     Ring::queueTimeout(&bundleExecRetryTick);
     bundleExecRetryTickQueued = true;

@@ -338,10 +338,15 @@ public:
 class CountingTimeoutDispatcher final : public TimeoutDispatcher {
 public:
   uint32_t calls = 0;
+  bool stopRing = false;
 
   void dispatchTimeout(TimeoutPacket *) override
   {
     calls += 1;
+    if (stopRing)
+    {
+      Ring::exit = true;
+    }
   }
 };
 
@@ -1870,6 +1875,29 @@ public:
     }
   }
 };
+
+static void testBrainBundleExecRetryRoutesThroughDispatcher(TestSuite& suite)
+{
+  TestBrain brain = {};
+  CountingTimeoutDispatcher watchdogDispatcher = {};
+  watchdogDispatcher.stopRing = true;
+  TimeoutPacket watchdog = {};
+  watchdog.dispatcher = &watchdogDispatcher;
+  watchdog.setTimeoutMs(50);
+
+  // Destroy the Ring before these packets and their dispatch targets.
+  ScopedFreshRing scopedRing = {};
+
+  brain.queueBundleExecRetry();
+  Ring::queueTimeout(&watchdog);
+  Ring::exit = false;
+  Ring::start();
+  Ring::exit = false;
+
+  suite.expect(brain.transitionToNewBundleCalls == 1 &&
+                   brain.bundleExecRetryTickQueued == false,
+               "brain_bundle_exec_retry_routes_ring_timeout_to_brain_dispatcher");
+}
 
 class ScopedSocketPair final {
 public:
@@ -22065,6 +22093,12 @@ int main(void)
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "brain-bundle-exec-retry") == 0)
+  {
+    testBrainBundleExecRetryRoutesThroughDispatcher(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "neuron-whitehole-peer-initialization") == 0)
   {
     testNeuronWhiteholeBindingBookkeepingWithoutPrograms(suite);
@@ -22226,6 +22260,7 @@ int main(void)
   testSwitchboardWormholeFleetAcknowledgementTransaction(suite);
   testApplyReplicatedDeploymentPlanLiveStateUpdatesTrackedContainers(suite);
   testApplyReplicatedDeploymentPlanCleansTlsResumptionState(suite);
+  testBrainBundleExecRetryRoutesThroughDispatcher(suite);
   testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(suite);
   testUpdateSelfPeerRegistrationCreditsBootNsChange(suite);
   testUpdateSelfPeerRegistrationCreditsReconnectWithoutBootNsChange(suite);
