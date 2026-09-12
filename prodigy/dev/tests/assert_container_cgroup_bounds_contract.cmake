@@ -45,12 +45,20 @@ foreach(REQUIRED IN ITEMS
    [[printf -- '-%s\n' "${controller}" > "${machine_cgroup}/cgroup.subtree_control"]])
    string(FIND "${VIRTUAL_DATACENTER_PROVIDER}" "${REQUIRED}" POSITION)
    if(POSITION EQUAL -1)
-      message(FATAL_ERROR "fake-machine restart must fully reset its cgroup: missing ${REQUIRED}")
+      message(FATAL_ERROR "empty fake-machine restart must fully reset its cgroup: missing ${REQUIRED}")
    endif()
 endforeach()
 
-string(FIND "${VIRTUAL_DATACENTER_PROVIDER}" [[         reset_machine_cgroup "${index}"]] RESET_POSITION)
-string(FIND "${VIRTUAL_DATACENTER_PROVIDER}" [[         start_machine "${index}"]] RESTART_POSITION REVERSE)
-if(RESET_POSITION EQUAL -1 OR RESTART_POSITION EQUAL -1 OR RESET_POSITION GREATER RESTART_POSITION)
-   message(FATAL_ERROR "fake-machine restart must reset its cgroup before starting the replacement process")
+string(FIND "${VIRTUAL_DATACENTER_PROVIDER}" [[   reset_machine_cgroup "${index}"
+   start_machine "${index}"
+   publish_runtime]] RESET_THEN_START_POSITION)
+if(RESET_THEN_START_POSITION EQUAL -1)
+   message(FATAL_ERROR "established-empty fake-machine restart must reset its cgroup before starting the replacement process")
+endif()
+
+string(FIND "${VIRTUAL_DATACENTER_PROVIDER}" [[machine_application_container_state()]] MACHINE_CGROUP_POLICY)
+string(FIND "${VIRTUAL_DATACENTER_PROVIDER}" [[handle_machine_exit()]] EXIT_POLICY_OWNER)
+string(FIND "${VIRTUAL_DATACENTER_PROVIDER}" [[MOTHERSHIP_RUNTIME_EXIT_HOLD]] LIVE_CONTAINER_HOLD)
+if(MACHINE_CGROUP_POLICY EQUAL -1 OR EXIT_POLICY_OWNER EQUAL -1 OR LIVE_CONTAINER_HOLD EQUAL -1)
+   message(FATAL_ERROR "unexpected runtime exit must retain a fail-closed application-cgroup policy owner")
 endif()

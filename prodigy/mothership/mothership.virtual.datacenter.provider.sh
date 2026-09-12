@@ -436,19 +436,26 @@ fault_datacenter()
       return 0
    fi
 
-   local marker=""
+   local marker="" fault_pid=""
    for index in "${parsed[@]}"
    do
       marker="${workspace}/fault-machine-${index}"
-      : > "${marker}"
-      kill -KILL -- "-${machine_pids[$((index - 1))]}" >/dev/null 2>&1 || true
-      kill -KILL "${machine_pids[$((index - 1))]}" >/dev/null 2>&1 || true
+      fault_pid="${machine_pids[$((index - 1))]}"
+      [[ "${fault_pid}" =~ ^[0-9]+$ ]] || return 1
+      # Bind a timed whole-machine fault to the exact runtime it killed. The
+      # atomic marker becomes the reset ticket only after the requested delay.
+      printf '%s\n' "${fault_pid}" > "${marker}.$$.tmp"
+      mv -f "${marker}.$$.tmp" "${marker}"
+      kill -KILL -- "-${fault_pid}" >/dev/null 2>&1 || true
+      kill -KILL "${fault_pid}" >/dev/null 2>&1 || true
    done
    [[ "${duration_ms}" -ne 0 ]] || return 0
    sleep_milliseconds "${duration_ms}"
    for index in "${parsed[@]}"
    do
-      rm -f "${workspace}/fault-machine-${index}"
+      # Preserve the explicit whole-machine-fault authorization until the
+      # supervisor resets the dead machine cgroup and starts its replacement.
+      mv -f "${workspace}/fault-machine-${index}" "${workspace}/fault-machine-reset-${index}"
    done
 
    local ready=0
@@ -743,6 +750,7 @@ host_edge="vdh${runtime_identity: -8}"
 parent_edge="vdp${runtime_identity: -8}"
 child_names=()
 machine_pids=()
+machine_exit_held=()
 storage_mounts=()
 host_ipv4_forward=""
 host_ipv6_forward=""
@@ -1071,6 +1079,99 @@ reset_machine_cgroup()
    return 1
 }
 
+# A replacement runtime can only re-adopt live application processes through
+# the authenticated recovery handoff. An ordinary fresh runtime has neither
+# that checkpoint nor the retained container control context.
+# Returns 0 for retained processes, 1 only for a populated=0 cgroup, and 2
+# when the kernel's authoritative cgroup event state cannot be read safely.
+machine_application_container_state()
+{
+   local index="$1"
+   local events_path="${cgroup_root}/machine${index}/cgroup.events"
+   local key="" value="" extra="" populated=""
+   [[ "${index}" =~ ^[0-9]+$ && "${index}" -ge 1 && "${index}" -le "${machine_count}" ]] || return 2
+   [[ -r "${events_path}" ]] || return 2
+   while read -r key value extra
+   do
+      [[ "${key}" == "populated" ]] || continue
+      [[ -z "${populated}" && "${value}" =~ ^[01]$ && -z "${extra}" ]] || return 2
+      populated="${value}"
+   done < "${events_path}"
+   [[ -n "${populated}" ]] || return 2
+   if [[ "${populated}" == "1" ]]
+   then
+      return 0
+   fi
+   return 1
+}
+
+machine_exit_is_held()
+{
+   local index="$1"
+   [[ "${machine_exit_held[$((index - 1))]:-0}" -ne 0 &&
+      ! -e "${workspace}/fault-machine-${index}" &&
+      ! -e "${workspace}/fault-machine-reset-${index}" ]]
+}
+
+hold_unexpected_runtime_exit()
+{
+   local index="$1"
+   local machine_pid="$2"
+   local reason="$3"
+   machine_exit_held[$((index - 1))]=1
+   printf 'MOTHERSHIP_RUNTIME_EXIT_HOLD epoch=%(%s)T machine=%s pid=%s reason=%s\n' \
+      -1 "${index}" "${machine_pid}" "${reason}" >>"${workspace}/machine-exits.log" || true
+}
+
+handle_machine_exit()
+{
+   local index="$1"
+   local machine_pid="$2"
+   local application_state=0
+   local reset_marker="${workspace}/fault-machine-reset-${index}"
+   local reset_pid="" reset_extra=""
+   # A current marker keeps the explicit fault in progress. A reset marker is
+   # durable authorization to finish its deliberate whole-machine teardown.
+   [[ -e "${workspace}/fault-machine-${index}" ]] && return 0
+   if [[ -e "${reset_marker}" ]]
+   then
+      if read -r reset_pid reset_extra < "${reset_marker}" &&
+         [[ "${reset_pid}" =~ ^[0-9]+$ && -z "${reset_extra}" && "${reset_pid}" == "${machine_pid}" ]]
+      then
+         reset_machine_cgroup "${index}"
+         start_machine "${index}"
+         publish_runtime
+         rm -f "${reset_marker}"
+         machine_exit_held[$((index - 1))]=0
+         return 0
+      fi
+      # A delayed fault may outlive the failed runtime it targeted. It cannot
+      # authorize tearing down a later runtime or its retained applications.
+      printf 'MOTHERSHIP_RUNTIME_FAULT_RESET_STALE epoch=%(%s)T machine=%s observedPid=%s ticketPid=%s\n' \
+         -1 "${index}" "${machine_pid}" "${reset_pid}" >>"${workspace}/machine-exits.log" || true
+      rm -f "${reset_marker}"
+   fi
+   if machine_application_container_state "${index}"
+   then
+      application_state=0
+   else
+      application_state=$?
+   fi
+   if [[ "${application_state}" -eq 0 ]]
+   then
+      hold_unexpected_runtime_exit "${index}" "${machine_pid}" "retained-machine-cgroup-populated"
+      return 0
+   fi
+   if [[ "${application_state}" -ne 1 ]]
+   then
+      hold_unexpected_runtime_exit "${index}" "${machine_pid}" "machine-cgroup-state-unavailable"
+      return 0
+   fi
+   reset_machine_cgroup "${index}"
+   start_machine "${index}"
+   publish_runtime
+}
+
 if [[ "${adopted_mode}" -eq 0 ]]
 then
    for index in $(seq 1 "${machine_count}")
@@ -1233,6 +1334,7 @@ do
       fi
       if ! kill -0 "${machine_pid}" >/dev/null 2>&1
       then
+         machine_exit_is_held "${index}" && continue
          machine_wait_status=0
          wait "${machine_pid}" >/dev/null 2>&1 || machine_wait_status=$?
          # Retain the supervisor observation before resetting the machine cgroup.
@@ -1240,13 +1342,7 @@ do
          # claim about that process's exit code.
          printf 'MOTHERSHIP_RUNTIME_EXIT epoch=%(%s)T machine=%s pid=%s waitStatus=%s\n' \
             -1 "${index}" "${machine_pid}" "${machine_wait_status}" >>"${workspace}/machine-exits.log" || true
-         if [[ -e "${workspace}/fault-machine-${index}" ]]
-         then
-            continue
-         fi
-         reset_machine_cgroup "${index}"
-         start_machine "${index}"
-         publish_runtime
+         handle_machine_exit "${index}" "${machine_pid}"
       fi
    done
    sleep 0.1

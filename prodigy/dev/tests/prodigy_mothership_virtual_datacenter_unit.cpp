@@ -5,6 +5,7 @@
 #include <services/debug.h>
 
 #include <cstdlib>
+#include <filesystem>
 #include <cstring>
 #include <string>
 
@@ -105,6 +106,172 @@ publish_runtime
   ::rmdir(temporary);
 }
 
+static void testUnexpectedRuntimeExitPreservesLiveApplicationCgroup(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  suite.expect(root != std::string::npos, "runtime_exit_guard_locates_provider_owner");
+  if (root == std::string::npos) return;
+  sourcePath.resize(root);
+  sourcePath += "/mothership/mothership.virtual.datacenter.provider.sh";
+  String source = {};
+  if (mothershipVDCRead(String(sourcePath.c_str()), source, 1024 * 1024) == false)
+  { suite.expect(false, "runtime_exit_guard_reads_provider_owner"); return; }
+  std::string text(reinterpret_cast<const char *>(source.data()), source.size());
+  size_t begin = text.find("machine_application_container_state()\n{\n");
+  size_t end = text.find("\nif [[ \"${adopted_mode}\" -eq 0 ]]", begin);
+  if (begin == std::string::npos || end == std::string::npos)
+  { suite.expect(false, "runtime_exit_guard_extracts_provider_owner"); return; }
+  // Execute the real post-exit policy against plain fixture cgroup files and
+  // lifecycle mocks. No cgroup mount, process signal, namespace, or provider
+  // lifecycle operation occurs in this unit.
+  std::string script = "set -euo pipefail\n" + text.substr(begin, end - begin) + R"TEST(
+cgroup_root="$PWD/cgroups"
+workspace="$PWD/workspace"
+machine_count=1
+machine_exit_held=()
+mkdir -p "$cgroup_root/machine1" "$workspace"
+printf 'populated 0\nfrozen 0\n' > "$cgroup_root/machine1/cgroup.events"
+calls=()
+reset_machine_cgroup() { calls+=(reset); }
+start_machine() { calls+=(start); }
+publish_runtime() { calls+=(publish); }
+# An authoritative populated=0 cgroup restarts.
+handle_machine_exit 1 777
+[[ "${calls[*]}" == "reset start publish" ]]
+[[ ! -e "$workspace/machine-exits.log" ]]
+# A retained process holds without reset or replacement.
+calls=()
+printf 'populated 1\nfrozen 0\n' > "$cgroup_root/machine1/cgroup.events"
+handle_machine_exit 1 777
+[[ "${#calls[@]}" == 0 && "${machine_exit_held[0]}" == 1 ]]
+machine_exit_is_held 1
+grep -qx '.*reason=retained-machine-cgroup-populated' "$workspace/machine-exits.log"
+# A deliberate fault remains authorized after its marker is removed, even
+# when it follows an ordinary hold and descendants remain populated.
+printf '777\n' > "$workspace/fault-machine-1"
+! machine_exit_is_held 1
+handle_machine_exit 1 777
+[[ "${#calls[@]}" == 0 && "${machine_exit_held[0]}" == 1 ]]
+mv "$workspace/fault-machine-1" "$workspace/fault-machine-reset-1"
+! machine_exit_is_held 1
+handle_machine_exit 1 777
+[[ "${calls[*]}" == "reset start publish" && "${machine_exit_held[0]}" == 0 ]]
+[[ ! -e "$workspace/fault-machine-reset-1" ]]
+# Missing or malformed authoritative state is not evidence of emptiness.
+machine_exit_held=()
+calls=()
+rm -f "$cgroup_root/machine1/cgroup.events"
+handle_machine_exit 1 777
+[[ "${#calls[@]}" == 0 && "${machine_exit_held[0]}" == 1 ]]
+grep -qx '.*reason=machine-cgroup-state-unavailable' "$workspace/machine-exits.log"
+# A stale fault ticket cannot destroy applications owned by a later runtime.
+machine_exit_held=()
+calls=()
+printf 'populated 1\nfrozen 0\n' > "$cgroup_root/machine1/cgroup.events"
+printf '999\n' > "$workspace/fault-machine-reset-1"
+handle_machine_exit 1 777
+[[ "${#calls[@]}" == 0 && "${machine_exit_held[0]}" == 1 ]]
+[[ ! -e "$workspace/fault-machine-reset-1" ]]
+grep -qx '.*ticketPid=999' "$workspace/machine-exits.log"
+# A malformed populated record also holds.
+machine_exit_held=()
+calls=()
+printf 'populated invalid\nfrozen 0\n' > "$cgroup_root/machine1/cgroup.events"
+handle_machine_exit 1 777
+[[ "${#calls[@]}" == 0 && "${machine_exit_held[0]}" == 1 ]]
+grep -qx '.*reason=machine-cgroup-state-unavailable' "$workspace/machine-exits.log"
+)TEST";
+  char temporary[] = "./vdc-runtime-exit-guard-unit.XXXXXX";
+  if (::mkdtemp(temporary) == nullptr)
+  { suite.expect(false, "runtime_exit_guard_creates_owned_directory"); return; }
+  String scriptPath = {};
+  mothershipVirtualDatacenterPath(String(temporary), "probe.sh", scriptPath);
+  String failure = {};
+  bool written = mothershipVirtualDatacenterWriteFile(scriptPath, String(script.c_str()), 0600, &failure);
+  pid_t child = written ? ::fork() : -1;
+  if (child == 0)
+  {
+    if (::chdir(temporary) != 0) _exit(125);
+    ::execl("/bin/bash", "bash", "probe.sh", static_cast<char *>(nullptr));
+    _exit(127);
+  }
+  int status = 0;
+  pid_t waited = -1;
+  if (child > 0) do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  suite.expect(written && waited == child && child > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+               "runtime_exit_policy_holds_live_or_indeterminate_cgroups_and_restarts_only_empty_machine");
+  std::error_code error;
+  std::filesystem::remove_all(temporary, error);
+}
+
+static void testFaultDatacenterBindsResetTicketToKilledPID(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  suite.expect(root != std::string::npos, "fault_ticket_fixture_locates_provider_owner");
+  if (root == std::string::npos) return;
+  sourcePath.resize(root);
+  sourcePath += "/mothership/mothership.virtual.datacenter.provider.sh";
+  String source = {};
+  if (mothershipVDCRead(String(sourcePath.c_str()), source, 1024 * 1024) == false)
+  { suite.expect(false, "fault_ticket_fixture_reads_provider_owner"); return; }
+  std::string text(reinterpret_cast<const char *>(source.data()), source.size());
+  size_t begin = text.find("fault_datacenter()\n{\n");
+  size_t end = text.find("\nprobe_datacenter()\n", begin);
+  if (begin == std::string::npos || end == std::string::npos)
+  { suite.expect(false, "fault_ticket_fixture_extracts_provider_owner"); return; }
+  // Execute the real fault issuer with process, network, and delay operations
+  // mocked. This verifies its ticket is atomically derived before the kill.
+  std::string script = "set -euo pipefail\n" + text.substr(begin, end - begin) + R"TEST(
+workspace="$PWD/workspace"
+mkdir -p "$workspace"
+printf '44\n' > "$workspace/virtual-datacenter.pid"
+printf '777\n' > "$workspace/virtual-datacenter.runtime"
+valid_workspace() { [[ "$1" == "$workspace" ]]; }
+provider_process() { [[ "$1" == 44 && "$2" == "$workspace" ]]; }
+runtime_identity_for_workspace() { printf '44\n'; }
+validate_machine_indices() { [[ "$1" == 1 && "$2" == 1 ]]; }
+command() { return 0; }
+kill() {
+  if [[ "$1" == -0 && "$2" == 888 && "$#" == 2 ]]; then return 0; fi
+  if [[ "$1" == -KILL && "$2" == -- && "$3" == -777 && "$#" == 3 ]]; then
+    printf '%s\n' "$*" >> "$workspace/kills"; return 0
+  fi
+  if [[ "$1" == -KILL && "$2" == 777 && "$#" == 2 ]]; then
+    printf '%s\n' "$*" >> "$workspace/kills"; return 0
+  fi
+  return 1
+}
+sleep_milliseconds() { printf '888\n' > "$workspace/virtual-datacenter.runtime"; }
+fault_datacenter "$workspace" crash 1 1 0 0 0
+[[ "$(<"$workspace/kills")" == $'-KILL -- -777\n-KILL 777' ]]
+[[ "$(<"$workspace/fault-machine-reset-1")" == 777 ]]
+[[ ! -e "$workspace/fault-machine-1" ]]
+)TEST";
+  char temporary[] = "./vdc-fault-ticket-unit.XXXXXX";
+  if (::mkdtemp(temporary) == nullptr)
+  { suite.expect(false, "fault_ticket_fixture_creates_owned_directory"); return; }
+  String scriptPath = {};
+  mothershipVirtualDatacenterPath(String(temporary), "probe.sh", scriptPath);
+  String failure = {};
+  bool written = mothershipVirtualDatacenterWriteFile(scriptPath, String(script.c_str()), 0600, &failure);
+  pid_t child = written ? ::fork() : -1;
+  if (child == 0)
+  {
+    if (::chdir(temporary) != 0) _exit(125);
+    ::execl("/bin/bash", "bash", "probe.sh", static_cast<char *>(nullptr));
+    _exit(127);
+  }
+  int status = 0;
+  pid_t waited = -1;
+  if (child > 0) do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  suite.expect(written && waited == child && child > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+               "fault_issuer_binds_post_duration_reset_ticket_to_exact_killed_runtime_pid");
+  std::error_code error;
+  std::filesystem::remove_all(temporary, error);
+}
+
 static void testFaultLinkRebindsPublishedProvider(TestSuite& suite)
 {
   std::string sourcePath = __FILE__;
@@ -180,6 +347,8 @@ int main(void)
 {
   TestSuite suite;
   testPublicationPreservesSelectedMachine(suite);
+  testUnexpectedRuntimeExitPreservesLiveApplicationCgroup(suite);
+  testFaultDatacenterBindsResetTicketToKilledPID(suite);
   testFaultLinkRebindsPublishedProvider(suite);
 
   suite.expect(mothershipTestClusterWorkspaceRootValid("/tmp/vdc"_ctv), "workspace_accepts_nested_absolute_path");
