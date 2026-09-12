@@ -1233,7 +1233,13 @@ do
       fi
       if ! kill -0 "${machine_pid}" >/dev/null 2>&1
       then
-         wait "${machine_pid}" >/dev/null 2>&1 || true
+         machine_wait_status=0
+         wait "${machine_pid}" >/dev/null 2>&1 || machine_wait_status=$?
+         # Retain the supervisor observation before resetting the machine cgroup.
+         # An adopted non-child can return 127; this is a wait status, not a
+         # claim about that process's exit code.
+         printf 'MOTHERSHIP_RUNTIME_EXIT epoch=%(%s)T machine=%s pid=%s waitStatus=%s\n' \
+            -1 "${index}" "${machine_pid}" "${machine_wait_status}" >>"${workspace}/machine-exits.log" || true
          if [[ -e "${workspace}/fault-machine-${index}" ]]
          then
             continue
