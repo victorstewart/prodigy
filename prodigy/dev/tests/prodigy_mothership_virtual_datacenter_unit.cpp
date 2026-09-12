@@ -105,10 +105,83 @@ publish_runtime
   ::rmdir(temporary);
 }
 
+static void testFaultLinkRebindsPublishedProvider(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  suite.expect(root != std::string::npos, "fault_fixture_locates_provider_owner");
+  if (root == std::string::npos) return;
+  sourcePath.resize(root);
+  sourcePath += "/mothership/mothership.virtual.datacenter.provider.sh";
+  String source = {};
+  if (mothershipVDCRead(String(sourcePath.c_str()), source, 1024 * 1024) == false)
+  { suite.expect(false, "fault_fixture_reads_provider_owner"); return; }
+  std::string text(reinterpret_cast<const char *>(source.data()), source.size());
+  size_t begin = text.find("fault_link_set()\n{\n");
+  size_t end = text.find("\nprobe_datacenter()\n", begin);
+  if (begin == std::string::npos || end == std::string::npos)
+  { suite.expect(false, "fault_fixture_extracts_link_owner"); return; }
+  // This executes only fault link bookkeeping with shell mocks. It models a
+  // committed adopter publishing PID 900 during a link fault while the
+  // retained resource identity stays 700. No namespace is entered.
+  std::string script = "set -euo pipefail\n" + text.substr(begin, end - begin) + R"TEST(
+workspace="$PWD/workspace"
+mkdir -p "$workspace"
+printf '700\n' > "$workspace/virtual-datacenter.pid"
+printf '700\n' > "$workspace/virtual-datacenter.identity"
+printf '101\n' > "$workspace/virtual-datacenter.runtime"
+valid_workspace() { [[ "$1" == "$workspace" ]]; }
+validate_machine_indices() { [[ "$1" == 1 && "$2" == 1 ]]; }
+provider_process() { [[ "$#" -eq 2 && "$2" == "$workspace" && ( "$1" == 700 || "$1" == 900 ) ]]; }
+runtime_identity_for_workspace() { [[ "$1" == "$workspace" && ( "$2" == 700 || "$2" == 900 ) ]]; printf '700\n'; }
+sleep_milliseconds() { :; }
+nsenter() {
+  case "$*" in
+    '-t 700 -m -- ip netns exec pvd-p-700 ip link set vp1 down')
+      printf '700 down\n' >> "$workspace/transitions"
+      printf '900\n' > "$workspace/virtual-datacenter.pid"
+      ;;
+    '-t 900 -m -- ip netns exec pvd-p-700 ip link set vp1 up')
+      printf '900 up\n' >> "$workspace/transitions"
+      ;;
+    *) return 1 ;;
+  esac
+}
+fault_datacenter "$workspace" link 1 1 0 0 0
+[[ "$(<"$workspace/transitions")" == $'700 down\n900 up' ]]
+)TEST";
+  char temporary[] = "./vdc-fault-link-unit.XXXXXX";
+  if (::mkdtemp(temporary) == nullptr)
+  { suite.expect(false, "fault_fixture_creates_owned_directory"); return; }
+  String scriptPath = {};
+  mothershipVirtualDatacenterPath(String(temporary), "probe.sh", scriptPath);
+  String failure = {};
+  bool written = mothershipVirtualDatacenterWriteFile(scriptPath, String(script.c_str()), 0600, &failure);
+  pid_t child = written ? ::fork() : -1;
+  if (child == 0)
+  {
+    if (::chdir(temporary) != 0) _exit(125);
+    ::execl("/bin/bash", "bash", "probe.sh", static_cast<char *>(nullptr));
+    _exit(127);
+  }
+  int status = 0;
+  pid_t waited = -1;
+  if (child > 0) do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  suite.expect(written && waited == child && child > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+               "fault_link_rebinds_published_provider_with_retained_namespace");
+  for (const char *name : {"probe.sh", "workspace/virtual-datacenter.pid", "workspace/virtual-datacenter.identity",
+                           "workspace/virtual-datacenter.runtime", "workspace/transitions"})
+  { String path = {}; mothershipVirtualDatacenterPath(String(temporary), name, path); ::unlink(path.c_str()); }
+  String workspacePath = {}; mothershipVirtualDatacenterPath(String(temporary), "workspace", workspacePath);
+  ::rmdir(workspacePath.c_str());
+  ::rmdir(temporary);
+}
+
 int main(void)
 {
   TestSuite suite;
   testPublicationPreservesSelectedMachine(suite);
+  testFaultLinkRebindsPublishedProvider(suite);
 
   suite.expect(mothershipTestClusterWorkspaceRootValid("/tmp/vdc"_ctv), "workspace_accepts_nested_absolute_path");
   suite.expect(mothershipTestClusterWorkspaceRootValid("/tmp/space dir/vdc"_ctv), "workspace_accepts_spaces");

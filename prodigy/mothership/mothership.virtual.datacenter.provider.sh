@@ -346,6 +346,29 @@ validate_machine_indices()
    done
 }
 
+# A fault can outlive provider adoption. Resolve the published owner at each
+# link transition and bind it to the original retained namespace identity.
+fault_link_set()
+{
+   [[ "$#" -eq 4 ]] || return 2
+   local workspace="$1"
+   local expected_runtime_identity="$2"
+   local link_name="$3"
+   local link_state="$4"
+   valid_workspace "${workspace}" || return 2
+   [[ "${expected_runtime_identity}" =~ ^[0-9]+$ && "${expected_runtime_identity}" -gt 1 ]] || return 2
+   [[ "${link_name}" =~ ^vp[1-9][0-9]*$ && ( "${link_state}" == down || "${link_state}" == up ) ]] || return 2
+   local pid_path="${workspace}/virtual-datacenter.pid"
+   local current_provider_pid=""
+   [[ -r "${pid_path}" ]] || return 1
+   current_provider_pid="$(<"${pid_path}")"
+   provider_process "${current_provider_pid}" "${workspace}" || return 1
+   local current_runtime_identity=""
+   current_runtime_identity="$(runtime_identity_for_workspace "${workspace}" "${current_provider_pid}")" || return 1
+   [[ "${current_runtime_identity}" == "${expected_runtime_identity}" ]] || return 1
+   nsenter -t "${current_provider_pid}" -m -- ip netns exec "pvd-p-${expected_runtime_identity}" ip link set "${link_name}" "${link_state}"
+}
+
 fault_datacenter()
 {
    [[ "$#" -eq 7 && "${EUID}" -eq 0 ]] || return 2
@@ -373,8 +396,6 @@ fault_datacenter()
    command -v nsenter >/dev/null
    local runtime_identity=""
    runtime_identity="$(runtime_identity_for_workspace "${workspace}" "${provider_pid}")" || return 1
-   local parent_ns="pvd-p-${runtime_identity}"
-   local -a parent_netns=(nsenter -t "${provider_pid}" -m -- ip netns exec "${parent_ns}")
    local -a machine_pids=()
    mapfile -t machine_pids < "${runtime_path}"
    validate_machine_indices "${indices}" "${#machine_pids[@]}" || return 2
@@ -399,7 +420,7 @@ fault_datacenter()
       do
          for index in "${parsed[@]}"
          do
-            "${parent_netns[@]}" ip link set "vp${index}" down
+            fault_link_set "${workspace}" "${runtime_identity}" "vp${index}" down || return 1
          done
          if [[ "${mode}" == "link" && "${duration_ms}" -eq 0 ]]
          then
@@ -408,7 +429,7 @@ fault_datacenter()
          sleep_milliseconds "${link_down_ms}"
          for index in "${parsed[@]}"
          do
-            "${parent_netns[@]}" ip link set "vp${index}" up
+            fault_link_set "${workspace}" "${runtime_identity}" "vp${index}" up || return 1
          done
          [[ "${cycle}" -eq "${repetitions}" ]] || sleep_milliseconds "${link_up_ms}"
       done
