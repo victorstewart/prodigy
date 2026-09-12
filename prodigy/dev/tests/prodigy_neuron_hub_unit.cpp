@@ -47,6 +47,18 @@ class TestNeuronControlRuntime final : public Neuron {
 public:
 
   uint32_t rawPollCompletions = 0;
+  uint32_t closeCompletions = 0;
+  uint32_t stopAfterCloseCompletions = 0;
+
+  void closeHandler(void *socket) override
+  {
+    Neuron::closeHandler(socket);
+    closeCompletions += 1;
+    if (stopAfterCloseCompletions != 0 && closeCompletions >= stopAfterCloseCompletions)
+    {
+      Ring::exit = true;
+    }
+  }
 
   void rawFDPollHandler(void *owner, uint64_t generation, uint64_t ticket, int result) override
   {
@@ -90,6 +102,11 @@ public:
     return closingBrainControls.contains(stream);
   }
 
+  bool testRawStreamIsActive(Container *container) const
+  {
+    return rawStreamIsActive(container);
+  }
+
   void testCloseHandler(void *socket)
   {
     closeHandler(socket);
@@ -98,6 +115,11 @@ public:
   void testRecvHandler(void *socket, int result)
   {
     recvHandler(socket, result);
+  }
+
+  void testConnectHandler(void *socket, int result)
+  {
+    connectHandler(socket, result);
   }
 
   bool testRetireContainerControlBeforeRestart(Container *container)
@@ -335,6 +357,97 @@ static void testContainerUnixSocketRecreate(TestSuite& suite)
   }
 }
 
+static void testContainerControlExecQuiesce(TestSuite& suite)
+{
+  TestNeuronControlRuntime runtime = {};
+  NeuronBase *previousNeuron = thisNeuron;
+  RingInterface *previousInterfacer = Ring::interfacer;
+  thisNeuron = &runtime;
+  Ring::interfacer = &runtime;
+
+  int socketPair[2] = {-1, -1};
+  suite.expect(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, socketPair) == 0,
+               "container_control_exec_quiesce_creates_socketpair");
+  if (socketPair[0] < 0)
+  {
+    Ring::interfacer = previousInterfacer;
+    thisNeuron = previousNeuron;
+    return;
+  }
+
+  Container retained = {};
+  retained.plan.uuid = 993;
+  retained.pid = ::getpid();
+  retained.neuronListenerPath.assign("/tmp/prodigy-neuron-control-reconnect-unit"_ctv);
+  runtime.containers.insert_or_assign(retained.plan.uuid, &retained);
+
+  // An ordinary live close still recreates and queues the addressful control
+  // stream. Bundle exec must suppress only this rearm, not normal recovery.
+  runtime.testCloseHandler(&retained);
+  suite.expect(runtime.testRawStreamIsActive(&retained) && retained.pendingConnectUserData != 0,
+               "container_control_exec_quiesce_normal_close_rearms_connect");
+  const int reconnectFD = retained.fd;
+  runtime.closeCompletions = 0;
+
+  Container draining = {};
+  draining.plan.uuid = 994;
+  draining.pid = ::getpid();
+  draining.fd = socketPair[0];
+  Ring::installFDIntoFixedFileSlot(&draining);
+  runtime.containers.insert_or_assign(draining.plan.uuid, &draining);
+  Ring::queueRecv(&draining);
+  suite.expect(runtime.testRawStreamIsActive(&draining) && draining.pendingRecv,
+               "container_control_exec_quiesce_arms_real_control_recv");
+
+  runtime.beginBundleExecQuiesce();
+  runtime.testConnectHandler(&retained, -ECONNREFUSED);
+  suite.expect(Ring::socketIsClosing(&retained) == false && retained.fd == reconnectFD,
+               "container_control_exec_quiesce_blocks_connect_failure_rearm");
+
+  suite.expect(runtime.quiesceContainerControlSocketsForBundleExec() == false,
+               "container_control_exec_quiesce_waits_for_control_close_cqe");
+  suite.expect(Ring::socketIsClosing(&retained) && Ring::socketIsClosing(&draining) &&
+                   runtime.containers.find(retained.plan.uuid) != runtime.containers.end() &&
+                   runtime.containers.find(draining.plan.uuid) != runtime.containers.end() &&
+                   retained.pid == ::getpid() && draining.pid == ::getpid(),
+               "container_control_exec_quiesce_preserves_live_container_owner");
+
+  runtime.stopAfterCloseCompletions = 2;
+  Ring::exit = false;
+  Ring::start();
+  Ring::exit = false;
+  suite.expect(runtime.closeCompletions == 2 && runtime.testRawStreamIsActive(&retained) == false &&
+                   runtime.testRawStreamIsActive(&draining) == false && retained.pendingConnectUserData == 0 &&
+                   draining.pendingRecv == false,
+               "container_control_exec_quiesce_drains_cancelled_control_operations");
+  suite.expect(runtime.quiesceContainerControlSocketsForBundleExec() &&
+                   runtime.containers.find(retained.plan.uuid) != runtime.containers.end() &&
+                   runtime.containers.find(draining.plan.uuid) != runtime.containers.end() &&
+                   retained.pid == ::getpid() && draining.pid == ::getpid(),
+               "container_control_exec_quiesce_finishes_without_reopening_or_destroying");
+
+  Container pendingDestroy = {};
+  pendingDestroy.plan.uuid = 995;
+  pendingDestroy.pendingDestroy = true;
+  pendingDestroy.waitidPending = true;
+  runtime.containers.insert_or_assign(pendingDestroy.plan.uuid, &pendingDestroy);
+  runtime.testCloseHandler(&pendingDestroy);
+  suite.expect(pendingDestroy.destroyCloseCompleted &&
+                   runtime.containers.find(pendingDestroy.plan.uuid) != runtime.containers.end(),
+               "container_control_exec_quiesce_preserves_pending_destroy_close_ack");
+
+  runtime.testCloseHandler(&retained);
+  suite.expect(runtime.testRawStreamIsActive(&retained) == false,
+               "container_control_exec_quiesce_blocks_close_reconnect_after_drain");
+
+  runtime.containers.erase(retained.plan.uuid);
+  runtime.containers.erase(draining.plan.uuid);
+  runtime.containers.erase(pendingDestroy.plan.uuid);
+  ::close(socketPair[1]);
+  Ring::interfacer = previousInterfacer;
+  thisNeuron = previousNeuron;
+}
+
 static void testRetainedNonChildPidfdExecQuiesce(TestSuite& suite)
 {
   TestNeuronControlRuntime runtime = {};
@@ -536,6 +649,7 @@ int main(void)
   testRetainedNonChildPidfdLiveness(suite);
 
   ScopedRing ring = {};
+  testContainerControlExecQuiesce(suite);
   testRetainedNonChildPidfdExecQuiesce(suite);
   testNeuronHubCanQueueToNeuron(suite);
   testNeuronHubFlushesBufferedFramesWhenNeuronBecomesSendable(suite);

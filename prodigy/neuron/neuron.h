@@ -133,6 +133,9 @@ protected:
   bool metricsTickQueued = false;
   TimeoutPacket bundleExecRetryTick;
   bool bundleExecRetryTickQueued = false;
+  // Once bundle exec begins, container control sockets must drain without
+  // reconnecting. The replacement Neuron reopens them after stateUpload.
+  bool bundleExecQuiescing = false;
   class WormholeFlowGC final : public TimeoutDispatcher {
     class PinnedMap {
     public:
@@ -3704,6 +3707,40 @@ public:
     return true;
   }
 
+  void beginBundleExecQuiesce(void)
+  {
+    bundleExecQuiescing = true;
+  }
+
+  bool quiesceContainerControlSocketsForBundleExec(void)
+  {
+    bool drained = true;
+    for (const auto& [uuid, container] : containers)
+    {
+      (void)uuid;
+      if (container == nullptr || container->exposesNeuronSocket() == false)
+      {
+        continue;
+      }
+      if (Ring::socketIsClosing(container))
+      {
+        drained = false;
+        continue;
+      }
+      if (rawStreamIsActive(container) == false)
+      {
+        continue;
+      }
+      drained = false;
+      if (container->isFixedFile && container->fslot >= 0)
+      {
+        Ring::queueCancelAll(container);
+      }
+      Ring::queueClose(container);
+    }
+    return drained;
+  }
+
   void queueBundleExecRetry(void)
   {
     if (bundleExecRetryTickQueued)
@@ -3719,10 +3756,13 @@ public:
 
   virtual void transitionToNewBundle(void)
   {
+    beginBundleExecQuiesce();
     // Host-control HTTP and DNS own raw-fd polls. Their asynchronous shutdown
     // callbacks are the lifetime barrier required by Ring::shutdownForExec().
     // Retry from this Neuron-owned timer after cancellation CQEs are dispatched.
-    if (quiesceProcessForBundleExec() == false)
+    const bool containerControlsQuiesced = quiesceContainerControlSocketsForBundleExec();
+    const bool processQuiesced = quiesceProcessForBundleExec();
+    if (containerControlsQuiesced == false || processQuiesced == false)
     {
       queueBundleExecRetry();
       return;
@@ -5550,6 +5590,13 @@ public:
         return;
       }
 
+      if (bundleExecQuiescing)
+      {
+        // Bundle exec retains the live process and its mount. The close CQE is
+        // only a lifetime barrier; the replacement Neuron reopens control.
+        return;
+      }
+
       if (container->restartAfterClose)
       {
         container->restartAfterClose = false;
@@ -5610,6 +5657,10 @@ public:
 
     Container *container = static_cast<Container *>(socket);
     if (container->pendingDestroy)
+    {
+      return;
+    }
+    if (bundleExecQuiescing)
     {
       return;
     }
