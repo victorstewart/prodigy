@@ -612,6 +612,7 @@ target_include_directories(prodigy_mothership_pricing_unit PRIVATE "${CMAKE_BINA
 target_include_directories(prodigy_mothership_unix_connect_unit PRIVATE "${CMAKE_BINARY_DIR}/generated")
 add_executable(prodigy_mothership_virtual_datacenter_unit
    ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_virtual_datacenter_unit.cpp)
+add_executable(prodigy_mothership_neuron_checkpoint_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_neuron_checkpoint_unit.cpp)
 add_executable(prodigy_mothership_provider_credential_registry_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_provider_credential_registry_unit.cpp)
 add_executable(prodigy_mothership_provider_machine_destroy_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_provider_machine_destroy_unit.cpp)
 
@@ -692,6 +693,7 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_mothership_addmachines_progress_unit
    prodigy_mothership_unix_connect_unit
    prodigy_mothership_virtual_datacenter_unit
+   prodigy_mothership_neuron_checkpoint_unit
    prodigy_mothership_provider_credential_registry_unit
    prodigy_mothership_provider_machine_destroy_unit
 )
@@ -931,6 +933,7 @@ target_compile_options(prodigy_mothership_cluster_create_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_addmachines_progress_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_unix_connect_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_virtual_datacenter_unit PUBLIC -O2)
+target_compile_options(prodigy_mothership_neuron_checkpoint_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_provider_credential_registry_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_provider_machine_destroy_unit PUBLIC -O2)
 if (PRODIGY_ENABLE_FUZZ_TESTS)
@@ -2034,6 +2037,11 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    add_test(
       NAME prodigy_mothership_virtual_datacenter_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_virtual_datacenter_unit
+   )
+
+   add_test(
+      NAME prodigy_mothership_neuron_checkpoint_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_neuron_checkpoint_unit
    )
 
    add_test(

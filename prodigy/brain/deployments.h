@@ -9935,7 +9935,6 @@ public:
     {
       return;
     }
-    uint32_t healthy = 0;
     for (ApplicationDeployment *owner : {previous, this})
     {
       for (ContainerView *container : owner->containers)
@@ -9950,12 +9949,7 @@ public:
         {
           return;
         }
-        healthy += container->state == ContainerState::healthy;
       }
-    }
-    if (healthy == 0)
-    {
-      return;
     }
     previous->rebuildRecoveredContainerCounts();
     previous->calculateTargets();
@@ -9994,7 +9988,7 @@ public:
         consumingSchedulingExecution || schedulingStack.waiters.empty() == false ||
         toSchedule.empty() == false || waitingOnContainers.empty() == false || nSuspended != 0 ||
         nShardGroups != 1 || nTarget() != 3 || nDeployed() != nTarget() ||
-        containers.size() != nTarget() || nHealthy() == 0 || nHealthy() >= nTarget())
+        containers.size() != nTarget() || nHealthy() >= nTarget())
     {
       return false;
     }

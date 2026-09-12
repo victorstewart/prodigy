@@ -18,6 +18,25 @@
 #include <services/base64.h>
 #include <services/random.h>
 
+// Exact live Neuron state captured by Mothership before an interrupted
+// sole-Brain replacement. ContainerPlan remains the wire/domain owner.
+class ProdigyLocalContainerCheckpoint {
+public:
+  uint128_t machineUUID = 0;
+  uint8_t datacenterFragment = 0;
+  uint32_t machineFragment = 0;
+  Vector<ContainerPlan> plans;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyLocalContainerCheckpoint& checkpoint)
+{
+  serializer.value16b(checkpoint.machineUUID);
+  serializer.value1b(checkpoint.datacenterFragment);
+  serializer.value4b(checkpoint.machineFragment);
+  serializer.container(checkpoint.plans, 4096);
+}
+
 class ProdigyBootstrapBundleSupersessionReceipt {
 public:
 
@@ -28,6 +47,8 @@ public:
   String expectedIncompleteWorkerBundleSHA256;
   String successorBundleSHA256;
   String targetControlSocketPath;
+  String localContainerCheckpoint;
+  String localContainerCheckpointSHA256;
 
   bool present(void) const { return operationID != 0; }
 };
@@ -1283,6 +1304,12 @@ static inline bool parseProdigyBootstrapBundleSupersessionReceiptJSONElement(
     else if (key == "expectedIncompleteWorkerBundleSHA256"_ctv) { parsed.expectedIncompleteWorkerBundleSHA256 = std::move(text); sawExpected = true; }
     else if (key == "successorBundleSHA256"_ctv) { parsed.successorBundleSHA256 = std::move(text); sawSuccessor = true; }
     else if (key == "targetControlSocketPath"_ctv) { parsed.targetControlSocketPath = std::move(text); sawSocket = true; }
+    else if (key == "localContainerCheckpoint"_ctv)
+    {
+      if (text.size() > 32 * 1024 * 1024) { if (failure) failure->assign("local container checkpoint exceeds size limit"_ctv); return false; }
+      Base64::decode(text, parsed.localContainerCheckpoint);
+    }
+    else if (key == "localContainerCheckpointSHA256"_ctv) { parsed.localContainerCheckpointSHA256 = std::move(text); }
     else { if (failure) failure->assign("invalid bootstrapBundleSupersession field"_ctv); return false; }
   }
   if (!(sawOperationID && sawClusterUUID && sawExpected && sawSuccessor && sawSocket) ||
@@ -1290,7 +1317,9 @@ static inline bool parseProdigyBootstrapBundleSupersessionReceiptJSONElement(
       prodigyParseCanonicalHex128(clusterUUID, parsed.clusterUUID) == false ||
       prodigySHA256HexIsCanonical(parsed.expectedIncompleteWorkerBundleSHA256) == false ||
       prodigySHA256HexIsCanonical(parsed.successorBundleSHA256) == false ||
-      parsed.targetControlSocketPath.empty())
+      parsed.targetControlSocketPath.empty() ||
+      (parsed.localContainerCheckpoint.empty() != parsed.localContainerCheckpointSHA256.empty()) ||
+      (parsed.localContainerCheckpoint.empty() == false && prodigySHA256HexIsCanonical(parsed.localContainerCheckpointSHA256) == false))
   {
     if (failure) failure->assign("invalid bootstrapBundleSupersession receipt"_ctv);
     return false;
@@ -1853,6 +1882,13 @@ static inline void renderProdigyPersistentBootStateJSON(const ProdigyPersistentB
     json.append(",\"expectedIncompleteWorkerBundleSHA256\":"_ctv); appendEscapedJSONString(json, receipt.expectedIncompleteWorkerBundleSHA256);
     json.append(",\"successorBundleSHA256\":"_ctv); appendEscapedJSONString(json, receipt.successorBundleSHA256);
     json.append(",\"targetControlSocketPath\":"_ctv); appendEscapedJSONString(json, receipt.targetControlSocketPath);
+    if (receipt.localContainerCheckpoint.empty() == false)
+    {
+      String encodedCheckpoint = {};
+      Base64::encode(receipt.localContainerCheckpoint.data(), receipt.localContainerCheckpoint.size(), encodedCheckpoint);
+      json.append(",\"localContainerCheckpoint\":"_ctv); appendEscapedJSONString(json, encodedCheckpoint);
+      json.append(",\"localContainerCheckpointSHA256\":"_ctv); appendEscapedJSONString(json, receipt.localContainerCheckpointSHA256);
+    }
     json.append("}"_ctv);
   }
 

@@ -11046,9 +11046,13 @@ int main(void)
 
       suite.expect(recovered.recoveredMaterializedStatefulRollForwardIsSafe(),
                    "materialized_stateful_recovery_accepts_quiescent_none_single_cohort_one_healthy");
+      cohort[0].state = ContainerState::scheduled;
+      recovered.nHealthyBase = 0;
+      suite.expect(recovered.recoveredMaterializedStatefulRollForwardIsSafe(),
+                   "materialized_stateful_recovery_accepts_quiescent_none_single_cohort_zero_healthy");
       recovered.state = DeploymentState::deploying;
       suite.expect(recovered.recoveredMaterializedStatefulRollForwardIsSafe() == false,
-                   "materialized_stateful_recovery_rejects_active_deploying_cohort");
+                   "materialized_stateful_recovery_rejects_active_deploying_zero_healthy_cohort");
     }
 
     if (machinesReady)
@@ -11072,7 +11076,7 @@ int main(void)
       old->nShardGroups = 1;
       old->nTargetBase = 3;
       old->nDeployedBase = 3;
-      old->nHealthyBase = 2;
+      old->nHealthyBase = 0;
 
       const uint64_t oldDeploymentID = old->plan.config.deploymentID();
       ContainerView *oldCohort[3] = {new ContainerView(), new ContainerView(), new ContainerView()};
@@ -11086,7 +11090,7 @@ int main(void)
         oldCohort[index]->lifetime = ApplicationLifetime::base;
         oldCohort[index]->isStateful = true;
         oldCohort[index]->shardGroup = 0;
-        oldCohort[index]->state = index == 0 ? ContainerState::scheduled : ContainerState::healthy;
+        oldCohort[index]->state = ContainerState::scheduled;
         oldCohort[index]->fragment = cohortMachines[index]->getContainerFragment();
         oldCohort[index]->runtime_nLogicalCores = old->plan.config.nLogicalCores;
         oldCohort[index]->runtime_memoryMB = old->plan.config.totalMemoryMB();
@@ -11111,39 +11115,72 @@ int main(void)
       current.deploy();
       suite.expect(current.waitingOnContainers.size() == 1,
                    "materialized_stateful_recovery_architect_starts_one_unhealthy_replacement");
-      suite.expect(oldCohort[0]->state == ContainerState::destroying,
+      uint32_t firstOldIndex = 3;
+      for (uint32_t index = 0; index < 3; ++index)
+      {
+        if (oldCohort[index]->state == ContainerState::destroying)
+        {
+          firstOldIndex = index;
+          break;
+        }
+      }
+      suite.expect(firstOldIndex < 3,
                    "materialized_stateful_recovery_architect_replaces_unhealthy_predecessor_first");
-      suite.expect(old->containers.size() == 2 && old->containers.contains(oldCohort[0]) == false,
+      ContainerView *firstOld = firstOldIndex < 3 ? oldCohort[firstOldIndex] : nullptr;
+      suite.expect(firstOld != nullptr && old->containers.size() == 2 && old->containers.contains(firstOld) == false,
                    "materialized_stateful_recovery_retires_replaced_predecessor_before_kill_ack");
-      suite.expect(oldCohort[0]->machine->containersByDeploymentID.contains(oldCohort[0]->deploymentID) == false ||
-                       oldCohort[0]->machine->containersByDeploymentID[oldCohort[0]->deploymentID].contains(oldCohort[0]) == false,
+      suite.expect(firstOld != nullptr && (firstOld->machine->containersByDeploymentID.contains(firstOld->deploymentID) == false ||
+                       firstOld->machine->containersByDeploymentID[firstOld->deploymentID].contains(firstOld) == false),
                    "materialized_stateful_recovery_retires_replaced_predecessor_machine_index_before_kill_ack");
-      suite.expect(brain.containers.contains(oldCohort[0]->uuid),
+      suite.expect(firstOld != nullptr && brain.containers.contains(firstOld->uuid),
                    "materialized_stateful_recovery_keeps_replaced_predecessor_for_kill_ack");
-      suite.expect(oldCohort[1]->state == ContainerState::healthy && oldCohort[2]->state == ContainerState::healthy &&
-                       oldCohort[1]->plannedWork != nullptr && oldCohort[2]->plannedWork != nullptr,
-                   "materialized_stateful_recovery_architect_plans_healthy_predecessors_without_executing_them");
+      uint32_t retainedScheduled = 0;
+      for (uint32_t index = 0; index < 3; ++index)
+      {
+        if (index != firstOldIndex && oldCohort[index]->state == ContainerState::scheduled && oldCohort[index]->plannedWork != nullptr)
+        {
+          retainedScheduled += 1;
+        }
+      }
+      suite.expect(retainedScheduled == 2,
+                   "materialized_stateful_recovery_architect_plans_remaining_zero_healthy_predecessors_without_executing_them");
 
       ContainerView *firstReplacement = current.waitingOnContainers.begin()->first;
-      suite.expect(firstReplacement->fragment != oldCohort[0]->fragment,
+      suite.expect(firstOld != nullptr && firstReplacement->fragment != firstOld->fragment,
                    "materialized_stateful_recovery_reserves_old_fragment_until_successor_allocated");
-      suite.expect(old->nDeployed() == 2 && old->nHealthy() == 2 && old->countPerMachine[cohortMachines[0]] == 0,
-                   "materialized_stateful_recovery_unhealthy_retirement_preserves_remaining_health_counts");
-      const uint128_t firstOldUUID = oldCohort[0]->uuid;
-      old->containerDestroyed(oldCohort[0]); // same owner invoked by the real kill ack
-      oldCohort[0] = nullptr;
+      suite.expect(firstOld != nullptr && old->nDeployed() == 2 && old->nHealthy() == 0 && old->countPerMachine[firstOld->machine] == 0,
+                   "materialized_stateful_recovery_zero_healthy_retirement_preserves_remaining_counts");
+      const uint128_t firstOldUUID = firstOld->uuid;
+      old->containerDestroyed(firstOld); // same owner invoked by the real kill ack
+      oldCohort[firstOldIndex] = nullptr;
       suite.expect(brain.containers.contains(firstOldUUID) == false,
                    "materialized_stateful_recovery_kill_ack_deletes_retired_global_view");
       current.containerIsHealthy(firstReplacement);
       suite.expect(current.waitingOnContainers.size() == 1,
                    "materialized_stateful_recovery_waits_for_each_successor_before_next_update");
-      suite.expect((oldCohort[1]->state == ContainerState::destroying) != (oldCohort[2]->state == ContainerState::destroying) &&
-                       (oldCohort[1]->state == ContainerState::healthy || oldCohort[2]->state == ContainerState::healthy),
-                   "materialized_stateful_recovery_releases_exactly_one_healthy_predecessor_after_ack");
+      uint32_t secondOldIndex = 3;
+      uint32_t thirdOldIndex = 3;
+      for (uint32_t index = 0; index < 3; ++index)
+      {
+        if (oldCohort[index] == nullptr)
+        {
+          continue;
+        }
+        if (oldCohort[index]->state == ContainerState::destroying)
+        {
+          secondOldIndex = index;
+        }
+        else if (oldCohort[index]->state == ContainerState::scheduled)
+        {
+          thirdOldIndex = index;
+        }
+      }
+      suite.expect(secondOldIndex < 3 && thirdOldIndex < 3,
+                   "materialized_stateful_recovery_zero_healthy_releases_exactly_one_predecessor_after_first_successor_health");
 
       ContainerView *secondReplacement = current.waitingOnContainers.begin()->first;
-      suite.expect(old->containers.size() == 1 && old->nDeployed() == 1 && old->nHealthy() == 1,
-                   "materialized_stateful_recovery_two_retirements_leave_one_live_predecessor");
+      suite.expect(old->containers.size() == 1 && old->nDeployed() == 1 && old->nHealthy() == 0,
+                   "materialized_stateful_recovery_zero_healthy_two_retirements_leave_one_live_predecessor");
       for (ContainerView *remaining : old->containers)
       {
         suite.expect(remaining->runtime_nLogicalCores == old->plan.config.nLogicalCores &&
@@ -11151,8 +11188,6 @@ int main(void)
                          remaining->runtime_storageMB == old->plan.config.totalStorageMB(),
                      "materialized_stateful_recovery_predecessor_report_has_live_runtime_values");
       }
-      const uint32_t secondOldIndex = oldCohort[1]->state == ContainerState::destroying ? 1 : 2;
-      const uint32_t thirdOldIndex = secondOldIndex == 1 ? 2 : 1;
       old->containerDestroyed(oldCohort[secondOldIndex]);
       oldCohort[secondOldIndex] = nullptr;
       current.containerIsHealthy(secondReplacement);

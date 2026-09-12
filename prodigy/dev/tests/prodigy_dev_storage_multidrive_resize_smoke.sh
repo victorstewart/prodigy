@@ -10,11 +10,11 @@ upgrade_bundle="${6:-}"
 case "${test_mode}" in
    resize) host_network=true ;;
    mount-only) host_network=false ;;
-   legacy-handoff|legacy-recovery|provider-handoff|bootstrap-supersession) host_network=false ;;
-   *) echo "error: expected resize, mount-only, legacy-handoff, legacy-recovery, provider-handoff or bootstrap-supersession mode" >&2; exit 2 ;;
+   legacy-handoff|legacy-recovery|legacy-recovery-zero|provider-handoff|bootstrap-supersession) host_network=false ;;
+   *) echo "error: expected resize, mount-only, legacy-handoff, legacy-recovery, legacy-recovery-zero, provider-handoff or bootstrap-supersession mode" >&2; exit 2 ;;
 esac
 is_handoff=0
-[[ "${test_mode}" != legacy-handoff && "${test_mode}" != legacy-recovery && "${test_mode}" != provider-handoff && "${test_mode}" != bootstrap-supersession ]] || is_handoff=1
+[[ "${test_mode}" != legacy-handoff && "${test_mode}" != legacy-recovery && "${test_mode}" != legacy-recovery-zero && "${test_mode}" != provider-handoff && "${test_mode}" != bootstrap-supersession ]] || is_handoff=1
 [[ "${storage_devices}" == 0 || "${storage_devices}" == 2 ]] || { echo "error: expected zero or two storage devices" >&2; exit 2; }
 [[ "${test_mode}" != resize || "${storage_devices}" == 2 ]] || { echo "error: resize requires two storage devices" >&2; exit 2; }
 [[ "${is_handoff}" == 0 || ( "${storage_devices}" == 0 && -s "${upgrade_bundle}" ) ]] || { echo "error: legacy handoff requires zero devices and an exact upgrade bundle" >&2; exit 2; }
@@ -220,9 +220,13 @@ then
    machine_count=4
    expected_healthy=3
    initial_healthy=3
-   if [[ "${test_mode}" == legacy-recovery ]]
+   if [[ "${test_mode}" == legacy-recovery || "${test_mode}" == legacy-recovery-zero ]]
    then
       initial_healthy=1
+      if [[ "${test_mode}" == legacy-recovery-zero ]]
+      then
+         initial_healthy=0
+      fi
       initial_state=deploying
       recovered_state=none
    fi
@@ -338,9 +342,9 @@ prodigy_dev_write_common_prodigy_assets "${discombobulator_file}"
 if [[ "${is_handoff}" == 1 ]]
 then
    printf 'ENV PINGPONG_STORAGE_HANDOFF_MODE=seed\nENV PINGPONG_STORAGE_HANDOFF_ID=%s\n' "${handoff_id}" >> "${discombobulator_file}"
-   if [[ "${test_mode}" == legacy-recovery ]]
+   if [[ "${test_mode}" == legacy-recovery || "${test_mode}" == legacy-recovery-zero ]]
    then
-      # A fixture readiness failure leaves two real data owners running unready.
+      # Recovery fixtures retain real seeded data owners while readiness is withheld.
       printf 'ENV PINGPONG_STORAGE_HANDOFF_WAIT_FOR_TRAFFIC=1\n' >> "${discombobulator_file}"
    fi
 fi
@@ -415,7 +419,7 @@ python3 - "${plan_json}" "${test_mode}" <<'PY'
 import json, sys
 with open(sys.argv[1]) as stream:
     plan = json.load(stream)
-if sys.argv[2] in ('legacy-handoff', 'legacy-recovery', 'provider-handoff', 'bootstrap-supersession'):
+if sys.argv[2] in ('legacy-handoff', 'legacy-recovery', 'legacy-recovery-zero', 'provider-handoff', 'bootstrap-supersession'):
     plan.pop('stateless')
     plan['verticalScalers'] = []
 else:
@@ -723,14 +727,14 @@ PY
    env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
       "${MOTHERSHIP_BIN}" deploy "${cluster_name}" "$(cat "${tmpdir}/verify.plan.json")" \
       "${tmpdir}/verify.container.zst" >"${tmpdir}/verify-deploy.log" 2>&1
-   if [[ "${test_mode}" == legacy-recovery ]]
+   if [[ "${test_mode}" == legacy-recovery || "${test_mode}" == legacy-recovery-zero ]]
    then
       queued=0
       for _ in $(seq 1 120)
       do
          if env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
             timeout 8s "${MOTHERSHIP_BIN}" applicationReport "${cluster_name}" Nametag >"${tmpdir}/recovery-admission-report.log" 2>&1 &&
-            report_version_ready "${tmpdir}/recovery-admission-report.log" "${version_id}" 3 1 none &&
+            report_version_ready "${tmpdir}/recovery-admission-report.log" "${version_id}" 3 "${initial_healthy}" none &&
             report_version_ready "${tmpdir}/recovery-admission-report.log" "$((version_id + 1))" 0 0 waitingToDeploy
          then
             queued=1
@@ -738,7 +742,7 @@ PY
          fi
          sleep 0.5
       done
-      [[ "${queued}" == 1 ]] || { echo "FAIL: exact retained 3/1 predecessor and empty waiting successor not observed" >&2; exit 1; }
+      [[ "${queued}" == 1 ]] || { echo "FAIL: exact retained 3/${initial_healthy} predecessor and empty waiting successor not observed" >&2; exit 1; }
       python3 - "${version_id}" "${tmpdir}/verify.container.zst" "${tmpdir}/recovery-request.json" <<'PY_RECOVERY_REQUEST'
 import hashlib, json, pathlib, sys, uuid
 version, blob, output = sys.argv[1:]
@@ -801,9 +805,9 @@ PY_HANDOFF_WAIT
    done
    [[ "${healthy}" == 1 ]] || { echo "FAIL: successor did not become healthy within ${handoff_wait_seconds}s serial handoff budget" >&2; exit 1; }
    observe_handoff after
-   if [[ "${test_mode}" == legacy-recovery ]]
+   if [[ "${test_mode}" == legacy-recovery || "${test_mode}" == legacy-recovery-zero ]]
    then
-      echo "PASS: durably admitted retained 3/1 recovery, idempotent retry and three-replica logical readback"
+      echo "PASS: durably admitted retained 3/${initial_healthy} recovery, idempotent retry and three-replica storage readback"
    else
       echo "PASS: worker-preserving bundle upgrade and lifecycle-quiesced legacy storage handoff with logical readback"
    fi

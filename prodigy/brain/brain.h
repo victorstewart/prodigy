@@ -22932,6 +22932,67 @@ public:
       return false;
     }
 
+    // A forced sole-Brain replacement has no surviving local Neuron owner.
+    // Consume its exact authenticated stateUpload before any scheduling or
+    // worker transition; startup parameters cannot reconstruct mutable plans.
+    ProdigyLocalContainerCheckpoint checkpoint = {};
+    String checkpointDigest = {};
+    ClusterTopology topology = {};
+    bool localIdentityMatches = false;
+    (void)loadAuthoritativeClusterTopology(topology);
+    if (receipt.localContainerCheckpoint.empty() ||
+        prodigyComputeSHA256Hex(receipt.localContainerCheckpoint, checkpointDigest, &digestFailure) == false ||
+        checkpointDigest.equals(receipt.localContainerCheckpointSHA256) == false ||
+        BitseryEngine::deserializeSafe(receipt.localContainerCheckpoint, checkpoint) == false ||
+        checkpoint.machineUUID == 0 || checkpoint.datacenterFragment == 0 ||
+        checkpoint.datacenterFragment != brainConfig.datacenterFragment ||
+        checkpoint.machineFragment == 0 || checkpoint.machineFragment > 0xffffff)
+    {
+      if (failure) failure->assign("bootstrap recovery local container checkpoint is missing or invalid"_ctv);
+      return false;
+    }
+    localIdentityMatches = false;
+    for (const ClusterMachine& machine : topology.machines)
+    {
+      if (machine.isBrain && machine.uuid == checkpoint.machineUUID) localIdentityMatches = true;
+    }
+    if (localIdentityMatches == false)
+    {
+      if (failure) failure->assign("bootstrap recovery checkpoint machine differs from sole Brain authority"_ctv);
+      return false;
+    }
+    Vector<String> bootstraps = {};
+    bytell_hash_set<uint128_t> checkpointUUIDs = {};
+    bytell_hash_set<uint8_t> checkpointFragments = {};
+    for (ContainerPlan& plan : checkpoint.plans)
+    {
+      if (plan.uuid == 0 || checkpointUUIDs.insert(plan.uuid).second == false ||
+          plan.fragment == 0 || checkpointFragments.insert(plan.fragment).second == false)
+      {
+        if (failure) failure->assign("bootstrap recovery checkpoint has invalid or duplicate container identities"_ctv);
+        return false;
+      }
+      // The tunnel provider has its own existing lifecycle/restore owner.
+      if (plan.system.kind == SystemContainerKind::mothershipTunnelProvider) continue;
+      auto deployment = deploymentPlans.find(plan.config.deploymentID());
+      if (plan.isSystemContainer() || deployment == deploymentPlans.end() ||
+          plan.config.containerBlobSHA256.equals(deployment->second.config.containerBlobSHA256) == false)
+      {
+        if (failure) failure->assign("bootstrap recovery checkpoint deployment does not match durable authority"_ctv);
+        return false;
+      }
+      NeuronContainerBootstrap bootstrap = {};
+      bootstrap.plan = std::move(plan);
+      bootstrap.metricPolicy = deriveNeuronMetricPolicyForDeployment(deployment->second);
+      String serialized = {};
+      BitseryEngine::serialize(serialized, bootstrap);
+      bootstraps.push_back(std::move(serialized));
+    }
+
+    const ProdigyPersistentUpdateSelfState previous = capturePersistentUpdateSelfState();
+    updateSelfLocalMachineUUID = checkpoint.machineUUID;
+    updateSelfLocalBundleRegistered = false;
+    updateSelfLocalContainerBootstraps = std::move(bootstraps);
     updateSelfBundleBlob = installedBundle;
     updateSelfWorkerExpectedBundleSHA256 = receipt.successorBundleSHA256;
     updateSelfWorkerFailure.clear();
@@ -22941,6 +23002,7 @@ public:
     updateSelfWorkerStateUploadedMachineUUIDs.clear();
     if (commitMasterAuthorityStateChange() == false)
     {
+      restorePersistentUpdateSelfState(previous);
       if (failure) failure->assign("bootstrap bundle supersession state could not be persisted"_ctv);
       return false;
     }
@@ -23651,7 +23713,8 @@ public:
       const bytell_hash_set<uint128_t>& reportedContainerUUIDs) const
   {
     if (machine == nullptr || machine->uuid != updateSelfLocalMachineUUID ||
-        updateSelfLocalBundleRegistered == false)
+        updateSelfLocalBundleRegistered == false ||
+        updateSelfWorkerStateUploadedMachineUUIDs.size() != updateSelfWorkerMachineUUIDs.size())
     {
       return false;
     }
@@ -23815,7 +23878,33 @@ public:
         updateSelfWorkerMachineUUIDs.empty() == false &&
         updateSelfWorkerStateUploadedMachineUUIDs.size() == updateSelfWorkerMachineUUIDs.size();
     noteMasterAuthorityRuntimeStateChanged();
-    if (allWorkersRestored) completeWorkerBundleUpgradeIfReady();
+    if (allWorkersRestored)
+    {
+      // Forced recovery can restore the local Neuron before the outstanding
+      // workers. Complete only when both exact inventories have arrived.
+      if (updateSelfLocalBundleRegistered && persistedMachineInventoryUploaded.contains(updateSelfLocalMachineUUID))
+      {
+        Machine *local = findMachineByUUID(updateSelfLocalMachineUUID);
+        bytell_hash_set<uint128_t> localInventory = {};
+        if (local != nullptr && local->runtimeReady)
+        {
+          for (const auto& [deploymentID, localContainers] : local->containersByDeploymentID)
+          {
+            (void)deploymentID;
+            for (const ContainerView *container : localContainers)
+            {
+              if (container != nullptr) localInventory.insert(container->uuid);
+            }
+          }
+          if (localBundleInventoryMatches(local, localInventory))
+          {
+            completeLocalBundleExecRecovery();
+            return;
+          }
+        }
+      }
+      completeWorkerBundleUpgradeIfReady();
+    }
     else queueWorkerBundleTransitionIfReady();
   }
 

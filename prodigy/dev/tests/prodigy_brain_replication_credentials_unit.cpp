@@ -9192,7 +9192,7 @@ static void testUpdateProdigyRejectsDifferentDigestWithoutMutation(TestSuite& su
 
 static void testBootstrapBundleSupersessionReceipt(TestSuite& suite)
 {
-  TestBrain brain = {};
+  ResumableAddMachinesBrain brain = {};
   Machine worker = {};
   Machine secondWorker = {};
   worker.uuid = 0x9011;
@@ -9205,6 +9205,29 @@ static void testBootstrapBundleSupersessionReceipt(TestSuite& suite)
   brain.machines.insert(&worker);
   brain.machines.insert(&secondWorker);
   brain.brainConfig.clusterUUID = 0x77112233;
+  brain.brainConfig.datacenterFragment = 1;
+  ClusterMachine local = {};
+  local.uuid = 0x9010;
+  local.isBrain = true;
+  brain.authoritativeTopology.machines.push_back(local);
+  DeploymentPlan localDeployment = {};
+  seedDeployRequestPlan(localDeployment, 33);
+  localDeployment.config.containerBlobSHA256.assign("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv);
+  brain.deploymentPlans.insert_or_assign(localDeployment.config.deploymentID(), localDeployment);
+  ProdigyLocalContainerCheckpoint checkpoint = {};
+  checkpoint.machineUUID = local.uuid;
+  checkpoint.datacenterFragment = 1;
+  checkpoint.machineFragment = 19;
+  ContainerPlan localPlan = {};
+  localPlan.uuid = 0xabc9010;
+  localPlan.fragment = 2;
+  localPlan.config = localDeployment.config;
+  localPlan.runtimeReady = true;
+  localPlan.state = ContainerState::healthy;
+  localPlan.createdAtMs = 123456;
+  localPlan.subscriptionPairings.emplace(9001, uint128_t(0x998877), uint128_t(0x443322), uint64_t(9001), uint16_t(1212));
+  checkpoint.plans.push_back(localPlan);
+
 
   const String oldBundle = "bootstrap-old-bundle"_ctv;
   const String successorBundle = "bootstrap-successor-bundle"_ctv;
@@ -9222,6 +9245,9 @@ static void testBootstrapBundleSupersessionReceipt(TestSuite& suite)
   receipt.expectedIncompleteWorkerBundleSHA256 = oldDigest;
   receipt.successorBundleSHA256 = successorDigest;
   receipt.targetControlSocketPath = boot.bootstrapConfig.controlSocketPath;
+  BitseryEngine::serialize(receipt.localContainerCheckpoint, checkpoint);
+  suite.expect(prodigyComputeSHA256Hex(receipt.localContainerCheckpoint, receipt.localContainerCheckpointSHA256, &failure),
+               "bootstrap_supersession_hashes_live_checkpoint");
 
   brain.updateSelfWorkerExpectedBundleSHA256 = oldDigest;
   brain.updateSelfBundleBlob = oldBundle;
@@ -9250,10 +9276,32 @@ static void testBootstrapBundleSupersessionReceipt(TestSuite& suite)
                    parsedBoot.bootstrapBundleSupersession.successorBundleSHA256.equals(successorDigest),
                "bootstrap_supersession_boot_json_round_trips_typed_receipt");
 
+  const auto beforeMissingCheckpoint = brain.capturePersistentUpdateSelfState();
+  const String validCheckpoint = receipt.localContainerCheckpoint;
+  receipt.localContainerCheckpoint.clear();
+  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, &failure, &successorBundle) == false &&
+                   equalSerializedObjects(beforeMissingCheckpoint, brain.capturePersistentUpdateSelfState()),
+               "bootstrap_supersession_rejects_missing_checkpoint_before_mutation");
+  receipt.localContainerCheckpoint = validCheckpoint;
   suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, &failure, &successorBundle),
                "bootstrap_supersession_accepts_exact_incomplete_update");
   suite.expect(brain.persistCalls == 1 && brain.lastPersistedMasterAuthorityState.updateSelf.workerExpectedBundleSHA256.equals(successorDigest),
                "bootstrap_supersession_persists_successor_before_registration");
+  NeuronContainerBootstrap restoredLocal = {};
+  suite.expect(brain.lastPersistedMasterAuthorityState.updateSelf.localMachineUUID == local.uuid &&
+                   brain.lastPersistedMasterAuthorityState.updateSelf.localContainerBootstraps.size() == 1 &&
+                   BitseryEngine::deserializeSafe(brain.lastPersistedMasterAuthorityState.updateSelf.localContainerBootstraps.front(), restoredLocal) &&
+                   equalSerializedObjects(restoredLocal.plan, localPlan),
+               "bootstrap_supersession_persists_exact_live_local_plan_before_registration");
+  Machine restoredLocalMachine = {};
+  restoredLocalMachine.uuid = local.uuid;
+  brain.updateSelfLocalBundleRegistered = true;
+  bytell_hash_set<uint128_t> localUUIDs = {};
+  localUUIDs.insert(localPlan.uuid);
+  suite.expect(brain.localBundleInventoryMatches(&restoredLocalMachine, localUUIDs) == false,
+               "bootstrap_local_inventory_cannot_clear_incomplete_worker_recovery");
+  brain.updateSelfLocalBundleRegistered = false;
+
   suite.expect(brain.updateSelfWorkerExpectedBundleSHA256.equals(successorDigest) &&
                    brain.updateSelfBundleBlob.equals(successorBundle) &&
                    brain.updateSelfWorkerMachineUUIDs.size() == 2 &&

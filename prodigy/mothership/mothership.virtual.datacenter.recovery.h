@@ -7,13 +7,12 @@
 #include <sched.h>
 #include <climits>
 
-// Forced replacement cannot reconstruct a Brain's colocated Neuron plans:
-// only the ordinary bundle-exec owner durably checkpoints those bootstraps.
-// Until recovery can obtain that authoritative checkpoint, keep the original
-// Brain alive rather than admitting a replacement that can duplicate its apps.
-static inline bool mothershipVDCRecoveryTargetIsSupported(uint32_t machineIndex, uint32_t brainCount)
+// Workers retain the live Brain as their plan owner. A sole Brain requires
+// the authenticated checkpoint path plus an exact incomplete-update receipt.
+static inline bool mothershipVDCRecoveryTargetIsSupported(uint32_t machineIndex, uint32_t brainCount,
+    bool checkpointedSupersession = false)
 {
-  return machineIndex > brainCount;
+  return machineIndex > brainCount || (checkpointedSupersession && machineIndex == 1 && brainCount == 1);
 }
 
 // The provider keeps resource plumbing. Mothership owns the exact process
@@ -236,7 +235,8 @@ static inline bool mothershipVDCReadRecovery(const String& directory, Mothership
 // Prepare through the boot-state owner before stopping anything. The caller
 // installs these exact bytes only after the selected Brain is stopped.
 static inline bool mothershipVDCPrepareSupersessionBoot(const String& original,
-    const MothershipVDCBundleRecovery& operation, String& successor, String *failure)
+    const MothershipVDCBundleRecovery& operation, String& successor, String *failure,
+    const String *localCheckpoint = nullptr)
 {
   ProdigyPersistentBootState boot = {};
   if (operation.machineIndex != 1 || operation.operationID == 0 || operation.clusterUUID == 0 ||
@@ -257,6 +257,11 @@ static inline bool mothershipVDCPrepareSupersessionBoot(const String& original,
   receipt.expectedIncompleteWorkerBundleSHA256 = operation.expectedIncompleteWorkerBundle;
   receipt.successorBundleSHA256 = operation.successorBundle;
   receipt.targetControlSocketPath = boot.bootstrapConfig.controlSocketPath;
+  if (localCheckpoint != nullptr)
+  {
+    receipt.localContainerCheckpoint = *localCheckpoint;
+    if (prodigyComputeSHA256Hex(*localCheckpoint, receipt.localContainerCheckpointSHA256, failure) == false) return false;
+  }
   renderProdigyPersistentBootStateJSON(boot, successor);
   return true;
 }

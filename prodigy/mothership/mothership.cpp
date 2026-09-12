@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
+#include <filesystem>
 #include <fcntl.h>
 #include <libssh2/libssh2.h>
 #include <linux/capability.h>
@@ -40,6 +41,7 @@
 #include <prodigy/mothership/mothership.cluster.registry.h>
 #include <prodigy/mothership/mothership.virtual.datacenter.h>
 #include <prodigy/mothership/mothership.virtual.datacenter.recovery.h>
+#include <prodigy/mothership/mothership.neuron.checkpoint.h>
 #include <prodigy/mothership/mothership.ssh.h>
 #include <prodigy/mothership/mothership.deployment.plan.helpers.h>
 #include <prodigy/mothership/mothership.gcp.managed.template.plan.h>
@@ -3651,12 +3653,254 @@ static bool mothershipRunVirtualDatacenterProvider(Vector<String> arguments, Str
   return true;
 }
 
+class MothershipVDCApplicationIdentity {
+public:
+  String name;
+  MothershipVDCProcessIdentity process;
+  uint64_t storageDevice = 0, storageInode = 0;
+};
+
+static bool mothershipVDCReadApplicationIdentities(const MothershipVDCProcessIdentity& runtime,
+    Vector<MothershipVDCApplicationIdentity>& applications, String *failure)
+{
+  applications.clear();
+  String root = {};
+  root.snprintf<"/proc/{itoa}/root/sys/fs/cgroup/containers.slice"_ctv>(runtime.pid);
+  DIR *directory = ::opendir(root.c_str());
+  if (directory == nullptr) { if (failure) failure->assign("local application cgroup inventory unavailable"_ctv); return false; }
+  bool okay = true;
+  while (dirent *entry = ::readdir(directory))
+  {
+    const size_t length = std::strlen(entry->d_name);
+    if (length <= 6 || std::strcmp(entry->d_name + length - 6, ".slice") != 0) continue;
+    MothershipVDCApplicationIdentity application = {};
+    application.name.assign(entry->d_name, length - 6);
+    String pidsPath = {}, pids = {};
+    pidsPath.snprintf<"{}/{}.slice/leaf/cgroup.procs"_ctv>(root, application.name);
+    if (mothershipVDCRead(pidsPath, pids, 4096) == false) { okay = false; break; }
+    if (pids.empty()) continue;
+    uint64_t pid = 0;
+    if (pids[pids.size() - 1] == '\n') pids.resize(pids.size() - 1);
+    if (mothershipVDCParseUnsigned(pids.c_str(), pids.c_str() + pids.size(), pid) == false ||
+        mothershipVDCReadProcess(pid, application.process) == false) { okay = false; break; }
+    String storagePath = {};
+    storagePath.snprintf<"/proc/{itoa}/root/storage"_ctv>(pid);
+    struct stat storage = {};
+    if (::stat(storagePath.c_str(), &storage) == 0)
+    {
+      application.storageDevice = uint64_t(storage.st_dev);
+      application.storageInode = uint64_t(storage.st_ino);
+    }
+    else if (errno != ENOENT) { okay = false; break; }
+    applications.push_back(std::move(application));
+  }
+  ::closedir(directory);
+  if (okay == false && failure) failure->assign("local application process or storage identity is ambiguous"_ctv);
+  return okay && mothershipVDCProcessMatches(runtime);
+}
+
+static bool mothershipVDCWaitStopped(const MothershipVDCProcessIdentity& process)
+{
+  for (unsigned attempt = 0; attempt < 100; ++attempt)
+  {
+    char state = 0;
+    if (mothershipVDCProcessMatches(process, &state) == false) return false;
+    if (state == 'T' || state == 't') return true;
+    ::usleep(10000);
+  }
+  return false;
+}
+
+class MothershipVDCCheckpointContext {
+public:
+  MothershipVDCProcessIdentity runtime;
+  uint8_t datacenterFragment = 0;
+  Vector<MothershipVDCApplicationIdentity> applications;
+};
+
+static bool mothershipVDCFreezeCheckpoint(void *opaque, ProdigyLocalContainerCheckpoint& checkpoint, String *failure)
+{
+  auto& context = *static_cast<MothershipVDCCheckpointContext *>(opaque);
+  if (checkpoint.datacenterFragment != context.datacenterFragment ||
+      checkpoint.machineFragment == 0 || checkpoint.machineFragment > 0xffffff ||
+      mothershipVDCSignal(context.runtime, SIGSTOP) == false || mothershipVDCWaitStopped(context.runtime) == false)
+  {
+    if (failure) failure->assign("cannot fence the exact local checkpoint runtime"_ctv);
+    return false;
+  }
+  Vector<MothershipVDCApplicationIdentity> observed = {};
+  if (mothershipVDCReadApplicationIdentities(context.runtime, observed, failure) == false ||
+      observed.size() != context.applications.size() || observed.size() != checkpoint.plans.size())
+  {
+    if (failure) failure->assign("local checkpoint does not cover the full retained application inventory"_ctv);
+    return false;
+  }
+  bytell_hash_set<String> checkpointNames = {};
+  for (const ContainerPlan& plan : checkpoint.plans)
+  {
+    String name = {}; name.assignItoa(plan.uuid);
+    if (plan.uuid == 0 || checkpointNames.insert(name).second == false) return false;
+  }
+  for (const auto& before : context.applications)
+  {
+    bool found = false;
+    for (const auto& after : observed)
+    {
+      if (before.name != after.name) continue;
+      found = checkpointNames.contains(after.name) &&
+              before.process.pid == after.process.pid && before.process.startTime == after.process.startTime &&
+              before.process.mountNamespace == after.process.mountNamespace &&
+              before.process.networkNamespace == after.process.networkNamespace &&
+              before.process.cgroupNamespace == after.process.cgroupNamespace &&
+              before.storageDevice == after.storageDevice && before.storageInode == after.storageInode;
+      break;
+    }
+    if (found == false)
+    {
+      if (failure) failure->assign("local checkpoint application identity changed during capture"_ctv);
+      return false;
+    }
+  }
+  return true;
+}
+
+// Run only under the existing provider-recovery lock and frozen provider.
+// The temporary state copy is opened through the canonical persistence owner;
+// the live databases are never opened or modified by the recovery client.
+static bool mothershipVDCCaptureLocalCheckpoint(MothershipVDCBundleRecovery& operation,
+    const String& directory, String *failure)
+{
+  auto reject = [&](const char *message) { if (failure) failure->assign(message); return false; };
+  if (std::getenv("PRODIGY_STATE_SECRETS_DB") != nullptr)
+    return reject("explicit secrets DB override is incompatible with isolated recovery state capture");
+  if (mothershipVDCSignal(operation.worker, SIGSTOP) == false || mothershipVDCWaitStopped(operation.worker) == false)
+    return reject("cannot freeze exact Brain for private state capture");
+  MothershipVDCCheckpointContext context = {};
+  context.runtime = operation.worker;
+  if (mothershipVDCReadApplicationIdentities(operation.worker, context.applications, failure) == false) return false;
+  String source = {}, copy = {}, copySecrets = {};
+  source.snprintf<"/proc/{itoa}/root/containers/prodigy.state"_ctv>(operation.worker.pid);
+  uint64_t nonce = Random::generateNumberWithNBits<64, uint64_t>();
+  copy.snprintf<"{}/checkpoint-state-{itoa}"_ctv>(directory, nonce);
+  copySecrets = copy; copySecrets.append(".secrets"_ctv);
+  struct RemoveCopies {
+    String primary, secrets;
+    ~RemoveCopies() {
+      std::error_code error;
+      std::filesystem::remove_all(primary.c_str(), error);
+      std::filesystem::remove_all(secrets.c_str(), error);
+    }
+  } cleanup {copy, copySecrets};
+  auto copyState = [&](const String& from, const String& to) {
+    std::error_code error;
+    if (::mkdir(const_cast<String&>(to).c_str(), 0700) != 0) return false;
+    for (std::filesystem::recursive_directory_iterator it(const_cast<String&>(from).c_str(), error), end;
+         error.value() == 0 && it != end; it.increment(error))
+    {
+      auto relative = it->path().lexically_relative(const_cast<String&>(from).c_str());
+      auto destination = std::filesystem::path(const_cast<String&>(to).c_str()) / relative;
+      if (it->is_symlink(error)) return false;
+      if (it->is_directory(error))
+      {
+        if (::mkdir(destination.c_str(), 0700) != 0) return false;
+      }
+      else if (it->is_regular_file(error))
+      {
+        if (std::filesystem::copy_file(it->path(), destination, std::filesystem::copy_options::none, error) == false ||
+            ::chmod(destination.c_str(), 0600) != 0) return false;
+      }
+      else return false;
+    }
+    return error.value() == 0;
+  };
+  String sourceSecrets = source; sourceSecrets.append(".secrets"_ctv);
+  if (copyState(source, copy) == false || copyState(sourceSecrets, copySecrets) == false)
+    return reject("private crash-consistent Brain state capture failed");
+  if (mothershipVDCSignal(operation.worker, SIGCONT) == false)
+    return reject("cannot resume exact Brain for authenticated checkpoint export");
+
+  String checkpointPath = {}, failurePath = {};
+  mothershipVirtualDatacenterPath(directory, "local-checkpoint.bin", checkpointPath);
+  mothershipVirtualDatacenterPath(directory, "checkpoint-failure", failurePath);
+  pid_t child = ::fork();
+  if (child == 0)
+  {
+    String childFailure = {};
+    bool okay = false;
+    {
+      ProdigyPersistentStateStore state(copy);
+      ProdigyPersistentLocalBrainState local = {};
+      ProdigyPersistentBrainSnapshot snapshot = {};
+      if (state.loadLocalBrainState(local, &childFailure) && state.loadBrainSnapshot(snapshot, &childFailure) &&
+          local.ownerClusterUUID == operation.clusterUUID && local.uuid != 0 &&
+          snapshot.brainConfig.clusterUUID == operation.clusterUUID &&
+          snapshot.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256 == operation.expectedIncompleteWorkerBundle &&
+          snapshot.masterAuthority.runtimeState.updateSelf.workerMachineUUIDs.empty() == false &&
+          snapshot.masterAuthority.runtimeState.updateSelf.workerStateUploadedMachineUUIDs.size() !=
+              snapshot.masterAuthority.runtimeState.updateSelf.workerMachineUUIDs.size())
+      {
+        context.datacenterFragment = snapshot.brainConfig.datacenterFragment;
+        String netPath = {};
+        netPath.snprintf<"/proc/{itoa}/ns/net"_ctv>(operation.worker.pid);
+        int network = ::open(netPath.c_str(), O_RDONLY | O_CLOEXEC);
+        if (network >= 0 && mothershipVDCProcessMatches(operation.worker) && ::setns(network, CLONE_NEWNET) == 0)
+        {
+          ProdigyLocalContainerCheckpoint checkpoint = {};
+          if (mothershipCaptureNeuronCheckpoint(local, "::1"_ctv, operation.expectedOldBundle,
+                                               checkpoint, mothershipVDCFreezeCheckpoint, &context, &childFailure))
+          {
+            String serialized = {};
+            BitseryEngine::serialize(serialized, checkpoint);
+            okay = mothershipVDCDurableWrite(directory, "local-checkpoint.bin", serialized, &childFailure);
+          }
+        }
+        if (network >= 0) ::close(network);
+      }
+      state.close();
+      if (okay == false && childFailure.empty()) childFailure.assign("checkpoint authority, pending update, or namespace mismatch"_ctv);
+    }
+    if (okay == false) (void)mothershipVDCDurableWrite(directory, "checkpoint-failure", childFailure, nullptr);
+    _exit(okay ? 0 : 1);
+  }
+  if (child < 0) return reject("cannot launch isolated checkpoint client");
+  bool finished = false;
+  int status = 0;
+  for (unsigned attempt = 0; attempt < 300; ++attempt)
+  {
+    if (::waitpid(child, &status, WNOHANG) == child) { finished = true; break; }
+    ::usleep(100000);
+  }
+  if (finished == false)
+  {
+    (void)::kill(child, SIGKILL);
+    while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    return reject("authenticated local checkpoint capture timed out");
+  }
+  if (WIFEXITED(status) == false || WEXITSTATUS(status) != 0)
+  {
+    String detail = {};
+    if (mothershipVDCRead(failurePath, detail) && failure) *failure = detail;
+    else if (failure) failure->assign("authenticated local checkpoint capture failed"_ctv);
+    return false;
+  }
+  if (mothershipVDCWaitStopped(operation.worker) == false) return reject("checkpoint runtime fence was lost");
+  String originalPath = {}, original = {}, checkpoint = {}, successorBoot = {};
+  mothershipVirtualDatacenterPath(directory, "previous-boot.json", originalPath);
+  if (mothershipVDCRead(originalPath, original, 32 * 1024 * 1024) == false ||
+      mothershipVDCRead(checkpointPath, checkpoint, 32 * 1024 * 1024) == false ||
+      mothershipVDCPrepareSupersessionBoot(original, operation, successorBoot, failure, &checkpoint) == false ||
+      prodigyComputeSHA256Hex(successorBoot, operation.successorBootSHA256, failure) == false ||
+      mothershipVDCDurableWrite(directory, "successor-boot.json", successorBoot, failure) == false)
+    return false;
+  return true;
+}
+
 static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyCluster& cluster,
     const String& bundlePath, const String& successorSHA, uint32_t machineIndex,
     const String& expectedOldSHA, const String& expectedIncompleteWorkerSHA, String *failure)
 {
   auto reject = [&](const char *message) { if (failure) failure->assign(message); return false; };
-  if (mothershipVDCRecoveryTargetIsSupported(machineIndex, cluster.nBrains) == false)
+  if (mothershipVDCRecoveryTargetIsSupported(machineIndex, cluster.nBrains, expectedIncompleteWorkerSHA.empty() == false) == false)
     return reject("Brain replacement is unsupported without an authoritative local-container checkpoint");
   if (expectedIncompleteWorkerSHA.empty() == false && (machineIndex != 1 || cluster.nBrains != 1 ||
       prodigyIsSHA256HexDigest(expectedIncompleteWorkerSHA) == false || expectedIncompleteWorkerSHA.equals(successorSHA)))
@@ -3799,6 +4043,8 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
       if (operation.phase < MothershipVDCRecoveryPhase::committed) {
         if (operation.adopter.pid > 1) (void)mothershipVDCSignal(operation.adopter, SIGKILL);
         char state = 0;
+        if (mothershipVDCProcessMatches(operation.worker, &state) && (state == 'T' || state == 't'))
+          (void)mothershipVDCSignal(operation.worker, SIGCONT);
         if (mothershipVDCProcessMatches(operation.supervisor, &state) && (state == 'T' || state == 't'))
           (void)mothershipVDCSignal(operation.supervisor, SIGCONT);
       }
@@ -3828,6 +4074,10 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
       String observedBootSHA = {};
       if (prodigyComputeFileSHA256Hex(bootPath, observedBootSHA, failure) == false || observedBootSHA.equals(operation.previousBootSHA256) == false)
         return reject("retained Brain boot identity changed before provider handoff");
+    }
+    if (expectedIncompleteWorkerSHA.empty() == false)
+    {
+      if (mothershipVDCCaptureLocalCheckpoint(operation, directory, failure) == false || save() == false) return false;
     }
     String readyPath = {}; mothershipVirtualDatacenterPath(directory, "ready", readyPath);
     auto readReady = [&]() {
@@ -3958,7 +4208,7 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
       String currentSHA = {}, stagedBoot = {}, stagedSHA = {}, stagedPath = {};
       mothershipVirtualDatacenterPath(directory, "successor-boot.json", stagedPath);
       if (prodigyComputeFileSHA256Hex(bootPath, currentSHA, failure) == false ||
-          mothershipVDCRead(stagedPath, stagedBoot) == false ||
+          mothershipVDCRead(stagedPath, stagedBoot, 32 * 1024 * 1024) == false ||
           prodigyComputeSHA256Hex(stagedBoot, stagedSHA, failure) == false || stagedSHA.equals(operation.successorBootSHA256) == false)
         return reject("prepared Brain bootstrap receipt identity mismatch");
       if (currentSHA.equals(operation.successorBootSHA256) == false)
