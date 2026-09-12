@@ -1101,6 +1101,9 @@ public:
   // duplicate runtimes when the remaining Neurons report their live copies.
   bool recoveringPersistedNeuronInventory = false;
   bool persistedMachineInventoryEnumerated = false;
+  // A runtime-ready Neuron has acknowledged its network assignment, but only
+  // stateUpload establishes its authoritative live-container inventory.
+  bytell_hash_set<uint128_t> persistedMachineInventoryUploaded;
   bool recoveredNeuronPairingsUnified = false;
 
   TimeoutPacket osUpdateTimer;
@@ -10326,7 +10329,8 @@ public:
         continue;
       }
 
-      if (machine->runtimeReady == false)
+      if (machine->uuid == 0 || machine->runtimeReady == false ||
+          persistedMachineInventoryUploaded.contains(machine->uuid) == false)
       {
         return false;
       }
@@ -11033,7 +11037,14 @@ public:
           neuron->wBuffer.clear();
         }
 
-        const bool requiresNeuronState = ignited && (reconnecting == false || machineNeedsNeuronStateRefresh(neuron->machine));
+        if (recoveringPersistedNeuronInventory && neuron->machine != nullptr)
+        {
+          persistedMachineInventoryUploaded.erase(neuron->machine->uuid);
+        }
+        const bool requiresNeuronState = recoveringPersistedNeuronInventory ||
+                                         (ignited &&
+                                          (reconnecting == false ||
+                                           machineNeedsNeuronStateRefresh(neuron->machine)));
         Message::construct(neuron->wBuffer, NeuronTopic::registration, requiresNeuronState);
         PRODIGY_DEBUG_LOG(
                      "brain neuron connect-queue-before stream=%p uuid=%llu private4=%u fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d wbytes=%u queued=%llu needsKick=%d\n",
@@ -12466,6 +12477,11 @@ public:
       cancelNeuronControlHandshakeWatchdog(neuron, "close");
       neuron->connected = false;
 
+      if (neuron->machine != nullptr)
+      {
+        persistedMachineInventoryUploaded.erase(neuron->machine->uuid);
+      }
+
       neuron->cancelSuspended();
       basics_log("brain neuron close stream=%p uuid=%llu private4=%u reconnect=%d connected=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d fd=%d isFixed=%d fslot=%d queuedBytes=%llu wbytes=%u rbytes=%llu\n",
                  static_cast<void *>(neuron),
@@ -12695,6 +12711,7 @@ public:
 
     machine->reportedDatacenterFragment = 0;
     machine->reportedFragment = 0;
+    persistedMachineInventoryUploaded.erase(machine->uuid);
     machine->runtimeReady = false;
 
     uint32_t headerOffset = Message::appendHeader(machine->neuron.wBuffer, NeuronTopic::stateUpload);
@@ -17348,6 +17365,7 @@ public:
     {
       recoveringPersistedNeuronInventory = true;
       persistedMachineInventoryEnumerated = false;
+      persistedMachineInventoryUploaded.clear();
       recoveredNeuronPairingsUnified = false;
     }
 
@@ -17485,6 +17503,15 @@ public:
           // traffic into a dead neuron stream.
           if (neuronControlStreamActive(machine) || nv->pendingSend || nv->pendingRecv || nv->connectAttemptPending())
           {
+            if (recoveringPersistedNeuronInventory &&
+                machine->state != MachineState::hardwareFailure &&
+                machine->state != MachineState::decommissioning &&
+                neuronControlStreamActive(machine))
+            {
+              persistedMachineInventoryUploaded.erase(machine->uuid);
+              Message::construct(nv->wBuffer, NeuronTopic::registration, true);
+              Ring::queueSend(nv);
+            }
             PRODIGY_DEBUG_LOG(
                          "prodigy debug neuron-control-rearm-preserve source=self-elect uuid=%llu private4=%u connected=%d closing=%d pendingConnect=%d pendingSend=%d pendingRecv=%d fd=%d fslot=%d\n",
                          (unsigned long long)machine->uuid,
@@ -19093,6 +19120,7 @@ public:
     neuron->reconnectAfterClose = false;
     neuron->connected = false;
     neuron->cancelSuspended();
+    persistedMachineInventoryUploaded.erase(machine->uuid);
 
     machines.erase(machine);
     for (auto indexed = machinesByUUID.begin(); indexed != machinesByUUID.end();)
@@ -30492,6 +30520,8 @@ public:
         }
       case NeuronTopic::stateUpload:
         {
+          persistedMachineInventoryUploaded.erase(neuron->machine->uuid);
+
           // fragment(4) [containerPlan{4} + runtimeCores(2) + runtimeMemMB(4) + runtimeStorMB(4)]...
 
           struct local_container_subnet6 fragment;
@@ -30811,6 +30841,10 @@ public:
                      int(malformedStateUpload));
 #endif
 
+          if (neuron->machine->uuid != 0)
+          {
+            persistedMachineInventoryUploaded.insert(neuron->machine->uuid);
+          }
           neuron->machine->runtimeReady =
               neuron->machine->fragment > 0 && neuron->machine->reportedDatacenterFragment != 0 && (brainConfig.datacenterFragment == 0 || neuron->machine->reportedDatacenterFragment == brainConfig.datacenterFragment) && neuron->machine->reportedFragment == neuron->machine->fragment;
           promoteMachineToHealthyIfReady(neuron->machine);

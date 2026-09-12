@@ -2955,12 +2955,14 @@ int main(void)
     }
   }
 
+  for (bool recoveringInventory : {false, true})
   {
     ScopedRing scopedRing = {};
 
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
-    brain.ignited = true;
+    brain.ignited = !recoveringInventory;
+    brain.recoveringPersistedNeuronInventory = recoveringInventory;
 
     Machine machine = {};
     machine.private4 = IPAddress("10.0.0.21", false).v4;
@@ -2986,7 +2988,8 @@ int main(void)
       suite.expect(findNeuronRegistrationRequiresState(machine.neuron.wBuffer, requiresState), "brain_neuron_connect_handler_reconnect_finds_registration_payload");
       suite.expect(topics.size() == 1, "brain_neuron_connect_handler_reconnect_drops_stale_payload");
       suite.expect(topics[0] == uint16_t(NeuronTopic::registration), "brain_neuron_connect_handler_reconnect_requeues_registration_only");
-      suite.expect(requiresState == false, "brain_neuron_connect_handler_reconnect_does_not_request_authoritative_state_upload");
+      suite.expect(requiresState == recoveringInventory,
+                   "brain_neuron_reconnect_requests_recovery_inventory_before_ignition");
 
       Ring::uninstallFromFixedFileSlot(&machine.neuron);
       ::close(peerFD);
@@ -9042,6 +9045,59 @@ int main(void)
 
     brain.brains.erase(peer);
     delete peer;
+  }
+
+  {
+    TestBrain brain = {};
+    brain.recoveringPersistedNeuronInventory = true;
+    brain.persistedMachineInventoryEnumerated = true;
+
+    Machine machine = {};
+    machine.uuid = uint128_t(0x710);
+    machine.state = MachineState::healthy;
+    machine.runtimeReady = true;
+    brain.machines.insert(&machine);
+
+    suite.expect(brain.testFinalizePersistedNeuronInventoryRecovery() == false &&
+                     brain.testRecoveringPersistedNeuronInventory(),
+                 "persisted_inventory_recovery_waits_for_authoritative_machine_upload");
+
+    // An empty upload is authoritative: exercise the actual message owner,
+    // which must open the gate for a genuinely missing runtime.
+    brain.brainConfig.datacenterFragment = 0x34;
+    machine.fragment = 7;
+    machine.neuron.machine = &machine;
+    String upload = {};
+    uint32_t headerOffset = Message::appendHeader(upload, NeuronTopic::stateUpload);
+    struct local_container_subnet6 fragment = {};
+    fragment.dpfx = brain.brainConfig.datacenterFragment;
+    fragment.mpfx[2] = 7;
+    Message::appendAlignedBuffer<Alignment::one>(
+        upload, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
+    Message::finish(upload, headerOffset);
+    brain.testNeuronHandler(&machine.neuron, reinterpret_cast<Message *>(upload.data()));
+    suite.expect(brain.persistedMachineInventoryUploaded.contains(machine.uuid),
+                 "persisted_inventory_recovery_credits_actual_empty_upload");
+
+    brain.queueNeuronStateUploadForMachine(&machine);
+    suite.expect(brain.persistedMachineInventoryUploaded.contains(machine.uuid) == false &&
+                     brain.testFinalizePersistedNeuronInventoryRecovery() == false,
+                 "persisted_inventory_recovery_replay_invalidates_prior_upload");
+
+    brain.testNeuronHandler(&machine.neuron, reinterpret_cast<Message *>(upload.data()));
+    brain.neurons.insert(&machine.neuron);
+    brain.testCloseHandler(&machine.neuron);
+    suite.expect(brain.persistedMachineInventoryUploaded.contains(machine.uuid) == false &&
+                     brain.testFinalizePersistedNeuronInventoryRecovery() == false,
+                 "persisted_inventory_recovery_close_invalidates_prior_upload");
+    brain.neurons.erase(&machine.neuron);
+
+    brain.testNeuronHandler(&machine.neuron, reinterpret_cast<Message *>(upload.data()));
+    suite.expect(brain.testFinalizePersistedNeuronInventoryRecovery() &&
+                     brain.testRecoveringPersistedNeuronInventory() == false,
+                 "persisted_inventory_recovery_accepts_authoritative_empty_upload");
+
+    brain.machines.erase(&machine);
   }
 
   thisNeuron = nullptr;
