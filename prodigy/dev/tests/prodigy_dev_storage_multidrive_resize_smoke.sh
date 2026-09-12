@@ -10,14 +10,15 @@ upgrade_bundle="${6:-}"
 case "${test_mode}" in
    resize) host_network=true ;;
    mount-only) host_network=false ;;
-   legacy-handoff|legacy-recovery|legacy-recovery-zero|provider-handoff|bootstrap-supersession) host_network=false ;;
-   *) echo "error: expected resize, mount-only, legacy-handoff, legacy-recovery, legacy-recovery-zero, provider-handoff or bootstrap-supersession mode" >&2; exit 2 ;;
+   legacy-handoff|legacy-recovery|legacy-recovery-zero|initial-health-zero|provider-handoff|bootstrap-supersession) host_network=false ;;
+   *) echo "error: expected resize, mount-only, legacy-handoff, legacy-recovery, legacy-recovery-zero, initial-health-zero, provider-handoff or bootstrap-supersession mode" >&2; exit 2 ;;
 esac
 is_handoff=0
-[[ "${test_mode}" != legacy-handoff && "${test_mode}" != legacy-recovery && "${test_mode}" != legacy-recovery-zero && "${test_mode}" != provider-handoff && "${test_mode}" != bootstrap-supersession ]] || is_handoff=1
+[[ "${test_mode}" != legacy-handoff && "${test_mode}" != legacy-recovery && "${test_mode}" != legacy-recovery-zero && "${test_mode}" != initial-health-zero && "${test_mode}" != provider-handoff && "${test_mode}" != bootstrap-supersession ]] || is_handoff=1
 [[ "${storage_devices}" == 0 || "${storage_devices}" == 2 ]] || { echo "error: expected zero or two storage devices" >&2; exit 2; }
 [[ "${test_mode}" != resize || "${storage_devices}" == 2 ]] || { echo "error: resize requires two storage devices" >&2; exit 2; }
-[[ "${is_handoff}" == 0 || ( "${storage_devices}" == 0 && -s "${upgrade_bundle}" ) ]] || { echo "error: legacy handoff requires zero devices and an exact upgrade bundle" >&2; exit 2; }
+[[ "${is_handoff}" == 0 || "${storage_devices}" == 0 ]] || { echo "error: legacy handoff requires zero storage devices" >&2; exit 2; }
+[[ "${test_mode}" == initial-health-zero || "${is_handoff}" == 0 || -s "${upgrade_bundle}" ]] || { echo "error: handoff update modes require an exact upgrade bundle" >&2; exit 2; }
 [[ "${is_handoff}" == 0 || "${PRODIGY_STORAGE_HANDOFF_EXPECTED_RUNTIME_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || { echo "error: legacy handoff requires the sealed successor runtime hash" >&2; exit 2; }
 if [[ "${test_mode}" == provider-handoff || "${test_mode}" == bootstrap-supersession ]]; then
    old_bundle_sha="${PRODIGY_STORAGE_HANDOFF_EXPECTED_OLD_BUNDLE_SHA256:-}"
@@ -42,7 +43,7 @@ prodigy_dev_reexec_in_private_mount_namespace_once PRODIGY_DEV_STORAGE_MULTIDRIV
 
 if [[ -z "${PRODIGY_BIN}" || -z "${MOTHERSHIP_BIN}" || -z "${PINGPONG_BIN}" ]]
 then
-   echo "usage: $0 /path/to/prodigy /path/to/mothership /path/to/prodigy_pingpong_container [resize|mount-only|legacy-handoff|legacy-recovery|provider-handoff] [0|2 storage devices] [upgrade bundle]"
+   echo "usage: $0 /path/to/prodigy /path/to/mothership /path/to/prodigy_pingpong_container [resize|mount-only|legacy-handoff|legacy-recovery|initial-health-zero|provider-handoff] [0|2 storage devices] [upgrade bundle]"
    exit 2
 fi
 
@@ -227,10 +228,10 @@ then
    fi
    expected_healthy=3
    initial_healthy=3
-   if [[ "${test_mode}" == legacy-recovery || "${test_mode}" == legacy-recovery-zero ]]
+   if [[ "${test_mode}" == legacy-recovery || "${test_mode}" == legacy-recovery-zero || "${test_mode}" == initial-health-zero ]]
    then
       initial_healthy=1
-      if [[ "${test_mode}" == legacy-recovery-zero ]]
+      if [[ "${test_mode}" == legacy-recovery-zero || "${test_mode}" == initial-health-zero ]]
       then
          initial_healthy=0
       fi
@@ -349,7 +350,7 @@ prodigy_dev_write_common_prodigy_assets "${discombobulator_file}"
 if [[ "${is_handoff}" == 1 ]]
 then
    printf 'ENV PINGPONG_STORAGE_HANDOFF_MODE=seed\nENV PINGPONG_STORAGE_HANDOFF_ID=%s\n' "${handoff_id}" >> "${discombobulator_file}"
-   if [[ "${test_mode}" == legacy-recovery || "${test_mode}" == legacy-recovery-zero ]]
+   if [[ "${test_mode}" == legacy-recovery || "${test_mode}" == legacy-recovery-zero || "${test_mode}" == initial-health-zero ]]
    then
       # Recovery fixtures retain real seeded data owners while readiness is withheld.
       printf 'ENV PINGPONG_STORAGE_HANDOFF_WAIT_FOR_TRAFFIC=1\n' >> "${discombobulator_file}"
@@ -426,7 +427,7 @@ python3 - "${plan_json}" "${test_mode}" <<'PY'
 import json, sys
 with open(sys.argv[1]) as stream:
     plan = json.load(stream)
-if sys.argv[2] in ('legacy-handoff', 'legacy-recovery', 'legacy-recovery-zero', 'provider-handoff', 'bootstrap-supersession'):
+if sys.argv[2] in ('legacy-handoff', 'legacy-recovery', 'legacy-recovery-zero', 'initial-health-zero', 'provider-handoff', 'bootstrap-supersession'):
     plan.pop('stateless')
     plan['verticalScalers'] = []
 else:
@@ -621,7 +622,113 @@ if phase == 'after':
 print('HANDOFF_OBSERVATION_PASS', phase, 'replicas=3')
 PY
    }
+   run_successor_handoff()
+   {
+      local active_state="$1"
+   # A second Discombobulator artifact reads the data before signaling healthy;
+   # the harness never seeds or modifies a live container's storage.
+   sed 's/PINGPONG_STORAGE_HANDOFF_MODE=seed/PINGPONG_STORAGE_HANDOFF_MODE=verify/' \
+      "${discombobulator_file}" > "${artifact_project_dir}/Verify.DiscombobuFile"
+   prodigy_dev_run_discombobulator_build "${artifact_project_dir}" "${artifact_project_dir}/Verify.DiscombobuFile" \
+      "${tmpdir}/verify.container.zst" "bin=$(dirname "${PINGPONG_BIN}")" "ebpf=$(dirname "${PRODIGY_BIN}")"
+   python3 - "${plan_json}" "${tmpdir}/verify.plan.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as stream:
+    plan = json.load(stream)
+plan['config']['versionID'] += 1
+with open(sys.argv[2], 'w') as stream:
+    json.dump(plan, stream)
+PY
+   env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+      "${MOTHERSHIP_BIN}" deploy "${cluster_name}" "$(cat "${tmpdir}/verify.plan.json")" \
+      "${tmpdir}/verify.container.zst" >"${tmpdir}/verify-deploy.log" 2>&1
+   if [[ -n "${active_state}" ]]
+   then
+      queued=0
+      for _ in $(seq 1 120)
+      do
+         if env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+            timeout 8s "${MOTHERSHIP_BIN}" applicationReport "${cluster_name}" Nametag >"${tmpdir}/recovery-admission-report.log" 2>&1 &&
+            report_version_ready "${tmpdir}/recovery-admission-report.log" "${version_id}" 3 "${initial_healthy}" "${active_state}" &&
+            report_version_ready "${tmpdir}/recovery-admission-report.log" "$((version_id + 1))" 0 0 waitingToDeploy
+         then
+            queued=1
+            break
+         fi
+         sleep 0.5
+      done
+      [[ "${queued}" == 1 ]] || { echo "FAIL: exact retained 3/${initial_healthy} predecessor and empty waiting successor not observed" >&2; exit 1; }
+      python3 - "${version_id}" "${tmpdir}/verify.container.zst" "${tmpdir}/recovery-request.json" <<'PY_RECOVERY_REQUEST'
+import hashlib, json, pathlib, sys, uuid
+version, blob, output = sys.argv[1:]
+request = dict(applicationName='Nametag', applicationID=6, activeVersionID=int(version),
+               successorVersionID=int(version) + 1, operationID=str(uuid.uuid4()),
+               successorBlobSHA256=hashlib.sha256(pathlib.Path(blob).read_bytes()).hexdigest())
+pathlib.Path(output).write_text(json.dumps(request) + '\n')
+PY_RECOVERY_REQUEST
+      for admission in initial retry
+      do
+         env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+            timeout 15s "${MOTHERSHIP_BIN}" recoverMaterializedStatefulDeployment "${cluster_name}" \
+            "$(cat "${tmpdir}/recovery-request.json")" >"${tmpdir}/recovery-${admission}.log" 2>&1
+         python3 - "${tmpdir}/recovery-request.json" "${tmpdir}/recovery-${admission}.log" <<'PY_RECOVERY_ACCEPTED'
+import json, pathlib, re, sys
+request = json.loads(pathlib.Path(sys.argv[1]).read_text())
+text = pathlib.Path(sys.argv[2]).read_text()
+line = next((line for line in text.splitlines() if line.startswith('recoverMaterializedStatefulDeployment accepted=')), '')
+fields = dict(re.findall(r'(\w+)=([^\s]*)', line))
+assert fields.get('accepted') == '1' and fields.get('failure') == '', line
+assert fields.get('operationID') == request['operationID'], line
+assert int(fields['appID']) == request['applicationID']
+for name in ('activeVersionID', 'successorVersionID'):
+    assert int(fields[name]) == request[name]
+    deployment = name.replace('VersionID', 'DeploymentID')
+    assert int(fields[deployment]) == ((request['applicationID'] << 48) | request[name])
+assert int(fields['durableGeneration']) > 0, line
+print('RECOVERY_API_ACCEPTED', pathlib.Path(sys.argv[2]).name, request['operationID'])
+PY_RECOVERY_ACCEPTED
+      done
+   fi
+   # Each replacement waits for actual predecessor exit, then actual health.
+   # Budget every serial stop grace; a fixed one-minute loop cuts off replica 3.
+   handoff_wait_seconds="$(python3 - "${plan_json}" "${expected_healthy}" <<'PY_HANDOFF_WAIT'
+import json, sys
+with open(sys.argv[1]) as stream:
+    config = json.load(stream)['config']
+per_replica = config['sTilKillable'] + (config['msTilHealthy'] + 999) // 1000 + config['sTilHealthcheck']
+print(int(sys.argv[2]) * per_replica + 30)
+PY_HANDOFF_WAIT
+)"
+   healthy=0
+   handoff_started=${SECONDS}
+   handoff_deadline=$((handoff_started + handoff_wait_seconds))
+   attempt=0
+   while (( SECONDS < handoff_deadline ))
+   do
+      attempt=$((attempt + 1))
+      if env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+         timeout 8s "${MOTHERSHIP_BIN}" applicationReport "${cluster_name}" Nametag >"${tmpdir}/verify-report.log" 2>&1 &&
+         report_version_ready "${tmpdir}/verify-report.log" "$((version_id + 1))" 3
+      then
+         healthy=1
+      fi
+      printf 'attempt=%s elapsedSeconds=%s budgetSeconds=%s\n' \
+         "${attempt}" "$((SECONDS - handoff_started))" "${handoff_wait_seconds}" >>"${tmpdir}/verify-report-samples.log"
+      cat "${tmpdir}/verify-report.log" >>"${tmpdir}/verify-report-samples.log"
+      [[ "${healthy}" != 1 ]] || break
+      sleep 0.5
+   done
+   [[ "${healthy}" == 1 ]] || { echo "FAIL: successor did not become healthy within ${handoff_wait_seconds}s serial handoff budget" >&2; exit 1; }
+   observe_handoff after
+   }
+
    observe_handoff before
+   if [[ "${test_mode}" == initial-health-zero ]]
+   then
+      run_successor_handoff deploying
+      echo "PASS: direct-runtime initial 3/0 health recovery, durable idempotent operation and three-replica storage readback"
+      exit 0
+   fi
    if [[ "${test_mode}" == provider-handoff ]]; then
       for machine_index in 2 3 4 1; do
          env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
@@ -734,101 +841,12 @@ PY
       echo "FAIL: controller recovery replaced original application/storage owners; no successor submitted" >&2
       exit 1
    }
-   # A second Discombobulator artifact reads the data before signaling healthy;
-   # the harness never seeds or modifies a live container's storage.
-   sed 's/PINGPONG_STORAGE_HANDOFF_MODE=seed/PINGPONG_STORAGE_HANDOFF_MODE=verify/' \
-      "${discombobulator_file}" > "${artifact_project_dir}/Verify.DiscombobuFile"
-   prodigy_dev_run_discombobulator_build "${artifact_project_dir}" "${artifact_project_dir}/Verify.DiscombobuFile" \
-      "${tmpdir}/verify.container.zst" "bin=$(dirname "${PINGPONG_BIN}")" "ebpf=$(dirname "${PRODIGY_BIN}")"
-   python3 - "${plan_json}" "${tmpdir}/verify.plan.json" <<'PY'
-import json, sys
-with open(sys.argv[1]) as stream:
-    plan = json.load(stream)
-plan['config']['versionID'] += 1
-with open(sys.argv[2], 'w') as stream:
-    json.dump(plan, stream)
-PY
-   env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
-      "${MOTHERSHIP_BIN}" deploy "${cluster_name}" "$(cat "${tmpdir}/verify.plan.json")" \
-      "${tmpdir}/verify.container.zst" >"${tmpdir}/verify-deploy.log" 2>&1
+   recovery_active_state=""
    if [[ "${test_mode}" == legacy-recovery || "${test_mode}" == legacy-recovery-zero ]]
    then
-      queued=0
-      for _ in $(seq 1 120)
-      do
-         if env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
-            timeout 8s "${MOTHERSHIP_BIN}" applicationReport "${cluster_name}" Nametag >"${tmpdir}/recovery-admission-report.log" 2>&1 &&
-            report_version_ready "${tmpdir}/recovery-admission-report.log" "${version_id}" 3 "${initial_healthy}" none &&
-            report_version_ready "${tmpdir}/recovery-admission-report.log" "$((version_id + 1))" 0 0 waitingToDeploy
-         then
-            queued=1
-            break
-         fi
-         sleep 0.5
-      done
-      [[ "${queued}" == 1 ]] || { echo "FAIL: exact retained 3/${initial_healthy} predecessor and empty waiting successor not observed" >&2; exit 1; }
-      python3 - "${version_id}" "${tmpdir}/verify.container.zst" "${tmpdir}/recovery-request.json" <<'PY_RECOVERY_REQUEST'
-import hashlib, json, pathlib, sys, uuid
-version, blob, output = sys.argv[1:]
-request = dict(applicationName='Nametag', applicationID=6, activeVersionID=int(version),
-               successorVersionID=int(version) + 1, operationID=str(uuid.uuid4()),
-               successorBlobSHA256=hashlib.sha256(pathlib.Path(blob).read_bytes()).hexdigest())
-pathlib.Path(output).write_text(json.dumps(request) + '\n')
-PY_RECOVERY_REQUEST
-      for admission in initial retry
-      do
-         env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
-            timeout 15s "${MOTHERSHIP_BIN}" recoverMaterializedStatefulDeployment "${cluster_name}" \
-            "$(cat "${tmpdir}/recovery-request.json")" >"${tmpdir}/recovery-${admission}.log" 2>&1
-         python3 - "${tmpdir}/recovery-request.json" "${tmpdir}/recovery-${admission}.log" <<'PY_RECOVERY_ACCEPTED'
-import json, pathlib, re, sys
-request = json.loads(pathlib.Path(sys.argv[1]).read_text())
-text = pathlib.Path(sys.argv[2]).read_text()
-line = next((line for line in text.splitlines() if line.startswith('recoverMaterializedStatefulDeployment accepted=')), '')
-fields = dict(re.findall(r'(\w+)=([^\s]*)', line))
-assert fields.get('accepted') == '1' and fields.get('failure') == '', line
-assert fields.get('operationID') == request['operationID'], line
-assert int(fields['appID']) == request['applicationID']
-for name in ('activeVersionID', 'successorVersionID'):
-    assert int(fields[name]) == request[name]
-    deployment = name.replace('VersionID', 'DeploymentID')
-    assert int(fields[deployment]) == ((request['applicationID'] << 48) | request[name])
-assert int(fields['durableGeneration']) > 0, line
-print('RECOVERY_API_ACCEPTED', pathlib.Path(sys.argv[2]).name, request['operationID'])
-PY_RECOVERY_ACCEPTED
-      done
+      recovery_active_state=none
    fi
-   # Each replacement waits for actual predecessor exit, then actual health.
-   # Budget every serial stop grace; a fixed one-minute loop cuts off replica 3.
-   handoff_wait_seconds="$(python3 - "${plan_json}" "${expected_healthy}" <<'PY_HANDOFF_WAIT'
-import json, sys
-with open(sys.argv[1]) as stream:
-    config = json.load(stream)['config']
-per_replica = config['sTilKillable'] + (config['msTilHealthy'] + 999) // 1000 + config['sTilHealthcheck']
-print(int(sys.argv[2]) * per_replica + 30)
-PY_HANDOFF_WAIT
-)"
-   healthy=0
-   handoff_started=${SECONDS}
-   handoff_deadline=$((handoff_started + handoff_wait_seconds))
-   attempt=0
-   while (( SECONDS < handoff_deadline ))
-   do
-      attempt=$((attempt + 1))
-      if env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
-         timeout 8s "${MOTHERSHIP_BIN}" applicationReport "${cluster_name}" Nametag >"${tmpdir}/verify-report.log" 2>&1 &&
-         report_version_ready "${tmpdir}/verify-report.log" "$((version_id + 1))" 3
-      then
-         healthy=1
-      fi
-      printf 'attempt=%s elapsedSeconds=%s budgetSeconds=%s\n' \
-         "${attempt}" "$((SECONDS - handoff_started))" "${handoff_wait_seconds}" >>"${tmpdir}/verify-report-samples.log"
-      cat "${tmpdir}/verify-report.log" >>"${tmpdir}/verify-report-samples.log"
-      [[ "${healthy}" != 1 ]] || break
-      sleep 0.5
-   done
-   [[ "${healthy}" == 1 ]] || { echo "FAIL: successor did not become healthy within ${handoff_wait_seconds}s serial handoff budget" >&2; exit 1; }
-   observe_handoff after
+   run_successor_handoff "${recovery_active_state}"
    if [[ "${test_mode}" == legacy-recovery || "${test_mode}" == legacy-recovery-zero ]]
    then
       echo "PASS: durably admitted retained 3/${initial_healthy} recovery, idempotent retry and three-replica storage readback"
