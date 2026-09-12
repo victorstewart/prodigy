@@ -452,6 +452,7 @@ application_name_for_plan()
       6) echo Nametag ;;
       7) echo Telnyx ;;
       8) echo AppleNotifs ;;
+      10) echo Truth ;;
       *)
          if [[ "${value}" =~ ^[1-9][0-9]*$ ]]
          then
