@@ -22575,7 +22575,10 @@ public:
               break;
           }
 
-          if (isActiveMaster())
+          // Persisted Neuron inventory is not complete until every live machine
+          // has uploaded its authoritative containers. The centralized recovery
+          // owner resumes these heads once that barrier clears.
+          if (isActiveMaster() && recoveringPersistedNeuronInventory == false)
           {
             for (const auto& [applicationID, head] : deploymentsByApp)
             {
@@ -24008,6 +24011,10 @@ public:
       return;
     }
     updateSelfWorkerStateUploadedMachineUUIDs.insert(neuron->machine->uuid);
+    // Registration proved the exact successor digest and this upload has now
+    // restored its authoritative inventory, so the per-machine exec fence is
+    // complete even while the durable cohort waits for its other members.
+    neuron->machine->inBinaryUpdate = false;
     // A non-empty target set is the durable completion criterion.  Do not
     // clear it early: recovery replays outstanding staged workers after a
     // master restart and reports remain visibly incomplete until all upload.

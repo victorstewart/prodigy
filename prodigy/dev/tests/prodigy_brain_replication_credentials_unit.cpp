@@ -9502,6 +9502,43 @@ static void testBootstrapBundleSupersessionReceipt(TestSuite& suite)
   brain.machines.erase(&secondWorker);
 }
 
+static void testWorkerStateUploadClearsOnlyValidatedExecFence(TestSuite& suite)
+{
+  TestBrain brain = {};
+  Machine worker = {};
+  worker.uuid = uint128_t(0x8813);
+  worker.neuron.machine = &worker;
+  worker.inBinaryUpdate = true;
+
+  const String digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
+  brain.updateSelfWorkerExpectedBundleSHA256 = digest;
+  brain.updateSelfWorkerMachineUUIDs.insert(worker.uuid);
+  brain.updateSelfWorkerStagedMachineUUIDs.insert(worker.uuid);
+  brain.updateSelfWorkerTransitionIssuedMachineUUIDs.insert(worker.uuid);
+
+  brain.noteWorkerStateUpload(&worker.neuron);
+  suite.expect(worker.inBinaryUpdate &&
+                   brain.updateSelfWorkerStateUploadedMachineUUIDs.empty(),
+               "worker_state_upload_unregistered_keeps_exec_fence");
+
+  const String wrongDigest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv;
+  brain.noteWorkerRegistration(&worker.neuron, wrongDigest);
+  brain.noteWorkerStateUpload(&worker.neuron);
+  suite.expect(worker.inBinaryUpdate &&
+                   brain.updateSelfWorkerRebootedMachineUUIDs.empty() &&
+                   brain.updateSelfWorkerStateUploadedMachineUUIDs.empty(),
+               "worker_state_upload_wrong_digest_keeps_exec_fence");
+
+  brain.updateSelfWorkerTransitionIssuedMachineUUIDs.insert(worker.uuid);
+  brain.noteWorkerRegistration(&worker.neuron, digest);
+  brain.noteWorkerStateUpload(&worker.neuron);
+  suite.expect(worker.inBinaryUpdate == false &&
+                   brain.updateSelfWorkerStateUploadedMachineUUIDs.contains(worker.uuid) &&
+                   brain.updateSelfWorkerMachineUUIDs.contains(worker.uuid) &&
+                   brain.updateSelfWorkerExpectedBundleSHA256.equals(digest),
+               "worker_state_upload_validated_inventory_clears_only_machine_exec_fence");
+}
+
 static void testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(TestSuite& suite)
 {
   TestBrain brain = {};
@@ -19293,6 +19330,110 @@ static void testBrainNeuronStateUploadHealthyReplacementPointerClearsEquivalentW
   thisBrain = previousBrain;
 }
 
+static void testMachineHealthyDefersStatelessRecoveryUntilInventoryComplete(TestSuite& suite)
+{
+  TestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.recoveringPersistedNeuronInventory = true;
+
+  BrainBase *previousBrain = thisBrain;
+  thisBrain = &brain;
+
+  Rack rack = {};
+  rack.uuid = 62'049;
+
+  Machine uploaded = {};
+  uploaded.uuid = uint128_t(0x62049001);
+  uploaded.private4 = IPAddress("10.0.0.91", false).v4;
+  uploaded.state = MachineState::deploying;
+  uploaded.runtimeReady = true;
+  uploaded.rack = &rack;
+  uploaded.rackUUID = rack.uuid;
+  uploaded.lifetime = MachineLifetime::owned;
+  uploaded.neuron.machine = &uploaded;
+
+  Machine awaitingInventory = {};
+  awaitingInventory.uuid = uint128_t(0x62049002);
+  awaitingInventory.private4 = IPAddress("10.0.0.92", false).v4;
+  awaitingInventory.state = MachineState::deploying;
+  awaitingInventory.runtimeReady = false;
+  awaitingInventory.rack = &rack;
+  awaitingInventory.rackUUID = rack.uuid;
+  awaitingInventory.lifetime = MachineLifetime::owned;
+  awaitingInventory.neuron.machine = &awaitingInventory;
+
+  rack.machines.insert(&uploaded);
+  rack.machines.insert(&awaitingInventory);
+  brain.racks.insert_or_assign(rack.uuid, &rack);
+  brain.machines.insert(&uploaded);
+  brain.machines.insert(&awaitingInventory);
+  brain.machinesByUUID.insert_or_assign(uploaded.uuid, &uploaded);
+  brain.machinesByUUID.insert_or_assign(awaitingInventory.uuid, &awaitingInventory);
+  brain.neurons.insert(&uploaded.neuron);
+  brain.neurons.insert(&awaitingInventory.neuron);
+
+  ApplicationDeployment deployment = {};
+  deployment.plan = makeDeploymentPlan(62'049, 1);
+  deployment.plan.stateless.nBase = 1;
+  deployment.state = DeploymentState::deploying;
+  deployment.nTargetBase = 1;
+  brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+  brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
+
+  ContainerView *retained = new ContainerView();
+  retained->uuid = uint128_t(0x62049003);
+  const uint128_t retainedUUID = retained->uuid;
+  retained->deploymentID = deployment.plan.config.deploymentID();
+  retained->applicationID = deployment.plan.config.applicationID;
+  retained->machine = &awaitingInventory;
+  retained->lifetime = ApplicationLifetime::base;
+  retained->state = ContainerState::healthy;
+  retained->fragment = 9;
+  deployment.containers.insert(retained);
+  brain.containers.insert_or_assign(retainedUUID, retained);
+  awaitingInventory.upsertContainerIndexEntry(retained->deploymentID, retained);
+
+  brain.handleMachineStateChange(&uploaded, MachineState::healthy);
+
+  suite.expect(brain.containers.contains(retainedUUID),
+               "machine_healthy_inventory_recovery_keeps_unreported_stateless_owner");
+  suite.expect(deployment.containers.size() == 1 &&
+                   awaitingInventory.containersByDeploymentID.contains(deployment.plan.config.deploymentID()),
+               "machine_healthy_inventory_recovery_keeps_unreported_machine_index");
+
+  // finalizePersistedNeuronInventoryRecovery clears this flag only after every
+  // live machine has uploaded. The normal healthy path must still recover once
+  // that existing barrier has completed.
+  brain.recoveringPersistedNeuronInventory = false;
+  uploaded.state = MachineState::deploying;
+  brain.handleMachineStateChange(&uploaded, MachineState::healthy);
+
+  suite.expect(brain.containers.contains(retainedUUID) == false,
+               "machine_healthy_inventory_recovery_resumes_after_inventory_complete");
+
+  if (auto it = brain.containers.find(retainedUUID); it != brain.containers.end())
+  {
+    ContainerView *container = it->second;
+    deployment.containers.erase(container);
+    awaitingInventory.removeContainerIndexEntry(container->deploymentID, container);
+    brain.containers.erase(it);
+    delete container;
+  }
+
+  brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
+  brain.deployments.erase(deployment.plan.config.deploymentID());
+  brain.neurons.erase(&awaitingInventory.neuron);
+  brain.neurons.erase(&uploaded.neuron);
+  brain.machinesByUUID.erase(awaitingInventory.uuid);
+  brain.machinesByUUID.erase(uploaded.uuid);
+  brain.machines.erase(&awaitingInventory);
+  brain.machines.erase(&uploaded);
+  brain.racks.erase(rack.uuid);
+  thisBrain = previousBrain;
+}
+
 static void testMachineHealthyClaimWakePreservesTicketOutstandingCount(TestSuite& suite)
 {
   TestBrain brain = {};
@@ -22099,6 +22240,18 @@ int main(void)
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "worker-state-upload-exec-fence") == 0)
+  {
+    testWorkerStateUploadClearsOnlyValidatedExecFence(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "brain-recovery-inventory-healthy-gate") == 0)
+  {
+    testMachineHealthyDefersStatelessRecoveryUntilInventoryComplete(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "neuron-whitehole-peer-initialization") == 0)
   {
     testNeuronWhiteholeBindingBookkeepingWithoutPrograms(suite);
@@ -22111,6 +22264,7 @@ int main(void)
     testUpdateProdigyRejectsDifferentDigestWithoutMutation(suite);
     testBootstrapBundleSupersessionReceipt(suite);
     testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(suite);
+    testWorkerStateUploadClearsOnlyValidatedExecFence(suite);
     return suite.failed == 0 ? 0 : 1;
   }
   if (std::getenv("PRODIGY_TEST_TLS_RESUMPTION_ACK_STABILITY") != nullptr)
