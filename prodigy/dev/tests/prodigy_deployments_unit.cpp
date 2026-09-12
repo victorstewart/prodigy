@@ -10982,6 +10982,7 @@ int main(void)
     deployment.plan.stateful.allMasters = true;
     deployment.plan.stateful.neverShard = false;
     deployment.plan.stateful.seedingAlways = false;
+    deployment.plan.stateful.allowUpdateInPlace = true;
     deployment.plan.canaryCount = 0;
     deployment.plan.canariesMustLiveForMinutes = 0;
     deployment.plan.moveConstructively = true;
@@ -11018,6 +11019,79 @@ int main(void)
       suite.expect(queuedMachine != nullptr && queuedMachine->neuron.pendingSendBytes > 0, "deploy_stateful_initial_schedule_marks_neuron_spins_pending_send");
       suite.expect(brain.finCount == 0, "deploy_stateful_initial_schedule_does_not_finish_before_first_health_ack");
       suite.expect(brain.failureCount == 0, "deploy_stateful_initial_schedule_does_not_fail_healthy_fixture");
+
+      // Exercise the recovery park from the actual initial scheduling path:
+      // three real health waiters and the scheduler continuation are present.
+      ApplicationDeployment successor = {};
+      successor.plan = deployment.plan;
+      successor.plan.config.versionID += 1;
+      successor.state = DeploymentState::waitingToDeploy;
+      deployment.next = &successor;
+      successor.previous = &deployment;
+      const bool initialZeroHealthyCanPark = deployment.materializedStatefulInitialHealthWaitCanPark();
+      suite.expect(initialZeroHealthyCanPark,
+                   "materialized_stateful_recovery_parks_actual_initial_zero_healthy_wait");
+      Vector<ContainerView *> initialCohort = {};
+      for (ContainerView *container : deployment.containers)
+      {
+        initialCohort.push_back(container);
+      }
+      deployment.containerIsHealthy(initialCohort[0]);
+      deployment.containerIsHealthy(initialCohort[1]);
+      const bool remainingUnhealthyCanPark = deployment.nHealthy() == 2 && deployment.waitingOnContainers.size() == 1 &&
+                                             deployment.materializedStatefulInitialHealthWaitCanPark();
+      suite.expect(remainingUnhealthyCanPark,
+                   "materialized_stateful_recovery_parks_actual_remaining_unhealthy_hot_cohort");
+      // The second half exercises the Truth-shaped 3/0 park. The scheduler is
+      // still suspended after two real health callbacks, so restore its exact
+      // initial wait map without consuming or recreating that continuation.
+      initialCohort[0]->state = ContainerState::scheduled;
+      initialCohort[1]->state = ContainerState::scheduled;
+      deployment.nHealthyBase -= 2;
+      deployment.waitingOnContainers.insert_or_assign(initialCohort[0], ContainerState::healthy);
+      deployment.waitingOnContainers.insert_or_assign(initialCohort[1], ContainerState::healthy);
+      const bool restoredZeroHealthyCanPark = deployment.nHealthy() == 0 && deployment.waitingOnContainers.size() == 3 &&
+                                              deployment.materializedStatefulInitialHealthWaitCanPark();
+      suite.expect(restoredZeroHealthyCanPark,
+                   "materialized_stateful_recovery_restored_actual_initial_zero_healthy_wait");
+
+      successor.plan.config.memoryMB += 1;
+      suite.expect(deployment.materializedStatefulInitialHealthWaitCanPark() == false,
+                   "materialized_stateful_recovery_rejects_initial_wait_memory_resize");
+      successor.plan.config.memoryMB -= 1;
+      MachineTicket pendingClaim = {};
+      pendingClaim.deployment = &deployment;
+      Machine::Claim claim = {};
+      claim.ticket = &pendingClaim;
+      machineA.claims.push_back(claim);
+      suite.expect(deployment.materializedStatefulInitialHealthWaitCanPark() == false,
+                   "materialized_stateful_recovery_rejects_initial_wait_machine_claim");
+      machineA.claims.pop_back();
+      deployment.toSchedule.push_back(nullptr);
+      suite.expect(deployment.materializedStatefulInitialHealthWaitCanPark() == false,
+                   "materialized_stateful_recovery_rejects_initial_wait_pending_work");
+      deployment.toSchedule.clear();
+
+      if (restoredZeroHealthyCanPark)
+      {
+        deployment.parkMaterializedStatefulInitialHealthWait();
+        suite.expect(deployment.state == DeploymentState::none,
+                     "materialized_stateful_recovery_park_sets_none_before_scheduler_tail");
+        suite.expect(brain.finCount == 0,
+                     "materialized_stateful_recovery_park_has_no_false_finish_callback");
+        suite.expect(deployment.schedulingStack.execution == nullptr && deployment.retiredSchedulingExecution == nullptr &&
+                         deployment.consumingSchedulingExecution == false && deployment.nSuspended == 0,
+                     "materialized_stateful_recovery_park_consumes_sole_initial_scheduler");
+        suite.expect(deployment.recoveredMaterializedStatefulRollForwardIsSafe(),
+                     "materialized_stateful_recovery_park_leaves_quiescent_retained_cohort");
+        ContainerView *lateHealthy = initialCohort[0];
+        deployment.containerIsHealthy(lateHealthy);
+        suite.expect(deployment.state == DeploymentState::none && deployment.nHealthy() == 1 &&
+                         deployment.waitingOnContainers.empty() && deployment.schedulingStack.execution == nullptr,
+                     "materialized_stateful_recovery_late_health_does_not_resume_parked_initial_scheduler");
+      }
+      deployment.next = nullptr;
+      successor.previous = nullptr;
     }
 
     {
@@ -11078,7 +11152,7 @@ int main(void)
       current.plan = old->plan;
       current.plan.config.versionID = 112;
       old->state = DeploymentState::none;
-      current.state = DeploymentState::deploying;
+      current.state = DeploymentState::waitingToDeploy;
       old->next = &current;
       current.previous = old;
       current.materializedStatefulRecoveryOwnsTransition = true;
@@ -11121,7 +11195,9 @@ int main(void)
       {
         availableMemoryBefore[index] = cohortMachines[index]->memoryMB_available;
       }
-      current.deploy();
+      suite.expect(old->recoveredMaterializedStatefulRollForwardIsSafe(),
+                   "materialized_stateful_recovery_serial_fixture_matches_parked_zero_healthy_owner");
+      current.resumeMaterializedStatefulRecovery();
       suite.expect(current.waitingOnContainers.size() == 1,
                    "materialized_stateful_recovery_architect_starts_one_unhealthy_replacement");
       uint32_t firstOldIndex = 3;

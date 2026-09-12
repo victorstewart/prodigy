@@ -30295,17 +30295,27 @@ public:
           {
             break;
           }
+          if (finalizePersistedNeuronInventoryRecovery() == false)
+          {
+            reject("materialized stateful recovery safety precondition failed");
+            break;
+          }
           auto active = deployments.find(activeID);
           auto successor = deployments.find(successorID);
           auto head = deploymentsByApp.find(request.applicationID);
-          if (finalizePersistedNeuronInventoryRecovery() == false ||
-              active == deployments.end() || successor == deployments.end() ||
+          const bool baseRecoveryReady =
+              active != deployments.end() && active->second != nullptr &&
+              active->second->recoveredMaterializedStatefulRollForwardIsSafe();
+          const bool initialHealthWaitParkable =
+              active != deployments.end() && active->second != nullptr &&
+              active->second->materializedStatefulInitialHealthWaitCanPark();
+          if (active == deployments.end() || successor == deployments.end() ||
               active->second == nullptr || successor->second == nullptr ||
               head == deploymentsByApp.end() || head->second != successor->second ||
               deploymentDNSReady(activeID) == false || deploymentDNSReady(successorID) == false ||
               active->second->next != successor->second || successor->second->previous != active->second ||
               successor->second->plan.config.containerBlobSHA256.equals(request.successorBlobSHA256) == false ||
-              active->second->recoveredMaterializedStatefulRollForwardIsSafe() == false)
+              (baseRecoveryReady == false && initialHealthWaitParkable == false))
           {
             reject("materialized stateful recovery safety precondition failed");
             break;
@@ -30325,6 +30335,14 @@ public:
             reject("materialized stateful recovery durable acceptance failed");
             break;
           }
+          // The initial-health-wait predicate is fully synchronous. Its only
+          // mutation is deliberately after durable acceptance, so a rejected
+          // request never alters the active deployment or its callbacks.
+          if (initialHealthWaitParkable)
+          {
+            active->second->parkMaterializedStatefulInitialHealthWait();
+          }
+          assert(active->second->recoveredMaterializedStatefulRollForwardIsSafe());
           successor->second->materializedStatefulRecoveryOwnsTransition = true;
           successor->second->resumeMaterializedStatefulRecovery();
           response.success = true;

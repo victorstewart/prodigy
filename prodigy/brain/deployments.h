@@ -9979,16 +9979,15 @@ public:
     recoverAfterReboot();
   }
 
-  bool recoveredMaterializedStatefulRollForwardIsSafe(void)
+  // Shared structural guard for the only retained-storage recovery path.
+  // It deliberately excludes mutable scheduler state; the two callers below
+  // own their distinct NONE and sole-initial-health-wait lifecycle barriers.
+  bool materializedStatefulRecoveryCohortAndSuccessorAreCompatible(void)
   {
     if (plan.isStateful == false || plan.config.type != ApplicationType::stateful ||
-        state != DeploymentState::none || previous != nullptr || next == nullptr ||
-        waitingOnCompactions || canaryStack != nullptr || currentlyExecutingWork != nullptr ||
-        schedulingStack.execution != nullptr || retiredSchedulingExecution != nullptr ||
-        consumingSchedulingExecution || schedulingStack.waiters.empty() == false ||
-        toSchedule.empty() == false || waitingOnContainers.empty() == false || nSuspended != 0 ||
-        nShardGroups != 1 || nTarget() != 3 || nDeployed() != nTarget() ||
-        containers.size() != nTarget() || nHealthy() >= nTarget())
+        previous != nullptr || next == nullptr || nShardGroups != 1 ||
+        nTarget() != 3 || nDeployed() != nTarget() || containers.size() != nTarget() ||
+        nHealthy() >= nTarget())
     {
       return false;
     }
@@ -9997,6 +9996,7 @@ public:
         next->plan.config.applicationID != plan.config.applicationID ||
         next->plan.stateful.allowUpdateInPlace == false || next->plan.canaryCount != 0 ||
         next->plan.config.nLogicalCores != plan.config.nLogicalCores ||
+        next->plan.config.totalMemoryMB() != plan.config.totalMemoryMB() ||
         next->plan.config.totalStorageMB() != plan.config.totalStorageMB() ||
         next->plan.stateful.clientPrefix != plan.stateful.clientPrefix ||
         next->plan.stateful.siblingPrefix != plan.stateful.siblingPrefix ||
@@ -10009,6 +10009,7 @@ public:
     {
       return false;
     }
+
     uint32_t healthy = 0;
     bytell_hash_set<Machine *> sourceMachines;
     for (ContainerView *container : containers)
@@ -10027,7 +10028,89 @@ public:
       }
       healthy += container->state == ContainerState::healthy;
     }
-    return healthy == nHealthy();
+    if (healthy != nHealthy()) return false;
+
+    for (Machine *machine : thisBrain->machines)
+    {
+      if (machine == nullptr) continue;
+      for (const Machine::Claim& claim : machine->claims)
+      {
+        if (claim.ticket != nullptr &&
+            (claim.ticket->deployment == this || claim.ticket->deployment == next))
+        {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  // A recovered initial stateful deployment can retain the normal scheduler's
+  // sole health wait even though every concrete storage owner is materialized.
+  bool materializedStatefulInitialHealthWaitCanPark(void)
+  {
+    if (state != DeploymentState::deploying || waitingOnCompactions || canaryStack != nullptr ||
+        currentlyExecutingWork != nullptr || schedulingStack.execution == nullptr ||
+        retiredSchedulingExecution != nullptr || consumingSchedulingExecution ||
+        schedulingStack.waiters.empty() == false || toSchedule.empty() == false || nSuspended != 1 ||
+        materializedStatefulRecoveryCohortAndSuccessorAreCompatible() == false ||
+        waitingOnContainers.size() != (nTarget() - nHealthy()))
+    {
+      return false;
+    }
+    for (ContainerView *container : containers)
+    {
+      const auto wait = waitingOnContainers.find(container);
+      if (container->state == ContainerState::healthy)
+      {
+        if (wait != waitingOnContainers.end()) return false;
+      }
+      else if (wait == waitingOnContainers.end() || wait->second != ContainerState::healthy)
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Call only after durable acceptance. State changes before the original
+  // scheduler is consumed so its normal tail cannot mark an unhealthy cohort
+  // running or release its retained container owners.
+  void parkMaterializedStatefulInitialHealthWait(void)
+  {
+    assert(materializedStatefulInitialHealthWaitCanPark());
+    state = DeploymentState::none;
+    stateChangedAtMs = Time::now<TimeResolution::ms>();
+    waitingOnContainers.clear();
+
+    // The scheduler tail treats any next pointer as a decommissioning request.
+    // This sole health wait has no queued work, waiters, or active work, so its
+    // consume is synchronous and no chain observer can run before restoration.
+    // Hide the already validated successor only while it retires, then restore
+    // the exact retained handoff chain.
+    ApplicationDeployment *successor = next;
+    next = nullptr;
+    consumeSchedulingExecution();
+    next = successor;
+
+    assert(schedulingStack.execution == nullptr && retiredSchedulingExecution == nullptr &&
+           consumingSchedulingExecution == false && schedulingStack.waiters.empty() &&
+           waitingOnContainers.empty() && toSchedule.empty() && nSuspended == 0 &&
+           state == DeploymentState::none && next == successor && successor != nullptr &&
+           successor->previous == this && containers.size() == nTarget());
+  }
+
+  bool recoveredMaterializedStatefulRollForwardIsSafe(void)
+  {
+    if (state != DeploymentState::none || waitingOnCompactions || canaryStack != nullptr ||
+        currentlyExecutingWork != nullptr || schedulingStack.execution != nullptr ||
+        retiredSchedulingExecution != nullptr || consumingSchedulingExecution ||
+        schedulingStack.waiters.empty() == false || toSchedule.empty() == false ||
+        waitingOnContainers.empty() == false || nSuspended != 0)
+    {
+      return false;
+    }
+    return materializedStatefulRecoveryCohortAndSuccessorAreCompatible();
   }
 
   void rollForward(void)
