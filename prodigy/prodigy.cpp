@@ -1239,11 +1239,48 @@ public:
     const bool bootstrapSupersessionSingleBrain =
         havePersistedBrainSnapshot && clusterTopologyBrainCount(persistedBrainSnapshot.topology) == 1;
     String bootstrapSupersessionFailure = {};
+    const auto& bootstrapReceipt = persistentBootState.bootstrapBundleSupersession;
+    ProdigyPersistentConsumedBootstrapBundleSupersessionReceipt expectedReceipt = {}, consumedReceipt = {};
+    bool matchingConsumedReceipt = false;
+    if (bootstrapReceipt.present())
+    {
+      expectedReceipt.operationID = bootstrapReceipt.operationID;
+      expectedReceipt.clusterUUID = bootstrapReceipt.clusterUUID;
+      expectedReceipt.localMachineUUID = persistentLocalBrainState.uuid;
+      expectedReceipt.targetControlSocketPath = bootstrapReceipt.targetControlSocketPath;
+      expectedReceipt.expectedIncompleteWorkerBundleSHA256 = bootstrapReceipt.expectedIncompleteWorkerBundleSHA256;
+      expectedReceipt.successorBundleSHA256 = bootstrapReceipt.successorBundleSHA256;
+      expectedReceipt.localContainerCheckpointSHA256 = bootstrapReceipt.localContainerCheckpointSHA256;
+      const bool haveConsumedReceipt = persistentStateStore.loadConsumedBootstrapBundleSupersessionReceipt(
+          consumedReceipt, &bootstrapSupersessionFailure);
+      if (!haveConsumedReceipt && bootstrapSupersessionFailure.size() > 0 &&
+          bootstrapSupersessionFailure != "record not found"_ctv)
+      {
+        std::fprintf(stderr, "prodigy startup could not load consumed bootstrap receipt: %s\n", bootstrapSupersessionFailure.c_str());
+        _exit(EXIT_FAILURE);
+      }
+      matchingConsumedReceipt = haveConsumedReceipt &&
+          consumedReceipt.operationID == expectedReceipt.operationID &&
+          consumedReceipt.clusterUUID == expectedReceipt.clusterUUID &&
+          consumedReceipt.localMachineUUID == expectedReceipt.localMachineUUID &&
+          consumedReceipt.targetControlSocketPath.equals(expectedReceipt.targetControlSocketPath) &&
+          consumedReceipt.expectedIncompleteWorkerBundleSHA256.equals(expectedReceipt.expectedIncompleteWorkerBundleSHA256) &&
+          consumedReceipt.successorBundleSHA256.equals(expectedReceipt.successorBundleSHA256) &&
+          consumedReceipt.localContainerCheckpointSHA256.equals(expectedReceipt.localContainerCheckpointSHA256);
+    }
     if (consumeBootstrapBundleSupersessionReceipt(persistentBootState, bootstrapSupersessionSingleBrain,
                                                  persistentLocalBrainState.uuid, persistentLocalBrainState.ownerClusterUUID,
-                                                 &bootstrapSupersessionFailure) == false)
+                                                 &bootstrapSupersessionFailure, nullptr, matchingConsumedReceipt) == false)
     {
       std::fprintf(stderr, "prodigy startup rejected bootstrap bundle supersession: %s\n", bootstrapSupersessionFailure.c_str());
+      _exit(EXIT_FAILURE);
+    }
+    // Persist only after receipt validation and durable authority acceptance.
+    // The provider may keep the original inline boot input across later execs.
+    if (bootstrapReceipt.present() && !matchingConsumedReceipt &&
+        !persistentStateStore.saveConsumedBootstrapBundleSupersessionReceipt(expectedReceipt, &bootstrapSupersessionFailure))
+    {
+      std::fprintf(stderr, "prodigy startup could not persist consumed bootstrap receipt: %s\n", bootstrapSupersessionFailure.c_str());
       _exit(EXIT_FAILURE);
     }
   }

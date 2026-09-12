@@ -22926,7 +22926,8 @@ public:
       uint128_t trustedLocalBrainUUID,
       uint128_t trustedOwnerClusterUUID,
       String *failure = nullptr,
-      const String *installedBundleOverride = nullptr)
+      const String *installedBundleOverride = nullptr,
+      bool previouslyConsumedReceipt = false)
   {
     if (failure) failure->clear();
     const ProdigyBootstrapBundleSupersessionReceipt& receipt = bootState.bootstrapBundleSupersession;
@@ -22962,12 +22963,12 @@ public:
       Filesystem::openReadAtClose(-1, installedPath, installedBundle);
     }
     String actualDigest = {}, digestFailure = {};
-    if (prodigyComputeSHA256Hex(installedBundle, actualDigest, &digestFailure) == false ||
-        actualDigest.equals(receipt.successorBundleSHA256) == false)
+    if (prodigyComputeSHA256Hex(installedBundle, actualDigest, &digestFailure) == false)
     {
       if (failure) failure->assign("bootstrap bundle supersession successor payload digest mismatch"_ctv);
       return false;
     }
+    const bool installedReceiptSuccessor = actualDigest.equals(receipt.successorBundleSHA256);
 
     // A forced sole-Brain replacement has no surviving local Neuron owner.
     // Consume its exact authenticated stateUpload before any scheduling or
@@ -23021,6 +23022,28 @@ public:
         if (failure) failure->assign("bootstrap recovery checkpoint machine fragment is already assigned"_ctv);
         return false;
       }
+    }
+
+    if (!installedReceiptSuccessor)
+    {
+      // Older recovery runtimes did not persist a consumed-receipt witness.
+      // A later normal update's authenticated worker/local checkpoint can
+      // prove that its installed payload has superseded that old input.
+      const bool laterInstalledUpdate = updateSelfWorkerMachineUUIDs.empty() == false &&
+          updateSelfWorkerExpectedBundleSHA256.equals(actualDigest) &&
+          updateSelfWorkerExpectedBundleSHA256.equals(receipt.expectedIncompleteWorkerBundleSHA256) == false &&
+          updateSelfLocalMachineUUID == trustedLocalBrainUUID &&
+          updateSelfWorkerFailure.empty() &&
+          updateSelfWorkerStateUploadedMachineUUIDs.size() == updateSelfWorkerMachineUUIDs.size() &&
+          std::all_of(updateSelfWorkerMachineUUIDs.begin(), updateSelfWorkerMachineUUIDs.end(),
+                      [&](uint128_t uuid) { return updateSelfWorkerStateUploadedMachineUUIDs.contains(uuid); });
+      if (!previouslyConsumedReceipt && !laterInstalledUpdate)
+      {
+        if (failure) failure->assign("bootstrap bundle supersession successor payload digest mismatch"_ctv);
+        return false;
+      }
+      // Do not import an old receipt's plans or replace a later update's state.
+      return true;
     }
 
     // Decode before the durable-successor return: the receipt remains the
@@ -30985,6 +31008,19 @@ public:
 
               if (reportedMachineContainerUUIDs.find(container->uuid) != reportedMachineContainerUUIDs.end())
               {
+                continue;
+              }
+
+              // The scheduler indexes a successor before Neuron has created it.
+              // An in-flight state upload is authoritative only for observed
+              // processes, so it must not erase that pending owner or free its
+              // reserved fragment before the normal failure/kill owner responds.
+              if (container->state == ContainerState::planned || container->state == ContainerState::scheduled)
+              {
+                if (container->fragment != 0)
+                {
+                  neuron->machine->usedContainerFragments.insert(container->fragment);
+                }
                 continue;
               }
 

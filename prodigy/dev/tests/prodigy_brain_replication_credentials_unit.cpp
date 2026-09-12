@@ -9421,6 +9421,50 @@ static void testBootstrapBundleSupersessionReceipt(TestSuite& suite)
                    brain.lastPersistedMasterAuthorityState.updateSelf.state == uint8_t(Brain::UpdateSelfState::idle),
                "bootstrap_supersession_clears_obsolete_coordinator_before_successor_commit");
 
+  String laterBundle = "later-normal-update-payload"_ctv;
+  String laterDigest;
+  suite.expect(prodigyComputeSHA256Hex(laterBundle, laterDigest, &failure),
+               "bootstrap_receipt_later_bundle_digest");
+  const auto beforeLaterUpdate = brain.capturePersistentUpdateSelfState();
+  suite.expect(!brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID,
+                                                                &failure, &laterBundle) &&
+                   equalSerializedObjects(beforeLaterUpdate, brain.capturePersistentUpdateSelfState()),
+               "bootstrap_receipt_unproven_different_installed_payload_rejected");
+  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID,
+                                                               &failure, &laterBundle, true) &&
+                   equalSerializedObjects(beforeLaterUpdate, brain.capturePersistentUpdateSelfState()),
+               "bootstrap_consumed_receipt_does_not_reimport_state_after_later_exec_or_provider_restart");
+  auto savedCheckpoint = boot.bootstrapBundleSupersession.localContainerCheckpoint;
+  boot.bootstrapBundleSupersession.localContainerCheckpoint.assign("corrupt"_ctv);
+  suite.expect(!brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID,
+                                                                &failure, &laterBundle, true),
+               "bootstrap_consumed_receipt_still_validates_checkpoint_integrity");
+  boot.bootstrapBundleSupersession.localContainerCheckpoint = savedCheckpoint;
+
+  // Upgrade an older recovered runtime which predates durable receipt witnesses.
+  // Every worker must have uploaded the later installed payload, including
+  // exact cohort membership rather than merely an equal acknowledgement count.
+  brain.updateSelfWorkerExpectedBundleSHA256 = laterDigest;
+  brain.updateSelfWorkerStateUploadedMachineUUIDs.insert(worker.uuid);
+  brain.updateSelfWorkerStateUploadedMachineUUIDs.insert(secondWorker.uuid);
+  const auto beforeLegacyMigration = brain.capturePersistentUpdateSelfState();
+  const auto legacyPersistCalls = brain.persistCalls;
+  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID,
+                                                               &failure, &laterBundle) &&
+                   equalSerializedObjects(beforeLegacyMigration, brain.capturePersistentUpdateSelfState()) &&
+                   brain.persistCalls == legacyPersistCalls,
+               "bootstrap_receipt_legacy_runtime_later_installed_durable_update_consumes_stale_input");
+  brain.updateSelfWorkerStateUploadedMachineUUIDs.erase(secondWorker.uuid);
+  brain.updateSelfWorkerStateUploadedMachineUUIDs.insert(secondWorker.uuid + 99);
+  suite.expect(!brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID,
+                                                                &failure, &laterBundle),
+               "bootstrap_receipt_later_update_requires_exact_uploaded_cohort");
+  brain.restorePersistentUpdateSelfState(beforeLegacyMigration);
+  brain.updateSelfWorkerFailure.assign("unfinished"_ctv);
+  suite.expect(!brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID,
+                                                                &failure, &laterBundle),
+               "bootstrap_receipt_failed_later_update_cannot_spend_active_input");
+
   brain.machines.erase(&restoredLocalMachine);
   brain.machines.erase(&worker);
   brain.machines.erase(&secondWorker);
@@ -18080,6 +18124,24 @@ static void testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(Test
   brain.containers.insert_or_assign(stale->uuid, stale);
   machine.upsertContainerIndexEntry(stale->deploymentID, stale);
 
+  constexpr uint32_t pendingFragment = 11;
+  ContainerView *pending = new ContainerView();
+  pending->uuid = uint128_t(0x5304);
+  uint128_t pendingUUID = pending->uuid;
+  pending->deploymentID = deployment.plan.config.deploymentID();
+  pending->applicationID = deployment.plan.config.applicationID;
+  pending->machine = &machine;
+  pending->lifetime = ApplicationLifetime::base;
+  pending->state = ContainerState::scheduled;
+  pending->fragment = pendingFragment;
+  pending->createdAtMs = 123'458;
+  pending->shardGroup = 0;
+
+  deployment.containers.insert(pending);
+  deployment.waitingOnContainers.insert_or_assign(pending, ContainerState::healthy);
+  brain.containers.insert_or_assign(pending->uuid, pending);
+  machine.upsertContainerIndexEntry(pending->deploymentID, pending);
+
   ContainerView liveSeed = {};
   liveSeed.uuid = uint128_t(0x5303);
   liveSeed.fragment = 10;
@@ -18107,25 +18169,42 @@ static void testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(Test
 
   suite.expect(machine.runtimeReady == true, "brain_neuron_state_upload_marks_machine_runtime_ready");
   suite.expect(machine.containerFragmentAvailable(9), "brain_neuron_state_upload_releases_unreported_container_fragment");
+  suite.expect(machine.containerFragmentAvailable(pendingFragment) == false, "brain_neuron_state_upload_retains_pending_container_fragment");
   suite.expect(machine.containerFragmentAvailable(livePlan.fragment) == false, "brain_neuron_state_upload_reserves_reported_container_fragment");
   auto liveIt = brain.containers.find(livePlan.uuid);
-  suite.expect(liveIt != brain.containers.end(), "brain_neuron_state_upload_tracks_reported_container");
-  suite.expect(brain.containers.find(staleUUID) == brain.containers.end(), "brain_neuron_state_upload_removes_stale_canonical_container");
-  suite.expect(deployment.containers.size() == 1, "brain_neuron_state_upload_prunes_deployment_container_set");
-  suite.expect(machine.containersByDeploymentID.size() == 1, "brain_neuron_state_upload_prunes_machine_container_bins");
-
+  auto pendingIt = brain.containers.find(pendingUUID);
   ContainerView *live = (liveIt != brain.containers.end()) ? liveIt->second : nullptr;
+  ContainerView *retainedPending = (pendingIt != brain.containers.end()) ? pendingIt->second : nullptr;
+  suite.expect(live != nullptr, "brain_neuron_state_upload_tracks_reported_container");
+  suite.expect(brain.containers.find(staleUUID) == brain.containers.end(), "brain_neuron_state_upload_removes_stale_canonical_container");
+  suite.expect(retainedPending != nullptr, "brain_neuron_state_upload_retains_scheduled_successor");
+  suite.expect(deployment.containers.size() == 2, "brain_neuron_state_upload_keeps_pending_successor_in_deployment");
+  suite.expect(machine.containersByDeploymentID.size() == 1, "brain_neuron_state_upload_keeps_pending_machine_bin");
+
   suite.expect(live != nullptr && live->machine == &machine, "brain_neuron_state_upload_assigns_live_container_machine");
   suite.expect(live != nullptr && live->deploymentID == deployment.plan.config.deploymentID(), "brain_neuron_state_upload_assigns_live_container_deployment");
 
   if (auto indexed = machine.containersByDeploymentID.find(deployment.plan.config.deploymentID()); indexed != machine.containersByDeploymentID.end())
   {
-    suite.expect(indexed->second.size() == 1, "brain_neuron_state_upload_keeps_one_indexed_machine_container");
-    suite.expect(indexed->second.size() == 1 && indexed->second[0] == live, "brain_neuron_state_upload_indexes_only_live_container");
+    suite.expect(indexed->second.size() == 2, "brain_neuron_state_upload_keeps_pending_indexed_machine_container");
+    suite.expect(indexed->second.size() == 2 && std::find(indexed->second.begin(), indexed->second.end(), live) != indexed->second.end(), "brain_neuron_state_upload_indexes_live_container");
+    suite.expect(indexed->second.size() == 2 && retainedPending != nullptr && std::find(indexed->second.begin(), indexed->second.end(), retainedPending) != indexed->second.end(), "brain_neuron_state_upload_indexes_pending_successor");
   }
   else
   {
     suite.expect(false, "brain_neuron_state_upload_keeps_deployment_machine_index");
+  }
+
+  if (retainedPending != nullptr)
+  {
+    brain.noteLocalContainerHealthy(pendingUUID);
+    suite.expect(retainedPending->state == ContainerState::healthy && deployment.nHealthyBase == 2,
+                 "brain_neuron_state_upload_retained_successor_counts_later_healthy");
+    suite.expect(deployment.waitingOnContainers.empty(), "brain_neuron_state_upload_retained_successor_clears_healthy_waiter");
+  }
+  else
+  {
+    suite.expect(false, "brain_neuron_state_upload_missing_successor_cannot_count_later_healthy");
   }
 
   if (live != nullptr)
@@ -18134,6 +18213,14 @@ static void testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(Test
     machine.removeContainerIndexEntry(live->deploymentID, live);
     brain.containers.erase(live->uuid);
     delete live;
+  }
+  if (auto retained = brain.containers.find(pendingUUID); retained != brain.containers.end())
+  {
+    ContainerView *container = retained->second;
+    deployment.containers.erase(container);
+    machine.removeContainerIndexEntry(container->deploymentID, container);
+    brain.containers.erase(container->uuid);
+    delete container;
   }
 
   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
@@ -22015,6 +22102,16 @@ int main(void)
   {
     Ring::createRing(8, 8, 32, 32, -1, -1, 0);
     createdRing = true;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "neuron-state-upload-pending-successor") == 0)
+  {
+    testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(suite);
+    if (createdRing)
+    {
+      Ring::shutdownForExec();
+    }
+    return suite.failed == 0 ? 0 : 1;
   }
   if (std::getenv("PRODIGY_TEST_TASK_LIFECYCLE_ONLY") != nullptr)
   {

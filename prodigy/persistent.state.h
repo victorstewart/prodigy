@@ -331,6 +331,33 @@ static void serialize(S&& serializer, ProdigyPersistentLocalBrainState& state)
   serializer.object(state.transportTLS);
 }
 
+// This is a durable, input-independent witness that a specific bootstrap
+// supersession receipt was fully consumed. It intentionally stores only the
+// checkpoint digest: the checkpoint itself remains one-shot startup input.
+class ProdigyPersistentConsumedBootstrapBundleSupersessionReceipt {
+public:
+
+  uint128_t operationID = 0;
+  uint128_t clusterUUID = 0;
+  uint128_t localMachineUUID = 0;
+  String targetControlSocketPath;
+  String expectedIncompleteWorkerBundleSHA256;
+  String successorBundleSHA256;
+  String localContainerCheckpointSHA256;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyPersistentConsumedBootstrapBundleSupersessionReceipt& receipt)
+{
+  serializer.value16b(receipt.operationID);
+  serializer.value16b(receipt.clusterUUID);
+  serializer.value16b(receipt.localMachineUUID);
+  serializer.text1b(receipt.targetControlSocketPath, UINT32_MAX);
+  serializer.text1b(receipt.expectedIncompleteWorkerBundleSHA256, UINT32_MAX);
+  serializer.text1b(receipt.successorBundleSHA256, UINT32_MAX);
+  serializer.text1b(receipt.localContainerCheckpointSHA256, UINT32_MAX);
+}
+
 static inline void resolveProdigyPersistentStateDBPath(String& path)
 {
   if (const char *overridePath = getenv("PRODIGY_STATE_DB"); overridePath && overridePath[0] != '\0')
@@ -2667,6 +2694,7 @@ private:
   constexpr static const char *bootKey = "local";
   constexpr static const char *brainSnapshotKey = "snapshot";
   constexpr static const char *localBrainStateKey = "local_brain_state";
+  constexpr static const char *consumedBootstrapBundleSupersessionReceiptKey = "consumed_bootstrap_bundle_supersession_receipt";
 
   TidesDB db;
   TidesDB secretsDb;
@@ -3204,6 +3232,37 @@ public:
 
     Vault::secureClearString(serialized);
     secrets.clear();
+    return ok;
+  }
+
+  bool loadConsumedBootstrapBundleSupersessionReceipt(
+      ProdigyPersistentConsumedBootstrapBundleSupersessionReceipt& receipt,
+      String *failure = nullptr)
+  {
+    String serialized = {};
+    if (db.read(brainColumnFamily, consumedBootstrapBundleSupersessionReceiptKey, serialized, failure) == false)
+    {
+      return false;
+    }
+
+    if (BitseryEngine::deserializeSafe(serialized, receipt) == false)
+    {
+      receipt = {};
+      if (failure) failure->assign("invalid consumed bootstrap bundle supersession receipt");
+      return false;
+    }
+
+    return true;
+  }
+
+  bool saveConsumedBootstrapBundleSupersessionReceipt(
+      const ProdigyPersistentConsumedBootstrapBundleSupersessionReceipt& receipt,
+      String *failure = nullptr)
+  {
+    String serialized = {};
+    BitseryEngine::serialize(serialized, receipt);
+    const bool ok = db.write(brainColumnFamily, consumedBootstrapBundleSupersessionReceiptKey, serialized, failure);
+    Vault::secureClearString(serialized);
     return ok;
   }
 

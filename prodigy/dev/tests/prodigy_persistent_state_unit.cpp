@@ -1700,10 +1700,47 @@ int main(void)
   {
     X509_free(parsedLocalCert);
   }
+  const String replacementConsumedReceiptSuccessorDigest = "4444444444444444444444444444444444444444444444444444444444444444"_ctv;
 
   {
     ProdigyPersistentStateStore store(dbPath);
     String failure;
+    ProdigyPersistentConsumedBootstrapBundleSupersessionReceipt consumedReceipt = {};
+    suite.expect(store.loadConsumedBootstrapBundleSupersessionReceipt(consumedReceipt, &failure) == false &&
+                     failure.equals("record not found"_ctv),
+                 "load_consumed_bootstrap_supersession_receipt_missing");
+
+    consumedReceipt.operationID = 0x9011;
+    consumedReceipt.clusterUUID = storedSnapshot.brainConfig.clusterUUID;
+    consumedReceipt.localMachineUUID = storedLocalBrainState.uuid;
+    consumedReceipt.targetControlSocketPath.assign("/run/prodigy/control.sock"_ctv);
+    consumedReceipt.expectedIncompleteWorkerBundleSHA256.assign("1111111111111111111111111111111111111111111111111111111111"_ctv);
+    consumedReceipt.successorBundleSHA256.assign("2222222222222222222222222222222222222222222222222222222222"_ctv);
+    consumedReceipt.localContainerCheckpointSHA256.assign("3333333333333333333333333333333333333333333333333333333333"_ctv);
+    suite.expect(store.saveConsumedBootstrapBundleSupersessionReceipt(consumedReceipt, &failure),
+                 "save_consumed_bootstrap_supersession_receipt");
+
+    ProdigyPersistentConsumedBootstrapBundleSupersessionReceipt loadedConsumedReceipt = {};
+    suite.expect(store.loadConsumedBootstrapBundleSupersessionReceipt(loadedConsumedReceipt, &failure),
+                 "load_consumed_bootstrap_supersession_receipt");
+    suite.expect(loadedConsumedReceipt.operationID == consumedReceipt.operationID &&
+                     loadedConsumedReceipt.clusterUUID == consumedReceipt.clusterUUID &&
+                     loadedConsumedReceipt.localMachineUUID == consumedReceipt.localMachineUUID &&
+                     loadedConsumedReceipt.targetControlSocketPath.equals(consumedReceipt.targetControlSocketPath) &&
+                     loadedConsumedReceipt.expectedIncompleteWorkerBundleSHA256.equals(consumedReceipt.expectedIncompleteWorkerBundleSHA256) &&
+                     loadedConsumedReceipt.successorBundleSHA256.equals(consumedReceipt.successorBundleSHA256) &&
+                     loadedConsumedReceipt.localContainerCheckpointSHA256.equals(consumedReceipt.localContainerCheckpointSHA256),
+                 "load_consumed_bootstrap_supersession_receipt_roundtrip");
+    consumedReceipt.operationID = 0x9012;
+    consumedReceipt.successorBundleSHA256.assign(replacementConsumedReceiptSuccessorDigest);
+    suite.expect(store.saveConsumedBootstrapBundleSupersessionReceipt(consumedReceipt, &failure),
+                 "replace_consumed_bootstrap_supersession_receipt");
+    loadedConsumedReceipt = {};
+    suite.expect(store.loadConsumedBootstrapBundleSupersessionReceipt(loadedConsumedReceipt, &failure) &&
+                     loadedConsumedReceipt.operationID == consumedReceipt.operationID &&
+                     loadedConsumedReceipt.successorBundleSHA256.equals(consumedReceipt.successorBundleSHA256),
+                 "load_latest_consumed_bootstrap_supersession_receipt");
+
 
     bool saveBoot = store.saveBootState(storedBootState, &failure);
     if (!saveBoot)
@@ -2084,6 +2121,19 @@ int main(void)
     suite.expect(storedLocalRecordAfterDuplicateSave.secretVersion == storedLocalRecord.secretVersion, "duplicate_save_local_brain_state_preserves_secret_version");
 
     ProdigyPersistentStateStore store(dbPath);
+
+    ProdigyPersistentConsumedBootstrapBundleSupersessionReceipt loadedConsumedReceipt = {};
+
+    bool reopenConsumedReceipt = store.loadConsumedBootstrapBundleSupersessionReceipt(loadedConsumedReceipt, &failure);
+    suite.expect(reopenConsumedReceipt, "reopen_consumed_bootstrap_supersession_receipt");
+    suite.expect(loadedConsumedReceipt.operationID == 0x9012 &&
+                     loadedConsumedReceipt.clusterUUID == storedSnapshot.brainConfig.clusterUUID &&
+                     loadedConsumedReceipt.localMachineUUID == storedLocalBrainState.uuid &&
+                     loadedConsumedReceipt.targetControlSocketPath.equals("/run/prodigy/control.sock"_ctv) &&
+                     loadedConsumedReceipt.expectedIncompleteWorkerBundleSHA256.equals("1111111111111111111111111111111111111111111111111111111111"_ctv) &&
+                     loadedConsumedReceipt.successorBundleSHA256.equals(replacementConsumedReceiptSuccessorDigest) &&
+                     loadedConsumedReceipt.localContainerCheckpointSHA256.equals("3333333333333333333333333333333333333333333333333333333333"_ctv),
+                 "reopen_consumed_bootstrap_supersession_receipt_roundtrip");
 
     ProdigyPersistentBootState loadedBootState = {};
     ProdigyPersistentBrainSnapshot loadedSnapshot = {};
