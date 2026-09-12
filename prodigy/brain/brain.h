@@ -23981,7 +23981,7 @@ public:
            updateSelfWorkerStateUploadedMachineUUIDs.contains(machine->uuid) == false;
   }
 
-  bool workerBundleUpgradeTransitionPending(const Machine *machine) const
+  bool workerBundleUpgradeTransitionPending(const Machine *machine) const override
   {
     return machine != nullptr &&
            updateSelfWorkerMachineUUIDs.contains(machine->uuid) &&

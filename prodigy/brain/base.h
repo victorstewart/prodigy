@@ -584,6 +584,13 @@ public:
   {
     return true;
   }
+
+  virtual bool workerBundleUpgradeTransitionPending(const Machine *machine) const
+  {
+    (void)machine;
+    return false;
+  }
+
   virtual bool hasHealthyMachines(void) const
   {
     for (Machine *machine : machines)

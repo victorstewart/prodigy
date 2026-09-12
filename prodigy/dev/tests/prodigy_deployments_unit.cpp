@@ -31,6 +31,12 @@ public:
   uint32_t requestMachinesCount = 0;
   String lastProgressMessage = {};
   String lastFailureMessage = {};
+  const Machine *pendingBundleTransitionMachine = nullptr;
+
+  bool workerBundleUpgradeTransitionPending(const Machine *machine) const override
+  {
+    return machine == pendingBundleTransitionMachine;
+  }
 
   TestBrain()
   {
@@ -9513,6 +9519,54 @@ int main(void)
       {
         deployment.destructContainer(container);
         deployment.containerDestroyed(container);
+      }
+    }
+
+    // An expected bundle exec temporarily drops the same control-stream fields
+    // as the dead-host fixture above, but must retain its authoritative owner.
+    for (bool transientTransition : {true, false})
+    {
+      staleMachine.inBinaryUpdate = transientTransition;
+      brain.pendingBundleTransitionMachine = transientTransition ? nullptr : &staleMachine;
+      ContainerView *updatingContainer = new ContainerView();
+      uint128_t updatingUUID = transientTransition ? uint128_t(0x19602024) : uint128_t(0x19602025);
+      updatingContainer->uuid = updatingUUID;
+      updatingContainer->deploymentID = deployment.plan.config.deploymentID();
+      updatingContainer->applicationID = deployment.plan.config.applicationID;
+      updatingContainer->machine = &staleMachine;
+      updatingContainer->lifetime = ApplicationLifetime::base;
+      updatingContainer->state = ContainerState::healthy;
+      deployment.state = DeploymentState::none;
+      deployment.nTargetBase = 1;
+      deployment.nDeployedBase = 1;
+      deployment.nHealthyBase = 1;
+      deployment.containers.insert(updatingContainer);
+      brain.containers.insert_or_assign(updatingUUID, updatingContainer);
+      staleMachine.upsertContainerIndexEntry(updatingContainer->deploymentID, updatingContainer);
+      const uint64_t containerCountBefore = deployment.containers.size();
+      const uint64_t waitingCountBefore = deployment.waitingOnContainers.size();
+      const uint32_t requestMachinesBefore = brain.requestMachinesCount;
+      const uint64_t readyMachineBytesBefore = readyMachine.neuron.wBuffer.size();
+      deployment.recoverAfterReboot();
+      ContainerView *retainedContainer = nullptr;
+      if (auto retained = brain.containers.find(updatingUUID); retained != brain.containers.end())
+      {
+        retainedContainer = retained->second;
+      }
+      const auto indexed = staleMachine.containersByDeploymentID.find(deployment.plan.config.deploymentID());
+      const bool machineIndexRetained = indexed != staleMachine.containersByDeploymentID.end() &&
+                                        std::find(indexed->second.begin(), indexed->second.end(), retainedContainer) != indexed->second.end();
+      suite.expect(retainedContainer != nullptr && deployment.containers.contains(retainedContainer), transientTransition ? "recoverAfterReboot_bundle_exec_transient_retains_stateless_owner" : "recoverAfterReboot_bundle_exec_durable_retains_stateless_owner");
+      suite.expect(retainedContainer != nullptr && retainedContainer->machine == &staleMachine && machineIndexRetained, transientTransition ? "recoverAfterReboot_bundle_exec_transient_keeps_stateless_owner_machine_index" : "recoverAfterReboot_bundle_exec_durable_keeps_stateless_owner_machine_index");
+      suite.expect(deployment.containers.size() == containerCountBefore && deployment.waitingOnContainers.size() == waitingCountBefore && brain.requestMachinesCount == requestMachinesBefore && readyMachine.neuron.wBuffer.size() == readyMachineBytesBefore, transientTransition ? "recoverAfterReboot_bundle_exec_transient_queues_no_replacement" : "recoverAfterReboot_bundle_exec_durable_queues_no_replacement");
+      suite.expect(deployment.state == DeploymentState::running, transientTransition ? "recoverAfterReboot_bundle_exec_transient_restores_satisfied_stateless_state" : "recoverAfterReboot_bundle_exec_durable_restores_satisfied_stateless_state");
+
+      brain.pendingBundleTransitionMachine = nullptr;
+      staleMachine.inBinaryUpdate = false;
+      if (retainedContainer && deployment.containers.contains(retainedContainer))
+      {
+        deployment.destructContainer(retainedContainer);
+        deployment.containerDestroyed(retainedContainer);
       }
     }
 

@@ -6229,6 +6229,16 @@ public:
       return false;
     }
 
+    // A worker bundle exec deliberately closes the control stream while its
+    // containers continue to own their process, storage, and network state.
+    // Its fresh Neuron state upload remains authoritative; do not discard that
+    // inventory merely because the expected transition is temporarily unready.
+    if (container->machine->inBinaryUpdate ||
+        (thisBrain != nullptr && thisBrain->workerBundleUpgradeTransitionPending(container->machine)))
+    {
+      return true;
+    }
+
     return prodigyMachineReadyForScheduling(container->machine);
   }
 
