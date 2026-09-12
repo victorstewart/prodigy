@@ -452,7 +452,14 @@ application_name_for_plan()
       6) echo Nametag ;;
       7) echo Telnyx ;;
       8) echo AppleNotifs ;;
-      *) echo "HarnessApp.$(basename "${plan}" | tr -cd 'A-Za-z0-9._-')" ;;
+      *)
+         if [[ "${value}" =~ ^[1-9][0-9]*$ ]]
+         then
+            echo "HarnessApp.${value}"
+         else
+            echo "HarnessApp.$(basename "${plan}" | tr -cd 'A-Za-z0-9._-')"
+         fi
+         ;;
    esac
 }
 
