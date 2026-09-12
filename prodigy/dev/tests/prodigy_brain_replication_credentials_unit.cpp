@@ -9279,12 +9279,21 @@ static void testBootstrapBundleSupersessionReceipt(TestSuite& suite)
   const auto beforeMissingCheckpoint = brain.capturePersistentUpdateSelfState();
   const String validCheckpoint = receipt.localContainerCheckpoint;
   receipt.localContainerCheckpoint.clear();
-  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, &failure, &successorBundle) == false &&
+  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID, &failure, &successorBundle) == false &&
                    equalSerializedObjects(beforeMissingCheckpoint, brain.capturePersistentUpdateSelfState()),
                "bootstrap_supersession_rejects_missing_checkpoint_before_mutation");
   receipt.localContainerCheckpoint = validCheckpoint;
-  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, &failure, &successorBundle),
-               "bootstrap_supersession_accepts_exact_incomplete_update");
+  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid + 1, brain.brainConfig.clusterUUID, &failure, &successorBundle) == false,
+               "bootstrap_supersession_rejects_mismatched_trusted_local_uuid");
+  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID + 1, &failure, &successorBundle) == false &&
+                   equalSerializedObjects(beforeMissingCheckpoint, brain.capturePersistentUpdateSelfState()),
+               "bootstrap_supersession_rejects_mismatched_local_cluster_before_mutation");
+  brain.authoritativeTopology.machines.front().uuid = local.uuid + 2;
+  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID, &failure, &successorBundle) == false,
+               "bootstrap_supersession_rejects_mismatched_nonzero_topology_uuid");
+  brain.authoritativeTopology.machines.front().uuid = 0;
+  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID, &failure, &successorBundle),
+               "bootstrap_supersession_accepts_zero_topology_uuid_with_exact_local_authority");
   suite.expect(brain.persistCalls == 1 && brain.lastPersistedMasterAuthorityState.updateSelf.workerExpectedBundleSHA256.equals(successorDigest),
                "bootstrap_supersession_persists_successor_before_registration");
   NeuronContainerBootstrap restoredLocal = {};
@@ -9320,12 +9329,12 @@ static void testBootstrapBundleSupersessionReceipt(TestSuite& suite)
                "bootstrap_supersession_requires_real_stage_and_registration_acks");
 
   const uint32_t persistedAfterReplacement = brain.persistCalls;
-  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, &failure, &successorBundle) && brain.persistCalls == persistedAfterReplacement,
+  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID, &failure, &successorBundle) && brain.persistCalls == persistedAfterReplacement,
                "bootstrap_supersession_same_tuple_retry_is_noop");
 
   ProdigyPersistentUpdateSelfState beforeConflict = brain.capturePersistentUpdateSelfState();
   boot.bootstrapBundleSupersession.successorBundleSHA256.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
-  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, &failure, &successorBundle) == false &&
+  suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID, &failure, &successorBundle) == false &&
                    equalSerializedObjects(beforeConflict, brain.capturePersistentUpdateSelfState()),
                "bootstrap_supersession_rejects_conflicting_tuple_without_mutation");
   boot.bootstrapBundleSupersession.successorBundleSHA256 = successorDigest;
@@ -9333,7 +9342,7 @@ static void testBootstrapBundleSupersessionReceipt(TestSuite& suite)
   noTargetBrain.brainConfig.clusterUUID = brain.brainConfig.clusterUUID;
   noTargetBrain.updateSelfWorkerExpectedBundleSHA256 = oldDigest;
   const ProdigyPersistentUpdateSelfState noTargetBefore = noTargetBrain.capturePersistentUpdateSelfState();
-  suite.expect(noTargetBrain.consumeBootstrapBundleSupersessionReceipt(boot, true, &failure, &successorBundle) == false &&
+  suite.expect(noTargetBrain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID, &failure, &successorBundle) == false &&
                    equalSerializedObjects(noTargetBefore, noTargetBrain.capturePersistentUpdateSelfState()),
                "bootstrap_supersession_rejects_empty_target_without_mutation");
   brain.machines.erase(&worker);

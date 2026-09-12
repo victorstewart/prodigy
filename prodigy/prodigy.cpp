@@ -1239,7 +1239,9 @@ public:
     const bool bootstrapSupersessionSingleBrain =
         havePersistedBrainSnapshot && clusterTopologyBrainCount(persistedBrainSnapshot.topology) == 1;
     String bootstrapSupersessionFailure = {};
-    if (consumeBootstrapBundleSupersessionReceipt(persistentBootState, bootstrapSupersessionSingleBrain, &bootstrapSupersessionFailure) == false)
+    if (consumeBootstrapBundleSupersessionReceipt(persistentBootState, bootstrapSupersessionSingleBrain,
+                                                 persistentLocalBrainState.uuid, persistentLocalBrainState.ownerClusterUUID,
+                                                 &bootstrapSupersessionFailure) == false)
     {
       std::fprintf(stderr, "prodigy startup rejected bootstrap bundle supersession: %s\n", bootstrapSupersessionFailure.c_str());
       _exit(EXIT_FAILURE);

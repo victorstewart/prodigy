@@ -22872,6 +22872,8 @@ public:
   bool consumeBootstrapBundleSupersessionReceipt(
       const ProdigyPersistentBootState& bootState,
       bool singleBrainTopologyConfirmed,
+      uint128_t trustedLocalBrainUUID,
+      uint128_t trustedOwnerClusterUUID,
       String *failure = nullptr,
       const String *installedBundleOverride = nullptr)
   {
@@ -22885,6 +22887,7 @@ public:
     if (bootState.bootstrapConfig.nodeRole != ProdigyBootstrapNodeRole::brain ||
         receipt.targetControlSocketPath.equals(bootState.bootstrapConfig.controlSocketPath) == false ||
         brainConfig.clusterUUID == 0 || brainConfig.clusterUUID != receipt.clusterUUID ||
+        trustedLocalBrainUUID == 0 || trustedOwnerClusterUUID != receipt.clusterUUID ||
         singleBrainTopologyConfirmed == false)
     {
       if (failure) failure->assign("bootstrap bundle supersession receipt does not target this single-brain authority"_ctv);
@@ -22938,7 +22941,6 @@ public:
     ProdigyLocalContainerCheckpoint checkpoint = {};
     String checkpointDigest = {};
     ClusterTopology topology = {};
-    bool localIdentityMatches = false;
     (void)loadAuthoritativeClusterTopology(topology);
     if (receipt.localContainerCheckpoint.empty() ||
         prodigyComputeSHA256Hex(receipt.localContainerCheckpoint, checkpointDigest, &digestFailure) == false ||
@@ -22951,13 +22953,24 @@ public:
       if (failure) failure->assign("bootstrap recovery local container checkpoint is missing or invalid"_ctv);
       return false;
     }
-    localIdentityMatches = false;
+    // Local persistent state owns the certificate UUID. Bootstrap topology
+    // may still have a zero UUID; a known topology UUID must agree as well.
+    bool localIdentityMatches = checkpoint.machineUUID == trustedLocalBrainUUID;
+    uint128_t conflictingTopologyUUID = 0;
     for (const ClusterMachine& machine : topology.machines)
     {
-      if (machine.isBrain && machine.uuid == checkpoint.machineUUID) localIdentityMatches = true;
+      if (machine.isBrain && machine.uuid != 0 && machine.uuid != checkpoint.machineUUID)
+      {
+        localIdentityMatches = false;
+        conflictingTopologyUUID = machine.uuid;
+      }
     }
     if (localIdentityMatches == false)
     {
+      String checkpointIdentity = String::toHex(checkpoint.machineUUID);
+      String trustedIdentity = String::toHex(trustedLocalBrainUUID);
+      String topologyIdentity = String::toHex(conflictingTopologyUUID);
+      basics_log("bootstrap recovery checkpoint identity mismatch checkpoint=%s trusted=%s topology=%s\n", checkpointIdentity.c_str(), trustedIdentity.c_str(), topologyIdentity.c_str());
       if (failure) failure->assign("bootstrap recovery checkpoint machine differs from sole Brain authority"_ctv);
       return false;
     }
