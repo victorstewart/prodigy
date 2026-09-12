@@ -696,7 +696,7 @@ PY
       fi
       sleep 0.5
    done
-   [[ "${upgraded}" == 1 ]] || { echo "FAIL: exact worker-preserving bundle upgrade was not observed" >&2; exit 1; }
+   [[ "${upgraded}" == 1 ]] || { archive_workspace=1; echo "FAIL: exact worker-preserving bundle upgrade was not observed" >&2; exit 1; }
    recovered=0
    for attempt in $(seq 1 240)
    do
@@ -713,10 +713,11 @@ PY
       fi
       sleep 0.5
    done
-   [[ "${recovered}" == 1 ]] || { echo "FAIL: original deployment control-plane recovery not observed; no successor submitted" >&2; exit 1; }
+   [[ "${recovered}" == 1 ]] || { archive_workspace=1; echo "FAIL: original deployment control-plane recovery not observed; no successor submitted" >&2; exit 1; }
    # Readiness counters alone can conceal fresh replicas created after exec.
    # Re-observe the original owners after recovery settles, before any update.
    observe_handoff recovered || {
+      archive_workspace=1
       echo "FAIL: controller recovery replaced original application/storage owners; no successor submitted" >&2
       exit 1
    }
