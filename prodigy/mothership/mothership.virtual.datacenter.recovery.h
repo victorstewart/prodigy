@@ -7,6 +7,15 @@
 #include <sched.h>
 #include <climits>
 
+// Forced replacement cannot reconstruct a Brain's colocated Neuron plans:
+// only the ordinary bundle-exec owner durably checkpoints those bootstraps.
+// Until recovery can obtain that authoritative checkpoint, keep the original
+// Brain alive rather than admitting a replacement that can duplicate its apps.
+static inline bool mothershipVDCRecoveryTargetIsSupported(uint32_t machineIndex, uint32_t brainCount)
+{
+  return machineIndex > brainCount;
+}
+
 // The provider keeps resource plumbing. Mothership owns the exact process
 // identities, approved artifact, durable intent and ordering of recovery.
 enum class MothershipVDCRecoveryPhase : uint8_t {

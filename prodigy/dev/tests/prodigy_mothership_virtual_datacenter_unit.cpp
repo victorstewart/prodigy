@@ -235,6 +235,10 @@ int main(void)
   suite.expect(mothershipVDCParseStat("917 (truncated)"_ctv, 917, parsed, processState) == false, "recovery_stat_rejects_truncation");
   constexpr char overflow[] = "18446744073709551616";
   suite.expect(mothershipVDCParseUnsigned(overflow, overflow + sizeof(overflow) - 1, parsed) == false, "recovery_identity_rejects_overflow");
+  suite.expect(mothershipVDCRecoveryTargetIsSupported(1, 1) == false, "recovery_rejects_only_brain");
+  suite.expect(mothershipVDCRecoveryTargetIsSupported(2, 3) == false, "recovery_rejects_second_brain");
+  suite.expect(mothershipVDCRecoveryTargetIsSupported(0, 1) == false, "recovery_rejects_zero_machine_index");
+  suite.expect(mothershipVDCRecoveryTargetIsSupported(2, 1), "recovery_allows_worker_after_brains");
 
   Vector<String> providerArguments = {};
   for (const char *argument : {"bash", "/proc/self/fd/7", "--serve", "/tmp/prodigy/vdc-unit", "3", "2", "65495", "0", "42", "4", "8192", "8192", "0", "1024", "/tmp/prodigy-vdc-0x1234/mothership.sock"})

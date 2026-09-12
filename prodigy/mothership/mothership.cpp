@@ -3656,6 +3656,8 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
     const String& expectedOldSHA, const String& expectedIncompleteWorkerSHA, String *failure)
 {
   auto reject = [&](const char *message) { if (failure) failure->assign(message); return false; };
+  if (mothershipVDCRecoveryTargetIsSupported(machineIndex, cluster.nBrains) == false)
+    return reject("Brain replacement is unsupported without an authoritative local-container checkpoint");
   if (expectedIncompleteWorkerSHA.empty() == false && (machineIndex != 1 || cluster.nBrains != 1 ||
       prodigyIsSHA256HexDigest(expectedIncompleteWorkerSHA) == false || expectedIncompleteWorkerSHA.equals(successorSHA)))
     return reject("incomplete bundle supersession requires the sole Brain and a distinct expected pending digest");
