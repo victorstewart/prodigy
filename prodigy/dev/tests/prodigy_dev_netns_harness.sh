@@ -71,11 +71,18 @@ deploy_second_container_zstd=
 deploy_second_start=0
 deploy_second_expect_accept=1
 deploy_second_expect_text=
+deploy_second_container_log_receipt=
 deploy_third_plan_json=
 deploy_third_container_zstd=
 deploy_third_start=0
 deploy_third_expect_accept=1
 deploy_third_expect_text=
+deploy_fourth_plan_json=
+deploy_fourth_container_zstd=
+deploy_fourth_start=0
+deploy_fourth_expect_accept=1
+deploy_fourth_expect_text=
+deploy_fourth_container_log_receipt=
 deploy_ping_port=0
 deploy_ping_payload=ping
 deploy_ping_expect=pong
@@ -125,7 +132,7 @@ do
       --tunnel-ebpf=*|--host-ingress-ebpf=*|--host-egress-ebpf=*|--fake-ipv4-boundary-ebpf=*|--private-ipv4-prefix=*|--switchboard-gateway-index=*)
          fail "runtime-owned artifact and network overrides are no longer harness options: ${1%%=*}"
          ;;
-      --runner-mode=*|--workspace-root=*|--manifest-path=*|--machines=*|--brains=*|--test-machine-logical-cores=*|--test-machine-memory-mb=*|--test-machine-storage-mb=*|--duration=*|--brain-bootstrap-family=*|--inter-container-mtu=*|--enable-fake-ipv4-boundary=*|--mothership-bin=*|--mothership-autoscale-interval-seconds=*|--mothership-update-prodigy-input=*|--mothership-update-start=*|--os-update-restart-on-command=*|--os-update-command-timeout=*|--os-update-rollout-timeout=*|--master-index=*|--fault-mode=*|--fault-targets=*|--fault-start=*|--fault-start-on-ready=*|--fault-duration=*|--fault-cycles=*|--fault-down=*|--fault-up=*|--post-fault-window=*|--fault-master-change-budget-ms=*|--update-master-change-budget-ms=*|--update-order-budget-ms=*|--expect-master-available=*|--expect-master-change=*|--expect-master-change-during-fault=*|--expect-peer-recovery=*|--expect-full-brain-registration=*|--deploy-plan-json=*|--deploy-container-zstd=*|--deploy-expect-accept=*|--deploy-expect-text=*|--deploy-second-plan-json=*|--deploy-second-container-zstd=*|--deploy-second-start=*|--deploy-second-expect-accept=*|--deploy-second-expect-text=*|--deploy-third-plan-json=*|--deploy-third-container-zstd=*|--deploy-third-start=*|--deploy-third-expect-accept=*|--deploy-third-expect-text=*|--deploy-ping-port=*|--deploy-ping-payload=*|--deploy-ping-expect=*|--deploy-ping-all=*|--deploy-ping-after-fault=*|--deploy-skip-probe=*|--deploy-report-application=*|--deploy-report-version-id=*|--deploy-report-version-min=*|--deploy-report-attempts=*|--deploy-report-min-healthy=*|--deploy-report-max-healthy-min=*|--deploy-report-final-healthy-min=*|--deploy-report-final-healthy-max=*|--deploy-report-min-target=*|--deploy-report-max-target-min=*|--deploy-report-final-target-max=*|--deploy-report-min-deployed=*|--deploy-report-max-deployed-min=*|--deploy-report-final-deployed-max=*|--deploy-report-min-shard-groups=*|--deploy-report-max-shard-groups-min=*|--deploy-report-final-shard-groups-max=*|--deploy-report-max-crashes-max=*|--deploy-report-runtime-cores-min=*|--deploy-report-runtime-memory-min-mb=*|--deploy-report-runtime-storage-min-mb=*|--deploy-report-runtime-cores-max-min=*|--deploy-report-runtime-memory-max-min-mb=*|--deploy-report-runtime-storage-max-min-mb=*|--deploy-report-require-scaler=*|--deploy-report-require-scaler-value-min=*|--deploy-report-traffic-burst=*|--deploy-report-success-hold-ms=*|--deploy-report-floor-min-runtime-ms=*|--deploy-report-poll-interval-ms=*|--deploy-mesh-mode=*|--deploy-mesh-require-all=*)
+      --runner-mode=*|--workspace-root=*|--manifest-path=*|--machines=*|--brains=*|--test-machine-logical-cores=*|--test-machine-memory-mb=*|--test-machine-storage-mb=*|--duration=*|--brain-bootstrap-family=*|--inter-container-mtu=*|--enable-fake-ipv4-boundary=*|--mothership-bin=*|--mothership-autoscale-interval-seconds=*|--mothership-update-prodigy-input=*|--mothership-update-start=*|--os-update-restart-on-command=*|--os-update-command-timeout=*|--os-update-rollout-timeout=*|--master-index=*|--fault-mode=*|--fault-targets=*|--fault-start=*|--fault-start-on-ready=*|--fault-duration=*|--fault-cycles=*|--fault-down=*|--fault-up=*|--post-fault-window=*|--fault-master-change-budget-ms=*|--update-master-change-budget-ms=*|--update-order-budget-ms=*|--expect-master-available=*|--expect-master-change=*|--expect-master-change-during-fault=*|--expect-peer-recovery=*|--expect-full-brain-registration=*|--deploy-plan-json=*|--deploy-container-zstd=*|--deploy-expect-accept=*|--deploy-expect-text=*|--deploy-second-plan-json=*|--deploy-second-container-zstd=*|--deploy-second-start=*|--deploy-second-expect-accept=*|--deploy-second-expect-text=*|--deploy-second-container-log-receipt=*|--deploy-third-plan-json=*|--deploy-third-container-zstd=*|--deploy-third-start=*|--deploy-third-expect-accept=*|--deploy-third-expect-text=*|--deploy-fourth-plan-json=*|--deploy-fourth-container-zstd=*|--deploy-fourth-start=*|--deploy-fourth-expect-accept=*|--deploy-fourth-expect-text=*|--deploy-fourth-container-log-receipt=*|--deploy-ping-port=*|--deploy-ping-payload=*|--deploy-ping-expect=*|--deploy-ping-all=*|--deploy-ping-after-fault=*|--deploy-skip-probe=*|--deploy-report-application=*|--deploy-report-version-id=*|--deploy-report-version-min=*|--deploy-report-attempts=*|--deploy-report-min-healthy=*|--deploy-report-max-healthy-min=*|--deploy-report-final-healthy-min=*|--deploy-report-final-healthy-max=*|--deploy-report-min-target=*|--deploy-report-max-target-min=*|--deploy-report-final-target-max=*|--deploy-report-min-deployed=*|--deploy-report-max-deployed-min=*|--deploy-report-final-deployed-max=*|--deploy-report-min-shard-groups=*|--deploy-report-max-shard-groups-min=*|--deploy-report-final-shard-groups-max=*|--deploy-report-max-crashes-max=*|--deploy-report-runtime-cores-min=*|--deploy-report-runtime-memory-min-mb=*|--deploy-report-runtime-storage-min-mb=*|--deploy-report-runtime-cores-max-min=*|--deploy-report-runtime-memory-max-min-mb=*|--deploy-report-runtime-storage-max-min-mb=*|--deploy-report-require-scaler=*|--deploy-report-require-scaler-value-min=*|--deploy-report-traffic-burst=*|--deploy-report-success-hold-ms=*|--deploy-report-floor-min-runtime-ms=*|--deploy-report-poll-interval-ms=*|--deploy-mesh-mode=*|--deploy-mesh-require-all=*)
          key="${1%%=*}"
          key="${key#--}"
          key="${key//-/_}"
@@ -157,7 +164,7 @@ boolean()
    [[ "$1" == 0 || "$1" == 1 ]]
 }
 
-for value in "${machines}" "${brains}" "${test_machine_logical_cores}" "${test_machine_memory_mb}" "${test_machine_storage_mb}" "${duration}" "${inter_container_mtu}" "${mothership_autoscale_interval_seconds}" "${fault_start}" "${fault_duration}" "${fault_cycles}" "${fault_down}" "${fault_up}" "${post_fault_window}" "${deploy_ping_port}" "${deploy_report_attempts}" "${deploy_report_poll_interval_ms}"
+for value in "${machines}" "${brains}" "${test_machine_logical_cores}" "${test_machine_memory_mb}" "${test_machine_storage_mb}" "${duration}" "${inter_container_mtu}" "${mothership_autoscale_interval_seconds}" "${fault_start}" "${fault_duration}" "${fault_cycles}" "${fault_down}" "${fault_up}" "${post_fault_window}" "${deploy_fourth_start}" "${deploy_ping_port}" "${deploy_report_attempts}" "${deploy_report_poll_interval_ms}"
 do
    unsigned "${value}" || fail "numeric option is invalid: ${value}"
 done
@@ -165,7 +172,7 @@ done
 [[ "${runner_mode}" == oneshot || "${runner_mode}" == persistent ]] || fail "runner mode must be oneshot or persistent"
 [[ "${brain_bootstrap_family}" =~ ^(ipv4|private6|public6|multihome6)$ ]] || fail "brain bootstrap family is invalid"
 [[ "${fault_mode}" =~ ^(link|crash|flap)$ ]] || fail "fault mode is invalid"
-for value in "${enable_fake_ipv4_boundary}" "${fault_start_on_ready}" "${expect_full_brain_registration}" "${deploy_expect_accept}" "${deploy_second_expect_accept}" "${deploy_third_expect_accept}" "${deploy_ping_all}" "${deploy_ping_after_fault}" "${deploy_skip_probe}" "${deploy_report_version_min}" "${deploy_mesh_require_all}" "${os_update_restart_on_command}"
+for value in "${enable_fake_ipv4_boundary}" "${fault_start_on_ready}" "${expect_full_brain_registration}" "${deploy_expect_accept}" "${deploy_second_expect_accept}" "${deploy_third_expect_accept}" "${deploy_fourth_expect_accept}" "${deploy_ping_all}" "${deploy_ping_after_fault}" "${deploy_skip_probe}" "${deploy_report_version_min}" "${deploy_mesh_require_all}" "${os_update_restart_on_command}"
 do
    boolean "${value}" || fail "boolean option is invalid: ${value}"
 done
@@ -553,6 +560,53 @@ deploy_one()
    echo "MOTHERSHIP_DEPLOY label=${label} accepted=${expect_accept} application=${resolved_application}"
 }
 
+container_log_receipt_until()
+{
+   local label="$1"
+   local specification="$2"
+   local attempts="${PRODIGY_DEV_CONTAINER_LOG_RECEIPT_ATTEMPTS:-60}"
+   local application output attempt receipt_line receipt_matches receipt_index receipt_field receipt_token field_matches
+   local -a receipt_parts receipt_tokens
+   IFS='|' read -r -a receipt_parts <<< "${specification}"
+   application="${receipt_parts[0]:-}"
+   [[ "${application}" =~ ^[0-9]+$ && "${#receipt_parts[@]}" -gt 1 ]] || return 1
+
+   for attempt in $(seq 1 "${attempts}")
+   do
+      output="${tmpdir}/container-receipt-${label}-${application}-${attempt}.log"
+      if container_logs "${application}" "${output}"
+      then
+         while IFS= read -r receipt_line
+         do
+            receipt_matches=1
+            for ((receipt_index = 1; receipt_index < ${#receipt_parts[@]}; ++receipt_index))
+            do
+               receipt_field="${receipt_parts[receipt_index]}"
+               field_matches=0
+               read -r -a receipt_tokens <<< "${receipt_line}"
+               for receipt_token in "${receipt_tokens[@]}"
+               do
+                  if [[ -n "${receipt_field}" && ( ( "${receipt_field}" != *= && "${receipt_token}" == "${receipt_field}" ) ||
+                        ( "${receipt_field}" == *= && "${receipt_token}" == "${receipt_field}"?* ) ) ]]
+                  then
+                     field_matches=1
+                     break
+                  fi
+               done
+               [[ "${field_matches}" == 1 ]] || { receipt_matches=0; break; }
+            done
+            if [[ "${receipt_matches}" == 1 ]]
+            then
+               echo "CONTAINER_LOG_RECEIPT_ASSERT success label=${label} application=${application}"
+               return 0
+            fi
+         done < "${output}"
+      fi
+      sleep 0.2
+   done
+   return 1
+}
+
 if [[ -n "${deploy_plan_json}" || -n "${deploy_container_zstd}" ]]
 then
    [[ -n "${deploy_plan_json}" && -n "${deploy_container_zstd}" ]] || fail "primary deployment requires both plan and container"
@@ -563,6 +617,10 @@ then
    [[ -n "${deploy_second_plan_json}" && -n "${deploy_second_container_zstd}" ]] || fail "second deployment requires both plan and container"
    sleep "${deploy_second_start}"
    deploy_one second "${deploy_second_plan_json}" "${deploy_second_container_zstd}" "${deploy_second_expect_accept}" "${deploy_second_expect_text}"
+fi
+if [[ -n "${deploy_second_container_log_receipt}" ]]
+then
+   container_log_receipt_until second "${deploy_second_container_log_receipt}" || fail "second deployment container receipt did not arrive"
 fi
 if [[ -n "${deploy_third_plan_json}" || -n "${deploy_third_container_zstd}" ]]
 then
@@ -767,6 +825,17 @@ else
       sed -n '1,260p' "${tmpdir}/container-logs.log" >&2 || true
    fi
    fail "application report constraints were not satisfied"
+fi
+
+if [[ -n "${deploy_fourth_plan_json}" || -n "${deploy_fourth_container_zstd}" ]]
+then
+   [[ -n "${deploy_fourth_plan_json}" && -n "${deploy_fourth_container_zstd}" ]] || fail "fourth deployment requires both plan and container"
+   sleep "${deploy_fourth_start}"
+   deploy_one fourth "${deploy_fourth_plan_json}" "${deploy_fourth_container_zstd}" "${deploy_fourth_expect_accept}" "${deploy_fourth_expect_text}"
+fi
+if [[ -n "${deploy_fourth_container_log_receipt}" ]]
+then
+   container_log_receipt_until fourth "${deploy_fourth_container_log_receipt}" || fail "fourth deployment container receipt did not arrive"
 fi
 
 if [[ "${deploy_ping_port}" -gt 0 && "${deploy_skip_probe}" == 0 && "${PRODIGY_DEV_DEPLOY_SKIP_FINAL_PING:-0}" != 1 && "${deploy_ping_after_fault}" == 0 ]]
