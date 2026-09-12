@@ -23079,6 +23079,12 @@ public:
     }
 
     const ProdigyPersistentUpdateSelfState previous = capturePersistentUpdateSelfState();
+    const bool previousTransitionAfterAck = updateSelfTransitionAfterMothershipAck;
+    // The receipt replaces the interrupted coordinator as well as its worker
+    // payload. Old peer acknowledgements cannot advance the successor operation.
+    resetUpdateSelfState();
+    pendingDesignatedMasterPeerKey = 0;
+    updateSelfTransitionAfterMothershipAck = false;
     updateSelfLocalMachineUUID = checkpoint.machineUUID;
     updateSelfLocalBundleRegistered = false;
     updateSelfLocalContainerBootstraps = std::move(bootstraps);
@@ -23092,6 +23098,7 @@ public:
     if (commitMasterAuthorityStateChange() == false)
     {
       restorePersistentUpdateSelfState(previous);
+      updateSelfTransitionAfterMothershipAck = previousTransitionAfterAck;
       if (failure) failure->assign("bootstrap bundle supersession state could not be persisted"_ctv);
       return false;
     }

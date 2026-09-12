@@ -9396,12 +9396,30 @@ static void testBootstrapBundleSupersessionReceipt(TestSuite& suite)
   brain.restorePersistentUpdateSelfState(beforeMissingCheckpoint);
   brain.updateSelfWorkerStateUploadedMachineUUIDs.insert(worker.uuid);
   brain.updateSelfWorkerStateUploadedMachineUUIDs.insert(secondWorker.uuid);
+  brain.updateSelfState = Brain::UpdateSelfState::waitingForBundleEchos;
+  brain.updateSelfExpectedEchos = 2;
+  brain.updateSelfBundleEchos = 1;
+  brain.updateSelfRelinquishEchos = 1;
+  brain.updateSelfPlannedMasterPeerKey = 0x7766;
+  brain.pendingDesignatedMasterPeerKey = 0x6655;
+  brain.updateSelfUseStagedBundleOnly = true;
+  brain.updateSelfTransitionAfterMothershipAck = true;
+  brain.updateSelfBundleEchoPeerKeys.insert(0x7766);
+  brain.updateSelfFollowerRebootedPeerKeys.insert(0x7766);
   suite.expect(brain.consumeBootstrapBundleSupersessionReceipt(boot, true, local.uuid, brain.brainConfig.clusterUUID, &failure, &successorBundle) &&
                    brain.updateSelfWorkerExpectedBundleSHA256.equals(successorDigest) &&
                    brain.updateSelfWorkerStateUploadedMachineUUIDs.empty() &&
                    brain.updateSelfLocalMachineUUID == checkpoint.machineUUID &&
                    brain.updateSelfLocalContainerBootstraps.size() == checkpoint.plans.size(),
                "bootstrap_supersession_accepts_uploaded_workers_before_local_brain_transition");
+  suite.expect(brain.updateSelfState == Brain::UpdateSelfState::idle &&
+                   brain.updateSelfExpectedEchos == 0 && brain.updateSelfBundleEchos == 0 &&
+                   brain.updateSelfRelinquishEchos == 0 && brain.updateSelfPlannedMasterPeerKey == 0 &&
+                   brain.pendingDesignatedMasterPeerKey == 0 && !brain.updateSelfUseStagedBundleOnly &&
+                   !brain.updateSelfTransitionAfterMothershipAck &&
+                   brain.updateSelfBundleEchoPeerKeys.empty() && brain.updateSelfFollowerRebootedPeerKeys.empty() &&
+                   brain.lastPersistedMasterAuthorityState.updateSelf.state == uint8_t(Brain::UpdateSelfState::idle),
+               "bootstrap_supersession_clears_obsolete_coordinator_before_successor_commit");
 
   brain.machines.erase(&restoredLocalMachine);
   brain.machines.erase(&worker);
