@@ -11658,6 +11658,135 @@ int main(void)
   }
 
   {
+    // A recovered stateless head can report target=1 while retaining surplus
+    // healthy containers. The canary scheduler must leave that live predecessor
+    // alone until the successor's sole canary has actually become healthy.
+    ScopedFreshRing ring;
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+
+    Rack rack = {};
+    rack.uuid = 19'610'201;
+    ScopedSocketPair socket = {};
+    bool socketReady = socket.create(suite, "canary_surplus_retirement_creates_neuron_control_socketpair");
+
+    Machine machine = {};
+    machine.uuid = uint128_t(0x19610201);
+    machine.private4 = 0x0a000041;
+    machine.slug = "canary-surplus-owner"_ctv;
+    machine.rack = &rack;
+    machine.state = MachineState::healthy;
+    machine.lifetime = MachineLifetime::owned;
+    machine.hardware.inventoryComplete = true;
+    machine.hardware.cpu.architecture = nametagCurrentBuildMachineArchitecture();
+    machine.nLogicalCores_available = 16;
+    machine.memoryMB_available = 16'384;
+    machine.storageMB_available = 4'096;
+    bool machineReady = socketReady && armNeuronControlStream(machine, socket);
+    rack.machines.insert(&machine);
+    brain.racks.insert_or_assign(rack.uuid, &rack);
+    brain.machines.insert(&machine);
+    suite.expect(machineReady, "canary_surplus_retirement_seeds_machine_neuron_control_stream");
+
+    ApplicationDeployment *previous = new ApplicationDeployment();
+    seedCommonPlan(*previous, false);
+    previous->plan.config.versionID = 41;
+    previous->plan.stateless.nBase = 1;
+    previous->state = DeploymentState::running;
+    previous->nTargetBase = 1;
+    previous->nDeployedBase = 3;
+    previous->nHealthyBase = 3;
+
+    Vector<ContainerView *> retained = {};
+    for (uint32_t index = 0; index < 3; ++index)
+    {
+      ContainerView *container = new ContainerView();
+      container->uuid = uint128_t(0x19610210 + index);
+      container->deploymentID = previous->plan.config.deploymentID();
+      container->applicationID = previous->plan.config.applicationID;
+      container->machine = &machine;
+      container->lifetime = ApplicationLifetime::base;
+      container->state = ContainerState::healthy;
+      previous->containers.insert(container);
+      machine.upsertContainerIndexEntry(container->deploymentID, container);
+      brain.containers.insert_or_assign(container->uuid, container);
+      retained.push_back(container);
+    }
+    brain.deployments.insert_or_assign(previous->plan.config.deploymentID(), previous);
+    brain.deploymentsByApp.insert_or_assign(previous->plan.config.applicationID, previous);
+
+    auto startSuccessor = [&](uint64_t versionID) -> ApplicationDeployment * {
+      ApplicationDeployment *successor = new ApplicationDeployment();
+      seedCommonPlan(*successor, false);
+      successor->plan.config.versionID = versionID;
+      successor->plan.stateless.nBase = 1;
+      successor->plan.canaryCount = 1;
+      successor->plan.canariesMustLiveForMinutes = 1;
+      successor->plan.moveConstructively = true;
+      successor->plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+      successor->previous = previous;
+      previous->next = successor;
+      brain.deployments.insert_or_assign(successor->plan.config.deploymentID(), successor);
+      brain.deploymentsByApp.insert_or_assign(successor->plan.config.applicationID, successor);
+      successor->deploy();
+      return successor;
+    };
+
+    TimeoutPacket canaryLifetime = {};
+    canaryLifetime.flags = uint64_t(DeploymentTimeoutFlags::canariesMinimumLifetime);
+
+    if (machineReady)
+    {
+      ApplicationDeployment *healthy = startSuccessor(42);
+      suite.expect(healthy->state == DeploymentState::canaries && previous->state == DeploymentState::running,
+                   "canary_surplus_retirement_waits_before_predecessor_decommission");
+      suite.expect(previous->containers.size() == 3 && retained[0]->state == ContainerState::healthy && retained[1]->state == ContainerState::healthy && retained[2]->state == ContainerState::healthy,
+                   "canary_surplus_retirement_unhealthy_canary_preserves_all_retained_instances");
+
+      ContainerView *canary = nullptr;
+      for (ContainerView *container : healthy->containers)
+      {
+        if (container && container->lifetime == ApplicationLifetime::canary)
+        {
+          canary = container;
+          break;
+        }
+      }
+      suite.expect(canary != nullptr, "canary_surplus_retirement_materializes_successor_canary");
+      if (canary)
+      {
+        healthy->containerIsHealthy(canary);
+        healthy->dispatchTimeout(&canaryLifetime);
+      }
+      suite.expect(previous->state == DeploymentState::decommissioning,
+                   "canary_surplus_retirement_healthy_timeout_decommissions_predecessor");
+      suite.expect(previous->containers.empty(),
+                   "canary_surplus_retirement_healthy_timeout_retires_all_surplus_instances");
+      suite.expect(healthy->nTargetBase == 1 && healthy->nDeployedBase == 1 && healthy->nHealthyBase == 1,
+                   "canary_surplus_retirement_healthy_timeout_keeps_successor_target_one");
+
+      healthy->waitingOnContainers.clear();
+      brain.deployments.erase(healthy->plan.config.deploymentID());
+      brain.deploymentsByApp.erase(healthy->plan.config.applicationID);
+      delete healthy;
+    }
+
+    for (ContainerView *container : retained)
+    {
+      brain.containers.erase(container->uuid);
+      machine.removeContainerIndexEntry(previous->plan.config.deploymentID(), container);
+      delete container;
+    }
+    brain.deployments.erase(previous->plan.config.deploymentID());
+    rack.machines.erase(&machine);
+    brain.machines.erase(&machine);
+    brain.racks.erase(rack.uuid);
+    delete previous;
+    thisBrain = savedBrain;
+  }
+
+  {
     ScopedFreshRing ring;
     TestBrain brain;
     BrainBase *savedBrain = thisBrain;
