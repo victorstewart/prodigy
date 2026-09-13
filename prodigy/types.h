@@ -4468,7 +4468,7 @@ public:
     void stringify(String& string, uint8_t nTabs) const
     {
       string.appendTabs(nTabs);
-      string.snprintf_tab_add<"containerRuntime: cores={itoa} memMB={itoa} storMB={itoa}\n"_ctv>(nTabs, nLogicalCores, memoryMB, storageMB);
+      string.snprintf_tab_add<"containerRuntime: cores={itoa} memMB={itoa} storMB={itoa} uuid={itoa}\n"_ctv>(nTabs, nLogicalCores, memoryMB, storageMB, uuid);
     }
   };
 

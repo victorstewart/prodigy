@@ -9706,6 +9706,12 @@ int main(void)
     suite.expect(report.containerRuntimes[0].nLogicalCores == 3, "generateReport_runtime_cores");
     suite.expect(report.containerRuntimes[0].memoryMB == 777, "generateReport_runtime_memory");
     suite.expect(report.containerRuntimes[0].storageMB == 222, "generateReport_runtime_storage");
+
+    String rendered = {};
+    report.stringify(rendered, 0);
+    std::string_view renderedView(rendered.c_str(), rendered.size());
+    suite.expect(renderedView.find("containerRuntime: cores=3 memMB=777 storMB=222 uuid=170") != std::string_view::npos,
+                 "generateReport_runtime_stringify_includes_container_uuid");
   }
 
   {
