@@ -11661,6 +11661,8 @@ int main(void)
     // A recovered stateless head can report target=1 while retaining surplus
     // healthy containers. The canary scheduler must leave that live predecessor
     // alone until the successor's sole canary has actually become healthy.
+    // Keep the three retained instances on the local Brain and two remote
+    // Neurons, matching the recovered public Timezone shape.
     ScopedFreshRing ring;
     TestBrain brain;
     BrainBase *savedBrain = thisBrain;
@@ -11668,26 +11670,42 @@ int main(void)
 
     Rack rack = {};
     rack.uuid = 19'610'201;
-    ScopedSocketPair socket = {};
-    bool socketReady = socket.create(suite, "canary_surplus_retirement_creates_neuron_control_socketpair");
+    ScopedSocketPair socketBrain = {};
+    ScopedSocketPair socketWorkerA = {};
+    ScopedSocketPair socketWorkerB = {};
+    bool socketsReady =
+        socketBrain.create(suite, "canary_surplus_retirement_creates_brain_control_socketpair") &&
+        socketWorkerA.create(suite, "canary_surplus_retirement_creates_worker_a_control_socketpair") &&
+        socketWorkerB.create(suite, "canary_surplus_retirement_creates_worker_b_control_socketpair");
 
-    Machine machine = {};
-    machine.uuid = uint128_t(0x19610201);
-    machine.private4 = 0x0a000041;
-    machine.slug = "canary-surplus-owner"_ctv;
-    machine.rack = &rack;
-    machine.state = MachineState::healthy;
-    machine.lifetime = MachineLifetime::owned;
-    machine.hardware.inventoryComplete = true;
-    machine.hardware.cpu.architecture = nametagCurrentBuildMachineArchitecture();
-    machine.nLogicalCores_available = 16;
-    machine.memoryMB_available = 16'384;
-    machine.storageMB_available = 4'096;
-    bool machineReady = socketReady && armNeuronControlStream(machine, socket);
-    rack.machines.insert(&machine);
+    auto prepareMachine = [&](Machine& machine, uint128_t uuid, uint32_t private4, const String& slug, bool isBrain, ScopedSocketPair& socket) {
+      machine.uuid = uuid;
+      machine.private4 = private4;
+      machine.slug = slug;
+      machine.rack = &rack;
+      machine.state = MachineState::healthy;
+      machine.lifetime = MachineLifetime::owned;
+      machine.isBrain = isBrain;
+      machine.isThisMachine = isBrain;
+      machine.hardware.inventoryComplete = true;
+      machine.hardware.cpu.architecture = nametagCurrentBuildMachineArchitecture();
+      machine.nLogicalCores_available = 16;
+      machine.memoryMB_available = 16'384;
+      machine.storageMB_available = 4'096;
+      rack.machines.insert(&machine);
+      brain.machines.insert(&machine);
+      return socketsReady && armNeuronControlStream(machine, socket);
+    };
+
+    Machine brainMachine = {};
+    Machine workerA = {};
+    Machine workerB = {};
+    bool brainMachineReady = prepareMachine(brainMachine, uint128_t(0x19610201), 0x0a000041, "canary-surplus-brain"_ctv, true, socketBrain);
+    bool workerAReady = prepareMachine(workerA, uint128_t(0x19610202), 0x0a000042, "canary-surplus-worker-a"_ctv, false, socketWorkerA);
+    bool workerBReady = prepareMachine(workerB, uint128_t(0x19610203), 0x0a000043, "canary-surplus-worker-b"_ctv, false, socketWorkerB);
     brain.racks.insert_or_assign(rack.uuid, &rack);
-    brain.machines.insert(&machine);
-    suite.expect(machineReady, "canary_surplus_retirement_seeds_machine_neuron_control_stream");
+    const bool machinesReady = brainMachineReady && workerAReady && workerBReady;
+    suite.expect(machinesReady, "canary_surplus_retirement_seeds_brain_and_worker_neuron_control_streams");
 
     ApplicationDeployment *previous = new ApplicationDeployment();
     seedCommonPlan(*previous, false);
@@ -11699,17 +11717,18 @@ int main(void)
     previous->nHealthyBase = 3;
 
     Vector<ContainerView *> retained = {};
+    Machine *retainedMachines[] = {&brainMachine, &workerA, &workerB};
     for (uint32_t index = 0; index < 3; ++index)
     {
       ContainerView *container = new ContainerView();
       container->uuid = uint128_t(0x19610210 + index);
       container->deploymentID = previous->plan.config.deploymentID();
       container->applicationID = previous->plan.config.applicationID;
-      container->machine = &machine;
+      container->machine = retainedMachines[index];
       container->lifetime = ApplicationLifetime::base;
       container->state = ContainerState::healthy;
       previous->containers.insert(container);
-      machine.upsertContainerIndexEntry(container->deploymentID, container);
+      retainedMachines[index]->upsertContainerIndexEntry(container->deploymentID, container);
       brain.containers.insert_or_assign(container->uuid, container);
       retained.push_back(container);
     }
@@ -11736,13 +11755,14 @@ int main(void)
     TimeoutPacket canaryLifetime = {};
     canaryLifetime.flags = uint64_t(DeploymentTimeoutFlags::canariesMinimumLifetime);
 
-    if (machineReady)
+    ApplicationDeployment *healthy = nullptr;
+    if (machinesReady)
     {
-      ApplicationDeployment *healthy = startSuccessor(42);
+      healthy = startSuccessor(42);
       suite.expect(healthy->state == DeploymentState::canaries && previous->state == DeploymentState::running,
                    "canary_surplus_retirement_waits_before_predecessor_decommission");
       suite.expect(previous->containers.size() == 3 && retained[0]->state == ContainerState::healthy && retained[1]->state == ContainerState::healthy && retained[2]->state == ContainerState::healthy,
-                   "canary_surplus_retirement_unhealthy_canary_preserves_all_retained_instances");
+                   "canary_surplus_retirement_unhealthy_canary_preserves_brain_and_worker_instances");
 
       ContainerView *canary = nullptr;
       for (ContainerView *container : healthy->containers)
@@ -11761,28 +11781,57 @@ int main(void)
       }
       suite.expect(previous->state == DeploymentState::decommissioning,
                    "canary_surplus_retirement_healthy_timeout_decommissions_predecessor");
-      suite.expect(previous->containers.empty(),
-                   "canary_surplus_retirement_healthy_timeout_retires_all_surplus_instances");
+      suite.expect(previous->containers.empty() && healthy->waitingOnContainers.size() == 3,
+                   "canary_surplus_retirement_healthy_timeout_queues_all_three_retained_destructions");
       suite.expect(healthy->nTargetBase == 1 && healthy->nDeployedBase == 1 && healthy->nHealthyBase == 1,
                    "canary_surplus_retirement_healthy_timeout_keeps_successor_target_one");
 
-      healthy->waitingOnContainers.clear();
+      // This is the normal post-Neuron kill acknowledgement callback. Do not
+      // clear waiters or manually delete retained views; the callback owns both.
+      for (uint32_t index = 0; index < retained.size(); ++index)
+      {
+        ContainerView *container = retained[index];
+        // Brain::neuronHandler resolves this same destroyed waiter before
+        // dispatching to the deployment callback. TestBrain is intentionally a
+        // BrainBase model, so exercise the callback itself without duplicating
+        // the production message-dispatch loop here.
+        healthy->containerDestroyed(container);
+        retained[index] = nullptr;
+        if (index + 1 < 3)
+        {
+          suite.expect(healthy->previous == previous && healthy->waitingOnContainers.size() == 2 - index,
+                       "canary_surplus_retirement_intermediate_ack_keeps_predecessor_and_remaining_waiters");
+        }
+      }
+      suite.expect(healthy->state == DeploymentState::running && healthy->previous == nullptr && healthy->waitingOnContainers.empty(),
+                   "canary_surplus_retirement_all_three_acknowledgements_finish_without_manual_cleanup");
+    }
+
+    if (healthy)
+    {
       brain.deployments.erase(healthy->plan.config.deploymentID());
       brain.deploymentsByApp.erase(healthy->plan.config.applicationID);
       delete healthy;
     }
-
-    for (ContainerView *container : retained)
+    else
     {
-      brain.containers.erase(container->uuid);
-      machine.removeContainerIndexEntry(previous->plan.config.deploymentID(), container);
-      delete container;
+      for (ContainerView *container : retained)
+      {
+        brain.containers.erase(container->uuid);
+        container->machine->removeContainerIndexEntry(previous->plan.config.deploymentID(), container);
+        delete container;
+      }
+      brain.deployments.erase(previous->plan.config.deploymentID());
+      brain.deploymentsByApp.erase(previous->plan.config.applicationID);
+      delete previous;
     }
-    brain.deployments.erase(previous->plan.config.deploymentID());
-    rack.machines.erase(&machine);
-    brain.machines.erase(&machine);
+    rack.machines.erase(&brainMachine);
+    rack.machines.erase(&workerA);
+    rack.machines.erase(&workerB);
+    brain.machines.erase(&brainMachine);
+    brain.machines.erase(&workerA);
+    brain.machines.erase(&workerB);
     brain.racks.erase(rack.uuid);
-    delete previous;
     thisBrain = savedBrain;
   }
 
