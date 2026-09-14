@@ -5085,6 +5085,17 @@ private:
         sshTunnelKnownHostsPath.assign(knownHostsPath);
         if (connectLocalUnixSocket(localTunnelPath))
         {
+          if (setRemoteSshUnixTransportNonblocking() == false)
+          {
+            disconnectLocal();
+            disconnectSSH();
+            if (failure)
+            {
+              *failure = lastConnectFailure;
+            }
+            return false;
+          }
+
           lastConnectFailure.clear();
           lastIOFailure.clear();
           basics_log("mothership control connect mode=remoteSshUnix target=%s ssh=%.*s:%u path=%.*s tunnel=%s tunnelPid=%d fd=%d\n",
@@ -5202,8 +5213,126 @@ private:
 
     return false;
   }
+  bool setRemoteSshUnixTransportNonblocking(void)
+  {
+    int flags = ::fcntl(transportFD, F_GETFL, 0);
+    if (flags < 0 || ::fcntl(transportFD, F_SETFL, flags | O_NONBLOCK) != 0)
+    {
+      lastConnectFailure.snprintf<"failed to set remote ssh unix transport nonblocking: {}"_ctv>(String(std::strerror(errno)));
+      return false;
+    }
+    return true;
+  }
+
+  bool waitForRemoteSshUnixTransport(short events, int64_t deadlineMs, const char *operation)
+  {
+    for (;;)
+    {
+      int64_t nowMs = Time::now<TimeResolution::ms>();
+      if (nowMs >= deadlineMs)
+      {
+        errno = ETIMEDOUT;
+        basics_log("mothership control ssh-unix-%s-timeout target=%s fd=%d\n", operation, targetLabel.c_str(), transportFD);
+        return false;
+      }
+
+      pollfd pollFD = {};
+      pollFD.fd = transportFD;
+      pollFD.events = events;
+      int remainingMs = int(std::min<int64_t>(deadlineMs - nowMs, INT_MAX));
+      int result = ::poll(&pollFD, 1, remainingMs);
+      if (result > 0)
+      {
+        if ((pollFD.revents & POLLNVAL) != 0)
+        {
+          errno = EBADF;
+          basics_log("mothership control ssh-unix-%s-invalid-fd target=%s fd=%d\n", operation, targetLabel.c_str(), transportFD);
+          return false;
+        }
+        return true;
+      }
+      if (result == 0)
+      {
+        errno = ETIMEDOUT;
+        basics_log("mothership control ssh-unix-%s-timeout target=%s fd=%d\n", operation, targetLabel.c_str(), transportFD);
+        return false;
+      }
+      if (errno != EINTR)
+      {
+        basics_log("mothership control ssh-unix-%s-poll-failed target=%s fd=%d errno=%d(%s)\n",
+                   operation,
+                   targetLabel.c_str(),
+                   transportFD,
+                   errno,
+                   std::strerror(errno));
+        return false;
+      }
+    }
+  }
+
+  ssize_t recvRemoteSshUnixTransport(uint8_t *buffer, size_t len)
+  {
+    int64_t deadlineMs = Time::now<TimeResolution::ms>() + sshTransportIOTimeoutMs;
+    for (;;)
+    {
+      if (waitForRemoteSshUnixTransport(POLLIN, deadlineMs, "recv") == false)
+      {
+        return -1;
+      }
+
+      ssize_t result = ::recv(transportFD, buffer, len, 0);
+      if (result >= 0)
+      {
+        return result;
+      }
+      if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+      {
+        return -1;
+      }
+    }
+  }
+
+  bool sendRemoteSshUnixTransport(const uint8_t *buffer, size_t len)
+  {
+    int64_t deadlineMs = Time::now<TimeResolution::ms>() + sshTransportIOTimeoutMs;
+    size_t sent = 0;
+    while (sent < len)
+    {
+      if (waitForRemoteSshUnixTransport(POLLOUT, deadlineMs, "send") == false)
+      {
+        return false;
+      }
+
+      int flags = 0;
+#ifdef MSG_NOSIGNAL
+      flags |= MSG_NOSIGNAL;
+#endif
+      ssize_t result = ::send(transportFD, buffer + sent, len - sent, flags);
+      if (result > 0)
+      {
+        sent += size_t(result);
+        continue;
+      }
+      if (result == 0)
+      {
+        errno = EPIPE;
+        return false;
+      }
+      if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
   ssize_t recvTransport(uint8_t *buffer, size_t len)
   {
+    if (transportMode == TransportMode::remoteSshUnix && sshChannel == nullptr)
+    {
+      return recvRemoteSshUnixTransport(buffer, len);
+    }
+
     if (transportMode == TransportMode::remoteSshUnix && sshChannel != nullptr)
     {
       int64_t deadlineMs = Time::now<TimeResolution::ms>() + sshTransportIOTimeoutMs;
@@ -5328,6 +5457,11 @@ private:
 
   bool sendTransport(const uint8_t *buffer, size_t len)
   {
+    if (transportMode == TransportMode::remoteSshUnix && sshChannel == nullptr)
+    {
+      return sendRemoteSshUnixTransport(buffer, len);
+    }
+
     if (transportMode == TransportMode::remoteSshUnix && sshChannel != nullptr)
     {
       int64_t deadlineMs = Time::now<TimeResolution::ms>() + sshTransportIOTimeoutMs;
@@ -5459,6 +5593,15 @@ public:
     transportMode = TransportMode::localUnix;
     targetLabel.assign("unit-test"_ctv);
     transportFD = fd;
+  }
+
+  bool unitTestAdoptRemoteSshUnixTransportFD(int fd)
+  {
+    disconnect();
+    transportMode = TransportMode::remoteSshUnix;
+    targetLabel.assign("unit-test-remote-ssh-unix"_ctv);
+    transportFD = fd;
+    return setRemoteSshUnixTransportNonblocking();
   }
 #endif
 
