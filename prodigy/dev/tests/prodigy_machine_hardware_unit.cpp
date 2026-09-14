@@ -461,23 +461,125 @@ int main(void)
     suite.expect(nics[0].driver == "ena"_ctv, "parse_ethtool_driver");
     suite.expect(nics[0].busAddress == "0000:00:05.0"_ctv, "parse_ethtool_bus_info");
 
-    String addressJSON = "[{\"ifname\":\"ens5\",\"addr_info\":[{\"family\":\"inet\",\"local\":\"172.31.15.235\",\"prefixlen\":20},{\"family\":\"inet6\",\"local\":\"2600:1f18:abcd::1\",\"prefixlen\":64}]}]"_ctv;
-    String routeJSON = "[{\"dst\":\"default\",\"gateway\":\"172.31.0.1\",\"dev\":\"ens5\"},{\"dst\":\"::/0\",\"gateway\":\"2600:1f18:abcd::ffff\",\"dev\":\"ens5\"}]"_ctv;
-    suite.expect(prodigyPopulateNicSubnetsFromJSON(nics, addressJSON, routeJSON), "populate_nic_subnets_from_json");
-    suite.expect(nics[0].subnets.size() == 2, "populate_nic_subnets_count");
-    suite.expect(nics[0].subnets[0].subnet.cidr == 20, "populate_nic_subnets_ipv4_cidr");
-    suite.expect(nics[0].subnets[0].subnet.network.equals(IPAddress("172.31.0.0", false)), "populate_nic_subnets_ipv4_network");
-    suite.expect(nics[0].subnets[0].gateway.equals(IPAddress("172.31.0.1", false)), "populate_nic_subnets_ipv4_gateway");
+    String addressJSON = "[{\"ifname\":\"ens5\",\"addr_info\":[{\"family\":\"inet\",\"local\":\"10.0.2.15\",\"prefixlen\":24},{\"family\":\"inet6\",\"local\":\"fd72:6e61:6d65:1::10\",\"prefixlen\":64},{\"family\":\"inet6\",\"local\":\"fdf8:42::10\",\"prefixlen\":120},{\"family\":\"inet6\",\"local\":\"fe80::10\",\"prefixlen\":64}]}]"_ctv;
+    suite.expect(prodigyPopulateNicSubnetsFromJSON(nics, addressJSON), "populate_nic_subnets_from_json");
+    suite.expect(nics[0].subnets.size() == 4, "populate_nic_subnets_count");
+    suite.expect(nics[0].subnets[0].subnet.cidr == 24, "populate_nic_subnets_ipv4_cidr");
+    suite.expect(nics[0].subnets[0].subnet.network.equals(IPAddress("10.0.2.0", false)), "populate_nic_subnets_ipv4_network");
+    suite.expect(nics[0].subnets[0].gateway.isNull(), "populate_nic_subnets_defers_ipv4_gateway_until_source_selection");
     suite.expect(nics[0].subnets[1].subnet.cidr == 64, "populate_nic_subnets_ipv6_cidr");
-    suite.expect(nics[0].subnets[1].gateway.equals(IPAddress("2600:1f18:abcd::ffff", true)), "populate_nic_subnets_ipv6_gateway");
+    suite.expect(nics[0].subnets[1].gateway.isNull(), "populate_nic_subnets_defers_ipv6_gateway_until_source_selection");
+
+    Vector<ProdigyNicGatewayMapping> defaultGateways = {};
+    prodigyCollectNicDefaultRouteGateways("[{\"dst\":\"default\",\"gateway\":\"10.0.2.2\",\"dev\":\"ens5\"}]"_ctv, false, defaultGateways);
+    prodigyCollectNicDefaultRouteGateways("[{\"dst\":\"default\",\"gateway\":\"fd72:6e61:6d65:1::1\",\"dev\":\"ens5\"}]"_ctv, true, defaultGateways);
+    suite.expect(prodigyApplyNicDefaultRouteSource(nics, defaultGateways, "[{\"dst\":\"1.1.1.1\",\"gateway\":\"10.0.2.2\",\"dev\":\"ens5\",\"src\":\"10.0.2.15\"}]"_ctv, false), "apply_ipv4_default_route_selected_source");
+    suite.expect(prodigyApplyNicDefaultRouteSource(nics, defaultGateways, "[{\"dst\":\"2606:4700:4700::1111\",\"gateway\":\"fd72:6e61:6d65:1::1\",\"dev\":\"ens5\",\"prefsrc\":\"fd72:6e61:6d65:1::10\"}]"_ctv, true), "apply_ipv6_default_route_selected_source");
+    suite.expect(nics[0].subnets[0].gateway.equals(IPAddress("10.0.2.2", false)), "apply_ipv4_default_route_selected_gateway");
+    suite.expect(nics[0].subnets[1].gateway.equals(IPAddress("fd72:6e61:6d65:1::1", true)), "apply_ipv6_default_route_selected_gateway");
+    suite.expect(nics[0].subnets[2].internetReachable == false, "apply_ipv6_default_route_excludes_container_overlay_source");
+    suite.expect(nics[0].subnets[3].internetReachable == false, "apply_ipv6_default_route_excludes_link_local_source");
 
     MachineNetworkHardwareProfile network = {};
     network.nics = nics;
-    network.internet.interfaceName = "ens5"_ctv;
-    network.internet.sourceAddress = IPAddress("172.31.15.235", false);
     prodigyTagInternetReachableNicSubnets(network);
-    suite.expect(network.nics[0].subnets[0].internetReachable, "tag_internet_reachable_nic_subnet_marks_matching_source");
-    suite.expect(network.nics[0].subnets[1].internetReachable == false, "tag_internet_reachable_nic_subnet_leaves_other_family_clear");
+    suite.expect(network.nics[0].subnets[0].internetReachable, "tag_internet_reachable_nic_subnet_marks_ipv4_default_route");
+    suite.expect(network.nics[0].subnets[1].internetReachable, "tag_internet_reachable_nic_subnet_marks_ipv6_default_route");
+    suite.expect(network.nics[0].subnets[2].internetReachable == false, "tag_internet_reachable_nic_subnet_excludes_container_overlay_source");
+    suite.expect(network.nics[0].subnets[3].internetReachable == false, "tag_internet_reachable_nic_subnet_excludes_link_local_source");
+
+    MachineHardwareProfile defaultRouteHardware = {};
+    defaultRouteHardware.network = network;
+    suite.expect(prodigyMachineHardwareHasInternetAccess(defaultRouteHardware), "hardware_internet_access_accepts_default_route_without_benchmark");
+
+    Vector<MachineNicHardwareProfile> privateOverlayNics = {};
+    suite.expect(
+        prodigyPopulateNicsFromIpLinkJSON(
+            privateOverlayNics,
+            "[{\"ifname\":\"overlay0\",\"address\":\"0a:11:22:33:44:66\",\"operstate\":\"UP\"}]"_ctv),
+        "populate_private_overlay_nic");
+    suite.expect(
+        prodigyPopulateNicSubnetsFromJSON(
+            privateOverlayNics,
+            "[{\"ifname\":\"overlay0\",\"addr_info\":[{\"family\":\"inet\",\"local\":\"10.42.0.2\",\"prefixlen\":24},{\"family\":\"inet6\",\"local\":\"fd72:6e61:6d65::2\",\"prefixlen\":64}]}]"_ctv),
+        "populate_private_overlay_nic_subnets_without_default_route");
+    MachineNetworkHardwareProfile privateOverlayNetwork = {};
+    privateOverlayNetwork.nics = privateOverlayNics;
+    prodigyTagInternetReachableNicSubnets(privateOverlayNetwork);
+    suite.expect(privateOverlayNetwork.nics[0].subnets[0].internetReachable == false, "tag_internet_reachable_nic_subnet_rejects_ipv4_nondefault_route");
+    suite.expect(privateOverlayNetwork.nics[0].subnets[1].internetReachable == false, "tag_internet_reachable_nic_subnet_rejects_ipv6_nondefault_route");
+    MachineHardwareProfile privateOverlayHardware = {};
+    privateOverlayHardware.network = privateOverlayNetwork;
+    suite.expect(prodigyMachineHardwareHasInternetAccess(privateOverlayHardware) == false, "hardware_internet_access_rejects_private_overlay_without_default_route");
+
+    Vector<MachineNicHardwareProfile> onlinkNics = {};
+    suite.expect(
+        prodigyPopulateNicsFromIpLinkJSON(onlinkNics, "[{\"ifname\":\"onlink0\",\"address\":\"0a:11:22:33:44:77\",\"operstate\":\"UP\"}]"_ctv),
+        "populate_onlink_default_nic");
+    suite.expect(
+        prodigyPopulateNicSubnetsFromJSON(onlinkNics, "[{\"ifname\":\"onlink0\",\"addr_info\":[{\"family\":\"inet6\",\"local\":\"2001:db8::2\",\"prefixlen\":64}]}]"_ctv),
+        "populate_onlink_default_nic_subnet");
+    Vector<ProdigyNicGatewayMapping> onlinkDefaults = {};
+    prodigyCollectNicDefaultRouteGateways("[{\"dst\":\"default\",\"dev\":\"onlink0\"}]"_ctv, true, onlinkDefaults);
+    suite.expect(prodigyApplyNicDefaultRouteSource(onlinkNics, onlinkDefaults, "[{\"dst\":\"2606:4700:4700::1111\",\"dev\":\"onlink0\",\"src\":\"2001:db8::2\"}]"_ctv, true), "apply_ipv6_onlink_default_route_selected_source");
+    suite.expect(onlinkNics[0].subnets[0].internetReachable, "apply_ipv6_onlink_default_route_marks_source");
+    suite.expect(onlinkNics[0].subnets[0].gateway.isNull(), "apply_ipv6_onlink_default_route_keeps_gateway_empty");
+  }
+
+  {
+    Vector<MachineNicHardwareProfile> liveNics = {};
+    Vector<MachineToolCapture> captures = {};
+    suite.expect(prodigyCollectNicInventoryFromProcess(liveNics), "collect_commandless_nics_before_route_collection");
+    suite.expect(prodigyCollectNicSubnets(liveNics, captures), "collect_nic_subnets_records_default_route_commands");
+    auto captureForPhase = [&](const String& phase) -> const MachineToolCapture * {
+      for (const MachineToolCapture& capture : captures)
+      {
+        if (capture.phase == phase)
+        {
+          return &capture;
+        }
+      }
+      return nullptr;
+    };
+    const MachineToolCapture *routeShow4 = captureForPhase("route-show-ipv4"_ctv);
+    const MachineToolCapture *routeShow6 = captureForPhase("route-show-ipv6"_ctv);
+    const MachineToolCapture *routeGet4 = captureForPhase("route-get-ipv4"_ctv);
+    const MachineToolCapture *routeGet6 = captureForPhase("route-get-ipv6"_ctv);
+    suite.expect(routeShow4 && routeShow4->succeeded && prodigyStringContains(routeShow4->command, "sh -lc 'ip -j -4 route show table all'"), "collect_nic_subnets_quotes_ipv4_default_route_inventory");
+    suite.expect(routeShow6 && routeShow6->succeeded && prodigyStringContains(routeShow6->command, "sh -lc 'ip -j -6 route show table all'"), "collect_nic_subnets_quotes_ipv6_default_route_inventory");
+    suite.expect(routeGet4 && prodigyStringContains(routeGet4->command, "sh -lc ") && prodigyStringContains(routeGet4->command, "ip -j -4 route get"), "collect_nic_subnets_quotes_ipv4_default_route_lookup");
+    suite.expect(routeGet6 && prodigyStringContains(routeGet6->command, "sh -lc ") && prodigyStringContains(routeGet6->command, "ip -j -6 route get"), "collect_nic_subnets_quotes_ipv6_default_route_lookup");
+
+    Vector<ProdigyNicGatewayMapping> liveDefaults = {};
+    if (routeShow4 && routeShow4->succeeded)
+    {
+      prodigyCollectNicDefaultRouteGateways(routeShow4->output, false, liveDefaults);
+    }
+    if (routeShow6 && routeShow6->succeeded)
+    {
+      prodigyCollectNicDefaultRouteGateways(routeShow6->output, true, liveDefaults);
+    }
+    auto hasSelectedSource = [&](bool is6) -> bool {
+      for (const MachineNicHardwareProfile& nic : liveNics)
+      {
+        for (const MachineNicSubnetHardwareProfile& subnet : nic.subnets)
+        {
+          if (subnet.internetReachable && subnet.address.is6 == is6)
+          {
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+    if (routeGet4 && routeGet4->succeeded && std::any_of(liveDefaults.begin(), liveDefaults.end(), [](const ProdigyNicGatewayMapping& mapping) { return mapping.is6 == false; }))
+    {
+      suite.expect(hasSelectedSource(false), "collect_nic_subnets_marks_selected_live_ipv4_default_source");
+    }
+    if (routeGet6 && routeGet6->succeeded && std::any_of(liveDefaults.begin(), liveDefaults.end(), [](const ProdigyNicGatewayMapping& mapping) { return mapping.is6; }))
+    {
+      suite.expect(hasSelectedSource(true), "collect_nic_subnets_marks_selected_live_ipv6_default_source");
+    }
   }
 
   {
