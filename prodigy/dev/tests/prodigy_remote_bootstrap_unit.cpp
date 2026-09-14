@@ -880,6 +880,43 @@ int main(void)
           "build_remote_bootstrap_plan_fallback_installed_bundle");
       suite.expect(failure.size() == 0, "build_remote_bootstrap_plan_fallback_installed_bundle_clears_failure");
       expectStringEqual(suite, fallbackResolvedBundlePath, fallbackInstalledBundlePath, "plan_local_bundle_path_fallback_installed_root");
+
+      String colocatedInstalledBundlePath = {};
+      prodigyResolveInstalledBundlePathForRoot(fakeExecutableDir, colocatedInstalledBundlePath);
+      String sourceBundlePathText = {};
+      sourceBundlePathText.assign(sourceBundlePath);
+      String colocatedInstalledBundlePathText = {};
+      colocatedInstalledBundlePathText.assign(colocatedInstalledBundlePath);
+      suite.expect(::symlink(sourceBundlePathText.c_str(), colocatedInstalledBundlePathText.c_str()) == 0, "colocated_generic_bundle_symlink_created");
+
+      String colocatedResolvedBundlePath = {};
+      suite.expect(
+          prodigyResolvePreferredBootstrapBundleArtifact(fakeExecutablePath, fallbackRequest.architecture, fallbackRequest.remoteProdigyPath, colocatedResolvedBundlePath, &failure),
+          "build_remote_bootstrap_plan_colocated_generic_bundle");
+      suite.expect(failure.size() == 0, "build_remote_bootstrap_plan_colocated_generic_bundle_clears_failure");
+      expectStringEqual(suite, colocatedResolvedBundlePath, colocatedInstalledBundlePath, "plan_local_bundle_path_colocated_generic_bundle");
+
+      AddMachines crossArchitectureRequest = fallbackRequest;
+      switch (nametagCurrentBuildMachineArchitecture())
+      {
+        case MachineCpuArchitecture::x86_64:
+          {
+            crossArchitectureRequest.architecture = MachineCpuArchitecture::aarch64;
+            break;
+          }
+        default:
+          {
+            crossArchitectureRequest.architecture = MachineCpuArchitecture::x86_64;
+            break;
+          }
+      }
+
+      String crossArchitectureResolvedBundlePath = {};
+      suite.expect(
+          prodigyResolvePreferredBootstrapBundleArtifact(fakeExecutablePath, crossArchitectureRequest.architecture, crossArchitectureRequest.remoteProdigyPath, crossArchitectureResolvedBundlePath, &failure),
+          "build_remote_bootstrap_plan_cross_architecture_fallback_bundle");
+      suite.expect(failure.size() == 0, "build_remote_bootstrap_plan_cross_architecture_fallback_bundle_clears_failure");
+      expectStringEqual(suite, crossArchitectureResolvedBundlePath, fallbackInstalledBundlePath, "plan_local_bundle_path_cross_architecture_fallback_bundle");
     }
   }
 

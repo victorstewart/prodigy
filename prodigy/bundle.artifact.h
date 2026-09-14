@@ -852,6 +852,19 @@ static inline bool prodigyResolvePreferredBootstrapBundleArtifact(const String& 
     return true;
   }
 
+  String colocatedInstalledBundlePath = {};
+  if (localExecutablePath.size() > 0 && architecture == nametagCurrentBuildMachineArchitecture())
+  {
+    String localExecutableDirectory = {};
+    prodigyDirname(localExecutablePath, localExecutableDirectory);
+    prodigyResolveInstalledBundlePathForRoot(localExecutableDirectory, colocatedInstalledBundlePath);
+    if (prodigyFileReadable(colocatedInstalledBundlePath))
+    {
+      bundlePath = colocatedInstalledBundlePath;
+      return true;
+    }
+  }
+
   String installedFailure = {};
   if (prodigyResolveInstalledBundleArtifact(architecture, bundlePath, &installedFailure))
   {
