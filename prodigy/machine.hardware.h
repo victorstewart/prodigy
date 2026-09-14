@@ -2778,9 +2778,8 @@ static inline bool prodigyCollectNicInventoryFromProcess(Vector<MachineNicHardwa
   return nics.empty() == false;
 }
 
-static inline bool prodigyPopulateNicSubnetsFromJSON(Vector<MachineNicHardwareProfile>& nics, const String& addressOutput, const String& routeOutput)
+static inline void prodigyCollectNicDefaultRouteGateways(const String& routeOutput, bool is6, Vector<ProdigyNicGatewayMapping>& gateways)
 {
-  Vector<ProdigyNicGatewayMapping> gateways;
   if (routeOutput.size() > 0)
   {
     simdjson::dom::parser routeParser;
@@ -2807,28 +2806,26 @@ static inline bool prodigyPopulateNicSubnetsFromJSON(Vector<MachineNicHardwarePr
           gatewayText.assign(value.get_c_str());
         }
 
-        if (ifname.size() == 0 || gatewayText.size() == 0)
-        {
-          continue;
-        }
-
-        if (dst.equal("default"_ctv) == false && dst.equal("::/0"_ctv) == false)
+        if (ifname.size() == 0 || (dst.equal("default"_ctv) == false && dst.equal("::/0"_ctv) == false))
         {
           continue;
         }
 
         ProdigyNicGatewayMapping mapping = {};
         mapping.ifname.assign(ifname);
-        if (prodigyParseIPAddressLiteral(gatewayText, mapping.gateway) == false)
+        mapping.is6 = is6;
+        if (gatewayText.size() > 0 && (prodigyParseIPAddressLiteral(gatewayText, mapping.gateway) == false || mapping.gateway.is6 != mapping.is6))
         {
           continue;
         }
-        mapping.is6 = mapping.gateway.is6;
         gateways.push_back(std::move(mapping));
       }
     }
   }
+}
 
+static inline bool prodigyPopulateNicSubnetsFromJSON(Vector<MachineNicHardwareProfile>& nics, const String& addressOutput)
+{
   simdjson::dom::parser addressParser;
   simdjson::dom::element addressDoc;
   if (addressParser.parse(addressOutput.data(), addressOutput.size()).get(addressDoc))
@@ -2895,16 +2892,84 @@ static inline bool prodigyPopulateNicSubnetsFromJSON(Vector<MachineNicHardwarePr
       }
 
       prodigyComputePrefixNetwork(subnet.address, uint8_t(prefixLength), subnet.subnet);
-      if (const ProdigyNicGatewayMapping *gateway = prodigyFindNicGateway(gateways, ifname, subnet.address.is6))
-      {
-        subnet.gateway = gateway->gateway;
-      }
-
       nic->subnets.push_back(std::move(subnet));
     }
   }
 
   return true;
+}
+
+static inline bool prodigyApplyNicDefaultRouteSource(
+    Vector<MachineNicHardwareProfile>& nics,
+    const Vector<ProdigyNicGatewayMapping>& defaultGateways,
+    const String& routeGetOutput,
+    bool is6)
+{
+  simdjson::dom::parser parser;
+  simdjson::dom::element document;
+  if (parser.parse(routeGetOutput.data(), routeGetOutput.size()).get(document) || document.type() != simdjson::dom::element_type::ARRAY)
+  {
+    return false;
+  }
+
+  for (simdjson::dom::element route : document.get_array())
+  {
+    String ifname = {};
+    String sourceText = {};
+    String gatewayText = {};
+    simdjson::dom::element value;
+    if (route["dev"].get(value) == simdjson::SUCCESS && value.type() == simdjson::dom::element_type::STRING)
+    {
+      ifname.assign(value.get_c_str());
+    }
+    if (route["src"].get(value) == simdjson::SUCCESS && value.type() == simdjson::dom::element_type::STRING)
+    {
+      sourceText.assign(value.get_c_str());
+    }
+    else if (route["prefsrc"].get(value) == simdjson::SUCCESS && value.type() == simdjson::dom::element_type::STRING)
+    {
+      sourceText.assign(value.get_c_str());
+    }
+    if (route["gateway"].get(value) == simdjson::SUCCESS && value.type() == simdjson::dom::element_type::STRING)
+    {
+      gatewayText.assign(value.get_c_str());
+    }
+
+    if (ifname.size() == 0 || sourceText.size() == 0 || prodigyFindNicGateway(defaultGateways, ifname, is6) == nullptr)
+    {
+      continue;
+    }
+
+    IPAddress source = {};
+    if (prodigyParseIPAddressLiteral(sourceText, source) == false || source.is6 != is6)
+    {
+      continue;
+    }
+
+    IPAddress gateway = {};
+    if (gatewayText.size() > 0 && (prodigyParseIPAddressLiteral(gatewayText, gateway) == false || gateway.is6 != is6))
+    {
+      continue;
+    }
+
+    MachineNicHardwareProfile *nic = prodigyFindNicByName(nics, ifname);
+    if (nic == nullptr)
+    {
+      continue;
+    }
+
+    for (MachineNicSubnetHardwareProfile& subnet : nic->subnets)
+    {
+      if (subnet.address.equals(source))
+      {
+        subnet.gateway = gateway;
+        subnet.internetReachable = true;
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 static inline bool prodigyPopulateNicsFromIpLinkJSON(Vector<MachineNicHardwareProfile>& nics, const String& output)
@@ -2997,13 +3062,67 @@ static inline bool prodigyCollectNicSubnets(Vector<MachineNicHardwareProfile>& n
     return false;
   }
 
-  command.clear();
-  prodigyAppendCommandPrefix(command, 4);
-  prodigyAppendMachineHardwareShellSingleQuoted(command, "ip -j route show table all"_ctv);
+  Vector<ProdigyNicGatewayMapping> defaultGateways = {};
+  for (bool is6 : {false, true})
+  {
+    String inner = {};
+    inner.append("ip -j "_ctv);
+    if (is6)
+    {
+      inner.append("-6 "_ctv);
+    }
+    else
+    {
+      inner.append("-4 "_ctv);
+    }
+    inner.append("route show table all"_ctv);
+    command.clear();
+    prodigyAppendCommandPrefix(command, 4);
+    prodigyAppendMachineHardwareShellSingleQuoted(command, inner);
 
-  String routeOutput = {};
-  (void)prodigyRunRecordedLocalCommand("ip"_ctv, "route-show"_ctv, command, captures, routeOutput);
-  return prodigyPopulateNicSubnetsFromJSON(nics, addressOutput, routeOutput);
+    String routeOutput = {};
+    if (is6)
+    {
+      if (prodigyRunRecordedLocalCommand("ip"_ctv, "route-show-ipv6"_ctv, command, captures, routeOutput))
+      {
+        prodigyCollectNicDefaultRouteGateways(routeOutput, true, defaultGateways);
+      }
+    }
+    else if (prodigyRunRecordedLocalCommand("ip"_ctv, "route-show-ipv4"_ctv, command, captures, routeOutput))
+    {
+      prodigyCollectNicDefaultRouteGateways(routeOutput, false, defaultGateways);
+    }
+  }
+  if (prodigyPopulateNicSubnetsFromJSON(nics, addressOutput) == false)
+  {
+    return false;
+  }
+
+  auto collectDefaultRouteSource = [&](bool is6, const String& destination, const String& phase) -> void {
+    String inner = {};
+    inner.append("ip -j "_ctv);
+    if (is6)
+    {
+      inner.append("-6 "_ctv);
+    }
+    else
+    {
+      inner.append("-4 "_ctv);
+    }
+    inner.append("route get "_ctv);
+    prodigyAppendMachineHardwareShellSingleQuoted(inner, destination);
+    String routeGetCommand = {};
+    prodigyAppendCommandPrefix(routeGetCommand, 4);
+    prodigyAppendMachineHardwareShellSingleQuoted(routeGetCommand, inner);
+    String routeGetOutput = {};
+    if (prodigyRunRecordedLocalCommand("ip"_ctv, phase, routeGetCommand, captures, routeGetOutput))
+    {
+      (void)prodigyApplyNicDefaultRouteSource(nics, defaultGateways, routeGetOutput, is6);
+    }
+  };
+  collectDefaultRouteSource(false, "1.1.1.1"_ctv, "route-get-ipv4"_ctv);
+  collectDefaultRouteSource(true, "2606:4700:4700::1111"_ctv, "route-get-ipv6"_ctv);
+  return true;
 }
 
 static inline void prodigyCollectNicInventory(MachineNetworkHardwareProfile& network, const ProdigyMachineHardwareCollectorOptions& options = {})
@@ -3303,14 +3422,9 @@ static inline bool prodigyParseSpeedtestJSON(
 
 static inline void prodigyTagInternetReachableNicSubnets(MachineNetworkHardwareProfile& network)
 {
-  for (MachineNicHardwareProfile& nic : network.nics)
-  {
-    for (MachineNicSubnetHardwareProfile& subnet : nic.subnets)
-    {
-      subnet.internetReachable = false;
-    }
-  }
-
+  // Route collection has already marked only the kernel-selected source for
+  // each family default route. Preserve those scheduling facts and add a
+  // speedtest-selected source when one is available.
   if (network.internet.sourceAddress.isNull())
   {
     return;
@@ -3570,6 +3684,7 @@ static inline void prodigyCollectMachineHardwareProfile(MachineHardwareProfile& 
 
   if (options.collectOptionalBenchmarks == false)
   {
+    prodigyTagInternetReachableNicSubnets(hardware.network);
     prodigyDeferOptionalMachineHardwareBenchmarks(hardware);
     return;
   }

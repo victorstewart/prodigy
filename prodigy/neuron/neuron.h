@@ -1082,7 +1082,10 @@ protected:
   {
     DeferredHardwareInventoryResult result = {};
     ProdigyMachineHardwareCollectorOptions hardwareCollectorOptions = {};
-    hardwareCollectorOptions.allowLocalCommands = false;
+    // This already runs on the deferred inventory worker.  Route discovery is
+    // required for family-specific egress placement, while benchmarks remain
+    // outside the boot path.
+    hardwareCollectorOptions.allowLocalCommands = true;
     hardwareCollectorOptions.collectOptionalBenchmarks = false;
     prodigyCollectMachineHardwareProfile(result.hardware, hardwareCollectorOptions);
     serializeMachineHardwareProfileForBrainTransport(result.hardware, result.serializedHardwareProfile);

@@ -678,5 +678,23 @@ static void serialize(S&& serializer, MachineHardwareProfile& profile)
 
 static inline bool prodigyMachineHardwareHasInternetAccess(const MachineHardwareProfile& hardware)
 {
-  return hardware.network.internet.attempted && hardware.network.internet.failure.size() == 0 && hardware.network.internet.latencyMs > 0 && hardware.network.internet.downloadMbps > 0 && hardware.network.internet.uploadMbps > 0;
+  if (hardware.network.internet.attempted && hardware.network.internet.failure.size() == 0 && hardware.network.internet.latencyMs > 0 && hardware.network.internet.downloadMbps > 0 && hardware.network.internet.uploadMbps > 0)
+  {
+    return true;
+  }
+
+  // A default route is sufficient to schedule an egress-dependent container.
+  // It is not a substitute for a measured Internet benchmark.
+  for (const MachineNicHardwareProfile& nic : hardware.network.nics)
+  {
+    for (const MachineNicSubnetHardwareProfile& subnet : nic.subnets)
+    {
+      if (subnet.internetReachable)
+      {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
