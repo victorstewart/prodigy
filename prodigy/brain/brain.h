@@ -982,6 +982,24 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityStateTransition& tra
   serializer.object(transition.brainConfig);
 }
 
+// An adopted machine's explicit peer or address list is operator authority.
+// Resource probing still supplies capacity, but must not turn an incidental
+// management/NAT interface into a second cluster identity.
+static inline bool prodigyAdoptProbedMachinePeerAddressesIfUnspecified(ClusterMachine& machine, const Vector<ClusterMachinePeerAddress>& discoveredAddresses)
+{
+  if (machine.peerAddresses.empty() == false || machine.addresses.privateAddresses.empty() == false || machine.addresses.publicAddresses.empty() == false)
+  {
+    return false;
+  }
+
+  for (const ClusterMachinePeerAddress& candidate : discoveredAddresses)
+  {
+    prodigyAppendUniqueClusterMachinePeerAddress(machine.peerAddresses, candidate);
+  }
+  prodigyAssignClusterMachineAddressesFromPeerCandidates(machine.addresses, discoveredAddresses);
+  return true;
+}
+
 class Brain : public BrainBase, public TimeoutDispatcher {
 public:
 
@@ -15574,14 +15592,9 @@ public:
     }
 
     uint32_t resolvedPrivate4 = 0;
-    if (resolveClusterMachinePrivate4(normalized, resolvedPrivate4) == false)
+    if (resolveClusterMachinePrivate4(normalized, resolvedPrivate4) == false &&
+        prodigyAdoptProbedMachinePeerAddressesIfUnspecified(normalized, probedResources.peerAddresses))
     {
-      normalized.peerAddresses.clear();
-      for (const ClusterMachinePeerAddress& candidate : probedResources.peerAddresses)
-      {
-        prodigyAppendUniqueClusterMachinePeerAddress(normalized.peerAddresses, candidate);
-      }
-      prodigyAssignClusterMachineAddressesFromPeerCandidates(normalized.addresses, probedResources.peerAddresses);
       ClusterTopology candidateTopology = {};
       for (const Machine *machine : machines)
       {

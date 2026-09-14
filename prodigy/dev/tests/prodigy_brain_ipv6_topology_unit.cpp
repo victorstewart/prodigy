@@ -539,6 +539,43 @@ int main(void)
   thisNeuron = &neuron;
 
   {
+    Vector<ClusterMachinePeerAddress> discovered = {};
+    discovered.push_back(ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24, "10.0.2.2"_ctv});
+
+    ClusterMachine firstExplicit = {};
+    prodigyAppendUniqueClusterMachineAddress(firstExplicit.addresses.privateAddresses, "fd72:6e61:6d65:1::10"_ctv, 64, "fd72:6e61:6d65:1::1"_ctv);
+    ClusterMachine secondExplicit = {};
+    prodigyAppendUniqueClusterMachineAddress(secondExplicit.addresses.privateAddresses, "fd72:6e61:6d65:2::10"_ctv, 64, "fd72:6e61:6d65:2::1"_ctv);
+
+    suite.expect(prodigyAdoptProbedMachinePeerAddressesIfUnspecified(firstExplicit, discovered) == false,
+                 "adopted_explicit_ipv6_keeps_peer_authority");
+    suite.expect(prodigyAdoptProbedMachinePeerAddressesIfUnspecified(secondExplicit, discovered) == false,
+                 "adopted_distinct_ipv6_keeps_peer_authority");
+    suite.expect(firstExplicit.peerAddresses.empty() && secondExplicit.peerAddresses.empty(),
+                 "adopted_explicit_ipv6_does_not_import_duplicate_nat_peer");
+    suite.expect(firstExplicit.addresses.privateAddresses.size() == 1 &&
+                 firstExplicit.addresses.privateAddresses[0].address.equals("fd72:6e61:6d65:1::10"_ctv) &&
+                 firstExplicit.addresses.privateAddresses[0].cidr == 64 &&
+                 firstExplicit.addresses.privateAddresses[0].gateway.equals("fd72:6e61:6d65:1::1"_ctv),
+                 "adopted_explicit_ipv6_retains_first_address_prefix_and_gateway");
+    suite.expect(secondExplicit.addresses.privateAddresses.size() == 1 &&
+                 secondExplicit.addresses.privateAddresses[0].address.equals("fd72:6e61:6d65:2::10"_ctv) &&
+                 secondExplicit.addresses.privateAddresses[0].cidr == 64 &&
+                 secondExplicit.addresses.privateAddresses[0].gateway.equals("fd72:6e61:6d65:2::1"_ctv),
+                 "adopted_explicit_ipv6_retains_second_address_prefix_and_gateway");
+    suite.expect(firstExplicit.sameIdentityAs(secondExplicit) == false,
+                 "adopted_distinct_ipv6_does_not_conflict_after_duplicate_nat_probe");
+
+    ClusterMachine addressless = {};
+    suite.expect(prodigyAdoptProbedMachinePeerAddressesIfUnspecified(addressless, discovered),
+                 "adopted_addressless_discovers_peer_authority");
+    suite.expect(addressless.peerAddresses.size() == 1 && addressless.peerAddresses[0].address.equals("10.0.2.15"_ctv),
+                 "adopted_addressless_retains_discovered_peer");
+    suite.expect(addressless.addresses.privateAddresses.size() == 1 && addressless.addresses.privateAddresses[0].address.equals("10.0.2.15"_ctv),
+                 "adopted_addressless_derives_private_address");
+  }
+
+  {
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
 
