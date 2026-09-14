@@ -961,6 +961,30 @@ int main(void)
   }
 
   {
+    int pair[2] = {-1, -1};
+    bool pairReady = ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0;
+    suite.expect(pairReady, "remote_ssh_unix_timeout_fixture_created");
+    if (pairReady)
+    {
+      MothershipSocket socket = {};
+      socket.setRemoteIOTimeoutMs(25);
+      bool adopted = socket.unitTestAdoptRemoteSshUnixTransportFD(pair[0]);
+      pair[0] = -1;
+      suite.expect(adopted, "remote_ssh_unix_timeout_transport_nonblocking");
+      if (adopted)
+      {
+        auto started = std::chrono::steady_clock::now();
+        errno = 0;
+        Message *response = socket.recvExpectedTopic(MothershipTopic::addMachines);
+        int elapsedMs = int(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count());
+        suite.expect(response == nullptr && errno == ETIMEDOUT, "remote_ssh_unix_timeout_returns_etimedout");
+        suite.expect(elapsedMs >= 15 && elapsedMs < 1000, "remote_ssh_unix_timeout_honors_deadline");
+      }
+      ::close(pair[1]);
+    }
+  }
+
+  {
     MothershipProdigyCluster remoteCluster = {};
     remoteCluster.name = "remote-candidate-test"_ctv;
     remoteCluster.deploymentMode = MothershipClusterDeploymentMode::remote;
