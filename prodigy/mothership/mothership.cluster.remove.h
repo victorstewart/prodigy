@@ -24,9 +24,57 @@ public:
   virtual bool destroyCreatedCloudMachines(const MothershipProdigyCluster& cluster, const Vector<ClusterMachine>& machines, uint32_t& destroyed, String *failure = nullptr) = 0;
 };
 
+static inline void mothershipAppendProdigyOwnedStorageCleanupCommand(String& command)
+{
+  // Bootstrap creates this loop only when /containers is not already btrfs.
+  // Do not unlink its backing file until the exact mount is gone.
+  command.append(R"SH(load=$(systemctl show --property=LoadState --value prodigy) || { echo 'failed to query prodigy service' >&2; exit 1; };
+if [ "$load" != not-found ]; then
+  systemctl stop prodigy || { echo 'failed to stop prodigy' >&2; exit 1; };
+  active=$(systemctl show --property=ActiveState --value prodigy) || exit 1;
+  pid=$(systemctl show --property=MainPID --value prodigy) || exit 1;
+  [ "$active" = inactive ] && [ "$pid" = 0 ] || { echo 'prodigy remained active' >&2; exit 1; };
+  systemctl disable prodigy || true;
+fi;
+img=/var/lib/prodigy/containers.btrfs.loop;
+query_owned_loop() {
+  loop=$(losetup -j "$img" --noheadings --output NAME) || { echo 'failed to query loop association' >&2; exit 1; };
+  case "$loop" in
+    '') ;;
+    /dev/loop*) loop_number=${loop#/dev/loop}; case "$loop_number" in ''|*[!0-9]*) echo 'refusing ambiguous loop association' >&2; exit 1;; esac ;;
+    *) echo 'refusing ambiguous loop association' >&2; exit 1;;
+  esac;
+};
+query_owned_loop;
+if mountpoint -q /containers; then
+  source=$(findmnt -rn -o SOURCE --target /containers) || { echo 'failed to identify /containers source' >&2; exit 1; };
+  fstype=$(findmnt -rn -o FSTYPE --target /containers) || { echo 'failed to identify /containers filesystem' >&2; exit 1; };
+  if [ -e "$img" ]; then
+    [ -n "$loop" ] && [ "$source" = "$loop" ] && [ "$fstype" = btrfs ] || { echo 'refusing ambiguous /containers loop mount' >&2; exit 1; };
+    umount /containers || { echo 'failed to unmount owned /containers loop mount' >&2; exit 1; };
+    if mountpoint -q /containers; then echo 'owned /containers loop mount remained mounted' >&2; exit 1; fi;
+    query_owned_loop;
+  else
+    case "$source" in /dev/loop*) echo 'refusing unexpected /containers loop mount' >&2; exit 1;; esac;
+  fi;
+fi;
+if [ -n "$loop" ]; then
+  sources=$(findmnt -rn -o SOURCE) || { echo 'failed to query mount sources' >&2; exit 1; };
+  set -f;
+  for source in $sources; do
+    case "$source" in "$loop"|"$loop"\[*) echo 'refusing loop still mounted outside /containers' >&2; exit 1;; esac;
+  done;
+  losetup -d "$loop" || { echo 'failed to detach owned /containers loop' >&2; exit 1; };
+  query_owned_loop;
+  [ -z "$loop" ] || { echo 'owned /containers loop remained attached' >&2; exit 1; };
+fi)SH"_ctv);
+}
+
 static inline void mothershipBuildProdigyStateWipeCommand(const String& stateDBPath, String& command)
 {
-  command.assign("systemctl stop prodigy || true; systemctl disable prodigy || true; rm -rf /run/prodigy /var/lib/prodigy"_ctv);
+  command.assign("set -eu; "_ctv);
+  mothershipAppendProdigyOwnedStorageCleanupCommand(command);
+  command.append("; rm -rf /run/prodigy /var/lib/prodigy"_ctv);
 
   constexpr static const char *defaultStatePrefix = "/var/lib/prodigy/";
   if (stateDBPath.size() >= 17 && std::memcmp(stateDBPath.data(), defaultStatePrefix, 17) == 0)
@@ -82,7 +130,9 @@ static inline void mothershipBuildRemoteProdigyUninstallCommand(const Mothership
     }
   }
 
-  command.assign("set -eu; systemctl stop prodigy || true; systemctl disable prodigy || true; rm -f /etc/systemd/system/prodigy.service /etc/systemd/system/prodigy.service.tmp /etc/systemd/system/multi-user.target.wants/prodigy.service"_ctv);
+  command.assign("set -eu; "_ctv);
+  mothershipAppendProdigyOwnedStorageCleanupCommand(command);
+  command.append("; rm -f /etc/systemd/system/prodigy.service /etc/systemd/system/prodigy.service.tmp /etc/systemd/system/multi-user.target.wants/prodigy.service"_ctv);
   command.append(" "_ctv);
   prodigyAppendShellSingleQuoted(command, remoteUnitTempPath);
   command.append(" "_ctv);
