@@ -25055,7 +25055,16 @@ public:
             {
               PRODIGY_DEBUG_LOG( "prodigy updateProdigy bundle-recv from=%u bytes=%u\n", bv->private4, uint32_t(newBundle.size()));
               PRODIGY_DEBUG_FLUSH();
-              Filesystem::openWriteAtClose(-1, prodigyStagedBundlePath(), newBundle);
+              String expectedDigest = {};
+              String actualDigest = {};
+              String stagingFailure = {};
+              if (prodigyComputeSHA256Hex(newBundle, expectedDigest, &stagingFailure) == false ||
+                  prodigyStageBundleWithExpectedSHA256(
+                      prodigyStagedBundlePath(), newBundle, expectedDigest, actualDigest, &stagingFailure) == false)
+              {
+                basics_log("prodigy updateProdigy peer bundle stage failed: %s\n", stagingFailure.c_str());
+                break;
+              }
             }
 
             if (peerSocketActive(bv))
@@ -28977,13 +28986,9 @@ public:
           }
           if (response.failure.empty())
           {
-            int written = Filesystem::openWriteAtClose(-1, prodigyStagedBundlePath(), newBundle);
-            if (written < 0 || uint64_t(written) != newBundle.size())
-            {
-              response.failure.snprintf<"failed to stage update bundle bytes={itoa} expected={itoa}"_ctv>(
-                  int64_t(written),
-                  uint64_t(newBundle.size()));
-            }
+            String actualWorkerDigest = {};
+            (void)prodigyStageBundleWithExpectedSHA256(
+                prodigyStagedBundlePath(), newBundle, expectedWorkerDigest, actualWorkerDigest, &response.failure);
           }
 
           uint32_t expectedPeerEchos = 0;

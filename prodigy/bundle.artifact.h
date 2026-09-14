@@ -481,6 +481,48 @@ static inline bool prodigyFileMatchesExpectedSHA256Hex(const String& path, const
   return true;
 }
 
+static inline bool prodigyStageBundleWithExpectedSHA256(
+    const String& bundlePath,
+    const String& bundle,
+    const String& expectedDigest,
+    String& actualDigest,
+    String *failure = nullptr)
+{
+  actualDigest.clear();
+  if (failure)
+  {
+    failure->clear();
+  }
+
+  const int written = Filesystem::openWriteAtClose(-1, bundlePath, bundle);
+  if (written < 0 || uint64_t(written) != bundle.size() ||
+      prodigyFileMatchesExpectedSHA256Hex(bundlePath, expectedDigest, actualDigest, failure) == false)
+  {
+    if (failure && failure->empty())
+    {
+      failure->snprintf<"failed to stage bundle bytes={itoa} expected={itoa}"_ctv>(int64_t(written), uint64_t(bundle.size()));
+    }
+    return false;
+  }
+
+  String sidecarPath = {};
+  prodigyResolveBundleSHA256Path(bundlePath, sidecarPath);
+  String sidecarContent = {};
+  sidecarContent.assign(expectedDigest);
+  sidecarContent.append('\n');
+  const int sidecarWritten = Filesystem::openWriteAtClose(-1, sidecarPath, sidecarContent);
+  if (sidecarWritten < 0 || uint64_t(sidecarWritten) != sidecarContent.size())
+  {
+    if (failure)
+    {
+      failure->snprintf<"failed to stage bundle sha256 sidecar bytes={itoa} expected={itoa}"_ctv>(int64_t(sidecarWritten), uint64_t(sidecarContent.size()));
+    }
+    return false;
+  }
+
+  return true;
+}
+
 static inline bool prodigyComputeFileSHA256Hex(const String& path, String& digest, String *failure = nullptr)
 {
   return prodigyComputeFileSHA256Hex(path, digest, nullptr, failure);
@@ -963,8 +1005,20 @@ static inline bool prodigyInstallBundleToRoot(const String& bundlePath, const St
 
   ProdigyInstallRootPaths paths = {};
   prodigyBuildInstallRootPaths(installRoot, paths);
+  String expectedDigest = {};
+  String actualDigest = {};
+  if (prodigyLoadBundleExpectedSHA256Hex(bundlePath, expectedDigest, failure) == false ||
+      prodigyBundleMatchesExpectedSHA256Hex(bundlePath, expectedDigest, actualDigest, failure) == false)
+  {
+    return false;
+  }
+
+  String bundleSHA256Path = {};
+  prodigyResolveBundleSHA256Path(bundlePath, bundleSHA256Path);
   String tempBundlePath = {};
   prodigyResolveInstalledBundlePathForRoot(paths.installRootTemp, tempBundlePath);
+  String tempBundleSHA256Path = {};
+  prodigyResolveBundleSHA256Path(tempBundlePath, tempBundleSHA256Path);
 
   String command = {};
   command.assign("set -eu; rm -rf "_ctv);
@@ -981,6 +1035,10 @@ static inline bool prodigyInstallBundleToRoot(const String& bundlePath, const St
   prodigyAppendShellSingleQuoted(command, bundlePath);
   command.append(" "_ctv);
   prodigyAppendShellSingleQuoted(command, tempBundlePath);
+  command.append("; install -m 0644 "_ctv);
+  prodigyAppendShellSingleQuoted(command, bundleSHA256Path);
+  command.append(" "_ctv);
+  prodigyAppendShellSingleQuoted(command, tempBundleSHA256Path);
   command.append("; if [ -e "_ctv);
   prodigyAppendShellSingleQuoted(command, paths.installRoot);
   command.append(" ]; then mv "_ctv);

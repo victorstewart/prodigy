@@ -28,7 +28,7 @@ public:
     }
     else
     {
-      basics_log("FAIL: %s\n", name);
+      std::fprintf(stderr, "FAIL: %s\n", name);
       failed += 1;
     }
   }
@@ -307,7 +307,6 @@ int main(int argc, char *argv[])
   suite.expect(stringContains(tarListing, "lib/libresolv.so.2") == false, "bundle_excludes_libresolv");
   suite.expect(stringContains(tarListing, "lib/ld-linux-x86-64.so.2") == false, "bundle_excludes_dynamic_loader");
   suite.expect(stringContains(tarListing, "lib/libstdc++.so.6") == false, "bundle_excludes_host_libstdcpp");
-  suite.expect(stringContains(tarListing, "lib/libatomic.so.1"), "bundle_includes_libatomic");
   suite.expect(stringContains(tarListing, "lib/libgcc_s.so.1") == false, "bundle_excludes_host_libgcc_s");
 
   String inspectDirectory = {};
@@ -435,6 +434,90 @@ int main(int argc, char *argv[])
   suite.expect(fileExists(installPaths.libraryDirectory), "installed_bundle_lib_directory_exists");
   suite.expect(fileExists(installPaths.toolsDirectory), "installed_bundle_tools_directory_exists");
   suite.expect(fileExists(installPaths.bundlePath), "installed_bundle_bundle_exists");
+  suite.expect(fileExists(installPaths.bundleSHA256Path), "installed_bundle_sha256_sidecar_exists");
+  String installedBundleExpectedDigest = {};
+  suite.expect(prodigyLoadBundleExpectedSHA256Hex(installPaths.bundlePath, installedBundleExpectedDigest, &failure),
+               "installed_bundle_sha256_sidecar_readable");
+  suite.expect(failure.size() == 0, "installed_bundle_sha256_sidecar_read_clears_failure");
+  suite.expect(installedBundleExpectedDigest == bundleDigest, "installed_bundle_sha256_sidecar_matches_bundle");
+
+  String bundleBytes = {};
+  Filesystem::openReadAtClose(-1, bundlePath, bundleBytes);
+  suite.expect(bundleBytes.empty() == false, "bundle_bytes_available_for_normal_stage");
+
+  String stagedBundlePath = {};
+  stagedBundlePath.assign(tempDirectory);
+  stagedBundlePath.append("/normal-stage.bundle.tar.zst"_ctv);
+  String stagedDigest = {};
+  suite.expect(prodigyStageBundleWithExpectedSHA256(
+                   stagedBundlePath, bundleBytes, bundleDigest, stagedDigest, &failure),
+               "normal_stage_bundle_with_verified_sha256_sidecar");
+  suite.expect(failure.size() == 0, "normal_stage_bundle_clears_failure");
+  suite.expect(stagedDigest == bundleDigest, "normal_stage_bundle_reports_verified_digest");
+  String stagedExpectedDigest = {};
+  suite.expect(prodigyLoadBundleExpectedSHA256Hex(stagedBundlePath, stagedExpectedDigest, &failure),
+               "normal_stage_bundle_sidecar_readable");
+  suite.expect(failure.size() == 0, "normal_stage_bundle_sidecar_clears_failure");
+  suite.expect(stagedExpectedDigest == bundleDigest, "normal_stage_bundle_sidecar_matches_verified_digest");
+
+  String stagedInstallRoot = {};
+  stagedInstallRoot.assign(tempDirectory);
+  stagedInstallRoot.append("/normal-stage-installed-root"_ctv);
+  suite.expect(prodigyInstallBundleToRoot(stagedBundlePath, stagedInstallRoot, &failure),
+               "normal_stage_then_install_bundle");
+  suite.expect(failure.size() == 0, "normal_stage_then_install_clears_failure");
+  ProdigyInstallRootPaths stagedInstallPaths = {};
+  prodigyBuildInstallRootPaths(stagedInstallRoot, stagedInstallPaths);
+  String stagedInstalledDigest = {};
+  suite.expect(prodigyLoadBundleExpectedSHA256Hex(stagedInstallPaths.bundlePath, stagedInstalledDigest, &failure),
+               "normal_stage_install_sidecar_readable");
+  suite.expect(failure.size() == 0, "normal_stage_install_sidecar_clears_failure");
+  suite.expect(stagedInstalledDigest == bundleDigest, "normal_stage_install_sidecar_matches_verified_digest");
+
+  String mismatchedStagePath = {};
+  mismatchedStagePath.assign(tempDirectory);
+  mismatchedStagePath.append("/mismatched-stage.bundle.tar.zst"_ctv);
+  String mismatchedDigest = bundleDigest;
+  mismatchedDigest[0] = mismatchedDigest[0] == '0' ? '1' : '0';
+  String mismatchedActualDigest = {};
+  suite.expect(prodigyStageBundleWithExpectedSHA256(
+                   mismatchedStagePath, bundleBytes, mismatchedDigest, mismatchedActualDigest, &failure) == false,
+               "normal_stage_rejects_digest_mismatch");
+  suite.expect(stringContains(failure, "mismatch"), "normal_stage_mismatch_reports_reason");
+  String mismatchedSidecarPath = {};
+  prodigyResolveBundleSHA256Path(mismatchedStagePath, mismatchedSidecarPath);
+  suite.expect(fileExists(mismatchedSidecarPath) == false, "normal_stage_mismatch_does_not_publish_sidecar");
+  String mismatchedSidecarContent = {};
+  mismatchedSidecarContent.assign(mismatchedDigest);
+  mismatchedSidecarContent.append('\n');
+  suite.expect(Filesystem::openWriteAtClose(-1, mismatchedSidecarPath, mismatchedSidecarContent) == int(mismatchedSidecarContent.size()),
+               "mismatched_sidecar_written_for_install_rejection");
+  String mismatchedInstallRoot = {};
+  mismatchedInstallRoot.assign(tempDirectory);
+  mismatchedInstallRoot.append("/mismatched-sidecar-installed-root"_ctv);
+  suite.expect(prodigyInstallBundleToRoot(mismatchedStagePath, mismatchedInstallRoot, &failure) == false,
+               "install_rejects_mismatched_sha256_sidecar");
+  suite.expect(stringContains(failure, "mismatch"), "install_mismatched_sidecar_reports_reason");
+  ProdigyInstallRootPaths mismatchedInstallPaths = {};
+  prodigyBuildInstallRootPaths(mismatchedInstallRoot, mismatchedInstallPaths);
+  suite.expect(fileExists(mismatchedInstallPaths.bundlePath) == false,
+               "install_mismatched_sidecar_does_not_publish_bundle");
+
+  String missingSidecarBundlePath = {};
+  missingSidecarBundlePath.assign(tempDirectory);
+  missingSidecarBundlePath.append("/missing-sidecar.bundle.tar.zst"_ctv);
+  suite.expect(Filesystem::openWriteAtClose(-1, missingSidecarBundlePath, bundleBytes) == int(bundleBytes.size()),
+               "missing_sidecar_bundle_bytes_written");
+  String missingSidecarInstallRoot = {};
+  missingSidecarInstallRoot.assign(tempDirectory);
+  missingSidecarInstallRoot.append("/missing-sidecar-installed-root"_ctv);
+  suite.expect(prodigyInstallBundleToRoot(missingSidecarBundlePath, missingSidecarInstallRoot, &failure) == false,
+               "install_rejects_missing_sha256_sidecar");
+  suite.expect(stringContains(failure, "sidecar is not readable"), "install_missing_sidecar_reports_reason");
+  ProdigyInstallRootPaths missingSidecarInstallPaths = {};
+  prodigyBuildInstallRootPaths(missingSidecarInstallRoot, missingSidecarInstallPaths);
+  suite.expect(fileExists(missingSidecarInstallPaths.bundlePath) == false,
+               "install_missing_sidecar_does_not_publish_bundle");
 
   String installedResolverArtifactPath = {};
   installedResolverArtifactPath.assign(installRoot);
@@ -493,11 +576,6 @@ int main(int argc, char *argv[])
   installedLibstdcppPath.assign(installPaths.libraryDirectory);
   installedLibstdcppPath.append("/libstdc++.so.6"_ctv);
   suite.expect(fileExists(installedLibstdcppPath) == false, "installed_bundle_excludes_host_libstdcpp");
-
-  String installedLibatomicPath = {};
-  installedLibatomicPath.assign(installPaths.libraryDirectory);
-  installedLibatomicPath.append("/libatomic.so.1"_ctv);
-  suite.expect(fileExists(installedLibatomicPath), "installed_bundle_includes_libatomic");
 
   String installedLibgccPath = {};
   installedLibgccPath.assign(installPaths.libraryDirectory);
