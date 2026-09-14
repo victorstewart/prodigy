@@ -5062,8 +5062,43 @@ public:
     return nullptr;
   }
 
-  uint64_t journalAddMachinesOperation(const AddMachines& request, const ClusterTopology& plannedTopology, const Vector<ClusterMachine>& machinesToBootstrap)
+  void assignAdoptedBootstrapMachineUUIDs(ClusterTopology& plannedTopology, Vector<ClusterMachine>& machinesToBootstrap) const
   {
+    for (ClusterMachine& machine : machinesToBootstrap)
+    {
+      if (machine.source != ClusterMachineSource::adopted)
+      {
+        continue;
+      }
+
+      for (ClusterMachine& plannedMachine : plannedTopology.machines)
+      {
+        if (plannedMachine.sameIdentityAs(machine) == false)
+        {
+          continue;
+        }
+
+        if (plannedMachine.uuid == 0)
+        {
+          uint128_t candidate = 0;
+          do
+          {
+            candidate = Random::generateNumberWithNBits<128, uint128_t>();
+          } while (candidate == 0 || std::any_of(plannedTopology.machines.begin(), plannedTopology.machines.end(), [&](const ClusterMachine& existing) {
+            return existing.uuid == candidate;
+          }));
+          plannedMachine.uuid = candidate;
+        }
+
+        machine.uuid = plannedMachine.uuid;
+        break;
+      }
+    }
+  }
+
+  uint64_t journalAddMachinesOperation(const AddMachines& request, ClusterTopology& plannedTopology, Vector<ClusterMachine>& machinesToBootstrap)
+  {
+    assignAdoptedBootstrapMachineUUIDs(plannedTopology, machinesToBootstrap);
     refreshMasterAuthorityRuntimeStateFromLiveFields();
 
     uint64_t operationID = masterAuthorityRuntimeState.nextPendingAddMachinesOperationID++;
