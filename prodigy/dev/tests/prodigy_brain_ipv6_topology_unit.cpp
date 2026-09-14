@@ -291,6 +291,11 @@ public:
     queueLocalPeerAddressCandidates(brain);
   }
 
+  void testSynchronizeBrainUUIDToMachine(BrainView *brain)
+  {
+    synchronizeBrainUUIDToMachine(brain);
+  }
+
   void testBrainHandler(BrainView *brain, Message *message)
   {
     brainHandler(brain, message);
@@ -885,6 +890,70 @@ int main(void)
   }
 
   {
+    const uint32_t sharedSlirpPrivate4 = IPAddress("10.0.2.15", false).v4;
+    constexpr uint128_t brain2UUID = 0x702;
+    constexpr uint128_t brain3UUID = 0x703;
+
+    Machine brain2Machine = {};
+    brain2Machine.isBrain = true;
+    brain2Machine.uuid = brain2UUID;
+    brain2Machine.private4 = sharedSlirpPrivate4;
+    brain2Machine.peerAddresses.push_back(ClusterMachinePeerAddress {"2001:db8:702::10"_ctv, 64});
+
+    Machine brain3Machine = {};
+    brain3Machine.isBrain = true;
+    brain3Machine.uuid = brain3UUID;
+    brain3Machine.private4 = sharedSlirpPrivate4;
+    brain3Machine.peerAddresses.push_back(ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24});
+    brain3Machine.peerAddresses.push_back(ClusterMachinePeerAddress {"2001:db8:702::11"_ctv, 64});
+
+    // Both views begin with valid topology data. The first Brain2 candidate is
+    // shared SLIRP IPv4, which belongs only to Brain3's explicit peer set.
+    BrainView brain2View = {};
+    brain2View.uuid = brain2UUID;
+    brain2View.private4 = sharedSlirpPrivate4;
+    brain2View.peerAddresses.push_back(ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24});
+    brain2View.peerAddresses.push_back(ClusterMachinePeerAddress {"2001:db8:702::10"_ctv, 64});
+
+    BrainView brain3View = {};
+    brain3View.uuid = brain3UUID;
+    brain3View.private4 = sharedSlirpPrivate4;
+    brain3View.peerAddresses = brain3Machine.peerAddresses;
+    brain3View.machine = &brain3Machine;
+    brain3Machine.brain = &brain3View;
+
+    TestBrain brain = {};
+    brain.machines.insert(&brain2Machine);
+    brain.machines.insert(&brain3Machine);
+    brain.machinesByUUID.insert_or_assign(brain2UUID, &brain2Machine);
+    brain.machinesByUUID.insert_or_assign(brain3UUID, &brain3Machine);
+    brain.brains.insert(&brain2View);
+    brain.brains.insert(&brain3View);
+    brain.testSynchronizeBrainUUIDToMachine(&brain2View);
+
+    suite.expect(brain2View.machine == &brain2Machine && brain2Machine.brain == &brain2View &&
+                     brain2Machine.peerAddresses[0].address == "2001:db8:702::10"_ctv,
+                 "known_brain_uuid_synchronizes_to_own_ipv6_machine_before_shared_peer_fallback");
+    suite.expect(brain3View.machine == &brain3Machine && brain3Machine.brain == &brain3View &&
+                     brain3Machine.peerAddresses[1].address == "2001:db8:702::11"_ctv,
+                 "known_brain_uuid_sync_preserves_other_shared_slirp_machine_association");
+    suite.expect(brain.machinesByUUID.find(brain2UUID) != brain.machinesByUUID.end() &&
+                     brain.machinesByUUID.find(brain2UUID)->second == &brain2Machine &&
+                     brain.machinesByUUID.find(brain3UUID) != brain.machinesByUUID.end() &&
+                     brain.machinesByUUID.find(brain3UUID)->second == &brain3Machine,
+                 "known_brain_uuid_sync_preserves_both_identity_indexes");
+
+    // A stale pre-existing view link must also resolve through the known UUID,
+    // rather than reassigning the currently bound Brain3 Machine.
+    brain2View.machine = &brain3Machine;
+    brain3Machine.brain = &brain2View;
+    brain.testSynchronizeBrainUUIDToMachine(&brain2View);
+    suite.expect(brain2View.machine == &brain2Machine && brain2Machine.brain == &brain2View &&
+                     brain3View.machine == &brain3Machine && brain3Machine.brain == &brain3View,
+                 "known_brain_uuid_sync_replaces_stale_bound_other_machine");
+  }
+
+  {
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
 
@@ -1004,6 +1073,56 @@ int main(void)
       close(peer.fd);
       peer.fd = -1;
     }
+
+    Vector<ClusterMachinePeerAddress> neuronLocalCandidates = {};
+    neuronLocalCandidates.push_back(ClusterMachinePeerAddress {"2001:db8:703::10"_ctv, 64});
+
+    Machine remoteMachine = {};
+    remoteMachine.uuid = 0x702;
+    remoteMachine.peerAddresses.push_back(ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24});
+    remoteMachine.peerAddresses.push_back(ClusterMachinePeerAddress {"2001:db8:704::10"_ctv, 64});
+    prodigyConfigureMachineNeuronEndpoint(remoteMachine, &neuron, &neuronLocalCandidates);
+
+    IPAddress remoteNeuronDestination = {};
+    String remoteNeuronDestinationText = {};
+    suite.expect(
+        prodigySockaddrToIPAddress(remoteMachine.neuron.daddr<struct sockaddr>(), remoteNeuronDestination, &remoteNeuronDestinationText),
+        "machine_neuron_endpoint_shared_slirp_reads_remote_destination");
+    suite.expect(
+        remoteNeuronDestination.is6 && remoteNeuronDestinationText == "2001:db8:704::10"_ctv,
+        "machine_neuron_endpoint_shared_slirp_skips_local_private4_for_known_remote");
+    IPAddress remoteNeuronSource = {};
+    String remoteNeuronSourceText = {};
+    suite.expect(
+        prodigySockaddrToIPAddress(remoteMachine.neuron.saddr<struct sockaddr>(), remoteNeuronSource, &remoteNeuronSourceText) &&
+            remoteNeuronSource.is6 && remoteNeuronSourceText == "2001:db8:703::10"_ctv,
+        "machine_neuron_endpoint_shared_slirp_selects_ipv6_source");
+    remoteMachine.neuron.close();
+
+    Machine unavailableRemote = {};
+    unavailableRemote.uuid = 0x703;
+    unavailableRemote.peerAddresses.push_back(ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24});
+    unavailableRemote.neuron.setDaddr(neuron.private4, uint16_t(ReservedPorts::neuron));
+    prodigyConfigureMachineNeuronEndpoint(unavailableRemote, &neuron, &neuronLocalCandidates);
+    suite.expect(unavailableRemote.neuron.daddrLen == 0,
+                 "machine_neuron_endpoint_shared_slirp_rejects_local_only_candidates");
+    unavailableRemote.neuron.close();
+
+    Machine selfMachine = {};
+    selfMachine.uuid = neuron.uuid;
+    selfMachine.peerAddresses.push_back(ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24});
+    selfMachine.peerAddresses.push_back(ClusterMachinePeerAddress {"2001:db8:703::10"_ctv, 64});
+    prodigyConfigureMachineNeuronEndpoint(selfMachine, &neuron, &neuronLocalCandidates);
+
+    IPAddress selfNeuronDestination = {};
+    String selfNeuronDestinationText = {};
+    suite.expect(
+        prodigySockaddrToIPAddress(selfMachine.neuron.daddr<struct sockaddr>(), selfNeuronDestination, &selfNeuronDestinationText),
+        "machine_neuron_endpoint_shared_slirp_reads_self_destination");
+    suite.expect(
+        selfNeuronDestination.is6 == false && selfNeuronDestinationText == "10.0.2.15"_ctv,
+        "machine_neuron_endpoint_shared_slirp_preserves_local_self_control");
+    selfMachine.neuron.close();
 
     BrainView fallback = {};
     fallback.peerAddresses.push_back(ClusterMachinePeerAddress {"2001:db8:701::20"_ctv, 64});
