@@ -11522,7 +11522,7 @@ public:
            brain->reconnectAfterClose;
   }
 
-  void attemptBrainPeerReconnectNow(BrainView *brain, bool persistentReconnect, const char *reason)
+  void attemptBrainPeerReconnectNow(BrainView *brain, bool persistentReconnect, const char *reason, bool advanceCandidate = false)
   {
     if (brain == nullptr || brains.contains(brain) == false)
     {
@@ -11553,7 +11553,7 @@ public:
     }
 
     brain->reset();
-    configureBrainPeerConnectAddress(brain);
+    configureBrainPeerConnectAddress(brain, advanceCandidate);
 
     if (persistentReconnect)
     {
@@ -13699,26 +13699,60 @@ public:
     Vector<ClusterMachinePeerAddress> localCandidates = {};
     collectLocalBrainPeerSourceCandidates(localCandidates);
 
+    auto isLocalCandidate = [&](const IPAddress& candidateAddress) -> bool {
+      for (const ClusterMachinePeerAddress& localCandidate : localCandidates)
+      {
+        IPAddress localAddress = {};
+        if (ClusterMachine::parseIPAddressLiteral(localCandidate.address, localAddress) && localAddress.equals(candidateAddress))
+        {
+          return true;
+        }
+      }
+
+      return thisNeuron != nullptr && thisNeuron->private4.isNull() == false && thisNeuron->private4.equals(candidateAddress);
+    };
+
     IPAddress peerAddress = {};
     String peerAddressText = {};
     ClusterMachinePeerAddress selectedPeerCandidate = {};
     if (brain->peerAddresses.empty() == false)
     {
+      uint32_t candidateIndex = brain->peerAddressIndex;
+      if (candidateIndex >= brain->peerAddresses.size())
+      {
+        candidateIndex = 0;
+      }
       if (advanceCandidate && brain->peerAddresses.size() > 1)
       {
-        brain->peerAddressIndex = (brain->peerAddressIndex + 1) % uint32_t(brain->peerAddresses.size());
-      }
-      else if (brain->peerAddressIndex >= brain->peerAddresses.size())
-      {
-        brain->peerAddressIndex = 0;
+        candidateIndex = (candidateIndex + 1) % uint32_t(brain->peerAddresses.size());
       }
 
-      if (ClusterMachine::parseIPAddressLiteral(brain->peerAddresses[brain->peerAddressIndex].address, peerAddress))
+      for (uint32_t offset = 0; offset < brain->peerAddresses.size(); ++offset)
       {
-        peerAddressText.assign(brain->peerAddresses[brain->peerAddressIndex].address);
-        selectedPeerCandidate = brain->peerAddresses[brain->peerAddressIndex];
+        uint32_t index = (candidateIndex + offset) % uint32_t(brain->peerAddresses.size());
+        IPAddress candidateAddress = {};
+        if (ClusterMachine::parseIPAddressLiteral(brain->peerAddresses[index].address, candidateAddress) == false || isLocalCandidate(candidateAddress))
+        {
+          continue;
+        }
+
+        brain->peerAddressIndex = index;
+        peerAddress = candidateAddress;
+        peerAddressText.assign(brain->peerAddresses[index].address);
+        selectedPeerCandidate = brain->peerAddresses[index];
         brain->peerAddress = peerAddress;
         brain->peerAddressText = peerAddressText;
+        break;
+      }
+
+      // A shared management/NAT address may appear in a peer's advertised
+      // candidates. It cannot identify a remote Brain when it is also local.
+      if (peerAddress.isNull())
+      {
+        brain->peerAddress = {};
+        brain->peerAddressText.clear();
+        brain->daddrLen = 0;
+        return;
       }
     }
 
@@ -15242,8 +15276,8 @@ public:
         continue;
       }
 
-      BrainView *brain = nullptr;
-      if (peerAddresses.empty() == false)
+      BrainView *brain = clusterMachine.uuid == 0 ? nullptr : findBrainViewByUUID(clusterMachine.uuid);
+      if (brain == nullptr && peerAddresses.empty() == false)
       {
         brain = findBrainViewByPeerAddresses(peerAddresses);
       }
@@ -15251,13 +15285,18 @@ public:
       {
         brain = findBrainViewByPeerAddress(peerAddress);
       }
-      if (brain == nullptr && clusterMachine.uuid != 0)
-      {
-        brain = findBrainViewByUUID(clusterMachine.uuid);
-      }
       if (brain == nullptr && resolvedPrivate4 != 0)
       {
         brain = findBrainViewByPrivate4(resolvedPrivate4);
+      }
+      if (brain != nullptr && brain->uuid != 0 && brain->uuid != clusterMachine.uuid &&
+          std::any_of(topology.machines.begin(), topology.machines.end(), [&](const ClusterMachine& member) {
+            return member.isBrain && member.uuid == brain->uuid;
+          }))
+      {
+        // A shared transport address cannot replace another current member's
+        // identity. Address reuse is still valid for a removed/replaced member.
+        brain = nullptr;
       }
       if (brain == nullptr)
       {
@@ -15715,9 +15754,9 @@ public:
       return false;
     }
 
-    if (machine.uuid != 0 && machine.uuid == thisNeuron->uuid)
+    if (machine.uuid != 0 && thisNeuron->uuid != 0)
     {
-      return true;
+      return machine.uuid == thisNeuron->uuid;
     }
 
     if (machine.peerAddresses.empty() == false)
@@ -20398,7 +20437,7 @@ public:
           }
 
           delete packet;
-          attemptBrainPeerReconnectNow(brain, persistentReconnect, "reconnect-timeout");
+          attemptBrainPeerReconnectNow(brain, persistentReconnect, "reconnect-timeout", true);
           break;
         }
       case BrainTimeoutFlags::brainPeerHandshake:
