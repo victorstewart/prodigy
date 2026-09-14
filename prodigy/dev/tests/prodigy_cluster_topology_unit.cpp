@@ -8,6 +8,7 @@
 #include <prodigy/types.h>
 #include <prodigy/dev/tests/prodigy_test_ssh_keys.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -703,6 +704,39 @@ int main(void)
       "peer_source_selection_public6_resolves");
   suite.expect(resolvedSourceAddress.is6, "peer_source_selection_public6_family");
   suite.expect(resolvedSourceText == "2602:fac0:0:12ab:34cd::31"_ctv, "peer_source_selection_public6_prefers_matching_public_subnet");
+
+  Vector<ClusterMachinePeerAddress> ambiguousUlaCandidates = {};
+  ambiguousUlaCandidates.push_back(ClusterMachinePeerAddress {"fdf8:1111:2222:3333::10"_ctv, 120});
+  ambiguousUlaCandidates.push_back(ClusterMachinePeerAddress {"fd72:6e61:6d65:1::10"_ctv, 64});
+  const ClusterMachinePeerAddress routedUlaRemote {"fd72:6e61:6d65:2::10"_ctv, 64};
+  suite.expect(
+      prodigyResolvePreferredLocalSourceAddress(
+          ambiguousUlaCandidates, routedUlaRemote, resolvedSourceAddress, &resolvedSourceText),
+      "peer_source_selection_ambiguous_ula_resolves");
+  suite.expect(
+      resolvedSourceText == "fd72:6e61:6d65:1::10"_ctv,
+      "peer_source_selection_ambiguous_ula_prefers_longest_common_prefix");
+
+  std::reverse(ambiguousUlaCandidates.begin(), ambiguousUlaCandidates.end());
+  suite.expect(
+      prodigyResolvePreferredLocalSourceAddress(
+          ambiguousUlaCandidates, routedUlaRemote, resolvedSourceAddress, &resolvedSourceText),
+      "peer_source_selection_reversed_ambiguous_ula_resolves");
+  suite.expect(
+      resolvedSourceText == "fd72:6e61:6d65:1::10"_ctv,
+      "peer_source_selection_ambiguous_ula_is_not_candidate_order_dependent");
+
+  Vector<ClusterMachinePeerAddress> ambiguousPrivate4Candidates = {};
+  ambiguousPrivate4Candidates.push_back(ClusterMachinePeerAddress {"192.168.200.10"_ctv, 24});
+  ambiguousPrivate4Candidates.push_back(ClusterMachinePeerAddress {"192.168.1.10"_ctv, 24});
+  suite.expect(
+      prodigyResolvePreferredLocalSourceAddress(
+          ambiguousPrivate4Candidates, ClusterMachinePeerAddress {"192.168.2.10"_ctv, 24},
+          resolvedSourceAddress, &resolvedSourceText),
+      "peer_source_selection_ambiguous_private4_resolves");
+  suite.expect(
+      resolvedSourceText == "192.168.1.10"_ctv,
+      "peer_source_selection_private4_compares_network_order_prefix");
 
   MachineConfig adoptedConfig = {};
   adoptedConfig.slug = "vm-brain"_ctv;

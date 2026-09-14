@@ -186,6 +186,35 @@ static inline void prodigyCollectLocalPeerAddressCandidates(const String& prefer
   }
 }
 
+static inline uint16_t prodigyCommonAddressPrefixLength(const IPAddress& lhs, const IPAddress& rhs)
+{
+  if (lhs.is6 != rhs.is6)
+  {
+    return 0;
+  }
+
+  // Both address families are stored in network byte order by IPAddress.
+  uint16_t prefixLength = 0;
+  const uint32_t addressBytes = lhs.is6 ? 16 : 4;
+  for (uint32_t index = 0; index < addressBytes; ++index)
+  {
+    uint8_t differingBits = lhs.v6[index] ^ rhs.v6[index];
+    if (differingBits == 0)
+    {
+      prefixLength += 8;
+      continue;
+    }
+
+    while ((differingBits & 0x80u) == 0)
+    {
+      prefixLength += 1;
+      differingBits <<= 1;
+    }
+    break;
+  }
+  return prefixLength;
+}
+
 static inline bool prodigyResolvePreferredLocalSourceAddress(
     const Vector<ClusterMachinePeerAddress>& localCandidates,
     const ClusterMachinePeerAddress& remoteCandidate,
@@ -211,6 +240,7 @@ static inline bool prodigyResolvePreferredLocalSourceAddress(
   bool haveRemoteSubnet = prodigyClusterMachinePeerAddressSubnetKey(remoteCandidate, remoteSubnet, false);
 
   int bestScore = -1;
+  uint16_t bestCommonPrefixLength = 0;
   for (const ClusterMachinePeerAddress& localCandidate : localCandidates)
   {
     IPAddress localAddress = {};
@@ -243,9 +273,11 @@ static inline bool prodigyResolvePreferredLocalSourceAddress(
       score += 40;
     }
 
-    if (score > bestScore)
+    uint16_t commonPrefixLength = prodigyCommonAddressPrefixLength(localAddress, remoteAddress);
+    if (score > bestScore || (score == bestScore && commonPrefixLength > bestCommonPrefixLength))
     {
       bestScore = score;
+      bestCommonPrefixLength = commonPrefixLength;
       sourceAddress = localAddress;
       if (sourceAddressText)
       {
