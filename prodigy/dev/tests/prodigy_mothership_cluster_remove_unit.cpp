@@ -3,6 +3,10 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <string>
+#include <sys/stat.h>
+#include <unistd.h>
 
 class TestSuite {
 public:
@@ -200,6 +204,91 @@ static bool stringContains(const String& haystack, const char *needle)
   return std::strstr(haystackText.c_str(), needle) != nullptr;
 }
 
+static std::string shellQuote(const std::string& value)
+{
+  std::string quoted = "'";
+  for (char c : value)
+  {
+    if (c == '\'') quoted += "'\\''";
+    else quoted += c;
+  }
+  return quoted + "'";
+}
+
+static void replaceAll(std::string& value, const std::string& from, const std::string& to)
+{
+  size_t offset = 0;
+  while ((offset = value.find(from, offset)) != std::string::npos)
+  {
+    value.replace(offset, from.size(), to);
+    offset += to.size();
+  }
+}
+
+static bool runStorageCleanupScript(const String& rendered, const char *scenario, bool expectSuccess, bool expectUnmount, bool expectWipe)
+{
+  char templatePath[] = "/tmp/prodigy-remove-unit-XXXXXX";
+  char *rootPath = ::mkdtemp(templatePath);
+  if (rootPath == nullptr) return false;
+  std::string root(rootPath);
+  std::string fake = root + "/fake";
+  std::string state = root + "/state";
+  std::string containers = root + "/containers";
+  std::string run = root + "/run";
+  ::mkdir(fake.c_str(), 0700); ::mkdir(state.c_str(), 0700); ::mkdir(containers.c_str(), 0700); ::mkdir(run.c_str(), 0700);
+  if (std::string(scenario) != "external") std::ofstream(state + "/containers.btrfs.loop").put('x');
+  auto write = [&](const char *name, const char *body) { std::ofstream file(fake + "/" + name); file << "#!/bin/sh\n" << body; file.close(); ::chmod((fake + "/" + name).c_str(), 0700); };
+  write("systemctl", R"SH(case "$*" in
+  *LoadState*) echo loaded;;
+  *ActiveState*) { [ "$MOCK_SCENARIO" = stoppedfailed ] || [ "$MOCK_SCENARIO" = failedrunning ]; } && echo failed || echo inactive;;
+  *MainPID*) [ "$MOCK_SCENARIO" = failedrunning ] && echo 935 || echo 0;;
+  *stop*) [ "$MOCK_SCENARIO" = stopfail ] && exit 1;;
+esac
+exit 0
+)SH");
+  write("mountpoint", "[ \"$2\" = \"$MOCK_CONTAINERS\" ] && [ -f \"$MOCK_ROOT/mounted\" ]\n");
+  write("findmnt", R"SH(case "$*" in
+  *FSTYPE*) echo btrfs;;
+  *--target*) [ "$MOCK_SCENARIO" = external ] && echo /dev/sda || echo /dev/loop7;;
+  *) echo /dev/sda; [ "$MOCK_SCENARIO" = elsewhere ] && echo /dev/loop7;;
+esac
+exit 0
+)SH");
+  write("losetup", R"SH(if [ "$1" = -j ]; then
+  [ "$MOCK_SCENARIO" = lookupfail ] && exit 1;
+  [ "$MOCK_SCENARIO" = ambiguous ] && exit 0;
+  [ -f "$MOCK_ROOT/associated" ] && echo /dev/loop7;
+else
+  echo detach >>"$MOCK_ROOT/log";
+  /bin/rm -f "$MOCK_ROOT/associated";
+fi
+exit 0
+)SH");
+  write("umount", R"SH(echo umount >>"$MOCK_ROOT/log";
+[ "$MOCK_SCENARIO" = umountfail ] && exit 1;
+/bin/rm -f "$MOCK_ROOT/mounted";
+[ "$MOCK_SCENARIO" = autoclear ] && /bin/rm -f "$MOCK_ROOT/associated";
+exit 0
+)SH");
+  write("rm", "echo rm >>\"$MOCK_ROOT/log\"\n");
+  std::ofstream(root + "/mounted").put('x');
+  if (std::string(scenario) != "external") std::ofstream(root + "/associated").put('x');
+  String renderedCopy = rendered;
+  std::string command(renderedCopy.c_str());
+  replaceAll(command, "/var/lib/prodigy/containers.btrfs.loop", "@OWNED_LOOP_IMAGE@");
+  replaceAll(command, "/var/lib/prodigy", state);
+  replaceAll(command, "/containers", containers);
+  replaceAll(command, "/run/prodigy", run);
+  replaceAll(command, "@OWNED_LOOP_IMAGE@", state + "/containers.btrfs.loop");
+  // A missing mock must fail closed rather than invoke a real host command.
+  std::string invoke = "PATH=" + shellQuote(fake) + " MOCK_ROOT=" + shellQuote(root) + " MOCK_CONTAINERS=" + shellQuote(containers) + " MOCK_SCENARIO=" + shellQuote(scenario) + " /bin/sh -c " + shellQuote(command);
+  bool success = ::system(invoke.c_str()) == 0;
+  std::ifstream log(root + "/log"); std::string lines((std::istreambuf_iterator<char>(log)), {});
+  bool okay = success == expectSuccess && (lines.find("umount") != std::string::npos) == expectUnmount && (lines.find("rm") != std::string::npos) == expectWipe;
+  (void)::system(("/bin/rm -rf " + shellQuote(root)).c_str());
+  return okay;
+}
+
 int main(void)
 {
   TestSuite suite;
@@ -207,7 +296,16 @@ int main(void)
   {
     String command = {};
     mothershipBuildProdigyStateWipeCommand("/var/lib/prodigy/state"_ctv, command);
-    suite.expect(command == "systemctl stop prodigy || true; systemctl disable prodigy || true; rm -rf /run/prodigy /var/lib/prodigy"_ctv, "remove_local_wipe_command_default_paths");
+    suite.expect(runStorageCleanupScript(command, "autoclear", true, true, true), "remove_owned_loop_autoclear_before_wipe");
+    suite.expect(runStorageCleanupScript(command, "detach", true, true, true), "remove_owned_loop_explicit_detach_before_wipe");
+    suite.expect(runStorageCleanupScript(command, "external", true, false, true), "remove_external_containers_preserved");
+    suite.expect(runStorageCleanupScript(command, "ambiguous", false, false, false), "remove_ambiguous_loop_refuses_wipe");
+    suite.expect(runStorageCleanupScript(command, "umountfail", false, true, false), "remove_failed_unmount_refuses_wipe");
+    suite.expect(runStorageCleanupScript(command, "stopfail", false, false, false), "remove_failed_stop_refuses_wipe");
+    suite.expect(runStorageCleanupScript(command, "stoppedfailed", true, true, true), "remove_stopped_failed_unit_allows_owned_cleanup");
+    suite.expect(runStorageCleanupScript(command, "failedrunning", false, false, false), "remove_failed_unit_with_live_pid_refuses_cleanup");
+    suite.expect(runStorageCleanupScript(command, "lookupfail", false, false, false), "remove_failed_loop_lookup_refuses_wipe");
+    suite.expect(runStorageCleanupScript(command, "elsewhere", false, true, false), "remove_loop_mounted_elsewhere_refuses_wipe");
   }
 
   {
@@ -220,7 +318,7 @@ int main(void)
 
     String command = {};
     mothershipBuildRemoteProdigyUninstallCommand(cluster, command);
-    suite.expect(stringContains(command, "systemctl stop prodigy || true; systemctl disable prodigy || true"), "remove_remote_uninstall_stops_and_disables");
+    suite.expect(stringContains(command, "systemctl show --property=LoadState --value prodigy") && stringContains(command, "failed to stop prodigy"), "remove_remote_uninstall_stops_and_verifies");
     suite.expect(stringContains(command, "/etc/systemd/system/prodigy.service"), "remove_remote_uninstall_removes_unit");
     suite.expect(stringContains(command, "/srv/prodigy/current"), "remove_remote_uninstall_removes_install_root");
     suite.expect(stringContains(command, "/srv/prodigy/current.new"), "remove_remote_uninstall_removes_install_root_temp");
