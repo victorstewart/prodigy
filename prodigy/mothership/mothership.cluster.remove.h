@@ -33,7 +33,8 @@ if [ "$load" != not-found ]; then
   systemctl stop prodigy || { echo 'failed to stop prodigy' >&2; exit 1; };
   active=$(systemctl show --property=ActiveState --value prodigy) || exit 1;
   pid=$(systemctl show --property=MainPID --value prodigy) || exit 1;
-  [ "$active" = inactive ] && [ "$pid" = 0 ] || { echo 'prodigy remained active' >&2; exit 1; };
+  [ "$pid" = 0 ] || { echo 'prodigy remained active' >&2; exit 1; };
+  case "$active" in inactive|failed) ;; *) echo 'prodigy service is still transitioning' >&2; exit 1;; esac;
   systemctl disable prodigy || true;
 fi;
 img=/var/lib/prodigy/containers.btrfs.loop;

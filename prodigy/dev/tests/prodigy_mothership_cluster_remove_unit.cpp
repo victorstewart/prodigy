@@ -240,8 +240,8 @@ static bool runStorageCleanupScript(const String& rendered, const char *scenario
   auto write = [&](const char *name, const char *body) { std::ofstream file(fake + "/" + name); file << "#!/bin/sh\n" << body; file.close(); ::chmod((fake + "/" + name).c_str(), 0700); };
   write("systemctl", R"SH(case "$*" in
   *LoadState*) echo loaded;;
-  *ActiveState*) echo inactive;;
-  *MainPID*) echo 0;;
+  *ActiveState*) { [ "$MOCK_SCENARIO" = stoppedfailed ] || [ "$MOCK_SCENARIO" = failedrunning ]; } && echo failed || echo inactive;;
+  *MainPID*) [ "$MOCK_SCENARIO" = failedrunning ] && echo 935 || echo 0;;
   *stop*) [ "$MOCK_SCENARIO" = stopfail ] && exit 1;;
 esac
 exit 0
@@ -302,6 +302,8 @@ int main(void)
     suite.expect(runStorageCleanupScript(command, "ambiguous", false, false, false), "remove_ambiguous_loop_refuses_wipe");
     suite.expect(runStorageCleanupScript(command, "umountfail", false, true, false), "remove_failed_unmount_refuses_wipe");
     suite.expect(runStorageCleanupScript(command, "stopfail", false, false, false), "remove_failed_stop_refuses_wipe");
+    suite.expect(runStorageCleanupScript(command, "stoppedfailed", true, true, true), "remove_stopped_failed_unit_allows_owned_cleanup");
+    suite.expect(runStorageCleanupScript(command, "failedrunning", false, false, false), "remove_failed_unit_with_live_pid_refuses_cleanup");
     suite.expect(runStorageCleanupScript(command, "lookupfail", false, false, false), "remove_failed_loop_lookup_refuses_wipe");
     suite.expect(runStorageCleanupScript(command, "elsewhere", false, true, false), "remove_loop_mounted_elsewhere_refuses_wipe");
   }
