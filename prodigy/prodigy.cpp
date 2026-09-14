@@ -1433,6 +1433,8 @@ int main(int argc, char *argv[])
     return EXIT_FAILURE;
   }
 
+  Prodigy<ProdigyNeuron, ProdigyBrain, ProdigyHostControlNetwork>::prepareManagedSignalMask();
+
   if (loadProdigyStartupState(bootJSON, failure) == false)
   {
     std::fprintf(stderr, "failed to load prodigy startup state: %s\n", failure.c_str());
