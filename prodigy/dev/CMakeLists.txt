@@ -1983,6 +1983,12 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       NAME prodigy_brain_ipv6_topology_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_brain_ipv6_topology_unit
    )
+   add_test(
+      NAME prodigy_addmachines_bootstrap_completion_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=addmachines-bootstrap-completion
+              $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
+   )
+   set_tests_properties(prodigy_addmachines_bootstrap_completion_unit PROPERTIES TIMEOUT 30)
 
    add_test(
       NAME prodigy_remote_bootstrap_unit

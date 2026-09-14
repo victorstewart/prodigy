@@ -62,11 +62,14 @@ private:
   }
 #endif
 
+  constexpr static int managedSignals[] = {SIGINT, SIGUSR1, SIGTERM};
+
   void beforeRing(void)
   {
-    Ring::signals[0] = SIGINT;
-    Ring::signals[1] = SIGUSR1;
-    Ring::signals[2] = SIGTERM;
+    for (uint32_t index = 0; index < sizeof(managedSignals) / sizeof(managedSignals[0]); ++index)
+    {
+      Ring::signals[index] = managedSignals[index];
+    }
   }
 
   void afterRing(void)
@@ -170,6 +173,17 @@ private:
   }
 
 public:
+
+  static void prepareManagedSignalMask(void)
+  {
+    sigset_t signalSet = {};
+    sigemptyset(&signalSet);
+    for (int signal : managedSignals)
+    {
+      sigaddset(&signalSet, signal);
+    }
+    Ring::blockSignalSet(signalSet);
+  }
 
   void prepare(int argc, char *argv[])
   {

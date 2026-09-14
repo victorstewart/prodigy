@@ -15685,6 +15685,20 @@ public:
       return true;
     }
 
+    if (machine.peerAddresses.empty() == false)
+    {
+      for (const ClusterMachinePeerAddress& candidate : machine.peerAddresses)
+      {
+        IPAddress peerAddress = {};
+        if (ClusterMachine::parseIPAddressLiteral(candidate.address, peerAddress) && localBrainAddressMatches(peerAddress))
+        {
+          return true;
+        }
+      }
+
+      return false;
+    }
+
     bool hadExplicitPeerAddress = false;
     auto explicitAddressMatches = [&](const String& addressText) -> bool {
       if (addressText.size() == 0)
@@ -27018,14 +27032,11 @@ public:
             }
           }
 
-          if (bootstrapCoordinator.pendingTasks > 0 || bootstrapCoordinator.openSockets > 0)
+          while (bootstrapCoordinator.pendingTasks > 0 || bootstrapCoordinator.openSockets > 0)
           {
-            uint32_t suspendIndex = bootstrapCoordinator.nextSuspendIndex();
-            bootstrapCoordinator.awaitCompletion();
-            if (suspendIndex < bootstrapCoordinator.nextSuspendIndex())
-            {
-              co_await bootstrapCoordinator.suspendAtIndex(suspendIndex);
-            }
+            // The coordinator wakes one continuation per completion. Wait here
+            // directly so its final socket close resumes this operation too.
+            co_await bootstrapCoordinator.suspend();
           }
 
           Vector<ClusterMachine> bootstrappedMachines = {};
