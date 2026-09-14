@@ -260,9 +260,54 @@ static inline void prodigyConfigureMachineNeuronEndpoint(
     const NeuronBase *localNeuron,
     const Vector<ClusterMachinePeerAddress> *localCandidatesOverride)
 {
-  IPAddress peerAddress = {};
-  if (prodigyResolveMachinePeerAddress(machine, peerAddress) == false)
+  const Vector<ClusterMachinePeerAddress> *localCandidates = localCandidatesOverride;
+  Vector<ClusterMachinePeerAddress> discoveredLocalCandidates = {};
+  if (localCandidates == nullptr && localNeuron != nullptr)
   {
+    String preferredInterface = {};
+    preferredInterface.assign(localNeuron->eth.name);
+    prodigyCollectLocalPeerAddressCandidates(preferredInterface, localNeuron->private4, discoveredLocalCandidates);
+    localCandidates = &discoveredLocalCandidates;
+  }
+
+  auto candidateIsLocal = [&](const IPAddress& candidateAddress) -> bool {
+    if (localCandidates != nullptr)
+    {
+      for (const ClusterMachinePeerAddress& localCandidate : *localCandidates)
+      {
+        IPAddress localAddress = {};
+        if (ClusterMachine::parseIPAddressLiteral(localCandidate.address, localAddress) && localAddress.equals(candidateAddress))
+        {
+          return true;
+        }
+      }
+    }
+
+    return localNeuron != nullptr && localNeuron->private4.isNull() == false && localNeuron->private4.equals(candidateAddress);
+  };
+
+  IPAddress peerAddress = {};
+  ClusterMachinePeerAddress remoteCandidate = {};
+  Vector<ClusterMachinePeerAddress> remoteCandidates = {};
+  prodigyCollectMachinePeerAddresses(machine, remoteCandidates);
+  bool knownRemoteMachine = localNeuron != nullptr && machine.uuid != 0 && localNeuron->uuid != 0 && machine.uuid != localNeuron->uuid;
+  for (const ClusterMachinePeerAddress& candidate : remoteCandidates)
+  {
+    IPAddress candidateAddress = {};
+    if (ClusterMachine::parseIPAddressLiteral(candidate.address, candidateAddress) == false ||
+        (knownRemoteMachine && candidateIsLocal(candidateAddress)))
+    {
+      continue;
+    }
+
+    peerAddress = candidateAddress;
+    remoteCandidate = candidate;
+    break;
+  }
+  if (peerAddress.isNull())
+  {
+    machine.neuron.daddrLen = 0;
+    machine.neuron.saddrLen = 0;
     return;
   }
 
@@ -284,28 +329,8 @@ static inline void prodigyConfigureMachineNeuronEndpoint(
     }
   }
 
-  ClusterMachinePeerAddress remoteCandidate = {};
-  if (machine.peerAddresses.empty() == false)
-  {
-    remoteCandidate = machine.peerAddresses[0];
-  }
-  else if (machine.privateAddress.size() > 0)
-  {
-    remoteCandidate.address = machine.privateAddress;
-  }
-
   if (localNeuron != nullptr && remoteCandidate.address.size() > 0)
   {
-    const Vector<ClusterMachinePeerAddress> *localCandidates = localCandidatesOverride;
-    Vector<ClusterMachinePeerAddress> discoveredLocalCandidates = {};
-    if (localCandidates == nullptr)
-    {
-      String preferredInterface = {};
-      preferredInterface.assign(localNeuron->eth.name);
-      prodigyCollectLocalPeerAddressCandidates(preferredInterface, localNeuron->private4, discoveredLocalCandidates);
-      localCandidates = &discoveredLocalCandidates;
-    }
-
     IPAddress sourceAddress = {};
     if (localCandidates != nullptr && prodigyResolvePreferredLocalSourceAddress(*localCandidates, remoteCandidate, sourceAddress))
     {

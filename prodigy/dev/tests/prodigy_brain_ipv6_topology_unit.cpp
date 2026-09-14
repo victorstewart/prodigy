@@ -1005,6 +1005,56 @@ int main(void)
       peer.fd = -1;
     }
 
+    Vector<ClusterMachinePeerAddress> neuronLocalCandidates = {};
+    neuronLocalCandidates.push_back(ClusterMachinePeerAddress {"2001:db8:703::10"_ctv, 64});
+
+    Machine remoteMachine = {};
+    remoteMachine.uuid = 0x702;
+    remoteMachine.peerAddresses.push_back(ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24});
+    remoteMachine.peerAddresses.push_back(ClusterMachinePeerAddress {"2001:db8:704::10"_ctv, 64});
+    prodigyConfigureMachineNeuronEndpoint(remoteMachine, &neuron, &neuronLocalCandidates);
+
+    IPAddress remoteNeuronDestination = {};
+    String remoteNeuronDestinationText = {};
+    suite.expect(
+        prodigySockaddrToIPAddress(remoteMachine.neuron.daddr<struct sockaddr>(), remoteNeuronDestination, &remoteNeuronDestinationText),
+        "machine_neuron_endpoint_shared_slirp_reads_remote_destination");
+    suite.expect(
+        remoteNeuronDestination.is6 && remoteNeuronDestinationText == "2001:db8:704::10"_ctv,
+        "machine_neuron_endpoint_shared_slirp_skips_local_private4_for_known_remote");
+    IPAddress remoteNeuronSource = {};
+    String remoteNeuronSourceText = {};
+    suite.expect(
+        prodigySockaddrToIPAddress(remoteMachine.neuron.saddr<struct sockaddr>(), remoteNeuronSource, &remoteNeuronSourceText) &&
+            remoteNeuronSource.is6 && remoteNeuronSourceText == "2001:db8:703::10"_ctv,
+        "machine_neuron_endpoint_shared_slirp_selects_ipv6_source");
+    remoteMachine.neuron.close();
+
+    Machine unavailableRemote = {};
+    unavailableRemote.uuid = 0x703;
+    unavailableRemote.peerAddresses.push_back(ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24});
+    unavailableRemote.neuron.setDaddr(neuron.private4, uint16_t(ReservedPorts::neuron));
+    prodigyConfigureMachineNeuronEndpoint(unavailableRemote, &neuron, &neuronLocalCandidates);
+    suite.expect(unavailableRemote.neuron.daddrLen == 0,
+                 "machine_neuron_endpoint_shared_slirp_rejects_local_only_candidates");
+    unavailableRemote.neuron.close();
+
+    Machine selfMachine = {};
+    selfMachine.uuid = neuron.uuid;
+    selfMachine.peerAddresses.push_back(ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24});
+    selfMachine.peerAddresses.push_back(ClusterMachinePeerAddress {"2001:db8:703::10"_ctv, 64});
+    prodigyConfigureMachineNeuronEndpoint(selfMachine, &neuron, &neuronLocalCandidates);
+
+    IPAddress selfNeuronDestination = {};
+    String selfNeuronDestinationText = {};
+    suite.expect(
+        prodigySockaddrToIPAddress(selfMachine.neuron.daddr<struct sockaddr>(), selfNeuronDestination, &selfNeuronDestinationText),
+        "machine_neuron_endpoint_shared_slirp_reads_self_destination");
+    suite.expect(
+        selfNeuronDestination.is6 == false && selfNeuronDestinationText == "10.0.2.15"_ctv,
+        "machine_neuron_endpoint_shared_slirp_preserves_local_self_control");
+    selfMachine.neuron.close();
+
     BrainView fallback = {};
     fallback.peerAddresses.push_back(ClusterMachinePeerAddress {"2001:db8:701::20"_ctv, 64});
     fallback.peerAddresses.push_back(ClusterMachinePeerAddress {"2001:db8:701::21"_ctv, 64});
