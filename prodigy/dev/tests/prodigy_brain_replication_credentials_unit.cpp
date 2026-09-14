@@ -9846,6 +9846,83 @@ static void testResumePendingAddMachinesOperations(TestSuite& suite)
   suite.expect(brain.persistCalls >= 2, "resume_pending_addmachines_persists_runtime_and_topology");
 }
 
+static void testAdoptedMachineUUIDJournalSurvivesInterruptedBootstrap(TestSuite& suite)
+{
+  ResumableAddMachinesBrain brain;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  brain.nBrains = 1;
+
+  ClusterMachine existingMachine = {};
+  existingMachine.uuid = 0x4101;
+  existingMachine.isBrain = true;
+  prodigyAppendUniqueClusterMachineAddress(existingMachine.addresses.privateAddresses, "10.4.1.10"_ctv, 24, "10.4.1.1"_ctv);
+  brain.authoritativeTopology.version = 1;
+  brain.authoritativeTopology.machines.push_back(existingMachine);
+
+  auto makeAdoptedMachine = [](const String& address, uint128_t uuid = 0) -> ClusterMachine {
+    ClusterMachine machine = {};
+    machine.source = ClusterMachineSource::adopted;
+    machine.backing = ClusterMachineBacking::owned;
+    machine.kind = MachineConfig::MachineKind::vm;
+    machine.lifetime = MachineLifetime::owned;
+    machine.isBrain = true;
+    machine.uuid = uuid;
+    machine.ssh.address = address;
+    machine.ssh.user.assign("root"_ctv);
+    machine.ssh.privateKeyPath.assign("/tmp/test-key"_ctv);
+    prodigyAppendUniqueClusterMachineAddress(machine.addresses.privateAddresses, address, 24, "10.4.1.1"_ctv);
+    return machine;
+  };
+
+  ClusterMachine firstAdopted = makeAdoptedMachine("10.4.1.11"_ctv);
+  ClusterMachine secondAdopted = makeAdoptedMachine("10.4.1.12"_ctv);
+  constexpr uint128_t explicitUUID = 0x4104;
+  ClusterMachine explicitAdopted = makeAdoptedMachine("10.4.1.13"_ctv, explicitUUID);
+  explicitAdopted.isBrain = false;
+  ClusterTopology plannedTopology = brain.authoritativeTopology;
+  plannedTopology.machines.push_back(firstAdopted);
+  plannedTopology.machines.push_back(secondAdopted);
+  plannedTopology.machines.push_back(explicitAdopted);
+
+  AddMachines request = {};
+  request.bootstrapSshUser.assign("root"_ctv);
+  request.bootstrapSshPrivateKeyPath.assign("/tmp/test-key"_ctv);
+  request.controlSocketPath.assign("/run/prodigy/control.sock"_ctv);
+  request.clusterUUID = 0x4401;
+  Vector<ClusterMachine> machinesToBootstrap = {};
+  machinesToBootstrap.push_back(firstAdopted);
+  machinesToBootstrap.push_back(secondAdopted);
+  machinesToBootstrap.push_back(explicitAdopted);
+  const uint64_t operationID = brain.journalAddMachinesOperation(request, plannedTopology, machinesToBootstrap);
+  const auto& operation = brain.masterAuthorityRuntimeState.pendingAddMachinesOperations[0];
+  const uint128_t firstUUID = operation.plannedTopology.machines[1].uuid;
+  const uint128_t secondUUID = operation.plannedTopology.machines[2].uuid;
+  suite.expect(firstUUID != 0 && secondUUID != 0 && firstUUID != secondUUID && firstUUID != existingMachine.uuid && secondUUID != existingMachine.uuid &&
+                   firstUUID != explicitUUID && secondUUID != explicitUUID,
+               "adopted_uuid_journal_allocates_distinct_nonzero_uuids");
+  suite.expect(operation.plannedTopology.machines[3].uuid == explicitUUID && operation.machinesToBootstrap[2].uuid == explicitUUID,
+               "adopted_uuid_journal_preserves_explicit_uuid");
+  suite.expect(brain.masterAuthorityRuntimeState.pendingAddMachinesOperations.size() == 1 &&
+                   operation.machinesToBootstrap[0].uuid == firstUUID && operation.machinesToBootstrap[1].uuid == secondUUID &&
+                   plannedTopology.machines[1].uuid == firstUUID && plannedTopology.machines[2].uuid == secondUUID &&
+                   machinesToBootstrap[0].uuid == firstUUID && machinesToBootstrap[1].uuid == secondUUID,
+               "adopted_uuid_journal_persists_topology_and_bootstrap_identity");
+
+  brain.failBootstrap = true;
+  suite.expect(brain.resumePendingAddMachinesOperation(operationID) == false &&
+                   brain.masterAuthorityRuntimeState.pendingAddMachinesOperations.size() == 1 &&
+                   brain.masterAuthorityRuntimeState.pendingAddMachinesOperations[0].plannedTopology.machines[1].uuid == firstUUID &&
+                   brain.masterAuthorityRuntimeState.pendingAddMachinesOperations[0].plannedTopology.machines[2].uuid == secondUUID,
+               "adopted_uuid_journal_retains_identity_after_interrupted_bootstrap");
+
+  brain.failBootstrap = false;
+  suite.expect(brain.resumePendingAddMachinesOperation(operationID) && brain.bootstrappedMachines.size() == 3 &&
+                   brain.bootstrappedMachines[0].uuid == firstUUID && brain.bootstrappedMachines[1].uuid == secondUUID &&
+                   brain.bootstrappedMachines[2].uuid == explicitUUID && brain.masterAuthorityRuntimeState.pendingAddMachinesOperations.empty(),
+               "adopted_uuid_journal_resume_reuses_persisted_identity");
+}
+
 static void testResumePendingAddMachinesRefreshesProvisionalCreatedMachine(TestSuite& suite)
 {
   ResumableAddMachinesBrain brain;
@@ -22323,6 +22400,12 @@ int main(void)
     createdRing = true;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "adopted-uuid-journal") == 0)
+  {
+    testAdoptedMachineUUIDJournalSurvivesInterruptedBootstrap(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "addmachines-bootstrap-completion") == 0)
   {
     testSuspendableAddMachinesStreamsCreatedBootstrapDuringSpin(suite);
@@ -22463,6 +22546,7 @@ int main(void)
   testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(suite);
   testPersistentMasterAuthorityPackageRestore(suite);
   testResumePendingAddMachinesOperations(suite);
+  testAdoptedMachineUUIDJournalSurvivesInterruptedBootstrap(suite);
   testResumePendingAddMachinesRefreshesProvisionalCreatedMachine(suite);
   testResumePendingAddMachinesOperationFailureRetainsJournal(suite);
   testSuspendableAddMachinesStreamsCreatedBootstrapDuringSpin(suite);

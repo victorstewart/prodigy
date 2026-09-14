@@ -5062,8 +5062,43 @@ public:
     return nullptr;
   }
 
-  uint64_t journalAddMachinesOperation(const AddMachines& request, const ClusterTopology& plannedTopology, const Vector<ClusterMachine>& machinesToBootstrap)
+  void assignAdoptedBootstrapMachineUUIDs(ClusterTopology& plannedTopology, Vector<ClusterMachine>& machinesToBootstrap) const
   {
+    for (ClusterMachine& machine : machinesToBootstrap)
+    {
+      if (machine.source != ClusterMachineSource::adopted)
+      {
+        continue;
+      }
+
+      for (ClusterMachine& plannedMachine : plannedTopology.machines)
+      {
+        if (plannedMachine.sameIdentityAs(machine) == false)
+        {
+          continue;
+        }
+
+        if (plannedMachine.uuid == 0)
+        {
+          uint128_t candidate = 0;
+          do
+          {
+            candidate = Random::generateNumberWithNBits<128, uint128_t>();
+          } while (candidate == 0 || std::any_of(plannedTopology.machines.begin(), plannedTopology.machines.end(), [&](const ClusterMachine& existing) {
+            return existing.uuid == candidate;
+          }));
+          plannedMachine.uuid = candidate;
+        }
+
+        machine.uuid = plannedMachine.uuid;
+        break;
+      }
+    }
+  }
+
+  uint64_t journalAddMachinesOperation(const AddMachines& request, ClusterTopology& plannedTopology, Vector<ClusterMachine>& machinesToBootstrap)
+  {
+    assignAdoptedBootstrapMachineUUIDs(plannedTopology, machinesToBootstrap);
     refreshMasterAuthorityRuntimeStateFromLiveFields();
 
     uint64_t operationID = masterAuthorityRuntimeState.nextPendingAddMachinesOperationID++;
@@ -25055,7 +25090,16 @@ public:
             {
               PRODIGY_DEBUG_LOG( "prodigy updateProdigy bundle-recv from=%u bytes=%u\n", bv->private4, uint32_t(newBundle.size()));
               PRODIGY_DEBUG_FLUSH();
-              Filesystem::openWriteAtClose(-1, prodigyStagedBundlePath(), newBundle);
+              String expectedDigest = {};
+              String actualDigest = {};
+              String stagingFailure = {};
+              if (prodigyComputeSHA256Hex(newBundle, expectedDigest, &stagingFailure) == false ||
+                  prodigyStageBundleWithExpectedSHA256(
+                      prodigyStagedBundlePath(), newBundle, expectedDigest, actualDigest, &stagingFailure) == false)
+              {
+                basics_log("prodigy updateProdigy peer bundle stage failed: %s\n", stagingFailure.c_str());
+                break;
+              }
             }
 
             if (peerSocketActive(bv))
@@ -28977,13 +29021,9 @@ public:
           }
           if (response.failure.empty())
           {
-            int written = Filesystem::openWriteAtClose(-1, prodigyStagedBundlePath(), newBundle);
-            if (written < 0 || uint64_t(written) != newBundle.size())
-            {
-              response.failure.snprintf<"failed to stage update bundle bytes={itoa} expected={itoa}"_ctv>(
-                  int64_t(written),
-                  uint64_t(newBundle.size()));
-            }
+            String actualWorkerDigest = {};
+            (void)prodigyStageBundleWithExpectedSHA256(
+                prodigyStagedBundlePath(), newBundle, expectedWorkerDigest, actualWorkerDigest, &response.failure);
           }
 
           uint32_t expectedPeerEchos = 0;

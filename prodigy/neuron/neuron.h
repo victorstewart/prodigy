@@ -3815,9 +3815,7 @@ public:
     Message::extractToStringView(args, expectedDigest);
     String actualDigest = {};
     String failure = {};
-    const int written = Filesystem::openWriteAtClose(-1, prodigyStagedBundlePath(), bundle);
-    if (written < 0 || uint64_t(written) != bundle.size() ||
-        prodigyFileMatchesExpectedSHA256Hex(prodigyStagedBundlePath(), expectedDigest, actualDigest, &failure) == false)
+    if (prodigyStageBundleWithExpectedSHA256(prodigyStagedBundlePath(), bundle, expectedDigest, actualDigest, &failure) == false)
     {
       basics_log("neuron updateBundle rejected bytes=%llu reason=%s\n", (unsigned long long)bundle.size(), failure.c_str());
       if (brain != nullptr)
