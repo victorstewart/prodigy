@@ -792,6 +792,94 @@ int main(void)
   }
 
   {
+    constexpr uint32_t sharedSlirpPrivate4 = 0x0a00020f;
+
+    BrainView explicitPeer = {};
+    explicitPeer.private4 = sharedSlirpPrivate4;
+    explicitPeer.peerAddress = IPAddress("fd72:6e61:6d65:2::11", true);
+    explicitPeer.peerAddressText.assign("fd72:6e61:6d65:2::11"_ctv);
+    explicitPeer.peerAddresses.push_back(ClusterMachinePeerAddress {"fd72:6e61:6d65:2::11"_ctv, 64});
+
+    Machine conflictingMachine = {};
+    conflictingMachine.isBrain = true;
+    conflictingMachine.private4 = sharedSlirpPrivate4;
+    conflictingMachine.peerAddresses.push_back(ClusterMachinePeerAddress {"fd72:6e61:6d65:2::10"_ctv, 64});
+
+    RingDispatcher dispatcher(false);
+    RingDispatcher *previousDispatcher = RingDispatcher::dispatcher;
+    RingDispatcher::dispatcher = &dispatcher;
+    {
+      TestBrain brain = {};
+      brain.brains.insert(&explicitPeer);
+      brain.finishMachineConfig(&conflictingMachine);
+      suite.expect(conflictingMachine.brain == nullptr,
+                   "finish_machine_config_does_not_link_distinct_explicit_ipv6_with_shared_slirp_private4");
+      suite.expect(explicitPeer.machine == nullptr,
+                   "finish_machine_config_keeps_distinct_explicit_peer_unlinked");
+    }
+    RingDispatcher::dispatcher = previousDispatcher;
+
+    BrainView zeroPrivate4Peer = {};
+    zeroPrivate4Peer.peerAddress = IPAddress("fd72:6e61:6d65:2::11", true);
+    zeroPrivate4Peer.peerAddressText.assign("fd72:6e61:6d65:2::11"_ctv);
+    zeroPrivate4Peer.peerAddresses.push_back(ClusterMachinePeerAddress {"fd72:6e61:6d65:2::11"_ctv, 64});
+
+    Machine zeroPrivate4Machine = {};
+    zeroPrivate4Machine.isBrain = true;
+    zeroPrivate4Machine.peerAddresses.push_back(ClusterMachinePeerAddress {"fd72:6e61:6d65:2::10"_ctv, 64});
+
+    previousDispatcher = RingDispatcher::dispatcher;
+    RingDispatcher::dispatcher = &dispatcher;
+    {
+      TestBrain brain = {};
+      brain.brains.insert(&zeroPrivate4Peer);
+      brain.finishMachineConfig(&zeroPrivate4Machine);
+      suite.expect(zeroPrivate4Machine.brain == nullptr,
+                   "finish_machine_config_does_not_link_distinct_explicit_ipv6_with_zero_private4");
+      suite.expect(zeroPrivate4Peer.machine == nullptr,
+                   "finish_machine_config_keeps_zero_private4_explicit_peer_unlinked");
+    }
+    RingDispatcher::dispatcher = previousDispatcher;
+
+    conflictingMachine.brain = nullptr;
+    explicitPeer.machine = nullptr;
+
+    Machine matchingMachine = {};
+    matchingMachine.isBrain = true;
+    matchingMachine.private4 = sharedSlirpPrivate4;
+    matchingMachine.peerAddresses.push_back(ClusterMachinePeerAddress {"fd72:6e61:6d65:2::11"_ctv, 64});
+
+    {
+      TestBrain brain = {};
+      brain.brains.insert(&explicitPeer);
+      brain.linkBrainViewToMachine(&conflictingMachine);
+      suite.expect(conflictingMachine.brain == nullptr,
+                   "relink_does_not_link_distinct_explicit_ipv6_with_shared_slirp_private4");
+      brain.linkBrainViewToMachine(&matchingMachine);
+      suite.expect(matchingMachine.brain == &explicitPeer,
+                   "relink_matches_explicit_ipv6_before_private4");
+      suite.expect(explicitPeer.machine == &matchingMachine,
+                   "relink_records_matching_explicit_ipv6_peer");
+    }
+
+    BrainView addresslessPeer = {};
+    addresslessPeer.private4 = sharedSlirpPrivate4;
+    Machine addresslessMachine = {};
+    addresslessMachine.isBrain = true;
+    addresslessMachine.private4 = sharedSlirpPrivate4;
+    previousDispatcher = RingDispatcher::dispatcher;
+    RingDispatcher::dispatcher = &dispatcher;
+    {
+      TestBrain brain = {};
+      brain.brains.insert(&addresslessPeer);
+      brain.finishMachineConfig(&addresslessMachine);
+      suite.expect(addresslessMachine.brain == &addresslessPeer,
+                   "finish_machine_config_preserves_addressless_private4_fallback");
+    }
+    RingDispatcher::dispatcher = previousDispatcher;
+  }
+
+  {
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
 

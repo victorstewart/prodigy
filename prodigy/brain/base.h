@@ -793,6 +793,54 @@ public:
     // to recover after a brain restart.
   }
 
+  static bool brainViewMatchesMachineIdentity(const BrainView& brain, const Machine& machine)
+  {
+    if (brain.uuid != 0 && machine.uuid != 0 && brain.uuid == machine.uuid)
+    {
+      return true;
+    }
+
+    const bool brainHasPeerIdentity = brain.peerAddress.isNull() == false ||
+                                      brain.peerAddressText.size() > 0 ||
+                                      brain.peerAddresses.empty() == false;
+    const bool machineHasPeerIdentity = machine.peerAddresses.empty() == false ||
+                                        machine.privateAddress.size() > 0 ||
+                                        machine.publicAddress.size() > 0 ||
+                                        machine.sshAddress.size() > 0;
+    if (brainHasPeerIdentity || machineHasPeerIdentity)
+    {
+      if (brain.peerAddress.isNull() == false &&
+          prodigyMachinePeerAddressMatches(machine, brain.peerAddress, &brain.peerAddressText))
+      {
+        return true;
+      }
+
+      if (brain.peerAddressText.size() > 0)
+      {
+        IPAddress address = {};
+        if (ClusterMachine::parseIPAddressLiteral(brain.peerAddressText, address) &&
+            prodigyMachinePeerAddressMatches(machine, address, &brain.peerAddressText))
+        {
+          return true;
+        }
+      }
+
+      for (const ClusterMachinePeerAddress& candidate : brain.peerAddresses)
+      {
+        IPAddress address = {};
+        if (ClusterMachine::parseIPAddressLiteral(candidate.address, address) &&
+            prodigyMachinePeerAddressMatches(machine, address, &candidate.address))
+        {
+          return true;
+        }
+      }
+
+      return false;
+    }
+
+    return brain.private4 != 0 && machine.private4 != 0 && brain.private4 == machine.private4;
+  }
+
   void finishMachineConfig(Machine *machine)
   {
     PRODIGY_DEBUG_LOG( "prodigy machine finish-config begin machine=%p uuid=%llu private4=%u isBrain=%d isThisMachine=%d slug=%s fd=%d isFixed=%d fslot=%d\n",
@@ -841,8 +889,7 @@ public:
     {
       for (BrainView *brain : brains)
       {
-        // Brain identity is source-address based (peer private4), not socket destination.
-        if (brain->private4 == machine->private4)
+        if (brain != nullptr && brainViewMatchesMachineIdentity(*brain, *machine))
         {
           machine->brain = brain;
           brain->machine = machine;
