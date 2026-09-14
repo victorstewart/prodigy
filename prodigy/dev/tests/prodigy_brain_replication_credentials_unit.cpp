@@ -608,6 +608,7 @@ class AsyncQueuedAddMachinesBrain final : public ResumableAddMachinesBrain {
 public:
 
   mutable Vector<ClusterMachine> asyncQueuedMachines;
+  mutable ProdigyRemoteBootstrapCoordinator *pendingBootstrap = nullptr;
 
   bool canSuspendRemoteBootstrap(void) const override
   {
@@ -622,12 +623,20 @@ public:
       const ClusterTopology& topology,
       String& failure) const override
   {
-    (void)coordinator;
     (void)bundleApprovalCache;
     (void)request;
     (void)topology;
     failure.clear();
     asyncQueuedMachines.push_back(clusterMachine);
+    pendingBootstrap = &coordinator;
+    auto *task = new ProdigyRemoteBootstrapCoordinator::Task();
+    task->coordinator = &coordinator;
+    task->prepared.clusterMachine = clusterMachine;
+    task->socketInstalled = true;
+    task->phase = ProdigyRemoteBootstrapCoordinator::Task::Phase::running;
+    coordinator.tasks.push_back(task);
+    coordinator.pendingTasks += 1;
+    coordinator.openSockets += 1;
     return true;
   }
 };
@@ -10016,9 +10025,27 @@ static void testSuspendableAddMachinesStreamsCreatedBootstrapDuringSpin(TestSuit
   suite.expect(iaas.sawPendingOperationDuringSpin, "suspendable_addmachines_streams_pending_operation_before_spin_returns");
   suite.expect(iaas.sawBootstrapDuringSpin, "suspendable_addmachines_streams_bootstrap_before_spin_returns");
   suite.expect(brain.asyncQueuedMachines.size() == 1, "suspendable_addmachines_queues_single_async_bootstrap");
+  suite.expect(brain.authoritativeTopology.version == 21, "suspendable_addmachines_waits_for_bootstrap_completion");
+  ProdigyRemoteBootstrapCoordinator *coordinator = brain.pendingBootstrap;
+  suite.expect(coordinator != nullptr && coordinator->tasks.size() == 1, "suspendable_addmachines_tracks_pending_coordinator");
+  if (coordinator == nullptr || coordinator->tasks.size() != 1)
+  {
+    return;
+  }
+  auto *task = coordinator->tasks[0];
+  task->complete(true, String(), false);
+  suite.expect(brain.authoritativeTopology.version == 21, "suspendable_addmachines_waits_for_final_socket_close");
+  coordinator->closeHandler(task);
   suite.expect(brain.masterAuthorityRuntimeState.pendingAddMachinesOperations.empty(), "suspendable_addmachines_clears_pending_operation_on_success");
   suite.expect(brain.authoritativeTopology.version == 22, "suspendable_addmachines_persists_new_topology_version");
   suite.expect(brain.authoritativeTopology.machines.size() == 2, "suspendable_addmachines_persists_created_machine");
+
+  // Release the stranded test coroutine when checking the pre-fix behavior.
+  // Success destroys the coordinator as addMachines returns, so do not touch it.
+  if (brain.masterAuthorityRuntimeState.pendingAddMachinesOperations.empty() == false)
+  {
+    coordinator->runNextSuspended();
+  }
 }
 
 static void testReconcileManagedMachineSchemasSkipsEmptySchemaState(TestSuite& suite)
@@ -22294,6 +22321,16 @@ int main(void)
   {
     Ring::createRing(8, 8, 32, 32, -1, -1, 0);
     createdRing = true;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "addmachines-bootstrap-completion") == 0)
+  {
+    testSuspendableAddMachinesStreamsCreatedBootstrapDuringSpin(suite);
+    if (createdRing)
+    {
+      Ring::shutdownForExec();
+    }
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "neuron-state-upload-pending-successor") == 0)
