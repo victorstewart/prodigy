@@ -15685,6 +15685,20 @@ public:
       return true;
     }
 
+    if (machine.peerAddresses.empty() == false)
+    {
+      for (const ClusterMachinePeerAddress& candidate : machine.peerAddresses)
+      {
+        IPAddress peerAddress = {};
+        if (ClusterMachine::parseIPAddressLiteral(candidate.address, peerAddress) && localBrainAddressMatches(peerAddress))
+        {
+          return true;
+        }
+      }
+
+      return false;
+    }
+
     bool hadExplicitPeerAddress = false;
     auto explicitAddressMatches = [&](const String& addressText) -> bool {
       if (addressText.size() == 0)

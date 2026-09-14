@@ -261,6 +261,11 @@ public:
     return localBrainAddressMatches(address);
   }
 
+  bool testClusterMachineMatchesThisBrain(const ClusterMachine& machine) const
+  {
+    return clusterMachineMatchesThisBrain(machine);
+  }
+
   bool testResolveLocalBrainPeerAddressFromIaaS(void)
   {
     return resolveLocalBrainPeerAddressFromIaaS();
@@ -904,6 +909,53 @@ int main(void)
     auto *iaas = new NoopBrainIaaS();
     brain.iaas = iaas;
     suite.expect(brain.testResolveLocalBrainPeerAddressFromIaaS() == false, "resolve_local_brain_peer_address_from_iaas_rejects_unconfigured_iaas");
+  }
+
+  {
+    IPAddress savedPrivate4 = neuron.private4;
+    neuron.private4 = IPAddress("10.0.2.15", false);
+
+    auto makeSharedSlirpBrain = [&](uint128_t uuid, const char *peerAddress) {
+      ClusterMachine machine = {};
+      machine.source = ClusterMachineSource::adopted;
+      machine.backing = ClusterMachineBacking::owned;
+      machine.lifetime = MachineLifetime::owned;
+      machine.isBrain = true;
+      machine.uuid = uuid;
+      machine.creationTimeMs = 1;
+      machine.peerAddresses.push_back(ClusterMachinePeerAddress {peerAddress, 64});
+      prodigyAppendUniqueClusterMachineAddress(machine.addresses.privateAddresses, "10.0.2.15"_ctv, 24, "10.0.2.2"_ctv);
+      prodigyAppendUniqueClusterMachineAddress(machine.addresses.privateAddresses, peerAddress, 64);
+      return machine;
+    };
+
+    ClusterTopology topology = {};
+    topology.machines.push_back(makeSharedSlirpBrain(0x201, "2001:db8:101::10"));
+    topology.machines.push_back(makeSharedSlirpBrain(neuron.uuid, "2001:db8:102::10"));
+    topology.machines.push_back(makeSharedSlirpBrain(0x301, "2001:db8:102::11"));
+
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    suite.expect(brain.testClusterMachineMatchesThisBrain(topology.machines[0]) == false,
+                 "explicit_ipv6_peer_identity_rejects_shared_slirp_ipv4_other_brain");
+    suite.expect(brain.testClusterMachineMatchesThisBrain(topology.machines[1]),
+                 "explicit_ipv6_peer_identity_accepts_matching_uuid");
+    suite.expect(brain.testClusterMachineMatchesThisBrain(topology.machines[2]) == false,
+                 "explicit_ipv6_peer_identity_rejects_shared_slirp_ipv4_second_other_brain");
+    suite.expect(brain.restoreBrainsFromClusterTopology(topology), "restore_shared_slirp_explicit_ipv6_topology");
+    suite.expect(brain.brains.size() == 2, "restore_shared_slirp_explicit_ipv6_restores_two_peers");
+
+    uint32_t outboundConnectors = 0;
+    for (BrainView *peer : brain.brains)
+    {
+      if (peer && brain.shouldWeConnectToBrain(peer))
+      {
+        outboundConnectors += 1;
+      }
+    }
+    suite.expect(outboundConnectors == 1, "restore_shared_slirp_explicit_ipv6_chooses_one_connector");
+
+    neuron.private4 = savedPrivate4;
   }
 
   {
