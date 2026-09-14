@@ -15,6 +15,7 @@ static inline void mothershipFillAdoptedClusterMachine(const MothershipProdigyCl
   target.ssh = source.ssh;
   target.addresses = source.addresses;
   target.ownership = source.ownership;
+  target.rackUUID = source.rackUUID;
 }
 
 static inline bool mothershipClusterWantsAdoptedMachine(

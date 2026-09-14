@@ -1891,6 +1891,18 @@ static bool parseMothershipClusterMachineJSON(simdjson::dom::element value, Moth
         return false;
       }
     }
+    else if (key.equal("rackUUID"_ctv))
+    {
+      uint64_t rackUUID = 0;
+      if ((field.value.type() != simdjson::dom::element_type::INT64 && field.value.type() != simdjson::dom::element_type::UINT64) ||
+          field.value.get(rackUUID) != simdjson::SUCCESS || rackUUID > UINT32_MAX)
+      {
+        basics_log("%s.rackUUID requires uint32\n", context);
+        return false;
+      }
+
+      parsed.rackUUID = uint32_t(rackUUID);
+    }
     else
     {
       basics_log("%s invalid field\n", context);

@@ -210,6 +210,9 @@ public:
   ClusterMachineSSH ssh;
   ClusterMachineAddresses addresses;
   ClusterMachineOwnership ownership;
+  // Zero preserves the legacy runtime default rack. Nonzero values identify an
+  // adopted machine's physical failure domain when first added to a topology.
+  uint32_t rackUUID = 0;
 
   bool cloudPresent(void) const
   {

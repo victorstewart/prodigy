@@ -13,6 +13,20 @@
 #include <prodigy/mothership/mothership.tunnel.auth.h>
 #include <prodigy/mothership/mothership.tunnel.policy.h>
 
+class MothershipProdigyClusterRecordV3 {
+public:
+
+  MothershipProdigyCluster cluster;
+  Vector<uint32_t> adoptedMachineRackUUIDs;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipProdigyClusterRecordV3& record)
+{
+  serializer.object(record.cluster);
+  serializer.container4b(record.adoptedMachineRackUUIDs, UINT32_MAX);
+}
+
 class MothershipClusterRegistry {
 private:
 
@@ -21,6 +35,7 @@ private:
   constexpr static auto clustersColumnFamily = "clusters"_ctv;
   constexpr static auto clustersByUUIDColumnFamily = "clusters_by_uuid"_ctv;
   constexpr static auto clusterRecordV2Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=2\n\n"_ctv;
+  constexpr static auto clusterRecordV3Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=3\n\n"_ctv;
 
   static void resolveDefaultDBPath(String& path)
   {
@@ -136,26 +151,55 @@ private:
     return true;
   }
 
-  static bool deserializeClusterValue(const uint8_t *value, size_t valueSize, MothershipProdigyCluster& cluster)
+  static bool recordHasHeader(const String& serialized, const auto& header)
   {
-    String serialized;
-    serialized.append(value, valueSize);
-    String header = {};
-    header.assign(clusterRecordV2Header);
+    if (serialized.size() < header.size())
+    {
+      return false;
+    }
 
-    bool hasV2Header = serialized.size() >= header.size();
-    for (uint64_t index = 0; hasV2Header && index < header.size(); ++index)
+    for (uint64_t index = 0; index < header.size(); ++index)
     {
       if (serialized[index] != header[index])
       {
-        hasV2Header = false;
+        return false;
       }
     }
 
-    if (hasV2Header)
+    return true;
+  }
+
+  static bool deserializeClusterValue(const uint8_t *value, size_t valueSize, MothershipProdigyCluster& cluster)
+  {
+    cluster = {};
+    String serialized;
+    serialized.append(value, valueSize);
+
+    if (recordHasHeader(serialized, clusterRecordV3Header))
     {
       String payload = {};
-      payload.assign(serialized.substr(header.size(), serialized.size() - header.size(), Copy::yes));
+      payload.assign(serialized.substr(clusterRecordV3Header.size(), serialized.size() - clusterRecordV3Header.size(), Copy::yes));
+      MothershipProdigyClusterRecordV3 record = {};
+      if (BitseryEngine::deserializeSafe(payload, record) == false ||
+          record.adoptedMachineRackUUIDs.size() != record.cluster.machines.size())
+      {
+        return false;
+      }
+
+      for (uint32_t index = 0; index < record.cluster.machines.size(); ++index)
+      {
+        record.cluster.machines[index].rackUUID = record.adoptedMachineRackUUIDs[index];
+      }
+      cluster = std::move(record.cluster);
+      return true;
+    }
+
+    if (recordHasHeader(serialized, clusterRecordV2Header))
+    {
+      String payload = {};
+      payload.assign(serialized.substr(clusterRecordV2Header.size(), serialized.size() - clusterRecordV2Header.size(), Copy::yes));
+      // V2 serialized the unchanged cluster object directly, so all adopted rack
+      // identifiers retain the legacy zero/default semantics after decoding.
       return BitseryEngine::deserializeSafe(payload, cluster);
     }
 
@@ -164,10 +208,17 @@ private:
 
   static void serializeClusterValue(const MothershipProdigyCluster& cluster, String& serialized)
   {
+    MothershipProdigyClusterRecordV3 record = {};
+    record.cluster = cluster;
+    record.adoptedMachineRackUUIDs.reserve(cluster.machines.size());
+    for (const MothershipProdigyClusterMachine& machine : cluster.machines)
+    {
+      record.adoptedMachineRackUUIDs.push_back(machine.rackUUID);
+    }
+
     String payload = {};
-    MothershipProdigyCluster mutableCluster = cluster;
-    BitseryEngine::serialize(payload, mutableCluster);
-    serialized.assign(clusterRecordV2Header);
+    BitseryEngine::serialize(payload, record);
+    serialized.assign(clusterRecordV3Header);
     serialized.append(payload);
   }
 

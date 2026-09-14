@@ -19,6 +19,7 @@ public:
     else
     {
       basics_log("FAIL: %s\n", name);
+      std::fprintf(stderr, "FAIL: %s\n", name);
       failed += 1;
     }
   }
@@ -53,6 +54,7 @@ int main(void)
   prodigyAppendUniqueClusterMachineAddress(adoptedBrain.addresses.publicAddresses, "203.0.113.10"_ctv);
   prodigyAppendUniqueClusterMachineAddress(adoptedBrain.addresses.privateAddresses, "10.0.0.11"_ctv);
   adoptedBrain.ownership.mode = ClusterMachineOwnershipMode::wholeMachine;
+  adoptedBrain.rackUUID = 77;
   cluster.machines.push_back(adoptedBrain);
 
   MothershipProdigyClusterMachineSchema createdSchema = {};
@@ -105,8 +107,10 @@ int main(void)
   suite.expect(request.adoptedMachines[0].cloud.schema.equals(adoptedBrain.cloud.schema), "reconcile_adopted_machine_schema");
   suite.expect(request.adoptedMachines[0].cloud.cloudID.equals(adoptedBrain.cloud.cloudID), "reconcile_adopted_cloud_id");
   suite.expect(request.adoptedMachines[0].isBrain, "reconcile_adopted_is_brain");
+  suite.expect(request.adoptedMachines[0].rackUUID == adoptedBrain.rackUUID, "reconcile_adopted_rack_propagated");
 
   ClusterMachine duplicateAdopted = existingBrain;
+  adoptedBrain.rackUUID = 88;
   cluster.machines.clear();
   cluster.machineSchemas.clear();
   cluster.machineSchemas.push_back(createdSchema);
@@ -121,13 +125,15 @@ int main(void)
       .cloud = duplicateAdopted.cloud,
       .ssh = duplicateAdopted.ssh,
       .addresses = duplicateAdopted.addresses,
-      .ownership = duplicateAdopted.ownership});
+      .ownership = duplicateAdopted.ownership,
+      .rackUUID = adoptedBrain.rackUUID});
 
   request = {};
   failure.clear();
   built = mothershipBuildClusterAddMachinesRequest(cluster, topology, request, &failure);
   suite.expect(built, "reconcile_duplicate_identity_ok");
   suite.expect(request.adoptedMachines.size() == 0, "reconcile_duplicate_identity_not_readded");
+  suite.expect(topology.machines[0].rackUUID == 0, "reconcile_duplicate_identity_does_not_mutate_rack");
 
   cluster.nBrains = 5;
   createdSchema.budget = 1;
