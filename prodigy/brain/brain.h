@@ -14982,28 +14982,7 @@ public:
         continue;
       }
 
-      if ((brain->uuid != 0 && machine->uuid != 0 && brain->uuid == machine->uuid) || machineMatchesPeerAddress(machine, brain->peerAddress, &brain->peerAddressText))
-      {
-        applyBrainViewRuntimeMetadataToMachine(machine, brain);
-        return;
-      }
-
-      for (const ClusterMachinePeerAddress& candidate : brain->peerAddresses)
-      {
-        IPAddress candidateAddress = {};
-        if (ClusterMachine::parseIPAddressLiteral(candidate.address, candidateAddress) == false)
-        {
-          continue;
-        }
-
-        if (machineMatchesPeerAddress(machine, candidateAddress, &candidate.address))
-        {
-          applyBrainViewRuntimeMetadataToMachine(machine, brain);
-          return;
-        }
-      }
-
-      if (machine->private4 != 0 && brain->private4 != 0 && machine->private4 == brain->private4 && brain->peerAddress.isNull() && brain->peerAddressText.size() == 0)
+      if (brainViewMatchesMachineIdentity(*brain, *machine))
       {
         applyBrainViewRuntimeMetadataToMachine(machine, brain);
         return;
