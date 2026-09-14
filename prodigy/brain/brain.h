@@ -1000,6 +1000,52 @@ static inline bool prodigyAdoptProbedMachinePeerAddressesIfUnspecified(ClusterMa
   return true;
 }
 
+static inline void prodigyResolveLocalBundleReportDigests(
+    const String& localExecutablePath,
+    const String& stagedBundlePath,
+    String& localInstalledBundleSHA256,
+    String& stagedBundleSHA256)
+{
+  localInstalledBundleSHA256.clear();
+  stagedBundleSHA256.clear();
+
+  if (localExecutablePath.size() > 0)
+  {
+    String localInstallRoot = {};
+    prodigyDirname(localExecutablePath, localInstallRoot);
+    String installedBundlePath = {};
+    prodigyResolveInstalledBundlePathForRoot(localInstallRoot, installedBundlePath);
+    if (prodigyFileReadable(installedBundlePath))
+    {
+      String digestFailure = {};
+      (void)prodigyComputeFileSHA256Hex(installedBundlePath, localInstalledBundleSHA256, &digestFailure);
+    }
+  }
+
+  if (prodigyFileReadable(stagedBundlePath))
+  {
+    String digestFailure = {};
+    (void)prodigyComputeFileSHA256Hex(stagedBundlePath, stagedBundleSHA256, &digestFailure);
+  }
+}
+
+static inline void prodigyAssignMachineBundleReportDigests(
+    MachineStatusReport& report,
+    bool isThisMachine,
+    const char *updateStage,
+    const String& localInstalledBundleSHA256,
+    const String& stagedBundleSHA256)
+{
+  if (isThisMachine)
+  {
+    report.approvedBundleSHA256.assign(localInstalledBundleSHA256);
+    if (strcmp(updateStage, "idle") != 0 && stagedBundleSHA256.size() > 0)
+    {
+      report.stagedBundleSHA256.assign(stagedBundleSHA256);
+    }
+  }
+}
+
 class Brain : public BrainBase, public TimeoutDispatcher {
 public:
 
@@ -28554,25 +28600,14 @@ public:
           };
 
           String localInstalledBundleSHA256 = {};
-          {
-            String installedBundlePath = {};
-            prodigyResolveInstalledBundlePathForRoot("/root/prodigy"_ctv, installedBundlePath);
-            if (prodigyFileReadable(installedBundlePath))
-            {
-              String digestFailure = {};
-              (void)prodigyComputeFileSHA256Hex(installedBundlePath, localInstalledBundleSHA256, &digestFailure);
-            }
-          }
-
           String stagedBundleSHA256 = {};
-          {
-            String stagedBundlePath = prodigyStagedBundlePath();
-            if (prodigyFileReadable(stagedBundlePath))
-            {
-              String digestFailure = {};
-              (void)prodigyComputeFileSHA256Hex(stagedBundlePath, stagedBundleSHA256, &digestFailure);
-            }
-          }
+          String localExecutablePath = {};
+          (void)prodigyResolveCurrentExecutablePath(localExecutablePath);
+          prodigyResolveLocalBundleReportDigests(
+              localExecutablePath,
+              prodigyStagedBundlePath(),
+              localInstalledBundleSHA256,
+              stagedBundleSHA256);
 
           for (Machine *machine : machines)
           {
@@ -28716,10 +28751,6 @@ public:
             sortAndDedupeTextList(mreport.deploymentIDs);
             sortAndDedupeTextList(mreport.shardGroups);
 
-            if (machine->isThisMachine)
-            {
-              mreport.approvedBundleSHA256.assign(localInstalledBundleSHA256);
-            }
             if (machine->isThisMachine && version > 0)
             {
               mreport.runningProdigyVersion.snprintf<"{itoa}"_ctv>(version);
@@ -28728,11 +28759,10 @@ public:
             {
               mreport.runningProdigyVersion.snprintf<"{itoa}"_ctv>(machine->brain->version);
             }
-            mreport.updateStage.assign(resolveMachineUpdateStage(machine));
-            if (machine->isBrain && stagedBundleSHA256.size() > 0)
-            {
-              mreport.stagedBundleSHA256.assign(stagedBundleSHA256);
-            }
+            const char *updateStage = resolveMachineUpdateStage(machine);
+            mreport.updateStage.assign(updateStage);
+            prodigyAssignMachineBundleReportDigests(
+                mreport, machine->isThisMachine, updateStage, localInstalledBundleSHA256, stagedBundleSHA256);
             mreport.hardware = machine->hardware;
           }
 
