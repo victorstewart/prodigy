@@ -15113,16 +15113,44 @@ public:
     }
 
     Machine *machine = brain->machine;
+    // A registered Brain UUID is authoritative. A stale link or shared
+    // transport address may identify a different current member, but neither
+    // may overwrite that member's UUID association.
+    if (machine != nullptr && machine->uuid != 0 && machine->uuid != brain->uuid)
+    {
+      Machine *staleMachine = machine;
+      brain->machine = nullptr;
+      if (staleMachine->brain == brain)
+      {
+        staleMachine->brain = nullptr;
+      }
+      machine = nullptr;
+      linkBrainViewToMachine(staleMachine);
+    }
     if (machine == nullptr)
     {
-      machine = findMachineByIdentity(0, brain->private4, &brain->peerAddresses,
-                                      brain->peerAddress.isNull() ? nullptr : &brain->peerAddress,
-                                      brain->peerAddressText.size() > 0 ? &brain->peerAddressText : nullptr);
+      if (auto it = machinesByUUID.find(brain->uuid); it != machinesByUUID.end())
+      {
+        machine = it->second;
+      }
+      else
+      {
+        machine = findMachineByIdentity(0, brain->private4, &brain->peerAddresses,
+                                        brain->peerAddress.isNull() ? nullptr : &brain->peerAddress,
+                                        brain->peerAddressText.size() > 0 ? &brain->peerAddressText : nullptr);
+      }
       if (machine == nullptr)
       {
         return;
       }
+    }
 
+    if (machine->uuid != 0 && machine->uuid != brain->uuid)
+    {
+      return;
+    }
+    if (brain->machine != machine)
+    {
       applyBrainViewRuntimeMetadataToMachine(machine, brain);
     }
 
@@ -15134,11 +15162,6 @@ public:
     if (machine->cloudID.size() > 0)
     {
       return;
-    }
-
-    if (machine->uuid != 0)
-    {
-      machinesByUUID.erase(machine->uuid);
     }
 
     machine->uuid = brain->uuid;
