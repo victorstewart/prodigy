@@ -5718,6 +5718,79 @@ static void testClusterReportIncludesMothershipConnectivityStatus(TestSuite& sui
       "cluster_report_mothership_connectivity_missing_artifact_failure");
 }
 
+static void testClusterReportUsesCurrentInstallAndLocalUpdateAuthority(TestSuite& suite)
+{
+  char scratchTemplate[] = "/tmp/prodigy-cluster-report-bundle-XXXXXX";
+  char *scratch = ::mkdtemp(scratchTemplate);
+  suite.require(scratch != nullptr, "cluster_report_creates_private_bundle_fixture");
+  if (scratch == nullptr)
+  {
+    return;
+  }
+
+  String fixtureRoot = {};
+  fixtureRoot.assign(scratch);
+  String fixtureExecutable = fixtureRoot;
+  fixtureExecutable.append("/prodigy"_ctv);
+  String fixtureBundlePath = {};
+  prodigyResolveInstalledBundlePathForRoot(fixtureRoot, fixtureBundlePath);
+  String fixtureStagedPath = fixtureRoot;
+  fixtureStagedPath.append("/prodigy.bundle.new.tar.zst"_ctv);
+
+  const String currentBundle = "cluster-report-current-install-bundle"_ctv;
+  suite.require(
+      Filesystem::openWriteAtClose(-1, fixtureBundlePath, currentBundle) == int(currentBundle.size()),
+      "cluster_report_writes_private_current_install_bundle_fixture");
+  const String stagedBundle = "cluster-report-local-staged-bundle"_ctv;
+  suite.require(
+      Filesystem::openWriteAtClose(-1, fixtureStagedPath, stagedBundle) == int(stagedBundle.size()),
+      "cluster_report_writes_private_staged_bundle_fixture");
+
+  String expectedCurrentDigest = {};
+  String expectedStagedDigest = {};
+  String digestFailure = {};
+  suite.require(prodigyComputeSHA256Hex(currentBundle, expectedCurrentDigest, &digestFailure),
+                "cluster_report_computes_current_install_bundle_digest");
+  suite.require(prodigyComputeSHA256Hex(stagedBundle, expectedStagedDigest, &digestFailure),
+                "cluster_report_computes_staged_bundle_digest");
+
+  String localDigest = {};
+  String stagedDigest = {};
+  prodigyResolveLocalBundleReportDigests(
+      fixtureExecutable, fixtureStagedPath, localDigest, stagedDigest);
+  suite.expect(localDigest.equal(expectedCurrentDigest) && stagedDigest.equal(expectedStagedDigest),
+               "cluster_report_resolves_private_current_and_staged_bundle_digests");
+
+  String missingExecutable = fixtureRoot;
+  missingExecutable.append("/missing/prodigy"_ctv);
+  prodigyResolveLocalBundleReportDigests(
+      missingExecutable, fixtureStagedPath, localDigest, stagedDigest);
+  suite.expect(localDigest.size() == 0 && stagedDigest.equal(expectedStagedDigest),
+               "cluster_report_missing_current_install_bundle_has_no_fallback");
+
+  MachineStatusReport localActive = {};
+  MachineStatusReport remoteUpdating = {};
+  MachineStatusReport localIdle = {};
+  prodigyAssignMachineBundleReportDigests(
+      localActive, true, "waitingForBundle", expectedCurrentDigest, expectedStagedDigest);
+  prodigyAssignMachineBundleReportDigests(
+      remoteUpdating, false, "updating", expectedCurrentDigest, expectedStagedDigest);
+  prodigyAssignMachineBundleReportDigests(
+      localIdle, true, "idle", expectedCurrentDigest, expectedStagedDigest);
+  suite.expect(
+      localActive.approvedBundleSHA256.equal(expectedCurrentDigest) &&
+          localActive.stagedBundleSHA256.equal(expectedStagedDigest) &&
+          remoteUpdating.approvedBundleSHA256.size() == 0 &&
+          remoteUpdating.stagedBundleSHA256.size() == 0 &&
+          localIdle.approvedBundleSHA256.equal(expectedCurrentDigest) &&
+          localIdle.stagedBundleSHA256.size() == 0,
+      "cluster_report_binds_bundle_data_to_local_non_idle_update_only");
+
+  (void)::unlink(fixtureBundlePath.c_str());
+  (void)::unlink(fixtureStagedPath.c_str());
+  (void)::rmdir(scratch);
+}
+
 static void testDeploymentReplicationBackpressureClosesPeer(TestSuite& suite)
 {
   TestBrain brain;
@@ -22416,6 +22489,16 @@ int main(void)
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "cluster-report-bundle-identity") == 0)
+  {
+    testClusterReportUsesCurrentInstallAndLocalUpdateAuthority(suite);
+    if (createdRing)
+    {
+      Ring::shutdownForExec();
+    }
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "neuron-state-upload-pending-successor") == 0)
   {
     testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(suite);
@@ -22484,6 +22567,7 @@ int main(void)
   testMothershipTunnelProviderContainerFailureStopsRuntime(suite);
   testMothershipTunnelProviderStateUploadKillsStaleProvider(suite);
   testClusterReportIncludesMothershipConnectivityStatus(suite);
+  testClusterReportUsesCurrentInstallAndLocalUpdateAuthority(suite);
   testDeploymentReplicationBackpressureClosesPeer(suite);
   testMothershipConfigureAppliesClusterUUID(suite);
   testMothershipConfigureOwnsMachineConfigsForManagedSchemas(suite);

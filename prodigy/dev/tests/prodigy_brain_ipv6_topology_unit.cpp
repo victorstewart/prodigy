@@ -959,6 +959,91 @@ int main(void)
   }
 
   {
+    IPAddress savedPrivate4 = neuron.private4;
+    neuron.private4 = IPAddress("10.0.2.15", false);
+
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    brain.testAdoptLocalBrainPeerAddresses({ClusterMachinePeerAddress {"2001:db8:700::10"_ctv, 64}});
+
+    ClusterTopology topology = {};
+    ClusterMachine local = makeMultihomedBrainMachine(neuron.uuid, {
+                                                                        {"2001:db8:700::10", 64}
+    });
+    local.peerAddresses.push_back(ClusterMachinePeerAddress {"2001:db8:700::10"_ctv, 64});
+    auto makeRemote = [&](uint128_t uuid, const char *address) {
+      ClusterMachine remote = makeMultihomedBrainMachine(uuid, {{"10.0.2.15", 24}, {address, 64}});
+      remote.peerAddresses.push_back(ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24});
+      remote.peerAddresses.push_back(ClusterMachinePeerAddress {address, 64});
+      return remote;
+    };
+    topology.machines.push_back(std::move(local));
+    topology.machines.push_back(makeRemote(0x702, "2001:db8:700::20"));
+    topology.machines.push_back(makeRemote(0x703, "2001:db8:700::21"));
+    prodigyNormalizeClusterTopologyPeerAddresses(topology);
+
+    suite.expect(brain.restoreBrainsFromClusterTopology(topology), "restore_shared_slirp_mixed_peer_candidates");
+    suite.expect(brain.brains.size() == 2 && brain.findBrainViewByUUID(0x702) != nullptr && brain.findBrainViewByUUID(0x703) != nullptr,
+                 "shared_slirp_mixed_peers_preserve_distinct_member_uuids");
+
+    // Exercise endpoint selection independently so a restore failure cannot
+    // hide the separate connection-address regression.
+    brain.testAdoptLocalBrainPeerAddresses({ClusterMachinePeerAddress {"2001:db8:700::10"_ctv, 64}});
+    BrainView peer = {};
+    brain.adoptBrainPeerAddresses(&peer, topology.machines[1].peerAddresses);
+    suite.expect(peer.peerAddresses.size() == 2 && peer.peerAddresses[0].address == "10.0.2.15"_ctv,
+                 "shared_slirp_mixed_peer_normalizes_shared_ipv4_first");
+    suite.expect(brain.shouldWeConnectToBrain(&peer), "shared_slirp_mixed_peer_preserves_one_connector");
+    brain.configureBrainPeerConnectAddress(&peer);
+    suite.expect(peer.peerAddressText == "2001:db8:700::20"_ctv,
+                 "shared_slirp_mixed_peer_skips_local_private4_target");
+    suite.expect(peer.peerAddressIndex == 1,
+                 "shared_slirp_mixed_peer_selects_documentation_ipv6_fallback");
+    if (peer.fd >= 0)
+    {
+      close(peer.fd);
+      peer.fd = -1;
+    }
+
+    BrainView fallback = {};
+    fallback.peerAddresses.push_back(ClusterMachinePeerAddress {"2001:db8:701::20"_ctv, 64});
+    fallback.peerAddresses.push_back(ClusterMachinePeerAddress {"2001:db8:701::21"_ctv, 64});
+    brain.configureBrainPeerConnectAddress(&fallback);
+    suite.expect(fallback.peerAddressIndex == 0 && fallback.peerAddressText == "2001:db8:701::20"_ctv,
+                 "brain_peer_reconnect_initial_candidate_selected");
+    if (fallback.fd >= 0)
+    {
+      close(fallback.fd);
+      fallback.fd = -1;
+    }
+    fallback.isFixedFile = false;
+    fallback.fslot = -1;
+    fallback.reset();
+    brain.configureBrainPeerConnectAddress(&fallback, true);
+    suite.expect(fallback.peerAddressIndex == 1 && fallback.peerAddressText == "2001:db8:701::21"_ctv,
+                 "brain_peer_reconnect_advances_after_failed_candidate");
+    if (fallback.fd >= 0)
+    {
+      close(fallback.fd);
+      fallback.fd = -1;
+    }
+
+    BrainView localOnly = {};
+    localOnly.peerAddresses.push_back(ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24});
+    localOnly.peerAddresses.push_back(ClusterMachinePeerAddress {"2001:db8:700::10"_ctv, 64});
+    brain.configureBrainPeerConnectAddress(&localOnly);
+    suite.expect(localOnly.peerAddress.isNull() && localOnly.peerAddressText.empty() && localOnly.daddrLen == 0,
+                 "brain_peer_local_only_candidates_have_no_destination");
+    if (localOnly.fd >= 0)
+    {
+      close(localOnly.fd);
+      localOnly.fd = -1;
+    }
+
+    neuron.private4 = savedPrivate4;
+  }
+
+  {
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
 
