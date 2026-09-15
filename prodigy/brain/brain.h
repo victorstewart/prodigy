@@ -5331,6 +5331,82 @@ public:
     return true;
   }
 
+  static bool applyAdoptedMachineRackUpdate(
+      ClusterTopology& topology,
+      const ClusterMachine& requestedMachine,
+      String& failure)
+  {
+    if (requestedMachine.uuid == 0)
+    {
+      failure.assign("adopted rack update requires existing machine UUID"_ctv);
+      return false;
+    }
+
+    ClusterMachine *existingMachine = nullptr;
+    for (ClusterMachine& candidate : topology.machines)
+    {
+      if (candidate.uuid == requestedMachine.uuid)
+      {
+        existingMachine = &candidate;
+        break;
+      }
+    }
+
+    if (existingMachine == nullptr)
+    {
+      failure.assign("adopted rack update requires existing machine UUID"_ctv);
+      return false;
+    }
+
+    if (existingMachine->source != ClusterMachineSource::adopted ||
+        existingMachine->preservesIdentityAndConfigurationForRackUpdate(requestedMachine) == false ||
+        (requestedMachine.rackUUID == 0 && existingMachine->rackUUID != 0))
+    {
+      failure.assign("adopted rack update must only change rackUUID"_ctv);
+      return false;
+    }
+
+    // A journal may be replayed after its topology write but before the entry is
+    // erased. This also keeps a completed explicit-UUID adoption with the
+    // legacy zero rack idempotent when its pending request is replayed.
+    if (requestedMachine.rackUUID != existingMachine->rackUUID)
+    {
+      existingMachine->rackUUID = requestedMachine.rackUUID;
+    }
+    return true;
+  }
+
+  static bool applyAdoptedMachineRackUpdates(
+      ClusterTopology& topology,
+      const Vector<ClusterMachine>& requestedMachines,
+      String& failure)
+  {
+    for (const ClusterMachine& requestedMachine : requestedMachines)
+    {
+      if (requestedMachine.uuid == 0)
+      {
+        continue;
+      }
+
+      bool hasExistingUUID = false;
+      for (const ClusterMachine& existingMachine : topology.machines)
+      {
+        if (existingMachine.uuid == requestedMachine.uuid)
+        {
+          hasExistingUUID = true;
+          break;
+        }
+      }
+
+      if (hasExistingUUID && applyAdoptedMachineRackUpdate(topology, requestedMachine, failure) == false)
+      {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
   bool mergePendingAddMachinesTopology(const ProdigyPendingAddMachinesOperation& operation, ClusterTopology& mergedTopology, String& failure) const
   {
     failure.clear();
@@ -5343,6 +5419,11 @@ public:
     }
 
     mergedTopology = authoritativeTopology;
+    if (applyAdoptedMachineRackUpdates(mergedTopology, operation.request.adoptedMachines, failure) == false)
+    {
+      return false;
+    }
+
     for (const ClusterMachine& machine : operation.plannedTopology.machines)
     {
       if (clusterTopologyContainsMachineIdentity(mergedTopology, machine))
@@ -26756,6 +26837,34 @@ public:
 
       for (const ClusterMachine& requestedMachine : request.adoptedMachines)
       {
+        if (requestedMachine.uuid != 0)
+        {
+          bool hasExistingUUID = false;
+          for (const ClusterMachine& existingMachine : targetTopology.machines)
+          {
+            if (existingMachine.uuid == requestedMachine.uuid)
+            {
+              hasExistingUUID = true;
+              break;
+            }
+          }
+
+          if (hasExistingUUID)
+          {
+            if (applyAdoptedMachineRackUpdate(targetTopology, requestedMachine, response.failure) == false)
+            {
+              break;
+            }
+            continue;
+          }
+
+          if (clusterTopologyContainsMachineIdentity(targetTopology, requestedMachine))
+          {
+            response.failure.assign("adopted machine UUID conflicts with existing topology identity"_ctv);
+            break;
+          }
+        }
+
         String requestedLabel = {};
         requestedMachine.renderIdentityLabel(requestedLabel);
         PRODIGY_DEBUG_LOG( "prodigy mothership addMachines-adopted-normalize-start machine=%.*s\n",

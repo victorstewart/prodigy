@@ -9872,6 +9872,145 @@ static void testPersistentMasterAuthorityPackageRestore(TestSuite& suite)
   suite.expect(restored.masterAuthorityRuntimeState.pendingAddMachinesOperations.size() == 1, "restore_package_restores_pending_addmachines_operation");
 }
 
+static ClusterMachine makeRackUpdateMachine(uint128_t uuid, uint32_t rackUUID)
+{
+  ClusterMachine machine = {};
+  machine.source = ClusterMachineSource::adopted;
+  machine.backing = ClusterMachineBacking::owned;
+  machine.kind = MachineConfig::MachineKind::vm;
+  machine.lifetime = MachineLifetime::owned;
+  machine.isBrain = false;
+  machine.uuid = uuid;
+  machine.rackUUID = rackUUID;
+  machine.creationTimeMs = 1234;
+  machine.ssh.address.assign("2001:db8:400::10"_ctv);
+  machine.ssh.port = 22;
+  machine.ssh.user.assign("root"_ctv);
+  machine.ssh.privateKeyPath.assign("/tmp/test-key"_ctv);
+  machine.ssh.hostPublicKeyOpenSSH.assign("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest rack-update"_ctv);
+  prodigyAppendUniqueClusterMachineAddress(machine.addresses.privateAddresses, "2001:db8:400::10"_ctv, 64);
+  prodigyAppendUniqueClusterMachinePeerAddress(machine.peerAddresses, ClusterMachinePeerAddress {"2001:db8:400::10"_ctv, 64});
+  machine.ownership.mode = ClusterMachineOwnershipMode::wholeMachine;
+  return machine;
+}
+
+static void testAdoptedMachineRackUpdates(TestSuite& suite)
+{
+  NoopBrainIaaS iaas;
+  ResumableAddMachinesBrain brain;
+  brain.iaas = &iaas;
+  brain.weAreMaster = false;
+  brain.noMasterYet = false;
+  brain.nBrains = 1;
+  brain.brainConfig.clusterUUID = 0x5a01;
+
+  ClusterMachine original = makeRackUpdateMachine(0x5a02, 1);
+  brain.authoritativeTopology.version = 7;
+  brain.authoritativeTopology.machines.push_back(original);
+
+  AddMachines updateRequest = {};
+  updateRequest.clusterUUID = brain.brainConfig.clusterUUID;
+  ClusterMachine rackUpdate = original;
+  rackUpdate.rackUUID = 2;
+  updateRequest.adoptedMachines.push_back(rackUpdate);
+  AddMachines updateResponse = {};
+  brain.addMachines(nullptr, updateRequest, Brain::ManagedAddMachinesWork {}, &updateResponse);
+  suite.expect(updateResponse.success && updateResponse.hasTopology, "adopted_rack_update_succeeds_without_bootstrap");
+  suite.expect(brain.authoritativeTopology.machines.size() == 1 && brain.authoritativeTopology.machines[0].rackUUID == 2,
+               "adopted_rack_update_persists_only_rack_change");
+  suite.expect(brain.bootstrappedMachines.empty(), "adopted_rack_update_does_not_bootstrap_or_restart_machine");
+
+  ResumableAddMachinesBrain rejectedBrain;
+  rejectedBrain.iaas = &iaas;
+  rejectedBrain.weAreMaster = false;
+  rejectedBrain.noMasterYet = false;
+  rejectedBrain.nBrains = 1;
+  rejectedBrain.brainConfig.clusterUUID = 0x5a01;
+  rejectedBrain.authoritativeTopology.version = 7;
+  rejectedBrain.authoritativeTopology.machines.push_back(original);
+  AddMachines rejectedRequest = updateRequest;
+  rejectedRequest.adoptedMachines[0].isBrain = true;
+  AddMachines rejectedResponse = {};
+  rejectedBrain.addMachines(nullptr, rejectedRequest, Brain::ManagedAddMachinesWork {}, &rejectedResponse);
+  suite.expect(rejectedResponse.success == false && rejectedResponse.failure.equals("adopted rack update must only change rackUUID"_ctv),
+               "adopted_rack_update_rejects_role_change");
+  suite.expect(rejectedBrain.authoritativeTopology.machines[0].rackUUID == 1, "adopted_rack_update_role_rejection_preserves_topology");
+
+  ResumableAddMachinesBrain identityRejectedBrain;
+  identityRejectedBrain.iaas = &iaas;
+  identityRejectedBrain.weAreMaster = false;
+  identityRejectedBrain.noMasterYet = false;
+  identityRejectedBrain.nBrains = 1;
+  identityRejectedBrain.brainConfig.clusterUUID = 0x5a01;
+  identityRejectedBrain.authoritativeTopology.version = 7;
+  identityRejectedBrain.authoritativeTopology.machines.push_back(original);
+  AddMachines identityRejectedRequest = updateRequest;
+  identityRejectedRequest.adoptedMachines[0].uuid = 0x5a03;
+  AddMachines identityRejectedResponse = {};
+  identityRejectedBrain.addMachines(nullptr, identityRejectedRequest, Brain::ManagedAddMachinesWork {}, &identityRejectedResponse);
+  suite.expect(identityRejectedResponse.success == false && identityRejectedResponse.failure.equals("adopted machine UUID conflicts with existing topology identity"_ctv),
+               "adopted_rack_update_rejects_mismatched_uuid_identity");
+  suite.expect(identityRejectedBrain.authoritativeTopology.machines[0].rackUUID == 1, "adopted_rack_update_uuid_rejection_preserves_topology");
+
+  ResumableAddMachinesBrain resumedBrain;
+  resumedBrain.iaas = &iaas;
+  resumedBrain.weAreMaster = true;
+  resumedBrain.noMasterYet = false;
+  resumedBrain.nBrains = 1;
+  resumedBrain.authoritativeTopology.version = 7;
+  resumedBrain.authoritativeTopology.machines.push_back(original);
+  ProdigyPendingAddMachinesOperation pending = {};
+  pending.operationID = 1;
+  pending.request = updateRequest;
+  pending.plannedTopology = resumedBrain.authoritativeTopology;
+  pending.plannedTopology.machines[0].rackUUID = 2;
+  resumedBrain.masterAuthorityRuntimeState.pendingAddMachinesOperations.push_back(pending);
+  resumedBrain.masterAuthorityRuntimeState.nextPendingAddMachinesOperationID = 2;
+  resumedBrain.resumePendingAddMachinesOperations();
+  suite.expect(resumedBrain.masterAuthorityRuntimeState.pendingAddMachinesOperations.empty(), "adopted_rack_update_resume_clears_journal");
+  suite.expect(resumedBrain.authoritativeTopology.machines.size() == 1 && resumedBrain.authoritativeTopology.machines[0].rackUUID == 2,
+               "adopted_rack_update_resume_preserves_rack_change");
+
+  ResumableAddMachinesBrain appliedBeforeClearBrain;
+  appliedBeforeClearBrain.iaas = &iaas;
+  appliedBeforeClearBrain.weAreMaster = true;
+  appliedBeforeClearBrain.noMasterYet = false;
+  appliedBeforeClearBrain.nBrains = 1;
+  appliedBeforeClearBrain.authoritativeTopology.version = 8;
+  ClusterMachine applied = original;
+  applied.rackUUID = 2;
+  appliedBeforeClearBrain.authoritativeTopology.machines.push_back(applied);
+  ProdigyPendingAddMachinesOperation appliedPending = {};
+  appliedPending.operationID = 2;
+  appliedPending.request = updateRequest;
+  appliedPending.plannedTopology = appliedBeforeClearBrain.authoritativeTopology;
+  appliedBeforeClearBrain.masterAuthorityRuntimeState.pendingAddMachinesOperations.push_back(appliedPending);
+  appliedBeforeClearBrain.masterAuthorityRuntimeState.nextPendingAddMachinesOperationID = 3;
+  appliedBeforeClearBrain.resumePendingAddMachinesOperations();
+  suite.expect(appliedBeforeClearBrain.masterAuthorityRuntimeState.pendingAddMachinesOperations.empty(), "adopted_rack_update_applied_before_clear_is_idempotent");
+  suite.expect(appliedBeforeClearBrain.authoritativeTopology.machines[0].rackUUID == 2, "adopted_rack_update_applied_before_clear_keeps_rack");
+
+  ResumableAddMachinesBrain explicitAdoptionReplayBrain;
+  explicitAdoptionReplayBrain.iaas = &iaas;
+  explicitAdoptionReplayBrain.weAreMaster = true;
+  explicitAdoptionReplayBrain.noMasterYet = false;
+  explicitAdoptionReplayBrain.nBrains = 1;
+  explicitAdoptionReplayBrain.authoritativeTopology.version = 9;
+  ClusterMachine explicitAdopted = makeRackUpdateMachine(0x5a04, 0);
+  explicitAdoptionReplayBrain.authoritativeTopology.machines.push_back(explicitAdopted);
+  ProdigyPendingAddMachinesOperation explicitPending = {};
+  explicitPending.operationID = 3;
+  explicitPending.request.adoptedMachines.push_back(explicitAdopted);
+  explicitPending.plannedTopology = explicitAdoptionReplayBrain.authoritativeTopology;
+  explicitAdoptionReplayBrain.masterAuthorityRuntimeState.pendingAddMachinesOperations.push_back(explicitPending);
+  explicitAdoptionReplayBrain.masterAuthorityRuntimeState.nextPendingAddMachinesOperationID = 4;
+  explicitAdoptionReplayBrain.resumePendingAddMachinesOperations();
+  suite.expect(explicitAdoptionReplayBrain.masterAuthorityRuntimeState.pendingAddMachinesOperations.empty(), "adopted_explicit_uuid_replay_is_idempotent");
+  suite.expect(explicitAdoptionReplayBrain.authoritativeTopology.machines[0].uuid == explicitAdopted.uuid &&
+                   explicitAdoptionReplayBrain.authoritativeTopology.machines[0].rackUUID == 0,
+               "adopted_explicit_uuid_replay_keeps_legacy_rack");
+}
+
 static void testResumePendingAddMachinesOperations(TestSuite& suite)
 {
   ResumableAddMachinesBrain brain;
@@ -22473,6 +22612,18 @@ int main(void)
     createdRing = true;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "adopted-rack-update") == 0)
+  {
+    testAdoptedMachineRackUpdates(suite);
+    testResumePendingAddMachinesOperations(suite);
+    testAdoptedMachineUUIDJournalSurvivesInterruptedBootstrap(suite);
+    if (createdRing)
+    {
+      Ring::shutdownForExec();
+    }
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "adopted-uuid-journal") == 0)
   {
     testAdoptedMachineUUIDJournalSurvivesInterruptedBootstrap(suite);
@@ -22629,6 +22780,7 @@ int main(void)
   testUpdateProdigyRejectsDifferentDigestWithoutMutation(suite);
   testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(suite);
   testPersistentMasterAuthorityPackageRestore(suite);
+  testAdoptedMachineRackUpdates(suite);
   testResumePendingAddMachinesOperations(suite);
   testAdoptedMachineUUIDJournalSurvivesInterruptedBootstrap(suite);
   testResumePendingAddMachinesRefreshesProvisionalCreatedMachine(suite);

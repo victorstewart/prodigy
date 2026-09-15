@@ -1632,6 +1632,34 @@ public:
     return (*this == other) == false;
   }
 
+  bool preservesIdentityAndConfigurationForRackUpdate(const ClusterMachine& other) const
+  {
+    if (uuid == 0 || uuid != other.uuid)
+    {
+      return false;
+    }
+
+    if (peerAddresses.size() != other.peerAddresses.size())
+    {
+      return false;
+    }
+
+    for (uint32_t index = 0; index < peerAddresses.size(); ++index)
+    {
+      if (peerAddresses[index] != other.peerAddresses[index])
+      {
+        return false;
+      }
+    }
+
+    return source == other.source && backing == other.backing && kind == other.kind &&
+           lifetime == other.lifetime && isBrain == other.isBrain &&
+           cloudPresent() == other.cloudPresent() &&
+           (cloudPresent() == false || cloud == other.cloud) && ssh == other.ssh &&
+           addresses == other.addresses && creationTimeMs == other.creationTimeMs &&
+           vmImageURI == other.vmImageURI && ownership == other.ownership;
+  }
+
   void renderIdentityLabel(String& label) const
   {
     label.clear();

@@ -92,6 +92,8 @@ int main(void)
   prodigyAppendUniqueClusterMachineAddress(existingBrain.addresses.publicAddresses, "203.0.113.9"_ctv, 24, "203.0.113.1"_ctv);
   prodigyAppendUniqueClusterMachineAddress(existingBrain.addresses.privateAddresses, "10.0.0.10"_ctv, 24, "10.0.0.1"_ctv);
   existingBrain.ownership.mode = ClusterMachineOwnershipMode::wholeMachine;
+  existingBrain.uuid = 0x1001;
+  existingBrain.rackUUID = 77;
   topology.machines.push_back(existingBrain);
 
   AddMachines request = {};
@@ -110,12 +112,15 @@ int main(void)
   suite.expect(request.adoptedMachines[0].rackUUID == adoptedBrain.rackUUID, "reconcile_adopted_rack_propagated");
 
   ClusterMachine duplicateAdopted = existingBrain;
+  ClusterMachine enrichedExistingBrain = existingBrain;
+  enrichedExistingBrain.addresses.privateAddresses[0].gateway.clear();
+  prodigyAppendUniqueClusterMachineAddress(enrichedExistingBrain.addresses.privateAddresses, "10.0.2.15"_ctv, 24, "10.0.2.2"_ctv);
   adoptedBrain.rackUUID = 88;
   cluster.machines.clear();
   cluster.machineSchemas.clear();
   cluster.machineSchemas.push_back(createdSchema);
   topology.machines.clear();
-  topology.machines.push_back(existingBrain);
+  topology.machines.push_back(enrichedExistingBrain);
   cluster.machines.push_back(MothershipProdigyClusterMachine {
       .source = MothershipClusterMachineSource::adopted,
       .backing = duplicateAdopted.backing,
@@ -131,9 +136,30 @@ int main(void)
   request = {};
   failure.clear();
   built = mothershipBuildClusterAddMachinesRequest(cluster, topology, request, &failure);
-  suite.expect(built, "reconcile_duplicate_identity_ok");
-  suite.expect(request.adoptedMachines.size() == 0, "reconcile_duplicate_identity_not_readded");
-  suite.expect(topology.machines[0].rackUUID == 0, "reconcile_duplicate_identity_does_not_mutate_rack");
+  suite.expect(built, "reconcile_known_identity_rack_update_accepts_runtime_gateway_omission");
+  suite.expect(request.adoptedMachines.size() == 1, "reconcile_known_identity_rack_update_emitted");
+  suite.expect(request.adoptedMachines.size() == 1 && request.adoptedMachines[0].uuid == existingBrain.uuid &&
+                   request.adoptedMachines[0].rackUUID == 88,
+               "reconcile_known_identity_rack_update_preserves_uuid");
+  suite.expect(topology.machines[0].rackUUID == 77, "reconcile_known_identity_rack_update_does_not_mutate_topology");
+
+  cluster.machines[0].rackUUID = 77;
+  request = {};
+  failure.clear();
+  built = mothershipBuildClusterAddMachinesRequest(cluster, topology, request, &failure);
+  suite.expect(built, "reconcile_known_identity_unchanged_rack_ok");
+  suite.expect(request.adoptedMachines.empty(), "reconcile_known_identity_unchanged_rack_noop");
+
+  cluster.machines[0].rackUUID = 89;
+  cluster.machines[0].addresses.privateAddresses[0].address.assign("10.0.0.99"_ctv);
+  request = {};
+  failure.clear();
+  built = mothershipBuildClusterAddMachinesRequest(cluster, topology, request, &failure);
+  suite.expect(built == false, "reconcile_known_identity_rack_update_rejects_address_change");
+  suite.expect(failure.equals("adopted rack update requires an unchanged known machine"_ctv), "reconcile_known_identity_rack_update_address_reason");
+  suite.expect(request.adoptedMachines.empty(), "reconcile_known_identity_rack_update_address_has_no_request");
+  cluster.machines[0].addresses.privateAddresses[0].address.assign("10.0.0.10"_ctv);
+  cluster.machines[0].rackUUID = 77;
 
   cluster.nBrains = 5;
   createdSchema.budget = 1;

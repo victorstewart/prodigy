@@ -70,6 +70,60 @@ static inline void mothershipAppendRemovedAdoptedClusterMachines(
   }
 }
 
+static inline bool mothershipDeclaredAddressesMatchTopology(
+    const Vector<ClusterMachineAddress>& declaredAddresses,
+    const Vector<ClusterMachineAddress>& topologyAddresses)
+{
+  Vector<ClusterMachineAddress> normalizedDeclared = {};
+  for (const ClusterMachineAddress& address : declaredAddresses)
+  {
+    prodigyAppendUniqueClusterMachineAddress(normalizedDeclared, address);
+  }
+
+  for (const ClusterMachineAddress& declaredAddress : normalizedDeclared)
+  {
+    bool found = false;
+    for (const ClusterMachineAddress& topologyAddress : topologyAddresses)
+    {
+      ClusterMachineAddress normalizedTopologyAddress = {};
+      if (prodigyNormalizeClusterMachineAddress(topologyAddress, normalizedTopologyAddress) &&
+          normalizedTopologyAddress.address.equals(declaredAddress.address) &&
+          normalizedTopologyAddress.cidr == declaredAddress.cidr)
+      {
+        found = true;
+        break;
+      }
+    }
+
+    if (found == false)
+    {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static inline bool mothershipCanUpdateAdoptedMachineRack(
+    const ClusterMachine& existingMachine,
+    const ClusterMachine& requestedMachine)
+{
+  ClusterMachine candidate = existingMachine;
+  candidate.source = requestedMachine.source;
+  candidate.backing = requestedMachine.backing;
+  candidate.kind = requestedMachine.kind;
+  candidate.lifetime = requestedMachine.lifetime;
+  candidate.isBrain = requestedMachine.isBrain;
+  candidate.hasCloud = requestedMachine.hasCloud;
+  candidate.cloud = requestedMachine.cloud;
+  candidate.ssh = requestedMachine.ssh;
+  candidate.ownership = requestedMachine.ownership;
+  return existingMachine.source == ClusterMachineSource::adopted &&
+         mothershipDeclaredAddressesMatchTopology(requestedMachine.addresses.privateAddresses, existingMachine.addresses.privateAddresses) &&
+         mothershipDeclaredAddressesMatchTopology(requestedMachine.addresses.publicAddresses, existingMachine.addresses.publicAddresses) &&
+         existingMachine.preservesIdentityAndConfigurationForRackUpdate(candidate);
+}
+
 static inline bool mothershipBuildClusterAddMachinesRequest(const MothershipProdigyCluster& cluster, const ClusterTopology& topology, AddMachines& request, String *failure = nullptr)
 {
   request = {};
@@ -106,6 +160,22 @@ static inline bool mothershipBuildClusterAddMachinesRequest(const MothershipProd
       if (existingMachine.sameIdentityAs(requestedMachine))
       {
         alreadyPresent = true;
+        if (requestedMachine.rackUUID != 0 && requestedMachine.rackUUID != existingMachine.rackUUID)
+        {
+          if (mothershipCanUpdateAdoptedMachineRack(existingMachine, requestedMachine) == false)
+          {
+            if (failure)
+            {
+              failure->assign("adopted rack update requires an unchanged known machine"_ctv);
+            }
+            request = {};
+            return false;
+          }
+
+          ClusterMachine rackUpdate = existingMachine;
+          rackUpdate.rackUUID = requestedMachine.rackUUID;
+          request.adoptedMachines.push_back(std::move(rackUpdate));
+        }
         break;
       }
     }
