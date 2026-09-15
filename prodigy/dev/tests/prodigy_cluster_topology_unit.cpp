@@ -349,6 +349,18 @@ int main(void)
     sharedNatTopology.erase(removed, sharedNatTopology.end());
     suite.expect(sharedNatTopology.size() == 1 && sharedNatTopology[0].uuid == sharedNatA.uuid, "cluster_machine_identity_removal_keeps_other_known_uuid_behind_shared_nat");
 
+    Machine sharedNatMachineB = {};
+    sharedNatMachineB.uuid = uint128_t(0xb002);
+    sharedNatMachineB.private4 = IPAddress("10.0.2.15", false).v4;
+    sharedNatMachineB.peerAddresses.push_back(ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24});
+    sharedNatMachineB.peerAddresses.push_back(ClusterMachinePeerAddress {"fd72:6e61:6d65:3::10"_ctv, 64});
+    suite.expect(prodigyClusterMachineMatchesMachineIdentity(sharedNatA, sharedNatMachineB) == false,
+                 "cluster_machine_helper_known_uuid_mismatch_rejects_shared_nat");
+
+    sharedNatMachineB.uuid = 0;
+    suite.expect(prodigyClusterMachineMatchesMachineIdentity(sharedNatA, sharedNatMachineB),
+                 "cluster_machine_helper_zero_uuid_preserves_shared_nat_fallback");
+
     sharedNatA.uuid = 0;
     sharedNatB.uuid = 0;
     suite.expect(sharedNatA.sameIdentityAs(sharedNatB), "cluster_machine_identity_uuid_zero_preserves_shared_nat_fallback");

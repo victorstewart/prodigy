@@ -1599,6 +1599,52 @@ int main(void)
     brain.iaas = new NoopBrainIaaS();
     brain.weAreMaster = true;
     brain.haveStoredTopology = true;
+    brain.storedTopology.version = 12;
+
+    auto makeSharedNatBrain = [](uint128_t uuid, const char *peer6) {
+      ClusterMachine machine = makeMultihomedBrainMachine(uuid, {{"10.0.2.15", 24}, {peer6, 64}});
+      machine.peerAddresses.clear();
+      machine.peerAddresses.push_back(ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24});
+      machine.peerAddresses.push_back(ClusterMachinePeerAddress {String(peer6), 64});
+      return machine;
+    };
+
+    const uint128_t firstUUID = 0x8a01;
+    const uint128_t updatedUUID = 0x8a02;
+    const uint128_t thirdUUID = 0x8a03;
+    brain.storedTopology.machines.push_back(makeSharedNatBrain(firstUUID, "fd72:6e61:6d65:1::10"));
+    brain.storedTopology.machines.push_back(makeSharedNatBrain(updatedUUID, "fd72:6e61:6d65:2::10"));
+    brain.storedTopology.machines.push_back(makeSharedNatBrain(thirdUUID, "fd72:6e61:6d65:3::10"));
+
+    BrainView updatedPeer = {};
+    updatedPeer.uuid = updatedUUID;
+    Vector<ClusterMachinePeerAddress> publishedCandidates = {};
+    publishedCandidates.push_back(ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24});
+    publishedCandidates.push_back(ClusterMachinePeerAddress {"fd72:6e61:6d65:2::20"_ctv, 64});
+
+    suite.expect(brain.updateBrainPeerAddressCandidates(&updatedPeer, publishedCandidates),
+                 "update_peer_candidates_known_uuid_shared_nat_applies");
+    auto containsCandidate = [](const ClusterMachine& machine, const char *address) {
+      return std::any_of(machine.peerAddresses.begin(), machine.peerAddresses.end(), [&](const ClusterMachinePeerAddress& candidate) {
+        return candidate.address.equals(address);
+      });
+    };
+    suite.expect(containsCandidate(brain.storedTopology.machines[0], "fd72:6e61:6d65:1::10") &&
+                     containsCandidate(brain.storedTopology.machines[0], "fd72:6e61:6d65:2::20") == false,
+                 "update_peer_candidates_known_uuid_shared_nat_preserves_first_peer");
+    suite.expect(containsCandidate(brain.storedTopology.machines[1], "fd72:6e61:6d65:2::20") &&
+                     containsCandidate(brain.storedTopology.machines[1], "fd72:6e61:6d65:1::10") == false,
+                 "update_peer_candidates_known_uuid_shared_nat_updates_matching_peer_only");
+    suite.expect(containsCandidate(brain.storedTopology.machines[2], "fd72:6e61:6d65:3::10") &&
+                     containsCandidate(brain.storedTopology.machines[2], "fd72:6e61:6d65:2::20") == false,
+                 "update_peer_candidates_known_uuid_shared_nat_preserves_third_peer");
+  }
+
+  {
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    brain.weAreMaster = true;
+    brain.haveStoredTopology = true;
     brain.storedTopology.version = 4;
     brain.storedTopology.machines.push_back(makeMultihomedBrainMachine(0x777, {
                                                                                   {"2001:db8::81", 64}
