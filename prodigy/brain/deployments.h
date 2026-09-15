@@ -8859,6 +8859,24 @@ public:
             container->whiteholes = plan.whiteholes;
             container->networkAccess = plan.networkAccess;
 
+            uint128_t replaceContainerUUID = 0;
+            if (replacingContainer)
+            {
+              replaceContainerUUID = replacingContainer->uuid;
+
+              // Allocate the successor fragment before releasing its predecessor.
+              // Retire the predecessor's mesh edges before successor setup so the
+              // bootstrap snapshot cannot retain a same-host stale peer. The real
+              // replacement kill still happens through spinContainer below.
+              ApplicationDeployment *destructionOwner = containerDeploymentOwner(replacingContainer);
+              destructionOwner->releaseContainerPlacementCounts(replacingContainer);
+              if (replacingContainer->state == ContainerState::healthy)
+              {
+                replacingContainer->state = ContainerState::aboutToDestroy;
+              }
+              destructionOwner->destructContainer(replacingContainer, false);
+            }
+
             RoutableResourceLeaseOwner whiteholeLeaseOwner = routableResourceLeaseOwner();
             for (Whitehole& whitehole : container->whiteholes)
             {
@@ -8900,23 +8918,6 @@ public:
 
             String buffer;
             BitseryEngine::serialize(buffer, bootstrap);
-
-            uint128_t replaceContainerUUID = 0;
-            if (replacingContainer)
-            {
-              replaceContainerUUID = replacingContainer->uuid;
-
-              // Allocate the successor fragment before releasing its predecessor.
-              // Retirement removes owner indexes; the real kill ack alone deletes
-              // the global view after Neuron has captured the stopped process data.
-              ApplicationDeployment *destructionOwner = containerDeploymentOwner(replacingContainer);
-              destructionOwner->releaseContainerPlacementCounts(replacingContainer);
-              if (replacingContainer->state == ContainerState::healthy)
-              {
-                replacingContainer->state = ContainerState::aboutToDestroy;
-              }
-              destructionOwner->destructContainer(replacingContainer, false);
-            }
 
 #if PRODIGY_DEBUG
             PRODIGY_DEBUG_LOG( "schedule spinContainer deploymentID=%llu appID=%u machinePrivate4=%u containerUUID=%llu replaceUUID=%llu state=%d waitingBefore=%llu\n",
