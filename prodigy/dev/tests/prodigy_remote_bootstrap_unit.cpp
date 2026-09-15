@@ -626,6 +626,19 @@ int main(void)
               &failure),
           "blocking_ssh_session_accepts_pinned_host_key");
       suite.expect(failure.size() == 0, "blocking_ssh_session_accepts_pinned_host_key_clears_failure");
+      if (session != nullptr)
+      {
+        suite.expect(prodigyRunBlockingSSHCommand(session, fd,
+                         "printf 'owned cleanup failure' >&2; exit 7"_ctv,
+                         nullptr, &failure, 5'000) == false,
+                     "blocking_ssh_command_reports_cleanup_failure");
+        suite.expect(stringContains(failure, "stderr: owned cleanup failure"),
+                     "blocking_ssh_command_preserves_cleanup_stderr");
+        suite.expect(prodigyRunBlockingSSHCommand(session, fd, "true"_ctv,
+                         nullptr, &failure, 5'000),
+                     "blocking_ssh_command_succeeds_after_failure");
+        suite.expect(failure.size() == 0, "blocking_ssh_command_success_clears_failure");
+      }
       prodigyCloseBlockingSSHSession(session, fd);
     }
 

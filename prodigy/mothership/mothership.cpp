@@ -2831,60 +2831,6 @@ static void printConnectFailure(void)
   basics_log("failed to connect to mothership: %s\n", std::strerror(errno));
 }
 
-static bool mothershipRunSSHCommand(LIBSSH2_SESSION *session, const String& command, String *failure = nullptr)
-{
-  String commandText = {};
-  commandText.assign(command);
-  LIBSSH2_CHANNEL *channel = libssh2_channel_open_session(session);
-  if (channel == nullptr)
-  {
-    if (failure)
-    {
-      failure->assign("failed to open ssh exec channel");
-    }
-    return false;
-  }
-
-  if (libssh2_channel_exec(channel, commandText.c_str()) != 0)
-  {
-    if (failure)
-    {
-      failure->snprintf<"failed to execute remote command {}"_ctv>(command);
-    }
-    libssh2_channel_free(channel);
-    return false;
-  }
-
-  char scratch[1024];
-  while (libssh2_channel_read(channel, scratch, sizeof(scratch)) > 0)
-  {
-  }
-  while (libssh2_channel_read_stderr(channel, scratch, sizeof(scratch)) > 0)
-  {
-  }
-
-  (void)libssh2_channel_send_eof(channel);
-  (void)libssh2_channel_wait_eof(channel);
-  (void)libssh2_channel_close(channel);
-
-  int exitStatus = libssh2_channel_get_exit_status(channel);
-  libssh2_channel_free(channel);
-  if (exitStatus != 0)
-  {
-    if (failure)
-    {
-      failure->snprintf<"remote command failed: {}"_ctv>(command);
-    }
-    return false;
-  }
-
-  if (failure)
-  {
-    failure->clear();
-  }
-  return true;
-}
-
 static void mothershipAppendSSHSessionLastError(LIBSSH2_SESSION *session, String& failure)
 {
   if (session == nullptr)
@@ -7418,7 +7364,7 @@ private:
     {
       mothershipBuildProdigyStateWipeCommand(defaultProdigyPersistentStateDBPath(), command);
     }
-    bool ok = mothershipRunSSHCommand(session, command, &failure);
+    bool ok = prodigyRunBlockingSSHCommand(session, fd, command, nullptr, &failure, 120'000);
     mothershipCloseSSHSession(session, fd);
     return ok;
   }
@@ -16459,9 +16405,16 @@ private:
 
   void runRemoveCluster(int argc, char *argv[])
   {
-    if (argc < 1)
+    if (argc != 1 && argc != 2)
     {
-      basics_log("too few arguments. ex: removeCluster [name|clusterUUID]\n");
+      basics_log("usage: removeCluster [name|clusterUUID] [--resume-after-dns-teardown]\n");
+      exit(EXIT_FAILURE);
+    }
+
+    const bool resumeAfterDNS = argc == 2 && std::strcmp(argv[1], "--resume-after-dns-teardown") == 0;
+    if (argc == 2 && resumeAfterDNS == false)
+    {
+      basics_log("removeCluster unknown option; use --resume-after-dns-teardown only after confirmed DNS teardown\n");
       exit(EXIT_FAILURE);
     }
 
@@ -16486,9 +16439,10 @@ private:
 
     MothershipClusterRemoveSummary summary = {};
     RemoveClusterHooks hooks(this);
-    if (mothershipRemoveClusterRuntime(cluster, hooks, summary, &failure) == false)
+    if (mothershipRemoveClusterRuntime(cluster, hooks, summary, &failure, resumeAfterDNS ? &name : nullptr) == false)
     {
-      basics_log("removeCluster success=0 removed=0 identity=%s failure=%s\n", name.c_str(), (failure.size() ? failure.c_str() : ""));
+      basics_log("removeCluster success=0 removed=0 identity=%s dnsTeardownCompleted=%u resumedAfterDNS=%u failure=%s\n",
+                 name.c_str(), unsigned(summary.dnsTeardownCompleted), unsigned(resumeAfterDNS), (failure.size() ? failure.c_str() : ""));
       exit(EXIT_FAILURE);
     }
 
@@ -16501,12 +16455,13 @@ private:
       }
     }
 
-    basics_log("removeCluster success=1 removed=1 identity=%s removedDNSRecords=%u wipedLocalMachine=%u wipedAdoptedMachines=%u destroyedCreatedCloudMachines=%u\n",
+    basics_log("removeCluster success=1 removed=1 identity=%s removedDNSRecords=%u wipedLocalMachine=%u wipedAdoptedMachines=%u destroyedCreatedCloudMachines=%u resumedAfterDNS=%u\n",
                name.c_str(),
                unsigned(summary.removedDNSRecords),
                unsigned(summary.stoppedLocalMachine),
                unsigned(summary.wipedAdoptedMachines),
-               unsigned(summary.destroyedCreatedCloudMachines));
+               unsigned(summary.destroyedCreatedCloudMachines),
+               unsigned(resumeAfterDNS));
   }
 
   void runUpdateProdigy(int argc, char *argv[])

@@ -516,5 +516,38 @@ int main(void)
     suite.expect(hooks.destroyCreatedCalls == 0, "remove_remote_cluster_no_destroy_after_adopted_failure");
   }
 
+  {
+    MothershipProdigyCluster cluster = {};
+    cluster.name = "reused-name"_ctv;
+    cluster.clusterUUID = 91;
+    cluster.includeLocalMachine = false;
+    cluster.machines.push_back(makeAdoptedMachine("10.0.2.10"_ctv, true));
+    FakeRemoveHooks hooks = {};
+    hooks.failAdoptedWipe = true;
+    MothershipClusterRemoveSummary summary = {};
+    String failure = {};
+    suite.expect(mothershipRemoveClusterRuntime(cluster, hooks, summary, &failure) == false && summary.dnsTeardownCompleted,
+                 "remove_partial_failure_reports_completed_dns");
+    hooks.failDNSCleanup = true;
+    hooks.failAdoptedWipe = false;
+    suite.expect(mothershipRemoveClusterRuntime(cluster, hooks, summary, &failure) == false && summary.dnsTeardownCompleted == false,
+                 "remove_normal_retry_requires_dns_confirmation");
+    const uint32_t dnsCalls = hooks.removeDNSCalls;
+    const uint32_t wipeCalls = hooks.stopAdoptedCalls;
+    suite.expect(mothershipRemoveClusterRuntime(cluster, hooks, summary, &failure, &cluster.name) == false,
+                 "remove_resume_rejects_reusable_cluster_name");
+    String completedUUID = {};
+    completedUUID.assignItoh(90);
+    suite.expect(mothershipRemoveClusterRuntime(cluster, hooks, summary, &failure, &completedUUID) == false,
+                 "remove_resume_rejects_different_cluster_uuid");
+    suite.expect(hooks.stopAdoptedCalls == wipeCalls && hooks.removeDNSCalls == dnsCalls,
+                 "remove_resume_invalid_identity_has_no_side_effects");
+    completedUUID.assignItoh(cluster.clusterUUID);
+    suite.expect(mothershipRemoveClusterRuntime(cluster, hooks, summary, &failure, &completedUUID),
+                 "remove_resume_finishes_after_confirmed_dns_and_offline_control");
+    suite.expect(summary.dnsTeardownCompleted && hooks.removeDNSCalls == dnsCalls && hooks.stopAdoptedCalls == wipeCalls + 1,
+                 "remove_resume_uses_existing_wipe_without_repeating_dns");
+  }
+
   return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

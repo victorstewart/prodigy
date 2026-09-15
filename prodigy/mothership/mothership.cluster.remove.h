@@ -6,6 +6,7 @@
 class MothershipClusterRemoveSummary {
 public:
 
+  bool dnsTeardownCompleted = false;
   bool stoppedLocalMachine = false;
   uint32_t removedDNSRecords = 0;
   uint32_t wipedAdoptedMachines = 0;
@@ -304,7 +305,7 @@ static inline void mothershipCollectCreatedCloudClusterRemoveMachines(const Moth
   }
 }
 
-static inline bool mothershipRemoveClusterRuntime(const MothershipProdigyCluster& cluster, MothershipClusterRemoveHooks& hooks, MothershipClusterRemoveSummary& summary, String *failure = nullptr)
+static inline bool mothershipRemoveClusterRuntime(const MothershipProdigyCluster& cluster, MothershipClusterRemoveHooks& hooks, MothershipClusterRemoveSummary& summary, String *failure = nullptr, const String *completedDNSClusterUUID = nullptr)
 {
   summary = {};
   if (failure)
@@ -312,10 +313,24 @@ static inline bool mothershipRemoveClusterRuntime(const MothershipProdigyCluster
     failure->clear();
   }
 
-  if (hooks.removeDNSBindings(cluster, summary.removedDNSRecords, failure) == false)
+  if (completedDNSClusterUUID != nullptr)
+  {
+    // Explicit operator recovery for an interrupted removal whose DNS teardown
+    // already succeeded. A reusable name cannot authorize skipping this step
+    // for a replacement cluster; require the exact previously removed UUID.
+    String expectedUUID = {};
+    expectedUUID.assignItoh(cluster.clusterUUID);
+    if (cluster.clusterUUID == 0 || completedDNSClusterUUID->equals(expectedUUID) == false)
+    {
+      if (failure) failure->assign("removal resume requires the exact cluster UUID whose DNS teardown completed"_ctv);
+      return false;
+    }
+  }
+  else if (hooks.removeDNSBindings(cluster, summary.removedDNSRecords, failure) == false)
   {
     return false;
   }
+  summary.dnsTeardownCompleted = true;
 
   if (cluster.deploymentMode == MothershipClusterDeploymentMode::test)
   {
