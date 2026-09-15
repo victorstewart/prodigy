@@ -9,6 +9,8 @@ mothership_bin="${1:-}"
 
 workdir="$(mktemp -d)"
 trap 'rm -rf "${workdir}"' EXIT
+# Never discover or contact a running local cluster from this input test.
+export PRODIGY_MOTHERSHIP_SOCKET="${workdir}/unavailable.sock"
 
 request='{"name":"json-argument-test","provider":"aws","mode":"awsImds","scope":"test/us-east-1","allowPropagateToProdigy":false}'
 request_file="${workdir}/request.json"
@@ -126,4 +128,58 @@ then
 fi
 rg -qx 'upsertApiCredentialSet json input exceeds 4194304 bytes' "${workdir}/api-oversize.log"
 
-echo "PASS: mothership JSON arguments accept inline, stdin, and @file sources and reject invalid paths"
+python3 - "${mothership_bin}" "${workdir}" <<'PY'
+import copy
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+
+binary, directory = sys.argv[1:]
+directory = Path(directory)
+control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+control.bind(str(directory / 'parse-only.sock'))
+# A bound, non-listening socket satisfies target discovery without a live
+# control plane. The absent artifact must stop deploy before any connection.
+env = dict(os.environ, PRODIGY_MOTHERSHIP_SOCKET=str(directory / 'parse-only.sock'),
+           PRODIGY_MOTHERSHIP_TIDESDB_PATH=str(directory / 'parse-only.tidesdb'))
+plan = {
+    'config': {'applicationID': 42, 'versionID': 1,
+               'architecture': os.uname().machine,
+               'type': 'ApplicationType::stateless', 'nLogicalCores': 1,
+               'memoryMB': 64, 'filesystemMB': 64, 'storageMB': 64},
+    'isStateful': False, 'stateless': {'nBase': 1, 'maxPerMachineRatio': 1.0,
+                                     'maxPerRackRatio': 1.0},
+    'apiCredentials': {'applicationID': 42, 'requiredCredentialNames': []},
+}
+missing_blob = directory / 'must-not-exist.artifact.zst'
+assert not missing_blob.exists()
+cases = [('explicit-empty', plan, 'no file exists at containerPath provided')]
+omitted = copy.deepcopy(plan)
+del omitted['apiCredentials']
+cases.append(('omitted-policy', omitted, 'apiCredentials declaration required'))
+missing_names = copy.deepcopy(plan)
+del missing_names['apiCredentials']['requiredCredentialNames']
+cases.append(('omitted-names', missing_names,
+              'apiCredentials.requiredCredentialNames required; use [] only for an application without API credentials'))
+duplicate = copy.deepcopy(plan)
+duplicate['apiCredentials']['requiredCredentialNames'] = ['token', 'token']
+cases.append(('duplicate-names', duplicate,
+              'apiCredentials.requiredCredentialNames contains duplicate name'))
+
+try:
+    for name, candidate, expected in cases:
+        path = directory / (name + '.json')
+        path.write_text(json.dumps(candidate))
+        result = subprocess.run([binary, 'deploy', 'local', '@' + str(path), str(missing_blob)],
+                                env=env, capture_output=True, text=True, timeout=15)
+        output = result.stdout + result.stderr
+        assert result.returncode != 0 and expected in output.splitlines(), (name, result.returncode, output)
+        assert 'mothership control connect' not in output, (name, output)
+finally:
+    control.close()
+PY
+
+echo "PASS: mothership JSON inputs and deploy credential declarations use the active CLI parser"
