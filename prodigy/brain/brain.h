@@ -10602,6 +10602,37 @@ public:
       return false;
     }
 
+    // A restarted local Neuron can announce an empty in-memory inventory before
+    // the recovered bundle registration asks it to replay the durable local
+    // container bootstraps.  That upload cannot release the persisted-inventory
+    // barrier: doing so lets normal scheduling create successors beside the
+    // retained local processes before their authoritative replay arrives.
+    if (updateSelfLocalMachineUUID != 0 && updateSelfLocalContainerBootstraps.empty() == false)
+    {
+      Machine *local = findMachineByUUID(updateSelfLocalMachineUUID);
+      bytell_hash_set<uint128_t> localInventory = {};
+      if (local == nullptr || local->runtimeReady == false ||
+          persistedMachineInventoryUploaded.contains(updateSelfLocalMachineUUID) == false)
+      {
+        return false;
+      }
+      for (const auto& [deploymentID, localContainers] : local->containersByDeploymentID)
+      {
+        (void)deploymentID;
+        for (const ContainerView *container : localContainers)
+        {
+          if (container != nullptr)
+          {
+            localInventory.insert(container->uuid);
+          }
+        }
+      }
+      if (localBundleInventoryIncludesCapturedBootstraps(local, localInventory) == false)
+      {
+        return false;
+      }
+    }
+
     if (mesh == nullptr)
     {
       return false;
@@ -24188,13 +24219,12 @@ public:
     return true;
   }
 
-  bool localBundleInventoryMatches(
+  bool localBundleInventoryIncludesCapturedBootstraps(
       const Machine *machine,
       const bytell_hash_set<uint128_t>& reportedContainerUUIDs) const
   {
     if (machine == nullptr || machine->uuid != updateSelfLocalMachineUUID ||
-        updateSelfLocalBundleRegistered == false ||
-        updateSelfWorkerStateUploadedMachineUUIDs.size() != updateSelfWorkerMachineUUIDs.size())
+        reportedContainerUUIDs.size() < updateSelfLocalContainerBootstraps.size())
     {
       return false;
     }
@@ -24202,10 +24232,6 @@ public:
     // Mothership tunnel provider) that is not part of application deployment
     // replay. Require every captured application identity without rejecting
     // those independently owned live runtimes.
-    if (reportedContainerUUIDs.size() < updateSelfLocalContainerBootstraps.size())
-    {
-      return false;
-    }
     for (const String& serializedBootstrap : updateSelfLocalContainerBootstraps)
     {
       NeuronContainerBootstrap bootstrap = {};
@@ -24216,6 +24242,16 @@ public:
       }
     }
     return true;
+  }
+
+  bool localBundleInventoryMatches(
+      const Machine *machine,
+      const bytell_hash_set<uint128_t>& reportedContainerUUIDs) const
+  {
+    return machine != nullptr && machine->uuid == updateSelfLocalMachineUUID &&
+           updateSelfLocalBundleRegistered &&
+           updateSelfWorkerStateUploadedMachineUUIDs.size() == updateSelfWorkerMachineUUIDs.size() &&
+           localBundleInventoryIncludesCapturedBootstraps(machine, reportedContainerUUIDs);
   }
 
   void completeLocalBundleExecRecovery(void)
@@ -30986,7 +31022,7 @@ public:
             break;
           }
           const bool localBrainRefresh = localBundleRefresh || localNeuronStateRefreshMayBypassIgnition(machine, haveData);
-          needsStateRefresh = needsStateRefresh || workerBundleRefresh || machineNeedsNeuronStateRefresh(machine);
+          needsStateRefresh = needsStateRefresh || workerBundleRefresh || localBundleRefresh || machineNeedsNeuronStateRefresh(machine);
 
           if (haveData == false || needsStateRefresh) // either 1) first time the neuron is connecting or 2) neuron crashed or 3) neuron was updated or 4) OS updated
           {

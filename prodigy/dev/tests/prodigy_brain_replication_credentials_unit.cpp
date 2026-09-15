@@ -21324,6 +21324,116 @@ static void testPersistedLocalBrainRefreshBypassesIgnition(TestSuite& suite)
   brain.machines.erase(&machine);
 }
 
+static void testLocalBundleRecoveryWaitsForCapturedInventory(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+  TestBrain brain = {};
+  BrainBase *previousBrain = thisBrain;
+  thisBrain = &brain;
+  brain.brainConfig.datacenterFragment = 1;
+  brain.recoveringPersistedNeuronInventory = true;
+  brain.persistedMachineInventoryEnumerated = true;
+
+  Machine local = {};
+  local.uuid = uint128_t(0x52190001);
+  local.isThisMachine = true;
+  local.state = MachineState::deploying;
+  local.fragment = 0x123a;
+  local.reportedDatacenterFragment = 1;
+  local.reportedFragment = local.fragment;
+  local.runtimeReady = true;
+  local.neuron.machine = &local;
+  local.hardware.inventoryComplete = true;
+  local.hardware.cpu.logicalCores = 2;
+  local.hardware.memory.totalMB = 4096;
+  brain.machines.insert(&local);
+  brain.machinesByUUID.insert_or_assign(local.uuid, &local);
+  brain.neurons.insert(&local.neuron);
+
+  const String digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
+  ContainerPlan retainedPlan = {};
+  retainedPlan.uuid = uint128_t(0x52190002);
+  retainedPlan.fragment = 7;
+  retainedPlan.config = makeDeploymentPlan(52'019, 1).config;
+  NeuronContainerBootstrap retainedBootstrap = {};
+  retainedBootstrap.plan = retainedPlan;
+  String serializedBootstrap = {};
+  BitseryEngine::serialize(serializedBootstrap, retainedBootstrap);
+
+  brain.updateSelfWorkerExpectedBundleSHA256 = digest;
+  brain.updateSelfLocalMachineUUID = local.uuid;
+  brain.updateSelfLocalMachineFragment = local.fragment;
+  brain.updateSelfLocalContainerBootstraps.push_back(serializedBootstrap);
+
+  String emptyUpload = {};
+  uint32_t headerOffset = Message::appendHeader(emptyUpload, NeuronTopic::stateUpload);
+  local_container_subnet6 fragment = {};
+  fragment.dpfx = 1;
+  fragment.mpfx[0] = static_cast<uint8_t>((local.fragment >> 16) & 0xff);
+  fragment.mpfx[1] = static_cast<uint8_t>((local.fragment >> 8) & 0xff);
+  fragment.mpfx[2] = static_cast<uint8_t>(local.fragment & 0xff);
+  Message::appendAlignedBuffer<Alignment::one>(emptyUpload, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
+  Message::finish(emptyUpload, headerOffset);
+  brain.neuronHandler(&local.neuron, reinterpret_cast<Message *>(emptyUpload.data()));
+
+  suite.expect(brain.persistedMachineInventoryUploaded.contains(local.uuid) &&
+                   brain.finalizePersistedNeuronInventoryRecovery() == false &&
+                   brain.recoveringPersistedNeuronInventory,
+               "local_bundle_recovery_empty_spontaneous_upload_keeps_inventory_barrier");
+  suite.expect(local.containersByDeploymentID.size() == 0 && brain.containers.empty(),
+               "local_bundle_recovery_empty_spontaneous_upload_does_not_adopt_or_schedule_successor");
+
+  String registration = {};
+  Message *registrationMessage = buildNeuronMessage(
+      registration,
+      NeuronTopic::registration,
+      int64_t(1'700'000'000'019),
+      "linux-6.10.0"_ctv,
+      "ubuntu"_ctv,
+      "24.04"_ctv,
+      true,
+      digest);
+  brain.neuronHandler(&local.neuron, registrationMessage);
+
+  uint32_t queuedUploads = 0;
+  NeuronContainerBootstrap queuedBootstrap = {};
+  forEachMessageInBuffer(local.neuron.wBuffer, [&](Message *queued) {
+    if (NeuronTopic(queued->topic) != NeuronTopic::stateUpload)
+    {
+      return;
+    }
+    queuedUploads += 1;
+    uint8_t *args = queued->args;
+    local_container_subnet6 queuedFragment = {};
+    Message::extractBytes<Alignment::one>(args, reinterpret_cast<uint8_t *>(&queuedFragment), sizeof(queuedFragment));
+    String serialized = {};
+    Message::extractToStringView(args, serialized);
+    BitseryEngine::deserializeSafe(serialized, queuedBootstrap);
+  });
+  suite.expect(queuedUploads == 1 && queuedBootstrap.plan.uuid == retainedPlan.uuid,
+               "local_bundle_recovery_registration_queues_captured_bootstrap_refresh");
+
+  ContainerView retained = {};
+  retained.uuid = retainedPlan.uuid;
+  retained.deploymentID = retainedPlan.config.deploymentID();
+  retained.machine = &local;
+  local.upsertContainerIndexEntry(retained.deploymentID, &retained);
+  brain.containers.insert_or_assign(retained.uuid, &retained);
+  local.runtimeReady = true;
+  brain.persistedMachineInventoryUploaded.insert(local.uuid);
+
+  suite.expect(brain.finalizePersistedNeuronInventoryRecovery() &&
+                   brain.recoveringPersistedNeuronInventory == false,
+               "local_bundle_recovery_captured_inventory_releases_barrier_only_after_replay");
+
+  local.removeContainerIndexEntry(retained.deploymentID, &retained);
+  brain.containers.erase(retained.uuid);
+  brain.neurons.erase(&local.neuron);
+  brain.machinesByUUID.erase(local.uuid);
+  brain.machines.erase(&local);
+  thisBrain = previousBrain;
+}
+
 static void testBrainNeuronHandlerReportsHardwareFailureAndDecommissionsMachine(TestSuite& suite)
 {
   TestBrain brain = {};
@@ -22670,6 +22780,16 @@ int main(void)
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "local-bundle-recovery-ordering") == 0)
+  {
+    testLocalBundleRecoveryWaitsForCapturedInventory(suite);
+    testBrainNeuronRegistrationKeepsHealthyRuntimeReadyWithoutRefresh(suite);
+    testBrainNeuronRegistrationRefreshesWorkerAfterBundleTransition(suite);
+    testPersistedLocalBrainRefreshBypassesIgnition(suite);
+    testMachineHealthyDefersStatelessRecoveryUntilInventoryComplete(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "neuron-whitehole-peer-initialization") == 0)
   {
     testNeuronWhiteholeBindingBookkeepingWithoutPrograms(suite);
@@ -23026,6 +23146,7 @@ int main(void)
   testBrainNeuronRegistrationKeepsHealthyRuntimeReadyWithoutRefresh(suite);
   testBrainNeuronRegistrationRefreshesWorkerAfterBundleTransition(suite);
   testPersistedLocalBrainRefreshBypassesIgnition(suite);
+  testLocalBundleRecoveryWaitsForCapturedInventory(suite);
   testBrainNeuronHandlerReportsHardwareFailureAndDecommissionsMachine(suite);
   testBrainMachineStateMissingEscalatesWhenSshBudgetExhausted(suite);
   testBrainSoftEscalationTimeoutPromotesMachineToHardReboot(suite);
