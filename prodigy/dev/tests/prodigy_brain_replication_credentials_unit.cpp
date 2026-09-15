@@ -504,6 +504,19 @@ public:
 class StreamingTestBrain final : public TestBrain {
 public:
 
+  ClusterTopology authoritativeTopology = {};
+  bool hasAuthoritativeTopology = false;
+
+  bool loadAuthoritativeClusterTopology(ClusterTopology& topology) const override
+  {
+    if (hasAuthoritativeTopology == false)
+    {
+      return false;
+    }
+    topology = authoritativeTopology;
+    return true;
+  }
+
   void pushSpinApplicationProgressToMothership(ApplicationDeployment *deployment, const String& message) override
   {
     Mothership *stream = spinApplicationMothershipFor(deployment);
@@ -3506,6 +3519,208 @@ static void testSpinApplicationReplicatesInitialBlobWithPlan(TestSuite& suite)
     brain.deployments.erase(it);
   }
   delete previous;
+}
+
+static uint32_t countTopicFrames(String& buffer, BrainTopic topic)
+{
+  uint32_t count = 0;
+  forEachMessageInBuffer(buffer, [&](Message *frame) {
+    if (BrainTopic(frame->topic) == topic)
+    {
+      count += 1;
+    }
+  });
+  return count;
+}
+
+static void testInitialDeploymentWaitsForDurableAuthoritativePeerReplication(TestSuite& suite)
+{
+  StreamingTestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  Mothership mothership = {};
+  TestNeuron self = {};
+  const uint128_t selfUUID = 0x62'020'01;
+  const uint128_t followerAUUID = 0x62'020'02;
+  const uint128_t followerBUUID = 0x62'020'03;
+  self.uuid = selfUUID;
+
+  NeuronBase *previousNeuron = thisNeuron;
+  BrainBase *previousBrain = thisBrain;
+  thisNeuron = &self;
+  thisBrain = &brain;
+
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  brain.nBrains = 3;
+  brain.mothership = &mothership;
+  mothership.isFixedFile = true;
+  mothership.fslot = 1;
+  brain.hasAuthoritativeTopology = true;
+  for (uint128_t uuid : {selfUUID, followerAUUID, followerBUUID})
+  {
+    ClusterMachine machine = {};
+    machine.isBrain = true;
+    machine.uuid = uuid;
+    brain.authoritativeTopology.machines.push_back(std::move(machine));
+  }
+
+  BrainView followerA = {};
+  followerA.uuid = followerAUUID;
+  followerA.connected = true;
+  followerA.isFixedFile = true;
+  followerA.fslot = 11;
+  BrainView followerB = {};
+  followerB.connected = false; // Wizard is unavailable when the master accepts the deployment.
+  followerB.isFixedFile = true;
+  followerB.fslot = -1;
+  brain.brains.insert(&followerA);
+  brain.brains.insert(&followerB);
+
+  DeploymentPlan plan = {};
+  seedDeployRequestPlan(plan, 62'020);
+  String reserveFailure = {};
+  suite.require(brain.reserveApplicationIDMapping("DurableReplicationGate"_ctv, plan.config.applicationID, &reserveFailure),
+                "initial_deployment_replication_reserves_application");
+
+  String serializedPlan = {};
+  BitseryEngine::serialize(serializedPlan, plan);
+  String containerBlob = prodigyDiscombobulatorBlobHeaderText();
+  containerBlob.append("initial-deployment-durable-replication"_ctv);
+  ContainerStore::destroy(plan.config.deploymentID());
+
+  String requestBuffer = {};
+  Message *request = buildMothershipMessage(
+      requestBuffer,
+      MothershipTopic::spinApplication,
+      uint16_t(plan.config.applicationID),
+      serializedPlan,
+      containerBlob);
+  brain.mothershipHandler(&mothership, request);
+
+  auto deploymentIt = brain.deployments.find(plan.config.deploymentID());
+  ApplicationDeployment *deployment = deploymentIt != brain.deployments.end() ? deploymentIt->second : nullptr;
+  suite.require(deployment != nullptr, "initial_deployment_replication_admits_plan");
+  if (deployment == nullptr)
+  {
+    thisBrain = previousBrain;
+    thisNeuron = previousNeuron;
+    return;
+  }
+  suite.expect(countTopicFrames(followerA.wBuffer, BrainTopic::replicateDeployment) == 1,
+               "initial_deployment_replication_sends_active_follower_full_blob");
+  suite.expect(countTopicFrames(followerB.wBuffer, BrainTopic::replicateDeployment) == 0,
+               "initial_deployment_replication_does_not_treat_inactive_follower_as_delivered");
+  suite.expect(deployment->state == DeploymentState::none,
+               "initial_deployment_replication_does_not_start_before_all_authoritative_peers_ack");
+
+  String echoBuffer = {};
+  brain.brainHandler(&followerA, buildBrainMessage(echoBuffer, BrainTopic::replicateDeployment, plan.config.deploymentID()));
+  brain.brainHandler(&followerA, buildBrainMessage(echoBuffer, BrainTopic::replicateDeployment, plan.config.deploymentID()));
+  suite.expect(deployment->brainBlobEchoPeerKeys.contains(followerAUUID),
+               "initial_deployment_replication_records_first_authoritative_follower_ack");
+  suite.expect(deployment->state == DeploymentState::none,
+               "initial_deployment_replication_keeps_plan_blocked_until_inactive_follower_rejoins");
+  brain.deploymentsWaitingForDNS.insert(plan.config.deploymentID());
+  brain.resumeDNSReadyDeployments();
+  suite.expect(deployment->state == DeploymentState::none &&
+                   brain.deploymentsWaitingForDNS.contains(plan.config.deploymentID()),
+               "initial_deployment_replication_dns_resume_keeps_authoritative_replication_gate");
+
+  followerB.connected = true;
+  followerB.fslot = 12;
+  String registrationBuffer = {};
+  brain.brainHandler(
+      &followerB,
+      buildBrainMessage(registrationBuffer,
+                        BrainTopic::registration,
+                        followerBUUID,
+                        int64_t(1),
+                        uint64_t(ProdigyBinaryVersion),
+                        selfUUID,
+                        "test-kernel"_ctv,
+                        "test-os"_ctv,
+                        "test-version"_ctv));
+  suite.expect(countTopicFrames(followerB.wBuffer, BrainTopic::replicateDeployment) == 1,
+               "initial_deployment_replication_registration_replays_missing_plan_to_known_uuid");
+
+  brain.brainHandler(&followerB, buildBrainMessage(echoBuffer, BrainTopic::replicateDeployment, plan.config.deploymentID()));
+  suite.expect(deployment->state == DeploymentState::none,
+               "initial_deployment_replication_first_replay_echo_only_queues_store_backed_completion");
+  brain.brainHandler(&followerB, buildBrainMessage(echoBuffer, BrainTopic::replicateDeployment, plan.config.deploymentID()));
+  suite.expect(deployment->brainBlobEchoPeerKeys.contains(followerBUUID),
+               "initial_deployment_replication_records_rejoined_follower_durable_ack");
+  suite.expect(deployment->state != DeploymentState::none,
+               "initial_deployment_replication_starts_once_all_known_uuid_acks_are_durable");
+
+  ContainerStore::destroy(plan.config.deploymentID());
+  if (auto it = brain.deployments.find(plan.config.deploymentID()); it != brain.deployments.end())
+  {
+    delete it->second;
+    brain.deployments.erase(it);
+  }
+  brain.deploymentsByApp.erase(plan.config.applicationID);
+  brain.deploymentPlans.erase(plan.config.deploymentID());
+
+  // A metadata-only plan still needs durable copies on the same peers.
+  ApplicationDeployment *metadata = new ApplicationDeployment();
+  metadata->plan = plan;
+  metadata->plan.config.versionID = 2;
+  const uint64_t metadataID = metadata->plan.config.deploymentID();
+  brain.deployments.insert_or_assign(metadataID, metadata);
+  brain.deploymentPlans.insert_or_assign(metadataID, metadata->plan);
+  brain.deploymentsWaitingForDNS.insert(metadataID);
+  brain.resumeDNSReadyDeployments();
+  suite.expect(metadata->state == DeploymentState::none,
+               "metadata_only_deployment_waits_for_authoritative_peer_acks");
+  brain.brainHandler(&followerA, buildBrainMessage(echoBuffer, BrainTopic::replicateDeployment, metadataID));
+  brain.brainHandler(&followerA, buildBrainMessage(echoBuffer, BrainTopic::replicateDeployment, metadataID));
+  suite.expect(metadata->state == DeploymentState::none && metadata->brainBlobEchoPeerKeys.size() == 1,
+               "metadata_only_deployment_rejects_duplicate_peer_ack_as_quorum");
+  const uint32_t priorReplayFrames = countTopicFrames(followerB.wBuffer, BrainTopic::replicateDeployment);
+  brain.brainHandler(
+      &followerB,
+      buildBrainMessage(registrationBuffer, BrainTopic::registration, followerBUUID,
+                        int64_t(1), uint64_t(ProdigyBinaryVersion), selfUUID,
+                        "test-kernel"_ctv, "test-os"_ctv, "test-version"_ctv));
+  suite.expect(countTopicFrames(followerB.wBuffer, BrainTopic::replicateDeployment) == priorReplayFrames + 1,
+               "metadata_only_deployment_replays_on_registration");
+  brain.brainHandler(&followerB, buildBrainMessage(echoBuffer, BrainTopic::replicateDeployment, metadataID));
+  suite.expect(metadata->state != DeploymentState::none && metadata->brainBlobEchoPeerKeys.size() == 2,
+               "metadata_only_deployment_starts_after_distinct_durable_peer_acks");
+  brain.deployments.erase(metadataID);
+  brain.deploymentsByApp.erase(plan.config.applicationID);
+  brain.deploymentPlans.erase(metadataID);
+  delete metadata;
+
+  thisBrain = previousBrain;
+  thisNeuron = previousNeuron;
+}
+
+static void testReplicatedDeploymentAcknowledgesOnlyAfterDurablePersistence(TestSuite& suite)
+{
+  TestBrain follower = {};
+  NoopBrainIaaS iaas = {};
+  follower.iaas = &iaas;
+
+  BrainView master = {};
+  authorizeMasterPeerForTest(follower, master, 21, uint128_t(0x62'021'01), 62'021);
+  DeploymentPlan plan = {};
+  seedDeployRequestPlan(plan, 62'021);
+  String serializedPlan = {};
+  BitseryEngine::serialize(serializedPlan, plan);
+  String messageBuffer = {};
+
+  follower.persistSucceeds = false;
+  follower.brainHandler(&master, buildBrainMessage(messageBuffer, BrainTopic::replicateDeployment, serializedPlan, ""_ctv));
+  suite.expect(master.wBuffer.empty(),
+               "replicated_deployment_does_not_ack_before_persistence_succeeds");
+
+  follower.persistSucceeds = true;
+  follower.brainHandler(&master, buildBrainMessage(messageBuffer, BrainTopic::replicateDeployment, serializedPlan, ""_ctv));
+  suite.expect(master.wBuffer.empty() == false,
+               "replicated_deployment_acks_after_persistence_succeeds");
+  follower.deploymentPlans.erase(plan.config.deploymentID());
 }
 
 static void testStatefulRequestMachinesClaimsDeployingMachinesWithSpecializedTicket(TestSuite& suite)
@@ -23416,6 +23631,16 @@ int main(void)
   TestSuite suite;
 
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "initial-deployment-durable-replication") == 0)
+  {
+    testSpinApplicationStagesFollowerBlobReplicationBehindMetadataEcho(suite);
+    testSpinApplicationReplicatesInitialBlobWithPlan(suite);
+    testInitialDeploymentWaitsForDurableAuthoritativePeerReplication(suite);
+    testReplicatedDeploymentAcknowledgesOnlyAfterDurablePersistence(suite);
+    testCertificateLifecycleSchedulers(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "neuron-kill-pending-restart") == 0)
   {
     testNeuronHandlerKillContainerStopsContainerAndEchoesBrain(suite);
@@ -23672,6 +23897,8 @@ int main(void)
   testSpinApplicationProgressStaysOnOriginalDeployStream(suite);
   testSpinApplicationStagesFollowerBlobReplicationBehindMetadataEcho(suite);
   testSpinApplicationReplicatesInitialBlobWithPlan(suite);
+  testInitialDeploymentWaitsForDurableAuthoritativePeerReplication(suite);
+  testReplicatedDeploymentAcknowledgesOnlyAfterDurablePersistence(suite);
   testLargePayloadPeerKeepaliveUsesFixedFileSocketCommand(suite);
   testAcceptedBrainPeerSetsLargePayloadUserTimeout(suite);
   testStatefulRequestMachinesClaimsDeployingMachinesWithSpecializedTicket(suite);

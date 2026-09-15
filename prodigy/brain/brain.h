@@ -9748,6 +9748,144 @@ public:
     Ring::queueTimeout(&dnsReconcileRetry);
   }
 
+  bool deploymentReplicationAcknowledgedByAuthoritativePeers(const ApplicationDeployment *deployment) const
+  {
+    if (deployment == nullptr)
+    {
+      return true;
+    }
+
+    ClusterTopology topology = {};
+    if (loadAuthoritativeClusterTopology(topology) == false)
+    {
+      // The one-Brain bootstrap path predates topology persistence and has no
+      // remote peer that can acknowledge this deployment.
+      return nBrains <= 1;
+    }
+
+    uint32_t configuredBrains = 0;
+    for (const ClusterMachine& machine : topology.machines)
+    {
+      configuredBrains += machine.isBrain ? 1 : 0;
+    }
+    if (nBrains <= 1)
+    {
+      return configuredBrains <= 1;
+    }
+
+    const uint128_t localUUID = selfBrainUUID();
+    if (localUUID == 0)
+    {
+      return false;
+    }
+
+    uint32_t expectedBrains = 0;
+    uint32_t localBrains = 0;
+    bytell_hash_set<uint128_t> expectedPeerUUIDs = {};
+    for (const ClusterMachine& machine : topology.machines)
+    {
+      if (machine.isBrain == false || machine.uuid == 0)
+      {
+        continue;
+      }
+      expectedBrains += 1;
+      if (machine.uuid == localUUID)
+      {
+        localBrains += 1;
+        continue;
+      }
+      if (expectedPeerUUIDs.insert(machine.uuid).second == false ||
+          deployment->brainBlobEchoPeerKeys.contains(machine.uuid) == false)
+      {
+        return false;
+      }
+    }
+
+    return localBrains == 1 && expectedBrains == nBrains &&
+           expectedPeerUUIDs.size() + 1 == expectedBrains;
+  }
+
+  bool startDeploymentAfterAuthoritativeReplication(ApplicationDeployment *deployment)
+  {
+    if (deployment == nullptr || deployment->state != DeploymentState::none)
+    {
+      return false;
+    }
+
+    if (deploymentReplicationAcknowledgedByAuthoritativePeers(deployment) == false)
+    {
+      pushSpinApplicationProgressToMothership(
+          deployment,
+          "waiting for durable deployment replication to authoritative Brain peers"_ctv);
+      return false;
+    }
+
+    if (deploymentDNSReady(deployment->plan.config.deploymentID()) == false)
+    {
+      deploymentsWaitingForDNS.insert(deployment->plan.config.deploymentID());
+      pushSpinApplicationProgressToMothership(deployment, "waiting for authoritative DNS reconciliation"_ctv);
+      return false;
+    }
+
+    spinApplication(deployment);
+    return true;
+  }
+
+  bool authoritativeTopologyContainsRemoteBrainUUID(uint128_t uuid) const
+  {
+    if (uuid == 0 || uuid == selfBrainUUID())
+    {
+      return false;
+    }
+
+    ClusterTopology topology = {};
+    if (loadAuthoritativeClusterTopology(topology) == false)
+    {
+      return false;
+    }
+
+    for (const ClusterMachine& machine : topology.machines)
+    {
+      if (machine.isBrain && machine.uuid == uuid)
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void replayUnacknowledgedDeploymentsToRegisteredBrain(BrainView *brain)
+  {
+    if (weAreMaster == false || peerSocketActive(brain) == false ||
+        authoritativeTopologyContainsRemoteBrainUUID(brain->uuid) == false)
+    {
+      return;
+    }
+
+    for (const auto& [deploymentID, deployment] : deployments)
+    {
+      (void)deploymentID;
+      if (deployment == nullptr || deployment->brainBlobEchoPeerKeys.contains(brain->uuid))
+      {
+        continue;
+      }
+
+      String serializedPlan = {};
+      BitseryEngine::serialize(serializedPlan, deployment->plan);
+      const bool queued = deployment->plan.config.containerBlobBytes > 0 ?
+          queueBrainDeploymentReplicationFromStoreToPeer(
+              brain,
+              serializedPlan,
+              deployment->plan.config.deploymentID(),
+              deployment->plan.config.containerBlobBytes) :
+          queueBrainDeploymentReplicationToPeer(brain, serializedPlan, ""_ctv);
+      if (queued == false)
+      {
+        break;
+      }
+    }
+  }
+
   void resumeDNSReadyDeployments(void)
   {
     for (auto it = deploymentsWaitingForDNS.begin(); it != deploymentsWaitingForDNS.end();)
@@ -9759,10 +9897,24 @@ public:
         continue;
       }
       auto deployment = deployments.find(deploymentID);
-      it = deploymentsWaitingForDNS.erase(it);
-      if (deployment != deployments.end() && deployment->second != nullptr)
+      if (deployment != deployments.end() && deployment->second != nullptr &&
+          deployment->second->state == DeploymentState::waitingToDeploy)
       {
+        // This successor already passed admission before it was queued. Its
+        // persisted DNS wait must still resume after predecessor recovery.
+        it = deploymentsWaitingForDNS.erase(it);
         spinApplication(deployment->second);
+        continue;
+      }
+      if (deployment == deployments.end() || deployment->second == nullptr ||
+          deployment->second->state != DeploymentState::none ||
+          startDeploymentAfterAuthoritativeReplication(deployment->second))
+      {
+        it = deploymentsWaitingForDNS.erase(it);
+      }
+      else
+      {
+        ++it;
       }
     }
   }
@@ -25269,21 +25421,16 @@ public:
                 break;
               }
 
-              if (requiresBlobEcho && peerKey != 0)
+              if (peerKey == 0 || deployment->brainBlobEchoPeerKeys.contains(peerKey))
               {
-                if (deployment->brainBlobEchoPeerKeys.contains(peerKey))
-                {
-                  break;
-                }
-
-                deployment->brainBlobEchoPeerKeys.insert(peerKey);
+                break;
               }
 
+              deployment->brainBlobEchoPeerKeys.insert(peerKey);
               deployment->brainEchos += 1;
-
-              if (deployment->brainEchos == 2 && deployment->state == DeploymentState::none) // what if a brain dies during this??? then when it comes back online and gets replicated the deployments it will echo back to us
+              if (startDeploymentAfterAuthoritativeReplication(deployment))
               {
-                spinApplication(deployment);
+                deploymentsWaitingForDNS.erase(deployment->plan.config.deploymentID());
               }
             }
           }
@@ -25316,17 +25463,19 @@ public:
             String containerBlob;
             Message::extractToStringView(args, containerBlob);
 
+            bool stored = true;
             if (containerBlob.size() > 0)
             {
               String storeFailure = {};
-              if (ContainerStore::store(
-                      deploymentID,
-                      containerBlob,
-                      nullptr,
-                      nullptr,
-                      &plan.config.containerBlobSHA256,
-                      &plan.config.containerBlobBytes,
-                      &storeFailure) == false)
+              stored = ContainerStore::store(
+                  deploymentID,
+                  containerBlob,
+                  nullptr,
+                  nullptr,
+                  &plan.config.containerBlobSHA256,
+                  &plan.config.containerBlobBytes,
+                  &storeFailure);
+              if (stored == false)
               {
                 basics_log(
                     "replicateDeployment blob store failed deploymentID=%llu reason=%s\n",
@@ -25336,8 +25485,10 @@ public:
             }
             // else this replication carried only metadata (e.g. no-op image reuse path)
 
-            Message::construct(bv->wBuffer, BrainTopic::replicateDeployment, plan.config.deploymentID());
-            persistLocalRuntimeState();
+            if (stored && persistLocalRuntimeState())
+            {
+              Message::construct(bv->wBuffer, BrainTopic::replicateDeployment, plan.config.deploymentID());
+            }
           }
 
           break;
@@ -25548,6 +25699,7 @@ public:
             PRODIGY_DEBUG_FLUSH();
           }
           synchronizeBrainUUIDToMachine(bv);
+          replayUnacknowledgedDeploymentsToRegisteredBrain(bv);
           refreshBrainPeerHandshakeWatchdog(bv, "registration");
           if (isActiveMaster() && bv->machine != nullptr)
           {
@@ -31070,15 +31222,7 @@ public:
 
           // The deploy CLI waits for the initial okay/invalidPlan frame before it starts
           // consuming streamed progress on the same topic.
-          if (deploymentDNSReady(deployment->plan.config.deploymentID()))
-          {
-            spinApplication(deployment);
-          }
-          else
-          {
-            deploymentsWaitingForDNS.insert(deployment->plan.config.deploymentID());
-            pushSpinApplicationProgressToMothership(deployment, "waiting for authoritative DNS reconciliation"_ctv);
-          }
+          (void)startDeploymentAfterAuthoritativeReplication(deployment);
 
           break;
         }
