@@ -54,6 +54,7 @@ int main(void)
   prodigyAppendUniqueClusterMachineAddress(adoptedBrain.addresses.publicAddresses, "203.0.113.10"_ctv);
   prodigyAppendUniqueClusterMachineAddress(adoptedBrain.addresses.privateAddresses, "10.0.0.11"_ctv);
   adoptedBrain.ownership.mode = ClusterMachineOwnershipMode::wholeMachine;
+  adoptedBrain.uuid = 0x2002;
   adoptedBrain.rackUUID = 77;
   cluster.machines.push_back(adoptedBrain);
 
@@ -109,6 +110,7 @@ int main(void)
   suite.expect(request.adoptedMachines[0].cloud.schema.equals(adoptedBrain.cloud.schema), "reconcile_adopted_machine_schema");
   suite.expect(request.adoptedMachines[0].cloud.cloudID.equals(adoptedBrain.cloud.cloudID), "reconcile_adopted_cloud_id");
   suite.expect(request.adoptedMachines[0].isBrain, "reconcile_adopted_is_brain");
+  suite.expect(request.adoptedMachines[0].uuid == adoptedBrain.uuid, "reconcile_adopted_explicit_uuid_propagated");
   suite.expect(request.adoptedMachines[0].rackUUID == adoptedBrain.rackUUID, "reconcile_adopted_rack_propagated");
 
   ClusterMachine duplicateAdopted = existingBrain;
@@ -131,6 +133,7 @@ int main(void)
       .ssh = duplicateAdopted.ssh,
       .addresses = duplicateAdopted.addresses,
       .ownership = duplicateAdopted.ownership,
+      .uuid = duplicateAdopted.uuid,
       .rackUUID = adoptedBrain.rackUUID});
 
   request = {};
@@ -150,6 +153,31 @@ int main(void)
   suite.expect(built, "reconcile_known_identity_unchanged_rack_ok");
   suite.expect(request.adoptedMachines.empty(), "reconcile_known_identity_unchanged_rack_noop");
 
+  cluster.machines[0].ssh.address.assign("203.0.113.99"_ctv);
+  request = {};
+  failure.clear();
+  built = mothershipBuildClusterAddMachinesRequest(cluster, topology, request, &failure);
+  suite.expect(built == false, "reconcile_explicit_uuid_rejects_changed_identity");
+  suite.expect(failure.equals("adopted explicit UUID requires an unchanged known machine"_ctv), "reconcile_explicit_uuid_changed_identity_reason");
+  suite.expect(request.adoptedMachines.empty(), "reconcile_explicit_uuid_changed_identity_has_no_request");
+  cluster.machines[0].ssh.address = duplicateAdopted.ssh.address;
+
+  MothershipProdigyClusterMachine sameNatOtherMachine = cluster.machines[0];
+  sameNatOtherMachine.uuid = 0x3003;
+  sameNatOtherMachine.cloud.cloudID.assign("789654123000333"_ctv);
+  sameNatOtherMachine.ssh.address.assign("fd72:6e61:6d65:2::10"_ctv);
+  sameNatOtherMachine.addresses.privateAddresses.clear();
+  prodigyAppendUniqueClusterMachineAddress(sameNatOtherMachine.addresses.privateAddresses, "10.0.2.15"_ctv, 24, "10.0.2.2"_ctv);
+  cluster.machines.push_back(sameNatOtherMachine);
+  request = {};
+  failure.clear();
+  built = mothershipBuildClusterAddMachinesRequest(cluster, topology, request, &failure);
+  suite.expect(built, "reconcile_explicit_uuid_distinguishes_shared_nat");
+  suite.expect(request.adoptedMachines.size() == 1 && request.adoptedMachines[0].uuid == sameNatOtherMachine.uuid,
+               "reconcile_explicit_uuid_shared_nat_added");
+  cluster.machines.pop_back();
+
+  cluster.machines[0].uuid = 0; // Preserve legacy address-only rack validation.
   cluster.machines[0].rackUUID = 89;
   cluster.machines[0].addresses.privateAddresses[0].address.assign("10.0.0.99"_ctv);
   request = {};
@@ -160,6 +188,7 @@ int main(void)
   suite.expect(request.adoptedMachines.empty(), "reconcile_known_identity_rack_update_address_has_no_request");
   cluster.machines[0].addresses.privateAddresses[0].address.assign("10.0.0.10"_ctv);
   cluster.machines[0].rackUUID = 77;
+  cluster.machines[0].uuid = duplicateAdopted.uuid;
 
   cluster.nBrains = 5;
   createdSchema.budget = 1;

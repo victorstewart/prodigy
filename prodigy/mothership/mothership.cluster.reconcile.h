@@ -15,6 +15,7 @@ static inline void mothershipFillAdoptedClusterMachine(const MothershipProdigyCl
   target.ssh = source.ssh;
   target.addresses = source.addresses;
   target.ownership = source.ownership;
+  target.uuid = source.uuid;
   target.rackUUID = source.rackUUID;
 }
 
@@ -160,6 +161,17 @@ static inline bool mothershipBuildClusterAddMachinesRequest(const MothershipProd
       if (existingMachine.sameIdentityAs(requestedMachine))
       {
         alreadyPresent = true;
+        if (requestedMachine.uuid != 0 &&
+            existingMachine.uuid == requestedMachine.uuid &&
+            mothershipCanUpdateAdoptedMachineRack(existingMachine, requestedMachine) == false)
+        {
+          if (failure)
+          {
+            failure->assign("adopted explicit UUID requires an unchanged known machine"_ctv);
+          }
+          request = {};
+          return false;
+        }
         if (requestedMachine.rackUUID != 0 && requestedMachine.rackUUID != existingMachine.rackUUID)
         {
           if (mothershipCanUpdateAdoptedMachineRack(existingMachine, requestedMachine) == false)

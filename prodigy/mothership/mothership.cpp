@@ -1903,6 +1903,23 @@ static bool parseMothershipClusterMachineJSON(simdjson::dom::element value, Moth
 
       parsed.rackUUID = uint32_t(rackUUID);
     }
+    else if (key.equal("uuid"_ctv))
+    {
+      if (field.value.type() != simdjson::dom::element_type::STRING)
+      {
+        basics_log("%s.uuid requires nonzero hexadecimal string\n", context);
+        return false;
+      }
+
+      String uuidText = {};
+      uuidText.setInvariant(field.value.get_c_str());
+      parsed.uuid = String::numberFromHexString<uint128_t>(uuidText);
+      if (parsed.uuid == 0)
+      {
+        basics_log("%s.uuid requires nonzero hexadecimal string\n", context);
+        return false;
+      }
+    }
     else
     {
       basics_log("%s invalid field\n", context);

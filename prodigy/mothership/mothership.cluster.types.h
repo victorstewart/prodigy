@@ -210,6 +210,9 @@ public:
   ClusterMachineSSH ssh;
   ClusterMachineAddresses addresses;
   ClusterMachineOwnership ownership;
+  // A nonzero value re-adopts the retained local Prodigy identity instead of
+  // allocating a new bootstrap UUID.
+  uint128_t uuid = 0;
   // Zero preserves the legacy runtime default rack. Nonzero values identify an
   // adopted machine's physical failure domain when first added to a topology.
   uint32_t rackUUID = 0;

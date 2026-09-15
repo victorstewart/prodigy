@@ -20,6 +20,22 @@ public:
   Vector<uint32_t> adoptedMachineRackUUIDs;
 };
 
+class MothershipProdigyClusterRecordV4 {
+public:
+
+  MothershipProdigyCluster cluster;
+  Vector<uint32_t> adoptedMachineRackUUIDs;
+  Vector<uint128_t> adoptedMachineUUIDs;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipProdigyClusterRecordV4& record)
+{
+  serializer.object(record.cluster);
+  serializer.container4b(record.adoptedMachineRackUUIDs, UINT32_MAX);
+  serializer.object(record.adoptedMachineUUIDs);
+}
+
 template <typename S>
 static void serialize(S&& serializer, MothershipProdigyClusterRecordV3& record)
 {
@@ -36,6 +52,7 @@ private:
   constexpr static auto clustersByUUIDColumnFamily = "clusters_by_uuid"_ctv;
   constexpr static auto clusterRecordV2Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=2\n\n"_ctv;
   constexpr static auto clusterRecordV3Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=3\n\n"_ctv;
+  constexpr static auto clusterRecordV4Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=4\n\n"_ctv;
 
   static void resolveDefaultDBPath(String& path)
   {
@@ -175,6 +192,27 @@ private:
     String serialized;
     serialized.append(value, valueSize);
 
+    if (recordHasHeader(serialized, clusterRecordV4Header))
+    {
+      String payload = {};
+      payload.assign(serialized.substr(clusterRecordV4Header.size(), serialized.size() - clusterRecordV4Header.size(), Copy::yes));
+      MothershipProdigyClusterRecordV4 record = {};
+      if (BitseryEngine::deserializeSafe(payload, record) == false ||
+          record.adoptedMachineRackUUIDs.size() != record.cluster.machines.size() ||
+          record.adoptedMachineUUIDs.size() != record.cluster.machines.size())
+      {
+        return false;
+      }
+
+      for (uint32_t index = 0; index < record.cluster.machines.size(); ++index)
+      {
+        record.cluster.machines[index].rackUUID = record.adoptedMachineRackUUIDs[index];
+        record.cluster.machines[index].uuid = record.adoptedMachineUUIDs[index];
+      }
+      cluster = std::move(record.cluster);
+      return true;
+    }
+
     if (recordHasHeader(serialized, clusterRecordV3Header))
     {
       String payload = {};
@@ -208,17 +246,19 @@ private:
 
   static void serializeClusterValue(const MothershipProdigyCluster& cluster, String& serialized)
   {
-    MothershipProdigyClusterRecordV3 record = {};
+    MothershipProdigyClusterRecordV4 record = {};
     record.cluster = cluster;
     record.adoptedMachineRackUUIDs.reserve(cluster.machines.size());
+    record.adoptedMachineUUIDs.reserve(cluster.machines.size());
     for (const MothershipProdigyClusterMachine& machine : cluster.machines)
     {
       record.adoptedMachineRackUUIDs.push_back(machine.rackUUID);
+      record.adoptedMachineUUIDs.push_back(machine.uuid);
     }
 
     String payload = {};
     BitseryEngine::serialize(payload, record);
-    serialized.assign(clusterRecordV3Header);
+    serialized.assign(clusterRecordV4Header);
     serialized.append(payload);
   }
 
