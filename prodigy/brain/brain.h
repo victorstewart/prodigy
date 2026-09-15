@@ -14496,11 +14496,24 @@ public:
   {
     if (uuid != 0)
     {
-      if (auto it = machinesByUUID.find(uuid); it != machinesByUUID.end())
+      if (auto it = machinesByUUID.find(uuid); it != machinesByUUID.end() &&
+          it->second != nullptr && it->second->uuid == uuid)
       {
         return it->second;
       }
+
+      for (Machine *machine : machines)
+      {
+        if (machine != nullptr && machine->uuid == uuid)
+        {
+          return machine;
+        }
+      }
     }
+
+    auto fallbackIdentityMatches = [uuid](const Machine *machine) {
+      return machine != nullptr && (uuid == 0 || machine->uuid == 0 || machine->uuid == uuid);
+    };
 
     if (peerAddresses != nullptr)
     {
@@ -14514,7 +14527,7 @@ public:
 
         for (Machine *machine : machines)
         {
-          if (machineMatchesPeerAddress(machine, candidateAddress, &candidate.address))
+          if (fallbackIdentityMatches(machine) && machineMatchesPeerAddress(machine, candidateAddress, &candidate.address))
           {
             return machine;
           }
@@ -14526,7 +14539,7 @@ public:
     {
       for (Machine *machine : machines)
       {
-        if (machineMatchesPeerAddress(machine, *peerAddress, peerAddressText))
+        if (fallbackIdentityMatches(machine) && machineMatchesPeerAddress(machine, *peerAddress, peerAddressText))
         {
           return machine;
         }
@@ -14537,7 +14550,7 @@ public:
     {
       for (Machine *machine : machines)
       {
-        if (machine && machine->private4 == private4)
+        if (fallbackIdentityMatches(machine) && machine->private4 == private4)
         {
           return machine;
         }
