@@ -9653,6 +9653,20 @@ private:
 
         sawMachines = true;
       }
+      else if (key.equal("nBrains"_ctv))
+      {
+        int64_t value = 0;
+        if (field.value.type() != simdjson::dom::element_type::INT64 ||
+            field.value.get(value) != simdjson::SUCCESS || value <= 0 || value > UINT8_MAX)
+        {
+          basics_log("setLocalClusterMembership.nBrains requires integer in 1..255\n");
+          exit(EXIT_FAILURE);
+        }
+
+        // Keep the declared capacity and desired membership in one validated
+        // mutation. Omission preserves the existing minimum Brain count.
+        desiredCluster.nBrains = uint32_t(value);
+      }
       else
       {
         basics_log("setLocalClusterMembership invalid field\n");
