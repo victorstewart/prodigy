@@ -93,6 +93,7 @@ public:
   bool persistSucceeds = true;
   BrainConfig lastPersistedBrainConfig = {};
   ProdigyMasterAuthorityRuntimeState lastPersistedMasterAuthorityState = {};
+  ProdigyPersistentUpdateSelfState lastPersistedUpdateSelfState = {};
   uint32_t masterAuthorityApplyCalls = 0;
   uint32_t clusterOwnershipCalls = 0;
   uint128_t lastClaimedClusterUUID = 0;
@@ -150,6 +151,7 @@ public:
     persistCalls += 1;
     ownBrainConfig(brainConfig, lastPersistedBrainConfig);
     lastPersistedMasterAuthorityState = masterAuthorityRuntimeState;
+    lastPersistedUpdateSelfState = capturePersistentUpdateSelfState();
     return persistSucceeds;
   }
 
@@ -5502,6 +5504,10 @@ static void testReconcileStateReplicatesCredentialAndTlsState(TestSuite& suite)
   brain.apiCredentialSetsByApp.insert_or_assign(appID, credentialSet);
   brain.nextMintedClientTlsGeneration = 66;
   brain.masterAuthorityRuntimeState.generation = 44;
+  brain.updateSelfWorkerExpectedBundleSHA256 =
+      "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv;
+  brain.updateSelfLocalMachineUUID = uint128_t(0x2202);
+  brain.updateSelfLocalContainerBootstraps.push_back("captured-bootstrap"_ctv);
   suite.expect(generateTransportAuthority(brain.masterAuthorityRuntimeState.transportTLSAuthority, failure), "reconcile_state_generate_transport_authority");
   brain.refreshMasterAuthorityRuntimeStateFromLiveFields();
   brain.recordContainerMetric(0x1001, 0x1002, ProdigyMetrics::runtimeContainerCpuUtilPctKey(), 1'700'000'000'000, 33.0);
@@ -5520,6 +5526,7 @@ static void testReconcileStateReplicatesCredentialAndTlsState(TestSuite& suite)
   bool foundBrainConfig = false;
   bool foundSplitBrainConfig = false;
   bool foundMasterAuthority = false;
+  bool foundRecoveryWitness = false;
   bool foundMetricsSnapshot = false;
 
   forEachMessageInBuffer(follower.wBuffer, [&](Message *message) -> void {
@@ -5587,6 +5594,13 @@ static void testReconcileStateReplicatesCredentialAndTlsState(TestSuite& suite)
       {
         foundMasterAuthority = true;
         foundBrainConfig = decoded.brainConfig.clusterUUID == brain.brainConfig.clusterUUID;
+        foundRecoveryWitness = decoded.runtimeState.updateSelf.localMachineUUID ==
+                                   brain.updateSelfLocalMachineUUID &&
+                               decoded.runtimeState.updateSelf.localBundleRegistered == false &&
+                               decoded.runtimeState.updateSelf.localContainerBootstraps ==
+                                   brain.updateSelfLocalContainerBootstraps &&
+                               decoded.runtimeState.updateSelf.bundleBlob.empty() &&
+                               decoded.runtimeState.updateSelf.state == 0;
       }
     }
     else if (topic == BrainTopic::replicateMetricsSnapshot)
@@ -5609,6 +5623,7 @@ static void testReconcileStateReplicatesCredentialAndTlsState(TestSuite& suite)
   suite.expect(foundTlsFactory, "reconcile_state_emits_tls_factory_replication");
   suite.expect(foundApiSet, "reconcile_state_emits_api_credential_set_replication");
   suite.expect(foundMasterAuthority, "reconcile_state_emits_master_authority_replication");
+  suite.expect(foundRecoveryWitness, "reconcile_state_projects_local_bundle_recovery_witness");
   suite.expect(foundMetricsSnapshot, "reconcile_state_emits_metrics_snapshot_replication");
 }
 
@@ -21899,15 +21914,37 @@ static void testLocalBundleRecoveryWaitsForCapturedInventory(TestSuite& suite)
   retainedPlan.uuid = uint128_t(0x52190002);
   retainedPlan.fragment = 7;
   retainedPlan.config = makeDeploymentPlan(52'019, 1).config;
+  IPPrefix retainedAddress = {};
+  retainedAddress.network.is6 = true;
+  retainedAddress.cidr = 128;
+  std::memcpy(retainedAddress.network.v6,
+              container_network_subnet6.value,
+              sizeof(container_network_subnet6.value));
+  retainedAddress.network.v6[11] = brain.brainConfig.datacenterFragment;
+  retainedAddress.network.v6[12] = static_cast<uint8_t>((local.fragment >> 16) & 0xff);
+  retainedAddress.network.v6[13] = static_cast<uint8_t>((local.fragment >> 8) & 0xff);
+  retainedAddress.network.v6[14] = static_cast<uint8_t>(local.fragment & 0xff);
+  retainedAddress.network.v6[15] = retainedPlan.fragment;
+  retainedPlan.addresses.push_back(retainedAddress);
   NeuronContainerBootstrap retainedBootstrap = {};
   retainedBootstrap.plan = retainedPlan;
   String serializedBootstrap = {};
   BitseryEngine::serialize(serializedBootstrap, retainedBootstrap);
 
-  brain.updateSelfWorkerExpectedBundleSHA256 = digest;
-  brain.updateSelfLocalMachineUUID = local.uuid;
-  brain.updateSelfLocalMachineFragment = local.fragment;
-  brain.updateSelfLocalContainerBootstraps.push_back(serializedBootstrap);
+  ProdigyMasterAuthorityRuntimeState replicatedRecovery = {};
+  replicatedRecovery.generation = 1;
+  replicatedRecovery.nextPendingAddMachinesOperationID = 1;
+  replicatedRecovery.nextPendingElasticAddressOperationID = 1;
+  replicatedRecovery.nextDNSIntentRevision = 1;
+  replicatedRecovery.nextTlsResumptionGeneration = 1;
+  replicatedRecovery.updateSelf.workerExpectedBundleSHA256 = digest;
+  replicatedRecovery.updateSelf.localMachineUUID = local.uuid;
+  replicatedRecovery.updateSelf.localContainerBootstraps.push_back(serializedBootstrap);
+  suite.require(brain.applyReplicatedMasterAuthorityRuntimeState(replicatedRecovery, true),
+                "local_bundle_recovery_applies_successor_witness_before_state_upload");
+  suite.require(brain.restorePendingLocalMachineFragment(&local) &&
+                    brain.updateSelfLocalMachineFragment == local.fragment,
+                "local_bundle_recovery_derives_machine_fragment_from_captured_bootstrap_prefix");
 
   String emptyUpload = {};
   uint32_t headerOffset = Message::appendHeader(emptyUpload, NeuronTopic::stateUpload);
@@ -21976,6 +22013,152 @@ static void testLocalBundleRecoveryWaitsForCapturedInventory(TestSuite& suite)
   brain.machinesByUUID.erase(local.uuid);
   brain.machines.erase(&local);
   thisBrain = previousBrain;
+}
+
+static void testReplicatedLocalBundleRecoveryWitnessIsDurableAndBounded(TestSuite& suite)
+{
+  TestBrain successor = {};
+  TestNeuron localNeuron = {};
+  localNeuron.uuid = uint128_t(0x521a0001);
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &localNeuron;
+
+  ProdigyMasterAuthorityRuntimeState incoming = {};
+  incoming.generation = 1;
+  incoming.nextPendingAddMachinesOperationID = 1;
+  incoming.nextPendingElasticAddressOperationID = 1;
+  incoming.nextDNSIntentRevision = 1;
+  incoming.nextTlsResumptionGeneration = 1;
+  incoming.updateSelf.state = 1;
+  incoming.updateSelf.bundleBlob.assign("coordinator-private-payload"_ctv);
+  incoming.updateSelf.workerExpectedBundleSHA256 =
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv;
+  incoming.updateSelf.localMachineUUID = uint128_t(0x521a0002);
+  incoming.updateSelf.localBundleRegistered = true;
+  incoming.updateSelf.localContainerBootstraps.push_back("captured-bootstrap"_ctv);
+
+  suite.require(successor.applyReplicatedMasterAuthorityRuntimeState(incoming, true),
+                "replicated_local_bundle_witness_accepts_fresh_authority_generation");
+  suite.expect(successor.lastPersistedUpdateSelfState.localMachineUUID ==
+                   incoming.updateSelf.localMachineUUID &&
+                   successor.lastPersistedUpdateSelfState.localBundleRegistered == false &&
+                   successor.lastPersistedUpdateSelfState.localContainerBootstraps ==
+                       incoming.updateSelf.localContainerBootstraps &&
+                   successor.lastPersistedUpdateSelfState.bundleBlob.empty() &&
+                   successor.lastPersistedUpdateSelfState.state == 0,
+               "replicated_local_bundle_witness_persists_before_ack_without_coordinator_payload");
+
+  ProdigyMasterAuthorityRuntimeState sameGeneration = incoming;
+  sameGeneration.updateSelf.localMachineUUID = uint128_t(0x521a0004);
+  suite.expect(successor.applyReplicatedMasterAuthorityRuntimeState(sameGeneration, true) == false &&
+                   successor.updateSelfLocalMachineUUID == incoming.updateSelf.localMachineUUID,
+               "replicated_local_bundle_witness_rejects_same_generation_identity_change");
+
+  ProdigyMasterAuthorityRuntimeState conflicting = incoming;
+  conflicting.generation += 1;
+  conflicting.updateSelf.localMachineUUID = uint128_t(0x521a0003);
+  suite.expect(successor.applyReplicatedMasterAuthorityRuntimeState(conflicting, true) == false &&
+                   successor.updateSelfLocalMachineUUID == incoming.updateSelf.localMachineUUID,
+               "replicated_local_bundle_witness_rejects_wrong_machine_identity");
+
+  ProdigyMasterAuthorityRuntimeState completion = incoming;
+  completion.generation += 1;
+  completion.updateSelf = {};
+  suite.require(successor.applyReplicatedMasterAuthorityRuntimeState(completion, true),
+                "replicated_local_bundle_witness_accepts_completion_projection");
+  suite.expect(successor.updateSelfLocalMachineUUID == 0 &&
+                   successor.updateSelfLocalContainerBootstraps.empty(),
+               "replicated_local_bundle_witness_completion_clears_inactive_copied_witness");
+
+  TestBrain failedSuccessor = {};
+  failedSuccessor.persistSucceeds = false;
+  suite.expect(failedSuccessor.applyReplicatedMasterAuthorityRuntimeState(incoming, true) == false &&
+                   failedSuccessor.updateSelfLocalMachineUUID == 0 &&
+                   failedSuccessor.updateSelfLocalContainerBootstraps.empty(),
+               "replicated_local_bundle_witness_failed_persist_restores_live_coordinator");
+
+  TestBrain formerOwner = {};
+  formerOwner.updateSelfWorkerExpectedBundleSHA256 = incoming.updateSelf.workerExpectedBundleSHA256;
+  formerOwner.updateSelfLocalMachineUUID = localNeuron.uuid;
+  formerOwner.updateSelfLocalContainerBootstraps = incoming.updateSelf.localContainerBootstraps;
+  formerOwner.pendingDesignatedMasterPeerKey = uint128_t(0x521a0005);
+  ProdigyMasterAuthorityRuntimeState nextCycleCompletion = {};
+  nextCycleCompletion.generation = 1;
+  nextCycleCompletion.nextPendingAddMachinesOperationID = 1;
+  nextCycleCompletion.nextPendingElasticAddressOperationID = 1;
+  nextCycleCompletion.nextDNSIntentRevision = 1;
+  nextCycleCompletion.nextTlsResumptionGeneration = 1;
+  suite.require(formerOwner.applyReplicatedMasterAuthorityRuntimeState(nextCycleCompletion, true),
+                "replicated_local_bundle_witness_former_owner_accepts_next_cycle_completion");
+  suite.expect(formerOwner.updateSelfLocalMachineUUID == 0 &&
+                   formerOwner.updateSelfLocalContainerBootstraps.empty(),
+               "replicated_local_bundle_witness_former_owner_completion_does_not_block_next_update");
+
+  TestBrain activeOwner = {};
+  activeOwner.updateSelfState = Brain::UpdateSelfState::waitingForBundleEchos;
+  activeOwner.updateSelfLocalMachineUUID = localNeuron.uuid;
+  activeOwner.updateSelfLocalContainerBootstraps = incoming.updateSelf.localContainerBootstraps;
+  suite.require(activeOwner.applyReplicatedMasterAuthorityRuntimeState(nextCycleCompletion, true),
+                "replicated_local_bundle_witness_active_owner_accepts_authority_completion");
+  suite.expect(activeOwner.updateSelfLocalMachineUUID == localNeuron.uuid &&
+                   activeOwner.updateSelfLocalContainerBootstraps.empty() == false,
+               "replicated_local_bundle_witness_completion_preserves_active_local_coordinator");
+
+  thisNeuron = previousNeuron;
+}
+
+static void testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+  TestBrain brain = {};
+  brain.nBrains = 3;
+  brain.updateSelfState = Brain::UpdateSelfState::waitingForFollowerReboots;
+  brain.updateSelfExpectedEchos = 2;
+  brain.updateSelfLocalMachineUUID = uint128_t(0x521b0001);
+  brain.updateSelfWorkerExpectedBundleSHA256 =
+      "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv;
+  brain.updateSelfLocalContainerBootstraps.push_back("captured-bootstrap"_ctv);
+  brain.masterAuthorityRuntimeState.generation = 7;
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = 7;
+
+  BrainView peer = {};
+  peer.uuid = uint128_t(0x521b0002);
+  peer.boottimens = 52'102;
+  peer.connected = true;
+  peer.isFixedFile = true;
+  peer.fslot = 52;
+  brain.brains.insert(&peer);
+  BrainView secondPeer = {};
+  secondPeer.uuid = uint128_t(0x521b0003);
+  secondPeer.boottimens = 52'103;
+  secondPeer.connected = true;
+  secondPeer.isFixedFile = true;
+  secondPeer.fslot = 53;
+  brain.brains.insert(&secondPeer);
+  brain.updateSelfFollowerRebootedPeerKeys.insert(peer.uuid);
+  brain.updateSelfFollowerRebootedPeerKeys.insert(secondPeer.uuid);
+  Brain::MasterAuthorityReplicationPeerState tracking = {};
+  tracking.uuid = peer.uuid;
+  tracking.bootNs = peer.boottimens;
+  tracking.acknowledgedGeneration = 6;
+  brain.masterAuthorityReplicationByPeer.emplace(&peer, std::move(tracking));
+  Brain::MasterAuthorityReplicationPeerState secondTracking = {};
+  secondTracking.uuid = secondPeer.uuid;
+  secondTracking.bootNs = secondPeer.boottimens;
+  secondTracking.acknowledgedGeneration = 7;
+  brain.masterAuthorityReplicationByPeer.emplace(&secondPeer, std::move(secondTracking));
+
+  brain.maybeRelinquishMasterForUpdateSelf();
+  suite.expect(brain.updateSelfState == Brain::UpdateSelfState::waitingForFollowerReboots,
+               "update_self_recovery_witness_stale_ack_blocks_master_relinquish");
+
+  brain.masterAuthorityReplicationByPeer[&peer].acknowledgedGeneration = 7;
+  brain.maybeRelinquishMasterForUpdateSelf();
+  suite.expect(brain.updateSelfState == Brain::UpdateSelfState::waitingForRelinquishEchos &&
+                   brain.updateSelfRelinquishIssuedPeerKeys.contains(peer.uuid) &&
+                   brain.updateSelfRelinquishIssuedPeerKeys.contains(secondPeer.uuid),
+               "update_self_recovery_witness_current_acks_allow_three_brain_master_relinquish");
 }
 
 static void testBrainNeuronHandlerReportsHardwareFailureAndDecommissionsMachine(TestSuite& suite)
@@ -23675,6 +23858,8 @@ int main(void)
       only != nullptr && strcmp(only, "local-bundle-recovery-ordering") == 0)
   {
     testLocalBundleRecoveryWaitsForCapturedInventory(suite);
+    testReplicatedLocalBundleRecoveryWitnessIsDurableAndBounded(suite);
+    testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(suite);
     testBrainNeuronRegistrationKeepsHealthyRuntimeReadyWithoutRefresh(suite);
     testBrainNeuronRegistrationRefreshesWorkerAfterBundleTransition(suite);
     testPersistedLocalBrainRefreshBypassesIgnition(suite);

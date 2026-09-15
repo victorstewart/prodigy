@@ -2025,9 +2025,55 @@ public:
     for (uint128_t uuid : state.workerTransitionIssuedMachineUUIDs) updateSelfWorkerTransitionIssuedMachineUUIDs.insert(uuid);
     for (uint128_t uuid : state.workerRebootedMachineUUIDs) updateSelfWorkerRebootedMachineUUIDs.insert(uuid);
     for (uint128_t uuid : state.workerStateUploadedMachineUUIDs) updateSelfWorkerStateUploadedMachineUUIDs.insert(uuid);
+    // This is derived from the retained container-network addresses after
+    // BrainConfig is available; it is never a persisted coordinator field.
+    updateSelfLocalMachineFragment = 0;
     updateSelfLocalMachineUUID = state.localMachineUUID;
     updateSelfLocalBundleRegistered = state.localBundleRegistered;
     updateSelfLocalContainerBootstraps = state.localContainerBootstraps;
+  }
+
+  static ProdigyPersistentUpdateSelfState projectUpdateSelfRecoveryWitness(
+      const ProdigyPersistentUpdateSelfState& state)
+  {
+    ProdigyPersistentUpdateSelfState witness = {};
+    if (state.localMachineUUID == 0 || state.localContainerBootstraps.empty())
+    {
+      return witness;
+    }
+
+    // The update coordinator and bundle payload are local to the current
+    // master.  A successor needs only the exact local re-adoption witness.
+    witness.workerExpectedBundleSHA256 = state.workerExpectedBundleSHA256;
+    witness.localMachineUUID = state.localMachineUUID;
+    // Registration attestation belongs to the active owner.  A successor
+    // must obtain its own matching registration before it may clear the fence.
+    witness.localBundleRegistered = false;
+    witness.localContainerBootstraps = state.localContainerBootstraps;
+    return witness;
+  }
+
+  static bool updateSelfRecoveryWitnessMatches(
+      const ProdigyPersistentUpdateSelfState& lhs,
+      const ProdigyPersistentUpdateSelfState& rhs)
+  {
+    return projectUpdateSelfRecoveryWitness(lhs) == projectUpdateSelfRecoveryWitness(rhs);
+  }
+
+  static bool updateSelfCoordinatorActiveBeyondRecoveryWitness(
+      const ProdigyPersistentUpdateSelfState& state)
+  {
+    return state.state != 0 || state.expectedEchos != 0 || state.bundleEchos != 0 ||
+           state.relinquishEchos != 0 || state.plannedMasterPeerKey != 0 ||
+           state.useStagedBundleOnly ||
+           state.bundleBlob.empty() == false || state.bundleEchoPeerKeys.empty() == false ||
+           state.relinquishEchoPeerKeys.empty() == false ||
+           state.followerBootNsByPeerKey.empty() == false ||
+           state.followerRebootedPeerKeys.empty() == false || state.workerFailure.empty() == false ||
+           state.workerMachineUUIDs.empty() == false || state.workerStagedMachineUUIDs.empty() == false ||
+           state.workerTransitionIssuedMachineUUIDs.empty() == false ||
+           state.workerRebootedMachineUUIDs.empty() == false ||
+           state.workerStateUploadedMachineUUIDs.empty() == false;
   }
 
   ProdigyResumptionRegistry::SnapshotMap captureTlsResumptionSnapshotsByWormhole(void) const
@@ -5810,7 +5856,8 @@ public:
     String serialized;
     ProdigyMasterAuthorityStateTransition transition;
     transition.runtimeState = masterAuthorityRuntimeState;
-    transition.runtimeState.updateSelf = {};
+    transition.runtimeState.updateSelf =
+        projectUpdateSelfRecoveryWitness(transition.runtimeState.updateSelf);
     ownBrainConfig(brainConfig, transition.brainConfig);
     BitseryEngine::serialize(serialized, transition);
     String transitionDigest;
@@ -6305,8 +6352,46 @@ public:
 
   bool applyReplicatedMasterAuthorityRuntimeState(const ProdigyMasterAuthorityRuntimeState& incoming, bool persist = true)
   {
+    const ProdigyPersistentUpdateSelfState incomingRecoveryWitness =
+        projectUpdateSelfRecoveryWitness(incoming.updateSelf);
+    ProdigyPersistentUpdateSelfState localUpdateCoordinator =
+        capturePersistentUpdateSelfState();
+    const ProdigyPersistentUpdateSelfState localRecoveryWitness =
+        projectUpdateSelfRecoveryWitness(localUpdateCoordinator);
+    if (incomingRecoveryWitness.localMachineUUID != 0 &&
+        localRecoveryWitness.localMachineUUID != 0 &&
+        updateSelfRecoveryWitnessMatches(incomingRecoveryWitness, localRecoveryWitness) == false)
+    {
+      return false;
+    }
+
+    if (incomingRecoveryWitness.localMachineUUID != 0)
+    {
+      localUpdateCoordinator.workerExpectedBundleSHA256 =
+          incomingRecoveryWitness.workerExpectedBundleSHA256;
+      localUpdateCoordinator.localMachineUUID = incomingRecoveryWitness.localMachineUUID;
+      localUpdateCoordinator.localBundleRegistered = false;
+      localUpdateCoordinator.localContainerBootstraps =
+          incomingRecoveryWitness.localContainerBootstraps;
+    }
+    else if (localRecoveryWitness.localMachineUUID != 0 &&
+             updateSelfCoordinatorActiveBeyondRecoveryWitness(localUpdateCoordinator) == false)
+    {
+      // An authenticated empty later projection completes either a copied
+      // successor witness or the former owner's own witness. A stale pending
+      // handoff key is not an active coordinator and cannot pin the next
+      // update; a real coordinator remains intact.
+      localUpdateCoordinator.workerExpectedBundleSHA256.clear();
+      localUpdateCoordinator.localMachineUUID = 0;
+      localUpdateCoordinator.localBundleRegistered = false;
+      localUpdateCoordinator.localContainerBootstraps.clear();
+    }
+
     ProdigyMasterAuthorityRuntimeState sanitizedIncoming = incoming;
-    sanitizedIncoming.updateSelf = {};
+    // A follower must retain its own update coordinator, but a successor must
+    // also durably retain the former master's narrow local re-adoption witness.
+    // Do not replicate coordinator echos, peer state, or the bundle payload.
+    sanitizedIncoming.updateSelf = localUpdateCoordinator;
     ProdigyMachineRetirementJournal retirementJournal = {};
     if (decodeMachineRetirementJournal(sanitizedIncoming, retirementJournal) == false)
     {
@@ -6330,10 +6415,18 @@ public:
       sanitizedIncoming.nextTlsResumptionGeneration = 1;
     }
 
+    ProdigyMasterAuthorityRuntimeState comparableIncoming = sanitizedIncoming;
+    comparableIncoming.updateSelf = {};
+    ProdigyMasterAuthorityRuntimeState comparableCurrent = masterAuthorityRuntimeState;
+    comparableCurrent.updateSelf = {};
+    const ProdigyPersistentUpdateSelfState previousLiveUpdateCoordinator =
+        capturePersistentUpdateSelfState();
+
     const bool shouldApply = sanitizedIncoming.generation > masterAuthorityRuntimeState.generation;
 
     if (sanitizedIncoming.generation == masterAuthorityRuntimeState.generation &&
-        sanitizedIncoming != masterAuthorityRuntimeState)
+        (comparableIncoming != comparableCurrent ||
+         updateSelfRecoveryWitnessMatches(incomingRecoveryWitness, localRecoveryWitness) == false))
     {
       return false;
     }
@@ -6352,23 +6445,33 @@ public:
       return false;
     }
 
-    if (shouldApply == false && sanitizedIncoming == masterAuthorityRuntimeState && persist &&
+    if (shouldApply == false && comparableIncoming == comparableCurrent && persist &&
         (masterAuthorityRuntimeStateDurable == false ||
          durableMasterAuthorityRuntimeStateGeneration != sanitizedIncoming.generation))
     {
+      restorePersistentUpdateSelfState(localUpdateCoordinator);
       masterAuthorityRuntimeStateDurable = persistLocalRuntimeState();
       if (masterAuthorityRuntimeStateDurable)
       {
         durableMasterAuthorityRuntimeStateGeneration = sanitizedIncoming.generation;
         captureDurableElasticAddressOperations();
       }
+      else
+      {
+        restorePersistentUpdateSelfState(previousLiveUpdateCoordinator);
+      }
       return masterAuthorityRuntimeStateDurable;
     }
-    if (shouldApply == false && sanitizedIncoming == masterAuthorityRuntimeState)
+    if (shouldApply == false && comparableIncoming == comparableCurrent)
     {
-      return persist == false ||
-             (masterAuthorityRuntimeStateDurable &&
-              durableMasterAuthorityRuntimeStateGeneration == sanitizedIncoming.generation);
+      if (persist == false ||
+          (masterAuthorityRuntimeStateDurable &&
+           durableMasterAuthorityRuntimeStateGeneration == sanitizedIncoming.generation))
+      {
+        restorePersistentUpdateSelfState(localUpdateCoordinator);
+        return true;
+      }
+      return false;
     }
     if (shouldApply == false)
     {
@@ -6390,11 +6493,15 @@ public:
     ProdigyResumptionRegistry::SnapshotMap previousTlsResumptionSnapshots =
         captureTlsResumptionSnapshotsByWormhole();
     Vector<ProdigyManagedMachineSchema> previousSchemas = previousRuntimeState.machineSchemas;
+    // Persist captures live fields into the master-authority package. Apply
+    // the narrow witness before that capture and restore it on every failure.
+    restorePersistentUpdateSelfState(localUpdateCoordinator);
     masterAuthorityRuntimeState = std::move(sanitizedIncoming);
     masterAuthorityRuntimeStateDurable = false;
     if (restoreRetiredMachineIdentitiesFromRuntimeState() == false)
     {
       masterAuthorityRuntimeState = std::move(previousRuntimeState);
+      restorePersistentUpdateSelfState(previousLiveUpdateCoordinator);
       masterAuthorityRuntimeStateDurable = previousDurable;
       durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
       (void)restoreRetiredMachineIdentitiesFromRuntimeState();
@@ -6411,6 +6518,7 @@ public:
     if (persist && persistLocalRuntimeState() == false)
     {
       masterAuthorityRuntimeState = std::move(previousRuntimeState);
+      restorePersistentUpdateSelfState(previousLiveUpdateCoordinator);
       masterAuthorityRuntimeStateDurable = previousDurable;
       durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
       hasCompletedInitialMasterElection = previousCompletedInitialElection;
@@ -6489,9 +6597,12 @@ public:
     {
       return false;
     }
+    ProdigyMasterAuthorityRuntimeState comparableIncoming = incoming.runtimeState;
+    comparableIncoming.updateSelf = {};
+    ProdigyMasterAuthorityRuntimeState comparableCurrent = masterAuthorityRuntimeState;
+    comparableCurrent.updateSelf = {};
     if (incoming.runtimeState.generation == masterAuthorityRuntimeState.generation &&
-        (incoming.runtimeState != masterAuthorityRuntimeState ||
-         configChanged))
+        (comparableIncoming != comparableCurrent || configChanged))
     {
       return false;
     }
@@ -13665,15 +13776,75 @@ public:
     }
   }
 
+  bool deriveUpdateSelfLocalMachineFragmentFromCapturedBootstraps(uint32_t& fragment) const
+  {
+    fragment = 0;
+    if (updateSelfLocalMachineUUID == 0 || updateSelfLocalContainerBootstraps.empty() ||
+        brainConfig.datacenterFragment == 0)
+    {
+      return false;
+    }
+
+    for (const String& serializedBootstrap : updateSelfLocalContainerBootstraps)
+    {
+      NeuronContainerBootstrap bootstrap = {};
+      if (BitseryEngine::deserializeSafe(serializedBootstrap, bootstrap) == false)
+      {
+        return false;
+      }
+
+      bool found = false;
+      for (const IPPrefix& address : bootstrap.plan.addresses)
+      {
+        if (address.network.is6 == false || address.cidr != 128 ||
+            memcmp(address.network.v6, container_network_subnet6.value, 11) != 0 ||
+            address.network.v6[11] != brainConfig.datacenterFragment)
+        {
+          continue;
+        }
+
+        const uint32_t candidate = (uint32_t(address.network.v6[12]) << 16) |
+                                   (uint32_t(address.network.v6[13]) << 8) |
+                                   uint32_t(address.network.v6[14]);
+        if (address.network.v6[15] != bootstrap.plan.fragment || candidate == 0 ||
+            (fragment != 0 && fragment != candidate))
+        {
+          return false;
+        }
+        fragment = candidate;
+        found = true;
+        break;
+      }
+      if (found == false)
+      {
+        return false;
+      }
+    }
+
+    return fragment != 0;
+  }
+
   bool restorePendingLocalMachineFragment(Machine *machine)
   {
     if (machine == nullptr || updateSelfLocalMachineUUID == 0 ||
-        machine->uuid != updateSelfLocalMachineUUID || updateSelfLocalMachineFragment == 0)
+        machine->uuid != updateSelfLocalMachineUUID)
     {
       return true;
     }
 
-    const uint32_t expectedFragment = updateSelfLocalMachineFragment;
+    uint32_t expectedFragment = updateSelfLocalMachineFragment;
+    if (expectedFragment == 0 && updateSelfLocalContainerBootstraps.empty())
+    {
+      return true;
+    }
+    if (expectedFragment == 0 &&
+        deriveUpdateSelfLocalMachineFragmentFromCapturedBootstraps(expectedFragment) == false)
+    {
+      updateSelfWorkerFailure.assign("bootstrap recovery local machine fragment is unavailable"_ctv);
+      noteMasterAuthorityRuntimeStateChanged();
+      return false;
+    }
+    updateSelfLocalMachineFragment = expectedFragment;
     if (machine->fragment != 0 && machine->fragment != expectedFragment)
     {
       updateSelfWorkerFailure.assign("bootstrap recovery local machine fragment conflicts with checkpoint"_ctv);
@@ -24501,6 +24672,41 @@ public:
     queueUpdateSelfBundleToPendingPeers();
   }
 
+  bool updateSelfRecoveryWitnessAcknowledgedByPeers(
+      const bytell_hash_set<uint128_t>& requiredPeerKeys) const
+  {
+    if (projectUpdateSelfRecoveryWitness(capturePersistentUpdateSelfState()).localMachineUUID == 0)
+    {
+      return true;
+    }
+    if (masterAuthorityRuntimeStateDurable == false)
+    {
+      return false;
+    }
+
+    for (uint128_t peerKey : requiredPeerKeys)
+    {
+      BrainView *peer = findBrainViewByUpdateSelfPeerKey(peerKey);
+      if (peer == nullptr || peer->uuid == 0 || peer->boottimens == 0 ||
+          peerSocketActive(peer) == false)
+      {
+        return false;
+      }
+      auto trackingIt = masterAuthorityReplicationByPeer.find(peer);
+      if (trackingIt == masterAuthorityReplicationByPeer.end())
+      {
+        return false;
+      }
+      const MasterAuthorityReplicationPeerState& tracking = trackingIt->second;
+      if (tracking.uuid != peer->uuid || tracking.bootNs != peer->boottimens ||
+          tracking.acknowledgedGeneration < masterAuthorityRuntimeState.generation)
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
   void maybeRelinquishMasterForUpdateSelf(void)
   {
     if (updateSelfState != UpdateSelfState::waitingForFollowerReboots)
@@ -24508,6 +24714,10 @@ public:
       return;
     }
     if (updateSelfFollowerRebootedPeerKeys.size() < updateSelfExpectedEchos)
+    {
+      return;
+    }
+    if (updateSelfRecoveryWitnessAcknowledgedByPeers(updateSelfFollowerRebootedPeerKeys) == false)
     {
       return;
     }
@@ -24563,6 +24773,10 @@ public:
       return;
     }
     if (updateSelfBundleEchos < updateSelfExpectedEchos)
+    {
+      return;
+    }
+    if (updateSelfRecoveryWitnessAcknowledgedByPeers(updateSelfBundleEchoPeerKeys) == false)
     {
       return;
     }
@@ -25625,7 +25839,8 @@ public:
             String serializedRuntimeState;
             ProdigyMasterAuthorityStateTransition transition;
             transition.runtimeState = masterAuthorityRuntimeState;
-            transition.runtimeState.updateSelf = {};
+            transition.runtimeState.updateSelf =
+                projectUpdateSelfRecoveryWitness(transition.runtimeState.updateSelf);
             ownBrainConfig(brainConfig, transition.brainConfig);
             BitseryEngine::serialize(serializedRuntimeState, transition);
             String transitionDigest;
@@ -26309,7 +26524,8 @@ public:
             if (applied &&
                 (incoming.runtimeState.pendingElasticAddressAssignments.empty() == false ||
                  incoming.runtimeState.pendingElasticAddressReleases.empty() == false ||
-                 machineRetirementJournalPresent(incoming.runtimeState)) &&
+                 machineRetirementJournalPresent(incoming.runtimeState) ||
+                 projectUpdateSelfRecoveryWitness(incoming.runtimeState.updateSelf).localMachineUUID != 0) &&
                 applyReplicatedMachineRetirementTopology(incoming.runtimeState) &&
                 replicatedRuntimeStateCoversPendingElasticAddressOperations(incoming.runtimeState) &&
                 prodigyComputeSHA256Hex(serialized, transitionDigest))
