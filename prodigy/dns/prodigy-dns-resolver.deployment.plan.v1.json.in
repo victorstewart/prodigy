@@ -1,4 +1,5 @@
 {
+   "apiCredentials": {"applicationID": 1, "requiredCredentialNames": []},
    "config": {
       "type": "ApplicationType::stateless",
       "applicationID": 1,

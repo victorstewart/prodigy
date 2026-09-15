@@ -2887,6 +2887,34 @@ public:
     return secretsDb.path();
   }
 
+  // Reads only the public stored snapshot record. This intentionally does not
+  // open or decrypt the snapshot secret sidecar.
+  bool readStoredClusterUUID(uint128_t& clusterUUID, String *failure = nullptr)
+  {
+    clusterUUID = 0;
+    ProdigyPersistentStoredBrainSnapshot stored = {};
+    if (loadStoredBrainSnapshotRecord(stored, failure) == false)
+    {
+      return false;
+    }
+
+    clusterUUID = stored.state.brainConfig.clusterUUID;
+    if (clusterUUID == 0)
+    {
+      if (failure)
+      {
+        failure->assign("persistent brain snapshot has no cluster UUID"_ctv);
+      }
+      return false;
+    }
+
+    if (failure)
+    {
+      failure->clear();
+    }
+    return true;
+  }
+
   void close(void)
   {
     db.close();

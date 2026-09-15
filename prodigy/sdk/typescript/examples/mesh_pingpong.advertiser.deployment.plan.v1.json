@@ -1,4 +1,5 @@
 {
+  "apiCredentials": {"applicationID": "${application:TypeScriptMeshPingPongAdvertiser}", "requiredCredentialNames": []},
    "config": {
       "type": "ApplicationType::stateless",
       "applicationID": "${application:TypeScriptMeshPingPongAdvertiser}",

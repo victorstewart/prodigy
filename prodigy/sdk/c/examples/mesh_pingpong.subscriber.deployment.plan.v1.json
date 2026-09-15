@@ -1,4 +1,5 @@
 {
+  "apiCredentials": {"applicationID": "${application:CMeshPingPongSubscriber}", "requiredCredentialNames": []},
    "config": {
       "type": "ApplicationType::stateless",
       "allowedMachineTypes": [

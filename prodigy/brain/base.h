@@ -574,11 +574,22 @@ public:
     (void)container;
     (void)termination;
   }
-  virtual void applyCredentialsToContainerPlan(const DeploymentPlan& deploymentPlan, const ContainerView& container, ContainerPlan& plan)
+  virtual bool deploymentApiCredentialsAvailableForLaunch(const DeploymentPlan& deploymentPlan, String *failure = nullptr) const
+  {
+    (void)deploymentPlan;
+    if (failure)
+    {
+      failure->clear();
+    }
+    return true;
+  }
+
+  virtual bool applyCredentialsToContainerPlan(const DeploymentPlan& deploymentPlan, const ContainerView& container, ContainerPlan& plan)
   {
     (void)deploymentPlan;
     (void)container;
     (void)plan;
+    return true;
   }
   virtual bool canControlNeurons(void) const
   {

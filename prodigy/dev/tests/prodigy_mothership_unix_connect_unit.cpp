@@ -1132,6 +1132,204 @@ int main(void)
   {
     int pair[2] = {-1, -1};
     bool pairReady = ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0;
+    suite.expect(pairReady, "credential_expiry_interleaved_fixture_created");
+    if (pairReady)
+    {
+      constexpr uint128_t clusterUUID = 0x8a12;
+      std::atomic<bool> sawSnapshotRequest = false;
+      std::atomic<bool> sawOrdinaryRequest = false;
+      std::atomic<bool> sawAcknowledgement = false;
+      String serverFailure = {};
+      std::thread server([&]() {
+        String frame = {};
+        if (recvOneMessageFrame(pair[1], frame, serverFailure) == false)
+        {
+          return;
+        }
+        Message *request = reinterpret_cast<Message *>(frame.data());
+        if (MothershipTopic(request->topic) != MothershipTopic::credentialExpiryNotices)
+        {
+          serverFailure.assign("credential expiry subscription topic missing"_ctv);
+          return;
+        }
+        uint8_t *args = request->args;
+        String serialized = {};
+        Message::extractToStringView(args, serialized);
+        ApiCredentialExpiryNoticePayload subscription = {};
+        if (args != request->terminal() ||
+            BitseryEngine::deserializeSafe(serialized, subscription) == false ||
+            subscription.clusterUUID != clusterUUID || subscription.requestSnapshot == false ||
+            subscription.includeAcknowledged)
+        {
+          serverFailure.assign("credential expiry subscription payload invalid"_ctv);
+          return;
+        }
+        sawSnapshotRequest.store(true);
+
+        if (recvOneMessageFrame(pair[1], frame, serverFailure) == false)
+        {
+          return;
+        }
+        request = reinterpret_cast<Message *>(frame.data());
+        if (MothershipTopic(request->topic) != MothershipTopic::addMachines)
+        {
+          serverFailure.assign("ordinary request missing after subscription"_ctv);
+          return;
+        }
+        sawOrdinaryRequest.store(true);
+
+        ApiCredentialExpiryNoticePayload notification = {};
+        notification.clusterUUID = clusterUUID;
+        notification.notice.stableID = 7;
+        notification.notice.applicationID = 11;
+        notification.notice.name.assign("maps"_ctv);
+        notification.notice.provider.assign("turnstile"_ctv);
+        notification.notice.generation = 3;
+        notification.notice.deadlineMs = 1'700'000'000'000LL;
+        notification.notice.createdAtMs = 1'699'000'000'000LL;
+        notification.notice.severity = ApiCredentialExpirySeverity::warning;
+        String serializedNotification = {};
+        BitseryEngine::serialize(serializedNotification, notification);
+        String notificationFrame = {};
+        Message::construct(notificationFrame, MothershipTopic::credentialExpiryNotices, serializedNotification);
+        if (sendAll(pair[1], notificationFrame, serverFailure) == false ||
+            recvOneMessageFrame(pair[1], frame, serverFailure) == false)
+        {
+          return;
+        }
+        Message *acknowledgementMessage = reinterpret_cast<Message *>(frame.data());
+        args = acknowledgementMessage->args;
+        serialized.clear();
+        Message::extractToStringView(args, serialized);
+        ApiCredentialExpiryNoticePayload acknowledgement = {};
+        if (MothershipTopic(acknowledgementMessage->topic) != MothershipTopic::credentialExpiryNotices ||
+            args != acknowledgementMessage->terminal() ||
+            BitseryEngine::deserializeSafe(serialized, acknowledgement) == false ||
+            acknowledgement.clusterUUID != clusterUUID || acknowledgement.notice.stableID != notification.notice.stableID ||
+            acknowledgement.notice.createdAtMs != notification.notice.createdAtMs || acknowledgement.requestSnapshot ||
+            acknowledgement.acknowledge == false)
+        {
+          serverFailure.assign("credential expiry acknowledgement invalid"_ctv);
+          return;
+        }
+        sawAcknowledgement.store(true);
+
+        String response = {};
+        Message::construct(response, MothershipTopic::addMachines);
+        (void)sendAll(pair[1], response, serverFailure);
+      });
+
+      MothershipSocket socket = {};
+      socket.unitTestSetExpectedClusterUUID(clusterUUID);
+      socket.unitTestAdoptLocalTransportFD(pair[0]);
+      pair[0] = -1;
+      Message::construct(socket.wBuffer, MothershipTopic::addMachines);
+      bool receivedOrdinaryResponse = socket.send() && socket.recvExpectedTopic(MothershipTopic::addMachines) != nullptr;
+      socket.close();
+      server.join();
+      ::close(pair[1]);
+      pair[1] = -1;
+      suite.expect(receivedOrdinaryResponse, "credential_expiry_interleaved_notice_preserves_ordinary_response");
+      suite.expect(sawSnapshotRequest.load() && sawOrdinaryRequest.load(), "credential_expiry_subscribes_before_first_ordinary_request");
+      suite.expect(sawAcknowledgement.load(), "credential_expiry_notice_acknowledged_after_display");
+      suite.expect(serverFailure.size() == 0, "credential_expiry_interleaved_wire_contract_valid");
+    }
+  }
+
+  {
+    int pair[2] = {-1, -1};
+    bool pairReady = ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0;
+    suite.expect(pairReady, "credential_expiry_catalog_fixture_created");
+    if (pairReady)
+    {
+      constexpr uint128_t clusterUUID = 0x8a13;
+      std::atomic<bool> sawCatalogRequest = false;
+      std::atomic<bool> sawCatalogAcknowledgement = false;
+      String serverFailure = {};
+      std::thread server([&]() {
+        String frame = {};
+        if (recvOneMessageFrame(pair[1], frame, serverFailure) == false)
+        {
+          return;
+        }
+        Message *request = reinterpret_cast<Message *>(frame.data());
+        uint8_t *args = request->args;
+        String serialized = {};
+        Message::extractToStringView(args, serialized);
+        ApiCredentialExpiryNoticePayload catalogRequest = {};
+        if (MothershipTopic(request->topic) != MothershipTopic::credentialExpiryNotices ||
+            args != request->terminal() || BitseryEngine::deserializeSafe(serialized, catalogRequest) == false ||
+            catalogRequest.clusterUUID != clusterUUID || catalogRequest.requestSnapshot == false ||
+            catalogRequest.includeAcknowledged == false)
+        {
+          serverFailure.assign("credential expiry catalog request invalid"_ctv);
+          return;
+        }
+        sawCatalogRequest.store(true);
+
+        ApiCredentialExpiryNoticePayload notification = {};
+        notification.clusterUUID = clusterUUID;
+        notification.notice.stableID = 8;
+        notification.notice.applicationID = 12;
+        notification.notice.name.assign("web"_ctv);
+        notification.notice.provider.assign("sms"_ctv);
+        notification.notice.generation = 4;
+        notification.notice.deadlineMs = 1'700'000'000'001LL;
+        notification.notice.createdAtMs = 1'699'000'000'001LL;
+        notification.notice.severity = ApiCredentialExpirySeverity::expired;
+        String serializedNotification = {};
+        BitseryEngine::serialize(serializedNotification, notification);
+        String notificationFrame = {};
+        Message::construct(notificationFrame, MothershipTopic::credentialExpiryNotices, serializedNotification);
+        if (sendAll(pair[1], notificationFrame, serverFailure) == false ||
+            recvOneMessageFrame(pair[1], frame, serverFailure) == false)
+        {
+          return;
+        }
+        Message *acknowledgementMessage = reinterpret_cast<Message *>(frame.data());
+        args = acknowledgementMessage->args;
+        serialized.clear();
+        Message::extractToStringView(args, serialized);
+        ApiCredentialExpiryNoticePayload acknowledgement = {};
+        if (MothershipTopic(acknowledgementMessage->topic) != MothershipTopic::credentialExpiryNotices ||
+            args != acknowledgementMessage->terminal() || BitseryEngine::deserializeSafe(serialized, acknowledgement) == false ||
+            acknowledgement.clusterUUID != clusterUUID || acknowledgement.notice.stableID != notification.notice.stableID ||
+            acknowledgement.notice.createdAtMs != notification.notice.createdAtMs || acknowledgement.requestSnapshot ||
+            acknowledgement.includeAcknowledged || acknowledgement.snapshotComplete || acknowledgement.acknowledge == false)
+        {
+          serverFailure.assign("credential expiry catalog acknowledgement invalid"_ctv);
+          return;
+        }
+        sawCatalogAcknowledgement.store(true);
+
+        ApiCredentialExpiryNoticePayload completion = {};
+        completion.clusterUUID = clusterUUID;
+        completion.snapshotComplete = true;
+        String serializedCompletion = {};
+        BitseryEngine::serialize(serializedCompletion, completion);
+        String completionFrame = {};
+        Message::construct(completionFrame, MothershipTopic::credentialExpiryNotices, serializedCompletion);
+        (void)sendAll(pair[1], completionFrame, serverFailure);
+      });
+
+      MothershipSocket socket = {};
+      socket.unitTestSetExpectedClusterUUID(clusterUUID);
+      socket.unitTestAdoptLocalTransportFD(pair[0]);
+      pair[0] = -1;
+      bool catalogReceived = socket.requestCredentialExpiryCatalog();
+      socket.close();
+      server.join();
+      ::close(pair[1]);
+      pair[1] = -1;
+      suite.expect(catalogReceived, "credential_expiry_catalog_receives_snapshot_complete");
+      suite.expect(sawCatalogRequest.load() && sawCatalogAcknowledgement.load(), "credential_expiry_catalog_requests_history_and_acknowledges_unacknowledged");
+      suite.expect(serverFailure.size() == 0, "credential_expiry_catalog_wire_contract_valid");
+    }
+  }
+
+  {
+    int pair[2] = {-1, -1};
+    bool pairReady = ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0;
     suite.expect(pairReady, "remote_ssh_unix_timeout_fixture_created");
     if (pairReady)
     {
@@ -1656,7 +1854,31 @@ int main(void)
           String frame = {};
           if (recvOneMessageFrame(controlFD, frame, gatewayControlFailure))
           {
-            (void)sendAll(controlFD, frame, gatewayControlFailure);
+            Message *subscriptionMessage = reinterpret_cast<Message *>(frame.data());
+            uint8_t *args = subscriptionMessage->args;
+            String serializedSubscription = {};
+            Message::extractToStringView(args, serializedSubscription);
+            ApiCredentialExpiryNoticePayload subscription = {};
+            if (MothershipTopic(subscriptionMessage->topic) != MothershipTopic::credentialExpiryNotices ||
+                args != subscriptionMessage->terminal() ||
+                BitseryEngine::deserializeSafe(serializedSubscription, subscription) == false ||
+                subscription.clusterUUID != gatewayCluster.clusterUUID || subscription.requestSnapshot == false ||
+                subscription.includeAcknowledged || subscription.acknowledge)
+            {
+              gatewayControlFailure.assign("gateway credential expiry subscription invalid"_ctv);
+            }
+            else if (recvOneMessageFrame(controlFD, frame, gatewayControlFailure))
+            {
+              Message *request = reinterpret_cast<Message *>(frame.data());
+              if (MothershipTopic(request->topic) != MothershipTopic::pullClusterReport)
+              {
+                gatewayControlFailure.assign("gateway ordinary request missing after subscription"_ctv);
+              }
+              else
+              {
+                (void)sendAll(controlFD, frame, gatewayControlFailure);
+              }
+            }
           }
           ::close(controlFD);
         });

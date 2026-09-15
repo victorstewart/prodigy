@@ -7254,6 +7254,63 @@ template <typename OutputAdapter, typename Context>
 struct ProdigyPersistentSerializerIsWriter<bitsery::Serializer<OutputAdapter, Context>> : std::true_type {
 };
 
+enum class ApiCredentialExpirySeverity : uint8_t {
+  warning,
+  expired,
+};
+
+class ApiCredentialExpiryNotice {
+public:
+  uint64_t stableID = 0;
+  uint16_t applicationID = 0;
+  String name;
+  String provider;
+  uint64_t generation = 0;
+  int64_t deadlineMs = 0;
+  int64_t createdAtMs = 0;
+  ApiCredentialExpirySeverity severity = ApiCredentialExpirySeverity::warning;
+  bool acknowledged = false;
+  bool resolved = false;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ApiCredentialExpiryNotice& notice)
+{
+  serializer.value8b(notice.stableID);
+  serializer.value2b(notice.applicationID);
+  serializer.text1b(notice.name, UINT32_MAX);
+  serializer.text1b(notice.provider, UINT32_MAX);
+  serializer.value8b(notice.generation);
+  serializer.value8b(notice.deadlineMs);
+  serializer.value8b(notice.createdAtMs);
+  serializer.value1b(notice.severity);
+  serializer.value1b(notice.acknowledged);
+  serializer.value1b(notice.resolved);
+}
+
+// One shared payload is used for Brain delivery, Mothership acknowledgement,
+// and Mothership snapshot requests. It deliberately has no credential material.
+class ApiCredentialExpiryNoticePayload {
+public:
+  uint128_t clusterUUID = 0;
+  ApiCredentialExpiryNotice notice;
+  bool includeAcknowledged = false;
+  bool requestSnapshot = false;
+  bool acknowledge = false;
+  bool snapshotComplete = false;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ApiCredentialExpiryNoticePayload& payload)
+{
+  serializer.value16b(payload.clusterUUID);
+  serializer.object(payload.notice);
+  serializer.value1b(payload.includeAcknowledged);
+  serializer.value1b(payload.requestSnapshot);
+  serializer.value1b(payload.acknowledge);
+  serializer.value1b(payload.snapshotComplete);
+}
+
 class ProdigyMasterAuthorityRuntimeState {
 public:
 
@@ -7273,6 +7330,7 @@ public:
   Vector<ProdigyStatefulWorkerTopologyUpgradeOperation> statefulWorkerTopologyUpgradeOperations;
   Vector<ProdigyDeferredStatefulScaleIntent> deferredStatefulScaleIntents;
   Vector<ProdigyMaterializedStatefulRecoveryOperation> materializedStatefulRecoveryOperations;
+  Vector<ApiCredentialExpiryNotice> apiCredentialExpiryNotices;
   Vector<ProdigyManagedMachineSchema> machineSchemas;
   Vector<RoutableResourceLease> routableResourceLeases;
   Vector<PublicTlsCertificateState> publicTlsCertificates;
@@ -7283,7 +7341,7 @@ public:
 
   bool operator==(const ProdigyMasterAuthorityRuntimeState& other) const
   {
-    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf)
+    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf)
     {
       return false;
     }
@@ -7347,8 +7405,38 @@ public:
 
     for (uint32_t index = 0; index < materializedStatefulRecoveryOperations.size(); ++index)
     {
-      const auto& a = materializedStatefulRecoveryOperations[index]; const auto& b = other.materializedStatefulRecoveryOperations[index];
-      if (a.operationID.equals(b.operationID) == false || a.activeDeploymentID != b.activeDeploymentID || a.successorDeploymentID != b.successorDeploymentID || a.successorBlobSHA256.equals(b.successorBlobSHA256) == false || a.accepted != b.accepted || a.started != b.started || a.completed != b.completed || a.updatedAtMs != b.updatedAtMs) return false;
+      const auto& a = materializedStatefulRecoveryOperations[index];
+      const auto& b = other.materializedStatefulRecoveryOperations[index];
+      if (a.operationID.equals(b.operationID) == false ||
+          a.activeDeploymentID != b.activeDeploymentID ||
+          a.successorDeploymentID != b.successorDeploymentID ||
+          a.successorBlobSHA256.equals(b.successorBlobSHA256) == false ||
+          a.accepted != b.accepted ||
+          a.started != b.started ||
+          a.completed != b.completed ||
+          a.updatedAtMs != b.updatedAtMs)
+      {
+        return false;
+      }
+    }
+
+    for (uint32_t index = 0; index < apiCredentialExpiryNotices.size(); ++index)
+    {
+      const auto& a = apiCredentialExpiryNotices[index];
+      const auto& b = other.apiCredentialExpiryNotices[index];
+      if (a.stableID != b.stableID ||
+          a.applicationID != b.applicationID ||
+          a.name.equals(b.name) == false ||
+          a.provider.equals(b.provider) == false ||
+          a.generation != b.generation ||
+          a.deadlineMs != b.deadlineMs ||
+          a.createdAtMs != b.createdAtMs ||
+          a.severity != b.severity ||
+          a.acknowledged != b.acknowledged ||
+          a.resolved != b.resolved)
+      {
+        return false;
+      }
     }
 
     for (uint32_t index = 0; index < machineSchemas.size(); ++index)
@@ -7405,18 +7493,21 @@ template <typename S>
 static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
 {
   constexpr uint64_t versionMarker = UINT64_MAX;
-  constexpr uint64_t explicitVersion = 1;
+  constexpr uint64_t explicitVersion = 2;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
   bool hasMaterializedStatefulRecoveryOperations = false;
+  bool hasApiCredentialExpiryNotices = false;
 
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
     hasMaterializedStatefulRecoveryOperations = state.materializedStatefulRecoveryOperations.empty() == false;
-    if (hasMaterializedStatefulRecoveryOperations)
+    hasApiCredentialExpiryNotices = state.apiCredentialExpiryNotices.empty() == false;
+    if (hasMaterializedStatefulRecoveryOperations || hasApiCredentialExpiryNotices)
     {
       uint64_t marker = versionMarker;
       serializer.value8b(marker);
-      uint64_t version = explicitVersion;
+
+      uint64_t version = hasApiCredentialExpiryNotices ? explicitVersion : 1;
       serializer.value8b(version);
     }
     serializer.value8b(state.generation);
@@ -7429,12 +7520,13 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
       uint64_t version = 0;
       serializer.value8b(version);
       serializer.value8b(state.generation);
-      if (version != explicitVersion || state.generation == versionMarker)
+      if ((version != 1 && version != explicitVersion) || state.generation == versionMarker)
       {
         serializer.adapter().error(bitsery::ReaderError::InvalidData);
         return;
       }
       hasMaterializedStatefulRecoveryOperations = true;
+      hasApiCredentialExpiryNotices = version >= 2;
     }
   }
 
@@ -7452,13 +7544,20 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
   serializer.object(state.pendingElasticAddressReleases);
   serializer.object(state.statefulWorkerTopologyUpgradeOperations);
   serializer.object(state.deferredStatefulScaleIntents);
-  if (hasMaterializedStatefulRecoveryOperations)
+  if (hasApiCredentialExpiryNotices)
   {
     serializer.object(state.materializedStatefulRecoveryOperations);
+    serializer.object(state.apiCredentialExpiryNotices);
+  }
+  else if (hasMaterializedStatefulRecoveryOperations)
+  {
+    serializer.object(state.materializedStatefulRecoveryOperations);
+    if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false) state.apiCredentialExpiryNotices.clear();
   }
   else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
   {
     state.materializedStatefulRecoveryOperations.clear();
+    state.apiCredentialExpiryNotices.clear();
   }
   serializer.object(state.machineSchemas);
   serializer.object(state.routableResourceLeases);

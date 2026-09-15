@@ -672,10 +672,14 @@ public:
   ProdigyMasterAuthorityRuntimeState state;
 };
 
-template <typename S>
-static void serialize(S&& serializer, LegacyRuntimeStateWire& wire)
+class VersionOneRuntimeStateWire {
+public:
+  ProdigyMasterAuthorityRuntimeState state;
+};
+
+template <bool includesMaterializedStatefulRecoveryOperations, typename S>
+static void serializeLegacyRuntimeStateFields(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
 {
-  ProdigyMasterAuthorityRuntimeState& state = wire.state;
   serializer.value8b(state.generation);
   serializer.value1b(state.hasCompletedInitialMasterElection);
   serializer.object(state.transportTLSAuthority);
@@ -691,6 +695,10 @@ static void serialize(S&& serializer, LegacyRuntimeStateWire& wire)
   serializer.object(state.pendingElasticAddressReleases);
   serializer.object(state.statefulWorkerTopologyUpgradeOperations);
   serializer.object(state.deferredStatefulScaleIntents);
+  if constexpr (includesMaterializedStatefulRecoveryOperations)
+  {
+    serializer.object(state.materializedStatefulRecoveryOperations);
+  }
   serializer.object(state.machineSchemas);
   serializer.object(state.routableResourceLeases);
   serializer.object(state.publicTlsCertificates);
@@ -698,6 +706,23 @@ static void serialize(S&& serializer, LegacyRuntimeStateWire& wire)
   serializer.object(state.taskExecutions);
   serializer.object(state.mothershipTunnelProviderDesiredState);
   serializer.object(state.updateSelf);
+}
+
+template <typename S>
+static void serialize(S&& serializer, LegacyRuntimeStateWire& wire)
+{
+  serializeLegacyRuntimeStateFields<false>(serializer, wire.state);
+}
+
+template <typename S>
+static void serialize(S&& serializer, VersionOneRuntimeStateWire& wire)
+{
+  constexpr uint64_t versionMarker = UINT64_MAX;
+  uint64_t marker = versionMarker;
+  uint64_t version = 1;
+  serializer.value8b(marker);
+  serializer.value8b(version);
+  serializeLegacyRuntimeStateFields<true>(serializer, wire.state);
 }
 
 static void testMasterAuthorityRuntimeStateRecoveryCodec(TestSuite& suite)
@@ -723,16 +748,16 @@ static void testMasterAuthorityRuntimeStateRecoveryCodec(TestSuite& suite)
                    legacyDecoded.generation == 19 &&
                    legacyDecoded.deferredStatefulScaleIntents.size() == 1 &&
                    legacyDecoded.deferredStatefulScaleIntents[0].deploymentID == nested.deploymentID &&
-                   legacyDecoded.materializedStatefulRecoveryOperations.empty(),
-               "master_authority_runtime_state_reads_populated_legacy_nested_record");
+                   legacyDecoded.materializedStatefulRecoveryOperations.empty() &&
+                   legacyDecoded.apiCredentialExpiryNotices.empty(),
+               "master_authority_runtime_state_reads_unversioned_legacy_fixture");
 
-  ProdigyMasterAuthorityRuntimeState emptyCurrent = legacy.state;
-  String emptyCurrentBytes = {};
-  BitseryEngine::serialize(emptyCurrentBytes, emptyCurrent);
-  suite.expect(emptyCurrentBytes.equals(legacyBytes),
-               "master_authority_runtime_state_empty_recovery_encoding_is_exact_legacy");
+  ProdigyMasterAuthorityRuntimeState neither = legacy.state;
+  String neitherBytes = {};
+  BitseryEngine::serialize(neitherBytes, neither);
+  suite.expect(neitherBytes.equals(legacyBytes),
+               "master_authority_runtime_state_neither_vector_keeps_legacy_layout");
 
-  ProdigyMasterAuthorityRuntimeState versioned = legacy.state;
   ProdigyMaterializedStatefulRecoveryOperation operation = {};
   operation.operationID.assign("00000000-0000-4000-8000-000000000001"_ctv);
   operation.activeDeploymentID = 0x7101000000000001ULL;
@@ -742,22 +767,79 @@ static void testMasterAuthorityRuntimeStateRecoveryCodec(TestSuite& suite)
   operation.started = true;
   operation.completed = true;
   operation.updatedAtMs = 123457;
-  versioned.materializedStatefulRecoveryOperations.push_back(operation);
-  String versionedBytes = {};
-  BitseryEngine::serialize(versionedBytes, versioned);
-  ProdigyMasterAuthorityRuntimeState versionedDecoded = {};
-  suite.expect(BitseryEngine::deserializeSafe(versionedBytes, versionedDecoded) &&
-                   versionedDecoded == versioned,
-               "master_authority_runtime_state_roundtrips_versioned_recovery_operations");
 
-  String truncated = versionedBytes;
+  ApiCredentialExpiryNotice notice = {};
+  notice.stableID = 0xdecafbadULL;
+  notice.applicationID = 6;
+  notice.name.assign("turnstile"_ctv);
+  notice.provider.assign("cloudflare"_ctv);
+  notice.generation = 4;
+  notice.deadlineMs = 123999;
+  notice.createdAtMs = 123456;
+  notice.severity = ApiCredentialExpirySeverity::warning;
+
+  ApiCredentialExpiryNoticePayload payload = {};
+  payload.clusterUUID = 0x123456789abcdef0ULL;
+  payload.notice = notice;
+  payload.includeAcknowledged = true;
+  payload.requestSnapshot = true;
+  payload.acknowledge = true;
+  payload.snapshotComplete = true;
+  String payloadBytes = {};
+  BitseryEngine::serialize(payloadBytes, payload);
+  ApiCredentialExpiryNoticePayload payloadDecoded = {};
+  suite.expect(BitseryEngine::deserializeSafe(payloadBytes, payloadDecoded) &&
+                   payloadDecoded.clusterUUID == payload.clusterUUID &&
+                   payloadDecoded.notice.stableID == payload.notice.stableID &&
+                   payloadDecoded.notice.name.equals(payload.notice.name) &&
+                   payloadDecoded.includeAcknowledged &&
+                   payloadDecoded.requestSnapshot &&
+                   payloadDecoded.acknowledge &&
+                   payloadDecoded.snapshotComplete,
+               "api_credential_expiry_notice_payload_roundtrips_catalog_flags");
+
+  ProdigyMasterAuthorityRuntimeState recoveryOnly = legacy.state;
+  recoveryOnly.materializedStatefulRecoveryOperations.push_back(operation);
+  String recoveryOnlyBytes = {};
+  BitseryEngine::serialize(recoveryOnlyBytes, recoveryOnly);
+  VersionOneRuntimeStateWire legacyVersionOne = {};
+  legacyVersionOne.state = recoveryOnly;
+  String legacyVersionOneBytes = {};
+  BitseryEngine::serialize(legacyVersionOneBytes, legacyVersionOne);
+  ProdigyMasterAuthorityRuntimeState recoveryOnlyDecoded = {};
+  suite.expect(BitseryEngine::deserializeSafe(legacyVersionOneBytes, recoveryOnlyDecoded) &&
+                   recoveryOnlyDecoded == recoveryOnly &&
+                   recoveryOnlyDecoded.apiCredentialExpiryNotices.empty(),
+               "master_authority_runtime_state_reads_legacy_v1_fixture");
+  suite.expect(recoveryOnlyBytes.equals(legacyVersionOneBytes),
+               "master_authority_runtime_state_writes_legacy_v1_recovery_layout");
+
+  ProdigyMasterAuthorityRuntimeState noticeOnly = legacy.state;
+  noticeOnly.apiCredentialExpiryNotices.push_back(notice);
+  String noticeOnlyBytes = {};
+  BitseryEngine::serialize(noticeOnlyBytes, noticeOnly);
+  ProdigyMasterAuthorityRuntimeState noticeOnlyDecoded = {};
+  suite.expect(BitseryEngine::deserializeSafe(noticeOnlyBytes, noticeOnlyDecoded) &&
+                   noticeOnlyDecoded == noticeOnly &&
+                   noticeOnlyDecoded.materializedStatefulRecoveryOperations.empty(),
+               "master_authority_runtime_state_roundtrips_v2_notice_only");
+
+  ProdigyMasterAuthorityRuntimeState both = recoveryOnly;
+  both.apiCredentialExpiryNotices.push_back(notice);
+  String bothBytes = {};
+  BitseryEngine::serialize(bothBytes, both);
+  ProdigyMasterAuthorityRuntimeState bothDecoded = {};
+  suite.expect(BitseryEngine::deserializeSafe(bothBytes, bothDecoded) && bothDecoded == both,
+               "master_authority_runtime_state_roundtrips_v2_recovery_and_notice");
+
+  String truncated = bothBytes;
   truncated.resize(8);
   ProdigyMasterAuthorityRuntimeState malformed = {};
   suite.expect(BitseryEngine::deserializeSafe(truncated, malformed) == false,
                "master_authority_runtime_state_rejects_truncated_version_marker");
 
-  String unknownVersion = versionedBytes;
-  uint64_t unsupportedVersion = 2;
+  String unknownVersion = bothBytes;
+  uint64_t unsupportedVersion = 3;
   memcpy(unknownVersion.data() + sizeof(uint64_t), &unsupportedVersion, sizeof(unsupportedVersion));
   malformed = {};
   suite.expect(BitseryEngine::deserializeSafe(unknownVersion, malformed) == false,
@@ -1466,6 +1548,11 @@ int main(void)
     suite.expect(equalBootStates(storedBootState, cachedBootState), "brain_commit_success_updates_boot_cache");
     suite.expect(failure.size() == 0, "brain_commit_success_clears_failure");
 
+    uint128_t storedClusterUUID = 0;
+    suite.expect(store.readStoredClusterUUID(storedClusterUUID, &failure) &&
+                     storedClusterUUID == storedSnapshot.brainConfig.clusterUUID,
+                 "brain_commit_success_reads_public_snapshot_cluster_uuid");
+
     ProdigyPersistentBrainSnapshot loadedSnapshot = {};
     ProdigyPersistentBootState loadedBootState = {};
     suite.expect(store.loadBrainSnapshot(loadedSnapshot, &failure), "brain_commit_success_loads_snapshot");
@@ -2173,6 +2260,11 @@ int main(void)
     bool missingSnapshot = store.loadBrainSnapshot(loadedSnapshot, &failure);
     suite.expect(missingSnapshot == false, "load_snapshot_missing");
     suite.expect(failure.equals("record not found"_ctv), "load_snapshot_missing_reason");
+
+    uint128_t missingClusterUUID = 0;
+    suite.expect(store.readStoredClusterUUID(missingClusterUUID, &failure) == false &&
+                     missingClusterUUID == 0 && failure.equals("record not found"_ctv),
+                 "read_stored_cluster_uuid_rejects_missing_snapshot");
 
     uint128_t generatedLocalBrainUUID = 0;
     suite.expect(store.loadOrCreateLocalBrainUUID(generatedLocalBrainUUID, &failure), "load_or_create_local_brain_uuid");

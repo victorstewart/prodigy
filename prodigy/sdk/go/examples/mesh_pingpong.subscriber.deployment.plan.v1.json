@@ -1,4 +1,5 @@
 {
+  "apiCredentials": {"applicationID": "${application:GoMeshPingPongSubscriber}", "requiredCredentialNames": []},
    "config": {
       "type": "ApplicationType::stateless",
       "allowedMachineTypes": [

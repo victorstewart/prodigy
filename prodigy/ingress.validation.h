@@ -286,6 +286,7 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
     case MothershipTopic::reserveServiceID:
     case MothershipTopic::upsertTlsVaultFactory:
     case MothershipTopic::upsertApiCredentialSet:
+    case MothershipTopic::credentialExpiryNotices:
     case MothershipTopic::mintClientTlsIdentity:
     case MothershipTopic::registerRoutableSubnet:
     case MothershipTopic::unregisterRoutableSubnet:

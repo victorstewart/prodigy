@@ -6525,17 +6525,16 @@ public:
   {
     WorkBase *work = meta->getBase();
 
-    if (work->lifecycle == LifecycleOp::updateInPlace)
+    // Any abandoned work can leave a planned pointer on its live container.
+    // Clear only pointers to this work: linked construct/destruct pairs may
+    // still be retained by the failure policy until their owner is reclaimed.
+    if (work->container && work->container->plannedWork == meta)
     {
-      // Clear both new and old containers' plannedWork to avoid dangling pointers
-      if (work->container)
-      {
-        work->container->plannedWork = nullptr; // because the destruction container cleans this up
-      }
-      if (work->oldContainer)
-      {
-        work->oldContainer->plannedWork = nullptr;
-      }
+      work->container->plannedWork = nullptr;
+    }
+    if (work->oldContainer && work->oldContainer->plannedWork == meta)
+    {
+      work->oldContainer->plannedWork = nullptr;
     }
 
     // sever any links
@@ -8678,6 +8677,27 @@ public:
 
   void schedule(CoroutineStack *waiter = nullptr)
   {
+    // A failed deployment remains owned by its failure path. Late health or
+    // credential callbacks must not resume queued construction or destruction.
+    if (state == DeploymentState::failed && operatorCancellationOwnsTransition == false)
+    {
+      co_return;
+    }
+
+    String credentialFailure = {};
+    if (operatorCancellationOwnsTransition == false &&
+        thisBrain->deploymentApiCredentialsAvailableForLaunch(plan, &credentialFailure) == false)
+    {
+      state = DeploymentState::failed;
+      thisBrain->deploymentFailed(
+          this,
+          plan.config.applicationID,
+          plan.config.deploymentID(),
+          credentialFailure.size() ? credentialFailure : String("credential policy unavailable for container launch"_ctv),
+          generateReport());
+      co_return;
+    }
+
     if (plan.isStateful)
     {
 #if PRODIGY_DEBUG
@@ -8708,8 +8728,16 @@ public:
     }
 
     LifecycleOp last = LifecycleOp::none;
+    bool credentialLaunchFailed = false;
 
     auto executeWork = [&]<typename T>(T& work) -> void {
+      // Coroutine continuations resume after schedule's entry checks.
+      if (state == DeploymentState::failed && operatorCancellationOwnsTransition == false)
+      {
+        cancelDeploymentWork(currentlyExecutingWork);
+        credentialLaunchFailed = true;
+        return;
+      }
       last = work.lifecycle;
 
       Machine *machine = work.machine;
@@ -8834,14 +8862,43 @@ public:
         case LifecycleOp::updateInPlace:
         case LifecycleOp::construct:
           {
+            String credentialFailure = {};
+            if (thisBrain->deploymentApiCredentialsAvailableForLaunch(plan, &credentialFailure) == false)
+            {
+              state = DeploymentState::failed;
+              thisBrain->deploymentFailed(
+                  this,
+                  plan.config.applicationID,
+                  plan.config.deploymentID(),
+                  credentialFailure.size() ? credentialFailure : String("credential policy unavailable for container launch"_ctv),
+                  generateReport());
+              cancelDeploymentWork(currentlyExecutingWork);
+              credentialLaunchFailed = true;
+              break;
+            }
+
+            ContainerView *container = work.container;
+            ContainerPlan credentialPlan = {};
+            if (thisBrain->applyCredentialsToContainerPlan(plan, *container, credentialPlan) == false)
+            {
+              state = DeploymentState::failed;
+              thisBrain->deploymentFailed(
+                  this,
+                  plan.config.applicationID,
+                  plan.config.deploymentID(),
+                  "credential policy unavailable while building container launch bundle"_ctv,
+                  generateReport());
+              cancelDeploymentWork(currentlyExecutingWork);
+              credentialLaunchFailed = true;
+              break;
+            }
+
             ContainerView *replacingContainer = nullptr;
 
             if (work.lifecycle == LifecycleOp::updateInPlace)
             {
               replacingContainer = work.oldContainer;
             }
-
-            ContainerView *container = work.container;
 
             container->state = ContainerState::scheduled;
             container->remainingSubscriberCapacity = plan.minimumSubscriberCapacity;
@@ -8876,6 +8933,24 @@ public:
               }
             }
 
+            uint128_t replaceContainerUUID = 0;
+            if (replacingContainer)
+            {
+              replaceContainerUUID = replacingContainer->uuid;
+
+              // Allocate the successor fragment before releasing its predecessor.
+              // Retire the predecessor's mesh edges before successor setup so the
+              // bootstrap snapshot cannot retain a same-host stale peer. The real
+              // replacement kill still happens through spinContainer below.
+              ApplicationDeployment *destructionOwner = containerDeploymentOwner(replacingContainer);
+              destructionOwner->releaseContainerPlacementCounts(replacingContainer);
+              if (replacingContainer->state == ContainerState::healthy)
+              {
+                replacingContainer->state = ContainerState::aboutToDestroy;
+              }
+              destructionOwner->destructContainer(replacingContainer, false);
+            }
+
             setupContainerServices(container);
 
             ApplicationConfig containerConfig = resourceConfigForContainer(container);
@@ -8887,7 +8962,8 @@ public:
             {
               prodigyPopulateDefaultStatefulTopology(containerPlan.statefulTopology, containerPlan.shardGroup, containerPlan.config);
             }
-            thisBrain->applyCredentialsToContainerPlan(plan, *container, containerPlan);
+            containerPlan.hasCredentialBundle = credentialPlan.hasCredentialBundle;
+            containerPlan.credentialBundle = std::move(credentialPlan.credentialBundle);
             container->hasCredentialBundle = containerPlan.hasCredentialBundle;
             container->credentialBundle = containerPlan.credentialBundle;
             container->hasPendingCredentialBundle = false;
@@ -8900,23 +8976,6 @@ public:
 
             String buffer;
             BitseryEngine::serialize(buffer, bootstrap);
-
-            uint128_t replaceContainerUUID = 0;
-            if (replacingContainer)
-            {
-              replaceContainerUUID = replacingContainer->uuid;
-
-              // Allocate the successor fragment before releasing its predecessor.
-              // Retirement removes owner indexes; the real kill ack alone deletes
-              // the global view after Neuron has captured the stopped process data.
-              ApplicationDeployment *destructionOwner = containerDeploymentOwner(replacingContainer);
-              destructionOwner->releaseContainerPlacementCounts(replacingContainer);
-              if (replacingContainer->state == ContainerState::healthy)
-              {
-                replacingContainer->state = ContainerState::aboutToDestroy;
-              }
-              destructionOwner->destructContainer(replacingContainer, false);
-            }
 
 #if PRODIGY_DEBUG
             PRODIGY_DEBUG_LOG( "schedule spinContainer deploymentID=%llu appID=%u machinePrivate4=%u containerUUID=%llu replaceUUID=%llu state=%d waitingBefore=%llu\n",
@@ -9067,6 +9126,22 @@ public:
         }
 
         executeWork(*work);
+      }
+
+      if (credentialLaunchFailed)
+      {
+        currentlyExecutingWork = nullptr;
+        Vector<DeploymentWork *> abandonedWork = toSchedule;
+        toSchedule.erase(workAnon);
+        workPool.relinquish(workAnon);
+        for (DeploymentWork *abandoned : abandonedWork)
+        {
+          if (abandoned != workAnon)
+          {
+            cancelDeploymentWork(abandoned);
+          }
+        }
+        break;
       }
 
       currentlyExecutingWork = nullptr;

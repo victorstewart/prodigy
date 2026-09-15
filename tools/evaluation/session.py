@@ -121,6 +121,7 @@ class Client:
         assets = self.root / "examples/hello-prodigy"
         plan = json.loads((assets / f"hello-prodigy-v{version}.deployment.plan.v1.json").read_text())
         plan["config"]["applicationID"] = self.state["applicationID"]
+        plan["apiCredentials"]["applicationID"] = self.state["applicationID"]
         plan["config"]["architecture"] = self.state["architecture"]
         plan["wormholes"][0]["routablePrefixUUID"] = self.state["routablePrefixUUID"]
         target = self.run / f"deployment-v{version}.json"
