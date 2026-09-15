@@ -4964,161 +4964,62 @@ private:
 
   bool connectRemoteMachineUnixSocket(const MothershipProdigyClusterMachine& machine, const String& path, String *failure = nullptr)
   {
-    String sshUser = {};
-    sshUser.assign(machine.ssh.user);
-    String sshPrivateKeyPath = {};
-    sshPrivateKeyPath.assign(machine.ssh.privateKeyPath);
     String socketPath = {};
     socketPath.assign(path);
-    basics_log("mothership control ssh-unix-start target=%s ssh=%.*s:%u user=%s path=%s\n",
+    basics_log("mothership control ssh-unix-start target=%s ssh=%.*s:%u path=%s\n",
                targetLabel.c_str(),
                int(machine.ssh.address.size()),
                reinterpret_cast<const char *>(machine.ssh.address.data()),
                unsigned(machine.ssh.port),
-               sshUser.c_str(),
                socketPath.c_str());
 
     disconnectSSH();
 
-    uint64_t nonce = Time::now<TimeResolution::us>();
-    String localTunnelPath = {};
-    localTunnelPath.snprintf<"/tmp/prodigy-mothership-ssh-{itoa}-{itoa}.sock"_ctv>(uint64_t(::getpid()), nonce);
-    (void)::unlink(localTunnelPath.c_str());
-    String knownHostsPath = {};
-    String knownHostLine = {};
-    if (renderOpenSSHKnownHostLine(machine.ssh.address, machine.ssh.port, machine.ssh.hostPublicKeyOpenSSH, knownHostLine, failure) == false)
-    {
-      return false;
-    }
-    knownHostsPath.snprintf<"/tmp/prodigy-mothership-known-hosts-{itoa}-{itoa}"_ctv>(uint64_t(::getpid()), nonce);
-    if (prodigyWriteLocalFile(knownHostsPath, knownHostLine, 0600, failure) == false)
+    LIBSSH2_SESSION *session = nullptr;
+    int fd = -1;
+    if (mothershipConnectSSHSession(
+            machine,
+            session,
+            fd,
+            failure,
+            &clusterBootstrapSshKeyPackage,
+            &clusterBootstrapSshPrivateKeyPath) == false)
     {
       return false;
     }
 
-    pid_t pid = ::fork();
-    if (pid < 0)
+    libssh2_session_set_timeout(session, uint32_t(sshTransportIOTimeoutMs));
+    LIBSSH2_CHANNEL *channel = libssh2_channel_direct_streamlocal_ex(
+        session,
+        socketPath.c_str(),
+        "127.0.0.1",
+        0);
+    if (channel == nullptr)
     {
-      (void)::unlink(knownHostsPath.c_str());
       if (failure)
       {
-        failure->assign("failed to fork ssh tunnel"_ctv);
+        failure->assign("failed to open remote mothership unix control stream: "_ctv);
+        mothershipAppendSSHSessionLastError(session, *failure);
       }
+      mothershipCloseSSHSession(session, fd);
       return false;
     }
 
-    if (pid == 0)
-    {
-      int devNullFD = ::open("/dev/null", O_RDWR);
-      if (devNullFD >= 0)
-      {
-        (void)::dup2(devNullFD, STDIN_FILENO);
-        (void)::dup2(devNullFD, STDOUT_FILENO);
-        (void)::dup2(devNullFD, STDERR_FILENO);
-        if (devNullFD > STDERR_FILENO)
-        {
-          ::close(devNullFD);
-        }
-      }
-
-      String sshTarget = {};
-      sshTarget.snprintf<"{}@{}"_ctv>(sshUser, machine.ssh.address);
-      String sshPortText = {};
-      sshPortText.assignItoa(machine.ssh.port);
-      String knownHostsOption = {};
-      knownHostsOption.snprintf<"UserKnownHostsFile={}"_ctv>(knownHostsPath);
-
-      const char *argv[] = {
-          "ssh",
-          "-o", "BatchMode=yes",
-          "-o", "ExitOnForwardFailure=yes",
-          "-o", "StreamLocalBindUnlink=yes",
-          "-o", "StrictHostKeyChecking=yes",
-          "-o", nullptr,
-          "-i", sshPrivateKeyPath.c_str(),
-          "-p", sshPortText.c_str(),
-          "-nNT",
-          "-L", nullptr,
-          sshTarget.c_str(),
-          nullptr};
-
-      String forwardSpec = {};
-      forwardSpec.snprintf<"{}:{}"_ctv>(localTunnelPath, path);
-      argv[10] = knownHostsOption.c_str();
-      argv[17] = forwardSpec.c_str();
-      ::execvp("ssh", const_cast<char *const *>(argv));
-      _exit(111);
-    }
-
-    int64_t deadlineMs = Time::now<TimeResolution::ms>() + sshTransportIOTimeoutMs;
-    for (;;)
-    {
-      if (mothershipPathIsUnixSocket(localTunnelPath))
-      {
-        sshTunnelPID = pid;
-        sshTunnelSocketPath.assign(localTunnelPath);
-        sshTunnelKnownHostsPath.assign(knownHostsPath);
-        if (connectLocalUnixSocket(localTunnelPath))
-        {
-          if (setRemoteSshUnixTransportNonblocking() == false)
-          {
-            disconnectLocal();
-            disconnectSSH();
-            if (failure)
-            {
-              *failure = lastConnectFailure;
-            }
-            return false;
-          }
-
-          lastConnectFailure.clear();
-          lastIOFailure.clear();
-          basics_log("mothership control connect mode=remoteSshUnix target=%s ssh=%.*s:%u path=%.*s tunnel=%s tunnelPid=%d fd=%d\n",
-                     targetLabel.c_str(),
-                     int(machine.ssh.address.size()),
-                     reinterpret_cast<const char *>(machine.ssh.address.data()),
-                     unsigned(machine.ssh.port),
-                     int(path.size()),
-                     reinterpret_cast<const char *>(path.data()),
-                     localTunnelPath.c_str(),
-                     int(pid),
-                     transportFD);
-          return true;
-        }
-      }
-
-      int status = 0;
-      pid_t waited = ::waitpid(pid, &status, WNOHANG);
-      if (waited == pid)
-      {
-        (void)::unlink(localTunnelPath.c_str());
-        (void)::unlink(knownHostsPath.c_str());
-        if (failure)
-        {
-          failure->snprintf<"ssh tunnel exited before unix socket became ready for {} via ssh {}:{} status={itoa}"_ctv>(
-              path,
-              machine.ssh.address,
-              unsigned(machine.ssh.port),
-              uint64_t(status));
-        }
-        return false;
-      }
-
-      if (Time::now<TimeResolution::ms>() >= deadlineMs)
-      {
-        (void)::kill(pid, SIGKILL);
-        (void)::waitpid(pid, nullptr, 0);
-        (void)::unlink(localTunnelPath.c_str());
-        (void)::unlink(knownHostsPath.c_str());
-        if (failure)
-        {
-          failure->snprintf<"timed out waiting for ssh tunnel {} via ssh {}:{itoa}"_ctv>(path, machine.ssh.address, unsigned(machine.ssh.port));
-        }
-        return false;
-      }
-
-      ::usleep(25 * 1000);
-    }
+    libssh2_session_set_blocking(session, 0);
+    sshSession = session;
+    sshChannel = channel;
+    sshFD = fd;
+    lastConnectFailure.clear();
+    lastIOFailure.clear();
+    basics_log("mothership control connect mode=remoteSshUnix target=%s ssh=%.*s:%u path=%.*s fd=%d\n",
+               targetLabel.c_str(),
+               int(machine.ssh.address.size()),
+               reinterpret_cast<const char *>(machine.ssh.address.data()),
+               unsigned(machine.ssh.port),
+               int(path.size()),
+               reinterpret_cast<const char *>(path.data()),
+               fd);
+    return true;
   }
 
   bool connectCluster(void)

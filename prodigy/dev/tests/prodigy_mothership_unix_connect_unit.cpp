@@ -8,6 +8,8 @@
 #include <string>
 #include <thread>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -25,6 +27,7 @@
 #include <prodigy/mothership/mothership.cpp>
 #undef main
 #include <prodigy/mothership/mothership.tunnel.gateway.h>
+#include <prodigy/dev/tests/prodigy_test_ssh_keys.h>
 
 class TestSuite {
 public:
@@ -114,6 +117,172 @@ public:
   ~ScopedProcess()
   {
     terminate();
+  }
+};
+
+static uint16_t reserveLoopbackPort(void)
+{
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0)
+  {
+    return 0;
+  }
+
+  sockaddr_in address = {};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (::bind(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0)
+  {
+    ::close(fd);
+    return 0;
+  }
+
+  sockaddr_in bound = {};
+  socklen_t boundSize = sizeof(bound);
+  bool okay = ::getsockname(fd, reinterpret_cast<sockaddr *>(&bound), &boundSize) == 0;
+  ::close(fd);
+  return okay ? ntohs(bound.sin_port) : 0;
+}
+
+class ScopedControlSSHD {
+public:
+
+  String root = {};
+  String hostPublicKeyOpenSSH = {};
+  String failure = {};
+  uint16_t port = 0;
+  pid_t pid = -1;
+
+  ScopedControlSSHD()
+  {
+    char scratch[] = "/tmp/prodigy-mothership-unix-sshd-XXXXXX";
+    char *created = ::mkdtemp(scratch);
+    if (created == nullptr)
+    {
+      failure.assign("failed to create sshd fixture directory"_ctv);
+      return;
+    }
+    root.assign(created);
+
+    String sshdPath = {};
+    for (const char *candidate : {"/usr/sbin/sshd", "/usr/bin/sshd"})
+    {
+      if (::access(candidate, X_OK) == 0)
+      {
+        sshdPath.assign(candidate);
+        break;
+      }
+    }
+    if (sshdPath.size() == 0 || prodigyReadBootstrapSSHPublicKey(prodigyTestSSHDHostPrivateKeyPath(), hostPublicKeyOpenSSH, &failure) == false)
+    {
+      if (failure.size() == 0)
+      {
+        failure.assign("sshd fixture executable unavailable"_ctv);
+      }
+      return;
+    }
+
+    port = reserveLoopbackPort();
+    if (port == 0)
+    {
+      failure.assign("failed to reserve sshd fixture port"_ctv);
+      return;
+    }
+
+    String hostKeyPath = {};
+    String authorizedKeysPath = {};
+    String pidPath = {};
+    String logPath = {};
+    String configPath = {};
+    hostKeyPath.snprintf<"{}/host_ed25519_key"_ctv>(root);
+    authorizedKeysPath.snprintf<"{}/authorized_keys"_ctv>(root);
+    pidPath.snprintf<"{}/sshd.pid"_ctv>(root);
+    logPath.snprintf<"{}/sshd.log"_ctv>(root);
+    configPath.snprintf<"{}/sshd_config"_ctv>(root);
+    std::error_code copyError = {};
+    std::filesystem::copy_file(
+        std::filesystem::path(prodigyTestSSHDHostPrivateKeyPath().c_str()),
+        std::filesystem::path(hostKeyPath.c_str()),
+        std::filesystem::copy_options::overwrite_existing,
+        copyError);
+    if (copyError || ::chmod(hostKeyPath.c_str(), 0600) != 0)
+    {
+      failure.assign("failed to prepare sshd fixture host key"_ctv);
+      return;
+    }
+    copyError.clear();
+    std::filesystem::copy_file(
+        std::filesystem::path(prodigyTestClientSSHPublicKeyPath().c_str()),
+        std::filesystem::path(authorizedKeysPath.c_str()),
+        std::filesystem::copy_options::overwrite_existing,
+        copyError);
+    if (copyError || ::chmod(authorizedKeysPath.c_str(), 0600) != 0)
+    {
+      failure.assign("failed to prepare sshd fixture authorized keys"_ctv);
+      return;
+    }
+    String config = {};
+    config.snprintf<"Port {itoa}\nListenAddress 127.0.0.1\nHostKey {}\nPidFile {}\nPermitRootLogin yes\nPubkeyAuthentication yes\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nChallengeResponseAuthentication no\nUsePAM no\nStrictModes no\nAuthorizedKeysFile {}\nAllowStreamLocalForwarding yes\nLogLevel ERROR\n"_ctv>(
+        uint64_t(port),
+        hostKeyPath,
+        pidPath,
+        authorizedKeysPath);
+    if (Filesystem::openWriteAtClose(-1, configPath, config) < 0)
+    {
+      failure.assign("failed to write sshd fixture config"_ctv);
+      return;
+    }
+
+    pid = ::fork();
+    if (pid == 0)
+    {
+      execl(sshdPath.c_str(), sshdPath.c_str(), "-D", "-e", "-f", configPath.c_str(), "-E", logPath.c_str(), nullptr);
+      _exit(127);
+    }
+    if (pid < 0)
+    {
+      failure.assign("failed to fork sshd fixture"_ctv);
+      return;
+    }
+
+    for (uint32_t attempt = 0; attempt < 60; ++attempt)
+    {
+      int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+      sockaddr_in address = {};
+      address.sin_family = AF_INET;
+      address.sin_port = htons(port);
+      address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      bool ready = fd >= 0 && ::connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0;
+      if (fd >= 0)
+      {
+        ::close(fd);
+      }
+      if (ready)
+      {
+        return;
+      }
+      ::usleep(50 * 1000);
+    }
+    failure.assign("sshd fixture did not become ready"_ctv);
+  }
+
+  ~ScopedControlSSHD()
+  {
+    if (pid > 0)
+    {
+      (void)::kill(pid, SIGTERM);
+      (void)::waitpid(pid, nullptr, 0);
+    }
+    if (root.size() > 0)
+    {
+      std::error_code ignored = {};
+      std::filesystem::remove_all(std::filesystem::path(root.c_str()), ignored);
+    }
+  }
+
+  bool ready(void) const
+  {
+    return pid > 0 && failure.size() == 0;
   }
 };
 
@@ -981,6 +1150,91 @@ int main(void)
         suite.expect(elapsedMs >= 15 && elapsedMs < 1000, "remote_ssh_unix_timeout_honors_deadline");
       }
       ::close(pair[1]);
+    }
+  }
+
+  {
+    ScopedControlSSHD sshd = {};
+    suite.expect(sshd.ready(), "remote_ssh_unix_streamlocal_fixture_ready");
+    ScopedUnixListener remoteListener = {};
+    String remoteListenerFailure = {};
+    bool remoteReady = createUnixListener(remoteListener, remoteListenerFailure);
+    suite.expect(remoteReady, "remote_ssh_unix_listener_created");
+    if (sshd.ready() && remoteReady)
+    {
+      uint16_t unavailablePort = reserveLoopbackPort();
+      suite.expect(unavailablePort != 0, "remote_ssh_unix_streamlocal_unavailable_port_reserved");
+      if (unavailablePort != 0)
+      {
+        auto makeRemoteBrain = [&](uint16_t port) {
+          ClusterMachine machine = makeAdoptedMachine("127.0.0.1"_ctv, true);
+          machine.ssh.address.assign("127.0.0.1"_ctv);
+          machine.ssh.port = port;
+          machine.ssh.user.assign("root"_ctv);
+          machine.ssh.privateKeyPath = prodigyTestClientSSHPrivateKeyPath();
+          machine.ssh.hostPublicKeyOpenSSH = sshd.hostPublicKeyOpenSSH;
+          return machine;
+        };
+
+        MothershipProdigyCluster fallbackCluster = {};
+        fallbackCluster.name.assign("remote-ssh-unix-fallback"_ctv);
+        fallbackCluster.deploymentMode = MothershipClusterDeploymentMode::remote;
+        fallbackCluster.bootstrapSshUser.assign("root"_ctv);
+        fallbackCluster.bootstrapSshPrivateKeyPath = prodigyTestClientSSHPrivateKeyPath();
+        String missingSocketPath = remoteListener.path;
+        missingSocketPath.append(".missing"_ctv);
+        fallbackCluster.controls.push_back(makeUnixControl(missingSocketPath));
+        fallbackCluster.controls.push_back(makeUnixControl(remoteListener.path));
+        fallbackCluster.topology.machines.push_back(makeRemoteBrain(unavailablePort));
+        fallbackCluster.topology.machines.push_back(makeRemoteBrain(sshd.port));
+        String failure = {};
+        Vector<MothershipProdigyClusterMachine> candidates = {};
+        MothershipSocket fallbackSocket = {};
+        suite.expect(fallbackSocket.configureCluster(fallbackCluster, &failure), "remote_ssh_unix_streamlocal_fallback_configures");
+        fallbackSocket.setRemoteIOTimeoutMs(2'000);
+        bool connected = fallbackSocket.connect() == 0;
+        suite.expect(connected, "remote_ssh_unix_streamlocal_fallback_skips_absent_remote_socket");
+        if (connected)
+        {
+          ControlServerState state = {};
+          String echoFailure = {};
+          std::thread echo([&]() {
+            int peer = -1;
+            if (acceptNextClient(remoteListener.fd, state, peer))
+            {
+              String frame = {};
+              if (recvOneMessageFrame(peer, frame, echoFailure))
+                (void)sendAll(peer, frame, echoFailure);
+              ::close(peer);
+            }
+          });
+          Message::construct(fallbackSocket.wBuffer, MothershipTopic::pullClusterReport);
+          bool echoed = fallbackSocket.send() && fallbackSocket.recvExpectedTopic(MothershipTopic::pullClusterReport) != nullptr;
+          fallbackSocket.close();
+          state.stopRequested = true;
+          echo.join();
+          suite.expect(echoed && echoFailure.size() == 0, "remote_ssh_unix_streamlocal_round_trip_after_fallback");
+        }
+
+        MothershipProdigyCluster missingSocketCluster = fallbackCluster;
+        missingSocketCluster.name.assign("remote-ssh-unix-missing-socket"_ctv);
+        missingSocketCluster.topology.machines.clear();
+        missingSocketCluster.topology.machines.push_back(makeRemoteBrain(sshd.port));
+        missingSocketCluster.controls.clear();
+        missingSocketCluster.controls.push_back(makeUnixControl(missingSocketPath));
+        Mothership missingSocketMothership = {};
+        suite.expect(missingSocketMothership.unitTestConfigureClusterSocket(missingSocketCluster, candidates, &failure), "remote_ssh_unix_streamlocal_missing_socket_configures");
+        suite.expect(missingSocketMothership.unitTestConnectConfiguredSocket(failure) == false, "remote_ssh_unix_streamlocal_missing_socket_rejected_before_request");
+
+        MothershipProdigyCluster unavailableCluster = fallbackCluster;
+        unavailableCluster.name.assign("remote-ssh-unix-all-unavailable"_ctv);
+        unavailableCluster.topology.machines.clear();
+        unavailableCluster.topology.machines.push_back(makeRemoteBrain(unavailablePort));
+        unavailableCluster.topology.machines.push_back(makeRemoteBrain(unavailablePort));
+        Mothership unavailableMothership = {};
+        suite.expect(unavailableMothership.unitTestConfigureClusterSocket(unavailableCluster, candidates, &failure), "remote_ssh_unix_all_unavailable_configures");
+        suite.expect(unavailableMothership.unitTestConnectConfiguredSocket(failure) == false, "remote_ssh_unix_all_unavailable_fails_without_request");
+      }
     }
   }
 
