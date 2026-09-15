@@ -1589,12 +1589,12 @@ private:
         continue;
       }
 
-      ApplicationDeployment *thisDeployment = thisBrain->deployments[deploymentID];
-
-      if (thisDeployment == nullptr)
+      auto deploymentIterator = thisBrain->deployments.find(deploymentID);
+      if (deploymentIterator == thisBrain->deployments.end() || deploymentIterator->second == nullptr)
       {
         continue;
       }
+      ApplicationDeployment *thisDeployment = deploymentIterator->second;
       if (thisDeployment->statelessCompactionDonorIsQuiescent() == false)
       {
         continue;
