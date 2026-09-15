@@ -2229,10 +2229,13 @@ public:
   String transportTLSAuthorityClusterRootKeyPem;
   String mothershipTunnelGatewayServerKeyPem;
   Vector<ProdigyPersistentPendingAddMachinesOperationSecrets> pendingAddMachinesOperationSecrets;
+  // Container bootstraps contain credential bundles and transport identities.
+  // Keep the exact replay payload in the existing private snapshot sidecar.
+  Vector<String> localContainerBootstraps;
 
   bool empty(void) const
   {
-    return bootstrapSshPrivateKeyOpenSSH.size() == 0 && bootstrapSshHostPrivateKeyOpenSSH.size() == 0 && dnsCredentialMaterial.size() == 0 && tlsVaultFactorySecretsByApp.empty() && apiCredentialSecretsByApp.empty() && tlsResumptionEpochSecrets.empty() && publicTlsCertificateSecrets.empty() && transportTLSAuthorityClusterRootKeyPem.size() == 0 && mothershipTunnelGatewayServerKeyPem.size() == 0 && pendingAddMachinesOperationSecrets.empty();
+    return bootstrapSshPrivateKeyOpenSSH.size() == 0 && bootstrapSshHostPrivateKeyOpenSSH.size() == 0 && dnsCredentialMaterial.size() == 0 && tlsVaultFactorySecretsByApp.empty() && apiCredentialSecretsByApp.empty() && tlsResumptionEpochSecrets.empty() && publicTlsCertificateSecrets.empty() && transportTLSAuthorityClusterRootKeyPem.size() == 0 && mothershipTunnelGatewayServerKeyPem.size() == 0 && pendingAddMachinesOperationSecrets.empty() && localContainerBootstraps.empty();
   }
 
   void clear(void)
@@ -2274,6 +2277,11 @@ public:
     tlsResumptionEpochSecrets.clear();
     publicTlsCertificateSecrets.clear();
     pendingAddMachinesOperationSecrets.clear();
+    for (String& bootstrap : localContainerBootstraps)
+    {
+      prodigyClearPersistentSecretString(bootstrap);
+    }
+    localContainerBootstraps.clear();
   }
 };
 
@@ -2290,6 +2298,17 @@ static void serialize(S&& serializer, ProdigyPersistentBrainSnapshotSecrets& sec
   serializer.text1b(secrets.transportTLSAuthorityClusterRootKeyPem, UINT32_MAX);
   serializer.text1b(secrets.mothershipTunnelGatewayServerKeyPem, UINT32_MAX);
   serializer.object(secrets.pendingAddMachinesOperationSecrets);
+  // This sidecar is a top-level record. Older records end at the preceding
+  // field; their bootstraps remain in the public snapshot until the next save.
+  using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
+  if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
+  {
+    serializer.object(secrets.localContainerBootstraps);
+  }
+  else if (serializer.adapter().isCompletedSuccessfully() == false)
+  {
+    serializer.object(secrets.localContainerBootstraps);
+  }
 }
 
 class ProdigyPersistentLocalBrainStateSecrets {
@@ -2346,6 +2365,10 @@ static inline void prodigyExtractPersistentBrainSnapshotSecrets(
 {
   publicSnapshot = std::move(snapshot);
   secrets.clear();
+
+  secrets.localContainerBootstraps =
+      std::move(publicSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps);
+  publicSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps.clear();
 
   secrets.bootstrapSshPrivateKeyOpenSSH = publicSnapshot.brainConfig.bootstrapSshKeyPackage.privateKeyOpenSSH;
   secrets.bootstrapSshHostPrivateKeyOpenSSH = publicSnapshot.brainConfig.bootstrapSshHostKeyPackage.privateKeyOpenSSH;
@@ -2463,6 +2486,10 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
   snapshot.brainConfig.bootstrapSshKeyPackage.privateKeyOpenSSH = secrets.bootstrapSshPrivateKeyOpenSSH;
   snapshot.brainConfig.bootstrapSshHostKeyPackage.privateKeyOpenSSH = secrets.bootstrapSshHostPrivateKeyOpenSSH;
   snapshot.brainConfig.dnsCredential.material = secrets.dnsCredentialMaterial;
+  if (secrets.localContainerBootstraps.empty() == false)
+  {
+    snapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps = secrets.localContainerBootstraps;
+  }
 
   for (const auto& [applicationID, factorySecrets] : secrets.tlsVaultFactorySecretsByApp)
   {
