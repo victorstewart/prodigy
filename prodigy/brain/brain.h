@@ -10625,6 +10625,16 @@ public:
         continue;
       }
 
+      const bool viewUUIDMismatches = brain->uuid != 0 && clusterMachine.uuid != 0 && brain->uuid != clusterMachine.uuid;
+      const bool machineUUIDMismatches =
+          brain->machine != nullptr && brain->machine->uuid != 0 && clusterMachine.uuid != 0 && brain->machine->uuid != clusterMachine.uuid;
+      if (viewUUIDMismatches || machineUUIDMismatches)
+      {
+        // A shared transport address cannot identify a different known Brain.
+        // Address and cloud fallbacks remain only for legacy zero-UUID peers.
+        continue;
+      }
+
       bool matchesPeer = (brain->uuid != 0 && clusterMachine.uuid != 0 && clusterMachine.uuid == brain->uuid);
       if (matchesPeer == false && brain->machine != nullptr)
       {

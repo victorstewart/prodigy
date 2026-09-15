@@ -1030,9 +1030,11 @@ static inline bool prodigyClusterMachineBootstrapReady(const ClusterMachine& clu
 
 static inline bool prodigyClusterMachineMatchesMachineIdentity(const ClusterMachine& clusterMachine, const Machine& machine)
 {
-  if (clusterMachine.uuid != 0 && machine.uuid != 0 && clusterMachine.uuid == machine.uuid)
+  // A populated runtime UUID is authoritative. Shared NAT, cloud, and SSH
+  // addresses remain legacy fallbacks only when one side has no UUID.
+  if (clusterMachine.uuid != 0 && machine.uuid != 0)
   {
-    return true;
+    return clusterMachine.uuid == machine.uuid;
   }
 
   if (clusterMachine.cloudPresent() && clusterMachine.cloud.cloudID.size() > 0 && machine.cloudID.size() > 0 && clusterMachine.cloud.cloudID.equals(machine.cloudID))
