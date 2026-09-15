@@ -795,9 +795,9 @@ public:
 
   static bool brainViewMatchesMachineIdentity(const BrainView& brain, const Machine& machine)
   {
-    if (brain.uuid != 0 && machine.uuid != 0 && brain.uuid == machine.uuid)
+    if (brain.uuid != 0 && machine.uuid != 0)
     {
-      return true;
+      return brain.uuid == machine.uuid;
     }
 
     const bool brainHasPeerIdentity = brain.peerAddress.isNull() == false ||

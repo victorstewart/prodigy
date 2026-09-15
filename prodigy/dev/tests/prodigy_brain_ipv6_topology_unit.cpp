@@ -171,6 +171,11 @@ public:
   bool haveStoredTopology = false;
   bool persistTopologyShouldFail = false;
 
+  bool testBrainViewMatchesMachineIdentity(const BrainView& brain, const Machine& machine) const
+  {
+    return brainViewMatchesMachineIdentity(brain, machine);
+  }
+
   void testSendNeuronSwitchboardRoutableSubnets(void)
   {
     sendNeuronSwitchboardRoutableSubnets();
@@ -929,6 +934,14 @@ int main(void)
     brain.machinesByUUID.insert_or_assign(brain3UUID, &brain3Machine);
     brain.brains.insert(&brain2View);
     brain.brains.insert(&brain3View);
+    suite.expect(brain.testBrainViewMatchesMachineIdentity(brain2View, brain3Machine) == false,
+                 "known_brain_uuid_mismatch_rejects_shared_peer_identity");
+    suite.expect(brain.testBrainViewMatchesMachineIdentity(brain2View, brain2Machine),
+                 "known_brain_uuid_match_accepts_authoritative_identity");
+    brain2View.uuid = 0;
+    suite.expect(brain.testBrainViewMatchesMachineIdentity(brain2View, brain3Machine),
+                 "unknown_brain_uuid_preserves_peer_identity_fallback");
+    brain2View.uuid = brain2UUID;
     brain.testSynchronizeBrainUUIDToMachine(&brain2View);
 
     suite.expect(brain2View.machine == &brain2Machine && brain2Machine.brain == &brain2View &&
@@ -1208,7 +1221,10 @@ int main(void)
     brain.brains.insert(&ignoredWithPeerAddress);
 
     suite.expect(brain.testUpdateSelfPeerTrackingKey(nullptr) == 0, "update_self_peer_tracking_key_null_brain_zero");
+    suite.expect(brain.testUpdateSelfPeerTrackingKey(&trackedByPrivate4) == trackedByPrivate4.uuid, "update_self_peer_tracking_key_uuid_before_prefers_private4");
+    trackedByPrivate4.uuid = 0;
     suite.expect(brain.testUpdateSelfPeerTrackingKey(&trackedByPrivate4) == uint128_t(trackedByPrivate4.private4), "update_self_peer_tracking_key_prefers_private4");
+    trackedByPrivate4.uuid = 0x661;
     suite.expect(brain.testFindBrainViewByPrivate4(trackedByPrivate4.private4) == &trackedByPrivate4, "find_brain_view_by_private4_requires_blank_peer_state");
     suite.expect(brain.testFindBrainViewByPrivate4(0x0a00002a) == nullptr, "find_brain_view_by_private4_returns_null_for_missing_private4");
   }
@@ -1238,15 +1254,21 @@ int main(void)
     brain.brains.insert(&trackedByUUID);
 
     uint128_t peerAddressKey = makePeerTrackingKey(trackedByPeerAddress.peerAddress);
+    suite.expect(brain.testUpdateSelfPeerTrackingKey(&trackedByPeerAddress) == trackedByPeerAddress.uuid, "update_self_peer_tracking_key_uuid_before_uses_peer_address");
+    trackedByPeerAddress.uuid = 0;
     suite.expect(brain.testUpdateSelfPeerTrackingKey(&trackedByPeerAddress) == peerAddressKey, "update_self_peer_tracking_key_uses_peer_address");
+    trackedByPeerAddress.uuid = 0x671;
     suite.expect(brain.testFindBrainViewByUpdateSelfPeerKey(peerAddressKey) == &trackedByPeerAddress, "find_brain_view_by_update_self_peer_key_matches_peer_address");
 
     uint128_t candidateKey = makePeerTrackingKey(IPAddress("fd00:10::42", true));
+    suite.expect(brain.testUpdateSelfPeerTrackingKey(&trackedByPeerCandidates) == trackedByPeerCandidates.uuid, "update_self_peer_tracking_key_uuid_before_uses_first_parseable_candidate");
+    trackedByPeerCandidates.uuid = 0;
     suite.expect(brain.testUpdateSelfPeerTrackingKey(&trackedByPeerCandidates) == candidateKey, "update_self_peer_tracking_key_uses_first_parseable_candidate");
+    trackedByPeerCandidates.uuid = 0x672;
     suite.expect(brain.testFindBrainViewByUpdateSelfPeerKey(candidateKey) == &trackedByPeerCandidates, "find_brain_view_by_update_self_peer_key_matches_candidate");
 
-    suite.expect(brain.testUpdateSelfPeerTrackingKey(&trackedByUUID) == trackedByUUID.uuid, "update_self_peer_tracking_key_falls_back_to_uuid");
-    suite.expect(brain.testFindBrainViewByUpdateSelfPeerKey(trackedByUUID.uuid) == &trackedByUUID, "find_brain_view_by_update_self_peer_key_matches_uuid_fallback");
+    suite.expect(brain.testUpdateSelfPeerTrackingKey(&trackedByUUID) == trackedByUUID.uuid, "update_self_peer_tracking_key_uses_uuid_without_addresses");
+    suite.expect(brain.testFindBrainViewByUpdateSelfPeerKey(trackedByUUID.uuid) == &trackedByUUID, "find_brain_view_by_update_self_peer_key_matches_uuid");
     suite.expect(brain.testFindBrainViewByUpdateSelfPeerKey(0) == nullptr, "find_brain_view_by_update_self_peer_key_zero_returns_null");
   }
 
@@ -1254,7 +1276,10 @@ int main(void)
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
 
+    const uint128_t localUUID = neuron.uuid;
     neuron.private4 = IPAddress("10.0.0.10", false);
+    suite.expect(brain.testUpdateSelfLocalPeerTrackingKey() == localUUID, "update_self_local_peer_tracking_key_uuid_before_private4");
+    neuron.uuid = 0;
     suite.expect(brain.testUpdateSelfLocalPeerTrackingKey() == uint128_t(neuron.private4.v4), "update_self_local_peer_tracking_key_prefers_local_private4");
 
     neuron.private4 = {};
@@ -1271,7 +1296,9 @@ int main(void)
     suite.expect(brain.testUpdateSelfLocalPeerTrackingKey() == makePeerTrackingKey(IPAddress("fd00:10::12", true)), "update_self_local_peer_tracking_key_uses_local_candidate");
 
     brain.localBrainPeerAddresses.clear();
-    suite.expect(brain.testUpdateSelfLocalPeerTrackingKey() == brain.selfBrainUUID(), "update_self_local_peer_tracking_key_falls_back_to_uuid");
+    suite.expect(brain.testUpdateSelfLocalPeerTrackingKey() == 0, "update_self_local_peer_tracking_key_without_identity_zero");
+    neuron.uuid = localUUID;
+    suite.expect(brain.testUpdateSelfLocalPeerTrackingKey() == brain.selfBrainUUID(), "update_self_local_peer_tracking_key_uses_uuid_without_addresses");
   }
 
   {
