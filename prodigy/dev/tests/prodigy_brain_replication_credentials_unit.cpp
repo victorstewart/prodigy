@@ -2998,9 +2998,16 @@ static void testSpinApplicationCredentialPolicyAdmission(TestSuite& suite)
 
   DeploymentPlan unavailable = {};
   seedDeployRequestPlan(unavailable, 62'018);
+  unavailable.apiCredentialPolicy.refreshPushEnabled = true;
   unavailable.apiCredentialPolicy.requiredCredentialNames.push_back("turnstile"_ctv);
   suite.expect(submit(unavailable, "CredentialAdmissionRequired"_ctv) == "invalid plan: required api credential set is not registered"_ctv,
                "spin_application_rejects_unavailable_required_api_credential");
+
+  DeploymentPlan refreshDisabled = {};
+  seedDeployRequestPlan(refreshDisabled, 62'019);
+  refreshDisabled.apiCredentialPolicy.requiredCredentialNames.push_back("turnstile"_ctv);
+  suite.expect(submit(refreshDisabled, "CredentialAdmissionRefreshDisabled"_ctv) == "invalid plan: required api credentials must enable refresh delivery"_ctv,
+               "spin_application_rejects_required_credentials_without_refresh");
 }
 
 static void testSpinApplicationRejectsDuplicateNonTaskDeploymentIDWithoutMutation(TestSuite& suite)
@@ -4287,6 +4294,8 @@ static DeploymentPlan makeDeploymentPlan(uint16_t applicationID, uint64_t versio
 {
   DeploymentPlan plan = {};
   plan.config.applicationID = applicationID;
+  plan.hasApiCredentialPolicy = true;
+  plan.apiCredentialPolicy.applicationID = applicationID;
   plan.config.versionID = versionID;
   plan.config.filesystemMB = 64;
   plan.config.storageMB = 128;
@@ -4609,11 +4618,13 @@ static void testCredentialBundleBuildAndApply(TestSuite& suite)
 
   DeploymentPlan noPolicyPlan;
   ContainerPlan noPolicyContainerPlan;
-  brain.applyCredentialsToContainerPlan(noPolicyPlan, container, noPolicyContainerPlan);
+  suite.expect(brain.applyCredentialsToContainerPlan(noPolicyPlan, container, noPolicyContainerPlan) == false,
+               "apply_credentials_rejects_missing_policy");
   suite.expect(noPolicyContainerPlan.hasCredentialBundle == false, "apply_credentials_clears_bundle_without_policy");
   suite.expect(noPolicyContainerPlan.credentialBundle.apiCredentials.size() == 0, "apply_credentials_empty_without_policy");
 
-  DeploymentPlan resumptionPlan = makeDeploymentPlan(6, 909);
+  // Keep this credential-free application separate from app 6's API generation.
+  DeploymentPlan resumptionPlan = makeDeploymentPlan(16, 909);
   resumptionPlan.wormholes.push_back(makeTlsResumptionTestWormhole());
 
   ContainerView resumptionContainerA;
@@ -4648,6 +4659,7 @@ static void testApiCredentialPolicyAvailability(TestSuite& suite)
   DeploymentPlan plan = makeDeploymentPlan(6, 0xC0ED);
   plan.hasApiCredentialPolicy = true;
   plan.apiCredentialPolicy.applicationID = 6;
+  plan.apiCredentialPolicy.refreshPushEnabled = true;
   plan.apiCredentialPolicy.requiredCredentialNames.push_back("turnstile"_ctv);
 
   ApplicationApiCredentialSet set = {};
@@ -4665,6 +4677,18 @@ static void testApiCredentialPolicyAvailability(TestSuite& suite)
   CredentialBundle bundle = {};
   suite.expect(brain.buildCredentialBundleForContainer(plan, ContainerView {}, bundle), "api_policy_launch_builds_complete_required_bundle");
   suite.expect(bundle.apiCredentials.size() == 1 && bundle.apiCredentials[0].name.equal("turnstile"_ctv), "api_policy_launch_bundle_has_exact_required_credential");
+
+  plan.apiCredentialPolicy.refreshPushEnabled = false;
+  suite.expect(brain.deploymentApiCredentialsAvailableForLaunch(plan, &failure) == false &&
+                   failure.equal("required api credentials must enable refresh delivery"_ctv),
+               "api_policy_rejects_required_credentials_without_refresh");
+  suite.expect(brain.buildCredentialBundleForContainer(plan, ContainerView {}, bundle) == false && bundle.apiCredentials.empty(),
+               "api_policy_launch_rejects_refresh_disabled_bundle");
+  ContainerPlan refreshDisabledContainerPlan = {};
+  suite.expect(brain.applyCredentialsToContainerPlan(plan, ContainerView {}, refreshDisabledContainerPlan) == false &&
+                   refreshDisabledContainerPlan.hasCredentialBundle == false,
+               "api_policy_launch_rejects_refresh_disabled_container");
+  plan.apiCredentialPolicy.refreshPushEnabled = true;
 
   auto setIt = brain.apiCredentialSetsByApp.find(6);
   suite.expect(setIt != brain.apiCredentialSetsByApp.end(), "api_policy_test_set_present");
@@ -4713,10 +4737,31 @@ static void testApiCredentialPolicyAvailability(TestSuite& suite)
   suite.expect(brain.deploymentApiCredentialsAvailableForLaunch(plan, &failure) == false, "api_policy_rejects_duplicate_required_name");
   plan.apiCredentialPolicy.requiredCredentialNames.resize(1);
   plan.apiCredentialPolicy.requiredCredentialNames.clear();
+  plan.apiCredentialPolicy.refreshPushEnabled = false;
   suite.expect(brain.deploymentApiCredentialsAvailableForLaunch(plan, &failure), "api_policy_accepts_explicit_credential_free_declaration");
+  ContainerPlan credentialFreeContainerPlan = {};
+  suite.expect(brain.applyCredentialsToContainerPlan(plan, ContainerView {}, credentialFreeContainerPlan),
+               "api_policy_launch_accepts_explicit_credential_free_declaration");
 
   plan.hasApiCredentialPolicy = false;
-  suite.expect(brain.deploymentApiCredentialsAvailableForLaunch(plan, &failure), "api_policy_allows_legacy_replay_without_declaration");
+  suite.expect(brain.deploymentApiCredentialsAvailableForLaunch(plan, &failure) == false &&
+                   failure.equal("api credential policy declaration required"_ctv),
+               "api_policy_rejects_legacy_replay_without_declaration");
+  suite.expect(brain.buildCredentialBundleForContainer(plan, ContainerView {}, bundle) == false && bundle.apiCredentials.empty(),
+               "api_policy_launch_rejects_omitted_declaration_bundle");
+  suite.expect(brain.applyCredentialsToContainerPlan(plan, ContainerView {}, credentialFreeContainerPlan) == false,
+               "api_policy_launch_rejects_omitted_declaration_container");
+
+  ApplicationDeployment legacyDeployment = {};
+  legacyDeployment.plan = plan;
+  legacyDeployment.state = DeploymentState::deploying;
+  previousBrain = thisBrain;
+  thisBrain = &brain;
+  legacyDeployment.schedule();
+  thisBrain = previousBrain;
+  suite.expect(legacyDeployment.state == DeploymentState::failed,
+               "api_policy_replay_without_declaration_fails_before_scheduling");
+  brain.failedDeployments.erase(plan.config.deploymentID());
 }
 
 static void testTlsResumptionRotationAckCoverage(TestSuite& suite)
@@ -10810,6 +10855,8 @@ static void testImportedTlsFactoryEnablesBundleBuild(TestSuite& suite)
   DeploymentPlan deploymentPlan;
   deploymentPlan.config.applicationID = request.applicationID;
   deploymentPlan.config.versionID = 1;
+  deploymentPlan.hasApiCredentialPolicy = true;
+  deploymentPlan.apiCredentialPolicy.applicationID = request.applicationID;
   deploymentPlan.hasTlsIssuancePolicy = true;
   deploymentPlan.tlsIssuancePolicy.applicationID = request.applicationID;
   deploymentPlan.tlsIssuancePolicy.enablePerContainerLeafs = true;
@@ -23179,6 +23226,7 @@ static void testApiCredentialExpiryNotificationLifecycle(TestSuite& suite)
   deployment.plan.config.applicationID = 77;
   deployment.plan.hasApiCredentialPolicy = true;
   deployment.plan.apiCredentialPolicy.applicationID = 77;
+  deployment.plan.apiCredentialPolicy.refreshPushEnabled = true;
   deployment.plan.apiCredentialPolicy.requiredCredentialNames.push_back("turnstile"_ctv);
   deployment.state = DeploymentState::running;
   ContainerView liveContainer = {};
@@ -23529,6 +23577,7 @@ int main(void)
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "api-credential-policy") == 0)
   {
+    testCredentialBundleBuildAndApply(suite);
     testApiCredentialPolicyAvailability(suite);
     testSpinApplicationCredentialPolicyAdmission(suite);
     testApiCredentialUpsertPreservesMaterializedRequirements(suite);

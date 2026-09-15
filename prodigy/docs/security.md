@@ -29,7 +29,7 @@ After bootstrap, runtime machines should rely on provider-native identity where 
 
 Application containers should receive only credentials explicitly delivered through the runtime protocol. The credential set should match the application service identity and should not inherit broad provider bootstrap authority by default.
 
-Every new deployment plan must declare `apiCredentials.applicationID` matching
+Every deployment plan must declare `apiCredentials.applicationID` matching
 `config.applicationID` and an explicit `requiredCredentialNames` array. Use `[]`
 only when the application needs no API credentials. This declaration is the
 application's dependency manifest; review it alongside the Discombobulator image
@@ -43,14 +43,16 @@ reached its sunset time, and is permitted to reach that container. It checks aga
 before launch. DNS management credentials remain in their control-plane owner;
 declaring one as an application credential does not authorize its delivery.
 
-Set `refreshPushEnabled: true` for applications that consume credential updates.
-This delivers registered rotations; it does not renew credentials. Credential
+Nonempty dependency lists must set `refreshPushEnabled: true`; Prodigy rejects
+plans that disable delivery of required credential rotations. This delivers
+registered rotations; it does not renew credentials. Credential
 expiry notices are durably cataloged and delivered for required credentials at
 the seven-day warning threshold and again when expired; acknowledgement and
 resolution are tracked separately from credential delivery. Managed TLS
-certificates use their separate certificate-renewal lifecycle. Existing admitted
-deployments remain recoverable without an API policy; their next submitted plan
-must declare one.
+certificates use their separate certificate-renewal lifecycle. Recovery and
+queued launches use the same validation as new admission. An older stored plan
+without a declaration remains readable but cannot launch another container;
+submit an explicit dependency policy before resuming that deployment.
 
 ## Bundle update signatures
 

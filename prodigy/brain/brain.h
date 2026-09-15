@@ -7633,7 +7633,11 @@ public:
     }
     if (deploymentPlan.hasApiCredentialPolicy == false)
     {
-      return true; // Existing admitted deployments may predate credential dependency declarations.
+      if (failure)
+      {
+        failure->assign("api credential policy declaration required"_ctv);
+      }
+      return false;
     }
 
     const DeploymentApiCredentialPolicy& policy = deploymentPlan.apiCredentialPolicy;
@@ -7648,6 +7652,14 @@ public:
     if (policy.requiredCredentialNames.empty())
     {
       return true; // Explicitly declared credential-free application.
+    }
+    if (policy.refreshPushEnabled == false)
+    {
+      if (failure)
+      {
+        failure->assign("required api credentials must enable refresh delivery"_ctv);
+      }
+      return false;
     }
 
     const ApplicationApiCredentialSet *set = candidateSet;
@@ -8799,22 +8811,18 @@ public:
     bool produced = false;
     uint64_t bundleGeneration = 0;
 
-    if (deploymentPlan.hasApiCredentialPolicy)
+    Vector<ApiCredential> requiredApiCredentials = {};
+    if (appendRequiredApiCredentials(deploymentPlan, &requiredApiCredentials) == false)
     {
-      Vector<ApiCredential> requiredApiCredentials = {};
-      if (appendRequiredApiCredentials(deploymentPlan, &requiredApiCredentials) == false)
-      {
-        bundle.apiCredentials.clear();
-        return false;
-      }
-      bundle.apiCredentials = std::move(requiredApiCredentials);
-      produced = bundle.apiCredentials.empty() == false;
+      return false;
+    }
+    bundle.apiCredentials = std::move(requiredApiCredentials);
+    produced = bundle.apiCredentials.empty() == false;
 
-      if (auto setIt = apiCredentialSetsByApp.find(deploymentPlan.apiCredentialPolicy.applicationID);
-          setIt != apiCredentialSetsByApp.end() && setIt->second.setGeneration > bundleGeneration)
-      {
-        bundleGeneration = setIt->second.setGeneration;
-      }
+    if (auto setIt = apiCredentialSetsByApp.find(deploymentPlan.apiCredentialPolicy.applicationID);
+        setIt != apiCredentialSetsByApp.end() && setIt->second.setGeneration > bundleGeneration)
+    {
+      bundleGeneration = setIt->second.setGeneration;
     }
 
     if (buildTlsBundleForContainer(deploymentPlan, container, bundle, bundleGeneration))
@@ -8848,8 +8856,8 @@ public:
 
     plan.hasCredentialBundle = false;
     plan.credentialBundle = CredentialBundle();
-    return deploymentPlan.hasApiCredentialPolicy == false ||
-           deploymentPlan.apiCredentialPolicy.requiredCredentialNames.empty();
+    return deploymentPlan.apiCredentialPolicy.requiredCredentialNames.empty() &&
+           deploymentApiCredentialsAvailableForLaunch(deploymentPlan);
   }
 
   bool containerTlsIdentitiesFresh(const DeploymentPlan& deploymentPlan, const ContainerView& container, bool *pending = nullptr, String *failure = nullptr)

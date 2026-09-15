@@ -10912,99 +10912,13 @@ private:
       }
       else if (key.equal("apiCredentials"_ctv))
       {
-        if (field.value.type() != simdjson::dom::element_type::OBJECT)
+        auto resolveApplicationIDReference = [&](const String& reference, uint16_t& applicationID) -> bool {
+          return socket.resolveApplicationIDReference(reference, applicationID, false);
+        };
+        String failure = {};
+        if (mothershipParseDeploymentPlanApiCredentials(field.value, plan, resolveApplicationIDReference, &failure) == false)
         {
-          basics_log("apiCredentials requires a document\n");
-          exit(EXIT_FAILURE);
-        }
-
-        plan.hasApiCredentialPolicy = true;
-
-        for (auto subfield : field.value.get_object())
-        {
-          String sk;
-          sk.setInvariant(subfield.key.data(), subfield.key.size());
-
-          if (sk.equal("applicationID"_ctv))
-          {
-            if (subfield.value.type() == simdjson::dom::element_type::INT64)
-            {
-              int64_t v = 0;
-              (void)subfield.value.get(v);
-              if (v <= 0 || v > UINT16_MAX)
-              {
-                basics_log("apiCredentials.applicationID invalid\n");
-                exit(EXIT_FAILURE);
-              }
-              plan.apiCredentialPolicy.applicationID = static_cast<uint16_t>(v);
-            }
-            else if (subfield.value.type() == simdjson::dom::element_type::STRING)
-            {
-              String reference;
-              reference.setInvariant(subfield.value.get_c_str());
-              if (socket.resolveApplicationIDReference(reference, plan.apiCredentialPolicy.applicationID, false) == false)
-              {
-                basics_log("apiCredentials.applicationID symbolic reference invalid or unreserved; reserveApplicationID first\n");
-                exit(EXIT_FAILURE);
-              }
-            }
-            else
-            {
-              basics_log("apiCredentials.applicationID requires an integer or symbolic reference string\n");
-              exit(EXIT_FAILURE);
-            }
-          }
-          else if (sk.equal("requiredCredentialNames"_ctv))
-          {
-            if (subfield.value.type() != simdjson::dom::element_type::ARRAY)
-            {
-              basics_log("apiCredentials.requiredCredentialNames requires an array\n");
-              exit(EXIT_FAILURE);
-            }
-            for (auto item : subfield.value.get_array())
-            {
-              if (item.type() != simdjson::dom::element_type::STRING)
-              {
-                basics_log("apiCredentials.requiredCredentialNames requires string members\n");
-                exit(EXIT_FAILURE);
-              }
-              String name;
-              name.assign(item.get_c_str());
-              if (name.size() == 0)
-              {
-                basics_log("apiCredentials.requiredCredentialNames contains empty name\n");
-                exit(EXIT_FAILURE);
-              }
-              plan.apiCredentialPolicy.requiredCredentialNames.push_back(name);
-            }
-          }
-          else if (sk.equal("refreshPushEnabled"_ctv))
-          {
-            if (subfield.value.type() != simdjson::dom::element_type::BOOL)
-            {
-              basics_log("apiCredentials.refreshPushEnabled requires a bool\n");
-              exit(EXIT_FAILURE);
-            }
-            bool b = false;
-            (void)subfield.value.get(b);
-            plan.apiCredentialPolicy.refreshPushEnabled = b;
-          }
-          else
-          {
-            basics_log("apiCredentials invalid field\n");
-            exit(EXIT_FAILURE);
-          }
-        }
-
-        if (plan.apiCredentialPolicy.applicationID == 0)
-        {
-          basics_log("apiCredentials.applicationID required\n");
-          exit(EXIT_FAILURE);
-        }
-
-        if (plan.apiCredentialPolicy.requiredCredentialNames.size() == 0)
-        {
-          basics_log("apiCredentials.requiredCredentialNames required\n");
+          basics_log("%s\n", failure.c_str());
           exit(EXIT_FAILURE);
         }
       }
@@ -13069,19 +12983,15 @@ private:
       }
     }
 
-    if (plan.hasApiCredentialPolicy)
+    if (plan.hasApiCredentialPolicy == false)
     {
-      if (plan.apiCredentialPolicy.applicationID != plan.config.applicationID)
-      {
-        basics_log("apiCredentials.applicationID must match config.applicationID\n");
-        exit(EXIT_FAILURE);
-      }
-
-      if (plan.apiCredentialPolicy.requiredCredentialNames.size() == 0)
-      {
-        basics_log("apiCredentials.requiredCredentialNames required\n");
-        exit(EXIT_FAILURE);
-      }
+      basics_log("apiCredentials declaration required\n");
+      exit(EXIT_FAILURE);
+    }
+    if (plan.apiCredentialPolicy.applicationID != plan.config.applicationID)
+    {
+      basics_log("apiCredentials.applicationID must match config.applicationID\n");
+      exit(EXIT_FAILURE);
     }
 
     for (HorizontalScaler& scaler : plan.horizontalScalers)
