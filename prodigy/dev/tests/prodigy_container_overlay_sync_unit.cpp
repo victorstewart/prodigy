@@ -530,6 +530,45 @@ public:
   }
 };
 
+static void testContainerRouterBPFPathsResolveAlongsideExecutable(TestSuite& suite)
+{
+  String executablePath = {};
+  suite.require(prodigyResolveCurrentExecutablePath(executablePath), "container_router_bpf_paths_resolve_current_executable");
+
+  String executableDirectory = {};
+  prodigyDirname(executablePath, executableDirectory);
+
+  struct ContainerRouterObject {
+    ContainerNetworkAccess networkAccess;
+    bool ingress;
+    const char *filename;
+  };
+
+  constexpr static ContainerRouterObject objects[] = {
+      {ContainerNetworkAccess::unrestricted, false, "container.egress.router.ebpf.o"},
+      {ContainerNetworkAccess::unrestricted, true, "container.ingress.router.ebpf.o"},
+      {ContainerNetworkAccess::declaredOnly, false, "container.egress.router.declared.ebpf.o"},
+      {ContainerNetworkAccess::declaredOnly, true, "container.ingress.router.declared.ebpf.o"}};
+
+  for (const ContainerRouterObject& object : objects)
+  {
+    String resolved = {};
+    String failure = {};
+    String expected = executableDirectory;
+    if (expected.size() > 0 && expected[expected.size() - 1] != '/')
+    {
+      expected.append('/');
+    }
+    expected.append(object.filename);
+
+    suite.expect(prodigyResolveContainerRouterBPFPath(object.networkAccess, object.ingress, resolved, &failure),
+                 "container_router_bpf_path_resolves_bundled_object");
+    suite.expect(resolved.equals(expected), "container_router_bpf_path_uses_executable_directory");
+    suite.expect(prodigyFileReadable(resolved), "container_router_bpf_path_is_readable");
+    suite.expect(failure.size() == 0, "container_router_bpf_path_keeps_failure_empty");
+  }
+}
+
 static void testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntries(TestSuite& suite)
 {
   OverlayTestNeuron neuron = {};
@@ -2248,6 +2287,14 @@ static void testDeclaredNetworkPairingRevocationPreservesUnrelatedFlows(TestSuit
 
 int main(void)
 {
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && std::strcmp(only, "container-router-bpf-path") == 0)
+  {
+    TestSuite suite = {};
+    testContainerRouterBPFPathsResolveAlongsideExecutable(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+
   if (const char *allow = std::getenv("PRODIGY_DEV_ALLOW_BPF_ATTACH"); allow == nullptr || std::strcmp(allow, "1") != 0)
   {
     std::fprintf(stderr, "SKIP: container overlay sync unit loads BPF programs; set PRODIGY_DEV_ALLOW_BPF_ATTACH=1 only inside an authorized isolated VM\n");
@@ -2256,6 +2303,7 @@ int main(void)
 
   TestSuite suite = {};
 
+  testContainerRouterBPFPathsResolveAlongsideExecutable(suite);
   testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntries(suite);
   testContainerPeerRuntimeSyncPopulatesAndClearsWormholeEgressBindings(suite);
   testSystemEgressPolicyConstrainsIPv4(suite);

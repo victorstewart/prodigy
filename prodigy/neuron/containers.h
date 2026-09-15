@@ -38,6 +38,7 @@
 #include <services/memfd.h>
 #include <prodigy/application.container.privileges.h>
 #include <prodigy/build.identity.h>
+#include <prodigy/bundle.artifact.h>
 #include <prodigy/container.contract.h>
 #include <prodigy/declared.network.policy.h>
 #include <prodigy/system.container.policy.h>
@@ -57,6 +58,57 @@ constexpr static auto containerNeuronListenerFDEnvironment = "PRODIGY_NEURON_LIS
 constexpr static auto containerRuntimeRootPath = "/run/prodigy/containers"_ctv;
 constexpr static int64_t failedContainerArtifactRetentionMs = 24LL * 60LL * 60LL * 1000LL;
 constexpr static int64_t failedContainerArtifactCleanupIntervalMs = 3LL * 60LL * 60LL * 1000LL;
+
+static inline bool prodigyResolveContainerRouterBPFPath(
+    ContainerNetworkAccess networkAccess,
+    bool ingress,
+    String& path,
+    String *failureReport = nullptr)
+{
+  path.clear();
+
+  String executablePath = {};
+  if (prodigyResolveCurrentExecutablePath(executablePath) == false)
+  {
+    if (failureReport)
+    {
+      failureReport->assign("unable to resolve executable path for bundled container router BPF object"_ctv);
+    }
+    return false;
+  }
+
+  prodigyDirname(executablePath, path);
+  if (path.size() > 0 && path[path.size() - 1] != '/')
+  {
+    path.append('/');
+  }
+
+  if (ingress)
+  {
+    path.append("container.ingress.router"_ctv);
+  }
+  else
+  {
+    path.append("container.egress.router"_ctv);
+  }
+  if (networkAccess == ContainerNetworkAccess::declaredOnly)
+  {
+    path.append(".declared"_ctv);
+  }
+  path.append(".ebpf.o"_ctv);
+
+  if (prodigyFileReadable(path))
+  {
+    return true;
+  }
+
+  if (failureReport)
+  {
+    failureReport->snprintf<"bundled container router BPF object is not readable: {}"_ctv>(path);
+  }
+  path.clear();
+  return false;
+}
 
 static inline bool prodigyClearInheritedContainerEnvironment(void)
 {
@@ -1990,13 +2042,17 @@ public:
       return false;
     }
 
-    if (plan.networkAccess == ContainerNetworkAccess::declaredOnly)
+    if (prodigyResolveContainerRouterBPFPath(plan.networkAccess, false, path, failureReport) == false)
     {
-      path.assign("/root/prodigy/container.egress.router.declared.ebpf.o"_ctv);
-    }
-    else
-    {
-      path.assign("/root/prodigy/container.egress.router.ebpf.o"_ctv);
+      if (peernetnsfd >= 0)
+      {
+        ::close(peernetnsfd);
+      }
+      if (hostnetnsfd >= 0)
+      {
+        ::close(hostnetnsfd);
+      }
+      return false;
     }
     peer_program = netdevs.host.loadPreattachedProgram(prodigyContainerEgressNetkitAttachType(), path);
     if (peer_program)
@@ -2020,13 +2076,17 @@ public:
       thisNeuron->syncWhiteholeBindingsForContainerPeer(this);
     }
 
-    if (plan.networkAccess == ContainerNetworkAccess::declaredOnly)
+    if (prodigyResolveContainerRouterBPFPath(plan.networkAccess, true, path, failureReport) == false)
     {
-      path.assign("/root/prodigy/container.ingress.router.declared.ebpf.o"_ctv);
-    }
-    else
-    {
-      path.assign("/root/prodigy/container.ingress.router.ebpf.o"_ctv);
+      if (peernetnsfd >= 0)
+      {
+        ::close(peernetnsfd);
+      }
+      if (hostnetnsfd >= 0)
+      {
+        ::close(hostnetnsfd);
+      }
+      return false;
     }
     primary_program = netdevs.host.loadPreattachedProgram(prodigyContainerIngressNetkitAttachType(), path);
     if (primary_program)
@@ -2322,13 +2382,17 @@ public:
       return false;
     }
 
-    if (plan.networkAccess == ContainerNetworkAccess::declaredOnly)
+    if (prodigyResolveContainerRouterBPFPath(plan.networkAccess, false, path, failureReport) == false)
     {
-      path.assign("/root/prodigy/container.egress.router.declared.ebpf.o"_ctv);
-    }
-    else
-    {
-      path.assign("/root/prodigy/container.egress.router.ebpf.o"_ctv);
+      if (peernetnsfd >= 0)
+      {
+        ::close(peernetnsfd);
+      }
+      if (hostnetnsfd >= 0)
+      {
+        ::close(hostnetnsfd);
+      }
+      return false;
     }
     peer_program = host.attachBPF(prodigyContainerEgressNetkitAttachType(), path, "ct_egress"_ctv,
                                   [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
@@ -2399,13 +2463,17 @@ public:
       return false;
     }
 
-    if (plan.networkAccess == ContainerNetworkAccess::declaredOnly)
+    if (prodigyResolveContainerRouterBPFPath(plan.networkAccess, true, path, failureReport) == false)
     {
-      path.assign("/root/prodigy/container.ingress.router.declared.ebpf.o"_ctv);
-    }
-    else
-    {
-      path.assign("/root/prodigy/container.ingress.router.ebpf.o"_ctv);
+      if (peernetnsfd >= 0)
+      {
+        ::close(peernetnsfd);
+      }
+      if (hostnetnsfd >= 0)
+      {
+        ::close(hostnetnsfd);
+      }
+      return false;
     }
     bool tcpFlowMapReused = plan.networkAccess != ContainerNetworkAccess::declaredOnly;
     primary_program = host.attachBPF(prodigyContainerIngressNetkitAttachType(), path, "ct_ingress"_ctv,
