@@ -323,7 +323,7 @@ public:
 
   void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines, String& failure) override
   {
-    bootstrapDelegate.getMachines(coro, metro, machines, failure);
+    activeDelegate()->getMachines(coro, metro, machines, failure);
   }
 
   void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains, String& failure) override
