@@ -1,4 +1,5 @@
 {
+  "apiCredentials": {"applicationID": "${application:PythonMeshPingPongAdvertiser}", "requiredCredentialNames": []},
    "config": {
       "type": "ApplicationType::stateless",
       "applicationID": "${application:PythonMeshPingPongAdvertiser}",

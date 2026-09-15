@@ -926,6 +926,8 @@ public:
 
   bool closeAfterSendDrain = false;
   uint64_t connectionIncarnation = 0;
+  bool apiCredentialExpiryNoticesSubscribed = false;
+  bytell_hash_set<uint64_t> queuedApiCredentialExpiryNoticeIDs;
 
   Mothership()
   {
@@ -5890,6 +5892,270 @@ public:
     return true;
   }
 
+  static int64_t apiCredentialEffectiveDeadlineMs(const ApiCredential& credential)
+  {
+    int64_t deadlineMs = 0;
+    if (credential.expiresAtMs > 0)
+    {
+      deadlineMs = credential.expiresAtMs;
+    }
+    if (credential.sunsetAtMs > 0 && (deadlineMs == 0 || credential.sunsetAtMs < deadlineMs))
+    {
+      deadlineMs = credential.sunsetAtMs;
+    }
+    return deadlineMs;
+  }
+
+  static bool apiCredentialExpiryNoticeMatches(
+      const ApiCredentialExpiryNotice& notice,
+      const ApiCredentialExpiryNotice& expected)
+  {
+    return notice.stableID == expected.stableID &&
+           notice.applicationID == expected.applicationID &&
+           notice.name.equals(expected.name) &&
+           notice.provider.equals(expected.provider) &&
+           notice.generation == expected.generation &&
+           notice.deadlineMs == expected.deadlineMs &&
+           notice.severity == expected.severity;
+  }
+
+  bool buildApiCredentialExpiryNotice(
+      uint16_t applicationID,
+      const ApiCredential& credential,
+      int64_t deadlineMs,
+      int64_t nowMs,
+      ApiCredentialExpirySeverity severity,
+      ApiCredentialExpiryNotice& notice) const
+  {
+    if (brainConfig.clusterUUID == 0 || applicationID == 0 || credential.name.empty() ||
+        credential.provider.empty() || credential.generation == 0 || deadlineMs <= 0)
+    {
+      return false;
+    }
+
+    ApiCredentialExpiryNoticePayload identity = {};
+    identity.clusterUUID = brainConfig.clusterUUID;
+    identity.notice.applicationID = applicationID;
+    identity.notice.name = credential.name;
+    identity.notice.provider = credential.provider;
+    identity.notice.generation = credential.generation;
+    identity.notice.deadlineMs = deadlineMs;
+    identity.notice.severity = severity;
+    String stableTuple = {};
+    BitseryEngine::serialize(stableTuple, identity);
+    String digest = {};
+    if (prodigyComputeSHA256Hex(stableTuple, digest) == false || digest.size() < 16)
+    {
+      return false;
+    }
+
+    notice = {};
+    notice.stableID = String::numberFromHexString<uint64_t>(digest.substr(0, 16, Copy::no));
+    notice.applicationID = applicationID;
+    notice.name = credential.name;
+    notice.provider = credential.provider;
+    notice.generation = credential.generation;
+    notice.deadlineMs = deadlineMs;
+    notice.createdAtMs = nowMs;
+    notice.severity = severity;
+    return notice.stableID != 0;
+  }
+
+  void queueApiCredentialExpiryNoticeToMothership(
+      Mothership *stream,
+      const ApiCredentialExpiryNotice& notice,
+      bool includeAcknowledged = false)
+  {
+    if (stream == nullptr || streamIsActive(stream) == false || Ring::socketIsClosing(stream) ||
+        stream->apiCredentialExpiryNoticesSubscribed == false ||
+        (includeAcknowledged == false && (notice.acknowledged || notice.resolved)) ||
+        stream->queuedApiCredentialExpiryNoticeIDs.contains(notice.stableID))
+    {
+      return;
+    }
+
+    ApiCredentialExpiryNoticePayload payload = {};
+    payload.clusterUUID = brainConfig.clusterUUID;
+    payload.notice = notice;
+    String serializedPayload = {};
+    BitseryEngine::serialize(serializedPayload, payload);
+    Message::construct(stream->wBuffer, MothershipTopic::credentialExpiryNotices, serializedPayload);
+    stream->queuedApiCredentialExpiryNoticeIDs.insert(notice.stableID);
+  }
+
+  void queuePendingApiCredentialExpiryNoticesToMothership(
+      Mothership *stream,
+      bool includeAcknowledged,
+      bool snapshotComplete)
+  {
+    if (stream == nullptr || streamIsActive(stream) == false || Ring::socketIsClosing(stream))
+    {
+      return;
+    }
+
+    for (const ApiCredentialExpiryNotice& notice : masterAuthorityRuntimeState.apiCredentialExpiryNotices)
+    {
+      if (includeAcknowledged == false && (notice.acknowledged || notice.resolved))
+      {
+        continue;
+      }
+      queueApiCredentialExpiryNoticeToMothership(stream, notice, includeAcknowledged);
+    }
+
+    if (snapshotComplete)
+    {
+      ApiCredentialExpiryNoticePayload complete = {};
+      complete.clusterUUID = brainConfig.clusterUUID;
+      complete.snapshotComplete = true;
+      String serializedComplete = {};
+      BitseryEngine::serialize(serializedComplete, complete);
+      Message::construct(stream->wBuffer, MothershipTopic::credentialExpiryNotices, serializedComplete);
+    }
+
+    (void)flushActiveMothershipSendBuffer(stream, "credential-expiry-notices");
+  }
+
+  void broadcastApiCredentialExpiryNotices(const Vector<ApiCredentialExpiryNotice>& notices)
+  {
+    if (notices.empty())
+    {
+      return;
+    }
+
+    Vector<Mothership *> streams = {};
+    streams.reserve(activeMotherships.size());
+    for (Mothership *stream : activeMotherships)
+    {
+      streams.push_back(stream);
+    }
+
+    for (Mothership *stream : streams)
+    {
+      if (activeMotherships.contains(stream) == false)
+      {
+        continue;
+      }
+      for (const ApiCredentialExpiryNotice& notice : notices)
+      {
+        queueApiCredentialExpiryNoticeToMothership(stream, notice);
+      }
+      (void)flushActiveMothershipSendBuffer(stream, "credential-expiry-notice-broadcast");
+    }
+  }
+
+  uint32_t advanceApiCredentialExpiryNotices(int64_t nowMs)
+  {
+    constexpr int64_t warningLeadMs = 7LL * 24 * 60 * 60 * 1000;
+    if (weAreMaster == false || brainConfig.clusterUUID == 0)
+    {
+      return 0;
+    }
+
+    Vector<ApiCredentialExpiryNotice> desired = {};
+    bytell_hash_set<uint64_t> seenNoticeIDs = {};
+    for (const auto& [deploymentID, deployment] : deployments)
+    {
+      (void)deploymentID;
+      if (deployment == nullptr || deployment->lifecycleIsUnmaterialized() ||
+          deployment->state == DeploymentState::failed || deployment->state == DeploymentState::decommissioning ||
+          deployment->plan.hasApiCredentialPolicy == false)
+      {
+        continue;
+      }
+
+      const DeploymentApiCredentialPolicy& policy = deployment->plan.apiCredentialPolicy;
+      auto setIt = apiCredentialSetsByApp.find(policy.applicationID);
+      if (setIt == apiCredentialSetsByApp.end())
+      {
+        continue;
+      }
+
+      for (const String& requiredName : policy.requiredCredentialNames)
+      {
+        const ApiCredential *credential = findApiCredential(setIt->second, requiredName);
+        if (credential == nullptr || apiCredentialMayReachContainer(deployment->plan, *credential) == false)
+        {
+          continue;
+        }
+
+        const int64_t deadlineMs = apiCredentialEffectiveDeadlineMs(*credential);
+        if (deadlineMs == 0 || deadlineMs > nowMs + warningLeadMs)
+        {
+          continue;
+        }
+
+        ApiCredentialExpiryNotice notice = {};
+        ApiCredentialExpirySeverity severity =
+            deadlineMs <= nowMs ? ApiCredentialExpirySeverity::expired : ApiCredentialExpirySeverity::warning;
+        if (buildApiCredentialExpiryNotice(
+                policy.applicationID, *credential, deadlineMs, nowMs, severity, notice) == false ||
+            seenNoticeIDs.contains(notice.stableID))
+        {
+          continue;
+        }
+        seenNoticeIDs.insert(notice.stableID);
+        desired.push_back(std::move(notice));
+      }
+    }
+
+    ProdigyMasterAuthorityRuntimeState previous = masterAuthorityRuntimeState;
+    const bool previousDurable = masterAuthorityRuntimeStateDurable;
+    const uint64_t previousDurableGeneration = durableMasterAuthorityRuntimeStateGeneration;
+    Vector<ApiCredentialExpiryNotice> newlyCreated = {};
+    bool changed = false;
+    for (ApiCredentialExpiryNotice& existing : masterAuthorityRuntimeState.apiCredentialExpiryNotices)
+    {
+      bool stillRequired = false;
+      for (const ApiCredentialExpiryNotice& candidate : desired)
+      {
+        if (apiCredentialExpiryNoticeMatches(existing, candidate))
+        {
+          stillRequired = true;
+          break;
+        }
+      }
+      if (stillRequired == false && existing.resolved == false)
+      {
+        existing.resolved = true;
+        changed = true;
+      }
+    }
+
+    for (const ApiCredentialExpiryNotice& candidate : desired)
+    {
+      bool exists = false;
+      for (const ApiCredentialExpiryNotice& existing : masterAuthorityRuntimeState.apiCredentialExpiryNotices)
+      {
+        if (apiCredentialExpiryNoticeMatches(existing, candidate))
+        {
+          exists = true;
+          break;
+        }
+      }
+      if (exists == false)
+      {
+        masterAuthorityRuntimeState.apiCredentialExpiryNotices.push_back(candidate);
+        newlyCreated.push_back(candidate);
+        changed = true;
+      }
+    }
+
+    if (changed == false)
+    {
+      return 0;
+    }
+    if (commitMasterAuthorityStateChange() == false)
+    {
+      masterAuthorityRuntimeState = std::move(previous);
+      masterAuthorityRuntimeStateDurable = previousDurable;
+      durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+      return 0;
+    }
+
+    broadcastApiCredentialExpiryNotices(newlyCreated);
+    return uint32_t(newlyCreated.size());
+  }
+
   bool pruneExpiredTaskExecutionRecords(int64_t nowMs)
   {
     if (weAreMaster == false)
@@ -6759,8 +7025,10 @@ public:
     state = {};
     state.machineUUID = container->machine->uuid;
     state.machinePrivate4 = container->machine->private4;
+    // Preserve the credential bundle that started this live container.  Fresh
+    // validation belongs to launch and replay; an expired credential must not
+    // make replicated runtime state uncapturable or erase its recovery record.
     state.plan = container->generatePlan(deployment->plan, deployment->nShardGroups, &replayConfig);
-    applyCredentialsToContainerPlan(deployment->plan, *container, state.plan);
     state.runtimeLogicalCores = container->runtime_nLogicalCores;
     state.runtimeMemoryMB = container->runtime_memoryMB;
     state.runtimeStorageMB = container->runtime_storageMB;
@@ -7350,6 +7618,125 @@ public:
     for (const Wormhole& wormhole : plan.wormholes)
     {
       if (wormhole.hasDNSConfig && credential.name.equals(wormhole.dns.credentialName))
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool appendRequiredApiCredentials(const DeploymentPlan& deploymentPlan, Vector<ApiCredential> *delivered, String *failure = nullptr, const ApplicationApiCredentialSet *candidateSet = nullptr) const
+  {
+    if (failure)
+    {
+      failure->clear();
+    }
+    if (deploymentPlan.hasApiCredentialPolicy == false)
+    {
+      return true; // Existing admitted deployments may predate credential dependency declarations.
+    }
+
+    const DeploymentApiCredentialPolicy& policy = deploymentPlan.apiCredentialPolicy;
+    if (policy.applicationID == 0 || policy.applicationID != deploymentPlan.config.applicationID)
+    {
+      if (failure)
+      {
+        failure->assign("api credential policy applicationID mismatch"_ctv);
+      }
+      return false;
+    }
+    if (policy.requiredCredentialNames.empty())
+    {
+      return true; // Explicitly declared credential-free application.
+    }
+
+    const ApplicationApiCredentialSet *set = candidateSet;
+    if (set != nullptr && set->applicationID != policy.applicationID)
+    {
+      if (failure)
+      {
+        failure->assign("candidate api credential set applicationID mismatch"_ctv);
+      }
+      return false;
+    }
+    if (set == nullptr)
+    {
+      const auto setIt = apiCredentialSetsByApp.find(policy.applicationID);
+      if (setIt == apiCredentialSetsByApp.end())
+      {
+        if (failure)
+        {
+          failure->assign("required api credential set is not registered"_ctv);
+        }
+        return false;
+      }
+      set = &setIt->second;
+    }
+    if (set->applicationID != policy.applicationID)
+    {
+      if (failure)
+      {
+        failure->assign("api credential set applicationID mismatch"_ctv);
+      }
+      return false;
+    }
+
+    const int64_t nowMs = Time::now<TimeResolution::ms>();
+    Vector<String> seenNames = {};
+    for (const String& requiredName : policy.requiredCredentialNames)
+    {
+      if (requiredName.empty() || containsCredentialName(seenNames, requiredName))
+      {
+        if (failure)
+        {
+          failure->assign("api credential policy has an empty or duplicate required name"_ctv);
+        }
+        return false;
+      }
+      seenNames.push_back(requiredName);
+
+      const ApiCredential *credential = findApiCredential(*set, requiredName);
+      if (credential == nullptr || credential->provider.empty() || credential->material.empty() ||
+          (credential->activeFromMs > 0 && nowMs < credential->activeFromMs) ||
+          (credential->expiresAtMs > 0 && nowMs >= credential->expiresAtMs) ||
+          (credential->sunsetAtMs > 0 && nowMs >= credential->sunsetAtMs) ||
+          apiCredentialMayReachContainer(deploymentPlan, *credential) == false)
+      {
+        if (failure)
+        {
+          failure->snprintf<"required api credential '{}' is unavailable for container delivery"_ctv>(requiredName);
+        }
+        return false;
+      }
+
+      if (delivered)
+      {
+        delivered->push_back(*credential);
+      }
+    }
+    return true;
+  }
+
+  bool deploymentApiCredentialsAvailableForLaunch(const DeploymentPlan& deploymentPlan, String *failure = nullptr) const override
+  {
+    return appendRequiredApiCredentials(deploymentPlan, nullptr, failure);
+  }
+
+  bool materializedApiCredentialDependenciesAvailable(const ApplicationApiCredentialSet& candidateSet, String *failure = nullptr) const
+  {
+    if (failure)
+    {
+      failure->clear();
+    }
+    for (const auto& [deploymentID, deployment] : deployments)
+    {
+      (void)deploymentID;
+      if (deployment == nullptr || deployment->plan.config.applicationID != candidateSet.applicationID ||
+          deployment->plan.hasApiCredentialPolicy == false || deployment->lifecycleIsUnmaterialized())
+      {
+        continue;
+      }
+      if (appendRequiredApiCredentials(deployment->plan, nullptr, failure, &candidateSet) == false)
       {
         return false;
       }
@@ -8414,26 +8801,19 @@ public:
 
     if (deploymentPlan.hasApiCredentialPolicy)
     {
-      const DeploymentApiCredentialPolicy& apiPolicy = deploymentPlan.apiCredentialPolicy;
-      if (auto setIt = apiCredentialSetsByApp.find(apiPolicy.applicationID); setIt != apiCredentialSetsByApp.end())
+      Vector<ApiCredential> requiredApiCredentials = {};
+      if (appendRequiredApiCredentials(deploymentPlan, &requiredApiCredentials) == false)
       {
-        const ApplicationApiCredentialSet& set = setIt->second;
-        for (const String& requiredName : apiPolicy.requiredCredentialNames)
-        {
-          if (const ApiCredential *credential = findApiCredential(set, requiredName); credential != nullptr)
-          {
-            if (apiCredentialMayReachContainer(deploymentPlan, *credential))
-            {
-              bundle.apiCredentials.push_back(*credential);
-              produced = true;
-            }
-          }
-        }
+        bundle.apiCredentials.clear();
+        return false;
+      }
+      bundle.apiCredentials = std::move(requiredApiCredentials);
+      produced = bundle.apiCredentials.empty() == false;
 
-        if (set.setGeneration > bundleGeneration)
-        {
-          bundleGeneration = set.setGeneration;
-        }
+      if (auto setIt = apiCredentialSetsByApp.find(deploymentPlan.apiCredentialPolicy.applicationID);
+          setIt != apiCredentialSetsByApp.end() && setIt->second.setGeneration > bundleGeneration)
+      {
+        bundleGeneration = setIt->second.setGeneration;
       }
     }
 
@@ -8456,19 +8836,20 @@ public:
     return produced;
   }
 
-  void applyCredentialsToContainerPlan(const DeploymentPlan& deploymentPlan, const ContainerView& container, ContainerPlan& plan) override
+  bool applyCredentialsToContainerPlan(const DeploymentPlan& deploymentPlan, const ContainerView& container, ContainerPlan& plan) override
   {
     CredentialBundle bundle;
     if (buildCredentialBundleForContainer(deploymentPlan, container, bundle))
     {
       plan.hasCredentialBundle = true;
       plan.credentialBundle = std::move(bundle);
+      return true;
     }
-    else
-    {
-      plan.hasCredentialBundle = false;
-      plan.credentialBundle = CredentialBundle();
-    }
+
+    plan.hasCredentialBundle = false;
+    plan.credentialBundle = CredentialBundle();
+    return deploymentPlan.hasApiCredentialPolicy == false ||
+           deploymentPlan.apiCredentialPolicy.requiredCredentialNames.empty();
   }
 
   bool containerTlsIdentitiesFresh(const DeploymentPlan& deploymentPlan, const ContainerView& container, bool *pending = nullptr, String *failure = nullptr)
@@ -12969,6 +13350,18 @@ public:
       }
 
       ApplicationDeployment *deployment = deploymentIt->second;
+      String credentialFailure = {};
+      if (deploymentApiCredentialsAvailableForLaunch(deployment->plan, &credentialFailure) == false)
+      {
+        deployment->state = DeploymentState::failed;
+        this->deploymentFailed(
+            deployment,
+            deployment->plan.config.applicationID,
+            deployment->plan.config.deploymentID(),
+            credentialFailure.size() ? credentialFailure : String("credential policy unavailable for container replay"_ctv),
+            deployment->generateReport());
+        return false;
+      }
       for (ContainerView *container : containers)
       {
         if (container == nullptr)
@@ -12981,7 +13374,17 @@ public:
         {
           prodigyPopulateDefaultStatefulTopology(planToReplay.statefulTopology, planToReplay.shardGroup, planToReplay.config);
         }
-        applyCredentialsToContainerPlan(deployment->plan, *container, planToReplay);
+        if (applyCredentialsToContainerPlan(deployment->plan, *container, planToReplay) == false)
+        {
+          deployment->state = DeploymentState::failed;
+          this->deploymentFailed(
+              deployment,
+              deployment->plan.config.applicationID,
+              deployment->plan.config.deploymentID(),
+              "credential policy unavailable for container replay"_ctv,
+              deployment->generateReport());
+          return false;
+        }
 
         NeuronContainerBootstrap bootstrap = {};
         bootstrap.plan = std::move(planToReplay);
@@ -19683,6 +20086,7 @@ public:
     (void)advanceAllDeploymentTlsResumptionLifecycles(true);
     const int64_t nowMs = Time::now<TimeResolution::ms>();
     (void)advanceCertificateLifecycles(nowMs);
+    (void)advanceApiCredentialExpiryNotices(nowMs);
     (void)pruneExpiredTaskExecutionRecords(nowMs);
     spotDecomissionChecker.setTimeoutMs(prodigyBrainSpotDecommissionCheckIntervalMs);
     Ring::queueTimeout(&spotDecomissionChecker);
@@ -29961,22 +30365,47 @@ public:
 
               set.setGeneration = nextSetGeneration;
               set.updatedAtMs = Time::now<TimeResolution::ms>();
-              apiCredentialSetsByApp.insert_or_assign(request.applicationID, set);
-
-              response.setGeneration = set.setGeneration;
-              response.success = true;
-              (void)created;
-
-              if (nBrains > 1)
+              String dependencyFailure = {};
+              if (materializedApiCredentialDependenciesAvailable(set, &dependencyFailure) == false)
               {
-                String serializedSet;
-                BitseryEngine::serialize(serializedSet, set);
-                queueBrainReplication(BrainTopic::replicateApiCredentialSet, serializedSet);
+                response.failure = dependencyFailure.size() ? dependencyFailure : String("candidate api credential set would violate a materialized deployment policy"_ctv);
+                response.updatedNames.clear();
+                response.removedNames.clear();
               }
+              else
+              {
+                const ApplicationApiCredentialSet previousSet = created ? ApplicationApiCredentialSet {} : apiCredentialSetsByApp.find(request.applicationID)->second;
+                apiCredentialSetsByApp.insert_or_assign(request.applicationID, set);
 
-              persistLocalRuntimeState();
+                if (persistLocalRuntimeState() == false)
+                {
+                  if (created)
+                  {
+                    apiCredentialSetsByApp.erase(request.applicationID);
+                  }
+                  else
+                  {
+                    apiCredentialSetsByApp.insert_or_assign(request.applicationID, std::move(previousSet));
+                  }
+                  response.failure.assign("failed to persist api credential set"_ctv);
+                  response.updatedNames.clear();
+                  response.removedNames.clear();
+                }
+                else
+                {
+                  response.setGeneration = set.setGeneration;
+                  response.success = true;
+                  if (nBrains > 1)
+                  {
+                    String serializedSet;
+                    BitseryEngine::serialize(serializedSet, set);
+                    queueBrainReplication(BrainTopic::replicateApiCredentialSet, serializedSet);
+                  }
 
-              pushApiCredentialDeltaToLiveContainers(request.applicationID, set, response.updatedNames, response.removedNames, request.reason);
+                  (void)advanceApiCredentialExpiryNotices(Time::now<TimeResolution::ms>());
+                  pushApiCredentialDeltaToLiveContainers(request.applicationID, set, response.updatedNames, response.removedNames, request.reason);
+                }
+              }
             }
           }
 
@@ -30296,48 +30725,17 @@ public:
             }
           }
 
-          if (deployment->plan.hasApiCredentialPolicy)
+          if (deployment->plan.hasApiCredentialPolicy == false)
           {
-            const DeploymentApiCredentialPolicy& apiPolicy = deployment->plan.apiCredentialPolicy;
-            if (apiPolicy.applicationID == 0)
-            {
-              rejectInvalidPlan("invalid api credential policy: applicationID missing"_ctv);
-              return;
-            }
-            if (apiPolicy.applicationID != deployment->plan.config.applicationID)
-            {
-              rejectInvalidPlan("invalid api credential policy: applicationID mismatch"_ctv);
-              return;
-            }
+            rejectInvalidPlan("invalid plan: api credential policy declaration required"_ctv);
+            return;
+          }
 
-            auto setIt = apiCredentialSetsByApp.find(apiPolicy.applicationID);
-            if (setIt == apiCredentialSetsByApp.end())
-            {
-              rejectInvalidPlan("invalid api credential policy: credential set does not exist"_ctv);
-              return;
-            }
-
-            const ApplicationApiCredentialSet& set = setIt->second;
-            for (const String& requiredName : apiPolicy.requiredCredentialNames)
-            {
-              bool found = false;
-              for (const ApiCredential& credential : set.credentials)
-              {
-                if (credential.name.equals(requiredName))
-                {
-                  found = true;
-                  break;
-                }
-              }
-
-              if (found == false)
-              {
-                String reason;
-                reason.snprintf<"invalid api credential policy: required key '{}' is not registered"_ctv>(requiredName);
-                rejectInvalidPlan(reason);
-                return;
-              }
-            }
+          String apiCredentialFailure = {};
+          if (deploymentApiCredentialsAvailableForLaunch(deployment->plan, &apiCredentialFailure) == false)
+          {
+            rejectInvalidPlanFailure(apiCredentialFailure, "invalid api credential policy"_ctv);
+            return;
           }
 
           if (wormholeTargetBindingsUnique(deployment->plan.wormholes) == false)
@@ -30651,6 +31049,74 @@ public:
             pushSpinApplicationProgressToMothership(deployment, "waiting for authoritative DNS reconciliation"_ctv);
           }
 
+          break;
+        }
+      case MothershipTopic::credentialExpiryNotices:
+        {
+          String serializedPayload = {};
+          Message::extractToStringView(args, serializedPayload);
+          ApiCredentialExpiryNoticePayload payload = {};
+          if (args != message->terminal() ||
+              BitseryEngine::deserializeSafe(serializedPayload, payload) == false ||
+              payload.clusterUUID != brainConfig.clusterUUID || payload.snapshotComplete)
+          {
+            break;
+          }
+
+          if (payload.requestSnapshot)
+          {
+            if (payload.acknowledge || payload.notice.stableID != 0 || payload.notice.applicationID != 0 ||
+                payload.notice.name.empty() == false || payload.notice.provider.empty() == false ||
+                payload.notice.generation != 0 || payload.notice.deadlineMs != 0 ||
+                payload.notice.createdAtMs != 0 || payload.notice.acknowledged || payload.notice.resolved)
+            {
+              break;
+            }
+            mothership->apiCredentialExpiryNoticesSubscribed = true;
+            mothership->queuedApiCredentialExpiryNoticeIDs.clear();
+            queuePendingApiCredentialExpiryNoticesToMothership(
+                mothership, payload.includeAcknowledged, true);
+            break;
+          }
+
+          if (payload.acknowledge == false || payload.includeAcknowledged || payload.requestSnapshot ||
+              payload.notice.stableID == 0 || payload.notice.applicationID == 0 || payload.notice.name.empty() ||
+              payload.notice.provider.empty() || payload.notice.generation == 0 || payload.notice.deadlineMs <= 0 ||
+              payload.notice.acknowledged || payload.notice.resolved ||
+              uint8_t(payload.notice.severity) > uint8_t(ApiCredentialExpirySeverity::expired))
+          {
+            break;
+          }
+
+          bool acknowledged = false;
+          for (ApiCredentialExpiryNotice& existing : masterAuthorityRuntimeState.apiCredentialExpiryNotices)
+          {
+            if (apiCredentialExpiryNoticeMatches(existing, payload.notice) &&
+                existing.createdAtMs == payload.notice.createdAtMs)
+            {
+              if (existing.acknowledged == false)
+              {
+                ProdigyMasterAuthorityRuntimeState previous = masterAuthorityRuntimeState;
+                const bool previousDurable = masterAuthorityRuntimeStateDurable;
+                const uint64_t previousDurableGeneration = durableMasterAuthorityRuntimeStateGeneration;
+                existing.acknowledged = true;
+                if (commitMasterAuthorityStateChange() == false)
+                {
+                  masterAuthorityRuntimeState = std::move(previous);
+                  masterAuthorityRuntimeStateDurable = previousDurable;
+                  durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+                  break;
+                }
+              }
+              acknowledged = true;
+              break;
+            }
+          }
+
+          if (acknowledged)
+          {
+            mothership->queuedApiCredentialExpiryNoticeIDs.erase(payload.notice.stableID);
+          }
           break;
         }
       case MothershipTopic::recoverMaterializedStatefulDeployment:

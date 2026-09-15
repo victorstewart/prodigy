@@ -3349,6 +3349,13 @@ static bool resolveLiveLocalProdigyControlSocketPath(String& controlSocketPath, 
   return false;
 }
 
+static bool loadLocalProdigyClusterUUID(uint128_t& clusterUUID, String *failure = nullptr)
+{
+  clusterUUID = 0;
+  ProdigyPersistentStateStore stateStore;
+  return stateStore.readStoredClusterUUID(clusterUUID, failure);
+}
+
 static bool loadLocalProdigyControlSocketPath(String& controlSocketPath, String *failure = nullptr)
 {
   if (const char *explicitSocketPath = getenv("PRODIGY_MOTHERSHIP_SOCKET"))
@@ -4722,6 +4729,9 @@ private:
   Vault::SSHKeyPackage clusterBootstrapSshKeyPackage;
   String clusterBootstrapSshPrivateKeyPath;
   String matchedFrameBuffer;
+  uint128_t expectedClusterUUID = 0;
+  String localClusterUUIDResolutionFailure;
+  bool credentialExpirySubscriptionAttempted = false;
   int transportFD = -1;
   std::unique_ptr<SSL, decltype(&SSL_free)> tunnelGatewayTLS {nullptr, SSL_free};
   LIBSSH2_SESSION *sshSession = nullptr;
@@ -4765,6 +4775,9 @@ private:
     clusterBootstrapSshPrivateKeyPath.clear();
     sshTunnelKnownHostsPath.clear();
     matchedFrameBuffer.clear();
+    expectedClusterUUID = 0;
+    localClusterUUIDResolutionFailure.clear();
+    credentialExpirySubscriptionAttempted = false;
   }
 
   void disconnectSSH(void)
@@ -5430,6 +5443,121 @@ private:
     return true;
   }
 
+  bool consumeApiCredentialExpiryNoticeFrame(
+      uint8_t *frame, uint32_t frameSize, bool acknowledge, FILE *display)
+  {
+    if (frame == nullptr || frameSize < sizeof(Message))
+    {
+      return false;
+    }
+
+    Message *message = reinterpret_cast<Message *>(frame);
+    if (message->size != frameSize)
+    {
+      return false;
+    }
+
+    uint8_t *args = message->args;
+    String serialized = {};
+    Message::extractToStringView(args, serialized);
+    ApiCredentialExpiryNoticePayload payload = {};
+    if (args != message->terminal() ||
+        BitseryEngine::deserializeSafe(serialized, payload) == false ||
+        payload.clusterUUID == 0 ||
+        (expectedClusterUUID != 0 && payload.clusterUUID != expectedClusterUUID) ||
+        payload.includeAcknowledged || payload.requestSnapshot || payload.acknowledge)
+    {
+      return false;
+    }
+
+    if (payload.snapshotComplete)
+    {
+      const ApiCredentialExpiryNotice& completion = payload.notice;
+      return completion.stableID == 0 && completion.applicationID == 0 && completion.name.empty() &&
+             completion.provider.empty() && completion.generation == 0 && completion.deadlineMs == 0 &&
+             completion.createdAtMs == 0 && completion.severity == ApiCredentialExpirySeverity::warning &&
+             completion.acknowledged == false && completion.resolved == false;
+    }
+
+    const ApiCredentialExpiryNotice& notice = payload.notice;
+    if (notice.stableID == 0 || notice.applicationID == 0 || notice.name.empty() ||
+        notice.provider.empty() || notice.generation == 0 || notice.deadlineMs <= 0 ||
+        uint8_t(notice.severity) > uint8_t(ApiCredentialExpirySeverity::expired))
+    {
+      return false;
+    }
+
+    if (display == nullptr)
+    {
+      return false;
+    }
+
+    String clusterUUIDText = {};
+    clusterUUIDText.assignItoh(payload.clusterUUID);
+    String noticeName = notice.name;
+    String noticeProvider = notice.provider;
+    if (std::fprintf(display,
+                     "credential-expiry cluster=%s appID=%u name=%s provider=%s generation=%llu deadlineMs=%lld severity=%s acknowledged=%u resolved=%u\n",
+                     clusterUUIDText.c_str(),
+                     unsigned(notice.applicationID),
+                     noticeName.c_str(),
+                     noticeProvider.c_str(),
+                     (unsigned long long)notice.generation,
+                     (long long)notice.deadlineMs,
+                     notice.severity == ApiCredentialExpirySeverity::expired ? "expired" : "warning",
+                     unsigned(notice.acknowledged),
+                     unsigned(notice.resolved)) < 0 ||
+        std::fflush(display) != 0 || std::ferror(display) != 0)
+    {
+      lastIOFailure.assign("failed to display credential expiry notice"_ctv);
+      return false;
+    }
+
+    if (acknowledge == false || notice.acknowledged || notice.resolved)
+    {
+      return true;
+    }
+
+    ApiCredentialExpiryNoticePayload acknowledgement = {};
+    acknowledgement.clusterUUID = payload.clusterUUID;
+    acknowledgement.notice = notice;
+    acknowledgement.acknowledge = true;
+    String serializedAcknowledgement = {};
+    BitseryEngine::serialize(serializedAcknowledgement, acknowledgement);
+    String acknowledgementFrame = {};
+    Message::construct(acknowledgementFrame, MothershipTopic::credentialExpiryNotices, serializedAcknowledgement);
+    if (sendTransport(reinterpret_cast<const uint8_t *>(acknowledgementFrame.data()), acknowledgementFrame.size()) == false)
+    {
+      lastIOFailure.assign("failed to acknowledge credential expiry notice"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  bool sendCredentialExpirySnapshotRequest(bool includeAcknowledged)
+  {
+    if (expectedClusterUUID == 0 || credentialExpirySubscriptionAttempted)
+    {
+      return true;
+    }
+
+    credentialExpirySubscriptionAttempted = true;
+    ApiCredentialExpiryNoticePayload request = {};
+    request.clusterUUID = expectedClusterUUID;
+    request.includeAcknowledged = includeAcknowledged;
+    request.requestSnapshot = true;
+    String serializedRequest = {};
+    BitseryEngine::serialize(serializedRequest, request);
+    String requestFrame = {};
+    Message::construct(requestFrame, MothershipTopic::credentialExpiryNotices, serializedRequest);
+    if (sendTransport(reinterpret_cast<const uint8_t *>(requestFrame.data()), requestFrame.size()) == false)
+    {
+      lastIOFailure.assign("failed to subscribe to credential expiry notices"_ctv);
+      return false;
+    }
+    return true;
+  }
+
 public:
 
   void setRemoteIOTimeoutMs(int timeoutMs)
@@ -5471,6 +5599,11 @@ public:
     transportFD = fd;
   }
 
+  void unitTestSetExpectedClusterUUID(uint128_t clusterUUID)
+  {
+    expectedClusterUUID = clusterUUID;
+  }
+
   bool unitTestAdoptRemoteSshUnixTransportFD(int fd)
   {
     disconnect();
@@ -5494,6 +5627,12 @@ public:
     }
 
     controlPaths.push_back(controlSocketPath);
+    String clusterUUIDFailure = {};
+    if (loadLocalProdigyClusterUUID(expectedClusterUUID, &clusterUUIDFailure) == false)
+    {
+      expectedClusterUUID = 0;
+      localClusterUUIDResolutionFailure = std::move(clusterUUIDFailure);
+    }
     if (failure)
     {
       failure->clear();
@@ -5515,6 +5654,7 @@ public:
   {
     clearTarget();
     targetLabel = cluster.name;
+    expectedClusterUUID = cluster.clusterUUID;
 
     if (cluster.mothershipConnectivity.kind == MothershipConnectivityKind::tunnelProvider)
     {
@@ -5715,6 +5855,7 @@ public:
     rBuffer.clear();
     wBuffer.clear();
     matchedFrameBuffer.clear();
+    credentialExpirySubscriptionAttempted = false;
 
     switch (transportMode)
     {
@@ -5831,6 +5972,17 @@ public:
 
   bool send(void)
   {
+    if (wBuffer.size() >= sizeof(Message))
+    {
+      const Message *pending = reinterpret_cast<const Message *>(wBuffer.data());
+      const MothershipTopic pendingTopic = MothershipTopic(pending->topic);
+      if (pendingTopic != MothershipTopic::configure &&
+          pendingTopic != MothershipTopic::credentialExpiryNotices &&
+          sendCredentialExpirySnapshotRequest(false) == false)
+      {
+        return false;
+      }
+    }
     uint16_t topic = 0;
     uint32_t messageSize = 0;
     uint8_t messagePadding = 0;
@@ -5980,6 +6132,18 @@ public:
           break;
         }
 
+        if (MothershipTopic(messageTopic) == MothershipTopic::credentialExpiryNotices &&
+            expectedTopic != MothershipTopic::credentialExpiryNotices)
+        {
+          if (consumeApiCredentialExpiryNoticeFrame(cursor, messageSize, true, stderr) == false)
+          {
+            lastIOFailure.assign("invalid credential expiry notification frame"_ctv);
+            return nullptr;
+          }
+          cursorOffset += messageSize;
+          continue;
+        }
+
         if (MothershipTopic(messageTopic) == expectedTopic)
         {
           matchedFrameBuffer.clear();
@@ -6098,6 +6262,69 @@ public:
 
     basics_log("timed out waiting for response topic %u\n", uint32_t(expectedTopic));
     return nullptr;
+  }
+
+  bool requestCredentialExpiryCatalog(void)
+  {
+    if (expectedClusterUUID == 0)
+    {
+      if (localClusterUUIDResolutionFailure.empty() == false)
+      {
+        lastIOFailure.snprintf<"credential expiry notifications could not resolve local cluster UUID: {}"_ctv>(
+            localClusterUUIDResolutionFailure);
+      }
+      else
+      {
+        lastIOFailure.assign("credential expiry notifications require a registered cluster target"_ctv);
+      }
+      return false;
+    }
+
+    ApiCredentialExpiryNoticePayload request = {};
+    request.clusterUUID = expectedClusterUUID;
+    request.includeAcknowledged = true;
+    request.requestSnapshot = true;
+    String serializedRequest = {};
+    BitseryEngine::serialize(serializedRequest, request);
+    Message::construct(wBuffer, MothershipTopic::credentialExpiryNotices, serializedRequest);
+    if (send() == false)
+    {
+      return false;
+    }
+
+    for (uint32_t frameCount = 0; frameCount < 4096; ++frameCount)
+    {
+      Message *frame = recvExpectedTopic(MothershipTopic::credentialExpiryNotices, 64);
+      if (frame == nullptr)
+      {
+        return false;
+      }
+
+      if (consumeApiCredentialExpiryNoticeFrame(
+              reinterpret_cast<uint8_t *>(frame), frame->size, true, stdout) == false)
+      {
+        lastIOFailure.assign("invalid credential expiry catalog frame"_ctv);
+        return false;
+      }
+
+      uint8_t *args = frame->args;
+      String serialized = {};
+      Message::extractToStringView(args, serialized);
+      ApiCredentialExpiryNoticePayload payload = {};
+      if (args != frame->terminal() ||
+          BitseryEngine::deserializeSafe(serialized, payload) == false)
+      {
+        lastIOFailure.assign("credential expiry catalog decode failed"_ctv);
+        return false;
+      }
+      if (payload.snapshotComplete)
+      {
+        return true;
+      }
+    }
+
+    lastIOFailure.assign("credential expiry catalog exceeded frame limit"_ctv);
+    return false;
   }
 
   bool ensureConnected(void)
@@ -17984,6 +18211,28 @@ private:
     }
   }
 
+  void runCredentialExpiryNotifications(int argc, char *argv[])
+  {
+    if (argc < 1)
+    {
+      basics_log("too few arguments. ex: credentialExpiryNotifications [target: clusterName|clusterUUID]\n");
+      exit(EXIT_FAILURE);
+    }
+    if (configureControlTarget(argv[0]) == false || socket.connect() != 0)
+    {
+      exit(EXIT_FAILURE);
+    }
+    if (socket.requestCredentialExpiryCatalog() == false)
+    {
+      String failure = socket.ioFailureDetail();
+      if (failure.size() > 0)
+      {
+        std::fprintf(stderr, "credentialExpiryNotifications failed: %s\n", failure.c_str());
+      }
+      exit(EXIT_FAILURE);
+    }
+  }
+
   void runUpsertApiCredentialSet(int argc, char *argv[])
   {
     if (argc < 2)
@@ -18587,6 +18836,7 @@ public:
         {"containerLogs",                   &Mothership::runContainerLogs                  },
         {"createCluster",                   &Mothership::runCreateCluster                  },
         {"createProviderCredential",        &Mothership::runCreateProviderCredential       },
+        {"credentialExpiryNotifications",   &Mothership::runCredentialExpiryNotifications },
         {"deleteDNSBinding",                &Mothership::runDeleteDNSBinding               },
         {"deleteMachineSchema",             &Mothership::runDeleteMachineSchema            },
         {"deltaMachineBudget",              &Mothership::runDeltaMachineBudget             },
@@ -18666,7 +18916,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultTestCluster, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, taskReport, containerLogs, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
+        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultTestCluster, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }
@@ -18728,6 +18978,8 @@ int main(int argc, char *argv[])
     message.append("\tfor stored cluster targets, it also refreshes the cached authoritative topology and refresh metadata in the local cluster registry\n");
     message.append("containerLogs [target: local|clusterName|clusterUUID] [application name] [maximum bytes]\n");
     message.append("\tfetches bounded current stdout/stderr and 24-hour retained failure logs through the master Brain and Neurons\n");
+    message.append("credentialExpiryNotifications [target: clusterName|clusterUUID]\n");
+    message.append("\tlists retained API credential expiry metadata and acknowledges unacknowledged notices\n");
     message.append("deploy [target: local|clusterName|clusterUUID] [json|-|@path] [path to container blob]\n");
     message.append("\tdeploys an application on the cluster\n");
     message.append("applicationReport [target: local|clusterName|clusterUUID] [application name]\n");

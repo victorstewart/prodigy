@@ -1,4 +1,5 @@
 {
+  "apiCredentials": {"applicationID": "${application:RustMeshPingPongSubscriber}", "requiredCredentialNames": []},
    "config": {
       "type": "ApplicationType::stateless",
       "applicationID": "${application:RustMeshPingPongSubscriber}",

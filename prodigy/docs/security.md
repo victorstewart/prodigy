@@ -29,6 +29,29 @@ After bootstrap, runtime machines should rely on provider-native identity where 
 
 Application containers should receive only credentials explicitly delivered through the runtime protocol. The credential set should match the application service identity and should not inherit broad provider bootstrap authority by default.
 
+Every new deployment plan must declare `apiCredentials.applicationID` matching
+`config.applicationID` and an explicit `requiredCredentialNames` array. Use `[]`
+only when the application needs no API credentials. This declaration is the
+application's dependency manifest; review it alongside the Discombobulator image
+recipe. Prodigy cannot discover secrets hidden in arbitrary application files.
+Do not embed credential material in images, build arguments, or deployment plans.
+
+Register material separately with `mothership upsertApiCredentialSet`, using a
+restricted input file or stdin. Brain checks that every declared credential is
+registered, has a provider and material, is currently active, has not expired or
+reached its sunset time, and is permitted to reach that container. It checks again
+before launch. DNS management credentials remain in their control-plane owner;
+declaring one as an application credential does not authorize its delivery.
+
+Set `refreshPushEnabled: true` for applications that consume credential updates.
+This delivers registered rotations; it does not renew credentials. Credential
+expiry notices are durably cataloged and delivered for required credentials at
+the seven-day warning threshold and again when expired; acknowledgement and
+resolution are tracked separately from credential delivery. Managed TLS
+certificates use their separate certificate-renewal lifecycle. Existing admitted
+deployments remain recoverable without an API policy; their next submitted plan
+must declare one.
+
 ## Bundle update signatures
 
 Prodigy update bundles are intended to be signed with Ed25519 before in-place rollout. CI should produce the bundle plus a raw 64-byte `prodigy.sig`; the master Brain should attach the bundle and signature when pushing to peers; receivers should verify the signature against a pinned public key before writing and transitioning to the new bundle.

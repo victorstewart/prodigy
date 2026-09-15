@@ -302,6 +302,88 @@ static inline bool mothershipParseStringArray(
 }
 
 template <typename ResolveApplicationIDReference>
+static inline bool mothershipParseDeploymentPlanApiCredentials(
+    const simdjson::dom::element& value,
+    DeploymentPlan& plan,
+    ResolveApplicationIDReference&& resolveApplicationIDReference,
+    String *failure = nullptr)
+{
+  if (failure) failure->clear();
+  auto reject = [&](const char *message) {
+    if (failure) failure->assign(message);
+    return false;
+  };
+  if (value.type() != simdjson::dom::element_type::OBJECT)
+    return reject("apiCredentials requires a document");
+
+  DeploymentApiCredentialPolicy policy = {};
+  bool sawNames = false;
+  bytell_hash_set<String> fields;
+  for (auto field : value.get_object())
+  {
+    String key;
+    key.assign(field.key.data(), field.key.size());
+    if (fields.insert(key).second == false)
+      return reject("apiCredentials contains a duplicate field");
+    if (key.equal("applicationID"_ctv))
+    {
+      if (field.value.type() == simdjson::dom::element_type::INT64)
+      {
+        int64_t id = 0;
+        (void)field.value.get(id);
+        if (id <= 0 || id > UINT16_MAX)
+          return reject("apiCredentials.applicationID invalid");
+        policy.applicationID = static_cast<uint16_t>(id);
+      }
+      else if (field.value.type() == simdjson::dom::element_type::STRING)
+      {
+        String reference;
+        reference.assign(field.value.get_c_str());
+        if (resolveApplicationIDReference(reference, policy.applicationID) == false || policy.applicationID == 0)
+          return reject("apiCredentials.applicationID symbolic reference invalid or unreserved; reserveApplicationID first");
+      }
+      else
+        return reject("apiCredentials.applicationID requires an integer or symbolic reference string");
+    }
+    else if (key.equal("requiredCredentialNames"_ctv))
+    {
+      sawNames = true;
+      if (field.value.type() != simdjson::dom::element_type::ARRAY)
+        return reject("apiCredentials.requiredCredentialNames requires an array");
+      for (auto item : field.value.get_array())
+      {
+        if (item.type() != simdjson::dom::element_type::STRING)
+          return reject("apiCredentials.requiredCredentialNames requires string members");
+        String name;
+        name.assign(item.get_c_str());
+        if (name.size() == 0)
+          return reject("apiCredentials.requiredCredentialNames contains empty name");
+        for (const String& existing : policy.requiredCredentialNames)
+          if (existing.equals(name))
+            return reject("apiCredentials.requiredCredentialNames contains duplicate name");
+        policy.requiredCredentialNames.push_back(std::move(name));
+      }
+    }
+    else if (key.equal("refreshPushEnabled"_ctv))
+    {
+      if (field.value.type() != simdjson::dom::element_type::BOOL)
+        return reject("apiCredentials.refreshPushEnabled requires a bool");
+      (void)field.value.get(policy.refreshPushEnabled);
+    }
+    else
+      return reject("apiCredentials invalid field");
+  }
+  if (policy.applicationID == 0)
+    return reject("apiCredentials.applicationID required");
+  if (sawNames == false)
+    return reject("apiCredentials.requiredCredentialNames required; use [] only for an application without API credentials");
+
+  plan.apiCredentialPolicy = std::move(policy);
+  plan.hasApiCredentialPolicy = true;
+  return true;
+}
+
+template <typename ResolveApplicationIDReference>
 static inline bool mothershipParseDeploymentPlanTlsPolicy(
     const simdjson::dom::element& value,
     DeploymentPlan& plan,

@@ -2804,6 +2804,10 @@ static void seedDeployRequestPlan(DeploymentPlan& plan, uint16_t applicationID)
   plan.stateless.nBase = 1;
   plan.stateless.maxPerRackRatio = 1.0f;
   plan.stateless.maxPerMachineRatio = 1.0f;
+  // New deployment admission requires an explicit policy.  This fixture is
+  // intentionally credential-free rather than relying on legacy omission.
+  plan.hasApiCredentialPolicy = true;
+  plan.apiCredentialPolicy.applicationID = applicationID;
 }
 
 static void seedStatefulDeployRequestPlan(DeploymentPlan& plan, uint16_t applicationID)
@@ -2929,6 +2933,73 @@ static void testSpinApplicationInvalidPlanUsesSingleTopicFrame(TestSuite& suite)
   suite.expect(frameCount == 1, "spin_application_invalid_plan_uses_single_frame");
   suite.expect(sawInvalidPlan, "spin_application_invalid_plan_sets_invalid_code");
   suite.expect(invalidPlanReason == "invalid plan: applicationID not reserved"_ctv, "spin_application_invalid_plan_includes_reason");
+}
+
+static void testSpinApplicationCredentialPolicyAdmission(TestSuite& suite)
+{
+  StreamingTestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  Mothership mothership = {};
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  brain.mothership = &mothership;
+  mothership.isFixedFile = true;
+  mothership.fslot = 1;
+
+  auto submit = [&](DeploymentPlan& plan, const String& applicationName) -> String {
+    String reserveFailure = {};
+    suite.require(brain.reserveApplicationIDMapping(applicationName, plan.config.applicationID, &reserveFailure),
+                  "spin_application_credential_policy_reserves_application");
+    String serializedPlan = {};
+    BitseryEngine::serialize(serializedPlan, plan);
+    String requestBuffer = {};
+    Message *request = buildMothershipMessage(
+        requestBuffer,
+        MothershipTopic::spinApplication,
+        uint16_t(plan.config.applicationID),
+        serializedPlan,
+        "credential admission does not consume the blob"_ctv);
+    brain.mothershipHandler(&mothership, request);
+
+    uint32_t responseCount = 0;
+    SpinApplicationResponseCode responseCode = SpinApplicationResponseCode::okay;
+    String responseReason = {};
+    forEachMessageInBuffer(mothership.wBuffer, [&](Message *frame) {
+      if (MothershipTopic(frame->topic) != MothershipTopic::spinApplication)
+      {
+        return;
+      }
+      ++responseCount;
+      uint8_t rawCode = uint8_t(SpinApplicationResponseCode::okay);
+      uint8_t *args = frame->args;
+      Message::extractArg<ArgumentNature::fixed>(args, rawCode);
+      responseCode = SpinApplicationResponseCode(rawCode);
+      if (args < frame->terminal())
+      {
+        Message::extractToStringView(args, responseReason);
+      }
+    });
+    suite.expect(responseCount == 1 && responseCode == SpinApplicationResponseCode::invalidPlan,
+                 "spin_application_credential_policy_rejects_before_admission");
+    suite.expect(brain.deployments.contains(plan.config.deploymentID()) == false,
+                 "spin_application_credential_policy_does_not_admit_rejected_plan");
+    mothership.wBuffer.clear();
+    return responseReason;
+  };
+
+  DeploymentPlan omitted = {};
+  seedDeployRequestPlan(omitted, 62'017);
+  omitted.hasApiCredentialPolicy = false;
+  omitted.apiCredentialPolicy = {};
+  suite.expect(submit(omitted, "CredentialAdmissionOmitted"_ctv) == "invalid plan: api credential policy declaration required"_ctv,
+               "spin_application_rejects_omitted_api_credential_policy");
+
+  DeploymentPlan unavailable = {};
+  seedDeployRequestPlan(unavailable, 62'018);
+  unavailable.apiCredentialPolicy.requiredCredentialNames.push_back("turnstile"_ctv);
+  suite.expect(submit(unavailable, "CredentialAdmissionRequired"_ctv) == "invalid plan: required api credential set is not registered"_ctv,
+               "spin_application_rejects_unavailable_required_api_credential");
 }
 
 static void testSpinApplicationRejectsDuplicateNonTaskDeploymentIDWithoutMutation(TestSuite& suite)
@@ -4432,9 +4503,6 @@ static void testCredentialBundleBuildAndApply(TestSuite& suite)
   deploymentPlan.hasApiCredentialPolicy = true;
   deploymentPlan.apiCredentialPolicy.applicationID = 6;
   deploymentPlan.apiCredentialPolicy.requiredCredentialNames.push_back("telnyx_bearer"_ctv);
-  deploymentPlan.apiCredentialPolicy.requiredCredentialNames.push_back("cloudflare_dns"_ctv);
-  deploymentPlan.apiCredentialPolicy.requiredCredentialNames.push_back("route53_dns"_ctv);
-  deploymentPlan.apiCredentialPolicy.requiredCredentialNames.push_back("missing_name"_ctv);
   deploymentPlan.apiCredentialPolicy.refreshPushEnabled = true;
   Wormhole dnsWormhole = {};
   dnsWormhole.name = "api"_ctv;
@@ -4529,15 +4597,13 @@ static void testCredentialBundleBuildAndApply(TestSuite& suite)
   brain.deployments.insert_or_assign(deploymentPlan.config.deploymentID(), &deployment);
   Vector<String> updatedNames = {};
   updatedNames.push_back("telnyx_bearer"_ctv);
-  updatedNames.push_back("cloudflare_dns"_ctv);
-  updatedNames.push_back("route53_dns"_ctv);
   Vector<String> removedNames = {};
   brain.pushApiCredentialDeltaToLiveContainers(6, set, updatedNames, removedNames, "unit-api-refresh"_ctv);
   uint128_t refreshedContainer = {};
   CredentialDelta delta = {};
-  suite.expect(extractQueuedCredentialDelta(machine, refreshedContainer, delta), "api_credential_delta_filters_dns_credentials");
-  suite.expect(delta.updatedApi.size() == 1 && delta.updatedApi[0].name.equal("telnyx_bearer"_ctv), "api_credential_delta_delivers_only_app_credential");
-  suite.expect(stringVectorContains(delta.removedApiNames, "cloudflare_dns"_ctv) && stringVectorContains(delta.removedApiNames, "route53_dns"_ctv), "api_credential_delta_removes_dns_credentials");
+  suite.expect(extractQueuedCredentialDelta(machine, refreshedContainer, delta), "api_credential_delta_delivers_required_app_credential");
+  suite.expect(delta.updatedApi.size() == 1 && delta.updatedApi[0].name.equal("telnyx_bearer"_ctv), "api_credential_delta_delivers_only_required_app_credential");
+  suite.expect(delta.removedApiNames.empty(), "api_credential_delta_ignores_nonrequired_dns_credentials");
   brain.deployments.erase(deploymentPlan.config.deploymentID());
 
   DeploymentPlan noPolicyPlan;
@@ -4573,6 +4639,83 @@ static void testCredentialBundleBuildAndApply(TestSuite& suite)
   brain.applyCredentialsToContainerPlan(resumptionPlan, resumptionContainerA, resumptionContainerPlan);
   suite.expect(resumptionContainerPlan.hasCredentialBundle, "apply_credentials_resumption_sets_bundle_flag");
   suite.expect(resumptionContainerPlan.credentialBundle.tlsResumptionSnapshots.size() == 1, "apply_credentials_resumption_copies_snapshot");
+}
+
+static void testApiCredentialPolicyAvailability(TestSuite& suite)
+{
+  TestBrain brain;
+  DeploymentPlan plan = makeDeploymentPlan(6, 0xC0ED);
+  plan.hasApiCredentialPolicy = true;
+  plan.apiCredentialPolicy.applicationID = 6;
+  plan.apiCredentialPolicy.requiredCredentialNames.push_back("turnstile"_ctv);
+
+  ApplicationApiCredentialSet set = {};
+  set.applicationID = 6;
+  set.setGeneration = 1;
+  ApiCredential credential = {};
+  credential.name.assign("turnstile"_ctv);
+  credential.provider.assign("turnstile"_ctv);
+  credential.material.assign("unit-secret"_ctv);
+  set.credentials.push_back(credential);
+  brain.apiCredentialSetsByApp.insert_or_assign(6, set);
+
+  String failure = {};
+  suite.expect(brain.deploymentApiCredentialsAvailableForLaunch(plan, &failure), "api_policy_admission_accepts_deliverable_required_credential");
+  CredentialBundle bundle = {};
+  suite.expect(brain.buildCredentialBundleForContainer(plan, ContainerView {}, bundle), "api_policy_launch_builds_complete_required_bundle");
+  suite.expect(bundle.apiCredentials.size() == 1 && bundle.apiCredentials[0].name.equal("turnstile"_ctv), "api_policy_launch_bundle_has_exact_required_credential");
+
+  auto setIt = brain.apiCredentialSetsByApp.find(6);
+  suite.expect(setIt != brain.apiCredentialSetsByApp.end(), "api_policy_test_set_present");
+  if (setIt == brain.apiCredentialSetsByApp.end())
+  {
+    return;
+  }
+  ApiCredential& stored = setIt->second.credentials[0];
+  stored.expiresAtMs = Time::now<TimeResolution::ms>() - 1;
+  suite.expect(brain.deploymentApiCredentialsAvailableForLaunch(plan, &failure) == false, "api_policy_rejects_credential_expired_after_admission");
+  CredentialBundle expiredBundle = {};
+  suite.expect(brain.buildCredentialBundleForContainer(plan, ContainerView {}, expiredBundle) == false && expiredBundle.apiCredentials.empty(), "api_policy_launch_rejects_expired_partial_bundle");
+
+  // The original scheduler path must report a terminal deployment failure rather
+  // than repeatedly deferring an expired credential requirement.
+  ApplicationDeployment expiredDeployment = {};
+  expiredDeployment.plan = plan;
+  expiredDeployment.state = DeploymentState::deploying;
+  BrainBase *previousBrain = thisBrain;
+  thisBrain = &brain;
+  expiredDeployment.schedule();
+  thisBrain = previousBrain;
+  const auto failedIt = brain.failedDeployments.find(plan.config.deploymentID());
+  suite.expect(expiredDeployment.state == DeploymentState::failed,
+               "api_policy_expired_schedule_marks_deployment_failed");
+  suite.expect(failedIt != brain.failedDeployments.end() &&
+                   failedIt->second.reason.equal("required api credential 'turnstile' is unavailable for container delivery"_ctv),
+               "api_policy_expired_schedule_records_actionable_failure");
+  brain.failedDeployments.erase(plan.config.deploymentID());
+
+  stored.expiresAtMs = 0;
+  stored.metadata.insert_or_assign("dnsScope"_ctv, "zone"_ctv);
+  suite.expect(brain.deploymentApiCredentialsAvailableForLaunch(plan, &failure) == false, "api_policy_rejects_dns_filtered_required_credential");
+  CredentialBundle filteredBundle = {};
+  suite.expect(brain.buildCredentialBundleForContainer(plan, ContainerView {}, filteredBundle) == false && filteredBundle.apiCredentials.empty(), "api_policy_launch_rejects_dns_filtered_partial_bundle");
+
+  stored.metadata.clear();
+  stored.activeFromMs = Time::now<TimeResolution::ms>() + 60'000;
+  suite.expect(brain.deploymentApiCredentialsAvailableForLaunch(plan, &failure) == false, "api_policy_rejects_not_yet_active_credential");
+  stored.activeFromMs = 0;
+  stored.sunsetAtMs = Time::now<TimeResolution::ms>() - 1;
+  suite.expect(brain.deploymentApiCredentialsAvailableForLaunch(plan, &failure) == false, "api_policy_rejects_sunset_credential");
+  stored.sunsetAtMs = 0;
+
+  plan.apiCredentialPolicy.requiredCredentialNames.push_back("turnstile"_ctv);
+  suite.expect(brain.deploymentApiCredentialsAvailableForLaunch(plan, &failure) == false, "api_policy_rejects_duplicate_required_name");
+  plan.apiCredentialPolicy.requiredCredentialNames.resize(1);
+  plan.apiCredentialPolicy.requiredCredentialNames.clear();
+  suite.expect(brain.deploymentApiCredentialsAvailableForLaunch(plan, &failure), "api_policy_accepts_explicit_credential_free_declaration");
+
+  plan.hasApiCredentialPolicy = false;
+  suite.expect(brain.deploymentApiCredentialsAvailableForLaunch(plan, &failure), "api_policy_allows_legacy_replay_without_declaration");
 }
 
 static void testTlsResumptionRotationAckCoverage(TestSuite& suite)
@@ -10679,13 +10822,26 @@ static void testImportedTlsFactoryEnablesBundleBuild(TestSuite& suite)
   suite.expect(containerPlan.credentialBundle.tlsIdentities.size() == 1, "mothership_upsert_tls_valid_import_builds_tls_bundle");
   suite.expect(containerPlan.credentialBundle.tlsIdentities[0].name.equal("inbound_server_tls"_ctv), "mothership_upsert_tls_valid_import_bundle_name");
 
+  Machine machine = {};
+  machine.uuid = uint128_t(0x6002);
+  machine.neuron.isFixedFile = true;
+  machine.neuron.fslot = 6;
+  machine.neuron.connected = true;
   ApplicationDeployment deployment = {};
   deployment.plan = deploymentPlan;
-  container.uuid = uint128_t(0x6002);
+  container.uuid = uint128_t(0x6003);
+  container.machine = &machine;
+  container.deploymentID = deploymentPlan.config.deploymentID();
   container.state = ContainerState::healthy;
   deployment.containers.insert(&container);
   brain.deployments.insert_or_assign(deploymentPlan.config.deploymentID(), &deployment);
   suite.expect(brain.pushPrivateTlsIdentityDeltaToLiveContainers(request.applicationID, "unit-test"_ctv) == 1, "mothership_upsert_tls_valid_import_pushes_live_tls_delta");
+  uint128_t refreshedContainer = {};
+  CredentialDelta delta = {};
+  suite.expect(extractQueuedCredentialDelta(machine, refreshedContainer, delta) &&
+                   refreshedContainer == container.uuid && delta.updatedTls.size() == 1 &&
+                   delta.updatedTls[0].name.equal("inbound_server_tls"_ctv),
+               "mothership_upsert_tls_valid_import_queues_live_tls_delta");
 }
 
 static void testCertificateLifecycleSchedulers(TestSuite& suite)
@@ -22869,6 +23025,259 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
   thisBrain = previousBrain;
 }
 
+static void testApiCredentialUpsertPreservesMaterializedRequirements(TestSuite& suite)
+{
+  StreamingTestBrain brain = {};
+  Mothership mothership = {};
+  brain.mothership = &mothership;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  mothership.isFixedFile = true;
+  mothership.fslot = 1;
+
+  DeploymentPlan plan = {};
+  seedDeployRequestPlan(plan, 6);
+  plan.apiCredentialPolicy.requiredCredentialNames.push_back("turnstile"_ctv);
+  plan.apiCredentialPolicy.refreshPushEnabled = true;
+  ApplicationDeployment deployment = {};
+  deployment.plan = plan;
+  deployment.state = DeploymentState::deploying;
+  Machine machine = {};
+  machine.neuron.isFixedFile = true;
+  machine.neuron.fslot = 4;
+  ContainerView container = {};
+  container.uuid = uint128_t(0xC0ED'0001);
+  container.deploymentID = plan.config.deploymentID();
+  container.applicationID = plan.config.applicationID;
+  container.machine = &machine;
+  container.state = ContainerState::healthy;
+  deployment.containers.insert(&container);
+  brain.deployments.insert_or_assign(plan.config.deploymentID(), &deployment);
+
+  ApiCredential original = {};
+  original.name.assign("turnstile"_ctv);
+  original.provider.assign("turnstile"_ctv);
+  original.material.assign("original-material"_ctv);
+  original.generation = 7;
+  ApplicationApiCredentialSet originalSet = {};
+  originalSet.applicationID = plan.config.applicationID;
+  originalSet.setGeneration = 7;
+  originalSet.credentials.push_back(original);
+  brain.apiCredentialSetsByApp.insert_or_assign(plan.config.applicationID, originalSet);
+
+  auto submit = [&](const ApiCredentialSetUpsertRequest& request) {
+    String serializedRequest = {};
+    ApiCredentialSetUpsertRequest copy = request;
+    BitseryEngine::serialize(serializedRequest, copy);
+    String requestBuffer = {};
+    Message *message = buildMothershipMessage(requestBuffer, MothershipTopic::upsertApiCredentialSet, serializedRequest);
+    brain.mothershipHandler(&mothership, message);
+
+    ApiCredentialSetUpsertResponse response = {};
+    uint32_t responseCount = 0;
+    forEachMessageInBuffer(mothership.wBuffer, [&](Message *frame) {
+      if (MothershipTopic(frame->topic) != MothershipTopic::upsertApiCredentialSet)
+      {
+        return;
+      }
+      String serializedResponse = {};
+      uint8_t *args = frame->args;
+      Message::extractToStringView(args, serializedResponse);
+      suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response),
+                   "api_credential_upsert_handler_serializes_response");
+      ++responseCount;
+    });
+    suite.expect(responseCount == 1, "api_credential_upsert_handler_emits_one_response");
+    mothership.wBuffer.clear();
+    return response;
+  };
+  auto currentStillOriginal = [&]() {
+    auto it = brain.apiCredentialSetsByApp.find(plan.config.applicationID);
+    return it != brain.apiCredentialSetsByApp.end() && it->second.setGeneration == originalSet.setGeneration &&
+           it->second.credentials.size() == 1 && it->second.credentials[0].material.equal("original-material"_ctv);
+  };
+
+  ApiCredentialSetUpsertRequest removeRequired = {};
+  removeRequired.applicationID = plan.config.applicationID;
+  removeRequired.removeCredentialNames.push_back("turnstile"_ctv);
+  ApiCredentialSetUpsertResponse response = submit(removeRequired);
+  suite.expect(response.success == false && currentStillOriginal() && response.updatedNames.empty() && response.removedNames.empty(),
+               "api_credential_upsert_rejects_required_removal_without_mutation");
+
+  auto replacement = [&](const String& material) {
+    ApiCredential candidate = original;
+    candidate.material = material;
+    candidate.generation = 0;
+    return candidate;
+  };
+  ApiCredentialSetUpsertRequest expired = {};
+  expired.applicationID = plan.config.applicationID;
+  ApiCredential expiredCredential = replacement("expired-material"_ctv);
+  expiredCredential.expiresAtMs = Time::now<TimeResolution::ms>() - 1;
+  expired.upsertCredentials.push_back(expiredCredential);
+  response = submit(expired);
+  suite.expect(response.success == false && currentStillOriginal(),
+               "api_credential_upsert_rejects_expired_required_replacement_without_mutation");
+
+  ApiCredentialSetUpsertRequest inactive = {};
+  inactive.applicationID = plan.config.applicationID;
+  ApiCredential inactiveCredential = replacement("inactive-material"_ctv);
+  inactiveCredential.activeFromMs = Time::now<TimeResolution::ms>() + 60'000;
+  inactive.upsertCredentials.push_back(inactiveCredential);
+  response = submit(inactive);
+  suite.expect(response.success == false && currentStillOriginal(),
+               "api_credential_upsert_rejects_inactive_required_replacement_without_mutation");
+
+  ApiCredentialSetUpsertRequest scoped = {};
+  scoped.applicationID = plan.config.applicationID;
+  ApiCredential scopedCredential = replacement("scoped-material"_ctv);
+  scopedCredential.metadata.insert_or_assign("dnsScope"_ctv, "zone"_ctv);
+  scoped.upsertCredentials.push_back(scopedCredential);
+  response = submit(scoped);
+  suite.expect(response.success == false && currentStillOriginal(),
+               "api_credential_upsert_rejects_dns_scoped_required_replacement_without_mutation");
+
+  ApiCredentialSetUpsertRequest persistFailure = {};
+  persistFailure.applicationID = plan.config.applicationID;
+  persistFailure.reason.assign("unit durable credential rotation"_ctv);
+  persistFailure.upsertCredentials.push_back(replacement("durability-failure-material"_ctv));
+  brain.persistSucceeds = false;
+  response = submit(persistFailure);
+  suite.expect(response.success == false && response.failure.equal("failed to persist api credential set"_ctv) &&
+                   response.updatedNames.empty() && response.removedNames.empty() && currentStillOriginal() &&
+                   machine.neuron.wBuffer.empty(),
+               "api_credential_upsert_persist_failure_restores_prior_set_without_delta");
+  brain.persistSucceeds = true;
+
+  ApiCredentialSetUpsertRequest valid = {};
+  valid.applicationID = plan.config.applicationID;
+  valid.reason.assign("unit credential rotation"_ctv);
+  valid.upsertCredentials.push_back(replacement("replacement-material"_ctv));
+  response = submit(valid);
+  const auto accepted = brain.apiCredentialSetsByApp.find(plan.config.applicationID);
+  suite.expect(response.success && accepted != brain.apiCredentialSetsByApp.end() &&
+                   accepted->second.setGeneration == originalSet.setGeneration + 1 &&
+                   accepted->second.credentials.size() == 1 &&
+                   accepted->second.credentials[0].material.equal("replacement-material"_ctv),
+               "api_credential_upsert_accepts_valid_required_replacement");
+  suite.expect(container.hasPendingCredentialBundle && container.pendingCredentialBundle.apiCredentials.size() == 1 &&
+                   container.pendingCredentialBundle.apiCredentials[0].material.equal("replacement-material"_ctv),
+               "api_credential_upsert_pushes_valid_required_replacement_to_live_container");
+
+  brain.deployments.erase(plan.config.deploymentID());
+}
+
+static void testApiCredentialExpiryNotificationLifecycle(TestSuite& suite)
+{
+  TestBrain brain = {};
+  brain.weAreMaster = true;
+  brain.brainConfig.clusterUUID = uint128_t(0xE771);
+
+  ApplicationDeployment deployment = {};
+  deployment.plan = makeDeploymentPlan(77'100, 1);
+  deployment.plan.config.applicationID = 77;
+  deployment.plan.hasApiCredentialPolicy = true;
+  deployment.plan.apiCredentialPolicy.applicationID = 77;
+  deployment.plan.apiCredentialPolicy.requiredCredentialNames.push_back("turnstile"_ctv);
+  deployment.state = DeploymentState::running;
+  ContainerView liveContainer = {};
+  liveContainer.uuid = uint128_t(0xE772);
+  liveContainer.deploymentID = deployment.plan.config.deploymentID();
+  liveContainer.state = ContainerState::healthy;
+  deployment.containers.insert(&liveContainer);
+  brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+
+  constexpr int64_t nowMs = 1'800'000'000'000LL;
+  ApplicationApiCredentialSet credentials = {};
+  credentials.applicationID = 77;
+  credentials.setGeneration = 1;
+  ApiCredential turnstile = {};
+  turnstile.name.assign("turnstile"_ctv);
+  turnstile.provider.assign("cloudflare"_ctv);
+  turnstile.generation = 1;
+  turnstile.expiresAtMs = nowMs + 7LL * 24 * 60 * 60 * 1000;
+  turnstile.material.assign("test-material"_ctv);
+  credentials.credentials.push_back(turnstile);
+  brain.apiCredentialSetsByApp.insert_or_assign(credentials.applicationID, credentials);
+
+  suite.expect(brain.advanceApiCredentialExpiryNotices(nowMs) == 1,
+               "api_credential_expiry_warning_created_at_threshold");
+  suite.expect(brain.masterAuthorityRuntimeState.apiCredentialExpiryNotices.size() == 1 &&
+                   brain.masterAuthorityRuntimeState.apiCredentialExpiryNotices[0].severity == ApiCredentialExpirySeverity::warning &&
+                   brain.masterAuthorityRuntimeState.apiCredentialExpiryNotices[0].resolved == false,
+               "api_credential_expiry_warning_is_metadata_only_and_unresolved");
+  suite.expect(brain.advanceApiCredentialExpiryNotices(nowMs) == 0,
+               "api_credential_expiry_warning_is_deduplicated");
+
+  credentials.credentials[0].expiresAtMs = 0;
+  brain.apiCredentialSetsByApp.insert_or_assign(credentials.applicationID, credentials);
+  suite.expect(brain.advanceApiCredentialExpiryNotices(nowMs) == 0 &&
+                   brain.masterAuthorityRuntimeState.apiCredentialExpiryNotices[0].resolved,
+               "api_credential_expiry_nonexpiring_credential_resolves_notice");
+
+  credentials.credentials[0].generation = 2;
+  credentials.credentials[0].sunsetAtMs = nowMs - 1;
+  brain.apiCredentialSetsByApp.insert_or_assign(credentials.applicationID, credentials);
+  suite.expect(brain.advanceApiCredentialExpiryNotices(nowMs) == 1 &&
+                   brain.masterAuthorityRuntimeState.apiCredentialExpiryNotices.size() == 2 &&
+                   brain.masterAuthorityRuntimeState.apiCredentialExpiryNotices[1].severity == ApiCredentialExpirySeverity::expired,
+               "api_credential_expiry_rotation_rearms_and_escalates_once");
+  suite.expect(brain.advanceApiCredentialExpiryNotices(nowMs) == 0,
+               "api_credential_expiry_expired_notice_is_deduplicated");
+
+  Mothership acknowledgementStream = {};
+  ApiCredentialExpiryNoticePayload acknowledgement = {};
+  acknowledgement.clusterUUID = brain.brainConfig.clusterUUID;
+  acknowledgement.notice = brain.masterAuthorityRuntimeState.apiCredentialExpiryNotices[1];
+  acknowledgement.acknowledge = true;
+  String serializedAcknowledgement = {};
+  BitseryEngine::serialize(serializedAcknowledgement, acknowledgement);
+  String acknowledgementMessage = {};
+  brain.mothershipHandler(
+      &acknowledgementStream,
+      buildMothershipMessage(
+          acknowledgementMessage,
+          MothershipTopic::credentialExpiryNotices,
+          serializedAcknowledgement));
+  suite.expect(brain.masterAuthorityRuntimeState.apiCredentialExpiryNotices[1].acknowledged,
+               "api_credential_expiry_ack_persists_matching_notice");
+
+  ProdigyMasterAuthorityRuntimeState beforeInvalidAcknowledgement = brain.masterAuthorityRuntimeState;
+  acknowledgement.clusterUUID = uint128_t(0xBAD);
+  BitseryEngine::serialize(serializedAcknowledgement, acknowledgement);
+  acknowledgementMessage.clear();
+  brain.mothershipHandler(
+      &acknowledgementStream,
+      buildMothershipMessage(
+          acknowledgementMessage,
+          MothershipTopic::credentialExpiryNotices,
+          serializedAcknowledgement));
+  suite.expect(brain.masterAuthorityRuntimeState == beforeInvalidAcknowledgement,
+               "api_credential_expiry_invalid_ack_does_not_mutate_state");
+
+  ProdigyMasterAuthorityRuntimeState beforeFailedCommit = brain.masterAuthorityRuntimeState;
+  const bool durableBeforeFailedCommit = brain.masterAuthorityRuntimeStateDurable;
+  const uint64_t durableGenerationBeforeFailedCommit = brain.durableMasterAuthorityRuntimeStateGeneration;
+  credentials.credentials[0].generation = 3;
+  credentials.credentials[0].sunsetAtMs = nowMs + 7LL * 24 * 60 * 60 * 1000;
+  brain.apiCredentialSetsByApp.insert_or_assign(credentials.applicationID, credentials);
+  brain.persistSucceeds = false;
+  suite.expect(brain.advanceApiCredentialExpiryNotices(nowMs) == 0 &&
+                   brain.masterAuthorityRuntimeState == beforeFailedCommit &&
+                   brain.masterAuthorityRuntimeStateDurable == durableBeforeFailedCommit &&
+                   brain.durableMasterAuthorityRuntimeStateGeneration == durableGenerationBeforeFailedCommit,
+               "api_credential_expiry_failed_persist_rolls_back_notice");
+  brain.persistSucceeds = true;
+
+  ProdigyMasterAuthorityRuntimeState restored = {};
+  String persisted = {};
+  BitseryEngine::serialize(persisted, beforeFailedCommit);
+  suite.expect(BitseryEngine::deserializeSafe(persisted, restored) &&
+                   restored.apiCredentialExpiryNotices.size() == beforeFailedCommit.apiCredentialExpiryNotices.size(),
+               "api_credential_expiry_notice_survives_runtime_state_restart_codec");
+
+  brain.deployments.erase(deployment.plan.config.deploymentID());}
+
 int main(void)
 {
   TestSuite suite;
@@ -23022,6 +23431,28 @@ int main(void)
     }
     return suite.failed == 0 ? 0 : 1;
   }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "api-credential-policy") == 0)
+  {
+    testApiCredentialPolicyAvailability(suite);
+    testSpinApplicationCredentialPolicyAdmission(suite);
+    testApiCredentialUpsertPreservesMaterializedRequirements(suite);
+    if (createdRing)
+    {
+      Ring::shutdownForExec();
+    }
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "api-credential-expiry-notification") == 0)
+  {
+    testApiCredentialExpiryNotificationLifecycle(suite);
+    if (createdRing)
+    {
+      Ring::shutdownForExec();
+    }
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (std::getenv("PRODIGY_TEST_TASK_LIFECYCLE_ONLY") != nullptr)
   {
     testNeuronCloseHandlerPaths(suite);
@@ -23065,6 +23496,8 @@ int main(void)
   testContainerNeuronListenerContract(suite);
   testReplicationAcceptanceRules(suite);
   testCredentialBundleBuildAndApply(suite);
+  testApiCredentialPolicyAvailability(suite);
+  testApiCredentialExpiryNotificationLifecycle(suite);
   testTlsResumptionRotationAckCoverage(suite);
   testBrainHandlerReplicationPaths(suite);
   testReconcileStateReplicatesCredentialAndTlsState(suite);
