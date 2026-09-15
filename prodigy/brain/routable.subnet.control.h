@@ -376,9 +376,12 @@ inline bool Brain::replicatedRuntimeStateCoversPendingElasticAddressOperations(
 {
   ProdigyMasterAuthorityRuntimeState expected = incoming;
   expected.updateSelf = {};
+  ProdigyMasterAuthorityRuntimeState observed = masterAuthorityRuntimeState;
+  observed.updateSelf = {};
   if (masterAuthorityRuntimeStateDurable == false ||
       durableMasterAuthorityRuntimeStateGeneration != incoming.generation ||
-      masterAuthorityRuntimeState != expected)
+      observed != expected ||
+      updateSelfRecoveryWitnessMatches(capturePersistentUpdateSelfState(), incoming.updateSelf) == false)
   {
     return false;
   }
@@ -390,9 +393,12 @@ inline void Brain::noteMasterAuthorityTransitionSentToPeer(
     const ProdigyMasterAuthorityRuntimeState& state,
     const String& transitionDigest)
 {
+  const bool carriesUpdateSelfRecoveryWitness =
+      projectUpdateSelfRecoveryWitness(state.updateSelf).localMachineUUID != 0;
   if (state.pendingElasticAddressAssignments.empty() &&
       state.pendingElasticAddressReleases.empty() &&
-      machineRetirementJournalPresent(state) == false)
+      machineRetirementJournalPresent(state) == false &&
+      carriesUpdateSelfRecoveryWitness == false)
   {
     masterAuthorityReplicationByPeer.erase(peer);
     return;
@@ -539,6 +545,8 @@ inline void Brain::acknowledgeMasterAuthorityTransition(
   reconcilePendingElasticAddressAssignments();
   reconcilePendingElasticAddressReleases();
   reapRetiringMachines();
+  maybeTransitionFollowersForUpdateSelf();
+  maybeRelinquishMasterForUpdateSelf();
 }
 
 inline void Brain::sendMasterAuthorityTransitionAcknowledgement(
