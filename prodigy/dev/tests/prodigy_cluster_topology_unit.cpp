@@ -327,6 +327,33 @@ int main(void)
   adoptedIdentityByPrivateAddress.addresses.privateAddresses = adopted.addresses.privateAddresses;
   suite.expect(adopted.sameIdentityAs(adoptedIdentityByPrivateAddress), "cluster_machine_identity_private_address_equality");
 
+  {
+    ClusterMachine sharedNatA = {};
+    sharedNatA.uuid = uint128_t(0xa001);
+    sharedNatA.ssh.address = "fd72:6e61:6d65:2::10"_ctv;
+    appendPeerCandidate(sharedNatA, "10.0.2.15", 24);
+
+    ClusterMachine sharedNatB = {};
+    sharedNatB.uuid = uint128_t(0xb002);
+    sharedNatB.ssh.address = "fd72:6e61:6d65:3::10"_ctv;
+    appendPeerCandidate(sharedNatB, "10.0.2.15", 24);
+
+    suite.expect(sharedNatA.sameIdentityAs(sharedNatB) == false, "cluster_machine_identity_known_uuid_mismatch_rejects_shared_nat");
+    suite.expect(sharedNatB.sameIdentityAs(sharedNatA) == false, "cluster_machine_identity_known_uuid_mismatch_rejects_shared_nat_reverse");
+
+    Vector<ClusterMachine> sharedNatTopology = {sharedNatA, sharedNatB};
+    auto removed = std::remove_if(sharedNatTopology.begin(), sharedNatTopology.end(), [&](const ClusterMachine& machine)
+    {
+      return machine.sameIdentityAs(sharedNatB);
+    });
+    sharedNatTopology.erase(removed, sharedNatTopology.end());
+    suite.expect(sharedNatTopology.size() == 1 && sharedNatTopology[0].uuid == sharedNatA.uuid, "cluster_machine_identity_removal_keeps_other_known_uuid_behind_shared_nat");
+
+    sharedNatA.uuid = 0;
+    sharedNatB.uuid = 0;
+    suite.expect(sharedNatA.sameIdentityAs(sharedNatB), "cluster_machine_identity_uuid_zero_preserves_shared_nat_fallback");
+  }
+
   ClusterMachine distinctIdentity = {};
   distinctIdentity.cloud.cloudID = "789654123000999"_ctv;
   appendPrivateAddress(distinctIdentity, "10.0.0.99");

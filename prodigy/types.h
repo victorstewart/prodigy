@@ -1565,9 +1565,9 @@ public:
 
   bool sameIdentityAs(const ClusterMachine& other) const
   {
-    if (uuid != 0 && other.uuid != 0 && uuid == other.uuid)
+    if (uuid != 0 && other.uuid != 0)
     {
-      return true;
+      return uuid == other.uuid;
     }
 
     IPAddress resolvedAddress = {};

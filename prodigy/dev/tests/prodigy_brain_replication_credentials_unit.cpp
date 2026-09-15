@@ -10026,6 +10026,34 @@ static void testAdoptedMachineRackUpdates(TestSuite& suite)
                "adopted_rack_update_rejects_mismatched_uuid_identity");
   suite.expect(identityRejectedBrain.authoritativeTopology.machines[0].rackUUID == 1, "adopted_rack_update_uuid_rejection_preserves_topology");
 
+  ResumableAddMachinesBrain sharedNatBrain;
+  sharedNatBrain.iaas = &iaas;
+  sharedNatBrain.weAreMaster = false;
+  sharedNatBrain.noMasterYet = false;
+  sharedNatBrain.nBrains = 1;
+  sharedNatBrain.brainConfig.clusterUUID = 0x5a01;
+  sharedNatBrain.authoritativeTopology.version = 7;
+  ClusterMachine sharedNatExisting = original;
+  sharedNatExisting.peerAddresses.clear();
+  prodigyAppendUniqueClusterMachinePeerAddress(sharedNatExisting.peerAddresses, ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24});
+  sharedNatBrain.authoritativeTopology.machines.push_back(sharedNatExisting);
+  ClusterMachine sharedNatNew = sharedNatExisting;
+  sharedNatNew.uuid = 0x5a05;
+  sharedNatNew.ssh.hostPublicKeyOpenSSH.clear();
+  sharedNatNew.ssh.address.assign("2001:db8:401::10"_ctv);
+  sharedNatNew.addresses = {};
+  prodigyAppendUniqueClusterMachineAddress(sharedNatNew.addresses.privateAddresses, "2001:db8:401::10"_ctv, 64);
+  AddMachines sharedNatRequest = {};
+  sharedNatRequest.clusterUUID = sharedNatBrain.brainConfig.clusterUUID;
+  sharedNatRequest.adoptedMachines.push_back(sharedNatNew);
+  AddMachines sharedNatResponse = {};
+  sharedNatBrain.addMachines(nullptr, sharedNatRequest, Brain::ManagedAddMachinesWork {}, &sharedNatResponse);
+  suite.expect(sharedNatResponse.success == false &&
+                   sharedNatResponse.failure.equals("adopted machine ssh.hostPublicKeyOpenSSH required"_ctv),
+               "adopted_explicit_uuid_shared_nat_reaches_bootstrap_validation");
+  suite.expect(sharedNatBrain.authoritativeTopology.machines.size() == 1 && sharedNatBrain.bootstrappedMachines.empty(),
+               "adopted_explicit_uuid_invalid_bootstrap_preserves_topology");
+
   ResumableAddMachinesBrain resumedBrain;
   resumedBrain.iaas = &iaas;
   resumedBrain.weAreMaster = true;

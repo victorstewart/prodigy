@@ -26975,7 +26975,13 @@ public:
             continue;
           }
 
-          if (clusterTopologyContainsMachineIdentity(targetTopology, requestedMachine))
+          // A new UUID cannot reuse an existing bootstrap identity. Shared
+          // runtime peer addresses do not identify a physical machine.
+          ClusterMachine bootstrapIdentity = requestedMachine;
+          bootstrapIdentity.uuid = 0;
+          bootstrapIdentity.peerAddresses.clear();
+          bootstrapIdentity.addresses = {};
+          if (clusterTopologyContainsMachineIdentity(targetTopology, bootstrapIdentity))
           {
             response.failure.assign("adopted machine UUID conflicts with existing topology identity"_ctv);
             break;
