@@ -83,19 +83,13 @@ static inline bool prodigyResolveContainerRouterBPFPath(
     path.append('/');
   }
 
-  if (ingress)
-  {
-    path.append("container.ingress.router"_ctv);
-  }
-  else
-  {
-    path.append("container.egress.router"_ctv);
-  }
-  if (networkAccess == ContainerNetworkAccess::declaredOnly)
-  {
-    path.append(".declared"_ctv);
-  }
-  path.append(".ebpf.o"_ctv);
+  const bool declared = networkAccess == ContainerNetworkAccess::declaredOnly;
+  const char *filename = ingress
+                             ? (declared ? "container.ingress.router.declared.ebpf.o"
+                                         : "container.ingress.router.ebpf.o")
+                             : (declared ? "container.egress.router.declared.ebpf.o"
+                                         : "container.egress.router.ebpf.o");
+  path.append(filename);
 
   if (prodigyFileReadable(path))
   {

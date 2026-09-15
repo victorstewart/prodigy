@@ -2975,6 +2975,108 @@ static void testSpinApplicationRejectsDuplicateNonTaskDeploymentIDWithoutMutatio
   suite.expect(taskBrain.deploymentIDAdmissionAllowed(originalPlan) == false, "spin_application_task_record_rejects_non_task_plan");
 }
 
+static void testSpinApplicationRejectsMaterializedFailedPredecessor(TestSuite& suite)
+{
+  StreamingTestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  Mothership mothership = {};
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  brain.mothership = &mothership;
+  mothership.isFixedFile = true;
+  mothership.fslot = 1;
+
+  BrainBase *previousBrain = thisBrain;
+  thisBrain = &brain;
+
+  DeploymentPlan failedPlan = {};
+  seedStatefulDeployRequestPlan(failedPlan, 62'016);
+  failedPlan.config.versionID = 1;
+  String reserveFailure = {};
+  suite.require(
+      brain.reserveApplicationIDMapping("MaterializedFailedHead"_ctv, failedPlan.config.applicationID, &reserveFailure),
+      "materialized_failed_head_reserves_application");
+
+  ApplicationDeployment *failed = new ApplicationDeployment();
+  failed->plan = failedPlan;
+  failed->state = DeploymentState::failed;
+  ContainerView *retained = new ContainerView();
+  retained->uuid = uint128_t(0x62'016'01);
+  retained->deploymentID = failedPlan.config.deploymentID();
+  retained->applicationID = failedPlan.config.applicationID;
+  retained->state = ContainerState::healthy;
+  failed->containers.insert(retained);
+  brain.containers.insert_or_assign(retained->uuid, retained);
+  brain.deployments.insert_or_assign(failedPlan.config.deploymentID(), failed);
+  brain.deploymentsByApp.insert_or_assign(failedPlan.config.applicationID, failed);
+  brain.deploymentPlans.insert_or_assign(failedPlan.config.deploymentID(), failedPlan);
+
+  DeploymentPlan successorPlan = failedPlan;
+  successorPlan.config.versionID = 2;
+  String serializedSuccessor = {};
+  BitseryEngine::serialize(serializedSuccessor, successorPlan);
+  String requestBuffer = {};
+  Message *request = buildMothershipMessage(
+      requestBuffer,
+      MothershipTopic::spinApplication,
+      uint16_t(successorPlan.config.applicationID),
+      serializedSuccessor,
+      "unread because the materialized predecessor is rejected first"_ctv);
+  brain.mothershipHandler(&mothership, request);
+
+  uint32_t responseCount = 0;
+  SpinApplicationResponseCode responseCode = SpinApplicationResponseCode::okay;
+  String responseReason = {};
+  forEachMessageInBuffer(mothership.wBuffer, [&](Message *frame) {
+    if (MothershipTopic(frame->topic) != MothershipTopic::spinApplication)
+    {
+      return;
+    }
+    ++responseCount;
+    uint8_t rawCode = uint8_t(SpinApplicationResponseCode::okay);
+    uint8_t *args = frame->args;
+    Message::extractArg<ArgumentNature::fixed>(args, rawCode);
+    responseCode = SpinApplicationResponseCode(rawCode);
+    if (args < frame->terminal())
+    {
+      Message::extractToStringView(args, responseReason);
+    }
+  });
+
+  suite.expect(responseCount == 1 && responseCode == SpinApplicationResponseCode::invalidPlan,
+               "materialized_failed_head_rejects_successor_before_admission");
+  suite.expect(responseReason == "invalid plan: previous failed deployment retains materialized containers"_ctv,
+               "materialized_failed_head_reports_preservation_reason");
+  const auto retainedDeployment = brain.deployments.find(failedPlan.config.deploymentID());
+  const auto applicationHead = brain.deploymentsByApp.find(failedPlan.config.applicationID);
+  suite.expect(retainedDeployment != brain.deployments.end() && retainedDeployment->second == failed,
+               "materialized_failed_head_preserves_live_deployment");
+  suite.expect(applicationHead != brain.deploymentsByApp.end() && applicationHead->second == failed,
+               "materialized_failed_head_preserves_application_head");
+  suite.expect(brain.containers.contains(retained->uuid),
+               "materialized_failed_head_preserves_retained_container_registration");
+  suite.expect(brain.deployments.contains(successorPlan.config.deploymentID()) == false,
+               "materialized_failed_head_does_not_admit_successor");
+
+  for (auto& [deploymentID, deployment] : brain.deployments)
+  {
+    (void)deploymentID;
+    if (deployment != nullptr)
+    {
+      deployment->containers.erase(retained);
+    }
+  }
+  brain.containers.erase(retained->uuid);
+  delete retained;
+  while (brain.deployments.empty() == false)
+  {
+    delete brain.deployments.begin()->second;
+  }
+  brain.deploymentPlans.clear();
+  thisBrain = previousBrain;
+}
+
 static void testSpinApplicationProgressAppendsAfterOkayFrame(TestSuite& suite)
 {
   StreamingTestBrain brain;
@@ -18993,13 +19095,36 @@ static void testDeployingContainerFailureFailsDeployment(TestSuite& suite)
   suite.expect(
       ContainerStore::store(expiredLiveDeploymentID, containerBlob, nullptr, nullptr, nullptr, nullptr, &storeFailure),
       "deploying_container_failure_retention_seeds_live_failed_image");
+  ContainerView *retainedHealthy = new ContainerView();
+  retainedHealthy->uuid = uint128_t(0x62'048'01);
+  retainedHealthy->deploymentID = expiredLiveDeploymentID;
+  retainedHealthy->applicationID = expiredLiveFailure.applicationID;
+  retainedHealthy->state = ContainerState::healthy;
+  expiredLiveDeployment->containers.insert(retainedHealthy);
   thisBrain = &restored;
+  const int64_t blockedCleanupAtMs = Time::now<TimeResolution::ms>();
   suite.expect(
-      restored.expireFailedDeployments(Time::now<TimeResolution::ms>()) == 1,
-      "deploying_container_failure_retention_retires_live_failed_deployment");
-  suite.expect(restored.deployments.contains(expiredLiveDeploymentID) == false, "deploying_container_failure_retention_removes_live_failed_deployment");
-  suite.expect(restored.deploymentsByApp.contains(expiredLiveFailure.applicationID) == false, "deploying_container_failure_retention_removes_live_failed_application");
-  suite.expect(ContainerStore::contains(expiredLiveDeploymentID) == false, "deploying_container_failure_retention_removes_live_failed_image");
+      restored.expireFailedDeployments(blockedCleanupAtMs) == 0,
+      "deploying_container_failure_retention_keeps_materialized_failed_deployment");
+  suite.expect(restored.deployments.contains(expiredLiveDeploymentID), "deploying_container_failure_retention_keeps_materialized_failed_head");
+  suite.expect(restored.deploymentPlans.contains(expiredLiveDeploymentID), "deploying_container_failure_retention_keeps_materialized_failed_plan");
+  suite.expect(ContainerStore::contains(expiredLiveDeploymentID), "deploying_container_failure_retention_keeps_materialized_failed_image");
+  const auto retainedFailure = restored.failedDeployments.find(expiredLiveDeploymentID);
+  suite.expect(
+      retainedFailure != restored.failedDeployments.end() && retainedFailure->second.failedAtMs == blockedCleanupAtMs,
+      "deploying_container_failure_retention_defers_materialized_failed_cleanup");
+  if (auto retainedDeployment = restored.deployments.find(expiredLiveDeploymentID);
+      retainedDeployment != restored.deployments.end())
+  {
+    retainedDeployment->second->containers.erase(retainedHealthy);
+  }
+  delete retainedHealthy;
+  suite.expect(
+      restored.expireFailedDeployments(blockedCleanupAtMs + prodigyBrainFailedDeploymentCleanerIntervalMs) == 1,
+      "deploying_container_failure_retention_retires_empty_failed_deployment");
+  suite.expect(restored.deployments.contains(expiredLiveDeploymentID) == false, "deploying_container_failure_retention_removes_empty_failed_deployment");
+  suite.expect(restored.deploymentsByApp.contains(expiredLiveFailure.applicationID) == false, "deploying_container_failure_retention_removes_empty_failed_application");
+  suite.expect(ContainerStore::contains(expiredLiveDeploymentID) == false, "deploying_container_failure_retention_removes_empty_failed_image");
 
   FailedDeploymentRecord incompleteCancellation = {};
   incompleteCancellation.applicationID = 63'010;
@@ -22818,6 +22943,7 @@ int main(void)
   if (std::getenv("PRODIGY_TEST_FAILED_DEPLOYMENT_RESTART") != nullptr)
   {
     testDeployingContainerFailureFailsDeployment(suite);
+    testSpinApplicationRejectsMaterializedFailedPredecessor(suite);
     return suite.failed == 0 ? 0 : 1;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
@@ -23118,6 +23244,7 @@ int main(void)
   testBrainNeuronStateUploadHealthyContainerClearsWaiters(suite);
   testCanaryRollbackPersistsTerminalApplicationReport(suite);
   testDeployingContainerFailureFailsDeployment(suite);
+  testSpinApplicationRejectsMaterializedFailedPredecessor(suite);
   testBoundedOperatorDeploymentCancellation(suite);
   testMaterializedStatefulRecoveryAdmission(suite);
   testBrainNeuronStateUploadRestoresOnlyActiveMeshServices(suite);

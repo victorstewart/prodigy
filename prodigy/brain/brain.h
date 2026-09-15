@@ -25970,15 +25970,23 @@ public:
           }
         case DeploymentState::failed:
           {
-            // this happens if canaries fail....
-            // otherwise should never happen?
+            // A failed deployment can retain a live container when a sibling
+            // fails before becoming healthy. Keep that ownership intact: the
+            // Mothership admission path rejects this shape, while this branch
+            // safely preserves it if a replicated plan arrives out of order.
+            if (previous->lifecycleIsUnmaterialized() == false)
+            {
+              previous->next = deployment;
+              deployment->previous = previous;
+              deployment->state = DeploymentState::waitingToDeploy;
+              break;
+            }
 
             if (previous->previous)
             {
               deployment->previous = previous->previous;
             }
 
-            // just delete this for now but maybe in the future we'd want to store failed results?
             delete previous;
             deployment->deploy();
 
@@ -30256,6 +30264,15 @@ public:
           if (deploymentIDAdmissionAllowed(deployment->plan) == false)
           {
             rejectInvalidPlan("invalid plan: deploymentID already exists"_ctv);
+            return;
+          }
+
+          if (auto existing = deploymentsByApp.find(deployment->plan.config.applicationID);
+              existing != deploymentsByApp.end() && existing->second != nullptr &&
+              existing->second->state == DeploymentState::failed &&
+              existing->second->lifecycleIsUnmaterialized() == false)
+          {
+            rejectInvalidPlan("invalid plan: previous failed deployment retains materialized containers"_ctv);
             return;
           }
 

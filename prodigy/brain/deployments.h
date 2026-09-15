@@ -10689,7 +10689,7 @@ public:
 inline uint32_t BrainBase::expireFailedDeployments(int64_t nowMs)
 {
   Vector<uint64_t> expiredDeploymentIDs = {};
-  for (const auto& [deploymentID, failed] : failedDeployments)
+  for (auto& [deploymentID, failed] : failedDeployments)
   {
     if (failed.hasOperatorCancellation && failed.cancellationPhase != CancelDeploymentPhase::completed)
     {
@@ -10710,6 +10710,18 @@ inline uint32_t BrainBase::expireFailedDeployments(int64_t nowMs)
     }
     if (retainedAtMs <= 0 || nowMs - retainedAtMs >= retentionMs)
     {
+      auto live = deployments.find(deploymentID);
+      if (live != deployments.end() && live->second != nullptr &&
+          live->second->state == DeploymentState::failed &&
+          live->second->lifecycleIsUnmaterialized() == false)
+      {
+        // A partially failed deployment can still own live container runtime.
+        // Retain its durable plan and image until a lifecycle owner resolves
+        // that materialized head. Move the next bounded cleaner attempt out
+        // one interval so a fail-closed record cannot spin at zero delay.
+        failed.failedAtMs = nowMs;
+        continue;
+      }
       expiredDeploymentIDs.push_back(deploymentID);
     }
   }
