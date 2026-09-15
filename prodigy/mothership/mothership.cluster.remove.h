@@ -37,6 +37,26 @@ if [ "$load" != not-found ]; then
   case "$active" in inactive|failed) ;; *) echo 'prodigy service is still transitioning' >&2; exit 1;; esac;
   systemctl disable prodigy || true;
 fi;
+# Prodigy containers are placed in independent cgroup-v2 leaves, outside the
+# prodigy.service control group. Stop every exact owned leaf before detaching
+# its storage or erasing the controller state; otherwise an exited service can
+# leave live application processes behind.
+container_cgroup_root=/sys/fs/cgroup/containers.slice;
+if [ -d "$container_cgroup_root" ]; then
+  for container_leaf in "$container_cgroup_root"/*.slice/leaf; do
+    [ -e "$container_leaf/cgroup.procs" ] || continue;
+    [ -w "$container_leaf/cgroup.kill" ] || { echo 'owned container cgroup kill is unavailable' >&2; exit 1; };
+    printf 1 >"$container_leaf/cgroup.kill" || { echo 'failed to kill owned container cgroup' >&2; exit 1; };
+    container_procs=$(cat "$container_leaf/cgroup.procs") || { echo 'failed to read owned container cgroup' >&2; exit 1; };
+    cgroup_kill_attempt=0;
+    while [ -n "$container_procs" ] && [ "$cgroup_kill_attempt" -lt 20 ]; do
+      sleep 0.05;
+      container_procs=$(cat "$container_leaf/cgroup.procs") || { echo 'failed to read owned container cgroup' >&2; exit 1; };
+      cgroup_kill_attempt=$((cgroup_kill_attempt + 1));
+    done;
+    [ -z "$container_procs" ] || { echo 'owned container cgroup remained populated' >&2; exit 1; };
+  done;
+fi;
 img=/var/lib/prodigy/containers.btrfs.loop;
 query_owned_loop() {
   loop=$(losetup -j "$img" --noheadings --output NAME) || { echo 'failed to query loop association' >&2; exit 1; };

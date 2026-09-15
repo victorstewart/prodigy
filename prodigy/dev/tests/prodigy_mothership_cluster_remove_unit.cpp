@@ -21,7 +21,7 @@ public:
     }
     else
     {
-      basics_log("FAIL: %s\n", name);
+      std::fprintf(stderr, "FAIL: %s\n", name);
       failed += 1;
     }
   }
@@ -225,7 +225,7 @@ static void replaceAll(std::string& value, const std::string& from, const std::s
   }
 }
 
-static bool runStorageCleanupScript(const String& rendered, const char *scenario, bool expectSuccess, bool expectUnmount, bool expectWipe)
+static bool runStorageCleanupScript(const String& rendered, const char *scenario, bool expectSuccess, bool expectUnmount, bool expectWipe, bool expectContainerKill = false)
 {
   char templatePath[] = "/tmp/prodigy-remove-unit-XXXXXX";
   char *rootPath = ::mkdtemp(templatePath);
@@ -234,15 +234,16 @@ static bool runStorageCleanupScript(const String& rendered, const char *scenario
   std::string fake = root + "/fake";
   std::string state = root + "/state";
   std::string containers = root + "/containers";
+  std::string cgroups = root + "/cgroups";
   std::string run = root + "/run";
-  ::mkdir(fake.c_str(), 0700); ::mkdir(state.c_str(), 0700); ::mkdir(containers.c_str(), 0700); ::mkdir(run.c_str(), 0700);
+  ::mkdir(fake.c_str(), 0700); ::mkdir(state.c_str(), 0700); ::mkdir(containers.c_str(), 0700); ::mkdir(cgroups.c_str(), 0700); ::mkdir(run.c_str(), 0700);
   if (std::string(scenario) != "external") std::ofstream(state + "/containers.btrfs.loop").put('x');
   auto write = [&](const char *name, const char *body) { std::ofstream file(fake + "/" + name); file << "#!/bin/sh\n" << body; file.close(); ::chmod((fake + "/" + name).c_str(), 0700); };
   write("systemctl", R"SH(case "$*" in
   *LoadState*) echo loaded;;
   *ActiveState*) { [ "$MOCK_SCENARIO" = stoppedfailed ] || [ "$MOCK_SCENARIO" = failedrunning ]; } && echo failed || echo inactive;;
   *MainPID*) [ "$MOCK_SCENARIO" = failedrunning ] && echo 935 || echo 0;;
-  *stop*) [ "$MOCK_SCENARIO" = stopfail ] && exit 1;;
+  *stop*) echo stop >>"$MOCK_ROOT/log"; [ "$MOCK_SCENARIO" = stopfail ] && exit 1;;
 esac
 exit 0
 )SH");
@@ -271,20 +272,61 @@ exit 0
 exit 0
 )SH");
   write("rm", "echo rm >>\"$MOCK_ROOT/log\"\n");
+  write("sleep", "exit 0\n");
+  write("cat", R"SH(case "$1" in
+  "$MOCK_CGROUP"/*.slice/leaf/cgroup.procs)
+    case "$MOCK_SCENARIO" in
+      cgroup-populated)
+        if [ -s "${1%/cgroup.procs}/cgroup.kill" ]; then
+          if [ ! -f "$MOCK_ROOT/cgroup-kill-logged" ]; then echo kill >>"$MOCK_ROOT/log"; : >"$MOCK_ROOT/cgroup-kill-logged"; fi;
+        else
+          echo 123;
+        fi;;
+      cgroup-remains) echo 123;;
+      cgroup-read-fail) exit 1;;
+      *) exec /bin/cat "$@";;
+    esac;;
+  *) exec /bin/cat "$@";;
+esac
+)SH");
+  std::string leaf = cgroups + "/retained.slice/leaf";
+  if (std::string(scenario) == "cgroup-populated")
+  {
+    ::mkdir((cgroups + "/retained.slice").c_str(), 0700); ::mkdir(leaf.c_str(), 0700);
+    std::ofstream(leaf + "/cgroup.kill");
+    std::ofstream(leaf + "/cgroup.procs"); // Virtual cgroup files report zero stat size.
+  }
+  else if (std::string(scenario) == "cgroup-kill-fail")
+  {
+    ::mkdir((cgroups + "/retained.slice").c_str(), 0700); ::mkdir(leaf.c_str(), 0700); ::mkdir((leaf + "/cgroup.kill").c_str(), 0700);
+    std::ofstream(leaf + "/cgroup.procs"); // Virtual cgroup files report zero stat size.
+  }
+  else if (std::string(scenario) == "cgroup-remains" || std::string(scenario) == "cgroup-read-fail")
+  {
+    ::mkdir((cgroups + "/retained.slice").c_str(), 0700); ::mkdir(leaf.c_str(), 0700);
+    std::ofstream(leaf + "/cgroup.kill");
+    std::ofstream(leaf + "/cgroup.procs"); // Virtual cgroup files report zero stat size.
+  }
   std::ofstream(root + "/mounted").put('x');
   if (std::string(scenario) != "external") std::ofstream(root + "/associated").put('x');
   String renderedCopy = rendered;
   std::string command(renderedCopy.c_str());
   replaceAll(command, "/var/lib/prodigy/containers.btrfs.loop", "@OWNED_LOOP_IMAGE@");
+  replaceAll(command, "/sys/fs/cgroup/containers.slice", cgroups);
   replaceAll(command, "/var/lib/prodigy", state);
   replaceAll(command, "/containers", containers);
   replaceAll(command, "/run/prodigy", run);
   replaceAll(command, "@OWNED_LOOP_IMAGE@", state + "/containers.btrfs.loop");
   // A missing mock must fail closed rather than invoke a real host command.
-  std::string invoke = "PATH=" + shellQuote(fake) + " MOCK_ROOT=" + shellQuote(root) + " MOCK_CONTAINERS=" + shellQuote(containers) + " MOCK_SCENARIO=" + shellQuote(scenario) + " /bin/sh -c " + shellQuote(command);
+  std::string invoke = "PATH=" + shellQuote(fake) + " MOCK_ROOT=" + shellQuote(root) + " MOCK_CONTAINERS=" + shellQuote(containers) + " MOCK_CGROUP=" + shellQuote(cgroups) + " MOCK_SCENARIO=" + shellQuote(scenario) + " /bin/sh -c " + shellQuote(command);
   bool success = ::system(invoke.c_str()) == 0;
   std::ifstream log(root + "/log"); std::string lines((std::istreambuf_iterator<char>(log)), {});
-  bool okay = success == expectSuccess && (lines.find("umount") != std::string::npos) == expectUnmount && (lines.find("rm") != std::string::npos) == expectWipe;
+  const size_t stop = lines.find("stop");
+  const size_t kill = lines.find("kill");
+  const size_t unmount = lines.find("umount");
+  const size_t wipe = lines.find("rm");
+  bool killOrder = expectContainerKill == false || (kill != std::string::npos && unmount != std::string::npos && wipe != std::string::npos && stop != std::string::npos && stop < kill && kill < unmount && unmount < wipe);
+  bool okay = success == expectSuccess && (unmount != std::string::npos) == expectUnmount && (wipe != std::string::npos) == expectWipe && killOrder;
   (void)::system(("/bin/rm -rf " + shellQuote(root)).c_str());
   return okay;
 }
@@ -306,6 +348,10 @@ int main(void)
     suite.expect(runStorageCleanupScript(command, "failedrunning", false, false, false), "remove_failed_unit_with_live_pid_refuses_cleanup");
     suite.expect(runStorageCleanupScript(command, "lookupfail", false, false, false), "remove_failed_loop_lookup_refuses_wipe");
     suite.expect(runStorageCleanupScript(command, "elsewhere", false, true, false), "remove_loop_mounted_elsewhere_refuses_wipe");
+    suite.expect(runStorageCleanupScript(command, "cgroup-populated", true, true, true, true), "remove_populated_owned_cgroup_kills_before_storage_wipe");
+    suite.expect(runStorageCleanupScript(command, "cgroup-kill-fail", false, false, false), "remove_owned_cgroup_kill_failure_refuses_storage_wipe");
+    suite.expect(runStorageCleanupScript(command, "cgroup-remains", false, false, false), "remove_owned_cgroup_remaining_processes_refuse_storage_wipe");
+    suite.expect(runStorageCleanupScript(command, "cgroup-read-fail", false, false, false), "remove_owned_cgroup_read_failure_refuses_storage_wipe");
   }
 
   {
