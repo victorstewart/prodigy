@@ -5749,6 +5749,12 @@ int main(void)
     deployment.plan.stateless.maxPerRackRatio = 1.0f;
     deployment.plan.stateless.maxPerMachineRatio = 1.0f;
 
+    // Capacity measurement runs stateless donor compaction. An unknown machine index
+    // must not reserve this deployment identity in the authoritative deployment map.
+    uint64_t measuredDeploymentID = deployment.plan.config.deploymentID();
+    machineA.containersByDeploymentID[measuredDeploymentID];
+    suite.expect(brain.deployments.find(measuredDeploymentID) == brain.deployments.end(), "measure_stateless_compaction_starts_without_measured_deployment_identity");
+
     uint32_t measured = deployment.measure();
     suite.expect(measured == 1, "measure_stateless_counts_compaction_fit");
     suite.expect(deployment.containers.empty(), "measure_stateless_compaction_cleans_measured_containers");
@@ -5760,7 +5766,9 @@ int main(void)
     suite.expect(donorCContainer.state == ContainerState::healthy && donorCContainer.plannedWork == nullptr, "measure_stateless_compaction_preserves_donor_c_container");
     suite.expect(machineA.nLogicalCores_available == 4 && machineB.nLogicalCores_available == 4 && machineC.nLogicalCores_available == 4, "measure_stateless_compaction_preserves_machine_capacity");
     suite.expect(brain.containers.size() == 3, "measure_stateless_compaction_preserves_brain_container_index");
+    suite.expect(brain.deployments.find(measuredDeploymentID) == brain.deployments.end(), "measure_stateless_compaction_does_not_reserve_unknown_deployment_identity");
 
+    machineA.containersByDeploymentID.erase(measuredDeploymentID);
     machineA.removeContainerIndexEntry(donorAContainer.deploymentID, &donorAContainer);
     machineB.removeContainerIndexEntry(donorBContainer.deploymentID, &donorBContainer);
     machineC.removeContainerIndexEntry(donorCContainer.deploymentID, &donorCContainer);
