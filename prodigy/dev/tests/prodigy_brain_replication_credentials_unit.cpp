@@ -8884,6 +8884,66 @@ static void testApplyReplicatedDeploymentPlanCleansTlsResumptionState(TestSuite&
   suite.expect(container.wormholes.size() == 2 && container.wormholes[0].name.equal(keep.name) && container.wormholes[1].name.equal(disabled.name), "resumption_cleanup_updates_container_wormholes");
 }
 
+static void testUpdateSelfPeerTrackingUsesKnownUUIDsAndUnambiguousLegacyKeys(TestSuite& suite)
+{
+  TestBrain brain = {};
+  TestNeuron self = {};
+  self.uuid = 0x7700;
+  self.private4 = IPAddress("10.0.2.16", false);
+
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &self;
+
+  BrainView designatedPeer = {};
+  designatedPeer.uuid = 0x7701;
+  designatedPeer.private4 = IPAddress("10.0.2.15", false).v4;
+  designatedPeer.connected = true;
+  designatedPeer.isFixedFile = true;
+  designatedPeer.fslot = 71;
+  suite.expect(brain.updateSelfPeerTrackingKey(&designatedPeer) == designatedPeer.uuid,
+               "update_self_peer_tracking_uses_known_uuid_before_shared_private4");
+  suite.expect(brain.updateSelfLocalPeerTrackingKey() == self.uuid,
+               "update_self_peer_tracking_uses_local_uuid_before_private4");
+
+  BrainView unknownIPv6Peer = {};
+  unknownIPv6Peer.peerAddress = IPAddress("2001:db8:7700::1", true);
+  uint128_t expectedIPv6Key = 0;
+  memcpy(&expectedIPv6Key, unknownIPv6Peer.peerAddress.v6, sizeof(expectedIPv6Key));
+  suite.expect(brain.updateSelfPeerTrackingKey(&unknownIPv6Peer) == expectedIPv6Key,
+               "update_self_peer_tracking_preserves_unknown_uuid_ipv6_fallback");
+
+  brain.brains.insert(&designatedPeer);
+  uint128_t legacySharedPrivate4Key = uint128_t(designatedPeer.private4);
+  suite.expect(brain.updateSelfPeerKeyMatchesBrain(legacySharedPrivate4Key, &designatedPeer),
+               "update_self_peer_tracking_resolves_unambiguous_legacy_peer_key");
+
+  BrainView departingMaster = {};
+  departingMaster.uuid = 0x7702;
+  departingMaster.private4 = designatedPeer.private4;
+  departingMaster.connected = true;
+  departingMaster.isFixedFile = true;
+  departingMaster.fslot = 72;
+  brain.brains.insert(&departingMaster);
+  suite.expect(brain.updateSelfPeerKeyMatchesBrain(legacySharedPrivate4Key, &designatedPeer) == false,
+               "update_self_peer_tracking_rejects_legacy_peer_key_shared_by_active_peers");
+  suite.expect(brain.updateSelfPeerKeyMatchesBrain(legacySharedPrivate4Key, &designatedPeer, &departingMaster),
+               "update_self_peer_tracking_excludes_departing_master_from_legacy_handoff");
+
+  self.private4 = IPAddress("10.0.2.15", false);
+  suite.expect(brain.updateSelfPeerKeyMatchesLocal(legacySharedPrivate4Key) == false,
+               "update_self_peer_tracking_rejects_legacy_local_key_shared_by_peer");
+  bool matchesLocalLegacyAddress = false;
+  bool legacyAddressAmbiguous = false;
+  suite.expect(brain.findBrainViewByUpdateSelfPeerKey(legacySharedPrivate4Key,
+                                                       nullptr,
+                                                       &matchesLocalLegacyAddress,
+                                                       &legacyAddressAmbiguous) == nullptr &&
+               legacyAddressAmbiguous,
+               "update_self_peer_tracking_leaves_ambiguous_legacy_handoff_pending");
+
+  thisNeuron = previousNeuron;
+}
+
 static void testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(TestSuite& suite)
 {
   ScopedRing scopedRing = {};
@@ -8892,17 +8952,20 @@ static void testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(Test
   brain.nBrains = 1;
   brain.weAreMaster = false;
   brain.updateSelfUseStagedBundleOnly = true;
-  brain.beginUpdateSelfBundle(2);
 
   BrainView peerA = {};
-  peerA.private4 = 0x0a000011;
+  peerA.uuid = 0x7711;
+  peerA.private4 = 0;
+  peerA.peerAddress = IPAddress("10.0.2.15", false);
   peerA.boottimens = 101;
   peerA.connected = true;
   peerA.isFixedFile = true;
   peerA.fslot = 11;
 
   BrainView peerB = {};
-  peerB.private4 = 0x0a000012;
+  peerB.uuid = 0x7712;
+  peerB.private4 = 0;
+  peerB.peerAddress = peerA.peerAddress;
   peerB.boottimens = 202;
   peerB.connected = true;
   peerB.isFixedFile = true;
@@ -8910,7 +8973,18 @@ static void testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(Test
 
   brain.brains.insert(&peerA);
   brain.brains.insert(&peerB);
+  brain.beginUpdateSelfBundle(2);
 
+  suite.expect(brain.updateSelfBundleIssuedPeerKeys.size() == 2,
+               "update_self_bundle_issues_distinct_known_uuid_peers_sharing_peer_address");
+  suite.expect(brain.updateSelfBundleIssuedPeerKeys.contains(peerA.uuid),
+               "update_self_bundle_issues_peer_a_by_uuid");
+  suite.expect(brain.updateSelfBundleIssuedPeerKeys.contains(peerB.uuid),
+               "update_self_bundle_issues_peer_b_by_uuid");
+
+  // Echoes arrive after the queued bundle send has completed.
+  peerA.pendingSend = false;
+  peerB.pendingSend = false;
   brain.onUpdateSelfBundleEcho(&peerA);
   suite.expect(brain.updateSelfState == Brain::UpdateSelfState::waitingForBundleEchos, "update_self_bundle_echo_waits_for_all_peers");
   suite.expect(brain.updateSelfBundleEchos == 1, "update_self_bundle_echo_counts_first_peer");
@@ -8919,8 +8993,8 @@ static void testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(Test
 
   suite.expect(brain.updateSelfState == Brain::UpdateSelfState::waitingForFollowerReboots, "update_self_bundle_echo_transitions_followers");
   suite.expect(brain.updateSelfFollowerBootNsByPeerKey.size() == 2, "update_self_bundle_echo_captures_follower_boot_ns");
-  suite.expect(brain.updateSelfTransitionIssuedPeerKeys.contains(uint128_t(peerA.private4)), "update_self_bundle_echo_marks_transition_sent_peer_a");
-  suite.expect(brain.updateSelfTransitionIssuedPeerKeys.contains(uint128_t(peerB.private4)), "update_self_bundle_echo_marks_transition_sent_peer_b");
+  suite.expect(brain.updateSelfTransitionIssuedPeerKeys.contains(peerA.uuid), "update_self_bundle_echo_marks_transition_sent_peer_a");
+  suite.expect(brain.updateSelfTransitionIssuedPeerKeys.contains(peerB.uuid), "update_self_bundle_echo_marks_transition_sent_peer_b");
 
   uint32_t peerATransitionFrames = 0;
   forEachMessageInBuffer(peerA.wBuffer, [&](Message *frame) {
@@ -22612,6 +22686,21 @@ int main(void)
     createdRing = true;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "update-peer-identity") == 0)
+  {
+    testUpdateSelfPeerTrackingUsesKnownUUIDsAndUnambiguousLegacyKeys(suite);
+    testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(suite);
+    testUpdateSelfPeerRegistrationCreditsBootNsChange(suite);
+    testUpdateSelfPeerRegistrationCreditsReconnectWithoutBootNsChange(suite);
+    testMaybeRelinquishMasterSelectsLowestPeerKey(suite);
+    testUpdateSelfFinalRelinquishPersistsDesignatedHandoff(suite);
+    if (createdRing)
+    {
+      Ring::shutdownForExec();
+    }
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "adopted-rack-update") == 0)
   {
     testAdoptedMachineRackUpdates(suite);
@@ -22770,6 +22859,7 @@ int main(void)
   testApplyReplicatedDeploymentPlanLiveStateUpdatesTrackedContainers(suite);
   testApplyReplicatedDeploymentPlanCleansTlsResumptionState(suite);
   testBrainBundleExecRetryRoutesThroughDispatcher(suite);
+  testUpdateSelfPeerTrackingUsesKnownUUIDsAndUnambiguousLegacyKeys(suite);
   testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(suite);
   testUpdateSelfPeerRegistrationCreditsBootNsChange(suite);
   testUpdateSelfPeerRegistrationCreditsReconnectWithoutBootNsChange(suite);

@@ -1763,7 +1763,7 @@ public:
     return 0;
   }
 
-  uint128_t updateSelfPeerTrackingKey(const BrainView *brain) const
+  uint128_t updateSelfPeerAddressTrackingKey(const BrainView *brain) const
   {
     if (brain == nullptr)
     {
@@ -1787,22 +1787,37 @@ public:
       }
     }
 
-    if (peerAddress.isNull() == false)
+    if (peerAddress.isNull())
     {
-      if (peerAddress.is6 == false)
-      {
-        peerAddress = peerAddress.create4in6();
-      }
-
-      uint128_t key = 0;
-      memcpy(&key, peerAddress.v6, sizeof(key));
-      return key;
+      return 0;
     }
 
-    return brain->uuid;
+    if (peerAddress.is6 == false)
+    {
+      peerAddress = peerAddress.create4in6();
+    }
+
+    uint128_t key = 0;
+    memcpy(&key, peerAddress.v6, sizeof(key));
+    return key;
   }
 
-  uint128_t updateSelfLocalPeerTrackingKey(void) const
+  uint128_t updateSelfPeerTrackingKey(const BrainView *brain) const
+  {
+    if (brain == nullptr)
+    {
+      return 0;
+    }
+
+    if (brain->uuid != 0)
+    {
+      return brain->uuid;
+    }
+
+    return updateSelfPeerAddressTrackingKey(brain);
+  }
+
+  uint128_t updateSelfLocalAddressTrackingKey(void) const
   {
     if (thisNeuron != nullptr && thisNeuron->private4.isNull() == false && thisNeuron->private4.v4 != 0)
     {
@@ -1823,7 +1838,7 @@ public:
 
     if (selfAddress.isNull())
     {
-      return selfBrainUUID();
+      return 0;
     }
 
     if (selfAddress.is6 == false)
@@ -1834,6 +1849,70 @@ public:
     uint128_t key = 0;
     memcpy(&key, selfAddress.v6, sizeof(key));
     return key;
+  }
+
+  uint128_t updateSelfLocalPeerTrackingKey(void) const
+  {
+    if (uint128_t uuid = selfBrainUUID(); uuid != 0)
+    {
+      return uuid;
+    }
+
+    return updateSelfLocalAddressTrackingKey();
+  }
+
+  bool updateSelfPeerKeyMatchesLocal(uint128_t peerKey, const BrainView *excludedLegacyPeer = nullptr) const
+  {
+    if (peerKey == 0)
+    {
+      return false;
+    }
+
+    if (peerKey == updateSelfLocalPeerTrackingKey())
+    {
+      return true;
+    }
+
+    if (selfBrainUUID() == 0)
+    {
+      return false;
+    }
+
+    bool matchesLocalLegacyAddress = false;
+    bool legacyAddressAmbiguous = false;
+    (void)findBrainViewByUpdateSelfPeerKey(peerKey,
+                                           excludedLegacyPeer,
+                                           &matchesLocalLegacyAddress,
+                                           &legacyAddressAmbiguous);
+    return matchesLocalLegacyAddress && legacyAddressAmbiguous == false;
+  }
+
+  bool updateSelfPeerKeyMatchesBrain(uint128_t peerKey,
+                                     const BrainView *brain,
+                                     const BrainView *excludedLegacyPeer = nullptr) const
+  {
+    if (brain == nullptr || peerKey == 0)
+    {
+      return false;
+    }
+
+    if (peerKey == updateSelfPeerTrackingKey(brain))
+    {
+      return true;
+    }
+
+    if (brain->uuid == 0)
+    {
+      return false;
+    }
+
+    bool matchesLocalLegacyAddress = false;
+    bool legacyAddressAmbiguous = false;
+    return findBrainViewByUpdateSelfPeerKey(peerKey,
+                                            excludedLegacyPeer,
+                                            &matchesLocalLegacyAddress,
+                                            &legacyAddressAmbiguous) == brain &&
+           legacyAddressAmbiguous == false;
   }
 
   ProdigyPersistentUpdateSelfState capturePersistentUpdateSelfState(void) const
@@ -10399,7 +10478,7 @@ public:
     return true;
   }
 
-  bool peerEligibleForClusterQuorum(BrainView *peer) const
+  bool peerEligibleForClusterQuorum(BrainView *peer, bool allowSharedPrivate4 = false) const
   {
     if (peer == nullptr || peer->quarantined)
     {
@@ -10430,7 +10509,7 @@ public:
 
     if (thisNeuron != nullptr)
     {
-      if (peer->private4 != 0 && peer->private4 == thisNeuron->private4.v4)
+      if (allowSharedPrivate4 == false && peer->private4 != 0 && peer->private4 == thisNeuron->private4.v4)
       {
         return false;
       }
@@ -13611,8 +13690,19 @@ public:
     return nullptr;
   }
 
-  BrainView *findBrainViewByUpdateSelfPeerKey(uint128_t peerKey) const
+  BrainView *findBrainViewByUpdateSelfPeerKey(uint128_t peerKey,
+                                               const BrainView *excludedLegacyPeer = nullptr,
+                                               bool *matchesLocalLegacyAddress = nullptr,
+                                               bool *legacyAddressAmbiguous = nullptr) const
   {
+    if (matchesLocalLegacyAddress != nullptr)
+    {
+      *matchesLocalLegacyAddress = false;
+    }
+    if (legacyAddressAmbiguous != nullptr)
+    {
+      *legacyAddressAmbiguous = false;
+    }
     if (peerKey == 0)
     {
       return nullptr;
@@ -13620,18 +13710,39 @@ public:
 
     for (BrainView *brain : brains)
     {
-      if (brain == nullptr)
-      {
-        continue;
-      }
-
-      if (updateSelfPeerTrackingKey(brain) == peerKey)
+      if (brain != nullptr && updateSelfPeerTrackingKey(brain) == peerKey)
       {
         return brain;
       }
     }
 
-    return nullptr;
+    const bool localLegacyMatch = (peerKey == updateSelfLocalAddressTrackingKey());
+    BrainView *legacyMatch = nullptr;
+    for (BrainView *brain : brains)
+    {
+      if (brain == nullptr || brain == excludedLegacyPeer || peerEligibleForClusterQuorum(brain, true) == false ||
+          updateSelfPeerAddressTrackingKey(brain) != peerKey)
+      {
+        continue;
+      }
+
+      if (localLegacyMatch || legacyMatch != nullptr)
+      {
+        if (legacyAddressAmbiguous != nullptr)
+        {
+          *legacyAddressAmbiguous = true;
+        }
+        return nullptr;
+      }
+
+      legacyMatch = brain;
+    }
+
+    if (matchesLocalLegacyAddress != nullptr)
+    {
+      *matchesLocalLegacyAddress = localLegacyMatch;
+    }
+    return legacyMatch;
   }
 
   BrainView *findBrainViewByPeerAddress(const IPAddress& address) const
@@ -25098,9 +25209,7 @@ public:
 
           if (noMasterYet && weAreMaster == false && pendingDesignatedMasterPeerKey > 0)
           {
-            uint128_t registrationPeerKey = updateSelfPeerTrackingKey(bv);
-            uint128_t selfPeerKey = updateSelfLocalPeerTrackingKey();
-            if (selfPeerKey > 0 && pendingDesignatedMasterPeerKey == selfPeerKey)
+            if (updateSelfPeerKeyMatchesLocal(pendingDesignatedMasterPeerKey))
             {
               String pendingPeerKeyText = {};
               pendingPeerKeyText.snprintf<"{itoa}"_ctv>(pendingDesignatedMasterPeerKey);
@@ -25108,7 +25217,7 @@ public:
                          pendingPeerKeyText.c_str());
               (void)selfElectAsMaster("registration:pending-designated-master", true);
             }
-            else if (registrationPeerKey == pendingDesignatedMasterPeerKey && bv->quarantined == false)
+            else if (updateSelfPeerKeyMatchesBrain(pendingDesignatedMasterPeerKey, bv) && bv->quarantined == false)
             {
               electBrainToMaster(bv);
             }
@@ -25345,24 +25454,32 @@ public:
 
             bool electedDesignatedMaster = false;
             bool designatedMasterKnown = false;
-            uint128_t selfPeerKey = updateSelfLocalPeerTrackingKey();
-            if (designatedMasterPeerKey > 0 && designatedMasterPeerKey == selfPeerKey)
+            bool matchesLocalLegacyAddress = false;
+            bool legacyAddressAmbiguous = false;
+            BrainView *peer = findBrainViewByUpdateSelfPeerKey(designatedMasterPeerKey,
+                                                                bv,
+                                                                &matchesLocalLegacyAddress,
+                                                                &legacyAddressAmbiguous);
+            if (updateSelfPeerKeyMatchesLocal(designatedMasterPeerKey, bv))
             {
               designatedMasterKnown = true;
               basics_log("relinquishMasterStatus elect-self reason=designated-master\n");
               electedDesignatedMaster = selfElectAsMaster("relinquishMasterStatus:designated-master", true);
             }
-            else if (designatedMasterPeerKey > 0)
+            else if (peer != nullptr)
             {
-              if (BrainView *peer = findBrainViewByUpdateSelfPeerKey(designatedMasterPeerKey); peer != nullptr)
+              designatedMasterKnown = true;
+              if (peerEligibleForClusterQuorum(peer))
               {
-                designatedMasterKnown = true;
-                if (peerEligibleForClusterQuorum(peer))
-                {
-                  electBrainToMaster(peer);
-                  electedDesignatedMaster = true;
-                }
+                electBrainToMaster(peer);
+                electedDesignatedMaster = true;
               }
+            }
+            else if (matchesLocalLegacyAddress || legacyAddressAmbiguous)
+            {
+              // Keep the existing designated-master wait if an address-keyed
+              // rolling handoff cannot identify one post-handoff candidate.
+              designatedMasterKnown = true;
             }
 
             if (electedDesignatedMaster == false)
