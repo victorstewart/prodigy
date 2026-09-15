@@ -5,6 +5,7 @@
 #include <prodigy/brain/brain.h>
 #include <prodigy/dev/tests/prodigy_test_ssh_keys.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cerrno>
 #include <cstdio>
@@ -23278,6 +23279,90 @@ static void testApiCredentialExpiryNotificationLifecycle(TestSuite& suite)
 
   brain.deployments.erase(deployment.plan.config.deploymentID());}
 
+static void testTopologyRestoreKeepsKnownUUIDsDistinctAcrossSharedPrivate4(TestSuite& suite)
+{
+  TestBrain brain = {};
+  const uint32_t sharedPrivate4 = IPAddress("10.0.2.15", false).v4;
+  ClusterTopology topology = {};
+
+  auto appendMachine = [&](uint128_t uuid, const char *peer6, uint32_t rackUUID) {
+    ClusterMachine machine = {};
+    machine.uuid = uuid;
+    machine.source = ClusterMachineSource::adopted;
+    machine.backing = ClusterMachineBacking::owned;
+    machine.lifetime = MachineLifetime::reserved;
+    machine.kind = MachineConfig::MachineKind::vm;
+    machine.isBrain = true;
+    machine.rackUUID = rackUUID;
+    machine.ssh.address.assign(peer6);
+    machine.ssh.user.assign("root"_ctv);
+    machine.ssh.privateKeyPath.assign("/tmp/test-key"_ctv);
+    prodigyAppendUniqueClusterMachinePeerAddress(machine.peerAddresses, ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24});
+    prodigyAppendUniqueClusterMachinePeerAddress(machine.peerAddresses, ClusterMachinePeerAddress {String(peer6), 64});
+    prodigyAppendUniqueClusterMachineAddress(machine.addresses.privateAddresses, "10.0.2.15"_ctv, 24);
+    prodigyAppendUniqueClusterMachineAddress(machine.addresses.privateAddresses, String(peer6), 64);
+    topology.machines.push_back(std::move(machine));
+  };
+
+  appendMachine(0x9101, "2001:db8:910::10", 1);
+  appendMachine(0x9102, "2001:db8:910::11", 2);
+  appendMachine(0x9103, "2001:db8:910::12", 3);
+
+  suite.expect(brain.restoreMachinesFromClusterTopology(topology),
+               "topology_restore_shared_private4_restores_known_machines");
+  Machine *first = brain.findMachineByUUIDForTest(0x9101);
+  Machine *second = brain.findMachineByUUIDForTest(0x9102);
+  Machine *third = brain.findMachineByUUIDForTest(0x9103);
+  auto hasPeerAddress = [](const Machine *machine, const String& expected) {
+    return machine != nullptr && std::any_of(machine->peerAddresses.begin(), machine->peerAddresses.end(), [&](const ClusterMachinePeerAddress& candidate) {
+      return candidate.address.equals(expected);
+    });
+  };
+  const String firstIPv6 = "2001:db8:910::10"_ctv;
+  const String secondIPv6 = "2001:db8:910::11"_ctv;
+  const String thirdIPv6 = "2001:db8:910::12"_ctv;
+  suite.expect(first != nullptr && second != nullptr && third != nullptr &&
+                   first != second && first != third && second != third && brain.machines.size() == 3,
+               "topology_restore_shared_private4_keeps_distinct_uuid_objects");
+  suite.expect(first != nullptr && second != nullptr && third != nullptr &&
+                   first->private4 == sharedPrivate4 && second->private4 == sharedPrivate4 && third->private4 == sharedPrivate4 &&
+                   hasPeerAddress(first, firstIPv6) && hasPeerAddress(second, secondIPv6) && hasPeerAddress(third, thirdIPv6),
+               "topology_restore_shared_private4_preserves_each_explicit_ipv6_identity");
+
+  TestBrain provisionalBrain = {};
+  Machine provisional = {};
+  provisional.isBrain = true;
+  provisional.private4 = sharedPrivate4;
+  provisional.peerAddresses.push_back(ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24});
+  provisional.peerAddresses.push_back(ClusterMachinePeerAddress {"2001:db8:911::10"_ctv, 64});
+  provisional.neuron.machine = &provisional;
+  provisionalBrain.machines.insert(&provisional);
+  provisionalBrain.neurons.insert(&provisional.neuron);
+
+  ClusterTopology provisionalTopology = {};
+  ClusterMachine knownMachine = {};
+  knownMachine.uuid = 0x9110;
+  knownMachine.source = ClusterMachineSource::adopted;
+  knownMachine.backing = ClusterMachineBacking::owned;
+  knownMachine.lifetime = MachineLifetime::reserved;
+  knownMachine.kind = MachineConfig::MachineKind::vm;
+  knownMachine.isBrain = true;
+  knownMachine.rackUUID = 4;
+  knownMachine.ssh.address.assign("2001:db8:911::10"_ctv);
+  knownMachine.ssh.user.assign("root"_ctv);
+  knownMachine.ssh.privateKeyPath.assign("/tmp/test-key"_ctv);
+  knownMachine.peerAddresses.push_back(ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24});
+  knownMachine.peerAddresses.push_back(ClusterMachinePeerAddress {"2001:db8:911::10"_ctv, 64});
+  prodigyAppendUniqueClusterMachineAddress(knownMachine.addresses.privateAddresses, "10.0.2.15"_ctv, 24);
+  prodigyAppendUniqueClusterMachineAddress(knownMachine.addresses.privateAddresses, "2001:db8:911::10"_ctv, 64);
+  provisionalTopology.machines.push_back(std::move(knownMachine));
+
+  suite.expect(provisionalBrain.restoreMachinesFromClusterTopology(provisionalTopology),
+               "topology_restore_shared_private4_accepts_zero_uuid_provisional_machine");
+  suite.expect(provisionalBrain.findMachineByUUIDForTest(0x9110) == &provisional && provisionalBrain.machines.size() == 1,
+               "topology_restore_shared_private4_binds_known_uuid_to_provisional_machine");
+}
+
 int main(void)
 {
   TestSuite suite;
@@ -23367,6 +23452,16 @@ int main(void)
   {
     Ring::createRing(8, 8, 32, 32, -1, -1, 0);
     createdRing = true;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "topology-uuid-restore") == 0)
+  {
+    testTopologyRestoreKeepsKnownUUIDsDistinctAcrossSharedPrivate4(suite);
+    if (createdRing)
+    {
+      Ring::shutdownForExec();
+    }
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "update-peer-identity") == 0)
@@ -23721,6 +23816,7 @@ int main(void)
   testMothershipHandlerReplaysReadyLocalHardwareProfile(suite);
   testGetMachinesPreservesTopologySchemaOverBootstrapSnapshot(suite);
   testGetMachinesPreservesTopologyIPv6ControlAddressOverSparseSnapshot(suite);
+  testTopologyRestoreKeepsKnownUUIDsDistinctAcrossSharedPrivate4(suite);
 
   if (createdRing)
   {
