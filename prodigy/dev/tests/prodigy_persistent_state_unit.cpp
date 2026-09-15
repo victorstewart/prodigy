@@ -1349,6 +1349,18 @@ int main(void)
   followerBoot.bootNs = 444;
   storedSnapshot.masterAuthority.runtimeState.updateSelf.followerBootNsByPeerKey.push_back(followerBoot);
   storedSnapshot.masterAuthority.runtimeState.updateSelf.followerRebootedPeerKeys.push_back(storedLocalBrainState.uuid + 6);
+  storedSnapshot.masterAuthority.runtimeState.updateSelf.localMachineUUID = storedLocalBrainState.uuid;
+  NeuronContainerBootstrap retainedBootstrap = {};
+  retainedBootstrap.plan.uuid = 0x901234;
+  retainedBootstrap.plan.config = storedPlan.config;
+  retainedBootstrap.plan.fragment = 17;
+  retainedBootstrap.plan.hasCredentialBundle = true;
+  ApiCredential retainedCredential = storedCredential;
+  retainedCredential.material.assign("retained-container-api-secret"_ctv);
+  retainedBootstrap.plan.credentialBundle.apiCredentials.push_back(retainedCredential);
+  String retainedBootstrapBytes = {};
+  BitseryEngine::serialize(retainedBootstrapBytes, retainedBootstrap);
+  storedSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps.push_back(retainedBootstrapBytes);
   storedSnapshot.masterAuthority.runtimeState.nextPendingAddMachinesOperationID = 9;
   ProdigyPendingAddMachinesOperation pendingAddMachinesOperation = {};
   pendingAddMachinesOperation.operationID = 7;
@@ -1678,6 +1690,42 @@ int main(void)
     ProdigyPersistentBrainSnapshot extractionSource = expectedManagedSnapshot;
     prodigyExtractPersistentBrainSnapshotSecrets(std::move(extractionSource), publicSnapshot, extractedSecrets);
 
+    suite.expect(publicSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps.empty(),
+                 "extract_snapshot_secrets_scrubs_retained_container_bootstraps");
+    suite.expect(extractedSecrets.localContainerBootstraps ==
+                     expectedManagedSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps,
+                 "extract_snapshot_secrets_preserves_exact_retained_container_bootstraps");
+    {
+      ProdigyPersistentBrainSnapshotSecrets legacySecrets = extractedSecrets;
+      legacySecrets.localContainerBootstraps.clear();
+      String legacyRecord = {}, emptyExtension = {};
+      BitseryEngine::serialize(legacyRecord, legacySecrets);
+      BitseryEngine::serialize(emptyExtension, legacySecrets.localContainerBootstraps);
+      legacyRecord.resize(legacyRecord.size() - emptyExtension.size());
+      ProdigyPersistentBrainSnapshotSecrets decodedLegacy = {};
+      suite.expect(BitseryEngine::deserializeSafe(legacyRecord, decodedLegacy) &&
+                       decodedLegacy.localContainerBootstraps.empty(),
+                   "legacy_snapshot_secret_record_decodes_without_inventory_extension");
+      ProdigyPersistentBrainSnapshot legacyPublic = publicSnapshot;
+      legacyPublic.masterAuthority.runtimeState.updateSelf.localContainerBootstraps =
+          expectedManagedSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps;
+      String legacyFailure = {};
+      suite.expect(prodigyApplyPersistentBrainSnapshotSecrets(legacyPublic, decodedLegacy, &legacyFailure) &&
+                       legacyPublic.masterAuthority.runtimeState.updateSelf.localContainerBootstraps ==
+                           expectedManagedSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps,
+                   "legacy_snapshot_restore_preserves_existing_public_inventory_for_migration");
+      ProdigyPersistentBrainSnapshot migratedPublic = {};
+      ProdigyPersistentBrainSnapshotSecrets migratedSecrets = {};
+      prodigyExtractPersistentBrainSnapshotSecrets(std::move(legacyPublic), migratedPublic, migratedSecrets);
+      suite.expect(migratedPublic.masterAuthority.runtimeState.updateSelf.localContainerBootstraps.empty() &&
+                       migratedSecrets.localContainerBootstraps ==
+                           expectedManagedSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps,
+                   "legacy_snapshot_save_migrates_inventory_to_private_sidecar");
+      migratedSecrets.clear();
+      suite.expect(migratedSecrets.localContainerBootstraps.empty(),
+                   "snapshot_secret_clear_releases_retained_inventory");
+    }
+
     suite.expect(publicSnapshot.topology == expectedManagedSnapshot.topology, "extract_snapshot_secrets_preserves_topology");
     suite.expect(
         equalMapBySerializedValue(publicSnapshot.masterAuthority.deploymentPlans, expectedManagedSnapshot.masterAuthority.deploymentPlans),
@@ -1869,6 +1917,9 @@ int main(void)
     }
     suite.expect(loadSnapshot, "load_snapshot");
     suite.expect(equalBrainSnapshots(expectedManagedSnapshot, loadedSnapshot), "load_snapshot_roundtrip");
+    suite.expect(loadedSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps ==
+                     storedSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps,
+                 "load_snapshot_restores_exact_private_inventory");
     suite.expect(
         loadedSnapshot.masterAuthority.runtimeState.statefulWorkerTopologyUpgradeOperations.size() == 1 && loadedSnapshot.masterAuthority.runtimeState.statefulWorkerTopologyUpgradeOperations[0].targetLogicalCores == 2 && loadedSnapshot.masterAuthority.runtimeState.statefulWorkerTopologyUpgradeOperations[0].targetWorkerCount == 1,
         "load_snapshot_restores_stateful_worker_topology_upgrade_operation");
@@ -2125,6 +2176,9 @@ int main(void)
     ProdigyPersistentStoredBrainSnapshot storedSnapshotRecord = {};
     suite.expect(BitseryEngine::deserializeSafe(rawPublicSnapshotRecord, storedSnapshotRecord), "deserialize_raw_public_snapshot_record");
     suite.expect(storedSnapshotRecord.secretVersion != 0, "raw_public_snapshot_record_has_secret_version");
+    suite.expect(storedSnapshotRecord.state.masterAuthority.runtimeState.updateSelf.localContainerBootstraps.empty() &&
+                     stringContains(rawPublicSnapshotRecord, retainedCredential.material) == false,
+                 "raw_public_snapshot_record_scrubs_retained_container_credentials");
     suite.expect(stringContains(rawPublicSnapshotRecord, storedSnapshot.brainConfig.bootstrapSshKeyPackage.privateKeyOpenSSH) == false, "raw_public_snapshot_record_scrubs_bootstrap_private_key");
     suite.expect(stringContains(rawPublicSnapshotRecord, storedSnapshot.brainConfig.bootstrapSshHostKeyPackage.privateKeyOpenSSH) == false, "raw_public_snapshot_record_scrubs_bootstrap_host_private_key");
     suite.expect(stringContains(rawPublicSnapshotRecord, storedCredential.material) == false, "raw_public_snapshot_record_scrubs_api_credential_material");
@@ -2156,6 +2210,8 @@ int main(void)
     prodigyBuildPersistentSecretRecordKey("snapshot", storedSnapshotRecord.secretVersion, snapshotSecretKey);
     String rawSnapshotSecretRecord = {};
     suite.expect(readRawTidesDBRecord(secretsDBPath, "brain"_ctv, snapshotSecretKey, rawSnapshotSecretRecord, &failure), "read_raw_snapshot_secret_record");
+    suite.expect(stringContains(rawSnapshotSecretRecord, retainedCredential.material),
+                 "raw_snapshot_secret_record_keeps_retained_container_credentials");
     suite.expect(stringContains(rawSnapshotSecretRecord, storedSnapshot.brainConfig.bootstrapSshKeyPackage.privateKeyOpenSSH), "raw_snapshot_secret_record_keeps_bootstrap_private_key");
     suite.expect(stringContains(rawSnapshotSecretRecord, storedSnapshot.brainConfig.bootstrapSshHostKeyPackage.privateKeyOpenSSH), "raw_snapshot_secret_record_keeps_bootstrap_host_private_key");
     suite.expect(stringContains(rawSnapshotSecretRecord, storedCredential.material), "raw_snapshot_secret_record_keeps_api_credential_material");
