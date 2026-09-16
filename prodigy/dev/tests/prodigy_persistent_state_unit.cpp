@@ -1361,6 +1361,14 @@ int main(void)
   String retainedBootstrapBytes = {};
   BitseryEngine::serialize(retainedBootstrapBytes, retainedBootstrap);
   storedSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps.push_back(retainedBootstrapBytes);
+  for (uint128_t machineUUID : {uint128_t(0x901001), uint128_t(0x901002), uint128_t(0x901003)})
+  {
+    ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
+    witness.machineUUID = machineUUID;
+    witness.bundleRegistered = machineUUID != uint128_t(0x901002);
+    witness.containerBootstraps.push_back(retainedBootstrapBytes);
+    storedSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses.push_back(std::move(witness));
+  }
   storedSnapshot.masterAuthority.runtimeState.nextPendingAddMachinesOperationID = 9;
   ProdigyPendingAddMachinesOperation pendingAddMachinesOperation = {};
   pendingAddMachinesOperation.operationID = 7;
@@ -1695,17 +1703,24 @@ int main(void)
     suite.expect(extractedSecrets.localContainerBootstraps ==
                      expectedManagedSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps,
                  "extract_snapshot_secrets_preserves_exact_retained_container_bootstraps");
+    suite.expect(publicSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses.empty() &&
+                     extractedSecrets.machineRecoveryWitnesses ==
+                         expectedManagedSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses,
+                 "extract_snapshot_secrets_moves_all_machine_recovery_inventory_to_private_sidecar");
     {
       ProdigyPersistentBrainSnapshotSecrets legacySecrets = extractedSecrets;
       legacySecrets.localContainerBootstraps.clear();
-      String legacyRecord = {}, emptyExtension = {};
+      legacySecrets.machineRecoveryWitnesses.clear();
+      String legacyRecord = {}, emptyLocalExtension = {}, emptyWitnessExtension = {};
       BitseryEngine::serialize(legacyRecord, legacySecrets);
-      BitseryEngine::serialize(emptyExtension, legacySecrets.localContainerBootstraps);
-      legacyRecord.resize(legacyRecord.size() - emptyExtension.size());
+      BitseryEngine::serialize(emptyLocalExtension, legacySecrets.localContainerBootstraps);
+      BitseryEngine::serialize(emptyWitnessExtension, legacySecrets.machineRecoveryWitnesses);
+      legacyRecord.resize(legacyRecord.size() - emptyLocalExtension.size() - emptyWitnessExtension.size());
       ProdigyPersistentBrainSnapshotSecrets decodedLegacy = {};
       suite.expect(BitseryEngine::deserializeSafe(legacyRecord, decodedLegacy) &&
-                       decodedLegacy.localContainerBootstraps.empty(),
-                   "legacy_snapshot_secret_record_decodes_without_inventory_extension");
+                       decodedLegacy.localContainerBootstraps.empty() &&
+                       decodedLegacy.machineRecoveryWitnesses.empty(),
+                   "legacy_snapshot_secret_record_decodes_without_inventory_extensions");
       ProdigyPersistentBrainSnapshot legacyPublic = publicSnapshot;
       legacyPublic.masterAuthority.runtimeState.updateSelf.localContainerBootstraps =
           expectedManagedSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps;
@@ -1920,6 +1935,21 @@ int main(void)
     suite.expect(loadedSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps ==
                      storedSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps,
                  "load_snapshot_restores_exact_private_inventory");
+    suite.expect(loadedSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses ==
+                     storedSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses,
+                 "load_snapshot_restores_all_machine_private_inventory");
+    ProdigyPersistentBrainSnapshot legacyFullSnapshot = storedSnapshot;
+    legacyFullSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses.clear();
+    String legacyFullSnapshotBytes = {};
+    BitseryEngine::serialize(legacyFullSnapshotBytes, legacyFullSnapshot);
+    ProdigyPersistentBrainSnapshot decodedLegacyFullSnapshot = {};
+    suite.expect(BitseryEngine::deserializeSafe(legacyFullSnapshotBytes, decodedLegacyFullSnapshot) &&
+                     decodedLegacyFullSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses.empty() &&
+                     decodedLegacyFullSnapshot.masterAuthority.runtimeState.publicTlsCertificates.size() ==
+                         legacyFullSnapshot.masterAuthority.runtimeState.publicTlsCertificates.size() &&
+                     decodedLegacyFullSnapshot.masterAuthority.deploymentPlans.size() ==
+                         legacyFullSnapshot.masterAuthority.deploymentPlans.size(),
+                 "legacy_full_brain_snapshot_with_trailing_fields_decodes_without_all_machine_extension");
     suite.expect(
         loadedSnapshot.masterAuthority.runtimeState.statefulWorkerTopologyUpgradeOperations.size() == 1 && loadedSnapshot.masterAuthority.runtimeState.statefulWorkerTopologyUpgradeOperations[0].targetLogicalCores == 2 && loadedSnapshot.masterAuthority.runtimeState.statefulWorkerTopologyUpgradeOperations[0].targetWorkerCount == 1,
         "load_snapshot_restores_stateful_worker_topology_upgrade_operation");

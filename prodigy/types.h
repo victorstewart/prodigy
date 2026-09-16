@@ -6862,6 +6862,36 @@ static void serialize(S&& serializer, ProdigyPersistentUpdateSelfFollowerBoot& s
   serializer.value8b(state.bootNs);
 }
 
+template <typename T>
+struct ProdigyPersistentSerializerIsWriter : std::false_type {
+};
+
+template <typename OutputAdapter, typename Context>
+struct ProdigyPersistentSerializerIsWriter<bitsery::Serializer<OutputAdapter, Context>> : std::true_type {
+};
+
+class ProdigyPersistentUpdateSelfMachineRecoveryWitness {
+public:
+
+  uint128_t machineUUID = 0;
+  bool bundleRegistered = false;
+  Vector<String> containerBootstraps;
+
+  bool operator==(const ProdigyPersistentUpdateSelfMachineRecoveryWitness& other) const
+  {
+    return machineUUID == other.machineUUID && bundleRegistered == other.bundleRegistered &&
+           containerBootstraps == other.containerBootstraps;
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyPersistentUpdateSelfMachineRecoveryWitness& witness)
+{
+  serializer.value16b(witness.machineUUID);
+  serializer.value1b(witness.bundleRegistered);
+  serializer.object(witness.containerBootstraps);
+}
+
 class ProdigyPersistentUpdateSelfState {
 public:
 
@@ -6894,15 +6924,18 @@ public:
   uint128_t localMachineUUID = 0;
   bool localBundleRegistered = false;
   Vector<String> localContainerBootstraps;
+  // Version-three master-authority records capture every commissioned machine under
+  // one master-authority transaction. Payload bytes remain sidecar secrets.
+  Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness> machineRecoveryWitnesses;
 
   bool active(void) const
   {
-    return state != 0 || expectedEchos != 0 || bundleEchos != 0 || relinquishEchos != 0 || plannedMasterPeerKey != 0 || pendingDesignatedMasterPeerKey != 0 || useStagedBundleOnly || bundleBlob.size() > 0 || bundleEchoPeerKeys.empty() == false || relinquishEchoPeerKeys.empty() == false || followerBootNsByPeerKey.empty() == false || followerRebootedPeerKeys.empty() == false || workerExpectedBundleSHA256.size() > 0 || workerFailure.size() > 0 || workerMachineUUIDs.empty() == false || workerStagedMachineUUIDs.empty() == false || workerTransitionIssuedMachineUUIDs.empty() == false || workerRebootedMachineUUIDs.empty() == false || workerStateUploadedMachineUUIDs.empty() == false || localMachineUUID != 0 || localBundleRegistered || localContainerBootstraps.empty() == false;
+    return state != 0 || expectedEchos != 0 || bundleEchos != 0 || relinquishEchos != 0 || plannedMasterPeerKey != 0 || pendingDesignatedMasterPeerKey != 0 || useStagedBundleOnly || bundleBlob.size() > 0 || bundleEchoPeerKeys.empty() == false || relinquishEchoPeerKeys.empty() == false || followerBootNsByPeerKey.empty() == false || followerRebootedPeerKeys.empty() == false || workerExpectedBundleSHA256.size() > 0 || workerFailure.size() > 0 || workerMachineUUIDs.empty() == false || workerStagedMachineUUIDs.empty() == false || workerTransitionIssuedMachineUUIDs.empty() == false || workerRebootedMachineUUIDs.empty() == false || workerStateUploadedMachineUUIDs.empty() == false || localMachineUUID != 0 || localBundleRegistered || localContainerBootstraps.empty() == false || machineRecoveryWitnesses.empty() == false;
   }
 
   bool operator==(const ProdigyPersistentUpdateSelfState& other) const
   {
-    return state == other.state && expectedEchos == other.expectedEchos && bundleEchos == other.bundleEchos && relinquishEchos == other.relinquishEchos && plannedMasterPeerKey == other.plannedMasterPeerKey && pendingDesignatedMasterPeerKey == other.pendingDesignatedMasterPeerKey && useStagedBundleOnly == other.useStagedBundleOnly && bundleBlob.equals(other.bundleBlob) && bundleEchoPeerKeys == other.bundleEchoPeerKeys && relinquishEchoPeerKeys == other.relinquishEchoPeerKeys && followerBootNsByPeerKey == other.followerBootNsByPeerKey && followerRebootedPeerKeys == other.followerRebootedPeerKeys && workerExpectedBundleSHA256.equals(other.workerExpectedBundleSHA256) && workerFailure.equals(other.workerFailure) && workerMachineUUIDs == other.workerMachineUUIDs && workerStagedMachineUUIDs == other.workerStagedMachineUUIDs && workerTransitionIssuedMachineUUIDs == other.workerTransitionIssuedMachineUUIDs && workerRebootedMachineUUIDs == other.workerRebootedMachineUUIDs && workerStateUploadedMachineUUIDs == other.workerStateUploadedMachineUUIDs && localMachineUUID == other.localMachineUUID && localBundleRegistered == other.localBundleRegistered && localContainerBootstraps == other.localContainerBootstraps;
+    return state == other.state && expectedEchos == other.expectedEchos && bundleEchos == other.bundleEchos && relinquishEchos == other.relinquishEchos && plannedMasterPeerKey == other.plannedMasterPeerKey && pendingDesignatedMasterPeerKey == other.pendingDesignatedMasterPeerKey && useStagedBundleOnly == other.useStagedBundleOnly && bundleBlob.equals(other.bundleBlob) && bundleEchoPeerKeys == other.bundleEchoPeerKeys && relinquishEchoPeerKeys == other.relinquishEchoPeerKeys && followerBootNsByPeerKey == other.followerBootNsByPeerKey && followerRebootedPeerKeys == other.followerRebootedPeerKeys && workerExpectedBundleSHA256.equals(other.workerExpectedBundleSHA256) && workerFailure.equals(other.workerFailure) && workerMachineUUIDs == other.workerMachineUUIDs && workerStagedMachineUUIDs == other.workerStagedMachineUUIDs && workerTransitionIssuedMachineUUIDs == other.workerTransitionIssuedMachineUUIDs && workerRebootedMachineUUIDs == other.workerRebootedMachineUUIDs && workerStateUploadedMachineUUIDs == other.workerStateUploadedMachineUUIDs && localMachineUUID == other.localMachineUUID && localBundleRegistered == other.localBundleRegistered && localContainerBootstraps == other.localContainerBootstraps && machineRecoveryWitnesses == other.machineRecoveryWitnesses;
   }
 
   bool operator!=(const ProdigyPersistentUpdateSelfState& other) const
@@ -6936,6 +6969,9 @@ static void serialize(S&& serializer, ProdigyPersistentUpdateSelfState& state)
   serializer.value16b(state.localMachineUUID);
   serializer.value1b(state.localBundleRegistered);
   serializer.object(state.localContainerBootstraps);
+  // All-machine recovery witnesses are framed by the enclosing master-authority
+  // record version. They cannot be conditionally read here: updateSelf is a
+  // nested object and old outer records contain subsequent fields.
 }
 
 class ProdigyPendingAddMachinesOperation {
@@ -7246,14 +7282,6 @@ static void serialize(S&& serializer, ProdigyMaterializedStatefulRecoveryOperati
   serializer.value8b(operation.updatedAtMs);
 }
 
-template <typename T>
-struct ProdigyPersistentSerializerIsWriter : std::false_type {
-};
-
-template <typename OutputAdapter, typename Context>
-struct ProdigyPersistentSerializerIsWriter<bitsery::Serializer<OutputAdapter, Context>> : std::true_type {
-};
-
 enum class ApiCredentialExpirySeverity : uint8_t {
   warning,
   expired,
@@ -7493,21 +7521,31 @@ template <typename S>
 static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
 {
   constexpr uint64_t versionMarker = UINT64_MAX;
-  constexpr uint64_t explicitVersion = 2;
+  constexpr uint64_t explicitVersion = 3;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
   bool hasMaterializedStatefulRecoveryOperations = false;
   bool hasApiCredentialExpiryNotices = false;
+  bool hasAllMachineRecoveryWitnesses = false;
 
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
     hasMaterializedStatefulRecoveryOperations = state.materializedStatefulRecoveryOperations.empty() == false;
     hasApiCredentialExpiryNotices = state.apiCredentialExpiryNotices.empty() == false;
-    if (hasMaterializedStatefulRecoveryOperations || hasApiCredentialExpiryNotices)
+    hasAllMachineRecoveryWitnesses = state.updateSelf.machineRecoveryWitnesses.empty() == false;
+    // Version-three framing is cumulative: emit the earlier optional fields
+    // (empty when unused) so a version-three reader has an unambiguous tail.
+    if (hasAllMachineRecoveryWitnesses)
+    {
+      hasMaterializedStatefulRecoveryOperations = true;
+      hasApiCredentialExpiryNotices = true;
+    }
+    if (hasMaterializedStatefulRecoveryOperations || hasApiCredentialExpiryNotices || hasAllMachineRecoveryWitnesses)
     {
       uint64_t marker = versionMarker;
       serializer.value8b(marker);
 
-      uint64_t version = hasApiCredentialExpiryNotices ? explicitVersion : 1;
+      uint64_t version = hasAllMachineRecoveryWitnesses ? explicitVersion :
+                         (hasApiCredentialExpiryNotices ? 2 : 1);
       serializer.value8b(version);
     }
     serializer.value8b(state.generation);
@@ -7520,13 +7558,14 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
       uint64_t version = 0;
       serializer.value8b(version);
       serializer.value8b(state.generation);
-      if ((version != 1 && version != explicitVersion) || state.generation == versionMarker)
+      if ((version < 1 || version > explicitVersion) || state.generation == versionMarker)
       {
         serializer.adapter().error(bitsery::ReaderError::InvalidData);
         return;
       }
       hasMaterializedStatefulRecoveryOperations = true;
       hasApiCredentialExpiryNotices = version >= 2;
+      hasAllMachineRecoveryWitnesses = version >= 3;
     }
   }
 
@@ -7566,6 +7605,14 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
   serializer.object(state.taskExecutions);
   serializer.object(state.mothershipTunnelProviderDesiredState);
   serializer.object(state.updateSelf);
+  if (hasAllMachineRecoveryWitnesses)
+  {
+    serializer.object(state.updateSelf.machineRecoveryWitnesses);
+  }
+  else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+  {
+    state.updateSelf.machineRecoveryWitnesses.clear();
+  }
 }
 
 class ProdigyMasterAuthorityStateTransitionAck {
