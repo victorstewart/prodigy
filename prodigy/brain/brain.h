@@ -2176,7 +2176,16 @@ public:
 
   static void ownDNSRecordLease(RoutableResourceLease& target, const RoutableResourceLease& source)
   {
-    target = source;
+    target.kind = source.kind;
+    target.owner.applicationID = source.owner.applicationID;
+    target.owner.deploymentID = source.owner.deploymentID;
+    target.owner.lineageID = source.owner.lineageID;
+    target.registeredPrefixUUID = source.registeredPrefixUUID;
+    target.address = source.address;
+    target.sourcePort = source.sourcePort;
+    target.dnsTTL = source.dnsTTL;
+    target.dnsDeletePending = source.dnsDeletePending;
+    target.dnsIntentRevision = source.dnsIntentRevision;
     target.owner.name.assign(source.owner.name);
     target.dnsProvider.assign(source.dnsProvider);
     target.dnsCredentialName.assign(source.dnsCredentialName);
