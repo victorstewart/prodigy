@@ -28983,6 +28983,8 @@ public:
     }
     FailedDeploymentRecord& record = failedIt->second;
     const bool alreadyCompleted = record.cancellationPhase == CancelDeploymentPhase::completed;
+    const bool successorIntentWasDurable =
+        uint8_t(record.cancellationPhase) >= uint8_t(CancelDeploymentPhase::successorStarted);
 
     if (record.cancellationPhase != CancelDeploymentPhase::none &&
         operatorCancellationDevCrashBarrier(record))
@@ -29004,6 +29006,11 @@ public:
     {
       return;
     }
+    if (deployment == nullptr && deploymentPlans.contains(deploymentID) == false &&
+        successorIntentWasDurable == false)
+    {
+      return;
+    }
     auto resourcesCanTransferNow = [&]() {
       const DeploymentPlan *activePlan = deployment ? &deployment->plan : nullptr;
       if (activePlan == nullptr)
@@ -29014,8 +29021,23 @@ public:
           activePlan = &activePlanIt->second;
         }
       }
-      return activePlan != nullptr &&
-             operatorCancellationResourcesCanTransfer(deploymentID, *activePlan, *successor);
+      if (activePlan != nullptr)
+      {
+        return operatorCancellationResourcesCanTransfer(deploymentID, *activePlan, *successor);
+      }
+      // Once the transfer is committed, the old deployment need not be in the
+      // snapshot. Resume its durable successor intent only when no old resource
+      // owner remains; an absent plan is never evidence that a transfer is safe.
+      if (successorIntentWasDurable == false || deploymentHasRoutableResourceLease(deploymentID) ||
+          std::any_of(masterAuthorityRuntimeState.publicTlsCertificates.begin(),
+                      masterAuthorityRuntimeState.publicTlsCertificates.end(),
+                      [deploymentID](const PublicTlsCertificateState& certificate) {
+                        return certificate.spec.deploymentID == deploymentID;
+                      }))
+      {
+        return false;
+      }
+      return deploymentApiCredentialsAvailableForLaunch(successor->plan);
     };
     if (deployment != nullptr && deployment->operatorCancellationFinalizationIsQuiescent() == false)
     {
@@ -29102,10 +29124,6 @@ public:
       // crash repeats the existing idempotent transfer before any successor
       // launch, so an old resource owner can never be cleaned up underneath a
       // new public endpoint.
-      if (resourcesCanTransferNow() == false)
-      {
-        return;
-      }
       releaseRoutableResourceLeasesForDeployment(deploymentID);
       if (deploymentHasRoutableResourceLease(deploymentID) ||
           commitMasterAuthorityStateChange() == false)
