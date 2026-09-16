@@ -22486,6 +22486,246 @@ static void testBrainNeuronRegistrationQueuesStateRefreshForRebootRecovery(TestS
   brain.machines.erase(&machine);
 }
 
+static void testBrainNeuronRegistrationDefersUnprovenFragmentDuringPersistedRecovery(TestSuite& suite)
+{
+  TestBrain brain = {};
+  brain.weAreMaster = true;
+  brain.ignited = true;
+  brain.recoveringPersistedNeuronInventory = true;
+  brain.persistedMachineInventoryEnumerated = true;
+  brain.brainConfig.datacenterFragment = 1;
+
+  Machine retained = {};
+  retained.uuid = uint128_t(0x521501);
+  retained.state = MachineState::healthy;
+  retained.neuron.machine = &retained;
+  brain.machines.insert(&retained);
+  brain.machinesByUUID.insert_or_assign(retained.uuid, &retained);
+  brain.neurons.insert(&retained.neuron);
+
+  // Keep the recovery fence closed while this fixture validates one retained
+  // Neuron upload. Production waits for every commissioned peer before it can
+  // call the deployment recovery owner.
+  Machine pendingPeer = {};
+  pendingPeer.uuid = uint128_t(0x521500);
+  pendingPeer.state = MachineState::healthy;
+  pendingPeer.neuron.machine = &pendingPeer;
+  brain.machines.insert(&pendingPeer);
+  brain.machinesByUUID.insert_or_assign(pendingPeer.uuid, &pendingPeer);
+  brain.neurons.insert(&pendingPeer.neuron);
+
+  ApplicationDeployment deployment = {};
+  deployment.plan = makeDeploymentPlan(62'151, 1);
+  brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+  brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
+
+  String registrationBuffer = {};
+  brain.neuronHandler(&retained.neuron,
+                      buildNeuronMessage(registrationBuffer,
+                                         NeuronTopic::registration,
+                                         int64_t(1'700'000'000'151),
+                                         "linux-6.10.0"_ctv,
+                                         "fedora"_ctv,
+                                         "44-prodigy-recovered"_ctv,
+                                         true));
+
+  bool requestedAuthoritativeInventory = false;
+  forEachMessageInBuffer(retained.neuron.wBuffer, [&](Message *queued) {
+    if (NeuronTopic(queued->topic) != NeuronTopic::registration)
+    {
+      return;
+    }
+    uint8_t *args = queued->args;
+    bool requiresState = false;
+    Message::extractArg<ArgumentNature::fixed>(args, requiresState);
+    requestedAuthoritativeInventory = requestedAuthoritativeInventory || requiresState;
+  });
+  suite.expect(retained.fragment == 0 && requestedAuthoritativeInventory,
+               "brain_neuron_registration_persisted_recovery_defers_unproven_fragment_until_state_upload");
+
+  auto sendStateUpload = [&](Machine& machine,
+                             uint8_t datacenterFragment,
+                             uint32_t reportedFragment,
+                             const ContainerPlan *plan = nullptr,
+                             const ContainerPlan *secondPlan = nullptr) -> void {
+    String uploadBuffer = {};
+    uint32_t headerOffset = Message::appendHeader(uploadBuffer, NeuronTopic::stateUpload);
+    local_container_subnet6 fragment = {};
+    fragment.dpfx = datacenterFragment;
+    fragment.mpfx[0] = uint8_t((reportedFragment >> 16) & 0xffu);
+    fragment.mpfx[1] = uint8_t((reportedFragment >> 8) & 0xffu);
+    fragment.mpfx[2] = uint8_t(reportedFragment & 0xffu);
+    Message::appendAlignedBuffer<Alignment::one>(uploadBuffer, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
+    if (plan != nullptr)
+    {
+      String serializedPlan = {};
+      BitseryEngine::serialize(serializedPlan, *plan);
+      Message::appendValue(uploadBuffer, serializedPlan);
+    }
+    if (secondPlan != nullptr)
+    {
+      String serializedPlan = {};
+      BitseryEngine::serialize(serializedPlan, *secondPlan);
+      Message::appendValue(uploadBuffer, serializedPlan);
+    }
+    Message::finish(uploadBuffer, headerOffset);
+    brain.neuronHandler(&machine.neuron, reinterpret_cast<Message *>(uploadBuffer.data()));
+  };
+
+  constexpr uint32_t retainedFragment = 0x9bd554;
+  ContainerPlan retainedPlan = {};
+  retainedPlan.uuid = uint128_t(0x521504);
+  retainedPlan.config = deployment.plan.config;
+  retainedPlan.fragment = 9;
+  retainedPlan.state = ContainerState::scheduled;
+  retainedPlan.lifetime = ApplicationLifetime::base;
+  IPPrefix retainedAddress = {};
+  retainedAddress.network.is6 = true;
+  retainedAddress.cidr = 128;
+  std::memcpy(retainedAddress.network.v6, container_network_subnet6.value, sizeof(container_network_subnet6.value));
+  retainedAddress.network.v6[11] = brain.brainConfig.datacenterFragment;
+  retainedAddress.network.v6[12] = uint8_t((retainedFragment >> 16) & 0xffu);
+  retainedAddress.network.v6[13] = uint8_t((retainedFragment >> 8) & 0xffu);
+  retainedAddress.network.v6[14] = uint8_t(retainedFragment & 0xffu);
+  retainedAddress.network.v6[15] = uint8_t(retainedPlan.fragment);
+  retainedPlan.addresses.push_back(retainedAddress);
+  ContainerPlan secondRetainedPlan = retainedPlan;
+  secondRetainedPlan.uuid = uint128_t(0x52150A);
+  secondRetainedPlan.fragment = 10;
+  secondRetainedPlan.addresses[0].network.v6[15] = uint8_t(secondRetainedPlan.fragment);
+  sendStateUpload(retained, 1, retainedFragment, &retainedPlan, &secondRetainedPlan);
+  suite.expect(retained.fragment == retainedFragment && retained.reportedFragment == retainedFragment && retained.runtimeReady,
+               "brain_neuron_state_upload_persisted_recovery_adopts_authenticated_retained_fragment");
+  auto retainedContainer = brain.containers.find(retainedPlan.uuid);
+  auto secondRetainedContainer = brain.containers.find(secondRetainedPlan.uuid);
+  ContainerView *restored = retainedContainer != brain.containers.end() ? retainedContainer->second : nullptr;
+  ContainerView *secondRestored = secondRetainedContainer != brain.containers.end() ? secondRetainedContainer->second : nullptr;
+  uint128_t retainedAddressValue = 0;
+  std::memcpy(&retainedAddressValue, retainedAddress.network.v6, sizeof(retainedAddress.network.v6));
+  suite.expect(restored != nullptr && restored->meshAddress == retainedAddressValue && secondRestored != nullptr,
+               "brain_neuron_state_upload_persisted_recovery_adoption_requires_reported_container_prefix_ownership");
+
+  Machine collision = {};
+  collision.uuid = uint128_t(0x521502);
+  collision.state = MachineState::healthy;
+  collision.neuron.machine = &collision;
+  brain.machines.insert(&collision);
+  brain.machinesByUUID.insert_or_assign(collision.uuid, &collision);
+  brain.neurons.insert(&collision.neuron);
+  sendStateUpload(collision, 1, retainedFragment);
+  suite.expect(collision.fragment == 0 && collision.runtimeReady == false,
+               "brain_neuron_state_upload_persisted_recovery_rejects_colliding_retained_fragment");
+
+  Machine wrongDatacenter = {};
+  wrongDatacenter.uuid = uint128_t(0x521503);
+  wrongDatacenter.state = MachineState::healthy;
+  wrongDatacenter.neuron.machine = &wrongDatacenter;
+  brain.machines.insert(&wrongDatacenter);
+  brain.machinesByUUID.insert_or_assign(wrongDatacenter.uuid, &wrongDatacenter);
+  brain.neurons.insert(&wrongDatacenter.neuron);
+  sendStateUpload(wrongDatacenter, 2, 0x9bd555);
+  suite.expect(wrongDatacenter.fragment == 0 && wrongDatacenter.runtimeReady == false,
+               "brain_neuron_state_upload_persisted_recovery_rejects_wrong_datacenter_fragment");
+
+  Machine wrongAddress = {};
+  wrongAddress.uuid = uint128_t(0x521506);
+  wrongAddress.state = MachineState::healthy;
+  wrongAddress.neuron.machine = &wrongAddress;
+  brain.machines.insert(&wrongAddress);
+  brain.machinesByUUID.insert_or_assign(wrongAddress.uuid, &wrongAddress);
+  brain.neurons.insert(&wrongAddress.neuron);
+  ContainerPlan wrongAddressPlan = retainedPlan;
+  wrongAddressPlan.uuid = uint128_t(0x521507);
+  wrongAddressPlan.addresses[0].network.v6[14] = 0x57;
+  sendStateUpload(wrongAddress, 1, 0x9bd556, &wrongAddressPlan);
+  suite.expect(wrongAddress.fragment == 0 && wrongAddress.runtimeReady == false,
+               "brain_neuron_state_upload_persisted_recovery_rejects_container_prefix_disagreement");
+
+  Machine reserved = {};
+  reserved.uuid = uint128_t(0x521508);
+  reserved.state = MachineState::healthy;
+  reserved.neuron.machine = &reserved;
+  brain.machines.insert(&reserved);
+  brain.machinesByUUID.insert_or_assign(reserved.uuid, &reserved);
+  brain.neurons.insert(&reserved.neuron);
+  constexpr uint32_t reservedFragment = 0x9bd558;
+  brain.usedMachineFragments.insert(reservedFragment);
+  sendStateUpload(reserved, 1, reservedFragment);
+  suite.expect(reserved.fragment == 0 && reserved.runtimeReady == false,
+               "brain_neuron_state_upload_persisted_recovery_rejects_reserved_fragment");
+  brain.usedMachineFragments.erase(reservedFragment);
+
+  Machine freshEmpty = {};
+  freshEmpty.uuid = uint128_t(0x521505);
+  freshEmpty.state = MachineState::healthy;
+  freshEmpty.neuron.machine = &freshEmpty;
+  brain.machines.insert(&freshEmpty);
+  brain.machinesByUUID.insert_or_assign(freshEmpty.uuid, &freshEmpty);
+  brain.neurons.insert(&freshEmpty.neuron);
+  sendStateUpload(freshEmpty, 0, 0);
+  suite.expect(freshEmpty.fragment != 0 && freshEmpty.runtimeReady == false,
+               "brain_neuron_state_upload_persisted_recovery_assigns_only_proven_fresh_empty_inventory");
+
+  Machine malformedEmpty = {};
+  malformedEmpty.uuid = uint128_t(0x521509);
+  malformedEmpty.state = MachineState::healthy;
+  malformedEmpty.neuron.machine = &malformedEmpty;
+  brain.machines.insert(&malformedEmpty);
+  brain.machinesByUUID.insert_or_assign(malformedEmpty.uuid, &malformedEmpty);
+  brain.neurons.insert(&malformedEmpty.neuron);
+  String malformedBuffer = {};
+  uint32_t malformedHeader = Message::appendHeader(malformedBuffer, NeuronTopic::stateUpload);
+  local_container_subnet6 malformedFragment = {};
+  malformedFragment.dpfx = 0;
+  Message::appendAlignedBuffer<Alignment::one>(malformedBuffer, reinterpret_cast<const uint8_t *>(&malformedFragment), sizeof(malformedFragment));
+  Message::append(malformedBuffer, uint32_t(1));
+  Message::finish(malformedBuffer, malformedHeader);
+  brain.neuronHandler(&malformedEmpty.neuron, reinterpret_cast<Message *>(malformedBuffer.data()));
+  suite.expect(malformedEmpty.fragment == 0 && malformedEmpty.runtimeReady == false,
+               "brain_neuron_state_upload_persisted_recovery_rejects_malformed_empty_inventory");
+
+  brain.neurons.erase(&malformedEmpty.neuron);
+  brain.neurons.erase(&freshEmpty.neuron);
+  brain.neurons.erase(&reserved.neuron);
+  brain.neurons.erase(&wrongAddress.neuron);
+  brain.neurons.erase(&wrongDatacenter.neuron);
+  brain.neurons.erase(&collision.neuron);
+  brain.neurons.erase(&retained.neuron);
+  brain.neurons.erase(&pendingPeer.neuron);
+  brain.machinesByUUID.erase(wrongDatacenter.uuid);
+  brain.machinesByUUID.erase(collision.uuid);
+  brain.machinesByUUID.erase(retained.uuid);
+  brain.machinesByUUID.erase(freshEmpty.uuid);
+  brain.machinesByUUID.erase(reserved.uuid);
+  brain.machinesByUUID.erase(wrongAddress.uuid);
+  brain.machinesByUUID.erase(malformedEmpty.uuid);
+  brain.machinesByUUID.erase(pendingPeer.uuid);
+  brain.machines.erase(&malformedEmpty);
+  brain.machines.erase(&freshEmpty);
+  brain.machines.erase(&reserved);
+  brain.machines.erase(&wrongAddress);
+  brain.machines.erase(&wrongDatacenter);
+  brain.machines.erase(&collision);
+  brain.machines.erase(&retained);
+  brain.machines.erase(&pendingPeer);
+  if (restored != nullptr)
+  {
+    deployment.containers.erase(restored);
+    retained.removeContainerIndexEntry(restored->deploymentID, restored);
+    brain.containers.erase(retainedPlan.uuid);
+    delete restored;
+  }
+  if (secondRestored != nullptr)
+  {
+    deployment.containers.erase(secondRestored);
+    retained.removeContainerIndexEntry(secondRestored->deploymentID, secondRestored);
+    brain.containers.erase(secondRetainedPlan.uuid);
+    delete secondRestored;
+  }
+  brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
+  brain.deployments.erase(deployment.plan.config.deploymentID());
+}
+
 static void testBrainNeuronRegistrationKeepsHealthyRuntimeReadyWithoutRefresh(TestSuite& suite)
 {
   TestBrain brain = {};
@@ -25140,6 +25380,12 @@ int main(void)
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "retained-fragment-recovery") == 0)
+  {
+    testBrainNeuronRegistrationDefersUnprovenFragmentDuringPersistedRecovery(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "brain-timeout-cancellation") == 0)
   {
     testBrainTimeoutCancellationDoesNotDereferenceRetiredPacket(suite);
@@ -25604,6 +25850,7 @@ int main(void)
   testBrainNeuronHandlerQueuesRequestedContainerBlob(suite);
   testBrainNeuronHandlerOwnsRegistrationKernelString(suite);
   testBrainNeuronRegistrationQueuesStateRefreshForRebootRecovery(suite);
+  testBrainNeuronRegistrationDefersUnprovenFragmentDuringPersistedRecovery(suite);
   testBrainNeuronRegistrationKeepsHealthyRuntimeReadyWithoutRefresh(suite);
   testBrainNeuronRegistrationRefreshesWorkerAfterBundleTransition(suite);
   testPersistedLocalBrainRefreshBypassesIgnition(suite);
