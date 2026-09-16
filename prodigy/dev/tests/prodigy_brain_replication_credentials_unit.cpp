@@ -23513,6 +23513,15 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
   const uint64_t activeDeploymentID = (uint64_t(applicationID) << 48) | activeVersionID;
   const uint64_t successorDeploymentID = (uint64_t(applicationID) << 48) | successorVersionID;
   String applicationName = "operator-cancel-test"_ctv;
+  auto installCancellationCredentials = [&](TestBrain& target) {
+    installACMEZoneDNSCredential(target, applicationID, "cancel-token"_ctv, "example.com"_ctv);
+    target.apiCredentialSetsByApp[applicationID].setGeneration = 1;
+    ApiCredential apiCredential = {};
+    apiCredential.name = "cancel-api"_ctv;
+    apiCredential.provider = "operator-test"_ctv;
+    apiCredential.material = "unit-secret"_ctv;
+    target.apiCredentialSetsByApp[applicationID].credentials.push_back(std::move(apiCredential));
+  };
   brain.reservedApplicationIDsByName.insert_or_assign(applicationName, applicationID);
   brain.reservedApplicationNamesByID.insert_or_assign(applicationID, applicationName);
 
@@ -23521,11 +23530,47 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
   active->plan = makeDeploymentPlan(applicationID, activeVersionID);
   active->plan.stateless.nBase = 0;
   active->plan.canaryCount = 0;
+  active->plan.apiCredentialPolicy.requiredCredentialNames.push_back("cancel-api"_ctv);
+  active->plan.apiCredentialPolicy.refreshPushEnabled = true;
+  for (uint16_t index = 0; index < 4; ++index)
+  {
+    Wormhole wormhole = {};
+    wormhole.name.snprintf<"inbound{}"_ctv>(uint64_t(index));
+    wormhole.externalAddress = IPAddress(index < 2 ? "2001:db8::63" : "2001:db8::64", true);
+    wormhole.deliveryAddress = IPAddress("fd72:6e61:6d65:1::10", true);
+    wormhole.externalPort = uint16_t(index < 2 ? 443 : 445);
+    wormhole.containerPort = uint16_t(8443 + index);
+    wormhole.layer4 = index < 2 ? IPPROTO_TCP : IPPROTO_UDP;
+    wormhole.isQuic = index >= 2;
+    wormhole.source = ExternalAddressSource::registeredRoutablePrefix;
+    wormhole.routablePrefixUUID = uint128_t(0x6311);
+    wormhole.hasDNSConfig = true;
+    wormhole.dns.provider = "cloudflare"_ctv;
+    wormhole.dns.credentialName = "cancel-token"_ctv;
+    wormhole.dns.zone = "example.com"_ctv;
+    wormhole.dns.name.snprintf<"inbound{}.example.com"_ctv>(uint64_t(index));
+    wormhole.dns.ttl = 60;
+    active->plan.wormholes.push_back(std::move(wormhole));
+  }
+  WormholePublicTLSConfig publicTLS = {};
+  publicTLS.wormholeName = active->plan.wormholes[0].name;
+  publicTLS.identityName = "operator-cancel-public"_ctv;
+  publicTLS.domains.push_back("inbound0.example.com"_ctv);
+  publicTLS.issuer = "letsencrypt"_ctv;
+  publicTLS.keyType = "ecdsa"_ctv;
+  publicTLS.renewAfterLifetimePermille = 750;
+  active->plan.publicTLS.push_back(publicTLS);
+  active->plan.advertisements.push_back(
+      Advertisement(uint64_t(0x6311), ContainerState::healthy,
+                    ContainerState::destroyed, 4343));
   active->state = DeploymentState::deploying;
-  successor->plan = makeDeploymentPlan(applicationID, successorVersionID);
-  successor->plan.stateless.nBase = 0;
-  successor->plan.canaryCount = 0;
+  successor->plan = active->plan;
+  successor->plan.config.versionID = successorVersionID;
   successor->state = DeploymentState::waitingToDeploy;
+
+  installCancellationCredentials(brain);
+  brain.brainConfig.acme.accountEmail = "ops@example.com"_ctv;
+  brain.brainConfig.acme.termsAgreed = true;
   active->next = successor;
   successor->previous = active;
   brain.deployments.insert_or_assign(activeDeploymentID, active);
@@ -23533,6 +23578,122 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
   brain.deploymentsByApp.insert_or_assign(applicationID, successor);
   brain.deploymentPlans.insert_or_assign(activeDeploymentID, active->plan);
   brain.deploymentPlans.insert_or_assign(successorDeploymentID, successor->plan);
+
+  RoutableResourceLease activeWormholeLease = {};
+  activeWormholeLease.kind = RoutableResourceLeaseKind::wormholeAddress;
+  activeWormholeLease.owner = deploymentRoutableResourceLeaseOwner(active->plan);
+  activeWormholeLease.owner.name = active->plan.wormholes[0].name;
+  activeWormholeLease.registeredPrefixUUID = active->plan.wormholes[0].routablePrefixUUID;
+  activeWormholeLease.address = active->plan.wormholes[0].externalAddress;
+  brain.routableResourceLeaseRuntimeState.push_back(activeWormholeLease);
+  RoutableResourceLease activeDNSLease = activeWormholeLease;
+  activeDNSLease.kind = RoutableResourceLeaseKind::dnsRecord;
+  activeDNSLease.dnsProvider = active->plan.wormholes[0].dns.provider;
+  activeDNSLease.dnsCredentialName = active->plan.wormholes[0].dns.credentialName;
+  activeDNSLease.dnsZone = active->plan.wormholes[0].dns.zone;
+  activeDNSLease.dnsName = active->plan.wormholes[0].dns.name;
+  suite.expect(wormholeDNSRecordType(active->plan.wormholes[0], activeDNSLease.dnsType),
+               "operator_cancellation_test_builds_dns_lease_type");
+  activeDNSLease.dnsTTL = active->plan.wormholes[0].dns.ttl;
+  activeDNSLease.dnsIntentRevision = 73;
+  brain.routableResourceLeaseRuntimeState.push_back(activeDNSLease);
+
+  PublicTlsCertificateSpec activeCertificateSpec = {};
+  String activeCertificateName = {};
+  String certificateFailure = {};
+  suite.expect(brain.buildPublicTlsCertificateSpecForDeployment(
+                   active->plan, active->plan.publicTLS[0], activeCertificateSpec,
+                   activeCertificateName, certificateFailure),
+               "operator_cancellation_test_builds_issued_public_tls_state");
+  PublicTlsCertificateState activeCertificate = {};
+  activeCertificate.spec = activeCertificateSpec;
+  activeCertificate.certbotCertName = activeCertificateName;
+  activeCertificate.identity.certPem = "issued-cert"_ctv;
+  activeCertificate.identity.keyPem = "issued-key"_ctv;
+  brain.masterAuthorityRuntimeState.publicTlsCertificates.push_back(std::move(activeCertificate));
+
+  const uint64_t dnsRevisionBeforePreflight = brain.masterAuthorityRuntimeState.nextDNSIntentRevision;
+  suite.expect(
+      brain.operatorCancellationResourcesCanTransfer(activeDeploymentID, active->plan, *successor),
+      "operator_cancellation_accepts_matching_inbound_tls_api_and_advertisement_contract");
+  suite.expect(brain.masterAuthorityRuntimeState.nextDNSIntentRevision == dnsRevisionBeforePreflight &&
+                   brain.routableResourceLeaseRuntimeState[1].owner.deploymentID == activeDeploymentID &&
+                   brain.masterAuthorityRuntimeState.publicTlsCertificates[0].spec.deploymentID == activeDeploymentID,
+               "operator_cancellation_preflight_is_pure_for_dns_and_issued_tls");
+  brain.routableResourceLeaseRuntimeState[1].dnsDeletePending = true;
+  suite.expect(brain.operatorCancellationResourcesCanTransfer(activeDeploymentID, active->plan, *successor) == false,
+               "operator_cancellation_rejects_pending_dns_delete_before_transfer");
+  brain.routableResourceLeaseRuntimeState[1].dnsDeletePending = false;
+  Brain::PendingDNSOperation pendingDNS = {};
+  pendingDNS.kind = Brain::PendingDNSOperationKind::lease;
+  pendingDNS.action = ProdigyBrainDNSOperationCoordinator::Action::upsert;
+  pendingDNS.lease = brain.routableResourceLeaseRuntimeState[1];
+  brain.pendingDNSOperations.insert_or_assign(0x6311, std::move(pendingDNS));
+  suite.expect(brain.operatorCancellationResourcesCanTransfer(activeDeploymentID, active->plan, *successor) == false,
+               "operator_cancellation_rejects_inflight_dns_operation_before_transfer");
+  brain.pendingDNSOperations.clear();
+  brain.masterAuthorityRuntimeState.publicTlsCertificates[0].pendingDNS01Challenges.push_back({});
+  suite.expect(brain.operatorCancellationResourcesCanTransfer(activeDeploymentID, active->plan, *successor) == false,
+               "operator_cancellation_rejects_pending_tls_cleanup_before_transfer");
+  brain.masterAuthorityRuntimeState.publicTlsCertificates[0].pendingDNS01Challenges.clear();
+  String activeCertificateRuntimeKey = Brain::publicTlsCertificateRuntimeKey(
+      brain.masterAuthorityRuntimeState.publicTlsCertificates[0]);
+  Brain::PublicTlsDNS01CleanupIntent cleanupIntent = {};
+  cleanupIntent.certificateKey = activeCertificateRuntimeKey;
+  brain.publicTlsDNS01CleanupIntents.push_back(std::move(cleanupIntent));
+  suite.expect(brain.operatorCancellationResourcesCanTransfer(activeDeploymentID, active->plan, *successor) == false,
+               "operator_cancellation_rejects_tls_cleanup_intent_before_transfer");
+  brain.publicTlsDNS01CleanupIntents.clear();
+  brain.publicTlsCertbotJobs.insert_or_assign(activeCertificateRuntimeKey, PublicTlsCertbotJob {});
+  suite.expect(brain.operatorCancellationResourcesCanTransfer(activeDeploymentID, active->plan, *successor) == false,
+               "operator_cancellation_rejects_active_tls_job_before_transfer");
+  brain.publicTlsCertbotJobs.clear();
+  PublicTlsCertificateSpec successorCertificateSpec = {};
+  String successorCertificateName = {};
+  String successorCertificateFailure = {};
+  suite.expect(brain.buildPublicTlsCertificateSpecForDeployment(
+                   successor->plan, successor->plan.publicTLS[0], successorCertificateSpec,
+                   successorCertificateName, successorCertificateFailure),
+               "operator_cancellation_test_builds_successor_tls_identity");
+  PublicTlsCertificateState conflictingCertificate = {};
+  conflictingCertificate.spec = successorCertificateSpec;
+  conflictingCertificate.certbotCertName = successorCertificateName;
+  conflictingCertificate.identity.certPem = "other-issued-cert"_ctv;
+  brain.masterAuthorityRuntimeState.publicTlsCertificates.push_back(std::move(conflictingCertificate));
+  suite.expect(brain.operatorCancellationResourcesCanTransfer(activeDeploymentID, active->plan, *successor) == false,
+               "operator_cancellation_rejects_conflicting_tls_runtime_identity");
+  brain.masterAuthorityRuntimeState.publicTlsCertificates.pop_back();
+  ApplicationDeployment changedSuccessor = {};
+  changedSuccessor.plan = successor->plan;
+  changedSuccessor.plan.wormholes[3].containerPort += 1;
+  suite.expect(
+      brain.operatorCancellationResourcesCanTransfer(activeDeploymentID, active->plan, changedSuccessor) == false,
+      "operator_cancellation_rejects_changed_inbound_wormhole_contract");
+  changedSuccessor.plan = successor->plan;
+  changedSuccessor.plan.wormholes[0].dns.name = "changed.example.com"_ctv;
+  suite.expect(
+      brain.operatorCancellationResourcesCanTransfer(activeDeploymentID, active->plan, changedSuccessor) == false,
+      "operator_cancellation_rejects_changed_dns_binding_contract");
+  changedSuccessor.plan = successor->plan;
+  changedSuccessor.plan.publicTLS[0].identityName = "changed-public-identity"_ctv;
+  suite.expect(
+      brain.operatorCancellationResourcesCanTransfer(activeDeploymentID, active->plan, changedSuccessor) == false,
+      "operator_cancellation_rejects_changed_public_tls_contract");
+  changedSuccessor.plan = successor->plan;
+  changedSuccessor.plan.apiCredentialPolicy.requiredCredentialNames.push_back("other-token"_ctv);
+  suite.expect(
+      brain.operatorCancellationResourcesCanTransfer(activeDeploymentID, active->plan, changedSuccessor) == false,
+      "operator_cancellation_rejects_changed_api_credential_contract");
+  changedSuccessor.plan = successor->plan;
+  changedSuccessor.plan.advertisements[0].port += 1;
+  suite.expect(
+      brain.operatorCancellationResourcesCanTransfer(activeDeploymentID, active->plan, changedSuccessor) == false,
+      "operator_cancellation_rejects_changed_advertisement_contract");
+  brain.apiCredentialSetsByApp.erase(applicationID);
+  suite.expect(
+      brain.operatorCancellationResourcesCanTransfer(activeDeploymentID, active->plan, *successor) == false,
+      "operator_cancellation_rejects_unavailable_successor_credential");
+  installCancellationCredentials(brain);
 
   ContainerView pendingHealth = {};
   pendingHealth.deploymentID = activeDeploymentID;
@@ -23616,6 +23777,15 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
   suite.expect(brain.deployments.contains(activeDeploymentID) == false &&
                    brain.deploymentsByApp[applicationID] == successor,
                "operator_cancellation_relinks_exact_successor_once");
+  suite.expect(brain.routableResourceLeaseRuntimeState.size() == 2 &&
+                   brain.routableResourceLeaseRuntimeState[0].owner.deploymentID == successorDeploymentID &&
+                   brain.routableResourceLeaseRuntimeState[0].owner.name.equals(successor->plan.wormholes[0].name) &&
+                   brain.routableResourceLeaseRuntimeState[1].owner.deploymentID == successorDeploymentID &&
+                   brain.routableResourceLeaseRuntimeState[1].dnsDeletePending == false,
+               "operator_cancellation_transfers_owned_wormhole_and_dns_leases_before_successor_launch");
+  suite.expect(brain.masterAuthorityRuntimeState.publicTlsCertificates.size() == 1 &&
+                   brain.masterAuthorityRuntimeState.publicTlsCertificates[0].spec.deploymentID == successorDeploymentID,
+               "operator_cancellation_transfers_issued_public_tls_before_successor_launch");
 
   CancelDeploymentResponse retryResponse = {};
   suite.expect(issueDeploymentLifecycleOperationForTest<MothershipTopic::cancelDeployment>(brain, mothership, request, retryResponse),
@@ -23671,21 +23841,33 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
   recovering.noMasterYet = false;
   ApplicationDeployment *recoveringActive = new ApplicationDeployment();
   ApplicationDeployment *recoveringSuccessor = new ApplicationDeployment();
-  recoveringActive->plan = makeDeploymentPlan(applicationID, activeVersionID);
-  recoveringActive->plan.stateless.nBase = 0;
-  recoveringActive->plan.canaryCount = 0;
+  recoveringActive->plan = brain.deploymentPlans[activeDeploymentID];
   recoveringActive->state = DeploymentState::failed;
-  recoveringSuccessor->plan = makeDeploymentPlan(applicationID, successorVersionID);
-  recoveringSuccessor->plan.stateless.nBase = 0;
-  recoveringSuccessor->plan.canaryCount = 0;
+  recoveringSuccessor->plan = brain.deploymentPlans[successorDeploymentID];
   recoveringSuccessor->state = DeploymentState::waitingToDeploy;
   recoveringActive->next = recoveringSuccessor;
   recoveringSuccessor->previous = recoveringActive;
+  installCancellationCredentials(recovering);
+  recovering.brainConfig.acme.accountEmail = "ops@example.com"_ctv;
+  recovering.brainConfig.acme.termsAgreed = true;
+  recovering.deploymentPlans.insert_or_assign(activeDeploymentID, recoveringActive->plan);
+  recovering.deploymentPlans.insert_or_assign(successorDeploymentID, recoveringSuccessor->plan);
+  RoutableResourceLease recoveringWormholeLease = brain.routableResourceLeaseRuntimeState[0];
+  recoveringWormholeLease.owner = deploymentRoutableResourceLeaseOwner(recoveringActive->plan);
+  recoveringWormholeLease.owner.name = recoveringActive->plan.wormholes[0].name;
+  recovering.routableResourceLeaseRuntimeState.push_back(std::move(recoveringWormholeLease));
+  RoutableResourceLease recoveringDNSLease = brain.routableResourceLeaseRuntimeState[1];
+  recoveringDNSLease.owner = deploymentRoutableResourceLeaseOwner(recoveringActive->plan);
+  recoveringDNSLease.owner.name = recoveringActive->plan.wormholes[0].name;
+  recovering.routableResourceLeaseRuntimeState.push_back(std::move(recoveringDNSLease));
+  PublicTlsCertificateState recoveringCertificate = brain.masterAuthorityRuntimeState.publicTlsCertificates[0];
+  recoveringCertificate.spec.deploymentID = activeDeploymentID;
+  recovering.masterAuthorityRuntimeState.publicTlsCertificates.push_back(std::move(recoveringCertificate));
   recovering.deployments.insert_or_assign(activeDeploymentID, recoveringActive);
   recovering.deployments.insert_or_assign(successorDeploymentID, recoveringSuccessor);
   recovering.deploymentsByApp.insert_or_assign(applicationID, recoveringSuccessor);
   FailedDeploymentRecord acceptedRecord = replicatedRecord;
-  acceptedRecord.cancellationPhase = CancelDeploymentPhase::accepted;
+  acceptedRecord.cancellationPhase = CancelDeploymentPhase::successorStarted;
   acceptedRecord.cancellationCompletedAtMs = 0;
   recovering.failedDeployments.insert_or_assign(activeDeploymentID, acceptedRecord);
   thisBrain = &recovering;
@@ -23695,7 +23877,24 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
                    recovering.deployments.contains(activeDeploymentID) == false &&
                    recovering.deploymentsByApp[applicationID] == recoveringSuccessor,
                "operator_cancellation_restart_resumes_forward_exactly_once");
+  suite.expect(recovering.routableResourceLeaseRuntimeState.size() == 2 &&
+                   recovering.routableResourceLeaseRuntimeState[0].owner.deploymentID == successorDeploymentID &&
+                   recovering.routableResourceLeaseRuntimeState[0].kind == RoutableResourceLeaseKind::wormholeAddress &&
+                   recovering.routableResourceLeaseRuntimeState[1].owner.deploymentID == successorDeploymentID &&
+                   recovering.routableResourceLeaseRuntimeState[1].kind == RoutableResourceLeaseKind::dnsRecord &&
+                   recovering.masterAuthorityRuntimeState.publicTlsCertificates.size() == 1 &&
+                   recovering.masterAuthorityRuntimeState.publicTlsCertificates[0].spec.deploymentID == successorDeploymentID,
+               "operator_cancellation_successor_started_restart_transfers_public_resources_once_before_launch");
+  recovering.resumeOperatorCancellations();
+  suite.expect(recovering.routableResourceLeaseRuntimeState.size() == 2 &&
+                   recovering.routableResourceLeaseRuntimeState[0].owner.deploymentID == successorDeploymentID &&
+                   recovering.routableResourceLeaseRuntimeState[1].owner.deploymentID == successorDeploymentID &&
+                   recovering.masterAuthorityRuntimeState.publicTlsCertificates.size() == 1 &&
+                   recovering.masterAuthorityRuntimeState.publicTlsCertificates[0].spec.deploymentID == successorDeploymentID,
+               "operator_cancellation_successor_started_restart_reentry_does_not_repeat_resource_transfer");
   recovering.failedDeployments.erase(activeDeploymentID);
+  recovering.deploymentPlans.erase(activeDeploymentID);
+  recovering.deploymentPlans.erase(successorDeploymentID);
   recovering.deploymentsByApp.erase(applicationID);
   recovering.deployments.erase(successorDeploymentID);
   delete recoveringSuccessor;
@@ -23712,6 +23911,8 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
   completedSuccessor->state = DeploymentState::waitingToDeploy;
   completedActive->next = completedSuccessor;
   completedSuccessor->previous = completedActive;
+  recovering.deploymentPlans.insert_or_assign(activeDeploymentID, completedActive->plan);
+  recovering.deploymentPlans.insert_or_assign(successorDeploymentID, completedSuccessor->plan);
   recovering.deployments.insert_or_assign(activeDeploymentID, completedActive);
   recovering.deployments.insert_or_assign(successorDeploymentID, completedSuccessor);
   recovering.deploymentsByApp.insert_or_assign(applicationID, completedSuccessor);
@@ -23721,6 +23922,8 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
                    recovering.deploymentsByApp[applicationID] == completedSuccessor,
                "operator_cancellation_completed_follower_takeover_removes_stale_active");
   recovering.failedDeployments.erase(activeDeploymentID);
+  recovering.deploymentPlans.erase(activeDeploymentID);
+  recovering.deploymentPlans.erase(successorDeploymentID);
   recovering.deploymentsByApp.erase(applicationID);
   recovering.deployments.erase(successorDeploymentID);
   delete completedSuccessor;

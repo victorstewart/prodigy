@@ -3879,10 +3879,13 @@ public:
     return true;
   }
 
-  bool transferPublicTlsCertificateToApplicationHead(PublicTlsCertificateState& certificate)
+  bool publicTlsCertificateCanTransferToDeployment(
+      const PublicTlsCertificateState& certificate, const DeploymentPlan& target,
+      PublicTlsCertificateSpec& transferredSpec, String& transferredCertName)
   {
-    auto appIt = deploymentsByApp.find(certificate.spec.applicationID);
-    if (appIt == deploymentsByApp.end() || appIt->second == nullptr || appIt->second->plan.config.deploymentID() == certificate.spec.deploymentID ||
+    transferredSpec = {};
+    transferredCertName.clear();
+    if (certificate.spec.deploymentID == target.config.deploymentID() ||
         certificate.pendingDNS01Challenges.empty() == false ||
         publicTlsDNS01CleanupIntentPendingForCertificate(publicTlsCertificateRuntimeKey(certificate)) ||
         publicTlsCertbotJobs.find(publicTlsCertificateRuntimeKey(certificate)) != publicTlsCertbotJobs.end())
@@ -3890,28 +3893,44 @@ public:
       return false;
     }
 
-    for (const WormholePublicTLSConfig& config : appIt->second->plan.publicTLS)
+    for (const WormholePublicTLSConfig& config : target.publicTLS)
     {
       PublicTlsCertificateSpec spec = {};
       String certName = {};
       String failure = {};
-      if (buildPublicTlsCertificateSpecForDeployment(appIt->second->plan, config, spec, certName, failure) == false ||
+      if (buildPublicTlsCertificateSpecForDeployment(target, config, spec, certName, failure) == false ||
           publicTlsCertificateTransferCompatible(certificate, spec) == false)
       {
         continue;
       }
-      String newKey = publicTlsCertificateRuntimeKey(spec, certName);
-      PublicTlsCertificateState *existing = findPublicTlsCertificateStateByRuntimeKey(newKey);
+      const String newKey = publicTlsCertificateRuntimeKey(spec, certName);
+      const PublicTlsCertificateState *existing = findPublicTlsCertificateStateByRuntimeKey(newKey);
       if (existing != nullptr && existing != &certificate)
       {
         return false;
       }
-      certificate.spec = spec;
-      certificate.certbotCertName = certName;
-      certificate.releasePending = false;
+      transferredSpec = std::move(spec);
+      transferredCertName = std::move(certName);
       return true;
     }
     return false;
+  }
+
+  bool transferPublicTlsCertificateToApplicationHead(PublicTlsCertificateState& certificate)
+  {
+    auto appIt = deploymentsByApp.find(certificate.spec.applicationID);
+    PublicTlsCertificateSpec transferredSpec = {};
+    String transferredCertName = {};
+    if (appIt == deploymentsByApp.end() || appIt->second == nullptr ||
+        publicTlsCertificateCanTransferToDeployment(certificate, appIt->second->plan,
+                                                    transferredSpec, transferredCertName) == false)
+    {
+      return false;
+    }
+    certificate.spec = std::move(transferredSpec);
+    certificate.certbotCertName = std::move(transferredCertName);
+    certificate.releasePending = false;
+    return true;
   }
 
   uint32_t releasePublicTlsCertificatesForDeployment(uint64_t deploymentID)
@@ -4514,6 +4533,67 @@ public:
     return true;
   }
 
+  bool routableResourceLeaseCanTransferToDeployment(
+      const RoutableResourceLease& lease, const DeploymentPlan& target,
+      RoutableResourceLease& transferred) const
+  {
+    if (lease.kind != RoutableResourceLeaseKind::wormholeAddress &&
+        lease.kind != RoutableResourceLeaseKind::dnsRecord)
+    {
+      return false;
+    }
+
+    RoutableResourceLeaseOwner owner = deploymentRoutableResourceLeaseOwner(target);
+    if (routableResourceLeaseOwnersCompatible(lease.owner, owner) == false)
+    {
+      return false;
+    }
+
+    for (const Wormhole& wormhole : target.wormholes)
+    {
+      if (wormhole.externalAddress.equals(lease.address) == false)
+      {
+        continue;
+      }
+      transferred = lease;
+      if (lease.kind == RoutableResourceLeaseKind::dnsRecord)
+      {
+        String dnsType = {};
+        if (wormhole.hasDNSConfig == false || wormholeDNSRecordType(wormhole, dnsType) == false)
+        {
+          continue;
+        }
+
+        RoutableResourceLease candidate = {};
+        candidate.kind = RoutableResourceLeaseKind::dnsRecord;
+        candidate.dnsProvider = wormhole.dns.provider;
+        candidate.dnsCredentialName = wormhole.dns.credentialName;
+        candidate.dnsZone = wormhole.dns.zone;
+        candidate.dnsName = wormhole.dns.name;
+        candidate.dnsType = dnsType;
+        candidate.dnsTTL = wormhole.dns.ttl;
+        if (routableResourceDNSIdentityMatches(lease, candidate) == false)
+        {
+          continue;
+        }
+
+        transferred.dnsProvider = candidate.dnsProvider;
+        transferred.dnsCredentialName = candidate.dnsCredentialName;
+        transferred.dnsZone = candidate.dnsZone;
+        transferred.dnsName = candidate.dnsName;
+        transferred.dnsType = candidate.dnsType;
+        transferred.dnsTTL = candidate.dnsTTL;
+      }
+
+      transferred.owner = owner;
+      transferred.owner.name = wormhole.name;
+      transferred.registeredPrefixUUID = wormhole.routablePrefixUUID;
+      transferred.address = wormhole.externalAddress;
+      return true;
+    }
+    return false;
+  }
+
   bool transferRoutableResourceLeaseToApplicationHead(RoutableResourceLease& lease)
   {
     if (lease.kind != RoutableResourceLeaseKind::wormholeAddress && lease.kind != RoutableResourceLeaseKind::whiteholeAddressPort && lease.kind != RoutableResourceLeaseKind::dnsRecord)
@@ -4527,14 +4607,13 @@ public:
       return false;
     }
 
-    RoutableResourceLeaseOwner owner = deploymentRoutableResourceLeaseOwner(appIt->second->plan);
-    if (routableResourceLeaseOwnersCompatible(lease.owner, owner) == false)
-    {
-      return false;
-    }
-
     if (lease.kind == RoutableResourceLeaseKind::whiteholeAddressPort)
     {
+      RoutableResourceLeaseOwner owner = deploymentRoutableResourceLeaseOwner(appIt->second->plan);
+      if (routableResourceLeaseOwnersCompatible(lease.owner, owner) == false)
+      {
+        return false;
+      }
       for (const auto& [shardGroup, containers] : appIt->second->containersByShardGroup)
       {
         (void)shardGroup;
@@ -4557,54 +4636,18 @@ public:
       return false;
     }
 
-    for (const Wormhole& wormhole : appIt->second->plan.wormholes)
+    RoutableResourceLease transferred = {};
+    if (routableResourceLeaseCanTransferToDeployment(lease, appIt->second->plan, transferred) == false)
     {
-      if (wormhole.externalAddress.equals(lease.address) == false)
-      {
-        continue;
-      }
-      if (lease.kind == RoutableResourceLeaseKind::dnsRecord)
-      {
-        String dnsType = {};
-        if (wormhole.hasDNSConfig == false || wormholeDNSRecordType(wormhole, dnsType) == false)
-        {
-          continue;
-        }
-
-        RoutableResourceLease candidate = {};
-        candidate.kind = RoutableResourceLeaseKind::dnsRecord;
-        candidate.dnsProvider = wormhole.dns.provider;
-        candidate.dnsCredentialName = wormhole.dns.credentialName;
-        candidate.dnsZone = wormhole.dns.zone;
-        candidate.dnsName = wormhole.dns.name;
-        candidate.dnsType = dnsType;
-        candidate.dnsTTL = wormhole.dns.ttl;
-        if (routableResourceDNSIdentityMatches(lease, candidate) == false)
-        {
-          continue;
-        }
-
-        lease.dnsProvider = candidate.dnsProvider;
-        lease.dnsCredentialName = candidate.dnsCredentialName;
-        lease.dnsZone = candidate.dnsZone;
-        lease.dnsName = candidate.dnsName;
-        lease.dnsType = candidate.dnsType;
-        lease.dnsTTL = candidate.dnsTTL;
-      }
-
-      lease.owner = owner;
-      lease.owner.name = wormhole.name;
-      lease.registeredPrefixUUID = wormhole.routablePrefixUUID;
-      lease.address = wormhole.externalAddress;
-      if (lease.kind == RoutableResourceLeaseKind::dnsRecord)
-      {
-        lease.dnsDeletePending = false;
-        lease.dnsIntentRevision = mintDNSIntentRevision();
-      }
-      return true;
+      return false;
     }
-
-    return false;
+    if (transferred.kind == RoutableResourceLeaseKind::dnsRecord)
+    {
+      transferred.dnsDeletePending = false;
+      transferred.dnsIntentRevision = mintDNSIntentRevision();
+    }
+    lease = std::move(transferred);
+    return true;
   }
 
   bool validateDNSBindingLease(RoutableResourceLease& lease, String& failure) const
@@ -28614,6 +28657,116 @@ public:
     return false;
   }
 
+  // Operator cancellation is intentionally narrower than ordinary roll-forward:
+  // it can retire only an unhealthy stateless head.  A named successor may keep
+  // its public contract, but may not use this recovery path to change it.
+  static bool operatorCancellationPublishedContractsMatch(
+      const DeploymentPlan& active, const DeploymentPlan& successor)
+  {
+    auto equalSerialized = []<typename T>(T lhs, T rhs) {
+      String serializedLhs = {};
+      String serializedRhs = {};
+      BitseryEngine::serialize(serializedLhs, lhs);
+      BitseryEngine::serialize(serializedRhs, rhs);
+      return serializedLhs.equals(serializedRhs);
+    };
+
+    if (active.wormholes.size() != successor.wormholes.size() ||
+        active.publicTLS.size() != successor.publicTLS.size() ||
+        active.advertisements.size() != successor.advertisements.size() ||
+        active.hasApiCredentialPolicy != successor.hasApiCredentialPolicy ||
+        active.hasTlsIssuancePolicy != successor.hasTlsIssuancePolicy)
+    {
+      return false;
+    }
+
+    Vector<Wormhole> activeWormholes = active.wormholes;
+    Vector<Wormhole> successorWormholes = successor.wormholes;
+    for (Wormhole& wormhole : activeWormholes)
+    {
+      // Rotated CID material is runtime state, not an inbound declaration.
+      wormhole.hasQuicCidKeyState = false;
+      wormhole.quicCidKeyState = {};
+    }
+    for (Wormhole& wormhole : successorWormholes)
+    {
+      wormhole.hasQuicCidKeyState = false;
+      wormhole.quicCidKeyState = {};
+    }
+    if (equalSerialized(activeWormholes, successorWormholes) == false ||
+        equalSerialized(active.publicTLS, successor.publicTLS) == false)
+    {
+      return false;
+    }
+
+    if (active.hasApiCredentialPolicy &&
+        equalSerialized(active.apiCredentialPolicy, successor.apiCredentialPolicy) == false)
+    {
+      return false;
+    }
+    if (active.hasTlsIssuancePolicy &&
+        equalSerialized(active.tlsIssuancePolicy, successor.tlsIssuancePolicy) == false)
+    {
+      return false;
+    }
+
+    return equalSerialized(active.advertisements, successor.advertisements);
+  }
+
+  bool operatorCancellationResourcesCanTransfer(
+      uint64_t activeDeploymentID, const DeploymentPlan& active,
+      const ApplicationDeployment& successor)
+  {
+    if (operatorCancellationPublishedContractsMatch(active, successor.plan) == false)
+    {
+      return false;
+    }
+
+    String credentialFailure = {};
+    if (deploymentApiCredentialsAvailableForLaunch(successor.plan, &credentialFailure) == false)
+    {
+      return false;
+    }
+
+    for (const RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
+    {
+      if (lease.owner.deploymentID != activeDeploymentID)
+      {
+        continue;
+      }
+      if (lease.kind == RoutableResourceLeaseKind::dnsRecord &&
+          (lease.dnsDeletePending || dnsRecordLeaseOperationPending(lease, ProdigyBrainDNSOperationCoordinator::Action::upsert) ||
+           dnsRecordLeaseOperationPending(lease, ProdigyBrainDNSOperationCoordinator::Action::remove)))
+      {
+        return false;
+      }
+      RoutableResourceLease transferred = {};
+      if (routableResourceLeaseCanTransferToDeployment(lease, successor.plan, transferred) == false)
+      {
+        return false;
+      }
+    }
+
+    // A pending certificate job or DNS-01 cleanup cannot be safely reassigned.
+    // Issued identities are already transferred to a compatible successor at
+    // plan admission; this check covers any old-owner state that remains.
+    for (const PublicTlsCertificateState& certificate : masterAuthorityRuntimeState.publicTlsCertificates)
+    {
+      if (certificate.spec.deploymentID != activeDeploymentID)
+      {
+        continue;
+      }
+      PublicTlsCertificateSpec transferredSpec = {};
+      String transferredCertName = {};
+      if (publicTlsCertificateCanTransferToDeployment(certificate, successor.plan,
+                                                       transferredSpec, transferredCertName) == false)
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
   static const char *operatorCancellationDevPhaseName(CancelDeploymentPhase phase)
   {
     switch (phase)
@@ -28851,6 +29004,19 @@ public:
     {
       return;
     }
+    auto resourcesCanTransferNow = [&]() {
+      const DeploymentPlan *activePlan = deployment ? &deployment->plan : nullptr;
+      if (activePlan == nullptr)
+      {
+        auto activePlanIt = deploymentPlans.find(deploymentID);
+        if (activePlanIt != deploymentPlans.end())
+        {
+          activePlan = &activePlanIt->second;
+        }
+      }
+      return activePlan != nullptr &&
+             operatorCancellationResourcesCanTransfer(deploymentID, *activePlan, *successor);
+    };
     if (deployment != nullptr && deployment->operatorCancellationFinalizationIsQuiescent() == false)
     {
       // A kill acknowledgement can arrive before the cancelled deployment's
@@ -28903,6 +29069,14 @@ public:
       }
     }
 
+    // The accepted record can outlive DNS/certbot work.  Validate again only
+    // after the durable successor intent, immediately before unlinking the old
+    // deployment or transferring any published resource.
+    if (resourcesCanTransferNow() == false)
+    {
+      return;
+    }
+
     if (deployment != nullptr)
     {
       ApplicationDeployment *previous = deployment->previous;
@@ -28919,10 +29093,25 @@ public:
         deployments.erase(deploymentIt);
       }
       delete deployment;
+      deployment = nullptr;
     }
 
     if (successor->state == DeploymentState::waitingToDeploy || successor->state == DeploymentState::none)
     {
+      // successorStarted is the durable intent.  Re-entering this path after a
+      // crash repeats the existing idempotent transfer before any successor
+      // launch, so an old resource owner can never be cleaned up underneath a
+      // new public endpoint.
+      if (resourcesCanTransferNow() == false)
+      {
+        return;
+      }
+      releaseRoutableResourceLeasesForDeployment(deploymentID);
+      if (deploymentHasRoutableResourceLease(deploymentID) ||
+          commitMasterAuthorityStateChange() == false)
+      {
+        return;
+      }
       successor->deploy();
     }
     if (alreadyCompleted)
@@ -31845,17 +32034,16 @@ public:
               activePlan.config.applicationID != request.applicationID ||
               activePlan.config.versionID != request.activeVersionID ||
               activePlan.config.type == ApplicationType::task || activePlan.isStateful ||
-              activePlan.wormholes.empty() == false || activePlan.publicTLS.empty() == false ||
-              activePlan.whiteholes.empty() == false || activePlan.advertisements.empty() == false ||
-              activePlan.useHostNetworkNamespace || activePlan.hasTlsIssuancePolicy || activePlan.hasApiCredentialPolicy;
+              activePlan.whiteholes.empty() == false || activePlan.useHostNetworkNamespace;
           if (unsafeActivePlan || activeTransitioning == false || deployment->nHealthy() != 0 ||
               deployment->next != successor || successor->previous != deployment ||
               successor->plan.config.applicationID != request.applicationID ||
               successor->plan.config.versionID != request.successorVersionID ||
               successor->plan.config.type == ApplicationType::task || successor->plan.isStateful ||
+              successor->plan.whiteholes.empty() == false || successor->plan.useHostNetworkNamespace ||
               successor->state != DeploymentState::waitingToDeploy || successor->containers.empty() == false ||
               deployment->operatorCancellationTransitionIsSafe() == false ||
-              deploymentHasRoutableResourceLease(cancelledID))
+              operatorCancellationResourcesCanTransfer(cancelledID, deployment->plan, *successor) == false)
           {
             reject("cancelDeployment safety precondition failed");
             break;
