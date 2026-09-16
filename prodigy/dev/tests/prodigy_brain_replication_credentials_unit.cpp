@@ -23163,6 +23163,76 @@ static void testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(Tes
                "update_self_recovery_witness_current_acks_allow_three_brain_master_relinquish");
 }
 
+static void testAllMachineRecoveryWitnessRetainsReplicationAcknowledgement(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+  ProdigyMasterAuthorityRuntimeState state = {};
+  state.generation = 1;
+  state.nextPendingAddMachinesOperationID = 1;
+  state.nextPendingElasticAddressOperationID = 1;
+  state.nextDNSIntentRevision = 1;
+  state.nextTlsResumptionGeneration = 1;
+  state.updateSelf.workerExpectedBundleSHA256 =
+      "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv;
+  for (uint128_t machineUUID : {uint128_t(0x521c0001), uint128_t(0x521c0002), uint128_t(0x521c0003)})
+  {
+    ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
+    witness.machineUUID = machineUUID;
+    witness.containerBootstraps.push_back("captured-bootstrap"_ctv);
+    state.updateSelf.machineRecoveryWitnesses.push_back(std::move(witness));
+  }
+
+  TestBrain master = {};
+  BrainView followerPeer = {};
+  followerPeer.connected = true;
+  followerPeer.isFixedFile = true;
+  followerPeer.fslot = 91;
+  followerPeer.registrationFresh = true;
+  followerPeer.uuid = uint128_t(0x521c0002);
+  followerPeer.boottimens = 52'102;
+  String serialized = {};
+  BrainConfig config = {};
+  config.clusterUUID = uint128_t(0x521c0100);
+  serializeMasterAuthorityTransition(serialized, state, config);
+  String digest = {};
+  suite.require(prodigyComputeSHA256Hex(serialized, digest),
+                "all_machine_recovery_ack_tracking_digest_fixture");
+  master.noteMasterAuthorityTransitionSentToPeer(&followerPeer, state, digest);
+  suite.expect(master.masterAuthorityReplicationByPeer.contains(&followerPeer),
+               "all_machine_recovery_witness_retains_master_ack_tracking");
+
+  TestBrain follower = {};
+  ElasticPrefixBrainIaaS followerIaaS = {};
+  follower.iaas = &followerIaaS;
+  BrainView currentMaster = {};
+  authorizeMasterPeerForTest(follower, currentMaster, 92, uint128_t(0x521c0001), 52'101);
+  TestNeuron followerSelf = {};
+  followerSelf.uuid = uint128_t(0x521c0002);
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &followerSelf;
+  follower.boottimens = 52'102;
+  String messageBuffer = {};
+  follower.brainHandler(
+      &currentMaster,
+      buildBrainMessage(messageBuffer, BrainTopic::replicateMasterAuthorityState, serialized));
+
+  ProdigyMasterAuthorityStateTransitionAck acknowledgement = {};
+  bool decodedAck = false;
+  forEachMessageInBuffer(currentMaster.wBuffer, [&](Message *message) {
+    if (BrainTopic(message->topic) != BrainTopic::replicateMasterAuthorityState) return;
+    uint8_t *args = message->args;
+    String serializedAck = {};
+    Message::extractToStringView(args, serializedAck);
+    decodedAck = BitseryEngine::deserializeSafe(serializedAck, acknowledgement);
+  });
+  suite.expect(decodedAck && acknowledgement.generation == state.generation &&
+                   acknowledgement.peerUUID == followerSelf.uuid &&
+                   acknowledgement.peerBootNs == follower.boottimens &&
+                   acknowledgement.transitionDigest.equals(digest),
+               "all_machine_recovery_witness_follower_acks_durable_transition");
+  thisNeuron = previousNeuron;
+}
+
 static void testBrainNeuronHandlerReportsHardwareFailureAndDecommissionsMachine(TestSuite& suite)
 {
   TestBrain brain = {};
@@ -25113,6 +25183,7 @@ int main(void)
     testReplicatedAllMachineBundleRecoveryWitnessIsUUIDIndexed(suite);
     testReplicatedLocalBundleRecoveryWitnessIsDurableAndBounded(suite);
     testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(suite);
+    testAllMachineRecoveryWitnessRetainsReplicationAcknowledgement(suite);
     testBrainNeuronRegistrationKeepsHealthyRuntimeReadyWithoutRefresh(suite);
     testBrainNeuronRegistrationRefreshesWorkerAfterBundleTransition(suite);
     testPersistedLocalBrainRefreshBypassesIgnition(suite);
