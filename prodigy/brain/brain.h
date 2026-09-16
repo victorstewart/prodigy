@@ -7175,7 +7175,12 @@ public:
       armWormholeRuntimeAckDeadline(container);
     }
 
-    if (weAreMaster)
+    // A promoted Brain receives retained runtime state before every captured
+    // Neuron inventory has attested.  Recovery may otherwise discard a
+    // temporarily-unready stateless host and schedule a duplicate beside it.
+    // recoverDeploymentsAfterNeuronState owns the one resume after the exact
+    // persisted-inventory barrier clears.
+    if (weAreMaster && recoveringPersistedNeuronInventory == false)
     {
       deployment->recoverAfterReboot();
     }
