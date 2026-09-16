@@ -16,6 +16,7 @@
 #include <prodigy/quic.cid.generator.h>
 
 #include <cstdio>
+#include <fcntl.h>
 #include <cstdlib>
 #include <cstring>
 #include <array>
@@ -2708,6 +2709,234 @@ static void verifyWhiteholeBindingValue(TestSuite& suite)
   suite.expect(value.container.value[1] == 0x02 && value.container.value[2] == 0x03 && value.container.value[3] == 0x04 && value.container.value[4] == 0x01, "switchboard_whitehole_binding_sets_container_suffix");
 }
 
+static bool socketIPv4Address(int fd, sockaddr_in& address)
+{
+  socklen_t length = sizeof(address);
+  std::memset(&address, 0, sizeof(address));
+  return getsockname(fd, reinterpret_cast<sockaddr *>(&address), &length) == 0 && length == sizeof(address);
+}
+
+static bool setNonblocking(int fd)
+{
+  int flags = fcntl(fd, F_GETFL, 0);
+  return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
+static bool configureHostedIPv4Route(BPFProgram& program, uint32_t address)
+{
+  mac localMAC = {};
+  localMAC.mac[0] = 0x02;
+  localMAC.mac[1] = 0x42;
+  localMAC.mac[2] = 0xac;
+  localMAC.mac[3] = 0x11;
+  localMAC.mac[4] = 0x00;
+  localMAC.mac[5] = 0x0a;
+  mac gatewayMAC = localMAC;
+  gatewayMAC.mac[5] = 0x01;
+  program.setArrayElement("mac_map"_ctv, 0, localMAC);
+  program.setArrayElement("gw_mac_map"_ctv, 0, gatewayMAC);
+
+  constexpr uint32_t machineFragment = 0x000002u;
+  switchboard_overlay_hosted_ingress_route4 hosted = {};
+  hosted.machine_fragment = machineFragment;
+  switchboard_overlay_prefix4_key hostedKey = {};
+  hostedKey.prefixlen = 32;
+  hostedKey.addr = address;
+  switchboard_overlay_machine_route route = {};
+  route.family = SWITCHBOARD_OVERLAY_ROUTE_FAMILY_IPV6;
+  route.use_gateway_mac = 1;
+  parseIPv6Bytes("fd00:10::a", route.source6);
+  parseIPv6Bytes("fd00:10::b", route.next_hop6);
+  switchboard_overlay_machine_route_key routeKey = switchboardMakeOverlayMachineRouteKey(machineFragment);
+  return updateProgramMapElement(program, "ovl_host4"_ctv, hostedKey, hosted) &&
+         updateProgramMapElement(program, "ovl_mach_full"_ctv, routeKey, route);
+}
+
+static bool runHostedSocketFrame(BPFProgram& program, const std::vector<uint8_t>& frame, bool expectLocalPass)
+{
+  std::vector<uint8_t> output(frame.size() + sizeof(struct ipv6hdr) + 64u);
+  LIBBPF_OPTS(bpf_test_run_opts, opts,
+              .data_in = frame.data(),
+              .data_out = output.data(),
+              .data_size_in = static_cast<__u32>(frame.size()),
+              .data_size_out = static_cast<__u32>(output.size()),
+              .repeat = 1, );
+  if (bpf_prog_test_run_opts(program.prog_fd, &opts) != 0)
+  {
+    return false;
+  }
+  if (expectLocalPass)
+  {
+    return opts.retval == TC_ACT_OK && opts.data_size_out == frame.size();
+  }
+  return opts.retval == TC_ACT_OK && opts.data_size_out == frame.size() + sizeof(struct ipv6hdr);
+}
+
+static void exerciseHostIngressHostedSocketException(TestSuite& suite)
+{
+  const char *label = "switchboard_host_ingress_hosted_socket_exception";
+  auto expectNamed = [&](bool condition, const char *suffix) -> void {
+    char name[160] = {};
+    std::snprintf(name, sizeof(name), "%s_%s", label, suffix);
+    suite.expect(condition, name);
+  };
+
+  String ingressObjectPath = {};
+  ingressObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+  ingressObjectPath.append("/host.ingress.router.ebpf.o"_ctv);
+  BPFProgram ingress = {};
+  expectNamed(ingress.load(ingressObjectPath, "host_ingress"_ctv), "loads_program");
+  if (ingress.prog_fd < 0)
+  {
+    return;
+  }
+
+  int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  expectNamed(listener >= 0 && client >= 0, "opens_tcp_pair");
+  sockaddr_in loopback = {};
+  loopback.sin_family = AF_INET;
+  loopback.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (listener < 0 || client < 0 || bind(listener, reinterpret_cast<sockaddr *>(&loopback), sizeof(loopback)) != 0 ||
+      listen(listener, 1) != 0 || socketIPv4Address(listener, loopback) == false ||
+      connect(client, reinterpret_cast<sockaddr *>(&loopback), sizeof(loopback)) != 0)
+  {
+    expectNamed(false, "establishes_tcp_pair");
+    if (listener >= 0) close(listener);
+    if (client >= 0) close(client);
+    ingress.close();
+    return;
+  }
+  int accepted = accept4(listener, nullptr, nullptr, SOCK_CLOEXEC);
+  sockaddr_in clientAddress = {};
+  expectNamed(accepted >= 0 && socketIPv4Address(client, clientAddress), "establishes_tcp_pair");
+  if (accepted >= 0)
+  {
+    expectNamed(configureHostedIPv4Route(ingress, clientAddress.sin_addr.s_addr), "sets_tcp_hosted_route");
+    std::vector<uint8_t> reply = makeIPv4L4EthernetFrame(loopback.sin_addr, clientAddress.sin_addr,
+                                                           IPPROTO_TCP, ntohs(loopback.sin_port), ntohs(clientAddress.sin_port));
+    expectNamed(runHostedSocketFrame(ingress, reply, true), "passes_established_tcp_reply");
+    struct tcp_info closingInfo = {};
+    socklen_t closingInfoLength = sizeof(closingInfo);
+    bool closing = shutdown(client, SHUT_WR) == 0 &&
+                   getsockopt(client, IPPROTO_TCP, TCP_INFO, &closingInfo, &closingInfoLength) == 0 &&
+                   (closingInfo.tcpi_state == BPF_TCP_FIN_WAIT1 || closingInfo.tcpi_state == BPF_TCP_FIN_WAIT2);
+    expectNamed(closing, "enters_tcp_fin_wait");
+    if (closing)
+    {
+      expectNamed(runHostedSocketFrame(ingress, reply, true), "passes_tcp_fin_wait_reply");
+    }
+    sockaddr_in unrelated = {};
+    inet_pton(AF_INET, "198.18.0.77", &unrelated.sin_addr);
+    unrelated.sin_port = htons(443);
+    std::vector<uint8_t> listenerPacket = makeIPv4L4EthernetFrame(unrelated.sin_addr, loopback.sin_addr,
+                                                                    IPPROTO_TCP, ntohs(unrelated.sin_port), ntohs(loopback.sin_port));
+    expectNamed(runHostedSocketFrame(ingress, listenerPacket, false), "does_not_pass_tcp_listener");
+
+    local_container_subnet6 subnet = {};
+    subnet.dpfx = 0x01;
+    subnet.mpfx[0] = 0x52;
+    subnet.mpfx[1] = 0xdf;
+    subnet.mpfx[2] = 0x39;
+    constexpr uint8_t fragment = 0x4e;
+    uint32_t redirectIfindex = 93;
+    ingress.setArrayElement("lc_subnet"_ctv, 0, subnet);
+    ingress.setArrayElement("ct_dev_map"_ctv, fragment, redirectIfindex);
+    uint8_t containerID[5] = {subnet.dpfx, subnet.mpfx[0], subnet.mpfx[1], subnet.mpfx[2], fragment};
+    portal_meta portalMeta = {};
+    portalMeta.slot = 29;
+    portal_definition portal = {};
+    portal.addr4 = clientAddress.sin_addr.s_addr;
+    portal.port = clientAddress.sin_port;
+    portal.proto = IPPROTO_TCP;
+    switchboard_wormhole_target_key targetKey = {};
+    targetKey.slot = portalMeta.slot;
+    std::memcpy(targetKey.container, containerID, sizeof(containerID));
+    uint16_t targetPort = htons(8443);
+    expectNamed(installSingleContainerPortalRing(ingress, portalMeta.slot, containerID) &&
+                    updateProgramMapElement(ingress, "ext_portals"_ctv, portal, portalMeta) &&
+                    updateProgramMapElement(ingress, "wh_targets"_ctv, targetKey, targetPort) &&
+                    installWormholeExposure(ingress, portal, false, containerID, targetPort, portalMeta.slot + 1u),
+                "installs_portal_before_socket_exception");
+    std::vector<uint8_t> portalOutput(reply.size());
+    LIBBPF_OPTS(bpf_test_run_opts, portalOpts,
+                .data_in = reply.data(),
+                .data_out = portalOutput.data(),
+                .data_size_in = static_cast<__u32>(reply.size()),
+                .data_size_out = static_cast<__u32>(portalOutput.size()),
+                .repeat = 1, );
+    expectNamed(bpf_prog_test_run_opts(ingress.prog_fd, &portalOpts) == 0 && portalOpts.retval == TC_ACT_REDIRECT,
+                "portal_precedes_socket_exception");
+    close(accepted);
+  }
+  close(client);
+  close(listener);
+
+  int udp = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  sockaddr_in remote = {};
+  remote.sin_family = AF_INET;
+  inet_pton(AF_INET, "198.18.0.77", &remote.sin_addr);
+  remote.sin_port = htons(443);
+  sockaddr_in udpAddress = {};
+  sockaddr_in udpLocal = {};
+  udpLocal.sin_family = AF_INET;
+  inet_pton(AF_INET, "198.18.0.1", &udpLocal.sin_addr);
+  bool connectedUDP = udp >= 0 && bind(udp, reinterpret_cast<sockaddr *>(&udpLocal), sizeof(udpLocal)) == 0 &&
+                      connect(udp, reinterpret_cast<sockaddr *>(&remote), sizeof(remote)) == 0 &&
+                      socketIPv4Address(udp, udpAddress);
+  expectNamed(connectedUDP, "opens_connected_udp_socket");
+  if (connectedUDP)
+  {
+    expectNamed(configureHostedIPv4Route(ingress, udpAddress.sin_addr.s_addr), "sets_udp_hosted_route");
+    std::vector<uint8_t> reply = makeIPv4L4EthernetFrame(remote.sin_addr, udpAddress.sin_addr,
+                                                           IPPROTO_UDP, ntohs(remote.sin_port), ntohs(udpAddress.sin_port));
+    expectNamed(runHostedSocketFrame(ingress, reply, true), "passes_connected_udp_reply");
+  }
+  if (udp >= 0) close(udp);
+
+  int udpListener = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  std::memset(&loopback, 0, sizeof(loopback));
+  loopback.sin_family = AF_INET;
+  loopback.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  sockaddr_in udpListenerAddress = {};
+  bool unconnectedUDP = udpListener >= 0 && bind(udpListener, reinterpret_cast<sockaddr *>(&loopback), sizeof(loopback)) == 0 &&
+                        socketIPv4Address(udpListener, udpListenerAddress);
+  expectNamed(unconnectedUDP, "opens_unconnected_udp_listener");
+  if (unconnectedUDP)
+  {
+    expectNamed(configureHostedIPv4Route(ingress, udpListenerAddress.sin_addr.s_addr), "sets_listener_hosted_route");
+    std::vector<uint8_t> reply = makeIPv4L4EthernetFrame(remote.sin_addr, udpListenerAddress.sin_addr,
+                                                           IPPROTO_UDP, ntohs(remote.sin_port), ntohs(udpListenerAddress.sin_port));
+    expectNamed(runHostedSocketFrame(ingress, reply, false), "does_not_pass_unconnected_udp_listener");
+  }
+  if (udpListener >= 0) close(udpListener);
+
+  int pending = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  sockaddr_in pendingLocal = {};
+  pendingLocal.sin_family = AF_INET;
+  inet_pton(AF_INET, "198.18.0.1", &pendingLocal.sin_addr);
+  sockaddr_in pendingRemote = remote;
+  pendingRemote.sin_port = htons(444);
+  struct tcp_info pendingInfo = {};
+  socklen_t pendingInfoLength = sizeof(pendingInfo);
+  bool pendingStarted = pending >= 0 && bind(pending, reinterpret_cast<sockaddr *>(&pendingLocal), sizeof(pendingLocal)) == 0 &&
+                        setNonblocking(pending) && connect(pending, reinterpret_cast<sockaddr *>(&pendingRemote), sizeof(pendingRemote)) < 0 &&
+                        errno == EINPROGRESS && socketIPv4Address(pending, pendingLocal) &&
+                        getsockopt(pending, IPPROTO_TCP, TCP_INFO, &pendingInfo, &pendingInfoLength) == 0 &&
+                        pendingInfo.tcpi_state == BPF_TCP_SYN_SENT;
+  expectNamed(pendingStarted, "opens_syn_sent_tcp_socket");
+  if (pendingStarted)
+  {
+    expectNamed(configureHostedIPv4Route(ingress, pendingLocal.sin_addr.s_addr), "sets_syn_sent_hosted_route");
+    std::vector<uint8_t> reply = makeIPv4L4EthernetFrame(pendingRemote.sin_addr, pendingLocal.sin_addr,
+                                                           IPPROTO_TCP, ntohs(pendingRemote.sin_port), ntohs(pendingLocal.sin_port));
+    expectNamed(runHostedSocketFrame(ingress, reply, true), "passes_syn_sent_tcp_reply");
+  }
+  if (pending >= 0) close(pending);
+
+  ingress.close();
+}
+
 int main(int argc, char **argv)
 {
   if (argc == 2 && std::strcmp(argv[1], "--development-map-allocation-only") == 0)
@@ -3125,6 +3354,7 @@ int main(int argc, char **argv)
   exerciseHostIngressHostedIngressRoute(suite, false, IPPROTO_TCP);
   exerciseHostIngressHostedIngressRoute(suite, true, IPPROTO_UDP);
   exerciseHostIngressHostedIngressRoute(suite, true, IPPROTO_TCP);
+  exerciseHostIngressHostedSocketException(suite);
   exerciseHostIngressRemotePortalRoute(suite, false, IPPROTO_UDP, false);
   exerciseHostIngressRemotePortalRoute(suite, false, IPPROTO_TCP, true);
   exerciseHostIngressRemotePortalRoute(suite, true, IPPROTO_UDP, false);
