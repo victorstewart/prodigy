@@ -12646,11 +12646,10 @@ public:
     return std::max<int64_t>(brain->connectTimeoutMs, 1);
   }
 
-  bool staleDisconnectedFixedFileBrainPeer(BrainView *brain)
+  bool staleDisconnectedBrainPeer(BrainView *brain)
   {
     if (brain == nullptr ||
-        brain->isFixedFile == false ||
-        brain->fslot < 0 ||
+        (brain->isFixedFile ? brain->fslot < 0 : brain->fd < 0) ||
         brain->connected ||
         brain->pendingSend ||
         brain->pendingRecv ||
@@ -12671,13 +12670,14 @@ public:
       return;
     }
 
-    if (staleDisconnectedFixedFileBrainPeer(brain))
+    if (staleDisconnectedBrainPeer(brain))
     {
-      basics_log("brain reconnect abandoning stale fixedfile private4=%u reason=%s fd=%d fslot=%d quarantined=%d reconnectAfterClose=%d\n",
+      basics_log("brain reconnect abandoning stale transport private4=%u reason=%s fd=%d fslot=%d isFixed=%d quarantined=%d reconnectAfterClose=%d\n",
                  brain->private4,
                  (reason ? reason : "unspecified"),
                  brain->fd,
                  brain->fslot,
+                 int(brain->isFixedFile),
                  int(brain->quarantined),
                  int(brain->reconnectAfterClose));
       abandonSocketGeneration(brain);
@@ -12731,13 +12731,14 @@ public:
       return;
     }
 
-    if (staleDisconnectedFixedFileBrainPeer(brain))
+    if (staleDisconnectedBrainPeer(brain))
     {
-      basics_log("brain reconnect waiter abandoning stale fixedfile private4=%u reason=%s fd=%d fslot=%d quarantined=%d reconnectAfterClose=%d\n",
+      basics_log("brain reconnect waiter abandoning stale transport private4=%u reason=%s fd=%d fslot=%d isFixed=%d quarantined=%d reconnectAfterClose=%d\n",
                  brain->private4,
                  (reason ? reason : "unspecified"),
                  brain->fd,
                  brain->fslot,
+                 int(brain->isFixedFile),
                  int(brain->quarantined),
                  int(brain->reconnectAfterClose));
       abandonSocketGeneration(brain);
@@ -16770,7 +16771,7 @@ public:
     {
       if (brain->fslot >= 0)
       {
-        if (staleDisconnectedFixedFileBrainPeer(brain))
+        if (staleDisconnectedBrainPeer(brain))
         {
           PRODIGY_DEBUG_LOG(
                        "prodigy brain init-peer-stale-fixedfile private4=%u fd=%d isFixed=%d fslot=%d\n",
@@ -16796,14 +16797,28 @@ public:
     }
     else if (brain->fd >= 0)
     {
-      PRODIGY_DEBUG_LOG(
-                   "prodigy brain init-peer-skip reason=fd-present private4=%u fd=%d isFixed=%d fslot=%d\n",
-                   unsigned(brain->private4),
-                   brain->fd,
-                   int(brain->isFixedFile),
-                   brain->fslot);
-      PRODIGY_DEBUG_FLUSH();
-      return;
+      if (staleDisconnectedBrainPeer(brain))
+      {
+        PRODIGY_DEBUG_LOG(
+                     "prodigy brain init-peer-stale-direct-fd private4=%u fd=%d isFixed=%d fslot=%d\n",
+                     unsigned(brain->private4),
+                     brain->fd,
+                     int(brain->isFixedFile),
+                     brain->fslot);
+        PRODIGY_DEBUG_FLUSH();
+        abandonSocketGeneration(brain);
+      }
+      else
+      {
+        PRODIGY_DEBUG_LOG(
+                     "prodigy brain init-peer-skip reason=fd-present private4=%u fd=%d isFixed=%d fslot=%d\n",
+                     unsigned(brain->private4),
+                     brain->fd,
+                     int(brain->isFixedFile),
+                     brain->fslot);
+        PRODIGY_DEBUG_FLUSH();
+        return;
+      }
     }
 
     uint32_t connectAttemptTimeMs = BrainBase::machineInitialConnectAttemptTimeMs(
