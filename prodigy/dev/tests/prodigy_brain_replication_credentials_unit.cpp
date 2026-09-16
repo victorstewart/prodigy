@@ -9503,6 +9503,63 @@ static void testUpdateSelfPeerTrackingUsesKnownUUIDsAndUnambiguousLegacyKeys(Tes
   thisNeuron = previousNeuron;
 }
 
+static void testSharedPrivate4PeersParticipateInQuorumAndElectOneMaster(TestSuite& suite)
+{
+  NeuronBase *previousNeuron = thisNeuron;
+  const uint128_t identities[] = {0x7700, 0x7701, 0x7702};
+  uint32_t preferredMasters = 0;
+  for (uint128_t identity : identities)
+  {
+    TestBrain brain = {};
+    TestNeuron self = {};
+    self.uuid = identity;
+    self.private4 = IPAddress("10.0.2.15", false);
+    thisNeuron = &self;
+    brain.nBrains = 3;
+    brain.boottimens = 10;
+
+    BrainView peers[2];
+    uint32_t index = 0;
+    for (uint128_t peerIdentity : identities)
+    {
+      if (peerIdentity == identity) continue;
+      BrainView& peer = peers[index];
+      peer.uuid = peerIdentity;
+      peer.private4 = self.private4.v4;
+      peer.boottimens = 20;
+      peer.connected = true;
+      peer.registrationFresh = true;
+      peer.isFixedFile = true;
+      peer.fslot = 71 + index++;
+      brain.brains.insert(&peer);
+      suite.expect(brain.peerEligibleForClusterQuorum(&peer),
+                   "shared_private4_known_remote_uuid_counts_for_quorum");
+    }
+
+    suite.expect(brain.hasConnectedBrainMajority(),
+                 "shared_private4_registered_cluster_has_connected_majority");
+    suite.expect(brain.deriveRegisteredMasterUUID() == identities[0],
+                 "shared_private4_initial_election_agrees_on_one_uuid");
+    bool preferSelf = false;
+    bool sawActivePeer = false;
+    suite.expect(brain.resolveFailoverMasterByActivePeerAddressOrder(preferSelf, &sawActivePeer) && sawActivePeer,
+                 "shared_private4_failover_compares_registered_peers");
+    suite.expect(preferSelf == (identity == identities[0]),
+                 "shared_private4_failover_breaks_address_ties_by_uuid");
+    preferredMasters += preferSelf;
+
+    peers[0].uuid = self.uuid;
+    suite.expect(brain.peerEligibleForClusterQuorum(&peers[0]) == false,
+                 "shared_private4_same_uuid_still_excludes_self");
+    peers[0].uuid = 0;
+    suite.expect(brain.peerEligibleForClusterQuorum(&peers[0]) == false,
+                 "shared_private4_unknown_uuid_retains_legacy_self_guard");
+    brain.brains.clear();
+  }
+  suite.expect(preferredMasters == 1, "shared_private4_failover_has_exactly_one_preferred_master");
+  thisNeuron = previousNeuron;
+}
+
 static void testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(TestSuite& suite)
 {
   ScopedRing scopedRing = {};
@@ -23995,6 +24052,7 @@ int main(void)
       only != nullptr && strcmp(only, "update-peer-identity") == 0)
   {
     testUpdateSelfPeerTrackingUsesKnownUUIDsAndUnambiguousLegacyKeys(suite);
+    testSharedPrivate4PeersParticipateInQuorumAndElectOneMaster(suite);
     testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(suite);
     testUpdateSelfPeerRegistrationCreditsBootNsChange(suite);
     testUpdateSelfPeerRegistrationCreditsReconnectWithoutBootNsChange(suite);
@@ -24193,6 +24251,7 @@ int main(void)
   testApplyReplicatedDeploymentPlanCleansTlsResumptionState(suite);
   testBrainBundleExecRetryRoutesThroughDispatcher(suite);
   testUpdateSelfPeerTrackingUsesKnownUUIDsAndUnambiguousLegacyKeys(suite);
+  testSharedPrivate4PeersParticipateInQuorumAndElectOneMaster(suite);
   testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(suite);
   testUpdateSelfPeerRegistrationCreditsBootNsChange(suite);
   testUpdateSelfPeerRegistrationCreditsReconnectWithoutBootNsChange(suite);
