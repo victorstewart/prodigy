@@ -22758,6 +22758,117 @@ static void testLocalBundleRecoveryWaitsForCapturedInventory(TestSuite& suite)
   thisBrain = previousBrain;
 }
 
+static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+  TestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.ignited = true;
+  brain.recoveringPersistedNeuronInventory = true;
+  brain.brainConfig.datacenterFragment = 1;
+
+  BrainBase *previousBrain = thisBrain;
+  thisBrain = &brain;
+
+  Machine machine = {};
+  machine.uuid = uint128_t(0x5219f001);
+  machine.state = MachineState::healthy;
+  machine.runtimeReady = false;
+  machine.fragment = 0x120101;
+  machine.neuron.machine = &machine;
+  machine.neuron.isFixedFile = true;
+  machine.neuron.fslot = 9;
+  machine.neuron.connected = true;
+  brain.machines.insert(&machine);
+  brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+  brain.neurons.insert(&machine.neuron);
+
+  ApplicationDeployment deployment = {};
+  deployment.plan = makeDeploymentPlan(52'190, 1);
+  deployment.plan.stateless.nBase = 1;
+  deployment.nTargetBase = 1;
+  deployment.state = DeploymentState::running;
+  brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+  brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
+
+  ContainerView retained = {};
+  retained.uuid = uint128_t(0x5219f002);
+  retained.deploymentID = deployment.plan.config.deploymentID();
+  retained.applicationID = deployment.plan.config.applicationID;
+  retained.machine = &machine;
+  retained.lifetime = ApplicationLifetime::base;
+  retained.state = ContainerState::healthy;
+  retained.fragment = 2;
+  retained.createdAtMs = 1;
+
+  BrainReplicatedContainerRuntimeState runtime = {};
+  runtime.machineUUID = machine.uuid;
+  runtime.machinePrivate4 = machine.private4;
+  runtime.plan = retained.generatePlan(deployment.plan);
+  Vector<Wormhole> desired = {};
+  BitseryEngine::serialize(runtime.wormholeRuntimeDesired, desired);
+  suite.require(prodigyComputeWormholeDesiredStateRevision(retained.generateContainerID(),
+                                                           runtime.wormholeRuntimeDesired,
+                                                           runtime.wormholeRuntimeRevision),
+                "persisted_inventory_runtime_builds_empty_wormhole_revision");
+
+  brain.applyReplicatedContainerRuntimeState(runtime);
+  auto restored = brain.containers.find(retained.uuid);
+  suite.expect(restored != brain.containers.end() && restored->second != nullptr &&
+                   deployment.containers.contains(restored->second) &&
+                   brain.recoveringPersistedNeuronInventory,
+               "persisted_inventory_runtime_does_not_discard_unready_retained_stateless_container_before_exact_uploads");
+
+  // Model the exact captured upload and let the existing central recovery
+  // owner clear its barrier before it invokes deployment recovery.
+  NeuronContainerBootstrap bootstrap = {};
+  bootstrap.plan = runtime.plan;
+  String serializedBootstrap = {};
+  BitseryEngine::serialize(serializedBootstrap, bootstrap);
+  ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
+  witness.machineUUID = machine.uuid;
+  witness.bundleRegistered = true;
+  witness.containerBootstraps.push_back(std::move(serializedBootstrap));
+  brain.updateSelfMachineRecoveryWitnesses.push_back(std::move(witness));
+  Mesh mesh = {};
+  brain.mesh = &mesh;
+  brain.persistedMachineInventoryEnumerated = true;
+  brain.persistedMachineInventoryUploaded.insert(machine.uuid);
+  machine.runtimeReady = true;
+  suite.expect(Ring::getRingFD() > 0,
+               "persisted_inventory_runtime_fixture_has_active_ring");
+  suite.expect(Ring::socketIsClosing(&machine.neuron) == false,
+               "persisted_inventory_runtime_fixture_neuron_not_closing");
+  suite.expect(machine.neuron.transportTLSEnabled() == false ||
+                   (machine.neuron.isTLSNegotiated() && machine.neuron.tlsPeerVerified),
+               "persisted_inventory_runtime_fixture_neuron_tls_ready_when_enabled");
+  suite.require(prodigyMachineReadyForScheduling(&machine),
+                "persisted_inventory_runtime_exact_upload_restores_scheduling_readiness");
+  brain.recoverDeploymentsAfterNeuronState();
+  restored = brain.containers.find(retained.uuid);
+  suite.expect(brain.recoveringPersistedNeuronInventory == false &&
+                   restored != brain.containers.end() && restored->second != nullptr &&
+                   deployment.containers.contains(restored->second),
+               "persisted_inventory_runtime_central_recovery_resumes_only_after_exact_upload");
+
+  if (restored != brain.containers.end() && restored->second != nullptr)
+  {
+    ContainerView *view = restored->second;
+    deployment.containers.erase(view);
+    machine.removeContainerIndexEntry(view->deploymentID, view);
+    brain.containers.erase(view->uuid);
+    delete view;
+  }
+  brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
+  brain.deployments.erase(deployment.plan.config.deploymentID());
+  brain.neurons.erase(&machine.neuron);
+  brain.machinesByUUID.erase(machine.uuid);
+  brain.machines.erase(&machine);
+  thisBrain = previousBrain;
+}
+
 static void testReplicatedAllMachineBundleRecoveryWitnessIsUUIDIndexed(TestSuite& suite)
 {
   TestBrain successor = {};
@@ -24961,6 +25072,13 @@ int main(void)
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "persisted-inventory-runtime") == 0)
+  {
+    testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "local-bundle-recovery-ordering") == 0)
   {
     testLocalBundleRecoveryWaitsForCapturedInventory(suite);
@@ -25391,6 +25509,7 @@ int main(void)
   testBrainNeuronRegistrationRefreshesWorkerAfterBundleTransition(suite);
   testPersistedLocalBrainRefreshBypassesIgnition(suite);
   testLocalBundleRecoveryWaitsForCapturedInventory(suite);
+  testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(suite);
   testBrainNeuronHandlerReportsHardwareFailureAndDecommissionsMachine(suite);
   testBrainMachineStateMissingEscalatesWhenSshBudgetExhausted(suite);
   testBrainSoftEscalationTimeoutPromotesMachineToHardReboot(suite);
