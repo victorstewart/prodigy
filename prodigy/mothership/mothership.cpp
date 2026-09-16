@@ -7629,7 +7629,7 @@ private:
       String command = {}; command.assign("set -eu; "_ctv); prodigyAppendShellSingleQuoted(command, remoteBinary); command.append(" offlineDNSCleanupInventory "_ctv); prodigyAppendShellSingleQuoted(command, expectedUUID);
       ok = prodigyRunBlockingSSHCommand(session, fd, command, &output, &failure, 120'000);
     }
-    String cleanup = "rm -rf "_ctv; prodigyAppendShellSingleQuoted(cleanup, stage);
+    String cleanup = {}; cleanup.assign("rm -rf "_ctv); prodigyAppendShellSingleQuoted(cleanup, stage);
     String ignored = {}; (void)prodigyRunBlockingSSHCommand(session, fd, cleanup, nullptr, &ignored, 30'000);
     mothershipCloseSSHSession(session, fd);
     if (ok == false) return false;
@@ -7717,7 +7717,7 @@ private:
   public:
     OfflineDNSRecoveryHooks(Mothership *owner, const MothershipProdigyCluster& cluster) : owner(owner), cluster(cluster) {}
     bool quiesce(const MothershipProdigyClusterMachine& machine, String *failure) override {
-      String command = "set -eu; "_ctv; mothershipAppendProdigyStopAndDrainCommand(command);
+      String command = {}; mothershipBuildProdigyStopAndDrainCommand(command);
       LIBSSH2_SESSION *session = nullptr; int fd = -1; String localFailure = {};
       bool ok = mothershipConnectSSHSession(machine, session, fd, &localFailure, &cluster.bootstrapSshKeyPackage, &cluster.bootstrapSshPrivateKeyPath) && prodigyRunBlockingSSHCommand(session, fd, command, &localFailure, 120'000);
       mothershipCloseSSHSession(session, fd); if (failure) *failure = localFailure; return ok;
