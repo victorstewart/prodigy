@@ -14202,7 +14202,28 @@ public:
     return true;
   }
 
-  void assignMachineFragment(Machine *machine)
+  bool persistedRecoveryMustAwaitReportedMachineFragment(const Machine *machine) const
+  {
+    return recoveringPersistedNeuronInventory && machine != nullptr && machine->fragment == 0 &&
+           machine->state != MachineState::hardwareFailure &&
+           machine->state != MachineState::decommissioning;
+  }
+
+  void requestNeuronPersistedInventory(Machine *machine)
+  {
+    if (machine == nullptr)
+    {
+      return;
+    }
+
+    Message::construct(machine->neuron.wBuffer, NeuronTopic::registration, true);
+    if (neuronControlStreamActive(machine))
+    {
+      Ring::queueSend(&machine->neuron);
+    }
+  }
+
+  void assignMachineFragment(Machine *machine, bool provenFreshEmptyRecoveryInventory = false)
   {
     if (machine == nullptr || brainConfig.datacenterFragment == 0)
     {
@@ -14212,6 +14233,13 @@ public:
     // periodic refresh or registration paths necessarily run.
     if (restorePendingLocalMachineFragment(machine) == false)
     {
+      return;
+    }
+
+    if (persistedRecoveryMustAwaitReportedMachineFragment(machine) &&
+        provenFreshEmptyRecoveryInventory == false)
+    {
+      requestNeuronPersistedInventory(machine);
       return;
     }
 
@@ -32764,11 +32792,7 @@ public:
                                       static_cast<uint32_t>(fragment.mpfx[2]);
           neuron->machine->reportedDatacenterFragment = fragment.dpfx;
           neuron->machine->reportedFragment = reportedFragment;
-          if (neuron->machine->fragment == 0 && fragment.dpfx != 0 && reportedFragment > 0)
-          {
-            neuron->machine->fragment = reportedFragment;
-          }
-          else if (reportedFragment > 0 && neuron->machine->fragment > 0 && reportedFragment != neuron->machine->fragment)
+          if (reportedFragment > 0 && neuron->machine->fragment > 0 && reportedFragment != neuron->machine->fragment)
           {
             basics_log("brain stateUpload fragment mismatch private4=%u assigned=%u reported=%u\n",
                        unsigned(neuron->machine ? neuron->machine->private4 : 0u),
@@ -32780,6 +32804,150 @@ public:
           bool malformedStateUpload = false;
           bytell_hash_set<uint128_t> reportedMachineContainerUUIDs = {};
           bytell_hash_set<uint32_t> reportedMachineContainerFragments = {};
+          if (persistedRecoveryMustAwaitReportedMachineFragment(neuron->machine))
+          {
+            bool fragmentProven = neuron->machine->uuid != 0 && brainConfig.datacenterFragment != 0 &&
+                                 fragment.dpfx == brainConfig.datacenterFragment &&
+                                 reportedFragment > 0;
+            bool reportedInventoryEmpty = true;
+            bool validationComplete = true;
+            uint8_t *validationArgs = args;
+            while (validationArgs < terminal)
+            {
+              uintptr_t sizeAddress = (reinterpret_cast<uintptr_t>(validationArgs) +
+                                       uintptr_t(Alignment::four) - 1u) &
+                                      ~(uintptr_t(Alignment::four) - 1u);
+              uint8_t *sizeCursor = reinterpret_cast<uint8_t *>(sizeAddress);
+              if (sizeCursor > terminal || uint64_t(terminal - sizeCursor) < sizeof(uint32_t))
+              {
+                fragmentProven = false;
+                validationComplete = false;
+                break;
+              }
+              uint32_t serializedBytes = 0;
+              std::memcpy(&serializedBytes, sizeCursor, sizeof(serializedBytes));
+              uintptr_t payloadAddress = (reinterpret_cast<uintptr_t>(sizeCursor + sizeof(serializedBytes)) +
+                                          uintptr_t(Alignment::eight) - 1u) &
+                                         ~(uintptr_t(Alignment::eight) - 1u);
+              uint8_t *payloadCursor = reinterpret_cast<uint8_t *>(payloadAddress);
+              if (payloadCursor > terminal || serializedBytes > uint64_t(terminal - payloadCursor))
+              {
+                fragmentProven = false;
+                validationComplete = false;
+                break;
+              }
+              validationArgs = payloadCursor + serializedBytes;
+              String serializedPlan = {};
+              uint8_t *extractCursor = sizeCursor;
+              Message::extractToStringView(extractCursor, serializedPlan);
+              ContainerPlan plan = {};
+              if (serializedPlan.data() > terminal ||
+                  serializedPlan.size() > uint64_t(terminal - serializedPlan.data()) ||
+                  BitseryEngine::deserializeSafe(serializedPlan, plan) == false)
+              {
+                fragmentProven = false;
+                validationComplete = false;
+                break;
+              }
+              reportedInventoryEmpty = false;
+              if (fragmentProven == false)
+              {
+                continue;
+              }
+              // The tunnel provider has no container-network address. Every
+              // other uploaded plan must bind the reported machine prefix.
+              if (plan.isSystemContainer() && plan.addresses.empty())
+              {
+                continue;
+              }
+
+              bool ownsReportedFragment = false;
+              for (const IPPrefix& address : plan.addresses)
+              {
+                if (address.network.is6 && address.cidr == 128 &&
+                    memcmp(address.network.v6, container_network_subnet6.value, 11) == 0 &&
+                    address.network.v6[11] == fragment.dpfx &&
+                    address.network.v6[12] == fragment.mpfx[0] &&
+                    address.network.v6[13] == fragment.mpfx[1] &&
+                    address.network.v6[14] == fragment.mpfx[2] &&
+                    address.network.v6[15] == plan.fragment)
+                {
+                  ownsReportedFragment = true;
+                  break;
+                }
+              }
+              if (ownsReportedFragment == false)
+              {
+                fragmentProven = false;
+              }
+            }
+
+            if (fragmentProven)
+            {
+              if (usedMachineFragments.contains(reportedFragment))
+              {
+                fragmentProven = false;
+              }
+            }
+
+            if (fragmentProven)
+            {
+              for (Machine *other : machines)
+              {
+                if (other != nullptr && other != neuron->machine && other->fragment == reportedFragment)
+                {
+                  fragmentProven = false;
+                  break;
+                }
+              }
+            }
+
+            if (fragmentProven)
+            {
+              for (const auto& witness : updateSelfMachineRecoveryWitnesses)
+              {
+                if (witness.machineUUID == neuron->machine->uuid)
+                {
+                  continue;
+                }
+                uint32_t witnessFragment = 0;
+                if (deriveMachineFragmentFromCapturedBootstraps(witness.containerBootstraps, witnessFragment) &&
+                    witnessFragment == reportedFragment)
+                {
+                  fragmentProven = false;
+                  break;
+                }
+              }
+            }
+
+            if (fragmentProven)
+            {
+              neuron->machine->fragment = reportedFragment;
+              usedMachineFragments.insert(reportedFragment);
+            }
+            else if (reportedFragment == 0 &&
+                     (fragment.dpfx == brainConfig.datacenterFragment || fragment.dpfx == 0) &&
+                     reportedInventoryEmpty && validationComplete &&
+                     (findUpdateSelfMachineRecoveryWitness(neuron->machine->uuid) == nullptr ||
+                      findUpdateSelfMachineRecoveryWitness(neuron->machine->uuid)->containerBootstraps.empty()))
+            {
+              assignMachineFragment(neuron->machine, true);
+              break;
+            }
+            else
+            {
+              basics_log("brain stateUpload rejected unproven recovery fragment private4=%u reportedDatacenter=%u reportedFragment=%u\n",
+                         unsigned(neuron->machine->private4),
+                         unsigned(fragment.dpfx),
+                         unsigned(reportedFragment));
+              neuron->machine->runtimeReady = false;
+              break;
+            }
+          }
+          else if (neuron->machine->fragment == 0 && fragment.dpfx != 0 && reportedFragment > 0)
+          {
+            neuron->machine->fragment = reportedFragment;
+          }
 #if PRODIGY_DEBUG
           const uint64_t indexedBefore = neuron->machine ? neuron->machine->containersByDeploymentID.size() : 0u;
 #endif
