@@ -327,6 +327,11 @@ public:
     queueBrainSystemContainerArtifactReplication(sha256, bytes, blob);
   }
 
+  bool selfElectAsMasterForTest(const char *reason)
+  {
+    return selfElectAsMaster(reason);
+  }
+
   Machine *findMachineByUUIDForTest(uint128_t uuid)
   {
     if (auto it = machinesByUUID.find(uuid); it != machinesByUUID.end())
@@ -3561,6 +3566,216 @@ static uint32_t countTopicFrames(String& buffer, BrainTopic topic)
     }
   });
   return count;
+}
+
+static void testRestoredDeploymentChainOrderingAndLateAcknowledgements(TestSuite& suite)
+{
+  auto restoreThreeVersions = [&](std::initializer_list<uint64_t> insertionOrder, const char *name) -> void {
+    ScopedRing scopedRing = {};
+    TestBrain brain = {};
+    NoopBrainIaaS iaas = {};
+    TestNeuron self = {};
+    self.uuid = 0x6203000;
+    NeuronBase *savedNeuron = thisNeuron;
+    BrainBase *savedBrain = thisBrain;
+    thisNeuron = &self;
+    thisBrain = &brain;
+    brain.iaas = &iaas;
+
+    char socketPath[108] = {};
+    std::snprintf(socketPath, sizeof(socketPath), "/tmp/prodigy-recovered-chain-%d-%s.sock", int(getpid()), name);
+    const char *oldSocketPath = std::getenv("PRODIGY_MOTHERSHIP_SOCKET");
+    const bool hadSocketPath = oldSocketPath != nullptr;
+    std::string savedSocketPath = oldSocketPath ? oldSocketPath : "";
+    ::setenv("PRODIGY_MOTHERSHIP_SOCKET", socketPath, 1);
+
+    for (uint64_t versionID : insertionOrder)
+    {
+      DeploymentPlan plan = {};
+      seedDeployRequestPlan(plan, 62'030);
+      plan.config.versionID = versionID;
+      brain.deploymentPlans.insert_or_assign(plan.config.deploymentID(), plan);
+    }
+
+    suite.require(brain.selfElectAsMasterForTest("restored-deployment-order"),
+                  std::string("restored_deployment_order_promotes_") + name);
+    ApplicationDeployment *first = brain.deployments[(uint64_t(62'030) << 48) | 1];
+    ApplicationDeployment *second = brain.deployments[(uint64_t(62'030) << 48) | 2];
+    ApplicationDeployment *third = brain.deployments[(uint64_t(62'030) << 48) | 3];
+    suite.expect(first != nullptr && second != nullptr && third != nullptr,
+                 std::string("restored_deployment_order_materializes_") + name);
+    suite.expect(brain.deploymentsByApp[62'030] == third &&
+                     third != nullptr && third->previous == second && third->next == nullptr &&
+                     second != nullptr && second->previous == first && second->next == third &&
+                     first != nullptr && first->previous == nullptr && first->next == second,
+                 std::string("restored_deployment_order_links_versions_") + name);
+
+    brain.forfeitMasterStatus();
+    for (auto& [deploymentID, deployment] : brain.deployments)
+    {
+      (void)deploymentID;
+      delete deployment;
+    }
+    brain.deployments.clear();
+    brain.deploymentsByApp.clear();
+    thisBrain = savedBrain;
+    thisNeuron = savedNeuron;
+    ::unlink(socketPath);
+    if (hadSocketPath)
+    {
+      ::setenv("PRODIGY_MOTHERSHIP_SOCKET", savedSocketPath.c_str(), 1);
+    }
+    else
+    {
+      ::unsetenv("PRODIGY_MOTHERSHIP_SOCKET");
+    }
+  };
+
+  restoreThreeVersions({3, 2, 1}, "highest_first");
+  restoreThreeVersions({2, 1, 3}, "mixed_order");
+
+  {
+    ScopedRing scopedRing = {};
+    TestBrain brain = {};
+    NoopBrainIaaS iaas = {};
+    TestNeuron self = {};
+    self.uuid = 0x6203004;
+    NeuronBase *savedNeuron = thisNeuron;
+    BrainBase *savedBrain = thisBrain;
+    thisNeuron = &self;
+    thisBrain = &brain;
+    brain.iaas = &iaas;
+
+    char socketPath[] = "/tmp/prodigy-recovered-live-owner.sock";
+    const char *oldSocketPath = std::getenv("PRODIGY_MOTHERSHIP_SOCKET");
+    const bool hadSocketPath = oldSocketPath != nullptr;
+    std::string savedSocketPath = oldSocketPath ? oldSocketPath : "";
+    ::setenv("PRODIGY_MOTHERSHIP_SOCKET", socketPath, 1);
+
+    DeploymentPlan livePlan = {};
+    seedDeployRequestPlan(livePlan, 62'032);
+    livePlan.config.versionID = 3;
+    ApplicationDeployment *live = new ApplicationDeployment();
+    ContainerView *retainedContainer = new ContainerView();
+    live->plan = livePlan;
+    live->containers.insert(retainedContainer);
+    brain.deployments.insert_or_assign(livePlan.config.deploymentID(), live);
+    brain.deploymentsByApp.insert_or_assign(livePlan.config.applicationID, live);
+    for (uint64_t versionID : {uint64_t(2), uint64_t(1), uint64_t(3)})
+    {
+      DeploymentPlan plan = livePlan;
+      plan.config.versionID = versionID;
+      brain.deploymentPlans.insert_or_assign(plan.config.deploymentID(), plan);
+    }
+
+    suite.require(brain.selfElectAsMasterForTest("restored-live-owner"),
+                  "restored_live_owner_promotes");
+    ApplicationDeployment *first = brain.deployments[(uint64_t(62'032) << 48) | 1];
+    ApplicationDeployment *second = brain.deployments[(uint64_t(62'032) << 48) | 2];
+    suite.expect(brain.deployments[(uint64_t(62'032) << 48) | 3] == live &&
+                     brain.deploymentsByApp[62'032] == live && live->containers.contains(retainedContainer) &&
+                     first != nullptr && second != nullptr && first->previous == nullptr && first->next == second &&
+                     second->previous == first && second->next == live &&
+                     live->previous == second && live->next == nullptr,
+                 "restored_live_owner_reuses_duplicate_id_and_rebuilds_complete_chain");
+
+    brain.forfeitMasterStatus();
+    for (auto& [deploymentID, deployment] : brain.deployments)
+    {
+      (void)deploymentID;
+      delete deployment;
+    }
+    brain.deployments.clear();
+    brain.deploymentsByApp.clear();
+    delete retainedContainer;
+    thisBrain = savedBrain;
+    thisNeuron = savedNeuron;
+    ::unlink(socketPath);
+    if (hadSocketPath)
+    {
+      ::setenv("PRODIGY_MOTHERSHIP_SOCKET", savedSocketPath.c_str(), 1);
+    }
+    else
+    {
+      ::unsetenv("PRODIGY_MOTHERSHIP_SOCKET");
+    }
+  }
+
+  auto acknowledgeRestoredChain = [&](bool recoveringInventory, const char *name) -> void {
+    StreamingTestBrain brain = {};
+    NoopBrainIaaS iaas = {};
+    TestNeuron self = {};
+    const uint128_t selfUUID = 0x6203001;
+    const uint128_t followerAUUID = 0x6203002;
+    const uint128_t followerBUUID = 0x6203003;
+    self.uuid = selfUUID;
+    NeuronBase *savedNeuron = thisNeuron;
+    BrainBase *savedBrain = thisBrain;
+    thisNeuron = &self;
+    thisBrain = &brain;
+
+    brain.iaas = &iaas;
+    brain.weAreMaster = true;
+    brain.noMasterYet = false;
+    brain.nBrains = 3;
+    brain.recoveringPersistedNeuronInventory = recoveringInventory;
+    brain.hasAuthoritativeTopology = true;
+    for (uint128_t uuid : {selfUUID, followerAUUID, followerBUUID})
+    {
+      ClusterMachine machine = {};
+      machine.isBrain = true;
+      machine.uuid = uuid;
+      brain.authoritativeTopology.machines.push_back(std::move(machine));
+    }
+    BrainView followerA = {};
+    followerA.uuid = followerAUUID;
+    BrainView followerB = {};
+    followerB.uuid = followerBUUID;
+
+    DeploymentPlan oldPlan = {};
+    seedDeployRequestPlan(oldPlan, 62'031);
+    oldPlan.config.versionID = 702;
+    DeploymentPlan newPlan = oldPlan;
+    newPlan.config.versionID = 707;
+    ApplicationDeployment *oldDeployment = new ApplicationDeployment();
+    ApplicationDeployment *newDeployment = new ApplicationDeployment();
+    oldDeployment->plan = oldPlan;
+    newDeployment->plan = newPlan;
+    oldDeployment->next = newDeployment;
+    newDeployment->previous = oldDeployment;
+    for (ApplicationDeployment *deployment : {oldDeployment, newDeployment})
+    {
+      deployment->brainBlobQueuedPeerKeys.insert(followerAUUID);
+      deployment->brainBlobQueuedPeerKeys.insert(followerBUUID);
+      brain.deployments.insert_or_assign(deployment->plan.config.deploymentID(), deployment);
+    }
+    brain.deploymentsByApp.insert_or_assign(oldPlan.config.applicationID, newDeployment);
+
+    String buffer = {};
+    for (ApplicationDeployment *deployment : {newDeployment, oldDeployment})
+    {
+      brain.brainHandler(&followerA, buildBrainMessage(buffer, BrainTopic::replicateDeployment, deployment->plan.config.deploymentID()));
+      brain.brainHandler(&followerB, buildBrainMessage(buffer, BrainTopic::replicateDeployment, deployment->plan.config.deploymentID()));
+    }
+
+    suite.expect(newDeployment->brainBlobEchoPeerKeys.size() == 2 && oldDeployment->brainBlobEchoPeerKeys.size() == 2,
+                 std::string("restored_deployment_ack_records_distinct_peers_") + name);
+    suite.expect(brain.deploymentsByApp[oldPlan.config.applicationID] == newDeployment &&
+                     newDeployment->previous == oldDeployment && newDeployment->next == nullptr &&
+                     oldDeployment->previous == nullptr && oldDeployment->next == newDeployment &&
+                     oldDeployment->state == DeploymentState::none && newDeployment->state == DeploymentState::none,
+                 std::string("restored_deployment_ack_preserves_chain_") + name);
+
+    brain.deployments.clear();
+    brain.deploymentsByApp.clear();
+    delete oldDeployment;
+    delete newDeployment;
+    thisBrain = savedBrain;
+    thisNeuron = savedNeuron;
+  };
+
+  acknowledgeRestoredChain(true, "during_inventory_recovery");
+  acknowledgeRestoredChain(false, "after_inventory_recovery");
 }
 
 static void testInitialDeploymentWaitsForDurableAuthoritativePeerReplication(TestSuite& suite)
@@ -24319,6 +24534,7 @@ int main(void)
     testSpinApplicationStagesFollowerBlobReplicationBehindMetadataEcho(suite);
     testSpinApplicationReplicatesInitialBlobWithPlan(suite);
     testInitialDeploymentWaitsForDurableAuthoritativePeerReplication(suite);
+    testRestoredDeploymentChainOrderingAndLateAcknowledgements(suite);
     testReplicatedDeploymentAcknowledgesOnlyAfterDurablePersistence(suite);
     testCertificateLifecycleSchedulers(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -24597,6 +24813,7 @@ int main(void)
   testSpinApplicationStagesFollowerBlobReplicationBehindMetadataEcho(suite);
   testSpinApplicationReplicatesInitialBlobWithPlan(suite);
   testInitialDeploymentWaitsForDurableAuthoritativePeerReplication(suite);
+  testRestoredDeploymentChainOrderingAndLateAcknowledgements(suite);
   testReplicatedDeploymentAcknowledgesOnlyAfterDurablePersistence(suite);
   testLargePayloadPeerKeepaliveUsesFixedFileSocketCommand(suite);
   testAcceptedBrainPeerSetsLargePayloadUserTimeout(suite);

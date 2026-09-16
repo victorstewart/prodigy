@@ -1043,6 +1043,122 @@ int main(void)
   neuron.private4 = IPAddress("10.0.0.10", false);
   thisNeuron = &neuron;
 
+  auto withUniqueMothershipSocket = [&](const char *fixtureName, auto&& callback) {
+    ScopedRing scopedRing = {};
+
+    char socketDirectoryTemplate[] = "/tmp/prodigy-brain-master-XXXXXX";
+    char *socketDirectory = ::mkdtemp(socketDirectoryTemplate);
+    suite.expect(socketDirectory != nullptr, fixtureName);
+    if (socketDirectory == nullptr)
+    {
+      return;
+    }
+
+    String socketPath = {};
+    socketPath.assign(socketDirectory);
+    socketPath.append("/mothership.sock"_ctv);
+
+    const char *previousSocketPath = ::getenv("PRODIGY_MOTHERSHIP_SOCKET");
+    String previousSocketPathText = {};
+    if (previousSocketPath != nullptr)
+    {
+      previousSocketPathText.assign(previousSocketPath);
+    }
+
+    ::setenv("PRODIGY_MOTHERSHIP_SOCKET", socketPath.c_str(), 1);
+    callback();
+
+    if (previousSocketPath != nullptr)
+    {
+      ::setenv("PRODIGY_MOTHERSHIP_SOCKET", previousSocketPathText.c_str(), 1);
+    }
+    else
+    {
+      ::unsetenv("PRODIGY_MOTHERSHIP_SOCKET");
+    }
+
+    ::unlink(socketPath.c_str());
+    ::rmdir(socketDirectory);
+  };
+
+  auto runRestoredDeploymentChainFixtures = [&]() -> void {
+    withUniqueMothershipSocket("self_elect_as_master_promotes_newer_pending_deployment_socket_dir_created", [&] {
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+
+    DeploymentPlan olderPlan = makeDeploymentPlan(61'001, 1);
+    DeploymentPlan newerPlan = makeDeploymentPlan(61'001, 2);
+
+    ApplicationDeployment *older = new ApplicationDeployment();
+    older->plan = olderPlan;
+    brain.deployments.insert_or_assign(olderPlan.config.deploymentID(), older);
+    brain.deploymentsByApp.insert_or_assign(olderPlan.config.applicationID, older);
+    brain.deploymentPlans.insert_or_assign(newerPlan.config.deploymentID(), newerPlan);
+
+    brain.testSelfElectAsMaster("unit-test");
+
+    suite.expect(brain.deploymentPlans.empty(), "self_elect_as_master_promotes_newer_pending_deployment_clears_pending_plan_map");
+    suite.expect(brain.deployments.contains(newerPlan.config.deploymentID()), "self_elect_as_master_promotes_newer_pending_deployment_materializes_newer_deployment");
+
+    ApplicationDeployment *newer = brain.deployments[newerPlan.config.deploymentID()];
+    suite.expect(newer != nullptr, "self_elect_as_master_promotes_newer_pending_deployment_stores_newer_deployment");
+    if (newer != nullptr)
+    {
+      suite.expect(brain.deploymentsByApp[newerPlan.config.applicationID] == newer, "self_elect_as_master_promotes_newer_pending_deployment_repoints_app_index");
+      suite.expect(newer->previous == older, "self_elect_as_master_promotes_newer_pending_deployment_links_previous_generation");
+      suite.expect(older->next == newer, "self_elect_as_master_promotes_newer_pending_deployment_links_next_generation");
+      delete newer;
+    }
+
+    delete older;
+    brain.deployments.clear();
+    brain.deploymentsByApp.clear();
+    });
+
+    withUniqueMothershipSocket("self_elect_as_master_keeps_newer_existing_deployment_socket_dir_created", [&] {
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+
+    DeploymentPlan existingPlan = makeDeploymentPlan(61'002, 4);
+    DeploymentPlan stalePendingPlan = makeDeploymentPlan(61'002, 3);
+
+    ApplicationDeployment *existing = new ApplicationDeployment();
+    existing->plan = existingPlan;
+    brain.deployments.insert_or_assign(existingPlan.config.deploymentID(), existing);
+    brain.deploymentsByApp.insert_or_assign(existingPlan.config.applicationID, existing);
+    brain.deploymentPlans.insert_or_assign(stalePendingPlan.config.deploymentID(), stalePendingPlan);
+
+    brain.testSelfElectAsMaster("unit-test");
+
+    suite.expect(brain.deploymentPlans.empty(), "self_elect_as_master_keeps_newer_existing_deployment_clears_pending_plan_map");
+    suite.expect(brain.deployments.contains(stalePendingPlan.config.deploymentID()), "self_elect_as_master_keeps_newer_existing_deployment_still_materializes_pending_entry");
+    suite.expect(brain.deploymentsByApp[existingPlan.config.applicationID] == existing,
+                 "self_elect_as_master_keeps_newer_existing_deployment_preserves_live_owner_as_head");
+
+    ApplicationDeployment *stale = brain.deployments[stalePendingPlan.config.deploymentID()];
+    suite.expect(stale != nullptr, "self_elect_as_master_keeps_newer_existing_deployment_stores_stale_deployment");
+    if (stale != nullptr)
+    {
+      suite.expect(stale->previous == nullptr && stale->next == existing &&
+                       existing->previous == stale && existing->next == nullptr,
+                   "self_elect_as_master_keeps_newer_existing_deployment_rebuilds_complete_ordered_chain");
+      delete stale;
+    }
+
+    delete existing;
+    brain.deployments.clear();
+    brain.deploymentsByApp.clear();
+    });
+
+  };
+
+  if (const char *testOnly = ::getenv("PRODIGY_TEST_ONLY");
+      testOnly != nullptr && std::strcmp(testOnly, "restored-deployment-chain") == 0)
+  {
+    runRestoredDeploymentChainFixtures();
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+
   suite.expect(prodigyBrainPeerHeartbeatTimeoutMs <= 5000u, "timing_knobs_bound_production_master_stale_detection");
   suite.expect(prodigyBrainDevPeerHeartbeatTimeoutMs <= 5000u, "timing_knobs_bound_dev_master_stale_detection");
   suite.expect(prodigyBrainPeerHeartbeatTimeoutMs >= prodigyBrainPeerHeartbeatIntervalMs * 3u, "timing_knobs_production_allows_multiple_missed_heartbeats");
@@ -1278,44 +1394,6 @@ int main(void)
     brain.brains.erase(&nonMasterPeer);
     brain.brains.erase(&masterPeer);
   }
-
-  auto withUniqueMothershipSocket = [&](const char *fixtureName, auto&& callback) {
-    ScopedRing scopedRing = {};
-
-    char socketDirectoryTemplate[] = "/tmp/prodigy-brain-master-XXXXXX";
-    char *socketDirectory = ::mkdtemp(socketDirectoryTemplate);
-    suite.expect(socketDirectory != nullptr, fixtureName);
-    if (socketDirectory == nullptr)
-    {
-      return;
-    }
-
-    String socketPath = {};
-    socketPath.assign(socketDirectory);
-    socketPath.append("/mothership.sock"_ctv);
-
-    const char *previousSocketPath = ::getenv("PRODIGY_MOTHERSHIP_SOCKET");
-    String previousSocketPathText = {};
-    if (previousSocketPath != nullptr)
-    {
-      previousSocketPathText.assign(previousSocketPath);
-    }
-
-    ::setenv("PRODIGY_MOTHERSHIP_SOCKET", socketPath.c_str(), 1);
-    callback();
-
-    if (previousSocketPath != nullptr)
-    {
-      ::setenv("PRODIGY_MOTHERSHIP_SOCKET", previousSocketPathText.c_str(), 1);
-    }
-    else
-    {
-      ::unsetenv("PRODIGY_MOTHERSHIP_SOCKET");
-    }
-
-    ::unlink(socketPath.c_str());
-    ::rmdir(socketDirectory);
-  };
 
   auto countQueuedTopics = [&](String buffer, Vector<uint16_t>& topics) -> bool {
     topics.clear();
@@ -6901,71 +6979,7 @@ int main(void)
     thisBrain = savedBrain;
   }
 
-  withUniqueMothershipSocket("self_elect_as_master_promotes_newer_pending_deployment_socket_dir_created", [&] {
-    TestBrain brain = {};
-    brain.iaas = new NoopBrainIaaS();
-
-    DeploymentPlan olderPlan = makeDeploymentPlan(61'001, 1);
-    DeploymentPlan newerPlan = makeDeploymentPlan(61'001, 2);
-
-    ApplicationDeployment *older = new ApplicationDeployment();
-    older->plan = olderPlan;
-    brain.deployments.insert_or_assign(olderPlan.config.deploymentID(), older);
-    brain.deploymentsByApp.insert_or_assign(olderPlan.config.applicationID, older);
-    brain.deploymentPlans.insert_or_assign(newerPlan.config.deploymentID(), newerPlan);
-
-    brain.testSelfElectAsMaster("unit-test");
-
-    suite.expect(brain.deploymentPlans.empty(), "self_elect_as_master_promotes_newer_pending_deployment_clears_pending_plan_map");
-    suite.expect(brain.deployments.contains(newerPlan.config.deploymentID()), "self_elect_as_master_promotes_newer_pending_deployment_materializes_newer_deployment");
-
-    ApplicationDeployment *newer = brain.deployments[newerPlan.config.deploymentID()];
-    suite.expect(newer != nullptr, "self_elect_as_master_promotes_newer_pending_deployment_stores_newer_deployment");
-    if (newer != nullptr)
-    {
-      suite.expect(brain.deploymentsByApp[newerPlan.config.applicationID] == newer, "self_elect_as_master_promotes_newer_pending_deployment_repoints_app_index");
-      suite.expect(newer->previous == older, "self_elect_as_master_promotes_newer_pending_deployment_links_previous_generation");
-      suite.expect(older->next == newer, "self_elect_as_master_promotes_newer_pending_deployment_links_next_generation");
-      delete newer;
-    }
-
-    delete older;
-    brain.deployments.clear();
-    brain.deploymentsByApp.clear();
-  });
-
-  withUniqueMothershipSocket("self_elect_as_master_keeps_newer_existing_deployment_socket_dir_created", [&] {
-    TestBrain brain = {};
-    brain.iaas = new NoopBrainIaaS();
-
-    DeploymentPlan existingPlan = makeDeploymentPlan(61'002, 4);
-    DeploymentPlan stalePendingPlan = makeDeploymentPlan(61'002, 3);
-
-    ApplicationDeployment *existing = new ApplicationDeployment();
-    existing->plan = existingPlan;
-    brain.deployments.insert_or_assign(existingPlan.config.deploymentID(), existing);
-    brain.deploymentsByApp.insert_or_assign(existingPlan.config.applicationID, existing);
-    brain.deploymentPlans.insert_or_assign(stalePendingPlan.config.deploymentID(), stalePendingPlan);
-
-    brain.testSelfElectAsMaster("unit-test");
-
-    suite.expect(brain.deploymentPlans.empty(), "self_elect_as_master_keeps_newer_existing_deployment_clears_pending_plan_map");
-    suite.expect(brain.deployments.contains(stalePendingPlan.config.deploymentID()), "self_elect_as_master_keeps_newer_existing_deployment_still_materializes_pending_entry");
-    suite.expect(brain.deploymentsByApp[existingPlan.config.applicationID] == existing, "self_elect_as_master_keeps_newer_existing_deployment_preserves_app_index");
-
-    ApplicationDeployment *stale = brain.deployments[stalePendingPlan.config.deploymentID()];
-    suite.expect(stale != nullptr, "self_elect_as_master_keeps_newer_existing_deployment_stores_stale_deployment");
-    if (stale != nullptr)
-    {
-      suite.expect(stale->previous == nullptr, "self_elect_as_master_keeps_newer_existing_deployment_leaves_stale_previous_unset");
-      suite.expect(stale->next == nullptr, "self_elect_as_master_keeps_newer_existing_deployment_leaves_stale_next_unset");
-      delete stale;
-    }
-
-    delete existing;
-    brain.deployments.clear();
-    brain.deploymentsByApp.clear();
-  });
+  runRestoredDeploymentChainFixtures();
 
   withUniqueMothershipSocket("self_elect_as_master_tolerates_managed_schema_reconcile_failure_socket_dir_created", [&] {
     TestBrain brain = {};
