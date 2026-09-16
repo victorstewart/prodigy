@@ -10473,8 +10473,10 @@ static void testUpdateProdigyRespondsBeforeSingleBrainTransition(TestSuite& suit
   MothershipResponse response = {};
   suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response), "update_prodigy_response_deserializes");
   suite.expect(response.success, "update_prodigy_response_success");
-  suite.expect(brain.updateSelfLocalMachineUUID == local.uuid,
-               "update_prodigy_single_brain_persists_local_handoff_before_success");
+  suite.expect(brain.updateSelfLocalMachineUUID == 0 &&
+                   brain.updateSelfMachineRecoveryWitnesses.size() == 1 &&
+                   brain.updateSelfMachineRecoveryWitnesses[0].machineUUID == local.uuid,
+               "update_prodigy_single_brain_persists_all_machine_handoff_before_success");
   suite.expect(brain.updateSelfTransitionAfterMothershipAck, "update_prodigy_single_brain_defers_transition_until_ack");
   suite.expect(brain.transitionToNewBundleCalls == 0, "update_prodigy_single_brain_no_transition_before_ack_send");
 
@@ -11039,32 +11041,40 @@ static void testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(TestSuite&
                "worker_upgrade_queues_terminal_mothership_success");
   suite.expect(brain.updateSelfTransitionAfterMothershipAck && brain.transitionToNewBundleCalls == 0,
                "worker_upgrade_waits_for_terminal_success_send_before_master_transition");
-  suite.expect(brain.updateSelfLocalMachineUUID == local.uuid &&
-                   brain.updateSelfLocalBundleRegistered == false &&
-                   brain.updateSelfLocalContainerBootstraps.size() == 1,
-               "worker_upgrade_persists_local_container_handoff_before_success");
+  auto localWitness = std::find_if(brain.updateSelfMachineRecoveryWitnesses.begin(),
+                                   brain.updateSelfMachineRecoveryWitnesses.end(),
+                                   [&](const auto& witness) { return witness.machineUUID == local.uuid; });
+  suite.expect(brain.updateSelfLocalMachineUUID == 0 &&
+                   brain.updateSelfMachineRecoveryWitnesses.size() == 3 &&
+                   localWitness != brain.updateSelfMachineRecoveryWitnesses.end() &&
+                   localWitness->bundleRegistered == false &&
+                   localWitness->containerBootstraps.size() == 1,
+               "worker_upgrade_persists_all_machine_container_handoff_before_success");
 
   ProdigyPersistentUpdateSelfState localSnapshot = brain.capturePersistentUpdateSelfState();
   TestBrain localRestored = {};
   localRestored.restorePersistentUpdateSelfState(localSnapshot);
-  suite.expect(localRestored.updateSelfLocalMachineUUID == local.uuid &&
-                   localRestored.updateSelfLocalContainerBootstraps == brain.updateSelfLocalContainerBootstraps,
-               "worker_upgrade_restores_exact_local_container_handoff");
+  suite.expect(localRestored.updateSelfLocalMachineUUID == 0 &&
+                   localRestored.updateSelfMachineRecoveryWitnesses == brain.updateSelfMachineRecoveryWitnesses,
+               "worker_upgrade_restores_exact_all_machine_container_handoff");
+  auto restoredLocalWitness = [&]() {
+    return std::find_if(localRestored.updateSelfMachineRecoveryWitnesses.begin(),
+                        localRestored.updateSelfMachineRecoveryWitnesses.end(),
+                        [&](const auto& witness) { return witness.machineUUID == local.uuid; });
+  };
   suite.expect(localRestored.noteLocalBundleRegistration(&local, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv) == false &&
-                   localRestored.updateSelfLocalBundleRegistered == false,
-               "worker_upgrade_rejects_wrong_local_post_exec_digest");
-  suite.expect(localRestored.noteLocalBundleRegistration(&local, digest),
-               "worker_upgrade_accepts_intended_local_post_exec_digest");
-  bytell_hash_set<uint128_t> incompleteInventory = {};
-  suite.expect(localRestored.localBundleInventoryMatches(&local, incompleteInventory) == false,
-               "worker_upgrade_rejects_partial_local_inventory");
-  bytell_hash_set<uint128_t> completeInventory = {};
-  completeInventory.insert(localContainer.uuid);
-  suite.expect(localRestored.localBundleInventoryMatches(&local, completeInventory),
-               "worker_upgrade_accepts_exact_local_inventory");
+                   restoredLocalWitness() != localRestored.updateSelfMachineRecoveryWitnesses.end() &&
+                   restoredLocalWitness()->bundleRegistered == false,
+               "worker_upgrade_rejects_wrong_all_machine_post_exec_digest");
+  suite.expect(localRestored.noteLocalBundleRegistration(&local, digest) &&
+                   restoredLocalWitness() != localRestored.updateSelfMachineRecoveryWitnesses.end() &&
+                   restoredLocalWitness()->bundleRegistered,
+               "worker_upgrade_accepts_intended_all_machine_post_exec_digest");
+  // Exact missing-inventory rejection is exercised by the all-machine bundle
+  // recovery selector; this worker path proves its local registration facet.
   localRestored.completeLocalBundleExecRecovery();
   suite.expect(localRestored.capturePersistentUpdateSelfState().active() == false,
-               "worker_upgrade_clears_transaction_only_after_local_restore");
+               "worker_upgrade_completion_clears_registered_transaction");
 
   brain.activeMotherships.erase(&mothership);
   local.removeContainerIndexEntry(localContainer.deploymentID, &localContainer);
