@@ -13060,6 +13060,47 @@ public:
     return false;
   }
 
+  void startMasterMissingRecovery(BrainView *missingPeer, const char *reason)
+  {
+    if (missingPeer == nullptr)
+    {
+      return;
+    }
+
+    isMasterMissing = true;
+    basics_log("master missing private4=%u reason=%s, starting masterMissing gossip\n",
+               missingPeer->private4,
+               (reason ? reason : "unspecified"));
+
+    for (BrainView *peer : brains)
+    {
+      if (peer->quarantined == false)
+      {
+        peer->sendMasterMissing();
+      }
+    }
+
+    // Derivation remains owned by the existing connected-majority agreement path.
+    (void)maybeDeriveOnMasterMissingAgreement(reason);
+  }
+
+  void recoverUnavailablePendingDesignatedMaster(const char *reason)
+  {
+    if (noMasterYet == false || weAreMaster || pendingDesignatedMasterPeerKey == 0)
+    {
+      return;
+    }
+
+    BrainView *designatedPeer = findBrainViewByUpdateSelfPeerKey(pendingDesignatedMasterPeerKey);
+    if (designatedPeer != nullptr && designatedPeer->quarantined)
+    {
+      // A persisted handoff can be restored after the designated peer was already
+      // quarantined. Registration and heartbeat traffic from the surviving quorum
+      // re-enter recovery without waiting for another missing transition.
+      startMasterMissingRecovery(designatedPeer, reason);
+    }
+  }
+
   void driveMasterPeerIdentityConvergence(BrainView *peer, int64_t nowMs)
   {
     if (weAreMaster == false || peer == nullptr)
@@ -13274,6 +13315,9 @@ public:
   void brainMissing(BrainView *brain)
   {
     const bool peerWasCurrentMaster = peerRepresentsCurrentMasterForLiveness(brain);
+    const bool peerWasPendingDesignatedMaster = (noMasterYet &&
+                                                 pendingDesignatedMasterPeerKey > 0 &&
+                                                 updateSelfPeerKeyMatchesBrain(pendingDesignatedMasterPeerKey, brain));
     brain->connected = false;
     cancelBrainReconnectWaiter(brain, "brain-missing");
     cancelBrainLivenessWaiter(brain, "brain-missing");
@@ -13374,30 +13418,13 @@ public:
       }
       else
       {
-        if (peerWasCurrentMaster)
+        if (peerWasCurrentMaster || peerWasPendingDesignatedMaster)
         {
-          // the master brain is missing
-          isMasterMissing = true;
-          basics_log("brainMissing detected master private4=%u, starting masterMissing gossip\n", brain->private4);
-
-          for (BrainView *bv : brains)
-          {
-            if (bv->quarantined == false)
-            {
-              // tell it the master is lost to us
-              // chat with the other peers to see if they agree
-              // then we'd select a new master
-              // a major utiltiy of this is to test connectivity... it's possible this breaks the connection.. aka this would cascade the failure discovery
-              bv->sendMasterMissing();
-
-              // and if they all fail, we'll end up in our if (allQuarantined) bracket below
-            }
-          }
-
-          // Re-evaluate after publishing our local vote. A reachable peer may
-          // already have reported the master missing before our own liveness
-          // timeout completed; derivation still requires connected-majority checks.
-          maybeDeriveOnMasterMissingAgreement("brain-missing-local-vote");
+          // The current master, or the persisted handoff designation, is missing.
+          // The latter must enter the same quorum-gated recovery path: registrations
+          // otherwise continue to defer derivation while the unavailable designation
+          // remains persisted.
+          startMasterMissingRecovery(brain, "brain-missing-local-vote");
         }
 
         if (isMasterMissing) // if master fails first, then the other brain fails, we'd run through here twice, otherwise once
@@ -26617,6 +26644,7 @@ public:
             }
           }
 
+          recoverUnavailablePendingDesignatedMaster("registration-unavailable-designated");
           refreshMasterPeerLivenessWaiter(bv, "registration");
           break;
         }
@@ -26677,6 +26705,7 @@ public:
           {
             bv->respondPeerHeartbeat(heartbeatNonce);
           }
+          recoverUnavailablePendingDesignatedMaster("peer-heartbeat-unavailable-designated");
           break;
         }
       case BrainTopic::updateBundle:
@@ -26815,6 +26844,7 @@ public:
                 designatedPeerKeyText.snprintf<"{itoa}"_ctv>(designatedMasterPeerKey);
                 basics_log("relinquishMasterStatus waiting designated peerKey=%s (currently unavailable)\n",
                            designatedPeerKeyText.c_str());
+                recoverUnavailablePendingDesignatedMaster("relinquish-unavailable-designated");
               }
               else
               {
