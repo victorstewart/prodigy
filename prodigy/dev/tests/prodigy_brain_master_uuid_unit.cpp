@@ -1034,6 +1034,259 @@ static void forEachMessageInBuffer(String& buffer, Handler&& handler)
   }
 }
 
+static void runPendingDesignatedMasterRecoveryFixtures(TestSuite& suite)
+{
+  {
+    ScopedRing scopedRing = {};
+
+    char socketDirectoryTemplate[] = "/tmp/prodigy-pending-master-XXXXXX";
+    char *socketDirectory = ::mkdtemp(socketDirectoryTemplate);
+    suite.expect(socketDirectory != nullptr,
+                 "brain_missing_pending_designated_master_majority_socket_directory_created");
+    if (socketDirectory == nullptr)
+    {
+      return;
+    }
+    String socketPath = {};
+    socketPath.assign(socketDirectory);
+    socketPath.append("/mothership.sock"_ctv);
+    ::setenv("PRODIGY_MOTHERSHIP_SOCKET", socketPath.c_str(), 1);
+
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    brain.nBrains = 3;
+    brain.boottimens = 10;
+    brain.hasCompletedInitialMasterElection = true;
+    brain.noMasterYet = true;
+    brain.weAreMaster = false;
+    brain.overrideMetroReachabilityCheck = true;
+    brain.forcedConnectedMajorityAfterMetroCheck = true;
+    brain.forcedReachableSwitchMajority = true;
+    brain.localBrainPeerAddress = IPAddress("10.0.0.10", false);
+    brain.localBrainPeerAddressText = "10.0.0.10"_ctv;
+
+    BrainView *designatedPeer = makePeer(uint128_t(0x220), 20, IPAddress("10.0.0.11", false).v4, "10.0.0.11");
+    designatedPeer->connected = true;
+    designatedPeer->isFixedFile = true;
+    designatedPeer->fslot = 34;
+    brain.pendingDesignatedMasterPeerKey = designatedPeer->uuid;
+    brain.brains.insert(designatedPeer);
+
+    BrainView *reachablePeer = makePeer(uint128_t(0x200), 21, IPAddress("10.0.0.12", false).v4, "10.0.0.12");
+    reachablePeer->connected = true;
+    reachablePeer->isMasterMissing = true;
+    reachablePeer->isFixedFile = true;
+    reachablePeer->fslot = 35;
+    brain.brains.insert(reachablePeer);
+
+    brain.testBrainMissing(designatedPeer);
+
+    bool sawMasterMissingFrame = false;
+    forEachMessageInBuffer(reachablePeer->wBuffer, [&](Message *frame) {
+      if (BrainTopic(frame->topic) == BrainTopic::masterMissing)
+      {
+        sawMasterMissingFrame = true;
+      }
+    });
+
+    suite.expect(designatedPeer->quarantined,
+                 "brain_missing_pending_designated_master_quarantines_unavailable_designated_peer");
+    suite.expect(sawMasterMissingFrame,
+                 "brain_missing_pending_designated_master_gossips_to_reachable_majority_peer");
+    suite.expect(brain.weAreMaster && brain.noMasterYet == false && brain.pendingDesignatedMasterPeerKey == 0,
+                 "brain_missing_pending_designated_master_majority_agreement_elects_and_clears_designation");
+
+    brain.brains.erase(designatedPeer);
+    brain.brains.erase(reachablePeer);
+    delete designatedPeer;
+    delete reachablePeer;
+    ::unsetenv("PRODIGY_MOTHERSHIP_SOCKET");
+    ::unlink(socketPath.c_str());
+    ::rmdir(socketDirectory);
+  }
+
+  {
+    ScopedRing scopedRing = {};
+
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    brain.nBrains = 3;
+    brain.noMasterYet = true;
+    brain.weAreMaster = false;
+
+    BrainView *designatedPeer = makePeer(uint128_t(0x420), 30, IPAddress("10.0.0.21", false).v4, "10.0.0.21");
+    designatedPeer->connected = true;
+    designatedPeer->isFixedFile = true;
+    designatedPeer->fslot = 44;
+    brain.pendingDesignatedMasterPeerKey = designatedPeer->uuid;
+    brain.brains.insert(designatedPeer);
+
+    BrainView *ordinaryPeer = makePeer(uint128_t(0x430), 31, IPAddress("10.0.0.22", false).v4, "10.0.0.22");
+    ordinaryPeer->connected = true;
+    ordinaryPeer->isFixedFile = true;
+    ordinaryPeer->fslot = 45;
+    brain.brains.insert(ordinaryPeer);
+
+    brain.testBrainMissing(ordinaryPeer);
+
+    suite.expect(ordinaryPeer->quarantined,
+                 "brain_missing_pending_designated_master_quarantines_unavailable_ordinary_peer");
+    suite.expect(brain.isMasterMissing == false,
+                 "brain_missing_pending_designated_master_does_not_treat_ordinary_peer_as_master");
+    suite.expect(designatedPeer->wBuffer.size() == 0,
+                 "brain_missing_pending_designated_master_does_not_gossip_for_ordinary_peer");
+
+    brain.brains.erase(designatedPeer);
+    brain.brains.erase(ordinaryPeer);
+    delete designatedPeer;
+    delete ordinaryPeer;
+  }
+
+  {
+    ScopedRing scopedRing = {};
+
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    brain.nBrains = 4;
+    brain.boottimens = 10;
+    brain.hasCompletedInitialMasterElection = true;
+    brain.noMasterYet = true;
+    brain.weAreMaster = false;
+    brain.overrideMetroReachabilityCheck = true;
+    brain.forcedConnectedMajorityAfterMetroCheck = false;
+    brain.forcedReachableSwitchMajority = false;
+    brain.localBrainPeerAddress = IPAddress("10.0.0.30", false);
+    brain.localBrainPeerAddressText = "10.0.0.30"_ctv;
+
+    BrainView *designatedPeer = makePeer(uint128_t(0x520), 40, IPAddress("10.0.0.31", false).v4, "10.0.0.31");
+    designatedPeer->connected = true;
+    designatedPeer->isFixedFile = true;
+    designatedPeer->fslot = 54;
+    brain.pendingDesignatedMasterPeerKey = designatedPeer->uuid;
+    brain.brains.insert(designatedPeer);
+
+    BrainView *reachablePeer = makePeer(uint128_t(0x530), 41, IPAddress("10.0.0.32", false).v4, "10.0.0.32");
+    reachablePeer->connected = true;
+    reachablePeer->isMasterMissing = true;
+    reachablePeer->isFixedFile = true;
+    reachablePeer->fslot = 55;
+    brain.brains.insert(reachablePeer);
+
+    brain.testBrainMissing(designatedPeer);
+
+    suite.expect(brain.metroReachabilityChecks == 1,
+                 "brain_missing_pending_designated_master_checks_insufficient_majority");
+    suite.expect(brain.isMasterMissing == false && brain.noMasterYet && brain.weAreMaster == false && reachablePeer->isMasterBrain == false,
+                 "brain_missing_pending_designated_master_insufficient_majority_does_not_elect");
+
+    brain.brains.erase(designatedPeer);
+    brain.brains.erase(reachablePeer);
+    delete designatedPeer;
+    delete reachablePeer;
+  }
+
+  {
+    ScopedRing scopedRing = {};
+
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    brain.nBrains = 3;
+    brain.hasCompletedInitialMasterElection = true;
+    brain.noMasterYet = false;
+    brain.weAreMaster = false;
+
+    BrainView *commandPeer = makePeer(uint128_t(0x620), 50, IPAddress("10.0.0.41", false).v4, "10.0.0.41");
+    commandPeer->connected = true;
+    commandPeer->isFixedFile = true;
+    commandPeer->fslot = 64;
+    brain.brains.insert(commandPeer);
+
+    BrainView *designatedPeer = makePeer(uint128_t(0x630), 51, IPAddress("10.0.0.42", false).v4, "10.0.0.42");
+    designatedPeer->connected = false;
+    designatedPeer->quarantined = true;
+    designatedPeer->isFixedFile = true;
+    designatedPeer->fslot = 65;
+    brain.brains.insert(designatedPeer);
+
+    String buffer = {};
+    Message *message = buildBrainMessage(buffer,
+                                         BrainTopic::relinquishMasterStatus,
+                                         uint8_t(0),
+                                         designatedPeer->uuid);
+    brain.testBrainHandler(commandPeer, message);
+
+    bool sawMasterMissingFrame = false;
+    forEachMessageInBuffer(commandPeer->wBuffer, [&](Message *frame) {
+      if (BrainTopic(frame->topic) == BrainTopic::masterMissing)
+      {
+        sawMasterMissingFrame = true;
+      }
+    });
+
+    suite.expect(brain.pendingDesignatedMasterPeerKey == designatedPeer->uuid,
+                 "relinquish_unavailable_designated_master_preserves_designation_for_recovery");
+    suite.expect(brain.isMasterMissing,
+                 "relinquish_unavailable_designated_master_starts_majority_recovery");
+    suite.expect(sawMasterMissingFrame,
+                 "relinquish_unavailable_designated_master_gossips_to_command_peer");
+
+    brain.brains.erase(commandPeer);
+    brain.brains.erase(designatedPeer);
+    delete commandPeer;
+    delete designatedPeer;
+  }
+
+  {
+    ScopedRing scopedRing = {};
+
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    brain.nBrains = 3;
+    brain.hasCompletedInitialMasterElection = true;
+    brain.noMasterYet = true;
+    brain.weAreMaster = false;
+
+    BrainView *commandPeer = makePeer(uint128_t(0x720), 60, IPAddress("10.0.0.51", false).v4, "10.0.0.51");
+    commandPeer->connected = true;
+    commandPeer->isFixedFile = true;
+    commandPeer->fslot = 74;
+    brain.brains.insert(commandPeer);
+
+    BrainView *designatedPeer = makePeer(uint128_t(0x730), 61, IPAddress("10.0.0.52", false).v4, "10.0.0.52");
+    designatedPeer->connected = false;
+    designatedPeer->quarantined = true;
+    designatedPeer->isFixedFile = true;
+    designatedPeer->fslot = 75;
+    brain.pendingDesignatedMasterPeerKey = designatedPeer->uuid;
+    brain.brains.insert(designatedPeer);
+
+    String buffer = {};
+    Message *message = buildBrainMessage(buffer,
+                                         BrainTopic::peerHeartbeat,
+                                         false,
+                                         uint64_t(1));
+    brain.testBrainHandler(commandPeer, message);
+
+    bool sawMasterMissingFrame = false;
+    forEachMessageInBuffer(commandPeer->wBuffer, [&](Message *frame) {
+      if (BrainTopic(frame->topic) == BrainTopic::masterMissing)
+      {
+        sawMasterMissingFrame = true;
+      }
+    });
+
+    suite.expect(brain.isMasterMissing,
+                 "peer_heartbeat_restored_unavailable_designated_master_starts_majority_recovery");
+    suite.expect(sawMasterMissingFrame,
+                 "peer_heartbeat_restored_unavailable_designated_master_gossips_to_surviving_peer");
+
+    brain.brains.erase(commandPeer);
+    brain.brains.erase(designatedPeer);
+    delete commandPeer;
+    delete designatedPeer;
+  }
+}
+
 int main(void)
 {
   TestSuite suite;
@@ -1369,6 +1622,11 @@ int main(void)
     {
       TestBrain familyFallbackBrain = {};
       runShouldWeConnectFamilyFallbackFixture(familyFallbackBrain);
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (std::strcmp(testOnly, "pending-designated-master-recovery") == 0)
+    {
+      runPendingDesignatedMasterRecoveryFixtures(suite);
       return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
   }
@@ -3749,6 +4007,8 @@ int main(void)
     delete masterPeer;
     delete followerPeer;
   }
+
+  runPendingDesignatedMasterRecoveryFixtures(suite);
 
   {
     ScopedRing scopedRing = {};
