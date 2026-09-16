@@ -22494,6 +22494,126 @@ static void testLocalBundleRecoveryWaitsForCapturedInventory(TestSuite& suite)
   thisBrain = previousBrain;
 }
 
+static void testReplicatedAllMachineBundleRecoveryWitnessIsUUIDIndexed(TestSuite& suite)
+{
+  TestBrain successor = {};
+  ProdigyMasterAuthorityRuntimeState incoming = {};
+  incoming.generation = 1;
+  incoming.nextPendingAddMachinesOperationID = 1;
+  incoming.nextPendingElasticAddressOperationID = 1;
+  incoming.nextDNSIntentRevision = 1;
+  incoming.nextTlsResumptionGeneration = 1;
+  incoming.updateSelf.workerExpectedBundleSHA256 =
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
+  for (uint128_t machineUUID : {uint128_t(0x52190003), uint128_t(0x52190001), uint128_t(0x52190002)})
+  {
+    ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
+    witness.machineUUID = machineUUID;
+    witness.bundleRegistered = true;
+    witness.containerBootstraps.push_back("captured-bootstrap"_ctv);
+    incoming.updateSelf.machineRecoveryWitnesses.push_back(std::move(witness));
+  }
+
+  suite.require(successor.applyReplicatedMasterAuthorityRuntimeState(incoming, true),
+                "all_machine_bundle_recovery_projects_authoritative_witness_before_ack");
+  suite.expect(successor.updateSelfMachineRecoveryWitnesses.size() == 3 &&
+                   successor.updateSelfMachineRecoveryWitnesses[0].machineUUID == uint128_t(0x52190001) &&
+                   successor.updateSelfMachineRecoveryWitnesses[1].machineUUID == uint128_t(0x52190002) &&
+                   successor.updateSelfMachineRecoveryWitnesses[2].machineUUID == uint128_t(0x52190003) &&
+                   successor.updateSelfMachineRecoveryWitnesses[0].bundleRegistered == false &&
+                   successor.updateSelfLocalMachineUUID == 0,
+               "all_machine_bundle_recovery_persists_sorted_uuid_witnesses_without_remote_registration_credit");
+
+  ProdigyMasterAuthorityRuntimeState conflicting = incoming;
+  conflicting.generation = 2;
+  conflicting.updateSelf.machineRecoveryWitnesses[1].machineUUID = uint128_t(0x52190004);
+  suite.expect(successor.applyReplicatedMasterAuthorityRuntimeState(conflicting, true) == false &&
+                   successor.updateSelfMachineRecoveryWitnesses.size() == 3,
+               "all_machine_bundle_recovery_rejects_conflicting_promoted_master_witness");
+
+  ProdigyMasterAuthorityRuntimeState completion = incoming;
+  completion.generation = 2;
+  completion.updateSelf = {};
+  suite.require(successor.applyReplicatedMasterAuthorityRuntimeState(completion, true),
+                "all_machine_bundle_recovery_accepts_authenticated_completion");
+  suite.expect(successor.updateSelfMachineRecoveryWitnesses.empty(),
+               "all_machine_bundle_recovery_completion_clears_all_machine_witnesses");
+
+  TestBrain inventoryOwner = {};
+  Machine machines[3] = {};
+  ContainerView containers[3] = {};
+  inventoryOwner.updateSelfWorkerExpectedBundleSHA256 = incoming.updateSelf.workerExpectedBundleSHA256;
+  inventoryOwner.brainConfig.datacenterFragment = 1;
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    Machine& machine = machines[index];
+    machine.uuid = uint128_t(0x52191001 + index);
+    machine.runtimeReady = true;
+    inventoryOwner.machines.insert(&machine);
+    inventoryOwner.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+    inventoryOwner.persistedMachineInventoryUploaded.insert(machine.uuid);
+
+    ContainerView& container = containers[index];
+    container.uuid = uint128_t(0x52192001 + index);
+    container.deploymentID = 0x52193001 + index;
+    container.machine = &machine;
+    machine.upsertContainerIndexEntry(container.deploymentID, &container);
+
+    ContainerPlan plan = {};
+    plan.uuid = container.uuid;
+    plan.fragment = 0x110001 + index;
+    IPPrefix address = {};
+    address.network.is6 = true;
+    address.cidr = 128;
+    std::memcpy(address.network.v6, container_network_subnet6.value, sizeof(container_network_subnet6.value));
+    address.network.v6[11] = inventoryOwner.brainConfig.datacenterFragment;
+    address.network.v6[12] = 0x10;
+    address.network.v6[13] = 0x00;
+    address.network.v6[14] = uint8_t(index + 1);
+    address.network.v6[15] = uint8_t(plan.fragment);
+    plan.addresses.push_back(address);
+    NeuronContainerBootstrap bootstrap = {};
+    bootstrap.plan = plan;
+    String serialized = {};
+    BitseryEngine::serialize(serialized, bootstrap);
+    ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
+    witness.machineUUID = machine.uuid;
+    witness.bundleRegistered = true;
+    witness.containerBootstraps.push_back(std::move(serialized));
+    inventoryOwner.updateSelfMachineRecoveryWitnesses.push_back(std::move(witness));
+  }
+  bool restoredFragments = true;
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    restoredFragments = inventoryOwner.restorePendingLocalMachineFragment(&machines[index]) &&
+                        machines[index].fragment == uint32_t(0x100001 + index) && restoredFragments;
+    // Fragment restoration intentionally invalidates readiness. Model the
+    // required post-exec state upload before checking the recovery barrier.
+    machines[index].reportedDatacenterFragment = inventoryOwner.brainConfig.datacenterFragment;
+    machines[index].reportedFragment = machines[index].fragment;
+    machines[index].runtimeReady = true;
+  }
+  suite.expect(restoredFragments,
+               "all_machine_bundle_recovery_restores_each_witness_machine_fragment_before_inventory_replay");
+  suite.expect(inventoryOwner.allMachineBundleInventoriesMatch(),
+               "all_machine_bundle_recovery_promoted_master_requires_three_distinct_uuid_inventories_before_deficit_recovery");
+  inventoryOwner.persistedMachineInventoryUploaded.erase(machines[1].uuid);
+  suite.expect(inventoryOwner.allMachineBundleInventoriesMatch() == false,
+               "all_machine_bundle_recovery_missing_machine_inventory_holds_persisted_recovery_barrier");
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    machines[index].removeContainerIndexEntry(containers[index].deploymentID, &containers[index]);
+    inventoryOwner.machinesByUUID.erase(machines[index].uuid);
+    inventoryOwner.machines.erase(&machines[index]);
+  }
+
+  TestBrain incompleteRecovery = {};
+  incompleteRecovery.recoveringPersistedNeuronInventory = true;
+  suite.expect(incompleteRecovery.prepareLocalBundleExecRecovery() == false &&
+                   incompleteRecovery.updateSelfMachineRecoveryWitnesses.empty(),
+               "all_machine_bundle_recovery_refuses_partial_persisted_inventory_capture");
+}
+
 static void testReplicatedLocalBundleRecoveryWitnessIsDurableAndBounded(TestSuite& suite)
 {
   TestBrain successor = {};
@@ -24574,6 +24694,7 @@ int main(void)
       only != nullptr && strcmp(only, "local-bundle-recovery-ordering") == 0)
   {
     testLocalBundleRecoveryWaitsForCapturedInventory(suite);
+    testReplicatedAllMachineBundleRecoveryWitnessIsUUIDIndexed(suite);
     testReplicatedLocalBundleRecoveryWitnessIsDurableAndBounded(suite);
     testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(suite);
     testBrainNeuronRegistrationKeepsHealthyRuntimeReadyWithoutRefresh(suite);

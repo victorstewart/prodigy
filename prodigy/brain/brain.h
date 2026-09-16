@@ -1146,6 +1146,7 @@ public:
   uint32_t updateSelfLocalMachineFragment = 0;
   bool updateSelfLocalBundleRegistered = false;
   Vector<String> updateSelfLocalContainerBootstraps;
+  Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness> updateSelfMachineRecoveryWitnesses;
   constexpr static int64_t connectFailureLogIntervalMs = prodigyBrainConnectFailureLogIntervalMs;
   constexpr static int64_t certificateLifecycleBaseRetryDelayMs = 5 * 60 * 1000;
   constexpr static int64_t certificateLifecycleMaxRetryDelayMs = 60 * 60 * 1000;
@@ -1958,6 +1959,12 @@ public:
     state.localMachineUUID = updateSelfLocalMachineUUID;
     state.localBundleRegistered = updateSelfLocalBundleRegistered;
     state.localContainerBootstraps = updateSelfLocalContainerBootstraps;
+    state.machineRecoveryWitnesses = updateSelfMachineRecoveryWitnesses;
+    std::sort(state.machineRecoveryWitnesses.begin(), state.machineRecoveryWitnesses.end(),
+              [](const ProdigyPersistentUpdateSelfMachineRecoveryWitness& lhs,
+                 const ProdigyPersistentUpdateSelfMachineRecoveryWitness& rhs) {
+                return lhs.machineUUID < rhs.machineUUID;
+              });
 
     std::sort(state.bundleEchoPeerKeys.begin(), state.bundleEchoPeerKeys.end());
     std::sort(state.relinquishEchoPeerKeys.begin(), state.relinquishEchoPeerKeys.end());
@@ -2031,23 +2038,55 @@ public:
     updateSelfLocalMachineUUID = state.localMachineUUID;
     updateSelfLocalBundleRegistered = state.localBundleRegistered;
     updateSelfLocalContainerBootstraps = state.localContainerBootstraps;
+    updateSelfMachineRecoveryWitnesses = state.machineRecoveryWitnesses;
+  }
+
+  ProdigyPersistentUpdateSelfMachineRecoveryWitness *findUpdateSelfMachineRecoveryWitness(uint128_t machineUUID)
+  {
+    for (auto& witness : updateSelfMachineRecoveryWitnesses)
+    {
+      if (witness.machineUUID == machineUUID)
+      {
+        return &witness;
+      }
+    }
+    return nullptr;
+  }
+
+  const ProdigyPersistentUpdateSelfMachineRecoveryWitness *findUpdateSelfMachineRecoveryWitness(uint128_t machineUUID) const
+  {
+    return const_cast<Brain *>(this)->findUpdateSelfMachineRecoveryWitness(machineUUID);
   }
 
   static ProdigyPersistentUpdateSelfState projectUpdateSelfRecoveryWitness(
       const ProdigyPersistentUpdateSelfState& state)
   {
     ProdigyPersistentUpdateSelfState witness = {};
+    witness.workerExpectedBundleSHA256 = state.workerExpectedBundleSHA256;
+    if (state.machineRecoveryWitnesses.empty() == false)
+    {
+      witness.machineRecoveryWitnesses = state.machineRecoveryWitnesses;
+      std::sort(witness.machineRecoveryWitnesses.begin(), witness.machineRecoveryWitnesses.end(),
+                [](const ProdigyPersistentUpdateSelfMachineRecoveryWitness& lhs,
+                   const ProdigyPersistentUpdateSelfMachineRecoveryWitness& rhs) {
+                  return lhs.machineUUID < rhs.machineUUID;
+                });
+      for (auto& machine : witness.machineRecoveryWitnesses)
+      {
+        // Registration attestation belongs to the active owner.
+        machine.bundleRegistered = false;
+      }
+      return witness;
+    }
     if (state.localMachineUUID == 0 || state.localContainerBootstraps.empty())
     {
       return witness;
     }
 
-    // The update coordinator and bundle payload are local to the current
-    // master.  A successor needs only the exact local re-adoption witness.
-    witness.workerExpectedBundleSHA256 = state.workerExpectedBundleSHA256;
+    // Legacy single-witness snapshots remain readable, but multi-Brain
+    // recovery rejects them before scheduling because they cannot prove every
+    // retained machine inventory.
     witness.localMachineUUID = state.localMachineUUID;
-    // Registration attestation belongs to the active owner.  A successor
-    // must obtain its own matching registration before it may clear the fence.
     witness.localBundleRegistered = false;
     witness.localContainerBootstraps = state.localContainerBootstraps;
     return witness;
@@ -6410,14 +6449,28 @@ public:
         capturePersistentUpdateSelfState();
     const ProdigyPersistentUpdateSelfState localRecoveryWitness =
         projectUpdateSelfRecoveryWitness(localUpdateCoordinator);
-    if (incomingRecoveryWitness.localMachineUUID != 0 &&
-        localRecoveryWitness.localMachineUUID != 0 &&
+    const bool incomingHasAllMachineWitness = incomingRecoveryWitness.machineRecoveryWitnesses.empty() == false;
+    const bool localHasAllMachineWitness = localRecoveryWitness.machineRecoveryWitnesses.empty() == false;
+    const bool incomingHasLegacyWitness = incomingRecoveryWitness.localMachineUUID != 0;
+    const bool localHasLegacyWitness = localRecoveryWitness.localMachineUUID != 0;
+    if ((incomingHasAllMachineWitness || incomingHasLegacyWitness) &&
+        (localHasAllMachineWitness || localHasLegacyWitness) &&
         updateSelfRecoveryWitnessMatches(incomingRecoveryWitness, localRecoveryWitness) == false)
     {
       return false;
     }
 
-    if (incomingRecoveryWitness.localMachineUUID != 0)
+    if (incomingHasAllMachineWitness)
+    {
+      localUpdateCoordinator.workerExpectedBundleSHA256 =
+          incomingRecoveryWitness.workerExpectedBundleSHA256;
+      localUpdateCoordinator.machineRecoveryWitnesses =
+          incomingRecoveryWitness.machineRecoveryWitnesses;
+      localUpdateCoordinator.localMachineUUID = 0;
+      localUpdateCoordinator.localBundleRegistered = false;
+      localUpdateCoordinator.localContainerBootstraps.clear();
+    }
+    else if (incomingHasLegacyWitness)
     {
       localUpdateCoordinator.workerExpectedBundleSHA256 =
           incomingRecoveryWitness.workerExpectedBundleSHA256;
@@ -6425,8 +6478,9 @@ public:
       localUpdateCoordinator.localBundleRegistered = false;
       localUpdateCoordinator.localContainerBootstraps =
           incomingRecoveryWitness.localContainerBootstraps;
+      localUpdateCoordinator.machineRecoveryWitnesses.clear();
     }
-    else if (localRecoveryWitness.localMachineUUID != 0 &&
+    else if ((localHasAllMachineWitness || localHasLegacyWitness) &&
              updateSelfCoordinatorActiveBeyondRecoveryWitness(localUpdateCoordinator) == false)
     {
       // An authenticated empty later projection completes either a copied
@@ -6437,6 +6491,7 @@ public:
       localUpdateCoordinator.localMachineUUID = 0;
       localUpdateCoordinator.localBundleRegistered = false;
       localUpdateCoordinator.localContainerBootstraps.clear();
+      localUpdateCoordinator.machineRecoveryWitnesses.clear();
     }
 
     ProdigyMasterAuthorityRuntimeState sanitizedIncoming = incoming;
@@ -11433,11 +11488,25 @@ public:
       return false;
     }
 
-    // A restarted local Neuron can announce an empty in-memory inventory before
-    // the recovered bundle registration asks it to replay the durable local
-    // container bootstraps.  That upload cannot release the persisted-inventory
-    // barrier: doing so lets normal scheduling create successors beside the
-    // retained local processes before their authoritative replay arrives.
+    // A restarted Neuron can announce an empty in-memory inventory before
+    // the recovered registration asks it to replay the durable bootstraps.
+    // Every captured machine must attest its exact inventory before normal
+    // recovery is allowed to schedule a deficit.
+    if (updateSelfMachineRecoveryWitnesses.empty() == false)
+    {
+      if (allMachineBundleInventoriesMatch() == false)
+      {
+        return false;
+      }
+    }
+    // A legacy singleton record is insufficient for a multi-Brain recovery.
+    // Old snapshots remain readable, but a new scheduler must fail closed
+    // rather than creating replacements beside unproven retained peers.
+    if (machines.size() > 1 && (updateSelfLocalMachineUUID != 0 ||
+                                updateSelfLocalContainerBootstraps.empty() == false))
+    {
+      return false;
+    }
     if (updateSelfLocalMachineUUID != 0 && updateSelfLocalContainerBootstraps.empty() == false)
     {
       Machine *local = findMachineByUUID(updateSelfLocalMachineUUID);
@@ -13871,7 +13940,18 @@ public:
 
     Vector<String> liveBootstraps = {};
     const Vector<String> *bootstraps = nullptr;
-    if (machine->uuid == updateSelfLocalMachineUUID && updateSelfLocalMachineUUID != 0)
+    if (const auto *witness = findUpdateSelfMachineRecoveryWitness(machine->uuid))
+    {
+      bootstraps = &witness->containerBootstraps;
+    }
+    else if (updateSelfMachineRecoveryWitnesses.empty() == false)
+    {
+      // A partial all-machine checkpoint must never turn into an empty upload
+      // that releases the persisted-inventory barrier and schedules duplicates.
+      machine->neuron.wBuffer.resize(headerOffset);
+      return;
+    }
+    else if (machine->uuid == updateSelfLocalMachineUUID && updateSelfLocalMachineUUID != 0)
     {
       bootstraps = &updateSelfLocalContainerBootstraps;
     }
@@ -13945,16 +14025,17 @@ public:
     }
   }
 
-  bool deriveUpdateSelfLocalMachineFragmentFromCapturedBootstraps(uint32_t& fragment) const
+  bool deriveMachineFragmentFromCapturedBootstraps(
+      const Vector<String>& bootstraps,
+      uint32_t& fragment) const
   {
     fragment = 0;
-    if (updateSelfLocalMachineUUID == 0 || updateSelfLocalContainerBootstraps.empty() ||
-        brainConfig.datacenterFragment == 0)
+    if (bootstraps.empty() || brainConfig.datacenterFragment == 0)
     {
       return false;
     }
 
-    for (const String& serializedBootstrap : updateSelfLocalContainerBootstraps)
+    for (const String& serializedBootstrap : bootstraps)
     {
       NeuronContainerBootstrap bootstrap = {};
       if (BitseryEngine::deserializeSafe(serializedBootstrap, bootstrap) == false)
@@ -13993,30 +14074,51 @@ public:
     return fragment != 0;
   }
 
+  bool deriveUpdateSelfLocalMachineFragmentFromCapturedBootstraps(uint32_t& fragment) const
+  {
+    if (updateSelfLocalMachineUUID == 0)
+    {
+      fragment = 0;
+      return false;
+    }
+    return deriveMachineFragmentFromCapturedBootstraps(updateSelfLocalContainerBootstraps, fragment);
+  }
+
   bool restorePendingLocalMachineFragment(Machine *machine)
   {
-    if (machine == nullptr || updateSelfLocalMachineUUID == 0 ||
-        machine->uuid != updateSelfLocalMachineUUID)
+    if (machine == nullptr)
     {
       return true;
     }
 
-    uint32_t expectedFragment = updateSelfLocalMachineFragment;
-    if (expectedFragment == 0 && updateSelfLocalContainerBootstraps.empty())
+    const ProdigyPersistentUpdateSelfMachineRecoveryWitness *witness =
+        findUpdateSelfMachineRecoveryWitness(machine->uuid);
+    const bool legacyLocal = updateSelfMachineRecoveryWitnesses.empty() &&
+                             updateSelfLocalMachineUUID != 0 &&
+                             machine->uuid == updateSelfLocalMachineUUID;
+    if (witness == nullptr && legacyLocal == false)
+    {
+      return true;
+    }
+
+    uint32_t expectedFragment = legacyLocal ? updateSelfLocalMachineFragment : 0;
+    const Vector<String>& bootstraps = witness ? witness->containerBootstraps :
+                                                  updateSelfLocalContainerBootstraps;
+    if (expectedFragment == 0 && bootstraps.empty())
     {
       return true;
     }
     if (expectedFragment == 0 &&
-        deriveUpdateSelfLocalMachineFragmentFromCapturedBootstraps(expectedFragment) == false)
+        deriveMachineFragmentFromCapturedBootstraps(bootstraps, expectedFragment) == false)
     {
-      updateSelfWorkerFailure.assign("bootstrap recovery local machine fragment is unavailable"_ctv);
+      updateSelfWorkerFailure.assign("bootstrap recovery machine fragment is unavailable"_ctv);
       noteMasterAuthorityRuntimeStateChanged();
       return false;
     }
-    updateSelfLocalMachineFragment = expectedFragment;
+    if (legacyLocal) updateSelfLocalMachineFragment = expectedFragment;
     if (machine->fragment != 0 && machine->fragment != expectedFragment)
     {
-      updateSelfWorkerFailure.assign("bootstrap recovery local machine fragment conflicts with checkpoint"_ctv);
+      updateSelfWorkerFailure.assign("bootstrap recovery machine fragment conflicts with checkpoint"_ctv);
       noteMasterAuthorityRuntimeStateChanged();
       return false;
     }
@@ -14024,7 +14126,7 @@ public:
     {
       if (other != nullptr && other != machine && other->fragment == expectedFragment)
       {
-        updateSelfWorkerFailure.assign("bootstrap recovery local machine fragment is already assigned"_ctv);
+        updateSelfWorkerFailure.assign("bootstrap recovery machine fragment is already assigned"_ctv);
         noteMasterAuthorityRuntimeStateChanged();
         return false;
       }
@@ -25159,43 +25261,152 @@ public:
     }
   }
 
-  bool prepareLocalBundleExecRecovery(void)
+  bool machineBundleInventoryIncludesCapturedBootstraps(
+      const Machine *machine,
+      const Vector<String>& bootstraps,
+      const bytell_hash_set<uint128_t>& reportedContainerUUIDs) const
   {
-    Machine *localMachine = nullptr;
-    for (Machine *machine : machines)
+    if (machine == nullptr || reportedContainerUUIDs.size() < bootstraps.size())
     {
-      if (machine == nullptr || machine->isThisMachine == false)
+      return false;
+    }
+    // The local Neuron may also own lifecycle infrastructure (for example the
+    // Mothership tunnel provider) that is not part of application deployment
+    // replay. Require every captured application identity without rejecting
+    // those independently owned live runtimes.
+    for (const String& serializedBootstrap : bootstraps)
+    {
+      NeuronContainerBootstrap bootstrap = {};
+      if (BitseryEngine::deserializeSafe(serializedBootstrap, bootstrap) == false ||
+          reportedContainerUUIDs.contains(bootstrap.plan.uuid) == false)
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool machineBundleInventoryMatchesWitness(
+      Machine *machine,
+      const ProdigyPersistentUpdateSelfMachineRecoveryWitness& witness) const
+  {
+    if (machine == nullptr || machine->uuid == 0 || machine->uuid != witness.machineUUID ||
+        witness.bundleRegistered == false || machine->runtimeReady == false ||
+        persistedMachineInventoryUploaded.contains(machine->uuid) == false)
+    {
+      return false;
+    }
+    bytell_hash_set<uint128_t> inventory = {};
+    for (const auto& [deploymentID, machineContainers] : machine->containersByDeploymentID)
+    {
+      (void)deploymentID;
+      for (const ContainerView *container : machineContainers)
+      {
+        if (container != nullptr) inventory.insert(container->uuid);
+      }
+    }
+    return machineBundleInventoryIncludesCapturedBootstraps(machine, witness.containerBootstraps, inventory);
+  }
+
+  bool allMachineBundleInventoriesMatch(void) const
+  {
+    if (updateSelfMachineRecoveryWitnesses.empty()) return false;
+    bytell_hash_set<uint128_t> seen = {};
+    for (const auto& witness : updateSelfMachineRecoveryWitnesses)
+    {
+      if (witness.machineUUID == 0 || seen.insert(witness.machineUUID).second == false ||
+          machineBundleInventoryMatchesWitness(findMachineByUUID(witness.machineUUID), witness) == false)
+      {
+        return false;
+      }
+    }
+    // The witness is an exact all-machine recovery record.  Do not let an
+    // omitted live machine release the inventory barrier.
+    for (const Machine *machine : machines)
+    {
+      if (machine == nullptr || machine->state == MachineState::hardwareFailure ||
+          machine->state == MachineState::decommissioning)
       {
         continue;
       }
-      if (localMachine != nullptr)
+      if (machine->uuid == 0 || seen.contains(machine->uuid) == false) return false;
+    }
+    return true;
+  }
+
+  bool prepareLocalBundleExecRecovery(void)
+  {
+    if (updateSelfMachineRecoveryWitnesses.empty() == false &&
+        masterAuthorityRuntimeStateDurable &&
+        masterAuthorityRuntimeState.updateSelf.machineRecoveryWitnesses == updateSelfMachineRecoveryWitnesses)
+    {
+      // A same-digest retry resumes a durably committed all-machine checkpoint.
+      // Do not replace it with a post-handoff local view.
+      return true;
+    }
+    if (recoveringPersistedNeuronInventory)
+    {
+      updateSelfWorkerFailure.assign("persisted machine inventory is incomplete for bundle exec"_ctv);
+      return false;
+    }
+    // A master can be replaced while its peers exec the same bundle.  Capture
+    // every machine through the established Neuron plan collector before the
+    // transition, so a promoted successor can require each retained inventory
+    // rather than scheduling a deficit beside it.
+    Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness> witnesses = {};
+    bytell_hash_set<uint128_t> seen = {};
+    for (Machine *machine : machines)
+    {
+      if (machine == nullptr || machine->state == MachineState::hardwareFailure ||
+          machine->state == MachineState::decommissioning)
       {
-        updateSelfWorkerFailure.assign("multiple local machines while preparing bundle exec"_ctv);
+        continue;
+      }
+      if (machine->uuid == 0 || seen.insert(machine->uuid).second == false)
+      {
+        updateSelfWorkerFailure.assign("machine identity unavailable while preparing bundle exec"_ctv);
         return false;
       }
-      localMachine = machine;
+      ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
+      witness.machineUUID = machine->uuid;
+      if (collectNeuronStateUploadBootstraps(machine, witness.containerBootstraps) == false)
+      {
+        updateSelfWorkerFailure.assign("machine container ownership could not be captured for bundle exec"_ctv);
+        return false;
+      }
+      witnesses.push_back(std::move(witness));
     }
-    if (localMachine == nullptr)
+    if (witnesses.empty())
     {
-      updateSelfWorkerFailure.assign("local machine missing while preparing bundle exec"_ctv);
+      updateSelfWorkerFailure.assign("no machine inventory available while preparing bundle exec"_ctv);
       return false;
     }
-
-    Vector<String> bootstraps = {};
-    if (collectNeuronStateUploadBootstraps(localMachine, bootstraps) == false)
-    {
-      updateSelfWorkerFailure.assign("local container ownership could not be captured for bundle exec"_ctv);
-      return false;
-    }
-
-    updateSelfLocalMachineUUID = localMachine->uuid;
+    std::sort(witnesses.begin(), witnesses.end(), [](const auto& lhs, const auto& rhs) {
+      return lhs.machineUUID < rhs.machineUUID;
+    });
+    const Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness> previousWitnesses =
+        updateSelfMachineRecoveryWitnesses;
+    const uint128_t previousLocalMachineUUID = updateSelfLocalMachineUUID;
+    const uint32_t previousLocalMachineFragment = updateSelfLocalMachineFragment;
+    const bool previousLocalBundleRegistered = updateSelfLocalBundleRegistered;
+    const Vector<String> previousLocalBootstraps = updateSelfLocalContainerBootstraps;
+    updateSelfMachineRecoveryWitnesses = std::move(witnesses);
+    // New producers use the all-machine witness.  Preserve legacy fields only
+    // while reading an old snapshot; never overwrite this record with the
+    // former master's later local recapture.
+    updateSelfLocalMachineUUID = 0;
     updateSelfLocalMachineFragment = 0;
     updateSelfLocalBundleRegistered = false;
-    updateSelfLocalContainerBootstraps = std::move(bootstraps);
+    updateSelfLocalContainerBootstraps.clear();
     updateSelfWorkerFailure.clear();
     if (commitMasterAuthorityStateChange() == false)
     {
-      updateSelfWorkerFailure.assign("local bundle-exec recovery state could not be persisted"_ctv);
+      updateSelfMachineRecoveryWitnesses = previousWitnesses;
+      updateSelfLocalMachineUUID = previousLocalMachineUUID;
+      updateSelfLocalMachineFragment = previousLocalMachineFragment;
+      updateSelfLocalBundleRegistered = previousLocalBundleRegistered;
+      updateSelfLocalContainerBootstraps = previousLocalBootstraps;
+      updateSelfWorkerFailure.assign("bundle-exec recovery state could not be persisted"_ctv);
       return false;
     }
     return true;
@@ -25205,8 +25416,14 @@ public:
       const Machine *machine,
       const String& installedDigest)
   {
-    if (machine == nullptr || updateSelfLocalMachineUUID == 0 ||
-        machine->uuid != updateSelfLocalMachineUUID)
+    if (machine == nullptr) return false;
+    auto *witness = findUpdateSelfMachineRecoveryWitness(machine->uuid);
+    if (updateSelfMachineRecoveryWitnesses.empty() == false && witness == nullptr)
+    {
+      return false;
+    }
+    if (witness == nullptr &&
+        (updateSelfLocalMachineUUID == 0 || machine->uuid != updateSelfLocalMachineUUID))
     {
       return false;
     }
@@ -25220,6 +25437,18 @@ public:
       }
       return false;
     }
+    if (witness != nullptr)
+    {
+      if (witness->bundleRegistered == false)
+      {
+        witness->bundleRegistered = true;
+        updateSelfWorkerFailure.clear();
+        noteMasterAuthorityRuntimeStateChanged();
+      }
+      return true;
+    }
+    if (updateSelfMachineRecoveryWitnesses.empty() == false) return false;
+    if (updateSelfLocalMachineUUID == 0 || machine->uuid != updateSelfLocalMachineUUID) return false;
     if (updateSelfLocalBundleRegistered == false)
     {
       updateSelfLocalBundleRegistered = true;
@@ -25233,31 +25462,18 @@ public:
       const Machine *machine,
       const bytell_hash_set<uint128_t>& reportedContainerUUIDs) const
   {
-    if (machine == nullptr || machine->uuid != updateSelfLocalMachineUUID ||
-        reportedContainerUUIDs.size() < updateSelfLocalContainerBootstraps.size())
-    {
-      return false;
-    }
-    // The local Neuron may also own lifecycle infrastructure (for example the
-    // Mothership tunnel provider) that is not part of application deployment
-    // replay. Require every captured application identity without rejecting
-    // those independently owned live runtimes.
-    for (const String& serializedBootstrap : updateSelfLocalContainerBootstraps)
-    {
-      NeuronContainerBootstrap bootstrap = {};
-      if (BitseryEngine::deserializeSafe(serializedBootstrap, bootstrap) == false ||
-          reportedContainerUUIDs.contains(bootstrap.plan.uuid) == false)
-      {
-        return false;
-      }
-    }
-    return true;
+    return machine != nullptr && machine->uuid == updateSelfLocalMachineUUID &&
+           machineBundleInventoryIncludesCapturedBootstraps(machine, updateSelfLocalContainerBootstraps, reportedContainerUUIDs);
   }
 
   bool localBundleInventoryMatches(
       const Machine *machine,
       const bytell_hash_set<uint128_t>& reportedContainerUUIDs) const
   {
+    if (updateSelfMachineRecoveryWitnesses.empty() == false)
+    {
+      return allMachineBundleInventoriesMatch();
+    }
     return machine != nullptr && machine->uuid == updateSelfLocalMachineUUID &&
            updateSelfLocalBundleRegistered &&
            updateSelfWorkerStateUploadedMachineUUIDs.size() == updateSelfWorkerMachineUUIDs.size() &&
@@ -25279,6 +25495,7 @@ public:
     updateSelfLocalMachineFragment = 0;
     updateSelfLocalBundleRegistered = false;
     updateSelfLocalContainerBootstraps.clear();
+    updateSelfMachineRecoveryWitnesses.clear();
     noteMasterAuthorityRuntimeStateChanged();
   }
 
@@ -30628,7 +30845,8 @@ public:
               }
               else
               {
-                if (updateSelfLocalMachineUUID != 0 &&
+                if ((updateSelfMachineRecoveryWitnesses.empty() == false ||
+                     updateSelfLocalMachineUUID != 0) &&
                     updateSelfWorkerExpectedBundleSHA256.equals(expectedWorkerDigest) == false)
                 {
                   response.success = false;
@@ -30637,7 +30855,8 @@ public:
                 else
                 {
                   updateSelfWorkerExpectedBundleSHA256 = expectedWorkerDigest;
-                  if (updateSelfLocalMachineUUID == 0 && prepareLocalBundleExecRecovery() == false)
+                  if (updateSelfMachineRecoveryWitnesses.empty() &&
+                      updateSelfLocalMachineUUID == 0 && prepareLocalBundleExecRecovery() == false)
                   {
                     response.success = false;
                     response.failure = updateSelfWorkerFailure;
