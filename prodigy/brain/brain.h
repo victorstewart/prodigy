@@ -2092,6 +2092,12 @@ public:
     return witness;
   }
 
+  static bool hasUpdateSelfRecoveryWitness(const ProdigyPersistentUpdateSelfState& state)
+  {
+    const ProdigyPersistentUpdateSelfState witness = projectUpdateSelfRecoveryWitness(state);
+    return witness.localMachineUUID != 0 || witness.machineRecoveryWitnesses.empty() == false;
+  }
+
   static bool updateSelfRecoveryWitnessMatches(
       const ProdigyPersistentUpdateSelfState& lhs,
       const ProdigyPersistentUpdateSelfState& rhs)
@@ -25051,10 +25057,7 @@ public:
   bool updateSelfRecoveryWitnessAcknowledgedByPeers(
       const bytell_hash_set<uint128_t>& requiredPeerKeys) const
   {
-    const ProdigyPersistentUpdateSelfState recoveryWitness =
-        projectUpdateSelfRecoveryWitness(capturePersistentUpdateSelfState());
-    if (recoveryWitness.localMachineUUID == 0 &&
-        recoveryWitness.machineRecoveryWitnesses.empty())
+    if (hasUpdateSelfRecoveryWitness(capturePersistentUpdateSelfState()) == false)
     {
       return true;
     }
@@ -27057,7 +27060,7 @@ public:
                 (incoming.runtimeState.pendingElasticAddressAssignments.empty() == false ||
                  incoming.runtimeState.pendingElasticAddressReleases.empty() == false ||
                  machineRetirementJournalPresent(incoming.runtimeState) ||
-                 projectUpdateSelfRecoveryWitness(incoming.runtimeState.updateSelf).localMachineUUID != 0) &&
+                 hasUpdateSelfRecoveryWitness(incoming.runtimeState.updateSelf)) &&
                 applyReplicatedMachineRetirementTopology(incoming.runtimeState) &&
                 replicatedRuntimeStateCoversPendingElasticAddressOperations(incoming.runtimeState) &&
                 prodigyComputeSHA256Hex(serialized, transitionDigest))

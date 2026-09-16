@@ -393,8 +393,7 @@ inline void Brain::noteMasterAuthorityTransitionSentToPeer(
     const ProdigyMasterAuthorityRuntimeState& state,
     const String& transitionDigest)
 {
-  const bool carriesUpdateSelfRecoveryWitness =
-      projectUpdateSelfRecoveryWitness(state.updateSelf).localMachineUUID != 0;
+  const bool carriesUpdateSelfRecoveryWitness = hasUpdateSelfRecoveryWitness(state.updateSelf);
   if (state.pendingElasticAddressAssignments.empty() &&
       state.pendingElasticAddressReleases.empty() &&
       machineRetirementJournalPresent(state) == false &&
