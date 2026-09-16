@@ -10337,10 +10337,15 @@ public:
       return;
     }
 
-    Vector<ClusterMachinePeerAddress> candidates;
+    Vector<ClusterMachinePeerAddress> candidates = localBrainPeerAddresses;
     String preferredInterface = {};
     preferredInterface.assign(thisNeuron->eth.name);
-    prodigyCollectLocalPeerAddressCandidates(preferredInterface, thisNeuron->private4, candidates);
+    Vector<ClusterMachinePeerAddress> discoveredCandidates = {};
+    prodigyCollectLocalPeerAddressCandidates(preferredInterface, thisNeuron->private4, discoveredCandidates);
+    for (const ClusterMachinePeerAddress& candidate : discoveredCandidates)
+    {
+      prodigyAppendUniqueClusterMachinePeerAddress(candidates, candidate);
+    }
 
     for (const ClusterMachinePeerAddress& candidate : candidates)
     {
@@ -10404,6 +10409,41 @@ public:
     }
   }
 
+  // A known topology record is operator authority for a Brain endpoint. It
+  // may be empty while an incomplete topology is being assembled; callers use
+  // the return value to distinguish that from the legacy topology-free path.
+  bool collectAuthoritativeBrainPeerCandidates(uint128_t brainUUID, Vector<ClusterMachinePeerAddress>& candidates) const
+  {
+    candidates.clear();
+    if (brainUUID == 0)
+    {
+      return false;
+    }
+
+    ClusterTopology topology = {};
+    if (loadAuthoritativeClusterTopology(topology) == false)
+    {
+      return false;
+    }
+
+    for (const ClusterMachine& machine : topology.machines)
+    {
+      const bool matchesKnownUUID = machine.isBrain && machine.uuid == brainUUID;
+      const bool matchesCommissionedBootstrapSelf =
+          machine.isBrain && machine.uuid == 0 && brainUUID == selfBrainUUID() &&
+          clusterMachineMatchesThisBrain(machine);
+      if (matchesKnownUUID || matchesCommissionedBootstrapSelf)
+      {
+        prodigyCollectClusterMachinePeerAddresses(machine, candidates);
+        return true;
+      }
+    }
+
+    // Managed topology is still authoritative when this identity has not
+    // been admitted yet. An empty set must not enable interface discovery.
+    return topology.machines.empty() == false;
+  }
+
   void refreshLocalBrainPeerAddresses(void)
   {
     if (thisNeuron == nullptr)
@@ -10413,18 +10453,22 @@ public:
     }
 
     Vector<ClusterMachinePeerAddress> candidates;
-    String preferredInterface = {};
-    preferredInterface.assign(thisNeuron->eth.name);
-    prodigyCollectLocalPeerAddressCandidates(preferredInterface, thisNeuron->private4, candidates);
-    if (candidates.empty() == false)
+    const bool hasAuthoritativeCandidates = collectAuthoritativeBrainPeerCandidates(thisNeuron->uuid, candidates);
+    if (hasAuthoritativeCandidates == false)
     {
-      ClusterTopology topology = {};
-      ClusterMachine self = {};
-      self.isBrain = true;
-      prodigyAssignClusterMachineAddressesFromPeerCandidates(self.addresses, candidates);
-      topology.machines.push_back(self);
-      prodigyNormalizeClusterTopologyPeerAddresses(topology);
-      prodigyCollectClusterMachinePeerAddresses(topology.machines[0], candidates);
+      String preferredInterface = {};
+      preferredInterface.assign(thisNeuron->eth.name);
+      prodigyCollectLocalPeerAddressCandidates(preferredInterface, thisNeuron->private4, candidates);
+      if (candidates.empty() == false)
+      {
+        ClusterTopology topology = {};
+        ClusterMachine self = {};
+        self.isBrain = true;
+        prodigyAssignClusterMachineAddressesFromPeerCandidates(self.addresses, candidates);
+        topology.machines.push_back(self);
+        prodigyNormalizeClusterTopologyPeerAddresses(topology);
+        prodigyCollectClusterMachinePeerAddresses(topology.machines[0], candidates);
+      }
     }
 
     adoptLocalBrainPeerAddresses(candidates);
@@ -10632,6 +10676,15 @@ public:
     if (brain == nullptr)
     {
       return false;
+    }
+
+    // A complete UUID pair is the stable Brain identity. Transport addresses
+    // choose the route after ownership is decided; they cannot choose which
+    // member opens the single connector when a machine has more than one NIC.
+    const uint128_t selfUUID = selfBrainUUID();
+    if (selfUUID != 0 && brain->uuid != 0)
+    {
+      return selfUUID < brain->uuid;
     }
 
     Vector<ClusterMachinePeerAddress> localCandidates = {};
@@ -10854,6 +10907,22 @@ public:
       prodigyAppendUniqueClusterMachinePeerAddress(normalizedCandidates, candidate);
     }
 
+    ClusterTopology topology = {};
+    const bool haveAuthoritativeTopology = loadAuthoritativeClusterTopology(topology);
+    const uint128_t peerUUID = brain->uuid != 0 ? brain->uuid :
+        (brain->machine != nullptr ? brain->machine->uuid : 0);
+    if (haveAuthoritativeTopology && topology.machines.empty() == false)
+    {
+      Vector<ClusterMachinePeerAddress> commissionedCandidates;
+      if (peerUUID == 0 || collectAuthoritativeBrainPeerCandidates(peerUUID, commissionedCandidates) == false)
+      {
+        return false;
+      }
+      // Registration reports availability. It cannot admit a new member or
+      // expand the commissioned routes with ambient interface addresses.
+      normalizedCandidates = std::move(commissionedCandidates);
+    }
+
     if (normalizedCandidates.empty())
     {
       return false;
@@ -10883,8 +10952,7 @@ public:
       return true;
     }
 
-    ClusterTopology topology = {};
-    if (loadAuthoritativeClusterTopology(topology) == false || topology.machines.empty())
+    if (haveAuthoritativeTopology == false || topology.machines.empty())
     {
       return true;
     }
@@ -11073,13 +11141,14 @@ public:
       *sawActivePeer = false;
     }
 
-    if (thisNeuron == nullptr || thisNeuron->private4.isNull())
+    if (thisNeuron == nullptr)
     {
       return false;
     }
 
-    uint32_t selfPrivate4 = thisNeuron->private4.v4;
-    if (selfPrivate4 == 0)
+    const uint128_t selfUUID = selfBrainUUID();
+    const uint32_t selfPrivate4 = thisNeuron->private4.v4;
+    if (selfUUID == 0 && selfPrivate4 == 0)
     {
       return false;
     }
@@ -11104,7 +11173,21 @@ public:
         *sawActivePeer = true;
       }
 
-      if (bv->private4 == 0)
+      if (selfUUID != 0 && bv->uuid != 0)
+      {
+        sawComparableActivePeer = true;
+        PRODIGY_DEBUG_LOG("failoverAddressOrder compare selfUUID=%llu peerUUID=%llu preferSelfBefore=%d\n",
+                          (unsigned long long)selfUUID,
+                          (unsigned long long)bv->uuid,
+                          int(preferSelf));
+        if (bv->uuid < selfUUID)
+        {
+          preferSelf = false;
+        }
+        continue;
+      }
+
+      if (selfPrivate4 == 0 || bv->private4 == 0)
       {
         basics_log("failoverAddressOrder skip-incomplete peer=%p uuid=%llu connected=%d quarantined=%d isFixed=%d fslot=%d\n",
                    static_cast<void *>(bv),
@@ -11123,11 +11206,7 @@ public:
                  unsigned(bv->private4),
                  (unsigned long long)bv->uuid,
                  int(preferSelf));
-      // Distinct machines may share a management/NAT IPv4 address. Preserve
-      // address ordering, but use their persistent identities to break a tie.
-      const uint128_t selfUUID = selfBrainUUID();
-      if (bv->private4 < selfPrivate4 ||
-          (bv->private4 == selfPrivate4 && selfUUID != 0 && bv->uuid != 0 && bv->uuid < selfUUID))
+      if (bv->private4 < selfPrivate4)
       {
         preferSelf = false;
       }
@@ -11135,7 +11214,8 @@ public:
 
     if (sawComparableActivePeer)
     {
-      basics_log("failoverAddressOrder resolved selfPrivate4=%u preferSelf=%d incomplete=%d\n",
+      basics_log("failoverAddressOrder resolved selfUUID=%llu selfPrivate4=%u preferSelf=%d incomplete=%d\n",
+                 (unsigned long long)selfUUID,
                  unsigned(selfPrivate4),
                  int(preferSelf),
                  int(sawIncompleteActivePeer));
@@ -11145,11 +11225,15 @@ public:
     if (sawIncompleteActivePeer)
     {
       preferSelf = false;
-      basics_log("failoverAddressOrder waiting selfPrivate4=%u reason=incomplete-active-peer\n", unsigned(selfPrivate4));
+      basics_log("failoverAddressOrder waiting selfUUID=%llu selfPrivate4=%u reason=incomplete-active-peer\n",
+                 (unsigned long long)selfUUID,
+                 unsigned(selfPrivate4));
       return false;
     }
 
-    basics_log("failoverAddressOrder selfPrivate4=%u no-active-peers\n", unsigned(selfPrivate4));
+    basics_log("failoverAddressOrder selfUUID=%llu selfPrivate4=%u no-active-peers\n",
+               (unsigned long long)selfUUID,
+               unsigned(selfPrivate4));
     return true;
   }
 

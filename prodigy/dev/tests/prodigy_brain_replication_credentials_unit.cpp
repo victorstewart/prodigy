@@ -9560,6 +9560,154 @@ static void testSharedPrivate4PeersParticipateInQuorumAndElectOneMaster(TestSuit
   thisNeuron = previousNeuron;
 }
 
+static void testKnownUUIDsOwnConnectorAndFailoverBeforeAddresses(TestSuite& suite)
+{
+  NeuronBase *previousNeuron = thisNeuron;
+  const uint128_t identities[] = {0x7800, 0x7801, 0x7802};
+  const char *private4s[] = {"10.0.2.253", "10.0.2.2", "10.0.2.1"};
+  uint32_t preferredMasters = 0;
+
+  for (uint32_t selfIndex = 0; selfIndex < 3; ++selfIndex)
+  {
+    TestBrain brain = {};
+    TestNeuron self = {};
+    self.uuid = identities[selfIndex];
+    self.private4 = IPAddress(private4s[selfIndex], false);
+    thisNeuron = &self;
+    brain.nBrains = 3;
+    brain.boottimens = 10;
+
+    BrainView peers[2] = {};
+    uint32_t peerIndex = 0;
+    uint32_t outboundConnectors = 0;
+    for (uint32_t candidateIndex = 0; candidateIndex < 3; ++candidateIndex)
+    {
+      if (candidateIndex == selfIndex)
+      {
+        continue;
+      }
+
+      BrainView& peer = peers[peerIndex++];
+      peer.uuid = identities[candidateIndex];
+      peer.private4 = IPAddress(private4s[candidateIndex], false).v4;
+      peer.boottimens = 20;
+      peer.connected = true;
+      peer.registrationFresh = true;
+      peer.isFixedFile = true;
+      peer.fslot = 81 + int(peerIndex);
+      brain.brains.insert(&peer);
+
+      const bool ownsConnector = brain.shouldWeConnectToBrain(&peer);
+      suite.expect(ownsConnector == (self.uuid < peer.uuid),
+                   "known_uuid_connector_ownership_ignores_reversed_private4_order");
+      outboundConnectors += ownsConnector ? 1u : 0u;
+    }
+
+    suite.expect(outboundConnectors == (selfIndex == 0 ? 2u : (selfIndex == 1 ? 1u : 0u)),
+                 "known_uuid_connector_ownership_has_one_direction_per_three_brain_pair");
+
+    bool preferSelf = false;
+    bool sawActivePeer = false;
+    suite.expect(brain.resolveFailoverMasterByActivePeerAddressOrder(preferSelf, &sawActivePeer) && sawActivePeer,
+                 "known_uuid_failover_compares_three_active_brains_with_reversed_private4_order");
+    suite.expect(preferSelf == (self.uuid == identities[0]),
+                 "known_uuid_failover_elects_same_deterministic_winner_despite_reversed_private4_order");
+    preferredMasters += preferSelf ? 1u : 0u;
+    brain.brains.clear();
+  }
+
+  suite.expect(preferredMasters == 1,
+               "known_uuid_failover_has_exactly_one_winner_across_three_brain_views");
+
+  TestBrain ipv6OnlyBrain = {};
+  TestNeuron ipv6OnlySelf = {};
+  ipv6OnlySelf.uuid = 0x7811;
+  thisNeuron = &ipv6OnlySelf;
+  BrainView lowerIPv6OnlyPeer = {};
+  lowerIPv6OnlyPeer.uuid = 0x7810;
+  lowerIPv6OnlyPeer.connected = true;
+  lowerIPv6OnlyPeer.isFixedFile = true;
+  lowerIPv6OnlyPeer.fslot = 91;
+  ipv6OnlyBrain.brains.insert(&lowerIPv6OnlyPeer);
+  suite.expect(ipv6OnlyBrain.shouldWeConnectToBrain(&lowerIPv6OnlyPeer) == false,
+               "known_uuid_connector_ownership_does_not_require_private4");
+  bool ipv6OnlyPreferSelf = true;
+  suite.expect(ipv6OnlyBrain.resolveFailoverMasterByActivePeerAddressOrder(ipv6OnlyPreferSelf) && ipv6OnlyPreferSelf == false,
+               "known_uuid_failover_does_not_require_private4");
+  lowerIPv6OnlyPeer.uuid = 0x7812;
+  suite.expect(ipv6OnlyBrain.shouldWeConnectToBrain(&lowerIPv6OnlyPeer),
+               "known_uuid_connector_ownership_uses_uuid_for_ipv6_only_peer");
+  ipv6OnlyBrain.brains.clear();
+
+  thisNeuron = previousNeuron;
+}
+
+static void testAuthoritativeBrainPeerCandidatesRejectAmbientAdvertisement(TestSuite& suite)
+{
+  NeuronBase *previousNeuron = thisNeuron;
+  ResumableAddMachinesBrain brain = {};
+  TestNeuron self = {};
+  self.uuid = 0x7901;
+  self.private4 = IPAddress("10.0.2.15", false);
+  thisNeuron = &self;
+
+  auto appendCommissionedBrain = [&](uint128_t uuid, const char *address) {
+    ClusterMachine machine = {};
+    machine.uuid = uuid;
+    machine.isBrain = true;
+    prodigyAppendUniqueClusterMachineAddress(machine.addresses.privateAddresses, String(address), 64);
+    brain.authoritativeTopology.machines.push_back(std::move(machine));
+  };
+  appendCommissionedBrain(0, "fd72:6e61:6d65:1::10");
+  brain.localBrainPeerAddresses.push_back(ClusterMachinePeerAddress {"fd72:6e61:6d65:1::10"_ctv, 64});
+  const uint128_t remoteUUID = 0x7902;
+  appendCommissionedBrain(remoteUUID, "fd72:6e61:6d65:2::10");
+
+  brain.refreshLocalBrainPeerAddresses();
+  suite.expect(brain.localBrainPeerAddresses.size() == 1 &&
+                   brain.localBrainPeerAddresses[0].address.equals("fd72:6e61:6d65:1::10"_ctv),
+               "authoritative_zero_uuid_bootstrap_self_keeps_commissioned_candidates_without_ambient_advertisement");
+
+  BrainView remote = {};
+  remote.uuid = remoteUUID;
+  Vector<ClusterMachinePeerAddress> ambientCandidates = {};
+  ambientCandidates.push_back(ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24});
+  ambientCandidates.push_back(ClusterMachinePeerAddress {"192.168.88.15"_ctv, 24});
+  ambientCandidates.push_back(ClusterMachinePeerAddress {"fd00:1234::15"_ctv, 64});
+  ambientCandidates.push_back(ClusterMachinePeerAddress {"fd72:6e61:6d65:2::10"_ctv, 64});
+  brain.weAreMaster = true;
+  suite.expect(brain.updateBrainPeerAddressCandidates(&remote, ambientCandidates),
+               "authoritative_remote_brain_candidates_accept_registration_without_expanding_commissioned_endpoint_set");
+  suite.expect(remote.peerAddresses.size() == 1 &&
+                   remote.peerAddresses[0].address.equals("fd72:6e61:6d65:2::10"_ctv),
+               "authoritative_remote_brain_candidates_reject_shared_nat_home_lan_and_internal_ipv6");
+  suite.expect(brain.authoritativeTopology.machines.size() == 2 &&
+                   brain.authoritativeTopology.machines[1].peerAddresses.size() == 1 &&
+                   brain.authoritativeTopology.machines[1].peerAddresses[0].address.equals("fd72:6e61:6d65:2::10"_ctv),
+               "authoritative_remote_brain_candidates_do_not_expand_persisted_commissioned_endpoint_set");
+
+  remote.peerAddresses.clear();
+  Vector<ClusterMachinePeerAddress> noCommissionedIntersection = {};
+  noCommissionedIntersection.push_back(ClusterMachinePeerAddress {"192.168.88.15"_ctv, 24});
+  suite.expect(brain.updateBrainPeerAddressCandidates(&remote, noCommissionedIntersection),
+               "authoritative_remote_brain_candidates_preserve_commissioned_endpoint_when_report_has_no_intersection");
+  suite.expect(remote.peerAddresses.size() == 1 &&
+                   remote.peerAddresses[0].address.equals("fd72:6e61:6d65:2::10"_ctv),
+               "authoritative_remote_brain_candidates_keep_configured_different_prefix_endpoint");
+
+  BrainView uncommissioned = {};
+  uncommissioned.uuid = 0x79ff;
+  suite.expect(brain.updateBrainPeerAddressCandidates(&uncommissioned, ambientCandidates) == false &&
+                   uncommissioned.peerAddresses.empty(),
+               "authoritative_peer_advertisement_cannot_admit_unknown_uuid");
+  uncommissioned.uuid = 0;
+  suite.expect(brain.updateBrainPeerAddressCandidates(&uncommissioned, ambientCandidates) == false &&
+                   uncommissioned.peerAddresses.empty(),
+               "authoritative_peer_advertisement_waits_for_registered_uuid");
+
+  thisNeuron = previousNeuron;
+}
+
 static void testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(TestSuite& suite)
 {
   ScopedRing scopedRing = {};
@@ -24053,6 +24201,8 @@ int main(void)
   {
     testUpdateSelfPeerTrackingUsesKnownUUIDsAndUnambiguousLegacyKeys(suite);
     testSharedPrivate4PeersParticipateInQuorumAndElectOneMaster(suite);
+    testKnownUUIDsOwnConnectorAndFailoverBeforeAddresses(suite);
+    testAuthoritativeBrainPeerCandidatesRejectAmbientAdvertisement(suite);
     testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(suite);
     testUpdateSelfPeerRegistrationCreditsBootNsChange(suite);
     testUpdateSelfPeerRegistrationCreditsReconnectWithoutBootNsChange(suite);
@@ -24252,6 +24402,8 @@ int main(void)
   testBrainBundleExecRetryRoutesThroughDispatcher(suite);
   testUpdateSelfPeerTrackingUsesKnownUUIDsAndUnambiguousLegacyKeys(suite);
   testSharedPrivate4PeersParticipateInQuorumAndElectOneMaster(suite);
+  testKnownUUIDsOwnConnectorAndFailoverBeforeAddresses(suite);
+  testAuthoritativeBrainPeerCandidatesRejectAmbientAdvertisement(suite);
   testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(suite);
   testUpdateSelfPeerRegistrationCreditsBootNsChange(suite);
   testUpdateSelfPeerRegistrationCreditsReconnectWithoutBootNsChange(suite);
