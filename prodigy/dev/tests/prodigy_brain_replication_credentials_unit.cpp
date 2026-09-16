@@ -381,6 +381,8 @@ public:
   Vector<ProdigyDNSRecordBinding> cleanedTXT;
   Vector<ProdigyDNSRecordBinding> activeTXT;
   String lastCredentialMaterial;
+  TestBrain *inspectRemoveBrain = nullptr;
+  bool inspectedRemoveExactLease = false;
 
   bool supportsProvider(const String& provider) const override
   {
@@ -406,6 +408,25 @@ public:
     (void)credential;
     removeCalls += 1;
     removes.push_back(record);
+    if (inspectRemoveBrain != nullptr)
+    {
+      for (const auto& [owner, pending] : inspectRemoveBrain->pendingDNSOperations)
+      {
+        (void)owner;
+        if (pending.kind == Brain::PendingDNSOperationKind::lease &&
+            pending.action == ProdigyBrainDNSOperationCoordinator::Action::remove)
+        {
+          inspectedRemoveExactLease = std::any_of(
+              inspectRemoveBrain->routableResourceLeaseRuntimeState.begin(),
+              inspectRemoveBrain->routableResourceLeaseRuntimeState.end(),
+              [&](const RoutableResourceLease& current) { return current == pending.lease; });
+          if (inspectedRemoveExactLease)
+          {
+            break;
+          }
+        }
+      }
+    }
     if (failRemove)
     {
       failure.assign("injected DNS remove failure"_ctv);
@@ -13615,6 +13636,8 @@ static void testDNSBindingTopicsReserveAddressAndApplyProvider(TestSuite& suite)
 
   mothership.wBuffer.clear();
   messageBuffer.clear();
+  dns.inspectRemoveBrain = &brain;
+  dns.inspectedRemoveExactLease = false;
   message = buildMothershipMessage(messageBuffer, MothershipTopic::teardownDNSBindings);
   brain.mothershipHandler(&mothership, message);
   responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
@@ -13636,6 +13659,7 @@ static void testDNSBindingTopicsReserveAddressAndApplyProvider(TestSuite& suite)
             size_t(response.leases.size()), size_t(brain.pendingDNSOperations.size()), size_t(brain.pendingDNSControls.size()),
             size_t(brain.routableResourceLeaseRuntimeState.size()), unsigned(dns.removeCalls));
   }
+  suite.expect(dns.inspectedRemoveExactLease, "mothership_teardown_dns_pending_lease_owns_exact_intent");
   suite.expect(teardownTopicMatches, "mothership_teardown_dns_bindings_topic");
   suite.expect(teardownResponseDecoded, "mothership_teardown_dns_bindings_deserializes_response");
   suite.expect(response.success, "mothership_teardown_dns_bindings_success");
@@ -23945,6 +23969,17 @@ int main(void)
   {
     Ring::createRing(8, 8, 32, 32, -1, -1, 0);
     createdRing = true;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "dns-lease-completion") == 0)
+  {
+    testWormholeDNSLeasesAndCredentialValidation(suite);
+    testDNSBindingTopicsReserveAddressAndApplyProvider(suite);
+    if (createdRing)
+    {
+      Ring::shutdownForExec();
+    }
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "topology-uuid-restore") == 0)
