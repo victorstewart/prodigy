@@ -9968,9 +9968,34 @@ public:
            expectedPeerUUIDs.size() + 1 == expectedBrains;
   }
 
+  bool deploymentIsIndexedApplicationChainMember(const ApplicationDeployment *deployment) const
+  {
+    if (deployment == nullptr)
+    {
+      return false;
+    }
+    auto indexed = deploymentsByApp.find(deployment->plan.config.applicationID);
+    if (indexed == deploymentsByApp.end())
+    {
+      return false;
+    }
+    bytell_hash_set<const ApplicationDeployment *> visited = {};
+    for (const ApplicationDeployment *current = indexed->second;
+         current != nullptr && visited.insert(current).second;
+         current = current->previous)
+    {
+      if (current == deployment)
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
   bool startDeploymentAfterAuthoritativeReplication(ApplicationDeployment *deployment)
   {
-    if (deployment == nullptr || deployment->state != DeploymentState::none)
+    if (deployment == nullptr || deployment->state != DeploymentState::none ||
+        deploymentIsIndexedApplicationChainMember(deployment))
     {
       return false;
     }
@@ -18693,11 +18718,10 @@ public:
       recoveredNeuronPairingsUnified = false;
     }
 
-    // Materialize durable deployment ownership before machine inventory can
-    // resume Neuron control. A Neuron may upload its live containers as soon as
-    // that control stream is active; without the deployment index those
-    // containers are discarded and the following Switchboard state sync has
-    // no wormholes to reconstruct.
+    // Materialize every durable plan before reconstructing app chains.  The
+    // persistent plan store is a hash map, so its iteration order cannot define
+    // which version is the head or predecessor during a master recovery.
+    bytell_hash_set<uint16_t> recoveredApplicationIDs = {};
     for (const auto& [deploymentID, plan] : deploymentPlans)
     {
       if (auto failedIt = failedDeployments.find(deploymentID);
@@ -18710,31 +18734,72 @@ public:
         // cancelled deployment after election or restart.
         continue;
       }
-      ApplicationDeployment *deployment = new ApplicationDeployment(); // as neurons register and upload their state, these deployments will be populated
-      deployment->plan = plan;
-      deployment->restorePersistedStatefulWorkerTopologyUpgradeOperation();
-      deployment->restorePersistedDeferredStatefulScaleIntent();
-
-      deployments.insert_or_assign(plan.config.deploymentID(), deployment);
-
-      if (auto it = deploymentsByApp.find(plan.config.applicationID); it != deploymentsByApp.end())
+      ApplicationDeployment *deployment = nullptr;
+      if (auto existing = deployments.find(plan.config.deploymentID());
+          existing != deployments.end() && existing->second != nullptr)
       {
-        ApplicationDeployment *other = it->second;
-
-        if (other->plan.config.versionID < deployment->plan.config.versionID)
-        {
-          // replace
-          deploymentsByApp.insert_or_assign(plan.config.applicationID, deployment);
-          deployment->previous = other;
-          other->next = deployment;
-        }
+        // Runtime update handoff can retain a live owner for this durable plan.
+        // Keep its containers and scheduler state; only refresh the replicated
+        // declaration before rebuilding its app chain below.
+        deployment = existing->second;
+        deployment->plan = plan;
       }
       else
       {
-        deploymentsByApp.insert_or_assign(plan.config.applicationID, deployment);
+        deployment = new ApplicationDeployment(); // as neurons register and upload their state, these deployments will be populated
+        deployment->plan = plan;
+        deployment->restorePersistedStatefulWorkerTopologyUpgradeOperation();
+        deployment->restorePersistedDeferredStatefulScaleIntent();
+        deployments.insert_or_assign(plan.config.deploymentID(), deployment);
+      }
+      if (plan.config.type != ApplicationType::task)
+      {
+        recoveredApplicationIDs.insert(plan.config.applicationID);
       }
     }
     deploymentPlans.clear();
+
+    // Rebuild every owned version for each recovered application in version
+    // order before Neuron inventory can schedule.  This includes an owner that
+    // survived the handoff, so no retained container is orphaned by a duplicate
+    // durable plan ID or an older persisted predecessor.
+    for (uint16_t applicationID : recoveredApplicationIDs)
+    {
+      Vector<ApplicationDeployment *> versions = {};
+      for (const auto& [deploymentID, deployment] : deployments)
+      {
+        (void)deploymentID;
+        if (deployment != nullptr && deployment->plan.config.type != ApplicationType::task &&
+            deployment->plan.config.applicationID == applicationID)
+        {
+          versions.push_back(deployment);
+        }
+      }
+      std::sort(versions.begin(), versions.end(), [](const ApplicationDeployment *lhs, const ApplicationDeployment *rhs) {
+        if (lhs->plan.config.versionID != rhs->plan.config.versionID)
+        {
+          return lhs->plan.config.versionID < rhs->plan.config.versionID;
+        }
+        return lhs->plan.config.deploymentID() < rhs->plan.config.deploymentID();
+      });
+
+      deploymentsByApp.erase(applicationID);
+      ApplicationDeployment *previous = nullptr;
+      for (ApplicationDeployment *deployment : versions)
+      {
+        deployment->previous = previous;
+        deployment->next = nullptr;
+        if (previous != nullptr)
+        {
+          previous->next = deployment;
+        }
+        previous = deployment;
+      }
+      if (previous != nullptr)
+      {
+        deploymentsByApp.insert_or_assign(applicationID, previous);
+      }
+    }
 
     refreshAllDeploymentWormholeQuicCidState(false);
     basics_log("selfElectAsMaster complete\n");
