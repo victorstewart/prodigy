@@ -340,7 +340,7 @@ esac
   const size_t unmount = lines.find("umount");
   const size_t wipe = lines.find("rm");
   bool killOrder = expectContainerKill == false || (kill != std::string::npos && unmount != std::string::npos && wipe != std::string::npos && stop != std::string::npos && stop < kill && kill < unmount && unmount < wipe);
-  bool okay = success == expectSuccess && (unmount != std::string::npos) == expectUnmount && (wipe != std::string::npos) == expectWipe && killOrder;
+  bool okay = stop != std::string::npos && success == expectSuccess && (unmount != std::string::npos) == expectUnmount && (wipe != std::string::npos) == expectWipe && killOrder;
   (void)::system(("/bin/rm -rf " + shellQuote(root)).c_str());
   return okay;
 }
@@ -421,6 +421,9 @@ int main(void)
 
   {
     String command = {};
+    mothershipBuildProdigyStopAndDrainCommand(command);
+    suite.expect(runStorageCleanupScript(command, "detach", true, false, false), "offline_quiesce_executes_stop_without_storage_wipe");
+    suite.expect(runStorageCleanupScript(command, "stopfail", false, false, false), "offline_quiesce_stop_failure_prevents_inventory_export");
     mothershipBuildProdigyStateWipeCommand("/var/lib/prodigy/state"_ctv, command);
     suite.expect(runStorageCleanupScript(command, "autoclear", true, true, true), "remove_owned_loop_autoclear_before_wipe");
     suite.expect(runStorageCleanupScript(command, "detach", true, true, true), "remove_owned_loop_explicit_detach_before_wipe");

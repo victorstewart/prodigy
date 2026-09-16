@@ -121,6 +121,12 @@ fi;
 )SH"_ctv);
 }
 
+static inline void mothershipBuildProdigyStopAndDrainCommand(String& command)
+{
+  command.assign("set -eu; "_ctv);
+  mothershipAppendProdigyStopAndDrainCommand(command);
+}
+
 static inline void mothershipAppendProdigyOwnedStorageCleanupCommand(String& command)
 {
   mothershipAppendProdigyStopAndDrainCommand(command);
