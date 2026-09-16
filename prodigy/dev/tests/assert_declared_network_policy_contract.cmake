@@ -92,16 +92,24 @@ endif()
 string(FIND "${_container_egress}" "if (localSubnetContainsDaddr(daddr6))" _local_route_action)
 string(FIND "${_containers}" "host.addDirectRoute(address, 128, AF_INET6);" _local_route_install)
 string(FIND "${_all}" "writeProcSysctlValue(\"/proc/sys/net/ipv4/ip_forward\", \"1\")" _public_ingress_forwarding)
-string(FIND "${_containers}" "bool disableHostNetkitIPv4ReversePathFilter" _container_ipv4_rpf_owner)
-string(FIND "${_containers}" "actualBytes != 2 || actual[0] != '0' || actual[1] != '\\n'" _container_ipv4_rpf_verified)
-string(FIND "${_containers}" "netdevs.getInfo();\n    if (disableHostNetkitIPv4ReversePathFilter(failureReport) == false)" _container_ipv4_rpf_restore)
-string(FIND "${_containers}" "host.bringUp();\n    peer.bringUp();\n\n    if (disableHostNetkitIPv4ReversePathFilter(failureReport) == false)" _container_ipv4_rpf_setup)
+string(FIND "${_containers}" "bool applyHostNetkitIPv4SourceValidationPolicy" _container_ipv4_source_validation_owner)
+string(FIND "${_containers}" "{\"rp_filter\", \"0\", '0'}" _container_ipv4_rpf_policy)
+string(FIND "${_containers}" "{\"accept_local\", \"1\", '1'}" _container_ipv4_accept_local_policy)
+string(FIND "${_containers}" "bool waitForHostNetkitUdevInitialization" _container_udev_wait_owner)
+string(FIND "${_containers}" "\"--initialized=yes\"" _container_udev_wait_initialized)
+string(FIND "${_containers}" "\"--timeout=5\"" _container_udev_wait_timeout)
+string(FIND "${_containers}" "if (waitForHostNetkitUdevInitialization(failureReport) == false)" _container_udev_wait_applied)
+string(FIND "${_containers}" "netdevs.getInfo();\n    if (applyHostNetkitIPv4SourceValidationPolicy(failureReport) == false)" _container_ipv4_source_validation_restore)
+string(FIND "${_containers}" "host.bringUp();\n    peer.bringUp();\n\n    if (applyHostNetkitIPv4SourceValidationPolicy(failureReport) == false)" _container_ipv4_source_validation_setup)
 string(FIND "${_all}" "writeProcSysctlValue(\"/proc/sys/net/ipv6/conf/all/forwarding\", \"1\")" _local_route_forwarding)
 string(REGEX MATCHALL "primary_program->setArrayElement\\(\"lc_subnet\"_ctv, 0, thisNeuron->lcsubnet6\\);" _primary_subnet_sync "${_containers}")
 list(LENGTH _primary_subnet_sync _primary_subnet_sync_count)
 if(_local_route_action EQUAL -1 OR _local_route_install EQUAL -1 OR _public_ingress_forwarding EQUAL -1 OR
-   _container_ipv4_rpf_owner EQUAL -1 OR _container_ipv4_rpf_verified EQUAL -1 OR
-   _container_ipv4_rpf_restore EQUAL -1 OR _container_ipv4_rpf_setup EQUAL -1 OR
+   _container_ipv4_source_validation_owner EQUAL -1 OR _container_ipv4_rpf_policy EQUAL -1 OR
+   _container_ipv4_accept_local_policy EQUAL -1 OR _container_udev_wait_owner EQUAL -1 OR
+   _container_udev_wait_initialized EQUAL -1 OR _container_udev_wait_timeout EQUAL -1 OR
+   _container_udev_wait_applied EQUAL -1 OR
+   _container_ipv4_source_validation_restore EQUAL -1 OR _container_ipv4_source_validation_setup EQUAL -1 OR
    _local_route_forwarding EQUAL -1 OR
    _primary_subnet_sync_count LESS 2)
    message(FATAL_ERROR "same-machine L3 netkit traffic must use host /128 routing")
