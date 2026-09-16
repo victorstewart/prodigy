@@ -9529,6 +9529,163 @@ static void testSwitchboardWormholeFleetAcknowledgementTransaction(TestSuite& su
                "wormhole_fleet_transaction_promotes_latched_runtime_ready_after_exact_all_machine_acks");
 }
 
+static void testRecoveredStatelessWormholesReplayAndAwaitAcknowledgement(TestSuite& suite)
+{
+  // The recovery predicate requires an active Neuron control socket, as it
+  // does in the retained-inventory path. This owns the test ring only when
+  // the focused selector has not already created one.
+  ScopedRing scopedRing = {};
+
+  TestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.ignited = true;
+  brain.brainConfig.datacenterFragment = 1;
+
+  BrainBase *previousBrain = thisBrain;
+  thisBrain = &brain;
+
+  Rack rack = {};
+  rack.uuid = 62'551;
+
+  Machine machine = {};
+  machine.uuid = uint128_t(0xA551);
+  machine.private4 = 0x0A000051;
+  machine.fragment = 0x551u;
+  machine.rack = &rack;
+  machine.state = MachineState::healthy;
+  machine.runtimeReady = true;
+  machine.neuron.machine = &machine;
+  machine.neuron.connected = true;
+  machine.neuron.isFixedFile = true;
+  machine.neuron.fslot = 51;
+  machine.neuron.pendingSend = true;
+  brain.machines.insert(&machine);
+  brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+  brain.neurons.insert(&machine.neuron);
+
+  ApplicationDeployment deployment = {};
+  deployment.plan = makeDeploymentPlan(62'551, 265'325'899'677'707ULL);
+  deployment.plan.stateless.nBase = 1;
+  deployment.state = DeploymentState::running;
+  deployment.nTargetBase = 1;
+  deployment.nDeployedBase = 1;
+  deployment.nHealthyBase = 1;
+
+  DistributableExternalSubnet registered = {};
+  registered.uuid = uint128_t(0xA553);
+  registered.name.assign("recovery-ingress-prefix"_ctv);
+  registered.machineUUID = machine.uuid;
+  registered.ingressScope = RoutableIngressScope::singleMachine;
+  registered.usage = ExternalSubnetUsage::wormholes;
+  registered.subnet = IPPrefix("10.0.2.15", false, 32);
+  registered.deliverySubnet = IPPrefix("10.0.2.15", false, 32);
+  brain.brainConfig.distributableExternalSubnets.push_back(registered);
+
+  Wormhole wormhole = {};
+  wormhole.name.assign("recovery-ingress"_ctv);
+  wormhole.externalAddress = IPAddress("10.0.2.15", false);
+  wormhole.deliveryAddress = registered.deliverySubnet.network;
+  wormhole.externalPort = 443;
+  wormhole.containerPort = 8443;
+  wormhole.layer4 = IPPROTO_TCP;
+  wormhole.source = ExternalAddressSource::registeredRoutablePrefix;
+  wormhole.routablePrefixUUID = registered.uuid;
+  deployment.plan.wormholes.push_back(wormhole);
+
+  ContainerView container = {};
+  container.uuid = uint128_t(0xA552);
+  container.deploymentID = deployment.plan.config.deploymentID();
+  container.applicationID = deployment.plan.config.applicationID;
+  container.machine = &machine;
+  container.fragment = 7;
+  container.lifetime = ApplicationLifetime::base;
+  container.state = ContainerState::healthy;
+  container.runtimeReady = true;
+  deployment.containers.insert(&container);
+  brain.containers.insert_or_assign(container.uuid, &container);
+  machine.upsertContainerIndexEntry(container.deploymentID, &container);
+  brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+  brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
+
+  deployment.recoverAfterReboot();
+
+  uint32_t hostedPrefixIndex = UINT32_MAX;
+  uint32_t openIndex = UINT32_MAX;
+  uint32_t messageIndex = 0;
+  bool replayed = false;
+  String firstRevision = {};
+  forEachMessageInBuffer(machine.neuron.wBuffer, [&](Message *queued) {
+    if (NeuronTopic(queued->topic) == NeuronTopic::configureSwitchboardHostedIngressPrefixes &&
+        hostedPrefixIndex == UINT32_MAX)
+    {
+      hostedPrefixIndex = messageIndex;
+    }
+    if (NeuronTopic(queued->topic) == NeuronTopic::openSwitchboardWormholes)
+    {
+      if (openIndex == UINT32_MAX)
+      {
+        openIndex = messageIndex;
+      }
+      SwitchboardWormholeOperation operation = {};
+      Vector<Wormhole> decoded = {};
+      if (decodeSwitchboardWormholeOperation(queued, operation, decoded) &&
+          operation.containerID == container.generateContainerID() && decoded.size() == 1 &&
+          equalSerializedObjects(decoded[0], deployment.plan.wormholes[0]))
+      {
+        replayed = true;
+        firstRevision = operation.revision;
+      }
+    }
+    messageIndex += 1;
+  });
+  suite.expect(replayed, "recovered_stateless_wormholes_replay_existing_leased_ingress_mapping");
+  suite.expect(hostedPrefixIndex < openIndex,
+               "recovered_stateless_wormholes_refresh_hosted_prefix_before_open");
+  suite.expect(container.wormholeRuntimePendingMachines.contains(machine.fragment) && container.runtimeReady == false,
+               "recovered_stateless_wormholes_hold_routing_readiness_for_ack");
+
+  deployment.recoverAfterReboot();
+  bool sameRevision = true;
+  uint32_t matchingOperations = 0;
+  forEachMessageInBuffer(machine.neuron.wBuffer, [&](Message *queued) {
+    if (NeuronTopic(queued->topic) != NeuronTopic::openSwitchboardWormholes)
+    {
+      return;
+    }
+    SwitchboardWormholeOperation operation = {};
+    Vector<Wormhole> decoded = {};
+    if (decodeSwitchboardWormholeOperation(queued, operation, decoded) &&
+        operation.containerID == container.generateContainerID())
+    {
+      matchingOperations += 1;
+      sameRevision = sameRevision && operation.revision.equals(firstRevision);
+    }
+  });
+  suite.expect(matchingOperations == 2 && sameRevision &&
+                   container.wormholeRuntimePendingMachines.size() == 1 && container.runtimeReady == false,
+               "recovered_stateless_wormholes_repeat_recovery_is_revision_idempotent_and_ack_gated");
+
+  String acknowledgement = {};
+  brain.neuronHandler(&machine.neuron,
+                      buildNeuronSwitchboardWormholeAcknowledgement(acknowledgement,
+                                                                    container.generateContainerID(),
+                                                                    container.wormholeRuntimeRevision,
+                                                                    SwitchboardWormholeOperationStatus::applied));
+  suite.expect(container.wormholeRuntimePendingMachines.empty() && container.runtimeReady,
+               "recovered_stateless_wormholes_restore_readiness_only_after_ack");
+
+  brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
+  brain.deployments.erase(deployment.plan.config.deploymentID());
+  machine.removeContainerIndexEntry(container.deploymentID, &container);
+  brain.containers.erase(container.uuid);
+  brain.neurons.erase(&machine.neuron);
+  brain.machinesByUUID.erase(machine.uuid);
+  brain.machines.erase(&machine);
+  thisBrain = previousBrain;
+}
+
 static void testApplyReplicatedDeploymentPlanLiveStateUpdatesTrackedContainers(TestSuite& suite)
 {
   TestBrain brain = {};
@@ -24792,6 +24949,12 @@ int main(void)
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "recovered-wormhole-replay") == 0)
+  {
+    testRecoveredStatelessWormholesReplayAndAwaitAcknowledgement(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "brain-recovery-inventory-healthy-gate") == 0)
   {
     testMachineHealthyDefersStatelessRecoveryUntilInventoryComplete(suite);
@@ -25079,6 +25242,7 @@ int main(void)
   testRegisteredRoutablePrefixRefreshReplaysToNeuronsFollowersAndContainers(suite);
   testRegisteredRoutablePrefixWormholesRefreshHostedIngressBeforeOpen(suite);
   testSwitchboardWormholeFleetAcknowledgementTransaction(suite);
+  testRecoveredStatelessWormholesReplayAndAwaitAcknowledgement(suite);
   testApplyReplicatedDeploymentPlanLiveStateUpdatesTrackedContainers(suite);
   testApplyReplicatedDeploymentPlanCleansTlsResumptionState(suite);
   testBrainBundleExecRetryRoutesThroughDispatcher(suite);

@@ -6437,6 +6437,14 @@ public:
       {
         container->replayActivePairingsToSelf(true);
         container->replayActivePairingsToPeers(true);
+
+        // A restored inventory may retain its healthy container report without
+        // retaining the per-Neuron switchboard map. Requeue the existing
+        // revisioned operation so routing readiness remains ACK-gated.
+        if (plan.isStateful == false)
+        {
+          thisBrain->sendNeuronOpenSwitchboardWormholes(container, plan.wormholes);
+        }
       }
     }
 
