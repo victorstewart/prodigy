@@ -861,8 +861,9 @@ int main(void)
     return (suite.failed == 0) ? 0 : 1;
   if (getenv("PRODIGY_TEST_STORAGE_REPLACEMENT_ONLY") != nullptr)
   {
-    // Pure admission/finalization state plus mkdtemp-owned file moves. No Ring,
-    // stop/destroy/create, host runtime paths, mounts or cgroup writes.
+    // Pure admission/finalization state plus mkdtemp-owned file moves. Ring
+    // callbacks are exercised in memory; no stop/destroy/create, host runtime
+    // paths, mounts or cgroup writes run here.
     Container predecessor;
     ContainerPlan successor;
     predecessor.plan.uuid = 11;
@@ -892,6 +893,76 @@ int main(void)
     suite.expect(!ready(), "replacement_foreign_application_rejected");
     successor.config.applicationID = predecessor.plan.config.applicationID;
     suite.expect(ready(), "replacement_unmodified_live_owner_still_admissible");
+
+    // Materialized recovery can deliberately select a stateful predecessor
+    // after waitid observed its crash, while the Neuron owns a restart-backoff
+    // timer.  Exercise the real claim path: it must take only that exact
+    // owner, cancel its timer and block a delayed control-close restart.
+    Container crashed;
+    ContainerPlan recovered;
+    crashed.plan.uuid = 21;
+    crashed.plan.config.applicationID = 6;
+    crashed.plan.config.type = ApplicationType::stateful;
+    crashed.pid = 321;
+    crashed.infop.si_pid = 321;
+    TemporaryDirectory crashBackoffFixture;
+    suite.expect(crashBackoffFixture.create(".run"), "replacement_crash_backoff_cgroup_fixture_created");
+    auto crashBackoffCgroup = filesystemPathFromString(crashBackoffFixture.path) / "cgroup";
+    suite.expect(writeFileFixture(crashBackoffCgroup / "cgroup.events", "populated 0\n"),
+                 "replacement_crash_backoff_cgroup_empty_fixture_created");
+    crashed.cgroup = open(crashBackoffCgroup.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    recovered.uuid = 22;
+    recovered.config.applicationID = 6;
+    String crashBackoffFailure;
+    auto crashBackoffReady = [&] {
+      return ContainerManager::crashBackoffReplacementPredecessorReady(&crashed, recovered, &crashBackoffFailure);
+    };
+    suite.expect(!crashBackoffReady(), "replacement_crash_backoff_without_restart_owner_rejected");
+    TimeoutPacket *restartTimer = new TimeoutPacket();
+    restartTimer->identifier = crashed.plan.uuid;
+    restartTimer->flags = uint64_t(NeuronTimeoutFlags::restartContainer);
+    restartTimer->setTimeoutMs(30'000);
+    crashed.restartTimer = restartTimer;
+    crashed.restartAfterClose = true;
+    suite.expect(crashBackoffReady(), "replacement_observed_crash_backoff_owner_admitted");
+    suite.expect(ContainerManager::observedCrashBackoffPredecessorCgroupIsEmpty(&crashed, &crashBackoffFailure),
+                 "replacement_observed_crash_backoff_cgroup_empty_required");
+    suite.expect(writeFileFixture(crashBackoffCgroup / "cgroup.events", "populated 1\n") &&
+                     !ContainerManager::observedCrashBackoffPredecessorCgroupIsEmpty(&crashed, &crashBackoffFailure) &&
+                     writeFileFixture(crashBackoffCgroup / "cgroup.events", "populated 0\n"),
+                 "replacement_populated_crash_backoff_cgroup_rejected_before_claim");
+    crashed.waitidPending = true;
+    suite.expect(!crashBackoffReady(), "replacement_unobserved_crash_backoff_exit_rejected");
+    crashed.waitidPending = false;
+    crashed.infop.si_pid = 322;
+    suite.expect(!crashBackoffReady(), "replacement_crash_backoff_pid_identity_mismatch_rejected");
+    crashed.infop.si_pid = crashed.pid;
+    recovered.config.applicationID = 7;
+    suite.expect(!crashBackoffReady(), "replacement_crash_backoff_foreign_application_rejected");
+    recovered.config.applicationID = crashed.plan.config.applicationID;
+    {
+      ScopedFreshRing ring;
+      suite.expect(ContainerManager::claimCrashBackoffReplacementPredecessor(&crashed, recovered, &crashBackoffFailure) &&
+                       crashed.killedOnPurpose && crashed.restartTimer == nullptr && crashed.restartAfterClose == false,
+                   "replacement_crash_backoff_claim_cancels_restart_and_close_replay");
+      Neuron neuron = {};
+      neuron.containers.insert_or_assign(crashed.plan.uuid, &crashed);
+      // The cancellation and close CQEs can already be queued when the claim
+      // wins.  Dispatch them directly with the retained inventory: neither is
+      // allowed to recreate the predecessor.
+      neuron.timeoutHandler(restartTimer, -ETIME);
+      crashed.restartAfterClose = true;
+      neuron.closeHandler(&crashed);
+      suite.expect(neuron.containers.contains(crashed.plan.uuid) && crashed.killedOnPurpose &&
+                       crashed.restartTimer == nullptr && crashed.restartAfterClose == false,
+                   "replacement_claimed_crash_backoff_ignores_late_timeout_and_close_callbacks");
+      neuron.containers.erase(crashed.plan.uuid);
+    }
+    if (crashed.cgroup >= 0)
+    {
+      close(crashed.cgroup);
+      crashed.cgroup = -1;
+    }
 
     // Exercise the actual finalizer with storage auto-destruction disabled and
     // an in-memory Neuron transport. Neither stop() nor destroyContainer() runs.

@@ -5597,7 +5597,11 @@ public:
       {
         container->restartAfterClose = false;
         container->reset();
-        if (container->restartTimer == nullptr)
+        // A stateful replacement can claim an already-observed crash during
+        // its backoff.  Its owner cancels the timer before this CQE is
+        // dispatched; never let this delayed close recreate that predecessor.
+        if (container->pendingDestroy == false && container->killedOnPurpose == false &&
+            container->restartTimer == nullptr)
         {
           ContainerManager::restartContainer(container);
         }

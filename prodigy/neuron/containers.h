@@ -9348,6 +9348,135 @@ public:
     return true;
   }
 
+  // Materialized recovery may name a predecessor after waitid observed its
+  // crash, while its ordinary restart timer still owns backoff.  This is not
+  // a live replacement: the normal stop coroutine retains its wait instead.
+  static bool crashBackoffReplacementPredecessorReady(const Container *predecessor, const ContainerPlan& successor,
+                                                      String *failureReport = nullptr)
+  {
+    if (predecessor == nullptr || predecessor->pid <= 0 || predecessor->waitidPending ||
+        predecessor->infop.si_pid != predecessor->pid || predecessor->infop.si_pid <= 0 ||
+        predecessor->cgroup < 0 || predecessor->restartTimer == nullptr || predecessor->killedOnPurpose ||
+        predecessor->pendingDestroy || predecessor->resumeAfterShutdown != nullptr ||
+        predecessor->plan.uuid == successor.uuid ||
+        predecessor->plan.config.applicationID != successor.config.applicationID ||
+        predecessor->plan.config.type == ApplicationType::task)
+    {
+      if (failureReport) failureReport->assign("replacement requires the identified observed crash-backoff predecessor"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  static bool observedCrashBackoffPredecessorCgroupIsEmpty(const Container *predecessor,
+                                                           String *failureReport = nullptr)
+  {
+    if (predecessor == nullptr || predecessor->cgroup < 0)
+    {
+      if (failureReport) failureReport->assign("observed crash-backoff predecessor has no cgroup owner"_ctv);
+      return false;
+    }
+    String events;
+    Filesystem::openReadAtClose(predecessor->cgroup, "cgroup.events"_ctv, events);
+    if (std::string_view(reinterpret_cast<const char *>(events.data()), events.size()).find("populated 0\n") == std::string_view::npos)
+    {
+      if (failureReport) failureReport->assign("observed crash-backoff predecessor cgroup is not empty"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  // Mark before cancelling: a timeout or close CQE already queued must see
+  // that the replacement owns retirement and must not restart the old process.
+  static bool claimCrashBackoffReplacementPredecessor(Container *predecessor, const ContainerPlan& successor,
+                                                       String *failureReport = nullptr)
+  {
+    if (crashBackoffReplacementPredecessorReady(predecessor, successor, failureReport) == false ||
+        observedCrashBackoffPredecessorCgroupIsEmpty(predecessor, failureReport) == false)
+    {
+      return false;
+    }
+    TimeoutPacket *restartTimer = predecessor->restartTimer;
+    predecessor->killedOnPurpose = true;
+    predecessor->restartAfterClose = false;
+    predecessor->restartTimer = nullptr;
+    Ring::queueCancelTimeout(restartTimer);
+    return true;
+  }
+
+  // A dead predecessor has no /proc root to compare.  Select only the backend
+  // recorded on the retained Container; path inference is not ownership proof.
+  static bool selectObservedCrashBackoffStorage(
+      const Container *predecessor,
+      const ContainerPlan& successor,
+      String& directPayload,
+      struct stat& directIdentity,
+      bool& renameLoopArtifacts,
+      String *failureReport = nullptr)
+  {
+    auto fail = [&](const char *message) {
+      if (failureReport) failureReport->assign(message);
+      return false;
+    };
+    directPayload.clear();
+    directIdentity = {};
+    renameLoopArtifacts = false;
+    if (predecessor == nullptr || predecessor->plan.config.storageMB == 0) return predecessor != nullptr;
+    if (predecessor->storagePayloadPath.size() == 0 || predecessor->storageRootPath.size() == 0)
+      return fail("observed crash-backoff predecessor has no recorded storage backend");
+
+    String expectedRoot;
+    prodigyContainerStorageRootPathForName(predecessor->name, expectedRoot);
+    if (predecessor->storageRootPath.equals(expectedRoot) == false)
+      return fail("observed crash-backoff predecessor storage root is not canonical");
+
+    if (predecessor->storageUsesLoopFilesystem)
+    {
+      String expectedPayload;
+      prodigyContainerStoragePayloadPathForName(predecessor->name, expectedPayload);
+      if (predecessor->storagePayloadPath.equals(expectedPayload) == false || predecessor->storageLoopDevices.empty())
+        return fail("observed crash-backoff loop storage is incomplete or non-canonical");
+      struct stat root = {}, payload = {};
+      const auto storageRoot = prodigyFilesystemPathFromString(predecessor->storageRootPath);
+      const auto storagePayload = prodigyFilesystemPathFromString(predecessor->storagePayloadPath);
+      if (lstat(storageRoot.c_str(), &root) != 0 || !S_ISDIR(root.st_mode) ||
+          lstat(storagePayload.c_str(), &payload) != 0 || !S_ISDIR(payload.st_mode))
+        return fail("observed crash-backoff loop storage is unavailable");
+      Vector<String> configuredMountPaths;
+      collectConfiguredContainerStorageMountPaths(configuredMountPaths);
+      for (const Container::StorageLoopDevice& device : predecessor->storageLoopDevices)
+      {
+        bool configured = false;
+        for (const String& mountPath : configuredMountPaths)
+        {
+          String expectedBacking;
+          prodigyContainerStorageBackingFilePathForMount(mountPath, predecessor->name, expectedBacking);
+          configured |= device.backingFilePath.equals(expectedBacking);
+        }
+        struct stat backing = {};
+        const auto backingPath = prodigyFilesystemPathFromString(device.backingFilePath);
+        if (device.backingFilePath.size() == 0 || device.sizeMB == 0 || !configured ||
+            lstat(backingPath.c_str(), &backing) != 0 || !S_ISREG(backing.st_mode))
+          return fail("observed crash-backoff loop storage backing identity is unavailable");
+      }
+      renameLoopArtifacts = true;
+      return true;
+    }
+
+    const auto directPath = prodigyFilesystemPathFromString(predecessor->storagePayloadPath);
+    if (predecessor->storagePayloadPath.equals(expectedRoot) == false ||
+        lstat(directPath.c_str(), &directIdentity) != 0 || !S_ISDIR(directIdentity.st_mode))
+      return fail("observed crash-backoff direct storage payload is unavailable or non-canonical");
+    String successorName;
+    successorName.assignItoa(successor.uuid);
+    Vector<ProdigyContainerStorageDevicePlan> devices;
+    if (successor.config.storageMB == 0 || predecessor->plan.config.isolatedChildMemoryMB != 0 ||
+        collectEligibleStorageDevicePlans(successorName, successor.config.storageMB, devices) == false || !devices.empty())
+      return fail("observed crash-backoff direct storage requires the existing no-device backend");
+    directPayload.assign(predecessor->storagePayloadPath);
+    return true;
+  }
+
   // Shared by legacy rootfs-local and direct no-device storage. Called only
   // after the lifecycle wait has observed the predecessor exit.
   // A reflink is mandatory: HSE files can be multi-terabyte sparse files while
@@ -12222,14 +12351,16 @@ public:
     {
       auto it = thisNeuron->containers.find(replaceContainerUUID);
       String replacementFailure;
-      if (!replacementPredecessorReady(it == thisNeuron->containers.end() ? nullptr : it->second,
-                                       plan, &replacementFailure))
+      Container *old = (it == thisNeuron->containers.end()) ? nullptr : it->second;
+      const bool livePredecessor = replacementPredecessorReady(old, plan, &replacementFailure);
+      const bool crashBackoffPredecessor =
+          livePredecessor == false && crashBackoffReplacementPredecessorReady(old, plan, &replacementFailure);
+      if (livePredecessor == false && crashBackoffPredecessor == false)
       {
         reportSpinContainerFailure(plan, replacementFailure);
         co_return;
       }
       {
-        Container *old = it->second;
         const bool hasStorage = old->plan.config.storageMB > 0;
 #if PRODIGY_DEBUG
         appendContainerTrace(old, "legacy-pre-stop replacement=%llu successor=%llu oldStorageMB=%u successorStorageMB=%u hasStorage=%d\n",
@@ -12238,7 +12369,17 @@ public:
 #endif
         String legacySource;
         struct stat legacyIdentity = {};
-        if (hasStorage)
+        bool renameLoopArtifacts = false;
+        if (hasStorage && crashBackoffPredecessor)
+        {
+          if (selectObservedCrashBackoffStorage(old, plan, legacySource, legacyIdentity,
+                                                renameLoopArtifacts, &replacementFailure) == false)
+          {
+            reportSpinContainerFailure(plan, replacementFailure);
+            co_return;
+          }
+        }
+        if (hasStorage && livePredecessor)
         {
           String originalRoot;
           originalRoot.snprintf<"/containers/{}/rootfs/storage"_ctv>(old->name);
@@ -12317,12 +12458,23 @@ public:
             }
           }
         }
-        CoroutineStack *coro = new CoroutineStack();
         old->deleteStorageOnCleanUp = false;
-        old->resumeAfterShutdown = coro;
-        old->stop();
-        co_await coro->suspend();
-        delete coro;
+        if (crashBackoffPredecessor)
+        {
+          if (claimCrashBackoffReplacementPredecessor(old, plan, &replacementFailure) == false)
+          {
+            reportSpinContainerFailure(plan, replacementFailure);
+            co_return;
+          }
+        }
+        else
+        {
+          CoroutineStack *coro = new CoroutineStack();
+          old->resumeAfterShutdown = coro;
+          old->stop();
+          co_await coro->suspend();
+          delete coro;
+        }
 
         String handoffFailure;
         bool staged = legacySource.size() == 0 ||
@@ -12339,6 +12491,11 @@ public:
         if (!staged)
         {
           reportSpinContainerFailure(plan, handoffFailure);
+          co_return;
+        }
+        if (crashBackoffPredecessor && hasStorage && legacySource.size() == 0 && renameLoopArtifacts == false)
+        {
+          reportSpinContainerFailure(plan, "observed crash-backoff storage backend was not selected"_ctv);
           co_return;
         }
       if (hasStorage && legacySource.size() == 0)
