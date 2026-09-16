@@ -21,7 +21,7 @@ then
    exit 77
 fi
 
-for command in find findmnt mount pgrep readlink umount unshare
+for command in find findmnt ip mount pgrep readlink umount unshare
 do
    if ! command -v "${command}" >/dev/null 2>&1
    then
@@ -56,6 +56,7 @@ fi
 mount -t bpf bpf /sys/fs/bpf
 cleanup()
 {
+   ip link delete pwhsyn0 >/dev/null 2>&1 || true
    umount /sys/fs/bpf >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -71,5 +72,13 @@ then
    echo "FAIL: switchboard whitehole unit private bpffs is not empty" >&2
    exit 1
 fi
+
+# Real socket lookup coverage is confined to this already-private netns.  Keep
+# loopback local and make an unresolved veth peer so TCP remains SYN_SENT.
+ip link set lo up
+ip link add pwhsyn0 type veth peer name pwhsink0
+ip addr add 198.18.0.1/24 dev pwhsyn0
+ip link set pwhsyn0 up
+ip link set pwhsink0 up
 
 "${unit}"

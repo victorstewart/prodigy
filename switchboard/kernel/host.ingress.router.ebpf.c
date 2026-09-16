@@ -841,6 +841,65 @@ __attribute__((__always_inline__)) static inline bool maybe_decap_overlay_packet
   return false;
 }
 
+// A registered hosted prefix normally belongs to the overlay.  A host may also
+// use that address as the local source of ordinary sockets.  A reply for one of
+// those exact connected sockets must reach the host stack before the prefix
+// route is considered.  A listener or wildcard UDP socket is
+// deliberately insufficient: it would turn undeclared inbound traffic into a
+// local delivery path.
+__attribute__((__always_inline__)) static inline bool local_connected_socket_owns_ipv4_packet(struct __sk_buff *skb, struct ethhdr *eth, void *data_end)
+{
+  if (skb == NULL || eth == NULL || eth->h_proto != BE_ETH_P_IP)
+  {
+    return false;
+  }
+
+  struct iphdr *iph = (struct iphdr *)(eth + 1);
+  if (switchboard_unfragmented_ipv4(iph, data_end) == false)
+  {
+    return false;
+  }
+
+  struct switchboard_l4_ports ports = {};
+  if ((iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP) ||
+      switchboard_parse_l4_ports((void *)(iph + 1), data_end, iph->protocol,
+                                 sizeof(struct ethhdr) + sizeof(struct iphdr), &ports) == false)
+  {
+    return false;
+  }
+
+  struct bpf_sock_tuple tuple = {};
+  tuple.ipv4.saddr = iph->saddr;
+  tuple.ipv4.daddr = iph->daddr;
+  tuple.ipv4.sport = ports.source;
+  tuple.ipv4.dport = ports.dest;
+
+  if (iph->protocol == IPPROTO_TCP)
+  {
+    struct bpf_sock *socket = bpf_sk_lookup_tcp(skb, &tuple, sizeof(tuple.ipv4), -1, 0);
+    if (socket == NULL)
+    {
+      return false;
+    }
+    bool connected = socket->state != BPF_TCP_LISTEN && socket->state != BPF_TCP_CLOSE;
+    bpf_sk_release(socket);
+    return connected;
+  }
+
+  struct bpf_sock *socket = bpf_sk_lookup_udp(skb, &tuple, sizeof(tuple.ipv4), -1, 0);
+  if (socket == NULL)
+  {
+    return false;
+  }
+  // UDP lookup can return a wildcard listener.  Require the reverse peer and
+  // local endpoint recorded by a connected socket before passing the packet.
+  bool connected = socket->src_ip4 == iph->daddr &&
+                   socket->src_port == bpf_ntohs(ports.dest) &&
+                   socket->dst_ip4 == iph->saddr && socket->dst_port == ports.source;
+  bpf_sk_release(socket);
+  return connected;
+}
+
 __attribute__((__always_inline__)) static inline int maybe_route_hosted_ingress_packet(struct __sk_buff *skb, struct ethhdr *eth, void *data_end, bool *handled)
 {
   if (handled == NULL)
@@ -856,6 +915,19 @@ __attribute__((__always_inline__)) static inline int maybe_route_hosted_ingress_
   }
 
   int action = TC_ACT_OK;
+  if (eth->h_proto == BE_ETH_P_IP)
+  {
+    struct iphdr *iph = (struct iphdr *)(eth + 1);
+    __u32 machine_fragment = 0;
+    if ((void *)(iph + 1) <= data_end &&
+        lookupHostedIngressMachineFragmentIPv4(iph->daddr, &machine_fragment) &&
+        local_connected_socket_owns_ipv4_packet(skb, eth, data_end))
+    {
+      *handled = true;
+      return TC_ACT_OK;
+    }
+  }
+
   if (eth->h_proto == BE_ETH_P_IP && switchboardMaybeRouteHostedIngressIPv4(skb, eth, data_end, &action))
   {
     *handled = true;
