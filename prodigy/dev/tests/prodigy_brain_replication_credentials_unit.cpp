@@ -23576,8 +23576,10 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
   brain.deployments.insert_or_assign(activeDeploymentID, active);
   brain.deployments.insert_or_assign(successorDeploymentID, successor);
   brain.deploymentsByApp.insert_or_assign(applicationID, successor);
-  brain.deploymentPlans.insert_or_assign(activeDeploymentID, active->plan);
-  brain.deploymentPlans.insert_or_assign(successorDeploymentID, successor->plan);
+  // An active master owns materialized plans through deployments; the pending
+  // deploymentPlans map is cleared when election materializes that ownership.
+  const DeploymentPlan originalActivePlan = active->plan;
+  const DeploymentPlan originalSuccessorPlan = successor->plan;
 
   RoutableResourceLease activeWormholeLease = {};
   activeWormholeLease.kind = RoutableResourceLeaseKind::wormholeAddress;
@@ -23841,17 +23843,15 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
   recovering.noMasterYet = false;
   ApplicationDeployment *recoveringActive = new ApplicationDeployment();
   ApplicationDeployment *recoveringSuccessor = new ApplicationDeployment();
-  recoveringActive->plan = brain.deploymentPlans[activeDeploymentID];
+  recoveringActive->plan = originalActivePlan;
   recoveringActive->state = DeploymentState::failed;
-  recoveringSuccessor->plan = brain.deploymentPlans[successorDeploymentID];
+  recoveringSuccessor->plan = originalSuccessorPlan;
   recoveringSuccessor->state = DeploymentState::waitingToDeploy;
   recoveringActive->next = recoveringSuccessor;
   recoveringSuccessor->previous = recoveringActive;
   installCancellationCredentials(recovering);
   recovering.brainConfig.acme.accountEmail = "ops@example.com"_ctv;
   recovering.brainConfig.acme.termsAgreed = true;
-  recovering.deploymentPlans.insert_or_assign(activeDeploymentID, recoveringActive->plan);
-  recovering.deploymentPlans.insert_or_assign(successorDeploymentID, recoveringSuccessor->plan);
   RoutableResourceLease recoveringWormholeLease = brain.routableResourceLeaseRuntimeState[0];
   recoveringWormholeLease.owner = deploymentRoutableResourceLeaseOwner(recoveringActive->plan);
   recoveringWormholeLease.owner.name = recoveringActive->plan.wormholes[0].name;
@@ -23892,6 +23892,41 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
                    recovering.masterAuthorityRuntimeState.publicTlsCertificates.size() == 1 &&
                    recovering.masterAuthorityRuntimeState.publicTlsCertificates[0].spec.deploymentID == successorDeploymentID,
                "operator_cancellation_successor_started_restart_reentry_does_not_repeat_resource_transfer");
+
+  // A crash after the resource commit can leave the durable intent without an
+  // old deployment or pending plan. It must finish once ownership has moved.
+  recovering.failedDeployments[activeDeploymentID].cancellationPhase = CancelDeploymentPhase::accepted;
+  recovering.failedDeployments[activeDeploymentID].cancellationCompletedAtMs = 0;
+  recoveringSuccessor->state = DeploymentState::waitingToDeploy;
+  recovering.resumeOperatorCancellations();
+  suite.expect(recovering.failedDeployments[activeDeploymentID].cancellationPhase == CancelDeploymentPhase::accepted &&
+                   recoveringSuccessor->state == DeploymentState::waitingToDeploy,
+               "operator_cancellation_missing_old_owner_requires_durable_successor_intent");
+  recovering.failedDeployments[activeDeploymentID].cancellationPhase = CancelDeploymentPhase::successorStarted;
+  recovering.routableResourceLeaseRuntimeState[0].owner.deploymentID = activeDeploymentID;
+  recovering.resumeOperatorCancellations();
+  suite.expect(recovering.failedDeployments[activeDeploymentID].cancellationPhase == CancelDeploymentPhase::successorStarted &&
+                   recoveringSuccessor->state == DeploymentState::waitingToDeploy,
+               "operator_cancellation_missing_old_plan_rejects_untransferred_lease");
+  recovering.routableResourceLeaseRuntimeState[0].owner.deploymentID = successorDeploymentID;
+  recovering.masterAuthorityRuntimeState.publicTlsCertificates[0].spec.deploymentID = activeDeploymentID;
+  recovering.resumeOperatorCancellations();
+  suite.expect(recovering.failedDeployments[activeDeploymentID].cancellationPhase == CancelDeploymentPhase::successorStarted &&
+                   recoveringSuccessor->state == DeploymentState::waitingToDeploy,
+               "operator_cancellation_missing_old_plan_rejects_untransferred_certificate");
+  recovering.masterAuthorityRuntimeState.publicTlsCertificates[0].spec.deploymentID = successorDeploymentID;
+  recovering.apiCredentialSetsByApp.erase(applicationID);
+  recovering.resumeOperatorCancellations();
+  suite.expect(recovering.failedDeployments[activeDeploymentID].cancellationPhase == CancelDeploymentPhase::successorStarted &&
+                   recoveringSuccessor->state == DeploymentState::waitingToDeploy,
+               "operator_cancellation_transferred_resume_requires_successor_credentials");
+  installCancellationCredentials(recovering);
+  recovering.resumeOperatorCancellations();
+  suite.expect(recovering.failedDeployments[activeDeploymentID].cancellationPhase == CancelDeploymentPhase::completed &&
+                   recoveringSuccessor->state != DeploymentState::waitingToDeploy &&
+                   recovering.routableResourceLeaseRuntimeState.size() == 2 &&
+                   recovering.masterAuthorityRuntimeState.publicTlsCertificates.size() == 1,
+               "operator_cancellation_resumes_after_transfer_without_old_plan");
   recovering.failedDeployments.erase(activeDeploymentID);
   recovering.deploymentPlans.erase(activeDeploymentID);
   recovering.deploymentPlans.erase(successorDeploymentID);
@@ -23911,8 +23946,6 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
   completedSuccessor->state = DeploymentState::waitingToDeploy;
   completedActive->next = completedSuccessor;
   completedSuccessor->previous = completedActive;
-  recovering.deploymentPlans.insert_or_assign(activeDeploymentID, completedActive->plan);
-  recovering.deploymentPlans.insert_or_assign(successorDeploymentID, completedSuccessor->plan);
   recovering.deployments.insert_or_assign(activeDeploymentID, completedActive);
   recovering.deployments.insert_or_assign(successorDeploymentID, completedSuccessor);
   recovering.deploymentsByApp.insert_or_assign(applicationID, completedSuccessor);
