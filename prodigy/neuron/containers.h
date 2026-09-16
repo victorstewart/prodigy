@@ -1985,57 +1985,84 @@ public:
 
   // configuration
 
-  bool disableHostNetkitIPv4ReversePathFilter(String *failureReport = nullptr)
+  bool applyHostNetkitIPv4SourceValidationPolicy(String *failureReport = nullptr)
   {
-    // L3 netkit host peers intentionally have no IPv4 address. Linux rejects
-    // forwarded IPv4 from an addressless peer while rp_filter is nonzero,
-    // before the host egress switchboard can enforce its own policy.
-    String path;
-    path.assign("/proc/sys/net/ipv4/conf/"_ctv);
-    path.append(netdevs.host.name);
-    path.append("/rp_filter"_ctv);
-    if (writeProcSysctlValue(path.c_str(), "0") == false)
+    if (waitForHostNetkitUdevInitialization(failureReport) == false)
     {
-      if (failureReport)
-      {
-        failureReport->snprintf<"failed to disable IPv4 reverse-path filtering on container netkit {} for container {itoa}"_ctv>(
-            netdevs.host.name,
-            plan.uuid);
-      }
-      basics_log("netkit IPv4 reverse-path filter update failed uuid=%llu path=%s errno=%d(%s)\n",
-                 (unsigned long long)plan.uuid,
-                 path.c_str(),
-                 errno,
-                 strerror(errno));
       return false;
     }
 
-    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    char actual[2] = {};
-    ssize_t actualBytes = (fd >= 0) ? read(fd, actual, sizeof(actual)) : -1;
-    if (fd >= 0)
+    // L3 netkit host peers intentionally have no IPv4 address. A reply from a
+    // container portal can use a host-local IPv4 source, so Linux must neither
+    // reverse-path filter this peer nor reject that local source before the
+    // host egress switchboard enforces its own policy.
+    struct SysctlSetting
     {
-      ::close(fd);
-    }
-    if (actualBytes != 2 || actual[0] != '0' || actual[1] != '\n')
+      const char *name;
+      const char *value;
+      char expected;
+    };
+    const SysctlSetting settings[] = {
+        {"rp_filter", "0", '0'},
+        {"accept_local", "1", '1'},
+    };
+
+    String path;
+    for (const SysctlSetting& setting : settings)
     {
-      if (failureReport)
+      String settingName = {};
+      settingName.assign(setting.name);
+      path.assign("/proc/sys/net/ipv4/conf/"_ctv);
+      path.append(netdevs.host.name);
+      path.append("/"_ctv);
+      path.append(setting.name);
+      if (writeProcSysctlValue(path.c_str(), setting.value) == false)
       {
-        failureReport->snprintf<"failed to verify disabled IPv4 reverse-path filtering on container netkit {} for container {itoa}"_ctv>(
-            netdevs.host.name,
-            plan.uuid);
+        if (failureReport)
+        {
+          failureReport->snprintf<"failed to apply IPv4 source-validation policy {} on container netkit {} for container {itoa}"_ctv>(
+              settingName,
+              netdevs.host.name,
+              plan.uuid);
+        }
+        basics_log("netkit IPv4 source-validation update failed uuid=%llu path=%s errno=%d(%s)\n",
+                   (unsigned long long)plan.uuid,
+                   path.c_str(),
+                   errno,
+                   strerror(errno));
+        return false;
       }
-      basics_log("netkit IPv4 reverse-path filter verification failed uuid=%llu path=%s bytes=%lld first=%u second=%u\n",
-                 (unsigned long long)plan.uuid,
-                 path.c_str(),
-                 (long long)actualBytes,
-                 unsigned(uint8_t(actual[0])),
-                 unsigned(uint8_t(actual[1])));
-      return false;
+
+      int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+      char actual[2] = {};
+      ssize_t actualBytes = (fd >= 0) ? read(fd, actual, sizeof(actual)) : -1;
+      if (fd >= 0)
+      {
+        ::close(fd);
+      }
+      if (actualBytes != 2 || actual[0] != setting.expected || actual[1] != '\n')
+      {
+        if (failureReport)
+        {
+          failureReport->snprintf<"failed to verify IPv4 source-validation policy {} on container netkit {} for container {itoa}"_ctv>(
+              settingName,
+              netdevs.host.name,
+              plan.uuid);
+        }
+        basics_log("netkit IPv4 source-validation verification failed uuid=%llu path=%s bytes=%lld first=%u second=%u\n",
+                   (unsigned long long)plan.uuid,
+                   path.c_str(),
+                   (long long)actualBytes,
+                   unsigned(uint8_t(actual[0])),
+                   unsigned(uint8_t(actual[1])));
+        return false;
+      }
     }
 
     return true;
   }
+
+  bool waitForHostNetkitUdevInitialization(String *failureReport = nullptr);
 
   bool restoreNetwork(String *failureReport = nullptr)
   {
@@ -2060,7 +2087,7 @@ public:
       return false;
     }
     netdevs.getInfo();
-    if (disableHostNetkitIPv4ReversePathFilter(failureReport) == false)
+    if (applyHostNetkitIPv4SourceValidationPolicy(failureReport) == false)
     {
       if (peernetnsfd >= 0)
       {
@@ -2314,7 +2341,7 @@ public:
     host.bringUp();
     peer.bringUp();
 
-    if (disableHostNetkitIPv4ReversePathFilter(failureReport) == false)
+    if (applyHostNetkitIPv4SourceValidationPolicy(failureReport) == false)
     {
       ::close(peernetnsfd);
       ::close(hostnetnsfd);
@@ -2808,6 +2835,8 @@ public:
 
 class ContainerManager {
 private:
+
+  friend bool Container::waitForHostNetkitUdevInitialization(String *failureReport);
 
   int slicefd;
   static inline bool rootCgroupSeeded = false;
@@ -12976,3 +13005,27 @@ public:
                plan.config);
   }
 };
+
+inline bool Container::waitForHostNetkitUdevInitialization(String *failureReport)
+{
+  // systemd-udevd applies per-interface sysctls asynchronously on netdev
+  // creation. Hosts without udev retain the direct policy path.
+  if (access("/run/udev/control", F_OK) != 0)
+  {
+    return true;
+  }
+
+  String devicePath = {};
+  devicePath.assign("/sys/class/net/"_ctv);
+  devicePath.append(netdevs.host.name);
+  std::vector<char *> argv = {
+      const_cast<char *>("udevadm"),
+      const_cast<char *>("wait"),
+      const_cast<char *>("--initialized=yes"),
+      const_cast<char *>("--timeout=5"),
+      const_cast<char *>(devicePath.c_str()),
+      nullptr,
+  };
+  return ContainerManager::runExternalCommand(
+      "netkit_udev_initialization", "udevadm", argv, nullptr, failureReport);
+}
