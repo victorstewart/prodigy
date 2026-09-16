@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <prodigy/bundle.artifact.h>
 #include <prodigy/mothership/mothership.cluster.types.h>
 
@@ -25,10 +26,69 @@ public:
   virtual bool destroyCreatedCloudMachines(const MothershipProdigyCluster& cluster, const Vector<ClusterMachine>& machines, uint32_t& destroyed, String *failure = nullptr) = 0;
 };
 
-static inline void mothershipAppendProdigyOwnedStorageCleanupCommand(String& command)
+// This is deliberately the only thing the emergency reader is allowed to
+// return.  In particular it is not a BrainConfig or a persistent snapshot:
+// those also contain the credential and SSH-key sidecars needed to run a
+// cluster.  The payload is shared by every adopted machine and is compared as
+// a serialized value before Mothership touches the DNS provider.
+class MothershipOfflineDNSCleanupInventory {
+public:
+  uint128_t clusterUUID = 0;
+  class Machine {
+  public:
+    uint128_t uuid = 0;
+    String sshAddress;
+  };
+  Vector<Machine> machines;
+  Vector<RoutableResourceLease> dnsRecordLeases;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipOfflineDNSCleanupInventory::Machine& machine)
 {
-  // Bootstrap creates this loop only when /containers is not already btrfs.
-  // Do not unlink its backing file until the exact mount is gone.
+  serializer.value16b(machine.uuid);
+  serializer.text1b(machine.sshAddress, UINT32_MAX);
+}
+
+template <typename S>
+static void serialize(S&& serializer, MothershipOfflineDNSCleanupInventory& inventory)
+{
+  serializer.value16b(inventory.clusterUUID);
+  serializer.object(inventory.machines);
+  serializer.object(inventory.dnsRecordLeases);
+}
+
+static inline bool mothershipOfflineDNSCleanupInventoryMatches(const MothershipOfflineDNSCleanupInventory& expected,
+                                                                const MothershipOfflineDNSCleanupInventory& actual)
+{
+  if (expected.clusterUUID != actual.clusterUUID || expected.machines.size() != actual.machines.size() || expected.dnsRecordLeases.size() != actual.dnsRecordLeases.size()) return false;
+  for (uint32_t i = 0; i < expected.machines.size(); ++i)
+  {
+    if (expected.machines[i].uuid != actual.machines[i].uuid || expected.machines[i].sshAddress != actual.machines[i].sshAddress) return false;
+  }
+  for (uint32_t i = 0; i < expected.dnsRecordLeases.size(); ++i)
+  {
+    if ((expected.dnsRecordLeases[i] == actual.dnsRecordLeases[i]) == false) return false;
+  }
+  return true;
+}
+
+// A deliberately narrow seam for the offline recovery ordering.  It keeps the
+// unit proof independent of SSH and DNS transports: every root is quiesced,
+// then every public inventory agrees, then DNS is removed, then (and only then)
+// the normal wipe owner may run.
+class MothershipOfflineDNSRecoveryHooks {
+public:
+  virtual ~MothershipOfflineDNSRecoveryHooks() = default;
+  virtual bool quiesce(const MothershipProdigyClusterMachine& machine, String *failure) = 0;
+  virtual bool exportInventory(const MothershipProdigyClusterMachine& machine, MothershipOfflineDNSCleanupInventory& inventory, String *failure) = 0;
+  virtual bool removeDNS(const MothershipOfflineDNSCleanupInventory& inventory, uint32_t& removed, String *failure) = 0;
+  virtual bool wipe(const MothershipProdigyClusterMachine& machine, String *failure) = 0;
+};
+
+
+static inline void mothershipAppendProdigyStopAndDrainCommand(String& command)
+{
   command.append(R"SH(load=$(systemctl show --property=LoadState --value prodigy) || { echo 'failed to query prodigy service' >&2; exit 1; };
 if [ "$load" != not-found ]; then
   systemctl stop prodigy || { echo 'failed to stop prodigy' >&2; exit 1; };
@@ -58,6 +118,13 @@ if [ -d "$container_cgroup_root" ]; then
     [ -z "$container_procs" ] || { echo 'owned container cgroup remained populated' >&2; exit 1; };
   done;
 fi;
+)SH"_ctv);
+}
+
+static inline void mothershipAppendProdigyOwnedStorageCleanupCommand(String& command)
+{
+  mothershipAppendProdigyStopAndDrainCommand(command);
+  command.append(R"SH(
 img=/var/lib/prodigy/containers.btrfs.loop;
 query_owned_loop() {
   loop=$(losetup -j "$img" --noheadings --output NAME) || { echo 'failed to query loop association' >&2; exit 1; };
@@ -273,6 +340,70 @@ static inline void mothershipCollectAdoptedClusterRemoveMachines(const Mothershi
     mothershipPopulateRemoveMachineFromTopology(topologyMachine, machine);
     (void)mothershipAppendUniqueClusterRemoveMachine(machines, machine);
   }
+}
+
+static inline bool mothershipRunOfflineDNSRecovery(const MothershipProdigyCluster& cluster, MothershipOfflineDNSRecoveryHooks& hooks, MothershipClusterRemoveSummary& summary, String *failure = nullptr)
+{
+  summary = {};
+  if (failure) failure->clear();
+  if (cluster.clusterUUID == 0 || cluster.deploymentMode == MothershipClusterDeploymentMode::test || cluster.includeLocalMachine)
+  {
+    if (failure) failure->assign("offline DNS recovery requires an identified SSH-only cluster"_ctv);
+    return false;
+  }
+  for (const MothershipProdigyClusterMachine& machine : cluster.machines)
+  {
+    if (machine.source != MothershipClusterMachineSource::adopted || machine.ssh.address.size() == 0 || machine.ssh.user.size() == 0)
+    {
+      if (failure) failure->assign("offline DNS recovery requires complete adopted SSH registration"_ctv);
+      return false;
+    }
+  }
+  Vector<MothershipProdigyClusterMachine> machines = {};
+  mothershipCollectAdoptedClusterRemoveMachines(cluster, machines);
+  if (machines.empty() || cluster.topology.machines.empty()) { if (failure) failure->assign("offline DNS recovery requires complete adopted topology"_ctv); return false; }
+  MothershipOfflineDNSCleanupInventory expected = {}; expected.clusterUUID = cluster.clusterUUID;
+  for (const ClusterMachine& machine : cluster.topology.machines)
+  {
+    if (machine.source != ClusterMachineSource::adopted || machine.uuid == 0 || machine.ssh.address.size() == 0) { if (failure) failure->assign("offline DNS recovery topology mapping is incomplete"_ctv); return false; }
+    expected.machines.push_back({.uuid = machine.uuid, .sshAddress = machine.ssh.address});
+  }
+  std::sort(expected.machines.begin(), expected.machines.end(), [](const auto& a, const auto& b) { return a.uuid < b.uuid || (a.uuid == b.uuid && prodigyPersistentStringComesBefore(a.sshAddress, b.sshAddress)); });
+  if (expected.machines.size() != machines.size()) { if (failure) failure->assign("offline DNS recovery adopted machine membership mismatch"_ctv); return false; }
+  for (uint32_t i = 0; i < expected.machines.size(); ++i)
+  {
+    for (uint32_t previous = 0; previous < i; ++previous)
+    {
+      if (expected.machines[previous].uuid == expected.machines[i].uuid || expected.machines[previous].sshAddress == expected.machines[i].sshAddress)
+      {
+        if (failure) failure->assign("offline DNS recovery topology mapping is duplicate"_ctv);
+        return false;
+      }
+    }
+    bool found = false; for (const MothershipProdigyClusterMachine& registered : machines) if (registered.ssh.address == expected.machines[i].sshAddress) found = true;
+    if (found == false) { if (failure) failure->assign("offline DNS recovery adopted machine membership mismatch"_ctv); return false; }
+  }
+  for (const MothershipProdigyClusterMachine& machine : machines)
+    if (hooks.quiesce(machine, failure) == false) return false;
+  MothershipOfflineDNSCleanupInventory inventory = {};
+  for (const MothershipProdigyClusterMachine& machine : machines)
+  {
+    MothershipOfflineDNSCleanupInventory observed = {};
+    if (hooks.exportInventory(machine, observed, failure) == false) return false;
+    if (observed.clusterUUID != cluster.clusterUUID || (inventory.clusterUUID != 0 && mothershipOfflineDNSCleanupInventoryMatches(inventory, observed) == false))
+    { if (failure) failure->assign("offline DNS recovery inventories do not match"_ctv); return false; }
+    inventory = std::move(observed);
+  }
+  MothershipOfflineDNSCleanupInventory observed = {}; observed.clusterUUID = inventory.clusterUUID; observed.machines = inventory.machines;
+  if (mothershipOfflineDNSCleanupInventoryMatches(expected, observed) == false) { if (failure) failure->assign("offline DNS recovery inventory source membership mismatch"_ctv); return false; }
+  if (hooks.removeDNS(inventory, summary.removedDNSRecords, failure) == false) return false;
+  summary.dnsTeardownCompleted = true;
+  for (const MothershipProdigyClusterMachine& machine : machines)
+  {
+    if (hooks.wipe(machine, failure) == false) return false;
+    summary.wipedAdoptedMachines += 1;
+  }
+  return true;
 }
 
 static inline void mothershipCollectCreatedCloudClusterRemoveMachines(const MothershipProdigyCluster& cluster, Vector<ClusterMachine>& machines)

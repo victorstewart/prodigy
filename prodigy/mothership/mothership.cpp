@@ -29,6 +29,7 @@
 #include <prodigy/bootstrap.config.h>
 #include <prodigy/container.contract.h>
 #include <prodigy/containerstore.h>
+#include <prodigy/dns.providers.h>
 #include <prodigy/iaas/runtime/runtime.h>
 #include <prodigy/persistent.state.h>
 #include <prodigy/remote.bootstrap.h>
@@ -7460,6 +7461,82 @@ private:
     return true;
   }
 
+  // Read just the public TideDB record.  Do not use ProdigyPersistentStateStore
+  // here: loadBrainSnapshot opens the private sidecar in order to reconstruct a
+  // runnable BrainConfig, which is expressly outside this recovery operation.
+  static bool buildOfflineDNSCleanupInventory(const String& statePath, uint128_t expectedClusterUUID, MothershipOfflineDNSCleanupInventory& inventory, String& failure)
+  {
+    inventory = {};
+    TidesDB db(statePath);
+    String serialized = {};
+    if (db.read("brain", "snapshot", serialized, &failure) == false) return false;
+    ProdigyPersistentStoredBrainSnapshot stored = {};
+    if (prodigyLoadPersistentStoredRecord(serialized, stored) == false)
+    {
+      failure.assign("offline DNS recovery snapshot decode failed"_ctv);
+      return false;
+    }
+    if (stored.state.brainConfig.clusterUUID == 0 || stored.state.brainConfig.clusterUUID != expectedClusterUUID)
+    {
+      failure.assign("offline DNS recovery snapshot cluster UUID does not match requested cluster"_ctv);
+      return false;
+    }
+    inventory.clusterUUID = expectedClusterUUID;
+    for (const ClusterMachine& machine : stored.state.topology.machines)
+    {
+      if (machine.ssh.address.size() == 0)
+      {
+        failure.assign("offline DNS recovery snapshot topology has a machine without SSH address"_ctv);
+        return false;
+      }
+      if (machine.uuid == 0)
+      {
+        failure.assign("offline DNS recovery snapshot topology has a machine without UUID"_ctv);
+        return false;
+      }
+      inventory.machines.push_back({.uuid = machine.uuid, .sshAddress = machine.ssh.address});
+    }
+    for (const RoutableResourceLease& lease : stored.state.masterAuthority.runtimeState.routableResourceLeases)
+    {
+      if (lease.kind == RoutableResourceLeaseKind::dnsRecord) inventory.dnsRecordLeases.push_back(lease);
+    }
+    // A deterministic ordering makes inventories from different elected peers
+    // byte-comparable without retaining a second recovery journal.
+    std::sort(inventory.machines.begin(), inventory.machines.end(), [](const MothershipOfflineDNSCleanupInventory::Machine& a, const MothershipOfflineDNSCleanupInventory::Machine& b) { return a.uuid < b.uuid || (a.uuid == b.uuid && prodigyPersistentStringComesBefore(a.sshAddress, b.sshAddress)); });
+    std::sort(inventory.dnsRecordLeases.begin(), inventory.dnsRecordLeases.end(), [](const RoutableResourceLease& a, const RoutableResourceLease& b) {
+      RoutableResourceLease ac = a, bc = b; String as = {}, bs = {}; BitseryEngine::serialize(as, ac); BitseryEngine::serialize(bs, bc);
+      const size_t common = std::min(as.size(), bs.size()); const int compared = common ? std::memcmp(as.data(), bs.data(), common) : 0;
+      return compared != 0 ? compared < 0 : as.size() < bs.size();
+    });
+    failure.clear();
+    return true;
+  }
+
+  void runOfflineDNSCleanupInventory(int argc, char *argv[])
+  {
+    if (argc != 1)
+    {
+      basics_log("offlineDNSCleanupInventory requires exact cluster UUID\n");
+      exit(EXIT_FAILURE);
+    }
+    String expectedText = {}; expectedText.assign(argv[0]);
+    uint128_t expected = 0;
+    if (prodigyParseCanonicalHex128(expectedText, expected) == false)
+    {
+      basics_log("offlineDNSCleanupInventory requires canonical nonzero cluster UUID\n");
+      exit(EXIT_FAILURE);
+    }
+    MothershipOfflineDNSCleanupInventory inventory = {}; String failure = {};
+    if (buildOfflineDNSCleanupInventory(defaultProdigyPersistentStateDBPath(), expected, inventory, failure) == false)
+    {
+      basics_log("offlineDNSCleanupInventory success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    String payload = {}; BitseryEngine::serialize(payload, inventory);
+    String encoded = {}; Base64::encode(payload.data(), payload.size(), encoded);
+    basics_log("offlineDNSCleanupInventory success=1 payload=%s\n", encoded.c_str());
+  }
+
   bool stopAndWipeLocalProdigyInstance(String& failure)
   {
     failure.clear();
@@ -7495,6 +7572,77 @@ private:
     bool ok = prodigyRunBlockingSSHCommand(session, fd, command, nullptr, &failure, 120'000);
     mothershipCloseSSHSession(session, fd);
     return ok;
+  }
+
+  bool removeClusterDNSBindingsOffline(const MothershipProdigyCluster& cluster, const MothershipOfflineDNSCleanupInventory& inventory, uint32_t& removed, String& failure)
+  {
+    removed = 0;
+    MothershipProviderCredential source = {};
+    if (validateClusterDNSProviderCredentialReference(cluster, failure, &source) == false) return false;
+    ApiCredential credential = {};
+    if (mothershipBuildClusterDNSCredential(cluster, &source, credential, &failure) == false) return false;
+    bool ok = true;
+    bool ran = hostRuntime.run([&](ProdigyProviderServices services, CoroutineStack *coro) -> void {
+      ProdigyDefaultDNSProvider provider = {};
+      provider.configureRuntime({.http = services.http, .delay = services.delay, .operationDeadline = services.operationDeadline});
+      for (const RoutableResourceLease& lease : inventory.dnsRecordLeases)
+      {
+        ProdigyDNSRecordBinding binding = {};
+        if (prodigyBuildDNSRecordBinding(lease, binding, &failure) == false) { ok = false; co_return; }
+        if (binding.provider != credential.provider || binding.credentialName != credential.name)
+        {
+          failure.assign("offline DNS recovery inventory does not match cluster DNS credential"_ctv); ok = false; co_return;
+        }
+        if (co_await provider.remove(coro, binding, credential, failure) == false) { ok = false; co_return; }
+        removed += 1;
+      }
+    });
+    credential.material.clear();
+    credential.metadata.clear();
+    if (ran == false && failure.size() == 0) failure.assign("offline DNS recovery host runtime failed to start"_ctv);
+    return ran && ok;
+  }
+
+  bool offlineDNSRecoveryInventoryFromMachine(const MothershipProdigyCluster& cluster, const MothershipProdigyClusterMachine& machine, MothershipOfflineDNSCleanupInventory& inventory, String& failure)
+  {
+    inventory = {};
+    LIBSSH2_SESSION *session = nullptr; int fd = -1;
+    if (mothershipConnectSSHSession(machine, session, fd, &failure, &cluster.bootstrapSshKeyPackage, &cluster.bootstrapSshPrivateKeyPath) == false) return false;
+    String executable = {};
+    if (prodigyResolveCurrentExecutablePath(executable) == false)
+    {
+      mothershipCloseSSHSession(session, fd); failure.assign("cannot resolve Mothership executable for offline DNS recovery"_ctv); return false;
+    }
+    String stage = {}, output = {};
+    if (prodigyRunBlockingSSHCommand(session, fd, "set -eu; d=$(mktemp -d /tmp/prodigy-mothership-offline.XXXXXX); chmod 700 \"$d\"; printf '%s' \"$d\""_ctv, &stage, &failure, 30'000) == false)
+    { mothershipCloseSSHSession(session, fd); return false; }
+    constexpr const char *stagePrefix = "/tmp/prodigy-mothership-offline.";
+    const size_t prefixSize = std::strlen(stagePrefix);
+    if (stage.size() <= prefixSize || std::memcmp(stage.data(), stagePrefix, prefixSize) != 0) { mothershipCloseSSHSession(session, fd); failure.assign("offline DNS recovery remote temporary directory is invalid"_ctv); return false; }
+    for (size_t i = prefixSize; i < stage.size(); ++i)
+      if ((stage[i] < 'a' || stage[i] > 'z') && (stage[i] < 'A' || stage[i] > 'Z') && (stage[i] < '0' || stage[i] > '9')) { mothershipCloseSSHSession(session, fd); failure.assign("offline DNS recovery remote temporary directory suffix is unsafe"_ctv); return false; }
+    String remoteBinary = stage; remoteBinary.append("/mothership"_ctv);
+    bool ok = prodigyUploadLocalFileToSSHSession(session, fd, executable, remoteBinary, 0700, &failure, 120'000);
+    String expectedUUID = {}; expectedUUID.assignItoh(cluster.clusterUUID);
+    if (ok)
+    {
+      String command = {}; command.assign("set -eu; "_ctv); prodigyAppendShellSingleQuoted(command, remoteBinary); command.append(" offlineDNSCleanupInventory "_ctv); prodigyAppendShellSingleQuoted(command, expectedUUID);
+      ok = prodigyRunBlockingSSHCommand(session, fd, command, &output, &failure, 120'000);
+    }
+    String cleanup = "rm -rf "_ctv; prodigyAppendShellSingleQuoted(cleanup, stage);
+    String ignored = {}; (void)prodigyRunBlockingSSHCommand(session, fd, cleanup, nullptr, &ignored, 30'000);
+    mothershipCloseSSHSession(session, fd);
+    if (ok == false) return false;
+    if (output.size() > 4_MB) { failure.assign("offline DNS recovery exporter output exceeds 4 MiB"_ctv); return false; }
+    const char *marker = "payload=";
+    const char *begin = std::strstr(output.c_str(), marker);
+    if (begin == nullptr) { failure.assign("offline DNS recovery exporter returned no inventory payload"_ctv); return false; }
+    begin += std::strlen(marker); const char *end = std::strchr(begin, '\n');
+    String encoded = {}; encoded.append(begin, end ? size_t(end - begin) : std::strlen(begin));
+    String payload = {};
+    if (Base64::decode(encoded, payload) == false || BitseryEngine::deserializeSafe(payload, inventory) == false)
+    { failure.assign("offline DNS recovery exporter payload decode failed"_ctv); return false; }
+    return true;
   }
 
   class RemoveClusterHooks final : public MothershipClusterRemoveHooks {
@@ -7563,6 +7711,21 @@ private:
   private:
 
     Mothership *mothership = nullptr;
+  };
+
+  class OfflineDNSRecoveryHooks final : public MothershipOfflineDNSRecoveryHooks {
+  public:
+    OfflineDNSRecoveryHooks(Mothership *owner, const MothershipProdigyCluster& cluster) : owner(owner), cluster(cluster) {}
+    bool quiesce(const MothershipProdigyClusterMachine& machine, String *failure) override {
+      String command = "set -eu; "_ctv; mothershipAppendProdigyStopAndDrainCommand(command);
+      LIBSSH2_SESSION *session = nullptr; int fd = -1; String localFailure = {};
+      bool ok = mothershipConnectSSHSession(machine, session, fd, &localFailure, &cluster.bootstrapSshKeyPackage, &cluster.bootstrapSshPrivateKeyPath) && prodigyRunBlockingSSHCommand(session, fd, command, &localFailure, 120'000);
+      mothershipCloseSSHSession(session, fd); if (failure) *failure = localFailure; return ok;
+    }
+    bool exportInventory(const MothershipProdigyClusterMachine& machine, MothershipOfflineDNSCleanupInventory& inventory, String *failure) override { String localFailure = {}; bool ok = owner->offlineDNSRecoveryInventoryFromMachine(cluster, machine, inventory, localFailure); if (failure) *failure = localFailure; return ok; }
+    bool removeDNS(const MothershipOfflineDNSCleanupInventory& inventory, uint32_t& removed, String *failure) override { String localFailure = {}; bool ok = owner->removeClusterDNSBindingsOffline(cluster, inventory, removed, localFailure); if (failure) *failure = localFailure; return ok; }
+    bool wipe(const MothershipProdigyClusterMachine& machine, String *failure) override { String localFailure = {}; bool ok = owner->stopAndWipeRemoteProdigyInstance(cluster, machine, localFailure); if (failure) *failure = localFailure; return ok; }
+  private: Mothership *owner; const MothershipProdigyCluster& cluster;
   };
 
   bool providerCredentialReferencedByClusters(const String& name, String& failure, String *referencingClusterName = nullptr)
@@ -16445,14 +16608,15 @@ private:
   {
     if (argc != 1 && argc != 2)
     {
-      basics_log("usage: removeCluster [name|clusterUUID] [--resume-after-dns-teardown]\n");
+      basics_log("usage: removeCluster [name|clusterUUID] [--resume-after-dns-teardown|--offline-dns-recovery]\n");
       exit(EXIT_FAILURE);
     }
 
     const bool resumeAfterDNS = argc == 2 && std::strcmp(argv[1], "--resume-after-dns-teardown") == 0;
-    if (argc == 2 && resumeAfterDNS == false)
+    const bool offlineDNSRecovery = argc == 2 && std::strcmp(argv[1], "--offline-dns-recovery") == 0;
+    if (argc == 2 && resumeAfterDNS == false && offlineDNSRecovery == false)
     {
-      basics_log("removeCluster unknown option; use --resume-after-dns-teardown only after confirmed DNS teardown\n");
+      basics_log("removeCluster unknown option\n");
       exit(EXIT_FAILURE);
     }
 
@@ -16473,6 +16637,79 @@ private:
         basics_log("removeCluster success=0 removed=0 identity=%s failure=%s\n", name.c_str(), (failure.size() ? failure.c_str() : ""));
         exit(EXIT_FAILURE);
       }
+    }
+
+    if (offlineDNSRecovery)
+    {
+      uint128_t requestedUUID = 0;
+      if (prodigyParseCanonicalHex128(name, requestedUUID) == false)
+      {
+        basics_log("removeCluster offline DNS recovery requires exact canonical cluster UUID\n");
+        exit(EXIT_FAILURE);
+      }
+      if (cluster.clusterUUID != requestedUUID || cluster.deploymentMode == MothershipClusterDeploymentMode::test || cluster.includeLocalMachine)
+      {
+        basics_log("removeCluster offline DNS recovery requires the exact registered SSH-only cluster UUID\n");
+        exit(EXIT_FAILURE);
+      }
+      for (const ClusterMachine& machine : cluster.topology.machines)
+      {
+        if (machine.source != ClusterMachineSource::adopted || machine.uuid == 0 || machine.ssh.address.size() == 0)
+        {
+          basics_log("removeCluster offline DNS recovery requires a fully adopted cluster with registered UUID and SSH mappings\n");
+          exit(EXIT_FAILURE);
+        }
+      }
+      Vector<MothershipProdigyClusterMachine> adopted = {};
+      mothershipCollectAdoptedClusterRemoveMachines(cluster, adopted);
+      if (adopted.empty())
+      {
+        basics_log("removeCluster offline DNS recovery requires registered adopted SSH machines\n");
+        exit(EXIT_FAILURE);
+      }
+      char localArchitecture[128] = {};
+      FILE *localArchitecturePipe = ::popen("uname -m", "r");
+      if (localArchitecturePipe == nullptr || std::fgets(localArchitecture, sizeof(localArchitecture), localArchitecturePipe) == nullptr || ::pclose(localArchitecturePipe) != 0)
+      {
+        basics_log("removeCluster offline DNS recovery could not determine Mothership executable architecture\n");
+        exit(EXIT_FAILURE);
+      }
+      localArchitecture[std::strcspn(localArchitecture, "\r\n")] = '\0';
+      for (const MothershipProdigyClusterMachine& machine : adopted)
+      {
+        LIBSSH2_SESSION *session = nullptr; int fd = -1; String remoteArchitecture = {};
+        if (mothershipConnectSSHSession(machine, session, fd, &failure, &cluster.bootstrapSshKeyPackage, &cluster.bootstrapSshPrivateKeyPath) == false ||
+            prodigyRunBlockingSSHCommand(session, fd, "uname -m"_ctv, &remoteArchitecture, &failure, 30'000) == false)
+        {
+          mothershipCloseSSHSession(session, fd);
+          basics_log("removeCluster offline DNS recovery architecture probe failed: %s\n", failure.c_str());
+          exit(EXIT_FAILURE);
+        }
+        mothershipCloseSSHSession(session, fd);
+        while (remoteArchitecture.size() > 0 && (remoteArchitecture[remoteArchitecture.size() - 1] == '\n' || remoteArchitecture[remoteArchitecture.size() - 1] == '\r')) remoteArchitecture.resize(remoteArchitecture.size() - 1);
+        if (remoteArchitecture.equals(localArchitecture) == false)
+        {
+          basics_log("removeCluster offline DNS recovery refuses incompatible staged Mothership architecture\n");
+          exit(EXIT_FAILURE);
+        }
+      }
+      for (const MothershipProdigyClusterMachine& machine : adopted)
+        if (machine.ssh.address.size() == 0 || machine.ssh.user.size() == 0) { basics_log("removeCluster offline DNS recovery requires complete adopted SSH registration\n"); exit(EXIT_FAILURE); }
+      MothershipClusterRemoveSummary summary = {};
+      OfflineDNSRecoveryHooks offlineHooks(this, cluster);
+      if (mothershipRunOfflineDNSRecovery(cluster, offlineHooks, summary, &failure) == false)
+      {
+        basics_log("removeCluster success=0 removed=0 identity=%s offlineDNSRecovery=1 dnsTeardownCompleted=%u wipedAdoptedMachines=%u failure=%s\n", name.c_str(), unsigned(summary.dnsTeardownCompleted), unsigned(summary.wipedAdoptedMachines), failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+      MothershipClusterRegistry clusterRegistry = openClusterRegistry();
+      if (clusterRegistry.removeClusterByIdentity(name, &failure) == false)
+      {
+        basics_log("removeCluster success=0 removed=0 identity=%s offlineDNSRecovery=1 failure=%s\n", name.c_str(), failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+      basics_log("removeCluster success=1 removed=1 identity=%s removedDNSRecords=%u wipedAdoptedMachines=%u offlineDNSRecovery=1\n", name.c_str(), unsigned(summary.removedDNSRecords), unsigned(summary.wipedAdoptedMachines));
+      return;
     }
 
     MothershipClusterRemoveSummary summary = {};
@@ -18756,6 +18993,7 @@ public:
         {"estimateClusterHourlyCost",       &Mothership::runEstimateClusterHourlyCost      },
         {"faultTestCluster",                &Mothership::runFaultTestCluster               },
         {"mintClientTlsIdentity",           &Mothership::runMintClientTlsIdentity          },
+        {"offlineDNSCleanupInventory",      &Mothership::runOfflineDNSCleanupInventory     },
         {"printClusters",                   &Mothership::runPrintClusters                  },
         {"probeTestCluster",                &Mothership::runProbeTestCluster               },
         {"pullDNSBindings",                 &Mothership::runPullDNSBindings                },
