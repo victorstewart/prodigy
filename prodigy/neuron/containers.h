@@ -1985,6 +1985,58 @@ public:
 
   // configuration
 
+  bool disableHostNetkitIPv4ReversePathFilter(String *failureReport = nullptr)
+  {
+    // L3 netkit host peers intentionally have no IPv4 address. Linux rejects
+    // forwarded IPv4 from an addressless peer while rp_filter is nonzero,
+    // before the host egress switchboard can enforce its own policy.
+    String path;
+    path.assign("/proc/sys/net/ipv4/conf/"_ctv);
+    path.append(netdevs.host.name);
+    path.append("/rp_filter"_ctv);
+    if (writeProcSysctlValue(path.c_str(), "0") == false)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to disable IPv4 reverse-path filtering on container netkit {} for container {itoa}"_ctv>(
+            netdevs.host.name,
+            plan.uuid);
+      }
+      basics_log("netkit IPv4 reverse-path filter update failed uuid=%llu path=%s errno=%d(%s)\n",
+                 (unsigned long long)plan.uuid,
+                 path.c_str(),
+                 errno,
+                 strerror(errno));
+      return false;
+    }
+
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    char actual[2] = {};
+    ssize_t actualBytes = (fd >= 0) ? read(fd, actual, sizeof(actual)) : -1;
+    if (fd >= 0)
+    {
+      ::close(fd);
+    }
+    if (actualBytes != 2 || actual[0] != '0' || actual[1] != '\n')
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"failed to verify disabled IPv4 reverse-path filtering on container netkit {} for container {itoa}"_ctv>(
+            netdevs.host.name,
+            plan.uuid);
+      }
+      basics_log("netkit IPv4 reverse-path filter verification failed uuid=%llu path=%s bytes=%lld first=%u second=%u\n",
+                 (unsigned long long)plan.uuid,
+                 path.c_str(),
+                 (long long)actualBytes,
+                 unsigned(uint8_t(actual[0])),
+                 unsigned(uint8_t(actual[1])));
+      return false;
+    }
+
+    return true;
+  }
+
   bool restoreNetwork(String *failureReport = nullptr)
   {
     int hostnetnsfd = Filesystem::openFileAt(-1, "/proc/self/ns/net"_ctv, O_RDONLY);
@@ -2008,6 +2060,18 @@ public:
       return false;
     }
     netdevs.getInfo();
+    if (disableHostNetkitIPv4ReversePathFilter(failureReport) == false)
+    {
+      if (peernetnsfd >= 0)
+      {
+        ::close(peernetnsfd);
+      }
+      if (hostnetnsfd >= 0)
+      {
+        ::close(hostnetnsfd);
+      }
+      return false;
+    }
     if (applyHostMTUToNetkitPair(failureReport) == false)
     {
       if (peernetnsfd >= 0)
@@ -2250,28 +2314,8 @@ public:
     host.bringUp();
     peer.bringUp();
 
-    // L3 netkit host peers intentionally have no IPv4 address. Linux source
-    // validation rejects every forwarded IPv4 packet from an addressless
-    // interface when rp_filter is nonzero, even in loose mode, before the
-    // host egress switchboard can validate and route it. The per-container
-    // egress program already owns source/port authorization, so disable only
-    // this netkit peer's inherited reverse-path filter.
-    path.assign("/proc/sys/net/ipv4/conf/"_ctv);
-    path.append(host.name);
-    path.append("/rp_filter"_ctv);
-    if (writeProcSysctlValue(path.c_str(), "0") == false)
+    if (disableHostNetkitIPv4ReversePathFilter(failureReport) == false)
     {
-      if (failureReport)
-      {
-        failureReport->snprintf<"failed to disable IPv4 reverse-path filtering on container netkit {} for container {itoa}"_ctv>(
-            host.name,
-            plan.uuid);
-      }
-      basics_log("setupNetwork failed uuid=%llu reason=netkit-ipv4-rp-filter path=%s errno=%d(%s)\n",
-                 (unsigned long long)plan.uuid,
-                 path.c_str(),
-                 errno,
-                 strerror(errno));
       ::close(peernetnsfd);
       ::close(hostnetnsfd);
       return false;

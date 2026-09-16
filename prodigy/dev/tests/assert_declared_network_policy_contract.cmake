@@ -92,13 +92,16 @@ endif()
 string(FIND "${_container_egress}" "if (localSubnetContainsDaddr(daddr6))" _local_route_action)
 string(FIND "${_containers}" "host.addDirectRoute(address, 128, AF_INET6);" _local_route_install)
 string(FIND "${_all}" "writeProcSysctlValue(\"/proc/sys/net/ipv4/ip_forward\", \"1\")" _public_ingress_forwarding)
-string(FIND "${_containers}" "path.append(\"/rp_filter\"_ctv);" _container_ipv4_rpf_path)
-string(FIND "${_containers}" "writeProcSysctlValue(path.c_str(), \"0\")" _container_ipv4_rpf_disable)
+string(FIND "${_containers}" "bool disableHostNetkitIPv4ReversePathFilter" _container_ipv4_rpf_owner)
+string(FIND "${_containers}" "actualBytes != 2 || actual[0] != '0' || actual[1] != '\\n'" _container_ipv4_rpf_verified)
+string(FIND "${_containers}" "netdevs.getInfo();\n    if (disableHostNetkitIPv4ReversePathFilter(failureReport) == false)" _container_ipv4_rpf_restore)
+string(FIND "${_containers}" "host.bringUp();\n    peer.bringUp();\n\n    if (disableHostNetkitIPv4ReversePathFilter(failureReport) == false)" _container_ipv4_rpf_setup)
 string(FIND "${_all}" "writeProcSysctlValue(\"/proc/sys/net/ipv6/conf/all/forwarding\", \"1\")" _local_route_forwarding)
 string(REGEX MATCHALL "primary_program->setArrayElement\\(\"lc_subnet\"_ctv, 0, thisNeuron->lcsubnet6\\);" _primary_subnet_sync "${_containers}")
 list(LENGTH _primary_subnet_sync _primary_subnet_sync_count)
 if(_local_route_action EQUAL -1 OR _local_route_install EQUAL -1 OR _public_ingress_forwarding EQUAL -1 OR
-   _container_ipv4_rpf_path EQUAL -1 OR _container_ipv4_rpf_disable EQUAL -1 OR
+   _container_ipv4_rpf_owner EQUAL -1 OR _container_ipv4_rpf_verified EQUAL -1 OR
+   _container_ipv4_rpf_restore EQUAL -1 OR _container_ipv4_rpf_setup EQUAL -1 OR
    _local_route_forwarding EQUAL -1 OR
    _primary_subnet_sync_count LESS 2)
    message(FATAL_ERROR "same-machine L3 netkit traffic must use host /128 routing")
