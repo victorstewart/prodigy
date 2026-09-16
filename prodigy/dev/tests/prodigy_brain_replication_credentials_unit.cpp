@@ -22776,7 +22776,7 @@ static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(Tes
   brain.iaas = &iaas;
   brain.weAreMaster = true;
   brain.ignited = true;
-  brain.recoveringPersistedNeuronInventory = true;
+  brain.persistedMachineInventoryEnumerated = true;
   brain.brainConfig.datacenterFragment = 1;
 
   BrainBase *previousBrain = thisBrain;
@@ -22812,6 +22812,22 @@ static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(Tes
   retained.state = ContainerState::healthy;
   retained.fragment = 2;
   retained.createdAtMs = 1;
+  deployment.containers.insert(&retained);
+  machine.upsertContainerIndexEntry(retained.deploymentID, &retained);
+  brain.containers.insert_or_assign(retained.uuid, &retained);
+
+  // The live coordinator already has a prior inventory attestation. A durable
+  // all-machine update must replace it with fresh post-exec attestations before
+  // a follower runtime report can trigger stateless deficit recovery.
+  brain.persistedMachineInventoryUploaded.insert(machine.uuid);
+  brain.updateSelfWorkerExpectedBundleSHA256 =
+      "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv;
+  suite.require(brain.prepareLocalBundleExecRecovery(),
+                "persisted_inventory_runtime_active_coordinator_captures_durable_machine_witness");
+  suite.expect(brain.recoveringPersistedNeuronInventory &&
+                   brain.persistedMachineInventoryUploaded.empty() &&
+                   brain.updateSelfMachineRecoveryWitnesses.size() == 1,
+               "persisted_inventory_runtime_active_coordinator_starts_fresh_inventory_barrier");
 
   BrainReplicatedContainerRuntimeState runtime = {};
   runtime.machineUUID = machine.uuid;
@@ -22831,20 +22847,14 @@ static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(Tes
                    brain.recoveringPersistedNeuronInventory,
                "persisted_inventory_runtime_does_not_discard_unready_retained_stateless_container_before_exact_uploads");
 
-  // Model the exact captured upload and let the existing central recovery
-  // owner clear its barrier before it invokes deployment recovery.
-  NeuronContainerBootstrap bootstrap = {};
-  bootstrap.plan = runtime.plan;
-  String serializedBootstrap = {};
-  BitseryEngine::serialize(serializedBootstrap, bootstrap);
-  ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
-  witness.machineUUID = machine.uuid;
-  witness.bundleRegistered = true;
-  witness.containerBootstraps.push_back(std::move(serializedBootstrap));
-  brain.updateSelfMachineRecoveryWitnesses.push_back(std::move(witness));
+  // A digest-matching registration and the exact fresh inventory upload let
+  // the existing central recovery owner release the coordinator barrier.
+  suite.require(brain.noteLocalBundleRegistration(
+                    &machine,
+                    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv),
+                "persisted_inventory_runtime_active_coordinator_accepts_matching_machine_registration");
   Mesh mesh = {};
   brain.mesh = &mesh;
-  brain.persistedMachineInventoryEnumerated = true;
   brain.persistedMachineInventoryUploaded.insert(machine.uuid);
   machine.runtimeReady = true;
   suite.expect(Ring::getRingFD() > 0,
@@ -22869,7 +22879,10 @@ static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(Tes
     deployment.containers.erase(view);
     machine.removeContainerIndexEntry(view->deploymentID, view);
     brain.containers.erase(view->uuid);
-    delete view;
+    if (view != &retained)
+    {
+      delete view;
+    }
   }
   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
   brain.deployments.erase(deployment.plan.config.deploymentID());
@@ -23098,10 +23111,15 @@ static void testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(Tes
   brain.nBrains = 3;
   brain.updateSelfState = Brain::UpdateSelfState::waitingForFollowerReboots;
   brain.updateSelfExpectedEchos = 2;
-  brain.updateSelfLocalMachineUUID = uint128_t(0x521b0001);
   brain.updateSelfWorkerExpectedBundleSHA256 =
       "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv;
-  brain.updateSelfLocalContainerBootstraps.push_back("captured-bootstrap"_ctv);
+  for (uint128_t machineUUID : {uint128_t(0x521b0001), uint128_t(0x521b0002), uint128_t(0x521b0003)})
+  {
+    ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
+    witness.machineUUID = machineUUID;
+    witness.containerBootstraps.push_back("captured-bootstrap"_ctv);
+    brain.updateSelfMachineRecoveryWitnesses.push_back(std::move(witness));
+  }
   brain.masterAuthorityRuntimeState.generation = 7;
   brain.masterAuthorityRuntimeStateDurable = true;
   brain.durableMasterAuthorityRuntimeStateGeneration = 7;

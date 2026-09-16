@@ -25009,7 +25009,10 @@ public:
   bool updateSelfRecoveryWitnessAcknowledgedByPeers(
       const bytell_hash_set<uint128_t>& requiredPeerKeys) const
   {
-    if (projectUpdateSelfRecoveryWitness(capturePersistentUpdateSelfState()).localMachineUUID == 0)
+    const ProdigyPersistentUpdateSelfState recoveryWitness =
+        projectUpdateSelfRecoveryWitness(capturePersistentUpdateSelfState());
+    if (recoveryWitness.localMachineUUID == 0 &&
+        recoveryWitness.machineRecoveryWitnesses.empty())
     {
       return true;
     }
@@ -25432,6 +25435,14 @@ public:
       updateSelfWorkerFailure.assign("bundle-exec recovery state could not be persisted"_ctv);
       return false;
     }
+
+    // The current master remains authoritative while followers exec.  Start
+    // the existing exact-inventory barrier before either follower can report
+    // a transiently unready runtime; otherwise its report may close a target
+    // deficit and create a replacement alongside the retained process.
+    recoveringPersistedNeuronInventory = true;
+    persistedMachineInventoryUploaded.clear();
+    recoveredNeuronPairingsUnified = false;
     return true;
   }
 
