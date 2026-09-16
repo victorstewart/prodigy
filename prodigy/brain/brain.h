@@ -13241,6 +13241,24 @@ public:
       driveMasterPeerIdentityConvergence(peer, nowMs);
 
       const bool heartbeatDue = (peer->lastHeartbeatSendMs == 0 || nowMs - peer->lastHeartbeatSendMs >= int64_t(brainPeerHeartbeatIntervalMs) || (lastPeerLivenessMs > 0 && nowMs - lastPeerLivenessMs >= int64_t(brainPeerHeartbeatIntervalMs)));
+      // A completed write only proves that the relinquish command left this
+      // stream; it does not prove that the peer's acknowledgement arrived.
+      // Reuse the existing peer-heartbeat cadence to retry the same durable
+      // handoff command until that peer has acknowledged it.  The receiver
+      // recognizes an already-applied designated handoff, so this cannot
+      // repeat election side effects after a lost acknowledgement.
+      if (heartbeatDue && updateSelfState == UpdateSelfState::waitingForRelinquishEchos)
+      {
+        uint128_t peerKey = updateSelfPeerTrackingKey(peer);
+        if (peerKey != 0 &&
+            updateSelfFollowerRebootedPeerKeys.contains(peerKey) &&
+            updateSelfRelinquishEchoPeerKeys.contains(peerKey) == false)
+        {
+          updateSelfRelinquishIssuedPeerKeys.erase(peerKey);
+          queueUpdateSelfRelinquishToPeer(peer);
+        }
+      }
+
       if (heartbeatOutstanding == false && heartbeatDue)
       {
         peer->sendPeerHeartbeat(nowMs);
@@ -25698,6 +25716,21 @@ public:
     transitionToNewBundle();
   }
 
+  bool relinquishMasterStatusAlreadyApplied(BrainView *commandPeer,
+                                            uint128_t designatedMasterPeerKey,
+                                            BrainView *designatedPeer) const
+  {
+    if (designatedMasterPeerKey == 0)
+    {
+      return false;
+    }
+    if (updateSelfPeerKeyMatchesLocal(designatedMasterPeerKey, commandPeer))
+    {
+      return weAreMaster;
+    }
+    return designatedPeer != nullptr && designatedPeer->isMasterBrain && noMasterYet == false;
+  }
+
   BrainView *currentMasterPeer(void)
   {
     for (BrainView *peer : brains)
@@ -26707,6 +26740,24 @@ public:
               Message::extractArg<ArgumentNature::fixed>(args, designatedMasterPeerKey);
             }
 
+            bool matchesLocalLegacyAddress = false;
+            bool legacyAddressAmbiguous = false;
+            BrainView *peer = findBrainViewByUpdateSelfPeerKey(
+                designatedMasterPeerKey,
+                bv,
+                &matchesLocalLegacyAddress,
+                &legacyAddressAmbiguous);
+            if (relinquishMasterStatusAlreadyApplied(
+                    bv, designatedMasterPeerKey, peer))
+            {
+              if (peerSocketActive(bv))
+              {
+                Message::construct(bv->wBuffer, BrainTopic::relinquishMasterStatus);
+                Ring::queueSend(bv);
+              }
+              break;
+            }
+
             resetMasterBrainAssignment();
             pendingDesignatedMasterPeerKey = designatedMasterPeerKey;
             {
@@ -26718,12 +26769,6 @@ public:
 
             bool electedDesignatedMaster = false;
             bool designatedMasterKnown = false;
-            bool matchesLocalLegacyAddress = false;
-            bool legacyAddressAmbiguous = false;
-            BrainView *peer = findBrainViewByUpdateSelfPeerKey(designatedMasterPeerKey,
-                                                                bv,
-                                                                &matchesLocalLegacyAddress,
-                                                                &legacyAddressAmbiguous);
             if (updateSelfPeerKeyMatchesLocal(designatedMasterPeerKey, bv))
             {
               designatedMasterKnown = true;

@@ -10123,6 +10123,113 @@ static void testMaybeRelinquishMasterSelectsLowestPeerKey(TestSuite& suite)
   suite.expect(designatedPeerKey == uint128_t(lowerPeer.private4), "update_self_relinquish_message_preserves_lowest_peer_key");
 }
 
+static void testUpdateSelfRelinquishRetriesLostAckWithoutRepeatingPeerElection(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+
+  TestBrain sender = {};
+  sender.nBrains = 3;
+  sender.updateSelfState = Brain::UpdateSelfState::waitingForRelinquishEchos;
+  sender.updateSelfExpectedEchos = 1;
+
+  BrainView peer = {};
+  peer.uuid = 0x5101;
+  peer.private4 = 0x0a000051;
+  peer.boottimens = 510;
+  peer.connected = true;
+  peer.isFixedFile = true;
+  peer.fslot = 51;
+  sender.brains.insert(&peer);
+  sender.updateSelfFollowerRebootedPeerKeys.insert(peer.uuid);
+  sender.updateSelfRelinquishIssuedPeerKeys.insert(peer.uuid);
+
+  sender.runBrainPeerHeartbeatTick();
+
+  uint32_t retriedCommands = 0;
+  forEachMessageInBuffer(peer.wBuffer, [&](Message *frame) {
+    if (BrainTopic(frame->topic) == BrainTopic::relinquishMasterStatus)
+    {
+      retriedCommands += 1;
+    }
+  });
+  suite.expect(retriedCommands == 1 && sender.updateSelfRelinquishIssuedPeerKeys.contains(peer.uuid),
+               "update_self_relinquish_heartbeat_retries_unacknowledged_command");
+
+  peer.wBuffer.clear();
+  peer.pendingSend = false;
+  sender.updateSelfRelinquishEchoPeerKeys.insert(peer.uuid);
+  peer.lastHeartbeatSendMs = 0;
+  sender.runBrainPeerHeartbeatTick();
+  uint32_t commandsAfterAck = 0;
+  forEachMessageInBuffer(peer.wBuffer, [&](Message *frame) {
+    if (BrainTopic(frame->topic) == BrainTopic::relinquishMasterStatus)
+    {
+      commandsAfterAck += 1;
+    }
+  });
+  suite.expect(commandsAfterAck == 0,
+               "update_self_relinquish_heartbeat_stops_after_acknowledgement");
+
+  TestNeuron local = {};
+  local.uuid = 0x5200;
+  local.private4.v4 = 0x0a000052;
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &local;
+
+  TestBrain receiver = {};
+  receiver.nBrains = 3;
+  BrainView commandPeer = {};
+  commandPeer.uuid = peer.uuid;
+  commandPeer.private4 = peer.private4;
+  commandPeer.connected = true;
+  commandPeer.isFixedFile = true;
+  commandPeer.fslot = 52;
+  BrainView designatedPeer = {};
+  designatedPeer.uuid = 0x5301;
+  designatedPeer.private4 = 0x0a000053;
+  designatedPeer.quarantined = true;
+  receiver.brains.insert(&commandPeer);
+  receiver.brains.insert(&designatedPeer);
+
+  String command = {};
+  Message::construct(command, BrainTopic::relinquishMasterStatus, uint8_t(1), designatedPeer.uuid);
+  receiver.brainHandler(&commandPeer, reinterpret_cast<Message *>(command.data()));
+  suite.expect(designatedPeer.isMasterBrain == false && receiver.noMasterYet &&
+                   receiver.pendingDesignatedMasterPeerKey == designatedPeer.uuid,
+               "update_self_relinquish_unavailable_designated_peer_remains_retryable");
+
+  commandPeer.wBuffer.clear();
+  commandPeer.pendingSend = false;
+  commandPeer.transportEpoch += 1;
+  designatedPeer.quarantined = false;
+  receiver.brainHandler(&commandPeer, reinterpret_cast<Message *>(command.data()));
+  const uint32_t persistAfterRecoveredCommand = receiver.persistCalls;
+  suite.expect(designatedPeer.isMasterBrain && receiver.noMasterYet == false &&
+                   persistAfterRecoveredCommand > 0,
+               "update_self_relinquish_reconnect_command_elects_designated_peer_once");
+
+  commandPeer.wBuffer.clear();
+  commandPeer.pendingSend = false;
+  commandPeer.transportEpoch += 1;
+  receiver.brainHandler(&commandPeer, reinterpret_cast<Message *>(command.data()));
+
+  uint32_t echoFrames = 0;
+  forEachMessageInBuffer(commandPeer.wBuffer, [&](Message *frame) {
+    if (BrainTopic(frame->topic) == BrainTopic::relinquishMasterStatus)
+    {
+      echoFrames += 1;
+    }
+  });
+  suite.expect(receiver.persistCalls == persistAfterRecoveredCommand && echoFrames == 1 &&
+                   designatedPeer.isMasterBrain,
+               "update_self_relinquish_duplicate_command_replies_without_repeating_election");
+
+  receiver.brains.erase(&designatedPeer);
+  receiver.brains.erase(&commandPeer);
+  sender.brains.erase(&peer);
+  thisNeuron = previousNeuron;
+}
+
 static void testUpdateSelfFinalRelinquishPersistsDesignatedHandoff(TestSuite& suite)
 {
   ScopedRing scopedRing = {};
@@ -24780,6 +24887,7 @@ int main(void)
     testUpdateSelfPeerRegistrationCreditsBootNsChange(suite);
     testUpdateSelfPeerRegistrationCreditsReconnectWithoutBootNsChange(suite);
     testMaybeRelinquishMasterSelectsLowestPeerKey(suite);
+    testUpdateSelfRelinquishRetriesLostAckWithoutRepeatingPeerElection(suite);
     testUpdateSelfFinalRelinquishPersistsDesignatedHandoff(suite);
     if (createdRing)
     {
@@ -24982,6 +25090,7 @@ int main(void)
   testUpdateSelfPeerRegistrationCreditsBootNsChange(suite);
   testUpdateSelfPeerRegistrationCreditsReconnectWithoutBootNsChange(suite);
   testMaybeRelinquishMasterSelectsLowestPeerKey(suite);
+  testUpdateSelfRelinquishRetriesLostAckWithoutRepeatingPeerElection(suite);
   testUpdateSelfFinalRelinquishPersistsDesignatedHandoff(suite);
   testUpdateProdigyRespondsBeforeSingleBrainTransition(suite);
   testUpdateProdigyDefersSuccessUntilWorkersRestore(suite);
