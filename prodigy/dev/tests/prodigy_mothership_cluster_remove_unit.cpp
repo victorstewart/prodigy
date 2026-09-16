@@ -174,6 +174,20 @@ public:
   }
 };
 
+class FakeOfflineDNSRecoveryHooks final : public MothershipOfflineDNSRecoveryHooks {
+public:
+  bool failExport = false;
+  bool failDNS = false;
+  uint32_t failWipeCall = 0;
+  uint32_t wipeCalls = 0;
+  MothershipOfflineDNSCleanupInventory inventory = {};
+  Vector<String> callOrder = {};
+  bool quiesce(const MothershipProdigyClusterMachine&, String *failure) override { callOrder.push_back("quiesce"_ctv); if (failure) failure->clear(); return true; }
+  bool exportInventory(const MothershipProdigyClusterMachine&, MothershipOfflineDNSCleanupInventory& result, String *failure) override { callOrder.push_back("export"_ctv); if (failExport) { if (failure) failure->assign("export failed"_ctv); return false; } result = inventory; if (failure) failure->clear(); return true; }
+  bool removeDNS(const MothershipOfflineDNSCleanupInventory&, uint32_t& removed, String *failure) override { callOrder.push_back("dns"_ctv); if (failDNS) { if (failure) failure->assign("dns failed"_ctv); return false; } removed = 1; if (failure) failure->clear(); return true; }
+  bool wipe(const MothershipProdigyClusterMachine&, String *failure) override { callOrder.push_back("wipe"_ctv); if (++wipeCalls == failWipeCall) { if (failure) failure->assign("wipe failed"_ctv); return false; } if (failure) failure->clear(); return true; }
+};
+
 static bool equalStrings(const Vector<String>& values, std::initializer_list<const char *> expected)
 {
   if (values.size() != expected.size())
@@ -334,6 +348,76 @@ esac
 int main(void)
 {
   TestSuite suite;
+
+  {
+    MothershipOfflineDNSCleanupInventory first = {};
+    first.clusterUUID = 77;
+    first.machines.push_back({.uuid = 101, .sshAddress = "2001:db8::1"_ctv});
+    RoutableResourceLease lease = {};
+    lease.kind = RoutableResourceLeaseKind::dnsRecord;
+    lease.dnsProvider = "cloudflare"_ctv;
+    lease.dnsCredentialName = "credential-reference"_ctv;
+    lease.dnsZone = "example.test"_ctv;
+    lease.dnsName = "app.example.test"_ctv;
+    lease.dnsType = "AAAA"_ctv;
+    lease.address.is6 = true;
+    first.dnsRecordLeases.push_back(lease);
+    MothershipOfflineDNSCleanupInventory same = first;
+    MothershipOfflineDNSCleanupInventory wrongUUID = first;
+    wrongUUID.clusterUUID = 78;
+    MothershipOfflineDNSCleanupInventory wrongMembership = first;
+    wrongMembership.machines[0].uuid = 102;
+    MothershipOfflineDNSCleanupInventory wrongDNS = first;
+    wrongDNS.dnsRecordLeases[0].dnsName = "other.example.test"_ctv;
+    suite.expect(mothershipOfflineDNSCleanupInventoryMatches(first, same), "offline_inventory_matching_records_accepted");
+    suite.expect(mothershipOfflineDNSCleanupInventoryMatches(first, wrongUUID) == false, "offline_inventory_wrong_uuid_rejected_before_dns_or_wipe");
+    suite.expect(mothershipOfflineDNSCleanupInventoryMatches(first, wrongMembership) == false, "offline_inventory_wrong_machine_uuid_mapping_rejected_before_dns_or_wipe");
+    suite.expect(mothershipOfflineDNSCleanupInventoryMatches(first, wrongDNS) == false, "offline_inventory_mismatching_dns_rejected_before_dns_or_wipe");
+  }
+
+  {
+    MothershipProdigyCluster cluster = {};
+    cluster.clusterUUID = 77;
+    cluster.includeLocalMachine = false;
+    cluster.deploymentMode = MothershipClusterDeploymentMode::remote;
+    cluster.machines.push_back(makeAdoptedMachine("10.0.3.1"_ctv, true));
+    cluster.machines.push_back(makeAdoptedMachine("10.0.3.2"_ctv, false));
+    ClusterMachine topologyA = makeTopologyMachine("10.0.3.1"_ctv, ClusterMachineSource::adopted, ClusterMachineBacking::owned); topologyA.uuid = 101;
+    ClusterMachine topologyB = makeTopologyMachine("10.0.3.2"_ctv, ClusterMachineSource::adopted, ClusterMachineBacking::owned); topologyB.uuid = 102;
+    cluster.topology.machines.push_back(topologyA); cluster.topology.machines.push_back(topologyB);
+    FakeOfflineDNSRecoveryHooks hooks = {};
+    hooks.inventory.clusterUUID = cluster.clusterUUID;
+    hooks.inventory.machines.push_back({.uuid = 101, .sshAddress = "10.0.3.1"_ctv}); hooks.inventory.machines.push_back({.uuid = 102, .sshAddress = "10.0.3.2"_ctv});
+    String failure = {};
+    MothershipClusterRemoveSummary summary = {};
+    suite.expect(mothershipRunOfflineDNSRecovery(cluster, hooks, summary, &failure), "offline_recovery_happy_path");
+    suite.expect(equalStrings(hooks.callOrder, {"quiesce", "quiesce", "export", "export", "dns", "wipe", "wipe"}), "offline_recovery_quiesces_all_before_export_dns_and_wipe");
+    hooks = {}; hooks.inventory.clusterUUID = cluster.clusterUUID; hooks.inventory.machines.push_back({.uuid = 101, .sshAddress = "10.0.3.1"_ctv}); hooks.inventory.machines.push_back({.uuid = 102, .sshAddress = "10.0.3.2"_ctv}); hooks.failExport = true;
+    suite.expect(mothershipRunOfflineDNSRecovery(cluster, hooks, summary, &failure) == false, "offline_recovery_export_failure_rejected");
+    suite.expect(equalStrings(hooks.callOrder, {"quiesce", "quiesce", "export"}), "offline_recovery_export_failure_preserves_roots");
+    hooks = {}; hooks.inventory.clusterUUID = cluster.clusterUUID; hooks.inventory.machines.push_back({.uuid = 101, .sshAddress = "10.0.3.1"_ctv}); hooks.inventory.machines.push_back({.uuid = 102, .sshAddress = "10.0.3.2"_ctv}); hooks.failDNS = true;
+    suite.expect(mothershipRunOfflineDNSRecovery(cluster, hooks, summary, &failure) == false, "offline_recovery_dns_failure_rejected");
+    suite.expect(equalStrings(hooks.callOrder, {"quiesce", "quiesce", "export", "export", "dns"}), "offline_recovery_dns_failure_preserves_roots");
+    hooks = {}; hooks.inventory.clusterUUID = cluster.clusterUUID; hooks.inventory.machines.push_back({.uuid = 101, .sshAddress = "10.0.3.1"_ctv}); hooks.inventory.machines.push_back({.uuid = 102, .sshAddress = "10.0.3.2"_ctv}); hooks.failWipeCall = 2;
+    suite.expect(mothershipRunOfflineDNSRecovery(cluster, hooks, summary, &failure) == false && summary.dnsTeardownCompleted && summary.wipedAdoptedMachines == 1, "offline_recovery_partial_wipe_records_completed_dns_and_progress");
+    for (uint32_t invalidCase = 0; invalidCase < 5; ++invalidCase)
+    {
+      MothershipProdigyCluster invalid = cluster;
+      if (invalidCase == 0) invalid.topology.machines.clear();
+      if (invalidCase == 1) invalid.topology.machines[0].uuid = 0;
+      if (invalidCase == 2) invalid.topology.machines[1].uuid = invalid.topology.machines[0].uuid;
+      if (invalidCase == 3) invalid.topology.machines[1].ssh.address = invalid.topology.machines[0].ssh.address;
+      if (invalidCase == 4) invalid.includeLocalMachine = true;
+      FakeOfflineDNSRecoveryHooks invalidHooks = {};
+      suite.expect(mothershipRunOfflineDNSRecovery(invalid, invalidHooks, summary, &failure) == false && invalidHooks.callOrder.empty(),
+                   "offline_recovery_invalid_preflight_never_quiesces");
+    }
+    hooks = {}; hooks.inventory.clusterUUID = cluster.clusterUUID + 1;
+    suite.expect(mothershipRunOfflineDNSRecovery(cluster, hooks, summary, &failure) == false &&
+                 equalStrings(hooks.callOrder, {"quiesce", "quiesce", "export"}) && summary.dnsTeardownCompleted == false,
+                 "offline_recovery_foreign_snapshot_never_deletes_dns_or_roots");
+
+  }
 
   {
     String command = {};
