@@ -1152,11 +1152,225 @@ int main(void)
 
   };
 
-  if (const char *testOnly = ::getenv("PRODIGY_TEST_ONLY");
-      testOnly != nullptr && std::strcmp(testOnly, "restored-deployment-chain") == 0)
+  auto installNeuronSocket = [&](TestBrain& brain, Machine& machine, int& peerFD) -> bool {
+    int sv[2] = {-1, -1};
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0)
+    {
+      return false;
+    }
+
+    RingDispatcher::installMultiplexee(&machine.neuron, &brain);
+    machine.neuron.fd = sv[0];
+    Ring::installFDIntoFixedFileSlot(&machine.neuron);
+    peerFD = sv[1];
+    return true;
+  };
+
+  auto cleanupNeuronSocket = [&](NeuronView& neuron, int& peerFD) -> void {
+    if (neuron.isFixedFile)
+    {
+      Ring::uninstallFromFixedFileSlot(&neuron);
+    }
+    else if (neuron.fd >= 0)
+    {
+      ::close(neuron.fd);
+    }
+
+    neuron.fd = -1;
+    neuron.isFixedFile = false;
+
+    if (peerFD >= 0)
+    {
+      ::close(peerFD);
+      peerFD = -1;
+    }
+  };
+
+  auto runMachineDecommissionSuspendedDrainFixture = [&]() -> void {
+    BrainBase *savedBrain = thisBrain;
+    NoopBrainIaaS provider = {};
+    TestBrain brain = {};
+    Mesh mesh = {};
+    brain.iaas = &provider;
+    brain.enableMachineRetirementAuthority();
+    brain.mesh = &mesh;
+    thisBrain = &brain;
+    RingExitDeadline deadline(2000);
+    ScopedRing scopedRing = {};
+
+    DeploymentPlan plan = makeDeploymentPlan(6091, 1);
+    plan.canaryCount = 0;
+    ApplicationDeployment *deployment = new ApplicationDeployment();
+    deployment->plan = plan;
+    deployment->state = DeploymentState::running;
+    deployment->nTargetBase = 1;
+    deployment->nDeployedBase = 1;
+    deployment->nHealthyBase = 1;
+    brain.deployments.insert_or_assign(plan.config.deploymentID(), deployment);
+
+    Rack *retiringRack = new Rack();
+    retiringRack->uuid = 99;
+    Machine *retiring = new Machine();
+    retiring->uuid = uint128_t(9901);
+    retiring->private4 = 99;
+    retiring->state = MachineState::hardwareFailure;
+    retiring->lifetime = MachineLifetime::ondemand;
+    retiring->rack = retiringRack;
+    retiring->rackUUID = retiringRack->uuid;
+    retiring->neuron.machine = retiring;
+    retiring->neuron.connected = true;
+    retiring->ownedLogicalCores = 4;
+    retiring->memoryMB_available = 4096;
+    retiring->storageMB_available = 4096;
+    prodigyRecomputeMachineCPUAvailability(retiring, prodigyActiveSharedCPUOvercommitPermille());
+    prodigyDebitMachineScalarResources(retiring, plan.config, 1);
+    retiringRack->machines.insert(retiring);
+    brain.racks.insert_or_assign(retiringRack->uuid, retiringRack);
+    brain.machines.insert(retiring);
+    brain.machinesByUUID.insert_or_assign(retiring->uuid, retiring);
+    brain.neurons.insert(&retiring->neuron);
+    int retiringPeerFD = -1;
+    suite.expect(installNeuronSocket(brain, *retiring, retiringPeerFD),
+                 "machine_decommission_suspended_drain_installs_retiring_transport");
+
+    Rack *replacementRack = new Rack();
+    replacementRack->uuid = 100;
+    Machine *replacement = new Machine();
+    replacement->uuid = uint128_t(10001);
+    replacement->private4 = 100;
+    replacement->state = MachineState::deploying;
+    replacement->lifetime = MachineLifetime::ondemand;
+    replacement->rack = replacementRack;
+    replacement->rackUUID = replacementRack->uuid;
+    replacement->fragment = 2;
+    replacement->neuron.machine = replacement;
+    replacement->neuron.connected = true;
+    replacement->ownedLogicalCores = 4;
+    replacement->memoryMB_available = 4096;
+    replacement->storageMB_available = 4096;
+    prodigyRecomputeMachineCPUAvailability(replacement, prodigyActiveSharedCPUOvercommitPermille());
+    replacementRack->machines.insert(replacement);
+    brain.racks.insert_or_assign(replacementRack->uuid, replacementRack);
+    brain.machines.insert(replacement);
+    brain.machinesByUUID.insert_or_assign(replacement->uuid, replacement);
+    brain.neurons.insert(&replacement->neuron);
+    int replacementPeerFD = -1;
+    suite.expect(installNeuronSocket(brain, *replacement, replacementPeerFD),
+                 "machine_decommission_suspended_drain_installs_replacement_transport");
+
+    ContainerView *container = new ContainerView();
+    container->uuid = uint128_t(609101);
+    container->applicationID = plan.config.applicationID;
+    container->deploymentID = plan.config.deploymentID();
+    container->lifetime = ApplicationLifetime::base;
+    container->state = ContainerState::healthy;
+    container->machine = retiring;
+    container->fragment = 1;
+    deployment->containers.insert(container);
+    deployment->countPerMachine[retiring] = 1;
+    deployment->countPerRack[retiringRack] = 1;
+    retiring->upsertContainerIndexEntry(container->deploymentID, container);
+    brain.containers.insert_or_assign(container->uuid, container);
+
+    brain.decommissionMachine(retiring);
+    suite.expect(deployment->nSuspended > 0 && replacement->claims.size() == 1,
+                 "machine_decommission_suspended_drain_waits_on_replacement_claim");
+
+    deadline.arm();
+    brain.exitRingAfterMachineRetirement = true;
+    Ring::exit = false;
+    Ring::start();
+    Ring::exit = false;
+    suite.expect(deadline.fired == false && brain.retiringMachinesByNeuron.contains(&retiring->neuron) && brain.retiringMachinesByNeuron[&retiring->neuron].ringCloseObserved,
+                 "machine_decommission_suspended_drain_close_keeps_machine_quarantined");
+    suite.expect(brain.racks.contains(99) && deployment->nSuspended > 0,
+                 "machine_decommission_suspended_drain_keeps_rack_and_frame_alive");
+
+    replacement->state = MachineState::healthy;
+    replacement->runtimeReady = true;
+    brain.resumeMachineClaimsIfSchedulingReady(replacement);
+    ContainerView *replacementContainer = nullptr;
+    for (ContainerView *candidate : deployment->containers)
+    {
+      if (candidate != nullptr && candidate->machine == replacement)
+      {
+        replacementContainer = candidate;
+        break;
+      }
+    }
+    suite.expect(replacementContainer != nullptr && replacementContainer->state == ContainerState::scheduled && deployment->nSuspended > 0,
+                 "machine_decommission_suspended_drain_resumes_onto_replacement");
+    if (replacementContainer != nullptr)
+    {
+      deployment->containerIsHealthy(replacementContainer);
+    }
+    suite.expect(deployment->nSuspended == 0 && deployment->schedulingStack.execution == nullptr,
+                 "machine_decommission_suspended_drain_reaches_quiescence");
+
+    brain.testReapRetiringMachines();
+    suite.expect(brain.retiringMachinesByNeuron.empty() && brain.racks.contains(99) == false &&
+                     brain.racks.contains(100) && deployment->countPerMachine.size() == 1 &&
+                     deployment->countPerMachine.getIf(replacement) == 1,
+                 "machine_decommission_suspended_drain_reaps_after_exact_quiescence");
+
+    RingExitDeadline flushDeadline(20);
+    flushDeadline.arm();
+    Ring::exit = false;
+    Ring::start();
+    Ring::exit = false;
+    if (replacementContainer != nullptr)
+    {
+      deployment->destructContainer(replacementContainer);
+      deployment->containerDestroyed(replacementContainer);
+    }
+    cleanupNeuronSocket(replacement->neuron, replacementPeerFD);
+    if (retiringPeerFD >= 0)
+    {
+      ::close(retiringPeerFD);
+    }
+    brain.deployments.clear();
+    brain.machines.erase(replacement);
+    brain.machinesByUUID.erase(replacement->uuid);
+    brain.neurons.erase(&replacement->neuron);
+    replacementRack->machines.erase(replacement);
+    brain.racks.erase(replacementRack->uuid);
+    delete replacement;
+    delete replacementRack;
+    delete deployment;
+    thisBrain = savedBrain;
+  };
+
+  auto runShouldWeConnectFamilyFallbackFixture = [&](TestBrain& brain) -> void {
+    Vector<ClusterMachinePeerAddress> ipv6OnlyCandidates = {};
+    ipv6OnlyCandidates.push_back(ClusterMachinePeerAddress {"2001:db8::1"_ctv, 0});
+    brain.localBrainPeerAddresses = ipv6OnlyCandidates;
+    brain.localBrainPeerAddress = {};
+    BrainView familyMismatchFalse = {};
+    familyMismatchFalse.peerAddress = IPAddress("10.0.0.20", false);
+    // A known peer UUID takes the identity-order path. Keep it absent here so
+    // this fixture covers only legacy address fallback after the family mismatch.
+    familyMismatchFalse.uuid = 0;
+    suite.expect(brain.testShouldWeConnectToBrain(&familyMismatchFalse), "should_we_connect_to_brain_skips_mismatched_local_candidate_family_and_falls_back_to_neuron_private4");
+  };
+
+  if (const char *testOnly = ::getenv("PRODIGY_TEST_ONLY"); testOnly != nullptr)
   {
-    runRestoredDeploymentChainFixtures();
-    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    if (std::strcmp(testOnly, "restored-deployment-chain") == 0)
+    {
+      runRestoredDeploymentChainFixtures();
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (std::strcmp(testOnly, "machine-decommission-suspended-drain") == 0)
+    {
+      runMachineDecommissionSuspendedDrainFixture();
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (std::strcmp(testOnly, "should-we-connect-family-fallback") == 0)
+    {
+      TestBrain familyFallbackBrain = {};
+      runShouldWeConnectFamilyFallbackFixture(familyFallbackBrain);
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
   }
 
   suite.expect(prodigyBrainPeerHeartbeatTimeoutMs <= 5000u, "timing_knobs_bound_production_master_stale_detection");
@@ -1337,14 +1551,7 @@ int main(void)
     fallbackFalse.uuid = neuron.uuid;
     suite.expect(brain.testShouldWeConnectToBrain(&fallbackFalse) == false, "should_we_connect_to_brain_returns_false_when_no_address_or_uuid_tiebreaker_applies");
 
-    Vector<ClusterMachinePeerAddress> ipv6OnlyCandidates = {};
-    ipv6OnlyCandidates.push_back(ClusterMachinePeerAddress {"2001:db8::1"_ctv, 0});
-    brain.localBrainPeerAddresses = ipv6OnlyCandidates;
-    brain.localBrainPeerAddress = {};
-    BrainView familyMismatchFalse = {};
-    familyMismatchFalse.peerAddress = IPAddress("10.0.0.20", false);
-    familyMismatchFalse.uuid = neuron.uuid;
-    suite.expect(brain.testShouldWeConnectToBrain(&familyMismatchFalse), "should_we_connect_to_brain_skips_mismatched_local_candidate_family_and_falls_back_to_neuron_private4");
+    runShouldWeConnectFamilyFallbackFixture(brain);
 
     Vector<ClusterMachinePeerAddress> tiedPreferredCandidates = {};
     tiedPreferredCandidates.push_back(ClusterMachinePeerAddress {"10.0.0.20"_ctv, 24});
@@ -1423,20 +1630,6 @@ int main(void)
     return found;
   };
 
-  auto installNeuronSocket = [&](TestBrain& brain, Machine& machine, int& peerFD) -> bool {
-    int sv[2] = {-1, -1};
-    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0)
-    {
-      return false;
-    }
-
-    RingDispatcher::installMultiplexee(&machine.neuron, &brain);
-    machine.neuron.fd = sv[0];
-    Ring::installFDIntoFixedFileSlot(&machine.neuron);
-    peerFD = sv[1];
-    return true;
-  };
-
   auto installBrainPeerSocket = [&](TestBrain& brain, BrainView& peer, int& peerFD) -> bool {
     int sv[2] = {-1, -1};
     if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0)
@@ -1449,26 +1642,6 @@ int main(void)
     Ring::installFDIntoFixedFileSlot(&peer);
     peerFD = sv[1];
     return true;
-  };
-
-  auto cleanupNeuronSocket = [&](NeuronView& neuron, int& peerFD) -> void {
-    if (neuron.isFixedFile)
-    {
-      Ring::uninstallFromFixedFileSlot(&neuron);
-    }
-    else if (neuron.fd >= 0)
-    {
-      ::close(neuron.fd);
-    }
-
-    neuron.fd = -1;
-    neuron.isFixedFile = false;
-
-    if (peerFD >= 0)
-    {
-      ::close(peerFD);
-      peerFD = -1;
-    }
   };
 
   auto cleanupBrainPeerSocket = [&](BrainView& peer, int& peerFD) -> void {
@@ -2473,159 +2646,7 @@ int main(void)
     thisBrain = savedBrain;
   }
 
-  {
-    BrainBase *savedBrain = thisBrain;
-    NoopBrainIaaS provider = {};
-    TestBrain brain = {};
-    Mesh mesh = {};
-    brain.iaas = &provider;
-    brain.enableMachineRetirementAuthority();
-    brain.mesh = &mesh;
-    thisBrain = &brain;
-    RingExitDeadline deadline(2000);
-    ScopedRing scopedRing = {};
-
-    DeploymentPlan plan = makeDeploymentPlan(6091, 1);
-    plan.canaryCount = 0;
-    ApplicationDeployment *deployment = new ApplicationDeployment();
-    deployment->plan = plan;
-    deployment->state = DeploymentState::running;
-    deployment->nTargetBase = 1;
-    deployment->nDeployedBase = 1;
-    deployment->nHealthyBase = 1;
-    brain.deployments.insert_or_assign(plan.config.deploymentID(), deployment);
-
-    Rack *retiringRack = new Rack();
-    retiringRack->uuid = 99;
-    Machine *retiring = new Machine();
-    retiring->uuid = uint128_t(9901);
-    retiring->private4 = 99;
-    retiring->state = MachineState::hardwareFailure;
-    retiring->lifetime = MachineLifetime::ondemand;
-    retiring->rack = retiringRack;
-    retiring->rackUUID = retiringRack->uuid;
-    retiring->neuron.machine = retiring;
-    retiring->neuron.connected = true;
-    retiring->ownedLogicalCores = 4;
-    retiring->memoryMB_available = 4096;
-    retiring->storageMB_available = 4096;
-    prodigyRecomputeMachineCPUAvailability(retiring, prodigyActiveSharedCPUOvercommitPermille());
-    prodigyDebitMachineScalarResources(retiring, plan.config, 1);
-    retiringRack->machines.insert(retiring);
-    brain.racks.insert_or_assign(retiringRack->uuid, retiringRack);
-    brain.machines.insert(retiring);
-    brain.machinesByUUID.insert_or_assign(retiring->uuid, retiring);
-    brain.neurons.insert(&retiring->neuron);
-    int retiringPeerFD = -1;
-    suite.expect(installNeuronSocket(brain, *retiring, retiringPeerFD),
-                 "machine_decommission_suspended_drain_installs_retiring_transport");
-
-    Rack *replacementRack = new Rack();
-    replacementRack->uuid = 100;
-    Machine *replacement = new Machine();
-    replacement->uuid = uint128_t(10001);
-    replacement->private4 = 100;
-    replacement->state = MachineState::deploying;
-    replacement->lifetime = MachineLifetime::ondemand;
-    replacement->rack = replacementRack;
-    replacement->rackUUID = replacementRack->uuid;
-    replacement->fragment = 2;
-    replacement->neuron.machine = replacement;
-    replacement->neuron.connected = true;
-    replacement->ownedLogicalCores = 4;
-    replacement->memoryMB_available = 4096;
-    replacement->storageMB_available = 4096;
-    prodigyRecomputeMachineCPUAvailability(replacement, prodigyActiveSharedCPUOvercommitPermille());
-    replacementRack->machines.insert(replacement);
-    brain.racks.insert_or_assign(replacementRack->uuid, replacementRack);
-    brain.machines.insert(replacement);
-    brain.machinesByUUID.insert_or_assign(replacement->uuid, replacement);
-    brain.neurons.insert(&replacement->neuron);
-    int replacementPeerFD = -1;
-    suite.expect(installNeuronSocket(brain, *replacement, replacementPeerFD),
-                 "machine_decommission_suspended_drain_installs_replacement_transport");
-
-    ContainerView *container = new ContainerView();
-    container->uuid = uint128_t(609101);
-    container->applicationID = plan.config.applicationID;
-    container->deploymentID = plan.config.deploymentID();
-    container->lifetime = ApplicationLifetime::base;
-    container->state = ContainerState::healthy;
-    container->machine = retiring;
-    container->fragment = 1;
-    deployment->containers.insert(container);
-    deployment->countPerMachine[retiring] = 1;
-    deployment->countPerRack[retiringRack] = 1;
-    retiring->upsertContainerIndexEntry(container->deploymentID, container);
-    brain.containers.insert_or_assign(container->uuid, container);
-
-    brain.decommissionMachine(retiring);
-    suite.expect(deployment->nSuspended > 0 && replacement->claims.size() == 1,
-                 "machine_decommission_suspended_drain_waits_on_replacement_claim");
-
-    deadline.arm();
-    brain.exitRingAfterMachineRetirement = true;
-    Ring::exit = false;
-    Ring::start();
-    Ring::exit = false;
-    suite.expect(deadline.fired == false && brain.retiringMachinesByNeuron.contains(&retiring->neuron) && brain.retiringMachinesByNeuron[&retiring->neuron].ringCloseObserved,
-                 "machine_decommission_suspended_drain_close_keeps_machine_quarantined");
-    suite.expect(brain.racks.contains(99) && deployment->nSuspended > 0,
-                 "machine_decommission_suspended_drain_keeps_rack_and_frame_alive");
-
-    replacement->state = MachineState::healthy;
-    replacement->runtimeReady = true;
-    brain.resumeMachineClaimsIfSchedulingReady(replacement);
-    ContainerView *replacementContainer = nullptr;
-    for (ContainerView *candidate : deployment->containers)
-    {
-      if (candidate != nullptr && candidate->machine == replacement)
-      {
-        replacementContainer = candidate;
-        break;
-      }
-    }
-    suite.expect(replacementContainer != nullptr && replacementContainer->state == ContainerState::scheduled && deployment->nSuspended > 0,
-                 "machine_decommission_suspended_drain_resumes_onto_replacement");
-    if (replacementContainer != nullptr)
-    {
-      deployment->containerIsHealthy(replacementContainer);
-    }
-    suite.expect(deployment->nSuspended == 0 && deployment->schedulingStack.execution == nullptr,
-                 "machine_decommission_suspended_drain_reaches_quiescence");
-
-    brain.testReapRetiringMachines();
-    suite.expect(brain.retiringMachinesByNeuron.empty() && brain.racks.contains(99) == false &&
-                     brain.racks.contains(100) && deployment->countPerMachine.size() == 1 &&
-                     deployment->countPerMachine.getIf(replacement) == 1,
-                 "machine_decommission_suspended_drain_reaps_after_exact_quiescence");
-
-    RingExitDeadline flushDeadline(20);
-    flushDeadline.arm();
-    Ring::exit = false;
-    Ring::start();
-    Ring::exit = false;
-    if (replacementContainer != nullptr)
-    {
-      deployment->destructContainer(replacementContainer);
-      deployment->containerDestroyed(replacementContainer);
-    }
-    cleanupNeuronSocket(replacement->neuron, replacementPeerFD);
-    if (retiringPeerFD >= 0)
-    {
-      ::close(retiringPeerFD);
-    }
-    brain.deployments.clear();
-    brain.machines.erase(replacement);
-    brain.machinesByUUID.erase(replacement->uuid);
-    brain.neurons.erase(&replacement->neuron);
-    replacementRack->machines.erase(replacement);
-    brain.racks.erase(replacementRack->uuid);
-    delete replacement;
-    delete replacementRack;
-    delete deployment;
-    thisBrain = savedBrain;
-  }
+  runMachineDecommissionSuspendedDrainFixture();
 
   {
     SuspendedGetMachinesBrainIaaS provider = {};
