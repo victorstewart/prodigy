@@ -11123,7 +11123,11 @@ public:
                  unsigned(bv->private4),
                  (unsigned long long)bv->uuid,
                  int(preferSelf));
-      if (bv->private4 < selfPrivate4)
+      // Distinct machines may share a management/NAT IPv4 address. Preserve
+      // address ordering, but use their persistent identities to break a tie.
+      const uint128_t selfUUID = selfBrainUUID();
+      if (bv->private4 < selfPrivate4 ||
+          (bv->private4 == selfPrivate4 && selfUUID != 0 && bv->uuid != 0 && bv->uuid < selfUUID))
       {
         preferSelf = false;
       }
@@ -11180,14 +11184,18 @@ public:
 
     if (thisNeuron != nullptr)
     {
-      if (allowSharedPrivate4 == false && peer->private4 != 0 && peer->private4 == thisNeuron->private4.v4)
-      {
-        return false;
-      }
-
       uint128_t selfUUID = selfBrainUUID();
-      if (selfUUID != 0 && peer->uuid != 0 && peer->uuid == selfUUID)
+      if (selfUUID != 0 && peer->uuid != 0)
       {
+        if (peer->uuid == selfUUID)
+        {
+          return false;
+        }
+      }
+      else if (allowSharedPrivate4 == false && peer->private4 != 0 && peer->private4 == thisNeuron->private4.v4)
+      {
+        // Only legacy peers without a complete UUID pair need an address-based
+        // self check. A shared NAT address cannot exclude a known remote member.
         return false;
       }
     }
