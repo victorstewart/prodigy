@@ -484,6 +484,13 @@ public:
   uint16_t lastSubscriptionPort = 0;
   uint16_t lastSubscriptionApplicationID = 0;
 
+  bool readyForSubscriptionPairingNotifications(void) const override
+  {
+    return state == ContainerState::scheduled ||
+           state == ContainerState::healthy ||
+           state == ContainerState::crashedRestarting;
+  }
+
   void subscriptionPairing(uint128_t secret, uint128_t address, uint64_t service, uint16_t port, uint16_t applicationID, bool activate) override
   {
     (void)secret;
@@ -7352,7 +7359,7 @@ static void testOSUpdateLocalMasterHandsOffBeforeSelfUpdate(TestSuite& suite)
 
   uint128_t designatedPeerKey = 0;
   suite.expect(extractQueuedRelinquishTarget(peer, designatedPeerKey), "os_update_local_master_handoff_queues_relinquish");
-  suite.expect(designatedPeerKey == uint128_t(peer.private4), "os_update_local_master_handoff_designates_target_peer");
+  suite.expect(designatedPeerKey == peer.uuid, "os_update_local_master_handoff_designates_target_peer_uuid");
 
   brain.brains.erase(&peer);
   brain.neurons.erase(&peerMachine.neuron);
@@ -7748,8 +7755,10 @@ static void testOSUpdateCommandDeadlineFailsClosed(TestSuite& suite)
 
   suite.expect(iaas.reportHardwareFailureCalls == 1, "os_update_command_deadline_reports_hardware_failure");
   suite.expect(iaas.lastReportedHardwareFailureUUID == uint128_t(0x72109002), "os_update_command_deadline_reports_failed_machine_uuid");
-  suite.expect(iaas.destroyCalls == 1, "os_update_command_deadline_destroys_failed_machine");
-  suite.expect(brain.machinesByUUID.find(uint128_t(0x72109002)) == brain.machinesByUUID.end(), "os_update_command_deadline_removes_machine_index");
+  suite.expect(iaas.destroyCalls == 0, "os_update_command_deadline_journals_before_provider_destroy");
+  suite.expect(brain.machinesByUUID.find(uint128_t(0x72109002)) == brain.machinesByUUID.end(),
+               "os_update_command_deadline_releases_local_machine_after_retirement_quiescence");
+  suite.expect(brain.retiredMachineIdentities.empty() == false, "os_update_command_deadline_records_deferred_provider_destroy_intent");
 }
 
 static void testOSUpdateBrainPeerCloseMarksExpectedReboot(TestSuite& suite)
@@ -8752,12 +8761,16 @@ static void testWormholeDNSLeasesAndCredentialValidation(TestSuite& suite)
   failBrain.dnsProvider = &failDNS;
   addPrefixAndCredential(failBrain, 61'405);
   DeploymentPlan failPlan = makePlan(61'405, 1, "203.0.113.40");
-  suite.expect(failBrain.reserveDeploymentWormholeAddressLeases(failPlan, failure, true) == false, "wormhole_dns_apply_failure_rejects_commit");
-  suite.expect(failure.equal("injected DNS upsert failure"_ctv), "wormhole_dns_apply_failure_surfaces_provider_error");
-  suite.expect(failBrain.routableResourceLeaseRuntimeState.empty(), "wormhole_dns_apply_failure_does_not_commit_leases");
+  suite.expect(failBrain.reserveDeploymentWormholeAddressLeases(failPlan, failure, true), "wormhole_dns_apply_failure_enqueues_authoritative_intent");
+  suite.expect(failure.empty(), "wormhole_dns_apply_failure_does_not_report_completion_from_enqueue");
+  suite.expect(failDNS.upsertCalls == 1 && failBrain.pendingDNSOperations.empty(),
+               "wormhole_dns_apply_failure_completion_runs_through_coordinator");
+  suite.expect(failBrain.routableResourceLeaseRuntimeState.size() == 2 && failBrain.appliedDNSRecordLeases.empty(),
+               "wormhole_dns_apply_failure_retains_unapplied_authoritative_leases");
 
   TestBrain deleteBrain = {};
   TestDNSProvider deleteDNS = {};
+  deleteBrain.weAreMaster = true;
   deleteBrain.dnsProvider = &deleteDNS;
   addPrefixAndCredential(deleteBrain, 61'406);
   DeploymentPlan deletePlan = makePlan(61'406, 1, "203.0.113.41");
@@ -8766,8 +8779,12 @@ static void testWormholeDNSLeasesAndCredentialValidation(TestSuite& suite)
   suite.expect(deleteBrain.releaseRoutableResourceLeasesForDeployment(deletePlan.config.deploymentID()) == 0, "wormhole_dns_delete_failure_keeps_lease_owner");
   suite.expect(deleteBrain.routableResourceLeaseRuntimeState.size() == 2, "wormhole_dns_delete_failure_keeps_leases");
   deleteDNS.failRemove = false;
-  suite.expect(deleteBrain.releaseRoutableResourceLeasesForDeployment(deletePlan.config.deploymentID()) == 2, "wormhole_dns_delete_success_releases_leases");
-  suite.expect(deleteDNS.removeCalls == 2, "wormhole_dns_delete_retries_after_failure");
+  suite.expect(deleteBrain.releaseRoutableResourceLeasesForDeployment(deletePlan.config.deploymentID()) == 0,
+               "wormhole_dns_delete_retry_reconciles_pending_intent");
+  suite.expect(deleteBrain.routableResourceLeaseRuntimeState.empty(),
+               "wormhole_dns_delete_success_completion_releases_leases");
+  suite.expect(deleteDNS.removeCalls == 2 && deleteBrain.pendingDNSOperations.empty(),
+               "wormhole_dns_delete_retries_after_failure_through_coordinator");
 }
 
 static void testWormholeAddressLeaseReleaseAndUpgradeTransfer(TestSuite& suite)
@@ -10311,8 +10328,8 @@ static void testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(TestSuite&
   brain.noteWorkerStateUpload(&second.neuron);
   suite.expect(brain.updateSelfWorkerStateUploadedMachineUUIDs.size() == 2,
                "worker_upgrade_completes_only_after_every_state_upload");
-  suite.expect(transitioningWorker->inBinaryUpdate,
-               "worker_upgrade_keeps_close_fence_through_state_re_adoption");
+  suite.expect(transitioningWorker->inBinaryUpdate == false,
+               "worker_upgrade_state_re_adoption_clears_machine_exec_fence");
   suite.expect(mothership.pendingSend && mothership.wBuffer.empty() == false,
                "worker_upgrade_queues_terminal_mothership_success");
   suite.expect(brain.updateSelfTransitionAfterMothershipAck && brain.transitionToNewBundleCalls == 0,
@@ -13381,6 +13398,7 @@ static void testDNSBindingTopicsReserveAddressAndApplyProvider(TestSuite& suite)
   brain.weAreMaster = true;
   brain.dnsProvider = &dns;
   brain.brainConfig.dnsProvider = "cloudflare"_ctv;
+  brain.activeMotherships.insert(&mothership);
 
   DistributableExternalSubnet prefix = {};
   prefix.uuid = uint128_t(0xDDBB01);
@@ -13426,6 +13444,8 @@ static void testDNSBindingTopicsReserveAddressAndApplyProvider(TestSuite& suite)
   RoutableResourceLeaseReport response = {};
   suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response), "mothership_upsert_dns_binding_deserializes_response");
   suite.expect(response.success, "mothership_upsert_dns_binding_success");
+  suite.expect(brain.pendingDNSOperations.empty() && brain.pendingDNSControls.empty(),
+               "mothership_upsert_dns_binding_completion_drains_coordinator_controls");
   suite.expect(response.leases.size() == 2, "mothership_upsert_dns_binding_returns_address_and_dns_leases");
   suite.expect(brain.routableResourceLeaseRuntimeState.size() == 2, "mothership_upsert_dns_binding_persists_two_leases");
   suite.expect(dns.upsertCalls == 1 && dns.upserts[0].values.size() == 1 && dns.upserts[0].values[0].equal("203.0.113.77"_ctv), "mothership_upsert_dns_binding_applies_provider_record");
@@ -13598,16 +13618,31 @@ static void testDNSBindingTopicsReserveAddressAndApplyProvider(TestSuite& suite)
   message = buildMothershipMessage(messageBuffer, MothershipTopic::teardownDNSBindings);
   brain.mothershipHandler(&mothership, message);
   responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
-  suite.expect(MothershipTopic(responseMessage->topic) == MothershipTopic::teardownDNSBindings, "mothership_teardown_dns_bindings_topic");
+  const bool teardownTopicMatches = MothershipTopic(responseMessage->topic) == MothershipTopic::teardownDNSBindings;
   responseArgs = responseMessage->args;
   Message::extractToStringView(responseArgs, serializedResponse);
   response = {};
-  suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response), "mothership_teardown_dns_bindings_deserializes_response");
+  const bool teardownResponseDecoded = BitseryEngine::deserializeSafe(serializedResponse, response);
+  const bool teardownReportsAAAA = response.leases.size() == 1 && response.leases[0].dnsType.equal("AAAA"_ctv);
+  const bool teardownRemovedAAAA = dns.removeCalls == 2 && dns.removes.size() == 2 && dns.removes[1].type.equal("AAAA"_ctv) &&
+                                    dns.removes[1].values.size() == 1 && dns.removes[1].values[0].equal("2001:db8:113::77"_ctv);
+  const bool teardownReleasedLeases = brain.routableResourceLeaseRuntimeState.empty();
+  if (teardownTopicMatches == false || teardownResponseDecoded == false || response.success == false ||
+      teardownReportsAAAA == false || teardownRemovedAAAA == false || teardownReleasedLeases == false)
+  {
+    dprintf(STDERR_FILENO,
+            "teardown-dns fixture topic=%u decoded=%d success=%d failure=%.*s leases=%zu pendingDNS=%zu pendingControls=%zu runtimeLeases=%zu removes=%u\n",
+            unsigned(responseMessage->topic), int(teardownResponseDecoded), int(response.success), int(response.failure.size()), response.failure.data(),
+            size_t(response.leases.size()), size_t(brain.pendingDNSOperations.size()), size_t(brain.pendingDNSControls.size()),
+            size_t(brain.routableResourceLeaseRuntimeState.size()), unsigned(dns.removeCalls));
+  }
+  suite.expect(teardownTopicMatches, "mothership_teardown_dns_bindings_topic");
+  suite.expect(teardownResponseDecoded, "mothership_teardown_dns_bindings_deserializes_response");
   suite.expect(response.success, "mothership_teardown_dns_bindings_success");
-  suite.expect(response.leases.size() == 1 && response.leases[0].dnsType.equal("AAAA"_ctv), "mothership_teardown_dns_bindings_reports_aaaa");
+  suite.expect(teardownReportsAAAA, "mothership_teardown_dns_bindings_reports_aaaa");
   suite.expect(dns.removeCalls == 2, "mothership_teardown_dns_bindings_removes_provider_record");
-  suite.expect(dns.removes.size() == 2 && dns.removes[1].type.equal("AAAA"_ctv) && dns.removes[1].values.size() == 1 && dns.removes[1].values[0].equal("2001:db8:113::77"_ctv), "mothership_teardown_dns_bindings_removes_aaaa_value");
-  suite.expect(brain.routableResourceLeaseRuntimeState.empty(), "mothership_teardown_dns_bindings_releases_aaaa_address_and_dns_leases");
+  suite.expect(teardownRemovedAAAA, "mothership_teardown_dns_bindings_removes_aaaa_value");
+  suite.expect(teardownReleasedLeases, "mothership_teardown_dns_bindings_releases_aaaa_address_and_dns_leases");
   brain.deployments.erase(boundPlan6.config.deploymentID());
 }
 
