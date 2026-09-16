@@ -449,6 +449,18 @@ public:
     return nullptr;
   }
 
+  void testArmBrainReconnectWaiter(
+      BrainView *brain,
+      int64_t delayMs,
+      bool persistentReconnect)
+  {
+    armBrainReconnectWaiterIfAbsent(
+        brain,
+        delayMs,
+        persistentReconnect,
+        "unit-test");
+  }
+
   bool testHasBrainLivenessWaiter(BrainView *brain) const
   {
     return brainLivenessWaiters.contains(brain);
@@ -1287,6 +1299,59 @@ static void runPendingDesignatedMasterRecoveryFixtures(TestSuite& suite)
   }
 }
 
+static void runStrandedFollowerReconnectFixture(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+
+  TestBrain brain = {};
+  brain.localBrainPeerAddress = IPAddress("127.0.0.20", false);
+  brain.localBrainPeerAddressText = "127.0.0.20"_ctv;
+  brain.localBrainPeerAddresses.push_back(ClusterMachinePeerAddress {"127.0.0.20"_ctv, 32});
+  brain.brainPeerHeartbeatIntervalMs = 1;
+  brain.brainPeerHeartbeatTimeoutMs = 1000;
+
+  BrainView strandedPeer = {};
+  strandedPeer.uuid = uint128_t(0x0613);
+  strandedPeer.boottimens = 223;
+  strandedPeer.peerAddress = IPAddress("127.0.0.18", false);
+  strandedPeer.peerAddressText = "127.0.0.18"_ctv;
+  strandedPeer.quarantined = true;
+  strandedPeer.reconnectAfterClose = true;
+  int stalePair[2] = {-1, -1};
+  suite.expect(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, stalePair) == 0,
+               "stranded_follower_reconnect_fixture_creates_direct_fd");
+  if (stalePair[0] >= 0)
+  {
+    brain.brains.insert(&strandedPeer);
+    brain.testArmBrainReconnectWaiter(&strandedPeer, 1, true);
+    TimeoutPacket *reconnect = brain.testGetBrainReconnectWaiter(&strandedPeer);
+    suite.expect(reconnect != nullptr, "stranded_follower_reconnect_arms_timeout");
+    strandedPeer.fd = stalePair[0];
+    if (reconnect != nullptr)
+    {
+      brain.testDispatchTimeout(reconnect);
+    }
+    suite.expect(brain.testHasBrainReconnectWaiter(&strandedPeer) == false,
+                 "stranded_follower_reconnect_timeout_consumes_waiter");
+    suite.expect(strandedPeer.connectAttemptPending(), "stranded_follower_reconnect_redials_expired_direct_fd");
+    suite.expect(strandedPeer.isFixedFile && strandedPeer.fslot >= 0,
+                 "stranded_follower_reconnect_replaces_direct_fd");
+    brain.brains.erase(&strandedPeer);
+    if (strandedPeer.isFixedFile)
+    {
+      Ring::uninstallFromFixedFileSlot(&strandedPeer);
+    }
+    else if (strandedPeer.fd >= 0)
+    {
+      ::close(strandedPeer.fd);
+    }
+    if (stalePair[1] >= 0)
+    {
+      ::close(stalePair[1]);
+    }
+  }
+}
+
 int main(void)
 {
   TestSuite suite;
@@ -1608,6 +1673,11 @@ int main(void)
 
   if (const char *testOnly = ::getenv("PRODIGY_TEST_ONLY"); testOnly != nullptr)
   {
+    if (std::strcmp(testOnly, "stranded-follower-reconnect") == 0)
+    {
+      runStrandedFollowerReconnectFixture(suite);
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (std::strcmp(testOnly, "restored-deployment-chain") == 0)
     {
       runRestoredDeploymentChainFixtures();
@@ -1630,6 +1700,8 @@ int main(void)
       return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
   }
+
+  runStrandedFollowerReconnectFixture(suite);
 
   suite.expect(prodigyBrainPeerHeartbeatTimeoutMs <= 5000u, "timing_knobs_bound_production_master_stale_detection");
   suite.expect(prodigyBrainDevPeerHeartbeatTimeoutMs <= 5000u, "timing_knobs_bound_dev_master_stale_detection");
