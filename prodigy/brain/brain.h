@@ -680,7 +680,11 @@ inline void BrainBase::sendNeuronSwitchboardStateSync(Machine *machine)
   for (const auto& [uuid, container] : containers)
   {
     (void)uuid;
-    if (container == nullptr || container->machine == nullptr)
+    // During promotion another machine's retained inventory may not have
+    // supplied its identity yet. Never cache or transmit a route for that
+    // temporary zero ID; the completed inventory barrier replays the fleet.
+    if (container == nullptr || container->machine == nullptr ||
+        container->machine->fragment == 0 || container->fragment == 0)
     {
       continue;
     }
@@ -694,8 +698,17 @@ inline void BrainBase::sendNeuronSwitchboardStateSync(Machine *machine)
     if (container->wormholeRuntimeRevision.size() == 64)
     {
       operation.containerID = container->generateContainerID();
-      operation.revision = container->wormholeRuntimeRevision;
       operation.desired = container->wormholeRuntimeDesired;
+      // Retained state may come from an earlier runtime which cached a
+      // revision before the owner identity was known. Preserve the desired
+      // bytes, but bind their revision to the now-authoritative identity.
+      if (prodigyComputeWormholeDesiredStateRevision(operation.containerID,
+                                                    operation.desired,
+                                                    operation.revision) == false)
+      {
+        continue;
+      }
+      container->wormholeRuntimeRevision = operation.revision;
     }
     else if (prodigyPrepareSwitchboardWormholeOperation(container->generateContainerID(), container->wormholes, operation) == false)
     {
@@ -725,7 +738,9 @@ inline void BrainBase::sendNeuronSwitchboardStateSync(Machine *machine)
   for (const auto& [uuid, container] : containers)
   {
     (void)uuid;
-    if (container == nullptr || container->whiteholes.empty())
+    if (container == nullptr || container->machine == nullptr ||
+        container->machine->fragment == 0 || container->fragment == 0 ||
+        container->whiteholes.empty())
     {
       continue;
     }
@@ -762,7 +777,8 @@ inline void BrainBase::sendNeuronSwitchboardStateSync(Machine *machine)
 
 inline void BrainBase::sendNeuronOpenSwitchboardWormholes(ContainerView *container, const Vector<Wormhole>& wormholes)
 {
-  if (container == nullptr || container->machine == nullptr)
+  if (container == nullptr || container->machine == nullptr ||
+      container->machine->fragment == 0 || container->fragment == 0)
   {
     return;
   }
@@ -865,7 +881,8 @@ inline void BrainBase::sendNeuronCloseSwitchboardWormholesToContainer(ContainerV
 
 inline void BrainBase::sendNeuronOpenSwitchboardWhiteholes(ContainerView *container, const Vector<Whitehole>& whiteholes)
 {
-  if (container == nullptr || container->machine == nullptr || whiteholes.empty())
+  if (container == nullptr || container->machine == nullptr ||
+      container->machine->fragment == 0 || container->fragment == 0 || whiteholes.empty())
   {
     return;
   }
@@ -10060,7 +10077,7 @@ public:
 
   bool startDeploymentAfterAuthoritativeReplication(ApplicationDeployment *deployment)
   {
-    if (deployment == nullptr || deployment->state != DeploymentState::none ||
+    if (isActiveMaster() == false || deployment == nullptr || deployment->state != DeploymentState::none ||
         deploymentIsIndexedApplicationChainMember(deployment))
     {
       return false;
@@ -11553,6 +11570,16 @@ public:
     {
       mesh->unifyPairingHalves();
       recoveredNeuronPairingsUnified = true;
+      // Earlier per-machine uploads could only replay the inventory known at
+      // that point. All identities are authoritative now: replay every route
+      // to every live Switchboard once, then require their exact ACKs below.
+      for (Machine *machine : machines)
+      {
+        if (prodigyWormholeRuntimeTargetMachine(machine))
+        {
+          sendNeuronSwitchboardStateSync(machine);
+        }
+      }
     }
 
     // State sync marks recovered wormholes pending on every live Switchboard.

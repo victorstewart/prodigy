@@ -3930,9 +3930,12 @@ static void testInitialDeploymentWaitsForDurableAuthoritativePeerReplication(Tes
                         "test-kernel"_ctv, "test-os"_ctv, "test-version"_ctv));
   suite.expect(countTopicFrames(followerB.wBuffer, BrainTopic::replicateDeployment) == priorReplayFrames + 1,
                "metadata_only_deployment_replays_on_registration");
+  brain.forfeitMasterStatus();
   brain.brainHandler(&followerB, buildBrainMessage(echoBuffer, BrainTopic::replicateDeployment, metadataID));
-  suite.expect(metadata->state != DeploymentState::none && metadata->brainBlobEchoPeerKeys.size() == 2,
-               "metadata_only_deployment_starts_after_distinct_durable_peer_acks");
+  suite.expect(metadata->state == DeploymentState::none && metadata->brainBlobEchoPeerKeys.size() == 2 &&
+                   brain.deploymentsByApp.contains(metadata->plan.config.applicationID) == false,
+               "metadata_only_deployment_late_echo_after_forfeit_does_not_launch_on_follower");
+  brain.deploymentsWaitingForDNS.erase(metadataID);
   brain.deployments.erase(metadataID);
   brain.deploymentsByApp.erase(plan.config.applicationID);
   brain.deploymentPlans.erase(metadataID);
@@ -9683,6 +9686,159 @@ static void testRecoveredStatelessWormholesReplayAndAwaitAcknowledgement(TestSui
   brain.neurons.erase(&machine.neuron);
   brain.machinesByUUID.erase(machine.uuid);
   brain.machines.erase(&machine);
+  thisBrain = previousBrain;
+}
+
+static void testRecoveredWormholeFleetReplayWaitsForAssignedIdentity(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+
+  TestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.ignited = true;
+  brain.brainConfig.datacenterFragment = 1;
+  brain.recoveringPersistedNeuronInventory = true;
+  brain.persistedMachineInventoryEnumerated = true;
+
+  BrainBase *previousBrain = thisBrain;
+  thisBrain = &brain;
+
+  Rack rack = {};
+  rack.uuid = 62'552;
+  Machine first = {};
+  Machine second = {};
+  Machine third = {};
+  Machine *machines[] = {&first, &second, &third};
+  const uint32_t fragments[] = {0x55201u, 0x55202u, 0x55203u};
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    Machine *machine = machines[index];
+    machine->uuid = uint128_t(0xA560 + index);
+    machine->private4 = 0x0A000060u + index;
+    machine->fragment = index == 0 ? 0 : fragments[index];
+    machine->rack = &rack;
+    machine->state = MachineState::healthy;
+    machine->runtimeReady = true;
+    machine->neuron.machine = machine;
+    machine->neuron.connected = true;
+    machine->neuron.isFixedFile = true;
+    machine->neuron.fslot = 60 + int(index);
+    machine->neuron.pendingSend = true;
+    brain.machines.insert(machine);
+    brain.machinesByUUID.insert_or_assign(machine->uuid, machine);
+    brain.neurons.insert(&machine->neuron);
+  }
+
+  ContainerView container = {};
+  container.uuid = uint128_t(0xA570);
+  container.machine = &first;
+  container.fragment = 7;
+  container.state = ContainerState::healthy;
+  container.runtimeReady = true;
+  Wormhole wormhole = {};
+  wormhole.externalAddress = IPAddress("10.0.2.16", false);
+  wormhole.deliveryAddress = wormhole.externalAddress;
+  wormhole.externalPort = 443;
+  wormhole.containerPort = 8443;
+  wormhole.layer4 = IPPROTO_TCP;
+  wormhole.source = ExternalAddressSource::hostPublicAddress;
+  container.wormholes.push_back(wormhole);
+  brain.containers.insert_or_assign(container.uuid, &container);
+
+  brain.sendNeuronSwitchboardStateSync(&second);
+  bool earlyZeroOwnerOperation = false;
+  forEachMessageInBuffer(second.neuron.wBuffer, [&](Message *queued) {
+    earlyZeroOwnerOperation = earlyZeroOwnerOperation || NeuronTopic(queued->topic) == NeuronTopic::openSwitchboardWormholes;
+  });
+  suite.expect(earlyZeroOwnerOperation == false && container.wormholeRuntimeRevision.empty(),
+               "recovered_wormhole_zero_owner_never_emits_or_caches_identity_bound_revision");
+
+  SwitchboardWormholeOperation stale = {};
+  suite.require(prodigyPrepareSwitchboardWormholeOperation(container.generateContainerID(), container.wormholes, stale),
+                "recovered_wormhole_fixture_builds_stale_zero_owner_revision");
+  container.wormholeRuntimeRevision = stale.revision;
+  container.wormholeRuntimeDesired = stale.desired;
+  const String staleRevision = stale.revision;
+  const String staleDesired = stale.desired;
+
+  first.fragment = fragments[0];
+  for (Machine *machine : machines)
+  {
+    brain.persistedMachineInventoryUploaded.insert(machine->uuid);
+  }
+
+  suite.expect(brain.finalizePersistedNeuronInventoryRecovery() == false &&
+                   brain.recoveringPersistedNeuronInventory &&
+                   container.wormholeRuntimePendingMachines.size() == 3 &&
+                   container.wormholeRuntimePendingMachines.contains(first.fragment) &&
+                   container.wormholeRuntimePendingMachines.contains(second.fragment) &&
+                   container.wormholeRuntimePendingMachines.contains(third.fragment) &&
+                   container.wormholeRuntimeRevision.equals(staleRevision) == false &&
+                   container.wormholeRuntimeDesired.equals(staleDesired),
+               "recovered_wormhole_inventory_barrier_repairs_identity_and_waits_for_every_switchboard_ack");
+
+  uint32_t correctedOperationCount = 0;
+  bool everySwitchboardSawCorrectedOperation = true;
+  for (Machine *machine : machines)
+  {
+    bool sawCorrectedOperation = false;
+    forEachMessageInBuffer(machine->neuron.wBuffer, [&](Message *queued) {
+      if (NeuronTopic(queued->topic) != NeuronTopic::openSwitchboardWormholes)
+      {
+        return;
+      }
+      SwitchboardWormholeOperation operation = {};
+      Vector<Wormhole> decoded = {};
+      if (decodeSwitchboardWormholeOperation(queued, operation, decoded) &&
+          operation.containerID == container.generateContainerID() &&
+          operation.revision.equals(container.wormholeRuntimeRevision) &&
+          operation.desired.equals(staleDesired))
+      {
+        correctedOperationCount += 1;
+        sawCorrectedOperation = true;
+      }
+    });
+    everySwitchboardSawCorrectedOperation = everySwitchboardSawCorrectedOperation && sawCorrectedOperation;
+  }
+  suite.expect(everySwitchboardSawCorrectedOperation && correctedOperationCount == 3,
+               "recovered_wormhole_inventory_barrier_replays_corrected_revision_to_fleet_once");
+
+  String acknowledgement = {};
+  brain.neuronHandler(&first.neuron,
+                      buildNeuronSwitchboardWormholeAcknowledgement(acknowledgement,
+                                                                    container.generateContainerID(),
+                                                                    staleRevision,
+                                                                    SwitchboardWormholeOperationStatus::applied));
+  suite.expect(container.wormholeRuntimePendingMachines.size() == 3 && brain.recoveringPersistedNeuronInventory,
+               "recovered_wormhole_stale_zero_owner_ack_cannot_release_recovery");
+
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    Machine *machine = machines[index];
+    brain.neuronHandler(&machine->neuron,
+                        buildNeuronSwitchboardWormholeAcknowledgement(acknowledgement,
+                                                                      container.generateContainerID(),
+                                                                      container.wormholeRuntimeRevision,
+                                                                      SwitchboardWormholeOperationStatus::applied));
+    if (index < 2)
+    {
+      suite.expect(brain.recoveringPersistedNeuronInventory &&
+                       container.wormholeRuntimePendingMachines.size() == 2 - index,
+                   "recovered_wormhole_each_partial_fleet_ack_keeps_inventory_barrier");
+    }
+  }
+  suite.expect(container.wormholeRuntimePendingMachines.empty() && brain.recoveringPersistedNeuronInventory == false,
+               "recovered_wormhole_exact_fleet_ack_releases_inventory_barrier");
+
+  brain.containers.erase(container.uuid);
+  for (Machine *machine : machines)
+  {
+    brain.neurons.erase(&machine->neuron);
+    brain.machinesByUUID.erase(machine->uuid);
+    brain.machines.erase(machine);
+  }
   thisBrain = previousBrain;
 }
 
@@ -23108,10 +23264,26 @@ static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(Tes
                 "persisted_inventory_runtime_exact_upload_restores_scheduling_readiness");
   brain.recoverDeploymentsAfterNeuronState();
   restored = brain.containers.find(retained.uuid);
+  suite.expect(brain.recoveringPersistedNeuronInventory &&
+                   restored != brain.containers.end() && restored->second != nullptr &&
+                   restored->second->wormholeRuntimePendingMachines.contains(machine.fragment) &&
+                   deployment.containers.contains(restored->second),
+               "persisted_inventory_runtime_central_recovery_waits_for_fresh_switchboard_ack");
+
+  if (restored != brain.containers.end() && restored->second != nullptr)
+  {
+    String acknowledgement = {};
+    brain.neuronHandler(&machine.neuron,
+                        buildNeuronSwitchboardWormholeAcknowledgement(acknowledgement,
+                                                                      restored->second->generateContainerID(),
+                                                                      restored->second->wormholeRuntimeRevision,
+                                                                      SwitchboardWormholeOperationStatus::applied));
+  }
+  restored = brain.containers.find(retained.uuid);
   suite.expect(brain.recoveringPersistedNeuronInventory == false &&
                    restored != brain.containers.end() && restored->second != nullptr &&
                    deployment.containers.contains(restored->second),
-               "persisted_inventory_runtime_central_recovery_resumes_only_after_exact_upload");
+               "persisted_inventory_runtime_central_recovery_releases_after_fresh_switchboard_ack");
 
   if (restored != brain.containers.end() && restored->second != nullptr)
   {
@@ -25410,6 +25582,12 @@ int main(void)
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "recovered-fleet-routing") == 0)
+  {
+    testRecoveredWormholeFleetReplayWaitsForAssignedIdentity(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "brain-recovery-inventory-healthy-gate") == 0)
   {
     testMachineHealthyDefersStatelessRecoveryUntilInventoryComplete(suite);
@@ -25706,6 +25884,7 @@ int main(void)
   testRegisteredRoutablePrefixWormholesRefreshHostedIngressBeforeOpen(suite);
   testSwitchboardWormholeFleetAcknowledgementTransaction(suite);
   testRecoveredStatelessWormholesReplayAndAwaitAcknowledgement(suite);
+  testRecoveredWormholeFleetReplayWaitsForAssignedIdentity(suite);
   testApplyReplicatedDeploymentPlanLiveStateUpdatesTrackedContainers(suite);
   testApplyReplicatedDeploymentPlanCleansTlsResumptionState(suite);
   testBrainBundleExecRetryRoutesThroughDispatcher(suite);
