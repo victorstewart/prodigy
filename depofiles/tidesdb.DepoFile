@@ -1,13 +1,13 @@
 # Copyright 2026 Victor Stewart
 # SPDX-License-Identifier: Apache-2.0
 NAME tidesdb
-VERSION 9.3.15-prodigy-61ae822b90e4
+VERSION 9.3.15-prodigy-b211dc81d800
 SYSTEM_LIBS ALLOW
-# The pinned fork revision is the audited memory-bound and highest-sequence read fix atop v9.3.15.
+# The pinned fork retains memory/read fixes and adds durable empty-WAL startup recovery.
 DEPENDS zstd VERSION 1.5.7
 DEPENDS snappy VERSION 1.2.2
 DEPENDS lz4 VERSION 1.10.0
-SOURCE GIT https://github.com/victorstewart/tidesdb.git 61ae822b90e4581664dced2101691b1570b8ab0b
+SOURCE GIT https://github.com/victorstewart/tidesdb.git b211dc81d8007a4fb7622c3251d0cd000794acbe
 BUILD_SYSTEM CMAKE
 CMAKE_ARG "-DCMAKE_PREFIX_PATH=${dep:zstd};${dep:snappy};${dep:lz4}"
 CMAKE_ARG "-DCMAKE_C_FLAGS=-I${dep:zstd}/include -I${dep:snappy}/include -I${dep:lz4}/include"
