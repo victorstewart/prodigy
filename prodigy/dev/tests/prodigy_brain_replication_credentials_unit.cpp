@@ -3787,6 +3787,141 @@ static void testRestoredDeploymentChainOrderingAndLateAcknowledgements(TestSuite
   acknowledgeRestoredChain(false, "after_inventory_recovery");
 }
 
+static void testRecoveredIndexedSuccessorWaitsForDurableReplication(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+  StreamingTestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  TestNeuron self = {};
+  const uint128_t selfUUID = 0x62'032'01;
+  const uint128_t followerAUUID = 0x62'032'02;
+  const uint128_t followerBUUID = 0x62'032'03;
+  self.uuid = selfUUID;
+
+  NeuronBase *previousNeuron = thisNeuron;
+  BrainBase *previousBrain = thisBrain;
+  thisNeuron = &self;
+  thisBrain = &brain;
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  brain.ignited = true;
+  brain.nBrains = 3;
+  brain.hasAuthoritativeTopology = true;
+  for (uint128_t uuid : {selfUUID, followerAUUID, followerBUUID})
+  {
+    ClusterMachine machine = {};
+    machine.isBrain = true;
+    machine.uuid = uuid;
+    brain.authoritativeTopology.machines.push_back(std::move(machine));
+  }
+
+  BrainView followerA = {};
+  followerA.uuid = followerAUUID;
+  BrainView followerB = {};
+  followerB.uuid = followerBUUID;
+  brain.brains.insert(&followerA);
+  brain.brains.insert(&followerB);
+
+  DeploymentPlan activePlan = {};
+  seedDeployRequestPlan(activePlan, 62'032);
+  activePlan.config.versionID = 1;
+  activePlan.canaryCount = 0;
+  DeploymentPlan successorPlan = activePlan;
+  successorPlan.config.versionID = 2;
+  ApplicationDeployment *active = new ApplicationDeployment();
+  ApplicationDeployment *successor = new ApplicationDeployment();
+  ContainerView retained = {};
+  Machine activeMachine = {};
+  activeMachine.state = MachineState::healthy;
+  activeMachine.runtimeReady = true;
+  active->plan = activePlan;
+  successor->plan = successorPlan;
+  active->next = successor;
+  successor->previous = active;
+  retained.uuid = 0x62032001;
+  retained.deploymentID = activePlan.config.deploymentID();
+  retained.applicationID = activePlan.config.applicationID;
+  active->containers.insert(&retained);
+  retained.machine = &activeMachine;
+  retained.lifetime = ApplicationLifetime::base;
+  retained.state = ContainerState::healthy;
+  for (uint128_t peerUUID : {followerAUUID, followerBUUID})
+  {
+    successor->brainBlobQueuedPeerKeys.insert(peerUUID);
+  }
+  brain.deployments.insert_or_assign(activePlan.config.deploymentID(), active);
+  brain.deployments.insert_or_assign(successorPlan.config.deploymentID(), successor);
+  brain.deploymentsByApp.insert_or_assign(activePlan.config.applicationID, successor);
+  brain.machines.insert(&activeMachine);
+
+  RoutableResourceLease pendingDNSLease = {};
+  pendingDNSLease.kind = RoutableResourceLeaseKind::dnsRecord;
+  pendingDNSLease.owner.deploymentID = successorPlan.config.deploymentID();
+  pendingDNSLease.dnsDeletePending = true;
+  brain.routableResourceLeaseRuntimeState.push_back(pendingDNSLease);
+
+  brain.recoverDeploymentsAfterNeuronState();
+  suite.expect(active->state == DeploymentState::none && successor->state == DeploymentState::none &&
+                   active->containers.contains(&retained) && successor->containers.empty(),
+               "recovered_indexed_successor_healthy_predecessor_does_not_bypass_missing_ack_or_dns");
+  brain.machines.erase(&activeMachine);
+  retained.machine = nullptr;
+  retained.state = ContainerState::none;
+
+  String echoBuffer = {};
+  brain.recoveringPersistedNeuronInventory = true;
+  brain.brainHandler(&followerA, buildBrainMessage(echoBuffer, BrainTopic::replicateDeployment, successorPlan.config.deploymentID()));
+  brain.brainHandler(&followerB, buildBrainMessage(echoBuffer, BrainTopic::replicateDeployment, successorPlan.config.deploymentID()));
+  suite.expect(successor->brainBlobEchoPeerKeys.size() == 2 && successor->state == DeploymentState::none,
+               "recovered_indexed_successor_inventory_gate_retains_none_after_final_ack");
+  suite.expect(brain.deploymentsWaitingForDNS.contains(successorPlan.config.deploymentID()) == false,
+               "recovered_indexed_successor_inventory_gate_does_not_arm_dns_resume_early");
+
+  brain.recoveringPersistedNeuronInventory = false;
+  brain.recoverDeploymentsAfterNeuronState();
+  suite.expect(successor->state == DeploymentState::none &&
+                   brain.deploymentsWaitingForDNS.contains(successorPlan.config.deploymentID()),
+               "recovered_indexed_successor_dns_gate_retains_none_after_inventory");
+
+  brain.routableResourceLeaseRuntimeState.clear();
+  brain.resumeDNSReadyDeployments();
+  suite.expect(successor->state == DeploymentState::waitingToDeploy &&
+                   brain.deploymentsWaitingForDNS.contains(successorPlan.config.deploymentID()) == false,
+               "recovered_indexed_successor_durable_ack_normalizes_to_waiting");
+  suite.expect(brain.deployments.size() == 2 && brain.deploymentsByApp[activePlan.config.applicationID] == successor &&
+                   active->next == successor && successor->previous == active &&
+                   active->containers.size() == 1 && active->containers.contains(&retained) &&
+                   successor->containers.empty(),
+               "recovered_indexed_successor_normalization_preserves_predecessor_owner_without_claims");
+
+  successor->state = DeploymentState::none;
+  successor->brainBlobEchoPeerKeys.clear();
+  brain.deploymentsWaitingForDNS.erase(successorPlan.config.deploymentID());
+  brain.brainHandler(&followerA, buildBrainMessage(echoBuffer, BrainTopic::replicateDeployment, successorPlan.config.deploymentID()));
+  suite.expect(successor->state == DeploymentState::none,
+               "recovered_indexed_successor_withheld_ack_retains_none_after_all_other_gates");
+  brain.brainHandler(&followerB, buildBrainMessage(echoBuffer, BrainTopic::replicateDeployment, successorPlan.config.deploymentID()));
+  suite.expect(successor->state == DeploymentState::waitingToDeploy &&
+                   brain.deploymentsWaitingForDNS.contains(successorPlan.config.deploymentID()) == false,
+               "recovered_indexed_successor_final_ack_resumes_without_unrelated_event");
+
+  const uint32_t persistCalls = brain.persistCalls;
+  brain.brainHandler(&followerB, buildBrainMessage(echoBuffer, BrainTopic::replicateDeployment, successorPlan.config.deploymentID()));
+  brain.recoverDeploymentsAfterNeuronState();
+  suite.expect(successor->state == DeploymentState::waitingToDeploy && brain.persistCalls == persistCalls &&
+                   brain.deployments.size() == 2 && active->containers.contains(&retained),
+               "recovered_indexed_successor_normalization_is_idempotent");
+
+  brain.deployments.clear();
+  brain.deploymentsByApp.clear();
+  brain.machines.erase(&activeMachine);
+  delete active;
+  delete successor;
+  thisBrain = previousBrain;
+  thisNeuron = previousNeuron;
+}
+
 static void testInitialDeploymentWaitsForDurableAuthoritativePeerReplication(TestSuite& suite)
 {
   StreamingTestBrain brain = {};
@@ -25870,6 +26005,7 @@ int main(void)
     testSpinApplicationStagesFollowerBlobReplicationBehindMetadataEcho(suite);
     testSpinApplicationReplicatesInitialBlobWithPlan(suite);
     testInitialDeploymentWaitsForDurableAuthoritativePeerReplication(suite);
+    testRecoveredIndexedSuccessorWaitsForDurableReplication(suite);
     testRestoredDeploymentChainOrderingAndLateAcknowledgements(suite);
     testReplicatedDeploymentAcknowledgesOnlyAfterDurablePersistence(suite);
     testCertificateLifecycleSchedulers(suite);
@@ -26186,6 +26322,7 @@ int main(void)
   testSpinApplicationStagesFollowerBlobReplicationBehindMetadataEcho(suite);
   testSpinApplicationReplicatesInitialBlobWithPlan(suite);
   testInitialDeploymentWaitsForDurableAuthoritativePeerReplication(suite);
+  testRecoveredIndexedSuccessorWaitsForDurableReplication(suite);
   testRestoredDeploymentChainOrderingAndLateAcknowledgements(suite);
   testReplicatedDeploymentAcknowledgesOnlyAfterDurablePersistence(suite);
   testLargePayloadPeerKeepaliveUsesFixedFileSocketCommand(suite);

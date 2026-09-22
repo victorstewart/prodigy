@@ -10147,33 +10147,52 @@ public:
 
   void resumeDNSReadyDeployments(void)
   {
-    for (auto it = deploymentsWaitingForDNS.begin(); it != deploymentsWaitingForDNS.end();)
+    Vector<uint64_t> waitingDeploymentIDs = {};
+    waitingDeploymentIDs.reserve(deploymentsWaitingForDNS.size());
+    for (uint64_t deploymentID : deploymentsWaitingForDNS)
     {
-      const uint64_t deploymentID = *it;
-      if (deploymentDNSReady(deploymentID) == false)
+      waitingDeploymentIDs.push_back(deploymentID);
+    }
+
+    for (uint64_t deploymentID : waitingDeploymentIDs)
+    {
+      if (deploymentsWaitingForDNS.contains(deploymentID) == false ||
+          deploymentDNSReady(deploymentID) == false)
       {
-        ++it;
         continue;
       }
       auto deployment = deployments.find(deploymentID);
+      deploymentsWaitingForDNS.erase(deploymentID);
       if (deployment != deployments.end() && deployment->second != nullptr &&
           deployment->second->state == DeploymentState::waitingToDeploy)
       {
         // This successor already passed admission before it was queued. Its
         // persisted DNS wait must still resume after predecessor recovery.
-        it = deploymentsWaitingForDNS.erase(it);
-        spinApplication(deployment->second);
+        if (deploymentIsIndexedApplicationChainMember(deployment->second))
+        {
+          recoverDeploymentsAfterNeuronState();
+        }
+        else
+        {
+          spinApplication(deployment->second);
+        }
         continue;
       }
       if (deployment == deployments.end() || deployment->second == nullptr ||
-          deployment->second->state != DeploymentState::none ||
-          startDeploymentAfterAuthoritativeReplication(deployment->second))
+          deployment->second->state != DeploymentState::none)
       {
-        it = deploymentsWaitingForDNS.erase(it);
+        continue;
       }
-      else
+      const bool started = startDeploymentAfterAuthoritativeReplication(deployment->second);
+      if (started == false)
       {
-        ++it;
+        recoverDeploymentsAfterNeuronState();
+      }
+      auto resumed = deployments.find(deploymentID);
+      if (resumed != deployments.end() && resumed->second != nullptr &&
+          resumed->second->state == DeploymentState::none)
+      {
+        deploymentsWaitingForDNS.insert(deploymentID);
       }
     }
   }
@@ -11688,6 +11707,35 @@ public:
       {
         // Only the dedicated recovery owner may resume this incomplete head.
         continue;
+      }
+
+      // A successor admitted before a cold recovery is already the indexed
+      // head, so the normal peer-echo starter deliberately cannot spin it
+      // again.  Once the complete inventory, its authoritative peer copies,
+      // and its DNS lease are all present, restore the same queued state that
+      // normal admission records before the predecessor owns roll-forward.
+      if (head->previous != nullptr && head->state == DeploymentState::none &&
+          head->lifecycleIsUnmaterialized())
+      {
+        if (deploymentReplicationAcknowledgedByAuthoritativePeers(head) == false)
+        {
+          continue;
+        }
+        if (deploymentDNSReady(head->plan.config.deploymentID()) == false)
+        {
+          deploymentsWaitingForDNS.insert(head->plan.config.deploymentID());
+          continue;
+        }
+        const int64_t stateChangedAtMs = head->stateChangedAtMs;
+        head->state = DeploymentState::waitingToDeploy;
+        head->stateChangedAtMs = Time::now<TimeResolution::ms>();
+        if (persistLocalRuntimeState() == false)
+        {
+          head->state = DeploymentState::none;
+          head->stateChangedAtMs = stateChangedAtMs;
+          continue;
+        }
+        deploymentsWaitingForDNS.erase(head->plan.config.deploymentID());
       }
 
       // A queued successor becomes the application index head before the
@@ -26188,6 +26236,14 @@ public:
               if (startDeploymentAfterAuthoritativeReplication(deployment))
               {
                 deploymentsWaitingForDNS.erase(deployment->plan.config.deploymentID());
+              }
+              else if (deploymentIsIndexedApplicationChainMember(deployment) &&
+                       deployment->previous != nullptr && deployment->state == DeploymentState::none &&
+                       deployment->lifecycleIsUnmaterialized())
+              {
+                // A restored successor is already indexed, so only the
+                // inventory recovery owner can restore its queued handoff.
+                recoverDeploymentsAfterNeuronState();
               }
             }
           }
