@@ -264,7 +264,7 @@ static bool recvOneMessageFrame(int fd, String& frame)
     return false;
   }
 
-  if (header.size < sizeof(Message))
+  if (header.size < sizeof(MothershipWireHeader))
   {
     return false;
   }
@@ -339,15 +339,17 @@ static bool acceptOneClient(int listenerFD, int& clientFD, int timeoutMs = 5000)
   return clientFD >= 0;
 }
 
-static bool verifyPullClusterReportRequest(const String& frame)
+static bool verifyRequestTopic(const String& frame, MothershipTopic expected)
 {
-  if (frame.size() < sizeof(Message))
+  if (frame.size() < sizeof(MothershipWireHeader))
   {
     return false;
   }
 
-  const Message *message = reinterpret_cast<const Message *>(frame.data());
-  return MothershipTopic(message->topic) == MothershipTopic::pullClusterReport;
+  MothershipWireHeader header = {};
+  std::memcpy(&header, frame.data(), sizeof(header));
+  return header.size == frame.size() && header.headerSize == sizeof(header) &&
+         header.topic == uint16_t(expected);
 }
 
 static bool sendClusterReportResponse(int fd, const ClusterStatusReport& report)
@@ -519,13 +521,17 @@ static bool runMothershipClusterReport(const String& mothershipBinary, const Str
     {
       serverFailure.assign("recv_cluster_report_request_failed"_ctv);
     }
-    else if (verifyPullClusterReportRequest(frame) == false)
+    else
     {
-      serverFailure.assign("unexpected_cluster_report_request_topic"_ctv);
-    }
-    else if (sendClusterReportResponse(clientFD, report) == false)
-    {
-      serverFailure.assign("send_cluster_report_response_failed"_ctv);
+      // The client subscribes to expiry notices before its report request.
+      // Consume only that one known preflight; never skip arbitrary messages.
+      if (verifyRequestTopic(frame, MothershipTopic::credentialExpiryNotices) &&
+          recvOneMessageFrame(clientFD, frame) == false)
+        serverFailure.assign("recv_cluster_report_after_expiry_subscription_failed"_ctv);
+      if (serverFailure.empty() && verifyRequestTopic(frame, MothershipTopic::pullClusterReport) == false)
+        serverFailure.assign("unexpected_cluster_report_request_topic"_ctv);
+      else if (serverFailure.empty() && sendClusterReportResponse(clientFD, report) == false)
+        serverFailure.assign("send_cluster_report_response_failed"_ctv);
     }
   }
 

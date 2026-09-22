@@ -37,6 +37,7 @@
 #include <prodigy/wire.h>
 #include <prodigy/mothership/mothership.cluster.create.h>
 #include <prodigy/mothership/mothership.cluster.remove.h>
+#include <prodigy/mothership/mothership.tidesdb.migration.h>
 #include <prodigy/mothership/mothership.addmachines.progress.h>
 #include <prodigy/mothership/mothership.cluster.reconcile.h>
 #include <prodigy/mothership/mothership.cluster.registry.h>
@@ -58,6 +59,7 @@
 #include <prodigy/types.h>
 
 #include "mothership.virtual.datacenter.provider.inc"
+#include <prodigy/mothership/mothership.tidesdb.migration.command.h>
 
 // for now every time we create a new application or service we're going to have to recompile the mothership so that
 // it can read the enum values from enums.datacenter.h, but in the future we can do something else more flexible
@@ -10095,6 +10097,22 @@ private:
     basics_log("faultTestCluster success=1 identity=%s mode=%s machineIndices=%s\n", identity.c_str(), mode.c_str(), machineIndices.c_str());
   }
 
+  void runMigrateTidesDB9To10(int argc, char *argv[])
+  {
+    if (argc < 1 || argc > 2 || (argc == 2 && std::strcmp(argv[1], "rollback") != 0))
+    {
+      basics_log("migrateTidesDB9To10 expects [private versioned plan JSON path] [optional rollback before activation]\n");
+      exit(EXIT_FAILURE);
+    }
+    String failure;
+    if (!MothershipTidesMigration::run(argv[0], argc == 2, &failure))
+    {
+      basics_log("migrateTidesDB9To10 success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    basics_log("migrateTidesDB9To10 success=1 action=%s applicationHealthAttested=0\n", argc == 2 ? "rolledBack" : "activated");
+  }
+
   void runRecoverTestClusterBundle(int argc, char *argv[])
   {
     if (argc != 4 && argc != 5)
@@ -18992,6 +19010,7 @@ public:
         {"destroyProviderMachines",         &Mothership::runDestroyProviderMachines        },
         {"estimateClusterHourlyCost",       &Mothership::runEstimateClusterHourlyCost      },
         {"faultTestCluster",                &Mothership::runFaultTestCluster               },
+        {"migrateTidesDB9To10",             &Mothership::runMigrateTidesDB9To10             },
         {"mintClientTlsIdentity",           &Mothership::runMintClientTlsIdentity          },
         {"offlineDNSCleanupInventory",      &Mothership::runOfflineDNSCleanupInventory     },
         {"printClusters",                   &Mothership::runPrintClusters                  },
@@ -19107,6 +19126,7 @@ int main(int argc, char *argv[])
     message.append("\trequires deploymentMode=local and atomically replaces the stored local membership spec with exact json fields includeLocalMachine and machines before reconciling and persisting on live success\n");
     message.append("setTestClusterMachineCount [name|clusterUUID] [json]\n");
     message.append("\trequires deploymentMode=test and updates only test.machineCount through exact json field machineCount before restarting/reconciling and persisting on live success\n");
+    message.append("migrateTidesDB9To10 [private versioned plan JSON path] [optional rollback before activation]\n");
     message.append("recoverTestClusterBundle [name|clusterUUID] [approved bundle] [machineIndex] [expected installed bundle SHA256] [optional expected incomplete worker bundle SHA256 for sole Brain]\n");
     message.append("\tadopts an exact retained test-provider owner and replaces one worker while preserving descendant cgroups; application health must be observed separately\n");
     message.append("faultTestCluster [name|clusterUUID] [link|crash|flap] [machine indices csv] [durationMs] [cycles] [downMs] [upMs]\n");

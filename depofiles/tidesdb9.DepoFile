@@ -1,14 +1,13 @@
 # Copyright 2026 Victor Stewart
 # SPDX-License-Identifier: Apache-2.0
-NAME tidesdb
-VERSION 10.0.1.20260919.210236
+NAME tidesdb9
+VERSION 9.0.0.20260921
 SYSTEM_LIBS ALLOW
-# Upstream master pinned by immutable commit and archive checksum.
 DEPENDS zstd VERSION 1.5.7
 DEPENDS snappy VERSION 1.2.2
 DEPENDS lz4 VERSION 1.10.0
-SOURCE URL https://github.com/tidesdb/tidesdb/archive/2e029f971e664319edec26e0a19f2dd02344bcff.tar.gz
-SHA256 72eaa5c91ec62aec43e0481bc612475e99099c67e4c2f3b4141dce93de9d87a7
+SOURCE URL https://github.com/tidesdb/tidesdb/archive/b211dc81d8007a4fb7622c3251d0cd000794acbe.tar.gz
+SHA256 3dc09a8e802b8608a34af3a1e493cecdda20561a9225307dcfb0df9b62ae5a3b
 BUILD_SYSTEM CMAKE
 CMAKE_ARG "-DCMAKE_PREFIX_PATH=${dep:zstd};${dep:snappy};${dep:lz4}"
 CMAKE_ARG "-DCMAKE_C_FLAGS=-I${dep:zstd}/include -I${dep:snappy}/include -I${dep:lz4}/include"
@@ -18,5 +17,5 @@ CMAKE_DEFINE TIDESDB_BUILD_TESTS=OFF
 CMAKE_DEFINE TIDESDB_WITH_SANITIZER=OFF
 CMAKE_DEFINE TIDESDB_WITH_MIMALLOC=OFF
 CMAKE_DEFINE TIDESDB_WITH_TCMALLOC=OFF
-TARGET tidesdb::tidesdb STATIC lib/libtidesdb.a INTERFACE include
-LINK tidesdb::tidesdb zstd::zstd snappy::snappy lz4::lz4 pthread m stdc++ atomic
+TARGET tidesdb9::tidesdb9 STATIC lib/libtidesdb.a INTERFACE include
+LINK tidesdb9::tidesdb9 zstd::zstd snappy::snappy lz4::lz4 pthread m stdc++ atomic

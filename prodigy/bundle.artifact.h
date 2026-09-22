@@ -996,23 +996,13 @@ static inline bool prodigyResolveBundleArtifactInput(const String& inputPath, St
   return prodigyResolveBundleArtifactInput(inputPath, nametagCurrentBuildMachineArchitecture(), bundlePath, failure);
 }
 
-static inline bool prodigyInstallBundleToRoot(const String& bundlePath, const String& installRoot, String *failure = nullptr)
+// Render the shared installer for execution locally or by Mothership's SSH owner.
+// The caller must approve the bundle first. Remote callers additionally compare
+// its uploaded digest before executing this command.
+static inline void prodigyBuildBundleInstallCommand(const String& bundlePath, const String& installRoot, String& command)
 {
-  if (failure)
-  {
-    failure->clear();
-  }
-
   ProdigyInstallRootPaths paths = {};
   prodigyBuildInstallRootPaths(installRoot, paths);
-  String expectedDigest = {};
-  String actualDigest = {};
-  if (prodigyLoadBundleExpectedSHA256Hex(bundlePath, expectedDigest, failure) == false ||
-      prodigyBundleMatchesExpectedSHA256Hex(bundlePath, expectedDigest, actualDigest, failure) == false)
-  {
-    return false;
-  }
-
   String bundleSHA256Path = {};
   prodigyResolveBundleSHA256Path(bundlePath, bundleSHA256Path);
   String tempBundlePath = {};
@@ -1020,7 +1010,6 @@ static inline bool prodigyInstallBundleToRoot(const String& bundlePath, const St
   String tempBundleSHA256Path = {};
   prodigyResolveBundleSHA256Path(tempBundlePath, tempBundleSHA256Path);
 
-  String command = {};
   command.assign("set -eu; rm -rf "_ctv);
   prodigyAppendShellSingleQuoted(command, paths.installRootTemp);
   command.append(" "_ctv);
@@ -1052,5 +1041,24 @@ static inline bool prodigyInstallBundleToRoot(const String& bundlePath, const St
   command.append("; rm -rf "_ctv);
   prodigyAppendShellSingleQuoted(command, paths.installRootPrevious);
 
+}
+
+static inline bool prodigyInstallBundleToRoot(const String& bundlePath, const String& installRoot, String *failure = nullptr)
+{
+  if (failure)
+  {
+    failure->clear();
+  }
+
+  String expectedDigest = {};
+  String actualDigest = {};
+  if (prodigyLoadBundleExpectedSHA256Hex(bundlePath, expectedDigest, failure) == false ||
+      prodigyBundleMatchesExpectedSHA256Hex(bundlePath, expectedDigest, actualDigest, failure) == false)
+  {
+    return false;
+  }
+
+  String command = {};
+  prodigyBuildBundleInstallCommand(bundlePath, installRoot, command);
   return prodigyRunLocalShellCommand(command, failure);
 }

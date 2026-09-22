@@ -173,6 +173,7 @@ set(PRODIGY_DEPOFILES
    "${PRODIGY_DEPOFILES_DIR}/snappy.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/static_type_info.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/tidesdb.DepoFile"
+   "${PRODIGY_DEPOFILES_DIR}/tidesdb9.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/zlib.DepoFile"
    "${PRODIGY_DEPOFILES_DIR}/zstd.DepoFile"
 )
@@ -502,6 +503,18 @@ add_executable(prodigy ${PRODIGY_ROOT}/prodigy/prodigy.cpp ${PRODIGY_MOTHERSHIP_
 add_executable(mothership ${PRODIGY_ROOT}/prodigy/mothership/mothership.cpp ${PRODIGY_VIRTUAL_DATACENTER_PROVIDER_HEADER} ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES})
 target_include_directories(mothership PRIVATE "${CMAKE_BINARY_DIR}/generated")
 add_executable(prodigy_dns_resolver ${PRODIGY_ROOT}/prodigy/dns/resolver.cpp)
+add_executable(prodigy_tidesdb9_export ${CMAKE_CURRENT_SOURCE_DIR}/tidesdb9_export.c)
+add_executable(prodigy_tidesdb10_import ${CMAKE_CURRENT_SOURCE_DIR}/tidesdb10_import.c)
+add_executable(prodigy_tidesdb9_fixture ${CMAKE_CURRENT_SOURCE_DIR}/tidesdb9_fixture.c)
+add_executable(prodigy_tidesdb9_lock_compat_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_tidesdb9_lock_compat_unit.c)
+set_target_properties(prodigy_tidesdb9_export prodigy_tidesdb10_import prodigy_tidesdb9_fixture prodigy_tidesdb9_lock_compat_unit PROPERTIES
+   C_STANDARD 11
+   C_STANDARD_REQUIRED YES
+)
+target_link_libraries(prodigy_tidesdb9_export PRIVATE tidesdb9::tidesdb9 openssl openssl::crypto)
+target_link_libraries(prodigy_tidesdb10_import PRIVATE tidesdb::tidesdb openssl openssl::crypto)
+target_link_libraries(prodigy_tidesdb9_fixture PRIVATE tidesdb9::tidesdb9)
+target_link_libraries(prodigy_tidesdb9_lock_compat_unit PRIVATE tidesdb9::tidesdb9)
 set_target_properties(prodigy_dns_resolver PROPERTIES OUTPUT_NAME prodigy-dns-resolver)
 add_executable(prodigy_mothership_tunnel_provider ${CMAKE_CURRENT_SOURCE_DIR}/tests/mothership_tunnel_provider_fixture.cpp)
 set_target_properties(prodigy_mothership_tunnel_provider PROPERTIES OUTPUT_NAME mothership-tunnel-provider)
@@ -603,6 +616,10 @@ add_executable(prodigy_remote_bootstrap_smoke ${CMAKE_CURRENT_SOURCE_DIR}/tests/
 add_executable(prodigy_mothership_cluster_registry_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cluster_registry_unit.cpp)
 add_executable(prodigy_mothership_cluster_report_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cluster_report_unit.cpp)
 add_executable(prodigy_mothership_restart_persistence_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_restart_persistence_unit.cpp)
+add_executable(prodigy_mothership_tidesdb_migration_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_tidesdb_migration_unit.cpp)
+add_executable(prodigy_mothership_tidesdb_migration_command_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_tidesdb_migration_command_unit.cpp)
+target_compile_options(prodigy_mothership_tidesdb_migration_command_unit PRIVATE -UNDEBUG)
+add_dependencies(prodigy_mothership_tidesdb_migration_command_unit prodigy_tidesdb9_export prodigy_tidesdb10_import prodigy_tidesdb9_fixture)
 add_executable(prodigy_mothership_cluster_reconcile_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cluster_reconcile_unit.cpp)
 add_executable(prodigy_mothership_cluster_remove_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cluster_remove_unit.cpp)
 add_executable(prodigy_mothership_cluster_create_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cluster_create_unit.cpp)
@@ -687,6 +704,8 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_mothership_cluster_registry_unit
    prodigy_mothership_cluster_report_unit
    prodigy_mothership_restart_persistence_unit
+   prodigy_mothership_tidesdb_migration_unit
+   prodigy_mothership_tidesdb_migration_command_unit
    prodigy_mothership_cluster_reconcile_unit
    prodigy_mothership_cluster_remove_unit
    prodigy_mothership_cluster_create_unit
@@ -927,6 +946,7 @@ target_compile_options(prodigy_remote_bootstrap_smoke PUBLIC -O2)
 target_compile_options(prodigy_mothership_cluster_registry_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_cluster_report_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_restart_persistence_unit PUBLIC -O2)
+target_compile_options(prodigy_mothership_tidesdb_migration_unit PRIVATE -UNDEBUG)
 target_compile_options(prodigy_mothership_cluster_reconcile_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_cluster_remove_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_cluster_create_unit PUBLIC -O2)
@@ -1180,6 +1200,8 @@ add_custom_command(
            --tool-binary "${PRODIGY_BUNDLED_BW_MEM_BIN}"
            --tool-binary "${PRODIGY_BUNDLED_SPEEDTEST_BIN}"
            --tool-binary "$<TARGET_FILE:mothership>"
+           --tool-binary "$<TARGET_FILE:prodigy_tidesdb9_export>"
+           --tool-binary "$<TARGET_FILE:prodigy_tidesdb10_import>"
            --tool-binary "${PRODIGY_CERTBOT_WHEELHOUSE_OUTPUT}"
            --tool-binary "${PRODIGY_ROOT}/prodigy/acme/acme-present-dns-01"
            --tool-binary "${PRODIGY_ROOT}/prodigy/acme/acme-cleanup-dns-01"
@@ -1188,6 +1210,8 @@ add_custom_command(
            --container-plan "${PRODIGY_DNS_RESOLVER_DEPLOYMENT_PLAN}"
    DEPENDS prodigy
            mothership
+           prodigy_tidesdb9_export
+           prodigy_tidesdb10_import
            balancer.ebpf.o
            host.ingress.router.ebpf.o
            host.ingress.router.dev.ebpf.o
@@ -1268,6 +1292,19 @@ endif()
 
 if (PROJECT_ENABLE_TESTS)
    include(CTest)
+
+   add_test(
+      NAME prodigy_tidesdb_9_to_10_migration
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_tidesdb_9_to_10_migration.py
+              --fixture $<TARGET_FILE:prodigy_tidesdb9_fixture>
+              --exporter $<TARGET_FILE:prodigy_tidesdb9_export>
+              --importer $<TARGET_FILE:prodigy_tidesdb10_import>
+   )
+
+   add_test(
+      NAME prodigy_tidesdb9_lock_compat_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_tidesdb9_lock_compat_unit
+   )
 
    add_test(
       NAME prodigy_mothership_json_argument_unit
@@ -2013,6 +2050,16 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    add_test(
       NAME prodigy_mothership_restart_persistence_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_restart_persistence_unit
+   )
+
+   add_test(
+      NAME prodigy_mothership_tidesdb_migration_command_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_tidesdb_migration_command_unit
+              $<TARGET_FILE:prodigy_tidesdb9_fixture> $<TARGET_FILE:prodigy_tidesdb9_export> $<TARGET_FILE:prodigy_tidesdb10_import>
+   )
+   add_test(
+      NAME prodigy_mothership_tidesdb_migration_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_tidesdb_migration_unit
    )
 
    add_test(
