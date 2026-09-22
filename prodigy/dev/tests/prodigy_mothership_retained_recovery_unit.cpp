@@ -95,6 +95,26 @@ int main()
     }
     input.parameters.push_back(params);input.observedCreatedAtMs.push_back(1790040000000LL);request.machines.push_back(input);
   }
+  // BrainConfig and API credentials contain nested unordered maps as well.
+  ApiCredential credential = {};credential.name="fixture"_ctv;
+  for (uint32_t index=0;index<32;++index) {
+    String key;key.snprintf<"key-{itoa}"_ctv>(index);
+    MachineConfig machine = {};machine.slug=key;machine.nLogicalCores=index+1;
+    snapshot.brainConfig.configBySlug[key]=machine;
+    snapshot.brainConfig.dnsCredential.metadata[key]=key;
+    credential.metadata[key]=key;
+  }
+  ApplicationApiCredentialSet credentials = {};credentials.applicationID=77;credentials.credentials.push_back(credential);
+  snapshot.masterAuthority.apiCredentialSetsByApp[77]=credentials;
+  String snapshotBytes;BitseryEngine::serialize(snapshotBytes,snapshot);
+  ProdigyPersistentBrainSnapshot snapshotRoundTrip;
+  assert(BitseryEngine::deserializeSafe(snapshotBytes,snapshotRoundTrip));
+  assert(prodigyPersistentBrainSnapshotsEqual(snapshot,snapshotRoundTrip));
+  snapshotRoundTrip.brainConfig.configBySlug.begin()->second.nLogicalCores+=1;
+  assert(!prodigyPersistentBrainSnapshotsEqual(snapshot,snapshotRoundTrip));
+  snapshotRoundTrip=snapshot;
+  snapshotRoundTrip.masterAuthority.apiCredentialSetsByApp[77].credentials[0].metadata.begin()->second="changed"_ctv;
+  assert(!prodigyPersistentBrainSnapshotsEqual(snapshot,snapshotRoundTrip));
   auto preparedSnapshot=snapshot;
   assert(mothershipPrepareRetainedRecoverySnapshot(preparedSnapshot,request.plans,request.machines,request.bundleSHA,&failure));
   auto preexistingSnapshot=preparedSnapshot;

@@ -2740,11 +2740,36 @@ static bool prodigyPersistentMapEqual(
   return prodigyPersistentMapEqual(lhs.map, rhs.map);
 }
 
+static bool prodigyPersistentApiCredentialsEqual(
+    const Vector<ApiCredential>& lhs, const Vector<ApiCredential>& rhs)
+{
+  if (lhs.size() != rhs.size()) return false;
+  for (uint32_t index = 0; index < lhs.size(); ++index)
+  {
+    if (!prodigyPersistentMapEqual(lhs[index].metadata, rhs[index].metadata)) return false;
+    auto left = lhs[index], right = rhs[index];
+    left.metadata.clear(); right.metadata.clear();
+    if (!prodigyPersistentSerializedEqual(left, right)) return false;
+  }
+  return true;
+}
+
+template <>
+inline bool prodigyPersistentMapValueEqual<ApplicationApiCredentialSet>(
+    const ApplicationApiCredentialSet& lhs, const ApplicationApiCredentialSet& rhs)
+{
+  if (!prodigyPersistentApiCredentialsEqual(lhs.credentials, rhs.credentials)) return false;
+  auto left = lhs, right = rhs;
+  left.credentials.clear(); right.credentials.clear();
+  return prodigyPersistentSerializedEqual(left, right);
+}
+
 static bool prodigyPersistentRetainedBootstrapEqual(
     const NeuronContainerBootstrap& lhs,
     const NeuronContainerBootstrap& rhs)
 {
-  if (prodigyPersistentMapEqual(lhs.plan.subscriptions, rhs.plan.subscriptions) == false ||
+  if (!prodigyPersistentApiCredentialsEqual(lhs.plan.credentialBundle.apiCredentials, rhs.plan.credentialBundle.apiCredentials) ||
+      prodigyPersistentMapEqual(lhs.plan.subscriptions, rhs.plan.subscriptions) == false ||
       prodigyPersistentMapEqual(lhs.plan.advertisements, rhs.plan.advertisements) == false ||
       prodigyPersistentMapEqual(lhs.plan.subscriptionPairings, rhs.plan.subscriptionPairings) == false ||
       prodigyPersistentMapEqual(lhs.plan.advertisementPairings, rhs.plan.advertisementPairings) == false)
@@ -2754,6 +2779,8 @@ static bool prodigyPersistentRetainedBootstrapEqual(
 
   NeuronContainerBootstrap lhsCopy = lhs;
   NeuronContainerBootstrap rhsCopy = rhs;
+  lhsCopy.plan.credentialBundle.apiCredentials.clear();
+  rhsCopy.plan.credentialBundle.apiCredentials.clear();
   lhsCopy.plan.subscriptions.clear();
   lhsCopy.plan.advertisements.clear();
   lhsCopy.plan.subscriptionPairings.clear();
@@ -2771,7 +2798,9 @@ static bool prodigyPersistentBrainSnapshotsEqual(
 {
   const auto& lhsAuthority = lhs.masterAuthority;
   const auto& rhsAuthority = rhs.masterAuthority;
-  if (prodigyPersistentMapEqual(lhsAuthority.tlsVaultFactoriesByApp, rhsAuthority.tlsVaultFactoriesByApp) == false ||
+  if (!prodigyPersistentMapEqual(lhs.brainConfig.configBySlug, rhs.brainConfig.configBySlug) ||
+      !prodigyPersistentMapEqual(lhs.brainConfig.dnsCredential.metadata, rhs.brainConfig.dnsCredential.metadata) ||
+      prodigyPersistentMapEqual(lhsAuthority.tlsVaultFactoriesByApp, rhsAuthority.tlsVaultFactoriesByApp) == false ||
       prodigyPersistentMapEqual(lhsAuthority.apiCredentialSetsByApp, rhsAuthority.apiCredentialSetsByApp) == false ||
       prodigyPersistentMapEqual(lhsAuthority.reservedApplicationIDsByName, rhsAuthority.reservedApplicationIDsByName) == false ||
       prodigyPersistentMapEqual(lhsAuthority.reservedApplicationNamesByID, rhsAuthority.reservedApplicationNamesByID) == false ||
@@ -2784,6 +2813,10 @@ static bool prodigyPersistentBrainSnapshotsEqual(
 
   ProdigyPersistentBrainSnapshot lhsCopy = lhs;
   ProdigyPersistentBrainSnapshot rhsCopy = rhs;
+  lhsCopy.brainConfig.configBySlug.clear();
+  rhsCopy.brainConfig.configBySlug.clear();
+  lhsCopy.brainConfig.dnsCredential.metadata.clear();
+  rhsCopy.brainConfig.dnsCredential.metadata.clear();
   lhsCopy.masterAuthority.tlsVaultFactoriesByApp.clear();
   lhsCopy.masterAuthority.apiCredentialSetsByApp.clear();
   lhsCopy.masterAuthority.reservedApplicationIDsByName.clear();
