@@ -88,7 +88,7 @@ inline Manifest parseManifest(const std::string& path,const Plan& p) {
     }
     m.request.machines.push_back(std::move(machine));
   }
-  require(seenMachines.size()==3 && m.records.size()==34 && canonical==23,"recovery requires the sealed three-host 34-process inventory with 23 canonical containers");
+  require(seenMachines.size()==3 && canonical==23,"recovery requires the sealed three-host inventory with 23 canonical containers");
   return m;
 }
 inline void loadSnapshot(const std::string& path,ProdigyPersistentBrainSnapshot& snapshot) {
@@ -209,10 +209,31 @@ inline bool sameRecordIdentity(const Manifest& left,const Manifest& right) {
   }
   return true;
 }
+inline bool sameCanonicalRecordIdentity(const Manifest& left,const Manifest& right) {
+  std::map<uint128_t,const Record*> index;
+  for(const auto& record:left.records)if(record.canonical)index.emplace(record.container,&record);
+  if(index.size()!=23)return false;
+  uint32_t canonical=0;
+  for(const auto& record:right.records) {
+    if(!record.canonical)continue;
+    canonical++;
+    const auto found=index.find(record.container); if(found==index.end())return false;
+    const auto& expected=*found->second;
+    if(expected.machine!=record.machine || expected.pid!=record.pid || expected.created!=record.created || expected.start!=record.start || expected.executableSHA!=record.executableSHA || expected.paramsSHA!=record.paramsSHA || expected.paramsPath!=record.paramsPath)return false;
+  }
+  return canonical==23;
+}
 inline bool samePlanTarget(const Plan& oldPlan,const Plan& successor) {
   if(oldPlan.operationID==successor.operationID || oldPlan.operationRoot==successor.operationRoot || oldPlan.clusterUUID!=successor.clusterUUID || oldPlan.identity!=successor.identity || oldPlan.registryRoot!=successor.registryRoot || oldPlan.runtimeRoot!=successor.runtimeRoot || oldPlan.statePath!=successor.statePath || oldPlan.secretsPath!=successor.secretsPath || oldPlan.oldRuntimeSHA!=successor.oldRuntimeSHA || oldPlan.oldBundleSHA!=successor.oldBundleSHA || oldPlan.machines.size()!=successor.machines.size())return false;
   for(size_t i=0;i<oldPlan.machines.size();++i)if(oldPlan.machines[i].uuid!=successor.machines[i].uuid || oldPlan.machines[i].linuxID!=successor.machines[i].linuxID || oldPlan.machines[i].address!=successor.machines[i].address)return false;
   return true;
+}
+inline bool sameContainedSuccessorTarget(const Plan& predecessor,const MothershipTidesDBMigrationReceipt& receipt,const Plan& successor) {
+  if(successor.oldRuntimeSHA!=str(receipt.newRuntimeSHA256) || successor.oldBundleSHA!=str(receipt.approvedBundleSHA256))return false;
+  Plan current=predecessor;
+  current.oldRuntimeSHA=successor.oldRuntimeSHA;
+  current.oldBundleSHA=successor.oldBundleSHA;
+  return samePlanTarget(current,successor);
 }
 inline void requirePreactivation(Execution& e,const Execution *successor=nullptr) {
   require(e.receipt.phase>=MothershipTidesDBMigrationPhase::writersQuiesced && !e.receipt.activationBoundaryCrossed,"retained action requires a fenced pre-activation operation");
@@ -261,7 +282,12 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         quiesceServiceCommand(true)+e.observeContainers()+"snapshot_containers > "+quote(e.remoteRoot+"/containers.contained")+"; sync -f "+quote(e.remoteRoot));
       return true;
     }
-    require(!fs::exists(containment),"activated recovery is contained; use a fresh retained recovery plan");
+    const bool predecessorContained=fs::exists(containment);
+    if(predecessorContained) {
+      privateFile(containment,4096);
+      require(read(containment)==e.plan.planSHA+"\n" && e.receipt.activationBoundaryCrossed && e.receipt.phase==MothershipTidesDBMigrationPhase::completed,"contained recovery receipt differs");
+    }
+    if(predecessorContained && std::strcmp(action,"supersede-preactivation")!=0)throw std::runtime_error("activated recovery is contained; use a fresh retained recovery plan");
     const auto superseded=e.plan.operationRoot+"/superseded-by";
     if(fs::exists(superseded)) { privateFile(superseded,4096); if(std::strcmp(action,"supersede-preactivation")!=0)throw std::runtime_error("retained operation was superseded before activation"); }
     if(std::strcmp(action,"retire-extras-preactivation")==0) {
@@ -286,16 +312,26 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
       require(successorDoc["retainedRecoveryMode"].get_bool().get(successorMode)==simdjson::SUCCESS && successorMode,"successor retained recovery mode required");
       const auto successorManifestPath=field(successorDoc,"retainedManifestPath"), successorManifestSHA=field(successorDoc,"retainedManifestSHA256"); pathCheck(successorManifestPath);
       require(digest(successorManifestPath)==successorManifestSHA,"successor retained manifest digest mismatch"); Manifest successorManifest=parseManifest(successorManifestPath,successorPlan);
-      require(sameRecordIdentity(manifest,successorManifest),"successor retained manifest does not seal the predecessor inventory");
-      require(successorPlan.planSHA!=e.plan.planSHA && samePlanTarget(e.plan,successorPlan) && !successorPlan.operationRoot.starts_with(e.plan.operationRoot+"/") && !e.plan.operationRoot.starts_with(successorPlan.operationRoot+"/"),"invalid retained successor identity");
+      require(predecessorContained ? sameCanonicalRecordIdentity(manifest,successorManifest) : sameRecordIdentity(manifest,successorManifest),"successor retained manifest does not preserve the predecessor canonical inventory");
+      require(successorPlan.planSHA!=e.plan.planSHA && (predecessorContained ? sameContainedSuccessorTarget(e.plan,e.receipt,successorPlan) : samePlanTarget(e.plan,successorPlan)) && !successorPlan.operationRoot.starts_with(e.plan.operationRoot+"/") && !e.plan.operationRoot.starts_with(successorPlan.operationRoot+"/"),"invalid retained successor identity");
       Execution successor(std::move(successorPlan)); successor.initialize(); require(successorManifest.request.bundleSHA==successor.receipt.approvedBundleSHA256,"successor retained manifest bundle mismatch");
-      requirePreactivation(e,&successor); verify(InventoryMode::sealed);
-      if(fs::exists(superseded))require(read(superseded)==successor.plan.planSHA+"\n","supersession selects another successor"); else durable(superseded,text(successor.plan.planSHA+"\n"));
       successor.cluster=e.cluster; for(auto& machine:successor.plan.machines) { resolveRegisteredMachine(successor.cluster,machine); successor.machines.emplace(machine.uuid,&machine); }
       require(successor.receipt.phase<=MothershipTidesDBMigrationPhase::writersQuiesced && !successor.receipt.activationBoundaryCrossed,"successor already crossed preparation");
-      successor.buildArtifactManifest(); successor.stageInheritedQuiesced(e);
+      if(predecessorContained) {
+        for(const auto& database:e.receipt.databases)require(database.swapped && e.exists(database,database.livePath) && e.exists(database,database.retainedV9Path) && !e.exists(database,database.preparedV10Path),"contained predecessor database state differs");
+        for(const auto& machine:e.plan.machines) {
+          const std::string fence="( test \"$(cat "+quote(e.fencePath())+")\" = "+quote(e.plan.planSHA)+" || test \"$(cat "+quote(successor.fencePath())+")\" = "+quote(successor.plan.planSHA)+" )";
+          e.run(machine.uuid,"test \"$(systemctl show -p MainPID --value prodigy)\" = 0; "+fence+
+                "; test \"$(sha256sum "+quote(e.plan.runtimeRoot+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(str(e.receipt.newRuntimeSHA256))+
+                "; test \"$(sha256sum "+quote(e.plan.runtimeRoot+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(str(e.receipt.approvedBundleSHA256)));
+        }
+      } else { requirePreactivation(e,&successor); verify(InventoryMode::sealed); }
+      for(auto& machine:successor.plan.machines)successor.run(machine.uuid,"test \"$(realpath -m "+quote(successor.remoteRoot)+")\" = "+quote(successor.remoteRoot)+"; umask 077; mkdir -p "+quote(successor.remoteRoot)+"; chmod 700 "+quote(successor.remoteRoot));
       for(auto& machine:successor.plan.machines)successor.upload(machine,successorManifestPath,successor.remoteRoot+"/retained-manifest.json");
-      durable(fs::path(successor.plan.operationRoot)/"inherited-preactivation",text(e.plan.planSHA+"\n"+manifestSHA+"\n"));
+      for(auto& machine:successor.plan.machines)successor.run(machine.uuid,inventoryProgram(successor.remoteRoot+"/retained-manifest.json",machine,InventoryMode::sealed));
+      if(fs::exists(superseded))require(read(superseded)==successor.plan.planSHA+"\n","supersession selects another successor"); else durable(superseded,text(successor.plan.planSHA+"\n"));
+      successor.buildArtifactManifest(); successor.stageInheritedQuiesced(e);
+      durable(fs::path(successor.plan.operationRoot)/(predecessorContained?"inherited-contained":"inherited-preactivation"),text(e.plan.planSHA+"\n"+manifestSHA+"\n"));
       require(successor.receipt.phase<=MothershipTidesDBMigrationPhase::writersQuiesced && !successor.receipt.activationBoundaryCrossed,"successor already crossed activation");
       successor.receipt.phase=MothershipTidesDBMigrationPhase::writersQuiesced; successor.persist(successor.receipt,nullptr); return true;
     }

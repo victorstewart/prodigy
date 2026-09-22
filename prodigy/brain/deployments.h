@@ -6161,7 +6161,11 @@ public:
         continue;
       }
 
-      if (recoveredStatelessContainerHostIsLive(container))
+      // A control outage or unready runtime is not proof that this canonical
+      // process died. Keep its owner until authoritative inventory resolves it
+      // or an explicit terminal machine lifecycle event releases it.
+      if (container->machine->state != MachineState::hardwareFailure &&
+          container->machine->state != MachineState::decommissioning)
       {
         continue;
       }
@@ -6207,7 +6211,6 @@ public:
       bool countsAsHealthy = (container->state == ContainerState::healthy);
       if (plan.isStateful == false && recoveredStatelessContainerHostIsLive(container) == false)
       {
-        countsAsDeployed = false;
         countsAsHealthy = false;
       }
 
@@ -9775,7 +9778,7 @@ public:
           case ApplicationLifetime::base:
             {
               nDeployedBase += 1;
-              if (container->state == ContainerState::healthy)
+              if (container->state == ContainerState::healthy && recoveredStatelessContainerHostIsLive(container))
               {
                 nHealthyBase += 1;
               }
@@ -9786,7 +9789,7 @@ public:
               // maybe we had more surge containers and lost some... but this will give us a rough approximation... and any missing will be created upon next loadStress
               nTargetSurge += 1;
               nDeployedSurge += 1;
-              if (container->state == ContainerState::healthy)
+              if (container->state == ContainerState::healthy && recoveredStatelessContainerHostIsLive(container))
               {
                 nHealthySurge += 1;
               }

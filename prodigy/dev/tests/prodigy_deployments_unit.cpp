@@ -9583,14 +9583,14 @@ int main(void)
     readyMachine.storageMB_available = 4096;
 
     ScopedSocketPair socket = {};
-    bool machineReady = socket.create(suite, "recoverAfterReboot_stale_stateless_fixture_socketpair") && armNeuronControlStream(readyMachine, socket);
+    bool machineReady = socket.create(suite, "recoverAfterReboot_terminal_stateless_fixture_socketpair") && armNeuronControlStream(readyMachine, socket);
 
     rack.machines.insert(&staleMachine);
     rack.machines.insert(&readyMachine);
     brain.machines.insert(&staleMachine);
     brain.machines.insert(&readyMachine);
 
-    suite.expect(machineReady, "recoverAfterReboot_stale_stateless_fixture_machine_ready");
+    suite.expect(machineReady, "recoverAfterReboot_terminal_stateless_fixture_machine_ready");
 
     ApplicationDeployment deployment;
     seedCommonPlan(deployment, false);
@@ -9622,6 +9622,7 @@ int main(void)
 
     if (machineReady)
     {
+      staleMachine.state = MachineState::hardwareFailure;
       deployment.recoverAfterReboot();
 
       ContainerView *replacement = nullptr;
@@ -9630,14 +9631,14 @@ int main(void)
         replacement = container;
       }
 
-      suite.expect(deployment.containers.size() == 1, "recoverAfterReboot_stale_stateless_replaces_one_container");
-      suite.expect(replacement && replacement->machine == &readyMachine, "recoverAfterReboot_stale_stateless_schedules_on_live_machine");
-      suite.expect(deployment.nDeployedBase == 1, "recoverAfterReboot_stale_stateless_restores_deployed_count");
-      suite.expect(deployment.nHealthyBase == 0, "recoverAfterReboot_stale_stateless_does_not_count_stale_healthy");
-      suite.expect(deployment.state == DeploymentState::deploying, "recoverAfterReboot_stale_stateless_enters_deploying");
-      suite.expect(deployment.waitingOnContainers.size() == 1, "recoverAfterReboot_stale_stateless_waits_for_replacement_health");
-      suite.expect(brain.containers.contains(oldUUID) == false, "recoverAfterReboot_stale_stateless_erases_old_brain_container");
-      suite.expect(readyMachine.neuron.pendingSend && readyMachine.neuron.wBuffer.size() > 0, "recoverAfterReboot_stale_stateless_queues_replacement_spin");
+      suite.expect(deployment.containers.size() == 1, "recoverAfterReboot_terminal_stateless_replaces_one_container");
+      suite.expect(replacement && replacement->machine == &readyMachine, "recoverAfterReboot_terminal_stateless_schedules_on_live_machine");
+      suite.expect(deployment.nDeployedBase == 1, "recoverAfterReboot_terminal_stateless_restores_deployed_count");
+      suite.expect(deployment.nHealthyBase == 0, "recoverAfterReboot_terminal_stateless_does_not_count_stale_healthy");
+      suite.expect(deployment.state == DeploymentState::deploying, "recoverAfterReboot_terminal_stateless_enters_deploying");
+      suite.expect(deployment.waitingOnContainers.size() == 1, "recoverAfterReboot_terminal_stateless_waits_for_replacement_health");
+      suite.expect(brain.containers.contains(oldUUID) == false, "recoverAfterReboot_terminal_stateless_erases_old_brain_container");
+      suite.expect(readyMachine.neuron.pendingSend && readyMachine.neuron.wBuffer.size() > 0, "recoverAfterReboot_terminal_stateless_queues_replacement_spin");
     }
 
     Vector<ContainerView *> cleanupContainers;
@@ -9655,8 +9656,9 @@ int main(void)
       }
     }
 
-    // An expected bundle exec temporarily drops the same control-stream fields
-    // as the dead-host fixture above, but must retain its authoritative owner.
+    // A bundle exec drops control-stream fields without terminal host loss.
+    // It must retain its authoritative owner.
+    staleMachine.state = MachineState::unresponsive;
     for (bool transientTransition : {true, false})
     {
       staleMachine.inBinaryUpdate = transientTransition;
@@ -10390,6 +10392,47 @@ int main(void)
 
     deployment.containers.erase(&base);
     deployment.containers.erase(&surge);
+    thisBrain = savedBrain;
+  }
+
+  {
+    ScopedFreshRing ring;
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+
+    ApplicationDeployment deployment;
+    seedCommonPlan(deployment, false);
+    deployment.plan.stateless.nBase = 1;
+    Machine machine = {};
+    machine.slug = "retained-unready-owner"_ctv;
+    machine.state = MachineState::unresponsive;
+    machine.lifetime = MachineLifetime::owned;
+
+    ContainerView canonical = {};
+    canonical.uuid = uint128_t(0x19011904);
+    canonical.deploymentID = deployment.plan.config.deploymentID();
+    canonical.applicationID = deployment.plan.config.applicationID;
+    canonical.machine = &machine;
+    canonical.lifetime = ApplicationLifetime::base;
+    canonical.state = ContainerState::scheduled;
+    deployment.containers.insert(&canonical);
+
+    deployment.evaluateAfterNewMaster();
+    suite.expect(deployment.containers.contains(&canonical), "evaluateAfterNewMaster_retains_unready_canonical_stateless_owner");
+    suite.expect(deployment.nTargetBase == 1 && deployment.nDeployedBase == 1 && deployment.toSchedule.empty(), "evaluateAfterNewMaster_unready_canonical_owner_has_no_replacement_deficit");
+    deployment.evaluateAfterNewMaster();
+    suite.expect(deployment.containers.contains(&canonical) && deployment.nDeployedBase == 1 && deployment.toSchedule.empty(), "evaluateAfterNewMaster_repeat_unready_canonical_owner_has_no_replacement");
+    machine.state = MachineState::missing;
+    deployment.evaluateAfterNewMaster();
+    suite.expect(deployment.containers.contains(&canonical) && deployment.nDeployedBase == 1 && deployment.toSchedule.empty(), "evaluateAfterNewMaster_transport_loss_keeps_canonical_owner_without_replacement");
+    canonical.state = ContainerState::healthy;
+    deployment.evaluateAfterNewMaster();
+    suite.expect(deployment.containers.contains(&canonical) && deployment.nDeployedBase == 1 && deployment.nHealthyBase == 0 && deployment.toSchedule.empty(), "evaluateAfterNewMaster_unready_owner_is_retained_without_claiming_health");
+    deployment.rebuildRecoveredContainerCounts();
+    suite.expect(deployment.nDeployedBase == 1 && deployment.nHealthyBase == 0, "recoverAfterReboot_unready_owner_counts_deployed_but_not_healthy");
+
+    deployment.containers.erase(&canonical);
     thisBrain = savedBrain;
   }
 

@@ -1,8 +1,8 @@
 # Retained-fleet recovery after the TidesDB format migration
 
 This explicit Mothership command repairs lost ownership for the frozen three-host
-fleet: 34 surviving processes, 23 canonical containers selected from the last
-verified healthy deployment, and 11 stateless extras. It is not a general reset.
+fleet: 23 canonical containers selected from the last verified healthy deployment
+and the exact surviving extras recorded in its sealed manifest. It is not a general reset.
 All lifecycle operations remain inside Mothership. Discombobulator supplies the
 approved runtime bundle. Never restore the v9 databases after v10 writers started.
 
@@ -79,7 +79,7 @@ before recording completion. It does not start a Brain or delete application dat
 
 If the existing preactivation plan names an older runtime, seal a successor plan
 with a new operation ID/root and corrected Discombobulator bundle. Keep the same
-cluster, machine, database, registry and old-runtime identities and the same 34
+cluster, machine, database, registry and old-runtime identities and the same
 process records. Invoke:
 
 ```sh
@@ -105,3 +105,15 @@ PID/start/executable/cgroup/parameter identity through a pidfd before signaling;
 no application directories are deleted. Reverify three Brains, 13 services,
 exactly 23 matching processes and three Hot replicas with 3 GiB limits and no
 observed crashes/OOMs. No recovery-command success is an application-health claim.
+
+If activation fails qualification, `contain-active` fences and stops only the
+three Brains, preserving current v10 databases and all container processes.
+It verifies the installed runtime against the activated operation receipt.
+Do not roll back databases after activation.
+
+A contained operation can then use `supersede-preactivation` with a fresh plan
+whose expected old hashes identify that activated runtime. The successor must
+preserve every canonical process identity; its separately sealed extras may
+differ. Mothership verifies the complete current inventory before handing over
+fences. The successor copies current live v10 databases, preserving intervening
+writes, and prepares new witnesses before any further activation.

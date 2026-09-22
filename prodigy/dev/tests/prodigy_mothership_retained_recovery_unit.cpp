@@ -61,6 +61,35 @@ int main()
 
   using namespace MothershipRetainedRecovery;
   assertRetainedBootstrapUnorderedMapRoundTrip();
+  // The sealed manifest owns its complete inventory count. A successor after
+  // containment can have different extras while retaining the canonical 23.
+  {
+    fs::create_directories(".run");
+    char directory[]=".run/retained-manifest-unit-XXXXXX";
+    assert(::mkdtemp(directory));
+    const std::string path=std::string(directory)+"/manifest.json";
+    Plan plan; plan.clusterUUID=7;
+    for(uint32_t machine=1;machine<=3;++machine) { MothershipTidesMigration::Machine selected; selected.uuid=machine; plan.machines.push_back(selected); }
+    for(uint32_t count:{23u,31u,34u}) {
+      std::string json="{\"schemaVersion\":1,\"clusterUUID\":\"0x7\",\"bundleSHA256\":\""+std::string(64,'a')+"\",\"machines\":[";
+      for(uint32_t machine=1;machine<=3;++machine) {
+        if(machine>1)json+=",";
+        json+="{\"machineUUID\":\"0x"+std::to_string(machine)+"\",\"machineFragment\":"+std::to_string(machine)+",\"records\":[";
+        bool first=true;
+        for(uint32_t index=machine-1;index<count;index+=3) {
+          if(!first)json+=",";first=false;
+          String id;id.snprintf<"{itoh}"_ctv>(uint128_t(index+100));
+          json+="{\"uuid\":\""+str(id)+"\",\"pid\":"+std::to_string(index+200)+",\"createdAtMs\":1,\"start\":\"1\",\"exeSHA256\":\""+std::string(64,'b')+"\",\"paramsSHA256\":\""+std::string(64,'c')+"\",\"paramsPath\":\"/private/params\",\"canonical\":"+(index<23?"true":"false")+"}";
+        }
+        json+="]}";
+      }
+      json+="]}";durable(path,text(json));
+      const auto manifest=parseManifest(path,plan);
+      assert(manifest.records.size()==count);
+    }
+    fs::remove_all(directory);
+  }
+
   Request request;request.clusterUUID=1;request.bundleSHA.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
   String bytes;BitseryEngine::serialize(bytes,request);Request decoded;
   assert(BitseryEngine::deserializeSafe(bytes,decoded) && decoded.clusterUUID==1 && decoded.bundleSHA==request.bundleSHA);
@@ -70,6 +99,22 @@ int main()
   assert(sameRecordIdentity(sealedManifest,successor));
   successor.records[0].pid++;
   assert(!sameRecordIdentity(sealedManifest,successor));
+  Manifest canonicalPredecessor = {}, canonicalSuccessor = {};
+  for (uint32_t index=0;index<23;++index) {
+    Record canonical = record;
+    canonical.container=100+index;
+    canonical.pid=200+index;
+    canonical.created=300+index;
+    canonicalPredecessor.records.push_back(canonical);
+    canonicalSuccessor.records.push_back(canonical);
+  }
+  Record differentExtra = record;
+  differentExtra.container=1000;
+  differentExtra.canonical=false;
+  canonicalSuccessor.records.push_back(differentExtra);
+  assert(sameCanonicalRecordIdentity(canonicalPredecessor,canonicalSuccessor));
+  canonicalSuccessor.records[0].start="changed";
+  assert(!sameCanonicalRecordIdentity(canonicalPredecessor,canonicalSuccessor));
   MothershipTidesMigration::Plan predecessorPlan = {}, successorPlan = {};
   predecessorPlan.operationID=1; successorPlan.operationID=2; predecessorPlan.operationRoot="/root/old"; successorPlan.operationRoot="/root/new";
   predecessorPlan.clusterUUID=7; successorPlan.clusterUUID=7; predecessorPlan.identity="7"; successorPlan.identity="7";
@@ -88,6 +133,15 @@ int main()
   }
   auto wrongMachine=successorPlan; wrongMachine.machines[0].linuxID[0]='f';
   assert(!samePlanTarget(predecessorPlan,wrongMachine));
+  MothershipTidesDBMigrationReceipt containedReceipt = {};
+  containedReceipt.newRuntimeSHA256=text(std::string(64,'c'));
+  containedReceipt.approvedBundleSHA256=text(std::string(64,'d'));
+  successorPlan.oldRuntimeSHA=std::string(64,'c');
+  successorPlan.oldBundleSHA=std::string(64,'d');
+  assert(sameContainedSuccessorTarget(predecessorPlan,containedReceipt,successorPlan));
+  successorPlan.oldBundleSHA=std::string(64,'e');
+  assert(!sameContainedSuccessorTarget(predecessorPlan,containedReceipt,successorPlan));
+  successorPlan.oldBundleSHA=std::string(64,'d');
   MothershipTidesMigration::Machine inventoryMachine = {}; inventoryMachine.uuid=1;
   assert(inventoryProgram("/sealed-manifest",inventoryMachine,InventoryMode::sealed).find("actual==expected")!=std::string::npos);
   assert(inventoryProgram("/sealed-manifest",inventoryMachine,InventoryMode::canonical).find("canonical_only=True")!=std::string::npos);
