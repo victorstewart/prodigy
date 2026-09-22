@@ -165,20 +165,86 @@ if [ -n "$loop" ]; then
 fi)SH"_ctv);
 }
 
-static inline void mothershipBuildProdigyStateWipeCommand(const String& stateDBPath, String& command)
+// Preserve only the migration-owned database backups before the ordinary reset
+// erases /var/lib/prodigy.  The destination name is the exact source basename
+// below a UUID-specific directory, so a retry can recognize an already moved
+// backup without widening cleanup to arbitrary state directories.
+static inline void mothershipAppendProdigyMigrationResetCleanupCommand(uint128_t clusterUUID, String& command)
+{
+  if (clusterUUID == 0) { command.append("echo 'cluster reset cleanup requires a cluster UUID' >&2; exit 1; "_ctv); return; }
+
+  String retainedRoot = {};
+  retainedRoot.snprintf<"/var/lib/prodigy-retained/{itoh}"_ctv>(clusterUUID);
+  command.append("umask 077; retained_root=/var/lib/prodigy-retained; cluster_retained_root="_ctv);
+  prodigyAppendShellSingleQuoted(command, retainedRoot);
+  command.append(R"SH(;
+for retained_directory in "$retained_root" "$cluster_retained_root"; do
+  test ! -L "$retained_directory" || { echo 'refusing retained directory symlink' >&2; exit 1; };
+  mkdir -p "$retained_directory";
+  test -d "$retained_directory" && test ! -L "$retained_directory" && test -O "$retained_directory" || { echo 'unsafe retained backup directory' >&2; exit 1; };
+  chmod 700 "$retained_directory";
+done;
+if test -d /var/lib/prodigy; then test "$(stat -c %d /var/lib/prodigy)" = "$(stat -c %d "$retained_root")" || { echo 'retained backup destination is not on the state filesystem' >&2; exit 1; }; fi;
+for source in /var/lib/prodigy/state.tidesdb9-* /var/lib/prodigy/state.secrets.tidesdb9-* /var/lib/prodigy/state.retained10-* /var/lib/prodigy/state.secrets.retained10-*; do
+  test -e "$source" || test ! -L "$source" || { echo 'refusing retained backup symlink' >&2; exit 1; };
+  test -e "$source" || continue;
+  name=${source##*/}; suffix=${name##*-};
+  case "${name%-*}" in state.tidesdb9|state.secrets.tidesdb9|state.retained10|state.secrets.retained10) ;; *) echo 'unsupported retained backup name' >&2; exit 1;; esac;
+  test "${#suffix}" = 16 || { echo 'unsupported retained backup suffix' >&2; exit 1; };
+  case "$suffix" in *[!0123456789abcdef]*) echo 'unsupported retained backup suffix' >&2; exit 1;; esac;
+  test -d "$source" && test ! -L "$source" && test -O "$source" || { echo 'unsafe retained backup source' >&2; exit 1; };
+  destination="$cluster_retained_root/$name";
+  if test -e "$destination" || test -L "$destination"; then
+    echo 'retained backup collision' >&2; exit 1;
+  fi;
+  mv -T "$source" "$destination" || { echo 'failed to preserve retained backup' >&2; exit 1; };
+done;
+sync -f "$cluster_retained_root"; if test -d /var/lib/prodigy; then sync -f /var/lib/prodigy; fi)SH"_ctv);
+}
+
+static inline void mothershipAppendProdigyMigrationFenceCleanupCommand(String& command)
+{
+  command.append(R"SH(dropin_directory=/etc/systemd/system/prodigy.service.d;
+removed_migration_dropin=0;
+for dropin in "$dropin_directory"/99-tidesdb-migration-????????????????.conf; do
+  test -e "$dropin" || test ! -L "$dropin" || { echo 'refusing migration drop-in symlink' >&2; exit 1; };
+  test -e "$dropin" || continue;
+  name=${dropin##*/}; suffix=${name#99-tidesdb-migration-}; suffix=${suffix%.conf};
+  case "$suffix" in *[!0123456789abcdef]*) echo 'refusing non-migration drop-in name' >&2; exit 1;; esac;
+  test -f "$dropin" && test ! -L "$dropin" && test -O "$dropin" || { echo 'unsafe migration drop-in' >&2; exit 1; };
+  fence=$(sed -n '2{s/^ConditionPathExists=!\(\/.*\/guest\/writers-fenced\)$/\1/p;}' "$dropin");
+  test -n "$fence" && printf '[Unit]\nConditionPathExists=!%s\n' "$fence" | cmp -s - "$dropin" || { echo 'refusing non-migration drop-in' >&2; exit 1; };
+  rm -- "$dropin" || { echo 'failed to remove migration drop-in' >&2; exit 1; };
+  removed_migration_dropin=1;
+done;
+if test "$removed_migration_dropin" = 1; then sync -f "$dropin_directory"; systemctl daemon-reload; fi
+)SH"_ctv);
+}
+
+static inline void mothershipBuildProdigyStateWipeCommand(const String& stateDBPath, uint128_t clusterUUID, String& command)
 {
   command.assign("set -eu; "_ctv);
   mothershipAppendProdigyOwnedStorageCleanupCommand(command);
-  command.append("; rm -rf /run/prodigy /var/lib/prodigy"_ctv);
-
-  constexpr static const char *defaultStatePrefix = "/var/lib/prodigy/";
-  if (stateDBPath.size() >= 17 && std::memcmp(stateDBPath.data(), defaultStatePrefix, 17) == 0)
-  {
-    return;
+  command.append("; "_ctv);
+  if (clusterUUID != 0) {
+    mothershipAppendProdigyMigrationResetCleanupCommand(clusterUUID, command);
+    command.append("; "_ctv);
   }
+  command.append("rm -rf /run/prodigy /var/lib/prodigy"_ctv);
+  constexpr static const char *defaultStatePrefix = "/var/lib/prodigy/";
+  if (stateDBPath.size() < 17 || std::memcmp(stateDBPath.data(), defaultStatePrefix, 17) != 0) {
+    command.append(" "_ctv);
+    prodigyAppendShellSingleQuoted(command, stateDBPath);
+  }
+  if (clusterUUID != 0) {
+    command.append("; "_ctv);
+    mothershipAppendProdigyMigrationFenceCleanupCommand(command);
+  }
+}
 
-  command.append(" "_ctv);
-  prodigyAppendShellSingleQuoted(command, stateDBPath);
+static inline void mothershipBuildProdigyStateWipeCommand(const String& stateDBPath, String& command)
+{
+  mothershipBuildProdigyStateWipeCommand(stateDBPath, 0, command);
 }
 
 static inline void mothershipBuildRemoteProdigyUninstallCommand(const MothershipProdigyCluster& cluster, String& command)

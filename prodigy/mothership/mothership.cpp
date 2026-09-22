@@ -7540,7 +7540,7 @@ private:
     basics_log("offlineDNSCleanupInventory success=1 payload=%s\n", encoded.c_str());
   }
 
-  bool stopAndWipeLocalProdigyInstance(String& failure)
+  bool stopAndWipeLocalProdigyInstance(const MothershipProdigyCluster& cluster, String& failure)
   {
     failure.clear();
 
@@ -7548,7 +7548,7 @@ private:
     resolveProdigyPersistentStateDBPath(stateDBPath);
 
     String command = {};
-    mothershipBuildProdigyStateWipeCommand(stateDBPath, command);
+    mothershipBuildProdigyStateWipeCommand(stateDBPath, cluster.clusterUUID, command);
     return prodigyRunLocalShellCommand(command, &failure);
   }
 
@@ -7570,7 +7570,7 @@ private:
     }
     else
     {
-      mothershipBuildProdigyStateWipeCommand(defaultProdigyPersistentStateDBPath(), command);
+      mothershipBuildProdigyStateWipeCommand(defaultProdigyPersistentStateDBPath(), cluster.clusterUUID, command);
     }
     bool ok = prodigyRunBlockingSSHCommand(session, fd, command, nullptr, &failure, 120'000);
     mothershipCloseSSHSession(session, fd);
@@ -7679,9 +7679,8 @@ private:
 
     bool stopAndWipeLocalMachine(const MothershipProdigyCluster& cluster, String *failure = nullptr) override
     {
-      (void)cluster;
       String localFailure = {};
-      bool ok = mothership->stopAndWipeLocalProdigyInstance(localFailure);
+      bool ok = mothership->stopAndWipeLocalProdigyInstance(cluster, localFailure);
       if (failure != nullptr)
       {
         *failure = localFailure;

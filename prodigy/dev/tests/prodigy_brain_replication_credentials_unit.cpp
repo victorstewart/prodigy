@@ -10749,11 +10749,18 @@ static void testUpdateProdigyRespondsBeforeSingleBrainTransition(TestSuite& suit
   brain.nBrains = 1;
   brain.weAreMaster = true;
   brain.noMasterYet = false;
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = brain.masterAuthorityRuntimeState.generation;
   Machine local = {};
   local.uuid = 0x7701;
   local.isThisMachine = true;
   local.isBrain = true;
+  local.runtimeReady = true;
   brain.machines.insert(&local);
+  // A normal Neuron stateUpload has already authenticated this empty local
+  // inventory. The update admission may checkpoint it without deriving work.
+  brain.persistedMachineInventoryUploaded.insert(local.uuid);
+  brain.persistedMachineStateUploadPlansByMachine.insert_or_assign(local.uuid, Vector<String>{});
 
   Mothership mothership = {};
   mothership.isFixedFile = true;
@@ -11243,6 +11250,7 @@ static void testWorkerStateUploadClearsOnlyValidatedExecFence(TestSuite& suite)
 static void testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(TestSuite& suite)
 {
   TestBrain brain = {};
+  brain.weAreMaster = true;
   Machine local = {};
   Machine first = {};
   Machine second = {};
@@ -11273,6 +11281,24 @@ static void testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(TestSuite&
   localContainer.createdAtMs = 12345;
   deployment.containers.insert(&localContainer);
   local.upsertContainerIndexEntry(localContainer.deploymentID, &localContainer);
+  brain.containers.insert_or_assign(localContainer.uuid, &localContainer);
+  // These are authenticated inventories from the normal Neuron stateUpload
+  // owner. The local machine has its retained container; workers are empty.
+  String serializedLocalInventoryPlan = {};
+  BitseryEngine::serialize(serializedLocalInventoryPlan,
+                           localContainer.generatePlan(deployment.plan, deployment.nShardGroups));
+  local.runtimeReady = true;
+  first.runtimeReady = true;
+  second.runtimeReady = true;
+  brain.persistedMachineInventoryUploaded.insert(local.uuid);
+  brain.persistedMachineInventoryUploaded.insert(first.uuid);
+  brain.persistedMachineInventoryUploaded.insert(second.uuid);
+  brain.persistedMachineStateUploadPlansByMachine.insert_or_assign(
+      local.uuid, Vector<String>{serializedLocalInventoryPlan});
+  brain.persistedMachineStateUploadPlansByMachine.insert_or_assign(first.uuid, Vector<String>{});
+  brain.persistedMachineStateUploadPlansByMachine.insert_or_assign(second.uuid, Vector<String>{});
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = brain.masterAuthorityRuntimeState.generation;
   const String digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
   brain.updateSelfWorkerExpectedBundleSHA256 = digest;
   brain.updateSelfWorkerMachineUUIDs.insert(first.uuid);
@@ -11373,6 +11399,7 @@ static void testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(TestSuite&
   brain.activeMotherships.erase(&mothership);
   local.removeContainerIndexEntry(localContainer.deploymentID, &localContainer);
   deployment.containers.erase(&localContainer);
+  brain.containers.erase(localContainer.uuid);
   brain.deployments.erase(deployment.plan.config.deploymentID());
   brain.machines.erase(&local);
   brain.machines.erase(&first);
@@ -21425,6 +21452,7 @@ static void testMachineHealthyDefersStatelessRecoveryUntilInventoryComplete(Test
   brain.iaas = &iaas;
   brain.weAreMaster = true;
   brain.recoveringPersistedNeuronInventory = true;
+  brain.brainConfig.datacenterFragment = 1;
 
   BrainBase *previousBrain = thisBrain;
   thisBrain = &brain;
@@ -21447,6 +21475,7 @@ static void testMachineHealthyDefersStatelessRecoveryUntilInventoryComplete(Test
   awaitingInventory.private4 = IPAddress("10.0.0.92", false).v4;
   awaitingInventory.state = MachineState::deploying;
   awaitingInventory.runtimeReady = false;
+  awaitingInventory.fragment = 0x1237;
   awaitingInventory.rack = &rack;
   awaitingInventory.rackUUID = rack.uuid;
   awaitingInventory.lifetime = MachineLifetime::owned;
@@ -21491,15 +21520,32 @@ static void testMachineHealthyDefersStatelessRecoveryUntilInventoryComplete(Test
                    awaitingInventory.containersByDeploymentID.contains(deployment.plan.config.deploymentID()),
                "machine_healthy_inventory_recovery_keeps_unreported_machine_index");
 
-  // finalizePersistedNeuronInventoryRecovery clears this flag only after every
-  // live machine has uploaded. The normal healthy path must still recover once
-  // that existing barrier has completed.
+  // Clearing the barrier is not proof that the other Neuron lost this
+  // retained process. Preserve it until that machine supplies the existing
+  // authenticated stateUpload which omits the UUID.
   brain.recoveringPersistedNeuronInventory = false;
   uploaded.state = MachineState::deploying;
   brain.handleMachineStateChange(&uploaded, MachineState::healthy);
+  suite.expect(brain.containers.contains(retainedUUID),
+               "machine_healthy_inventory_recovery_preserves_unready_owner_without_upload");
 
-  suite.expect(brain.containers.contains(retainedUUID) == false,
-               "machine_healthy_inventory_recovery_resumes_after_inventory_complete");
+  String emptyInventoryUpload = {};
+  uint32_t headerOffset = Message::appendHeader(emptyInventoryUpload, NeuronTopic::stateUpload);
+  local_container_subnet6 fragment = {};
+  fragment.dpfx = brain.brainConfig.datacenterFragment;
+  fragment.mpfx[0] = static_cast<uint8_t>((awaitingInventory.fragment >> 16) & 0xff);
+  fragment.mpfx[1] = static_cast<uint8_t>((awaitingInventory.fragment >> 8) & 0xff);
+  fragment.mpfx[2] = static_cast<uint8_t>(awaitingInventory.fragment & 0xff);
+  Message::appendAlignedBuffer<Alignment::one>(emptyInventoryUpload,
+                                                reinterpret_cast<const uint8_t *>(&fragment),
+                                                sizeof(fragment));
+  Message::finish(emptyInventoryUpload, headerOffset);
+  brain.neuronHandler(&awaitingInventory.neuron,
+                      reinterpret_cast<Message *>(emptyInventoryUpload.data()));
+
+  suite.expect(brain.containers.contains(retainedUUID) == false &&
+                   brain.persistedMachineInventoryUploaded.contains(awaitingInventory.uuid),
+               "machine_healthy_inventory_recovery_resumes_after_authenticated_empty_inventory");
 
   if (auto it = brain.containers.find(retainedUUID); it != brain.containers.end())
   {
@@ -23610,6 +23656,142 @@ static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(Tes
   brain.machinesByUUID.erase(machine.uuid);
   brain.machines.erase(&machine);
   thisBrain = previousBrain;
+}
+
+static void testBundleCheckpointCapturesOnlyAcknowledgedNeuronInventory(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+  TestBrain brain = {};
+  brain.weAreMaster = true;
+  brain.brainConfig.datacenterFragment = 1;
+  brain.masterAuthorityRuntimeState.generation = 9;
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = 9;
+  brain.updateSelfWorkerExpectedBundleSHA256 =
+      "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"_ctv;
+
+  Machine machine = {};
+  machine.uuid = uint128_t(0x5218'0001);
+  machine.fragment = 1;
+  machine.runtimeReady = true;
+  brain.machines.insert(&machine);
+  brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+  brain.persistedMachineInventoryUploaded.insert(machine.uuid);
+
+  DeploymentPlan deploymentPlan = makeDeploymentPlan(0x5218, 1);
+  deploymentPlan.config.type = ApplicationType::stateless;
+  const uint64_t deploymentID = deploymentPlan.config.deploymentID();
+  ApplicationDeployment deployment = {};
+  deployment.plan = deploymentPlan;
+  deployment.state = DeploymentState::running;
+  brain.deployments.insert_or_assign(deploymentID, &deployment);
+  brain.deploymentsByApp.insert_or_assign(deploymentPlan.config.applicationID, &deployment);
+
+  ContainerPlan uploadedPlan = {};
+  uploadedPlan.uuid = uint128_t(0x5218'1001);
+  uploadedPlan.config = deploymentPlan.config;
+  uploadedPlan.state = ContainerState::scheduled;
+  uploadedPlan.runtimeReady = true;
+  uploadedPlan.fragment = 1;
+  String serializedUploadedPlan = {};
+  BitseryEngine::serialize(serializedUploadedPlan, uploadedPlan);
+  brain.persistedMachineStateUploadPlansByMachine.insert_or_assign(machine.uuid,
+                                                                    Vector<String>{serializedUploadedPlan});
+
+  ContainerView uploaded = {};
+  uploaded.uuid = uploadedPlan.uuid;
+  uploaded.deploymentID = deploymentID;
+  uploaded.applicationID = deploymentPlan.config.applicationID;
+  uploaded.machine = &machine;
+  uploaded.lifetime = ApplicationLifetime::base;
+  uploaded.state = ContainerState::scheduled;
+  deployment.containers.insert(&uploaded);
+  machine.upsertContainerIndexEntry(deploymentID, &uploaded);
+  brain.containers.insert_or_assign(uploaded.uuid, &uploaded);
+
+  // This is a scheduler-only owner absent from the Neuron's authenticated
+  // stateUpload. It must never become a durable bundle checkpoint bootstrap.
+  ContainerView planned = {};
+  planned.uuid = uint128_t(0x5218'1002);
+  planned.deploymentID = deploymentID;
+  planned.applicationID = deploymentPlan.config.applicationID;
+  planned.machine = &machine;
+  planned.lifetime = ApplicationLifetime::base;
+  planned.state = ContainerState::planned;
+  deployment.containers.insert(&planned);
+  machine.upsertContainerIndexEntry(deploymentID, &planned);
+  brain.containers.insert_or_assign(planned.uuid, &planned);
+
+  BrainView peer = {};
+  peer.uuid = uint128_t(0x5218'0002);
+  peer.boottimens = 52'180;
+  peer.connected = true;
+  peer.registrationFresh = true;
+  peer.isFixedFile = true;
+  peer.isMasterBrain = true;
+  peer.fslot = 52;
+  brain.brains.insert(&peer);
+  Brain::MasterAuthorityReplicationPeerState tracking = {};
+  tracking.uuid = peer.uuid;
+  tracking.bootNs = peer.boottimens;
+  tracking.acknowledgedGeneration = 8;
+  brain.masterAuthorityReplicationByPeer.insert_or_assign(&peer, tracking);
+
+  suite.expect(brain.prepareLocalBundleExecRecovery() == false &&
+                   brain.updateSelfMachineRecoveryWitnesses.empty(),
+               "bundle_checkpoint_requires_current_authority_ack_before_new_witness");
+
+  // Normal registration/reconnect replay still owns scheduled UUID delivery;
+  // it must not depend on a prior authenticated stateUpload cache.
+  Vector<String> normalReplay = {};
+  suite.require(brain.collectNeuronStateUploadBootstraps(&machine, normalReplay) && normalReplay.size() == 2,
+                "normal_state_upload_replay_preserves_scheduled_uuid_without_authenticated_cache");
+
+  brain.masterAuthorityReplicationByPeer[&peer].acknowledgedGeneration = 9;
+  suite.expect(brain.prepareLocalBundleExecRecovery() == false &&
+                   brain.updateSelfMachineRecoveryWitnesses.empty() &&
+                   brain.persistedMachineInventoryUploaded.contains(machine.uuid) == false &&
+                   machine.runtimeReady == false,
+               "bundle_checkpoint_requests_fresh_upload_when_canonical_membership_changed");
+
+  // Model the established stateUpload owner removing the unmaterialized view
+  // and accepting the Neuron's fresh exact inventory before the retry.
+  deployment.containers.erase(&planned);
+  machine.removeContainerIndexEntry(deploymentID, &planned);
+  brain.containers.erase(planned.uuid);
+  brain.persistedMachineStateUploadPlansByMachine.insert_or_assign(machine.uuid,
+                                                                    Vector<String>{serializedUploadedPlan});
+  brain.persistedMachineInventoryUploaded.insert(machine.uuid);
+  machine.runtimeReady = true;
+  suite.require(brain.prepareLocalBundleExecRecovery(),
+                "bundle_checkpoint_accepts_fresh_authenticated_exact_inventory");
+  const bool capturedOneAuthenticatedPlan =
+      brain.updateSelfMachineRecoveryWitnesses.size() == 1 &&
+      brain.updateSelfMachineRecoveryWitnesses[0].containerBootstraps.size() == 1;
+  suite.require(capturedOneAuthenticatedPlan,
+                "bundle_checkpoint_serializes_one_authoritative_neuron_plan");
+  if (capturedOneAuthenticatedPlan)
+  {
+    NeuronContainerBootstrap captured = {};
+    const bool decoded = BitseryEngine::deserializeSafe(
+        brain.updateSelfMachineRecoveryWitnesses[0].containerBootstraps[0], captured);
+    suite.require(decoded, "bundle_checkpoint_serialized_neuron_plan_decodes");
+    if (decoded)
+    {
+      suite.expect(captured.plan.uuid == uploadedPlan.uuid,
+                   "bundle_checkpoint_excludes_unmaterialized_scheduler_view");
+    }
+  }
+
+  brain.masterAuthorityReplicationByPeer.erase(&peer);
+  brain.brains.erase(&peer);
+  deployment.containers.erase(&uploaded);
+  machine.removeContainerIndexEntry(deploymentID, &uploaded);
+  brain.containers.erase(uploaded.uuid);
+  brain.deploymentsByApp.erase(deploymentPlan.config.applicationID);
+  brain.deployments.erase(deploymentID);
+  brain.machinesByUUID.erase(machine.uuid);
+  brain.machines.erase(&machine);
 }
 
 static void testReplicatedAllMachineBundleRecoveryWitnessIsUUIDIndexed(TestSuite& suite)
@@ -26170,6 +26352,7 @@ int main(void)
       only != nullptr && strcmp(only, "local-bundle-recovery-ordering") == 0)
   {
     testLocalBundleRecoveryWaitsForCapturedInventory(suite);
+    testBundleCheckpointCapturesOnlyAcknowledgedNeuronInventory(suite);
     testReplicatedAllMachineBundleRecoveryWitnessIsUUIDIndexed(suite);
     testReplicatedLocalBundleRecoveryWitnessIsDurableAndBounded(suite);
     testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(suite);
@@ -26603,6 +26786,7 @@ int main(void)
   testBrainNeuronRegistrationRefreshesWorkerAfterBundleTransition(suite);
   testPersistedLocalBrainRefreshBypassesIgnition(suite);
   testLocalBundleRecoveryWaitsForCapturedInventory(suite);
+  testBundleCheckpointCapturesOnlyAcknowledgedNeuronInventory(suite);
   testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(suite);
   testBrainNeuronHandlerReportsHardwareFailureAndDecommissionsMachine(suite);
   testBrainMachineStateMissingEscalatesWhenSshBudgetExhausted(suite);

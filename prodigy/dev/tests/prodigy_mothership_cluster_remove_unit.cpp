@@ -345,6 +345,76 @@ esac
   return okay;
 }
 
+static bool runMigrationResetCleanupFixture(const char *scenario)
+{
+  char templatePath[] = "/tmp/prodigy-migration-reset-unit-XXXXXX";
+  char *rootPath = ::mkdtemp(templatePath);
+  if (rootPath == nullptr) return false;
+  std::string root(rootPath);
+  std::string state = root + "/varlib";
+  std::string retained = root + "/retained";
+  std::string dropins = root + "/dropins";
+  std::string fake = root + "/fake";
+  std::string source = state + "/state.retained10-0123456789abcdef";
+  std::string destination = retained + "/0x1234/state.retained10-0123456789abcdef";
+  ::mkdir(state.c_str(), 0700); ::mkdir(dropins.c_str(), 0700); ::mkdir(fake.c_str(), 0700);
+  std::ofstream systemctl(fake + "/systemctl"); systemctl << "#!/bin/sh\necho \"$*\" >>\"$MIGRATION_TEST_ROOT/systemctl.log\"\n"; systemctl.close();
+  ::chmod((fake + "/systemctl").c_str(), 0700);
+  std::ofstream crashEvidence(dropins + "/20-nametag-crash-evidence.conf"); crashEvidence << "[Service]\nEnvironment=keep=1\n"; crashEvidence.close();
+  std::ofstream migrationFence(dropins + "/99-tidesdb-migration-0123456789abcdef.conf"); migrationFence << "[Unit]\nConditionPathExists=!" << root << "/migration/guest/writers-fenced\n"; migrationFence.close();
+
+  if (std::string(scenario) == "symlink")
+  {
+    std::string target = root + "/outside";
+    ::mkdir(target.c_str(), 0700);
+    if (::symlink(target.c_str(), source.c_str()) != 0) { (void)::system(("/bin/rm -rf " + shellQuote(root)).c_str()); return false; }
+  }
+  else
+  {
+    ::mkdir(source.c_str(), 0700);
+    std::ofstream payload(source + "/payload", std::ios::binary); payload << "retained migration bytes"; payload.close();
+  }
+  if (std::string(scenario) == "collision")
+  {
+    ::mkdir(retained.c_str(), 0700); ::mkdir((retained + "/0x1234").c_str(), 0700); ::mkdir(destination.c_str(), 0700);
+  }
+
+  struct stat before = {};
+  bool captured = std::string(scenario) == "normal" && ::stat((source + "/payload").c_str(), &before) == 0;
+  String reset = {}, fence = {};
+  mothershipAppendProdigyMigrationResetCleanupCommand(uint128_t(0x1234), reset);
+  mothershipAppendProdigyMigrationFenceCleanupCommand(fence);
+  std::string command = "set -eu; "; String resetCopy = reset, fenceCopy = fence; command += resetCopy.c_str(); command += "; "; command += fenceCopy.c_str();
+  replaceAll(command, "/var/lib/prodigy-retained", retained);
+  replaceAll(command, "/var/lib/prodigy", state);
+  replaceAll(command, "/etc/systemd/system/prodigy.service.d", dropins);
+  auto invoke = [&]() { return ::system(("PATH=" + shellQuote(fake) + ":/usr/bin:/bin MIGRATION_TEST_ROOT=" + shellQuote(root) + " /bin/sh -c " + shellQuote(command)).c_str()) == 0; };
+  bool first = invoke();
+  bool okay = false;
+  if (std::string(scenario) == "normal")
+  {
+    struct stat after = {};
+    std::ifstream payload(destination + "/payload", std::ios::binary); std::string bytes((std::istreambuf_iterator<char>(payload)), {});
+    bool firstState = captured && first && ::stat((destination + "/payload").c_str(), &after) == 0 && before.st_ino == after.st_ino && bytes == "retained migration bytes" &&
+                      ::access(source.c_str(), F_OK) != 0 && ::access((dropins + "/99-tidesdb-migration-0123456789abcdef.conf").c_str(), F_OK) != 0 &&
+                      ::access((dropins + "/20-nametag-crash-evidence.conf").c_str(), F_OK) == 0;
+    struct stat retry = {};
+    bool simulatedWipe = ::rmdir(state.c_str()) == 0;
+    okay = firstState && simulatedWipe && invoke() && ::stat((destination + "/payload").c_str(), &retry) == 0 && retry.st_ino == before.st_ino;
+  }
+  else if (std::string(scenario) == "symlink")
+  {
+    okay = first == false && ::access(source.c_str(), F_OK) == 0 && ::access(destination.c_str(), F_OK) != 0;
+  }
+  else
+  {
+    okay = first == false && ::access(source.c_str(), F_OK) == 0 && ::access(destination.c_str(), F_OK) == 0;
+  }
+  if (!okay) std::fprintf(stderr, "migration reset fixture failed scenario=%s first=%d command=%s\n", scenario, int(first), command.c_str());
+  (void)::system(("/bin/rm -rf " + shellQuote(root)).c_str());
+  return okay;
+}
+
 int main(void)
 {
   TestSuite suite;
@@ -439,6 +509,12 @@ int main(void)
     suite.expect(runStorageCleanupScript(command, "cgroup-kill-fail", false, false, false), "remove_owned_cgroup_kill_failure_refuses_storage_wipe");
     suite.expect(runStorageCleanupScript(command, "cgroup-remains", false, false, false), "remove_owned_cgroup_remaining_processes_refuse_storage_wipe");
     suite.expect(runStorageCleanupScript(command, "cgroup-read-fail", false, false, false), "remove_owned_cgroup_read_failure_refuses_storage_wipe");
+  }
+
+  {
+    suite.expect(runMigrationResetCleanupFixture("normal"), "remove_reset_preserves_backup_bytes_and_inode_removes_only_fence_and_is_idempotent");
+    suite.expect(runMigrationResetCleanupFixture("symlink"), "remove_reset_rejects_retained_backup_symlink");
+    suite.expect(runMigrationResetCleanupFixture("collision"), "remove_reset_rejects_retained_backup_collision");
   }
 
   {

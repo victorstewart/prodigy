@@ -1172,8 +1172,11 @@ public:
   bool recoveringPersistedNeuronInventory = false;
   bool persistedMachineInventoryEnumerated = false;
   // A runtime-ready Neuron has acknowledged its network assignment, but only
-  // stateUpload establishes its authoritative live-container inventory.
+  // stateUpload establishes its authoritative live-container inventory. Keep
+  // the exact accepted plans separately from scheduler indexes: planned views
+  // can survive an upload that did not observe a corresponding process.
   bytell_hash_set<uint128_t> persistedMachineInventoryUploaded;
+  bytell_hash_map<uint128_t, Vector<String>> persistedMachineStateUploadPlansByMachine;
   // Control loss cannot establish that a scheduled launch died. Hold its
   // canonical owner until one authenticated post-reconnect inventory can
   // either re-adopt it or ask Neuron to resolve that exact UUID.
@@ -12589,7 +12592,7 @@ public:
 
         if (recoveringPersistedNeuronInventory && neuron->machine != nullptr)
         {
-          persistedMachineInventoryUploaded.erase(neuron->machine->uuid);
+          discardPersistedMachineStateUploadInventory(neuron->machine);
         }
         // A new control transport has no delivery proof for any launch frame
         // discarded with the previous generation. Always obtain a fresh
@@ -14080,7 +14083,7 @@ public:
       if (neuron->machine != nullptr)
       {
         Machine *machine = neuron->machine;
-        persistedMachineInventoryUploaded.erase(machine->uuid);
+        discardPersistedMachineStateUploadInventory(machine);
         // A transport close says nothing about a scheduled process: the
         // spinContainer frame may have reached Neuron and the process may be
         // live. Do not treat the machine as schedulable until its replacement
@@ -14268,6 +14271,20 @@ public:
     }
   }
 
+  void discardPersistedMachineStateUploadInventory(Machine *machine)
+  {
+    if (machine == nullptr || machine->uuid == 0)
+    {
+      return;
+    }
+    persistedMachineInventoryUploaded.erase(machine->uuid);
+    persistedMachineStateUploadPlansByMachine.erase(machine->uuid);
+  }
+
+  // Normal registration/state-upload replay is scheduler-owned. It must retain
+  // the original generated-plan path so a fresh Neuron, or a post-close replay
+  // of a scheduled UUID, can receive its first bootstrap before any accepted
+  // stateUpload exists.
   bool collectNeuronStateUploadBootstraps(Machine *machine, Vector<String>& serializedBootstraps)
   {
     serializedBootstraps.clear();
@@ -14276,7 +14293,7 @@ public:
       return false;
     }
 
-    for (const auto& [deploymentID, containers] : machine->containersByDeploymentID)
+    for (const auto& [deploymentID, machineContainers] : machine->containersByDeploymentID)
     {
       auto deploymentIt = deployments.find(deploymentID);
       if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
@@ -14297,7 +14314,7 @@ public:
             deployment->generateReport());
         return false;
       }
-      for (ContainerView *container : containers)
+      for (ContainerView *container : machineContainers)
       {
         if (container == nullptr)
         {
@@ -14332,17 +14349,87 @@ public:
     return true;
   }
 
+  // A bundle-exec checkpoint has a stricter provenance requirement than a
+  // normal registration replay: it may capture only Neuron-authenticated
+  // stateUpload records, and only while their complete UUID set still equals
+  // the canonical machine index. A membership change makes this return false;
+  // the caller requests the established fresh stateUpload before retrying.
+  bool collectAuthenticatedNeuronStateUploadBootstraps(Machine *machine, Vector<String>& serializedBootstraps)
+  {
+    serializedBootstraps.clear();
+    if (machine == nullptr || machine->uuid == 0 || machine->runtimeReady == false ||
+        persistedMachineInventoryUploaded.contains(machine->uuid) == false)
+    {
+      return false;
+    }
+    const auto uploaded = persistedMachineStateUploadPlansByMachine.find(machine->uuid);
+    if (uploaded == persistedMachineStateUploadPlansByMachine.end())
+    {
+      return false;
+    }
+
+    bytell_hash_set<uint128_t> canonical = {};
+    for (const auto& [deploymentID, machineContainers] : machine->containersByDeploymentID)
+    {
+      for (const ContainerView *container : machineContainers)
+      {
+        if (container == nullptr || container->uuid == 0 || container->machine != machine ||
+            container->deploymentID != deploymentID || canonical.insert(container->uuid).second == false)
+        {
+          return false;
+        }
+      }
+    }
+
+    bytell_hash_set<uint128_t> seen = {};
+    for (const String& serializedPlan : uploaded->second)
+    {
+      ContainerPlan plan = {};
+      if (BitseryEngine::deserializeSafe(serializedPlan, plan) == false || plan.uuid == 0 ||
+          canonical.contains(plan.uuid) == false || seen.insert(plan.uuid).second == false)
+      {
+        return false;
+      }
+      auto deploymentIt = deployments.find(plan.config.deploymentID());
+      if (deploymentIt == deployments.end() || deploymentIt->second == nullptr)
+      {
+        return false;
+      }
+      ApplicationDeployment *deployment = deploymentIt->second;
+      auto indexed = containers.find(plan.uuid);
+      if (indexed == containers.end() || indexed->second == nullptr || indexed->second->machine != machine ||
+          indexed->second->deploymentID != plan.config.deploymentID())
+      {
+        return false;
+      }
+      String credentialFailure = {};
+      if (deploymentApiCredentialsAvailableForLaunch(deployment->plan, &credentialFailure) == false)
+      {
+        deployment->state = DeploymentState::failed;
+        this->deploymentFailed(
+            deployment,
+            deployment->plan.config.applicationID,
+            deployment->plan.config.deploymentID(),
+            credentialFailure.size() ? credentialFailure : String("credential policy unavailable for container replay"_ctv),
+            deployment->generateReport());
+        return false;
+      }
+      NeuronContainerBootstrap bootstrap = {};
+      bootstrap.plan = plan;
+      bootstrap.metricPolicy = deriveNeuronMetricPolicyForDeployment(deployment->plan);
+      String serializedBootstrap = {};
+      BitseryEngine::serialize(serializedBootstrap, bootstrap);
+      serializedBootstraps.push_back(std::move(serializedBootstrap));
+    }
+    return seen.size() == canonical.size();
+  }
+
   void queueNeuronStateUploadForMachine(Machine *machine)
   {
     if (machine == nullptr || brainConfig.datacenterFragment == 0 || machine->fragment == 0)
     {
       return;
     }
-
-    machine->reportedDatacenterFragment = 0;
-    machine->reportedFragment = 0;
-    persistedMachineInventoryUploaded.erase(machine->uuid);
-    machine->runtimeReady = false;
 
     uint32_t headerOffset = Message::appendHeader(machine->neuron.wBuffer, NeuronTopic::stateUpload);
 
@@ -14364,6 +14451,10 @@ public:
     {
       // A partial all-machine checkpoint must never turn into an empty upload
       // that releases the persisted-inventory barrier and schedules duplicates.
+      machine->reportedDatacenterFragment = 0;
+      machine->reportedFragment = 0;
+      discardPersistedMachineStateUploadInventory(machine);
+      machine->runtimeReady = false;
       machine->neuron.wBuffer.resize(headerOffset);
       return;
     }
@@ -14376,6 +14467,12 @@ public:
       bootstraps = &liveBootstraps;
     }
 
+    // Read the last accepted inventory before invalidating it for this new
+    // request. No checkpoint may use it until the fresh upload succeeds.
+    machine->reportedDatacenterFragment = 0;
+    machine->reportedFragment = 0;
+    discardPersistedMachineStateUploadInventory(machine);
+    machine->runtimeReady = false;
     if (bootstraps == nullptr)
     {
       machine->neuron.wBuffer.resize(headerOffset);
@@ -19275,6 +19372,7 @@ public:
       recoveringPersistedNeuronInventory = true;
       persistedMachineInventoryEnumerated = false;
       persistedMachineInventoryUploaded.clear();
+      persistedMachineStateUploadPlansByMachine.clear();
       recoveredNeuronPairingsUnified = false;
     }
 
@@ -19457,7 +19555,7 @@ public:
                 machine->state != MachineState::decommissioning &&
                 neuronControlStreamActive(machine))
             {
-              persistedMachineInventoryUploaded.erase(machine->uuid);
+              discardPersistedMachineStateUploadInventory(machine);
               Message::construct(nv->wBuffer, NeuronTopic::registration, true);
               Ring::queueSend(nv);
             }
@@ -21069,7 +21167,7 @@ public:
     neuron->reconnectAfterClose = false;
     neuron->connected = false;
     neuron->cancelSuspended();
-    persistedMachineInventoryUploaded.erase(machine->uuid);
+    discardPersistedMachineStateUploadInventory(machine);
     machinesAwaitingPostCloseInventory.erase(machine->uuid);
 
     machines.erase(machine);
@@ -25409,6 +25507,30 @@ public:
     queueUpdateSelfBundleToPendingPeers();
   }
 
+  bool masterAuthorityRuntimeStateAcknowledgedByRegisteredPeers()
+  {
+    if (weAreMaster == false || masterAuthorityRuntimeStateDurable == false ||
+        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation)
+    {
+      return false;
+    }
+    for (BrainView *peer : brains)
+    {
+      if (peerCanReplicateMasterAuthorityState(peer) == false)
+      {
+        return false;
+      }
+      const auto tracking = masterAuthorityReplicationByPeer.find(peer);
+      if (tracking == masterAuthorityReplicationByPeer.end() || tracking->second.uuid != peer->uuid ||
+          tracking->second.bootNs != peer->boottimens ||
+          tracking->second.acknowledgedGeneration < masterAuthorityRuntimeState.generation)
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
   bool updateSelfRecoveryWitnessAcknowledgedByPeers(
       const bytell_hash_set<uint128_t>& requiredPeerKeys) const
   {
@@ -25775,6 +25897,11 @@ public:
       updateSelfWorkerFailure.assign("persisted machine inventory is incomplete for bundle exec"_ctv);
       return false;
     }
+    if (masterAuthorityRuntimeStateAcknowledgedByRegisteredPeers() == false)
+    {
+      updateSelfWorkerFailure.assign("current master authority is not durably acknowledged by every registered peer"_ctv);
+      return false;
+    }
     // A master can be replaced while its peers exec the same bundle.  Capture
     // every machine through the established Neuron plan collector before the
     // transition, so a promoted successor can require each retained inventory
@@ -25795,9 +25922,14 @@ public:
       }
       ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
       witness.machineUUID = machine->uuid;
-      if (collectNeuronStateUploadBootstraps(machine, witness.containerBootstraps) == false)
+      if (collectAuthenticatedNeuronStateUploadBootstraps(machine, witness.containerBootstraps) == false)
       {
-        updateSelfWorkerFailure.assign("machine container ownership could not be captured for bundle exec"_ctv);
+        // A normal stateUpload remains the single owner of inventory refresh.
+        // Do not checkpoint a stale or scheduler-derived view; ask Neuron for
+        // its current authenticated inventory and let the existing retry path
+        // attempt this operation again after the reply.
+        queueNeuronStateUploadForMachine(machine);
+        updateSelfWorkerFailure.assign("machine container ownership needs a fresh authenticated stateUpload for bundle exec"_ctv);
         return false;
       }
       witnesses.push_back(std::move(witness));
@@ -25842,6 +25974,7 @@ public:
     // deficit and create a replacement alongside the retained process.
     recoveringPersistedNeuronInventory = true;
     persistedMachineInventoryUploaded.clear();
+    persistedMachineStateUploadPlansByMachine.clear();
     recoveredNeuronPairingsUnified = false;
     return true;
   }
@@ -33442,7 +33575,7 @@ public:
         }
       case NeuronTopic::stateUpload:
         {
-          persistedMachineInventoryUploaded.erase(neuron->machine->uuid);
+          discardPersistedMachineStateUploadInventory(neuron->machine);
 
           // fragment(4) [containerPlan{4} + runtimeCores(2) + runtimeMemMB(4) + runtimeStorMB(4)]...
 
@@ -33466,6 +33599,7 @@ public:
           bool malformedStateUpload = false;
           bytell_hash_set<uint128_t> reportedMachineContainerUUIDs = {};
           bytell_hash_set<uint32_t> reportedMachineContainerFragments = {};
+          Vector<String> acceptedStateUploadPlans = {};
           if (persistedRecoveryMustAwaitReportedMachineFragment(neuron->machine))
           {
             bool fragmentProven = neuron->machine->uuid != 0 && brainConfig.datacenterFragment != 0 &&
@@ -33643,6 +33777,9 @@ public:
             {
               continue;
             }
+            String acceptedPlan = {};
+            acceptedPlan.assign(buffer);
+            acceptedStateUploadPlans.push_back(std::move(acceptedPlan));
             ContainerView *container = nullptr;
             if (auto existing = containers.find(plan.uuid); existing != containers.end())
             {
@@ -33951,6 +34088,8 @@ public:
 
           if (neuron->machine->uuid != 0)
           {
+            persistedMachineStateUploadPlansByMachine.insert_or_assign(
+                neuron->machine->uuid, std::move(acceptedStateUploadPlans));
             persistedMachineInventoryUploaded.insert(neuron->machine->uuid);
           }
           neuron->machine->runtimeReady =
