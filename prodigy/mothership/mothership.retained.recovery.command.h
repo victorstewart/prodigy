@@ -230,7 +230,7 @@ inline void requirePreactivation(Execution& e,const Execution *successor=nullptr
 }
 inline bool runFile(const char *file,const char *action,String *failure=nullptr,const char *repairBundle=nullptr,const char *successorFile=nullptr) {
   try {
-    require(std::strcmp(action,"recover")==0 || std::strcmp(action,"prepare")==0 || std::strcmp(action,"retire-extras")==0 || std::strcmp(action,"retire-extras-preactivation")==0 || std::strcmp(action,"supersede-preactivation")==0,"invalid retained recovery action");
+    require(std::strcmp(action,"recover")==0 || std::strcmp(action,"prepare")==0 || std::strcmp(action,"retire-extras")==0 || std::strcmp(action,"retire-extras-preactivation")==0 || std::strcmp(action,"supersede-preactivation")==0 || std::strcmp(action,"contain-active")==0,"invalid retained recovery action");
     Plan plan=parse(file);plan.retainedRecovery=true;
     simdjson::dom::parser parser;simdjson::dom::element doc;auto raw=read(file);require(parser.parse(raw).get(doc)==simdjson::SUCCESS,"invalid recovery plan");
     bool mode=false;require(doc["retainedRecoveryMode"].get_bool().get(mode)==simdjson::SUCCESS && mode,"explicit retained recovery mode required");
@@ -247,6 +247,21 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
     for(auto& m:e.plan.machines) {resolveRegisteredMachine(e.cluster,m);e.machines.emplace(m.uuid,&m);}
     e.buildArtifactManifest();
     auto verify=[&](InventoryMode mode=InventoryMode::sealed) {for(auto& m:e.plan.machines)e.run(m.uuid,inventoryProgram(e.remoteRoot+"/retained-manifest.json",m,mode));};
+    const auto containment=e.plan.operationRoot+"/activation-contained";
+    if(std::strcmp(action,"contain-active")==0) {
+      require(e.receipt.activationBoundaryCrossed && e.receipt.phase==MothershipTidesDBMigrationPhase::completed,"containment requires a completed activated operation");
+      // Validate the installed generation on every host before fencing any host.
+      // Never roll back a database that has had v10 writers.
+      for(const auto& machine:e.plan.machines)e.run(machine.uuid,
+        "test \"$(sha256sum "+quote(e.plan.runtimeRoot+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(str(e.receipt.newRuntimeSHA256))+
+        "; test \"$(sha256sum "+quote(e.plan.runtimeRoot+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(str(e.receipt.approvedBundleSHA256)));
+      durable(containment,text(e.plan.planSHA+"\n"));
+      e.fenceWriters();
+      for(const auto& machine:e.plan.machines)e.run(machine.uuid,
+        quiesceServiceCommand(true)+e.observeContainers()+"snapshot_containers > "+quote(e.remoteRoot+"/containers.contained")+"; sync -f "+quote(e.remoteRoot));
+      return true;
+    }
+    require(!fs::exists(containment),"activated recovery is contained; use a fresh retained recovery plan");
     const auto superseded=e.plan.operationRoot+"/superseded-by";
     if(fs::exists(superseded)) { privateFile(superseded,4096); if(std::strcmp(action,"supersede-preactivation")!=0)throw std::runtime_error("retained operation was superseded before activation"); }
     if(std::strcmp(action,"retire-extras-preactivation")==0) {
