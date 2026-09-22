@@ -94,6 +94,11 @@ inline void resolveRegisteredMachine(const MothershipProdigyCluster& cluster, Ma
   machine.registered=*registered;
 }
 
+inline std::string quiesceServiceCommand() {
+  String stop; mothershipBuildTidesDBMigrationServiceQuiesceCommand(stop);
+  return "if test \"$(systemctl show -p MainPID --value prodigy)\" != 0; then\n"+str(stop)+"\nfi; test \"$(systemctl show -p MainPID --value prodigy)\" = 0; ";
+}
+
 class Execution final : public MothershipTidesDBMigrationHooks {
 public:
   Plan plan; MothershipProdigyCluster cluster; MothershipTidesDBMigrationReceipt receipt;
@@ -324,11 +329,10 @@ public:
   }
   void quiesce() {
     fenceWriters();
-    String stop; mothershipBuildTidesDBMigrationServiceQuiesceCommand(stop);
     for(auto& machine:plan.machines) {
       // A stopped unit remains stopped through process failure/reentry; no
       // application leaf belongs to this service's cgroup.
-      run(machine.uuid,"if test \"$(systemctl show -p MainPID --value prodigy)\" != 0; then "+str(stop)+"; fi; test \"$(systemctl show -p MainPID --value prodigy)\" = 0; "+observeContainers()+"snapshot_containers > "+quote(remoteRoot+"/containers.stopped")+"; cmp "+quote(remoteRoot+"/containers.before")+" "+quote(remoteRoot+"/containers.stopped"));
+      run(machine.uuid,quiesceServiceCommand()+observeContainers()+"snapshot_containers > "+quote(remoteRoot+"/containers.stopped")+"; cmp "+quote(remoteRoot+"/containers.before")+" "+quote(remoteRoot+"/containers.stopped"));
     }
     receipt.phase=MothershipTidesDBMigrationPhase::writersQuiesced; persist(receipt,nullptr);
   }
@@ -369,10 +373,15 @@ public:
     // service or original database. Later phases must restore every old owner
     // before restarting any Brain.
     if(receipt.phase<MothershipTidesDBMigrationPhase::preflighted) { receipt.phase=MothershipTidesDBMigrationPhase::rolledBack; persist(receipt,nullptr); return; }
-    for(auto& m:plan.machines) {
-      String stop; mothershipBuildTidesDBMigrationServiceQuiesceCommand(stop);
-      run(m.uuid,"if test \"$(systemctl show -p MainPID --value prodigy)\" != 0; then "+str(stop)+"; fi; test \"$(systemctl show -p MainPID --value prodigy)\" = 0");
+    if(receipt.phase==MothershipTidesDBMigrationPhase::preflighted) {
+      // Before quiescence is checkpointed, no database or runtime swap can have
+      // begun. Remove startup fences and restart only already-stopped old units.
+      for(auto& db:receipt.databases) require(exists(db,db.livePath) && !exists(db,db.retainedV9Path),"unexpected database swap before quiescence");
+      for(auto& m:plan.machines) run(m.uuid,"test \"$(sha256sum "+quote(plan.runtimeRoot+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(plan.oldRuntimeSHA));
+      for(auto& m:plan.machines) { unfence(m); run(m.uuid,"systemctl start prodigy; systemctl is-active --quiet prodigy"); }
+      receipt.phase=MothershipTidesDBMigrationPhase::rolledBack; persist(receipt,nullptr); return;
     }
+    for(auto& m:plan.machines) run(m.uuid,quiesceServiceCommand());
     receipt.phase=MothershipTidesDBMigrationPhase::rollbackRequired; persist(receipt,nullptr);
     for(auto& db:receipt.databases) {
       if(exists(db,db.retainedV9Path)) {

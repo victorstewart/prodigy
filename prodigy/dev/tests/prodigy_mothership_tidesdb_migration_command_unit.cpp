@@ -37,6 +37,7 @@ int main(int argc, char **argv)
   for(size_t i=0;i<roundtrip.databases.size();++i) assert(roundtrip.databases[i].machineUUID==i+100);
   String stop; mothershipBuildTidesDBMigrationServiceQuiesceCommand(stop);
   assert(str(stop).find("systemctl stop prodigy")!=std::string::npos);
+  execution.run(0,"bash -n -c "+quote(quiesceServiceCommand()));
   assert(str(stop).find("cgroup.kill")==std::string::npos && str(stop).find("pkill")==std::string::npos);
   assert(uuid("0x850fa69cddf33ccdb965f709303710c6")!=0);
   bool rejected=false; try { pathCheck("/var/lib/../prod"); } catch(const std::exception&) { rejected=true; } assert(rejected);
