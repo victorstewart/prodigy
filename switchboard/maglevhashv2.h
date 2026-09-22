@@ -129,8 +129,10 @@ private:
         if (cum_weight[pos] >= highestWeight) // so with all weights equal this always triggers on the first endpoint
         {
           cum_weight[pos] -= highestWeight;
-          auto offset = permutation[2 * pos]; // and positiont here always 0
-          auto skip = permutation[2 * pos + 1];
+          // Widen before multiplication: 65536 * 65536 overflows uint32_t,
+          // breaking the permutation and potentially leaving a slot unreachable.
+          const uint64_t offset = permutation[2 * pos];
+          const uint64_t skip = permutation[2 * pos + 1];
           auto cur = (offset + next[pos] * skip) % RING_SIZE;
 
           while (ring[cur] > 0) // we switch the terminal factor to 0, because that's our never value

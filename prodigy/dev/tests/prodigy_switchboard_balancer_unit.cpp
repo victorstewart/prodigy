@@ -1,9 +1,26 @@
 #include <limits.h>
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <vector>
 
 #include <networking/includes.h>
 #include <services/debug.h>
 
 #include <switchboard/common/balancer.policy.h>
+
+// Exercise the production ring builder without constructing runtime/BPF owners.
+namespace MaglevFixture {
+struct Wormhole {
+  uint32_t containerID;
+  uint32_t weight;
+  uint64_t hash() const { return 156164; }
+};
+struct Portal {
+  std::vector<Wormhole *> wormholes;
+};
+#include <switchboard/maglevhashv2.h>
+}
 
 class TestSuite {
 public:
@@ -27,6 +44,15 @@ public:
 int main(void)
 {
   TestSuite suite = {};
+
+  // This endpoint produces offset 30993 and skip 65536. A 32-bit probe
+  // product wraps before the last slot (30994), then repeats forever.
+  MaglevFixture::Wormhole wormhole = {9, 1};
+  MaglevFixture::Portal portal = {{&wormhole}};
+  const auto ring = MaglevFixture::MaglevHashV2::generateHashRingForPortal(&portal);
+  suite.expect(
+      std::all_of(ring.begin(), ring.end(), [](uint32_t endpoint) { return endpoint == 9; }),
+      "switchboard_maglev_maximum_skip_fills_entire_prime_ring");
 
   suite.expect(
       switchboardBalancerPassesIPv6ToKernel(IPPROTO_ICMPV6),

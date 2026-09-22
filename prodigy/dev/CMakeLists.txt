@@ -1734,6 +1734,7 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       NAME prodigy_switchboard_balancer_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_switchboard_balancer_unit
    )
+   set_tests_properties(prodigy_switchboard_balancer_unit PROPERTIES TIMEOUT 10)
 
    add_test(
       NAME prodigy_container_storage_layout_unit
