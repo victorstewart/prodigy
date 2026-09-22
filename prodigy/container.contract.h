@@ -4,6 +4,11 @@
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <string_view>
+#include <limits>
 #include <unistd.h>
 
 #include <services/filesystem.h>
@@ -42,6 +47,74 @@ static inline void prodigyContainerCgroupProcLeafSuffix(const String& containerN
   path.assign("/containers.slice/"_ctv);
   path.append(containerName);
   path.append(".slice/leaf"_ctv);
+}
+
+// A cold Neuron can have an empty in-memory inventory while its old children
+// still run outside prodigy.service. Never advertise that inventory as complete
+// until every populated owned cgroup has a matching live process owner.
+template <typename OwnsProcess>
+static bool prodigyContainerInventoryCgroupsOwned(
+    const std::filesystem::path& root,
+    OwnsProcess&& ownsProcess,
+    String& failure)
+{
+  failure.clear();
+  std::error_code error;
+  const bool exists = std::filesystem::exists(root, error);
+  if (!exists && !error)
+  {
+    return true; // A new machine has not created containers.slice yet.
+  }
+  auto reject = [&](const std::filesystem::path& path) {
+    failure.snprintf<"container inventory cannot account for live cgroup {}; retained-container recovery is required"_ctv>(String(path.c_str()));
+    return false;
+  };
+  if (error)
+  {
+    return reject(root);
+  }
+  std::filesystem::directory_iterator it(root, error), end;
+  for (; !error && it != end; it.increment(error))
+  {
+    const auto status = it->symlink_status(error);
+    if (error) break;
+    if (std::filesystem::is_symlink(status)) return reject(it->path());
+    if (!std::filesystem::is_directory(status)) continue;
+
+    const auto path = it->path();
+    std::ifstream events(path / "cgroup.events");
+    std::string key;
+    uint64_t value = 0;
+    bool havePopulated = false, populated = false;
+    while (events >> key >> value)
+    {
+      if (key == "populated")
+      {
+        if (havePopulated || value > 1) return reject(path);
+        havePopulated = true;
+        populated = value != 0;
+      }
+    }
+    if (!havePopulated || events.bad()) return reject(path);
+    if (!populated) continue;
+
+    std::string name = path.filename().string();
+    constexpr std::string_view suffix = ".slice";
+    if (!name.ends_with(suffix)) return reject(path);
+    name.resize(name.size() - suffix.size());
+    // cgroup.procs is not PID-sorted and may include a container's children.
+    // Require the actual tracked leader, rather than trusting a directory name.
+    std::ifstream processes(path / "leaf" / "cgroup.procs");
+    uint64_t pid = 0;
+    bool owned = false;
+    while (processes >> pid)
+    {
+      if (pid == 0 || pid > uint64_t(std::numeric_limits<pid_t>::max())) return reject(path);
+      owned |= ownsProcess(name, pid_t(pid));
+    }
+    if (!owned || processes.bad() || !processes.eof()) return reject(path);
+  }
+  return error ? reject(root) : true;
 }
 
 static inline String prodigyContainerErrnoString(int err)

@@ -1123,6 +1123,7 @@ public:
 
   NoopNeuronIaaS localIaaS;
   bool failAcceptedBrainTransportTLSForTest = false;
+  bool liveContainerInventoryCompleteForTest = true;
   uint32_t refreshContainerSwitchboardWormholesCallsForTest = 0;
   uint32_t syncContainerSwitchboardRuntimeCallsForTest = 0;
   uint32_t popContainerCallsForTest = 0;
@@ -1160,6 +1161,12 @@ public:
     {
       containerByPid.erase(container->pid);
     }
+  }
+
+  bool liveContainerInventoryComplete(String& failure) const override
+  {
+    failure.clear();
+    return liveContainerInventoryCompleteForTest;
   }
 
   bool ensureHostNetworkingReady(String *failureReport = nullptr) override
@@ -11148,8 +11155,6 @@ static void testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(TestSuite&
   suite.expect(uint32_t(first.inBinaryUpdate) + uint32_t(second.inBinaryUpdate) == 1,
                "worker_upgrade_marks_expected_exec_before_control_close");
   Machine *transitioningWorker = first.inBinaryUpdate ? &first : &second;
-  suite.expect(brain.neuronCloseRequiresScheduledWaiterRetry(transitioningWorker) == false,
-               "worker_upgrade_control_close_does_not_reschedule_live_containers");
 
   ProdigyPersistentUpdateSelfState snapshot = brain.capturePersistentUpdateSelfState();
   TestBrain restored = {};
@@ -11162,12 +11167,8 @@ static void testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(TestSuite&
                    first.neuron.wBuffer.empty() ? &second : &first),
                "worker_upgrade_restart_preserves_expected_exec_fence");
   transitioningWorker->inBinaryUpdate = false;
-  suite.expect(restored.neuronCloseRequiresScheduledWaiterRetry(transitioningWorker) == false,
-               "worker_upgrade_restart_control_close_keeps_live_ownership");
   restored.updateSelfWorkerTransitionIssuedMachineUUIDs.clear();
   restored.recoveringPersistedNeuronInventory = true;
-  suite.expect(restored.neuronCloseRequiresScheduledWaiterRetry(transitioningWorker) == false,
-               "worker_upgrade_master_exec_inventory_recovery_suppresses_reschedule");
   restored.recoveringPersistedNeuronInventory = false;
   transitioningWorker->inBinaryUpdate = true;
 
@@ -18923,6 +18924,70 @@ static void testNeuronContainerHandlerForwardsHealthyToBrain(TestSuite& suite)
   suite.expect(observedContainerUUID == container.plan.uuid, "neuron_container_healthy_preserves_container_uuid");
 }
 
+static void testNeuronPendingLaunchStateUploadRetainsCanonicalUUID(TestSuite& suite)
+{
+  TestNeuron neuron = {};
+  neuron.seedBrainStreamForTest(false);
+  neuron.seedLocalContainerSubnetForTest(1, 0x123a);
+
+  ContainerPlan pending = {};
+  pending.uuid = uint128_t(0x51aa01);
+  pending.config.applicationID = 62'171;
+  pending.config.versionID = 1;
+  pending.state = ContainerState::scheduled;
+  suite.expect(neuron.beginPendingContainerLaunch(pending),
+               "neuron_pending_launch_claims_uuid_before_download_suspends");
+  suite.expect(neuron.beginPendingContainerLaunch(pending) == false,
+               "neuron_pending_launch_rejects_duplicate_uuid_claim");
+
+  NeuronContainerBootstrap bootstrap = {};
+  bootstrap.plan = pending;
+  String serialized = {};
+  BitseryEngine::serialize(serialized, bootstrap);
+  String frame = {};
+  uint32_t headerOffset = Message::appendHeader(frame, NeuronTopic::stateUpload);
+  local_container_subnet6 fragment = {};
+  fragment.dpfx = 1;
+  fragment.mpfx[1] = 0x12;
+  fragment.mpfx[2] = 0x3a;
+  Message::appendAlignedBuffer<Alignment::one>(frame, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
+  Message::appendValue(frame, serialized);
+  Message::finish(frame, headerOffset);
+  neuron.dispatchBrainMessageForTest(reinterpret_cast<Message *>(frame.data()));
+
+  uint32_t failedFrames = 0, inventoryFrames = 0;
+  uint128_t reportedUUID = 0;
+  forEachMessageInBuffer(neuron.brainOutboundForTest(), [&](Message *queued) {
+    if (NeuronTopic(queued->topic) == NeuronTopic::containerFailed) failedFrames += 1;
+    if (NeuronTopic(queued->topic) != NeuronTopic::stateUpload) return;
+    inventoryFrames += 1;
+    uint8_t *args = queued->args;
+    local_container_subnet6 reportedFragment = {};
+    Message::extractBytes<Alignment::one>(args, reinterpret_cast<uint8_t *>(&reportedFragment), sizeof(reportedFragment));
+    if (args >= queued->terminal()) return;
+    String value;
+    Message::extractToStringView(args, value);
+    ContainerPlan reported;
+    if (BitseryEngine::deserializeSafe(value, reported)) reportedUUID = reported.uuid;
+  });
+  suite.expect(inventoryFrames == 1 && reportedUUID == pending.uuid,
+               "neuron_state_upload_reports_in_flight_launch_uuid_before_process_exists");
+  suite.expect(neuron.isPendingContainerLaunch(pending.uuid),
+               "neuron_state_upload_preserves_download_pending_canonical_uuid");
+  suite.expect(failedFrames == 0,
+               "neuron_state_upload_does_not_report_pending_launch_as_missing");
+  neuron.brainOutboundForTest().clear();
+  neuron.liveContainerInventoryCompleteForTest = false;
+  String registration;
+  Message::construct(registration, NeuronTopic::registration, true);
+  neuron.dispatchBrainMessageForTest(reinterpret_cast<Message *>(registration.data()));
+  suite.expect(neuron.brainOutboundForTest().size() == 0,
+               "neuron_withholds_authoritative_inventory_with_unaccounted_live_processes");
+  neuron.finishPendingContainerLaunch(pending.uuid);
+  suite.expect(neuron.isPendingContainerLaunch(pending.uuid) == false,
+               "neuron_pending_launch_failure_or_completion_releases_claim");
+}
+
 static void testNeuronContainerHandlerMarksMasterLocalContainerHealthyWithoutBrainStream(TestSuite& suite)
 {
   TestBrain brain = {};
@@ -22882,6 +22947,112 @@ static void testBrainNeuronRegistrationDefersUnprovenFragmentDuringPersistedReco
   brain.deployments.erase(deployment.plan.config.deploymentID());
 }
 
+static void testNeuronControlClosePreservesScheduledOwnerUntilFreshInventory(TestSuite& suite)
+{
+  ScopedFreshRing scopedRing = {};
+  TestBrain brain = {};
+  brain.weAreMaster = true;
+  brain.ignited = true;
+  brain.brainConfig.datacenterFragment = 1;
+
+  Machine machine = {};
+  machine.uuid = uint128_t(0x521aa1);
+  machine.state = MachineState::healthy;
+  machine.fragment = 0x123a;
+  machine.runtimeReady = true;
+  machine.reportedDatacenterFragment = 1;
+  machine.reportedFragment = machine.fragment;
+  machine.neuron.machine = &machine;
+  machine.neuron.connectTimeoutMs = 1;
+  machine.neuron.nDefaultAttemptsBudget = 1;
+  brain.machines.insert(&machine);
+  brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+  brain.neurons.insert(&machine.neuron);
+
+  ApplicationDeployment deployment = {};
+  deployment.plan = makeDeploymentPlan(62'170, 1);
+  deployment.state = DeploymentState::deploying;
+  brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+  brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
+
+  ContainerView *scheduled = new ContainerView();
+  scheduled->uuid = uint128_t(0x521aa2);
+  scheduled->deploymentID = deployment.plan.config.deploymentID();
+  scheduled->applicationID = deployment.plan.config.applicationID;
+  scheduled->machine = &machine;
+  scheduled->lifetime = ApplicationLifetime::base;
+  scheduled->state = ContainerState::scheduled;
+  scheduled->fragment = 17;
+  scheduled->createdAtMs = 123'456;
+  deployment.containers.insert(scheduled);
+  deployment.waitingOnContainers.insert_or_assign(scheduled, ContainerState::healthy);
+  brain.containers.insert_or_assign(scheduled->uuid, scheduled);
+  machine.upsertContainerIndexEntry(scheduled->deploymentID, scheduled);
+
+  brain.closeHandler(&machine.neuron);
+
+  suite.expect(brain.containers.find(scheduled->uuid) != brain.containers.end() &&
+                   deployment.waitingOnContainers.contains(scheduled),
+               "neuron_control_close_keeps_scheduled_canonical_owner");
+  suite.expect(machine.runtimeReady == false && machine.reportedDatacenterFragment == 0 &&
+                   machine.reportedFragment == 0,
+               "neuron_control_close_blocks_machine_until_fresh_inventory");
+
+  String upload = {};
+  uint32_t headerOffset = Message::appendHeader(upload, NeuronTopic::stateUpload);
+  local_container_subnet6 fragment = {};
+  fragment.dpfx = 1;
+  fragment.mpfx[1] = 0x12;
+  fragment.mpfx[2] = 0x3a;
+  Message::appendAlignedBuffer<Alignment::one>(upload, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
+  Message::finish(upload, headerOffset);
+  brain.neuronHandler(&machine.neuron, reinterpret_cast<Message *>(upload.data()));
+
+  uint32_t recoveryFrames = 0;
+  uint128_t replayedUUID = 0;
+  forEachMessageInBuffer(machine.neuron.wBuffer, [&](Message *frame) {
+    if (NeuronTopic(frame->topic) != NeuronTopic::stateUpload)
+    {
+      return;
+    }
+    uint8_t *args = frame->args;
+    local_container_subnet6 queuedFragment = {};
+    Message::extractBytes<Alignment::one>(args, reinterpret_cast<uint8_t *>(&queuedFragment), sizeof(queuedFragment));
+    if (args >= frame->terminal())
+    {
+      return;
+    }
+    String serialized = {};
+    Message::extractToStringView(args, serialized);
+    NeuronContainerBootstrap bootstrap = {};
+    if (BitseryEngine::deserializeSafe(serialized, bootstrap))
+    {
+      replayedUUID = bootstrap.plan.uuid;
+      recoveryFrames += 1;
+    }
+  });
+
+  suite.expect(recoveryFrames == 1 && replayedUUID == scheduled->uuid,
+               "neuron_control_fresh_empty_inventory_replays_exact_scheduled_uuid");
+  suite.expect(machine.runtimeReady == false,
+               "neuron_control_replay_holds_machine_until_neuron_acknowledges_canonical_owner");
+  suite.expect(brain.containers.find(scheduled->uuid) != brain.containers.end() &&
+                   deployment.waitingOnContainers.contains(scheduled),
+               "neuron_control_replay_never_allocates_replacement_for_undelivered_launch");
+
+  brain.cancelNeuronReconnectWaiter(&machine.neuron, "unit-cleanup");
+  deployment.waitingOnContainers.erase(scheduled);
+  deployment.containers.erase(scheduled);
+  machine.removeContainerIndexEntry(scheduled->deploymentID, scheduled);
+  brain.containers.erase(scheduled->uuid);
+  delete scheduled;
+  brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
+  brain.deployments.erase(deployment.plan.config.deploymentID());
+  brain.neurons.erase(&machine.neuron);
+  brain.machinesByUUID.erase(machine.uuid);
+  brain.machines.erase(&machine);
+}
+
 static void testBrainNeuronRegistrationKeepsHealthyRuntimeReadyWithoutRefresh(TestSuite& suite)
 {
   TestBrain brain = {};
@@ -25552,6 +25723,14 @@ int main(void)
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "duplicate-inventory-recovery") == 0)
+  {
+    testNeuronPendingLaunchStateUploadRetainsCanonicalUUID(suite);
+    testNeuronStateUploadSkipsExistingLiveContainer(suite);
+    testNeuronControlClosePreservesScheduledOwnerUntilFreshInventory(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "retained-fragment-recovery") == 0)
   {
     testBrainNeuronRegistrationDefersUnprovenFragmentDuringPersistedRecovery(suite);
@@ -25609,6 +25788,7 @@ int main(void)
     testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(suite);
     testAllMachineRecoveryWitnessRetainsReplicationAcknowledgement(suite);
     testBrainNeuronRegistrationKeepsHealthyRuntimeReadyWithoutRefresh(suite);
+    testNeuronControlClosePreservesScheduledOwnerUntilFreshInventory(suite);
     testBrainNeuronRegistrationRefreshesWorkerAfterBundleTransition(suite);
     testPersistedLocalBrainRefreshBypassesIgnition(suite);
     testMachineHealthyDefersStatelessRecoveryUntilInventoryComplete(suite);
@@ -26009,6 +26189,7 @@ int main(void)
   testBrainNeuronStateUploadRestoresOnlyActiveMeshServices(suite);
   testBrainNeuronStateUploadRuntimeReadyFalseClearsStatefulTopologyBarrier(suite);
   testBrainNeuronStateUploadRequiresMatchingAssignedFragmentForMachineRuntimeReady(suite);
+  testNeuronControlClosePreservesScheduledOwnerUntilFreshInventory(suite);
   testBrainNeuronControlHandshakeWatchdogClosesStalledRebootRecovery(suite);
   testBrainPeerHandshakeWatchdogClosesStalledRegistration(suite);
   testBrainPeerHandshakeWatchdogCancelsAfterFreshRegistration(suite);

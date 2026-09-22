@@ -41,6 +41,10 @@ public:
   double perCoreUtil[256] = {0.0}; // rolling avg per-core utilization estimate
   double nodeLoad[16] = {0.0}; // rolling avg per-node load
   bytell_hash_map<uint128_t, Container *> containers;
+  // A spin coroutine can await its artifact before pushContainer publishes a
+  // live Container. Preserve the canonical UUID and plan across that gap.
+  bytell_hash_map<uint128_t, ContainerPlan> pendingContainerLaunchPlans;
+
   bytell_hash_map<uint128_t, Container *> quarantinedContainerNetworks;
   bytell_hash_map<pid_t, Container *> containerByPid;
   bytell_hash_set<uint128_t> statefulCrashed; // waiting on word from the brain what to do with the data
@@ -94,6 +98,26 @@ public:
     memcpy(address.network.v6 + 15, &fragment, 1);
 
     return address;
+  }
+
+  bool beginPendingContainerLaunch(const ContainerPlan& plan)
+  {
+    if (plan.uuid == 0 || containers.contains(plan.uuid) || pendingContainerLaunchPlans.contains(plan.uuid))
+    {
+      return false;
+    }
+    pendingContainerLaunchPlans.insert_or_assign(plan.uuid, plan);
+    return true;
+  }
+
+  void finishPendingContainerLaunch(uint128_t uuid)
+  {
+    pendingContainerLaunchPlans.erase(uuid);
+  }
+
+  bool isPendingContainerLaunch(uint128_t uuid) const
+  {
+    return pendingContainerLaunchPlans.contains(uuid);
   }
 
   virtual void pushContainer(Container *container) = 0;

@@ -1179,6 +1179,10 @@ public:
   // A runtime-ready Neuron has acknowledged its network assignment, but only
   // stateUpload establishes its authoritative live-container inventory.
   bytell_hash_set<uint128_t> persistedMachineInventoryUploaded;
+  // Control loss cannot establish that a scheduled launch died. Hold its
+  // canonical owner until one authenticated post-reconnect inventory can
+  // either re-adopt it or ask Neuron to resolve that exact UUID.
+  bytell_hash_set<uint128_t> machinesAwaitingPostCloseInventory;
   bool recoveredNeuronPairingsUnified = false;
 
   TimeoutPacket osUpdateTimer;
@@ -12260,7 +12264,11 @@ public:
         {
           persistedMachineInventoryUploaded.erase(neuron->machine->uuid);
         }
-        const bool requiresNeuronState = recoveringPersistedNeuronInventory ||
+        // A new control transport has no delivery proof for any launch frame
+        // discarded with the previous generation. Always obtain a fresh
+        // authenticated inventory before this machine may schedule again.
+        const bool requiresNeuronState = reconnecting ||
+                                         recoveringPersistedNeuronInventory ||
                                          (ignited &&
                                           (reconnecting == false ||
                                            machineNeedsNeuronStateRefresh(neuron->machine)));
@@ -13744,7 +13752,16 @@ public:
 
       if (neuron->machine != nullptr)
       {
-        persistedMachineInventoryUploaded.erase(neuron->machine->uuid);
+        Machine *machine = neuron->machine;
+        persistedMachineInventoryUploaded.erase(machine->uuid);
+        // A transport close says nothing about a scheduled process: the
+        // spinContainer frame may have reached Neuron and the process may be
+        // live. Do not treat the machine as schedulable until its replacement
+        // transport supplies fresh authenticated inventory.
+        machine->runtimeReady = false;
+        machine->reportedDatacenterFragment = 0;
+        machine->reportedFragment = 0;
+        machinesAwaitingPostCloseInventory.insert(machine->uuid);
       }
 
       neuron->cancelSuspended();
@@ -13781,10 +13798,9 @@ public:
       PRODIGY_DEBUG_FLUSH();
       neuron->cancelPendingConnect();
 
-      if (neuronCloseRequiresScheduledWaiterRetry(neuron->machine))
-      {
-        retryScheduledContainerWaitersAfterNeuronClose(neuron->machine);
-      }
+      // A close is transport loss, not a container death proof. The fresh
+      // stateUpload path replays an absent scheduled owner with its canonical
+      // UUID; explicit Neuron failure remains the only replacement trigger.
 
       if (weAreMaster)
       {
@@ -20727,6 +20743,7 @@ public:
     neuron->connected = false;
     neuron->cancelSuspended();
     persistedMachineInventoryUploaded.erase(machine->uuid);
+    machinesAwaitingPostCloseInventory.erase(machine->uuid);
 
     machines.erase(machine);
     for (auto indexed = machinesByUUID.begin(); indexed != machinesByUUID.end();)
@@ -20908,39 +20925,6 @@ public:
       }
     }
     machine->containersByDeploymentID.clear();
-  }
-
-  void retryScheduledContainerWaitersAfterNeuronClose(Machine *machine)
-  {
-    if (machine == nullptr || weAreMaster == false)
-    {
-      return;
-    }
-
-    Vector<ApplicationDeployment *> affectedDeployments;
-    for (const auto& [deploymentID, deployment] : deployments)
-    {
-      (void)deploymentID;
-      if (deployment && deployment->plan.isStateful == false)
-      {
-        affectedDeployments.push_back(deployment);
-      }
-    }
-
-    for (ApplicationDeployment *deployment : affectedDeployments)
-    {
-      deployment->drainMachine(machine, true, true);
-    }
-  }
-
-  bool neuronCloseRequiresScheduledWaiterRetry(const Machine *machine) const
-  {
-    // An exec deliberately closes the Neuron control stream while its
-    // container processes remain alive. Retrying stateless scheduler waiters
-    // here would create replacements before authoritative state re-adoption.
-    return machine != nullptr && recoveringPersistedNeuronInventory == false &&
-           machine->inBinaryUpdate == false &&
-           workerBundleUpgradeTransitionPending(machine) == false;
   }
 
   uint32_t normalizedMaxOSDrains(void) const
@@ -33274,12 +33258,49 @@ public:
                      int(malformedStateUpload));
 #endif
 
+          const bool postCloseInventory = neuron->machine->uuid != 0 &&
+                                          machinesAwaitingPostCloseInventory.erase(neuron->machine->uuid) > 0;
+          bool replayMissingScheduledOwners = false;
+          if (postCloseInventory)
+          {
+            // A fresh inventory can prove only that the first launch did not
+            // become a live local container. Re-submit the same canonical
+            // bootstrap, never a replacement UUID; Neuron re-adopts an
+            // in-flight/live UUID idempotently and reports an explicit failure
+            // if that UUID is truly absent.
+            for (const auto& [deploymentID, machineContainers] : neuron->machine->containersByDeploymentID)
+            {
+              (void)deploymentID;
+              for (ContainerView *container : machineContainers)
+              {
+                if (container != nullptr && container->state == ContainerState::scheduled &&
+                    reportedMachineContainerUUIDs.contains(container->uuid) == false)
+                {
+                  replayMissingScheduledOwners = true;
+                  break;
+                }
+              }
+              if (replayMissingScheduledOwners)
+              {
+                break;
+              }
+            }
+          }
+
           if (neuron->machine->uuid != 0)
           {
             persistedMachineInventoryUploaded.insert(neuron->machine->uuid);
           }
           neuron->machine->runtimeReady =
+              replayMissingScheduledOwners == false &&
               neuron->machine->fragment > 0 && neuron->machine->reportedDatacenterFragment != 0 && (brainConfig.datacenterFragment == 0 || neuron->machine->reportedDatacenterFragment == brainConfig.datacenterFragment) && neuron->machine->reportedFragment == neuron->machine->fragment;
+          if (replayMissingScheduledOwners)
+          {
+            queueNeuronStateUploadForMachine(neuron->machine);
+            refreshNeuronControlHandshakeWatchdog(neuron, "state-upload-replay");
+            noteWorkerStateUpload(neuron);
+            break;
+          }
           promoteMachineToHealthyIfReady(neuron->machine);
           refreshNeuronControlHandshakeWatchdog(neuron, "state-upload");
           resumeMachineClaimsIfSchedulingReady(neuron->machine);

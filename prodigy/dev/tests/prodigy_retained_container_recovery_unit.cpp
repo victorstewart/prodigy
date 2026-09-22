@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include <prodigy/persistent.state.h>
+#include <prodigy/container.contract.h>
 #include <prodigy/retained.container.recovery.h>
 
 static DeploymentPlan deployment(bool stateful)
@@ -123,8 +124,49 @@ static void expectCompactStartupCPURecovery()
   assert(prodigyBuildRetainedContainerBootstrap(plan,decoded,machineFragment,datacenterFragment,observedCreatedAtMs,bootstrap,&failure));
 }
 
+static void expectColdInventoryRejectsRetainedUnownedProcesses()
+{
+  const auto scratch = std::filesystem::current_path() / ".run";
+  std::filesystem::create_directories(scratch);
+  std::string temporary = (scratch / "prodigy-inventory-unit-XXXXXX").string();
+  const char *created = mkdtemp(temporary.data());
+  assert(created);
+  const std::filesystem::path root = created;
+  String failure;
+  bool knowsOwner = false;
+  auto owner = [&](const std::string& name, pid_t pid) {
+    return knowsOwner && name == "7711" && pid == 123;
+  };
+  assert(prodigyContainerInventoryCgroupsOwned(root / "missing", owner, failure));
+  assert(prodigyContainerInventoryCgroupsOwned(root, owner, failure));
+  const auto slice = root / "7711.slice";
+  std::filesystem::create_directories(slice / "leaf");
+  std::ofstream(slice / "cgroup.events") << "populated 1\nfrozen 0\n";
+  std::ofstream(slice / "leaf" / "cgroup.procs") << "456\n123\n";
+  // Regression: a cold empty map must not release the Brain recovery barrier.
+  assert(!prodigyContainerInventoryCgroupsOwned(root, owner, failure));
+  assert(failure.size() > 0);
+  knowsOwner = true;
+  assert(prodigyContainerInventoryCgroupsOwned(root, owner, failure));
+  // A stale PID or an unreported second slice is not a complete inventory.
+  std::ofstream(slice / "leaf" / "cgroup.procs") << "456\n";
+  assert(!prodigyContainerInventoryCgroupsOwned(root, owner, failure));
+  std::ofstream(slice / "leaf" / "cgroup.procs") << "123\n";
+  const auto extra = root / "8822.slice";
+  std::filesystem::create_directories(extra / "leaf");
+  std::ofstream(extra / "cgroup.events") << "populated 1\nfrozen 0\n";
+  std::ofstream(extra / "leaf" / "cgroup.procs") << "789\n";
+  assert(!prodigyContainerInventoryCgroupsOwned(root, owner, failure));
+  std::ofstream(extra / "cgroup.events") << "populated 0\nfrozen 0\n";
+  assert(prodigyContainerInventoryCgroupsOwned(root, owner, failure));
+  std::filesystem::remove(slice / "leaf" / "cgroup.procs");
+  assert(!prodigyContainerInventoryCgroupsOwned(root, owner, failure));
+  std::filesystem::remove_all(root);
+}
+
 int main()
 {
+  expectColdInventoryRejectsRetainedUnownedProcesses();
   expectCompactStartupCPURecovery();
   expectReplicaAndShardableRecovery();
   expectValidStateless();

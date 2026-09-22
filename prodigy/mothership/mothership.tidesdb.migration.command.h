@@ -314,6 +314,44 @@ public:
       }
     }
   }
+  // A retained-recovery successor may adopt an already stopped, fenced fleet.
+  // Every successor fence is durable before any predecessor fence is removed.
+  void stageInheritedQuiesced(const Execution& predecessor) {
+    require(predecessor.plan.clusterUUID==plan.clusterUUID && predecessor.plan.runtimeRoot==plan.runtimeRoot && predecessor.plan.machines.size()==plan.machines.size(),"inherited fence target differs");
+    const auto oldFence=predecessor.fencePath();
+    const auto oldDropin="/etc/systemd/system/prodigy.service.d/99-tidesdb-migration-"+predecessor.plan.planSHA.substr(0,16)+".conf";
+    const auto newDropin="/etc/systemd/system/prodigy.service.d/99-tidesdb-migration-"+plan.planSHA.substr(0,16)+".conf";
+    const auto content="[Unit]\nConditionPathExists=!"+fencePath()+"\n";
+    for(auto& machine:plan.machines) {
+      const auto id=machine.uuid;
+      run(id,"test \"$(realpath -m "+quote(remoteRoot)+")\" = "+quote(remoteRoot)+"; umask 077; mkdir -p "+quote(remoteRoot)+"; chmod 700 "+quote(remoteRoot));
+      MothershipTidesDBMigrationDatabase marker; marker.machineUUID=id;
+      if(!exists(marker,text(remoteRuntime))) {
+        const auto bundle=remoteRoot+"/successor.bundle.tar.zst";
+        upload(machine,plan.bundle,bundle); upload(machine,plan.bundle+".sha256",bundle+".sha256");
+        String install; prodigyBuildBundleInstallCommand(text(bundle),text(remoteRuntime),install);
+        run(id,"test \"$(sha256sum "+quote(bundle)+" | cut -d' ' -f1)\" = "+quote(str(receipt.approvedBundleSHA256))+"; "+str(install));
+      }
+      upload(machine,plan.operationRoot+"/runtime.files.sha256",remoteRoot+"/runtime.files.sha256"); verifyRuntime(machine,remoteRuntime);
+      std::string cmd="test \"$(systemctl show -p MainPID --value prodigy)\" = 0; ";
+      cmd+="if test -e "+quote(fencePath())+"; then test \"$(cat "+quote(fencePath())+")\" = "+quote(plan.planSHA)+"; else test \"$(cat "+quote(oldFence)+")\" = "+quote(predecessor.plan.planSHA)+"; printf %s "+quote(plan.planSHA)+" > "+quote(fencePath()+".new")+"; sync -f "+quote(fencePath()+".new")+"; mv -T "+quote(fencePath()+".new")+" "+quote(fencePath())+"; sync -f "+quote(remoteRoot)+"; fi; ";
+      cmd+="mkdir -p /etc/systemd/system/prodigy.service.d; if test -e "+quote(newDropin)+"; then printf %s "+quote(content)+" | cmp -s - "+quote(newDropin)+"; else printf %s "+quote(content)+" > "+quote(newDropin+".new")+"; sync -f "+quote(newDropin+".new")+"; mv -T "+quote(newDropin+".new")+" "+quote(newDropin)+"; sync -f /etc/systemd/system/prodigy.service.d; systemctl daemon-reload; fi; systemctl daemon-reload";
+      run(id,cmd);
+    }
+    for(auto& machine:plan.machines) {
+      std::string cmd="test \"$(systemctl show -p MainPID --value prodigy)\" = 0; test \"$(cat "+quote(fencePath())+")\" = "+quote(plan.planSHA)+"; ";
+      cmd+="if test -e "+quote(oldFence)+"; then test \"$(cat "+quote(oldFence)+")\" = "+quote(predecessor.plan.planSHA)+"; rm -- "+quote(oldFence)+"; sync -f "+quote(predecessor.remoteRoot)+"; fi; ";
+      cmd+="if test -e "+quote(oldDropin)+"; then printf %s "+quote("[Unit]\nConditionPathExists=!"+oldFence+"\n")+" | cmp -s - "+quote(oldDropin)+"; rm -- "+quote(oldDropin)+"; sync -f /etc/systemd/system/prodigy.service.d; fi; systemctl daemon-reload; ";
+      cmd+=observeContainers()+"snapshot_containers > "+quote(remoteRoot+"/containers.inherited")+"; if test -f "+quote(remoteRoot+"/containers.before")+"; then cmp "+quote(remoteRoot+"/containers.before")+" "+quote(remoteRoot+"/containers.inherited")+"; else mv "+quote(remoteRoot+"/containers.inherited")+" "+quote(remoteRoot+"/containers.before")+"; sync -f "+quote(remoteRoot)+"; fi";
+      run(machine.uuid,cmd);
+    }
+  }
+  // Retirement has separately verified the canonical inventory.  Replace only
+  // the operation-local stopped baseline that activation compares; no runtime
+  // or database path is changed here.
+  void acceptStoppedContainerBaseline() {
+    for(auto& machine:plan.machines)run(machine.uuid,observeContainers()+"snapshot_containers > "+quote(remoteRoot+"/containers.canonical")+"; mv -T "+quote(remoteRoot+"/containers.canonical")+" "+quote(remoteRoot+"/containers.before")+"; sync -f "+quote(remoteRoot));
+  }
   std::string fencePath() const { return remoteRoot+"/writers-fenced"; }
   void fenceWriters() {
     const auto dropin="/etc/systemd/system/prodigy.service.d/99-tidesdb-migration-"+plan.planSHA.substr(0,16)+".conf";

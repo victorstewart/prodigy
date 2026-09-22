@@ -12340,6 +12340,23 @@ public:
                       (unsigned long long)plan.uuid,
                       (unsigned long long)replaceContainerUUID);
 #endif
+    if (thisNeuron != nullptr && thisNeuron->beginPendingContainerLaunch(plan) == false)
+    {
+      // Duplicate transport/recovery frames converge on the original launch.
+      co_return;
+    }
+    struct PendingLaunchScope {
+      NeuronBase *neuron = nullptr;
+      uint128_t uuid = 0;
+      ~PendingLaunchScope()
+      {
+        if (neuron != nullptr)
+        {
+          neuron->finishPendingContainerLaunch(uuid);
+        }
+      }
+    } pendingLaunch {thisNeuron, plan.uuid};
+
     bool skipLaunch = false;
     String taskGateFailure = {};
     if (thisNeuron != nullptr && thisNeuron->prepareTaskAttemptLaunch(plan, skipLaunch, &taskGateFailure) == false)

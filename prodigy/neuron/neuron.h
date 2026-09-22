@@ -3837,6 +3837,20 @@ public:
     }
   }
 
+  virtual bool liveContainerInventoryComplete(String& failure) const
+  {
+    return prodigyContainerInventoryCgroupsOwned(
+        "/sys/fs/cgroup/containers.slice",
+        [this](const std::string& name, pid_t pid) {
+          const auto found = containerByPid.find(pid);
+          if (found == containerByPid.end() || found->second == nullptr) return false;
+          const Container *container = found->second;
+          return container->pendingDestroy == false &&
+                 container->name.equal(String(name.c_str())) &&
+                 containers.contains(container->plan.uuid);
+        }, failure);
+  }
+
   void neuronHandler(Message *message)
   {
     uint8_t *args = message->args;
@@ -3855,6 +3869,13 @@ public:
     auto queueNeuronStateUpload = [&]() -> void {
       if (brain == nullptr)
       {
+        return;
+      }
+
+      String inventoryFailure;
+      if (!liveContainerInventoryComplete(inventoryFailure))
+      {
+        basics_log("neuron stateUpload withheld: %s\n", inventoryFailure.c_str());
         return;
       }
 
@@ -3877,6 +3898,14 @@ public:
         (void)uuid;
         String serializedPlan = {};
         BitseryEngine::serialize(serializedPlan, container->plan);
+        Message::appendValue(brain->wBuffer, serializedPlan);
+      }
+
+      for (const auto& [uuid, plan] : pendingContainerLaunchPlans)
+      {
+        if (containers.contains(uuid)) continue;
+        String serializedPlan;
+        BitseryEngine::serialize(serializedPlan, plan);
         Message::appendValue(brain->wBuffer, serializedPlan);
       }
 
@@ -3964,6 +3993,13 @@ public:
               break;
             }
 
+            if (isPendingContainerLaunch(restoredPlan.uuid))
+            {
+              // The same UUID is still owned by a suspended spin coroutine.
+              // Re-adoption is idempotent: wait for that launch rather than
+              // manufacturing an absent-launch failure.
+              continue;
+            }
             if (auto existing = containers.find(restoredPlan.uuid); existing != containers.end() && existing->second != nullptr)
             {
               Container *liveContainer = existing->second;
@@ -4001,9 +4037,17 @@ public:
             path.snprintf<"/sys/fs/cgroup/containers.slice/{}.slice/leaf"_ctv>(container->name);
 
             container->cgroup = Filesystem::openDirectoryAt(-1, path);
+            if (container->cgroup >= 0)
+            {
+              Filesystem::openReadAtClose(container->cgroup, "cgroup.procs"_ctv, output);
+            }
+            pid_t restoredPID = -1;
+            const bool processPresent = prodigyParseFirstCgroupPID(output, restoredPID);
 
             memset(container->lcores, 0, sizeof(container->lcores));
-            if (applicationUsesIsolatedCPUs(container->plan.config))
+            // A launch that never reached Neuron has no cpuset to recover.
+            // Let the existing missing-process failure path resolve its UUID.
+            if (processPresent && applicationUsesIsolatedCPUs(container->plan.config))
             {
               String configuredCPUs = {};
               String effectiveCPUs = {};
@@ -4029,10 +4073,7 @@ public:
               }
             }
 
-            Filesystem::openReadAtClose(container->cgroup, "cgroup.procs"_ctv, output);
-
-            pid_t restoredPID = -1;
-            if (prodigyParseFirstCgroupPID(output, restoredPID))
+            if (processPresent)
             {
               // in the future if we ever need to run multiple processes inside a container,
               // then we'd need to check /proc/{pid}/status and line NSpid: 12345 1 to get the pid mapping to select pid 1
@@ -4365,6 +4406,14 @@ public:
       case NeuronTopic::spinContainer:
         {
           // replaceContainerUUID(16) plan{4}
+
+          String inventoryFailure;
+          if (!liveContainerInventoryComplete(inventoryFailure))
+          {
+            basics_log("neuron spinContainer withheld: %s\n", inventoryFailure.c_str());
+            queueCloseIfActive(brain);
+            break;
+          }
 
           uint128_t replaceContainerUUID;
           Message::extractArg<ArgumentNature::fixed>(args, replaceContainerUUID);

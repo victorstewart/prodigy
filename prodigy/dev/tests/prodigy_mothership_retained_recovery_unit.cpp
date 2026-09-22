@@ -64,6 +64,42 @@ int main()
   Request request;request.clusterUUID=1;request.bundleSHA.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
   String bytes;BitseryEngine::serialize(bytes,request);Request decoded;
   assert(BitseryEngine::deserializeSafe(bytes,decoded) && decoded.clusterUUID==1 && decoded.bundleSHA==request.bundleSHA);
+  Manifest sealedManifest = {}; Manifest successor = {};
+  Record record = {}; record.machine=1; record.container=2; record.pid=3; record.created=4; record.start="5"; record.executableSHA=std::string(64,'a'); record.paramsSHA=std::string(64,'b'); record.paramsPath="/root/params"; record.canonical=true;
+  sealedManifest.records.push_back(record); successor.records.push_back(record);
+  assert(sameRecordIdentity(sealedManifest,successor));
+  successor.records[0].pid++;
+  assert(!sameRecordIdentity(sealedManifest,successor));
+  MothershipTidesMigration::Plan predecessorPlan = {}, successorPlan = {};
+  predecessorPlan.operationID=1; successorPlan.operationID=2; predecessorPlan.operationRoot="/root/old"; successorPlan.operationRoot="/root/new";
+  predecessorPlan.clusterUUID=7; successorPlan.clusterUUID=7; predecessorPlan.identity="7"; successorPlan.identity="7";
+  predecessorPlan.registryRoot="/root/registry"; successorPlan.registryRoot="/root/registry"; predecessorPlan.runtimeRoot="/root/prodigy"; successorPlan.runtimeRoot="/root/prodigy";
+  predecessorPlan.statePath="/var/lib/prodigy/state"; successorPlan.statePath=predecessorPlan.statePath; predecessorPlan.secretsPath="/var/lib/prodigy/secrets"; successorPlan.secretsPath=predecessorPlan.secretsPath;
+  predecessorPlan.oldRuntimeSHA=std::string(64,'a'); successorPlan.oldRuntimeSHA=predecessorPlan.oldRuntimeSHA; predecessorPlan.oldBundleSHA=std::string(64,'b'); successorPlan.oldBundleSHA=predecessorPlan.oldBundleSHA;
+  MothershipTidesMigration::Machine plannedMachine = {}; plannedMachine.uuid=3; plannedMachine.linuxID="0123456789abcdef0123456789abcdef"; plannedMachine.address="fd72::1"; predecessorPlan.machines.push_back(plannedMachine); successorPlan.machines.push_back(plannedMachine);
+  assert(samePlanTarget(predecessorPlan,successorPlan)); successorPlan.operationRoot=predecessorPlan.operationRoot;
+  assert(!samePlanTarget(predecessorPlan,successorPlan));
+  successorPlan.operationRoot="/root/new";
+  for (auto member : {&MothershipTidesMigration::Plan::statePath, &MothershipTidesMigration::Plan::secretsPath,
+                      &MothershipTidesMigration::Plan::runtimeRoot, &MothershipTidesMigration::Plan::registryRoot,
+                      &MothershipTidesMigration::Plan::oldRuntimeSHA, &MothershipTidesMigration::Plan::oldBundleSHA}) {
+    auto invalid=successorPlan; invalid.*member+="-changed";
+    assert(!samePlanTarget(predecessorPlan,invalid));
+  }
+  auto wrongMachine=successorPlan; wrongMachine.machines[0].linuxID[0]='f';
+  assert(!samePlanTarget(predecessorPlan,wrongMachine));
+  MothershipTidesMigration::Machine inventoryMachine = {}; inventoryMachine.uuid=1;
+  assert(inventoryProgram("/sealed-manifest",inventoryMachine,InventoryMode::sealed).find("actual==expected")!=std::string::npos);
+  assert(inventoryProgram("/sealed-manifest",inventoryMachine,InventoryMode::canonical).find("canonical_only=True")!=std::string::npos);
+  assert(inventoryProgram("/sealed-manifest",inventoryMachine,InventoryMode::retire).find("canonical <= actual <= expected")!=std::string::npos);
+  for (auto mode : {InventoryMode::sealed, InventoryMode::canonical, InventoryMode::remaining, InventoryMode::retire}) {
+    const auto command=inventoryProgram("/sealed-MODE-manifest",inventoryMachine,mode);
+    assert(command.find("/sealed-MODE-manifest")!=std::string::npos);
+    if(mode!=InventoryMode::retire) assert(command.find("pidfd_send_signal")==std::string::npos);
+    String syntaxFailure;
+    const auto check="python3 -c "+quote("import ast,shlex,sys; ast.parse(shlex.split(sys.argv[1])[2])")+" "+quote(command);
+    assert(prodigyRunLocalShellCommand(text(check),&syntaxFailure));
+  }
   const auto stop=MothershipTidesMigration::quiesceServiceCommand();
   assert(stop.find("retained containers require")<stop.find("systemctl stop"));
   assert(MothershipTidesMigration::quiesceServiceCommand(true).find("retained containers require")==std::string::npos);

@@ -6,7 +6,11 @@ verified healthy deployment, and 11 stateless extras. It is not a general reset.
 All lifecycle operations remain inside Mothership. Discombobulator supplies the
 approved runtime bundle. Never restore the v9 databases after v10 writers started.
 
-`mothership recoverRetainedFleet PRIVATE_PLAN recover`
+```sh
+mothership recoverRetainedFleet PRIVATE_PLAN prepare
+mothership recoverRetainedFleet PRIVATE_PLAN retire-extras-preactivation
+mothership recoverRetainedFleet PRIVATE_PLAN recover
+```
 
 The private schema-v1 plan uses the migration plan fields and adds
 `retainedRecoveryMode: true`, `retainedManifestPath`, and
@@ -64,15 +68,40 @@ The internal `prepareRetainedRecoveryLocal REQUEST STATE prepare|verify` command
 is invoked by the staged Mothership against private copies. It is not a substitute
 for the fenced fleet operation.
 
-After normal reports prove the canonical 23 containers healthy, bind the inspected
-health evidence to the immutable plan and manifest by creating the private
-`OPERATION_ROOT/canonical-health-attestation` containing plan SHA, newline,
-manifest SHA, newline. Then explicitly invoke:
+A cold Neuron now refuses to upload authoritative inventory or accept a launch
+while any populated container cgroup lacks a matching live owner. Therefore
+retire the sealed extras before activation. `retire-extras-preactivation` requires
+all three Brains stopped and fenced, all six originals unswapped, and freshly
+verified prepared copies. Mothership verifies all canonical process identities
+across the fleet before signaling any extra. Interrupted retirement resumes only
+against the same sealed remaining processes and checks the exact canonical 23
+before recording completion. It does not start a Brain or delete application data.
 
-`mothership recoverRetainedFleet PRIVATE_PLAN retire-extras`
+If the existing preactivation plan names an older runtime, seal a successor plan
+with a new operation ID/root and corrected Discombobulator bundle. Keep the same
+cluster, machine, database, registry and old-runtime identities and the same 34
+process records. Invoke:
+
+```sh
+mothership recoverRetainedFleet OLD_PLAN supersede-preactivation SUCCESSOR_PLAN
+mothership recoverRetainedFleet SUCCESSOR_PLAN prepare
+mothership recoverRetainedFleet SUCCESSOR_PLAN retire-extras-preactivation
+mothership recoverRetainedFleet SUCCESSOR_PLAN recover
+```
+
+Supersession preserves the old plan, receipt, copies and prepared databases. It
+blocks old-plan reentry, stages the successor, installs all successor fences
+before removing any predecessor fence, and never starts a process. Retry the
+same supersession command after interruption. The successor prepares its own
+copies because recovery witnesses bind the deployment bundle digest.
+
+For a legacy recovery already activated without the cold-inventory guard,
+`retire-extras` remains available after canonical health is independently proven.
+Its private `OPERATION_ROOT/canonical-health-attestation` contains plan SHA,
+newline, manifest SHA, newline.
 
 Only the 11 recorded stateless extras can be retired. Mothership rechecks each
 PID/start/executable/cgroup/parameter identity through a pidfd before signaling;
 no application directories are deleted. Reverify three Brains, 13 services,
 exactly 23 matching processes and three Hot replicas with 3 GiB limits and no
-observed crashes/OOMs. Neither command's success is an application-health claim.
+observed crashes/OOMs. No recovery-command success is an application-health claim.

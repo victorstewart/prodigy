@@ -132,9 +132,10 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
 
 // Python is only an identity observer / pidfd transport launched by Mothership.
 // It cannot choose a process or delete a directory: every identity is sealed.
-inline std::string inventoryProgram(const std::string& manifestPath,const MothershipTidesMigration::Machine& machine,bool retire) {
+enum class InventoryMode { sealed, canonical, remaining, retire };
+inline std::string inventoryProgram(const std::string& manifestPath,const MothershipTidesMigration::Machine& machine,InventoryMode mode) {
   String machineID;machineID.snprintf<"{itoh}"_ctv>(machine.uuid);
-  std::string code="import json,os,pathlib,hashlib,signal,time\nm=json.load(open("+quote(manifestPath)+"))\nselected=[x for x in m['machines'] if int(x['machineUUID'],16)==int("+quote(str(machineID))+",16)]\nassert len(selected)==1\nrecords=selected[0]['records']\n";
+  std::string code="import json,os,pathlib,hashlib,signal,time\nm=json.load(open("+quote(manifestPath)+"))\nselected=[x for x in m['machines'] if int(x['machineUUID'],16)==int("+quote(str(machineID))+",16)]\nassert len(selected)==1\nrecords=selected[0]['records']\ncanonical_only="+std::string(mode==InventoryMode::canonical?"True":"False")+"\n";
   code+=R"PY(def sha(p):
  h=hashlib.sha256()
  with open(p,'rb') as f:
@@ -156,37 +157,80 @@ def verify(r):
  assert len(found)==1 and sha(found[0])==r['paramsSHA256'],'live startup parameters changed'
  return base
 )PY";
-  if(!retire) code+=R"PY(expected={(str(int(r['uuid'],16)),r['pid']) for r in records}
+  if(mode==InventoryMode::sealed || mode==InventoryMode::canonical) code+=R"PY(expected={(str(int(r['uuid'],16)),r['pid']) for r in records if (not canonical_only or r['canonical'])}
 actual=set()
 for leaf in pathlib.Path('/sys/fs/cgroup/containers.slice').glob('*.slice/leaf'):
  for p in (leaf/'cgroup.procs').read_text().split():actual.add((leaf.parent.name[:-6],int(p)))
 assert actual==expected,'retained process inventory changed'
-for r in records:verify(r)
-print('retained inventory verified',len(records))
-)PY";
-  else code+=R"PY(for r in records:
- if r['canonical']:verify(r)
 for r in records:
+ if (not canonical_only or r['canonical']):verify(r)
+print('retained inventory verified',len(expected))
+)PY";
+  else code+=R"PY(expected={(str(int(r['uuid'],16)),r['pid']) for r in records}
+canonical={(str(int(r['uuid'],16)),r['pid']) for r in records if r['canonical']}
+actual=set()
+for leaf in pathlib.Path('/sys/fs/cgroup/containers.slice').glob('*.slice/leaf'):
+ for p in (leaf/'cgroup.procs').read_text().split():actual.add((leaf.parent.name[:-6],int(p)))
+assert canonical <= actual <= expected,'retained process inventory changed'
+for r in records:
+ if (str(int(r['uuid'],16)),r['pid']) in actual:verify(r)
+)PY";
+  if(mode==InventoryMode::retire) code+=R"PY(for r in records:
  if r['canonical']:continue
  base=pathlib.Path('/proc')/str(r['pid'])
  if not base.exists():continue
- fd=os.pidfd_open(r['pid'],0)
+ try: fd=os.pidfd_open(r['pid'],0)
+ except ProcessLookupError:
+  assert not base.exists(),'pid changed during retirement'; continue
  try:
-  verify(r)
-  signal.pidfd_send_signal(fd,signal.SIGTERM)
+  verify(r); signal.pidfd_send_signal(fd,signal.SIGTERM)
   for _ in range(50):
    if not base.exists():break
    time.sleep(.1)
   if base.exists():
    verify(r);signal.pidfd_send_signal(fd,signal.SIGKILL)
+   for _ in range(50):
+    if not base.exists():break
+    time.sleep(.1)
+  assert not base.exists(),'retired process did not exit'
  finally:os.close(fd)
 print('pinned stateless extras retired')
 )PY";
   return "python3 -c "+quote(code);
 }
-inline bool runFile(const char *file,const char *action,String *failure=nullptr,const char *repairBundle=nullptr) {
+inline bool sameRecordIdentity(const Manifest& left,const Manifest& right) {
+  if(left.records.size()!=right.records.size())return false;
+  std::map<uint128_t,const Record*> index;
+  for(const auto& record:left.records)index.emplace(record.container,&record);
+  for(const auto& record:right.records) {
+    const auto found=index.find(record.container); if(found==index.end())return false;
+    const auto& expected=*found->second;
+    if(expected.machine!=record.machine || expected.pid!=record.pid || expected.created!=record.created || expected.start!=record.start || expected.executableSHA!=record.executableSHA || expected.paramsSHA!=record.paramsSHA || expected.paramsPath!=record.paramsPath || expected.canonical!=record.canonical)return false;
+  }
+  return true;
+}
+inline bool samePlanTarget(const Plan& oldPlan,const Plan& successor) {
+  if(oldPlan.operationID==successor.operationID || oldPlan.operationRoot==successor.operationRoot || oldPlan.clusterUUID!=successor.clusterUUID || oldPlan.identity!=successor.identity || oldPlan.registryRoot!=successor.registryRoot || oldPlan.runtimeRoot!=successor.runtimeRoot || oldPlan.statePath!=successor.statePath || oldPlan.secretsPath!=successor.secretsPath || oldPlan.oldRuntimeSHA!=successor.oldRuntimeSHA || oldPlan.oldBundleSHA!=successor.oldBundleSHA || oldPlan.machines.size()!=successor.machines.size())return false;
+  for(size_t i=0;i<oldPlan.machines.size();++i)if(oldPlan.machines[i].uuid!=successor.machines[i].uuid || oldPlan.machines[i].linuxID!=successor.machines[i].linuxID || oldPlan.machines[i].address!=successor.machines[i].address)return false;
+  return true;
+}
+inline void requirePreactivation(Execution& e,const Execution *successor=nullptr) {
+  require(e.receipt.phase>=MothershipTidesDBMigrationPhase::writersQuiesced && !e.receipt.activationBoundaryCrossed,"retained action requires a fenced pre-activation operation");
+  for(const auto& database:e.receipt.databases) {
+    require(!database.swapped,"retained action refuses a database swap");
+    require(e.exists(database,database.livePath) && !e.exists(database,database.retainedV9Path),"retained action found an incomplete database swap");
+  }
+  for(const auto& machine:e.plan.machines) {
+    std::string fence="test \"$(cat "+quote(e.fencePath())+")\" = "+quote(e.plan.planSHA);
+    if(successor)fence="( "+fence+" || test \"$(cat "+quote(successor->fencePath())+")\" = "+quote(successor->plan.planSHA)+" )";
+    e.run(machine.uuid,"test \"$(systemctl show -p MainPID --value prodigy)\" = 0; "+fence+
+      "; test \"$(sha256sum "+quote(e.plan.runtimeRoot+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(e.plan.oldRuntimeSHA)+
+      "; test \"$(sha256sum "+quote(e.plan.runtimeRoot+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(e.plan.oldBundleSHA));
+  }
+}
+inline bool runFile(const char *file,const char *action,String *failure=nullptr,const char *repairBundle=nullptr,const char *successorFile=nullptr) {
   try {
-    require(std::strcmp(action,"recover")==0 || std::strcmp(action,"prepare")==0 || std::strcmp(action,"retire-extras")==0,"invalid retained recovery action");
+    require(std::strcmp(action,"recover")==0 || std::strcmp(action,"prepare")==0 || std::strcmp(action,"retire-extras")==0 || std::strcmp(action,"retire-extras-preactivation")==0 || std::strcmp(action,"supersede-preactivation")==0,"invalid retained recovery action");
     Plan plan=parse(file);plan.retainedRecovery=true;
     simdjson::dom::parser parser;simdjson::dom::element doc;auto raw=read(file);require(parser.parse(raw).get(doc)==simdjson::SUCCESS,"invalid recovery plan");
     bool mode=false;require(doc["retainedRecoveryMode"].get_bool().get(mode)==simdjson::SUCCESS && mode,"explicit retained recovery mode required");
@@ -202,14 +246,51 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
     require(e.cluster.clusterUUID==e.plan.clusterUUID && e.cluster.nBrains==3 && e.cluster.machines.size()==3 && str(e.cluster.remoteProdigyPath)==e.plan.runtimeRoot,"retained cluster authority differs");
     for(auto& m:e.plan.machines) {resolveRegisteredMachine(e.cluster,m);e.machines.emplace(m.uuid,&m);}
     e.buildArtifactManifest();
-    auto verify=[&](bool retire=false) {for(auto& m:e.plan.machines)e.run(m.uuid,inventoryProgram(e.remoteRoot+"/retained-manifest.json",m,retire));};
+    auto verify=[&](InventoryMode mode=InventoryMode::sealed) {for(auto& m:e.plan.machines)e.run(m.uuid,inventoryProgram(e.remoteRoot+"/retained-manifest.json",m,mode));};
+    const auto superseded=e.plan.operationRoot+"/superseded-by";
+    if(fs::exists(superseded)) { privateFile(superseded,4096); if(std::strcmp(action,"supersede-preactivation")!=0)throw std::runtime_error("retained operation was superseded before activation"); }
+    if(std::strcmp(action,"retire-extras-preactivation")==0) {
+      requirePreactivation(e); require(e.receipt.phase==MothershipTidesDBMigrationPhase::validated,"extra retirement requires prepared private copies");
+      for(const auto& database:e.receipt.databases)require(e.exists(database,database.livePath) && e.exists(database,database.copiedV9Path) && e.exists(database,database.preparedV10Path) && !e.exists(database,database.retainedV9Path),"extra retirement database state differs");
+      for(const auto& machine:e.plan.machines) {
+        const auto request=e.remoteRoot+"/recovery.request", marker=e.remoteRoot+"/prepared.request.sha256";
+        e.run(machine.uuid,"test -f "+quote(marker)+"; test \"$(cat "+quote(marker)+")\" = "+quote(digest(e.plan.operationRoot+"/recovery.request"))+"; LD_LIBRARY_PATH="+quote(e.remoteRuntime+"/lib")+" "+quote(e.remoteRuntime+"/tools/mothership")+" prepareRetainedRecoveryLocal "+quote(request)+" "+quote(e.remoteRoot+"/state.new10")+" verify");
+      }
+      const auto authority=e.plan.operationRoot+"/stateless-extras-authority"; privateFile(authority,4096);
+      require(read(authority)==e.plan.planSHA+"\n"+manifestSHA+"\n"+digest(e.plan.operationRoot+"/recovery.request")+"\n","stateless extra authority differs");
+      const auto started=e.plan.operationRoot+"/extras-retirement-started";
+      if(!fs::exists(started)) { verify(InventoryMode::sealed); durable(started,text(e.plan.planSHA+"\n"+manifestSHA+"\n")); }
+      else require(read(started)==e.plan.planSHA+"\n"+manifestSHA+"\n","extra retirement marker differs");
+      verify(InventoryMode::remaining); verify(InventoryMode::retire); verify(InventoryMode::canonical); e.acceptStoppedContainerBaseline(); durable(fs::path(e.plan.operationRoot)/"extras-retired",text(manifestSHA)); return true;
+    }
+    if(std::strcmp(action,"supersede-preactivation")==0) {
+      require(successorFile && !repairBundle,"supersession requires exactly a successor retained plan");
+      Plan successorPlan=parse(successorFile); successorPlan.retainedRecovery=true;
+      simdjson::dom::parser successorParser; simdjson::dom::element successorDoc; auto successorRaw=read(successorFile);
+      require(successorParser.parse(successorRaw).get(successorDoc)==simdjson::SUCCESS,"invalid successor recovery plan"); bool successorMode=false;
+      require(successorDoc["retainedRecoveryMode"].get_bool().get(successorMode)==simdjson::SUCCESS && successorMode,"successor retained recovery mode required");
+      const auto successorManifestPath=field(successorDoc,"retainedManifestPath"), successorManifestSHA=field(successorDoc,"retainedManifestSHA256"); pathCheck(successorManifestPath);
+      require(digest(successorManifestPath)==successorManifestSHA,"successor retained manifest digest mismatch"); Manifest successorManifest=parseManifest(successorManifestPath,successorPlan);
+      require(sameRecordIdentity(manifest,successorManifest),"successor retained manifest does not seal the predecessor inventory");
+      require(successorPlan.planSHA!=e.plan.planSHA && samePlanTarget(e.plan,successorPlan) && !successorPlan.operationRoot.starts_with(e.plan.operationRoot+"/") && !e.plan.operationRoot.starts_with(successorPlan.operationRoot+"/"),"invalid retained successor identity");
+      Execution successor(std::move(successorPlan)); successor.initialize(); require(successorManifest.request.bundleSHA==successor.receipt.approvedBundleSHA256,"successor retained manifest bundle mismatch");
+      requirePreactivation(e,&successor); verify(InventoryMode::sealed);
+      if(fs::exists(superseded))require(read(superseded)==successor.plan.planSHA+"\n","supersession selects another successor"); else durable(superseded,text(successor.plan.planSHA+"\n"));
+      successor.cluster=e.cluster; for(auto& machine:successor.plan.machines) { resolveRegisteredMachine(successor.cluster,machine); successor.machines.emplace(machine.uuid,&machine); }
+      require(successor.receipt.phase<=MothershipTidesDBMigrationPhase::writersQuiesced && !successor.receipt.activationBoundaryCrossed,"successor already crossed preparation");
+      successor.buildArtifactManifest(); successor.stageInheritedQuiesced(e);
+      for(auto& machine:successor.plan.machines)successor.upload(machine,successorManifestPath,successor.remoteRoot+"/retained-manifest.json");
+      durable(fs::path(successor.plan.operationRoot)/"inherited-preactivation",text(e.plan.planSHA+"\n"+manifestSHA+"\n"));
+      require(successor.receipt.phase<=MothershipTidesDBMigrationPhase::writersQuiesced && !successor.receipt.activationBoundaryCrossed,"successor already crossed activation");
+      successor.receipt.phase=MothershipTidesDBMigrationPhase::writersQuiesced; successor.persist(successor.receipt,nullptr); return true;
+    }
     if(std::strcmp(action,"retire-extras")==0) {
       require(e.receipt.phase==MothershipTidesDBMigrationPhase::completed && e.receipt.activationBoundaryCrossed,"recovery has not activated");
       // Root submits this explicit action only after inspecting canonical normal
       // application health; the identity gate still runs immediately per PID.
       const auto marker=e.plan.operationRoot+"/canonical-health-attestation";privateFile(marker,4096);
       require(read(marker)==e.plan.planSHA+"\n"+manifestSHA+"\n","canonical health attestation differs");
-      verify(true);durable(fs::path(e.plan.operationRoot)/"extras-retired",text(manifestSHA));return true;
+      verify(InventoryMode::sealed); verify(InventoryMode::remaining); verify(InventoryMode::retire); verify(InventoryMode::canonical); durable(fs::path(e.plan.operationRoot)/"extras-retired",text(manifestSHA));return true;
     }
     if(e.receipt.phase==MothershipTidesDBMigrationPhase::completed)return true;
     if(e.receipt.phase<MothershipTidesDBMigrationPhase::preflighted) {
@@ -217,7 +298,10 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
       for(auto& m:e.plan.machines)e.upload(m,manifestPath,e.remoteRoot+"/retained-manifest.json");
       verify();e.receipt.phase=MothershipTidesDBMigrationPhase::preflighted;e.persist(e.receipt,nullptr);
     }
-    if(e.receipt.phase<MothershipTidesDBMigrationPhase::writersQuiesced) {verify();e.quiesce();}
+    const auto retiredMarker=e.plan.operationRoot+"/extras-retired";
+    const bool extrasRetired=fs::exists(retiredMarker);
+    if(extrasRetired) { privateFile(retiredMarker,4096); require(read(retiredMarker)==manifestSHA,"retired inventory marker differs"); }
+    if(e.receipt.phase<MothershipTidesDBMigrationPhase::writersQuiesced) {verify(extrasRetired?InventoryMode::canonical:InventoryMode::sealed);e.quiesce();}
     if(!e.receipt.activationBoundaryCrossed) {
       for(auto& m:e.plan.machines)e.run(m.uuid,"test \"$(systemctl show -p MainPID --value prodigy)\" = 0; test \"$(cat "+quote(e.fencePath())+")\" = "+quote(e.plan.planSHA));
     }
@@ -237,13 +321,14 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
       helper.receipt.approvedBundleSHA256=approved;helper.receipt.newRuntimeSHA256=text(digest(helper.localRuntime+"/prodigy"));
       helper.buildArtifactManifest();helper.stageAndPreflight();preparationRuntime=helper.remoteRuntime;
     }
-    const auto requestPath=e.plan.operationRoot+"/recovery.request";
-    if(e.receipt.phase<MothershipTidesDBMigrationPhase::validated) {
+    const auto requestPath=e.plan.operationRoot+"/recovery.request", authorityPath=e.plan.operationRoot+"/stateless-extras-authority";
+    if(e.receipt.phase<MothershipTidesDBMigrationPhase::validated || !fs::exists(authorityPath)) {
       for(auto& db:e.receipt.databases) {
         String why;if(!e.exists(db,db.copiedV9Path))require(e.copySource(db,&why),"retained v10 copy failed");
         if(!e.exists(db,db.preparedV10Path)) e.run(db.machineUUID,"test ! -e "+quote(str(db.preparedV10Path)+".partial")+"; cp -a --reflink=auto "+quote(str(db.copiedV9Path))+" "+quote(str(db.preparedV10Path)+".partial")+"; sync -f "+quote(str(db.preparedV10Path)+".partial")+"; mv -T "+quote(str(db.preparedV10Path)+".partial")+" "+quote(str(db.preparedV10Path))+"; sync -f "+quote(e.remoteRoot));
       }
-      if(!fs::exists(requestPath)) {
+      const bool requestAlreadySealed=fs::exists(requestPath);
+      if(!requestAlreadySealed || !fs::exists(authorityPath)) {
         // This command runs on the selected seed; prove that before using the
         // seed's stopped private copy as shared deployment-plan authority.
         require(read("/etc/machine-id")==e.plan.machines[0].linuxID+"\n","retained recovery must run on selected seed");
@@ -259,7 +344,8 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
           if(!r.canonical) {require(!deployment->second.isStateful && deployment->second.config.type==ApplicationType::stateless,"extra retirement would affect a stateful container");continue;}
           for(auto& m:manifest.request.machines)if(m.machineUUID==r.machine) {m.parameters.push_back(std::move(params));m.observedCreatedAtMs.push_back(r.created);}
         }
-        String bytes;BitseryEngine::serialize(bytes,manifest.request);durable(requestPath,bytes);
+        String bytes;BitseryEngine::serialize(bytes,manifest.request); if(!requestAlreadySealed)durable(requestPath,bytes);
+        durable(authorityPath,text(e.plan.planSHA+"\n"+manifestSHA+"\n"+digest(requestPath)+"\n"));
       }
       const auto witnessPath=requestPath+".witnesses";
       if(!fs::exists(witnessPath)) {
@@ -278,7 +364,7 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         const auto invoke="LD_LIBRARY_PATH="+quote(preparationRuntime+"/lib")+" "+quote(preparationRuntime+"/tools/mothership")+" prepareRetainedRecoveryLocal "+quote(e.remoteRoot+"/recovery.request")+" "+quote(e.remoteRoot+"/state.new10");
         cmd+="if test -f "+quote(marker)+"; then test \"$(cat "+quote(marker)+")\" = "+quote(requestSHA)+"; "+invoke+" verify; else "+invoke+" prepare; printf %s "+quote(requestSHA)+" > "+quote(marker)+"; sync -f "+quote(marker)+"; fi";e.run(m.uuid,cmd);
       }
-      verify();e.receipt.phase=MothershipTidesDBMigrationPhase::validated;e.persist(e.receipt,nullptr);
+      verify(extrasRetired?InventoryMode::canonical:InventoryMode::sealed);e.receipt.phase=MothershipTidesDBMigrationPhase::validated;e.persist(e.receipt,nullptr);
     }
     if(std::strcmp(action,"prepare")==0) {require(!e.receipt.activationBoundaryCrossed,"recovery already activated");return true;}
     if(e.receipt.phase<MothershipTidesDBMigrationPhase::swapped) {
@@ -293,7 +379,7 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
       e.receipt.phase=MothershipTidesDBMigrationPhase::swapped;e.persist(e.receipt,nullptr);
     }
     if(!e.receipt.activationBoundaryCrossed) {
-      verify();for(auto& m:e.plan.machines)e.run(m.uuid,"LD_LIBRARY_PATH="+quote(preparationRuntime+"/lib")+" "+quote(preparationRuntime+"/tools/mothership")+" prepareRetainedRecoveryLocal "+quote(e.remoteRoot+"/recovery.request")+" "+quote(e.plan.statePath)+" verify");
+      verify(extrasRetired?InventoryMode::canonical:InventoryMode::sealed);for(auto& m:e.plan.machines)e.run(m.uuid,"LD_LIBRARY_PATH="+quote(preparationRuntime+"/lib")+" "+quote(preparationRuntime+"/tools/mothership")+" prepareRetainedRecoveryLocal "+quote(e.remoteRoot+"/recovery.request")+" "+quote(e.plan.statePath)+" verify");
       e.installRuntimes();
     }
     e.activate();return true;

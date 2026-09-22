@@ -1671,8 +1671,85 @@ int main(void)
     suite.expect(brain.testShouldWeConnectToBrain(&familyMismatchFalse), "should_we_connect_to_brain_skips_mismatched_local_candidate_family_and_falls_back_to_neuron_private4");
   };
 
+  auto countQueuedTopics = [&](String buffer, Vector<uint16_t>& topics) -> bool {
+    topics.clear();
+    forEachMessageInBuffer(buffer, [&](Message *message) -> void {
+      topics.push_back(message->topic);
+    });
+    return true;
+  };
+
+  auto findNeuronRegistrationRequiresState = [&](String buffer, bool& requiresState) -> bool {
+    bool found = false;
+    forEachMessageInBuffer(buffer, [&](Message *message) -> void {
+      if (found || NeuronTopic(message->topic) != NeuronTopic::registration)
+      {
+        return;
+      }
+
+      uint8_t *args = message->args;
+      if (args >= message->terminal())
+      {
+        return;
+      }
+
+      Message::extractArg<ArgumentNature::fixed>(args, requiresState);
+      found = true;
+    });
+    return found;
+  };
+
+  auto runNeuronReconnectInventoryFixture = [&]() {
+  for (bool recoveringInventory : {false, true})
+  {
+    ScopedRing scopedRing = {};
+
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    brain.ignited = !recoveringInventory;
+    brain.recoveringPersistedNeuronInventory = recoveringInventory;
+
+    Machine machine = {};
+    machine.private4 = IPAddress("10.0.0.21", false).v4;
+    machine.uuid = uint128_t(0x9021);
+    machine.state = MachineState::healthy;
+    machine.runtimeReady = true;
+    machine.neuron.machine = &machine;
+    machine.neuron.hadSuccessfulConnection = true;
+    brain.neurons.insert(&machine.neuron);
+
+    int peerFD = -1;
+    bool installed = installNeuronSocket(brain, machine, peerFD);
+    suite.expect(installed, "brain_neuron_connect_handler_reconnect_installs_socket");
+    if (installed)
+    {
+      Message::construct(machine.neuron.wBuffer, NeuronTopic::spinContainer, uint128_t(0), String("stale"_ctv));
+
+      brain.testConnectHandler(&machine.neuron, 0);
+
+      Vector<uint16_t> topics = {};
+      bool requiresState = true;
+      suite.expect(countQueuedTopics(machine.neuron.wBuffer, topics), "brain_neuron_connect_handler_reconnect_parses_messages");
+      suite.expect(findNeuronRegistrationRequiresState(machine.neuron.wBuffer, requiresState), "brain_neuron_connect_handler_reconnect_finds_registration_payload");
+      suite.expect(topics.size() == 1, "brain_neuron_connect_handler_reconnect_drops_stale_payload");
+      suite.expect(topics[0] == uint16_t(NeuronTopic::registration), "brain_neuron_connect_handler_reconnect_requeues_registration_only");
+      suite.expect(requiresState,
+                   "brain_neuron_reconnect_always_requests_fresh_inventory_before_ignition");
+
+      Ring::uninstallFromFixedFileSlot(&machine.neuron);
+      ::close(peerFD);
+      machine.neuron.fd = -1;
+    }
+  }
+  };
+
   if (const char *testOnly = ::getenv("PRODIGY_TEST_ONLY"); testOnly != nullptr)
   {
+    if (std::strcmp(testOnly, "neuron-reconnect-inventory") == 0)
+    {
+      runNeuronReconnectInventoryFixture();
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (std::strcmp(testOnly, "stranded-follower-reconnect") == 0)
     {
       runStrandedFollowerReconnectFixture(suite);
@@ -1931,34 +2008,6 @@ int main(void)
     brain.brains.erase(&nonMasterPeer);
     brain.brains.erase(&masterPeer);
   }
-
-  auto countQueuedTopics = [&](String buffer, Vector<uint16_t>& topics) -> bool {
-    topics.clear();
-    forEachMessageInBuffer(buffer, [&](Message *message) -> void {
-      topics.push_back(message->topic);
-    });
-    return true;
-  };
-
-  auto findNeuronRegistrationRequiresState = [&](String buffer, bool& requiresState) -> bool {
-    bool found = false;
-    forEachMessageInBuffer(buffer, [&](Message *message) -> void {
-      if (found || NeuronTopic(message->topic) != NeuronTopic::registration)
-      {
-        return;
-      }
-
-      uint8_t *args = message->args;
-      if (args >= message->terminal())
-      {
-        return;
-      }
-
-      Message::extractArg<ArgumentNature::fixed>(args, requiresState);
-      found = true;
-    });
-    return found;
-  };
 
   auto installBrainPeerSocket = [&](TestBrain& brain, BrainView& peer, int& peerFD) -> bool {
     int sv[2] = {-1, -1};
@@ -3384,47 +3433,7 @@ int main(void)
     }
   }
 
-  for (bool recoveringInventory : {false, true})
-  {
-    ScopedRing scopedRing = {};
-
-    TestBrain brain = {};
-    brain.iaas = new NoopBrainIaaS();
-    brain.ignited = !recoveringInventory;
-    brain.recoveringPersistedNeuronInventory = recoveringInventory;
-
-    Machine machine = {};
-    machine.private4 = IPAddress("10.0.0.21", false).v4;
-    machine.uuid = uint128_t(0x9021);
-    machine.state = MachineState::healthy;
-    machine.runtimeReady = true;
-    machine.neuron.machine = &machine;
-    machine.neuron.hadSuccessfulConnection = true;
-    brain.neurons.insert(&machine.neuron);
-
-    int peerFD = -1;
-    bool installed = installNeuronSocket(brain, machine, peerFD);
-    suite.expect(installed, "brain_neuron_connect_handler_reconnect_installs_socket");
-    if (installed)
-    {
-      Message::construct(machine.neuron.wBuffer, NeuronTopic::spinContainer, uint128_t(0), String("stale"_ctv));
-
-      brain.testConnectHandler(&machine.neuron, 0);
-
-      Vector<uint16_t> topics = {};
-      bool requiresState = true;
-      suite.expect(countQueuedTopics(machine.neuron.wBuffer, topics), "brain_neuron_connect_handler_reconnect_parses_messages");
-      suite.expect(findNeuronRegistrationRequiresState(machine.neuron.wBuffer, requiresState), "brain_neuron_connect_handler_reconnect_finds_registration_payload");
-      suite.expect(topics.size() == 1, "brain_neuron_connect_handler_reconnect_drops_stale_payload");
-      suite.expect(topics[0] == uint16_t(NeuronTopic::registration), "brain_neuron_connect_handler_reconnect_requeues_registration_only");
-      suite.expect(requiresState == recoveringInventory,
-                   "brain_neuron_reconnect_requests_recovery_inventory_before_ignition");
-
-      Ring::uninstallFromFixedFileSlot(&machine.neuron);
-      ::close(peerFD);
-      machine.neuron.fd = -1;
-    }
-  }
+  runNeuronReconnectInventoryFixture();
 
   {
     ScopedRing scopedRing = {};
