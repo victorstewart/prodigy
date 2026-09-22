@@ -5,6 +5,44 @@
 #include <prodigy/mothership/mothership.retained.recovery.command.h>
 #include <prodigy/mothership/mothership.tidesdb.migration.h>
 
+static void assertRetainedBootstrapUnorderedMapRoundTrip(void)
+{
+  NeuronContainerBootstrap bootstrap = {};
+  for (uint64_t index = 0; index < 16; ++index)
+  {
+    const uint64_t subscriptionService = 1000 + index;
+    const uint64_t advertisementService = 2000 + index;
+    bootstrap.plan.subscriptions[subscriptionService] = Subscription(
+        subscriptionService, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::any);
+    bootstrap.plan.advertisements[advertisementService] = Advertisement(
+        advertisementService, ContainerState::scheduled, ContainerState::destroying, uint16_t(3000 + index));
+
+    SubscriptionPairing subscriptionPairing = {};
+    subscriptionPairing.secret = 10 + index;
+    subscriptionPairing.address = 20 + index;
+    subscriptionPairing.service = subscriptionService;
+    subscriptionPairing.port = uint16_t(4000 + index);
+    bootstrap.plan.subscriptionPairings.insert(subscriptionService, subscriptionPairing);
+
+    AdvertisementPairing advertisementPairing = {};
+    advertisementPairing.secret = 30 + index;
+    advertisementPairing.address = 40 + index;
+    advertisementPairing.service = advertisementService;
+    bootstrap.plan.advertisementPairings.insert(advertisementService, advertisementPairing);
+  }
+
+  String serialized = {};
+  BitseryEngine::serialize(serialized, bootstrap);
+  NeuronContainerBootstrap roundTrip = {};
+  assert(BitseryEngine::deserializeSafe(serialized, roundTrip));
+  assert(prodigyPersistentRetainedBootstrapEqual(bootstrap, roundTrip));
+
+  auto changed = roundTrip.plan.advertisements.find(2000);
+  assert(changed != roundTrip.plan.advertisements.end());
+  changed->second.port += 1;
+  assert(!prodigyPersistentRetainedBootstrapEqual(bootstrap, roundTrip));
+}
+
 int main()
 {
   // Recovery must reject malformed input before it opens or mutates a private
@@ -22,6 +60,7 @@ int main()
   assert(strstr(quiesce.c_str(), "retained containers require a recovery checkpoint") != nullptr);
 
   using namespace MothershipRetainedRecovery;
+  assertRetainedBootstrapUnorderedMapRoundTrip();
   Request request;request.clusterUUID=1;request.bundleSHA.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
   String bytes;BitseryEngine::serialize(bytes,request);Request decoded;
   assert(BitseryEngine::deserializeSafe(bytes,decoded) && decoded.clusterUUID==1 && decoded.bundleSHA==request.bundleSHA);
@@ -48,17 +87,42 @@ int main()
     params.private6.network.is6=true;params.private6.cidr=128;
     std::memcpy(params.private6.network.v6,container_network_subnet6.value,11);
     params.private6.network.v6[11]=7;params.private6.network.v6[12]=0;params.private6.network.v6[13]=0;params.private6.network.v6[14]=i;params.private6.network.v6[15]=1;
+    for(uint64_t service=1;service<=16;++service) {
+      SubscriptionPairing subscriptionPairing = {};subscriptionPairing.secret=service;subscriptionPairing.address=service+100;subscriptionPairing.service=service;subscriptionPairing.port=uint16_t(5000+service);
+      params.subscriptionPairings.insert(service,subscriptionPairing);
+      AdvertisementPairing advertisementPairing = {};advertisementPairing.secret=service+200;advertisementPairing.address=service+300;advertisementPairing.service=service+1000;
+      params.advertisementPairings.insert(service+1000,advertisementPairing);
+    }
     input.parameters.push_back(params);input.observedCreatedAtMs.push_back(1790040000000LL);request.machines.push_back(input);
   }
-  { ProdigyPersistentStateStore store(MothershipTidesMigration::text(statePath)); assert(store.saveBrainSnapshot(snapshot,&failure)); }
+  auto preparedSnapshot=snapshot;
+  assert(mothershipPrepareRetainedRecoverySnapshot(preparedSnapshot,request.plans,request.machines,request.bundleSHA,&failure));
+  auto preexistingSnapshot=preparedSnapshot;
+  String& originalBootstrap=preexistingSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].containerBootstraps[0];
+  NeuronContainerBootstrap decodedBootstrap = {};assert(BitseryEngine::deserializeSafe(originalBootstrap,decodedBootstrap));
+  NeuronContainerBootstrap reorderedBootstrap=decodedBootstrap;
+  Vector<std::pair<uint64_t,Vector<SubscriptionPairing>>> subscriptionPairings = {};
+  for(const auto& [service,pairings]:decodedBootstrap.plan.subscriptionPairings) subscriptionPairings.emplace_back(service,pairings);
+  reorderedBootstrap.plan.subscriptionPairings.clear();
+  for(auto iterator=subscriptionPairings.rbegin();iterator!=subscriptionPairings.rend();++iterator)
+    for(const SubscriptionPairing& pairing:iterator->second) reorderedBootstrap.plan.subscriptionPairings.insert(iterator->first,pairing);
+  String reorderedBytes = {};BitseryEngine::serialize(reorderedBytes,reorderedBootstrap);
+  assert(!originalBootstrap.equals(reorderedBytes));
+  originalBootstrap=std::move(reorderedBytes);
+  assert(prodigyPersistentRetainedBootstrapEqual(decodedBootstrap,reorderedBootstrap));
+  { ProdigyPersistentStateStore store(MothershipTidesMigration::text(statePath)); assert(store.saveBrainSnapshot(preexistingSnapshot,&failure)); }
   std::filesystem::create_directories(statePath+".secrets");
   BitseryEngine::serialize(bytes,request);MothershipTidesMigration::durable(requestPath,bytes);
+  WitnessSet sealed;sealed.requestSHA=MothershipTidesMigration::text(MothershipTidesMigration::digest(requestPath));
+  sealed.witnesses=preparedSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
+  BitseryEngine::serialize(bytes,sealed);MothershipTidesMigration::durable(requestPath+".witnesses",bytes);
   const bool prepared=prepareLocal(requestPath.c_str(),statePath.c_str(),false,&failure);
   if(!prepared)std::fprintf(stderr,"private recovery preparation: %s\n",failure.c_str());
   assert(prepared);
   assert(prepareLocal(requestPath.c_str(),statePath.c_str(),true,&failure));
   ProdigyPersistentBrainSnapshot after;loadSnapshot(statePath,after);
   assert(after.masterAuthority.runtimeState.generation==1 && after.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses.size()==3);
+  assert(after.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].containerBootstraps[0].equals(sealed.witnesses[0].containerBootstraps[0]));
   // A saved request is an idempotent retry even if its outer marker was lost.
   assert(prepareLocal(requestPath.c_str(),statePath.c_str(),false,&failure));
   request.machines[0].parameters[0].memoryMB+=1;

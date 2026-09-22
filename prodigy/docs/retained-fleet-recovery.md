@@ -36,11 +36,29 @@ configuration, and rebuilds service definitions through the normal scheduler
 owner. Containers start as scheduled and unready. Normal readiness, mesh and
 bundle-attestation checks must establish their actual health.
 
-Private-copy readback must match before six atomic directory swaps. Original v10
+The seed seals one set of serialized recovery witnesses, bound to the immutable
+request digest, and supplies those exact bytes to every Brain. Verification
+compares unordered maps by keys and values; ordered fields and sealed witness
+bytes remain exact. Private-copy readback must match before six atomic directory swaps. Original v10
 directories and the previous runtime are retained. The existing durable lifecycle
 receipt records each swap and crosses the activation boundary before any new
 writer starts. Repeat the same immutable command after interruption; do not
 replace its plan or silently roll back after activation.
+
+Before activation, a stopped operation can use a separately approved repair-tool
+bundle without changing its plan or deployment bundle:
+
+`mothership recoverRetainedFleet PRIVATE_PLAN recover REPAIR_TOOL_BUNDLE`
+
+Use action `prepare` in place of `recover` to stop after all private copies pass
+readback, before any original directory is renamed or runtime activated.
+
+The repair bundle must be produced by Discombobulator and contain the exact
+Mothership executing the command. Mothership stages and verifies the entire tool
+bundle on each selected guest. This option requires the existing writer fences
+and quiesced receipt; it cannot authorize a new deployment identity or roll back
+activated writers. A previously prepared private copy may be rewritten only when
+its decoded witnesses and all other snapshot content match the sealed request.
 
 The internal `prepareRetainedRecoveryLocal REQUEST STATE prepare|verify` command
 is invoked by the staged Mothership against private copies. It is not a substitute

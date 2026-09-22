@@ -10101,7 +10101,7 @@ private:
   void runRecoverRetainedFleet(int argc, char *argv[])
   {
     String failure;
-    if (argc != 2 || !MothershipRetainedRecovery::runFile(argv[0], argv[1], &failure)) {
+    if ((argc != 2 && argc != 3) || !MothershipRetainedRecovery::runFile(argv[0], argv[1], &failure, argc == 3 ? argv[2] : nullptr)) {
       basics_log("recoverRetainedFleet success=0 failure=%s\n", failure.c_str()); exit(EXIT_FAILURE);
     }
     basics_log("recoverRetainedFleet success=1 action=%s applicationHealthAttested=0\n", argv[1]);

@@ -22,6 +22,29 @@ struct Request {
 template<typename S> void serialize(S&& s, Request& r) {
   s.value16b(r.clusterUUID); s.text1b(r.bundleSHA,UINT32_MAX); s.object(r.plans); s.object(r.machines);
 }
+// The seed generates these bytes once. Every Brain must receive identical
+// witness strings, even when unordered maps decode in a different order.
+struct WitnessSet {
+  String requestSHA;
+  Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness> witnesses;
+};
+template<typename S> void serialize(S&& s, WitnessSet& w) {
+  s.text1b(w.requestSHA,64); s.object(w.witnesses);
+}
+inline bool witnessesEquivalent(const Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness>& a,
+                                const Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness>& b) {
+  if(a.size()!=b.size())return false;
+  for(uint32_t i=0;i<a.size();++i) {
+    if(a[i].machineUUID!=b[i].machineUUID || a[i].bundleRegistered!=b[i].bundleRegistered || a[i].containerBootstraps.size()!=b[i].containerBootstraps.size())return false;
+    for(uint32_t j=0;j<a[i].containerBootstraps.size();++j) {
+      NeuronContainerBootstrap left,right;
+      if(!BitseryEngine::deserializeSafe(a[i].containerBootstraps[j],left) ||
+         !BitseryEngine::deserializeSafe(b[i].containerBootstraps[j],right) ||
+         !prodigyPersistentRetainedBootstrapEqual(left,right))return false;
+    }
+  }
+  return true;
+}
 struct Record {
   uint128_t machine=0, container=0;
   uint64_t pid=0, created=0;
@@ -81,22 +104,29 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
     require(::getenv("PRODIGY_STATE_SECRETS_DB")==nullptr,"recovery refuses a secrets-path override");
     Request request;require(BitseryEngine::deserializeSafe(text(read(requestPath)),request),"recovery request decode failed");
     ProdigyPersistentBrainSnapshot before;loadSnapshot(path,before);require(before.brainConfig.clusterUUID==request.clusterUUID,"recovery request targets another cluster");
-    // A save may have completed before its outer marker was persisted.
-    // Reentry accepts only an exact readback of this same recovery request.
-    verifyOnly = verifyOnly || before.masterAuthority.runtimeState.updateSelf.active();
+    const auto witnessPath=std::string(requestPath)+".witnesses";privateFile(witnessPath);
+    WitnessSet sealed;require(BitseryEngine::deserializeSafe(text(read(witnessPath)),sealed) && sealed.requestSHA==text(digest(requestPath)),"sealed recovery witnesses differ from request");
+    const bool alreadyPrepared=before.masterAuthority.runtimeState.updateSelf.active();
+    require(!verifyOnly || alreadyPrepared,"recovery snapshot is not prepared");
     auto expected=before;
-    if(verifyOnly) {
-      // The prepared request's exact witness, digest and deployment authority
-      // are checked without accepting a different active update operation.
+    if(alreadyPrepared) {
       expected.masterAuthority.runtimeState.updateSelf={};
       require(expected.masterAuthority.runtimeState.generation>0,"recovery generation missing"); --expected.masterAuthority.runtimeState.generation;
     }
     String why;
     require(mothershipPrepareRetainedRecoverySnapshot(expected,request.plans,request.machines,request.bundleSHA,&why),str(why).c_str());
-    if(verifyOnly) { require(prodigyPersistentSerializedEqual(before,expected),"prepared recovery snapshot readback differs");return true; }
+    require(witnessesEquivalent(expected.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses,sealed.witnesses),"sealed witnesses differ from validated retained fleet");
+    expected.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses=sealed.witnesses;
+    if(alreadyPrepared) {
+      auto comparable=before;
+      require(witnessesEquivalent(comparable.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses,sealed.witnesses),"existing prepared witnesses differ from retained fleet");
+      comparable.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses=sealed.witnesses;
+      require(prodigyPersistentBrainSnapshotsEqual(comparable,expected),"prepared recovery snapshot content differs");
+    }
+    if(verifyOnly) { require(prodigyPersistentBrainSnapshotsEqual(before,expected),"prepared recovery snapshot readback differs");return true; }
     { ProdigyPersistentStateStore store(text(path)); require(store.saveBrainSnapshot(expected,&why),"private recovery snapshot write failed"); }
     ProdigyPersistentBrainSnapshot observed;loadSnapshot(path,observed);
-    require(prodigyPersistentSerializedEqual(expected,observed),"private recovery snapshot did not persist exactly");return true;
+    require(prodigyPersistentBrainSnapshotsEqual(expected,observed),"private recovery snapshot did not persist exactly");return true;
   } catch(const std::exception& e) { if(failure) failure->assign(e.what());return false; }
 }
 
@@ -154,9 +184,9 @@ print('pinned stateless extras retired')
 )PY";
   return "python3 -c "+quote(code);
 }
-inline bool runFile(const char *file,const char *action,String *failure=nullptr) {
+inline bool runFile(const char *file,const char *action,String *failure=nullptr,const char *repairBundle=nullptr) {
   try {
-    require(std::strcmp(action,"recover")==0 || std::strcmp(action,"retire-extras")==0,"invalid retained recovery action");
+    require(std::strcmp(action,"recover")==0 || std::strcmp(action,"prepare")==0 || std::strcmp(action,"retire-extras")==0,"invalid retained recovery action");
     Plan plan=parse(file);plan.retainedRecovery=true;
     simdjson::dom::parser parser;simdjson::dom::element doc;auto raw=read(file);require(parser.parse(raw).get(doc)==simdjson::SUCCESS,"invalid recovery plan");
     bool mode=false;require(doc["retainedRecoveryMode"].get_bool().get(mode)==simdjson::SUCCESS && mode,"explicit retained recovery mode required");
@@ -188,6 +218,25 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr)
       verify();e.receipt.phase=MothershipTidesDBMigrationPhase::preflighted;e.persist(e.receipt,nullptr);
     }
     if(e.receipt.phase<MothershipTidesDBMigrationPhase::writersQuiesced) {verify();e.quiesce();}
+    if(!e.receipt.activationBoundaryCrossed) {
+      for(auto& m:e.plan.machines)e.run(m.uuid,"test \"$(systemctl show -p MainPID --value prodigy)\" = 0; test \"$(cat "+quote(e.fencePath())+")\" = "+quote(e.plan.planSHA));
+    }
+    // A repair CLI may resume an immutable, pre-activation operation using a
+    // separately approved Discombobulator tool bundle. The deployment bundle,
+    // receipt, databases and writer fences retain their original identities.
+    std::string preparationRuntime=e.remoteRuntime;
+    if(repairBundle) {
+      require(e.receipt.phase>=MothershipTidesDBMigrationPhase::writersQuiesced && !e.receipt.activationBoundaryCrossed,"repair tools require a fenced pre-activation recovery");
+      pathCheck(repairBundle);String approved,why;
+      require(prodigyApproveBundleArtifact(text(repairBundle),approved,&why),"recovery tool bundle not approved");
+      Plan helperPlan=e.plan;helperPlan.operationRoot+="/tool-"+str(approved);helperPlan.bundle=repairBundle;
+      Execution helper(std::move(helperPlan));helper.cluster=e.cluster;helper.machines=e.machines;helper.receipt=e.receipt;
+      fs::create_directories(helper.plan.operationRoot);require(::chmod(helper.plan.operationRoot.c_str(),0700)==0,"cannot protect recovery tool directory");
+      require(prodigyInstallBundleToRoot(text(repairBundle),text(helper.localRuntime),&why),"recovery tool staging failed");
+      require(digest("/proc/self/exe")==digest(helper.localRuntime+"/tools/mothership"),"repair bundle does not contain this Mothership");
+      helper.receipt.approvedBundleSHA256=approved;helper.receipt.newRuntimeSHA256=text(digest(helper.localRuntime+"/prodigy"));
+      helper.buildArtifactManifest();helper.stageAndPreflight();preparationRuntime=helper.remoteRuntime;
+    }
     const auto requestPath=e.plan.operationRoot+"/recovery.request";
     if(e.receipt.phase<MothershipTidesDBMigrationPhase::validated) {
       for(auto& db:e.receipt.databases) {
@@ -212,15 +261,26 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr)
         }
         String bytes;BitseryEngine::serialize(bytes,manifest.request);durable(requestPath,bytes);
       }
+      const auto witnessPath=requestPath+".witnesses";
+      if(!fs::exists(witnessPath)) {
+        require(read("/etc/machine-id")==e.plan.machines[0].linuxID+"\n","witness sealing requires the selected seed");
+        Request request;require(BitseryEngine::deserializeSafe(text(read(requestPath)),request),"sealed request unreadable");
+        ProdigyPersistentBrainSnapshot seed;loadSnapshot(e.remoteRoot+"/state.copy10",seed);String why;
+        require(mothershipPrepareRetainedRecoverySnapshot(seed,request.plans,request.machines,request.bundleSHA,&why),str(why).c_str());
+        WitnessSet sealed;sealed.requestSHA=text(digest(requestPath));sealed.witnesses=seed.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
+        String bytes;BitseryEngine::serialize(bytes,sealed);durable(witnessPath,bytes);
+      }
       for(auto& m:e.plan.machines) {
         e.upload(m,requestPath,e.remoteRoot+"/recovery.request");
+        e.upload(m,witnessPath,e.remoteRoot+"/recovery.request.witnesses");
         const auto marker=e.remoteRoot+"/prepared.request.sha256",requestSHA=digest(requestPath);
         std::string cmd="test \"$(systemctl show -p MainPID --value prodigy)\" = 0; ";
-        const auto invoke=e.environment(m.uuid)+quote(e.remoteRuntime+"/tools/mothership")+" prepareRetainedRecoveryLocal "+quote(e.remoteRoot+"/recovery.request")+" "+quote(e.remoteRoot+"/state.new10");
+        const auto invoke="LD_LIBRARY_PATH="+quote(preparationRuntime+"/lib")+" "+quote(preparationRuntime+"/tools/mothership")+" prepareRetainedRecoveryLocal "+quote(e.remoteRoot+"/recovery.request")+" "+quote(e.remoteRoot+"/state.new10");
         cmd+="if test -f "+quote(marker)+"; then test \"$(cat "+quote(marker)+")\" = "+quote(requestSHA)+"; "+invoke+" verify; else "+invoke+" prepare; printf %s "+quote(requestSHA)+" > "+quote(marker)+"; sync -f "+quote(marker)+"; fi";e.run(m.uuid,cmd);
       }
       verify();e.receipt.phase=MothershipTidesDBMigrationPhase::validated;e.persist(e.receipt,nullptr);
     }
+    if(std::strcmp(action,"prepare")==0) {require(!e.receipt.activationBoundaryCrossed,"recovery already activated");return true;}
     if(e.receipt.phase<MothershipTidesDBMigrationPhase::swapped) {
       for(auto& db:e.receipt.databases) {
         if(db.swapped)continue;String why;
@@ -233,7 +293,7 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr)
       e.receipt.phase=MothershipTidesDBMigrationPhase::swapped;e.persist(e.receipt,nullptr);
     }
     if(!e.receipt.activationBoundaryCrossed) {
-      verify();for(auto& m:e.plan.machines)e.run(m.uuid,e.environment(m.uuid)+quote(e.remoteRuntime+"/tools/mothership")+" prepareRetainedRecoveryLocal "+quote(e.remoteRoot+"/recovery.request")+" "+quote(e.plan.statePath)+" verify");
+      verify();for(auto& m:e.plan.machines)e.run(m.uuid,"LD_LIBRARY_PATH="+quote(preparationRuntime+"/lib")+" "+quote(preparationRuntime+"/tools/mothership")+" prepareRetainedRecoveryLocal "+quote(e.remoteRoot+"/recovery.request")+" "+quote(e.plan.statePath)+" verify");
       e.installRuntimes();
     }
     e.activate();return true;

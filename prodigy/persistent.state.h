@@ -2697,6 +2697,110 @@ static bool prodigyPersistentSerializedEqual(const T& lhs, const T& rhs)
   return equal;
 }
 
+template <typename Value>
+static bool prodigyPersistentMapValueEqual(const Value& lhs, const Value& rhs)
+{
+  if constexpr (std::is_arithmetic_v<Value> || std::is_enum_v<Value>)
+  {
+    return lhs == rhs;
+  }
+  else
+  {
+    return prodigyPersistentSerializedEqual(lhs, rhs);
+  }
+}
+
+template <typename Key, typename Value>
+static bool prodigyPersistentMapEqual(
+    const bytell_hash_map<Key, Value>& lhs,
+    const bytell_hash_map<Key, Value>& rhs)
+{
+  if (lhs.size() != rhs.size())
+  {
+    return false;
+  }
+
+  for (const auto& [key, value] : lhs)
+  {
+    auto it = rhs.find(key);
+    if (it == rhs.end() || prodigyPersistentMapValueEqual(value, it->second) == false)
+    {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+template <typename Key, typename Value>
+static bool prodigyPersistentMapEqual(
+    const bytell_hash_subvector<Key, Value>& lhs,
+    const bytell_hash_subvector<Key, Value>& rhs)
+{
+  return prodigyPersistentMapEqual(lhs.map, rhs.map);
+}
+
+static bool prodigyPersistentRetainedBootstrapEqual(
+    const NeuronContainerBootstrap& lhs,
+    const NeuronContainerBootstrap& rhs)
+{
+  if (prodigyPersistentMapEqual(lhs.plan.subscriptions, rhs.plan.subscriptions) == false ||
+      prodigyPersistentMapEqual(lhs.plan.advertisements, rhs.plan.advertisements) == false ||
+      prodigyPersistentMapEqual(lhs.plan.subscriptionPairings, rhs.plan.subscriptionPairings) == false ||
+      prodigyPersistentMapEqual(lhs.plan.advertisementPairings, rhs.plan.advertisementPairings) == false)
+  {
+    return false;
+  }
+
+  NeuronContainerBootstrap lhsCopy = lhs;
+  NeuronContainerBootstrap rhsCopy = rhs;
+  lhsCopy.plan.subscriptions.clear();
+  lhsCopy.plan.advertisements.clear();
+  lhsCopy.plan.subscriptionPairings.clear();
+  lhsCopy.plan.advertisementPairings.clear();
+  rhsCopy.plan.subscriptions.clear();
+  rhsCopy.plan.advertisements.clear();
+  rhsCopy.plan.subscriptionPairings.clear();
+  rhsCopy.plan.advertisementPairings.clear();
+  return prodigyPersistentSerializedEqual(lhsCopy, rhsCopy);
+}
+
+static bool prodigyPersistentBrainSnapshotsEqual(
+    const ProdigyPersistentBrainSnapshot& lhs,
+    const ProdigyPersistentBrainSnapshot& rhs)
+{
+  const auto& lhsAuthority = lhs.masterAuthority;
+  const auto& rhsAuthority = rhs.masterAuthority;
+  if (prodigyPersistentMapEqual(lhsAuthority.tlsVaultFactoriesByApp, rhsAuthority.tlsVaultFactoriesByApp) == false ||
+      prodigyPersistentMapEqual(lhsAuthority.apiCredentialSetsByApp, rhsAuthority.apiCredentialSetsByApp) == false ||
+      prodigyPersistentMapEqual(lhsAuthority.reservedApplicationIDsByName, rhsAuthority.reservedApplicationIDsByName) == false ||
+      prodigyPersistentMapEqual(lhsAuthority.reservedApplicationNamesByID, rhsAuthority.reservedApplicationNamesByID) == false ||
+      prodigyPersistentMapEqual(lhsAuthority.deploymentPlans, rhsAuthority.deploymentPlans) == false ||
+      prodigyPersistentMapEqual(lhsAuthority.failedDeployments, rhsAuthority.failedDeployments) == false ||
+      lhsAuthority.runtimeState != rhsAuthority.runtimeState)
+  {
+    return false;
+  }
+
+  ProdigyPersistentBrainSnapshot lhsCopy = lhs;
+  ProdigyPersistentBrainSnapshot rhsCopy = rhs;
+  lhsCopy.masterAuthority.tlsVaultFactoriesByApp.clear();
+  lhsCopy.masterAuthority.apiCredentialSetsByApp.clear();
+  lhsCopy.masterAuthority.reservedApplicationIDsByName.clear();
+  lhsCopy.masterAuthority.reservedApplicationNamesByID.clear();
+  lhsCopy.masterAuthority.deploymentPlans.clear();
+  lhsCopy.masterAuthority.failedDeployments.clear();
+  lhsCopy.masterAuthority.runtimeState = {};
+  rhsCopy.masterAuthority.tlsVaultFactoriesByApp.clear();
+  rhsCopy.masterAuthority.apiCredentialSetsByApp.clear();
+  rhsCopy.masterAuthority.reservedApplicationIDsByName.clear();
+  rhsCopy.masterAuthority.reservedApplicationNamesByID.clear();
+  rhsCopy.masterAuthority.deploymentPlans.clear();
+  rhsCopy.masterAuthority.failedDeployments.clear();
+  rhsCopy.masterAuthority.runtimeState = {};
+  return prodigyPersistentSerializedEqual(lhsCopy, rhsCopy);
+}
+
 static bool prodigyPersistentRawBytesEqual(const String& lhs, const String& rhs)
 {
   return lhs.size() == rhs.size() && (lhs.size() == 0 || std::memcmp(lhs.data(), rhs.data(), lhs.size()) == 0);
