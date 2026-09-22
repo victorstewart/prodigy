@@ -26,6 +26,63 @@ static inline bool mothershipRetainedRecoveryPlansEqual(const DeploymentPlan& lh
   return left == right;
 }
 
+static inline bool mothershipRetainedRecoveryEnvelopeMatches(
+    const ProdigyPersistentUpdateSelfState& update, const String& bundleSHA256)
+{
+  if (!prodigyIsSHA256HexDigest(bundleSHA256) || update.machineRecoveryWitnesses.empty()) return false;
+  ProdigyPersistentUpdateSelfState envelope;
+  envelope.workerExpectedBundleSHA256 = bundleSHA256;
+  envelope.machineRecoveryWitnesses = update.machineRecoveryWitnesses;
+  return update == envelope;
+}
+
+// A fenced fleet may have stopped while the normal updater was only collecting
+// bundle echoes. Accept that transaction only for this exact successor, before
+// any exec or handoff evidence. The command owner proves the stopped runtime
+// and retained process identities; this owner validates the saved transaction.
+static inline bool mothershipRetainedRecoveryCanReplaceUpdate(
+    const ProdigyPersistentBrainSnapshot& snapshot, const String& expectedBundleSHA256,
+    const String& previousBundleSHA256 = {})
+{
+  const auto& update = snapshot.masterAuthority.runtimeState.updateSelf;
+  if (!update.active()) return true;
+  // Followers can still hold the previous recovery envelope when the master's
+  // next update is contained. Only the sealed installed predecessor is allowed.
+  const bool previousEnvelope = mothershipRetainedRecoveryEnvelopeMatches(update, previousBundleSHA256);
+  if (!previousEnvelope && (update.state != uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForBundleEchos) ||
+      update.expectedEchos == 0 || update.expectedEchos >= snapshot.topology.machines.size() ||
+      update.bundleEchos > update.expectedEchos || update.bundleEchoPeerKeys.size() != update.bundleEchos ||
+      update.relinquishEchos != 0 || update.plannedMasterPeerKey != 0 || update.pendingDesignatedMasterPeerKey != 0 ||
+      update.useStagedBundleOnly || update.bundleBlob.empty() ||
+      !update.relinquishEchoPeerKeys.empty() || !update.followerBootNsByPeerKey.empty() || !update.followerRebootedPeerKeys.empty() ||
+      update.workerExpectedBundleSHA256 != expectedBundleSHA256 || !update.workerFailure.empty() ||
+      !update.workerMachineUUIDs.empty() || !update.workerStagedMachineUUIDs.empty() ||
+      !update.workerTransitionIssuedMachineUUIDs.empty() || !update.workerRebootedMachineUUIDs.empty() ||
+      !update.workerStateUploadedMachineUUIDs.empty() || update.localMachineUUID != 0 ||
+      update.localBundleRegistered || !update.localContainerBootstraps.empty())) return false;
+  bytell_hash_set<uint128_t> peers;
+  for (uint128_t key : update.bundleEchoPeerKeys)
+  {
+    if (key == 0 || !peers.insert(key).second) return false;
+    bool known = false;
+    for (const auto& machine : snapshot.topology.machines) known |= machine.uuid == key;
+    if (!known) return false;
+  }
+  if (!update.machineRecoveryWitnesses.empty()) {
+    if (update.machineRecoveryWitnesses.size() != snapshot.topology.machines.size()) return false;
+    bytell_hash_set<uint128_t> machines;
+    for (const auto& witness : update.machineRecoveryWitnesses) {
+      if (witness.bundleRegistered || !machines.insert(witness.machineUUID).second) return false;
+      bool known = false;
+      for (const auto& machine : snapshot.topology.machines) known |= machine.uuid == witness.machineUUID;
+      if (!known) return false;
+    }
+  }
+  if (previousEnvelope) return true;
+  String digest;
+  return prodigyComputeSHA256Hex(update.bundleBlob, digest) && digest == expectedBundleSHA256;
+}
+
 // `approvedPlans` is read from the sealed seed copy.  Existing plans are never
 // overwritten; a missing plan is admitted only if its supplied deployment ID
 // and exact serialized plan agree with every recovered bootstrap.
@@ -34,7 +91,8 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
     const bytell_hash_map<uint64_t, DeploymentPlan>& approvedPlans,
     const Vector<MothershipRetainedRecoveryMachineInput>& machines,
     const String& expectedBundleSHA256,
-    String *failure = nullptr)
+    String *failure = nullptr,
+    const String& previousBundleSHA256 = {})
 {
   if (failure) failure->clear();
   if (snapshot.brainConfig.clusterUUID == 0 ||
@@ -47,9 +105,10 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
     return false;
   }
   auto& runtime = snapshot.masterAuthority.runtimeState;
-  if (runtime.generation == std::numeric_limits<uint64_t>::max() || runtime.updateSelf.active())
+  if (runtime.generation == std::numeric_limits<uint64_t>::max() ||
+      !mothershipRetainedRecoveryCanReplaceUpdate(snapshot, expectedBundleSHA256, previousBundleSHA256))
   {
-    if (failure) failure->assign("retained recovery refuses an active or exhausted update coordinator"_ctv);
+    if (failure) failure->assign("retained recovery refuses an incompatible or exhausted update coordinator"_ctv);
     return false;
   }
 

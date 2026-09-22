@@ -97,7 +97,7 @@ inline void loadSnapshot(const std::string& path,ProdigyPersistentBrainSnapshot&
   require(store.loadBrainSnapshot(snapshot,&failure),"private recovery snapshot unreadable");
 }
 // Only the staged Mothership invokes this against its private paired copy.
-inline bool prepareLocal(const char *requestPath,const char *statePath,bool verifyOnly,String *failure) {
+inline bool prepareLocal(const char *requestPath,const char *statePath,bool verifyOnly,String *failure,const String& previousBundleSHA256={}) {
   try {
     privateFile(requestPath); const std::string path=statePath;pathCheck(path);
     require(path.ends_with("/state.new10") || (verifyOnly && path=="/var/lib/prodigy/state"),"recovery suboperation refuses an unowned database path");
@@ -106,7 +106,9 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
     ProdigyPersistentBrainSnapshot before;loadSnapshot(path,before);require(before.brainConfig.clusterUUID==request.clusterUUID,"recovery request targets another cluster");
     const auto witnessPath=std::string(requestPath)+".witnesses";privateFile(witnessPath);
     WitnessSet sealed;require(BitseryEngine::deserializeSafe(text(read(witnessPath)),sealed) && sealed.requestSHA==text(digest(requestPath)),"sealed recovery witnesses differ from request");
-    const bool alreadyPrepared=before.masterAuthority.runtimeState.updateSelf.active();
+    // An interrupted normal update is active too. Only the recovery envelope
+    // may skip a generation increment on retry; verify its witnesses below.
+    const bool alreadyPrepared=mothershipRetainedRecoveryEnvelopeMatches(before.masterAuthority.runtimeState.updateSelf,request.bundleSHA);
     require(!verifyOnly || alreadyPrepared,"recovery snapshot is not prepared");
     auto expected=before;
     if(alreadyPrepared) {
@@ -114,7 +116,7 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
       require(expected.masterAuthority.runtimeState.generation>0,"recovery generation missing"); --expected.masterAuthority.runtimeState.generation;
     }
     String why;
-    require(mothershipPrepareRetainedRecoverySnapshot(expected,request.plans,request.machines,request.bundleSHA,&why),str(why).c_str());
+    require(mothershipPrepareRetainedRecoverySnapshot(expected,request.plans,request.machines,request.bundleSHA,&why,previousBundleSHA256),str(why).c_str());
     require(witnessesEquivalent(expected.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses,sealed.witnesses),"sealed witnesses differ from validated retained fleet");
     expected.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses=sealed.witnesses;
     if(alreadyPrepared) {
@@ -355,6 +357,10 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
     if(e.receipt.phase<MothershipTidesDBMigrationPhase::writersQuiesced) {verify(extrasRetired?InventoryMode::canonical:InventoryMode::sealed);e.quiesce();}
     if(!e.receipt.activationBoundaryCrossed) {
       for(auto& m:e.plan.machines)e.run(m.uuid,"test \"$(systemctl show -p MainPID --value prodigy)\" = 0; test \"$(cat "+quote(e.fencePath())+")\" = "+quote(e.plan.planSHA));
+      if(e.receipt.phase<MothershipTidesDBMigrationPhase::validated) {
+        requirePreactivation(e);
+        verify(extrasRetired?InventoryMode::canonical:InventoryMode::sealed);
+      }
     }
     // A repair CLI may resume an immutable, pre-activation operation using a
     // separately approved Discombobulator tool bundle. The deployment bundle,
@@ -403,7 +409,7 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         require(read("/etc/machine-id")==e.plan.machines[0].linuxID+"\n","witness sealing requires the selected seed");
         Request request;require(BitseryEngine::deserializeSafe(text(read(requestPath)),request),"sealed request unreadable");
         ProdigyPersistentBrainSnapshot seed;loadSnapshot(e.remoteRoot+"/state.copy10",seed);String why;
-        require(mothershipPrepareRetainedRecoverySnapshot(seed,request.plans,request.machines,request.bundleSHA,&why),str(why).c_str());
+        require(mothershipPrepareRetainedRecoverySnapshot(seed,request.plans,request.machines,request.bundleSHA,&why,text(e.plan.oldBundleSHA)),str(why).c_str());
         WitnessSet sealed;sealed.requestSHA=text(digest(requestPath));sealed.witnesses=seed.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
         String bytes;BitseryEngine::serialize(bytes,sealed);durable(witnessPath,bytes);
       }
@@ -413,7 +419,7 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         const auto marker=e.remoteRoot+"/prepared.request.sha256",requestSHA=digest(requestPath);
         std::string cmd="test \"$(systemctl show -p MainPID --value prodigy)\" = 0; ";
         const auto invoke="LD_LIBRARY_PATH="+quote(preparationRuntime+"/lib")+" "+quote(preparationRuntime+"/tools/mothership")+" prepareRetainedRecoveryLocal "+quote(e.remoteRoot+"/recovery.request")+" "+quote(e.remoteRoot+"/state.new10");
-        cmd+="if test -f "+quote(marker)+"; then test \"$(cat "+quote(marker)+")\" = "+quote(requestSHA)+"; "+invoke+" verify; else "+invoke+" prepare; printf %s "+quote(requestSHA)+" > "+quote(marker)+"; sync -f "+quote(marker)+"; fi";e.run(m.uuid,cmd);
+        cmd+="if test -f "+quote(marker)+"; then test \"$(cat "+quote(marker)+")\" = "+quote(requestSHA)+"; "+invoke+" verify; else "+invoke+" prepare "+quote(e.plan.oldBundleSHA)+"; printf %s "+quote(requestSHA)+" > "+quote(marker)+"; sync -f "+quote(marker)+"; fi";e.run(m.uuid,cmd);
       }
       verify(extrasRetired?InventoryMode::canonical:InventoryMode::sealed);e.receipt.phase=MothershipTidesDBMigrationPhase::validated;e.persist(e.receipt,nullptr);
     }

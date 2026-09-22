@@ -10113,8 +10113,11 @@ private:
   void runPrepareRetainedRecoveryLocal(int argc, char *argv[])
   {
     String failure;
-    if (argc != 3 || (std::strcmp(argv[2], "prepare") != 0 && std::strcmp(argv[2], "verify") != 0) ||
-        !MothershipRetainedRecovery::prepareLocal(argv[0], argv[1], std::strcmp(argv[2], "verify") == 0, &failure)) {
+    String previousBundleSHA;
+    if (argc == 4) previousBundleSHA.assign(argv[3]);
+    if ((argc != 3 && argc != 4) || (argc == 4 && !prodigyIsSHA256HexDigest(previousBundleSHA)) ||
+        (std::strcmp(argv[2], "prepare") != 0 && std::strcmp(argv[2], "verify") != 0) ||
+        !MothershipRetainedRecovery::prepareLocal(argv[0], argv[1], std::strcmp(argv[2], "verify") == 0, &failure, previousBundleSHA)) {
       basics_log("prepareRetainedRecoveryLocal success=0 failure=%s\n", failure.c_str()); exit(EXIT_FAILURE);
     }
     basics_log("prepareRetainedRecoveryLocal success=1\n");

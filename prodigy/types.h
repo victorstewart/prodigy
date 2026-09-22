@@ -6895,6 +6895,13 @@ static void serialize(S&& serializer, ProdigyPersistentUpdateSelfMachineRecovery
 class ProdigyPersistentUpdateSelfState {
 public:
 
+  enum class Phase : uint8_t {
+    idle,
+    waitingForBundleEchos,
+    waitingForFollowerReboots,
+    waitingForRelinquishEchos
+  };
+
   uint8_t state = 0;
   uint32_t expectedEchos = 0;
   uint32_t bundleEchos = 0;

@@ -1114,12 +1114,7 @@ public:
   bytell_hash_map<uint64_t, uint64_t> durableElasticOperationTransitions;
   bool hasCompletedInitialMasterElection = false;
 
-  enum class UpdateSelfState : uint8_t {
-    idle,
-    waitingForBundleEchos,
-    waitingForFollowerReboots,
-    waitingForRelinquishEchos
-  };
+  using UpdateSelfState = ProdigyPersistentUpdateSelfState::Phase;
   UpdateSelfState updateSelfState = UpdateSelfState::idle;
   uint32_t updateSelfExpectedEchos = 0;
   uint32_t updateSelfBundleEchos = 0;

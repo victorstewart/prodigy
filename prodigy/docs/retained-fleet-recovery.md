@@ -64,9 +64,18 @@ and quiesced receipt; it cannot authorize a new deployment identity or roll back
 activated writers. A previously prepared private copy may be rewritten only when
 its decoded witnesses and all other snapshot content match the sealed request.
 
-The internal `prepareRetainedRecoveryLocal REQUEST STATE prepare|verify` command
-is invoked by the staged Mothership against private copies. It is not a substitute
-for the fenced fleet operation.
+The internal `prepareRetainedRecoveryLocal REQUEST STATE prepare|verify
+[PREVIOUS_BUNDLE_SHA256]` command is invoked by the staged Mothership against
+private copies. It is not a substitute for the fenced fleet operation.
+
+A contained normal update can be replaced while it is still collecting bundle
+echoes for the exact approved successor, with no exec, reboot, registration, or
+handoff evidence. Followers may instead retain the previous recovery envelope;
+Mothership binds that case to the installed predecessor digest in the sealed plan.
+Preparation rechecks the stopped runtime and exact retained process inventory,
+then validates each saved transaction before replacing it with fresh witnesses.
+An already prepared envelope for this request remains an idempotent retry; an
+interrupted normal update or predecessor envelope advances the generation once.
 
 A cold Neuron now refuses to upload authoritative inventory or accept a launch
 while any populated container cgroup lacks a matching live owner. Therefore

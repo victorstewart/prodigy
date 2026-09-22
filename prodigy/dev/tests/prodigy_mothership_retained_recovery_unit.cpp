@@ -90,7 +90,9 @@ int main()
     fs::remove_all(directory);
   }
 
-  Request request;request.clusterUUID=1;request.bundleSHA.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
+  Request request;request.clusterUUID=1;
+  String interruptedBundle = "retained-recovery-interrupted-update-bundle"_ctv;
+  assert(prodigyComputeSHA256Hex(interruptedBundle,request.bundleSHA));
   String bytes;BitseryEngine::serialize(bytes,request);Request decoded;
   assert(BitseryEngine::deserializeSafe(bytes,decoded) && decoded.clusterUUID==1 && decoded.bundleSHA==request.bundleSHA);
   Manifest sealedManifest = {}; Manifest successor = {};
@@ -196,6 +198,53 @@ int main()
   }
   ApplicationApiCredentialSet credentials = {};credentials.applicationID=77;credentials.credentials.push_back(credential);
   snapshot.masterAuthority.apiCredentialSetsByApp[77]=credentials;
+
+  // A normal update that stopped while merely collecting bundle echoes may be
+  // replaced.  Both a complete and lagging echo set are pre-exec states.
+  auto makeInterruptedUpdate = [&](uint32_t expectedEchos, uint32_t bundleEchos) {
+    ProdigyPersistentBrainSnapshot interrupted = snapshot;
+    auto& update=interrupted.masterAuthority.runtimeState.updateSelf;
+    update.state=uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForBundleEchos);
+    update.expectedEchos=expectedEchos;
+    update.bundleEchos=bundleEchos;
+    update.bundleBlob=interruptedBundle;
+    update.workerExpectedBundleSHA256=request.bundleSHA;
+    for(uint32_t index=0;index<bundleEchos;++index) update.bundleEchoPeerKeys.push_back(1+index);
+    return interrupted;
+  };
+  auto fullEchoSnapshot=makeInterruptedUpdate(2,2);
+  assert(mothershipRetainedRecoveryCanReplaceUpdate(fullEchoSnapshot,request.bundleSHA,{}));
+  auto laggingEchoSnapshot=makeInterruptedUpdate(2,1);
+  assert(mothershipRetainedRecoveryCanReplaceUpdate(laggingEchoSnapshot,request.bundleSHA,{}));
+  auto unknownEchoPeerSnapshot=laggingEchoSnapshot;
+  unknownEchoPeerSnapshot.masterAuthority.runtimeState.updateSelf.bundleEchoPeerKeys[0]=99;
+  assert(!mothershipRetainedRecoveryCanReplaceUpdate(unknownEchoPeerSnapshot,request.bundleSHA,{}));
+  auto duplicateEchoPeerSnapshot=fullEchoSnapshot;
+  duplicateEchoPeerSnapshot.masterAuthority.runtimeState.updateSelf.bundleEchoPeerKeys[1]=1;
+  assert(!mothershipRetainedRecoveryCanReplaceUpdate(duplicateEchoPeerSnapshot,request.bundleSHA,{}));
+  auto laterPhaseSnapshot=laggingEchoSnapshot;
+  laterPhaseSnapshot.masterAuthority.runtimeState.updateSelf.state=uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForFollowerReboots);
+  assert(!mothershipRetainedRecoveryCanReplaceUpdate(laterPhaseSnapshot,request.bundleSHA,{}));
+  auto wrongDigestSnapshot=laggingEchoSnapshot;
+  wrongDigestSnapshot.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256.assign(std::string(64,'f').c_str());
+  assert(!mothershipRetainedRecoveryCanReplaceUpdate(wrongDigestSnapshot,request.bundleSHA,{}));
+  auto wrongBlobSnapshot=laggingEchoSnapshot;
+  wrongBlobSnapshot.masterAuthority.runtimeState.updateSelf.bundleBlob.assign("different-bundle"_ctv);
+  assert(!mothershipRetainedRecoveryCanReplaceUpdate(wrongBlobSnapshot,request.bundleSHA,{}));
+  auto registeredWitnessSnapshot=laggingEchoSnapshot;
+  for(const ClusterMachine& machine:registeredWitnessSnapshot.topology.machines) {
+    ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
+    witness.machineUUID=machine.uuid;
+    registeredWitnessSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses.push_back(witness);
+  }
+  registeredWitnessSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].bundleRegistered=true;
+  assert(!mothershipRetainedRecoveryCanReplaceUpdate(registeredWitnessSnapshot,request.bundleSHA,{}));
+  auto transitionSnapshot=laggingEchoSnapshot;
+  transitionSnapshot.masterAuthority.runtimeState.updateSelf.workerTransitionIssuedMachineUUIDs.push_back(1);
+  assert(!mothershipRetainedRecoveryCanReplaceUpdate(transitionSnapshot,request.bundleSHA,{}));
+  auto exhaustedSnapshot=laggingEchoSnapshot;
+  exhaustedSnapshot.masterAuthority.runtimeState.generation=std::numeric_limits<uint64_t>::max();
+  assert(!mothershipPrepareRetainedRecoverySnapshot(exhaustedSnapshot,request.plans,request.machines,request.bundleSHA,&failure));
   String snapshotBytes;BitseryEngine::serialize(snapshotBytes,snapshot);
   ProdigyPersistentBrainSnapshot snapshotRoundTrip;
   assert(BitseryEngine::deserializeSafe(snapshotBytes,snapshotRoundTrip));
@@ -205,8 +254,25 @@ int main()
   snapshotRoundTrip=snapshot;
   snapshotRoundTrip.masterAuthority.apiCredentialSetsByApp[77].credentials[0].metadata.begin()->second="changed"_ctv;
   assert(!prodigyPersistentBrainSnapshotsEqual(snapshot,snapshotRoundTrip));
-  auto preparedSnapshot=snapshot;
+  auto preparedSnapshot=laggingEchoSnapshot;
   assert(mothershipPrepareRetainedRecoverySnapshot(preparedSnapshot,request.plans,request.machines,request.bundleSHA,&failure));
+
+  // A follower may still hold the sealed envelope from the predecessor
+  // recovery.  It is neither an idle state nor this request's envelope, so it
+  // needs the explicitly sealed predecessor digest to be replaced once.
+  const String previousBundleSHA=text(std::string(64,'b'));
+  auto predecessorEnvelopeSnapshot=snapshot;
+  auto& predecessorEnvelope=predecessorEnvelopeSnapshot.masterAuthority.runtimeState.updateSelf;
+  predecessorEnvelope={};
+  predecessorEnvelope.workerExpectedBundleSHA256=previousBundleSHA;
+  predecessorEnvelope.machineRecoveryWitnesses=preparedSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
+  assert(mothershipRetainedRecoveryEnvelopeMatches(predecessorEnvelope,previousBundleSHA));
+  assert(mothershipRetainedRecoveryCanReplaceUpdate(predecessorEnvelopeSnapshot,request.bundleSHA,previousBundleSHA));
+  assert(!mothershipRetainedRecoveryCanReplaceUpdate(predecessorEnvelopeSnapshot,request.bundleSHA,text(std::string(64,'c'))));
+  auto predecessorPrepared=predecessorEnvelopeSnapshot;
+  assert(mothershipPrepareRetainedRecoverySnapshot(predecessorPrepared,request.plans,request.machines,request.bundleSHA,&failure,previousBundleSHA));
+  assert(predecessorPrepared.masterAuthority.runtimeState.generation==predecessorEnvelopeSnapshot.masterAuthority.runtimeState.generation+1);
+  assert(mothershipRetainedRecoveryEnvelopeMatches(predecessorPrepared.masterAuthority.runtimeState.updateSelf,request.bundleSHA));
   auto preexistingSnapshot=preparedSnapshot;
   String& originalBootstrap=preexistingSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].containerBootstraps[0];
   NeuronContainerBootstrap decodedBootstrap = {};assert(BitseryEngine::deserializeSafe(originalBootstrap,decodedBootstrap));
@@ -220,7 +286,10 @@ int main()
   assert(!originalBootstrap.equals(reorderedBytes));
   originalBootstrap=std::move(reorderedBytes);
   assert(prodigyPersistentRetainedBootstrapEqual(decodedBootstrap,reorderedBootstrap));
-  { ProdigyPersistentStateStore store(MothershipTidesMigration::text(statePath)); assert(store.saveBrainSnapshot(preexistingSnapshot,&failure)); }
+  // Save the interrupted normal update, rather than the recovery envelope.
+  // prepareLocal must replace it once, then recognize its own envelope on
+  // retry without touching unrelated deployment or credential authority.
+  { ProdigyPersistentStateStore store(MothershipTidesMigration::text(statePath)); assert(store.saveBrainSnapshot(laggingEchoSnapshot,&failure)); }
   std::filesystem::create_directories(statePath+".secrets");
   BitseryEngine::serialize(bytes,request);MothershipTidesMigration::durable(requestPath,bytes);
   WitnessSet sealed;sealed.requestSHA=MothershipTidesMigration::text(MothershipTidesMigration::digest(requestPath));
@@ -229,12 +298,25 @@ int main()
   const bool prepared=prepareLocal(requestPath.c_str(),statePath.c_str(),false,&failure);
   if(!prepared)std::fprintf(stderr,"private recovery preparation: %s\n",failure.c_str());
   assert(prepared);
-  assert(prepareLocal(requestPath.c_str(),statePath.c_str(),true,&failure));
   ProdigyPersistentBrainSnapshot after;loadSnapshot(statePath,after);
   assert(after.masterAuthority.runtimeState.generation==1 && after.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses.size()==3);
   assert(after.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].containerBootstraps[0].equals(sealed.witnesses[0].containerBootstraps[0]));
+  assert(prodigyPersistentBrainSnapshotsEqual(after,preparedSnapshot));
+  assert(after.masterAuthority.apiCredentialSetsByApp[77].credentials[0].metadata==credential.metadata);
   // A saved request is an idempotent retry even if its outer marker was lost.
   assert(prepareLocal(requestPath.c_str(),statePath.c_str(),false,&failure));
+  assert(prepareLocal(requestPath.c_str(),statePath.c_str(),true,&failure));
+  ProdigyPersistentBrainSnapshot afterRetry;loadSnapshot(statePath,afterRetry);
+  assert(prodigyPersistentBrainSnapshotsEqual(after,afterRetry));
+  // The private database can already contain the same recovery envelope with
+  // unordered plan maps encoded in a different iteration order. Semantic
+  // witness matching accepts it, then rewrites the exact sealed bytes.
+  { ProdigyPersistentStateStore store(MothershipTidesMigration::text(statePath)); assert(store.saveBrainSnapshot(preexistingSnapshot,&failure)); }
+  assert(prepareLocal(requestPath.c_str(),statePath.c_str(),false,&failure));
+  assert(prepareLocal(requestPath.c_str(),statePath.c_str(),true,&failure));
+  ProdigyPersistentBrainSnapshot afterReordered;loadSnapshot(statePath,afterReordered);
+  assert(prodigyPersistentBrainSnapshotsEqual(after,afterReordered));
+  assert(afterReordered.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].containerBootstraps[0].equals(sealed.witnesses[0].containerBootstraps[0]));
   request.machines[0].parameters[0].memoryMB+=1;
   BitseryEngine::serialize(bytes,request);MothershipTidesMigration::durable(requestPath,bytes);
   assert(!prepareLocal(requestPath.c_str(),statePath.c_str(),true,&failure));
