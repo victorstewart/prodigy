@@ -3,6 +3,7 @@
 #include "tidesdb_migration_format.h"
 #include <ctype.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <tidesdb/db.h>
@@ -25,6 +26,13 @@ static int stream_sha256(const char *path,
 static int scan_stream(const char *stream, struct stream_info *info);
 static int fail(const char *s) {
   fprintf(stderr, "tidesdb10 import: %s\n", s);
+  return 1;
+}
+static int compact_fail(const char *stage, int rc) {
+  if (rc == INT_MIN)
+    fprintf(stderr, "tidesdb10 import: compact stage=%s rc=unavailable\n", stage);
+  else
+    fprintf(stderr, "tidesdb10 import: compact stage=%s rc=%d\n", stage, rc);
   return 1;
 }
 static int bytes(FILE *f, SHA256_CTX *s, unsigned char **p, uint32_t n) {
@@ -52,12 +60,15 @@ static void free_keys(struct seen_key *p) {
     p = next;
   }
 }
-static int start_db(const char *path, tidesdb_t **db) {
+static int open_db(const char *path, tidesdb_t **db) {
   tidesdb_config_t c = tidesdb_default_config();
   c.db_path = path;
   c.log_level = TDB_LOG_NONE;
   c.memtable_sync_mode = TDB_SYNC_FULL;
-  return tidesdb_open(&c, db) == TDB_SUCCESS;
+  return tidesdb_open(&c, db);
+}
+static int start_db(const char *path, tidesdb_t **db) {
+  return open_db(path, db) == TDB_SUCCESS;
 }
 
 static int compare_cf_names(const void *a, const void *b) {
@@ -232,10 +243,32 @@ done:
 static int compact_all_column_families(tidesdb_t *db, char **names, int n) {
   for (int i = 0; i < n; ++i) {
     tidesdb_column_family_t *cf = names[i] ? tidesdb_get_column_family(db, names[i]) : 0;
-    if (!cf || tidesdb_compact(db, cf) != TDB_SUCCESS)
-      return 0;
+    int rc;
+    if (!cf)
+      return INT_MIN;
+    rc = tidesdb_compact(db, cf);
+    if (rc != TDB_SUCCESS)
+      return rc;
   }
-  return 1;
+  return TDB_SUCCESS;
+}
+
+static int compact_wait_for_cf_idle(tidesdb_t *db, char **names, int n) {
+  const int attempts = 100; /* one bounded ten-second wait before one retry */
+  struct timespec pause = {.tv_sec = 0, .tv_nsec = 100000000};
+  for (int i = 0; i < attempts; ++i) {
+    int busy = tidesdb_is_flushing(db);
+    for (int cf_index = 0; !busy && cf_index < n; ++cf_index) {
+      tidesdb_column_family_t *cf = tidesdb_get_column_family(db, names[cf_index]);
+      if (!cf)
+        return 0;
+      busy = tidesdb_is_compacting(cf);
+    }
+    if (!busy)
+      return 1;
+    nanosleep(&pause, 0);
+  }
+  return 0;
 }
 
 static int compact_wait_for_vlog(tidesdb_t *db, char **names, int n,
@@ -262,7 +295,7 @@ static int compact_wait_for_vlog(tidesdb_t *db, char **names, int n,
      * drainable segments, one further forced CF pass carries those values out. */
     if (i >= 20 && !compacting && stats->vlog_segments_drainable &&
         !followup_compaction) {
-      if (!compact_all_column_families(db, names, n))
+      if (compact_all_column_families(db, names, n) != TDB_SUCCESS)
         return 0;
       followup_compaction = 1;
       continue;
@@ -286,6 +319,9 @@ static int compact_database(const char *path, const char *baseline) {
   struct stat receipt_st, partial_st;
   char *partial = 0;
   int have_receipt, receipt_errno, partial_exists;
+  const char *failure_stage = "unknown";
+  int failure_rc = INT_MIN;
+  int rc;
   int ok = 0;
   if (!compact_db_path_ok(path) || !baseline)
     return fail("compact requires an existing root-owned database");
@@ -306,29 +342,57 @@ static int compact_database(const char *path, const char *baseline) {
     return fail("compact baseline is not an absent or root-owned regular file");
   if (have_receipt) {
     if (!scan_stream(baseline, &info) || !verify(baseline, path, &info) ||
-        !stream_sha256(baseline, digest))
+        !stream_sha256(baseline, digest)) {
+      failure_stage = "baselineVerify";
       goto done;
+    }
   }
-  if (!start_db(path, &db) || tidesdb_get_db_stats(db, &before) != TDB_SUCCESS)
+  if ((rc = open_db(path, &db)) != TDB_SUCCESS) {
+    failure_stage = "open";
+    failure_rc = rc;
     goto done;
+  }
+  if ((rc = tidesdb_get_db_stats(db, &before)) != TDB_SUCCESS) {
+    failure_stage = "beforeStats";
+    failure_rc = rc;
+    goto done;
+  }
   if (!have_receipt &&
       (!export_actual(db, baseline, &info) || !scan_stream(baseline, &info) ||
        !stream_sha256(baseline, digest))) {
+    failure_stage = "baselineExport";
     goto done;
   }
-  if (tidesdb_flush_memtable(db) != TDB_SUCCESS ||
-      tidesdb_list_column_families(db, &names, &n) != TDB_SUCCESS || n < 0)
+  if ((rc = tidesdb_flush_memtable(db)) != TDB_SUCCESS) {
+    failure_stage = "flush";
+    failure_rc = rc;
     goto done;
+  }
+  if ((rc = tidesdb_list_column_families(db, &names, &n)) != TDB_SUCCESS || n < 0) {
+    failure_stage = "listColumnFamilies";
+    failure_rc = rc;
+    goto done;
+  }
   for (int i = 0; i < n; ++i)
-    if (!names[i])
+    if (!names[i]) {
+      failure_stage = "listColumnFamilies";
       goto done;
+    }
   if (n)
     qsort(names, (size_t)n, sizeof(*names), compare_cf_names);
-  if (!compact_all_column_families(db, names, n))
+  rc = compact_all_column_families(db, names, n);
+  if (rc == TDB_ERR_LOCKED && compact_wait_for_cf_idle(db, names, n))
+    rc = compact_all_column_families(db, names, n);
+  if (rc != TDB_SUCCESS) {
+    failure_stage = "compact";
+    failure_rc = rc;
     goto done;
+  }
   wait = compact_wait_for_vlog(db, names, n, before.vlog_reclaim_calls, &after);
-  if (wait == 0)
+  if (wait == 0) {
+    failure_stage = "vlogWait";
     goto done;
+  }
   if (wait < 0) {
     printf("{\"reclaimComplete\":false,\"vlogFileBytes\":%llu,\"vlogSegments\":%llu,\"vlogDeadBytes\":%llu,\"vlogDrainableSegments\":%llu,\"vlogReclaimCalls\":%llu,\"vlogSegmentsRetired\":%llu,\"compactionPending\":%d}\n",
            (unsigned long long)after.vlog_file_size,
@@ -338,15 +402,20 @@ static int compact_database(const char *path, const char *baseline) {
            (unsigned long long)after.vlog_reclaim_calls,
            (unsigned long long)after.vlog_segments_retired,
            after.compaction_pending_count);
+    failure_stage = "vlogTimeout";
     goto done;
   }
-  if (tidesdb_close(db) != TDB_SUCCESS) {
+  if ((rc = tidesdb_close(db)) != TDB_SUCCESS) {
     db = 0;
+    failure_stage = "close";
+    failure_rc = rc;
     goto done;
   }
   db = 0;
-  if (!compact_db_path_ok(path) || !verify(baseline, path, &info))
+  if (!compact_db_path_ok(path) || !verify(baseline, path, &info)) {
+    failure_stage = "readbackVerify";
     goto done;
+  }
   printf("{\"reclaimComplete\":true,\"records\":%llu,\"columnFamilies\":%u,\"logicalSHA256\":\"%s\",\"vlogFileBytesBefore\":%llu,\"vlogFileBytesAfter\":%llu,\"vlogSegmentsBefore\":%llu,\"vlogSegmentsAfter\":%llu,\"vlogDeadBytesBefore\":%llu,\"vlogDeadBytesAfter\":%llu,\"vlogDrainableSegmentsAfter\":%llu,\"vlogReclaimCallsBefore\":%llu,\"vlogReclaimCallsAfter\":%llu,\"vlogSegmentsRetiredBefore\":%llu,\"vlogSegmentsRetiredAfter\":%llu,\"compactionPendingAfter\":%d}\n",
          (unsigned long long)info.records, info.cfs, digest,
          (unsigned long long)before.vlog_file_size,
@@ -370,7 +439,7 @@ done:
   }
   if (db)
     tidesdb_close(db);
-  return ok ? 0 : fail("compact maintenance or logical readback failed");
+  return ok ? 0 : compact_fail(failure_stage, failure_rc);
 }
 static int stream_sha256(const char *path,
                          char hex[SHA256_DIGEST_LENGTH * 2 + 1]) {
