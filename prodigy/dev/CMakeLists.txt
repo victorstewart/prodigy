@@ -1308,6 +1308,14 @@ if (PROJECT_ENABLE_TESTS)
    )
 
    add_test(
+      NAME prodigy_tidesdb10_compact
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_tidesdb10_compact.py
+              --fixture $<TARGET_FILE:prodigy_tidesdb9_fixture>
+              --exporter $<TARGET_FILE:prodigy_tidesdb9_export>
+              --importer $<TARGET_FILE:prodigy_tidesdb10_import>
+   )
+
+   add_test(
       NAME prodigy_tidesdb9_lock_compat_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_tidesdb9_lock_compat_unit
    )

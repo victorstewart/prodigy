@@ -2885,8 +2885,12 @@ private:
   constexpr static const char *localBrainStateKey = "local_brain_state";
   constexpr static const char *consumedBootstrapBundleSupersessionReceiptKey = "consumed_bootstrap_bundle_supersession_receipt";
 
-  TidesDB db;
-  TidesDB secretsDb;
+  // Separated snapshot values contribute only references to TidesDB's memtable
+  // limit. Bound committed value bytes as well so frequent overwrites cannot
+  // keep obsolete value-log segments pinned indefinitely waiting for idle.
+  constexpr static uint64_t snapshotFlushBytes = 64ULL * 1024 * 1024;
+  TidesDB db{""_ctv, TidesDB::Durability::inherit, snapshotFlushBytes};
+  TidesDB secretsDb{""_ctv, TidesDB::Durability::inherit, snapshotFlushBytes};
 
   bool loadStoredBootStateRecord(ProdigyPersistentStoredBootState& record, String *failure = nullptr)
   {

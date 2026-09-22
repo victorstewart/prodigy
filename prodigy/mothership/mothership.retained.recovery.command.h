@@ -251,9 +251,93 @@ inline void requirePreactivation(Execution& e,const Execution *successor=nullptr
       "; test \"$(sha256sum "+quote(e.plan.runtimeRoot+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(e.plan.oldBundleSHA));
   }
 }
+// A repair bundle supplies tools only. It cannot replace the deployment bundle,
+// its receipt, or the writer fence. The invoking Mothership must itself be one
+// of the checked Discombobulator outputs in that bundle.
+inline std::string stageRepairTools(Execution& e,const char *repairBundle) {
+  pathCheck(repairBundle); String approved,why;
+  require(prodigyApproveBundleArtifact(text(repairBundle),approved,&why),"recovery tool bundle not approved");
+  Plan helperPlan=e.plan;helperPlan.operationRoot+="/tool-"+str(approved);helperPlan.bundle=repairBundle;
+  Execution helper(std::move(helperPlan));helper.cluster=e.cluster;helper.machines=e.machines;helper.receipt=e.receipt;
+  fs::create_directories(helper.plan.operationRoot);require(::chmod(helper.plan.operationRoot.c_str(),0700)==0,"cannot protect recovery tool directory");
+  require(prodigyInstallBundleToRoot(text(repairBundle),text(helper.localRuntime),&why),"recovery tool staging failed");
+  require(digest("/proc/self/exe")==digest(helper.localRuntime+"/tools/mothership"),"repair bundle does not contain this Mothership");
+  helper.receipt.approvedBundleSHA256=approved;helper.receipt.newRuntimeSHA256=text(digest(helper.localRuntime+"/prodigy"));
+  helper.buildArtifactManifest();helper.stageAndPreflight();return helper.remoteRuntime;
+}
+inline std::string containedGuard(const Execution& e) {
+  return "test \"$(systemctl show -p MainPID --value prodigy)\" = 0; test \"$(cat "+quote(e.fencePath())+")\" = "+quote(e.plan.planSHA)+
+    "; test \"$(sha256sum "+quote(e.plan.runtimeRoot+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(str(e.receipt.newRuntimeSHA256))+
+    "; test \"$(sha256sum "+quote(e.plan.runtimeRoot+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(str(e.receipt.approvedBundleSHA256))+"; "+
+    e.observeContainers()+"snapshot_containers > "+quote(e.remoteRoot+"/containers.compact-check")+"; cmp "+quote(e.remoteRoot+"/containers.contained")+" "+quote(e.remoteRoot+"/containers.compact-check")+"; ";
+}
+inline std::string compactionBaselineSHA(const std::string& output) {
+  simdjson::dom::parser parser;simdjson::dom::element doc;bool complete=false;
+  require(parser.parse(output).get(doc)==simdjson::SUCCESS && doc["reclaimComplete"].get_bool().get(complete)==simdjson::SUCCESS && complete,
+          "compaction result is incomplete");
+  const auto sha=field(doc,"logicalSHA256");
+  require(prodigyIsSHA256HexDigest(text(sha)),"invalid compaction baseline digest");
+  return sha;
+}
+inline void compactContained(Execution& e,const char *repairBundle) {
+  require(repairBundle && e.receipt.activationBoundaryCrossed && e.receipt.phase==MothershipTidesDBMigrationPhase::completed,
+          "compaction requires a contained completed recovery and a sealed tool bundle");
+  // This baseline was captured by contain-active after stopping the Brains. It
+  // deliberately retains their current processes, including a degraded fleet;
+  // it does not grant permission to launch replacements or retire survivors.
+  const auto guard=containedGuard(e);
+  for(const auto& machine:e.plan.machines)e.run(machine.uuid,guard);
+  const auto runtime=stageRepairTools(e,repairBundle);
+  for(const auto& db:e.receipt.databases) {
+    require(db.machineUUID!=0 && db.swapped && (str(db.livePath)==e.plan.statePath || str(db.livePath)==e.plan.secretsPath),
+            "contained maintenance requires the active paired Brain databases");
+    const auto label=str(db.label);
+    require(!label.empty() && label.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")==std::string::npos,
+            "invalid compaction database label");
+    const auto baseline=e.remoteRoot+"/compact-"+label+".kv", capture=baseline+".result.json";
+    // The helper persists the current logical stream before maintenance and
+    // refuses a retry if that baseline has changed. Original retained databases
+    // and migration streams are never opened or removed here.
+    e.run(db.machineUUID,guard+"umask 077; if ! LD_LIBRARY_PATH="+quote(runtime+"/lib")+" "+quote(runtime+"/tools/prodigy_tidesdb10_import")+
+          " --compact "+quote(str(db.livePath))+" "+quote(baseline)+" > "+quote(capture)+"; then exit 1; fi; "+guard);
+    const auto output=e.readPath(db.machineUUID,capture);
+    (void)compactionBaselineSHA(output);
+    String machine;machine.snprintf<"{itoh}"_ctv>(db.machineUUID);
+    durable(fs::path(e.plan.operationRoot)/("compact-"+str(machine)+"-"+label+".json"),text(output));
+  }
+  for(const auto& machine:e.plan.machines)e.run(machine.uuid,guard);
+  durable(fs::path(e.plan.operationRoot)/"compacted-contained",text(e.plan.planSHA+"\n"+digest(repairBundle)+"\n"));
+}
+inline void resumeCompacted(Execution& e,const char *repairBundle) {
+  require(repairBundle && e.receipt.activationBoundaryCrossed && e.receipt.phase==MothershipTidesDBMigrationPhase::completed,
+          "resume requires a contained completed recovery and its maintenance tools");
+  const auto marker=e.plan.operationRoot+"/compacted-contained";
+  privateFile(marker,4096);
+  const auto binding=e.plan.planSHA+"\n"+digest(repairBundle)+"\n";
+  require(read(marker)==binding,"resume maintenance bundle differs");
+  require(!fs::exists(e.plan.operationRoot+"/compaction-resume-started"),"resume already started; inspect the running generation before another lifecycle action");
+  const auto guard=containedGuard(e);
+  for(const auto& machine:e.plan.machines)e.run(machine.uuid,guard);
+  const auto runtime=stageRepairTools(e,repairBundle);
+  for(const auto& db:e.receipt.databases) {
+    String machine;machine.snprintf<"{itoh}"_ctv>(db.machineUUID);
+    const auto label=str(db.label),result=e.plan.operationRoot+"/compact-"+str(machine)+"-"+label+".json";
+    privateFile(result,65536);
+    const auto baseline=e.remoteRoot+"/compact-"+label+".kv",sha=compactionBaselineSHA(read(result));
+    e.run(db.machineUUID,guard+"test \"$(sha256sum "+quote(baseline)+" | cut -d' ' -f1)\" = "+quote(sha)+
+          "; LD_LIBRARY_PATH="+quote(runtime+"/lib")+" "+quote(runtime+"/tools/prodigy_tidesdb10_import")+" --verify "+quote(baseline)+" "+quote(str(db.livePath)));
+  }
+  // Verify every host and logical database before the first fence is removed.
+  // Resume the same installed generation; its persisted normal update/recovery
+  // operations continue through their existing owners after reconnect.
+  for(const auto& machine:e.plan.machines)e.run(machine.uuid,guard);
+  durable(fs::path(e.plan.operationRoot)/"compaction-resume-started",text(binding));
+  e.activate();
+  durable(fs::path(e.plan.operationRoot)/"compaction-resumed",text(binding));
+}
 inline bool runFile(const char *file,const char *action,String *failure=nullptr,const char *repairBundle=nullptr,const char *successorFile=nullptr) {
   try {
-    require(std::strcmp(action,"recover")==0 || std::strcmp(action,"prepare")==0 || std::strcmp(action,"retire-extras")==0 || std::strcmp(action,"retire-extras-preactivation")==0 || std::strcmp(action,"supersede-preactivation")==0 || std::strcmp(action,"contain-active")==0,"invalid retained recovery action");
+    require(std::strcmp(action,"recover")==0 || std::strcmp(action,"prepare")==0 || std::strcmp(action,"retire-extras")==0 || std::strcmp(action,"retire-extras-preactivation")==0 || std::strcmp(action,"supersede-preactivation")==0 || std::strcmp(action,"contain-active")==0 || std::strcmp(action,"compact-contained")==0 || std::strcmp(action,"resume-compacted")==0,"invalid retained recovery action");
     Plan plan=parse(file);plan.retainedRecovery=true;
     simdjson::dom::parser parser;simdjson::dom::element doc;auto raw=read(file);require(parser.parse(raw).get(doc)==simdjson::SUCCESS,"invalid recovery plan");
     bool mode=false;require(doc["retainedRecoveryMode"].get_bool().get(mode)==simdjson::SUCCESS && mode,"explicit retained recovery mode required");
@@ -288,6 +372,14 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
     if(predecessorContained) {
       privateFile(containment,4096);
       require(read(containment)==e.plan.planSHA+"\n" && e.receipt.activationBoundaryCrossed && e.receipt.phase==MothershipTidesDBMigrationPhase::completed,"contained recovery receipt differs");
+    }
+    if(std::strcmp(action,"compact-contained")==0) {
+      require(predecessorContained && !successorFile && !fs::exists(e.plan.operationRoot+"/superseded-by") && !fs::exists(e.plan.operationRoot+"/compaction-resume-started"),"compaction requires the current contained operation");
+      compactContained(e,repairBundle);return true;
+    }
+    if(std::strcmp(action,"resume-compacted")==0) {
+      require(predecessorContained && !successorFile && !fs::exists(e.plan.operationRoot+"/superseded-by"),"resume requires the current contained operation");
+      resumeCompacted(e,repairBundle);return true;
     }
     if(predecessorContained && std::strcmp(action,"supersede-preactivation")!=0)throw std::runtime_error("activated recovery is contained; use a fresh retained recovery plan");
     const auto superseded=e.plan.operationRoot+"/superseded-by";
@@ -368,15 +460,7 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
     std::string preparationRuntime=e.remoteRuntime;
     if(repairBundle) {
       require(e.receipt.phase>=MothershipTidesDBMigrationPhase::writersQuiesced && !e.receipt.activationBoundaryCrossed,"repair tools require a fenced pre-activation recovery");
-      pathCheck(repairBundle);String approved,why;
-      require(prodigyApproveBundleArtifact(text(repairBundle),approved,&why),"recovery tool bundle not approved");
-      Plan helperPlan=e.plan;helperPlan.operationRoot+="/tool-"+str(approved);helperPlan.bundle=repairBundle;
-      Execution helper(std::move(helperPlan));helper.cluster=e.cluster;helper.machines=e.machines;helper.receipt=e.receipt;
-      fs::create_directories(helper.plan.operationRoot);require(::chmod(helper.plan.operationRoot.c_str(),0700)==0,"cannot protect recovery tool directory");
-      require(prodigyInstallBundleToRoot(text(repairBundle),text(helper.localRuntime),&why),"recovery tool staging failed");
-      require(digest("/proc/self/exe")==digest(helper.localRuntime+"/tools/mothership"),"repair bundle does not contain this Mothership");
-      helper.receipt.approvedBundleSHA256=approved;helper.receipt.newRuntimeSHA256=text(digest(helper.localRuntime+"/prodigy"));
-      helper.buildArtifactManifest();helper.stageAndPreflight();preparationRuntime=helper.remoteRuntime;
+      preparationRuntime=stageRepairTools(e,repairBundle);
     }
     const auto requestPath=e.plan.operationRoot+"/recovery.request", authorityPath=e.plan.operationRoot+"/stateless-extras-authority";
     if(e.receipt.phase<MothershipTidesDBMigrationPhase::validated || !fs::exists(authorityPath)) {

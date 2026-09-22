@@ -10102,7 +10102,7 @@ private:
   {
     String failure;
     const bool supersede=argc==3 && std::strcmp(argv[1], "supersede-preactivation")==0;
-    const bool repair=argc==3 && (std::strcmp(argv[1], "recover")==0 || std::strcmp(argv[1], "prepare")==0);
+    const bool repair=argc==3 && (std::strcmp(argv[1], "recover")==0 || std::strcmp(argv[1], "prepare")==0 || std::strcmp(argv[1], "compact-contained")==0 || std::strcmp(argv[1], "resume-compacted")==0);
     if ((argc != 2 && argc != 3) || (!supersede && !repair && argc != 2) ||
         !MothershipRetainedRecovery::runFile(argv[0], argv[1], &failure, repair ? argv[2] : nullptr, supersede ? argv[2] : nullptr)) {
       basics_log("recoverRetainedFleet success=0 failure=%s\n", failure.c_str()); exit(EXIT_FAILURE);

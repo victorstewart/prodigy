@@ -61,6 +61,35 @@ int main()
 
   using namespace MothershipRetainedRecovery;
   assertRetainedBootstrapUnorderedMapRoundTrip();
+  // Maintenance and resumption cannot manufacture authority from an incomplete
+  // migration receipt or run without the explicitly supplied tool artifact.
+  {
+    Plan plan;plan.operationRoot="/unopened-maintenance-fixture";
+    Execution execution(plan);
+    for(bool activated:{false,true}) {
+      execution.receipt.activationBoundaryCrossed=activated;
+      execution.receipt.phase=MothershipTidesDBMigrationPhase::validated;
+      bool rejected=false;
+      try {compactContained(execution,"/unopened-bundle");} catch(const std::exception&) {rejected=true;}
+      assert(rejected);
+      rejected=false;
+      try {resumeCompacted(execution,"/unopened-bundle");} catch(const std::exception&) {rejected=true;}
+      assert(rejected);
+    }
+    execution.receipt.phase=MothershipTidesDBMigrationPhase::completed;
+    bool rejected=false;
+    try {compactContained(execution,nullptr);} catch(const std::exception&) {rejected=true;}
+    assert(rejected);
+    rejected=false;
+    try {resumeCompacted(execution,nullptr);} catch(const std::exception&) {rejected=true;}
+    assert(rejected);
+    for(const std::string output:{"", "{}", "{\"reclaimComplete\":false}", "{\"reclaimComplete\":true,\"logicalSHA256\":\"invalid\"}"}) {
+      rejected=false;
+      try {(void)compactionBaselineSHA(output);} catch(const std::exception&) {rejected=true;}
+      assert(rejected);
+    }
+    assert(compactionBaselineSHA("{\"reclaimComplete\":true,\"logicalSHA256\":\""+std::string(64,'a')+"\"}")==std::string(64,'a'));
+  }
   // The sealed manifest owns its complete inventory count. A successor after
   // containment can have different extras while retaining the canonical 23.
   {

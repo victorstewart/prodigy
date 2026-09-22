@@ -127,6 +127,39 @@ differ. Mothership verifies the complete current inventory before handing over
 fences. The successor copies current live v10 databases, preserving intervening
 writes, and prepares new witnesses before any further activation.
 
+For storage exhaustion with otherwise valid current state, a contained operation
+can instead reclaim obsolete TidesDB 10 value logs in place and resume the same
+installed runtime:
+
+```sh
+mothership recoverRetainedFleet PLAN compact-contained REPAIR_BUNDLE
+mothership recoverRetainedFleet PLAN resume-compacted REPAIR_BUNDLE
+```
+
+The repair bundle must be built by Discombobulator and contain the invoking
+Mothership. Before maintenance it checks all three stopped services, writer
+fences, installed artifact hashes and the exact processes recorded at containment.
+The packaged v10 helper saves each current database as a private, durable logical
+stream, flushes and compacts through TidesDB's public API, then reopens and verifies
+every record. Only TidesDB reclaims its obsolete files. Retained originals and
+earlier migration streams remain untouched. Failed or incomplete maintenance
+leaves the Brains fenced; a partial baseline requires investigation and is never
+silently overwritten.
+
+Resumption requires six completed maintenance results bound to those streams and
+the same tool bundle. It rechecks every logical database and process baseline
+before removing any fence, then uses the existing activation owner to start the
+same runtime. This supports a degraded retained fleet without inventing missing
+bootstraps or relaxing the separate 23-container recovery-manifest guard. A normal
+update resumes if its persisted coordinator becomes master again. If an idle peer
+becomes master, submit the verified bundle through ordinary Mothership update once
+that master is idle; do not manufacture coordinator state. Stateful recovery still
+uses its existing durable operation and retry owner.
+If startup partially fails, inspect the running generations before another
+lifecycle action; do not automatically repeat a started resumption. The command
+does not attest application health. Reverify that and deploy a runtime with the
+bounded snapshot flush policy before considering the storage defect resolved.
+
 ## Retrying a failed first stateful replacement
 
 If an accepted `recoverMaterializedStatefulDeployment` operation stopped its
