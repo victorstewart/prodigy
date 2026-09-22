@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define PRODIGY_TIDES_MIGRATION_MAX_BYTES (64U * 1024U * 1024U)
+#define PRODIGY_TIDES_MIGRATION_MAX_BYTES UINT32_MAX // wire lengths; control snapshots can exceed 64 MiB
 #define PRODIGY_TIDES_MIGRATION_MAX_NAME 128U
 #define PRODIGY_TIDES_MIGRATION_CF 1U
 #define PRODIGY_TIDES_MIGRATION_RECORD 2U

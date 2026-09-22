@@ -19,6 +19,13 @@ static int fail(const char *s) {
   return 1;
 }
 static int bytes(FILE *f, SHA256_CTX *s, unsigned char **p, uint32_t n) {
+  // Reject impossible lengths before allocating, including truncated streams
+  // that declare a multi-gigabyte value. Valid snapshots use the full wire range.
+  struct stat st;
+  off_t offset = ftello(f);
+  if (offset < 0 || fstat(fileno(f), &st) || !S_ISREG(st.st_mode) ||
+      st.st_size < offset || (uint64_t)n > (uint64_t)(st.st_size - offset))
+    return 0;
   *p = malloc(n ? n : 1);
   return *p && ptm_read(f, s, *p, n);
 }

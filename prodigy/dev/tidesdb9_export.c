@@ -108,8 +108,13 @@ int main(int argc, char **argv) {
       uint8_t *key = 0, *value = 0;
       size_t key_size = 0, value_size = 0;
       type = PRODIGY_TIDES_MIGRATION_RECORD;
-      if (tidesdb_iter_key(it, &key, &key_size) != TDB_SUCCESS ||
-          tidesdb_iter_value(it, &value, &value_size) != TDB_SUCCESS ||
+      const int key_result = tidesdb_iter_key(it, &key, &key_size);
+      const int value_result = tidesdb_iter_value(it, &value, &value_size);
+      if (key_result == TDB_SUCCESS && value_result == TDB_SUCCESS &&
+          (key_size > PRODIGY_TIDES_MIGRATION_MAX_BYTES || value_size > PRODIGY_TIDES_MIGRATION_MAX_BYTES))
+        fprintf(stderr, "tidesdb9 export: record exceeds migration bound: key=%zu value=%zu maximum=%u\n",
+                key_size, value_size, PRODIGY_TIDES_MIGRATION_MAX_BYTES);
+      if (key_result != TDB_SUCCESS || value_result != TDB_SUCCESS ||
           key_size > PRODIGY_TIDES_MIGRATION_MAX_BYTES ||
           value_size > PRODIGY_TIDES_MIGRATION_MAX_BYTES ||
           !ptm_write(out, &sha, &type, 1) ||

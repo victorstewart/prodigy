@@ -97,6 +97,23 @@ def main():
         work = pathlib.Path(temp)
         migrate(args.fixture, args.exporter, args.importer, work, False)
         migrate(args.fixture, args.exporter, args.importer, work, True)
+        large = work / "large-original"
+        run(args.fixture, str(large), "--large")
+        before = tree_digest(large)
+        shutil.copytree(large, work / "large-copy")
+        run(args.exporter, str(work / "large-copy"), str(work / "large.stream"))
+        run(args.importer, str(work / "large.stream"), str(work / "large-imported"))
+        run(args.importer, "--verify", str(work / "large.stream"), str(work / "large-imported"))
+        if tree_digest(large) != before:
+            raise RuntimeError("large migration modified original")
+        payload = (work / "large.stream").read_bytes()[:8]
+        payload += b"\x01" + struct.pack("<I", 1) + b"x"
+        payload += b"\x02" + struct.pack("<II", 1, 0xffffffff) + b"k"
+        malformed = payload + b"\xff" + hashlib.sha256(payload).digest() + struct.pack("<Q", 1)
+        (work / "impossible-length.stream").write_bytes(malformed)
+        run(args.importer, str(work / "impossible-length.stream"), str(work / "impossible-length-db"), ok=False)
+        if (work / "impossible-length-db").exists():
+            raise RuntimeError("impossible length created destination")
 
 
 if __name__ == "__main__":

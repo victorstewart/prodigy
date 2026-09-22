@@ -415,7 +415,8 @@ public:
     if(receipt.phase<MothershipTidesDBMigrationPhase::writersQuiesced) quiesce();
     else for(auto& m:plan.machines) run(m.uuid,"test \"$(systemctl show -p MainPID --value prodigy)\" = 0");
     String failure;
-    require(mothershipMigrateTidesDB9To10Offline(receipt,"prodigy_tidesdb9_export"_ctv,"prodigy_tidesdb10_import"_ctv,*this,&failure),"migration database preparation/swap failed");
+    if(!mothershipMigrateTidesDB9To10Offline(receipt,"prodigy_tidesdb9_export"_ctv,"prodigy_tidesdb10_import"_ctv,*this,&failure))
+      throw std::runtime_error("migration database preparation/swap failed: "+str(failure));
     installRuntimes(); activate();
   }
 

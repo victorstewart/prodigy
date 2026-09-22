@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <tidesdb/db.h>
 
@@ -24,8 +25,8 @@ static int put(tidesdb_t *db, tidesdb_column_family_t *cf,
 int main(int argc, char **argv) {
   tidesdb_config_t cfg;
   tidesdb_t *db = 0;
-  if (argc != 2 && (argc != 3 || strcmp(argv[2], "--empty")))
-    return fail("usage DB [--empty]");
+  if (argc != 2 && (argc != 3 || (strcmp(argv[2], "--empty") && strcmp(argv[2], "--large"))))
+    return fail("usage DB [--empty|--large]");
   cfg = tidesdb_default_config();
   cfg.db_path = argv[1];
   cfg.log_level = TDB_LOG_NONE;
@@ -47,6 +48,17 @@ int main(int argc, char **argv) {
         !put(db, tidesdb_get_column_family(db, "unknown"), unknown_key,
              sizeof(unknown_key), unknown_value, sizeof(unknown_value)))
       return fail("fixture write");
+  }
+  if (argc == 3 && strcmp(argv[2], "--large") == 0) {
+    tidesdb_column_family_config_t c = tidesdb_default_column_family_config();
+    const size_t size = 65U * 1024U * 1024U;
+    unsigned char *value = malloc(size);
+    if (!value) return fail("large fixture allocation");
+    memset(value, 0xa5, size); value[size - 1] = 0x5a;
+    if (tidesdb_create_column_family(db, "large", &c) != TDB_SUCCESS ||
+        !put(db, tidesdb_get_column_family(db, "large"), (const unsigned char *)"state", 5, value, size))
+      return fail("large fixture write");
+    free(value);
   }
   if (tidesdb_close(db) != TDB_SUCCESS)
     return fail("close");
