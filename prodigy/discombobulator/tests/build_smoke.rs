@@ -245,6 +245,96 @@ fn scratch_build_emits_btrfs_blob_with_private_launch_metadata() {
 }
 
 #[test]
+fn app_artifact_envelope_is_traversable_under_a_restrictive_builder_umask() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path();
+    let source_dir = project.join("srcctx");
+    fs::create_dir_all(&source_dir).unwrap();
+    let executable = source_dir.join("true");
+    fs::copy(
+        if Path::new("/bin/true").exists() {
+            "/bin/true"
+        } else {
+            "/usr/bin/true"
+        },
+        &executable,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let recipe = project.join("RestrictiveUmask.DiscombobuFile");
+    fs::write(
+        &recipe,
+        r#"
+      FROM scratch for x86_64
+      COPY {src} ./true /app/true
+      SURVIVE /app/true
+      EXECUTE ["/app/true"]
+      "#,
+    )
+    .unwrap();
+    let output = project.join("restrictive-umask.blob.zst");
+    let binary = env!("CARGO_BIN_EXE_discombobulator");
+    // umask belongs to the invoked builder process, not this parallel test
+    // process. This proves the serialized Btrfs envelope is deterministic.
+    let build = Command::new("sh")
+        .current_dir(project)
+        .args([
+            "-c",
+            "umask 077; exec \"$@\"",
+            "sh",
+            binary,
+            "build",
+            "--file",
+            recipe.to_str().unwrap(),
+            "--context",
+            &format!("src={}", source_dir.display()),
+            "--output",
+            output.to_str().unwrap(),
+            "--kind",
+            "app",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let mounted = MountedBlob::receive(&output);
+    let artifact_root = mounted.artifact_root();
+    assert_eq!(
+        fs::metadata(&artifact_root).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::metadata(artifact_root.join("rootfs"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::metadata(artifact_root.join(".prodigy-private"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(artifact_root.join("rootfs/app/true"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+}
+
+#[test]
 fn app_survive_projection_excludes_undeclared_files_and_keeps_private_metadata_outside_rootfs() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path();

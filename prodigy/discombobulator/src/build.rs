@@ -40,7 +40,7 @@ use walkdir::WalkDir;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
 const STEP_CACHE_VERSION: &str = "discombobulator-step-cache-v1";
-const ARTIFACT_CACHE_VERSION: &str = "discombobulator-artifact-cache-v1";
+const ARTIFACT_CACHE_VERSION: &str = "discombobulator-artifact-cache-v2";
 const METALOR_RUNTIME_DIR_NAME: &str = ".metalor-runtime";
 const SESSION_STALE_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
 const LOCK_EXCLUSIVE: i32 = 2;
@@ -438,7 +438,14 @@ fn execute_supported_subset(
                     assemble_app_tree(&workspace_root, &projected_root, resolved)?;
 
                     let artifact_root = session.work_root().join("artifact");
-                    fs::create_dir_all(artifact_root.join(".prodigy-private"))?;
+                    // The isolated container user must traverse this host-owned
+                    // envelope to reach its rootfs. Keep that access independent
+                    // of the builder's umask.
+                    fs::create_dir_all(&artifact_root)?;
+                    fs::set_permissions(&artifact_root, fs::Permissions::from_mode(0o755))?;
+                    let private_root = artifact_root.join(".prodigy-private");
+                    fs::create_dir_all(&private_root)?;
+                    fs::set_permissions(&private_root, fs::Permissions::from_mode(0o700))?;
                     fs::rename(&projected_root, artifact_root.join("rootfs"))?;
                     write_launch_metadata(
                         &artifact_root.join(".prodigy-private/launch.metadata"),
@@ -2580,6 +2587,9 @@ fn assemble_app_tree(
     resolved: &ResolvedBuildSpec,
 ) -> Result<()> {
     fs::create_dir_all(final_tree)?;
+    // rootfs is the public portion of an artifact envelope. Its descendants
+    // retain their copied source modes, while the root must remain traversable.
+    fs::set_permissions(final_tree, fs::Permissions::from_mode(0o755))?;
     if resolved.survives.is_empty() {
         bail!("app builds require at least one SURVIVE path");
     }
@@ -2742,6 +2752,7 @@ fn compute_artifact_cache_key(root: &Path) -> Result<String> {
 
     let mut hasher = Sha256::new();
     hasher.update(ARTIFACT_CACHE_VERSION.as_bytes());
+    hasher.update((fs::metadata(root)?.permissions().mode() & 0o7777).to_le_bytes());
     for entry in entries {
         let relative = entry.path().strip_prefix(root)?;
         let relative = path_to_unix(relative);
@@ -2782,6 +2793,8 @@ fn emit_btrfs_blob(temp_root: &Path, artifact_root: &Path, output_path: &Path) -
     let mount = LoopbackBtrfs::new_in(temp_root, artifact_root)?;
     let subvolume = mount.create_subvolume("artifact")?;
     copy_tree(artifact_root, &subvolume)?;
+    // copy_tree preserves children; the newly created subvolume has its own mode.
+    fs::set_permissions(&subvolume, fs::metadata(artifact_root)?.permissions())?;
     mount.send_subvolume(&subvolume, &output_temp)?;
     fs::rename(&output_temp, output_path)?;
     Ok(())
