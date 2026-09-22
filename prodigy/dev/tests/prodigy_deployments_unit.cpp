@@ -1171,6 +1171,98 @@ int main(void)
       suite.expect(stat(sparse.c_str(), &original) == 0 && original.st_size == sparseSize &&
                    original.st_blocks * 512 < 1024 * 1024, "reflink_failure_preserves_sparse_original");
     }
+    // A failed launch leaves a sealed receipt and the original data owner.
+    // A corrected launch must authenticate that retained owner before using
+    // the same copy implementation; paths never come from the wire payload.
+    const auto retainedRoot = root / "retained";
+    const auto retainedSourcePath = retainedRoot / "storage/21";
+    suite.expect(writeFileFixture(retainedSourcePath / "kvdb/value", "retained-original"),
+                 "retained_capture_original_created");
+    String retainedStorageRoot, retainedHandoffRoot, retainedProcRoot, retainedCgroupRoot, originalPath;
+    retainedStorageRoot.assign((retainedRoot / "storage").c_str());
+    retainedHandoffRoot.assign((retainedRoot / "handoffs").c_str());
+    retainedProcRoot.assign((retainedRoot / "proc").c_str());
+    retainedCgroupRoot.assign((retainedRoot / "cgroups").c_str());
+    originalPath.assign(retainedSourcePath.c_str());
+    struct stat retainedIdentity = {};
+    suite.expect(lstat(originalPath.c_str(), &retainedIdentity) == 0, "retained_capture_original_identified");
+    ContainerPlan failedPlan = successor;
+    failedPlan.uuid = 22;
+    failedPlan.config.type = ApplicationType::stateful;
+    failedPlan.config.storageMB = 64;
+    String failedPayload;
+    suite.expect(ContainerManager::stageQuiescedStorageCopy(21, 123, 0, 0, failedPlan, originalPath,
+                     retainedIdentity, failedPayload, &failure, retainedHandoffRoot),
+                 "retained_capture_prior_quiescent_receipt_created");
+    RetainedContainerStorageSource retained;
+    retained.sourceContainerUUID = 21;
+    retained.failedSuccessorContainerUUID = 22;
+    retained.machineUUID = 42;
+    retained.sourcePID = 123;
+    retained.sourceDevice = uint64_t(retainedIdentity.st_dev);
+    retained.sourceInode = uint64_t(retainedIdentity.st_ino);
+    retained.sourceUID = retainedIdentity.st_uid;
+    retained.sourceGID = retainedIdentity.st_gid;
+    String capturePath;
+    capturePath.assign((retainedRoot / "handoffs/21-22/capture.txt").c_str());
+    const bool captureReady = prodigyComputeFileSHA256Hex(capturePath, retained.captureSHA256, &failure);
+    suite.expect(captureReady, "retained_capture_sealed_digest_computed");
+    if (!captureReady)
+    {
+      close(predecessor.cgroup);
+      predecessor.cgroup = -1;
+      return EXIT_FAILURE;
+    }
+    ContainerPlan correctedPlan = failedPlan;
+    correctedPlan.uuid = 23;
+    String observedSource;
+    struct stat observedIdentity = {};
+    auto validateRetained = [&]() {
+      return ContainerManager::validateRetainedStorageCapture(retained, correctedPlan, 42,
+          observedSource, observedIdentity, &failure, retainedStorageRoot,
+          retainedHandoffRoot, retainedCgroupRoot, retainedProcRoot);
+    };
+    suite.expect(validateRetained(), "retained_capture_exact_quiescent_owner_accepted");
+    ++retained.sourceInode;
+    suite.expect(!validateRetained(), "retained_capture_changed_inode_rejected");
+    --retained.sourceInode;
+    ++retained.sourceGID;
+    suite.expect(!validateRetained(), "retained_capture_changed_group_rejected");
+    --retained.sourceGID;
+    ++retained.machineUUID;
+    suite.expect(!validateRetained(), "retained_capture_wrong_machine_rejected");
+    --retained.machineUUID;
+    String goodDigest = retained.captureSHA256;
+    retained.captureSHA256[0] = retained.captureSHA256[0] == 'a' ? 'b' : 'a';
+    suite.expect(!validateRetained(), "retained_capture_changed_digest_rejected");
+    retained.captureSHA256 = goodDigest;
+    suite.expect(writeFileFixture(retainedRoot / "proc/123/status", "fixture"), "retained_capture_live_pid_fixture");
+    suite.expect(!validateRetained(), "retained_capture_present_pid_rejected");
+    std::filesystem::remove_all(retainedRoot / "proc/123");
+    suite.expect(writeFileFixture(retainedRoot / "cgroups/21.slice/cgroup.events", "populated 1\n"),
+                 "retained_capture_populated_cgroup_fixture");
+    suite.expect(!validateRetained(), "retained_capture_populated_cgroup_rejected");
+    suite.expect(writeFileFixture(retainedRoot / "cgroups/21.slice/cgroup.events", "populated 0\n"),
+                 "retained_capture_empty_cgroup_fixture");
+    String recoveredPayload;
+    suite.expect(validateRetained() && ContainerManager::stageQuiescedStorageCopy(
+                     retained.sourceContainerUUID, pid_t(retained.sourcePID), 0, 0, correctedPlan,
+                     observedSource, observedIdentity, recoveredPayload, &failure, retainedHandoffRoot),
+                 "retained_capture_corrected_successor_uses_shared_reflink_owner");
+    struct stat originalAfter = {};
+    suite.expect(lstat(originalPath.c_str(), &originalAfter) == 0 &&
+                     originalAfter.st_ino == retainedIdentity.st_ino &&
+                     originalAfter.st_uid == retainedIdentity.st_uid &&
+                     std::filesystem::exists(retainedSourcePath / "kvdb/value"),
+                 "retained_capture_corrected_successor_preserves_original_identity_and_data");
+    String originalValue, recoveredValue;
+    String originalValuePath, recoveredValuePath;
+    originalValuePath.assign((retainedSourcePath / "kvdb/value").c_str());
+    recoveredValuePath.assign((filesystemPathFromString(recoveredPayload) / "kvdb/value").c_str());
+    Filesystem::openReadAtClose(-1, originalValuePath, originalValue);
+    Filesystem::openReadAtClose(-1, recoveredValuePath, recoveredValue);
+    suite.expect(originalValue.equals("retained-original"_ctv) && recoveredValue.equals(originalValue),
+                 "retained_capture_original_and_corrected_copy_bytes_match");
     close(predecessor.cgroup);
     predecessor.cgroup = -1;
     dprintf(STDOUT_FILENO, "storage_reflink_focused failed=%d\n", suite.failed);
@@ -5877,7 +5969,7 @@ int main(void)
         seedSchedulableMachine(brain, rack, machine, uint128_t(0x19601101), 0x0a000118, "deploy-task"_ctv, socket);
     suite.expect(machineReady, "deploy_task_single_attempt_seeds_machine");
 
-    ApplicationDeployment deployment;
+    ApplicationDeployment deployment = {};
     seedCommonPlan(deployment, false);
     deployment.plan.config.type = ApplicationType::task;
     deployment.plan.config.taskExecutionPolicy = TaskExecutionPolicy::untilSucceeded;
@@ -5887,6 +5979,9 @@ int main(void)
 
     if (machineReady)
     {
+      suite.expect(prodigyMachineReadyForScheduling(&machine), "deploy_task_single_attempt_fixture_runtime_ready");
+      suite.expect(ApplicationDeployment::nFitOnMachine(&deployment, &machine, 1) == 1,
+                   "deploy_task_single_attempt_fixture_has_capacity");
       deployment.deploy();
       ContainerView *container = deployment.containers.size() == 1 ? *deployment.containers.begin() : nullptr;
       ContainerPlan plan = container ? container->generatePlan(deployment.plan) : ContainerPlan {};
@@ -8528,6 +8623,7 @@ int main(void)
     wormhole.routablePrefixUUID = registered.uuid;
     deployment.plan.wormholes.push_back(wormhole);
     brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+
 
     if (machinesReady)
     {
@@ -11851,6 +11947,135 @@ int main(void)
         brain.containers.erase(container->uuid);
       }
       current.containers.clear();
+      brain.deployments.erase(oldDeploymentID);
+      brain.deployments.erase(current.plan.config.deploymentID());
+      brain.deploymentsByApp.erase(current.plan.config.applicationID);
+    }
+
+    if (machinesReady)
+    {
+      ApplicationDeployment *old = new ApplicationDeployment();
+      ApplicationDeployment current = {};
+      seedCommonPlan(*old, true);
+      old->plan = deployment.plan;
+      old->plan.config.applicationID += 7;
+      old->plan.config.versionID = 131;
+      old->plan.stateful.allowUpdateInPlace = true;
+      current.plan = old->plan;
+      current.plan.config.versionID = 132;
+      old->state = DeploymentState::decommissioning;
+      current.state = DeploymentState::waitingToDeploy;
+      old->next = &current;
+      current.previous = old;
+      current.nShardGroups = 1;
+      old->nShardGroups = 1;
+      old->nTargetBase = 3;
+      old->nDeployedBase = 2;
+      old->nHealthyBase = 0;
+      const uint64_t oldDeploymentID = old->plan.config.deploymentID();
+      ContainerView *oldCohort[2] = {new ContainerView(), new ContainerView()};
+      Machine *oldMachines[] = {&machineA, &machineB};
+      for (uint32_t index = 0; index < 2; ++index)
+      {
+        oldCohort[index]->uuid = uint128_t(0x19051980 + index);
+        oldCohort[index]->deploymentID = old->plan.config.deploymentID();
+        oldCohort[index]->applicationID = old->plan.config.applicationID;
+        oldCohort[index]->machine = oldMachines[index];
+        oldCohort[index]->lifetime = ApplicationLifetime::base;
+        oldCohort[index]->isStateful = true;
+        oldCohort[index]->shardGroup = 0;
+        oldCohort[index]->state = ContainerState::scheduled;
+        oldCohort[index]->fragment = oldMachines[index]->getContainerFragment();
+        prodigyDebitMachineScalarResources(oldMachines[index], old->plan.config, 1);
+        old->containers.insert(oldCohort[index]);
+        old->containersByShardGroup.insert(0, oldCohort[index]);
+        old->countPerMachine[oldMachines[index]] = 1;
+        old->countPerRack[oldMachines[index]->rack] = 1;
+        brain.containers.insert_or_assign(oldCohort[index]->uuid, oldCohort[index]);
+        oldMachines[index]->upsertContainerIndexEntry(oldCohort[index]->deploymentID, oldCohort[index]);
+      }
+      brain.deployments.insert_or_assign(old->plan.config.deploymentID(), old);
+      brain.deployments.insert_or_assign(current.plan.config.deploymentID(), &current);
+      brain.deploymentsByApp.insert_or_assign(current.plan.config.applicationID, &current);
+      RetainedContainerStorageSource source = {};
+      source.sourceContainerUUID = uint128_t(0x19051990);
+      source.failedSuccessorContainerUUID = uint128_t(0x19051991);
+      source.machineUUID = machineC.uuid;
+      source.sourceDevice = 56;
+      source.sourceInode = 265;
+      source.sourceUID = 12517185;
+      source.sourceGID = 12517185;
+      source.sourcePID = 42;
+      source.captureSHA256.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
+      const uint128_t retryUUID = uint128_t(0x19051992);
+      machineA.neuron.wBuffer.clear();
+      machineB.neuron.wBuffer.clear();
+      machineC.neuron.wBuffer.clear();
+      suite.expect(current.beginRetainedStorageRecoverySlot(&machineC, retryUUID, source),
+                   "materialized_recovery_retained_slot_dispatches_only_missing_source_machine");
+      suite.expect(old->containers.size() == 2 && oldCohort[0]->state == ContainerState::scheduled &&
+                       oldCohort[1]->state == ContainerState::scheduled && machineA.neuron.wBuffer.empty() && machineB.neuron.wBuffer.empty(),
+                   "materialized_recovery_retained_slot_never_stops_old_pair_before_first_health");
+      uint32_t recoveryFrames = 0;
+      bool decodedRecoveryFrame = false;
+      const auto inspectRecoveryFrame = [&](Message *queued) {
+        if (NeuronTopic(queued->topic) != NeuronTopic::spinContainer) return;
+        uint8_t *args = queued->args;
+        uint128_t replaceUUID = 0;
+        String bootstrapBytes = {};
+        String sourceBytes = {};
+        NeuronContainerBootstrap bootstrap = {};
+        RetainedContainerStorageSource decoded = {};
+        Message::extractArg<ArgumentNature::fixed>(args, replaceUUID);
+        Message::extractToStringView(args, bootstrapBytes);
+        Message::extractToStringView(args, sourceBytes);
+        if (args != queued->terminal() || BitseryEngine::deserializeSafe(bootstrapBytes, bootstrap) == false ||
+            BitseryEngine::deserializeSafe(sourceBytes, decoded) == false) return;
+        decodedRecoveryFrame = replaceUUID == source.sourceContainerUUID && bootstrap.plan.uuid == retryUUID && decoded.sourceContainerUUID == source.sourceContainerUUID &&
+                               decoded.failedSuccessorContainerUUID == source.failedSuccessorContainerUUID && decoded.machineUUID == machineC.uuid;
+        recoveryFrames += 1;
+      };
+      for (uint64_t offset = 0; offset + sizeof(Message) <= machineC.neuron.wBuffer.size(); )
+      {
+        Message *frame = reinterpret_cast<Message *>(machineC.neuron.wBuffer.data() + offset);
+        if (frame->size < sizeof(Message) || frame->size > machineC.neuron.wBuffer.size() - offset) break;
+        inspectRecoveryFrame(frame);
+        offset += frame->size;
+      }
+      suite.expect(recoveryFrames == 1 && decodedRecoveryFrame,
+                   "materialized_recovery_retained_slot_emits_bootstrap_and_separate_exact_source_suffix");
+      suite.expect(current.beginRetainedStorageRecoverySlot(&machineC, retryUUID, source) == false,
+                   "materialized_recovery_retained_slot_rejects_duplicate_dispatch");
+      ContainerView *recovered = current.containers.begin() == current.containers.end() ? nullptr : *current.containers.begin();
+      suite.expect(recovered != nullptr, "materialized_recovery_retained_slot_has_canonical_view");
+      if (recovered) current.containerIsHealthy(recovered);
+      current.resumeMaterializedStatefulRecovery();
+      suite.expect(old->containers.size() == 1 && current.waitingOnContainers.size() == 1,
+                   "materialized_recovery_retained_slot_releases_one_old_only_after_new_health");
+      // Drive the existing serial owner to a clean terminal fixture state.
+      for (uint32_t pass = 0; pass < 2 && !current.waitingOnContainers.empty(); ++pass)
+      {
+        for (uint32_t index = 0; index < 2; ++index)
+        {
+          if (oldCohort[index] && oldCohort[index]->state == ContainerState::destroying)
+          {
+            old->containerDestroyed(oldCohort[index]);
+            oldCohort[index] = nullptr;
+          }
+        }
+        ContainerView *replacement = current.waitingOnContainers.begin()->first;
+        current.containerIsHealthy(replacement);
+      }
+      suite.expect(current.state == DeploymentState::running && current.nHealthy() == 3 && current.previous == nullptr,
+                   "materialized_recovery_retained_slot_finishes_through_existing_serial_owner");
+      Vector<ContainerView *> created;
+      for (ContainerView *container : current.containers) created.push_back(container);
+      for (ContainerView *container : created)
+      {
+        current.releaseContainerPlacementCounts(container);
+        current.destructContainer(container);
+        current.containerDestroyed(container);
+      }
       brain.deployments.erase(oldDeploymentID);
       brain.deployments.erase(current.plan.config.deploymentID());
       brain.deploymentsByApp.erase(current.plan.config.applicationID);

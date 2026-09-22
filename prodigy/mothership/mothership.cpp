@@ -17048,6 +17048,9 @@ private:
     bool sawSuccessorVersionID = false;
     bool sawOperationID = false;
     bool sawSuccessorBlobSHA256 = false;
+    bool sawRetry = false, sawReplacementVersion = false, sawReplacementBlob = false;
+    bool sawSourceContainer = false, sawFailedContainer = false, sawSourceMachine = false;
+    bool sawSourceDevice = false, sawSourceInode = false, sawSourceUID = false, sawSourceGID = false, sawSourcePID = false, sawCaptureSHA = false;
     if (parser.parse(json.data(), json.size()).get(doc))
     {
       basics_log("invalid json for recoverMaterializedStatefulDeployment\n");
@@ -17057,16 +17060,19 @@ private:
     {
       String key;
       key.setInvariant(field.key.data(), field.key.size());
-      if (key.equal("applicationName"_ctv) || key.equal("operationID"_ctv) || key.equal("successorBlobSHA256"_ctv))
+      if (key.equal("applicationName"_ctv) || key.equal("operationID"_ctv) || key.equal("successorBlobSHA256"_ctv) ||
+          key.equal("replacementSuccessorBlobSHA256"_ctv) || key.equal("captureSHA256"_ctv) ||
+          key.equal("sourceContainerUUID"_ctv) || key.equal("failedSuccessorContainerUUID"_ctv) || key.equal("sourceMachineUUID"_ctv))
       {
         if (field.value.type() != simdjson::dom::element_type::STRING)
         {
           basics_log("recoverMaterializedStatefulDeployment.%s requires string\n", key.c_str());
           exit(EXIT_FAILURE);
         }
-        bool *seen = key.equal("applicationName"_ctv) ? &sawApplicationName
-                     : key.equal("operationID"_ctv) ? &sawOperationID
-                                                      : &sawSuccessorBlobSHA256;
+        bool *seen = key.equal("applicationName"_ctv) ? &sawApplicationName : key.equal("operationID"_ctv) ? &sawOperationID :
+                     key.equal("successorBlobSHA256"_ctv) ? &sawSuccessorBlobSHA256 : key.equal("replacementSuccessorBlobSHA256"_ctv) ? &sawReplacementBlob :
+                     key.equal("captureSHA256"_ctv) ? &sawCaptureSHA : key.equal("sourceContainerUUID"_ctv) ? &sawSourceContainer :
+                     key.equal("failedSuccessorContainerUUID"_ctv) ? &sawFailedContainer : &sawSourceMachine;
         if (*seen)
         {
           basics_log("recoverMaterializedStatefulDeployment duplicate field %s\n", key.c_str());
@@ -17075,9 +17081,26 @@ private:
         *seen = true;
         if (key.equal("applicationName"_ctv)) request.applicationName.assign(field.value.get_c_str());
         else if (key.equal("operationID"_ctv)) request.operationID.assign(field.value.get_c_str());
-        else request.successorBlobSHA256.assign(field.value.get_c_str());
+        else if (key.equal("successorBlobSHA256"_ctv)) request.successorBlobSHA256.assign(field.value.get_c_str());
+        else if (key.equal("replacementSuccessorBlobSHA256"_ctv)) request.replacementSuccessorBlobSHA256.assign(field.value.get_c_str());
+        else if (key.equal("captureSHA256"_ctv)) request.captureSHA256.assign(field.value.get_c_str());
+        else
+        {
+          String uuidText = {};
+          uuidText.assign(field.value.get_c_str());
+          uint128_t uuid = 0;
+          if (!prodigyParseCanonicalHex128(uuidText, uuid) || uuid == 0)
+          {
+            basics_log("recoverMaterializedStatefulDeployment.%s requires canonical nonzero UUID\n", key.c_str());
+            exit(EXIT_FAILURE);
+          }
+          if (key.equal("sourceContainerUUID"_ctv)) request.sourceContainerUUID = uuid;
+          else if (key.equal("failedSuccessorContainerUUID"_ctv)) request.failedSuccessorContainerUUID = uuid;
+          else request.sourceMachineUUID = uuid;
+        }
       }
-      else if (key.equal("applicationID"_ctv) || key.equal("activeVersionID"_ctv) || key.equal("successorVersionID"_ctv))
+      else if (key.equal("applicationID"_ctv) || key.equal("activeVersionID"_ctv) || key.equal("successorVersionID"_ctv) || key.equal("replacementSuccessorVersionID"_ctv) ||
+               key.equal("sourceDevice"_ctv) || key.equal("sourceInode"_ctv) || key.equal("sourceUID"_ctv) || key.equal("sourceGID"_ctv) || key.equal("sourcePID"_ctv))
       {
         uint64_t value = 0;
         if ((field.value.type() != simdjson::dom::element_type::INT64 &&
@@ -17087,22 +17110,39 @@ private:
           basics_log("recoverMaterializedStatefulDeployment.%s requires positive integer\n", key.c_str());
           exit(EXIT_FAILURE);
         }
-        bool *seen = key.equal("applicationID"_ctv) ? &sawApplicationID
-                     : key.equal("activeVersionID"_ctv) ? &sawActiveVersionID
-                                                          : &sawSuccessorVersionID;
+        bool *seen = key.equal("applicationID"_ctv) ? &sawApplicationID : key.equal("activeVersionID"_ctv) ? &sawActiveVersionID :
+                     key.equal("successorVersionID"_ctv) ? &sawSuccessorVersionID : key.equal("replacementSuccessorVersionID"_ctv) ? &sawReplacementVersion :
+                     key.equal("sourceDevice"_ctv) ? &sawSourceDevice : key.equal("sourceInode"_ctv) ? &sawSourceInode :
+                     key.equal("sourceUID"_ctv) ? &sawSourceUID : key.equal("sourceGID"_ctv) ? &sawSourceGID : &sawSourcePID;
         if (*seen)
         {
           basics_log("recoverMaterializedStatefulDeployment duplicate field %s\n", key.c_str());
           exit(EXIT_FAILURE);
         }
         *seen = true;
+        if ((key.equal("sourceUID"_ctv) || key.equal("sourceGID"_ctv)) && value > UINT32_MAX)
+        {
+          basics_log("recoverMaterializedStatefulDeployment.%s exceeds host identity range\n", key.c_str());
+          exit(EXIT_FAILURE);
+        }
         if (key.equal("applicationID"_ctv))
         {
           if (value > UINT16_MAX) { basics_log("recoverMaterializedStatefulDeployment.applicationID invalid\n"); exit(EXIT_FAILURE); }
           request.applicationID = uint16_t(value);
         }
         else if (key.equal("activeVersionID"_ctv)) request.activeVersionID = value;
-        else request.successorVersionID = value;
+        else if (key.equal("successorVersionID"_ctv)) request.successorVersionID = value;
+        else if (key.equal("replacementSuccessorVersionID"_ctv)) request.replacementSuccessorVersionID=value;
+        else if (key.equal("sourceDevice"_ctv)) request.sourceDevice=value;
+        else if (key.equal("sourceInode"_ctv)) request.sourceInode=value;
+        else if (key.equal("sourceUID"_ctv)) request.sourceUID=uint32_t(value);
+        else if (key.equal("sourceGID"_ctv)) request.sourceGID=uint32_t(value);
+        else request.sourcePID=value;
+      }
+      else if (key.equal("retryFailedSuccessor"_ctv))
+      {
+        if (sawRetry || field.value.type() != simdjson::dom::element_type::BOOL || field.value.get(request.retryFailedSuccessor) != simdjson::SUCCESS) { basics_log("recoverMaterializedStatefulDeployment.retryFailedSuccessor requires bool\n"); exit(EXIT_FAILURE); }
+        sawRetry=true;
       }
       else
       {
@@ -17120,6 +17160,10 @@ private:
     {
       basics_log("recoverMaterializedStatefulDeployment requires applicationName, applicationID, activeVersionID, successorVersionID, canonical operationID, and bounded successorBlobSHA256\n");
       exit(EXIT_FAILURE);
+    }
+    if (request.retryFailedSuccessor && (!sawReplacementVersion || !sawReplacementBlob || !sawSourceContainer || !sawFailedContainer || !sawSourceMachine || !sawSourceDevice || !sawSourceInode || !sawSourceUID || !sawSourceGID || !sawSourcePID || !sawCaptureSHA || request.replacementSuccessorVersionID <= request.successorVersionID || request.replacementSuccessorVersionID >= (uint64_t(1) << 48) || request.sourceContainerUUID == 0 || request.failedSuccessorContainerUUID == 0 || request.sourceMachineUUID == 0 || request.sourceDevice == 0 || request.sourceInode == 0 || request.sourcePID == 0 || prodigyIsSHA256HexDigest(request.replacementSuccessorBlobSHA256) == false || prodigyIsSHA256HexDigest(request.captureSHA256) == false))
+    {
+      basics_log("recoverMaterializedStatefulDeployment retry requires replacement identity and retained source receipt identity\n"); exit(EXIT_FAILURE);
     }
     if (!configureControlTarget(argv[0]))
     {

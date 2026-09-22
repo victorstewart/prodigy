@@ -3890,11 +3890,11 @@ private:
     rollback();
   }
 
-  ContainerView *constructOnMachine(Machine *machine, ApplicationLifetime lifetime, Vector<uint32_t> assignedGPUMemoryMBs = {}, Vector<AssignedGPUDevice> assignedGPUDevices = {})
+  ContainerView *constructOnMachine(Machine *machine, ApplicationLifetime lifetime, Vector<uint32_t> assignedGPUMemoryMBs = {}, Vector<AssignedGPUDevice> assignedGPUDevices = {}, uint128_t fixedUUID = 0)
   {
     ContainerView *container = new ContainerView();
     container->createdAtMs = Time::now<TimeResolution::ms>();
-    container->uuid = Random::generateNumberWithNBits<128, uint128_t>();
+    container->uuid = fixedUUID ? fixedUUID : Random::generateNumberWithNBits<128, uint128_t>();
     container->state = ContainerState::planned;
     container->deploymentID = plan.config.deploymentID();
     container->applicationID = plan.config.applicationID;
@@ -7488,6 +7488,12 @@ public:
   // Restored by Brain from the durable, version-scoped recovery acceptance.
   bool materializedStatefulRecoveryOwnsTransition = false;
   bool materializedStatefulRecoveryHealthFailed = false;
+  // This is transient dispatch state reconstructed from Brain's durable retry
+  // record.  It is consumed by exactly one construct and never serialized in
+  // a DeploymentPlan.
+  bool hasRetainedStorageRecoverySource = false;
+  uint128_t retainedStorageRecoveryContainerUUID = 0;
+  RetainedContainerStorageSource retainedStorageRecoverySource;
 
   bytell_hash_map<uint32_t, ContainerView *> masterForShardGroup; // only for stateful + !allMasters
 
@@ -8851,6 +8857,23 @@ public:
 
             String buffer;
             BitseryEngine::serialize(buffer, bootstrap);
+            const bool retainedStorageRecoveryLaunch =
+                hasRetainedStorageRecoverySource &&
+                retainedStorageRecoveryContainerUUID == container->uuid &&
+                replacingContainer == nullptr;
+            if (retainedStorageRecoveryLaunch)
+            {
+              // The established spinContainer wire remains unchanged for all
+              // ordinary launches.  The recovery owner appends one bounded
+              // descriptor; Neuron derives its own canonical paths.
+              String retainedSourceBuffer = {};
+              BitseryEngine::serialize(retainedSourceBuffer, retainedStorageRecoverySource);
+              queueSend(machine, NeuronTopic::spinContainer, retainedStorageRecoverySource.sourceContainerUUID, buffer, retainedSourceBuffer);
+            }
+            else
+            {
+              queueSend(machine, NeuronTopic::spinContainer, replaceContainerUUID, buffer);
+            }
 
 #if PRODIGY_DEBUG
             PRODIGY_DEBUG_LOG( "schedule spinContainer deploymentID=%llu appID=%u machinePrivate4=%u containerUUID=%llu replaceUUID=%llu state=%d waitingBefore=%llu\n",
@@ -8863,7 +8886,6 @@ public:
                          (unsigned long long)waitingOnContainers.size());
 #endif
 
-            queueSend(machine, NeuronTopic::spinContainer, replaceContainerUUID, buffer);
             if (container->whiteholes.empty() == false)
             {
               thisBrain->sendNeuronOpenSwitchboardWhiteholes(container, container->whiteholes);
@@ -9868,6 +9890,101 @@ public:
     delete this;
   }
 
+  // A failed health barrier may retain planner-only views for replacements
+  // which were never sent to a Neuron.  They reserve accounting but own no
+  // process or storage, so discard them only as a single all-planned cohort.
+  bool canDiscardUnlaunchedMaterializedRecoveryViews(void) const
+  {
+    if (state != DeploymentState::failed || materializedStatefulRecoveryHealthFailed == false ||
+        currentlyExecutingWork || schedulingStack.execution || retiredSchedulingExecution ||
+        consumingSchedulingExecution || !schedulingStack.waiters.empty() || nSuspended != 0 ||
+        !waitingOnContainers.empty() || waitingOnCompactions || canaryStack)
+    {
+      return false;
+    }
+    for (ContainerView *container : containers)
+    {
+      if (container == nullptr || container->machine == nullptr || container->state != ContainerState::planned ||
+          container->deploymentID != plan.config.deploymentID() ||
+          container->fragment != 0 || !container->whiteholes.empty() ||
+          thisBrain->containers.find(container->uuid) == thisBrain->containers.end() ||
+          thisBrain->containers.find(container->uuid)->second != container)
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool retainedRecoveryFailedHeadCanBeReplaced(void) const
+  {
+    // A cold restart reconstructs an empty plan as NONE; the durable accepted
+    // recovery and authenticated retained-storage receipt remain its authority.
+    return canDiscardUnlaunchedMaterializedRecoveryViews() ||
+           ((state == DeploymentState::none || state == DeploymentState::waitingToDeploy) &&
+            lifecycleIsUnmaterialized());
+  }
+
+  bool discardUnlaunchedMaterializedRecoveryViews(void)
+  {
+    if (canDiscardUnlaunchedMaterializedRecoveryViews() == false)
+    {
+      return false;
+    }
+    Vector<ContainerView *> discarded = {};
+    for (ContainerView *container : containers) discarded.push_back(container);
+    for (ContainerView *container : discarded)
+    {
+      releaseContainerPlacementCounts(container);
+      // These existing owners release scalar/GPU reservations, shard indexes,
+      // and the canonical view. No kill is sent for a planner-only container.
+      destructContainer(container);
+      containerDestroyed(container);
+    }
+    rebuildRecoveredContainerCounts();
+    return true;
+  }
+
+  // Start exactly the missing retained-storage replica.  The caller has
+  // already durably allocated retryUUID and verified the source Machine.
+  // No predecessor work is considered here; normal recovery resumes only
+  // after this container becomes healthy.
+  bool beginRetainedStorageRecoverySlot(Machine *machine, uint128_t retryUUID,
+                                        const RetainedContainerStorageSource& source)
+  {
+    if (machine == nullptr || retryUUID == 0 || source.machineUUID != machine->uuid ||
+        source.sourceContainerUUID == 0 || source.failedSuccessorContainerUUID == 0 ||
+        source.sourceDevice == 0 || source.sourceInode == 0 || source.sourcePID == 0 ||
+        source.captureSHA256.size() == 0 || previous == nullptr || containers.empty() == false ||
+        state != DeploymentState::waitingToDeploy || plan.isStateful == false || nShardGroups > 1 ||
+        previous->nShardGroups != 1 ||
+        previous->containers.size() != 2 || BrainBase::neuronControlStreamActive(machine) == false ||
+        machine->runtimeReady == false || nFitOnMachine(this, machine, 1) == 0)
+    {
+      return false;
+    }
+    nShardGroups = 1;
+    calculateTargets();
+    if (nTarget() != 3) return false;
+    ContainerView *container = constructOnMachine(machine, ApplicationLifetime::base, {}, {}, retryUUID);
+    container->shardGroup = 0;
+    containersByShardGroup.insert(0, container);
+    nDeployedBase = 1;
+    countPerMachine[machine] += 1;
+    countPerRack[machine->rack] += 1;
+    racksByShardGroup[0].insert(machine->rack);
+    prodigyDebitMachineScalarResources(machine, plan.config, 1);
+    hasRetainedStorageRecoverySource = true;
+    retainedStorageRecoveryContainerUUID = retryUUID;
+    retainedStorageRecoverySource = source;
+    materializedStatefulRecoveryOwnsTransition = true;
+    state = DeploymentState::deploying;
+    stateChangedAtMs = Time::now<TimeResolution::ms>();
+    toSchedule.push_back(planStatefulConstruction(machine, container, DataStrategy::seeding));
+    schedule(nullptr);
+    return true;
+  }
+
   void resumeMaterializedStatefulRecovery(void)
   {
     if (materializedStatefulRecoveryOwnsTransition == false ||
@@ -9939,6 +10056,24 @@ public:
     recoverAfterReboot();
   }
 
+  static bool materializedStatefulRecoveryPlansAreCompatible(const DeploymentPlan& active, const DeploymentPlan& successor)
+  {
+    return active.isStateful && successor.isStateful &&
+           active.config.type == ApplicationType::stateful && successor.config.type == ApplicationType::stateful &&
+           active.config.applicationID == successor.config.applicationID &&
+           successor.stateful.allowUpdateInPlace && successor.canaryCount == 0 &&
+           successor.config.nLogicalCores == active.config.nLogicalCores &&
+           successor.config.totalMemoryMB() == active.config.totalMemoryMB() &&
+           successor.config.totalStorageMB() == active.config.totalStorageMB() &&
+           successor.stateful.clientPrefix == active.stateful.clientPrefix &&
+           successor.stateful.siblingPrefix == active.stateful.siblingPrefix &&
+           successor.stateful.cousinPrefix == active.stateful.cousinPrefix &&
+           successor.stateful.seedingPrefix == active.stateful.seedingPrefix &&
+           successor.stateful.shardingPrefix == active.stateful.shardingPrefix &&
+           successor.stateful.seedingAlways == active.stateful.seedingAlways &&
+           successor.stateful.allMasters == active.stateful.allMasters;
+  }
+
   // Shared structural guard for the only retained-storage recovery path.
   // It deliberately excludes mutable scheduler state; the two callers below
   // own their distinct NONE and sole-initial-health-wait lifecycle barriers.
@@ -9952,19 +10087,7 @@ public:
       return false;
     }
     if (next->previous != this || next->next != nullptr ||
-        next->plan.isStateful == false || next->plan.config.type != ApplicationType::stateful ||
-        next->plan.config.applicationID != plan.config.applicationID ||
-        next->plan.stateful.allowUpdateInPlace == false || next->plan.canaryCount != 0 ||
-        next->plan.config.nLogicalCores != plan.config.nLogicalCores ||
-        next->plan.config.totalMemoryMB() != plan.config.totalMemoryMB() ||
-        next->plan.config.totalStorageMB() != plan.config.totalStorageMB() ||
-        next->plan.stateful.clientPrefix != plan.stateful.clientPrefix ||
-        next->plan.stateful.siblingPrefix != plan.stateful.siblingPrefix ||
-        next->plan.stateful.cousinPrefix != plan.stateful.cousinPrefix ||
-        next->plan.stateful.seedingPrefix != plan.stateful.seedingPrefix ||
-        next->plan.stateful.shardingPrefix != plan.stateful.shardingPrefix ||
-        next->plan.stateful.seedingAlways != plan.stateful.seedingAlways ||
-        next->plan.stateful.allMasters != plan.stateful.allMasters ||
+        materializedStatefulRecoveryPlansAreCompatible(plan, next->plan) == false ||
         next->state != DeploymentState::waitingToDeploy || next->lifecycleIsUnmaterialized() == false)
     {
       return false;

@@ -832,6 +832,33 @@ static void testMasterAuthorityRuntimeStateRecoveryCodec(TestSuite& suite)
   suite.expect(BitseryEngine::deserializeSafe(bothBytes, bothDecoded) && bothDecoded == both,
                "master_authority_runtime_state_roundtrips_v2_recovery_and_notice");
 
+  ProdigyMasterAuthorityRuntimeState retryState = both;
+  ProdigyMaterializedStatefulRecoveryRetry retry = {};
+  retry.operationID = operation.operationID;
+  retry.activeDeploymentID = operation.activeDeploymentID;
+  retry.failedSuccessorDeploymentID = operation.successorDeploymentID;
+  retry.failedSuccessorBlobSHA256 = operation.successorBlobSHA256;
+  retry.replacementSuccessorDeploymentID = 0x7101000000000003ULL;
+  retry.replacementSuccessorBlobSHA256.assign("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"_ctv);
+  retry.source.sourceContainerUUID = uint128_t(0x1234);
+  retry.source.failedSuccessorContainerUUID = uint128_t(0x5678);
+  retry.source.machineUUID = uint128_t(0x9abc);
+  retry.source.sourceDevice = 56;
+  retry.source.sourceInode = 265;
+  retry.source.sourceUID = 12517185;
+  retry.source.sourceGID = 12517185;
+  retry.source.sourcePID = 42;
+  retry.source.captureSHA256 = operation.successorBlobSHA256;
+  retry.retryContainerUUID = uint128_t(0xdef0);
+  retry.phase = ProdigyMaterializedStatefulRecoveryRetryPhase::storageLaunchDispatched;
+  retry.updatedAtMs = 123458;
+  retryState.materializedStatefulRecoveryRetries.push_back(retry);
+  String retryBytes = {};
+  BitseryEngine::serialize(retryBytes, retryState);
+  ProdigyMasterAuthorityRuntimeState retryDecoded = {};
+  suite.expect(BitseryEngine::deserializeSafe(retryBytes, retryDecoded) && retryDecoded == retryState,
+               "master_authority_runtime_state_roundtrips_v4_retained_storage_retry");
+
   String truncated = bothBytes;
   truncated.resize(8);
   ProdigyMasterAuthorityRuntimeState malformed = {};
@@ -839,7 +866,7 @@ static void testMasterAuthorityRuntimeStateRecoveryCodec(TestSuite& suite)
                "master_authority_runtime_state_rejects_truncated_version_marker");
 
   String unknownVersion = bothBytes;
-  uint64_t unsupportedVersion = 3;
+  uint64_t unsupportedVersion = 5;
   memcpy(unknownVersion.data() + sizeof(uint64_t), &unsupportedVersion, sizeof(unsupportedVersion));
   malformed = {};
   suite.expect(BitseryEngine::deserializeSafe(unknownVersion, malformed) == false,

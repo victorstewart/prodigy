@@ -331,6 +331,11 @@ public:
     return finalizePersistedNeuronInventoryRecovery();
   }
 
+  bool testPruneRecoveredInventoryOrphanWhiteholeLeases(void)
+  {
+    return pruneRecoveredInventoryOrphanWhiteholeLeases();
+  }
+
   bool testFinalizePersistedNeuronInventoryRecoveryWithoutMesh(void)
   {
     Mesh *savedMesh = mesh;
@@ -1743,8 +1748,185 @@ int main(void)
   }
   };
 
+  auto runRecoveredInventoryWhiteholeFixtures = [&]() -> void {
+  {
+    ScopedRing scopedRing = {};
+    TestBrain brain = {};
+    brain.weAreMaster = true;
+    brain.recoveringPersistedNeuronInventory = true;
+    brain.persistedMachineInventoryEnumerated = true;
+    Machine machine = {};
+    machine.uuid = uint128_t(0x7B0);
+    machine.state = MachineState::healthy;
+    machine.runtimeReady = true;
+    machine.neuron.machine = &machine;
+    machine.neuron.connected = true;
+    machine.neuron.isFixedFile = true;
+    machine.neuron.fslot = 71;
+    brain.machines.insert(&machine);
+    brain.persistedMachineInventoryUploaded.insert(machine.uuid);
+
+    ContainerView retained = {};
+    retained.uuid = uint128_t(0x7B1);
+    retained.applicationID = 7;
+    retained.deploymentID = (uint64_t(7) << 48) | 0x7B1;
+    retained.machine = &machine;
+    retained.state = ContainerState::scheduled;
+    Whitehole attached = {};
+    attached.hasAddress = true;
+    attached.address = IPAddress("10.0.2.15", false);
+    attached.sourcePort = 49'152;
+    retained.whiteholes.push_back(attached);
+    brain.containers.insert_or_assign(retained.uuid, &retained);
+
+    RoutableResourceLease attachedLease = {};
+    attachedLease.kind = RoutableResourceLeaseKind::whiteholeAddressPort;
+    attachedLease.owner.applicationID = retained.applicationID;
+    attachedLease.owner.deploymentID = retained.deploymentID;
+    attachedLease.address = attached.address;
+    attachedLease.sourcePort = attached.sourcePort;
+    RoutableResourceLease orphanLease = attachedLease;
+    orphanLease.sourcePort += 1;
+    RoutableResourceLease nonWhitehole = attachedLease;
+    nonWhitehole.kind = RoutableResourceLeaseKind::wormholeAddress;
+    brain.routableResourceLeaseRuntimeState = {attachedLease, orphanLease, nonWhitehole};
+
+    Machine::Claim claim = {};
+    machine.claims.push_back(claim);
+    suite.expect(brain.testPruneRecoveredInventoryOrphanWhiteholeLeases() &&
+                     brain.routableResourceLeaseRuntimeState.size() == 3,
+                 "recovered_inventory_whitehole_prune_skips_active_machine_claim");
+    machine.claims.clear();
+    machine.state = MachineState::hardwareFailure;
+    suite.expect(brain.testPruneRecoveredInventoryOrphanWhiteholeLeases() &&
+                     brain.routableResourceLeaseRuntimeState.size() == 3,
+                 "recovered_inventory_whitehole_prune_skips_terminal_machine");
+    machine.state = MachineState::healthy;
+    machine.neuron.connected = false;
+    suite.expect(brain.testPruneRecoveredInventoryOrphanWhiteholeLeases() &&
+                     brain.routableResourceLeaseRuntimeState.size() == 3,
+                 "recovered_inventory_whitehole_prune_skips_unavailable_control");
+    machine.neuron.connected = true;
+
+    ApplicationDeployment allocating = {};
+    CoroutineStack allocation = {};
+    allocating.canaryStack = &allocation;
+    brain.deployments.insert_or_assign(uint64_t(0x7B2), &allocating);
+    suite.expect(brain.testPruneRecoveredInventoryOrphanWhiteholeLeases() &&
+                     brain.routableResourceLeaseRuntimeState.size() == 3,
+                 "recovered_inventory_whitehole_prune_skips_partial_allocation");
+    brain.deployments.erase(uint64_t(0x7B2));
+
+    brain.failRuntimeStatePersist = true;
+    suite.expect(brain.testPruneRecoveredInventoryOrphanWhiteholeLeases() == false &&
+                     brain.routableResourceLeaseRuntimeState.size() == 3,
+                 "recovered_inventory_whitehole_prune_restores_leases_after_persist_failure");
+    brain.failRuntimeStatePersist = false;
+    suite.expect(brain.testPruneRecoveredInventoryOrphanWhiteholeLeases() &&
+                     brain.routableResourceLeaseRuntimeState.size() == 2 &&
+                     brain.routableResourceLeaseRuntimeState[0].kind == RoutableResourceLeaseKind::whiteholeAddressPort &&
+                     brain.routableResourceLeaseRuntimeState[1].kind == RoutableResourceLeaseKind::wormholeAddress,
+                 "recovered_inventory_whitehole_prune_keeps_canonical_and_nonwhitehole_leases");
+    const uint32_t persistedAfterPrune = brain.persistCalls;
+    suite.expect(brain.testPruneRecoveredInventoryOrphanWhiteholeLeases() &&
+                     brain.persistCalls == persistedAfterPrune,
+                 "recovered_inventory_whitehole_prune_is_idempotent_after_cleanup");
+
+    brain.containers.erase(retained.uuid);
+    brain.machines.erase(&machine);
+  }
+
+  {
+    ScopedRing scopedRing = {};
+    TestBrain brain = {};
+    brain.weAreMaster = true;
+    brain.recoveringPersistedNeuronInventory = true;
+    brain.persistedMachineInventoryEnumerated = true;
+
+    Machine machine = {};
+    machine.uuid = uint128_t(0x710);
+    machine.state = MachineState::healthy;
+    machine.runtimeReady = true;
+    brain.machines.insert(&machine);
+    RoutableResourceLease inventoryBlockedOrphan = {};
+    inventoryBlockedOrphan.kind = RoutableResourceLeaseKind::whiteholeAddressPort;
+    inventoryBlockedOrphan.owner.deploymentID = uint64_t(0x710);
+    inventoryBlockedOrphan.address = IPAddress("10.0.2.15", false);
+    inventoryBlockedOrphan.sourcePort = 49'153;
+    brain.routableResourceLeaseRuntimeState.push_back(inventoryBlockedOrphan);
+
+    suite.expect(brain.testFinalizePersistedNeuronInventoryRecovery() == false &&
+                     brain.testRecoveringPersistedNeuronInventory() &&
+                     brain.routableResourceLeaseRuntimeState.size() == 1,
+                 "persisted_inventory_recovery_waits_for_authoritative_machine_upload");
+
+    // An empty upload is authoritative: exercise the actual message owner,
+    // which must open the gate for a genuinely missing runtime.
+    brain.brainConfig.datacenterFragment = 0x34;
+    machine.fragment = 7;
+    machine.neuron.machine = &machine;
+    machine.neuron.connected = true;
+    int inventoryPeerFD = -1;
+    if (installNeuronSocket(brain, machine, inventoryPeerFD) == false)
+    {
+      suite.expect(false, "persisted_inventory_recovery_socket_installed");
+      brain.machines.erase(&machine);
+      return;
+    }
+    String upload = {};
+    uint32_t headerOffset = Message::appendHeader(upload, NeuronTopic::stateUpload);
+    struct local_container_subnet6 fragment = {};
+    fragment.dpfx = brain.brainConfig.datacenterFragment;
+    fragment.mpfx[2] = 7;
+    Message::appendAlignedBuffer<Alignment::one>(
+        upload, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
+    Message::finish(upload, headerOffset);
+    brain.testNeuronHandler(&machine.neuron, reinterpret_cast<Message *>(upload.data()));
+    suite.expect(brain.persistedMachineInventoryUploaded.contains(machine.uuid),
+                 "persisted_inventory_recovery_credits_actual_empty_upload");
+
+    brain.queueNeuronStateUploadForMachine(&machine);
+    suite.expect(brain.persistedMachineInventoryUploaded.contains(machine.uuid) == false &&
+                     brain.testFinalizePersistedNeuronInventoryRecovery() == false,
+                 "persisted_inventory_recovery_replay_invalidates_prior_upload");
+
+    brain.testNeuronHandler(&machine.neuron, reinterpret_cast<Message *>(upload.data()));
+    brain.neurons.insert(&machine.neuron);
+    cleanupNeuronSocket(machine.neuron, inventoryPeerFD);
+    brain.testCloseHandler(&machine.neuron);
+    suite.expect(brain.persistedMachineInventoryUploaded.contains(machine.uuid) == false &&
+                     brain.testFinalizePersistedNeuronInventoryRecovery() == false,
+                 "persisted_inventory_recovery_close_invalidates_prior_upload");
+    brain.neurons.erase(&machine.neuron);
+    brain.testEraseNeuronReconnectWaiter(&machine.neuron);
+    if (installNeuronSocket(brain, machine, inventoryPeerFD) == false)
+    {
+      suite.expect(false, "persisted_inventory_recovery_reconnected_socket_installed");
+      brain.machines.erase(&machine);
+      return;
+    }
+    machine.neuron.connected = true;
+
+    brain.testNeuronHandler(&machine.neuron, reinterpret_cast<Message *>(upload.data()));
+    suite.expect(brain.testFinalizePersistedNeuronInventoryRecovery() &&
+                     brain.testRecoveringPersistedNeuronInventory() == false &&
+                     brain.routableResourceLeaseRuntimeState.empty(),
+                 "persisted_inventory_recovery_accepts_authoritative_empty_upload_and_prunes_only_after_upload");
+
+    cleanupNeuronSocket(machine.neuron, inventoryPeerFD);
+    brain.routableResourceLeaseRuntimeState.clear();
+    brain.machines.erase(&machine);
+  }
+
+  };
+
   if (const char *testOnly = ::getenv("PRODIGY_TEST_ONLY"); testOnly != nullptr)
   {
+    if (std::strcmp(testOnly, "recovered-inventory-whiteholes") == 0)
+    {
+      runRecoveredInventoryWhiteholeFixtures();
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (std::strcmp(testOnly, "neuron-reconnect-inventory") == 0)
     {
       runNeuronReconnectInventoryFixture();
@@ -9423,58 +9605,7 @@ int main(void)
     delete peer;
   }
 
-  {
-    TestBrain brain = {};
-    brain.recoveringPersistedNeuronInventory = true;
-    brain.persistedMachineInventoryEnumerated = true;
-
-    Machine machine = {};
-    machine.uuid = uint128_t(0x710);
-    machine.state = MachineState::healthy;
-    machine.runtimeReady = true;
-    brain.machines.insert(&machine);
-
-    suite.expect(brain.testFinalizePersistedNeuronInventoryRecovery() == false &&
-                     brain.testRecoveringPersistedNeuronInventory(),
-                 "persisted_inventory_recovery_waits_for_authoritative_machine_upload");
-
-    // An empty upload is authoritative: exercise the actual message owner,
-    // which must open the gate for a genuinely missing runtime.
-    brain.brainConfig.datacenterFragment = 0x34;
-    machine.fragment = 7;
-    machine.neuron.machine = &machine;
-    String upload = {};
-    uint32_t headerOffset = Message::appendHeader(upload, NeuronTopic::stateUpload);
-    struct local_container_subnet6 fragment = {};
-    fragment.dpfx = brain.brainConfig.datacenterFragment;
-    fragment.mpfx[2] = 7;
-    Message::appendAlignedBuffer<Alignment::one>(
-        upload, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
-    Message::finish(upload, headerOffset);
-    brain.testNeuronHandler(&machine.neuron, reinterpret_cast<Message *>(upload.data()));
-    suite.expect(brain.persistedMachineInventoryUploaded.contains(machine.uuid),
-                 "persisted_inventory_recovery_credits_actual_empty_upload");
-
-    brain.queueNeuronStateUploadForMachine(&machine);
-    suite.expect(brain.persistedMachineInventoryUploaded.contains(machine.uuid) == false &&
-                     brain.testFinalizePersistedNeuronInventoryRecovery() == false,
-                 "persisted_inventory_recovery_replay_invalidates_prior_upload");
-
-    brain.testNeuronHandler(&machine.neuron, reinterpret_cast<Message *>(upload.data()));
-    brain.neurons.insert(&machine.neuron);
-    brain.testCloseHandler(&machine.neuron);
-    suite.expect(brain.persistedMachineInventoryUploaded.contains(machine.uuid) == false &&
-                     brain.testFinalizePersistedNeuronInventoryRecovery() == false,
-                 "persisted_inventory_recovery_close_invalidates_prior_upload");
-    brain.neurons.erase(&machine.neuron);
-
-    brain.testNeuronHandler(&machine.neuron, reinterpret_cast<Message *>(upload.data()));
-    suite.expect(brain.testFinalizePersistedNeuronInventoryRecovery() &&
-                     brain.testRecoveringPersistedNeuronInventory() == false,
-                 "persisted_inventory_recovery_accepts_authoritative_empty_upload");
-
-    brain.machines.erase(&machine);
-  }
+  runRecoveredInventoryWhiteholeFixtures();
 
   thisNeuron = nullptr;
 

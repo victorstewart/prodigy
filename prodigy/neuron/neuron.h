@@ -4405,7 +4405,7 @@ public:
         }
       case NeuronTopic::spinContainer:
         {
-          // replaceContainerUUID(16) plan{4}
+          // replaceContainerUUID(16) bootstrap{4}, optional retained source{4}.
 
           String inventoryFailure;
           if (!liveContainerInventoryComplete(inventoryFailure))
@@ -4447,7 +4447,19 @@ public:
                        plan.config.containerBlobSHA256.c_str());
           PRODIGY_DEBUG_FLUSH();
 
-          ContainerManager::spinContainer(plan, replaceContainerUUID, metricPolicy);
+          RetainedContainerStorageSource retainedSource;
+          if (args != terminal)
+          {
+            String serializedSource;
+            Message::extractToStringView(args, serializedSource);
+            if (args != terminal || BitseryEngine::deserializeSafe(serializedSource, retainedSource) == false ||
+                retainedSource.sourceContainerUUID == 0 || replaceContainerUUID != retainedSource.sourceContainerUUID)
+            {
+              basics_log("neuron spinContainer retained source deserialize failed\n");
+              break;
+            }
+          }
+          ContainerManager::spinContainer(plan, replaceContainerUUID, metricPolicy, retainedSource);
           // Replacement is asynchronous and can reject before stopping the old
           // owner. Its destruction finalizer, not dispatch, acknowledges removal.
 

@@ -24947,6 +24947,7 @@ static void testMaterializedStatefulRecoveryAdmission(TestSuite& suite)
     container.machine = &machine;
     container.state = index == 0 ? ContainerState::healthy : ContainerState::scheduled;
     active->containers.insert(&container);
+    brain.containers.insert_or_assign(container.uuid, &container);
   }
   suite.expect(active->recoveredMaterializedStatefulRollForwardIsSafe(),
                "materialized_recovery_request_fixture_is_admissible");
@@ -24977,6 +24978,7 @@ static void testMaterializedStatefulRecoveryAdmission(TestSuite& suite)
                    successor->toSchedule.empty() && successor->containers.empty() &&
                    active->state == DeploymentState::none,
                "materialized_recovery_failed_persist_cannot_schedule_or_accept");
+  brain.persistSucceeds = true;
 
   ProdigyMaterializedStatefulRecoveryOperation operation = {};
   operation.operationID = request.operationID;
@@ -25013,6 +25015,95 @@ static void testMaterializedStatefulRecoveryAdmission(TestSuite& suite)
   suite.expect(issue(conflict).success == false &&
                    brain.masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.size() == 1,
                "materialized_recovery_rejects_conflicting_operation");
+
+  // A corrected successor is authorized only after the original recovery has
+  // hit its health barrier.  The two retained predecessor views need not be
+  // healthy: old SDKs can report them running without a health callback.
+  successor->containers.clear();
+  active->containers.erase(&containers[2]);
+  successor->state = DeploymentState::failed;
+  successor->materializedStatefulRecoveryOwnsTransition = true;
+  successor->materializedStatefulRecoveryHealthFailed = true;
+  brain.machines.insert(&machines[2]);
+  brain.containers.erase(containers[2].uuid);
+  containers[0].state = ContainerState::scheduled;
+  active->nHealthyBase = 0;
+  auto retry = request;
+  retry.retryFailedSuccessor = true;
+  retry.replacementSuccessorVersionID = 203;
+  retry.replacementSuccessorBlobSHA256.assign("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv);
+  retry.sourceContainerUUID = uint128_t(0x7b4001);
+  retry.failedSuccessorContainerUUID = uint128_t(0x7b4002);
+  retry.sourceMachineUUID = machines[2].uuid;
+  retry.sourceDevice = 56;
+  retry.sourceInode = 265;
+  retry.sourceUID = 12517185;
+  retry.sourceGID = 12517185;
+  retry.sourcePID = 42;
+  retry.captureSHA256.assign("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv);
+  const uint64_t generationBeforeRetry = brain.masterAuthorityRuntimeState.generation;
+  brain.persistSucceeds = false;
+  suite.expect(!issue(retry).success && brain.masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.empty() &&
+                   brain.masterAuthorityRuntimeState.generation == generationBeforeRetry && active->containers.size() == 2,
+               "materialized_recovery_retry_failed_acceptance_preserves_authority_and_old_pair");
+  brain.persistSucceeds = true;
+  auto retryAccepted = issue(retry);
+  suite.expect(retryAccepted.success && brain.masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.size() == 1 &&
+                   active->containers.size() == 2 && successor->state == DeploymentState::failed,
+               "materialized_recovery_retry_accepts_exact_source_without_stopping_retained_predecessors");
+  auto retryRepeat = issue(retry);
+  suite.expect(retryRepeat.success && brain.masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.size() == 1,
+               "materialized_recovery_retry_is_idempotent_across_replay");
+  auto wrongSource = retry;
+  wrongSource.sourceInode += 1;
+  suite.expect(issue(wrongSource).success == false,
+               "materialized_recovery_retry_rejects_changed_retained_source_identity");
+  ApplicationDeployment corrected = {};
+  corrected.plan = successor->plan;
+  corrected.plan.config.versionID = retry.replacementSuccessorVersionID;
+  corrected.plan.config.containerBlobSHA256 = retry.replacementSuccessorBlobSHA256;
+  corrected.state = DeploymentState::waitingToDeploy;
+  corrected.previous = successor;
+  successor->next = &corrected;
+  brain.persistSucceeds = false;
+  suite.expect(!brain.promoteRetainedStorageRecoverySuccessor(
+                   brain.masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.front(), &corrected) &&
+                   active->next == successor && corrected.previous == successor &&
+                   brain.masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.front().phase ==
+                     ProdigyMaterializedStatefulRecoveryRetryPhase::authorized,
+               "materialized_recovery_retry_failed_promotion_restores_exact_chain");
+  brain.persistSucceeds = true;
+  successor->state = DeploymentState::none;
+  successor->materializedStatefulRecoveryHealthFailed = false;
+  // Let Brain advance through dispatch without invoking the scheduler on
+  // this admission-only fixture's synthetic sockets. The deployment fixture
+  // separately verifies the exact launch frame and serial health handoff.
+  machines[2].memoryMB_available = 0;
+  brain.spinApplication(&corrected);
+  suite.expect(brain.masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.front().phase ==
+                     ProdigyMaterializedStatefulRecoveryRetryPhase::storageLaunchDispatched &&
+                   brain.masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.front().retryContainerUUID != 0 &&
+                   active->next == &corrected && corrected.previous == active && successor->previous == nullptr &&
+                   active->containers.size() == 2 && active->nDeployed() == 2 && active->nHealthy() == 0,
+               "materialized_recovery_cold_spin_reaches_durable_dispatch_without_another_event");
+  const uint128_t fixedRetryUUID = brain.masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.front().retryContainerUUID;
+  brain.masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.front().phase =
+      ProdigyMaterializedStatefulRecoveryRetryPhase::authorized;
+  active->next = successor;
+  successor->previous = active;
+  successor->next = &corrected;
+  corrected.previous = successor;
+  brain.recoverDeploymentsAfterNeuronState();
+  suite.expect(brain.masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.front().phase ==
+                     ProdigyMaterializedStatefulRecoveryRetryPhase::storageLaunchDispatched &&
+                   brain.masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.front().retryContainerUUID == fixedRetryUUID &&
+                   corrected.previous == active && active->containers.size() == 2 && corrected.containers.empty(),
+               "materialized_recovery_authorized_retry_reaches_same_durable_dispatch_in_one_call");
+  suite.expect(issue(retry).success,
+               "materialized_recovery_retry_exact_request_remains_idempotent_after_chain_promotion");
+  corrected.previous = nullptr;
+  brain.containers.clear();
+  brain.machines.erase(&machines[2]);
   active->containers.clear();
   successor->containers.clear();
   brain.deployments.clear();

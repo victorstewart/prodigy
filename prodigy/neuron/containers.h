@@ -9580,10 +9580,29 @@ public:
     {
       return fail("legacy storage handoff requires an empty predecessor cgroup");
     }
+    return stageQuiescedStorageCopy(predecessor->plan.uuid, predecessor->pid,
+        predecessor->infop.si_code, predecessor->infop.si_status, successor,
+        sourcePath, sourceIdentity, stagedPayload, failureReport, handoffRoot);
+  }
+
+  // Both a freshly observed exit and a sealed retained handoff use this one
+  // reflink/ownership/durability owner. Callers must prove quiescence first.
+  static bool stageQuiescedStorageCopy(
+      uint128_t sourceUUID, pid_t sourcePID, int terminationCode, int terminationStatus,
+      const ContainerPlan& successor, const String& sourcePath,
+      const struct stat& sourceIdentity, String& stagedPayload,
+      String *failureReport = nullptr,
+      const String& handoffRoot = "/containers/.storage-handoffs"_ctv)
+  {
+    auto fail = [&](const char *message) {
+      if (failureReport) failureReport->assign(message);
+      return false;
+    };
     struct stat current = {};
     String source = sourcePath;
     if (lstat(source.c_str(), &current) != 0 || S_ISDIR(current.st_mode) == false ||
-        current.st_dev != sourceIdentity.st_dev || current.st_ino != sourceIdentity.st_ino)
+        current.st_dev != sourceIdentity.st_dev || current.st_ino != sourceIdentity.st_ino ||
+        current.st_uid != sourceIdentity.st_uid || current.st_gid != sourceIdentity.st_gid)
     {
       return fail("legacy storage source identity changed after lifecycle exit");
     }
@@ -9593,7 +9612,7 @@ public:
       return fail("legacy storage successor identity is invalid");
     }
     String owner;
-    owner.snprintf<"{}/{itoa}-{itoa}"_ctv>(handoffRoot, predecessor->plan.uuid, successor.uuid);
+    owner.snprintf<"{}/{itoa}-{itoa}"_ctv>(handoffRoot, sourceUUID, successor.uuid);
     String payload;
     payload.snprintf<"{}/payload"_ctv>(owner);
     if (ensureDirectoryTree(prodigyFilesystemPathFromString(handoffRoot), failureReport) == false ||
@@ -9653,11 +9672,11 @@ public:
       if (S_ISREG(original.st_mode)) { ++files; logicalBytes += uint64_t(original.st_size); }
     }
     String receipt;
-    receipt.snprintf<"sourceUUID={itoa}\nsuccessorUUID={itoa}\nsourcePID={itoa}\nsourceDevice={itoa}\nsourceInode={itoa}\nsourceUID={itoa}\ntargetUID={itoa}\nfiles={itoa}\nlogicalBytes={itoa}\nterminationCode={itoa}\nterminationStatus={itoa}\nmethod=reflink-always\nsourceRetained=true\nlogicalReadback=pending\n"_ctv>(
-        predecessor->plan.uuid, successor.uuid, uint64_t(predecessor->pid),
+    receipt.snprintf<"sourceUUID={itoa}\nsuccessorUUID={itoa}\nsourcePID={itoa}\nsourceDevice={itoa}\nsourceInode={itoa}\nsourceUID={itoa}\nsourceGID={itoa}\ntargetUID={itoa}\nfiles={itoa}\nlogicalBytes={itoa}\nterminationCode={itoa}\nterminationStatus={itoa}\nmethod=reflink-always\nsourceRetained=true\nlogicalReadback=pending\n"_ctv>(
+        sourceUUID, successor.uuid, uint64_t(sourcePID),
         uint64_t(sourceIdentity.st_dev), uint64_t(sourceIdentity.st_ino),
-        uint64_t(sourceIdentity.st_uid), uint64_t(executionID), files, logicalBytes,
-        uint64_t(predecessor->infop.si_code), uint64_t(predecessor->infop.si_status));
+        uint64_t(sourceIdentity.st_uid), uint64_t(sourceIdentity.st_gid), uint64_t(executionID), files, logicalBytes,
+        uint64_t(terminationCode), uint64_t(terminationStatus));
     if (writeFailureArtifactTextFile(prodigyFilesystemPathFromString(owner) / "capture.txt", receipt, failureReport) == false)
       return false;
     bool durable = true;
@@ -9669,6 +9688,119 @@ public:
     }
     if (!durable) return fail("legacy storage capture directory sync failed");
     stagedPayload.assign(payload);
+    return true;
+  }
+
+  static bool validateRetainedStorageCapture(
+      const RetainedContainerStorageSource& retained, const ContainerPlan& successor,
+      uint128_t machineUUID, String& sourcePath, struct stat& sourceIdentity,
+      String *failureReport = nullptr,
+      const String& storageRoot = "/containers/storage"_ctv,
+      const String& handoffRoot = "/containers/.storage-handoffs"_ctv,
+      const String& cgroupRoot = "/sys/fs/cgroup/containers.slice"_ctv,
+      const String& procRoot = "/proc"_ctv)
+  {
+    auto fail = [&](const char *message) {
+      if (failureReport) failureReport->assign(message);
+      return false;
+    };
+    if (retained.sourceContainerUUID == 0 || retained.failedSuccessorContainerUUID == 0 ||
+        retained.sourceContainerUUID == retained.failedSuccessorContainerUUID ||
+        retained.sourceContainerUUID == successor.uuid || retained.failedSuccessorContainerUUID == successor.uuid ||
+        retained.machineUUID == 0 || retained.machineUUID != machineUUID || retained.sourcePID == 0 ||
+        retained.sourcePID > uint64_t(std::numeric_limits<pid_t>::max()) ||
+        retained.sourceDevice == 0 || retained.sourceInode == 0 ||
+        prodigyIsSHA256HexDigest(retained.captureSHA256) == false ||
+        successor.config.type != ApplicationType::stateful || successor.config.storageMB == 0 ||
+        successor.config.isolatedChildMemoryMB != 0)
+      return fail("retained storage recovery identity or backend is invalid");
+
+    String processPath;
+    processPath.snprintf<"{}/{itoa}"_ctv>(procRoot, retained.sourcePID);
+    struct stat metadata = {};
+    if (lstat(processPath.c_str(), &metadata) == 0 || errno != ENOENT)
+      return fail("retained storage predecessor PID is still present or cannot be inspected");
+    for (uint128_t uuid : {retained.sourceContainerUUID, retained.failedSuccessorContainerUUID})
+    {
+      String group;
+      group.snprintf<"{}/{itoa}.slice"_ctv>(cgroupRoot, uuid);
+      if (lstat(group.c_str(), &metadata) != 0)
+      {
+        if (errno == ENOENT) continue;
+        return fail("retained storage cgroup cannot be inspected");
+      }
+      if (!S_ISDIR(metadata.st_mode)) return fail("retained storage cgroup is not a directory");
+      int fd = open(group.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+      if (fd < 0) return fail("retained storage cgroup cannot be opened");
+      String events;
+      Filesystem::openReadAtClose(fd, "cgroup.events"_ctv, events);
+      close(fd);
+      if (std::string_view(events.c_str(), events.size()).find("populated 0\n") == std::string_view::npos)
+        return fail("retained storage cgroup remains populated");
+    }
+
+    sourcePath.snprintf<"{}/{itoa}"_ctv>(storageRoot, retained.sourceContainerUUID);
+    if (lstat(sourcePath.c_str(), &sourceIdentity) != 0 || !S_ISDIR(sourceIdentity.st_mode) ||
+        uint64_t(sourceIdentity.st_dev) != retained.sourceDevice ||
+        uint64_t(sourceIdentity.st_ino) != retained.sourceInode ||
+        uint64_t(sourceIdentity.st_uid) != retained.sourceUID ||
+        uint64_t(sourceIdentity.st_gid) != retained.sourceGID)
+      return fail("retained storage source does not match its sealed identity");
+
+    String captureOwner, capturePath;
+    captureOwner.snprintf<"{}/{itoa}-{itoa}"_ctv>(handoffRoot, retained.sourceContainerUUID,
+                                                retained.failedSuccessorContainerUUID);
+    if (lstat(captureOwner.c_str(), &metadata) != 0 || !S_ISDIR(metadata.st_mode) ||
+        metadata.st_uid != 0 || (metadata.st_mode & 0077) != 0)
+      return fail("retained storage capture owner is not private and root-owned");
+    capturePath.snprintf<"{}/capture.txt"_ctv>(captureOwner);
+    int captureFD = open(capturePath.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (captureFD < 0) return fail("retained storage capture is unavailable");
+    char bytes[8192];
+    const bool safeFile = fstat(captureFD, &metadata) == 0 && S_ISREG(metadata.st_mode) &&
+                          metadata.st_uid == 0 && (metadata.st_mode & 0022) == 0 &&
+                          metadata.st_size > 0 && metadata.st_size < off_t(sizeof(bytes));
+    const ssize_t count = safeFile ? read(captureFD, bytes, sizeof(bytes)) : -1;
+    close(captureFD);
+    if (!safeFile || count != metadata.st_size) return fail("retained storage capture is not a bounded trusted file");
+    String digest;
+    if (!prodigyComputeSHA256Hex(reinterpret_cast<const uint8_t *>(bytes), uint64_t(count), digest, failureReport) ||
+        digest.equals(retained.captureSHA256) == false)
+      return fail("retained storage capture digest differs from the authorized recovery");
+    String prefix;
+    prefix.snprintf<"sourceUUID={itoa}\nsuccessorUUID={itoa}\nsourcePID={itoa}\nsourceDevice={itoa}\nsourceInode={itoa}\nsourceUID={itoa}\n"_ctv>(
+        retained.sourceContainerUUID, retained.failedSuccessorContainerUUID, retained.sourcePID,
+        retained.sourceDevice, retained.sourceInode, retained.sourceUID);
+    std::string_view capture(bytes, size_t(count));
+    if (!capture.starts_with(std::string_view(prefix.c_str(), prefix.size())))
+      return fail("retained storage capture does not identify the authorized source");
+    capture.remove_prefix(prefix.size());
+    if (capture.starts_with("sourceGID="))
+    {
+      String group;
+      group.snprintf<"sourceGID={itoa}\n"_ctv>(retained.sourceGID);
+      if (!capture.starts_with(std::string_view(group.c_str(), group.size())))
+        return fail("retained storage capture group differs from its authorized source");
+      capture.remove_prefix(group.size());
+    }
+    else if (retained.sourceGID != retained.sourceUID)
+    {
+      // The original receipt format predates an explicit group field. Its
+      // no-device backend uses the same derived host ID for user and group.
+      return fail("legacy retained storage capture requires matching user and group");
+    }
+    for (std::string_view key : {"targetUID=", "files=", "logicalBytes="})
+    {
+      if (!capture.starts_with(key)) return fail("retained storage capture fields are malformed");
+      capture.remove_prefix(key.size());
+      const size_t end = capture.find('\n');
+      if (end == std::string_view::npos || end == 0 || end > 20 ||
+          capture.substr(0, end).find_first_not_of("0123456789") != std::string_view::npos)
+        return fail("retained storage capture count is malformed");
+      capture.remove_prefix(end + 1);
+    }
+    if (capture != "terminationCode=0\nterminationStatus=0\nmethod=reflink-always\nsourceRetained=true\nlogicalReadback=pending\n")
+      return fail("retained storage capture does not prove the supported quiescent handoff");
     return true;
   }
 
@@ -12332,7 +12464,8 @@ public:
 
   // Coroutine arguments must own every value used after suspension. Callers
   // commonly supply a handler-local or temporary metric policy.
-  static void spinContainer(ContainerPlan plan, uint128_t replaceContainerUUID, NeuronContainerMetricPolicy metricPolicy)
+  static void spinContainer(ContainerPlan plan, uint128_t replaceContainerUUID, NeuronContainerMetricPolicy metricPolicy,
+                            RetainedContainerStorageSource retainedSource = {})
   {
 #if PRODIGY_DEBUG
     PRODIGY_DEBUG_LOG("executeWork spinContainer deploymentID=%llu containerUUID=%llu replaceUUID=%llu lifecycle=construct-or-updateInPlace\n",
@@ -12437,7 +12570,34 @@ public:
     // Verify the intended artifact before stopping any predecessor. A missing
     // or rejected successor must never retire the application's data owner.
     String stagedLegacyPayload;
-    if (replaceContainerUUID > 0)
+    if (retainedSource.sourceContainerUUID != 0)
+    {
+      String source, failure;
+      struct stat identity = {};
+      String successorName;
+      successorName.assignItoa(plan.uuid);
+      Vector<ProdigyContainerStorageDevicePlan> devices;
+      if (thisNeuron == nullptr || replaceContainerUUID != retainedSource.sourceContainerUUID ||
+          thisNeuron->containers.contains(retainedSource.sourceContainerUUID) ||
+          thisNeuron->containers.contains(retainedSource.failedSuccessorContainerUUID) ||
+          thisNeuron->pendingContainerLaunchPlans.contains(retainedSource.sourceContainerUUID) ||
+          thisNeuron->pendingContainerLaunchPlans.contains(retainedSource.failedSuccessorContainerUUID) ||
+          thisNeuron->quarantinedContainerNetworks.contains(retainedSource.sourceContainerUUID) ||
+          thisNeuron->quarantinedContainerNetworks.contains(retainedSource.failedSuccessorContainerUUID) ||
+          !collectEligibleStorageDevicePlans(successorName, plan.config.storageMB, devices) || !devices.empty())
+      {
+        reportSpinContainerFailure(plan, "retained storage launch has another runtime owner or incompatible backend"_ctv);
+        co_return;
+      }
+      if (!validateRetainedStorageCapture(retainedSource, plan, thisNeuron->uuid, source, identity, &failure) ||
+          !stageQuiescedStorageCopy(retainedSource.sourceContainerUUID, pid_t(retainedSource.sourcePID),
+                                   0, 0, plan, source, identity, stagedLegacyPayload, &failure))
+      {
+        reportSpinContainerFailure(plan, failure);
+        co_return;
+      }
+    }
+    else if (replaceContainerUUID > 0)
     {
       auto it = thisNeuron->containers.find(replaceContainerUUID);
       String replacementFailure;

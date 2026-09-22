@@ -126,3 +126,37 @@ preserve every canonical process identity; its separately sealed extras may
 differ. Mothership verifies the complete current inventory before handing over
 fences. The successor copies current live v10 databases, preserving intervening
 writes, and prepares new witnesses before any further activation.
+
+## Retrying a failed first stateful replacement
+
+If an accepted `recoverMaterializedStatefulDeployment` operation stopped its
+first predecessor but the replacement failed before health, retain both surviving
+replicas and the stopped predecessor's storage. Correct the application artifact
+through Discombobulator. Install the supporting runtime on all Brains before
+authorizing a retry; accepting a retry writes version-four authority state.
+
+Use `mothership recoverMaterializedStatefulDeployment TARGET JSON` with the
+original `applicationName`, `applicationID`, `activeVersionID`,
+`successorVersionID`, `successorBlobSHA256`, and `operationID`, plus:
+
+- `retryFailedSuccessor: true`, `replacementSuccessorVersionID`, and
+  `replacementSuccessorBlobSHA256` identifying the corrected artifact;
+- canonical hexadecimal `sourceContainerUUID`, `failedSuccessorContainerUUID`,
+  and `sourceMachineUUID`;
+- numeric `sourceDevice`, `sourceInode`, `sourceUID`, `sourceGID`, and `sourcePID`,
+  and `captureSHA256` binding the original Neuron handoff receipt.
+
+Then submit that exact corrected plan and artifact through ordinary Mothership
+deployment. A repeated recovery request must preserve every identity above.
+Neuron derives paths itself and rejects a live source PID, populated predecessor
+cgroup, changed source identity, or mismatched receipt. Its existing reflink
+handoff preserves the original data and fails rather than copying sparse data
+densely on an unsupported filesystem.
+
+Brain durably assigns one replacement UUID before dispatch. Neither surviving
+predecessor is replaced until that first replica reports health. The existing
+serial recovery owner then completes the other two replacements. Command
+acceptance, successful copying, and a running process do not prove application
+health or logical data equality; verify those independently before declaring
+recovery complete. A failed private capture remains preserved and requires
+investigation rather than automatic overwrite.

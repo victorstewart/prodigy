@@ -91,6 +91,21 @@ public:
   uint64_t successorVersionID = 0;
   String operationID;
   String successorBlobSHA256;
+  // A retry replaces an already accepted successor which failed before its
+  // first health acknowledgement.  Storage identity is descriptive only;
+  // the Neuron derives every filesystem path from the UUIDs.
+  bool retryFailedSuccessor = false;
+  uint64_t replacementSuccessorVersionID = 0;
+  String replacementSuccessorBlobSHA256;
+  uint128_t sourceContainerUUID = 0;
+  uint128_t failedSuccessorContainerUUID = 0;
+  uint128_t sourceMachineUUID = 0;
+  uint64_t sourceDevice = 0;
+  uint64_t sourceInode = 0;
+  uint32_t sourceUID = 0;
+  uint32_t sourceGID = 0;
+  uint64_t sourcePID = 0;
+  String captureSHA256;
   bool success = false;
   String failure;
   uint64_t activeDeploymentID = 0;
@@ -106,11 +121,52 @@ static void serialize(S&& serializer, RecoverMaterializedStatefulDeployment& pay
   serializer.value8b(payload.successorVersionID);
   serializer.text1b(payload.operationID, 36);
   serializer.text1b(payload.successorBlobSHA256, 128);
+  serializer.value1b(payload.retryFailedSuccessor);
+  serializer.value8b(payload.replacementSuccessorVersionID);
+  serializer.text1b(payload.replacementSuccessorBlobSHA256, 128);
+  serializer.value16b(payload.sourceContainerUUID);
+  serializer.value16b(payload.failedSuccessorContainerUUID);
+  serializer.value16b(payload.sourceMachineUUID);
+  serializer.value8b(payload.sourceDevice);
+  serializer.value8b(payload.sourceInode);
+  serializer.value4b(payload.sourceUID);
+  serializer.value4b(payload.sourceGID);
+  serializer.value8b(payload.sourcePID);
+  serializer.text1b(payload.captureSHA256, 128);
   serializer.value1b(payload.success);
   serializer.text1b(payload.failure, UINT32_MAX);
   serializer.value8b(payload.activeDeploymentID);
   serializer.value8b(payload.successorDeploymentID);
   serializer.value8b(payload.durableGeneration);
+}
+
+// The trusted control plane identifies retained storage by immutable host
+// identity.  Callers never supply a path: ContainerManager derives it from
+// sourceContainerUUID and verifies the capture receipt before use.
+class RetainedContainerStorageSource {
+public:
+  uint128_t sourceContainerUUID = 0;
+  uint128_t failedSuccessorContainerUUID = 0;
+  uint128_t machineUUID = 0;
+  uint64_t sourceDevice = 0;
+  uint64_t sourceInode = 0;
+  uint32_t sourceUID = 0;
+  uint32_t sourceGID = 0;
+  uint64_t sourcePID = 0;
+  String captureSHA256;
+};
+template <typename S>
+static void serialize(S&& serializer, RetainedContainerStorageSource& source)
+{
+  serializer.value16b(source.sourceContainerUUID);
+  serializer.value16b(source.failedSuccessorContainerUUID);
+  serializer.value16b(source.machineUUID);
+  serializer.value8b(source.sourceDevice);
+  serializer.value8b(source.sourceInode);
+  serializer.value4b(source.sourceUID);
+  serializer.value4b(source.sourceGID);
+  serializer.value8b(source.sourcePID);
+  serializer.text1b(source.captureSHA256, 128);
 }
 
 static inline bool prodigyCanonicalOperationUUID(const String& value)
@@ -7289,6 +7345,46 @@ static void serialize(S&& serializer, ProdigyMaterializedStatefulRecoveryOperati
   serializer.value8b(operation.updatedAtMs);
 }
 
+enum class ProdigyMaterializedStatefulRecoveryRetryPhase : uint8_t {
+  authorized,
+  successorAdmitted,
+  storageLaunchDispatched,
+  storageLaunchHealthy,
+  completed,
+};
+
+// Kept separate from the original operation so version-three durable state
+// remains readable without interpreting a changed operation layout.
+class ProdigyMaterializedStatefulRecoveryRetry {
+public:
+  String operationID;
+  uint64_t activeDeploymentID = 0;
+  uint64_t failedSuccessorDeploymentID = 0;
+  String failedSuccessorBlobSHA256;
+  uint64_t replacementSuccessorDeploymentID = 0;
+  String replacementSuccessorBlobSHA256;
+  RetainedContainerStorageSource source;
+  uint128_t retryContainerUUID = 0;
+  ProdigyMaterializedStatefulRecoveryRetryPhase phase = ProdigyMaterializedStatefulRecoveryRetryPhase::authorized;
+  int64_t updatedAtMs = 0;
+};
+template <typename S>
+static void serialize(S&& serializer, ProdigyMaterializedStatefulRecoveryRetry& retry)
+{
+  serializer.text1b(retry.operationID, 36);
+  serializer.value8b(retry.activeDeploymentID);
+  serializer.value8b(retry.failedSuccessorDeploymentID);
+  serializer.text1b(retry.failedSuccessorBlobSHA256, 128);
+  serializer.value8b(retry.replacementSuccessorDeploymentID);
+  serializer.text1b(retry.replacementSuccessorBlobSHA256, 128);
+  serializer.object(retry.source);
+  serializer.value16b(retry.retryContainerUUID);
+  uint8_t phase = uint8_t(retry.phase);
+  serializer.value1b(phase);
+  retry.phase = ProdigyMaterializedStatefulRecoveryRetryPhase(phase);
+  serializer.value8b(retry.updatedAtMs);
+}
+
 enum class ApiCredentialExpirySeverity : uint8_t {
   warning,
   expired,
@@ -7365,6 +7461,7 @@ public:
   Vector<ProdigyStatefulWorkerTopologyUpgradeOperation> statefulWorkerTopologyUpgradeOperations;
   Vector<ProdigyDeferredStatefulScaleIntent> deferredStatefulScaleIntents;
   Vector<ProdigyMaterializedStatefulRecoveryOperation> materializedStatefulRecoveryOperations;
+  Vector<ProdigyMaterializedStatefulRecoveryRetry> materializedStatefulRecoveryRetries;
   Vector<ApiCredentialExpiryNotice> apiCredentialExpiryNotices;
   Vector<ProdigyManagedMachineSchema> machineSchemas;
   Vector<RoutableResourceLease> routableResourceLeases;
@@ -7376,7 +7473,7 @@ public:
 
   bool operator==(const ProdigyMasterAuthorityRuntimeState& other) const
   {
-    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf)
+    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || materializedStatefulRecoveryRetries.size() != other.materializedStatefulRecoveryRetries.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf)
     {
       return false;
     }
@@ -7455,6 +7552,29 @@ public:
       }
     }
 
+    for (uint32_t index = 0; index < materializedStatefulRecoveryRetries.size(); ++index)
+    {
+      const auto& a = materializedStatefulRecoveryRetries[index];
+      const auto& b = other.materializedStatefulRecoveryRetries[index];
+      if (a.operationID.equals(b.operationID) == false ||
+          a.activeDeploymentID != b.activeDeploymentID ||
+          a.failedSuccessorDeploymentID != b.failedSuccessorDeploymentID ||
+          a.failedSuccessorBlobSHA256.equals(b.failedSuccessorBlobSHA256) == false ||
+          a.replacementSuccessorDeploymentID != b.replacementSuccessorDeploymentID ||
+          a.replacementSuccessorBlobSHA256.equals(b.replacementSuccessorBlobSHA256) == false ||
+          a.source.sourceContainerUUID != b.source.sourceContainerUUID ||
+          a.source.failedSuccessorContainerUUID != b.source.failedSuccessorContainerUUID ||
+          a.source.machineUUID != b.source.machineUUID ||
+          a.source.sourceDevice != b.source.sourceDevice || a.source.sourceInode != b.source.sourceInode ||
+          a.source.sourceUID != b.source.sourceUID || a.source.sourceGID != b.source.sourceGID ||
+          a.source.sourcePID != b.source.sourcePID ||
+          a.source.captureSHA256.equals(b.source.captureSHA256) == false ||
+          a.retryContainerUUID != b.retryContainerUUID || a.phase != b.phase || a.updatedAtMs != b.updatedAtMs)
+      {
+        return false;
+      }
+    }
+
     for (uint32_t index = 0; index < apiCredentialExpiryNotices.size(); ++index)
     {
       const auto& a = apiCredentialExpiryNotices[index];
@@ -7528,31 +7648,34 @@ template <typename S>
 static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
 {
   constexpr uint64_t versionMarker = UINT64_MAX;
-  constexpr uint64_t explicitVersion = 3;
+  constexpr uint64_t explicitVersion = 4;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
   bool hasMaterializedStatefulRecoveryOperations = false;
   bool hasApiCredentialExpiryNotices = false;
   bool hasAllMachineRecoveryWitnesses = false;
+  bool hasMaterializedStatefulRecoveryRetries = false;
 
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
     hasMaterializedStatefulRecoveryOperations = state.materializedStatefulRecoveryOperations.empty() == false;
     hasApiCredentialExpiryNotices = state.apiCredentialExpiryNotices.empty() == false;
     hasAllMachineRecoveryWitnesses = state.updateSelf.machineRecoveryWitnesses.empty() == false;
-    // Version-three framing is cumulative: emit the earlier optional fields
+    hasMaterializedStatefulRecoveryRetries = state.materializedStatefulRecoveryRetries.empty() == false;
+    // Version-four framing is cumulative: emit the earlier optional fields
     // (empty when unused) so a version-three reader has an unambiguous tail.
-    if (hasAllMachineRecoveryWitnesses)
+    if (hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries)
     {
       hasMaterializedStatefulRecoveryOperations = true;
       hasApiCredentialExpiryNotices = true;
+      hasAllMachineRecoveryWitnesses = true;
     }
-    if (hasMaterializedStatefulRecoveryOperations || hasApiCredentialExpiryNotices || hasAllMachineRecoveryWitnesses)
+    if (hasMaterializedStatefulRecoveryOperations || hasApiCredentialExpiryNotices || hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries)
     {
       uint64_t marker = versionMarker;
       serializer.value8b(marker);
 
-      uint64_t version = hasAllMachineRecoveryWitnesses ? explicitVersion :
-                         (hasApiCredentialExpiryNotices ? 2 : 1);
+      uint64_t version = hasMaterializedStatefulRecoveryRetries ? 4 :
+                         (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1));
       serializer.value8b(version);
     }
     serializer.value8b(state.generation);
@@ -7573,6 +7696,7 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
       hasMaterializedStatefulRecoveryOperations = true;
       hasApiCredentialExpiryNotices = version >= 2;
       hasAllMachineRecoveryWitnesses = version >= 3;
+      hasMaterializedStatefulRecoveryRetries = version >= 4;
     }
   }
 
@@ -7604,6 +7728,14 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
   {
     state.materializedStatefulRecoveryOperations.clear();
     state.apiCredentialExpiryNotices.clear();
+  }
+  if (hasMaterializedStatefulRecoveryRetries)
+  {
+    serializer.object(state.materializedStatefulRecoveryRetries);
+  }
+  else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+  {
+    state.materializedStatefulRecoveryRetries.clear();
   }
   serializer.object(state.machineSchemas);
   serializer.object(state.routableResourceLeases);

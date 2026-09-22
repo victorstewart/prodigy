@@ -11482,6 +11482,115 @@ public:
     return false;
   }
 
+  bool recoveredInventoryWhiteholeLeasePruneIsSafe(void) const
+  {
+    // This is only a best-effort repair after the existing inventory gate.
+    // Any incomplete/terminal/control-unavailable machine leaves leases alone;
+    // it must never turn a normally recoverable inventory state into a gate.
+    if (weAreMaster == false || recoveringPersistedNeuronInventory == false ||
+        persistedMachineInventoryEnumerated == false)
+    {
+      return false;
+    }
+    for (Machine *machine : machines)
+    {
+      if (machine == nullptr || machine->uuid == 0 ||
+          machine->state == MachineState::hardwareFailure ||
+          machine->state == MachineState::decommissioning ||
+          machine->runtimeReady == false ||
+          persistedMachineInventoryUploaded.contains(machine->uuid) == false ||
+          neuronControlStreamActive(machine) == false || machine->claims.empty() == false)
+      {
+        return false;
+      }
+    }
+    for (const auto& [deploymentID, deployment] : deployments)
+    {
+      (void)deploymentID;
+      if (deployment == nullptr || deployment->currentlyExecutingWork != nullptr ||
+          deployment->toSchedule.empty() == false || deployment->waitingOnContainers.empty() == false ||
+          deployment->waitingOnCompactions || deployment->nSuspended != 0 ||
+          deployment->schedulingStack.execution != nullptr ||
+          deployment->schedulingStack.waiters.empty() == false || deployment->canaryStack != nullptr ||
+          deployment->retiredSchedulingExecution != nullptr || deployment->consumingSchedulingExecution)
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool pruneRecoveredInventoryOrphanWhiteholeLeases(void)
+  {
+    if (recoveredInventoryWhiteholeLeasePruneIsSafe() == false)
+    {
+      return true;
+    }
+
+    Vector<RoutableResourceLease> retained = {};
+    retained.reserve(routableResourceLeaseRuntimeState.size());
+    for (const RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
+    {
+      if (lease.kind != RoutableResourceLeaseKind::whiteholeAddressPort)
+      {
+        retained.push_back(lease);
+        continue;
+      }
+
+      bool attachedToCanonicalContainer = false;
+      for (const auto& [uuid, container] : containers)
+      {
+        (void)uuid;
+        if (container == nullptr || uuid != container->uuid || container->machine == nullptr)
+        {
+          return true;
+        }
+        if (container->state == ContainerState::destroyed ||
+            container->deploymentID != lease.owner.deploymentID)
+        {
+          continue;
+        }
+        for (const Whitehole& whitehole : container->whiteholes)
+        {
+          if (whitehole.hasAddress && whitehole.address.equals(lease.address) &&
+              whitehole.sourcePort == lease.sourcePort)
+          {
+            attachedToCanonicalContainer = true;
+            break;
+          }
+        }
+        if (attachedToCanonicalContainer)
+        {
+          break;
+        }
+      }
+      if (attachedToCanonicalContainer)
+      {
+        retained.push_back(lease);
+      }
+    }
+
+    if (retained.size() == routableResourceLeaseRuntimeState.size())
+    {
+      return true;
+    }
+
+    const Vector<RoutableResourceLease> previousLeases = routableResourceLeaseRuntimeState;
+    const ProdigyMasterAuthorityRuntimeState previousRuntimeState = masterAuthorityRuntimeState;
+    const bool previousDurable = masterAuthorityRuntimeStateDurable;
+    const uint64_t previousDurableGeneration = durableMasterAuthorityRuntimeStateGeneration;
+    routableResourceLeaseRuntimeState = std::move(retained);
+    if (commitMasterAuthorityStateChange() == false)
+    {
+      routableResourceLeaseRuntimeState = previousLeases;
+      masterAuthorityRuntimeState = previousRuntimeState;
+      masterAuthorityRuntimeStateDurable = previousDurable;
+      durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+      return false;
+    }
+    return true;
+  }
+
   bool finalizePersistedNeuronInventoryRecovery(void)
   {
     if (recoveringPersistedNeuronInventory == false)
@@ -11607,7 +11716,59 @@ public:
         return false;
       }
     }
+    // Only after every live Neuron has attested may the optional stale-lease
+    // repair run. Unsafe shapes skip it; only an attempted durable mutation
+    // failure leaves the inventory gate closed for retry.
+    if (pruneRecoveredInventoryOrphanWhiteholeLeases() == false)
+    {
+      return false;
+    }
     recoveringPersistedNeuronInventory = false;
+    return true;
+  }
+
+  bool promoteRetainedStorageRecoverySuccessor(ProdigyMaterializedStatefulRecoveryRetry& retry,
+                                               ApplicationDeployment *head)
+  {
+    auto activeIt = deployments.find(retry.activeDeploymentID);
+    auto failedIt = deployments.find(retry.failedSuccessorDeploymentID);
+    if (retry.phase != ProdigyMaterializedStatefulRecoveryRetryPhase::authorized || !head ||
+        activeIt == deployments.end() || !activeIt->second || failedIt == deployments.end() || !failedIt->second)
+      return false;
+    ApplicationDeployment *active = activeIt->second;
+    ApplicationDeployment *failed = failedIt->second;
+    if (head->previous != failed || failed->previous != active || active->next != failed ||
+        !head->containers.empty() || active->containers.size() != 2 ||
+        !head->plan.config.containerBlobSHA256.equals(retry.replacementSuccessorBlobSHA256) ||
+        !failed->plan.config.containerBlobSHA256.equals(retry.failedSuccessorBlobSHA256) ||
+        !ApplicationDeployment::materializedStatefulRecoveryPlansAreCompatible(active->plan, head->plan) ||
+        (!failed->containers.empty() && !failed->canDiscardUnlaunchedMaterializedRecoveryViews())) return false;
+    const auto before = masterAuthorityRuntimeState;
+    const bool wasDurable = masterAuthorityRuntimeStateDurable;
+    const uint64_t durableGeneration = durableMasterAuthorityRuntimeStateGeneration;
+    const DeploymentState priorState = head->state;
+    head->previous = active;
+    active->next = head;
+    failed->previous = nullptr;
+    failed->next = nullptr;
+    head->state = DeploymentState::waitingToDeploy;
+    retry.phase = ProdigyMaterializedStatefulRecoveryRetryPhase::successorAdmitted;
+    retry.updatedAtMs = Time::now<TimeResolution::ms>();
+    if (!commitMasterAuthorityStateChange())
+    {
+      head->previous = failed;
+      active->next = failed;
+      failed->previous = active;
+      failed->next = head;
+      head->state = priorState;
+      masterAuthorityRuntimeState = before;
+      masterAuthorityRuntimeStateDurable = wasDurable;
+      durableMasterAuthorityRuntimeStateGeneration = durableGeneration;
+      return false;
+    }
+    if (!failed->containers.empty())
+      (void)failed->discardUnlaunchedMaterializedRecoveryViews();
+    active->rebuildRecoveredContainerCounts();
     return true;
   }
 
@@ -11620,6 +11781,120 @@ public:
     }
 
     resumeOperatorCancellations();
+
+    // This retry rejoins the existing serial recovery only after its one
+    // missing storage owner is healthy. Keep the transition durable before
+    // the deployment scheduler can touch either retained predecessor.
+    for (auto& retry : masterAuthorityRuntimeState.materializedStatefulRecoveryRetries)
+    {
+      if (retry.phase == ProdigyMaterializedStatefulRecoveryRetryPhase::completed) continue;
+      auto found = deployments.find(retry.replacementSuccessorDeploymentID);
+      if (found == deployments.end() || found->second == nullptr) continue;
+      ApplicationDeployment *head = found->second;
+      if (!head->plan.config.containerBlobSHA256.equals(retry.replacementSuccessorBlobSHA256) ||
+          deploymentsByApp[head->plan.config.applicationID] != head ||
+          !deploymentDNSReady(retry.replacementSuccessorDeploymentID) ||
+          !deploymentReplicationAcknowledgedByAuthoritativePeers(head)) continue;
+      if (retry.phase == ProdigyMaterializedStatefulRecoveryRetryPhase::authorized)
+      {
+        // A failed persistence attempt leaves the same queued head available
+        // for this existing recovery owner to retry after a later event.
+        if (!promoteRetainedStorageRecoverySuccessor(retry, head)) return;
+        // The durable promotion is complete. Continue into dispatch now: a
+        // quiet retained fleet may emit no further inventory or health event.
+      }
+
+      const auto before = masterAuthorityRuntimeState;
+      const bool wasDurable = masterAuthorityRuntimeStateDurable;
+      const uint64_t durableGeneration = durableMasterAuthorityRuntimeStateGeneration;
+      auto persistTransition = [&]() {
+        retry.updatedAtMs = Time::now<TimeResolution::ms>();
+        if (commitMasterAuthorityStateChange()) return true;
+        masterAuthorityRuntimeState = before;
+        masterAuthorityRuntimeStateDurable = wasDurable;
+        durableMasterAuthorityRuntimeStateGeneration = durableGeneration;
+        return false;
+      };
+      // The predecessor may have been culled by the ordinary scheduler. Check
+      // completion before requiring that old owner to remain in the index.
+      if (head->state == DeploymentState::running && head->previous == nullptr &&
+          head->containers.size() == 3 && std::all_of(head->containers.begin(), head->containers.end(),
+            [&](ContainerView *container) {
+              return container && container->deploymentID == retry.replacementSuccessorDeploymentID &&
+                     container->isStateful && container->shardGroup == 0 &&
+                     container->lifetime == ApplicationLifetime::base && container->state == ContainerState::healthy;
+            }))
+      {
+        retry.phase = ProdigyMaterializedStatefulRecoveryRetryPhase::completed;
+        for (auto& operation : masterAuthorityRuntimeState.materializedStatefulRecoveryOperations)
+          if (operation.operationID.equals(retry.operationID)) operation.completed = true;
+        if (!persistTransition()) return;
+        continue;
+      }
+      auto activeIt = deployments.find(retry.activeDeploymentID);
+      if (activeIt == deployments.end() || activeIt->second == nullptr) continue;
+      ApplicationDeployment *active = activeIt->second;
+      auto failedIt = deployments.find(retry.failedSuccessorDeploymentID);
+      if (failedIt != deployments.end() && failedIt->second && head->previous == failedIt->second &&
+          failedIt->second->previous == active &&
+          failedIt->second->plan.config.containerBlobSHA256.equals(retry.failedSuccessorBlobSHA256))
+      {
+        // Cold plan reconstruction sorts versions and can recreate the failed
+        // link. A durable admitted retry may detach only an empty failed owner.
+        if (!failedIt->second->containers.empty()) continue;
+        failedIt->second->previous = nullptr;
+        failedIt->second->next = nullptr;
+        head->previous = active;
+        active->next = head;
+      }
+      if (head->previous != active || active->next != head ||
+          !ApplicationDeployment::materializedStatefulRecoveryPlansAreCompatible(active->plan, head->plan)) continue;
+      head->materializedStatefulRecoveryOwnsTransition = true;
+      if (retry.phase == ProdigyMaterializedStatefulRecoveryRetryPhase::storageLaunchHealthy)
+      {
+        head->resumeMaterializedStatefulRecovery();
+        continue;
+      }
+      auto slot = containers.find(retry.retryContainerUUID);
+      if (retry.retryContainerUUID != 0 && slot != containers.end())
+      {
+        ContainerView *container = slot->second;
+        if (container && container->deploymentID == retry.replacementSuccessorDeploymentID &&
+            container->machine && container->machine->uuid == retry.source.machineUUID &&
+            head->containers.contains(container) && container->state == ContainerState::healthy &&
+            active->containers.size() == 2 && head->containers.size() == 1)
+        {
+          retry.phase = ProdigyMaterializedStatefulRecoveryRetryPhase::storageLaunchHealthy;
+          if (!persistTransition()) return;
+          head->hasRetainedStorageRecoverySource = false;
+          head->retainedStorageRecoveryContainerUUID = 0;
+          head->retainedStorageRecoverySource = {};
+          head->resumeMaterializedStatefulRecovery();
+        }
+        continue;
+      }
+      if (!head->containers.empty() || active->containers.size() != 2 ||
+          head->materializedStatefulRecoveryHealthFailed || head->state == DeploymentState::failed) continue;
+      Machine *sourceMachine = nullptr;
+      for (Machine *machine : machines)
+        if (machine && machine->uuid == retry.source.machineUUID && machine->runtimeReady && neuronControlStreamActive(machine))
+          sourceMachine = machine;
+      if (sourceMachine == nullptr) continue;
+      const bool needsDispatchCommit = retry.retryContainerUUID == 0 ||
+          retry.phase != ProdigyMaterializedStatefulRecoveryRetryPhase::storageLaunchDispatched;
+      if (retry.retryContainerUUID == 0)
+      {
+        do { retry.retryContainerUUID = Random::generateNumberWithNBits<128, uint128_t>(); }
+        while (retry.retryContainerUUID == 0 || containers.contains(retry.retryContainerUUID));
+      }
+      if (needsDispatchCommit)
+      {
+        retry.phase = ProdigyMaterializedStatefulRecoveryRetryPhase::storageLaunchDispatched;
+        if (!persistTransition()) return;
+      }
+      if (head->state == DeploymentState::none) head->state = DeploymentState::waitingToDeploy;
+      (void)head->beginRetainedStorageRecoverySlot(sourceMachine, retry.retryContainerUUID, retry.source);
+    }
 
     // Hold accepted heads until exact inventory and real replacement health
     // permit their existing deployment owner to resume the retained handoff.
@@ -11698,6 +11973,15 @@ public:
       {
         if (operation.accepted && operation.completed == false &&
             operation.successorDeploymentID == head->plan.config.deploymentID())
+        {
+          heldByMaterializedStatefulRecovery = true;
+          break;
+        }
+      }
+      for (const auto& retry : masterAuthorityRuntimeState.materializedStatefulRecoveryRetries)
+      {
+        if (retry.phase != ProdigyMaterializedStatefulRecoveryRetryPhase::completed &&
+            retry.replacementSuccessorDeploymentID == head->plan.config.deploymentID())
         {
           heldByMaterializedStatefulRecovery = true;
           break;
@@ -27316,6 +27600,31 @@ public:
     }
     else
     {
+      // A durable retained-storage retry owns this queued successor in every
+      // restored state, including NONE after a cold runtime transition.
+      ProdigyMaterializedStatefulRecoveryRetry *retry = nullptr;
+      for (auto& candidate : masterAuthorityRuntimeState.materializedStatefulRecoveryRetries)
+      {
+        if (candidate.phase == ProdigyMaterializedStatefulRecoveryRetryPhase::authorized &&
+            candidate.replacementSuccessorDeploymentID == deployment->plan.config.deploymentID() &&
+            candidate.replacementSuccessorBlobSHA256.equals(deployment->plan.config.containerBlobSHA256) &&
+            candidate.failedSuccessorDeploymentID == previous->plan.config.deploymentID() &&
+            candidate.activeDeploymentID != 0)
+        {
+          retry = &candidate;
+          break;
+        }
+      }
+      if (retry)
+      {
+        previous->next = deployment;
+        deployment->previous = previous;
+        deployment->state = DeploymentState::waitingToDeploy;
+        (void)promoteRetainedStorageRecoverySuccessor(*retry, deployment);
+        (void)persistLocalRuntimeState();
+        recoverDeploymentsAfterNeuronState();
+        return;
+      }
       switch (previous->state)
       {
         case DeploymentState::none: // they rapid fire sent another before we could begin work on this
@@ -31949,10 +32258,34 @@ public:
             return;
           }
 
+          ProdigyMaterializedStatefulRecoveryRetry *recoveryRetryAdmission = nullptr;
+          for (auto& retry : masterAuthorityRuntimeState.materializedStatefulRecoveryRetries)
+          {
+            if (retry.phase == ProdigyMaterializedStatefulRecoveryRetryPhase::authorized &&
+                retry.replacementSuccessorDeploymentID == deployment->plan.config.deploymentID())
+            {
+              recoveryRetryAdmission = &retry;
+              break;
+            }
+          }
+
+          if (recoveryRetryAdmission == nullptr)
+          {
+            for (const auto& operation : masterAuthorityRuntimeState.materializedStatefulRecoveryOperations)
+            {
+              if (operation.accepted && !operation.completed &&
+                  ApplicationConfig::extractApplicationID(operation.successorDeploymentID) == deployment->plan.config.applicationID)
+              {
+                rejectInvalidPlan("invalid plan: retained stateful recovery requires an authorized successor retry"_ctv);
+                return;
+              }
+            }
+          }
+
           if (auto existing = deploymentsByApp.find(deployment->plan.config.applicationID);
               existing != deploymentsByApp.end() && existing->second != nullptr &&
               existing->second->state == DeploymentState::failed &&
-              existing->second->lifecycleIsUnmaterialized() == false)
+              existing->second->lifecycleIsUnmaterialized() == false && recoveryRetryAdmission == nullptr)
           {
             rejectInvalidPlan("invalid plan: previous failed deployment retains materialized containers"_ctv);
             return;
@@ -32247,6 +32580,16 @@ public:
 
           deployment->plan.config.containerBlobSHA256 = trustedContainerBlobSHA256;
           deployment->plan.config.containerBlobBytes = trustedContainerBlobBytes;
+          if (recoveryRetryAdmission &&
+              (recoveryRetryAdmission->replacementSuccessorBlobSHA256.equals(trustedContainerBlobSHA256) == false ||
+               !deployments.contains(recoveryRetryAdmission->activeDeploymentID) ||
+               !deployments.at(recoveryRetryAdmission->activeDeploymentID) ||
+               !ApplicationDeployment::materializedStatefulRecoveryPlansAreCompatible(
+                   deployments.at(recoveryRetryAdmission->activeDeploymentID)->plan, deployment->plan)))
+          {
+            rejectInvalidPlan("invalid plan: materialized stateful recovery retry target does not match its durable authorization"_ctv);
+            return;
+          }
           if (deployment->plan.config.type == ApplicationType::task)
           {
             TaskExecutionRecord record = {};
@@ -32404,6 +32747,152 @@ public:
               name == reservedApplicationNamesByID.end() || name->second.equals(request.applicationName) == false)
           {
             reject("materialized stateful recovery authority or application identity is not ready");
+            break;
+          }
+
+          if (request.retryFailedSuccessor)
+          {
+            if (request.replacementSuccessorVersionID <= request.successorVersionID ||
+                request.replacementSuccessorVersionID > maximumVersionID ||
+                !prodigyIsSHA256HexDigest(request.replacementSuccessorBlobSHA256) ||
+                !prodigyIsSHA256HexDigest(request.captureSHA256) ||
+                request.sourceContainerUUID == 0 || request.failedSuccessorContainerUUID == 0 ||
+                request.sourceContainerUUID == request.failedSuccessorContainerUUID ||
+                request.sourceMachineUUID == 0 || request.sourcePID == 0 ||
+                request.sourcePID > uint64_t(std::numeric_limits<pid_t>::max()))
+            {
+              reject("invalid materialized stateful recovery retry identity");
+              break;
+            }
+            const uint64_t replacementID = (uint64_t(request.applicationID) << 48) | request.replacementSuccessorVersionID;
+            response.successorDeploymentID = replacementID;
+            if (finalizePersistedNeuronInventoryRecovery() == false)
+            {
+              reject("materialized stateful recovery retry inventory is not authoritative");
+              break;
+            }
+            ProdigyMaterializedStatefulRecoveryOperation *original = nullptr;
+            for (auto& operation : masterAuthorityRuntimeState.materializedStatefulRecoveryOperations)
+            {
+              if (operation.operationID.equals(request.operationID))
+              {
+                original = &operation;
+                break;
+              }
+            }
+            for (const auto& retry : masterAuthorityRuntimeState.materializedStatefulRecoveryRetries)
+            {
+              if (retry.operationID.equals(request.operationID) && retry.activeDeploymentID == activeID &&
+                  retry.failedSuccessorDeploymentID == successorID && retry.failedSuccessorBlobSHA256.equals(request.successorBlobSHA256) &&
+                  retry.replacementSuccessorDeploymentID == replacementID &&
+                  retry.replacementSuccessorBlobSHA256.equals(request.replacementSuccessorBlobSHA256) &&
+                  retry.source.sourceContainerUUID == request.sourceContainerUUID &&
+                  retry.source.failedSuccessorContainerUUID == request.failedSuccessorContainerUUID &&
+                  retry.source.machineUUID == request.sourceMachineUUID && retry.source.sourceDevice == request.sourceDevice &&
+                  retry.source.sourceInode == request.sourceInode && retry.source.sourceUID == request.sourceUID &&
+                  retry.source.sourceGID == request.sourceGID && retry.source.sourcePID == request.sourcePID &&
+                  retry.source.captureSHA256.equals(request.captureSHA256))
+              {
+                response.success = true;
+                response.durableGeneration = masterAuthorityRuntimeState.generation;
+                reply();
+                break;
+              }
+            }
+            if (response.success)
+            {
+              break;
+            }
+            auto failed = deployments.find(successorID);
+            auto active = deployments.find(activeID);
+            if (original == nullptr || original->accepted == false || original->completed ||
+                original->activeDeploymentID != activeID || original->successorDeploymentID != successorID ||
+                original->successorBlobSHA256.equals(request.successorBlobSHA256) == false ||
+                failed == deployments.end() || failed->second == nullptr || active == deployments.end() || active->second == nullptr ||
+                failed->second->retainedRecoveryFailedHeadCanBeReplaced() == false ||
+                failed->second->previous != active->second || active->second->next != failed->second ||
+                failed->second->plan.config.containerBlobSHA256.equals(request.successorBlobSHA256) == false ||
+                request.failedSuccessorContainerUUID == 0 || request.sourceContainerUUID == 0 || request.sourceMachineUUID == 0 ||
+                request.sourceDevice == 0 || request.sourceInode == 0 || request.sourcePID == 0)
+            {
+              reject("materialized stateful recovery retry safety precondition failed");
+              break;
+            }
+            bool sourceMachineKnown = false;
+            for (Machine *machine : machines)
+            {
+              sourceMachineKnown |= machine != nullptr && machine->uuid == request.sourceMachineUUID &&
+                                    neuronControlStreamActive(machine) && machine->runtimeReady;
+            }
+            if (sourceMachineKnown == false || active->second->containers.size() != 2 ||
+                failed->second->containers.size() > 2 || replacementID == successorID ||
+                deployments.contains(replacementID) || deploymentPlans.contains(replacementID))
+            {
+              reject("materialized stateful recovery retry cohort or replacement identity is unsafe");
+              break;
+            }
+            bytell_hash_set<Machine *> retainedMachines;
+            bool retainedCohortValid = true;
+            for (ContainerView *container : active->second->containers)
+            {
+              retainedCohortValid &= container != nullptr && container->machine != nullptr &&
+                                     container->deploymentID == activeID && container->isStateful &&
+                                     container->lifetime == ApplicationLifetime::base && container->shardGroup == 0 &&
+                                     container->plannedWork == nullptr && container->machine->uuid != request.sourceMachineUUID &&
+                                     container->machine->runtimeReady && neuronControlStreamActive(container->machine) &&
+                                     (container->state == ContainerState::scheduled || container->state == ContainerState::healthy ||
+                                      container->state == ContainerState::crashedRestarting) &&
+                                     containers.contains(container->uuid) && containers.at(container->uuid) == container &&
+                                     retainedMachines.insert(container->machine).second;
+            }
+            if (retainedCohortValid == false ||
+                containers.contains(request.sourceContainerUUID) ||
+                containers.contains(request.failedSuccessorContainerUUID))
+            {
+              reject("materialized stateful recovery retry retained cohort is not canonical");
+              break;
+            }
+            for (const auto& retry : masterAuthorityRuntimeState.materializedStatefulRecoveryRetries)
+            {
+              if (retry.operationID.equals(request.operationID) || retry.replacementSuccessorDeploymentID == replacementID)
+              {
+                reject("materialized stateful recovery retry operation collision");
+                break;
+              }
+            }
+            if (response.failure.size() > 0) break;
+            const auto before = masterAuthorityRuntimeState;
+            const bool wasDurable = masterAuthorityRuntimeStateDurable;
+            const uint64_t durableGeneration = durableMasterAuthorityRuntimeStateGeneration;
+            ProdigyMaterializedStatefulRecoveryRetry retry = {};
+            retry.operationID = request.operationID;
+            retry.activeDeploymentID = activeID;
+            retry.failedSuccessorDeploymentID = successorID;
+            retry.failedSuccessorBlobSHA256 = request.successorBlobSHA256;
+            retry.replacementSuccessorDeploymentID = replacementID;
+            retry.replacementSuccessorBlobSHA256 = request.replacementSuccessorBlobSHA256;
+            retry.source.sourceContainerUUID = request.sourceContainerUUID;
+            retry.source.failedSuccessorContainerUUID = request.failedSuccessorContainerUUID;
+            retry.source.machineUUID = request.sourceMachineUUID;
+            retry.source.sourceDevice = request.sourceDevice;
+            retry.source.sourceInode = request.sourceInode;
+            retry.source.sourceUID = request.sourceUID;
+            retry.source.sourceGID = request.sourceGID;
+            retry.source.sourcePID = request.sourcePID;
+            retry.source.captureSHA256 = request.captureSHA256;
+            retry.updatedAtMs = Time::now<TimeResolution::ms>();
+            masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.push_back(std::move(retry));
+            if (commitMasterAuthorityStateChange() == false)
+            {
+              masterAuthorityRuntimeState = before;
+              masterAuthorityRuntimeStateDurable = wasDurable;
+              durableMasterAuthorityRuntimeStateGeneration = durableGeneration;
+              reject("materialized stateful recovery retry durable acceptance failed");
+              break;
+            }
+            response.success = true;
+            response.durableGeneration = masterAuthorityRuntimeState.generation;
+            reply();
             break;
           }
 

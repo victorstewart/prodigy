@@ -920,6 +920,10 @@ static bool validateNeuronPayloadForNeuron(uint16_t rawTopic, uint8_t *args, uin
         {
           return false;
         }
+        if (cursor != terminal && consumeVariable(cursor, terminal) == false)
+        {
+          return false;
+        }
         return (cursor == terminal);
       }
     case NeuronTopic::adjustContainerResources:
